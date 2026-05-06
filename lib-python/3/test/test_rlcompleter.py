@@ -38,14 +38,8 @@ class TestRlcompleter(unittest.TestCase):
         # test with builtins namespace
         self.assertEqual(sorted(self.stdcompleter.global_matches('di')),
                          [x+'(' for x in dir(builtins) if x.startswith('di')])
-        if IS_PYPY:
-            # staticmethod has an empty signature on PyPy
-            self.assertEqual(sorted(self.stdcompleter.global_matches('st')),
-                             sorted(('staticmethod()' if x == 'staticmethod' else x+'(')
-                                    for x in dir(builtins) if x.startswith('st')))
-        else:
-            self.assertEqual(sorted(self.stdcompleter.global_matches('st')),
-                             [x+'(' for x in dir(builtins) if x.startswith('st')])
+        self.assertEqual(sorted(self.stdcompleter.global_matches('st')),
+                         [x+'(' for x in dir(builtins) if x.startswith('st')])
         self.assertEqual(self.stdcompleter.global_matches('akaksajadhak'), [])
 
         # test with a customized namespace
@@ -63,10 +57,11 @@ class TestRlcompleter(unittest.TestCase):
                          ['str.{}('.format(x) for x in dir(str)
                           if x.startswith('s')])
         self.assertEqual(self.stdcompleter.attr_matches('tuple.foospamegg'), [])
-        # PyPy changes: CPython 3.11 has ( for everything except __doc__
+        # PyPy: CPython 3.11 has ( for everything except __doc__; PyPy returns
+        # empty signatures for these builtins so rlcompleter appends ().
         expected = sorted({'None.%s%s' % (x,
                                           '()' if x in (
-            '__bool__', '__dir__', '__getstate__', '__hash__',
+            '__bool__', '__class__', '__dir__', '__getstate__', '__hash__',
             '__init_subclass__', '__new__', '__reduce__', '__repr__', '__str__')
                                           else '' if x == '__doc__'
                                           else '(')

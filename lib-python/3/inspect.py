@@ -2013,9 +2013,16 @@ def _signature_get_user_defined_method(cls, method_name):
         return None
     code = getattr(inner, '__code__', None)
     if _builtin_code_type and isinstance(code, _builtin_code_type):
-        # PYPY: FunctionWithFixedCode has builtin code but may have a
-        # __text_signature__ — let it through so signature() can use it.
-        if not getattr(inner, '__text_signature__', None):
+        # PyPy: FunctionWithFixedCode has builtin code but may have a
+        # __text_signature__ -- let it through so signature() can use it,
+        # EXCEPT when __new__ is the class's own native constructor:
+        # __objclass__ matches cls, so the class's own __text_signature__
+        # is preferred over the double-strip the MRO loop would produce.
+        # If __new__ was assigned from another type (e.g. MethodDescriptorType
+        # test), __objclass__ != cls so we let it through normally.
+        own_new = (method_name == '__new__' and
+                   getattr(inner, '__objclass__', None) is cls)
+        if not getattr(inner, '__text_signature__', None) or own_new:
             return None
     if method_name != '__new__':
         meth = _descriptor_get(meth, cls)
@@ -2675,13 +2682,13 @@ def _signature_from_callable(obj, *,
                 obj.__new__ is object.__new__):
                 # Return a signature of 'object' builtin.
                 return sigcls.from_callable(object)
-            # PYPY: __new__ may be a builtin not returned by
+            # PyPy: __new__ may be a builtin not returned by
             # _signature_get_user_defined_method; try it directly.
+            # The heuristic in _signature_fromstr already strips the implicit
+            # $type arg, so do NOT call _signature_bound_method again.
             if obj.__init__ is object.__init__ and obj.__new__ is not object.__new__:
                 try:
                     sig = _get_signature_of(obj.__new__)
-                    if skip_bound_arg:
-                        return _signature_bound_method(sig)
                     return sig
                 except (ValueError, TypeError):
                     pass
