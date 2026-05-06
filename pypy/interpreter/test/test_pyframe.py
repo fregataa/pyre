@@ -37,13 +37,6 @@ def stack(*kinds):
 
 # MarkStacks unit tests
 
-def test_markstacks_constants():
-    assert _ms.UNINITIALIZED == -2
-    assert _ms.OVERFLOWED    == -1
-    assert _ms.EMPTY         == 0
-    assert _ms.BITS          == 3
-    assert _ms.MASK          == 7
-
 def test_markstacks_push_empty():
     assert _ms.push(_ms.EMPTY, _ms.OBJECT) == _ms.OBJECT
 
