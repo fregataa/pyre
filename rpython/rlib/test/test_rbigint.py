@@ -27,11 +27,13 @@ from rpython.translator.c.test.test_standalone import StandaloneTests
 from rpython.rtyper.tool.rfficache import platform
 from rpython.rlib.rstring import StringBuilder
 
-from hypothesis import given, strategies, example, settings, assume
+from hypothesis import given, strategies, example, settings, assume, HealthCheck
 
 longs = strategies.builds(
     long, strategies.integers())
 ints = strategies.integers(-sys.maxint-1, sys.maxint)
+_BIG_INT_MAX = 10000 if sys.maxint > 2 ** 32 else 2000
+
 
 def makelong(data):
     numbits = data.draw(strategies.integers(1, 2000))
@@ -1657,6 +1659,7 @@ class TestHypothesis(object):
             HOLDER.DIV_LIMIT = oldval
 
     @given(tuples_biglongs_for_division)
+    @settings(deadline=None, suppress_health_check=[HealthCheck.too_slow])
     def test_divmod_consistency(self, tup):
         lx, ly = tup
         ly = ly or 1
@@ -1869,7 +1872,7 @@ class TestHypothesis(object):
         r1 = rx.abs_rshift_and_mask(r_ulonglong(shift), mask)
         assert r1 == (abs(x) >> shift) & mask
 
-    @given(biglongs, strategies.integers(min_value=1, max_value=10000))
+    @given(biglongs, strategies.integers(min_value=1, max_value=_BIG_INT_MAX))
     def test_str_to_int_big_base10(self, l, limit):
         l = abs(l)
         s = str(l)
@@ -1897,7 +1900,7 @@ class TestHypothesis(object):
             HOLDER.STR2INT_LIMIT = oldval
             HOLDER.MINSIZE_STR2INT = 1
 
-    @given(strategies.integers(min_value=1, max_value=10000), strategies.integers(min_value=1, max_value=10000))
+    @given(strategies.integers(min_value=1, max_value=_BIG_INT_MAX), strategies.integers(min_value=1, max_value=_BIG_INT_MAX))
     @settings(max_examples=10)
     def test_str_to_int_big_w5pow(self, exp, limit):
         mem = {}

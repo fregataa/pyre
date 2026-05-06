@@ -1,4 +1,4 @@
-from rpython.rlib.rstring import StringBuilder
+from rpython.rlib.rstring import StringBuilder, ParseStringError
 from rpython.rlib.mutbuffer import MutableStringBuffer
 from rpython.rlib.rstruct import ieee
 from rpython.rlib.rstruct.ieee import float_pack
@@ -274,12 +274,16 @@ def unpackI(s, index=0):
     return val
 
 def unpackQ(s, index=0):
-    val = 0
+    from rpython.rlib.rarithmetic import r_ulonglong, intmask
+    val = r_ulonglong(0)
+    shift = r_ulonglong(0)
     for i in range(8):
-        x = ord(s[index])
-        val += x * (1 << 8 * i)
+        val |= r_ulonglong(ord(s[index])) << shift
+        shift += r_ulonglong(8)
         index += 1
-    return int(val)
+    if val > r_ulonglong(maxsize):
+        raise OverflowError("Q value exceeds system's maximum size")
+    return intmask(val)
 
 
 def packI(opcode, val):
@@ -1667,7 +1671,7 @@ def iscontiguous(buf):
     if ndim == 1:
         return shape[0] == 1 or itemsize == strides[0]
     sd = itemsize
-    for i in range(ndim -1, -1 -1):
+    for i in range(ndim -1, -1, -1):
         # C order
         dim = shape[i]
         if dim == 0:
@@ -1676,6 +1680,8 @@ def iscontiguous(buf):
             # Could be Fortran order?
             break
         sd *= dim
+    else:
+        return 1
     sd = itemsize
     for i in range(ndim):
         dim = shape[i]
@@ -2156,12 +2162,13 @@ class W_Unpickler(W_Root):
         else:
             from rpython.rlib.rbigint import rbigint
             try:
-                ival = int(data)
-                w_val = space.newint(ival)
-            except OverflowError:
-                w_val = space.newlong_from_rbigint(rbigint.fromstr(data))
-            except ValueError:
+                bigint = rbigint.fromstr(data)
+            except ParseStringError:
                 raise oefmt(space.w_ValueError, "could not convert string to int")
+            try:
+                w_val = space.newint(bigint.toint())
+            except OverflowError:
+                w_val = space.newlong_from_rbigint(bigint)
         self.append(w_val)
     dispatch[ord(op.INT[0])] = load_int
 
@@ -2257,14 +2264,14 @@ class W_Unpickler(W_Root):
 
     def load_binbytes(self):
         length = self.read_unpackI()
-        if length > maxsize:
+        if length < 0 or length > maxsize:
             raise oefmt(unpickling_error(self.space),
                 "BINBYTES exceeds system's maximum size "
                                   "of %d bytes", maxsize)
         data = self.read(length)
         if len(data) < length:
             raise oefmt(unpickling_error(self.space),
-                "trucated data in BINBYTES")
+                "truncated data in BINBYTES")
         self.append(self.space.newbytes(data))
     dispatch[ord(op.BINBYTES[0])] = load_binbytes
 
@@ -2278,14 +2285,14 @@ class W_Unpickler(W_Root):
 
     def load_binunicode(self):
         length = self.read_unpackI()
-        if length > maxsize:
+        if length < 0 or length > maxsize:
             raise oefmt(unpickling_error(self.space),
                 "BINUNICODE exceeds system's maximum size "
                                   "of %d bytes", maxsize)
         data = self.read(length)
         if len(data) < length:
             raise oefmt(unpickling_error(self.space),
-                "trucated data in BINUNICODE")
+                "truncated data in BINUNICODE")
         self.append(self.space.newtext(*decode_utf8sp(self.space, data)))
     dispatch[ord(op.BINUNICODE[0])] = load_binunicode
 
@@ -2294,7 +2301,10 @@ class W_Unpickler(W_Root):
             length = unpackQ(self.read(8))
         except IndexError:
             raise oefmt(unpickling_error(self.space),
-                "trucated data in BINUNICODE8")
+                "truncated data in BINUNICODE8")
+        except OverflowError:
+            raise oefmt(unpickling_error(self.space),
+                "BINUNICODE8 exceeds system's maximum size")
         if length > maxsize:
             raise oefmt(unpickling_error(self.space),
                 "BINUNICODE8 exceeds system's maximum size "
@@ -2302,7 +2312,7 @@ class W_Unpickler(W_Root):
         data = self.read(length)
         if len(data) < length:
             raise oefmt(unpickling_error(self.space),
-                "trucated data in BINUNICODE8")
+                "truncated data in BINUNICODE8")
         self.append(self.space.newtext(*decode_utf8sp(self.space, data)))
     dispatch[ord(op.BINUNICODE8[0])] = load_binunicode8
 
@@ -2311,7 +2321,10 @@ class W_Unpickler(W_Root):
             length = unpackQ(self.read(8))
         except IndexError:
             raise oefmt(unpickling_error(self.space),
-                "trucated data in BINBYTES8")
+                "truncated data in BINBYTES8")
+        except OverflowError:
+            raise oefmt(unpickling_error(self.space),
+                "BINBYTES8 exceeds system's maximum size")
         if length > maxsize:
             raise oefmt(unpickling_error(self.space),
                 "BINBYTES8 exceeds system's maximum size "
@@ -2319,7 +2332,7 @@ class W_Unpickler(W_Root):
         data = self.read(length)
         if len(data) < length:
             raise oefmt(unpickling_error(self.space),
-                "trucated data in BINBYTES8")
+                "truncated data in BINBYTES8")
         self.append(self.space.newbytes(data))
     dispatch[ord(op.BINBYTES8[0])] = load_binbytes8
 
@@ -2328,7 +2341,10 @@ class W_Unpickler(W_Root):
             length = unpackQ(self.read(8))
         except IndexError:
             raise oefmt(unpickling_error(self.space),
-                "trucated data in BYTEARRAY8")
+                "truncated data in BYTEARRAY8")
+        except OverflowError:
+            raise oefmt(unpickling_error(self.space),
+                "BYTEARRAY8 exceeds system's maximum size")
         if length > maxsize:
             raise oefmt(unpickling_error(self.space),
                 "BYTEARRAY8 exceeds system's maximum size "
@@ -2336,7 +2352,7 @@ class W_Unpickler(W_Root):
         data = self.read(length)
         if len(data) < length:
             raise oefmt(unpickling_error(self.space),
-                "trucated data in BYTEARRAY8")
+                "truncated data in BYTEARRAY8")
         self.append(self.space.newbytearray([c for c in data]))
     dispatch[ord(op.BYTEARRAY8[0])] = load_bytearray8
 
@@ -2375,7 +2391,7 @@ class W_Unpickler(W_Root):
         data = self.read(length)
         if len(data) < length:
             raise oefmt(unpickling_error(self.space),
-                "trucated data in SHORT_BINBYTES")
+                "truncated data in SHORT_BINBYTES")
         self.append(self.space.newbytes(data))
     dispatch[ord(op.SHORT_BINBYTES[0])] = load_short_binbytes
 
@@ -2384,7 +2400,7 @@ class W_Unpickler(W_Root):
         data = self.read(length)
         if len(data) < length:
             raise oefmt(unpickling_error(self.space),
-                "trucated data in SHORT_BINUNICODE")
+                "truncated data in SHORT_BINUNICODE")
         self.append(self.space.newtext(data))
     dispatch[ord(op.SHORT_BINUNICODE[0])] = load_short_binunicode
 
@@ -2656,6 +2672,9 @@ class W_Unpickler(W_Root):
 
     def load_long_binget(self):
         i = self.read_unpackI()
+        if i < 0:
+            raise oefmt(unpickling_error(self.space),
+                'Memo value not found at index %d', i)
         try:
             self.append(self.memo[i])
         except IndexError as exc:
@@ -2685,7 +2704,7 @@ class W_Unpickler(W_Root):
 
     def load_long_binput(self):
         i = self.read_unpackI()
-        if i > maxsize:
+        if i < 0 or i > maxsize:
             raise oefmt(self.space.w_ValueError, "negative LONG_BINPUT argument")
         w_val = self._stack_top("LONG_BINPUT")
         self._memo_put(i, w_val)

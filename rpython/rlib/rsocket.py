@@ -720,6 +720,12 @@ class RSocket(object):
             if res != 0:
                 raise self.error_handler()
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
     def detach(self):
         fd = self.fd
         self.fd = INVALID_SOCKET
@@ -1440,7 +1446,7 @@ if _c.HAVE_SENDMSG:
         Socket method to determine the optimal byte size of the ancillary.
         Recommended to be used when computing the ancillary size for recvmsg.
         :param demanded_len: an integer with the minimum size required.
-        :return: an integer with the minimum memory needed for the required size. The value is not memory alligned
+        :return: an integer with the minimum memory needed for the required size. The value is not memory aligned
         """
         if demanded_len < 0:
             return 0
@@ -1452,7 +1458,7 @@ if _c.HAVE_SENDMSG:
         Socket method to determine the optimal byte size of the ancillary.
         Recommended to be used when computing the ancillary size for recvmsg.
         :param demanded_size: an integer with the minimum size required.
-        :return: an integer with the minimum memory needed for the required size. The value is memory alligned
+        :return: an integer with the minimum memory needed for the required size. The value is memory aligned
         """
         if demanded_size < 0:
             return 0

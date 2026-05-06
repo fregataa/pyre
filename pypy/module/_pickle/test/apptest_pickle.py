@@ -463,6 +463,21 @@ def test_picklebuffer():
     # assert s1 == s2
     assert loads(s1) == b'foobar'
 
+def test_picklebuffer_multidim_contiguous():
+    # 2D C-contiguous memoryview must be picklable. iscontiguous() in
+    # interp_pickle.py had a missing comma: range(ndim-1, -1-1) instead of
+    # range(ndim-1, -1, -1), making the C-order loop dead code and causing
+    # any ndim>1 C-contiguous buffer to be rejected as non-contiguous.
+    data = bytearray(range(12))
+    mv = memoryview(data).cast('B', [3, 4])
+    assert mv.c_contiguous
+    pb = PickleBuffer(mv)
+    s1 = dumps(pb, 5)
+    s2 = dumps_py(pb, 5)
+    expected = bytearray(range(12))
+    assert loads(s1) == expected
+    assert loads(s2) == expected
+
 def test_buffers_error():
     pb = PickleBuffer(b"foobar")
     data = dumps(pb, 5, buffer_callback=[].append)
@@ -821,6 +836,20 @@ def test_unpickle_crash4():
     b = b'g\n'
     with raises(ValueError):
         pickle.loads(b)
+
+def test_large_32b_binbytes8():
+    # On 32-bit, a BINBYTES8/BINUNICODE8/BYTEARRAY8 with length >= 2**32
+    # must raise UnpicklingError or OverflowError, not silently truncate.
+    # The 8-byte length field encodes 2**32+4 = 0x100000004.
+    import pytest
+    if sys.maxsize >= 2**32:
+        pytest.skip("only relevant on 32-bit builds")
+    dumped_bytes8   = b'\x80\x04\x8e\x04\x00\x00\x00\x01\x00\x00\x00\xe2\x82\xac\x00.'
+    dumped_unicode8 = b'\x80\x04\x8d\x04\x00\x00\x00\x01\x00\x00\x00\xe2\x82\xac\x00.'
+    dumped_barray8  = b'\x80\x05\x96\x04\x00\x00\x00\x01\x00\x00\x00\xe2\x82\xac\x00.'
+    for dumped in (dumped_bytes8, dumped_unicode8, dumped_barray8):
+        raises((UnpicklingError, OverflowError), loads, dumped)
+
 
 def test_memoize_and_binput_index_collision():
     # original pickle: EMPTY_LIST + MEMOIZE (index 0), then 'spam' + BINPUT 1,
