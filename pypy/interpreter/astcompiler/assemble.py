@@ -27,6 +27,8 @@ _SETUP_CLEANUP = -2   # open exception scope, lasti=True (try/finally/except-as)
 _SETUP_WITH    = -3   # open exception scope, lasti=True, depth_sub=1 (with-blocks)
 _POP_BLOCK     = -4   # close exception scope
 
+PSEUDO_OPNAMES = ['_SETUP_FINALLY', '_SETUP_CLEANUP', '_SETUP_WITH', '_POP_BLOCK']
+
 # Pseudo-instructions: present in block.instructions so _build_exceptiontable
 # and _stacksize can read them, but they contribute zero bytes to the encoded
 # bytecode and have no interpreter dispatch.
@@ -115,8 +117,15 @@ class Instruction(object):
     def is_setup_pseudo_code(opcode):
         return opcode in (_SETUP_FINALLY, _SETUP_CLEANUP, _SETUP_WITH)
 
+    def opname(self):
+        # for debugging
+        if self.opcode >= 0:
+            return ops.opname[self.opcode]
+        else:
+            return PSEUDO_OPNAMES[~self.opcode]
+
     def __repr__(self):
-        data = ["<", ops.opname[self.opcode]]
+        data = ["<", self._opname()]
         if self.opcode >= ops.HAVE_ARGUMENT:
             data.append(" ")
             data.append(str(self.arg))

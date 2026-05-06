@@ -3177,7 +3177,7 @@ def view(startblock):
         color = "black"
 
         for j, instr in enumerate(block.instructions):
-            str_instr = "%5s: %s" % (instr.position_info[0], ops.opname[instr.opcode])
+            str_instr = "%5s: %s" % (instr.position_info[0], instr.opname())
             if instr.opcode >= ops.HAVE_ARGUMENT and instr.jump is None:
                 str_instr += " %s" % (instr.arg, )
             if instr._stack_depth_after != -99:
