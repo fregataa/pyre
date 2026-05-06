@@ -899,8 +899,8 @@ class PythonCodeMaker(ast.ASTVisitor):
             # Match CPython's label_exception_targets, which always follows
             # b_next unconditionally.
             if b.next_block is not None and b.next_block not in block_entry_stack:
-                    block_entry_stack[b.next_block] = stk
-                    worklist.append(b.next_block)
+                block_entry_stack[b.next_block] = stk
+                worklist.append(b.next_block)
 
         # --- Phase 2: emit exception table entries ---
         # cur_handler is Block or None (like CPython's basicblock *handler).
