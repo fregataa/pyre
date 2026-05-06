@@ -6,6 +6,10 @@ PyPy v7.3.21: release of python 2.7, 3.11, released 2026-03-13
 ..
   updated to 996ebee08886ee13f
 
+.. warning::
+
+  This release has some known crashes. We recommend you use a different version
+
 The PyPy team is proud to release version 7.3.21 of PyPy after the previous
 release on July 4, 2025. This is a bug-fix release that also updates to Python
 3.11.15.
@@ -44,7 +48,7 @@ on PyPy. In any case, `cibuildwheel`_ supports building wheels for PyPy.
 
 .. _`PyPy`: https://doc.pypy.org/
 .. _`RPython`: https://rpython.readthedocs.org
-.. _`help`: https://doc.pypy.org/en/latest/project-ideas.html
+.. _`help`: https://doc.pypy.org/project-ideas.html
 .. _CFFI: https://cffi.readthedocs.io
 .. _cppyy: https://cppyy.readthedocs.io
 .. _`cibuildwheel`: https://github.com/joerick/cibuildwheel
