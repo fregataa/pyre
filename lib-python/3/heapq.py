@@ -314,6 +314,7 @@ def _siftup_max(heap, pos):
     _siftdown_max(heap, startpos, pos)
 
 
+# PyPy modification for merge: use linked tournament tree for merges
 class _MergeNode:
     """
     Binary tree invariants:
@@ -474,6 +475,7 @@ def merge(*iterables, key=None, reverse=False):
                 winner = right if right.key < left.key else left
                 node.key = winner.key
                 node.leaf = winner.leaf
+# end PyPy modifications of merge
 
 
 # Algorithm notes for nlargest() and nsmallest()
