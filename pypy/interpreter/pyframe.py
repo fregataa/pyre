@@ -8,7 +8,7 @@ from rpython.rlib.debug import ll_assert_not_none
 from rpython.rlib.jit import hint
 from rpython.rlib.objectmodel import instantiate, specialize, we_are_translated
 from rpython.rlib.objectmodel import not_rpython
-from rpython.rlib.rarithmetic import intmask, r_uint
+from rpython.rlib.rarithmetic import intmask, r_uint, LONG_BIT
 from rpython.tool.pairtype import extendabletype
 
 from pypy.interpreter import pycode, pytraceback
@@ -864,7 +864,8 @@ class MarkStacks(object):
     """
     BITS = 3
     MASK = (1 << BITS) - 1
-    _WILL_OVERFLOW = 1 << (20 * BITS)
+    # 20 slots on 64-bit, 10 on 32-bit: result must fit in a signed platform int
+    _WILL_OVERFLOW = 1 << min(LONG_BIT - 2, 20 * BITS)
 
     UNINITIALIZED = -2
     OVERFLOWED    = -1
