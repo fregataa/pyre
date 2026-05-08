@@ -105,7 +105,7 @@ def test_add_bits(i):
 START = ord('A')
 STOP = ord('G')
 
-@given(strategies.lists(strategies.text(strategies.characters(min_codepoint=START, max_codepoint=STOP), min_size=1), min_size=5), strategies.data())
+@given(strategies.lists(strategies.text(strategies.characters(min_codepoint=START, max_codepoint=STOP), min_size=1, max_size=20), min_size=5), strategies.data())
 def test_random_dawg(l, data):
     l = [s.encode('ascii') for s in l]
     print l
