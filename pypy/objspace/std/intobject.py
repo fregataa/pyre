@@ -312,9 +312,9 @@ def _pow_ovf2long(space, iv, w_iv, iw, w_iw, w_modulus):
     from pypy.objspace.std.longobject import W_LongObject, W_AbstractLongObject
     if w_iv is None or not isinstance(w_iv, W_AbstractLongObject):
         w_iv = W_LongObject.fromint(space, iv)
-    if w_iw is None or not isinstance(w_iw, W_AbstractLongObject):
-        w_iw = W_LongObject.fromint(space, iw)
-
+    # *don't* convert w_iw. W_LongObject.descr_pow can deal with w_iw being an
+    # int just fine
+    assert w_iw is not None
     return w_iv.descr_pow(space, w_iw, w_modulus)
 
 
