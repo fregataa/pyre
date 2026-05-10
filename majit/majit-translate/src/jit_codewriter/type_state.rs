@@ -11,13 +11,13 @@
 //! beside the data type — these are pyre-only divergences from RPython
 //! that survive the rtyper cutover (`~/.claude/plans/0-warm-raccoon.md`
 //! Slice 3). The graph-walking algorithm `resolve_types` remains in
-//! `translate_legacy/rtyper/rtyper.rs` until the real rtyper
+//! `translator/rtyper/legacy_resolve.rs` until the real rtyper
 //! (`translator/rtyper/`) produces per-Variable concretetypes
 //! end-to-end and replaces it.
 
 use std::collections::HashMap;
 
-use crate::model::ValueId;
+use crate::model::{FunctionGraph, OpKind, ValueId, ValueType};
 
 /// Concrete low-level type. RPython `Repr.lowleveltype` collapsed to the
 /// four kinds the jit_codewriter needs (Signed / GcRef / Float / Void)
@@ -93,7 +93,7 @@ impl TypeResolutionState {
 /// Survives the rtyper cutover (Slice 3): once the real `RPythonTyper`
 /// path produces `original` / `post_resolve`, this function still
 /// reconciles them with `post_result` / `stamped`. Slice 3 relocated
-/// this body from `translate_legacy/rtyper/rtyper.rs:360-382` to
+/// this body from `translator/rtyper/legacy_resolve.rs:360-382` to
 /// keep the legacy graph-walk (`resolve_types`) callable separately
 /// from the merge logic.
 pub fn merge_synth_kinds(
@@ -123,6 +123,102 @@ pub fn merge_synth_kinds(
     }
 
     merged
+}
+
+/// `ValueType` → `ConcreteType` projection used by both
+/// `resolve_types` (legacy graph walk) and `authoritative_result_types`
+/// (post-jtransform op-result projection).
+///
+/// `Bool` collapses to `Signed` because RPython `BoolRepr.lowleveltype
+/// = Bool` lifts to LL `Signed` for the codewriter; the legacy resolver
+/// followed the same collapse and the post-jtransform projection
+/// matches it.
+pub(crate) fn valuetype_to_concrete(vt: &ValueType) -> ConcreteType {
+    match vt {
+        // `Unsigned` shares the `Signed` ConcreteType — the codewriter
+        // / regalloc do not distinguish signedness (`getkind(Unsigned)
+        // == 'int'`); only the rtyper picks `IntegerRepr.lowleveltype
+        // = Unsigned` based on `SomeInteger.unsigned`.
+        ValueType::Int | ValueType::Unsigned | ValueType::Bool => ConcreteType::Signed,
+        ValueType::Ref => ConcreteType::GcRef,
+        ValueType::Float => ConcreteType::Float,
+        ValueType::Void => ConcreteType::Void,
+        ValueType::State | ValueType::Unknown => ConcreteType::Unknown,
+    }
+}
+
+/// `result_kind: char` → `ConcreteType` projection used by jtransform
+/// call families (`CallElidable` / `CallResidual` / `CallMayForce` /
+/// `InlineCall` / `RecursiveCall`).
+pub(crate) fn kind_char_to_concrete(kind: char) -> ConcreteType {
+    match kind {
+        'i' => ConcreteType::Signed,
+        'r' => ConcreteType::GcRef,
+        'f' => ConcreteType::Float,
+        'v' => ConcreteType::Void,
+        _ => ConcreteType::Unknown,
+    }
+}
+
+fn concrete_if_known(concrete: ConcreteType) -> Option<ConcreteType> {
+    if concrete == ConcreteType::Unknown {
+        None
+    } else {
+        Some(concrete)
+    }
+}
+
+/// Per-op `ConcreteType` declared by the rewritten graph's op-result
+/// fields (`result_ty` / `result_kind`).  Authoritative for op-result
+/// kinds because the rewriter declares them at lowering time, so this
+/// projection wins over `original` operand inferences in
+/// [`merge_synth_kinds`]'s precedence chain.
+pub(crate) fn authoritative_result_type_from_op(kind: &OpKind) -> Option<ConcreteType> {
+    match kind {
+        OpKind::ConstInt(_) => Some(ConcreteType::Signed),
+        OpKind::ConstBool(_) => Some(ConcreteType::Signed),
+        OpKind::ConstFloat(_) => Some(ConcreteType::Float),
+        OpKind::Input { ty, .. } => concrete_if_known(valuetype_to_concrete(ty)),
+        OpKind::FieldRead { ty, .. } | OpKind::VableFieldRead { ty, .. } => {
+            concrete_if_known(valuetype_to_concrete(ty))
+        }
+        OpKind::ArrayRead { item_ty, .. }
+        | OpKind::InteriorFieldRead { item_ty, .. }
+        | OpKind::VableArrayRead { item_ty, .. } => {
+            concrete_if_known(valuetype_to_concrete(item_ty))
+        }
+        OpKind::Call { result_ty, .. }
+        | OpKind::IndirectCall { result_ty, .. }
+        | OpKind::BinOp { result_ty, .. }
+        | OpKind::UnaryOp { result_ty, .. } => concrete_if_known(valuetype_to_concrete(result_ty)),
+        OpKind::CallElidable { result_kind, .. }
+        | OpKind::CallResidual { result_kind, .. }
+        | OpKind::CallMayForce { result_kind, .. }
+        | OpKind::InlineCall { result_kind, .. }
+        | OpKind::RecursiveCall { result_kind, .. } => {
+            concrete_if_known(kind_char_to_concrete(*result_kind))
+        }
+        OpKind::VtableMethodPtr { .. } => Some(ConcreteType::Signed),
+        _ => None,
+    }
+}
+
+/// Walk the rewritten graph and collect every op-result that carries an
+/// authoritative `ConcreteType` (per-op declaration).  Feeds
+/// [`merge_synth_kinds`]'s `post_result` lane.
+pub(crate) fn authoritative_result_types(graph: &FunctionGraph) -> HashMap<ValueId, ConcreteType> {
+    let mut result = HashMap::new();
+    for block in &graph.blocks {
+        for op in &block.operations {
+            let Some(value) = op.result else {
+                continue;
+            };
+            if let Some(concrete) = authoritative_result_type_from_op(&op.kind) {
+                result.insert(value, concrete);
+            }
+        }
+    }
+    result
 }
 
 /// Build value kind map from type resolution state.

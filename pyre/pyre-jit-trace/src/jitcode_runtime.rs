@@ -287,17 +287,21 @@ static INSNS_OPNAME_TO_BYTE: LazyLock<HashMap<String, u8>> = LazyLock::new(|| {
     table
 });
 
-/// Inverted view: `u8` opcode byte → opname string. Built lazily on
-/// first access from `INSNS_OPNAME_TO_BYTE`. Duplicate u8 values should
-/// never occur (assembler.py assigns sequential ids), and we assert that
-/// at load time.
+/// Inverted view: `u8` opcode byte → opname string.  Built lazily on
+/// first access from `INSNS_OPNAME_TO_BYTE`.  Upstream `assembler.py:
+/// 220` assigns a fresh byte to every distinct key (`setdefault(key,
+/// len(self.insns))`), so the reverse map is one-to-one and panics on
+/// any duplicate-byte collision.
 static INSNS_BYTE_TO_OPNAME: LazyLock<HashMap<u8, String>> = LazyLock::new(|| {
-    let mut map = HashMap::with_capacity(INSNS_OPNAME_TO_BYTE.len());
+    let mut map: HashMap<u8, String> = HashMap::with_capacity(INSNS_OPNAME_TO_BYTE.len());
     for (name, &byte) in INSNS_OPNAME_TO_BYTE.iter() {
-        assert!(
-            map.insert(byte, name.clone()).is_none(),
-            "duplicate opcode byte {byte} in pipeline.insns table"
-        );
+        if let Some(existing) = map.insert(byte, name.clone()) {
+            panic!(
+                "INSNS_BYTE_TO_OPNAME: duplicate byte {byte} maps to both {existing:?} and \
+                 {name:?} (upstream Assembler.insns is 1:1; if both spellings need to \
+                 dispatch to the same handler, allocate distinct bytes per assembler.py:220)",
+            );
+        }
     }
     map
 });
@@ -1307,12 +1311,32 @@ mod tests {
         let (builder, _unwired) = build_default_bh_builder_with_unwired_report();
         let expected_live = insns_opname_to_byte().get("live/").copied();
         assert_eq!(Some(builder.op_live), expected_live);
-        // Reverse mapping parity: every opname in the build-time table
-        // must appear at the same byte index in builder._insns.
+        // Reverse mapping parity: for every opname in the build-time
+        // forward table, `builder._insns[byte]` must hold an opname
+        // that round-trips to the same byte.  RPython
+        // `assembler.py:220` allocates a fresh byte per distinct key
+        // (`setdefault(key, len(self.insns))`), so the forward map is
+        // injective and the reverse map is naturally 1:1.  Python
+        // class-attribute aliases on `BlackholeInterpreter`
+        // (`blackhole.py:913 bhimpl_goto_if_not_int_is_true =
+        // bhimpl_goto_if_not`) share the handler function under two
+        // attribute names but never register two opnames at the same
+        // byte in `Assembler.insns`.
         for (key, &byte) in insns_opname_to_byte() {
+            let inverse = &builder._insns[byte as usize];
+            let inverse_byte = insns_opname_to_byte()
+                .get(inverse)
+                .copied()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "builder._insns[{byte}] = {inverse:?} but that opname is not in the \
+                     forward table"
+                    )
+                });
             assert_eq!(
-                &builder._insns[byte as usize], key,
-                "builder._insns[{byte}] disagrees with build-time key {key:?}",
+                inverse_byte, byte,
+                "builder._insns[{byte}] = {inverse:?} maps to byte {inverse_byte}, expected {byte} \
+                 (for forward key {key:?})",
             );
         }
     }

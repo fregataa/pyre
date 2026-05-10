@@ -1058,7 +1058,7 @@ impl Assembler {
                 // `residual_call_r_v` are *different* bhimpls
                 // (`blackhole.py:1225-1231`): the `_r` / `_i` / `_v`
                 // suffix encodes the actual result kind. When pyre's
-                // rtyper (`translate_legacy::rtyper::resolve_types`)
+                // rtyper (`translator::rtyper::legacy_resolve::resolve_types`)
                 // upgrades a call result's concrete type to `Signed`
                 // (e.g. via `is_int_arith` backward constraint), the
                 // regalloc-assigned register class diverges from the
@@ -1094,6 +1094,26 @@ impl Assembler {
             // `bhimpl_int_copy` handler.
             OpKind::ConstInt(val) => {
                 let idx = self.emit_const_i(*val, state);
+                state.code.push(idx);
+                argcodes.push('i');
+                if let Some(result) = op.result {
+                    argcodes.push('>');
+                    let (reg, kc) = self.lookup_reg_with_kind(result, regallocs);
+                    argcodes.push(kc);
+                    state.code.push(reg);
+                }
+                let key = format!("int_copy/{argcodes}");
+                let opnum = self.get_opnum(&key);
+                state.code[startposition] = opnum;
+            }
+
+            // RPython folds `lltype.Bool` to kind `'int'` at codewriter
+            // (`flatten.py:getkind`), so `ConstBool` materialises through
+            // the same `int_copy/i>i` path as `ConstInt`. The bool value
+            // collapses to 0/1 in the int constant pool and the
+            // canonical `bhimpl_int_copy` handler runs in the blackhole.
+            OpKind::ConstBool(val) => {
+                let idx = self.emit_const_i(*val as i64, state);
                 state.code.push(idx);
                 argcodes.push('i');
                 if let Some(result) = op.result {
@@ -1569,10 +1589,12 @@ impl Assembler {
 
             // Default: encode operand registers + result register (no descriptor)
             other => {
+                let mut operand_kinds = String::new();
                 for v in crate::inline::op_value_refs(other) {
                     let (reg, kind_char) = self.lookup_reg_with_kind(v, regallocs);
                     state.code.push(reg);
                     argcodes.push(kind_char);
+                    operand_kinds.push(kind_char);
                 }
                 if let Some(result) = op.result {
                     argcodes.push('>');
@@ -1580,7 +1602,7 @@ impl Assembler {
                     argcodes.push(kind_char);
                     state.code.push(reg);
                 }
-                let opname = op_kind_to_opname(other);
+                let opname = op_kind_to_opname_with_kinds(other, &operand_kinds);
                 let key = format!("{opname}/{argcodes}");
                 let opnum = self.get_opnum(&key);
                 state.code[startposition] = opnum;
@@ -1870,6 +1892,7 @@ impl Assembler {
             match kind {
                 OpKind::Input { .. } => "Input",
                 OpKind::ConstInt(_) => "ConstInt",
+                OpKind::ConstBool(_) => "ConstBool",
                 OpKind::ConstFloat(_) => "ConstFloat",
                 OpKind::FieldRead { .. } => "FieldRead",
                 OpKind::FieldWrite { .. } => "FieldWrite",
@@ -2132,7 +2155,11 @@ struct AssemblyState {
 fn value_type_to_kind(ty: &crate::model::ValueType) -> char {
     use crate::model::ValueType;
     match ty {
-        ValueType::Int => 'i',
+        // RPython `getkind(Bool/Unsigned)` returns `'int'` (`lloperation.
+        // py:108`); BoolRepr's lowleveltype is `Bool` and IntegerRepr
+        // shares register class with Signed/Unsigned — all `'i'` for
+        // the codewriter.
+        ValueType::Int | ValueType::Unsigned | ValueType::Bool => 'i',
         ValueType::Ref => 'r',
         ValueType::Float => 'f',
         ValueType::Void | ValueType::State | ValueType::Unknown => 'v',
@@ -2167,7 +2194,13 @@ fn value_type_to_itemsize(ty: &crate::model::ValueType) -> usize {
 
 fn value_type_to_ir_type_for_descr(ty: &crate::model::ValueType) -> majit_ir::value::Type {
     match ty {
-        crate::model::ValueType::Int => majit_ir::value::Type::Int,
+        // `getkind(BOOL_TYPE)` returns `'int'` (`lloperation.py:108`);
+        // `getkind(Unsigned) == 'int'` per `lltype.py` — descriptor IR
+        // type tracks the register class so Bool/Unsigned alias to Int
+        // rather than falling into the wildcard Ref branch.
+        crate::model::ValueType::Int
+        | crate::model::ValueType::Bool
+        | crate::model::ValueType::Unsigned => majit_ir::value::Type::Int,
         crate::model::ValueType::Float => majit_ir::value::Type::Float,
         crate::model::ValueType::Void => majit_ir::value::Type::Void,
         _ => majit_ir::value::Type::Ref,
@@ -2808,6 +2841,60 @@ fn extract_element_type_from_str(type_str: &str) -> Option<String> {
 /// RPython jtransform produces fully-qualified names like `getfield_vable_i`,
 /// `setfield_gc_r`, `int_add`. The kind suffix comes from the result type
 /// or value type of the operation.
+/// Variant of [`op_kind_to_opname`] that routes operand-kind-sensitive
+/// names through the proper RPython opname.  Specifically:
+///
+/// `OpKind::UnaryOp { op: "bool", .. }` is the truthify operator
+/// pyre's frontend emits from the `&&`/`||`/`!` desugar (the bool
+/// switch discriminator).  Upstream RPython lowers `bool` per the
+/// operand's repr at rtyper time:
+///
+/// - `IntegerRepr.rtype_bool` → `genop("int_is_true", ...)`
+///   (`rint.py:200-205`)
+/// - `PtrRepr.rtype_bool` → `genop("ptr_nonzero", ...)`
+///   (`rmodel.py::PtrRepr.rtype_bool`)
+/// - `FloatRepr.rtype_bool` → `genop("float_ne", ..., 0.0)`
+///   (`rfloat.py:191`); the `/f>i` shape comes from the float
+///   compare, but pyre's truthify uses `float_ne` against zero
+///   directly so the assembler key is `float_ne/ff>i` after the
+///   constant pool emits the 0.0.  No `bool` op survives at the
+///   `f` operand kind here today, so the float arm is a defensive
+///   placeholder.
+///
+/// The unconditional `int_<op>` prefix in [`op_kind_to_opname`]
+/// would name these `int_bool/i>i` and `int_bool/r>i`, which has no
+/// blackhole handler (RPython has no `int_bool` opname) and trips
+/// the strict-coverage `default_bh_builder_unwired_set_matches_task_85_snapshot`
+/// guard.  Routing on the operand kind here keeps the legacy/codewriter
+/// path producing handler-backed opnames without requiring a full
+/// rtyper port for every prebuilt graph.
+fn op_kind_to_opname_with_kinds(kind: &crate::model::OpKind, operand_kinds: &str) -> String {
+    use crate::model::OpKind;
+    if let OpKind::UnaryOp { op, .. } = kind
+        && op == "bool"
+    {
+        return match operand_kinds {
+            "i" => "int_is_true".into(),
+            "r" => "ptr_nonzero".into(),
+            // RPython `jtransform.py:1627 rewrite_op_float_is_true`
+            // collapses both `bool/f` and `float_is_true/f` to
+            // `float_ne(x, 0.0)` upstream of the assembler — pyre's
+            // jtransform mirror at `jtransform.rs:917-984` covers
+            // both surfaces, so an `f` operand reaching here means
+            // the rewrite was skipped.  Fail loud rather than emit
+            // a `float_is_true` opname the backend does not register
+            // (`rpython/jit/codewriter/jtransform.py:1627` is
+            // unconditional, so pyre matches that invariant here).
+            "f" => unreachable!(
+                "OpKind::UnaryOp {{ op: \"bool\", .. }} over an `f` operand must be \
+                 rewritten to float_ne in jtransform — see jtransform.rs:917"
+            ),
+            _ => format!("int_{op}"),
+        };
+    }
+    op_kind_to_opname(kind)
+}
+
 fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
     use crate::model::OpKind;
     match kind {
@@ -2815,6 +2902,10 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         // RPython: ConstInt is NOT a standalone op; see encode_op comment.
         // Pyre materialises constants as an int_copy from pool-region reg.
         OpKind::ConstInt(_) => "int_copy".into(),
+        // RPython folds `lltype.Bool` into kind `'int'`
+        // (`flatten.py:getkind`), so the bool constant materialises
+        // through the same `int_copy` path as `ConstInt`.
+        OpKind::ConstBool(_) => "int_copy".into(),
         // Mirrors `ConstInt` — the constant is materialised through the
         // shared `constants_f` pool, then a `float_copy` op moves it into
         // the SSA destination register.
@@ -2904,8 +2995,23 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         // pyre's front-end uses Rust's `syn::UnOp::Not` spelling `not` for
         // both logical-not and bitwise-not (they share the `!` token at the
         // AST level); canonicalize to `int_invert` at the emission boundary.
+        //
+        // `bool` (truthify) lacks per-operand-kind dispatch here — see
+        // [`op_kind_to_opname_with_kinds`] which routes `bool` to
+        // `int_is_true` / `ptr_nonzero` / `float_ne` based on the
+        // operand's actual register-class.
         OpKind::UnaryOp { op, .. } => match op.as_str() {
             "not" => "int_invert".into(),
+            // Already-canonical opnames produced by the rtyper / cast
+            // family / jtransform rewrites — preserve as-is so the
+            // unconditional `int_` prefix below does not double up
+            // (`int_is_true` would otherwise become `int_int_is_true`,
+            // which has no blackhole handler).  RPython's
+            // `rint.py:rtype_int__Bool` emits `int_is_true` directly,
+            // and `ptr_nonzero` / `same_as` / cast_* are similarly
+            // already-canonical.
+            "int_is_true" | "ptr_nonzero" | "same_as" => op.clone(),
+            s if s.starts_with("int_") || s.starts_with("uint_") => op.clone(),
             s if s.starts_with("float_") || s.starts_with("cast_") => op.clone(),
             _ => format!("int_{op}"),
         },
@@ -3670,167 +3776,6 @@ mod tests {
         assert_eq!(body.c_num_regs_f as usize, 0);
     }
 
-    #[test]
-    fn assemble_direct_residual_call_encodes_leading_funcptr_operand() {
-        use crate::call::CallControl;
-        use crate::jtransform::{GraphTransformConfig, Transformer};
-        use crate::model::{FunctionGraph, OpKind, ValueType};
-        use crate::translate_legacy::annotator::annrpython::annotate;
-        use crate::translate_legacy::rtyper::rtyper::resolve_types;
-
-        let mut cc = CallControl::new();
-        let mut graph = FunctionGraph::new("caller");
-        let arg = graph
-            .push_op(
-                graph.startblock,
-                OpKind::Input {
-                    name: "arg".into(),
-                    ty: ValueType::Ref,
-                },
-                true,
-            )
-            .unwrap();
-        graph.push_op(
-            graph.startblock,
-            OpKind::Call {
-                target: crate::model::CallTarget::function_path(["custom_reader"]),
-                args: vec![arg],
-                result_ty: ValueType::Ref,
-            },
-            true,
-        );
-        graph.set_return(graph.startblock, None);
-
-        let annotations = annotate(&graph);
-        let type_state = resolve_types(&graph, &annotations);
-        let config = GraphTransformConfig::default();
-        let mut transformer = Transformer::new(&config)
-            .with_callcontrol(&mut cc)
-            .with_type_state(&type_state);
-        let rewritten = transformer.transform(&graph);
-        let rewritten_types = resolve_types(&rewritten.graph, &annotations);
-        let value_kinds = crate::jit_codewriter::type_state::build_value_kinds(&rewritten_types);
-        let regallocs = regalloc::perform_all_register_allocations(&rewritten.graph, &value_kinds);
-        let mut flat =
-            crate::flatten::flatten_with_types(&rewritten.graph, &rewritten_types, &regallocs);
-
-        let mut asm = Assembler::new();
-        let _ = asm.assemble(&mut flat, &regallocs);
-
-        // RPython jtransform.py:422-431 canonical order:
-        // `residual_call_r_r/iRd>r` (funcptr, R-list, descr, >result).
-        assert!(
-            asm.insns.contains_key("residual_call_r_r/iRd>r"),
-            "expected funcptr-first residual_call key, got {:?}",
-            asm.insns.keys().collect::<Vec<_>>()
-        );
-    }
-
-    /// Boundary test (plan Rev 2 Phase E
-    /// `no_legacy_funcptr_from_vtable_after_new_pipeline`): after the
-    /// rtyper-equivalent `lower_indirect_calls` pass + jtransform +
-    /// assemble, no `funcptr_from_vtable/*` opcode key may survive.
-    /// The RPython-orthodox replacement is `vtable_method_ptr/rd>i`
-    /// emitted by `OpKind::VtableMethodPtr`
-    /// (`translator/rtyper/rclass.rs::class_get_method_ptr` ↔
-    /// `rpython/rtyper/rclass.py:371-377` + `rpython/rtyper/rpbc.py:1203-1205`).
-    /// `OpKind::FuncptrFromVtable` has been deleted from the enum
-    /// (Phase D compile-time guarantee); this test adds a runtime
-    /// guarantee at the assembled-opname level.
-    #[test]
-    fn no_legacy_funcptr_from_vtable_after_new_pipeline() {
-        use crate::call::CallControl;
-        use crate::jtransform::{GraphTransformConfig, Transformer};
-        use crate::model::{CallTarget, FunctionGraph, OpKind, ValueType};
-        use crate::translate_legacy::annotator::annrpython::annotate;
-        use crate::translate_legacy::rtyper::rtyper::resolve_types;
-        use crate::translator::rtyper::rpbc::lower_indirect_calls;
-
-        fn build_run_impl(name: &str) -> FunctionGraph {
-            let mut g = FunctionGraph::new(name);
-            g.push_op(
-                g.startblock,
-                OpKind::Input {
-                    name: "self".into(),
-                    ty: ValueType::Ref,
-                },
-                true,
-            )
-            .unwrap();
-            g.set_return(g.startblock, None);
-            g
-        }
-
-        let mut cc = CallControl::new();
-        cc.register_trait_method("run", Some("Handler"), "A", build_run_impl("A::run"));
-        cc.register_trait_method("run", Some("Handler"), "B", build_run_impl("B::run"));
-        cc.find_all_graphs_for_tests();
-
-        let mut graph = FunctionGraph::new("outer");
-        let receiver = graph
-            .push_op(
-                graph.startblock,
-                OpKind::Input {
-                    name: "handler".into(),
-                    ty: ValueType::Unknown,
-                },
-                true,
-            )
-            .unwrap();
-        // Per RPython `flatten.py:373-380` `serialize_op` — an op whose
-        // result has `getkind(concretetype) == 'void'` does not get a
-        // color lookup.  Mirror that here by passing `has_result=false`
-        // so no `ValueId` is allocated on the void `run()` return.
-        graph.push_op(
-            graph.startblock,
-            OpKind::Call {
-                target: CallTarget::indirect("Handler", "run"),
-                args: vec![receiver],
-                result_ty: ValueType::Void,
-            },
-            false,
-        );
-        graph.set_return(graph.startblock, None);
-
-        let annotations = annotate(&graph);
-        let mut type_state = resolve_types(&graph, &annotations);
-        lower_indirect_calls(&mut graph, &mut type_state, &cc);
-
-        let config = GraphTransformConfig::default();
-        let mut transformer = Transformer::new(&config)
-            .with_callcontrol(&mut cc)
-            .with_type_state(&type_state);
-        let rewritten = transformer.transform(&graph);
-        let rewritten_types = resolve_types(&rewritten.graph, &annotations);
-        let value_kinds = crate::jit_codewriter::type_state::build_value_kinds(&rewritten_types);
-        let regallocs = regalloc::perform_all_register_allocations(&rewritten.graph, &value_kinds);
-        let mut flat =
-            crate::flatten::flatten_with_types(&rewritten.graph, &rewritten_types, &regallocs);
-
-        let mut asm = Assembler::new();
-        let _ = asm.assemble(&mut flat, &regallocs);
-
-        let legacy_keys: Vec<&String> = asm
-            .insns
-            .keys()
-            .filter(|k| k.starts_with("funcptr_from_vtable"))
-            .collect();
-        assert!(
-            legacy_keys.is_empty(),
-            "legacy funcptr_from_vtable opname survived after the new \
-             lower_indirect_calls + jtransform + assemble pipeline: {:?}",
-            legacy_keys,
-        );
-
-        let has_vtable_method_ptr = asm.insns.keys().any(|k| k.starts_with("vtable_method_ptr"));
-        assert!(
-            has_vtable_method_ptr,
-            "expected vtable_method_ptr opname from OpKind::VtableMethodPtr, \
-             insns keys: {:?}",
-            asm.insns.keys().collect::<Vec<_>>(),
-        );
-    }
-
     /// `OpKind::RecordQuasiImmutField` must lower to a single opcode
     /// keyed `record_quasiimmut_field/rdd`, with the field+mutate
     /// FieldDescriptor pair pushed as two `BhDescr::Field` entries — see
@@ -4181,147 +4126,6 @@ mod tests {
         assert!(
             !asm.insns.contains_key("getarrayitem_gc_v/ird>i"),
             "unexpected getarrayitem_gc_v/ird>i key: {:?}",
-            asm.insns.keys().collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn assemble_vable_access_uses_explicit_base_argcodes() {
-        use crate::flatten::flatten as flatten_graph;
-        use crate::model::{FunctionGraph, OpKind, ValueType};
-
-        let mut graph = FunctionGraph::new("vable_access");
-        let base = graph
-            .push_op(
-                graph.startblock,
-                OpKind::Input {
-                    name: "frame".into(),
-                    ty: ValueType::Ref,
-                },
-                true,
-            )
-            .unwrap();
-        let index = graph
-            .push_op(
-                graph.startblock,
-                OpKind::Input {
-                    name: "i".into(),
-                    ty: ValueType::Int,
-                },
-                true,
-            )
-            .unwrap();
-        let value = graph
-            .push_op(
-                graph.startblock,
-                OpKind::Input {
-                    name: "v".into(),
-                    ty: ValueType::Int,
-                },
-                true,
-            )
-            .unwrap();
-        let _field_result = graph.push_op(
-            graph.startblock,
-            OpKind::VableFieldRead {
-                base,
-                field_index: 0,
-                ty: ValueType::Int,
-            },
-            true,
-        );
-        graph.push_op(
-            graph.startblock,
-            OpKind::VableFieldWrite {
-                base,
-                field_index: 0,
-                value,
-                ty: ValueType::Int,
-            },
-            false,
-        );
-        let array_result = graph
-            .push_op(
-                graph.startblock,
-                OpKind::VableArrayRead {
-                    base,
-                    array_index: 1,
-                    elem_index: index,
-                    item_ty: ValueType::Int,
-                    array_itemsize: 8,
-                    array_is_signed: true,
-                },
-                true,
-            )
-            .unwrap();
-        graph.push_op(
-            graph.startblock,
-            OpKind::VableArrayWrite {
-                base,
-                array_index: 1,
-                elem_index: index,
-                value,
-                item_ty: ValueType::Int,
-                array_itemsize: 8,
-                array_is_signed: true,
-            },
-            false,
-        );
-        graph.set_return(graph.startblock, Some(array_result));
-
-        // Drive the type pipeline end-to-end so every reachable value
-        // receives a concrete class.  `resolve_types` backfills any
-        // orphan ValueId (return/except block pseudo-args, link-only
-        // values) with `GcRef` so the assembler's
-        // `lookup_reg_with_kind` never hits the missing-coloring
-        // panic path for this hand-built graph.
-        let annotations = crate::translate_legacy::annotator::annrpython::annotate(&graph);
-        let type_state =
-            crate::translate_legacy::rtyper::rtyper::resolve_types(&graph, &annotations);
-        let value_kinds = crate::jit_codewriter::type_state::build_value_kinds(&type_state);
-        let regallocs = regalloc::perform_all_register_allocations(&graph, &value_kinds);
-        let mut flat = flatten_graph(&graph, &regallocs);
-        // Slice C-3: seed `SSARepr.value_kinds` (left empty by
-        // `flatten_graph`) so `lookup_coloring` finds the
-        // authoritative kind for every operand.
-        flat.value_kinds = value_kinds.clone();
-
-        let mut asm = Assembler::new();
-        let _ = asm.assemble(&mut flat, &regallocs);
-
-        assert!(
-            asm.insns.contains_key("getfield_vable_i/rd>i"),
-            "expected canonical getfield_vable_i key, got {:?}",
-            asm.insns.keys().collect::<Vec<_>>()
-        );
-        assert!(
-            asm.insns.contains_key("setfield_vable_i/rid"),
-            "expected canonical setfield_vable_i key, got {:?}",
-            asm.insns.keys().collect::<Vec<_>>()
-        );
-        assert!(
-            asm.insns.contains_key("getarrayitem_vable_i/ridd>i"),
-            "expected canonical getarrayitem_vable_i key, got {:?}",
-            asm.insns.keys().collect::<Vec<_>>()
-        );
-        assert!(
-            asm.insns.contains_key("setarrayitem_vable_i/riidd"),
-            "expected canonical setarrayitem_vable_i key, got {:?}",
-            asm.insns.keys().collect::<Vec<_>>()
-        );
-        assert!(
-            !asm.insns.contains_key("getfield_vable_v/d>i"),
-            "unexpected getfield_vable_v/d>i key: {:?}",
-            asm.insns.keys().collect::<Vec<_>>()
-        );
-        assert!(
-            !asm.insns.contains_key("setfield_vable_v/id"),
-            "unexpected setfield_vable_v/id key: {:?}",
-            asm.insns.keys().collect::<Vec<_>>()
-        );
-        assert!(
-            !asm.insns.contains_key("setfield_vable_v/rd"),
-            "unexpected setfield_vable_v/rd key: {:?}",
             asm.insns.keys().collect::<Vec<_>>()
         );
     }

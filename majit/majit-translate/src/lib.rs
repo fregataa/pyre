@@ -2,9 +2,12 @@
 //!
 //! Upstream counterparts:
 //! - `jit_codewriter/` ← `rpython/jit/codewriter/`
-//! - `translate_legacy/` — pre-roadmap ad-hoc annotator+rtyper, deleted at P8.11
-//! - `flowspace/`, `annotator/`, `rtyper/`, `translator/` — future line-by-line
+//! - `flowspace/`, `annotator/`, `rtyper/`, `translator/` — line-by-line
 //!   ports of `rpython/{flowspace,annotator,rtyper,translator}/`
+//! - `translator/rtyper/legacy_{annotator,resolve,pipeline}.rs` —
+//!   transitional pyre-only adapters with no upstream counterpart;
+//!   slated for retirement once Skip categories close
+//!   (see [`crate::translator::rtyper::cutover`])
 //!
 //! Everything under one crate because upstream has circular imports
 //! (flowspace/operation.py ↔ annotator, annotator/annrpython.py ↔
@@ -37,19 +40,12 @@ mod parse;
 pub mod pipeline;
 #[cfg(test)]
 mod test_support;
-// Phase 0 P1 (roadmap: line-by-line port of rpython/{flowspace,annotator,rtyper}):
-// `translator/` renamed to `translate_legacy/` because this tree is the
-// pre-roadmap ad-hoc majit implementation, not a line-by-line port of
-// `rpython/translator/`. The identifier `translator` is reserved for that
-// future port; legacy consumers must spell `translate_legacy::…`
-// explicitly. The legacy tree is deleted at roadmap commit P8.11.
-pub mod translate_legacy;
-
-// `translator/` is the non-LEGACY home for RPython-orthodox port files —
-// see `translator/mod.rs` for the contract. Currently hosts
+// `translator/` is the RPython-orthodox port home — see
+// `translator/mod.rs` for the contract.  Currently hosts
 // `translator/rtyper/{rclass.rs, rpbc.rs}`, the `rpython/rtyper/` 1:1
-// port. The matching `TypeResolutionState` infra still lives under
-// `translator_legacy/rtyper/rtyper.rs` until majit-rtyper Phase 6.
+// port, alongside the transitional `legacy_{annotator,resolve,pipeline}.rs`
+// adapters that the cutover (`translator/rtyper/cutover.rs`) consumes
+// until the real-rtyper path types every production graph end-to-end.
 pub mod translator;
 
 pub use call::{CallDescriptor, StructFieldLayout, StructLayout};
@@ -76,15 +72,15 @@ pub use parse::{
     parse_source,
 };
 pub use pipeline::{PipelineConfig, PipelineResult, PortalSpec, ProgramPipelineResult};
-pub use translate_legacy::annotator::annrpython::annotate as annotate_graph;
-pub use translate_legacy::pipeline::{analyze_function, analyze_program};
-pub use translate_legacy::rtyper::rtyper::resolve_types;
 
 use serde::{Deserialize, Serialize};
 
-use crate::translate_legacy::{
-    annotator::annrpython as annotate, pipeline as legacy_pipeline, rtyper::rtyper as rtype,
-};
+#[cfg(test)]
+use crate::translator::rtyper::legacy_annotator as annotate;
+#[cfg(test)]
+use crate::translator::rtyper::legacy_pipeline;
+#[cfg(test)]
+use crate::translator::rtyper::legacy_resolve as rtype;
 
 /// Configuration for the canonical graph/pipeline analyzer.
 ///
@@ -320,15 +316,6 @@ fn analyze_pipeline_from_parsed(
     // a graph.
     let program = front::build_semantic_program_from_parsed_files(parsed_files)
         .expect("pyre-interpreter source must lower without FlowingError");
-    // legacy_pipeline::analyze_program is now invoked after
-    // `call_control.find_all_graphs` so the BFS-from-portal candidate
-    // set drives the per-function annotate → rtype → jtransform →
-    // flatten chain.  RPython parity: `annrpython.py:215
-    // schedule_pending` walks pending blocks reachable from the
-    // entry-point closure; unreachable helpers stay outside the
-    // translator and never trip the strict-typing assertions the JIT
-    // path enforces.  See the
-    // `legacy_pipeline::analyze_program_filtered` call site below.
     let mut canonical_trait_impls = Vec::new();
     let mut canonical_inherent_methods = Vec::new();
     let mut canonical_function_graphs = std::collections::HashMap::new();
@@ -760,20 +747,21 @@ fn analyze_pipeline_from_parsed(
     let mut policy = policy::DefaultJitPolicy::new();
     call_control.find_all_graphs(&mut policy);
 
-    // RPython parity: `RPythonAnnotator.build_types(entry_point, args)`
-    // only analyses functions reachable from the entry-point closure.
-    // Pyre's legacy whole-program iteration ran annotate / rtype /
-    // jtransform / flatten on every parsed function, including
-    // runtime-only resume helpers (`materialize_virtual_from_rd`,
-    // `replay_pending_fields`) the JIT never traces.  Filtering by
-    // `call_control.is_candidate` mirrors annrpython's BFS-from-entry
-    // shape so unreachable helpers stay outside the analyser the same
-    // way `annotator/translator/translator.py:55 buildflowgraph`
-    // skips them upstream.
-    let mut pipeline =
-        legacy_pipeline::analyze_program_filtered(&program.functions, &config.pipeline, |func| {
-            function_is_candidate_for_analysis(func, &call_control)
-        });
+    // The canonical jitcode emitter below is the production analysis
+    // path; `ProgramPipelineResult.functions` / `total_*` are populated
+    // only with their default values because every consumer reads
+    // `opcode_dispatch` / `jitcodes` / `insns` / `descrs` instead.
+    let mut pipeline = pipeline::ProgramPipelineResult {
+        functions: Vec::new(),
+        opcode_dispatch: Vec::new(),
+        jitcodes: Vec::new(),
+        jitcodes_by_path: std::collections::HashMap::new(),
+        insns: std::collections::HashMap::new(),
+        descrs: Vec::new(),
+        total_blocks: 0,
+        total_ops: 0,
+        total_vable_rewrites: 0,
+    };
 
     let (opcode_dispatch, jitcodes, insns, descrs) = build_canonical_opcode_dispatch(
         parsed_files,
@@ -794,42 +782,6 @@ fn analyze_pipeline_from_parsed(
     pipeline.descrs = descrs;
 
     pipeline
-}
-
-/// Decide whether `func` falls inside the BFS-from-portal closure that
-/// the canonical jitcode emitter consumes.  RPython's
-/// `RPythonAnnotator.build_types` schedules pending graphs from
-/// `entry_point` outwards via `annrpython.py:215 schedule_pending`;
-/// pyre mirrors that closure with `call_control.candidate_graphs`,
-/// populated by `find_all_graphs_bfs`.  We probe both unprefixed and
-/// `crate::`-prefixed forms because `register_function_graph` records
-/// free functions under both keys (see the `for func in
-/// &program.functions` loop earlier in this function).  Impl methods
-/// surface as `(self_ty_root, method_name)` paths via
-/// `canonical_trait_impls` registration; the same two-segment lookup
-/// covers both inherent and trait impls.
-fn function_is_candidate_for_analysis(
-    func: &front::SemanticFunction,
-    call_control: &call::CallControl,
-) -> bool {
-    if let Some(ref owner) = func.self_ty_root {
-        let path = parse::CallPath::from_segments([owner.as_str(), func.name.as_str()]);
-        if call_control.is_candidate(&path) {
-            return true;
-        }
-        let crate_path =
-            parse::CallPath::from_segments(["crate", owner.as_str(), func.name.as_str()]);
-        return call_control.is_candidate(&crate_path);
-    }
-    let segments: Vec<&str> = func.name.split("::").collect();
-    let path = parse::CallPath::from_segments(segments.iter().copied());
-    if call_control.is_candidate(&path) {
-        return true;
-    }
-    let mut crate_segs = vec!["crate"];
-    crate_segs.extend(segments.iter().copied());
-    let crate_path = parse::CallPath::from_segments(crate_segs);
-    call_control.is_candidate(&crate_path)
 }
 
 /// Build opcode dispatch arms and produce JitCodes for discovered callee graphs.
@@ -902,10 +854,13 @@ fn build_canonical_opcode_dispatch(
     // and a synthetic `CallPath::["__opcode_dispatch__", "<selector>#<arm_id>"]`
     // which decouples display label (selector) from identity (path/index).
     //
-    // The parser-level `flattened` field is computed eagerly here so existing
-    // snapshot tests / debug dumps keep working. The orthodox pipeline inside
-    // `drain_pending_graphs` will recompute its own SSARepr+JitCode below
-    // and place the result at `jitcodes[entry_jitcode_index]`.
+    // `arm.flattened` is set after `drain_pending_graphs` from the
+    // assembled jitcode's `body._ssarepr`; the previous eager
+    // dual_gate→lower_indirect_calls→jtransform→resolve_rewritten_types→
+    // regalloc→flatten chain at this site duplicated the work that
+    // `transform_graph_to_jitcode` does inside the drain loop, so we
+    // register the arm bodies here and let the canonical pipeline
+    // produce the SSARepr we then read back below.
     let mut dispatch: Vec<opcode_dispatch::PipelineOpcodeArm> =
         Vec::with_capacity(opcode_arms.len());
     let mut dispatch_paths: Vec<Option<parse::CallPath>> = Vec::with_capacity(opcode_arms.len());
@@ -917,39 +872,6 @@ fn build_canonical_opcode_dispatch(
             function_graphs,
             &receiver_traits,
         );
-
-        // Parser-level flatten — kept for snapshot tests / debug.
-        let flattened = arm.body_graph.as_ref().map(|handler_graph| {
-            let annotations = annotate::annotate(handler_graph);
-            let mut type_state = rtype::resolve_types(handler_graph, &annotations);
-            // Run the rtyper-equivalent indirect_call lowering before
-            // jtransform so this snapshot path matches the canonical
-            // codewriter pipeline (post-rtyper graph has no
-            // `CallTarget::Indirect`). RPython rpbc.py:199-217.
-            let mut handler_graph_owned = handler_graph.clone();
-            crate::translator::rtyper::rpbc::lower_indirect_calls(
-                &mut handler_graph_owned,
-                &mut type_state,
-                &mut *call_control,
-            );
-            #[cfg(debug_assertions)]
-            crate::translator::rtyper::rpbc::assert_no_indirect_call_targets(&handler_graph_owned);
-            let mut transformer = jtransform::Transformer::new(&pipeline_config.transform)
-                .with_callcontrol(&mut *call_control)
-                .with_type_state(&type_state);
-            let rewritten = transformer.transform(&handler_graph_owned);
-            let rewritten_type_state = rtype::resolve_rewritten_types(
-                &type_state,
-                &rewritten.graph,
-                &annotations,
-                &rewritten.synth_kinds,
-            );
-            let value_kinds =
-                crate::jit_codewriter::type_state::build_value_kinds(&rewritten_type_state);
-            let regallocs =
-                crate::regalloc::perform_all_register_allocations(&rewritten.graph, &value_kinds);
-            flatten::flatten_with_types(&rewritten.graph, &rewritten_type_state, &regallocs)
-        });
 
         // Register the arm body in CallControl. RPython call.py:155-172
         // `get_jitcode(graph)` returns the callee object; the final
@@ -965,7 +887,7 @@ fn build_canonical_opcode_dispatch(
             arm_id,
             selector: arm.selector,
             entry_jitcode_index: None,
-            flattened,
+            flattened: None,
         });
         dispatch_paths.push(entry_jitcode_path);
     }
@@ -990,6 +912,7 @@ fn build_canonical_opcode_dispatch(
                 .jitcode_handle(&path)
                 .expect("opcode arm jitcode handle must exist after registration");
             arm.entry_jitcode_index = Some(jitcode.index());
+            arm.flattened = jitcode.try_body().and_then(|body| body._ssarepr.clone());
         }
     }
 
@@ -1346,16 +1269,24 @@ mod tests {
             &source_refs,
             &crate::test_support::pyre_analyze_config(),
         );
-        let empty_sf = crate::front::StructFieldRegistry::default();
-        let empty_frt = std::collections::HashMap::new();
+        // Walker-populated metadata mirrors the production
+        // `analyze_pipeline_from_parsed` path: `extract_trait_impls`
+        // lowers method bodies against this registry so the
+        // `expr_unary_not_operand_kind` classifier can resolve
+        // cross-module bool calls. Empty registries previously masked
+        // unsupported `!x` patterns through the UNARY_NOT bool-fork
+        // fall-through; with the fail-loud restoration, the test
+        // fixture must populate the registries the same way production
+        // does.
+        let metadata = crate::front::ast::collect_program_metadata_pub(&parsed_files);
         let trait_impls: Vec<_> = parsed_files
             .iter()
             .flat_map(|p| {
                 parse::extract_trait_impls(
                     p,
-                    &empty_sf,
-                    &empty_frt,
-                    &std::collections::HashSet::new(),
+                    &metadata.struct_fields,
+                    &metadata.fn_return_types,
+                    &metadata.known_struct_names,
                 )
                 .expect("trait impls must lower")
             })
@@ -1624,7 +1555,7 @@ mod tests {
         );
 
         // Step 3: flatten the rewritten graph
-        let types = resolve_types(&result.graph, &annotate_graph(&result.graph));
+        let types = rtype::resolve_types(&result.graph, &annotate::annotate(&result.graph));
         let value_kinds = crate::jit_codewriter::type_state::build_value_kinds(&types);
         let regallocs =
             crate::regalloc::perform_all_register_allocations(&result.graph, &value_kinds);
@@ -1649,7 +1580,7 @@ mod tests {
         let program = front::build_semantic_program(&parsed).expect("pyopcode.rs must lower");
 
         let config = PipelineConfig::default();
-        let result = analyze_program(&program, &config);
+        let result = legacy_pipeline::analyze_program(&program, &config);
 
         eprintln!("=== Graph Pipeline on pyre-interpreter ===");
         eprintln!("Functions analyzed: {}", result.functions.len());
@@ -1683,14 +1614,15 @@ mod tests {
         let source = read_pyre_file("pyre-interpreter/src/pyopcode.rs");
         let graph_result = analyze_pipeline(&source);
 
-        // Graph pipeline should analyze functions
-        assert!(graph_result.functions.len() >= 5);
-
-        eprintln!(
-            "analyze_pipeline: graph {} functions / {} blocks / {} ops",
-            graph_result.functions.len(),
-            graph_result.total_blocks,
-            graph_result.total_ops,
+        // Canonical pipeline should produce per-opcode dispatch arms.
+        assert!(
+            graph_result.opcode_dispatch.len() >= 5,
+            "expected >=5 opcode dispatch arms, got {}",
+            graph_result.opcode_dispatch.len(),
+        );
+        assert!(
+            !graph_result.jitcodes.is_empty(),
+            "canonical pipeline should produce jitcodes"
         );
     }
 
@@ -1810,10 +1742,6 @@ mod tests {
             .find(|arm| arm.selector.canonical_key() == "Instruction::LoadFast")
             .expect("canonical LoadFast opcode arm");
         assert!(
-            result.total_vable_rewrites > 0,
-            "graph pipeline should perform vable rewrites"
-        );
-        assert!(
             canonical_load_fast.flattened.is_some(),
             "canonical LoadFast should be flattened"
         );
@@ -1917,8 +1845,12 @@ mod tests {
         )
         .expect("inherent methods must lower");
         let mut function_graphs = std::collections::HashMap::new();
-        parse::collect_function_graphs(&parsed, &mut function_graphs)
-            .expect("free functions must lower");
+        parse::collect_function_graphs(
+            &parsed,
+            &crate::front::ast::collect_program_metadata_pub(std::slice::from_ref(&parsed)),
+            &mut function_graphs,
+        )
+        .expect("free functions must lower");
         let receiver_traits = parse::extract_opcode_dispatch_receiver_traits(&parsed);
         let arms = parse::extract_opcode_dispatch_arms(&parsed);
         let resolved = resolve_handler_calls(
@@ -1983,8 +1915,12 @@ mod tests {
         )
         .expect("inherent methods must lower");
         let mut function_graphs = std::collections::HashMap::new();
-        parse::collect_function_graphs(&parsed, &mut function_graphs)
-            .expect("free functions must lower");
+        parse::collect_function_graphs(
+            &parsed,
+            &crate::front::ast::collect_program_metadata_pub(std::slice::from_ref(&parsed)),
+            &mut function_graphs,
+        )
+        .expect("free functions must lower");
         let receiver_traits = parse::extract_opcode_dispatch_receiver_traits(&parsed);
         let arms = parse::extract_opcode_dispatch_arms(&parsed);
         let resolved = resolve_handler_calls(
@@ -2037,8 +1973,12 @@ mod tests {
         )
         .expect("inherent methods must lower");
         let mut function_graphs = std::collections::HashMap::new();
-        parse::collect_function_graphs(&parsed, &mut function_graphs)
-            .expect("free functions must lower");
+        parse::collect_function_graphs(
+            &parsed,
+            &crate::front::ast::collect_program_metadata_pub(std::slice::from_ref(&parsed)),
+            &mut function_graphs,
+        )
+        .expect("free functions must lower");
         let receiver_traits = parse::extract_opcode_dispatch_receiver_traits(&parsed);
         let arms = parse::extract_opcode_dispatch_arms(&parsed);
         let resolved = resolve_handler_calls(
@@ -2098,8 +2038,12 @@ mod tests {
         )
         .expect("inherent methods must lower");
         let mut function_graphs = std::collections::HashMap::new();
-        parse::collect_function_graphs(&parsed, &mut function_graphs)
-            .expect("free functions must lower");
+        parse::collect_function_graphs(
+            &parsed,
+            &crate::front::ast::collect_program_metadata_pub(std::slice::from_ref(&parsed)),
+            &mut function_graphs,
+        )
+        .expect("free functions must lower");
         let receiver_traits = parse::extract_opcode_dispatch_receiver_traits(&parsed);
         let arms = parse::extract_opcode_dispatch_arms(&parsed);
         let resolved = resolve_handler_calls(
@@ -2186,23 +2130,22 @@ mod tests {
         // Build CallControl from parsed sources
         let mut call_control = call::CallControl::new();
         let mut function_graphs = std::collections::HashMap::new();
+        let metadata = crate::front::ast::collect_program_metadata_pub(&parsed_files);
         for parsed in &parsed_files {
-            parse::collect_function_graphs(parsed, &mut function_graphs)
+            parse::collect_function_graphs(parsed, &metadata, &mut function_graphs)
                 .expect("collect_function_graphs: FlowingError must propagate");
         }
         for (path, graph) in &function_graphs {
             call_control.register_function_graph(path.clone(), graph.clone());
         }
-        let empty_sf2 = crate::front::StructFieldRegistry::default();
-        let empty_frt2 = std::collections::HashMap::new();
         let trait_impls: Vec<TraitImplInfo> = parsed_files
             .iter()
             .flat_map(|p| {
                 parse::extract_trait_impls(
                     p,
-                    &empty_sf2,
-                    &empty_frt2,
-                    &std::collections::HashSet::new(),
+                    &metadata.struct_fields,
+                    &metadata.fn_return_types,
+                    &metadata.known_struct_names,
                 )
                 .expect("trait impls must lower")
             })

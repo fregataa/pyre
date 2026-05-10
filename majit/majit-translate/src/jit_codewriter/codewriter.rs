@@ -20,6 +20,7 @@ use std::sync::Arc;
 use crate::assembler::Assembler;
 use crate::call::CallControl;
 use crate::flatten::{RegKind, SSARepr, flatten_with_types};
+use crate::jit_codewriter::type_state::TypeResolutionState;
 use crate::jitcode::JitCode;
 use crate::jtransform::GraphTransformConfig;
 use crate::model::{FunctionGraph, ValueId};
@@ -74,6 +75,15 @@ pub struct CodeWriter {
     pub assembler: Assembler,
     /// RPython: `self.debug = True` (codewriter.py:18).
     pub debug: bool,
+    /// Slice 6 — lazy program-wide `PyreCallRegistry` for the
+    /// PYRE_RTYPER dual-gate (cf. `transform_graph_to_jitcode`).
+    /// Built on first use from `callcontrol.function_graphs()` and
+    /// reused across every dual-gated graph in the same CodeWriter
+    /// run, mirroring upstream `Bookkeeper.descs` lifecycle (one
+    /// descs map per `Translator` driving an `RPythonAnnotator`).
+    real_rtyper_registry: std::cell::RefCell<
+        Option<std::rc::Rc<crate::translator::rtyper::pyre_call_registry::PyreCallRegistry>>,
+    >,
 }
 
 impl CodeWriter {
@@ -88,7 +98,64 @@ impl CodeWriter {
         Self {
             assembler: Assembler::new(),
             debug: true,
+            real_rtyper_registry: std::cell::RefCell::new(None),
         }
+    }
+
+    /// Get-or-build the program-wide `PyreCallRegistry` for the
+    /// PYRE_RTYPER dual-gate.  Builds once per CodeWriter run and
+    /// caches; subsequent calls reuse the same `Rc`.  The registry
+    /// is populated from `callcontrol.function_graphs()` — pyre's
+    /// program-wide graph map, the production analog of
+    /// `SemanticProgram.functions`.
+    fn dual_gate_registry(
+        &self,
+        callcontrol: &CallControl,
+    ) -> std::rc::Rc<crate::translator::rtyper::pyre_call_registry::PyreCallRegistry> {
+        if let Some(existing) = self.real_rtyper_registry.borrow().as_ref() {
+            return existing.clone();
+        }
+        let registry = std::rc::Rc::new(
+            crate::translator::rtyper::pyre_call_registry::PyreCallRegistry::new(std::rc::Rc::new(
+                crate::annotator::bookkeeper::Bookkeeper::new(),
+            )),
+        );
+        // PyPy's `Bookkeeper.compute_at_fixpoint` raises through to
+        // the caller (`bookkeeper.py:108-127`); pyre's dual-gate
+        // mirrors that propagation by routing the populate `TyperError`
+        // through `is_known_unported`.  Known-unported categories
+        // leave a partial registry (the per-graph dual-gate will
+        // Skip-classify the affected callsites via the cascade
+        // `"not registered in PyreCallRegistry"`).  Unknown errors
+        // panic immediately so parity bugs surface here rather than
+        // silently shifting downstream behind a Skip mask.
+        let populate_result =
+            crate::translator::rtyper::cutover::populate_call_registry_from_call_graphs(
+                callcontrol.function_graphs(),
+                &registry,
+            );
+        if let Err(err) = populate_result {
+            let msg = format!("{err}");
+            if !crate::translator::rtyper::cutover::is_known_unported(&msg) {
+                panic!("populate_call_registry_from_call_graphs failed: {msg}");
+            }
+        }
+        // RPython parity: `Translator.buildannotator()` /
+        // `Translator.buildrtyper()` (`translator.py:69-83`) construct
+        // exactly one annotator and one rtyper per Translator and assert
+        // on re-entry.  Pyre mirrors that contract through
+        // [`PyreCallRegistry::ensure_session`]
+        // (`pyre_call_registry.rs:210-234`), which lazily builds a single
+        // `(RPythonAnnotator, RPythonTyper)` pair on first use and
+        // returns the cached pair on every subsequent
+        // `specialize_legacy_graph_with_registry_seed` call.  The
+        // registry itself is cached on the `CodeWriter`
+        // (`real_rtyper_registry`), so all per-graph subjects of one
+        // CodeWriter share the same annotator + rtyper, matching
+        // upstream's "one annotator + one rtyper per Translator"
+        // semantics.
+        *self.real_rtyper_registry.borrow_mut() = Some(registry.clone());
+        registry
     }
 
     /// RPython: `CodeWriter.transform_graph_to_jitcode()` (codewriter.py:33-72).
@@ -114,6 +181,71 @@ impl CodeWriter {
     ///   5. `jitcode.index = index` (codewriter.py:68)
     ///   6. `if self.debug: self.print_ssa_repr(ssarepr, portal_jd, verbose)`
     ///      (codewriter.py:71-72)
+    /// Slice 12.2 / 12.4 — shared dual-gate type-resolve entry.
+    ///
+    /// Runs [`dual_gate_check_with_registry`] against the
+    /// program-wide `PyreCallRegistry`; on Match the real path's
+    /// `TypeResolutionState` is returned directly, on Skip the
+    /// legacy walker (`legacy_annotator::annotate` +
+    /// `legacy_resolve::resolve_types`) computes the fallback so the
+    /// non-portal jitcodes that didn't pass the real path still get a
+    /// sound type state.
+    ///
+    /// `diag_label` is appended to the optional Skip log line and the
+    /// real-path panic message; production callers pass
+    /// `path.canonical_key()`-style identification, the lib.rs
+    /// debug-snapshot path passes `graph.name`.
+    pub fn dual_gate_type_state(
+        &mut self,
+        graph: &FunctionGraph,
+        callcontrol: &mut CallControl,
+        diag_label: &str,
+    ) -> TypeResolutionState {
+        let dual_gate_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let registry = self.dual_gate_registry(callcontrol);
+            crate::translator::rtyper::cutover::dual_gate_check_with_registry(graph, &registry)
+        }));
+        let outcome = match dual_gate_outcome {
+            Ok(result) => result,
+            Err(payload) => {
+                let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
+                    (*s).to_string()
+                } else if let Some(s) = payload.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "<unrecognised panic payload>".to_string()
+                };
+                if crate::translator::rtyper::cutover::is_known_unported(&msg) {
+                    Ok(crate::translator::rtyper::cutover::DualGateOutcome::Skip(
+                        format!("registry build panicked: {msg}"),
+                    ))
+                } else {
+                    Err(format!("registry build panicked: {msg}"))
+                }
+            }
+        };
+        match outcome {
+            Ok(crate::translator::rtyper::cutover::DualGateOutcome::Match {
+                real_state,
+                real_annotations: _,
+            }) => real_state,
+            Ok(crate::translator::rtyper::cutover::DualGateOutcome::Skip(reason)) => {
+                if std::env::var_os("PYRE_RTYPER_VERBOSE").is_some_and(|v| v == "1") {
+                    eprintln!(
+                        "[PYRE_RTYPER skip] graph {diag_label:?} ({:?}): {reason}",
+                        graph.name,
+                    );
+                }
+                let annotations = crate::translator::rtyper::legacy_annotator::annotate(graph);
+                crate::translator::rtyper::legacy_resolve::resolve_types(graph, &annotations)
+            }
+            Err(diff) => panic!(
+                "PYRE_RTYPER real-path failure on graph {diag_label:?} ({:?}): {diff}",
+                graph.name,
+            ),
+        }
+    }
+
     pub fn transform_graph_to_jitcode(
         &mut self,
         graph: &FunctionGraph,
@@ -129,9 +261,14 @@ impl CodeWriter {
 
         // Step 0: annotate + rtype (majit-specific)
         // RPython: types are already on Variable.concretetype from the rtyper.
-        let annotations = crate::translate_legacy::annotator::annrpython::annotate(graph);
-        let mut type_state =
-            crate::translate_legacy::rtyper::rtyper::resolve_types(graph, &annotations);
+        //
+        // Slice 12.2 narrowed the legacy walker to the Skip arm; Slice
+        // 12.4 lifted the dual-gate logic into the shared
+        // [`Self::dual_gate_type_state`] helper so the parser-level
+        // debug snapshot in `build_canonical_opcode_dispatch`
+        // (lib.rs:898) can route through the same path.
+        let canonical_diag = path.canonical_key().to_string();
+        let mut type_state = self.dual_gate_type_state(graph, callcontrol, &canonical_diag);
 
         // Step 0b: rtyper-equivalent indirect_call lowering
         // (`translator/rtyper/rpbc.rs::lower_indirect_calls`).
@@ -176,10 +313,31 @@ impl CodeWriter {
         // the pre-jtransform rtyper table with explicit result kinds
         // introduced by jtransform (`CallResidual.result_kind`, etc.)
         // without letting stale pre-rewrite entries override them.
-        let rewritten_type_state = crate::translate_legacy::rtyper::rtyper::resolve_rewritten_types(
+        //
+        // The merge precedence is `stamped > post_result > original`:
+        //   - `original` = pre-jtransform `type_state` from the real
+        //     RPythonTyper (already typed every pre-rewrite ValueId).
+        //   - `post_result` = `authoritative_result_types(rewritten)`
+        //     reads the rewritten ops' declared `result_ty`/`result_
+        //     kind` fields (per-op ground-truth).
+        //   - `stamped` = `synth_kinds` jtransform produced for
+        //     freshly-synthesised values.
+        //
+        // The legacy `resolve_types(rewritten_graph, annotations)`
+        // walker that previously fed `merge_synth_kinds`'s `post_
+        // resolve` lane is no longer called: every post-rewrite
+        // ValueId either reuses a pre-rewrite identity (covered by
+        // `original`), is an op.result with declared kind (covered by
+        // `post_result`), or is a synth jtransform value (covered by
+        // `stamped`).  Block inputargs introduced by jtransform pick
+        // up types via `original` (jtransform reuses the pre-rewrite
+        // inputarg ValueIds when splicing new control flow).
+        let post_result_types =
+            crate::jit_codewriter::type_state::authoritative_result_types(&rewritten.graph);
+        let rewritten_type_state = crate::jit_codewriter::type_state::merge_synth_kinds(
             &type_state,
-            &rewritten.graph,
-            &annotations,
+            crate::jit_codewriter::type_state::TypeResolutionState::new(),
+            post_result_types,
             &rewritten.synth_kinds,
         );
 

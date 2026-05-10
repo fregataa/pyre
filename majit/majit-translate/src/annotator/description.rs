@@ -645,7 +645,7 @@ impl DescEntry {
     pub fn get_call_parameters(
         &self,
         args_s: Vec<super::model::SomeValue>,
-    ) -> Result<(Rc<PyGraph>, Vec<super::model::SomeValue>), AnnotatorError> {
+    ) -> Result<(Rc<PyGraph>, Vec<Option<super::model::SomeValue>>), AnnotatorError> {
         match self {
             DescEntry::Function(rc) => rc.borrow().get_call_parameters(args_s),
             DescEntry::Method(_)
@@ -1049,7 +1049,9 @@ impl FunctionDesc {
         self.cache.borrow_mut().insert(key, graph.clone());
         Ok(graph)
     }
+}
 
+impl FunctionDesc {
     /// RPython `FunctionDesc.parse_arguments(args, graph=None)`
     /// (description.py:251-270).
     ///
@@ -1061,7 +1063,7 @@ impl FunctionDesc {
         &self,
         args: &ArgumentsForTranslation,
         graph: Option<&PyGraph>,
-    ) -> Result<Vec<SomeValue>, AnnotatorError> {
+    ) -> Result<Vec<Option<SomeValue>>, AnnotatorError> {
         // upstream description.py:256-264 — `if defaults:` walks each
         // Python value through `self.bookkeeper.immutablevalue(x)` at
         // parse time. `graph_defaults` overrides `self.defaults` when
@@ -1114,7 +1116,16 @@ impl FunctionDesc {
     /// via [`Self::annenforceargs`] / [`Self::annsignature`]. Upstream
     /// raises on having both simultaneously; the Rust port returns
     /// `AnnotatorError` with the same message.
-    pub fn normalize_args(&self, inputs_s: &mut [SomeValue]) -> Result<(), AnnotatorError> {
+    ///
+    /// Accepts `&mut [Option<SomeValue>]` to preserve the unbound-cell
+    /// pass-through into `default_specialize` / `specialize_argvalue`.
+    /// When neither decorator is set the body is a no-op and never
+    /// touches a slot — matching upstream's "no enforceargs / no
+    /// signature → return inputs_s unchanged" path.  When a decorator
+    /// is present the body materialises a concrete buffer at that
+    /// access point (panicking on `None` to mirror upstream's
+    /// `inputs_s[i].knowntype` AttributeError surface).
+    pub fn normalize_args(&self, inputs_s: &mut [Option<SomeValue>]) -> Result<(), AnnotatorError> {
         let enforceargs = self.annenforceargs.clone();
         let signature = self.annsignature.clone();
         if enforceargs.is_some() && signature.is_some() {
@@ -1123,21 +1134,45 @@ impl FunctionDesc {
                 self.name
             )));
         }
+        if enforceargs.is_none() && signature.is_none() {
+            // upstream: neither decorator present — `normalize_args`
+            // body falls through without touching a single cell, so
+            // unbound `None` slots travel intact into the specializer.
+            return Ok(());
+        }
+        // From here a decorator will iterate the cells; an unannotated
+        // slot would AttributeError on first access in upstream.
+        // Materialise into a concrete buffer once so the existing
+        // `&mut [SomeValue]` enforcer signatures stay clean.
+        let mut concrete: Vec<SomeValue> = inputs_s
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                s.clone().ok_or_else(|| {
+                    AnnotatorError::new(format!(
+                        "{}.normalize_args: inputs_s[{i}] unannotated, but \
+                         enforceargs/signature requires concrete cells",
+                        self.name,
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         if let Some(sig) = enforceargs {
             // upstream: `enforceargs(self, inputs_s)` — Sig.__call__
             // (signature.py:113-147).
-            sig.call(&self.name, &self.base.bookkeeper, inputs_s)
+            sig.call(&self.name, &self.base.bookkeeper, &mut concrete)
                 .map_err(|e| -> AnnotatorError { e.into() })?;
-            return Ok(());
-        }
-        if let Some(sig) = signature {
+        } else if let Some(sig) = signature {
             super::signature::enforce_signature_args(
                 &self.name,
                 &self.base.bookkeeper,
                 &sig.params,
-                inputs_s,
+                &mut concrete,
             )
             .map_err(|e| -> AnnotatorError { e.into() })?;
+        }
+        for (slot, s) in inputs_s.iter_mut().zip(concrete.into_iter()) {
+            *slot = Some(s);
         }
         Ok(())
     }
@@ -1229,8 +1264,15 @@ impl FunctionDesc {
     /// rewrite the fresh graph so it no longer takes a `*arg` tuple.
     pub(crate) fn flatten_star_args(
         &self,
-        args_s: &[SomeValue],
-    ) -> Result<(Vec<SomeValue>, GraphCacheKey, Option<GraphBuilder<'_>>), AnnotatorError> {
+        args_s: &[Option<SomeValue>],
+    ) -> Result<
+        (
+            Vec<Option<SomeValue>>,
+            GraphCacheKey,
+            Option<GraphBuilder<'_>>,
+        ),
+        AnnotatorError,
+    > {
         // upstream: `argnames, vararg, kwarg = funcdesc.signature`.
         let vararg = self.signature.varargname.clone();
         let kwarg = self.signature.kwargname.clone();
@@ -1256,7 +1298,16 @@ impl FunctionDesc {
             )));
         }
         // upstream: `s_tuple = args_s[-1]; assert isinstance(s_tuple, SomeTuple)`.
-        let s_tuple = &args_s[args_s.len() - 1];
+        // `specialize.py:18` reads `args_s[-1]` directly; an unbound
+        // (None) cell would raise AttributeError on `isinstance`.
+        // Pyre's `.expect()` on the trailing *arg slot mirrors that
+        // fail-loud surface.
+        let s_tuple = args_s[args_s.len() - 1].as_ref().ok_or_else(|| {
+            AnnotatorError::new(format!(
+                "{}.flatten_star_args: trailing *arg slot is unannotated",
+                self.name
+            ))
+        })?;
         let tuple = match s_tuple {
             SomeValue::Tuple(t) => t,
             other => {
@@ -1270,8 +1321,8 @@ impl FunctionDesc {
         //             nb_extra_args = s_len.const`.
         let nb_extra_args = tuple.items.len();
         // upstream: `flattened_s = list(args_s[:-1]); flattened_s.extend(s_tuple.items)`.
-        let mut flattened_s: Vec<SomeValue> = args_s[..args_s.len() - 1].to_vec();
-        flattened_s.extend(tuple.items.iter().cloned());
+        let mut flattened_s: Vec<Option<SomeValue>> = args_s[..args_s.len() - 1].to_vec();
+        flattened_s.extend(tuple.items.iter().cloned().map(Some));
         // upstream: `key = ('star', nb_extra_args)`.
         let key_suffix = GraphCacheKey::Tuple(vec![
             GraphCacheKey::String("star".to_string()),
@@ -1294,7 +1345,7 @@ impl FunctionDesc {
     fn maybe_star_args(
         &self,
         key: GraphCacheKey,
-        args_s: &[SomeValue],
+        args_s: &[Option<SomeValue>],
     ) -> Result<Rc<PyGraph>, AnnotatorError> {
         let (_flattened_s, star_key, builder) = self.flatten_star_args(args_s)?;
         let combined_key = self.append_cache_key(key, star_key)?;
@@ -1303,13 +1354,17 @@ impl FunctionDesc {
 
     pub(crate) fn default_specialize(
         &self,
-        inputcells: &mut Vec<SomeValue>,
+        inputcells: &mut Vec<Option<SomeValue>>,
     ) -> Result<Rc<PyGraph>, AnnotatorError> {
         // upstream `default_specialize(funcdesc, args_s)`
-        // (specialize.py:60-85).
+        // (specialize.py:60-85).  RPython iterates `args_s` and only
+        // touches entries that are `SomeInstance`; unbound (None)
+        // cells naturally fall through the `isinstance(s_obj,
+        // SomeInstance)` check.  Pyre mirrors that by skipping `None`
+        // slots in the access_directly scan.
         let (flattened_cells, mut key, builder) = self.flatten_star_args(inputcells)?;
         let mut flattened_cells = flattened_cells;
-        let inputcells: &mut [SomeValue] = if !matches!(key, GraphCacheKey::None) {
+        let inputcells: &mut [Option<SomeValue>] = if !matches!(key, GraphCacheKey::None) {
             flattened_cells.as_mut_slice()
         } else {
             inputcells.as_mut_slice()
@@ -1323,7 +1378,10 @@ impl FunctionDesc {
             .and_then(|func| func._jit_look_inside_)
             .unwrap_or(true);
         let mut access_directly = false;
-        for s_obj in inputcells.iter_mut() {
+        for slot in inputcells.iter_mut() {
+            let Some(s_obj) = slot else {
+                continue;
+            };
             if let SomeValue::Instance(inst) = s_obj {
                 let has_flag = inst.flags.get("access_directly").copied().unwrap_or(false);
                 if has_flag {
@@ -1334,11 +1392,11 @@ impl FunctionDesc {
                     } else {
                         let mut new_flags = inst.flags.clone();
                         new_flags.remove("access_directly");
-                        *s_obj = SomeValue::Instance(SomeInstance::new(
+                        *slot = Some(SomeValue::Instance(SomeInstance::new(
                             inst.classdef.clone(),
                             inst.can_be_none,
                             new_flags,
-                        ));
+                        )));
                     }
                 }
             }
@@ -1352,7 +1410,7 @@ impl FunctionDesc {
 
     fn specialize_argvalue(
         &self,
-        args_s: &[SomeValue],
+        args_s: &[Option<SomeValue>],
         parms: &[String],
     ) -> Result<Rc<PyGraph>, AnnotatorError> {
         let mut key_parts = Vec::with_capacity(parms.len());
@@ -1362,11 +1420,18 @@ impl FunctionDesc {
                     "specialize:arg expects integer indices, got {parm:?}"
                 ))
             })?;
-            let s = args_s.get(idx).ok_or_else(|| {
+            let s_slot = args_s.get(idx).ok_or_else(|| {
                 AnnotatorError::new(format!(
                     "specialize:arg index {idx} out of range for {}",
                     self.name
                 ))
+            })?;
+            // upstream `specialize_argvalue(funcdesc, args_s, *parms)`
+            // (specialize.py:122-130) reaches `args_s[i].is_constant()`
+            // / `args_s[i].const`; an unbound cell raises AttributeError
+            // there.  Mirror with fail-loud at access.
+            let s = s_slot.as_ref().ok_or_else(|| {
+                AnnotatorError::new(format!("specialize:arg({idx}): argument is unannotated"))
             })?;
             match s {
                 SomeValue::PBC(pbc) if pbc.descriptions.len() == 1 => {
@@ -1487,10 +1552,14 @@ impl FunctionDesc {
     /// dispatching to the specializer.
     pub fn specialize(
         &self,
-        inputcells: &mut Vec<SomeValue>,
+        inputcells: &mut Vec<Option<SomeValue>>,
         op_key: Option<PositionKey>,
     ) -> Result<Rc<PyGraph>, AnnotatorError> {
         let op_key = op_key.or_else(|| self.base.bookkeeper.current_position_key());
+        // upstream description.py:277 — `self.normalize_args(inputcells)`.
+        // The Option layer is preserved into the specializer; only the
+        // enforceargs / signature paths inside `normalize_args` need
+        // concrete cells, and they materialise their own buffer there.
         self.normalize_args(inputcells)?;
         match self.specializer.as_ref().unwrap_or(&Specializer::Default) {
             Specializer::Default => self.default_specialize(inputcells),
@@ -1502,10 +1571,15 @@ impl FunctionDesc {
                             "specialize:arg_or_var expects integer indices, got {parm:?}"
                         ))
                     })?;
-                    let s = inputcells.get(idx).ok_or_else(|| {
+                    let s_slot = inputcells.get(idx).ok_or_else(|| {
                         AnnotatorError::new(format!(
                             "specialize:arg_or_var index {idx} out of range for {}",
                             self.name
+                        ))
+                    })?;
+                    let s = s_slot.as_ref().ok_or_else(|| {
+                        AnnotatorError::new(format!(
+                            "specialize:arg_or_var({idx}): argument is unannotated"
                         ))
                     })?;
                     if !s.is_constant() {
@@ -1522,10 +1596,15 @@ impl FunctionDesc {
                             "specialize:argtype expects integer indices, got {parm:?}"
                         ))
                     })?;
-                    let s = inputcells.get(idx).ok_or_else(|| {
+                    let s_slot = inputcells.get(idx).ok_or_else(|| {
                         AnnotatorError::new(format!(
                             "specialize:argtype index {idx} out of range for {}",
                             self.name
+                        ))
+                    })?;
+                    let s = s_slot.as_ref().ok_or_else(|| {
+                        AnnotatorError::new(format!(
+                            "specialize:argtype({idx}): argument is unannotated"
                         ))
                     })?;
                     key_parts.push(GraphCacheKey::KnownType(s.knowntype()));
@@ -1544,8 +1623,30 @@ impl FunctionDesc {
                             "specialize:arglistitemtype expects integer indices, got {parms:?}"
                         ))
                     })?;
-                let key = match inputcells.get(idx) {
-                    Some(SomeValue::List(list)) => {
+                // `specialize.py:360 specialize_arglistitemtype` reads
+                // `args_s[i].knowntype` directly — if the slot is
+                // None, Python raises `AttributeError: 'NoneType'
+                // object has no attribute 'knowntype'`.  Mirror the
+                // fail-loud rather than folding None into a
+                // `GraphCacheKey::None` bucket that would silently
+                // collapse cache identity across unrelated unbound
+                // callers.
+                let slot = inputcells.get(idx).ok_or_else(|| {
+                    AnnotatorError::new(format!(
+                        "specialize:arglistitemtype index {idx} out of range \
+                         (inputcells len {})",
+                        inputcells.len()
+                    ))
+                })?;
+                let s = slot.as_ref().ok_or_else(|| {
+                    AnnotatorError::new(format!(
+                        "specialize:arglistitemtype: args_s[{idx}] is None \
+                         (specialize.py:360 reads .knowntype directly — \
+                         caller must bind every slot before specialising)"
+                    ))
+                })?;
+                let key = match s {
+                    SomeValue::List(list) => {
                         GraphCacheKey::KnownType(list.listdef.s_value().knowntype())
                     }
                     _ => GraphCacheKey::None,
@@ -1705,6 +1806,9 @@ impl FunctionDesc {
         op_key: Option<PositionKey>,
     ) -> Result<SomeValue, AnnotatorError> {
         // upstream: `inputcells = self.parse_arguments(args)`.
+        // Option-aware inputcells thread directly through specialize /
+        // unmatch_signature / recursivecall, matching `description.py:283-298`
+        // pycall's "pass inputcells through" propagation.
         let mut inputcells = self.parse_arguments(args, None)?;
         // upstream: `graph = self.specialize(inputcells, op)`.
         let graph = self.specialize(&mut inputcells, op_key.clone())?;
@@ -1740,7 +1844,7 @@ impl FunctionDesc {
             if let Some(sigresult) = sigresult {
                 // upstream: `annotator.addpendingblock(graph, graph.returnblock, [sigresult])`.
                 let returnblock = graph.graph.borrow().returnblock.clone();
-                annotator.addpendingblock(&graph.graph, &returnblock, &[sigresult.clone()]);
+                annotator.addpendingblock(&graph.graph, &returnblock, &[Some(sigresult.clone())]);
                 result = sigresult;
             }
         }
@@ -1791,7 +1895,7 @@ impl FunctionDesc {
     pub fn get_call_parameters(
         &self,
         args_s: Vec<SomeValue>,
-    ) -> Result<(Rc<PyGraph>, Vec<SomeValue>), AnnotatorError> {
+    ) -> Result<(Rc<PyGraph>, Vec<Option<SomeValue>>), AnnotatorError> {
         // upstream: `args = simple_args(args_s)`.
         let args = super::argument::simple_args(args_s);
         // upstream: `inputcells = self.parse_arguments(args)`.
@@ -1827,7 +1931,7 @@ impl FunctionDesc {
                 //     graph, graph.returnblock, [s_result])`.
                 let annotator = self.base.bookkeeper.annotator();
                 let returnblock = graph.graph.borrow().returnblock.clone();
-                annotator.addpendingblock(&graph.graph, &returnblock, &[s_result]);
+                annotator.addpendingblock(&graph.graph, &returnblock, &[Some(s_result)]);
             }
         }
 
@@ -2983,7 +3087,7 @@ mod tests {
                 parms: vec!["0".to_string()],
             }),
         );
-        let mut inputcells = vec![SomeValue::Integer(SomeInteger::default())];
+        let mut inputcells = vec![Some(SomeValue::Integer(SomeInteger::default()))];
         let graph = fd
             .specialize(&mut inputcells, None)
             .expect("argtype specialization");
@@ -3115,7 +3219,7 @@ mod tests {
             None,
         );
         let args = ArgumentsForTranslation::new(
-            vec![SomeValue::Integer(SomeInteger::new(true, false))],
+            vec![Some(SomeValue::Integer(SomeInteger::new(true, false)))],
             None,
             None,
         );
@@ -3130,8 +3234,8 @@ mod tests {
         // Call with two args where signature expects one, no vararg.
         let args = ArgumentsForTranslation::new(
             vec![
-                SomeValue::Integer(SomeInteger::new(true, false)),
-                SomeValue::Integer(SomeInteger::new(true, false)),
+                Some(SomeValue::Integer(SomeInteger::new(true, false))),
+                Some(SomeValue::Integer(SomeInteger::new(true, false))),
             ],
             None,
             None,
@@ -3156,7 +3260,7 @@ mod tests {
             None,
         );
         let args = ArgumentsForTranslation::new(
-            vec![SomeValue::Integer(SomeInteger::new(true, false))],
+            vec![Some(SomeValue::Integer(SomeInteger::new(true, false)))],
             None,
             None,
         );
@@ -3223,8 +3327,8 @@ mod tests {
     fn flatten_star_args_identity_for_plain_signature() {
         let fd = FunctionDesc::new(bk(), None, "f", int_sig(&["a", "b"]), None, None);
         let args = vec![
-            SomeValue::Integer(SomeInteger::default()),
-            SomeValue::Integer(SomeInteger::default()),
+            Some(SomeValue::Integer(SomeInteger::default())),
+            Some(SomeValue::Integer(SomeInteger::default())),
         ];
         let (out, key, builder) = fd.flatten_star_args(&args).expect("identity path");
         assert!(matches!(key, GraphCacheKey::None));
@@ -3237,8 +3341,8 @@ mod tests {
         let sig = Signature::new(vec!["a".into()], None, Some("kw".into()));
         let fd = FunctionDesc::new(bk(), None, "f", sig, None, None);
         let args = vec![
-            SomeValue::Integer(SomeInteger::default()),
-            SomeValue::Integer(SomeInteger::default()),
+            Some(SomeValue::Integer(SomeInteger::default())),
+            Some(SomeValue::Integer(SomeInteger::default())),
         ];
         let err = match fd.flatten_star_args(&args) {
             Ok(_) => panic!("expected flatten_star_args to fail"),
@@ -3257,11 +3361,11 @@ mod tests {
         let sig = Signature::new(vec!["a".into()], Some("rest".into()), None);
         let fd = FunctionDesc::new(bk(), None, "f", sig, None, None);
         let args = vec![
-            SomeValue::Integer(SomeInteger::default()),
-            SomeValue::Tuple(SomeTuple::new(vec![
+            Some(SomeValue::Integer(SomeInteger::default())),
+            Some(SomeValue::Tuple(SomeTuple::new(vec![
                 SomeValue::Integer(SomeInteger::default()),
                 SomeValue::Integer(SomeInteger::default()),
-            ])),
+            ]))),
         ];
         let (out, key, builder) = fd.flatten_star_args(&args).expect("vararg path");
         assert_eq!(out.len(), 3, "a + 2 flattened star args");
@@ -3291,13 +3395,17 @@ mod tests {
         );
         let mut flags = std::collections::BTreeMap::new();
         flags.insert("access_directly".into(), true);
-        let mut inputcells = vec![SomeValue::Instance(SomeInstance::new(None, false, flags))];
+        let mut inputcells = vec![Some(SomeValue::Instance(SomeInstance::new(
+            None, false, flags,
+        )))];
 
         let graph = fd.specialize(&mut inputcells, None).unwrap();
 
         assert!(!graph.access_directly.get());
         match &inputcells[0] {
-            SomeValue::Instance(inst) => assert!(!inst.flags.contains_key("access_directly")),
+            Some(SomeValue::Instance(inst)) => {
+                assert!(!inst.flags.contains_key("access_directly"))
+            }
             other => panic!("expected SomeInstance, got {other:?}"),
         }
     }
@@ -3319,11 +3427,11 @@ mod tests {
             None,
         );
         let mut inputcells = vec![
-            SomeValue::Integer(SomeInteger::default()),
-            SomeValue::Tuple(SomeTuple::new(vec![
+            Some(SomeValue::Integer(SomeInteger::default())),
+            Some(SomeValue::Tuple(SomeTuple::new(vec![
                 SomeValue::Integer(SomeInteger::default()),
                 SomeValue::Integer(SomeInteger::default()),
-            ])),
+            ]))),
         ];
 
         let graph = fd.specialize(&mut inputcells, None).unwrap();
@@ -3362,7 +3470,7 @@ mod tests {
         );
         let mut s_int = SomeInteger::default();
         s_int.base.const_box = Some(Constant::new(ConstValue::Int(42)));
-        let mut inputcells = vec![SomeValue::Integer(s_int)];
+        let mut inputcells = vec![Some(SomeValue::Integer(s_int))];
 
         let graph = fd
             .specialize(&mut inputcells, None)
@@ -3397,7 +3505,7 @@ mod tests {
             }),
         );
         let pbc = SomePBC::new(vec![DescEntry::Function(callee)], false);
-        let mut inputcells = vec![SomeValue::PBC(pbc)];
+        let mut inputcells = vec![Some(SomeValue::PBC(pbc))];
 
         let graph = fd.specialize(&mut inputcells, None).expect("arg graph");
 
@@ -3427,7 +3535,7 @@ mod tests {
             params: Vec::new(),
             result: ParamType::Marker(super::super::signature::TypeMarker::AnyType),
         }));
-        let mut inputs = vec![SomeValue::Integer(SomeInteger::default())];
+        let mut inputs = vec![Some(SomeValue::Integer(SomeInteger::default()))];
         let err = fd.normalize_args(&mut inputs).unwrap_err();
         assert!(
             err.msg
@@ -3522,7 +3630,7 @@ mod tests {
         );
         let args = ArgumentsForTranslation::new(vec![], None, None);
         let out = md.func_args(&args).expect("bound method args");
-        assert!(matches!(out.arguments_w[0], SomeValue::Instance(_)));
+        assert!(matches!(out.arguments_w[0], Some(SomeValue::Instance(_))));
     }
 
     #[test]
@@ -3920,7 +4028,7 @@ mod tests {
         let mfd = MethodOfFrozenDesc::new(bk, fd, frozen);
         let args = ArgumentsForTranslation::new(vec![], None, None);
         let out = mfd.func_args(&args).expect("method-of-frozen args");
-        assert!(matches!(out.arguments_w[0], SomeValue::PBC(_)));
+        assert!(matches!(out.arguments_w[0], Some(SomeValue::PBC(_))));
     }
 
     #[test]
@@ -3968,7 +4076,7 @@ mod tests {
             None,
         )));
         let args = ArgumentsForTranslation::new(
-            vec![SomeValue::Integer(SomeInteger::default())],
+            vec![Some(SomeValue::Integer(SomeInteger::default()))],
             None,
             None,
         );
@@ -4002,13 +4110,13 @@ mod tests {
             Some(Specializer::CallLocation),
         );
 
-        let mut inputs1 = vec![SomeValue::Integer(SomeInteger::default())];
+        let mut inputs1 = vec![Some(SomeValue::Integer(SomeInteger::default()))];
         bk.set_position_key(Some(PositionKey::new(1, 2, 3)));
         let graph1 = fd
             .specialize(&mut inputs1, None)
             .expect("first call-location specialization");
 
-        let mut inputs2 = vec![SomeValue::Integer(SomeInteger::default())];
+        let mut inputs2 = vec![Some(SomeValue::Integer(SomeInteger::default()))];
         bk.set_position_key(Some(PositionKey::new(1, 2, 4)));
         let graph2 = fd
             .specialize(&mut inputs2, None)

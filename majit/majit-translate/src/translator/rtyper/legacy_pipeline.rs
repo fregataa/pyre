@@ -1,12 +1,19 @@
-//! End-to-end analysis pipeline.
+//! Legacy end-to-end analysis pipeline — transitional production driver.
 //!
-//! **LEGACY.** Majit-local driver that sequences the ad-hoc
-//! `annotate → resolve_types → flatten_with_types` chain. Not the
-//! same as RPython's `translator/driver.py` (TranslationDriver +
-//! SimpleTaskEngine); re-identification was considered and rejected.
-//! The rtyper-pipeline cutover (roadmap Phase 8) routes pyre compiles
-//! through `majit-rtyper` directly and bypasses this file; this file
-//! is deleted at roadmap commit P8.11.
+//! TODO(retire-legacy-pipeline): majit-local driver that sequences the
+//! ad-hoc `legacy_annotator::annotate → legacy_resolve::resolve_types →
+//! flatten_with_types` chain.  No upstream `rpython/` counterpart —
+//! orthodox `translator/driver.py` (TranslationDriver +
+//! SimpleTaskEngine) drives a different shape (per-function build_types
+//! after BFS-from-entry, no separate flatten driver), so this file is
+//! not a port target.
+//!
+//! The legacy chain remains the production analysis driver for
+//! `lib.rs::analyze_pipeline_from_parsed` — the BFS-from-portal
+//! candidate set drives the per-function annotate → rtype → jtransform
+//! → flatten chain that feeds `build_canonical_opcode_dispatch`.
+//! Retirement requires migrating the production caller to the
+//! real-rtyper path ([`crate::translator::rtyper::cutover`]) end-to-end.
 //!
 //! RPython-orthodox chain (when fully ported):
 //!   flowspace → annotator → rtyper → jtransform → flatten
@@ -19,8 +26,8 @@ use crate::flatten;
 use crate::front::SemanticFunction;
 use crate::jtransform::rewrite_graph_with_callcontrol;
 use crate::pipeline::{PipelineConfig, PipelineResult, ProgramPipelineResult};
-use crate::translate_legacy::annotator::annrpython::annotate;
-use crate::translate_legacy::rtyper::rtyper::resolve_types;
+use crate::translator::rtyper::legacy_annotator::annotate;
+use crate::translator::rtyper::legacy_resolve::resolve_types;
 
 /// Run the full analysis pipeline on a single function.
 ///
@@ -36,7 +43,6 @@ pub fn analyze_function(func: &SemanticFunction, config: &PipelineConfig) -> Pip
 
     // Pass 2: Type resolution (RPython rtyper)
     let mut types = resolve_types(graph, &annotations);
-    let concrete_types_count = types.concrete_types.len();
 
     // Pass 2b: rtyper-equivalent indirect_call lowering. RPython's rtyper
     // (rpbc.py:199-217) always emits `indirect_call(funcptr, *args,
@@ -78,9 +84,8 @@ pub fn analyze_function(func: &SemanticFunction, config: &PipelineConfig) -> Pip
         transformer.transform(&graph_owned)
     };
     let vable_rewrites = transform_result.vable_rewrites;
-    let calls_classified = transform_result.calls_classified;
     let transform_notes = transform_result.notes.clone();
-    let rewritten_types = crate::translate_legacy::rtyper::rtyper::resolve_rewritten_types(
+    let rewritten_types = crate::translator::rtyper::legacy_resolve::resolve_rewritten_types(
         &types,
         &transform_result.graph,
         &annotations,
@@ -98,9 +103,7 @@ pub fn analyze_function(func: &SemanticFunction, config: &PipelineConfig) -> Pip
         name: func.name.clone(),
         original_blocks,
         annotations_count,
-        concrete_types_count,
         vable_rewrites,
-        calls_classified,
         transform_notes,
         flattened,
     }
@@ -301,9 +304,7 @@ mod tests {
                 name: "consts".into(),
                 original_blocks: 1,
                 annotations_count: 0,
-                concrete_types_count: 0,
                 vable_rewrites: 0,
-                calls_classified: 0,
                 transform_notes: Vec::new(),
                 flattened: flattened.clone(),
             }],

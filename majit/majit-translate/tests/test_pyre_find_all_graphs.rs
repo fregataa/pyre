@@ -24,11 +24,8 @@
 use std::path::PathBuf;
 
 use majit_translate::{
-    CallPath, ParsedInterpreter,
-    call::CallControl,
-    extract_trait_impls,
-    front::{StructFieldRegistry, ast::build_function_graph_pub},
-    parse_source,
+    CallPath, ParsedInterpreter, build_semantic_program_from_parsed_files, call::CallControl,
+    extract_trait_impls, front::ast::build_function_graph_pub, parse_source,
     policy::DefaultJitPolicy,
 };
 use syn::{Item, ItemFn};
@@ -48,6 +45,39 @@ fn parse_pyre_file(relative: &str) -> ParsedInterpreter {
     let src = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("failed to read {}: {}", path.display(), e));
     parse_source(&src)
+}
+
+/// Mirror `pyre-jit-trace/build.rs::collect_rs_files`: walk every `.rs`
+/// under `pyre-object/src` and `pyre-interpreter/src`, parsing each so
+/// `build_semantic_program_from_parsed_files` sees the same
+/// whole-program scope as production.
+fn collect_pyre_interpreter_program_inputs() -> Vec<ParsedInterpreter> {
+    let mut out = Vec::new();
+    for dir in ["pyre/pyre-object/src", "pyre/pyre-interpreter/src"] {
+        let root = pyre_file_path(dir);
+        collect_rs_under(&root, &mut out);
+    }
+    out
+}
+
+fn collect_rs_under(dir: &std::path::Path, out: &mut Vec<ParsedInterpreter>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rs_under(&path, out);
+            continue;
+        }
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let Ok(src) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        out.push(parse_source(&src));
+    }
 }
 
 fn iter_opcode_handler_fns(file: &syn::File) -> impl Iterator<Item = &ItemFn> {
@@ -92,23 +122,47 @@ fn find_all_graphs_closure_reaches_handler_graphs_from_dispatch_portal() {
     );
 
     // Register trait impl graphs so BFS can follow `executor.method(...)`
-    // dispatch edges into PyFrame.
-    let empty_registry = StructFieldRegistry::default();
-    let empty_fn_ret = std::collections::HashMap::new();
-    let empty_struct_names = std::collections::HashSet::new();
+    // dispatch edges into PyFrame.  Production at `lib.rs:317-342`
+    // populates `program.fn_return_types` / `program.struct_fields` /
+    // `program.known_struct_names` via
+    // `build_semantic_program_from_parsed_files` BEFORE handing them to
+    // `extract_trait_impls`.  Mirror that two-pass walk here so the
+    // impl-body lowering can resolve user-source method-return types
+    // (`bookkeeper.getdesc(...).find_method` upstream parity at
+    // `unaryop.py:206-213`).  Without it, every `!self.method()`
+    // surface where `method` is a user-defined predicate fails the
+    // `UnaryNotUnknownOperand` fail-loud at `front/ast.rs:3713`.
+    // Re-parse for the program build because `ParsedInterpreter`
+    // does not derive `Clone`.  Walk the full pyre-interpreter and
+    // pyre-object source trees so the walker discovers every
+    // user-defined method's return type before any body lowering
+    // touches `expr_unary_not_operand_kind`
+    // (`bookkeeper.getdesc(...).find_method` upstream parity at
+    // `unaryop.py:206-213`).  Mirrors `pyre-jit-trace/build.rs`'s
+    // `collect_rs_files` walk over `pyre-object/src` +
+    // `pyre-interpreter/src` so the test sees the same whole-program
+    // visibility production runs with.
+    let program_inputs = collect_pyre_interpreter_program_inputs();
+    let program = build_semantic_program_from_parsed_files(&program_inputs)
+        .expect("pyre-interpreter source must lower without FlowingError");
     let mut impls = Vec::new();
     impls.extend(
         extract_trait_impls(
             &pyopcode,
-            &empty_registry,
-            &empty_fn_ret,
-            &empty_struct_names,
+            &program.struct_fields,
+            &program.fn_return_types,
+            &program.known_struct_names,
         )
         .expect("pyopcode trait impls must lower"),
     );
     impls.extend(
-        extract_trait_impls(&eval, &empty_registry, &empty_fn_ret, &empty_struct_names)
-            .expect("eval trait impls must lower"),
+        extract_trait_impls(
+            &eval,
+            &program.struct_fields,
+            &program.fn_return_types,
+            &program.known_struct_names,
+        )
+        .expect("eval trait impls must lower"),
     );
     for imp in &impls {
         for method in &imp.methods {

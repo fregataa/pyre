@@ -1,11 +1,11 @@
 //! Pipeline result types.
 //!
-//! Data carriers consumed by codegen + downstream tooling. The producers
-//! (`analyze_function`, `analyze_program`) currently live in
-//! `translate_legacy/pipeline.rs` and stay there until the real
-//! annotator+rtyper drive the pipeline end-to-end; the struct definitions
-//! live here (non-legacy) so consumers do not need to spell
-//! `translate_legacy::…` to name a pipeline output.
+//! Data carriers consumed by codegen + downstream tooling. The
+//! production producer is `lib::analyze_pipeline_from_parsed` (which
+//! drives `build_canonical_opcode_dispatch` to fill `opcode_dispatch`,
+//! `jitcodes`, `insns`, `descrs`); `translator/rtyper/legacy_pipeline.rs`
+//! retains a parallel `analyze_program` chain only under
+//! `#[cfg(test)]` to anchor dual-gate fixture tests.
 
 use serde::{Deserialize, Serialize};
 
@@ -59,9 +59,7 @@ pub struct PipelineResult {
     pub name: String,
     pub original_blocks: usize,
     pub annotations_count: usize,
-    pub concrete_types_count: usize,
     pub vable_rewrites: usize,
-    pub calls_classified: usize,
     pub transform_notes: Vec<GraphTransformNote>,
     /// RPython: the SSARepr produced by flatten_graph().
     ///

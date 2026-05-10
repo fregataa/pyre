@@ -2535,11 +2535,20 @@ impl BlackholeInterpBuilder {
         };
         self._insns = vec![String::new(); table_len];
         for (key, &value) in insns {
+            // `blackhole.py:69` `assert self._insns[value] is None`:
+            // every byte slot is filled exactly once across the
+            // forward map.  Pyre's `wellknown_bh_insns` +
+            // `pyre_extension_insns` + `pipeline.insns` union must
+            // not insert two distinct keys at the same byte.  Empty
+            // gaps between sparse `BC_*` constants stay
+            // `String::new()` and surface as the unwired-handler
+            // placeholder if dispatched against.
+            let slot = &mut self._insns[value as usize];
             assert!(
-                self._insns[value as usize].is_empty(),
-                "duplicate opcode {value} for key {key:?}"
+                slot.is_empty(),
+                "setup_insns: byte {value} already bound to {slot:?}, refusing duplicate {key:?}",
             );
-            self._insns[value as usize] = key.clone();
+            *slot = key.clone();
         }
         // RPython blackhole.py:72-74: resolve well-known opcodes
         self.op_live = insns.get("live/").copied().unwrap_or(u8::MAX);
@@ -3920,6 +3929,10 @@ mod tests {
                 "goto_if_not_int_is_true_pyre_u16/iL".to_string(),
                 insns::BC_GOTO_IF_NOT_INT_IS_TRUE,
             );
+            // Canonical `goto_if_not/iL` alias — `bhimpl_goto_if_not_int_is_true =
+            // bhimpl_goto_if_not` (`blackhole.py:913`) routes both bytes to
+            // the same handler body.
+            entries.insert("goto_if_not_pyre_u16/iL".to_string(), insns::BC_GOTO_IF_NOT);
             entries.insert(
                 "goto_if_not_ptr_nonzero_pyre_u16/rL".to_string(),
                 insns::BC_GOTO_IF_NOT_PTR_NONZERO,
@@ -4849,6 +4862,64 @@ pub extern "C" fn _ll_2_int_floordiv(x: i64, y: i64) -> i64 {
 /// rationale.  In Rust, `i64.wrapping_rem` is natively C-truncating.
 pub extern "C" fn _ll_2_int_mod(x: i64, y: i64) -> i64 {
     x.wrapping_rem(y)
+}
+
+/// RPython `support.py:274 _ll_1_cast_uint_to_float(x)` —
+/// `r_uint(x)`-domain `float(x)` (matching `op_cast_uint_to_float`
+/// at `opimpl.py:393-395`).  `_do_builtin_call` re-routes
+/// `cast_uint_to_float` through this helper so blackhole sees a
+/// `direct_call` instead of a bare `cast_uint_to_float` opname.
+/// Mirror of `opimpl.rs::op_cast_uint_to_float`'s u64-domain
+/// rounding so the runtime path agrees with const-fold.
+pub fn cast_uint_to_float(x: i64) -> f64 {
+    (x as u64) as f64
+}
+
+/// RPython `support.py:274 _ll_1_cast_float_to_uint(f)` —
+/// `r_uint(long(f))` mod 2^64 wrap (matching
+/// `op_cast_float_to_uint` at `opimpl.py:432-434`).  Plain
+/// `f as u64` saturates outside `[0, 2^64)` rather than wrapping;
+/// reuse the IEEE-754 mantissa+exponent decomposition that
+/// `opimpl.rs::float_trunc_mod_2_pow_64` already implements so
+/// runtime and const-fold agree.  Refuses to fold on NaN / inf
+/// (RPython `OverflowError` / `ValueError`); callers must filter.
+pub fn cast_float_to_uint(f: f64) -> i64 {
+    // `opimpl.py:432-434` routes through `long(f)` which raises
+    // `OverflowError` / `ValueError` on NaN / inf — there is no
+    // upstream guard outside this helper that filters non-finite
+    // values, so reproduce the fail-loud here unconditionally (not
+    // only in debug) instead of returning garbage at release.
+    assert!(
+        f.is_finite(),
+        "cast_float_to_uint: NaN/inf is caller error (opimpl.py:432 raises ValueError)"
+    );
+    let bits = f.to_bits();
+    let sign = (bits >> 63) & 1;
+    let raw_exp = ((bits >> 52) & 0x7FF) as i64;
+    if raw_exp == 0 {
+        return 0;
+    }
+    let exp = raw_exp - 1023;
+    if exp < 0 {
+        return 0;
+    }
+    let mantissa = (bits & ((1u64 << 52) - 1)) | (1u64 << 52);
+    let unsigned_trunc = if exp >= 52 {
+        let shift = (exp - 52) as u32;
+        if shift >= 64 {
+            0
+        } else {
+            mantissa.wrapping_shl(shift)
+        }
+    } else {
+        mantissa >> (52 - exp) as u32
+    };
+    let wrapped = if sign == 0 {
+        unsigned_trunc
+    } else {
+        unsigned_trunc.wrapping_neg()
+    };
+    wrapped as i64
 }
 
 /// blackhole.py:499-501 `bhimpl_int_and(a, b): return a & b`.
@@ -7345,6 +7416,15 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
         "goto_if_not_int_is_true_pyre_u16/iL".to_string(),
         majit_translate::insns::BC_GOTO_IF_NOT_INT_IS_TRUE,
     );
+    // `blackhole.py:913 bhimpl_goto_if_not_int_is_true = bhimpl_goto_if_not`
+    // — both `(opname, argcodes)` keys route to the same handler body.
+    // `Assembler.insns.setdefault` (`assembler.py:221`) allocates the
+    // canonical key `goto_if_not/iL` its own byte (`BC_GOTO_IF_NOT`)
+    // distinct from the alias byte (`BC_GOTO_IF_NOT_INT_IS_TRUE`).
+    insns.insert(
+        "goto_if_not_pyre_u16/iL".to_string(),
+        majit_translate::insns::BC_GOTO_IF_NOT,
+    );
     // Sub-slice C.5: cover the BC_* set the inline_call-only test
     // fixtures emit (`int_return`, `float_return`, `int_add`,
     // `float_copy`, `void_return`, `abort`, `abort_permanent`) so the
@@ -7901,8 +7981,10 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     builder.wire_handler("goto_if_not_int_ne/iiL", handler_goto_if_not_int_ne);
     builder.wire_handler("goto_if_not_int_gt/iiL", handler_goto_if_not_int_gt);
     builder.wire_handler("goto_if_not_int_ge/iiL", handler_goto_if_not_int_ge);
-    // goto_if_not_int_is_true = goto_if_not (alias, blackhole.py:913)
-    builder.wire_handler("goto_if_not_int_is_true/iL", handler_goto_if_not);
+    // upstream `flatten.py:247` registers opname `goto_if_not`
+    // (the `_int_is_true` suffix is a Python class-attribute alias of
+    // the bhimpl function, not a separate opname — `blackhole.py:913`).
+    builder.wire_handler("goto_if_not/iL", handler_goto_if_not);
 
     // Guard values — no-op in blackhole (blackhole.py:648-656)
     builder.wire_handler("int_guard_value/i", handler_int_guard_value);
@@ -7925,6 +8007,18 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     // Cast operations (blackhole.py:800-831)
     builder.wire_handler("cast_float_to_int/f>i", handler_cast_float_to_int);
     builder.wire_handler("cast_int_to_float/i>f", handler_cast_int_to_float);
+    // No `cast_bool_to_int` / `cast_bool_to_float` / `float_is_true`
+    // backend handlers — RPython jtransform canonicalises these
+    // upstream of the assembler:
+    //   * `cast_bool_to_int` is dropped entirely
+    //     (`jtransform.py:330 def rewrite_op_cast_bool_to_int(self, op): pass`,
+    //     mirrored at `jit_codewriter/jtransform.rs` `same_as`-family arm).
+    //   * `cast_bool_to_float` → `cast_int_to_float`
+    //     (`jtransform.py:1592` rename pass).
+    //   * `float_is_true` → `float_ne(x, 0.0)`
+    //     (`jtransform.py:1627`, mirrored at `jtransform.rs:947+`).
+    // Adding backend opcodes for these would diverge from upstream's
+    // "shrink the opcode table at jtransform" contract.
 
     // int_signext (blackhole.py:566-569)
     builder.wire_handler("int_signext/ii>i", handler_int_signext);
@@ -8321,6 +8415,13 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     );
     builder.wire_handler(
         "goto_if_not_int_is_true_pyre_u16/iL",
+        handler_goto_if_not_int_is_true_pyre_u16,
+    );
+    // Canonical `goto_if_not/iL` alias — `bhimpl_goto_if_not_int_is_true =
+    // bhimpl_goto_if_not` (`blackhole.py:913`) routes both bytes to the
+    // same handler body.
+    builder.wire_handler(
+        "goto_if_not_pyre_u16/iL",
         handler_goto_if_not_int_is_true_pyre_u16,
     );
     // Sub-slice C.5: pyre-u16 variants for the inline_call test

@@ -60,7 +60,8 @@
 use std::collections::HashMap;
 use std::fmt::{self, Debug};
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::thread::{self, ThreadId};
 
 use crate::annotator::model::{KnownType, SomeValue};
 use crate::flowspace::model::{ConstValue, Constant, Hlvalue};
@@ -283,12 +284,20 @@ impl Setupstate {
 /// Interior mutability uses [`AtomicU8`] so Repr instances stored in
 /// `OnceLock`-backed singletons (`impossible_repr`, per-lltype caches)
 /// can survive Rust's `Sync` bound. Upstream Python is single-threaded
-/// so this only matters for the Rust adaptation; ordering is
-/// `Relaxed` since `setup()` is serialized by the rtyper's own
-/// sequential control flow.
+/// so the state machine assumes serial calls; pyre's parallel test
+/// harness exercises the singletons concurrently, so [`Repr::setup`]
+/// uses CAS to claim `InProgress` and tracks the owning [`ThreadId`]
+/// in [`ReprState::owner`] to keep RPython's same-thread recursion
+/// panic (`rmodel.py:45-47`) while letting other threads wait.
 #[derive(Debug)]
 pub struct ReprState {
     initialized: AtomicU8,
+    /// `Some(thread)` while `setup()` runs on this Repr; `None`
+    /// otherwise. Read under the implicit happens-before of
+    /// [`AtomicU8::compare_exchange`] on `initialized` — observers
+    /// that see `InProgress` are guaranteed to see the matching
+    /// owner store.
+    owner: Mutex<Option<ThreadId>>,
 }
 
 impl ReprState {
@@ -296,17 +305,31 @@ impl ReprState {
     pub fn new() -> Self {
         ReprState {
             initialized: AtomicU8::new(Setupstate::NotInitialized as u8),
+            owner: Mutex::new(None),
         }
     }
 
     /// Current state (read).
     pub fn get(&self) -> Setupstate {
-        Setupstate::from_u8(self.initialized.load(Ordering::Relaxed))
+        Setupstate::from_u8(self.initialized.load(Ordering::Acquire))
     }
 
     /// Force-set (write).
     pub fn set(&self, state: Setupstate) {
-        self.initialized.store(state as u8, Ordering::Relaxed);
+        self.initialized.store(state as u8, Ordering::Release);
+    }
+
+    /// Test-only helper: force `InProgress` on this state and stamp
+    /// the owner to the current thread. Lets the
+    /// `setup_on_inprogress_panics_like_upstream_assertion` parity
+    /// test simulate the "same thread already in setup" scenario the
+    /// upstream `raise AssertionError` (`rmodel.py:45-47`) panics
+    /// on, with pyre's CAS+thread-tracking model preserving that
+    /// panic on owner==current-thread.
+    #[doc(hidden)]
+    pub fn _force_inprogress_for_current_thread(&self) {
+        *self.owner.lock().unwrap() = Some(thread::current().id());
+        self.set(Setupstate::InProgress);
     }
 }
 
@@ -411,41 +434,65 @@ pub trait Repr: Debug + std::any::Any {
     /// ```
     fn setup(&self) -> Result<(), TyperError> {
         let state = self.state();
-        match state.get() {
-            Setupstate::Finished => return Ok(()),
-            Setupstate::Broken => {
-                return Err(TyperError::broken_repr(format!(
-                    "cannot setup already failed Repr: {}",
-                    self.repr_string()
-                )));
+        let me = thread::current().id();
+        loop {
+            match state.get() {
+                Setupstate::Finished => return Ok(()),
+                Setupstate::Broken => {
+                    return Err(TyperError::broken_repr(format!(
+                        "cannot setup already failed Repr: {}",
+                        self.repr_string()
+                    )));
+                }
+                Setupstate::InProgress => {
+                    // Single-threaded RPython panics on any InProgress
+                    // observation (`rmodel.py:45-47`). Pyre's parallel
+                    // tests share `OnceLock`-backed singletons, so
+                    // distinguish same-thread recursion (true bug)
+                    // from cross-thread overlap (wait).
+                    if state.owner.lock().unwrap().as_ref() == Some(&me) {
+                        panic!(
+                            "recursive invocation of Repr setup(): {}",
+                            self.repr_string()
+                        );
+                    }
+                    thread::yield_now();
+                    continue;
+                }
+                Setupstate::Delayed => {
+                    panic!(
+                        "Repr setup() is delayed and cannot be called yet: {}",
+                        self.repr_string()
+                    );
+                }
+                Setupstate::NotInitialized => {}
             }
-            Setupstate::InProgress => {
-                // upstream `raise AssertionError` — pyre surfaces the
-                // same diagnostic through TyperError since Rust has no
-                // AssertionError class and callers already handle
-                // TyperError on the specialize path.
-                panic!(
-                    "recursive invocation of Repr setup(): {}",
-                    self.repr_string()
-                );
+            // Try to atomically claim NotInitialized → InProgress.
+            // On race, another thread won; loop and re-observe.
+            if state
+                .initialized
+                .compare_exchange(
+                    Setupstate::NotInitialized as u8,
+                    Setupstate::InProgress as u8,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
+                continue;
             }
-            Setupstate::Delayed => {
-                panic!(
-                    "Repr setup() is delayed and cannot be called yet: {}",
-                    self.repr_string()
-                );
-            }
-            Setupstate::NotInitialized => {}
-        }
-        state.set(Setupstate::InProgress);
-        match self._setup_repr() {
-            Ok(()) => {
-                state.set(Setupstate::Finished);
-                Ok(())
-            }
-            Err(e) => {
-                state.set(Setupstate::Broken);
-                Err(e)
+            *state.owner.lock().unwrap() = Some(me);
+            let result = self._setup_repr();
+            *state.owner.lock().unwrap() = None;
+            match result {
+                Ok(()) => {
+                    state.set(Setupstate::Finished);
+                    return Ok(());
+                }
+                Err(e) => {
+                    state.set(Setupstate::Broken);
+                    return Err(e);
+                }
             }
         }
     }
@@ -2626,8 +2673,13 @@ mod tests {
     #[should_panic(expected = "recursive invocation of Repr setup()")]
     fn setup_on_inprogress_panics_like_upstream_assertion() {
         // rmodel.py:45-47 uses `raise AssertionError` — pyre panics.
+        // Pyre's CAS+thread-tracking model keys recursion detection on
+        // owner==current-thread, so simulate the "this thread is already
+        // in setup" state via the `_force_inprogress_for_current_thread`
+        // test helper instead of poking `state.set` (which would leave
+        // owner=None and cause the cross-thread wait loop to spin).
         let r = VoidRepr::new();
-        r.state().set(Setupstate::InProgress);
+        r.state()._force_inprogress_for_current_thread();
         let _ = r.setup();
     }
 

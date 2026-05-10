@@ -487,6 +487,29 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         majit_metainterp::blackhole::_ll_2_int_floordiv as *const (),
     );
 
+    // `support.py:274 _ll_1_cast_uint_to_float` / `_ll_1_cast_float_to_uint`
+    // residual-call targets emitted by
+    // `jit_codewriter/jtransform.rs:cast_*_to_*` (mirroring
+    // `jtransform.py:587-588 _do_builtin_call`).  Without these the
+    // codewriter falls back to `symbolic_fnaddr_for_path`, which
+    // produces a deterministic but unbound hash — fine for source
+    // analysis but unreachable at runtime.  The 1-segment root_path
+    // alias is what `CallTarget::function_path(["cast_uint_to_float"])`
+    // resolves against after `register_macro_helper_trace_fnaddr`
+    // strips the crate segment.
+    push_alias_pair(
+        &mut entries,
+        "majit_metainterp::blackhole::cast_uint_to_float",
+        "majit_metainterp::cast_uint_to_float",
+        majit_metainterp::blackhole::cast_uint_to_float as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "majit_metainterp::blackhole::cast_float_to_uint",
+        "majit_metainterp::cast_float_to_uint",
+        majit_metainterp::blackhole::cast_float_to_uint as *const (),
+    );
+
     entries
 }
 

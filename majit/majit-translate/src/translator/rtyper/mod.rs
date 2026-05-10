@@ -1,12 +1,14 @@
-//! `translator/rtyper/` — RPython-orthodox `rpython/rtyper/` counterparts
-//! that are not part of the LEGACY `translator_legacy/rtyper/` infra.
+//! `translator/rtyper/` — RPython-orthodox `rpython/rtyper/` counterparts.
 //!
-//! Files in this module mirror upstream `rpython/rtyper/` 1:1 by name and
-//! by structure (`rclass.py` → `rclass.rs`, `rpbc.py` → `rpbc.rs`).
-//! Until the standalone `majit-rtyper` crate (roadmap Phase 6) lands,
-//! the underlying `TypeResolutionState` machinery still lives under
-//! `translator_legacy/rtyper/rtyper.rs`; these modules import it from
-//! there as a temporary wiring bridge.
+//! Files in this module mirror upstream `rpython/rtyper/` 1:1 by name
+//! and by structure (`rclass.py` → `rclass.rs`, `rpbc.py` → `rpbc.rs`).
+//! The standalone `majit-rtyper` crate (roadmap Phase 6) is still
+//! pending; the underlying `TypeResolutionState` machinery lives in
+//! [`legacy_resolve`] inside this tree (relocated from the deleted
+//! `translate_legacy/` subtree at Slice 10).  The dual-gate Skip arm
+//! drives [`legacy_annotator::annotate`] +
+//! [`legacy_resolve::resolve_types`] for graphs that the real
+//! `RPythonTyper::specialize` path does not yet cover.
 
 pub mod annlowlevel;
 pub mod callparse;
@@ -14,11 +16,16 @@ pub mod cutover;
 pub mod error;
 pub mod extregistry;
 pub mod flowspace_adapter;
+pub mod legacy_annotator;
+#[cfg(test)]
+pub mod legacy_pipeline;
+pub mod legacy_resolve;
 pub mod llannotation;
 pub mod llinterp;
 pub mod lltypesystem;
 pub mod normalizecalls;
 pub mod pairtype;
+pub mod pyre_call_registry;
 pub mod rbool;
 pub mod rbuiltin;
 pub mod rclass;

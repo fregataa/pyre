@@ -254,18 +254,28 @@ impl LowLevelAnnotatorPolicy {
     pub fn lowlevelspecialize(
         &self,
         funcdesc: &FunctionDesc,
-        args_s: &mut Vec<SomeValue>,
+        args_s: &mut Vec<Option<SomeValue>>,
         key_for_args: &HashMap<usize, KeyComp>,
     ) -> Result<Rc<PyGraph>, TyperError> {
         let (args_s_flat, key1, builder) = funcdesc
             .flatten_star_args(args_s)
             .map_err(|e| TyperError::message(e.to_string()))?;
         let mut key = Vec::new();
-        let mut new_args_s = Vec::new();
-        for (i, s_obj) in args_s_flat.iter().enumerate() {
+        let mut new_args_s: Vec<Option<SomeValue>> = Vec::new();
+        for (i, s_slot) in args_s_flat.iter().enumerate() {
+            // upstream `annlowlevel.py:218-241` reads
+            // `args_s[i].is_constant() / .const / .__class__`; an
+            // unbound cell raises AttributeError there.  Mirror with
+            // fail-loud at access on the .as_ref().
+            let s_obj = s_slot.as_ref().ok_or_else(|| {
+                TyperError::message(format!(
+                    "lowlevelspecialize({}): args_s[{i}] is unannotated",
+                    funcdesc.name,
+                ))
+            })?;
             if let Some(keycomp) = key_for_args.get(&i) {
                 key.push(GraphCacheKey::KeyComp(keycomp.clone()));
-                new_args_s.push(s_obj.clone());
+                new_args_s.push(Some(s_obj.clone()));
             } else if let SomeValue::PBC(_pbc) = s_obj {
                 if !s_obj.is_constant() {
                     return Err(TyperError::message(
@@ -279,14 +289,14 @@ impl LowLevelAnnotatorPolicy {
                 key.push(GraphCacheKey::KeyComp(KeyComp::new(KeyCompValue::Const(
                     const_value,
                 ))));
-                new_args_s.push(s_obj.clone());
+                new_args_s.push(Some(s_obj.clone()));
             } else if matches!(s_obj, SomeValue::None_(_)) {
                 key.push(GraphCacheKey::KeyComp(KeyComp::new(KeyCompValue::Const(
                     ConstValue::None,
                 ))));
-                new_args_s.push(s_obj.clone());
+                new_args_s.push(Some(s_obj.clone()));
             } else {
-                new_args_s.push(not_const(s_obj));
+                new_args_s.push(Some(not_const(s_obj)));
                 match annotation_to_lltype(s_obj, None) {
                     Ok(lltype) => key.push(GraphCacheKey::LowLevelType(lltype)),
                     Err(_) => key.push(GraphCacheKey::SomeValueTag(s_obj.tag())),
@@ -313,7 +323,7 @@ impl LowLevelAnnotatorPolicy {
     pub fn default_specialize(
         &self,
         funcdesc: &crate::annotator::description::FunctionDesc,
-        args_s: &mut Vec<SomeValue>,
+        args_s: &mut Vec<Option<SomeValue>>,
     ) -> Result<Rc<PyGraph>, TyperError> {
         self.lowlevelspecialize(funcdesc, args_s, &std::collections::HashMap::new())
     }
@@ -325,7 +335,7 @@ impl LowLevelAnnotatorPolicy {
     pub fn specialize_ll(
         &self,
         funcdesc: &crate::annotator::description::FunctionDesc,
-        args_s: &mut Vec<SomeValue>,
+        args_s: &mut Vec<Option<SomeValue>>,
     ) -> Result<Rc<PyGraph>, TyperError> {
         self.default_specialize(funcdesc, args_s)
     }
@@ -347,13 +357,14 @@ impl LowLevelAnnotatorPolicy {
     pub fn specialize_ll_and_arg(
         &self,
         funcdesc: &FunctionDesc,
-        args_s: &mut Vec<SomeValue>,
+        args_s: &mut Vec<Option<SomeValue>>,
         argindices: &[usize],
     ) -> Result<Rc<PyGraph>, TyperError> {
         let mut keys = HashMap::new();
         for &i in argindices {
             let const_value = args_s
                 .get(i)
+                .and_then(|s| s.as_ref())
                 .and_then(SomeValue::const_)
                 .cloned()
                 .ok_or_else(|| {
@@ -482,7 +493,7 @@ impl MixLevelAnnotatorPolicy {
     pub fn default_specialize(
         &self,
         funcdesc: &FunctionDesc,
-        args_s: &mut Vec<SomeValue>,
+        args_s: &mut Vec<Option<SomeValue>>,
     ) -> Result<Rc<PyGraph>, TyperError> {
         let name = &funcdesc.name;
         if name.starts_with("ll_") || name.starts_with("_ll_") {
@@ -510,7 +521,7 @@ impl MixLevelAnnotatorPolicy {
     pub fn specialize_arglltype(
         &self,
         funcdesc: &FunctionDesc,
-        args_s: &[SomeValue],
+        args_s: &[Option<SomeValue>],
         i: usize,
     ) -> Result<Rc<PyGraph>, TyperError> {
         let rtyper = self
@@ -518,7 +529,10 @@ impl MixLevelAnnotatorPolicy {
             .rtyper
             .upgrade()
             .ok_or_else(|| TyperError::message("MixLevelAnnotatorPolicy: rtyper dropped"))?;
-        let key = rtyper.getrepr(&args_s[i])?.lowleveltype().clone();
+        let s = args_s[i].as_ref().ok_or_else(|| {
+            TyperError::message(format!("specialize__arglltype: args_s[{i}] is unannotated"))
+        })?;
+        let key = rtyper.getrepr(s)?.lowleveltype().clone();
         let alt_name = valid_identifier(format!("{}__for_{}LlT", funcdesc.name, key.short_name()));
         funcdesc
             .cachedgraph(GraphCacheKey::LowLevelType(key), Some(&alt_name), None)
@@ -536,12 +550,15 @@ impl MixLevelAnnotatorPolicy {
     pub fn specialize_genconst(
         &self,
         funcdesc: &FunctionDesc,
-        args_s: &mut Vec<SomeValue>,
+        args_s: &mut Vec<Option<SomeValue>>,
         i: usize,
     ) -> Result<Rc<PyGraph>, TyperError> {
-        let typ = annotation_to_lltype(&args_s[i], Some("genconst"))
+        let s = args_s[i].as_ref().ok_or_else(|| {
+            TyperError::message(format!("specialize__genconst: args_s[{i}] is unannotated"))
+        })?;
+        let typ = annotation_to_lltype(s, Some("genconst"))
             .map_err(|e| TyperError::message(e.to_string()))?;
-        args_s[i] = lltype_to_annotation(typ.clone());
+        args_s[i] = Some(lltype_to_annotation(typ.clone()));
         let alt_name = valid_identifier(format!("{}__{}", funcdesc.name, typ.short_name()));
         funcdesc
             .cachedgraph(GraphCacheKey::LowLevelType(typ), Some(&alt_name), None)
@@ -585,7 +602,7 @@ impl From<MixLevelAnnotatorPolicy> for PolicyHandle {
 pub struct PendingHelper {
     pub ll_function: HostObject,
     pub graph: Rc<PyGraph>,
-    pub args_s: Vec<SomeValue>,
+    pub args_s: Vec<Option<SomeValue>>,
     pub s_result: SomeValue,
 }
 
@@ -733,7 +750,9 @@ impl MixLevelHelperAnnotator {
             .zip(args_s.iter())
         {
             if let crate::flowspace::model::Hlvalue::Variable(mut v_arg) = v_arg {
-                ann.setbinding(&mut v_arg, s_arg.clone());
+                if let Some(s_arg) = s_arg.clone() {
+                    ann.setbinding(&mut v_arg, s_arg);
+                }
             }
         }
         if let crate::flowspace::model::Hlvalue::Variable(mut retvar) =
@@ -1086,12 +1105,30 @@ impl MixLevelHelperAnnotator {
                 let s_function = bk
                     .immutablevalue(&ConstValue::HostObject(ll_function.clone()))
                     .map_err(|e| TyperError::message(e.to_string()))?;
+                // Post-specialize, args_s carries `Some(_)` for every
+                // slot (specialize re-wraps after normalize_args).
+                // emulate_pbc_call's `&[SomeValue]` shape stays as-is —
+                // unwrap each cell here, surfacing any unannotated
+                // residue as a fail-loud error matching upstream
+                // `bookkeeper.emulate_pbc_call`'s downstream
+                // AttributeError surface.
+                let args_s_concrete: Vec<SomeValue> = args_s
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| {
+                        s.clone().ok_or_else(|| {
+                            TyperError::message(format!(
+                                "MixLevelHelperAnnotator: args_s[{i}] is unannotated post-specialize"
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
                 bk.emulate_pbc_call(
                     crate::annotator::bookkeeper::EmulatedPbcCallKey::Graph(GraphKey::of(
                         &graph.graph,
                     )),
                     &s_function,
-                    args_s,
+                    &args_s_concrete,
                     &[],
                     None,
                 )

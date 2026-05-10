@@ -30,7 +30,7 @@
 //!    and drop this fallback together with the projection.
 //!
 //! The `annotate()` algorithm in
-//! `translate_legacy/annotator/annrpython.rs` populates `types` only;
+//! `translator/rtyper/legacy_annotator.rs` populates `types` only;
 //! producers can populate `some_values` opportunistically (e.g. the
 //! frontend's struct/PBC/Ptr cases) without breaking back-compat.
 
@@ -64,7 +64,21 @@ use crate::model::{ValueId, ValueType};
 /// projects to a definite `SomeValue` shell.
 pub fn valuetype_to_someshell(vt: &ValueType) -> Option<SomeValue> {
     match vt {
+        // `Int` shells to `SomeInteger { unsigned: false }` (default);
+        // `Unsigned` shells to `SomeInteger { unsigned: true }` so the
+        // rtyper picks `IntegerRepr.lowleveltype = Unsigned`
+        // (`rint.py:_init_repr`).  `getkind(Unsigned) == 'int'` so the
+        // codewriter / regalloc share register classes via Int|Unsigned
+        // arms downstream.
         ValueType::Int => Some(SomeValue::Integer(SomeInteger::default())),
+        ValueType::Unsigned => Some(SomeValue::Integer(SomeInteger::new(false, true))),
+        // RPython `SomeBool` (`annotator/model.py:185-198`) is a
+        // distinct lattice node from `SomeInteger`; the rtyper picks
+        // `BoolRepr` (`rmodel.rs::BoolRepr`) which lowers to LL `Bool`
+        // (integer-compatible).  Until a richer Bool annotation lands
+        // (with truthy_value tracking per `model.py:188-194`), shape it
+        // as `SomeBool::default` matching `SomeBool()` upstream.
+        ValueType::Bool => Some(SomeValue::Bool(crate::annotator::model::SomeBool::default())),
         ValueType::Float => Some(SomeValue::Float(SomeFloat::default())),
         ValueType::Ref => {
             // RPython `SomeInstance(classdef=None, can_be_None=False,

@@ -18,6 +18,57 @@ pub struct ValueId(pub usize);
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ValueType {
     Int,
+    /// `lltype.Unsigned` — register class is `'int'` per
+    /// `getkind(Unsigned) == 'int'`, distinct from `Signed` only at
+    /// the rtyper dispatch level (`rbool.py:78 uint_is_true`,
+    /// `rint.py` cast family).  Downstream consumers that do not
+    /// distinguish signedness (regalloc, jit_codewriter,
+    /// valuetype_to_someshell) treat `Unsigned` identically to `Int`
+    /// via `Int | Unsigned` arms.
+    ///
+    /// SCAFFOLDED, NOT YET REACHED FROM PYRE SOURCE.  The producer
+    /// (`front/ast.rs:classify_fn_arg_ty`) currently folds Rust
+    /// `u8`/`u16`/`u32`/`u64`/`usize` into `Int` because flipping
+    /// them onto this arm cascades into pyre-source analysis
+    /// regressions (`annotator/unaryop.rs:445` getattr,
+    /// `assembler.rs:581` kind-mismatch in `setinteriorfield_gc_r`).
+    /// The `cast_op_name` Unsigned arms (`cast_uint_to_*`,
+    /// `cast_*_to_uint`, `uint_is_true`) and the matching rtyper
+    /// handlers (`rtype_cast_uint_to_float` /
+    /// `rtype_cast_float_to_uint` / `rtype_uint_is_true`) are wired
+    /// for the eventual flip — see `front/ast.rs:classify_fn_arg_ty`
+    /// TODO(unsigned-producer-flip) for the convergence path.
+    Unsigned,
+    /// RPython `SomeBool` (`annotator/model.py:185-198`): a Python `bool`
+    /// at the annotator level.  Distinct from `Int` (RPython `SomeInteger`,
+    /// `:200-264`) because PyPy's flowspace `UNARY_NOT` (`flowcontext.py:531-538`,
+    /// `op.bool` then `guessbool` fork) and `UNARY_INVERT` (`:188-191`,
+    /// `op.invert`) dispatch on which one is on the stack:
+    /// `not` for booleans, `~` for integers.
+    ///
+    /// Every comparison opname (`lt`/`le`/`eq`/`ne`/`gt`/`ge`,
+    /// `operation.py:505-510 add_operator(.., dispatch=2, pure=True)`),
+    /// `is`/`is not`, the unary `bool` op, and Rust `bool`-typed locals
+    /// produce `Bool`.
+    ///
+    /// `Lit::Bool` and the `UNARY_NOT` arms in `front/ast.rs` emit
+    /// the dedicated `OpKind::ConstBool(bool)` variant; the rtyper
+    /// adapter lifts it to `Constant(True/False, lltype.Bool)` so the
+    /// annotator selects `SomeBool` and the rtyper picks `BoolRepr`.
+    /// The codewriter collapses storage to the int kind via
+    /// `getkind(Bool) == 'int'`
+    /// (`rpython/jit/codewriter/flatten.py:getkind`); the assembler
+    /// emits `int_copy/i>i` for both `ConstInt` and `ConstBool`.
+    ///
+    /// Pyre's annotator-side `valuetype_to_someshell`
+    /// (`annotation_state.rs::valuetype_to_someshell`) lifts `Bool`
+    /// to `SomeBool(unspecified)`.  The rtyper has `BoolRepr`
+    /// available (`rmodel.rs::BoolRepr`); the high-level dispatch in
+    /// `RPythonTyper::translate_op` continues to share rint paths for
+    /// arithmetic operations because RPython's `BoolRepr.lowleveltype
+    /// = Bool` is integer-compatible at the LL level (everything
+    /// except logical-vs-bitwise distinguishes).
+    Bool,
     Ref,
     Float,
     Void,
@@ -80,6 +131,33 @@ pub enum UnsupportedExprKind {
     TryBlock,
     Verbatim,
     Yield,
+    /// Rust `!x` whose operand has no statically-known bool/int type.
+    /// RPython distinguishes UNARY_NOT (`flowcontext.py:531-538`) from
+    /// UNARY_INVERT (`flowcontext.py:188-191`) at the bytecode token,
+    /// so an Unknown operand cannot pick the parity-correct flowspace
+    /// op without guessing.
+    UnaryNotUnknownOperand,
+    /// Multi-segment `Expr::Path` (e.g. `Into::into`, `Foo::bar`) used
+    /// as a value rather than as a call target.  RPython has no analogue
+    /// — `flowcontext.py:LOAD_GLOBAL` lifts a name lookup to a constant
+    /// (registered `FuncDesc` / class) or raises `FlowingError`; pyre
+    /// has no `Const(PBCRef)` IR variant for a bare path-as-value, so
+    /// classifying these explicitly as `Abort` keeps the producer site
+    /// distinct from the "cross-block local was not threaded" category
+    /// (the prior fall-through emitted naked `OpKind::Input { name:
+    /// "Foo::bar" }` and tripped `adapter cross-block body Input`).
+    PathConstantRef,
+    /// Rust `|args| body` closure expression used as a value (closure
+    /// capture / function-pointer argument).  RPython has no closure
+    /// model in flowspace — `flowcontext.py:1235 MAKE_FUNCTION` raises
+    /// `FlowingError` for nested-fn / lambda surfaces (only top-level
+    /// `FunctionGraph`s round-trip through the bookkeeper).  Pyre's
+    /// `syn::Expr::Closure` arm produces an `Unknown` marker for the
+    /// closure value rather than walking the body — inlining it would
+    /// be a NEW-DEVIATION (treats the closure as a synchronous block).
+    /// Classified separately from `OtherExpr` so the producer site is
+    /// distinguishable from the catch-all in dual-gate diagnostics.
+    Closure,
     OtherExpr,
 }
 
@@ -292,6 +370,15 @@ pub enum OpKind {
         ty: ValueType,
     },
     ConstInt(i64),
+    /// RPython `flowmodel.py:Constant(bool_value)` — a bool constant
+    /// whose `concretetype` is `lltype.Bool`. The codewriter folds Bool
+    /// into kind `'int'` (`rpython/jit/codewriter/flatten.py:getkind`),
+    /// so backend lowering shares the integer materialization path with
+    /// `ConstInt`. Distinct from `ConstInt(0/1)` at the annotator /
+    /// rtyper layer: lifts to `SomeBool` (`annotator/model.py:227`)
+    /// instead of `SomeInteger`, and selects `BoolRepr`
+    /// (`rpython/rtyper/rbool.py:10`) instead of `IntegerRepr`.
+    ConstBool(bool),
     /// RPython `flowmodel.py:Constant(rfloat)` — a float constant whose
     /// `concretetype` is `lltype.Float`.  Stored as the f64 bit pattern
     /// (`history.py:265 ConstFloat.getfloatstorage`) so PartialEq/Hash
@@ -1959,6 +2046,43 @@ impl FunctionGraph {
     /// Get the name of a value, if any.
     pub fn value_name(&self, id: ValueId) -> Option<&str> {
         self.value_names.get(&id).map(|s| s.as_str())
+    }
+
+    /// Whether `id` is the result of a constant-define `OpKind` —
+    /// RPython's analogue is `Constant` (immutable wrapper around a
+    /// Python literal).  STORE_FAST upstream
+    /// (`flowspace/flowcontext.py:878-885`) only renames the rhs
+    /// when it is a `Variable`; pyre's `name_value` is a ValueId-
+    /// keyed metadata side table that would otherwise attach a
+    /// local name to a constant define-op, breaking the 1:1
+    /// structural correspondence.
+    ///
+    /// **Maintenance contract**: every new constant-producing
+    /// `OpKind` variant must be added to the predicate below.
+    /// Today the only constant-define `OpKind`s are `ConstInt` and
+    /// `ConstFloat`; if pyre's frontend later adds e.g.
+    /// `ConstBool` / `ConstStr` / `ConstNone` opvariants for
+    /// `LOAD_CONST`-equivalents
+    /// (`flowcontext.py:858-869` + `operation.py:152`), this match
+    /// must extend to cover them so the STORE_FAST rename gate
+    /// stays parity-faithful.
+    pub fn is_constant_define_value(&self, id: ValueId) -> bool {
+        self.iter_block_ops().any(|(_, op)| {
+            op.result == Some(id)
+                && match &op.kind {
+                    // RPython `Constant(int_value)` — integer-literal
+                    // define op.
+                    OpKind::ConstInt(_) => true,
+                    // RPython `Constant(bool_value)` (lltype.Bool).
+                    OpKind::ConstBool(_) => true,
+                    // RPython `Constant(float_value)`.
+                    OpKind::ConstFloat(_) => true,
+                    // Every other variant is computed via flowspace
+                    // operators or recorder hooks; results are
+                    // RPython `Variable`s.
+                    _ => false,
+                }
+        })
     }
 
     pub fn block_mut(&mut self, block: BlockId) -> &mut Block {

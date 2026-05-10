@@ -914,6 +914,351 @@ fn rtype_builtin_list(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RT
     arg_repr(hop, 0)?.rtype_bltn_list(hop)
 }
 
+/// RPython `@typer_for(lltype.cast_ptr_to_int)` (rbuiltin.py:543-548):
+///
+/// ```python
+/// @typer_for(lltype.cast_ptr_to_int)
+/// def rtype_cast_ptr_to_int(hop):
+///     assert isinstance(hop.args_r[0], rptr.PtrRepr)
+///     vlist = hop.inputargs(hop.args_r[0])
+///     hop.exception_cannot_occur()
+///     return hop.genop('cast_ptr_to_int', vlist,
+///                      resulttype=lltype.Signed)
+/// ```
+///
+/// Pyre dispatch divergence — RPython reaches this body through
+/// `simple_call(lltype.cast_ptr_to_int, p) → Repr.rtype_simple_call →
+/// @typer_for(lltype.cast_ptr_to_int)`. Pyre's surface DSL has no
+/// `lltype.*` HostObject (M2.5g extern-Rust-helper registry walker
+/// epic), so the frontend at `front/ast.rs:4041 cast_op_name` emits
+/// the op as a HIGH-LEVEL `OpKind::UnaryOp { op: "cast_ptr_to_int",
+/// .. }` directly. The adapter forwards this via
+/// `flowspace_adapter.rs:395 normalize_unary_op_name`, so the rtyper
+/// observes a SpaceOperation with opname `cast_ptr_to_int` and
+/// dispatches it through `RPythonTyper::translate_operation`'s
+/// `cast_ptr_to_int` arm — the body below is verbatim
+/// `rtype_cast_ptr_to_int`.
+pub fn rtype_cast_ptr_to_int(hop: &HighLevelOp) -> RTypeResult {
+    use crate::flowspace::model::Hlvalue;
+    use crate::translator::rtyper::rmodel::PtrRepr;
+    use crate::translator::rtyper::rtyper::{ConvertedTo, GenopResult};
+
+    // TODO(typed-ref-someptr-followup-epic Phase 2,
+    // `~/.claude/plans/typed-ref-someptr-followup-epic.md`): pyre's
+    // surface DSL has no `lltype.*` HostObject (M2.5g extern Rust
+    // helper registry walker epic), so typed `&Foo` references lift
+    // to `SomeInstance(classdef=None)` instead of upstream's
+    // `SomePtr(ll_ptrtype)`.  That makes `hop.args_r[0]` arrive as
+    // `InstanceRepr` (lowleveltype `Ptr(GcStruct(OBJECT))`) rather
+    // than `PtrRepr`, so the upstream
+    // `assert isinstance(hop.args_r[0], rptr.PtrRepr)` cannot run
+    // directly.  The operand's concretetype is already a `Ptr(...)`
+    // (`InstanceRepr.lowleveltype`), so we relabel `args_r[0]` as
+    // `PtrRepr(operand_lltype)`; the relabel is a noop at LL because
+    // the underlying lowleveltype is unchanged.  Convergence path:
+    // M2.5g lands → frontend lifts typed `&Foo` to
+    // `SomeValue::Ptr(SomePtr::new(t))` directly → this swap retires
+    // (`rptr.py:13-14 SomePtr.rtyper_makerepr` produces `PtrRepr`
+    // upstream).
+    let needs_swap = hop.args_r.borrow()[0]
+        .as_ref()
+        .map_or(false, |r| r.repr_class_id() != ReprClassId::PtrRepr);
+    if needs_swap {
+        let v = hop.args_v.borrow()[0].clone();
+        let concrete = match &v {
+            Hlvalue::Variable(var) => var.concretetype(),
+            Hlvalue::Constant(c) => c.concretetype.clone(),
+        };
+        let ptr = match concrete {
+            Some(LowLevelType::Ptr(p)) => *p,
+            other => {
+                return Err(TyperError::message(format!(
+                    "rtype_cast_ptr_to_int: operand concretetype must be Ptr(...) for \
+                     late InstanceRepr→PtrRepr swap (typed-ref-someptr-followup-epic \
+                     Phase 2), got {other:?}"
+                )));
+            }
+        };
+        hop.args_r.borrow_mut()[0] = Some(Arc::new(PtrRepr::new(ptr)) as Arc<dyn Repr>);
+    }
+
+    let r_arg1 = arg_repr(hop, 0)?;
+    // RPython `rbuiltin.py:545 assert isinstance(hop.args_r[0], rptr.PtrRepr)`.
+    assert!(
+        matches!(r_arg1.repr_class_id(), ReprClassId::PtrRepr),
+        "rtype_cast_ptr_to_int: hop.args_r[0] must be PtrRepr after \
+         InstanceRepr→PtrRepr relabel, got {:?}",
+        r_arg1.repr_class_id()
+    );
+    let vlist = hop.inputargs(vec![ConvertedTo::Repr(r_arg1.as_ref())])?;
+    hop.exception_cannot_occur()?;
+    Ok(hop.genop(
+        "cast_ptr_to_int",
+        vlist,
+        GenopResult::LLType(LowLevelType::Signed),
+    ))
+}
+
+/// RPython `rtyper.py:478-481 same_as` — internal renaming op the
+/// rtyper emits to copy a value into a fresh result variable while
+/// preserving its lltype.  Pyre's frontend at `front/ast.rs:5879
+/// cast_op_name` returns `"same_as"` for category-matching casts
+/// (e.g. `i32 as i64`, `u32 as usize`, `*const T as *mut T`) — both
+/// operands lift to the same `ValueType`, so the cast is a noop at
+/// pyre's value-type level but still surfaces as a real
+/// `OpKind::UnaryOp { op: "same_as", .. }` (no silent elision; see
+/// the front/ast.rs:3676 commentary).  The handler emits the
+/// equivalent low-level `same_as` op and lets jtransform / regalloc
+/// downstream collapse it where safe.
+pub fn rtype_same_as(hop: &HighLevelOp) -> RTypeResult {
+    use crate::translator::rtyper::rtyper::{ConvertedTo, GenopResult};
+
+    let r_arg1 = arg_repr(hop, 0)?;
+    let lltype = r_arg1.lowleveltype().clone();
+    let vlist = hop.inputargs(vec![ConvertedTo::Repr(r_arg1.as_ref())])?;
+    hop.exception_cannot_occur()?;
+    Ok(hop.genop("same_as", vlist, GenopResult::LLType(lltype)))
+}
+
+/// RPython `rint.py:651-652` — `cast_int_to_float` is emitted by
+/// `IntegerRepr.rtype_float` (and `IntegerRepr.convert_to_float`'s
+/// `pair_integer_float_convert_from_to` helper at `rint.rs:686`)
+/// when an integer value lifts to a Float.  Pyre's frontend at
+/// `front/ast.rs:5875 cast_op_name` returns `"cast_int_to_float"`
+/// for `(Some(Int), Float)` pair surface casts, surfacing a direct
+/// `OpKind::UnaryOp` because pyre has no `lltype.cast_int_to_float`
+/// HostObject (M2.5g epic).
+pub fn rtype_cast_int_to_float(hop: &HighLevelOp) -> RTypeResult {
+    use crate::translator::rtyper::rtyper::{ConvertedTo, GenopResult};
+
+    let r_arg1 = arg_repr(hop, 0)?;
+    let vlist = hop.inputargs(vec![ConvertedTo::Repr(r_arg1.as_ref())])?;
+    hop.exception_cannot_occur()?;
+    Ok(hop.genop(
+        "cast_int_to_float",
+        vlist,
+        GenopResult::LLType(LowLevelType::Float),
+    ))
+}
+
+/// RPython `rint.py:667-668` — `cast_float_to_int` is emitted by
+/// `FloatRepr.rtype_int` (`rfloat.py:53`) and
+/// `pair_float_integer_convert_from_to` (`rint.rs:711`) when a
+/// float value lifts to a Signed int.  Pyre's frontend emits
+/// `"cast_float_to_int"` directly for `(Some(Float), Int)` pair
+/// surface casts; mirror of `rtype_cast_int_to_float` above.
+pub fn rtype_cast_float_to_int(hop: &HighLevelOp) -> RTypeResult {
+    use crate::translator::rtyper::rtyper::{ConvertedTo, GenopResult};
+
+    let r_arg1 = arg_repr(hop, 0)?;
+    let vlist = hop.inputargs(vec![ConvertedTo::Repr(r_arg1.as_ref())])?;
+    hop.exception_cannot_occur()?;
+    Ok(hop.genop(
+        "cast_float_to_int",
+        vlist,
+        GenopResult::LLType(LowLevelType::Signed),
+    ))
+}
+
+/// RPython `rbuiltin.py:551-557 @typer_for(lltype.cast_int_to_ptr)`.
+///
+/// ```python
+/// @typer_for(lltype.cast_int_to_ptr)
+/// def rtype_cast_int_to_ptr(hop):
+///     assert hop.args_s[0].is_constant()
+///     v_type, v_input = hop.inputargs(lltype.Void, lltype.Signed)
+///     hop.exception_cannot_occur()
+///     return hop.genop('cast_int_to_ptr', [v_input],
+///                      resulttype=hop.r_result.lowleveltype)
+/// ```
+///
+/// Upstream takes a 2-arg `simple_call(lltype.cast_int_to_ptr, T,
+/// v_int)` shape — `args_s[0]` is the constant target type `T`
+/// (Void-typed at LL, just a marker) and `args_s[1]` is the
+/// integer value.  Pyre's frontend emits a 1-arg
+/// `OpKind::UnaryOp { op: "cast_int_to_ptr", operand, result_ty:
+/// Ref }` because the surface DSL has no `lltype.*` HostObject; the
+/// target Ptr type is recovered from `hop.r_result.lowleveltype`,
+/// which the rtyper assigned when annotating the result variable.
+pub fn rtype_cast_int_to_ptr(hop: &HighLevelOp) -> RTypeResult {
+    use crate::translator::rtyper::rtyper::{ConvertedTo, GenopResult};
+
+    let r_result = hop
+        .r_result
+        .borrow()
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| TyperError::message("rtype_cast_int_to_ptr: missing r_result"))?;
+    let result_lltype = r_result.lowleveltype().clone();
+    let vlist = hop.inputargs(vec![ConvertedTo::LowLevelType(&LowLevelType::Signed)])?;
+    hop.exception_cannot_occur()?;
+    Ok(hop.genop("cast_int_to_ptr", vlist, GenopResult::LLType(result_lltype)))
+}
+
+/// `rbool.py:62-71 pairtype(BoolRepr, IntegerRepr).convert_from_to`
+/// emits `genop('cast_bool_to_int', [v], resulttype=Signed)` when the
+/// destination is the Signed integer repr.  Pyre's frontend at
+/// `front/ast.rs::cast_op_name` returns `"cast_bool_to_int"` for the
+/// `(Some(Bool), Int)` pair and surfaces a direct `OpKind::UnaryOp`
+/// because the surface DSL has no `lltype.cast_bool_to_int` HostObject.
+/// Mirror of `rtype_cast_int_to_float` above with the lowleveltypes
+/// flipped: input Bool, output Signed.
+pub fn rtype_cast_bool_to_int(hop: &HighLevelOp) -> RTypeResult {
+    use crate::translator::rtyper::rtyper::{ConvertedTo, GenopResult};
+
+    let vlist = hop.inputargs(vec![ConvertedTo::LowLevelType(&LowLevelType::Bool)])?;
+    hop.exception_cannot_occur()?;
+    Ok(hop.genop(
+        "cast_bool_to_int",
+        vlist,
+        GenopResult::LLType(LowLevelType::Signed),
+    ))
+}
+
+/// `rbool.py:50-55 pairtype(BoolRepr, FloatRepr).convert_from_to`
+/// emits `genop('cast_bool_to_float', [v], resulttype=Float)` when the
+/// destination is FloatRepr.  Companion to [`rtype_cast_bool_to_int`].
+pub fn rtype_cast_bool_to_float(hop: &HighLevelOp) -> RTypeResult {
+    use crate::translator::rtyper::rtyper::{ConvertedTo, GenopResult};
+
+    let vlist = hop.inputargs(vec![ConvertedTo::LowLevelType(&LowLevelType::Bool)])?;
+    hop.exception_cannot_occur()?;
+    Ok(hop.genop(
+        "cast_bool_to_float",
+        vlist,
+        GenopResult::LLType(LowLevelType::Float),
+    ))
+}
+
+/// `rbool.py:81-83 pairtype(IntegerRepr, BoolRepr).convert_from_to`
+/// emits `genop('int_is_true', [v], resulttype=Bool)` when the source
+/// is Signed (the Unsigned arm at :77-80 emits `uint_is_true`, which
+/// pyre doesn't surface today).  Pyre's frontend emits `"int_is_true"`
+/// directly for `(Some(Int), Bool)` casts.  Equivalent to
+/// `IntegerRepr.rtype_bool` (`rint.py`) which calls the same `genop`.
+pub fn rtype_int_is_true(hop: &HighLevelOp) -> RTypeResult {
+    use crate::translator::rtyper::rtyper::{ConvertedTo, GenopResult};
+
+    let vlist = hop.inputargs(vec![ConvertedTo::LowLevelType(&LowLevelType::Signed)])?;
+    hop.exception_cannot_occur()?;
+    Ok(hop.genop(
+        "int_is_true",
+        vlist,
+        GenopResult::LLType(LowLevelType::Bool),
+    ))
+}
+
+/// `rfloat.py:31-33 FloatRepr.rtype_bool` emits `genop('float_is_true',
+/// vlist, resulttype=Bool)`.  Pyre's frontend emits `"float_is_true"`
+/// directly for `(Some(Float), Bool)` casts.
+pub fn rtype_float_is_true(hop: &HighLevelOp) -> RTypeResult {
+    use crate::translator::rtyper::rtyper::{ConvertedTo, GenopResult};
+
+    let vlist = hop.inputargs(vec![ConvertedTo::LowLevelType(&LowLevelType::Float)])?;
+    hop.exception_cannot_occur()?;
+    Ok(hop.genop(
+        "float_is_true",
+        vlist,
+        GenopResult::LLType(LowLevelType::Bool),
+    ))
+}
+
+/// `rbool.py:77-80 pairtype(IntegerRepr, BoolRepr).convert_from_to`
+/// emits `genop('uint_is_true', [v], resulttype=Bool)` when the source
+/// is Unsigned (the Signed arm at :81-83 emits `int_is_true`).  Pyre's
+/// frontend at `front/ast.rs::cast_op_name` returns `"uint_is_true"`
+/// for `(Some(Unsigned), Bool)` casts.
+pub fn rtype_uint_is_true(hop: &HighLevelOp) -> RTypeResult {
+    use crate::translator::rtyper::rtyper::{ConvertedTo, GenopResult};
+
+    let vlist = hop.inputargs(vec![ConvertedTo::LowLevelType(&LowLevelType::Unsigned)])?;
+    hop.exception_cannot_occur()?;
+    Ok(hop.genop(
+        "uint_is_true",
+        vlist,
+        GenopResult::LLType(LowLevelType::Bool),
+    ))
+}
+
+/// `rint.py` integer cross-signedness conversion: `Unsigned → Signed`
+/// at the LL layer is `cast_uint_to_int`.  Pyre's frontend emits this
+/// for `(Some(Unsigned), Int)` casts.
+pub fn rtype_cast_uint_to_int(hop: &HighLevelOp) -> RTypeResult {
+    use crate::translator::rtyper::rtyper::{ConvertedTo, GenopResult};
+
+    let vlist = hop.inputargs(vec![ConvertedTo::LowLevelType(&LowLevelType::Unsigned)])?;
+    hop.exception_cannot_occur()?;
+    Ok(hop.genop(
+        "cast_uint_to_int",
+        vlist,
+        GenopResult::LLType(LowLevelType::Signed),
+    ))
+}
+
+/// `rint.py` integer cross-signedness conversion: `Signed → Unsigned`
+/// at the LL layer is `cast_int_to_uint`.  Pyre's frontend emits this
+/// for `(Some(Int), Unsigned)` casts.
+pub fn rtype_cast_int_to_uint(hop: &HighLevelOp) -> RTypeResult {
+    use crate::translator::rtyper::rtyper::{ConvertedTo, GenopResult};
+
+    let vlist = hop.inputargs(vec![ConvertedTo::LowLevelType(&LowLevelType::Signed)])?;
+    hop.exception_cannot_occur()?;
+    Ok(hop.genop(
+        "cast_int_to_uint",
+        vlist,
+        GenopResult::LLType(LowLevelType::Unsigned),
+    ))
+}
+
+/// `rfloat.py` companion: `Unsigned → Float` lifts via
+/// `cast_uint_to_float` (mirror of `rtype_cast_int_to_float` for the
+/// unsigned source domain).  Pyre's frontend emits this for
+/// `(Some(Unsigned), Float)` casts.
+pub fn rtype_cast_uint_to_float(hop: &HighLevelOp) -> RTypeResult {
+    use crate::translator::rtyper::rtyper::{ConvertedTo, GenopResult};
+
+    let vlist = hop.inputargs(vec![ConvertedTo::LowLevelType(&LowLevelType::Unsigned)])?;
+    hop.exception_cannot_occur()?;
+    Ok(hop.genop(
+        "cast_uint_to_float",
+        vlist,
+        GenopResult::LLType(LowLevelType::Float),
+    ))
+}
+
+/// `rfloat.py` companion: `Float → Unsigned` (mirror of
+/// `rtype_cast_float_to_int` for the unsigned destination domain).
+/// Pyre's frontend emits `"cast_float_to_uint"` for `(Some(Float),
+/// Unsigned)` casts.
+pub fn rtype_cast_float_to_uint(hop: &HighLevelOp) -> RTypeResult {
+    use crate::translator::rtyper::rtyper::{ConvertedTo, GenopResult};
+
+    let vlist = hop.inputargs(vec![ConvertedTo::LowLevelType(&LowLevelType::Float)])?;
+    hop.exception_cannot_occur()?;
+    Ok(hop.genop(
+        "cast_float_to_uint",
+        vlist,
+        GenopResult::LLType(LowLevelType::Unsigned),
+    ))
+}
+
+/// `rbool.py:62-66 pairtype(BoolRepr, IntegerRepr).convert_from_to`
+/// at the Unsigned arm emits `genop('cast_bool_to_uint', [v],
+/// resulttype=Unsigned)`.  Pyre's frontend emits `"cast_bool_to_uint"`
+/// for `(Some(Bool), Unsigned)` casts (mirror of
+/// `rtype_cast_bool_to_int` with destination Unsigned).
+pub fn rtype_cast_bool_to_uint(hop: &HighLevelOp) -> RTypeResult {
+    use crate::translator::rtyper::rtyper::{ConvertedTo, GenopResult};
+
+    let vlist = hop.inputargs(vec![ConvertedTo::LowLevelType(&LowLevelType::Bool)])?;
+    hop.exception_cannot_occur()?;
+    Ok(hop.genop(
+        "cast_bool_to_uint",
+        vlist,
+        GenopResult::LLType(LowLevelType::Unsigned),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

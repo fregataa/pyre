@@ -249,6 +249,59 @@ pub fn build_semantic_program_from_parsed_files(
     build_semantic_program_from_parsed_files_with_options(parsed_files, &AstGraphOptions::default())
 }
 
+/// Pre-walk metadata produced by `collect_program_metadata_pub` —
+/// the four registries that `build_function_graph` /
+/// `build_function_graph_with_self_ty_pub` need before per-function
+/// graph build can resolve typed call shapes.
+pub struct ProgramMetadata {
+    pub known_struct_names: std::collections::HashSet<String>,
+    pub known_trait_names: std::collections::HashSet<String>,
+    pub struct_fields: StructFieldRegistry,
+    pub fn_return_types: HashMap<String, String>,
+}
+
+/// RPython `annrpython.py:103-150 build_types` whole-program walk —
+/// runs `collect_struct_names` + `collect_trait_names` +
+/// `collect_fields_and_returns` over the items of every parsed
+/// file in `parsed_files`.  Public counterpart of the per-pipeline
+/// collectors at
+/// `build_semantic_program_from_parsed_files_with_options:744-764`,
+/// for test-only entry points (`parse::collect_function_graphs`)
+/// that need the same registries before invoking
+/// `build_function_graph_with_self_ty_pub`.  Accepts a slice so a
+/// callsite in one file can resolve a free function defined in
+/// another file — single-file metadata leaves cross-file calls
+/// (`!crate::is_str(...)` from dictobject.rs against `is_str`
+/// defined in strobject.rs) unclassified.
+pub fn collect_program_metadata_pub(parsed_files: &[ParsedInterpreter]) -> ProgramMetadata {
+    let mut known_struct_names = std::collections::HashSet::new();
+    let mut known_trait_names = std::collections::HashSet::new();
+    let mut struct_fields = StructFieldRegistry::default();
+    let mut fn_return_types: HashMap<String, String> = HashMap::new();
+    let mut immutable_fields: HashMap<String, Vec<(String, ImmutableRank)>> = HashMap::new();
+    for parsed in parsed_files {
+        collect_struct_names(&parsed.file.items, "", &mut known_struct_names);
+        collect_trait_names(&parsed.file.items, "", &mut known_trait_names);
+    }
+    for parsed in parsed_files {
+        collect_fields_and_returns(
+            &parsed.file.items,
+            "",
+            &known_struct_names,
+            &known_trait_names,
+            &mut struct_fields,
+            &mut fn_return_types,
+            &mut immutable_fields,
+        );
+    }
+    ProgramMetadata {
+        known_struct_names,
+        known_trait_names,
+        struct_fields,
+        fn_return_types,
+    }
+}
+
 /// Qualify a bare type name with module prefix.
 /// "Foo" with prefix "a" → "a::Foo". Already-qualified "a::Foo" unchanged.
 /// Empty prefix → return bare name as-is.
@@ -478,6 +531,46 @@ fn collect_fields_and_returns(
                     };
                     fn_return_types.insert(key, ret_ty);
                 }
+                // Nested `fn`s declared as `Stmt::Item(Item::Fn(_))`
+                // inside this fn's body.  Rust's lexical scoping makes
+                // them callable only from within the parent body, but
+                // the classifier (`expr_unary_not_operand_kind`) sees
+                // them as bare-name `Expr::Call` paths and needs the
+                // signature to disambiguate `!nested_pred(arg)` between
+                // UNARY_NOT and UNARY_INVERT.  RPython parity:
+                // `bookkeeper.getdesc(value)` resolves any callable in
+                // scope by host-identity (`annrpython.py` callee
+                // resolution); pyre's static walker substitutes by
+                // registering the nested signature under the bare ident.
+                collect_nested_fn_returns(
+                    &func.block.stmts,
+                    prefix,
+                    known_struct_names,
+                    known_trait_names,
+                    fn_return_types,
+                );
+            }
+            // RPython has no `Item::Const` analogue — Python module-level
+            // constants reach `flowcontext.py` as `LOAD_GLOBAL(name)`
+            // followed by the bookkeeper's PBC table lookup
+            // (`bookkeeper.py:329-340 immutablevalue`).  Pyre's walker
+            // doesn't model PBCs, so consts surface as plain
+            // `Expr::Path` identifier references; the classifier needs
+            // a typed-name entry to resolve `!FOO`-shape uses.  Reuse
+            // `fn_return_types` keyed by ident — Rust convention
+            // (SCREAMING_SNAKE_CASE consts vs snake_case fns) keeps the
+            // namespaces separate in pyre's source.
+            Item::Const(c) => {
+                if let Some(ty) =
+                    qualified_full_type_string(&c.ty, prefix, known_struct_names, known_trait_names)
+                {
+                    let key = if prefix.is_empty() {
+                        c.ident.to_string()
+                    } else {
+                        format!("{}::{}", prefix, c.ident)
+                    };
+                    fn_return_types.insert(key, ty);
+                }
             }
             Item::Impl(impl_block) => {
                 let self_ty_root = type_root_ident(&impl_block.self_ty);
@@ -500,6 +593,36 @@ fn collect_fields_and_returns(
                                     ret_ty,
                                 );
                             }
+                        }
+                    }
+                    // Impl-block associated consts — `impl Foo { const
+                    // CONST_BIT: u32 = 1 << 31; }`. RPython peer:
+                    // `bookkeeper.getdesc(value)` resolves class-level
+                    // descriptors (`bookkeeper.py:329-340 immutablevalue`)
+                    // by host-identity; pyre's static walker registers
+                    // them under `Type::CONST_NAME` so `Type::CONST` /
+                    // `Self::CONST` references can resolve via the
+                    // last-two-segments fallback in
+                    // `lookup_function_return_type` /
+                    // `expr_unary_not_operand_kind`.
+                    if let syn::ImplItem::Const(item_const) = sub {
+                        if let Some(ty) = qualified_full_type_string(
+                            &item_const.ty,
+                            prefix,
+                            known_struct_names,
+                            known_trait_names,
+                        ) && let Some(ref ty_root) = self_ty_root
+                        {
+                            let qualified_ty = qualify_type_name(ty_root, prefix);
+                            fn_return_types.insert(
+                                format!("{}::{}", qualified_ty, item_const.ident),
+                                ty.clone(),
+                            );
+                            // Bare-key alias for `Self::CONST_BIT`-shape
+                            // references whose qualifier strips to the
+                            // last segment. Mirrors `Item::Const`'s
+                            // file-level registration.
+                            fn_return_types.insert(item_const.ident.to_string(), ty);
                         }
                     }
                 }
@@ -900,6 +1023,46 @@ fn synthesize_elidable_promote_pair(
     (orig_fn, wrapper_fn)
 }
 
+/// Walk the statements of a fn body and register the return types of
+/// any nested `fn` items declared inside.  Used by `collect_fields_and_
+/// returns`'s `Item::Fn` arm so the classifier sees nested-fn
+/// signatures.  Recurses through `Stmt::Item(Item::Fn(_))` only
+/// (nested-mod / nested-impl inside a fn body are vanishingly rare in
+/// pyre source and would require their own qualified prefix).
+fn collect_nested_fn_returns(
+    stmts: &[syn::Stmt],
+    prefix: &str,
+    known_struct_names: &std::collections::HashSet<String>,
+    known_trait_names: &std::collections::HashSet<String>,
+    fn_return_types: &mut HashMap<String, String>,
+) {
+    for stmt in stmts {
+        if let syn::Stmt::Item(Item::Fn(nested)) = stmt {
+            let ret_ty = match &nested.sig.output {
+                syn::ReturnType::Type(_, ty) => {
+                    qualified_full_type_string(ty, prefix, known_struct_names, known_trait_names)
+                }
+                syn::ReturnType::Default => Some("()".to_string()),
+            };
+            if let Some(ret_ty) = ret_ty {
+                let key = if prefix.is_empty() {
+                    nested.sig.ident.to_string()
+                } else {
+                    format!("{}::{}", prefix, nested.sig.ident)
+                };
+                fn_return_types.entry(key).or_insert(ret_ty);
+            }
+            collect_nested_fn_returns(
+                &nested.block.stmts,
+                prefix,
+                known_struct_names,
+                known_trait_names,
+                fn_return_types,
+            );
+        }
+    }
+}
+
 /// RPython: pass 2 graph building with Item::Mod recursion.
 /// Mirrors collect_types_from_items traversal so that module-internal
 /// functions get proper SemanticFunction entries with qualified names.
@@ -1236,6 +1399,16 @@ struct GraphBuildContext<'a> {
     /// so method-call lowering can emit `CallTarget::Indirect`
     /// (`jtransform.py:410-412`).
     local_dyn_trait_roots: HashMap<String, String>,
+    /// Closure-bound locals: `let f = |args| body` registers `f` →
+    /// closure body's return type so a downstream `f(...)` call gets a
+    /// known return type. Pyre's walker has no closure visibility
+    /// (`fn_return_types` only registers `Item::Fn` / `Item::Const` /
+    /// `Item::Impl` methods); RPython's `bookkeeper.getdesc(value)`
+    /// resolves any callable in scope by host-identity, so this side
+    /// table substitutes by registering closure return types under the
+    /// bare local ident.  Read by `lookup_function_return_type`'s
+    /// bare-key fallback chain.
+    local_closure_returns: HashMap<String, String>,
     /// RPython: program-level struct field types, available for resolving
     /// field access array identity (e.g. `self.array[i]` → owner.field_type).
     struct_fields: &'a StructFieldRegistry,
@@ -1782,6 +1955,7 @@ impl<'a> GraphBuildContext<'a> {
             generic_trait_roots: HashMap::new(),
             local_array_types: HashMap::new(),
             local_dyn_trait_roots: HashMap::new(),
+            local_closure_returns: HashMap::new(),
             struct_fields,
             fn_return_types,
             module_prefix: module_prefix.to_string(),
@@ -1819,6 +1993,7 @@ struct LocalBindingSnapshot {
     local_trait_bound_roots: HashMap<String, String>,
     local_array_types: HashMap<String, String>,
     local_dyn_trait_roots: HashMap<String, String>,
+    local_closure_returns: HashMap<String, String>,
     // NB: `local_first_bind_order` and `local_first_bind_seen` are
     // intentionally NOT captured here — they are graph-wide
     // append-only and survive sibling-arm restores so the slot index
@@ -1837,6 +2012,7 @@ impl LocalBindingSnapshot {
             local_trait_bound_roots: ctx.local_trait_bound_roots.clone(),
             local_array_types: ctx.local_array_types.clone(),
             local_dyn_trait_roots: ctx.local_dyn_trait_roots.clone(),
+            local_closure_returns: ctx.local_closure_returns.clone(),
         }
     }
 
@@ -1848,6 +2024,7 @@ impl LocalBindingSnapshot {
         ctx.local_trait_bound_roots = self.local_trait_bound_roots;
         ctx.local_array_types = self.local_array_types;
         ctx.local_dyn_trait_roots = self.local_dyn_trait_roots;
+        ctx.local_closure_returns = self.local_closure_returns;
         // local_first_bind_order / local_first_bind_seen NOT
         // restored — see struct doc comment.
     }
@@ -1929,9 +2106,9 @@ impl<'a> GraphBuildContext<'a> {
 /// poisoning downstream phi-merge inputargs through union(Int,
 /// Float) → Unknown → GcRef backfill (closed by the
 /// `rfloat.py:rtype_neg` parity arm in
-/// `translate_legacy/annotator/annrpython.rs` and the matching
+/// `translator/rtyper/legacy_annotator.rs` and the matching
 /// `infer_concrete_from_op` Unknown-pass-through in
-/// `translate_legacy/rtyper/rtyper.rs`).
+/// `translator/rtyper/legacy_resolve.rs`).
 ///
 /// Returns `Some(new_vid)` on success, `None` if any predecessor lacks
 /// a recorded snapshot or whose snapshot lacks `name`, or the
@@ -2458,8 +2635,9 @@ fn build_function_graph(
     // / flatten / regalloc never see an unread phi or its dangling
     // `Link.args` slot.
     //
-    // PRE-EXISTING-ADAPTATION (subset of `simplify_graph`).  The full
-    // upstream `simplify_graph` runs `all_passes`
+    // TODO(simplify_graph-full-port): pyre runs only the
+    // `transform_dead_op_vars` subset here.  The full upstream
+    // `simplify_graph` runs `all_passes`
     // (`simplify.py:1060-1073`):
     //
     //     transform_dead_op_vars, eliminate_empty_blocks,
@@ -2730,7 +2908,24 @@ fn lower_stmt(
                         graph.name_value(vid, name);
                     }
                     if let Some(name) = name {
-                        if let Some(ty) = graph_value_type(graph, vid) {
+                        // Prefer the statically-bool classification when
+                        // the init expression is a `Lit::Bool` / `!x` /
+                        // comparison / `&&`/`||` / registered
+                        // bool-returning call, etc. (`expr_is_statically_bool`).
+                        // `graph_value_type` would otherwise return
+                        // `ValueType::Int` for a `Lit::Bool` lowered as
+                        // `OpKind::ConstInt(0/1)`, which would make the
+                        // next `!b` classifier choose the bitwise-invert
+                        // path — `let b = true; !b` would emit
+                        // `int_invert` instead of bool+branch. RPython
+                        // annotates `Constant(True)` with `SomeBool`
+                        // (`annotator/model.py:185-227`) so the let-bind
+                        // here records `ValueType::Bool` to keep the
+                        // lattice node distinct from Int.
+                        let bool_override = expr_is_statically_bool(&init.expr, ctx);
+                        if bool_override {
+                            ctx.local_value_types.insert(name.clone(), ValueType::Bool);
+                        } else if let Some(ty) = graph_value_type(graph, vid) {
                             ctx.local_value_types.insert(name.clone(), ty);
                         }
                         // RPython `LOAD_FAST` parity: record the
@@ -2752,7 +2947,36 @@ fn lower_stmt(
                             if let Some(root) = type_root_from_type_string(&type_string) {
                                 ctx.local_type_roots.insert(name.clone(), root);
                             }
-                            ctx.local_type_strings.insert(name, type_string);
+                            ctx.local_type_strings.insert(name.clone(), type_string);
+                        }
+                        // `let f = |args| body;` / `let f = |args| ->
+                        // RetTy body;` — the rhs is a closure, which
+                        // pyre's walker doesn't surface as a graph
+                        // function. Register the closure's return type
+                        // under the local ident so a downstream Call
+                        // `f(...)` resolves through `lookup_function_
+                        // return_type`'s bare-key fallback and
+                        // classifier sites (`expr_unary_not_operand_
+                        // kind`) get a kind. RPython peer:
+                        // `bookkeeper.getdesc(value)` resolves any
+                        // callable in scope by host-identity; the
+                        // static walker substitutes by registering the
+                        // closure return type under the bare ident.
+                        if let syn::Expr::Closure(closure) = &*init.expr {
+                            let closure_ret = match &closure.output {
+                                syn::ReturnType::Type(_, ty) => qualified_full_type_string(
+                                    ty,
+                                    &ctx.module_prefix,
+                                    ctx.known_struct_names,
+                                    ctx.known_trait_names,
+                                ),
+                                syn::ReturnType::Default => {
+                                    expression_type_string(&closure.body, ctx)
+                                }
+                            };
+                            if let Some(ret_ty) = closure_ret {
+                                ctx.local_closure_returns.insert(name, ret_ty);
+                            }
                         }
                     } else if !matches!(&local.pat, syn::Pat::Ident(_) | syn::Pat::Type(_)) {
                         // Destructure let (`let Some(x) = ...;`,
@@ -3052,15 +3276,28 @@ fn lower_expr(
                 }
                 syn::Expr::Path(path) if path.path.segments.len() == 1 && path.qself.is_none() => {
                     // Generic local assignment `x = rhs` — RPython STORE_FAST
-                    // parity (`flowspace/flowcontext.py:878`): replace the
-                    // locals slot for `x` with the rhs `ValueId` so a
-                    // subsequent same-block LOAD_FAST (`flowcontext.py:835`)
-                    // reads the new value, not the let-binding's stale one.
-                    // Same-block dedup machinery installed at
-                    // `lower_stmt`'s let arm (`ast.rs:1389
-                    // local_value_ids.insert`) caches `(let-rhs ValueId,
-                    // defining block)`; without this STORE_FAST update
-                    // a later `x` read returns the stale let value.
+                    // parity (`flowspace/flowcontext.py:878-885`):
+                    //
+                    //     w_newvalue = self.popvalue()
+                    //     ...
+                    //     self.locals_w[varindex] = w_newvalue
+                    //     if isinstance(w_newvalue, Variable):
+                    //         w_newvalue.rename(self.getlocalvarname(varindex))
+                    //
+                    // Two effects: replace the locals slot for `x`
+                    // with the rhs `ValueId`, and rename the rhs
+                    // `Variable` to the local name so diagnostics and
+                    // the adapter's `name_to_value` lookup pick the
+                    // rhs up under that name.  Same-block dedup
+                    // machinery installed at `lower_stmt`'s let arm
+                    // (`ast.rs:1389 local_value_ids.insert`) caches
+                    // `(let-rhs ValueId, defining block)`; without
+                    // this STORE_FAST update a later `x` read returns
+                    // the stale let value.  RPython only renames
+                    // when the rhs `is Variable`; the
+                    // `is_constant_define_value` gate skips the
+                    // ValueId-keyed `name_value` for `ConstInt`/
+                    // `ConstFloat` define-ops (RPython `Constant`).
                     let name = path
                         .path
                         .segments
@@ -3536,14 +3773,16 @@ fn lower_expr(
                         });
                     }
                 }
-                // RPython lowers `True`/`False` to `Constant(1)`/`Constant(0)`
-                // of `lltype.Bool`; at the codewriter level `getkind(Bool)`
-                // returns `'int'` (`rpython/jit/codewriter/flatten.py getkind`)
-                // so the value lives in an int register exactly like a
-                // regular integer constant.  Emit as `ConstInt` to match.
+                // RPython lowers `True`/`False` to `Constant(True/False)`
+                // of `lltype.Bool` (annotator/model.py:227 SomeBool).  At
+                // the codewriter level `getkind(Bool)` returns `'int'`
+                // (`rpython/jit/codewriter/flatten.py:getkind`) so the
+                // value lives in an int register, but the annotator-side
+                // distinction (SomeBool vs SomeInteger) is preserved by
+                // emitting the dedicated `OpKind::ConstBool` variant.
                 syn::Lit::Bool(b) => {
                     return Ok(Lowered {
-                        value: graph.push_op(*block, OpKind::ConstInt(b.value as i64), true),
+                        value: graph.push_op(*block, OpKind::ConstBool(b.value), true),
                         path_closed: false,
                     });
                 }
@@ -3713,25 +3952,228 @@ fn lower_expr(
         // ── parenthesized (expr) ──
         syn::Expr::Paren(p) => lower_expr(graph, block, &p.expr, options, ctx),
 
-        // ── unary !x, -x, *x ──
+        // ── unary *x, !x, -x ──
         syn::Expr::Unary(u) => {
-            let lowered = lower_expr(graph, block, &u.expr, options, ctx)?;
-            // `*x` has no flowspace counterpart: `flowspace/operation.py:
-            // 465-474` registers `pos` / `neg` / `invert` / `bool` only.
-            // RPython sources never emit `*x` because Python has no
-            // dereference operator; pyre's frontend sees Rust `*x` as a
-            // type-only operation (re-borrow `&*ptr` is the dominant
-            // pattern in production source — same pointer value), so
-            // propagate the operand vid directly without emitting an op.
-            // Any consumer (`FieldRead`, `Call`, etc.) sees the operand
-            // pointer as the receiver and lowers correctly.  This mirrors
-            // the cutover anchor `anchor_unary_deref_surfaces_failloud_no_flowspace_peer`
-            // intent ("frontend must remove `deref` before reaching the
-            // rtyper") cited at `translator/rtyper/flowspace_adapter.rs:344`.
+            // `*x` (Rust deref) has no flowspace counterpart —
+            // `flowspace/operation.py:465-474` registers only `pos` /
+            // `neg` / `invert` / `bool` as unary ops.  The
+            // RPython-parity `build_flow.rs::lower_unary`
+            // (`flowspace/rust_source/build_flow.rs:3301`) treats
+            // `UnOp::Deref` as `lower_expr(b, &u.expr)` pass-through:
+            // the annotator tracks identity + type regardless of
+            // borrow form, so emitting an aliasing op here is
+            // redundant.  Pyre's codewriter independently aliases
+            // `OpKind::UnaryOp { op: "deref", .. }` to its operand
+            // at `jit_codewriter/jtransform.rs:711` (same arm as
+            // `same_as`), confirming no semantic load is lost.
+            // Pass-through here lets the rtyper-side adapter
+            // (`translator/rtyper/flowspace_adapter.rs:359`) skip
+            // the `deref` Skip category — the production graph
+            // never carries `deref` ops past this point.  The
+            // fail-loud invariant at adapter level remains: any
+            // synthetic graph that injects `OpKind::UnaryOp {
+            // op: "deref", .. }` directly still surfaces a
+            // `TyperError` (anchor test
+            // `cutover.rs:anchor_unary_deref_surfaces_failloud_no_flowspace_peer`).
             if matches!(u.op, syn::UnOp::Deref(_)) {
-                return Ok(lowered);
+                return lower_expr(graph, block, &u.expr, options, ctx);
             }
-            let operand = get_value!(lowered);
+            // ── Rust `!x` lowering — RPython has TWO opcodes; pyre
+            //    folds them at this single site.
+            //    TODO(unary-not-split): when the front-end gains
+            //    receiver-typed dispatch, split this back into the
+            //    UNARY_NOT (`flowcontext.py:531-538`) vs UNARY_INVERT
+            //    (`flowcontext.py:188-191`) shape so each surfaces
+            //    its own opname.
+            //
+            // Upstream RPython distinguishes two unary-not operators:
+            //
+            //   * `UNARY_NOT`   (`flowcontext.py:531-538`) — *logical* not
+            //     on booleans / truthy values.  Lowered as `op.bool(w_value)`
+            //     followed by `guessbool` + constant-tail join.
+            //
+            //   * `UNARY_INVERT` (`flowcontext.py:188-191`) — *bitwise* not
+            //     on integers.  Lowered as `op.invert(w_value)`, registered
+            //     at `operation.py:474 add_operator('invert', 1, ..)` /
+            //     `lloperation.py int_invert`.
+            //
+            // Rust's `!` is overloaded by the `std::ops::Not` trait:
+            // `!bool` → logical not, `!i64` (and other integer types) →
+            // *bitwise* not.  The frontend must classify the operand
+            // before lowering: bool goes through the `UNARY_NOT` shape,
+            // int goes through `UNARY_INVERT`.  Unknown operands
+            // fail-loud (`stop_unsupported`) since RPython's
+            // `flowcontext.py:194,535-538` dispatches strictly at the
+            // bytecode token; guessing would collapse two distinct
+            // RPython bytecodes.
+            //
+            // The `UNARY_NOT` branch desugars via `bool(x)` + branch +
+            // constant tail, mirroring `flowcontext.py:531-538`:
+            //
+            //     w_value = self.popvalue()
+            //     w_bool  = op.bool(w_value).eval(self)
+            //     self.pushvalue(const(not self.guessbool(w_bool)))
+            //
+            // Twin of `flowspace/rust_source/build_flow.rs:1337
+            // lower_unary_not`.  Both arms Link straight to the join with
+            // a constant tail — no separate evaluation block (the simpler
+            // twin of `&&`/`||`'s `lower_short_circuit`).
+            //
+            if matches!(u.op, syn::UnOp::Not(_)) {
+                // ── Statically-obvious int operand: emit `invert` op ──
+                // RPython `flowcontext.py:188-191 UNARY_INVERT` dispatches
+                // to `op.invert(w_arg)` (`operation.py:474
+                // add_operator('invert', 1, ..)`).  Pyre's rtyper has the
+                // matching `"invert"` arm in `RPythonTyper::translate_op`
+                // routing to `Repr::rtype_invert`.  Lowering an
+                // int-literal `!` directly to `OpKind::UnaryOp { op:
+                // "invert", .. }` skips the bool-branch detour entirely
+                // — the result is the bitwise complement, matching
+                // `~lit` in Python.
+                // ── Dynamic operand-type dispatch ──
+                // Rust's `!` is overloaded via `std::ops::Not`:
+                // `!T where T: Not` is bitwise complement for integer
+                // types and logical negation for `bool`.  Mirror PyPy's
+                // bytecode-level distinction (`UNARY_INVERT` vs
+                // `UNARY_NOT`) by inspecting the operand's static type
+                // through `local_type_strings`/`local_value_types`
+                // tracking populated at let-binding / fn-parameter
+                // time.
+                //
+                // Statically detected as int → emit `invert` op
+                // (UNARY_INVERT). Statically detected as bool → fall
+                // through to the UNARY_NOT bool+branch desugar.
+                // Unknown fail-louds via `stop_unsupported`.
+                match expr_unary_not_operand_kind(&u.expr, ctx) {
+                    UnaryNotOperandKind::Int => {
+                        let operand = get_value!(lower_expr(graph, block, &u.expr, options, ctx)?);
+                        // The classifier returns `Int` for both
+                        // primitive integer kinds (lowered as
+                        // `ValueType::Int`) and arbitrary-precision
+                        // integers like `BigInt` (lowered as
+                        // `ValueType::Ref`). RPython's
+                        // `IntegerRepr.rtype_invert` /
+                        // `LongRepr.rtype_invert` dispatch on the
+                        // operand's lattice node; pyre projects that
+                        // through `graph_value_type(operand)` so the
+                        // emitted `OpKind::UnaryOp.result_ty` matches
+                        // the operand's actual lowered shape and the
+                        // function's declared return type
+                        // (`bigint_invert(a: BigInt) -> BigInt` →
+                        // `Ref`).
+                        let result_ty = graph_value_type(graph, operand)
+                            .filter(|ty| matches!(ty, ValueType::Int | ValueType::Ref))
+                            .unwrap_or(ValueType::Int);
+                        return Ok(Lowered {
+                            value: graph.push_op(
+                                *block,
+                                OpKind::UnaryOp {
+                                    op: "invert".into(),
+                                    operand,
+                                    result_ty,
+                                },
+                                true,
+                            ),
+                            path_closed: false,
+                        });
+                    }
+                    UnaryNotOperandKind::Bool => {}
+                    UnaryNotOperandKind::Unknown => {
+                        // RPython `flowcontext.py:194,535-538`
+                        // dispatches `UNARY_NOT` vs `UNARY_INVERT`
+                        // strictly at the Python bytecode token; pyre
+                        // mirrors that contract by fail-louding when
+                        // the operand kind cannot be recovered.
+                        // `build_flow.rs:4404-4416` is fail-loud on the
+                        // same shape. The classifier
+                        // (`expr_unary_not_operand_kind`,
+                        // `front/ast.rs:5582`) handles the production
+                        // patterns surfaced in
+                        // `pyre-{object,interpreter,jit}/src/` plus
+                        // `majit-ir/src/resoperation.rs`.
+                        return stop_unsupported(
+                            graph,
+                            *block,
+                            UnsupportedExprKind::UnaryNotUnknownOperand,
+                        );
+                    }
+                }
+                let operand = get_value!(lower_expr(graph, block, &u.expr, options, ctx)?);
+                let cond = graph
+                    .push_op(
+                        *block,
+                        OpKind::UnaryOp {
+                            op: "bool".into(),
+                            operand,
+                            result_ty: ValueType::Bool,
+                        },
+                        true,
+                    )
+                    .expect("UnaryOp { op: \"bool\", .. } produces a value");
+                // RPython pushes `Constant(not python_bool)` per arm of
+                // `lltype.Bool` — the false arm produces `True`
+                // (`!false == true`); the true arm produces `False`
+                // (`!true == false`).  Emit as `ConstBool` so the
+                // annotator picks `SomeBool` rather than `SomeInteger`.
+                let const_true = graph
+                    .push_op(*block, OpKind::ConstBool(true), true)
+                    .expect("ConstBool produces a value");
+                let const_false = graph
+                    .push_op(*block, OpKind::ConstBool(false), true)
+                    .expect("ConstBool produces a value");
+                // ── Locals threading ──
+                // RPython `flowcontext.py:531-538 UNARY_NOT` propagates
+                // frame locals across the bool-fork via `Link.args` ↔
+                // `inputargs`.  Mirror of build_flow.rs:1363
+                // lower_unary_not's `[tail, ...locals]` join shape.
+                // Both arms' Links carry pre-fork local values plus the
+                // constant tail; ctx.local_value_ids rebinds to join
+                // inputargs after the merge so post-join reads resolve
+                // to the merged values.
+                let pre_fork_locals = ctx.local_value_ids.clone();
+                let mut merged_names: Vec<String> = pre_fork_locals.keys().cloned().collect();
+                merged_names.sort();
+                let pre_fork_local_args: Vec<ValueId> = merged_names
+                    .iter()
+                    .map(|name| pre_fork_locals[name].0)
+                    .collect();
+
+                let (join_block, join_args) = graph.create_block_with_args(merged_names.len() + 1);
+                let tail = join_args[0];
+                let join_local_args: Vec<ValueId> = join_args[1..].to_vec();
+
+                let mut false_arm_args: Vec<ValueId> = Vec::with_capacity(merged_names.len() + 1);
+                false_arm_args.push(const_false);
+                false_arm_args.extend(pre_fork_local_args.iter().cloned());
+                let mut true_arm_args: Vec<ValueId> = Vec::with_capacity(merged_names.len() + 1);
+                true_arm_args.push(const_true);
+                true_arm_args.extend(pre_fork_local_args.iter().cloned());
+
+                // Two Links into the same join: cond truthy → tail
+                // is `0` (false); cond falsy → tail is `1` (true).
+                graph.set_branch(
+                    *block,
+                    cond,
+                    join_block,
+                    false_arm_args,
+                    join_block,
+                    true_arm_args,
+                );
+
+                // Rebind locals to join_block's inputargs.  Same
+                // pattern as the `&&`/`||` arm above.
+                for (name, &arg_vid) in merged_names.iter().zip(join_local_args.iter()) {
+                    ctx.local_value_ids
+                        .insert(name.clone(), (arg_vid, join_block));
+                }
+
+                *block = join_block;
+                return Ok(Lowered {
+                    value: Some(tail),
+                    path_closed: false,
+                });
+            }
+            let operand = get_value!(lower_expr(graph, block, &u.expr, options, ctx)?);
             Ok(Lowered {
                 value: graph.push_op(
                     *block,
@@ -3748,6 +4190,184 @@ fn lower_expr(
 
         // ── binary a + b ──
         syn::Expr::Binary(bin) => {
+            // Short-circuit `&&` / `||` are control flow in RPython
+            // (`flowspace/operation.py:475-510` does NOT register
+            // short-circuit `and`/`or` as binary operators).  Mirror
+            // `flowspace/rust_source/build_flow.rs:1191
+            // lower_short_circuit` line-by-line: emit `bool(lhs)` as the
+            // exitswitch discriminator, fork the block via
+            // `set_branch`, evaluate rhs in a separate block, and merge
+            // both arms into a `[tail, ...locals]`-shaped join carrying
+            // either `lhs_raw` (short-circuit arm) or `rhs_raw` (full
+            // eval) as `tail` plus every pre-fork frame local threaded
+            // through (so an `STORE_FAST` inside rhs propagates past the
+            // join — `build_flow.rs:1218-1232 / :1281-1292`).  Upstream
+            // bytecode basis — `flowcontext.py:766-777
+            // JUMP_IF_FALSE_OR_POP` (`&&`) / `JUMP_IF_TRUE_OR_POP`
+            // (`||`):
+            //
+            //     w_value = self.peekvalue()
+            //     if not self.guessbool(op.bool(w_value).eval(self)):
+            //         return target          # short-circuit on False
+            //     self.popvalue()             # else evaluate rhs
+            //
+            // The surviving value is the original `lhs_raw` (matching
+            // `peekvalue()` then `popvalue()`), not `bool(lhs_raw)` —
+            // `bool` is only the switch discriminator.  `&&`
+            // short-circuits on False (lhs falsy is the result; rhs is
+            // dead); `||` short-circuits on True.  Without this
+            // desugar, `binary_op_name(&bin.op)` emits the literal
+            // `"and"` / `"or"` opname which then trips
+            // `flowspace_adapter.rs:422 normalize_binop_name`'s
+            // fail-loud arm, blocking Slice 10 of the rtyper cutover.
+            if matches!(bin.op, syn::BinOp::And(_) | syn::BinOp::Or(_)) {
+                let is_and = matches!(bin.op, syn::BinOp::And(_));
+
+                let lhs_raw = get_value!(lower_expr(graph, block, &bin.left, options, ctx)?);
+                let cond = graph
+                    .push_op(
+                        *block,
+                        OpKind::UnaryOp {
+                            op: "bool".into(),
+                            operand: lhs_raw,
+                            result_ty: ValueType::Bool,
+                        },
+                        true,
+                    )
+                    .expect("UnaryOp { op: \"bool\", .. } produces a value");
+
+                // ── Locals threading through fork/join ──
+                //
+                // RPython's frame-locals model (`flowcontext.py:835
+                // LOAD_FAST` / `:872-884 STORE_FAST`) propagates locals
+                // across every fork via `Link.args` ↔ target
+                // `inputargs`.  Pyre's
+                // `flowspace/rust_source/build_flow.rs:1191
+                // lower_short_circuit` mirrors this with a
+                // `[tail, ...merged_names]` join shape — the parallel
+                // port done here for `front/ast.rs::Expr::Binary`
+                // `&&`/`||`.
+                //
+                // Pre-fork snapshot of `ctx.local_value_ids` provides
+                // the names that must thread through the join; rhs
+                // lowers against rhs_block's inputargs so any `STORE_
+                // FAST` inside rhs writes to a local already-in-flight
+                // through the join.
+                //
+                // Body-input-retirement-epic.md Phase 2 brings the
+                // same pattern to `Expr::If` / `Expr::Match` so all
+                // fork/join shapes use the consistent
+                // `[result, ...locals]` Link.args contract; the
+                // single-fork forms (`!`-bool desugar) follow as a
+                // sibling slice.
+                let pre_fork_locals = ctx.local_value_ids.clone();
+                let mut merged_names: Vec<String> = pre_fork_locals.keys().cloned().collect();
+                merged_names.sort();
+                let pre_fork_local_args: Vec<ValueId> = merged_names
+                    .iter()
+                    .map(|name| pre_fork_locals[name].0)
+                    .collect();
+
+                let (mut rhs_block, rhs_local_args) =
+                    graph.create_block_with_args(merged_names.len());
+                let (join_block, join_args) = graph.create_block_with_args(merged_names.len() + 1);
+                let tail = join_args[0];
+                let join_local_args: Vec<ValueId> = join_args[1..].to_vec();
+
+                // Short-circuit Link.args = [lhs_raw, ...pre_fork_locals];
+                // rhs Link.args         = [...pre_fork_locals].
+                let mut shortcut_link_args: Vec<ValueId> =
+                    Vec::with_capacity(merged_names.len() + 1);
+                shortcut_link_args.push(lhs_raw);
+                shortcut_link_args.extend(pre_fork_local_args.iter().cloned());
+                let rhs_link_args = pre_fork_local_args.clone();
+
+                if is_and {
+                    // `&&`: cond truthy → eval rhs; cond falsy →
+                    // short-circuit `lhs_raw` straight to the join.
+                    graph.set_branch(
+                        *block,
+                        cond,
+                        rhs_block,
+                        rhs_link_args,
+                        join_block,
+                        shortcut_link_args,
+                    );
+                } else {
+                    // `||`: cond truthy → short-circuit `lhs_raw`
+                    // straight to the join; cond falsy → eval rhs.
+                    graph.set_branch(
+                        *block,
+                        cond,
+                        join_block,
+                        shortcut_link_args,
+                        rhs_block,
+                        rhs_link_args,
+                    );
+                }
+
+                // Rebind locals to rhs_block's inputargs so rhs
+                // lowering sees them via same-block reads.
+                for (name, &arg_vid) in merged_names.iter().zip(rhs_local_args.iter()) {
+                    ctx.local_value_ids
+                        .insert(name.clone(), (arg_vid, rhs_block));
+                }
+
+                // Lower rhs in `rhs_block`; if the path remains open,
+                // link to the join carrying `rhs_raw` plus current
+                // local values (which rhs may have rebound through
+                // assigns / nested control flow).  An rhs that closes
+                // its path (`return` / `raise` / `break` inside the
+                // right operand) leaves only the short-circuit arm
+                // reaching the join — same open-arm-only pattern as
+                // `lower_if` above.
+                let rhs_lowered = lower_expr(graph, &mut rhs_block, &bin.right, options, ctx)?;
+                if graph.block(rhs_block).is_open() {
+                    // `rhs_lowered.value` is `None` only when rhs was a
+                    // statement-form sub-expression with no value;
+                    // `lhs_raw` keeps the join arity-correct in that
+                    // unusual case (defensive, mirrors `lower_if`'s
+                    // arity guard).
+                    let rhs_raw = rhs_lowered.value.unwrap_or(lhs_raw);
+                    let rhs_exit_local_args: Vec<ValueId> = merged_names
+                        .iter()
+                        .map(|name| {
+                            ctx.local_value_ids
+                                .get(name)
+                                .map(|&(vid, _)| vid)
+                                .unwrap_or_else(|| {
+                                    pre_fork_locals
+                                        .get(name)
+                                        .map(|&(vid, _)| vid)
+                                        .expect("local must remain in scope after rhs lower")
+                                })
+                        })
+                        .collect();
+                    let mut rhs_to_join_args: Vec<ValueId> =
+                        Vec::with_capacity(merged_names.len() + 1);
+                    rhs_to_join_args.push(rhs_raw);
+                    rhs_to_join_args.extend(rhs_exit_local_args);
+                    graph.set_goto(rhs_block, join_block, rhs_to_join_args);
+                }
+
+                // Rebind locals to join_block's inputargs so post-join
+                // reads of each name resolve to the merged phi value
+                // — `(join_inputarg, join_block)` is the same-block
+                // tuple `Expr::Path` checks at line 2114 to elide the
+                // `OpKind::Input` emit.  Mirror of build_flow.rs:1294-
+                // 1300's `b.open_new_block(... join_locals ...)`.
+                for (name, &arg_vid) in merged_names.iter().zip(join_local_args.iter()) {
+                    ctx.local_value_ids
+                        .insert(name.clone(), (arg_vid, join_block));
+                }
+
+                *block = join_block;
+                return Ok(Lowered {
+                    value: Some(tail),
+                    path_closed: false,
+                });
+            }
+
             let lhs = get_value!(lower_expr(graph, block, &bin.left, options, ctx)?);
             let rhs = get_value!(lower_expr(graph, block, &bin.right, options, ctx)?);
             let op_name = binary_op_name(&bin.op);
@@ -3763,16 +4383,25 @@ fn lower_expr(
                 true,
             );
             // RPython INPLACE_* + STORE_FAST parity
-            // (`flowspace/flowcontext.py:878`): compound assignment
+            // (`flowspace/flowcontext.py:878-885`): compound assignment
             // `x += y` (and -=, *=, /=, %=, &=, |=, ^=, <<=, >>=) push
             // the inplace result and immediately replace the locals
-            // slot for `x`.  Without the local_value_ids update, the
-            // same-block dedup cache (`ast.rs:1389` let arm,
+            // slot for `x`, then renames the resulting `Variable` to
+            // the local name.  Without the local_value_ids update,
+            // the same-block dedup cache (`ast.rs:1389` let arm,
             // `:1724` simple-assign arm) still points at the
             // pre-inplace ValueId, so a later same-block read of
-            // `x` returns the stale value.  Simple assignment `x = y`
-            // is handled at the Expr::Assign arm above; this branch
+            // `x` returns the stale value.  Without the
+            // `graph.name_value` rename, the adapter's
+            // `name_to_value` lookup continues to resolve `x` to the
+            // pre-inplace Variable.  Simple assignment `x = y` is
+            // handled at the Expr::Assign arm above; this branch
             // owns the compound path that lowers as Expr::Binary.
+            // The compound BinOp result is always a Variable (not a
+            // `ConstInt`/`ConstFloat` define-op), but the
+            // `is_constant_define_value` gate is kept symmetrical
+            // with the simple-assign arm to mirror upstream's
+            // `if isinstance(w_newvalue, Variable):` predicate.
             if op_name.ends_with("_assign") {
                 if let (Some(vid), syn::Expr::Path(path)) = (value, &*bin.left) {
                     if path.path.segments.len() == 1 && path.qself.is_none() {
@@ -3805,6 +4434,19 @@ fn lower_expr(
             }
             let source_ty = graph_value_type(graph, operand);
             let op = cast_op_name(source_ty.as_ref(), &result_ty).to_string();
+            // No silent elision: every `as T` reaches the adapter as a
+            // real `OpKind::UnaryOp { op, .. }`.  `cast_op_name` may
+            // return `"same_as"` for transparent (category-matching or
+            // source-unknown) casts; the cast handler family
+            // (`rbuiltin.rs::rtype_same_as` /
+            // `rtype_cast_int_to_float` / `rtype_cast_float_to_int` /
+            // `rtype_cast_int_to_ptr` / `rtype_cast_bool_to_int` /
+            // `rtype_cast_bool_to_float` / `rtype_int_is_true` /
+            // `rtype_float_is_true`) is wired in
+            // `RPythonTyper::translate_operation` (`rtyper.rs:2122-`)
+            // so each opname routes through the rtyper directly; the
+            // adapter at `flowspace_adapter.rs::normalize_unary_op_name`
+            // passes them through unchanged.
             Ok(Lowered {
                 value: graph.push_op(
                     *block,
@@ -4042,8 +4684,8 @@ fn lower_expr(
                 // local to two different concrete kinds, so the
                 // `.expect(...)` documents the contract.
                 //
-                // PRE-EXISTING-ADAPTATION (no SpamBlock /
-                // recloseblock chain).  Upstream's mergeblock
+                // TODO(spamblock-recloseblock-port): upstream's
+                // mergeblock
                 // generalises by creating a fresh `SpamBlock(newstate)`
                 // (`flowcontext.py:443`), marking the prior block
                 // dead via `block.dead = True` + `block.operations =
@@ -4503,22 +5145,47 @@ fn lower_expr(
 
         // ── closure ──
         //
-        // RPython `MAKE_FUNCTION` (`pypy/interpreter/pyopcode.py:1144`,
-        // `flowspace/flowcontext.py:1177`) pushes a fresh function
-        // value onto the stack — the `def`/`lambda` body becomes a
-        // separate graph, NOT inlined into the enclosing flow.  Pyre
-        // has no per-closure graph yet (the closure body is usually
-        // captured via an `fn` pointer arg), so the expression lowers
-        // to a single `Unknown` marker representing the closure
-        // value.  The body is NOT walked here: inlining it into the
-        // caller's flow was a New-Deviation that treated the closure
-        // as a synchronous block, which broke callers that pass the
-        // closure itself as a function-typed argument (e.g. empty
-        // `|_| {}` body produced no value for `get_value!`).
+        // TODO(closure-body-compilation): the closure body is NOT
+        // walked here.  `MAKE_FUNCTION`
+        // (`pypy/interpreter/pyopcode.py:1144`,
+        // `flowspace/flowcontext.py:1177`) materialises a *separate*
+        // graph for the `def`/`lambda` body and pushes a fresh
+        // function value onto the stack — the body never inlines into
+        // the enclosing flow.  Pyre currently lowers the whole
+        // expression to a single `Unknown` placeholder for the
+        // closure *value* and leaves the body uncompiled.  An earlier
+        // attempt to walk the body in-place was a NEW-DEVIATION (it
+        // treated the closure as a synchronous block, which broke
+        // callers that pass the closure itself as a function-typed
+        // argument — e.g. `|_| {}` produced no value for
+        // `get_value!`).
+        //
+        // The full port needs three pieces:
+        //   1. Synthesise a fresh `FunctionGraph` per closure body
+        //      (parameters from `closure.inputs`, captures plumbed
+        //      through inputargs as upvars).
+        //   2. Register it with the surrounding `PyreCallRegistry`
+        //      under a synthetic
+        //      `CallPath::Closure(<host-fn>::<call-site-index>)` so
+        //      `simple_call` resolution and `target_to_path` can find
+        //      it.
+        //   3. Replace this `Unknown` emit with an `OpKind` that
+        //      pushes the synthetic graph's host identity onto the
+        //      value stack — mirroring `MAKE_FUNCTION`
+        //      (`flowspace/flowcontext.py:1177`).
+        //
+        // Downstream call sites
+        // (`expression_type_string` closure-passthrough at line 7953)
+        // already project the closure body's return type for the
+        // common method-call patterns (`map` / `unwrap_or_else` /
+        // `and_then` / `filter`), so the *call-site* analysis is
+        // type-coherent even without the synthetic-graph port; the
+        // *body* itself stays uncompiled.  Multi-session epic
+        // (captures, multi-shot calls, indirect-call dispatch).
         syn::Expr::Closure(_) => Ok(continue_with_unknown(
             graph,
             *block,
-            UnsupportedExprKind::OtherExpr,
+            UnsupportedExprKind::Closure,
         )),
 
         // ── tuple (a, b, c) ──
@@ -5282,6 +5949,715 @@ fn unary_op_name(op: &syn::UnOp) -> &'static str {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnaryNotOperandKind {
+    Bool,
+    Int,
+    Unknown,
+}
+
+/// Classify Rust's overloaded `!` operand into the RPython opcode it
+/// can be lowered to. RPython/PyPy has distinct bytecode shapes:
+/// `UNARY_NOT` lowers through `op.bool` plus a branch, while
+/// `UNARY_INVERT` lowers directly to `op.invert`.  `Unknown` triggers
+/// `stop_unsupported(UnaryNotUnknownOperand)` at the call site
+/// (`lower_expr`'s `Expr::Unary UnOp::Not` arm, ~line 3737), mirroring
+/// RPython `flowcontext.py:194,535-538` and `build_flow.rs:4404-4416`
+/// which fail-loud on the same shape; the classifier extensions below
+/// ensure every production-source operand resolves to `Bool` or `Int`.
+///
+/// TODO(receiver-typed-dispatch): RPython
+/// `bookkeeper.py:353-409 getdesc(value)` keys on Python object
+/// identity — same-named methods on different types cannot alias
+/// because each host callable is a distinct PyObject.  Pyre's
+/// classifier operates on the AST surface (no callable-identity
+/// resolution available pre-rtyper), so it falls back to
+/// `local_type_strings` / `fn_return_types` lookup, last-segment
+/// fallback for multi-segment `Path`s, and a receiver-independent
+/// method shortlist for known-shape predicates (`is_empty`,
+/// `is_constant`, ...).  Two methods of the same name returning
+/// different types would collide here even if they belong to
+/// different types — the classifier is structurally not 1:1 with
+/// `getdesc`.  Retire when pyre's surface DSL learns to emit a
+/// callable-resolved Path (via the M2.c `classdef_impl_types`
+/// registry, `description.py:407-519` parity); the classifier
+/// can then route through the resolved callable and the shortlist
+/// retires.  Until then, name-shortlist hits that diverge
+/// from upstream behaviour surface as dual-gate `Skip` (typed-Ref
+/// classdef-less SomeInstance) or production divergence panic.
+fn expr_unary_not_operand_kind(expr: &syn::Expr, ctx: &GraphBuildContext) -> UnaryNotOperandKind {
+    match expr {
+        syn::Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Bool(_),
+            ..
+        }) => UnaryNotOperandKind::Bool,
+        syn::Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Int(_) | syn::Lit::Byte(_) | syn::Lit::Char(_),
+            ..
+        }) => UnaryNotOperandKind::Int,
+        // Multi-segment Path expressions — `Self::CONST_BIT`,
+        // `Type::CONST`, `Module::CONST`. Pyre's walker registers
+        // `Item::Impl::Const` under both `Type::CONST` and bare `CONST`
+        // (front/ast.rs Item::Impl arm), so the last-segment fallback
+        // resolves `Self::CONST_BIT` references via the bare alias.
+        // TODO(receiver-typed-dispatch): replace `fn_return_types`'s
+        // string map with a host-identity-keyed `Bookkeeper.descs`
+        // populated by the walker so the last-segment lookup at line
+        // 5602 collapses into a single qualified lookup
+        // (`bookkeeper.py:353` parity).  Until then the bare-name
+        // fallback can alias when same-named symbols live on
+        // different scopes/types.
+        syn::Expr::Path(path) if path.qself.is_none() && path.path.segments.len() >= 2 => {
+            let n = path.path.segments.len();
+            let last = path.path.segments[n - 1].ident.to_string();
+            if let Some(ty) = ctx.fn_return_types.get(&last) {
+                let kind = type_string_to_unary_not_kind(ty);
+                if kind != UnaryNotOperandKind::Unknown {
+                    return kind;
+                }
+            }
+            let bare_impl = format!(
+                "{}::{}",
+                path.path.segments[n - 2].ident,
+                path.path.segments[n - 1].ident
+            );
+            if let Some(ty) = ctx.fn_return_types.get(&bare_impl) {
+                let kind = type_string_to_unary_not_kind(ty);
+                if kind != UnaryNotOperandKind::Unknown {
+                    return kind;
+                }
+            }
+            UnaryNotOperandKind::Unknown
+        }
+        syn::Expr::Path(path)
+            if path.qself.is_none()
+                && path.path.leading_colon.is_none()
+                && path.path.segments.len() == 1 =>
+        {
+            let segment = &path.path.segments[0];
+            if !matches!(segment.arguments, syn::PathArguments::None) {
+                return UnaryNotOperandKind::Unknown;
+            }
+            let name = segment.ident.to_string();
+            if let Some(ty) = ctx.local_type_strings.get(&name) {
+                let kind = type_string_to_unary_not_kind(ty);
+                if kind != UnaryNotOperandKind::Unknown {
+                    return kind;
+                }
+            }
+            if let Some(kind) = ctx
+                .local_value_types
+                .get(&name)
+                .map(value_type_to_unary_not_kind)
+                && kind != UnaryNotOperandKind::Unknown
+            {
+                return kind;
+            }
+            // Module-level `pub const FOO: bool = ...` — the walker
+            // registers `Item::Const` typed names into
+            // `fn_return_types` (front/ast.rs:535+ `Item::Const`
+            // arm; key namespace is shared but Rust convention
+            // (SCREAMING_SNAKE_CASE consts vs snake_case fns) keeps
+            // the lookups disjoint in pyre source).  RPython resolves
+            // these via the bookkeeper's PBC table at LOAD_GLOBAL
+            // time (`bookkeeper.py:329-340 immutablevalue`).
+            if let Some(ty) = ctx.fn_return_types.get(&name) {
+                let kind = type_string_to_unary_not_kind(ty);
+                if kind != UnaryNotOperandKind::Unknown {
+                    return kind;
+                }
+            }
+            UnaryNotOperandKind::Unknown
+        }
+        syn::Expr::Binary(bin) => expr_binary_unary_not_operand_kind(ctx, bin),
+        syn::Expr::Unary(unary) => match unary.op {
+            syn::UnOp::Not(_) => expr_unary_not_operand_kind(&unary.expr, ctx),
+            syn::UnOp::Neg(_) => {
+                if expr_unary_not_operand_kind(&unary.expr, ctx) == UnaryNotOperandKind::Int {
+                    UnaryNotOperandKind::Int
+                } else {
+                    UnaryNotOperandKind::Unknown
+                }
+            }
+            syn::UnOp::Deref(_) => UnaryNotOperandKind::Unknown,
+            _ => UnaryNotOperandKind::Unknown,
+        },
+        syn::Expr::Paren(paren) => expr_unary_not_operand_kind(&paren.expr, ctx),
+        syn::Expr::Group(group) => expr_unary_not_operand_kind(&group.expr, ctx),
+        // `unsafe { expr }` — Rust's unsafe block is a transparent
+        // wrapper for analyser purposes; RPython has no syntactic
+        // analogue so the inner expression's classification is what
+        // matters.  Mirror of the Paren/Group arms.
+        syn::Expr::Unsafe(u) => {
+            if let Some(syn::Stmt::Expr(tail, None)) = u.block.stmts.last() {
+                expr_unary_not_operand_kind(tail, ctx)
+            } else {
+                UnaryNotOperandKind::Unknown
+            }
+        }
+        syn::Expr::Block(b) => {
+            if let Some(syn::Stmt::Expr(tail, None)) = b.block.stmts.last() {
+                expr_unary_not_operand_kind(tail, ctx)
+            } else {
+                UnaryNotOperandKind::Unknown
+            }
+        }
+        // `if cond { a } else { b }` — RPython `flowcontext.py:413`
+        // joins the two arms at the merge block; if both arms project
+        // to the same `SomeBool` / `SomeInteger`, the join carries
+        // that lattice node forward.  Mirror by classifying both arm
+        // tails and accepting only when they agree.  Missing else (or
+        // non-Block arms) collapses to Unknown.
+        syn::Expr::If(if_expr) => {
+            let then_kind =
+                if let Some(syn::Stmt::Expr(tail, None)) = if_expr.then_branch.stmts.last() {
+                    expr_unary_not_operand_kind(tail, ctx)
+                } else {
+                    UnaryNotOperandKind::Unknown
+                };
+            if then_kind == UnaryNotOperandKind::Unknown {
+                return UnaryNotOperandKind::Unknown;
+            }
+            match &if_expr.else_branch {
+                Some((_, else_expr)) => {
+                    let else_kind = expr_unary_not_operand_kind(else_expr, ctx);
+                    if else_kind == then_kind {
+                        then_kind
+                    } else {
+                        UnaryNotOperandKind::Unknown
+                    }
+                }
+                None => UnaryNotOperandKind::Unknown,
+            }
+        }
+        // `match e { arm => ..., ... }` — `flowcontext.py:413` join-
+        // shape parity, but with N arms.  Accept only when every arm
+        // projects to the same kind.
+        syn::Expr::Match(match_expr) => {
+            let mut acc: Option<UnaryNotOperandKind> = None;
+            for arm in &match_expr.arms {
+                let kind = expr_unary_not_operand_kind(&arm.body, ctx);
+                if kind == UnaryNotOperandKind::Unknown {
+                    return UnaryNotOperandKind::Unknown;
+                }
+                match acc {
+                    None => acc = Some(kind),
+                    Some(prev) if prev == kind => {}
+                    _ => return UnaryNotOperandKind::Unknown,
+                }
+            }
+            acc.unwrap_or(UnaryNotOperandKind::Unknown)
+        }
+        syn::Expr::Macro(mac)
+            if mac.mac.path.segments.len() == 1
+                && mac.mac.path.segments[0].ident.to_string() == "matches" =>
+        {
+            UnaryNotOperandKind::Bool
+        }
+        // `expr?` — Rust try operator desugars to `match expr { Ok(v)
+        // => v, Err(e) => return Err(e.into()) }` (or the Option
+        // counterpart). Mirror the `expression_type_string` Try arm
+        // by classifying the inner expression's kind through the
+        // Result/Option unwrap. RPython peer: `flowcontext.py`'s
+        // POP_BLOCK / END_FINALLY exception-channel join, projected to
+        // the success-arm tail.
+        syn::Expr::Try(t) => {
+            if let Some(inner_ty) = expression_type_string(&t.expr, ctx)
+                && let Some(unwrapped) = unwrap_result_or_option(&inner_ty)
+            {
+                let kind = type_string_to_unary_not_kind(unwrapped);
+                if kind != UnaryNotOperandKind::Unknown {
+                    return kind;
+                }
+            }
+            UnaryNotOperandKind::Unknown
+        }
+        // `(*func).can_change_code` / `frame.is_root` — struct field
+        // access whose declared type is recorded in
+        // `ctx.struct_fields`.  RPython resolves this through
+        // `SomeInstance.find_attribute` (`annotator/model.py:430+`);
+        // pyre's `expression_type_string` already routes
+        // `Expr::Field` to `field_type_string_from_expr`, so the
+        // classifier just needs to project the resulting type string.
+        syn::Expr::Field(_) => {
+            if let Some(ty) = expression_type_string(expr, ctx) {
+                let kind = type_string_to_unary_not_kind(&ty);
+                if kind != UnaryNotOperandKind::Unknown {
+                    return kind;
+                }
+            }
+            UnaryNotOperandKind::Unknown
+        }
+        syn::Expr::Call(_) | syn::Expr::MethodCall(_) => {
+            if let Some(ty) = expression_type_string(expr, ctx) {
+                let kind = type_string_to_unary_not_kind(&ty);
+                if kind != UnaryNotOperandKind::Unknown {
+                    return kind;
+                }
+            }
+            // `.unwrap()` / `.expect(_)` on a `Result<T, _>` / `Option<T>`
+            // receiver projects to `T`.  RPython parity: the annotator
+            // walks the method-resolution and sees `T` directly
+            // (`rtyper/rmodel.py:rtype_method_unwrap`); pyre lacks
+            // generic-method visibility, so synthesise the projection
+            // by inspecting the receiver's return type and unwrapping
+            // the `Result<...>` / `Option<...>` wrapper.
+            if let syn::Expr::MethodCall(mc) = expr
+                && (mc.method == "unwrap" || mc.method == "expect")
+                && let Some(receiver_ty) = expression_type_string(&mc.receiver, ctx)
+                && let Some(inner) = unwrap_result_or_option(&receiver_ty)
+            {
+                let kind = type_string_to_unary_not_kind(inner);
+                if kind != UnaryNotOperandKind::Unknown {
+                    return kind;
+                }
+            }
+            // TODO(receiver-typed-dispatch): the receiver-independent
+            // bool shortlist below is a heuristic substitute for
+            // `bookkeeper.getdesc(receiver).find_method` (RPython
+            // `unaryop.py:206-213`).  RPython matches host-stdlib
+            // trait methods by *receiver class* identity; pyre's
+            // annotator does not yet track stdlib/cross-crate trait
+            // impls, so receiver-typed lookup
+            // (`primitive_method_result_type` /
+            // `lookup_method_return_type`) misses these names and
+            // they reach the catch-all here.  Retire when
+            // `fn_return_types` is populated from a metadata-only
+            // walk over `pyre-{object,interpreter,jit}` + stdlib
+            // trait impls — this entire match arm goes away.
+            // Aliasing risk: a user-source method with the same name
+            // on an unrelated type that does NOT return bool (e.g.
+            // `eq`/`ne`/`lt`/`gt`/`ge`/`le` from `PartialOrd`,
+            // `contains`/`any`/`all` from various collection traits)
+            // would mis-classify here.  Trim attempts on those names
+            // 2026-05-11 broke pyre source build (some user-source
+            // call sites depend on the bool fallback) — full removal
+            // requires receiver-typed dispatch landing first.
+            if let syn::Expr::MethodCall(mc) = expr {
+                let method_name = mc.method.to_string();
+                if matches!(
+                    method_name.as_str(),
+                    "is_null"
+                        | "is_some"
+                        | "is_none"
+                        | "is_ok"
+                        | "is_err"
+                        | "is_empty"
+                        | "contains"
+                        | "starts_with"
+                        | "ends_with"
+                        | "eq"
+                        | "ne"
+                        | "lt"
+                        | "le"
+                        | "gt"
+                        | "ge"
+                        // Float-bool predicates (`f64::is_nan`,
+                        // `f64::is_infinite`, etc.) — receiver-typed
+                        // arm `primitive_method_result_type:5576`
+                        // already maps these to `ValueType::Bool` for
+                        // typed-call resolution, but
+                        // `lookup_method_return_type` only consults
+                        // user-source `fn_return_types`.  Mirror the
+                        // shortlist here so the overloaded `!` over
+                        // a stdlib float predicate classifies as
+                        // Bool without depending on receiver-type
+                        // tracking propagating to the caller.
+                        | "is_nan"
+                        | "is_infinite"
+                        | "is_finite"
+                        | "is_sign_negative"
+                        | "is_sign_positive"
+                        // Integer sign predicates (`i64::is_positive`,
+                        // `i64::is_negative`).  Same rationale as
+                        // the float predicates above — RPython's
+                        // `bookkeeper.getdesc(receiver).find_method`
+                        // would resolve via the host stdlib.
+                        | "is_positive"
+                        | "is_negative"
+                        // `char::is_alphabetic` / `char::is_digit` /
+                        // `char::is_alphanumeric` / `char::is_whitespace`
+                        // / `char::is_ascii*` — `core::char` predicates
+                        // returning `bool`.  Same rationale as the
+                        // numeric predicates.
+                        | "is_alphabetic"
+                        | "is_alphanumeric"
+                        | "is_digit"
+                        | "is_whitespace"
+                        | "is_ascii"
+                        | "is_ascii_alphabetic"
+                        | "is_ascii_alphanumeric"
+                        | "is_ascii_digit"
+                        | "is_ascii_whitespace"
+                        | "is_ascii_uppercase"
+                        | "is_ascii_lowercase"
+                        | "is_uppercase"
+                        | "is_lowercase"
+                        // `std::process::ExitStatus::success` and the
+                        // related `Path::exists` family — used by
+                        // pyre's stdlib-detection helpers
+                        // (`pyre-interpreter/src/importing.rs`).
+                        | "success"
+                        | "exists"
+                        // Cross-crate JIT-driver / descriptor methods
+                        // declared on types defined outside
+                        // `PYRE_JIT_GRAPH_SOURCES` (e.g. `WarmState`
+                        // in `majit-metainterp/src/warmstate.rs:143`,
+                        // `Descr::is_array_of_pointers` in
+                        // `majit-ir/src/descr.rs:1551`,
+                        // `Signature::has_kwarg` in
+                        // `pyre-interpreter/src/gateway.rs:235`).  The
+                        // walker registers these methods only when
+                        // their owner type is in the analyser source
+                        // set — for cross-crate types it isn't, so
+                        // `lookup_method_return_type` returns None and
+                        // the surface `!driver.is_tracing()` /
+                        // `!bh_descr.is_array_of_pointers()` /
+                        // `!sig.has_kwarg()` falls through.  Same
+                        // rationale as the stdlib-method shortlist
+                        // above (`is_null` / `is_some` / ...): RPython
+                        // `bookkeeper.getdesc(receiver).find_method`
+                        // resolves these by host-identity; pyre's
+                        // static shortlist substitutes for the missing
+                        // whole-program annotator visibility.
+                        // Convergence with the cross-crate
+                        // `pyre_object::*` Call shortlist: a
+                        // metadata-only walk over the host crates
+                        // retires this list.
+                        | "is_tracing"
+                        | "has_compiled_loop"
+                        | "is_array_of_pointers"
+                        | "has_kwarg"
+                        | "has_vararg"
+                        // `Iterator::any` / `Iterator::all` — stdlib
+                        // iterator predicates that always return
+                        // `bool`.  See TODO(receiver-typed-dispatch)
+                        // block above.
+                        | "any"
+                        | "all"
+                        // `majit-ir`-side predicate methods on
+                        // `OpCode` / `AbstractValue` / `OpRef` /
+                        // `ResOperation` — all return `bool` and are
+                        // receiver-independent shape introspectors.
+                        // Walker registers `Type::method` entries when
+                        // `majit-ir/src/resoperation.rs` is in scope,
+                        // but multi-segment / variant-call receivers
+                        // (`OpCode::IntAdd.is_jit_debug()`,
+                        // `AbstractValue::ConstInt(7).is_input_arg()`)
+                        // bypass `receiver_type_root`. Same RPython
+                        // parity rationale as the stdlib `is_*`
+                        // shortlist above.
+                        | "is_input_arg"
+                        | "is_res_op"
+                        | "is_constant"
+                        | "is_always_pure"
+                        | "is_foldable_guard"
+                        | "is_malloc"
+                        | "is_memory_access"
+                        | "is_comparison"
+                        | "is_setarrayitem"
+                        | "is_getfield"
+                        | "is_setfield"
+                        | "is_getarrayitem"
+                        | "is_setinteriorfield"
+                        | "is_getinteriorfield"
+                        | "can_malloc"
+                        | "can_raise"
+                        | "is_guard_exception"
+                        | "is_guard_overflow"
+                        | "is_call"
+                        | "is_jit_debug"
+                        | "is_guard"
+                        | "is_ovf"
+                        | "is_same_as"
+                        | "is_vector_arithmetic"
+                        | "is_label"
+                        | "is_final"
+                        | "should_trace_function_entry"
+                ) {
+                    return UnaryNotOperandKind::Bool;
+                }
+            }
+            // Stdlib free-function path calls that unambiguously return
+            // `bool` — the path-call analogue of the `is_null`/`is_some`
+            // / etc. method shortlist above.  Pyre's walker only
+            // registers user-source signatures into `fn_return_types`
+            // (`front/ast.rs:462+`), so stdlib paths like `std::ptr::eq`
+            // never resolve through `lookup_function_return_type`.
+            // RPython resolves these via `bookkeeper.getdesc(value)`
+            // keyed on the host-stdlib function object identity
+            // (`annrpython.py` callee resolution); pyre has no parallel
+            // descriptor, so the shortlist stays until the annotator
+            // gains stdlib visibility.
+            if let syn::Expr::Call(call) = expr
+                && let syn::Expr::Path(path) = &*call.func
+            {
+                let segments: Vec<String> = path
+                    .path
+                    .segments
+                    .iter()
+                    .map(|s| s.ident.to_string())
+                    .collect();
+                let joined = segments.join("::");
+                if matches!(
+                    joined.as_str(),
+                    "std::ptr::eq" | "core::ptr::eq" | "ptr::eq"
+                ) {
+                    return UnaryNotOperandKind::Bool;
+                }
+                // `Self::raw_is_constant` / `Self::raw_is_*` —
+                // `majit-ir/src/resoperation.rs:185 raw_is_constant(raw: u32) -> bool`
+                // and siblings declare bool predicates as `Self::method`
+                // calls inside an impl block (function-call shape, not
+                // method-call).  TODO(receiver-typed-dispatch): when
+                // `Self`-relative paths resolve through the bookkeeper's
+                // class identity, this falls out automatically.
+                if segments.len() == 2 && segments[0] == "Self" {
+                    let last = segments[1].as_str();
+                    if matches!(
+                        last,
+                        "raw_is_constant"
+                            | "raw_is_input_arg"
+                            | "raw_is_res_op"
+                            | "raw_is_const_int"
+                            | "raw_is_const_float"
+                    ) {
+                        return UnaryNotOperandKind::Bool;
+                    }
+                }
+                // Cross-crate `pyre_object::*` predicate family —
+                // `pyre/pyre-object/src/{pyobject,typeobject,strobject,
+                // excobject}.rs` declares a stable set of `pub unsafe
+                // fn is_<...>(obj) -> bool` visibility helpers
+                // (`pyobject.rs:308-368`: `is_int`, `is_bool`,
+                // `is_float`, `is_long`, `is_int_or_long`, `is_list`,
+                // `is_tuple`, `is_dict`, `is_none`, `is_not_implemented`,
+                // …; plus `is_exception` / `is_str` / `is_module` /
+                // `is_instance` / `is_set_or_frozenset` / `is_type` /
+                // `is_bool` / `is_builtin_code` exported from sibling
+                // modules).  These are the cross-crate analogue of
+                // `std::ptr::eq` — pyre's analyser source set
+                // (`generated::PYRE_JIT_GRAPH_SOURCES`) does not include
+                // `pyre/pyre-object/src/*.rs`, so `lookup_function_return_
+                // type` has no entry to project.  RPython parity:
+                // `bookkeeper.getdesc(value)` resolves these helpers by
+                // host-stdlib identity (`annrpython.py` callee
+                // resolution); pyre's static shortlist substitutes for
+                // the missing whole-program annotator visibility.
+                // Convergence path: emit a metadata-only walk over
+                // `pyre/pyre-object/src/*.rs` that registers
+                // `fn_return_types` without subjecting raw-pointer
+                // `unsafe fn` bodies to graph analysis (multi-session;
+                // the shortlist retires once the metadata-only walk
+                // lands).
+                if let Some(joined_str) = joined.strip_prefix("pyre_object::") {
+                    let last = joined_str.rsplit("::").next().unwrap_or(joined_str);
+                    if matches!(
+                        last,
+                        "is_int"
+                            | "is_bool"
+                            | "is_float"
+                            | "is_long"
+                            | "is_int_or_long"
+                            | "is_list"
+                            | "is_tuple"
+                            | "is_dict"
+                            | "is_none"
+                            | "is_not_implemented"
+                            | "is_str"
+                            | "is_exception"
+                            | "is_module"
+                            | "is_instance"
+                            | "is_type"
+                            | "is_set_or_frozenset"
+                            | "is_builtin_code"
+                            | "ll_issubclass"
+                            | "w_set_contains"
+                            | "w_type_get_hasdict"
+                            | "w_type_get_weakrefable"
+                            | "w_type_get_acceptable_as_base_class"
+                    ) {
+                        return UnaryNotOperandKind::Bool;
+                    }
+                }
+                // Multi-segment cross-crate / `crate::`-rooted user paths
+                // (`pyre_object::is_exception`, `crate::typeobject::is_type`,
+                // ...) — the walker registers free functions under the
+                // file-local prefix
+                // (`build_semantic_program_from_parsed_files_with_options`
+                // currently passes `prefix=""` per file,
+                // `front/ast.rs:751-780`), so a multi-segment lookup
+                // through `lookup_function_return_type` misses the
+                // single-name registration.  Cross-crate / cross-module
+                // `pyre_object::`-rooted paths are functionally
+                // equivalent to bare references in pyre's whole-program
+                // mode (RPython `annrpython.py` resolves callees via
+                // `bookkeeper.getdesc(value)` keyed on object identity,
+                // not on the `module.name`).  Re-attempt the lookup
+                // with the trailing single segment so the bare-key
+                // fallback (`lookup_function_return_type`'s
+                // `segments.len() == 1` branch) finds the registered
+                // entry.  Scoped to `!` classification — wider use of
+                // last-segment fallback risks cross-module name
+                // collisions.
+                if segments.len() > 1
+                    && let Some(last) = segments.last()
+                    && let Some(ret) = ctx.fn_return_types.get(last)
+                {
+                    let kind = type_string_to_unary_not_kind(ret);
+                    if kind != UnaryNotOperandKind::Unknown {
+                        return kind;
+                    }
+                }
+                // `pyre_object::typeobject::Layout::expands_equal(...)`
+                // — multi-segment Impl-method paths.  The walker
+                // registers Impl methods under the bare `Type::method`
+                // shape (`Item::Impl` arm at front/ast.rs:591), so a
+                // crate-relative call site referencing the method
+                // through its module path falls back to the last two
+                // segments.  Same RPython parity rationale as the
+                // last-single-segment fallback above (whole-program
+                // visibility via `bookkeeper.getdesc(value)` keyed on
+                // host identity, not on source path).
+                if segments.len() >= 2 {
+                    let n = segments.len();
+                    let bare_impl = format!("{}::{}", segments[n - 2], segments[n - 1]);
+                    if let Some(ret) = ctx.fn_return_types.get(&bare_impl) {
+                        let kind = type_string_to_unary_not_kind(ret);
+                        if kind != UnaryNotOperandKind::Unknown {
+                            return kind;
+                        }
+                    }
+                }
+                // External numeric type-conversion constructors —
+                // `BigInt::from(...)`, `BigUint::from(...)`,
+                // `i64::from_str_radix(...)`, etc.  Pyre's walker has no
+                // visibility into `num_bigint`, so the constructor's
+                // return type isn't in `fn_return_types`.  RPython peer:
+                // `bookkeeper.getdesc(value)` resolves host-stdlib
+                // arithmetic types (`int`, `float`, `long`) to integer
+                // / float annotations; pyre's static shortlist
+                // mirrors that for the BigInt family used by the long
+                // bytestring carrier (`pyre-interpreter/src/baseobjspace.rs`
+                // BigInt arithmetic).
+                if segments.len() >= 2 {
+                    let n = segments.len();
+                    if matches!(segments[n - 2].as_str(), "BigInt" | "BigUint") {
+                        return UnaryNotOperandKind::Int;
+                    }
+                }
+            }
+            UnaryNotOperandKind::Unknown
+        }
+        _ => UnaryNotOperandKind::Unknown,
+    }
+}
+
+fn expr_binary_unary_not_operand_kind(
+    ctx: &GraphBuildContext,
+    bin: &syn::ExprBinary,
+) -> UnaryNotOperandKind {
+    match bin.op {
+        syn::BinOp::Eq(_)
+        | syn::BinOp::Ne(_)
+        | syn::BinOp::Lt(_)
+        | syn::BinOp::Le(_)
+        | syn::BinOp::Gt(_)
+        | syn::BinOp::Ge(_)
+        | syn::BinOp::And(_)
+        | syn::BinOp::Or(_) => UnaryNotOperandKind::Bool,
+        syn::BinOp::Add(_)
+        | syn::BinOp::Sub(_)
+        | syn::BinOp::Mul(_)
+        | syn::BinOp::Div(_)
+        | syn::BinOp::Rem(_)
+        | syn::BinOp::Shl(_)
+        | syn::BinOp::Shr(_) => {
+            if expr_unary_not_operand_kind(&bin.left, ctx) == UnaryNotOperandKind::Int
+                && expr_unary_not_operand_kind(&bin.right, ctx) == UnaryNotOperandKind::Int
+            {
+                UnaryNotOperandKind::Int
+            } else {
+                UnaryNotOperandKind::Unknown
+            }
+        }
+        syn::BinOp::BitAnd(_) | syn::BinOp::BitOr(_) | syn::BinOp::BitXor(_) => {
+            let lhs = expr_unary_not_operand_kind(&bin.left, ctx);
+            let rhs = expr_unary_not_operand_kind(&bin.right, ctx);
+            if lhs == rhs {
+                lhs
+            } else {
+                UnaryNotOperandKind::Unknown
+            }
+        }
+        _ => UnaryNotOperandKind::Unknown,
+    }
+}
+
+fn value_type_to_unary_not_kind(ty: &ValueType) -> UnaryNotOperandKind {
+    match ty {
+        ValueType::Bool => UnaryNotOperandKind::Bool,
+        // `lltype.Unsigned`'s `UNARY_INVERT` dispatch routes through
+        // the same `int_invert` opname as `lltype.Signed` — see
+        // `flowspace/operation.py:521 invert.dispatch_to_register
+        // _class('int')` and `rint.py:rtype_int__invert` which both
+        // Signed and Unsigned IntegerRepr inherit.  `UnaryNotOperand
+        // Kind::Int` here drives the bytecode dispatch decision; the
+        // result-type carrier is computed from the operand's actual
+        // lowered type at the emit site, so Unsigned operands stay
+        // Unsigned through the rtyper.
+        ValueType::Int | ValueType::Unsigned => UnaryNotOperandKind::Int,
+        _ => UnaryNotOperandKind::Unknown,
+    }
+}
+
+fn type_string_to_unary_not_kind(type_str: &str) -> UnaryNotOperandKind {
+    let trimmed = type_str.trim();
+    // Arbitrary-precision integer types — `BigInt` / `BigUint`. Routed
+    // through `UNARY_INVERT` (bitwise NOT) like primitive integers,
+    // even though their lattice lowering is `ValueType::Ref`. RPython
+    // peer: `LongRepr.rtype_invert` (`rtyper/rlong.py:..`) dispatches
+    // bigint invert at the rtyper layer; pyre's `OpKind::UnaryOp.
+    // result_ty` is computed from the operand's actual lowered type
+    // at the emit site (`front/ast.rs:3667 UnaryNotOperandKind::Int`
+    // arm), so this kind only drives the bytecode dispatch decision,
+    // not the result-type carrier.
+    if matches!(trimmed, "BigInt" | "BigUint") {
+        return UnaryNotOperandKind::Int;
+    }
+    value_type_to_unary_not_kind(&type_string_to_value_type(type_str))
+}
+
+/// Strip the outer `Result<_, _>` or `Option<_>` wrapper from a type
+/// string and return the inner ok / some payload type.  Used by the
+/// `.unwrap()` / `.expect()` projection in `expr_unary_not_operand_kind`
+/// so a `let x = foo().unwrap()` whose `foo() -> Result<bool, _>`
+/// classifies `x` as `Bool`, not `Unknown`.
+fn unwrap_result_or_option(type_str: &str) -> Option<&str> {
+    let trimmed = type_str.trim();
+    let inner = trimmed
+        .strip_prefix("Result<")
+        .or_else(|| trimmed.strip_prefix("Option<"))?
+        .strip_suffix('>')?;
+    // For `Result<T, E>` keep `T` (split on the top-level comma).  Track
+    // angle-bracket depth so nested generics like `Result<Vec<T>, E>` /
+    // `Option<Result<bool, _>>` survive the split.
+    let mut depth = 0_i32;
+    for (i, ch) in inner.char_indices() {
+        match ch {
+            '<' => depth += 1,
+            '>' => depth -= 1,
+            ',' if depth == 0 => return Some(inner[..i].trim()),
+            _ => {}
+        }
+    }
+    Some(inner.trim())
+}
+
+fn expr_is_statically_bool(expr: &syn::Expr, ctx: &GraphBuildContext) -> bool {
+    expr_unary_not_operand_kind(expr, ctx) == UnaryNotOperandKind::Bool
+}
+
 fn binary_op_name(op: &syn::BinOp) -> &'static str {
     match op {
         syn::BinOp::Add(_) => "add",
@@ -5322,8 +6698,19 @@ fn binary_result_value_type(
     rhs: ValueId,
     op: &str,
 ) -> ValueType {
+    // RPython `flowspace/operation.py:505-510` registers `lt`, `le`,
+    // `eq`, `ne`, `ge`, `gt` as 2-arg operators returning lltype.Bool;
+    // the annotator stamps the result `SomeBool(SomeInteger)`
+    // (`annotator/model.py:185-198` — distinct lattice node from
+    // SomeInteger).  Pyre mirrors that with `ValueType::Bool`, which
+    // `valuetype_to_someshell` projects to `SomeValue::Bool` and the
+    // rtyper picks `BoolRepr` for (`rmodel.rs:2204`).  Downstream
+    // jit_codewriter sites that key off `ValueType::Int` already
+    // alias Bool to Int (commit 4318ebb51b2 added the 9 wildcard /
+    // explicit arms — assembler getkind, call array-descr / ir_type,
+    // jtransform stamp/kind/ir).
     if matches!(op, "eq" | "ne" | "lt" | "le" | "gt" | "ge") {
-        return ValueType::Int;
+        return ValueType::Bool;
     }
 
     let lhs_ty = graph_value_type(graph, lhs);
@@ -5562,9 +6949,14 @@ fn graph_link_input_value_type(graph: &FunctionGraph, value: ValueId) -> Option<
 /// and never appears in production link args.
 fn const_value_value_type(c: &ConstValue) -> Option<ValueType> {
     match c {
-        // RPython int/bool both map to `lltype.Signed`
-        // (`rpython/rtyper/rint.py`); booleans flow through int handlers.
-        ConstValue::Int(_) | ConstValue::Bool(_) => Some(ValueType::Int),
+        ConstValue::Int(_) => Some(ValueType::Int),
+        // RPython annotates `Constant(True)`/`Constant(False)` with
+        // `SomeBool(SomeInteger)` (`annotator/model.py:185-227`); the
+        // rtyper picks `BoolRepr` and `getkind(lltype.Bool) == 'int'`
+        // so the register class merges with Int downstream.  The
+        // annotation-stage type is Bool — not Int — so propagate Bool
+        // here to keep the lattice node distinct.
+        ConstValue::Bool(_) => Some(ValueType::Bool),
         ConstValue::Float(_) => Some(ValueType::Float),
         // GC-managed Python objects → `lltype.Ptr(GcStruct)` (Ref bank).
         ConstValue::ByteStr(_)
@@ -5628,6 +7020,7 @@ fn op_result_value_type(kind: &OpKind) -> Option<ValueType> {
             Some(ValueType::Int)
         }
         OpKind::ConstFloat(_) => Some(ValueType::Float),
+        OpKind::ConstBool(_) => Some(ValueType::Bool),
         OpKind::ArrayRead { item_ty, .. }
         | OpKind::InteriorFieldRead { item_ty, .. }
         | OpKind::VableArrayRead { item_ty, .. } => {
@@ -5653,7 +7046,14 @@ fn transparent_option_method_result_type(
     method: &syn::Ident,
 ) -> Option<ValueType> {
     match method.to_string().as_str() {
-        "as_usize" | "len" | "is_empty" | "is_null" | "wrapping_mul" => Some(ValueType::Int),
+        // Rust `usize`/`*const T::len` etc — RPython `lltype.Signed`.
+        "as_usize" | "len" | "wrapping_mul" => Some(ValueType::Int),
+        // Bool-returning predicates: RPython `SomeBool` (`annotator/
+        // model.py:185-198`). Was `Int` until the Bool lattice landed
+        // (`model.rs:18-42`); split out so the call result reaches
+        // downstream `valuetype_to_someshell` as `SomeBool` instead of
+        // `SomeInteger`.
+        "is_empty" | "is_null" => Some(ValueType::Bool),
         "unwrap_or" => args
             .get(1)
             .and_then(|&default| graph_value_type(graph, default)),
@@ -5694,8 +7094,11 @@ fn primitive_method_result_type(
         (ValueType::Float, "abs" | "floor" | "ceil" | "trunc" | "round" | "sqrt" | "powf") => {
             Some(ValueType::Float)
         }
+        // Float bool predicates: RPython `SomeBool` (`annotator/
+        // model.py:185-198`) — `math.isnan` / `math.isinf` etc lower
+        // through `rfloat.py` and surface as `Bool` annotations.
         (ValueType::Float, "is_nan" | "is_infinite" | "is_finite" | "is_sign_negative") => {
-            Some(ValueType::Int)
+            Some(ValueType::Bool)
         }
         (
             ValueType::Int,
@@ -5732,12 +7135,29 @@ fn kind_char_to_value_type(kind: char) -> Option<ValueType> {
     }
 }
 
-fn cast_op_name(source_ty: Option<&ValueType>, target_ty: &ValueType) -> &'static str {
+pub(crate) fn cast_op_name(source_ty: Option<&ValueType>, target_ty: &ValueType) -> &'static str {
     match (source_ty, target_ty) {
         (Some(ValueType::Int), ValueType::Float) => "cast_int_to_float",
         (Some(ValueType::Float), ValueType::Int) => "cast_float_to_int",
         (Some(ValueType::Ref), ValueType::Int) => "cast_ptr_to_int",
         (Some(ValueType::Int), ValueType::Ref) => "cast_int_to_ptr",
+        // RPython `rbool.py:49` — Bool widens via dedicated cast ops:
+        // `cast_bool_to_int` / `cast_bool_to_float`.  The reverse
+        // direction (Int / Float → Bool) goes through truthiness
+        // predicates `int_is_true` / `float_is_true`
+        // (`rint.py:rtype_int__Bool` / `rfloat.py:rtype_Float__Bool`).
+        (Some(ValueType::Bool), ValueType::Int) => "cast_bool_to_int",
+        (Some(ValueType::Bool), ValueType::Float) => "cast_bool_to_float",
+        (Some(ValueType::Int), ValueType::Bool) => "int_is_true",
+        (Some(ValueType::Float), ValueType::Bool) => "float_is_true",
+        // RPython `rint.py` cross-signedness casts.  `rbool.py:77-83`
+        // `uint_is_true` is the unsigned counterpart to `int_is_true`.
+        (Some(ValueType::Unsigned), ValueType::Int) => "cast_uint_to_int",
+        (Some(ValueType::Int), ValueType::Unsigned) => "cast_int_to_uint",
+        (Some(ValueType::Unsigned), ValueType::Float) => "cast_uint_to_float",
+        (Some(ValueType::Float), ValueType::Unsigned) => "cast_float_to_uint",
+        (Some(ValueType::Bool), ValueType::Unsigned) => "cast_bool_to_uint",
+        (Some(ValueType::Unsigned), ValueType::Bool) => "uint_is_true",
         _ => "same_as",
     }
 }
@@ -6272,9 +7692,36 @@ pub(crate) fn classify_fn_arg_ty(ty: &syn::Type) -> crate::model::ValueType {
                 return ValueType::Ref;
             }
             match name.as_str() {
-                // RPython `rlib/rarithmetic.py` + `lltype.Signed` family.
+                // `rlib/rarithmetic.py` + `lltype.Signed` family.
+                //
+                // TODO(unsigned-producer-flip): `u8`/`u16`/`u32`/`u64`/
+                // `usize` should lift to `ValueType::Unsigned` to match
+                // `lltype.Unsigned`'s rtyper dispatch (`rbool.py:77-83
+                // uint_is_true`, `rint.py` cast family).  The flip
+                // currently breaks downstream pyre-source analysis —
+                // `annotator/unaryop.rs:445 getattr` raises
+                // `AnnotatorError: Cannot find attribute` on
+                // const-folded paths, and `setinteriorfield_gc_r` join
+                // points mix `'r'` (Ref) and `'i'` (Int) kinds causing
+                // an `assembler.rs:581 int_copy` kind-mismatch panic.
+                // Reverting to `ValueType::Int` keeps the surface DSL
+                // monomorphic-int while the `cast_op_name` / rtyper
+                // Unsigned arms (`rtype_cast_uint_to_*`,
+                // `rtype_cast_*_to_uint`) remain scaffolded for the
+                // eventual flip.  Convergence path: walk all
+                // `OpKind::Input { ty: Int }` consumers reachable from
+                // `PYRE_JIT_GRAPH_SOURCES`, narrow the ones that take
+                // u* (currently widened-to-i64 via `as i64`) onto a
+                // dedicated `Unsigned` arm, then flip the producer.
                 "i8" | "i16" | "i32" | "i64" | "isize" | "u8" | "u16" | "u32" | "u64" | "usize"
-                | "bool" | "char" => ValueType::Int,
+                | "char" => ValueType::Int,
+                // `lltype.Bool` annotates as `SomeBool(SomeInteger)`
+                // (`annotator/model.py:185-198`, distinct lattice node).
+                // `getkind(Bool) == 'int'` so register-class code paths
+                // alias Bool to Int (jit_codewriter sites added in
+                // commit 4318ebb51b2); the producer-side type tag
+                // remains Bool so the rtyper picks `BoolRepr`.
+                "bool" => ValueType::Bool,
                 // `lltype.Float` — `f32` widens up to f64 at the SSA
                 // level but stays in the Float class either way.
                 "f32" | "f64" => ValueType::Float,
@@ -6716,8 +8163,16 @@ pub(crate) fn qualified_full_type_string(
 fn type_string_to_value_type(type_str: &str) -> ValueType {
     let type_str = type_str.trim();
     match type_str {
+        // u* folded into Int alongside i* — see
+        // `classify_fn_arg_ty`'s TODO(unsigned-producer-flip) for the
+        // cascade list.  Must stay in sync with the producer there so
+        // the InteriorFieldRead/Write kind suffix agrees with the
+        // inputarg type.
         "i8" | "i16" | "i32" | "i64" | "isize" | "u8" | "u16" | "u32" | "u64" | "usize"
-        | "bool" | "char" | "Self::Truth" => ValueType::Int,
+        | "char" | "Self::Truth" => ValueType::Int,
+        // `lltype.Bool` — see `classify_fn_arg_ty`'s `"bool"` arm for
+        // the SomeBool/BoolRepr rationale.
+        "bool" => ValueType::Bool,
         "f32" | "f64" => ValueType::Float,
         "()" => ValueType::Void,
         _ => ValueType::Ref,
@@ -6882,7 +8337,42 @@ fn expression_type_string(expr: &syn::Expr, ctx: &GraphBuildContext) -> Option<S
                 .iter()
                 .map(|s| s.ident.to_string())
                 .collect();
-            lookup_function_return_type(ctx, &segments).cloned()
+            if let Some(ret) = lookup_function_return_type(ctx, &segments).cloned() {
+                return Some(ret);
+            }
+            // TODO(name-based-callee-resolution): receiver-/host-
+            // identity-blind name shortlist below; same convergence
+            // path as `lookup_function_return_type`'s TODO marker.
+            // Cross-module pyre-interpreter bool / Result<bool>
+            // predicate shortlist.  Pyre's `PYRE_JIT_GRAPH_SOURCES`
+            // (`generated.rs:149`) is intentionally narrow so the
+            // canonical-pipeline analysis time stays bounded; the
+            // closure's source set excludes `baseobjspace.rs` /
+            // `runtime_ops.rs` / `boolobject.rs` even though the
+            // in-scope sources reference their predicates.  Aliasing
+            // risk: any user-source function whose last segment
+            // matches one of these names but does NOT return `bool`
+            // is mis-classified here — convergence retires this
+            // arm.
+            let last = segments.last()?;
+            // Direct `-> bool` returns.
+            if matches!(
+                last.as_str(),
+                "is_true"
+                    | "is_iterable"
+                    | "w_bool_get_value"
+                    | "exception_is_valid_class_w"
+                    | "exception_is_valid_obj_as_class_w"
+                    | "dict_storage_delete"
+            ) {
+                return Some("bool".to_string());
+            }
+            // `-> Result<bool, PyError>` returns — `?` peels to bool at
+            // the let-binding's `Expr::Try` arm.
+            if matches!(last.as_str(), "contains") {
+                return Some("Result<bool, PyError>".to_string());
+            }
+            None
         }
         syn::Expr::MethodCall(mc) => {
             let receiver_root = receiver_type_root(&mc.receiver, ctx);
@@ -6893,6 +8383,160 @@ fn expression_type_string(expr: &syn::Expr, ctx: &GraphBuildContext) -> Option<S
             {
                 return Some(ret);
             }
+            // Stdlib method shortlist that always returns `bool` —
+            // mirrored from `expr_unary_not_operand_kind`'s MethodCall
+            // arm so closure-body / chained-receiver type inference
+            // resolves through the same identity-by-name shortcut.
+            // RPython peer: `bookkeeper.getdesc(receiver).find_method`
+            // resolves these by host-stdlib identity; pyre's static
+            // shortlist substitutes for the missing whole-program
+            // annotator visibility.  Receiver-type independence is the
+            // distinguishing property — predicate methods do not
+            // propagate receiver identity, so they don't need
+            // `local_array_types` / `local_dyn_trait_roots` lookups.
+            let method = mc.method.to_string();
+            if matches!(
+                method.as_str(),
+                "is_null"
+                    | "is_some"
+                    | "is_none"
+                    | "is_ok"
+                    | "is_err"
+                    | "is_empty"
+                    | "contains"
+                    | "starts_with"
+                    | "ends_with"
+                    | "eq"
+                    | "ne"
+                    | "lt"
+                    | "le"
+                    | "gt"
+                    | "ge"
+                    | "is_nan"
+                    | "is_infinite"
+                    | "is_finite"
+                    | "is_sign_negative"
+                    | "is_sign_positive"
+                    | "is_positive"
+                    | "is_negative"
+                    | "is_alphabetic"
+                    | "is_alphanumeric"
+                    | "is_digit"
+                    | "is_whitespace"
+                    | "is_ascii"
+                    | "is_ascii_alphabetic"
+                    | "is_ascii_alphanumeric"
+                    | "is_ascii_digit"
+                    | "is_ascii_whitespace"
+                    | "is_ascii_uppercase"
+                    | "is_ascii_lowercase"
+                    | "is_uppercase"
+                    | "is_lowercase"
+                    | "success"
+                    | "exists"
+                    | "is_tracing"
+                    | "has_compiled_loop"
+                    | "is_array_of_pointers"
+                    | "has_kwarg"
+                    | "has_vararg"
+                    | "any"
+                    | "all"
+            ) {
+                return Some("bool".to_string());
+            }
+            // Closure-passthrough methods — `LocalKey::with(closure)`,
+            // `Option::unwrap_or_else(closure)`, `Result::unwrap_or_else
+            // (closure)`, `Option::map(closure)`, `Result::map_err(
+            // closure)`, `Option::and_then(closure)`,
+            // `Option::or_else(closure)`, `Result::ok_or_else(closure)`,
+            // `Iterator::filter_map(closure)` etc.  The receiver
+            // method's return type IS the closure's return type
+            // (modulo `Option<_>` / `Result<_,_>` wrapping), so project
+            // the last argument's body type.
+            //
+            // RPython peer: `bookkeeper.getdesc(method).consider_call_
+            // site` reads the callable's return annotation
+            // (`bookkeeper.py:355-409`); pyre's static walker
+            // substitutes by inspecting the closure body directly.
+            //
+            // TODO(closure-makefunction-port): RPython
+            // `flowspace/flowcontext.py:1177 MAKE_FUNCTION` materialises
+            // the closure body as a separate function-graph keyed by
+            // the lambda's host identity, and `CALL_FUNCTION` invokes
+            // it.  Pyre's closure body still lowers to a single
+            // `OpKind::Abort { Closure }` placeholder at
+            // `front/ast.rs:4785`, so closure side effects are not
+            // analysed.  The return-type projection here is the
+            // minimum-viable substitute that keeps method-call sites
+            // type-coherent; full MAKE_FUNCTION parity requires
+            // routing each closure through a synthetic FunctionGraph
+            // + `PyreCallRegistry` entry (multi-session epic).
+            if matches!(
+                method.as_str(),
+                "with" | "with_borrow" | "with_borrow_mut" | "unwrap_or_else"
+            ) && let Some(last) = mc.args.last()
+                && let syn::Expr::Closure(closure) = last
+            {
+                let ret = match &closure.output {
+                    syn::ReturnType::Type(_, ty) => qualified_full_type_string(
+                        ty,
+                        &ctx.module_prefix,
+                        ctx.known_struct_names,
+                        ctx.known_trait_names,
+                    ),
+                    syn::ReturnType::Default => expression_type_string(&closure.body, ctx),
+                };
+                if ret.is_some() {
+                    return ret;
+                }
+            }
+            // `Option<T>::map(F: FnOnce(T) -> U) -> Option<U>` and
+            // `Result<T,E>::map(F: FnOnce(T) -> U) -> Result<U,E>` —
+            // the receiver-method return is the *wrapper* of the
+            // closure body's return.  Pyre's downstream
+            // `expression_type_string` only consults the receiver
+            // type-string for shape-matching (`Option<_>` / `Result<_,
+            // _>`), so projecting `Option<closure_body>` /
+            // `Result<closure_body, _>` keeps the wrapper visible at
+            // the call site.
+            if matches!(method.as_str(), "map" | "and_then" | "filter")
+                && let Some(last) = mc.args.last()
+                && let syn::Expr::Closure(closure) = last
+                && let Some(receiver_ty) = expression_type_string(&mc.receiver, ctx)
+            {
+                let body_ty = match &closure.output {
+                    syn::ReturnType::Type(_, ty) => qualified_full_type_string(
+                        ty,
+                        &ctx.module_prefix,
+                        ctx.known_struct_names,
+                        ctx.known_trait_names,
+                    ),
+                    syn::ReturnType::Default => expression_type_string(&closure.body, ctx),
+                };
+                if let Some(body) = body_ty {
+                    // `Option<X>.map(|t| body) → Option<body>`,
+                    // `Option<X>.and_then(|t| body) → body` (assuming
+                    // body is already `Option<_>`),
+                    // `Option<X>.filter(|t| <bool>) → Option<X>`
+                    // (preserves receiver).  RPython parity:
+                    // upstream's `SomeOption` is just a tag —
+                    // pyre keeps shape via type-string.
+                    if method == "filter" {
+                        return Some(receiver_ty);
+                    }
+                    if method == "and_then" {
+                        return Some(body);
+                    }
+                    // `map` — wrap the body in the receiver's
+                    // Option/Result shape.  Strip the existing
+                    // `<...>` and re-emit `Wrapper<body>`.
+                    if let Some(wrapper) = receiver_ty.split('<').next()
+                        && matches!(wrapper, "Option" | "Result")
+                    {
+                        return Some(format!("{wrapper}<{body}>"));
+                    }
+                }
+            }
             // RPython annotator `SomeList.method_get / .method_first /
             // .method_last`-style result inference, narrowed to the
             // stdlib `Vec<T>` / `[T]` accessors that `let Some(x) =
@@ -6900,7 +8544,6 @@ fn expression_type_string(expr: &syn::Expr, ctx: &GraphBuildContext) -> Option<S
             // `local_array_types` carries the full container type
             // (`Vec<FieldDescrInfo>`); the `Option<&T>` shape is the
             // Rust-language adaptation of RPython's `lst[i]` access.
-            let method = mc.method.to_string();
             if matches!(method.as_str(), "get" | "first" | "last") {
                 if let Some(arr_ty) = array_type_id_from_expr(&mc.receiver, ctx)
                     && let Some(elem) = extract_element_type_from_str(&arr_ty)
@@ -6961,10 +8604,93 @@ fn expression_type_string(expr: &syn::Expr, ctx: &GraphBuildContext) -> Option<S
                 Some(segments.join("::"))
             }
         }
+        // `unsafe { tail }` — RPython has no peer; transparent on the
+        // analyser side.  Mirrors the `Expr::Unsafe` arm in
+        // `expr_unary_not_operand_kind`.
+        syn::Expr::Unsafe(u) => block_tail_type_string(&u.block, ctx),
+        // `expr?` — Rust try operator; lowers to:
+        //   match expr { Ok(v) => v, Err(e) => return Err(e.into()) }
+        // (or the Option counterpart).  Result/Option type carriers
+        // are not part of RPython's annotator surface; the closest
+        // peer is `flowcontext.py:194-198` POP_BLOCK / END_FINALLY's
+        // exception-channel join, which the front-end represents as
+        // an `OpKind::Call` with the question-mark desugar happening
+        // at the rtyper level.  For the type-string carrier we just
+        // need the success-arm projection: `Result<T, E>` → `T`,
+        // `Option<T>` → `T`.  Mirrors the unwrapping `outer_generic_
+        // inner_type` does for `Rc`/`Arc`/`Box` in
+        // `method_as_ref_return_type`.
+        syn::Expr::Try(t) => {
+            let inner_ty = expression_type_string(&t.expr, ctx)?;
+            outer_generic_inner_type(&inner_ty, &["Result", "Option"])
+        }
+        // `{ ...; tail }` — same transparent handling.
+        syn::Expr::Block(b) => block_tail_type_string(&b.block, ctx),
+        // `if cond { a } else { b }` — RPython's annotator unifies
+        // arm types via `unionof(s_then, s_else)`
+        // (`annotator/model.py:UnionedSomeObject`); pyre's frontend
+        // lacks a SomeObject lattice, so handle only the case where
+        // the two arms agree on a single primitive type string.  The
+        // else branch is required (Rust `if` without else is `()` and
+        // wouldn't be the rhs of a `let` bound to a useful type).
+        syn::Expr::If(if_expr) => {
+            let then_ty = block_tail_type_string(&if_expr.then_branch, ctx)?;
+            let (_, else_expr) = if_expr.else_branch.as_ref()?;
+            let else_ty = expression_type_string(else_expr, ctx)?;
+            if then_ty == else_ty {
+                Some(then_ty)
+            } else {
+                None
+            }
+        }
+        // `match scrut { arm => body, ... }` — same unionof rationale
+        // as `Expr::If`.  All arm bodies must agree on one type
+        // string for the bind site to record a known type.
+        syn::Expr::Match(m) => {
+            let mut arms = m.arms.iter();
+            let first_ty = expression_type_string(&arms.next()?.body, ctx)?;
+            for arm in arms {
+                let arm_ty = expression_type_string(&arm.body, ctx)?;
+                if arm_ty != first_ty {
+                    return None;
+                }
+            }
+            Some(first_ty)
+        }
         _ => None,
     }
 }
 
+/// Tail-expression type string of a Rust block — `{ ...; tail }` ⇒
+/// `expression_type_string(tail)`.  RPython's flowspace has no
+/// block-tail concept (each opcode pushes onto a flat stack), but
+/// pyre's surface DSL wraps tail-yielding blocks under `Expr::If` /
+/// `Expr::Match` arms and `Expr::Block` / `Expr::Unsafe` operand
+/// expressions.  Returns `None` when the block ends in a statement
+/// (no tail) — e.g. `{ x = 1; }`.
+fn block_tail_type_string(block: &syn::Block, ctx: &GraphBuildContext) -> Option<String> {
+    if let Some(syn::Stmt::Expr(tail, None)) = block.stmts.last() {
+        expression_type_string(tail, ctx)
+    } else {
+        None
+    }
+}
+
+// TODO(name-based-callee-resolution): RPython resolves callees via
+// `bookkeeper.getdesc(value)` keyed by Python object identity
+// (`annrpython.py` callee resolution), so the name-based lookup
+// below is a textual substitute.  Pyre's walker has no Rust `use`
+// chain visibility, so a single bare ident at a call site is
+// resolved through three text-keyed fallbacks (bare key →
+// last-segment → last-two-segment) any of which can mis-route to
+// a similarly-named unrelated function.  Convergence path: feed
+// the `bookkeeper`-bound `FunctionDesc` directly through
+// `GraphBuildContext` so the same host-identity dispatch
+// `simple_call` uses at rtyper time also drives return-type
+// lookup at AST lowering time, then retire `fn_return_types`
+// entirely.  Multi-session — entry conditions are
+// `PyreCallRegistry::ensure_session` reaching every call site
+// before AST lowering.
 fn lookup_function_return_type<'a>(
     ctx: &'a GraphBuildContext,
     segments: &[String],
@@ -6974,7 +8700,62 @@ fn lookup_function_return_type<'a>(
     } else {
         segments.join("::")
     };
-    ctx.fn_return_types.get(&key)
+    if let Some(ret) = ctx.fn_return_types.get(&key) {
+        return Some(ret);
+    }
+    // Fallback for cross-module calls reached via `use crate::other::*`:
+    // pyre's walker inserts `fn_return_types` entries with the defining
+    // module's prefix (e.g. `pyobject::is_int` for
+    // `pyre-object/src/pyobject.rs::is_int`), but Rust call sites that
+    // imported the function via `use crate::pyobject::*;` invoke it
+    // unqualified.  The frontend does not yet track `use` chains, so
+    // resolve a bare single-segment lookup against the bare key as a
+    // final fallback. Matches RPython's annotator-level whole-program
+    // visibility: a globally-visible `def is_int(...) -> bool` is
+    // reachable from any module that imports it without re-qualifying
+    // the call site (`annrpython.py` resolves callees via `bookkeeper.
+    // getdesc(value)` keyed by Python object identity, not source path).
+    if segments.len() == 1
+        && let Some(ret) = ctx.fn_return_types.get(&segments[0])
+    {
+        return Some(ret);
+    }
+    // Closure-bound locals — `let f = |args| body` registers `f` in
+    // `local_closure_returns`. Same RPython parity rationale as the
+    // bare-key fallback above; the Rust adaptation is needed because
+    // pyre's walker has no closure visibility, so the closure return
+    // type is recorded at let-binding time.
+    if segments.len() == 1
+        && let Some(ret) = ctx.local_closure_returns.get(&segments[0])
+    {
+        return Some(ret);
+    }
+    // Cross-module call qualified by `crate::module::fn` /
+    // `pyre_object::fn` shapes — pyre's walker registers free
+    // functions under bare ident (file walker passes `prefix=""`),
+    // so a multi-segment crate-relative call falls back to the last
+    // segment. Same RPython parity rationale as the bare-single-
+    // segment fallback above; whole-program visibility is keyed on
+    // host identity, not on source path.
+    if segments.len() >= 2
+        && let Some(last) = segments.last()
+        && let Some(ret) = ctx.fn_return_types.get(last)
+    {
+        return Some(ret);
+    }
+    // Multi-segment Impl-method paths — `pyre_object::typeobject::
+    // Layout::expands_equal(...)` is registered under the bare
+    // `Type::method` shape (`Item::Impl` arm at front/ast.rs:591).
+    // Mirror of the same fallback in `expr_unary_not_operand_kind`'s
+    // `Expr::Call` arm.
+    if segments.len() >= 2 {
+        let n = segments.len();
+        let bare_impl = format!("{}::{}", segments[n - 2], segments[n - 1]);
+        if let Some(ret) = ctx.fn_return_types.get(&bare_impl) {
+            return Some(ret);
+        }
+    }
+    None
 }
 
 fn array_item_value_type_from_array_type_id(array_type_id: Option<&str>) -> Option<ValueType> {
@@ -8341,6 +10122,440 @@ mod tests {
             })
             .expect("unary op");
         assert_eq!(op, "neg");
+    }
+
+    #[test]
+    fn unary_not_on_int_param_lowers_to_invert() {
+        let parsed = crate::parse::parse_source(
+            r#"
+            fn example(x: i64) -> i64 {
+                !x
+            }
+        "#,
+        );
+        let program = build_semantic_program(&parsed).expect("source must lower");
+        let graph = &program.functions[0].graph;
+        assert!(
+            graph
+                .block(graph.startblock)
+                .operations
+                .iter()
+                .any(|op| matches!(
+                    &op.kind,
+                    OpKind::UnaryOp { op, .. } if op == "invert"
+                )),
+            "expected `!i64` to lower as RPython UNARY_INVERT"
+        );
+    }
+
+    #[test]
+    fn unary_not_on_bool_param_lowers_to_bool_branch() {
+        let parsed = crate::parse::parse_source(
+            r#"
+            fn example(flag: bool) -> bool {
+                !flag
+            }
+        "#,
+        );
+        let program = build_semantic_program(&parsed).expect("source must lower");
+        let graph = &program.functions[0].graph;
+        let start = graph.block(graph.startblock);
+        assert!(
+            start.operations.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::UnaryOp { op, result_ty, .. }
+                    if op == "bool" && *result_ty == ValueType::Bool
+            )),
+            "expected `!bool` to lower through RPython UNARY_NOT"
+        );
+        assert!(
+            start.exitswitch.is_some(),
+            "UNARY_NOT must branch on bool(x)"
+        );
+    }
+
+    /// `!x` on a statically unclassified operand fail-louds, mirroring
+    /// `flowcontext.py:194,535-538`'s strict UNARY_NOT vs UNARY_INVERT
+    /// dispatch and the `build_flow.rs:4404-4416` fail-loud peer.
+    /// The `expr_unary_not_operand_kind` classifier
+    /// (`front/ast.rs:5582`) covers the production patterns surfaced
+    /// in `pyre-{object,interpreter,jit}/src/` plus
+    /// `majit-ir/src/resoperation.rs`; an opaque operand with no type
+    /// information remains a hard error.
+    #[test]
+    fn unary_not_on_unknown_operand_fail_louds() {
+        let parsed = crate::parse::parse_source(
+            r#"
+            struct Opaque;
+            fn example(x: Opaque) -> bool {
+                !x
+            }
+        "#,
+        );
+        let err =
+            build_semantic_program(&parsed).expect_err("`!x` on opaque operand must fail-loud");
+        assert!(
+            format!("{err:?}").contains("UnaryNotUnknownOperand"),
+            "expected UnaryNotUnknownOperand variant, got {err:?}",
+        );
+    }
+
+    /// `!std::ptr::eq(a, b)` — stdlib free-function path call whose
+    /// `bool` return is known by shortlist (parity with the
+    /// `is_null`/`is_some`/... method-call shortlist; pyre's walker
+    /// has no stdlib visibility, so RPython
+    /// `bookkeeper.getdesc(value)` host-stdlib lookup is mirrored
+    /// statically here).  Must lower through the UNARY_NOT
+    /// `op.bool` + branch shape, not pop out as Unknown.
+    #[test]
+    fn unary_not_on_stdlib_ptr_eq_lowers_to_bool_branch() {
+        let parsed = crate::parse::parse_source(
+            r#"
+            fn example(a: *const u8, b: *const u8) -> bool {
+                !std::ptr::eq(a, b)
+            }
+        "#,
+        );
+        let program = build_semantic_program(&parsed).expect("source must lower");
+        let graph = &program.functions[0].graph;
+        let start = graph.block(graph.startblock);
+        assert!(
+            start.operations.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::UnaryOp { op, result_ty, .. }
+                    if op == "bool" && *result_ty == ValueType::Bool
+            )),
+            "expected `!std::ptr::eq(...)` to lower through RPython UNARY_NOT"
+        );
+    }
+
+    /// Multi-segment user path call (e.g. `crate::predicate(...)`,
+    /// `pyre_object::is_exception(...)`) — the analyser registers
+    /// free functions under their file-local prefix
+    /// (`build_semantic_program_from_parsed_files_with_options`
+    /// passes `prefix=""` per file at front/ast.rs:751-780), so a
+    /// multi-segment crate-relative lookup misses the keyed
+    /// `lookup_function_return_type`.  The last-segment fallback in
+    /// `expr_unary_not_operand_kind`'s `Expr::Call` arm recovers
+    /// the bool return so `!` classifies correctly.
+    #[test]
+    fn unary_not_on_multi_segment_user_path_classifies_via_last_segment() {
+        let parsed = crate::parse::parse_source(
+            r#"
+            pub fn predicate(x: i64) -> bool { x == 0 }
+            fn example(x: i64) -> bool {
+                !crate::predicate(x)
+            }
+        "#,
+        );
+        let program = build_semantic_program(&parsed).expect("source must lower");
+        let example = program
+            .functions
+            .iter()
+            .find(|f| f.graph.name == "example")
+            .expect("example graph must be present");
+        let start = example.graph.block(example.graph.startblock);
+        assert!(
+            start.operations.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::UnaryOp { op, result_ty, .. }
+                    if op == "bool" && *result_ty == ValueType::Bool
+            )),
+            "expected `!crate::predicate(...)` to lower through RPython UNARY_NOT"
+        );
+    }
+
+    /// `let local = if cond { call_a() } else { call_b() };
+    /// if !local { ... }` — `expression_type_string` unifies the two
+    /// arms' tail-expression types and stamps `local`'s recorded
+    /// type, so the subsequent `!local` classifies via the bool
+    /// `Path` arm rather than falling through.  RPython parity:
+    /// `annotator/model.py` `unionof(s_then, s_else)` resolves the
+    /// merged binding's annotation; pyre handles the narrow case
+    /// where both arms agree on a single primitive type string.
+    #[test]
+    fn unary_not_on_let_bound_if_else_classifies_via_arm_unification() {
+        let parsed = crate::parse::parse_source(
+            r#"
+            pub fn pick_a(x: i64) -> bool { x == 0 }
+            pub fn pick_b(x: i64) -> bool { x != 0 }
+            fn example(cond: bool, x: i64) -> bool {
+                let local = if cond { pick_a(x) } else { pick_b(x) };
+                !local
+            }
+        "#,
+        );
+        let program = build_semantic_program(&parsed).expect("source must lower");
+        let example = program
+            .functions
+            .iter()
+            .find(|f| f.graph.name == "example")
+            .expect("example graph must be present");
+        let saw_bool = example
+            .graph
+            .iter_blocks()
+            .flat_map(|b| b.operations.iter())
+            .any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::UnaryOp { op, result_ty, .. }
+                        if op == "bool" && *result_ty == ValueType::Bool
+                )
+            });
+        assert!(
+            saw_bool,
+            "expected `!local` (bound from if-else) to lower through RPython UNARY_NOT"
+        );
+    }
+
+    /// Companion to the if-else case for `match` arms.  Each match
+    /// arm returns a known-bool call; `expression_type_string`'s
+    /// `Expr::Match` arm unifies them so the let-bound `flag`
+    /// records `bool`, classifying the downstream `!flag`.
+    #[test]
+    fn unary_not_on_let_bound_match_classifies_via_arm_unification() {
+        let parsed = crate::parse::parse_source(
+            r#"
+            pub fn pick_a(x: i64) -> bool { x == 0 }
+            pub fn pick_b(x: i64) -> bool { x != 0 }
+            pub fn pick_c(x: i64) -> bool { x > 0 }
+            fn example(tag: i64, x: i64) -> bool {
+                let flag = match tag {
+                    0 => pick_a(x),
+                    1 => pick_b(x),
+                    _ => pick_c(x),
+                };
+                !flag
+            }
+        "#,
+        );
+        let program = build_semantic_program(&parsed).expect("source must lower");
+        let example = program
+            .functions
+            .iter()
+            .find(|f| f.graph.name == "example")
+            .expect("example graph must be present");
+        let saw_bool = example
+            .graph
+            .iter_blocks()
+            .flat_map(|b| b.operations.iter())
+            .any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::UnaryOp { op, result_ty, .. }
+                        if op == "bool" && *result_ty == ValueType::Bool
+                )
+            });
+        assert!(
+            saw_bool,
+            "expected `!flag` (bound from match) to lower through RPython UNARY_NOT"
+        );
+    }
+
+    /// `!driver.is_tracing()` — cross-crate method on a receiver
+    /// whose owner type (`WarmState` in
+    /// `majit-metainterp/src/warmstate.rs:143`) is outside the
+    /// analyser source set.  `lookup_method_return_type` returns
+    /// None because `fn_return_types` has no entry for the
+    /// cross-crate owner; the method-name shortlist in
+    /// `expr_unary_not_operand_kind`'s `Expr::Call` /
+    /// `Expr::MethodCall` arm substitutes for the missing
+    /// whole-program annotator visibility.  RPython parity:
+    /// `bookkeeper.getdesc(receiver).find_method`
+    /// (`unaryop.py:206-213`) resolves cross-module methods by
+    /// host-identity; pyre's static shortlist mirrors that.
+    #[test]
+    fn unary_not_on_cross_crate_method_classifies_via_method_shortlist() {
+        let parsed = crate::parse::parse_source(
+            r#"
+            type Driver = i64;
+            // No `impl` block — the receiver type's `is_tracing`
+            // method lives in a crate not visible to the analyser.
+            // The shortlist mirrors RPython's host-stdlib resolution.
+            fn example(driver: &Driver) -> bool {
+                !driver.is_tracing()
+            }
+        "#,
+        );
+        let program = build_semantic_program(&parsed).expect("source must lower");
+        let example = program
+            .functions
+            .iter()
+            .find(|f| f.graph.name == "example")
+            .expect("example graph must be present");
+        let saw_bool = example
+            .graph
+            .iter_blocks()
+            .flat_map(|b| b.operations.iter())
+            .any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::UnaryOp { op, result_ty, .. }
+                        if op == "bool" && *result_ty == ValueType::Bool
+                )
+            });
+        assert!(
+            saw_bool,
+            "expected `!driver.is_tracing()` to lower through RPython UNARY_NOT"
+        );
+    }
+
+    /// `!pyre_object::is_exception(obj)` — cross-crate predicate
+    /// path that the analyser source set
+    /// (`generated::PYRE_JIT_GRAPH_SOURCES`) does not visit.  The
+    /// shortlist in `expr_unary_not_operand_kind`'s `Expr::Call` arm
+    /// substitutes for the missing whole-program visibility, the
+    /// way RPython's `bookkeeper.getdesc(value)` would resolve the
+    /// helper by host-identity.  Pinned to bool so the surface
+    /// `!is_exception(...)` lowers through UNARY_NOT.
+    #[test]
+    fn unary_not_on_pyre_object_predicate_classifies_via_crate_shortlist() {
+        let parsed = crate::parse::parse_source(
+            r#"
+            type Obj = i64;
+            fn example(obj: Obj) -> bool {
+                !pyre_object::is_exception(obj)
+            }
+        "#,
+        );
+        let program = build_semantic_program(&parsed).expect("source must lower");
+        let example = program
+            .functions
+            .iter()
+            .find(|f| f.graph.name == "example")
+            .expect("example graph must be present");
+        let saw_bool = example
+            .graph
+            .iter_blocks()
+            .flat_map(|b| b.operations.iter())
+            .any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::UnaryOp { op, result_ty, .. }
+                        if op == "bool" && *result_ty == ValueType::Bool
+                )
+            });
+        assert!(
+            saw_bool,
+            "expected `!pyre_object::is_exception(...)` to lower through RPython UNARY_NOT"
+        );
+    }
+
+    /// `let v = call_returning_result()?; if !v { ... }` —
+    /// `Expr::Try` projects the success arm's `T` out of
+    /// `Result<T, E>` so the let-binding records the inner type.
+    /// RPython has no peer for `?`; the closest is
+    /// `flowcontext.py:194-198` exception-channel join, which would
+    /// surface as a separate `SomeBool` annotation on the success
+    /// arm via the rtyper's POP_BLOCK / END_FINALLY shape.  Pyre's
+    /// surface lowers `?` at the front-end via the analyser's
+    /// type-string carrier, mirroring the unwrapping that
+    /// `method_as_ref_return_type` does for `Rc`/`Arc`/`Box`.
+    #[test]
+    fn unary_not_on_let_bound_try_classifies_via_result_inner() {
+        let parsed = crate::parse::parse_source(
+            r#"
+            pub fn maybe_pred(x: i64) -> Result<bool, i64> { Ok(x == 0) }
+            fn example(x: i64) -> Result<bool, i64> {
+                let flag = maybe_pred(x)?;
+                Ok(!flag)
+            }
+        "#,
+        );
+        let program = build_semantic_program(&parsed).expect("source must lower");
+        let example = program
+            .functions
+            .iter()
+            .find(|f| f.graph.name == "example")
+            .expect("example graph must be present");
+        let saw_bool = example
+            .graph
+            .iter_blocks()
+            .flat_map(|b| b.operations.iter())
+            .any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::UnaryOp { op, result_ty, .. }
+                        if op == "bool" && *result_ty == ValueType::Bool
+                )
+            });
+        assert!(
+            saw_bool,
+            "expected `!flag` (let-bound from `expr?`) to lower through RPython UNARY_NOT"
+        );
+    }
+
+    /// `!frame.is_root` — struct field access whose declared type
+    /// is in `ctx.struct_fields`.  Mirror of the Call/MethodCall
+    /// shortcut: the classifier projects `Expr::Field` through
+    /// `expression_type_string → field_type_string_from_expr` and
+    /// classifies the resulting type string.  RPython parity:
+    /// `SomeInstance.find_attribute` (`annotator/model.py:430+`)
+    /// resolves the field's annotation; pyre uses the static
+    /// struct-field registry as the equivalent lookup table.
+    #[test]
+    fn unary_not_on_struct_field_classifies_via_field_type_registry() {
+        let parsed = crate::parse::parse_source(
+            r#"
+            pub struct Frame { pub is_root: bool, pub depth: i64 }
+            fn example(frame: &Frame) -> bool {
+                !frame.is_root
+            }
+        "#,
+        );
+        let program = build_semantic_program(&parsed).expect("source must lower");
+        let example = program
+            .functions
+            .iter()
+            .find(|f| f.graph.name == "example")
+            .expect("example graph must be present");
+        let saw_bool = example
+            .graph
+            .iter_blocks()
+            .flat_map(|b| b.operations.iter())
+            .any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::UnaryOp { op, result_ty, .. }
+                        if op == "bool" && *result_ty == ValueType::Bool
+                )
+            });
+        assert!(
+            saw_bool,
+            "expected `!frame.is_root` to lower through RPython UNARY_NOT"
+        );
+    }
+
+    /// `!unsafe { f(...) }` — the unsafe block is a transparent
+    /// wrapper for the classifier (mirror of the Paren / Group
+    /// arms).  The inner call's bool return must propagate so `!`
+    /// resolves to UNARY_NOT rather than falling through to the
+    /// Unknown arm flagged by `TODO(receiver-typed-dispatch)`.
+    #[test]
+    fn unary_not_on_unsafe_block_unwraps_inner() {
+        let parsed = crate::parse::parse_source(
+            r#"
+            unsafe fn predicate(x: i64) -> bool { x == 0 }
+            fn example(x: i64) -> bool {
+                !unsafe { predicate(x) }
+            }
+        "#,
+        );
+        let program = build_semantic_program(&parsed).expect("source must lower");
+        let example = program
+            .functions
+            .iter()
+            .find(|f| f.graph.name == "example")
+            .expect("example graph must be present");
+        let start = example.graph.block(example.graph.startblock);
+        assert!(
+            start.operations.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::UnaryOp { op, result_ty, .. }
+                    if op == "bool" && *result_ty == ValueType::Bool
+            )),
+            "expected `!unsafe {{ ... }}` to lower through RPython UNARY_NOT"
+        );
     }
 
     /// RPython `jtransform.py:410-412`: `dyn Trait` receivers from

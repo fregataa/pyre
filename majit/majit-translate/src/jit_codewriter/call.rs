@@ -2165,7 +2165,12 @@ fn return_type_string_to_kind(s: &str) -> char {
 fn graph_non_void_arg_types(graph: &FunctionGraph) -> Vec<Type> {
     let start = graph.block(graph.startblock);
     let map_ty = |ty: &crate::model::ValueType| match ty {
-        crate::model::ValueType::Int => Some(Type::Int),
+        // RPython `getkind(BOOL_TYPE)` returns `'int'`
+        // (`lloperation.py:108`); BoolRepr's lowleveltype is `Bool`
+        // and `FUNC.ARGS` (`call.py:220-221`) records it under the
+        // same `'i'` register kind as `Signed`.  Bool aliases to Int
+        // so the wildcard does not silently re-classify it as Ref.
+        crate::model::ValueType::Int | crate::model::ValueType::Bool => Some(Type::Int),
         crate::model::ValueType::Ref => Some(Type::Ref),
         crate::model::ValueType::Float => Some(Type::Float),
         crate::model::ValueType::Void => None,
@@ -4378,9 +4383,10 @@ fn collect_readwrite_effects(
                     // (frozenset semantics, matching `ArrayWrite` handler).
                     if !array_read_descrs.iter().any(|d| d.index() == idx) {
                         let ir_type = match item_ty {
-                            crate::model::ValueType::Int | crate::model::ValueType::State => {
-                                majit_ir::value::Type::Int
-                            }
+                            crate::model::ValueType::Int
+                            | crate::model::ValueType::Unsigned
+                            | crate::model::ValueType::Bool
+                            | crate::model::ValueType::State => majit_ir::value::Type::Int,
                             crate::model::ValueType::Ref | crate::model::ValueType::Unknown => {
                                 majit_ir::value::Type::Ref
                             }
@@ -4421,9 +4427,10 @@ fn collect_readwrite_effects(
                     // Dedup by descriptor index (frozenset semantics).
                     if !array_write_descrs.iter().any(|d| d.index() == idx) {
                         let ir_type = match item_ty {
-                            crate::model::ValueType::Int | crate::model::ValueType::State => {
-                                majit_ir::value::Type::Int
-                            }
+                            crate::model::ValueType::Int
+                            | crate::model::ValueType::Unsigned
+                            | crate::model::ValueType::Bool
+                            | crate::model::ValueType::State => majit_ir::value::Type::Int,
                             crate::model::ValueType::Ref | crate::model::ValueType::Unknown => {
                                 majit_ir::value::Type::Ref
                             }
@@ -4919,7 +4926,10 @@ fn op_can_raise(op: &OpKind) -> RaiseClass {
         // RPython LL: int_neg, bool_not → cannot raise
         OpKind::UnaryOp { op, .. } if !op.contains("ovf") => RaiseClass::No,
         // RPython LL: same_as, cast_*, hint → cannot raise
-        OpKind::Input { .. } | OpKind::ConstInt(_) | OpKind::ConstFloat(_) => RaiseClass::No,
+        OpKind::Input { .. }
+        | OpKind::ConstInt(_)
+        | OpKind::ConstBool(_)
+        | OpKind::ConstFloat(_) => RaiseClass::No,
         // JIT-specific ops that cannot raise
         OpKind::GuardTrue { .. }
         | OpKind::GuardFalse { .. }
@@ -5022,7 +5032,11 @@ fn exceptblock_is_reraise_of_caught_exception(graph: &FunctionGraph) -> bool {
 fn value_type_discriminant(ty: &crate::model::ValueType) -> u8 {
     use crate::model::ValueType;
     match ty {
-        ValueType::Int => 0,
+        // ValueType::Bool maps to the same array-descriptor bucket as
+        // Int — RPython's `cpu.arraydescrof(ARRAY)` records `BOOL_TYPE`
+        // and `INT_TYPE` under the same `'int'` kind for descriptor
+        // indexing (`lltypesystem/lloperation.py:108 getkind`).
+        ValueType::Int | ValueType::Unsigned | ValueType::Bool => 0,
         ValueType::Ref => 1,
         ValueType::Float => 2,
         ValueType::Void => 3,
@@ -5144,6 +5158,18 @@ const INT_FLOORDIV_TARGETS: &[CallTargetPattern] =
 
 const INT_MOD_TARGETS: &[CallTargetPattern] = &[CallTargetPattern::FunctionPath(&["int_mod"])];
 
+// RPython `jtransform.py:587-588` — `_do_builtin_call` re-routes
+// `cast_uint_to_float` / `cast_float_to_uint` to support helpers
+// (`support.py:274 _ll_1_cast_*`).  Cannot raise (NaN/inf are
+// caller-filtered); elidable because the conversion is pure given
+// the same input bit pattern.  No upstream `OopSpecIndex` — plain
+// support helpers, not `OS_*` oopspec calls.
+const CAST_UINT_TO_FLOAT_TARGETS: &[CallTargetPattern] =
+    &[CallTargetPattern::FunctionPath(&["cast_uint_to_float"])];
+
+const CAST_FLOAT_TO_UINT_TARGETS: &[CallTargetPattern] =
+    &[CallTargetPattern::FunctionPath(&["cast_float_to_uint"])];
+
 const FLOAT_DIV_TARGETS: &[CallTargetPattern] = &[
     CallTargetPattern::FunctionPath(&["float_floordiv"]),
     CallTargetPattern::FunctionPath(&["float_mod"]),
@@ -5229,6 +5255,18 @@ const CALL_DESCRIPTOR_TABLE: &[CallDescriptorEntry] = &[
         targets: INT_MOD_TARGETS,
         extraeffect: ExtraEffect::ElidableCanRaise,
         oopspecindex: OopSpecIndex::IntPyMod,
+    },
+    // RPython `jtransform.py:587-588` `_do_builtin_call` casts —
+    // unsigned-domain conversion helpers.  Cannot raise; elidable.
+    CallDescriptorEntry {
+        targets: CAST_UINT_TO_FLOAT_TARGETS,
+        extraeffect: ExtraEffect::ElidableCannotRaise,
+        oopspecindex: OopSpecIndex::None,
+    },
+    CallDescriptorEntry {
+        targets: CAST_FLOAT_TO_UINT_TARGETS,
+        extraeffect: ExtraEffect::ElidableCannotRaise,
+        oopspecindex: OopSpecIndex::None,
     },
     CallDescriptorEntry {
         targets: FLOAT_DIV_TARGETS,

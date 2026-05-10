@@ -244,7 +244,7 @@ impl SomePtr {
 
     /// RPython `SomePtr.call(self, args)` (lltype.py:1567-1577).
     pub fn call(&self, args: &ArgumentsForTranslation) -> Result<SomeValue, AnnotatorError> {
-        let (args_s, kwds_s) = args
+        let (args_s_opt, kwds_s) = args
             .unpack()
             .map_err(|err| AnnotatorError::new(err.getmsg()))?;
         if !kwds_s.is_empty() {
@@ -253,9 +253,18 @@ impl SomePtr {
             ));
         }
         let info = "argument to ll function pointer call";
-        let llargs = args_s
-            .iter()
-            .map(|s_arg| annotation_to_lltype(s_arg, Some(info)).map(|t| t._defl()))
+        // `lltype.py:1573-1574 SomePtr.call`: `[annotation_to_lltype(
+        // s_arg, info)._defl() for s_arg in args_s]` — touches every
+        // slot once via the list comprehension; `annotation_to_lltype`
+        // raises `AttributeError` on `None.knowntype` at the first slot
+        // that is unbound.  Mirror via per-touch [`arg_at`] so an
+        // unannotated slot panics with the call boundary name + slot
+        // index at the same iteration upstream would raise.
+        let llargs = (0..args_s_opt.len())
+            .map(|i| {
+                let s_arg = crate::annotator::builtin::arg_at(&args_s_opt, i, "SomePtr.call");
+                annotation_to_lltype(s_arg, Some(info)).map(|t| t._defl())
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let v = self.ll_ptrtype._example().call(&llargs);
         Ok(ll_to_annotation(v))
@@ -360,7 +369,7 @@ impl SomeInteriorPtr {
     }
 
     pub fn call(&self, args: &ArgumentsForTranslation) -> Result<SomeValue, AnnotatorError> {
-        let (args_s, kwds_s) = args
+        let (args_s_opt, kwds_s) = args
             .unpack()
             .map_err(|err| AnnotatorError::new(err.getmsg()))?;
         if !kwds_s.is_empty() {
@@ -369,9 +378,19 @@ impl SomeInteriorPtr {
             ));
         }
         let info = "argument to ll function pointer call";
-        let llargs = args_s
-            .iter()
-            .map(|s_arg| annotation_to_lltype(s_arg, Some(info)).map(|t| t._defl()))
+        // `lltype.py:1573-1574 SomePtr.call`: list comprehension touches
+        // every slot once via `annotation_to_lltype(s_arg, info)._defl()`;
+        // `annotation_to_lltype` raises `AttributeError` on
+        // `None.knowntype` at the first slot that is unbound.  Per-touch
+        // [`arg_at`] mirror so an unannotated slot panics with the call
+        // boundary name + slot index at the same iteration upstream
+        // would raise (`unaryop.py:940 simple_call_SomeBuiltin` bind-
+        // then-body sequence).
+        let llargs = (0..args_s_opt.len())
+            .map(|i| {
+                let s_arg = crate::annotator::builtin::arg_at(&args_s_opt, i, "SomeLLPtr.call");
+                annotation_to_lltype(s_arg, Some(info)).map(|t| t._defl())
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let v = self.ll_ptrtype._example().call(&llargs);
         Ok(ll_to_annotation(v))

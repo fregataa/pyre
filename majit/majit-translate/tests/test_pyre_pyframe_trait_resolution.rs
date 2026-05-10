@@ -42,8 +42,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use majit_translate::{
-    ParsedInterpreter, TraitImplInfo, extract_opcode_dispatch_receiver_traits, extract_trait_impls,
-    front::StructFieldRegistry, parse_source,
+    ParsedInterpreter, TraitImplInfo, build_semantic_program_from_parsed_files,
+    extract_opcode_dispatch_receiver_traits, extract_trait_impls, parse_source,
 };
 
 /// Source baked into the test binary so the assertions do not drift
@@ -60,15 +60,33 @@ fn parse_pyre_source(src: &str) -> ParsedInterpreter {
 }
 
 fn collect_all_trait_impls() -> Vec<TraitImplInfo> {
-    let empty_registry = StructFieldRegistry::default();
-    let empty_fn_ret: HashMap<String, String> = HashMap::new();
-    let empty_struct_names: HashSet<String> = HashSet::new();
+    // Mirror production at `lib.rs:317-342`: feed the parsed files into
+    // `build_semantic_program_from_parsed_files` first so the walker
+    // populates `fn_return_types` / `struct_fields` /
+    // `known_struct_names` for every user-source method.  Without
+    // that, `extract_trait_impls` body lowering hits
+    // `UnaryNotUnknownOperand` on `!self.<user_method>()` patterns
+    // (e.g. `!self.get_is_being_profiled()` at `eval.rs:2212`), the
+    // RPython parity equivalent being
+    // `bookkeeper.getdesc(receiver).find_method` at
+    // `unaryop.py:206-213`.
+    let parsed_files: Vec<ParsedInterpreter> =
+        [PYOPCODE_SRC, EVAL_SRC, PYFRAME_SRC, SHARED_OPCODE_SRC]
+            .iter()
+            .map(|src| parse_pyre_source(src))
+            .collect();
+    let program = build_semantic_program_from_parsed_files(&parsed_files)
+        .expect("pyre source must lower without FlowingError");
     let mut out = Vec::new();
-    for src in [PYOPCODE_SRC, EVAL_SRC, PYFRAME_SRC, SHARED_OPCODE_SRC] {
-        let parsed = parse_pyre_source(src);
+    for parsed in &parsed_files {
         out.extend(
-            extract_trait_impls(&parsed, &empty_registry, &empty_fn_ret, &empty_struct_names)
-                .expect("pyre source must lower"),
+            extract_trait_impls(
+                parsed,
+                &program.struct_fields,
+                &program.fn_return_types,
+                &program.known_struct_names,
+            )
+            .expect("pyre source must lower"),
         );
     }
     out

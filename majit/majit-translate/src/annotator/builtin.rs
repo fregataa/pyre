@@ -84,11 +84,54 @@ use crate::flowspace::model::ConstValue;
 /// * `kwds_s` — keyword argument annotations, already `s_` prefixed to
 ///   match upstream's `kwds_s['s_'+key] = s_value`. Most analysers do
 ///   not consume keywords.
+/// `unaryop.py:944-946 SomeBuiltin.call`: `args_s, kwds = args.unpack();
+/// return self.analyser(*args_s, **kwds_s)` — args_s passes through as a
+/// Python list possibly carrying `None` for unbound caller args.  The
+/// analyser body raises AttributeError on the first
+/// `s_arg.knowntype` / `.is_constant()` access if it touches an
+/// unbound slot.  The Rust port mirrors this by taking
+/// `&[Option<SomeValue>]`: each analyser body unwraps via [`arg_at`]
+/// at the touch site, panicking with the analyser name and slot
+/// index — observationally equivalent to upstream's first-attribute-
+/// touch failure, matching `unaryop.py:940 simple_call_SomeBuiltin`'s
+/// bind-then-body sequence.
 pub type BuiltinAnalyzer = fn(
     bk: &Rc<Bookkeeper>,
-    args_s: &[SomeValue],
-    kwds_s: &HashMap<String, SomeValue>,
+    args_s: &[Option<SomeValue>],
+    kwds_s: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError>;
+
+/// Per-slot access helper: return `&SomeValue` at index `i`, panicking
+/// on `None` to mirror upstream's `args_s[i].knowntype` AttributeError
+/// surface at the moment of first attribute touch.  Bodies use this at
+/// the access site so an unannotated optional-default slot can still
+/// be observed via `args_s.get(i)`-style arity probing before the
+/// panic fires.
+pub(crate) fn arg_at<'a>(
+    args_s: &'a [Option<SomeValue>],
+    i: usize,
+    analyser: &str,
+) -> &'a SomeValue {
+    args_s.get(i).and_then(|s| s.as_ref()).unwrap_or_else(|| {
+        panic!(
+            "{analyser}: positional arg {i} is unannotated \
+                 (upstream `args_s[{i}].knowntype` AttributeError)",
+        )
+    })
+}
+
+// (Retired 2026-05-12, strict-parity pass.)  The
+// `args_s_concrete_or_panic` eager-prefix helper was a NEW-DEVIATION
+// from `unaryop.py:940 simple_call_SomeBuiltin`'s bind-then-body
+// sequence (upstream's analyser body raises `AttributeError` on the
+// FIRST slot touch, not at a blanket prefix unwrap).  Every
+// `builtin_*` analyser in this file now uses [`arg_at`] at the touch
+// site directly; per-iteration `arg_at` covers helpers like
+// `union_many` / `r_dict_helper` that previously consumed the prefix
+// buffer.  Rtyper-phase callers (`SomePtr.call` / `SomeLLPtr.call`)
+// touch each slot via `annotation_to_lltype` in a list comprehension
+// — those now drive `arg_at` per iteration to mirror upstream
+// `lltype.py:1573-1574` AttributeError semantics.
 
 /// Process-wide `BUILTIN_ANALYZERS` table, lazily populated on first
 /// access by [`register_builtins`]. Mirrors upstream's module-level
@@ -161,8 +204,8 @@ fn allowed_kwds(qualname: &str) -> &'static [&'static str] {
 pub fn call_builtin(
     bk: &Rc<Bookkeeper>,
     analyser_name: &str,
-    args_s: &[SomeValue],
-    kwds_s: &HashMap<String, SomeValue>,
+    args_s: &[Option<SomeValue>],
+    kwds_s: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
     let Some(analyser) = lookup(analyser_name) else {
         return Err(AnnotatorError::new(format!(
@@ -389,22 +432,30 @@ fn is_str_annotation(s: &SomeValue) -> bool {
 /// Upstream `builtin_range(*args)` (builtin.py:49-84).
 pub fn builtin_range(
     bk: &Rc<Bookkeeper>,
-    args_s: &[SomeValue],
-    _kwds: &HashMap<String, SomeValue>,
+    args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
-    let bk_for_stop = bk.clone();
+    // Arity check fires first per `builtin.py:49-84` shape; per-slot
+    // access defers through `arg_at` so a `None` slot surfaces as
+    // "unannotated arg" at the touch site (matching `unaryop.py:940
+    // simple_call_SomeBuiltin`'s bind-then-body sequence) instead of
+    // the entry-point prefix unwrap.
     let (s_start, s_stop, s_step) = match args_s.len() {
         1 => (
-            bk_for_stop.immutablevalue(&ConstValue::Int(0))?,
-            args_s[0].clone(),
-            bk_for_stop.immutablevalue(&ConstValue::Int(1))?,
+            bk.immutablevalue(&ConstValue::Int(0))?,
+            arg_at(args_s, 0, "builtin_range").clone(),
+            bk.immutablevalue(&ConstValue::Int(1))?,
         ),
         2 => (
-            args_s[0].clone(),
-            args_s[1].clone(),
-            bk_for_stop.immutablevalue(&ConstValue::Int(1))?,
+            arg_at(args_s, 0, "builtin_range").clone(),
+            arg_at(args_s, 1, "builtin_range").clone(),
+            bk.immutablevalue(&ConstValue::Int(1))?,
         ),
-        3 => (args_s[0].clone(), args_s[1].clone(), args_s[2].clone()),
+        3 => (
+            arg_at(args_s, 0, "builtin_range").clone(),
+            arg_at(args_s, 1, "builtin_range").clone(),
+            arg_at(args_s, 2, "builtin_range").clone(),
+        ),
         _ => {
             return Err(AnnotatorError::new("range() takes 1 to 3 arguments"));
         }
@@ -476,12 +527,20 @@ pub fn builtin_range(
 /// Upstream `builtin_enumerate(s_obj, s_start=None)` (builtin.py:89-95).
 pub fn builtin_enumerate(
     _bk: &Rc<Bookkeeper>,
-    args_s: &[SomeValue],
-    kwds: &HashMap<String, SomeValue>,
+    args_s: &[Option<SomeValue>],
+    kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
-    let (s_obj, s_start_positional) = match args_s {
-        [s_obj] => (s_obj.clone(), None),
-        [s_obj, s_start] => (s_obj.clone(), Some(s_start.clone())),
+    // upstream: arity check first — `s_start=None` default means a
+    // 1-arg call binds `s_start` to Python None.  Defer per-slot
+    // access through `arg_at` so the unwrap surfaces at first
+    // attribute touch (matching upstream's `s_start.is_constant()`
+    // AttributeError) rather than a blanket entry-point panic.
+    let (s_obj, s_start_positional) = match args_s.len() {
+        1 => (arg_at(args_s, 0, "builtin_enumerate").clone(), None),
+        2 => (
+            arg_at(args_s, 0, "builtin_enumerate").clone(),
+            Some(arg_at(args_s, 1, "builtin_enumerate").clone()),
+        ),
         _ => {
             return Err(AnnotatorError::new("enumerate() takes 1 or 2 arguments"));
         }
@@ -493,7 +552,12 @@ pub fn builtin_enumerate(
             "enumerate() got multiple values for argument 'start'",
         ));
     }
-    let s_start = s_start_positional.or_else(|| kwds.get("s_start").cloned());
+    // upstream `Argument(start=...)` binds the value as-is (including
+    // `None` from `annotator.annotation(v) is None`); pyre's
+    // `kwds.get(...).cloned()` returns `Option<Option<SomeValue>>` so
+    // `.flatten()` collapses to the Option<SomeValue> form the body
+    // consumes via `s_start.as_ref()` (None tolerated).
+    let s_start = s_start_positional.or_else(|| kwds.get("s_start").cloned().flatten());
     if let Some(s_start) = s_start.as_ref()
         && !s_start.is_constant()
     {
@@ -512,12 +576,13 @@ pub fn builtin_enumerate(
 /// Upstream `builtin_reversed(s_obj)` (builtin.py:98-99).
 pub fn builtin_reversed(
     _bk: &Rc<Bookkeeper>,
-    args_s: &[SomeValue],
-    _kwds: &HashMap<String, SomeValue>,
+    args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
-    let [s_obj] = args_s else {
+    if args_s.len() != 1 {
         return Err(AnnotatorError::new("reversed() takes exactly one argument"));
-    };
+    }
+    let s_obj = arg_at(args_s, 0, "builtin_reversed");
     Ok(SomeValue::Iterator(SomeIterator::new(
         s_obj.clone(),
         vec!["reversed".to_string()],
@@ -542,12 +607,13 @@ pub fn builtin_reversed(
 /// the surrounding flow-level dispatch.
 pub fn builtin_bool(
     _bk: &Rc<Bookkeeper>,
-    args_s: &[SomeValue],
-    _kwds: &HashMap<String, SomeValue>,
+    args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
-    let [s_obj] = args_s else {
+    if args_s.len() != 1 {
         return Err(AnnotatorError::new("bool() takes exactly one argument"));
-    };
+    }
+    let s_obj = arg_at(args_s, 0, "builtin_bool");
     let mut r = SomeBool::new();
 
     // upstream `SomeTuple.bool` (unaryop.py:347-351): empty tuple is
@@ -604,33 +670,33 @@ pub fn builtin_bool(
 /// Upstream `builtin_int(s_obj, s_base=None)` (builtin.py:105-115).
 pub fn builtin_int(
     bk: &Rc<Bookkeeper>,
-    args_s: &[SomeValue],
-    kwds: &HashMap<String, SomeValue>,
+    args_s: &[Option<SomeValue>],
+    kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
     // upstream signature: `int(s_obj, s_base=None)` — allow keyword
-    // form for parity.
-    let s_obj = match args_s.first() {
-        Some(v) => v.clone(),
-        None => {
-            return Err(AnnotatorError::new("int() takes at least one argument"));
-        }
-    };
-    // upstream's Python dispatch raises TypeError when the same
-    // parameter is supplied both positionally and as a keyword. Bind
-    // `base` manually because `ArgumentsForTranslation.unpack()` is
-    // signature-agnostic at this call site.
+    // form for parity.  Arity check first so a 1-arg call lets
+    // `s_base` default to None without touching slot 1.
+    if args_s.is_empty() {
+        return Err(AnnotatorError::new("int() takes at least one argument"));
+    }
+    if args_s.len() > 2 {
+        return Err(AnnotatorError::new("int() takes at most 2 arguments"));
+    }
+    let s_obj = arg_at(args_s, 0, "builtin_int").clone();
     if args_s.len() >= 2 && kwds.contains_key("s_base") {
         return Err(AnnotatorError::new(
             "int() got multiple values for argument 'base'",
         ));
     }
-    if args_s.len() > 2 {
-        return Err(AnnotatorError::new("int() takes at most 2 arguments"));
-    }
-    let s_base = args_s
-        .get(1)
-        .cloned()
-        .or_else(|| kwds.get("s_base").cloned());
+    let s_base = if args_s.len() == 2 {
+        Some(arg_at(args_s, 1, "builtin_int").clone())
+    } else {
+        // upstream `Argument(base=...)` accepts `None` (unbound).
+        // pyre's `kwds.get(...).cloned()` returns
+        // `Option<Option<SomeValue>>`; `.flatten()` projects to
+        // `Option<SomeValue>` to align with the positional arm.
+        kwds.get("s_base").cloned().flatten()
+    };
 
     if let SomeValue::Integer(ref i) = s_obj
         && i.unsigned
@@ -695,12 +761,13 @@ pub fn builtin_int(
 /// Upstream `builtin_float(s_obj)` (builtin.py:117-118).
 pub fn builtin_float(
     bk: &Rc<Bookkeeper>,
-    args_s: &[SomeValue],
-    _kwds: &HashMap<String, SomeValue>,
+    args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
-    let [s_obj] = args_s else {
+    if args_s.len() != 1 {
         return Err(AnnotatorError::new("float() takes exactly one argument"));
-    };
+    }
+    let s_obj = arg_at(args_s, 0, "builtin_float");
     constpropagate(
         bk,
         &[s_obj.clone()],
@@ -721,12 +788,13 @@ pub fn builtin_float(
 /// Upstream `builtin_chr(s_int)` (builtin.py:120-121).
 pub fn builtin_chr(
     bk: &Rc<Bookkeeper>,
-    args_s: &[SomeValue],
-    _kwds: &HashMap<String, SomeValue>,
+    args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
-    let [s_int] = args_s else {
+    if args_s.len() != 1 {
         return Err(AnnotatorError::new("chr() takes exactly one argument"));
-    };
+    }
+    let s_int = arg_at(args_s, 0, "builtin_chr");
     constpropagate(
         bk,
         &[s_int.clone()],
@@ -751,12 +819,13 @@ pub fn builtin_chr(
 /// `const_box` ourselves.
 pub fn builtin_unichr(
     _bk: &Rc<Bookkeeper>,
-    args_s: &[SomeValue],
-    _kwds: &HashMap<String, SomeValue>,
+    args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
-    let [s_int] = args_s else {
+    if args_s.len() != 1 {
         return Err(AnnotatorError::new("unichr() takes exactly one argument"));
-    };
+    }
+    let s_int = arg_at(args_s, 0, "builtin_unichr");
     let mut result = SomeUnicodeCodePoint::new(false);
     if is_immutable_constant(s_int)
         && let Some(ConstValue::Int(n)) = s_int.const_()
@@ -776,12 +845,13 @@ pub fn builtin_unichr(
 /// `ConstValue::UniStr` type tag.
 pub fn builtin_unicode(
     _bk: &Rc<Bookkeeper>,
-    args_s: &[SomeValue],
-    _kwds: &HashMap<String, SomeValue>,
+    args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
-    let [s_unicode] = args_s else {
+    if args_s.len() != 1 {
         return Err(AnnotatorError::new("unicode() takes exactly one argument"));
-    };
+    }
+    let s_unicode = arg_at(args_s, 0, "builtin_unicode");
     let mut result = SomeUnicodeString::new(false, false);
     if is_immutable_constant(s_unicode)
         && let Some(s) = s_unicode.const_().and_then(ConstValue::as_text)
@@ -796,23 +866,35 @@ pub fn builtin_unicode(
 /// Upstream `builtin_bytearray(s_str)` (builtin.py:129-130).
 pub fn builtin_bytearray(
     _bk: &Rc<Bookkeeper>,
-    _args_s: &[SomeValue],
-    _kwds: &HashMap<String, SomeValue>,
+    args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
-    // upstream ignores the argument shape entirely — the analyser just
-    // returns `SomeByteArray()`.
+    // `builtin.py:129` `def builtin_bytearray(s_str):` — Python's
+    // call binding (`unaryop.py:940 simple_call_SomeBuiltin` →
+    // `signature(builtin_bytearray).bind(...)`) raises `TypeError`
+    // when arity disagrees.  Mirror the bind-time check; analyser
+    // body still ignores the argument shape and returns
+    // `SomeByteArray()`.
+    if args_s.len() != 1 {
+        return Err(AnnotatorError::new(format!(
+            "bytearray() takes exactly one argument ({} given)",
+            args_s.len()
+        )));
+    }
     Ok(SomeValue::ByteArray(SomeByteArray::new(false)))
 }
 
 /// Upstream `builtin_hasattr(s_obj, s_attr)` (builtin.py:133-148).
 pub fn builtin_hasattr(
     _bk: &Rc<Bookkeeper>,
-    args_s: &[SomeValue],
-    _kwds: &HashMap<String, SomeValue>,
+    args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
-    let [s_obj, s_attr] = args_s else {
+    if args_s.len() != 2 {
         return Err(AnnotatorError::new("hasattr() takes exactly two arguments"));
-    };
+    }
+    let s_obj = arg_at(args_s, 0, "builtin_hasattr");
+    let s_attr = arg_at(args_s, 1, "builtin_hasattr");
     // builtin.py:133-136 — `if not s_attr.is_constant() or not
     // isinstance(s_attr.const, str): bookkeeper.warning("hasattr is not
     // RPythonic enough") ; return SomeBool()`. Upstream's `isinstance(x,
@@ -886,12 +968,13 @@ pub fn builtin_hasattr(
 /// Upstream `builtin_tuple(s_iterable)` (builtin.py:151-154).
 pub fn builtin_tuple(
     _bk: &Rc<Bookkeeper>,
-    args_s: &[SomeValue],
-    _kwds: &HashMap<String, SomeValue>,
+    args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
-    let [s_iterable] = args_s else {
+    if args_s.len() != 1 {
         return Err(AnnotatorError::new("tuple() takes exactly one argument"));
-    };
+    }
+    let s_iterable = arg_at(args_s, 0, "builtin_tuple");
     if let SomeValue::Tuple(_) = s_iterable {
         return Ok(s_iterable.clone());
     }
@@ -903,12 +986,13 @@ pub fn builtin_tuple(
 /// Upstream `builtin_list(s_iterable)` (builtin.py:156-161).
 pub fn builtin_list(
     bk: &Rc<Bookkeeper>,
-    args_s: &[SomeValue],
-    _kwds: &HashMap<String, SomeValue>,
+    args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
-    let [s_iterable] = args_s else {
+    if args_s.len() != 1 {
         return Err(AnnotatorError::new("list() takes exactly one argument"));
-    };
+    }
+    let s_iterable = arg_at(args_s, 0, "builtin_list");
     if let SomeValue::List(s_list) = s_iterable {
         // upstream: `s_iterable.listdef.offspring(bk)`.
         return Ok(SomeValue::List(s_list.listdef.offspring(bk, &[])?));
@@ -922,14 +1006,14 @@ pub fn builtin_list(
 /// Upstream `builtin_zip(s_iterable1, s_iterable2)` (builtin.py:163-167).
 pub fn builtin_zip(
     bk: &Rc<Bookkeeper>,
-    args_s: &[SomeValue],
-    _kwds: &HashMap<String, SomeValue>,
+    args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
-    let [s_iter1, s_iter2] = args_s else {
+    if args_s.len() != 2 {
         return Err(AnnotatorError::new("zip() takes exactly two arguments"));
-    };
-    let s_iter1 = SomeIterator::new(s_iter1.clone(), vec![]);
-    let s_iter2 = SomeIterator::new(s_iter2.clone(), vec![]);
+    }
+    let s_iter1 = SomeIterator::new(arg_at(args_s, 0, "builtin_zip").clone(), vec![]);
+    let s_iter2 = SomeIterator::new(arg_at(args_s, 1, "builtin_zip").clone(), vec![]);
     let s_tup = SomeValue::Tuple(SomeTuple::new(vec![
         someiterator_next_stub(bk, &s_iter1),
         someiterator_next_stub(bk, &s_iter2),
@@ -940,35 +1024,35 @@ pub fn builtin_zip(
 /// Upstream `builtin_min(*s_values)` (builtin.py:169-174).
 pub fn builtin_min(
     bk: &Rc<Bookkeeper>,
-    args_s: &[SomeValue],
-    _kwds: &HashMap<String, SomeValue>,
+    args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
     if args_s.is_empty() {
         return Err(AnnotatorError::new("min() takes at least one argument"));
     }
     if args_s.len() == 1 {
         // upstream: `s_iter = s_values[0].iter(); return s_iter.next()`.
-        let s_iter = SomeIterator::new(args_s[0].clone(), vec![]);
+        let s_iter = SomeIterator::new(arg_at(args_s, 0, "builtin_min").clone(), vec![]);
         return Ok(someiterator_next_stub(bk, &s_iter));
     }
     // upstream: `return union(*s_values)`.
-    union_many(args_s)
+    union_many(args_s, "builtin_min")
 }
 
 /// Upstream `builtin_max(*s_values)` (builtin.py:176-188).
 pub fn builtin_max(
     bk: &Rc<Bookkeeper>,
-    args_s: &[SomeValue],
-    _kwds: &HashMap<String, SomeValue>,
+    args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
     if args_s.is_empty() {
         return Err(AnnotatorError::new("max() takes at least one argument"));
     }
     if args_s.len() == 1 {
-        let s_iter = SomeIterator::new(args_s[0].clone(), vec![]);
+        let s_iter = SomeIterator::new(arg_at(args_s, 0, "builtin_max").clone(), vec![]);
         return Ok(someiterator_next_stub(bk, &s_iter));
     }
-    let mut s = union_many(args_s)?;
+    let mut s = union_many(args_s, "builtin_max")?;
     // upstream (builtin.py:182-188):
     //
     //     if type(s) is SomeInteger and not s.nonneg:
@@ -983,7 +1067,10 @@ pub fn builtin_max(
     if let SomeValue::Integer(ref i) = s
         && !i.nonneg
     {
-        let any_nonneg = args_s.iter().any(nonneg_of);
+        // Per-touch revisit: `union_many` already touched every slot
+        // above, so by this point each `args_s[i]` is guaranteed to be
+        // `Some(..)` (otherwise the loop would have panicked).
+        let any_nonneg = (0..args_s.len()).any(|i| nonneg_of(arg_at(args_s, i, "builtin_max")));
         if any_nonneg {
             // upstream: `SomeInteger(nonneg=True, knowntype=s.knowntype)`
             // — pin the existing knowntype to avoid widening r_uint to int.
@@ -1000,8 +1087,8 @@ pub fn builtin_max(
 /// Upstream `object_init(s_self, *args)` (builtin.py:198-201).
 pub fn object_init(
     _bk: &Rc<Bookkeeper>,
-    _args_s: &[SomeValue],
-    _kwds: &HashMap<String, SomeValue>,
+    _args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
     // upstream returns `None` which `immutablevalue` wraps as s_None.
     Ok(s_none())
@@ -1010,8 +1097,8 @@ pub fn object_init(
 /// Upstream `EnvironmentError_init(s_self, *args)` (builtin.py:203-205).
 pub fn environment_error_init(
     _bk: &Rc<Bookkeeper>,
-    _args_s: &[SomeValue],
-    _kwds: &HashMap<String, SomeValue>,
+    _args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
     Ok(s_none())
 }
@@ -1019,8 +1106,8 @@ pub fn environment_error_init(
 /// Upstream `WindowsError_init(s_self, *args)` (builtin.py:212-214).
 pub fn windows_error_init(
     _bk: &Rc<Bookkeeper>,
-    _args_s: &[SomeValue],
-    _kwds: &HashMap<String, SomeValue>,
+    _args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
     Ok(s_none())
 }
@@ -1028,8 +1115,8 @@ pub fn windows_error_init(
 /// Upstream `conf()` (builtin.py:217-219).
 pub fn conf(
     _bk: &Rc<Bookkeeper>,
-    _args_s: &[SomeValue],
-    _kwds: &HashMap<String, SomeValue>,
+    _args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
     Ok(SomeValue::String(SomeString::new(false, false)))
 }
@@ -1037,8 +1124,8 @@ pub fn conf(
 /// Upstream `rarith_intmask(s_obj)` (builtin.py:221-223).
 pub fn rarith_intmask(
     _bk: &Rc<Bookkeeper>,
-    _args_s: &[SomeValue],
-    _kwds: &HashMap<String, SomeValue>,
+    _args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
     Ok(SomeValue::Integer(SomeInteger::default()))
 }
@@ -1046,8 +1133,8 @@ pub fn rarith_intmask(
 /// Upstream `rarith_longlongmask(s_obj)` (builtin.py:225-227).
 pub fn rarith_longlongmask(
     _bk: &Rc<Bookkeeper>,
-    _args_s: &[SomeValue],
-    _kwds: &HashMap<String, SomeValue>,
+    _args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
     // upstream: `SomeInteger(knowntype=rpython.rlib.rarithmetic.r_longlong)`.
     Ok(SomeValue::Integer(SomeInteger::new_with_knowntype(
@@ -1060,16 +1147,19 @@ pub fn rarith_longlongmask(
 /// (builtin.py:229-242).
 pub fn robjmodel_instantiate(
     _bk: &Rc<Bookkeeper>,
-    args_s: &[SomeValue],
-    _kwds: &HashMap<String, SomeValue>,
+    args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
-    let s_clspbc = match args_s.first() {
-        Some(SomeValue::PBC(p)) => p,
-        _ => {
-            return Err(AnnotatorError::new(
-                "instantiate() expected SomePBC as first argument",
-            ));
-        }
+    if args_s.is_empty() {
+        return Err(AnnotatorError::new(
+            "instantiate() expected SomePBC as first argument",
+        ));
+    }
+    let s_clspbc_v = arg_at(args_s, 0, "robjmodel_instantiate");
+    let SomeValue::PBC(s_clspbc) = s_clspbc_v else {
+        return Err(AnnotatorError::new(
+            "instantiate() expected SomePBC as first argument",
+        ));
     };
     let mut clsdef: Option<Rc<RefCell<ClassDef>>> = None;
     // upstream: `more_than_one = len(s_clspbc.descriptions) > 1`. The
@@ -1105,19 +1195,25 @@ pub fn robjmodel_instantiate(
 /// Upstream `robjmodel_r_dict(...)` (builtin.py:244-246).
 pub fn robjmodel_r_dict(
     bk: &Rc<Bookkeeper>,
-    args_s: &[SomeValue],
-    kwds: &HashMap<String, SomeValue>,
+    args_s: &[Option<SomeValue>],
+    kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
-    r_dict_helper(bk, args_s, kwds, RDictKind::Regular)
+    r_dict_helper(bk, args_s, kwds, RDictKind::Regular, "robjmodel_r_dict")
 }
 
 /// Upstream `robjmodel_r_ordereddict(...)` (builtin.py:248-251).
 pub fn robjmodel_r_ordereddict(
     bk: &Rc<Bookkeeper>,
-    args_s: &[SomeValue],
-    kwds: &HashMap<String, SomeValue>,
+    args_s: &[Option<SomeValue>],
+    kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
-    r_dict_helper(bk, args_s, kwds, RDictKind::Ordered)
+    r_dict_helper(
+        bk,
+        args_s,
+        kwds,
+        RDictKind::Ordered,
+        "robjmodel_r_ordereddict",
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -1135,18 +1231,23 @@ enum RDictKind {
 /// argument error if a caller passes both.
 fn r_dict_helper(
     bk: &Rc<Bookkeeper>,
-    args_s: &[SomeValue],
-    kwds: &HashMap<String, SomeValue>,
+    args_s: &[Option<SomeValue>],
+    kwds: &HashMap<String, Option<SomeValue>>,
     kind: RDictKind,
+    analyser: &str,
 ) -> Result<SomeValue, AnnotatorError> {
-    let s_eqfn = args_s
-        .first()
-        .cloned()
-        .ok_or_else(|| AnnotatorError::new("r_dict(): missing eq function"))?;
-    let s_hashfn = args_s
-        .get(1)
-        .cloned()
-        .ok_or_else(|| AnnotatorError::new("r_dict(): missing hash function"))?;
+    if args_s.is_empty() {
+        return Err(AnnotatorError::new("r_dict(): missing eq function"));
+    }
+    if args_s.len() < 2 {
+        return Err(AnnotatorError::new("r_dict(): missing hash function"));
+    }
+    // upstream `_r_dict_helper` binds these positions first; the body
+    // touches `s_eqfn`/`s_hashfn` immediately so the per-touch `arg_at`
+    // unwrap fires here (matching `unaryop.py:940 simple_call_
+    // SomeBuiltin`'s bind-then-body sequence).
+    let s_eqfn = arg_at(args_s, 0, analyser).clone();
+    let s_hashfn = arg_at(args_s, 1, analyser).clone();
     if args_s.len() >= 3 && kwds.contains_key("s_force_non_null") {
         return Err(AnnotatorError::new(
             "r_dict() got multiple values for argument 'force_non_null'",
@@ -1160,14 +1261,22 @@ fn r_dict_helper(
     if args_s.len() > 4 {
         return Err(AnnotatorError::new("r_dict() takes at most 4 arguments"));
     }
+    // Optional positions: a slot present-but-None is treated identically
+    // to "absent" here, matching upstream's `args_s.get(N)` semantic
+    // (`None` from `get` and `None` from the slot itself both fall
+    // through to the kwds lookup).  Required slots above use `arg_at`
+    // which panics on None.  `kwds.get(name).cloned().flatten()`
+    // projects `Option<Option<SomeValue>>` → `Option<SomeValue>`,
+    // collapsing "key absent" and "key present but value unbound"
+    // into a single "no concrete annotation" sentinel.
     let s_force = args_s
         .get(2)
-        .cloned()
-        .or_else(|| kwds.get("s_force_non_null").cloned());
+        .and_then(|s| s.clone())
+        .or_else(|| kwds.get("s_force_non_null").cloned().flatten());
     let s_simple = args_s
         .get(3)
-        .cloned()
-        .or_else(|| kwds.get("s_simple_hash_eq").cloned());
+        .and_then(|s| s.clone())
+        .or_else(|| kwds.get("s_simple_hash_eq").cloned().flatten());
     let force_non_null = match s_force {
         None => false,
         Some(ref s) => {
@@ -1209,8 +1318,8 @@ fn r_dict_helper(
 /// rtyper bridge lands.
 pub fn robjmodel_hlinvoke(
     _bk: &Rc<Bookkeeper>,
-    _args_s: &[SomeValue],
-    _kwds: &HashMap<String, SomeValue>,
+    _args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
     Err(AnnotatorError::new(
         "hlinvoke: rtyper-phase only, not supported in annotator",
@@ -1220,8 +1329,8 @@ pub fn robjmodel_hlinvoke(
 /// Upstream `robjmodel_keepalive_until_here(*args_s)` (builtin.py:291-293).
 pub fn robjmodel_keepalive_until_here(
     _bk: &Rc<Bookkeeper>,
-    _args_s: &[SomeValue],
-    _kwds: &HashMap<String, SomeValue>,
+    _args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
     Ok(s_none())
 }
@@ -1229,8 +1338,8 @@ pub fn robjmodel_keepalive_until_here(
 /// Upstream `robjmodel_free_non_gc_object(obj)` (builtin.py:326-328).
 pub fn robjmodel_free_non_gc_object(
     _bk: &Rc<Bookkeeper>,
-    _args_s: &[SomeValue],
-    _kwds: &HashMap<String, SomeValue>,
+    _args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
     // upstream implicitly returns None from an empty `def`.
     Ok(s_none())
@@ -1239,8 +1348,8 @@ pub fn robjmodel_free_non_gc_object(
 /// Upstream `unicodedata_decimal(s_uchr)` (builtin.py:300-303).
 pub fn unicodedata_decimal(
     _bk: &Rc<Bookkeeper>,
-    _args_s: &[SomeValue],
-    _kwds: &HashMap<String, SomeValue>,
+    _args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
     Err(AnnotatorError::new(
         "unicodedate.decimal() calls should not happen at interp-level",
@@ -1250,8 +1359,8 @@ pub fn unicodedata_decimal(
 /// Upstream `analyze()` registered for `OrderedDict` (builtin.py:305-307).
 pub fn analyze_ordered_dict(
     bk: &Rc<Bookkeeper>,
-    _args_s: &[SomeValue],
-    _kwds: &HashMap<String, SomeValue>,
+    _args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
     // upstream returns `SomeOrderedDict(bk.getdictdef())`; the Rust port
     // collapses `SomeDict`/`SomeOrderedDict` (see `model.rs:878-880`).
@@ -1262,14 +1371,15 @@ pub fn analyze_ordered_dict(
 /// Upstream `weakref_ref(s_obj)` (builtin.py:314-321).
 pub fn weakref_ref(
     _bk: &Rc<Bookkeeper>,
-    args_s: &[SomeValue],
-    _kwds: &HashMap<String, SomeValue>,
+    args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
-    let [s_obj] = args_s else {
+    if args_s.len() != 1 {
         return Err(AnnotatorError::new(
             "weakref.ref() takes exactly one argument",
         ));
-    };
+    }
+    let s_obj = arg_at(args_s, 0, "weakref_ref");
     let SomeValue::Instance(inst) = s_obj else {
         return Err(AnnotatorError::new(format!(
             "cannot take a weakref to {s_obj:?}"
@@ -1286,8 +1396,8 @@ pub fn weakref_ref(
 /// Upstream `pdb_set_trace(*args_s)` (builtin.py:335-339).
 pub fn pdb_set_trace(
     _bk: &Rc<Bookkeeper>,
-    _args_s: &[SomeValue],
-    _kwds: &HashMap<String, SomeValue>,
+    _args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
     Err(AnnotatorError::new(
         "you left pdb.set_trace() in your interpreter! \
@@ -1353,10 +1463,15 @@ fn host_hasattr(host: &crate::flowspace::model::HostObject, name: &str) -> bool 
 ///
 /// n-ary fold with `SomeImpossibleValue` as the identity element,
 /// mirroring `annmodel.union(*s_values)` being called with the unpacked
-/// `*s_values` tuple.
-fn union_many(s_values: &[SomeValue]) -> Result<SomeValue, AnnotatorError> {
+/// `*s_values` tuple.  Each slot is unwrapped via [`arg_at`] at touch
+/// time so an unannotated slot surfaces at the first iteration that
+/// reads it — matching `unaryop.py:940 simple_call_SomeBuiltin`'s
+/// bind-then-body sequence rather than an entry-point eager prefix
+/// unwrap.
+fn union_many(s_values: &[Option<SomeValue>], analyser: &str) -> Result<SomeValue, AnnotatorError> {
     let mut acc = s_impossible_value();
-    for s in s_values {
+    for i in 0..s_values.len() {
+        let s = arg_at(s_values, i, analyser);
         acc = union(&acc, s).map_err(|e| AnnotatorError::new(e.msg))?;
     }
     Ok(acc)
@@ -1423,7 +1538,7 @@ mod tests {
         Rc::new(Bookkeeper::new())
     }
 
-    fn no_kwds() -> HashMap<String, SomeValue> {
+    fn no_kwds() -> HashMap<String, Option<SomeValue>> {
         HashMap::new()
     }
 
@@ -1465,7 +1580,7 @@ mod tests {
         // range_step=1.
         let bk = bk();
         let s_stop = bk.immutablevalue(&ConstValue::Int(10)).unwrap();
-        let result = builtin_range(&bk, &[s_stop], &no_kwds()).unwrap();
+        let result = builtin_range(&bk, &[Some(s_stop)], &no_kwds()).unwrap();
         match result {
             SomeValue::List(list) => {
                 let item = list.listdef.read_item(None);
@@ -1481,7 +1596,7 @@ mod tests {
         // s_ImpossibleValue.
         let bk = bk();
         let s_stop = bk.immutablevalue(&ConstValue::Int(-5)).unwrap();
-        let result = builtin_range(&bk, &[s_stop], &no_kwds()).unwrap();
+        let result = builtin_range(&bk, &[Some(s_stop)], &no_kwds()).unwrap();
         match result {
             SomeValue::List(list) => {
                 let item = list.listdef.read_item(None);
@@ -1497,7 +1612,7 @@ mod tests {
         let a = bk.immutablevalue(&ConstValue::Int(0)).unwrap();
         let b = bk.immutablevalue(&ConstValue::Int(10)).unwrap();
         let c = bk.immutablevalue(&ConstValue::Int(0)).unwrap();
-        let err = builtin_range(&bk, &[a, b, c], &no_kwds()).unwrap_err();
+        let err = builtin_range(&bk, &[Some(a), Some(b), Some(c)], &no_kwds()).unwrap_err();
         assert!(err.msg.as_deref().unwrap_or("").contains("step zero"));
     }
 
@@ -1505,7 +1620,7 @@ mod tests {
     fn builtin_int_const_string_returns_constant_integer() {
         let bk = bk();
         let s_str = bk.immutablevalue(&ConstValue::byte_str("42")).unwrap();
-        let result = builtin_int(&bk, &[s_str], &no_kwds()).unwrap();
+        let result = builtin_int(&bk, &[Some(s_str)], &no_kwds()).unwrap();
         match result {
             SomeValue::Integer(i) => {
                 assert!(i.base.const_box.is_some());
@@ -1522,7 +1637,7 @@ mod tests {
         use crate::annotator::model::SomeInteger;
         let bk = bk();
         let s_nonneg = SomeValue::Integer(SomeInteger::new(true, false));
-        let result = builtin_int(&bk, &[s_nonneg], &no_kwds()).unwrap();
+        let result = builtin_int(&bk, &[Some(s_nonneg)], &no_kwds()).unwrap();
         assert!(matches!(result, SomeValue::Integer(ref i) if i.nonneg));
     }
 
@@ -1530,7 +1645,7 @@ mod tests {
     fn builtin_chr_const_integer_returns_constant_char() {
         let bk = bk();
         let s_int = bk.immutablevalue(&ConstValue::Int(65)).unwrap();
-        let result = builtin_chr(&bk, &[s_int], &no_kwds()).unwrap();
+        let result = builtin_chr(&bk, &[Some(s_int)], &no_kwds()).unwrap();
         match result {
             SomeValue::Char(ch) => {
                 assert!(ch.inner.base.const_box.is_some());
@@ -1554,7 +1669,7 @@ mod tests {
             false,
         );
         let s = SomeValue::List(super::super::model::SomeList::new(listdef));
-        let out = builtin_list(&bk, &[s], &no_kwds()).unwrap();
+        let out = builtin_list(&bk, &[Some(s)], &no_kwds()).unwrap();
         assert!(matches!(out, SomeValue::List(_)));
     }
 
@@ -1574,7 +1689,7 @@ mod tests {
     fn call_builtin_dispatches_range() {
         let bk = bk();
         let s_stop = bk.immutablevalue(&ConstValue::Int(3)).unwrap();
-        let result = call_builtin(&bk, "range", &[s_stop], &no_kwds()).unwrap();
+        let result = call_builtin(&bk, "range", &[Some(s_stop)], &no_kwds()).unwrap();
         assert!(matches!(result, SomeValue::List(_)));
     }
 
@@ -1672,7 +1787,7 @@ mod tests {
         let inner_list = SomeValue::List(SomeList::new(inner));
         let s_iter =
             SomeValue::Iterator(SomeIterator::new(inner_list, vec!["reversed".to_string()]));
-        let out = builtin_list(&bk, &[s_iter], &no_kwds()).unwrap();
+        let out = builtin_list(&bk, &[Some(s_iter)], &no_kwds()).unwrap();
         match out {
             SomeValue::List(list) => {
                 let item = list.listdef.read_item(None);
@@ -1693,7 +1808,7 @@ mod tests {
         let bk = bk();
         let a = SomeValue::Integer(SomeInteger::new(true, false));
         let b = SomeValue::Integer(SomeInteger::new(false, false));
-        let out = builtin_max(&bk, &[a, b], &no_kwds()).unwrap();
+        let out = builtin_max(&bk, &[Some(a), Some(b)], &no_kwds()).unwrap();
         match out {
             SomeValue::Integer(i) => assert!(
                 i.nonneg,
@@ -1712,7 +1827,7 @@ mod tests {
         let bk = bk();
         let huge = ConstValue::float(1.0e20_f64);
         let s_huge = bk.immutablevalue(&huge).unwrap();
-        let out = builtin_int(&bk, &[s_huge], &no_kwds()).unwrap();
+        let out = builtin_int(&bk, &[Some(s_huge)], &no_kwds()).unwrap();
         match out {
             SomeValue::Integer(i) => {
                 assert!(
@@ -1753,7 +1868,7 @@ mod tests {
         // through immutablevalue needs the explicit unicode tag.
         let bk = bk();
         let s_int = bk.immutablevalue(&ConstValue::Int(65)).unwrap();
-        let out = builtin_unichr(&bk, &[s_int], &no_kwds()).unwrap();
+        let out = builtin_unichr(&bk, &[Some(s_int)], &no_kwds()).unwrap();
         match out {
             SomeValue::UnicodeCodePoint(cp) => {
                 match cp.inner.base.const_box.as_ref().map(|c| &c.value) {
@@ -1771,7 +1886,7 @@ mod tests {
         // SomeUnicodeString, not raise AnnotatorError.
         let bk = bk();
         let s_str = bk.immutablevalue(&ConstValue::byte_str("abc")).unwrap();
-        let out = builtin_unicode(&bk, &[s_str], &no_kwds()).unwrap();
+        let out = builtin_unicode(&bk, &[Some(s_str)], &no_kwds()).unwrap();
         match out {
             SomeValue::UnicodeString(us) => {
                 match us.inner.base.const_box.as_ref().map(|c| &c.value) {
@@ -1797,7 +1912,7 @@ mod tests {
         let s_attr = bk
             .immutablevalue(&ConstValue::byte_str("no_such_attr"))
             .unwrap();
-        let out = builtin_hasattr(&bk, &[s_obj, s_attr], &no_kwds()).unwrap();
+        let out = builtin_hasattr(&bk, &[Some(s_obj), Some(s_attr)], &no_kwds()).unwrap();
         match out {
             SomeValue::Bool(b) => match b.base.const_box.as_ref().map(|c| &c.value) {
                 Some(ConstValue::Bool(false)) => {}
@@ -1813,7 +1928,7 @@ mod tests {
         // returning an unrefined SomeBool.
         let bk = bk();
         let s_none_val = bk.immutablevalue(&ConstValue::None).unwrap();
-        let out = builtin_bool(&bk, &[s_none_val], &no_kwds()).unwrap();
+        let out = builtin_bool(&bk, &[Some(s_none_val)], &no_kwds()).unwrap();
         match out {
             SomeValue::Bool(b) => match b.base.const_box.as_ref().map(|c| &c.value) {
                 Some(ConstValue::Bool(false)) => {}
@@ -1827,7 +1942,7 @@ mod tests {
     fn builtin_bool_folds_constant_int_to_true() {
         let bk = bk();
         let s_int = bk.immutablevalue(&ConstValue::Int(42)).unwrap();
-        let out = builtin_bool(&bk, &[s_int], &no_kwds()).unwrap();
+        let out = builtin_bool(&bk, &[Some(s_int)], &no_kwds()).unwrap();
         match out {
             SomeValue::Bool(b) => match b.base.const_box.as_ref().map(|c| &c.value) {
                 Some(ConstValue::Bool(true)) => {}
@@ -1843,10 +1958,10 @@ mod tests {
         // ignoring `foo=1`. The dispatcher now rejects kwds outside
         // each analyser's allow-list.
         let bk = bk();
-        let mut kwds: HashMap<String, SomeValue> = HashMap::new();
+        let mut kwds: HashMap<String, Option<SomeValue>> = HashMap::new();
         kwds.insert(
             "s_foo".into(),
-            bk.immutablevalue(&ConstValue::Int(1)).unwrap(),
+            Some(bk.immutablevalue(&ConstValue::Int(1)).unwrap()),
         );
         let err = call_builtin(&bk, "list", &[], &kwds).unwrap_err();
         assert!(
@@ -1866,9 +1981,9 @@ mod tests {
         let bk = bk();
         let s_str = bk.immutablevalue(&ConstValue::byte_str("1a")).unwrap();
         let s_base = bk.immutablevalue(&ConstValue::Int(16)).unwrap();
-        let mut kwds: HashMap<String, SomeValue> = HashMap::new();
-        kwds.insert("s_base".into(), s_base);
-        let out = call_builtin(&bk, "int", &[s_str], &kwds).unwrap();
+        let mut kwds: HashMap<String, Option<SomeValue>> = HashMap::new();
+        kwds.insert("s_base".into(), Some(s_base));
+        let out = call_builtin(&bk, "int", &[Some(s_str)], &kwds).unwrap();
         match out {
             SomeValue::Integer(i) => match i.base.const_box.as_ref().map(|c| &c.value) {
                 Some(ConstValue::Int(n)) => assert_eq!(*n, 26),
@@ -1886,9 +2001,9 @@ mod tests {
         let s_str = bk.immutablevalue(&ConstValue::byte_str("1a")).unwrap();
         let s_base_pos = bk.immutablevalue(&ConstValue::Int(10)).unwrap();
         let s_base_kw = bk.immutablevalue(&ConstValue::Int(16)).unwrap();
-        let mut kwds: HashMap<String, SomeValue> = HashMap::new();
-        kwds.insert("s_base".into(), s_base_kw);
-        let err = builtin_int(&bk, &[s_str, s_base_pos], &kwds).unwrap_err();
+        let mut kwds: HashMap<String, Option<SomeValue>> = HashMap::new();
+        kwds.insert("s_base".into(), Some(s_base_kw));
+        let err = builtin_int(&bk, &[Some(s_str), Some(s_base_pos)], &kwds).unwrap_err();
         assert!(
             err.msg
                 .as_deref()
@@ -1915,12 +2030,13 @@ mod tests {
         let bk = bk();
         bk.enter(None);
         let s_force = bk.immutablevalue(&ConstValue::Bool(true)).unwrap();
-        let mut kwds: HashMap<String, SomeValue> = HashMap::new();
-        kwds.insert("s_force_non_null".into(), s_force);
+        let mut kwds: HashMap<String, Option<SomeValue>> = HashMap::new();
+        kwds.insert("s_force_non_null".into(), Some(s_force));
 
         // Mirror r_dict_helper's flag extraction — the unit under test.
         let force_non_null = kwds
             .get("s_force_non_null")
+            .and_then(|s| s.as_ref())
             .and_then(|s| s.const_().cloned())
             .map(|cv| matches!(cv, ConstValue::Bool(true)))
             .unwrap_or(false);
@@ -1946,9 +2062,9 @@ mod tests {
         let bk = bk();
         let s_xs = SomeValue::object();
         let s_start_nonconst = SomeValue::Integer(SomeInteger::default());
-        let mut kwds: HashMap<String, SomeValue> = HashMap::new();
-        kwds.insert("s_start".into(), s_start_nonconst);
-        let err = builtin_enumerate(&bk, &[s_xs], &kwds).unwrap_err();
+        let mut kwds: HashMap<String, Option<SomeValue>> = HashMap::new();
+        kwds.insert("s_start".into(), Some(s_start_nonconst));
+        let err = builtin_enumerate(&bk, &[Some(s_xs)], &kwds).unwrap_err();
         assert!(
             err.msg
                 .as_deref()
@@ -1964,7 +2080,7 @@ mod tests {
         let bk = bk();
         let s_xs = SomeValue::object();
         let s_start = bk.immutablevalue(&ConstValue::Int(3)).unwrap();
-        let result = builtin_enumerate(&bk, &[s_xs, s_start], &no_kwds()).unwrap();
+        let result = builtin_enumerate(&bk, &[Some(s_xs), Some(s_start)], &no_kwds()).unwrap();
         let SomeValue::Iterator(it) = result else {
             panic!("expected SomeIterator");
         };
@@ -1977,9 +2093,9 @@ mod tests {
         let bk = bk();
         let s_xs = SomeValue::object();
         let s_start = bk.immutablevalue(&ConstValue::Int(5)).unwrap();
-        let mut kwds: HashMap<String, SomeValue> = HashMap::new();
-        kwds.insert("s_start".into(), s_start);
-        let result = builtin_enumerate(&bk, &[s_xs], &kwds).unwrap();
+        let mut kwds: HashMap<String, Option<SomeValue>> = HashMap::new();
+        kwds.insert("s_start".into(), Some(s_start));
+        let result = builtin_enumerate(&bk, &[Some(s_xs)], &kwds).unwrap();
         let SomeValue::Iterator(it) = result else {
             panic!("expected SomeIterator");
         };
@@ -2000,7 +2116,7 @@ mod tests {
         let sub = HostObject::new_class("pkg.Sub", vec![base]);
         let s_obj = bk.immutablevalue(&ConstValue::HostObject(sub)).unwrap();
         let s_attr = bk.immutablevalue(&ConstValue::byte_str("m")).unwrap();
-        let out = builtin_hasattr(&bk, &[s_obj, s_attr], &no_kwds()).unwrap();
+        let out = builtin_hasattr(&bk, &[Some(s_obj), Some(s_attr)], &no_kwds()).unwrap();
         match out {
             SomeValue::Bool(b) => match b.base.const_box.as_ref().map(|c| &c.value) {
                 Some(ConstValue::Bool(true)) => {}

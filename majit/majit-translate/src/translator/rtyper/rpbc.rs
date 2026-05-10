@@ -444,15 +444,12 @@ pub(crate) mod tests {
     use crate::annotator::bookkeeper::Bookkeeper;
     use crate::annotator::description::{DescEntry, FunctionDesc};
     use crate::annotator::model::{SomeInteger, SomePBC, SomeValue};
-    use crate::call::CallControl;
     use crate::flowspace::model::{
         Block as FlowBlock, BlockRefExt as FlowBlockRefExt, ConstValue as FlowConstValue,
         Constant as FlowConstant, FunctionGraph as FlowFunctionGraph, GraphFunc as FlowGraphFunc,
         Hlvalue as FlowHlvalue, Link as FlowLink, Variable as FlowVariable,
     };
     use crate::model::{FunctionGraph, OpKind, ValueType};
-    use crate::translate_legacy::annotator::annrpython::annotate;
-    use crate::translate_legacy::rtyper::rtyper::resolve_types;
     use crate::translator::rtyper::lltypesystem::lltype::{_ptr, FuncType, functionptr};
 
     fn make_rtyper() -> (Rc<RPythonAnnotator>, RPythonTyper) {
@@ -734,7 +731,7 @@ pub(crate) mod tests {
             cached_graph.clone(),
         );
         let args = ArgumentsForTranslation::new(
-            vec![SomeValue::Integer(SomeInteger::default())],
+            vec![Some(SomeValue::Integer(SomeInteger::default()))],
             None,
             None,
         );
@@ -751,8 +748,8 @@ pub(crate) mod tests {
         assert!(Rc::ptr_eq(&selected.anygraph.graph, &cached_graph.graph));
     }
 
-    fn build_indirect_graph() -> FunctionGraph {
-        let mut graph = FunctionGraph::new("outer");
+    fn build_indirect_graph() -> crate::model::FunctionGraph {
+        let mut graph = crate::model::FunctionGraph::new("outer");
         let receiver = graph
             .push_op(
                 graph.startblock,
@@ -766,7 +763,7 @@ pub(crate) mod tests {
         graph.push_op(
             graph.startblock,
             OpKind::Call {
-                target: CallTarget::indirect("Handler", "run"),
+                target: crate::model::CallTarget::indirect("Handler", "run"),
                 args: vec![receiver],
                 result_ty: ValueType::Void,
             },
@@ -776,14 +773,34 @@ pub(crate) mod tests {
         graph
     }
 
-    /// Boundary: pre-lowering graph has `CallTarget::Indirect`; post-lowering
-    /// graph has `VtableMethodPtr + IndirectCall` and zero `Indirect`
-    /// targets. Mirrors RPython rpbc.py:199-217 emit shape.
+    /// Boundary: pre-lowering graph has `CallTarget::Indirect`;
+    /// post-lowering graph has `VtableMethodPtr + IndirectCall` and
+    /// zero `Indirect` targets.  Mirrors `rpbc.py:199-217` emit shape.
+    /// Runs through the cfg(test)-gated legacy annotate / resolve_types
+    /// pair because `function_graph_to_flowspace` rejects
+    /// `CallTarget::Indirect` (it is the rclass-rewrite pre-image,
+    /// not a flowspace operand) — the production path lowers it
+    /// away first.
     #[test]
     fn lower_indirect_calls_eliminates_call_target_indirect() {
+        use crate::call::CallControl;
+        use crate::model::CallTarget;
+        use crate::translator::rtyper::legacy_annotator::annotate;
+        use crate::translator::rtyper::legacy_resolve::resolve_types;
+
         let mut cc = CallControl::new();
-        cc.register_trait_method("run", Some("Handler"), "A", FunctionGraph::new("A::run"));
-        cc.register_trait_method("run", Some("Handler"), "B", FunctionGraph::new("B::run"));
+        cc.register_trait_method(
+            "run",
+            Some("Handler"),
+            "A",
+            crate::model::FunctionGraph::new("A::run"),
+        );
+        cc.register_trait_method(
+            "run",
+            Some("Handler"),
+            "B",
+            crate::model::FunctionGraph::new("B::run"),
+        );
         cc.find_all_graphs_for_tests();
 
         let mut graph = build_indirect_graph();
@@ -825,20 +842,26 @@ pub(crate) mod tests {
         assert_eq!(indirect_call_count, 1);
     }
 
-    /// Regression: inherent (non-trait) method calls — `CallTarget::Method`
-    /// targets — must pass through `lower_indirect_calls` unchanged.
-    /// RPython rpbc.py:199-217 only rewrites the indirect-call dispatch
-    /// (`s_pbc.callfamily`), inherent method calls are statically resolved
-    /// upstream by the rtyper.
+    /// Regression: inherent (non-trait) method calls —
+    /// `CallTarget::Method` targets — must pass through
+    /// `lower_indirect_calls` unchanged.  `rpbc.py:199-217` only
+    /// rewrites the indirect-call dispatch (`s_pbc.callfamily`);
+    /// inherent method calls are statically resolved upstream by
+    /// the rtyper.
     #[test]
     fn inherent_method_unchanged_by_lowering() {
+        use crate::call::CallControl;
+        use crate::model::CallTarget;
+        use crate::translator::rtyper::legacy_annotator::annotate;
+        use crate::translator::rtyper::legacy_resolve::resolve_types;
+
         let mut cc = CallControl::new();
         cc.register_function_graph(
             crate::parse::CallPath::from_segments(["Foo", "bar"]),
-            FunctionGraph::new("Foo::bar"),
+            crate::model::FunctionGraph::new("Foo::bar"),
         );
 
-        let mut graph = FunctionGraph::new("outer");
+        let mut graph = crate::model::FunctionGraph::new("outer");
         let receiver = graph
             .push_op(
                 graph.startblock,
@@ -1393,7 +1416,13 @@ where
             "FunctionReprBase.call: hop.args_s must contain the receiver",
         ));
     }
-    let args = build_args_for_op(&hop.spaceop.opname, &args_s_full[1..])
+    // `hop.args_s` carries concrete `SomeValue`s by the time the
+    // rtyper runs (annotator's fixpoint has converged), so wrap each
+    // entry as `Some(_)` for the post-Item-#100 `build_args_for_op`
+    // signature.
+    let args_s_opt: Vec<Option<super::super::super::annotator::model::SomeValue>> =
+        args_s_full[1..].iter().cloned().map(Some).collect();
+    let args = build_args_for_op(&hop.spaceop.opname, &args_s_opt)
         .map_err(|e| TyperError::message(e.to_string()))?;
 
     // upstream: `s_pbc = hop.args_s[0]; descs = list(s_pbc.descriptions);
@@ -3022,7 +3051,13 @@ impl SmallFunctionSetPBCRepr {
                 "SmallFunctionSetPBCRepr.call: hop.args_s must contain the receiver",
             ));
         }
-        let args = build_args_for_op(&hop.spaceop.opname, &args_s_full[1..])
+        // `hop.args_s` carries concrete `SomeValue`s by the time the
+        // rtyper runs (annotator's fixpoint has converged), so wrap
+        // each entry as `Some(_)` for the post-Item-#100
+        // `build_args_for_op` signature.
+        let args_s_opt: Vec<Option<SomeValue>> =
+            args_s_full[1..].iter().cloned().map(Some).collect();
+        let args = build_args_for_op(&hop.spaceop.opname, &args_s_opt)
             .map_err(|e| TyperError::message(e.to_string()))?;
 
         // upstream: `s_pbc = hop.args_s[0]; descs = list(s_pbc.descriptions);
@@ -6479,6 +6514,28 @@ impl MethodsPBCRepr {
             })?;
         Ok((r_func, 1))
     }
+
+    /// RPython `MethodsPBCRepr.get_method_from_instance(self, r_inst,
+    /// v_inst, llops)` (rpbc.py:1173-1176):
+    ///
+    /// ```python
+    /// def get_method_from_instance(self, r_inst, v_inst, llops):
+    ///     # The 'self' might have to be cast to a parent class
+    ///     # (as shown for example in test_rclass/test_method_both_A_and_B)
+    ///     return llops.convertvar(v_inst, r_inst, self.r_im_self)
+    /// ```
+    ///
+    /// Called from `InstanceRepr.rtype_getattr` (rclass.py:850-854) on
+    /// the method-dispatch branch. Pyre's `convertvar` lives on the
+    /// active `LowLevelOpList` (`rtyper.rs:4705`); pass it through.
+    pub fn get_method_from_instance(
+        &self,
+        r_inst: &dyn Repr,
+        v_inst: Hlvalue,
+        llops: &mut crate::translator::rtyper::rtyper::LowLevelOpList,
+    ) -> Result<Hlvalue, TyperError> {
+        llops.convertvar(v_inst, r_inst, self.r_im_self.as_ref())
+    }
 }
 
 impl Repr for MethodsPBCRepr {
@@ -6811,7 +6868,7 @@ mod pbc_repr_tests {
                 .insert(GraphCacheKey::None, super::tests::make_pygraph(name));
         }
         let args = ArgumentsForTranslation::new(
-            vec![SomeValue::Integer(SomeInteger::default())],
+            vec![Some(SomeValue::Integer(SomeInteger::default()))],
             None,
             None,
         );
@@ -6896,7 +6953,7 @@ mod pbc_repr_tests {
                 .insert(GraphCacheKey::None, super::tests::make_pygraph(name));
         }
         let args = ArgumentsForTranslation::new(
-            vec![SomeValue::Integer(SomeInteger::default())],
+            vec![Some(SomeValue::Integer(SomeInteger::default()))],
             None,
             None,
         );
@@ -8463,7 +8520,7 @@ mod pbc_repr_tests {
             .insert(GraphCacheKey::None, pygraph.clone());
 
         let args = ArgumentsForTranslation::new(
-            vec![SomeValue::Integer(SomeInteger::default())],
+            vec![Some(SomeValue::Integer(SomeInteger::default()))],
             None,
             None,
         );
@@ -8886,7 +8943,7 @@ mod pbc_repr_tests {
                 .insert(GraphCacheKey::None, super::tests::make_pygraph(name));
         }
         let args = ArgumentsForTranslation::new(
-            vec![SomeValue::Integer(SomeInteger::default())],
+            vec![Some(SomeValue::Integer(SomeInteger::default()))],
             None,
             None,
         );
@@ -8945,7 +9002,7 @@ mod pbc_repr_tests {
                 .insert(GraphCacheKey::None, super::tests::make_pygraph(name));
         }
         let args = ArgumentsForTranslation::new(
-            vec![SomeValue::Integer(SomeInteger::default())],
+            vec![Some(SomeValue::Integer(SomeInteger::default()))],
             None,
             None,
         );
@@ -9009,7 +9066,7 @@ mod pbc_repr_tests {
         FunctionDesc::consider_call_site(
             &[fd_f.clone(), fd_g.clone()],
             &ArgumentsForTranslation::new(
-                vec![SomeValue::Integer(SomeInteger::default())],
+                vec![Some(SomeValue::Integer(SomeInteger::default()))],
                 None,
                 None,
             ),
@@ -9072,7 +9129,7 @@ mod pbc_repr_tests {
         FunctionDesc::consider_call_site(
             &[fd_rc.clone()],
             &ArgumentsForTranslation::new(
-                vec![SomeValue::Integer(SomeInteger::default())],
+                vec![Some(SomeValue::Integer(SomeInteger::default()))],
                 None,
                 None,
             ),
@@ -9138,7 +9195,7 @@ mod pbc_repr_tests {
         FunctionDesc::consider_call_site(
             &[fd_f.clone(), fd_g.clone()],
             &ArgumentsForTranslation::new(
-                vec![SomeValue::Integer(SomeInteger::default())],
+                vec![Some(SomeValue::Integer(SomeInteger::default()))],
                 None,
                 None,
             ),
@@ -9218,7 +9275,7 @@ mod pbc_repr_tests {
         FunctionDesc::consider_call_site(
             &[fd_f.clone(), fd_g.clone()],
             &ArgumentsForTranslation::new(
-                vec![SomeValue::Integer(SomeInteger::default())],
+                vec![Some(SomeValue::Integer(SomeInteger::default()))],
                 None,
                 None,
             ),
@@ -9297,7 +9354,7 @@ mod pbc_repr_tests {
                 .insert(GraphCacheKey::None, super::tests::make_pygraph(name));
         }
         let args = ArgumentsForTranslation::new(
-            vec![SomeValue::Integer(SomeInteger::default())],
+            vec![Some(SomeValue::Integer(SomeInteger::default()))],
             None,
             None,
         );

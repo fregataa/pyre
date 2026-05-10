@@ -2110,6 +2110,52 @@ impl RPythonTyper {
             "newtuple" => super::rtuple::TupleRepr::rtype_newtuple(hop),
             // rtuple.py:292-315 — `pairtype(TupleRepr, Repr).rtype_contains`.
             "contains" => self.translate_pair_operation(hop, super::pairtype::pair_rtype_contains),
+            // rbuiltin.py:543-548 `@typer_for(lltype.cast_ptr_to_int)`.
+            // Upstream is reached via `simple_call(lltype.cast_ptr_to_int,
+            // p) → Repr.rtype_simple_call → @typer_for(...)`; pyre's
+            // frontend (front/ast.rs:4041 cast_op_name) emits
+            // `cast_ptr_to_int` as a direct UnaryOp opname because the
+            // surface DSL has no `lltype.*` HostObject (M2.5g epic), so
+            // we dispatch the body of `rtype_cast_ptr_to_int` from this
+            // arm directly. Body parity preserved verbatim.
+            "cast_ptr_to_int" => super::rbuiltin::rtype_cast_ptr_to_int(hop),
+            // Cast family ports (`rbuiltin.rs::rtype_same_as` /
+            // `rtype_cast_int_to_float` / `rtype_cast_float_to_int` /
+            // `rtype_cast_int_to_ptr`).  Each mirrors the upstream
+            // `@typer_for(lltype.cast_*)` body verbatim; the dispatch
+            // sits here because pyre's `front/ast.rs:5873 cast_op_name`
+            // emits the cast as a direct `OpKind::UnaryOp` rather than
+            // routing through `lltype.*` HostObject (M2.5g epic).
+            // Closes the `normalize_unary_op_name: pyre UnaryOp` Skip
+            // category in `cutover.rs::is_known_unported`.
+            "same_as" => super::rbuiltin::rtype_same_as(hop),
+            "cast_int_to_float" => super::rbuiltin::rtype_cast_int_to_float(hop),
+            "cast_float_to_int" => super::rbuiltin::rtype_cast_float_to_int(hop),
+            "cast_int_to_ptr" => super::rbuiltin::rtype_cast_int_to_ptr(hop),
+            // `rbool.py:50-71` pairtype(BoolRepr, FloatRepr/IntegerRepr).
+            // convert_from_to emit cast_bool_to_int / cast_bool_to_float;
+            // pyre's front/ast.rs::cast_op_name surfaces them as direct
+            // UnaryOp opnames since the surface DSL has no lltype.cast_*
+            // HostObject (M2.5g epic).
+            "cast_bool_to_int" => super::rbuiltin::rtype_cast_bool_to_int(hop),
+            "cast_bool_to_float" => super::rbuiltin::rtype_cast_bool_to_float(hop),
+            // `rint.py::IntegerRepr.rtype_bool` / `rfloat.py:31-33
+            // FloatRepr.rtype_bool` emit int_is_true / float_is_true.
+            // Pyre surfaces them as direct UnaryOp opnames for
+            // `(Some(Int|Float), Bool)` casts.
+            "int_is_true" => super::rbuiltin::rtype_int_is_true(hop),
+            "float_is_true" => super::rbuiltin::rtype_float_is_true(hop),
+            // Unsigned cast family (`rbool.py:77-83 pairtype(IntegerRepr,
+            // BoolRepr)` Unsigned arm + `rint.py` cross-signedness +
+            // `rfloat.py` Unsigned↔Float).  Pyre's frontend at
+            // `front/ast.rs::cast_op_name` emits these when the source
+            // or destination is `ValueType::Unsigned` (Rust `u*` types).
+            "uint_is_true" => super::rbuiltin::rtype_uint_is_true(hop),
+            "cast_uint_to_int" => super::rbuiltin::rtype_cast_uint_to_int(hop),
+            "cast_int_to_uint" => super::rbuiltin::rtype_cast_int_to_uint(hop),
+            "cast_uint_to_float" => super::rbuiltin::rtype_cast_uint_to_float(hop),
+            "cast_float_to_uint" => super::rbuiltin::rtype_cast_float_to_uint(hop),
+            "cast_bool_to_uint" => super::rbuiltin::rtype_cast_bool_to_uint(hop),
             _ => self.default_translate_operation(hop),
         }
     }

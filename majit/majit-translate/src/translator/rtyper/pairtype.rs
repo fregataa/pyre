@@ -1634,7 +1634,7 @@ mod tests {
             );
         }
         let args = crate::annotator::argument::ArgumentsForTranslation::new(
-            vec![SomeValue::Integer(SomeInteger::default())],
+            vec![Some(SomeValue::Integer(SomeInteger::default()))],
             None,
             None,
         );
@@ -1719,7 +1719,7 @@ mod tests {
             );
         }
         let args = crate::annotator::argument::ArgumentsForTranslation::new(
-            vec![SomeValue::Integer(SomeInteger::default())],
+            vec![Some(SomeValue::Integer(SomeInteger::default()))],
             None,
             None,
         );

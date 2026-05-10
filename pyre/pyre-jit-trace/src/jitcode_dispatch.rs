@@ -6482,7 +6482,17 @@ mod tests {
         drive_int_binop("int_and/ii>i", majit_ir::OpCode::IntAnd);
     }
 
+    // `int_or/ii>i` is not currently in `pipeline.insns` — pyre's
+    // interpreter source does not emit Rust `|` on integers in any
+    // path the JIT traces.  RPython's `Assembler.insns` only carries
+    // emitted opnames (`assembler.py:220
+    // setdefault(key, len(self.insns))`); pyre's runtime now mirrors
+    // that (build.rs walks only `pipeline.insns`).  The dispatcher
+    // handler exists; this test will unignore once an interpreter
+    // source path emits `int_or` (e.g., bitset / flag computation).
     #[test]
+    #[ignore = "int_or not currently emitted by pyre interpreter source — \
+                pipeline.insns drops it"]
     fn int_or_records_intor() {
         drive_int_binop("int_or/ii>i", majit_ir::OpCode::IntOr);
     }

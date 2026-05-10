@@ -2200,10 +2200,26 @@ impl SomeValue {
                 let bk = super::bookkeeper::getbookkeeper().ok_or_else(|| {
                     AnnotatorError::new("SomeBuiltin.call() called without an active bookkeeper")
                 })?;
-                let (args_s, kwds) = args
+                let (args_s_opt, kwds) = args
                     .unpack()
                     .map_err(|err| AnnotatorError::new(err.getmsg()))?;
-                let kwds_s: std::collections::HashMap<String, SomeValue> = kwds
+                // `model.py:1182-1188 SomeBuiltin.call` passes args_s
+                // (which may carry None for unbound caller args) directly
+                // to `analyser(*args_s, **kwds_s)`; the analyser body
+                // raises AttributeError on the first attribute access of
+                // an unbound slot.  Pyre threads `&[Option<SomeValue>]`
+                // through `call_builtin`; each analyser body unwraps via
+                // [`builtin::arg_at`] at the touch site, panicking with
+                // the analyser name + slot index at the same iteration
+                // upstream would raise (`unaryop.py:940` bind-then-body
+                // sequence).
+                // upstream `model.py:1184 kwds_s['s_'+key] = s_value`
+                // — passes the value through unchanged (None or
+                // SomeValue).  Pyre's `BuiltinAnalyzer` ABI now matches
+                // `HashMap<String, Option<SomeValue>>` so the `None`
+                // sentinel propagates all the way to the per-touch
+                // unwrap inside each analyser body.
+                let kwds_s: std::collections::HashMap<String, Option<SomeValue>> = kwds
                     .into_iter()
                     .map(|(k, v)| (format!("s_{k}"), v))
                     .collect();
@@ -2233,7 +2249,7 @@ impl SomeValue {
                 {
                     return entry.compute_annotation_with_kwds(&bk, &kwds_s);
                 }
-                super::builtin::call_builtin(&bk, &sb.analyser_name, &args_s, &kwds_s)
+                super::builtin::call_builtin(&bk, &sb.analyser_name, &args_s_opt, &kwds_s)
             }
             _ => Err(AnnotatorError::new(
                 "Cannot prove that the object is callable",
@@ -3855,7 +3871,7 @@ mod tests {
             }),
         });
         let args = super::super::argument::ArgumentsForTranslation::new(
-            vec![SomeValue::Integer(SomeInteger::new(false, false))],
+            vec![Some(SomeValue::Integer(SomeInteger::new(false, false)))],
             None,
             None,
         );
@@ -3882,7 +3898,7 @@ mod tests {
             vec![],
             Some(std::collections::HashMap::from([(
                 "x".into(),
-                SomeValue::Integer(SomeInteger::new(false, false)),
+                Some(SomeValue::Integer(SomeInteger::new(false, false))),
             )])),
             None,
         );
@@ -4148,7 +4164,7 @@ mod tests {
             .find_method("append")
             .expect("list.append must be recognized by find_method");
         let args = super::super::argument::ArgumentsForTranslation::new(
-            vec![SomeValue::Integer(SomeInteger::new(false, false))],
+            vec![Some(SomeValue::Integer(SomeInteger::new(false, false)))],
             None,
             None,
         );

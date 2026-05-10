@@ -348,6 +348,7 @@ fn remap_op_kind(kind: &OpKind, remap: &impl Fn(&ValueId) -> ValueId) -> OpKind 
             ty: ty.clone(),
         },
         OpKind::ConstInt(v) => OpKind::ConstInt(*v),
+        OpKind::ConstBool(v) => OpKind::ConstBool(*v),
         OpKind::ConstFloat(bits) => OpKind::ConstFloat(*bits),
         OpKind::FieldRead {
             base,
@@ -718,6 +719,7 @@ pub fn op_value_refs(kind: &OpKind) -> Vec<ValueId> {
     match kind {
         OpKind::Input { .. }
         | OpKind::ConstInt(_)
+        | OpKind::ConstBool(_)
         | OpKind::ConstFloat(_)
         | OpKind::CurrentTraceLength
         | OpKind::Live
@@ -937,6 +939,7 @@ pub fn is_pure_op(kind: &OpKind) -> bool {
         // dependency-routing classification.
         OpKind::Input { .. }
         | OpKind::ConstInt(_)
+        | OpKind::ConstBool(_)
         | OpKind::ConstFloat(_)
         // Pure reads — `getfield(_pure) getarrayitem(_pure)
         // getinteriorfield` in `enum_ops_without_sideeffects`.

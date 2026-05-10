@@ -1,9 +1,18 @@
-//! Annotation propagation pass.
+//! Legacy annotation propagation pass — transitional cutover input.
 //!
-//! **LEGACY.** Ad-hoc `ValueType`-flat-enum annotator.
-//! Line-by-line port of `annotator/annrpython.py:RPythonAnnotator` is
-//! landing at `majit-annotator/src/annrpython.rs` (roadmap Phase 5).
-//! This file is deleted at roadmap commit P8.11.
+//! TODO(retire-legacy-annotator): ad-hoc `ValueType`-flat-enum annotator
+//! with no upstream `rpython/` counterpart — the orthodox port is
+//! [`crate::annotator::annrpython::RPythonAnnotator`] (`annrpython.py`),
+//! which produces per-`Variable.annotation` `SomeValue` shells directly.
+//!
+//! This file remains because the cutover transitional path
+//! ([`crate::translator::rtyper::cutover::dual_gate_check_with_registry`]
+//! + [`crate::translator::rtyper::cutover::lift_callee_to_pygraph`]) and
+//! the Skip-fallback in
+//! [`crate::jit_codewriter::codewriter::transform_graph_to_jitcode`]
+//! still consume an [`AnnotationState`] produced by this `annotate()`.
+//! A follow-up retirement slice drops both consumers and this file
+//! together once the dual-gate Skip categories close.
 //!
 //! Propagates ValueType annotations through the graph by analyzing
 //! each op's inputs and computing the output type. Iterates to
@@ -31,12 +40,13 @@ pub fn annotate(graph: &FunctionGraph) -> AnnotationState {
     // 169-172` assumes `etype: Int, evalue: Ref` and `return_var:
     // <result_type>` unconditionally; pyre mirrors that by seeding the
     // annotator state up front.
-    let exceptblock = graph.block(graph.exceptblock);
-    if let Some(&etype) = exceptblock.inputargs.first() {
-        state.set(etype, ValueType::Int);
-    }
-    if let Some(&evalue) = exceptblock.inputargs.get(1) {
-        state.set(evalue, ValueType::Ref);
+    if let Some(exceptblock) = graph.blocks.get(graph.exceptblock.0) {
+        if let Some(&etype) = exceptblock.inputargs.first() {
+            state.set(etype, ValueType::Int);
+        }
+        if let Some(&evalue) = exceptblock.inputargs.get(1) {
+            state.set(evalue, ValueType::Ref);
+        }
     }
     // `returnblock.inputargs[0]` must not be pre-seeded to `Ref`.
     // Doing so collapses a real `Float`/`Int` return into
@@ -44,8 +54,9 @@ pub fn annotate(graph: &FunctionGraph) -> AnnotationState {
     // then backfills to `GcRef`.  Seed only the pyre-only synthetic
     // `return None` placeholder values here; normal non-void returns
     // are inferred from the incoming Link args.
-    let returnblock = graph.block(graph.returnblock);
-    if let Some(&ret) = returnblock.inputargs.first() {
+    if let Some(returnblock) = graph.blocks.get(graph.returnblock.0)
+        && let Some(&ret) = returnblock.inputargs.first()
+    {
         for block in &graph.blocks {
             for link in &block.exits {
                 if link.target != graph.returnblock {
@@ -200,6 +211,7 @@ fn infer_op_type(kind: &OpKind, state: &AnnotationState) -> ValueType {
     match kind {
         OpKind::Input { ty, .. } => ty.clone(),
         OpKind::ConstInt(_) => ValueType::Int,
+        OpKind::ConstBool(_) => ValueType::Bool,
         OpKind::ConstFloat(_) => ValueType::Float,
         OpKind::FieldRead { ty, .. } => ty.clone(),
         OpKind::FieldWrite { .. } => ValueType::Void,

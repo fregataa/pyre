@@ -358,6 +358,13 @@ impl TranslationContext {
         Ok(pygraph)
     }
 
+    /// RPython `translator.rtyper = self` assignment performed in
+    /// `TranslationContext.buildrtyper()` (translator.py:83).  Mirror
+    /// of [`Self::set_annotator`] for the rtyper slot.
+    pub fn set_rtyper(&self, rtyper: Rc<RPythonTyper>) {
+        *self.rtyper.borrow_mut() = Some(rtyper);
+    }
+
     /// RPython `TranslationContext.buildrtyper()` (translator.py:77-84).
     pub fn buildrtyper(&self) -> Rc<RPythonTyper> {
         let annotator = self.annotator().expect("ValueError: no annotator");
@@ -373,7 +380,7 @@ impl TranslationContext {
         rtyper
             .initialize_exceptiondata()
             .expect("RPythonTyper::initialize_exceptiondata");
-        *self.rtyper.borrow_mut() = Some(rtyper.clone());
+        self.set_rtyper(rtyper.clone());
         rtyper
     }
 

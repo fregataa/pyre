@@ -112,7 +112,7 @@ pub fn build_flow_from_rust_in_module(
 ) -> Result<FunctionGraph, AdapterError> {
     validate_signature(func)?;
 
-    let (inputargs, locals) = collect_params(func)?;
+    let (inputargs, locals, local_unary_not_kinds) = collect_params(func)?;
     let startblock = Block::shared(inputargs);
     let name = func.sig.ident.to_string();
     let graph = FunctionGraph::new(name, startblock.clone());
@@ -127,6 +127,7 @@ pub fn build_flow_from_rust_in_module(
         exceptblock: graph.exceptblock.clone(),
         loop_stack: Vec::new(),
         module_id,
+        local_unary_not_kinds,
     };
 
     // Function body root: tail expression flows directly into the
@@ -219,25 +220,42 @@ fn validate_signature(func: &ItemFn) -> Result<(), AdapterError> {
     Ok(())
 }
 
-fn collect_params(func: &ItemFn) -> Result<(Vec<Hlvalue>, HashMap<String, Hlvalue>), AdapterError> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnaryNotOperandKind {
+    Bool,
+    Int,
+    Unknown,
+}
+
+fn collect_params(
+    func: &ItemFn,
+) -> Result<
+    (
+        Vec<Hlvalue>,
+        HashMap<String, Hlvalue>,
+        HashMap<String, UnaryNotOperandKind>,
+    ),
+    AdapterError,
+> {
     let mut inputargs: Vec<Hlvalue> = Vec::new();
     let mut locals: HashMap<String, Hlvalue> = HashMap::new();
+    let mut local_unary_not_kinds: HashMap<String, UnaryNotOperandKind> = HashMap::new();
     for input in &func.sig.inputs {
-        let ident = match input {
+        let (ident, not_kind) = match input {
             // `self` / `&self` / `&mut self` — the method dispatch
             // case. Upstream RPython binds `self` as the first local
             // after `FunctionDesc.bind_self` has annotated it with
             // the concrete classdef (`description.py:350-355`); the
             // adapter just exposes it as a Variable named `self`,
             // matching the Python source convention.
-            syn::FnArg::Receiver(_) => "self".to_string(),
+            syn::FnArg::Receiver(_) => ("self".to_string(), UnaryNotOperandKind::Unknown),
             syn::FnArg::Typed(pat_type) => match &*pat_type.pat {
                 Pat::Ident(PatIdent {
                     ident,
                     by_ref: None,
                     subpat: None,
                     ..
-                }) => ident.to_string(),
+                }) => (ident.to_string(), classify_type_for_unary_not(&pat_type.ty)),
                 _ => {
                     return Err(AdapterError::InvalidSignature {
                         reason: "parameter pattern must be a plain identifier".into(),
@@ -246,10 +264,32 @@ fn collect_params(func: &ItemFn) -> Result<(Vec<Hlvalue>, HashMap<String, Hlvalu
             },
         };
         let var = Hlvalue::Variable(Variable::named(&ident));
-        locals.insert(ident, var.clone());
+        locals.insert(ident.clone(), var.clone());
+        if not_kind != UnaryNotOperandKind::Unknown {
+            local_unary_not_kinds.insert(ident, not_kind);
+        }
         inputargs.push(var);
     }
-    Ok((inputargs, locals))
+    Ok((inputargs, locals, local_unary_not_kinds))
+}
+
+fn classify_type_for_unary_not(ty: &syn::Type) -> UnaryNotOperandKind {
+    let syn::Type::Path(type_path) = ty else {
+        return UnaryNotOperandKind::Unknown;
+    };
+    if type_path.qself.is_some() || type_path.path.segments.len() != 1 {
+        return UnaryNotOperandKind::Unknown;
+    }
+    let segment = &type_path.path.segments[0];
+    if !matches!(segment.arguments, syn::PathArguments::None) {
+        return UnaryNotOperandKind::Unknown;
+    }
+    match segment.ident.to_string().as_str() {
+        "bool" => UnaryNotOperandKind::Bool,
+        "i8" | "i16" | "i32" | "i64" | "i128" | "isize" | "u8" | "u16" | "u32" | "u64" | "u128"
+        | "usize" => UnaryNotOperandKind::Int,
+        _ => UnaryNotOperandKind::Unknown,
+    }
 }
 
 // ____________________________________________________________
@@ -312,6 +352,11 @@ struct Builder {
     /// dict — not a process-shared registry. Issue 1.3 closure
     /// (2026-05-05): replaces the prior process-global lookup.
     module_id: ModuleId,
+    /// Rust-only adapter metadata for the overloaded `!` token. Python
+    /// bytecode already distinguishes `UNARY_NOT` from `UNARY_INVERT`;
+    /// Rust source does not, so the adapter keeps the minimal local type
+    /// fact needed to choose the matching RPython opcode.
+    local_unary_not_kinds: HashMap<String, UnaryNotOperandKind>,
 }
 
 impl Builder {
@@ -361,6 +406,14 @@ impl Builder {
 
     fn set_local(&mut self, name: String, value: Hlvalue) {
         self.current.locals.insert(name, value);
+    }
+
+    fn set_local_unary_not_kind(&mut self, name: String, kind: UnaryNotOperandKind) {
+        if kind == UnaryNotOperandKind::Unknown {
+            self.local_unary_not_kinds.remove(&name);
+        } else {
+            self.local_unary_not_kinds.insert(name, kind);
+        }
     }
 
     /// Attach accumulated `current.ops` + `exitswitch` to
@@ -974,9 +1027,20 @@ fn lower_let(b: &mut Builder, local: &Local) -> Result<(), AdapterError> {
             });
         }
     };
+    let explicit_kind = match &local.pat {
+        Pat::Type(pat_type) => classify_type_for_unary_not(&pat_type.ty),
+        _ => UnaryNotOperandKind::Unknown,
+    };
+    let inferred_kind = classify_unary_not_operand(b, init);
     let value = lower_expr(b, init)?;
     // Upstream STORE_FAST: reassignment REPLACES the locals-map entry.
     // The SSA value feeding subsequent reads is the new one.
+    let not_kind = if explicit_kind == UnaryNotOperandKind::Unknown {
+        inferred_kind
+    } else {
+        explicit_kind
+    };
+    b.set_local_unary_not_kind(ident.clone(), not_kind);
     b.set_local(ident, value);
     Ok(())
 }
@@ -1466,6 +1530,9 @@ fn lower_binop(
     left: &Expr,
     right: &Expr,
 ) -> Result<Hlvalue, AdapterError> {
+    if matches!(op, BinOp::And(_) | BinOp::Or(_)) {
+        return lower_short_circuit(b, op, left, right);
+    }
     let opname = binop_opname(op)?;
     let lhs = lower_expr(b, left)?;
     let rhs = lower_expr(b, right)?;
@@ -1474,8 +1541,9 @@ fn lower_binop(
 
 /// Rust `BinOp` → upstream `operation.py` opname. Covers the 16
 /// non-short-circuit infix operators the M2.5a subset supports.
-/// Short-circuit `&&` / `||` are control flow and land in M2.5b
-/// together with `if` / `match`.
+/// Short-circuit `&&` / `||` are control flow — `lower_binop`
+/// dispatches them to [`lower_short_circuit`] before reaching this
+/// function, so the `BinOp::And`/`BinOp::Or` arms are unreachable.
 fn binop_opname(op: BinOp) -> Result<&'static str, AdapterError> {
     Ok(match op {
         BinOp::Add(_) => "add",
@@ -1495,9 +1563,11 @@ fn binop_opname(op: BinOp) -> Result<&'static str, AdapterError> {
         BinOp::Gt(_) => "gt",
         BinOp::Ge(_) => "ge",
         BinOp::And(_) | BinOp::Or(_) => {
-            return Err(AdapterError::Unsupported {
-                reason: "short-circuit && / || (lands with match in next M2.5b slice)".into(),
-            });
+            unreachable!(
+                "&& / || are short-circuit control flow — `lower_binop` \
+                 must dispatch them to `lower_short_circuit` before \
+                 reaching `binop_opname`"
+            );
         }
         BinOp::AddAssign(_)
         | BinOp::SubAssign(_)
@@ -1974,6 +2044,348 @@ fn lower_if_without_else(
     Ok(BlockExit::FallThrough(Hlvalue::Constant(Constant::new(
         ConstValue::None,
     ))))
+}
+
+/// Lower a short-circuit `&&` / `||` into RPython-style control flow.
+///
+/// Upstream basis — `flowcontext.py:766-777`:
+///
+/// ```text
+/// def JUMP_IF_FALSE_OR_POP(self, target):    # `&&` semantics
+///     w_value = self.peekvalue()
+///     if not self.guessbool(op.bool(w_value).eval(self)):
+///         return target                       # short-circuit on False
+///     self.popvalue()                          # else evaluate rhs
+///
+/// def JUMP_IF_TRUE_OR_POP(self, target):      # `||` semantics
+///     w_value = self.peekvalue()
+///     if self.guessbool(op.bool(w_value).eval(self)):
+///         return target                       # short-circuit on True
+///     self.popvalue()                          # else evaluate rhs
+/// ```
+///
+/// Both operators share one graph shape, differing only in which
+/// `bool(lhs)` exitcase short-circuits to the join:
+///
+/// ```text
+///     fork:
+///         lhs_raw = eval(lhs)
+///         cond    = bool(lhs_raw)
+///         exitswitch: cond
+///         exits:
+///             - case Bool(short_circuit_case) → join (tail = lhs_raw)
+///             - case Bool(rhs_case)           → rhs_block
+///     rhs_block:
+///         rhs_raw = eval(rhs)
+///         link to join (tail = rhs_raw)
+///     join:
+///         inputargs: [tail_var, ...locals]
+/// ```
+///
+/// `&&` short-circuits on `False` (lhs falsy is the result; rhs is
+/// dead).  `||` short-circuits on `True` (lhs truthy is the result).
+/// In both cases the surviving value is the original `lhs_raw`, not
+/// `bool(lhs_raw)` — `bool` is only the switch discriminator,
+/// matching upstream `peekvalue()` then `popvalue()` semantics.
+fn lower_short_circuit(
+    b: &mut Builder,
+    op: BinOp,
+    left: &Expr,
+    right: &Expr,
+) -> Result<Hlvalue, AdapterError> {
+    let is_and = matches!(op, BinOp::And(_));
+
+    // 1. Eval lhs in current block, then `bool(lhs)` for the switch.
+    //    Mirrors `op.bool(w_value).eval(self)` in flowcontext.py.
+    let lhs_raw = lower_expr(b, left)?;
+    let cond = Hlvalue::Variable(Variable::new());
+    b.emit_op(SpaceOperation::new(
+        "bool",
+        vec![lhs_raw.clone()],
+        cond.clone(),
+    ));
+
+    // 2. Snapshot pre-fork locals (deterministic order via sort, same
+    //    discipline as `lower_if`).
+    let pre_fork_locals = b.locals().clone();
+    let mut merged_names: Vec<String> = pre_fork_locals.keys().cloned().collect();
+    merged_names.sort();
+
+    // 3. Allocate the rhs-evaluation block.  The short-circuit arm
+    //    needs no separate block — it Links straight from the fork
+    //    into the join with `lhs_raw` as the result.
+    let (rhs_block, rhs_locals) = branch_block_with_inputargs(&merged_names);
+
+    // 4. Pre-build the join block (inputargs = [tail, ...locals]).
+    //    Both arms must Link into it; `tail_var` is the value the
+    //    short-circuit expression evaluates to.
+    let tail_var = Hlvalue::Variable(Variable::new());
+    let mut join_inputargs: Vec<Hlvalue> = Vec::with_capacity(merged_names.len() + 1);
+    join_inputargs.push(tail_var.clone());
+    let mut join_locals: HashMap<String, Hlvalue> = HashMap::new();
+    for name in &merged_names {
+        let fresh = Hlvalue::Variable(Variable::named(name));
+        join_inputargs.push(fresh.clone());
+        join_locals.insert(name.clone(), fresh);
+    }
+    let join_block = Block::shared(join_inputargs);
+
+    // 5. Build the two outgoing Links from the fork.
+    //    Short-circuit Link: fork → join with [lhs_raw, ...pre_fork_locals]
+    //    Rhs Link:           fork → rhs_block with [...pre_fork_locals]
+    let pre_fork_args: Vec<Hlvalue> = merged_names
+        .iter()
+        .map(|name| pre_fork_locals[name].clone())
+        .collect();
+
+    let mut shortcut_link_args: Vec<Hlvalue> = Vec::with_capacity(merged_names.len() + 1);
+    shortcut_link_args.push(lhs_raw.clone());
+    shortcut_link_args.extend(pre_fork_args.iter().cloned());
+
+    let shortcut_case = !is_and; // `&&` shortcuts on False; `||` on True.
+    let shortcut_link = Rc::new(RefCell::new(Link::new(
+        shortcut_link_args,
+        Some(join_block.clone()),
+        Some(Hlvalue::Constant(Constant::new(ConstValue::Bool(
+            shortcut_case,
+        )))),
+    )));
+
+    let rhs_case = is_and;
+    let rhs_link = Rc::new(RefCell::new(Link::new(
+        pre_fork_args,
+        Some(rhs_block.clone()),
+        Some(Hlvalue::Constant(Constant::new(ConstValue::Bool(rhs_case)))),
+    )));
+
+    // 6. Close the fork block.  Convention: `false_link` first,
+    //    `true_link` second (matches `lower_if`).
+    let exits = if is_and {
+        // `&&` shortcuts on False, evaluates rhs on True.
+        vec![shortcut_link, rhs_link]
+    } else {
+        // `||` evaluates rhs on False, shortcuts on True.
+        vec![rhs_link, shortcut_link]
+    };
+    b.finalize_current(exits, Some(cond));
+
+    // 7. Lower rhs in `rhs_block`, then close it into the join.  rhs
+    //    is an expression — its `lower_expr` cannot terminate the
+    //    block via `return`, so the resulting tail is always live.
+    b.open_new_block(BlockBuilder {
+        block: rhs_block,
+        ops: Vec::new(),
+        locals: rhs_locals,
+    });
+    let rhs_raw = lower_expr(b, right)?;
+    let rhs_exit_block = b.current.block.clone();
+    let rhs_exit_ops = std::mem::take(&mut b.current.ops);
+    let rhs_exit_locals = std::mem::take(&mut b.current.locals);
+    let rhs_link_args = branch_link_args(&rhs_raw, &merged_names, &rhs_exit_locals);
+    let rhs_to_join = Rc::new(RefCell::new(Link::new(
+        rhs_link_args,
+        Some(join_block.clone()),
+        None,
+    )));
+    rhs_exit_block.borrow_mut().operations = rhs_exit_ops;
+    rhs_exit_block.closeblock(vec![rhs_to_join]);
+
+    // 8. Open `join_block` as the new current block; `tail_var` is
+    //    the short-circuit expression's value for the caller.
+    b.open_new_block(BlockBuilder {
+        block: join_block,
+        ops: Vec::new(),
+        locals: join_locals,
+    });
+
+    Ok(tail_var)
+}
+
+/// Lower a unary `!` (logical not) — RPython `UNARY_NOT` line-by-line
+/// port.
+///
+/// Upstream basis — `flowcontext.py:531-538`:
+///
+/// ```text
+/// def UNARY_NOT(self, oparg):
+///     w_value = self.popvalue()
+///     w_bool = op.bool(w_value).eval(self)
+///     self.pushvalue(const(not self.guessbool(w_bool)))
+/// ```
+///
+/// `op.bool(w_value).eval(self)` emits a `bool` SpaceOperation;
+/// `self.guessbool(w_bool)` forks the graph (Python's annotator
+/// branches on the abstract bool) and pushes
+/// `Constant(not python_bool)` per branch.  Graph shape:
+///
+/// ```text
+///     fork:
+///         cond = bool(x)
+///         exitswitch: cond
+///         exits:
+///             - case Bool(False) → join (tail = Constant(true))
+///             - case Bool(True)  → join (tail = Constant(false))
+///     join:
+///         inputargs: [tail_var, ...locals]
+/// ```
+///
+/// Both arms Link straight to the join — no separate evaluation
+/// block, since each arm pushes a constant.  `lower_short_circuit`
+/// uses the same shape with one separate rhs-block, so this helper
+/// is the simpler twin.
+/// Classify Rust's overloaded `!` operand into the RPython opcode it
+/// can be lowered to. Python bytecode has already split these cases:
+/// `UNARY_NOT` for bool truth negation, `UNARY_INVERT` for integer
+/// bitwise inversion. If the Rust source shape cannot prove one side,
+/// the caller must fail loud instead of guessing.
+fn classify_unary_not_operand(b: &Builder, expr: &Expr) -> UnaryNotOperandKind {
+    match expr {
+        Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Bool(_),
+            ..
+        }) => UnaryNotOperandKind::Bool,
+        Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Int(_),
+            ..
+        }) => UnaryNotOperandKind::Int,
+        Expr::Path(ExprPath {
+            path, qself: None, ..
+        }) if path.leading_colon.is_none() && path.segments.len() == 1 => {
+            let segment = &path.segments[0];
+            if !matches!(segment.arguments, syn::PathArguments::None) {
+                return UnaryNotOperandKind::Unknown;
+            }
+            let name = segment.ident.to_string();
+            if b.locals().contains_key(&name) {
+                b.local_unary_not_kinds
+                    .get(&name)
+                    .copied()
+                    .unwrap_or(UnaryNotOperandKind::Unknown)
+            } else {
+                UnaryNotOperandKind::Unknown
+            }
+        }
+        Expr::Binary(ExprBinary {
+            op, left, right, ..
+        }) => classify_binary_unary_not_operand(b, op, left, right),
+        Expr::Unary(unary) => match unary.op {
+            UnOp::Not(_) => classify_unary_not_operand(b, &unary.expr),
+            UnOp::Neg(_) => {
+                if classify_unary_not_operand(b, &unary.expr) == UnaryNotOperandKind::Int {
+                    UnaryNotOperandKind::Int
+                } else {
+                    UnaryNotOperandKind::Unknown
+                }
+            }
+            UnOp::Deref(_) => UnaryNotOperandKind::Unknown,
+            _ => UnaryNotOperandKind::Unknown,
+        },
+        Expr::Paren(paren) => classify_unary_not_operand(b, &paren.expr),
+        Expr::Group(group) => classify_unary_not_operand(b, &group.expr),
+        _ => UnaryNotOperandKind::Unknown,
+    }
+}
+
+fn classify_binary_unary_not_operand(
+    b: &Builder,
+    op: &BinOp,
+    left: &Expr,
+    right: &Expr,
+) -> UnaryNotOperandKind {
+    match op {
+        BinOp::Eq(_) | BinOp::Ne(_) | BinOp::Lt(_) | BinOp::Le(_) | BinOp::Gt(_) | BinOp::Ge(_) => {
+            UnaryNotOperandKind::Bool
+        }
+        BinOp::And(_) | BinOp::Or(_) => UnaryNotOperandKind::Bool,
+        BinOp::Add(_)
+        | BinOp::Sub(_)
+        | BinOp::Mul(_)
+        | BinOp::Div(_)
+        | BinOp::Rem(_)
+        | BinOp::Shl(_)
+        | BinOp::Shr(_) => {
+            if classify_unary_not_operand(b, left) == UnaryNotOperandKind::Int
+                && classify_unary_not_operand(b, right) == UnaryNotOperandKind::Int
+            {
+                UnaryNotOperandKind::Int
+            } else {
+                UnaryNotOperandKind::Unknown
+            }
+        }
+        BinOp::BitAnd(_) | BinOp::BitOr(_) | BinOp::BitXor(_) => {
+            let lhs = classify_unary_not_operand(b, left);
+            let rhs = classify_unary_not_operand(b, right);
+            if lhs == rhs {
+                lhs
+            } else {
+                UnaryNotOperandKind::Unknown
+            }
+        }
+        _ => UnaryNotOperandKind::Unknown,
+    }
+}
+
+fn lower_unary_not(b: &mut Builder, expr: &Expr) -> Result<Hlvalue, AdapterError> {
+    // 1. Eval operand, then `bool(operand)` for the switch.
+    let arg = lower_expr(b, expr)?;
+    let cond = Hlvalue::Variable(Variable::new());
+    b.emit_op(SpaceOperation::new("bool", vec![arg], cond.clone()));
+
+    // 2. Snapshot pre-fork locals (deterministic ordering).
+    let pre_fork_locals = b.locals().clone();
+    let mut merged_names: Vec<String> = pre_fork_locals.keys().cloned().collect();
+    merged_names.sort();
+
+    // 3. Pre-build the join block (inputargs = [tail, ...locals]).
+    let tail_var = Hlvalue::Variable(Variable::new());
+    let mut join_inputargs: Vec<Hlvalue> = Vec::with_capacity(merged_names.len() + 1);
+    join_inputargs.push(tail_var.clone());
+    let mut join_locals: HashMap<String, Hlvalue> = HashMap::new();
+    for name in &merged_names {
+        let fresh = Hlvalue::Variable(Variable::named(name));
+        join_inputargs.push(fresh.clone());
+        join_locals.insert(name.clone(), fresh);
+    }
+    let join_block = Block::shared(join_inputargs);
+
+    // 4. Build the two outgoing Links from the fork.  Both target
+    //    the join with a Bool constant as the tail (the inverted
+    //    `guessbool` result) plus the merged locals.
+    let pre_fork_args: Vec<Hlvalue> = merged_names
+        .iter()
+        .map(|name| pre_fork_locals[name].clone())
+        .collect();
+
+    let mut false_link_args: Vec<Hlvalue> = Vec::with_capacity(merged_names.len() + 1);
+    false_link_args.push(Hlvalue::Constant(Constant::new(ConstValue::Bool(true))));
+    false_link_args.extend(pre_fork_args.iter().cloned());
+
+    let mut true_link_args: Vec<Hlvalue> = Vec::with_capacity(merged_names.len() + 1);
+    true_link_args.push(Hlvalue::Constant(Constant::new(ConstValue::Bool(false))));
+    true_link_args.extend(pre_fork_args.iter().cloned());
+
+    let false_link = Rc::new(RefCell::new(Link::new(
+        false_link_args,
+        Some(join_block.clone()),
+        Some(Hlvalue::Constant(Constant::new(ConstValue::Bool(false)))),
+    )));
+    let true_link = Rc::new(RefCell::new(Link::new(
+        true_link_args,
+        Some(join_block.clone()),
+        Some(Hlvalue::Constant(Constant::new(ConstValue::Bool(true)))),
+    )));
+
+    // 5. Close the fork (false_link first, matching `lower_if`).
+    b.finalize_current(vec![false_link, true_link], Some(cond));
+
+    // 6. Open the join as the new current block.
+    b.open_new_block(BlockBuilder {
+        block: join_block,
+        ops: Vec::new(),
+        locals: join_locals,
+    });
+
+    Ok(tail_var)
 }
 
 /// Create a branch block whose inputargs are fresh Variables — one
@@ -3984,26 +4396,30 @@ fn lower_unary(b: &mut Builder, u: &ExprUnary) -> Result<Hlvalue, AdapterError> 
             let arg = lower_expr(b, &u.expr)?;
             b.record_pure_op("neg", vec![arg])
         }
-        // `!x` — Rust overloads this for bitwise (ints) AND logical
-        // (bools). Upstream handles the two paths *differently*:
-        // - `UNARY_INVERT` (flowcontext.py:194) emits `op.invert`.
-        // - `UNARY_NOT` (flowcontext.py:531) emits `op.bool` then
-        //   forks on `guessbool` — `bool(x)` is a runtime
-        //   conversion, the true-branch yields `Constant(False)`
-        //   and the false-branch yields `Constant(True)`. There is
-        //   no direct `not_` op in the registry.
+        // `!x` — Rust's `!` is overloaded via `std::ops::Not`: `!bool`
+        // is logical-not (RPython `UNARY_NOT`, `flowcontext.py:531-538`
+        // → `op.bool` + `guessbool` + negate), `!i64` (and other
+        // integer types) is *bitwise*-not (RPython `UNARY_INVERT`,
+        // `flowcontext.py:188-191` → `op.invert`,
+        // `operation.py:474 add_operator('invert', 1, ..)`).
         //
-        // The adapter cannot pick bitwise-vs-logical without type
-        // info, and has no `guessbool` facility to replicate the
-        // upstream logical path. Rejecting keeps the lowering
-        // honest — users who need bitwise NOT can write the
-        // explicit helper call.
-        UnOp::Not(_) => Err(AdapterError::Unsupported {
-            reason: "unary `!` has no line-by-line upstream mapping (UNARY_NOT uses \
-                `bool` + guessbool fork; UNARY_INVERT emits `invert`) — reject to keep \
-                adapter orthodox"
-                .into(),
-        }),
+        // The Rust token is accepted only when the source type facts
+        // prove the RPython opcode. Unknown operands fail loud; routing
+        // them through UNARY_NOT would silently mistranslate `!int`.
+        UnOp::Not(_) => match classify_unary_not_operand(b, &u.expr) {
+            UnaryNotOperandKind::Bool => lower_unary_not(b, &u.expr),
+            UnaryNotOperandKind::Int => {
+                let arg = lower_expr(b, &u.expr)?;
+                let result = Hlvalue::Variable(Variable::new());
+                b.emit_op(SpaceOperation::new("invert", vec![arg], result.clone()));
+                Ok(result)
+            }
+            UnaryNotOperandKind::Unknown => Err(AdapterError::Unsupported {
+                reason: "Rust `!` operand has no statically known bool/int type; \
+                        cannot choose RPython UNARY_NOT vs UNARY_INVERT line-by-line"
+                    .into(),
+            }),
+        },
         _ => Err(AdapterError::Unsupported {
             reason: "unrecognised unary operator".into(),
         }),
@@ -4047,24 +4463,24 @@ fn lower_index(b: &mut Builder, idx: &ExprIndex) -> Result<Hlvalue, AdapterError
 }
 
 fn lower_cast(_b: &mut Builder, _c: &ExprCast) -> Result<Hlvalue, AdapterError> {
-    // `x as T` — Rust compile-time numeric conversion. Upstream has
-    // no direct counterpart:
-    //
-    // - `operation.py:347 do_int(x)` → calls `x.__int__()`, not a
-    //   numeric cast. It is a Python-method dispatch with its own
-    //   method-resolution path.
-    // - `operation.py:490 float(x)` → same shape, calls `__float__`.
-    // - `operation.py:467 bool(x)` → calls `__bool__`.
-    //
-    // Mapping Rust `as` to these would silently inject a dunder call
-    // the user never wrote, diverging semantically. Users who need
-    // conversion can invoke the helper explicitly (e.g. `x.to_i64()`
-    // or a registered function) and let the adapter lower that as a
-    // method / function call.
+    // `x as T` is rejected here pending source-type inference.
+    // build_flow.rs does not track per-`Hlvalue` `ValueType`
+    // (unlike `front/ast.rs::Expr::Cast` which uses
+    // `graph_value_type`), so the only `cast_op_name(None, target)`
+    // arm reachable is the transparent `same_as` fallthrough — that
+    // would silently retype `Int → Float`, `Float → Int`, `Bool →
+    // Int` etc. as a value-preserving op, diverging from
+    // `rbool.py:49` `cast_bool_to_int` / `rfloat.py:48`
+    // `cast_int_to_float` / `rint.py:rtype_int__Bool` `int_is_true`.
+    // Convergence requires per-`Hlvalue` `ValueType` tracking on the
+    // build_flow.rs Builder so `cast_op_name(Some(src), tgt)` picks
+    // the correct opname — until then, fail loudly.
     Err(AdapterError::Unsupported {
-        reason: "`x as T` has no line-by-line upstream mapping — upstream `do_int` / \
-            `do_float` / `bool` are __int__/__float__/__bool__ dunder dispatches, \
-            not numeric coercions. Use an explicit helper call instead."
+        reason: "`x as T` lowering pending source-type inference in build_flow.rs — \
+            without per-Hlvalue ValueType the cast would silently fall through to \
+            `same_as` and mistranslate `cast_int_to_float` / `cast_bool_to_int` / \
+            `int_is_true`. Use `front/ast.rs` (which has source-type lookup) or an \
+            explicit helper call."
             .into(),
     })
 }
@@ -6095,15 +6511,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn rejects_short_circuit_and() {
-        match lower("fn f(a: bool, b: bool) -> bool { a && b }").unwrap_err() {
-            AdapterError::Unsupported { reason } => {
-                assert!(reason.contains("short-circuit"), "reason: {reason}");
-            }
-            other => panic!("expected Unsupported(short-circuit), got {other:?}"),
-        }
-    }
+    // NOTE: `&&` / `||` short-circuits are now lowered to RPython
+    // `JUMP_IF_FALSE_OR_POP` / `JUMP_IF_TRUE_OR_POP` control flow.
+    // See `short_circuit_*` accept tests above.
 
     // NOTE: `?` operator is now accepted (slice 4). See the
     // `try_op_*` tests below for coverage.
@@ -7846,16 +8256,82 @@ mod tests {
         assert_eq!(start.operations[0].args.len(), 1);
     }
 
+    // ---- unary `!` (UNARY_NOT) desugar -----------------------------
+    //
+    // Upstream basis: `flowcontext.py:531-538` — emit `bool(x)`,
+    // fork on `guessbool`, each branch pushes the inverted Bool
+    // constant.
+
     #[test]
-    fn rejects_unary_not() {
-        // `!x` has no 1-to-1 upstream mapping — UNARY_NOT is a
-        // `bool` + guessbool fork, UNARY_INVERT emits `invert`. The
-        // adapter can't distinguish without type info.
-        match lower("fn f(x: i64) -> i64 { !x }").unwrap_err() {
-            AdapterError::Unsupported { reason } => {
-                assert!(reason.contains("unary `!`"), "reason: {reason}");
-            }
-            other => panic!("expected Unsupported(unary !), got {other:?}"),
+    fn unary_not_emits_bool_switch_to_inverted_constants() {
+        let g = lower("fn f(x: bool) -> bool { !x }").unwrap();
+        checkgraph(&g);
+
+        let start = g.startblock.borrow();
+        // Fork emits exactly `bool(x)` (operand `x` is already an
+        // inputarg, no extra eval ops).
+        assert_eq!(start.operations.len(), 1);
+        assert_eq!(start.operations[0].opname, "bool");
+        let switch_var = start.operations[0].result.clone();
+        assert_eq!(start.exitswitch.as_ref(), Some(&switch_var));
+        assert_eq!(start.exits.len(), 2);
+
+        let false_exit = start.exits[0].borrow();
+        let true_exit = start.exits[1].borrow();
+        assert_eq!(
+            false_exit.exitcase.as_ref().unwrap(),
+            &Hlvalue::Constant(Constant::new(ConstValue::Bool(false)))
+        );
+        assert_eq!(
+            true_exit.exitcase.as_ref().unwrap(),
+            &Hlvalue::Constant(Constant::new(ConstValue::Bool(true)))
+        );
+
+        // bool(x) == False → tail Constant(true)
+        assert_eq!(
+            false_exit.args[0].as_ref().unwrap(),
+            &Hlvalue::Constant(Constant::new(ConstValue::Bool(true)))
+        );
+        // bool(x) == True → tail Constant(false)
+        assert_eq!(
+            true_exit.args[0].as_ref().unwrap(),
+            &Hlvalue::Constant(Constant::new(ConstValue::Bool(false)))
+        );
+    }
+
+    #[test]
+    fn unary_not_threads_through_locals_merge() {
+        // `let y = a + 1; !(y > 0)` — the unary-not fork has `y`
+        // as a local; checkgraph + Link.args arity verifies merge.
+        let g = lower(
+            "fn f(a: i64) -> bool {
+                let y = a + 1;
+                !(y > 0)
+            }",
+        )
+        .unwrap();
+        checkgraph(&g);
+    }
+
+    #[test]
+    fn unary_not_on_int_param_emits_invert() {
+        let g = lower("fn f(x: i64) -> i64 { !x }").unwrap();
+        checkgraph(&g);
+        let start = g.startblock.borrow();
+        assert_eq!(start.operations.len(), 1);
+        assert_eq!(start.operations[0].opname, "invert");
+    }
+
+    #[test]
+    fn unary_not_on_unknown_operand_fails_loud() {
+        let err = lower("fn f(x: Opaque) -> bool { !x }")
+            .expect_err("unknown `!` operand must not default to UNARY_NOT");
+        match err {
+            AdapterError::Unsupported { reason } => assert!(
+                reason.contains("UNARY_NOT") && reason.contains("UNARY_INVERT"),
+                "reason: {reason}"
+            ),
+            other => panic!("expected unsupported unknown `!`, got {other:?}"),
         }
     }
 
@@ -7908,11 +8384,14 @@ mod tests {
     }
 
     #[test]
-    fn rejects_numeric_cast() {
-        // `x as T` has no 1-to-1 upstream mapping — upstream's
-        // `do_int`/`do_float`/`bool` are dunder-method dispatches,
-        // not numeric coercions. Users who need conversion should
-        // call an explicit helper.
+    fn rejects_numeric_cast_pending_source_type_inference() {
+        // `x as T` is fail-loud in `build_flow.rs` until per-Hlvalue
+        // `ValueType` tracking lands on the Builder.  Without it,
+        // `cast_op_name(None, target)` falls through to the
+        // transparent `same_as` arm and would silently mistranslate
+        // `cast_int_to_float` / `cast_bool_to_int` / `int_is_true`.
+        // Front/ast.rs::Expr::Cast (which has `graph_value_type`)
+        // remains the lowering path for typed casts.
         match lower("fn f(x: i64) -> i64 { x as i32 }").unwrap_err() {
             AdapterError::Unsupported { reason } => {
                 assert!(reason.contains("`x as T`"), "reason: {reason}");
@@ -8438,5 +8917,106 @@ mod tests {
             "explicit return with nested block-in-arm must collapse; \
              got {simple_call_count} simple_call ops"
         );
+    }
+
+    // ---- short-circuit `&&` / `||` desugar -------------------------
+    //
+    // Upstream basis: `flowcontext.py:766-777`
+    // `JUMP_IF_FALSE_OR_POP` / `JUMP_IF_TRUE_OR_POP`. The graph shape
+    // is `bool(lhs)`-switched fork into either a short-circuit Link
+    // (lhs survives as the result) or a separate rhs-evaluation block.
+
+    #[test]
+    fn short_circuit_and_emits_bool_switch() {
+        // `a && b` — fork emits `bool(a)`, switches on it; False arm
+        // shortcuts to join with `a`; True arm runs `b` and joins.
+        let g = lower("fn f(a: bool, b: bool) -> bool { a && b }").unwrap();
+        checkgraph(&g);
+
+        let start = g.startblock.borrow();
+        // Only `bool(a)` lives in the fork — lhs is already an
+        // inputarg (`a`), so no extra ops to compute it.
+        assert_eq!(start.operations.len(), 1);
+        assert_eq!(start.operations[0].opname, "bool");
+        let switch_var = start.operations[1.min(start.operations.len()) - 1]
+            .result
+            .clone();
+        assert_eq!(start.exitswitch.as_ref(), Some(&switch_var));
+        assert_eq!(start.exits.len(), 2);
+
+        // `&&` shortcuts on False — false_link goes straight to join,
+        // true_link goes to the rhs-evaluation block.
+        let false_exit = start.exits[0].borrow();
+        let true_exit = start.exits[1].borrow();
+        assert_eq!(
+            false_exit.exitcase.as_ref().unwrap(),
+            &Hlvalue::Constant(Constant::new(ConstValue::Bool(false)))
+        );
+        assert_eq!(
+            true_exit.exitcase.as_ref().unwrap(),
+            &Hlvalue::Constant(Constant::new(ConstValue::Bool(true)))
+        );
+        // The False-branch carries `a` as the tail (short-circuit
+        // result is lhs itself, not `bool(lhs)`).
+        let lhs_inputarg = start.inputargs[0].clone();
+        assert_eq!(false_exit.args[0].as_ref().unwrap(), &lhs_inputarg);
+    }
+
+    #[test]
+    fn short_circuit_or_emits_bool_switch() {
+        // `a || b` — symmetric to `&&` but shortcuts on True.
+        let g = lower("fn f(a: bool, b: bool) -> bool { a || b }").unwrap();
+        checkgraph(&g);
+
+        let start = g.startblock.borrow();
+        assert_eq!(start.operations.len(), 1);
+        assert_eq!(start.operations[0].opname, "bool");
+        assert_eq!(start.exits.len(), 2);
+
+        let false_exit = start.exits[0].borrow();
+        let true_exit = start.exits[1].borrow();
+        // false_link first, true_link second (matches `lower_if`
+        // ordering convention). For `||`, true_link is the shortcut.
+        assert_eq!(
+            false_exit.exitcase.as_ref().unwrap(),
+            &Hlvalue::Constant(Constant::new(ConstValue::Bool(false)))
+        );
+        assert_eq!(
+            true_exit.exitcase.as_ref().unwrap(),
+            &Hlvalue::Constant(Constant::new(ConstValue::Bool(true)))
+        );
+        // The True-branch carries `a` as the tail (`||` shortcut).
+        let lhs_inputarg = start.inputargs[0].clone();
+        assert_eq!(true_exit.args[0].as_ref().unwrap(), &lhs_inputarg);
+    }
+
+    #[test]
+    fn short_circuit_and_evaluates_rhs_in_separate_block() {
+        // `a && (b + 0)` — rhs is a non-trivial expression; verify it
+        // lives in the rhs-evaluation block, not the fork.
+        let g = lower("fn f(a: bool, b: i64) -> i64 { if a && (b > 0) { 1 } else { 0 } }").unwrap();
+        checkgraph(&g);
+        let blocks = g.iterblocks();
+
+        // Fork emits `bool(a)` only.
+        let start = g.startblock.borrow();
+        let opnames: Vec<_> = start.operations.iter().map(|o| o.opname.as_str()).collect();
+        assert_eq!(opnames, vec!["bool"]);
+
+        // Some other block emits the `b > 0` (gt) op — that's the
+        // rhs-evaluation block.
+        let has_gt = blocks
+            .iter()
+            .any(|b| b.borrow().operations.iter().any(|o| o.opname == "gt"));
+        assert!(has_gt, "rhs `b > 0` must lower into its own block");
+    }
+
+    #[test]
+    fn short_circuit_chained_and_or() {
+        // `a && b || c` — Rust precedence: `(a && b) || c`. Two
+        // nested short-circuits; checkgraph alone catches Link/inputarg
+        // arity mismatches.
+        let g = lower("fn f(a: bool, b: bool, c: bool) -> bool { a && b || c }").unwrap();
+        checkgraph(&g);
     }
 }

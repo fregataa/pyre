@@ -53,7 +53,7 @@ use crate::translator::rtyper::lltypesystem::lltype::{
 };
 use crate::translator::rtyper::pairtype::ReprClassId;
 use crate::translator::rtyper::rmodel::{DescOrConst, RTypeResult, Repr, ReprState, mangle};
-use crate::translator::rtyper::rtyper::{GenopResult, LowLevelOpList, RPythonTyper};
+use crate::translator::rtyper::rtyper::{GenopResult, HighLevelOp, LowLevelOpList, RPythonTyper};
 
 // ---------------------------------------------------------------------
 // VtableMethodPtr helper (carried over from the pre-R1 rclass.rs scaffold).
@@ -2628,6 +2628,219 @@ impl Repr for InstanceRepr {
 
     fn repr_class_id(&self) -> ReprClassId {
         ReprClassId::Repr
+    }
+
+    /// RPython `InstanceRepr.rtype_getattr(self, hop)` (rclass.py:838-857):
+    ///
+    /// ```python
+    /// def rtype_getattr(self, hop):
+    ///     if hop.s_result.is_constant():
+    ///         return hop.inputconst(hop.r_result, hop.s_result.const)
+    ///     attr = hop.args_s[1].const
+    ///     vinst, vattr = hop.inputargs(self, Void)
+    ///     if attr == '__class__' and hop.r_result.lowleveltype is Void:
+    ///         # special case for when the result of '.__class__' is a constant
+    ///         [desc] = hop.s_result.descriptions
+    ///         return hop.inputconst(Void, desc.pyobj)
+    ///     if attr in self.allinstancefields:
+    ///         return self.getfield(vinst, attr, hop.llops,
+    ///                              flags=hop.args_s[0].flags)
+    ///     elif attr in self.rclass.allmethods:
+    ///         # special case for methods: represented as their 'self' only
+    ///         # (see MethodsPBCRepr)
+    ///         return hop.r_result.get_method_from_instance(self, vinst,
+    ///                                                      hop.llops)
+    ///     else:
+    ///         vcls = self.getfield(vinst, '__class__', hop.llops)
+    ///         return self.rclass.getclsfield(vcls, attr, hop.llops)
+    /// ```
+    ///
+    /// Step 6 (`allmethods` method dispatch) routes through
+    /// `MethodsPBCRepr.get_method_from_instance` (rpbc.py:1173-1176)
+    /// which is also unported.  For `classdef=None` (the only
+    /// `InstanceRepr` flavour reaching the rtyper today, per
+    /// `valuetype_to_someshell(Ref) -> SomeInstance(classdef=None)` at
+    /// `flowspace_adapter.rs:1638-1659`), the Step 6 branch is
+    /// unreachable: `RootClassRepr._setup_repr` (rclass.rs:1902) keeps
+    /// `allmethods = {}`.
+    fn rtype_getattr(&self, hop: &HighLevelOp) -> RTypeResult {
+        use crate::annotator::model::{SomeObjectTrait, SomeValue};
+        use crate::flowspace::model::Hlvalue;
+        use crate::translator::rtyper::rtyper::ConvertedTo;
+
+        // upstream rclass.py:839-840: `if hop.s_result.is_constant():
+        //     return hop.inputconst(hop.r_result, hop.s_result.const)`.
+        let s_result_clone = hop.s_result.borrow().clone();
+        if let Some(s_result) = &s_result_clone {
+            if s_result.is_constant() {
+                let r_result = hop.r_result.borrow().clone().ok_or_else(|| {
+                    TyperError::message("InstanceRepr.rtype_getattr: r_result missing")
+                })?;
+                let const_val = s_result
+                    .const_()
+                    .cloned()
+                    .expect("s_result.is_constant() implies const_() is Some");
+                return HighLevelOp::inputconst(ConvertedTo::Repr(r_result.as_ref()), &const_val)
+                    .map(Hlvalue::Constant)
+                    .map(Some);
+            }
+        }
+
+        // upstream: `attr = hop.args_s[1].const` (rclass.py:841).
+        let attr = {
+            let args_s = hop.args_s.borrow();
+            let s_attr = args_s.get(1).ok_or_else(|| {
+                TyperError::message("InstanceRepr.rtype_getattr: hop.args_s[1] missing")
+            })?;
+            s_attr
+                .const_()
+                .and_then(ConstValue::as_pystr)
+                .ok_or_else(|| {
+                    TyperError::message(
+                        "InstanceRepr.rtype_getattr: attribute name must be a constant string",
+                    )
+                })?
+                .to_string()
+        };
+
+        // upstream: `vinst, vattr = hop.inputargs(self, Void)` (rclass.py:842).
+        let void = LowLevelType::Void;
+        let vlist = hop.inputargs(vec![ConvertedTo::Repr(self), ConvertedTo::from(&void)])?;
+        let vinst = vlist[0].clone();
+
+        // upstream rclass.py:843-846:
+        //     if attr == '__class__' and hop.r_result.lowleveltype is Void:
+        //         # special case for when the result of '.__class__' is a constant
+        //         [desc] = hop.s_result.descriptions
+        //         return hop.inputconst(Void, desc.pyobj)
+        let r_result_for_classattr =
+            hop.r_result.borrow().clone().ok_or_else(|| {
+                TyperError::message("InstanceRepr.rtype_getattr: r_result missing")
+            })?;
+        if attr == "__class__"
+            && matches!(r_result_for_classattr.lowleveltype(), &LowLevelType::Void)
+        {
+            let pbc = match s_result_clone.as_ref() {
+                Some(SomeValue::PBC(pbc)) => pbc.clone(),
+                _ => {
+                    return Err(TyperError::message(
+                        "InstanceRepr.rtype_getattr: __class__ Void-typed result expects \
+                         SomePBC s_result (rclass.py:843-846)",
+                    ));
+                }
+            };
+            if pbc.descriptions.len() != 1 {
+                return Err(TyperError::message(
+                    "InstanceRepr.rtype_getattr: __class__ Void-typed result expects a \
+                     singleton SomePBC.descriptions (rclass.py:845)",
+                ));
+            }
+            let entry = pbc.descriptions.values().next().unwrap();
+            let pyobj = entry.pyobj().ok_or_else(|| {
+                TyperError::message(
+                    "InstanceRepr.rtype_getattr: __class__ description missing pyobj \
+                     (rclass.py:846)",
+                )
+            })?;
+            return HighLevelOp::inputconst(
+                ConvertedTo::from(&LowLevelType::Void),
+                &ConstValue::HostObject(pyobj),
+            )
+            .map(Hlvalue::Constant)
+            .map(Some);
+        }
+
+        // Recover `Arc<Self>` from the rtyper repr cache so we can call
+        // the `&Arc<Self>`-receiver helpers (`getfield`).  Same pattern
+        // as `convert_const` (rclass.rs:2666) which routes back through
+        // `getinstancerepr`.
+        let rtyper = self.rtyper.upgrade().ok_or_else(|| {
+            TyperError::message("InstanceRepr.rtype_getattr: rtyper weak ref expired")
+        })?;
+        let self_arc = getinstancerepr(&rtyper, self.classdef.as_ref(), self.gcflavor)?;
+
+        // upstream: `if attr in self.allinstancefields:`
+        //          `return self.getfield(vinst, attr, hop.llops,
+        //                                flags=hop.args_s[0].flags)`
+        // (rclass.py:847-849).
+        let has_field = self.allinstancefields.borrow().contains_key(&attr);
+        if has_field {
+            let flags = {
+                let args_s = hop.args_s.borrow();
+                let s_inst = args_s.get(0).ok_or_else(|| {
+                    TyperError::message("InstanceRepr.rtype_getattr: hop.args_s[0] missing")
+                })?;
+                match s_inst {
+                    SomeValue::Instance(inst) => inst
+                        .flags
+                        .iter()
+                        .map(|(k, v)| (k.clone(), ConstValue::Bool(*v)))
+                        .collect::<Flags>(),
+                    _ => Flags::default(),
+                }
+            };
+            let mut llops = hop.llops.borrow_mut();
+            let var = self_arc.getfield(vinst, &attr, &mut llops, false, &flags)?;
+            return Ok(Some(Hlvalue::Variable(var)));
+        }
+
+        // upstream: `elif attr in self.rclass.allmethods:`
+        //          `return hop.r_result.get_method_from_instance(self, vinst, hop.llops)`
+        // (rclass.py:850-854).
+        let rclass = self.rclass.borrow().clone().ok_or_else(|| {
+            TyperError::message("InstanceRepr.rtype_getattr: rclass missing — call setup() first")
+        })?;
+        let has_method = match &rclass {
+            ClassReprArc::Inst(c) => c.allmethods().contains_key(&attr),
+            // `RootClassRepr.allmethods` is always empty (rclass.rs:1902).
+            ClassReprArc::Root(_) => false,
+        };
+        if has_method {
+            // upstream rclass.py:850-854:
+            //     elif attr in self.rclass.allmethods:
+            //         # special case for methods: represented as their
+            //         # 'self' only (see MethodsPBCRepr)
+            //         return hop.r_result.get_method_from_instance(
+            //             self, vinst, hop.llops)
+            //
+            // `hop.r_result` upstream is the `MethodsPBCRepr` for the
+            // dispatched method.  Pyre stores it as `Arc<dyn Repr>`;
+            // downcast through `Repr: Any` (rmodel.rs:332) to reach the
+            // concrete `get_method_from_instance` (rpbc.rs:6363+).
+            use crate::translator::rtyper::rpbc::MethodsPBCRepr;
+            let r_result_arc = hop.r_result.borrow().clone().ok_or_else(|| {
+                TyperError::message("InstanceRepr.rtype_getattr: r_result missing on method branch")
+            })?;
+            let methods_repr = (r_result_arc.as_ref() as &dyn std::any::Any)
+                .downcast_ref::<MethodsPBCRepr>()
+                .ok_or_else(|| {
+                    TyperError::message(format!(
+                        "InstanceRepr.rtype_getattr: method '{attr}' dispatch expects \
+                         MethodsPBCRepr r_result, got {}",
+                        r_result_arc.class_name()
+                    ))
+                })?;
+            let mut llops = hop.llops.borrow_mut();
+            let v_method = methods_repr.get_method_from_instance(
+                self_arc.as_ref() as &dyn Repr,
+                vinst.clone(),
+                &mut llops,
+            )?;
+            return Ok(Some(v_method));
+        }
+
+        // upstream: `else:`
+        //          `vcls = self.getfield(vinst, '__class__', hop.llops)`
+        //          `return self.rclass.getclsfield(vcls, attr, hop.llops)`
+        // (rclass.py:855-857).
+        let mut llops = hop.llops.borrow_mut();
+        let flags = Flags::default();
+        let v_cls = self_arc.getfield(vinst, "__class__", &mut llops, false, &flags)?;
+        let var = match &rclass {
+            ClassReprArc::Inst(c) => c.getclsfield(Hlvalue::Variable(v_cls), &attr, &mut llops)?,
+            ClassReprArc::Root(r) => r.getclsfield(Hlvalue::Variable(v_cls), &attr, &mut llops)?,
+        };
+        Ok(Some(Hlvalue::Variable(var)))
     }
 
     /// RPython `InstanceRepr.convert_const(self, value)` (rclass.py:772-792):

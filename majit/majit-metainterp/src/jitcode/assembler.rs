@@ -920,12 +920,18 @@ impl JitCodeBuilder {
         *slot = Some(self.code.len());
     }
 
-    /// RPython `blackhole.py:913`
-    /// `bhimpl_goto_if_not_int_is_true = bhimpl_goto_if_not`. Take
-    /// `label` iff `reg == 0`.
+    /// RPython `flatten.py:247` emits the bool exitswitch as opname
+    /// `goto_if_not` (not `goto_if_not_int_is_true`).  The `_int_is_true`
+    /// suffix in upstream is a Python class-attribute alias on
+    /// `BlackholeInterpreter` (`blackhole.py:913`
+    /// `bhimpl_goto_if_not_int_is_true = bhimpl_goto_if_not`) that
+    /// shares the handler function under two attribute names — it is
+    /// NOT a second opname registered in `Assembler.insns`.  The Rust
+    /// method name preserves the longer attribute spelling for
+    /// readability; the bytecode key matches upstream's single opname.
     pub fn goto_if_not_int_is_true(&mut self, reg: u16, label: u16) {
         self.touch_reg(reg);
-        self.write_insn("goto_if_not_int_is_true/iL");
+        self.write_insn("goto_if_not/iL");
         self.push_u16(reg);
         self.push_label_ref(label);
     }

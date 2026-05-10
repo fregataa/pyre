@@ -1259,10 +1259,17 @@ impl ClassDesc {
                 let [s_arg] = unpacked.as_slice() else {
                     unreachable!("fixedunpack(1) must return exactly one argument");
                 };
-                assert!(!matches!(
-                    s_arg,
-                    SomeValue::Ptr(_) | SomeValue::InteriorPtr(_)
-                ));
+                // Exception(s_arg): when caller bound the arg, it
+                // must not be a pointer (upstream invariant); when
+                // unbound, the assert is vacuously skipped — the
+                // fixpoint will retry once the arg's annotation
+                // populates.
+                if let Some(s_arg) = s_arg {
+                    assert!(!matches!(
+                        s_arg,
+                        SomeValue::Ptr(_) | SomeValue::InteriorPtr(_)
+                    ));
+                }
             }
         } else {
             // upstream: `args = args.prepend(s_instance); s_init.call(args)`.
@@ -3834,7 +3841,8 @@ mod tests {
         )));
         let ptr = lltype::getfunctionptr(&graph, lltype::_getconcretetype).unwrap();
         let s_arg = SomeValue::Ptr(SomePtr::new(lltype::typeOf(&ptr)));
-        let args = super::super::argument::ArgumentsForTranslation::new(vec![s_arg], None, None);
+        let args =
+            super::super::argument::ArgumentsForTranslation::new(vec![Some(s_arg)], None, None);
 
         let _ = ClassDesc::pycall(&cdesc, None, &args, &SomeValue::Impossible, None);
     }

@@ -176,8 +176,9 @@ pub struct GraphTransformResult {
 /// `codewriter::transform_graph_to_jitcode` instead, which threads
 /// `&CallControl` and runs the lowering pass before jtransform.
 /// This debug-assertion catches missed lowering sites at the
-/// last remaining entry (`translate_legacy/pipeline.rs::analyze_function`
-/// + lib/test helpers) — plan Rev 2 §Phase B3.
+/// remaining entries (test fixtures + the cfg(test)-gated
+/// `translator/rtyper/legacy_pipeline.rs::analyze_function`) —
+/// plan Rev 2 §Phase B3.
 pub fn rewrite_graph(graph: &FunctionGraph, config: &GraphTransformConfig) -> GraphTransformResult {
     #[cfg(debug_assertions)]
     crate::translator::rtyper::rpbc::assert_no_indirect_call_targets(graph);
@@ -189,9 +190,9 @@ pub fn rewrite_graph(graph: &FunctionGraph, config: &GraphTransformConfig) -> Gr
 /// `Transformer`. Required when the graph contains `OpKind::IndirectCall`
 /// (emitted by `translator/rtyper/rpbc.rs::lower_indirect_calls`), since
 /// `lower_indirect_call_op` needs `CallControl::getcalldescr` +
-/// `guess_call_kind` + `graphs_from`. Used by
-/// `translate_legacy::pipeline::analyze_function` after it calls
-/// `lower_indirect_calls` upstream.
+/// `guess_call_kind` + `graphs_from`. Used by the cfg(test)-gated
+/// `translator::rtyper::legacy_pipeline::analyze_function` after it
+/// calls `lower_indirect_calls` upstream.
 pub fn rewrite_graph_with_callcontrol(
     graph: &FunctionGraph,
     config: &GraphTransformConfig,
@@ -544,7 +545,7 @@ impl<'a> Transformer<'a> {
     /// computed by the rtyper for an existing ValueId.
     fn stamp_value_kind_from_value_type(&mut self, value: Option<ValueId>, result_ty: &ValueType) {
         let ty = match result_ty {
-            ValueType::Int | ValueType::State => {
+            ValueType::Int | ValueType::Unsigned | ValueType::Bool | ValueType::State => {
                 crate::jit_codewriter::type_state::ConcreteType::Signed
             }
             ValueType::Ref => crate::jit_codewriter::type_state::ConcreteType::GcRef,
@@ -731,8 +732,14 @@ impl<'a> Transformer<'a> {
                 op: unop_name,
                 operand,
                 ..
-            } if unop_name == "same_as" => {
-                // `jtransform.py:246-248 rewrite_op_same_as`:
+            } if unop_name == "same_as"
+                || unop_name == "deref"
+                || unop_name == "cast_bool_to_int"
+                || unop_name == "cast_bool_to_uint"
+                || unop_name == "cast_int_to_uint"
+                || unop_name == "cast_uint_to_int" =>
+            {
+                // RPython `jtransform.py:246-248 rewrite_op_same_as`:
                 //
                 //     def rewrite_op_same_as(self, op):
                 //         if op.args[0] in self.vable_array_vars:
@@ -743,8 +750,24 @@ impl<'a> Transformer<'a> {
                 // `optimize_block` that means "remove the op and rename
                 // the result to args[0]" (`jtransform.py:106-111`).
                 //
-                // Pyre drops the op (`RewriteResult::Identity`) and
-                // records `op.result -> *operand` in `self.aliases`
+                // `cast_bool_to_int` / `cast_bool_to_uint` /
+                // `cast_int_to_uint` / `cast_uint_to_int` follow the
+                // same drop-and-alias shape — RPython
+                // `jtransform.py:330,331,336,337`:
+                //
+                //     def rewrite_op_cast_bool_to_int(self, op): pass
+                //     def rewrite_op_cast_bool_to_uint(self, op): pass
+                //     def rewrite_op_cast_int_to_uint(self, op): pass
+                //     def rewrite_op_cast_uint_to_int(self, op): pass
+                //
+                // are explicit no-ops.  Each cast is identity at LL
+                // level because `getkind(lltype.Bool) == getkind(
+                // lltype.Signed) == getkind(lltype.Unsigned) == 'int'`
+                // (`history.py:45-63`), so backend opcodes need not
+                // grow separate handlers.
+                //
+                // Pyre instead drops the op (`RewriteResult::Identity`)
+                // and records `op.result -> *operand` in `self.aliases`
                 // (line 446-450). Subsequent ops in the same block
                 // (and `block.exitswitch` / `link.args` via
                 // `remap_control_flow_metadata`) go through `remap_op`
@@ -757,6 +780,29 @@ impl<'a> Transformer<'a> {
                 // upstream's explicit propagation, without keeping a
                 // redundant alias key.
                 RewriteResult::Identity(*operand)
+            }
+            // RPython `jtransform.py:1592` rename pass:
+            //   ('cast_bool_to_float', 'cast_int_to_float'),
+            // The Bool register class is 'int' at LL, so the same
+            // `cast_int_to_float` machine op handles the conversion;
+            // backend opcodes don't need a separate `cast_bool_to_float`.
+            OpKind::UnaryOp {
+                op: unop_name,
+                operand,
+                ..
+            } if unop_name == "cast_bool_to_float" => {
+                self.stamp_value_kind(
+                    op.result,
+                    crate::jit_codewriter::type_state::ConcreteType::Float,
+                );
+                RewriteResult::Replace(vec![SpaceOperation {
+                    result: op.result,
+                    kind: OpKind::UnaryOp {
+                        op: "cast_int_to_float".into(),
+                        operand: *operand,
+                        result_ty: ValueType::Float,
+                    },
+                }])
             }
             // RPython `jtransform.py:1243-1255` `rewrite_op_ptr_eq`/`rewrite_op_ptr_ne`
             // + `_rewrite_cmp_ptrs`: equality/inequality of two Ref operands is
@@ -1083,6 +1129,221 @@ impl<'a> Transformer<'a> {
                     },
                 });
                 RewriteResult::Replace(ops)
+            }
+            // RPython `Transformer.rewrite_op_float_is_true(self, op)`
+            // (`jtransform.py:1627-1631`):
+            //
+            //     def rewrite_op_float_is_true(self, op):
+            //         op1 = SpaceOperation('float_ne',
+            //                              [op.args[0], Constant(0.0, lltype.Float)],
+            //                              op.result)
+            //         return self.rewrite_operation(op1)
+            //
+            // Two upstream surfaces both lower to this rewrite in pyre:
+            //
+            //   1. The front-end emits the un-rtyped `OpKind::UnaryOp
+            //      { op: "bool", .. }` over a float-kind operand
+            //      (RPython `op.bool` before the rtyper).
+            //   2. The rtyper itself emits `OpKind::UnaryOp { op:
+            //      "float_is_true", .. }` from `FloatRepr.rtype_bool`
+            //      (`rfloat.rs:191-198`, mirror of upstream
+            //      `rfloat.py:rtype_bool`).
+            //
+            // Both shapes must be rewritten here.  If neither is
+            // caught the assembler emits a literal `float_is_true`
+            // opname, but downstream backends only register
+            // `float_ne` — RPython jtransform.py:1627 collapses both
+            // surfaces to the same canonical shape.  Pyre's rewriter
+            // does not chain back into `rewrite_operation` the way
+            // upstream does (the loop at `jtransform.rs:446-462`
+            // consumes `Replace(ops)` without re-dispatch), so emit
+            // the canonical `float_ne` opname here rather than
+            // leaving an intermediate op for the float-comparison
+            // arm at `jtransform.rs:827-854`.
+            OpKind::UnaryOp {
+                op: unop_name,
+                operand,
+                ..
+            } if (unop_name == "bool" && self.get_value_kind(*operand) == 'f')
+                || unop_name == "float_is_true" =>
+            {
+                self.stamp_value_kind(
+                    op.result,
+                    crate::jit_codewriter::type_state::ConcreteType::Signed,
+                );
+                let zero_id = self.fresh_synthetic_value_typed(
+                    crate::jit_codewriter::type_state::ConcreteType::Float,
+                );
+                let zero_op = SpaceOperation {
+                    result: Some(zero_id),
+                    kind: OpKind::ConstFloat(0.0_f64.to_bits()),
+                };
+                let ne_op = SpaceOperation {
+                    result: op.result,
+                    kind: OpKind::BinOp {
+                        op: "float_ne".into(),
+                        lhs: *operand,
+                        rhs: zero_id,
+                        result_ty: ValueType::Int,
+                    },
+                };
+                RewriteResult::Replace(vec![zero_op, ne_op])
+            }
+            // RPython `jtransform.py:587-588`:
+            //   rewrite_op_cast_float_to_uint  = _do_builtin_call
+            //   rewrite_op_cast_uint_to_float  = _do_builtin_call
+            // `_do_builtin_call` (`jtransform.py:587-588`) re-routes
+            // through support helpers
+            // (`rpython/jit/codewriter/support.py:274 _ll_1_cast_*`)
+            // so blackhole never sees a bare `cast_*_to_uint*` opname
+            // — instead a `direct_call(<helper-funcptr>)` residual
+            // call carries unsigned-domain semantics (e.g.
+            // `r_uint(long(f))` mod 2^64 wrap, `float(u64_value)`
+            // u64-domain rounding) preserved at runtime.
+            //
+            // Pyre's rtyper-side `rtype_cast_uint_to_float` /
+            // `rtype_cast_float_to_uint`
+            // (`rbuiltin.rs::rtype_cast_uint_to_float` line 1217 and
+            // `rtype_cast_float_to_uint` line 1233) emit the literal
+            // opname.  The signed-domain `cast_int_to_float` /
+            // `cast_float_to_int` backend instructions do NOT
+            // preserve the unsigned semantics: `f as i64 as f64`
+            // rounds for the signed range, not the unsigned range
+            // (e.g. `u64::MAX` becomes `-1.0` instead of `~1.84e19`),
+            // and `f as i64` saturates outside `[-2^63, 2^63)` rather
+            // than wrapping mod 2^64.
+            //
+            // The arms below synthesise the `direct_call` shape
+            // matching `_do_builtin_call`:
+            //   - `direct_funcptr_value` produces a `ConstInt` of the
+            //     helper's runtime fnaddr (registered by
+            //     `pyre/pyre-interpreter/src/jit_fnaddr.rs` →
+            //     `majit_metainterp::blackhole::cast_*_to_*`).
+            //   - `OpKind::CallResidual` mirrors
+            //     `residual_call_irf_<f|i>` (`handle_residual_call` at
+            //     `jtransform.py:439-470` for the integer / float
+            //     register classes).
+            //   - `ElidableCannotRaise` + `OopSpecIndex::None` keeps
+            //     the call out of the `may_call_jitcodes` /
+            //     `calldescr_canraise` set, so no `-live-` is
+            //     appended (`test_flatten.py:1007-1023`).
+            // Const-fold path lives in `opimpl.rs::op_cast_*`; the
+            // runtime helpers reproduce the same IEEE-754 mantissa
+            // decomposition so runtime and const-fold agree.
+            //
+            // Coverage: today these arms are unreachable from pyre
+            // source — `front/ast.rs:classify_fn_arg_ty` folds u*
+            // into `ValueType::Int`, so the rtyper never emits
+            // `cast_uint_to_float` / `cast_float_to_uint` opnames in
+            // practice.  The wiring is staged for the eventual
+            // producer flip — see
+            // `front/ast.rs:classify_fn_arg_ty`'s
+            // TODO(unsigned-producer-flip) for the cascade list.
+            OpKind::UnaryOp {
+                op: unop_name,
+                operand,
+                ..
+            } if unop_name == "cast_uint_to_float" => {
+                // `jtransform.py:587 _do_builtin_call` routes through
+                // `support.py:274 _ll_1_cast_uint_to_float`.  Helper
+                // `blackhole.rs::cast_uint_to_float` carries u64-domain
+                // rounding matching `opimpl.rs::op_cast_uint_to_float`.
+                // `handle_residual_call` (`jtransform.py:456-470`) only
+                // appends `-live-` when `may_call_jitcodes` or the
+                // descriptor can raise; this helper is
+                // `ElidableCannotRaise` with `OopSpecIndex::None` so the
+                // flatten is `residual_call_irf_f ... -> %f0` /
+                // `float_return %f0` with no intervening `-live-`
+                // (`test_flatten.py:1021-1023`).
+                let target = CallTarget::function_path(["cast_uint_to_float"]);
+                let (funcptr, funcptr_op) = self.direct_funcptr_value(&target);
+                self.stamp_value_kind(
+                    op.result,
+                    crate::jit_codewriter::type_state::ConcreteType::Float,
+                );
+                let mut ops = Vec::with_capacity(2);
+                ops.push(funcptr_op);
+                ops.push(SpaceOperation {
+                    result: op.result,
+                    kind: OpKind::CallResidual {
+                        funcptr: CallFuncPtr::Value(funcptr),
+                        descriptor: CallDescriptor::from_signature(
+                            &[majit_ir::value::Type::Int],
+                            majit_ir::value::Type::Float,
+                            EffectInfo::new(ExtraEffect::ElidableCannotRaise, OopSpecIndex::None),
+                        ),
+                        args_i: vec![*operand],
+                        args_r: vec![],
+                        args_f: vec![],
+                        result_kind: 'f',
+                        indirect_targets: None,
+                    },
+                });
+                RewriteResult::Replace(ops)
+            }
+            OpKind::UnaryOp {
+                op: unop_name,
+                operand,
+                ..
+            } if unop_name == "cast_float_to_uint" => {
+                // `jtransform.py:588 _do_builtin_call` →
+                // `support.py:274 _ll_1_cast_float_to_uint`.  Helper
+                // mirrors `opimpl.rs::op_cast_float_to_uint` (mod 2^64
+                // wrap via mantissa/exponent decomposition).
+                // `ElidableCannotRaise`+`OopSpecIndex::None` → no
+                // `-live-` (`test_flatten.py:1007-1009`).
+                let target = CallTarget::function_path(["cast_float_to_uint"]);
+                let (funcptr, funcptr_op) = self.direct_funcptr_value(&target);
+                self.stamp_value_kind(
+                    op.result,
+                    crate::jit_codewriter::type_state::ConcreteType::Signed,
+                );
+                let mut ops = Vec::with_capacity(2);
+                ops.push(funcptr_op);
+                ops.push(SpaceOperation {
+                    result: op.result,
+                    kind: OpKind::CallResidual {
+                        funcptr: CallFuncPtr::Value(funcptr),
+                        descriptor: CallDescriptor::from_signature(
+                            &[majit_ir::value::Type::Float],
+                            majit_ir::value::Type::Int,
+                            EffectInfo::new(ExtraEffect::ElidableCannotRaise, OopSpecIndex::None),
+                        ),
+                        args_i: vec![],
+                        args_r: vec![],
+                        args_f: vec![*operand],
+                        result_kind: 'i',
+                        indirect_targets: None,
+                    },
+                });
+                RewriteResult::Replace(ops)
+            }
+            // RPython `jtransform.py:1606` rename pass:
+            //   ('uint_is_true', 'int_is_true'),
+            // The Unsigned register class is 'int' at LL, so `uint_is_true`
+            // is a textual alias for `int_is_true`; the backend opcode
+            // table only registers `int_is_true`.  Pyre's rtyper-side
+            // `rtype_uint_is_true` (`rbuiltin.rs::rtype_uint_is_true`)
+            // emits the literal `uint_is_true` opname for typing
+            // `r_uint(...)` truthiness; without this rename the
+            // assembler emits an unmapped opname.
+            OpKind::UnaryOp {
+                op: unop_name,
+                operand,
+                ..
+            } if unop_name == "uint_is_true" => {
+                self.stamp_value_kind(
+                    op.result,
+                    crate::jit_codewriter::type_state::ConcreteType::Signed,
+                );
+                RewriteResult::Replace(vec![SpaceOperation {
+                    result: op.result,
+                    kind: OpKind::UnaryOp {
+                        op: "int_is_true".into(),
+                        operand: *operand,
+                        result_ty: ValueType::Int,
+                    },
+                }])
             }
             // pyre front-end uses Rust's syn::BinOp / syn::UnOp identifiers
             // (`add_assign`, `deref`) which have no RPython counterpart —
@@ -3090,7 +3351,10 @@ fn resolve_non_void_arg_types(
 
 fn value_type_to_kind(ty: &ValueType) -> char {
     match ty {
-        ValueType::Int | ValueType::State => 'i',
+        // RPython `getkind(BOOL_TYPE)` / `getkind(Unsigned)` both
+        // return `'int'` (ll Bool / Unsigned share register class
+        // with Signed at the codewriter register-kind layer).
+        ValueType::Int | ValueType::Unsigned | ValueType::Bool | ValueType::State => 'i',
         ValueType::Ref | ValueType::Unknown => 'r',
         ValueType::Float => 'f',
         ValueType::Void => 'v',
@@ -3145,7 +3409,9 @@ fn canonical_assign_binop(op: &str) -> Option<&'static str> {
 /// Used by getcalldescr to build NON_VOID_ARGS and RESULT types.
 fn value_type_to_ir_type(ty: &ValueType) -> majit_ir::value::Type {
     match ty {
-        ValueType::Int | ValueType::State => majit_ir::value::Type::Int,
+        ValueType::Int | ValueType::Unsigned | ValueType::Bool | ValueType::State => {
+            majit_ir::value::Type::Int
+        }
         ValueType::Ref | ValueType::Unknown => majit_ir::value::Type::Ref,
         ValueType::Float => majit_ir::value::Type::Float,
         ValueType::Void => majit_ir::value::Type::Void,
@@ -3221,6 +3487,7 @@ fn remap_op(
     let kind = match &op.kind {
         OpKind::Input { .. }
         | OpKind::ConstInt(_)
+        | OpKind::ConstBool(_)
         | OpKind::ConstFloat(_)
         | OpKind::CurrentTraceLength
         | OpKind::Live
@@ -4762,706 +5029,6 @@ mod tests {
         ));
     }
 
-    // ── RPython indirect_call plumbing tests — plan §Tests ──────────
-
-    /// Build a graph that calls `receiver.run()` on a `dyn Handler` receiver
-    /// with two registered impls, run the rtyper-equivalent
-    /// `lower_indirect_calls` pass and then `Transformer::transform`, and
-    /// assert the post-jtransform sequence is exactly
-    /// `[VtableMethodPtr, Live, GuardValue{kind='i'},
-    ///   CallResidual{funcptr=Value(_), indirect_targets=Some}, Live]`.
-    /// RPython `jtransform.py:410-412 + 538-553` orthodox port parity.
-    /// Build an impl-method graph with a single `Input { ty: Ref }`
-    /// representing the receiver `self` — mirrors the one-arg signature
-    /// `fn run(&self)` that `FunctionReprBase.call` feeds into
-    /// `indirect_call(funcptr, self, c_graphs)` (rpbc.py:207-217).
-    fn build_handler_run_impl_graph(name: &str) -> FunctionGraph {
-        let mut graph = FunctionGraph::new(name);
-        graph
-            .push_op(
-                graph.startblock,
-                OpKind::Input {
-                    name: "self".to_string(),
-                    ty: ValueType::Ref,
-                },
-                true,
-            )
-            .unwrap();
-        graph.set_return(graph.startblock, None);
-        graph
-    }
-
-    #[test]
-    fn lower_indirect_call_op_emit_order() {
-        use crate::call::CallControl;
-        use crate::translate_legacy::annotator::annrpython::annotate;
-        use crate::translate_legacy::rtyper::rtyper::resolve_types;
-        use crate::translator::rtyper::rpbc::lower_indirect_calls;
-
-        let mut cc = CallControl::new();
-        cc.register_trait_method(
-            "run",
-            Some("Handler"),
-            "A",
-            build_handler_run_impl_graph("A::run"),
-        );
-        cc.register_trait_method(
-            "run",
-            Some("Handler"),
-            "B",
-            build_handler_run_impl_graph("B::run"),
-        );
-        cc.find_all_graphs_for_tests();
-
-        // Build a graph: `receiver = input(); receiver.run()`.
-        let mut graph = FunctionGraph::new("outer");
-        let receiver = graph
-            .push_op(
-                graph.startblock,
-                OpKind::Input {
-                    name: "handler".to_string(),
-                    ty: ValueType::Unknown,
-                },
-                true,
-            )
-            .unwrap();
-        graph.push_op(
-            graph.startblock,
-            OpKind::Call {
-                target: CallTarget::indirect("Handler", "run"),
-                args: vec![receiver],
-                result_ty: ValueType::Void,
-            },
-            true,
-        );
-        graph.set_return(graph.startblock, None);
-
-        // Run the rtyper-equivalent lowering before jtransform — this is
-        // what `codewriter.rs::transform_graph_to_jitcode` does for the
-        // canonical pipeline.
-        let annotations = annotate(&graph);
-        let mut type_state = resolve_types(&graph, &annotations);
-        lower_indirect_calls(&mut graph, &mut type_state, &cc);
-
-        let config = GraphTransformConfig::default();
-        let mut transformer = Transformer::new(&config)
-            .with_callcontrol(&mut cc)
-            .with_type_state(&type_state);
-        let result = transformer.transform(&graph);
-
-        let ops = &result.graph.block(graph.startblock).operations;
-        // Strip the initial Input op.
-        let post_input = &ops[1..];
-        assert!(
-            matches!(post_input[0].kind, OpKind::VtableMethodPtr { .. }),
-            "expected VtableMethodPtr first, got {:?}",
-            post_input[0].kind
-        );
-        assert!(
-            matches!(post_input[1].kind, OpKind::Live),
-            "expected Live second, got {:?}",
-            post_input[1].kind
-        );
-        match &post_input[2].kind {
-            OpKind::GuardValue { kind_char: 'i', .. } => {}
-            other => panic!("expected GuardValue kind='i', got {other:?}"),
-        }
-        match &post_input[3].kind {
-            OpKind::CallResidual {
-                funcptr: CallFuncPtr::Value(_),
-                indirect_targets: Some(t),
-                ..
-            } => assert_eq!(t.lst.len(), 2, "both impls should be candidates"),
-            other => panic!(
-                "expected CallResidual with runtime funcptr + indirect_targets, got {other:?}"
-            ),
-        }
-        // jtransform.py:547 handle_residual_call(..., may_call_jitcodes=True)
-        // forces a trailing `-live-`.
-        assert!(
-            matches!(post_input[4].kind, OpKind::Live),
-            "expected trailing Live, got {:?}",
-            post_input[4].kind
-        );
-    }
-
-    /// End-to-end smoke: after the rtyper-equivalent `lower_indirect_calls`
-    /// pass + `Transformer::transform`, the `CallResidual.indirect_targets`
-    /// payload carries exactly one `JitCodeHandle` per candidate impl
-    /// (each shell allocated by `CallControl::get_jitcode`). The assembler
-    /// later merges these handles into `Assembler.indirectcalltargets`
-    /// (RPython `assembler.py:208-209`).
-    #[test]
-    fn indirectcalltargets_reach_call_residual_payload() {
-        use crate::call::CallControl;
-        use crate::translate_legacy::annotator::annrpython::annotate;
-        use crate::translate_legacy::rtyper::rtyper::resolve_types;
-        use crate::translator::rtyper::rpbc::lower_indirect_calls;
-
-        let mut cc = CallControl::new();
-        cc.register_trait_method(
-            "run",
-            Some("Handler"),
-            "A",
-            build_handler_run_impl_graph("A::run"),
-        );
-        cc.register_trait_method(
-            "run",
-            Some("Handler"),
-            "B",
-            build_handler_run_impl_graph("B::run"),
-        );
-        cc.find_all_graphs_for_tests();
-
-        let mut graph = FunctionGraph::new("outer");
-        let receiver = graph
-            .push_op(
-                graph.startblock,
-                OpKind::Input {
-                    name: "handler".to_string(),
-                    ty: ValueType::Unknown,
-                },
-                true,
-            )
-            .unwrap();
-        graph.push_op(
-            graph.startblock,
-            OpKind::Call {
-                target: CallTarget::indirect("Handler", "run"),
-                args: vec![receiver],
-                result_ty: ValueType::Void,
-            },
-            true,
-        );
-        graph.set_return(graph.startblock, None);
-
-        let annotations = annotate(&graph);
-        let mut type_state = resolve_types(&graph, &annotations);
-        lower_indirect_calls(&mut graph, &mut type_state, &cc);
-
-        let config = GraphTransformConfig::default();
-        let mut transformer = Transformer::new(&config)
-            .with_callcontrol(&mut cc)
-            .with_type_state(&type_state);
-        let result = transformer.transform(&graph);
-
-        let residual = result
-            .graph
-            .block(graph.startblock)
-            .operations
-            .iter()
-            .find_map(|op| match &op.kind {
-                OpKind::CallResidual {
-                    indirect_targets, ..
-                } => indirect_targets.clone(),
-                _ => None,
-            })
-            .expect("residual call with indirect_targets");
-
-        assert_eq!(residual.lst.len(), 2);
-        // `IndirectCallTargets.lst` carries shell handles returned by
-        // `CallControl::get_jitcode()`. RPython appends/indices jitcodes
-        // only after `transform_graph_to_jitcode(...)` completes, so the
-        // candidate handles must still be unindexed at this stage.
-        assert!(
-            residual.lst.iter().all(|h| h.try_index().is_none()),
-            "indirect target shells should not have final all_jitcodes indices yet"
-        );
-    }
-
-    // ── Kind matrix: `indirect_regular_call_{r,ir,irf}_{i,r,f,v}` ────
-    //
-    // RPython upstream: `test_jtransform.py:340-367` parameterization +
-    // `test_jtransform.py:447-484 indirect_regular_call_test`.  Each
-    // test builds a `receiver.m(extras...)` site where `extras` covers
-    // the arg kind signature (`r`, `ir`, `irf`) and `result_ty` covers
-    // the result kind (`i`, `r`, `f`, `v`).  The emitted `CallResidual`
-    // must split args into `(args_i, args_r, args_f)` by kind — with
-    // the receiver always landing in `args_r` — and carry `result_kind`
-    // matching the call's `result_ty`.  Receiver-in-args mirrors RPython
-    // `rpbc.py:1195-1208 MethodsPBCRepr.redispatch_call`.
-
-    /// Runs the full rtyper-equivalent + jtransform pipeline for a
-    /// `receiver.m(extras...)` dyn-Trait call and asserts the emitted
-    /// op sequence is exactly
-    /// `[VtableMethodPtr, Live, GuardValue{'i'}, CallResidual, Live]`,
-    /// with the CallResidual's arg-kind distribution matching `expect`
-    /// and `result_kind` matching `expect_res_kind`.  Two impls are
-    /// registered so `CallKind::Regular` is selected.
-    fn check_indirect_regular_call_kind(
-        extras: &[ValueType],
-        result_ty: ValueType,
-        expect: (usize, usize, usize),
-        expect_res_kind: char,
-    ) {
-        use crate::call::CallControl;
-        use crate::translate_legacy::annotator::annrpython::annotate;
-        use crate::translate_legacy::rtyper::rtyper::resolve_types;
-        use crate::translator::rtyper::rpbc::lower_indirect_calls;
-
-        let build_impl = |name: &str| {
-            let mut g = FunctionGraph::new(name);
-            g.push_op(
-                g.startblock,
-                OpKind::Input {
-                    name: "self".into(),
-                    ty: ValueType::Ref,
-                },
-                true,
-            )
-            .unwrap();
-            for (i, ty) in extras.iter().enumerate() {
-                g.push_op(
-                    g.startblock,
-                    OpKind::Input {
-                        name: format!("a{i}"),
-                        ty: ty.clone(),
-                    },
-                    true,
-                )
-                .unwrap();
-            }
-            g.set_return(g.startblock, None);
-            g
-        };
-
-        let mut cc = CallControl::new();
-        cc.register_trait_method("m", Some("T"), "A", build_impl("A::m"));
-        cc.register_trait_method("m", Some("T"), "B", build_impl("B::m"));
-        // The indirect branch of `getcalldescr(op)` validates that the
-        // caller's `result_type` matches the witness impl's declared
-        // return type (`call.rs` indirect-arm signature check).  Inject
-        // matching strings so the non-void kind-matrix cases resolve
-        // without panicking.
-        let return_str = match result_ty {
-            ValueType::Int | ValueType::State => "i64",
-            ValueType::Ref | ValueType::Unknown => "String",
-            ValueType::Float => "f64",
-            ValueType::Void => "",
-        };
-        if !return_str.is_empty() {
-            cc.return_types.insert(
-                crate::parse::CallPath::for_impl_method("A", "m"),
-                return_str.to_string(),
-            );
-            cc.return_types.insert(
-                crate::parse::CallPath::for_impl_method("B", "m"),
-                return_str.to_string(),
-            );
-        }
-        cc.find_all_graphs_for_tests();
-
-        let mut graph = FunctionGraph::new("outer");
-        let receiver = graph
-            .push_op(
-                graph.startblock,
-                OpKind::Input {
-                    name: "self".into(),
-                    ty: ValueType::Ref,
-                },
-                true,
-            )
-            .unwrap();
-        let mut args = vec![receiver];
-        for (i, ty) in extras.iter().enumerate() {
-            args.push(
-                graph
-                    .push_op(
-                        graph.startblock,
-                        OpKind::Input {
-                            name: format!("a{i}"),
-                            ty: ty.clone(),
-                        },
-                        true,
-                    )
-                    .unwrap(),
-            );
-        }
-        let has_result = !matches!(result_ty, ValueType::Void);
-        graph.push_op(
-            graph.startblock,
-            OpKind::Call {
-                target: CallTarget::indirect("T", "m"),
-                args,
-                result_ty,
-            },
-            has_result,
-        );
-        graph.set_return(graph.startblock, None);
-
-        let annotations = annotate(&graph);
-        let mut type_state = resolve_types(&graph, &annotations);
-        lower_indirect_calls(&mut graph, &mut type_state, &cc);
-
-        let config = GraphTransformConfig::default();
-        let mut transformer = Transformer::new(&config)
-            .with_callcontrol(&mut cc)
-            .with_type_state(&type_state);
-        let result = transformer.transform(&graph);
-
-        let ops = &result.graph.block(graph.startblock).operations;
-        let post_input: Vec<_> = ops
-            .iter()
-            .filter(|op| !matches!(&op.kind, OpKind::Input { .. }))
-            .collect();
-
-        assert!(
-            matches!(post_input[0].kind, OpKind::VtableMethodPtr { .. }),
-            "expected VtableMethodPtr first, got {:?}",
-            post_input[0].kind,
-        );
-        assert!(
-            matches!(post_input[1].kind, OpKind::Live),
-            "expected Live second, got {:?}",
-            post_input[1].kind,
-        );
-        assert!(
-            matches!(
-                post_input[2].kind,
-                OpKind::GuardValue { kind_char: 'i', .. }
-            ),
-            "expected GuardValue kind_char='i', got {:?}",
-            post_input[2].kind,
-        );
-        match &post_input[3].kind {
-            OpKind::CallResidual {
-                funcptr: CallFuncPtr::Value(_),
-                args_i,
-                args_r,
-                args_f,
-                result_kind,
-                indirect_targets: Some(t),
-                ..
-            } => {
-                assert_eq!(args_i.len(), expect.0, "args_i count");
-                assert_eq!(args_r.len(), expect.1, "args_r count (receiver counted)");
-                assert_eq!(args_f.len(), expect.2, "args_f count");
-                assert_eq!(*result_kind, expect_res_kind, "result_kind");
-                assert_eq!(t.lst.len(), 2, "both impls in family");
-            }
-            other => {
-                panic!("expected CallResidual with Value funcptr + indirect_targets, got {other:?}")
-            }
-        }
-        assert!(
-            matches!(post_input[4].kind, OpKind::Live),
-            "expected trailing Live (may_call_jitcodes=true), got {:?}",
-            post_input[4].kind,
-        );
-    }
-
-    #[test]
-    fn indirect_regular_call_r_i() {
-        check_indirect_regular_call_kind(&[], ValueType::Int, (0, 1, 0), 'i');
-    }
-    #[test]
-    fn indirect_regular_call_r_r() {
-        check_indirect_regular_call_kind(&[], ValueType::Ref, (0, 1, 0), 'r');
-    }
-    #[test]
-    fn indirect_regular_call_r_f() {
-        check_indirect_regular_call_kind(&[], ValueType::Float, (0, 1, 0), 'f');
-    }
-    #[test]
-    fn indirect_regular_call_r_v() {
-        check_indirect_regular_call_kind(&[], ValueType::Void, (0, 1, 0), 'v');
-    }
-
-    #[test]
-    fn indirect_regular_call_ir_i() {
-        check_indirect_regular_call_kind(&[ValueType::Int], ValueType::Int, (1, 1, 0), 'i');
-    }
-    #[test]
-    fn indirect_regular_call_ir_r() {
-        check_indirect_regular_call_kind(&[ValueType::Int], ValueType::Ref, (1, 1, 0), 'r');
-    }
-    #[test]
-    fn indirect_regular_call_ir_f() {
-        check_indirect_regular_call_kind(&[ValueType::Int], ValueType::Float, (1, 1, 0), 'f');
-    }
-    #[test]
-    fn indirect_regular_call_ir_v() {
-        check_indirect_regular_call_kind(&[ValueType::Int], ValueType::Void, (1, 1, 0), 'v');
-    }
-
-    #[test]
-    fn indirect_regular_call_irf_i() {
-        check_indirect_regular_call_kind(
-            &[ValueType::Int, ValueType::Float],
-            ValueType::Int,
-            (1, 1, 1),
-            'i',
-        );
-    }
-    #[test]
-    fn indirect_regular_call_irf_r() {
-        check_indirect_regular_call_kind(
-            &[ValueType::Int, ValueType::Float],
-            ValueType::Ref,
-            (1, 1, 1),
-            'r',
-        );
-    }
-    #[test]
-    fn indirect_regular_call_irf_f() {
-        check_indirect_regular_call_kind(
-            &[ValueType::Int, ValueType::Float],
-            ValueType::Float,
-            (1, 1, 1),
-            'f',
-        );
-    }
-    #[test]
-    fn indirect_regular_call_irf_v() {
-        check_indirect_regular_call_kind(
-            &[ValueType::Int, ValueType::Float],
-            ValueType::Void,
-            (1, 1, 1),
-            'v',
-        );
-    }
-
-    // ── Kind matrix: `indirect_residual_call_{r,ir,irf}_{i,r,f,v}` ───
-    //
-    // RPython upstream: `test_jtransform.py:420-445 indirect_residual_call_test`.
-    // `handle_residual_indirect_call` is an alias for the regular
-    // residual-call path (`jtransform.py:536`): no `int_guard_value` guard
-    // and no `IndirectCallTargets` sidecar; only `[residual_call_*, -live-]`.
-    // On the pyre side we additionally retain the `VtableMethodPtr` op
-    // emitted by `lower_indirect_calls` — the rtyper-equivalent layer runs
-    // unconditionally and provides the runtime funcptr ValueId consumed
-    // by the `CallResidual.funcptr` operand.
-
-    /// Same skeleton as `check_indirect_regular_call_kind` but drops
-    /// `find_all_graphs_for_tests`, so `candidate_graphs` stays empty
-    /// and `guess_call_kind(op)` falls through to `CallKind::Residual`
-    /// via the `graphs_from(op)` call.py:137-139 fall-through.
-    /// Emit is `[VtableMethodPtr, CallResidual{indirect_targets: None},
-    /// Live?]` — the trailing `-live-` appears only when the descriptor's
-    /// `can_raise` is true, which is the default for non-elidable
-    /// family calls.
-    fn check_indirect_residual_call_kind(
-        extras: &[ValueType],
-        result_ty: ValueType,
-        expect: (usize, usize, usize),
-        expect_res_kind: char,
-    ) {
-        use crate::call::CallControl;
-        use crate::translate_legacy::annotator::annrpython::annotate;
-        use crate::translate_legacy::rtyper::rtyper::resolve_types;
-        use crate::translator::rtyper::rpbc::lower_indirect_calls;
-
-        let build_impl = |name: &str| {
-            let mut g = FunctionGraph::new(name);
-            g.push_op(
-                g.startblock,
-                OpKind::Input {
-                    name: "self".into(),
-                    ty: ValueType::Ref,
-                },
-                true,
-            )
-            .unwrap();
-            for (i, ty) in extras.iter().enumerate() {
-                g.push_op(
-                    g.startblock,
-                    OpKind::Input {
-                        name: format!("a{i}"),
-                        ty: ty.clone(),
-                    },
-                    true,
-                )
-                .unwrap();
-            }
-            g.set_return(g.startblock, None);
-            g
-        };
-
-        let mut cc = CallControl::new();
-        cc.register_trait_method("m", Some("T"), "A", build_impl("A::m"));
-        cc.register_trait_method("m", Some("T"), "B", build_impl("B::m"));
-        let return_str = match result_ty {
-            ValueType::Int | ValueType::State => "i64",
-            ValueType::Ref | ValueType::Unknown => "String",
-            ValueType::Float => "f64",
-            ValueType::Void => "",
-        };
-        if !return_str.is_empty() {
-            cc.return_types.insert(
-                crate::parse::CallPath::for_impl_method("A", "m"),
-                return_str.to_string(),
-            );
-            cc.return_types.insert(
-                crate::parse::CallPath::for_impl_method("B", "m"),
-                return_str.to_string(),
-            );
-        }
-        // NOTE: intentionally *no* `find_all_graphs_for_tests` — that keeps
-        // `candidate_graphs` empty so `guess_call_kind(op)` classifies
-        // this call as `CallKind::Residual` via the call.py:137-139
-        // `graphs_from(op) is None` fall-through.
-
-        let mut graph = FunctionGraph::new("outer");
-        let receiver = graph
-            .push_op(
-                graph.startblock,
-                OpKind::Input {
-                    name: "self".into(),
-                    ty: ValueType::Ref,
-                },
-                true,
-            )
-            .unwrap();
-        let mut args = vec![receiver];
-        for (i, ty) in extras.iter().enumerate() {
-            args.push(
-                graph
-                    .push_op(
-                        graph.startblock,
-                        OpKind::Input {
-                            name: format!("a{i}"),
-                            ty: ty.clone(),
-                        },
-                        true,
-                    )
-                    .unwrap(),
-            );
-        }
-        let has_result = !matches!(result_ty, ValueType::Void);
-        graph.push_op(
-            graph.startblock,
-            OpKind::Call {
-                target: CallTarget::indirect("T", "m"),
-                args,
-                result_ty,
-            },
-            has_result,
-        );
-        graph.set_return(graph.startblock, None);
-
-        let annotations = annotate(&graph);
-        let mut type_state = resolve_types(&graph, &annotations);
-        lower_indirect_calls(&mut graph, &mut type_state, &cc);
-
-        let config = GraphTransformConfig::default();
-        let mut transformer = Transformer::new(&config)
-            .with_callcontrol(&mut cc)
-            .with_type_state(&type_state);
-        let result = transformer.transform(&graph);
-
-        let ops = &result.graph.block(graph.startblock).operations;
-        let post_input: Vec<_> = ops
-            .iter()
-            .filter(|op| !matches!(&op.kind, OpKind::Input { .. }))
-            .collect();
-
-        assert!(
-            matches!(post_input[0].kind, OpKind::VtableMethodPtr { .. }),
-            "expected VtableMethodPtr first, got {:?}",
-            post_input[0].kind,
-        );
-        // Residual path must NOT emit the [Live, GuardValue] prefix —
-        // upstream `jtransform.py:536` aliases
-        // `handle_residual_indirect_call = handle_residual_call`.
-        assert!(
-            !post_input
-                .iter()
-                .any(|op| matches!(op.kind, OpKind::GuardValue { .. })),
-            "residual path must not emit int_guard_value, got ops: {:?}",
-            post_input.iter().map(|op| &op.kind).collect::<Vec<_>>(),
-        );
-        match &post_input[1].kind {
-            OpKind::CallResidual {
-                funcptr: CallFuncPtr::Value(_),
-                args_i,
-                args_r,
-                args_f,
-                result_kind,
-                indirect_targets: None,
-                ..
-            } => {
-                assert_eq!(args_i.len(), expect.0, "args_i count");
-                assert_eq!(args_r.len(), expect.1, "args_r count (receiver counted)");
-                assert_eq!(args_f.len(), expect.2, "args_f count");
-                assert_eq!(*result_kind, expect_res_kind, "result_kind");
-            }
-            other => panic!(
-                "expected CallResidual with Value funcptr + indirect_targets=None, got {other:?}"
-            ),
-        }
-    }
-
-    #[test]
-    fn indirect_residual_call_r_i() {
-        check_indirect_residual_call_kind(&[], ValueType::Int, (0, 1, 0), 'i');
-    }
-    #[test]
-    fn indirect_residual_call_r_r() {
-        check_indirect_residual_call_kind(&[], ValueType::Ref, (0, 1, 0), 'r');
-    }
-    #[test]
-    fn indirect_residual_call_r_f() {
-        check_indirect_residual_call_kind(&[], ValueType::Float, (0, 1, 0), 'f');
-    }
-    #[test]
-    fn indirect_residual_call_r_v() {
-        check_indirect_residual_call_kind(&[], ValueType::Void, (0, 1, 0), 'v');
-    }
-
-    #[test]
-    fn indirect_residual_call_ir_i() {
-        check_indirect_residual_call_kind(&[ValueType::Int], ValueType::Int, (1, 1, 0), 'i');
-    }
-    #[test]
-    fn indirect_residual_call_ir_r() {
-        check_indirect_residual_call_kind(&[ValueType::Int], ValueType::Ref, (1, 1, 0), 'r');
-    }
-    #[test]
-    fn indirect_residual_call_ir_f() {
-        check_indirect_residual_call_kind(&[ValueType::Int], ValueType::Float, (1, 1, 0), 'f');
-    }
-    #[test]
-    fn indirect_residual_call_ir_v() {
-        check_indirect_residual_call_kind(&[ValueType::Int], ValueType::Void, (1, 1, 0), 'v');
-    }
-
-    #[test]
-    fn indirect_residual_call_irf_i() {
-        check_indirect_residual_call_kind(
-            &[ValueType::Int, ValueType::Float],
-            ValueType::Int,
-            (1, 1, 1),
-            'i',
-        );
-    }
-    #[test]
-    fn indirect_residual_call_irf_r() {
-        check_indirect_residual_call_kind(
-            &[ValueType::Int, ValueType::Float],
-            ValueType::Ref,
-            (1, 1, 1),
-            'r',
-        );
-    }
-    #[test]
-    fn indirect_residual_call_irf_f() {
-        check_indirect_residual_call_kind(
-            &[ValueType::Int, ValueType::Float],
-            ValueType::Float,
-            (1, 1, 1),
-            'f',
-        );
-    }
-    #[test]
-    fn indirect_residual_call_irf_v() {
-        check_indirect_residual_call_kind(
-            &[ValueType::Int, ValueType::Float],
-            ValueType::Void,
-            (1, 1, 1),
-            'v',
-        );
-    }
-
     /// RPython `rpython/jit/codewriter/jtransform.py:895-903` — a
     /// quasi-immutable field read lowers to
     /// `[-live-, record_quasiimmut_field(v, descr, descr1), getfield_*_pure]`.
@@ -5963,6 +5530,716 @@ mod tests {
         assert_eq!(
             super::map_user_oopspec_to_index("dict.setitem"),
             OopSpecIndex::None
+        );
+    }
+
+    // ── RPython indirect_call plumbing tests — parity guard ──────────
+    //
+    // RPython upstream: `jtransform.py:538-553 handle_regular_indirect_
+    // call` emits `[-live-, int_guard_value, residual_call +
+    // IndirectCallTargets, -live-]`; `assembler.py:208-209` collects
+    // the candidate jitcodes into `indirectcalltargets`.  These two
+    // tests anchor the RPython-orthodox post-jtransform shape so any
+    // future change to `lower_indirect_calls` / `Transformer::transform`
+    // surfaces here rather than reaching the assembler with a wrong
+    // op sequence.
+
+    /// Build an impl-method graph with a single `Input { ty: Ref }`
+    /// representing the receiver `self` — mirrors the one-arg signature
+    /// `fn run(&self)` that `FunctionReprBase.call` feeds into
+    /// `indirect_call(funcptr, self, c_graphs)` (`rpbc.py:207-217`).
+    fn build_handler_run_impl_graph(name: &str) -> FunctionGraph {
+        let mut graph = FunctionGraph::new(name);
+        graph
+            .push_op(
+                graph.startblock,
+                OpKind::Input {
+                    name: "self".to_string(),
+                    ty: ValueType::Ref,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, None);
+        graph
+    }
+
+    /// Build a graph that calls `receiver.run()` on a `dyn Handler`
+    /// receiver with two registered impls, run the rtyper-equivalent
+    /// `lower_indirect_calls` pass and then `Transformer::transform`,
+    /// and assert the post-jtransform sequence is exactly
+    /// `[VtableMethodPtr, Live, GuardValue{kind='i'},
+    ///   CallResidual{funcptr=Value(_), indirect_targets=Some}, Live]`.
+    /// RPython `jtransform.py:410-412 + 538-553` orthodox port parity.
+    #[test]
+    fn lower_indirect_call_op_emit_order() {
+        use crate::call::CallControl;
+        use crate::translator::rtyper::legacy_annotator::annotate;
+        use crate::translator::rtyper::legacy_resolve::resolve_types;
+        use crate::translator::rtyper::rpbc::lower_indirect_calls;
+
+        let mut cc = CallControl::new();
+        cc.register_trait_method(
+            "run",
+            Some("Handler"),
+            "A",
+            build_handler_run_impl_graph("A::run"),
+        );
+        cc.register_trait_method(
+            "run",
+            Some("Handler"),
+            "B",
+            build_handler_run_impl_graph("B::run"),
+        );
+        cc.find_all_graphs_for_tests();
+
+        let mut graph = FunctionGraph::new("outer");
+        let receiver = graph
+            .push_op(
+                graph.startblock,
+                OpKind::Input {
+                    name: "handler".to_string(),
+                    ty: ValueType::Unknown,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op(
+            graph.startblock,
+            OpKind::Call {
+                target: CallTarget::indirect("Handler", "run"),
+                args: vec![receiver],
+                result_ty: ValueType::Void,
+            },
+            true,
+        );
+        graph.set_return(graph.startblock, None);
+
+        let annotations = annotate(&graph);
+        let mut type_state = resolve_types(&graph, &annotations);
+        lower_indirect_calls(&mut graph, &mut type_state, &cc);
+
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .with_type_state(&type_state);
+        let result = transformer.transform(&graph);
+
+        let ops = &result.graph.block(graph.startblock).operations;
+        let post_input = &ops[1..];
+        assert!(
+            matches!(post_input[0].kind, OpKind::VtableMethodPtr { .. }),
+            "expected VtableMethodPtr first, got {:?}",
+            post_input[0].kind
+        );
+        assert!(
+            matches!(post_input[1].kind, OpKind::Live),
+            "expected Live second, got {:?}",
+            post_input[1].kind
+        );
+        match &post_input[2].kind {
+            OpKind::GuardValue { kind_char: 'i', .. } => {}
+            other => panic!("expected GuardValue kind='i', got {other:?}"),
+        }
+        match &post_input[3].kind {
+            OpKind::CallResidual {
+                funcptr: CallFuncPtr::Value(_),
+                indirect_targets: Some(t),
+                ..
+            } => assert_eq!(t.lst.len(), 2, "both impls should be candidates"),
+            other => panic!(
+                "expected CallResidual with runtime funcptr + indirect_targets, got {other:?}"
+            ),
+        }
+        // jtransform.py:547 handle_residual_call(..., may_call_jitcodes=True)
+        // forces a trailing `-live-`.
+        assert!(
+            matches!(post_input[4].kind, OpKind::Live),
+            "expected trailing Live, got {:?}",
+            post_input[4].kind
+        );
+    }
+
+    /// End-to-end smoke: after the rtyper-equivalent `lower_indirect_calls`
+    /// pass + `Transformer::transform`, the `CallResidual.indirect_targets`
+    /// payload carries exactly one `JitCodeHandle` per candidate impl
+    /// (each shell allocated by `CallControl::get_jitcode`). The assembler
+    /// later merges these handles into `Assembler.indirectcalltargets`
+    /// (RPython `assembler.py:208-209`).
+    #[test]
+    fn indirectcalltargets_reach_call_residual_payload() {
+        use crate::call::CallControl;
+        use crate::translator::rtyper::legacy_annotator::annotate;
+        use crate::translator::rtyper::legacy_resolve::resolve_types;
+        use crate::translator::rtyper::rpbc::lower_indirect_calls;
+
+        let mut cc = CallControl::new();
+        cc.register_trait_method(
+            "run",
+            Some("Handler"),
+            "A",
+            build_handler_run_impl_graph("A::run"),
+        );
+        cc.register_trait_method(
+            "run",
+            Some("Handler"),
+            "B",
+            build_handler_run_impl_graph("B::run"),
+        );
+        cc.find_all_graphs_for_tests();
+
+        let mut graph = FunctionGraph::new("outer");
+        let receiver = graph
+            .push_op(
+                graph.startblock,
+                OpKind::Input {
+                    name: "handler".to_string(),
+                    ty: ValueType::Unknown,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op(
+            graph.startblock,
+            OpKind::Call {
+                target: CallTarget::indirect("Handler", "run"),
+                args: vec![receiver],
+                result_ty: ValueType::Void,
+            },
+            true,
+        );
+        graph.set_return(graph.startblock, None);
+
+        let annotations = annotate(&graph);
+        let mut type_state = resolve_types(&graph, &annotations);
+        lower_indirect_calls(&mut graph, &mut type_state, &cc);
+
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .with_type_state(&type_state);
+        let result = transformer.transform(&graph);
+
+        let residual = result
+            .graph
+            .block(graph.startblock)
+            .operations
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::CallResidual {
+                    indirect_targets, ..
+                } => indirect_targets.clone(),
+                _ => None,
+            })
+            .expect("residual call with indirect_targets");
+
+        assert_eq!(residual.lst.len(), 2);
+        // `IndirectCallTargets.lst` carries shell handles returned by
+        // `CallControl::get_jitcode()`. RPython appends/indices jitcodes
+        // only after `transform_graph_to_jitcode(...)` completes, so the
+        // candidate handles must still be unindexed at this stage.
+        assert!(
+            residual.lst.iter().all(|h| h.try_index().is_none()),
+            "indirect target shells should not have final all_jitcodes indices yet"
+        );
+    }
+
+    // ── Kind matrix: `indirect_regular_call_{r,ir,irf}_{i,r,f,v}` ────
+    //
+    // RPython upstream: `test_jtransform.py:340-367` parameterization +
+    // `test_jtransform.py:447-484 indirect_regular_call_test`.  Each
+    // test builds a `receiver.m(extras...)` site where `extras` covers
+    // the arg kind signature (`r`, `ir`, `irf`) and `result_ty` covers
+    // the result kind (`i`, `r`, `f`, `v`).  The emitted `CallResidual`
+    // must split args into `(args_i, args_r, args_f)` by kind — with
+    // the receiver always landing in `args_r` — and carry `result_kind`
+    // matching the call's `result_ty`.  Receiver-in-args mirrors RPython
+    // `rpbc.py:1195-1208 MethodsPBCRepr.redispatch_call`.
+
+    /// Runs the full rtyper-equivalent + jtransform pipeline for a
+    /// `receiver.m(extras...)` dyn-Trait call and asserts the emitted
+    /// op sequence is exactly
+    /// `[VtableMethodPtr, Live, GuardValue{'i'}, CallResidual, Live]`,
+    /// with the CallResidual's arg-kind distribution matching `expect`
+    /// and `result_kind` matching `expect_res_kind`.  Two impls are
+    /// registered so `CallKind::Regular` is selected.
+    #[cfg(test)]
+    fn check_indirect_regular_call_kind(
+        extras: &[ValueType],
+        result_ty: ValueType,
+        expect: (usize, usize, usize),
+        expect_res_kind: char,
+    ) {
+        use crate::call::CallControl;
+        use crate::translator::rtyper::legacy_annotator::annotate;
+        use crate::translator::rtyper::legacy_resolve::resolve_types;
+        use crate::translator::rtyper::rpbc::lower_indirect_calls;
+
+        let build_impl = |name: &str| {
+            let mut g = FunctionGraph::new(name);
+            g.push_op(
+                g.startblock,
+                OpKind::Input {
+                    name: "self".into(),
+                    ty: ValueType::Ref,
+                },
+                true,
+            )
+            .unwrap();
+            for (i, ty) in extras.iter().enumerate() {
+                g.push_op(
+                    g.startblock,
+                    OpKind::Input {
+                        name: format!("a{i}"),
+                        ty: ty.clone(),
+                    },
+                    true,
+                )
+                .unwrap();
+            }
+            g.set_return(g.startblock, None);
+            g
+        };
+
+        let mut cc = CallControl::new();
+        cc.register_trait_method("m", Some("T"), "A", build_impl("A::m"));
+        cc.register_trait_method("m", Some("T"), "B", build_impl("B::m"));
+        // The indirect branch of `getcalldescr(op)` validates that the
+        // caller's `result_type` matches the witness impl's declared
+        // return type (`call.rs` indirect-arm signature check).  Inject
+        // matching strings so the non-void kind-matrix cases resolve
+        // without panicking.
+        let return_str = match result_ty {
+            ValueType::Int | ValueType::State => "i64",
+            ValueType::Unsigned => "u64",
+            ValueType::Ref | ValueType::Unknown => "String",
+            ValueType::Float => "f64",
+            ValueType::Void => "",
+            ValueType::Bool => "bool",
+        };
+        if !return_str.is_empty() {
+            cc.return_types.insert(
+                crate::parse::CallPath::for_impl_method("A", "m"),
+                return_str.to_string(),
+            );
+            cc.return_types.insert(
+                crate::parse::CallPath::for_impl_method("B", "m"),
+                return_str.to_string(),
+            );
+        }
+        cc.find_all_graphs_for_tests();
+
+        let mut graph = FunctionGraph::new("outer");
+        let receiver = graph
+            .push_op(
+                graph.startblock,
+                OpKind::Input {
+                    name: "self".into(),
+                    ty: ValueType::Ref,
+                },
+                true,
+            )
+            .unwrap();
+        let mut args = vec![receiver];
+        for (i, ty) in extras.iter().enumerate() {
+            args.push(
+                graph
+                    .push_op(
+                        graph.startblock,
+                        OpKind::Input {
+                            name: format!("a{i}"),
+                            ty: ty.clone(),
+                        },
+                        true,
+                    )
+                    .unwrap(),
+            );
+        }
+        let has_result = !matches!(result_ty, ValueType::Void);
+        graph.push_op(
+            graph.startblock,
+            OpKind::Call {
+                target: CallTarget::indirect("T", "m"),
+                args,
+                result_ty,
+            },
+            has_result,
+        );
+        graph.set_return(graph.startblock, None);
+
+        let annotations = annotate(&graph);
+        let mut type_state = resolve_types(&graph, &annotations);
+        lower_indirect_calls(&mut graph, &mut type_state, &cc);
+
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .with_type_state(&type_state);
+        let result = transformer.transform(&graph);
+
+        let ops = &result.graph.block(graph.startblock).operations;
+        let post_input: Vec<_> = ops
+            .iter()
+            .filter(|op| !matches!(&op.kind, OpKind::Input { .. }))
+            .collect();
+
+        assert!(
+            matches!(post_input[0].kind, OpKind::VtableMethodPtr { .. }),
+            "expected VtableMethodPtr first, got {:?}",
+            post_input[0].kind,
+        );
+        assert!(
+            matches!(post_input[1].kind, OpKind::Live),
+            "expected Live second, got {:?}",
+            post_input[1].kind,
+        );
+        assert!(
+            matches!(
+                post_input[2].kind,
+                OpKind::GuardValue { kind_char: 'i', .. }
+            ),
+            "expected GuardValue kind_char='i', got {:?}",
+            post_input[2].kind,
+        );
+        match &post_input[3].kind {
+            OpKind::CallResidual {
+                funcptr: CallFuncPtr::Value(_),
+                args_i,
+                args_r,
+                args_f,
+                result_kind,
+                indirect_targets: Some(t),
+                ..
+            } => {
+                assert_eq!(args_i.len(), expect.0, "args_i count");
+                assert_eq!(args_r.len(), expect.1, "args_r count (receiver counted)");
+                assert_eq!(args_f.len(), expect.2, "args_f count");
+                assert_eq!(*result_kind, expect_res_kind, "result_kind");
+                assert_eq!(t.lst.len(), 2, "both impls in family");
+            }
+            other => {
+                panic!("expected CallResidual with Value funcptr + indirect_targets, got {other:?}")
+            }
+        }
+        assert!(
+            matches!(post_input[4].kind, OpKind::Live),
+            "expected trailing Live (may_call_jitcodes=true), got {:?}",
+            post_input[4].kind,
+        );
+    }
+
+    #[test]
+    fn indirect_regular_call_r_i() {
+        check_indirect_regular_call_kind(&[], ValueType::Int, (0, 1, 0), 'i');
+    }
+    #[test]
+    fn indirect_regular_call_r_r() {
+        check_indirect_regular_call_kind(&[], ValueType::Ref, (0, 1, 0), 'r');
+    }
+    #[test]
+    fn indirect_regular_call_r_f() {
+        check_indirect_regular_call_kind(&[], ValueType::Float, (0, 1, 0), 'f');
+    }
+    #[test]
+    fn indirect_regular_call_r_v() {
+        check_indirect_regular_call_kind(&[], ValueType::Void, (0, 1, 0), 'v');
+    }
+
+    #[test]
+    fn indirect_regular_call_ir_i() {
+        check_indirect_regular_call_kind(&[ValueType::Int], ValueType::Int, (1, 1, 0), 'i');
+    }
+    #[test]
+    fn indirect_regular_call_ir_r() {
+        check_indirect_regular_call_kind(&[ValueType::Int], ValueType::Ref, (1, 1, 0), 'r');
+    }
+    #[test]
+    fn indirect_regular_call_ir_f() {
+        check_indirect_regular_call_kind(&[ValueType::Int], ValueType::Float, (1, 1, 0), 'f');
+    }
+    #[test]
+    fn indirect_regular_call_ir_v() {
+        check_indirect_regular_call_kind(&[ValueType::Int], ValueType::Void, (1, 1, 0), 'v');
+    }
+
+    #[test]
+    fn indirect_regular_call_irf_i() {
+        check_indirect_regular_call_kind(
+            &[ValueType::Int, ValueType::Float],
+            ValueType::Int,
+            (1, 1, 1),
+            'i',
+        );
+    }
+    #[test]
+    fn indirect_regular_call_irf_r() {
+        check_indirect_regular_call_kind(
+            &[ValueType::Int, ValueType::Float],
+            ValueType::Ref,
+            (1, 1, 1),
+            'r',
+        );
+    }
+    #[test]
+    fn indirect_regular_call_irf_f() {
+        check_indirect_regular_call_kind(
+            &[ValueType::Int, ValueType::Float],
+            ValueType::Float,
+            (1, 1, 1),
+            'f',
+        );
+    }
+    #[test]
+    fn indirect_regular_call_irf_v() {
+        check_indirect_regular_call_kind(
+            &[ValueType::Int, ValueType::Float],
+            ValueType::Void,
+            (1, 1, 1),
+            'v',
+        );
+    }
+
+    // ── Kind matrix: `indirect_residual_call_{r,ir,irf}_{i,r,f,v}` ───
+    //
+    // RPython upstream: `test_jtransform.py:420-445 indirect_residual_call_test`.
+    // `handle_residual_indirect_call` is an alias for the regular
+    // residual-call path (`jtransform.py:536`): no `int_guard_value` guard
+    // and no `IndirectCallTargets` sidecar; only `[residual_call_*, -live-]`.
+    // On the pyre side we additionally retain the `VtableMethodPtr` op
+    // emitted by `lower_indirect_calls` — the rtyper-equivalent layer runs
+    // unconditionally and provides the runtime funcptr ValueId consumed
+    // by the `CallResidual.funcptr` operand.
+
+    /// Same skeleton as `check_indirect_regular_call_kind` but drops
+    /// `find_all_graphs_for_tests`, so `candidate_graphs` stays empty
+    /// and `guess_call_kind(op)` falls through to `CallKind::Residual`
+    /// via the `graphs_from(op)` call.py:137-139 fall-through.
+    /// Emit is `[VtableMethodPtr, CallResidual{indirect_targets: None},
+    /// Live?]` — the trailing `-live-` appears only when the descriptor's
+    /// `can_raise` is true, which is the default for non-elidable
+    /// family calls.
+    #[cfg(test)]
+    fn check_indirect_residual_call_kind(
+        extras: &[ValueType],
+        result_ty: ValueType,
+        expect: (usize, usize, usize),
+        expect_res_kind: char,
+    ) {
+        use crate::call::CallControl;
+        use crate::translator::rtyper::legacy_annotator::annotate;
+        use crate::translator::rtyper::legacy_resolve::resolve_types;
+        use crate::translator::rtyper::rpbc::lower_indirect_calls;
+
+        let build_impl = |name: &str| {
+            let mut g = FunctionGraph::new(name);
+            g.push_op(
+                g.startblock,
+                OpKind::Input {
+                    name: "self".into(),
+                    ty: ValueType::Ref,
+                },
+                true,
+            )
+            .unwrap();
+            for (i, ty) in extras.iter().enumerate() {
+                g.push_op(
+                    g.startblock,
+                    OpKind::Input {
+                        name: format!("a{i}"),
+                        ty: ty.clone(),
+                    },
+                    true,
+                )
+                .unwrap();
+            }
+            g.set_return(g.startblock, None);
+            g
+        };
+
+        let mut cc = CallControl::new();
+        cc.register_trait_method("m", Some("T"), "A", build_impl("A::m"));
+        cc.register_trait_method("m", Some("T"), "B", build_impl("B::m"));
+        let return_str = match result_ty {
+            ValueType::Int | ValueType::State => "i64",
+            ValueType::Unsigned => "u64",
+            ValueType::Ref | ValueType::Unknown => "String",
+            ValueType::Float => "f64",
+            ValueType::Void => "",
+            ValueType::Bool => "bool",
+        };
+        if !return_str.is_empty() {
+            cc.return_types.insert(
+                crate::parse::CallPath::for_impl_method("A", "m"),
+                return_str.to_string(),
+            );
+            cc.return_types.insert(
+                crate::parse::CallPath::for_impl_method("B", "m"),
+                return_str.to_string(),
+            );
+        }
+        // NOTE: intentionally *no* `find_all_graphs_for_tests` — that keeps
+        // `candidate_graphs` empty so `guess_call_kind(op)` classifies
+        // this call as `CallKind::Residual` via the call.py:137-139
+        // `graphs_from(op) is None` fall-through.
+
+        let mut graph = FunctionGraph::new("outer");
+        let receiver = graph
+            .push_op(
+                graph.startblock,
+                OpKind::Input {
+                    name: "self".into(),
+                    ty: ValueType::Ref,
+                },
+                true,
+            )
+            .unwrap();
+        let mut args = vec![receiver];
+        for (i, ty) in extras.iter().enumerate() {
+            args.push(
+                graph
+                    .push_op(
+                        graph.startblock,
+                        OpKind::Input {
+                            name: format!("a{i}"),
+                            ty: ty.clone(),
+                        },
+                        true,
+                    )
+                    .unwrap(),
+            );
+        }
+        let has_result = !matches!(result_ty, ValueType::Void);
+        graph.push_op(
+            graph.startblock,
+            OpKind::Call {
+                target: CallTarget::indirect("T", "m"),
+                args,
+                result_ty,
+            },
+            has_result,
+        );
+        graph.set_return(graph.startblock, None);
+
+        let annotations = annotate(&graph);
+        let mut type_state = resolve_types(&graph, &annotations);
+        lower_indirect_calls(&mut graph, &mut type_state, &cc);
+
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .with_type_state(&type_state);
+        let result = transformer.transform(&graph);
+
+        let ops = &result.graph.block(graph.startblock).operations;
+        let post_input: Vec<_> = ops
+            .iter()
+            .filter(|op| !matches!(&op.kind, OpKind::Input { .. }))
+            .collect();
+
+        assert!(
+            matches!(post_input[0].kind, OpKind::VtableMethodPtr { .. }),
+            "expected VtableMethodPtr first, got {:?}",
+            post_input[0].kind,
+        );
+        // Residual path must NOT emit the [Live, GuardValue] prefix —
+        // upstream `jtransform.py:536` aliases
+        // `handle_residual_indirect_call = handle_residual_call`.
+        assert!(
+            !post_input
+                .iter()
+                .any(|op| matches!(op.kind, OpKind::GuardValue { .. })),
+            "residual path must not emit int_guard_value, got ops: {:?}",
+            post_input.iter().map(|op| &op.kind).collect::<Vec<_>>(),
+        );
+        match &post_input[1].kind {
+            OpKind::CallResidual {
+                funcptr: CallFuncPtr::Value(_),
+                args_i,
+                args_r,
+                args_f,
+                result_kind,
+                indirect_targets: None,
+                ..
+            } => {
+                assert_eq!(args_i.len(), expect.0, "args_i count");
+                assert_eq!(args_r.len(), expect.1, "args_r count (receiver counted)");
+                assert_eq!(args_f.len(), expect.2, "args_f count");
+                assert_eq!(*result_kind, expect_res_kind, "result_kind");
+            }
+            other => panic!(
+                "expected CallResidual with Value funcptr + indirect_targets=None, got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn indirect_residual_call_r_i() {
+        check_indirect_residual_call_kind(&[], ValueType::Int, (0, 1, 0), 'i');
+    }
+    #[test]
+    fn indirect_residual_call_r_r() {
+        check_indirect_residual_call_kind(&[], ValueType::Ref, (0, 1, 0), 'r');
+    }
+    #[test]
+    fn indirect_residual_call_r_f() {
+        check_indirect_residual_call_kind(&[], ValueType::Float, (0, 1, 0), 'f');
+    }
+    #[test]
+    fn indirect_residual_call_r_v() {
+        check_indirect_residual_call_kind(&[], ValueType::Void, (0, 1, 0), 'v');
+    }
+
+    #[test]
+    fn indirect_residual_call_ir_i() {
+        check_indirect_residual_call_kind(&[ValueType::Int], ValueType::Int, (1, 1, 0), 'i');
+    }
+    #[test]
+    fn indirect_residual_call_ir_r() {
+        check_indirect_residual_call_kind(&[ValueType::Int], ValueType::Ref, (1, 1, 0), 'r');
+    }
+    #[test]
+    fn indirect_residual_call_ir_f() {
+        check_indirect_residual_call_kind(&[ValueType::Int], ValueType::Float, (1, 1, 0), 'f');
+    }
+    #[test]
+    fn indirect_residual_call_ir_v() {
+        check_indirect_residual_call_kind(&[ValueType::Int], ValueType::Void, (1, 1, 0), 'v');
+    }
+
+    #[test]
+    fn indirect_residual_call_irf_i() {
+        check_indirect_residual_call_kind(
+            &[ValueType::Int, ValueType::Float],
+            ValueType::Int,
+            (1, 1, 1),
+            'i',
+        );
+    }
+    #[test]
+    fn indirect_residual_call_irf_r() {
+        check_indirect_residual_call_kind(
+            &[ValueType::Int, ValueType::Float],
+            ValueType::Ref,
+            (1, 1, 1),
+            'r',
+        );
+    }
+    #[test]
+    fn indirect_residual_call_irf_f() {
+        check_indirect_residual_call_kind(
+            &[ValueType::Int, ValueType::Float],
+            ValueType::Float,
+            (1, 1, 1),
+            'f',
+        );
+    }
+    #[test]
+    fn indirect_residual_call_irf_v() {
+        check_indirect_residual_call_kind(
+            &[ValueType::Int, ValueType::Float],
+            ValueType::Void,
+            (1, 1, 1),
+            'v',
         );
     }
 }

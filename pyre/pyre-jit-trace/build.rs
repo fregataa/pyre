@@ -215,25 +215,31 @@ fn real_main() {
     let dispatch_bin = bincode::serialize(&pipeline.opcode_dispatch).unwrap();
     std::fs::write(format!("{out_dir}/opcode_dispatch.bin"), &dispatch_bin).unwrap();
 
-    // Phase D-2 prerequisite: persist `pipeline.insns` — the opname → u8
-    // table `Assembler.write_insn` grew during assembly. JitCode bytecode
-    // bytes are opaque without it (the mapping is assembler-local, not
-    // part of the serialized JitCode), so any runtime consumer that
-    // wants to decode `JitCode.code` (shadow dispatch, IR diffing)
-    // needs this side by side with opcode_jitcodes.bin. RPython
-    // equivalent: the table handed to `BlackholeInterpBuilder::setup_insns`
-    // at metainterp startup (pyjitpl.py:2227-2243).
+    // Phase D-2 prerequisite: persist the runtime opname → u8 table so
+    // `JitCode.code` (assembler-local mapping) decodes back to the
+    // canonical `(opname, argcodes)` shape at runtime (shadow dispatch,
+    // IR diffing).  RPython equivalent: the table handed to
+    // `BlackholeInterpBuilder::setup_insns` at metainterp startup
+    // (`pyjitpl.py:2227-2243`).
+    //
+    // RPython parity (`assembler.py:220 self.insns.setdefault(key,
+    // len(self.insns))`): the table is the assembler's emission-driven
+    // dict, populated by `write_insn` calls during graph flattening.
+    // Pyre's analog is `pipeline.insns`, snapshotted from
+    // `codewriter.assembler.insns()` after `make_jitcodes` finishes
+    // (`majit-translate/src/lib.rs:910`).  Each distinct key gets a
+    // fresh byte; the forward map is injective.  `blackhole.py:913`
+    // aliases the bhimpl handler under two Python attribute names
+    // (`bhimpl_goto_if_not_int_is_true = bhimpl_goto_if_not`) but
+    // does NOT register a second opname in `Assembler.insns`; the
+    // alias is at the dispatch-function-name level only.  Pyre
+    // therefore registers exactly one opname per byte; the runtime
+    // inverse (`byte → opname`) is 1:1 and panics on duplicate-byte
+    // collisions (`jitcode_runtime.rs:INSNS_BYTE_TO_OPNAME`).
     //
     // Serialize through a `BTreeMap` view so the byte output is stable
-    // across processes.  `pipeline.insns` is a `HashMap<String, u8>`
-    // and `bincode` walks it in iteration order; Rust's `HashMap` uses
-    // SipHash with a per-process random seed, which would otherwise
-    // make `opcode_insns.bin` byte-differ on each build.  RPython's
-    // equivalent (`assembler.py:220` `self.insns = {}`) is a Python
-    // dict with stable insertion-order iteration, so run-to-run
-    // stability is the expected behaviour.  Serde's map format is
-    // HashMap / BTreeMap compatible, so the runtime deserializer that
-    // receives a `HashMap<String, u8>` back is unaffected.
+    // across processes (Rust's `HashMap` SipHash makes raw iteration
+    // non-deterministic; RPython's Python dict is insertion-ordered).
     let insns_sorted: std::collections::BTreeMap<&String, &u8> = pipeline.insns.iter().collect();
     let insns_bin = bincode::serialize(&insns_sorted).unwrap();
     std::fs::write(format!("{out_dir}/opcode_insns.bin"), &insns_bin).unwrap();

@@ -1,10 +1,25 @@
-//! Type resolution pass.
+//! Legacy type resolution pass — transitional cutover input + reference.
 //!
-//! **LEGACY.** Flat `ConcreteType` enum with ad-hoc lowering.
-//! Line-by-line port of `rtyper/rtyper.py:RPythonTyper` +
-//! `rtyper/rmodel.py:Repr` hierarchy is landing at
-//! `majit-rtyper/src/{rtyper,rmodel}.rs` (roadmap Phase 6). This file
-//! is deleted at roadmap commit P8.11.
+//! TODO(retire-legacy-resolve): flat `ConcreteType` enum with ad-hoc
+//! lowering and no upstream `rpython/` counterpart — the orthodox port
+//! is [`crate::translator::rtyper::rtyper::RPythonTyper`]
+//! (`rtyper.py:RPythonTyper` + `rmodel.py:Repr` hierarchy), which
+//! produces per-`Variable.concretetype` `LowLevelType` directly.
+//!
+//! This file remains because:
+//!   * `dual_gate_check_with_registry`
+//!     ([`crate::translator::rtyper::cutover`]) still compares the real
+//!     path against `resolve_types(graph, &annotations)` for parity
+//!     diff, and
+//!   * `transform_graph_to_jitcode`
+//!     ([`crate::jit_codewriter::codewriter`]) calls
+//!     `resolve_rewritten_types(...)` to merge the post-jtransform
+//!     `result_kind` declarations with `merge_synth_kinds`, and falls
+//!     back to `legacy_state` (`resolve_types(graph, &annotations)`)
+//!     when the dual-gate Skip-classifies.
+//!
+//! Retirement drops both consumers and this file together once Skip
+//! categories close.
 //!
 //! Transforms annotated ValueTypes into concrete low-level types
 //! and specializes operations accordingly.
@@ -13,7 +28,10 @@ use std::collections::HashMap;
 
 use crate::flowspace::model::ConstValue;
 use crate::jit_codewriter::annotation_state::AnnotationState;
-use crate::jit_codewriter::type_state::{ConcreteType, TypeResolutionState};
+use crate::jit_codewriter::type_state::{
+    ConcreteType, TypeResolutionState, authoritative_result_types, kind_char_to_concrete,
+    valuetype_to_concrete,
+};
 use crate::model::{FunctionGraph, Link, LinkArg, OpKind, ValueId, ValueType};
 
 /// Resolve annotations to concrete types.
@@ -492,29 +510,12 @@ fn maybe_seed_concrete_type(
     }
 }
 
-fn kind_char_to_concrete(kind: char) -> ConcreteType {
-    match kind {
-        'i' => ConcreteType::Signed,
-        'r' => ConcreteType::GcRef,
-        'f' => ConcreteType::Float,
-        'v' => ConcreteType::Void,
-        _ => ConcreteType::Unknown,
-    }
-}
-
-fn valuetype_to_concrete(vt: &ValueType) -> ConcreteType {
-    match vt {
-        ValueType::Int => ConcreteType::Signed,
-        ValueType::Ref => ConcreteType::GcRef,
-        ValueType::Float => ConcreteType::Float,
-        ValueType::Void => ConcreteType::Void,
-        ValueType::State | ValueType::Unknown => ConcreteType::Unknown,
-    }
-}
-
 fn infer_concrete_from_op(kind: &OpKind) -> ConcreteType {
     match kind {
         OpKind::ConstInt(_) => ConcreteType::Signed,
+        // RPython `getkind(lltype.Bool) == 'int'` (flatten.py:getkind);
+        // codewriter folds Bool storage to int kind.
+        OpKind::ConstBool(_) => ConcreteType::Signed,
         OpKind::ConstFloat(_) => ConcreteType::Float,
         // RPython `rpython/annotator/annrpython.py` types every Variable
         // at annotation time, so `OpKind::Input` reaching rtyper has a
@@ -616,65 +617,13 @@ fn infer_concrete_from_op(kind: &OpKind) -> ConcreteType {
     }
 }
 
-fn authoritative_result_types(graph: &FunctionGraph) -> HashMap<ValueId, ConcreteType> {
-    let mut result = HashMap::new();
-    for block in &graph.blocks {
-        for op in &block.operations {
-            let Some(value) = op.result else {
-                continue;
-            };
-            if let Some(concrete) = authoritative_result_type_from_op(&op.kind) {
-                result.insert(value, concrete);
-            }
-        }
-    }
-    result
-}
-
-fn concrete_if_known(concrete: ConcreteType) -> Option<ConcreteType> {
-    if concrete == ConcreteType::Unknown {
-        None
-    } else {
-        Some(concrete)
-    }
-}
-
-fn authoritative_result_type_from_op(kind: &OpKind) -> Option<ConcreteType> {
-    match kind {
-        OpKind::ConstInt(_) => Some(ConcreteType::Signed),
-        OpKind::ConstFloat(_) => Some(ConcreteType::Float),
-        OpKind::Input { ty, .. } => concrete_if_known(valuetype_to_concrete(ty)),
-        OpKind::FieldRead { ty, .. } | OpKind::VableFieldRead { ty, .. } => {
-            concrete_if_known(valuetype_to_concrete(ty))
-        }
-        OpKind::ArrayRead { item_ty, .. }
-        | OpKind::InteriorFieldRead { item_ty, .. }
-        | OpKind::VableArrayRead { item_ty, .. } => {
-            concrete_if_known(valuetype_to_concrete(item_ty))
-        }
-        OpKind::Call { result_ty, .. }
-        | OpKind::IndirectCall { result_ty, .. }
-        | OpKind::BinOp { result_ty, .. }
-        | OpKind::UnaryOp { result_ty, .. } => concrete_if_known(valuetype_to_concrete(result_ty)),
-        OpKind::CallElidable { result_kind, .. }
-        | OpKind::CallResidual { result_kind, .. }
-        | OpKind::CallMayForce { result_kind, .. }
-        | OpKind::InlineCall { result_kind, .. }
-        | OpKind::RecursiveCall { result_kind, .. } => {
-            concrete_if_known(kind_char_to_concrete(*result_kind))
-        }
-        OpKind::VtableMethodPtr { .. } => Some(ConcreteType::Signed),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::{
         ExitSwitch, FunctionGraph, Link, LinkArg, OpKind, ValueType, exception_exitcase,
     };
-    use crate::translate_legacy::annotator::annrpython as annotate;
+    use crate::translator::rtyper::legacy_annotator as annotate;
 
     #[test]
     fn resolves_int_types() {

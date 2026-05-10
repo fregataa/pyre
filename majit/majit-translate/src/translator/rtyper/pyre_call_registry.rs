@@ -1,0 +1,684 @@
+//! Pyre-side `FunctionPath → (HostObject, FunctionDesc)` registry.
+//!
+//! ## Role
+//!
+//! Upstream RPython's `rpython/annotator/bookkeeper.py:353-409
+//! Bookkeeper.getdesc` looks up or creates a `FunctionDesc` keyed by
+//! Python object identity (`id(pyobj)`).  The bookkeeper hosts the
+//! `descs: dict[id, Desc]` map so any annotator pass can resolve a
+//! `Constant(<function foo>)` argument in `simple_call` to the
+//! `FunctionDesc` carrying `foo`'s signature, defaults, specializer,
+//! and per-graph cache.
+//!
+//! Pyre's surface DSL has no Python callable objects — pyre's
+//! frontend produces `OpKind::Call { target: CallTarget::FunctionPath
+//! { segments }, .. }` (`crate::model`) carrying only the symbolic
+//! path.  The line-by-line port wraps each pyre callee in a
+//! synthetic `HostObject::UserFunction { graph_func }` whose
+//! `(host_object, function_desc)` pair is pre-registered in
+//! `Bookkeeper.descs` keyed by the host's Arc identity.  When
+//! `getdesc` later looks up the host object, it short-circuits at
+//! the cache lookup at upstream `bookkeeper.py:362-364`
+//! (`try: return self.descs[obj_key]; except KeyError: ...`) and
+//! returns the pre-built FunctionDesc instead of falling through to
+//! `newfuncdesc`.  Without the pre-register, `newfuncdesc` would
+//! call `cpython_code_signature(pyfunc.__code__)`
+//! (`bookkeeper.py:418`) and fail on the synthetic GraphFunc that
+//! has no `code` slot — the `Signature(["entry"])` upstream branch
+//! at `bookkeeper.py:413-416` is reserved for the
+//! `_generator_next_method_of_` special case, not a general
+//! signature fallback.
+//!
+//! ## Module ownership
+//!
+//! This module owns the surface for pyre's `FunctionPath`-keyed
+//! callable identity:
+//!
+//! - The synthetic GraphFunc + HostObject construction (one Arc
+//!   identity per FunctionPath).
+//! - The FunctionDesc construction with pyre's authoritative
+//!   `Signature`.
+//! - The `bookkeeper.descs` pre-registration so any subsequent
+//!   `getdesc(host_object)` hits the cache.
+//! - The `FunctionDesc.cache` pre-fill (via `prefill_default_cache`)
+//!   so the rtyper's `cachedgraph` returns the lifted leaf
+//!   `PyGraph` and skips `buildflowgraph` (which requires a real
+//!   Python `__code__` body).
+//! - The path → entry cache so repeat lookups (and the
+//!   `translate_op` consumer) share one `Hlvalue::Constant` identity
+//!   across all callsites of the same path.
+//!
+//! ## Position vs `Bookkeeper`
+//!
+//! The registry lives in `translator/rtyper/` rather than folded
+//! into the upstream-mirrored `Bookkeeper` because pyre lacks the
+//! `id(pyobj)` keying mechanism upstream uses; the
+//! `FunctionPathKey`-keyed map is a peer to `Bookkeeper.descs`,
+//! not a replacement.  Each `get_or_register` call writes the
+//! resulting entry into `Bookkeeper.descs` so `getdesc(host_object)`
+//! and the rtyper's downstream chain
+//! (`pair_simple_call → FunctionDesc.specialize → cachedgraph →
+//! FunctionRepr.call`) all see the registry's entries.
+
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
+
+use crate::annotator::bookkeeper::Bookkeeper;
+use crate::annotator::description::{DescEntry, FunctionDesc, GraphCacheKey};
+use crate::flowspace::argument::Signature;
+use crate::flowspace::model::{ConstValue, Constant, GraphFunc, HostObject};
+use crate::flowspace::pygraph::PyGraph;
+use crate::model::ValueId;
+use crate::translator::rtyper::flowspace_adapter::ValueIdToVariable;
+use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+
+/// Stable hashable key for a function path.
+///
+/// Pyre's `CallTarget::FunctionPath { segments }` uses `Vec<String>`;
+/// the registry keys directly off that vector so equal paths share
+/// the same entry without an intermediate hash truncation.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct FunctionPathKey(pub Vec<String>);
+
+impl FunctionPathKey {
+    pub fn from_segments<I, S>(segments: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        FunctionPathKey(segments.into_iter().map(Into::into).collect())
+    }
+
+    pub fn segments(&self) -> &[String] {
+        &self.0
+    }
+
+    /// Last segment, or empty string when the path is empty.
+    /// Used as the synthetic GraphFunc / FunctionDesc display name.
+    pub fn name(&self) -> &str {
+        self.0.last().map(|s| s.as_str()).unwrap_or("")
+    }
+}
+
+/// Per-path registry entry.  Each entry owns:
+///
+/// - `host_object` — synthetic `HostObject::UserFunction` whose Arc
+///   identity is the canonical callable token for the path.  Slice
+///   A.3c's `translate_op` wraps a clone of this in
+///   `Hlvalue::Constant { value: ConstValue::HostObject(host_object),
+///   ... }`.
+/// - `function_desc` — `FunctionDesc` carrying pyre's authoritative
+///   `Signature`.  Pre-registered in `bookkeeper.descs` keyed by
+///   `host_object`'s Arc identity so `Bookkeeper::getdesc(host_object)`
+///   short-circuits at the cache.
+pub struct PyreFunctionEntry {
+    pub host_object: HostObject,
+    pub function_desc: Rc<RefCell<FunctionDesc>>,
+}
+
+impl PyreFunctionEntry {
+    /// Pre-fill the entry's `FunctionDesc.cache` for the default
+    /// specializer with no `*args` (the lookup key
+    /// `Specializer::Default + flatten_star_args(no vararg) ->
+    /// GraphCacheKey::None` produced by `default_specialize` at
+    /// `description.rs:1304-1351`).
+    ///
+    /// `cachedgraph` (`description.rs:1037-1039`) returns the cached
+    /// `Rc<PyGraph>` immediately when the key hits, so the
+    /// `buildgraph` path that requires a real `HostCode` body
+    /// (`description.rs:1147-1169`) is skipped — pyre's synthetic
+    /// `GraphFunc` has no `HostCode` and would fail there.
+    ///
+    /// The producer (Slice A.4 follow-on, or a test fixture) is
+    /// responsible for constructing `pygraph` from pyre's
+    /// `model::FunctionGraph` for this callee — see
+    /// `cutover::lift_callee_to_pygraph`.
+    pub fn prefill_default_cache(&self, pygraph: Rc<PyGraph>) {
+        self.function_desc
+            .borrow()
+            .cache
+            .borrow_mut()
+            .insert(GraphCacheKey::None, pygraph);
+    }
+}
+
+/// Per-program registry. Constructed once per `analyze_program` /
+/// `specialize_legacy_graph_with_registry` driver invocation; shares
+/// its `Bookkeeper` with the `RPythonAnnotator` so pre-registered
+/// entries are visible to the rtyper's `getdesc` lookup.
+///
+/// `entries` is the canonical `FunctionPathKey → Rc<PyreFunctionEntry>`
+/// table — one row per distinct callable identity.  Mirrors RPython
+/// `Bookkeeper.descs[Constant(pyobj)] = Desc` (`bookkeeper.py:353-409`),
+/// where the dict is keyed by Python function-object identity and
+/// holds at most one `FunctionDesc` per callable.
+///
+/// `aliases` carries the alternate-spelling indirection (free function
+/// registered under both `a::foo` and `crate::a::foo` keys).  Each
+/// alias maps to the canonical `FunctionPathKey` whose entry the
+/// caller wants.  Splitting this from `entries` keeps
+/// [`Self::len`] (and any future canonical-entries iterator) free of
+/// double-counting: the canonical entry appears exactly once even
+/// when N aliases point at it.  RPython has no equivalent indirection
+/// because Python callable identity gives `Bookkeeper.getdesc` direct
+/// dedup; pyre's segment-key storage stands in for that until host
+/// callable identity is available.
+pub struct PyreCallRegistry {
+    bookkeeper: Rc<Bookkeeper>,
+    entries: RefCell<HashMap<FunctionPathKey, Rc<PyreFunctionEntry>>>,
+    aliases: RefCell<HashMap<FunctionPathKey, FunctionPathKey>>,
+    /// Lazily-constructed `(RPythonAnnotator, RPythonTyper)` pair
+    /// shared by every per-session
+    /// `specialize_legacy_graph_with_registry_seed` call against this
+    /// registry.  RPython parity: `Translator.buildannotator()` /
+    /// `:buildrtyper()` (`translator.py:73-83`) construct exactly one
+    /// of each per Translator, and `RPythonTyper.specialize` runs
+    /// exactly once per Translator (`driver.py:345`).  The per-graph
+    /// subject is added through `addpendingblock` and rtyped via
+    /// `specialize_more_blocks` (rtyper.py:198-241), which only
+    /// touches blocks not yet in `already_seen`.
+    session: RefCell<
+        Option<(
+            Rc<crate::annotator::annrpython::RPythonAnnotator>,
+            Rc<crate::translator::rtyper::rtyper::RPythonTyper>,
+        )>,
+    >,
+}
+
+impl PyreCallRegistry {
+    /// Construct an empty registry sharing `bookkeeper`.
+    pub fn new(bookkeeper: Rc<Bookkeeper>) -> Self {
+        PyreCallRegistry {
+            bookkeeper,
+            entries: RefCell::new(HashMap::new()),
+            aliases: RefCell::new(HashMap::new()),
+            session: RefCell::new(None),
+        }
+    }
+
+    /// Get-or-construct the shared `(annotator, rtyper)` pair.
+    ///
+    /// First call constructs both from `self.bookkeeper`; subsequent
+    /// calls return the cached pair, mirroring RPython's
+    /// `Translator.buildannotator()` / `:buildrtyper()` cache
+    /// (`translator.py:69-83 — assert self.annotator is None;
+    /// self.annotator = RPythonAnnotator(self, ...)`).  The
+    /// `RPythonTyper::initialize_exceptiondata()` setup runs on
+    /// construction so the first per-session caller does not need to
+    /// remember it.
+    pub fn ensure_session(
+        &self,
+    ) -> Result<
+        (
+            Rc<crate::annotator::annrpython::RPythonAnnotator>,
+            Rc<crate::translator::rtyper::rtyper::RPythonTyper>,
+        ),
+        crate::translator::rtyper::error::TyperError,
+    > {
+        if let Some((ann, rt)) = self.session.borrow().as_ref() {
+            return Ok((ann.clone(), rt.clone()));
+        }
+        // Mirror `TranslationContext.buildannotator()` /
+        // `buildrtyper()` (`translator.py:69-83`) which both
+        // construct the slot value and assign it onto the
+        // context (`self.annotator = ...`, `self.rtyper = ...`).
+        //
+        // We cannot call `tc.buildannotator()` directly here because
+        // pyre shares the registry-owned `Bookkeeper` with the
+        // annotator (the registry pre-populates HostObjects /
+        // FunctionDescs) and `buildannotator()` always constructs a
+        // fresh bookkeeper.  TODO(buildannotator-bookkeeper-share):
+        // manual construction here mirrors the upstream sequence —
+        // assign `tc.annotator` / `tc.rtyper`
+        // through `set_annotator` / `set_rtyper` so any downstream
+        // caller observing `translator.annotator` /
+        // `translator.rtyper` (e.g. `rpbc.py` / `rclass.py` policy
+        // gating) sees the bound values.
+        let translator = std::rc::Rc::new(crate::translator::translator::TranslationContext::new());
+        let annotator = crate::annotator::annrpython::RPythonAnnotator::new_with_translator(
+            Some(std::rc::Rc::clone(&translator)),
+            None,
+            Some(self.bookkeeper.clone()),
+            false,
+        );
+        translator.set_annotator(std::rc::Rc::downgrade(&annotator));
+        let rtyper = std::rc::Rc::new(crate::translator::rtyper::rtyper::RPythonTyper::new(
+            &annotator,
+        ));
+        rtyper.initialize_exceptiondata()?;
+        // rtyper.py:182 — `self.exceptiondata.finish(self)` is the
+        // prologue of `RPythonTyper.specialize()`.  In pyre's
+        // incremental per-subject flow `specialize()` is not called as
+        // a single driver; per-subject `specialize_more_blocks()` runs
+        // instead (cutover.rs:specialize_legacy_graph_with_registry_
+        // seed).  `finish_exceptiondata` registers the standard
+        // exception class reprs once via `getclassrepr` (cached on
+        // `rtyper.instance_reprs`), so we hoist it into the session
+        // initializer here — the call is idempotent and must precede
+        // the first per-subject specialize so exception types are
+        // resolvable when block specialize hits a `raise` op.
+        rtyper.finish_exceptiondata()?;
+        translator.set_rtyper(rtyper.clone());
+        *self.session.borrow_mut() = Some((annotator.clone(), rtyper.clone()));
+        Ok((annotator, rtyper))
+    }
+
+    /// The bookkeeper backing this registry — exposed so
+    /// `specialize_legacy_graph_with_registry` can pass the same
+    /// bookkeeper to `RPythonAnnotator::new`, ensuring pre-registered
+    /// entries are visible to the rtyper's `getdesc` lookup.
+    pub fn bookkeeper(&self) -> &Rc<Bookkeeper> {
+        &self.bookkeeper
+    }
+
+    /// Look up an existing entry without creating one.  Returns
+    /// `None` when the path has not yet been registered.
+    ///
+    /// First checks the canonical `entries` map; if that misses,
+    /// resolves through `aliases` to the canonical key and re-reads.
+    /// Mirrors RPython `Bookkeeper.getdesc(pyobj)`'s "obj_key direct
+    /// lookup" plus alias indirection (`bookkeeper.py:362-364`).
+    pub fn lookup(&self, key: &FunctionPathKey) -> Option<Rc<PyreFunctionEntry>> {
+        if let Some(entry) = self.entries.borrow().get(key) {
+            return Some(entry.clone());
+        }
+        let canonical = self.aliases.borrow().get(key).cloned()?;
+        self.entries.borrow().get(&canonical).cloned()
+    }
+
+    /// Look up or insert. The first caller for a given path:
+    ///
+    /// 1. constructs a synthetic `GraphFunc` (`name` = `key.name()`,
+    ///    empty Dict `globals` matching upstream `Constant(dict)`'s
+    ///    "no globals attached" sentinel),
+    /// 2. wraps it in `HostObject::new_user_function` so
+    ///    `bookkeeper.getdesc` would dispatch through the
+    ///    `is_user_function()` arm (`bookkeeper.rs:955-956`),
+    /// 3. constructs `FunctionDesc::new(bookkeeper, Some(host),
+    ///    name, signature, None, None)` with pyre's authoritative
+    ///    parameter signature,
+    /// 4. inserts `DescEntry::Function(fd)` into `bookkeeper.descs`
+    ///    keyed by `host_object`'s Arc identity so any later
+    ///    `bookkeeper.getdesc(host_object)` short-circuits at the
+    ///    cache lookup at upstream `bookkeeper.py:362-364`
+    ///    (`try: return self.descs[obj_key]; except KeyError`).
+    ///
+    /// Subsequent callers receive the same `Rc<PyreFunctionEntry>`
+    /// (identity-cached, matching upstream `Bookkeeper.getdesc`'s
+    /// "create once, share thereafter" contract at
+    /// `bookkeeper.py:362-364`).
+    ///
+    /// Re-registration with a *different* `Signature` panics — upstream
+    /// `description.py:205 FunctionDesc.__init__` binds the signature
+    /// to the underlying Python function object once at creation time,
+    /// and a single `Constant(<function foo>)` cannot legally project
+    /// to two distinct `FunctionDesc.signature` values.  Pyre's
+    /// adapter must surface the conflict at the producer site rather
+    /// than silently route the second caller through the first
+    /// caller's signature.
+    pub fn get_or_register(
+        &self,
+        key: FunctionPathKey,
+        signature: Signature,
+    ) -> Rc<PyreFunctionEntry> {
+        if let Some(existing) = self.entries.borrow().get(&key) {
+            assert_eq!(
+                existing.function_desc.borrow().signature,
+                signature,
+                "PyreCallRegistry.get_or_register: conflicting signatures for \
+                 FunctionPath {:?} — upstream description.py:205 \
+                 FunctionDesc.__init__ binds the signature to the underlying \
+                 Python function object once at creation time, so a single \
+                 callable cannot legally project to two distinct signatures.",
+                key.segments(),
+            );
+            return existing.clone();
+        }
+        let name = key.name().to_string();
+        // upstream `description.py:193-203 FunctionDesc.__init__` reads
+        // the signature directly; pyre's authoritative signature comes
+        // from the `OpKind::Call` lowering site (function declaration's
+        // parameter list).
+        let graph_func = GraphFunc::new(
+            name.clone(),
+            // upstream `func.__globals__` defaults to an empty dict in
+            // `description.py` test fixtures; pyre's synthetic
+            // GraphFunc has no Python-runtime globals so we feed the
+            // sentinel directly.
+            Constant::new(ConstValue::Dict(HashMap::new())),
+        );
+        let host_object = HostObject::new_user_function(graph_func);
+        let function_desc = Rc::new(RefCell::new(FunctionDesc::new(
+            self.bookkeeper.clone(),
+            Some(host_object.clone()),
+            name,
+            signature,
+            None,
+            None,
+        )));
+        // Pre-register in bookkeeper.descs so the rtyper's
+        // getdesc(host_object) lookup short-circuits at the cache.
+        self.bookkeeper.descs.borrow_mut().insert(
+            host_object.clone(),
+            DescEntry::Function(function_desc.clone()),
+        );
+        let entry = Rc::new(PyreFunctionEntry {
+            host_object,
+            function_desc,
+        });
+        self.entries.borrow_mut().insert(key, entry.clone());
+        entry
+    }
+
+    /// Atomic register + cache prefill — the contract pyre callsites
+    /// actually require to reach the rtyper's `direct_call` chain
+    /// without falling through to upstream `description.py:1147-1169
+    /// buildgraph` (which delegates to
+    /// `translator.buildflowgraph(pyobj, false)` and would fail on
+    /// pyre's synthetic `GraphFunc`-without-`HostCode`).
+    ///
+    /// Bare `get_or_register` only inserts into `bookkeeper.descs`; a
+    /// caller that forgets the matching `prefill_default_cache` would
+    /// register the FunctionDesc but leave the `cachedgraph` lookup at
+    /// `description.rs:1037-1039` cold, causing `pair_simple_call` to
+    /// invoke `buildgraph` on the synthetic GraphFunc.  Upstream's
+    /// equivalent path (`Bookkeeper.getdesc(pyfunc) -> FunctionDesc`)
+    /// guarantees the FunctionDesc is paired with a real Python
+    /// `__code__` body that `buildflowgraph` can consume; pyre's port
+    /// has no analogue so the prefill is mandatory.  Producers should
+    /// prefer this entry over the two-step pair to avoid the trap.
+    ///
+    /// `pygraph` is the lifted leaf body (`cutover::lift_callee_to_pygraph`).
+    /// Re-registration with the same key replaces the cached pygraph
+    /// and asserts on signature equality (same contract as
+    /// [`Self::get_or_register`]).
+    pub fn register_callee(
+        &self,
+        key: FunctionPathKey,
+        signature: Signature,
+        pygraph: Rc<PyGraph>,
+    ) -> Rc<PyreFunctionEntry> {
+        let entry = self.get_or_register(key, signature);
+        entry.prefill_default_cache(pygraph);
+        entry
+    }
+
+    /// Register `alias_key` as an alternate spelling of `canonical_key`.
+    ///
+    /// RPython's `Bookkeeper.descs` is keyed by `Constant(<callable>)`
+    /// identity (`bookkeeper.py:353`) — the same Python function
+    /// object always yields the same `FunctionDesc` regardless of
+    /// which `crate::foo` / `foo` addressing alias the caller spelled.
+    /// Pyre's storage is keyed by `FunctionPathKey`, so when the
+    /// producer (`lib.rs::analyze_*`) registers a free function under
+    /// both its canonical path AND its `crate::`-prefixed alias, the
+    /// populator must point both keys at the *same* canonical entry
+    /// (otherwise the same callable acquires two `HostObject` Arc
+    /// identities and two `FunctionDesc`s, which breaks upstream's
+    /// "create once, share thereafter" contract at
+    /// `bookkeeper.py:362-364`).
+    ///
+    /// `canonical_key` MUST already be registered (typically via
+    /// [`Self::get_or_register`]).  Panics if the key is unknown, if
+    /// `alias_key` is itself a canonical entry, or if `alias_key`
+    /// already aliases to a different canonical key.
+    pub fn alias(&self, alias_key: FunctionPathKey, canonical_key: &FunctionPathKey) {
+        assert!(
+            self.entries.borrow().contains_key(canonical_key),
+            "PyreCallRegistry.alias: canonical key {:?} is not registered",
+            canonical_key.segments(),
+        );
+        assert!(
+            !self.entries.borrow().contains_key(&alias_key),
+            "PyreCallRegistry.alias: alias key {:?} is already a canonical entry",
+            alias_key.segments(),
+        );
+        if let Some(existing) = self.aliases.borrow().get(&alias_key) {
+            assert_eq!(
+                existing,
+                canonical_key,
+                "PyreCallRegistry.alias: alias key {:?} already maps to a different canonical key",
+                alias_key.segments(),
+            );
+            return;
+        }
+        self.aliases
+            .borrow_mut()
+            .insert(alias_key, canonical_key.clone());
+    }
+
+    /// Number of canonical entries — one row per distinct callable
+    /// identity.  Aliases do not count.  Diagnostic only.  Mirrors
+    /// `len(Bookkeeper.descs)` (`bookkeeper.py:353-409`).
+    pub fn len(&self) -> usize {
+        self.entries.borrow().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.borrow().is_empty()
+    }
+
+    // `cached_pygraphs()` retired at Step 3 (2026-05-07).  The only
+    // consumer was `seed_callee_blocks`, which itself was a
+    // workaround for the missing `simple_call_SomeObject` dispatch.
+    // RPython's annotator discovers callee bodies through `pycall ->
+    // recursivecall -> addpendingblock` (description.py:283-305,
+    // annrpython.py:315-336); pyre now matches that via Step 2's
+    // dispatch registration.  Callers that need a callee's PyGraph
+    // walk through `registry.lookup(key).function_desc.borrow().
+    // cache.borrow()` directly.
+
+    // The `value_to_var_by_key` and `constant_concretetypes_by_key`
+    // side maps were retired at Issue 2.5 (2026-05-07).  They were
+    // populated by `cutover::register_callees` / `populate_call_
+    // registry_from_program` but had no production reader — the only
+    // consumers were per-test invariants asserting the side-table
+    // contents.  RPython parity: `Variable.concretetype` and
+    // `Constant.concretetype` carry the per-variable / per-constant
+    // LL type after specialise (`history.py:204` `same_constant`,
+    // `model.py:438`); a parallel `FunctionPathKey -> ValueId` side
+    // map was a pyre-only divergence with no upstream peer.  Real
+    // readers must consult `Variable.concretetype` directly through
+    // the `PyGraph.graph` already cached on the `PyreFunctionEntry.
+    // function_desc.cache`.
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::flowspace::model::Variable;
+
+    fn signature(arg_names: &[&str]) -> Signature {
+        Signature::new(
+            arg_names.iter().map(|s| s.to_string()).collect(),
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn lookup_returns_none_for_unregistered_path() {
+        let bk = Rc::new(Bookkeeper::new());
+        let registry = PyreCallRegistry::new(bk);
+        assert!(
+            registry
+                .lookup(&FunctionPathKey::from_segments(["foo"]))
+                .is_none(),
+            "unregistered path must return None"
+        );
+        assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn get_or_register_constructs_entry_with_function_desc_and_host_object() {
+        let bk = Rc::new(Bookkeeper::new());
+        let registry = PyreCallRegistry::new(bk);
+        let key = FunctionPathKey::from_segments(["foo"]);
+        let entry = registry.get_or_register(key.clone(), signature(&["x"]));
+        assert_eq!(
+            entry.function_desc.borrow().name,
+            "foo",
+            "FunctionDesc must carry the registered name"
+        );
+        assert_eq!(
+            entry.function_desc.borrow().signature.argnames,
+            vec!["x".to_string()],
+            "FunctionDesc must carry the registered Signature"
+        );
+        assert!(
+            entry.host_object.is_user_function(),
+            "registered HostObject must be a UserFunction so getdesc routes \
+             through the is_user_function() arm (bookkeeper.rs:955-956)"
+        );
+        assert_eq!(registry.len(), 1);
+    }
+
+    #[test]
+    fn get_or_register_preregisters_function_desc_in_bookkeeper_descs() {
+        let bk = Rc::new(Bookkeeper::new());
+        let registry = PyreCallRegistry::new(bk.clone());
+        let entry =
+            registry.get_or_register(FunctionPathKey::from_segments(["foo"]), signature(&["x"]));
+        // Direct cache lookup — Bookkeeper.descs[host_object] must
+        // be DescEntry::Function(entry.function_desc).
+        let descs = bk.descs.borrow();
+        let cached = descs
+            .get(&entry.host_object)
+            .expect("registry must pre-insert the entry under host_object's Arc identity");
+        match cached {
+            DescEntry::Function(fd) => {
+                assert!(
+                    Rc::ptr_eq(fd, &entry.function_desc),
+                    "bookkeeper.descs entry must point at the same FunctionDesc Rc the \
+                     registry returned, so getdesc identity-cache parity holds"
+                );
+            }
+            other => panic!("expected DescEntry::Function, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bookkeeper_getdesc_short_circuits_on_pre_registered_host_object() {
+        let bk = Rc::new(Bookkeeper::new());
+        let registry = PyreCallRegistry::new(bk.clone());
+        let entry =
+            registry.get_or_register(FunctionPathKey::from_segments(["foo"]), signature(&["x"]));
+        // The headline parity claim: bookkeeper.getdesc(host_object)
+        // returns the pre-registered FunctionDesc rather than
+        // dispatching through newfuncdesc.  Without the pre-register,
+        // newfuncdesc would build a default-Signature(["entry"]) FD
+        // because the synthetic GraphFunc has no HostCode.
+        let resolved = bk
+            .getdesc(&entry.host_object)
+            .expect("pre-registered host_object must resolve via cache short-circuit");
+        let fd = resolved.as_function().expect("resolves to FunctionDesc");
+        assert!(
+            Rc::ptr_eq(&fd, &entry.function_desc),
+            "getdesc must return the same FunctionDesc the registry registered"
+        );
+        assert_eq!(
+            fd.borrow().signature.argnames,
+            vec!["x".to_string()],
+            "the cached FunctionDesc must carry pyre's authoritative argnames, \
+             not newfuncdesc's default fallback"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "conflicting signatures")]
+    fn get_or_register_panics_on_signature_conflict() {
+        let bk = Rc::new(Bookkeeper::new());
+        let registry = PyreCallRegistry::new(bk);
+        let key = FunctionPathKey::from_segments(["foo"]);
+        registry.get_or_register(key.clone(), signature(&["x"]));
+        // Second registration with a different signature must surface
+        // the conflict — upstream description.py:205 binds the
+        // signature to the underlying Python function once at
+        // FunctionDesc creation time; pyre's adapter cannot silently
+        // route the second caller through the first caller's signature.
+        registry.get_or_register(key, signature(&["y"]));
+    }
+
+    #[test]
+    fn get_or_register_returns_cached_entry_on_repeat_lookup() {
+        let bk = Rc::new(Bookkeeper::new());
+        let registry = PyreCallRegistry::new(bk);
+        let key = FunctionPathKey::from_segments(["foo"]);
+        let first = registry.get_or_register(key.clone(), signature(&["x"]));
+        let second = registry.get_or_register(key.clone(), signature(&["x"]));
+        assert!(
+            Rc::ptr_eq(&first, &second),
+            "second get_or_register must return the same Rc as the first \
+             (Bookkeeper.getdesc identity-cache parity, bookkeeper.py:353-409)"
+        );
+        assert_eq!(
+            registry.len(),
+            1,
+            "duplicate registration must not grow the map"
+        );
+    }
+
+    #[test]
+    fn lookup_after_register_returns_same_entry() {
+        let bk = Rc::new(Bookkeeper::new());
+        let registry = PyreCallRegistry::new(bk);
+        let key = FunctionPathKey::from_segments(["foo"]);
+        let registered = registry.get_or_register(key.clone(), signature(&["x"]));
+        let looked_up = registry
+            .lookup(&key)
+            .expect("lookup after register must hit");
+        assert!(
+            Rc::ptr_eq(&registered, &looked_up),
+            "lookup must return the same Rc that get_or_register registered"
+        );
+    }
+
+    #[test]
+    fn distinct_paths_register_distinct_entries() {
+        let bk = Rc::new(Bookkeeper::new());
+        let registry = PyreCallRegistry::new(bk.clone());
+        let foo =
+            registry.get_or_register(FunctionPathKey::from_segments(["foo"]), signature(&["x"]));
+        let bar =
+            registry.get_or_register(FunctionPathKey::from_segments(["bar"]), signature(&["y"]));
+        assert!(
+            !Rc::ptr_eq(&foo, &bar),
+            "different paths must produce distinct entries"
+        );
+        assert_ne!(
+            foo.host_object, bar.host_object,
+            "different paths must produce distinct HostObjects (different Arc identities)"
+        );
+        assert_eq!(
+            bk.descs.borrow().len(),
+            2,
+            "bookkeeper.descs must have 2 entries"
+        );
+        assert_eq!(registry.len(), 2);
+    }
+
+    #[test]
+    fn multi_segment_path_distinct_from_single_segment() {
+        let bk = Rc::new(Bookkeeper::new());
+        let registry = PyreCallRegistry::new(bk);
+        let bare =
+            registry.get_or_register(FunctionPathKey::from_segments(["foo"]), signature(&["x"]));
+        let qualified = registry.get_or_register(
+            FunctionPathKey::from_segments(["mymod", "foo"]),
+            signature(&["x"]),
+        );
+        assert!(
+            !Rc::ptr_eq(&bare, &qualified),
+            "FunctionPath {{ segments: [\"foo\"] }} and \
+             FunctionPath {{ segments: [\"mymod\", \"foo\"] }} are \
+             distinct callees and must register separately"
+        );
+    }
+
+    // Note: end-to-end coverage of `register_callee` lives in
+    // `cutover.rs::anchor_call_function_path_registered_emits_simple_call`,
+    // which builds a real lifted leaf PyGraph via
+    // `lift_callee_to_pygraph` and verifies the cache pre-fill lets
+    // the rtyper resolve the call to `Signed`.
+}

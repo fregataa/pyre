@@ -1938,17 +1938,18 @@ mod tests {
         // mirror that — no `build_flow_from_rust` call, no graph in
         // hand, no PyGraph wrapped.
         //
-        // A body using a construct the body lowerer rejects (`x as
-        // i64` — task #94, `as T` cast removal epic) demonstrates
-        // this directly: the body lowerer would surface
+        // A body using a construct the body lowerer rejects (a
+        // leading-`::` globally-anchored path — see
+        // `build_flow.rs::resolve_path_constant` Unsupported branch)
+        // demonstrates this directly: the body lowerer would surface
         // `AdapterError::Unsupported` if invoked, but the metadata
         // path bypasses the body and succeeds.
-        let item = parse("fn helper(x: u32) -> i64 { x as i64 }");
+        let item = parse("fn helper(x: i64) -> i64 { ::std::result::Result::Ok(x); x }");
         // First confirm the body lowerer rejects this fixture so the
-        // bypass is actually load-bearing — if `x as i64` ever lands
-        // in `build_flow_from_rust`'s subset, this assertion will
-        // fail loudly and the test author can refresh the body to a
-        // still-rejected construct.
+        // bypass is actually load-bearing — if leading-`::` paths
+        // ever land in `build_flow_from_rust`'s subset, this
+        // assertion will fail loudly and the test author can refresh
+        // the body to a still-rejected construct.
         assert!(
             super::super::build_flow::build_flow_from_rust(&item).is_err(),
             "fixture body must be rejected by build_flow_from_rust so the \

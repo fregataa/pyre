@@ -624,13 +624,21 @@ impl Bookkeeper {
     /// gap (see that method's doc); the outer scaffolding — at_position
     /// guard, call_sites drain, emulated_pbc_calls drain + clear — is
     /// parity-faithful.
-    pub fn compute_at_fixpoint(self: &Rc<Self>) {
+    ///
+    /// Errors from `consider_call_site` propagate verbatim: upstream
+    /// `bookkeeper.py:108-118` runs both inner loops without a
+    /// `try`/`except`, so a raised exception terminates
+    /// `compute_at_fixpoint` and unwinds out of
+    /// `RPythonAnnotator.simplify`.  Pyre's port mirrors this with
+    /// early `?`-propagation; callers that previously ignored the
+    /// `Result` (the `let _ = ...` shape that Issue 3.1 flagged) are
+    /// migrated to propagate or to panic on uncaught errors,
+    /// matching upstream's Python-exception semantics.
+    pub fn compute_at_fixpoint(self: &Rc<Self>) -> Result<(), AnnotatorError> {
         let _guard = self.at_position(None);
         let ann = self.annotator();
         for (call_op, op_key) in ann.call_sites_with_positions() {
-            // Errors surface via annotator.errors in upstream (Priority
-            // #3). For now propagate-by-ignore matches the stub contract.
-            let _ = self.consider_call_site(&call_op, Some(op_key));
+            self.consider_call_site(&call_op, Some(op_key))?;
         }
         // Snapshot values so we can mutate emulated_pbc_calls inside the
         // loop (upstream does `for pbc, args_s in
@@ -641,10 +649,11 @@ impl Bookkeeper {
             // upstream: `args = simple_args(args_s)`;
             //            `pbc.consider_call_site(args, s_ImpossibleValue, None)`.
             let args = simple_args(args_s);
-            let _ = pbc.consider_call_site(&args, &SomeValue::Impossible, None);
+            pbc.consider_call_site(&args, &SomeValue::Impossible, None)?;
         }
         // upstream: `self.emulated_pbc_calls = {}`.
         self.emulated_pbc_calls.borrow_mut().clear();
+        Ok(())
     }
 
     /// RPython `Bookkeeper.consider_call_site(self, call_op)`
@@ -681,19 +690,31 @@ impl Bookkeeper {
         let Some(mut s_callable) = ann.annotation(&call_op.args[0]) else {
             return Ok(());
         };
-        let mut args_s: Vec<SomeValue> = call_op
+        // upstream `args_s = [annotation(arg) for arg in call_op.args[1:]]`
+        // (`bookkeeper.py:156`) preserves positional arity *and* the
+        // `None` sentinel for not-yet-annotated args (Python list of
+        // `SomeValue or None`).  Pyre's `arguments_w:
+        // Vec<Option<SomeValue>>` carries None unchanged so downstream
+        // `pbc_call → FunctionDesc.pycall → recursivecall` can route
+        // through unbound positions exactly as upstream
+        // `description.py:283-305` does (each unbound position skips
+        // its `binding_join` until the fixpoint round populates it).
+        let mut args_s: Vec<Option<SomeValue>> = call_op
             .args
             .iter()
             .skip(1)
-            .filter_map(|a| ann.annotation(a))
+            .map(|a| ann.annotation(a))
             .collect();
         if let SomeValue::LLADTMeth(adtmeth) = &s_callable {
             let func = adtmeth.func.clone();
             let ll_ptrtype = adtmeth.ll_ptrtype.clone();
             s_callable = self.immutablevalue(&func)?;
+            // upstream `bookkeeper.py:158`: args_s = [lltype_to_
+            // annotation(adtmeth.ll_ptrtype)] + args_s — the prepended
+            // ll_ptrtype is always concrete.
             args_s.insert(
                 0,
-                crate::translator::rtyper::llannotation::lltype_to_annotation(ll_ptrtype),
+                Some(crate::translator::rtyper::llannotation::lltype_to_annotation(ll_ptrtype)),
             );
         }
         if let SomeValue::PBC(pbc) = &s_callable {
@@ -1551,11 +1572,18 @@ impl Bookkeeper {
     pub fn union_jit_annotation_kwds(
         self: &Rc<Self>,
         driver: &HostObject,
-        kwds_s: &HashMap<String, SomeValue>,
+        kwds_s: &HashMap<String, Option<SomeValue>>,
     ) -> Result<(), AnnotatorError> {
         let mut cache_outer = self._jit_annotation_cache.borrow_mut();
         let cache = cache_outer.entry(driver.clone()).or_default();
         for (key, s_value) in kwds_s {
+            // upstream `bookkeeper.py union_jit_annotation_kwds` iterates
+            // `kwds_s.items()` and `union`s each `s_value` into the cache.
+            // A `None` value (unbound annotation, mirroring
+            // `annotator.annotation(v) is None`) contributes nothing to
+            // the union — preserve the previous cache entry verbatim
+            // instead of widening it through `union(prev, None)`.
+            let Some(s_value) = s_value else { continue };
             let s_previous = cache.remove(key).unwrap_or_else(s_impossible_value);
             let s_unioned = union(&s_previous, s_value).map_err(|e| {
                 AnnotatorError::new(format!(
@@ -2204,21 +2232,33 @@ fn check_no_flags_listitem(
 
 pub(crate) fn build_args_for_op(
     opname: &str,
-    args_s: &[SomeValue],
+    args_s: &[Option<SomeValue>],
 ) -> Result<ArgumentsForTranslation, AnnotatorError> {
     match opname {
-        "simple_call" => Ok(simple_args(args_s.to_vec())),
+        "simple_call" => Ok(super::argument::simple_args_opt(args_s.to_vec())),
         "call_args" => {
             if args_s.is_empty() {
                 return Err(AnnotatorError::new(
                     "build_args_for_op(call_args): missing shape argument",
                 ));
             }
-            let shape_const = args_s[0].const_().ok_or_else(|| {
+            // RPython `call_args` puts a concrete shape Constant at
+            // position 0; pyre's frontend mirrors this in
+            // `flowcontext::build_call_shape_constant`, so position 0
+            // is always bound (matched by the unwrap below — None
+            // here is a producer bug).
+            let shape_arg = args_s[0].as_ref().ok_or_else(|| {
+                AnnotatorError::new("build_args_for_op(call_args): args_s[0] is unbound")
+            })?;
+            let shape_const = shape_arg.const_().ok_or_else(|| {
                 AnnotatorError::new("build_args_for_op(call_args): args_s[0] is not a Constant")
             })?;
             let shape = call_shape_from_const(shape_const)?;
-            Ok(complex_args(&shape, args_s[1..].to_vec()))
+            // Position 0 was the shape Constant; remaining positions
+            // may carry None for unbound caller args.
+            let mut data_w: Vec<Option<SomeValue>> = Vec::with_capacity(args_s.len() - 1);
+            data_w.extend_from_slice(&args_s[1..]);
+            Ok(ArgumentsForTranslation::fromshape(&shape, data_w))
         }
         other => Err(AnnotatorError::new(format!(
             "build_args_for_op: unsupported call opname {other:?}"
@@ -3381,9 +3421,10 @@ mod tests {
             .expect("SomeLLADTMeth call site must flow through the wrapped function");
 
         let family = fd.borrow().base.getcallfamily().unwrap();
-        let expected_shape = build_args_for_op("simple_call", &[lltype_to_annotation(ll_ptrtype)])
-            .unwrap()
-            .rawshape();
+        let expected_shape =
+            build_args_for_op("simple_call", &[Some(lltype_to_annotation(ll_ptrtype))])
+                .unwrap()
+                .rawshape();
         let family_ref = family.borrow();
         let table = family_ref
             .calltables
@@ -3437,7 +3478,9 @@ mod tests {
 
         // Run — should not panic, should leave position_entered false
         // (at_position guard exits via Drop).
-        ann.bookkeeper.compute_at_fixpoint();
+        ann.bookkeeper
+            .compute_at_fixpoint()
+            .expect("empty annotator state must not error");
         assert!(!ann.bookkeeper.position_entered.get());
         assert!(ann.bookkeeper.emulated_pbc_calls.borrow().is_empty());
     }

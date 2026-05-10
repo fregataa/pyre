@@ -37,12 +37,28 @@ use crate::flowspace::argument::{CallShape, Signature};
 /// The companion flowspace CallSpec is hard-typed against `Hlvalue`;
 /// this struct carries the same field shape for the annotator layer
 /// (see module doc).
+///
+/// `arguments_w` carries `Option<SomeValue>` because RPython
+/// `bookkeeper.py:152 consider_call_site` builds args via
+/// `[annotator.annotation(arg) for arg in call_op.args[1:]]`, where
+/// `annotation(v)` returns `None` when `v` is not yet bound at the
+/// current fixpoint round.  The Python list passes None through to
+/// `s_callable.consider_call_site(args, …)` and downstream
+/// `pycall(schedule, args, …)` unchanged.  Pyre mirrors this by
+/// preserving `None` in `arguments_w` so the same per-arg "not yet
+/// annotated" sentinel survives every transform chain (closes Item #100).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ArgumentsForTranslation {
-    /// RPython `CallSpec.arguments_w`.
-    pub arguments_w: Vec<SomeValue>,
-    /// RPython `CallSpec.keywords`.
-    pub keywords: HashMap<String, SomeValue>,
+    /// RPython `CallSpec.arguments_w`.  `None` slots = unbound caller
+    /// arg (mirrors `annotator.annotation(v) is None`).
+    pub arguments_w: Vec<Option<SomeValue>>,
+    /// RPython `CallSpec.keywords` — `None` value = unbound caller
+    /// arg, mirroring `argument.py:116 fromshape` and
+    /// `:153 unmatch_signature` which build the kwds dict via
+    /// `dict(zip(shape_keys, w_args[...]))` and propagate `None`
+    /// through to the analyser body (where the first attribute touch
+    /// raises `AttributeError`).
+    pub keywords: HashMap<String, Option<SomeValue>>,
     /// RPython `CallSpec.w_stararg`.
     pub w_stararg: Option<SomeValue>,
 }
@@ -139,8 +155,8 @@ impl ArgumentsForTranslation {
     /// (flowspace/argument.py) inherited by
     /// `ArgumentsForTranslation`.
     pub fn new(
-        arguments_w: Vec<SomeValue>,
-        keywords: Option<HashMap<String, SomeValue>>,
+        arguments_w: Vec<Option<SomeValue>>,
+        keywords: Option<HashMap<String, Option<SomeValue>>>,
         w_stararg: Option<SomeValue>,
     ) -> Self {
         ArgumentsForTranslation {
@@ -151,12 +167,15 @@ impl ArgumentsForTranslation {
     }
 
     /// RPython `ArgumentsForTranslation.positional_args` property
-    /// (argument.py:8-14).
-    pub fn positional_args(&self) -> Result<Vec<SomeValue>, ArgErr> {
+    /// (argument.py:8-14).  `None` slots = unbound caller arg
+    /// (mirrors `annotator.annotation(v) is None`).  Stararg unpacks
+    /// from a fully-annotated `SomeTuple` so its contributions are
+    /// always `Some(_)`.
+    pub fn positional_args(&self) -> Result<Vec<Option<SomeValue>>, ArgErr> {
         if let Some(stararg) = &self.w_stararg {
             let args_w = Self::unpackiterable(stararg)?;
             let mut out = self.arguments_w.clone();
-            out.extend(args_w);
+            out.extend(args_w.into_iter().map(Some));
             Ok(out)
         } else {
             Ok(self.arguments_w.clone())
@@ -188,7 +207,7 @@ impl ArgumentsForTranslation {
 
     /// RPython `ArgumentsForTranslation.fixedunpack(argcount)`
     /// (argument.py:23-32).
-    pub fn fixedunpack(&self, argcount: usize) -> Result<Vec<SomeValue>, String> {
+    pub fn fixedunpack(&self, argcount: usize) -> Result<Vec<Option<SomeValue>>, String> {
         if !self.keywords.is_empty() {
             return Err("no keyword arguments expected".into());
         }
@@ -200,10 +219,13 @@ impl ArgumentsForTranslation {
     }
 
     /// RPython `ArgumentsForTranslation.prepend(w_firstarg)`
-    /// (argument.py:34-37).
+    /// (argument.py:34-37).  `w_firstarg` is a concrete annotation
+    /// produced by the caller (e.g. `lltype_to_annotation(adtmeth.
+    /// ll_ptrtype)` at `bookkeeper.py:158`), so it slots in as
+    /// `Some(_)`.
     pub fn prepend(&self, w_firstarg: SomeValue) -> Self {
         let mut args = Vec::with_capacity(self.arguments_w.len() + 1);
-        args.push(w_firstarg);
+        args.push(Some(w_firstarg));
         args.extend(self.arguments_w.iter().cloned());
         ArgumentsForTranslation {
             arguments_w: args,
@@ -232,16 +254,44 @@ impl ArgumentsForTranslation {
         let num_kwds = self.keywords.len();
 
         // `take = min(num_args, co_argcount)`. scope_w[:take] = args_w[:take].
+        // `args_w[i]` is `Option<SomeValue>`; pass through as-is so an
+        // unbound caller arg surfaces as `scope_w[i] = None`, matching
+        // RPython where `annotator.annotation(arg) is None` flows
+        // through to the callee's startblock binding (`description.py:
+        // 283-305`, `annrpython.py:315-336`).
         let take = num_args.min(co_argcount);
         for i in 0..take {
-            scope_w[i] = Some(args_w[i].clone());
+            scope_w[i] = args_w[i].clone();
         }
         let input_argcount = take;
 
         // `if signature.has_vararg(): ...`
         if signature.has_vararg() {
+            // `*args` collects positional excess; upstream
+            // `argument.py:63 starargs_w = args_w[co_argcount:]` hands
+            // the slice to `self.newtuple(starargs_w)` which calls
+            // `SomeTuple(items)` (`model.py:357-368`).  When an item
+            // is Python None, `i.is_constant()` raises AttributeError
+            // there — fail loudly here for the same upstream-faithful
+            // shape rather than silently substituting Impossible
+            // (which would fold to a Bottom tuple element and erase
+            // the diagnostic).
             let starargs_w: Vec<SomeValue> = if num_args > co_argcount {
-                args_w[co_argcount..].to_vec()
+                args_w[co_argcount..]
+                    .iter()
+                    .enumerate()
+                    .map(|(offset, s)| {
+                        s.clone().unwrap_or_else(|| {
+                            panic!(
+                                "match_signature: varargs positional {} (scope_w[{}]) is \
+                                 unannotated; SomeTuple items must be concrete \
+                                 (argument.py:63 + model.py:357-368)",
+                                co_argcount + offset,
+                                co_argcount,
+                            )
+                        })
+                    })
+                    .collect()
             } else {
                 Vec::new()
             };
@@ -324,7 +374,11 @@ impl ArgumentsForTranslation {
             for i in input_argcount..co_argcount {
                 let name = &signature.argnames[i];
                 if let Some(v) = self.keywords.get(name) {
-                    scope_w[i] = Some(v.clone());
+                    // upstream `argument.py:62-63 scope_w[i] = kwds_w[name]`
+                    // — `kwds_w[name]` may be `None` (unbound caller
+                    // arg), and `scope_w` is the `Vec<Option<SomeValue>>`
+                    // carrier that propagates the lattice node forward.
+                    scope_w[i] = v.clone();
                     continue;
                 }
                 let defnum = i as isize - def_first as isize;
@@ -351,30 +405,34 @@ impl ArgumentsForTranslation {
         Ok(())
     }
 
-    /// RPython `unpack()` (argument.py:122-124).
-    pub fn unpack(&self) -> Result<(Vec<SomeValue>, HashMap<String, SomeValue>), ArgErr> {
+    /// RPython `unpack()` (argument.py:122-124).  Positional and
+    /// keyword slots both preserve `Option<SomeValue>` (None = unbound
+    /// caller arg, mirroring `annotator.annotation(v) is None`).
+    pub fn unpack(
+        &self,
+    ) -> Result<(Vec<Option<SomeValue>>, HashMap<String, Option<SomeValue>>), ArgErr> {
         Ok((self.positional_args()?, self.keywords.clone()))
     }
 
     /// RPython `match_signature(signature, defaults_w)`
     /// (argument.py:126-133).
+    ///
+    /// Returns `scope_w` with `None` slots preserved verbatim (upstream:
+    /// `scope_w = [None] * scopelen; ...; return scope_w`).  None slots
+    /// reach `setbinding` as "unresolved cell" — `bindinputargs` skips
+    /// `setbinding` for them so the corresponding `Variable.annotation`
+    /// stays `None`, mirroring `annrpython.py:422-427` where upstream
+    /// `setbinding(a, None)` either writes None (fresh variable) or no-
+    /// ops because `unionof(None, None)` collapses.
     pub fn match_signature(
         &self,
         signature: &Signature,
         defaults_w: Option<&[SomeValue]>,
-    ) -> Result<Vec<SomeValue>, ArgErr> {
+    ) -> Result<Vec<Option<SomeValue>>, ArgErr> {
         let scopelen = signature.scope_length();
         let mut scope_w: Vec<Option<SomeValue>> = vec![None; scopelen];
         self.match_signature_into(&mut scope_w, signature, defaults_w)?;
-        // Upstream returns the scope_w list possibly containing `None`
-        // slots for unmatched-default args; since Rust callers consume
-        // a `Vec<SomeValue>` and upstream's next step unconditionally
-        // overwrites None slots from defaults, flatten with Impossible
-        // as a no-default sentinel.
-        Ok(scope_w
-            .into_iter()
-            .map(|opt| opt.unwrap_or(SomeValue::Impossible))
-            .collect())
+        Ok(scope_w)
     }
 
     /// RPython `unmatch_signature(signature, data_w)`
@@ -382,7 +440,7 @@ impl ArgumentsForTranslation {
     pub fn unmatch_signature(
         &self,
         signature: &Signature,
-        data_w: &[SomeValue],
+        data_w: &[Option<SomeValue>],
     ) -> Result<Self, ArgErr> {
         let argnames = &signature.argnames;
         let varargname = signature.varargname.as_deref();
@@ -393,10 +451,18 @@ impl ArgumentsForTranslation {
 
         let (args_source_slice, has_stararg) = if varargname.is_some() {
             assert_eq!(data_w.len(), cnt + 1);
-            let stararg_w = Self::unpackiterable(&data_w[cnt])?;
+            // `unpackiterable(s_tuple)` reads `.items`; an unbound
+            // (None) trailing *arg slot would AttributeError there.
+            // Mirror with a fail-loud panic (ArgErr has no Custom
+            // variant — RPython surfaces this as AttributeError up
+            // through the call chain).
+            let s_tuple = data_w[cnt]
+                .as_ref()
+                .unwrap_or_else(|| panic!("unmatch_signature: trailing *arg slot is unannotated"));
+            let stararg_w = Self::unpackiterable(s_tuple)?;
             if !stararg_w.is_empty() {
-                let mut args_w = data_w[..cnt].to_vec();
-                args_w.extend(stararg_w);
+                let mut args_w: Vec<Option<SomeValue>> = data_w[..cnt].to_vec();
+                args_w.extend(stararg_w.into_iter().map(Some));
                 assert_eq!(args_w.len(), need_cnt);
                 assert!(self.keywords.is_empty());
                 return Ok(ArgumentsForTranslation::new(args_w, None, None));
@@ -410,9 +476,13 @@ impl ArgumentsForTranslation {
 
         assert_eq!(args_source_slice.len(), cnt);
         assert!(args_source_slice.len() >= need_cnt);
-        let args_w = args_source_slice[..need_cnt].to_vec();
-        // upstream: `_kwds_w = dict(zip(argnames[need_cnt:], data_w[need_cnt:]))`
-        let mut kwds_w: HashMap<String, SomeValue> = HashMap::new();
+        let args_w: Vec<Option<SomeValue>> = args_source_slice[..need_cnt].to_vec();
+        // upstream `argument.py:153 _kwds_w = dict(zip(argnames, data_w))`
+        // — Python dict accepts any value, so `None` slots
+        // (`annotator.annotation(v) is None`) propagate through to the
+        // analyser body.  The Rust port mirrors via
+        // `HashMap<String, Option<SomeValue>>`.
+        let mut kwds_w: HashMap<String, Option<SomeValue>> = HashMap::new();
         for (name, value) in argnames[need_cnt..]
             .iter()
             .zip(args_source_slice[need_cnt..].iter())
@@ -444,19 +514,22 @@ impl ArgumentsForTranslation {
     }
 
     /// RPython `CallSpec.fromshape(cls, shape, data_w)`
-    /// (flowspace/argument.py), re-implemented over `SomeValue` for
-    /// [`complex_args`].
-    pub fn fromshape(shape: &CallShape, data_w: Vec<SomeValue>) -> Self {
+    /// (flowspace/argument.py:116), re-implemented over
+    /// `Option<SomeValue>` for [`complex_args`].  `data_w` is the flat
+    /// positional+keyword+stararg buffer; every slot may be `None`
+    /// (unbound caller arg, mirroring `annotator.annotation(v) is None`)
+    /// and the kwds dict propagates `None` through to the analyser body.
+    pub fn fromshape(shape: &CallShape, data_w: Vec<Option<SomeValue>>) -> Self {
         let shape_cnt = shape.shape_cnt;
         let end_keys = shape_cnt + shape.shape_keys.len();
         let args_w = data_w[..shape_cnt].to_vec();
         let keyword_slice = &data_w[shape_cnt..end_keys];
-        let mut keywords: HashMap<String, SomeValue> = HashMap::new();
+        let mut keywords: HashMap<String, Option<SomeValue>> = HashMap::new();
         for (name, value) in shape.shape_keys.iter().zip(keyword_slice.iter()) {
             keywords.insert(name.clone(), value.clone());
         }
         let w_stararg = if shape.shape_star {
-            Some(data_w[end_keys].clone())
+            data_w[end_keys].clone()
         } else {
             None
         };
@@ -474,7 +547,21 @@ pub fn rawshape(args: &ArgumentsForTranslation) -> CallShape {
 }
 
 /// RPython `simple_args(args_s)` (argument.py:162-163).
+///
+/// Concrete-args entry: callers that already hold every annotation
+/// bound (e.g. test fixtures, dispatch surfaces post-bind) pass a
+/// plain `Vec<SomeValue>` here.  Use [`simple_args_opt`] when the
+/// producer reads `annotator.annotation(arg)` directly and may
+/// observe `None` for not-yet-bound positions.
 pub fn simple_args(args_s: Vec<SomeValue>) -> ArgumentsForTranslation {
+    ArgumentsForTranslation::new(args_s.into_iter().map(Some).collect(), None, None)
+}
+
+/// RPython `simple_args(args_s)` parity entry that preserves
+/// `Option<SomeValue>` (`None` = unbound caller arg, mirroring
+/// `annotator.annotation(v) is None` at `bookkeeper.py:152` /
+/// `unaryop.py:114`).
+pub fn simple_args_opt(args_s: Vec<Option<SomeValue>>) -> ArgumentsForTranslation {
     ArgumentsForTranslation::new(args_s, None, None)
 }
 
@@ -485,7 +572,7 @@ pub fn simple_args(args_s: Vec<SomeValue>) -> ArgumentsForTranslation {
 /// callers do not need to round-trip a [`CallShape`] through a
 /// `SomeValue::Constant` payload just for this call site.
 pub fn complex_args(shape: &CallShape, args_s: Vec<SomeValue>) -> ArgumentsForTranslation {
-    ArgumentsForTranslation::fromshape(shape, args_s)
+    ArgumentsForTranslation::fromshape(shape, args_s.into_iter().map(Some).collect())
 }
 
 #[cfg(test)]
@@ -503,14 +590,14 @@ mod tests {
 
     #[test]
     fn positional_args_without_stararg() {
-        let args = ArgumentsForTranslation::new(vec![s_int(), s_int()], None, None);
+        let args = ArgumentsForTranslation::new(vec![Some(s_int()), Some(s_int())], None, None);
         assert_eq!(args.positional_args().unwrap().len(), 2);
     }
 
     #[test]
     fn positional_args_with_stararg_tuple() {
         let args = ArgumentsForTranslation::new(
-            vec![s_int()],
+            vec![Some(s_int())],
             None,
             Some(s_tuple(vec![s_int(), s_int()])),
         );
@@ -519,7 +606,7 @@ mod tests {
 
     #[test]
     fn fixedunpack_rejects_too_few() {
-        let args = ArgumentsForTranslation::new(vec![s_int()], None, None);
+        let args = ArgumentsForTranslation::new(vec![Some(s_int())], None, None);
         let err = args.fixedunpack(2).expect_err("too few must error");
         assert!(err.contains("not enough"));
     }
@@ -527,19 +614,20 @@ mod tests {
     #[test]
     fn fixedunpack_rejects_kwargs() {
         let mut kws = HashMap::new();
-        kws.insert("x".into(), s_int());
-        let args = ArgumentsForTranslation::new(vec![s_int(), s_int()], Some(kws), None);
+        kws.insert("x".into(), Some(s_int()));
+        let args =
+            ArgumentsForTranslation::new(vec![Some(s_int()), Some(s_int())], Some(kws), None);
         let err = args.fixedunpack(2).expect_err("kwargs must error");
         assert!(err.contains("no keyword arguments"));
     }
 
     #[test]
     fn prepend_inserts_first() {
-        let args = ArgumentsForTranslation::new(vec![s_int()], None, None);
+        let args = ArgumentsForTranslation::new(vec![Some(s_int())], None, None);
         let ten = SomeValue::Integer(SomeInteger::new(true, false));
         let out = args.prepend(ten.clone());
         assert_eq!(out.arguments_w.len(), 2);
-        assert_eq!(out.arguments_w[0], ten);
+        assert_eq!(out.arguments_w[0], Some(ten));
     }
 
     #[test]
@@ -547,7 +635,7 @@ mod tests {
         // def f(a, b=10): ...
         let sig = Signature::new(vec!["a".into(), "b".into()], None, None);
         let defaults = [SomeValue::Integer(SomeInteger::new(true, false))];
-        let args = ArgumentsForTranslation::new(vec![s_int()], None, None);
+        let args = ArgumentsForTranslation::new(vec![Some(s_int())], None, None);
         let scope = args.match_signature(&sig, Some(&defaults)).unwrap();
         assert_eq!(scope.len(), 2);
     }
@@ -573,7 +661,7 @@ mod tests {
     fn match_signature_errors_on_too_many_without_vararg() {
         // def f(a): ...   called as f(1, 2)
         let sig = Signature::new(vec!["a".into()], None, None);
-        let args = ArgumentsForTranslation::new(vec![s_int(), s_int()], None, None);
+        let args = ArgumentsForTranslation::new(vec![Some(s_int()), Some(s_int())], None, None);
         let err = args
             .match_signature(&sig, None)
             .expect_err("too many args must error");
@@ -584,10 +672,14 @@ mod tests {
     fn match_signature_collects_stararg_into_tuple() {
         // def f(a, *args): ...   called as f(1, 2, 3)
         let sig = Signature::new(vec!["a".into()], Some("args".into()), None);
-        let args = ArgumentsForTranslation::new(vec![s_int(), s_int(), s_int()], None, None);
+        let args = ArgumentsForTranslation::new(
+            vec![Some(s_int()), Some(s_int()), Some(s_int())],
+            None,
+            None,
+        );
         let scope = args.match_signature(&sig, None).unwrap();
         assert_eq!(scope.len(), 2);
-        match &scope[1] {
+        match scope[1].as_ref().expect("stararg slot must be Some") {
             SomeValue::Tuple(t) => assert_eq!(t.items.len(), 2),
             other => panic!("expected stararg SomeTuple, got {other:?}"),
         }
@@ -598,8 +690,8 @@ mod tests {
         // def f(a): ...   called as f(1, a=2)
         let sig = Signature::new(vec!["a".into()], None, None);
         let mut kws = HashMap::new();
-        kws.insert("a".into(), s_int());
-        let args = ArgumentsForTranslation::new(vec![s_int()], Some(kws), None);
+        kws.insert("a".into(), Some(s_int()));
+        let args = ArgumentsForTranslation::new(vec![Some(s_int())], Some(kws), None);
         let err = args
             .match_signature(&sig, None)
             .expect_err("duplicate kwarg must error");
@@ -614,8 +706,8 @@ mod tests {
         // f(a=1, zzz=2) → `a` binds, `zzz` is the unknown kwarg.
         let sig = Signature::new(vec!["a".into()], None, None);
         let mut kws = HashMap::new();
-        kws.insert("a".into(), s_int());
-        kws.insert("zzz".into(), s_int());
+        kws.insert("a".into(), Some(s_int()));
+        kws.insert("zzz".into(), Some(s_int()));
         let args = ArgumentsForTranslation::new(Vec::new(), Some(kws), None);
         let err = args
             .match_signature(&sig, None)
@@ -668,8 +760,8 @@ mod tests {
     #[test]
     fn rawshape_free_fn_delegates() {
         let mut kws = HashMap::new();
-        kws.insert("k".into(), s_int());
-        let args = ArgumentsForTranslation::new(vec![s_int()], Some(kws), None);
+        kws.insert("k".into(), Some(s_int()));
+        let args = ArgumentsForTranslation::new(vec![Some(s_int())], Some(kws), None);
         let shape = rawshape(&args);
         assert_eq!(shape.shape_cnt, 1);
         assert_eq!(shape.shape_keys, vec!["k".to_string()]);
@@ -687,10 +779,10 @@ mod tests {
     #[test]
     fn fromshape_round_trip() {
         let mut kws = HashMap::new();
-        kws.insert("k".into(), s_int());
-        let args = ArgumentsForTranslation::new(vec![s_int()], Some(kws), None);
+        kws.insert("k".into(), Some(s_int()));
+        let args = ArgumentsForTranslation::new(vec![Some(s_int())], Some(kws), None);
         let shape = args.rawshape();
-        let data_w = {
+        let data_w: Vec<Option<SomeValue>> = {
             let mut v = args.arguments_w.clone();
             // Sort keys like flatten() does and append kw values in
             // that order.

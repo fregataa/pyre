@@ -276,7 +276,7 @@ impl ExtRegistryEntry {
     pub fn compute_annotation_with_kwds(
         &self,
         bookkeeper: &Rc<Bookkeeper>,
-        kwds_s: &HashMap<String, SomeValue>,
+        kwds_s: &HashMap<String, Option<SomeValue>>,
     ) -> Result<SomeValue, AnnotatorError> {
         match self {
             ExtRegistryEntry::EnterLeaveMarker { meta, marker_kind } => {
@@ -955,10 +955,12 @@ mod tests {
         }
     }
 
-    fn integer_kwd(name: &str) -> (String, SomeValue) {
+    fn integer_kwd(name: &str) -> (String, Option<SomeValue>) {
         (
             format!("s_{name}"),
-            SomeValue::Integer(crate::annotator::model::SomeInteger::default()),
+            Some(SomeValue::Integer(
+                crate::annotator::model::SomeInteger::default(),
+            )),
         )
     }
 
@@ -974,7 +976,7 @@ mod tests {
             meta: meta.clone(),
             marker_kind: JitMarkerKind::JitMergePoint,
         };
-        let kwds: HashMap<String, SomeValue> = [
+        let kwds: HashMap<String, Option<SomeValue>> = [
             integer_kwd("pc"),
             integer_kwd("is_profiled"),
             integer_kwd("frame"),
@@ -1008,7 +1010,7 @@ mod tests {
             meta: meta.clone(),
             marker_kind: JitMarkerKind::JitMergePoint,
         };
-        let kwds: HashMap<String, SomeValue> = [integer_kwd("pc")].into_iter().collect();
+        let kwds: HashMap<String, Option<SomeValue>> = [integer_kwd("pc")].into_iter().collect();
 
         let err = entry
             .compute_annotation_with_kwds(&bk, &kwds)
@@ -1030,7 +1032,7 @@ mod tests {
             meta: meta.clone(),
             marker_kind: JitMarkerKind::JitMergePoint,
         };
-        let kwds: HashMap<String, SomeValue> = [
+        let kwds: HashMap<String, Option<SomeValue>> = [
             integer_kwd("pc"),
             integer_kwd("frame"),
             integer_kwd("not_a_field"),
@@ -1058,7 +1060,7 @@ mod tests {
             meta: meta.clone(),
             marker_kind: JitMarkerKind::JitMergePoint,
         };
-        let kwds: HashMap<String, SomeValue> = [integer_kwd("pc"), integer_kwd("frame")]
+        let kwds: HashMap<String, Option<SomeValue>> = [integer_kwd("pc"), integer_kwd("frame")]
             .into_iter()
             .collect();
 
@@ -1082,7 +1084,7 @@ mod tests {
         let meta = meta_for("LoopHeaderDriver", &["pc"], &["frame"]);
         let bk = Rc::new(crate::annotator::bookkeeper::Bookkeeper::new());
         let entry = ExtRegistryEntry::LoopHeader { meta };
-        let kwds: HashMap<String, SomeValue> = HashMap::new();
+        let kwds: HashMap<String, Option<SomeValue>> = HashMap::new();
         let result = entry
             .compute_annotation_with_kwds(&bk, &kwds)
             .expect("LoopHeader must annotate without kwds");
@@ -1177,7 +1179,7 @@ mod tests {
             meta: meta.clone(),
             marker_kind: JitMarkerKind::JitMergePoint,
         };
-        let kwds: HashMap<String, SomeValue> = [integer_kwd("pc"), integer_kwd("frame")]
+        let kwds: HashMap<String, Option<SomeValue>> = [integer_kwd("pc"), integer_kwd("frame")]
             .into_iter()
             .collect();
 
@@ -1227,7 +1229,7 @@ mod tests {
             meta,
             marker_kind: JitMarkerKind::CanEnterJit,
         };
-        let kwds: HashMap<String, SomeValue> = [integer_kwd("pc"), integer_kwd("frame")]
+        let kwds: HashMap<String, Option<SomeValue>> = [integer_kwd("pc"), integer_kwd("frame")]
             .into_iter()
             .collect();
 
@@ -1446,7 +1448,7 @@ mod tests {
             meta,
             marker_kind: JitMarkerKind::CanEnterJit,
         };
-        let kwds: HashMap<String, SomeValue> = [integer_kwd("pc"), integer_kwd("frame")]
+        let kwds: HashMap<String, Option<SomeValue>> = [integer_kwd("pc"), integer_kwd("frame")]
             .into_iter()
             .collect();
         entry

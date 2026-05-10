@@ -2300,6 +2300,22 @@ impl HLOperation {
         //     args_s = [annotator.annotation(arg) for arg in self.args]
         //     spec = type(self).get_specialization(*args_s)
         //     return spec(annotator, *self.args)
+        //
+        // TODO(consider-none-arg-propagation) — STRICT-PARITY DIVERGENCE.
+        // Upstream `operation.py:101` collects `annotation(arg)` as a
+        // Python list where `None` slots are kept intact;
+        // `SingleDispatchMixin._dispatch` (`operation.py:212-219`)
+        // walks `type(None).__mro__` so unbound args reach a
+        // SomeObject-tagged spec.  `simple_call`
+        // (`operation.py:663` `simple_call_SomeObject`) and
+        // `unaryop.py:114 immutablevalue` also tolerate None mid-
+        // fixpoint.  Pyre's `Vec<SomeValue>` shape forces eager
+        // unwrap before dispatch and raises "unbound argument"; this
+        // closes off the Option<SomeValue> propagation epic at
+        // tag/MRO time.  Converging needs a NoneType lattice tag and
+        // a `Vec<Option<SomeValue>>` carrier through every spec arm
+        // — multi-session (touches every binding registered in
+        // `_REGISTRY_SINGLE` / `_REGISTRY_DOUBLE`).
         let mut args_s: Vec<SomeValue> = Vec::with_capacity(self.args.len());
         for a in &self.args {
             let s = annotator.annotation(a).ok_or_else(|| {

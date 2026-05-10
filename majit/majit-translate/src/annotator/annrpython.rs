@@ -415,7 +415,14 @@ impl RPythonAnnotator {
     ///     return s_arg
     /// ```
     pub fn binding(&self, arg: &Hlvalue) -> SomeValue {
-        self.annotation(arg).expect("KeyError: no binding for arg")
+        // Required substring `"KeyError: no binding for arg"` is
+        // preserved verbatim for `cutover.rs:486
+        // is_known_unported`; the trailing `{arg:?}` adds the
+        // failing Hlvalue (typically a Variable name like `v11` or a
+        // Constant payload) so per-graph diagnosis can locate the
+        // unbound operand without a separate verbose pass.
+        self.annotation(arg)
+            .unwrap_or_else(|| panic!("KeyError: no binding for arg {arg:?}"))
     }
 
     /// RPython `typeannotation(self, t)` (annrpython.py:289-290).
@@ -558,6 +565,9 @@ impl RPythonAnnotator {
 
         // upstream: `return self.build_graph_types(flowgraph, inputs_s,
         //                                         complete_now=complete_now)`.
+        // get_call_parameters now returns Vec<Option<SomeValue>> via
+        // the Option-aware specialize chain (description.py:283-298
+        // pycall propagation parity).
         self.build_graph_types(&flowgraph.graph, &inputs_s, complete_now)
     }
 
@@ -575,7 +585,10 @@ impl RPythonAnnotator {
         function: &crate::flowspace::model::HostObject,
         args_s: Vec<SomeValue>,
     ) -> Result<
-        (Rc<crate::flowspace::pygraph::PyGraph>, Vec<SomeValue>),
+        (
+            Rc<crate::flowspace::pygraph::PyGraph>,
+            Vec<Option<SomeValue>>,
+        ),
         super::model::AnnotatorError,
     > {
         // upstream: `with self.bookkeeper.at_position(None):`.
@@ -654,7 +667,7 @@ impl RPythonAnnotator {
     pub fn build_graph_types(
         &self,
         graph: &GraphRef,
-        inputcells: &[SomeValue],
+        inputcells: &[Option<SomeValue>],
         complete_now: bool,
     ) -> Result<Option<SomeValue>, crate::annotator::model::AnnotatorError> {
         checkgraph(&graph.borrow());
@@ -747,7 +760,7 @@ impl RPythonAnnotator {
         &self,
         graph: &GraphRef,
         whence: Option<(GraphRef, BlockRef, usize)>,
-        inputcells: &[SomeValue],
+        inputcells: &[Option<SomeValue>],
     ) -> SomeValue {
         use super::model::s_impossible_value;
         if let Some((parent_graph, parent_block, parent_index)) = whence.clone() {
@@ -972,7 +985,18 @@ impl RPythonAnnotator {
             super::super::translator::simplify::eliminate_empty_blocks(&fg);
         }
         // upstream: `self.bookkeeper.compute_at_fixpoint()`.
-        self.bookkeeper.compute_at_fixpoint();
+        // Upstream lets the call propagate any raised exception out
+        // of `simplify` (see `annrpython.py:simplify` —
+        // `bookkeeper.compute_at_fixpoint()` runs without a
+        // `try`/`except`).  Pyre's `simplify` returns `()` so we
+        // panic on uncaught errors, structurally matching upstream's
+        // "uncaught Python exception terminates the annotator" path.
+        // Re-shaping `simplify` to `Result<(), AnnotatorError>` is
+        // the eventual port; until that lands, panic preserves the
+        // upstream "the annotator stops" semantics.
+        self.bookkeeper
+            .compute_at_fixpoint()
+            .unwrap_or_else(|err| panic!("compute_at_fixpoint failed: {err}"));
         // upstream: `if block_subset is None: perform_normalizations(self)`
         if block_subset.is_none() {
             super::super::translator::rtyper::normalizecalls::perform_normalizations(self)
@@ -1209,7 +1233,7 @@ impl RPythonAnnotator {
     /// def addpendinggraph(self, flowgraph, inputcells):
     ///     self.addpendingblock(flowgraph, flowgraph.startblock, inputcells)
     /// ```
-    pub fn addpendinggraph(&self, graph: &GraphRef, inputcells: &[SomeValue]) {
+    pub fn addpendinggraph(&self, graph: &GraphRef, inputcells: &[Option<SomeValue>]) {
         let startblock = graph.borrow().startblock.clone();
         self.addpendingblock(graph, &startblock, inputcells);
     }
@@ -1224,7 +1248,7 @@ impl RPythonAnnotator {
     /// `bindinputargs` (fresh) or `mergeinputargs` (already seen), and
     /// then queued via `schedulependingblock` if the block still needs
     /// flowin work.
-    pub fn addpendingblock(&self, graph: &GraphRef, block: &BlockRef, cells: &[SomeValue]) {
+    pub fn addpendingblock(&self, graph: &GraphRef, block: &BlockRef, cells: &[Option<SomeValue>]) {
         let gkey = GraphKey::of(graph);
         if self.fixed_graphs.borrow().contains_key(&gkey) {
             // Upstream: safety-check path for graphs that have already
@@ -1232,7 +1256,7 @@ impl RPythonAnnotator {
             // existing ones (`unionof(old, new) == old`). We validate
             // positionally against `block.inputargs`.
             let blk = block.borrow();
-            for (a, s_newarg) in blk.inputargs.iter().zip(cells) {
+            for (a, s_newarg_opt) in blk.inputargs.iter().zip(cells) {
                 let Hlvalue::Variable(v) = a else { continue };
                 let s_old = v
                     .annotation
@@ -1240,6 +1264,17 @@ impl RPythonAnnotator {
                     .as_ref()
                     .map(|rc| (**rc).clone())
                     .expect("addpendingblock: fixed graph's inputarg lacks annotation");
+                // Upstream `cells` carries SomeObject — None never
+                // reaches the fixed-graph safety check.  Panic loud
+                // rather than silently ignoring late-stage unbound
+                // input.
+                let s_newarg = s_newarg_opt.as_ref().unwrap_or_else(|| {
+                    panic!(
+                        "addpendingblock: fixed graph received None caller cell \
+                         for inputarg {}",
+                        v.name()
+                    )
+                });
                 let merged = unionof([&s_old, s_newarg]).unwrap_or_else(|_| {
                     panic!(
                         "AnnotatorError: Late-stage annotation is not allowed to modify the \
@@ -1481,7 +1516,11 @@ impl RPythonAnnotator {
         let lkey = LinkKey::of(link);
         drop(link_borrow);
         self.links_followed.borrow_mut().insert(lkey);
-        self.addpendingblock(graph, &target_rc, &inputs_s);
+        // Internal flowin produces concrete SomeValue per link arg (None
+        // is upstream's "unannotated caller arg" signal that originates
+        // from the call-site interface, not from intra-graph flow).
+        let inputs_s_opt: Vec<Option<SomeValue>> = inputs_s.into_iter().map(Some).collect();
+        self.addpendingblock(graph, &target_rc, &inputs_s_opt);
     }
 
     /// RPython `follow_raise_link(self, graph, link, s_last_exc_value)`
@@ -1669,7 +1708,8 @@ impl RPythonAnnotator {
 
         let lkey = LinkKey::of(link);
         self.links_followed.borrow_mut().insert(lkey);
-        self.addpendingblock(graph, &target_rc, &inputs_s);
+        let inputs_s_opt: Vec<Option<SomeValue>> = inputs_s.into_iter().map(Some).collect();
+        self.addpendingblock(graph, &target_rc, &inputs_s_opt);
     }
 
     /// RPython `reflowfromposition(self, position_key)`
@@ -1703,7 +1743,12 @@ impl RPythonAnnotator {
     /// every `block.inputargs[i]` gets `setbinding(..., inputcells[i])`.
     /// The block is then marked as `annotated[block] = False`
     /// (= awaiting flowin) and registered in `blocked_blocks`.
-    pub fn bindinputargs(&self, graph: &GraphRef, block: &BlockRef, inputcells: &[SomeValue]) {
+    pub fn bindinputargs(
+        &self,
+        graph: &GraphRef,
+        block: &BlockRef,
+        inputcells: &[Option<SomeValue>],
+    ) {
         {
             let mut blk = block.borrow_mut();
             assert_eq!(
@@ -1713,7 +1758,29 @@ impl RPythonAnnotator {
             );
             for (a, cell) in blk.inputargs.iter_mut().zip(inputcells.iter()) {
                 if let Hlvalue::Variable(v) = a {
-                    self.setbinding(v, cell.clone());
+                    // `annrpython.py:425-426` calls `setbinding(a,
+                    // cell)` unconditionally.  When `cell is None`
+                    // and `arg.annotation` is already set, upstream
+                    // crashes with `AttributeError: 'NoneType' object
+                    // has no attribute 'contains'` inside
+                    // `setbinding` — Python's lattice contract that
+                    // an existing binding can only widen.  Match that
+                    // fail-loud: an existing annotation cannot be
+                    // bound to None.  When the existing slot is
+                    // already None we leave it alone (no-op
+                    // `arg.annotation = None`).
+                    match cell {
+                        Some(cell) => self.setbinding(v, cell.clone()),
+                        None => {
+                            let annot = v.annotation.borrow();
+                            assert!(
+                                annot.is_none(),
+                                "bindinputargs: None cell overrides existing \
+                                 annotation {:?} (annrpython.py:425 contract)",
+                                annot.as_ref().map(|rc| (**rc).clone())
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -1734,7 +1801,12 @@ impl RPythonAnnotator {
     /// `unionof(old, new)`. If any merged cell differs from its old
     /// counterpart, the block is re-seeded via `bindinputargs` so the
     /// widened input triggers a fresh flow pass.
-    pub fn mergeinputargs(&self, graph: &GraphRef, block: &BlockRef, inputcells: &[SomeValue]) {
+    pub fn mergeinputargs(
+        &self,
+        graph: &GraphRef,
+        block: &BlockRef,
+        inputcells: &[Option<SomeValue>],
+    ) {
         let blk = block.borrow();
         let oldcells: Vec<SomeValue> = blk
             .inputargs
@@ -1754,10 +1826,30 @@ impl RPythonAnnotator {
             .collect();
         drop(blk);
 
+        // `annrpython.py:432` calls `unionof(c1, c2)` directly —
+        // every link.arg's `binding(a)` is concrete by construction
+        // (an unbound `Variable.annotation` would raise
+        // AttributeError before the unionof runs).  Pyre's
+        // `Vec<Option<SomeValue>>` cascade guarantees `Some(_)` from
+        // intra-graph emission (`follow_link` lifts unbound Variables
+        // to `Impossible` first, then wraps as `Some`); a `None`
+        // reaching here means a call-site interface (recursivecall /
+        // addpendinggraph) leaked an unannotated arg through —
+        // fail-loud matches the upstream AttributeError.
         let unions: Result<Vec<SomeValue>, UnionError> = oldcells
             .iter()
             .zip(inputcells.iter())
-            .map(|(c1, c2)| unionof([c1, c2]))
+            .enumerate()
+            .map(|(i, (c1, c2))| {
+                let s2 = c2.as_ref().unwrap_or_else(|| {
+                    panic!(
+                        "mergeinputargs: inputcells[{i}] is None — caller leaked \
+                         an unannotated arg (annrpython.py:432 unionof would have \
+                         raised AttributeError)"
+                    )
+                });
+                unionof([c1, s2])
+            })
             .collect();
 
         let unions = match unions {
@@ -1778,7 +1870,11 @@ impl RPythonAnnotator {
         };
 
         if unions != oldcells {
-            self.bindinputargs(graph, block, &unions);
+            // mergeinputargs's `unions` are concrete `SomeValue` (no
+            // None contribution survives the unionof reduction); wrap
+            // back as `Some(_)` for the Option-aware bindinputargs.
+            let unions_opt: Vec<Option<SomeValue>> = unions.into_iter().map(Some).collect();
+            self.bindinputargs(graph, block, &unions_opt);
         }
     }
 
@@ -2373,7 +2469,7 @@ mod tests {
         let graph = mk_graph("f", 1);
         let startblock = graph.borrow().startblock.clone();
         let s_int = SomeValue::Integer(SomeInteger::default());
-        ann.addpendinggraph(&graph, &[s_int.clone()]);
+        ann.addpendinggraph(&graph, &[Some(s_int.clone())]);
 
         // bindinputargs side effect: block appears in `annotated` as
         // `Some(None)` (= False, awaiting flowin).
@@ -2407,13 +2503,15 @@ mod tests {
         let graph = mk_graph("g", 1);
         let startblock = graph.borrow().startblock.clone();
 
-        ann.addpendinggraph(&graph, &[SomeValue::Integer(SomeInteger::default())]);
+        ann.addpendinggraph(&graph, &[Some(SomeValue::Integer(SomeInteger::default()))]);
         // Re-seed with SomeFloat — unionof(Int, Float) = Float, which
         // differs from the old cell, so bindinputargs must re-run.
         ann.addpendingblock(
             &graph,
             &startblock,
-            &[SomeValue::Float(super::super::model::SomeFloat::new())],
+            &[Some(
+                SomeValue::Float(super::super::model::SomeFloat::new()),
+            )],
         );
 
         let bound = {
@@ -2751,7 +2849,7 @@ mod tests {
         let r = ann.recursivecall(
             &callee,
             whence,
-            &[SomeValue::Integer(SomeInteger::default())],
+            &[Some(SomeValue::Integer(SomeInteger::default()))],
         );
         // The callee's return var has no binding yet → s_ImpossibleValue.
         assert!(matches!(r, SomeValue::Impossible), "got {:?}", r);
@@ -2802,7 +2900,7 @@ mod tests {
         let ann = RPythonAnnotator::new(None, None, None, false);
         let graph = mk_graph("h", 1);
         let startblock = graph.borrow().startblock.clone();
-        ann.addpendinggraph(&graph, &[SomeValue::Integer(SomeInteger::default())]);
+        ann.addpendinggraph(&graph, &[Some(SomeValue::Integer(SomeInteger::default()))]);
 
         // Simulate "block was annotated by processblock" by setting
         // annotated[block] = Some(graph).

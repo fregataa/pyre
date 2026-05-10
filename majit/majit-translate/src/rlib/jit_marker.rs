@@ -150,7 +150,7 @@ pub fn ext_enter_leave_marker_compute_result_annotation(
     bookkeeper: &Rc<Bookkeeper>,
     meta: &Arc<JitDriverMeta>,
     marker_kind: JitMarkerKind,
-    kwds_s: &HashMap<String, SomeValue>,
+    kwds_s: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
     // rlib/jit.py:889-890 — `if self.instance.__name__ ==
     // 'jit_merge_point': self.annotate_hooks(**kwds_s)`. Upstream
@@ -219,7 +219,7 @@ pub fn ext_enter_leave_marker_compute_result_annotation(
 fn annotate_hooks(
     bookkeeper: &Rc<Bookkeeper>,
     meta: &Arc<JitDriverMeta>,
-    kwds_s: &HashMap<String, SomeValue>,
+    kwds_s: &HashMap<String, Option<SomeValue>>,
 ) -> Result<(), AnnotatorError> {
     annotate_hook(
         bookkeeper,
@@ -269,7 +269,7 @@ fn annotate_hook(
     bookkeeper: &Rc<Bookkeeper>,
     func: Option<&HostObject>,
     variables: &[String],
-    kwds_s: &HashMap<String, SomeValue>,
+    kwds_s: &HashMap<String, Option<SomeValue>>,
 ) -> Result<(), AnnotatorError> {
     // rlib/jit.py:932-933 — `if func is None: return`.
     let Some(func) = func else { return Ok(()) };
@@ -301,6 +301,19 @@ fn annotate_hook(
             // rlib/jit.py:940 raises KeyError on `kwds_s['s_'+name]`.
             AnnotatorError::new(format!(
                 "JitDriver hook annotate: missing kwarg {key:?} for green {name:?}"
+            ))
+        })?;
+        // upstream pushes the kwds entry to args_s as-is; if the entry
+        // is `None` (annotation not yet bound at this fixpoint round),
+        // `emulate_pbc_call(args_s)` would AttributeError on the first
+        // `s.knowntype` access downstream.  `emulate_pbc_call` still
+        // takes `&[SomeValue]` so we surface the unbound-cell case as
+        // an `AnnotatorError` here; widening that ABI to
+        // `&[Option<SomeValue>]` is a follow-up.
+        let s_arg = s_arg.as_ref().ok_or_else(|| {
+            AnnotatorError::new(format!(
+                "JitDriver hook annotate: kwarg {key:?} for green {name:?} \
+                 is not yet annotated"
             ))
         })?;
         args_s.push(s_arg.clone());

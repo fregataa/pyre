@@ -3914,8 +3914,9 @@ pub fn checkgraph(graph: &FunctionGraph) {
     }
 
     let mut vars_previous_blocks: Vec<Variable> = Vec::new();
+    let graph_name = graph.name.as_str();
 
-    for block in graph.iterblocks() {
+    for (block_idx, block) in graph.iterblocks().into_iter().enumerate() {
         let b = block.borrow();
         if b.exits.is_empty() {
             let is_return = BlockKey::of(&block) == BlockKey::of(&graph.returnblock);
@@ -3938,19 +3939,32 @@ pub fn checkgraph(graph: &FunctionGraph) {
             vars.insert(v.clone(), only_in_link);
         };
 
-        let usevar =
-            |v: &Variable, in_link: Option<usize>, vars: &HashMap<Variable, Option<usize>>| {
-                let only_in_link = vars
-                    .get(v)
-                    .unwrap_or_else(|| panic!("variable {} used before definition", v.name()));
-                if let Some(in_link) = in_link {
-                    assert!(
-                        only_in_link.is_none() || *only_in_link == Some(in_link),
-                        "variable {} used from the wrong exception link",
-                        v.name()
-                    );
-                }
-            };
+        // `where_str` enriches the panic with the use-site context
+        // (e.g. `"op_index 4 ('setattr')"`, `"exitswitch"`,
+        // `"link[2].args[1]"`) so per-graph diagnosis can locate the
+        // dangling reference without re-traversing the graph. Required
+        // substring `" used before definition"` is preserved verbatim
+        // for `cutover.rs:443-444 is_known_unported`.
+        let usevar = |v: &Variable,
+                      in_link: Option<usize>,
+                      vars: &HashMap<Variable, Option<usize>>,
+                      where_str: &str| {
+            let only_in_link = vars.get(v).unwrap_or_else(|| {
+                panic!(
+                    "variable {name} used before definition (graph {graph_name:?}, \
+                         block {block_idx}, {where_str})",
+                    name = v.name(),
+                )
+            });
+            if let Some(in_link) = in_link {
+                assert!(
+                    only_in_link.is_none() || *only_in_link == Some(in_link),
+                    "variable {} used from the wrong exception link (graph {graph_name:?}, \
+                         block {block_idx}, {where_str})",
+                    v.name()
+                );
+            }
+        };
 
         for w in &b.inputargs {
             let Hlvalue::Variable(v) = w else {
@@ -3959,10 +3973,16 @@ pub fn checkgraph(graph: &FunctionGraph) {
             definevar(v, None, &mut vars, &vars_previous_blocks);
         }
 
-        for op in &b.operations {
-            for a in &op.args {
+        for (op_index, op) in b.operations.iter().enumerate() {
+            for (arg_index, a) in op.args.iter().enumerate() {
                 match a {
-                    Hlvalue::Variable(v) => usevar(v, None, &vars),
+                    Hlvalue::Variable(v) => {
+                        let where_str = format!(
+                            "op_index {op_index} ('{opname}') args[{arg_index}]",
+                            opname = op.opname
+                        );
+                        usevar(v, None, &vars, &where_str);
+                    }
                     Hlvalue::Constant(c) => assert!(
                         !matches!(&c.value, ConstValue::Atom(a) if a.name == LAST_EXCEPTION.name),
                         "last_exception constant cannot appear as an operation argument"
@@ -4028,7 +4048,7 @@ pub fn checkgraph(graph: &FunctionGraph) {
                 }
             }
             Some(Hlvalue::Variable(sw)) => {
-                usevar(sw, None, &vars);
+                usevar(sw, None, &vars, "exitswitch");
                 let is_boolean_switch = b.exits.len() == 2
                     && matches!(
                         (
@@ -4075,7 +4095,7 @@ pub fn checkgraph(graph: &FunctionGraph) {
         }
 
         let mut all_exitcases: Vec<Option<Hlvalue>> = Vec::new();
-        for link_ref in &b.exits {
+        for (link_idx, link_ref) in b.exits.iter().enumerate() {
             let link_id = Rc::as_ptr(link_ref) as usize;
             let exc_link = exc_links.contains(&link_id);
             let link = link_ref.borrow();
@@ -4101,12 +4121,13 @@ pub fn checkgraph(graph: &FunctionGraph) {
                 assert!(link.last_exception.is_none());
                 assert!(link.last_exc_value.is_none());
             }
-            for arg in &link.args {
+            for (arg_idx, arg) in link.args.iter().enumerate() {
                 let arg = arg
                     .as_ref()
                     .expect("finalized graph cannot contain undefined-local link args");
                 if let Hlvalue::Variable(v) = arg {
-                    usevar(v, Some(link_id), &vars);
+                    let where_str = format!("link[{link_idx}].args[{arg_idx}]");
+                    usevar(v, Some(link_id), &vars, &where_str);
                     if exc_link {
                         if let Some(last_op) = b.operations.last() {
                             assert!(

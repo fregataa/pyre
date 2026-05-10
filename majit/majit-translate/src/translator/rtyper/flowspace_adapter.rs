@@ -1,16 +1,17 @@
-//! P8.3a — `model::FunctionGraph` (legacy) → `flowspace::FunctionGraph`
-//! (real) adapter scaffolding.
+//! `model::FunctionGraph` (pyre surface DSL) →
+//! `flowspace::FunctionGraph` (RPython-orthodox) adapter.
 //!
-//! This file is a **PRE-EXISTING-ADAPTATION** with no upstream RPython
-//! counterpart. RPython's pipeline never has a "legacy graph model" to
-//! convert from — the annotator builds its `FunctionGraph` (from
-//! `rpython/flowspace/model.py`) directly, and the rtyper consumes it
-//! in place. Pyre carries two graph models in parallel during the
-//! Phase 8 cutover (`crate::model::FunctionGraph` for the legacy
-//! `translate_legacy/` pipeline, and
+//! TODO(retire-this-adapter): this file has no upstream RPython
+//! counterpart. RPython's pipeline has only one graph model — the
+//! annotator builds its `FunctionGraph` (`rpython/flowspace/model.py`)
+//! directly and the rtyper consumes it in place.  Pyre carries two
+//! graph models in parallel: `crate::model::FunctionGraph` for the
+//! surface DSL emitted by `parse → front → SemanticProgram`, and
 //! `crate::flowspace::model::FunctionGraph` for the real
-//! `translator/rtyper/` pipeline) — this adapter exists solely to
-//! bridge the gap until P8.8 deletes the legacy graph and its callers.
+//! `translator/rtyper/` pipeline.  This adapter bridges the gap.
+//! Retire when the surface DSL is replaced with `flowspace`-native
+//! producers; until then the adapter remains the per-graph entry
+//! into `RPythonAnnotator` / `RPythonTyper::specialize`.
 //!
 //! ## Why not `PyGraph`?
 //!
@@ -25,37 +26,36 @@
 //! [`FlowspaceAdapterOutput`] this adapter returns. Skipping the PyGraph
 //! wrapping avoids fabricating fake `GraphFunc` / `HostCode` instances.
 //!
-//! ## Slice progression
+//! ## Layout
 //!
-//! Per the local rtyper cutover plan:
+//! The adapter performs three responsibilities, all line-by-line at
+//! `function_graph_to_flowspace`:
 //!
-//! - **Slice 1a:** annotation lift — project legacy
-//!   `AnnotationState.types` (`ValueId → ValueType`) to `SomeValue`
-//!   shells on freshly-allocated `flowspace::Variable`s. Variable
-//!   identity remains block-local per `flowspace/model.py:checkgraph`;
-//!   the adapter only keeps `ValueId → Variable` representatives for
-//!   post-specialize readback.
-//! - **Slice 1b:** per-OpKind translation table — Slice 1b-core landed
-//!   the dispatcher framework + skip arms (Input / ConstInt /
-//!   ConstFloat). The first followup ports the `BinOp` arm as a
-//!   pre-rtyper opname pass-through (`add`/`sub`/`lt`/... → flowspace
-//!   `SpaceOperation` of the same name). Remaining per-variant
-//!   lowering arms (Call / FieldRead / ArrayRead / ...) land as later
-//!   Slice 1b-followup commits.
-//! - **Slice 1c (current):** block topology — wire `flowspace::Block`
-//!   instances per legacy `Block`, translate `exits` / `exitcase` /
-//!   `exitswitch`, designate `startblock` / `returnblock` /
-//!   `exceptblock`, and assemble a `flowspace::FunctionGraph`.
-//!   `getreturnvar` (`rtyper.rs:1633-1638`) becomes non-degenerate
-//!   because the returnblock's inputarg is materialised as the
-//!   canonical flowspace return `Variable`.
-//! - **Slice 2:** `specialize_legacy_graph` wrapper (in
-//!   `translator/rtyper/cutover.rs`) drives this adapter, runs
-//!   `RPythonTyper::specialize`, projects `LowLevelType → ConcreteType`,
-//!   and returns a [`TypeResolutionState`] keyed by the original
-//!   legacy `ValueId`.
-//! - **Slices 4–10:** dual-gate validation, default flip, prod
-//!   migration, test fixture migration, legacy deletion.
+//! 1. **Annotation lift** — project pyre's
+//!    `AnnotationState.types` (`ValueId → ValueType`) to `SomeValue`
+//!    shells on freshly-allocated `flowspace::Variable`s. Variable
+//!    identity is block-local per `flowspace/model.py:checkgraph`;
+//!    the adapter keeps a `ValueId → Variable` representative map for
+//!    post-specialize readback.
+//! 2. **Per-OpKind translation** — `translate_op` maps each pyre
+//!    `model::SpaceOperation` to a `flowspace::SpaceOperation` over
+//!    `Hlvalue` operands.  Pre-rtyper variants (`Input`, `ConstInt`,
+//!    `ConstFloat`, `BinOp`, `Call`, `FieldRead`, `ArrayRead`, ...)
+//!    have explicit arms; post-rtyper jtransform variants are
+//!    classified by [`post_rtyper_jtransform_variant_name`] and
+//!    fail-loud with a stage-mismatch message.
+//! 3. **Block topology** — wires `flowspace::Block` per legacy
+//!    `Block`, translates `exits` / `exitcase` / `exitswitch`,
+//!    designates `startblock` / `returnblock` / `exceptblock`, and
+//!    assembles a `flowspace::FunctionGraph`.  `getreturnvar`
+//!    (`rtyper.rs:1633-1638`) is non-degenerate because the
+//!    returnblock's inputarg is materialised as the canonical
+//!    flowspace return `Variable`.
+//!
+//! [`crate::translator::rtyper::cutover::specialize_legacy_graph_with_registry_seed`]
+//! drives this adapter, runs `RPythonTyper::specialize`, projects
+//! `LowLevelType → ConcreteType`, and returns a [`TypeResolutionState`]
+//! keyed by the original pyre `ValueId`.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -93,6 +93,28 @@ pub use crate::jit_codewriter::annotation_state::valuetype_to_someshell;
 /// `Variable::new` allocates a fresh process-wide identity
 /// (`flowspace/model.rs:2042`). Identity correspondence is preserved
 /// out-of-band by [`ValueIdToVariable`].
+/// Return `true` when `value` is a synthetic placeholder allocated
+/// by `model.rs::set_return(_, None)` for a void return — i.e. a
+/// `ValueId` that appears in `Link.args` but is **not** defined as
+/// any block's `inputargs` entry or any op's `result`.  Mirrors
+/// `translator/rtyper/legacy_annotator.rs:183-193
+/// is_synthetic_return_void_value` line-by-line so the adapter and
+/// the legacy annotator agree on which `Link.args` ValueIds are
+/// "void return placeholders" eligible for the Void pre-seed and
+/// which are genuine `undefined operand` producer bugs that should
+/// remain fail-loud.
+fn is_synthetic_return_void_value(graph: &FunctionGraph, value: ValueId) -> bool {
+    for block in &graph.blocks {
+        if block.inputargs.contains(&value) {
+            return false;
+        }
+        if block.operations.iter().any(|op| op.result == Some(value)) {
+            return false;
+        }
+    }
+    true
+}
+
 fn seed_variable(vid: ValueId, annotations: &AnnotationState) -> Variable {
     let var = Variable::new();
     // Prefer the precise per-`ValueId` `SomeValue` when a producer
@@ -279,6 +301,15 @@ pub fn build_value_to_hlvalue_map(
                         )),
                     );
                 }
+                OpKind::ConstBool(b) => {
+                    map.insert(
+                        result,
+                        Hlvalue::Constant(Constant::with_concretetype(
+                            ConstValue::Bool(*b),
+                            LowLevelType::Bool,
+                        )),
+                    );
+                }
                 OpKind::ConstFloat(bits) => {
                     map.insert(
                         result,
@@ -300,15 +331,28 @@ pub fn build_value_to_hlvalue_map(
 /// referenced `ValueId` must have been seeded by Slice 1a's
 /// [`build_value_to_variable_map`] or shadowed by
 /// [`build_value_to_hlvalue_map`]'s const inlining).
+///
+/// The error message embeds the enclosing `SpaceOperation` (variant
+/// name + result vid) and the role of the failing argument (e.g.
+/// `"lhs"`, `"rhs"`, `"base"`, `"index"`, `"value"`, `"operand"`,
+/// `"args[i]"`, `"result"`) so per-graph diagnosis can locate the
+/// broken op without re-traversing the graph. The required substring
+/// `"undefined operand ValueId"` is preserved verbatim so the dual
+/// gate's `is_known_unported` predicate (`cutover.rs:441`) keeps
+/// matching this category.
 fn lookup_operand(
     value_map: &HashMap<ValueId, Hlvalue>,
     vid: ValueId,
+    op: &SpaceOperation,
+    arg_role: &str,
 ) -> Result<Hlvalue, TyperError> {
     value_map.get(&vid).cloned().ok_or_else(|| {
         TyperError::message(format!(
-            "translate_op: undefined operand {vid:?} — adapter invariant \
-             broken (every referenced ValueId must be defined as a block \
-             inputarg or op result)"
+            "translate_op: undefined operand {vid:?} as {arg_role} of {opkind} \
+             (result {result:?}) — adapter invariant broken (every referenced \
+             ValueId must be defined as a block inputarg or op result)",
+            opkind = opkind_variant_name(&op.kind),
+            result = op.result,
         ))
     })
 }
@@ -323,7 +367,7 @@ fn resolve_result_hlvalue(
     value_map: &HashMap<ValueId, Hlvalue>,
 ) -> Result<Hlvalue, TyperError> {
     match op.result {
-        Some(vid) => lookup_operand(value_map, vid),
+        Some(vid) => lookup_operand(value_map, vid, op, "result"),
         None => Ok(Hlvalue::Variable(Variable::new())),
     }
 }
@@ -332,24 +376,115 @@ fn resolve_result_hlvalue(
 /// unary_op_name`) onto the RPython flowspace operator name
 /// (`rpython/flowspace/operation.py:465-474`).
 ///
-/// `neg` passes through (registered upstream as `add_operator('neg',
-/// 1, ..)` at line 466).  `not` and `deref` are not flowspace
-/// operators — Python's `not x` is control flow (the truthy / falsy
-/// branch lives in the abstract interpreter, not the operator
-/// table), and Rust's `*x` has no Python peer.  Both surface as a
-/// fail-loud `TyperError`; resolution is at the frontend (Bool
-/// `not` should desugar to `bool` + branch; integer `!` should map
-/// to `invert` distinctly from logical `not`; `*` should not produce
-/// a body op at all).
+/// `neg` and `bool` pass through (registered upstream as
+/// `add_operator('neg', 1, ..)` at line 466 and `add_operator('bool',
+/// 1, ..)` at line 467).  `cast_ptr_to_int` is the one cross-class
+/// cast op pyre's frontend emits that has a real rtyper handler
+/// (`rbuiltin.rs::rtype_cast_ptr_to_int`, registered as the
+/// `"cast_ptr_to_int"` arm of `RPythonTyper::translate_operation`).
+///
+/// TODO(cast-dispatch-route): in upstream RPython, `same_as` and the
+/// `cast_*` family are NOT high-level flowspace SpaceOperations.
+/// `same_as` is generated by the rtyper itself (`rtyper.py:478-481`)
+/// as a post-translation renaming op; the `cast_*` family is
+/// generated through repr conversions or `lltype.cast_*` builtin
+/// call paths (`rbuiltin.py:543-558`).  Pyre emits them directly at
+/// the AST surface in `front/ast.rs::cast_op_name` (~line 5873), so
+/// this adapter has to accept them at the rtyper input.  The handler
+/// bodies in
+/// `rbuiltin.rs::rtype_{same_as,cast_int_to_float,cast_float_to_int,
+/// cast_int_to_ptr}` are line-by-line ports of upstream
+/// (`rint.py:651-668`, `rfloat.py:31-53`, `rbuiltin.py:543-557`); the
+/// remaining divergence is the dispatch route, not the handler logic.
+/// Retire by lifting these out of `Expr::Cast` lowering and routing
+/// through repr conversions instead (multi-session epic).
+///
+/// `not` and `deref` are the only fail-loud arms: pyre's frontend
+/// eliminates both at the source (`front/ast.rs::Expr::Unary`
+/// UnOp::Not desugar / Deref pass-through, both landed 2026-05-04 on
+/// `annrpython`).  Reaching either arm means a synthetic graph
+/// injected the op directly.  RPython distinguishes logical `not`
+/// (UNARY_NOT, lowered as `bool(operand)` + branch —
+/// `flowcontext.py:531-538`) from bitwise `invert` (UNARY_INVERT —
+/// `flowcontext.py:190` → `op.invert`); without static type info,
+/// the adapter cannot discriminate, so fail-loud is the only safe
+/// choice.
 fn normalize_unary_op_name(pyre_name: &str) -> Result<String, TyperError> {
     match pyre_name {
         "neg" => Ok("neg".to_string()),
+        // RPython `bool` is registered as a unary op at
+        // `operation.py:467 add_operator('bool', 1, ..)` and emitted
+        // by `flowcontext.py:531-538 UNARY_NOT` /
+        // `:766-777 JUMP_IF_*_OR_POP` as the discriminator before a
+        // `guessbool` fork.  Pyre's frontend emits
+        // `OpKind::UnaryOp { op: "bool", .. }` from the `&&` / `||`
+        // short-circuit desugar at `front/ast.rs::Expr::Binary`,
+        // mirroring `build_flow.rs:1191 lower_short_circuit`.
+        // Pass through unchanged.
+        "bool" => Ok("bool".to_string()),
+        // `invert` — PyPy `add_operator('invert', 1, .., pure=True)` at
+        // `operation.py:474`, emitted by `flowcontext.py:188-191
+        // UNARY_INVERT` and dispatched through
+        // `RPythonTyper::translate_op`'s `"invert"` arm
+        // (`rtyper.rs:2025`) into `IntegerRepr::rtype_invert`
+        // (`rint.py:107-110` → `rint.rs:284`). Pyre's
+        // `front/ast.rs::Expr::Unary(UnOp::Not(_))` literal-int branch
+        // emits `OpKind::UnaryOp { op: "invert", .. }` directly when
+        // the operand is a `syn::Lit::Int` (the bitwise-complement
+        // case Rust's `!42_i64` denotes).  Without this arm the
+        // literal-int parity path Skip-classifies in the real rtyper.
+        "invert" => Ok("invert".to_string()),
+        // `cast_ptr_to_int` — `lloperation.py`-registered SpaceOperation;
+        // dispatched through `RPythonTyper::translate_operation`'s
+        // `cast_ptr_to_int` arm into `rbuiltin.rs::rtype_cast_ptr_to_int`
+        // (line-by-line port of `rbuiltin.py:543-548`).
+        "cast_ptr_to_int" => Ok("cast_ptr_to_int".to_string()),
+        // Cast family — pyre's `front/ast.rs:5873 cast_op_name` emits
+        // these for surface `as T` casts whose source/target categories
+        // diverge.  Each has a dedicated `RPythonTyper::translate_
+        // operation` arm into `rbuiltin.rs::rtype_*` (verbatim ports
+        // of upstream `@typer_for(lltype.cast_*)` bodies):
+        //
+        //   - `same_as`           → `rtype_same_as`
+        //                           (rtyper.py:478-481 internal renaming)
+        //   - `cast_int_to_float` → `rtype_cast_int_to_float`
+        //                           (rint.py:651-652)
+        //   - `cast_float_to_int` → `rtype_cast_float_to_int`
+        //                           (rint.py:667-668; rfloat.py:53)
+        //   - `cast_int_to_ptr`   → `rtype_cast_int_to_ptr`
+        //                           (rbuiltin.py:551-557)
+        "same_as" => Ok("same_as".to_string()),
+        "cast_int_to_float" => Ok("cast_int_to_float".to_string()),
+        "cast_float_to_int" => Ok("cast_float_to_int".to_string()),
+        "cast_int_to_ptr" => Ok("cast_int_to_ptr".to_string()),
+        // Bool widening / truthiness — `rbool.py:49` cast_bool_to_int /
+        // cast_bool_to_float, `rint.py:rtype_int__Bool` int_is_true,
+        // `rfloat.py:rtype_Float__Bool` float_is_true.
+        "cast_bool_to_int" => Ok("cast_bool_to_int".to_string()),
+        "cast_bool_to_float" => Ok("cast_bool_to_float".to_string()),
+        "int_is_true" => Ok("int_is_true".to_string()),
+        "float_is_true" => Ok("float_is_true".to_string()),
+        // Unsigned cross-signedness casts — `rint.py:rtype_uint_*`,
+        // `rbool.py:77-83 uint_is_true`.  Pyre emits these from
+        // `front/ast.rs::cast_op_name` for `u* as T` surface casts.
+        "cast_uint_to_int" => Ok("cast_uint_to_int".to_string()),
+        "cast_int_to_uint" => Ok("cast_int_to_uint".to_string()),
+        "cast_uint_to_float" => Ok("cast_uint_to_float".to_string()),
+        "cast_float_to_uint" => Ok("cast_float_to_uint".to_string()),
+        "cast_bool_to_uint" => Ok("cast_bool_to_uint".to_string()),
+        "uint_is_true" => Ok("uint_is_true".to_string()),
         other => Err(TyperError::missing_rtype_operation(format!(
             "normalize_unary_op_name: pyre UnaryOp `{other}` has no \
              flowspace counterpart (operation.py:465-474 registers \
-             only `pos` / `neg` / `invert` / `bool` as unary ops). \
-             Frontend must distinguish bitwise `invert` from logical \
-             `not` and remove `deref` before reaching the rtyper."
+             only `pos` / `neg` / `invert` / `bool` as unary ops; \
+             `same_as` / `cast_int_to_float` / `cast_float_to_int` / \
+             `cast_int_to_ptr` / `cast_bool_to_int` / `cast_bool_to_float` / \
+             `int_is_true` / `float_is_true` / `cast_uint_to_int` / \
+             `cast_int_to_uint` / `cast_uint_to_float` / `cast_float_to_uint` / \
+             `cast_bool_to_uint` / `uint_is_true` route through \
+             `rbuiltin.rs::rtype_*` via `RPythonTyper::translate_operation`).  \
+             Frontend must distinguish bitwise `invert` from logical `not` \
+             and remove `deref` before reaching the rtyper."
         ))),
     }
 }
@@ -368,12 +503,23 @@ fn normalize_unary_op_name(pyre_name: &str) -> Result<String, TyperError> {
 /// Pyre's short-circuit `and` / `or` (Rust `&&` / `||`) are NOT
 /// flowspace operations — Python's `and`/`or` are control flow and
 /// `operation.py:475-510` does not register them as binary operators.
-/// They surface here as a fail-loud `TyperError`; the proper
-/// resolution is at the frontend, where `&&`/`||` should desugar to
-/// short-circuit control-flow blocks (mirroring `flowcontext.py`'s
-/// `JUMP_IF_FALSE_OR_POP` handling) instead of becoming `OpKind::BinOp`
-/// nodes.  Until that frontend desugaring lands, the adapter must
-/// refuse to forward an unregistered opname to the rtyper.
+///
+/// Both frontends desugar `&&` / `||` into
+/// `JUMP_IF_FALSE_OR_POP` / `JUMP_IF_TRUE_OR_POP`-shaped control flow
+/// before the graph reaches this adapter:
+///
+/// - The RPython-parity frontend at
+///   `flowspace/rust_source/build_flow.rs:1191 lower_short_circuit`.
+/// - The legacy `front/ast.rs::Expr::Binary` arm now does the same
+///   (commit landed 2026-05-04 on `annrpython`), mirroring the
+///   build_flow.rs port: emit `bool(lhs)` + `set_branch` fork + 1-arg
+///   join carrying `lhs_raw` (short-circuit) or `rhs_raw` (full eval).
+///
+/// The fail-loud arm below survives for synthetic graphs (test
+/// fixtures, future ad-hoc producers) that inject `OpKind::BinOp {
+/// op: "and"/"or", .. }` directly without going through either
+/// frontend, plus any future RPython binop opnames that have not yet
+/// been ported.
 fn normalize_binop_name(pyre_name: &str) -> Result<String, TyperError> {
     let normalized = match pyre_name {
         "bitand" => "and_",
@@ -420,11 +566,18 @@ fn normalize_binop_name(pyre_name: &str) -> Result<String, TyperError> {
 pub fn translate_op(
     op: &SpaceOperation,
     value_map: &HashMap<ValueId, Hlvalue>,
+    // The call registry is consulted by the `OpKind::Call::FunctionPath`
+    // arm to resolve a registered `(HostObject, FunctionDesc)` pair
+    // and emit a flowspace `simple_call` (`operation.py:152`,
+    // `rpbc.rs:1621 FunctionRepr::rtype_simple_call`).  Empty registry
+    // callsites surface a distinct fail-loud message; producers
+    // must pre-register every reachable FunctionPath.
+    call_registry: &crate::translator::rtyper::pyre_call_registry::PyreCallRegistry,
 ) -> Result<Vec<FlowspaceOp>, TyperError> {
     match &op.kind {
         // ─── Skipped: fully consumed by other adapter infrastructure ───
         OpKind::Input { .. } => Ok(Vec::new()),
-        OpKind::ConstInt(_) | OpKind::ConstFloat(_) => Ok(Vec::new()),
+        OpKind::ConstInt(_) | OpKind::ConstBool(_) | OpKind::ConstFloat(_) => Ok(Vec::new()),
         // ─── Skipped: pyre JIT trace markers without a flowspace peer ───
         // `GuardTrue` / `GuardFalse` / `GuardValue` are JIT-side
         // assertions emitted by pyre's tracer — they constrain the
@@ -461,8 +614,8 @@ pub fn translate_op(
             rhs,
             ..
         } => {
-            let l = lookup_operand(value_map, *lhs)?;
-            let r = lookup_operand(value_map, *rhs)?;
+            let l = lookup_operand(value_map, *lhs, op, "lhs")?;
+            let r = lookup_operand(value_map, *rhs, op, "rhs")?;
             let result = resolve_result_hlvalue(op, value_map)?;
             Ok(vec![FlowspaceOp::new(
                 normalize_binop_name(opname)?,
@@ -486,7 +639,7 @@ pub fn translate_op(
             operand,
             ..
         } => {
-            let v = lookup_operand(value_map, *operand)?;
+            let v = lookup_operand(value_map, *operand, op, "operand")?;
             let result = resolve_result_hlvalue(op, value_map)?;
             Ok(vec![FlowspaceOp::new(
                 normalize_unary_op_name(opname)?,
@@ -505,7 +658,7 @@ pub fn translate_op(
         // `getattr`/`setattr` op into a `getfield_*` / `setfield_*`
         // bytecode keyed on the field's lltype kind.
         OpKind::FieldRead { base, field, .. } => {
-            let base_hl = lookup_operand(value_map, *base)?;
+            let base_hl = lookup_operand(value_map, *base, op, "base")?;
             let result = resolve_result_hlvalue(op, value_map)?;
             Ok(vec![FlowspaceOp::new(
                 "getattr",
@@ -519,8 +672,8 @@ pub fn translate_op(
         OpKind::FieldWrite {
             base, field, value, ..
         } => {
-            let base_hl = lookup_operand(value_map, *base)?;
-            let value_hl = lookup_operand(value_map, *value)?;
+            let base_hl = lookup_operand(value_map, *base, op, "base")?;
+            let value_hl = lookup_operand(value_map, *value, op, "value")?;
             let result = resolve_result_hlvalue(op, value_map)?;
             Ok(vec![FlowspaceOp::new(
                 "setattr",
@@ -542,8 +695,8 @@ pub fn translate_op(
         // resolved type, lowering to `getarrayitem_gc_*` /
         // `setarrayitem_gc_*` bytecodes.
         OpKind::ArrayRead { base, index, .. } => {
-            let base_hl = lookup_operand(value_map, *base)?;
-            let index_hl = lookup_operand(value_map, *index)?;
+            let base_hl = lookup_operand(value_map, *base, op, "base")?;
+            let index_hl = lookup_operand(value_map, *index, op, "index")?;
             let result = resolve_result_hlvalue(op, value_map)?;
             Ok(vec![FlowspaceOp::new(
                 "getitem",
@@ -554,9 +707,9 @@ pub fn translate_op(
         OpKind::ArrayWrite {
             base, index, value, ..
         } => {
-            let base_hl = lookup_operand(value_map, *base)?;
-            let index_hl = lookup_operand(value_map, *index)?;
-            let value_hl = lookup_operand(value_map, *value)?;
+            let base_hl = lookup_operand(value_map, *base, op, "base")?;
+            let index_hl = lookup_operand(value_map, *index, op, "index")?;
+            let value_hl = lookup_operand(value_map, *value, op, "value")?;
             let result = resolve_result_hlvalue(op, value_map)?;
             Ok(vec![FlowspaceOp::new(
                 "setitem",
@@ -578,8 +731,8 @@ pub fn translate_op(
         OpKind::InteriorFieldRead {
             base, index, field, ..
         } => {
-            let base_hl = lookup_operand(value_map, *base)?;
-            let index_hl = lookup_operand(value_map, *index)?;
+            let base_hl = lookup_operand(value_map, *base, op, "base")?;
+            let index_hl = lookup_operand(value_map, *index, op, "index")?;
             let result = resolve_result_hlvalue(op, value_map)?;
             let elem_var = Hlvalue::Variable(Variable::new());
             Ok(vec![
@@ -601,9 +754,9 @@ pub fn translate_op(
             value,
             ..
         } => {
-            let base_hl = lookup_operand(value_map, *base)?;
-            let index_hl = lookup_operand(value_map, *index)?;
-            let value_hl = lookup_operand(value_map, *value)?;
+            let base_hl = lookup_operand(value_map, *base, op, "base")?;
+            let index_hl = lookup_operand(value_map, *index, op, "index")?;
+            let value_hl = lookup_operand(value_map, *value, op, "value")?;
             let result = resolve_result_hlvalue(op, value_map)?;
             let elem_var = Hlvalue::Variable(Variable::new());
             Ok(vec![
@@ -656,15 +809,42 @@ pub fn translate_op(
         //                                    `front/ast.rs` arm.
         OpKind::Call { target, args, .. } => {
             use crate::model::CallTarget;
-            let arg_hls: Result<Vec<_>, _> =
-                args.iter().map(|v| lookup_operand(value_map, *v)).collect();
+            let arg_hls: Result<Vec<_>, _> = args
+                .iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    let role = format!("args[{i}]");
+                    lookup_operand(value_map, *v, op, &role)
+                })
+                .collect();
             let arg_hls = arg_hls?;
             let result = resolve_result_hlvalue(op, value_map)?;
             match target {
+                // Slice A.3c — `FunctionPath` resolves through
+                // `PyreCallRegistry`, returning the registry entry's
+                // `HostObject::UserFunction` instead of an opaque
+                // wrapper. The rtyper's `pair_simple_call` then
+                // short-circuits on `bookkeeper.descs` (pre-populated
+                // by the registry) and routes through
+                // `FunctionRepr::call(hop)` (`rpbc.py:199`).
                 CallTarget::FunctionPath { segments } => {
-                    let qualname = segments.join("::");
+                    let key =
+                        crate::translator::rtyper::pyre_call_registry::FunctionPathKey::from_segments(
+                            segments.iter().cloned(),
+                        );
+                    let entry = call_registry.lookup(&key).ok_or_else(|| {
+                        TyperError::message(format!(
+                            "translate_op: OpKind::Call::FunctionPath {{ segments: {:?} }} \
+                             not registered in PyreCallRegistry — the production \
+                             builder (a SemanticProgram walker, or a test fixture \
+                             building the registry directly) must register the path \
+                             with its parameter Signature before specialize_legacy_graph \
+                             consults the rtyper. Result ValueId = {:?}",
+                            segments, op.result,
+                        ))
+                    })?;
                     let callable = Hlvalue::Constant(Constant::new(ConstValue::HostObject(
-                        HostObject::new_opaque(qualname),
+                        entry.host_object.clone(),
                     )));
                     let mut call_args = Vec::with_capacity(arg_hls.len() + 1);
                     call_args.push(callable);
@@ -672,8 +852,25 @@ pub fn translate_op(
                     Ok(vec![FlowspaceOp::new("simple_call", call_args, result)])
                 }
                 CallTarget::SyntheticTransparentCtor { name } => {
+                    // RPython parity: tagged-union ctor `Foo(x)` annotates as
+                    // `SomePBC([ClassDesc(Foo)])` then `pair_simple_call`
+                    // constructs `SomeInstance(classdef)` (`bookkeeper.py:
+                    // 315-316`).  Wrapping the ctor name as
+                    // `HostObject::new_class(name, [])` routes through the
+                    // existing `is_class()` arm in
+                    // [`crate::annotator::bookkeeper::Bookkeeper::immutablevalue_hostobject`]
+                    // (`bookkeeper.rs:1984`) → `getdesc` → `ClassDesc::new`
+                    // (`classdesc.rs:708`) → `SomePBC([ClassDesc])`, instead
+                    // of falling through to the "Don't know how to represent"
+                    // error that `HostObject::new_opaque` produces.  The
+                    // resulting `SomeInstance(classdef)` projects to
+                    // `ConcreteType::GcRef`, matching legacy
+                    // `resolve_types(Unknown) → GcRef`.  Post-jtransform
+                    // [`crate::jit_codewriter::jtransform`] still unwraps
+                    // the simple_call to its inner value (the transparent
+                    // semantics survive at the codewriter layer).
                     let callable = Hlvalue::Constant(Constant::new(ConstValue::HostObject(
-                        HostObject::new_opaque(name.clone()),
+                        HostObject::new_class(name.clone(), Vec::new()),
                     )));
                     let mut call_args = Vec::with_capacity(arg_hls.len() + 1);
                     call_args.push(callable);
@@ -749,16 +946,18 @@ pub fn translate_op(
         ))),
 
         // ─── Pyre-internal: VtableMethodPtr ───
-        // PRE-EXISTING-ADAPTATION of `rclass.py:371-377 getclsfield()`.
-        // Emitted by `translator/rtyper/rclass.rs` to project the function
-        // pointer out of a `dyn Trait` receiver's vtable. It exists only
-        // *inside* the rtyper pipeline (rclass produces it; jtransform
-        // consumes it), so reaching the flowspace adapter input means an
-        // rtyper-stage layer missed its own emit/consume invariant.
+        // TODO(rclass-vtable-rework): pyre-only adaptation of
+        // `rclass.py:371-377 getclsfield()`.  Emitted by
+        // `translator/rtyper/rclass.rs` to project the function
+        // pointer out of a `dyn Trait` receiver's vtable. It exists
+        // only *inside* the rtyper pipeline (rclass produces it;
+        // jtransform consumes it), so reaching the flowspace adapter
+        // input means an rtyper-stage layer missed its own emit/
+        // consume invariant.
         OpKind::VtableMethodPtr { .. } => Err(TyperError::message(format!(
             "translate_op: VtableMethodPtr at result={:?} is rtyper-internal \
-             (PRE-EXISTING-ADAPTATION of rclass.py:371-377); rclass.rs emits \
-             it and the jtransform layer consumes it before flowspace \
+             (TODO(rclass-vtable-rework) of rclass.py:371-377); rclass.rs \
+             emits it and the jtransform layer consumes it before flowspace \
              adapter input — reaching here means the rclass→jtransform \
              pipeline broke",
             op.result
@@ -817,6 +1016,7 @@ fn opkind_variant_name(kind: &OpKind) -> &'static str {
     match kind {
         OpKind::Input { .. } => "Input",
         OpKind::ConstInt(_) => "ConstInt",
+        OpKind::ConstBool(_) => "ConstBool",
         OpKind::ConstFloat(_) => "ConstFloat",
         OpKind::FieldRead { .. } => "FieldRead",
         OpKind::FieldWrite { .. } => "FieldWrite",
@@ -893,6 +1093,16 @@ fn post_rtyper_jtransform_variant_name(kind: &OpKind) -> Option<&'static str> {
         OpKind::Live => "Live (jtransform.py:469,481,533)",
         OpKind::JitMergePoint { .. } => "JitMergePoint (jtransform.py:1690-1718)",
         OpKind::LoopHeader { .. } => "LoopHeader (jtransform.py:1690-1718)",
+        // `OpKind::Abort` is pyre-only — RPython raises `FlowingError`
+        // (`flowspace/flowcontext.py:258,417`) and drops the function
+        // before reaching the rtyper.  No real-path lowering exists;
+        // the dual-gate Skip-classifies the graph and the legacy path
+        // covers it.  The Slice 10C ratchet that synthesised a
+        // `SomeInstance(None) -> Ptr -> GcRef` projection was a
+        // NEW-DEVIATION (no upstream peer) and has been reverted —
+        // closing this entry requires retiring every Abort emit-site
+        // in the front-end (Expr::ForLoop placeholder, etc.) and
+        // replacing them with proper RPython-orthodox lowerings.
         OpKind::Abort { .. } => "Abort (pyre-only abort marker)",
         _ => return None,
     })
@@ -963,6 +1173,13 @@ fn legacy_const_define_hlvalue(op: &SpaceOperation) -> Option<(ValueId, Hlvalue)
                 LowLevelType::Signed,
             )),
         )),
+        OpKind::ConstBool(b) => Some((
+            result,
+            Hlvalue::Constant(Constant::with_concretetype(
+                ConstValue::Bool(*b),
+                LowLevelType::Bool,
+            )),
+        )),
         OpKind::ConstFloat(bits) => Some((
             result,
             Hlvalue::Constant(Constant::with_concretetype(
@@ -980,12 +1197,32 @@ fn legacy_const_define_hlvalue(op: &SpaceOperation) -> Option<(ValueId, Hlvalue)
 /// `ConstFloat` defines per Slice 1b-core's
 /// [`build_value_to_hlvalue_map`]). `LinkArg::Const` materialises a
 /// fresh `Hlvalue::Constant`.
+///
+/// `source_block_id` / `target_block_id` / `arg_index` carry the
+/// surrounding context for fail-loud diagnostics — when the lookup
+/// misses, the message embeds the predecessor and successor block ids
+/// plus the slot index in `Link.args`, so per-graph diagnosis can
+/// locate the broken link without re-traversing the graph.  Mirrors
+/// the role-bearing enrichment of `lookup_operand` (variant name +
+/// arg role).  The required substring `"undefined operand ValueId"`
+/// is preserved verbatim for `is_known_unported`
+/// (`cutover.rs:441`).
 fn link_arg_to_hlvalue(
     arg: &LinkArg,
     value_map: &HashMap<ValueId, Hlvalue>,
+    source_block_id: BlockId,
+    target_block_id: BlockId,
+    arg_index: usize,
 ) -> Result<Hlvalue, TyperError> {
     match arg {
-        LinkArg::Value(vid) => lookup_operand(value_map, *vid),
+        LinkArg::Value(vid) => value_map.get(vid).cloned().ok_or_else(|| {
+            TyperError::message(format!(
+                "translate_op: undefined operand {vid:?} as Link.args[{arg_index}] entry \
+                 (source block {source_block_id:?} -> target block {target_block_id:?}) — \
+                 adapter invariant broken (every referenced ValueId must be \
+                 defined as a block inputarg or op result)"
+            ))
+        }),
         LinkArg::Const(cv) => Ok(Hlvalue::Constant(constant_from_constvalue(cv.clone()))),
     }
 }
@@ -1019,6 +1256,97 @@ fn link_extravar_to_hlvalue(
     }
 }
 
+/// Derive per-inputarg `SomeValue` cells for a subject's startblock,
+/// preferring the explicit `seed_annotations` source (test-fixture
+/// hand-built graphs without front-end Input ops) and falling through
+/// to the `OpKind::Input { name, ty }` ops the front-end emits at
+/// `front/ast.rs:2107-2125` (self) and `:2168-2184` (typed params).
+///
+/// Returns one `SomeValue` per `startblock.inputargs` entry, in
+/// position order.
+///
+/// Resolution order per inputarg `vid`:
+/// 1. `seed_annotations.get_some_value(vid)` (`Slice 12.2` test entry)
+///    — minimal fixtures supply Variable-shape annotations explicitly.
+/// 2. Matching `OpKind::Input { ty }` op result == `vid` at the
+///    startblock — production graphs from `front/ast.rs`.
+/// 3. `seed_annotations.get_value_type(vid)` projected through
+///    `valuetype_to_someshell` — covers the
+///    `function_graph_to_flowspace_with_seed_annotations` path that
+///    `Slice 12.4` flattens onto the per-vid types map without
+///    materialising the SomeValue.
+///
+/// Errors:
+///
+/// - All three sources miss for an inputarg — front-end producer
+///   divergence (every typed param emits the Input op alongside the
+///   inputargs registration in the front pass; a missing Input op
+///   means the producer wired the inputarg without declaring its
+///   type and no seed_annotations entry was supplied either).
+/// - `valuetype_to_someshell(ty)` returns `None` for the resolved
+///   `ValueType` (only `ValueType::Unknown`) — the inputarg's type
+///   is an annotation gap; the helper surfaces it the same way
+///   `seed_variable` does (`flowspace_adapter.rs:99-115`).
+pub(crate) fn derive_subject_inputcells(
+    legacy: &FunctionGraph,
+    seed_annotations: Option<&crate::jit_codewriter::annotation_state::AnnotationState>,
+) -> Result<Vec<crate::annotator::model::SomeValue>, TyperError> {
+    let startblock = &legacy.blocks[legacy.startblock.0];
+    let mut input_ty_by_result: HashMap<ValueId, &crate::model::ValueType> = HashMap::new();
+    for op in &startblock.operations {
+        if let (Some(result), OpKind::Input { ty, .. }) = (op.result, &op.kind) {
+            input_ty_by_result.insert(result, ty);
+        }
+    }
+    let mut cells = Vec::with_capacity(startblock.inputargs.len());
+    for (idx, vid) in startblock.inputargs.iter().enumerate() {
+        // 1. Explicit SomeValue seed (test fixtures and any caller
+        //    that wants to bypass the ValueType projection).
+        if let Some(seed) = seed_annotations {
+            if let Some(rc) = seed.some_values.get(vid) {
+                cells.push((**rc).clone());
+                continue;
+            }
+        }
+        // 2. Front-end Input op at the startblock.
+        if let Some(ty) = input_ty_by_result.get(vid) {
+            let shell = valuetype_to_someshell(ty).ok_or_else(|| {
+                TyperError::message(format!(
+                    "derive_subject_inputcells: startblock.inputargs[{idx}] \
+                     ({vid:?}) has `ValueType::{ty:?}` (from Input op) whose \
+                     `valuetype_to_someshell` projection is `None` (annotation gap — \
+                     only `ValueType::Unknown` lacks a SomeValue shell)"
+                ))
+            })?;
+            cells.push(shell);
+            continue;
+        }
+        // 3. seed_annotations ValueType fallback.
+        if let Some(seed) = seed_annotations {
+            if let Some(vt) = seed.types.get(vid) {
+                let shell = valuetype_to_someshell(vt).ok_or_else(|| {
+                    TyperError::message(format!(
+                        "derive_subject_inputcells: startblock.inputargs[{idx}] \
+                         ({vid:?}) has `ValueType::{vt:?}` (from seed_annotations.types) \
+                         whose `valuetype_to_someshell` projection is `None`"
+                    ))
+                })?;
+                cells.push(shell);
+                continue;
+            }
+        }
+        return Err(TyperError::message(format!(
+            "derive_subject_inputcells: startblock.inputargs[{idx}] \
+             ({vid:?}) has no matching `OpKind::Input {{ ty }}` op at \
+             the startblock and no `seed_annotations` entry — \
+             front-end producer divergence (every typed parameter emits \
+             the Input op alongside the inputargs registration; see \
+             `front/ast.rs:2107-2184`)"
+        )));
+    }
+    Ok(cells)
+}
+
 /// One-way conversion from the legacy `crate::model::FunctionGraph` +
 /// `AnnotationState` pair into a `flowspace::FunctionGraph` whose
 /// blocks carry `Hlvalue` operands and per-value `SomeValue`
@@ -1045,8 +1373,55 @@ fn link_extravar_to_hlvalue(
 /// op definitions) flow through cleanly.
 pub fn function_graph_to_flowspace(
     legacy: &FunctionGraph,
-    annotations: &AnnotationState,
+    // Slice A.2 plumbing — see [`translate_op`].
+    call_registry: &crate::translator::rtyper::pyre_call_registry::PyreCallRegistry,
 ) -> Result<FlowspaceAdapterOutput, TyperError> {
+    function_graph_to_flowspace_with_seed_annotations(legacy, None, call_registry)
+}
+
+/// Slice 12.2 — explicit annotation seed entry for unit-test fixtures
+/// that build minimal SSA graphs without `OpKind::Input { ty }` ops.
+///
+/// Production callers go through [`function_graph_to_flowspace`] and
+/// rely on the internal `legacy_annotator::annotate(legacy)` call to
+/// recover types from production-shape Input / FieldRead / Call ops
+/// the front-end emits.  Tests that hand-roll an SSA graph without
+/// those ops must seed the annotator-state explicitly so
+/// `seed_variable` can attach `Variable.annotation` shells the rtyper
+/// reads at `bindingrepr` time.
+///
+/// `seed_annotations: None` keeps the production path; `Some(state)`
+/// lets the test override the internal computation with hand-built
+/// `(ValueId, ValueType)` pairs.
+pub fn function_graph_to_flowspace_with_seed_annotations(
+    legacy: &FunctionGraph,
+    seed_annotations: Option<&AnnotationState>,
+    call_registry: &crate::translator::rtyper::pyre_call_registry::PyreCallRegistry,
+) -> Result<FlowspaceAdapterOutput, TyperError> {
+    // Phase 2 (addpendingblock conversion) — production path no longer
+    // pre-seeds `Variable.annotation` from `legacy_annotator::annotate`.
+    // Once the cutover entry queues the subject's startblock onto the
+    // orthodox `addpendingblock` queue
+    // (`cutover.rs:specialize_legacy_graph_with_registry_seed`),
+    // `complete_pending_blocks` drives `flowin` which writes
+    // `Variable.annotation` for every reachable inputarg and op result.
+    // Carrying the legacy pre-seed alongside flowin caused
+    // `setbinding: new value does not contain old` panics at
+    // `annrpython.rs:459` whenever flowin's `follow_link` computed a
+    // narrower annotation (e.g., constant-tracking `SomeInteger{const,
+    // nonneg}`) than legacy_annotator's wider lift.
+    //
+    // Test fixtures keep the explicit `seed_annotations` injection so
+    // hand-built minimal SSA graphs that bypass front-end Input ops can
+    // still seed the `value_to_var` shells `seed_variable` reads.
+    let empty_annotations;
+    let annotations: &AnnotationState = match seed_annotations {
+        Some(s) => s,
+        None => {
+            empty_annotations = AnnotationState::new();
+            &empty_annotations
+        }
+    };
     let mut value_to_var: ValueIdToVariable = HashMap::new();
     let mut constant_hlvalues: HashMap<ValueId, Hlvalue> = HashMap::new();
     let mut constant_concretetypes: HashMap<ValueId, LowLevelType> = HashMap::new();
@@ -1061,6 +1436,47 @@ pub fn function_graph_to_flowspace(
                 }
                 constant_hlvalues.insert(vid, hlvalue);
             }
+        }
+    }
+
+    // ─── Synthetic void-return placeholder seeding ───
+    // `model.rs::set_return(block, None)` (`model.rs:1177`) emits a
+    // Link to the canonical returnblock with a fresh
+    // `alloc_value()`-allocated ValueId in `args[0]` — a pyre
+    // divergence from RPython's `RETURN_VALUE`
+    // (`flowcontext.py:687-689`) which carries `Constant(None)` from
+    // a preceding `LOAD_CONST None` directly.  The legacy annotator
+    // already pre-seeds these synthetic placeholders as
+    // `ValueType::Void` (`translator/rtyper/legacy_annotator.rs:
+    // 47-62` + `is_synthetic_return_void_value`); the adapter
+    // mirrors the same pre-seed by materializing a Variable with
+    // the Void shell that `valuetype_to_someshell(&ValueType::Void)`
+    // returns (`SomeImpossible`).  `RPythonTyper::specialize` then
+    // assigns `Void` LowLevelType, the LL→Concrete projector maps
+    // back to `Void`, and the dual-gate matches legacy's `Void`
+    // resolution — keeping the synthetic placeholder resolvable in
+    // `link_arg_to_hlvalue` without dropping the fail-loud invariant
+    // for genuinely-undefined Link.args producers.
+    let mut synthetic_void_hlvalues: HashMap<ValueId, Hlvalue> = HashMap::new();
+    for legacy_block in &legacy.blocks {
+        for link in &legacy_block.exits {
+            if link.target != legacy.returnblock {
+                continue;
+            }
+            let Some(LinkArg::Value(vid)) = link.args.first() else {
+                continue;
+            };
+            if !is_synthetic_return_void_value(legacy, *vid) {
+                continue;
+            }
+            let var = Variable::new();
+            if let Some(shell) = valuetype_to_someshell(&crate::model::ValueType::Void) {
+                *var.annotation.borrow_mut() = Some(Rc::new(shell));
+            }
+            value_to_var.entry(*vid).or_insert_with(|| var.clone());
+            synthetic_void_hlvalues
+                .entry(*vid)
+                .or_insert(Hlvalue::Variable(var));
         }
     }
 
@@ -1102,6 +1518,16 @@ pub fn function_graph_to_flowspace(
     // Variable. Even when the legacy graph reuses the source ValueId
     // here, RPython's checkgraph treats target inputargs as definitions
     // in the target block, not as the predecessor's Variable object.
+    //
+    // RPython `flowmodel.py:281 FunctionGraph.getreturnvar(self)`
+    // returns `self.returnblock.inputargs[0]` unconditionally — there
+    // is no fallback for an empty `inputargs` list, and a malformed
+    // graph raises `IndexError` at this site rather than fabricating a
+    // fresh Variable.  Pyre's `model::FunctionGraph::with_return_var`
+    // (`model.rs:983-988`) builds the returnblock with `inputargs:
+    // vec![return_value]` by invariant, so the lookup is guaranteed to
+    // succeed; surface the violation as a `TyperError` instead of
+    // silently producing a `Variable::new()` placeholder.
     let return_var = legacy
         .blocks
         .iter()
@@ -1112,7 +1538,18 @@ pub fn function_graph_to_flowspace(
             value_to_var.entry(vid).or_insert_with(|| var.clone());
             Hlvalue::Variable(var)
         })
-        .unwrap_or_else(|| Hlvalue::Variable(Variable::new()));
+        .ok_or_else(|| {
+            TyperError::message(format!(
+                "function_graph_to_flowspace: legacy graph {:?} has no \
+                 returnblock {:?} with at least one inputarg — \
+                 `model::FunctionGraph::with_return_var` (model.rs:983-988) \
+                 builds the returnblock with `inputargs: vec![return_value]` \
+                 by invariant; matches RPython `flowmodel.py:281 \
+                 getreturnvar()` which indexes `returnblock.inputargs[0]` \
+                 without a fallback",
+                legacy.name, legacy.returnblock,
+            ))
+        })?;
 
     let graph = FlowspaceGraph::with_return_var(legacy.name.clone(), startblock, return_var);
     let returnblock_ref = graph.returnblock.clone();
@@ -1150,6 +1587,14 @@ pub fn function_graph_to_flowspace(
         }
         let block_ref = block_map[&legacy_block.id].clone();
         let mut value_map = constant_hlvalues.clone();
+        // Mirror the legacy annotator's `is_synthetic_return_void_value`
+        // pre-seed: any synthetic void-return placeholder ValueId is
+        // available in every block's value_map so `link_arg_to_hlvalue`
+        // resolves the Link.args[0] entry instead of failing
+        // `undefined operand`.
+        for (&vid, hlv) in &synthetic_void_hlvalues {
+            value_map.entry(vid).or_insert_with(|| hlv.clone());
+        }
         let mut name_to_value: HashMap<String, Hlvalue> = HashMap::new();
 
         if let Some(inputs) = block_inputarg_vars.get(&legacy_block.id) {
@@ -1181,7 +1626,7 @@ pub fn function_graph_to_flowspace(
                 if let Some(name) = legacy.value_name(vid) {
                     name_to_value.insert(name.to_string(), hlvalue);
                 }
-                translated_ops.extend(translate_op(legacy_op, &value_map)?);
+                translated_ops.extend(translate_op(legacy_op, &value_map, call_registry)?);
                 continue;
             }
 
@@ -1189,19 +1634,55 @@ pub fn function_graph_to_flowspace(
                 (legacy_op.result, &legacy_op.kind)
             {
                 if !value_map.contains_key(&result) {
-                    let Some(alias) = name_to_value.get(name).cloned() else {
+                    if let Some(alias) = name_to_value.get(name).cloned() {
+                        // Same-block name match: alias the body `Input`
+                        // result to the prior `Hlvalue` for `name`.
+                        // Mirrors `front/ast.rs:2127-2156`'s same-block
+                        // LOAD_FAST dedup that the front already
+                        // enforces (no SSA divergence at this site).
+                        if let Hlvalue::Variable(var) = &alias {
+                            value_to_var.entry(result).or_insert_with(|| var.clone());
+                        }
+                        value_map.insert(result, alias);
+                    } else {
+                        // Cross-block body `Input`: name not in the
+                        // current block's `name_to_value`.  RPython
+                        // flowspace has no analogue for this — every
+                        // local cross-block reference is threaded via
+                        // the predecessor `Link.args` and the target
+                        // block's `inputargs` (`flowcontext.py:872-884
+                        // LOAD_FAST` writes the local into
+                        // `self.locals_w`; cross-block reads always go
+                        // through the target block's pre-allocated
+                        // `inputargs[]`, never via a fresh Variable).
+                        //
+                        // Fail-loud here surfaces the producer-side
+                        // gap: either the target block's inputargs were
+                        // not extended to carry `name`, or the
+                        // predecessor link's args do not include the
+                        // ValueId producer.  The dual-gate at
+                        // `cutover.rs:439 is_known_unported` matches
+                        // the substring `"adapter cross-block body
+                        // Input"` and Skip-classifies the graph,
+                        // routing it through `legacy_state` until the
+                        // Cat 2.1 cross-block locals threading covers
+                        // every shape.
                         return Err(TyperError::message(format!(
-                            "function_graph_to_flowspace: Input `{name}` at result={result:?} \
-                             has no in-scope flowspace Variable/Constant; RPython flowspace has \
-                             no standalone Input operation"
+                            "translate_op: adapter cross-block body Input — \
+                             name {name:?} (result {result:?}) was not threaded \
+                             through Link.args / target inputargs by the \
+                             predecessor block.  RPython has no body-`Input` \
+                             op (flowcontext.py:872-884 LOAD_FAST writes locals \
+                             into self.locals_w; cross-block reads go via the \
+                             target block's pre-allocated inputargs).  Producer \
+                             gap — either Cat 2.1 cross-block locals threading \
+                             missed this shape, or the front-end's body-`Input` \
+                             emission needs to be extended to predeclare the \
+                             name in the predecessor link."
                         )));
-                    };
-                    if let Hlvalue::Variable(var) = &alias {
-                        value_to_var.entry(result).or_insert_with(|| var.clone());
                     }
-                    value_map.insert(result, alias);
                 }
-                translated_ops.extend(translate_op(legacy_op, &value_map)?);
+                translated_ops.extend(translate_op(legacy_op, &value_map, call_registry)?);
                 continue;
             }
 
@@ -1212,7 +1693,7 @@ pub fn function_graph_to_flowspace(
                     value_map.insert(result, Hlvalue::Variable(var));
                 }
             }
-            translated_ops.extend(translate_op(legacy_op, &value_map)?);
+            translated_ops.extend(translate_op(legacy_op, &value_map, call_registry)?);
             if let Some(result) = legacy_op.result {
                 if let Some(name) = legacy.value_name(result) {
                     if let Some(value) = value_map.get(&result).cloned() {
@@ -1261,7 +1742,16 @@ pub fn function_graph_to_flowspace(
             let args: Vec<Hlvalue> = legacy_link
                 .args
                 .iter()
-                .map(|arg| link_arg_to_hlvalue(arg, &link_value_map))
+                .enumerate()
+                .map(|(idx, arg)| {
+                    link_arg_to_hlvalue(
+                        arg,
+                        &link_value_map,
+                        legacy_block.id,
+                        legacy_link.target,
+                        idx,
+                    )
+                })
                 .collect::<Result<Vec<_>, _>>()?;
             let exitcase = exitcase_to_hlvalue(legacy_link.exitcase.as_ref());
             let mut link = FlowspaceLink::new(args, Some(target), exitcase);
@@ -1279,7 +1769,19 @@ pub fn function_graph_to_flowspace(
         // Translate exitswitch.
         let translated_exitswitch = match &legacy_block.exitswitch {
             None => None,
-            Some(ExitSwitch::Value(vid)) => Some(lookup_operand(&value_map, *vid)?),
+            Some(ExitSwitch::Value(vid)) => Some(value_map.get(vid).cloned().ok_or_else(|| {
+                // Inline counterpart of `lookup_operand` for the
+                // block.exitswitch path (no enclosing
+                // SpaceOperation). Required substring
+                // `"undefined operand ValueId"` is preserved
+                // verbatim for `is_known_unported`
+                // (`cutover.rs:441`).
+                TyperError::message(format!(
+                    "translate_op: undefined operand {vid:?} as block.exitswitch — \
+                         adapter invariant broken (every referenced ValueId must be \
+                         defined as a block inputarg or op result)"
+                ))
+            })?),
             Some(ExitSwitch::LastException) => Some(Hlvalue::Constant(c_last_exception())),
         };
 
@@ -1306,10 +1808,20 @@ pub fn function_graph_to_flowspace(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::annotator::bookkeeper::Bookkeeper;
     use crate::annotator::model::{KnownType, SomeObjectTrait, SomeValue};
     use crate::model::{
         Block, BlockId, FunctionGraph as LegacyGraph, OpKind, SpaceOperation, ValueType,
     };
+    use crate::translator::rtyper::pyre_call_registry::PyreCallRegistry;
+
+    /// Helper: empty `PyreCallRegistry` for tests that don't exercise
+    /// the Slice A.2/A.3 Call resolution path.  The registry's
+    /// bookkeeper is freshly minted because translate_op tests don't
+    /// share state with an enclosing annotator.
+    fn empty_call_registry() -> PyreCallRegistry {
+        PyreCallRegistry::new(Rc::new(Bookkeeper::new()))
+    }
 
     #[test]
     fn valuetype_int_lifts_to_someinteger_default() {
@@ -1371,7 +1883,7 @@ mod tests {
 
     #[test]
     fn valuetype_state_lifts_to_someinstance_classdef_none() {
-        // PRE-EXISTING-ADAPTATION: pyre-only `State` (JIT state pointer)
+        // TODO(state-shell): pyre-only `State` (JIT state pointer)
         // — temporary fallback shell.
         let s = valuetype_to_someshell(&ValueType::State).expect("State must project");
         match s {
@@ -1663,11 +2175,109 @@ mod tests {
                 ty: ValueType::Int,
             },
         };
-        let result = translate_op(&op, &value_map).expect("Input must translate to skip");
+        let result = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("Input must translate to skip");
         assert!(
             result.is_empty(),
             "Input define has no SpaceOperation analogue (handled by Slice 1c \
              via block.inputargs); translate_op must yield empty Vec"
+        );
+    }
+
+    #[test]
+    fn derive_subject_inputcells_projects_each_typed_input_op() {
+        let mut graph = LegacyGraph::new("subject");
+        let entry = graph.startblock;
+        let x_vid = graph
+            .push_op(
+                entry,
+                OpKind::Input {
+                    name: "x".to_string(),
+                    ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let y_vid = graph
+            .push_op(
+                entry,
+                OpKind::Input {
+                    name: "y".to_string(),
+                    ty: ValueType::Float,
+                },
+                true,
+            )
+            .unwrap();
+        let z_vid = graph
+            .push_op(
+                entry,
+                OpKind::Input {
+                    name: "z".to_string(),
+                    ty: ValueType::Ref,
+                },
+                true,
+            )
+            .unwrap();
+        graph.block_mut(entry).inputargs.push(x_vid);
+        graph.block_mut(entry).inputargs.push(y_vid);
+        graph.block_mut(entry).inputargs.push(z_vid);
+
+        let cells = derive_subject_inputcells(&graph, None)
+            .expect("typed Input ops must project to definite SomeValue cells");
+        assert_eq!(cells.len(), 3);
+        assert!(
+            matches!(cells[0], SomeValue::Integer(_)),
+            "x: Int -> SomeInteger, got {:?}",
+            cells[0],
+        );
+        assert!(
+            matches!(cells[1], SomeValue::Float(_)),
+            "y: Float -> SomeFloat, got {:?}",
+            cells[1],
+        );
+        assert!(
+            matches!(cells[2], SomeValue::Instance(_)),
+            "z: Ref -> SomeInstance(classdef=None), got {:?}",
+            cells[2],
+        );
+    }
+
+    #[test]
+    fn derive_subject_inputcells_fails_loud_on_inputarg_without_input_op() {
+        let mut graph = LegacyGraph::new("subject");
+        let entry = graph.startblock;
+        let orphan = graph.alloc_value();
+        graph.block_mut(entry).inputargs.push(orphan);
+        let err = derive_subject_inputcells(&graph, None)
+            .expect_err("inputarg without matching Input op must surface as TyperError");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("no matching `OpKind::Input"),
+            "error must name the missing Input op invariant, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn derive_subject_inputcells_fails_loud_on_unknown_valuetype() {
+        let mut graph = LegacyGraph::new("subject");
+        let entry = graph.startblock;
+        let vid = graph
+            .push_op(
+                entry,
+                OpKind::Input {
+                    name: "u".to_string(),
+                    ty: ValueType::Unknown,
+                },
+                true,
+            )
+            .unwrap();
+        graph.block_mut(entry).inputargs.push(vid);
+        let err = derive_subject_inputcells(&graph, None)
+            .expect_err("ValueType::Unknown has no SomeValue projection");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("Unknown") && msg.contains("None"),
+            "error must mention Unknown + missing projection, got: {msg}"
         );
     }
 
@@ -1678,7 +2288,8 @@ mod tests {
             result: Some(ValueId(1)),
             kind: OpKind::ConstInt(7),
         };
-        let result = translate_op(&op, &value_map).expect("ConstInt must translate to skip");
+        let result = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("ConstInt must translate to skip");
         assert!(
             result.is_empty(),
             "ConstInt define is inlined by build_value_to_hlvalue_map; \
@@ -1693,7 +2304,8 @@ mod tests {
             result: Some(ValueId(1)),
             kind: OpKind::ConstFloat(0),
         };
-        let result = translate_op(&op, &value_map).expect("ConstFloat must translate to skip");
+        let result = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("ConstFloat must translate to skip");
         assert!(result.is_empty());
     }
 
@@ -1720,7 +2332,8 @@ mod tests {
                 result_ty: ValueType::Int,
             },
         };
-        let translated = translate_op(&op, &value_map).expect("BinOp arm must lower");
+        let translated =
+            translate_op(&op, &value_map, &empty_call_registry()).expect("BinOp arm must lower");
         assert_eq!(translated.len(), 1, "BinOp lowers to exactly one SpaceOp");
         let lowered = &translated[0];
         assert_eq!(lowered.opname, "add", "opname passes through unchanged");
@@ -1744,7 +2357,7 @@ mod tests {
                 result_ty: ValueType::Int,
             },
         };
-        let err = translate_op(&op, &value_map)
+        let err = translate_op(&op, &value_map, &empty_call_registry())
             .expect_err("undefined BinOp operand must surface invariant break");
         let msg = format!("{err}");
         assert!(msg.contains("undefined operand"));
@@ -1752,11 +2365,14 @@ mod tests {
 
     #[test]
     fn translate_op_call_function_path_lowers_to_simple_call() {
-        // Call::FunctionPath → `simple_call(opaque_host(qualname),
-        // args...)` per `flowspace/operation.py:663
-        // SimpleCall.opname = 'simple_call'`. The callable Constant
-        // wraps a `HostObject::new_opaque(qualname)` so the rtyper has
-        // a routing key.
+        // Call::FunctionPath → `simple_call(callable_host, args...)` per
+        // `flowspace/operation.py:663 SimpleCall.opname = 'simple_call'`.
+        // The callable Constant wraps the `PyreCallRegistry` entry's
+        // synthetic `HostObject::UserFunction` so the rtyper's
+        // `bookkeeper.getdesc` short-circuits onto the registered
+        // FunctionDesc.
+        use crate::flowspace::argument::Signature;
+        use crate::translator::rtyper::pyre_call_registry::FunctionPathKey;
         let mut value_map: HashMap<ValueId, Hlvalue> = HashMap::new();
         value_map.insert(ValueId(1), Hlvalue::Variable(Variable::new()));
         value_map.insert(ValueId(2), Hlvalue::Variable(Variable::new()));
@@ -1770,7 +2386,13 @@ mod tests {
                 result_ty: ValueType::Int,
             },
         };
-        let translated = translate_op(&op, &value_map).expect("Call::FunctionPath must lower");
+        let registry = empty_call_registry();
+        registry.get_or_register(
+            FunctionPathKey::from_segments(["a", "b"]),
+            Signature::new(vec!["x".into()], None, None),
+        );
+        let translated =
+            translate_op(&op, &value_map, &registry).expect("Call::FunctionPath must lower");
         assert_eq!(translated.len(), 1);
         let lowered = &translated[0];
         assert_eq!(lowered.opname, "simple_call");
@@ -1781,7 +2403,10 @@ mod tests {
         let ConstValue::HostObject(ref host) = callable.value else {
             panic!("FunctionPath callable must be ConstValue::HostObject");
         };
-        assert_eq!(host.qualname(), "a::b");
+        // Synthetic GraphFunc takes the last path segment as its
+        // `__name__`, mirroring upstream `func.__name__` (the leaf
+        // identifier, not the dotted module path).
+        assert_eq!(host.qualname(), "b");
     }
 
     #[test]
@@ -1802,8 +2427,8 @@ mod tests {
                 result_ty: ValueType::Ref,
             },
         };
-        let translated =
-            translate_op(&op, &value_map).expect("Call::SyntheticTransparentCtor must lower");
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("Call::SyntheticTransparentCtor must lower");
         assert_eq!(translated.len(), 1);
         assert_eq!(translated[0].opname, "simple_call");
         let Hlvalue::Constant(ref callable) = translated[0].args[0] else {
@@ -1836,7 +2461,8 @@ mod tests {
                 result_ty: ValueType::Int,
             },
         };
-        let translated = translate_op(&op, &value_map).expect("Call::Method must lower");
+        let translated =
+            translate_op(&op, &value_map, &empty_call_registry()).expect("Call::Method must lower");
         assert_eq!(translated.len(), 2);
         assert_eq!(translated[0].opname, "getattr");
         assert_eq!(translated[1].opname, "simple_call");
@@ -1885,7 +2511,7 @@ mod tests {
                 result_ty: ValueType::Int,
             },
         };
-        let err = translate_op(&op, &value_map)
+        let err = translate_op(&op, &value_map, &empty_call_registry())
             .expect_err("Call::Indirect must surface rclass invariant break");
         let msg = format!("{err}");
         assert!(
@@ -1917,7 +2543,7 @@ mod tests {
                 result_ty: ValueType::Int,
             },
         };
-        let err = translate_op(&op, &value_map)
+        let err = translate_op(&op, &value_map, &empty_call_registry())
             .expect_err("IndirectCall must surface rpbc.rs invariant break");
         let msg = format!("{err}");
         assert!(
@@ -1947,7 +2573,8 @@ mod tests {
                 pure: false,
             },
         };
-        let translated = translate_op(&op, &value_map).expect("FieldRead arm must lower");
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("FieldRead arm must lower");
         assert_eq!(translated.len(), 1);
         let lowered = &translated[0];
         assert_eq!(lowered.opname, "getattr");
@@ -1975,7 +2602,8 @@ mod tests {
                 ty: ValueType::Int,
             },
         };
-        let translated = translate_op(&op, &value_map).expect("FieldWrite arm must lower");
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("FieldWrite arm must lower");
         assert_eq!(translated.len(), 1);
         let lowered = &translated[0];
         assert_eq!(lowered.opname, "setattr");
@@ -2010,7 +2638,8 @@ mod tests {
                 nolength: false,
             },
         };
-        let translated = translate_op(&op, &value_map).expect("ArrayRead arm must lower");
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("ArrayRead arm must lower");
         assert_eq!(translated.len(), 1);
         let lowered = &translated[0];
         assert_eq!(lowered.opname, "getitem");
@@ -2034,7 +2663,8 @@ mod tests {
                 nolength: false,
             },
         };
-        let translated = translate_op(&op, &value_map).expect("ArrayWrite arm must lower");
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("ArrayWrite arm must lower");
         assert_eq!(translated.len(), 1);
         let lowered = &translated[0];
         assert_eq!(lowered.opname, "setitem");
@@ -2061,7 +2691,8 @@ mod tests {
                 array_type_id: None,
             },
         };
-        let translated = translate_op(&op, &value_map).expect("InteriorFieldRead arm must lower");
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("InteriorFieldRead arm must lower");
         assert_eq!(translated.len(), 2);
         assert_eq!(translated[0].opname, "getitem");
         assert_eq!(translated[0].args.len(), 2);
@@ -2099,7 +2730,8 @@ mod tests {
                 array_type_id: None,
             },
         };
-        let translated = translate_op(&op, &value_map).expect("InteriorFieldWrite arm must lower");
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("InteriorFieldWrite arm must lower");
         assert_eq!(translated.len(), 2);
         assert_eq!(translated[0].opname, "getitem");
         assert_eq!(translated[1].opname, "setattr");
@@ -2111,14 +2743,29 @@ mod tests {
         // Although Slice 1b-core's only implemented arm with operands is
         // gone (Call → followup), the lookup_operand helper is shared
         // with future arms. Validate it surfaces a clear "adapter
-        // invariant broken" message.
+        // invariant broken" message and embeds the enriched diagnostic
+        // context (op variant + arg role) added by the verbose-mode
+        // groundwork pass.
         let value_map: HashMap<ValueId, Hlvalue> = HashMap::new();
-        let err = lookup_operand(&value_map, ValueId(99))
+        let op = SpaceOperation {
+            result: Some(ValueId(100)),
+            kind: OpKind::BinOp {
+                op: "add".to_string(),
+                lhs: ValueId(99),
+                rhs: ValueId(0),
+                result_ty: ValueType::Int,
+            },
+        };
+        let err = lookup_operand(&value_map, ValueId(99), &op, "lhs")
             .expect_err("undefined operand lookup must error");
         let msg = format!("{err}");
         assert!(
             msg.contains("undefined operand") && msg.contains("invariant"),
             "fail-loud message must explain the invariant, got: {msg}"
+        );
+        assert!(
+            msg.contains("as lhs of BinOp") && msg.contains("ValueId(100)"),
+            "verbose diagnostic must include arg role + op variant + result vid, got: {msg}"
         );
     }
 
@@ -2173,7 +2820,7 @@ mod tests {
         annotations.set(ValueId(1), ValueType::Int);
         let legacy = legacy_minimal_identity_return_graph();
 
-        let output = function_graph_to_flowspace(&legacy, &annotations)
+        let output = function_graph_to_flowspace(&legacy, &empty_call_registry())
             .expect("minimal graph must assemble");
 
         // value_to_var must contain the inputarg.
@@ -2243,8 +2890,8 @@ mod tests {
         };
         graph.blocks = vec![startblock, returnblock];
 
-        let output =
-            function_graph_to_flowspace(&graph, &annotations).expect("graph must assemble");
+        let output = function_graph_to_flowspace(&graph, &empty_call_registry())
+            .expect("graph must assemble");
 
         // The flowspace returnblock's single inputarg must be the
         // Variable we seeded for ValueId(2).
@@ -2305,8 +2952,8 @@ mod tests {
         annotations.set(ValueId(3), ValueType::Int);
         graph.blocks = vec![startblock, returnblock];
 
-        let output =
-            function_graph_to_flowspace(&graph, &annotations).expect("graph must assemble");
+        let output = function_graph_to_flowspace(&graph, &empty_call_registry())
+            .expect("graph must assemble");
 
         let flowspace_graph = output.graph.borrow();
         let startblock = flowspace_graph.startblock.borrow();
@@ -2386,8 +3033,8 @@ mod tests {
         };
         graph.blocks = vec![startblock, returnblock, exceptblock];
 
-        let output =
-            function_graph_to_flowspace(&graph, &annotations).expect("exception graph assembles");
+        let output = function_graph_to_flowspace(&graph, &empty_call_registry())
+            .expect("exception graph assembles");
         let flowspace_graph = output.graph.borrow();
         let startblock = flowspace_graph.startblock.borrow();
         let exc_link = startblock.exits[1].borrow();
@@ -2449,7 +3096,7 @@ mod tests {
         annotations.set(ValueId(3), ValueType::Int);
         graph.blocks = vec![startblock, returnblock];
 
-        let err = function_graph_to_flowspace(&graph, &annotations)
+        let err = function_graph_to_flowspace(&graph, &empty_call_registry())
             .expect_err("unported OpKind must surface as TyperError");
         let msg = format!("{err}");
         assert!(

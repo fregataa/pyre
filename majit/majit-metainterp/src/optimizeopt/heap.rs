@@ -6543,8 +6543,8 @@ mod tests {
     /// heap.py:480-528 parity: FLAG_LOOKUP deduplicates consecutive dict lookups.
     #[test]
     fn test_dict_lookup_cache_flag_lookup() {
-        let extra_field: DescrRef = Arc::new(TestDescr(80));
-        let extra_array: DescrRef = Arc::new(TestDescr(81));
+        let extra_field: DescrRef = descr(80);
+        let extra_array: DescrRef = descr(81);
         let descr = dict_lookup_descr(90, extra_field, extra_array);
 
         let mut heap = OptHeap::new();
@@ -6577,8 +6577,8 @@ mod tests {
     /// heap.py:495-499 parity: FLAG_STORE reuses only if cached value >= 0.
     #[test]
     fn test_dict_lookup_cache_flag_store_nonneg() {
-        let extra_field: DescrRef = Arc::new(TestDescr(80));
-        let extra_array: DescrRef = Arc::new(TestDescr(81));
+        let extra_field: DescrRef = descr(80);
+        let extra_array: DescrRef = descr(81);
         let descr = dict_lookup_descr(90, extra_field, extra_array);
 
         let mut heap = OptHeap::new();
@@ -6619,8 +6619,8 @@ mod tests {
     /// heap.py:390 parity: clean_caches clears cached_dict_reads.
     #[test]
     fn test_dict_lookup_cache_cleared_by_clean_caches() {
-        let extra_field: DescrRef = Arc::new(TestDescr(80));
-        let extra_array: DescrRef = Arc::new(TestDescr(81));
+        let extra_field: DescrRef = descr(80);
+        let extra_array: DescrRef = descr(81);
         let descr = dict_lookup_descr(90, extra_field, extra_array);
 
         let mut heap = OptHeap::new();
@@ -6659,8 +6659,8 @@ mod tests {
     /// slots must hit the cache.
     #[test]
     fn test_dict_lookup_cache_key_same_box_for_constants() {
-        let extra_field: DescrRef = Arc::new(TestDescr(80));
-        let extra_array: DescrRef = Arc::new(TestDescr(81));
+        let extra_field: DescrRef = descr(80);
+        let extra_array: DescrRef = descr(81);
         let descr = dict_lookup_descr(90, extra_field, extra_array);
 
         let mut heap = OptHeap::new();
@@ -6733,8 +6733,8 @@ mod tests {
     /// FLAG_DELETE (2+) should never cache or reuse.
     #[test]
     fn test_dict_lookup_cache_flag_delete_no_cache() {
-        let extra_field: DescrRef = Arc::new(TestDescr(80));
-        let extra_array: DescrRef = Arc::new(TestDescr(81));
+        let extra_field: DescrRef = descr(80);
+        let extra_array: DescrRef = descr(81);
         let descr = dict_lookup_descr(90, extra_field, extra_array);
 
         let mut heap = OptHeap::new();
