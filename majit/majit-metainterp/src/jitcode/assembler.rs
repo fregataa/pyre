@@ -1862,15 +1862,17 @@ impl JitCodeBuilder {
             ),
             fn_ptr_idx,
             arg_regs,
-            majit_ir::descr::EffectInfo {
-                // pyjitpl.py:2655 do_residual_call invalidation parity:
-                // when the callee has not been write-analyzed, RPython
-                // falls back to `MOST_GENERAL` (None bitsets read as
-                // "all writes" by `force_from_effectinfo`). Pyre's
-                // bitset model encodes that as `u64::MAX`.
-                extraeffect: majit_ir::descr::ExtraEffect::ForcesVirtualOrVirtualizable,
-                ..crate::call_descr::default_effect_info()
-            },
+            // Analyzer-absent may-force call.  `call.py:288-289`
+            // assigns `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE = 6` when
+            // `virtualizable_analyzer.analyze(op)` is true; that is
+            // distinct from `EF_RANDOM_EFFECTS = 7` (the
+            // `randomeffects_analyzer` branch at `call.py:282-283`).
+            // Both values dispatch through `optimize_CALL_MAY_FORCE_*`
+            // (`pyjitpl.py:2007-2068`) but `EF_RANDOM_EFFECTS`
+            // additionally trips `has_random_effects()`
+            // (`effectinfo.py:252`) which OptHeap reads to invalidate
+            // caches that `EF_FORCES` leaves intact.
+            crate::call_descr::forces_virtual_or_virtualizable_effect_info(),
             "call_may_force_void_canonical_via_target",
         );
     }
@@ -1896,22 +1898,17 @@ impl JitCodeBuilder {
                 // release-gil callees default to RandomEffects with
                 // `can_invalidate=true` so the heapcache `clear_caches`
                 // path fires (heapcache.py:343-353) instead of only
-                // the escape-based fallback.
-                // effectinfo.py:149-155 keeps every readonly/write
-                // descr set None for `EF_RANDOM_EFFECTS`; spreading
-                // `..MOST_GENERAL` matches the wildcard contract
-                // instead of inheriting `default_effect_info()`'s
-                // `Some(vec![0xff; 8])` saturation.
-                // effectinfo.py:255-257 is_call_release_gil() needs a
-                // non-zero `tgt_func`. The actual C address is filled
-                // in by `resolve_call_release_gil_target` from the
-                // resolved `target.concrete_ptr`; the (1, 0) seed is
-                // just a probe to flip the predicate. saveerr stays 0
-                // by design: pyre is free-threaded with no GIL
-                // (`pyre/README.md:100`), so the `RFFI_ERR_*` errno-
-                // save modes have no release/acquire window to
-                // protect. See `resolve_call_release_gil_target` for
-                // the full no-GIL structural rationale.
+                // the escape-based fallback. effectinfo.py:149-155
+                // keeps every readonly/write descr set None for
+                // `EF_RANDOM_EFFECTS`. `(1, 0)` is the unresolved
+                // sentinel — the inner
+                // `emit_canonical_call_*_via_target` helper looks up
+                // the `JitCallTarget` from `descrs[fn_ptr_idx]` and
+                // calls `resolve_call_release_gil_target` to
+                // substitute both the real
+                // `_call_aroundstate_target_[0]` (`rffi.py:228`)
+                // address and the wrapper's `save_err` flag bits
+                // (`rffi.py:62-71`).
                 call_release_gil_target: (1, 0),
                 ..majit_ir::descr::EffectInfo::MOST_GENERAL
             },
@@ -1974,7 +1971,8 @@ impl JitCodeBuilder {
             ),
         };
         let concrete_ptr = target.concrete_ptr as i64;
-        let effect_info = resolve_call_release_gil_target(effect_info, target.concrete_ptr);
+        let effect_info =
+            resolve_call_release_gil_target(effect_info, target.concrete_ptr, target.save_err);
 
         let arg_classes: String = arg_regs
             .iter()
@@ -2065,7 +2063,8 @@ impl JitCodeBuilder {
             ),
         };
         let concrete_ptr = target.concrete_ptr as i64;
-        let effect_info = resolve_call_release_gil_target(effect_info, target.concrete_ptr);
+        let effect_info =
+            resolve_call_release_gil_target(effect_info, target.concrete_ptr, target.save_err);
         let arg_classes: String = arg_regs
             .iter()
             .map(|a| match a.kind {
@@ -2278,7 +2277,8 @@ impl JitCodeBuilder {
             ),
         };
         let concrete_ptr = target.concrete_ptr as i64;
-        let effect_info = resolve_call_release_gil_target(effect_info, target.concrete_ptr);
+        let effect_info =
+            resolve_call_release_gil_target(effect_info, target.concrete_ptr, target.save_err);
         let arg_classes: String = arg_regs
             .iter()
             .map(|a| match a.kind {
@@ -2320,10 +2320,7 @@ impl JitCodeBuilder {
             fn_ptr_idx,
             arg_regs,
             dst,
-            majit_ir::descr::EffectInfo {
-                extraeffect: majit_ir::descr::ExtraEffect::ForcesVirtualOrVirtualizable,
-                ..crate::call_descr::default_effect_info()
-            },
+            crate::call_descr::forces_virtual_or_virtualizable_effect_info(),
         );
     }
 
@@ -2348,6 +2345,12 @@ impl JitCodeBuilder {
                 // readonly/write descr set as `None`; spread MOST_GENERAL
                 // for the wildcard rather than `default_effect_info()`'s
                 // saturated `Some(vec![0xff; 8])` bitstrings.
+                // `(1, 0)` is the unresolved sentinel — the inner
+                // `emit_canonical_call_*_via_target` helper looks up the
+                // `JitCallTarget` from `descrs[fn_ptr_idx]` and calls
+                // `resolve_call_release_gil_target` to substitute both
+                // the real `_call_aroundstate_target_[0]` (`rffi.py:228`)
+                // address and the wrapper's `save_err` flag bits.
                 call_release_gil_target: (1, 0),
                 ..majit_ir::descr::EffectInfo::MOST_GENERAL
             },
@@ -2391,10 +2394,7 @@ impl JitCodeBuilder {
             fn_ptr_idx,
             arg_regs,
             dst,
-            majit_ir::descr::EffectInfo {
-                extraeffect: majit_ir::descr::ExtraEffect::ForcesVirtualOrVirtualizable,
-                ..crate::call_descr::default_effect_info()
-            },
+            crate::call_descr::forces_virtual_or_virtualizable_effect_info(),
         );
     }
 
@@ -2433,10 +2433,7 @@ impl JitCodeBuilder {
             fn_ptr_idx,
             arg_regs,
             dst,
-            majit_ir::descr::EffectInfo {
-                extraeffect: majit_ir::descr::ExtraEffect::ForcesVirtualOrVirtualizable,
-                ..crate::call_descr::default_effect_info()
-            },
+            crate::call_descr::forces_virtual_or_virtualizable_effect_info(),
         );
     }
 
@@ -2457,6 +2454,12 @@ impl JitCodeBuilder {
                 // readonly/write descr set as `None`; spread MOST_GENERAL
                 // for the wildcard rather than `default_effect_info()`'s
                 // saturated `Some(vec![0xff; 8])` bitstrings.
+                // `(1, 0)` is the unresolved sentinel — the inner
+                // `emit_canonical_call_*_via_target` helper looks up the
+                // `JitCallTarget` from `descrs[fn_ptr_idx]` and calls
+                // `resolve_call_release_gil_target` to substitute both
+                // the real `_call_aroundstate_target_[0]` (`rffi.py:228`)
+                // address and the wrapper's `save_err` flag bits.
                 call_release_gil_target: (1, 0),
                 ..majit_ir::descr::EffectInfo::MOST_GENERAL
             },
@@ -3152,14 +3155,35 @@ impl JitCodeBuilder {
     /// same fn pointer registered with two different slots produces two
     /// distinct entries; in practice the same helper is registered with
     /// a single classification and the dedup matches the `add_call_target`
-    /// path verbatim.
+    /// path verbatim.  `save_err` defaults to `0` (`RFFI_ERR_NONE`,
+    /// `rffi.py:80`); release-gil callees use [`add_call_target_with_save_err`]
+    /// to thread the wrapper's `_call_aroundstate_target_[1]`
+    /// (`rffi.py:228`) into the dedup key.
     pub fn add_call_target_with_slot(
         &mut self,
         trace_ptr: *const (),
         concrete_ptr: *const (),
         slot: crate::call_descr::EffectInfoSlot,
     ) -> u16 {
-        let target = JitCallTarget::with_effect_info_slot(trace_ptr, concrete_ptr, slot);
+        self.add_call_target_with_save_err(trace_ptr, concrete_ptr, slot, 0)
+    }
+
+    /// `add_call_target_with_slot` variant for release-gil callees:
+    /// records the wrapper callable's
+    /// `_call_aroundstate_target_ = (funcptr, save_err)` decoration
+    /// (`rffi.py:228`).  The `(trace_ptr, concrete_ptr, slot,
+    /// save_err)` tuple is the dedup key — same callee registered with
+    /// two different `save_err` values produces two distinct entries
+    /// because the recorded `EffectInfo.call_release_gil_target`
+    /// differs.
+    pub fn add_call_target_with_save_err(
+        &mut self,
+        trace_ptr: *const (),
+        concrete_ptr: *const (),
+        slot: crate::call_descr::EffectInfoSlot,
+        save_err: i32,
+    ) -> u16 {
+        let target = JitCallTarget::with_save_err(trace_ptr, concrete_ptr, slot, save_err);
         for (idx, entry) in self.descrs.iter().enumerate() {
             if let RuntimeBhDescr::Call(existing) = entry {
                 if *existing == target {
@@ -3710,22 +3734,24 @@ impl JitCodeBuilder {
 /// keeping the override sentinel-conditional preserves the upstream
 /// invariant for any future analyzer-driven descr.
 ///
-/// **No-GIL structural divergence (`saveerr=0`)**: pyre is free-threaded
-/// from day one (`pyre/README.md:100`); GIL-dependent code paths in
-/// PyPy — including the `release_gil` effect-info concept itself —
-/// "simply don't exist". `saveerr` controls the upstream `RFFI_ERR_*`
-/// errno-save modes around the GIL release/acquire window
-/// (`rpython/rlib/rffi.py`); without a GIL there is no release window
-/// for another thread to clobber `errno`/`lasterror`, so
-/// `saveerr` is **structurally moot** at runtime. `is_call_release_gil()`
-/// is preserved as a structural predicate for parity with PyPy's
-/// heapcache invalidation routing (`heapcache.py:343-353`); the
-/// `tgt_func` slot still carries the real C address, but the second
-/// tuple slot stays 0 by design — not a TODO. There is no wire-up
-/// task to schedule here.
+/// Resolve the `(realfuncaddr, save_err)` pair on a release-gil EI.
+///
+/// `effectinfo.py:114, 197 call_release_gil_target = (target_fn_addr,
+/// save_err)` mirrors `rffi.py:228 _call_aroundstate_target_ =
+/// (funcptr, save_err)` — both halves come from the
+/// `@llexternal(... save_err=...)` registration on the wrapper.  The
+/// outer `call_release_gil_*_canonical_via_target` sites lack a
+/// resolved `JitCallTarget`, so they emit `(1, 0)` as the unresolved
+/// sentinel; this helper, called from
+/// `emit_canonical_call_*_via_target` with the descr-resolved target,
+/// substitutes both halves verbatim.  The `save_err` argument carries
+/// the `JitCallTarget::save_err` field set by the macro DSL's
+/// `#[jit_release_gil(save_err = N)]` attribute (`rffi.py:62-71` flag
+/// bits, default `RFFI_ERR_NONE = 0`).
 fn resolve_call_release_gil_target(
     mut effect_info: majit_ir::descr::EffectInfo,
     realfuncaddr: *const (),
+    save_err: i32,
 ) -> majit_ir::descr::EffectInfo {
     // effectinfo.rs:292 is_call_release_gil checks `tgt_func != 0`, so
     // skip the substitution for non-release-gil callers (the slot
@@ -3734,8 +3760,7 @@ fn resolve_call_release_gil_target(
     // resolved `(tgt_func, saveerr)` from `_call_aroundstate_target_`
     // (`call.py:252-258`) are preserved.
     if effect_info.call_release_gil_target.0 == 1 {
-        let saveerr = effect_info.call_release_gil_target.1;
-        effect_info.call_release_gil_target = (realfuncaddr as usize as u64, saveerr);
+        effect_info.call_release_gil_target = (realfuncaddr as usize as u64, save_err);
     }
     effect_info
 }

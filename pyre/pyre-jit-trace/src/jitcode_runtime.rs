@@ -242,11 +242,18 @@ pub fn jitcode_for_instruction(instruction: &Instruction) -> Option<Arc<JitCode>
     jitcode_for_arm(arm_id_for_instruction(instruction)?)
 }
 
-/// Deserialized `pipeline.insns` — the opname → u8 table
-/// `Assembler.write_insn` grew during assembly. `JitCode.code[i]` bytes
-/// can be mapped back to opnames through the inverted view exposed by
-/// `opname_for_byte`. Matches RPython `setup_insns(insns)` consumption
-/// at pyjitpl.py:2227-2243.
+/// Deserialized `pipeline.insns` — the build-observed `Assembler::
+/// write_insn` emit set.  `Assembler::get_opnum` mirrors RPython
+/// `assembler.py:221 setdefault(key, len(self.insns))`: keys present
+/// in `majit_translate::insns::{wellknown_bh_insns, pyre_extension_insns}`
+/// reuse their reserved `BC_*` byte for build/runtime stability, and
+/// translator-only keys outside the canonical universe get the lowest
+/// available non-reserved dynamic byte.  Both kinds land here verbatim,
+/// so a key in this map is NOT a guarantee of canonical pinning — only
+/// the byte the build observed gets serialised.  `JitCode.code[i]`
+/// bytes can be mapped back to opnames through the inverted view
+/// exposed by `opname_for_byte`.  Matches RPython `setup_insns(insns)`
+/// consumption at `pyjitpl.py:2227-2243`.
 static INSNS_OPNAME_TO_BYTE: LazyLock<HashMap<String, u8>> = LazyLock::new(|| {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/opcode_insns.bin"));
     bincode::deserialize(BYTES).unwrap_or_else(|e| {
@@ -834,6 +841,54 @@ pub fn resolve_op_at(code: &[u8], pc: usize, regs: RegisterFileView<'_>) -> Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every key in build-observed `pipeline.insns` that ALSO appears in
+    /// the canonical universe (`majit_translate::insns::
+    /// {wellknown_bh_insns, pyre_extension_insns}`) must carry the
+    /// matching reserved byte.  Translator-only keys allocated by
+    /// `Assembler::get_opnum`'s `setdefault` fallback (`assembler.py:220`
+    /// parity) may live in any non-reserved byte, including gaps below
+    /// the canonical high-water byte, and are permitted in
+    /// pipeline.insns without a canonical entry.
+    /// This regression test guards against build-time/runtime drift on
+    /// the bytes the runtime walker actually dispatches (canonical
+    /// keys), without locking out the upstream-shaped dynamic-byte
+    /// allocator for transient codewriter helpers.
+    #[test]
+    fn pipeline_insns_canonical_keys_match_canonical_bytes() {
+        let observed = insns_opname_to_byte();
+        let mut canonical: HashMap<String, u8> = majit_translate::insns::wellknown_bh_insns()
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+        for (k, v) in majit_translate::insns::pyre_extension_insns() {
+            assert!(
+                canonical.insert(k.to_string(), v).is_none(),
+                "duplicate opname {k:?} between wellknown_bh_insns() and \
+                 pyre_extension_insns()",
+            );
+        }
+        for (key, &observed_byte) in observed.iter() {
+            if let Some(canonical_byte) = canonical.get(key).copied() {
+                assert_eq!(
+                    canonical_byte, observed_byte,
+                    "pipeline.insns assigned byte {observed_byte} to \
+                     canonical key {key:?} but the canonical table has \
+                     byte {canonical_byte} — the build-time and runtime \
+                     byte tables have drifted",
+                );
+            } else {
+                assert!(
+                    !majit_translate::insns::is_reserved_opcode_byte(observed_byte),
+                    "pipeline.insns key {key:?} is absent from \
+                     wellknown_bh_insns() ∪ pyre_extension_insns() but \
+                     was assigned reserved byte {observed_byte}; \
+                     translator-only dynamic bytes must not collide with \
+                     canonical/extension opcodes",
+                );
+            }
+        }
+    }
 
     #[test]
     fn deserializes_jitcodes_without_error() {

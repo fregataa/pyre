@@ -483,6 +483,15 @@ pub enum DispatchError {
     /// of `ref_return/r`, which is a codewriter shape mismatch — the
     /// caller has nowhere to land the missing value.
     UnexpectedVoidSubReturn { pc: usize },
+    /// `inline_call_*_v/d{R,IR,IRF}`'s callee surfaced
+    /// `SubReturn { result: Some(_) }`. RPython parity: the `_v` variant
+    /// (`bhimpl_inline_call_*_v`, `blackhole.py:1287/1300/1317`) is
+    /// wired to a callee whose `*_return` op is `void_return/`; reaching
+    /// it with a typed-return result means the callee body executed
+    /// `int_return/i` / `ref_return/r` / `float_return/f` instead of
+    /// `void_return/`, which is a codewriter shape mismatch — the
+    /// caller has no `>X` slot to land the surplus value.
+    UnexpectedNonVoidSubReturn { pc: usize },
     /// `reraise/` fired but `WalkContext::last_exc_value` was `None`.
     /// RPython parity: `pyjitpl.py:1702
     /// opimpl_reraise: assert self.metainterp.last_exc_value` —
@@ -1195,8 +1204,8 @@ pub fn dispatch_via_miframe(
     result
 }
 
-/// `getarrayitem_gc_r/rid>r` handler. Operand layout `rid>r`:
-/// 1B r-reg(array) + 1B i-reg(index) + 2B descr + 1B r-dst.
+/// `getarrayitem_gc_<i|r|f>/rid>X` handler. Operand layout `rid>X`:
+/// 1B r-reg(array) + 1B i-reg(index) + 2B descr + 1B X-dst.
 ///
 /// RPython parity: `pyjitpl.py:639-673 _do_getarrayitem_gc_any`:
 ///
@@ -1206,14 +1215,14 @@ pub fn dispatch_via_miframe(
 ///   heapcache.getarrayitem_now_known(arraybox, indexbox, resop, arraydescr)
 ///   return resop
 ///
-/// Walker emits `OpCode::GetarrayitemGcR` for the `_r` variant (the
-/// only canonical shape the codewriter emits today;
-/// `getarrayitem_gc_i` and `getarrayitem_gc_f` would land
-/// mechanically when emitted).
-fn getarrayitem_gc_r_via_heapcache(
+/// `opcode` is one of `GetarrayitemGc{I,R,F}`; `dst_bank` selects the
+/// result bank (`'i'`/`'r'`/`'f'`) the walker writes back into.
+fn getarrayitem_gc_via_heapcache(
     code: &[u8],
     op: &DecodedOp,
     ctx: &mut WalkContext<'_, '_>,
+    opcode: OpCode,
+    dst_bank: char,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let array = read_ref_reg(code, op, 0, ctx)?;
     let index = read_int_reg(code, op, 1, ctx)?;
@@ -1239,9 +1248,9 @@ fn getarrayitem_gc_r_via_heapcache(
         );
         cached
     } else {
-        let resbox =
-            ctx.trace_ctx
-                .record_op_with_descr(OpCode::GetarrayitemGcR, &[array, index], descr);
+        let resbox = ctx
+            .trace_ctx
+            .record_op_with_descr(opcode, &[array, index], descr);
         ctx.trace_ctx
             .heap_cache_mut()
             .getarrayitem_now_known(array, index, descr_index, resbox);
@@ -1249,22 +1258,55 @@ fn getarrayitem_gc_r_via_heapcache(
     };
 
     let dst = code[op.pc + 5] as usize;
-    let len = ctx.registers_r.len();
-    let slot = ctx
-        .registers_r
-        .get_mut(dst)
-        .ok_or(DispatchError::RegisterOutOfRange {
-            pc: op.pc,
-            reg: dst,
-            len,
-            bank: "r",
-        })?;
-    *slot = result;
+    match dst_bank {
+        'i' => {
+            let len = ctx.registers_i.len();
+            let slot = ctx
+                .registers_i
+                .get_mut(dst)
+                .ok_or(DispatchError::RegisterOutOfRange {
+                    pc: op.pc,
+                    reg: dst,
+                    len,
+                    bank: "i",
+                })?;
+            *slot = result;
+        }
+        'r' => {
+            let len = ctx.registers_r.len();
+            let slot = ctx
+                .registers_r
+                .get_mut(dst)
+                .ok_or(DispatchError::RegisterOutOfRange {
+                    pc: op.pc,
+                    reg: dst,
+                    len,
+                    bank: "r",
+                })?;
+            *slot = result;
+        }
+        'f' => {
+            let len = ctx.registers_f.len();
+            let slot = ctx
+                .registers_f
+                .get_mut(dst)
+                .ok_or(DispatchError::RegisterOutOfRange {
+                    pc: op.pc,
+                    reg: dst,
+                    len,
+                    bank: "f",
+                })?;
+            *slot = result;
+        }
+        _ => unreachable!("dst_bank must be 'i', 'r' or 'f'"),
+    }
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
-/// `setarrayitem_gc_r/rird` handler. Operand layout `rird`:
-/// 1B r-reg(array) + 1B i-reg(index) + 1B r-reg(value) + 2B descr.
+/// `setarrayitem_gc_<i|r|f>/ri{i,r,f}d` handler. Operand layout per
+/// `bhimpl_setarrayitem_gc_{i,r,f}(cpu, array, index, newvalue,
+/// arraydescr)` (`blackhole.py:1351-1359`):
+/// 1B r-reg(array) + 1B i-reg(index) + 1B {i,r,f}-reg(newvalue) + 2B descr.
 ///
 /// RPython parity: `pyjitpl.py:736-744 _opimpl_setarrayitem_gc_any`
 /// dispatches through `metainterp.execute_setarrayitem_gc(arraydescr,
@@ -1276,14 +1318,23 @@ fn getarrayitem_gc_r_via_heapcache(
 /// `_opimpl_setarrayitem_gc_any` has no `if cached == value: return`,
 /// because `heapcache.setarrayitem` already handles aliasing
 /// invalidation at the right granularity).
-fn setarrayitem_gc_r_via_heapcache(
+///
+/// `value_bank` selects the newvalue register source: `'i'` /
+/// `'r'` / `'f'`.
+fn setarrayitem_gc_via_heapcache(
     code: &[u8],
     op: &DecodedOp,
     ctx: &mut WalkContext<'_, '_>,
+    value_bank: char,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let array = read_ref_reg(code, op, 0, ctx)?;
     let index = read_int_reg(code, op, 1, ctx)?;
-    let value = read_ref_reg(code, op, 2, ctx)?;
+    let value = match value_bank {
+        'i' => read_int_reg(code, op, 2, ctx)?,
+        'r' => read_ref_reg(code, op, 2, ctx)?,
+        'f' => read_float_reg(code, op, 2, ctx)?,
+        _ => unreachable!("value_bank must be 'i', 'r' or 'f'"),
+    };
     let descr = read_descr(code, op, 3, ctx)?;
     let descr_index = descr.index();
 
@@ -1341,9 +1392,8 @@ fn setfield_gc_via_heapcache(
     let valuebox = match value_bank {
         'i' => read_int_reg(code, op, 1, ctx)?,
         'r' => read_ref_reg(code, op, 1, ctx)?,
-        _ => {
-            unreachable!("value_bank must be 'i' or 'r' (no float setfield variant emitted today)")
-        }
+        'f' => read_float_reg(code, op, 1, ctx)?,
+        _ => unreachable!("value_bank must be 'i', 'r' or 'f'"),
     };
     let descr = read_descr(code, op, 2, ctx)?;
     let descr_index = descr.index();
@@ -1467,7 +1517,20 @@ fn getfield_gc_via_heapcache(
                 })?;
             *slot = result;
         }
-        _ => unreachable!("dst_bank must be 'i' or 'r' (no float getfield variant)"),
+        'f' => {
+            let len = ctx.registers_f.len();
+            let slot = ctx
+                .registers_f
+                .get_mut(dst)
+                .ok_or(DispatchError::RegisterOutOfRange {
+                    pc: op.pc,
+                    reg: dst,
+                    len,
+                    bank: "f",
+                })?;
+            *slot = result;
+        }
+        _ => unreachable!("dst_bank must be 'i', 'r' or 'f'"),
     }
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
@@ -1516,6 +1579,35 @@ fn binop_ref_to_int_record(
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let a = read_ref_reg(code, op, 0, ctx)?;
     let b = read_ref_reg(code, op, 1, ctx)?;
+    let result = ctx.trace_ctx.record_op(opcode, &[a, b]);
+    let dst = code[op.pc + 3] as usize;
+    let len = ctx.registers_i.len();
+    let slot = ctx
+        .registers_i
+        .get_mut(dst)
+        .ok_or(DispatchError::RegisterOutOfRange {
+            pc: op.pc,
+            reg: dst,
+            len,
+            bank: "i",
+        })?;
+    *slot = result;
+    Ok((DispatchOutcome::Continue, op.next_pc))
+}
+
+/// Generic float-pair-to-int handler for `float_<cmp>/ff>i` (operand
+/// layout `ff>i`: 1B f-src + 1B f-src + 1B i-dst).  RPython parity:
+/// `bhimpl_float_{lt,le,eq,ne,gt,ge}` (`blackhole.py:721-746`) — read
+/// two `f` regs, record `OpCode::Float<Cmp>`, write the recorder
+/// result into `registers_i[dst]`.
+fn binop_float_to_int_record(
+    code: &[u8],
+    op: &DecodedOp,
+    ctx: &mut WalkContext<'_, '_>,
+    opcode: OpCode,
+) -> Result<(DispatchOutcome, usize), DispatchError> {
+    let a = read_float_reg(code, op, 0, ctx)?;
+    let b = read_float_reg(code, op, 1, ctx)?;
     let result = ctx.trace_ctx.record_op(opcode, &[a, b]);
     let dst = code[op.pc + 3] as usize;
     let len = ctx.registers_i.len();
@@ -2947,6 +3039,13 @@ fn dispatch_inline_call_dr_kind(
         DispatchOutcome::SubReturn {
             result: Some(value),
         } => {
+            if dst_bank == 'v' {
+                // `inline_call_r_v/dR`
+                // (`bhimpl_inline_call_r_v` `blackhole.py:1287-1290`)
+                // expects a void-return callee. A `Some` return here is
+                // a codewriter shape mismatch.
+                return Err(DispatchError::UnexpectedNonVoidSubReturn { pc: op.pc });
+            }
             let dst = code[op.pc + 1 + 2 + arg_width] as usize;
             match dst_bank {
                 'r' => {
@@ -2976,13 +3075,18 @@ fn dispatch_inline_call_dr_kind(
                     *slot = value;
                 }
                 _ => unreachable!(
-                    "dispatch_inline_call_dr_kind dst_bank must be 'r' or 'i' (\
+                    "dispatch_inline_call_dr_kind dst_bank must be 'r', 'i' or 'v' (\
                      codewriter does not emit dR>f shape today)"
                 ),
             }
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
         DispatchOutcome::SubReturn { result: None } => {
+            if dst_bank == 'v' {
+                // `inline_call_r_v/dR` expects exactly this — callee
+                // exits via `void_return/`, no SubReturn writeback.
+                return Ok((DispatchOutcome::Continue, op.next_pc));
+            }
             // Same shape contract as `_r_r`: a `_r_<X>` variant promises
             // a non-void result for the dst's `>X` slot. A void return
             // reaching here is a codewriter shape mismatch.
@@ -3107,6 +3211,9 @@ fn dispatch_inline_call_dir_kind(
         DispatchOutcome::SubReturn {
             result: Some(value),
         } => {
+            if dst_bank == 'v' {
+                return Err(DispatchError::UnexpectedNonVoidSubReturn { pc: op.pc });
+            }
             // dst register byte sits after descr (2B) + I-list (int_width)
             // + R-list (ref_width) bytes.
             let dst = code[op.pc + 1 + 2 + int_width + ref_width] as usize;
@@ -3137,11 +3244,14 @@ fn dispatch_inline_call_dir_kind(
                             })?;
                     *slot = value;
                 }
-                _ => unreachable!("dispatch_inline_call_dir_kind dst_bank must be 'r' or 'i'"),
+                _ => unreachable!("dispatch_inline_call_dir_kind dst_bank must be 'r', 'i' or 'v'"),
             }
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
         DispatchOutcome::SubReturn { result: None } => {
+            if dst_bank == 'v' {
+                return Ok((DispatchOutcome::Continue, op.next_pc));
+            }
             Err(DispatchError::UnexpectedVoidSubReturn { pc: op.pc })
         }
         DispatchOutcome::SubRaise { exc } => {
@@ -3272,8 +3382,24 @@ fn dispatch_inline_call_dirf_kind(
         DispatchOutcome::SubReturn {
             result: Some(value),
         } => {
+            if dst_bank == 'v' {
+                return Err(DispatchError::UnexpectedNonVoidSubReturn { pc: op.pc });
+            }
             let dst = code[op.pc + 1 + 2 + int_width + ref_width + float_width] as usize;
             match dst_bank {
+                'i' => {
+                    let len = ctx.registers_i.len();
+                    let slot =
+                        ctx.registers_i
+                            .get_mut(dst)
+                            .ok_or(DispatchError::RegisterOutOfRange {
+                                pc: op.pc,
+                                reg: dst,
+                                len,
+                                bank: "i",
+                            })?;
+                    *slot = value;
+                }
                 'r' => {
                     let len = ctx.registers_r.len();
                     let slot =
@@ -3301,13 +3427,15 @@ fn dispatch_inline_call_dirf_kind(
                     *slot = value;
                 }
                 _ => unreachable!(
-                    "dispatch_inline_call_dirf_kind dst_bank must be 'r' or 'f' \
-                     (codewriter emits no dIRF>i shape today)"
+                    "dispatch_inline_call_dirf_kind dst_bank must be 'i', 'r', 'f' or 'v'"
                 ),
             }
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
         DispatchOutcome::SubReturn { result: None } => {
+            if dst_bank == 'v' {
+                return Ok((DispatchOutcome::Continue, op.next_pc));
+            }
             Err(DispatchError::UnexpectedVoidSubReturn { pc: op.pc })
         }
         DispatchOutcome::SubRaise { exc } => {
@@ -3359,18 +3487,26 @@ fn handle(
         // the same `dR` arglist shape; only the dst bank differs.
         "inline_call_r_r/dR>r" => dispatch_inline_call_dr_kind(code, op, ctx, 'r'),
         "inline_call_r_i/dR>i" => dispatch_inline_call_dr_kind(code, op, ctx, 'i'),
+        // `_r_v/dR` — void-return variant per `bhimpl_inline_call_r_v`
+        // (`blackhole.py:1287`).  Same recursion + arglist as `_r_*`;
+        // callee exits via `void_return/`, no SubReturn writeback.
+        "inline_call_r_v/dR" => dispatch_inline_call_dr_kind(code, op, ctx, 'v'),
         // `_ir_*` variants extend the arglist to a (I-list, R-list) pair.
         // RPython's `setup_call(argboxes_i, argboxes_r, argboxes_f)` populates
         // both kind banks. The dst bank still selects the SubReturn write
-        // target (Ref bank for `_ir_r/dIR>r`, Int bank for `_ir_i/dIR>i`).
+        // target (Ref bank for `_ir_r/dIR>r`, Int bank for `_ir_i/dIR>i`,
+        // void no-write for `_ir_v/dIR`).
         "inline_call_ir_r/dIR>r" => dispatch_inline_call_dir_kind(code, op, ctx, 'r'),
         "inline_call_ir_i/dIR>i" => dispatch_inline_call_dir_kind(code, op, ctx, 'i'),
+        "inline_call_ir_v/dIR" => dispatch_inline_call_dir_kind(code, op, ctx, 'v'),
         // `_irf_*` variants extend the arglist with a float list (I-list,
         // R-list, F-list). Same `setup_call(argboxes_i, argboxes_r,
-        // argboxes_f)` distribution; dst bank chooses Ref vs Float for the
-        // SubReturn writeback.
+        // argboxes_f)` distribution; dst bank chooses Int / Ref / Float
+        // for the SubReturn writeback or void no-write for `_irf_v/dIRF`.
+        "inline_call_irf_i/dIRF>i" => dispatch_inline_call_dirf_kind(code, op, ctx, 'i'),
         "inline_call_irf_r/dIRF>r" => dispatch_inline_call_dirf_kind(code, op, ctx, 'r'),
         "inline_call_irf_f/dIRF>f" => dispatch_inline_call_dirf_kind(code, op, ctx, 'f'),
+        "inline_call_irf_v/dIRF" => dispatch_inline_call_dirf_kind(code, op, ctx, 'v'),
         "goto/L" => {
             // RPython `blackhole.py:950-952 bhimpl_goto(target): return
             // target`. The 2-byte LE label was resolved by
@@ -3504,6 +3640,16 @@ fn handle(
         "float_sub/ff>f" => binop_float_record(code, op, ctx, OpCode::FloatSub),
         "float_truediv/ff>f" => binop_float_record(code, op, ctx, OpCode::FloatTrueDiv),
         "float_neg/f>f" => unop_float_record(code, op, ctx, OpCode::FloatNeg),
+        // Float-to-int comparisons — `bhimpl_float_{lt,le,eq,ne,gt,ge}`
+        // (`blackhole.py:721-746`).  Read two `f` regs, record
+        // `OpCode::Float<Cmp>`, write the recorder result into the int
+        // bank.
+        "float_lt/ff>i" => binop_float_to_int_record(code, op, ctx, OpCode::FloatLt),
+        "float_le/ff>i" => binop_float_to_int_record(code, op, ctx, OpCode::FloatLe),
+        "float_eq/ff>i" => binop_float_to_int_record(code, op, ctx, OpCode::FloatEq),
+        "float_ne/ff>i" => binop_float_to_int_record(code, op, ctx, OpCode::FloatNe),
+        "float_gt/ff>i" => binop_float_to_int_record(code, op, ctx, OpCode::FloatGt),
+        "float_ge/ff>i" => binop_float_to_int_record(code, op, ctx, OpCode::FloatGe),
         // Int-bank unary ops. RPython parity:
         // `pyjitpl.py:356-368` (int_neg / int_invert) + 371-375
         // (int_same_as which calls `_record_helper(rop.SAME_AS_I, ...)`
@@ -3514,32 +3660,86 @@ fn handle(
         "int_same_as/i>i" => unop_int_record(code, op, ctx, OpCode::SameAsI),
         // `int_floordiv/ii>i` and `int_mod/ii>i` intentionally absent:
         // `jtransform.py:575-577` rewrites both to
-        // `direct_call(ll_int_py_*)` before jitcode emission, so neither
-        // opname is registered in the insns table.
+        // `direct_call(ll_int_py_*)` before jitcode emission.  The
+        // trace-front lowering at `majit-translate/src/codegen.rs`
+        // mirrors that rewrite for code reaching the JIT trace, so
+        // this walker is never asked to dispatch the bare ops on a
+        // traceable path.  Build-time helper graphs that still emit
+        // the bare ops (e.g. `pyre/pyre-interpreter/src/baseobjspace.rs`
+        // long_mod / long_div until the build-pipeline jtransform
+        // port lands) get a `setdefault`-allocated dynamic byte and
+        // resolve through BH dispatch only.
         "cast_int_to_float/i>f" => cast_int_to_float_record(code, op, ctx),
         "ptr_eq/rr>i" => binop_ref_to_int_record(code, op, ctx, OpCode::PtrEq),
         "ptr_ne/rr>i" => binop_ref_to_int_record(code, op, ctx, OpCode::PtrNe),
         // Heapcache-aware getfield reads. RPython
-        // `pyjitpl.py:855-882 opimpl_getfield_gc_<i|r>` →
+        // `pyjitpl.py:855-882 opimpl_getfield_gc_<i|r|f>` →
         // `_opimpl_getfield_gc_any_pureornot` (`pyjitpl.py:929-950`)
         // dispatches the same way through `heapcache.get_field_updater`.
-        // Walker only handles the canonical `rd>X` shapes (Ref source);
+        // Walker handles the canonical `rd>X` shapes (Ref source);
         // pyre-specific `id>X` variants where the source is an int
         // register holding an unwrapped pointer are kind-flow Task #85
         // territory and stay unsupported here.
         "getfield_gc_i/rd>i" => getfield_gc_via_heapcache(code, op, ctx, OpCode::GetfieldGcI, 'i'),
         "getfield_gc_r/rd>r" => getfield_gc_via_heapcache(code, op, ctx, OpCode::GetfieldGcR, 'r'),
+        "getfield_gc_f/rd>f" => getfield_gc_via_heapcache(code, op, ctx, OpCode::GetfieldGcF, 'f'),
+        // RPython `blackhole.py:1441-1443` aliases
+        // `bhimpl_getfield_gc_{i,r,f}_pure = bhimpl_getfield_gc_{i,r,f}` —
+        // pure-getter shape on quasi-immutable descrs.  Walker emits
+        // the non-pure opcode; the optimizer rewrites to the Pure form
+        // post-trace based on `descr.is_always_pure()`
+        // (`resoperation.py:1284-1289 OpHelpers.getfield_pure_for_descr`).
+        "getfield_gc_i_pure/rd>i" => {
+            getfield_gc_via_heapcache(code, op, ctx, OpCode::GetfieldGcI, 'i')
+        }
+        "getfield_gc_r_pure/rd>r" => {
+            getfield_gc_via_heapcache(code, op, ctx, OpCode::GetfieldGcR, 'r')
+        }
+        "getfield_gc_f_pure/rd>f" => {
+            getfield_gc_via_heapcache(code, op, ctx, OpCode::GetfieldGcF, 'f')
+        }
         // setfield_gc canonical shapes. `iid` / `ird` (int box)
         // shapes are pyre kind-flow Task #85 territory and stay
         // unsupported.
         "setfield_gc_i/rid" => setfield_gc_via_heapcache(code, op, ctx, 'i'),
         "setfield_gc_r/rrd" => setfield_gc_via_heapcache(code, op, ctx, 'r'),
-        // Heapcache-aware array reads/writes (canonical Ref shapes).
-        // `getarrayitem_gc_r/rrd>r` (Ref index) + `setarrayitem_gc_*`
-        // variants with non-canonical shapes (rrid / rrrd / rrfd —
-        // Ref index) stay unsupported (Task #85 kind-flow territory).
-        "getarrayitem_gc_r/rid>r" => getarrayitem_gc_r_via_heapcache(code, op, ctx),
-        "setarrayitem_gc_r/rird" => setarrayitem_gc_r_via_heapcache(code, op, ctx),
+        "setfield_gc_f/rfd" => setfield_gc_via_heapcache(code, op, ctx, 'f'),
+        // Heapcache-aware array reads/writes (canonical `rid>X` /
+        // `ri{i,r,f}d` shapes).  The pyre-only Ref-index shape
+        // `getarrayitem_gc_r/rrd>r` lives in `pyre_extension_insns()`
+        // and is NOT canonical; non-canonical setarrayitem shapes
+        // (`rrid`/`rrrd`/`rrfd`, Ref index) stay unsupported (Task #85
+        // kind-flow territory).
+        "getarrayitem_gc_i/rid>i" => {
+            getarrayitem_gc_via_heapcache(code, op, ctx, OpCode::GetarrayitemGcI, 'i')
+        }
+        "getarrayitem_gc_r/rid>r" => {
+            getarrayitem_gc_via_heapcache(code, op, ctx, OpCode::GetarrayitemGcR, 'r')
+        }
+        "getarrayitem_gc_f/rid>f" => {
+            getarrayitem_gc_via_heapcache(code, op, ctx, OpCode::GetarrayitemGcF, 'f')
+        }
+        // RPython `pyjitpl.py:701-734 opimpl_getarrayitem_gc_{i,f,r}_pure`
+        // — distinct opimpls (NOT aliased to the non-pure form,
+        // unlike `getfield_gc_*_pure` at `pyjitpl.py:884-886`).
+        // Records `rop.GETARRAYITEM_GC_PURE_{I,F,R}` directly through
+        // `_do_getarrayitem_gc_any(rop.GETARRAYITEM_GC_PURE_*, ...)`.
+        // The ConstPtr+ConstInt constant-fold fast path (`pyjitpl.py:
+        // 703-707`) is structurally unreachable on the symbolic walker
+        // (no concrete-pointer access on OpRefs); the cache miss
+        // branch records the Pure rop.
+        "getarrayitem_gc_i_pure/rid>i" => {
+            getarrayitem_gc_via_heapcache(code, op, ctx, OpCode::GetarrayitemGcPureI, 'i')
+        }
+        "getarrayitem_gc_r_pure/rid>r" => {
+            getarrayitem_gc_via_heapcache(code, op, ctx, OpCode::GetarrayitemGcPureR, 'r')
+        }
+        "getarrayitem_gc_f_pure/rid>f" => {
+            getarrayitem_gc_via_heapcache(code, op, ctx, OpCode::GetarrayitemGcPureF, 'f')
+        }
+        "setarrayitem_gc_i/riid" => setarrayitem_gc_via_heapcache(code, op, ctx, 'i'),
+        "setarrayitem_gc_r/rird" => setarrayitem_gc_via_heapcache(code, op, ctx, 'r'),
+        "setarrayitem_gc_f/rifd" => setarrayitem_gc_via_heapcache(code, op, ctx, 'f'),
         "int_copy/i>i" => {
             // RPython `pyjitpl.py:471-477 _opimpl_any_copy(self, box) → box`
             // + `@arguments("box")` + `>i` result coding: read src

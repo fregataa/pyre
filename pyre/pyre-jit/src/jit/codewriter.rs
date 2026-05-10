@@ -995,24 +995,23 @@ fn mergeblock(
             // PRE-EXISTING-ADAPTATION — pyre-only head-of-list
             // promotion.  Upstream `flowcontext.py:438-441` returns
             // the matched block directly; the surrounding pendingblocks
-            // queue carries block objects so an
-            // `ensure_pc_block`-style PC lookup never happens.
-            // Pyre's walker is PC-sequential (codewriter.rs:3514)
+            // queue carries block objects so a PC-keyed joinpoint
+            // lookup never happens.  Pyre's walker is PC-sequential
             // and reads "active block at PC N" through
-            // `joinpoints[pc].iter().find(|b| !b.dead())`.  The loop
-            // above allows `continue` on union-None (line 957), so a
-            // match can land at `index > 0`; without this reorder
-            // the next `ensure_pc_block(next_offset)` would return
-            // a sibling candidate instead of the one we just linked
-            // into, and the walker would emit subsequent ops against
-            // a different block's FrameState.  The supersede branch
-            // at codewriter.rs:1021-1022 and the fresh-path
-            // `candidates.insert(0, ...)` at codewriter.rs:1038 /
-            // ensure_pc_block at codewriter.rs:1069 already preserve
-            // the head-of-list invariant; the match branch must do
-            // the same.  Retires together with `ensure_pc_block`
-            // when Task #227 Phase 4 replaces PC lookup with a
-            // pendingblocks-driven walker.
+            // `joinpoints.get(&py_pc).and_then(|blocks|
+            // blocks.iter().find(|b| !b.dead()))` (codewriter.rs:3584).
+            // The loop above allows `continue` on union-None (line
+            // 957), so a match can land at `index > 0`; without this
+            // reorder the next joinpoint lookup at `next_offset` would
+            // return a sibling candidate instead of the one we just
+            // linked into, and the walker would emit subsequent ops
+            // against a different block's FrameState.  The supersede
+            // branch at codewriter.rs:1021-1022 and the fresh-path
+            // `candidates.insert(0, ...)` at codewriter.rs:1038 / 1080
+            // already preserve the head-of-list invariant; the match
+            // branch must do the same.  Retires when Task #227 Phase
+            // 4 replaces PC sequencing with a pendingblocks-driven
+            // walker.
             if index != 0 {
                 candidates.remove(index);
                 candidates.insert(0, block.clone());

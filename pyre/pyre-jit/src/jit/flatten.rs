@@ -617,63 +617,46 @@ pub fn slot_for_call_flavor(flavor: CallFlavor) -> majit_metainterp::EffectInfoS
 pub fn effect_info_for_call_flavor(flavor: CallFlavor) -> majit_ir::EffectInfo {
     use majit_ir::{EffectInfo, ExtraEffect};
     match flavor {
-        // EF_CAN_RAISE — default normal call (`effectinfo.py:22`).
-        // Mirror `majit-metainterp/src/call_descr.rs::default_effect_info()`
-        // (the conservative "all read/write descrs touched" fallback used
-        // when the producer has no analyzer output).  `EffectInfo::default()`
-        // alone leaves the descr bitsets at zero, which makes
-        // `force_from_effectinfo` (`heap.py:540-560`) skip the cached
-        // lazy_set / field flush — a regression vs main's plain void
-        // residual call invalidation.  `call.py:296-326 getcalldescr` is
-        // the upstream constructor; the analyzer port is a separate epic.
-        CallFlavor::Plain => EffectInfo {
-            extraeffect: ExtraEffect::CanRaise,
-            readonly_descrs_fields: Some(vec![0xff; 8]),
-            write_descrs_fields: Some(vec![0xff; 8]),
-            readonly_descrs_arrays: Some(vec![0xff; 8]),
-            write_descrs_arrays: Some(vec![0xff; 8]),
-            readonly_descrs_interiorfields: Some(vec![0xff; 8]),
-            write_descrs_interiorfields: Some(vec![0xff; 8]),
-            ..EffectInfo::default()
-        },
+        // EF_CAN_RAISE — `call.py:300 elif self._canraise(op)`
+        // selects this extraeffect for plain non-elidable raising
+        // callees.  `MOST_GENERAL` (`EF_RANDOM_EFFECTS = 7`) is
+        // strictly the `randomeffects_analyzer` branch
+        // (`call.py:282-283`); collapsing Plain onto it would route
+        // every plain call through
+        // `check_forces_virtual_or_virtualizable()`
+        // (`pyjitpl.py:2007`, `effectinfo.py:250`), inserting
+        // unnecessary `GUARD_NOT_FORCED` and over-zeroing heap caches
+        // via `force_from_effectinfo`'s `clear_caches` branch.
+        CallFlavor::Plain => majit_metainterp::default_effect_info(),
         // EF_CANNOT_RAISE — `call.py:303 getcalldescr`'s `else` branch
         // (non-elidable callee whose `_canraise(op) == False`).
         // `pyjitpl.py:2111 do_residual_call` reads `exc =
         // effectinfo.check_can_raise()` (`effectinfo.py:236`,
         // `extraeffect > EF_CANNOT_RAISE`) which is false for
         // `extraeffect == 2`, so the canonical walker skips the trailing
-        // `GUARD_NO_EXCEPTION`.  Same `read/write_descrs_*` saturation
-        // as `Plain` — pyre's analyzer port (Task #64) is the upstream
-        // replacement; producers select this flavor today only when the
-        // callee is statically known not to raise.
+        // `GUARD_NO_EXCEPTION`.  Producers select this flavor only when
+        // the callee is statically known not to raise; the
+        // `cannot_raise_effect_info()` body keeps the saturated
+        // `Some(vec![0xff; 8])` bitstrings as the analyzer-absent
+        // conservative fallback for hand-classified non-raising
+        // helpers that may still touch heap state.  Helpers known to
+        // touch no heap opt into `CANNOT_RAISE_NO_HEAP_EFFECT_INFO`
+        // (the analyzer-output empty-set shape) instead.
         CallFlavor::PlainCannotRaise => majit_metainterp::cannot_raise_effect_info(),
-        // EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE — `effectinfo.py:23`.
-        // `optimize_CALL_MAY_FORCE_*` branch.
-        //
-        // PRE-EXISTING-ADAPTATION (Slice γ): saturate the
-        // `read/write_descrs_*` bitsets to `Some(vec![0xff; 8])`,
-        // matching the `Plain` / `cannot_raise_effect_info()`
-        // analyzer-absent fallback
-        // (`call_descr.rs:175-207 default_effect_info()`).
-        // RPython's `effectinfo.py:172-177` only clears
-        // `_write_descrs_*` for elidable / loopinvariant extraeffects;
-        // `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE` keeps the analyzer's
-        // results, which without an analyzer means `effectinfo.py:285`
-        // `top_set` saturation.  The previous `..default()` left the
-        // bitsets at 0, so `force_from_effectinfo`
-        // (`heap.rs:712 force_lazy_setfields_and_arrayitems_from_effectinfo`)
-        // skipped the cached descr flush after a MayForce call —
-        // a NEW-DEVIATION the reviewer flagged as #4.
-        CallFlavor::MayForce => EffectInfo {
-            extraeffect: ExtraEffect::ForcesVirtualOrVirtualizable,
-            readonly_descrs_fields: Some(vec![0xff; 8]),
-            write_descrs_fields: Some(vec![0xff; 8]),
-            readonly_descrs_arrays: Some(vec![0xff; 8]),
-            write_descrs_arrays: Some(vec![0xff; 8]),
-            readonly_descrs_interiorfields: Some(vec![0xff; 8]),
-            write_descrs_interiorfields: Some(vec![0xff; 8]),
-            ..EffectInfo::default()
-        },
+        // EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE — `call.py:288-289`
+        // selects this extraeffect when `virtualizable_analyzer.
+        // analyze(op)` is true.  `MOST_GENERAL` (`EF_RANDOM_EFFECTS
+        // = 7`) is strictly the `randomeffects_analyzer` branch
+        // (`call.py:282-283`); collapsing onto it would over-claim
+        // random-effects semantics on a callee whose only declared
+        // escape is virtualizable forcing.  Both values pass
+        // `check_forces_virtual_or_virtualizable()` so dispatch
+        // through `optimize_CALL_MAY_FORCE_*` (`pyjitpl.py:2007-2068`)
+        // is the same — but `EF_RANDOM_EFFECTS` additionally trips
+        // `has_random_effects()` (`effectinfo.py:252`) which
+        // `OptHeap.optimize_CALL` reads to invalidate caches that
+        // `EF_FORCES` leaves intact.
+        CallFlavor::MayForce => majit_metainterp::forces_virtual_or_virtualizable_effect_info(),
         // EF_LOOPINVARIANT — `effectinfo.py:18`.
         // `optimize_CALL_LOOPINVARIANT_*` branch.
         CallFlavor::LoopInvariant => EffectInfo {
@@ -1969,9 +1952,10 @@ where
             // exclusively `returnblock` (1 arg) or `exceptblock`
             // (2 args), and both are handled by `make_return`.  Any
             // other empty-exits block shape is a walker NEW-DEVIATION
-            // (orphan join-point left by `ensure_pc_block` with
-            // FrameState-merge inputargs and no incoming fall-through
-            // edge — see `w1_root_cause_analysis_2026_05_07.md`).
+            // (orphan join-point left by the PC-sequential walker
+            // creating a fresh `joinpoints[pc]` entry with FrameState-
+            // merge inputargs and no incoming fall-through edge —
+            // see `w1_root_cause_analysis_2026_05_07.md`).
             // Fail-loud here so any future flatten_graph driver
             // promotion against such graphs surfaces immediately
             // instead of silently emitting `Insn::Unreachable`; the
@@ -3570,11 +3554,19 @@ mod tests {
 
     #[test]
     fn call_flavor_round_trip_through_effect_info() {
-        // call.py:282-303 maps each ExtraEffect to one CallFlavor; the
-        // round-trip property is `dispatch_kind_for_effect_info(
-        // effect_info_for_call_flavor(f)) == f` for every flavor that
-        // carries a fully materialized EffectInfo. ReleaseGil is excluded:
-        // it needs the real target address or the explicit via-target seed.
+        // `call.py:282-303 getcalldescr` maps each `ExtraEffect` to one
+        // `CallFlavor`; the round-trip property
+        //   `dispatch_kind_for_effect_info(effect_info_for_call_flavor(f)) == f`
+        // holds for every flavor since each one carries a distinct
+        // upstream `extraeffect` (Plain → `EF_CAN_RAISE`, MayForce →
+        // `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE`, …).  `ReleaseGil` is
+        // excluded — it requires the resolved `(target_fn_addr,
+        // save_err)` pair from `call.py:252-258
+        // _call_aroundstate_target_` and is built by
+        // `assembler.rs::call_release_gil_*_canonical_via_target`
+        // instead; the unresolved-target shape exercised by
+        // `unresolved_release_gil_effect_info_routes_to_release_gil_dispatch`
+        // covers the via-target seed half of the round trip.
         for flavor in [
             CallFlavor::Plain,
             CallFlavor::PlainCannotRaise,
@@ -3598,6 +3590,33 @@ mod tests {
         let ei = unresolved_release_gil_effect_info_for_via_target();
         assert_eq!(dispatch_kind_for_effect_info(&ei), CallFlavor::ReleaseGil);
         assert_eq!(ei.call_release_gil_target, (1, 0));
+    }
+
+    #[test]
+    fn analyzer_absent_plain_and_may_force_carry_distinct_extra_effects() {
+        // `call.py:288-303 getcalldescr` keeps `EF_CAN_RAISE`
+        // (plain raising callees) and `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE`
+        // (virtualizable forcing callees) as distinct extraeffect
+        // values.  Collapsing them both onto `EF_RANDOM_EFFECTS = 7`
+        // (`MOST_GENERAL`) would over-claim random-effects semantics on
+        // plain calls, routing them through
+        // `check_forces_virtual_or_virtualizable()` (`pyjitpl.py:2007`,
+        // `effectinfo.py:250`) and tripping `has_random_effects()`
+        // cache invalidation that `EF_CAN_RAISE` / `EF_FORCES` leave
+        // intact.
+        let plain_ei = effect_info_for_call_flavor(CallFlavor::Plain);
+        let may_force_ei = effect_info_for_call_flavor(CallFlavor::MayForce);
+        assert_ne!(plain_ei, may_force_ei);
+        assert_eq!(plain_ei.extraeffect, majit_ir::ExtraEffect::CanRaise);
+        assert_eq!(
+            may_force_ei.extraeffect,
+            majit_ir::ExtraEffect::ForcesVirtualOrVirtualizable
+        );
+        assert_eq!(dispatch_kind_for_effect_info(&plain_ei), CallFlavor::Plain);
+        assert_eq!(
+            dispatch_kind_for_effect_info(&may_force_ei),
+            CallFlavor::MayForce
+        );
     }
 
     #[test]
@@ -5702,17 +5721,18 @@ mod tests {
     }
 
     #[test]
-    fn build_load_global_helper_differs_from_binary_op_helper_only_in_flavor() {
-        // Cross-verify that the LoadGlobal helper's only structural
-        // difference from BINARY_OP at the same `(fn_idx, op_val,
-        // lhs_reg, rhs_reg, dst_reg)` tuple is the EffectInfo
-        // CallFlavor on the Descr operand: BINARY_OP records
-        // `MayForce`, LoadGlobal records `Plain`.  This locks in the
-        // factor refactor invariant — both share the same
-        // `(Ref, Ref, Int) → Ref` arity through
-        // `build_residual_call_ir_r_insn_from_operands` and the
-        // helpers diverge only in the `flavor` parameter passed to
-        // that shared constructor.
+    fn build_load_global_helper_carries_distinct_ei_from_binary_op_helper_under_analyzer_absent_default()
+     {
+        // BINARY_OP is hand-classified `MayForce`
+        // (`EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE`, `call.py:288-289`)
+        // and LoadGlobal is hand-classified `Plain`
+        // (`EF_CAN_RAISE`, `call.py:300`).  Each helper's
+        // `EffectInfo` carries the matching extraeffect; the two are
+        // never equal at the descr level — collapsing them onto
+        // `MOST_GENERAL` would route plain calls through
+        // `has_random_effects()` cache invalidation
+        // (`effectinfo.py:252`) that strict parity reserves for the
+        // `randomeffects_analyzer` branch (`call.py:282-283`).
         let bin = build_binary_op_residual_call_ir_r_insn(7, 0, 1, 2, 3);
         let glob = build_load_global_fn_residual_call_ir_r_insn(7, 0, 1, 2, 3);
         let bin_descr = match &bin {
@@ -5735,7 +5755,12 @@ mod tests {
             },
             _ => panic!("LoadGlobal Insn is not Op"),
         };
-        assert_ne!(bin_descr, glob_descr, "flavors must differ");
+        assert_ne!(bin_descr, glob_descr);
+        assert_eq!(
+            bin_descr.extraeffect,
+            majit_ir::ExtraEffect::ForcesVirtualOrVirtualizable
+        );
+        assert_eq!(glob_descr.extraeffect, majit_ir::ExtraEffect::CanRaise);
         assert_eq!(bin_descr, effect_info_for_call_flavor(CallFlavor::MayForce));
         assert_eq!(glob_descr, effect_info_for_call_flavor(CallFlavor::Plain));
     }

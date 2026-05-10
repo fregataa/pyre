@@ -33,7 +33,7 @@ use pyre_object::{__majit_call_policy_int_bit_count, __majit_call_target_int_bit
 /// `getfunctionptr` parity, observed from outside the helper's crate.
 #[test]
 fn elidable_helper_macro_advertises_extern_c_trampoline() {
-    let (policy, _, trace_target, concrete_target, _) =
+    let (policy, _, trace_target, concrete_target, _, _) =
         __majit_call_policy_jit_int_in_small_cache_range();
     assert_eq!(policy, 19u8);
     assert_eq!(
@@ -154,7 +154,7 @@ fn emit_trace_call_int_typed_elidable_cannot_raise_routes_to_call_pure_i() {
 /// same `record_result_of_call_pure` path.
 #[test]
 fn elidable_int_bit_count_macro_advertises_extern_c_trampoline_and_traces_call_pure_i() {
-    let (policy, _, trace_target, _, _) = __majit_call_policy_int_bit_count();
+    let (policy, _, trace_target, _, _, _) = __majit_call_policy_int_bit_count();
     assert_eq!(policy, 19u8);
     assert_eq!(trace_target, __majit_call_target_int_bit_count as *const (),);
 

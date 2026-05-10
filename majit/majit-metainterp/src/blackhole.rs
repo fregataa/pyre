@@ -8155,11 +8155,15 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
 
     // PRE-EXISTING-ADAPTATION: pyre nested-bytecode `inline_call`.  See
     // the comment on `handler_inline_call_pyre_nested` for rationale.
-    // The canonical keys above remain wired but stay inert in production
-    // because pyre never registers them in `wellknown_bh_insns()` (no
-    // matching entry in `setup_insns`-built `_insns`).  Byte 17 is
-    // exposed via the pyre-only `inline_call_pyre_nested/P` key in
-    // `pyre_extension_insns()`.
+    // The canonical `inline_call_{r,ir,irf}_*` keys above are now pinned
+    // in `wellknown_bh_insns()` (`BC_INLINE_CALL_*`,
+    // `insns.rs:797-806`) so their handlers dispatch through
+    // `setup_insns`-built `_insns` like every other canonical opcode.
+    // Byte 17 (`BC_INLINE_CALL`) sits below the canonical range and is
+    // exposed via the separate pyre-only `inline_call_pyre_nested/P`
+    // key in `pyre_extension_insns()` — the adapter shape that carries
+    // pyre's nested-bytecode payload, distinct from the canonical
+    // `dR`/`dIR`/`dIRF` arglists.
     builder.wire_handler("inline_call_pyre_nested/P", handler_inline_call_pyre_nested);
     // P10 — pyre call_assembler / cond_call / record_known_result adapter wiring.
     builder.wire_handler("call_assembler_int_pyre/P", handler_call_assembler_int_pyre);
@@ -10199,8 +10203,12 @@ fn handler_record_known_result_ref_pyre(
 /// `u16::MAX` in any return slot encodes "no caller destination".
 ///
 /// Registered via the pyre-only opname `inline_call_pyre_nested/P`
-/// in `pyre_extension_insns()`; canonical `inline_call_*` keys remain
-/// quarantined out of `wellknown_bh_insns()`.
+/// in `pyre_extension_insns()`.  Canonical `inline_call_{r,ir,irf}_*`
+/// keys are pinned in `wellknown_bh_insns()` (`BC_INLINE_CALL_*`,
+/// `insns.rs:797-806`) — this `_pyre_nested/P` shape is a separate
+/// pyre-only adapter that carries the nested-bytecode payload layout
+/// described above, distinct from the canonical `dR`/`dIR`/`dIRF`
+/// arglist shapes the upstream walker dispatches.
 fn handler_inline_call_pyre_nested(
     bh: &mut BlackholeInterpreter,
     code: &[u8],

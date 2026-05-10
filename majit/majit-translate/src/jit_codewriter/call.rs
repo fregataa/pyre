@@ -701,16 +701,20 @@ impl StructLayout {
 /// `cpu.arraydescrof(ARRAY).get_ei_index()`.
 ///
 /// RPython: each descriptor gets a globally unique index via
-/// `compute_bitstrings()`. The bitstring module creates variable-length
-/// bitfields. In majit we use fixed-width u64, so indices wrap at 64.
+/// `effectinfo.py:465-538 compute_bitstrings()`.  Indices are monotonic
+/// `u32` (no upper bound from the bitstring representation; the final
+/// `make_bitstring` (`bitstring.py:3-13`) sizes the byte vector to
+/// `(max_index + 7) / 8`).  Pyre keeps the same monotonic shape:
+/// `(owner_root, field_name)` keys always map to the same index, and
+/// distinct keys never alias.
 ///
-/// Guarantees: same (owner_root, field_name) always gets the same index.
-/// Limitation: after 64 unique field descriptors, indices wrap and may
-/// alias unrelated descriptors. This matches RPython's bitstring semantics
-/// where aliased bits cause conservative over-approximation (safe but
-/// imprecise). Array descriptors are keyed by `(item_ty, array_type_id)`,
-/// matching RPython's `cpu.arraydescrof(ARRAY)` which distinguishes by
-/// ARRAY identity (e.g. `GcArray(Signed)` vs `GcArray(Ptr(STRUCT_X))`).
+/// Array descriptors are keyed by `(item_ty, array_type_id)` per
+/// RPython's `cpu.arraydescrof(ARRAY)`, which distinguishes by ARRAY
+/// lltype identity (`GcArray(Signed)` vs `GcArray(Ptr(STRUCT_X))`,
+/// `effectinfo.py:307-311`).  Interior-field descriptors are keyed by
+/// `(array_type_id, field_name)` per
+/// `cpu.interiorfielddescrof(ARRAY, fieldname)` — a separate namespace
+/// from struct field indices.
 #[derive(Default)]
 pub struct DescrIndexRegistry {
     /// (owner_root, field_name) → unbounded `ei_index` per
@@ -748,12 +752,6 @@ impl DescrIndexRegistry {
     }
 
     /// RPython: `cpu.arraydescrof(ARRAY).get_ei_index()`
-    ///
-    /// Keys on `(item_ty_discriminant, array_type_id)` unconditionally.
-    /// RPython always distinguishes by ARRAY lltype identity:
-    /// `GcArray(Char)`, `GcArray(Signed)`, `GcArray(Bool)` are all
-    /// different descriptors even though they are all "integer" arrays
-    /// (effectinfo.py:307-311).
     pub fn array_index(&mut self, item_ty_discriminant: u8, array_type_id: &Option<String>) -> u32 {
         let key = (item_ty_discriminant, array_type_id.clone());
         *self.array_indices.entry(key).or_insert_with(|| {
@@ -764,11 +762,6 @@ impl DescrIndexRegistry {
     }
 
     /// RPython: `cpu.interiorfielddescrof(ARRAY, fieldname).get_ei_index()`
-    ///
-    /// Keys on `(array_type_id, field_name)` — matches RPython's cache key
-    /// `(ARRAY, name, arrayfieldname)` in `get_interiorfield_descr()`.
-    /// Separate namespace from field_indices: two different array types
-    /// with the same element struct get different interiorfield indices.
     pub fn interiorfield_index(&mut self, array_type_id: &Option<String>, field_name: &str) -> u32 {
         let key = (array_type_id.clone(), field_name.to_string());
         *self.interiorfield_indices.entry(key).or_insert_with(|| {

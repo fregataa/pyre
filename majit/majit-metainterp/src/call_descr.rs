@@ -179,16 +179,30 @@ impl majit_ir::descr::LoopTokenDescr for MetaCallAssemblerDescr {
 ///    correctness no-op for helpers that never raise but still bloats
 ///    the trace.
 ///
-/// `EF_CAN_RAISE` with all-ones field/array bitsets is the parity-
-/// equivalent middle ground: `force_from_effectinfo` (heap.py:540-560)
-/// iterates per cached descr index and sees both readonly and write
-/// bits set, so every cached lazy_set / field gets flushed exactly the
-/// same way as the conservative branch — without resetting
-/// `seen_guard_not_invalidated` or routing through `clean_caches`.
-/// The bitsets are 8 bytes wide; descr indices ≥ 64 still slip through,
-/// the same blind spot upstream papered over with frozenset bitstrings
-/// before the bitstring rewrite. PRE-EXISTING-ADAPTATION: the analyzer
-/// port replaces this fallback with per-callee `EffectInfo`.
+/// `EF_CAN_RAISE` analyzer-absent fallback (`effectinfo.py:22`).
+/// Upstream `call.py:300 elif self._canraise(op)` selects this
+/// extraeffect for plain non-elidable raising callees — the
+/// analyzer-absent default for `pyjitpl.py:2007 do_residual_call`'s
+/// CALL/CALL_PURE/CALL_MAY_FORCE/CALL_LOOPINVARIANT switch.
+/// `MOST_GENERAL` (`EF_RANDOM_EFFECTS = 7`) is reserved for callees
+/// the `randomeffects_analyzer` flagged (`call.py:282-283`); using it
+/// as a default would route every plain call through
+/// `check_forces_virtual_or_virtualizable()` (`pyjitpl.py:2007`,
+/// `effectinfo.py:250 extraeffect >= EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE`),
+/// inserting unnecessary `GUARD_NOT_FORCED` and over-zeroing heap
+/// caches via `force_from_effectinfo`'s `clear_caches` branch.
+///
+/// PRE-EXISTING-ADAPTATION: same `read/write_descrs_*` and
+/// `can_collect` saturation as [`cannot_raise_effect_info()`].
+/// `call.py:320-324 effectinfo_from_writeanalyze` builds those
+/// bitsets from the `readwrite_analyzer` and `collect_analyzer`
+/// results.  Pyre has the analyzer ported (`majit-translate/src/
+/// jit_codewriter/call.rs:3250`) but plumbing per-callsite EI from
+/// the codewriter pipeline back to runtime trace recording is still
+/// pending (Task #64); until that wire-up lands, conservative
+/// full-bitset is the line-by-line equivalent of "no analyzer
+/// available at this callsite", matching the pre-rebase behaviour
+/// `force_from_effectinfo` was already shaped against.
 pub fn default_effect_info() -> EffectInfo {
     EffectInfo {
         extraeffect: ExtraEffect::CanRaise,
@@ -207,30 +221,61 @@ pub fn default_effect_info() -> EffectInfo {
     }
 }
 
-/// `EF_CANNOT_RAISE` (effectinfo.py:19). Selected by `call.py:303
-/// getcalldescr`'s `else` branch (non-elidable callee whose
-/// `_canraise(op) == False`).  `pyjitpl.py:2111-2115 do_residual_call`
-/// reads `exc = effectinfo.check_can_raise()` (effectinfo.py:236) which
-/// is false for `extraeffect == 2`, so the canonical walker omits the
-/// trailing `GUARD_NO_EXCEPTION`.
+/// `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE` analyzer-absent fallback
+/// (`effectinfo.py:23`).  Upstream `call.py:288-289` selects this
+/// extraeffect when `virtualizable_analyzer.analyze(op)` is true —
+/// the explicit "may force" path that `pyjitpl.py:2007-2068` routes
+/// through `optimize_CALL_MAY_FORCE_*`, distinct from the
+/// `EF_RANDOM_EFFECTS = 7` branch (`call.py:282-283`).  The two
+/// values are NOT interchangeable: collapsing onto `MOST_GENERAL`
+/// over-claims random-effects semantics on a callee whose only
+/// declared escape is virtualizable forcing.
 ///
-/// PRE-EXISTING-ADAPTATION: same `read/write_descrs_*` and `can_collect`
-/// saturation as [`default_effect_info()`].  `call.py:320-324
-/// effectinfo_from_writeanalyze` builds those bitsets from the
-/// `readwrite_analyzer` and `collect_analyzer` results.  Pyre has the
-/// analyzer ported (`majit-translate/src/jit_codewriter/call.rs:3250
-/// effectinfo_from_writeanalyze`, exercised by 13+ `getcalldescr`
-/// fixtures); the gap is plumbing per-callsite EI from the codewriter
-/// pipeline back to runtime trace recording (Task #64
-/// analyzer-rollout). Until that wire-up lands, conservative
-/// full-bitset is the line-by-line equivalent of "no analyzer
-/// available at this callsite" — it preserves `force_from_effectinfo`'s
-/// per-cached-descr flush behaviour for callees that mutate heap
-/// state but never raise, matching the same fallback semantics
-/// `default_effect_info()` uses for raising callees.  When the
-/// codewriter→recorder plumbing lands, this constant becomes the
-/// no-callee-info default and producers thread per-callee
-/// `EffectInfo` values through `make_call_descr_with_effect`.
+/// Same saturated-bitstring rationale as [`default_effect_info()`]:
+/// pyre's hand-classified `MayForce` flavor runs without the
+/// writeanalyzer, so the conservative full-bitset is the
+/// analyzer-absent line-by-line equivalent.
+pub fn forces_virtual_or_virtualizable_effect_info() -> EffectInfo {
+    EffectInfo {
+        extraeffect: ExtraEffect::ForcesVirtualOrVirtualizable,
+        oopspecindex: OopSpecIndex::None,
+        readonly_descrs_fields: Some(vec![0xff; 8]),
+        write_descrs_fields: Some(vec![0xff; 8]),
+        readonly_descrs_arrays: Some(vec![0xff; 8]),
+        write_descrs_arrays: Some(vec![0xff; 8]),
+        readonly_descrs_interiorfields: Some(vec![0xff; 8]),
+        write_descrs_interiorfields: Some(vec![0xff; 8]),
+        can_invalidate: false,
+        can_collect: true,
+        single_write_descr_array: None,
+        extradescrs: None,
+        call_release_gil_target: EffectInfo::_NO_CALL_RELEASE_GIL_TARGET,
+    }
+}
+
+/// `EF_CANNOT_RAISE` analyzer-absent fallback (`effectinfo.py:19`).
+/// Selected by `call.py:303 getcalldescr`'s `else` branch (non-elidable
+/// callee whose `_canraise(op) == False`).  `pyjitpl.py:2111-2115
+/// do_residual_call` reads `exc = effectinfo.check_can_raise()`
+/// (`effectinfo.py:236`) which is false for `extraeffect == 2`, so the
+/// canonical walker omits the trailing `GUARD_NO_EXCEPTION`.
+///
+/// Upstream `effectinfo_from_writeanalyze` (effectinfo.py:276-345)
+/// produces `extraeffect == EF_CANNOT_RAISE` only in the analyzed
+/// branch, where the bitstrings start as empty `[]` and grow with the
+/// per-callee analyzer outputs.  Pyre hand-classifies a callee as
+/// `CannotRaise` (`#[dont_look_inside_cannot_raise]` /
+/// `CallFlavor::PlainCannotRaise`) without running the writeanalyzer,
+/// so the analyzer-absent shape must be conservative on heap effects:
+/// the saturated `Some(vec![0xff; 8])` mask matches the same per-cached-
+/// descr flush behaviour `default_effect_info()` historically used for
+/// raising callees, only with `extraeffect == CannotRaise` so
+/// `pyjitpl.py:2111-2115` still omits `GUARD_NO_EXCEPTION`.  Upstream
+/// never produces this third "EF_CANNOT_RAISE + saturated mask" shape
+/// because PyPy always runs the analyzer; PRE-EXISTING-ADAPTATION on
+/// the unanalyzed hand-classification itself.  Helpers known to touch
+/// no heap should opt into [`CANNOT_RAISE_NO_HEAP_EFFECT_INFO`]
+/// (the analyzer-output empty-set) instead.
 pub fn cannot_raise_effect_info() -> EffectInfo {
     EffectInfo {
         extraeffect: ExtraEffect::CannotRaise,
@@ -429,10 +474,12 @@ pub fn default_effect_for_opcode(opcode: majit_ir::OpCode) -> EffectInfo {
 }
 
 /// Create a CallDescr with the conservative
-/// [`default_effect_info()`] (`EF_CAN_RAISE` + all-ones field/array
-/// bitsets).  This is the analyzer-absent fallback that mirrors RPython's
-/// behaviour when `call.py:296-326 getcalldescr` runs against a callee
-/// graph that the readwrite/raise analyzers haven't visited yet.
+/// [`default_effect_info()`] (`EF_CAN_RAISE` + saturated
+/// `Some(vec![0xff; 8])` field/array bitsets).  This is the
+/// analyzer-absent fallback mirroring `call.py:300 elif self._canraise(op)`
+/// — the extraeffect upstream picks for plain non-elidable raising
+/// callees whenever `call.py:296-326 getcalldescr` runs without
+/// per-callsite analyzer output.
 ///
 /// Production producers should prefer one of the more specific factories
 /// so the per-callee classification reaches the trace IR:

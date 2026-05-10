@@ -303,23 +303,28 @@ fn helper_policy_tokens_for_fn(
     attr_name: &str,
     trace_target_name: Option<&Ident>,
     concrete_target_name: Option<&Ident>,
+    save_err: i32,
 ) -> syn::Result<proc_macro2::TokenStream> {
     let unsupported_byte = jit_interp::call_policy_byte::UNSUPPORTED;
     let unsupported = quote! {
-        (#unsupported_byte, std::ptr::null(), std::ptr::null(), std::ptr::null(), std::ptr::null())
+        (#unsupported_byte, std::ptr::null(), std::ptr::null(), std::ptr::null(), std::ptr::null(), 0i32)
     };
     let (Some(trace_target_name), Some(concrete_target_name)) =
         (trace_target_name, concrete_target_name)
     else {
         return Ok(unsupported);
     };
-    // 5-tuple: (policy, inline_builder, trace_target, concrete_target, prebuild).
+    // 6-tuple: (policy, inline_builder, trace_target, concrete_target, prebuild, save_err).
     // `prebuild` is the per-helper liveness prebuild fn pointer or null
     // for non-Inline helpers (these have no per-marker triples to register).
     // Only `#[jit_inline]` emits a real prebuild fn at `lib.rs:1330`; every
     // other helper attribute that flows through here advertises null and
     // the parent `#[jit_interp]` lowerer's inferred-policy site
     // (`jitcode_lower.rs::CallPolicySpec::Infer`) skips the call.
+    // `save_err` carries the parsed `#[jit_release_gil(save_err = N)]`
+    // value (`rffi.py:62-71` flag bits, default `RFFI_ERR_NONE = 0`)
+    // for the wrapped release-gil lowering's
+    // `add_call_target_with_save_err`; non-release-gil arms emit `0i32`.
     use jit_interp::call_policy_byte::{
         INT_DONT_LOOK_INSIDE, INT_DONT_LOOK_INSIDE_CANNOT_RAISE, INT_ELIDABLE,
         INT_ELIDABLE_CANNOT_RAISE, INT_ELIDABLE_OR_MEMERROR, INT_LOOP_INVARIANT, INT_MAY_FORCE,
@@ -331,7 +336,7 @@ fn helper_policy_tokens_for_fn(
     match helper_call_kind_for_return(&func.sig.output) {
         HelperCallKind::Void => Ok(match attr_name {
             "dont_look_inside" => quote! {
-                (#VOID_DONT_LOOK_INSIDE, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
+                (#VOID_DONT_LOOK_INSIDE, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null(), 0i32)
             },
             // `call.py:303 getcalldescr`'s non-elidable `else` branch —
             // EF_CANNOT_RAISE for void-return helpers.  Same dispatch
@@ -339,46 +344,46 @@ fn helper_policy_tokens_for_fn(
             // recording walker uses `cannot_raise_effect_info()` so no
             // trailing `-live-` is required.
             "dont_look_inside_cannot_raise" => quote! {
-                (#VOID_DONT_LOOK_INSIDE_CANNOT_RAISE, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
+                (#VOID_DONT_LOOK_INSIDE_CANNOT_RAISE, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null(), 0i32)
             },
             "jit_may_force" => quote! {
-                (#VOID_MAY_FORCE, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
+                (#VOID_MAY_FORCE, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null(), 0i32)
             },
             "jit_release_gil" => quote! {
-                (#VOID_RELEASE_GIL, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
+                (#VOID_RELEASE_GIL, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null(), #save_err)
             },
             "jit_loop_invariant" => quote! {
-                (#VOID_LOOP_INVARIANT, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
+                (#VOID_LOOP_INVARIANT, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null(), 0i32)
             },
             _ => unsupported,
         }),
         HelperCallKind::Int => Ok(match attr_name {
             "elidable" => quote! {
-                (#INT_ELIDABLE, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
+                (#INT_ELIDABLE, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null(), 0i32)
             },
             // call.py:299 elidable && _canraise(op) == False — EF_ELIDABLE_CANNOT_RAISE.
             "elidable_cannot_raise" => quote! {
-                (#INT_ELIDABLE_CANNOT_RAISE, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
+                (#INT_ELIDABLE_CANNOT_RAISE, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null(), 0i32)
             },
             // call.py:295 elidable && _canraise(op) == "mem" — EF_ELIDABLE_OR_MEMORYERROR.
             "elidable_or_memerror" => quote! {
-                (#INT_ELIDABLE_OR_MEMERROR, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
+                (#INT_ELIDABLE_OR_MEMERROR, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null(), 0i32)
             },
             "dont_look_inside" => quote! {
-                (#INT_DONT_LOOK_INSIDE, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
+                (#INT_DONT_LOOK_INSIDE, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null(), 0i32)
             },
             // `call.py:303` non-elidable EF_CANNOT_RAISE for int-return helpers.
             "dont_look_inside_cannot_raise" => quote! {
-                (#INT_DONT_LOOK_INSIDE_CANNOT_RAISE, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
+                (#INT_DONT_LOOK_INSIDE_CANNOT_RAISE, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null(), 0i32)
             },
             "jit_may_force" => quote! {
-                (#INT_MAY_FORCE, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
+                (#INT_MAY_FORCE, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null(), 0i32)
             },
             "jit_release_gil" => quote! {
-                (#INT_RELEASE_GIL, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
+                (#INT_RELEASE_GIL, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null(), #save_err)
             },
             "jit_loop_invariant" => quote! {
-                (#INT_LOOP_INVARIANT, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
+                (#INT_LOOP_INVARIANT, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null(), 0i32)
             },
             _ => unsupported,
         }),
@@ -394,19 +399,19 @@ fn helper_policy_tokens_for_fn(
             // descr (result-kind match, forces/release-gil rejection,
             // loop-invariant no-args assertion).
             "elidable" => quote! {
-                (#REF_ELIDABLE, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
+                (#REF_ELIDABLE, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null(), 0i32)
             },
             "elidable_cannot_raise" => quote! {
-                (#REF_ELIDABLE_CANNOT_RAISE, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
+                (#REF_ELIDABLE_CANNOT_RAISE, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null(), 0i32)
             },
             "elidable_or_memerror" => quote! {
-                (#REF_ELIDABLE_OR_MEMERROR, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
+                (#REF_ELIDABLE_OR_MEMERROR, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null(), 0i32)
             },
             "jit_loop_invariant" => quote! {
-                (#REF_LOOP_INVARIANT, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
+                (#REF_LOOP_INVARIANT, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null(), 0i32)
             },
             "dont_look_inside" => quote! {
-                (#REF_DONT_LOOK_INSIDE, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
+                (#REF_DONT_LOOK_INSIDE, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null(), 0i32)
             },
             // `call.py:303` non-elidable EF_CANNOT_RAISE for ref-return helpers.
             // Closes the audit's Item 4 parity-divergence (ref dont_look_inside
@@ -415,10 +420,10 @@ fn helper_policy_tokens_for_fn(
             // is unknown); REF_DONT_LOOK_INSIDE_CANNOT_RAISE is the explicit
             // cannot-raise opt-in.
             "dont_look_inside_cannot_raise" => quote! {
-                (#REF_DONT_LOOK_INSIDE_CANNOT_RAISE, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
+                (#REF_DONT_LOOK_INSIDE_CANNOT_RAISE, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null(), 0i32)
             },
             "jit_may_force" => quote! {
-                (#REF_MAY_FORCE, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
+                (#REF_MAY_FORCE, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null(), 0i32)
             },
             // RPython `resoperation.py:1238-1248` has
             // CALL_RELEASE_GIL_I/F/N only; ref-return release-gil calls
@@ -429,16 +434,25 @@ fn helper_policy_tokens_for_fn(
         HelperCallKind::Float => Ok(match attr_name {
             // Same restriction as ref-return helpers: explicit wrapped float
             // policies consume these targets directly, but inferred value-call
-            // lowering cannot model the static float result bank.
+            // lowering cannot model the static float result bank.  RPython
+            // `resoperation.py:1238-1248` keeps `CALL_RELEASE_GIL_F` so
+            // float release-gil helpers are legal — the wrapped lowering
+            // at `jitcode_lower.rs::ReleaseGilFloatWrapped` reads
+            // `__save_err` from this 6th tuple slot to thread the
+            // `#[jit_release_gil(save_err = N)]` value through
+            // `add_call_target_with_save_err` (`rffi.py:228
+            // _call_aroundstate_target_ = (funcptr, save_err)` parity).
+            "jit_release_gil" => quote! {
+                (#UNSUPPORTED, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null(), #save_err)
+            },
             "elidable"
             | "elidable_cannot_raise"
             | "elidable_or_memerror"
             | "dont_look_inside"
             | "dont_look_inside_cannot_raise"
             | "jit_may_force"
-            | "jit_release_gil"
             | "jit_loop_invariant" => quote! {
-                (#UNSUPPORTED, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
+                (#UNSUPPORTED, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null(), 0i32)
             },
             _ => unsupported,
         }),
@@ -455,10 +469,13 @@ fn emit_helper_policy_fn(
     // `__majit_call_policy_*` visibility follows the user fn so
     // external integration tests can read the 4-tuple's trace_target /
     // concrete_target function pointers for PyPy `getfunctionptr`
-    // parity verification.
+    // parity verification.  The trailing `i32` carries the wrapper
+    // callable's `_call_aroundstate_target_[1]` (`save_err`) per
+    // `rffi.py:228`; non-`release_gil` policies emit `0i32`
+    // (`RFFI_ERR_NONE`, `rffi.py:80`).
     Ok(quote! {
         #[doc(hidden)]
-        #vis fn #helper_name() -> (u8, *const (), *const (), *const (), *const ()) {
+        #vis fn #helper_name() -> (u8, *const (), *const (), *const (), *const (), i32) {
             #body
         }
     })
@@ -770,6 +787,7 @@ fn expand_elidable_attribute(item: TokenStream, attr_name: &str) -> TokenStream 
             attr_name,
             trace_target_name.as_ref(),
             concrete_target_name.as_ref(),
+            0,
         ) {
             Ok(tokens) => tokens,
             Err(err) => return err.to_compile_error().into(),
@@ -851,6 +869,7 @@ fn expand_dont_look_inside_attribute(item: TokenStream, attr_name: &str) -> Toke
             attr_name,
             trace_target_name.as_ref(),
             concrete_target_name.as_ref(),
+            0,
         ) {
             Ok(tokens) => tokens,
             Err(err) => return err.to_compile_error().into(),
@@ -879,7 +898,12 @@ fn expand_dont_look_inside_attribute(item: TokenStream, attr_name: &str) -> Toke
     expanded.into()
 }
 
-fn expand_call_surface_attr(attr_name: &str, marker_name: &str, item: TokenStream) -> TokenStream {
+fn expand_call_surface_attr(
+    attr_name: &str,
+    marker_name: &str,
+    save_err: i32,
+    item: TokenStream,
+) -> TokenStream {
     let func = parse_macro_input!(item as ItemFn);
     let attrs = &func.attrs;
     let vis = &func.vis;
@@ -903,6 +927,7 @@ fn expand_call_surface_attr(attr_name: &str, marker_name: &str, item: TokenStrea
             attr_name,
             trace_target_name.as_ref(),
             concrete_target_name.as_ref(),
+            save_err,
         ) {
             Ok(tokens) => tokens,
             Err(err) => return err.to_compile_error().into(),
@@ -934,19 +959,33 @@ fn expand_call_surface_attr(attr_name: &str, marker_name: &str, item: TokenStrea
 /// Mark a function as a may-force call surface.
 #[proc_macro_attribute]
 pub fn jit_may_force(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    expand_call_surface_attr("jit_may_force", "_MAJIT_MAY_FORCE", item)
+    expand_call_surface_attr("jit_may_force", "_MAJIT_MAY_FORCE", 0, item)
 }
 
 /// Mark a function as a release-GIL call surface.
+///
+/// Optional `save_err = N` argument mirrors `rffi.llexternal(...,
+/// save_err=N)` (`rffi.py:80`); the parsed integer flows into the
+/// policy tuple's `save_err` slot, matching the second element of
+/// `_call_aroundstate_target_ = (funcptr, save_err)` (`rffi.py:228`).
+/// Default is `RFFI_ERR_NONE = 0` (`rffi.py:71`).
 #[proc_macro_attribute]
-pub fn jit_release_gil(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    expand_call_surface_attr("jit_release_gil", "_MAJIT_RELEASE_GIL", item)
+pub fn jit_release_gil(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let save_err = if attr.is_empty() {
+        0
+    } else {
+        match parse_release_gil_save_err(attr.into()) {
+            Ok(v) => v,
+            Err(err) => return err.to_compile_error().into(),
+        }
+    };
+    expand_call_surface_attr("jit_release_gil", "_MAJIT_RELEASE_GIL", save_err, item)
 }
 
 /// Mark a function as a loop-invariant call surface.
 #[proc_macro_attribute]
 pub fn jit_loop_invariant(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    expand_call_surface_attr("jit_loop_invariant", "_MAJIT_LOOP_INVARIANT", item)
+    expand_call_surface_attr("jit_loop_invariant", "_MAJIT_LOOP_INVARIANT", 0, item)
 }
 
 /// Mark a function as loop-invariant.
@@ -958,7 +997,41 @@ pub fn jit_loop_invariant(_attr: TokenStream, item: TokenStream) -> TokenStream 
 /// Implies `@dont_look_inside`.
 #[proc_macro_attribute]
 pub fn loop_invariant(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    expand_call_surface_attr("jit_loop_invariant", "_MAJIT_LOOP_INVARIANT", item)
+    expand_call_surface_attr("jit_loop_invariant", "_MAJIT_LOOP_INVARIANT", 0, item)
+}
+
+/// Parse `save_err = N` from `#[jit_release_gil(...)]` arguments.
+/// Mirrors `rffi.llexternal(..., save_err=...)` kwarg (`rffi.py:80`).
+fn parse_release_gil_save_err(attr: proc_macro2::TokenStream) -> syn::Result<i32> {
+    use syn::{Lit, MetaNameValue, Token};
+    let parser = syn::punctuated::Punctuated::<MetaNameValue, Token![,]>::parse_terminated;
+    let pairs = syn::parse::Parser::parse2(parser, attr)?;
+    let mut save_err: i32 = 0;
+    for pair in pairs {
+        let key = pair
+            .path
+            .get_ident()
+            .ok_or_else(|| syn::Error::new_spanned(&pair.path, "expected `save_err = N`"))?;
+        if key == "save_err" {
+            let syn::Expr::Lit(syn::ExprLit {
+                lit: Lit::Int(int_lit),
+                ..
+            }) = &pair.value
+            else {
+                return Err(syn::Error::new_spanned(
+                    &pair.value,
+                    "save_err must be an integer literal (`rffi.py:62-71` flag bits)",
+                ));
+            };
+            save_err = int_lit.base10_parse::<i32>()?;
+        } else {
+            return Err(syn::Error::new_spanned(
+                key,
+                format!("unknown #[jit_release_gil] argument `{key}`; expected `save_err`"),
+            ));
+        }
+    }
+    Ok(save_err)
 }
 
 /// Mark struct fields whose value never mutates after construction.
@@ -1179,6 +1252,7 @@ pub fn elidable_promote(attr: TokenStream, item: TokenStream) -> TokenStream {
             "elidable",
             trace_target_name.as_ref(),
             concrete_target_name.as_ref(),
+            0,
         ) {
             Ok(tokens) => tokens,
             Err(err) => return err.to_compile_error().into(),
@@ -1485,13 +1559,14 @@ pub fn jit_inline(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
 
         #[doc(hidden)]
-        pub(crate) fn #policy_name() -> (u8, *const (), *const (), *const (), *const ()) {
+        pub(crate) fn #policy_name() -> (u8, *const (), *const (), *const (), *const (), i32) {
             (
                 #inferred_policy_code,
                 #inferred_inline_builder,
                 std::ptr::null(),
                 std::ptr::null(),
                 #helper_prebuild_name as *const (),
+                0i32,
             )
         }
     };
@@ -1985,7 +2060,7 @@ fn impl_addr_expr(h: &DiscoveredHelper) -> proc_macro2::TokenStream {
         let policy_fn = format_ident!("__majit_call_policy_{}", fn_name);
         return quote! {
             {
-                let (_, _inline_builder, __trace_target, __concrete_target, _prebuild) = #policy_fn();
+                let (_, _inline_builder, __trace_target, __concrete_target, _prebuild, _save_err) = #policy_fn();
                 let __trace_target = if __trace_target.is_null() {
                     if __concrete_target.is_null() {
                         #fn_name as *const ()

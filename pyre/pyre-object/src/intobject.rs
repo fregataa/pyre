@@ -289,7 +289,7 @@ mod tests {
     /// and a non-null trace_target / concrete_target trampoline pair.
     #[test]
     fn test_int_bit_count_advertises_int_elidable_cannot_raise_byte() {
-        let (policy, _, trace_target, concrete_target, _) = __majit_call_policy_int_bit_count();
+        let (policy, _, trace_target, concrete_target, _, _) = __majit_call_policy_int_bit_count();
         assert_eq!(policy, 19u8);
         assert!(!trace_target.is_null());
         assert!(!concrete_target.is_null());

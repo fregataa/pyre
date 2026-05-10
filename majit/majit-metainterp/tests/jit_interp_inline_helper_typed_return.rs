@@ -161,7 +161,7 @@ fn jit_inline_mixed_identity_generates_dense_per_kind_jitcode() {
 
 #[test]
 fn jit_inline_inferred_policy_only_advertises_int_return_helpers() {
-    let (ref_policy, ref_builder, _, _, _) = __majit_call_policy_inline_ref_identity();
+    let (ref_policy, ref_builder, _, _, _, _) = __majit_call_policy_inline_ref_identity();
     assert_eq!(
         ref_policy, 0u8,
         "ref-return inline helper should not claim inferred inline_int parity"
@@ -171,7 +171,7 @@ fn jit_inline_inferred_policy_only_advertises_int_return_helpers() {
         "ref-return inline helper should not expose inferred inline builder"
     );
 
-    let (float_policy, float_builder, _, _, _) = __majit_call_policy_inline_float_identity();
+    let (float_policy, float_builder, _, _, _, _) = __majit_call_policy_inline_float_identity();
     assert_eq!(
         float_policy, 0u8,
         "float-return inline helper should not claim inferred inline_int parity"
@@ -181,7 +181,7 @@ fn jit_inline_inferred_policy_only_advertises_int_return_helpers() {
         "float-return inline helper should not expose inferred inline builder"
     );
 
-    let (int_policy, int_builder, _, _, _) = __majit_call_policy_inline_mixed_int_identity();
+    let (int_policy, int_builder, _, _, _, _) = __majit_call_policy_inline_mixed_int_identity();
     assert_eq!(
         int_policy, 4u8,
         "int-return inline helper should keep inferred inline policy"
@@ -194,7 +194,7 @@ fn jit_inline_inferred_policy_only_advertises_int_return_helpers() {
 
 #[test]
 fn wrapped_helpers_advertise_supported_inferred_policy_bytes() {
-    let (ref_policy, ref_inline_builder, ref_trace_target, ref_concrete_target, _) =
+    let (ref_policy, ref_inline_builder, ref_trace_target, ref_concrete_target, _, _) =
         __majit_call_policy_wrapped_ref_identity();
     assert_eq!(
         ref_policy, 25u8,
@@ -209,7 +209,7 @@ fn wrapped_helpers_advertise_supported_inferred_policy_bytes() {
         "explicit wrapped ref policy still needs trace/concrete targets"
     );
 
-    let (float_policy, float_inline_builder, float_trace_target, float_concrete_target, _) =
+    let (float_policy, float_inline_builder, float_trace_target, float_concrete_target, _, _) =
         __majit_call_policy_wrapped_float_identity();
     assert_eq!(
         float_policy, 0u8,
@@ -224,7 +224,7 @@ fn wrapped_helpers_advertise_supported_inferred_policy_bytes() {
         "explicit wrapped float policy still needs trace/concrete targets"
     );
 
-    let (int_policy, int_inline_builder, int_trace_target, int_concrete_target, _) =
+    let (int_policy, int_inline_builder, int_trace_target, int_concrete_target, _, _) =
         __majit_call_policy_wrapped_int_identity();
     assert_eq!(
         int_policy, 2u8,
@@ -248,7 +248,7 @@ fn dont_look_inside_cannot_raise_emits_dedicated_policy_bytes() {
     // can produce `cannot_raise_effect_info()` calldescrs and skip the
     // trailing `-live-` marker that the audit cited as parity-divergent
     // for `dont_look_inside` ref helpers.
-    let (ref_policy, _, ref_trace_target, ref_concrete_target, _) =
+    let (ref_policy, _, ref_trace_target, ref_concrete_target, _, _) =
         __majit_call_policy_wrapped_ref_identity_cr();
     assert_eq!(
         ref_policy, 30u8,
@@ -259,7 +259,7 @@ fn dont_look_inside_cannot_raise_emits_dedicated_policy_bytes() {
         "explicit wrapped ref policy still needs trace/concrete targets"
     );
 
-    let (float_policy, _, float_trace_target, float_concrete_target, _) =
+    let (float_policy, _, float_trace_target, float_concrete_target, _, _) =
         __majit_call_policy_wrapped_float_identity_cr();
     assert_eq!(
         float_policy, 0u8,
@@ -271,7 +271,7 @@ fn dont_look_inside_cannot_raise_emits_dedicated_policy_bytes() {
         "explicit wrapped float policy still needs trace/concrete targets"
     );
 
-    let (int_policy, _, int_trace_target, int_concrete_target, _) =
+    let (int_policy, _, int_trace_target, int_concrete_target, _, _) =
         __majit_call_policy_wrapped_int_identity_cr();
     assert_eq!(
         int_policy, 29u8,

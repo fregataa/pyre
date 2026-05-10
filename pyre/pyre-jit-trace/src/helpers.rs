@@ -760,7 +760,7 @@ mod tests {
     /// `pub(crate)` `__majit_call_policy_*` symbol from outside.
     #[test]
     fn elidable_helper_macro_emits_int_elidable_cannot_raise_byte() {
-        let (policy, _, trace_target, concrete_target, _) =
+        let (policy, _, trace_target, concrete_target, _, _) =
             __majit_call_policy_jit_int_in_small_cache_range();
         assert_eq!(policy, 19u8);
         assert!(!trace_target.is_null());

@@ -100,6 +100,16 @@ pub struct JitCallTarget {
     pub trace_ptr: *const (),
     pub concrete_ptr: *const (),
     pub effect_info_slot: crate::call_descr::EffectInfoSlot,
+    /// Per-callee `save_err` decoration mirroring upstream
+    /// `rffi.py:228 call_external_function._call_aroundstate_target_ =
+    /// (funcptr, save_err)`.  Read at descr-build time by
+    /// `codewriter/call.py:252-258 getcalldescr` to populate
+    /// `EffectInfo.call_release_gil_target = (realfuncaddr, tgt_saveerr)`
+    /// (`effectinfo.py:114, 197`).  `RFFI_ERR_NONE = 0` matches the
+    /// `llexternal` default (`rffi.py:80`); release-gil callees that
+    /// preserve `errno`, `winerror`, etc. carry one of the
+    /// `RFFI_ERR_*` flags (`rffi.py:121-167`).
+    pub save_err: i32,
 }
 
 impl JitCallTarget {
@@ -108,6 +118,7 @@ impl JitCallTarget {
             trace_ptr,
             concrete_ptr,
             effect_info_slot: crate::call_descr::EffectInfoSlot::CanRaise,
+            save_err: 0,
         }
     }
 
@@ -125,6 +136,25 @@ impl JitCallTarget {
             trace_ptr,
             concrete_ptr,
             effect_info_slot,
+            save_err: 0,
+        }
+    }
+
+    /// Construct a release-gil target carrying the wrapper callable's
+    /// `_call_aroundstate_target_ = (funcptr, save_err)` decoration
+    /// (`rffi.py:228`).  `effect_info_slot` is unused by release-gil
+    /// dispatchers but kept for the dedup key triple.
+    pub fn with_save_err(
+        trace_ptr: *const (),
+        concrete_ptr: *const (),
+        effect_info_slot: crate::call_descr::EffectInfoSlot,
+        save_err: i32,
+    ) -> Self {
+        Self {
+            trace_ptr,
+            concrete_ptr,
+            effect_info_slot,
+            save_err,
         }
     }
 }
@@ -569,15 +599,19 @@ mod tests {
             "helper-side BC_RECORD_KNOWN_RESULT_REF must not masquerade as \
              canonical record_known_result_r_ir_v/riIRd",
         );
-        assert!(
-            !insns.contains_key("inline_call_ir_r/dIR>r"),
-            "helper-side BC_INLINE_CALL adapter must not masquerade as \
-             canonical inline_call_ir_r/dIR>r",
-        );
-        assert!(
-            !insns.contains_key("inline_call_irf_f/dIRF>f"),
-            "helper-side BC_INLINE_CALL adapter must not masquerade as \
-             canonical inline_call_irf_f/dIRF>f",
+        // Canonical `inline_call_*/d{R,IR,IRF}>{i,r,v,f}` keys live in
+        // `wellknown_bh_insns()` with their own distinct `BC_*` bytes
+        // (187-194); the pyre-only nested-bytecode adapter
+        // `inline_call_pyre_nested/P` reuses `BC_INLINE_CALL = 17` and is
+        // quarantined in `pyre_extension_insns()`.  The two byte ranges
+        // are disjoint, so they cannot collide on dispatch.
+        assert!(insns.contains_key("inline_call_ir_r/dIR>r"));
+        assert!(insns.contains_key("inline_call_irf_f/dIRF>f"));
+        assert_ne!(
+            insns.get("inline_call_ir_r/dIR>r").copied(),
+            Some(majit_translate::insns::BC_INLINE_CALL),
+            "canonical inline_call_ir_r byte must NOT collide with \
+             helper-side BC_INLINE_CALL adapter byte",
         );
         assert_eq!(
             insns.get("getfield_vable_i/rd>i"),
@@ -651,12 +685,19 @@ mod tests {
         );
     }
 
-    /// Tasks #94c (abort/*) and #94b' (state_*) quarantine the 8 pyre-
-    /// only keys arising from Rust adaptations into
-    /// `pyre_extension_insns()`. `wellknown_bh_insns()` becomes a strict
-    /// subset of RPython's canonical opname universe. `insn_byte` merges
-    /// both tables so build-time `write_insn(...)` callers continue to
-    /// resolve unchanged.
+    /// Tasks #94c (abort/*) and #94b' (state_*) seeded the
+    /// `pyre_extension_insns()` quarantine with the 8 keys arising from
+    /// the borrow-checker abort signals (2) and the proc-macro JIT-machine
+    /// state addressing (6).  Subsequent slices added 4 more pyre-only
+    /// keys — `inline_call_pyre_nested/P` (nested-bytecode `inline_call`
+    /// adapter, `BC_INLINE_CALL = 17`), `abort/>r` (Ref-result variant of
+    /// `abort/`), `vtable_method_ptr/rd>i` (dyn-trait method-pointer
+    /// reification), and `getarrayitem_gc_r/rrd>r` (Ref-indexed GC array
+    /// read; RPython only has the int-indexed `rid` shape) — so the
+    /// `pyre_extension_insns()` table now holds 12 entries total.
+    /// `wellknown_bh_insns()` is a strict subset of RPython's canonical
+    /// opname universe; `insn_byte` merges both tables so build-time
+    /// `write_insn(...)` callers continue to resolve unchanged.
     #[test]
     fn pyre_extension_insns_quarantines_pyre_only_keys_out_of_wellknown() {
         let wellknown = wellknown_bh_insns();
@@ -675,6 +716,19 @@ mod tests {
             ("store_state_varray/dii", insns::BC_STORE_STATE_VARRAY),
             // pyre nested-bytecode inline_call (pyre-only `P` argcode).
             ("inline_call_pyre_nested/P", insns::BC_INLINE_CALL),
+            // Ref-result variant of the borrow-checker abort signal.
+            ("abort/>r", majit_translate::insns::BC_ABORT_RESULT_R),
+            // dyn-trait method pointer reification (backend epic).
+            (
+                "vtable_method_ptr/rd>i",
+                majit_translate::insns::BC_VTABLE_METHOD_PTR,
+            ),
+            // Ref-indexed GC array read (RPython only has the int-indexed
+            // `rid` shape).
+            (
+                "getarrayitem_gc_r/rrd>r",
+                majit_translate::insns::BC_GETARRAYITEM_GC_R_RRD,
+            ),
         ];
 
         for (key, expected_byte) in pairs {

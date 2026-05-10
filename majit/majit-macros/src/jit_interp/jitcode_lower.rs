@@ -390,7 +390,7 @@ fn inferred_policy_live_condition(func: &Expr, can_raise_codes: &[u8]) -> TokenS
         return quote! { false };
     }
     quote! {{
-        let (__policy, _, _, _, _) = #policy_path();
+        let (__policy, _, _, _, _, _) = #policy_path();
         matches!(__policy, #(#patterns)|*)
     }}
 }
@@ -1945,7 +1945,7 @@ impl<'c> Lowerer<'c> {
                 helper_policy_path(func).expect("wrapped helper policy requires a path expression");
             let inferred_policy_check = inferred_policy_check.unwrap_or_else(|| quote! {});
             quote! {
-                let (__policy, _inline_builder, __trace_target, __concrete_target, _prebuild) = #policy_path();
+                let (__policy, _inline_builder, __trace_target, __concrete_target, _prebuild, __save_err) = #policy_path();
                 #inferred_policy_check
                 if __trace_target.is_null() && __concrete_target.is_null() {
                     panic!("wrapped helper policy requires generated call-target wrappers");
@@ -1960,10 +1960,11 @@ impl<'c> Lowerer<'c> {
                 } else {
                     __concrete_target
                 };
-                let __fn_idx = __builder.add_call_target_with_slot(
+                let __fn_idx = __builder.add_call_target_with_save_err(
                     __trace_target,
                     __concrete_target,
                     #slot_expr,
+                    __save_err,
                 );
             }
         } else {
@@ -3356,7 +3357,7 @@ impl<'c> Lowerer<'c> {
                     self.emit_op(
                         OpMeta::linear(OpKind::Call, __arg_regs, vec![]),
                         quote! {
-                            let (__policy, _inline_builder, __trace_target, __concrete_target, _prebuild) = #policy_path();
+                            let (__policy, _inline_builder, __trace_target, __concrete_target, _prebuild, __save_err) = #policy_path();
                             if __trace_target.is_null() && __concrete_target.is_null() {
                                 panic!("wrapped helper policy requires generated call-target wrappers");
                             }
@@ -3370,7 +3371,12 @@ impl<'c> Lowerer<'c> {
                             } else {
                                 __concrete_target
                             };
-                            let __fn_idx = __builder.add_call_target(__trace_target, __concrete_target);
+                            let __fn_idx = __builder.add_call_target_with_save_err(
+                                __trace_target,
+                                __concrete_target,
+                                majit_metainterp::EffectInfoSlot::CanRaise,
+                                __save_err,
+                            );
                             #call_stmt
                         },
                     );
@@ -3397,7 +3403,7 @@ impl<'c> Lowerer<'c> {
                     self.emit_op(
                         OpMeta::linear(OpKind::Call, __arg_regs, vec![]),
                         quote! {
-                            let (__policy, _inline_builder, __trace_target, __concrete_target, _prebuild) = #policy_path();
+                            let (__policy, _inline_builder, __trace_target, __concrete_target, _prebuild, __save_err) = #policy_path();
                             if __trace_target.is_null() && __concrete_target.is_null() {
                                 panic!("wrapped helper policy requires generated call-target wrappers");
                             }
@@ -3411,7 +3417,12 @@ impl<'c> Lowerer<'c> {
                             } else {
                                 __concrete_target
                             };
-                            let __fn_idx = __builder.add_call_target(__trace_target, __concrete_target);
+                            let __fn_idx = __builder.add_call_target_with_save_err(
+                                __trace_target,
+                                __concrete_target,
+                                majit_metainterp::EffectInfoSlot::CanRaise,
+                                __save_err,
+                            );
                             #call_stmt
                         },
                     );
@@ -3579,7 +3590,7 @@ impl<'c> Lowerer<'c> {
                             vec![Register::new(result_kind, throwaway_reg)],
                         ),
                         quote! {
-                            let (__policy, _inline_builder, __trace_target, __concrete_target, _prebuild) = #policy_path();
+                            let (__policy, _inline_builder, __trace_target, __concrete_target, _prebuild, __save_err) = #policy_path();
                             if __trace_target.is_null() && __concrete_target.is_null() {
                                 panic!("wrapped helper policy requires generated call-target wrappers");
                             }
@@ -3593,7 +3604,12 @@ impl<'c> Lowerer<'c> {
                             } else {
                                 __concrete_target
                             };
-                            let __fn_idx = __builder.add_call_target(__trace_target, __concrete_target);
+                            let __fn_idx = __builder.add_call_target_with_save_err(
+                                __trace_target,
+                                __concrete_target,
+                                majit_metainterp::EffectInfoSlot::CanRaise,
+                                __save_err,
+                            );
                             #call_stmt
                         },
                     );
@@ -3608,7 +3624,7 @@ impl<'c> Lowerer<'c> {
                 self.emit_op(
                     OpMeta::linear(OpKind::Call, __arg_regs, vec![]),
                     quote! {
-                        let (__policy, _inline_builder, __trace_target, __concrete_target, _prebuild) = #policy_path();
+                        let (__policy, _inline_builder, __trace_target, __concrete_target, _prebuild, __save_err) = #policy_path();
                         let __trace_target = if __trace_target.is_null() {
                             #func as *const ()
                         } else {
@@ -3619,7 +3635,12 @@ impl<'c> Lowerer<'c> {
                         } else {
                             __concrete_target
                         };
-                        let __fn_idx = __builder.add_call_target(__trace_target, __concrete_target);
+                        let __fn_idx = __builder.add_call_target_with_save_err(
+                            __trace_target,
+                            __concrete_target,
+                            majit_metainterp::EffectInfoSlot::CanRaise,
+                            __save_err,
+                        );
                         match __policy {
                             #VOID_DONT_LOOK_INSIDE => {
                                 __builder.residual_call_void_canonical_via_target(__fn_idx, #typed_args);
@@ -5201,7 +5222,7 @@ impl<'c> Lowerer<'c> {
                             vec![Register::new(result_kind, reg)],
                         ),
                         quote! {
-                            let (__policy, _inline_builder, __trace_target, __concrete_target, _prebuild) = #policy_path();
+                            let (__policy, _inline_builder, __trace_target, __concrete_target, _prebuild, __save_err) = #policy_path();
                             if __trace_target.is_null() && __concrete_target.is_null() {
                                 panic!("wrapped helper policy requires generated call-target wrappers");
                             }
@@ -5215,7 +5236,12 @@ impl<'c> Lowerer<'c> {
                             } else {
                                 __concrete_target
                             };
-                            let __fn_idx = __builder.add_call_target(__trace_target, __concrete_target);
+                            let __fn_idx = __builder.add_call_target_with_save_err(
+                                __trace_target,
+                                __concrete_target,
+                                majit_metainterp::EffectInfoSlot::CanRaise,
+                                __save_err,
+                            );
                             #call_stmt
                         },
                     );
@@ -5313,7 +5339,7 @@ impl<'c> Lowerer<'c> {
                             vec![Register::int(reg)],
                         ),
                         quote! {
-                            let (__policy, __inline_builder, __trace_target, __concrete_target, _prebuild) = #policy_path();
+                            let (__policy, __inline_builder, __trace_target, __concrete_target, _prebuild, __save_err) = #policy_path();
                             let __trace_target = if __trace_target.is_null() {
                                 #func as *const ()
                             } else {
@@ -5324,7 +5350,12 @@ impl<'c> Lowerer<'c> {
                             } else {
                                 __concrete_target
                             };
-                            let __fn_idx = __builder.add_call_target(__trace_target, __concrete_target);
+                            let __fn_idx = __builder.add_call_target_with_save_err(
+                                __trace_target,
+                                __concrete_target,
+                                majit_metainterp::EffectInfoSlot::CanRaise,
+                                __save_err,
+                            );
                             match __policy {
                                 #INT_DONT_LOOK_INSIDE => {
                                     __builder.residual_call_int_canonical_via_target(__fn_idx, #typed_args, #reg);
@@ -5406,7 +5437,7 @@ impl<'c> Lowerer<'c> {
                             vec![Register::int(reg)],
                         ),
                         quote! {
-                            let (__policy, __inline_builder, __trace_target, __concrete_target, _prebuild) = #policy_path();
+                            let (__policy, __inline_builder, __trace_target, __concrete_target, _prebuild, __save_err) = #policy_path();
                             let __trace_target = if __trace_target.is_null() {
                                 #func as *const ()
                             } else {
@@ -5417,7 +5448,12 @@ impl<'c> Lowerer<'c> {
                             } else {
                                 __concrete_target
                             };
-                            let __fn_idx = __builder.add_call_target(__trace_target, __concrete_target);
+                            let __fn_idx = __builder.add_call_target_with_save_err(
+                                __trace_target,
+                                __concrete_target,
+                                majit_metainterp::EffectInfoSlot::CanRaise,
+                                __save_err,
+                            );
                             match __policy {
                                 #INT_DONT_LOOK_INSIDE => {
                                     __builder.residual_call_int_canonical_via_target(__fn_idx, #typed_args, #reg);

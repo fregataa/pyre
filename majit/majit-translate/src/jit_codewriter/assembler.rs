@@ -30,6 +30,13 @@ use crate::regalloc::RegAllocResult;
 pub struct Assembler {
     /// RPython: Assembler.insns — map {opcode_key: opcode_number}
     insns: HashMap<String, u8>,
+    /// Next candidate for the translator-only `setdefault` fallback
+    /// (`assembler.py:220`). RPython grows `self.insns` densely from
+    /// zero; pyre keeps canonical / extension `BC_*` bytes reserved for
+    /// build/runtime stability, so this cursor scans upward from zero
+    /// and skips only those reserved bytes plus already-assigned
+    /// translator-only bytes.
+    dynamic_byte_cursor: u16,
     /// RPython: Assembler.descrs — list of descriptors. Inline-call
     /// descriptors keep the callee JitCode object until the final
     /// snapshot, where `jitcode.index` is guaranteed to be assigned.
@@ -112,19 +119,6 @@ pub struct Assembler {
     /// table now plays the same role: the kind decided at build time
     /// must match the regalloc class that holds the coloring.
     current_value_kinds: Option<HashMap<ValueId, RegKind>>,
-    /// Next byte to assign for a translator-only key whose opname is
-    /// not registered in the canonical `insns::insn_byte_opt` table
-    /// (e.g. `inline_call_*/dR>X` per `insns.rs:425-436`'s
-    /// pre-registration omission).  Initialised lazily to
-    /// `CANONICAL_BYTE_CEILING` (one past the highest fixed `BC_*`)
-    /// inside [`Self::get_opnum`] so the dynamic byte range stays
-    /// disjoint from canonical assignments.  Stored as `u16` so the
-    /// last assignable byte (255) can be consumed before the next call
-    /// trips the `< 256` overflow assert — matching RPython
-    /// `setdefault(key, len(self.insns))` which permits the full
-    /// 0..=255 range (`assembler.py:220-222`, `blackhole.py len(insns)
-    /// <= 256`).
-    next_dynamic_byte: Option<u16>,
 }
 
 impl Assembler {
@@ -132,6 +126,7 @@ impl Assembler {
     pub fn new() -> Self {
         Self {
             insns: HashMap::new(),
+            dynamic_byte_cursor: 0,
             descrs: Vec::new(),
             descr_dict: HashMap::new(),
             indirectcalltargets: std::collections::HashSet::new(),
@@ -147,7 +142,6 @@ impl Assembler {
             current_graph_name: None,
             current_flatop_debug: None,
             current_value_kinds: None,
-            next_dynamic_byte: None,
         }
     }
 
@@ -1656,86 +1650,71 @@ impl Assembler {
     /// num = self.insns.setdefault(key, len(self.insns))
     /// ```
     ///
-    /// Pyre routes through the canonical
-    /// [`crate::insns::insn_byte_opt`] table whenever the key is one of
-    /// the BH-runtime-shared opnames so `Assembler` and
-    /// `JitCodeBuilder::write_insn` agree on the byte assigned to the
-    /// same opname (otherwise the same `code` byte could decode to
-    /// different opnames depending on which producer wrote it — see
-    /// `jitcode_dispatch.rs:5734-5743` for the exact risk shape).
+    /// RPython parity: `assembler.py:220
+    /// self.insns.setdefault(key, len(self.insns))`.  Each opname/
+    /// argcodes key gets a stable opcode byte recorded into
+    /// `self.insns`; subsequent emissions of the same key reuse the
+    /// recorded byte.
     ///
-    /// PRE-EXISTING-ADAPTATION (`insns.rs` module doc): pyre serialises
-    /// `opcode_jitcodes.bin` at build time and the runtime decoder
-    /// reads those bytes verbatim, so opcode bytes must stay stable
-    /// across build/runtime.  Canonical keys carry a fixed `BC_*`
-    /// pinning to satisfy that adaptation; routing canonical keys here
-    /// through the same table preserves the pinning instead of
-    /// silently re-numbering them.
+    /// Pyre serialises `opcode_insns.bin` at build time and the runtime
+    /// decoder reads those bytes verbatim, so canonical/extension keys
+    /// pin a reserved `BC_*` (`crate::insns::wellknown_bh_insns` /
+    /// `pyre_extension_insns`, merged through
+    /// [`crate::insns::insn_byte_opt`]) — this preserves byte stability
+    /// across builds for keys that the runtime walker dispatches.
+    /// Translator-only keys (transient codewriter helpers, test
+    /// fixtures) follow the upstream `setdefault` shape as closely as
+    /// pyre's fixed-byte adaptation allows: scan upward from zero and
+    /// allocate the lowest byte that is neither reserved by a
+    /// canonical/extension key nor already used by another
+    /// translator-only key.  Their byte landing in `self.insns` flows
+    /// verbatim into the serialized pipeline.insns blob the runtime
+    /// decoder reads.
     ///
-    /// Translator-pipeline-only keys (e.g. `inline_call_*/dR>X` per
-    /// `insns.rs:425-436`'s pre-registration omission note) are
-    /// intentionally absent from the canonical table because their
-    /// runtime payload differs from the BH-side `BC_INLINE_CALL`
-    /// adapter; for those keys this falls through to RPython's
-    /// `setdefault(key, len(self.insns))` dynamic allocation, matching
-    /// upstream literally.
-    ///
-    /// `setdefault` in Python silently grows past 255; pyre's bytecode
-    /// dispatcher reads the opnum as a single byte, so going past 255
-    /// would silently wrap and alias two distinct opcodes onto one.
-    /// Strict assert surfaces the overflow at the first new-opcode
-    /// registration instead of as a baffling dispatch bug.
-    ///
-    /// Dynamic-fallback note: RPython uses `len(self.insns)` as the next
-    /// byte because every key participates in the same monotonic
-    /// numbering.  Pyre's canonical-routing splits the byte space —
-    /// canonical keys land at fixed `BC_*` values inside `0..=168`,
-    /// translator-only keys must come AFTER that range or two distinct
-    /// keys could end up at the same byte.  The first dynamic insertion
-    /// therefore starts at `CANONICAL_BYTE_CEILING` rather than at
-    /// `len(self.insns)`, and increments per insertion to mirror
-    /// RPython's monotonic semantics inside the dynamic-only sub-range.
+    /// PRE-EXISTING-ADAPTATION (byte-stability vs. dynamic-range
+    /// trade-off).  Upstream `assembler.py:221 setdefault(key,
+    /// len(self.insns))` allocates densely from 0 — every emitted key
+    /// consumes one of the full 256 byte slots, no reservation.  Pyre
+    /// pins canonical/extension keys at fixed `BC_*` so build-time
+    /// `pipeline.insns` and runtime `wellknown_bh_insns()` can decode
+    /// the same byte to the same opname; the cost is that
+    /// translator-only keys must avoid reserved bytes.  Earlier pyre
+    /// builds allocated only above `canonical_byte_high_water()`, which
+    /// made every gap below the high-water unusable.  The scanner below
+    /// preserves fixed canonical bytes while recovering those gaps,
+    /// leaving only actually reserved bytes unavailable.  The panic
+    /// surfaces exhaustion at the offending registration site instead
+    /// of silently wrapping.
     fn get_opnum(&mut self, key: &str) -> u8 {
+        if let Some(&existing) = self.insns.get(key) {
+            return existing;
+        }
         if let Some(num) = crate::insns::insn_byte_opt(key) {
             self.insns.insert(key.to_string(), num);
             return num;
         }
-        if let Some(&existing) = self.insns.get(key) {
-            return existing;
+        let num = self.next_dynamic_opnum(key);
+        self.insns.insert(key.to_string(), num);
+        num
+    }
+
+    fn next_dynamic_opnum(&mut self, key: &str) -> u8 {
+        let mut candidate = self.dynamic_byte_cursor;
+        while candidate <= u8::MAX as u16 {
+            let byte = candidate as u8;
+            let is_available = !crate::insns::is_reserved_opcode_byte(byte)
+                && !self.insns.values().any(|&used| used == byte);
+            if is_available {
+                self.dynamic_byte_cursor = candidate + 1;
+                return byte;
+            }
+            candidate += 1;
         }
-        // First byte past every fixed canonical `BC_*` (currently the
-        // max canonical byte is 168 — BC_RESIDUAL_CALL_IRF_F).  Bumping
-        // the canonical table forward is allowed; this constant just
-        // needs to stay one past the highest canonical byte.
-        const CANONICAL_BYTE_CEILING: u16 = 169;
-        let next_dynamic = self.next_dynamic_byte.unwrap_or(CANONICAL_BYTE_CEILING);
-        // RPython `assembler.py:220-222 setdefault(key, len(self.insns))`
-        // permits the full 0..=255 range (blackhole.py keeps
-        // `len(insns) <= 256`).  Surface the overflow only when there
-        // is no slot left to assign — bumping past 255 BEFORE the
-        // assignment would forbid the last legal byte.
-        assert!(
-            next_dynamic < 256,
-            "opcode table grew past 256 entries when registering `{key}`; \
-             a 1-byte opcode dispatcher cannot encode more"
+        panic!(
+            "Assembler::get_opnum: opcode byte exhausted while assigning \
+             translator-only key {key:?}; all non-reserved u8 opcode bytes \
+             are already assigned"
         );
-        let assigned = next_dynamic as u8;
-        assert!(
-            (assigned as u16) >= CANONICAL_BYTE_CEILING,
-            "next_dynamic_byte regressed below CANONICAL_BYTE_CEILING for `{key}`; \
-             a translator-only key would collide with a canonical BC_*"
-        );
-        assert!(
-            !self.insns.values().any(|&v| v == assigned),
-            "dynamic byte {assigned} for `{key}` collides with a previously \
-             assigned opcode; canonical and dynamic ranges must be disjoint"
-        );
-        // Saturate at 256 — the next call's `< 256` assert above
-        // surfaces the overflow at the FIRST unassignable registration
-        // rather than during this (still-valid) one.
-        self.next_dynamic_byte = Some(next_dynamic + 1);
-        self.insns.insert(key.to_string(), assigned);
-        assigned
     }
 
     /// Resolve `(register_index, kind)` for a `ValueId`.
@@ -2128,6 +2107,20 @@ fn value_type_to_kind(ty: &crate::model::ValueType) -> char {
         ValueType::Ref => 'r',
         ValueType::Float => 'f',
         ValueType::Void | ValueType::State | ValueType::Unknown => 'v',
+    }
+}
+
+/// `i`/`r`/`f`/`v` → `int`/`ref`/`float`/`void` for opname formation.
+/// Mirrors RPython `bhimpl_<kind>_*` naming where the prefix is the full
+/// kind word — `bhimpl_int_guard_value`, `bhimpl_ref_isvirtual`, etc. —
+/// not the single-character argcode used inside the `/argcodes` suffix.
+fn kind_char_to_name(c: char) -> &'static str {
+    match c {
+        'i' => "int",
+        'r' => "ref",
+        'f' => "float",
+        'v' => "void",
+        _ => panic!("kind_char_to_name: unrecognised kind char {c:?}"),
     }
 }
 
@@ -2754,7 +2747,9 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         }
         OpKind::GuardTrue { .. } => "guard_true".into(),
         OpKind::GuardFalse { .. } => "guard_false".into(),
-        OpKind::GuardValue { kind_char, .. } => format!("{kind_char}_guard_value"),
+        OpKind::GuardValue { kind_char, .. } => {
+            format!("{}_guard_value", kind_char_to_name(*kind_char))
+        }
         // RPython: getfield_vable_i, getfield_vable_r, getfield_vable_f
         OpKind::VableFieldRead { ty, .. } => {
             format!("getfield_vable_{}", value_type_to_kind(ty))
@@ -2799,10 +2794,16 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         OpKind::VableForce { .. } => "hint_force_virtualizable".into(),
         // jtransform.py:1731-1743 — jit.* builtin ops
         OpKind::JitDebug { .. } => "jit_debug".into(),
-        OpKind::AssertGreen { kind_char, .. } => format!("{kind_char}_assert_green"),
+        OpKind::AssertGreen { kind_char, .. } => {
+            format!("{}_assert_green", kind_char_to_name(*kind_char))
+        }
         OpKind::CurrentTraceLength => "current_trace_length".into(),
-        OpKind::IsConstant { kind_char, .. } => format!("{kind_char}_isconstant"),
-        OpKind::IsVirtual { kind_char, .. } => format!("{kind_char}_isvirtual"),
+        OpKind::IsConstant { kind_char, .. } => {
+            format!("{}_isconstant", kind_char_to_name(*kind_char))
+        }
+        OpKind::IsVirtual { kind_char, .. } => {
+            format!("{}_isvirtual", kind_char_to_name(*kind_char))
+        }
         OpKind::RecordKnownResult { result_kind, .. } => {
             format!("record_known_result_{result_kind}")
         }
@@ -3189,27 +3190,42 @@ mod tests {
     }
 
     #[test]
-    fn get_opnum_assigns_byte_255_before_overflow_panic() {
-        // RPython parity: `assembler.py:220-222 setdefault(key, len(self.insns))`
-        // permits the full 0..=255 range; `blackhole.py` keeps
-        // `len(insns) <= 256`. Earlier this file's get_opnum bumped the
-        // dynamic counter BEFORE the assignment via `checked_add(1)`,
-        // which made byte 255 unassignable (the bump from 255 → 256
-        // tripped the overflow expect first). This regression test
-        // pins the full-range parity: the last legal slot must be
-        // assignable, the next call past it panics.
+    fn get_opnum_setdefault_allocates_dynamic_bytes_for_unregistered_keys() {
+        // RPython parity: `assembler.py:220 self.insns.setdefault(key,
+        // len(self.insns))` allocates a fresh byte when the key has
+        // not been seen before.  Pyre skips reserved canonical /
+        // extension bytes so those mappings keep their compile-time-
+        // stable bytes for the runtime walker, but translator-only
+        // keys still get assigned a unique byte instead of panicking.
         let mut asm = Assembler::new();
-        // Seed the counter at 254 so we exercise the 254 → 255 → panic
-        // boundary without registering 169..=253 first.
-        asm.next_dynamic_byte = Some(254);
-        assert_eq!(asm.get_opnum("translator_only_test/254"), 254u8);
-        assert_eq!(asm.get_opnum("translator_only_test/255"), 255u8);
-        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            asm.get_opnum("translator_only_test/256");
-        }));
-        assert!(
-            panic_result.is_err(),
-            "registering a 257th opcode must panic — the 1-byte dispatcher cannot encode it"
+        let expected_first = (0..=u8::MAX)
+            .find(|byte| !crate::insns::is_reserved_opcode_byte(*byte))
+            .expect("expected at least one non-reserved opcode byte");
+        let first = asm.get_opnum("translator_only_unknown_key/254");
+        assert_eq!(
+            first, expected_first,
+            "first unregistered key should land on the lowest \
+             non-reserved byte"
+        );
+        assert!(!crate::insns::is_reserved_opcode_byte(first));
+        let expected_second = ((first as u16 + 1)..=u8::MAX as u16)
+            .map(|byte| byte as u8)
+            .find(|byte| !crate::insns::is_reserved_opcode_byte(*byte))
+            .expect("expected a second non-reserved opcode byte");
+        let second = asm.get_opnum("translator_only_other_key/254");
+        assert_eq!(second, expected_second);
+        assert!(!crate::insns::is_reserved_opcode_byte(second));
+        // Re-querying the same key returns the cached byte, matching
+        // `setdefault`'s dict semantics.
+        let first_again = asm.get_opnum("translator_only_unknown_key/254");
+        assert_eq!(first_again, first);
+        // Canonical keys keep their reserved bytes regardless of the
+        // dynamic counter.
+        let live = asm.get_opnum("live/");
+        assert_eq!(
+            live,
+            crate::insns::insn_byte("live/"),
+            "canonical keys must keep their reserved BC_* bytes",
         );
     }
 

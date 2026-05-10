@@ -53,7 +53,7 @@ fn test_elidable_function() {
     assert_eq!(compute(0), 1);
     assert_eq!(compute(-3), 10);
     // EF_ELIDABLE_CAN_RAISE — call.py:297 `elif cr:` branch.
-    let (policy, _, _, _, _) = __majit_call_policy_compute();
+    let (policy, _, _, _, _, _) = __majit_call_policy_compute();
     assert_eq!(policy, 3u8);
 }
 
@@ -66,7 +66,7 @@ fn compute_pure(x: i64) -> i64 {
 fn test_elidable_cannot_raise_function() {
     assert_eq!(compute_pure(7), 14);
     // EF_ELIDABLE_CANNOT_RAISE — call.py:299 `else` branch.
-    let (policy, _, _, _, _) = __majit_call_policy_compute_pure();
+    let (policy, _, _, _, _, _) = __majit_call_policy_compute_pure();
     assert_eq!(policy, 19u8);
 }
 
@@ -79,7 +79,7 @@ fn compute_memerror(x: i64) -> i64 {
 fn test_elidable_or_memerror_function() {
     assert_eq!(compute_memerror(7), 107);
     // EF_ELIDABLE_OR_MEMORYERROR — call.py:295 `if cr == "mem":`.
-    let (policy, _, _, _, _) = __majit_call_policy_compute_memerror();
+    let (policy, _, _, _, _, _) = __majit_call_policy_compute_memerror();
     assert_eq!(policy, 20u8);
 }
 

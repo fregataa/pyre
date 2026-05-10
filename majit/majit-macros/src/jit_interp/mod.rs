@@ -1254,7 +1254,7 @@ fn rewrite_body(
                     let policy_path = jitcode_lower::helper_policy_path(func)?;
                     quote! {
                         {
-                            let (_, _, __majit_observer_trace, __majit_observer_concrete, _) = #policy_path();
+                            let (_, _, __majit_observer_trace, __majit_observer_concrete, _prebuild, _save_err) = #policy_path();
                             if __majit_observer_trace.is_null()
                                 && __majit_observer_concrete.is_null()
                             {

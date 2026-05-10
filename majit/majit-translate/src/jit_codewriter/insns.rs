@@ -266,10 +266,6 @@ pub const BC_RESIDUAL_CALL_R_R: u8 = 165;
 pub const BC_RESIDUAL_CALL_IR_R: u8 = 166;
 pub const BC_RESIDUAL_CALL_IRF_R: u8 = 167;
 pub const BC_RESIDUAL_CALL_IRF_F: u8 = 168;
-/// `bhimpl_getarrayitem_gc_i/rid>i` — read int from a GC-managed array
-/// at runtime offset (`pyjitpl.py:2237 op_getarrayitem_gc_i`). Used by
-/// dispatch JitCode opcode-fetch lowering to load `program[pc]`.
-pub const BC_GETARRAYITEM_GC_I: u8 = 169;
 // Typed return opcodes — RPython `blackhole.py:841-862`
 // `bhimpl_int_return`, `bhimpl_float_return`, `bhimpl_void_return`.
 // pyre's portal return is REF (see BC_REF_RETURN) but the insns map
@@ -279,6 +275,129 @@ pub const BC_GETARRAYITEM_GC_I: u8 = 169;
 pub const BC_INT_RETURN: u8 = 148;
 pub const BC_FLOAT_RETURN: u8 = 149;
 pub const BC_VOID_RETURN: u8 = 150;
+
+// `getfield_gc_*` / `setfield_gc_*` — RPython `blackhole.py:1432-1481`
+// `bhimpl_getfield_gc_{i,r,f}` + `bhimpl_setfield_gc_{i,r,f}` —
+// descr-keyed instance field load/store on the GC heap.  Pyre emits
+// these at build time from the assembler so the bytes are pinned
+// canonical to keep the byte → opname map stable across build/runtime.
+pub const BC_GETFIELD_GC_I: u8 = 169;
+pub const BC_GETFIELD_GC_R: u8 = 170;
+pub const BC_GETFIELD_GC_F: u8 = 171;
+pub const BC_SETFIELD_GC_I: u8 = 172;
+pub const BC_SETFIELD_GC_R: u8 = 173;
+
+// `getarrayitem_gc_*` / `setarrayitem_gc_*` — RPython
+// `blackhole.py:1330-1422`.  `bhimpl_getarrayitem_gc_{i,r,f}` only
+// defines the `rid` (ref + int_idx + descr) argcode shape.  Pyre also
+// emits a `rrd` (ref + ref_idx + descr) shape from
+// `OpKind::ArrayRead { index_ty: Ref }` (`blackhole.rs:6938`); that
+// shape has no upstream counterpart and lives in
+// `pyre_extension_insns()` — not here.
+pub const BC_GETARRAYITEM_GC_R_RID: u8 = 174;
+pub const BC_SETARRAYITEM_GC_I: u8 = 176;
+pub const BC_SETARRAYITEM_GC_R: u8 = 177;
+pub const BC_SETARRAYITEM_GC_F: u8 = 178;
+pub const BC_GETARRAYITEM_GC_I: u8 = 197;
+pub const BC_GETARRAYITEM_GC_F: u8 = 198;
+
+// `float_*` comparison ops — RPython `blackhole.py:721-746`
+// `bhimpl_float_{lt,le,eq,ne,gt,ge}` — float comparisons returning int.
+pub const BC_FLOAT_EQ: u8 = 179;
+pub const BC_FLOAT_NE: u8 = 180;
+pub const BC_FLOAT_LT: u8 = 181;
+pub const BC_FLOAT_GT: u8 = 182;
+
+// `cast_*_to_*` conversion ops — RPython `bhimpl_cast_ptr_to_int`
+// (`blackhole.py:603-606`), `bhimpl_cast_int_to_ptr`
+// (`blackhole.py:608-610`), `bhimpl_cast_int_to_float`
+// (`blackhole.py:811-816`).
+pub const BC_CAST_INT_TO_FLOAT: u8 = 183;
+pub const BC_CAST_INT_TO_PTR: u8 = 184;
+pub const BC_CAST_PTR_TO_INT: u8 = 185;
+
+// `switch/id` — RPython `blackhole.py:954-960` `bhimpl_switch` —
+// table-of-cases dispatch keyed by an int register + a descr selecting
+// the case table.
+pub const BC_SWITCH: u8 = 186;
+
+// `inline_call_{r,ir,irf}_{i,r,v,f}` — RPython `blackhole.py:1279-1320`
+// `bhimpl_inline_call_*` — inlined helper-jitcode dispatch.  The argcode
+// suffix encodes which kind families the helper takes (R/IR/IRF) and
+// what kind it returns (i/r/v/f).
+pub const BC_INLINE_CALL_R_I: u8 = 187;
+pub const BC_INLINE_CALL_R_R: u8 = 188;
+pub const BC_INLINE_CALL_R_V: u8 = 189;
+pub const BC_INLINE_CALL_IR_I: u8 = 190;
+pub const BC_INLINE_CALL_IR_R: u8 = 191;
+pub const BC_INLINE_CALL_IR_V: u8 = 192;
+pub const BC_INLINE_CALL_IRF_F: u8 = 193;
+pub const BC_INLINE_CALL_IRF_R: u8 = 194;
+pub const BC_INLINE_CALL_IRF_I: u8 = 202;
+pub const BC_INLINE_CALL_IRF_V: u8 = 203;
+
+// Float `<=` / `>=` comparisons — RPython `blackhole.py:726-749`
+// `bhimpl_float_{le,ge}` (le @726, ge @746).  `BC_FLOAT_LE` /
+// `BC_FLOAT_GE` join the existing `BC_FLOAT_{EQ,NE,LT,GT}` quartet at
+// 179-182.
+pub const BC_FLOAT_LE: u8 = 204;
+pub const BC_FLOAT_GE: u8 = 205;
+
+// `setfield_gc_f/rfd` — RPython `blackhole.py:1481`
+// `bhimpl_setfield_gc_f`.  Float-result sibling of
+// `bhimpl_setfield_gc_{i,r}` which already pin `BC_SETFIELD_GC_{I,R}`
+// at 172-173; deferred until now because pyre's float-field stores
+// only landed alongside the float comparison fix.
+pub const BC_SETFIELD_GC_F: u8 = 206;
+
+// `getfield_gc_*_pure/rd>X` and `getarrayitem_gc_*_pure/rid>X` —
+// RPython `blackhole.py:1339-1341, 1441-1443` aliases
+// `bhimpl_get{field,arrayitem}_gc_{i,r,f}_pure =
+// bhimpl_get{field,arrayitem}_gc_{i,r,f}`.  The Python aliases share
+// a function body but each `(opname, argcodes)` key still gets its
+// own opcode byte through `assembler.py:220
+// self.insns.setdefault(key, len(self.insns))`.  The walker dispatch
+// at `pyre/pyre-jit-trace/src/jitcode_dispatch.rs` routes the `_pure`
+// keys to the same handler as the non-pure form, but the byte must
+// be distinct or `pyjitpl.py:2230 setup_insns`'s
+// `assert opcode_implementations[value] is None` and pyre's
+// `jitcode_runtime.rs:272` duplicate-byte assert would fire.
+pub const BC_GETFIELD_GC_I_PURE: u8 = 207;
+pub const BC_GETFIELD_GC_R_PURE: u8 = 208;
+pub const BC_GETFIELD_GC_F_PURE: u8 = 209;
+pub const BC_GETARRAYITEM_GC_I_PURE: u8 = 210;
+pub const BC_GETARRAYITEM_GC_R_PURE: u8 = 211;
+pub const BC_GETARRAYITEM_GC_F_PURE: u8 = 212;
+
+// pyre-only `abort/>r` — Ref-result variant of `abort/` (BC_ABORT = 13)
+// emitted by `Assembler::encode_op`'s default branch when an `OpKind::
+// Abort { result_kind: Ref }` reaches the assembler.  Lives in
+// `pyre_extension_insns()` alongside `abort/` / `abort_permanent/`.
+pub const BC_ABORT_RESULT_R: u8 = 195;
+
+// pyre-only `vtable_method_ptr/rd>i` — emitted by `OpKind::
+// VtableMethodPtr` (assembler.rs:2762).  RPython has no counterpart
+// because Python dispatch goes through `cpu.bh_call_*` resolved at
+// runtime; pyre's Rust port hits this only when a `dyn Trait` method
+// pointer must be reified into the bytecode stream (backend-epic
+// adaptation, see `blackhole.rs:8462-8474`).
+pub const BC_VTABLE_METHOD_PTR: u8 = 196;
+
+// pyre-only `getarrayitem_gc_r/rrd>r` — Ref-indexed array read.  RPython
+// `blackhole.py:1333` only defines the `rid` (int-indexed) shape;
+// pyre's `OpKind::ArrayRead { index_ty: Ref, .. }` lowering
+// (`blackhole.rs:6938`) emits this `rrd` shape so the assembler can
+// encode the typed-Ref index without an int-coerce.  Quarantined into
+// `pyre_extension_insns()` until a porting pass lifts the ref-index
+// case to upstream's `cpu.bh_call_*`-resolved dispatch shape.
+pub const BC_GETARRAYITEM_GC_R_RRD: u8 = 175;
+
+// `record_quasiimmut_field/rdd` — RPython `blackhole.py:1538-1545`
+// `bhimpl_record_quasiimmut_field`.  Records that a quasi-immutable
+// struct field has been read so the optimizer can install a
+// `QUASIIMMUT_FIELD` guard before the corresponding `getfield_gc_*`.
+// Argcodes: `rdd` (struct ref + fielddescr + mutatefielddescr).
+pub const BC_RECORD_QUASIIMMUT_FIELD: u8 = 199;
 
 pub const MAX_HOST_CALL_ARITY: usize = 16;
 
@@ -305,18 +424,20 @@ pub fn insn_byte(key: &str) -> u8 {
 
 /// Non-panicking lookup against the merged
 /// `wellknown_bh_insns()` + `pyre_extension_insns()` table.  Returns
-/// `None` for keys that are intentionally left out of the canonical
-/// table — notably the translator-pipeline-only `inline_call_*/dR>X`
-/// family (see this module's pre-registration omission note at
-/// `wellknown_bh_insns()` for rationale).
+/// `Some(byte)` for canonical/extension keys (build/runtime-stable
+/// `BC_*`) and `None` for translator-only keys.  `Assembler::get_opnum`
+/// uses the `None` return to fall through to the
+/// `assembler.py:221 setdefault(key, len(self.insns))` dynamic-byte
+/// allocator, adjusted for pyre's fixed-byte table by scanning from
+/// zero and skipping reserved bytes.  A `None` here is not a
+/// fail-loud condition — it just means the key flows through the
+/// dynamic allocator instead of a reserved byte.
 ///
-/// Build-time `JitCodeBuilder::write_insn` consumers must always
-/// resolve to a canonical byte and use [`insn_byte`].  The
-/// translator-pipeline assembler (`Assembler::get_opnum`) consults
-/// this opt variant so it can preserve canonical-byte parity with the
-/// BH runtime for shared keys while still falling through to RPython's
-/// `setdefault(key, len(self.insns))` allocation for translator-only
-/// keys.
+/// Build-time `JitCodeBuilder::write_insn` callers use the panicking
+/// [`insn_byte`] variant (every key the BH dispatcher knows about must
+/// be registered here); the translator-pipeline assembler consults
+/// this `_opt` variant so unregistered translator-only keys can take
+/// the dynamic-allocation path without tripping the runtime decoder.
 pub fn insn_byte_opt(key: &str) -> Option<u8> {
     use std::sync::OnceLock;
     static TABLE: OnceLock<HashMap<&'static str, u8>> = OnceLock::new();
@@ -325,9 +446,9 @@ pub fn insn_byte_opt(key: &str) -> Option<u8> {
         // canonical opname (RPython parity) AND any pyre-only Rust-
         // adaptation opname (`abort/`, `abort_permanent/`). Merging both
         // tables keeps every legal key resolvable from a single entry
-        // point while the source of truth remains split — Task #93 audit
-        // bucket A (Canonical) lives in `wellknown_bh_insns()`, Task #94c
-        // pyre-only quarantine lives in `pyre_extension_insns()`.
+        // point while the source of truth remains split — canonical
+        // opnames live in `wellknown_bh_insns()`, pyre-only quarantine
+        // lives in `pyre_extension_insns()`.
         let mut merged = wellknown_bh_insns();
         for (k, v) in pyre_extension_insns() {
             assert!(
@@ -340,6 +461,52 @@ pub fn insn_byte_opt(key: &str) -> Option<u8> {
         merged
     });
     table.get(key).copied()
+}
+
+/// Highest byte value reserved across `wellknown_bh_insns()` ∪
+/// `pyre_extension_insns()`.  This is a diagnostic for pyre's fixed
+/// `BC_*` range; translator-only opcode allocation must not use this
+/// as a start offset because gaps below the high-water remain legal
+/// dynamic bytes.
+pub fn canonical_byte_high_water() -> u8 {
+    use std::sync::OnceLock;
+    static HIGH_WATER: OnceLock<u8> = OnceLock::new();
+    *HIGH_WATER.get_or_init(|| {
+        let mut max = 0u8;
+        for (_, v) in wellknown_bh_insns() {
+            if v > max {
+                max = v;
+            }
+        }
+        for (_, v) in pyre_extension_insns() {
+            if v > max {
+                max = v;
+            }
+        }
+        max
+    })
+}
+
+/// True when `byte` is pinned by either canonical RPython-mirror keys
+/// (`wellknown_bh_insns`) or pyre-only extension keys
+/// (`pyre_extension_insns`).  Multiple keys may intentionally share a
+/// byte because some RPython blackhole handlers are aliases; this helper
+/// only answers whether the byte is reserved, not whether the table is
+/// one-to-one.
+pub fn is_reserved_opcode_byte(byte: u8) -> bool {
+    use std::sync::OnceLock;
+    static RESERVED: OnceLock<[bool; 256]> = OnceLock::new();
+    let reserved = RESERVED.get_or_init(|| {
+        let mut reserved = [false; 256];
+        for (_, value) in wellknown_bh_insns() {
+            reserved[value as usize] = true;
+        }
+        for (_, value) in pyre_extension_insns() {
+            reserved[value as usize] = true;
+        }
+        reserved
+    });
+    reserved[byte as usize]
 }
 
 /// Fixed majit blackhole opcode-name table.
@@ -403,7 +570,6 @@ pub fn wellknown_bh_insns() -> HashMap<&'static str, u8> {
     m.insert("setfield_vable_i/rid", BC_SETFIELD_VABLE_I);
     m.insert("setfield_vable_r/rrd", BC_SETFIELD_VABLE_R);
     m.insert("setfield_vable_f/rfd", BC_SETFIELD_VABLE_F);
-    m.insert("getarrayitem_gc_i/rid>i", BC_GETARRAYITEM_GC_I);
     m.insert("getarrayitem_vable_i/ridd>i", BC_GETARRAYITEM_VABLE_I);
     m.insert("getarrayitem_vable_r/ridd>r", BC_GETARRAYITEM_VABLE_R);
     m.insert("getarrayitem_vable_f/ridd>f", BC_GETARRAYITEM_VABLE_F);
@@ -578,6 +744,91 @@ pub fn wellknown_bh_insns() -> HashMap<&'static str, u8> {
     m.insert("goto_if_not/iL", BC_GOTO_IF_NOT_INT_IS_TRUE);
     m.insert("goto_if_not_int_is_true/iL", BC_GOTO_IF_NOT_INT_IS_TRUE);
 
+    // GC heap field load/store — `blackhole.py:1432-1481` `bhimpl_
+    // {get,set}field_gc_{i,r,f}`.  Argcodes: `rd` (struct ref + descr)
+    // for gets, `r{i,r,f}d` (struct ref + value reg + descr) for sets.
+    m.insert("getfield_gc_i/rd>i", BC_GETFIELD_GC_I);
+    m.insert("getfield_gc_r/rd>r", BC_GETFIELD_GC_R);
+    m.insert("getfield_gc_f/rd>f", BC_GETFIELD_GC_F);
+    m.insert("setfield_gc_i/rid", BC_SETFIELD_GC_I);
+    m.insert("setfield_gc_r/rrd", BC_SETFIELD_GC_R);
+    m.insert("setfield_gc_f/rfd", BC_SETFIELD_GC_F);
+    // RPython `blackhole.py:1441-1443` aliases `bhimpl_getfield_gc_{i,r,f}_pure
+    // = bhimpl_getfield_gc_{i,r,f}` — pure-getter shape on quasi-immutable
+    // descrs.  Each `(opname, argcodes)` key gets its own byte per
+    // `assembler.py:220 setdefault(key, len(self.insns))`; `pyjitpl.py:2230
+    // setup_insns` and pyre's `jitcode_runtime.rs:272` both assert no
+    // duplicate bytes.  Walker dispatch routes `_pure` to the same handler.
+    m.insert("getfield_gc_i_pure/rd>i", BC_GETFIELD_GC_I_PURE);
+    m.insert("getfield_gc_r_pure/rd>r", BC_GETFIELD_GC_R_PURE);
+    m.insert("getfield_gc_f_pure/rd>f", BC_GETFIELD_GC_F_PURE);
+
+    // GC heap array element load/store — `blackhole.py:1330-1422`.
+    // `bhimpl_getarrayitem_gc_{i,r,f}` only register the canonical
+    // `rid` (ref + int_idx + descr) shape.  Pyre's pyre-only `rrd` (ref
+    // + ref_idx + descr) shape lives in `pyre_extension_insns()`.
+    // Setters are 4-byte payloads `ri{i,r,f}d` per
+    // `bhimpl_setarrayitem_gc_{i,r,f}(cpu, array, index, newvalue,
+    // arraydescr)` (`blackhole.py:1351-1359`): array (Ref), index (Int),
+    // newvalue ({Int,Ref,Float}), arraydescr.
+    m.insert("getarrayitem_gc_r/rid>r", BC_GETARRAYITEM_GC_R_RID);
+    m.insert("setarrayitem_gc_i/riid", BC_SETARRAYITEM_GC_I);
+    m.insert("setarrayitem_gc_r/rird", BC_SETARRAYITEM_GC_R);
+    m.insert("setarrayitem_gc_f/rifd", BC_SETARRAYITEM_GC_F);
+    m.insert("getarrayitem_gc_i/rid>i", BC_GETARRAYITEM_GC_I);
+    m.insert("getarrayitem_gc_f/rid>f", BC_GETARRAYITEM_GC_F);
+    // RPython `blackhole.py:1339-1341` aliases
+    // `bhimpl_getarrayitem_gc_{i,r,f}_pure = bhimpl_getarrayitem_gc_{i,r,f}`
+    // — pure-getter shape on immutable-array descrs.  Each
+    // `(opname, argcodes)` key gets its own byte per `assembler.py:220
+    // setdefault(key, len(self.insns))`; walker dispatch routes
+    // `_pure` to the same handler as the non-pure form.
+    m.insert("getarrayitem_gc_i_pure/rid>i", BC_GETARRAYITEM_GC_I_PURE);
+    m.insert("getarrayitem_gc_r_pure/rid>r", BC_GETARRAYITEM_GC_R_PURE);
+    m.insert("getarrayitem_gc_f_pure/rid>f", BC_GETARRAYITEM_GC_F_PURE);
+
+    // Quasi-immutable record — `blackhole.py:1538-1545`
+    // `bhimpl_record_quasiimmut_field`.  Argcodes `rdd`: struct ref +
+    // field descr + mutate descr (no result).
+    m.insert("record_quasiimmut_field/rdd", BC_RECORD_QUASIIMMUT_FIELD);
+
+    // Float comparisons — `blackhole.py:721-746`
+    // `bhimpl_float_{lt,le,eq,ne,gt,ge}` — float pair → int (0/1).
+    m.insert("float_eq/ff>i", BC_FLOAT_EQ);
+    m.insert("float_ne/ff>i", BC_FLOAT_NE);
+    m.insert("float_lt/ff>i", BC_FLOAT_LT);
+    m.insert("float_le/ff>i", BC_FLOAT_LE);
+    m.insert("float_gt/ff>i", BC_FLOAT_GT);
+    m.insert("float_ge/ff>i", BC_FLOAT_GE);
+
+    // Cross-kind casts — `bhimpl_cast_ptr_to_int` (`blackhole.py:603-606`),
+    // `bhimpl_cast_int_to_ptr` (`blackhole.py:608-610`),
+    // `bhimpl_cast_int_to_float` (`blackhole.py:811-816`).
+    m.insert("cast_int_to_float/i>f", BC_CAST_INT_TO_FLOAT);
+    m.insert("cast_int_to_ptr/i>r", BC_CAST_INT_TO_PTR);
+    m.insert("cast_ptr_to_int/r>i", BC_CAST_PTR_TO_INT);
+
+    // Switch dispatch — `blackhole.py:954-960` `bhimpl_switch`.
+    // Argcodes `id`: int discriminator + descr selecting the case table.
+    m.insert("switch/id", BC_SWITCH);
+
+    // Inlined helper-jitcode dispatch — `blackhole.py:1279-1320`
+    // `bhimpl_inline_call_*`.  Argcodes encode (a) which kind families
+    // the helper takes after the descr — `R` (ref-only), `IR`
+    // (int+ref), `IRF` (int+ref+float) — and (b) the helper's return
+    // kind — `>i`/`>r`/`>f` for typed returns, no suffix for void.  The
+    // descr `d` slot resolves to the helper's `JitCode` at runtime.
+    m.insert("inline_call_r_i/dR>i", BC_INLINE_CALL_R_I);
+    m.insert("inline_call_r_r/dR>r", BC_INLINE_CALL_R_R);
+    m.insert("inline_call_r_v/dR", BC_INLINE_CALL_R_V);
+    m.insert("inline_call_ir_i/dIR>i", BC_INLINE_CALL_IR_I);
+    m.insert("inline_call_ir_r/dIR>r", BC_INLINE_CALL_IR_R);
+    m.insert("inline_call_ir_v/dIR", BC_INLINE_CALL_IR_V);
+    m.insert("inline_call_irf_i/dIRF>i", BC_INLINE_CALL_IRF_I);
+    m.insert("inline_call_irf_r/dIRF>r", BC_INLINE_CALL_IRF_R);
+    m.insert("inline_call_irf_f/dIRF>f", BC_INLINE_CALL_IRF_F);
+    m.insert("inline_call_irf_v/dIRF", BC_INLINE_CALL_IRF_V);
+
     m
 }
 
@@ -700,5 +951,28 @@ pub fn pyre_extension_insns() -> HashMap<&'static str, u8> {
     m.insert("cond_call_value_ref_pyre/P", BC_COND_CALL_VALUE_REF);
     m.insert("record_known_result_int_pyre/P", BC_RECORD_KNOWN_RESULT_INT);
     m.insert("record_known_result_ref_pyre/P", BC_RECORD_KNOWN_RESULT_REF);
+    // pyre-only `abort/>r` — Ref-result variant of `abort/`.  Emitted by
+    // `Assembler::encode_op`'s default branch when an `OpKind::Abort` with
+    // `result_kind: Ref` reaches the assembler.  The blackhole-side
+    // handler `handler_abort_result_marker_r` (`blackhole.rs:6042`) is a
+    // no-op that advances past the trailing destination register byte;
+    // the abort signal proper goes through `abort/` (`BC_ABORT = 13`).
+    m.insert("abort/>r", BC_ABORT_RESULT_R);
+    // pyre-only `vtable_method_ptr/rd>i` — emitted by
+    // `OpKind::VtableMethodPtr` (`assembler.rs:2762`).  RPython's dispatch
+    // resolves dyn-method addresses through `cpu.bh_call_*` at runtime
+    // and never needs to reify a method pointer into the bytecode stream;
+    // pyre's Rust port hits this only on `dyn Trait` calls, where the
+    // backend epic must look up the vtable slot itself.
+    m.insert("vtable_method_ptr/rd>i", BC_VTABLE_METHOD_PTR);
+    // pyre-only `getarrayitem_gc_r/rrd>r` — Ref-indexed GC array read.
+    // RPython `blackhole.py:1333 bhimpl_getarrayitem_gc_r` only
+    // registers the canonical `rid` (int-indexed) shape.  Pyre's
+    // `OpKind::ArrayRead { index_ty: Ref, .. }` lowering
+    // (`blackhole.rs:6938`) emits this `rrd` shape so the assembler can
+    // encode the typed-Ref index without an int-coerce; converging
+    // requires lifting the ref-index case to upstream's
+    // `cpu.bh_call_*`-resolved dispatch shape.
+    m.insert("getarrayitem_gc_r/rrd>r", BC_GETARRAYITEM_GC_R_RRD);
     m
 }
