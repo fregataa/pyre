@@ -516,17 +516,13 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
             return true;
         }
         // make_constant mirrors optimizer.py:432 as
-        // `Forwarded::Box(constbox)`. Direct slot access also keeps legacy
-        // `Info(Constant)` fixtures readable.
+        // `Forwarded::Box(constbox)`.
         let idx = opref.raw() as usize;
         if let Some(b) = self.ctx.box_pool.get(idx) {
-            use crate::optimizeopt::info::OpInfo;
-            match &*b.get_forwarded() {
-                crate::r#box::Forwarded::Box(target) if target.is_constant() => return true,
-                crate::r#box::Forwarded::Info(OpInfo::Constant(_) | OpInfo::FloatConst(_)) => {
+            if let crate::r#box::Forwarded::Box(target) = &*b.get_forwarded() {
+                if target.is_constant() {
                     return true;
                 }
-                _ => {}
             }
         }
         // info.py: ConstPtrInfo.is_constant() → True
@@ -538,15 +534,11 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
 
     fn get_const(&self, opref: OpRef) -> (i64, majit_ir::Type) {
         // make_constant mirrors optimizer.py:432 as
-        // `Forwarded::Box(constbox)`. Direct slot access also keeps legacy
-        // `Info(Constant)` fixtures readable.
+        // `Forwarded::Box(constbox)`.
         let idx = opref.raw() as usize;
         let const_value: Option<Value> = if let Some(b) = self.ctx.box_pool.get(idx) {
-            use crate::optimizeopt::info::OpInfo;
             match &*b.get_forwarded() {
                 crate::r#box::Forwarded::Box(target) => target.const_value(),
-                crate::r#box::Forwarded::Info(OpInfo::Constant(v)) => Some(*v),
-                crate::r#box::Forwarded::Info(OpInfo::FloatConst(f)) => Some(Value::Float(*f)),
                 _ => None,
             }
         } else {
@@ -2389,8 +2381,10 @@ impl OptContext {
             // through this arm via IntBound::is_constant().
             Int(crate::optimizeopt::intutils::IntBound),
             // info.py:851 FloatConstInfo carries a single ConstFloat;
-            // make_guards emits a GUARD_VALUE pinning `op` to the
-            // ConstFloat.
+            // make_guards (info.py:861) emits a GUARD_VALUE pinning `op`
+            // to the ConstFloat. `set_preamble_forwarded_info` plants this
+            // shape per shortpreamble.py:416
+            // `preamble_op.set_forwarded(info)`.
             FloatConst(f64),
         }
         let snapshot_forwarded = |ctx: &Self, arg: OpRef| -> Option<ForwardedInfo> {
@@ -2400,13 +2394,7 @@ impl OptContext {
             //   `Forwarded::Info(OpInfo::Ptr(_))` — info.py:600 PtrInfo
             //   `Forwarded::Info(OpInfo::IntBound(_))` — intutils.py
             //   `Forwarded::Info(OpInfo::FloatConst(_))` — info.py:851
-            // Const-forwarded boxes (`Forwarded::Box(constbox)` from
-            // optimizer.py:432, or legacy `OpInfo::Constant`) are not
-            // reachable here in production: PyPy use_box never sees a
-            // Const in `_forwarded` because make_constant is not applied
-            // to short-preamble inputarg boxes, and pyre matches that
-            // call shape. Returning None on those arms preserves literal
-            // PyPy use_box structure.
+            //       FloatConstInfo planted via set_preamble_forwarded_info.
             let b = ctx.box_pool.get(arg.raw() as usize)?;
             use crate::optimizeopt::info::OpInfo;
             match &*b.get_forwarded() {
@@ -2470,6 +2458,8 @@ impl OptContext {
         // info.py:861 FloatConstInfo.make_guards / ConstPtrInfo path —
         // single-value info classes emit a GUARD_VALUE that pins `op` to
         // the recorded constant.
+        // info.py:861 FloatConstInfo.make_guards: emits GUARD_VALUE
+        // pinning `op` to the ConstFloat.
         let emit_const_guard =
             |arg: OpRef,
              value: &Value,
@@ -2582,16 +2572,25 @@ impl OptContext {
                 crate::r#box::Forwarded::Info(OpInfo::IntBound(ib)) => {
                     Some(OpInfo::IntBound(ib.clone()))
                 }
+                // info.py:851 FloatConstInfo planted via
+                // `set_preamble_forwarded_info` (shortpreamble.py:416
+                // `preamble_op.set_forwarded(info)`).
                 crate::r#box::Forwarded::Info(OpInfo::FloatConst(f)) => {
                     Some(OpInfo::FloatConst(*f))
                 }
-                crate::r#box::Forwarded::Info(OpInfo::Constant(v)) => {
-                    Some(OpInfo::Constant(v.clone()))
-                }
                 crate::r#box::Forwarded::Box(target) if target.is_constant() => {
-                    target.const_value().map(|v| match v {
-                        Value::Float(f) => OpInfo::FloatConst(f),
-                        v => OpInfo::Constant(v),
+                    // optimizer.py:329-338 `getinfo` parity for the Const
+                    // terminal — Refs surface as `ConstPtrInfo`, Floats as
+                    // `FloatConstInfo`, Ints as `IntBound::from_constant`.
+                    target.const_value().and_then(|v| match v {
+                        Value::Ref(gcref) => Some(OpInfo::Ptr(
+                            crate::optimizeopt::info::PtrInfo::Constant(gcref),
+                        )),
+                        Value::Float(f) => Some(OpInfo::FloatConst(f)),
+                        Value::Int(i) => Some(OpInfo::IntBound(
+                            crate::optimizeopt::intutils::IntBound::from_constant(i),
+                        )),
+                        Value::Void => None,
                     })
                 }
                 _ => None,
@@ -2802,12 +2801,6 @@ impl OptContext {
             OpInfo::FloatConst(f) => {
                 self.make_constant(target, Value::Float(*f));
             }
-            // Direct `OpInfo::Constant(Value)` — covers Int/other constant
-            // forwarding exported for constant OpRefs without a dedicated
-            // IntBound/FloatConst entry.
-            OpInfo::Constant(value) => {
-                self.make_constant(target, value.clone());
-            }
             // unroll.py:53-98 has no dispatch arm for "no info" — the
             // caller never stores an `Unknown` entry in `exported_infos`
             // (see `collect_exported_info`'s `None` return at
@@ -2842,9 +2835,6 @@ impl OptContext {
             }
             OpInfo::FloatConst(f) => {
                 self.make_constant(target, Value::Float(*f));
-            }
-            OpInfo::Constant(value) => {
-                self.make_constant(target, value.clone());
             }
             OpInfo::Unknown => {}
         }
@@ -3162,69 +3152,75 @@ impl OptContext {
     /// `Forwarded::Box(target)` and terminates at `None` /
     /// `Forwarded::Info(_)` / a Const target's reconstructed
     /// `OpRef::const_int/float/ptr`.
-    fn get_box_replacement_impl(&self, mut opref: OpRef, not_const: bool) -> OpRef {
-        use crate::r#box::Forwarded as BoxForwarded;
-
-        loop {
-            if opref.is_constant() || opref.is_none() {
-                return opref;
-            }
-            let idx = opref.raw() as usize;
-            let mut next: Option<OpRef> = None;
-            if let Some(b) = self.box_pool.get(idx) {
-                match &*b.get_forwarded() {
-                    BoxForwarded::None => {
-                        // No forwarding — terminal at this position.
-                    }
-                    BoxForwarded::Info(_) => {}
-                    BoxForwarded::Box(target) => {
-                        if target.is_constant() {
-                            if not_const {
-                                return opref;
-                            }
-                            // Slice 19: `replace_op(_, const_target)` writes
-                            // `Box(BoxRef::new_const_with_index(value, idx))`
-                            // carrying the original const_index. Reconstruct
-                            // the constant-namespace OpRef so the walker
-                            // advances natively without consulting Vec.
-                            // Pre-slice-19 callers (`new_const(value)`)
-                            // omit the const_index — fall through and terminate
-                            // at the source OpRef for those legacy/test paths.
-                            if let Some(idx_const) = target.const_index() {
-                                let const_opref = match target.type_() {
-                                    majit_ir::Type::Int => OpRef::const_int(idx_const),
-                                    majit_ir::Type::Float => OpRef::const_float(idx_const),
-                                    majit_ir::Type::Ref => OpRef::const_ptr(idx_const),
-                                    majit_ir::Type::Void => opref,
-                                };
-                                if !matches!(target.type_(), majit_ir::Type::Void) {
-                                    next = Some(const_opref);
-                                }
-                            }
-                        } else if let Some(pos) = target.position() {
-                            let tp = target.type_();
-                            // `Type::Void` targets are lazy-allocated phantom
-                            // placeholders (`ensure_box_at`); the placeholder
-                            // carries no type information, so preserve the
-                            // source variant via `with_raw` instead of
-                            // promoting to `void_op` / `input_arg_typed(_, Void)`.
-                            if matches!(tp, majit_ir::Type::Void) {
-                                next = Some(opref.with_raw(pos));
-                            } else if target.is_inputarg() {
-                                next = Some(OpRef::input_arg_typed(pos, tp));
-                            } else if target.is_resop() {
-                                next = Some(OpRef::op_typed(pos, tp));
-                            }
-                        }
-                    }
-                }
-            }
-            if let Some(n) = next {
-                opref = n;
-                continue;
-            }
+    fn get_box_replacement_impl(&self, opref: OpRef, not_const: bool) -> OpRef {
+        if opref.is_constant() || opref.is_none() {
             return opref;
         }
+        let idx = opref.raw() as usize;
+        let Some(start) = self.box_pool.get(idx).cloned() else {
+            return opref;
+        };
+        // resoperation.py:57-68: walk box._forwarded on the box itself.
+        let terminal = start.get_box_replacement(not_const);
+        // When the walker did not advance — chain root has Forwarded::None,
+        // Forwarded::Info(_), or (not_const=true and the immediate target
+        // is Const) — return the source OpRef variant unchanged. The
+        // original walker terminated before reading position()/type_(),
+        // so callers expect the OpRef shape they passed in.
+        if start == terminal {
+            return opref;
+        }
+        // The walker advanced through Const targets unconditionally
+        // (only `not_const=true` stops before one). Const-without-index —
+        // a `BoxRef::new_const(value)` planted by a legacy/test path with
+        // no matching `OpRef::const_*` namespace — has no OpRef
+        // counterpart, so re-walk stopping before Const and convert that
+        // predecessor instead.
+        if !not_const && terminal.is_constant() && terminal.const_index().is_none() {
+            let pre_const = start.get_box_replacement(true);
+            if start == pre_const {
+                return opref;
+            }
+            return self.box_to_opref(&pre_const, opref);
+        }
+        self.box_to_opref(&terminal, opref)
+    }
+
+    /// Convert a chain-walk terminal `BoxRef` back into an `OpRef`. This
+    /// is the OpRef-side glue around `BoxRef::get_box_replacement`; PyPy
+    /// callers hold the box directly and skip this step.
+    fn box_to_opref(&self, terminal: &crate::r#box::BoxRef, source: OpRef) -> OpRef {
+        if terminal.is_constant() {
+            // `replace_op(_, const_target)` plants
+            // `Box(BoxRef::new_const_with_index(value, idx))`; reconstruct
+            // the constant-namespace OpRef from `const_index`.
+            if let Some(idx_const) = terminal.const_index() {
+                return match terminal.type_() {
+                    majit_ir::Type::Int => OpRef::const_int(idx_const),
+                    majit_ir::Type::Float => OpRef::const_float(idx_const),
+                    majit_ir::Type::Ref => OpRef::const_ptr(idx_const),
+                    majit_ir::Type::Void => source,
+                };
+            }
+            return source;
+        }
+        if let Some(pos) = terminal.position() {
+            let tp = terminal.type_();
+            // `Type::Void` targets are lazy-allocated phantom placeholders
+            // (`ensure_box_at`); the placeholder carries no type
+            // information, so preserve the source variant via `with_raw`
+            // instead of promoting to `void_op` / `input_arg_typed(_, Void)`.
+            if matches!(tp, majit_ir::Type::Void) {
+                return source.with_raw(pos);
+            }
+            if terminal.is_inputarg() {
+                return OpRef::input_arg_typed(pos, tp);
+            }
+            if terminal.is_resop() {
+                return OpRef::op_typed(pos, tp);
+            }
+        }
+        source
     }
 
     pub fn get_box_replacement(&self, opref: OpRef) -> OpRef {
@@ -3315,19 +3311,16 @@ impl OptContext {
     }
 
     /// PyPy `box.is_constant()` (`history.py:188`) returns True for Const
-    /// objects. The pyre-side
-    /// equivalent must accept three forwarding shapes that all encode "the
-    /// box at `opref` is a known constant":
+    /// objects. The pyre-side equivalent accepts two forwarding shapes
+    /// that encode "the box at `opref` is a known constant":
     ///   (a) `opref` is itself a Const-namespace OpRef.
     ///   (b) BoxRef forwarded slot is `Forwarded::Box(target)` where
     ///       `target` is `BoxKind::Const` — orthodox `optimizer.py:432
     ///       set_forwarded(constbox)` shape.
-    ///   (c) BoxRef forwarded slot is `Forwarded::Info(OpInfo::Constant(_)
-    ///       | OpInfo::FloatConst(_))` — legacy fixtures and bridge snapshots.
     ///
     /// Used by write-side gates (`make_nonnull`, `make_nonnull_str`, ...)
     /// that must skip when the receiver is constant; the OpRef-only
-    /// `resolved.is_constant()` test misses (b)/(c) under the current
+    /// `resolved.is_constant()` test misses (b) under the current
     /// `make_constant` write shape and would let `set_ptr_info` clobber
     /// the const slot with `OpInfo::Ptr(...)`. Mirrors the
     /// `OptBoxEnv::is_const` impl that resume numbering already uses.
@@ -3339,12 +3332,10 @@ impl OptContext {
         let Some(b) = self.box_pool.get(idx) else {
             return false;
         };
-        use crate::optimizeopt::info::OpInfo;
-        match &*b.get_forwarded() {
-            crate::r#box::Forwarded::Box(target) if target.is_constant() => true,
-            crate::r#box::Forwarded::Info(OpInfo::Constant(_) | OpInfo::FloatConst(_)) => true,
-            _ => false,
-        }
+        matches!(
+            &*b.get_forwarded(),
+            crate::r#box::Forwarded::Box(target) if target.is_constant()
+        )
     }
 
     /// info.py: getptrinfo(op) — mutable variant. Mutates the PtrInfo
@@ -3700,8 +3691,7 @@ impl OptContext {
     /// optimizer.py:410-432 make_constant(box, constbox).
     ///
     /// Mirrors PyPy optimizer.py:432: `box.set_forwarded(constbox)`.
-    /// The constant Box carries the fresh Const identity; reader-side helpers
-    /// still accept the old `Info(Constant)` shape for legacy fixtures.
+    /// The constant Box carries the fresh Const identity.
     pub fn make_constant(&mut self, opref: OpRef, value: Value) {
         // optimizer.py:412: box = get_box_replacement(box)
         let replaced = self.get_box_replacement(opref);
@@ -3964,33 +3954,21 @@ impl OptContext {
 
     /// Get the constant value for an operation, if known.
     ///
-    /// BoxRef-routing reader. The BoxRef carries the constant value in
-    /// one of two shapes:
-    /// - `Forwarded::Box(target)` where `target` is a `BoxKind::Const(v)`
-    ///   — orthodox `optimizer.py:432 box.set_forwarded(constbox)` shape,
-    ///   written by `make_constant` and `replace_op(_, const_target)`.
-    /// - `Forwarded::Info(OpInfo::Constant(v))` / `OpInfo::FloatConst(f)`
-    ///   — legacy fixtures and bridge snapshot replay paths; production
-    ///   writers no longer produce this shape after the make_constant flip.
+    /// BoxRef-routing reader. The constant value lives in
+    /// `Forwarded::Box(target)` where `target` is a `BoxKind::Const(v)`,
+    /// matching `optimizer.py:432 box.set_forwarded(constbox)` shape
+    /// written by `make_constant` and `replace_op(_, const_target)`.
     pub fn get_constant(&self, opref: OpRef) -> Option<Value> {
-        use crate::optimizeopt::info::OpInfo;
         let opref = self.get_box_replacement(opref);
         if opref.is_constant() {
             return self.const_pool.get(&opref.const_index()).copied();
         }
         let idx = opref.raw() as usize;
         if let Some(b) = self.box_pool.get(idx) {
-            match &*b.get_forwarded() {
-                crate::r#box::Forwarded::Info(OpInfo::Constant(v)) => return Some(*v),
-                crate::r#box::Forwarded::Info(OpInfo::FloatConst(f)) => {
-                    return Some(Value::Float(*f));
+            if let crate::r#box::Forwarded::Box(target) = &*b.get_forwarded() {
+                if let Some(value) = target.const_value() {
+                    return Some(value);
                 }
-                crate::r#box::Forwarded::Box(target) => {
-                    if let Some(value) = target.const_value() {
-                        return Some(value);
-                    }
-                }
-                _ => {}
             }
         }
         self.constants.get(idx).and_then(|v| *v)
@@ -4683,27 +4661,20 @@ impl OptContext {
         // Resolve the receiver GcRef via the BoxRef chain only — never via
         // `self.constants[]` (which `seed_constant` pre-populates with
         // trace-time Ref values that may not match runtime; same
-        // parity rationale as `pure.rs:835` `constant_ptr_value`). Three
-        // valid sources, all PyPy `getinfo()`-equivalent:
+        // parity rationale as `pure.rs:835` `constant_ptr_value`). Two
+        // valid sources, both PyPy `getinfo()`-equivalent:
         //   (a) walker advanced to a Const-namespace OpRef → const_pool
         //   (b) BoxRef terminal carries `Forwarded::Box(constbox)` →
         //       `BoxKind::Const.value` (orthodox `optimizer.py:432`)
-        //   (c) BoxRef terminal carries legacy
-        //       `Forwarded::Info(OpInfo::Constant(_))`
         let gcref = if resolved.is_constant() {
             match self.get_constant_box(resolved)? {
                 Value::Ref(r) => r,
                 _ => return None,
             }
         } else {
-            use crate::optimizeopt::info::OpInfo;
             let b = self.get_box_replacement_box(resolved)?;
             if let Some(Value::Ref(r)) = b.const_value() {
                 r
-            } else if let crate::r#box::Forwarded::Info(OpInfo::Constant(Value::Ref(r))) =
-                &*b.get_forwarded()
-            {
-                *r
             } else {
                 return None;
             }
@@ -5623,9 +5594,9 @@ impl OptContext {
     pub fn make_nonnull(&mut self, opref: OpRef) {
         let resolved = self.get_box_replacement(opref);
         // PyPy `op.is_constant()` returns True for Const boxes after
-        // `get_box_replacement`. The BoxRef-level probe also protects legacy
-        // `Info(Constant)` fixtures where the walker terminates at the source
-        // InputArg/ResOp and `resolved.is_constant()` would be false.
+        // `get_box_replacement`. The BoxRef-level probe surfaces
+        // `Forwarded::Box(constbox)` chains where the walker terminates at
+        // the source InputArg/ResOp and `resolved.is_constant()` would be false.
         if self.resolved_is_constant_via_box(resolved) {
             return;
         }
@@ -5914,8 +5885,8 @@ impl OptContext {
     pub fn make_nonnull_str(&mut self, opref: OpRef, mode: u8) {
         let resolved = self.get_box_replacement(opref);
         // Same Const-detection caveat as `make_nonnull`: PyPy's
-        // Forwarded::Box(constbox) shape and legacy `Info(Constant)` fixtures
-        // both need the BoxRef-level probe before `set_ptr_info`.
+        // Forwarded::Box(constbox) shape needs the BoxRef-level probe before
+        // `set_ptr_info`.
         if self.resolved_is_constant_via_box(resolved) {
             return;
         }
@@ -6353,12 +6324,11 @@ mod boxref_forwarding_tests {
         }
     }
 
-    /// `resolved_is_constant_via_box` accepts all three Const shapes:
-    /// (a) Const-namespace OpRef, (b) `Forwarded::Box(constbox)` chain,
-    /// (c) legacy `Forwarded::Info(OpInfo::Constant)`. Used by
-    /// `make_nonnull` / `make_nonnull_str` write-side gates.
+    /// `resolved_is_constant_via_box` accepts both Const shapes:
+    /// (a) Const-namespace OpRef, (b) `Forwarded::Box(constbox)` chain.
+    /// Used by `make_nonnull` / `make_nonnull_str` write-side gates.
     #[test]
-    fn audit_a_resolved_is_constant_via_box_recognizes_three_shapes() {
+    fn audit_a_resolved_is_constant_via_box_recognizes_two_shapes() {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 2, 0, 2);
         let b0 = BoxRef::new_inputarg(Type::Int, Some(0));
         let b1 = BoxRef::new_inputarg(Type::Int, Some(1));
@@ -6371,10 +6341,9 @@ mod boxref_forwarding_tests {
         // (b) `Forwarded::Box(constbox)` chain on a non-Const-namespace OpRef.
         ctx.replace_op(OpRef::from_raw(0), const_opref);
         assert!(ctx.resolved_is_constant_via_box(OpRef::from_raw(0)));
-        // (c) legacy `Forwarded::Info(OpInfo::Constant)` shape. Readers keep
-        // accepting it for existing tests and bridge-state fixtures, while
-        // make_constant itself now writes PyPy's Forwarded::Box(constbox).
-        b1.set_forwarded_info(OpInfo::Constant(Value::Int(42)));
+        // `Forwarded::Box(constbox)` planted directly via set_forwarded_box.
+        b1.set_forwarded_box(BoxRef::new_const_with_index(Value::Int(42), 1));
+        ctx.const_pool.insert(1, Value::Int(42));
         assert!(ctx.resolved_is_constant_via_box(OpRef::from_raw(1)));
         // Negative case: OpRef with no constant forwarding.
         let mut ctx2 = OptContext::with_num_inputs_and_start_pos(0, 1, 0, 1);

@@ -1616,8 +1616,6 @@ pub struct ExportedState {
 /// is rooted at a particular shadow stack slot.
 #[derive(Clone, Copy, Debug)]
 enum ExportedGcRefField {
-    /// exported_infos[OpRef].constant (Value::Ref)
-    InfoConstantRef,
     /// exported_infos[OpRef].ptr_info = PtrInfo::Constant(GcRef)
     InfoPtrInfoConstant,
     /// exported_infos[OpRef].ptr_info = PtrInfo::Instance with known_class set
@@ -1632,8 +1630,6 @@ enum ExportedGcRefField {
     VirtualStateConstantRef(usize),
     /// short_box_const_values[OpRef] = Value::Ref(...)
     ShortBoxConstValue(OpRef),
-    /// box_pool_snapshot[index].forwarded = Info(OpInfo::Constant(Value::Ref(_)))
-    BoxPoolInfoConstantRef(usize),
     /// box_pool_snapshot[index].forwarded = Info(OpInfo::Ptr(PtrInfo::Constant(_)))
     BoxPoolInfoPtrInfoConstant(usize),
     /// box_pool_snapshot[index].forwarded = Info(OpInfo::Ptr(PtrInfo::Instance{known_class: Some(_)}))
@@ -1832,13 +1828,6 @@ impl ExportedState {
                         }
                     }
                 }
-                // Direct `OpInfo::Constant(Value::Ref(...))` — rare Int-typed
-                // constant forward that carries a Ref payload.
-                OpInfo::Constant(Value::Ref(gcref)) if !gcref.is_null() => {
-                    let ss_idx = majit_gc::shadow_stack::push(*gcref);
-                    self.rooted_refs
-                        .push((key, ExportedGcRefField::InfoConstantRef, ss_idx));
-                }
                 _ => {}
             }
         }
@@ -1904,14 +1893,6 @@ impl ExportedState {
                 let forwarded = b.get_forwarded();
                 if let crate::r#box::Forwarded::Info(opinfo) = &*forwarded {
                     match opinfo {
-                        OpInfo::Constant(Value::Ref(gcref)) if !gcref.is_null() => {
-                            let ss_idx = majit_gc::shadow_stack::push(*gcref);
-                            self.rooted_refs.push((
-                                dummy_key,
-                                ExportedGcRefField::BoxPoolInfoConstantRef(i),
-                                ss_idx,
-                            ));
-                        }
                         OpInfo::Ptr(PtrInfo::Constant(gcref)) if !gcref.is_null() => {
                             let ss_idx = majit_gc::shadow_stack::push(*gcref);
                             self.rooted_refs.push((
@@ -1986,11 +1967,6 @@ impl ExportedState {
         for &(key, ref field, ss_idx) in &self.rooted_refs {
             let updated = majit_gc::shadow_stack::get(ss_idx);
             match field {
-                ExportedGcRefField::InfoConstantRef => {
-                    if let Some(info) = self.exported_infos.get_mut(&key) {
-                        *info = crate::optimizeopt::info::OpInfo::Constant(Value::Ref(updated));
-                    }
-                }
                 ExportedGcRefField::InfoPtrInfoConstant => {
                     if let Some(info) = self.exported_infos.get_mut(&key) {
                         *info = crate::optimizeopt::info::OpInfo::Ptr(PtrInfo::Constant(updated));
@@ -2047,26 +2023,6 @@ impl ExportedState {
                 ExportedGcRefField::ShortBoxConstValue(source) => {
                     if let Some(value) = self.short_box_const_values.get_mut(source) {
                         *value = Value::Ref(updated);
-                    }
-                }
-                ExportedGcRefField::BoxPoolInfoConstantRef(i) => {
-                    if let Some(snapshot) = self.box_pool_snapshot.as_ref()
-                        && let Some(b) = snapshot.get(*i)
-                    {
-                        let new_info = {
-                            let f = b.get_forwarded();
-                            if matches!(
-                                &*f,
-                                crate::r#box::Forwarded::Info(OpInfo::Constant(Value::Ref(_)))
-                            ) {
-                                Some(OpInfo::Constant(Value::Ref(updated)))
-                            } else {
-                                None
-                            }
-                        };
-                        if let Some(info) = new_info {
-                            b.set_forwarded_info(info);
-                        }
                     }
                 }
                 ExportedGcRefField::BoxPoolInfoPtrInfoConstant(i) => {
@@ -2138,6 +2094,15 @@ impl ExportedState {
                             }
                         };
                         if let Some(orig_idx) = swap_idx {
+                            // After `make_constant` rewrite (optimizer.py:432
+                            // shape), every Const target in box_pool carries
+                            // a `const_index`. The `None` arm only fires for
+                            // legacy `BoxRef::new_const(value)` plants from
+                            // pre-rewrite test fixtures.
+                            debug_assert!(
+                                orig_idx.is_some(),
+                                "BoxPoolBoxConstRef refresh: Const target without const_index — legacy fixture path",
+                            );
                             let new_target = match orig_idx {
                                 Some(idx) => crate::r#box::BoxRef::new_const_with_index(
                                     Value::Ref(updated),
@@ -3570,19 +3535,14 @@ impl OptUnroll {
                 return synthesize_const_info(value);
             }
         }
-        // make_constant now mirrors optimizer.py:432 as
-        // `Forwarded::Box(constbox)`. Probe the BoxRef directly so RPython's
-        // ConstPtrInfo / FloatConstInfo / IntBound dispatch also fires for
-        // legacy Info(Constant) fixtures and guard_value-pinned boxes.
+        // make_constant mirrors optimizer.py:432 as `Forwarded::Box(constbox)`.
+        // The walker has advanced to the constbox terminal — surface RPython's
+        // ConstPtrInfo / FloatConstInfo / IntBound dispatch via const_value().
         if let Some(b) = ctx.get_box_replacement_box(resolved) {
-            match &*b.get_forwarded() {
-                crate::r#box::Forwarded::Info(OpInfo::Constant(v)) => {
-                    return synthesize_const_info(*v);
+            if b.is_constant() {
+                if let Some(value) = b.const_value() {
+                    return synthesize_const_info(value);
                 }
-                crate::r#box::Forwarded::Info(OpInfo::FloatConst(f)) => {
-                    return Some(OpInfo::FloatConst(*f));
-                }
-                _ => {}
             }
         }
         // unroll.py:432-443 _expand_info uses self.optimizer.getinfo(arg) which

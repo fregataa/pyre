@@ -346,21 +346,34 @@ impl SimpleBoxEnv {
 }
 
 impl BoxEnv for SimpleBoxEnv {
+    // resoperation.py:57-68 get_box_replacement walks the chain
+    // op -> op._forwarded -> ... until None / AbstractInfo, returning the
+    // last item before that. Iterate the replacement map the same way.
     fn get_box_replacement(&self, opref: majit_ir::OpRef) -> majit_ir::OpRef {
-        self.replacements
-            .get(&opref.raw())
-            .copied()
-            .unwrap_or(opref)
+        let mut opref = opref;
+        while let Some(next) = self.replacements.get(&opref.raw()).copied() {
+            if next == opref {
+                return opref;
+            }
+            opref = next;
+        }
+        opref
     }
 
+    // resoperation.py:64-65 not_const arm: stop one hop before reaching
+    // a Const target, returning the predecessor.
     fn get_box_replacement_not_const(&self, opref: majit_ir::OpRef) -> majit_ir::OpRef {
-        match self.replacements.get(&opref.raw()).copied() {
-            Some(target) if target.is_constant() || self.constants.contains_key(&target.raw()) => {
-                opref
+        let mut opref = opref;
+        while let Some(next) = self.replacements.get(&opref.raw()).copied() {
+            if next == opref {
+                return opref;
             }
-            Some(target) => target,
-            None => opref,
+            if next.is_constant() || self.constants.contains_key(&next.raw()) {
+                return opref;
+            }
+            opref = next;
         }
+        opref
     }
 
     fn is_const(&self, opref: majit_ir::OpRef) -> bool {

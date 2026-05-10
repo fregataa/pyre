@@ -848,21 +848,6 @@ fn constant_ptr_value(arg: OpRef, ctx: &OptContext) -> Option<usize> {
             if !ptr.is_null() {
                 return Some(ptr.as_usize());
             }
-            return None;
-        }
-        // Forwarded::Info(OpInfo::Constant(Value::Ref(_))) — legacy
-        // snapshot replay shape (bridge import / fixture seeding). The
-        // production make_constant writer now emits Forwarded::Box(constbox)
-        // per optimizer.py:432, handled above; this arm survives only for
-        // the legacy fixture replay path so GUARD_VALUE-pinned Ref
-        // inputargs still fold GETFIELD_GC_PURE under that shape.
-        use crate::optimizeopt::info::OpInfo;
-        if let crate::r#box::Forwarded::Info(OpInfo::Constant(Value::Ref(ptr))) =
-            &*b.get_forwarded()
-        {
-            if !ptr.is_null() {
-                return Some(ptr.as_usize());
-            }
         }
         return None;
     }

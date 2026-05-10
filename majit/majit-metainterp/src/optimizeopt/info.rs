@@ -104,15 +104,15 @@ impl FieldEntry {
 pub enum OpInfo {
     /// No information known.
     Unknown,
-    /// Known constant value (integer or pointer).
-    Constant(Value),
-    /// Known integer bounds.
+    /// Known integer bounds. info.py:1264 IntBound.
+    /// `IntBound::from_constant(v)` is the canonical Int constant carrier.
     IntBound(IntBound),
     /// Pointer info (non-null, known class, virtual, etc.).
+    /// `PtrInfo::Constant(GcRef)` is the Ref constant carrier
+    /// (info.py:706 ConstPtrInfo).
     Ptr(PtrInfo),
     /// Known constant float value.
-    /// info.py: FloatConstInfo — tracks float constants separately
-    /// because they need special boxing on 32-bit platforms.
+    /// info.py:851 FloatConstInfo — Float constant carrier.
     FloatConst(f64),
 }
 
@@ -120,22 +120,14 @@ impl OpInfo {
     pub fn is_constant(&self) -> bool {
         matches!(
             self,
-            OpInfo::Constant(_) | OpInfo::FloatConst(_) | OpInfo::Ptr(PtrInfo::Constant(_))
-        )
-    }
-
-    pub fn get_constant(&self) -> Option<&Value> {
-        match self {
-            OpInfo::Constant(v) => Some(v),
-            _ => None,
-        }
+            OpInfo::FloatConst(_) | OpInfo::Ptr(PtrInfo::Constant(_))
+        ) || matches!(self, OpInfo::IntBound(b) if b.is_constant())
     }
 
     /// Get the constant float value if this is a FloatConst.
     pub fn get_constant_float(&self) -> Option<f64> {
         match self {
             OpInfo::FloatConst(f) => Some(*f),
-            OpInfo::Constant(Value::Float(f)) => Some(*f),
             _ => None,
         }
     }
@@ -159,7 +151,6 @@ impl OpInfo {
     pub fn is_nonnull(&self) -> bool {
         match self {
             OpInfo::Ptr(ptr) => ptr.is_nonnull(),
-            OpInfo::Constant(Value::Int(v)) => *v != 0,
             _ => false,
         }
     }
@@ -3412,8 +3403,6 @@ mod tests {
     #[test]
     fn test_opinfo_is_nonnull() {
         assert!(!OpInfo::Unknown.is_nonnull());
-        assert!(OpInfo::Constant(Value::Int(42)).is_nonnull());
-        assert!(!OpInfo::Constant(Value::Int(0)).is_nonnull());
         assert!(OpInfo::Ptr(PtrInfo::nonnull()).is_nonnull());
     }
 
