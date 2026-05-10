@@ -508,19 +508,26 @@ def ll_shrink_array(p, smallerlength):
 @jit.dont_look_inside
 @specialize.ll()
 def ll_arrayclear(p):
-    # Equivalent to memset(array, 0).  Only for GcArray(primitive-type) for now.
+    # Equivalent to memset(array, 0).  Works for both primitive and GC pointer
+    # arrays: writing NULL never creates an old->young reference, so no write
+    # barrier is needed when zeroing.
     from rpython.rlib.objectmodel import keepalive_until_here
 
     length = len(p)
     ARRAY = lltype.typeOf(p).TO
     if must_split_gc_address_space():
         # do the clearing element by element
-        from rpython.rtyper.lltypesystem import rffi
-        ZERO = rffi.cast(ARRAY.OF, 0)
         i = 0
-        while i < length:
-            p[i] = ZERO
-            i += 1
+        if isinstance(ARRAY.OF, lltype.Ptr):
+            while i < length:
+                p[i] = lltype.nullptr(ARRAY.OF.TO)
+                i += 1
+        else:
+            from rpython.rtyper.lltypesystem import rffi
+            ZERO = rffi.cast(ARRAY.OF, 0)
+            while i < length:
+                p[i] = ZERO
+                i += 1
     else:
         offset = llmemory.itemoffsetof(ARRAY, 0)
         dest_addr = llmemory.cast_ptr_to_adr(p) + offset

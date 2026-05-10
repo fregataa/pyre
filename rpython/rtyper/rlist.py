@@ -493,7 +493,9 @@ def ll_alloc_and_set(LIST, count, item):
 
 def _ll_alloc_and_set_nojit(LIST, count, item):
     l = LIST.ll_newlist(count)
-    if malloc_zero_filled and _ll_zero_or_null(item):
+    if _ll_zero_or_null(item):
+        if not malloc_zero_filled:
+            rgc.ll_arrayclear(l.ll_items())
         return l
     i = 0
     while i < count:
@@ -518,11 +520,7 @@ def _ll_alloc_and_clear(LIST, count):
     l = LIST.ll_newlist(count)
     if malloc_zero_filled:
         return l
-    zeroitem = _null_of_type(LIST.ITEM)
-    i = 0
-    while i < count:
-        l.ll_setitem_fast(i, zeroitem)
-        i += 1
+    rgc.ll_arrayclear(l.ll_items())
     return l
 
 @jit.look_inside_iff(lambda LIST, count, item: jit.isconstant(count) and count < 137)
