@@ -1,4 +1,3 @@
-
 mod api;
 mod dispatch;
 mod helpers;
@@ -12,15 +11,15 @@ mod lowerer;
 
 pub use api::GeneratedJitCodeBody;
 #[allow(unused_imports)]
+pub(crate) use api::{
+    CallerLocalLayout, assign_caller_local_layout, generate_inline_helper_jitcode_with_calls,
+    inline_helper_param_counts, inline_helper_param_layout,
+    try_generate_jitcode_body_parts_with_caller_bindings,
+};
+#[allow(unused_imports)]
 pub use api::{
     try_generate_jitcode_body, try_generate_jitcode_body_parts,
     try_generate_jitcode_body_with_config, try_generate_jitcode_body_with_config_parts,
-};
-#[allow(unused_imports)]
-pub(crate) use api::{
-    assign_caller_local_layout, generate_inline_helper_jitcode_with_calls,
-    inline_helper_param_counts, inline_helper_param_layout,
-    try_generate_jitcode_body_parts_with_caller_bindings, CallerLocalLayout,
 };
 pub(crate) use dispatch::lower_dispatch_body;
 pub(crate) use helpers::classify_param_type;
@@ -30,11 +29,11 @@ pub(super) use helpers::helper_policy_path;
 // These appear unused in mod.rs itself but are consumed by submodules and tests.
 mod reexports {
     #![allow(unused_imports)]
-    pub(super) use super::lowerer::Lowerer;
-    pub(super) use super::liveness::{
-        annotate_live_markers_with_liveness, compute_per_marker_liveness, get_liveness_info,
-        liveness_prebuild_tokens, liveness_triple, liveness_triple_from_reads,
-        maybe_dump_liveness, remove_repeated_live, rewrite_live_marker_statements_with_triples,
+    pub(super) use super::api::bind_pre_merge_point_stmts;
+    pub(super) use super::dispatch::{
+        collect_arm_caller_locals, collect_pat_bound_idents, dispatch_arm_inline_call_tokens,
+        emit_promote_greens, find_dispatch_loop_body, green_schema, is_jit_merge_point_macro,
+        lower_dispatch_chain, lower_pre_dispatch_stmts, red_schema, resolve_greens, resolve_reds,
     };
     pub(super) use super::helpers::{
         binding_kind_for_inline_policy, block_has_loop_control, expr_has_loop_control,
@@ -42,15 +41,15 @@ mod reexports {
         extract_pat_literals, extract_pat_value_tokens, extract_stmts, inline_builder_path,
         inline_call_tokens, inline_float_arg_tokens, inline_int_arg_tokens, inline_prebuild_path,
         inline_ref_arg_tokens, int_arg_regs, is_supported_float_type, is_supported_int_cast,
-        is_supported_ref_type, opcode_for_assign_binop, opcode_for_binop,
-        stmt_has_loop_control, typed_call_arg_tokens,
+        is_supported_ref_type, opcode_for_assign_binop, opcode_for_binop, stmt_has_loop_control,
+        typed_call_arg_tokens,
     };
-    pub(super) use super::api::bind_pre_merge_point_stmts;
-    pub(super) use super::dispatch::{
-        collect_arm_caller_locals, collect_pat_bound_idents, dispatch_arm_inline_call_tokens,
-        emit_promote_greens, find_dispatch_loop_body, green_schema, is_jit_merge_point_macro,
-        lower_dispatch_chain, lower_pre_dispatch_stmts, red_schema, resolve_greens, resolve_reds,
+    pub(super) use super::liveness::{
+        annotate_live_markers_with_liveness, compute_per_marker_liveness, get_liveness_info,
+        liveness_prebuild_tokens, liveness_triple, liveness_triple_from_reads, maybe_dump_liveness,
+        remove_repeated_live, rewrite_live_marker_statements_with_triples,
     };
+    pub(super) use super::lowerer::Lowerer;
 }
 #[allow(unused_imports)]
 use reexports::*;
@@ -86,7 +85,9 @@ pub(super) enum VirtualizableHintKind {
     ForceVirtualizable,
 }
 
-pub(super) fn classify_virtualizable_hint_segments<'a, I>(segments: I) -> Option<VirtualizableHintKind>
+pub(super) fn classify_virtualizable_hint_segments<'a, I>(
+    segments: I,
+) -> Option<VirtualizableHintKind>
 where
     I: IntoIterator<Item = &'a str>,
 {
@@ -260,6 +261,56 @@ impl CondCallEffectSlot {
             Self::ElidableCanRaise | Self::ElidableCannotRaise | Self::ElidableOrMemerror
         )
     }
+
+    /// Emit the `EffectInfoSlot` token for a statically-known wrapped
+    /// `CallPolicyKind`.  Used by the `*Wrapped` lowering arms so the
+    /// registered call-target descr carries the real effect classification
+    /// (`call.py:282-303 getcalldescr`) rather than a blanket `CanRaise`.
+    /// Falls back to `CanRaise` for `MayForce` / `ReleaseGil` / `Inline*`
+    /// kinds whose conditional-call slot is `None` in
+    /// `call_policy_effect_slot`; the actual call surface dispatches them
+    /// through dedicated `call_may_force_*` / `call_release_gil_*` /
+    /// inline-helper paths that ignore the registered slot.
+    pub(super) fn for_wrapped_kind(kind: crate::jit_interp::CallPolicyKind) -> TokenStream {
+        call_policy_effect_slot(kind)
+            .map(|slot| slot.token())
+            .unwrap_or_else(|| quote! { majit_metainterp::EffectInfoSlot::CanRaise })
+    }
+
+    /// Emit a runtime `match __policy { ... }` expression that resolves the
+    /// `EffectInfoSlot` from the helper's `_jit_helper_policy` byte.  Used
+    /// by the `Infer` lowering paths where the policy kind is only known at
+    /// runtime (`call.py:282-303 getcalldescr` analyzer chain executed on
+    /// the live byte).
+    pub(super) fn slot_from_policy_tokens() -> TokenStream {
+        quote! {
+            match __policy {
+                #VOID_DONT_LOOK_INSIDE | #INT_DONT_LOOK_INSIDE | #REF_DONT_LOOK_INSIDE
+                | #VOID_MAY_FORCE | #INT_MAY_FORCE | #REF_MAY_FORCE
+                | #VOID_RELEASE_GIL | #INT_RELEASE_GIL => {
+                    majit_metainterp::EffectInfoSlot::CanRaise
+                }
+                #VOID_DONT_LOOK_INSIDE_CANNOT_RAISE
+                | #INT_DONT_LOOK_INSIDE_CANNOT_RAISE
+                | #REF_DONT_LOOK_INSIDE_CANNOT_RAISE => {
+                    majit_metainterp::EffectInfoSlot::CannotRaise
+                }
+                #INT_ELIDABLE | #REF_ELIDABLE => {
+                    majit_metainterp::EffectInfoSlot::ElidableCanRaise
+                }
+                #VOID_LOOP_INVARIANT | #INT_LOOP_INVARIANT | #REF_LOOP_INVARIANT => {
+                    majit_metainterp::EffectInfoSlot::LoopInvariant
+                }
+                #INT_ELIDABLE_CANNOT_RAISE | #REF_ELIDABLE_CANNOT_RAISE => {
+                    majit_metainterp::EffectInfoSlot::ElidableCannotRaise
+                }
+                #INT_ELIDABLE_OR_MEMERROR | #REF_ELIDABLE_OR_MEMERROR => {
+                    majit_metainterp::EffectInfoSlot::ElidableOrMemerror
+                }
+                _ => majit_metainterp::EffectInfoSlot::CanRaise,
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -280,7 +331,9 @@ impl ValueKind {
     }
 }
 
-pub(super) fn call_policy_effect_slot(kind: crate::jit_interp::CallPolicyKind) -> Option<CondCallEffectSlot> {
+pub(super) fn call_policy_effect_slot(
+    kind: crate::jit_interp::CallPolicyKind,
+) -> Option<CondCallEffectSlot> {
     use crate::jit_interp::CallPolicyKind as K;
     match kind {
         K::ResidualVoid
@@ -334,7 +387,9 @@ pub(super) fn call_policy_effect_slot(kind: crate::jit_interp::CallPolicyKind) -
     }
 }
 
-pub(super) fn call_policy_result_kind(kind: crate::jit_interp::CallPolicyKind) -> Option<CallResultKind> {
+pub(super) fn call_policy_result_kind(
+    kind: crate::jit_interp::CallPolicyKind,
+) -> Option<CallResultKind> {
     use crate::jit_interp::CallPolicyKind as K;
     match kind {
         K::ResidualVoid
@@ -422,7 +477,10 @@ pub(super) fn call_policy_is_wrapped(kind: crate::jit_interp::CallPolicyKind) ->
     )
 }
 
-pub(super) fn call_result_matches_binding(result_kind: CallResultKind, binding_kind: BindingKind) -> bool {
+pub(super) fn call_result_matches_binding(
+    result_kind: CallResultKind,
+    binding_kind: BindingKind,
+) -> bool {
     matches!(
         (result_kind, binding_kind),
         (CallResultKind::Int, BindingKind::Int)
@@ -1108,7 +1166,11 @@ impl OpMeta {
     /// Two-register conditional guard for `goto_if_not_int_eq(a, b, target)`.
     /// jtransform.py:196-225 `optimize_goto_if_not` fuses `int_eq + goto_if_not`
     /// into `goto_if_not_int_eq/iiL`. Both `a_reg` and `b_reg` are read uses.
-    pub(super) fn conditional_guard_int_eq(a_reg: Register, b_reg: Register, target: Ident) -> Self {
+    pub(super) fn conditional_guard_int_eq(
+        a_reg: Register,
+        b_reg: Register,
+        target: Ident,
+    ) -> Self {
         Self {
             kind: OpKind::GotoIfNot,
             reads: vec![a_reg, b_reg],
@@ -1184,7 +1246,6 @@ impl LoweredSequence {
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {

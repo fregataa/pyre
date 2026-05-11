@@ -1690,6 +1690,11 @@ impl Assembler {
             return existing;
         }
         if let Some(num) = crate::insns::insn_byte_opt(key) {
+            debug_assert!(
+                crate::insns::is_reserved_opcode_byte(num),
+                "insn_byte_opt({key:?}) returned {num} which is not reserved — \
+                 wellknown/extension tables out of sync with is_reserved_opcode_byte",
+            );
             self.insns.insert(key.to_string(), num);
             return num;
         }
@@ -2119,8 +2124,10 @@ fn kind_char_to_name(c: char) -> &'static str {
         'i' => "int",
         'r' => "ref",
         'f' => "float",
-        'v' => "void",
-        _ => panic!("kind_char_to_name: unrecognised kind char {c:?}"),
+        _ => panic!(
+            "kind_char_to_name: invalid kind char {c:?} — only 'i'/'r'/'f' \
+             are valid for typed opname prefixes (void is not an operand kind)"
+        ),
     }
 }
 
@@ -3227,6 +3234,46 @@ mod tests {
             crate::insns::insn_byte("live/"),
             "canonical keys must keep their reserved BC_* bytes",
         );
+
+        // Typed opname variants that are registered as canonical bytes
+        // must resolve to their reserved BC_* values through get_opnum.
+        for (key, canonical) in [
+            ("int_guard_value/i", "int_guard_value/i"),
+            ("ref_guard_value/r", "ref_guard_value/r"),
+            ("float_guard_value/f", "float_guard_value/f"),
+        ] {
+            let byte = asm.get_opnum(key);
+            let expected = crate::insns::insn_byte(canonical);
+            assert_eq!(
+                byte, expected,
+                "{key} must map to its canonical BC_* byte {expected}",
+            );
+            assert!(
+                crate::insns::is_reserved_opcode_byte(byte),
+                "{key} byte {byte} must be reserved",
+            );
+        }
+
+        // Typed opnames not in the canonical table get dynamic bytes.
+        for key in [
+            "int_assert_green/i",
+            "ref_assert_green/r",
+            "float_assert_green/f",
+            "int_isconstant/i",
+            "ref_isconstant/r",
+            "float_isconstant/f",
+            "ref_isvirtual/r",
+        ] {
+            assert!(
+                crate::insns::insn_byte_opt(key).is_none(),
+                "{key} should not be in the canonical table",
+            );
+            let byte = asm.get_opnum(key);
+            assert!(
+                !crate::insns::is_reserved_opcode_byte(byte),
+                "{key} should get a non-reserved dynamic byte, got {byte}",
+            );
+        }
     }
 
     #[test]
