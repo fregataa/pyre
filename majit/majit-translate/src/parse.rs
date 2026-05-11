@@ -246,8 +246,16 @@ fn collect_trait_impls_from_items(
                             // survives downstream.
                             // `?` propagates `FlowingError` out of the
                             // extractor (RPython re-raise at
-                            // `flowspace/flowcontext.py:417`).
-                            for synth in crate::front::ast::synthesize_or_passthrough(fake_fn) {
+                            // `flowspace/flowcontext.py:417`).  The
+                            // qualified `self_ty_root` is threaded into
+                            // synthesis so the wrapper's tail call uses
+                            // the same `<ImplType>::_orig_<name>_unlikely_name`
+                            // path that `lib.rs:531-537` registers via
+                            // `CallPath::for_impl_method`.
+                            for synth in crate::front::ast::synthesize_or_passthrough(
+                                fake_fn,
+                                self_ty_root.as_deref(),
+                            ) {
                                 let sf = crate::front::ast::build_function_graph_with_self_ty_pub(
                                     &synth,
                                     self_ty_root.clone(),
@@ -303,8 +311,16 @@ fn collect_trait_impls_from_items(
                                 block: Box::new(block.clone()),
                             };
                             // jit.py:184-201 — trait default methods get
-                            // the same wrapper/orig synthesis.
-                            for synth in crate::front::ast::synthesize_or_passthrough(fake_fn) {
+                            // the same wrapper/orig synthesis.  The
+                            // concrete `Self` type is not known until
+                            // a `for <T>` impl resolves the trait, so
+                            // the synthesizer emits a bare-path tail
+                            // call (`None`); a downstream `impl Trait
+                            // for S` block would re-emit the method
+                            // with `self_ty_root = "S"` and lower the
+                            // wrapper through this same path.
+                            for synth in crate::front::ast::synthesize_or_passthrough(fake_fn, None)
+                            {
                                 let sf = crate::front::ast::build_function_graph_with_self_ty_pub(
                                     &synth,
                                     None,
@@ -453,8 +469,14 @@ fn collect_inherent_methods_from_items(
                         // jit.py:184-201 — inherent-impl methods get the
                         // same wrapper/orig synthesis as free fns;
                         // `?` propagates `FlowingError` per
-                        // `flowspace/flowcontext.py:417`.
-                        for synth in crate::front::ast::synthesize_or_passthrough(fake_fn) {
+                        // `flowspace/flowcontext.py:417`.  The qualified
+                        // `self_ty_root` lets the wrapper's tail call
+                        // hit the impl-method registration path built
+                        // by `CallPath::for_impl_method`.
+                        for synth in crate::front::ast::synthesize_or_passthrough(
+                            fake_fn,
+                            self_ty_root.as_deref(),
+                        ) {
                             let sf = crate::front::ast::build_function_graph_with_self_ty_pub(
                                 &synth,
                                 self_ty_root.clone(),

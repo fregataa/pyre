@@ -658,10 +658,19 @@ fn parse_elidable_promote_args(attr: &syn::Attribute) -> syn::Result<PromoteArgs
 /// (`parse::extract_trait_impls`).  Centralising the expansion here
 /// keeps the decorator behaviour uniform across all four lowering
 /// surfaces.
-pub fn synthesize_or_passthrough(fake_fn: ItemFn) -> Vec<ItemFn> {
+///
+/// `impl_type` carries the qualified type root (`"S"`, `"a::S"`) when
+/// the source item lives inside an `impl` block, so the synthesizer can
+/// emit a type-qualified tail call (`a::S::_orig_<name>_unlikely_name(
+/// self, args)`) that matches the impl-method registration path built
+/// by `parse::CallPath::for_impl_method` at `lib.rs:531-537`.  Free
+/// functions and trait-default methods (which have no concrete `Self`
+/// type at synthesis time) pass `None` and fall back to the bare-path
+/// tail call.
+pub fn synthesize_or_passthrough(fake_fn: ItemFn, impl_type: Option<&str>) -> Vec<ItemFn> {
     match extract_elidable_promote_selector(&fake_fn.attrs) {
         Some(selector) => {
-            let (orig, wrapper) = synthesize_elidable_promote_pair(&fake_fn, &selector);
+            let (orig, wrapper) = synthesize_elidable_promote_pair(&fake_fn, &selector, impl_type);
             vec![orig, wrapper]
         }
         None => vec![fake_fn],
@@ -730,6 +739,7 @@ fn extract_elidable_promote_selector(attrs: &[syn::Attribute]) -> Option<Promote
 fn synthesize_elidable_promote_pair(
     func: &ItemFn,
     selector: &PromoteArgsSelector,
+    impl_type: Option<&str>,
 ) -> (ItemFn, ItemFn) {
     use quote::format_ident;
     // jit.py:186 args = _get_args(func) — positional names, self included.
@@ -833,7 +843,28 @@ fn synthesize_elidable_promote_pair(
             syn::parse_quote!(#id)
         }
     });
-    let tail_call: syn::Expr = syn::parse_quote!(#orig_ident(#(#call_args),*));
+    // jit.py:195-197 — `_orig_func_unlikely_name` is bound in the
+    // wrapper's `exec` namespace (`d = {"_orig_func_unlikely_name":
+    // func, ...}`), so the wrapper invokes it as a closure-local name.
+    // Pyre's lowering surface does not have an analogue closure scope;
+    // for free fns the orig is registered as a bare-path function (so a
+    // bare-path call resolves), but for impl methods the orig is
+    // registered under `<ImplType>::_orig_<name>_unlikely_name` via
+    // `parse::CallPath::for_impl_method` at `lib.rs:531-537`.  Emit a
+    // type-qualified tail call in that case so the wrapper's IR `Call`
+    // target matches the registration path and the elidable flag bound
+    // to the orig graph is visible at the call-site.
+    let tail_call: syn::Expr = match impl_type {
+        Some(ty_str) => {
+            let ty_path: syn::Path = syn::parse_str(ty_str).unwrap_or_else(|err| {
+                panic!(
+                    "synthesize_elidable_promote_pair: failed to parse impl type `{ty_str}`: {err}"
+                )
+            });
+            syn::parse_quote!(#ty_path::#orig_ident(#(#call_args),*))
+        }
+        None => syn::parse_quote!(#orig_ident(#(#call_args),*)),
+    };
     let tail_stmt = syn::Stmt::Expr(tail_call, None);
 
     // jit.py:198-201 — wrapper is the user-facing decorated name with
@@ -899,7 +930,7 @@ fn build_graphs_from_items(
                 // free fns and impl methods so the lowering layer below
                 // stays wrapper-blind, exactly like RPython's flow-graph
                 // builder.
-                for synth in synthesize_or_passthrough(func.clone()) {
+                for synth in synthesize_or_passthrough(func.clone(), None) {
                     let mut sf = build_function_graph(
                         &synth,
                         options,
@@ -931,8 +962,11 @@ fn build_graphs_from_items(
                         // jit.py:184-201 — method-level `@elidable_promote`
                         // gets the same wrapper/orig synthesis as free
                         // fns; RPython decorators apply uniformly to any
-                        // callable.
-                        for synth in synthesize_or_passthrough(fake_fn) {
+                        // callable.  The qualified `self_ty_root` lets
+                        // the wrapper's tail call hit the impl-method
+                        // registration path built by
+                        // `CallPath::for_impl_method`.
+                        for synth in synthesize_or_passthrough(fake_fn, self_ty_root.as_deref()) {
                             let sf = build_function_graph(
                                 &synth,
                                 options,
@@ -10000,6 +10034,56 @@ mod tests {
             .find(|sf| sf.name == "double")
             .expect("wrapper graph");
         assert!(!wrapper.hints.iter().any(|h| h == "elidable"));
+    }
+
+    /// `lib.rs:531-537` registers inherent-method graphs under
+    /// `CallPath::for_impl_method(impl_type, name)` which produces
+    /// `[<impl_type segments...>, name]`.  The synthesized wrapper's
+    /// tail call must therefore be a type-qualified path so the IR
+    /// `Call`-target segments match the registered callee.  A bare
+    /// `_orig_<name>_unlikely_name(self, args)` would resolve to a
+    /// non-existent free function and silently drop the elidable
+    /// binding bound to the orig graph.
+    #[test]
+    fn elidable_promote_wrapper_tail_call_is_type_qualified_for_inherent_method() {
+        let parsed = crate::parse::parse_source(
+            r#"
+            struct S { x: i64 }
+            impl S {
+                #[elidable_promote(promote_args = "all")]
+                pub fn double(&self, n: i64) -> i64 { n + n }
+            }
+        "#,
+        );
+        let program = build_semantic_program(&parsed).expect("source must lower");
+        let wrapper = program
+            .functions
+            .iter()
+            .find(|sf| sf.name == "double")
+            .expect("wrapper graph");
+        let ops = &wrapper.graph.block(wrapper.graph.startblock).operations;
+        let target = ops
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::Call { target, .. }
+                    if target.path_segments().and_then(|s| s.last().copied())
+                        == Some("_orig_double_unlikely_name") =>
+                {
+                    Some(target.clone())
+                }
+                _ => None,
+            })
+            .expect("wrapper must tail-call _orig_double_unlikely_name");
+        let segments = target
+            .path_segments()
+            .expect("function-path tail call must carry path segments");
+        assert_eq!(
+            segments,
+            vec!["S", "_orig_double_unlikely_name"],
+            "wrapper tail call must be type-qualified \
+             [\"S\", \"_orig_double_unlikely_name\"] to match \
+             CallPath::for_impl_method; got {segments:?}"
+        );
     }
 
     #[test]
