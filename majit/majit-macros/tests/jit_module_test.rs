@@ -78,7 +78,7 @@ fn test_empty_discovery() {
 #[jit_module]
 mod multi_attr_module {
     use majit_macros::{
-        dont_look_inside, elidable, jit_loop_invariant, jit_may_force, jit_release_gil,
+        dont_look_inside, elidable, jit_may_force, jit_release_gil, loop_invariant,
     };
 
     #[elidable]
@@ -101,7 +101,11 @@ mod multi_attr_module {
         x * 3
     }
 
-    #[jit_loop_invariant]
+    // `#[loop_invariant]` — RPython canonical `rlib/jit.py:162
+    // @loop_invariant`.  `#[jit_loop_invariant]` is a pyre-prefixed
+    // alias kept for back-compat (exercised separately in
+    // `rpython_attribute_name_module`).
+    #[loop_invariant]
     pub fn invariant_fn(x: i64) -> i64 {
         x / 2
     }
@@ -126,7 +130,7 @@ fn test_all_attribute_policies() {
     assert!(policies.contains(&("opaque_fn", "dont_look_inside")));
     assert!(policies.contains(&("force_fn", "jit_may_force")));
     assert!(policies.contains(&("gil_fn", "jit_release_gil")));
-    assert!(policies.contains(&("invariant_fn", "jit_loop_invariant")));
+    assert!(policies.contains(&("invariant_fn", "loop_invariant")));
 }
 
 #[test]
@@ -311,8 +315,13 @@ fn test_jit_module_disambiguates_trait_impl_with_as_trait_cast() {
 // scope`).  `#[jit_elidable]` (lib.rs:993) is a pure pass-through and
 // only relies on `front::ast::collect_jit_hints`'s hint flip, so it can
 // safely sit on impl methods.  This fixture verifies that live wire.
+pub trait PureTrait {
+    fn trait_elidable(&self) -> i64;
+}
+
 #[jit_module]
 mod elidable_method_module {
+    use super::PureTrait;
     use majit_macros::jit_elidable;
 
     pub struct PureCalc {
@@ -332,6 +341,13 @@ mod elidable_method_module {
             self.seed.wrapping_add(x)
         }
     }
+
+    impl PureTrait for PureCalc {
+        #[jit_elidable]
+        fn trait_elidable(&self) -> i64 {
+            self.seed ^ 0x55
+        }
+    }
 }
 
 #[test]
@@ -345,6 +361,10 @@ fn test_jit_elidable_on_impl_methods_is_discovered() {
         helpers.contains(&"PureCalc::shifted"),
         "&self elidable method must be discovered, got {helpers:?}"
     );
+    assert!(
+        helpers.contains(&"PureCalc::trait_elidable"),
+        "trait-impl elidable method must be discovered, got {helpers:?}"
+    );
 
     let policies = elidable_method_module::__MAJIT_HELPER_POLICIES;
     // jit_module records the raw attribute name; normalisation happens
@@ -353,6 +373,7 @@ fn test_jit_elidable_on_impl_methods_is_discovered() {
     // the hint.
     assert!(policies.contains(&("PureCalc::compute_xor", "jit_elidable")));
     assert!(policies.contains(&("PureCalc::shifted", "jit_elidable")));
+    assert!(policies.contains(&("PureCalc::trait_elidable", "jit_elidable")));
 }
 
 #[test]
@@ -364,6 +385,7 @@ fn test_jit_elidable_method_runtime_callable() {
     );
     let calc = elidable_method_module::PureCalc { seed: 100 };
     assert_eq!(calc.shifted(7), 107);
+    assert_eq!(PureTrait::trait_elidable(&calc), 49);
 }
 
 // ── pass-through attribute on a *free* fn under `#[jit_module]` ───
@@ -433,4 +455,221 @@ fn test_passthrough_free_fn_callable() {
     assert_eq!(passthrough_free_fn_module::pure_xor(0b1010, 0b0110), 0b1100);
     assert_eq!(passthrough_free_fn_module::unrolled(7), 8);
     assert_eq!(passthrough_free_fn_module::out_of_trace(5), 10);
+}
+
+mod release_gil_aroundstate_module {
+    use majit_macros::jit_release_gil;
+
+    #[jit_release_gil]
+    pub fn release_default(x: i64) -> i64 {
+        x + 1
+    }
+
+    #[jit_release_gil(save_err = 5)]
+    pub fn release_with_errno(x: i64) -> i64 {
+        x + 2
+    }
+}
+
+mod rpython_attribute_name_module {
+    use majit_macros::{
+        dont_look_inside, dont_look_inside_cannot_raise, elidable, elidable_cannot_raise,
+        elidable_or_memerror, jit_loop_invariant, loop_invariant, unroll_safe,
+    };
+
+    #[elidable]
+    pub fn pure_plain(x: i64) -> i64 {
+        x + 1
+    }
+
+    #[elidable_cannot_raise]
+    pub fn pure_cannot_raise(x: i64) -> i64 {
+        x + 2
+    }
+
+    #[elidable_or_memerror]
+    pub fn pure_or_memerror(x: i64) -> i64 {
+        x + 3
+    }
+
+    #[dont_look_inside]
+    pub fn opaque_plain(x: i64) -> i64 {
+        x + 4
+    }
+
+    #[dont_look_inside_cannot_raise]
+    pub fn opaque_cannot_raise(x: i64) -> i64 {
+        x + 5
+    }
+
+    #[jit_loop_invariant]
+    pub fn invariant_jit(x: i64) -> i64 {
+        x + 6
+    }
+
+    #[loop_invariant]
+    pub fn invariant_plain(x: i64) -> i64 {
+        x + 7
+    }
+
+    #[unroll_safe]
+    pub fn unrolled_helper(x: i64) -> i64 {
+        x + 9
+    }
+}
+
+/// RPython attribute-name parity: every annotated function carries a
+/// `pub const <attribute_name>_<NAME>: <ty> = <value>` next to it,
+/// matching upstream's wrapper-attached attribute model.  `rg
+/// <attribute>` must find both pyre and PyPy callsites under the same
+/// identifier.
+#[test]
+fn test_rpython_attribute_name_parity() {
+    use rpython_attribute_name_module::*;
+
+    // `rlib/jit.py:72 _elidable_function_ = True` — all three elidable
+    // variants normalise to the same upstream attribute name (the
+    // `_cannot_raise` / `_or_memerror` distinctions are codewriter-
+    // derived `EffectInfo` classes per `call.py:292-299`).
+    assert!(_elidable_function_pure_plain);
+    assert!(_elidable_function_pure_cannot_raise);
+    assert!(_elidable_function_pure_or_memerror);
+    // Methods (`self`-receiver) skip module-level const emission —
+    // `rpython_attribute_const_for`'s receiver guard avoids
+    // trait-impl associated-item conflicts.  RPython's
+    // `func._elidable_function_` parity at method scope is left for
+    // a follow-up slice that knows the surrounding `impl` context.
+
+    // `rlib/jit.py:139 _jit_look_inside_ = False` — both opaque
+    // variants share the upstream attribute.
+    assert!(!_jit_look_inside_opaque_plain);
+    assert!(!_jit_look_inside_opaque_cannot_raise);
+
+    // `rlib/jit.py:169 _jit_loop_invariant_ = True` — both
+    // `loop_invariant` and `jit_loop_invariant` (the latter is a pyre
+    // alias for the unprefixed name) share the upstream attribute.
+    assert!(_jit_loop_invariant_invariant_jit);
+    assert!(_jit_loop_invariant_invariant_plain);
+
+    // `rlib/jit.py:159 _jit_unroll_safe_ = True`.
+    assert!(_jit_unroll_safe_unrolled_helper);
+}
+
+mod look_inside_alias_module {
+    use majit_macros::{look_inside, purefunction, purefunction_promote};
+
+    // `rlib/jit.py:142-150 @look_inside` sets `_jit_look_inside_ =
+    // True` (line 148) — the opposite of `@dont_look_inside`
+    // (`_jit_look_inside_ = False`).
+    #[look_inside]
+    pub fn force_traced(x: i64) -> i64 {
+        x + 1
+    }
+
+    // `rlib/jit.py:75-78 @purefunction` is a deprecated alias for
+    // `@elidable`; pyre's `#[purefunction]` forwards verbatim so the
+    // emitted attribute identifier is `_elidable_function_<NAME>` like
+    // canonical `#[elidable]`.
+    #[purefunction]
+    pub fn purefunction_helper(x: i64) -> i64 {
+        x * 2
+    }
+
+    // `rlib/jit.py:203-205 @purefunction_promote` — deprecated alias
+    // for `@elidable_promote`; `#[purefunction_promote]` forwards.
+    #[purefunction_promote]
+    pub fn purefunction_promote_helper(x: i64) -> i64 {
+        x * 3
+    }
+}
+
+/// RPython parity for the alias / override decorators added in this
+/// slice: `@look_inside` (`jit.py:148`) flips `_jit_look_inside_` to
+/// `True`, while `@purefunction` (`jit.py:75`) and
+/// `@purefunction_promote` (`jit.py:203`) are deprecated aliases for
+/// `@elidable` / `@elidable_promote`.
+#[test]
+fn test_look_inside_and_purefunction_aliases() {
+    use look_inside_alias_module::*;
+
+    // `@look_inside` sets `_jit_look_inside_ = True`.
+    assert!(_jit_look_inside_force_traced);
+
+    // `@purefunction` is the `@elidable` alias — emits
+    // `_elidable_function_<NAME>` exactly like canonical `@elidable`.
+    assert!(_elidable_function_purefunction_helper);
+
+    // `@purefunction_promote` (`jit.py:203`) is the `@elidable_promote`
+    // alias.  `jit.py:185 elidable(func)` puts `_elidable_function_ =
+    // True` on the ORIGINAL `func` — which pyre stores as the hidden
+    // `_orig_<NAME>_unlikely_name` — and NOT on the wrapper `result`
+    // returned at `jit.py:201`.
+    assert!(_elidable_function__orig_purefunction_promote_helper_unlikely_name);
+}
+
+mod oopspec_attribute_module {
+    use majit_macros::{not_in_trace, oopspec};
+
+    #[oopspec("jit.isconstant(value)")]
+    pub fn marked_isconstant(value: i64) -> bool {
+        value == 0
+    }
+
+    #[not_in_trace]
+    pub fn marked_not_in_trace(x: i64) -> i64 {
+        x + 1
+    }
+}
+
+/// RPython attribute-name parity for `oopspec`.  `rlib/jit.py:255
+/// func.oopspec = spec` (set by `@oopspec(spec)`) and
+/// `rlib/jit.py:261 func.oopspec = "jit.not_in_trace()"` (set by
+/// `@not_in_trace`) both write the same attribute name (`oopspec`)
+/// with a string value.  Pyre's `#[oopspec(...)]` and
+/// `#[not_in_trace]` proc-macros emit `pub const oopspec_<NAME>:
+/// &'static str` matching the upstream attribute identifier.
+#[test]
+fn test_oopspec_attribute_name_parity() {
+    use oopspec_attribute_module::*;
+
+    assert_eq!(oopspec_marked_isconstant, "jit.isconstant(value)");
+    assert_eq!(oopspec_marked_not_in_trace, "jit.not_in_trace()");
+}
+
+/// RPython attribute-name parity: `#[jit_release_gil(save_err = N)]`
+/// emits a named static `_call_aroundstate_target_<NAME>` next to the
+/// wrapper, mirroring `rffi.py:228
+/// call_external_function._call_aroundstate_target_ = funcptr,
+/// save_err`.  Both halves (concrete target + save_err) must be
+/// reachable under this upstream-named identifier so `rg
+/// _call_aroundstate_target_` finds the parity counterpart in both
+/// pyre and PyPy repositories.
+#[test]
+fn test_release_gil_emits_call_aroundstate_target_static() {
+    let (default_ptr, default_save_err) =
+        release_gil_aroundstate_module::_call_aroundstate_target_release_default;
+    assert!(
+        !default_ptr.is_null(),
+        "_call_aroundstate_target_release_default[0] must point at the concrete wrapper",
+    );
+    assert_eq!(
+        default_save_err, 0,
+        "default save_err = 0 (RFFI_ERR_NONE per rffi.py:80)",
+    );
+
+    let (errno_ptr, errno_save_err) =
+        release_gil_aroundstate_module::_call_aroundstate_target_release_with_errno;
+    assert!(
+        !errno_ptr.is_null(),
+        "_call_aroundstate_target_release_with_errno[0] must point at the concrete wrapper",
+    );
+    assert_eq!(
+        errno_save_err, 5,
+        "save_err = 5 must flow through the proc-macro tuple verbatim",
+    );
+
+    assert_ne!(
+        default_ptr, errno_ptr,
+        "per-function `_call_aroundstate_target_` consts must not alias",
+    );
 }

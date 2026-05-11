@@ -28,6 +28,24 @@
 
 use std::collections::HashMap;
 
+// Canonical RPython keys filling free low bytes (`blackhole.py:1149-1525`).
+// One byte per `(opname, argcodes)` per `assembler.py:221
+// setdefault(key, len(self.insns))` — alias-shared bytes would violate the
+// 1:1 invariant that `pyjitpl.py:2230 setup_insns` enforces.
+pub const BC_CAST_FLOAT_TO_INT: u8 = 0;
+pub const BC_ARRAYLEN_GC: u8 = 1;
+// (slot 2 free — `BC_ARRAYLEN_VABLE` already pinned at byte 74
+//  in the vable group.)
+pub const BC_GETINTERIORFIELD_GC_I: u8 = 3;
+pub const BC_GETINTERIORFIELD_GC_R: u8 = 4;
+pub const BC_GETINTERIORFIELD_GC_F: u8 = 5;
+pub const BC_GETLISTITEM_GC_I: u8 = 6;
+pub const BC_GETLISTITEM_GC_R: u8 = 7;
+pub const BC_GETLISTITEM_GC_F: u8 = 8;
+pub const BC_NEWLIST: u8 = 9;
+pub const BC_NEWLIST_CLEAR: u8 = 10;
+pub const BC_NEWLIST_HINT: u8 = 11;
+
 pub const BC_LOOP_HEADER: u8 = 12;
 pub const BC_ABORT: u8 = 13;
 pub const BC_ABORT_PERMANENT: u8 = 14;
@@ -36,34 +54,43 @@ pub const BC_ABORT_PERMANENT: u8 = 14;
 /// which permits the interpreter to take over via
 /// `DispatchError::RaiseException`.
 pub const BC_UNREACHABLE: u8 = 19;
-/// RPython `blackhole.py:913` aliases `bhimpl_goto_if_not_int_is_true`
-/// to `bhimpl_goto_if_not`, whose body takes the branch iff the int
-/// register is zero/false (`goto_if_not_int_is_true/iL`).
+/// RPython `blackhole.py:913` `bhimpl_goto_if_not_int_is_true =
+/// bhimpl_goto_if_not` aliases the handler.  `assembler.py:221
+/// setdefault()` still allocates a distinct byte per `(opname,
+/// argcodes)` key — `goto_if_not_int_is_true/iL` gets its own byte
+/// here (alias); the canonical `goto_if_not/iL` lives at
+/// [`BC_GOTO_IF_NOT`] = 18.  Both bytes route to the same handler.
 pub const BC_GOTO_IF_NOT_INT_IS_TRUE: u8 = 15;
 pub const BC_JUMP: u8 = 16;
 pub const BC_INLINE_CALL: u8 = 17;
-// slot 18 (formerly BC_RESIDUAL_CALL_VOID) freed by Slice 1c —
-// pyre-call-family-canonical-migration.md retired the legacy
-// `(fn_ptr_idx:u16, num_args:u16, [(kind:u8, reg:u16)]...)` payload in
-// favour of canonical `BC_RESIDUAL_CALL_{R,IR,IRF}_V` (=159..=161).
+/// RPython `flatten.py:245` `opname = 'goto_if_not'` — the canonical
+/// boolean-exitswitch branch.  `blackhole.py:865 bhimpl_goto_if_not`
+/// is the handler shared with the
+/// [`BC_GOTO_IF_NOT_INT_IS_TRUE`] alias per `blackhole.py:913
+/// bhimpl_goto_if_not_int_is_true = bhimpl_goto_if_not`.  Slot 18
+/// (formerly `BC_RESIDUAL_CALL_VOID`, freed by Slice 1c of
+/// `pyre-call-family-canonical-migration.md`) now houses this
+/// canonical key so each `(opname, argcodes)` per
+/// `assembler.py:221 setdefault()` keeps its own byte.
+pub const BC_GOTO_IF_NOT: u8 = 18;
 pub const BC_MOVE_I: u8 = 21;
-// slot 22 (formerly BC_CALL_INT) freed by Slice 4 Phase B.4 followup —
-// the canonical `BC_RESIDUAL_CALL_{R,IR,IRF}_I` family supersedes the
-// untyped legacy int-call opcode.  See pyre-call-family-canonical-
-// migration.md for the matching producer/consumer migration.
-// slot 23 (formerly BC_CALL_PURE_INT) freed by Parity #14 Slice C.5 —
-// elidable EffectInfo on the canonical `BC_RESIDUAL_CALL_*_I` calldescr
-// drives `record_result_of_call_pure` mirroring `pyjitpl.py:2111-2115
-// do_residual_call`.  The Pure-vs-non-Pure surface is no longer encoded
-// in the opcode tag.
+// Canonical RPython keys taking previously-freed slots 22-26 and 28-31
+// (`blackhole.py:1149-1525` + `blackhole.py:1257-1296` conditional/known
+// result + `blackhole.py:621-630` record_known_result + raw/indexed
+// loads + bounds check).  Each `(opname, argcodes)` gets a distinct
+// byte per `assembler.py:221 setdefault()` semantics.
+pub const BC_RAW_LOAD_I: u8 = 20;
+pub const BC_RAW_LOAD_F: u8 = 22;
+pub const BC_GC_LOAD_INDEXED_I: u8 = 23;
+pub const BC_GC_LOAD_INDEXED_F: u8 = 24;
+pub const BC_CHECK_NEG_INDEX: u8 = 25;
+pub const BC_CONDITIONAL_CALL_IR_V: u8 = 26;
+pub const BC_CONDITIONAL_CALL_VALUE_IR_I: u8 = 28;
+pub const BC_CONDITIONAL_CALL_VALUE_IR_R: u8 = 29;
+pub const BC_RECORD_KNOWN_RESULT_I_IR_V: u8 = 30;
+pub const BC_RECORD_KNOWN_RESULT_R_IR_V: u8 = 31;
 // Ref-typed bytecodes
 pub const BC_MOVE_R: u8 = 27;
-// slot 28 (formerly BC_CALL_REF) freed by Slice 4 Phase B.4 — the
-// canonical `BC_RESIDUAL_CALL_{R,IR,IRF}_R` family supersedes the
-// untyped legacy ref-call opcode.  See pyre-call-family-canonical-
-// migration.md for the matching producer/consumer migration.
-// slot 29 (formerly BC_CALL_PURE_REF) freed by Parity #14 Slice C.5 —
-// see slot 23 above.
 // Float-typed bytecodes
 pub const BC_MOVE_F: u8 = 33;
 // slot 34 (formerly BC_CALL_FLOAT) freed by Slice 4 Phase B.4 — see
@@ -738,10 +765,14 @@ pub fn wellknown_bh_insns() -> HashMap<&'static str, u8> {
     m.insert("float_guard_value/f", BC_FLOAT_GUARD_VALUE);
 
     // Truthy-exitswitch branch — `flatten.py:245` emits the canonical
-    // `goto_if_not/iL`; `blackhole.py:913`
-    // `bhimpl_goto_if_not_int_is_true = bhimpl_goto_if_not` adds the
-    // specialised alias. Both keys map to the same fixed runtime byte.
-    m.insert("goto_if_not/iL", BC_GOTO_IF_NOT_INT_IS_TRUE);
+    // `goto_if_not/iL`; `blackhole.py:913
+    // bhimpl_goto_if_not_int_is_true = bhimpl_goto_if_not` aliases the
+    // handler on the alias key `goto_if_not_int_is_true/iL`.
+    // `assembler.py:221 setdefault()` allocates one byte per
+    // `(opname, argcodes)`: the canonical key gets [`BC_GOTO_IF_NOT`]
+    // and the alias key gets [`BC_GOTO_IF_NOT_INT_IS_TRUE`].  Both
+    // bytes route to the same handler at runtime.
+    m.insert("goto_if_not/iL", BC_GOTO_IF_NOT);
     m.insert("goto_if_not_int_is_true/iL", BC_GOTO_IF_NOT_INT_IS_TRUE);
 
     // GC heap field load/store — `blackhole.py:1432-1481` `bhimpl_
@@ -787,6 +818,27 @@ pub fn wellknown_bh_insns() -> HashMap<&'static str, u8> {
     m.insert("getarrayitem_gc_r_pure/rid>r", BC_GETARRAYITEM_GC_R_PURE);
     m.insert("getarrayitem_gc_f_pure/rid>f", BC_GETARRAYITEM_GC_F_PURE);
 
+    // Array length — `blackhole.py:1370` `bhimpl_arraylen_gc`
+    // (`@arguments("cpu", "r", "d", returns="i")`).
+    // `bhimpl_arraylen_vable` (`blackhole.py:1406`,
+    // `@arguments("cpu", "r", "d", "d", returns="i")`) is pinned with
+    // its vable siblings above at [`BC_ARRAYLEN_VABLE`] = 74.
+    m.insert("arraylen_gc/rd>i", BC_ARRAYLEN_GC);
+
+    // Interior-field load — `blackhole.py:1412-1418`
+    // `bhimpl_getinteriorfield_gc_{i,r,f}`
+    // (`@arguments("cpu", "r", "i", "d", returns="i"|"r"|"f")`).
+    m.insert("getinteriorfield_gc_i/rid>i", BC_GETINTERIORFIELD_GC_I);
+    m.insert("getinteriorfield_gc_r/rid>r", BC_GETINTERIORFIELD_GC_R);
+    m.insert("getinteriorfield_gc_f/rid>f", BC_GETINTERIORFIELD_GC_F);
+
+    // List item load — `blackhole.py:1196-1207`
+    // `bhimpl_getlistitem_gc_{i,r,f}`
+    // (`@arguments("cpu", "r", "i", "d", "d", returns="i"|"r"|"f")`).
+    m.insert("getlistitem_gc_i/ridd>i", BC_GETLISTITEM_GC_I);
+    m.insert("getlistitem_gc_r/ridd>r", BC_GETLISTITEM_GC_R);
+    m.insert("getlistitem_gc_f/ridd>f", BC_GETLISTITEM_GC_F);
+
     // Quasi-immutable record — `blackhole.py:1538-1545`
     // `bhimpl_record_quasiimmut_field`.  Argcodes `rdd`: struct ref +
     // field descr + mutate descr (no result).
@@ -803,10 +855,12 @@ pub fn wellknown_bh_insns() -> HashMap<&'static str, u8> {
 
     // Cross-kind casts — `bhimpl_cast_ptr_to_int` (`blackhole.py:603-606`),
     // `bhimpl_cast_int_to_ptr` (`blackhole.py:608-610`),
-    // `bhimpl_cast_int_to_float` (`blackhole.py:811-816`).
+    // `bhimpl_cast_int_to_float` (`blackhole.py:811-816`),
+    // `bhimpl_cast_float_to_int` (`blackhole.py:801-808`).
     m.insert("cast_int_to_float/i>f", BC_CAST_INT_TO_FLOAT);
     m.insert("cast_int_to_ptr/i>r", BC_CAST_INT_TO_PTR);
     m.insert("cast_ptr_to_int/r>i", BC_CAST_PTR_TO_INT);
+    m.insert("cast_float_to_int/f>i", BC_CAST_FLOAT_TO_INT);
 
     // Switch dispatch — `blackhole.py:954-960` `bhimpl_switch`.
     // Argcodes `id`: int discriminator + descr selecting the case table.
@@ -828,6 +882,62 @@ pub fn wellknown_bh_insns() -> HashMap<&'static str, u8> {
     m.insert("inline_call_irf_r/dIRF>r", BC_INLINE_CALL_IRF_R);
     m.insert("inline_call_irf_f/dIRF>f", BC_INLINE_CALL_IRF_F);
     m.insert("inline_call_irf_v/dIRF", BC_INLINE_CALL_IRF_V);
+
+    // List construction — `blackhole.py:1161-1194`
+    // `bhimpl_newlist{,_clear,_hint}`
+    // (`@arguments("cpu", "i", "d", "d", "d", "d", returns="r")`):
+    // length + 4 descrs (struct + length + items + array) → ref result.
+    m.insert("newlist/idddd>r", BC_NEWLIST);
+    m.insert("newlist_clear/idddd>r", BC_NEWLIST_CLEAR);
+    m.insert("newlist_hint/idddd>r", BC_NEWLIST_HINT);
+
+    // Raw memory load — `blackhole.py:1512-1518`
+    // `bhimpl_raw_load_{i,f}` (`@arguments("cpu", "i", "i", "d",
+    // returns="i"|"f")`): addr + offset + arraydescr.
+    m.insert("raw_load_i/iid>i", BC_RAW_LOAD_I);
+    m.insert("raw_load_f/iid>f", BC_RAW_LOAD_F);
+
+    // GC indexed load — `blackhole.py:1519-1525`
+    // `bhimpl_gc_load_indexed_{i,f}` (`@arguments("cpu", "r", "i", "i",
+    // "i", "i", returns="i"|"f")`): base ref + index + scale + base_ofs +
+    // bytes.
+    m.insert("gc_load_indexed_i/riiii>i", BC_GC_LOAD_INDEXED_I);
+    m.insert("gc_load_indexed_f/riiii>f", BC_GC_LOAD_INDEXED_F);
+
+    // Negative-index normalisation — `blackhole.py:1149-1158`
+    // `bhimpl_check_neg_index` (`@arguments("cpu", "r", "i", "d",
+    // returns="i")`): array ref + index + arraydescr → wrapped index.
+    m.insert("check_neg_index/rid>i", BC_CHECK_NEG_INDEX);
+
+    // Conditional residual call — `blackhole.py:1258-1296`
+    // `bhimpl_conditional_call_ir_v` (`@arguments("cpu", "i", "i", "I",
+    // "R", "d")`) is fired iff the int `condition` is non-zero;
+    // `bhimpl_conditional_call_value_ir_{i,r}` returns the `value`
+    // operand when the helper isn't fired so the result is always
+    // typed.
+    m.insert("conditional_call_ir_v/iiIRd", BC_CONDITIONAL_CALL_IR_V);
+    m.insert(
+        "conditional_call_value_ir_i/iiIRd>i",
+        BC_CONDITIONAL_CALL_VALUE_IR_I,
+    );
+    m.insert(
+        "conditional_call_value_ir_r/riIRd>r",
+        BC_CONDITIONAL_CALL_VALUE_IR_R,
+    );
+
+    // Record-known-result — `blackhole.py:621-630`
+    // `bhimpl_record_known_result_{i,r}_ir_v`
+    // (`@arguments("cpu", "i"|"r", "i", "I", "R", "d")`): tells the
+    // tracer that the helper's result equals the pre-supplied operand,
+    // so the call is elided on the trace.
+    m.insert(
+        "record_known_result_i_ir_v/iiIRd",
+        BC_RECORD_KNOWN_RESULT_I_IR_V,
+    );
+    m.insert(
+        "record_known_result_r_ir_v/riIRd",
+        BC_RECORD_KNOWN_RESULT_R_IR_V,
+    );
 
     m
 }

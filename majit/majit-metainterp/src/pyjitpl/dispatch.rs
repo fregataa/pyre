@@ -1891,7 +1891,7 @@ where
             }
             jitcode::insns::BC_PTR_ISZERO => self.trace_ptr_nullity(ctx, false),
             jitcode::insns::BC_PTR_NONZERO => self.trace_ptr_nullity(ctx, true),
-            jitcode::insns::BC_GOTO_IF_NOT_INT_IS_TRUE => {
+            jitcode::insns::BC_GOTO_IF_NOT | jitcode::insns::BC_GOTO_IF_NOT_INT_IS_TRUE => {
                 let (opcode_pc, cond_idx, target) = {
                     let frame = self.frames.current_mut();
                     // RPython `pyjitpl.py:3713 orgpc = position` parity: the

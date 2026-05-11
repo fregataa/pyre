@@ -579,25 +579,52 @@ mod tests {
 
     #[test]
     fn wellknown_bh_insns_stays_canonical_and_avoids_false_call_family_keys() {
+        use majit_translate::insns as ti;
         let insns = wellknown_bh_insns();
         assert!(
             !insns.contains_key("jump/L"),
             "wellknown_bh_insns must keep the canonical goto/L spelling",
         );
-        assert!(
-            !insns.contains_key("conditional_call_ir_v/iiIRd"),
-            "helper-side BC_COND_CALL_VOID must not masquerade as \
-             canonical conditional_call_ir_v/iiIRd",
+        // Canonical RPython `conditional_call_*` / `record_known_result_*`
+        // keys (`blackhole.py:1258-1296` + `:621-630`) are pinned at the
+        // distinct bytes [`BC_CONDITIONAL_CALL_*`] / [`BC_RECORD_KNOWN_RESULT_*`].
+        // The pyre-only helper-side proc-macro adapter keys
+        // `cond_call_*_pyre/P` / `record_known_result_*_pyre/P` reuse the
+        // legacy [`BC_COND_CALL_*`] / [`BC_RECORD_KNOWN_RESULT_*`] bytes
+        // (`pyre_extension_insns()`).  The two byte ranges must stay
+        // disjoint so the canonical and adapter forms cannot collide on
+        // dispatch.
+        assert_eq!(
+            insns.get("conditional_call_ir_v/iiIRd").copied(),
+            Some(ti::BC_CONDITIONAL_CALL_IR_V),
         );
-        assert!(
-            !insns.contains_key("conditional_call_value_ir_r/riIRd>r"),
-            "helper-side BC_COND_CALL_VALUE_REF must not masquerade as \
-             canonical conditional_call_value_ir_r/riIRd>r",
+        assert_eq!(
+            insns.get("conditional_call_value_ir_i/iiIRd>i").copied(),
+            Some(ti::BC_CONDITIONAL_CALL_VALUE_IR_I),
         );
-        assert!(
-            !insns.contains_key("record_known_result_r_ir_v/riIRd"),
-            "helper-side BC_RECORD_KNOWN_RESULT_REF must not masquerade as \
-             canonical record_known_result_r_ir_v/riIRd",
+        assert_eq!(
+            insns.get("conditional_call_value_ir_r/riIRd>r").copied(),
+            Some(ti::BC_CONDITIONAL_CALL_VALUE_IR_R),
+        );
+        assert_eq!(
+            insns.get("record_known_result_i_ir_v/iiIRd").copied(),
+            Some(ti::BC_RECORD_KNOWN_RESULT_I_IR_V),
+        );
+        assert_eq!(
+            insns.get("record_known_result_r_ir_v/riIRd").copied(),
+            Some(ti::BC_RECORD_KNOWN_RESULT_R_IR_V),
+        );
+        assert_ne!(
+            insns.get("conditional_call_ir_v/iiIRd").copied(),
+            Some(ti::BC_COND_CALL_VOID),
+            "canonical conditional_call_ir_v byte must NOT collide with \
+             helper-side BC_COND_CALL_VOID adapter byte",
+        );
+        assert_ne!(
+            insns.get("record_known_result_r_ir_v/riIRd").copied(),
+            Some(ti::BC_RECORD_KNOWN_RESULT_REF),
+            "canonical record_known_result_r_ir_v byte must NOT collide \
+             with helper-side BC_RECORD_KNOWN_RESULT_REF adapter byte",
         );
         // Canonical `inline_call_*/d{R,IR,IRF}>{i,r,v,f}` keys live in
         // `wellknown_bh_insns()` with their own distinct `BC_*` bytes

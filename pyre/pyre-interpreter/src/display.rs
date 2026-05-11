@@ -404,7 +404,7 @@ pub unsafe fn py_str(obj: PyObjectRef) -> String {
             if !pyre_object::is_tuple(args) {
                 return py_str(args);
             }
-            let n = pyre_object::w_tuple_len(args);
+            let n: usize = pyre_object::w_tuple_len(args);
             if n == 0 {
                 return String::new();
             }

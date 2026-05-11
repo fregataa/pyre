@@ -97,6 +97,78 @@ fn helper_call_target_fn_name(path: &Path) -> syn::Result<Ident> {
     Ok(format_ident!("__majit_call_target_{}", last.ident))
 }
 
+/// Emit an RPython attribute-named `pub const` next to the wrapper so
+/// `rg <attribute>_<NAME>` finds the parity counterpart in both pyre
+/// and PyPy.  RPython source citations:
+///
+/// * `_elidable_function_` — `rlib/jit.py:72` `@elidable`,
+///   `@elidable_promote()`.  pyre's `_cannot_raise` / `_or_memerror`
+///   variants are codewriter-derived effect classes that all start
+///   from the same `_elidable_function_` attribute upstream
+///   (`call.py:292-299` 3-way pick on `_canraise(op)`).
+/// * `_jit_look_inside_` — `rlib/jit.py:139` `@dont_look_inside`
+///   (`= False`); `:148` `@look_inside` (`= True`).
+/// * `_jit_loop_invariant_` — `rlib/jit.py:169` `@loop_invariant`.
+/// * `_jit_unroll_safe_` — `rlib/jit.py:159` `@unroll_safe`.
+///
+/// `_call_aroundstate_target_` (`rffi.py:228`) is emitted separately
+/// in `expand_call_surface_attr` because it carries a 2-tuple
+/// `(funcptr, save_err)` rather than a bool.
+///
+/// Returns `None` for attributes with no RPython attribute counterpart
+/// (e.g. `jit_may_force` — `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE` is
+/// analyzer-derived from `virtualizable_analyzer.analyze()`, not from
+/// a wrapper attribute).
+///
+/// Also returns `None` when the function has a `self`-receiver: at
+/// proc-macro time we cannot tell whether the surrounding `impl` is
+/// inherent (which would accept the const as an associated item) or
+/// a trait impl (which forbids it because only trait-declared
+/// associated items are allowed inside `impl Trait for ...`).
+/// Skipping the const emission for receiver methods keeps the macro
+/// usable in both contexts; the function-level inline marker still
+/// records the attribute presence for free-function discovery
+/// downstream.  RPython itself only attaches these attributes at
+/// function/method scope (`func._elidable_function_ = True`); methods
+/// in Python carry the attribute via the underlying function object
+/// regardless of how the method is bound, so callers that need the
+/// per-method const can attach the attribute at the free-function
+/// definition site instead.
+fn rpython_attribute_const_for(
+    attr_name: &str,
+    sig: &syn::Signature,
+    vis: &syn::Visibility,
+) -> Option<proc_macro2::TokenStream> {
+    if sig.receiver().is_some() {
+        return None;
+    }
+    let fn_ident = &sig.ident;
+    let (const_name, value) = match attr_name {
+        "elidable" | "elidable_cannot_raise" | "elidable_or_memerror" | "jit_elidable" => (
+            format_ident!("_elidable_function_{}", fn_ident),
+            quote! { true },
+        ),
+        "dont_look_inside" | "dont_look_inside_cannot_raise" => (
+            format_ident!("_jit_look_inside_{}", fn_ident),
+            quote! { false },
+        ),
+        "look_inside" => (
+            format_ident!("_jit_look_inside_{}", fn_ident),
+            quote! { true },
+        ),
+        "jit_loop_invariant" => (
+            format_ident!("_jit_loop_invariant_{}", fn_ident),
+            quote! { true },
+        ),
+        _ => return None,
+    };
+    Some(quote! {
+        #[doc(hidden)]
+        #[allow(non_upper_case_globals)]
+        #vis const #const_name: bool = #value;
+    })
+}
+
 fn primitive_type_ident(ty: &Type) -> Option<&Ident> {
     let Type::Path(type_path) = ty else {
         return None;
@@ -314,6 +386,23 @@ fn helper_policy_tokens_for_fn(
     else {
         return Ok(unsupported);
     };
+    // RPython `call.py:252-253 if getattr(func,
+    // "_call_aroundstate_target_", None): tgt_func, tgt_saveerr =
+    // func._call_aroundstate_target_` — destructure the 2-tuple under
+    // the upstream attribute name.  Pyre's `expand_call_surface_attr`
+    // emits this const at module scope for `#[jit_release_gil]` callees
+    // (see slice 1); the policy fn body below mirrors the upstream
+    // destructure verbatim instead of threading the concrete target /
+    // save_err through opaque tuple slots.
+    let aroundstate_path = format_ident!("_call_aroundstate_target_{}", func.sig.ident);
+    let release_gil_destructure = |policy_byte: proc_macro2::TokenStream| {
+        quote! {
+            {
+                let (__tgt_func, __tgt_saveerr) = #aroundstate_path;
+                (#policy_byte, std::ptr::null(), #trace_target_name as *const (), __tgt_func, std::ptr::null(), __tgt_saveerr)
+            }
+        }
+    };
     // 6-tuple: (policy, inline_builder, trace_target, concrete_target, prebuild, save_err).
     // `prebuild` is the per-helper liveness prebuild fn pointer or null
     // for non-Inline helpers (these have no per-marker triples to register).
@@ -349,9 +438,7 @@ fn helper_policy_tokens_for_fn(
             "jit_may_force" => quote! {
                 (#VOID_MAY_FORCE, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null(), 0i32)
             },
-            "jit_release_gil" => quote! {
-                (#VOID_RELEASE_GIL, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null(), #save_err)
-            },
+            "jit_release_gil" => release_gil_destructure(quote! { #VOID_RELEASE_GIL }),
             "jit_loop_invariant" => quote! {
                 (#VOID_LOOP_INVARIANT, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null(), 0i32)
             },
@@ -379,9 +466,7 @@ fn helper_policy_tokens_for_fn(
             "jit_may_force" => quote! {
                 (#INT_MAY_FORCE, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null(), 0i32)
             },
-            "jit_release_gil" => quote! {
-                (#INT_RELEASE_GIL, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null(), #save_err)
-            },
+            "jit_release_gil" => release_gil_destructure(quote! { #INT_RELEASE_GIL }),
             "jit_loop_invariant" => quote! {
                 (#INT_LOOP_INVARIANT, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null(), 0i32)
             },
@@ -442,9 +527,7 @@ fn helper_policy_tokens_for_fn(
             // `#[jit_release_gil(save_err = N)]` value through
             // `add_call_target_with_save_err` (`rffi.py:228
             // _call_aroundstate_target_ = (funcptr, save_err)` parity).
-            "jit_release_gil" => quote! {
-                (#UNSUPPORTED, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null(), #save_err)
-            },
+            "jit_release_gil" => release_gil_destructure(quote! { #UNSUPPORTED }),
             "elidable"
             | "elidable_cannot_raise"
             | "elidable_or_memerror"
@@ -741,6 +824,23 @@ pub fn elidable(_attr: TokenStream, item: TokenStream) -> TokenStream {
     expand_elidable_attribute(item, "elidable")
 }
 
+/// Deprecated alias for `#[elidable]`.
+///
+/// `rlib/jit.py:75-78`:
+/// ```python
+/// def purefunction(*args, **kwargs):
+///     """Deprecated, use elidable instead."""
+///     return elidable(*args, **kwargs)
+/// ```
+///
+/// Pyre's alias forwards to `expand_elidable_attribute` with the
+/// canonical `"elidable"` attr_name so the emitted `_elidable_function_
+/// <NAME>` const + policy fn match the `@elidable` path verbatim.
+#[proc_macro_attribute]
+pub fn purefunction(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    expand_elidable_attribute(item, "elidable")
+}
+
 /// `#[elidable_cannot_raise]` — `call.py:299 getcalldescr`'s
 /// `else` branch (`_canraise(op) == False`).  Maps to
 /// `EF_ELIDABLE_CANNOT_RAISE` (`effectinfo.py:17`).  The canonical
@@ -796,6 +896,7 @@ fn expand_elidable_attribute(item: TokenStream, attr_name: &str) -> TokenStream 
         Ok(tokens) => tokens,
         Err(err) => return err.to_compile_error().into(),
     };
+    let rpython_attribute_const = rpython_attribute_const_for(attr_name, sig, vis);
 
     let expanded = quote! {
         #(#attrs)*
@@ -811,6 +912,7 @@ fn expand_elidable_attribute(item: TokenStream, attr_name: &str) -> TokenStream 
 
         #call_target_fn
         #policy_fn
+        #rpython_attribute_const
     };
 
     expanded.into()
@@ -824,6 +926,43 @@ fn expand_elidable_attribute(item: TokenStream, attr_name: &str) -> TokenStream 
 #[proc_macro_attribute]
 pub fn dont_look_inside(_attr: TokenStream, item: TokenStream) -> TokenStream {
     expand_dont_look_inside_attribute(item, "dont_look_inside")
+}
+
+/// Make sure the JIT traces inside the decorated function, even if
+/// the rest of the module is not visible to the JIT.
+///
+/// `rlib/jit.py:142-150 @look_inside` — sets `_jit_look_inside_ =
+/// True` (line 148).  The RPython body also issues a deprecation
+/// warning (line 147); pyre omits the warning because Rust callers
+/// pick the attribute at compile time rather than at import time.
+///
+/// Unlike `#[dont_look_inside]`, this attribute does NOT emit a
+/// call-target wrapper or policy fn — it's a tracing override, not a
+/// residual-call surface declaration.
+#[proc_macro_attribute]
+pub fn look_inside(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let func = parse_macro_input!(item as ItemFn);
+    let attrs = &func.attrs;
+    let vis = &func.vis;
+    let sig = &func.sig;
+    let block = &func.block;
+    let rpython_attribute_const = rpython_attribute_const_for("look_inside", sig, vis);
+
+    let expanded = quote! {
+        #(#attrs)*
+        #[doc(hidden)]
+        #[allow(non_upper_case_globals)]
+        #vis #sig {
+            #[doc(hidden)]
+            #[allow(dead_code)]
+            const _MAJIT_LOOK_INSIDE: bool = true;
+            #block
+        }
+
+        #rpython_attribute_const
+    };
+
+    expanded.into()
 }
 
 /// `#[dont_look_inside_cannot_raise]` — non-elidable opaque helper that
@@ -878,6 +1017,7 @@ fn expand_dont_look_inside_attribute(item: TokenStream, attr_name: &str) -> Toke
         Ok(tokens) => tokens,
         Err(err) => return err.to_compile_error().into(),
     };
+    let rpython_attribute_const = rpython_attribute_const_for(attr_name, sig, vis);
 
     let expanded = quote! {
         #(#attrs)*
@@ -893,6 +1033,7 @@ fn expand_dont_look_inside_attribute(item: TokenStream, attr_name: &str) -> Toke
 
         #call_target_fn
         #policy_fn
+        #rpython_attribute_const
     };
 
     expanded.into()
@@ -937,6 +1078,47 @@ fn expand_call_surface_attr(
         Err(err) => return err.to_compile_error().into(),
     };
 
+    // RPython attribute-name parity: emit a separate 2-tuple static
+    // named verbatim after `_call_aroundstate_target_` for
+    // `#[jit_release_gil]` annotated helpers.  `rffi.py:228
+    // call_external_function._call_aroundstate_target_ = funcptr,
+    // save_err` attaches this 2-tuple to the wrapper at module-import
+    // time; pyre cannot replicate Python's late-bound attribute model,
+    // but it can emit a static next to the wrapper under the same
+    // identifier so `rg _call_aroundstate_target_` finds the parity
+    // counterpart in both repositories.  The bundled
+    // `__majit_call_policy_<NAME>` 6-tuple (`(policy_byte,
+    // inline_builder, trace_target, concrete_target, prebuild,
+    // save_err)`) keeps existing consumers wired; the named 2-tuple
+    // additionally surfaces `(concrete_target, save_err)` under its
+    // upstream attribute name for line-by-line parity readers.
+    //
+    // `call.py:252-253 if getattr(func, "_call_aroundstate_target_",
+    // None): tgt_func, tgt_saveerr = func._call_aroundstate_target_`
+    // is the upstream consumer site; future pyre slices migrate the
+    // codewriter to read from this static directly.
+    let aroundstate_target_static = if attr_name == "jit_release_gil" {
+        concrete_target_name.as_ref().map(|concrete| {
+            let const_name = format_ident!("_call_aroundstate_target_{}", sig.ident);
+            // `const` rather than `static`: `*const ()` is not `Sync`,
+            // but a `const` of the same type is a compile-time value
+            // (each use re-evaluates the initializer) so no `Sync`
+            // bound applies.  Semantically this matches upstream's
+            // read-only attribute attached to the wrapper callable:
+            // each `getattr(func, "_call_aroundstate_target_")` returns
+            // the same 2-tuple by value.
+            quote! {
+                #[doc(hidden)]
+                #[allow(non_upper_case_globals)]
+                #vis const #const_name: (*const (), i32) =
+                    (#concrete as *const (), #save_err);
+            }
+        })
+    } else {
+        None
+    };
+    let rpython_attribute_const = rpython_attribute_const_for(attr_name, sig, vis);
+
     let expanded = quote! {
         #(#attrs)*
         #[inline(never)]
@@ -951,6 +1133,8 @@ fn expand_call_surface_attr(
 
         #call_target_fn
         #policy_fn
+        #aroundstate_target_static
+        #rpython_attribute_const
     };
 
     expanded.into()
@@ -1082,7 +1266,25 @@ pub fn jit_immutable_fields(_attr: TokenStream, item: TokenStream) -> TokenStrea
 /// consumes downstream.
 #[proc_macro_attribute]
 pub fn jit_elidable(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    item
+    let item_ts = proc_macro2::TokenStream::from(item);
+    if let Ok(func) = syn::parse2::<ItemFn>(item_ts.clone()) {
+        let vis = &func.vis;
+        let rpython_attribute_const = rpython_attribute_const_for("jit_elidable", &func.sig, vis);
+        return quote! {
+            #func
+            #rpython_attribute_const
+        }
+        .into();
+    }
+    if let Ok(method) = syn::parse2::<syn::ImplItemFn>(item_ts.clone()) {
+        return quote! { #method }.into();
+    }
+    syn::Error::new_spanned(
+        item_ts,
+        "#[jit_elidable] supports free functions and impl methods",
+    )
+    .to_compile_error()
+    .into()
 }
 
 /// JIT can safely unroll loops in this function and this will
@@ -1097,6 +1299,23 @@ pub fn unroll_safe(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let vis = &func.vis;
     let sig = &func.sig;
     let block = &func.block;
+    // RPython attribute-name parity: `rlib/jit.py:159 func._jit_unroll_safe_
+    // = True`.  Emit a module-level `pub const _jit_unroll_safe_<NAME>:
+    // bool = true` next to the wrapper so `rg _jit_unroll_safe_` finds
+    // the parity counterpart in both pyre and PyPy.  Skip for methods
+    // (`self`-receiver) because trait-impl blocks reject foreign
+    // associated items — see `rpython_attribute_const_for`'s receiver
+    // guard for the same reasoning.
+    let unroll_safe_const = if sig.receiver().is_none() {
+        let const_name = format_ident!("_jit_unroll_safe_{}", sig.ident);
+        Some(quote! {
+            #[doc(hidden)]
+            #[allow(non_upper_case_globals)]
+            #vis const #const_name: bool = true;
+        })
+    } else {
+        None
+    };
 
     let expanded = quote! {
         #(#attrs)*
@@ -1108,6 +1327,8 @@ pub fn unroll_safe(_attr: TokenStream, item: TokenStream) -> TokenStream {
             const _MAJIT_UNROLL_SAFE: bool = true;
             #block
         }
+
+        #unroll_safe_const
     };
 
     expanded.into()
@@ -1126,6 +1347,22 @@ pub fn not_in_trace(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let vis = &func.vis;
     let sig = &func.sig;
     let block = &func.block;
+    // RPython attribute-name parity: `rlib/jit.py:261 func.oopspec =
+    // "jit.not_in_trace()"`.  Emit a module-level `pub const
+    // oopspec_<NAME>: &'static str` next to the wrapper so `rg oopspec_`
+    // finds the parity counterpart in both pyre and PyPy.  Skip for
+    // methods (`self`-receiver) — see `rpython_attribute_const_for`'s
+    // receiver guard for the same reasoning.
+    let oopspec_const = if sig.receiver().is_none() {
+        let const_name = format_ident!("oopspec_{}", sig.ident);
+        Some(quote! {
+            #[doc(hidden)]
+            #[allow(non_upper_case_globals)]
+            #vis const #const_name: &'static str = "jit.not_in_trace()";
+        })
+    } else {
+        None
+    };
 
     let expanded = quote! {
         #(#attrs)*
@@ -1137,6 +1374,8 @@ pub fn not_in_trace(_attr: TokenStream, item: TokenStream) -> TokenStream {
             const _MAJIT_NOT_IN_TRACE: bool = true;
             #block
         }
+
+        #oopspec_const
     };
 
     expanded.into()
@@ -1147,6 +1386,19 @@ pub fn not_in_trace(_attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// rlib/jit.py:180 — `@elidable_promote(promote_args='all')`.
 ///
+/// Deprecated alias for `#[elidable_promote]`.
+///
+/// `rlib/jit.py:203-205`:
+/// ```python
+/// def purefunction_promote(*args, **kwargs):
+///     """Deprecated, use elidable_promote instead."""
+///     return elidable_promote(*args, **kwargs)
+/// ```
+#[proc_macro_attribute]
+pub fn purefunction_promote(attr: TokenStream, item: TokenStream) -> TokenStream {
+    elidable_promote(attr, item)
+}
+
 /// The decorated name **becomes** the promoting wrapper (RPython parity).
 /// The original elidable body is renamed to a hidden `_orig_<name>_unlikely_name`.
 ///
@@ -1262,6 +1514,25 @@ pub fn elidable_promote(attr: TokenStream, item: TokenStream) -> TokenStream {
         Err(err) => return err.to_compile_error().into(),
     };
 
+    // `rlib/jit.py:185 elidable(func)` — the ORIGINAL `func` is what
+    // receives `_elidable_function_ = True`; `result` (the returned
+    // wrapper, see jit.py:198-201) does NOT carry the attribute.  In
+    // pyre's layout `func` becomes the hidden `_orig_<NAME>_unlikely_
+    // name` and the wrapper takes the decorated name, so the const
+    // lives on the renamed original.  Emitted at the user-facing `vis`
+    // (Rust adaptation: the renamed original is private `fn`, but
+    // callers need to read the const through the wrapper's module).
+    let orig_elidable_const = if !has_self {
+        let const_name = format_ident!("_elidable_function_{}", orig_name);
+        Some(quote! {
+            #[doc(hidden)]
+            #[allow(non_upper_case_globals)]
+            #vis const #const_name: bool = true;
+        })
+    } else {
+        None
+    };
+
     let expanded = quote! {
         // rlib/jit.py:184-185 — elidable(func); original body hidden
         #[inline(never)]
@@ -1283,6 +1554,8 @@ pub fn elidable_promote(attr: TokenStream, item: TokenStream) -> TokenStream {
             #(#promote_stmts)*
             #orig_name(#(#call_args),*)
         }
+
+        #orig_elidable_const
     };
 
     expanded.into()
@@ -1325,6 +1598,21 @@ pub fn oopspec(attr: TokenStream, item: TokenStream) -> TokenStream {
     let sig = &func.sig;
     let block = &func.block;
     let spec_value = spec.value();
+    // RPython attribute-name parity: `rlib/jit.py:255 func.oopspec =
+    // spec`.  Emit a module-level `pub const oopspec_<NAME>: &'static str
+    // = spec` next to the wrapper.  Skip for methods (`self`-receiver) —
+    // see `rpython_attribute_const_for`'s receiver guard for the same
+    // reasoning.
+    let oopspec_const = if sig.receiver().is_none() {
+        let const_name = format_ident!("oopspec_{}", sig.ident);
+        Some(quote! {
+            #[doc(hidden)]
+            #[allow(non_upper_case_globals)]
+            #vis const #const_name: &'static str = #spec_value;
+        })
+    } else {
+        None
+    };
 
     let expanded = quote! {
         #(#attrs)*
@@ -1336,6 +1624,8 @@ pub fn oopspec(attr: TokenStream, item: TokenStream) -> TokenStream {
             const _MAJIT_OOPSPEC: &str = #spec_value;
             #block
         }
+
+        #oopspec_const
     };
 
     expanded.into()
@@ -1668,6 +1958,7 @@ const JIT_HELPER_ATTRS: &[&str] = &[
     "jit_elidable",
     "dont_look_inside",
     "dont_look_inside_cannot_raise",
+    "look_inside",
     "unroll_safe",
     "loop_invariant",
     "not_in_trace",
@@ -1676,6 +1967,13 @@ const JIT_HELPER_ATTRS: &[&str] = &[
     "jit_may_force",
     "jit_release_gil",
     "jit_loop_invariant",
+    // `rlib/jit.py:75-78` — `@purefunction` is a deprecated alias for
+    // `@elidable`; `@purefunction_promote` (`jit.py:203-205`) likewise
+    // for `@elidable_promote`.  Listed here so `#[jit_module]` discovery
+    // recognises the alias decorators when callers use the deprecated
+    // name.
+    "purefunction",
+    "purefunction_promote",
 ];
 
 /// Check if a syn attribute path matches one of the JIT helper attributes.

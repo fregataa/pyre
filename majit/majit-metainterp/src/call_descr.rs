@@ -463,11 +463,28 @@ pub fn effect_info_for_slot(slot: EffectInfoSlot) -> EffectInfo {
 /// `descr.get_extra_info().extraeffect`. Pyre baked the choice into the
 /// opcode at codewriter time, so reverse the mapping here so the descr
 /// the optimizer reads carries the matching effect class.
+///
+/// `CALL_MAY_FORCE` maps to [`forces_virtual_or_virtualizable_effect_info`]
+/// (`effectinfo.py:23 EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE`).
+/// `CALL_RELEASE_GIL` cannot be reconstructed from the opcode alone —
+/// upstream `effectinfo.py:271-273 MOST_GENERAL` pairs `EF_RANDOM_EFFECTS`
+/// with a `call_release_gil_target` funcptr that this helper does not
+/// see, so the analyzer-absent default is fail-loud: any production
+/// path that needs a release-GIL EI must build it explicitly via
+/// [`make_call_descr_with_effect`] with the resolved target.
 pub fn default_effect_for_opcode(opcode: majit_ir::OpCode) -> EffectInfo {
     if opcode.is_call_pure() {
         ELIDABLE_EFFECT_INFO
     } else if opcode.is_call_loopinvariant() {
         LOOPINVARIANT_EFFECT_INFO
+    } else if opcode.is_call_may_force() {
+        forces_virtual_or_virtualizable_effect_info()
+    } else if opcode.is_call_release_gil() {
+        unreachable!(
+            "default_effect_for_opcode: CALL_RELEASE_GIL (`{opcode:?}`) requires \
+             call_release_gil_target funcptr; build the EffectInfo explicitly via \
+             make_call_descr_with_effect (effectinfo.py:271-273 MOST_GENERAL)"
+        );
     } else {
         default_effect_info()
     }
