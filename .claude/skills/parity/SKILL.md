@@ -22,7 +22,9 @@ Apply these to every decision made while this skill is active, even if the user'
 
 5. **Don't stop at the first dependency.** If line-by-line porting is impossible because a dependency (helper, pass, opcode, descriptor) has not been ported yet, port that dependency first in the same RPython-parity style. Then come back.
 
-6. **Removing new deviations takes priority over adding features.** When auditing a diff, new deviations found must be addressed before the follow-up task proceeds, unless the user has explicitly directed otherwise in the same invocation.
+6. **Parity regressions are fixed by default, and take priority over the follow-up task.** A **parity regression** is a NEW-DEVIATION introduced by the diff under audit — i.e., absent at the audit base, present at HEAD. Regressions found in audit are **fixed in-session by default** — no per-item user confirmation is required — and the follow-up task proceeds afterward. The user opts out only by directing so explicitly in the same invocation (e.g. `/parity only audit`, `/parity don't change <file>`, `/parity skip the regression and just do <X>`). "The user might not want this fixed" is not a reason to skip — they would have said so.
+
+Pre-existing NEW-DEVIATIONs (already at the audit base, simply visible because they sit in a modified file) are still violations per Principle 3 and the rule on PRE-EXISTING-ADAPTATION (Principle 7), but they are **not** auto-fixed by this default. Flag them in the audit so the user can decide whether to widen scope; do not silently expand the diff to clean unrelated old debt. Auto-fix discipline is scoped to what this diff broke, not to opportunistic cleanup of the surrounding code.
 
 7. **PRE-EXISTING-ADAPTATION is a fix queue, not an absolution.** When a PRE-EXISTING-ADAPTATION appears in the code you are touching — or in code adjacent to your task — treat it like a NEW-DEVIATION with a longer history. The default action is to port it back to canonical RPython shape in the same session. Only defer when there is a specific, cited, still-real blocker (a dependency not yet ported, a layout change that cascades across more files than the session can safely touch, a benchmark regression whose root cause is another unported optimization). "It works today" is never a sufficient reason to leave a PRE-EXISTING-ADAPTATION in place. If this feels aggressive, remember that adaptations accumulate silently: every PRE-EXISTING-ADAPTATION left untouched adds a permanent divergence surface that future ports must work around. Paying the conversion cost now, in the smallest feasible slice, is how the codebase actually converges on RPython.
 
@@ -36,7 +38,17 @@ Separate the invocation into:
 - The `/parity` flag itself (already consumed).
 - The **follow-up task** — everything the user wrote after `/parity`. This is the actual work to be done.
 
-If there is no follow-up task (just bare `/parity`), default to "run a full parity audit of the current diff, fix trivial deviations in-session, and report findings". A deviation is **trivial** when it fits in one session and does not change observable semantics — typical examples: adding an inline comment that cites the RPython file:line behind a PRE-EXISTING-ADAPTATION, renaming a local to match upstream identifier, re-ordering a match arm to mirror upstream's if/elif chain. Anything that touches cross-crate API shape, regenerates lockfiles, moves files between modules, or requires porting a missing dependency is **not** trivial — surface it as a finding and wait for user direction.
+If there is no follow-up task (just bare `/parity`), default to "run a full parity audit of the current diff, **auto-fix every parity regression** (NEW-DEVIATION introduced by the diff relative to the audit base), and report what was changed". This applies whenever the user has not explicitly opted out in the invocation (`/parity only audit`, `/parity report and stop`, `/parity skip <file>`). No per-finding confirmation is required — the invocation itself is the authorization. Pre-existing NEW-DEVIATIONs (visible because they live in a touched file but absent from the diff itself) are listed in the audit for awareness only — see Principle 6.
+
+The only NEW-DEVIATIONs that get surfaced-and-deferred instead of fixed are those that exceed safe session scope:
+
+- changes that touch cross-crate API shape;
+- changes that regenerate lockfiles or move files between modules;
+- fixes that require porting a missing upstream dependency whose own port would cascade beyond a single session (port the dependency first per Principle 5; if that's not possible in scope, surface).
+
+Self-contained fixes below that bar — renaming a local to match upstream, reordering arms to mirror upstream control flow, replacing a side-table with the upstream field, extracting a helper that already exists upstream, deleting an undocumented cache — are auto-fixed by default whether or not they are "trivial" in the strict semantic-preserving sense. Parity-correct code that changes observable behavior in the direction of upstream is still an auto-fix; the regression is the *deviation*, not the change that removes it.
+
+When the follow-up task is present, the same default applies to regressions found in audit: they are fixed in-session (in priority order per Principle 6), then the follow-up task runs.
 
 ### Step 2: Parity audit
 
@@ -56,7 +68,7 @@ Report findings as a short **Parity audit** section before executing the follow-
 - For each hunk that contains a candidate NEW-DEVIATION: cite the file:line in the diff, cite the RPython file:line it should have mirrored, quote the deviation concisely.
 - Files modified where the mechanical rule does not produce a valid counterpart — treat these as structural deviations in themselves and flag to the user.
 
-If the audit turns up NEW-DEVIATIONs that touch the follow-up task's scope, surface them before continuing.
+If the audit turns up **regressions** (NEW-DEVIATIONs introduced by the diff vs the audit base), list them in the report and fix them in Step 3 (regressions first, then the follow-up task, per Principle 6). Surface-and-defer only the regressions that fall under Step 1's session-scope opt-out list; the rest are fixed without asking. Pre-existing NEW-DEVIATIONs seen in modified files (already present at the audit base) are listed for awareness but **not** auto-fixed — that's a separate scope decision for the user.
 
 ### Step 3: Execute the follow-up task under parity
 
@@ -199,6 +211,7 @@ When the skill is active and a response is being written:
    - 3–10 lines max.
    - List each modified file with its mechanically-derived counterpart (or a "❌ mechanical transform failed: <reason>" note).
    - Cite each candidate NEW-DEVIATION as `<majit path>:<line> ↔ <rpython path>:<line> — <deviation summary>`.
+   - Mark each finding with its disposition: `[auto-fix]` for regressions being fixed in this response (the default for regressions), `[deferred: <reason>]` for regressions that exceed session scope per Step 1's opt-out list, `[pre-existing]` for NEW-DEVIATIONs already present at the audit base (flagged for user awareness only, not auto-fixed).
    - If there is nothing to report, still include the section with `Clean — no new deviations in current diff`.
 
 2. **Follow-up task** (the bulk of the response):

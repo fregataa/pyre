@@ -21,6 +21,8 @@ Otherwise, please fill out this section.
 
 Note: Do not run the review in the same session that generated the code.
 
+If you are using Claude, a quick local review is `/parity to upstream/main`.
+
 The currently recommended prompt for gpt-5.5 is:
 
 ----
