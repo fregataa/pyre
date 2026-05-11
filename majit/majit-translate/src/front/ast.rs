@@ -801,24 +801,34 @@ fn synthesize_elidable_promote_pair(
             ix.clone()
         }
     };
+    // jit.py:191-194 — `for arg in args: hint(arg, ...)`; `args` includes
+    // `self` since `_get_args(func)` reads `co_varnames` raw.  Rust forbids
+    // re-binding the `self` keyword, so the receiver is routed through a
+    // fresh `__self_promoted` local; non-receiver args keep RPython's
+    // shadow pattern (`let arg = hint_promote(arg);`).
+    let promote_self = promote_indices.iter().any(|&i| arg_names[i] == "self");
     let promote_stmts: Vec<syn::Stmt> = promote_indices
         .iter()
-        .map(|&i| arg_names[i].clone())
-        // jit.py:193 — `self`-promotion in pyre's syn tree would require
-        // a non-trivial rebinding (`let self = ...`), which Rust does not
-        // accept.  Skip self for now — RPython's `hint(self, ...)`
-        // returns the same object identity, and the elidable-original
-        // call below still threads `self` through unchanged.  Re-binding
-        // self via `let _self_promoted = hint_promote(self); ...` is a
-        // follow-up if a benchmark needs receiver promotion.
-        .filter(|id| *id != "self")
-        .map(|id| -> syn::Stmt { syn::parse_quote!(let #id = hint_promote(#id);) })
+        .map(|&i| {
+            let id = &arg_names[i];
+            if id == "self" {
+                syn::parse_quote!(let __self_promoted = hint_promote(self);)
+            } else {
+                syn::parse_quote!(let #id = hint_promote(#id);)
+            }
+        })
         .collect();
 
-    // jit.py:195 — return _orig_func_unlikely_name(args).
+    // jit.py:195 — return _orig_func_unlikely_name(args).  When `self` was
+    // promoted above, the tail call uses the promoted local; otherwise it
+    // threads the unmodified receiver through.
     let call_args = arg_names.iter().map(|id| -> syn::Expr {
         if id == "self" {
-            syn::parse_quote!(self)
+            if promote_self {
+                syn::parse_quote!(__self_promoted)
+            } else {
+                syn::parse_quote!(self)
+            }
         } else {
             syn::parse_quote!(#id)
         }
@@ -10068,6 +10078,46 @@ mod tests {
                     if target.path_segments().and_then(|s| s.last().copied()) == Some("_orig_foo_unlikely_name")
             )),
             "wrapper must tail-call _orig_foo_unlikely_name; ops:\n{ops:#?}"
+        );
+    }
+
+    /// `rlib/jit.py:186, 191` — `_get_args(func)` reads `co_varnames`
+    /// raw, so `self` is at index 0 and `promote_args='all'` covers it.
+    /// Pyre can't shadow `self` with `let self = ...`, so the
+    /// synthesizer routes the receiver through a fresh
+    /// `__self_promoted` local and rewrites the tail call accordingly.
+    /// The wrapper graph must emit one `hint_promote` per argument
+    /// including the receiver.
+    #[test]
+    fn elidable_promote_promotes_self_receiver_for_inherent_method() {
+        let parsed = crate::parse::parse_source(
+            r#"
+            struct S { x: i64 }
+            impl S {
+                #[elidable_promote(promote_args = "all")]
+                pub fn double(&self, n: i64) -> i64 { n + n }
+            }
+        "#,
+        );
+        let program = build_semantic_program(&parsed).expect("source must lower");
+        let wrapper = program
+            .functions
+            .iter()
+            .find(|sf| sf.name == "double")
+            .expect("wrapper graph");
+        let ops = &wrapper.graph.block(wrapper.graph.startblock).operations;
+        let hint_count = ops
+            .iter()
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target, .. } if target.path_segments().and_then(|s| s.last().copied()) == Some("hint_promote")
+                )
+            })
+            .count();
+        assert_eq!(
+            hint_count, 2,
+            "wrapper must emit hint_promote for self and n (2 total); ops:\n{ops:#?}"
         );
     }
 }
