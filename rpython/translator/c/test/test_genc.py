@@ -660,6 +660,10 @@ def test_computed_goto_large_switch():
     assert 'goto *' in c_src, "expected indirect goto in C source"
     # Spot-check: the table must be a static const array of void pointers.
     assert 'static const void * const _cgoto_' in c_src
+    # GCC 10 rejects a declaration directly after a label; verify the null
+    # statement that separates the block label from the table declaration.
+    import re
+    assert re.search(r';\s*\n\s*static const void \* const _cgoto_', c_src)
 
 def test_computed_goto_correctness():
     # Verify that computed goto dispatch produces correct results.

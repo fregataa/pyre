@@ -384,6 +384,7 @@ class FunctionCodeGenerator(object):
             default_label = None
 
         yield '#ifdef __GNUC__'
+        yield ';'  # null stmt: block label may immediately precede this declaration
 
         # Emit the static dispatch table.
         table_name = '_cgoto_%d' % myblocknum
