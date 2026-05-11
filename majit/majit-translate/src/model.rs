@@ -383,33 +383,34 @@ pub enum OpKind {
     ///     single bytecode wire `str_guard_value/rid>r`
     ///     (`majit-metainterp::blackhole.rs:8048`); the discriminant
     ///     between str / unicode lives only in the calldescr's
-    ///     oopspec.
+    ///     oopspec.  The op shape is 3-input/1-output (`rid>r`): ref
+    ///     arg + helper fnptr constant + calldescr → result.
     ///
-    /// Pyre uses `kind_char ∈ {'i', 'r', 'f', 's', 'u'}` to capture the
-    /// emit-time discriminant.  `'s'` and `'u'` are both routed onto
-    /// the single `str_guard_value` opname by
-    /// `assembler.rs::opname_for_kind`; the in-IR `'u'` only exists so
-    /// the rewrite arm that emitted it can later attach the right
-    /// oopspec (`OS_UNIEQ_NONNULL` vs `OS_STREQ_NONNULL`).
-    ///
-    /// The upstream `str_guard_value` operand shape is `[ref_arg,
-    /// const_helper_fnptr_int, calldescr] -> ref_result` (3-input,
-    /// argcode `rid>r`).  The current `GuardValue` variant only carries
-    /// `value` + `kind_char`; the helper-fnptr / calldescr extras are
-    /// not yet threaded through the IR, so a real promote_string trace
-    /// would not match the BH wire today.
+    /// Pyre currently only carries the 1-input i/r/f arms.  `kind_char
+    /// ∈ {'i', 'r', 'f'}` is the only set the rewrite arm in
+    /// `jit_codewriter/jtransform.rs::rewrite_op_hint` can produce; the
+    /// `PromoteString` / `PromoteUnicode` arms panic with a TODO citation
+    /// because the 3-input `str_guard_value` shape needs IR extras that
+    /// `GuardValue` does not yet carry and `_register_extra_helper`
+    /// (jit.py:2010-2029) is not ported.  Consequently the assembler's
+    /// `opname_for_kind` only ever sees `'i'`/`'r'`/`'f'` and any other
+    /// char would indicate an upstream rewrite-arm bug.
     ///
     /// TODO: extend `GuardValue` with optional `helper_func_addr: u64`
-    /// + `descr: DescrRef` fields (None for `'i'`/`'r'`/`'f'`, Some for
-    /// `'s'`/`'u'`) and have the assembler emit the 3-input `rid>r`
-    /// argcode when present.  Port `jit_codewriter/jtransform.py:2010-
-    /// 2029 _register_extra_helper` alongside so the oopspec lookup
-    /// resolves at rewrite time.
+    /// + `descr: DescrRef` fields and have the assembler emit the 3-input
+    /// `rid>r` argcode when present.  Port `jit_codewriter/jtransform.py:
+    /// 2010-2029 _register_extra_helper` alongside so the oopspec lookup
+    /// resolves at rewrite time, and then drop the panic in the
+    /// `PromoteString` / `PromoteUnicode` arms so the `'s'` / `'u'`
+    /// variants become reachable.
     GuardValue {
         value: ValueId,
-        /// `'i'` int, `'r'` ref, `'f'` float, `'s'` str, `'u'`
-        /// unicode — matching the `<kind>_guard_value` family naming
-        /// at `jit_codewriter/jtransform.py:611,631,648`.
+        /// `'i'` int, `'r'` ref, `'f'` float — matching the
+        /// `<kind>_guard_value` family naming at
+        /// `jit_codewriter/jtransform.py:611`.  `'s'` / `'u'`
+        /// (`str_guard_value` for `promote_string` / `promote_unicode`)
+        /// are reserved for the future helper+descr extension; the
+        /// rewrite arms panic before producing those values today.
         kind_char: char,
     },
     /// Project a callee function pointer out of a `dyn Trait` receiver's
