@@ -291,6 +291,25 @@ pub fn all_foreign_pytypes() -> &'static [(&'static PyType, &'static PyType)] {
         (&crate::setobject::SET_TYPE, &INSTANCE_TYPE),
         (&crate::setobject::FROZENSET_TYPE, &INSTANCE_TYPE),
         (&crate::memberobject::MEMBER_TYPE, &INSTANCE_TYPE),
+        // `pypy/objspace/std/dictmultiobject.py:449/459/469` —
+        // dict_keys / dict_values / dict_items.  The three Python
+        // visible types share the `W_DictView` payload but each
+        // gets a distinct W_TypeObject so `type(d.keys()) is
+        // dict_keys` parity holds.
+        (&crate::dictviewobject::DICT_KEYS_TYPE, &INSTANCE_TYPE),
+        (&crate::dictviewobject::DICT_VALUES_TYPE, &INSTANCE_TYPE),
+        (&crate::dictviewobject::DICT_ITEMS_TYPE, &INSTANCE_TYPE),
+        // `pypy/interpreter/typedef.py:444 GetSetProperty.typedef`.
+        // Registered in the foreign-pytype loop so the `instantiate`
+        // back-pointer is set before the first W_GetSetProperty
+        // allocation runs (typedef.rs::getset_descriptor_type forces
+        // it for the W_TypeObject side, but the static PyType also
+        // needs the foreign-loop entry to seed pytype_to_tid for the
+        // GC vtable lookup).
+        (
+            &crate::getsetproperty::GETSET_DESCRIPTOR_TYPE,
+            &INSTANCE_TYPE,
+        ),
     ];
     PYTYPES
 }

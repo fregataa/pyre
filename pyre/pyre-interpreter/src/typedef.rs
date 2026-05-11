@@ -176,12 +176,19 @@ pub fn r#type(obj: PyObjectRef) -> Option<PyObjectRef> {
     unsafe {
         // Exception instances share a single W_ExceptionObject layout
         // but carry an `ExcKind` tag that names the real Python class.
-        // Resolve that tag to the class registered by
-        // `install_default_builtins`'s `make_exc_type` so
-        // `type(TypeError)`, `isinstance(exc, TypeError)` and the
-        // `with assertRaises(TypeError): ...` context manager all see
-        // the correct class instead of the shared "exception" stub.
+        // `__new__` paths (exc_new_wrapper) overwrite `w_class` with the
+        // exact class that was called — including user subclasses such as
+        // `class MyErr(Exception): pass`. Trust `w_class` whenever it has
+        // been specialised away from the generic `EXCEPTION_TYPE` stub
+        // installed by `w_exception_new`; fall back to the kind-tag
+        // registry only for internal raise paths (`PyError::value_error`
+        // etc.) that bypass `__new__`.
         if pyre_object::is_exception(obj) {
+            let w_class = (*obj).w_class;
+            let exc_stub = pyre_object::get_instantiate(&pyre_object::excobject::EXCEPTION_TYPE);
+            if !w_class.is_null() && !std::ptr::eq(w_class, exc_stub) {
+                return Some(w_class);
+            }
             let kind = pyre_object::w_exception_get_kind(obj);
             let name = pyre_object::excobject::exc_kind_name(kind);
             if let Some(cls) = crate::builtins::lookup_exc_class(name) {
@@ -294,6 +301,41 @@ pub fn init_typeobjects() {
         reg.insert(
             &pyre_object::MAPPING_PROXY_TYPE as *const PyType as usize,
             new_typeobject_with_base("mappingproxy", init_mappingproxy_type, object_type) as usize,
+        );
+        // `pypy/objspace/std/dictmultiobject.py:449/459/469` —
+        // dict_keys / dict_values / dict_items.  PyPy registers
+        // each as a distinct TypeDef but they share the
+        // _iter_keys/_iter_values/_iter_items dispatch.  Pyre's
+        // baseobjspace iter/len/contains arms cover the runtime
+        // semantics, so the per-typedef init body stays empty for
+        // now — what matters is that `type(d.keys())` resolves to
+        // the right W_TypeObject (otherwise `builtin_type` falls
+        // back to a str return).  Mark these non-base-acceptable to
+        // mirror PyPy's `acceptable_as_base_class = False`.
+        // dict_keys / dict_items get the SetLikeDictView surface
+        // per dictmultiobject.py:1802-1829 / 1773-1800; dict_values
+        // stops at the common slots per dictmultiobject.py:1831-1840
+        // (values views are intentionally NOT set-like).
+        let dict_keys_type =
+            new_typeobject_with_base("dict_keys", init_dict_view_set_like_type, object_type);
+        unsafe { pyre_object::w_type_set_acceptable_as_base_class(dict_keys_type, false) };
+        reg.insert(
+            &pyre_object::dictviewobject::DICT_KEYS_TYPE as *const PyType as usize,
+            dict_keys_type as usize,
+        );
+        let dict_values_type =
+            new_typeobject_with_base("dict_values", init_dict_view_values_type, object_type);
+        unsafe { pyre_object::w_type_set_acceptable_as_base_class(dict_values_type, false) };
+        reg.insert(
+            &pyre_object::dictviewobject::DICT_VALUES_TYPE as *const PyType as usize,
+            dict_values_type as usize,
+        );
+        let dict_items_type =
+            new_typeobject_with_base("dict_items", init_dict_view_set_like_type, object_type);
+        unsafe { pyre_object::w_type_set_acceptable_as_base_class(dict_items_type, false) };
+        reg.insert(
+            &pyre_object::dictviewobject::DICT_ITEMS_TYPE as *const PyType as usize,
+            dict_items_type as usize,
         );
 
         // function — PyPy: funcobject.py
@@ -458,6 +500,71 @@ pub fn init_typeobjects() {
             ) as usize,
         );
 
+        // Foreign PyType statics that have no per-type init function but
+        // still need a W_TypeObject so `gettypefor(&XXX_TYPE)` returns
+        // it — used by `type(g).__name__`,
+        // `isinstance(x, type(x))`, and the descriptor protocol's
+        // `space.type(w_obj)` invariants.  Without a registered
+        // W_TypeObject the 1-arg `type(obj)` fallback at
+        // `builtins.rs:1003` would return the type's *name* as a
+        // `str`, breaking every downstream identity check.
+        //
+        // Empty init body matches PyPy typedefs that expose only
+        // protocol slots filled in by the runtime (e.g. generator's
+        // `send`/`throw`/`close` in `pypy/interpreter/generator.py`):
+        // pyre carries those slots elsewhere in the dispatch path so
+        // the typedef itself stays empty.
+        reg.insert(
+            &pyre_object::superobject::SUPER_TYPE as *const PyType as usize,
+            new_typeobject_with_base("super", |_| {}, object_type) as usize,
+        );
+        reg.insert(
+            &pyre_object::generatorobject::GENERATOR_TYPE as *const PyType as usize,
+            new_typeobject_with_base("generator", |_| {}, object_type) as usize,
+        );
+        reg.insert(
+            &pyre_object::rangeobject::RANGE_ITER_TYPE as *const PyType as usize,
+            new_typeobject_with_base("range_iterator", |_| {}, object_type) as usize,
+        );
+        reg.insert(
+            &pyre_object::rangeobject::SEQ_ITER_TYPE as *const PyType as usize,
+            new_typeobject_with_base("iterator", |_| {}, object_type) as usize,
+        );
+        reg.insert(
+            &pyre_object::cellobject::CELL_TYPE as *const PyType as usize,
+            new_typeobject_with_base("cell", |_| {}, object_type) as usize,
+        );
+        reg.insert(
+            &pyre_object::itertoolsmodule::COUNT_TYPE as *const PyType as usize,
+            new_typeobject_with_base("itertools.count", |_| {}, object_type) as usize,
+        );
+        reg.insert(
+            &pyre_object::itertoolsmodule::REPEAT_TYPE as *const PyType as usize,
+            new_typeobject_with_base("itertools.repeat", |_| {}, object_type) as usize,
+        );
+        // `pypy/objspace/std/specialisedtupleobject.py` — three SpecialisedTuple
+        // variants share the public `tuple` PyType name, so all three
+        // foreign statics map to a "tuple" typedef.  `gettypefor` keys
+        // by static address (each variant has its own
+        // `&SPECIALISED_TUPLE_..._TYPE`), so a separate
+        // W_TypeObject per variant is required — they just present
+        // the same `__name__` to user code (PyPy parity).
+        reg.insert(
+            &pyre_object::specialisedtupleobject::SPECIALISED_TUPLE_II_TYPE as *const PyType
+                as usize,
+            new_typeobject_with_base("tuple", |_| {}, object_type) as usize,
+        );
+        reg.insert(
+            &pyre_object::specialisedtupleobject::SPECIALISED_TUPLE_FF_TYPE as *const PyType
+                as usize,
+            new_typeobject_with_base("tuple", |_| {}, object_type) as usize,
+        );
+        reg.insert(
+            &pyre_object::specialisedtupleobject::SPECIALISED_TUPLE_OO_TYPE as *const PyType
+                as usize,
+            new_typeobject_with_base("tuple", |_| {}, object_type) as usize,
+        );
+
         // rclass.py:739-743 parity — cache W_TypeObject on each PyType
         // so allocators can set w_class at allocation time (like RPython's
         // `self.setfield(vptr, '__class__', ctypeptr, llops)` in new_instance).
@@ -505,6 +612,58 @@ pub fn init_typeobjects() {
     });
 
     patch_builtin_function_descriptors();
+    patch_getset_descriptor_metadata();
+    patch_typeobject_descriptor_names();
+}
+
+/// `typedef.py:58 add_entries` parity — walk every registered
+/// W_TypeObject's namespace and stamp each `W_GetSetProperty`'s
+/// `name` slot with the dict-key it lives under, when the slot
+/// still holds the `<generic property>` sentinel.  PyPy's
+/// `add_entries` runs at TypeDef construction time and writes
+/// `getset.name = key` so descriptor introspection
+/// (`type.__dict__['<key>'].__name__`) returns the same string the
+/// dict was keyed by.  Pyre's `init_<type>_type` helpers store
+/// descriptors via `make_getset_descriptor` (no name), so without
+/// this pass every descriptor's `__name__` would surface as the
+/// sentinel.  Explicit names passed via `make_*_named` survive
+/// (the sentinel-only check skips them).
+fn patch_typeobject_descriptor_names() {
+    let Some(reg) = TYPEOBJECT_CACHE.get() else {
+        return;
+    };
+    for (_pytype_addr, &w_typeobject_addr) in reg {
+        let tp = w_typeobject_addr as PyObjectRef;
+        if tp.is_null() {
+            continue;
+        }
+        let dict_ptr = unsafe { pyre_object::w_type_get_dict_ptr(tp) } as *mut DictStorage;
+        if dict_ptr.is_null() {
+            continue;
+        }
+        let ns = unsafe { &*dict_ptr };
+        let entries: Vec<(String, PyObjectRef)> = ns
+            .keys()
+            .filter_map(|k| ns.get(k).map(|&v| (k.clone(), v)))
+            .collect();
+        for (key, value) in entries {
+            if value.is_null() {
+                continue;
+            }
+            if !unsafe { pyre_object::getsetproperty::is_getset_property(value) } {
+                continue;
+            }
+            let cur = unsafe { pyre_object::getsetproperty::w_getset_get_name(value) };
+            let is_sentinel = cur.is_null()
+                || (unsafe { pyre_object::is_str(cur) }
+                    && unsafe { pyre_object::w_str_get_value(cur) } == "<generic property>");
+            if !is_sentinel {
+                continue;
+            }
+            let new_name = pyre_object::w_str_new(&key);
+            unsafe { pyre_object::getsetproperty::w_getset_set_name(value, new_name) };
+        }
+    }
 }
 
 /// The global `object` type object, accessible from builtins.
@@ -651,6 +810,21 @@ pub fn make_builtin_type_with_base(
     base: PyObjectRef,
 ) -> PyObjectRef {
     new_typeobject_with_base(name, init, base)
+}
+
+/// Create a named builtin type whose instances live behind a custom
+/// `layout_pytype` (the `*const PyType` stored in `ob_header.ob_type`
+/// for new instances).  Used for W_Root subclasses that allocate
+/// their own typed payload (e.g. `W_GetSetProperty`) rather than
+/// piggy-backing on `INSTANCE_TYPE`.  Mirrors `typeobject.py:1273-1280
+/// setup_builtin_type`'s explicit-layout branch.
+pub fn make_builtin_type_with_layout(
+    name: &str,
+    init: impl FnOnce(&mut DictStorage),
+    base: PyObjectRef,
+    layout_pytype: *const PyType,
+) -> PyObjectRef {
+    new_typeobject_with_base_and_layout(name, init, base, layout_pytype)
 }
 
 /// Generate a `__new__` wrapper that skips `cls` (first arg) and delegates
@@ -1193,6 +1367,51 @@ fn init_str_type(ns: &mut DictStorage) {
         ns,
         "split",
         make_builtin_function("split", crate::type_methods::str_method_split),
+    );
+    dict_storage_store(
+        ns,
+        "rsplit",
+        make_builtin_function("rsplit", crate::type_methods::str_method_rsplit),
+    );
+    dict_storage_store(
+        ns,
+        "splitlines",
+        make_builtin_function("splitlines", crate::type_methods::str_method_splitlines),
+    );
+    dict_storage_store(
+        ns,
+        "partition",
+        make_builtin_function("partition", crate::type_methods::str_method_partition),
+    );
+    dict_storage_store(
+        ns,
+        "rpartition",
+        make_builtin_function("rpartition", crate::type_methods::str_method_rpartition),
+    );
+    dict_storage_store(
+        ns,
+        "zfill",
+        make_builtin_function("zfill", crate::type_methods::str_method_zfill),
+    );
+    dict_storage_store(
+        ns,
+        "casefold",
+        make_builtin_function("casefold", crate::type_methods::str_method_casefold),
+    );
+    dict_storage_store(
+        ns,
+        "swapcase",
+        make_builtin_function("swapcase", crate::type_methods::str_method_swapcase),
+    );
+    dict_storage_store(
+        ns,
+        "expandtabs",
+        make_builtin_function("expandtabs", crate::type_methods::str_method_expandtabs),
+    );
+    dict_storage_store(
+        ns,
+        "format_map",
+        make_builtin_function("format_map", crate::type_methods::str_method_format_map),
     );
     dict_storage_store(
         ns,
@@ -1821,6 +2040,13 @@ fn init_dict_type(ns: &mut DictStorage) {
         make_builtin_function_with_arity(
             "__or__",
             |args| {
+                // `pypy/objspace/std/dictmultiobject.py:288 descr_or`:
+                //   def descr_or(self, space, w_other):
+                //       if not space.isinstance_w(w_other, space.w_dict):
+                //           return space.w_NotImplemented
+                //       new = self.descr_copy(space)
+                //       new.descr_update(space, w_other)
+                //       return new
                 if args.len() < 2 {
                     return Ok(args[0]);
                 }
@@ -1829,22 +2055,20 @@ fn init_dict_type(ns: &mut DictStorage) {
                 if other.is_null() {
                     return Ok(pyre_object::w_not_implemented());
                 }
+                // `descr_copy` then `descr_update`: copy LHS, overlay
+                // RHS — both reads go through `w_dict_items` so a
+                // dict backed by a `dict_storage_proxy` (globals() /
+                // module.__dict__) contributes its storage-only
+                // entries too, matching PyPy's storage-strategy
+                // delitem/iter parity.
                 let dst = pyre_object::w_dict_new();
                 if !src.is_null() {
-                    unsafe {
-                        let d = &*(src as *const pyre_object::dictobject::W_DictObject);
-                        for &(k, v) in &*d.entries {
-                            pyre_object::w_dict_store(dst, k, v);
-                        }
+                    for (k, v) in unsafe { pyre_object::w_dict_items(src) } {
+                        unsafe { pyre_object::w_dict_store(dst, k, v) };
                     }
                 }
-                {
-                    unsafe {
-                        let d = &*(other as *const pyre_object::dictobject::W_DictObject);
-                        for &(k, v) in &*d.entries {
-                            pyre_object::w_dict_store(dst, k, v);
-                        }
-                    }
+                for (k, v) in unsafe { pyre_object::w_dict_items(other) } {
+                    unsafe { pyre_object::w_dict_store(dst, k, v) };
                 }
                 Ok(dst)
             },
@@ -1915,6 +2139,485 @@ fn init_dict_type(ns: &mut DictStorage) {
 // methods forward to `self.w_mapping` (the wrapped W_DictObject);
 // pyre routes through `resolve_dict_backing`, which now unwraps the
 // proxy to its inner dict so the dict-method bodies stay shared.
+
+/// `pypy/objspace/std/dictmultiobject.py:449/459/469` —
+/// `W_DictMultiViewKeysObject` / `W_DictMultiViewValuesObject` /
+/// `W_DictMultiViewItemsObject` typedef bodies.  Pyre dispatches the
+/// runtime methods (`__iter__` / `__len__` / `__contains__` /
+/// `__repr__`) directly through baseobjspace + display arms keyed on
+/// the view's PyType, so dispatch works without typedef registration.
+/// Common slots shared across all three dict_view typedefs per
+/// `dictmultiobject.py:1773-1788 / 1802-1813 / 1831-1840`:
+/// `__iter__`, `__len__`, `__reversed__`, `__repr__`, `mapping`.
+/// `dict_values` stops here; `dict_keys` / `dict_items` extend with
+/// the SetLikeDictView surface in
+/// `init_dict_view_set_like_type` below.
+fn init_dict_view_common_slots(ns: &mut DictStorage) {
+    dict_storage_store(
+        ns,
+        "__iter__",
+        make_builtin_function_with_arity("__iter__", |args| crate::baseobjspace::iter(args[0]), 1),
+    );
+    dict_storage_store(
+        ns,
+        "__len__",
+        make_builtin_function_with_arity("__len__", |args| crate::baseobjspace::len(args[0]), 1),
+    );
+    dict_storage_store(
+        ns,
+        "__reversed__",
+        make_builtin_function_with_arity(
+            "__reversed__",
+            |args| {
+                let view = args[0];
+                let mut snapshot = crate::type_methods::dict_view_snapshot(view);
+                snapshot.reverse();
+                let n = snapshot.len();
+                let list = pyre_object::w_list_new(snapshot);
+                Ok(pyre_object::w_seq_iter_new(list, n))
+            },
+            1,
+        ),
+    );
+    dict_storage_store(
+        ns,
+        "__repr__",
+        make_builtin_function_with_arity(
+            "__repr__",
+            |args| {
+                if args.is_empty() {
+                    return Ok(pyre_object::w_str_new(""));
+                }
+                Ok(pyre_object::w_str_new(&unsafe {
+                    crate::display::py_repr(args[0])
+                }))
+            },
+            1,
+        ),
+    );
+    dict_storage_store(
+        ns,
+        "mapping",
+        make_getset_descriptor(make_builtin_function_with_arity(
+            "mapping",
+            |args| {
+                let view = args[1];
+                if view.is_null() {
+                    return Ok(pyre_object::w_none());
+                }
+                let dict = unsafe { pyre_object::dictviewobject::w_dict_view_get_dict(view) };
+                if dict.is_null() {
+                    return Ok(pyre_object::w_dict_proxy_new(pyre_object::w_dict_new()));
+                }
+                Ok(pyre_object::w_dict_proxy_new(dict))
+            },
+            2,
+        )),
+    );
+}
+
+/// `dictmultiobject.py:1802-1829` / `:1773-1800 W_DictView{Keys,Items}`
+/// typedef body — common slots plus `__contains__` and the
+/// SetLikeDictView surface (comparisons, set ops, isdisjoint).
+fn init_dict_view_set_like_type(ns: &mut DictStorage) {
+    init_dict_view_common_slots(ns);
+    dict_storage_store(
+        ns,
+        "__contains__",
+        make_builtin_function_with_arity(
+            "__contains__",
+            |args| {
+                if args.len() < 2 {
+                    return Ok(pyre_object::w_bool_from(false));
+                }
+                Ok(pyre_object::w_bool_from(crate::baseobjspace::contains(
+                    args[0], args[1],
+                )?))
+            },
+            2,
+        ),
+    );
+    register_dict_view_set_operators(ns);
+}
+
+/// `dictmultiobject.py:1831-1840 W_DictViewValuesObject.typedef` —
+/// common slots only.  Values views are NOT set-like in PyPy
+/// (`dictmultiobject.py:1619-1623 _is_set_like` excludes them) and
+/// have no `__contains__` / set ops / comparisons of their own;
+/// equality falls through to `object.__eq__`'s identity check.
+fn init_dict_view_values_type(ns: &mut DictStorage) {
+    init_dict_view_common_slots(ns);
+}
+
+/// `pypy/objspace/std/dictmultiobject.py:1605-1623`
+/// `_all_contained_in` + `_is_set_like` — shared helpers for
+/// `SetLikeDictView`'s comparison + set-op dispatch.  Pyre folds
+/// the three view types into one `W_DictView`, so kind-aware
+/// branching happens here.
+fn dict_view_is_set_like(obj: pyre_object::PyObjectRef) -> bool {
+    if obj.is_null() {
+        return false;
+    }
+    unsafe {
+        if pyre_object::is_set(obj) || pyre_object::is_frozenset(obj) {
+            return true;
+        }
+        if pyre_object::dictviewobject::is_dict_view(obj) {
+            let kind = pyre_object::dictviewobject::w_dict_view_get_kind(obj);
+            return matches!(
+                kind,
+                pyre_object::dictviewobject::DictViewKind::Keys
+                    | pyre_object::dictviewobject::DictViewKind::Items
+            );
+        }
+        false
+    }
+}
+
+fn dict_view_all_contained_in(
+    view: pyre_object::PyObjectRef,
+    other: pyre_object::PyObjectRef,
+) -> Result<bool, crate::PyError> {
+    let snapshot = crate::type_methods::dict_view_snapshot(view);
+    for item in snapshot {
+        if !crate::baseobjspace::contains(other, item)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+#[derive(Clone, Copy)]
+enum DictViewCmp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+fn dict_view_compare(
+    self_view: pyre_object::PyObjectRef,
+    other: pyre_object::PyObjectRef,
+    op: DictViewCmp,
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    if !dict_view_is_set_like(other) {
+        // PyPy returns NotImplemented; pyre's compare path turns
+        // that into the python `NotImplemented` singleton through
+        // the bytecode dispatch, so emit it directly here.
+        return Ok(pyre_object::w_not_implemented());
+    }
+    let self_len = unsafe { crate::baseobjspace::len(self_view)? };
+    let other_len = unsafe { crate::baseobjspace::len(other)? };
+    let self_n = unsafe { pyre_object::w_int_get_value(self_len) };
+    let other_n = unsafe { pyre_object::w_int_get_value(other_len) };
+    let result = match op {
+        // dictmultiobject.py:1628-1635 descr_eq
+        DictViewCmp::Eq => self_n == other_n && dict_view_all_contained_in(self_view, other)?,
+        DictViewCmp::Ne => !(self_n == other_n && dict_view_all_contained_in(self_view, other)?),
+        // dictmultiobject.py:1637-1642 descr_lt
+        DictViewCmp::Lt => self_n < other_n && dict_view_all_contained_in(self_view, other)?,
+        DictViewCmp::Le => self_n <= other_n && dict_view_all_contained_in(self_view, other)?,
+        // dictmultiobject.py:1651-1656 descr_gt — flips direction.
+        DictViewCmp::Gt => self_n > other_n && dict_view_all_contained_in(other, self_view)?,
+        DictViewCmp::Ge => self_n >= other_n && dict_view_all_contained_in(other, self_view)?,
+    };
+    Ok(pyre_object::w_bool_from(result))
+}
+
+/// `dictmultiobject.py:1665-1690 descr_isdisjoint` — iterate other,
+/// reject as soon as any item is in self.  Pyre's snapshot-based
+/// `contains` over the view materialises the (k, v) tuple wrapping
+/// for items views, matching the PyPy semantics.
+fn dict_view_isdisjoint(
+    self_view: pyre_object::PyObjectRef,
+    other: pyre_object::PyObjectRef,
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    if std::ptr::eq(self_view, other) {
+        let n = unsafe { crate::baseobjspace::len(self_view)? };
+        return Ok(pyre_object::w_bool_from(
+            unsafe { pyre_object::w_int_get_value(n) } == 0,
+        ));
+    }
+    let other_items = crate::builtins::collect_iterable(other)?;
+    for item in other_items {
+        if crate::baseobjspace::contains(self_view, item)? {
+            return Ok(pyre_object::w_bool_from(false));
+        }
+    }
+    Ok(pyre_object::w_bool_from(true))
+}
+
+/// `dictmultiobject.py:1692-1708 _as_set_op` — produce a fresh set
+/// holding the result of the named set operation between
+/// `self_view` and `other`.  PyPy delegates to set's `_update`
+/// methods for efficiency; pyre computes the result inline because
+/// pyre's set typedef does not expose the in-place mutators yet.
+/// Both shapes (forward and reflected) are reachable from the same
+/// helper because set ops on the supported subset (-, &, |, ^) are
+/// commutative under "build set(LHS) and combine with RHS"
+/// semantics — the reverse caller just swaps the operand order.
+#[derive(Clone, Copy)]
+enum DictViewSetOp {
+    Sub,
+    And,
+    Or,
+    Xor,
+}
+
+fn dict_view_set_op_compute(
+    self_view: pyre_object::PyObjectRef,
+    other: pyre_object::PyObjectRef,
+    op: DictViewSetOp,
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    let self_items = crate::type_methods::dict_view_snapshot(self_view);
+    let other_items = crate::builtins::collect_iterable(other)?;
+    // Materialise `other` as a set for O(1) `contains` lookups.  `set`
+    // requires hashable elements; PyPy raises TypeError naturally
+    // through the underlying set constructor, which is what `_as_set_op`
+    // surfaces too.
+    let other_set = pyre_object::w_set_from_items(&other_items);
+    let result_items: Vec<pyre_object::PyObjectRef> = match op {
+        // dictmultiobject.py:1705 sub → difference_update on set(self)
+        DictViewSetOp::Sub => self_items
+            .into_iter()
+            .filter(|&item| !unsafe { pyre_object::w_set_contains(other_set, item) })
+            .collect(),
+        // dictmultiobject.py:1706 and → intersection_update
+        DictViewSetOp::And => self_items
+            .into_iter()
+            .filter(|&item| unsafe { pyre_object::w_set_contains(other_set, item) })
+            .collect(),
+        // dictmultiobject.py:1707 or → update (set union, dedup via set ctor below)
+        DictViewSetOp::Or => {
+            let mut combined: Vec<pyre_object::PyObjectRef> = self_items;
+            combined.extend(other_items);
+            combined
+        }
+        // dictmultiobject.py:1708 xor → symmetric_difference_update
+        DictViewSetOp::Xor => {
+            let self_set = pyre_object::w_set_from_items(&self_items);
+            let mut out: Vec<pyre_object::PyObjectRef> = self_items
+                .into_iter()
+                .filter(|&item| !unsafe { pyre_object::w_set_contains(other_set, item) })
+                .collect();
+            for item in other_items {
+                if !unsafe { pyre_object::w_set_contains(self_set, item) } {
+                    out.push(item);
+                }
+            }
+            out
+        }
+    };
+    Ok(pyre_object::w_set_from_items(&result_items))
+}
+
+fn dict_view_set_op(
+    self_view: pyre_object::PyObjectRef,
+    other: pyre_object::PyObjectRef,
+    op_name: &str,
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    let op = match op_name {
+        "difference_update" => DictViewSetOp::Sub,
+        "intersection_update" => DictViewSetOp::And,
+        "update" => DictViewSetOp::Or,
+        "symmetric_difference_update" => DictViewSetOp::Xor,
+        _ => return Err(crate::PyError::type_error("unknown set op")),
+    };
+    dict_view_set_op_compute(self_view, other, op)
+}
+
+fn dict_view_rset_op(
+    self_view: pyre_object::PyObjectRef,
+    other: pyre_object::PyObjectRef,
+    op_name: &str,
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    let op = match op_name {
+        // PyPy's reverse ops swap operand order: `other - self_view`,
+        // `other & self_view`, etc.  Sub/And are not commutative, so
+        // the swap matters; Or/Xor are commutative.
+        "difference_update" => {
+            // other - self_view
+            let other_items = crate::builtins::collect_iterable(other)?;
+            let self_items = crate::type_methods::dict_view_snapshot(self_view);
+            let self_set = pyre_object::w_set_from_items(&self_items);
+            let result_items: Vec<pyre_object::PyObjectRef> = other_items
+                .into_iter()
+                .filter(|&item| !unsafe { pyre_object::w_set_contains(self_set, item) })
+                .collect();
+            return Ok(pyre_object::w_set_from_items(&result_items));
+        }
+        "intersection_update" => DictViewSetOp::And,
+        "update" => DictViewSetOp::Or,
+        "symmetric_difference_update" => DictViewSetOp::Xor,
+        _ => return Err(crate::PyError::type_error("unknown set op")),
+    };
+    dict_view_set_op_compute(self_view, other, op)
+}
+
+// Top-level fn-pointer dispatchers for each comparator and set op
+// (`make_builtin_function_with_arity` requires a `fn` pointer — closures
+// that capture per-op state are not allowed, so each spec gets its own
+// thin wrapper that calls into the shared `dict_view_*` helpers).
+fn dict_view_descr_eq(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    if args.len() < 2 {
+        return Ok(pyre_object::w_not_implemented());
+    }
+    dict_view_compare(args[0], args[1], DictViewCmp::Eq)
+}
+fn dict_view_descr_ne(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    if args.len() < 2 {
+        return Ok(pyre_object::w_not_implemented());
+    }
+    dict_view_compare(args[0], args[1], DictViewCmp::Ne)
+}
+fn dict_view_descr_lt(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    if args.len() < 2 {
+        return Ok(pyre_object::w_not_implemented());
+    }
+    dict_view_compare(args[0], args[1], DictViewCmp::Lt)
+}
+fn dict_view_descr_le(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    if args.len() < 2 {
+        return Ok(pyre_object::w_not_implemented());
+    }
+    dict_view_compare(args[0], args[1], DictViewCmp::Le)
+}
+fn dict_view_descr_gt(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    if args.len() < 2 {
+        return Ok(pyre_object::w_not_implemented());
+    }
+    dict_view_compare(args[0], args[1], DictViewCmp::Gt)
+}
+fn dict_view_descr_ge(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    if args.len() < 2 {
+        return Ok(pyre_object::w_not_implemented());
+    }
+    dict_view_compare(args[0], args[1], DictViewCmp::Ge)
+}
+fn dict_view_descr_isdisjoint(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    if args.len() < 2 {
+        return Err(crate::PyError::type_error(
+            "isdisjoint() takes exactly one argument",
+        ));
+    }
+    dict_view_isdisjoint(args[0], args[1])
+}
+fn dict_view_descr_sub(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    if args.len() < 2 {
+        return Ok(pyre_object::w_not_implemented());
+    }
+    dict_view_set_op(args[0], args[1], "difference_update")
+}
+fn dict_view_descr_and(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    if args.len() < 2 {
+        return Ok(pyre_object::w_not_implemented());
+    }
+    dict_view_set_op(args[0], args[1], "intersection_update")
+}
+fn dict_view_descr_or(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    if args.len() < 2 {
+        return Ok(pyre_object::w_not_implemented());
+    }
+    dict_view_set_op(args[0], args[1], "update")
+}
+fn dict_view_descr_xor(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    if args.len() < 2 {
+        return Ok(pyre_object::w_not_implemented());
+    }
+    dict_view_set_op(args[0], args[1], "symmetric_difference_update")
+}
+fn dict_view_descr_rsub(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    if args.len() < 2 {
+        return Ok(pyre_object::w_not_implemented());
+    }
+    dict_view_rset_op(args[0], args[1], "difference_update")
+}
+fn dict_view_descr_rand(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    if args.len() < 2 {
+        return Ok(pyre_object::w_not_implemented());
+    }
+    dict_view_rset_op(args[0], args[1], "intersection_update")
+}
+fn dict_view_descr_ror(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    if args.len() < 2 {
+        return Ok(pyre_object::w_not_implemented());
+    }
+    dict_view_rset_op(args[0], args[1], "update")
+}
+fn dict_view_descr_rxor(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    if args.len() < 2 {
+        return Ok(pyre_object::w_not_implemented());
+    }
+    dict_view_rset_op(args[0], args[1], "symmetric_difference_update")
+}
+
+fn register_dict_view_set_operators(ns: &mut DictStorage) {
+    // Comparisons (Items/Keys only — Values returns NotImplemented
+    // because `dict_view_is_set_like` rejects non-set-like LHS).
+    for (name, func) in [
+        ("__eq__", dict_view_descr_eq as fn(&[_]) -> _),
+        ("__ne__", dict_view_descr_ne),
+        ("__lt__", dict_view_descr_lt),
+        ("__le__", dict_view_descr_le),
+        ("__gt__", dict_view_descr_gt),
+        ("__ge__", dict_view_descr_ge),
+    ] {
+        dict_storage_store(ns, name, make_builtin_function_with_arity(name, func, 2));
+    }
+    // `dictmultiobject.py:1797 isdisjoint = interp2app(descr_isdisjoint)`
+    dict_storage_store(
+        ns,
+        "isdisjoint",
+        make_builtin_function_with_arity("isdisjoint", dict_view_descr_isdisjoint, 2),
+    );
+    // `dictmultiobject.py:1705-1708 _as_set_op` — set ops route
+    // through `set(self).METHOD(other)`; reflected variants build
+    // `set(other)` and merge self in.
+    for (name, func) in [
+        ("__sub__", dict_view_descr_sub as fn(&[_]) -> _),
+        ("__and__", dict_view_descr_and),
+        ("__or__", dict_view_descr_or),
+        ("__xor__", dict_view_descr_xor),
+        ("__rsub__", dict_view_descr_rsub),
+        ("__rand__", dict_view_descr_rand),
+        ("__ror__", dict_view_descr_ror),
+        ("__rxor__", dict_view_descr_rxor),
+    ] {
+        dict_storage_store(ns, name, make_builtin_function_with_arity(name, func, 2));
+    }
+}
 
 fn init_mappingproxy_type(ns: &mut DictStorage) {
     // dictproxyobject.py:32 descr_len → space.len(self.w_mapping)
@@ -2267,27 +2970,53 @@ thread_local! {
 fn getset_descriptor_type() -> pyre_object::PyObjectRef {
     GETSET_DESCRIPTOR_TYPE.with(|cell| {
         *cell.get_or_init(|| {
-            let tp = make_builtin_type("getset_descriptor", init_getset_descriptor_type);
+            // `typedef.py:444 GetSetProperty.typedef = TypeDef(
+            // "getset_descriptor", ...)`.  Pyre owns the static
+            // `GETSET_DESCRIPTOR_TYPE` PyType so W_GetSetProperty
+            // instances carry it as `ob_type` (not the catch-all
+            // `INSTANCE_TYPE`).  `make_builtin_type_with_layout`
+            // wires the layout so `setup_builtin_type` records the
+            // explicit typedef per `typeobject.py:1273-1280`.
+            let tp = make_builtin_type_with_layout(
+                "getset_descriptor",
+                init_getset_descriptor_type,
+                w_object(),
+                &pyre_object::getsetproperty::GETSET_DESCRIPTOR_TYPE as *const PyType,
+            );
             // typedef.py:446 assert not GetSetProperty.typedef.acceptable_as_base_class
             unsafe { pyre_object::w_type_set_acceptable_as_base_class(tp, false) };
-            // GetSetProperty stores fget/fset/fdel/name/w_objclass as instance
-            // attributes; pyre needs hasdict so they land in the live W_DictObject
-            // backing store rather than the legacy ATTR_TABLE fallback.
-            unsafe { pyre_object::w_type_set_hasdict(tp, true) };
+            // `init_typeobjects` would normally hand the W_TypeObject
+            // to `set_instantiate(pytype, w_typeobject)` so allocators
+            // can stamp `ob_header.w_class` at construction time
+            // (see typedef.rs around `for (pytype, w_type) in reg`).
+            // `getset_descriptor_type()` is called from inside the
+            // init loop *as* a builder for descriptors that other
+            // typedefs install, so the post-loop `set_instantiate`
+            // pass can race the first W_GetSetProperty alloc.
+            // Setting it eagerly here keeps `w_class` non-null for
+            // every descriptor regardless of allocation order.
+            pyre_object::pyobject::set_instantiate(
+                &pyre_object::getsetproperty::GETSET_DESCRIPTOR_TYPE,
+                tp,
+            );
             tp
         })
     })
 }
 
-/// typedef.py:367-371 readonly_attribute
+/// typedef.py:378-382 readonly_attribute
 ///
 /// ```python
-/// def readonly_attribute(self, space):
+/// def readonly_attribute(self, space):   # overwritten in cpyext
 ///     if self.name == '<generic property>':
-///         raise oefmt(space.w_TypeError, "readonly attribute")
+///         raise oefmt(space.w_AttributeError, "readonly attribute")
 ///     else:
-///         raise oefmt(space.w_TypeError, "readonly attribute '%s'", self.name)
+///         raise oefmt(space.w_AttributeError, "readonly attribute '%s'", self.name)
 /// ```
+///
+/// PyPy raises `AttributeError`, not `TypeError`; the message keeps
+/// the descriptor's `name` so `e.args[0]` matches CPython /
+/// inspect.py expectations.
 fn readonly_attribute(descr: pyre_object::PyObjectRef) -> crate::PyError {
     let name_obj = read_descr_name(descr);
     let name = if !name_obj.is_null() && unsafe { pyre_object::is_str(name_obj) } {
@@ -2297,9 +3026,9 @@ fn readonly_attribute(descr: pyre_object::PyObjectRef) -> crate::PyError {
     };
     match name {
         Some(n) if n != "<generic property>" => {
-            crate::PyError::type_error(format!("readonly attribute '{}'", n))
+            crate::PyError::attribute_error(format!("readonly attribute '{}'", n))
         }
-        _ => crate::PyError::type_error("readonly attribute".to_string()),
+        _ => crate::PyError::attribute_error("readonly attribute".to_string()),
     }
 }
 
@@ -2459,10 +3188,25 @@ fn init_getset_descriptor_type(ns: &mut DictStorage) {
                 let w_obj = args[1];
                 let fdel = read_fdel(w_self);
                 if fdel.is_null() || unsafe { pyre_object::is_none(fdel) } {
-                    return Err(crate::PyError::new(
-                        crate::PyErrorKind::AttributeError,
-                        "cannot delete attribute".to_string(),
-                    ));
+                    // typedef.py:404-405:
+                    //   raise oefmt(space.w_AttributeError,
+                    //       "cannot delete '%s' attribute of immutable type '%N'",
+                    //       self.name, w_obj)
+                    let name_obj = read_descr_name(w_self);
+                    let name = if !name_obj.is_null() && unsafe { pyre_object::is_str(name_obj) } {
+                        unsafe { pyre_object::w_str_get_value(name_obj) }
+                    } else {
+                        "<generic property>"
+                    };
+                    let type_name = unsafe {
+                        match crate::typedef::r#type(w_obj) {
+                            Some(tp) => pyre_object::w_type_get_name(tp).to_string(),
+                            None => (*(*w_obj).ob_type).name.to_string(),
+                        }
+                    };
+                    return Err(crate::PyError::attribute_error(format!(
+                        "cannot delete '{name}' attribute of immutable type '{type_name}'"
+                    )));
                 }
                 let reqcls = read_reqcls(w_self);
                 if !reqcls.is_null() {
@@ -2488,6 +3232,199 @@ fn init_getset_descriptor_type(ns: &mut DictStorage) {
             2,
         ),
     );
+    // The four metadata getsets (typedef.py:470-473
+    // __name__/__qualname__/__objclass__/__doc__) cannot be
+    // installed inside this function — each one allocates a fresh
+    // `W_GetSetProperty` via `make_getset_descriptor`, which
+    // funnels through `getset_descriptor_type()`'s OnceCell, and we
+    // are currently *inside* that OnceCell's init closure.
+    // Re-entering `OnceCell::get_or_init` is undefined behaviour
+    // (the cell is already mutably borrowed), so the post-init
+    // helper `patch_getset_descriptor_metadata` stamps them after
+    // the OnceCell finishes, mirroring how
+    // `patch_builtin_function_descriptors` patches the
+    // BuiltinFunction `reqcls` slot.
+}
+
+/// typedef.py:465-474 metadata getsets on `GetSetProperty.typedef`,
+/// installed in a post-init pass per the comment above
+/// `init_getset_descriptor_type`.
+///
+/// ```python
+/// __name__ = interp_attrproperty('name', cls=GetSetProperty,
+///                                 wrapfn="newtext_or_none"),
+/// __qualname__ = GetSetProperty(GetSetProperty.descr_get_qualname),
+/// __objclass__ = GetSetProperty(GetSetProperty.descr_get_objclass),
+/// __doc__ = interp_attrproperty('doc', cls=GetSetProperty,
+///                                wrapfn="newtext_or_none"),
+/// ```
+fn patch_getset_descriptor_metadata() {
+    let tp = getset_descriptor_type();
+    if tp.is_null() {
+        return;
+    }
+    let dict_ptr = unsafe { pyre_object::w_type_get_dict_ptr(tp) } as *mut DictStorage;
+    if dict_ptr.is_null() {
+        return;
+    }
+    let ns = unsafe { &mut *dict_ptr };
+    // typedef.py:470 __name__
+    dict_storage_store(
+        ns,
+        "__name__",
+        make_getset_descriptor(make_builtin_function_with_arity(
+            "__name__",
+            |args| {
+                let descr = args[1];
+                if descr.is_null() {
+                    return Ok(pyre_object::w_none());
+                }
+                let name = unsafe { pyre_object::getsetproperty::w_getset_get_name(descr) };
+                if name.is_null() {
+                    return Ok(pyre_object::w_none());
+                }
+                Ok(name)
+            },
+            2,
+        )),
+    );
+    // typedef.py:471 __qualname__ = GetSetProperty(descr_get_qualname)
+    //
+    // ```python
+    // def descr_get_qualname(self, space):
+    //     if self.w_qualname is None:
+    //         self.w_qualname = self._calculate_qualname(space)
+    //     return self.w_qualname
+    //
+    // def _calculate_qualname(self, space):
+    //     if self.reqcls is None:
+    //         type_qualname = '?'
+    //     else:
+    //         w_type = space.gettypeobject(self.reqcls.typedef)
+    //         type_qualname = space.text_w(
+    //             space.getattr(w_type, space.newtext('__qualname__')))
+    //     qualname = "%s.%s" % (type_qualname, self.name)
+    //     return space.newtext(qualname)
+    // ```
+    dict_storage_store(
+        ns,
+        "__qualname__",
+        make_getset_descriptor(make_builtin_function_with_arity(
+            "__qualname__",
+            |args| {
+                let descr = args[1];
+                if descr.is_null() {
+                    return Ok(pyre_object::w_none());
+                }
+                unsafe {
+                    let cached = pyre_object::getsetproperty::w_getset_get_qualname(descr);
+                    if !cached.is_null() {
+                        return Ok(cached);
+                    }
+                    // typedef.py:425-432 _calculate_qualname:
+                    //   if self.reqcls is None: type_qualname = '?'
+                    //   else:
+                    //       w_type = space.gettypeobject(self.reqcls.typedef)
+                    //       type_qualname = space.text_w(
+                    //           space.getattr(w_type, space.newtext('__qualname__')))
+                    //
+                    // PyPy reads the bound class's `__qualname__`
+                    // (which respects nested-class scoping and any
+                    // explicit `__qualname__` assignment in the class
+                    // body), NOT the bare `__name__`.  Pyre's
+                    // `getattr(w_type, '__qualname__')` resolves
+                    // through the type-side __qualname__ getset that
+                    // already mirrors PyPy's lookup-then-fallback
+                    // chain (`baseobjspace.rs:4004-4009`).
+                    let reqcls = pyre_object::getsetproperty::w_getset_get_reqcls(descr);
+                    let type_qualname = if reqcls.is_null() {
+                        "?".to_string()
+                    } else {
+                        match crate::baseobjspace::getattr(reqcls, "__qualname__") {
+                            Ok(qn) if pyre_object::is_str(qn) => {
+                                pyre_object::w_str_get_value(qn).to_string()
+                            }
+                            // PyPy raises through here on AttributeError;
+                            // pyre falls back to the bare type name to
+                            // avoid surfacing an unrelated AttributeError
+                            // when introspecting `descr.__qualname__`.
+                            _ => pyre_object::w_type_get_name(reqcls).to_string(),
+                        }
+                    };
+                    let name_obj = pyre_object::getsetproperty::w_getset_get_name(descr);
+                    let name = if !name_obj.is_null() && pyre_object::is_str(name_obj) {
+                        pyre_object::w_str_get_value(name_obj).to_string()
+                    } else {
+                        "<generic property>".to_string()
+                    };
+                    let combined = pyre_object::w_str_new(&format!("{type_qualname}.{name}"));
+                    pyre_object::getsetproperty::w_getset_set_qualname(descr, combined);
+                    Ok(combined)
+                }
+            },
+            2,
+        )),
+    );
+    // typedef.py:472 __objclass__ = GetSetProperty(descr_get_objclass)
+    //
+    // ```python
+    // def descr_get_objclass(self, space):
+    //     if self.w_objclass is not None:
+    //         return self.w_objclass
+    //     if self.reqcls is not None:
+    //         return space.gettypeobject(self.reqcls.typedef)
+    //     raise oefmt(space.w_AttributeError,
+    //                 "generic self has no __objclass__")
+    // ```
+    dict_storage_store(
+        ns,
+        "__objclass__",
+        make_getset_descriptor(make_builtin_function_with_arity(
+            "__objclass__",
+            |args| {
+                let descr = args[1];
+                if descr.is_null() {
+                    return Err(crate::PyError::attribute_error(
+                        "generic self has no __objclass__",
+                    ));
+                }
+                unsafe {
+                    let w_objclass = pyre_object::getsetproperty::w_getset_get_objclass(descr);
+                    if !w_objclass.is_null() {
+                        return Ok(w_objclass);
+                    }
+                    let reqcls = pyre_object::getsetproperty::w_getset_get_reqcls(descr);
+                    if !reqcls.is_null() {
+                        return Ok(reqcls);
+                    }
+                    Err(crate::PyError::attribute_error(
+                        "generic self has no __objclass__",
+                    ))
+                }
+            },
+            2,
+        )),
+    );
+    // typedef.py:473 __doc__ = interp_attrproperty('doc', ...)
+    dict_storage_store(
+        ns,
+        "__doc__",
+        make_getset_descriptor(make_builtin_function_with_arity(
+            "__doc__",
+            |args| {
+                let descr = args[1];
+                if descr.is_null() {
+                    return Ok(pyre_object::w_none());
+                }
+                let doc = unsafe { pyre_object::getsetproperty::w_getset_get_doc(descr) };
+                if doc.is_null() {
+                    return Ok(pyre_object::w_none());
+                }
+                Ok(doc)
+            },
+            2,
+        )),
+    );
 }
 
 /// `GetSetProperty(fget)` — read-only getset descriptor with no required class.
@@ -2499,6 +3436,25 @@ fn make_getset_descriptor(getter: pyre_object::PyObjectRef) -> pyre_object::PyOb
         pyre_object::PY_NULL,
         pyre_object::PY_NULL,
         pyre_object::PY_NULL,
+        None,
+    )
+}
+
+/// `GetSetProperty(fget)` with an explicit `name`.  Mirrors
+/// `typedef.py:58 add_entries` which stamps the dict-key as the
+/// descriptor's `name` (so `dict_descr.__name__` is `"__dict__"`,
+/// `weakref_descr.__name__` is `"__weakref__"`, etc.) — without this
+/// pyre's descriptors would all surface as `"<generic property>"`.
+fn make_getset_descriptor_named(
+    getter: pyre_object::PyObjectRef,
+    name: &str,
+) -> pyre_object::PyObjectRef {
+    make_getset_property_full(
+        getter,
+        pyre_object::PY_NULL,
+        pyre_object::PY_NULL,
+        pyre_object::PY_NULL,
+        Some(name),
     )
 }
 
@@ -2510,7 +3466,18 @@ fn make_getset_property(
     fset: pyre_object::PyObjectRef,
     fdel: pyre_object::PyObjectRef,
 ) -> pyre_object::PyObjectRef {
-    make_getset_property_full(fget, fset, fdel, pyre_object::PY_NULL)
+    make_getset_property_full(fget, fset, fdel, pyre_object::PY_NULL, None)
+}
+
+/// `GetSetProperty(fget, fset, fdel)` with explicit `name` — see
+/// `make_getset_descriptor_named` for the typedef.py:58 motivation.
+fn make_getset_property_named(
+    fget: pyre_object::PyObjectRef,
+    fset: pyre_object::PyObjectRef,
+    fdel: pyre_object::PyObjectRef,
+    name: &str,
+) -> pyre_object::PyObjectRef {
+    make_getset_property_full(fget, fset, fdel, pyre_object::PY_NULL, Some(name))
 }
 
 /// `GetSetProperty(fget, fset, fdel, cls=cls)` — full getset descriptor
@@ -2524,20 +3491,31 @@ fn make_getset_property_full(
     fset: pyre_object::PyObjectRef,
     fdel: pyre_object::PyObjectRef,
     cls: pyre_object::PyObjectRef,
+    name: Option<&str>,
 ) -> pyre_object::PyObjectRef {
-    use pyre_object::instanceobject::w_instance_new;
-    let obj = w_instance_new(getset_descriptor_type());
-    getset_property_init(
-        obj,
+    // Force `getset_descriptor_type` registration so the static
+    // PyType's `instantiate` slot points at the W_TypeObject before
+    // the first allocation reads it.  Returns the (cached)
+    // PyObjectRef back; the W_TypeObject side is not used for the
+    // alloc itself — the static `GETSET_DESCRIPTOR_TYPE` PyType is.
+    let _ = getset_descriptor_type();
+    // typedef.py:346 `self.name = name if name is not None else
+    // '<generic property>'` — pyre stamps the literal sentinel when
+    // no explicit name is supplied, so `make_getset_descriptor` keeps
+    // the PyPy-default sentinel for callers that don't override it.
+    let resolved_name = match name {
+        Some(n) => pyre_object::w_str_new(n),
+        None => pyre_object::w_str_new("<generic property>"),
+    };
+    pyre_object::getsetproperty::w_getset_property_new(
         fget,
         fset,
         fdel,
         pyre_object::PY_NULL, // doc
         cls,
-        false,                // use_closure
-        pyre_object::PY_NULL, // name (defaults to '<generic property>')
-    );
-    obj
+        false, // use_closure
+        resolved_name,
+    )
 }
 
 fn init_type_type(ns: &mut DictStorage) {
@@ -2674,15 +3652,339 @@ fn init_type_type(ns: &mut DictStorage) {
 /// Slots that exist on `Function.typedef` *and* on `BuiltinFunction.typedef`
 /// belong here so the two initializers stay structurally aligned with PyPy's
 /// `**rawdict` pattern. Function-only slots (currently just `__get__`) and
-/// BuiltinFunction-only overrides (`__new__`, `__self__`, `__repr__`,
-/// `__doc__`) live in their respective wrappers.
-fn init_function_type_common(_ns: &mut DictStorage) {
-    // Pyre does not yet model the rest of Function.typedef
-    // (`__call__`, `__name__`, `__qualname__`, `__doc__`, `__module__`,
-    // `__globals__`, `__closure__`, `__defaults__`, `__kwdefaults__`,
-    // `__code__`, `__dict__`, `__class__`, ...).
-    // They will be installed here when ported, so they automatically
-    // propagate to BuiltinFunction.typedef.
+/// BuiltinFunction-only overrides (`__new__`, `__self__`, `__repr__`)
+/// live in their respective wrappers.
+fn init_function_type_common(ns: &mut DictStorage) {
+    // `pypy/interpreter/typedef.py:802 __doc__ = getset_func_doc` —
+    // `getset_func_doc = GetSetProperty(Function.fget_func_doc,
+    // fset_func_doc, fdel_func_doc)` (typedef.py:758-760) lives on
+    // `Function.typedef`'s rawdict so it is inherited by
+    // `BuiltinFunction.typedef` via `**Function.typedef.rawdict`
+    // (typedef.py:899).  Registering the descriptor here mirrors that
+    // shape so `del f.__doc__` on a user-defined function reaches the
+    // typedef `__delete__` slot (and through it
+    // `function_del_doc`'s sticky-None write — function.py:455-457),
+    // not the fall-through "no attribute" path.  The `_check_code_mutable`
+    // gate inside the setter/deleter still raises `TypeError` for
+    // builtin functions (`can_change_code = False`).
+    let doc_getter = make_builtin_function("__doc__", |args| {
+        let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        if func.is_null() {
+            return Ok(pyre_object::w_none());
+        }
+        Ok(unsafe { crate::function::fget_func_doc(func) })
+    });
+    let doc_setter = make_builtin_function("__doc__", |args| {
+        let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        let value = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
+        unsafe { crate::function::fset_func_doc(func, value)? };
+        Ok(pyre_object::w_none())
+    });
+    let doc_deleter = make_builtin_function("__doc__", |args| {
+        let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        unsafe { crate::function::fdel_func_doc(func)? };
+        Ok(pyre_object::w_none())
+    });
+    dict_storage_store(
+        ns,
+        "__doc__",
+        make_getset_property(doc_getter, doc_setter, doc_deleter),
+    );
+    // `pypy/interpreter/typedef.py:811 __annotations__ =
+    // getset_func_annotations` →
+    // `getset_func_annotations = GetSetProperty(Function.fget_func_annotations,
+    //                                            Function.fset_func_annotations,
+    //                                            Function.fdel_func_annotations)`
+    // (typedef.py:787-789).  Without this descriptor, `f.__annotations__
+    // = X` falls through to the generic `setdictvalue` which would
+    // shadow the `Function.w_ann` slot (the getattr fast path reads
+    // `w_ann` directly).  The setter validates the new value as a
+    // dict per `function.py:557-558` and clears the slot on `None`.
+    let ann_getter = make_builtin_function("__annotations__", |args| {
+        let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        if func.is_null() {
+            return Ok(pyre_object::w_dict_new());
+        }
+        Ok(unsafe { crate::function::function_get_annotations(func) })
+    });
+    let ann_setter = make_builtin_function("__annotations__", |args| {
+        let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        let value = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
+        unsafe { crate::function::fset_func_annotations(func, value)? };
+        Ok(pyre_object::w_none())
+    });
+    let ann_deleter = make_builtin_function("__annotations__", |args| {
+        let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        unsafe { crate::function::fdel_func_annotations(func)? };
+        Ok(pyre_object::w_none())
+    });
+    dict_storage_store(
+        ns,
+        "__annotations__",
+        make_getset_property(ann_getter, ann_setter, ann_deleter),
+    );
+    // ── Remaining `pypy/interpreter/typedef.py:758-815 Function.typedef`
+    // GetSetProperty entries.  Installing each as a typedef descriptor
+    // is what makes user-level `f.__name__ = "x"` go through the
+    // validating `function.py:fset_func_name` path instead of the
+    // generic `setdictvalue` fall-through.  Reads keep using the
+    // baseobjspace fast path (it produces the same value the descriptor
+    // `__get__` would return); the descriptor's role is to enforce the
+    // setter / deleter type checks PyPy applies before mutating the
+    // function instance.
+    //
+    // `typedef.py:780 getset_func_name = GetSetProperty(fget_func_name,
+    //                                                    fset_func_name)`.
+    let name_getter = make_builtin_function("__name__", |args| {
+        let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        if func.is_null() {
+            return Ok(pyre_object::w_str_new(""));
+        }
+        Ok(unsafe { crate::function::fget_func_name(func) })
+    });
+    let name_setter = make_builtin_function("__name__", |args| {
+        let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        let value = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
+        unsafe { crate::function::fset_func_name(func, value)? };
+        Ok(pyre_object::w_none())
+    });
+    dict_storage_store(
+        ns,
+        "__name__",
+        make_getset_property(name_getter, name_setter, pyre_object::PY_NULL),
+    );
+    // `typedef.py:782 getset_func_qualname = GetSetProperty(
+    //   Function.fget_func_qualname, Function.fset_func_qualname)`.
+    // Both getter and setter wired so `f.__qualname__ = "C.m"`
+    // reaches `fset_func_qualname`'s str validation
+    // (function.py:476-485) instead of falling through to
+    // `setdictvalue` and silently shadowing the slot.
+    let qualname_getter = make_builtin_function("__qualname__", |args| {
+        let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        if func.is_null() {
+            return Ok(pyre_object::w_str_new(""));
+        }
+        let s = unsafe { crate::function::function_get_qualname(func) };
+        Ok(pyre_object::w_str_new(&s))
+    });
+    let qualname_setter = make_builtin_function("__qualname__", |args| {
+        let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        let value = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
+        unsafe { crate::function::fset_func_qualname(func, value)? };
+        Ok(pyre_object::w_none())
+    });
+    dict_storage_store(
+        ns,
+        "__qualname__",
+        make_getset_property(qualname_getter, qualname_setter, pyre_object::PY_NULL),
+    );
+    // `typedef.py:768-770 getset___module__ = GetSetProperty(
+    //   Function.fget___module__, fset___module__, fdel___module__)`.
+    let module_getter = make_builtin_function("__module__", |args| {
+        let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        if func.is_null() {
+            return Ok(pyre_object::w_none());
+        }
+        Ok(unsafe { crate::function::fget___module__(func) })
+    });
+    let module_setter = make_builtin_function("__module__", |args| {
+        let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        let value = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
+        unsafe { crate::function::fset___module__(func, value)? };
+        Ok(pyre_object::w_none())
+    });
+    let module_deleter = make_builtin_function("__module__", |args| {
+        let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        unsafe { crate::function::fdel___module__(func)? };
+        Ok(pyre_object::w_none())
+    });
+    dict_storage_store(
+        ns,
+        "__module__",
+        make_getset_property(module_getter, module_setter, module_deleter),
+    );
+    // `typedef.py:772-774 getset_func_defaults = GetSetProperty(
+    //   Function.fget_func_defaults, fset_func_defaults, fdel_func_defaults)`.
+    let defaults_getter = make_builtin_function("__defaults__", |args| {
+        let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        if func.is_null() {
+            return Ok(pyre_object::w_none());
+        }
+        Ok(unsafe { crate::function::fget_func_defaults(func) })
+    });
+    let defaults_setter = make_builtin_function("__defaults__", |args| {
+        let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        let value = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
+        unsafe { crate::function::fset_func_defaults(func, value)? };
+        Ok(pyre_object::w_none())
+    });
+    let defaults_deleter = make_builtin_function("__defaults__", |args| {
+        let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        unsafe { crate::function::fdel_func_defaults(func)? };
+        Ok(pyre_object::w_none())
+    });
+    dict_storage_store(
+        ns,
+        "__defaults__",
+        make_getset_property(defaults_getter, defaults_setter, defaults_deleter),
+    );
+    // `typedef.py:775-777 getset_func_kwdefaults = GetSetProperty(...)`.
+    let kwdefaults_getter = make_builtin_function("__kwdefaults__", |args| {
+        let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        if func.is_null() {
+            return Ok(pyre_object::w_none());
+        }
+        Ok(unsafe { crate::function::fget_func_kwdefaults(func) })
+    });
+    let kwdefaults_setter = make_builtin_function("__kwdefaults__", |args| {
+        let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        let value = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
+        unsafe { crate::function::fset_func_kwdefaults(func, value)? };
+        Ok(pyre_object::w_none())
+    });
+    let kwdefaults_deleter = make_builtin_function("__kwdefaults__", |args| {
+        let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        unsafe { crate::function::fdel_func_kwdefaults(func)? };
+        Ok(pyre_object::w_none())
+    });
+    dict_storage_store(
+        ns,
+        "__kwdefaults__",
+        make_getset_property(kwdefaults_getter, kwdefaults_setter, kwdefaults_deleter),
+    );
+    // `typedef.py:778-779 getset_func_code = GetSetProperty(
+    //   Function.fget_func_code, fset_func_code)`.
+    let code_getter = make_builtin_function("__code__", |args| {
+        let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        if func.is_null() {
+            return Ok(pyre_object::w_none());
+        }
+        let raw = unsafe { crate::function::fget_func_code(func) };
+        Ok(raw as pyre_object::PyObjectRef)
+    });
+    let code_setter = make_builtin_function("__code__", |args| {
+        let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        let value = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
+        unsafe { crate::function::fset_func_code(func, value)? };
+        Ok(pyre_object::w_none())
+    });
+    dict_storage_store(
+        ns,
+        "__code__",
+        make_getset_property(code_getter, code_setter, pyre_object::PY_NULL),
+    );
+    // `typedef.py:813 __closure__ = GetSetProperty(Function.fget_func_closure)`
+    // — read-only.
+    let closure_getter = make_builtin_function("__closure__", |args| {
+        let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        if func.is_null() {
+            return Ok(pyre_object::w_none());
+        }
+        Ok(unsafe { crate::function::fget_func_closure(func) })
+    });
+    dict_storage_store(ns, "__closure__", make_getset_descriptor(closure_getter));
+    // `typedef.py:812 __globals__ = interp_attrproperty_w('w_func_globals',
+    // cls=Function)` — read-only canonical W_DictObject view of the
+    // function's globals storage (lazy-cached on `w_func_globals_obj`).
+    let globals_getter = make_builtin_function("__globals__", |args| {
+        let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        if func.is_null() {
+            return Ok(pyre_object::w_none());
+        }
+        Ok(unsafe { crate::function::function_get_globals_obj(func) })
+    });
+    dict_storage_store(ns, "__globals__", make_getset_descriptor(globals_getter));
+    // `pypy/interpreter/typedef.py:805 __objclass__ = getset_func_objclass`
+    //
+    // ```python
+    // getset_func_objclass = GetSetProperty(Function.fget_func_objclass)
+    // ```
+    //
+    // Read-only descriptor that surfaces `self.w_objclass` for
+    // introspection helpers (`inspect.getfullargspec` etc.); raises
+    // AttributeError when no class is bound (`function.py:498-501`).
+    dict_storage_store(
+        ns,
+        "__objclass__",
+        make_getset_descriptor(make_builtin_function_with_arity(
+            "__objclass__",
+            |args| {
+                let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+                if func.is_null() {
+                    return Err(crate::PyError::attribute_error("__objclass__"));
+                }
+                unsafe { crate::function::fget_func_objclass(func) }
+            },
+            2,
+        )),
+    );
+    // `pypy/interpreter/typedef.py:806 __text_signature__ =
+    // getset_func_text_signature` —
+    //
+    // ```python
+    // getset_func_text_signature = GetSetProperty(
+    //     Function.fget_func_text_signature,
+    //     Function.fset_func_text_signature)
+    // ```
+    let text_signature_getter = make_builtin_function("__text_signature__", |args| {
+        let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        if func.is_null() {
+            return Err(crate::PyError::attribute_error("__text_signature__"));
+        }
+        unsafe { crate::function::fget_func_text_signature(func) }
+    });
+    let text_signature_setter = make_builtin_function("__text_signature__", |args| {
+        let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        let value = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
+        if !func.is_null() {
+            unsafe { crate::function::fset_func_text_signature(func, value) };
+        }
+        Ok(pyre_object::w_none())
+    });
+    dict_storage_store(
+        ns,
+        "__text_signature__",
+        make_getset_property(
+            text_signature_getter,
+            text_signature_setter,
+            pyre_object::PY_NULL,
+        ),
+    );
+    // `pypy/interpreter/typedef.py:809 __defaults_count__ =
+    // GetSetProperty(Function.fget_defaults_count)` — a PyPy
+    // extension that lets `inspect.py` distinguish "no default" from
+    // "default is None" when introspecting builtins like `dict.pop`.
+    //
+    // ```python
+    // def fget_defaults_count(self, space):
+    //     return space.newint(len(self.defs_w))
+    // ```
+    //
+    // Pyre stores `defs_w` as either a tuple PyObjectRef or PY_NULL
+    // (the latter mirrors PyPy's empty-list `[]`).
+    dict_storage_store(
+        ns,
+        "__defaults_count__",
+        make_getset_descriptor(make_builtin_function_with_arity(
+            "__defaults_count__",
+            |args| {
+                let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+                if func.is_null() {
+                    return Ok(pyre_object::w_int_new(0));
+                }
+                let defaults = unsafe { crate::function::function_get_defaults(func) };
+                let n = if defaults.is_null() {
+                    0
+                } else if unsafe { pyre_object::is_tuple(defaults) } {
+                    unsafe { pyre_object::w_tuple_len(defaults) as i64 }
+                } else {
+                    0
+                };
+                Ok(pyre_object::w_int_new(n))
+            },
+            2,
+        )),
+    );
 }
 
 fn init_function_type(ns: &mut DictStorage) {
@@ -2782,36 +4084,14 @@ fn init_builtin_function_type(ns: &mut DictStorage) {
         ),
     );
 
-    // function.py:395 getset_func_doc = GetSetProperty(fget_func_doc,
-    // fset_func_doc, fdel_func_doc). Reading goes through fget_func_doc,
-    // which is the same accessor used by `function.__doc__`; writing/
-    // deleting routes through _check_code_mutable, which raises TypeError
-    // for builtin functions because `can_change_code` is False.
-    // The `cls=BuiltinFunction` guard is patched in by
-    // `patch_builtin_function_descriptors` after the type cache exists.
-    let doc_getter = make_builtin_function("__doc__", |args| {
-        let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-        if func.is_null() {
-            return Ok(pyre_object::w_none());
-        }
-        Ok(unsafe { crate::function::fget_func_doc(func) })
-    });
-    let doc_setter = make_builtin_function("__doc__", |args| {
-        let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-        let value = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
-        unsafe { crate::function::fset_func_doc(func, value)? };
-        Ok(pyre_object::w_none())
-    });
-    let doc_deleter = make_builtin_function("__doc__", |args| {
-        let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-        unsafe { crate::function::fdel_func_doc(func)? };
-        Ok(pyre_object::w_none())
-    });
-    dict_storage_store(
-        ns,
-        "__doc__",
-        make_getset_property(doc_getter, doc_setter, doc_deleter),
-    );
+    // `pypy/interpreter/typedef.py:899-906`
+    // `BuiltinFunction.typedef.rawdict.update({...})` re-asserts
+    // `__doc__` from the inherited `Function.typedef.rawdict` slot
+    // (also `getset_func_doc`).  Pyre installs `__doc__` once in
+    // `init_function_type_common` so both function types share the
+    // same getter/setter/deleter; the `_check_code_mutable` gate
+    // inside the setter/deleter raises `TypeError` for builtin
+    // instances because `can_change_code = False`.
 }
 
 /// typedef.py:816,818 wires `cls=BuiltinFunction` on the `__self__` and
@@ -2832,9 +4112,14 @@ fn patch_builtin_function_descriptors() {
     let ns = unsafe { &*dict_ptr };
     for name in ["__self__", "__doc__"] {
         if let Some(&descr) = ns.get(name) {
-            if let Some(mut fields) = getset_fields_read(descr) {
-                fields.reqcls = bf_type as usize;
-                getset_fields_write(descr, fields);
+            if unsafe { pyre_object::getsetproperty::is_getset_property(descr) } {
+                // typedef.py:818 `cls=BuiltinFunction` — patch the
+                // `reqcls` slot in place now that the BuiltinFunction
+                // typeobject exists.  W_GetSetProperty's reqcls is a
+                // single PyObjectRef field, so this is a one-line
+                // store rather than the previous side-table read /
+                // mutate / write back dance.
+                unsafe { pyre_object::getsetproperty::w_getset_set_reqcls(descr, bf_type) };
             }
         }
     }
@@ -4537,9 +5822,13 @@ pub fn dict_descr() -> pyre_object::PyObjectRef {
         let fget = make_builtin_function_with_arity("descr_get_dict", descr_get_dict, 2);
         let fset = make_builtin_function_with_arity("descr_set_dict", descr_set_dict, 3);
         let fdel = make_builtin_function_with_arity("descr_del_dict", descr_del_dict, 2);
-        let descr = make_getset_property(fget, fset, fdel);
-        let _ = crate::baseobjspace::setattr(descr, "__name__", pyre_object::w_str_new("__dict__"));
-        descr as usize
+        // typedef.py:563 `dict_descr.name = '__dict__'` — pass the
+        // explicit name through the constructor so descriptor
+        // introspection (`type.__dict__['__dict__'].__name__`) returns
+        // `"__dict__"` instead of the `"<generic property>"` sentinel.
+        // The earlier setattr fix-up was masked by the new read-only
+        // `__name__` getset and silently failed.
+        make_getset_property_named(fget, fset, fdel, "__dict__") as usize
     });
     addr as pyre_object::PyObjectRef
 }
@@ -4556,10 +5845,9 @@ pub fn weakref_descr() -> pyre_object::PyObjectRef {
     static CACHED: OnceLock<usize> = OnceLock::new();
     let addr = *CACHED.get_or_init(|| {
         let fget = make_builtin_function_with_arity("descr_get_weakref", descr_get_weakref, 2);
-        let descr = make_getset_property(fget, pyre_object::PY_NULL, pyre_object::PY_NULL);
-        let _ =
-            crate::baseobjspace::setattr(descr, "__name__", pyre_object::w_str_new("__weakref__"));
-        descr as usize
+        // typedef.py:591 `weakref_descr.name = '__weakref__'` —
+        // see `dict_descr` for the parity rationale.
+        make_getset_descriptor_named(fget, "__weakref__") as usize
     });
     addr as pyre_object::PyObjectRef
 }
@@ -4567,63 +5855,16 @@ pub fn weakref_descr() -> pyre_object::PyObjectRef {
 /// PyPy stores `fget/fset/fdel/doc/reqcls/use_closure/name` directly on
 /// the `GetSetProperty` instance fields. pyre's instance dict (mapdict)
 /// is thread-local, but `init_typeobjects` runs once globally and the
-/// resulting `getset_descriptor` instances are visible from every thread,
-/// so per-instance attribute storage cannot be used. Mirror PyPy's
-/// "fields live on the descriptor itself" model with a process-global
-/// side table keyed by descriptor address.
-#[derive(Clone, Copy)]
-struct GetSetFields {
-    fget: usize,
-    fset: usize,
-    fdel: usize,
-    doc: usize,
-    reqcls: usize,
-    use_closure: bool,
-    name: usize,
-}
-
-static GETSET_FIELDS: std::sync::OnceLock<
-    std::sync::RwLock<std::collections::HashMap<usize, GetSetFields>>,
-> = std::sync::OnceLock::new();
-
-fn getset_fields_table()
--> &'static std::sync::RwLock<std::collections::HashMap<usize, GetSetFields>> {
-    GETSET_FIELDS.get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()))
-}
-
-fn getset_fields_read(descr: pyre_object::PyObjectRef) -> Option<GetSetFields> {
-    if descr.is_null() {
-        return None;
-    }
-    getset_fields_table()
-        .read()
-        .unwrap()
-        .get(&(descr as usize))
-        .copied()
-}
-
-fn getset_fields_write(descr: pyre_object::PyObjectRef, fields: GetSetFields) {
-    getset_fields_table()
-        .write()
-        .unwrap()
-        .insert(descr as usize, fields);
-}
-
-/// typedef.py:327-335 GetSetProperty._init.
+/// `pypy/interpreter/typedef.py:327-336 GetSetProperty._init` —
+/// stores fget/fset/fdel/doc/reqcls/use_closure/name directly on the
+/// descriptor instance.  Pyre matches that shape with a real W_Root
+/// struct (`pyre_object::getsetproperty::W_GetSetProperty`); these
+/// helpers are thin wrappers over the typed accessors so existing
+/// call sites stay readable.
 ///
-/// ```python
-/// def _init(self, fget, fset, fdel, doc, cls, use_closure, name):
-///     self.fget = fget
-///     self.fset = fset
-///     self.fdel = fdel
-///     self.doc = doc
-///     self.reqcls = cls
-///     self.use_closure = use_closure
-///     self.name = name if name is not None else '<generic property>'
-/// ```
-///
-/// `cls` is stored as `reqcls` exactly like PyPy. `use_closure` is unused
-/// (pyre has no closure-passing distinction) but still stored for parity.
+/// `cls` is stored as `reqcls` exactly like PyPy. `use_closure` is
+/// unused at runtime (pyre has no closure-passing distinction) but
+/// still kept on the struct for parity.
 fn getset_property_init(
     new: pyre_object::PyObjectRef,
     fget: pyre_object::PyObjectRef,
@@ -4634,56 +5875,69 @@ fn getset_property_init(
     use_closure: bool,
     name: pyre_object::PyObjectRef,
 ) {
+    // The descriptor struct is allocated by `make_getset_property_full`
+    // already filled in (typedef.py:327-336 hands the fully-formed
+    // instance back to the caller); this helper survives only as the
+    // copy-for-type path that re-stamps an existing W_GetSetProperty
+    // with new bindings.
+    let _ = use_closure; // mirrored in the struct but unused here
     let resolved_name = if !name.is_null() && unsafe { pyre_object::is_str(name) } {
         name
     } else {
         pyre_object::w_str_new("<generic property>")
     };
-    getset_fields_write(
-        new,
-        GetSetFields {
-            fget: fget as usize,
-            fset: fset as usize,
-            fdel: fdel as usize,
-            doc: doc as usize,
-            reqcls: cls as usize,
-            use_closure,
-            name: resolved_name as usize,
-        },
-    );
+    unsafe {
+        let descr = &mut *(new as *mut pyre_object::getsetproperty::W_GetSetProperty);
+        descr.fget = fget;
+        descr.fset = fset;
+        descr.fdel = fdel;
+        descr.doc = doc;
+        descr.reqcls = cls;
+        descr.name = resolved_name;
+        descr.use_closure = use_closure;
+    }
 }
 
 /// Read the optional `reqcls` field from a getset descriptor.
 /// Returns null if no required class is set.
 fn read_reqcls(descr: pyre_object::PyObjectRef) -> pyre_object::PyObjectRef {
-    getset_fields_read(descr)
-        .map(|f| f.reqcls as pyre_object::PyObjectRef)
-        .filter(|c| !c.is_null() && !unsafe { pyre_object::is_none(*c) })
-        .unwrap_or(pyre_object::PY_NULL)
+    if descr.is_null() {
+        return pyre_object::PY_NULL;
+    }
+    let value = unsafe { pyre_object::getsetproperty::w_getset_get_reqcls(descr) };
+    if value.is_null() || unsafe { pyre_object::is_none(value) } {
+        pyre_object::PY_NULL
+    } else {
+        value
+    }
 }
 
 fn read_fget(descr: pyre_object::PyObjectRef) -> pyre_object::PyObjectRef {
-    getset_fields_read(descr)
-        .map(|f| f.fget as pyre_object::PyObjectRef)
-        .unwrap_or(pyre_object::PY_NULL)
+    if descr.is_null() {
+        return pyre_object::PY_NULL;
+    }
+    unsafe { pyre_object::getsetproperty::w_getset_get_fget(descr) }
 }
 
 fn read_fset(descr: pyre_object::PyObjectRef) -> pyre_object::PyObjectRef {
-    getset_fields_read(descr)
-        .map(|f| f.fset as pyre_object::PyObjectRef)
-        .unwrap_or(pyre_object::PY_NULL)
+    if descr.is_null() {
+        return pyre_object::PY_NULL;
+    }
+    unsafe { pyre_object::getsetproperty::w_getset_get_fset(descr) }
 }
 
 fn read_fdel(descr: pyre_object::PyObjectRef) -> pyre_object::PyObjectRef {
-    getset_fields_read(descr)
-        .map(|f| f.fdel as pyre_object::PyObjectRef)
-        .unwrap_or(pyre_object::PY_NULL)
+    if descr.is_null() {
+        return pyre_object::PY_NULL;
+    }
+    unsafe { pyre_object::getsetproperty::w_getset_get_fdel(descr) }
 }
 
 fn read_descr_name(descr: pyre_object::PyObjectRef) -> pyre_object::PyObjectRef {
-    getset_fields_read(descr)
-        .map(|f| f.name as pyre_object::PyObjectRef)
-        .unwrap_or(pyre_object::PY_NULL)
+    if descr.is_null() {
+        return pyre_object::PY_NULL;
+    }
+    unsafe { pyre_object::getsetproperty::w_getset_get_name(descr) }
 }
 
 /// typedef.py:337-345 GetSetProperty.copy_for_type.
@@ -4703,33 +5957,32 @@ fn copy_for_type(
     descr: pyre_object::PyObjectRef,
     w_objclass: pyre_object::PyObjectRef,
 ) -> pyre_object::PyObjectRef {
-    use pyre_object::instanceobject::w_instance_new;
     // typedef.py:338 if self.reqcls is None:
     let reqcls = read_reqcls(descr);
     if !reqcls.is_null() {
         // typedef.py:344 return self
         return descr;
     }
-    let fields = match getset_fields_read(descr) {
-        Some(f) => f,
-        None => return descr,
-    };
-    // typedef.py:339 new = instantiate(GetSetProperty)
-    let new = w_instance_new(getset_descriptor_type());
-    // typedef.py:340-341 new._init(self.fget, self.fset, self.fdel, self.doc,
-    //                              self.reqcls, self.use_closure, self.name)
-    getset_property_init(
-        new,
-        fields.fget as pyre_object::PyObjectRef,
-        fields.fset as pyre_object::PyObjectRef,
-        fields.fdel as pyre_object::PyObjectRef,
-        fields.doc as pyre_object::PyObjectRef,
+    if !unsafe { pyre_object::getsetproperty::is_getset_property(descr) } {
+        return descr;
+    }
+    // typedef.py:350-352 — allocate a fresh GetSetProperty and copy
+    // every slot from the source descriptor (reqcls passes through as
+    // None per the source's `if self.reqcls is None` precondition).
+    let _ = getset_descriptor_type(); // ensure type registered
+    let src = unsafe { &*(descr as *const pyre_object::getsetproperty::W_GetSetProperty) };
+    let new = pyre_object::getsetproperty::w_getset_property_new(
+        src.fget,
+        src.fset,
+        src.fdel,
+        src.doc,
         pyre_object::PY_NULL,
-        fields.use_closure,
-        fields.name as pyre_object::PyObjectRef,
+        src.use_closure,
+        src.name,
     );
-    // typedef.py:342 new.w_objclass = w_objclass
-    let _ = crate::baseobjspace::setattr(new, "__objclass__", w_objclass);
+    // typedef.py:353 new.w_objclass = w_objclass — write directly to
+    // the typed slot, mirroring PyPy's instance-field assignment.
+    unsafe { pyre_object::getsetproperty::w_getset_set_objclass(new, w_objclass) };
     new
 }
 

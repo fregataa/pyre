@@ -129,13 +129,23 @@ fn wrap_trace_frame(frame: *mut PyFrame) -> PyObjectRef {
         let _ = crate::baseobjspace::setattr(w_frame, "f_back", f_back_obj);
         // pyframe.py:768-771 fget_f_builtins → self.get_builtin().getdict(space)
         let _ = crate::baseobjspace::setattr(w_frame, "f_builtins", frame_ref.fget_f_builtins());
+        // `pyframe.py:766 fget_f_globals` returns `self.w_globals`
+        // directly — same identity as `module.__dict__` so trace
+        // hooks (`sys.settrace`) observe `frame.f_globals is
+        // module.__dict__`.  Pyre routes through
+        // `dict_storage_to_dict` which returns the canonical
+        // W_DictObject paired with the storage (mirror_target
+        // invariant); a fresh `w_dict_new_with_dict_storage`
+        // wrapper per trace callback would silently break that
+        // identity.  `f_locals` follows the same shape (PyPy
+        // `pyframe.py:546 fast2locals` then `self.debugdata.w_locals`).
         let _ = crate::baseobjspace::setattr(
             w_frame,
             "f_globals",
             if w_globals.is_null() {
                 pyre_object::w_none()
             } else {
-                pyre_object::dictobject::w_dict_new_with_dict_storage(w_globals as *mut u8)
+                crate::baseobjspace::dict_storage_to_dict(w_globals as *const DictStorage)
             },
         );
         let _ = crate::baseobjspace::setattr(
@@ -144,7 +154,7 @@ fn wrap_trace_frame(frame: *mut PyFrame) -> PyObjectRef {
             if w_locals.is_null() {
                 pyre_object::w_none()
             } else {
-                pyre_object::dictobject::w_dict_new_with_dict_storage(w_locals as *mut u8)
+                crate::baseobjspace::dict_storage_to_dict(w_locals as *const DictStorage)
             },
         );
         let _ = crate::baseobjspace::setattr(

@@ -58,6 +58,53 @@ pub struct Function {
     /// `PY_NULL` until `function_get_globals_obj()` performs the
     /// `dict_storage_to_dict` lookup once.
     pub w_func_globals_obj: PyObjectRef,
+    /// `function.py:50 w_ann=None` constructor default plus
+    /// `function.py:548-551 fget_func_annotations` lazy-init shape:
+    /// PyPy stores the annotations dict directly on the function and
+    /// allocates an empty dict on first read when none was set.
+    /// Pyre mirrors that by keeping the slot `PY_NULL` until either
+    /// `MAKE_FUNCTION ANNOTATIONS` flag stamps the compile-time dict
+    /// (`function.py:553-559 fset_func_annotations`) or the getter
+    /// lazy-fills with `w_dict_new()`.  `f.__annotations__ is
+    /// f.__annotations__` identity holds because both reads see the
+    /// cached slot after the first allocation.
+    pub w_ann: PyObjectRef,
+    /// `function.py:375 self.w_doc = w_doc` constructor slot plus
+    /// `function.py:446-449 fget_func_doc` cache:
+    ///
+    /// ```python
+    /// def fget_func_doc(self, space):
+    ///     if self.w_doc is None:
+    ///         self.w_doc = self.code.getdocstring(space)
+    ///     return self.w_doc
+    /// ```
+    ///
+    /// `PY_NULL` means "not yet resolved" (PyPy `None`); first reader
+    /// caches `code.getdocstring()` here so subsequent
+    /// `f.__doc__ is f.__doc__` holds.  `function_del_doc` writes
+    /// `w_none()` to make the deleted state sticky against the lazy
+    /// fallback (`function.py:455-457 fdel_func_doc`).
+    pub w_doc: PyObjectRef,
+    /// `function.py:54 self.qualname = qualname or self.name` slot —
+    /// PyPy stores the qualified name as a regular field on the
+    /// function object.  `PY_NULL` means "not explicitly set"; the
+    /// getter falls back to `code.co_qualname` then `name` to mirror
+    /// the constructor's `qualname or self.name` short-circuit when
+    /// the compile path did not stamp a value at MAKE_FUNCTION time.
+    pub w_qualname: PyObjectRef,
+    /// `function.py:498-504 fget_func_objclass / set_objclass` slot —
+    /// PyPy stores the bound class on the function for descriptor
+    /// introspection (`inspect.getfullargspec` etc.).  `PY_NULL`
+    /// means "not bound to a class" and the getter raises
+    /// AttributeError per `function.py:500`.
+    pub w_objclass: PyObjectRef,
+    /// `function.py:487-496 fget_func_text_signature /
+    /// fset_func_text_signature` slot — PyPy stores the text
+    /// signature (the docstring-prefix `(...)` line that PEP 437
+    /// describes for builtins) directly on the function.  `PY_NULL`
+    /// means "no signature recorded" and the getter returns
+    /// `space.w_None` per `function.py:488`.
+    pub w_text_signature: PyObjectRef,
 }
 
 /// function.py:706 — `class BuiltinFunction(Function): can_change_code = False`
@@ -86,6 +133,22 @@ pub const FUNCTION_W_MODULE_OFFSET: usize = std::mem::offset_of!(Function, w_mod
 /// lazy-cached canonical W_DictObject for `w_func_globals`.
 pub const FUNCTION_W_FUNC_GLOBALS_OBJ_OFFSET: usize =
     std::mem::offset_of!(Function, w_func_globals_obj);
+/// Field offset of `w_ann` within `Function` — the
+/// `function.py:50 w_ann` annotations dict slot.
+pub const FUNCTION_W_ANN_OFFSET: usize = std::mem::offset_of!(Function, w_ann);
+/// Field offset of `w_doc` within `Function` — the
+/// `function.py:375 w_doc` docstring cache slot.
+pub const FUNCTION_W_DOC_OFFSET: usize = std::mem::offset_of!(Function, w_doc);
+/// Field offset of `w_qualname` within `Function` — the
+/// `function.py:54 qualname` slot.
+pub const FUNCTION_W_QUALNAME_OFFSET: usize = std::mem::offset_of!(Function, w_qualname);
+/// Field offset of `w_objclass` within `Function` — the
+/// `function.py:498-504 w_objclass` slot.
+pub const FUNCTION_W_OBJCLASS_OFFSET: usize = std::mem::offset_of!(Function, w_objclass);
+/// Field offset of `w_text_signature` within `Function` — the
+/// `function.py:487-496 w_text_signature` slot.
+pub const FUNCTION_W_TEXT_SIGNATURE_OFFSET: usize =
+    std::mem::offset_of!(Function, w_text_signature);
 
 /// GC type id assigned to `Function` at JitDriver init time. Held as
 /// a constant alongside the struct (rather than runtime-queried) so
@@ -123,7 +186,7 @@ pub const FUNCTION_OBJECT_SIZE: usize = std::mem::size_of::<Function>();
 /// W_FloatObject leave the typeptr-shaped header field out of their
 /// `gc_ptr_offsets`. W_TypeObject instances are static-region and
 /// not subject to nursery relocation.
-pub const FUNCTION_GC_PTR_OFFSETS: [usize; 6] = [
+pub const FUNCTION_GC_PTR_OFFSETS: [usize; 11] = [
     FUNCTION_CODE_OFFSET,
     FUNCTION_CLOSURE_OFFSET,
     FUNCTION_DEFS_W_OFFSET,
@@ -134,6 +197,20 @@ pub const FUNCTION_GC_PTR_OFFSETS: [usize; 6] = [
     // collection — the `dict_storage_to_dict` mirror_target invariant
     // keeps the same identity across the function's lifetime.
     FUNCTION_W_FUNC_GLOBALS_OBJ_OFFSET,
+    // `function.py:50 w_ann` — annotations dict, allocated lazily on
+    // first read by the getter or stamped at MAKE_FUNCTION time.
+    FUNCTION_W_ANN_OFFSET,
+    // `function.py:375 w_doc` — docstring slot cached on first read.
+    FUNCTION_W_DOC_OFFSET,
+    // `function.py:54 qualname` — qualified name slot stamped at
+    // construction or via `f.__qualname__ = ...`.
+    FUNCTION_W_QUALNAME_OFFSET,
+    // `function.py:498-504 w_objclass` — bound class for descriptor
+    // introspection (`inspect.getfullargspec` etc.).
+    FUNCTION_W_OBJCLASS_OFFSET,
+    // `function.py:487-496 w_text_signature` — PEP 437 text signature
+    // line stripped from the docstring.
+    FUNCTION_W_TEXT_SIGNATURE_OFFSET,
 ];
 
 impl pyre_object::lltype::GcType for Function {
@@ -204,6 +281,11 @@ fn function_new_impl(
         w_kw_defs: PY_NULL,
         w_module: PY_NULL,
         w_func_globals_obj: PY_NULL,
+        w_ann: PY_NULL,
+        w_doc: PY_NULL,
+        w_qualname: PY_NULL,
+        w_objclass: PY_NULL,
+        w_text_signature: PY_NULL,
     }) as PyObjectRef
 }
 
@@ -234,14 +316,20 @@ pub fn function_new_builtin(
     )
 }
 
-/// function.py:367-370 — `_check_code_mutable(attr)`:
-/// Raises TypeError if function code is not mutable.
+/// function.py:385-388 — `_check_code_mutable(attr)`:
+///
+/// ```python
+/// def _check_code_mutable(self, attr):
+///     if not self.can_change_code:
+///         raise oefmt(self.space.w_AttributeError,
+///                     "Cannot change %s attribute of builtin functions", attr)
+/// ```
 pub unsafe fn _check_code_mutable(func: PyObjectRef, attr: &str) -> Result<(), crate::PyError> {
     unsafe {
         if (*(func as *const Function)).can_change_code {
             Ok(())
         } else {
-            Err(crate::PyError::type_error(format!(
+            Err(crate::PyError::attribute_error(format!(
                 "Cannot change {} attribute of builtin functions",
                 attr
             )))
@@ -354,51 +442,81 @@ pub unsafe fn function_get_name(obj: PyObjectRef) -> &'static str {
     unsafe { &*(*(obj as *const Function)).name }
 }
 
-/// pypy/interpreter/function.py:53 `self.qualname = qualname or self.name`.
+/// `function.py:476-485 fset_func_qualname` parity:
 ///
-/// PyPy's `Function` stores `qualname` as a separate field initialised
-/// from the code object's `co_qualname` (see
-/// `function.py:50-54 __init__`).  Pyre's `Function` does not yet
-/// carry that field, so the lookup mirrors the same precedence that
-/// `getattr(func, '__qualname__')` already implements (see
-/// `baseobjspace.rs:3635-3653`):
+/// ```python
+/// def fset_func_qualname(self, space, w_name):
+///     self._check_code_mutable("__qualname__")
+///     try:
+///         qualname = space.realutf8_w(w_name)
+///     except OperationError as e:
+///         if e.match(space, space.w_TypeError):
+///             raise oefmt(space.w_TypeError,
+///                         "__qualname__ must be set to a string object")
+///         raise
+///     self.set_qualname(qualname)
+/// ```
 ///
-/// 1. ATTR_TABLE override (corresponds to PyPy's `set_qualname`
-///    `function.py:473-485`).
-/// 2. The bytecode `code.qualname` (CPython's `co_qualname`).
-/// 3. Fall back to the bare `function.name` — matches the
-///    `qualname or self.name` short-circuit.
+/// # Safety
+/// `obj` must point to a valid `Function`.
+pub unsafe fn fset_func_qualname(
+    obj: PyObjectRef,
+    value: PyObjectRef,
+) -> Result<(), crate::PyError> {
+    unsafe {
+        _check_code_mutable(obj, "__qualname__")?; // function.py:477
+        if value.is_null() || !pyre_object::is_str(value) {
+            return Err(crate::PyError::type_error(
+                "__qualname__ must be set to a string object",
+            ));
+        }
+        (*(obj as *mut Function)).w_qualname = value;
+        Ok(())
+    }
+}
+
+/// `function.py:470-471 fget_func_qualname` parity:
 ///
-/// PRE-EXISTING-ADAPTATION: storing `qualname` directly on `Function`
-/// requires growing the struct + GC offset table + JIT field offsets.
-/// Until that lands, this accessor is the line-by-line stand-in for
-/// `w_function.qualname`.
+/// ```python
+/// def fget_func_qualname(self, space):
+///     return space.newtext(self.qualname)
+/// ```
+///
+/// `self.qualname` is initialised from `qualname or self.name` at
+/// `function.py:54 __init__`.  MAKE_FUNCTION
+/// (`runtime_ops::make_function_from_code_obj`) stamps `w_qualname`
+/// from `codeobj.co_qualname` at construction, so subsequent
+/// `__code__ = new_code` assignments do NOT alter `__qualname__`
+/// (matching `pypy/interpreter/pyopcode.py:1457` + `function.py:54`).
+/// When `w_qualname` is still `PY_NULL` (legacy callers that never
+/// stamped it — builtins built via `gateway.rs` / unit tests), fall
+/// back to the bare `name` string per `qualname or self.name`.
 ///
 /// # Safety
 /// `obj` must point to a valid `Function`.
 pub unsafe fn function_get_qualname(obj: PyObjectRef) -> String {
     unsafe {
-        // function.py:473-485 — explicit `set_qualname(qualname)`
-        // mirrors `obj.__qualname__ = ...` which lands in ATTR_TABLE.
-        if let Some(w_qn) = crate::baseobjspace::ATTR_TABLE.with(|table| {
-            table
-                .borrow()
-                .get(&(obj as usize))
-                .and_then(|d| d.get("__qualname__").copied())
-        }) && pyre_object::is_str(w_qn)
-        {
-            return pyre_object::w_str_get_value(w_qn).to_string();
+        let cached = (*(obj as *const Function)).w_qualname;
+        if !cached.is_null() && pyre_object::is_str(cached) {
+            return pyre_object::w_str_get_value(cached).to_string();
         }
-        // function.py:50-54 — `qualname=None` defaults to `co_qualname`.
-        let code = function_get_code(obj) as PyObjectRef;
-        if !code.is_null() && crate::pycode::is_code(code) {
-            let raw_code_ptr = crate::pycode::w_code_get_ptr(code) as *const crate::CodeObject;
-            if !raw_code_ptr.is_null() {
-                return (*raw_code_ptr).qualname.to_string();
-            }
-        }
-        // `qualname or self.name`.
         function_get_name(obj).to_string()
+    }
+}
+
+/// `function.py:54 self.qualname = qualname or self.name` setter —
+/// used by MAKE_FUNCTION (`runtime_ops::make_function_from_code_obj`)
+/// to freeze the qualified name immediately after `function_new`.
+/// Bypasses `_check_code_mutable` because this is the construction
+/// path; user code goes through `fset_func_qualname` instead.
+///
+/// # Safety
+/// `obj` must point to a valid `Function`; `value` must be a string
+/// `PyObjectRef`.
+#[inline]
+pub unsafe fn function_set_qualname(obj: PyObjectRef, value: PyObjectRef) {
+    unsafe {
+        (*(obj as *mut Function)).w_qualname = value;
     }
 }
 
@@ -519,77 +637,216 @@ pub unsafe fn setdict(obj: PyObjectRef, value: PyObjectRef) {
     unsafe { function_setdict(obj, value) }
 }
 
-/// PyPy `W_Function.fget_func_doc` accessor (function.py:395-398).
+/// `function.py:446-449 fget_func_doc` parity:
 ///
-/// ```text
+/// ```python
 /// def fget_func_doc(self, space):
 ///     if self.w_doc is None:
 ///         self.w_doc = self.code.getdocstring(space)
 ///     return self.w_doc
 /// ```
 ///
-/// pyre has no `w_doc` struct field, so the explicit override (set via
-/// `function_set_doc`) lives in the instance dict. Both lookups bypass
-/// `crate::getattr` because `getattr(func, "__doc__")` resolves to the
-/// typedef-installed `getset_func_doc` descriptor, which would call back
-/// into here and recurse forever.
+/// `(*func).w_doc == PY_NULL` mirrors PyPy's `self.w_doc is None`
+/// (the unset / not-yet-cached state).  First reader resolves
+/// `code.getdocstring(space)` and stamps the result back so subsequent
+/// `f.__doc__ is f.__doc__` holds; `function_del_doc` writes
+/// `w_none()` to make the deleted state sticky against the lazy
+/// fallback (`function.py:455-457 fdel_func_doc`).
+///
+/// `code.getdocstring(space)` has two shapes in pyre:
+///   - `BuiltinCode`: stores `docstring` directly (gateway.rs:581).
+///   - `W_CodeObject`: docstring is the first const when `code.flags`
+///     has `HAS_DOCSTRING` set, mirroring `pycode.py:230
+///     PyCode.getdocstring`.
 pub fn function_get_doc(obj: PyObjectRef) -> PyObjectRef {
     if obj.is_null() {
         return pyre_object::w_none();
     }
-    // First-level: explicit override stored on the function instance
-    // (function.py:400 fset_func_doc writes here).
-    let w_dict = crate::objspace::std::mapdict::INSTANCE_DICT
-        .with(|table| table.borrow().get(&(obj as usize)).copied())
-        .unwrap_or(pyre_object::PY_NULL);
-    if !w_dict.is_null() {
-        if let Some(v) = unsafe { pyre_object::w_dict_getitem_str(w_dict, "__doc__") } {
-            return v;
-        }
+    let func = obj as *mut Function;
+    let cached = unsafe { (*func).w_doc };
+    if !cached.is_null() {
+        return cached;
     }
-    // Second-level: lazy fallback to `code.getdocstring(space)`
-    // (function.py:397). pyre's BuiltinCode stores `docstring` directly;
-    // user-level CodeObjects do not yet, so they default to None.
+    // Lazy fallback: `code.getdocstring(space)` (function.py:448).
+    let resolved = code_getdocstring(obj);
+    unsafe {
+        (*func).w_doc = resolved;
+    }
+    resolved
+}
+
+/// `pycode.py:230 PyCode.getdocstring(space)` parity for the two code
+/// shapes pyre carries — extracted out of `function_get_doc` so
+/// `fset_func_code`'s pre-assignment cache step
+/// (`function.py:538 self.fget_func_doc(space)`) can reach the same
+/// path without going through the cache write.
+fn code_getdocstring(obj: PyObjectRef) -> PyObjectRef {
     let code = unsafe { function_get_code(obj) } as PyObjectRef;
-    if !code.is_null() && unsafe { crate::gateway::is_builtin_code(code) } {
+    if code.is_null() {
+        return pyre_object::w_none();
+    }
+    if unsafe { crate::gateway::is_builtin_code(code) } {
         return unsafe { crate::gateway::builtin_code_get_docstring(code) };
+    }
+    if unsafe { crate::pycode::is_code(code) } {
+        let raw = unsafe { crate::pycode::w_code_get_ptr(code) } as *const crate::CodeObject;
+        if !raw.is_null() {
+            let code_ref = unsafe { &*raw };
+            if code_ref.flags.contains(crate::CodeFlags::HAS_DOCSTRING)
+                && !code_ref.constants.is_empty()
+            {
+                let first = crate::pyframe::load_const_from_code(code_ref, 0);
+                if !first.is_null() && unsafe { pyre_object::is_str(first) } {
+                    return first;
+                }
+            }
+        }
     }
     pyre_object::w_none()
 }
 
-/// function.py:400 — `fset_func_doc` mutator.
+/// `function.py:451-453 fset_func_doc` parity:
 ///
-/// Writes the doc directly into the instance dict; the typedef-installed
-/// `getset_func_doc` descriptor would otherwise recurse if we routed
-/// through `setattr`.
+/// ```python
+/// def fset_func_doc(self, space, w_doc):
+///     self._check_code_mutable("__doc__")
+///     self.w_doc = w_doc
+/// ```
 pub unsafe fn function_set_doc(obj: PyObjectRef, value: PyObjectRef) -> Result<(), crate::PyError> {
     unsafe {
-        _check_code_mutable(obj, "func_doc")?; // function.py:401
+        _check_code_mutable(obj, "__doc__")?; // function.py:452
         if obj.is_null() {
             return Ok(());
         }
-        let w_dict = crate::baseobjspace::getdict(obj);
-        if !w_dict.is_null() {
-            pyre_object::w_dict_setitem_str(w_dict, "__doc__", value);
-        }
+        (*(obj as *mut Function)).w_doc = value;
         Ok(())
     }
 }
 
-/// function.py:404 — `fdel_func_doc` deleter.
+/// `function.py:455-457 fdel_func_doc` parity:
 ///
-/// Removes the doc directly from the instance dict (see `function_set_doc`
-/// for the recursion rationale).
+/// ```python
+/// def fdel_func_doc(self, space):
+///     self._check_code_mutable("__doc__")
+///     self.w_doc = space.w_None
+/// ```
+///
+/// Stamps `w_none()` so the next `function_get_doc` short-circuits
+/// the lazy `code.getdocstring(space)` fallback — `w_doc` is no
+/// longer null, so the cache hit returns `w_none()` directly.
 pub unsafe fn function_del_doc(obj: PyObjectRef) -> Result<(), crate::PyError> {
     unsafe {
-        _check_code_mutable(obj, "func_doc")?; // function.py:405
+        _check_code_mutable(obj, "__doc__")?; // function.py:456
         if obj.is_null() {
             return Ok(());
         }
-        let w_dict = crate::baseobjspace::getdict(obj);
-        if !w_dict.is_null() {
-            pyre_object::w_dict_delitem_str(w_dict, "__doc__");
+        (*(obj as *mut Function)).w_doc = pyre_object::w_none();
+        Ok(())
+    }
+}
+
+/// `function.py:548-551 fget_func_annotations` parity — returns the
+/// stored annotations dict, lazily allocating an empty dict on the
+/// first read when none was set.  PyPy mutates `self.w_ann = space
+/// .newdict()` in place so subsequent reads return the same dict
+/// (`f.__annotations__ is f.__annotations__`); pyre stamps the slot
+/// the same way through `function_set_annotations`.
+///
+/// # Safety
+/// `obj` must point to a valid `Function`.
+#[inline]
+pub unsafe fn function_get_annotations(obj: PyObjectRef) -> PyObjectRef {
+    unsafe {
+        if obj.is_null() {
+            return pyre_object::w_dict_new();
         }
+        let func = obj as *mut Function;
+        let cached = (*func).w_ann;
+        if !cached.is_null() {
+            return cached;
+        }
+        let fresh = pyre_object::w_dict_new();
+        (*func).w_ann = fresh;
+        fresh
+    }
+}
+
+/// MAKE_FUNCTION ANNOTATIONS opcode helper — stamps the
+/// compile-time annotations dict directly into `Function.w_ann`
+/// without running `function.py:553-559 fset_func_annotations`'s
+/// type validation.  The compiler always emits a real dict here, so
+/// the `isinstance(w_new, dict)` check would never fail; bypassing
+/// it keeps the opcode hot path free of error-handling overhead.
+///
+/// User-level `f.__annotations__ = X` writes go through
+/// `fset_func_annotations` (typedef getset descriptor) instead.
+///
+/// # Safety
+/// `obj` must point to a valid `Function`.
+#[inline]
+pub unsafe fn function_set_annotations(obj: PyObjectRef, w_ann: PyObjectRef) {
+    unsafe {
+        if obj.is_null() {
+            return;
+        }
+        (*(obj as *mut Function)).w_ann = w_ann;
+    }
+}
+
+/// `function.py:553-559 fset_func_annotations` parity:
+///
+/// ```python
+/// def fset_func_annotations(self, space, w_new):
+///     self._check_code_mutable("__annotations__")
+///     if space.is_w(w_new, space.w_None):
+///         w_new = None
+///     elif not space.isinstance_w(w_new, space.w_dict):
+///         raise oefmt(space.w_TypeError, "__annotations__ must be a dict")
+///     self.w_ann = w_new
+/// ```
+///
+/// # Safety
+/// `obj` must point to a valid `Function`.
+pub unsafe fn fset_func_annotations(
+    obj: PyObjectRef,
+    value: PyObjectRef,
+) -> Result<(), crate::PyError> {
+    unsafe {
+        _check_code_mutable(obj, "__annotations__")?; // function.py:554
+        if obj.is_null() {
+            return Ok(());
+        }
+        // function.py:555-558 — None clears the slot, anything else
+        // must be a dict.
+        let stored = if value.is_null() || pyre_object::is_none(value) {
+            PY_NULL
+        } else if pyre_object::is_dict(value) {
+            value
+        } else {
+            return Err(crate::PyError::type_error("__annotations__ must be a dict"));
+        };
+        (*(obj as *mut Function)).w_ann = stored;
+        Ok(())
+    }
+}
+
+/// `function.py:561-563 fdel_func_annotations` parity:
+///
+/// ```python
+/// def fdel_func_annotations(self, space):
+///     self._check_code_mutable("__annotations__")
+///     self.w_ann = None
+/// ```
+///
+/// # Safety
+/// `obj` must point to a valid `Function`.
+pub unsafe fn fdel_func_annotations(obj: PyObjectRef) -> Result<(), crate::PyError> {
+    unsafe {
+        _check_code_mutable(obj, "__annotations__")?; // function.py:562
+        if obj.is_null() {
+            return Ok(());
+        }
+        (*(obj as *mut Function)).w_ann = PY_NULL;
         Ok(())
     }
 }
@@ -607,28 +864,51 @@ pub unsafe fn fget_func_defaults(obj: PyObjectRef) -> PyObjectRef {
     }
 }
 
-/// function.py:381 — `fset_func_defaults` mutator.
+/// `function.py:408-416 fset_func_defaults` parity:
+///
+/// ```python
+/// def fset_func_defaults(self, space, w_defaults):
+///     self._check_code_mutable("__defaults__")
+///     if space.is_w(w_defaults, space.w_None):
+///         self.defs_w = []
+///         return
+///     if not space.isinstance_w(w_defaults, space.w_tuple):
+///         raise oefmt(space.w_TypeError,
+///                     "__defaults__ must be set to a tuple object or None")
+///     self.defs_w = space.fixedview(w_defaults)
+/// ```
 #[inline]
 pub unsafe fn fset_func_defaults(
     obj: PyObjectRef,
     value: PyObjectRef,
 ) -> Result<(), crate::PyError> {
     unsafe {
-        _check_code_mutable(obj, "func_defaults")?; // function.py:382
+        _check_code_mutable(obj, "__defaults__")?; // function.py:409
         if value.is_null() || pyre_object::is_none(value) {
             function_set_defaults(obj, pyre_object::PY_NULL);
-        } else {
-            function_set_defaults(obj, value);
+            return Ok(());
         }
+        if !pyre_object::is_tuple(value) {
+            return Err(crate::PyError::type_error(
+                "__defaults__ must be set to a tuple object or None",
+            ));
+        }
+        function_set_defaults(obj, value);
         Ok(())
     }
 }
 
-/// function.py:391 — `fdel_func_defaults` deleter.
+/// `function.py:418-420 fdel_func_defaults` parity:
+///
+/// ```python
+/// def fdel_func_defaults(self, space):
+///     self._check_code_mutable("__defaults__")
+///     self.defs_w = []
+/// ```
 #[inline]
 pub unsafe fn fdel_func_defaults(obj: PyObjectRef) -> Result<(), crate::PyError> {
     unsafe {
-        _check_code_mutable(obj, "func_defaults")?; // function.py:392
+        _check_code_mutable(obj, "__defaults__")?; // function.py:419
         function_set_defaults(obj, pyre_object::PY_NULL);
         Ok(())
     }
@@ -647,28 +927,50 @@ pub unsafe fn fget_func_kwdefaults(obj: PyObjectRef) -> PyObjectRef {
     }
 }
 
-/// function.py — `fset_func_kwdefaults` mutator.
+/// `function.py:427-433 fset_func_kwdefaults` parity:
+///
+/// ```python
+/// def fset_func_kwdefaults(self, space, w_new):
+///     if space.is_w(w_new, space.w_None):
+///         self.w_kw_defs = None
+///     else:
+///         if not space.isinstance_w(w_new, space.w_dict):
+///             raise oefmt(space.w_TypeError, "__kwdefaults__ must be a dict")
+///         self.w_kw_defs = w_new
+/// ```
+///
+/// PyPy intentionally omits `_check_code_mutable` here — `__kwdefaults__`
+/// is settable on builtins too.
 #[inline]
 pub unsafe fn fset_func_kwdefaults(
     obj: PyObjectRef,
     value: PyObjectRef,
 ) -> Result<(), crate::PyError> {
     unsafe {
-        _check_code_mutable(obj, "func_kwdefaults")?;
         if value.is_null() || pyre_object::is_none(value) {
             function_set_kwdefaults(obj, pyre_object::PY_NULL);
-        } else {
-            function_set_kwdefaults(obj, value);
+            return Ok(());
         }
+        if !pyre_object::is_dict(value) {
+            return Err(crate::PyError::type_error("__kwdefaults__ must be a dict"));
+        }
+        function_set_kwdefaults(obj, value);
         Ok(())
     }
 }
 
-/// function.py — `fdel_func_kwdefaults` deleter.
+/// `function.py:435-436 fdel_func_kwdefaults` parity:
+///
+/// ```python
+/// def fdel_func_kwdefaults(self, space):
+///     self.w_kw_defs = None
+/// ```
+///
+/// PyPy intentionally omits `_check_code_mutable` here — symmetric
+/// with `fset_func_kwdefaults` at function.py:427-433.
 #[inline]
 pub unsafe fn fdel_func_kwdefaults(obj: PyObjectRef) -> Result<(), crate::PyError> {
     unsafe {
-        _check_code_mutable(obj, "func_kwdefaults")?;
         function_set_kwdefaults(obj, pyre_object::PY_NULL);
         Ok(())
     }
@@ -712,11 +1014,109 @@ pub unsafe fn function_set_func_name(obj: PyObjectRef, name: PyObjectRef) {
     }
 }
 
-/// function.py:411 — `fset_func_name` setter.
+/// `function.py:498-501 fget_func_objclass` parity:
+///
+/// ```python
+/// def fget_func_objclass(self, space):
+///     if self.w_objclass is None:
+///         raise oefmt(space.w_AttributeError, "__objclass__")
+///     return self.w_objclass
+/// ```
+///
+/// # Safety
+/// `obj` must point to a valid `Function`.
+#[inline]
+pub unsafe fn fget_func_objclass(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    unsafe {
+        let value = (*(obj as *const Function)).w_objclass;
+        if value.is_null() {
+            return Err(crate::PyError::attribute_error("__objclass__"));
+        }
+        Ok(value)
+    }
+}
+
+/// `function.py:503-504 set_objclass(w_type)` parity — direct field
+/// write used by descriptor-bind helpers.
+///
+/// # Safety
+/// `obj` must point to a valid `Function`.
+#[inline]
+pub unsafe fn function_set_objclass(obj: PyObjectRef, w_type: PyObjectRef) {
+    unsafe {
+        (*(obj as *mut Function)).w_objclass = w_type;
+    }
+}
+
+/// `function.py:487-490 fget_func_text_signature` parity:
+///
+/// ```python
+/// def fget_func_text_signature(self, space):
+///     if self.w_text_signature is None:
+///         raise oefmt(space.w_AttributeError, "__text_signature__")
+///     return self.w_text_signature
+/// ```
+///
+/// PyPy distinguishes the RPython-level `None` (unset, raises
+/// `AttributeError`) from `space.w_None` (explicitly stored). Pyre
+/// uses `PY_NULL` for the former; `space.w_None` survives as a
+/// real PyObjectRef.
+///
+/// # Safety
+/// `obj` must point to a valid `Function`.
+#[inline]
+pub unsafe fn fget_func_text_signature(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    unsafe {
+        let value = (*(obj as *const Function)).w_text_signature;
+        if value.is_null() {
+            return Err(crate::PyError::attribute_error("__text_signature__"));
+        }
+        Ok(value)
+    }
+}
+
+/// `function.py:492-493 fset_func_text_signature` parity:
+///
+/// ```python
+/// def fset_func_text_signature(self, space, w_value):
+///     self.w_text_signature = w_value
+/// ```
+///
+/// Direct field write — even `space.w_None` is preserved as a real
+/// value (only the RPython-level `None`, i.e. `PY_NULL`, is treated
+/// as "unset" by `fget_func_text_signature`).
+///
+/// # Safety
+/// `obj` must point to a valid `Function`.
+#[inline]
+pub unsafe fn fset_func_text_signature(obj: PyObjectRef, value: PyObjectRef) {
+    unsafe {
+        (*(obj as *mut Function)).w_text_signature = value;
+    }
+}
+
+/// `function.py:411-419 fset_func_name` parity:
+///
+/// ```python
+/// def fset_func_name(self, space, w_name):
+///     self._check_code_mutable("__name__")
+///     if space.isinstance_w(w_name, space.w_text):
+///         self.name = space.text_w(w_name)
+///     else:
+///         raise oefmt(space.w_TypeError, "__name__ must be set to a string")
+/// ```
+///
+/// # Safety
+/// `obj` must point to a valid `Function`.
 #[inline]
 pub unsafe fn fset_func_name(obj: PyObjectRef, name: PyObjectRef) -> Result<(), crate::PyError> {
     unsafe {
-        _check_code_mutable(obj, "func_name")?; // function.py:412
+        _check_code_mutable(obj, "__name__")?; // function.py:412
+        if name.is_null() || !pyre_object::is_str(name) {
+            return Err(crate::PyError::type_error(
+                "__name__ must be set to a string object",
+            ));
+        }
         function_set_func_name(obj, name);
         Ok(())
     }
@@ -738,12 +1138,77 @@ pub unsafe fn function_set_w_globals(obj: PyObjectRef, globals: *mut DictStorage
     }
 }
 
-/// function.py:367 — fset_func_code checks mutability before setting.
-#[inline]
-pub unsafe fn fset_func_code(obj: PyObjectRef, code: *const ()) -> Result<(), crate::PyError> {
+/// `function.py:525-553 fset_func_code` parity:
+///
+/// ```python
+/// def fset_func_code(self, space, w_code):
+///     from pypy.interpreter.pycode import PyCode
+///     if not self.can_change_code:
+///         raise oefmt(space.w_AttributeError,
+///                     "Cannot change code attribute of builtin functions")
+///     code = space.interp_w(Code, w_code)
+///     closure_len = 0
+///     if self.closure:
+///         closure_len = len(self.closure)
+///     if isinstance(code, PyCode) and closure_len != len(code.co_freevars):
+///         raise oefmt(space.w_ValueError,
+///                     "%N() requires a code object with %d free vars, not "
+///                     "%d", self, closure_len, len(code.co_freevars))
+///     self.code = code
+/// ```
+///
+/// `w_code` is the user-provided value as a `PyObjectRef`; this
+/// helper enforces the `is_code(...)` (interp_w PyCode) check and
+/// the closure / freevar arity invariant before reaching for the
+/// inner code pointer.  Without these checks the previous setter
+/// would happily reinterpret arbitrary objects as `*const CodeObject`
+/// and corrupt the function's internal pointer (worse than main's
+/// pre-fix shadowing-via-instance-dict regression).
+///
+/// # Safety
+/// `obj` must point to a valid `Function`.
+pub unsafe fn fset_func_code(obj: PyObjectRef, w_code: PyObjectRef) -> Result<(), crate::PyError> {
     unsafe {
-        _check_code_mutable(obj, "func_code")?;
-        function_set_func_code(obj, code);
+        // function.py:527-529 — `can_change_code = False` on
+        // BuiltinFunction / FunctionWithFixedCode.  pyre exposes
+        // this via `_check_code_mutable` which raises the same
+        // AttributeError.
+        _check_code_mutable(obj, "__code__")?;
+        // function.py:530 — `space.interp_w(Code, w_code)` raises
+        // TypeError when `w_code` is not a `PyCode` instance.
+        if w_code.is_null() || !crate::pycode::is_code(w_code) {
+            return Err(crate::PyError::type_error(
+                "__code__ must be set to a code object",
+            ));
+        }
+        // function.py:531-537 — closure-vs-freevars arity check.
+        // PyPy raises ValueError if the function has N closure cells
+        // and the new code object declares M co_freevars with N != M;
+        // mismatch leaves dangling cells / unbound freevars at runtime.
+        let closure = function_get_closure(obj);
+        let closure_len = if closure.is_null() || pyre_object::is_none(closure) {
+            0
+        } else {
+            pyre_object::w_tuple_len(closure)
+        };
+        let raw_code = crate::pycode::w_code_get_ptr(w_code) as *const crate::CodeObject;
+        let freevars_len = if raw_code.is_null() {
+            0
+        } else {
+            (&(*raw_code).freevars).len()
+        };
+        if closure_len != freevars_len {
+            let name = function_get_name(obj);
+            return Err(crate::PyError::value_error(format!(
+                "{name}() requires a code object with {closure_len} free vars, not {freevars_len}"
+            )));
+        }
+        // function.py:538 self.fget_func_doc(space) — see test_issue1293.
+        // Resolves the OLD code's docstring into `w_doc` *before* the
+        // pointer flip so the cached value reflects the function's
+        // original docstring, not the new code's first const.
+        let _ = function_get_doc(obj);
+        function_set_func_code(obj, w_code as *const ());
         Ok(())
     }
 }
@@ -831,22 +1296,33 @@ pub unsafe fn descr_function__new__(
     }
 }
 
-/// function.py:427 — `fset___module__` setter.
+/// `function.py:514-516 fset___module__` parity:
+///
+/// ```python
+/// def fset___module__(self, space, w_module):
+///     self._check_code_mutable("__module__")
+///     self.w_module = w_module
+/// ```
 #[inline]
 pub unsafe fn fset___module__(obj: PyObjectRef, value: PyObjectRef) -> Result<(), crate::PyError> {
     unsafe {
-        _check_code_mutable(obj, "func_name")?; // function.py:428
-        // function.py:429: self.w_module = w_module
+        _check_code_mutable(obj, "__module__")?; // function.py:515
         (*(obj as *mut Function)).w_module = value;
         Ok(())
     }
 }
 
-/// function.py:431 — `fdel___module__` deleter.
+/// `function.py:518-520 fdel___module__` parity:
+///
+/// ```python
+/// def fdel___module__(self, space):
+///     self._check_code_mutable("__module__")
+///     self.w_module = space.w_None
+/// ```
 #[inline]
 pub unsafe fn fdel___module__(obj: PyObjectRef) -> Result<(), crate::PyError> {
     unsafe {
-        _check_code_mutable(obj, "func_name")?; // function.py:432
+        _check_code_mutable(obj, "__module__")?; // function.py:519
         // function.py:433: self.w_module = space.w_None
         (*(obj as *mut Function)).w_module = pyre_object::w_none();
         Ok(())
@@ -1539,6 +2015,11 @@ mod tests {
                 std::mem::offset_of!(Function, w_kw_defs),
                 std::mem::offset_of!(Function, w_module),
                 std::mem::offset_of!(Function, w_func_globals_obj),
+                std::mem::offset_of!(Function, w_ann),
+                std::mem::offset_of!(Function, w_doc),
+                std::mem::offset_of!(Function, w_qualname),
+                std::mem::offset_of!(Function, w_objclass),
+                std::mem::offset_of!(Function, w_text_signature),
             ]
         );
     }

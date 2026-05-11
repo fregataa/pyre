@@ -342,17 +342,38 @@ pub fn normalize_raise_cause(cause: PyObjectRef) -> Result<PyObjectRef, PyError>
 }
 
 pub fn attach_raise_cause(exc: PyObjectRef, cause: Option<PyObjectRef>) -> Result<(), PyError> {
+    // `pypy/interpreter/pyopcode.py do_raise` /
+    // `pypy/interpreter/executioncontext.py:325 _normalize_exception` —
+    // when a `raise` runs while another exception is being handled,
+    // chain the in-flight one as the new `__context__` so tracebacks
+    // can show "During handling of the above exception, another
+    // exception occurred:". Skip self-context to avoid the obvious
+    // cycle (re-raising the same exception object).  Both
+    // `__context__` and `__cause__`/`__suppress_context__` writes land
+    // in the typed slots on `W_ExceptionObject` per
+    // `interp_exceptions.py:113-117`.
+    let active = CURRENT_EXCEPTION.with(|c| c.get());
+    if !active.is_null()
+        && active != exc
+        && unsafe { !pyre_object::is_none(active) }
+        && unsafe { pyre_object::is_exception(exc) }
+    {
+        // `interp_exceptions.py:115 W_BaseException.w_context = None`
+        // class default — only write if no `__context__` is already
+        // stamped on the exception (mirrors `or_insert` semantics).
+        let existing = unsafe { pyre_object::excobject::w_exception_get_context(exc) };
+        if existing.is_null() {
+            unsafe { pyre_object::excobject::w_exception_set_context(exc, active) };
+        }
+    }
     if let Some(cause_obj) = cause {
-        if !cause_obj.is_null() {
-            crate::baseobjspace::ATTR_TABLE.with(|table| {
-                let mut table = table.borrow_mut();
-                let attrs = table.entry(exc as usize).or_default();
-                attrs.insert("__cause__".to_string(), cause_obj);
-                attrs.insert(
-                    "__suppress_context__".to_string(),
-                    pyre_object::w_bool_from(true),
-                );
-            });
+        if !cause_obj.is_null() && unsafe { pyre_object::is_exception(exc) } {
+            // `interp_exceptions.py:166-174 descr_setcause` — writes
+            // `w_cause` and flips `suppress_context` to True.
+            unsafe {
+                pyre_object::excobject::w_exception_set_cause(exc, cause_obj);
+                pyre_object::excobject::w_exception_set_suppress_context(exc, true);
+            };
         }
     }
     Ok(())
@@ -1677,10 +1698,22 @@ impl OpcodeStepExecutor for PyFrame {
 
     // ── FormatWithSpec (format(TOS1, TOS)) ──
     fn format_with_spec(&mut self) -> Result<(), Self::Error> {
-        let _spec = self.pop();
+        let spec = self.pop();
         let val = self.pop();
-        // Phase 1: ignore spec, just convert to str
-        let s = unsafe { crate::py_str(val) };
+        // `pypy/objspace/std/newformat.py format(value, spec)` — empty
+        // spec falls through to `space.str_w(space.str(value))`; a
+        // non-empty spec routes through the type's `__format__`.  Pyre
+        // shares the str.format spec parser at
+        // `type_methods::format_with_spec` so f-string `{n:08.3f}` and
+        // `"{:08.3f}".format(n)` produce identical output.
+        let s = unsafe {
+            if pyre_object::is_str(spec) && !pyre_object::w_str_get_value(spec).is_empty() {
+                let spec_str = pyre_object::w_str_get_value(spec).to_string();
+                crate::type_methods::format_with_spec_public(val, &spec_str)
+            } else {
+                crate::py_str(val)
+            }
+        };
         self.push(pyre_object::w_str_new(&s));
         Ok(())
     }
@@ -1734,7 +1767,37 @@ impl OpcodeStepExecutor for PyFrame {
             MakeFunctionFlag::KwOnlyDefaults => unsafe {
                 crate::function_set_kwdefaults(func, attr);
             },
-            _ => {} // annotations, etc.
+            MakeFunctionFlag::Annotations => {
+                // `pypy/interpreter/function.py:553-559
+                // fset_func_annotations` — MAKE_FUNCTION ANNOTATIONS
+                // (oparg.rs:352 `MakeFunctionFlag::Annotations = 2`)
+                // carries the eager annotations dict.  PyPy stores it
+                // on `self.w_ann`; pyre stamps the typed
+                // `Function.w_ann` slot directly so
+                // `f.__annotations__ is f.__annotations__` holds
+                // (the getattr arm reads the same field) instead of
+                // routing through a side table.
+                unsafe { crate::function::function_set_annotations(func, attr) };
+            }
+            MakeFunctionFlag::Annotate => {
+                // PEP 649: lazy annotations.  `attr` is a callable
+                // (`__annotate_func__` / `__annotate__`) that the
+                // `__annotations__` getter evaluates with `format=1`
+                // when the runtime dict is requested
+                // (`baseobjspace.rs:3540` annotate fallback for type
+                // annotations; same shape applies to functions).
+                crate::baseobjspace::ATTR_TABLE.with(|table| {
+                    let mut table = table.borrow_mut();
+                    let entry = table.entry(func as usize).or_default();
+                    entry.insert("__annotate_func__".to_string(), attr);
+                });
+            }
+            // `MakeFunctionFlag::TypeParams` (oparg.rs:356) carries the
+            // tuple of TypeVar / ParamSpec / TypeVarTuple bound by a
+            // PEP 695 generic function.  Pyre has no PEP 695 surface
+            // yet (typing tests aren't in the bench suite); accept
+            // the operand silently rather than panic on the bytecode.
+            MakeFunctionFlag::TypeParams => {}
         }
         self.push(func);
         Ok(())
@@ -2042,8 +2105,29 @@ impl OpcodeStepExecutor for PyFrame {
                 Ok(())
             }
             Err(e) if e.kind == crate::PyErrorKind::StopIteration => {
-                // Don't pop iterator — END_SEND will handle it
-                self.push(pyre_object::w_none()); // push result (None)
+                // `pypy/interpreter/pyopcode.py:1158-1166 next_yield_from`:
+                //     try:
+                //         w_stop_value = space.getattr(e.get_w_value(space),
+                //                                      space.newtext("value"))
+                //     except OperationError as e:
+                //         if not e.match(space, space.w_AttributeError):
+                //             raise
+                //         w_stop_value = space.w_None
+                //     self.pushvalue(w_stop_value)
+                //
+                // CPython 3.13 emits SEND with an EOI target; pyre's
+                // dispatch lands here on StopIteration and must surface
+                // the exception's `.value` as the yield-from result so
+                // `val = yield from inner()` captures `inner`'s return.
+                let value = if !e.exc_object.is_null()
+                    && unsafe { pyre_object::is_exception(e.exc_object) }
+                {
+                    crate::baseobjspace::getattr(e.exc_object, "value")
+                        .unwrap_or_else(|_| pyre_object::w_none())
+                } else {
+                    pyre_object::w_none()
+                };
+                self.push(value);
                 self.set_last_instr_from_next_instr(target);
                 Ok(())
             }
@@ -4395,7 +4479,6 @@ for c in 'abc':
     }
 
     #[test]
-    #[ignore = "closure: RustPython uses LOAD_FAST for freevars, needs COPY_FREE_VARS to copy cells"]
     fn test_closure_basic() {
         let source = "\
 def make_adder(n):
@@ -4610,14 +4693,26 @@ result = c.f([1, 2, 3])";
         }
     }
 
+    /// `pypy/interpreter/typedef.py:817-831 Function.typedef.acceptable_as_base_class
+    /// = False` enforces that `type(len)()` raises `TypeError("cannot
+    /// create 'builtin_function' instances")` via the
+    /// `init_builtin_function_type` `__new__` staticmethod.  This was
+    /// previously failing because `PyError::type_error(msg)` produced
+    /// an exception whose `args_w` slot stayed `PY_NULL`, so
+    /// `str(e)` (which reads `W_BaseException.args_w` per
+    /// `interp_exceptions.py:126-135 descr_str`) returned an empty
+    /// string — `to_exc_object` now stamps `args_w = [msg]` per
+    /// `:123-124 W_BaseException.descr_init self.args_w = args_w`.
     #[test]
     fn test_builtin_function_typedef_overrides_match_pypy() {
         // The `__doc__` slot routes through `getset_func_doc` which falls
-        // back to `BuiltinCode.getdocstring` (function.py:395-398). pyre's
+        // back to `BuiltinCode.getdocstring` (function.py:446-449). pyre's
         // `len` is registered without a docstring so the access path
         // returns whatever code.getdocstring yields — the test only checks
         // that the lookup does not crash and that mutation/deletion fire
-        // the orthodox `_check_code_mutable` TypeError.
+        // the orthodox `_check_code_mutable` AttributeError per
+        // function.py:387 ("Cannot change __doc__ attribute of builtin
+        // functions").
         let source = "\
 doc_value = len.__doc__
 self_is_none = len.__self__ is None
@@ -4630,12 +4725,12 @@ except TypeError as e:
 set_err = ''
 try:
     len.__doc__ = 'x'
-except TypeError as e:
+except AttributeError as e:
     set_err = str(e)
 del_err = ''
 try:
     del len.__doc__
-except TypeError as e:
+except AttributeError as e:
     del_err = str(e)";
         let (res, frame) = run_exec_frame(source);
         res.expect("builtin_function typedef overrides failed");
@@ -4653,13 +4748,13 @@ except TypeError as e:
                 "cannot create 'builtin_function' instances"
             );
             assert!(
-                w_str_get_value(set_err).contains("func_doc"),
-                "len.__doc__ = 'x' should raise TypeError, got: {:?}",
+                w_str_get_value(set_err).contains("__doc__"),
+                "len.__doc__ = 'x' should raise AttributeError mentioning __doc__, got: {:?}",
                 w_str_get_value(set_err)
             );
             assert!(
-                w_str_get_value(del_err).contains("func_doc"),
-                "del len.__doc__ should raise TypeError, got: {:?}",
+                w_str_get_value(del_err).contains("__doc__"),
+                "del len.__doc__ should raise AttributeError mentioning __doc__, got: {:?}",
                 w_str_get_value(del_err)
             );
         }
@@ -4710,6 +4805,13 @@ result = len(sub)";
         }
     }
 
+    /// `pypy/objspace/std/setobject.py:160-180 W_SetObject.descr_init`
+    /// parses against `Signature(['some_iterable'])`, raising TypeError
+    /// when called with more than one positional argument.  Previously
+    /// failed because `set([1], 2)` *did* raise but with an empty
+    /// `args_w` slot; once `error.to_exc_object` stamps
+    /// `args_w = [msg]` per `interp_exceptions.py:123-124`, `str(e)`
+    /// surfaces the message and the test passes.
     #[test]
     fn test_set_constructors_reject_extra_positionals_like_pypy() {
         // setobject.py:160 W_SetObject.descr_init parses against
@@ -4765,6 +4867,14 @@ except TypeError as e:
         }
     }
 
+    /// `pypy/objspace/std/typeobject.py:520-523
+    /// W_TypeObject.check_user_subclass` refuses `set.__new__(int)`
+    /// (and similar cross-layout calls) before the base allocator
+    /// runs.  Previously failed because the cross-layout TypeError
+    /// *was* raised but with an empty `args_w` slot; once
+    /// `error.to_exc_object` stamps `args_w = [msg]` per
+    /// `interp_exceptions.py:123-124`, `str(e)` surfaces the message
+    /// and the test passes.
     #[test]
     fn test_set_new_rejects_foreign_layout_typedef() {
         // typeobject.py:520-523 W_TypeObject.check_user_subclass refuses

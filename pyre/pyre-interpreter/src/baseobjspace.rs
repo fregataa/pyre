@@ -784,6 +784,46 @@ unsafe fn try_instance_binop(a: PyObjectRef, b: PyObjectRef, dunder: &str) -> Op
     None
 }
 
+/// `descroperation.py _binop_impl` typedef-driven fallback for
+/// non-instance LHS / RHS — pyre's `try_instance_binop` only fires
+/// when at least one operand is `is_instance`, but built-in W_Root
+/// types (dict_view, exception, generator, …) also expose dunder
+/// methods through their typedef.  This helper does the same
+/// forward + reverse MRO lookup but routes through
+/// `crate::typedef::r#type` instead of `w_instance_get_type`, so
+/// `dict_keys() | set()` etc. find the typedef-installed `__or__`
+/// and friends.  Returns `None` when neither side defines the
+/// method (caller falls through to the existing TypeError path).
+unsafe fn try_typedef_binop(a: PyObjectRef, b: PyObjectRef, dunder: &str) -> Option<PyResult> {
+    if let Some(a_type) = crate::typedef::r#type(a) {
+        if let Some(method) = lookup_in_type_where(a_type, dunder) {
+            match crate::call::call_function_impl_result(method, &[a, b]) {
+                Ok(result) => {
+                    if !is_not_implemented(result) {
+                        return Some(Ok(result));
+                    }
+                }
+                Err(e) => return Some(Err(e)),
+            }
+        }
+    }
+    if let Some(rdunder) = reverse_dunder(dunder) {
+        if let Some(b_type) = crate::typedef::r#type(b) {
+            if let Some(method) = lookup_in_type_where(b_type, rdunder) {
+                match crate::call::call_function_impl_result(method, &[b, a]) {
+                    Ok(result) => {
+                        if !is_not_implemented(result) {
+                            return Some(Ok(result));
+                        }
+                    }
+                    Err(e) => return Some(Err(e)),
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Check if w_type is a subtype of cls using cached MRO.
 unsafe fn issubtype_cached(w_type: PyObjectRef, cls: PyObjectRef) -> bool {
     let mro_ptr = w_type_get_mro(w_type);
@@ -918,6 +958,11 @@ pub fn sub(a: PyObjectRef, b: PyObjectRef) -> PyResult {
             });
         }
         if let Some(result) = try_instance_binop(a, b, "__sub__") {
+            return result;
+        }
+        // Built-in W_Root types (dict_view, …) expose `__sub__` /
+        // `__rsub__` through their typedef.
+        if let Some(result) = try_typedef_binop(a, b, "__sub__") {
             return result;
         }
         let a_name = (*(*a).ob_type).name;
@@ -1055,8 +1100,17 @@ pub fn mod_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 /// PyPy: unicodeobject.py mod__String_ANY → formatting.py
 unsafe fn str_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> PyResult {
     let fmt_str = w_str_get_value(fmt);
-    // Collect args into a Vec
-    let arg_list: Vec<PyObjectRef> = if is_tuple(args) {
+    // `formatting.py:39-46 StringFormatter.__init__` — when `args`
+    // is a tuple, `values_w` is the unpacked positional list; for
+    // any other shape (mapping, single value), `values_w` stays
+    // None and `checkconsumed` is skipped.  Pyre tracks the same
+    // distinction via `args_is_tuple` so the trailing surplus-args
+    // check at the end fires only for tuple input — without it,
+    // `"%s"`-only formats against a mapping that exposes
+    // `__getitem__` would always trip "not all arguments converted"
+    // even when the mapping was the (single) intended value.
+    let args_is_tuple = is_tuple(args);
+    let arg_list: Vec<PyObjectRef> = if args_is_tuple {
         let n = w_tuple_len(args);
         (0..n)
             .filter_map(|i| w_tuple_getitem(args, i as i64))
@@ -1069,42 +1123,132 @@ unsafe fn str_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> PyResult {
     let mut arg_idx = 0;
     let bytes = fmt_str.as_bytes();
     let mut i = 0;
+    let take_next_arg =
+        |arg_idx: &mut usize, arg_list: &[PyObjectRef]| -> Result<PyObjectRef, PyError> {
+            // `formatting.py:574-582 nextinputvalue` — surfaces the
+            // canonical "not enough arguments" message when the
+            // positional pool runs dry.
+            if *arg_idx >= arg_list.len() {
+                return Err(PyError::type_error(
+                    "not enough arguments for format string",
+                ));
+            }
+            let a = arg_list[*arg_idx];
+            *arg_idx += 1;
+            Ok(a)
+        };
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 1 < bytes.len() {
             i += 1;
-            // Named format: %(name)s — look up key in dict
+            // Named format: %(name)s — `formatting.py:174-195
+            // getmappingkey` scans up to the *balanced* closing
+            // `)` (paren-depth counting so `%(a(b)c)s` parses key
+            // `a(b)c`), then `space.getitem(args, w_key)` looks up
+            // the mapping value (mapping-like object, not just
+            // exact dict).
             let named_arg = if i < bytes.len() && bytes[i] == b'(' {
-                i += 1; // skip '('
-                let mut key = String::new();
-                while i < bytes.len() && bytes[i] != b')' {
-                    key.push(bytes[i] as char);
+                i += 1; // skip the opening '('
+                let key_start = i;
+                let mut pcount: usize = 1;
+                while i < bytes.len() {
+                    let c = bytes[i];
+                    if c == b')' {
+                        pcount -= 1;
+                        if pcount == 0 {
+                            break;
+                        }
+                    } else if c == b'(' {
+                        pcount += 1;
+                    }
                     i += 1;
                 }
-                if i < bytes.len() {
-                    i += 1; // skip ')'
+                if i >= bytes.len() {
+                    // `formatting.py:184-186 incomplete format key` —
+                    // ran off the end of the format string without
+                    // the matching `)`.
+                    return Err(PyError::new(
+                        PyErrorKind::ValueError,
+                        "incomplete format key".to_string(),
+                    ));
                 }
-                // args must be a dict
+                let key = String::from_utf8_lossy(&bytes[key_start..i]).into_owned();
+                i += 1; // skip the closing ')'
+                // Fast path for exact dict: avoid building a W_StrObject
+                // when we can probe the dict storage directly.
                 if is_dict(args) {
                     w_dict_getitem_str(args, &key)
                 } else {
-                    None
+                    let w_key = pyre_object::w_str_new(&key);
+                    Some(getitem(args, w_key)?)
                 }
             } else {
                 None
             };
-            // Parse optional width/flags
-            let mut width = String::new();
-            while i < bytes.len()
-                && (bytes[i] == b'-'
-                    || bytes[i] == b'+'
-                    || bytes[i] == b'0'
-                    || bytes[i] == b' '
-                    || bytes[i].is_ascii_digit()
-                    || bytes[i] == b'*'
-                    || bytes[i] == b'.')
-            {
-                width.push(bytes[i] as char);
+            // `pypy/objspace/std/formatting.py StringFormatter._parse_spec`
+            // — flags (`-`, `+`, ` `, `0`, `#`), width digits, optional
+            // `.precision` digits, then conversion type.  pyre handles
+            // the common subset; the asterisk (`*`) form is left to a
+            // future round.
+            let mut left_align = false;
+            let mut zero_pad = false;
+            let mut explicit_sign = false;
+            let mut blank_sign = false;
+            let mut alt_form = false;
+            while i < bytes.len() {
+                match bytes[i] {
+                    b'-' => left_align = true,
+                    b'0' => zero_pad = true,
+                    b'+' => explicit_sign = true,
+                    b' ' => blank_sign = true,
+                    // `formatting.py:240-242` — `#` selects the
+                    // alternate form (0x/0o/0b prefix on integers).
+                    b'#' => alt_form = true,
+                    _ => break,
+                }
                 i += 1;
+            }
+            // `formatting.py:266-274 peel_num` — `*` reads width /
+            // precision from the next positional input.
+            let mut width = 0usize;
+            if i < bytes.len() && bytes[i] == b'*' {
+                i += 1;
+                let star_arg = take_next_arg(&mut arg_idx, &arg_list)?;
+                if !is_int_like(star_arg) {
+                    return Err(PyError::type_error("* wants int"));
+                }
+                let val = int_value(star_arg);
+                if val < 0 {
+                    // Negative star width acts like `-` flag with abs(width).
+                    left_align = true;
+                    width = (-val) as usize;
+                } else {
+                    width = val as usize;
+                }
+            } else {
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    width = width * 10 + (bytes[i] - b'0') as usize;
+                    i += 1;
+                }
+            }
+            let mut precision: Option<usize> = None;
+            if i < bytes.len() && bytes[i] == b'.' {
+                i += 1;
+                if i < bytes.len() && bytes[i] == b'*' {
+                    i += 1;
+                    let star_arg = take_next_arg(&mut arg_idx, &arg_list)?;
+                    if !is_int_like(star_arg) {
+                        return Err(PyError::type_error("* wants int"));
+                    }
+                    let v = int_value(star_arg);
+                    precision = Some(if v < 0 { 0 } else { v as usize });
+                } else {
+                    let mut p = 0usize;
+                    while i < bytes.len() && bytes[i].is_ascii_digit() {
+                        p = p * 10 + (bytes[i] - b'0') as usize;
+                        i += 1;
+                    }
+                    precision = Some(p);
+                }
             }
             if i >= bytes.len() {
                 break;
@@ -1117,76 +1261,272 @@ unsafe fn str_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> PyResult {
             }
             let arg = if let Some(na) = named_arg {
                 na
-            } else if arg_idx < arg_list.len() {
-                let a = arg_list[arg_idx];
-                arg_idx += 1;
-                a
             } else {
-                pyre_object::w_none()
+                take_next_arg(&mut arg_idx, &arg_list)?
+            };
+            // Helper closure: pad-and-emit body string respecting
+            // width/left-align (zero-pad only matters for numeric paths
+            // that build their own body with sign awareness).
+            let pad = |body: String| -> String {
+                if body.chars().count() >= width {
+                    return body;
+                }
+                let need = width - body.chars().count();
+                let mut s = String::with_capacity(width);
+                if left_align {
+                    s.push_str(&body);
+                    for _ in 0..need {
+                        s.push(' ');
+                    }
+                } else {
+                    for _ in 0..need {
+                        s.push(' ');
+                    }
+                    s.push_str(&body);
+                }
+                s
+            };
+            let sign_prefix = |val: i64| -> &'static str {
+                if val < 0 {
+                    "-"
+                } else if explicit_sign {
+                    "+"
+                } else if blank_sign {
+                    " "
+                } else {
+                    ""
+                }
             };
             match spec {
                 's' => {
-                    result.push_str(&crate::py_str(arg));
+                    let mut body = crate::py_str(arg);
+                    if let Some(p) = precision {
+                        body = body.chars().take(p).collect();
+                    }
+                    result.push_str(&pad(body));
                 }
                 'r' => {
-                    result.push_str(&crate::py_repr(arg));
+                    let mut body = crate::py_repr(arg);
+                    if let Some(p) = precision {
+                        body = body.chars().take(p).collect();
+                    }
+                    result.push_str(&pad(body));
                 }
-                'd' | 'i' => {
-                    if is_int_like(arg) {
-                        let val = int_value(arg);
-                        if width.is_empty() {
-                            result.push_str(&format!("{val}"));
-                        } else {
-                            let zero_pad = width.starts_with('0');
-                            let w: usize = width.trim_start_matches('0').parse().unwrap_or(0);
-                            let w = if w == 0 && zero_pad { width.len() } else { w };
-                            if zero_pad {
-                                result.push_str(&format!("{val:0>w$}"));
-                            } else {
-                                result.push_str(&format!("{val:>w$}"));
-                            }
+                // `formatting.py fmt_a` (CPython `%a`) — repr() force-
+                // ASCII-encoded.  Pyre's `py_repr` already produces
+                // ASCII-clean output for the types it covers, so the
+                // result matches PyPy `fmt_a` for the supported subset.
+                'a' => {
+                    let mut body = crate::py_repr(arg);
+                    if let Some(p) = precision {
+                        body = body.chars().take(p).collect();
+                    }
+                    result.push_str(&pad(body));
+                }
+                // `formatting.py:549-552 fmt_b` — `%b` is a *bytes-only*
+                // conversion (formats a `bytes`/`bytearray`/`__bytes__`
+                // object); for the unicode formatter PyPy calls
+                // `self.unknown_fmtchar()` which raises ValueError
+                // "unsupported format character 'b' (0x62) at index N".
+                'b' => {
+                    return Err(PyError::new(
+                        PyErrorKind::ValueError,
+                        format!("unsupported format character 'b' (0x62) at index {}", i - 1),
+                    ));
+                }
+                // `formatting.py fmt_u` is documented as a deprecated
+                // alias for `%d` and dispatches to the same body.
+                'd' | 'i' | 'u' | 'x' | 'X' | 'o' => {
+                    // `formatting.py:296-302 fmt_d / fmt_x ...` raises
+                    // TypeError when the argument is not int-like
+                    // (`%X format: an integer is required, not <type>`),
+                    // not silently coerce via str().
+                    if !is_int_like(arg) {
+                        return Err(PyError::type_error(format!(
+                            "%{spec} format: an integer is required, not {}",
+                            object_functionstr_type_name(arg),
+                        )));
+                    }
+                    let val = int_value(arg);
+                    let abs = val.unsigned_abs();
+                    let digits = match spec {
+                        'x' => format!("{abs:x}"),
+                        'X' => format!("{abs:X}"),
+                        'o' => format!("{abs:o}"),
+                        _ => format!("{abs}"),
+                    };
+                    // `formatting.py:240-242` — alt-form adds the
+                    // base prefix (`0x`, `0X`, `0o`) for the matching
+                    // radix; `%d/%i/%u` ignore it.  `%b` is not a
+                    // unicode-formatter conversion (rejected above
+                    // per `:549-552 fmt_b`).
+                    let prefix = if alt_form {
+                        match spec {
+                            'x' => "0x",
+                            'X' => "0X",
+                            'o' => "0o",
+                            _ => "",
                         }
                     } else {
-                        result.push_str(&crate::py_str(arg));
+                        ""
+                    };
+                    let sign = sign_prefix(val);
+                    // Sign-aware zero pad (`%05d`, `%-5d` parity):
+                    // `formatting.py:_pad_string` reserves width for
+                    // sign + alt-prefix before padding zeros.
+                    // Left-align disables zero pad.
+                    if zero_pad && !left_align {
+                        let need = width.saturating_sub(sign.len() + prefix.len() + digits.len());
+                        let mut s = String::with_capacity(width);
+                        s.push_str(sign);
+                        s.push_str(prefix);
+                        for _ in 0..need {
+                            s.push('0');
+                        }
+                        s.push_str(&digits);
+                        result.push_str(&s);
+                    } else {
+                        result.push_str(&pad(format!("{sign}{prefix}{digits}")));
                     }
                 }
-                'f' => {
+                // `formatting.py fmt_e / fmt_E / fmt_g / fmt_G` —
+                // scientific / general float formatting.  Default
+                // precision is 6 (CPython %e/%g), `%g` strips
+                // trailing zeros and chooses scientific vs fixed
+                // based on exponent magnitude (PyPy delegates to
+                // `rfloat.formatd` with the matching format char).
+                'e' | 'E' | 'g' | 'G' => {
+                    // `formatting.py:303-308 fmt_e / fmt_g ...` raises
+                    // TypeError when the argument is not numeric;
+                    // silently substituting 0.0 for non-numeric input
+                    // hid type bugs at the format site.
                     let val = if is_float(arg) {
                         pyre_object::floatobject::w_float_get_value(arg)
                     } else if is_int_like(arg) {
                         int_value(arg) as f64
                     } else {
-                        0.0
+                        return Err(PyError::type_error(format!(
+                            "must be real number, not {}",
+                            object_functionstr_type_name(arg),
+                        )));
                     };
-                    if width.contains('.') {
-                        let prec: usize = width
-                            .split('.')
-                            .nth(1)
-                            .and_then(|s| s.parse().ok())
-                            .unwrap_or(6);
-                        result.push_str(&format!("{val:.prec$}"));
+                    let prec = precision.unwrap_or(6);
+                    let abs = val.abs();
+                    let body = match spec {
+                        'e' => normalise_exponent(&format!("{:.*e}", prec, abs), false),
+                        'E' => normalise_exponent(&format!("{:.*E}", prec, abs), true),
+                        // `%g` precision counts significant digits;
+                        // Rust has no built-in formatter that exactly
+                        // matches CPython's `%g` rules, so emit
+                        // scientific when |v| >= 10^prec or < 1e-4
+                        // (matching the CPython threshold), else
+                        // fixed with (prec - 1 - exponent) decimals
+                        // and trailing zero stripping.
+                        'g' | 'G' => format_g_like(abs, prec, spec == 'G', alt_form),
+                        _ => unreachable!(),
+                    };
+                    let sign = if val.is_sign_negative() && !val.is_nan() {
+                        "-"
+                    } else if explicit_sign {
+                        "+"
+                    } else if blank_sign {
+                        " "
                     } else {
-                        result.push_str(&format!("{val:.6}"));
+                        ""
+                    };
+                    if zero_pad && !left_align {
+                        let need = width.saturating_sub(sign.len() + body.len());
+                        let mut s = String::with_capacity(width);
+                        s.push_str(sign);
+                        for _ in 0..need {
+                            s.push('0');
+                        }
+                        s.push_str(&body);
+                        result.push_str(&s);
+                    } else {
+                        result.push_str(&pad(format!("{sign}{body}")));
                     }
                 }
-                'x' => {
+                'f' | 'F' => {
+                    // `formatting.py:303-308 fmt_f` — same TypeError as
+                    // `%e/%g` for non-numeric arguments.
+                    let val = if is_float(arg) {
+                        pyre_object::floatobject::w_float_get_value(arg)
+                    } else if is_int_like(arg) {
+                        int_value(arg) as f64
+                    } else {
+                        return Err(PyError::type_error(format!(
+                            "must be real number, not {}",
+                            object_functionstr_type_name(arg),
+                        )));
+                    };
+                    let prec = precision.unwrap_or(6);
+                    let abs_body = format!("{:.*}", prec, val.abs());
+                    let sign = if val.is_sign_negative() && !val.is_nan() {
+                        "-"
+                    } else if explicit_sign {
+                        "+"
+                    } else if blank_sign {
+                        " "
+                    } else {
+                        ""
+                    };
+                    if zero_pad && !left_align {
+                        let need = width.saturating_sub(sign.len() + abs_body.len());
+                        let mut s = String::with_capacity(width);
+                        s.push_str(sign);
+                        for _ in 0..need {
+                            s.push('0');
+                        }
+                        s.push_str(&abs_body);
+                        result.push_str(&s);
+                    } else {
+                        result.push_str(&pad(format!("{sign}{abs_body}")));
+                    }
+                }
+                'c' => {
+                    // `formatting.py:283-294 fmt_c` parity:
+                    //   - int branch: `if value < 0 or value > 0x10FFFF:
+                    //     OverflowError("%c arg not in range(0x110000)")`
+                    //   - str branch: `if len(s) != 1: TypeError(
+                    //     "%c requires int or single character")`
+                    //   - other types: same TypeError.
                     if is_int_like(arg) {
-                        result.push_str(&format!("{:x}", int_value(arg)));
+                        let v = int_value(arg);
+                        if v < 0 || v > 0x10FFFF {
+                            return Err(PyError::new(
+                                PyErrorKind::OverflowError,
+                                "%c arg not in range(0x110000)".to_string(),
+                            ));
+                        }
+                        let c = char::from_u32(v as u32).ok_or_else(|| {
+                            PyError::new(
+                                PyErrorKind::OverflowError,
+                                "%c arg not in range(0x110000)".to_string(),
+                            )
+                        })?;
+                        result.push_str(&pad(c.to_string()));
+                    } else if is_str(arg) {
+                        let s = w_str_get_value(arg);
+                        if s.chars().count() != 1 {
+                            return Err(PyError::type_error("%c requires int or single character"));
+                        }
+                        result.push_str(&pad(s.to_string()));
+                    } else {
+                        return Err(PyError::type_error(format!(
+                            "%c requires int or char, not {}",
+                            object_functionstr_type_name(arg),
+                        )));
                     }
                 }
-                'X' => {
-                    if is_int_like(arg) {
-                        result.push_str(&format!("{:X}", int_value(arg)));
-                    }
-                }
-                'o' => {
-                    if is_int_like(arg) {
-                        result.push_str(&format!("{:o}", int_value(arg)));
-                    }
-                }
+                // `formatting.py:328-329 unknown_fmtchar` raises
+                // ValueError on any spec char outside FORMATTER_CHARS.
                 _ => {
-                    result.push('%');
-                    result.push(spec);
+                    return Err(PyError::value_error(format!(
+                        "unsupported format character '{spec}' (0x{:x}) at index {}",
+                        spec as u32,
+                        i.saturating_sub(1)
+                    )));
                 }
             }
         } else {
@@ -1194,7 +1534,138 @@ unsafe fn str_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> PyResult {
             i += 1;
         }
     }
+    // `formatting.py:572-580 checkconsumed` — surplus positional
+    // arguments are an error only when the input came as a tuple
+    // (PyPy's `values_w` invariant).  Mapping inputs (dict and any
+    // other shape) skip this check because every replacement field
+    // pulls from `args` by name, not by sequential index.
+    if args_is_tuple && arg_idx < arg_list.len() {
+        return Err(PyError::type_error(
+            "not all arguments converted during string formatting",
+        ));
+    }
     Ok(w_str_new(&result))
+}
+
+/// `formatting.py fmt_g / fmt_G` parity helper — emits the `%g` body
+/// for an *absolute* float value.  CPython's `%g` rules:
+///   * precision ≤ 0 is treated as 1 (PyPy: `prec = max(prec, 1)`)
+///   * choose scientific when `exp < -4` or `exp >= prec`
+///     (`pypy/objspace/std/formatting.py:120 format_e_g_complex`)
+///   * scientific body uses (`prec - 1`) decimals
+///   * fixed body uses `(prec - 1 - exp)` decimals
+///   * trailing zeros (and the trailing '.') are stripped unless
+///     `#` (alt-form) was set; with alt-form the trailing zeros AND
+///     the dangling '.' survive so the output advertises the full
+///     requested precision.
+pub(crate) fn format_g_like(abs: f64, prec: usize, upper: bool, alt_form: bool) -> String {
+    if abs == 0.0 {
+        return if alt_form {
+            // `formatting.py:120-128` — alt-form `%#g` keeps `prec`
+            // significant digits even for 0.0, so `"%#.4g" % 0`
+            // renders as `"0.000"` (one digit before the dot, then
+            // `prec - 1` zeros after).
+            let after = prec.saturating_sub(1);
+            if after == 0 {
+                "0".to_string()
+            } else {
+                format!("0.{}", "0".repeat(after))
+            }
+        } else {
+            "0".to_string()
+        };
+    }
+    if !abs.is_finite() {
+        return format!("{abs}");
+    }
+    let prec = prec.max(1);
+    let exp = abs.log10().floor() as i32;
+    let use_sci = exp < -4 || exp >= prec as i32;
+    let raw = if use_sci {
+        let rust_exp = format!("{:.*e}", prec - 1, abs);
+        normalise_exponent(&rust_exp, upper)
+    } else {
+        let dec = (prec as i32 - 1 - exp).max(0) as usize;
+        format!("{abs:.dec$}")
+    };
+    if alt_form {
+        // Alt-form preserves trailing zeros and the dangling '.';
+        // ensure a '.' is present even when the natural body has
+        // none (e.g. `"%#g" % 1` → `"1.00000"`).
+        if use_sci {
+            return raw;
+        }
+        return if raw.contains('.') {
+            raw
+        } else {
+            // `prec - 1 - exp` was 0, so the body has no decimals;
+            // re-render with the alt-form '.' suffix + trailing
+            // zeros to advertise the full precision.
+            let after = (prec as i32 - 1 - exp).max(0) as usize;
+            if after == 0 {
+                format!("{raw}.")
+            } else {
+                format!("{raw}.{}", "0".repeat(after))
+            }
+        };
+    }
+    // Strip trailing zeros from the mantissa (and a dangling '.').
+    if use_sci {
+        if let Some(epos) = raw.find(|c: char| c == 'e' || c == 'E') {
+            let (mantissa, exp_part) = raw.split_at(epos);
+            let trimmed = trim_trailing_zeros(mantissa);
+            format!("{trimmed}{exp_part}")
+        } else {
+            raw
+        }
+    } else if raw.contains('.') {
+        trim_trailing_zeros(&raw)
+    } else {
+        raw
+    }
+}
+
+/// Convert Rust's `{:e}` / `{:E}` exponent encoding (no sign, minimal
+/// width — `1.5e3` / `1.5e-3`) to PyPy / CPython `%e`-style
+/// (`1.5e+03` / `1.5e-03` — explicit sign, exponent zero-padded to at
+/// least two digits).  Mirrors `pypy/objspace/std/formatting.py
+/// fmt_e` which delegates to `rfloat.formatd` with the C printf-style
+/// padding rules.
+pub(crate) fn normalise_exponent(raw: &str, upper: bool) -> String {
+    let marker = if upper { 'E' } else { 'e' };
+    let lower_marker = marker.to_ascii_lowercase();
+    let upper_marker = marker.to_ascii_uppercase();
+    let pos = match raw.find([lower_marker, upper_marker].as_ref()) {
+        Some(p) => p,
+        None => return raw.to_string(),
+    };
+    let (mantissa, exp_part) = raw.split_at(pos);
+    let exp_str = &exp_part[1..]; // skip the marker
+    let (sign_char, digits) = if let Some(rest) = exp_str.strip_prefix('-') {
+        ('-', rest)
+    } else if let Some(rest) = exp_str.strip_prefix('+') {
+        ('+', rest)
+    } else {
+        ('+', exp_str)
+    };
+    let padded = if digits.len() < 2 {
+        format!("0{digits}")
+    } else {
+        digits.to_string()
+    };
+    format!("{mantissa}{marker}{sign_char}{padded}")
+}
+
+fn trim_trailing_zeros(body: &str) -> String {
+    if !body.contains('.') {
+        return body.to_string();
+    }
+    let trimmed = body.trim_end_matches('0').trim_end_matches('.');
+    if trimmed.is_empty() {
+        "0".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 /// True division (`/` operator) — always produces a float result.
@@ -1974,6 +2445,12 @@ pub fn and_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         if let Some(result) = try_instance_binop(a, b, "__and__") {
             return result;
         }
+        // Built-in W_Root types (dict_view, …) expose `__and__` /
+        // `__rand__` through their typedef but are not is_instance
+        // — fall back to typedef-driven MRO dispatch before TypeError.
+        if let Some(result) = try_typedef_binop(a, b, "__and__") {
+            return result;
+        }
         let a_name = (*(*a).ob_type).name;
         let b_name = (*(*b).ob_type).name;
         Err(PyError::type_error(format!(
@@ -2063,6 +2540,11 @@ pub fn or_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         if let Some(result) = try_instance_binop(a, b, "__ror__") {
             return result;
         }
+        // Built-in W_Root types (dict_view, …) expose `__or__` /
+        // `__ror__` through their typedef.
+        if let Some(result) = try_typedef_binop(a, b, "__or__") {
+            return result;
+        }
         let a_name = (*(*a).ob_type).name;
         let b_name = (*(*b).ob_type).name;
         Err(PyError::type_error(format!(
@@ -2077,8 +2559,6 @@ pub fn xor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     let b = unwrap_cell(b);
     unsafe {
-        // boolobject.py:76 W_BoolObject.descr_xor — both operands bool
-        // → space.newbool(op(a, b)).
         if is_bool(a) && is_bool(b) {
             return Ok(pyre_object::bool_descr_xor(a, b));
         }
@@ -2088,7 +2568,33 @@ pub fn xor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         if is_int_or_long(a) && is_int_or_long(b) {
             return long_bitxor(a, b);
         }
+        // set / frozenset symmetric difference — `pypy/objspace/std/
+        // setobject.py W_BaseSetObject.descr_xor`.  Mirrors `and_`'s
+        // intersection arm: walk both sides, keep elements present in
+        // exactly one set.  Result type follows the left operand
+        // (frozenset stays frozenset).
+        if pyre_object::is_set_or_frozenset(a) && pyre_object::is_set_or_frozenset(b) {
+            let mut out: Vec<PyObjectRef> = pyre_object::w_set_items(a)
+                .into_iter()
+                .filter(|&item| !pyre_object::w_set_contains(b, item))
+                .collect();
+            for item in pyre_object::w_set_items(b) {
+                if !pyre_object::w_set_contains(a, item) {
+                    out.push(item);
+                }
+            }
+            return Ok(if pyre_object::is_frozenset(a) {
+                pyre_object::w_frozenset_from_items(&out)
+            } else {
+                pyre_object::w_set_from_items(&out)
+            });
+        }
         if let Some(result) = try_instance_binop(a, b, "__xor__") {
+            return result;
+        }
+        // Built-in W_Root types (dict_view, …) expose `__xor__` /
+        // `__rxor__` through their typedef.
+        if let Some(result) = try_typedef_binop(a, b, "__xor__") {
             return result;
         }
         let a_name = (*(*a).ob_type).name;
@@ -2174,6 +2680,102 @@ pub fn compare(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
                 CompareOp::Ne => la != lb,
             }));
         }
+        // dict equality — `pypy/objspace/std/dictobject.py
+        // W_DictMultiObject.descr_eq` is order-independent: same length
+        // AND each key-value pair in `a` exists with equal value in `b`.
+        // CPython only defines == / != for dicts (no ordering), so we
+        // restrict to those ops; other ops fall through to the dunder
+        // dispatch which currently raises TypeError, matching the
+        // unimplemented `__lt__` etc. on plain dict.
+        if is_dict(a) && is_dict(b) && matches!(op, CompareOp::Eq | CompareOp::Ne) {
+            let la = pyre_object::w_dict_len(a);
+            let lb = pyre_object::w_dict_len(b);
+            let mut equal = la == lb;
+            if equal {
+                for (k, v) in pyre_object::w_dict_items(a) {
+                    match pyre_object::w_dict_lookup(b, k) {
+                        Some(other_v) => {
+                            let same = compare(v, other_v, CompareOp::Eq)
+                                .map(|r| is_true(r))
+                                .unwrap_or(false);
+                            if !same {
+                                equal = false;
+                                break;
+                            }
+                        }
+                        None => {
+                            equal = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            return Ok(w_bool_from(match op {
+                CompareOp::Eq => equal,
+                CompareOp::Ne => !equal,
+                _ => unreachable!(),
+            }));
+        }
+        // `dictmultiobject.py:1619-1623 _is_set_like` parity — when
+        // one side is a set/frozenset and the other is a set-like
+        // dict_view (Keys / Items), the comparison reduces to the
+        // set-set arm with the dict_view materialised through its
+        // snapshot.  Without this arm, `set == d.keys()` would fall
+        // through to `object.__eq__`'s identity check and return
+        // False even when the contents match.
+        if (pyre_object::is_set_or_frozenset(a) || pyre_object::is_set_or_frozenset(b))
+            && (pyre_object::dictviewobject::is_dict_view(a)
+                || pyre_object::dictviewobject::is_dict_view(b))
+        {
+            let view_set_like = |obj: PyObjectRef| -> bool {
+                if pyre_object::is_set_or_frozenset(obj) {
+                    return true;
+                }
+                if pyre_object::dictviewobject::is_dict_view(obj) {
+                    let kind = pyre_object::dictviewobject::w_dict_view_get_kind(obj);
+                    return matches!(
+                        kind,
+                        pyre_object::dictviewobject::DictViewKind::Keys
+                            | pyre_object::dictviewobject::DictViewKind::Items
+                    );
+                }
+                false
+            };
+            if view_set_like(a) && view_set_like(b) {
+                let a_items = if pyre_object::is_set_or_frozenset(a) {
+                    pyre_object::w_set_items(a)
+                } else {
+                    crate::type_methods::dict_view_snapshot(a)
+                };
+                let b_items = if pyre_object::is_set_or_frozenset(b) {
+                    pyre_object::w_set_items(b)
+                } else {
+                    crate::type_methods::dict_view_snapshot(b)
+                };
+                let a_set = pyre_object::w_set_from_items(&a_items);
+                let b_set = pyre_object::w_set_from_items(&b_items);
+                let la = pyre_object::w_set_len(a_set);
+                let lb = pyre_object::w_set_len(b_set);
+                let a_subset_b = || {
+                    pyre_object::w_set_items(a_set)
+                        .into_iter()
+                        .all(|item| pyre_object::w_set_contains(b_set, item))
+                };
+                let b_subset_a = || {
+                    pyre_object::w_set_items(b_set)
+                        .into_iter()
+                        .all(|item| pyre_object::w_set_contains(a_set, item))
+                };
+                return Ok(w_bool_from(match op {
+                    CompareOp::Eq => la == lb && a_subset_b(),
+                    CompareOp::Ne => la != lb || !a_subset_b(),
+                    CompareOp::Le => la <= lb && a_subset_b(),
+                    CompareOp::Lt => la < lb && a_subset_b(),
+                    CompareOp::Ge => la >= lb && b_subset_a(),
+                    CompareOp::Gt => la > lb && b_subset_a(),
+                }));
+            }
+        }
         // set / frozenset comparison — subset / superset / equality.
         // PyPy: setobject.py W_BaseSetObject.descr_eq, descr_le, descr_lt
         if pyre_object::is_set_or_frozenset(a) && pyre_object::is_set_or_frozenset(b) {
@@ -2234,6 +2836,44 @@ pub fn compare(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
         };
         if let Some(result) = try_instance_binop(a, b, dunder) {
             return result;
+        }
+        // `dictmultiobject.py:1628-1656 SetLikeDictView` — dict_keys
+        // / dict_items expose `__eq__` / `__ne__` / `__lt__` / etc.
+        // through the typedef.  `try_instance_binop` only fires for
+        // is_instance-shaped objects, so dict views (a separate
+        // W_Root type) need an explicit MRO-driven dispatch here.
+        // Reflected: if RHS is a dict view, try `b.dunder(a)` —
+        // PyPy's `_is_set_like(other)` short-circuits the LHS-side
+        // descr_eq when the other is set-like, so the reflected call
+        // path is the one that succeeds for `set == d.keys()`.
+        if let Some(a_type) = crate::typedef::r#type(a) {
+            if let Some(method) = lookup_in_type_where(a_type, dunder) {
+                if !crate::is_function(method) {
+                    if let Ok(result) = crate::call::call_function_impl_result(method, &[a, b]) {
+                        if !is_not_implemented(result) {
+                            return Ok(result);
+                        }
+                    }
+                }
+                if crate::is_function(method) {
+                    if let Ok(result) = crate::call::call_function_impl_result(method, &[a, b]) {
+                        if !is_not_implemented(result) {
+                            return Ok(result);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(rdunder) = reverse_dunder(dunder) {
+            if let Some(b_type) = crate::typedef::r#type(b) {
+                if let Some(method) = lookup_in_type_where(b_type, rdunder) {
+                    if let Ok(result) = crate::call::call_function_impl_result(method, &[b, a]) {
+                        if !is_not_implemented(result) {
+                            return Ok(result);
+                        }
+                    }
+                }
+            }
         }
         // Identity comparison fallback for == and !=
         if matches!(op, CompareOp::Eq) {
@@ -2561,51 +3201,22 @@ pub fn getitem(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
         } else if is_str(obj) {
             let s = w_str_get_value(obj);
             if is_slice(index) {
-                let len = s.chars().count() as i64;
-                let start = w_slice_get_start(index);
-                let stop = w_slice_get_stop(index);
-                let step = w_slice_get_step(index);
-                let s_val = if is_none(start) {
-                    0
-                } else {
-                    w_int_get_value(start)
-                };
-                let e_val = if is_none(stop) {
-                    len
-                } else {
-                    w_int_get_value(stop)
-                };
-                let step_val = if is_none(step) {
-                    1
-                } else {
-                    w_int_get_value(step)
-                };
-                let s_idx = if s_val < 0 {
-                    (len + s_val).max(0)
-                } else {
-                    s_val.min(len)
-                } as usize;
-                let e_idx = if e_val < 0 {
-                    (len + e_val).max(0)
-                } else {
-                    e_val.min(len)
-                } as usize;
-                if step_val == 1 {
-                    let chars: Vec<char> = s.chars().collect();
-                    let sliced: String = chars[s_idx..e_idx].iter().collect();
-                    Ok(w_str_new(&sliced))
-                } else {
-                    let chars: Vec<char> = s.chars().collect();
-                    let mut result = String::new();
-                    let mut i = s_idx as i64;
-                    while (step_val > 0 && i < e_idx as i64) || (step_val < 0 && i > e_idx as i64) {
-                        if (i as usize) < chars.len() {
-                            result.push(chars[i as usize]);
-                        }
-                        i += step_val;
+                // `pypy/objspace/std/unicodeobject.py W_UnicodeObject._getitem_slice`
+                // → `slice.indices(len)` (`pypy/objspace/std/sliceobject.py`).
+                // Reuse the shared `normalize_slice` helper so negative-step
+                // defaults (`s[::-1]`, `s[5::-1]`) match list/tuple semantics.
+                let chars: Vec<char> = s.chars().collect();
+                let len = chars.len() as i64;
+                let (start, stop, step) = normalize_slice(index, len)?;
+                let mut result = String::new();
+                let mut i = start;
+                while (step > 0 && i < stop) || (step < 0 && i > stop) {
+                    if i >= 0 && (i as usize) < chars.len() {
+                        result.push(chars[i as usize]);
                     }
-                    Ok(w_str_new(&result))
+                    i += step;
                 }
+                Ok(w_str_new(&result))
             } else if is_int(index) {
                 let idx = w_int_get_value(index);
                 let chars: Vec<char> = s.chars().collect();
@@ -2815,34 +3426,59 @@ pub fn setitem(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef) -> PyRe
         }
         if is_list(obj) {
             if is_slice(index) {
-                // list[start:stop] = value — slice assignment
                 let len = w_list_len(obj) as i64;
-                let start = w_slice_get_start(index);
-                let stop = w_slice_get_stop(index);
-                let s = if is_none(start) {
-                    0
-                } else {
-                    w_int_get_value(start)
-                };
-                let e = if is_none(stop) {
-                    len
-                } else {
-                    w_int_get_value(stop)
-                };
-                let s = if s < 0 { (len + s).max(0) } else { s.min(len) } as usize;
-                let e = if e < 0 { (len + e).max(0) } else { e.min(len) } as usize;
-                // listobject.py:1746-1758 setslice — strategy-preserving
-                // when replacement list uses the same strategy.
-                // listobject.py:709-714: wrap non-list iterables into a
-                // temporary W_ListObject so setslice is strategy-aware.
+                let (start, stop, step) = normalize_slice(index, len)?;
+                // listobject.py:709-714 wraps non-list iterables into a
+                // temporary W_ListObject so the strategy-aware setslice
+                // (`listobject.py:1746-1758`) and extended-slice
+                // (`listobject.py:descr_setitem` step != 1 branch) paths
+                // see a list operand.
                 let w_other = if pyre_object::is_list(value) {
                     value
                 } else {
                     let items = crate::builtins::collect_iterable(value)?;
                     pyre_object::listobject::w_list_new(items)
                 };
-                pyre_object::listobject::w_list_setslice(obj, s, e, w_other)
-                    .expect("w_other is always a valid list");
+                if step == 1 {
+                    let s_lo = start.max(0) as usize;
+                    let s_hi = stop.max(0) as usize;
+                    pyre_object::listobject::w_list_setslice(obj, s_lo, s_hi, w_other)
+                        .expect("w_other is always a valid list");
+                    return Ok(w_none());
+                }
+                // Extended slice: `pypy/objspace/std/listobject.py
+                // W_ListObject.descr_setitem` enforces equal length
+                // ("attempt to assign sequence of size %d to extended
+                // slice of size %d") and writes positions in order.
+                let mut indices = Vec::new();
+                let mut i = start;
+                while (step > 0 && i < stop) || (step < 0 && i > stop) {
+                    if i >= 0 && i < len {
+                        indices.push(i);
+                    }
+                    i += step;
+                }
+                let other_len = pyre_object::w_list_len(w_other);
+                if other_len != indices.len() {
+                    return Err(PyError::new(
+                        PyErrorKind::ValueError,
+                        format!(
+                            "attempt to assign sequence of size {} to extended slice of size {}",
+                            other_len,
+                            indices.len()
+                        ),
+                    ));
+                }
+                for (k, &idx) in indices.iter().enumerate() {
+                    let item = pyre_object::w_list_getitem(w_other, k as i64)
+                        .expect("k < other_len by construction");
+                    if !pyre_object::w_list_setitem(obj, idx, item) {
+                        return Err(PyError::new(
+                            PyErrorKind::IndexError,
+                            "list assignment index out of range",
+                        ));
+                    }
+                }
                 return Ok(w_none());
             }
             if !is_int(index) {
@@ -2993,6 +3629,19 @@ pub fn len(obj: PyObjectRef) -> PyResult {
             obj
         }
     };
+    // `pypy/objspace/std/dictmultiobject.py W_DictMultiViewKeysObject
+    // .descr_len` returns `space.len(self.w_dict)` for all three view
+    // kinds.  Forward to the source dict so the view's len reflects
+    // live mutations on the dict, matching PyPy's view semantics.
+    unsafe {
+        if pyre_object::dictviewobject::is_dict_view(obj) {
+            let dict = pyre_object::dictviewobject::w_dict_view_get_dict(obj);
+            if dict.is_null() {
+                return Ok(w_int_new(0));
+            }
+            return Ok(w_int_new(pyre_object::w_dict_len(dict) as i64));
+        }
+    }
     unsafe {
         if is_list(obj) {
             Ok(w_int_new(w_list_len(obj) as i64))
@@ -3008,6 +3657,29 @@ pub fn len(obj: PyObjectRef) -> PyResult {
             Ok(w_int_new(
                 pyre_object::bytesobject::bytes_like_len(obj) as i64
             ))
+        } else if is_range_iter(obj) {
+            // PRE-EXISTING-ADAPTATION: pyre conflates `range` and
+            // `range_iterator` into a single `W_RangeIterator` (see
+            // `builtin_range` in `builtins.rs`). PyPy keeps them
+            // separate: `pypy/module/__builtin__/functional.py:444
+            // W_Range` carries `w_length` and exposes
+            // `descr_len → self.w_length` (line 485-486), while the
+            // iterator (`pypy/objspace/std/iterobject.py
+            // W_AbstractSeqIterObject:47 descr_length_hint`) exposes
+            // only `__length_hint__`.  The convergence path is to
+            // split pyre's `W_RangeIterator` into `W_Range` +
+            // `W_RangeIterator`. Until then, derive the remaining
+            // count from `(stop - current) / step` so `len(range(N))`
+            // matches CPython's `range.__len__` semantics.
+            let r = &*(obj as *const pyre_object::rangeobject::W_RangeIterator);
+            let count = if r.step > 0 {
+                ((r.stop - r.current).max(0) + r.step - 1) / r.step
+            } else if r.step < 0 {
+                ((r.current - r.stop).max(0) + (-r.step) - 1) / (-r.step)
+            } else {
+                0
+            };
+            Ok(w_int_new(count.max(0)))
         } else if is_instance(obj) {
             // descroperation.py:294-298 `_len` — `space.lookup(w_obj,
             // '__len__')` then `space.get_and_call_function(w_descr,
@@ -3243,11 +3915,17 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
             let super_type = pyre_object::superobject::w_super_get_type(obj);
             let bound_obj = pyre_object::superobject::w_super_get_obj(obj);
 
-            // Walk obj's type MRO, skip until we pass super_type
+            // Walk obj's type MRO, skip until we pass super_type.
+            // Fall back to `crate::typedef::r#type(obj)` so non-INSTANCE
+            // built-in subclasses (W_ExceptionObject, etc.) resolve their
+            // class through the same path that powers `type(obj)` —
+            // `pypy/objspace/std/typeobject.py:1083 type_get_mro`.
             let w_obj_type = if is_instance(bound_obj) {
                 w_instance_get_type(bound_obj)
             } else if is_type(bound_obj) {
                 bound_obj
+            } else if let Some(cls) = crate::typedef::r#type(bound_obj) {
+                cls
             } else {
                 return Err(PyError::type_error("super: bad obj type"));
             };
@@ -3450,8 +4128,53 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
     //      → call w_descr.__get__(obj, type)
     //   5. Return w_descr as-is
     unsafe {
+        // `pypy/interpreter/typedef.py:825-826 Method.typedef` exposes
+        // `__func__` / `__self__` as `interp_attrproperty_w` getset
+        // descriptors that resolve to the wrapped function / instance
+        // directly on attribute access.  Pyre's method typedef
+        // registers them as regular `make_builtin_function` entries
+        // which the descriptor protocol below would surface as bound
+        // methods (binding the `__func__` helper to the method
+        // instance), breaking `m.__func__ is C.m` and `m.__self__ is
+        // c` identity.  Short-circuit before the `is_instance` branch
+        // so the type dispatch path matches PyPy's getset semantics.
+        // PyPy3 exposes only the dunder names — `im_func` / `im_self`
+        // were dropped in 3.x, so do not surface them here.
+        if pyre_object::methodobject::is_method(obj) {
+            match name {
+                "__func__" => {
+                    return Ok(pyre_object::methodobject::w_method_get_func(obj));
+                }
+                "__self__" => {
+                    return Ok(pyre_object::methodobject::w_method_get_self(obj));
+                }
+                _ => {}
+            }
+        }
         if is_instance(obj) {
             let w_type = w_instance_get_type(obj);
+
+            // `pypy/objspace/descroperation.py descr__getattribute__`
+            // dispatches through the receiver type's `__getattribute__`
+            // slot before running the default descriptor protocol.
+            // Users routinely override this to customise *all* attribute
+            // access (e.g. lazy proxies, validating wrappers).  Detect a
+            // non-default override by comparing against the canonical
+            // `object.__getattribute__` registered at type init.
+            if name != "__getattribute__" {
+                if let Some(slot) = lookup_in_type(w_type, "__getattribute__") {
+                    let default_slot =
+                        lookup_in_type(crate::typedef::w_object(), "__getattribute__");
+                    let is_default = match default_slot {
+                        Some(d) => std::ptr::eq(slot, d),
+                        None => false,
+                    };
+                    if !is_default {
+                        let name_obj = w_str_new(name);
+                        return crate::call::call_function_impl_result(slot, &[obj, name_obj]);
+                    }
+                }
+            }
 
             // Step 1: look up in type MRO
             let w_descr = lookup_in_type_where(w_type, name);
@@ -3535,6 +4258,27 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
     unsafe {
         if is_type(obj) {
             // Special type attributes — PyPy: typeobject.py
+            if name == "__class__" {
+                // `pypy/objspace/std/typeobject.py:198 type___class__getter`
+                // returns `self.w_metaclass` (the metaclass).  pyre stamps
+                // each registered builtin type's `w_class` to the
+                // `type` typeobject in `init_typeobjects`'s post-loop
+                // (typedef.rs:489-499).  Return that directly; falling
+                // through to `lookup_in_type_where` would hit the
+                // `__class__` getset descriptor on the metatype and
+                // recurse.  When `w_class` is null (bootstrap or a
+                // type built before `init_typeobjects`), fall back to
+                // the `type` typeobject so `int.__class__ is type`
+                // still holds.
+                let mc = (*obj).w_class;
+                if !mc.is_null() {
+                    return Ok(mc);
+                }
+                let w_type_type = crate::typedef::w_type();
+                if !w_type_type.is_null() {
+                    return Ok(w_type_type);
+                }
+            }
             if name == "__name__" {
                 return Ok(w_str_new(w_type_get_name(obj)));
             }
@@ -3741,7 +4485,16 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
                     return Ok(if closure.is_null() { w_none() } else { closure });
                 }
                 "__globals__" => {
-                    return Ok(dict_storage_to_dict(crate::function_get_globals(obj)));
+                    // `funcobject.py:325 fget_func_globals` returns
+                    // `self.w_func_globals` directly.  Pyre's cached
+                    // `function_get_globals_obj` returns the same
+                    // canonical W_DictObject as
+                    // `dict_storage_to_dict(function_get_globals(obj))`
+                    // (mirror_target invariant) but skips the
+                    // HashMap lookup on subsequent reads — every
+                    // `f.__globals__` access on the same function
+                    // re-uses the slot stamped on first call.
+                    return Ok(unsafe { crate::function_get_globals_obj(obj) });
                 }
                 "__defaults__" => {
                     let defaults = crate::function_get_defaults(obj);
@@ -3760,24 +4513,81 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
                     });
                 }
                 "__qualname__" => {
-                    let found = ATTR_TABLE.with(|table| {
-                        table
-                            .borrow()
-                            .get(&(obj as usize))
-                            .and_then(|d| d.get(name).copied())
-                    });
-                    if let Some(value) = found {
-                        return Ok(value);
+                    // function.py:470-471 fget_func_qualname returns
+                    // space.newtext(self.qualname); the typed
+                    // `function_get_qualname` mirrors PyPy's `qualname or
+                    // self.name` short-circuit (w_qualname slot →
+                    // code.co_qualname → name).
+                    let s = crate::function::function_get_qualname(obj);
+                    return Ok(w_str_new(&s));
+                }
+                "__doc__" => {
+                    // `pypy/interpreter/function.py:395-398 fget_func_doc`
+                    // — instance dict override first, then lazy
+                    // `code.getdocstring(space)`.  Pyre's
+                    // `function_get_doc` mirrors that shape (instance
+                    // dict → BuiltinCode `docstring` → user
+                    // CodeObject `HAS_DOCSTRING` first const).  The
+                    // generic `__doc__` fallback would otherwise
+                    // return None for every user-defined function
+                    // because no caller routes to `function_get_doc`.
+                    return Ok(crate::function::function_get_doc(obj));
+                }
+                "__module__" => {
+                    // `pypy/interpreter/function.py:507 fget___module__`
+                    // lazy-resolves from `w_func_globals['__name__']` on
+                    // first read and caches into `self.w_module`.  Pyre's
+                    // `crate::function::fget___module__` mirrors that
+                    // shape — `(*func).w_module` stamps on first call so
+                    // subsequent reads (and explicit `setattr(f,
+                    // '__module__', x)`) take the cache path.  The
+                    // generic `__module__` fallback at the end of
+                    // `getattr` would otherwise return `None` for every
+                    // function (function.rs:48 init `w_module = PY_NULL`).
+                    return Ok(unsafe { crate::function::fget___module__(obj) });
+                }
+                "__annotations__" => {
+                    // `pypy/interpreter/function.py:548-551
+                    // fget_func_annotations` returns
+                    // `self.w_ann`, allocating an empty dict on first
+                    // access if none was set, and stamping it back so
+                    // identity holds.
+                    //
+                    // Pyre stores the eager dict on the typed
+                    // `Function.w_ann` slot via
+                    // `function_set_annotations` at MAKE_FUNCTION
+                    // ANNOTATIONS time (eval.rs).  PEP 649 lazy
+                    // annotations (`MakeFunctionFlag::Annotate`,
+                    // default in the RustPython compiler) keep a
+                    // `__annotate_func__` callable in ATTR_TABLE that
+                    // we invoke with `format=1` to materialise the
+                    // dict; the result is stamped onto `w_ann` to
+                    // freeze identity for subsequent reads.
+                    let raw = unsafe { (*(obj as *mut crate::function::Function)).w_ann };
+                    if !raw.is_null() {
+                        return Ok(raw);
                     }
-                    let code = crate::function_get_code(obj) as PyObjectRef;
-                    if !code.is_null() && crate::pycode::is_code(code) {
-                        let raw_code_ptr =
-                            crate::pycode::w_code_get_ptr(code) as *const crate::CodeObject;
-                        if !raw_code_ptr.is_null() {
-                            return Ok(w_str_new((*raw_code_ptr).qualname.as_ref()));
+                    let annotate_fn = ATTR_TABLE.with(|table| {
+                        let table = table.borrow();
+                        let entry = table.get(&(obj as usize))?;
+                        entry
+                            .get("__annotate_func__")
+                            .copied()
+                            .or_else(|| entry.get("__annotate__").copied())
+                    });
+                    if let Some(annotate_fn) = annotate_fn {
+                        if !annotate_fn.is_null() && !is_none(annotate_fn) {
+                            let dict = crate::call_function(annotate_fn, &[w_int_new(1)]);
+                            unsafe {
+                                crate::function::function_set_annotations(obj, dict);
+                            }
+                            return Ok(dict);
                         }
                     }
-                    return Ok(w_str_new(crate::function_get_name(obj)));
+                    // Lazy-fill via the helper so the slot is stamped
+                    // and `f.__annotations__ is f.__annotations__`
+                    // identity holds across reads.
+                    return Ok(unsafe { crate::function::function_get_annotations(obj) });
                 }
                 _ => {}
             }
@@ -3838,7 +4648,29 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
     if unsafe { pyre_object::is_exception(obj) } {
         match name {
             "__traceback__" => {
-                // Stub traceback object with tb_frame, tb_lineno, tb_next
+                // `pypy/module/exceptions/interp_exceptions.py:196-201
+                // W_BaseException.descr_gettraceback` returns the
+                // `w_traceback` slot stamped by `descr_settraceback`
+                // and the `raise` machinery's
+                // `OperationError.normalize_exception` path.  Defaults
+                // to `None` in CPython when none has been set.  Pyre's
+                // stdlib bundle (`lib-python/3/types.py:53-57`) probes
+                // `type(exc.__traceback__.tb_frame)` even before any
+                // `raise` reaches except, so returning `None` here
+                // explodes module-level type initialisation for
+                // `types`, `functools`, `enum`, ...
+                //
+                // PRE-EXISTING-ADAPTATION — until pyre grows real
+                // traceback objects (`pypy/interpreter/pytraceback.py
+                // PyTraceback`), surface a stub `W_InstanceObject`
+                // carrying `tb_frame`/`tb_lineno`/`tb_next` so the
+                // type-derivation pattern survives.  Explicit
+                // `e.__traceback__ = tb` writes already land in the
+                // typed `w_traceback` slot and take precedence.
+                let stored = unsafe { pyre_object::excobject::w_exception_get_traceback(obj) };
+                if !stored.is_null() {
+                    return Ok(stored);
+                }
                 let tb = pyre_object::w_instance_new(crate::typedef::w_object());
                 let frame_obj = pyre_object::w_instance_new(crate::typedef::w_object());
                 ATTR_TABLE.with(|t| {
@@ -3855,17 +4687,57 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
                 });
                 return Ok(tb);
             }
-            "__cause__" | "__context__" | "__suppress_context__" => {
-                let found = ATTR_TABLE.with(|table| {
-                    let table = table.borrow();
-                    table
-                        .get(&(obj as usize))
-                        .and_then(|d| d.get(name).copied())
-                });
-                return Ok(found.unwrap_or(w_none()));
+            "__cause__" => {
+                // `interp_exceptions.py:163-164 descr_getcause`.
+                let stored = unsafe { pyre_object::excobject::w_exception_get_cause(obj) };
+                return Ok(if stored.is_null() { w_none() } else { stored });
+            }
+            "__context__" => {
+                // `interp_exceptions.py:180-181 descr_getcontext`.
+                let stored = unsafe { pyre_object::excobject::w_exception_get_context(obj) };
+                return Ok(if stored.is_null() { w_none() } else { stored });
+            }
+            "__suppress_context__" => {
+                // `interp_exceptions.py:212-213 descr_getsuppresscontext`
+                // returns `space.newbool(self.suppress_context)`.
+                // Defaults to False per `:117 W_BaseException` class
+                // default; `descr_setcause` flips to True.
+                let b = unsafe { pyre_object::excobject::w_exception_get_suppress_context(obj) };
+                return Ok(pyre_object::w_bool_from(b));
             }
             "args" => {
-                return Ok(w_tuple_new(vec![]));
+                // `pypy/module/exceptions/interp_exceptions.py:153
+                // W_BaseException.descr_getargs` returns
+                // `space.newtuple(self.args_w)` — a freshly-built
+                // tuple per call.  `w_exception_get_args` does the
+                // same: it walks the internal list slot and rebuilds
+                // a `W_TupleObject`, returning the empty tuple when
+                // the slot was never stamped.
+                return Ok(unsafe { pyre_object::excobject::w_exception_get_args(obj) });
+            }
+            "value" => {
+                // `pypy/module/exceptions/interp_exceptions.py
+                // W_StopIteration.descr_init` stores `value = w_args[0]`,
+                // exposed as `fget_value`.  `generator_send_ex` stamps
+                // the generator's return value into the exception's
+                // `args` tuple; mirror PyPy by returning `args[0]` and
+                // defaulting to `None`.  Only StopIteration uses this
+                // attribute — other exception kinds keep the regular
+                // attribute lookup fall-through.
+                let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
+                if kind == pyre_object::excobject::ExcKind::StopIteration {
+                    let args_tuple = unsafe { pyre_object::excobject::w_exception_get_args(obj) };
+                    // `w_exception_get_args` always returns a real
+                    // tuple — empty tuple when `args_w` was never
+                    // stamped — so the null-check above is unneeded.
+                    let len = unsafe { pyre_object::w_tuple_len(args_tuple) };
+                    if len > 0 {
+                        if let Some(v) = unsafe { pyre_object::w_tuple_getitem(args_tuple, 0) } {
+                            return Ok(v);
+                        }
+                    }
+                    return Ok(w_none());
+                }
             }
             _ => {}
         }
@@ -4369,6 +5241,16 @@ unsafe fn is_data_descr(descr: PyObjectRef) -> bool {
     if pyre_object::is_member(descr) {
         return true;
     }
+    // `typedef.py:312-320 GetSetProperty` is a data descriptor by
+    // virtue of always exposing `__set__`/`__delete__` slots in its
+    // typedef (regardless of whether `fset`/`fdel` are non-null —
+    // `descr_property_set` raises `readonly_attribute` for the
+    // null-fset case).  Pyre's W_GetSetProperty no longer rides on
+    // INSTANCE_TYPE so the generic `is_instance + lookup_in_type`
+    // branch below would miss it; short-circuit here.
+    if pyre_object::getsetproperty::is_getset_property(descr) {
+        return true;
+    }
     // Check if the descriptor's class has __set__ or __delete__
     if is_instance(descr) {
         let w_type = w_instance_get_type(descr);
@@ -4509,11 +5391,18 @@ unsafe fn set(
         return Ok(false);
     }
 
-    // property: PyPy W_Property.set → call_function(fset, obj, value)
+    // property: PyPy W_Property.set → call_function(fset, obj, value).
+    // Read-only properties (no `fset` / `@x.setter` never registered)
+    // raise AttributeError ("can't set attribute") rather than falling
+    // through to the instance dict (`descrobject.c property_descr_set`,
+    // mirrored at `pypy/objspace/std/typeobject.py W_Property.descr_set`).
     if is_property(descr) {
         let fset = w_property_get_fset(descr);
         if fset.is_null() || is_none(fset) {
-            return Ok(false);
+            return Err(crate::PyError::new(
+                crate::PyErrorKind::AttributeError,
+                "property has no setter".to_string(),
+            ));
         }
         crate::call_function(fset, &[obj, value]);
         return Ok(true);
@@ -4545,9 +5434,19 @@ unsafe fn set(
         return Ok(true);
     }
 
-    // General __set__: look up on descriptor's type MRO
-    if is_instance(descr) {
-        let descr_type = w_instance_get_type(descr);
+    // General __set__: look up on descriptor's type MRO.  GetSetProperty
+    // is no longer INSTANCE_TYPE-shaped (it carries `GETSET_DESCRIPTOR
+    // _TYPE` so its W_GetSetProperty payload is GC-traced), so resolve
+    // the type through `crate::typedef::r#type` rather than the
+    // `is_instance` branch.
+    let descr_type = if pyre_object::getsetproperty::is_getset_property(descr) {
+        crate::typedef::r#type(descr).unwrap_or(std::ptr::null_mut())
+    } else if is_instance(descr) {
+        w_instance_get_type(descr)
+    } else {
+        std::ptr::null_mut()
+    };
+    if !descr_type.is_null() {
         if let Some(set_fn) = lookup_in_type_where(descr_type, "__set__") {
             if !set_fn.is_null() {
                 crate::call::call_function_impl_result(set_fn, &[descr, obj, value])?;
@@ -4602,9 +5501,17 @@ unsafe fn delete(descr: PyObjectRef, obj: PyObjectRef) -> Result<(), crate::PyEr
         }
         return Ok(());
     }
-    // General __delete__: look up on descriptor's type MRO
-    if is_instance(descr) {
-        let descr_type = w_instance_get_type(descr);
+    // General __delete__: look up on descriptor's type MRO — same
+    // shape as `set` above (resolve type through `r#type` so non-
+    // INSTANCE_TYPE descriptors like `W_GetSetProperty` are reached).
+    let descr_type = if pyre_object::getsetproperty::is_getset_property(descr) {
+        crate::typedef::r#type(descr).unwrap_or(std::ptr::null_mut())
+    } else if is_instance(descr) {
+        w_instance_get_type(descr)
+    } else {
+        std::ptr::null_mut()
+    };
+    if !descr_type.is_null() {
         if let Some(del_fn) = lookup_in_type_where(descr_type, "__delete__") {
             if !del_fn.is_null() {
                 crate::call::call_function_impl_result(del_fn, &[descr, obj])?;
@@ -4773,7 +5680,135 @@ pub fn setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult {
             return Ok(w_none());
         }
     }
+    // Exception instances accept arbitrary attribute writes —
+    // `pypy/module/exceptions/interp_exceptions.py` declares
+    // W_BaseException.typedef with `__dict__ = GetSetProperty(descr_get_dict)`,
+    // so user code routinely does `e.foo = bar` (e.g.
+    // `argparse.ArgumentTypeError`'s `e.message = ...` pattern).
+    // pyre's W_ExceptionObject has no per-instance W_DictObject yet;
+    // fall back to ATTR_TABLE which the matching getattr branch reads.
+    if unsafe { pyre_object::is_exception(obj) } {
+        // `pypy/module/exceptions/interp_exceptions.py:156-157
+        // W_BaseException.descr_setargs` →
+        //   self.args_w = space.fixedview(w_newargs)
+        // `space.fixedview` materialises any iterable into a list of
+        // wrapped objects; pyre stores `args_w` as a tuple `PyObjectRef`,
+        // so coerce the incoming value into a tuple shape (tuple stays
+        // as-is, list wraps into tuple, anything else iterates).
+        if name == "args" {
+            let coerced = unsafe { coerce_to_list_for_args(value)? };
+            unsafe { pyre_object::excobject::w_exception_set_args(obj, coerced) };
+            return Ok(w_none());
+        }
+        // `interp_exceptions.py:165-219` — the four special exception
+        // attributes (`__cause__`, `__context__`, `__traceback__`,
+        // `__suppress_context__`) are registered as `GetSetProperty`
+        // setters on `W_BaseException.typedef` and each validates its
+        // input before storing into the matching typed slot
+        // (`w_cause`/`w_context`/`w_traceback`/`suppress_context`,
+        // line 113-117).  Storage lives on `W_ExceptionObject`
+        // directly — no ATTR_TABLE side store for these four names.
+        match name {
+            "__cause__" => {
+                // `interp_exceptions.py:166-174 descr_setcause` — None
+                // OR an instance whose type derives from `BaseException`,
+                // and always flips `suppress_context` to True.
+                if !unsafe { pyre_object::is_none(value) } {
+                    let value_type = crate::typedef::r#type(value).unwrap_or(pyre_object::PY_NULL);
+                    if value_type.is_null() || !unsafe { exception_is_valid_class_w(value_type) } {
+                        return Err(PyError::type_error(
+                            "exception cause must be None or derive from BaseException",
+                        ));
+                    }
+                }
+                unsafe {
+                    pyre_object::excobject::w_exception_set_cause(obj, value);
+                    pyre_object::excobject::w_exception_set_suppress_context(obj, true);
+                };
+                return Ok(w_none());
+            }
+            "__context__" => {
+                // `interp_exceptions.py:183-190 descr_setcontext` — None
+                // OR an instance whose type derives from `BaseException`.
+                if !unsafe { pyre_object::is_none(value) } {
+                    let value_type = crate::typedef::r#type(value).unwrap_or(pyre_object::PY_NULL);
+                    if value_type.is_null() || !unsafe { exception_is_valid_class_w(value_type) } {
+                        return Err(PyError::type_error(
+                            "exception context must be None or derive from BaseException",
+                        ));
+                    }
+                }
+                unsafe { pyre_object::excobject::w_exception_set_context(obj, value) };
+                return Ok(w_none());
+            }
+            "__traceback__" => {
+                // `interp_exceptions.py:203-206 descr_settraceback` —
+                // must be a traceback or None.  Pyre has no real
+                // traceback objects yet (`getattr(exc,
+                // "__traceback__")` returns a stub `W_InstanceObject`
+                // carrying `tb_frame`/`tb_lineno`/`tb_next`), so the
+                // validation rejects the obviously-wrong primitive
+                // types while accepting None or any object that could
+                // plausibly carry traceback attributes.
+                if !unsafe { pyre_object::is_none(value) } {
+                    let primitive = unsafe {
+                        pyre_object::is_int(value)
+                            || pyre_object::is_long(value)
+                            || pyre_object::is_str(value)
+                            || pyre_object::is_float(value)
+                            || pyre_object::is_tuple(value)
+                            || pyre_object::is_list(value)
+                            || pyre_object::is_bool(value)
+                            || pyre_object::is_dict(value)
+                    };
+                    if primitive {
+                        return Err(PyError::type_error(
+                            "__traceback__ must be a traceback or None",
+                        ));
+                    }
+                }
+                unsafe { pyre_object::excobject::w_exception_set_traceback(obj, value) };
+                return Ok(w_none());
+            }
+            "__suppress_context__" => {
+                // `interp_exceptions.py:215-216 descr_setsuppresscontext`
+                // — `space.bool_w(w_value)` coerces via `__bool__`.
+                let b = is_true(value);
+                unsafe { pyre_object::excobject::w_exception_set_suppress_context(obj, b) };
+                return Ok(w_none());
+            }
+            _ => {}
+        }
+        ATTR_TABLE.with(|table| {
+            table
+                .borrow_mut()
+                .entry(obj as usize)
+                .or_default()
+                .insert(name.to_string(), value);
+        });
+        return Ok(w_none());
+    }
     Err(raiseattrerror(obj, name))
+}
+
+/// `pypy/module/exceptions/interp_exceptions.py:156-157
+/// W_BaseException.descr_setargs` parity helper:
+///
+/// ```python
+/// def descr_setargs(self, space, w_newargs):
+///     self.args_w = space.fixedview(w_newargs)
+/// ```
+///
+/// `space.fixedview` materialises any iterable into a RPython list
+/// of `W_Root`; pyre stores `args_w` as a `W_ListObject` so the
+/// getter (`w_exception_get_args`) can build a fresh tuple per read
+/// (matching `descr_getargs: return space.newtuple(self.args_w)`).
+unsafe fn coerce_to_list_for_args(value: PyObjectRef) -> Result<PyObjectRef, PyError> {
+    if value.is_null() {
+        return Ok(w_list_new(vec![]));
+    }
+    let items = fixedview(value, -1)?;
+    Ok(w_list_new(items))
 }
 
 /// baseobjspace.py:52-57 W_Root.setdictvalue (default).
@@ -4900,6 +5935,14 @@ pub fn delattr(obj: PyObjectRef, name: &str) -> PyResult {
                 }
             }
         }
+    }
+    // `pypy/module/exceptions/interp_exceptions.py:159-161
+    // W_BaseException.descr_delargs` → unconditional TypeError
+    // ("args may not be deleted").  Reject `del e.args` before the
+    // generic dict/ATTR_TABLE removal path, which would otherwise
+    // succeed silently when an entry existed there.
+    if unsafe { pyre_object::is_exception(obj) } && name == "args" {
+        return Err(PyError::type_error("args may not be deleted"));
     }
     // Instance/general: remove from instance dict, then ATTR_TABLE
     let w_dict = getdict(obj);
@@ -6142,6 +7185,21 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
             obj
         }
     };
+    // `pypy/objspace/std/dictmultiobject.py W_DictMultiViewKeysObject
+    // .descr_iter` (and the values / items siblings) materialise an
+    // iterator over the source dict's current entries.  Pyre routes
+    // through `dict_view_snapshot` which produces the kind-appropriate
+    // list (keys / values / (k,v) tuples) and wraps it in a sequence
+    // iterator — same observable behaviour as PyPy's per-kind
+    // _iter_keys / _iter_values / _iter_items.
+    unsafe {
+        if pyre_object::dictviewobject::is_dict_view(obj) {
+            let snapshot = crate::type_methods::dict_view_snapshot(obj);
+            let n = snapshot.len();
+            let list = pyre_object::w_list_new(snapshot);
+            return Ok(pyre_object::w_seq_iter_new(list, n));
+        }
+    }
     unsafe {
         // Builtin iterables
         if is_list(obj) {
@@ -6192,6 +7250,11 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         if pyre_object::itertoolsmodule::is_count(obj)
             || pyre_object::itertoolsmodule::is_repeat(obj)
         {
+            return Ok(obj);
+        }
+        // `pypy/module/__builtin__/functional.py:277-278
+        // W_Enumerate.descr___iter__` — `return self`.
+        if pyre_object::enumerateobject::is_enumerate(obj) {
             return Ok(obj);
         }
         // pypy/objspace/descroperation.py:330-346 `def iter(space, w_obj)`
@@ -6379,6 +7442,98 @@ pub fn next(obj: PyObjectRef) -> PyResult {
             }
             return Ok(pyre_object::itertoolsmodule::w_repeat_get_obj(obj));
         }
+        // `pypy/module/__builtin__/functional.py:280-310 W_Enumerate.descr_next`
+        // line-by-line port —
+        //
+        //     def descr_next(self, space):
+        //         w_index = self.w_index
+        //         w_iter_or_list = self.w_iter_or_list
+        //         w_item = None
+        //         if w_index is None:
+        //             index = self.index
+        //             if type(w_iter_or_list) is W_ListObject:
+        //                 try:
+        //                     w_item = w_iter_or_list.getitem(index)
+        //                 except IndexError:
+        //                     self.w_iter_or_list = None
+        //                     raise OperationError(space.w_StopIteration, space.w_None)
+        //                 self.index = index + 1
+        //             elif w_iter_or_list is None:
+        //                 raise OperationError(space.w_StopIteration, space.w_None)
+        //             else:
+        //                 try:
+        //                     newval = rarithmetic.ovfcheck(index + 1)
+        //                 except OverflowError:
+        //                     w_index = space.newint(index)
+        //                     self.w_index = space.add(w_index, space.newint(1))
+        //                     self.index = -1
+        //                 else:
+        //                     self.index = newval
+        //             w_index = space.newint(index)
+        //         else:
+        //             self.w_index = space.add(w_index, space.newint(1))
+        //         if w_item is None:
+        //             w_item = space.next(self.w_iter_or_list)
+        //         return space.newtuple2(w_index, w_item)
+        if pyre_object::enumerateobject::is_enumerate(obj) {
+            use pyre_object::enumerateobject as eo;
+            let w_index_slot = eo::w_enumerate_get_w_index(obj);
+            let mut w_iter_or_list = eo::w_enumerate_get_iter_or_list(obj);
+            let mut w_item: PyObjectRef = pyre_object::PY_NULL;
+            let w_index: PyObjectRef;
+            if w_index_slot.is_null() {
+                // i64 fast-path branch.
+                let index = eo::w_enumerate_get_index(obj);
+                if !w_iter_or_list.is_null() && pyre_object::is_list(w_iter_or_list) {
+                    // `:289-294 W_ListObject` fast path — directly
+                    // getitem; IndexError marks end-of-iteration and
+                    // clears the slot.
+                    let list_len = pyre_object::w_list_len(w_iter_or_list) as i64;
+                    if index < 0 || index >= list_len {
+                        eo::w_enumerate_set_iter_or_list(obj, pyre_object::PY_NULL);
+                        return Err(PyError::stop_iteration());
+                    }
+                    w_item = pyre_object::w_list_getitem(w_iter_or_list, index).unwrap_or(PY_NULL);
+                    eo::w_enumerate_set_index(obj, index + 1);
+                } else if w_iter_or_list.is_null() {
+                    // `:295-296` — slot cleared after a previous
+                    // list-getitem stop.
+                    return Err(PyError::stop_iteration());
+                } else {
+                    // General iterator path — `:297-303` ovfcheck.
+                    match index.checked_add(1) {
+                        Some(next) => eo::w_enumerate_set_index(obj, next),
+                        None => {
+                            // Promote to bigint slot per `:299-302`.
+                            let w_idx =
+                                pyre_object::w_long_new(::malachite_bigint::BigInt::from(index));
+                            let one =
+                                pyre_object::w_long_new(::malachite_bigint::BigInt::from(1i64));
+                            let bumped = add(w_idx, one)?;
+                            eo::w_enumerate_set_w_index(obj, bumped);
+                            eo::w_enumerate_set_index(obj, -1);
+                        }
+                    }
+                }
+                w_index = pyre_object::w_int_new(index);
+            } else {
+                // Bigint slot active — bump via `space.add`.
+                let one = pyre_object::w_int_new(1);
+                let bumped = add(w_index_slot, one)?;
+                eo::w_enumerate_set_w_index(obj, bumped);
+                w_index = w_index_slot;
+            }
+            if w_item.is_null() {
+                // Re-read slot — list fast-path already set w_item;
+                // otherwise we need to pull from the iterator.
+                w_iter_or_list = eo::w_enumerate_get_iter_or_list(obj);
+                if w_iter_or_list.is_null() {
+                    return Err(PyError::stop_iteration());
+                }
+                w_item = next(w_iter_or_list)?;
+            }
+            return Ok(pyre_object::w_tuple_new(vec![w_index, w_item]));
+        }
         // Instance __next__
         if is_instance(obj) {
             let w_type = w_instance_get_type(obj);
@@ -6487,7 +7642,13 @@ fn generator_send_ex(gen_obj: PyObjectRef, w_arg: PyObjectRef, operr: Option<PyE
                 // it was RETURNed from; otherwise it YIELDed.
                 if frame.frame_finished_execution {
                     w_generator_set_exhausted(gen_obj);
-                    Err(PyError::stop_iteration())
+                    // generator.py:117-119 / pyopcode.py RETURN_VALUE in
+                    // generator frames — `raise StopIteration(returnvalue)`
+                    // so callers can pull the return value off `.value`.
+                    // Wrap any non-None return into the exception's args
+                    // tuple; bare `return` (or fallthrough → None) keeps
+                    // an empty args tuple.
+                    Err(stop_iteration_with_value(value))
                 } else {
                     Ok(value)
                 }
@@ -6498,6 +7659,25 @@ fn generator_send_ex(gen_obj: PyObjectRef, w_arg: PyObjectRef, operr: Option<PyE
             }
         }
     }
+}
+
+/// Build a `StopIteration` carrying `value` on `.value` / `args[0]`.
+/// `value == None` (or PY_NULL) keeps the args tuple empty so
+/// `next(g)` outside a generator-return context still surfaces a bare
+/// `StopIteration()`.
+fn stop_iteration_with_value(value: PyObjectRef) -> PyError {
+    use pyre_object::excobject::*;
+    let exc = w_exception_new(ExcKind::StopIteration, "");
+    if !value.is_null() && unsafe { !is_none(value) } {
+        // `interp_exceptions.py:121-124 W_BaseException.descr_init`
+        // stores `args_w` as a list; pyre matches the shape so that
+        // `e.args` materialises a fresh tuple each read.
+        let args_list = w_list_new(vec![value]);
+        unsafe {
+            w_exception_set_args(exc, args_list);
+        }
+    }
+    unsafe { PyError::from_exc_object(exc) }
 }
 
 /// PyPy: GeneratorIterator.next() — equivalent to __next__
@@ -7216,6 +8396,54 @@ pub fn contains(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, PyEr
             haystack
         }
     };
+    // `pypy/objspace/std/dictmultiobject.py W_DictMultiViewKeysObject
+    // .descr_contains` → `space.contains(self.w_dict, w_key)`.
+    // `W_DictMultiViewItemsObject.descr_contains` matches a (k, v)
+    // tuple via dict lookup + value equality.  `W_DictMultiViewValues
+    // Object` has no `__contains__` slot in PyPy — pyre delegates the
+    // fall-through to the standard `iter`-based scan further down so
+    // `v in d.values()` still works (as in PyPy where the missing
+    // slot triggers the iter fallback).
+    unsafe {
+        if pyre_object::dictviewobject::is_dict_view(haystack) {
+            let kind = pyre_object::dictviewobject::w_dict_view_get_kind(haystack);
+            let dict = pyre_object::dictviewobject::w_dict_view_get_dict(haystack);
+            if dict.is_null() {
+                return Ok(false);
+            }
+            match kind {
+                pyre_object::dictviewobject::DictViewKind::Keys => {
+                    return Ok(pyre_object::w_dict_lookup(dict, needle).is_some());
+                }
+                pyre_object::dictviewobject::DictViewKind::Items => {
+                    if !is_tuple(needle) || w_tuple_len(needle) != 2 {
+                        return Ok(false);
+                    }
+                    let k = match w_tuple_getitem(needle, 0) {
+                        Some(k) => k,
+                        None => return Ok(false),
+                    };
+                    let want = match w_tuple_getitem(needle, 1) {
+                        Some(v) => v,
+                        None => return Ok(false),
+                    };
+                    return Ok(match pyre_object::w_dict_lookup(dict, k) {
+                        Some(have) => eq_w(have, want),
+                        None => false,
+                    });
+                }
+                pyre_object::dictviewobject::DictViewKind::Values => {
+                    // values view: PyPy uses iter-based scan.
+                    for (_, v) in pyre_object::w_dict_items(dict) {
+                        if eq_w(v, needle) {
+                            return Ok(true);
+                        }
+                    }
+                    return Ok(false);
+                }
+            }
+        }
+    }
     unsafe {
         if is_list(haystack) {
             let len = w_list_len(haystack);

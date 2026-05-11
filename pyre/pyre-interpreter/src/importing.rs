@@ -1392,17 +1392,29 @@ fn init_itertools(ns: &mut DictStorage) {
             Ok(pyre_object::w_seq_iter_new(list, n))
         }),
     );
-    // zip_longest(*iterables, fillvalue=None)
+    // zip_longest(*iterables, fillvalue=None) — interp_itertools.py
+    // W_ZipLongest. CALL_KW packs `fillvalue` into the trailing
+    // `__pyre_kw__` dict (`call.rs:727-744`); strip it before
+    // collecting the iterable pools so the kwarg doesn't surface as
+    // an extra positional pool.
     crate::dict_storage_store(
         ns,
         "zip_longest",
         crate::make_builtin_function("zip_longest", |args| {
-            let pools: Vec<Vec<_>> = args
+            let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+            // `pypy/module/itertools/interp_itertools.py:685` —
+            // W_ZipLongest's `unwrap_spec` only knows about
+            // `fillvalue`; any other keyword raises TypeError at the
+            // gateway.  Pyre's flat builtin ABI has to enforce this
+            // by hand.
+            crate::builtins::kwarg_reject_unknown(kwargs, &["fillvalue"], "zip_longest")?;
+            let fill =
+                crate::builtins::kwarg_get(kwargs, "fillvalue").unwrap_or_else(pyre_object::w_none);
+            let pools: Vec<Vec<_>> = positional
                 .iter()
                 .map(|&a| crate::builtins::collect_iterable(a))
                 .collect::<Result<_, _>>()?;
             let max_len = pools.iter().map(|p| p.len()).max().unwrap_or(0);
-            let fill = pyre_object::w_none();
             let mut tuples = Vec::with_capacity(max_len);
             for i in 0..max_len {
                 let row: Vec<_> = pools

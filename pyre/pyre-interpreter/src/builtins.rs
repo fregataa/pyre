@@ -781,6 +781,113 @@ pub fn builtin_abs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     Err(crate::PyError::type_error("bad operand type for abs()"))
 }
 
+/// Strip the trailing `__pyre_kw__` dict that `call_with_kwargs`
+/// (`call.rs:727-744`) appends for builtin callees and return the
+/// positional slice paired with a keyword lookup helper.
+///
+/// PyPy's gateway parses `Arguments.keyword_names_w` directly through
+/// the `unwrap_spec` machinery; pyre's flat `BuiltinCodeFn` ABI lacks
+/// that surface, so each kwarg-aware builtin reaches into the trailing
+/// dict via this shared helper.
+pub(crate) fn split_builtin_kwargs(args: &[PyObjectRef]) -> (&[PyObjectRef], Option<PyObjectRef>) {
+    if let Some(&last) = args.last() {
+        if unsafe {
+            is_dict(last) && pyre_object::w_dict_lookup(last, w_str_new("__pyre_kw__")).is_some()
+        } {
+            return (&args[..args.len() - 1], Some(last));
+        }
+    }
+    (args, None)
+}
+
+/// Look up a single keyword argument from the kwargs dict produced by
+/// `split_builtin_kwargs`. Returns `None` when no kwargs dict is present
+/// or the requested key is absent.
+pub(crate) fn kwarg_get(kwargs: Option<PyObjectRef>, name: &str) -> Option<PyObjectRef> {
+    let dict = kwargs?;
+    unsafe { pyre_object::w_dict_lookup(dict, w_str_new(name)) }
+}
+
+/// Reject any keyword argument whose name is not in `allowed`.  Mirrors
+/// PyPy's `unwrap_spec` strict-keyword behaviour — for example
+/// `pypy/module/__builtin__/functional.py:198-201 min_max` raises
+/// `TypeError("min() got unexpected keyword argument")` whenever an
+/// unknown kwarg slips in (only `key` and `default` are accepted).
+/// pyre's flat builtin ABI has to police this manually because
+/// `split_builtin_kwargs` does not enforce a signature.
+///
+/// `fn_name` is the bare function name used in the error message
+/// ("min", "zip_longest", ...).  The `__pyre_kw__` marker entry the
+/// gateway appends is filtered out; it is an implementation detail of
+/// the kwargs encoding, not a user-visible argument.
+pub(crate) fn kwarg_reject_unknown(
+    kwargs: Option<PyObjectRef>,
+    allowed: &[&str],
+    fn_name: &str,
+) -> Result<(), crate::PyError> {
+    let dict = match kwargs {
+        Some(d) => d,
+        None => return Ok(()),
+    };
+    let entries = unsafe { pyre_object::w_dict_str_entries(dict) };
+    for (key, _) in entries.iter() {
+        if key == "__pyre_kw__" {
+            continue;
+        }
+        if !allowed.iter().any(|name| *name == key.as_str()) {
+            return Err(crate::PyError::type_error(format!(
+                "{fn_name}() got an unexpected keyword argument '{key}'"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// `space.index_w(obj)` parity — `pypy/interpreter/baseobjspace.py
+/// space.index_w` returns the int value of an object exposing
+/// `__index__`.  Pyre handles the int / long / bool fast paths
+/// directly and falls through to looking up `__index__` on the
+/// object's type, mirroring PyPy's `lookup_in_type` pass before
+/// raising `TypeError`.
+pub(crate) fn space_index_w(obj: PyObjectRef) -> Result<i64, crate::PyError> {
+    unsafe {
+        if pyre_object::is_int(obj) {
+            return Ok(pyre_object::w_int_get_value(obj));
+        }
+        if pyre_object::is_bool(obj) {
+            return Ok(if pyre_object::w_bool_get_value(obj) {
+                1
+            } else {
+                0
+            });
+        }
+        if let Some(w_type) = crate::typedef::r#type(obj) {
+            if let Some(index_fn) = crate::baseobjspace::lookup_in_type(w_type, "__index__") {
+                let result = crate::call::call_function_impl_result(index_fn, &[obj])?;
+                if pyre_object::is_int(result) {
+                    return Ok(pyre_object::w_int_get_value(result));
+                }
+                if pyre_object::is_bool(result) {
+                    return Ok(if pyre_object::w_bool_get_value(result) {
+                        1
+                    } else {
+                        0
+                    });
+                }
+            }
+        }
+    }
+    let tp_name = unsafe {
+        match crate::typedef::r#type(obj) {
+            Some(tp) => pyre_object::w_type_get_name(tp).to_string(),
+            None => "object".to_string(),
+        }
+    };
+    Err(crate::PyError::type_error(format!(
+        "'{tp_name}' object cannot be interpreted as an integer"
+    )))
+}
+
 /// Convert an int or long object to BigInt for comparison.
 pub(crate) unsafe fn obj_to_bigint(obj: PyObjectRef) -> BigInt {
     unsafe {
@@ -793,72 +900,101 @@ pub(crate) unsafe fn obj_to_bigint(obj: PyObjectRef) -> BigInt {
 }
 
 /// `min(*args)` / `min(iterable)` — return the smallest value.
+///
+/// `pypy/module/__builtin__/functional.py:188-218 min_max`:
+///   - reject any kwargs other than `key` / `default`
+///   - reject `default=` paired with multiple positional args
+///   - require ≥1 positional arg
 fn builtin_min(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty(), "min() takes at least one argument");
-    let items: Vec<PyObjectRef> = if args.len() == 1 {
-        collect_iterable(args[0])?
-    } else {
-        args.to_vec()
-    };
-    if items.is_empty() {
-        return Err(crate::PyError::new(
-            crate::PyErrorKind::ValueError,
-            "min() iterable argument is empty",
-        ));
-    }
-    let mut best = items[0];
-    for &item in &items[1..] {
-        unsafe {
-            let new_is_less = if is_int(item) && is_int(best) {
-                w_int_get_value(item) < w_int_get_value(best)
-            } else if is_int_or_long(item) && is_int_or_long(best) {
-                obj_to_bigint(item) < obj_to_bigint(best)
-            } else if is_str(item) && is_str(best) {
-                w_str_get_value(item) < w_str_get_value(best)
-            } else {
-                false
-            };
-            if new_is_less {
-                best = item;
-            }
-        }
-    }
-    Ok(best)
+    min_max_dispatch(args, /* want_max= */ false, "min")
 }
 
 /// `max(a, b)` / `max(iterable)` — return the largest of two values or an iterable.
-/// PyPy: operation.py max_w
 fn builtin_max(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty(), "max() takes at least one argument");
-    let items: Vec<PyObjectRef> = if args.len() == 1 {
-        collect_iterable(args[0])?
+    min_max_dispatch(args, /* want_max= */ true, "max")
+}
+
+fn min_max_dispatch(
+    args: &[PyObjectRef],
+    want_max: bool,
+    fn_name: &str,
+) -> Result<PyObjectRef, crate::PyError> {
+    let (positional, kwargs) = split_builtin_kwargs(args);
+    // functional.py:198-201 — only `key` and `default` are accepted.
+    kwarg_reject_unknown(kwargs, &["key", "default"], fn_name)?;
+    let key_fn = kwarg_get(kwargs, "key").filter(|k| unsafe { !pyre_object::is_none(*k) });
+    let default = kwarg_get(kwargs, "default");
+    // functional.py:216-218 — empty positional → TypeError, not panic.
+    if positional.is_empty() {
+        return Err(crate::PyError::type_error(format!(
+            "{fn_name}() expected at least one argument, got 0"
+        )));
+    }
+    // functional.py:206-210 — `default=` is only meaningful for the
+    // single-iterable form; combining it with multiple positional args
+    // is a user error.
+    if positional.len() > 1 && default.is_some() {
+        return Err(crate::PyError::type_error(format!(
+            "Cannot specify a default for {fn_name}() with multiple positional arguments"
+        )));
+    }
+    let items: Vec<PyObjectRef> = if positional.len() == 1 {
+        collect_iterable(positional[0])?
     } else {
-        args.to_vec()
+        positional.to_vec()
     };
     if items.is_empty() {
+        if let Some(d) = default {
+            return Ok(d);
+        }
         return Err(crate::PyError::new(
             crate::PyErrorKind::ValueError,
-            "max() iterable argument is empty",
+            format!("{fn_name}() iterable argument is empty"),
         ));
     }
-    let mut best = items[0];
+    select_extremum(&items, key_fn, want_max)
+}
+
+/// Shared min/max body — `pypy/module/__builtin__/functional.py:115-148
+/// min_max`.  Builds (key, item) pairs (identity when no `key=`),
+/// keeps a running best by comparing keys via `space.gt`/`space.lt`
+/// (the PyPy compare paths invoke `__gt__` / `__lt__` and propagate
+/// errors), returns the corresponding item.  PyPy's stable-tie rule:
+/// keep the first-seen extremum (`<` for min, `>` for max), matching
+/// CPython 3.x semantics.
+fn select_extremum(
+    items: &[PyObjectRef],
+    key_fn: Option<PyObjectRef>,
+    want_max: bool,
+) -> Result<PyObjectRef, crate::PyError> {
+    let key_of = |item: PyObjectRef| -> PyObjectRef {
+        match key_fn {
+            Some(kf) => crate::call_function(kf, &[item]),
+            None => item,
+        }
+    };
+    let cmp_op = if want_max {
+        crate::baseobjspace::CompareOp::Gt
+    } else {
+        crate::baseobjspace::CompareOp::Lt
+    };
+    let mut best_item = items[0];
+    let mut best_key = key_of(best_item);
     for &item in &items[1..] {
-        unsafe {
-            let keep_best = if is_int(item) && is_int(best) {
-                w_int_get_value(best) >= w_int_get_value(item)
-            } else if is_int_or_long(item) && is_int_or_long(best) {
-                obj_to_bigint(best) >= obj_to_bigint(item)
-            } else if is_str(item) && is_str(best) {
-                w_str_get_value(best) >= w_str_get_value(item)
-            } else {
-                true
-            };
-            if !keep_best {
-                best = item;
-            }
+        let key = key_of(item);
+        // `functional.py:139 if space.is_true(space.gt(key, best_key))`
+        // — route through the generic comparison dispatch which
+        // handles int/long/str/float/tuple natively and falls
+        // through to user-defined `__gt__`/`__lt__` for other
+        // types.  Errors (TypeError from incomparable types) are
+        // propagated to the caller as PyPy does.
+        let result = crate::baseobjspace::compare(key, best_key, cmp_op)?;
+        if crate::baseobjspace::is_true(result) {
+            best_item = item;
+            best_key = key;
         }
     }
-    Ok(best)
+    Ok(best_item)
 }
 
 /// `type(obj)` — return the type name as a string (simplified).
@@ -1087,18 +1223,37 @@ fn builtin_issubclass(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
 // weakproxy wrappers, and any future opcode dispatch.
 
 /// Exception type constructor — called as e.g. `ValueError("msg")`.
-/// Extracts the message from the first argument and creates a W_ExceptionObject.
+///
+/// `pypy/module/exceptions/interp_exceptions.py:121-124
+/// W_BaseException.descr_init` stores the constructor positional
+/// arguments on `self.args_w` (an RPython list), then
+/// `descr_str/descr_repr` (line 126-147) format from the same field.
+/// Pyre wraps the args into a `W_ListObject` and stamps it into the
+/// typed slot via `w_exception_set_args`, matching PyPy's
+/// `self.args_w = args_w` shape; `w_exception_get_args` rebuilds a
+/// fresh tuple per read so `e.args` mirrors
+/// `space.newtuple(self.args_w)` semantics.  The message string keeps
+/// driving `w_exception_get_message` for the lower-level error path.
 macro_rules! exc_constructor {
     ($fn_name:ident, $kind:expr) => {
         fn $fn_name(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-            let msg = if args.is_empty() {
-                ""
-            } else if unsafe { is_str(args[0]) } {
-                unsafe { w_str_get_value(args[0]) }
+            let msg: String = if args.is_empty() {
+                String::new()
+            } else if args.len() == 1 {
+                unsafe { crate::display::py_str(args[0]) }
             } else {
-                ""
+                let parts: Vec<String> = args
+                    .iter()
+                    .map(|&a| unsafe { crate::display::py_repr(a) })
+                    .collect();
+                format!("({})", parts.join(", "))
             };
-            Ok(pyre_object::excobject::w_exception_new($kind, msg))
+            let exc = pyre_object::excobject::w_exception_new($kind, &msg);
+            let args_list = pyre_object::w_list_new(args.to_vec());
+            unsafe {
+                pyre_object::excobject::w_exception_set_args(exc, args_list);
+            }
+            Ok(exc)
         }
     };
 }
@@ -2504,18 +2659,23 @@ fn builtin_globals(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
                 "globals() requires an active frame",
             ));
         }
-        let namespace = unsafe { (*frame).get_w_globals() };
-        if namespace.is_null() {
+        // `pypy/module/__builtin__/interp_inspect.py:5 globals_w` →
+        // `caller.get_w_globals()` returns the dict directly without
+        // wrapping.  PyPy keeps a single dict per module so subsequent
+        // `globals()` / `frame.f_globals` / `f.__globals__` /
+        // `module.__dict__` accesses on the same module share one
+        // identity.  Pyre routes through the lazy cached
+        // `get_w_globals_obj` (Step 1 of the w_globals type
+        // migration) which returns the canonical W_DictObject paired
+        // with the frame's storage — same identity invariant via
+        // `dict_storage_to_dict`'s mirror_target.  Returning a fresh
+        // wrapper per call (as the previous shape did) silently
+        // diverged on `globals() is module.__dict__`.
+        let dict = unsafe { (*frame).get_w_globals_obj() };
+        if dict.is_null() {
             return Err(crate::PyError::runtime_error(
                 "globals() requires an active frame",
             ));
-        }
-        // Create a dict backed by the live namespace. Mutations (update,
-        // __setitem__) are synced back to the namespace so that patterns
-        // like `globals().update({...})` work correctly.
-        let dict = pyre_object::w_dict_new_with_dict_storage(namespace as *mut u8);
-        for (k, &v) in unsafe { &*namespace }.entries() {
-            unsafe { pyre_object::w_dict_store(dict, pyre_object::w_str_new(k), v) };
         }
         Ok(dict)
     })
@@ -2542,30 +2702,30 @@ fn builtin_locals(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         if !w_locals_object.is_null() {
             return Ok(w_locals_object);
         }
-        let frame = unsafe { &*frame };
-        let w_locals = frame.get_w_locals();
+        // `pypy/interpreter/pyframe.py:540 getdictscope` runs
+        // `fast2locals()` then returns `self.debugdata.w_locals`.
+        // `fast2locals` (`pyframe.py:557-562`) lazily allocates the
+        // backing dict on first call and stamps it into
+        // `debugdata.w_locals`, so subsequent calls reuse the same
+        // storage — `locals() is locals()` (function scope) and
+        // `locals() is globals()` (module scope, where
+        // `debugdata.w_locals is w_globals`) both hold.  Pyre's
+        // `frame.fast2locals()` follows the same shape; the canonical
+        // W_DictObject for that storage is then resolved via
+        // `dict_storage_to_dict` (mirror_target invariant).
+        frame_mut.fast2locals()?;
+        let w_locals = frame_mut.get_w_locals();
         if !w_locals.is_null() {
-            let dict = pyre_object::w_dict_new();
-            for (k, &v) in unsafe { &*w_locals }.entries() {
-                unsafe { pyre_object::w_dict_store(dict, pyre_object::w_str_new(k), v) };
-            }
-            return Ok(dict);
+            return Ok(crate::baseobjspace::dict_storage_to_dict(
+                w_locals as *const _,
+            ));
         }
-        let dict = pyre_object::w_dict_new();
-        let code = unsafe { &*crate::pyframe_get_pycode(frame) };
-        for (idx, name) in code.varnames.iter().enumerate() {
-            let value = frame.locals_w()[idx];
-            if !value.is_null() {
-                unsafe { pyre_object::w_dict_store(dict, pyre_object::w_str_new(name), value) };
-            }
-        }
-        let w_globals = frame.get_w_globals();
-        if frame.nlocals() == 0 && !w_globals.is_null() {
-            for (k, &v) in unsafe { &*w_globals }.entries() {
-                unsafe { pyre_object::w_dict_store(dict, pyre_object::w_str_new(k), v) };
-            }
-        }
-        Ok(dict)
+        // Fallback only fires when `fast2locals` neither found a
+        // mapping nor materialised a storage (no fast locals, no
+        // module-level w_globals shadow).  Build a plain dict so
+        // `locals()` still returns *something* in that degenerate
+        // case rather than `None`.
+        Ok(pyre_object::w_dict_new())
     })
 }
 
@@ -2704,30 +2864,368 @@ fn builtin_id(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// `hash(obj)` — PyPy: baseobjspace.py hash → identity for now
 fn builtin_hash(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty(), "hash() takes exactly one argument");
-    unsafe {
-        if is_int(args[0]) {
-            return Ok(args[0]); // int hashes to itself
+    Ok(w_int_new(hash_value(args[0])))
+}
+
+/// `pypy/objspace/std/intobject.py:36-37` — `HASH_BITS = 61` (64-bit
+/// host); `HASH_MODULUS = 2**HASH_BITS - 1`.  The Mersenne-prime
+/// modulus is what makes pyre's `hash(42) == hash(42.0) ==
+/// hash(2**100 + 42)`-class invariants hold: every per-type hash
+/// reduces its input modulo the same `HASH_MODULUS`, so equal
+/// numeric values land on the same residue.
+const HASH_BITS: u32 = 61;
+const HASH_MODULUS: u64 = (1u64 << HASH_BITS) - 1;
+/// `floatobject.py:29-30` HASH_INF / HASH_NAN sentinels.
+const HASH_INF: i64 = 314159;
+const HASH_NAN: i64 = 0;
+
+/// `pypy/objspace/std/intobject.py:1231-1249 _hash_int` line-by-line
+/// port —
+///
+/// ```python
+/// def _hash_int(a):
+///     sign = 1 - ((a < 0) << 1)
+///     x = r_uint(a)
+///     x *= r_uint(sign)
+///     x = (x & HASH_MODULUS) + (x >> HASH_BITS)
+///     x -= HASH_MODULUS * (x >= HASH_MODULUS)
+///     h = intmask(intmask(x) * sign)
+///     return h - (h == -1)
+/// ```
+///
+/// `intmask` is "wrap-around to i64" on 64-bit RPython; Rust uses
+/// `as i64` for the same effect.  `-1` is the CPython-reserved "no
+/// hash" sentinel, so any natural hash producing `-1` is bumped to
+/// `-2`.
+#[inline]
+pub(crate) fn _hash_int(a: i64) -> i64 {
+    let sign: i64 = 1 - (((a < 0) as i64) << 1);
+    // r_uint(a) * r_uint(sign) — multiply as u64 to compute |a|
+    // without UB on `a == i64::MIN`.  When a < 0, sign == -1 and
+    // (-1 as u64) == u64::MAX; the wrapping product yields the
+    // two's-complement negation of a, i.e. its absolute value.
+    let mut x = (a as u64).wrapping_mul(sign as u64);
+    x = (x & HASH_MODULUS) + (x >> HASH_BITS);
+    if x >= HASH_MODULUS {
+        x -= HASH_MODULUS;
+    }
+    let h = (x as i64).wrapping_mul(sign);
+    h - (h == -1) as i64
+}
+
+/// `pypy/objspace/std/longobject.py:468-494 _hash_long` line-by-line
+/// port:
+///
+/// ```python
+/// def _hash_long(v):
+///     i = v.numdigits() - 1
+///     if i == -1: return 0
+///     x = _load_unsigned_digit(0)
+///     while i >= 0:
+///         x = ((x << _HASH_SHIFT) & HASH_MODULUS) | (x >> (HASH_BITS - _HASH_SHIFT))
+///         x += v.udigit(i)
+///         if SHIFT > HASH_BITS:
+///             x = (x & HASH_MODULUS) + (x >> HASH_BITS)
+///         if x >= HASH_MODULUS:
+///             x -= HASH_MODULUS
+///         i -= 1
+///     h = intmask(intmask(x) * v.get_sign())
+///     return h - (h == -1)
+/// ```
+///
+/// PyPy's `rbigint` uses 31-bit digits (`SHIFT = 31`); Rust's
+/// `num_bigint::BigInt` exposes `iter_u32_digits()` so we use
+/// `SHIFT = 32`.  Since `HASH_MODULUS = 2^61 - 1` is a Mersenne
+/// prime, `value mod HASH_MODULUS` is independent of the digit
+/// base — `_hash_int(v) == _hash_long(BigInt::from(v))` for any
+/// `v` that fits in `i64`.
+#[inline]
+pub(crate) fn _hash_long(v: &BigInt) -> i64 {
+    let sign = match v.sign() {
+        malachite_bigint::Sign::Plus => 1i64,
+        malachite_bigint::Sign::Minus => -1i64,
+        malachite_bigint::Sign::NoSign => return 0, // numdigits == 0
+    };
+    // Walk digits from MSB to LSB.  `iter_u32_digits()` yields
+    // little-endian; collect + reverse so we mirror PyPy's loop.
+    let digits: Vec<u32> = v.iter_u32_digits().collect();
+    let mut x: u64 = 0;
+    const SHIFT: u32 = 32;
+    const HASH_SHIFT: u32 = SHIFT % HASH_BITS; // 32 — `SHIFT > HASH_BITS` arm reached later
+    for &d in digits.iter().rev() {
+        // x = ((x << HASH_SHIFT) & HASH_MODULUS) | (x >> (HASH_BITS - HASH_SHIFT))
+        let left = (x.wrapping_shl(HASH_SHIFT)) & HASH_MODULUS;
+        let right = if HASH_BITS > HASH_SHIFT {
+            x >> (HASH_BITS - HASH_SHIFT)
+        } else {
+            0
+        };
+        x = left | right;
+        x = x.wrapping_add(d as u64);
+        if SHIFT > HASH_BITS {
+            x = (x & HASH_MODULUS) + (x >> HASH_BITS);
         }
-        if is_str(args[0]) {
-            // Simplified string hash — deterministic within one run
-            let s = w_str_get_value(args[0]);
+        if x >= HASH_MODULUS {
+            x -= HASH_MODULUS;
+        }
+    }
+    let h = (x as i64).wrapping_mul(sign);
+    h - (h == -1) as i64
+}
+
+/// `pypy/objspace/std/floatobject.py:790-822 _hash_float` line-by-line
+/// port:
+///
+/// ```python
+/// def _hash_float(v):
+///     if math.isinf(v): return HASH_INF if v > 0 else -HASH_INF
+///     # nan hash handled elsewhere (W_FloatObject.descr_hash routes to HASH_NAN)
+///     m, e = math.frexp(v)
+///     sign = 1
+///     if m < 0: sign = -1; m = -m
+///     x = r_uint(0)
+///     while m:
+///         x = ((x << 28) & HASH_MODULUS) | x >> (HASH_BITS - 28)
+///         m *= 268435456.0          # 2**28
+///         e -= 28
+///         y = r_uint(m)
+///         m -= y
+///         x += y
+///         if x >= HASH_MODULUS: x -= HASH_MODULUS
+///     e = e % HASH_BITS if e >= 0 else HASH_BITS - 1 - ((-1 - e) % HASH_BITS)
+///     x = ((x << e) & HASH_MODULUS) | x >> (HASH_BITS - e)
+///     x = intmask(intmask(x) * sign)
+///     x -= (x == -1)
+///     return x
+/// ```
+///
+/// For finite floats whose value is an integer that fits in `i64`,
+/// this returns the same value as `_hash_int(v as i64)` — that's the
+/// `hash(42) == hash(42.0)` invariant.  NaN is dispatched to
+/// `HASH_NAN` by the caller (PyPy's `W_FloatObject.descr_hash` does
+/// the NaN check before reaching `_hash_float`).
+#[inline]
+pub(crate) fn _hash_float(v: f64) -> i64 {
+    if v.is_nan() {
+        return HASH_NAN;
+    }
+    if v.is_infinite() {
+        return if v > 0.0 { HASH_INF } else { -HASH_INF };
+    }
+    // For integral values that fit in i64, short-circuit to
+    // `_hash_int(v as i64)` so `hash(2.0) == hash(2)`.  The frexp
+    // walk below produces the same result, but the integer fast path
+    // avoids floating-point noise on already-integer inputs.
+    if v.fract() == 0.0 && (i64::MIN as f64) <= v && v <= (i64::MAX as f64) {
+        return _hash_int(v as i64);
+    }
+    let (mut m, mut e) = libm_frexp(v);
+    let mut sign: i64 = 1;
+    if m < 0.0 {
+        sign = -1;
+        m = -m;
+    }
+    let mut x: u64 = 0;
+    while m != 0.0 {
+        x = ((x.wrapping_shl(28)) & HASH_MODULUS) | (x >> (HASH_BITS - 28));
+        m *= 268435456.0; // 2**28
+        e -= 28;
+        let y = m as u64;
+        m -= y as f64;
+        x = x.wrapping_add(y);
+        if x >= HASH_MODULUS {
+            x -= HASH_MODULUS;
+        }
+    }
+    // `e = e % HASH_BITS if e >= 0 else HASH_BITS - 1 - ((-1 - e) % HASH_BITS)`
+    let e_mod: u32 = if e >= 0 {
+        (e as u32) % HASH_BITS
+    } else {
+        HASH_BITS - 1 - (((-1 - e) as u32) % HASH_BITS)
+    };
+    x = ((x.wrapping_shl(e_mod)) & HASH_MODULUS) | (x >> (HASH_BITS - e_mod));
+    let h = (x as i64).wrapping_mul(sign);
+    h - (h == -1) as i64
+}
+
+/// Rust port of Python's `math.frexp(x) -> (mantissa, exponent)` where
+/// `x == mantissa * 2**exponent` and `0.5 <= |mantissa| < 1` (or both
+/// are 0).  `libm` isn't a workspace dep, so we use `f64::to_bits`
+/// to peek at the IEEE-754 exponent directly.
+#[inline]
+fn libm_frexp(v: f64) -> (f64, i32) {
+    if v == 0.0 || !v.is_finite() {
+        return (v, 0);
+    }
+    let bits = v.to_bits();
+    let raw_exp = ((bits >> 52) & 0x7ff) as i32;
+    if raw_exp == 0 {
+        // Subnormal — normalise by multiplying with 2**54.
+        let (m, e) = libm_frexp(v * (1u64 << 54) as f64);
+        return (m, e - 54);
+    }
+    let exponent = raw_exp - 1022;
+    let mantissa_bits = (bits & !(0x7ffu64 << 52)) | (1022u64 << 52);
+    (f64::from_bits(mantissa_bits), exponent)
+}
+
+/// `pypy/objspace/std/tupleobject.py:358-401 descr_hash` line-by-line
+/// port — xxHash sequence hash (CPython 3.8+ tuple hash):
+///
+/// ```python
+/// XXPRIME_1 = 0x9E3779B185EBCA87
+/// XXPRIME_2 = 0xC2B2AE3D27D4EB4F
+/// XXPRIME_5 = 0x27D4EB2F165667C5
+/// xxrotate = lambda x: (x << 31) | (x >> 33)
+///
+/// acc = XXPRIME_5
+/// for w_item in items:
+///     lane = space.hash_w(w_item)
+///     acc += lane * XXPRIME_2
+///     acc = xxrotate(acc)
+///     acc *= XXPRIME_1
+/// acc += len(items) ^ (XXPRIME_5 ^ 3527539)
+/// if acc == -1: acc = 1546275796 + 1
+/// return acc
+/// ```
+const XXPRIME_1: u64 = 11400714785074694791;
+const XXPRIME_2: u64 = 14029467366897019727;
+const XXPRIME_5: u64 = 2870177450012600261;
+
+#[inline]
+fn _hash_tuple_xx(items: &[i64]) -> i64 {
+    let mut acc: u64 = XXPRIME_5;
+    for &lane in items {
+        acc = acc.wrapping_add((lane as u64).wrapping_mul(XXPRIME_2));
+        // xxrotate: rotate-left 31 bits.
+        acc = acc.rotate_left(31);
+        acc = acc.wrapping_mul(XXPRIME_1);
+    }
+    // Mangle in the length per `tupleobject.py:399`.
+    let n = items.len() as u64;
+    acc = acc.wrapping_add(n ^ (XXPRIME_5 ^ 3527539u64));
+    let mut h = acc as i64;
+    if h == -1 {
+        h = 1546275796 + 1;
+    }
+    h
+}
+
+/// `pypy/objspace/std/setobject.py:623-642 W_FrozensetObject.descr_hash`
+/// line-by-line port:
+///
+/// ```python
+/// multi = r_uint(1822399083) + r_uint(1822399083) + 1
+/// hash = r_uint(1927868237)
+/// hash *= r_uint(self.length() + 1)
+/// for item in items:
+///     h = space.hash_w(item)
+///     value = (r_uint(h ^ (h << 16) ^ 89869747) * multi)
+///     hash = hash ^ value
+/// hash ^= (hash >> 11) ^ (hash >> 25)
+/// hash = hash * 69069 + 907133923
+/// hash = intmask(hash)
+/// if hash == -1: hash = 590923713
+/// return hash
+/// ```
+#[inline]
+fn _hash_frozenset(items: &[i64]) -> i64 {
+    let multi: u64 = 1822399083u64.wrapping_add(1822399083).wrapping_add(1);
+    let mut h: u64 = 1927868237;
+    h = h.wrapping_mul((items.len() as u64).wrapping_add(1));
+    for &item_hash in items {
+        let item_u = item_hash as u64;
+        let v = (item_u ^ item_u.wrapping_shl(16) ^ 89869747u64).wrapping_mul(multi);
+        h ^= v;
+    }
+    h ^= (h >> 11) ^ (h >> 25);
+    h = h.wrapping_mul(69069).wrapping_add(907133923);
+    let mut hi = h as i64;
+    if hi == -1 {
+        hi = 590923713;
+    }
+    hi
+}
+
+/// `pypy/objspace/std/objspace.py StdObjSpace.hash` parity — share one
+/// implementation across builtin `hash()`, dict / set lookup, and
+/// tuple/frozenset content hashing.  Dispatches to PyPy's per-type
+/// hash helpers (`_hash_int`/`_hash_long`/`_hash_float`/
+/// `_hash_tuple_xx`/`_hash_frozenset`), so:
+///
+/// - `hash(42) == hash(42.0) == hash(2**100 + 42)` (Mersenne mod)
+/// - `hash((1, 2)) == hash((1, 2))` regardless of allocation identity
+/// - `hash(frozenset(...))` is deterministic and order-independent
+///
+/// `unicodeobject.py W_UnicodeObject.descr_hash` routes through
+/// RPython's `compute_hash(self._utf8)` which is siphash on 64-bit;
+/// pyre keeps an FNV-style multiplicative mix here (functional but
+/// not bit-identical to CPython/PyPy).  Convergence target: import
+/// siphash24 from a workspace dep.
+pub(crate) fn hash_value(obj: PyObjectRef) -> i64 {
+    unsafe {
+        if is_int(obj) {
+            return _hash_int(w_int_get_value(obj));
+        }
+        if is_bool(obj) {
+            return if pyre_object::w_bool_get_value(obj) {
+                1
+            } else {
+                0
+            };
+        }
+        if is_long(obj) {
+            return _hash_long(pyre_object::w_long_get_value(obj));
+        }
+        if is_float(obj) {
+            return _hash_float(pyre_object::w_float_get_value(obj));
+        }
+        if is_str(obj) {
+            // PRE-EXISTING-ADAPTATION — `unicodeobject.py:341 hash_w`
+            // calls `compute_hash(self._utf8)` (RPython's siphash24
+            // on 64-bit hosts).  Pyre's FNV mix below is
+            // deterministic and content-derived but not bit-identical
+            // to CPython/PyPy.  Convergence target: import siphash24
+            // (e.g. `siphasher` crate) and use the per-process secret
+            // key.
+            let s = w_str_get_value(obj);
             let mut h: i64 = 0;
             for b in s.bytes() {
                 h = h.wrapping_mul(1000003).wrapping_add(b as i64);
             }
-            return Ok(w_int_new(h));
+            return h;
         }
-    }
-    // Instance __hash__ — PyPy: baseobjspace.py hash_w
-    unsafe {
-        if pyre_object::is_instance(args[0]) {
-            let w_type = pyre_object::w_instance_get_type(args[0]);
+        if pyre_object::is_none(obj) {
+            return 0;
+        }
+        if is_tuple(obj) {
+            let n = w_tuple_len(obj);
+            let mut hashes = Vec::with_capacity(n);
+            for i in 0..(n as i64) {
+                if let Some(item) = w_tuple_getitem(obj, i) {
+                    hashes.push(hash_value(item));
+                }
+            }
+            return _hash_tuple_xx(&hashes);
+        }
+        if pyre_object::is_frozenset(obj) {
+            let hashes: Vec<i64> = pyre_object::w_set_items(obj)
+                .into_iter()
+                .map(hash_value)
+                .collect();
+            return _hash_frozenset(&hashes);
+        }
+        if pyre_object::is_instance(obj) {
+            let w_type = pyre_object::w_instance_get_type(obj);
             if let Some(method) = crate::baseobjspace::lookup_in_type(w_type, "__hash__") {
-                return Ok(crate::call_function(method, &[args[0]]));
+                let r = crate::call_function(method, &[obj]);
+                if !r.is_null() && is_int(r) {
+                    return w_int_get_value(r);
+                }
             }
         }
+        obj as i64
     }
-    Ok(w_int_new(args[0] as i64)) // identity hash fallback
 }
 
 /// `ord(c)` — PyPy: operation.py ord
@@ -2851,59 +3349,71 @@ fn builtin_zip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(pyre_object::w_seq_iter_new(list, min_len))
 }
 
-/// `enumerate(iterable, start=0)` — PyPy: functional.py W_Enumerate
+/// `pypy/module/__builtin__/functional.py:253-272 W_Enumerate.descr_new`
+/// parity:
+///
+/// ```python
+/// def descr_new(space, w_subtype, w_iterable, w_start=None):
+///     ...
+///     if w_start is None:
+///         start = 0
+///     else:
+///         start = space.index_w(w_start)
+///     ...
+/// ```
+///
+/// `space.index_w` accepts ANY object exposing `__index__`
+/// (subclasses of int, NumPy ints, etc.) — not just exact int.  The
+/// kwarg surface is also strict: anything other than `start=` is a
+/// TypeError per the gateway's parsed signature.
+// `pypy/module/__builtin__/functional.py:253-275 W_Enumerate.descr___new__`
+// line-by-line port — constructs the lazy `W_Enumerate` iterator,
+// resolving `start` via `space.index_w` (with overflow promotion to a
+// bigint slot) and capturing either the source iterator or the
+// source list directly when `start == 0 + isinstance(it, list)`.
 fn builtin_enumerate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if args.is_empty() {
+    let (positional, kwargs) = split_builtin_kwargs(args);
+    if positional.is_empty() {
         return Err(crate::PyError::type_error(
             "enumerate() requires at least one argument",
         ));
     }
-    let start = if args.len() > 1 {
-        unsafe {
-            if pyre_object::is_int(args[1]) {
-                pyre_object::w_int_get_value(args[1])
-            } else {
-                0
-            }
-        }
-    } else {
-        0
-    };
-    // Collect iterable, pair with indices
-    let mut items = Vec::new();
-    unsafe {
-        let obj = args[0];
-        if pyre_object::is_list(obj) {
-            let n = pyre_object::w_list_len(obj);
-            for i in 0..n {
-                if let Some(v) = pyre_object::w_list_getitem(obj, i as i64) {
-                    items.push(pyre_object::w_tuple_new(vec![
-                        pyre_object::w_int_new(start + i as i64),
-                        v,
-                    ]));
-                }
-            }
-        } else {
-            let it = crate::baseobjspace::iter(obj)?;
-            let mut idx = start;
-            loop {
-                match crate::baseobjspace::next(it) {
-                    Ok(v) => {
-                        items.push(pyre_object::w_tuple_new(vec![
-                            pyre_object::w_int_new(idx),
-                            v,
-                        ]));
-                        idx += 1;
-                    }
-                    Err(e) if e.kind == crate::PyErrorKind::StopIteration => break,
-                    Err(e) => return Err(e),
-                }
-            }
-        }
+    if positional.len() > 2 {
+        return Err(crate::PyError::type_error(format!(
+            "enumerate() takes at most 2 arguments ({} given)",
+            positional.len()
+        )));
     }
-    let n = items.len();
-    let list = pyre_object::w_list_new(items);
-    Ok(pyre_object::w_seq_iter_new(list, n))
+    kwarg_reject_unknown(kwargs, &["start"], "enumerate")?;
+    let start_obj = if positional.len() > 1 {
+        Some(positional[1])
+    } else {
+        kwarg_get(kwargs, "start")
+    };
+    // `functional.py:255-264 descr___new__` — `space.index(w_start)`
+    // then `space.int_w(w_start)`; on OverflowError, drop into bigint
+    // slot.  Pyre uses i64 directly and would overflow on bigint
+    // start; surfaced as a PRE-EXISTING-ADAPTATION below (W_Enumerate
+    // can still promote during iteration once start fits in i64).
+    let start = match start_obj {
+        Some(o) if !unsafe { pyre_object::is_none(o) } => space_index_w(o)?,
+        _ => 0,
+    };
+    let source = positional[0];
+    // `functional.py:268-271` — `if start == 0 and type(w_iterable) is
+    // W_ListObject: w_iter = w_iterable` (skip space.iter for the
+    // common list-source case so __next__ can `getitem(index)`
+    // directly).  Otherwise call `space.iter(w_iterable)`.
+    let w_iter_or_list = if start == 0 && unsafe { pyre_object::is_list(source) } {
+        source
+    } else {
+        crate::baseobjspace::iter(source)?
+    };
+    Ok(pyre_object::enumerateobject::w_enumerate_new(
+        w_iter_or_list,
+        start,
+        pyre_object::PY_NULL, // i64 fast-path active per :225-227
+    ))
 }
 
 /// `reversed()` — PyPy: functional.py W_ReversedIterator
@@ -2959,24 +3469,116 @@ fn builtin_reversed(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     Ok(pyre_object::w_seq_iter_new(pyre_object::w_list_new(rev), n))
 }
 
-/// `sorted(iterable)` — PyPy: listobject.py listsort
+/// `pypy/module/__builtin__/functional.py:328-340 builtin_sorted`
+/// parity:
 ///
-/// Returns a new sorted list. Simplified: sorts by int value.
+/// ```python
+/// @unwrap_spec(reverse=bool)
+/// def sorted(space, w_iterable, w_key=None, reverse=False):
+///     w_lst = space.call_function(space.w_list, w_iterable)
+///     space.call_method(w_lst, "sort", w_key, space.newbool(reverse))
+///     return w_lst
+/// ```
+///
+/// PyPy's `sort` then calls into `listobject.py W_ListObject.descr_sort`
+/// which dispatches keys through `space.lt`.  Pyre mirrors:
+///   - exactly one positional iterable (extras → TypeError),
+///   - kwargs limited to `{key, reverse}` (others → TypeError),
+///   - per-comparison errors (e.g. user `__lt__` raises) propagate
+///     instead of silently falling back to "treat as not less".
 fn builtin_sorted(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty(), "sorted() takes at least one argument");
-    let iterable = args[0];
-    let mut items = collect_iterable(iterable)?;
-    unsafe {
-        items.sort_by(|a, b| {
-            if is_int(*a) && is_int(*b) {
-                w_int_get_value(*a).cmp(&w_int_get_value(*b))
-            } else if is_str(*a) && is_str(*b) {
-                w_str_get_value(*a).cmp(w_str_get_value(*b))
-            } else {
-                std::cmp::Ordering::Equal
-            }
-        });
+    let (positional, kwargs) = split_builtin_kwargs(args);
+    if positional.is_empty() {
+        return Err(crate::PyError::type_error(
+            "sorted() requires at least one argument",
+        ));
     }
+    if positional.len() > 1 {
+        return Err(crate::PyError::type_error(format!(
+            "sorted() takes at most 1 positional argument ({} given)",
+            positional.len()
+        )));
+    }
+    kwarg_reject_unknown(kwargs, &["key", "reverse"], "sorted")?;
+    let iterable = positional[0];
+    let key_fn = kwarg_get(kwargs, "key").filter(|k| unsafe { !pyre_object::is_none(*k) });
+    let reverse = kwarg_get(kwargs, "reverse")
+        .map(|v| crate::baseobjspace::is_true(v))
+        .unwrap_or(false);
+    let mut items = collect_iterable(iterable)?;
+    // `pypy/objspace/std/listobject.py W_ListObject.descr_sort` →
+    // build (key, item) pairs, sort by key, optionally reverse.
+    let keyed: Vec<(PyObjectRef, PyObjectRef)> = if let Some(kf) = key_fn {
+        items
+            .iter()
+            .map(|&item| {
+                let k = crate::call_function(kf, &[item]);
+                (k, item)
+            })
+            .collect()
+    } else {
+        items.iter().map(|&item| (item, item)).collect()
+    };
+    let mut keyed = keyed;
+    // `pypy/objspace/std/listsort.py listsort_lt` defers to
+    // `space.lt(a, b)` and propagates exceptions; if the user's
+    // `__lt__` raises, sort halts with that error.  Rust's
+    // `sort_by` closure cannot return Result, so capture the first
+    // error via a Cell and surface it after the sort completes.
+    let sort_error: std::cell::Cell<Option<crate::PyError>> = std::cell::Cell::new(None);
+    let sort_lt = |ka: PyObjectRef, kb: PyObjectRef| -> bool {
+        if sort_error
+            .take()
+            .map(|e| {
+                sort_error.set(Some(e));
+                true
+            })
+            .unwrap_or(false)
+        {
+            return false;
+        }
+        match crate::baseobjspace::compare(ka, kb, crate::baseobjspace::CompareOp::Lt) {
+            Ok(r) => crate::baseobjspace::is_true(r),
+            Err(e) => {
+                sort_error.set(Some(e));
+                false
+            }
+        }
+    };
+    keyed.sort_by(|(ka, _), (kb, _)| {
+        let ab = sort_lt(*ka, *kb);
+        if ab {
+            return std::cmp::Ordering::Less;
+        }
+        let ba = sort_lt(*kb, *ka);
+        if ba {
+            return std::cmp::Ordering::Greater;
+        }
+        // Fast-path tail kept for the cases where `compare` returns
+        // `False` for both directions (legacy unhashable / unorderable
+        // pairs that pyre still has) — preserves prior behaviour.
+        unsafe {
+            if is_int(*ka) && is_int(*kb) {
+                return w_int_get_value(*ka).cmp(&w_int_get_value(*kb));
+            }
+            if is_str(*ka) && is_str(*kb) {
+                return w_str_get_value(*ka).cmp(w_str_get_value(*kb));
+            }
+            if is_float(*ka) && is_float(*kb) {
+                return pyre_object::w_float_get_value(*ka)
+                    .partial_cmp(&pyre_object::w_float_get_value(*kb))
+                    .unwrap_or(std::cmp::Ordering::Equal);
+            }
+            std::cmp::Ordering::Equal
+        }
+    });
+    if let Some(err) = sort_error.take() {
+        return Err(err);
+    }
+    if reverse {
+        keyed.reverse();
+    }
+    items = keyed.into_iter().map(|(_, v)| v).collect();
     Ok(w_list_new(items))
 }
 

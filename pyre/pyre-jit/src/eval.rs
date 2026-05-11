@@ -841,14 +841,17 @@ thread_local! {
             &pyre_object::setobject::FROZENSET_TYPE as *const _ as usize,
             w_set_tid,
         );
-        // W_ExceptionObject carries an `ExcKind` tag and a
-        // `*mut String` pointer (raw heap, not a `PyObjectRef`).
-        // Pre-registered with `object_subclass(size, ...)` so the
-        // foreign-pytype loop's `sizeof(PyObject)` approximation does
-        // not under-count the payload.
-        let w_exception_tid = gc.register_type(TypeInfo::object_subclass(
+        // W_ExceptionObject carries an `ExcKind` tag, a `*mut String`
+        // pointer (raw heap, not a `PyObjectRef`), and a `args_w`
+        // tuple `PyObjectRef` (`interp_exceptions.py:123-124
+        // W_BaseException.descr_init` parity — the constructor stores
+        // the args tuple inline on the instance).  Register the
+        // `args_w` offset so the GC traces it across minor
+        // collections.
+        let w_exception_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
             std::mem::size_of::<pyre_object::excobject::W_ExceptionObject>(),
             object_tid,
+            pyre_object::excobject::W_EXCEPTION_GC_PTR_OFFSETS.to_vec(),
         ));
         debug_assert_eq!(w_exception_tid, W_EXCEPTION_GC_TYPE_ID);
         majit_gc::GcAllocator::register_vtable_for_type(
@@ -1021,6 +1024,61 @@ thread_local! {
         pytype_to_tid.insert(
             &pyre_object::MAPPING_PROXY_TYPE as *const _ as usize,
             w_dict_proxy_tid,
+        );
+        // `pypy/objspace/std/dictmultiobject.py:449-470` — three
+        // sibling W_DictMultiView* classes (Keys / Values / Items)
+        // each carry a `w_dict` PyObjectRef back to the source.  Pyre
+        // folds the three into one `W_DictView` struct + tag; all
+        // three Python-visible PyTypes (`DICT_KEYS_TYPE` /
+        // `DICT_VALUES_TYPE` / `DICT_ITEMS_TYPE`) share the same tid
+        // / vtable / size / offsets so the view's `w_dict` slot is
+        // traced regardless of which kind it represents.
+        let w_dict_view_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
+            std::mem::size_of::<pyre_object::dictviewobject::W_DictView>(),
+            object_tid,
+            pyre_object::dictviewobject::W_DICT_VIEW_GC_PTR_OFFSETS.to_vec(),
+        ));
+        debug_assert_eq!(
+            w_dict_view_tid,
+            pyre_object::dictviewobject::W_DICT_VIEW_GC_TYPE_ID
+        );
+        for tp in [
+            &pyre_object::dictviewobject::DICT_KEYS_TYPE,
+            &pyre_object::dictviewobject::DICT_VALUES_TYPE,
+            &pyre_object::dictviewobject::DICT_ITEMS_TYPE,
+        ] {
+            majit_gc::GcAllocator::register_vtable_for_type(
+                &mut gc,
+                tp as *const _ as usize,
+                w_dict_view_tid,
+            );
+            pytype_to_tid.insert(tp as *const _ as usize, w_dict_view_tid);
+        }
+        // `pypy/interpreter/typedef.py:312-326 class GetSetProperty`
+        // — fget/fset/fdel/doc/reqcls/name are W_Root references.
+        // Pyre's `W_GetSetProperty` ports them as inline fields; the
+        // GC must trace each so descriptors built before
+        // `init_typeobjects` (e.g. function.__doc__ / __annotations__)
+        // survive minor collection.  Registered after the dict-view
+        // tid so `W_GETSET_PROPERTY_GC_TYPE_ID = 40` lines up with
+        // the post-`W_DICT_VIEW_GC_TYPE_ID = 39` slot.
+        let w_getset_property_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
+            std::mem::size_of::<pyre_object::getsetproperty::W_GetSetProperty>(),
+            object_tid,
+            pyre_object::getsetproperty::W_GETSET_PROPERTY_GC_PTR_OFFSETS.to_vec(),
+        ));
+        debug_assert_eq!(
+            w_getset_property_tid,
+            pyre_object::getsetproperty::W_GETSET_PROPERTY_GC_TYPE_ID
+        );
+        majit_gc::GcAllocator::register_vtable_for_type(
+            &mut gc,
+            &pyre_object::getsetproperty::GETSET_DESCRIPTOR_TYPE as *const _ as usize,
+            w_getset_property_tid,
+        );
+        pytype_to_tid.insert(
+            &pyre_object::getsetproperty::GETSET_DESCRIPTOR_TYPE as *const _ as usize,
+            w_getset_property_tid,
         );
         // W_InstanceObject is intentionally NOT pre-registered: its
         // PyType (`INSTANCE_TYPE`) is the `object` root, already

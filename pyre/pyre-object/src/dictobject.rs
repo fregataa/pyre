@@ -529,6 +529,39 @@ pub unsafe fn w_dict_delitem_str(obj: PyObjectRef, key: &str) -> bool {
     hit
 }
 
+/// Remove an entry by arbitrary key (str or non-str).  Returns `true`
+/// when the key was present.  Mirrors `pypy/objspace/std/dictmultiobject.py
+/// W_DictMultiObject.delitem` — PyPy's flat strategy walks the entries
+/// list, comparing each key by `space.eq_w` (the `dict_keys_equal`
+/// helper here), so `del d[1]` on an int key removes the entry.  The
+/// previous str-only `w_dict_delitem_str` left non-str entries
+/// untouched, breaking `dict.pop(int_key)`'s after-pop deletion.
+///
+/// # Safety
+/// `obj` must point to a valid `W_DictObject`.
+pub unsafe fn w_dict_delitem(obj: PyObjectRef, key: PyObjectRef) -> bool {
+    let dict = &mut *(obj as *mut W_DictObject);
+    let entries = &mut *dict.entries;
+    let mut hit = false;
+    if let Some(idx) = entries.iter().position(|(k, _)| dict_keys_equal(*k, key)) {
+        entries.remove(idx);
+        dict.len -= 1;
+        hit = true;
+    }
+    // String-key delete must also flow into the storage proxy so
+    // `del module.__dict__[name]` and `globals().pop(name)` clear the
+    // backing namespace too — matches the str-key path in
+    // `w_dict_delitem_str`.
+    if crate::is_str(key) && !dict.dict_storage_proxy.is_null() {
+        let key_str = crate::w_str_get_value(key);
+        if !hit && maybe_lookup_dict_storage(dict.dict_storage_proxy, key_str).is_some() {
+            hit = true;
+        }
+        maybe_sync_dict_storage_delete(dict.dict_storage_proxy, key_str);
+    }
+    hit
+}
+
 /// Get the number of entries.
 ///
 /// Storage-authoritative for str keys when proxy is attached:

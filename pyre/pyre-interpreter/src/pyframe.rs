@@ -527,12 +527,34 @@ pub fn offset2lineno(code: &CodeObject, stopat: isize) -> usize {
 }
 
 /// pyframe.py:105-106 — cell + free variable slot count.
-/// PyPy: ncellvars = len(code.co_cellvars), nfreevars = len(code.co_freevars)
-/// No overlap filtering — cells and locals occupy separate slots even if
-/// a cellvar has the same name as a local variable.
+///
+/// Returns the number of *extra* slots beyond `varnames` needed for
+/// cellvars and freevars. CPython 3.11+ unified the slot layout
+/// (`co_localsplusnames`): a cellvar that also appears in varnames
+/// (i.e. a parameter captured by an inner function) shares its
+/// varname slot via `MAKE_CELL`. Only cellvars NOT in varnames need
+/// a fresh slot. Without this overlap filtering, freevar indices
+/// shift by the overlap count and `LOAD_DEREF`/`LOAD_FAST` for
+/// freevars reads the wrong slot — see decorator-with-args test
+/// `def repeat(n): def wrap(fn): def inner(): return (n, fn)`
+/// where `n` resolved to `fn` because of the off-by-one slot.
+#[inline]
+pub fn npure_cellvars(code: &CodeObject) -> usize {
+    code.cellvars
+        .iter()
+        .filter(|c| {
+            let cs: &str = c.as_ref();
+            !code.varnames.iter().any(|v| {
+                let vs: &str = v.as_ref();
+                vs == cs
+            })
+        })
+        .count()
+}
+
 #[inline]
 pub fn ncells(code: &CodeObject) -> usize {
-    code.cellvars.len() + code.freevars.len()
+    npure_cellvars(code) + code.freevars.len()
 }
 
 impl PyFrame {
@@ -754,9 +776,9 @@ impl PyFrame {
             self.getorcreate_debug_data(-1).w_locals = w_locals;
         }
 
-        let ncellvars = code.cellvars.len();
+        let npure = npure_cellvars(code);
         let nfreevars = code.freevars.len();
-        if ncellvars == 0 && nfreevars == 0 {
+        if npure == 0 && nfreevars == 0 {
             return Ok(());
         }
 
@@ -781,8 +803,11 @@ impl PyFrame {
             )));
         }
 
+        // CPython 3.11+ unified slot layout: only cellvars NOT in
+        // varnames take a fresh slot.  See `npure_cellvars` and
+        // `new_for_call_with_closure` for the call-site mirror.
         let mut index = code.varnames.len();
-        for _ in 0..ncellvars {
+        for _ in 0..npure {
             self.locals_w_mut()[index] = pyre_object::w_cell_new(PY_NULL);
             index += 1;
         }
@@ -852,11 +877,16 @@ impl PyFrame {
     /// * Mapping case (`setdictscope_object`): returns `w_locals_object`
     ///   directly so callers (`IMPORT_STAR`, `locals()`) operate on the
     ///   live mapping with `space.setitem` / `space.getitem`.
-    /// * Dict case (`setdictscope`): wraps the live `*mut DictStorage`
-    ///   as a `W_DictObject` aliasing the same storage via
-    ///   `pyre_object::w_dict_new_with_dict_storage`, so subsequent
-    ///   mutations (e.g. `IMPORT_STAR` writes) land in the original
-    ///   `DictStorage` that `STORE_NAME` / `LOAD_NAME` also see.
+    /// * Dict case (`setdictscope`): routes through
+    ///   `dict_storage_to_dict` so the live `*mut DictStorage` is
+    ///   always wrapped by the same `W_DictObject` (identity
+    ///   preserved via `storage.mirror_target()`).  PyPy's
+    ///   `pyframe.py:540-545 getdictscope` returns
+    ///   `self.debugdata.w_locals` — a single cached dict per frame.
+    ///   pyre achieves the same identity by memoising the wrapper on
+    ///   the storage; building a fresh `w_dict_new_with_dict_storage`
+    ///   shell every call would let `frame.f_locals is
+    ///   frame.f_locals` evaluate to `False`.
     /// * Empty case: forces `fast2locals` to materialise a fresh
     ///   `DictStorage` (matching pyframe.py:557-562 `w_locals = self
     ///   .space.newdict(instance=True)` followed by `d.w_locals =
@@ -872,8 +902,8 @@ impl PyFrame {
         if w_locals.is_null() {
             return Ok(pyre_object::PY_NULL);
         }
-        Ok(pyre_object::w_dict_new_with_dict_storage(
-            w_locals as *mut u8,
+        Ok(crate::baseobjspace::dict_storage_to_dict(
+            w_locals as *const crate::DictStorage,
         ))
     }
 
@@ -887,7 +917,7 @@ impl PyFrame {
         let raw =
             unsafe { crate::w_code_get_ptr(code as pyre_object::PyObjectRef) as *const CodeObject };
         let nlocals = unsafe { (&*raw).varnames.len() };
-        let ncells = unsafe { (&*raw).cellvars.len() + (&*raw).freevars.len() };
+        let ncells = unsafe { ncells(&*raw) };
         let size = nlocals + ncells + 16; // small stack
         let stores_global =
             unsafe { crate::w_code_frame_stores_global(code as PyObjectRef, w_globals) };
@@ -1661,23 +1691,39 @@ impl PyFrame {
         self.setfastscope(&new_fastlocals_w);
 
         // pyframe.py:619-636: freevarnames = co_cellvars
-        // if CO_OPTIMIZED and not skip_free_vars: freevarnames += co_freevars
-        let ncellvars = code.cellvars.len();
+        // if CO_OPTIMIZED and not skip_free_vars: freevarnames += co_freevars.
+        // CPython 3.11+ unified layout: cellvars that overlap with
+        // varnames live in their varname slot (handled by `setfastscope`
+        // above), so iterate only the *pure* cellvars (cellvars not in
+        // varnames) followed by freevars — same shape as
+        // `npure_cellvars`.
+        let pure_cells: Vec<&_> = code
+            .cellvars
+            .iter()
+            .filter(|c| {
+                let cs: &str = c.as_ref();
+                !code.varnames.iter().any(|v| {
+                    let vs: &str = v.as_ref();
+                    vs == cs
+                })
+            })
+            .collect();
+        let npure = pure_cells.len();
         let include_freevars = code.flags.contains(CodeFlags::OPTIMIZED) && !skip_free_vars;
         let freevarnames_len = if include_freevars {
-            ncellvars + code.freevars.len()
+            npure + code.freevars.len()
         } else {
-            ncellvars
+            npure
         };
         for i in 0..freevarnames_len {
-            let (name, idx) = if i < ncellvars {
-                (&code.cellvars[i], numlocals + i)
+            let name: &str = if i < npure {
+                pure_cells[i].as_ref()
             } else {
-                (&code.freevars[i - ncellvars], numlocals + i)
+                code.freevars[i - npure].as_ref()
             };
+            let idx = numlocals + i;
             if idx < self.locals_w().len() {
-                let w_value = w_locals_ref.get(name.as_ref()).copied().unwrap_or(PY_NULL);
-                // pyframe.py:632-634: cell.set(w_value) / cell.set(None)
+                let w_value = w_locals_ref.get(name).copied().unwrap_or(PY_NULL);
                 let slot = self.locals_w()[idx];
                 if !slot.is_null() && unsafe { pyre_object::is_cell(slot) } {
                     unsafe { pyre_object::w_cell_set(slot, w_value) };
@@ -1712,19 +1758,31 @@ impl PyFrame {
         }
         self.setfastscope(&new_fastlocals_w);
 
-        let ncellvars = code.cellvars.len();
+        let pure_cells: Vec<&_> = code
+            .cellvars
+            .iter()
+            .filter(|c| {
+                let cs: &str = c.as_ref();
+                !code.varnames.iter().any(|v| {
+                    let vs: &str = v.as_ref();
+                    vs == cs
+                })
+            })
+            .collect();
+        let npure = pure_cells.len();
         let include_freevars = code.flags.contains(CodeFlags::OPTIMIZED) && !skip_free_vars;
         let freevarnames_len = if include_freevars {
-            ncellvars + code.freevars.len()
+            npure + code.freevars.len()
         } else {
-            ncellvars
+            npure
         };
         for i in 0..freevarnames_len {
-            let (name, idx) = if i < ncellvars {
-                (&code.cellvars[i], numlocals + i)
+            let name: &str = if i < npure {
+                pure_cells[i].as_ref()
             } else {
-                (&code.freevars[i - ncellvars], numlocals + i)
+                code.freevars[i - npure].as_ref()
             };
+            let idx = numlocals + i;
             if idx < self.locals_w().len() {
                 let w_value = finditem_str_object(w_locals_object, name)?.unwrap_or(PY_NULL);
                 let slot = self.locals_w()[idx];
@@ -1738,34 +1796,21 @@ impl PyFrame {
         Ok(())
     }
 
-    /// pyframe.py:640-651 init_cells
+    /// pyframe.py:640-651 init_cells.
+    ///
+    /// In the CPython 3.11+ unified slot layout that pyre adopted via
+    /// `npure_cellvars`, every cellvar that also appears in varnames
+    /// shares its varname slot — and the bytecode walker emits
+    /// `MAKE_CELL i` to wrap that local into a cell at function entry
+    /// (see `RustPython` 0.5 compiler `bytecode/instruction.rs:233`).
+    /// That removes the need for the legacy `_compute_args_as_cellvars`
+    /// arg-to-cell copy: there is no separate cellvar slot to copy
+    /// into.  Pure cellvars (cellvars not in varnames) are pre-
+    /// initialised as empty cells in `new_for_call_with_closure`.  This
+    /// function therefore has nothing to do; keep the entry point so
+    /// other call sites that already invoke it remain valid.
     #[inline]
-    pub fn init_cells(&mut self) {
-        let code = unsafe { &*pyframe_get_pycode(self) };
-        let mut argcount = code.arg_count as usize + code.kwonlyarg_count as usize;
-        if code.flags.contains(CodeFlags::VARARGS) {
-            argcount += 1;
-        }
-        if code.flags.contains(CodeFlags::VARKEYWORDS) {
-            argcount += 1;
-        }
-        let args_to_copy =
-            crate::pycode::_compute_args_as_cellvars(&code.varnames, &code.cellvars, argcount);
-        let mut index = code.varnames.len(); // co_nlocals
-        for i in 0..args_to_copy.len() {
-            let argnum = args_to_copy[i];
-            if argnum >= 0 {
-                let cell = self.locals_w()[index];
-                let val = self.locals_w()[argnum as usize];
-                if !cell.is_null() && unsafe { pyre_object::is_cell(cell) } {
-                    unsafe { pyre_object::w_cell_set(cell, val) };
-                } else {
-                    self.locals_w_mut()[index] = val;
-                }
-            }
-            index += 1;
-        }
-    }
+    pub fn init_cells(&mut self) {}
 
     /// pyframe.py:554-598 fast2locals
     pub fn fast2locals(&mut self) -> Result<(), crate::PyError> {
@@ -1800,25 +1845,41 @@ impl PyFrame {
         }
 
         // pyframe.py:580-581: freevarnames = co_cellvars
-        // if CO_OPTIMIZED: freevarnames += co_freevars
-        let ncellvars = code.cellvars.len();
+        // if CO_OPTIMIZED: freevarnames += co_freevars.
+        // CPython 3.11+ unified slot layout: cellvars that overlap with
+        // varnames already had their value emitted by the varname loop
+        // above (their slot is the local slot, optionally wrapped by
+        // MAKE_CELL).  Iterate only pure cellvars (cellvars not in
+        // varnames) here so the cell-region indices match the layout
+        // chosen by `npure_cellvars`.
+        let pure_cells: Vec<&_> = code
+            .cellvars
+            .iter()
+            .filter(|c| {
+                let cs: &str = c.as_ref();
+                !varnames.iter().any(|v| {
+                    let vs: &str = v.as_ref();
+                    vs == cs
+                })
+            })
+            .collect();
+        let npure = pure_cells.len();
         let include_freevars = code.flags.contains(CodeFlags::OPTIMIZED);
         let freevarnames_len = if include_freevars {
-            ncellvars + code.freevars.len()
+            npure + code.freevars.len()
         } else {
-            ncellvars
+            npure
         };
         // pyframe.py:584-596: copy cell/free variables
         for i in 0..freevarnames_len {
-            let (name, idx) = if i < ncellvars {
-                (&code.cellvars[i], numlocals + i)
+            let name: &str = if i < npure {
+                pure_cells[i].as_ref()
             } else {
-                (&code.freevars[i - ncellvars], numlocals + i)
+                code.freevars[i - npure].as_ref()
             };
+            let idx = numlocals + i;
             if idx < self.locals_w().len() {
-                // pyframe.py:586: cell = self._getcell(i)
                 let slot = self.locals_w()[idx];
-                // pyframe.py:588: w_value = cell.get() — dereference cell
                 let w_value = if !slot.is_null() && unsafe { pyre_object::is_cell(slot) } {
                     unsafe { pyre_object::w_cell_get(slot) }
                 } else {
@@ -1827,8 +1888,7 @@ impl PyFrame {
                 if !w_value.is_null() {
                     w_locals_ref.insert(name.to_string(), w_value);
                 } else {
-                    // pyframe.py:589-593: space.delitem(w_locals, w_name)
-                    w_locals_ref.remove(name.as_ref());
+                    w_locals_ref.remove(name);
                 }
             }
         }
@@ -1863,19 +1923,31 @@ impl PyFrame {
             }
         }
 
-        let ncellvars = code.cellvars.len();
+        let pure_cells: Vec<&_> = code
+            .cellvars
+            .iter()
+            .filter(|c| {
+                let cs: &str = c.as_ref();
+                !varnames.iter().any(|v| {
+                    let vs: &str = v.as_ref();
+                    vs == cs
+                })
+            })
+            .collect();
+        let npure = pure_cells.len();
         let include_freevars = code.flags.contains(CodeFlags::OPTIMIZED);
         let freevarnames_len = if include_freevars {
-            ncellvars + code.freevars.len()
+            npure + code.freevars.len()
         } else {
-            ncellvars
+            npure
         };
         for i in 0..freevarnames_len {
-            let (name, idx) = if i < ncellvars {
-                (&code.cellvars[i], numlocals + i)
+            let name: &str = if i < npure {
+                pure_cells[i].as_ref()
             } else {
-                (&code.freevars[i - ncellvars], numlocals + i)
+                code.freevars[i - npure].as_ref()
             };
+            let idx = numlocals + i;
             if idx < self.locals_w().len() {
                 let slot = self.locals_w()[idx];
                 let w_value = if !slot.is_null() && unsafe { pyre_object::is_cell(slot) } {
@@ -1977,16 +2049,22 @@ impl PyFrame {
                 arr[i] = args[i];
             }
 
-            // pyframe.py:229-236: copy free variables from closure into freevar slots
-            for i in 0..code_ref.cellvars.len() {
+            // CPython 3.11+ `co_localsplusnames` unified slot layout:
+            // each cellvar that ALSO appears in varnames shares its
+            // varname slot (MAKE_CELL wraps the local). Only cellvars
+            // NOT in varnames take a fresh slot in the cell region.
+            // Allocating cells for the overlap would shift freevar
+            // indices and break LOAD_DEREF on `def repeat(n): def
+            // wrap(fn): def inner(): return (n, fn)` style closures.
+            let npure = npure_cellvars(code_ref);
+            for i in 0..npure {
                 arr[num_locals + i] = pyre_object::w_cell_new(PY_NULL);
             }
             if !closure.is_null() {
-                let ncellvars = code_ref.cellvars.len();
                 let nfreevars = code_ref.freevars.len();
                 for i in 0..nfreevars {
                     let cell = unsafe { w_tuple_getitem(closure, i as i64).unwrap() };
-                    arr[num_locals + ncellvars + i] = cell;
+                    arr[num_locals + npure + i] = cell;
                 }
             }
         }
@@ -2213,19 +2291,18 @@ pub fn createframe(
     let raw = unsafe { crate::w_code_get_ptr(code as PyObjectRef) as *const CodeObject };
     let code_ref = unsafe { &*raw };
     let num_locals = code_ref.varnames.len();
-    let ncellvars = code_ref.cellvars.len();
-    let nfreevars = code_ref.freevars.len();
+    let num_cells = ncells(code_ref);
     let max_stack = code_ref.max_stackdepth as usize;
     let stores_global =
         unsafe { crate::w_code_frame_stores_global(code as PyObjectRef, w_globals) };
 
-    let size = num_locals + ncellvars + nfreevars + max_stack;
+    let size = num_locals + num_cells + max_stack;
     let w_builtin = crate::baseobjspace::pick_builtin(w_globals, execution_context);
     let mut frame = Box::new(PyFrame {
         execution_context,
         pycode: code,
         locals_cells_stack_w: unsafe { alloc_fixed_array_with_header(size, PY_NULL) },
-        valuestackdepth: num_locals + ncellvars + nfreevars,
+        valuestackdepth: num_locals + num_cells,
         last_instr: -1,
         escaped: false,
         debugdata: std::ptr::null_mut(),

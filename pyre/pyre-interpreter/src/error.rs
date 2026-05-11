@@ -313,6 +313,14 @@ impl PyError {
         }
     }
 
+    pub fn attribute_error(msg: impl Into<String>) -> Self {
+        PyError {
+            kind: PyErrorKind::AttributeError,
+            message: msg.into(),
+            exc_object: std::ptr::null_mut(),
+        }
+    }
+
     pub fn value_error(msg: impl Into<String>) -> Self {
         PyError {
             kind: PyErrorKind::ValueError,
@@ -416,11 +424,27 @@ impl PyError {
 
     /// Convert to a W_ExceptionObject for pushing onto the value stack.
     /// Reuses the cached object from from_exc_object() if available.
+    ///
+    /// Mirrors `pypy/interpreter/error.py:OperationError.get_w_value`'s
+    /// upgrade-to-exception-instance path: when the OperationError
+    /// carries a raw message (the `oefmt` shape), the materialised
+    /// exception instance gets `args = (msg,)` per
+    /// `pypy/module/exceptions/interp_exceptions.py:123-124
+    /// W_BaseException.descr_init` — `self.args_w = args_w`.  Pyre
+    /// stores `args_w` as a `W_ListObject`, so we stamp a one-element
+    /// list `[msg_str]` here so `str(e)` and `repr(e)` and
+    /// `e.args == (msg,)` all line up with PyPy.
     pub fn to_exc_object(&self) -> PyObjectRef {
         if !self.exc_object.is_null() {
             return self.exc_object;
         }
-        w_exception_new(self.to_exc_kind(), &self.message)
+        let exc = w_exception_new(self.to_exc_kind(), &self.message);
+        if !self.message.is_empty() {
+            let msg = pyre_object::w_str_new(&self.message);
+            let args_list = pyre_object::w_list_new(vec![msg]);
+            unsafe { pyre_object::excobject::w_exception_set_args(exc, args_list) };
+        }
+        exc
     }
 
     fn to_exc_kind(&self) -> ExcKind {

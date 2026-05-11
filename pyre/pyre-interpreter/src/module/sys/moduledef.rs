@@ -38,6 +38,72 @@ fn make_sys_namespace_instance() -> PyObjectRef {
     w_instance_new(sys_namespace_type())
 }
 
+/// PRE-EXISTING-ADAPTATION: pyre does not yet expose `PyFrame` as a
+/// Python-visible W_Root with a typedef carrying
+/// `f_back/f_locals/f_globals/f_code/f_lineno` GetSetProperty
+/// descriptors (`pypy/interpreter/pyframe.py:769-786`).  The proper
+/// port mirrors `W_PyFrame.typedef` and lets `frame.f_back` walk the
+/// real execution chain via `fget_f_back`.  Until that lands,
+/// `sys._getframe` returns a `sys.namespace` stub populated from the
+/// PyFrame fields by hand.
+///
+/// To avoid the pre-fix degradation where `f_back` was always `None`
+/// — breaking the canonical `while f: f = f.f_back` traversal — this
+/// helper walks the entire `f_back` chain eagerly and links each
+/// stub to the previous one via its own `f_back` slot, mirroring the
+/// PyPy frame chain shape one stub at a time.  The cost is one stub
+/// allocation per live frame on every `_getframe` call; an
+/// acceptable price for stack-walking parity until the proper
+/// PyFrame typedef port lands.
+fn build_frame_stub_chain(top: *mut crate::pyframe::PyFrame) -> PyObjectRef {
+    let mut frames: Vec<*mut crate::pyframe::PyFrame> = Vec::new();
+    let mut cursor = top;
+    while !cursor.is_null() {
+        frames.push(cursor);
+        cursor = unsafe { (*cursor).get_f_back() };
+    }
+    let mut prev_stub: PyObjectRef = w_none();
+    let mut top_stub: PyObjectRef = w_none();
+    // Build from oldest to newest so each stub can attach the
+    // already-built older stub as its `f_back`.  The final
+    // (innermost) stub becomes the return value.
+    for &frame_ptr in frames.iter().rev() {
+        let stub = make_sys_namespace_instance();
+        let frame_ref = unsafe { &mut *frame_ptr };
+        // `pyframe.py:540-545 getdictscope`: PyPy materialises
+        // `f_locals` by running `fast2locals()` and exposing the
+        // resulting `debugdata.w_locals` dict.
+        let w_locals_obj = frame_ref.getdictscope_w().unwrap_or(pyre_object::PY_NULL);
+        let w_globals = unsafe { (*frame_ptr).get_w_globals() };
+        let pycode = frame_ref.pycode as pyre_object::PyObjectRef;
+        let lineno = frame_ref.fget_f_lineno() as i64;
+        let _ = crate::baseobjspace::setattr(
+            stub,
+            "f_globals",
+            if w_globals.is_null() {
+                pyre_object::w_none()
+            } else {
+                crate::baseobjspace::dict_storage_to_dict(w_globals as *const crate::DictStorage)
+            },
+        );
+        let _ = crate::baseobjspace::setattr(
+            stub,
+            "f_locals",
+            if w_locals_obj.is_null() {
+                w_dict_new()
+            } else {
+                w_locals_obj
+            },
+        );
+        let _ = crate::baseobjspace::setattr(stub, "f_code", pycode);
+        let _ = crate::baseobjspace::setattr(stub, "f_back", prev_stub);
+        let _ = crate::baseobjspace::setattr(stub, "f_lineno", w_int_new(lineno));
+        prev_stub = stub;
+        top_stub = stub;
+    }
+    top_stub
+}
+
 /// `pypy/module/sys/vm.py:217 space.getexecutioncontext()` access for
 /// `sys.gettrace`/`settrace`/`getprofile`/`setprofile`.
 ///
@@ -176,18 +242,77 @@ pub fn init(ns: &mut DictStorage) {
     dict_storage_store(ns, "__stdout__", make_std_stream("<stdout>", false));
     dict_storage_store(ns, "__stderr__", make_std_stream("<stderr>", true));
     dict_storage_store(ns, "__stdin__", make_std_stream("<stdin>", false));
-    // sys._getframe — returns a stub frame object with f_locals/f_globals
+    // `pypy/module/sys/vm.py:30 _getframe` walks the
+    // `space.getexecutioncontext().gettopframe_nohidden()` chain,
+    // following `f_back` `depth` times.  PyPy returns the frame
+    // object directly so `frame.f_globals is module.__dict__` /
+    // `frame.f_globals is globals()` (callee's scope) holds.  Pyre
+    // mirrors the depth walk through `CURRENT_FRAME` + `f_back`,
+    // populating the stub frame's attributes from the resolved
+    // PyFrame.  `f_globals` / `f_locals` flow through
+    // `dict_storage_to_dict` (canonical W_DictObject) so the
+    // `is module.__dict__` invariant survives sys._getframe access.
     dict_storage_store(
         ns,
         "_getframe",
-        crate::make_builtin_function("_getframe", |_| {
-            let frame = make_sys_namespace_instance();
-            let _ = crate::baseobjspace::setattr(frame, "f_locals", w_dict_new());
-            let _ = crate::baseobjspace::setattr(frame, "f_globals", w_dict_new());
-            let _ = crate::baseobjspace::setattr(frame, "f_code", w_none());
-            let _ = crate::baseobjspace::setattr(frame, "f_back", w_none());
-            let _ = crate::baseobjspace::setattr(frame, "f_lineno", w_int_new(0));
-            Ok(frame)
+        crate::make_builtin_function("_getframe", |args| {
+            // `pypy/module/sys/vm.py:28-39 _getframe`:
+            //   @unwrap_spec(depth=int) def _getframe(space, depth=0)
+            // `unwrap_spec` enforces a single optional int argument, so
+            // any extra positional arg must surface as TypeError before
+            // the depth walk runs.
+            if args.len() > 1 {
+                return Err(crate::PyError::type_error(format!(
+                    "_getframe expected at most 1 argument, got {}",
+                    args.len()
+                )));
+            }
+            let depth_signed = if args.is_empty() {
+                0i64
+            } else if unsafe { pyre_object::is_int(args[0]) } {
+                unsafe { pyre_object::w_int_get_value(args[0]) }
+            } else {
+                return Err(crate::PyError::type_error(
+                    "_getframe(): argument must be an int",
+                ));
+            };
+            // `vm.py:37-38 if depth < 0: raise ... "frame index must not
+            // be negative"` — the message string differs from the
+            // exhausted-stack case below.
+            if depth_signed < 0 {
+                return Err(crate::PyError::value_error(
+                    "frame index must not be negative",
+                ));
+            }
+            // `vm.py:43-54 getframe`: starts from the top frame and
+            // walks `f_back` `depth` times.  The `f is None` guard runs
+            // at the *start* of every iteration including the first, so
+            // a missing top frame must raise rather than fabricate a
+            // stub.  Pyre's previous code returned an empty namespace
+            // when `current` was null, which masked stack-exhaustion.
+            let mut current = crate::eval::CURRENT_FRAME.with(|cf| cf.get());
+            let mut remaining = depth_signed as usize;
+            loop {
+                if current.is_null() {
+                    return Err(crate::PyError::value_error("call stack is not deep enough"));
+                }
+                if remaining == 0 {
+                    break;
+                }
+                remaining -= 1;
+                current = unsafe { (*current).get_f_back() };
+            }
+            // `pyframe.py:773 f_back = GetSetProperty(W_PyFrame
+            // .fget_f_back)` returns the previous PyFrame in the
+            // execution chain.  Pyre exposes frames as `sys.namespace`
+            // stubs (see PRE-EXISTING-ADAPTATION on
+            // `make_sys_namespace_instance` — the proper port is to
+            // surface PyFrame as a typedef-described user-visible
+            // type).  Within the stub model, walk the `f_back` chain
+            // greedily so each stub's `f_back` points to the next
+            // stub instead of `None`, otherwise traversal patterns
+            // (`while f: f = f.f_back`) terminate at depth 1.
+            Ok(build_frame_stub_chain(current))
         }),
     );
     // sys.exc_info() → (type, value, traceback)
