@@ -1024,6 +1024,15 @@ impl<'a> Assembler386<'a> {
             ; .arch x64
             ; push rbp
             ; push r12               // save r12 (used by genop_call_assembler)
+        );
+        #[cfg(target_os = "windows")]
+        dynasm!(self.mc
+            ; .arch x64
+            ; mov rbp, rcx
+        );
+        #[cfg(not(target_os = "windows"))]
+        dynasm!(self.mc
+            ; .arch x64
             ; mov rbp, rdi
         );
         let propagate_descr = self.propagate_exception_descr_ptr();
@@ -2109,6 +2118,60 @@ impl<'a> Assembler386<'a> {
                     }
                 }
             }
+            // Structural adaptation: PyPy's llsupport/rewrite.py:132-154
+            // normally lowers SETARRAYITEM_* to GC_STORE(_INDEXED), but
+            // pyre's CI also exercises direct backend emission paths before
+            // that rewrite has run.
+            OpCode::SetarrayitemGc | OpCode::SetarrayitemRaw => {
+                if let (Some(Loc::Reg(base)), Some(index_loc), Some(value_loc)) =
+                    (arglocs.first(), arglocs.get(1), arglocs.get(2))
+                {
+                    let (base_size, item_size) = op
+                        .descr
+                        .as_ref()
+                        .and_then(|d| d.as_array_descr())
+                        .map(|ad| (ad.base_size() as i32, ad.item_size() as i32))
+                        .unwrap_or((0, 8));
+                    let index_reg = crate::regloc::X86_64_SCRATCH_REG.value;
+                    let value_reg = crate::regloc::X86_64_SCRATCH_REG_2.value;
+
+                    self.regalloc_mov(
+                        index_loc,
+                        &Loc::Reg(crate::regloc::RegLoc::new(index_reg, false)),
+                    );
+                    if item_size != 1 {
+                        dynasm!(self.mc ; .arch x64 ; imul Rq(index_reg), Rq(index_reg), item_size);
+                    }
+                    if base_size != 0 {
+                        dynasm!(self.mc ; .arch x64 ; add Rq(index_reg), base_size);
+                    }
+                    dynasm!(self.mc ; .arch x64 ; add Rq(index_reg), Rq(base.value));
+
+                    match value_loc {
+                        Loc::Reg(val) if val.is_xmm => {
+                            dynasm!(self.mc ; .arch x64 ; movsd [Rq(index_reg)], Rx(val.value));
+                        }
+                        Loc::Reg(val) => match item_size {
+                            1 => dynasm!(self.mc ; .arch x64 ; mov [Rq(index_reg)], Rb(val.value)),
+                            2 => dynasm!(self.mc ; .arch x64 ; mov [Rq(index_reg)], Rw(val.value)),
+                            4 => dynasm!(self.mc ; .arch x64 ; mov [Rq(index_reg)], Rd(val.value)),
+                            _ => dynasm!(self.mc ; .arch x64 ; mov [Rq(index_reg)], Rq(val.value)),
+                        },
+                        _ => {
+                            self.regalloc_mov(
+                                value_loc,
+                                &Loc::Reg(crate::regloc::RegLoc::new(value_reg, false)),
+                            );
+                            match item_size {
+                                1 => dynasm!(self.mc ; .arch x64 ; mov [Rq(index_reg)], Rb(value_reg)),
+                                2 => dynasm!(self.mc ; .arch x64 ; mov [Rq(index_reg)], Rw(value_reg)),
+                                4 => dynasm!(self.mc ; .arch x64 ; mov [Rq(index_reg)], Rd(value_reg)),
+                                _ => dynasm!(self.mc ; .arch x64 ; mov [Rq(index_reg)], Rq(value_reg)),
+                            }
+                        }
+                    }
+                }
+            }
             // ── Control flow ──
             OpCode::Jump => {
                 let jump_descr = loop_target_descr(op);
@@ -2830,7 +2893,6 @@ impl<'a> Assembler386<'a> {
 
     /// Emit SETcc into a register (zero-extend to 64-bit).
     fn emit_setcc(&mut self, cc: u8, dst_reg: u8) {
-        dynasm!(self.mc ; .arch x64 ; xor Rd(dst_reg), Rd(dst_reg));
         match cc {
             CC_E => {
                 dynasm!(self.mc ; .arch x64 ; sete  Rb(dst_reg));
@@ -2878,6 +2940,7 @@ impl<'a> Assembler386<'a> {
                 dynasm!(self.mc ; .arch x64 ; sete  Rb(dst_reg));
             }
         }
+        dynasm!(self.mc ; .arch x64 ; movzx Rd(dst_reg), Rb(dst_reg));
     }
 
     /// Map an integer comparison OpCode to a condition code.
@@ -5136,36 +5199,23 @@ impl<'a> Assembler386<'a> {
             // Inline card bit set (x86/assembler.py:2398 WriteBarrierSlowPath parity)
             dynasm!(self.mc ; .arch x64 ; =>card_mark);
             if let Some(Loc::Reg(loc_index)) = arglocs.get(1) {
-                let shift = (3 + wb.jit_wb_card_page_shift) as i8;
-                // byte_index = ~(index >> (3+page_shift))
-                dynasm!(self.mc ; .arch x64
-                    ; mov rcx, Rq(loc_index.value as u8)
-                    ; shr rcx, shift
-                    ; not rcx
-                );
-                // bit_index = (index >> page_shift) & 7 → set bit
                 let page_shift = wb.jit_wb_card_page_shift as i8;
+                let byte_shift = (3 + wb.jit_wb_card_page_shift) as i8;
                 dynasm!(self.mc ; .arch x64
-                    ; mov rax, Rq(loc_index.value as u8)
-                    ; shr rax, page_shift
-                    ; and rax, 7
-                    ; mov rdx, 1
-                    ; shl rdx, cl  // cl = bit_index? no, need rax
-                );
-                // Actually simpler: use BTS instruction
-                // card_byte_ofs = rcx, bit = (index >> page_shift) & 7
-                // Just OR the byte directly
-                dynasm!(self.mc ; .arch x64
-                    ; mov rdx, 1
-                    ; mov r8, Rq(loc_index.value as u8)
-                    ; shr r8, page_shift
-                    ; and r8, 7
-                );
-                // set bit: load byte, or, store
-                dynasm!(self.mc ; .arch x64
-                    ; mov cl, r8b
+                    ; push rcx
+                    ; push rdx
+                    ; mov r11, Rq(loc_index.value as u8)
+                    ; shr r11, byte_shift
+                    ; not r11
+                    ; sub r11, majit_gc::header::GcHeader::SIZE as i32
+                    ; mov rcx, Rq(loc_index.value as u8)
+                    ; shr rcx, page_shift
+                    ; and rcx, 7
+                    ; mov dl, 1
                     ; shl dl, cl
-                    ; or BYTE [Rq(loc_base.value as u8) + rcx], dl
+                    ; or BYTE [Rq(loc_base.value as u8) + r11], dl
+                    ; pop rdx
+                    ; pop rcx
                 );
             }
         } else {
