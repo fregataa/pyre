@@ -3090,8 +3090,8 @@ impl FlowContext {
                 | Instruction::MatchClass { .. } => {
                     self.unsupported_rpython("structural pattern matching is not RPython")
                 }
-                Instruction::GetAIter
-                | Instruction::GetANext
+                Instruction::GetAiter
+                | Instruction::GetAnext
                 | Instruction::GetAwaitable { .. }
                 | Instruction::EndAsyncFor
                 | Instruction::EndSend

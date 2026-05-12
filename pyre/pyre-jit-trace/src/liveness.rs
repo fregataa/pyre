@@ -592,7 +592,7 @@ fn stack_effects(
         | Instruction::UnaryInvert
         | Instruction::GetIter
         | Instruction::GetYieldFromIter
-        | Instruction::GetAIter
+        | Instruction::GetAiter
         | Instruction::LoadAttr { .. }
         | Instruction::GetAwaitable { .. } => (d, d),
         // Push 1 onto TOS without popping (net +1)

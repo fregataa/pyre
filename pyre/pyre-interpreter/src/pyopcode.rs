@@ -1989,8 +1989,8 @@ where
 
         // ── Async stubs ──
         Instruction::GetAwaitable { .. }
-        | Instruction::GetAIter
-        | Instruction::GetANext
+        | Instruction::GetAiter
+        | Instruction::GetAnext
         | Instruction::EndAsyncFor
         | Instruction::CleanupThrow => {
             Err(crate::PyError::type_error("async not yet implemented").into())
