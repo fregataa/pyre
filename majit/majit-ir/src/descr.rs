@@ -64,7 +64,10 @@ pub enum LLType {
     /// descr.py:665: (arg_classes, result_type, result_signed,
     ///   RESULT_ERASED, extrainfo).
     /// Structural key — two calls with the same signature + effects
-    /// share one CallDescr.
+    /// share one CallDescr. `effectinfo.py:152-164` keys the EI cache
+    /// on the raw `_*_descrs_*` frozensets (not the lazily-populated
+    /// `bitstring_*` fields), so pyre's `Vec<u32>` lift carries the
+    /// frozenset content.
     Func {
         arg_classes: String,
         result_type: Type,
@@ -74,14 +77,25 @@ pub enum LLType {
         result_size: usize,
         extraeffect: u8,
         oopspecindex: u16,
-        readonly_descrs_fields: Option<Vec<u8>>,
-        write_descrs_fields: Option<Vec<u8>>,
-        readonly_descrs_arrays: Option<Vec<u8>>,
-        write_descrs_arrays: Option<Vec<u8>>,
-        /// effectinfo.py: bitstring_readonly_descrs_interiorfields
-        readonly_descrs_interiorfields: Option<Vec<u8>>,
-        /// effectinfo.py: bitstring_write_descrs_interiorfields
-        write_descrs_interiorfields: Option<Vec<u8>>,
+        /// effectinfo.py:128 `_readonly_descrs_fields = frozenset_or_none(...)`
+        ///
+        /// Stored as a `Vec<usize>` of `Arc::as_ptr` ptr-ids
+        /// (`crate::effectinfo::descr_ptr_id` lift of PyPy
+        /// `id(descr)`). The structural cache key collapses to one
+        /// entry when two `LLType::func_key` invocations carry the
+        /// same Arcs in the EI raw set, regardless of any
+        /// `descr.index()` collision between distinct Arcs.
+        readonly_descrs_fields: Option<Vec<usize>>,
+        /// effectinfo.py:131 `_write_descrs_fields`.
+        write_descrs_fields: Option<Vec<usize>>,
+        /// effectinfo.py:129 `_readonly_descrs_arrays`.
+        readonly_descrs_arrays: Option<Vec<usize>>,
+        /// effectinfo.py:132 `_write_descrs_arrays`.
+        write_descrs_arrays: Option<Vec<usize>>,
+        /// effectinfo.py:130 `_readonly_descrs_interiorfields`.
+        readonly_descrs_interiorfields: Option<Vec<usize>>,
+        /// effectinfo.py:133 `_write_descrs_interiorfields`.
+        write_descrs_interiorfields: Option<Vec<usize>>,
         can_invalidate: bool,
         can_collect: bool,
     },
@@ -96,6 +110,37 @@ impl LLType {
     pub fn array_key(type_id: u64) -> Self {
         LLType::Array(type_id)
     }
+}
+
+/// Path-stable hash for `LLType::Struct` / `LLType::Array` identity.
+///
+/// RPython compares `lltype.Struct` objects by Python-object identity:
+/// `cpu.fielddescrof(STRUCT, name)` returns the same `FieldDescr` Arc
+/// regardless of which translator pass triggered the mint, because both
+/// passes resolve `STRUCT` to the same `lltype.Struct` instance through
+/// the shared `RPythonTyper` type registry. Pyre lacks RPython's type
+/// registry; the analyzer-time codewriter and the runtime
+/// `__majit_register_descrs` macro both need a path-stable key that
+/// maps `module_path::StructName` to a single `u64` — the macro
+/// emits `path_hash(concat!(module_path!(), "::", stringify!(Struct)))`
+/// at expansion time, the analyzer computes the same hash from
+/// `field.owner_root`, and both routes converge on the same
+/// `LLType::Struct(hash)` cache key. (Task #316 routing.)
+///
+/// Determinism is within-process only — `DefaultHasher::new()` returns a
+/// hasher with fixed SipHash keys at construction
+/// (`hashmap.rs::DefaultHasher::default`); hashing the same string
+/// twice in one process gives the same `u64`. Cross-process / cross-build
+/// stability is *not* required: every `LLType::Struct(_)` lookup happens
+/// against `_cache_field` etc. which are also process-local.
+pub fn path_hash(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
+}
+
+impl LLType {
     /// descr.py:665: get_call_descr key tuple.
     pub fn func_key(
         arg_types: &[Type],
@@ -120,12 +165,27 @@ impl LLType {
             result_size,
             extraeffect: effect.extraeffect as u8,
             oopspecindex: effect.oopspecindex as u16,
-            readonly_descrs_fields: effect.readonly_descrs_fields.clone(),
-            write_descrs_fields: effect.write_descrs_fields.clone(),
-            readonly_descrs_arrays: effect.readonly_descrs_arrays.clone(),
-            write_descrs_arrays: effect.write_descrs_arrays.clone(),
-            readonly_descrs_interiorfields: effect.readonly_descrs_interiorfields.clone(),
-            write_descrs_interiorfields: effect.write_descrs_interiorfields.clone(),
+            // `effectinfo.py:152-164` cache key: raw `_*_descrs_*` sets
+            // (frozenset[Descr] lift, projected to `Arc::as_ptr`
+            // ptr-ids), NOT the lazily-published `bitstring_*` fields.
+            readonly_descrs_fields: crate::effectinfo::descr_set_to_ptr_set_pub(
+                &effect._readonly_descrs_fields,
+            ),
+            write_descrs_fields: crate::effectinfo::descr_set_to_ptr_set_pub(
+                &effect._write_descrs_fields,
+            ),
+            readonly_descrs_arrays: crate::effectinfo::descr_set_to_ptr_set_pub(
+                &effect._readonly_descrs_arrays,
+            ),
+            write_descrs_arrays: crate::effectinfo::descr_set_to_ptr_set_pub(
+                &effect._write_descrs_arrays,
+            ),
+            readonly_descrs_interiorfields: crate::effectinfo::descr_set_to_ptr_set_pub(
+                &effect._readonly_descrs_interiorfields,
+            ),
+            write_descrs_interiorfields: crate::effectinfo::descr_set_to_ptr_set_pub(
+                &effect._write_descrs_interiorfields,
+            ),
             can_invalidate: effect.can_invalidate,
             can_collect: effect.can_collect,
         }
@@ -485,6 +545,161 @@ impl GcCache {
         self._cache_call_order.push(descr.clone());
         descr
     }
+
+    // ── External registration (cache-bypass mint sites) ─────────────
+    //
+    // PyPy `gc_cache._cache_*` is populated *exclusively* via the
+    // cache-or-mint `get_*_descr` API.  Pyre's lift currently has many
+    // mint sites that build descrs ad-hoc (`make_simple_descr_group`,
+    // `field_descr_from_bh_field`, the `jit_struct!` macro pre-wiring,
+    // bare `Arc::new(SimpleFieldDescr::new(...))`).  The
+    // `register_external_*` methods below let those sites publish the
+    // freshly-minted descr into the cache's per-category insertion
+    // order so `setup_descrs()` enumerates the full population and
+    // `compute_bitstrings()` sees every descr.
+    //
+    // PRE-EXISTING-ADAPTATION: temporary surface while mint sites
+    // migrate to `get_*_descr(LLType, ...)`.  Each migrated site
+    // drops `register_external_*` in favour of the keyed cache-or-mint
+    // call.  The end state retires every `register_external_*` call
+    // and the per-category Vec is populated solely by the keyed path.
+    //
+    // De-dup is by `Arc::ptr_eq` — same Arc clone re-registered is a
+    // no-op; structurally-distinct Arcs (even with matching field
+    // offsets / names) stay separate, mirroring PyPy `_cache_*` dict
+    // identity post-mint.
+
+    /// External registration for size descrs minted outside
+    /// `get_size_descr`.  PyPy `descr.py:25-29` cache iteration parity.
+    pub fn register_external_size(&mut self, descr: DescrRef) {
+        if !arc_in_vec(&self._cache_size_order, &descr) {
+            self._cache_size_order.push(descr);
+        }
+    }
+
+    /// External registration for field descrs minted outside
+    /// `get_field_descr`.  PyPy `descr.py:30-33`.
+    pub fn register_external_field(&mut self, descr: DescrRef) {
+        if !arc_in_vec(&self._cache_field_order, &descr) {
+            self._cache_field_order.push(descr);
+        }
+    }
+
+    /// External registration for array descrs minted outside
+    /// `get_array_descr`.  PyPy `descr.py:34-36`.
+    pub fn register_external_array(&mut self, descr: DescrRef) {
+        if !arc_in_vec(&self._cache_array_order, &descr) {
+            self._cache_array_order.push(descr);
+        }
+    }
+
+    /// External registration for arraylen descrs.  PyPy `descr.py:37-39`.
+    pub fn register_external_arraylen(&mut self, descr: DescrRef) {
+        if !arc_in_vec(&self._cache_arraylen_order, &descr) {
+            self._cache_arraylen_order.push(descr);
+        }
+    }
+
+    /// External registration for interiorfield descrs minted outside
+    /// `get_interiorfield_descr`.  PyPy `descr.py:43-45`.
+    pub fn register_external_interiorfield(&mut self, descr: DescrRef) {
+        if !arc_in_vec(&self._cache_interiorfield_order, &descr) {
+            self._cache_interiorfield_order.push(descr);
+        }
+    }
+
+    /// External registration for call descrs minted outside
+    /// `get_call_descr`.  PyPy `descr.py:40-42` — pyre routes call
+    /// descrs through `call_descr::CALL_DESCR_CACHE` (a separate
+    /// process-global) because the production `MetaCallDescr` type
+    /// carries `EffectInfoCell` and `heapcache_index` slots that
+    /// `SimpleCallDescr` (the type produced by `get_call_descr`) does
+    /// not have.  Write-through to `_cache_call_order` keeps
+    /// `setup_descrs()` enumeration unified — `finish_setup_descrs`
+    /// no longer needs to splice `cached_call_descrs()` separately.
+    pub fn register_external_call(&mut self, descr: DescrRef) {
+        if !arc_in_vec(&self._cache_call_order, &descr) {
+            self._cache_call_order.push(descr);
+        }
+    }
+
+    // ── Per-category snapshot accessors ─────────────────────────────
+    //
+    // `setup_descrs()` returns the full enumeration in PyPy group order;
+    // these accessors expose individual groups for callers that splice
+    // pyre-only side caches (e.g. `call_descr::cached_call_descrs()`,
+    // which currently lives outside `_cache_call_order`).
+
+    /// `descr.py:27-29 _cache_size` snapshot in insertion order.
+    pub fn snapshot_sizes(&self) -> Vec<DescrRef> {
+        self._cache_size_order.clone()
+    }
+
+    /// `descr.py:30-33 _cache_field` snapshot in insertion order.
+    pub fn snapshot_fields(&self) -> Vec<DescrRef> {
+        self._cache_field_order.clone()
+    }
+
+    /// `descr.py:34-36 _cache_array` snapshot in insertion order.
+    pub fn snapshot_arrays(&self) -> Vec<DescrRef> {
+        self._cache_array_order.clone()
+    }
+
+    /// `descr.py:37-39 _cache_arraylen` snapshot in insertion order.
+    pub fn snapshot_arraylens(&self) -> Vec<DescrRef> {
+        self._cache_arraylen_order.clone()
+    }
+
+    /// `descr.py:40-42 _cache_call` snapshot in insertion order.
+    pub fn snapshot_calls(&self) -> Vec<DescrRef> {
+        self._cache_call_order.clone()
+    }
+
+    /// `descr.py:43-45 _cache_interiorfield` snapshot in insertion order.
+    pub fn snapshot_interiorfields(&self) -> Vec<DescrRef> {
+        self._cache_interiorfield_order.clone()
+    }
+
+    /// Per-category counts for diagnostics / tests.  Tuple order:
+    /// `(sizes, fields, arrays, arraylens, calls, interiorfields)`,
+    /// matching PyPy `descr.py:25-47` group iteration order.
+    pub fn category_counts(&self) -> (usize, usize, usize, usize, usize, usize) {
+        (
+            self._cache_size_order.len(),
+            self._cache_field_order.len(),
+            self._cache_array_order.len(),
+            self._cache_arraylen_order.len(),
+            self._cache_call_order.len(),
+            self._cache_interiorfield_order.len(),
+        )
+    }
+}
+
+#[inline]
+fn arc_in_vec(haystack: &[DescrRef], needle: &DescrRef) -> bool {
+    haystack.iter().any(|d| Arc::ptr_eq(d, needle))
+}
+
+/// Process-global `GcCache` slot — pyre's lift of PyPy's per-CPU
+/// `gc_ll_descr.gc_cache`.  PyPy supports multiple CPUs in principle but
+/// production targets one CPU per process, so the singleton lift stays
+/// faithful: every mint site that goes through `get_*_descr` /
+/// `register_external_*` lands in the same cache, and
+/// `MetaInterpStaticData::finish_setup_descrs` enumerates from this
+/// slot.
+///
+/// `OnceLock<Mutex<GcCache>>` initialises lazily on first access.  The
+/// `Mutex` provides interior mutability for the cache-or-mint dict
+/// updates without requiring `&mut MetaInterpStaticData` (which would
+/// thread through every codewriter site).
+static GC_CACHE: OnceLock<Mutex<GcCache>> = OnceLock::new();
+
+/// Acquire a handle to the process-global `GcCache`.  Mirrors
+/// `cpu.gc_ll_descr.gc_cache` access in PyPy — every mint / lookup
+/// site for size / field / array / arraylen / call / interiorfield
+/// descrs flows through this single instance.
+pub fn gc_cache() -> &'static Mutex<GcCache> {
+    GC_CACHE.get_or_init(|| Mutex::new(GcCache::new()))
 }
 /// history.py: TargetToken / JitCellToken identity. PyPy keys
 /// `target_tokens_currently_compiling` and `consider_jump`'s
@@ -644,23 +859,47 @@ pub trait Descr: Send + Sync + std::fmt::Debug {
     /// Called by setup_descrs() to assign a sequential index.
     fn set_descr_index(&self, _index: i32) {}
 
-    /// `effectinfo.py:465 compute_bitstrings` writes a per-descr
-    /// `ei_index` that bridges the codewriter-side
-    /// `CallControl::array_index` / `CallControl::field_index` namespace
-    /// (the indices stored in `EffectInfo.read_descrs_*` /
-    /// `write_descrs_*` raw sets) to the runtime descr identity. Default
-    /// `u32::MAX` is the unset sentinel — `force_from_effectinfo`
-    /// readers must fall back to `descr.index()` when the bridge has
-    /// not been published.
+    /// `effectinfo.py:496` `descr.ei_index = sys.maxint` — initial sentinel
+    /// before `compute_bitstrings` partitions descrs into (eisetr, eisetw)
+    /// equivalence classes (`effectinfo.py:524-526`). Concrete field /
+    /// array / interiorfield descrs override this to expose their
+    /// `AtomicU32` storage; other descrs (calldescr, sizedescr, faildescr…)
+    /// keep the trait default and never participate in bitstring
+    /// classification — `compute_bitstrings` collects only descrs that
+    /// appear in some `EffectInfo._{readonly,write}_descrs_*` set.
     fn get_ei_index(&self) -> u32 {
         u32::MAX
     }
 
-    /// Companion to [`get_ei_index`]. Concrete descrs that override
-    /// `get_ei_index` with `AtomicU32` storage also override
-    /// `set_ei_index` to publish the codewriter-side index after
-    /// `compute_bitstrings()` runs.
+    /// `effectinfo.py:526` `descr.ei_index = mapping.setdefault(...)`.
+    /// Default no-op; field / array / interiorfield descrs override
+    /// with `AtomicU32` storage that `compute_bitstrings` publishes.
     fn set_ei_index(&self, _ei_index: u32) {}
+
+    /// `effectinfo.py:537-538` `setattr(ei, 'bitstring_*_descrs_*', ...)` —
+    /// per-EI bitstring publication after `compute_bitstrings` has
+    /// resolved each EI's (eisetr, eisetw) class membership. Default
+    /// no-op for descrs without `EffectInfo`; descrs that own a
+    /// mutable EI (i.e. `CallDescr` impls whose `get_extra_info()`
+    /// returns a stable address) override to atomically swap their
+    /// six bitstring slots.
+    ///
+    /// `compute_bitstrings` is invoked exactly once at JIT setup
+    /// (`pyjitpl.py:2287-2290 finish_setup_descrs`). Implementations
+    /// rely on that single-writer happens-before ordering — readers
+    /// (heap.rs / virtualize.rs / rewrite.rs) only run after the JIT
+    /// has been initialised, after the bitstring write completes.
+    #[allow(clippy::too_many_arguments)]
+    fn set_effect_bitstrings(
+        &self,
+        _readonly_descrs_fields: Option<Vec<u8>>,
+        _write_descrs_fields: Option<Vec<u8>>,
+        _readonly_descrs_arrays: Option<Vec<u8>>,
+        _write_descrs_arrays: Option<Vec<u8>>,
+        _readonly_descrs_interiorfields: Option<Vec<u8>>,
+        _write_descrs_interiorfields: Option<Vec<u8>>,
+    ) {
+    }
 
     /// Human-readable representation for debugging.
     fn repr(&self) -> String {
@@ -1617,6 +1856,17 @@ pub trait ArrayDescr: Descr {
         None
     }
 
+    /// descr.py:373 `arraydescr.all_interiorfielddescrs = descrs` —
+    /// post-construction publish for struct-array interior field
+    /// descriptors.  Concrete impls (`SimpleArrayDescr`) override with
+    /// a `OnceLock` set-once semantic so `cpu.arraydescrof(ARRAY)`
+    /// can return the cached `Arc<dyn ArrayDescr>` first (matching
+    /// `Arc::ptr_eq(interior.array_descr, returned_array_descr)` per
+    /// `descr.py:388 InteriorFieldDescr.__init__`) and the interior
+    /// list back-references the same Arc.  Default no-op for descrs
+    /// without an `OnceLock` slot.
+    fn set_all_interiorfielddescrs(&self, _descrs: Vec<DescrRef>) {}
+
     /// descr.py: repr_of_descr()
     fn repr_of_descr(&self) -> String {
         format!(
@@ -1896,11 +2146,22 @@ impl Descr for DebugMergePointDescr {
 #[derive(Debug)]
 pub struct VableArrayFieldDescr {
     pub idx: u16,
+    /// `effectinfo.py:496` `descr.ei_index = sys.maxint` — singleton, so
+    /// the storage lives in the descriptor itself rather than a side
+    /// table. Initialised to `u32::MAX` and rewritten by
+    /// `compute_bitstrings`.
+    ei_index: AtomicU32,
 }
 
 impl Descr for VableArrayFieldDescr {
     fn repr(&self) -> String {
         format!("vable_array_field_descr[{}]", self.idx)
+    }
+    fn get_ei_index(&self) -> u32 {
+        self.ei_index.load(Ordering::Relaxed)
+    }
+    fn set_ei_index(&self, index: u32) {
+        self.ei_index.store(index, Ordering::Relaxed);
     }
 }
 
@@ -1914,11 +2175,20 @@ impl Descr for VableArrayFieldDescr {
 #[derive(Debug)]
 pub struct VableArrayDescr {
     pub idx: u16,
+    /// `effectinfo.py:496` `descr.ei_index = sys.maxint`. See
+    /// `VableArrayFieldDescr::ei_index`.
+    ei_index: AtomicU32,
 }
 
 impl Descr for VableArrayDescr {
     fn repr(&self) -> String {
         format!("vable_array_descr[{}]", self.idx)
+    }
+    fn get_ei_index(&self) -> u32 {
+        self.ei_index.load(Ordering::Relaxed)
+    }
+    fn set_ei_index(&self, index: u32) {
+        self.ei_index.store(index, Ordering::Relaxed);
     }
 }
 
@@ -1941,8 +2211,13 @@ pub fn vable_array_field_descr(idx: u16) -> DescrRef {
          are a future extension"
     );
     static SLOT: OnceLock<DescrRef> = OnceLock::new();
-    SLOT.get_or_init(|| Arc::new(VableArrayFieldDescr { idx: 0 }) as DescrRef)
-        .clone()
+    SLOT.get_or_init(|| {
+        Arc::new(VableArrayFieldDescr {
+            idx: 0,
+            ei_index: AtomicU32::new(u32::MAX),
+        }) as DescrRef
+    })
+    .clone()
 }
 
 /// Singleton accessor for `array_descrs[idx]` — counterpart of
@@ -1956,8 +2231,13 @@ pub fn vable_array_descr(idx: u16) -> DescrRef {
          are a future extension"
     );
     static SLOT: OnceLock<DescrRef> = OnceLock::new();
-    SLOT.get_or_init(|| Arc::new(VableArrayDescr { idx: 0 }) as DescrRef)
-        .clone()
+    SLOT.get_or_init(|| {
+        Arc::new(VableArrayDescr {
+            idx: 0,
+            ei_index: AtomicU32::new(u32::MAX),
+        }) as DescrRef
+    })
+    .clone()
 }
 
 /// `rpython/jit/metainterp/virtualizable.py:71` —
@@ -1979,11 +2259,20 @@ pub fn vable_array_descr(idx: u16) -> DescrRef {
 #[derive(Debug)]
 pub struct VableStaticFieldDescr {
     pub idx: u16,
+    /// `effectinfo.py:496` `descr.ei_index = sys.maxint`. See
+    /// `VableArrayFieldDescr::ei_index`.
+    ei_index: AtomicU32,
 }
 
 impl Descr for VableStaticFieldDescr {
     fn repr(&self) -> String {
         format!("vable_static_field_descr[{}]", self.idx)
+    }
+    fn get_ei_index(&self) -> u32 {
+        self.ei_index.load(Ordering::Relaxed)
+    }
+    fn set_ei_index(&self, index: u32) {
+        self.ei_index.store(index, Ordering::Relaxed);
     }
 }
 
@@ -2027,7 +2316,12 @@ pub fn vable_static_field_descr(idx: u16) -> DescrRef {
         VABLE_STATIC_FIELD_DESCR_SLOTS,
     );
     SLOTS[i]
-        .get_or_init(|| Arc::new(VableStaticFieldDescr { idx }) as DescrRef)
+        .get_or_init(|| {
+            Arc::new(VableStaticFieldDescr {
+                idx,
+                ei_index: AtomicU32::new(u32::MAX),
+            }) as DescrRef
+        })
         .clone()
 }
 
@@ -2044,8 +2338,9 @@ pub struct SimpleFieldDescr {
     index: u32,
     /// history.py:1092: BackendDescr.descr_index = -1
     descr_index: AtomicI32,
-    /// `effectinfo.py:465 compute_bitstrings` ei_index. `u32::MAX` until
-    /// the codewriter publishes its `field_index` onto this descr.
+    /// `effectinfo.py:496` `descr.ei_index = sys.maxint` — initialised to
+    /// `u32::MAX` (sentinel matching `sys.maxint`); rewritten by
+    /// `compute_bitstrings` (`effectinfo.py:524-526`).
     ei_index: AtomicU32,
     /// RPython: FieldDescr.name — e.g. "MyStruct.field_name"
     name: String,
@@ -2478,6 +2773,23 @@ pub fn make_simple_descr_group(
             .with_all_fielddescrs(all_fielddescrs)
     });
     let field_descrs = field_descrs_cell.into_inner();
+    // descr.py:236-247 `get_size_descr` cache-miss branch — every
+    // freshly-minted size descr enters `gc_cache._cache_size`. Pyre
+    // mirrors via `descr_registry::register_size`; this is what makes
+    // `MetaInterpStaticData::finish_setup_descrs` see the size category
+    // when computing sequential `descr_index` values per
+    // `descr.py:25-47 setup_descrs` group order.
+    crate::descr_registry::register_size(size_descr.clone() as DescrRef);
+    // descr.py:225-235 `get_field_descr` cache-miss branch — every
+    // freshly-minted field descr enters `gc_cache._cache_field`. Pyre's
+    // mirror is `descr_registry::register_field`; the mint sites that
+    // call `make_simple_descr_group` (jit_struct! macro expansion +
+    // pyre-jit-trace::descr) implicitly register through this loop so
+    // `MetaInterpStaticData::finish_setup_descrs` can enumerate the
+    // full population for `compute_bitstrings`.
+    for fd in &field_descrs {
+        crate::descr_registry::register_field(fd.clone() as DescrRef);
+    }
     SimpleDescrGroup {
         size_descr,
         field_descrs,
@@ -2490,9 +2802,7 @@ pub struct SimpleArrayDescr {
     index: u32,
     /// history.py:1092: BackendDescr.descr_index = -1
     descr_index: AtomicI32,
-    /// `effectinfo.py:465 compute_bitstrings` ei_index — `u32::MAX`
-    /// until the bridge between codewriter `array_index` and runtime
-    /// descr identity has been published.
+    /// `effectinfo.py:496` `descr.ei_index = sys.maxint`. See SimpleFieldDescr.
     ei_index: AtomicU32,
     base_size: usize,
     item_size: usize,
@@ -2676,6 +2986,11 @@ impl ArrayDescr for SimpleArrayDescr {
     fn get_all_interiorfielddescrs(&self) -> Option<&[DescrRef]> {
         self.all_interiorfielddescrs.get().map(Vec::as_slice)
     }
+    /// `descr.py:373 arraydescr.all_interiorfielddescrs = descrs` —
+    /// post-construction publish (set-once via `OnceLock`).
+    fn set_all_interiorfielddescrs(&self, descrs: Vec<DescrRef>) {
+        let _ = self.all_interiorfielddescrs.set(descrs);
+    }
 }
 
 /// Simple concrete InteriorFieldDescr.
@@ -2684,9 +2999,7 @@ pub struct SimpleInteriorFieldDescr {
     index: u32,
     /// history.py:1092: BackendDescr.descr_index = -1
     descr_index: AtomicI32,
-    /// `effectinfo.py:465 compute_bitstrings` ei_index for the
-    /// `interiorfield` namespace (`effectinfo.py:351-354`). `u32::MAX`
-    /// until the codewriter publishes its `interiorfield_index` here.
+    /// `effectinfo.py:496` `descr.ei_index = sys.maxint`. See SimpleFieldDescr.
     ei_index: AtomicU32,
     array_descr: std::sync::Arc<SimpleArrayDescr>,
     field_descr: std::sync::Arc<SimpleFieldDescr>,
@@ -2772,6 +3085,10 @@ impl InteriorFieldDescr for SimpleInteriorFieldDescr {
 /// Simple concrete CallDescr for non-test use.
 /// descr.py:450-493: CallDescr(arg_classes, result_type, result_signed,
 ///   result_size, extrainfo, ffi_flags).
+///
+/// `effect` is wrapped in [`EffectInfoCell`] so
+/// `effectinfo::compute_bitstrings` can install the compacted
+/// bitstrings post-construction. See `Descr::set_effect_bitstrings`.
 #[derive(Debug)]
 pub struct SimpleCallDescr {
     index: u32,
@@ -2784,7 +3101,7 @@ pub struct SimpleCallDescr {
     /// descr.py:453: CallDescr.result_flag — computed from result_type +
     /// result_signed in __init__ (descr.py:478-493).
     result_flag: ArrayFlag,
-    effect: EffectInfo,
+    effect: crate::effectinfo::EffectInfoCell,
 }
 
 impl Clone for SimpleCallDescr {
@@ -2861,7 +3178,7 @@ impl SimpleCallDescr {
             result_class,
             result_size,
             result_flag,
-            effect,
+            effect: crate::effectinfo::EffectInfoCell::new(effect),
         }
     }
 }
@@ -2878,6 +3195,29 @@ impl Descr for SimpleCallDescr {
     }
     fn as_call_descr(&self) -> Option<&dyn CallDescr> {
         Some(self)
+    }
+    /// `effectinfo.py:537-538 setattr(ei, 'bitstring_*', …)`. Pyre's
+    /// `compute_bitstrings` writeback path reaches every call descr
+    /// uniformly via this trait method; without this override pyre
+    /// silently mixes index domains (descr.ei_index in the compact
+    /// domain, EI bitstring still raw `descr.index()`).
+    fn set_effect_bitstrings(
+        &self,
+        readonly_descrs_fields: Option<Vec<u8>>,
+        write_descrs_fields: Option<Vec<u8>>,
+        readonly_descrs_arrays: Option<Vec<u8>>,
+        write_descrs_arrays: Option<Vec<u8>>,
+        readonly_descrs_interiorfields: Option<Vec<u8>>,
+        write_descrs_interiorfields: Option<Vec<u8>>,
+    ) {
+        self.effect.set_bitstrings(
+            readonly_descrs_fields,
+            write_descrs_fields,
+            readonly_descrs_arrays,
+            write_descrs_arrays,
+            readonly_descrs_interiorfields,
+            write_descrs_interiorfields,
+        );
     }
 }
 
@@ -2899,7 +3239,7 @@ impl CallDescr for SimpleCallDescr {
         self.result_size
     }
     fn get_extra_info(&self) -> &EffectInfo {
-        &self.effect
+        self.effect.get()
     }
 }
 

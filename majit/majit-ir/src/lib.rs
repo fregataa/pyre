@@ -1,5 +1,6 @@
 pub mod bitstring;
 pub mod descr;
+pub mod descr_registry;
 pub mod effectinfo;
 pub mod op_type_index;
 pub mod resoperation;

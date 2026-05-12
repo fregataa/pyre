@@ -751,9 +751,19 @@ pub struct OptHeap {
     /// Inner key uses `DictArgKey` so Const args compare by value
     /// (util.py:100 args_dict / args_eq via history.py:204 same_box).
     cached_dict_reads: HashMap<usize, HashMap<[DictArgKey; 2], OpRef>>,
-    /// heap.py:560: corresponding_array_descrs — maps extradescrs[1] bitstring index → extradescrs[0] identity.
-    /// Used in force_from_effectinfo to clear dict_reads when the entries array is written.
-    corresponding_array_descrs: HashMap<u32, usize>,
+    /// heap.py:560: corresponding_array_descrs — maps extradescrs[1] (entries
+    /// array descr) → extradescrs[0] dict identity.
+    ///
+    /// PyPy stores the *array descr object* directly and resolves
+    /// `arraydescr.ei_index` inside `effectinfo.check_write_descr_array(arraydescr)`
+    /// at invalidation time (`effectinfo.py:220-222`).  Pyre keeps the
+    /// `DescrRef` alive on the value side so the same lazy resolution can
+    /// happen via `descr.get_ei_index()` (with `EI_INDEX_TABLE` fallback) at
+    /// `force_from_effectinfo`; the `u32` key dedups by raw `descr.index()`
+    /// to mirror PyPy's `dict[arraydescr]` "later registration wins" idiom
+    /// (the registration is gated by a `cached_dict_reads` first-encounter
+    /// check, so duplicates are rare anyway — see `_optimize_call_dict_lookup`).
+    corresponding_array_descrs: HashMap<u32, (DescrRef, usize)>,
     /// Fields known to be quasi-immutable: (obj, field_idx) -> cached value OpRef.
     /// Populated by QUASIIMMUT_FIELD, consumed by subsequent GETFIELD_GC_*.
     /// Survives calls (guarded by GUARD_NOT_INVALIDATED).
@@ -826,27 +836,57 @@ impl OptHeap {
         }
     }
 
-    /// Existing majit `EffectInfo` bitsets are indexed by the descriptor's
-    /// effect/global index domain, not by `PtrInfo._fields` slot.
+    /// `effectinfo.py:529-532` `bitstrr = [descr.ei_index for descr in
+    /// getattr(ei, '_readonly_descrs_' + key)]` — the bit position in
+    /// each EI's `bitstring_*` is the descr's `ei_index`, set by
+    /// `compute_bitstrings`. Pyre resolves it in priority order:
     ///
-    /// `effectinfo.py:465 compute_bitstrings` writes a per-descr
-    /// `ei_index` that names the bitstring slot. Until the bridge is
-    /// fully in place, fall back to `descr.index()` whose namespace
-    /// matches the codewriter's `field_index` for descrs minted by
-    /// `CallControl::fielddescrof`.
+    /// 1. `descr.get_ei_index()` — populated by `compute_bitstrings`
+    ///    only when the descr was reachable through the caller's
+    ///    `all_descrs`. Pyre's production path rarely has the
+    ///    field/array descr Arc on hand because there is no central
+    ///    descriptor enumeration (PyPy's `cpu.fetch_all_descrs()`),
+    ///    so this fast path mostly applies to test fixtures that
+    ///    pre-build their `all_descrs`.
+    /// 2. `EI_INDEX_TABLE.lookup_field(descr.index())` — side-table
+    ///    map published by `MetaInterpStaticData::finish_setup_descrs`
+    ///    after `compute_bitstrings` returns. Production callers see
+    ///    the compaction here.
+    /// 3. Sentinel `u32::MAX` — PyPy `effectinfo.py:496` writes
+    ///    `descr.ei_index = sys.maxint` for descrs absent from any
+    ///    EI's raw set. `bitstring.py:18 if byte_number >= len(bitstring)`
+    ///    then makes `bitcheck` return false out of range. Pyre
+    ///    matches by returning `u32::MAX`, whose
+    ///    `byte_number = u32::MAX >> 3` is far past any realistic
+    ///    bitstring length so `bitcheck` shorts to false the same way.
     fn field_effect_index(descr: &DescrRef) -> u32 {
-        let ei = descr.get_ei_index();
-        if ei != u32::MAX { ei } else { descr.index() }
+        let ei_idx = descr.get_ei_index();
+        if ei_idx != u32::MAX {
+            return ei_idx;
+        }
+        if let Some(table) = majit_ir::effectinfo::EI_INDEX_TABLE.get() {
+            if let Some(idx) = table.lookup_field(descr.index()) {
+                return idx;
+            }
+        }
+        u32::MAX
     }
 
-    /// Same lift for array descrs — `effectinfo.py:307-311`
-    /// `array_index` flows onto `descr.get_ei_index()` once
-    /// `CallControl::arraydescrof` publishes it; fallback is
-    /// `descr.index()` which carries the same value through the
-    /// SimpleArrayDescr `idx` parameter.
+    /// Same priority chain as [`field_effect_index`] for the array
+    /// namespace (`effectinfo.py:307-311 add_array` writes `ei_index`
+    /// onto the array descr; `EI_INDEX_TABLE.lookup_array` is the
+    /// production-path side-table fallback).
     fn array_effect_index(descr: &DescrRef) -> u32 {
-        let ei = descr.get_ei_index();
-        if ei != u32::MAX { ei } else { descr.index() }
+        let ei_idx = descr.get_ei_index();
+        if ei_idx != u32::MAX {
+            return ei_idx;
+        }
+        if let Some(table) = majit_ir::effectinfo::EI_INDEX_TABLE.get() {
+            if let Some(idx) = table.lookup_array(descr.index()) {
+                return idx;
+            }
+        }
+        u32::MAX
     }
 
     /// heapcache.py:295-309 `_escape_box`: escape a box and transitively
@@ -1535,7 +1575,7 @@ impl OptHeap {
             _ => return false,
         };
         let descr1_id = descr_identity(&descrs[0]);
-        let descr2_idx = Self::array_effect_index(&descrs[1]);
+        let descr2 = descrs[1].clone();
 
         // heap.py:506-511 try/except KeyError:
         //   try:
@@ -1550,7 +1590,7 @@ impl OptHeap {
         if !self.cached_dict_reads.contains_key(&descr1_id) {
             self.cached_dict_reads.insert(descr1_id, HashMap::new());
             self.corresponding_array_descrs
-                .insert(descr2_idx, descr1_id);
+                .insert(descr2.index(), (descr2, descr1_id));
         }
         let d = self
             .cached_dict_reads
@@ -1811,14 +1851,30 @@ impl OptHeap {
         }
 
         // heap.py:554-558: for arraydescr, submap in self.cached_arrayitems.items()
-        let array_descrs: Vec<u32> = self
+        // Bitstring bit position resolution mirrors `field_effect_index`:
+        // descr-side `get_ei_index` → published `EI_INDEX_TABLE.lookup_array`
+        // → `u32::MAX` sentinel matching PyPy `effectinfo.py:496`'s
+        // `descr.ei_index = sys.maxint` for descrs absent from any EI's
+        // raw set. See `field_effect_index` doc for the full priority chain.
+        let array_descrs: Vec<(u32, u32)> = self
             .cached_arrayitems
             .iter()
-            .map(|(idx, _, _)| *idx)
+            .map(|(idx, descr, _)| {
+                let ei_idx = descr.get_ei_index();
+                if ei_idx != u32::MAX {
+                    return (*idx, ei_idx);
+                }
+                if let Some(table) = majit_ir::effectinfo::EI_INDEX_TABLE.get() {
+                    if let Some(eii) = table.lookup_array(*idx) {
+                        return (*idx, eii);
+                    }
+                }
+                (*idx, u32::MAX)
+            })
             .collect();
-        for descr_idx in array_descrs {
-            let read = ei.check_readonly_descr_array(descr_idx);
-            let write = ei.check_write_descr_array(descr_idx);
+        for (descr_idx, effect_idx) in array_descrs {
+            let read = ei.check_readonly_descr_array(effect_idx);
+            let write = ei.check_write_descr_array(effect_idx);
             if !read && !write {
                 continue;
             }
@@ -1912,12 +1968,28 @@ impl OptHeap {
         }
 
         // heap.py:560-563: invalidate cached_dict_reads via corresponding_array_descrs.
+        // PyPy `effectinfo.check_write_descr_array(arraydescr)` reads
+        // `arraydescr.ei_index` (`effectinfo.py:220-222`); pyre's lift
+        // resolves `descr.get_ei_index()` (with `EI_INDEX_TABLE`
+        // fallback for descrs minted outside any registry —
+        // mirroring `cached_arrayitems` above) before passing into
+        // `check_write_descr_array(effect_idx)`.
         let array_ids_to_clear: Vec<usize> = self
             .corresponding_array_descrs
             .iter()
-            .filter_map(|(&arr_idx, &dict_id)| {
-                if ei.check_write_descr_array(arr_idx) {
-                    Some(dict_id)
+            .filter_map(|(_, (arr_descr, dict_id))| {
+                let effect_idx = {
+                    let ei_idx = arr_descr.get_ei_index();
+                    if ei_idx != u32::MAX {
+                        ei_idx
+                    } else if let Some(table) = majit_ir::effectinfo::EI_INDEX_TABLE.get() {
+                        table.lookup_array(arr_descr.index()).unwrap_or(u32::MAX)
+                    } else {
+                        u32::MAX
+                    }
+                };
+                if ei.check_write_descr_array(effect_idx) {
+                    Some(*dict_id)
                 } else {
                     None
                 }
@@ -3505,6 +3577,7 @@ mod tests {
     //! mostly covers only indirectly through larger integration tests.
 
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     use majit_ir::{
         CallDescr, Descr, DescrRef, EffectInfo, ExtraEffect, FieldDescr, OopSpecIndex, Op, OpCode,
@@ -3571,12 +3644,29 @@ mod tests {
     /// Minimal descriptor for tests, identified by its index. Implements
     /// `FieldDescr` with a synthetic Struct parent so the optimizer's
     /// `ensure_ptr_info_arg0` field branch can dispatch correctly.
+    ///
+    /// `ei_index` mirrors PyPy production field descrs (`history.py:498
+    /// FieldDescr.ei_index`); default `u32::MAX` matches PyPy
+    /// `effectinfo.py:496 descr.ei_index = sys.maxint` for descrs absent
+    /// from any EI's raw set. Tests that need a specific `ei_index`
+    /// (i.e., the descr appears in some EI's `_*_descrs_*` raw set) call
+    /// `descr.set_ei_index(N)` before constructing the EI, mirroring
+    /// `effectinfo.py:526 descr.ei_index = mapping.setdefault(...)`.
     #[derive(Debug)]
-    struct TestDescr(u32);
+    struct TestDescr {
+        index: u32,
+        ei_index: AtomicU32,
+    }
 
     impl Descr for TestDescr {
         fn index(&self) -> u32 {
-            self.0
+            self.index
+        }
+        fn get_ei_index(&self) -> u32 {
+            self.ei_index.load(Ordering::Relaxed)
+        }
+        fn set_ei_index(&self, idx: u32) {
+            self.ei_index.store(idx, Ordering::Relaxed);
         }
         fn as_field_descr(&self) -> Option<&dyn FieldDescr> {
             Some(self)
@@ -3588,7 +3678,7 @@ mod tests {
             Some(test_parent_descr())
         }
         fn offset(&self) -> usize {
-            self.0 as usize * 8
+            self.index as usize * 8
         }
         fn field_size(&self) -> usize {
             8
@@ -3599,13 +3689,21 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct ObjectTestDescr(u32);
+    struct ObjectTestDescr {
+        index: u32,
+        ei_index: AtomicU32,
+    }
 
     impl Descr for ObjectTestDescr {
         fn index(&self) -> u32 {
-            self.0
+            self.index
         }
-
+        fn get_ei_index(&self) -> u32 {
+            self.ei_index.load(Ordering::Relaxed)
+        }
+        fn set_ei_index(&self, idx: u32) {
+            self.ei_index.store(idx, Ordering::Relaxed);
+        }
         fn as_field_descr(&self) -> Option<&dyn FieldDescr> {
             Some(self)
         }
@@ -3616,7 +3714,7 @@ mod tests {
             Some(test_object_parent_descr())
         }
         fn offset(&self) -> usize {
-            self.0 as usize * 8
+            self.index as usize * 8
         }
         fn field_size(&self) -> usize {
             8
@@ -3628,11 +3726,20 @@ mod tests {
 
     /// Descriptor for immutable (green) fields. `is_always_pure()` returns true.
     #[derive(Debug)]
-    struct ImmutableDescr(u32);
+    struct ImmutableDescr {
+        index: u32,
+        ei_index: AtomicU32,
+    }
 
     impl Descr for ImmutableDescr {
         fn index(&self) -> u32 {
-            self.0
+            self.index
+        }
+        fn get_ei_index(&self) -> u32 {
+            self.ei_index.load(Ordering::Relaxed)
+        }
+        fn set_ei_index(&self, idx: u32) {
+            self.ei_index.store(idx, Ordering::Relaxed);
         }
 
         fn is_always_pure(&self) -> bool {
@@ -3649,7 +3756,7 @@ mod tests {
             Some(test_parent_descr())
         }
         fn offset(&self) -> usize {
-            self.0 as usize * 8
+            self.index as usize * 8
         }
         fn field_size(&self) -> usize {
             8
@@ -3663,15 +3770,24 @@ mod tests {
     }
 
     fn descr(idx: u32) -> DescrRef {
-        Arc::new(TestDescr(idx))
+        Arc::new(TestDescr {
+            index: idx,
+            ei_index: AtomicU32::new(u32::MAX),
+        })
     }
 
     fn immutable_descr(idx: u32) -> DescrRef {
-        Arc::new(ImmutableDescr(idx))
+        Arc::new(ImmutableDescr {
+            index: idx,
+            ei_index: AtomicU32::new(u32::MAX),
+        })
     }
 
     fn object_descr(idx: u32) -> DescrRef {
-        Arc::new(ObjectTestDescr(idx))
+        Arc::new(ObjectTestDescr {
+            index: idx,
+            ei_index: AtomicU32::new(u32::MAX),
+        })
     }
 
     #[derive(Debug)]
@@ -3774,6 +3890,18 @@ mod tests {
     /// Call descriptor with default EffectInfo (non-random, non-elidable).
     /// heapcache.py:362-370 parity: plain calls with known effectinfo
     /// use invalidate_unescaped instead of full reset.
+    /// Test helper for "residual call with unknown heap effects". Mirrors
+    /// PyPy `effectinfo.MOST_GENERAL` (`effectinfo.py:271-273`):
+    /// `extraeffect=EF_RANDOM_EFFECTS`, all six raw sets `None`, all six
+    /// bitstrings `None`, `can_invalidate=True`. Production sites and
+    /// tests use this whenever no analyzer info is available — invalidation
+    /// flows through `dispatch_emit:2631/2766 call_has_random_effects ==
+    /// true → clean_caches`, mirroring `heap.py:551`'s top-level
+    /// random-effects branch. The previous saturated-bitstring fallback
+    /// (`CanRaise + raw=Some(empty) + bitstring=Some(0xff;8)`) was a
+    /// pyre-only shape PyPy never produces — `effectinfo_from_writeanalyze`
+    /// (`effectinfo.py:285`) force-promotes top_set inputs to RandomEffects
+    /// before constructing the EI.
     fn plain_call_descr(idx: u32) -> DescrRef {
         Arc::new(majit_ir::SimpleCallDescr::new(
             idx,
@@ -3781,16 +3909,7 @@ mod tests {
             majit_ir::Type::Void,
             false,
             0,
-            EffectInfo {
-                // Write all fields/arrays so invalidation is triggered.
-                // `effectinfo.py:185-190` represents the read/write sets
-                // as bytestring bitstrings (`bitstring.py:make_bitstring`),
-                // so an "all bits set" sentinel for an unknown universe
-                // is a fully-saturated 8-byte run.
-                write_descrs_fields: Some(vec![0xff; 8]),
-                write_descrs_arrays: Some(vec![0xff; 8]),
-                ..EffectInfo::default()
-            },
+            EffectInfo::MOST_GENERAL,
         ))
     }
 
@@ -5343,10 +5462,16 @@ mod tests {
     #[test]
     fn test_call_may_force_uses_effectinfo_to_keep_unaffected_cached_fields() {
         let d0 = descr(0);
+        let d1 = descr(1);
         let call_d = call_descr(
             70,
             EffectInfo {
                 extraeffect: ExtraEffect::CanRaise,
+                // `effectinfo.py:131 _write_descrs_fields = frozenset({descr1})`
+                // — Arc-identity raw set carrying d1, paired with the
+                // legacy `descr.index()`-keyed bitstring so the fixture
+                // works both pre- and post-`compute_bitstrings`.
+                _write_descrs_fields: Some(vec![d1]),
                 write_descrs_fields: Some(bitstring::make_bitstring(&[1])),
                 ..Default::default()
             },
@@ -5377,10 +5502,17 @@ mod tests {
     #[test]
     fn test_call_may_force_uses_effectinfo_to_invalidate_written_cached_fields() {
         let d0 = descr(0);
+        // PyPy `effectinfo.py:526 mapping.setdefault(...)` would assign
+        // `d0.ei_index = 0` once compute_bitstrings has run, since d0 is
+        // the only descr in `_write_descrs_fields`. Tests skip
+        // compute_bitstrings, so we set it manually so the bitstring at
+        // bit 0 actually corresponds to d0's encoding.
+        d0.set_ei_index(0);
         let call_d = call_descr(
             71,
             EffectInfo {
                 extraeffect: ExtraEffect::CanRaise,
+                _write_descrs_fields: Some(vec![d0.clone()]),
                 write_descrs_fields: Some(bitstring::make_bitstring(&[0])),
                 ..Default::default()
             },
@@ -5440,11 +5572,13 @@ mod tests {
     #[test]
     fn test_call_may_force_keeps_unaffected_variable_index_array_cache() {
         let d0 = descr(0);
+        let d1 = descr(1);
         let idx = OpRef::int_op(50);
         let call_d = call_descr(
             73,
             EffectInfo {
                 extraeffect: ExtraEffect::CanRaise,
+                _write_descrs_arrays: Some(vec![d1]),
                 write_descrs_arrays: Some(bitstring::make_bitstring(&[1])),
                 ..Default::default()
             },
@@ -5503,11 +5637,16 @@ mod tests {
     #[test]
     fn test_call_may_force_invalidates_written_variable_index_array_cache() {
         let d0 = descr(0);
+        // d0 is the only descr in `_write_descrs_arrays`, so PyPy
+        // `effectinfo.py:526` would assign `d0.ei_index = 0`. Tests skip
+        // compute_bitstrings, so we set it manually.
+        d0.set_ei_index(0);
         let idx = OpRef::int_op(50);
         let call_d = call_descr(
             74,
             EffectInfo {
                 extraeffect: ExtraEffect::CanRaise,
+                _write_descrs_arrays: Some(vec![d0.clone()]),
                 write_descrs_arrays: Some(bitstring::make_bitstring(&[0])),
                 ..Default::default()
             },

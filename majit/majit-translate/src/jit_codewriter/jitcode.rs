@@ -995,7 +995,17 @@ pub fn bh_field_specs_from_size_descr(sd: &dyn majit_ir::descr::SizeDescr) -> Ve
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BhSizeSpec {
     pub size: usize,
-    pub type_id: u32,
+    /// `descr.py:108-110 cache[STRUCT]` cache-key surrogate.
+    /// Carries the full `path_hash(concat!(module_path!(), "::",
+    /// stringify!(Struct)))` u64 that the runtime `jit_struct!` macro
+    /// emits as `__majit_type_id()` (`majit-macros/src/jit_struct.rs:92`).
+    /// MUST be u64, not truncated to u32 — `path_hash` has 64-bit range
+    /// and truncating yields collisions at ~2^32 structs that PyPy's
+    /// per-object identity never has.  Analyzer side hashes
+    /// `field.owner_root` to the same u64 (`assembler.rs
+    /// :bh_size_spec_from_callcontrol`), so the two routes converge on
+    /// the same `LLType::Struct(u64)` cache key in `gc_cache._cache_size`.
+    pub type_id: u64,
     pub vtable: usize,
     pub all_fielddescrs: Vec<BhFieldSpec>,
 }
@@ -1057,7 +1067,11 @@ pub enum BhDescr {
         /// nolength/raw array descriptors; `bh_arraylen_gc` requires
         /// `Some` just like llmodel.py asserts an ArrayDescr with lendescr.
         len_offset: Option<usize>,
-        type_id: u32,
+        /// `descr.py:348-360 cache[ARRAY_OR_STRUCT]` cache-key
+        /// surrogate.  u64 `path_hash(array_type_id)` matching the
+        /// runtime macro emission; see `BhSizeSpec.type_id` for the
+        /// full identity rationale.
+        type_id: u64,
         item_type: majit_ir::value::Type,
         is_array_of_pointers: bool,
         is_array_of_structs: bool,
@@ -1105,7 +1119,10 @@ pub enum BhDescr {
     /// `bh_all_field_specs_for_struct`.
     Size {
         size: usize,
-        type_id: u32,
+        /// `descr.py:108-110 cache[STRUCT]` cache-key surrogate.
+        /// u64 `path_hash(module_path::Struct)` — see
+        /// `BhSizeSpec.type_id` doc for full identity rationale.
+        type_id: u64,
         vtable: usize,
         /// RPython `STRUCT._name` identity (empty when the size descr
         /// is built transiently for `bh_new` / `bh_new_with_vtable`
@@ -1202,7 +1219,7 @@ impl BhDescr {
         }
     }
 
-    pub fn get_type_id(&self) -> u32 {
+    pub fn get_type_id(&self) -> u64 {
         match self {
             BhDescr::Size { type_id, .. } => *type_id,
             BhDescr::Array { type_id, .. } => *type_id,
@@ -1317,7 +1334,12 @@ impl BhDescr {
             base_size: array_descr.base_size(),
             itemsize: array_descr.item_size(),
             len_offset: array_descr.len_descr().map(|fd| fd.offset()),
-            type_id: array_descr.type_id(),
+            // PRE-EXISTING-ADAPTATION: descr-back-to-spec inverse path.
+            // `ArrayDescr::type_id()` returns the u32 GC tid, not the
+            // u64 `path_hash` cache key.  Widen via `as u64` here; the
+            // structural fix is a `cache_key()` accessor on
+            // `ArrayDescr` paired with `gc_cache` routing.
+            type_id: array_descr.type_id() as u64,
             item_type: array_descr.item_type(),
             is_array_of_pointers: array_descr.is_array_of_pointers(),
             is_array_of_structs: array_descr.is_array_of_structs(),

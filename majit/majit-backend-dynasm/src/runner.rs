@@ -2166,7 +2166,10 @@ impl Backend for DynasmBackend {
         // allocation requires a real GC type id; tid=0 means the descr
         // never went through `gc.py:548 set_type_id` and the GC tracer
         // would lack the per-item visit shape.
-        let type_id = arraydescr.get_type_id();
+        // PRE-EXISTING-ADAPTATION: `BhDescr.get_type_id()` returns the
+        // u64 `path_hash` cache key, but `dynasm_alloc_*` expects the
+        // u32 GC tid.  Truncate `as u32` until gc_cache routing.
+        let type_id = arraydescr.get_type_id() as u32;
         assert!(
             type_id != 0,
             "bh_new_array requires ArrayDescr.tid (descr.py:340) — got 0"

@@ -972,7 +972,11 @@ where
             cache_key.interior_fields,
         );
         let descr_arc = majit_ir::descr::make_array_descr_from_lltype_shape(
-            type_id,
+            // PRE-EXISTING-ADAPTATION: `make_array_descr_from_lltype_shape`
+            // takes the u32 gc tid; this caller has the u64 cache key.
+            // Truncate `as u32` until gc_cache routing resolves the proper
+            // allocated tid here.
+            type_id as u32,
             base_size,
             itemsize,
             len_offset,
@@ -5337,10 +5341,22 @@ mod tests {
         }
     }
 
+    /// Build a test EI with the requested `extraeffect` while preserving
+    /// the `effectinfo.py:149-162 __new__` invariant: when
+    /// `extraeffect != EF_RANDOM_EFFECTS`, all six `_*_descrs_*` raw
+    /// sets must be `Some(...)` (not `None`).  `default_effect_info()`
+    /// returns `MOST_GENERAL` (raw=None), so a struct-update spread
+    /// with only `extraeffect` overridden would produce the
+    /// PyPy-impossible "non-random + raw=None" hybrid shape.
+    /// Use `const_new` (which seeds empty raw sets) for non-random
+    /// effects, fall through to MOST_GENERAL for `RandomEffects` so
+    /// the `assert *_descrs_* is None` arm at
+    /// `effectinfo.py:149-155` holds.
     fn residual_effect(extraeffect: majit_ir::descr::ExtraEffect) -> majit_ir::descr::EffectInfo {
-        majit_ir::descr::EffectInfo {
-            extraeffect,
-            ..crate::call_descr::default_effect_info()
+        if extraeffect == majit_ir::descr::ExtraEffect::RandomEffects {
+            majit_ir::descr::EffectInfo::MOST_GENERAL.clone()
+        } else {
+            majit_ir::descr::EffectInfo::const_new(extraeffect, majit_ir::descr::OopSpecIndex::None)
         }
     }
 

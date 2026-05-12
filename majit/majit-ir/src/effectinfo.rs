@@ -25,13 +25,172 @@ impl std::fmt::Display for UnsupportedFieldExc {
 
 impl std::error::Error for UnsupportedFieldExc {}
 
+/// `EffectInfo` with setup-time interior mutability for the bitstring
+/// fields.
+///
+/// PyPy `effectinfo.py:182-184` documents that `bitstring_*_descrs_*`
+/// fields are "initialized later, in compute_bitstrings()" — the EI
+/// object is constructed once with raw `_*_descrs_*` frozensets, then
+/// mutated by `effectinfo.compute_bitstrings(self.all_descrs)`
+/// (`pyjitpl.py:2287-2290`) to install the compacted bitstrings.
+/// Python's mutable object model makes the in-place setattr trivial;
+/// Rust requires explicit interior mutability for the same shape.
+///
+/// `EffectInfoCell` wraps the EI in `UnsafeCell` and exposes:
+/// - `get(&self) -> &EffectInfo` for the immutable-borrow read path
+///   used by every `cd.get_extra_info()` consumer (heap.rs / virtualize.rs
+///   / rewrite.rs / pure.rs / intbounds.rs / vstring.rs etc., 40+ sites).
+/// - `set_bitstrings(&self, …)` for the single setup-time writer
+///   (`MetaInterpStaticData::finish_setup_descrs`).
+///
+/// SAFETY contract (encoded via the `set_bitstrings` documentation,
+/// not enforced statically): exactly one writer at JIT-setup time,
+/// no concurrent reader-borrow in flight during the write. Pyre's
+/// JIT pipeline is single-threaded today; the `OnceLock`-like
+/// publish-once pattern at `pyre-jit-trace::state::finish_setup_if_needed`
+/// (gated on `was_done`) honours this contract structurally. Replacing
+/// the earlier raw `&EffectInfo as *const → *mut` cast with `UnsafeCell`
+/// keeps the same operational behaviour while making the contract
+/// explicit and respecting the Rust aliasing model — `UnsafeCell::get()`
+/// returns a `*mut T` whose mutation is permitted given a unique-
+/// access invariant on the caller, which is exactly what we have.
+#[derive(Debug)]
+pub struct EffectInfoCell {
+    cell: std::cell::UnsafeCell<EffectInfo>,
+}
+
+// SAFETY: pyre's JIT pipeline is single-threaded today; `EffectInfoCell`
+// is shared across threads only as part of `Arc<dyn Descr>` cache
+// entries that read `get()` after `finish_setup_descrs` has installed
+// the final bitstrings. The contract documented on `set_bitstrings`
+// requires the writer to have unique access at the moment of the call.
+unsafe impl Send for EffectInfoCell {}
+unsafe impl Sync for EffectInfoCell {}
+
+impl EffectInfoCell {
+    /// Wrap an `EffectInfo` for setup-time mutation.
+    pub fn new(ei: EffectInfo) -> Self {
+        Self {
+            cell: std::cell::UnsafeCell::new(ei),
+        }
+    }
+
+    /// Read-only borrow.  Used by every `CallDescr::get_extra_info()`
+    /// implementor.  SAFETY: shared `&EffectInfo` is sound as long as
+    /// no concurrent `set_bitstrings` is in flight; see type doc.
+    pub fn get(&self) -> &EffectInfo {
+        // SAFETY: the only mutation goes through `set_bitstrings`,
+        // which is documented as setup-time single-writer; readers
+        // observe the final value after the JIT-setup happens-before
+        // edge. Pyre is single-threaded today.
+        unsafe { &*self.cell.get() }
+    }
+
+    /// `effectinfo.py:537-538 setattr(ei, 'bitstring_*', ...)` —
+    /// install the compacted bitstrings produced by
+    /// `compute_bitstrings`.  Sole caller is
+    /// `MetaInterpStaticData::finish_setup_descrs`.
+    ///
+    /// SAFETY: see type doc. The argument signature mirrors
+    /// `Descr::set_effect_bitstrings`, mutating the six bitstring
+    /// fields and leaving every other EI field untouched.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_bitstrings(
+        &self,
+        readonly_descrs_fields: Option<Vec<u8>>,
+        write_descrs_fields: Option<Vec<u8>>,
+        readonly_descrs_arrays: Option<Vec<u8>>,
+        write_descrs_arrays: Option<Vec<u8>>,
+        readonly_descrs_interiorfields: Option<Vec<u8>>,
+        write_descrs_interiorfields: Option<Vec<u8>>,
+    ) {
+        // SAFETY: see type doc. Single-writer setup-time mutation.
+        unsafe {
+            let ei = &mut *self.cell.get();
+            ei.readonly_descrs_fields = readonly_descrs_fields;
+            ei.write_descrs_fields = write_descrs_fields;
+            ei.readonly_descrs_arrays = readonly_descrs_arrays;
+            ei.write_descrs_arrays = write_descrs_arrays;
+            ei.readonly_descrs_interiorfields = readonly_descrs_interiorfields;
+            ei.write_descrs_interiorfields = write_descrs_interiorfields;
+        }
+    }
+}
+
+impl Clone for EffectInfoCell {
+    fn clone(&self) -> Self {
+        // Cloning observes the current EI state; this is what
+        // existing test fixtures need.
+        Self::new(self.get().clone())
+    }
+}
+
 /// effectinfo.py:266-269: frozenset_or_none(x)
 ///
-/// `frozenset(x)` if `x is not None`, else `None`. Pyre uses bitsets in
-/// place of frozensets so this helper just unwraps `Option<Vec<T>>` into
-/// the equivalent. PRE-EXISTING-ADAPTATION (frozensets vs bitstrings).
-pub fn frozenset_or_none<T>(x: Option<Vec<T>>) -> Option<Vec<T>> {
-    x
+/// `frozenset(x)` if `x is not None`, else `None`. Pyre's lift of
+/// `frozenset[Descr]` is `Vec<DescrRef>` sorted+deduped by
+/// `Arc::as_ptr` (object identity, matching PyPy's
+/// `id(descr)`-keyed frozenset).  Every consumer
+/// (`PartialEq`, `Hash`, `EiCanonKey`, `EffectInfoKey`,
+/// `compute_bitstrings`) walks the raw set expecting this
+/// canonical Arc-pointer-sorted shape — without it, two
+/// structurally-identical sets would compare unequal.
+pub fn frozenset_or_none(x: Option<Vec<DescrRef>>) -> Option<Vec<DescrRef>> {
+    x.map(canonicalize_descr_set)
+}
+
+/// Sort by `Arc::as_ptr` thin pointer (data address only — vtable
+/// dropped via `*const () as usize`) and dedup adjacent duplicates.
+/// Matches PyPy's `frozenset(x)` identity semantic where two clones
+/// of the same `Arc` collapse to one entry, while two distinct Arcs
+/// (even of the same descr type) remain separate.
+pub fn canonicalize_descr_set(mut v: Vec<DescrRef>) -> Vec<DescrRef> {
+    v.sort_by_key(descr_ptr_id);
+    v.dedup_by(|a, b| std::sync::Arc::ptr_eq(a, b));
+    v
+}
+
+/// Project a `DescrRef` to a thin-pointer identity key — `Arc::as_ptr`
+/// returns a `*const dyn Descr` (wide pointer); we strip the vtable
+/// component via `*const () as usize` so the key is plain `usize`,
+/// suitable for `Hash`/`Ord`/`Eq`. Two clones of the same `Arc`
+/// share a data pointer; two distinct `Arc`s never do.
+#[inline]
+pub fn descr_ptr_id(d: &DescrRef) -> usize {
+    std::sync::Arc::as_ptr(d) as *const () as usize
+}
+
+/// Element-wise Arc-identity equality on a canonicalized
+/// `Option<Vec<DescrRef>>`. Both sides assumed already passed
+/// through `canonicalize_descr_set` — same Arc-ptr-sorted order,
+/// dedup'd. Falls back to length compare + `Arc::ptr_eq` per slot.
+fn descr_set_eq(a: &Option<Vec<DescrRef>>, b: &Option<Vec<DescrRef>>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(va), Some(vb)) => {
+            va.len() == vb.len()
+                && va
+                    .iter()
+                    .zip(vb.iter())
+                    .all(|(x, y)| std::sync::Arc::ptr_eq(x, y))
+        }
+        _ => false,
+    }
+}
+
+/// Hash a canonicalized `Option<Vec<DescrRef>>` by its element ptr ids.
+fn descr_set_hash<H: std::hash::Hasher>(s: &Option<Vec<DescrRef>>, state: &mut H) {
+    use std::hash::Hash;
+    match s {
+        None => 0u8.hash(state),
+        Some(v) => {
+            1u8.hash(state);
+            v.len().hash(state);
+            for d in v {
+                descr_ptr_id(d).hash(state);
+            }
+        }
+    }
 }
 
 /// effectinfo.py:380-390: consider_struct(TYPE, fieldname)
@@ -61,6 +220,42 @@ pub fn consider_array(_array_name: &str) -> bool {
 pub struct EffectInfo {
     pub extraeffect: ExtraEffect,
     pub oopspecindex: OopSpecIndex,
+    // ── effectinfo.py:128-145 raw descr sets ──
+    //
+    // PyPy stores `_readonly_descrs_fields: frozenset[Descr]` (and the
+    // five sibling sets) at `EffectInfo.__init__` time
+    // (`effectinfo.py:128-145 frozenset_or_none`). `compute_bitstrings`
+    // (`effectinfo.py:465-547`) later walks every EI, partitions the
+    // descrs into (eisetr, eisetw) equivalence classes per category by
+    // `id(descr)` (frozenset element identity), assigns
+    // `descr.ei_index = class_index`, and only then encodes the
+    // bitstring_* fields below.
+    //
+    // Pyre's lift carries `Vec<DescrRef>` (Arc identity) so the
+    // partition step honours PyPy's object-identity semantic — two
+    // distinct descrs with the same `descr.index()` (e.g. two structs'
+    // `index_in_parent = 0` fields at `call.rs:3849`) stay separate.
+    // Each Vec is sorted-deduped by `Arc::as_ptr` at construction
+    // (`canonicalize_descr_set`); `None` mirrors PyPy's
+    // `_readonly_descrs_fields = None` wildcard (random-effects EI).
+    /// effectinfo.py:128 `_readonly_descrs_fields = frozenset_or_none(readonly_descrs_fields)`.
+    #[serde(skip)]
+    pub _readonly_descrs_fields: Option<Vec<DescrRef>>,
+    /// effectinfo.py:131 `_write_descrs_fields`.
+    #[serde(skip)]
+    pub _write_descrs_fields: Option<Vec<DescrRef>>,
+    /// effectinfo.py:129 `_readonly_descrs_arrays`.
+    #[serde(skip)]
+    pub _readonly_descrs_arrays: Option<Vec<DescrRef>>,
+    /// effectinfo.py:132 `_write_descrs_arrays`.
+    #[serde(skip)]
+    pub _write_descrs_arrays: Option<Vec<DescrRef>>,
+    /// effectinfo.py:130 `_readonly_descrs_interiorfields`.
+    #[serde(skip)]
+    pub _readonly_descrs_interiorfields: Option<Vec<DescrRef>>,
+    /// effectinfo.py:133 `_write_descrs_interiorfields`.
+    #[serde(skip)]
+    pub _write_descrs_interiorfields: Option<Vec<DescrRef>>,
     /// effectinfo.py:185 bitstring_readonly_descrs_fields. `None` = wildcard
     /// (effectinfo.py:488-489 sets the bitstring to `None` for `EF_RANDOM_EFFECTS`).
     pub readonly_descrs_fields: Option<Vec<u8>>,
@@ -94,16 +289,35 @@ pub struct EffectInfo {
 
 /// Manual PartialEq: single_write_descr_array is excluded (like RPython's
 /// cache key which also excludes it — effectinfo.py:155-164).
+///
+/// PyPy `effectinfo.py:152-164` keys the EI cache on the raw frozensets
+/// (`(_readonly_descrs_fields, _write_descrs_fields, …)`); the bitstrings
+/// don't exist yet at construction time, so they must NOT be part of
+/// equality. We honour that here: identity is on `_*_descrs_*` (and
+/// extraeffect / oopspec / can_invalidate / can_collect / release_gil),
+/// not on the lazily-populated `bitstring_*` fields.
 impl PartialEq for EffectInfo {
     fn eq(&self, other: &Self) -> bool {
         self.extraeffect == other.extraeffect
             && self.oopspecindex == other.oopspecindex
-            && self.readonly_descrs_fields == other.readonly_descrs_fields
-            && self.write_descrs_fields == other.write_descrs_fields
-            && self.readonly_descrs_arrays == other.readonly_descrs_arrays
-            && self.write_descrs_arrays == other.write_descrs_arrays
-            && self.readonly_descrs_interiorfields == other.readonly_descrs_interiorfields
-            && self.write_descrs_interiorfields == other.write_descrs_interiorfields
+            && descr_set_eq(
+                &self._readonly_descrs_fields,
+                &other._readonly_descrs_fields,
+            )
+            && descr_set_eq(&self._write_descrs_fields, &other._write_descrs_fields)
+            && descr_set_eq(
+                &self._readonly_descrs_arrays,
+                &other._readonly_descrs_arrays,
+            )
+            && descr_set_eq(&self._write_descrs_arrays, &other._write_descrs_arrays)
+            && descr_set_eq(
+                &self._readonly_descrs_interiorfields,
+                &other._readonly_descrs_interiorfields,
+            )
+            && descr_set_eq(
+                &self._write_descrs_interiorfields,
+                &other._write_descrs_interiorfields,
+            )
             && self.can_invalidate == other.can_invalidate
             && self.can_collect == other.can_collect
             && self.call_release_gil_target == other.call_release_gil_target
@@ -114,17 +328,19 @@ impl Eq for EffectInfo {}
 
 /// Manual Hash matching the PartialEq subset (skips
 /// `single_write_descr_array` and `extradescrs` for the same reason
-/// `effectinfo.py:155-164` excludes them from the cache key).
+/// `effectinfo.py:155-164` excludes them from the cache key). Raw
+/// descr sets are hashed by element `Arc::as_ptr` ids (Arc-identity
+/// lift of PyPy's `id(descr)` frozenset hash).
 impl std::hash::Hash for EffectInfo {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.extraeffect.hash(state);
         self.oopspecindex.hash(state);
-        self.readonly_descrs_fields.hash(state);
-        self.write_descrs_fields.hash(state);
-        self.readonly_descrs_arrays.hash(state);
-        self.write_descrs_arrays.hash(state);
-        self.readonly_descrs_interiorfields.hash(state);
-        self.write_descrs_interiorfields.hash(state);
+        descr_set_hash(&self._readonly_descrs_fields, state);
+        descr_set_hash(&self._write_descrs_fields, state);
+        descr_set_hash(&self._readonly_descrs_arrays, state);
+        descr_set_hash(&self._write_descrs_arrays, state);
+        descr_set_hash(&self._readonly_descrs_interiorfields, state);
+        descr_set_hash(&self._write_descrs_interiorfields, state);
         self.can_invalidate.hash(state);
         self.can_collect.hash(state);
         self.call_release_gil_target.hash(state);
@@ -136,6 +352,14 @@ impl Default for EffectInfo {
         EffectInfo {
             extraeffect: ExtraEffect::CanRaise,
             oopspecindex: OopSpecIndex::None,
+            // effectinfo.py:128-145 frozenset_or_none: empty frozenset for
+            // a non-random-effects EI with no field/array touches yet.
+            _readonly_descrs_fields: Some(Vec::new()),
+            _write_descrs_fields: Some(Vec::new()),
+            _readonly_descrs_arrays: Some(Vec::new()),
+            _write_descrs_arrays: Some(Vec::new()),
+            _readonly_descrs_interiorfields: Some(Vec::new()),
+            _write_descrs_interiorfields: Some(Vec::new()),
             // effectinfo.py:175-181: empty frozenset for elidable, but `__new__`
             // requires a non-None value for non-RandomEffects EIs. Empty Vec
             // is the bitstring equivalent (no descrs touched).
@@ -325,6 +549,12 @@ impl EffectInfo {
         EffectInfo {
             extraeffect,
             oopspecindex,
+            _readonly_descrs_fields: Some(Vec::new()),
+            _write_descrs_fields: Some(Vec::new()),
+            _readonly_descrs_arrays: Some(Vec::new()),
+            _write_descrs_arrays: Some(Vec::new()),
+            _readonly_descrs_interiorfields: Some(Vec::new()),
+            _write_descrs_interiorfields: Some(Vec::new()),
             readonly_descrs_fields: Some(Vec::new()),
             write_descrs_fields: Some(Vec::new()),
             readonly_descrs_arrays: Some(Vec::new()),
@@ -380,6 +610,12 @@ impl EffectInfo {
     pub const MOST_GENERAL: EffectInfo = EffectInfo {
         extraeffect: ExtraEffect::RandomEffects,
         oopspecindex: OopSpecIndex::None,
+        _readonly_descrs_fields: None,
+        _write_descrs_fields: None,
+        _readonly_descrs_arrays: None,
+        _write_descrs_arrays: None,
+        _readonly_descrs_interiorfields: None,
+        _write_descrs_interiorfields: None,
         readonly_descrs_fields: None,
         write_descrs_fields: None,
         readonly_descrs_arrays: None,
@@ -603,5 +839,878 @@ impl CallInfoCollection {
     /// RPython: `see_raw_object(func.ptr)` derives name from `func.ptr._obj._name`.
     pub fn func_name(&self, addr: u64) -> Option<&str> {
         self.func_names.get(&addr).map(String::as_str)
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// effectinfo.py:465-547 `compute_bitstrings(all_descrs)`.
+// ════════════════════════════════════════════════════════════════════════
+
+/// Per-category `(descr_index → ei_index)` map produced by
+/// `compute_bitstrings`.
+///
+/// PRE-EXISTING-ADAPTATION: PyPy stores `descr.ei_index` directly on
+/// the descriptor object (`effectinfo.py:526`); pyre lacks a central
+/// descriptor enumeration (no upstream `cpu.setup_descrs()` analogue —
+/// `SimpleFieldDescr` / `SimpleArrayDescr` / `SimpleInteriorFieldDescr`
+/// are minted on demand by `pyre-jit-trace::descr` and the `jit_struct`
+/// macro without a registry). Publishing the map externally lets every
+/// consumer that holds the descr's `index()` value resolve its
+/// `ei_index` without enumeration.
+///
+/// Three categories mirror upstream's `for key in
+/// {'fields','arrays','interiorfields'}` loop (`effectinfo.py:498`).
+/// Pyre's `descr.index()` collides across categories (each LLType pool
+/// allocates from its own counter) so the maps are partitioned per
+/// category to avoid clobber.
+#[derive(Debug, Clone, Default)]
+pub struct EiIndexTable {
+    /// `effectinfo.py:498` `for key='fields'`.
+    pub fields: std::collections::HashMap<u32, u32>,
+    /// `effectinfo.py:498` `for key='arrays'`.
+    pub arrays: std::collections::HashMap<u32, u32>,
+    /// `effectinfo.py:498` `for key='interiorfields'`.
+    pub interiorfields: std::collections::HashMap<u32, u32>,
+}
+
+impl EiIndexTable {
+    /// Look up `descr.ei_index` for a field descr by `descr.index()`.
+    /// Returns `None` if the descr did not appear in any EI's raw
+    /// readonly/write set (matching PyPy's `descr.ei_index = sys.maxint`
+    /// sentinel — `effectinfo.py:496` — except pyre returns `None`
+    /// because the descr never participated).
+    pub fn lookup_field(&self, descr_index: u32) -> Option<u32> {
+        self.fields.get(&descr_index).copied()
+    }
+
+    /// Look up `descr.ei_index` for an array descr by `descr.index()`.
+    pub fn lookup_array(&self, descr_index: u32) -> Option<u32> {
+        self.arrays.get(&descr_index).copied()
+    }
+
+    /// Look up `descr.ei_index` for an interiorfield descr by `descr.index()`.
+    pub fn lookup_interiorfield(&self, descr_index: u32) -> Option<u32> {
+        self.interiorfields.get(&descr_index).copied()
+    }
+}
+
+/// Process-global publication slot for the active `EiIndexTable`.
+///
+/// `MetaInterpStaticData::finish_setup_descrs` writes here exactly
+/// once at JIT startup (`pyjitpl.py:2287-2290 finish_setup_descrs`);
+/// readers (`heap.rs::field_effect_index` and the array reader)
+/// query this slot to translate `descr.index()` to the `ei_index`
+/// position used inside the EI bitstrings.
+///
+/// PyPy `effectinfo.py:182-190` documents the same single-shot
+/// invariant in the dual form: bitstring fields are seeded with an
+/// `Ellipsis` sentinel at EI construction time, then overwritten
+/// inside `compute_bitstrings`; any EI created after compute_bitstrings
+/// keeps the sentinel and crashes on the next `bitcheck`. The intent
+/// is to prevent silent staleness when a new EI's raw set would have
+/// shifted the (eisetr, eisetw) class assignment of existing descrs.
+///
+/// Pyre's mirror: `OnceLock` lets the first `compute_bitstrings` win
+/// the table publication. `publish_ei_index_table` (below) panics
+/// loudly on a second publication whose population differs from the
+/// first — surfacing the same architectural violation PyPy guards
+/// against.
+pub static EI_INDEX_TABLE: std::sync::OnceLock<EiIndexTable> = std::sync::OnceLock::new();
+
+/// `effectinfo.py:182-184` "no new EffectInfo after compute_bitstrings"
+/// invariant — flipped to `true` on the first
+/// `MetaInterpStaticData::finish_setup_descrs` call.  Late call-descr
+/// minters consult this through
+/// [`compute_bitstrings_has_run()`] and refuse to introduce a new
+/// `EffectInfo` whose raw `_*_descrs_*` sets are non-trivial (any of
+/// the six `Some(non-empty Vec<u32>)`); a non-trivial raw set after
+/// the bitstring compaction would shift the (eisetr, eisetw) class
+/// partition without re-running `compute_bitstrings`, leaving every
+/// existing EI's bitstring stale.
+///
+/// PyPy's analog is the `Ellipsis` sentinel at
+/// `effectinfo.py:185-190` plus the implicit lifecycle ordering
+/// (codewriter mints all EIs before `compute_bitstrings`).  Pyre's
+/// architecture allows trace-time mints, so the invariant is enforced
+/// at the construction site instead of via post-hoc bitcheck failure.
+static COMPUTE_BITSTRINGS_RAN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Read accessor used by `make_call_descr_with_effect` to gate
+/// post-setup mints.  Returns `true` iff
+/// `MetaInterpStaticData::finish_setup_descrs` has executed.
+pub fn compute_bitstrings_has_run() -> bool {
+    COMPUTE_BITSTRINGS_RAN.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Setter — invoked by `finish_setup_descrs` after `compute_bitstrings`
+/// returns.  Idempotent; subsequent calls keep the flag set.
+pub fn mark_compute_bitstrings_ran() {
+    COMPUTE_BITSTRINGS_RAN.store(true, std::sync::atomic::Ordering::Release);
+}
+
+impl EffectInfo {
+    /// `effectinfo.py:149-162` invariant probe.  An EI carries a
+    /// non-trivial raw descr set iff at least one of the six
+    /// `_*_descrs_*` slots is `Some(non-empty)`.  Trivial shapes
+    /// (`None` ⇒ random-effects, `Some(empty)` ⇒ analyzer-confirmed
+    /// no-heap) leave every existing EI's bitstring valid because
+    /// `compute_bitstrings` would map an empty raw set to an empty
+    /// bitstring without disturbing other EIs' (eisetr, eisetw)
+    /// classes.
+    pub fn has_non_trivial_raw_set(&self) -> bool {
+        let any_non_empty = |s: &Option<Vec<DescrRef>>| s.as_ref().is_some_and(|v| !v.is_empty());
+        any_non_empty(&self._readonly_descrs_fields)
+            || any_non_empty(&self._write_descrs_fields)
+            || any_non_empty(&self._readonly_descrs_arrays)
+            || any_non_empty(&self._write_descrs_arrays)
+            || any_non_empty(&self._readonly_descrs_interiorfields)
+            || any_non_empty(&self._write_descrs_interiorfields)
+    }
+}
+
+/// Single-shot publisher with deterministic-equivalence assertion.
+///
+/// First call stores `new_table` and returns it. Subsequent calls
+/// must produce the same table (compute_bitstrings is deterministic
+/// for a given EI population). If they don't, panic — pyre's JIT
+/// pipeline minted new descrs/EIs after `compute_bitstrings` ran,
+/// shifting the (eisetr, eisetw) classification and invalidating
+/// every bitstring already keyed by old `ei_index` values. PyPy
+/// catches the same class of bug at `effectinfo.py:182-190` via the
+/// `Ellipsis` sentinel + `bitcheck` panic; pyre catches it earlier
+/// here so the architectural invariant ("all call descrs minted
+/// before `finish_setup_descrs` runs") is enforced at the point of
+/// violation rather than at the next bitcheck.
+///
+/// Returns a clone of the now-active table for the caller to inspect.
+pub fn publish_ei_index_table(new_table: EiIndexTable) -> EiIndexTable {
+    if let Err(_already_published) = EI_INDEX_TABLE.set(new_table.clone()) {
+        let existing = EI_INDEX_TABLE
+            .get()
+            .expect("EI_INDEX_TABLE Set succeeded above");
+        if existing.fields != new_table.fields
+            || existing.arrays != new_table.arrays
+            || existing.interiorfields != new_table.interiorfields
+        {
+            panic!(
+                "publish_ei_index_table: second publication differs from first — \
+                 a new call descr / EffectInfo was minted after compute_bitstrings \
+                 ran, shifting the (eisetr, eisetw) class partition. PyPy \
+                 effectinfo.py:182-190 forbids the same shape via the Ellipsis \
+                 sentinel + bitcheck panic. Fix: ensure all call descrs are \
+                 minted before MetaInterpStaticData::finish_setup_descrs runs.\n\
+                 existing: {existing:?}\n  new: {new_table:?}"
+            );
+        }
+        return existing.clone();
+    }
+    new_table
+}
+
+/// `effectinfo.py:147-148 EffectInfo._cache` parity key.
+///
+/// PyPy keys `EffectInfo._cache` (the EI factory cache) on the tuple
+/// `(readonly_descrs_fields, readonly_descrs_arrays,
+///   readonly_descrs_interiorfields, write_descrs_fields,
+///   write_descrs_arrays, write_descrs_interiorfields, extraeffect,
+///   oopspecindex, can_invalidate, can_collect)` plus an `object()`
+/// breaker for `call_release_gil_target != 0` (line 144-146).
+/// `effectinfo.py:511-512 frozenset(eisetr)` then collapses the
+/// per-descr (eisetr, eisetw) lists by `id(ei)`, which is identical
+/// to the cache key in PyPy's runtime because the cache hit returns
+/// the same EI instance.
+///
+/// Pyre lacks a process-global `EffectInfo._cache` today, so we
+/// reconstruct the key here for `compute_bitstrings`'s internal
+/// canonicalisation. Two structurally-equal `EffectInfo` values
+/// produce equal `EiCanonKey`s; `compute_bitstrings` then merges
+/// them into one canonical id, matching PyPy's post-frozenset class
+/// identity. Release-gil targets get a unique counter (mirroring
+/// PyPy's `object()` sentinel) so they remain distinct even when
+/// the rest of the EI matches.
+/// `effectinfo.py:144-146` release-gil cache-breaker.
+///
+/// PyPy: `if tgt_func: key += (object(),)` — every release-gil EI
+/// gets a fresh `object()` so its `_cache` key is unique, making
+/// each release-gil EI its own object identity even when
+/// `(tgt_func, tgt_saveerr)` happens to match a previously-cached
+/// instance. This shows up downstream in `effectinfo.py:511-512
+/// frozenset(eisetr)` where `id(ei)` distinguishes release-gil EIs.
+///
+/// Pyre's lift: `NoTarget` for non-release-gil EIs (structural dedup
+/// applies); `Unique(u64)` from a process-monotonic counter for
+/// release-gil EIs (each `from_effect_info` call gets a fresh id,
+/// matching PyPy's `object()` semantic — same release-gil EI cloned
+/// twice still produces two distinct canonical keys, so
+/// `compute_bitstrings`' canonical-id dedup never collapses
+/// release-gil EIs across distinct mint sites).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ReleaseGilCacheKey {
+    NoTarget,
+    Unique(u64),
+}
+
+static NEXT_RELEASE_GIL_KEY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// `effectinfo.py:147-148` `EffectInfo._cache` post-frozenset key
+/// canonicalization for compute_bitstrings's per-EI dedup pass.
+///
+/// Each raw set is projected to its sorted `Vec<usize>` of
+/// `Arc::as_ptr` thin-pointer ids — the Rust lift of PyPy's
+/// `frozenset[id(descr)]`.  Two structurally-identical EIs (same
+/// extraeffect/oopspec/release_gil + same set of descr Arcs) hash
+/// equal; two EIs whose raw sets differ in any descr Arc identity
+/// hash unequal.  Conversion via `descr_set_to_ptr_set` deepens
+/// `canonicalize_descr_set` (already sorted/dedup) by stripping the
+/// vtable so the key is plain `Vec<usize>`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct EiCanonKey {
+    extraeffect: ExtraEffect,
+    oopspecindex: OopSpecIndex,
+    readonly_descrs_fields: Option<Vec<usize>>,
+    write_descrs_fields: Option<Vec<usize>>,
+    readonly_descrs_arrays: Option<Vec<usize>>,
+    write_descrs_arrays: Option<Vec<usize>>,
+    readonly_descrs_interiorfields: Option<Vec<usize>>,
+    write_descrs_interiorfields: Option<Vec<usize>>,
+    can_invalidate: bool,
+    can_collect: bool,
+    /// `effectinfo.py:144-146` release-gil target breaker. PyPy
+    /// inserts a fresh `object()` per release-gil EI; pyre's lift
+    /// matches via [`ReleaseGilCacheKey::Unique`] from a process-
+    /// monotonic counter.
+    call_release_gil: ReleaseGilCacheKey,
+}
+
+/// Project an Arc-identity raw set to a thin-pointer ptr-id Vec.
+/// Caller's `Vec<DescrRef>` is assumed already canonicalised
+/// (sorted by `Arc::as_ptr`, dedup'd) — the resulting `Vec<usize>`
+/// inherits that ordering.
+fn descr_set_to_ptr_set(s: &Option<Vec<DescrRef>>) -> Option<Vec<usize>> {
+    s.as_ref()
+        .map(|v| v.iter().map(descr_ptr_id).collect::<Vec<_>>())
+}
+
+/// Public re-export of [`descr_set_to_ptr_set`] for cross-module
+/// use — `LLType::func_key` builds its cache-key ptr-id Vecs by
+/// projecting the EI raw sets through this helper.
+pub fn descr_set_to_ptr_set_pub(s: &Option<Vec<DescrRef>>) -> Option<Vec<usize>> {
+    descr_set_to_ptr_set(s)
+}
+
+impl EiCanonKey {
+    fn from_effect_info(ei: &EffectInfo) -> Self {
+        let call_release_gil = if ei.call_release_gil_target.0 != 0 {
+            ReleaseGilCacheKey::Unique(
+                NEXT_RELEASE_GIL_KEY.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            )
+        } else {
+            ReleaseGilCacheKey::NoTarget
+        };
+        Self {
+            extraeffect: ei.extraeffect,
+            oopspecindex: ei.oopspecindex,
+            readonly_descrs_fields: descr_set_to_ptr_set(&ei._readonly_descrs_fields),
+            write_descrs_fields: descr_set_to_ptr_set(&ei._write_descrs_fields),
+            readonly_descrs_arrays: descr_set_to_ptr_set(&ei._readonly_descrs_arrays),
+            write_descrs_arrays: descr_set_to_ptr_set(&ei._write_descrs_arrays),
+            readonly_descrs_interiorfields: descr_set_to_ptr_set(
+                &ei._readonly_descrs_interiorfields,
+            ),
+            write_descrs_interiorfields: descr_set_to_ptr_set(&ei._write_descrs_interiorfields),
+            can_invalidate: ei.can_invalidate,
+            can_collect: ei.can_collect,
+            call_release_gil,
+        }
+    }
+}
+
+/// `effectinfo.py:465-547` `compute_bitstrings`.
+///
+/// Walks every `EffectInfo` once: for the three categories
+/// (`fields`/`arrays`/`interiorfields`), partitions the descrs that
+/// appear in some EI's `_readonly_descrs_*` / `_write_descrs_*` set
+/// into (eisetr, eisetw) equivalence classes — descrs whose membership
+/// pattern across all EIs is identical share an `ei_index`. The
+/// bitstrings on each EI are then encoded with the descr-side
+/// `descr.get_ei_index()` rather than the global descr index, which is
+/// what makes upstream's "4000+ descrs → 373 ei classes" compaction
+/// possible.
+///
+/// Inputs:
+/// - `all_descrs`: every descriptor that participates in any EI's
+///   readonly/write set (typically: every field/array/interiorfield
+///   descr the codewriter has minted by this point). Descrs not in any
+///   EI keep their `ei_index = u32::MAX` sentinel; PyPy
+///   `effectinfo.py:496` writes the same `descr.ei_index = sys.maxint`
+///   default for the no-EI branch.
+/// - `all_eis`: the full set of EI handles to compact. EIs whose
+///   `_readonly_descrs_fields` is `None` (random-effects /
+///   `MOST_GENERAL`) follow PyPy's `effectinfo.py:485-489` rule:
+///   their bitstring fields are also forced to `None`, the call site
+///   is expected to gate via `has_random_effects()`.
+///
+/// Effect: writes to `descr.set_ei_index(...)` (interior atomic) for
+/// descrs reachable through `all_descrs` AND rewrites every
+/// `EffectInfo.bitstring_*` field. Idempotent — calling it twice on
+/// the same input is a no-op.
+///
+/// **Returns** the `(descr.index() → ei_index)` map per category.
+/// Pyre publishes this externally because the `Descr::set_ei_index`
+/// path only fires for descrs the caller has already enumerated into
+/// `all_descrs`; descrs that participate in EI raw sets but were minted
+/// outside any registry need the map for `descr.index() → ei_index`
+/// translation. See `EiIndexTable` doc.
+pub fn compute_bitstrings(
+    all_descrs: &[DescrRef],
+    all_eis: &mut [&mut EffectInfo],
+) -> EiIndexTable {
+    use std::collections::HashMap;
+
+    // effectinfo.py:484-489: random-effects EIs zero out bitstrings.
+    // The matching invariant — when `_readonly_descrs_fields` is None,
+    // every sibling raw set is None too — is asserted line-for-line.
+    //
+    // Same loop also enforces the *frozenset-or-none* canonical form
+    // (sorted-by-`Arc::as_ptr` + dedup'd by `Arc::ptr_eq`) on every
+    // non-None raw set.  Caller sites usually pre-canonicalise via
+    // `canonicalize_descr_set`, but routing every set through here
+    // is the self-enforcing equivalent of `effectinfo.py:128-145`'s
+    // `frozenset_or_none(...)` invariant — once `compute_bitstrings`
+    // returns, the `_*_descrs_*` Vecs match PyPy's frozenset semantic.
+    fn canonicalize(set: &mut Option<Vec<DescrRef>>) {
+        if let Some(v) = set.take() {
+            *set = Some(canonicalize_descr_set(v));
+        }
+    }
+    for ei in all_eis.iter_mut() {
+        if ei._readonly_descrs_fields.is_none() {
+            assert!(ei._write_descrs_fields.is_none());
+            assert!(ei._readonly_descrs_arrays.is_none());
+            assert!(ei._write_descrs_arrays.is_none());
+            assert!(ei._readonly_descrs_interiorfields.is_none());
+            assert!(ei._write_descrs_interiorfields.is_none());
+            ei.readonly_descrs_fields = None;
+            ei.write_descrs_fields = None;
+            ei.readonly_descrs_arrays = None;
+            ei.write_descrs_arrays = None;
+            ei.readonly_descrs_interiorfields = None;
+            ei.write_descrs_interiorfields = None;
+        } else {
+            canonicalize(&mut ei._readonly_descrs_fields);
+            canonicalize(&mut ei._write_descrs_fields);
+            canonicalize(&mut ei._readonly_descrs_arrays);
+            canonicalize(&mut ei._write_descrs_arrays);
+            canonicalize(&mut ei._readonly_descrs_interiorfields);
+            canonicalize(&mut ei._write_descrs_interiorfields);
+        }
+    }
+
+    // Per-category descr-Arc enumeration.
+    //
+    // PyPy `effectinfo.py:493-495`:
+    // ```python
+    // descrs = {'fields': set(), 'arrays': set(),
+    //           'interiorfields': set()}
+    // for ei in all_eis:
+    //     descrs['fields'].update(ei._readonly_descrs_fields)
+    //     ...
+    // ```
+    // Python's `set.update` keys on `id(descr)`, so the partition is
+    // intrinsically collision-free by object identity.
+    //
+    // Pyre's lift carries `Vec<DescrRef>` so the partition is keyed
+    // on `Arc::as_ptr` ptr-id (`descr_ptr_id`) — direct lift of
+    // Python's `id()`. Two distinct Arcs (even if they happen to
+    // share a `descr.index()`) stay separate; two clones of the
+    // same Arc collapse to one entry.
+    //
+    // We also keep an `all_descrs`-derived ptr-id → `&DescrRef` map
+    // for two reasons:
+    //   1. The per-category descrs that participate in any EI raw
+    //      set must have their `ei_index` written — when raw set
+    //      Arc has not been enumerated through `all_descrs`, the
+    //      direct walk through raw sets below covers it (the Arcs
+    //      live IN the raw set).
+    //   2. Descrs in `all_descrs` that do NOT appear in any EI raw
+    //      set must keep their `ei_index = u32::MAX` sentinel
+    //      (PyPy `effectinfo.py:496` `descr.ei_index = sys.maxint`).
+    //      The map below identifies category membership for these
+    //      so the `EiIndexTable.fields/arrays/interiorfields` can
+    //      stay populated for legacy heap.rs readers that key by
+    //      `descr.index()`.
+    let mut all_descrs_by_category: [HashMap<usize, &DescrRef>; 3] =
+        [HashMap::new(), HashMap::new(), HashMap::new()];
+    for d in all_descrs {
+        if d.as_field_descr().is_some() {
+            all_descrs_by_category[0].insert(descr_ptr_id(d), d);
+        }
+        if d.as_array_descr().is_some() {
+            all_descrs_by_category[1].insert(descr_ptr_id(d), d);
+        }
+        if d.as_interior_field_descr().is_some() {
+            all_descrs_by_category[2].insert(descr_ptr_id(d), d);
+        }
+    }
+
+    // `effectinfo.py:147-148` `EffectInfo._cache` parity — PyPy keys
+    // the EffectInfo factory cache on the structural tuple (raw sets,
+    // extraeffect, oopspecindex, can_invalidate, can_collect,
+    // call_release_gil_target) and returns the same EI instance for
+    // structurally-identical requests. `effectinfo.py:511-512
+    // frozenset(eisetr)` then collapses by identity (id(ei)). Pyre
+    // lacks the EI._cache today (each `EffectInfoCell` is per-call-
+    // descr), so structurally-identical EIs land at distinct
+    // positions in `all_eis`. Canonicalise here: assign each position
+    // a `canonical_id` based on first-occurrence of its structural
+    // shape; identical shapes share the canonical id, matching PyPy's
+    // post-frozenset (eisetr, eisetw) class identity.
+    let mut canonical_id_for_position: Vec<usize> = Vec::with_capacity(all_eis.len());
+    let mut first_position_for_shape: HashMap<EiCanonKey, usize> = HashMap::new();
+    for ei in all_eis.iter() {
+        let key = EiCanonKey::from_effect_info(ei);
+        let canon = *first_position_for_shape
+            .entry(key)
+            .or_insert(canonical_id_for_position.len());
+        canonical_id_for_position.push(canon);
+    }
+
+    let mut output_table = EiIndexTable::default();
+    // Three category iterations match `for key in descrs:` at
+    // `effectinfo.py:498-540`. Each category is independent: a descr
+    // is partitioned within its category, so the same `descr.ei_index`
+    // bank is shared across categories — `descr.ei_index` is unique
+    // per category (a fielddescr never appears in `arrays` etc.).
+    for category in 0..3usize {
+        // Gather every descr Arc that appears in any active EI for
+        // this category (`effectinfo.py:493-494`
+        // `descrs[key].update(...)`). `category_descrs` is keyed by
+        // ptr-id (Arc identity) and stores `DescrRef` clones so the
+        // downstream `set_ei_index` fan-out has the actual Arc.
+        let mut category_descrs: HashMap<usize, DescrRef> = HashMap::new();
+        for ei in all_eis.iter() {
+            let (r, w) = pick_category(ei, category);
+            if let Some(rs) = r {
+                for d in rs {
+                    category_descrs
+                        .entry(descr_ptr_id(d))
+                        .or_insert_with(|| d.clone());
+                }
+            }
+            if let Some(ws) = w {
+                for d in ws {
+                    category_descrs
+                        .entry(descr_ptr_id(d))
+                        .or_insert_with(|| d.clone());
+                }
+            }
+        }
+
+        // For each descr in the category, compute (eisetr, eisetw) —
+        // PyPy `effectinfo.py:505-512` builds these as Python lists
+        // then collapses via `frozenset()` on `id(ei)`. Pyre's lift
+        // pushes `canonical_id_for_position[ei_i]` (instead of the raw
+        // position) and `dedup`s per descr to mirror the frozenset
+        // collapse. The popularity-sort count
+        // (`size_of_both_sets = len(r) + len(w)`,
+        // `effectinfo.py:519-520`) thus weights each logical EI once
+        // per descr, regardless of how many call descrs share its
+        // structural shape.
+        //
+        // Membership probe is `Arc::as_ptr` ptr-id binary_search.
+        // The raw sets are pre-canonicalised by ptr-id at the
+        // `canonicalize_descr_set` step above so binary_search by
+        // ptr-id is exact.
+        let mut all_sets: Vec<(usize, DescrRef, Vec<usize>, Vec<usize>)> =
+            Vec::with_capacity(category_descrs.len());
+        // Fix iteration order — sort by ptr-id so the popularity-sort
+        // tie-break below is deterministic across runs.
+        let mut sorted_descrs: Vec<(usize, DescrRef)> = category_descrs.into_iter().collect();
+        sorted_descrs.sort_by_key(|(pid, _)| *pid);
+        for (pid, descr) in sorted_descrs {
+            let mut eisetr: Vec<usize> = Vec::new();
+            let mut eisetw: Vec<usize> = Vec::new();
+            for (ei_i, ei) in all_eis.iter().enumerate() {
+                let canon = canonical_id_for_position[ei_i];
+                let (r, w) = pick_category(ei, category);
+                if let Some(rs) = r {
+                    if rs.binary_search_by_key(&pid, descr_ptr_id).is_ok() {
+                        eisetr.push(canon);
+                    }
+                }
+                if let Some(ws) = w {
+                    if ws.binary_search_by_key(&pid, descr_ptr_id).is_ok() {
+                        eisetw.push(canon);
+                    }
+                }
+            }
+            // `frozenset(eisetr)` semantic: dedup canonical IDs (sort
+            // stays trivial for `Vec<usize>` Hash/Eq downstream).
+            eisetr.sort_unstable();
+            eisetr.dedup();
+            eisetw.sort_unstable();
+            eisetw.dedup();
+            all_sets.push((pid, descr, eisetr, eisetw));
+        }
+
+        // `effectinfo.py:519-521`: heuristic — sort by len(eisetr) +
+        // len(eisetw) descending so the most popular descrs claim the
+        // low ei_index slots, reducing total bitstring length. Tie-
+        // break on ptr-id ascending for determinism.
+        all_sets.sort_by(|a, b| {
+            (b.2.len() + b.3.len())
+                .cmp(&(a.2.len() + a.3.len()))
+                .then(a.0.cmp(&b.0))
+        });
+
+        // `effectinfo.py:523-526`: assign ei_index per (eisetr, eisetw)
+        // class. `mapping.setdefault((eisetr, eisetw), len(mapping))`
+        // gives each new class the next sequential index.
+        let mut mapping: HashMap<(Vec<usize>, Vec<usize>), u32> = HashMap::new();
+        let mut descr_to_eiindex_by_ptr: HashMap<usize, (DescrRef, u32)> = HashMap::new();
+        for (pid, descr, eisetr, eisetw) in all_sets {
+            let next = mapping.len() as u32;
+            let ei_index = *mapping.entry((eisetr, eisetw)).or_insert(next);
+            descr_to_eiindex_by_ptr.insert(pid, (descr, ei_index));
+        }
+
+        // Write `descr.ei_index = class_idx` (`effectinfo.py:526`).
+        // The Arc is guaranteed to be the actual descr from the raw
+        // set, so two distinct Arcs that share `descr.index()` each
+        // get their own `set_ei_index` call.
+        for (_pid, (descr, ei_index)) in &descr_to_eiindex_by_ptr {
+            descr.set_ei_index(*ei_index);
+        }
+
+        // PRE-EXISTING-ADAPTATION: `descr.index() → ei_index` side
+        // table for legacy `heap.rs` readers that still query by
+        // `descr.index()` (Task #306 — migrate `heap.rs` readers to
+        // canonical `descr.get_ei_index()`).
+        //
+        // **Divergence from PyPy**: `effectinfo.py:504-526` keys
+        // `compute_bitstrings` purely on descriptor **object identity**
+        // (Python `id(descr)` via dict containment + `descr.ei_index =
+        // bitstring_idx` write).  This side table keys on `descr.index()`,
+        // a u32 id minted by `descr_registry::register_*`. The mapping
+        // is correct **only** when each `descr.index()` value points
+        // to at most one Arc — i.e. the analyzer-time Arc and the
+        // runtime-time Arc that share a `(struct, fieldname)` happen
+        // to land on the same `descr.index()` bucket.  Task #316
+        // (`cc.fielddescrof` ↔ `gc_cache.get_field_descr` cache-or-mint
+        // convergence) is the structural fix; until it lands, two
+        // distinct Arcs with collidng `descr.index()` collapse to
+        // "first wins" here.  The `or_insert` is the audible signal
+        // of the collision.
+        //
+        // **Convergence path**: when Task #316 unifies the analyzer
+        // and runtime descr identity, drop this side table entirely —
+        // `descr.get_ei_index()` alone suffices, and the canonical
+        // reader path at `heap.rs::field_effect_index` already prefers
+        // it (the table is only consulted on the fallback branch).
+        let mut descr_to_eiindex_by_idx: HashMap<u32, u32> = HashMap::new();
+        for (_pid, (descr, ei_index)) in &descr_to_eiindex_by_ptr {
+            descr_to_eiindex_by_idx
+                .entry(descr.index())
+                .or_insert(*ei_index);
+        }
+        // Also cover descrs from `all_descrs` that did NOT appear in
+        // any EI raw set — they keep `ei_index = u32::MAX` (PyPy
+        // `effectinfo.py:496`) but should still be reachable via the
+        // EiIndexTable (heap.rs treats `u32::MAX` as no-bitstring).
+        // Currently this is implicit: descrs not in
+        // `descr_to_eiindex_by_ptr` simply don't get an entry, and
+        // heap.rs falls back to `descr.index()` legacy lookup which
+        // returns `None`.
+        let _ = &all_descrs_by_category[category]; // explicit usage marker
+
+        // Stash the resolved map onto the returned `EiIndexTable` for
+        // out-of-band callers (e.g. `heap.rs::field_effect_index`).
+        match category {
+            0 => output_table.fields = descr_to_eiindex_by_idx,
+            1 => output_table.arrays = descr_to_eiindex_by_idx,
+            2 => output_table.interiorfields = descr_to_eiindex_by_idx,
+            _ => unreachable!(),
+        }
+
+        // `effectinfo.py:528-538`: encode the bitstring on each active
+        // EI using `descr.get_ei_index()` per descr in the raw set.
+        // Inactive (random-effects) EIs were already zeroed above.
+        for ei in all_eis.iter_mut() {
+            let (r_raw, w_raw) = pick_category(ei, category);
+            // Skip inactive EIs.
+            if r_raw.is_none() {
+                continue;
+            }
+            let r = r_raw.unwrap();
+            let w = w_raw.unwrap();
+            let r_indices: Vec<u32> = r
+                .iter()
+                .map(|d| {
+                    descr_to_eiindex_by_ptr
+                        .get(&descr_ptr_id(d))
+                        .map(|(_, ei_index)| *ei_index)
+                        .expect("compute_bitstrings: descr in EI raw set must be in the partition")
+                })
+                .collect();
+            let w_indices: Vec<u32> = w
+                .iter()
+                .map(|d| {
+                    descr_to_eiindex_by_ptr
+                        .get(&descr_ptr_id(d))
+                        .map(|(_, ei_index)| *ei_index)
+                        .expect("compute_bitstrings: descr in EI raw set must be in the partition")
+                })
+                .collect();
+            // `effectinfo.py:533-534 assert sys.maxint not in bitstrr` —
+            // every descr in an active EI's set must have been assigned
+            // a finite `ei_index` above (we panic with `expect` if not).
+            let r_bs = crate::bitstring::make_bitstring(&r_indices);
+            let w_bs = crate::bitstring::make_bitstring(&w_indices);
+            store_category_bitstrings(ei, category, Some(r_bs), Some(w_bs));
+        }
+    }
+    output_table
+}
+
+/// Helper: project `(_readonly_descrs_*, _write_descrs_*)` for a category.
+fn pick_category(
+    ei: &EffectInfo,
+    category: usize,
+) -> (Option<&Vec<DescrRef>>, Option<&Vec<DescrRef>>) {
+    match category {
+        0 => (
+            ei._readonly_descrs_fields.as_ref(),
+            ei._write_descrs_fields.as_ref(),
+        ),
+        1 => (
+            ei._readonly_descrs_arrays.as_ref(),
+            ei._write_descrs_arrays.as_ref(),
+        ),
+        2 => (
+            ei._readonly_descrs_interiorfields.as_ref(),
+            ei._write_descrs_interiorfields.as_ref(),
+        ),
+        _ => unreachable!("compute_bitstrings: invalid category"),
+    }
+}
+
+/// Helper: install `(bitstring_readonly_*, bitstring_write_*)` for a
+/// category. Mirrors `setattr(ei, 'bitstring_readonly_descrs_' + key, …)`
+/// at `effectinfo.py:537-538`.
+fn store_category_bitstrings(
+    ei: &mut EffectInfo,
+    category: usize,
+    r: Option<Vec<u8>>,
+    w: Option<Vec<u8>>,
+) {
+    match category {
+        0 => {
+            ei.readonly_descrs_fields = r;
+            ei.write_descrs_fields = w;
+        }
+        1 => {
+            ei.readonly_descrs_arrays = r;
+            ei.write_descrs_arrays = w;
+        }
+        2 => {
+            ei.readonly_descrs_interiorfields = r;
+            ei.write_descrs_interiorfields = w;
+        }
+        _ => unreachable!("compute_bitstrings: invalid category"),
+    }
+}
+
+#[cfg(test)]
+mod compute_bitstrings_tests {
+    use super::*;
+    use crate::descr::{DescrRef, SimpleArrayDescr, SimpleFieldDescr};
+    use crate::value::Type;
+    use std::sync::Arc;
+
+    fn mk_field(idx: u32) -> DescrRef {
+        Arc::new(SimpleFieldDescr::new(idx, 0, 8, Type::Int, false)) as DescrRef
+    }
+    fn mk_array(idx: u32) -> DescrRef {
+        Arc::new(SimpleArrayDescr::new(idx, 0, 8, 0, Type::Int)) as DescrRef
+    }
+
+    /// Two EIs share a fielddescr in their write set; the descr's
+    /// `ei_index` should be the same after compute_bitstrings, and
+    /// each EI's `bitstring_write_descrs_fields` should set bit
+    /// `descr.get_ei_index()`.
+    #[test]
+    fn shared_descr_collapses_to_one_class() {
+        let f0 = mk_field(0);
+        let f1 = mk_field(1);
+        let mut ei_a = EffectInfo {
+            _write_descrs_fields: Some(vec![f0.clone(), f1.clone()]),
+            _readonly_descrs_fields: Some(Vec::new()),
+            _readonly_descrs_arrays: Some(Vec::new()),
+            _write_descrs_arrays: Some(Vec::new()),
+            _readonly_descrs_interiorfields: Some(Vec::new()),
+            _write_descrs_interiorfields: Some(Vec::new()),
+            ..Default::default()
+        };
+        let mut ei_b = EffectInfo {
+            _write_descrs_fields: Some(vec![f0.clone(), f1.clone()]),
+            _readonly_descrs_fields: Some(Vec::new()),
+            _readonly_descrs_arrays: Some(Vec::new()),
+            _write_descrs_arrays: Some(Vec::new()),
+            _readonly_descrs_interiorfields: Some(Vec::new()),
+            _write_descrs_interiorfields: Some(Vec::new()),
+            ..Default::default()
+        };
+        let descrs = vec![f0.clone(), f1.clone()];
+        let mut eis: Vec<&mut EffectInfo> = vec![&mut ei_a, &mut ei_b];
+        compute_bitstrings(&descrs, &mut eis);
+
+        // Both descrs appear in identical EIs (eisetr=∅, eisetw={A,B}),
+        // so both go in the same class → same ei_index.
+        assert_eq!(f0.get_ei_index(), f1.get_ei_index());
+        assert_ne!(f0.get_ei_index(), u32::MAX);
+
+        // Both EIs encode the same descr → bitstring with the bit at
+        // `descr.get_ei_index()` set.
+        let bs = ei_a.write_descrs_fields.as_ref().unwrap();
+        assert!(crate::bitstring::bitcheck(bs, f0.get_ei_index()));
+        assert!(crate::bitstring::bitcheck(bs, f1.get_ei_index()));
+    }
+
+    /// Two descrs with different (eisetr, eisetw) get different
+    /// `ei_index`. Only one EI reads `f0`; both write `f1`.
+    #[test]
+    fn divergent_membership_yields_distinct_classes() {
+        let f0 = mk_field(0);
+        let f1 = mk_field(1);
+        let mut ei_a = EffectInfo {
+            _readonly_descrs_fields: Some(vec![f0.clone()]),
+            _write_descrs_fields: Some(vec![f1.clone()]),
+            _readonly_descrs_arrays: Some(Vec::new()),
+            _write_descrs_arrays: Some(Vec::new()),
+            _readonly_descrs_interiorfields: Some(Vec::new()),
+            _write_descrs_interiorfields: Some(Vec::new()),
+            ..Default::default()
+        };
+        let mut ei_b = EffectInfo {
+            _readonly_descrs_fields: Some(Vec::new()),
+            _write_descrs_fields: Some(vec![f1.clone()]),
+            _readonly_descrs_arrays: Some(Vec::new()),
+            _write_descrs_arrays: Some(Vec::new()),
+            _readonly_descrs_interiorfields: Some(Vec::new()),
+            _write_descrs_interiorfields: Some(Vec::new()),
+            ..Default::default()
+        };
+        let descrs = vec![f0.clone(), f1.clone()];
+        let mut eis: Vec<&mut EffectInfo> = vec![&mut ei_a, &mut ei_b];
+        compute_bitstrings(&descrs, &mut eis);
+        assert_ne!(f0.get_ei_index(), f1.get_ei_index());
+    }
+
+    /// `MOST_GENERAL`-style EI with `_readonly_descrs_* = None` keeps
+    /// bitstrings None and asserts `effectinfo.py:485-487`.
+    #[test]
+    fn random_effects_zeros_bitstrings() {
+        let f0 = mk_field(0);
+        let mut ei_random = EffectInfo {
+            _readonly_descrs_fields: None,
+            _write_descrs_fields: None,
+            _readonly_descrs_arrays: None,
+            _write_descrs_arrays: None,
+            _readonly_descrs_interiorfields: None,
+            _write_descrs_interiorfields: None,
+            extraeffect: ExtraEffect::RandomEffects,
+            // Pre-existing bitstring should be wiped.
+            readonly_descrs_fields: Some(vec![0xff]),
+            write_descrs_fields: Some(vec![0xff]),
+            readonly_descrs_arrays: Some(vec![0xff]),
+            write_descrs_arrays: Some(vec![0xff]),
+            readonly_descrs_interiorfields: Some(vec![0xff]),
+            write_descrs_interiorfields: Some(vec![0xff]),
+            ..Default::default()
+        };
+        let descrs = vec![f0.clone()];
+        let mut eis: Vec<&mut EffectInfo> = vec![&mut ei_random];
+        compute_bitstrings(&descrs, &mut eis);
+        assert!(ei_random.readonly_descrs_fields.is_none());
+        assert!(ei_random.write_descrs_fields.is_none());
+        assert!(ei_random.readonly_descrs_arrays.is_none());
+        assert!(ei_random.write_descrs_arrays.is_none());
+        assert!(ei_random.readonly_descrs_interiorfields.is_none());
+        assert!(ei_random.write_descrs_interiorfields.is_none());
+        // Untouched descr keeps the sentinel.
+        assert_eq!(f0.get_ei_index(), u32::MAX);
+    }
+
+    /// Field and array descrs with the same global `index()` get
+    /// independent `ei_index`es because the partitioning is per-category.
+    #[test]
+    fn category_partitions_are_independent() {
+        let f0 = mk_field(0);
+        let a0 = mk_array(0);
+        let mut ei = EffectInfo {
+            _readonly_descrs_fields: Some(vec![f0.clone()]),
+            _write_descrs_fields: Some(Vec::new()),
+            _readonly_descrs_arrays: Some(vec![a0.clone()]),
+            _write_descrs_arrays: Some(Vec::new()),
+            _readonly_descrs_interiorfields: Some(Vec::new()),
+            _write_descrs_interiorfields: Some(Vec::new()),
+            ..Default::default()
+        };
+        // Both descrs have global index 0 but live in different
+        // partitions; both should get ei_index = 0 in their own
+        // partition (the class assignment starts fresh per category).
+        let descrs = vec![f0.clone(), a0.clone()];
+        let mut eis: Vec<&mut EffectInfo> = vec![&mut ei];
+        compute_bitstrings(&descrs, &mut eis);
+        // Now that compute_bitstrings keys partitions by Arc identity,
+        // the field and the array both get assigned ei_index in their
+        // own categories — each should be != u32::MAX.
+        assert_ne!(f0.get_ei_index(), u32::MAX);
+        assert_ne!(a0.get_ei_index(), u32::MAX);
+    }
+
+    /// Two distinct field descrs that happen to share the same
+    /// `descr.index()` (e.g. two structs' `index_in_parent = 0`
+    /// fields per `call.rs:3849`) MUST get distinct `ei_index`
+    /// values when their (eisetr, eisetw) shape diverges.  PyPy
+    /// `effectinfo.py:493-526` guarantees this by `id(descr)`
+    /// (object identity) keyed `frozenset`/`set` — the Arc-identity
+    /// lift in pyre matches the same semantic.  Earlier versions
+    /// keyed the partition on `descr.index()`, silently collapsing
+    /// these two distinct descrs into one ei_index.  This test
+    /// pins the parity invariant.
+    #[test]
+    fn distinct_arcs_share_index_get_distinct_ei_indices() {
+        let f_a = mk_field(99);
+        let f_b = mk_field(99);
+        // Two different EIs reference different Arcs even though
+        // both Arcs report `descr.index() == 99`.
+        let mut ei_reads_a = EffectInfo {
+            _readonly_descrs_fields: Some(vec![f_a.clone()]),
+            _write_descrs_fields: Some(Vec::new()),
+            _readonly_descrs_arrays: Some(Vec::new()),
+            _write_descrs_arrays: Some(Vec::new()),
+            _readonly_descrs_interiorfields: Some(Vec::new()),
+            _write_descrs_interiorfields: Some(Vec::new()),
+            ..Default::default()
+        };
+        let mut ei_writes_b = EffectInfo {
+            _readonly_descrs_fields: Some(Vec::new()),
+            _write_descrs_fields: Some(vec![f_b.clone()]),
+            _readonly_descrs_arrays: Some(Vec::new()),
+            _write_descrs_arrays: Some(Vec::new()),
+            _readonly_descrs_interiorfields: Some(Vec::new()),
+            _write_descrs_interiorfields: Some(Vec::new()),
+            ..Default::default()
+        };
+        let descrs = vec![f_a.clone(), f_b.clone()];
+        let mut eis: Vec<&mut EffectInfo> = vec![&mut ei_reads_a, &mut ei_writes_b];
+        compute_bitstrings(&descrs, &mut eis);
+        assert_ne!(f_a.get_ei_index(), u32::MAX);
+        assert_ne!(f_b.get_ei_index(), u32::MAX);
+        // f_a appears only in eisetr, f_b only in eisetw → distinct
+        // (eisetr, eisetw) class → distinct ei_index.
+        assert_ne!(f_a.get_ei_index(), f_b.get_ei_index());
     }
 }

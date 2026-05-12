@@ -197,9 +197,20 @@ impl MetaInterpStaticData {
     /// pyjitpl.py:2255-2264 `finish_setup`: wire the assembler's opcode table
     /// into this staticdata object and snapshot the current `all_liveness`.
     fn finish_setup_if_needed(&mut self, insns: &HashMap<String, u8>, all_liveness: Vec<u8>) {
+        let was_done = self.finish_setup_done;
         self.setup_insns(insns);
         self.liveness_info = std::sync::Arc::<[u8]>::from(all_liveness.into_boxed_slice());
         self.finish_setup_done = true;
+        // pyjitpl.py:2287-2290 `finish_setup_descrs`: PyPy invokes this
+        // immediately after `finish_setup(codewriter)` from
+        // `warmspot.py:289`. Pyre's `ensure_finish_setup` is the lazy
+        // first-trace gate, so the descr bitstring compaction runs
+        // exactly once on the very first JIT entry — `OnceLock` inside
+        // `effectinfo::publish_ei_index_table` keeps subsequent calls
+        // idempotent.
+        if !was_done {
+            self.canonical.finish_setup_descrs();
+        }
     }
 
     /// pyjitpl.py:2264 `self.liveness_info = "".join(asm.all_liveness)` —

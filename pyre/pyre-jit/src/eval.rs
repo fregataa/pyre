@@ -3644,7 +3644,10 @@ fn allocate_struct(typedescr: &dyn majit_ir::SizeDescr) -> usize {
     let size = typedescr.size();
     let descr = majit_translate::jitcode::BhDescr::Size {
         size,
-        type_id: typedescr.type_id(),
+        // PRE-EXISTING-ADAPTATION: BhDescr.type_id is the u64 cache key;
+        // `typedescr.type_id()` returns the u32 gc tid.  Widen via
+        // `as u64` until `SizeDescr` exposes a `cache_key()` accessor.
+        type_id: typedescr.type_id() as u64,
         vtable: 0,
         owner: String::new(),
         all_fielddescrs: majit_translate::jitcode::bh_field_specs_from_size_descr(typedescr),
@@ -3724,7 +3727,8 @@ fn allocate_with_vtable(descr: &dyn majit_ir::SizeDescr) -> usize {
     let vtable = descr.vtable();
     let bh_descr = majit_translate::jitcode::BhDescr::Size {
         size,
-        type_id: descr.type_id(),
+        // PRE-EXISTING-ADAPTATION: u32 gc tid widened to u64 cache key slot.
+        type_id: descr.type_id() as u64,
         vtable,
         owner: String::new(),
         all_fielddescrs: majit_translate::jitcode::bh_field_specs_from_size_descr(descr),
@@ -5675,7 +5679,8 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
             .expect("allocate_struct: not a SizeDescr");
         let bh_descr = majit_translate::jitcode::BhDescr::Size {
             size: sd.size(),
-            type_id: sd.type_id(),
+            // PRE-EXISTING-ADAPTATION: u32 gc tid widened to u64 cache key slot.
+            type_id: sd.type_id() as u64,
             vtable: 0,
             owner: String::new(),
             all_fielddescrs: majit_translate::jitcode::bh_field_specs_from_size_descr(sd),
@@ -5722,7 +5727,8 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
             _ => {
                 let bh_descr = majit_translate::jitcode::BhDescr::Size {
                     size: descr_size,
-                    type_id: descr_index,
+                    // PRE-EXISTING-ADAPTATION: u32 gc tid widened to u64 cache key slot.
+                    type_id: descr_index as u64,
                     vtable,
                     owner: String::new(),
                     all_fielddescrs: majit_translate::jitcode::bh_field_specs_from_size_descr(sd),

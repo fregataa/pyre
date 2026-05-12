@@ -3351,17 +3351,22 @@ mod tests {
     fn test_default_pipeline_lazy_setfield_flushed_before_residual_call_descr() {
         // heap.py:540-560 `force_from_effectinfo`: a residual CALL
         // whose descr lacks per-call write analysis must still flush
-        // any lazy_set on the cached fields it could touch. This is
-        // the descrful counterpart of the test above — earlier the
-        // production `MetaCallDescr` defaulted to `EF_CANNOT_RAISE`
-        // with empty bitsets, so `force_from_effectinfo` saw "no
-        // tracked field read or written" and skipped the flush. With
-        // `default_effect_info()` flipped to `EF_CAN_RAISE` + all-ones
-        // bitsets the per-cached-field flush runs and `setfield_gc`
-        // survives in front of the call.
+        // any lazy_set on the cached fields it could touch. PyPy
+        // `effectinfo.py:285 effectinfo_from_writeanalyze` force-promotes
+        // analyzer-absent EIs to `EF_RANDOM_EFFECTS` (`MOST_GENERAL`,
+        // `effectinfo.py:271-273`). `dispatch_emit:2631/2766
+        // call_has_random_effects` then routes through `clean_caches`,
+        // so the per-cached-field flush runs and `setfield_gc` survives
+        // in front of the call. The test threads `MOST_GENERAL` directly
+        // to exercise the analyzer-absent path orthogonally to the
+        // production `default_effect_info()` shape.
         let sd = size_descr(2);
         let fd = field_descr(11);
-        let call_descr = crate::call_descr::make_call_descr(&[Type::Ref], Type::Ref);
+        let call_descr = crate::call_descr::make_call_descr_with_effect(
+            &[Type::Ref],
+            Type::Ref,
+            majit_ir::EffectInfo::MOST_GENERAL,
+        );
 
         let mut ops = vec![
             Op::with_descr(OpCode::NewWithVtable, &[], sd),

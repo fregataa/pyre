@@ -1116,6 +1116,23 @@ pub struct JitCellToken {
     /// use the accessors (not `.get()` / `.set()` directly) to keep
     /// the bit-packing invariant.
     pub retraced_count: Cell<u32>,
+    /// `history.py:433` `JitCellToken.target_tokens = None` (lazily
+    /// populated to a `list[TargetToken]` in `compile.py:286-296` /
+    /// `:312-323` once the loop is compiled).  `pyjitpl.py:3898`
+    /// `has_compiled_targets(token)` reads this list — `bool(token)
+    /// and bool(token.target_tokens)`.
+    ///
+    /// Pyre stores the descr-side projection of TargetToken
+    /// (`LoopTargetDescr` Arc; `TargetToken IS-A AbstractDescr` in
+    /// PyPy, so a `DescrRef` is the matching identity).  Each
+    /// successful loop / retrace populates this through
+    /// `record_target_token` so `has_compiled_loop` reads the same
+    /// signal PyPy's `has_compiled_targets` does.  The metainterp-side
+    /// `TargetToken` value (with `virtual_state` / `short_preamble`)
+    /// stays on the `CompiledEntry::front_target_tokens` list per
+    /// the F.6 retirement plan — the per-target descr identity is the
+    /// part PyPy parity care about for `has_compiled_targets`.
+    pub target_tokens: parking_lot::Mutex<Vec<majit_ir::DescrRef>>,
 }
 
 impl JitCellToken {
@@ -1165,6 +1182,10 @@ impl JitCellToken {
             generation: Cell::new(0),
             // history.py:435 `retraced_count = 0` (class attribute default).
             retraced_count: Cell::new(0),
+            // history.py:433 `target_tokens = None` — pyre uses the
+            // empty-Vec equivalent so `has_target_tokens` is one
+            // `is_empty()` check away.
+            target_tokens: parking_lot::Mutex::new(Vec::new()),
         }
     }
 
@@ -1245,6 +1266,27 @@ impl JitCellToken {
     /// Get a clone of the invalidated flag (for registering with QuasiImmut).
     pub fn invalidation_flag(&self) -> Arc<AtomicBool> {
         self.invalidated.clone()
+    }
+
+    /// `pyjitpl.py:3898` `has_compiled_targets(token)` —
+    /// `bool(token) and bool(token.target_tokens)`.  PyPy reads
+    /// `token.target_tokens` (a `list[TargetToken]` populated at
+    /// `compile.py:286-296`) and treats a non-empty list as the signal
+    /// that the loop has been compiled.
+    #[inline]
+    pub fn has_target_tokens(&self) -> bool {
+        !self.target_tokens.lock().is_empty()
+    }
+
+    /// `compile.py:286-296` / `:312-323` — append a freshly minted
+    /// TargetToken's descr to `token.target_tokens`.  Idempotent on
+    /// `Arc::ptr_eq` so retrace paths that reuse `prior_front_target_tokens`
+    /// across `compile_loop` and `compile_retrace` do not duplicate.
+    pub fn record_target_token(&self, descr: majit_ir::DescrRef) {
+        let mut guard = self.target_tokens.lock();
+        if !guard.iter().any(|existing| Arc::ptr_eq(existing, &descr)) {
+            guard.push(descr);
+        }
     }
 }
 

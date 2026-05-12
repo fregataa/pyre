@@ -1988,21 +1988,75 @@ fn simple_field_spec_from_bh(
     }
 }
 
+/// `descr.py:108-118 get_size_descr` cache parity.
+///
+/// PyPy `gc_cache._cache_size[STRUCT]` keys on the **STRUCT object
+/// identity**, not on its layout — two distinct RPython STRUCTs that
+/// share `(size, vtable, fieldlist)` get distinct `SizeDescr` Arcs.
+/// Pyre's analogue of "STRUCT identity" is `BhSizeSpec.type_id`
+/// (`jit_struct.rs:__majit_type_id` → `path_hash(module_path::TypeName)`):
+/// every struct type has a unique `type_id`, and two RPython STRUCTs
+/// with coincidentally-identical layout end up with distinct
+/// `type_id`s.  Keying the cache on `type_id` alone matches PyPy's
+/// per-type identity, where structural-equality keying (the prior
+/// `BhSizeSpec`-by-value variant) would have collapsed identity for
+/// layout-coincident-but-logically-distinct structs.
+///
+/// `spec.type_id == 0` is the legacy fallback path
+/// (`assembler.rs:2244 bh_size_spec_from_callcontrol` stamps zero
+/// when the analyzer-time callcontrol has no host-type carrier).
+/// Without a STRUCT-identity carrier we MUST NOT key the cache by
+/// the zero sentinel — different STRUCTs with `type_id == 0` would
+/// alias onto the first one inserted (`or_insert` "first wins"),
+/// silently mixing their field tables.  PyPy's `_cache_size[STRUCT]`
+/// never aliases distinct STRUCTs; absent a real identity carrier,
+/// the closest orthodox behaviour is "each call is a distinct
+/// STRUCT" — mint fresh per call.
+static SIMPLE_DESCR_GROUP_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<u64, majit_ir::descr::SimpleDescrGroup>>,
+> = std::sync::OnceLock::new();
+
 fn simple_descr_group_from_bh_size(
     spec: &majit_translate::jitcode::BhSizeSpec,
 ) -> majit_ir::descr::SimpleDescrGroup {
-    let field_specs: Vec<_> = spec
-        .all_fielddescrs
-        .iter()
-        .map(simple_field_spec_from_bh)
-        .collect();
-    majit_ir::descr::make_simple_descr_group(
-        u32::MAX,
-        spec.size,
-        spec.type_id,
-        spec.vtable,
-        &field_specs,
-    )
+    let mint = || -> majit_ir::descr::SimpleDescrGroup {
+        let field_specs: Vec<_> = spec
+            .all_fielddescrs
+            .iter()
+            .map(simple_field_spec_from_bh)
+            .collect();
+        majit_ir::descr::make_simple_descr_group(
+            u32::MAX,
+            spec.size,
+            // PRE-EXISTING-ADAPTATION: `make_simple_descr_group` takes
+            // the u32 gc tid; `spec.type_id` is the u64 cache key.
+            // Truncate `as u32` until gc_cache routing allocates the
+            // proper gc tid here.
+            spec.type_id as u32,
+            spec.vtable,
+            &field_specs,
+        )
+    };
+
+    if spec.type_id == 0 {
+        // No STRUCT-identity carrier — mint fresh per call so distinct
+        // type_id-less STRUCTs don't collapse onto the first-inserted
+        // descr group.  Per-STRUCT caching kicks in only when callers
+        // route through a real `type_id` source.
+        return mint();
+    }
+
+    let cache = SIMPLE_DESCR_GROUP_CACHE
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    {
+        let cache = cache.lock().unwrap();
+        if let Some(group) = cache.get(&spec.type_id) {
+            return group.clone();
+        }
+    }
+    let group = mint();
+    let mut cache = cache.lock().unwrap();
+    cache.entry(spec.type_id).or_insert(group).clone()
 }
 
 #[derive(Debug)]
@@ -2032,6 +2086,16 @@ impl Descr for ParentBackedFieldDescr {
     }
     fn as_field_descr(&self) -> Option<&dyn FieldDescr> {
         Some(self)
+    }
+    /// `effectinfo.py:526` `descr.ei_index = …` parity — delegate to
+    /// the inner `SimpleFieldDescr`'s atomic so `compute_bitstrings`'s
+    /// `set_ei_index` write reaches the same storage that
+    /// `heap.rs::field_effect_index` reads through any cloned wrapper.
+    fn get_ei_index(&self) -> u32 {
+        self.field.get_ei_index()
+    }
+    fn set_ei_index(&self, index: u32) {
+        self.field.set_ei_index(index);
     }
 }
 
@@ -2099,7 +2163,11 @@ fn field_descr_from_bh_field(
         field.name.clone(),
     )
     .with_quasi_immutable(field.is_quasi_immutable);
-    Arc::new(descr)
+    let arc: DescrRef = Arc::new(descr);
+    // descr.py:225-235 `get_field_descr` cache-miss path — register the
+    // freshly-minted field descr so `compute_bitstrings` enumerates it.
+    majit_ir::descr_registry::register_field(arc.clone());
+    arc
 }
 
 pub fn make_struct_array_descr_full(
@@ -2130,6 +2198,8 @@ pub fn make_struct_array_descr_full(
     );
     raw_array_descr.lendescr = maybe_array_lendescr_at_offset(len_offset);
     let array_descr = Arc::new(raw_array_descr);
+    // descr.py:354-364 `get_array_descr` cache-miss path.
+    majit_ir::descr_registry::register_array(array_descr.clone() as DescrRef);
     if interior_fields.is_empty() {
         return array_descr;
     }
@@ -2153,7 +2223,10 @@ pub fn make_struct_array_descr_full(
                 field_descr.clone(),
                 owner_group.size_descr.clone(),
             );
-            descrs.push(Arc::new(ifd) as DescrRef);
+            let arc: DescrRef = Arc::new(ifd);
+            // descr.py:404-414 `get_interiorfield_descr` cache-miss path.
+            majit_ir::descr_registry::register_interior_field(arc.clone());
+            descrs.push(arc);
         }
     }
 
@@ -2408,7 +2481,10 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
                     *base_size,
                     *itemsize,
                     *len_offset,
-                    *type_id,
+                    // PRE-EXISTING-ADAPTATION: `make_struct_array_descr_full`
+                    // takes the u32 gc tid; `*type_id` is the u64 cache key.
+                    // Truncate `as u32` until gc_cache routing.
+                    *type_id as u32,
                     *item_type,
                     interior_fields,
                 )
@@ -2423,7 +2499,8 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
                 make_array_descr_with_full_id(
                     *base_size,
                     *itemsize,
-                    *type_id,
+                    // PRE-EXISTING-ADAPTATION: same u32 gc tid truncation.
+                    *type_id as u32,
                     *len_offset,
                     *item_type,
                     *is_item_signed,
@@ -2463,7 +2540,10 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
             // dispatch) carries an empty list and falls through to the
             // bare ctor, which is the existing test-helper shape.
             if all_fielddescrs.is_empty() {
-                make_size_descr_with_type_and_vtable(*size, *type_id, *vtable)
+                // PRE-EXISTING-ADAPTATION: `make_size_descr_with_type_and_vtable`
+                // takes the u32 gc tid; `*type_id` is the u64 cache key.
+                // Truncate `as u32` until gc_cache routing.
+                make_size_descr_with_type_and_vtable(*size, *type_id as u32, *vtable)
             } else {
                 let spec = majit_translate::jitcode::BhSizeSpec {
                     size: *size,
@@ -2565,6 +2645,7 @@ pub fn make_interior_field_descr(
         Type::Void,
         ArrayFlag::Struct,
     ));
+    majit_ir::descr_registry::register_array(array_descr.clone() as DescrRef);
     let field_descr = Arc::new(SimpleFieldDescr::new(
         field_descr_index,
         field_offset,
@@ -2572,9 +2653,12 @@ pub fn make_interior_field_descr(
         tp,
         true, // immutable (struct fields in array-of-struct)
     ));
-    Arc::new(SimpleInteriorFieldDescr::new(
+    majit_ir::descr_registry::register_field(field_descr.clone() as DescrRef);
+    let interior: DescrRef = Arc::new(SimpleInteriorFieldDescr::new(
         field_descr_index,
         array_descr,
         field_descr,
-    ))
+    ));
+    majit_ir::descr_registry::register_interior_field(interior.clone());
+    interior
 }

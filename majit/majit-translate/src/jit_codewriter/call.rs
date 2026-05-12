@@ -92,6 +92,28 @@ pub struct WriteAnalysis {
     pub write_arrays: Vec<u32>,
     pub read_interiorfields: Vec<u32>,
     pub write_interiorfields: Vec<u32>,
+    /// `effectinfo.py:294,301-305` `readonly_descrs_fields = []`
+    /// populated via `add_struct → cpu.fielddescrof(T, fieldname)` from
+    /// `("readstruct", T, fieldname)` tuples.
+    pub field_read_descrs: Vec<majit_ir::descr::DescrRef>,
+    /// `effectinfo.py:297,301-305` `write_descrs_fields = []` from
+    /// `("struct", T, fieldname)` tuples.
+    pub field_write_descrs: Vec<majit_ir::descr::DescrRef>,
+    /// `effectinfo.py:296,313-325` `readonly_descrs_interiorfields = []`
+    /// populated via `add_interiorfield → cpu.interiorfielddescrof(T,
+    /// fieldname)` from `("readinteriorfield", T, fieldname)` tuples.
+    pub interior_read_descrs: Vec<majit_ir::descr::DescrRef>,
+    /// `effectinfo.py:299,313-325` `write_descrs_interiorfields = []`
+    /// from `("interiorfield", T, fieldname)` tuples.
+    pub interior_write_descrs: Vec<majit_ir::descr::DescrRef>,
+    /// `effectinfo.py:295,307-311` `readonly_descrs_arrays = []` populated
+    /// via `add_array → cpu.arraydescrof(ARRAY)` from `("readarray", T)`
+    /// tuples (plus `("readinteriorfield", T, _)` tuples synthesised into
+    /// `("readarray", T)` at `effectinfo.py:327-340`).
+    pub array_read_descrs: Vec<majit_ir::descr::DescrRef>,
+    /// `effectinfo.py:298,307-311` `write_descrs_arrays = []` mirror of
+    /// the read side, populated from `("array", T)` tuples (plus
+    /// `("interiorfield", T, _)` synthesised into `("array", T)`).
     pub array_write_descrs: Vec<majit_ir::descr::DescrRef>,
     /// RPython: `effects is top_set` — unanalyzable (random effects).
     pub is_top: bool,
@@ -1058,8 +1080,27 @@ impl CallControl {
             None => 0,
             Some(off) => off + self.array_header_size,
         };
+        // `descr.py:348-378 get_array_descr(gccache, ARRAY_OR_STRUCT)`:
+        // PyPy keys `cache[ARRAY_OR_STRUCT]` on the ARRAY lltype's
+        // object identity.  Pyre's analogue is the codewriter
+        // `array_type_id` Rust type spelling (`"Vec<Foo>"`, `"GcArray<i64>"`,
+        // `"[Point; 4]"`, …) — two distinct ARRAYs disagree on this
+        // string, so it is the right surrogate for ARRAY identity.
+        // Hash it down to fit the u32 `SimpleArrayDescr.type_id` slot
+        // (the GC tid PyPy `init_array_descr` allocates).
+        //
+        // PRE-EXISTING-ADAPTATION: this is a u64→u32 truncation of the
+        // path_hash that loses identity around 2^16 distinct ARRAYs
+        // (birthday paradox); the structural fix is to route through
+        // `gc_cache.get_array_descr(LLType::Array(u64), ...)` and use
+        // the sequential u32 tid `gc_cache.init_array_descr` allocates
+        // (slice 3).  Until then, `path_hash(array_type_id) as u32`
+        // restores per-ARRAY distinction that the prior `0` literal
+        // collapsed — distinct ARRAYs get distinct tids whereas before
+        // every CallControl-minted array shared `tid = 0`.
+        let array_tid = majit_ir::descr::path_hash(array_type_id.as_deref().unwrap_or("")) as u32;
         let mut ad = majit_ir::descr::SimpleArrayDescr::with_flag(
-            idx, base_size, item_size, 0, ir_type, flag,
+            idx, base_size, item_size, array_tid, ir_type, flag,
         );
         // descr.py:359-362 — `nolength=True` arrays carry no length
         // FieldDescr (`lendescr = None`); length-prefixed arrays carry a
@@ -1106,6 +1147,135 @@ impl CallControl {
         let ad_arc = std::sync::Arc::new(ad);
         publish_ei(ad_arc.as_ref());
         ad_arc
+    }
+
+    /// RPython: `cpu.fielddescrof(STRUCT, fieldname)` — descr.py:215-247.
+    ///
+    /// Mints a `SimpleFieldDescr` from the analyzer-time struct layout
+    /// knowledge cached in `self.struct_fields`. The offset is the sum
+    /// of preceding field sizes (registration order), the field size +
+    /// element type come from `get_type_flag(field_type_str)` (same
+    /// mechanism `arraydescrof` uses for primitive item sizing).
+    ///
+    /// PRE-EXISTING-ADAPTATION: the resulting Arc does not share
+    /// identity with the runtime descr that `gc_cache.get_field_descr(
+    /// LLType::Struct(type_id), name, ...)` returns at runtime. PyPy's
+    /// `cpu.fielddescrof` is cached by `(STRUCT, fieldname)` identity
+    /// so analyzer and runtime both reach the same `FieldDescr` Arc.
+    /// Pyre's `__majit_type_id()` is now path-stable
+    /// (`path_hash(concat!(module_path!(), "::", stringify!(Struct)))`,
+    /// `majit-macros/src/jit_struct.rs:92`), so the runtime side
+    /// hashes the struct's *definition* module path; the analyzer's
+    /// `field.owner_root` is qualified with `ctx.module_prefix` (the
+    /// *use-site* module path, `front/ast.rs:255-261 qualify_type_name`).
+    /// When use-site and definition module coincide (most pyre code is
+    /// single-crate), the two routes converge naturally; cross-module
+    /// references still need Task #316's full module-path resolver to
+    /// reach the canonical definition path before hashing.  Until then
+    /// the analyzer-time Arc gets its own `descr.set_ei_index()` in
+    /// `compute_bitstrings`; the `EI_INDEX_TABLE.fields` side-table
+    /// absorbs the descr.index mismatch as a structural-completeness
+    /// placeholder.
+    ///
+    /// `None` when the struct is not registered in `self.struct_fields`
+    /// (unanalyzable callee — caller silently skips the raw-set push).
+    pub fn fielddescrof(
+        &self,
+        idx: u32,
+        owner_root: &str,
+        field_name: &str,
+    ) -> Option<majit_ir::descr::DescrRef> {
+        Some(self.fielddescrof_concrete(idx, owner_root, field_name)?)
+    }
+
+    /// Concrete-typed sibling of [`Self::fielddescrof`] returning
+    /// `Arc<SimpleFieldDescr>` rather than the trait-erased
+    /// `DescrRef`. Used by [`Self::interiorfielddescrof`] which needs
+    /// the concrete field-descr type for
+    /// `SimpleInteriorFieldDescr::new`.
+    fn fielddescrof_concrete(
+        &self,
+        idx: u32,
+        owner_root: &str,
+        field_name: &str,
+    ) -> Option<std::sync::Arc<majit_ir::descr::SimpleFieldDescr>> {
+        use majit_ir::descr::SimpleFieldDescr;
+        let fields = self.struct_fields.fields.get(owner_root)?;
+        let mut offset: usize = 0;
+        for (fname, fty) in fields {
+            let (_flag, ir_type, field_size) = get_type_flag(fty);
+            if fname == field_name {
+                // is_immutable=false: pyre's analyzer has no immutability
+                // annotation surface today; the conservative `false` keeps
+                // the optimizer from elision-folding stores. Upstream sets
+                // this from `lltype.Ptr(...)._hints['immutable']`.
+                return Some(std::sync::Arc::new(SimpleFieldDescr::new(
+                    idx, offset, field_size, ir_type, false,
+                )));
+            }
+            offset = offset.saturating_add(field_size);
+        }
+        None
+    }
+
+    /// RPython: `cpu.interiorfielddescrof(ARRAY, fieldname)` —
+    /// descr.py:404-433. Mints an interior-field descr referring to a
+    /// named field inside the struct element of `array_type_id`.
+    ///
+    /// Like [`Self::fielddescrof`] this produces a fresh analyzer-time
+    /// Arc that does not share identity with the runtime descr
+    /// (Task #316). The struct element is resolved by extracting
+    /// `ARRAY.OF` from the full container type string (`Vec<Point>` →
+    /// `"Point"`), then looking up the named field's offset/size from
+    /// `self.struct_fields`. The containing array's
+    /// `SimpleArrayDescr` is minted inline at `Ref` element type
+    /// (PyPy's `consider_array(ARRAY)` filter at `effectinfo.py:392`
+    /// only emits interiorfield effects for struct arrays where
+    /// `ARRAY.OF` is a GcStruct).
+    ///
+    /// `None` when `array_type_id` is unresolved, the element type is
+    /// not a registered struct, or the field name is absent. Caller
+    /// silently skips the raw-set push.
+    pub fn interiorfielddescrof(
+        &self,
+        idx: u32,
+        array_type_id: &Option<String>,
+        field_name: &str,
+    ) -> Option<majit_ir::descr::DescrRef> {
+        use majit_ir::descr::{ArrayFlag, SimpleArrayDescr, SimpleInteriorFieldDescr};
+        let array_str = array_type_id.as_deref()?;
+        // RPython: ARRAY.OF.fieldname — extract the element type from
+        // the container type, then look up field info in
+        // `self.struct_fields`.
+        let elem_name =
+            extract_element_type_from_str(array_str).or_else(|| Some(array_str.to_string()))?;
+        // Validate the element is a known struct (PyPy
+        // `consider_array(ARRAY)` filter at `effectinfo.py:392-397`).
+        if !self.is_known_struct(&elem_name) {
+            return None;
+        }
+        let field_descr = self.fielddescrof_concrete(idx, &elem_name, field_name)?;
+        // Mint the containing `SimpleArrayDescr` inline. `arraydescrof`
+        // exists but returns the trait-erased `DescrRef`; here we need
+        // the concrete `Arc<SimpleArrayDescr>` to wrap into
+        // `SimpleInteriorFieldDescr::new`. The shape mirrors
+        // `arraydescrof`'s struct-array branch (`ArrayFlag::Struct`,
+        // `compute_struct_size`, IR type `Ref`).
+        let item_size = compute_struct_size(self, &elem_name);
+        let base_size = self.array_header_size;
+        let array_descr = std::sync::Arc::new(SimpleArrayDescr::with_flag(
+            idx,
+            base_size,
+            item_size,
+            0,
+            majit_ir::value::Type::Ref,
+            ArrayFlag::Struct,
+        ));
+        Some(std::sync::Arc::new(SimpleInteriorFieldDescr::new(
+            idx,
+            array_descr,
+            field_descr,
+        )))
     }
 
     /// Register a free function graph.
@@ -3539,6 +3709,11 @@ fn analyze_readwrite(
         write_arrays: Vec::new(),
         read_interiorfields: Vec::new(),
         write_interiorfields: Vec::new(),
+        field_read_descrs: Vec::new(),
+        field_write_descrs: Vec::new(),
+        interior_read_descrs: Vec::new(),
+        interior_write_descrs: Vec::new(),
+        array_read_descrs: Vec::new(),
         array_write_descrs: Vec::new(),
         is_top: false,
     };
@@ -3556,6 +3731,11 @@ fn analyze_readwrite(
             &mut analysis.write_arrays,
             &mut analysis.read_interiorfields,
             &mut analysis.write_interiorfields,
+            &mut analysis.field_read_descrs,
+            &mut analysis.field_write_descrs,
+            &mut analysis.interior_read_descrs,
+            &mut analysis.interior_write_descrs,
+            &mut analysis.array_read_descrs,
             &mut analysis.array_write_descrs,
             &mut analysis.is_top,
         );
@@ -3583,6 +3763,11 @@ fn analyze_readwrite_indirect_family(
         write_arrays: Vec::new(),
         read_interiorfields: Vec::new(),
         write_interiorfields: Vec::new(),
+        field_read_descrs: Vec::new(),
+        field_write_descrs: Vec::new(),
+        interior_read_descrs: Vec::new(),
+        interior_write_descrs: Vec::new(),
+        array_read_descrs: Vec::new(),
         array_write_descrs: Vec::new(),
         is_top: false,
     };
@@ -3607,6 +3792,11 @@ fn analyze_readwrite_indirect_family(
             &mut analysis.write_arrays,
             &mut analysis.read_interiorfields,
             &mut analysis.write_interiorfields,
+            &mut analysis.field_read_descrs,
+            &mut analysis.field_write_descrs,
+            &mut analysis.interior_read_descrs,
+            &mut analysis.interior_write_descrs,
+            &mut analysis.array_read_descrs,
             &mut analysis.array_write_descrs,
             &mut analysis.is_top,
         );
@@ -3651,6 +3841,12 @@ fn effectinfo_from_writeanalyze(
         return EffectInfo {
             extraeffect: ExtraEffect::RandomEffects,
             oopspecindex,
+            _readonly_descrs_fields: None,
+            _write_descrs_fields: None,
+            _readonly_descrs_arrays: None,
+            _write_descrs_arrays: None,
+            _readonly_descrs_interiorfields: None,
+            _write_descrs_interiorfields: None,
             readonly_descrs_fields: None,
             write_descrs_fields: None,
             readonly_descrs_arrays: None,
@@ -3676,7 +3872,23 @@ fn effectinfo_from_writeanalyze(
     let mut write_descrs_fields = effects.write_fields;
     let mut write_descrs_arrays = effects.write_arrays;
     let mut write_descrs_interiorfields = effects.write_interiorfields;
+    let field_read_descrs_raw = effects.field_read_descrs;
+    let mut field_write_descrs = effects.field_write_descrs;
+    let interior_read_descrs_raw = effects.interior_read_descrs;
+    let mut interior_write_descrs = effects.interior_write_descrs;
+    let array_read_descrs_raw = effects.array_read_descrs;
     let mut array_write_descrs = effects.array_write_descrs;
+    // Sort + dedupe the write sets so the raw `_*_descrs_*` slot we hand
+    // to `compute_bitstrings` matches PyPy's `frozenset[Descr]` semantics
+    // (canonical, no duplicates). `subtract_index_set` already does this
+    // for the readonly sets; the write paths feed straight from the
+    // analyzer.
+    write_descrs_fields.sort_unstable();
+    write_descrs_fields.dedup();
+    write_descrs_arrays.sort_unstable();
+    write_descrs_arrays.dedup();
+    write_descrs_interiorfields.sort_unstable();
+    write_descrs_interiorfields.dedup();
 
     // effectinfo.py:169-181: for elidable/loopinvariant, ignore writes.
     if matches!(
@@ -3689,8 +3901,15 @@ fn effectinfo_from_writeanalyze(
         write_descrs_fields.clear();
         write_descrs_arrays.clear();
         write_descrs_interiorfields.clear();
+        field_write_descrs.clear();
+        interior_write_descrs.clear();
         array_write_descrs.clear();
     }
+
+    // Snapshot the Arc-list before consumption — `single_write_descr_array`
+    // takes ownership for its `.into_iter().next()` extract, but the EI's
+    // `_write_descrs_arrays: Vec<DescrRef>` raw set below also needs it.
+    let array_write_descrs_snapshot: Vec<majit_ir::descr::DescrRef> = array_write_descrs.clone();
 
     // effectinfo.py:201-206: single_write_descr_array
     let single_write_descr_array = if array_write_descrs.len() == 1 {
@@ -3707,9 +3926,132 @@ fn effectinfo_from_writeanalyze(
         can_collect
     };
 
+    // `effectinfo.py:128-145 frozenset_or_none` parity: raw descr
+    // sets carry the `cpu.fielddescrof()`/`cpu.arraydescrof()`/
+    // `cpu.interiorfielddescrof()` results that the analyzer found.
+    //
+    // Pyre's coverage today: all 6 raw sets populated.
+    //   - `_readonly_descrs_fields`, `_write_descrs_fields`: via
+    //     `cc.fielddescrof(idx, owner, name)` from `field.owner_root` +
+    //     `field.name` at the FieldRead / FieldWrite sites
+    //     (PyPy `effectinfo.py:301-305 add_struct →
+    //     cpu.fielddescrof(T, fieldname)`).
+    //   - `_readonly_descrs_arrays`, `_write_descrs_arrays`: via
+    //     `cc.arraydescrof()` from ArrayRead / ArrayWrite ops plus
+    //     interior-field synthesised array effects
+    //     (`effectinfo.py:327-340` + `:355-360`).
+    //     `_write_descrs_arrays` directly drives heap optimizer array
+    //     cache invalidation (`heap.py:537-571 force_from_effectinfo`).
+    //   - `_readonly_descrs_interiorfields`,
+    //     `_write_descrs_interiorfields`: via `cc.interiorfielddescrof(
+    //     idx, array_type_id, name)` from InteriorFieldRead /
+    //     InteriorFieldWrite ops (PyPy `effectinfo.py:313-325
+    //     add_interiorfield → cpu.interiorfielddescrof(T, fieldname)`).
+    //
+    // All `cc.*descrof()` helpers silently skip when struct layout is
+    // not registered with `cc.struct_fields`, mirroring PyPy's
+    // `consider_struct=False` / `consider_array=False` /
+    // `UnsupportedFieldExc` filters at `effectinfo.py:380-397` +
+    // `:316-324`.
+    //
+    // The architectural fix path (Task #316, multi-session):
+    //   1. `__majit_type_id` is already path-stable (`majit-macros/src/
+    //      jit_struct.rs:92` emits `path_hash(concat!(module_path!(),
+    //      "::", stringify!(Struct)))`).  The remaining gap is on the
+    //      analyzer side: `field.owner_root` is built with
+    //      `qualify_type_name(type_root, ctx.module_prefix)` —
+    //      `ctx.module_prefix` is the *use-site* module, not the
+    //      struct's *definition* module.  When they coincide (most
+    //      pyre code), `path_hash(owner_root)` already matches the
+    //      runtime macro's `__majit_type_id`; cross-module references
+    //      need a name → definition-path resolver (Task #316) to
+    //      replace the use-site qualifier with the canonical
+    //      definition path before hashing.  With both sides aligned,
+    //      `cc.fielddescrof()` / `cc.interiorfielddescrof()` route
+    //      through `gc_cache.get_field_descr(LLType::Struct(
+    //      path_hash(owner_root)), field_name, ...)` and analyzer
+    //      mints prime the cache so analyzer- and runtime-side Arcs
+    //      match by identity.
+    //   2. OR reorder `__majit_register_descrs` calls to run BEFORE
+    //      the analyzer.
+    //
+    // Both touch majit-translate (analyzer-side resolver) + pyre-jit-trace.
+    //
+    // Today's heap-invalidation behaviour: `compute_bitstrings`
+    // re-encodes bitstrings keyed on `descr.get_ei_index()`. For the
+    // interiorfield slots the bitstring is empty Vec<u8>, so
+    // `check_*_descr_interiorfields` returns false → interiorfield
+    // cache survives the call (under-invalidation possible if the
+    // call actually writes those interior slots). Field/array slots
+    // now get populated bitstrings but the runtime
+    // `descr.get_ei_index()` query still misses because analyzer-time
+    // Arcs and runtime Arcs don't share identity (same Task #316 root
+    // cause).
+    // PyPy `effectinfo.py:345-360` `readonly` rule:
+    //   elif tup[0] == "readstruct":
+    //       tupw = ("struct",) + tup[1:]
+    //       if tupw not in effects:
+    //           add_struct(readonly_descrs_fields, tup)
+    // i.e. a descr that is both read and written goes only to
+    // `write_descrs_*`, never to `readonly_descrs_*`. PyPy keys
+    // membership on the `("struct", T, fieldname)` tuple identity —
+    // distinct descrs with the same `descr.index()` (legacy u32 id)
+    // would collapse incorrectly here. Pyre's Arc identity (via
+    // `Arc::as_ptr`) is the closest analogue: each `cc.fielddescrof(...)`
+    // call returns one Arc per (T, fieldname); two analyzer-time Arcs
+    // sharing a `descr.index()` due to side-table collisions remain
+    // distinct under pointer equality, matching PyPy's tuple-identity
+    // membership test.
+    let field_write_ptr_set: std::collections::HashSet<*const ()> = field_write_descrs
+        .iter()
+        .map(|d| std::sync::Arc::as_ptr(d).cast::<()>())
+        .collect();
+    let mut read_descrs_fields_arcs: Vec<majit_ir::descr::DescrRef> = field_read_descrs_raw
+        .into_iter()
+        .filter(|d| !field_write_ptr_set.contains(&std::sync::Arc::as_ptr(d).cast::<()>()))
+        .collect();
+    read_descrs_fields_arcs.sort_by_key(majit_ir::effectinfo::descr_ptr_id);
+    read_descrs_fields_arcs.dedup_by(|a, b| std::sync::Arc::ptr_eq(a, b));
+    let mut write_descrs_fields_arcs: Vec<majit_ir::descr::DescrRef> = field_write_descrs;
+    write_descrs_fields_arcs.sort_by_key(majit_ir::effectinfo::descr_ptr_id);
+    write_descrs_fields_arcs.dedup_by(|a, b| std::sync::Arc::ptr_eq(a, b));
+    // Same `read \ write` subtract for interiorfield + array (PyPy
+    // `effectinfo.py:351-360`), again by Arc identity.
+    let interior_write_ptr_set: std::collections::HashSet<*const ()> = interior_write_descrs
+        .iter()
+        .map(|d| std::sync::Arc::as_ptr(d).cast::<()>())
+        .collect();
+    let mut read_descrs_interior_arcs: Vec<majit_ir::descr::DescrRef> = interior_read_descrs_raw
+        .into_iter()
+        .filter(|d| !interior_write_ptr_set.contains(&std::sync::Arc::as_ptr(d).cast::<()>()))
+        .collect();
+    read_descrs_interior_arcs.sort_by_key(majit_ir::effectinfo::descr_ptr_id);
+    read_descrs_interior_arcs.dedup_by(|a, b| std::sync::Arc::ptr_eq(a, b));
+    let mut write_descrs_interior_arcs: Vec<majit_ir::descr::DescrRef> = interior_write_descrs;
+    write_descrs_interior_arcs.sort_by_key(majit_ir::effectinfo::descr_ptr_id);
+    write_descrs_interior_arcs.dedup_by(|a, b| std::sync::Arc::ptr_eq(a, b));
+    let array_write_ptr_set: std::collections::HashSet<*const ()> = array_write_descrs_snapshot
+        .iter()
+        .map(|d| std::sync::Arc::as_ptr(d).cast::<()>())
+        .collect();
+    let mut read_descrs_arrays_arcs: Vec<majit_ir::descr::DescrRef> = array_read_descrs_raw
+        .into_iter()
+        .filter(|d| !array_write_ptr_set.contains(&std::sync::Arc::as_ptr(d).cast::<()>()))
+        .collect();
+    read_descrs_arrays_arcs.sort_by_key(majit_ir::effectinfo::descr_ptr_id);
+    read_descrs_arrays_arcs.dedup_by(|a, b| std::sync::Arc::ptr_eq(a, b));
+    let mut write_descrs_arrays_arcs: Vec<majit_ir::descr::DescrRef> = array_write_descrs_snapshot;
+    write_descrs_arrays_arcs.sort_by_key(majit_ir::effectinfo::descr_ptr_id);
+    write_descrs_arrays_arcs.dedup_by(|a, b| std::sync::Arc::ptr_eq(a, b));
     EffectInfo {
         extraeffect,
         oopspecindex,
+        _readonly_descrs_fields: Some(read_descrs_fields_arcs),
+        _write_descrs_fields: Some(write_descrs_fields_arcs),
+        _readonly_descrs_arrays: Some(read_descrs_arrays_arcs),
+        _write_descrs_arrays: Some(write_descrs_arrays_arcs),
+        _readonly_descrs_interiorfields: Some(read_descrs_interior_arcs),
+        _write_descrs_interiorfields: Some(write_descrs_interior_arcs),
         readonly_descrs_fields: Some(majit_ir::bitstring::make_bitstring(&readonly_descrs_fields)),
         write_descrs_fields: Some(majit_ir::bitstring::make_bitstring(&write_descrs_fields)),
         readonly_descrs_arrays: Some(majit_ir::bitstring::make_bitstring(&readonly_descrs_arrays)),
@@ -3904,8 +4246,27 @@ fn collect_readwrite_effects(
     // effectinfo.py:313-325: interiorfield descriptor sets.
     read_interiorfields: &mut Vec<u32>,
     write_interiorfields: &mut Vec<u32>,
-    // effectinfo.py:201-206: collect actual array write DescrRefs
-    // for single_write_descr_array population.
+    // effectinfo.py:294,301-305: `readonly_descrs_fields = []` populated
+    // via `add_struct → cpu.fielddescrof(T, fieldname)` from
+    // `("readstruct", T, fieldname)` tuples.
+    field_read_descrs: &mut Vec<majit_ir::descr::DescrRef>,
+    // effectinfo.py:297,301-305: `write_descrs_fields = []` from
+    // `("struct", T, fieldname)` tuples.
+    field_write_descrs: &mut Vec<majit_ir::descr::DescrRef>,
+    // effectinfo.py:296,313-325: `readonly_descrs_interiorfields = []`
+    // populated via `add_interiorfield → cpu.interiorfielddescrof(T,
+    // fieldname)` from `("readinteriorfield", T, fieldname)` tuples.
+    interior_read_descrs: &mut Vec<majit_ir::descr::DescrRef>,
+    // effectinfo.py:299,313-325: `write_descrs_interiorfields = []`
+    // from `("interiorfield", T, fieldname)` tuples.
+    interior_write_descrs: &mut Vec<majit_ir::descr::DescrRef>,
+    // effectinfo.py:295,307-311: `readonly_descrs_arrays = []` populated
+    // via `add_array → cpu.arraydescrof(ARRAY)` from `("readarray", T)`
+    // tuples (and `("readinteriorfield", T, _)` synthesised at
+    // effectinfo.py:327-340).
+    array_read_descrs: &mut Vec<majit_ir::descr::DescrRef>,
+    // effectinfo.py:201-206,298,355-356: `write_descrs_arrays = []` —
+    // also drives single_write_descr_array.
     array_write_descrs: &mut Vec<majit_ir::descr::DescrRef>,
     is_top: &mut bool,
 ) {
@@ -3959,11 +4320,33 @@ fn collect_readwrite_effects(
                     // RPython: cpu.fielddescrof(T, fieldname).get_ei_index()
                     let idx = descr_indices.field_index(&field.owner_root, &field.name);
                     read_fields.push(idx);
+                    // RPython: effectinfo.py:301-305 `add_struct →
+                    // cpu.fielddescrof(T, fieldname)`. Dedup by index
+                    // (frozenset semantics). Silently skipped when the
+                    // struct layout is not registered with `cc.struct_fields`
+                    // (analyzer-unknown owner — matches PyPy's
+                    // `consider_struct=False` filter at effectinfo.py:380).
+                    if let Some(owner) = field.owner_root.as_deref() {
+                        if !field_read_descrs.iter().any(|d| d.index() == idx) {
+                            if let Some(descr) = cc.fielddescrof(idx, owner, &field.name) {
+                                field_read_descrs.push(descr);
+                            }
+                        }
+                    }
                 }
                 // RPython: ("struct", T, fieldname)
                 OpKind::FieldWrite { field, .. } => {
                     let idx = descr_indices.field_index(&field.owner_root, &field.name);
                     write_fields.push(idx);
+                    // RPython: effectinfo.py:301-305 — same as FieldRead's
+                    // implicit `add_struct` walk, just into `write_descrs_fields`.
+                    if let Some(owner) = field.owner_root.as_deref() {
+                        if !field_write_descrs.iter().any(|d| d.index() == idx) {
+                            if let Some(descr) = cc.fielddescrof(idx, owner, &field.name) {
+                                field_write_descrs.push(descr);
+                            }
+                        }
+                    }
                 }
                 // RPython: ("readarray", T)
                 OpKind::ArrayRead {
@@ -3988,6 +4371,29 @@ fn collect_readwrite_effects(
                         len_offset,
                     );
                     read_arrays.push(idx);
+                    // RPython: effectinfo.py:307-311 + :355-356 — `add_array`
+                    // walks `("readarray", T)` tuples through
+                    // `cpu.arraydescrof(ARRAY)` and appends to
+                    // `readonly_descrs_arrays`. Dedup by descriptor index
+                    // (frozenset semantics, matching `ArrayWrite` handler).
+                    if !array_read_descrs.iter().any(|d| d.index() == idx) {
+                        let ir_type = match item_ty {
+                            crate::model::ValueType::Int | crate::model::ValueType::State => {
+                                majit_ir::value::Type::Int
+                            }
+                            crate::model::ValueType::Ref | crate::model::ValueType::Unknown => {
+                                majit_ir::value::Type::Ref
+                            }
+                            crate::model::ValueType::Float => majit_ir::value::Type::Float,
+                            crate::model::ValueType::Void => majit_ir::value::Type::Void,
+                        };
+                        array_read_descrs.push(cc.arraydescrof(
+                            idx,
+                            &resolved_id,
+                            ir_type,
+                            len_offset,
+                        ));
+                    }
                 }
                 // RPython: ("array", T)
                 OpKind::ArrayWrite {
@@ -4058,15 +4464,30 @@ fn collect_readwrite_effects(
                     // matching cpu.interiorfielddescrof(ARRAY, fieldname).
                     let ifield_idx = descr_indices.interiorfield_index(&resolved_id, &field.name);
                     read_interiorfields.push(ifield_idx);
-                    // effectinfo.py:327-340: implicit array read.
-                    // RPython: cpu.arraydescrof(ARRAY) uses get_type_flag(ARRAY.OF).
-                    // Interior fields only exist in struct arrays → element
-                    // type is Ref. `len_offset` honours
-                    // `ARRAY_INSIDE._hints.get('nolength', False)`
-                    // (`descr.py:359`) so headerless array-of-structs
-                    // shapes (`&[T]`, `*const [T]`, etc.) hash to a
-                    // different bitstring slot than length-prefixed
-                    // `Vec<T>` / `GcArray<T>` of the same item type.
+                    // RPython: effectinfo.py:313-325 `add_interiorfield →
+                    // cpu.interiorfielddescrof(ARRAY, fieldname)`. Dedup
+                    // by descriptor index. Silently skipped when the
+                    // array's element struct is unknown to
+                    // `cc.struct_fields` or the field is absent
+                    // (PyPy `effectinfo.py:316-324 consider_array` /
+                    // `Void` / `UnsupportedFieldExc` filters).
+                    if !interior_read_descrs.iter().any(|d| d.index() == ifield_idx) {
+                        if let Some(descr) =
+                            cc.interiorfielddescrof(ifield_idx, &resolved_id, &field.name)
+                        {
+                            interior_read_descrs.push(descr);
+                        }
+                    }
+                    // effectinfo.py:327-340: synthesizes `("readarray", T)`
+                    // for every `("readinteriorfield", T, _)` so the
+                    // implicit array read is recorded; effectinfo.py:355-360
+                    // then walks `add_array → cpu.arraydescrof(ARRAY)` →
+                    // `readonly_descrs_arrays.append(descr)`. Interior fields
+                    // only exist in struct arrays → element type is Ref.
+                    // `len_offset` honours `ARRAY_INSIDE._hints.get('nolength',
+                    // False)` (`descr.py:359`) so headerless array-of-structs
+                    // shapes hash to a different bitstring slot than
+                    // length-prefixed shapes of the same item type.
                     let len_offset =
                         if crate::front::ast::nolength_from_array_type_id(resolved_id.as_deref()) {
                             None
@@ -4079,6 +4500,18 @@ fn collect_readwrite_effects(
                         len_offset,
                     );
                     read_arrays.push(arr_idx);
+                    // RPython: effectinfo.py:355-360 — cpu.arraydescrof(ARRAY)
+                    // appended to readonly_descrs_arrays via the synthesized
+                    // ("readarray", T) tuple. Dedup by descriptor index
+                    // (frozenset semantics).
+                    if !array_read_descrs.iter().any(|d| d.index() == arr_idx) {
+                        array_read_descrs.push(cc.arraydescrof(
+                            arr_idx,
+                            &resolved_id,
+                            majit_ir::value::Type::Ref,
+                            len_offset,
+                        ));
+                    }
                 }
                 // RPython: ("interiorfield", T, fieldname)
                 // effectinfo.py:349-350: records interiorfield descriptor.
@@ -4100,12 +4533,29 @@ fn collect_readwrite_effects(
                     // matching cpu.interiorfielddescrof(ARRAY, fieldname).
                     let ifield_idx = descr_indices.interiorfield_index(&resolved_id, &field.name);
                     write_interiorfields.push(ifield_idx);
-                    // effectinfo.py:327-340: implicit array write.
-                    // RPython: cpu.arraydescrof(ARRAY) — struct arrays
-                    // are always Ref; `len_offset` reflects
-                    // `ARRAY_INSIDE._hints['nolength']` so headerless
-                    // array-of-structs shapes do not alias length-prefixed
-                    // ones at the EffectInfo bitset.
+                    // RPython: effectinfo.py:313-325 — same as
+                    // InteriorFieldRead's `add_interiorfield` walk,
+                    // routed into `write_descrs_interiorfields`.
+                    if !interior_write_descrs
+                        .iter()
+                        .any(|d| d.index() == ifield_idx)
+                    {
+                        if let Some(descr) =
+                            cc.interiorfielddescrof(ifield_idx, &resolved_id, &field.name)
+                        {
+                            interior_write_descrs.push(descr);
+                        }
+                    }
+                    // effectinfo.py:327-340: synthesizes `("array", T)`
+                    // for every `("interiorfield", T, _)` so the implicit
+                    // array write is recorded; effectinfo.py:355-356
+                    // then walks `add_array → cpu.arraydescrof(ARRAY)` →
+                    // `write_descrs_arrays.append(descr)`. Interior fields
+                    // only exist in struct arrays → element type is Ref;
+                    // `len_offset` reflects `ARRAY_INSIDE._hints['nolength']`
+                    // (`descr.py:359`) so headerless array-of-structs shapes
+                    // do not alias length-prefixed ones at the EffectInfo
+                    // bitset.
                     let len_offset =
                         if crate::front::ast::nolength_from_array_type_id(resolved_id.as_deref()) {
                             None
@@ -4118,6 +4568,18 @@ fn collect_readwrite_effects(
                         len_offset,
                     );
                     write_arrays.push(arr_idx);
+                    // RPython: effectinfo.py:355-356 — cpu.arraydescrof(ARRAY)
+                    // appended to write_descrs_arrays via the synthesized
+                    // ("array", T) tuple. Dedup by descriptor index
+                    // (frozenset semantics, matching ArrayWrite handler).
+                    if !array_write_descrs.iter().any(|d| d.index() == arr_idx) {
+                        array_write_descrs.push(cc.arraydescrof(
+                            arr_idx,
+                            &resolved_id,
+                            majit_ir::value::Type::Ref,
+                            len_offset,
+                        ));
+                    }
                 }
                 // Recursive: follow calls.
                 OpKind::Call { target, .. } => {
@@ -4134,6 +4596,11 @@ fn collect_readwrite_effects(
                             write_arrays,
                             read_interiorfields,
                             write_interiorfields,
+                            field_read_descrs,
+                            field_write_descrs,
+                            interior_read_descrs,
+                            interior_write_descrs,
+                            array_read_descrs,
                             array_write_descrs,
                             is_top,
                         );
@@ -4162,6 +4629,11 @@ fn collect_readwrite_effects(
                                 write_arrays,
                                 read_interiorfields,
                                 write_interiorfields,
+                                field_read_descrs,
+                                field_write_descrs,
+                                interior_read_descrs,
+                                interior_write_descrs,
+                                array_read_descrs,
                                 array_write_descrs,
                                 is_top,
                             );

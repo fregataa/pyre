@@ -82,11 +82,19 @@ pub(crate) fn expand(_attr: TokenStream, item: TokenStream) -> TokenStream {
             ///
             /// Deterministic within a process; not stable across builds.
             /// Analogue of RPython's `lltype.Struct` Python-object identity.
+            ///
+            /// Implementation: path-stable `path_hash(module_path::StructName)`
+            /// so analyzer-time and runtime mint sites can both compute the
+            /// same `LLType::Struct(_)` key without sharing a `TypeId::of`
+            /// runtime symbol — the codewriter's `cc.fielddescrof` can
+            /// resolve the same `gc_cache._cache_field` entry the
+            /// `__majit_register_descrs` runtime call populates. (Task #316.)
             pub fn __majit_type_id() -> u64 {
-                use ::std::hash::{Hash, Hasher};
-                let mut h = ::std::collections::hash_map::DefaultHasher::new();
-                ::std::any::TypeId::of::<Self>().hash(&mut h);
-                h.finish()
+                ::majit_ir::descr::path_hash(concat!(
+                    module_path!(),
+                    "::",
+                    stringify!(#struct_name),
+                ))
             }
 
             /// Field names declared at macro-expansion time, in declaration order.

@@ -2201,18 +2201,22 @@ fn register_helper_fn_pointers(
     let call_fn_6 = bind(assembler, cpu.call_fn_6 as *const (), CallFlavor::MayForce);
     let call_fn_7 = bind(assembler, cpu.call_fn_7 as *const (), CallFlavor::MayForce);
     let call_fn_8 = bind(assembler, cpu.call_fn_8 as *const (), CallFlavor::MayForce);
-    // TLS read of `CURRENT_EXCEPTION`; cannot raise.  Matches
-    // `EF_CANNOT_RAISE` (`call.py:303` `else` branch).
+    // TLS read of `CURRENT_EXCEPTION`; cannot raise; touches no GC
+    // heap (TLS slot is not tracked by `force_from_effectinfo`'s
+    // field/array bitstring caches). Maps to PyPy's analyzer output
+    // for a flat helper: `extraeffect=EF_CANNOT_RAISE` + every six
+    // raw set `frozenset()` + `can_collect=False`
+    // (`effectinfo.py:281-283`-equivalent).
     let get_current_exception_fn = bind(
         assembler,
         cpu.get_current_exception_fn as *const (),
-        CallFlavor::PlainCannotRaise,
+        CallFlavor::PlainCannotRaiseNoHeap,
     );
-    // TLS write; void return; cannot raise.
+    // TLS write; void return; cannot raise; touches no GC heap.
     let set_current_exception_fn = bind(
         assembler,
         cpu.set_current_exception_fn as *const (),
-        CallFlavor::PlainCannotRaise,
+        CallFlavor::PlainCannotRaiseNoHeap,
     );
     FnPtrIndices {
         call_fn,
@@ -5979,16 +5983,19 @@ impl CodeWriter {
                         // (shape residual_call_r_v).
                         if is_portal {
                             // Match helper bind-site flavors at
-                            // codewriter.rs:2253 / :2259 — both
+                            // codewriter.rs:2207-2217 — both
                             // current-exception helpers are TLS
-                            // read/write only and bound
-                            // `PlainCannotRaise` (`EF_CANNOT_RAISE`,
-                            // call.py:303 `else` branch).
+                            // read/write only and statically prove
+                            // "no GC heap touched", so they bind
+                            // `PlainCannotRaiseNoHeap` for the
+                            // analyzer-equivalent `EF_CANNOT_RAISE +
+                            // empty raw frozensets + can_collect=false`
+                            // shape (`effectinfo.py:281-283`).
                             let _ = record_residual_call_graph_op(
                                 &mut graph,
                                 &current_block.block(),
                                 get_current_exception_fn_idx,
-                                CallFlavor::PlainCannotRaise,
+                                CallFlavor::PlainCannotRaiseNoHeap,
                                 vec![],
                                 vec![],
                                 vec![],
@@ -6000,7 +6007,7 @@ impl CodeWriter {
                                 &mut graph,
                                 &current_block.block(),
                                 set_current_exception_fn_idx,
-                                CallFlavor::PlainCannotRaise,
+                                CallFlavor::PlainCannotRaiseNoHeap,
                                 vec![],
                                 vec![exc_value.clone()],
                                 vec![],
@@ -6116,14 +6123,15 @@ impl CodeWriter {
                         // Task #46 micro-slice 7: set_current_exception
                         // `(prev:Ref)→Void` shape residual_call_r_v.
                         // Match helper bind-site flavor at
-                        // codewriter.rs:2259 — TLS write,
-                        // `PlainCannotRaise`.
+                        // codewriter.rs:2213-2217 — TLS write, no GC
+                        // heap touched, `PlainCannotRaiseNoHeap`
+                        // (`effectinfo.py:281-283` analyzer output).
                         if is_portal {
                             let _ = record_residual_call_graph_op(
                                 &mut graph,
                                 &current_block.block(),
                                 set_current_exception_fn_idx,
-                                CallFlavor::PlainCannotRaise,
+                                CallFlavor::PlainCannotRaiseNoHeap,
                                 vec![],
                                 vec![prev_value],
                                 vec![],

@@ -2267,7 +2267,21 @@ fn bh_size_spec_from_callcontrol(
         .or_else(|| heuristic_struct_size_for_bh(cc, owner))?;
     Some(crate::jitcode::BhSizeSpec {
         size,
-        type_id: 0,
+        // `descr.py:105-127 get_size_descr` keys `_cache_size[STRUCT]` on
+        // the lltype STRUCT object identity.  Pyre's analogue is
+        // `path_hash(owner)` per `majit_ir::descr::path_hash` doc
+        // (`majit-ir/src/descr.rs:120-141`): the analyzer side hashes
+        // `field.owner_root`, the runtime macro hashes
+        // `concat!(module_path!(), "::", stringify!(Struct))`.  The
+        // analyzer hashes `owner` to the SAME u64 so analyzer-side
+        // `BhSizeSpec` and runtime-side `__majit_type_id` produce the
+        // same `LLType::Struct(u64)` cache key in `gc_cache._cache_size`.
+        // MUST NOT truncate to u32 — `path_hash` has 64-bit range and
+        // `as u32` collisions approach certainty around 2^16 distinct
+        // structs (birthday paradox), whereas PyPy's `id(STRUCT)` never
+        // aliases.  The rare hash-to-zero case (1 in 2^64) is handled
+        // by `simple_descr_group_from_bh_size`'s no-identity branch.
+        type_id: majit_ir::descr::path_hash(owner),
         vtable: 0,
         all_fielddescrs: bh_all_field_specs_for_struct(cc, owner),
     })
@@ -2581,7 +2595,18 @@ fn bh_field_spec_from_descr(fd: &dyn majit_ir::descr::FieldDescr) -> crate::jitc
 fn bh_size_spec_from_descr(sd: &dyn majit_ir::descr::SizeDescr) -> crate::jitcode::BhSizeSpec {
     crate::jitcode::BhSizeSpec {
         size: sd.size(),
-        type_id: sd.type_id(),
+        // PRE-EXISTING-ADAPTATION: descr-back-to-spec inverse path.
+        // `SizeDescr::type_id()` returns the u32 GC tid (allocated by
+        // `gc_cache.next_struct_tid`, used by backends for
+        // `gc.alloc_*_typed`), NOT the u64 `path_hash` cache key the
+        // analyzer route stamps via `bh_size_spec_from_callcontrol`.
+        // Widen via `as u64` here so the field type stays consistent;
+        // callers reading this `BhSizeSpec` to look up the gc_cache
+        // entry will not hit (the cache key u64 path_hash differs from
+        // the u32 tid).  Plumbing a real `cache_key()` accessor onto
+        // `SizeDescr` is the structural fix — once landed, this
+        // becomes `sd.cache_key()` directly.
+        type_id: sd.type_id() as u64,
         vtable: sd.vtable(),
         all_fielddescrs: sd
             .all_fielddescrs()
@@ -2648,7 +2673,10 @@ fn arraydescrof(
             base_size: array_descr.base_size(),
             itemsize: array_descr.item_size(),
             len_offset: array_descr.len_descr().map(|fd| fd.offset()),
-            type_id: array_descr.type_id(),
+            // PRE-EXISTING-ADAPTATION: same descr-back-to-spec gap
+            // as `BhDescr::from_array_descr` — widen via `as u64`
+            // until `ArrayDescr` exposes a `cache_key()` accessor.
+            type_id: array_descr.type_id() as u64,
             item_type: array_descr.item_type(),
             is_array_of_pointers: array_descr.is_array_of_pointers(),
             is_array_of_structs: array_descr.is_array_of_structs(),
@@ -3019,16 +3047,26 @@ impl Assembler {
     }
 }
 
+/// `effectinfo.py:152-164` `EffectInfo._cache` cache key parity.
+///
+/// PyPy keys the EI factory cache on the raw `frozenset[Descr]`
+/// readonly/write sets, NOT on the `bitstring_*` fields.  The
+/// bitstrings are setup-time derived state (`compute_bitstrings`
+/// at `effectinfo.py:528`), so the same logical EI must hit the
+/// same cache slot before AND after compaction.  Pyre's lift
+/// projects the `Vec<DescrRef>` raw sets to `Arc::as_ptr` ptr-id
+/// `Vec<usize>` for `Hash`/`Eq` — direct lift of PyPy's
+/// `frozenset[id(descr)]` cache key.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct EffectInfoKey {
     extraeffect: majit_ir::descr::ExtraEffect,
     oopspecindex: majit_ir::descr::OopSpecIndex,
-    readonly_descrs_fields: Option<Vec<u8>>,
-    write_descrs_fields: Option<Vec<u8>>,
-    readonly_descrs_arrays: Option<Vec<u8>>,
-    write_descrs_arrays: Option<Vec<u8>>,
-    readonly_descrs_interiorfields: Option<Vec<u8>>,
-    write_descrs_interiorfields: Option<Vec<u8>>,
+    readonly_descrs_fields: Option<Vec<usize>>,
+    write_descrs_fields: Option<Vec<usize>>,
+    readonly_descrs_arrays: Option<Vec<usize>>,
+    write_descrs_arrays: Option<Vec<usize>>,
+    readonly_descrs_interiorfields: Option<Vec<usize>>,
+    write_descrs_interiorfields: Option<Vec<usize>>,
     can_invalidate: bool,
     can_collect: bool,
     call_release_gil_target: (u64, i32),
@@ -3039,12 +3077,28 @@ impl EffectInfoKey {
         Self {
             extraeffect: effect.extraeffect,
             oopspecindex: effect.oopspecindex,
-            readonly_descrs_fields: effect.readonly_descrs_fields.clone(),
-            write_descrs_fields: effect.write_descrs_fields.clone(),
-            readonly_descrs_arrays: effect.readonly_descrs_arrays.clone(),
-            write_descrs_arrays: effect.write_descrs_arrays.clone(),
-            readonly_descrs_interiorfields: effect.readonly_descrs_interiorfields.clone(),
-            write_descrs_interiorfields: effect.write_descrs_interiorfields.clone(),
+            // `effectinfo.py:152-164` cache key: raw `_*_descrs_*`
+            // sets (frozenset[Descr] lift), projected to
+            // `Arc::as_ptr` ptr-ids.  NOT the lazily-published
+            // `bitstring_*` fields.
+            readonly_descrs_fields: majit_ir::effectinfo::descr_set_to_ptr_set_pub(
+                &effect._readonly_descrs_fields,
+            ),
+            write_descrs_fields: majit_ir::effectinfo::descr_set_to_ptr_set_pub(
+                &effect._write_descrs_fields,
+            ),
+            readonly_descrs_arrays: majit_ir::effectinfo::descr_set_to_ptr_set_pub(
+                &effect._readonly_descrs_arrays,
+            ),
+            write_descrs_arrays: majit_ir::effectinfo::descr_set_to_ptr_set_pub(
+                &effect._write_descrs_arrays,
+            ),
+            readonly_descrs_interiorfields: majit_ir::effectinfo::descr_set_to_ptr_set_pub(
+                &effect._readonly_descrs_interiorfields,
+            ),
+            write_descrs_interiorfields: majit_ir::effectinfo::descr_set_to_ptr_set_pub(
+                &effect._write_descrs_interiorfields,
+            ),
             can_invalidate: effect.can_invalidate,
             can_collect: effect.can_collect,
             call_release_gil_target: effect.call_release_gil_target,
@@ -3071,7 +3125,8 @@ enum AssemblerDescrKey {
         base_size: usize,
         itemsize: usize,
         len_offset: Option<usize>,
-        type_id: u32,
+        /// u64 cache-key surrogate matching `BhDescr::Array.type_id`.
+        type_id: u64,
         item_type: majit_ir::value::Type,
         is_array_of_pointers: bool,
         is_array_of_structs: bool,
@@ -3094,7 +3149,8 @@ enum AssemblerDescrKey {
     },
     Size {
         size: usize,
-        type_id: u32,
+        /// u64 cache-key surrogate matching `BhDescr::Size.type_id`.
+        type_id: u64,
         vtable: usize,
         owner: String,
         all_fielddescrs: Vec<crate::jitcode::BhFieldSpec>,

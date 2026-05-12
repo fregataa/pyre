@@ -14450,8 +14450,16 @@ impl majit_backend::Backend for CraneliftBackend {
     /// llmodel.py:775 bh_new(sizedescr) → gc_ll_descr.gc_malloc(sizedescr).
     fn bh_new(&self, sizedescr: &majit_translate::jitcode::BhDescr) -> i64 {
         let size = sizedescr.as_size();
-        match with_cranelift_gc(|gc| gc.alloc_nursery_typed(sizedescr.get_type_id(), size).0 as i64)
-        {
+        // PRE-EXISTING-ADAPTATION: `BhDescr.get_type_id()` returns the
+        // u64 `path_hash` cache key, but `gc.alloc_nursery_typed`
+        // expects a u32 GC tid (allocated by `gc_cache.next_struct_tid`).
+        // Truncating loses gc identity; the structural fix is to route
+        // through `gc_cache.get_size_descr` here and use the resolved
+        // descr's allocated tid.
+        match with_cranelift_gc(|gc| {
+            gc.alloc_nursery_typed(sizedescr.get_type_id() as u32, size)
+                .0 as i64
+        }) {
             Some(ptr) => ptr,
             None => {
                 let layout = std::alloc::Layout::from_size_align(size, 8)
@@ -14467,7 +14475,10 @@ impl majit_backend::Backend for CraneliftBackend {
         let size = sizedescr.as_size();
         let vtable = sizedescr.get_vtable();
         let ptr = match with_cranelift_gc(|gc| {
-            gc.alloc_nursery_typed(sizedescr.get_type_id(), size).0 as i64
+            // PRE-EXISTING-ADAPTATION: same cache-key/gc-tid conflation
+            // as `bh_new`; truncate `as u32` until gc_cache routing.
+            gc.alloc_nursery_typed(sizedescr.get_type_id() as u32, size)
+                .0 as i64
         }) {
             Some(p) => p,
             None => {
@@ -14499,7 +14510,11 @@ impl majit_backend::Backend for CraneliftBackend {
         // allocation requires a real GC type id; tid=0 means the descr
         // never went through `gc.py:548 set_type_id` and the GC tracer
         // would lack the per-item visit shape.
-        let type_id = arraydescr.get_type_id();
+        // PRE-EXISTING-ADAPTATION: `BhDescr.get_type_id()` returns the
+        // u64 `path_hash` cache key, but `active_runtime_alloc_*`
+        // expects the u32 GC tid.  Truncate `as u32` until gc_cache
+        // routing resolves the proper allocated tid here.
+        let type_id = arraydescr.get_type_id() as u32;
         assert!(
             type_id != 0,
             "bh_new_array requires ArrayDescr.tid (descr.py:340) — got 0"

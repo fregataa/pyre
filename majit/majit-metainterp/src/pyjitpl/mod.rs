@@ -1759,6 +1759,14 @@ impl<M: Clone> MetaInterp<M> {
              RPython warmspot.py:289 invariant requires a single owner at finish_setup time",
         );
         staticdata.finish_setup(codewriter, callcontrol);
+        // pyjitpl.py:2287-2290 `finish_setup_descrs`: PyPy invokes
+        // this as the immediately-following lifecycle step from
+        // `warmspot.py:289` after `finish_setup(codewriter)`. Pyre
+        // mirrors the call ordering — auto-invocation here means
+        // pyre-jit's bootstrap doesn't need a second hook, and every
+        // production caller of `MetaInterp::finish_setup` picks up
+        // `compute_bitstrings` for free.
+        staticdata.finish_setup_descrs();
         // pyjitpl.py:2268 `self.callinfocollection = codewriter.callcontrol
         //                                  .callinfocollection`. Upstream
         // exposes the populated collection through `metainterp.staticdata
@@ -1769,6 +1777,16 @@ impl<M: Clone> MetaInterp<M> {
         // identity through `Arc::clone` and the `vstring`/`Concat` resume
         // paths see a populated table instead of `None`.
         self.callinfocollection = Some(std::sync::Arc::new(staticdata.callinfocollection.clone()));
+    }
+
+    /// `pyjitpl.py:2287-2290 finish_setup_descrs` lifecycle hook.
+    ///
+    /// Idempotent — re-running publishes the same descr ordering and
+    /// the same `(eisetr, eisetw)` partition. Pyre auto-invokes this
+    /// from `MetaInterp::finish_setup` so callers don't need to
+    /// thread it explicitly.
+    pub fn finish_setup_descrs(&self) {
+        self.staticdata.finish_setup_descrs();
     }
 
     /// Narrow lifecycle hook for state-field JIT: install the canonical
@@ -4298,8 +4316,13 @@ impl<M: Clone> MetaInterp<M> {
         // owning JitCellToken.number on every TargetToken now that the token
         // exists, so `record_loop_or_bridge`'s JUMP branch
         // (`compile.py:197-199`) can read it.
+        //
+        // `compile.py:286-296` `jitcell_token.target_tokens = [start_descr]
+        // + ...` — populate the JCT-side descr list for
+        // `has_compiled_targets` parity (`pyjitpl.py:3898`).
         for target_token in &front_target_tokens {
             target_token.set_original_jitcell_token_number(token_num);
+            token.record_target_token(target_token.as_jump_target_descr());
         }
 
         // compile.py:504-511 send_loop_to_backend — unconditional virtualizable
@@ -5171,11 +5194,18 @@ impl<M: Clone> MetaInterp<M> {
                 // number here.  Without this, `record_loop_or_bridge`'s
                 // JUMP arm sees `target_owner_num == old_num !=
                 // new_token.number` and records a false self-loop keepalive.
+                // `compile.py:286-296` / `:312-323` retrace path —
+                // both prior + freshly produced TargetTokens are owned
+                // by the new JCT.  Mirror their descrs onto
+                // `JitCellToken.target_tokens` for `has_compiled_targets`
+                // parity (`pyjitpl.py:3898`).
                 for target_token in &prior_front_target_tokens {
                     target_token.set_original_jitcell_token_number(token_num);
+                    token.record_target_token(target_token.as_jump_target_descr());
                 }
                 for target_token in &unroll_opt.target_tokens {
                     target_token.set_original_jitcell_token_number(token_num);
+                    token.record_target_token(target_token.as_jump_target_descr());
                 }
                 self.warm_state.memory_manager.keep_loop_alive(&token);
                 // compile.py:213 record_loop_or_bridge.
@@ -5741,7 +5771,7 @@ impl<M: Clone> MetaInterp<M> {
                 );
                 {
                     let mut previous_tokens: Vec<std::sync::Arc<JitCellToken>> = Vec::new();
-                    let ft = self
+                    let mut ft = self
                         .compiled_loops
                         .get(&green_key)
                         .map(|c| c.front_target_tokens.clone())
@@ -5761,6 +5791,23 @@ impl<M: Clone> MetaInterp<M> {
                             self.retire_compiled_entry(green_key, old_entry, &mut traces);
                     }
                     token.set_retraced_count(rc);
+                    // `compile.py:245` `jitcell_token.target_tokens = [target_token]`
+                    // — every PyPy `compile_*` path emits at least one
+                    // TargetToken before publishing the JCT.  pyre's
+                    // FINISH-only `finish_and_compile` has no body LABEL
+                    // (the trace is `Phi → guard → ... → Finish`), so no
+                    // intrinsic TargetToken exists; synthesise one here so
+                    // `JitCellToken.target_tokens` is non-empty and the
+                    // `has_compiled_targets` (`pyjitpl.py:3898`) signal
+                    // matches PyPy's "any attached JCT is enterable".
+                    if ft.is_empty() {
+                        let synth = crate::optimizeopt::unroll::TargetToken::new_loop(token.number);
+                        synth.set_original_jitcell_token_number(token.number);
+                        ft.push(synth);
+                    }
+                    for target_token in &ft {
+                        token.record_target_token(target_token.as_jump_target_descr());
+                    }
                     self.compiled_loops.insert(
                         green_key,
                         CompiledEntry {
@@ -5963,6 +6010,9 @@ impl<M: Clone> MetaInterp<M> {
         let target_token = crate::optimizeopt::unroll::TargetToken::new_loop(token_num);
         // `compile.py:237 target_token.original_jitcell_token = jitcell_token`.
         target_token.set_original_jitcell_token_number(token_num);
+        // `compile.py:245 jitcell_token.target_tokens = [target_token]` —
+        // mirror onto JCT for `has_compiled_targets` (`pyjitpl.py:3898`).
+        token.record_target_token(target_token.as_jump_target_descr());
         let mut compiled_ops = optimized_ops.clone();
         if let Some(jump_op) = compiled_ops
             .last_mut()
@@ -7258,20 +7308,24 @@ impl<M: Clone> MetaInterp<M> {
     /// reads `cell.loop_token.as_ref()` directly per F.1 audit
     /// (`tfinal_f0_f1_landed_2026_05_07`).
     ///
-    /// PRE-EXISTING-ADAPTATION (residual): upstream step 2
-    /// `has_compiled_targets(token)` checks `token.target_tokens != []`
-    /// (`pyjitpl.py:3898`). pyre's per-token `target_tokens` list still
-    /// lives on `CompiledEntry.front_target_tokens`; until that field
-    /// migrates to `JitCellToken` (T-final.F.3 sub-slice), the closest
-    /// available signal is `!token.is_invalidated()`, which fires `false`
-    /// after a `GUARD_NOT_INVALIDATED` trip. Convergence path: once
-    /// `front_target_tokens` reaches `JitCellToken`, replace the
-    /// invalidation check with `!token.target_tokens.is_empty() && !token.is_invalidated()`.
+    /// `pyjitpl.py:3898` `has_compiled_targets(token)` parity:
+    /// `bool(token) and bool(token.target_tokens)`.  pyre stores the
+    /// per-target descr identity on `JitCellToken.target_tokens`
+    /// (`backend/src/lib.rs`); each successful `compile_loop` /
+    /// `compile_retrace` populates it through `record_target_token` so
+    /// `has_target_tokens` returns the same signal PyPy reads.
+    /// Invalidation in PyPy is `quasiimmut.py:99 looptoken.invalidated = True`
+    /// — a single boolean flag, not a clear of `target_tokens`. Pyre
+    /// routes the `bool(token)` half through `WarmEnterState::
+    /// get_procedure_token` (`warmstate.rs:174`), which filters on
+    /// `is_invalidated()`, so the post-`GUARD_NOT_INVALIDATED` `False`
+    /// PyPy reports falls out naturally without an extra
+    /// `is_invalidated` AND here.
     #[inline]
     pub fn has_compiled_loop(&self, green_key: u64) -> bool {
         self.warm_state
             .get_procedure_token(green_key)
-            .map_or(false, |token| !token.is_invalidated())
+            .map_or(false, |token| token.has_target_tokens())
     }
 
     /// Check if any guard in the compiled trace has Float-typed fail_args.
@@ -8144,6 +8198,13 @@ impl<M: Clone> MetaInterp<M> {
                             Vec::new()
                         }
                     });
+                // `compile.py:286-296` — the bridge's destination JCT inherits
+                // the loop's TargetTokens.  Mirror them onto
+                // `JitCellToken.target_tokens` so `has_compiled_targets`
+                // (`pyjitpl.py:3898`) reads non-empty after the bridge attaches.
+                for target_token in &front_target_tokens {
+                    token.record_target_token(target_token.as_jump_target_descr());
+                }
                 let retraced_count = self
                     .compiled_loops
                     .get(&original_green_key)
@@ -12667,7 +12728,14 @@ impl<M: Clone> MetaInterp<M> {
         // pyjitpl.py:2131: effectinfo = descr.get_extra_info()
         let effectinfo = descr_view.get_extra_info();
         // pyjitpl.py:2132: assert not effectinfo.check_forces_virtual_or_virtualizable()
-        debug_assert!(
+        // PyPy uses an unconditional `assert` (release-survives) — pyre's
+        // earlier `debug_assert!` differed on release builds. Match the
+        // upstream guarantee with `assert!` so a `Plain` slot that
+        // resolves to `MOST_GENERAL` (RandomEffects, which satisfies
+        // `>=` ForcesVirtualOrVirtualizable per `effectinfo.py:249-250`)
+        // crashes loudly instead of silently flipping cond_call onto
+        // a callee that may force virtuals.
+        assert!(
             !effectinfo.check_forces_virtual_or_virtualizable(),
             "do_conditional_call cannot force virtuals",
         );
@@ -13210,7 +13278,8 @@ impl std::error::Error for ChangeFrame {}
 /// correspondence PyPy gets for free from `id(ARRAY_OR_STRUCT)`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DispatchArrayDescrKey {
-    pub type_id: u32,
+    /// u64 cache-key surrogate matching `BhDescr::Array.type_id`.
+    pub type_id: u64,
     pub base_size: usize,
     pub itemsize: usize,
     pub len_offset: Option<usize>,
@@ -13848,6 +13917,154 @@ impl MetaInterpStaticData {
     /// pyjitpl.py:2245-2246 `setup_descrs(descrs)`.
     pub fn setup_descrs(&mut self, descrs: Vec<u64>) {
         self.opcode_descrs = descrs;
+    }
+
+    /// `pyjitpl.py:2287-2290 finish_setup_descrs`:
+    ///
+    /// ```python
+    /// def finish_setup_descrs(self):
+    ///     from rpython.jit.codewriter import effectinfo
+    ///     self.all_descrs = self.cpu.setup_descrs()
+    ///     effectinfo.compute_bitstrings(self.all_descrs)
+    /// ```
+    ///
+    /// Pyre lift: pulls every cached `MetaCallDescr` from
+    /// `crate::call_descr::cached_call_descrs` (CALL_DESCR_CACHE is
+    /// RPython's gc-cache call slot in pyre) and runs
+    /// `effectinfo::compute_bitstrings` over the population. The new
+    /// bitstrings are written back through `Descr::set_effect_bitstrings`
+    /// onto each `MetaCallDescr`'s `effect_info` (interior-mutable —
+    /// see the trait method's SAFETY note); the per-category
+    /// `(descr.index() → ei_index)` map returned by
+    /// `compute_bitstrings` is published into the process-global
+    /// `EI_INDEX_TABLE` so heap.rs (and other readers) can resolve
+    /// `descr.ei_index` for descrs that pyre never enumerated into
+    /// `all_descrs`.
+    ///
+    /// PRE-EXISTING-ADAPTATION: PyPy's `cpu.setup_descrs()` returns
+    /// every gc-cache descr (size/field/array/arraylen/call/
+    /// interiorfield) in one shot. Pyre lacks the central registry —
+    /// `SimpleFieldDescr` / `SimpleArrayDescr` etc. are minted on
+    /// demand by `pyre-jit-trace::descr` and `jit_struct!` macros
+    /// without registering anywhere. The side-table publication via
+    /// `EI_INDEX_TABLE` covers the gap; no GcCache parameter needed.
+    ///
+    /// Idempotent: re-running re-classifies in-place and emits the
+    /// same bitstrings (compute_bitstrings's class assignment is
+    /// deterministic for a given EI population). The `OnceLock`
+    /// publication slot makes the second call's table store a no-op;
+    /// see `publish_ei_index_table` for the keep-first semantic.
+    pub fn finish_setup_descrs(&self) {
+        // PyPy `backend/llsupport/descr.py:25-47 setup_descrs` walks
+        // `gc_cache` per-category in this fixed order: size, field,
+        // array, arraylen, call, interiorfield.  Each visit assigns
+        // the next sequential `descr_index`.  Pyre's lift threads the
+        // same group order through two side caches:
+        //
+        // - `descr_registry::DESCR_REGISTRY`: size, field, array,
+        //   arraylen, interiorfield — five of the six PyPy gc_cache
+        //   slots.  Mint sites push their freshly-created descrs in via
+        //   `register_size` / `register_field` / etc.; the
+        //   `make_simple_descr_group` helper threads size + field
+        //   registration; `pyre-jit-trace::descr` plus the
+        //   `jit_struct!` macro feed the same path.
+        // - `crate::call_descr::cached_call_descrs`: the `_cache_call`
+        //   slot for `MetaCallDescr` instances minted via
+        //   `make_call_descr_with_effect`.
+        //
+        // Concat order: sizes → fields → arrays → array_lens →
+        // call_descrs → interior_fields, mirroring `descr.py:25-47`
+        // verbatim.  This preserves PyPy's `descr_index` parity for
+        // serialised streams (used by `bridgeopt.serialize` /
+        // `opencoder.encode_descr`).  Categories that pyre doesn't
+        // register today (`array_lens` is populated only via
+        // `register_array_len` on `ArrayDescr.lendescr` mint sites — a
+        // narrow set since pyre's array descrs don't always carry a
+        // separate length descr) snapshot to empty Vec, leaving the
+        // sequential index domain compact but ordered correctly.
+        // GcCache SSOT epic Slice 2.x: call_descrs now write through to
+        // `gc_cache._cache_call_order` via `descr_registry::register_call`
+        // at `make_call_descr_with_effect` mint time, so `snapshot_calls()`
+        // returns the same population that `cached_call_descrs()` would.
+        // Concat order matches PyPy `descr.py:25-47` group order verbatim.
+        let mut all_descrs: Vec<DescrRef> = Vec::new();
+        all_descrs.extend(majit_ir::descr_registry::snapshot_sizes());
+        all_descrs.extend(majit_ir::descr_registry::snapshot_fields());
+        all_descrs.extend(majit_ir::descr_registry::snapshot_arrays());
+        all_descrs.extend(majit_ir::descr_registry::snapshot_array_lens());
+        all_descrs.extend(majit_ir::descr::gc_cache().lock().unwrap().snapshot_calls());
+        all_descrs.extend(majit_ir::descr_registry::snapshot_interior_fields());
+
+        // `descr.py:25-47 setup_descrs` assigns sequential `descr_index`
+        // to every cached descr in fixed group order (size, field, array,
+        // arraylen, call, interiorfield).  PyPy reads `descr.descr_index`
+        // from `bridgeopt.serialize` / `opencoder.encode_descr`
+        // (`pyjitpl.py:2245-2253`) so the per-trace serialised stream
+        // can recover the descr from a small integer instead of a raw
+        // Python object pointer.  Pyre's lift writes through the
+        // existing trait-method `Descr::set_descr_index` (`descr.rs:1973`
+        // and siblings); descrs without an override default to a no-op
+        // and stay at -1 (the initial sentinel from
+        // `BackendDescr.descr_index = -1`, `history.py:1092`).
+        for (idx, d) in all_descrs.iter().enumerate() {
+            d.set_descr_index(idx as i32);
+        }
+
+        // Publish onto staticdata.all_descrs so opencoder / bridgeopt /
+        // optimizer reads pick up the same length.
+        *self.all_descrs.lock().unwrap() = all_descrs.clone();
+
+        // pyjitpl.py:2290 `effectinfo.compute_bitstrings(self.all_descrs)`.
+        // Two-pass mutation: clone each call descr's EI for the algorithm
+        // input, run compute_bitstrings, then write the new bitstrings
+        // back to the original descr via Descr::set_effect_bitstrings.
+        // The two-pass shape avoids holding mutable borrows across the
+        // 6 cached fields while compute_bitstrings is doing its
+        // cross-EI partitioning.
+        let mut owned_eis: Vec<majit_ir::EffectInfo> = Vec::new();
+        let mut writeback_descrs: Vec<DescrRef> = Vec::new();
+        for d in &all_descrs {
+            if let Some(cd) = d.as_call_descr() {
+                owned_eis.push(cd.get_extra_info().clone());
+                writeback_descrs.push(d.clone());
+            }
+        }
+        let table = {
+            let mut ei_refs: Vec<&mut majit_ir::EffectInfo> = owned_eis.iter_mut().collect();
+            majit_ir::effectinfo::compute_bitstrings(&all_descrs, &mut ei_refs)
+        };
+        // `effectinfo.py:526` `descr.ei_index = …`. Pyre lacks a
+        // descriptor enumeration to back-write `ei_index` onto every
+        // field/array descr — `compute_bitstrings`'s `set_ei_index`
+        // loop only fires on descrs the caller has already collected
+        // into `all_descrs` (which excludes pyre's per-callsite
+        // `SimpleFieldDescr::new` allocations). Publishing the
+        // category-keyed map as the side-table lookup makes
+        // `heap.rs::field_effect_index` resolution unambiguous in
+        // either direction (descr-side `ei_index` field OR
+        // side-table map).
+        majit_ir::effectinfo::publish_ei_index_table(table);
+        // Write back the rewritten bitstring fields. PyPy
+        // `effectinfo.py:537-538` `setattr(ei, 'bitstring_*', ...)` runs
+        // inside compute_bitstrings; pyre splits that into a separate
+        // pass so the descr-side interior-mutability cast in
+        // `Descr::set_effect_bitstrings` is the only mutating path.
+        for (descr, ei) in writeback_descrs.iter().zip(owned_eis.into_iter()) {
+            descr.set_effect_bitstrings(
+                ei.readonly_descrs_fields,
+                ei.write_descrs_fields,
+                ei.readonly_descrs_arrays,
+                ei.write_descrs_arrays,
+                ei.readonly_descrs_interiorfields,
+                ei.write_descrs_interiorfields,
+            );
+        }
+        // `effectinfo.py:182-184` invariant gate — flip the global
+        // "compute_bitstrings has run" flag so `make_call_descr_with_effect`
+        // panics on any subsequent EI with a non-trivial raw descr set.
+        // PyPy maintains the same invariant implicitly via codewriter
+        // lifecycle ordering + the `Ellipsis` sentinel.
+        majit_ir::effectinfo::mark_compute_bitstrings_ran();
     }
 
     /// Register a `JitDriverStaticData` slot.  Returns the index that
