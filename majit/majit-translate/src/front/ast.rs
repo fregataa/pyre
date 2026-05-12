@@ -2963,6 +2963,7 @@ fn lower_expr(
                         base,
                         index,
                         item_ty,
+                        nolength: nolength_from_array_type_id(array_type_id.as_deref()),
                         array_type_id,
                     },
                     true,
@@ -3043,6 +3044,7 @@ fn lower_expr(
                             index,
                             value,
                             item_ty,
+                            nolength: nolength_from_array_type_id(array_type_id.as_deref()),
                             array_type_id,
                         },
                         false,
@@ -6077,6 +6079,63 @@ fn split_tuple_type_elements(type_str: &str) -> Option<Vec<String>> {
         elements.push(last.to_string());
     }
     Some(elements)
+}
+
+/// `descr.py:359 ARRAY_INSIDE._hints.get('nolength', False)` source-level
+/// reader. PyPy's flowgraph carries the lltype object on every array op
+/// and the JIT consults `_hints` directly; pyre's source-level analysis
+/// has only the Rust type spelling, so we approximate the bit by
+/// inspecting the pointee after stripping pointer-like prefixes.
+///
+/// Default is `False` to match PyPy's `_hints.get('nolength', False)`.
+/// We only return `true` when the pointee is unambiguously a contiguous
+/// item run with no length header:
+///
+/// - `[T]` / `[T; N]` — Rust slice / fixed-size array syntax. Pointer
+///   addresses items[0]; no length word stored in the block.
+/// - `*const T` / `*mut T` / `&T` / `&mut T` where the pointee `T` has
+///   no generic parameters (`<…>`) and no parenthesised wrapper
+///   (`Ptr(…)`). A bare identifier (`i64`, `Point`, `usize`, …) is
+///   read as the *element* type and the pointer addresses items[0].
+///
+/// All other shapes — `Vec<T>`, `GcArray<T>`, `Ptr(GcArray(T))`,
+/// `*const GcArray<T>`, … — keep PyPy's default `False`. The wrapper
+/// retains a length header at offset 0; a `*const GcArray<T>` is a
+/// pointer to that header block, not to items[0], so its descr must
+/// carry `lendescr` per `descr.py:359-362`.
+pub(crate) fn nolength_from_array_type_id(array_type_id: Option<&str>) -> bool {
+    let Some(s) = array_type_id else {
+        return false;
+    };
+    let mut inner = s.trim();
+    loop {
+        let stripped = inner
+            .strip_prefix("*const ")
+            .or_else(|| inner.strip_prefix("*mut "))
+            .or_else(|| inner.strip_prefix("&mut "))
+            .or_else(|| inner.strip_prefix('&'));
+        match stripped {
+            Some(rest) => inner = rest.trim_start(),
+            None => break,
+        }
+    }
+    // `[T]` / `[T; N]` are unambiguous headerless item runs.
+    if inner.starts_with('[') && inner.ends_with(']') {
+        return true;
+    }
+    // Length-prefixed wrappers carry `<` (generic) or `(` (paren-style
+    // lltype spelling such as `Ptr(GcArray(...))`).  Keep the PyPy
+    // default `False` for those — a pointer to a wrapper still
+    // dereferences a length header.
+    if inner.contains('<') || inner.contains('(') {
+        return false;
+    }
+    // Bare identifier pointee (`*const i64`, `*const Point`) means the
+    // pointer addresses items[0] of a primitive / struct item type.
+    // A bare identifier with NO pointer prefix is a value-type binding
+    // (e.g. an `array_type_id` directly naming a struct that contains
+    // an embedded array); preserve the PyPy default `False` for that.
+    s.trim() != inner
 }
 
 fn bind_ident_type(ident: &syn::Ident, type_str: &str, ctx: &mut GraphBuildContext<'_>) {

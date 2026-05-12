@@ -3554,6 +3554,18 @@ impl OptUnroll {
         if let Some(ptr_info) = ctx.peek_ptr_info_via_box(resolved) {
             return Some(OpInfo::Ptr(ptr_info));
         }
+        // PRE-EXISTING-ADAPTATION: read from `exported_int_bounds`
+        // side table.  RPython's `IntBound` flows through
+        // `OptInfo.IntBound` on the Box itself
+        // (`optimizeopt/info.py:580 IntBoundInfo`), so successive peeling
+        // iterations see the bound without an explicit hand-off.
+        // pyre's flat-OpRef `OptContext` is rebuilt per round so the
+        // preamble's bound must be exported by
+        // `intbounds.rs::export_arg_int_bounds` and re-imported here.
+        // Convergence: extend `setinfo_from_preamble_item` (`mod.rs`)
+        // to attach `OpInfo::IntBound` alongside `OpInfo::Ptr` so this
+        // branch becomes redundant and the side-table parameter
+        // disappears.
         if let Some(bound) = exported_int_bounds.and_then(|bounds| bounds.get(&resolved).cloned()) {
             return Some(OpInfo::IntBound(bound));
         }

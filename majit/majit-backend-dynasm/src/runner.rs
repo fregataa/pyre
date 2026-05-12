@@ -2155,6 +2155,35 @@ impl Backend for DynasmBackend {
         ptr as i64
     }
 
+    /// llmodel.py:788-790 bh_new_array / bh_new_array_clear.
+    fn bh_new_array(&self, length: i64, arraydescr: &majit_translate::jitcode::BhDescr) -> i64 {
+        let length = usize::try_from(length).expect("bh_new_array length must be non-negative");
+        let (base_size, itemsize, _sign) = arraydescr.unpack_arraydescr_size();
+        let len_offset = arraydescr
+            .array_len_offset()
+            .expect("bh_new_array requires ArrayDescr.lendescr");
+        // descr.py:340 `ArrayDescr.get_type_id(): assert self.tid` —
+        // allocation requires a real GC type id; tid=0 means the descr
+        // never went through `gc.py:548 set_type_id` and the GC tracer
+        // would lack the per-item visit shape.
+        let type_id = arraydescr.get_type_id();
+        assert!(
+            type_id != 0,
+            "bh_new_array requires ArrayDescr.tid (descr.py:340) — got 0"
+        );
+        dynasm_alloc_varsize_typed_and_set_len(type_id, base_size, itemsize, len_offset, length)
+            as i64
+    }
+
+    /// llmodel.py:790 bh_new_array_clear = bh_new_array.
+    fn bh_new_array_clear(
+        &self,
+        length: i64,
+        arraydescr: &majit_translate::jitcode::BhDescr,
+    ) -> i64 {
+        self.bh_new_array(length, arraydescr)
+    }
+
     /// llsupport/gc.py:563 GcLLDescr_framework
     ///   .get_typeid_from_classptr_if_gcremovetypeptr(classptr)
     /// Resolves a vtable pointer through the installed gc_ll_descr.
@@ -2378,6 +2407,113 @@ impl Backend for DynasmBackend {
     ) {
         let offset = fielddescr.as_offset();
         unsafe { *((struct_ptr as *mut u8).add(offset) as *mut usize) = value.0 };
+    }
+
+    /// llmodel.py:592-594 bh_getarrayitem_gc_i: ofs=base_size, size+sign
+    /// from `unpack_arraydescr_size`; route through `read_int_at_mem`
+    /// at `gcref + ofs + index*size`.
+    fn bh_getarrayitem_gc_i(
+        &self,
+        array_ptr: i64,
+        index: i64,
+        arraydescr: &majit_translate::jitcode::BhDescr,
+    ) -> i64 {
+        let (base_size, itemsize, sign) = arraydescr.unpack_arraydescr_size();
+        let offset = (base_size as i64) + index * (itemsize as i64);
+        self.read_int_at_mem(array_ptr, offset, itemsize, sign)
+    }
+
+    /// model.py:254 / llmodel.py:585-588 bh_arraylen_gc.
+    /// Read the length word from `arraydescr.lendescr.offset`.
+    fn bh_arraylen_gc(
+        &self,
+        array_ptr: i64,
+        arraydescr: &majit_translate::jitcode::BhDescr,
+    ) -> i64 {
+        let ofs = arraydescr
+            .array_len_offset()
+            .expect("bh_arraylen_gc requires ArrayDescr.lendescr");
+        self.read_int_at_mem(array_ptr, ofs as i64, std::mem::size_of::<usize>(), true)
+    }
+
+    /// llmodel.py:597-599 bh_getarrayitem_gc_r: ofs=base_size, item width
+    /// fixed at `WORD` (8 bytes).  Direct deref of `*const usize` mirrors
+    /// `bh_getfield_gc_r`'s pattern so the GcRef carries the raw machine
+    /// word from memory.
+    fn bh_getarrayitem_gc_r(
+        &self,
+        array_ptr: i64,
+        index: i64,
+        arraydescr: &majit_translate::jitcode::BhDescr,
+    ) -> majit_ir::GcRef {
+        let base_size = arraydescr.array_base_size();
+        let offset = (base_size as i64) + index * 8;
+        let raw = unsafe { *((array_ptr as *const u8).offset(offset as isize) as *const usize) };
+        majit_ir::GcRef(raw)
+    }
+
+    /// llmodel.py:603-606 bh_getarrayitem_gc_f: ofs=base_size, item
+    /// width fixed at `sizeof(FLOATSTORAGE)` (8 bytes).  Routes through
+    /// `read_float_at_mem` for the same `read_unaligned` safety as the
+    /// field sibling.
+    fn bh_getarrayitem_gc_f(
+        &self,
+        array_ptr: i64,
+        index: i64,
+        arraydescr: &majit_translate::jitcode::BhDescr,
+    ) -> f64 {
+        let base_size = arraydescr.array_base_size();
+        let offset = (base_size as i64) + index * 8;
+        self.read_float_at_mem(array_ptr, offset)
+    }
+
+    /// llmodel.py:609-611 bh_setarrayitem_gc_i.
+    fn bh_setarrayitem_gc_i(
+        &self,
+        array_ptr: i64,
+        index: i64,
+        newvalue: i64,
+        arraydescr: &majit_translate::jitcode::BhDescr,
+    ) {
+        let (base_size, itemsize, _sign) = arraydescr.unpack_arraydescr_size();
+        let offset = (base_size as i64) + index * (itemsize as i64);
+        self.write_int_at_mem(array_ptr, offset, itemsize, newvalue);
+    }
+
+    /// llmodel.py:613-615 bh_setarrayitem_gc_r.
+    fn bh_setarrayitem_gc_r(
+        &self,
+        array_ptr: i64,
+        index: i64,
+        newvalue: majit_ir::GcRef,
+        arraydescr: &majit_translate::jitcode::BhDescr,
+    ) {
+        let base_size = arraydescr.array_base_size();
+        let offset = (base_size as i64) + index * 8;
+        unsafe {
+            *((array_ptr as *mut u8).offset(offset as isize) as *mut usize) = newvalue.0;
+        }
+        // llmodel.py:495-497 `write_ref_at_mem`: raw_store + "write
+        // barrier is implied above". `dynasm_write_barrier_from_array`
+        // routes through `gc.jit_remember_young_pointer_from_array`
+        // for the CARDS_SET transition matching
+        // opassembler.py:953-960's array barrier path.
+        if array_ptr != 0 {
+            dynasm_write_barrier_from_array(array_ptr as u64);
+        }
+    }
+
+    /// llmodel.py:618-621 bh_setarrayitem_gc_f.
+    fn bh_setarrayitem_gc_f(
+        &self,
+        array_ptr: i64,
+        index: i64,
+        newvalue: f64,
+        arraydescr: &majit_translate::jitcode::BhDescr,
+    ) {
+        let base_size = arraydescr.array_base_size();
+        let offset = (base_size as i64) + index * 8;
+        self.write_float_at_mem(array_ptr, offset, newvalue);
     }
 
     /// llmodel.py:705-707 bh_getfield_gc_f delegates to read_float_at_mem.

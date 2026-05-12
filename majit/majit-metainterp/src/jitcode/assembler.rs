@@ -790,11 +790,20 @@ impl JitCodeBuilder {
         self.add_bh_descr(CanonicalBhDescr::Array {
             base_size: 0,
             itemsize: 1,
+            // base_size=0 → no length header (raw `&[u8]` data pointer
+            // points directly at items[0]); descr.py:359-362 nolength
+            // shape carries `lendescr=None`.
+            len_offset: None,
             type_id: 0,
             item_type: majit_ir::value::Type::Int,
             is_array_of_pointers: false,
             is_array_of_structs: false,
             is_item_signed: false,
+            ei_index: u32::MAX,
+            // `&[u8]` byte-array descrs are minted at assembler bootstrap
+            // with no source-level array_type_id; the structural tuple
+            // (base_size=0, itemsize=1, …) uniquely identifies them.
+            array_type_id: None,
             interior_fields: Vec::new(),
         })
     }
@@ -3242,11 +3251,17 @@ impl JitCodeBuilder {
         self.add_bh_descr(CanonicalBhDescr::Array {
             base_size: std::mem::size_of::<usize>(),
             itemsize: 8,
+            len_offset: Some(0),
             type_id: 0,
             item_type,
             is_array_of_pointers: matches!(item_type, majit_ir::value::Type::Ref),
             is_array_of_structs: false,
             is_item_signed,
+            ei_index: u32::MAX,
+            // vable array slots are per-vinfo with no source-level
+            // ARRAY type spelling; distinct slots are disambiguated by
+            // the parent `VableArray { index }` variant.
+            array_type_id: None,
             interior_fields: Vec::new(),
         })
     }
@@ -3779,31 +3794,51 @@ fn canonical_bh_descr_eq(lhs: &CanonicalBhDescr, rhs: &CanonicalBhDescr) -> bool
             CanonicalBhDescr::Array {
                 base_size: lhs_base_size,
                 itemsize: lhs_itemsize,
+                len_offset: lhs_len_offset,
                 type_id: lhs_type_id,
                 item_type: lhs_item_type,
                 is_array_of_pointers: lhs_is_array_of_pointers,
                 is_array_of_structs: lhs_is_array_of_structs,
                 is_item_signed: lhs_is_item_signed,
+                ei_index: _,
+                array_type_id: lhs_array_type_id,
                 interior_fields: lhs_interior_fields,
             },
             CanonicalBhDescr::Array {
                 base_size: rhs_base_size,
                 itemsize: rhs_itemsize,
+                len_offset: rhs_len_offset,
                 type_id: rhs_type_id,
                 item_type: rhs_item_type,
                 is_array_of_pointers: rhs_is_array_of_pointers,
                 is_array_of_structs: rhs_is_array_of_structs,
                 is_item_signed: rhs_is_item_signed,
+                ei_index: _,
+                array_type_id: rhs_array_type_id,
                 interior_fields: rhs_interior_fields,
             },
         ) => {
+            // `ei_index` is intentionally NOT part of the identity
+            // tuple — upstream `gccache._cache_array[ARRAY_OR_STRUCT]`
+            // (`descr.py:348-360`) keys on the lltype itself, and
+            // `compute_bitstrings` (`effectinfo.py:465`) later assigns
+            // the index slot as a derived attribute that multiple
+            // descrs are free to share.
+            //
+            // `array_type_id` joins the identity tuple as the
+            // codewriter lltype-identity proxy so two ARRAY entries
+            // that disagree on the Rust type spelling stay on distinct
+            // canonical slots even when their numeric `type_id`
+            // collides (default `0`).
             lhs_base_size == rhs_base_size
                 && lhs_itemsize == rhs_itemsize
+                && lhs_len_offset == rhs_len_offset
                 && lhs_type_id == rhs_type_id
                 && lhs_item_type == rhs_item_type
                 && lhs_is_array_of_pointers == rhs_is_array_of_pointers
                 && lhs_is_array_of_structs == rhs_is_array_of_structs
                 && lhs_is_item_signed == rhs_is_item_signed
+                && lhs_array_type_id == rhs_array_type_id
                 && lhs_interior_fields == rhs_interior_fields
         }
         // PRE-EXISTING-ADAPTATION: `Call` variant intentionally falls

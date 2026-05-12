@@ -325,6 +325,12 @@ pub enum OpKind {
         /// Distinguishes arrays with the same item_ty but different
         /// container types (e.g. `Vec<Point>` vs `Vec<Line>`).
         array_type_id: Option<String>,
+        /// RPython: `ARRAY_INSIDE._hints.get('nolength', False)`
+        /// (descr.py:359). `true` when the operand addresses a raw
+        /// items region with no length header; `false` (the common
+        /// length-prefixed shape) lays the length word at offset 0
+        /// and items past it.
+        nolength: bool,
     },
     ArrayWrite {
         base: ValueId,
@@ -333,6 +339,9 @@ pub enum OpKind {
         item_ty: ValueType,
         /// RPython: ARRAY identity for `cpu.arraydescrof(ARRAY)`.
         array_type_id: Option<String>,
+        /// RPython: `ARRAY_INSIDE._hints.get('nolength', False)`
+        /// (descr.py:359). See `ArrayRead::nolength`.
+        nolength: bool,
     },
     /// RPython: getinteriorfield_gc_i/r/f — read a field of an array-of-structs element.
     /// effectinfo.py:313-325: generates "readinteriorfield" effect.

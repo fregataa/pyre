@@ -1316,8 +1316,9 @@ pub fn load_const_concrete(constant: &pyre_interpreter::bytecode::ConstantData) 
 use pyre_interpreter::{DictStorage, decode_instruction_at};
 
 use crate::descr::{
-    PY_OBJECT_ARRAY_GC_TYPE_ID, float_floatval_descr, int_intval_descr, make_array_descr,
-    make_array_descr_with_type, w_float_size_descr, w_int_size_descr,
+    GC_FLOAT_ARRAY_GC_TYPE_ID, GC_INT_ARRAY_GC_TYPE_ID, PY_OBJECT_ARRAY_GC_TYPE_ID,
+    float_floatval_descr, int_intval_descr, make_array_descr, make_array_descr_with_type,
+    w_float_size_descr, w_int_size_descr,
 };
 use crate::frame_layout::{
     PYFRAME_DEBUGDATA_OFFSET, PYFRAME_LASTBLOCK_OFFSET, PYFRAME_LOCALS_CELLS_STACK_OFFSET,
@@ -1681,7 +1682,10 @@ pub struct PyreEnv;
 /// `base_size = FIXED_ARRAY_ITEMS_OFFSET` makes the descriptor itself
 /// skip the length prefix.
 pub(crate) fn pyobject_array_descr() -> DescrRef {
-    make_array_descr(0, 8, Type::Ref, false)
+    // `nolength=True` shape (descr.py:359-360): items start at offset 0,
+    // no length header — `GETARRAYITEM_GC_R(ptr, i)` lands on
+    // `ptr + i * item_size`.
+    make_array_descr(0, 8, None, Type::Ref, false)
 }
 
 /// Descriptor for RPython `Ptr(GcArray(PyObjectRef))` containers —
@@ -1703,21 +1707,52 @@ pub(crate) fn pyobject_gcarray_descr() -> DescrRef {
     // wrong fib values on dynasm and SIGSEGV on cranelift once the
     // recursion depth fills the nursery (rgc parity:
     // gctypelayout.py:266-291 T_IS_VARSIZE / T_IS_GCARRAY_OF_GCPTR).
+    // Length-prefixed shape (descr.py:362): the array_ptr addresses the
+    // length header at offset 0, items start at `FIXED_ARRAY_ITEMS_OFFSET`.
     make_array_descr_with_type(
         pyre_object::FIXED_ARRAY_ITEMS_OFFSET,
         8,
         PY_OBJECT_ARRAY_GC_TYPE_ID,
+        Some(0),
         Type::Ref,
         false,
     )
 }
 
 pub(crate) fn int_array_descr() -> DescrRef {
-    make_array_descr(0, 8, Type::Int, true)
+    // `nolength=True` view: caller already holds `*ItemsBlock`-style
+    // pointer to the items region, so no length header.
+    make_array_descr(0, 8, None, Type::Int, true)
 }
 
 pub(crate) fn float_array_descr() -> DescrRef {
-    make_array_descr(0, 8, Type::Float, false)
+    make_array_descr(0, 8, None, Type::Float, false)
+}
+
+/// Descriptor for `Ptr(GcArray(Signed))` materialized from resume data:
+/// `[len][items...]` with the block pointer addressing the length word.
+fn gc_int_array_descr() -> DescrRef {
+    make_array_descr_with_type(
+        pyre_object::GC_TYPED_ARRAY_ITEMS_OFFSET,
+        8,
+        GC_INT_ARRAY_GC_TYPE_ID,
+        Some(0),
+        Type::Int,
+        true,
+    )
+}
+
+/// Descriptor for `Ptr(GcArray(Float))` materialized from resume data:
+/// `[len][items...]` with the block pointer addressing the length word.
+fn gc_float_array_descr() -> DescrRef {
+    make_array_descr_with_type(
+        pyre_object::GC_TYPED_ARRAY_ITEMS_OFFSET,
+        8,
+        GC_FLOAT_ARRAY_GC_TYPE_ID,
+        Some(0),
+        Type::Float,
+        false,
+    )
 }
 
 /// resume.py:656 arraydescr kind dispatch for virtual array materialization.
@@ -1725,8 +1760,8 @@ pub(crate) fn float_array_descr() -> DescrRef {
 pub(crate) fn array_descr_for_kind(kind: u8, _descr_index: u32) -> DescrRef {
     match kind {
         0 => pyobject_gcarray_descr(),
-        2 => float_array_descr(),
-        _ => int_array_descr(),
+        2 => gc_float_array_descr(),
+        _ => gc_int_array_descr(),
     }
 }
 
@@ -4234,8 +4269,13 @@ fn materialize_bridge_virtual(
                     2 => majit_ir::Type::Float,
                     _ => majit_ir::Type::Int,
                 };
-                let store_descr =
-                    crate::descr::make_array_descr(di.base_size, di.item_size, tp, di.is_signed);
+                let store_descr = crate::descr::make_array_descr(
+                    di.base_size,
+                    di.item_size,
+                    di.len_offset,
+                    tp,
+                    di.is_signed,
+                );
                 let offset_ref = ctx.const_int(off as i64);
                 ctx.record_op_with_descr(
                     OpCode::RawStore,
@@ -7292,6 +7332,7 @@ mod tests {
                     item_size: 8,
                     item_type: 1,
                     is_signed: false,
+                    len_offset: None,
                 },
                 majit_ir::ArrayDescrInfo {
                     index: 0,
@@ -7299,6 +7340,7 @@ mod tests {
                     item_size: 8,
                     item_type: 1,
                     is_signed: false,
+                    len_offset: None,
                 },
             ],
             values: vec![

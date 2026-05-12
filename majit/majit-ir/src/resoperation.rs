@@ -511,6 +511,12 @@ pub struct ArrayDescrInfo {
     pub item_type: u8,
     /// descr.py:241-254 FLAG_SIGNED.
     pub is_signed: bool,
+    /// descr.py:277 / descr.py:359-362 — `ArrayDescr.lendescr.offset`.
+    /// `None` for the `nolength=True` shape (raw buffers); `Some(off)`
+    /// for length-prefixed `Ptr(GcArray(T))`. Carries the live offset
+    /// across the resume/materialization summary boundary so backends
+    /// can read the length word from the same place the producer wrote.
+    pub len_offset: Option<usize>,
 }
 
 /// AbstractVirtualInfo hierarchy (VirtualInfo, VStructInfo, VArrayInfo, etc.).

@@ -1267,6 +1267,7 @@ impl Assembler {
                 index,
                 item_ty,
                 array_type_id,
+                nolength,
             } => {
                 let (reg, kc) = self.lookup_reg_with_kind(*base, regallocs);
                 state.code.push(reg);
@@ -1274,8 +1275,18 @@ impl Assembler {
                 let (reg, kc) = self.lookup_reg_with_kind(*index, regallocs);
                 state.code.push(reg);
                 argcodes.push(kc);
-                let descr_idx =
-                    self.emit_ready_descr(arraydescrof(item_ty, array_type_id, callcontrol));
+                // descr.py:359-362 + ARRAY_INSIDE._hints.get('nolength',
+                // False): the producer (model::OpKind::ArrayRead) carries
+                // the layout bit. `nolength=true` → no length header
+                // (`lendescr=None`); `nolength=false` → length word at
+                // offset 0 (`lendescr=Some(0)`).
+                let len_offset = if *nolength { None } else { Some(0) };
+                let descr_idx = self.emit_ready_descr(arraydescrof(
+                    item_ty,
+                    array_type_id,
+                    len_offset,
+                    callcontrol,
+                ));
                 state.code.push((descr_idx & 0xFF) as u8);
                 state.code.push((descr_idx >> 8) as u8);
                 argcodes.push('d');
@@ -1301,6 +1312,7 @@ impl Assembler {
                 value,
                 item_ty,
                 array_type_id,
+                nolength,
             } => {
                 let (reg, kc) = self.lookup_reg_with_kind(*base, regallocs);
                 state.code.push(reg);
@@ -1311,8 +1323,20 @@ impl Assembler {
                 let (reg, value_kind) = self.lookup_reg_with_kind(*value, regallocs);
                 state.code.push(reg);
                 argcodes.push(value_kind);
-                let descr_idx =
-                    self.emit_ready_descr(arraydescrof(item_ty, array_type_id, callcontrol));
+                // pyre source-level array operations are emitted from
+                // `Vec<T>` / GcArray-backed layouts that always carry a
+                // length header at offset 0 (rust-source / jit_codewriter
+                // descr.py:359-362 + ARRAY_INSIDE._hints.get('nolength',
+                // False): the producer carries the layout bit via
+                // `OpKind::ArrayWrite::nolength`; same encoding rule as
+                // ArrayRead above.
+                let len_offset = if *nolength { None } else { Some(0) };
+                let descr_idx = self.emit_ready_descr(arraydescrof(
+                    item_ty,
+                    array_type_id,
+                    len_offset,
+                    callcontrol,
+                ));
                 state.code.push((descr_idx & 0xFF) as u8);
                 state.code.push((descr_idx >> 8) as u8);
                 argcodes.push('d');
@@ -2605,22 +2629,40 @@ fn bh_interior_field_specs_from_array_descr(
 fn arraydescrof(
     ty: &crate::model::ValueType,
     array_type_id: &Option<String>,
+    len_offset: Option<usize>,
     callcontrol: Option<&CallControl>,
 ) -> crate::jitcode::BhDescr {
     let ir_type = value_type_to_ir_type_for_descr(ty);
     if let Some(cc) = callcontrol {
-        let descr = cc.arraydescrof(0, array_type_id, ir_type);
+        // Route through `arraydescrof_for_type` so the bytecode emit
+        // path shares the same `(item_ty, array_type_id, len_offset) → ei_index`
+        // table as `writeanalyze` in `call.rs`; otherwise
+        // every emit-time descr lands at `ei_index = 0` and aliases
+        // distinct ARRAY identities at `force_from_effectinfo`
+        // (`heap.py:540-560`, `heap.rs:839 array_effect_index`).
+        let descr = cc.arraydescrof_for_type(ty, array_type_id, ir_type, len_offset);
         let array_descr = descr
             .as_array_descr()
             .expect("CallControl::arraydescrof must return an ArrayDescr");
         return crate::jitcode::BhDescr::Array {
             base_size: array_descr.base_size(),
             itemsize: array_descr.item_size(),
+            len_offset: array_descr.len_descr().map(|fd| fd.offset()),
             type_id: array_descr.type_id(),
             item_type: array_descr.item_type(),
             is_array_of_pointers: array_descr.is_array_of_pointers(),
             is_array_of_structs: array_descr.is_array_of_structs(),
             is_item_signed: array_descr.is_item_signed(),
+            // descr.py:465 compute_bitstrings — carry the SimpleArrayDescr's
+            // ei_index across the BhDescr boundary so make_descr_from_bh
+            // republishes it on the runtime PyreArrayDescr.
+            ei_index: descr.get_ei_index(),
+            // descr.py:348-360 cache identity — carry the codewriter
+            // `array_type_id` across the BhDescr boundary so the
+            // runtime `ArrayDescrKey` keeps two distinct ARRAY lltypes
+            // on distinct slots even when their structural tuples
+            // coincide (`type_id == 0` default, same item layout).
+            array_type_id: array_type_id.clone(),
             interior_fields: bh_interior_field_specs_from_array_descr(array_descr),
         };
     }
@@ -2656,14 +2698,30 @@ fn arraydescrof(
             ),
         }
     };
+    // descr.py:354/359-362 + symbolic.get_array_token — basesize follows
+    // the lltype's nolength flag: nolength → items at offset 0;
+    // length-prefixed → items past the header at len_offset + WORD.
+    let base_size = match len_offset {
+        None => 0,
+        Some(off) => off + std::mem::size_of::<usize>(),
+    };
     crate::jitcode::BhDescr::Array {
-        base_size: std::mem::size_of::<usize>(),
+        base_size,
         itemsize,
+        len_offset,
         type_id: 0,
         item_type,
         is_array_of_pointers: flag == majit_ir::descr::ArrayFlag::Pointer,
         is_array_of_structs: flag == majit_ir::descr::ArrayFlag::Struct,
         is_item_signed: flag == majit_ir::descr::ArrayFlag::Signed,
+        // No CallControl-side `array_index` for the fallback path —
+        // mint-time bridge unset; readers consult `get_ei_index()` and
+        // fall back to `descr.index()` per heap.rs::array_effect_index.
+        ei_index: u32::MAX,
+        // Codewriter-less fallback still carries the ARRAY identity
+        // string so the runtime registry keeps distinct lltypes
+        // distinct.
+        array_type_id: array_type_id.clone(),
         interior_fields: Vec::new(),
     }
 }
@@ -2677,11 +2735,19 @@ fn vable_arraydescrof(
     crate::jitcode::BhDescr::Array {
         base_size: std::mem::size_of::<usize>(),
         itemsize,
+        len_offset: Some(0),
         type_id: 0,
         item_type,
         is_array_of_pointers: matches!(item_type, majit_ir::value::Type::Ref),
         is_array_of_structs: false,
         is_item_signed,
+        // vable array slots are codewriter-known per-vinfo descrs, not
+        // EffectInfo-keyed; ei_index stays unset.
+        ei_index: u32::MAX,
+        // vable array slots have no source-level array_type_id;
+        // distinct vable indices are already disambiguated by the
+        // parent `VableArray { index }` variant carried alongside.
+        array_type_id: None,
         interior_fields: Vec::new(),
     }
 }
@@ -3004,11 +3070,26 @@ enum AssemblerDescrKey {
     Array {
         base_size: usize,
         itemsize: usize,
+        len_offset: Option<usize>,
         type_id: u32,
         item_type: majit_ir::value::Type,
         is_array_of_pointers: bool,
         is_array_of_structs: bool,
         is_item_signed: bool,
+        // `ei_index` deliberately omitted from the identity tuple —
+        // upstream `gccache._cache_array[ARRAY_OR_STRUCT]`
+        // (`descr.py:348-360`) keys on the lltype itself, and
+        // `compute_bitstrings` (`effectinfo.py:465`) later assigns the
+        // index slot as a derived attribute that multiple descrs are
+        // free to share.
+        //
+        // `array_type_id` joins the identity tuple as the codewriter
+        // lltype-identity proxy so two ARRAYs that disagree only on
+        // the Rust type string (e.g. `Vec<Foo>` vs `Vec<Bar>` with
+        // both at `type_id == 0`) keep distinct slots in the
+        // assembler's `_descr_dict`, mirroring upstream's per-lltype
+        // cache identity.
+        array_type_id: Option<String>,
         interior_fields: Vec<crate::jitcode::BhInteriorFieldSpec>,
     },
     Size {
@@ -3094,20 +3175,27 @@ impl AssemblerDescrKey {
             crate::jitcode::BhDescr::Array {
                 base_size,
                 itemsize,
+                len_offset,
                 type_id,
                 item_type,
                 is_array_of_pointers,
                 is_array_of_structs,
                 is_item_signed,
+                // `ei_index` intentionally not part of the identity
+                // tuple — see `AssemblerDescrKey::Array` comment.
+                ei_index: _,
+                array_type_id,
                 interior_fields,
             } => Self::Array {
                 base_size: *base_size,
                 itemsize: *itemsize,
+                len_offset: *len_offset,
                 type_id: *type_id,
                 item_type: *item_type,
                 is_array_of_pointers: *is_array_of_pointers,
                 is_array_of_structs: *is_array_of_structs,
                 is_item_signed: *is_item_signed,
+                array_type_id: array_type_id.clone(),
                 interior_fields: interior_fields.clone(),
             },
             crate::jitcode::BhDescr::Size {
@@ -3843,6 +3931,7 @@ mod tests {
                 value,
                 item_ty: ValueType::Unknown,
                 array_type_id: None,
+                nolength: false,
             },
             false,
         );
@@ -3962,6 +4051,7 @@ mod tests {
                     index,
                     item_ty: ValueType::Unknown,
                     array_type_id: None,
+                    nolength: false,
                 },
                 true,
             )

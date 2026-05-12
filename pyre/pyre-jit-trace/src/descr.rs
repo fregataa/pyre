@@ -5,9 +5,12 @@
 //! provides a concrete `PyreFieldDescr` implementing majit's
 //! `FieldDescr` trait for pyre's `#[repr(C)]` object layout.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::LazyLock;
+use std::sync::Mutex;
 use std::sync::Weak;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use majit_ir::{
     ArrayDescr, Descr, DescrRef, FieldDescr, JitCodeDescr, SizeDescr, SwitchDescr, Type,
@@ -73,6 +76,10 @@ pub struct PyreFieldDescr {
     name: &'static str,
     index_in_parent: usize,
     parent_descr: Option<Weak<dyn Descr>>,
+    /// `effectinfo.py:465 compute_bitstrings` ei_index. `u32::MAX` until
+    /// the codewriter publishes its `field_index` (`effectinfo.py:307-311`)
+    /// onto this descr.
+    ei_index: AtomicU32,
 }
 
 /// Concrete array descriptor for pointer-backed runtime arrays.
@@ -90,11 +97,134 @@ pub struct PyreArrayDescr {
     /// the runtime length so `ArraylenGc` / `bhimpl_arraylen_vable`
     /// can read it back.
     len_descr: Option<DescrRef>,
+    /// Sequential identity bound at construction. Mirrors PyPy's
+    /// per-lltype cache slot identity (`descr.py:350-351`
+    /// `cache[ARRAY_OR_STRUCT]`): every distinct `(base_size, item_size,
+    /// type_id, item_type, signed, len_offset)` tuple receives one slot,
+    /// every repeat lookup returns the same `Arc`. Replaces the
+    /// previous bit-packed structural hash so `descr.index()` is 1:1
+    /// with the registry slot rather than a lossy compression of the
+    /// fields.
+    descr_id: u32,
+    /// `effectinfo.py:465 compute_bitstrings` ei_index. `u32::MAX` until
+    /// the codewriter publishes its `array_index` onto this descr —
+    /// `Descr::get_ei_index()` readers fall back to `descr.index()`
+    /// while the bridge is unset.
+    ei_index: AtomicU32,
+}
+
+/// Structural key for `ARRAY_DESCR_REGISTRY`. Combination of all fields
+/// that PyPy treats as part of `ArrayDescr` identity (`descr.py:273-279
+/// + lendescr`). Two PyreArrayDescrs sharing this tuple share the same
+/// `descr_id`.
+///
+/// `array_type_id` carries the codewriter lltype-identity proxy
+/// (`majit-translate/src/jit_codewriter/call.rs::DescrIndexRegistry::array_index`
+/// key) so the runtime registry's identity domain matches PyPy's
+/// `gccache._cache_array[ARRAY_OR_STRUCT]` (`descr.py:348-360`) keyed
+/// on the actual lltype object: two BhDescr::Array entries that
+/// disagree only on the Rust type spelling
+/// (e.g. `"Vec<Foo>"` vs `"Vec<Bar>"` with both at `type_id == 0`)
+/// land on distinct registry slots, preventing the second
+/// `set_ei_index` from clobbering the first.
+///
+/// `None` for legacy descrs minted by pyre-jit-trace internal
+/// factories with no source-level array_type_id context; two `None`
+/// entries still collide on the remaining structural tuple just as
+/// the pre-bridge baseline did.
+#[derive(Hash, Eq, PartialEq, Clone)]
+struct ArrayDescrKey {
+    base_size: usize,
+    item_size: usize,
+    type_id: u32,
+    item_type_bits: u32,
+    signed: bool,
+    len_offset: Option<usize>,
+    array_type_id: Option<String>,
+}
+
+static NEXT_ARRAY_DESCR_ID: AtomicU32 = AtomicU32::new(0);
+
+/// Maximum sequential ARRAY descr id. Bits 0-27 of the index are
+/// available below `ARRAY_DESCR_TAG`; bit 28 is reserved by
+/// `FIELD_DESCR_TAG`.
+const ARRAY_DESCR_ID_MAX: u32 = 1 << 28;
+
+static ARRAY_DESCR_REGISTRY: LazyLock<Mutex<HashMap<ArrayDescrKey, DescrRef>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn alloc_array_descr_id() -> u32 {
+    let id = NEXT_ARRAY_DESCR_ID.fetch_add(1, Ordering::Relaxed);
+    assert!(
+        id < ARRAY_DESCR_ID_MAX,
+        "PyreArrayDescr registry exhausted (>2^28 instances) — index() bit 28 belongs to FIELD_DESCR_TAG"
+    );
+    id
+}
+
+fn get_or_create_array_descr(
+    base_size: usize,
+    item_size: usize,
+    type_id: u32,
+    item_type: Type,
+    signed: bool,
+    len_offset: Option<usize>,
+) -> DescrRef {
+    get_or_create_array_descr_with_full_id(
+        base_size, item_size, type_id, item_type, signed, len_offset, None,
+    )
+}
+
+fn get_or_create_array_descr_with_full_id(
+    base_size: usize,
+    item_size: usize,
+    type_id: u32,
+    item_type: Type,
+    signed: bool,
+    len_offset: Option<usize>,
+    array_type_id: Option<String>,
+) -> DescrRef {
+    let key = ArrayDescrKey {
+        base_size,
+        item_size,
+        type_id,
+        item_type_bits: type_bits(item_type),
+        signed,
+        len_offset,
+        array_type_id,
+    };
+    let mut cache = ARRAY_DESCR_REGISTRY
+        .lock()
+        .expect("ARRAY_DESCR_REGISTRY poisoned");
+    if let Some(existing) = cache.get(&key) {
+        return existing.clone();
+    }
+    let descr_id = alloc_array_descr_id();
+    let arc: DescrRef = Arc::new(PyreArrayDescr {
+        base_size,
+        item_size,
+        type_id,
+        item_type,
+        signed,
+        len_descr: maybe_array_lendescr_at_offset(len_offset),
+        descr_id,
+        ei_index: AtomicU32::new(u32::MAX),
+    });
+    cache.insert(key, arc.clone());
+    arc
 }
 
 impl Descr for PyreFieldDescr {
     fn index(&self) -> u32 {
         stable_field_index(self.offset, self.field_size, self.field_type, self.signed)
+    }
+
+    fn get_ei_index(&self) -> u32 {
+        self.ei_index.load(Ordering::Relaxed)
+    }
+
+    fn set_ei_index(&self, ei_index: u32) {
+        self.ei_index.store(ei_index, Ordering::Relaxed);
     }
 
     fn as_field_descr(&self) -> Option<&dyn FieldDescr> {
@@ -113,7 +243,36 @@ impl Descr for PyreFieldDescr {
 
 impl Descr for PyreArrayDescr {
     fn index(&self) -> u32 {
-        stable_array_index(self.base_size, self.item_size, self.item_type, self.signed)
+        // Registry-bound identity (`descr.py:350-351 cache[ARRAY_OR_STRUCT]`):
+        // bits 0-27 carry the sequential `descr_id` allocated at
+        // construction, bits 28-31 carry `ARRAY_DESCR_TAG`. Two ArrayDescrs
+        // built from the same structural tuple share the slot and report
+        // the same index; distinct tuples allocate fresh ids and never
+        // collide within the 2^28 budget.
+        //
+        // PRE-EXISTING-ADAPTATION: this index lives in a different
+        // namespace from the codewriter `CallControl::array_index`
+        // (`majit-translate/src/jit_codewriter/call.rs:762`), which
+        // mints `effectinfo.py:307-311` indices for the EffectInfo
+        // `read_descrs_arrays` / `write_descrs_arrays` raw sets. The
+        // PyPy-orthodox bridge between the two namespaces is
+        // `effectinfo.py:465 compute_bitstrings` plus a
+        // `Descr::get_ei_index()` accessor that publishes the
+        // codewriter-side index onto the runtime descr; until that
+        // infrastructure lands here, `force_from_effectinfo`
+        // (`heap.py:537-571`) reads the bitstring against the same
+        // codewriter index it was written with, but cannot map a
+        // runtime DescrRef back to the bitstring slot through this
+        // function alone.
+        ARRAY_DESCR_TAG | (self.descr_id & 0x0FFF_FFFF)
+    }
+
+    fn get_ei_index(&self) -> u32 {
+        self.ei_index.load(Ordering::Relaxed)
+    }
+
+    fn set_ei_index(&self, ei_index: u32) {
+        self.ei_index.store(ei_index, Ordering::Relaxed);
     }
 
     fn as_array_descr(&self) -> Option<&dyn ArrayDescr> {
@@ -190,6 +349,7 @@ pub fn make_field_descr(
         name: "",
         index_in_parent: 0,
         parent_descr: None,
+        ei_index: AtomicU32::new(u32::MAX),
     })
 }
 
@@ -233,6 +393,7 @@ pub fn make_field_descr_with_parent(
         name: "",
         index_in_parent: index,
         parent_descr: Some(Arc::downgrade(&parent)),
+        ei_index: AtomicU32::new(u32::MAX),
     })
 }
 
@@ -253,6 +414,7 @@ pub fn make_field_descr_full(
         name: "",
         index_in_parent: 0,
         parent_descr: None,
+        ei_index: AtomicU32::new(u32::MAX),
     })
 }
 
@@ -274,6 +436,7 @@ pub fn make_immutable_field_descr(
         name: "",
         index_in_parent: 0,
         parent_descr: None,
+        ei_index: AtomicU32::new(u32::MAX),
     })
 }
 
@@ -295,6 +458,7 @@ pub fn make_quasi_immutable_field_descr(
         name: "",
         index_in_parent: 0,
         parent_descr: None,
+        ei_index: AtomicU32::new(u32::MAX),
     })
 }
 
@@ -360,10 +524,12 @@ pub use pyre_object::listobject::W_LIST_GC_TYPE_ID;
 /// live list length is stored on the enclosing `W_ListObject` wrapper
 /// (`PyObjectArray.len`) to match rlist.py:116 `("length", Signed)`.
 ///
-// `PY_OBJECT_ARRAY_GC_TYPE_ID` lives in `pyre-object` alongside the
-// `ItemsBlock` struct it describes (matching W_INT/W_FLOAT/W_LIST/
-// W_TUPLE pattern). Re-exported here for existing call sites.
-pub use pyre_object::object_array::PY_OBJECT_ARRAY_GC_TYPE_ID;
+// Array GC type ids live in `pyre-object` alongside the backing storage
+// structs/constants they describe (matching W_INT/W_FLOAT/W_LIST/W_TUPLE
+// pattern). Re-exported here for existing call sites.
+pub use pyre_object::object_array::{
+    GC_FLOAT_ARRAY_GC_TYPE_ID, GC_INT_ARRAY_GC_TYPE_ID, PY_OBJECT_ARRAY_GC_TYPE_ID,
+};
 pub use pyre_object::tupleobject::W_TUPLE_GC_TYPE_ID;
 // GC type ids for `W_SpecialisedTupleObject_{ii,ff,oo}` live in
 // `pyre-object` alongside the structs they describe; re-exported here
@@ -509,6 +675,7 @@ fn build_object_descr_group(
                         name,
                         index_in_parent,
                         parent_descr: Some(parent_descr.clone()),
+                        ei_index: AtomicU32::new(u32::MAX),
                     }) as Arc<dyn FieldDescr>
                 },
             )
@@ -1130,9 +1297,9 @@ pub fn make_size_descr_with_type_and_vtable(
 /// `PyreArrayDescr::len_descr()` so `gen_initialize_len`
 /// (`rewrite.py:565,572`) emits the runtime length store after
 /// `CallMallocNurseryVarsize`.
-fn array_lendescr_at_offset_zero() -> DescrRef {
+fn array_lendescr_at_offset(offset: usize) -> DescrRef {
     Arc::new(PyreFieldDescr {
-        offset: 0,
+        offset,
         field_size: std::mem::size_of::<usize>(),
         field_type: Type::Int,
         signed: true,
@@ -1141,51 +1308,72 @@ fn array_lendescr_at_offset_zero() -> DescrRef {
         name: "len",
         index_in_parent: 0,
         parent_descr: None,
+        ei_index: AtomicU32::new(u32::MAX),
     })
 }
 
-/// Construct the optional `len_descr` for an array layout. RPython
-/// `descr.py:359 nolength` flag parity: arrays without a length-prefix
-/// header (`base_size == 0`, used by raw int/float-backed varsize
-/// stores) return `None`; length-prefixed layouts (`base_size >= WORD`,
-/// e.g. `Ptr(GcArray(PyObjectRef))` whose first word IS the length
-/// header) return a synthetic FieldDescr at offset 0.
-fn maybe_array_lendescr(base_size: usize) -> Option<DescrRef> {
-    (base_size >= std::mem::size_of::<usize>()).then(array_lendescr_at_offset_zero)
+/// Lift `Option<usize>` ↔ `Option<DescrRef>` so `make_array_descr*`
+/// callers express nolength/length-prefixed shapes directly. PyPy
+/// `descr.py:359-362` decides this from
+/// `ARRAY_INSIDE._hints.get('nolength', False)`; the explicit
+/// `Option<usize>` is the structural equivalent.
+fn maybe_array_lendescr_at_offset(len_offset: Option<usize>) -> Option<DescrRef> {
+    len_offset.map(array_lendescr_at_offset)
 }
 
 /// Create an array descriptor for a pointer-backed array field.
+///
+/// `len_offset`: `None` for the `nolength=True` shape (descr.py:360);
+/// `Some(off)` for length-prefixed layouts (descr.py:362).
+///
+/// Routes through `ARRAY_DESCR_REGISTRY` so repeat calls with the same
+/// structural tuple return the same `Arc`, mirroring PyPy's
+/// `cache[ARRAY_OR_STRUCT]` (descr.py:350-351).
 pub fn make_array_descr(
     base_size: usize,
     item_size: usize,
+    len_offset: Option<usize>,
     item_type: Type,
     signed: bool,
 ) -> DescrRef {
-    Arc::new(PyreArrayDescr {
-        base_size,
-        item_size,
-        type_id: 0,
-        item_type,
-        signed,
-        len_descr: maybe_array_lendescr(base_size),
-    })
+    get_or_create_array_descr(base_size, item_size, 0, item_type, signed, len_offset)
 }
 
 pub fn make_array_descr_with_type(
     base_size: usize,
     item_size: usize,
     type_id: u32,
+    len_offset: Option<usize>,
     item_type: Type,
     signed: bool,
 ) -> DescrRef {
-    Arc::new(PyreArrayDescr {
+    get_or_create_array_descr(base_size, item_size, type_id, item_type, signed, len_offset)
+}
+
+/// Bridge-only factory that threads the codewriter's `array_type_id`
+/// (`majit-translate::jit_codewriter::call::DescrIndexRegistry::array_index`
+/// key) into `ArrayDescrKey` so two BhDescr::Array entries with
+/// identical structural fields but different lltype spellings receive
+/// distinct registry slots — matching upstream
+/// `gccache._cache_array[ARRAY_OR_STRUCT]` (`descr.py:348-360`).
+pub fn make_array_descr_with_full_id(
+    base_size: usize,
+    item_size: usize,
+    type_id: u32,
+    len_offset: Option<usize>,
+    item_type: Type,
+    signed: bool,
+    array_type_id: Option<String>,
+) -> DescrRef {
+    get_or_create_array_descr_with_full_id(
         base_size,
         item_size,
         type_id,
         item_type,
         signed,
-        len_descr: maybe_array_lendescr(base_size),
-    })
+        len_offset,
+        array_type_id,
+    )
 }
 
 // ── Range iterator field descriptors ─────────────────────────────────
@@ -1394,6 +1582,7 @@ pub fn ob_type_descr() -> DescrRef {
         name: "typeptr",
         index_in_parent: 0,
         parent_descr: None,
+        ei_index: AtomicU32::new(u32::MAX),
     })
 }
 
@@ -1499,9 +1688,9 @@ mod tests {
 
     #[test]
     fn test_array_descr_indices_are_stable_and_distinct() {
-        let a = make_array_descr(0, 8, Type::Int, false);
-        let b = make_array_descr(0, 8, Type::Int, false);
-        let c = make_array_descr(0, 8, Type::Ref, false);
+        let a = make_array_descr(0, 8, None, Type::Int, false);
+        let b = make_array_descr(0, 8, None, Type::Int, false);
+        let c = make_array_descr(0, 8, None, Type::Ref, false);
 
         assert_eq!(a.index(), b.index());
         assert_ne!(a.index(), c.index());
@@ -1701,11 +1890,14 @@ mod tests {
         let descr = make_descr_from_bh(&BhDescr::Array {
             base_size: 8,
             itemsize: 16,
+            len_offset: Some(0),
             type_id: 42,
             item_type: Type::Ref,
             is_array_of_pointers: false,
             is_array_of_structs: true,
             is_item_signed: false,
+            ei_index: u32::MAX,
+            array_type_id: None,
             interior_fields,
         });
         let array = descr.as_array_descr().expect("Array BhDescr -> ArrayDescr");
@@ -1768,7 +1960,15 @@ pub fn make_jit_w_long_toint_calldescr() -> DescrRef {
 /// descr.py:273 ArrayDescr for array-of-structs (FLAG_STRUCT).
 /// resume.py:749: allocate_array(self.size, self.arraydescr, clear=True).
 pub fn make_struct_array_descr(descr_index: u32, base_size: usize, item_size: usize) -> DescrRef {
-    make_struct_array_descr_full(descr_index, base_size, item_size, 0, Type::Void, &[])
+    make_struct_array_descr_full(
+        descr_index,
+        base_size,
+        item_size,
+        Some(0),
+        0,
+        Type::Void,
+        &[],
+    )
 }
 
 fn simple_field_spec_from_bh(
@@ -1906,6 +2106,7 @@ pub fn make_struct_array_descr_full(
     descr_index: u32,
     base_size: usize,
     item_size: usize,
+    len_offset: Option<usize>,
     type_id: u32,
     item_type: Type,
     interior_fields: &[majit_translate::jitcode::BhInteriorFieldSpec],
@@ -1919,14 +2120,16 @@ pub fn make_struct_array_descr_full(
     // setter — `Arc::ptr_eq(interior.array_descr,
     // returned_array_descr)` now holds, matching the upstream
     // identity invariant.
-    let array_descr = Arc::new(SimpleArrayDescr::with_flag(
+    let mut raw_array_descr = SimpleArrayDescr::with_flag(
         descr_index,
         base_size,
         item_size,
         type_id,
         item_type,
         ArrayFlag::Struct,
-    ));
+    );
+    raw_array_descr.lendescr = maybe_array_lendescr_at_offset(len_offset);
+    let array_descr = Arc::new(raw_array_descr);
     if interior_fields.is_empty() {
         return array_descr;
     }
@@ -2189,31 +2392,53 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
         BhDescr::Array {
             base_size,
             itemsize,
+            len_offset,
             type_id,
             item_type,
             is_array_of_structs,
             is_item_signed,
+            ei_index,
+            array_type_id,
             interior_fields,
             ..
         } => {
-            if *is_array_of_structs {
+            let descr = if *is_array_of_structs {
                 make_struct_array_descr_full(
                     u32::MAX,
                     *base_size,
                     *itemsize,
+                    *len_offset,
                     *type_id,
                     *item_type,
                     interior_fields,
                 )
             } else {
-                make_array_descr_with_type(
+                // `descr.py:348-360 gccache._cache_array[ARRAY_OR_STRUCT]`
+                // is keyed on lltype object identity; thread the
+                // codewriter `array_type_id` across the BhDescr
+                // boundary into the runtime `ArrayDescrKey` so two
+                // BhDescr::Array entries that disagree only on the
+                // Rust type spelling don't collapse to the same
+                // registry slot (`set_ei_index` clobber).
+                make_array_descr_with_full_id(
                     *base_size,
                     *itemsize,
                     *type_id,
+                    *len_offset,
                     *item_type,
                     *is_item_signed,
+                    array_type_id.clone(),
                 )
+            };
+            // `effectinfo.py:465 compute_bitstrings` republish: the
+            // codewriter-side `array_index` carried across the BhDescr
+            // boundary lands on the runtime descr so heap.rs
+            // `force_from_effectinfo` (`heap.py:537-571`) reads the
+            // same bitstring slot the producer wrote.
+            if *ei_index != u32::MAX {
+                descr.set_ei_index(*ei_index);
             }
+            descr
         }
         BhDescr::Size {
             size,

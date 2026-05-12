@@ -828,8 +828,25 @@ impl OptHeap {
 
     /// Existing majit `EffectInfo` bitsets are indexed by the descriptor's
     /// effect/global index domain, not by `PtrInfo._fields` slot.
+    ///
+    /// `effectinfo.py:465 compute_bitstrings` writes a per-descr
+    /// `ei_index` that names the bitstring slot. Until the bridge is
+    /// fully in place, fall back to `descr.index()` whose namespace
+    /// matches the codewriter's `field_index` for descrs minted by
+    /// `CallControl::fielddescrof`.
     fn field_effect_index(descr: &DescrRef) -> u32 {
-        descr.index()
+        let ei = descr.get_ei_index();
+        if ei != u32::MAX { ei } else { descr.index() }
+    }
+
+    /// Same lift for array descrs — `effectinfo.py:307-311`
+    /// `array_index` flows onto `descr.get_ei_index()` once
+    /// `CallControl::arraydescrof` publishes it; fallback is
+    /// `descr.index()` which carries the same value through the
+    /// SimpleArrayDescr `idx` parameter.
+    fn array_effect_index(descr: &DescrRef) -> u32 {
+        let ei = descr.get_ei_index();
+        if ei != u32::MAX { ei } else { descr.index() }
     }
 
     /// heapcache.py:295-309 `_escape_box`: escape a box and transitively
@@ -916,6 +933,20 @@ impl OptHeap {
     }
 
     /// heap.py:399-407 arrayitem_submap(descr, create_if_nonexistant=True)
+    ///
+    /// `descr_idx` is the registry-slot identity (`descr.index()`),
+    /// matching every other cache-identity site in this file:
+    /// `arrayitem_key` (`:878-884`), the varindex lookup (`:2485`),
+    /// the lazy-set force probe (`:2586`), and the immutable-array
+    /// flag (`:2447` insert / `:1282` query) all key on
+    /// `descr.index()`.  Using `array_effect_index` here would publish
+    /// the ei_index slot once the codewriter set it
+    /// (`effectinfo.py:465 compute_bitstrings`), which puts insert and
+    /// lookup in different identity domains — PyPy's
+    /// `cached_arrayitems[descr]` (`heap.py:399`) avoids this by
+    /// keying on the descriptor object itself, and reserves
+    /// `descr.get_ei_index()` for the EffectInfo bitstring check
+    /// (`effectinfo.py:217 check_write_descr_array`).
     fn arrayitem_submap(&mut self, descr: &DescrRef) -> &mut ArrayCacheSubMap {
         let descr_idx = descr.index();
         let pos = match self.cached_array_pos_for_descr(descr) {
@@ -1504,7 +1535,7 @@ impl OptHeap {
             _ => return false,
         };
         let descr1_id = descr_identity(&descrs[0]);
-        let descr2_idx = descrs[1].index();
+        let descr2_idx = Self::array_effect_index(&descrs[1]);
 
         // heap.py:506-511 try/except KeyError:
         //   try:

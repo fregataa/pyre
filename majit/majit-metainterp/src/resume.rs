@@ -5958,12 +5958,10 @@ impl<'a> ResumeDataDirectReader<'a> {
                 .descr
                 .as_ref()
                 .expect("resume.py:1000 PENDINGFIELDSTRUCT.lldescr must be set");
-            let (field_offset, field_size, field_type) = if let Some(fd) = descr.as_field_descr() {
-                (fd.offset(), fd.field_size(), fd.field_type())
-            } else if let Some(ad) = descr.as_array_descr() {
-                let item_idx = pf.item_index.max(0) as usize;
-                let offset = ad.base_size() + item_idx * ad.item_size();
-                (offset, ad.item_size(), ad.item_type())
+            let field_info = if let Some(fd) = descr.as_field_descr() {
+                Some((fd.offset(), fd.field_size(), fd.field_type()))
+            } else if descr.as_array_descr().is_some() {
+                None
             } else {
                 panic!(
                     "pending field descr must be FieldDescr or ArrayDescr (descr_index={})",
@@ -5983,14 +5981,15 @@ impl<'a> ResumeDataDirectReader<'a> {
             );
             // resume.py:1002: struct = self.decode_ref(num)
             let struct_ptr = self.decode_ref(pf.target_tagged);
-            // resume.py:1004-1007: setfield/setarrayitem dispatch by descr type
-            let value = match field_type {
-                majit_ir::Type::Ref => self.decode_ref(pf.value_tagged),
-                majit_ir::Type::Float => self.decode_float(pf.value_tagged),
-                _ => self.decode_int(pf.value_tagged),
-            };
 
             if pf.item_index < 0 {
+                let (field_offset, field_size, field_type) =
+                    field_info.expect("resume.py:1005 setfield pending entry requires FieldDescr");
+                let value = match field_type {
+                    majit_ir::Type::Ref => self.decode_ref(pf.value_tagged),
+                    majit_ir::Type::Float => self.decode_float(pf.value_tagged),
+                    _ => self.decode_int(pf.value_tagged),
+                };
                 // resume.py:1005: self.setfield(struct, fieldnum, descr)
                 self.allocator.setfield_typed(
                     struct_ptr,
@@ -6000,13 +5999,25 @@ impl<'a> ResumeDataDirectReader<'a> {
                     field_size,
                 );
             } else {
-                // resume.py:1007: self.setarrayitem(struct, itemindex, fieldnum, descr)
-                self.allocator.setarrayitem_typed(
-                    struct_ptr,
-                    pf.item_index as usize,
-                    value,
-                    pf.descr_index,
-                );
+                // resume.py:1007-1015: self.setarrayitem dispatches by
+                // arraydescr and passes that same descriptor through.
+                let ad = descr
+                    .as_array_descr()
+                    .expect("resume.py:1007 setarrayitem pending entry requires ArrayDescr");
+                let index = pf.item_index as usize;
+                if ad.is_array_of_pointers() {
+                    let value = self.decode_ref(pf.value_tagged);
+                    self.allocator
+                        .setarrayitem_ref(struct_ptr, index, value, descr);
+                } else if ad.is_array_of_floats() {
+                    let value = self.decode_float(pf.value_tagged);
+                    self.allocator
+                        .setarrayitem_float(struct_ptr, index, value, descr);
+                } else {
+                    let value = self.decode_int(pf.value_tagged);
+                    self.allocator
+                        .setarrayitem_int(struct_ptr, index, value, descr);
+                }
             }
         }
     }

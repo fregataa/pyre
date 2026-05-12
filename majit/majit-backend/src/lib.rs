@@ -2157,7 +2157,12 @@ pub trait Backend: Send {
     ) {
     }
 
-    /// model.py:254 bh_arraylen_gc(array, arraydescr)
+    /// model.py:254 bh_arraylen_gc(array, arraydescr).
+    ///
+    /// Upstream shape is `read_int_at_mem(array, lendescr.offset, WORD, 1)`
+    /// (`llmodel.py:585-588`). Production backends override this for
+    /// pyre's length-prefixed GC arrays; the trait default remains a
+    /// compatibility stub for incomplete/test CPUs.
     fn bh_arraylen_gc(
         &self,
         _array_ptr: i64,

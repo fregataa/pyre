@@ -1083,6 +1083,10 @@ impl crate::walkvirtual::VirtualVisitor for RdVirtualInfoBuilder {
                     index: d.index(),
                     base_size: ad.map_or(0, |a| a.base_size()),
                     item_size: ad.map_or(8, |a| a.item_size()),
+                    // descr.py:277 ArrayDescr.lendescr.offset — preserved
+                    // across the resume summary so the materialize path
+                    // sees the same length word offset the producer used.
+                    len_offset: ad.and_then(|a| a.len_descr().map(|fd| fd.offset())),
                     item_type: ad.map_or(1, |a| {
                         if a.is_array_of_pointers() {
                             0

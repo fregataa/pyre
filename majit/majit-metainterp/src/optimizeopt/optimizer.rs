@@ -3369,6 +3369,13 @@ impl Optimizer {
         }
     }
 
+    /// PRE-EXISTING-ADAPTATION: aggregate per-pass `export_arg_int_bounds`
+    /// HashMaps for hand-off to the next peeling iteration.  RPython
+    /// preserves `IntBound` across iterations through Box-stable
+    /// `OptInfo.IntBound` forwarding; pyre's flat-OpRef rebuilds
+    /// `OptContext` per round, so the import path
+    /// (`unroll.rs:setinfo_from_preamble`) must consult this side
+    /// table.  See sibling cite at `intbounds.rs::export_arg_int_bounds`.
     fn collect_exported_int_bounds(
         &self,
         args: &[OpRef],

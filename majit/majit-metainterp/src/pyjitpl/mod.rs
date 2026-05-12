@@ -13189,19 +13189,36 @@ impl std::error::Error for ChangeFrame {}
 /// Pyre lowered the IR to `BhDescr::Array` before this site, so the
 /// equivalent key threads through every variant field that
 /// distinguishes two `BhDescr::Array` entries — `(type_id, base_size,
-/// itemsize, item_type, is_array_of_pointers, is_array_of_structs,
-/// is_item_signed, interior_fields)`.  Two arrays of distinct lltypes
+/// itemsize, len_offset, item_type, is_array_of_pointers,
+/// is_array_of_structs, is_item_signed, array_type_id,
+/// interior_fields)`.
+/// Two arrays of distinct lltypes
 /// with identical `(base_size, itemsize)` geometry land on distinct
 /// cache slots, matching upstream's per-lltype cache identity.
+/// `ei_index` is intentionally NOT part of the cache key — upstream
+/// `gccache._cache_array[ARRAY_OR_STRUCT]` (`descr.py:348-360`) is
+/// keyed on the lltype itself, and `ei_index` is a separate slot
+/// later assigned by `compute_bitstrings` (`effectinfo.py:465`) that
+/// multiple descrs are free to share.
+///
+/// `array_type_id` carries the codewriter lltype-identity proxy
+/// (`call.rs::DescrIndexRegistry::array_index` key) so two ARRAY
+/// entries that disagree on the Rust type spelling
+/// (e.g. `"Vec<Foo>"` vs `"Vec<Bar>"` with both at `type_id == 0`)
+/// land on distinct cache slots even when their structural tuples
+/// coincide — restoring the codewriter ↔ runtime 1:1 identity
+/// correspondence PyPy gets for free from `id(ARRAY_OR_STRUCT)`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DispatchArrayDescrKey {
     pub type_id: u32,
     pub base_size: usize,
     pub itemsize: usize,
+    pub len_offset: Option<usize>,
     pub item_type: majit_ir::Type,
     pub is_array_of_pointers: bool,
     pub is_array_of_structs: bool,
     pub is_item_signed: bool,
+    pub array_type_id: Option<String>,
     pub interior_fields: Vec<crate::jitcode::BhInteriorFieldSpec>,
 }
 
@@ -13348,7 +13365,7 @@ pub struct MetaInterpStaticData {
     ///
     /// Keyed on [`DispatchArrayDescrKey`], which captures the full
     /// lltype-discriminant shape carried on `BhDescr::Array`
-    /// (`type_id`, `base_size`, `itemsize`, `item_type`,
+    /// (`type_id`, `base_size`, `itemsize`, `len_offset`, `item_type`,
     /// `is_array_of_pointers`, `is_array_of_structs`, `is_item_signed`,
     /// `interior_fields`).  Mirrors upstream
     /// `gccache._cache_array[ARRAY_OR_STRUCT]` (`descr.py:348-360`)
@@ -13364,19 +13381,30 @@ pub struct MetaInterpStaticData {
     /// `BhDescr::Array` discriminants `type_id`, the pointer/struct
     /// `flag` selection, `lendescr`, and `is_pure` so the materialised
     /// `SimpleArrayDescr` carries the same discriminator surface as
-    /// RPython `descr.py:240-289 ArrayDescr.__init__`.
+    /// RPython `descr.py:240-289 ArrayDescr.__init__`, and stamps the
+    /// `BhDescr::Array.ei_index` slot onto the resulting descr via
+    /// `set_ei_index` (`effectinfo.py:465 compute_bitstrings`) so
+    /// subsequent `force_from_effectinfo` (`heap.py:540-560`)
+    /// bitstring checks see the right index.  `ei_index` is NOT part
+    /// of the cache key — upstream
+    /// `gccache._cache_array[ARRAY_OR_STRUCT]` (`descr.py:348-360`)
+    /// keys on the lltype itself and `compute_bitstrings` later
+    /// assigns the index slot as a derived attribute multiple descrs
+    /// are free to share.
     /// `arraydescr.all_interiorfielddescrs` (`descr.py:372-375`) is
-    /// NOT a constructor argument: every per-field
+    /// passed as a constructor argument: every per-field
     /// `SimpleInteriorFieldDescr` must share the parent
-    /// `Arc<SimpleArrayDescr>` identity, but the helper mints that Arc
-    /// internally; callers that need interior fields publish the list
-    /// AFTER the Arc returns, via
-    /// `SimpleArrayDescr::set_all_interiorfielddescrs` over the same
-    /// Arc.  Pyre's bytecode-array dispatch path (`program: &[u8]`)
-    /// supplies `lendescr=None` and `is_pure=false`, and the
-    /// `debug_assert!` at `dispatch.rs::dispatch_array_descr_ref`
-    /// pins that BhDescr::Array carries no interior fields for this
-    /// path — `&[u8]` items have no inline-struct layout.  Earlier
+    /// `Arc<SimpleArrayDescr>` identity, and the helper accepts a
+    /// pre-built `Vec<DescrRef>` whose entries reference the same
+    /// parent Arc once it returns (the helper writes the list through
+    /// `SimpleArrayDescr::set_all_interiorfielddescrs` after the Arc
+    /// is minted).  Pyre's bytecode-array dispatch path (`program:
+    /// &[u8]`) supplies `lendescr=None`, `is_pure=false`, and
+    /// `Vec::new()` for interior fields — `&[u8]` items have no
+    /// inline-struct layout, and the `debug_assert!` at
+    /// `dispatch.rs::dispatch_array_descr_ref` pins that
+    /// BhDescr::Array carries no interior fields for this path.
+    /// Earlier
     /// revisions keyed on `descr_idx` (per-JitCode-builder pool slot),
     /// which happens to work when only one JitCode body emits arrays
     /// but breaks structurally when distinct JitCodes use the same

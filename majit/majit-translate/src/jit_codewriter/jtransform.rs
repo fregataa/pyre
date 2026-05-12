@@ -1653,6 +1653,10 @@ impl<'a> Transformer<'a> {
                         OpKind::ArrayRead { array_type_id, .. } => array_type_id.clone(),
                         _ => unreachable!("rewrite_op_getarrayitem called on non-ArrayRead op"),
                     },
+                    nolength: match &op.kind {
+                        OpKind::ArrayRead { nolength, .. } => *nolength,
+                        _ => unreachable!("rewrite_op_getarrayitem called on non-ArrayRead op"),
+                    },
                 },
             }]);
         }
@@ -1702,6 +1706,10 @@ impl<'a> Transformer<'a> {
                     item_ty: typed_item_ty,
                     array_type_id: match &op.kind {
                         OpKind::ArrayWrite { array_type_id, .. } => array_type_id.clone(),
+                        _ => unreachable!("rewrite_op_setarrayitem called on non-ArrayWrite op"),
+                    },
+                    nolength: match &op.kind {
+                        OpKind::ArrayWrite { nolength, .. } => *nolength,
                         _ => unreachable!("rewrite_op_setarrayitem called on non-ArrayWrite op"),
                     },
                 },
@@ -3287,11 +3295,13 @@ fn remap_op(
             index,
             item_ty,
             array_type_id,
+            nolength,
         } => OpKind::ArrayRead {
             base: remap_value(*base, aliases),
             index: remap_value(*index, aliases),
             item_ty: item_ty.clone(),
             array_type_id: array_type_id.clone(),
+            nolength: *nolength,
         },
         OpKind::ArrayWrite {
             base,
@@ -3299,12 +3309,14 @@ fn remap_op(
             value,
             item_ty,
             array_type_id,
+            nolength,
         } => OpKind::ArrayWrite {
             base: remap_value(*base, aliases),
             index: remap_value(*index, aliases),
             value: remap_value(*value, aliases),
             item_ty: item_ty.clone(),
             array_type_id: array_type_id.clone(),
+            nolength: *nolength,
         },
         OpKind::InteriorFieldRead {
             base,
@@ -4088,6 +4100,7 @@ mod tests {
                 index,
                 item_ty: ValueType::Int,
                 array_type_id: None,
+                nolength: false,
             },
             true,
         );
@@ -4200,6 +4213,7 @@ mod tests {
                 value,
                 item_ty: ValueType::Unknown,
                 array_type_id: None,
+                nolength: false,
             },
             false,
         );
@@ -4270,6 +4284,7 @@ mod tests {
                     index,
                     item_ty: ValueType::Unknown,
                     array_type_id: None,
+                    nolength: false,
                 },
                 true,
             )

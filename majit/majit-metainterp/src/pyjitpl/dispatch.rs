@@ -863,41 +863,67 @@ where
             type_id,
             base_size,
             itemsize,
+            len_offset,
             item_type,
             is_array_of_pointers,
             is_array_of_structs,
             is_item_signed,
+            ei_index,
+            array_type_id,
             interior_fields,
         ) = match bh {
             crate::jitcode::CanonicalBhDescr::Array {
                 type_id,
                 base_size,
                 itemsize,
+                len_offset,
                 item_type,
                 is_array_of_pointers,
                 is_array_of_structs,
                 is_item_signed,
                 interior_fields,
+                ei_index,
+                array_type_id,
             } => (
                 *type_id,
                 *base_size,
                 *itemsize,
+                *len_offset,
                 *item_type,
                 *is_array_of_pointers,
                 *is_array_of_structs,
                 *is_item_signed,
+                *ei_index,
+                array_type_id.clone(),
                 interior_fields.clone(),
             ),
             _ => return None,
         };
+        // `ei_index` is intentionally NOT part of the cache key:
+        // upstream `gccache._cache_array[ARRAY_OR_STRUCT]`
+        // (`descr.py:348-360`) is keyed on the lltype itself, and the
+        // ei_index slot is later assigned by `compute_bitstrings`
+        // (`effectinfo.py:465`) — multiple descrs are free to share an
+        // ei_index. It is still passed into
+        // `make_array_descr_from_lltype_shape` below so the
+        // first-built `SimpleArrayDescr` records the index via
+        // `set_ei_index`; subsequent cache hits reuse that same Arc.
+        //
+        // `array_type_id` IS part of the cache key as the codewriter
+        // lltype-identity proxy — two BhDescr::Array entries with
+        // identical structural fields but different `array_type_id`
+        // represent distinct ARRAYs upstream and must not collapse to
+        // a single `SimpleArrayDescr` here.
         let cache_key = crate::pyjitpl::DispatchArrayDescrKey {
             type_id,
             base_size,
             itemsize,
+            len_offset,
             item_type,
             is_array_of_pointers,
             is_array_of_structs,
             is_item_signed,
+            array_type_id,
             interior_fields,
         };
         let cache = &ctx.metainterp_sd().dispatch_array_descr_cache;
@@ -913,18 +939,27 @@ where
         // stays distinct between two lltypes with the same primitive
         // shape), the pointer/struct flag selection (so `descr.flag`
         // matches RPython `descr.py:241-254 get_type_flag` precedence),
-        // the primitive sign carried on `is_item_signed`, and
-        // `lendescr` / `is_pure` (both `None` / `false` for the
-        // bytecode-array dispatch path — pyre's `program: &[u8]` is a
-        // fixed-size mutable buffer).
+        // the primitive sign carried on `is_item_signed`, `lendescr` /
+        // `is_pure` (both `None` / `false` for the bytecode-array
+        // dispatch path — pyre's `program: &[u8]` is a fixed-size
+        // mutable buffer), and `ei_index` (`effectinfo.py:465`).
+        // `ei_index` is passed in as a side slot stamped on the
+        // resulting descr via `set_ei_index` so heap.rs
+        // `force_from_effectinfo` (`heap.py:540-560`) reads the same
+        // bitstring slot the producer wrote; it does NOT participate
+        // in the cache key (upstream
+        // `gccache._cache_array[ARRAY_OR_STRUCT]` keys on lltype
+        // identity, and `compute_bitstrings` later assigns the index
+        // slot as a derived attribute multiple descrs are free to
+        // share).
         //
         // `arraydescr.all_interiorfielddescrs` (`descr.py:372-375`)
         // requires the per-field `SimpleInteriorFieldDescr` to share
         // the parent `Arc<SimpleArrayDescr>` identity, so it can only
-        // be published AFTER the helper returns; pyre's dispatch path
-        // does not reach that case (this `debug_assert` pins it),
-        // matching the helper's documented construction-order
-        // contract.
+        // be published AFTER the helper returns with a stable parent
+        // Arc.  Pyre's dispatch path supplies an empty list (this
+        // `debug_assert` pins it) — `program: &[u8]` items have no
+        // inline-struct layout.
         debug_assert!(
             cache_key.interior_fields.is_empty(),
             "dispatch_array_descr_ref: BhDescr::Array carries non-empty \
@@ -940,12 +975,15 @@ where
             type_id,
             base_size,
             itemsize,
+            len_offset,
             item_type,
             is_array_of_pointers,
             is_array_of_structs,
             is_item_signed,
             None,  // lendescr — `program: &[u8]` is fixed-size
             false, // is_pure — bytecode array is mutable from the JIT's POV
+            ei_index,
+            Vec::new(),
         );
         let descr: majit_ir::DescrRef = descr_arc;
         guard.insert(cache_key, descr.clone());

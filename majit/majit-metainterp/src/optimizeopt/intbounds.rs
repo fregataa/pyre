@@ -2988,6 +2988,21 @@ impl Optimization for OptIntBounds {
         // ctx.getintbound and generate guard ops.
     }
 
+    /// PRE-EXISTING-ADAPTATION: pyre threads loop-iteration IntBound
+    /// hand-offs through an explicit `HashMap<OpRef, IntBound>` side
+    /// table; RPython's `intbounds.py` lets bounds survive iteration
+    /// boundaries naturally because `box._forwarded`/`OptInfo.IntBound`
+    /// is stable per Box identity.  Pyre's flat-OpRef model breaks that
+    /// stability — `OptContext` is rebuilt per peeling round, so the
+    /// preamble's bounds must be exported to a side table here and
+    /// re-imported via `unroll.rs:setinfo_from_preamble`.
+    ///
+    /// Convergence path: extend the existing `setinfo_from_preamble`
+    /// import surface (`mod.rs:setinfo_from_preamble_item`) to carry
+    /// `IntBound` alongside `PtrInfo`/`IntBoundInfo`, so the next
+    /// iteration's `peek_intbound_via_box` finds bounds without a
+    /// dedicated HashMap routed through the optimizer/unroll boundary.
+    /// Multi-session retirement.
     fn export_arg_int_bounds(
         &self,
         args: &[OpRef],

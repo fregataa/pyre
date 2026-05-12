@@ -34,7 +34,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::Weak;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 
 use crate::OpRef;
 use crate::resoperation::{GuardPendingFieldEntry, RdVirtualInfo};
@@ -643,6 +643,24 @@ pub trait Descr: Send + Sync + std::fmt::Debug {
     /// descr.py:28: v.descr_index = len(all_descrs)
     /// Called by setup_descrs() to assign a sequential index.
     fn set_descr_index(&self, _index: i32) {}
+
+    /// `effectinfo.py:465 compute_bitstrings` writes a per-descr
+    /// `ei_index` that bridges the codewriter-side
+    /// `CallControl::array_index` / `CallControl::field_index` namespace
+    /// (the indices stored in `EffectInfo.read_descrs_*` /
+    /// `write_descrs_*` raw sets) to the runtime descr identity. Default
+    /// `u32::MAX` is the unset sentinel — `force_from_effectinfo`
+    /// readers must fall back to `descr.index()` when the bridge has
+    /// not been published.
+    fn get_ei_index(&self) -> u32 {
+        u32::MAX
+    }
+
+    /// Companion to [`get_ei_index`]. Concrete descrs that override
+    /// `get_ei_index` with `AtomicU32` storage also override
+    /// `set_ei_index` to publish the codewriter-side index after
+    /// `compute_bitstrings()` runs.
+    fn set_ei_index(&self, _ei_index: u32) {}
 
     /// Human-readable representation for debugging.
     fn repr(&self) -> String {
@@ -2026,6 +2044,9 @@ pub struct SimpleFieldDescr {
     index: u32,
     /// history.py:1092: BackendDescr.descr_index = -1
     descr_index: AtomicI32,
+    /// `effectinfo.py:465 compute_bitstrings` ei_index. `u32::MAX` until
+    /// the codewriter publishes its `field_index` onto this descr.
+    ei_index: AtomicU32,
     /// RPython: FieldDescr.name — e.g. "MyStruct.field_name"
     name: String,
     offset: usize,
@@ -2065,6 +2086,7 @@ impl Clone for SimpleFieldDescr {
         SimpleFieldDescr {
             index: self.index,
             descr_index: AtomicI32::new(self.descr_index.load(Ordering::Relaxed)),
+            ei_index: AtomicU32::new(self.ei_index.load(Ordering::Relaxed)),
             name: self.name.clone(),
             offset: self.offset,
             field_size: self.field_size,
@@ -2094,6 +2116,7 @@ impl SimpleFieldDescr {
         SimpleFieldDescr {
             index,
             descr_index: AtomicI32::new(-1),
+            ei_index: AtomicU32::new(u32::MAX),
             name: String::new(),
             offset,
             field_size,
@@ -2123,6 +2146,7 @@ impl SimpleFieldDescr {
         SimpleFieldDescr {
             index,
             descr_index: AtomicI32::new(-1),
+            ei_index: AtomicU32::new(u32::MAX),
             name,
             offset,
             field_size,
@@ -2196,6 +2220,12 @@ impl Descr for SimpleFieldDescr {
     }
     fn set_descr_index(&self, index: i32) {
         self.descr_index.store(index, Ordering::Relaxed);
+    }
+    fn get_ei_index(&self) -> u32 {
+        self.ei_index.load(Ordering::Relaxed)
+    }
+    fn set_ei_index(&self, ei_index: u32) {
+        self.ei_index.store(ei_index, Ordering::Relaxed);
     }
     fn is_always_pure(&self) -> bool {
         // RPython `jtransform.py:895-896`: a quasi-immutable field is *not*
@@ -2421,6 +2451,7 @@ pub fn make_simple_descr_group(
                 Arc::new(SimpleFieldDescr {
                     index: spec.index,
                     descr_index: AtomicI32::new(-1),
+                    ei_index: AtomicU32::new(u32::MAX),
                     name: spec.name.clone(),
                     offset: spec.offset,
                     field_size: spec.field_size,
@@ -2459,6 +2490,10 @@ pub struct SimpleArrayDescr {
     index: u32,
     /// history.py:1092: BackendDescr.descr_index = -1
     descr_index: AtomicI32,
+    /// `effectinfo.py:465 compute_bitstrings` ei_index — `u32::MAX`
+    /// until the bridge between codewriter `array_index` and runtime
+    /// descr identity has been published.
+    ei_index: AtomicU32,
     base_size: usize,
     item_size: usize,
     type_id: u32,
@@ -2492,6 +2527,7 @@ impl Clone for SimpleArrayDescr {
         SimpleArrayDescr {
             index: self.index,
             descr_index: AtomicI32::new(self.descr_index.load(Ordering::Relaxed)),
+            ei_index: AtomicU32::new(self.ei_index.load(Ordering::Relaxed)),
             base_size: self.base_size,
             item_size: self.item_size,
             type_id: self.type_id,
@@ -2517,6 +2553,7 @@ impl SimpleArrayDescr {
         SimpleArrayDescr {
             index,
             descr_index: AtomicI32::new(-1),
+            ei_index: AtomicU32::new(u32::MAX),
             base_size,
             item_size,
             type_id,
@@ -2541,6 +2578,7 @@ impl SimpleArrayDescr {
         SimpleArrayDescr {
             index,
             descr_index: AtomicI32::new(-1),
+            ei_index: AtomicU32::new(u32::MAX),
             base_size,
             item_size,
             type_id,
@@ -2579,6 +2617,12 @@ impl Descr for SimpleArrayDescr {
     }
     fn set_descr_index(&self, index: i32) {
         self.descr_index.store(index, Ordering::Relaxed);
+    }
+    fn get_ei_index(&self) -> u32 {
+        self.ei_index.load(Ordering::Relaxed)
+    }
+    fn set_ei_index(&self, ei_index: u32) {
+        self.ei_index.store(ei_index, Ordering::Relaxed);
     }
     fn as_array_descr(&self) -> Option<&dyn ArrayDescr> {
         Some(self)
@@ -2640,6 +2684,10 @@ pub struct SimpleInteriorFieldDescr {
     index: u32,
     /// history.py:1092: BackendDescr.descr_index = -1
     descr_index: AtomicI32,
+    /// `effectinfo.py:465 compute_bitstrings` ei_index for the
+    /// `interiorfield` namespace (`effectinfo.py:351-354`). `u32::MAX`
+    /// until the codewriter publishes its `interiorfield_index` here.
+    ei_index: AtomicU32,
     array_descr: std::sync::Arc<SimpleArrayDescr>,
     field_descr: std::sync::Arc<SimpleFieldDescr>,
     owner_size_descr: Option<std::sync::Arc<SimpleSizeDescr>>,
@@ -2650,6 +2698,7 @@ impl Clone for SimpleInteriorFieldDescr {
         SimpleInteriorFieldDescr {
             index: self.index,
             descr_index: AtomicI32::new(self.descr_index.load(Ordering::Relaxed)),
+            ei_index: AtomicU32::new(self.ei_index.load(Ordering::Relaxed)),
             array_descr: self.array_descr.clone(),
             field_descr: self.field_descr.clone(),
             owner_size_descr: self.owner_size_descr.clone(),
@@ -2666,6 +2715,7 @@ impl SimpleInteriorFieldDescr {
         SimpleInteriorFieldDescr {
             index,
             descr_index: AtomicI32::new(-1),
+            ei_index: AtomicU32::new(u32::MAX),
             array_descr,
             field_descr,
             owner_size_descr: None,
@@ -2681,6 +2731,7 @@ impl SimpleInteriorFieldDescr {
         SimpleInteriorFieldDescr {
             index,
             descr_index: AtomicI32::new(-1),
+            ei_index: AtomicU32::new(u32::MAX),
             array_descr,
             field_descr,
             owner_size_descr: Some(owner_size_descr),
@@ -2697,6 +2748,12 @@ impl Descr for SimpleInteriorFieldDescr {
     }
     fn set_descr_index(&self, index: i32) {
         self.descr_index.store(index, Ordering::Relaxed);
+    }
+    fn get_ei_index(&self) -> u32 {
+        self.ei_index.load(Ordering::Relaxed)
+    }
+    fn set_ei_index(&self, ei_index: u32) {
+        self.ei_index.store(ei_index, Ordering::Relaxed);
     }
     fn as_interior_field_descr(&self) -> Option<&dyn InteriorFieldDescr> {
         Some(self)
@@ -3764,6 +3821,28 @@ pub fn make_array_descr_full(
 /// callers must extend their cache key to cover whichever inputs
 /// they vary.
 ///
+/// `lendescr` mirrors `descr.py:286-287 self.lendescr = lendescr` —
+/// the caller passes a pre-built `FieldDescr` for `nolength=False`
+/// arrays (the upstream `get_field_arraylen_descr` shape) and `None`
+/// for `ARRAY._hints['nolength']` shapes.  `is_pure` mirrors
+/// `descr.py:288 self._is_pure = ARRAY._hints.get('immutable',
+/// False)` — drives the optimizer's pure-array fold.
+///
+/// `ei_index` mirrors `effectinfo.py:465 compute_bitstrings()`:
+/// publishes the codewriter-side `array_index`
+/// (`call.rs::DescrIndexRegistry::array_index`) onto the resulting
+/// descr via `set_ei_index` so heap.rs's `force_from_effectinfo`
+/// reads the same bitstring slot the producer wrote.
+/// `u32::MAX` is the unset sentinel.
+///
+/// `interior_field_descrs` mirrors `descr.py:372-375 arraydescr.
+/// all_interiorfielddescrs` — every interior FieldDescr must carry
+/// the SAME `arraydescr` Arc identity the array itself uses.  Pyre's
+/// `SimpleArrayDescr::set_all_interiorfielddescrs` writes through a
+/// `OnceLock` AFTER the parent Arc is minted; the caller is expected
+/// to have pre-built each `SimpleInteriorFieldDescr` referencing this
+/// parent.  Pass `Vec::new()` for primitive-item arrays.
+///
 /// Field provenance (RPython `descr.py:240-289 ArrayDescr.__init__`):
 /// - `lendescr`: `descr.py:286-287 self.lendescr = lendescr` — points
 ///   at the array length field's `FieldDescr` for arrays whose
@@ -3774,31 +3853,25 @@ pub fn make_array_descr_full(
 ///   `Ptr(rstr.UNICODE)` and any `lltype.Array(... hints={'immutable':
 ///   True})`.  Drives the optimizer's pure-array fold.
 ///
-/// LIMITATION (matches the `descr.py:388 InteriorFieldDescr.__init__`
-/// invariant): this helper does NOT mint
-/// `arraydescr.all_interiorfielddescrs`.  RPython requires every
-/// `InteriorFieldDescr` to carry the SAME `arraydescr` object identity
-/// the array descr it indexes into uses; pyre's
-/// [`SimpleInteriorFieldDescr::new`] takes that parent as
-/// `Arc<SimpleArrayDescr>` at construction time, so a caller cannot
-/// pre-build the interior descrs for an Arc that does not yet exist
-/// (which is exactly the situation here — the parent Arc is freshly
-/// minted inside this helper).  Use [`SimpleArrayDescr::
-/// set_all_interiorfielddescrs`] from the caller AFTER this helper
-/// returns: build the per-field `SimpleInteriorFieldDescr` Arcs with
-/// the returned parent Arc as their `array_descr`, then publish the
-/// list onto the parent through that `OnceLock` writer.  No interior
-/// argument here keeps the API honest about that ordering constraint.
 pub fn make_array_descr_from_lltype_shape(
     type_id: u32,
     base_size: usize,
     item_size: usize,
+    // `len_offset` is the BhDescr-side carry-over; the helper itself
+    // reads `lendescr` for the per-array length FieldDescr.  Callers
+    // that already have a pre-built `lendescr` pass `None` here and
+    // the real FieldDescr below; callers that only have the raw
+    // offset can construct an inline `SimpleFieldDescr` at the call
+    // site mirroring `descr.py:256-267 get_field_arraylen_descr`.
+    _len_offset: Option<usize>,
     item_type: Type,
     is_array_of_pointers: bool,
     is_array_of_structs: bool,
     is_item_signed: bool,
     lendescr: Option<DescrRef>,
     is_pure: bool,
+    ei_index: u32,
+    interior_field_descrs: Vec<DescrRef>,
 ) -> Arc<SimpleArrayDescr> {
     // RPython `descr.py:241-254 get_type_flag` precedence: pointer >
     // struct > primitive.  `is_array_of_pointers` selects FLAG_POINTER,
@@ -3828,7 +3901,22 @@ pub fn make_array_descr_from_lltype_shape(
     let mut descr = SimpleArrayDescr::with_flag(0, base_size, item_size, type_id, item_type, flag);
     descr.lendescr = lendescr;
     descr.is_pure = is_pure;
-    Arc::new(descr)
+    let arc = Arc::new(descr);
+    if ei_index != u32::MAX {
+        arc.set_ei_index(ei_index);
+    }
+    if !interior_field_descrs.is_empty() {
+        // RPython `descr.py:372-375` populates
+        // `arraydescr.all_interiorfielddescrs` after the array descr is
+        // minted, using the same arraydescr Arc inside each
+        // InteriorFieldDescr (`descr.py:388 InteriorFieldDescr.__init__`).
+        // The caller must therefore have built the `interior_field_descrs`
+        // with `arc` as their parent — pyre's
+        // `SimpleArrayDescr::set_all_interiorfielddescrs` writes through
+        // `OnceLock`, leaving the parent Arc identity stable.
+        arc.set_all_interiorfielddescrs(interior_field_descrs);
+    }
+    arc
 }
 
 /// Create a call descriptor.

@@ -69,9 +69,6 @@ pub struct AnalysisCache {
     can_invalidate: HashMap<CallPath, bool>,
     /// RPython: collect_analyzer (collectanalyze.py) — can this call trigger GC?
     can_collect: HashMap<CallPath, bool>,
-    /// RPython: `cpu.fielddescrof(T, fieldname)` / `cpu.arraydescrof(ARRAY)`.
-    /// Assigns sequential, collision-free ei_index values for bitstrings.
-    pub descr_indices: DescrIndexRegistry,
 }
 
 /// RPython: readwrite_analyzer.analyze(op) return value.
@@ -504,6 +501,19 @@ pub struct CallControl {
     /// Stores oopspec function info for builtin call handling.
     pub callinfocollection: majit_ir::CallInfoCollection,
 
+    /// `cpu.fielddescrof(T, fieldname).get_ei_index()` /
+    /// `cpu.arraydescrof(ARRAY).get_ei_index()` —
+    /// process-shared sequential, collision-free `ei_index` allocation
+    /// (`effectinfo.py:465 compute_bitstrings`).  Lives on `CallControl`
+    /// (not `AnalysisCache`) so the bytecode emit path
+    /// (`assembler.rs::arraydescrof`) and the writeanalyze walker
+    /// (`call.rs:3614`/`:3633`) consult a single source of truth — two
+    /// independent registries would assign different indices to the
+    /// same `(item_ty, array_type_id)` pair and alias distinct ARRAY
+    /// identities onto each other at `force_from_effectinfo`
+    /// (`heap.py:540-560`, `heap.rs:839 array_effect_index`).
+    pub descr_indices: DescrIndexRegistry,
+
     /// call.py:39 `self.virtualizable_analyzer = VirtualizableAnalyzer(translator)`.
     pub virtualizable_analyzer: majit_ir::effectinfo::VirtualizableAnalyzer,
 
@@ -774,23 +784,34 @@ impl StructLayout {
 /// with three independent counters (`next_field_index`,
 /// `next_array_index`, `next_interiorfield_index`).
 ///
-/// Array descriptors are keyed by `(item_ty, array_type_id)` per
+/// Array descriptors are keyed by `(item_ty, array_type_id, len_offset)` per
 /// RPython's `cpu.arraydescrof(ARRAY)`, which distinguishes by ARRAY
-/// lltype identity (`GcArray(Signed)` vs `GcArray(Ptr(STRUCT_X))`,
-/// `effectinfo.py:307-311`).  Interior-field descriptors are keyed by
+/// lltype identity, including `ARRAY._hints['nolength']`
+/// (`GcArray(Signed)` vs `GcArray(Ptr(STRUCT_X))`, `effectinfo.py:307-311`).
+/// Interior-field descriptors are keyed by
 /// `(array_type_id, field_name)` per
 /// `cpu.interiorfielddescrof(ARRAY, fieldname)` — a separate namespace
 /// from struct field indices.
 #[derive(Default)]
 pub struct DescrIndexRegistry {
+    /// Interior-mutable so that both the writeanalyze walker
+    /// (`call.rs:3614`/`:3633`) and the bytecode emit path
+    /// (`assembler.rs::arraydescrof`) can publish ei_index through
+    /// `&CallControl` without threading a `&mut` borrow through
+    /// `getcalldescr(&self, …)` and `assemble_with_callcontrol`.
+    inner: std::cell::RefCell<DescrIndexRegistryInner>,
+}
+
+#[derive(Default)]
+struct DescrIndexRegistryInner {
     /// (owner_root, field_name) → unbounded `ei_index` per
     /// `effectinfo.py:465 compute_bitstrings`. The value scales with the
     /// global descr count; `bitstring.make_bitstring` (`bitstring.py:3-13`)
     /// produces a bytestring whose length matches the largest index.
     field_indices: HashMap<(Option<String>, String), u32>,
-    /// (item_ty_discriminant, array_type_id) → unbounded `ei_index`.
+    /// (item_ty_discriminant, array_type_id, len_offset) → unbounded `ei_index`.
     /// RPython: cpu.arraydescrof(ARRAY).get_ei_index()
-    array_indices: HashMap<(u8, Option<String>), u32>,
+    array_indices: HashMap<(u8, Option<String>, Option<usize>), u32>,
     /// (array_type_id, field_name) → unbounded `ei_index`.
     /// RPython: cpu.interiorfielddescrof(ARRAY, fieldname).get_ei_index()
     /// Separate from field_indices — RPython keys on (ARRAY, fieldname)
@@ -808,33 +829,47 @@ impl DescrIndexRegistry {
     /// `bitstring.py:3-13 make_bitstring(lst)` — the bitstring length
     /// scales with the maximum index, not capped at any width
     /// (`effectinfo.py:465 compute_bitstrings`).
-    pub fn field_index(&mut self, owner_root: &Option<String>, field_name: &str) -> u32 {
+    pub fn field_index(&self, owner_root: &Option<String>, field_name: &str) -> u32 {
+        let mut inner = self.inner.borrow_mut();
         let key = (owner_root.clone(), field_name.to_string());
-        *self.field_indices.entry(key).or_insert_with(|| {
-            let idx = self.next_field_index;
-            self.next_field_index += 1;
-            idx
-        })
+        if let Some(&idx) = inner.field_indices.get(&key) {
+            return idx;
+        }
+        let idx = inner.next_field_index;
+        inner.next_field_index += 1;
+        inner.field_indices.insert(key, idx);
+        idx
     }
 
     /// RPython: `cpu.arraydescrof(ARRAY).get_ei_index()`
-    pub fn array_index(&mut self, item_ty_discriminant: u8, array_type_id: &Option<String>) -> u32 {
-        let key = (item_ty_discriminant, array_type_id.clone());
-        *self.array_indices.entry(key).or_insert_with(|| {
-            let idx = self.next_array_index;
-            self.next_array_index += 1;
-            idx
-        })
+    pub fn array_index(
+        &self,
+        item_ty_discriminant: u8,
+        array_type_id: &Option<String>,
+        len_offset: Option<usize>,
+    ) -> u32 {
+        let mut inner = self.inner.borrow_mut();
+        let key = (item_ty_discriminant, array_type_id.clone(), len_offset);
+        if let Some(&idx) = inner.array_indices.get(&key) {
+            return idx;
+        }
+        let idx = inner.next_array_index;
+        inner.next_array_index += 1;
+        inner.array_indices.insert(key, idx);
+        idx
     }
 
     /// RPython: `cpu.interiorfielddescrof(ARRAY, fieldname).get_ei_index()`
-    pub fn interiorfield_index(&mut self, array_type_id: &Option<String>, field_name: &str) -> u32 {
+    pub fn interiorfield_index(&self, array_type_id: &Option<String>, field_name: &str) -> u32 {
+        let mut inner = self.inner.borrow_mut();
         let key = (array_type_id.clone(), field_name.to_string());
-        *self.interiorfield_indices.entry(key).or_insert_with(|| {
-            let idx = self.next_interiorfield_index;
-            self.next_interiorfield_index += 1;
-            idx
-        })
+        if let Some(&idx) = inner.interiorfield_indices.get(&key) {
+            return idx;
+        }
+        let idx = inner.next_interiorfield_index;
+        inner.next_interiorfield_index += 1;
+        inner.interiorfield_indices.insert(key, idx);
+        idx
     }
 }
 
@@ -858,6 +893,7 @@ impl CallControl {
             finished_jitcodes: Vec::new(),
             unfinished_graphs: Vec::new(),
             callinfocollection: majit_ir::CallInfoCollection::new(),
+            descr_indices: DescrIndexRegistry::default(),
             virtualizable_analyzer: majit_ir::effectinfo::VirtualizableAnalyzer,
             quasiimmut_analyzer: majit_ir::effectinfo::QuasiImmutAnalyzer,
             randomeffects_analyzer: majit_ir::effectinfo::RandomEffectsAnalyzer,
@@ -937,16 +973,51 @@ impl CallControl {
         self.struct_fields.fields.get(owner).map(Vec::as_slice)
     }
 
+    /// `cpu.arraydescrof(ARRAY)` for callers that do not already hold the
+    /// codewriter-side `array_index` — resolves it via
+    /// [`DescrIndexRegistry::array_index`] keyed on
+    /// `(value_type_discriminant(item_ty), array_type_id, len_offset)`, the same key
+    /// the `writeanalyze` walker in this file uses, then
+    /// hands the resulting `ei_index` to [`arraydescrof`].
+    ///
+    /// Bytecode emit (`assembler.rs::arraydescrof`) and the per-callee
+    /// `writeanalyze` walker must agree on the same `(item_ty,
+    /// array_type_id, len_offset)` → `ei_index` mapping; routing both through
+    /// `descr_indices.array_index` mirrors `effectinfo.py:307-311`'s
+    /// shared `cpu.arraydescrof(ARRAY).get_ei_index()` namespace and
+    /// keeps `force_from_effectinfo` (`heap.py:540-560`) from aliasing
+    /// distinct ARRAY identities onto the same bitstring slot.
+    pub fn arraydescrof_for_type(
+        &self,
+        item_ty: &crate::model::ValueType,
+        array_type_id: &Option<String>,
+        ir_type: majit_ir::value::Type,
+        len_offset: Option<usize>,
+    ) -> majit_ir::descr::DescrRef {
+        let idx = self.descr_indices.array_index(
+            value_type_discriminant(item_ty),
+            array_type_id,
+            len_offset,
+        );
+        self.arraydescrof(idx, array_type_id, ir_type, len_offset)
+    }
+
     /// RPython: `cpu.arraydescrof(ARRAY)` — descr.py:348-378.
     ///
     /// `array_type_id`: full ARRAY type string (e.g. `"Vec<Point>"`), matching
     /// RPython's ARRAY lltype identity. The element type is extracted via
     /// `extract_element_type_from_str()` for struct checks and flag resolution.
+    ///
+    /// `len_offset`: descr.py:359-362 — `None` for the `nolength=True`
+    /// shape (`ARRAY_INSIDE._hints['nolength']`), `Some(off)` for
+    /// length-prefixed layouts where `off` is the byte offset of the
+    /// length word inside the allocation.
     pub fn arraydescrof(
         &self,
         idx: u32,
         array_type_id: &Option<String>,
         ir_type: majit_ir::value::Type,
+        len_offset: Option<usize>,
     ) -> majit_ir::descr::DescrRef {
         // RPython: ARRAY_INSIDE.OF — extract element type from full ARRAY type.
         let elem_name = array_type_id
@@ -975,11 +1046,46 @@ impl CallControl {
                 8,
             )
         };
-        // RPython: basesize, itemsize, _ = symbolic.get_array_token(ARRAY, tsc)
-        let base_size = self.array_header_size;
-        let ad = majit_ir::descr::SimpleArrayDescr::with_flag(
+        // RPython: basesize, itemsize, _ = symbolic.get_array_token(ARRAY, tsc).
+        // descr.py:359-362 + symbolic.get_array_token — basesize follows
+        // the lltype's nolength flag:
+        //   `nolength=True`  → no length header → items at offset 0
+        //   `nolength=False` → length at lendescr.offset → items past header
+        // pyre's CallControl uses a single-word array header
+        // (`array_header_size = WORD`), so the length-prefixed shape places
+        // items immediately after the length word at `len_offset + WORD`.
+        let base_size = match len_offset {
+            None => 0,
+            Some(off) => off + self.array_header_size,
+        };
+        let mut ad = majit_ir::descr::SimpleArrayDescr::with_flag(
             idx, base_size, item_size, 0, ir_type, flag,
         );
+        // descr.py:359-362 — `nolength=True` arrays carry no length
+        // FieldDescr (`lendescr = None`); length-prefixed arrays carry a
+        // FieldDescr at the supplied offset. The synthetic shape mirrors
+        // `get_field_arraylen_descr` (descr.py:256-267): FieldDescr("len",
+        // off, WORD, FLAG_SIGNED).
+        ad.lendescr = len_offset.map(|off| {
+            std::sync::Arc::new(majit_ir::descr::SimpleFieldDescr::new_with_name(
+                u32::MAX,
+                off,
+                std::mem::size_of::<usize>(),
+                majit_ir::value::Type::Int,
+                false,
+                majit_ir::descr::ArrayFlag::Signed,
+                "len".to_string(),
+            )) as majit_ir::descr::DescrRef
+        });
+        // `effectinfo.py:465 compute_bitstrings` ei_index publish: `idx`
+        // is the codewriter's per-trace `array_index`
+        // (`effectinfo.py:307-311`), the same key that EffectInfo
+        // `read_descrs_arrays` / `write_descrs_arrays` raw sets use.
+        // Publishing it onto the descr lets `force_from_effectinfo`
+        // (`heap.py:537-571`) lookup `descr.get_ei_index()` to find the
+        // bitstring slot directly, instead of relying on `descr.index()`
+        // namespace alignment.
+        let publish_ei = |descr: &dyn majit_ir::descr::Descr| descr.set_ei_index(idx);
         // RPython: descr.py:372-375 — struct arrays get interior field descriptors.
         if is_struct {
             if let Some(struct_name) = elem_ref {
@@ -989,6 +1095,7 @@ impl CallControl {
                 // the final Arc first and routing the interior list back
                 // onto it via the `OnceLock` interior-mutability setter.
                 let ad_arc = std::sync::Arc::new(ad);
+                publish_ei(ad_arc.as_ref());
                 let (descrs, _) = all_interiorfielddescrs(self, struct_name, ad_arc.clone());
                 if !descrs.is_empty() {
                     ad_arc.set_all_interiorfielddescrs(descrs);
@@ -996,7 +1103,9 @@ impl CallControl {
                 return ad_arc;
             }
         }
-        std::sync::Arc::new(ad)
+        let ad_arc = std::sync::Arc::new(ad);
+        publish_ei(ad_arc.as_ref());
+        ad_arc
     }
 
     /// Register a free function graph.
@@ -3336,17 +3445,14 @@ impl CallControl {
 
         // RPython call.py:320-324 effectinfo assembly.
         let effects = match shape {
-            CallShape::Direct(target) => analyze_readwrite(
-                target,
-                &self.function_graphs,
-                self,
-                &mut cache.descr_indices,
-            ),
+            CallShape::Direct(target) => {
+                analyze_readwrite(target, &self.function_graphs, self, &self.descr_indices)
+            }
             CallShape::Indirect(graphs) => analyze_readwrite_indirect_family(
                 graphs,
                 &self.function_graphs,
                 self,
-                &mut cache.descr_indices,
+                &self.descr_indices,
             ),
         };
         let can_collect = match shape {
@@ -3424,7 +3530,7 @@ fn analyze_readwrite(
     target: &CallTarget,
     function_graphs: &HashMap<CallPath, FunctionGraph>,
     cc: &CallControl,
-    descr_indices: &mut DescrIndexRegistry,
+    descr_indices: &DescrIndexRegistry,
 ) -> WriteAnalysis {
     let mut analysis = WriteAnalysis {
         read_fields: Vec::new(),
@@ -3468,7 +3574,7 @@ fn analyze_readwrite_indirect_family(
     graphs: Option<&[CallPath]>,
     function_graphs: &HashMap<CallPath, FunctionGraph>,
     cc: &CallControl,
-    descr_indices: &mut DescrIndexRegistry,
+    descr_indices: &DescrIndexRegistry,
 ) -> WriteAnalysis {
     let mut analysis = WriteAnalysis {
         read_fields: Vec::new(),
@@ -3735,12 +3841,23 @@ fn resolve_array_identity(
 /// - `Vec<Point>` → `"Point"` (angle brackets)
 /// - `[i64]` → `"i64"` (slice)
 /// - `[Point; 10]` → `"Point"` (fixed-size array)
+/// - `&[Point]` / `&mut [Point]` / `*const [Point]` / `*mut [Point]` —
+///   the pointer-like prefix is stripped first so the slice body is
+///   matched normally. Mirrors `front::ast::extract_element_type_from_str`
+///   so source-level analysis and effect bookkeeping agree on the
+///   item type (`descr.py:241-254 get_type_flag` reads the same
+///   `ARRAY.OF` regardless of how the lltype is referenced).
 fn extract_element_type_from_str(type_str: &str) -> Option<String> {
-    let s = type_str.trim();
-    // Angle brackets: Vec<T>, Box<T>, etc.
-    if let (Some(start), Some(end)) = (s.find('<'), s.rfind('>')) {
-        if start < end {
-            return Some(s[start + 1..end].trim().to_string());
+    let mut s = type_str.trim();
+    loop {
+        let stripped = s
+            .strip_prefix("*const ")
+            .or_else(|| s.strip_prefix("*mut "))
+            .or_else(|| s.strip_prefix("&mut "))
+            .or_else(|| s.strip_prefix("&"));
+        match stripped {
+            Some(rest) => s = rest.trim_start(),
+            None => break,
         }
     }
     // Square brackets: [T] or [T; N]
@@ -3753,6 +3870,14 @@ fn extract_element_type_from_str(type_str: &str) -> Option<String> {
         };
         if !elem.is_empty() {
             return Some(elem.to_string());
+        }
+    }
+    // Angle brackets: Vec<T>, Box<T>, etc.  Checked after the slice
+    // form so `[Rc<T>]` yields `Rc<T>`, not `T` — matches the front-end
+    // counterpart in `front::ast::extract_element_type_from_str`.
+    if let (Some(start), Some(end)) = (s.find('<'), s.rfind('>')) {
+        if start < end {
+            return Some(s[start + 1..end].trim().to_string());
         }
     }
     None
@@ -3770,7 +3895,7 @@ fn collect_readwrite_effects(
     path: &CallPath,
     function_graphs: &HashMap<CallPath, FunctionGraph>,
     cc: &CallControl,
-    descr_indices: &mut DescrIndexRegistry,
+    descr_indices: &DescrIndexRegistry,
     seen: &mut HashSet<CallPath>,
     read_fields: &mut Vec<u32>,
     write_fields: &mut Vec<u32>,
@@ -3845,6 +3970,7 @@ fn collect_readwrite_effects(
                     base,
                     item_ty,
                     array_type_id,
+                    nolength,
                     ..
                 } => {
                     // RPython: op.args[0].concretetype → cpu.arraydescrof(ARRAY)
@@ -3855,8 +3981,12 @@ fn collect_readwrite_effects(
                         &phi_sources,
                         cc,
                     );
-                    let idx =
-                        descr_indices.array_index(value_type_discriminant(item_ty), &resolved_id);
+                    let len_offset = if *nolength { None } else { Some(0) };
+                    let idx = descr_indices.array_index(
+                        value_type_discriminant(item_ty),
+                        &resolved_id,
+                        len_offset,
+                    );
                     read_arrays.push(idx);
                 }
                 // RPython: ("array", T)
@@ -3864,6 +3994,7 @@ fn collect_readwrite_effects(
                     base,
                     item_ty,
                     array_type_id,
+                    nolength,
                     ..
                 } => {
                     let resolved_id = resolve_array_identity(
@@ -3873,8 +4004,12 @@ fn collect_readwrite_effects(
                         &phi_sources,
                         cc,
                     );
-                    let idx =
-                        descr_indices.array_index(value_type_discriminant(item_ty), &resolved_id);
+                    let len_offset = if *nolength { None } else { Some(0) };
+                    let idx = descr_indices.array_index(
+                        value_type_discriminant(item_ty),
+                        &resolved_id,
+                        len_offset,
+                    );
                     write_arrays.push(idx);
                     // RPython: effectinfo.py:307-311 — cpu.arraydescrof(ARRAY).
                     // Dedup by descriptor index (frozenset semantics).
@@ -3889,7 +4024,18 @@ fn collect_readwrite_effects(
                             crate::model::ValueType::Float => majit_ir::value::Type::Float,
                             crate::model::ValueType::Void => majit_ir::value::Type::Void,
                         };
-                        array_write_descrs.push(cc.arraydescrof(idx, &resolved_id, ir_type));
+                        // descr.py:359-362 + ARRAY_INSIDE._hints.get(
+                        // 'nolength', False): the producer-side bit
+                        // carried on `OpKind::ArrayWrite` flows through
+                        // here so EffectInfo descrs match the same
+                        // `lendescr` shape `arraydescrof()` minted at the
+                        // emit-bytecode site (assembler.rs).
+                        array_write_descrs.push(cc.arraydescrof(
+                            idx,
+                            &resolved_id,
+                            ir_type,
+                            len_offset,
+                        ));
                     }
                 }
                 // RPython: ("readinteriorfield", T, fieldname)
@@ -3914,10 +4060,23 @@ fn collect_readwrite_effects(
                     read_interiorfields.push(ifield_idx);
                     // effectinfo.py:327-340: implicit array read.
                     // RPython: cpu.arraydescrof(ARRAY) uses get_type_flag(ARRAY.OF).
-                    // Interior fields only exist in struct arrays → element type is Ref.
+                    // Interior fields only exist in struct arrays → element
+                    // type is Ref. `len_offset` honours
+                    // `ARRAY_INSIDE._hints.get('nolength', False)`
+                    // (`descr.py:359`) so headerless array-of-structs
+                    // shapes (`&[T]`, `*const [T]`, etc.) hash to a
+                    // different bitstring slot than length-prefixed
+                    // `Vec<T>` / `GcArray<T>` of the same item type.
+                    let len_offset =
+                        if crate::front::ast::nolength_from_array_type_id(resolved_id.as_deref()) {
+                            None
+                        } else {
+                            Some(0)
+                        };
                     let arr_idx = descr_indices.array_index(
                         value_type_discriminant(&crate::model::ValueType::Ref),
                         &resolved_id,
+                        len_offset,
                     );
                     read_arrays.push(arr_idx);
                 }
@@ -3942,10 +4101,21 @@ fn collect_readwrite_effects(
                     let ifield_idx = descr_indices.interiorfield_index(&resolved_id, &field.name);
                     write_interiorfields.push(ifield_idx);
                     // effectinfo.py:327-340: implicit array write.
-                    // RPython: cpu.arraydescrof(ARRAY) — struct arrays are always Ref.
+                    // RPython: cpu.arraydescrof(ARRAY) — struct arrays
+                    // are always Ref; `len_offset` reflects
+                    // `ARRAY_INSIDE._hints['nolength']` so headerless
+                    // array-of-structs shapes do not alias length-prefixed
+                    // ones at the EffectInfo bitset.
+                    let len_offset =
+                        if crate::front::ast::nolength_from_array_type_id(resolved_id.as_deref()) {
+                            None
+                        } else {
+                            Some(0)
+                        };
                     let arr_idx = descr_indices.array_index(
                         value_type_discriminant(&crate::model::ValueType::Ref),
                         &resolved_id,
+                        len_offset,
                     );
                     write_arrays.push(arr_idx);
                 }

@@ -2007,6 +2007,7 @@ mod tests {
                 index: ValueId(2),
                 item_ty: ValueType::Int,
                 array_type_id: None,
+                nolength: false,
             },
         };
         let translated = translate_op(&op, &value_map).expect("ArrayRead arm must lower");
@@ -2030,6 +2031,7 @@ mod tests {
                 value: ValueId(3),
                 item_ty: ValueType::Int,
                 array_type_id: None,
+                nolength: false,
             },
         };
         let translated = translate_op(&op, &value_map).expect("ArrayWrite arm must lower");

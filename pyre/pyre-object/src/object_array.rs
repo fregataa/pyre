@@ -1,4 +1,4 @@
-use std::alloc::{Layout, alloc, dealloc};
+use std::alloc::{Layout, alloc, alloc_zeroed, dealloc};
 use std::ops::{Index, IndexMut};
 
 use crate::{PY_NULL, PyObjectRef};
@@ -13,6 +13,18 @@ use crate::{PY_NULL, PyObjectRef};
 /// GC walks each item slot as a Ref. Re-exported from
 /// `pyre_jit_trace::descr` for existing call sites.
 pub const PY_OBJECT_ARRAY_GC_TYPE_ID: u32 = 9;
+
+/// GC type id for `Ptr(GcArray(Signed))` blocks materialized by resume /
+/// blackhole paths. This is a distinct ARRAY identity from
+/// `GcArray(Float)` even though the collector trace shape is the same.
+/// Registered after the dictview (39) and getset-property (40) slots
+/// so `gc.register_type` returns 41 here.
+pub const GC_INT_ARRAY_GC_TYPE_ID: u32 = 41;
+
+/// GC type id for `Ptr(GcArray(Float))` blocks materialized by resume /
+/// blackhole paths. RPython gives each ARRAY lltype its own tid via
+/// `GcLLDescr_framework.init_array_descr`.
+pub const GC_FLOAT_ARRAY_GC_TYPE_ID: u32 = 42;
 
 /// `#[repr(C)] { capacity, items: [PyObjectRef; 0] }` — the single-block
 /// inline-varsize GcArray body used by `W_ListObject.items` /
@@ -332,74 +344,40 @@ impl IndexMut<usize> for FixedObjectArray {
     }
 }
 
-// ─── GcArray: RPython GC array allocation + setarrayitem parity ──────────
-//
-// resume.py:1444-1537 ResumeDataDirectReader:
-//   allocate_array(length, arraydescr, clear) → GCREF
-//   setarrayitem_ref(array, index, fieldnum, arraydescr) → write decoded ref
-//   setarrayitem_int(array, index, fieldnum, arraydescr) → write decoded int
-//   setarrayitem_float(array, index, fieldnum, arraydescr) → write decoded float
-//
-// In pyre, GcArray is a boxed PyObjectArray on the heap. The returned
-// pointer is a raw `*mut PyObjectArray` cast to usize for GcRef.
-
 // ─── GcTypedArray: typed array helper for resume / blackhole ─────────
 //
 // llmodel.py:788-789: bh_new_array / bh_new_array_clear
 // llmodel.py:607-619: bh_setarrayitem_gc_r/i/f, bh_getarrayitem_gc_r/i/f
 // resume.py:1444-1537: ResumeDataDirectReader allocate_array + setarrayitem_*
 //
-// RPython GC arrays are typed: ref[], int[], float[]. Each slot stores
-// a raw value of the corresponding type. pyre's `GcTypedArray` keeps
-// the typed distinction at the API level but DOES NOT match upstream's
-// memory shape:
-//
-// **NON-PARITY (PRE-EXISTING-ADAPTATION).** Upstream `gc_malloc_array`
-// (`framework.py:837-849 gct_fv_gc_malloc_varsize`) is a *varsize*
-// allocation parameterised by `(length, basesize, itemsize,
-// length_offset)`, producing a single flat block:
+// RPython GC arrays are flat varsize blocks:
 //
 //     [length: WORD] [item_0] [item_1] ... [item_(length-1)]
 //
-// `GcTypedArray` instead heap-boxes a fixed-size Rust enum that wraps
-// a `Vec<T>`, giving a double indirection
-// (`*mut GcTypedArray -> Vec.ptr -> items`). The Vec storage lives on
-// `std::alloc`'s heap, completely outside any GC nursery, so the GC
-// walker has no path to the inline `PyObjectRef`s in `Ref(_)` /
-// `Struct { data, .. }`.
-//
-// Convergence target: replace each variant with a flat varsize struct
-// matching upstream — see [`ItemsBlock`] above for the exact shape
-// (`rpython/rtyper/lltypesystem/rlist.py:84 GcArray(OBJECTPTR)`) and
-// register through `TypeInfo::varsize(basesize, itemsize,
-// length_offset, items_have_gc_ptrs, gc_ptr_offsets)` matching
-// `framework.py:839`. Allocation site (`allocate_array` /
-// `allocate_array_struct`) routes through `malloc_raw` rather than
-// `malloc` to avoid claiming GC-managed semantics it does not yet
-// honour. The Vec contents are reachable only through the resume /
-// blackhole walker holding `*mut GcTypedArray` directly as a root
-// (resume.py:1444-1537 reader pattern).
+// `GcTypedArray` mirrors that storage shape so backend
+// `bh_getarrayitem_gc_*` / `bh_setarrayitem_gc_*` pointer arithmetic can
+// operate on the same object that resume materialization returns.  This
+// is still an allocator adaptation: the block is allocated with
+// `std::alloc::alloc_zeroed` rather than MiniMark's nursery, so GC
+// tracing/write barriers are not claimed here.
 
-/// Typed array helper used by the resume / blackhole readers.
-/// `descr.py:273 ArrayDescr.flag` parity at the API level only —
-/// the memory shape is NOT upstream-equivalent (see module-level
-/// comment).
-pub enum GcTypedArray {
-    /// FLAG_POINTER: each slot is a PyObjectRef (GCREF).
-    Ref(Vec<PyObjectRef>),
-    /// FLAG_SIGNED/FLAG_UNSIGNED: each slot is a raw i64.
-    Int(Vec<i64>),
-    /// FLAG_FLOAT: each slot is a raw f64.
-    Float(Vec<f64>),
-    /// FLAG_STRUCT: Array(Struct(...)) — flat byte buffer.
-    /// llmodel.py:648-665 bh_setinteriorfield_gc_* parity.
-    /// Layout: num_elems elements, each item_size bytes, stored inline.
-    /// Access: elem_idx * item_size + field_offset.
-    Struct {
-        item_size: usize,
-        num_elems: usize,
-        data: Vec<u8>,
-    },
+/// Offset of the length prefix within `GcTypedArray` (always 0).
+pub const GC_TYPED_ARRAY_LEN_OFFSET: usize = 0;
+
+/// Offset of the first item within `GcTypedArray`.
+pub const GC_TYPED_ARRAY_ITEMS_OFFSET: usize = std::mem::size_of::<usize>();
+
+/// Typed varsize array helper used by the resume / blackhole readers.
+/// The element type is carried by the array descriptor/API call, matching
+/// RPython's typed `ArrayDescr`; the runtime block itself stores only the
+/// length prefix followed by inline bytes.
+#[repr(C)]
+pub struct GcTypedArray {
+    /// Length prefix. Backend `bh_arraylen_gc` reads this word at offset 0.
+    pub len: usize,
+    /// Flexible-array tail marker. Actual items follow immediately in
+    /// memory and are sized by the allocation descriptor.
+    items: [u8; 0],
 }
 
 /// Array element kind — resume.py:656 arraydescr.is_array_of_* / FLAG_STRUCT parity.
@@ -414,61 +392,85 @@ pub enum ArrayKind {
 
 /// resume.py:1444-1447, llmodel.py:788-790 — API alias.
 /// RPython: `bh_new_array_clear = bh_new_array` (llmodel.py:790).
-/// Upstream both call `gc_malloc_array` which allocates a varsize
-/// block from the GC nursery (always zero-filled).
-///
-/// **NON-PARITY** at the storage level: pyre boxes a fixed-size
-/// `GcTypedArray` enum (`malloc_raw`) whose `Vec` payload lives on
-/// `std::alloc`'s heap. The result is invisible to the GC walker
-/// — see the module-level comment for the convergence path through
-/// flat varsize blocks à la [`ItemsBlock`].
+/// Upstream both call `gc_malloc_array` which allocates a zero-filled
+/// varsize block. Ref/int/float slots are word-sized.
 pub fn allocate_array(length: usize, kind: ArrayKind, _clear: bool) -> *mut GcTypedArray {
-    // llmodel.py:790: bh_new_array_clear = bh_new_array.
-    // Both allocate from gc_malloc_array (always zero-filled).
-    let arr = match kind {
-        ArrayKind::Ref => GcTypedArray::Ref(vec![PY_NULL; length]),
-        ArrayKind::Int => GcTypedArray::Int(vec![0i64; length]),
-        ArrayKind::Float => GcTypedArray::Float(vec![0.0f64; length]),
-        ArrayKind::Struct => GcTypedArray::Struct {
-            item_size: 0,
-            num_elems: length,
-            data: Vec::new(),
-        },
+    let item_size = match kind {
+        ArrayKind::Ref | ArrayKind::Int | ArrayKind::Float => std::mem::size_of::<usize>(),
+        ArrayKind::Struct => 0,
     };
-    crate::lltype::malloc_raw(arr)
+    allocate_array_with_item_size(length, kind, item_size, _clear)
+}
+
+/// Same allocator as [`allocate_array`], but preserves the descriptor's
+/// item size for array-of-structs materialization.
+pub fn allocate_array_with_item_size(
+    length: usize,
+    _kind: ArrayKind,
+    item_size: usize,
+    _clear: bool,
+) -> *mut GcTypedArray {
+    allocate_flat_gc_typed_array(length, item_size)
 }
 
 /// resume.py:749 VArrayStructInfo.allocate — API alias.
-/// Allocate a flat byte buffer for Array(Struct(...)).
-/// Layout: num_elems elements × item_size bytes, zero-filled.
-/// llmodel.py: `gc_malloc_array(basesize + num_elems * itemsize)`.
-///
-/// **NON-PARITY** at the storage level: same caveat as
-/// [`allocate_array`] above. The byte buffer lives on `std::alloc`,
-/// not in the GC nursery, so reads/writes through
-/// [`setinteriorfield`] do not engage write-barriers. Until the
-/// flat-varsize port lands, callers must hold `*mut GcTypedArray` as
-/// an explicit root for any contained PyObjectRefs to survive a
-/// collection.
+/// Allocate a flat byte buffer for Array(Struct(...)):
+/// `[len][num_elems * item_size bytes]`.
 pub fn allocate_array_struct(num_elems: usize, item_size: usize) -> *mut GcTypedArray {
-    let total_bytes = num_elems * item_size;
-    let arr = GcTypedArray::Struct {
-        item_size,
-        num_elems,
-        data: vec![0u8; total_bytes],
-    };
-    crate::lltype::malloc_raw(arr)
+    allocate_flat_gc_typed_array(num_elems, item_size)
+}
+
+fn allocate_flat_gc_typed_array(length: usize, item_size: usize) -> *mut GcTypedArray {
+    let layout = gc_typed_array_layout(length, item_size);
+    unsafe {
+        let raw = alloc_zeroed(layout);
+        if raw.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        let array = raw as *mut GcTypedArray;
+        (*array).len = length;
+        array
+    }
+}
+
+fn gc_typed_array_layout(length: usize, item_size: usize) -> Layout {
+    let items_size = length
+        .checked_mul(item_size)
+        .expect("GcTypedArray item bytes overflow");
+    let total = GC_TYPED_ARRAY_ITEMS_OFFSET
+        .checked_add(items_size)
+        .expect("GcTypedArray allocation size overflow");
+    Layout::from_size_align(total, std::mem::align_of::<GcTypedArray>())
+        .expect("GcTypedArray layout")
+}
+
+/// Return the items base pointer of a `GcTypedArray`.
+#[inline]
+pub unsafe fn gc_typed_array_items_base(array: *mut GcTypedArray) -> *mut u8 {
+    if array.is_null() {
+        return std::ptr::null_mut();
+    }
+    unsafe { (array as *mut u8).add(GC_TYPED_ARRAY_ITEMS_OFFSET) }
+}
+
+#[inline]
+unsafe fn gc_typed_array_item_ptr(
+    array: *mut GcTypedArray,
+    index: usize,
+    item_size: usize,
+) -> Option<*mut u8> {
+    if array.is_null() || index >= unsafe { (*array).len } {
+        return None;
+    }
+    Some(unsafe { gc_typed_array_items_base(array).add(index * item_size) })
 }
 
 /// llmodel.py:607-609 bh_setarrayitem_gc_r parity.
 pub fn setarrayitem_ref(array: *mut GcTypedArray, index: usize, value: PyObjectRef) {
-    if array.is_null() {
-        return;
-    }
-    let arr = unsafe { &mut *array };
-    if let GcTypedArray::Ref(v) = arr {
-        if index < v.len() {
-            v[index] = value;
+    unsafe {
+        if let Some(ptr) = gc_typed_array_item_ptr(array, index, std::mem::size_of::<PyObjectRef>())
+        {
+            (ptr as *mut PyObjectRef).write_unaligned(value);
         }
     }
 }
@@ -476,46 +478,20 @@ pub fn setarrayitem_ref(array: *mut GcTypedArray, index: usize, value: PyObjectR
 /// llmodel.py:613-615 bh_setarrayitem_gc_i parity.
 /// Write a raw i64 to an int array slot.
 pub fn setarrayitem_int(array: *mut GcTypedArray, index: usize, value: i64) {
-    if array.is_null() {
-        return;
-    }
-    let arr = unsafe { &mut *array };
-    match arr {
-        GcTypedArray::Int(v) => {
-            if index < v.len() {
-                v[index] = value;
-            }
+    unsafe {
+        if let Some(ptr) = gc_typed_array_item_ptr(array, index, std::mem::size_of::<i64>()) {
+            (ptr as *mut i64).write_unaligned(value);
         }
-        // Fallback: box as W_IntObject into ref array
-        GcTypedArray::Ref(v) => {
-            if index < v.len() {
-                v[index] = crate::intobject::w_int_new(value);
-            }
-        }
-        _ => {}
     }
 }
 
 /// llmodel.py:618-619 bh_setarrayitem_gc_f parity.
 /// Write a raw f64 to a float array slot.
 pub fn setarrayitem_float(array: *mut GcTypedArray, index: usize, value: f64) {
-    if array.is_null() {
-        return;
-    }
-    let arr = unsafe { &mut *array };
-    match arr {
-        GcTypedArray::Float(v) => {
-            if index < v.len() {
-                v[index] = value;
-            }
+    unsafe {
+        if let Some(ptr) = gc_typed_array_item_ptr(array, index, std::mem::size_of::<f64>()) {
+            (ptr as *mut f64).write_unaligned(value);
         }
-        // Fallback: box as W_FloatObject into ref array
-        GcTypedArray::Ref(v) => {
-            if index < v.len() {
-                v[index] = crate::floatobject::w_float_new(value);
-            }
-        }
-        _ => {}
     }
 }
 
@@ -523,8 +499,6 @@ pub fn setarrayitem_float(array: *mut GcTypedArray, index: usize, value: f64) {
 /// resume.py:1520-1529 ResumeDataDirectReader: dispatch on descr type.
 /// llmodel.py:648-665: byte offset = elem_idx * item_size + field_offset.
 ///
-/// For GcTypedArray::Struct: writes directly to the flat byte buffer.
-/// For legacy Ref/Int/Float arrays: falls back to flat index computation.
 pub fn setinteriorfield(
     array: *mut GcTypedArray,
     elem_idx: usize,
@@ -537,48 +511,42 @@ pub fn setinteriorfield(
     if array.is_null() {
         return;
     }
-    let arr = unsafe { &mut *array };
-    match arr {
-        GcTypedArray::Struct {
-            data,
-            item_size: is,
-            ..
-        } => {
-            // llmodel.py:648-665 parity: byte_offset = elem_idx * item_size + field_offset
-            let byte_offset = elem_idx * *is + field_offset;
-            let end = byte_offset + field_size.min(8);
-            if end <= data.len() {
-                match descr_field_type {
-                    2 => {
-                        // bh_setinteriorfield_gc_f: write f64
-                        let bits = value as u64;
-                        data[byte_offset..byte_offset + 8.min(field_size)]
-                            .copy_from_slice(&bits.to_ne_bytes()[..8.min(field_size)]);
-                    }
-                    0 => {
-                        // bh_setinteriorfield_gc_r: write ref (pointer)
-                        let ptr = value as usize;
-                        let sz = std::mem::size_of::<usize>().min(field_size);
-                        data[byte_offset..byte_offset + sz]
-                            .copy_from_slice(&ptr.to_ne_bytes()[..sz]);
-                    }
-                    _ => {
-                        // bh_setinteriorfield_gc_i: write int
-                        let sz = field_size.min(8);
-                        data[byte_offset..byte_offset + sz]
-                            .copy_from_slice(&value.to_ne_bytes()[..sz]);
-                    }
-                }
+    if item_size == 0 || field_size == 0 {
+        return;
+    }
+    let len = gcarray_len(array);
+    let Some(byte_offset) = elem_idx
+        .checked_mul(item_size)
+        .and_then(|base| base.checked_add(field_offset))
+    else {
+        return;
+    };
+    let Some(end) = byte_offset.checked_add(field_size) else {
+        return;
+    };
+    let Some(total) = len.checked_mul(item_size) else {
+        return;
+    };
+    if end > total {
+        return;
+    }
+    unsafe {
+        let ptr = gc_typed_array_items_base(array).add(byte_offset);
+        match descr_field_type {
+            2 => {
+                let bits = value as u64;
+                std::ptr::copy_nonoverlapping(bits.to_ne_bytes().as_ptr(), ptr, field_size.min(8));
             }
-        }
-        _ => {
-            // Legacy fallback: flat index for Ref/Int/Float arrays.
-            let fields_per_elem = if item_size > 0 { item_size } else { 1 };
-            let flat = elem_idx * fields_per_elem + field_offset;
-            match descr_field_type {
-                2 => setarrayitem_float(array, flat, f64::from_bits(value as u64)),
-                1 => setarrayitem_int(array, flat, value),
-                _ => setarrayitem_ref(array, flat, value as PyObjectRef),
+            0 => {
+                let raw = value as usize;
+                std::ptr::copy_nonoverlapping(
+                    raw.to_ne_bytes().as_ptr(),
+                    ptr,
+                    field_size.min(std::mem::size_of::<usize>()),
+                );
+            }
+            _ => {
+                std::ptr::copy_nonoverlapping(value.to_ne_bytes().as_ptr(), ptr, field_size.min(8));
             }
         }
     }
@@ -589,11 +557,5 @@ pub fn gcarray_len(array: *const GcTypedArray) -> usize {
     if array.is_null() {
         return 0;
     }
-    let arr = unsafe { &*array };
-    match arr {
-        GcTypedArray::Ref(v) => v.len(),
-        GcTypedArray::Int(v) => v.len(),
-        GcTypedArray::Float(v) => v.len(),
-        GcTypedArray::Struct { num_elems, .. } => *num_elems,
-    }
+    unsafe { (*array).len }
 }

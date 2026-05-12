@@ -242,8 +242,16 @@ pub fn jitcode_for_instruction(instruction: &Instruction) -> Option<Arc<JitCode>
     jitcode_for_arm(arm_id_for_instruction(instruction)?)
 }
 
-/// Deserialized `pipeline.insns` — the build-observed `Assembler::
-/// write_insn` emit set.  `Assembler::get_opnum` mirrors RPython
+/// Deserialized `pipeline.insns` overlaid with `pyre_extension_insns()`
+/// — the build-observed `Assembler::write_insn` emit set plus the
+/// `_pyre/P` adapter keys that pyre's production blackhole builder
+/// registers via `setup_insns(...)` at runtime.  Both sources must
+/// contribute to this static map so that `decode_op_at`
+/// (`opcode_byte → opname` lookup) and the production dispatch path
+/// (`build_inline_call_only_bh_builder`) agree on which bytes are
+/// known.
+///
+/// `Assembler::get_opnum` mirrors RPython
 /// `assembler.py:221 setdefault(key, len(self.insns))`: keys present
 /// in `majit_translate::insns::{wellknown_bh_insns, pyre_extension_insns}`
 /// reuse their reserved `BC_*` byte for build/runtime stability, and
@@ -256,13 +264,27 @@ pub fn jitcode_for_instruction(instruction: &Instruction) -> Option<Arc<JitCode>
 /// consumption at `pyjitpl.py:2227-2243`.
 static INSNS_OPNAME_TO_BYTE: LazyLock<HashMap<String, u8>> = LazyLock::new(|| {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/opcode_insns.bin"));
-    bincode::deserialize(BYTES).unwrap_or_else(|e| {
+    let mut table: HashMap<String, u8> = bincode::deserialize(BYTES).unwrap_or_else(|e| {
         panic!(
             "pyre-jit-trace: failed to deserialize opcode_insns.bin \
              ({} bytes): {e}",
             BYTES.len(),
         )
-    })
+    });
+    // Overlay the helper-side `_pyre/P` adapter keys so the static
+    // decoder shares a key set with the production blackhole builder.
+    // pyre_extension_insns() is the same source the runtime builder
+    // hands to `setup_insns(...)`.
+    for (key, byte) in majit_translate::insns::pyre_extension_insns() {
+        if let Some(prev) = table.insert(key.to_string(), byte) {
+            assert_eq!(
+                prev, byte,
+                "pyre extension insns: opname {key:?} disagrees with build-time \
+                 pipeline.insns (build={prev}, extension={byte})",
+            );
+        }
+    }
+    table
 });
 
 /// Inverted view: `u8` opcode byte → opname string. Built lazily on

@@ -7763,13 +7763,24 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
         majit_translate::insns::BC_RVMPROF_CODE as i32,
     );
     wire_bhimpl_handlers(&mut builder);
-    // The setup_insns surface above covers every BC_* opcode pyre
-    // producers emit, including the helper-side `_pyre/P` adapters
-    // for `BC_CALL_ASSEMBLER_*`, `BC_COND_CALL_*`, and
-    // `BC_RECORD_KNOWN_RESULT_*` (P10).  `dispatch_step` panics on
-    // any emitted byte missing from the table or still wired to the
-    // placeholder, mirroring `blackhole.py:66-100 setup_insns`
-    // resolving every key via `_get_method`.
+    // Strict-coverage gate: enforce setup-time parity with RPython
+    // `blackhole.py:66 setup_insns` which raises `AttributeError` from
+    // `_get_method(name, argcodes)` whenever an opname has no matching
+    // `bhimpl_*`.  pyre's previous behaviour deferred the failure to
+    // the `dispatch_step` placeholder panic, which surfaces only when
+    // the unwired byte is actually executed; this gate matches the
+    // upstream contract by failing the moment the builder is
+    // assembled.
+    let unwired = builder.unwired_opnames();
+    if !unwired.is_empty() {
+        panic!(
+            "build_inline_call_only_bh_builder: {} insns opnames have no \
+             bhimpl_* handler (RPython `blackhole.py:66` raises \
+             AttributeError here): {:?}",
+            unwired.len(),
+            unwired,
+        );
+    }
     builder
 }
 
@@ -9075,16 +9086,20 @@ fn handler_setfield_vable_f(
 /// virtualizable scope.  Vable array opcodes therefore require
 /// `bh.virtualizable_info` to be non-null; an unset pointer means a
 /// builder constructed a vable-array bytecode outside a virtualizable
-/// context — a contract bug that should fail fast in debug builds.
+/// context — a contract bug that must fail loud in both debug and
+/// release builds, since the alternative is silent unsafe deref of a
+/// null pointer.
 fn vable_clear_token_and_get_vinfo(
     bh: &BlackholeInterpreter,
     vable: i64,
 ) -> &'static crate::virtualizable::VirtualizableInfo {
-    debug_assert!(
-        !bh.virtualizable_info.is_null(),
-        "vable array opcode requires `bh.virtualizable_info` to be set \
-         (RPython `blackhole.py:1374 fielddescr.get_vinfo()` parity)"
-    );
+    if bh.virtualizable_info.is_null() {
+        panic!(
+            "vable array opcode requires `bh.virtualizable_info` to be set \
+             (RPython `blackhole.py:1374 fielddescr.get_vinfo()` parity); \
+             a null pointer here is a contract bug, not a recoverable case"
+        );
+    }
     let vinfo = unsafe { &*bh.virtualizable_info };
     unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, vable as *mut u8) };
     vinfo

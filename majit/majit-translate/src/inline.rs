@@ -376,11 +376,13 @@ fn remap_op_kind(kind: &OpKind, remap: &impl Fn(&ValueId) -> ValueId) -> OpKind 
             index,
             item_ty,
             array_type_id,
+            nolength,
         } => OpKind::ArrayRead {
             base: remap(base),
             index: remap(index),
             item_ty: item_ty.clone(),
             array_type_id: array_type_id.clone(),
+            nolength: *nolength,
         },
         OpKind::ArrayWrite {
             base,
@@ -388,12 +390,14 @@ fn remap_op_kind(kind: &OpKind, remap: &impl Fn(&ValueId) -> ValueId) -> OpKind 
             value,
             item_ty,
             array_type_id,
+            nolength,
         } => OpKind::ArrayWrite {
             base: remap(base),
             index: remap(index),
             value: remap(value),
             item_ty: item_ty.clone(),
             array_type_id: array_type_id.clone(),
+            nolength: *nolength,
         },
         OpKind::InteriorFieldRead {
             base,
@@ -1254,6 +1258,7 @@ mod tests {
                 index: idx.unwrap(),
                 item_ty: ValueType::Ref,
                 array_type_id: None,
+                nolength: false,
             },
             true,
         );

@@ -157,27 +157,15 @@ impl majit_ir::descr::LoopTokenDescr for MetaCallAssemblerDescr {
 /// Default EffectInfo for call descriptors that lack per-call-site
 /// analysis.
 ///
-/// Upstream `effectinfo_from_writeanalyze` (effectinfo.py:285-298)
-/// returns `EF_RANDOM_EFFECTS` (≡ `EffectInfo.MOST_GENERAL`,
-/// effectinfo.py:271-273) for any callee whose write-analyzer reports
-/// `top_set`. Pyre lacks the analyzer for the residual helpers majit
-/// emits today, so the line-by-line match would be `MOST_GENERAL`.
-///
-/// Two practical caveats keep the default at `EF_CAN_RAISE` with all
-/// read/write bitsets full instead:
-///
-/// 1. `MOST_GENERAL` triggers `OptHeap.call_has_random_effects` which
-///    takes the `force_all_lazy_sets + clean_caches` branch. That path
-///    correctly flushes the lazy_set described in the comment for
-///    `make_call_descr` below — but it also invalidates non-lazy
-///    field/array caches and resets `seen_guard_not_invalidated`,
-///    which over-zeroes heap state across helper calls in tight loops
-///    (visible as 1.5x perf drops on `fib_loop` / `inline_helper`).
-/// 2. `MOST_GENERAL` makes `check_forces_virtual_or_virtualizable()`
-///    true and the walker tags the call `can_raise = true`, inserting
-///    a `GUARD_NO_EXCEPTION` after every helper call. That's a
-///    correctness no-op for helpers that never raise but still bloats
-///    the trace.
+/// PyPy invariant: `None` read/write bitstrings are only valid for
+/// `EF_RANDOM_EFFECTS` (`effectinfo.py:149-155`); any other
+/// `extraeffect` requires non-`None` bitstrings — they fall through to
+/// `bitstring.bitcheck` (`effectinfo.py:211-230`) which fails on
+/// `None`.  This default is consumed via the `..default_effect_info()`
+/// spread pattern at `jitcode/assembler.rs:1791,2247,2318,2360` and
+/// `pyjitpl/dispatch.rs:4516` to override only `extraeffect` (e.g.
+/// `ForcesVirtualOrVirtualizable`) while keeping the bitsets, so the
+/// default itself must keep the bitsets `Some(...)`.
 ///
 /// `EF_CAN_RAISE` analyzer-absent fallback (`effectinfo.py:22`).
 /// Upstream `call.py:300 elif self._canraise(op)` selects this
@@ -192,6 +180,15 @@ impl majit_ir::descr::LoopTokenDescr for MetaCallAssemblerDescr {
 /// inserting unnecessary `GUARD_NOT_FORCED` and over-zeroing heap
 /// caches via `force_from_effectinfo`'s `clear_caches` branch.
 ///
+/// `EF_CAN_RAISE` with all-ones field/array bitsets is a local
+/// analyzer-absent fallback, not PyPy's `top_set` representation:
+/// upstream `top_set` becomes `EF_RANDOM_EFFECTS`. This fallback keeps
+/// non-random override sites valid under the spread pattern above while
+/// still forcing `force_from_effectinfo` (heap.py:540-560) to flush
+/// every cached descr index covered by the local bitstring. The bitsets
+/// are 8 bytes wide; descr indices ≥ 64 still require the real analyzer
+/// port instead of relying on this saturated placeholder.
+///
 /// PRE-EXISTING-ADAPTATION: same `read/write_descrs_*` and
 /// `can_collect` saturation as [`cannot_raise_effect_info()`].
 /// `call.py:320-324 effectinfo_from_writeanalyze` builds those
@@ -202,7 +199,13 @@ impl majit_ir::descr::LoopTokenDescr for MetaCallAssemblerDescr {
 /// pending (Task #64); until that wire-up lands, conservative
 /// full-bitset is the line-by-line equivalent of "no analyzer
 /// available at this callsite", matching the pre-rebase behaviour
-/// `force_from_effectinfo` was already shaped against.
+/// `force_from_effectinfo` was already shaped against.  Switching to
+/// `MOST_GENERAL` (`extraeffect: RandomEffects` + `None` bitsets) is
+/// not safe under the spread pattern above because the override sites
+/// end up with non-`RandomEffects` extraeffect + `None` bitsets,
+/// violating the PyPy invariant and tripping `bitcheck`'s `expect()`
+/// on the `force_from_effectinfo` path (`heap.rs:2724`,
+/// `majit-ir/src/effectinfo.rs:418`).
 pub fn default_effect_info() -> EffectInfo {
     EffectInfo {
         extraeffect: ExtraEffect::CanRaise,

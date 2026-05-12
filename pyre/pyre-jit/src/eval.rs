@@ -116,17 +116,17 @@ enum JitAction {
 }
 
 use crate::jit::descr::{
-    BUILTIN_CODE_GC_TYPE_ID, FUNCTION_GC_TYPE_ID, JITFRAME_GC_TYPE_ID, OBJECT_GC_TYPE_ID,
-    PY_OBJECT_ARRAY_GC_TYPE_ID, PYFRAME_GC_TYPE_ID, RANGE_ITER_GC_TYPE_ID,
-    SPECIALISED_TUPLE_FF_GC_TYPE_ID, SPECIALISED_TUPLE_II_GC_TYPE_ID,
-    SPECIALISED_TUPLE_OO_GC_TYPE_ID, VREF_GC_TYPE_ID, W_BOOL_GC_TYPE_ID, W_BYTEARRAY_GC_TYPE_ID,
-    W_BYTES_GC_TYPE_ID, W_CELL_GC_TYPE_ID, W_CLASSMETHOD_GC_TYPE_ID, W_COUNT_GC_TYPE_ID,
-    W_DICT_GC_TYPE_ID, W_DICT_PROXY_GC_TYPE_ID, W_EXCEPTION_GC_TYPE_ID, W_FLOAT_GC_TYPE_ID,
-    W_GENERATOR_GC_TYPE_ID, W_INT_GC_TYPE_ID, W_LIST_GC_TYPE_ID, W_LONG_GC_TYPE_ID,
-    W_MEMBER_GC_TYPE_ID, W_METHOD_GC_TYPE_ID, W_MODULE_GC_TYPE_ID, W_PROPERTY_GC_TYPE_ID,
-    W_REPEAT_GC_TYPE_ID, W_SEQ_ITER_GC_TYPE_ID, W_SET_GC_TYPE_ID, W_SLICE_GC_TYPE_ID,
-    W_STATICMETHOD_GC_TYPE_ID, W_STR_GC_TYPE_ID, W_SUPER_GC_TYPE_ID, W_TUPLE_GC_TYPE_ID,
-    W_TYPE_GC_TYPE_ID, W_UNION_GC_TYPE_ID,
+    BUILTIN_CODE_GC_TYPE_ID, FUNCTION_GC_TYPE_ID, GC_FLOAT_ARRAY_GC_TYPE_ID,
+    GC_INT_ARRAY_GC_TYPE_ID, JITFRAME_GC_TYPE_ID, OBJECT_GC_TYPE_ID, PY_OBJECT_ARRAY_GC_TYPE_ID,
+    PYFRAME_GC_TYPE_ID, RANGE_ITER_GC_TYPE_ID, SPECIALISED_TUPLE_FF_GC_TYPE_ID,
+    SPECIALISED_TUPLE_II_GC_TYPE_ID, SPECIALISED_TUPLE_OO_GC_TYPE_ID, VREF_GC_TYPE_ID,
+    W_BOOL_GC_TYPE_ID, W_BYTEARRAY_GC_TYPE_ID, W_BYTES_GC_TYPE_ID, W_CELL_GC_TYPE_ID,
+    W_CLASSMETHOD_GC_TYPE_ID, W_COUNT_GC_TYPE_ID, W_DICT_GC_TYPE_ID, W_DICT_PROXY_GC_TYPE_ID,
+    W_EXCEPTION_GC_TYPE_ID, W_FLOAT_GC_TYPE_ID, W_GENERATOR_GC_TYPE_ID, W_INT_GC_TYPE_ID,
+    W_LIST_GC_TYPE_ID, W_LONG_GC_TYPE_ID, W_MEMBER_GC_TYPE_ID, W_METHOD_GC_TYPE_ID,
+    W_MODULE_GC_TYPE_ID, W_PROPERTY_GC_TYPE_ID, W_REPEAT_GC_TYPE_ID, W_SEQ_ITER_GC_TYPE_ID,
+    W_SET_GC_TYPE_ID, W_SLICE_GC_TYPE_ID, W_STATICMETHOD_GC_TYPE_ID, W_STR_GC_TYPE_ID,
+    W_SUPER_GC_TYPE_ID, W_TUPLE_GC_TYPE_ID, W_TYPE_GC_TYPE_ID, W_UNION_GC_TYPE_ID,
 };
 use majit_gc::collector::MiniMarkGC;
 use majit_metainterp::JitDriver;
@@ -1080,6 +1080,28 @@ thread_local! {
             &pyre_object::getsetproperty::GETSET_DESCRIPTOR_TYPE as *const _ as usize,
             w_getset_property_tid,
         );
+        // resume.py:1444-1447 allocate_array(length, arraydescr, clear)
+        // delegates to cpu.bh_new_array(), which in turn requires the
+        // live ArrayDescr to carry the GC type id set by
+        // GcLLDescr_framework.init_array_descr (gc.py:544-549).  These
+        // two primitive GcArray lltypes have the same trace shape but are
+        // distinct ARRAY identities, so register separate tids.
+        let gc_int_array_tid = gc.register_type(TypeInfo::varsize(
+            pyre_object::GC_TYPED_ARRAY_ITEMS_OFFSET,
+            std::mem::size_of::<i64>(),
+            pyre_object::GC_TYPED_ARRAY_LEN_OFFSET,
+            false,
+            Vec::new(),
+        ));
+        debug_assert_eq!(gc_int_array_tid, GC_INT_ARRAY_GC_TYPE_ID);
+        let gc_float_array_tid = gc.register_type(TypeInfo::varsize(
+            pyre_object::GC_TYPED_ARRAY_ITEMS_OFFSET,
+            std::mem::size_of::<f64>(),
+            pyre_object::GC_TYPED_ARRAY_LEN_OFFSET,
+            false,
+            Vec::new(),
+        ));
+        debug_assert_eq!(gc_float_array_tid, GC_FLOAT_ARRAY_GC_TYPE_ID);
         // W_InstanceObject is intentionally NOT pre-registered: its
         // PyType (`INSTANCE_TYPE`) is the `object` root, already
         // covered by `object_tid` (`OBJECT_GC_TYPE_ID = 0`). Adding
@@ -3631,6 +3653,70 @@ fn allocate_struct(typedescr: &dyn majit_ir::SizeDescr) -> usize {
     driver.meta_interp().backend().bh_new(&descr) as usize
 }
 
+fn bh_array_descr_from_descr(arraydescr: &majit_ir::DescrRef) -> majit_translate::jitcode::BhDescr {
+    let ad = arraydescr
+        .as_array_descr()
+        .expect("resume array path requires an ArrayDescr");
+    majit_translate::jitcode::BhDescr::from_array_descr(ad)
+}
+
+fn bh_new_array_from_descr(length: usize, arraydescr: &majit_ir::DescrRef, clear: bool) -> i64 {
+    let bh_descr = bh_array_descr_from_descr(arraydescr);
+    let (driver, _) = driver_pair();
+    let backend = driver.meta_interp().backend();
+    if clear {
+        backend.bh_new_array_clear(length as i64, &bh_descr)
+    } else {
+        backend.bh_new_array(length as i64, &bh_descr)
+    }
+}
+
+fn bh_setarrayitem_int_from_descr(
+    array: i64,
+    index: usize,
+    value: i64,
+    arraydescr: &majit_ir::DescrRef,
+) {
+    let bh_descr = bh_array_descr_from_descr(arraydescr);
+    let (driver, _) = driver_pair();
+    driver
+        .meta_interp()
+        .backend()
+        .bh_setarrayitem_gc_i(array, index as i64, value, &bh_descr);
+}
+
+fn bh_setarrayitem_ref_from_descr(
+    array: i64,
+    index: usize,
+    value: i64,
+    arraydescr: &majit_ir::DescrRef,
+) {
+    let bh_descr = bh_array_descr_from_descr(arraydescr);
+    let (driver, _) = driver_pair();
+    driver.meta_interp().backend().bh_setarrayitem_gc_r(
+        array,
+        index as i64,
+        majit_ir::GcRef(value as usize),
+        &bh_descr,
+    );
+}
+
+fn bh_setarrayitem_float_from_descr(
+    array: i64,
+    index: usize,
+    value_bits: i64,
+    arraydescr: &majit_ir::DescrRef,
+) {
+    let bh_descr = bh_array_descr_from_descr(arraydescr);
+    let (driver, _) = driver_pair();
+    driver.meta_interp().backend().bh_setarrayitem_gc_f(
+        array,
+        index as i64,
+        f64::from_bits(value_bits as u64),
+        &bh_descr,
+    );
+}
+
 /// resume.py:1437-1439 allocate_with_vtable(descr) → exec_new_with_vtable(cpu, descr).
 /// llmodel.py:778-782: bh_new_with_vtable uses sizedescr.get_vtable().
 fn allocate_with_vtable(descr: &dyn majit_ir::SizeDescr) -> usize {
@@ -3780,22 +3866,27 @@ fn materialize_virtual_from_rd(
     // resume.py:643-760: dispatch by virtual kind.
     match entry.as_ref() {
         majit_ir::RdVirtualInfo::VArrayInfoClear {
-            kind, fieldnums, ..
+            arraydescr,
+            fieldnums,
+            ..
         }
         | majit_ir::RdVirtualInfo::VArrayInfoNotClear {
-            kind, fieldnums, ..
+            arraydescr,
+            fieldnums,
+            ..
         } => {
             let clear = matches!(
                 entry.as_ref(),
                 majit_ir::RdVirtualInfo::VArrayInfoClear { .. }
             );
             // resume.py:650-670: allocate_array(len, arraydescr, clear)
-            let arr_kind = match kind {
-                2 => pyre_object::ArrayKind::Float,
-                1 => pyre_object::ArrayKind::Int,
-                _ => pyre_object::ArrayKind::Ref,
-            };
-            let array = pyre_object::allocate_array(fieldnums.len(), arr_kind, clear);
+            let arraydescr = arraydescr
+                .as_ref()
+                .expect("VArrayInfo.allocate requires self.arraydescr");
+            let ad = arraydescr
+                .as_array_descr()
+                .expect("VArrayInfo.arraydescr must be an ArrayDescr");
+            let array = bh_new_array_from_descr(fieldnums.len(), arraydescr, clear);
             // resume.py:654: cache BEFORE filling — recursive/shared virtuals
             // may reference this vidx during element decoding.
             let result = Value::Ref(majit_ir::GcRef(array as usize));
@@ -3805,21 +3896,43 @@ fn materialize_virtual_from_rd(
                 if fnum == majit_ir::resumedata::UNINITIALIZED_TAG {
                     continue; // resume.py:659: skip UNINITIALIZED
                 }
-                let v = decode_tagged_fieldnum(
-                    fnum,
-                    dead_frame,
-                    num_failargs,
-                    rd_consts,
-                    rd_virtuals,
-                    virtuals_cache,
-                );
-                if let Some(val) = v {
-                    // resume.py:656-670: dispatch by element kind.
-                    match val {
-                        Value::Float(f) => pyre_object::setarrayitem_float(array, i, f),
-                        Value::Int(n) => pyre_object::setarrayitem_int(array, i, n),
-                        _ => pyre_object::setarrayitem_ref(array, i, box_opt_value(&Some(val))),
-                    }
+                // resume.py:656-670: dispatch by arraydescr kind and pass
+                // the same arraydescr through to setarrayitem_*.
+                if ad.is_array_of_pointers() {
+                    let value = match decode_tagged_fieldnum(
+                        fnum,
+                        dead_frame,
+                        num_failargs,
+                        rd_consts,
+                        rd_virtuals,
+                        virtuals_cache,
+                    ) {
+                        Some(Value::Ref(gc)) => gc.0 as i64,
+                        Some(other) => box_opt_value(&Some(other)) as i64,
+                        None => 0,
+                    };
+                    bh_setarrayitem_ref_from_descr(array, i, value, arraydescr);
+                } else if ad.is_array_of_floats() {
+                    let value = decode_tagged_fieldnum_float(
+                        fnum,
+                        dead_frame,
+                        num_failargs,
+                        rd_consts,
+                        rd_virtuals,
+                        virtuals_cache,
+                    )
+                    .to_bits() as i64;
+                    bh_setarrayitem_float_from_descr(array, i, value, arraydescr);
+                } else {
+                    let value = decode_tagged_fieldnum_int(
+                        fnum,
+                        dead_frame,
+                        num_failargs,
+                        rd_consts,
+                        rd_virtuals,
+                        virtuals_cache,
+                    );
+                    bh_setarrayitem_int_from_descr(array, i, value, arraydescr);
                 }
             }
             return result;
@@ -5547,6 +5660,13 @@ fn extract_interior_field_info(descr: &majit_ir::DescrRef) -> (usize, usize, u8)
 pub(crate) struct PyreBlackholeAllocator;
 
 impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
+    fn allocate_array(&self, length: usize, arraydescr: &majit_ir::DescrRef, clear: bool) -> i64 {
+        // resume.py:1444-1447 allocate_array(length, arraydescr, clear)
+        // delegates to the CPU; do not replace ArrayDescr with a
+        // kind/item-size side channel here.
+        bh_new_array_from_descr(length, arraydescr, clear)
+    }
+
     fn allocate_struct(&self, typedescr: &majit_ir::DescrRef) -> i64 {
         // resume.py:1441-1442 allocate_struct → cpu.bh_new(typedescr)
         // llmodel.py:775-776 bh_new(sizedescr): plain malloc, no vtable.
@@ -5639,17 +5759,16 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
         }
     }
 
-    fn setarrayitem_typed(&self, array: i64, index: usize, value: i64, _descr: u32) {
-        // resume.py:1009-1015 setarrayitem dispatch by type
-        if array != 0 {
-            // pyre list items are PyObjectRef (pointer-sized)
-            let item_size = std::mem::size_of::<usize>();
-            unsafe {
-                let base = array as *mut u8;
-                let ptr = base.add(index * item_size) as *mut i64;
-                ptr.write(value);
-            }
-        }
+    fn setarrayitem_int(&self, array: i64, index: usize, value: i64, descr: &majit_ir::DescrRef) {
+        bh_setarrayitem_int_from_descr(array, index, value, descr);
+    }
+
+    fn setarrayitem_ref(&self, array: i64, index: usize, value: i64, descr: &majit_ir::DescrRef) {
+        bh_setarrayitem_ref_from_descr(array, index, value, descr);
+    }
+
+    fn setarrayitem_float(&self, array: i64, index: usize, value: i64, descr: &majit_ir::DescrRef) {
+        bh_setarrayitem_float_from_descr(array, index, value, descr);
     }
 
     // resume.py:1520-1529: setinteriorfield dispatch by descr

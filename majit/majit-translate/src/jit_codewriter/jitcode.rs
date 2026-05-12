@@ -1053,12 +1053,42 @@ pub enum BhDescr {
     Array {
         base_size: usize,
         itemsize: usize,
+        /// descr.py:277/286 ArrayDescr.lendescr.offset. `None` for
+        /// nolength/raw array descriptors; `bh_arraylen_gc` requires
+        /// `Some` just like llmodel.py asserts an ArrayDescr with lendescr.
+        len_offset: Option<usize>,
         type_id: u32,
         item_type: majit_ir::value::Type,
         is_array_of_pointers: bool,
         is_array_of_structs: bool,
         /// descr.py ArrayDescr.is_item_signed() — FLAG_SIGNED vs FLAG_UNSIGNED.
         is_item_signed: bool,
+        /// `effectinfo.py:465 compute_bitstrings` ei_index carried from
+        /// the producer-side `SimpleArrayDescr.get_ei_index()`. Passed
+        /// to `make_descr_from_bh` so the runtime `PyreArrayDescr` it
+        /// reconstructs publishes the same ei_index — without this
+        /// field the bridge breaks across the BhDescr boundary.
+        /// `u32::MAX` is the unset sentinel.
+        ei_index: u32,
+        /// Codewriter-side ARRAY identity proxy
+        /// (`call.rs::DescrIndexRegistry::array_index` key) — the Rust
+        /// type string for the ARRAY lltype this descr was built for
+        /// (`"Vec<Foo>"`, `"GcArray<i64>"`, `"[Point; 4]"`, …).
+        ///
+        /// Threaded into the runtime `ArrayDescrKey`
+        /// (`pyre-jit-trace/src/descr.rs`) and `DispatchArrayDescrKey`
+        /// (`pyjitpl::DispatchArrayDescrKey`) so two BhDescr::Array
+        /// entries that disagree on `array_type_id` never collapse to
+        /// the same registry slot — mirroring upstream
+        /// `gccache._cache_array[ARRAY_OR_STRUCT]` (`descr.py:348-360`)
+        /// keying on lltype object identity.
+        ///
+        /// `None` for descrs minted without an `array_type_id`
+        /// context (legacy pyre-jit-trace internal factories); two
+        /// `None` entries collide on the remaining structural tuple
+        /// just as upstream collides two arrays that happen to share
+        /// the same lltype.
+        array_type_id: Option<String>,
         /// descr.py:372-375 `arraydescr.all_interiorfielddescrs` for
         /// arrays whose item type is an inline struct.
         interior_fields: Vec<BhInteriorFieldSpec>,
@@ -1175,6 +1205,7 @@ impl BhDescr {
     pub fn get_type_id(&self) -> u32 {
         match self {
             BhDescr::Size { type_id, .. } => *type_id,
+            BhDescr::Array { type_id, .. } => *type_id,
             _ => 0,
         }
     }
@@ -1183,6 +1214,45 @@ impl BhDescr {
         match self {
             BhDescr::Array { itemsize, .. } => *itemsize,
             _ => panic!("BhDescr::as_itemsize called on {:?}", self),
+        }
+    }
+
+    /// `llmodel.py:625-628 unpack_arraydescr_size`: return
+    /// `(base_size, itemsize, is_item_signed)`.  Backend
+    /// `bh_getarrayitem_gc_i` / `bh_setarrayitem_gc_i` thread the tuple
+    /// to `read_int_at_mem` / `write_int_at_mem` so the per-array
+    /// itemsize and signedness reach the load/store, matching
+    /// `llmodel.py:592-594, 612-614`.  Panics on non-`Array` variants.
+    pub fn unpack_arraydescr_size(&self) -> (usize, usize, bool) {
+        match self {
+            BhDescr::Array {
+                base_size,
+                itemsize,
+                is_item_signed,
+                ..
+            } => (*base_size, *itemsize, *is_item_signed),
+            _ => panic!("BhDescr::unpack_arraydescr_size called on {:?}", self),
+        }
+    }
+
+    /// `llmodel.py:618 unpack_arraydescr`: return `base_size`.  Used by
+    /// the ref- and float-typed `bh_getarrayitem_gc_*` /
+    /// `bh_setarrayitem_gc_*` paths (`llmodel.py:597-600, 603-606`)
+    /// where the item width is fixed (`WORD` for ref,
+    /// `sizeof(FLOATSTORAGE)` for float).
+    pub fn array_base_size(&self) -> usize {
+        match self {
+            BhDescr::Array { base_size, .. } => *base_size,
+            _ => panic!("BhDescr::array_base_size called on {:?}", self),
+        }
+    }
+
+    /// `llmodel.py:585-588 bh_arraylen_gc`: the length is read from
+    /// `arraydescr.lendescr.offset`, not assumed to be at offset 0.
+    pub fn array_len_offset(&self) -> Option<usize> {
+        match self {
+            BhDescr::Array { len_offset, .. } => *len_offset,
+            _ => panic!("BhDescr::array_len_offset called on {:?}", self),
         }
     }
 
@@ -1210,6 +1280,10 @@ impl BhDescr {
         BhDescr::Array {
             base_size: info.base_size,
             itemsize: info.item_size,
+            // descr.py:277 ArrayDescr.lendescr.offset — preserved by the
+            // summary; `None` is the `nolength=True` shape (raw buffers),
+            // not a `base_size`-derived heuristic.
+            len_offset: info.len_offset,
             type_id: 0,
             item_type: match info.item_type {
                 0 => majit_ir::value::Type::Ref,
@@ -1219,6 +1293,40 @@ impl BhDescr {
             is_array_of_pointers: info.item_type == 0,
             is_array_of_structs: false,
             is_item_signed: info.is_signed,
+            // ArrayDescrInfo currently lacks the codewriter ei_index
+            // (`effectinfo.py:307-311`); resume/materialize paths do
+            // not consult heap.rs EffectInfo bitstrings, so the sentinel
+            // is correct here.
+            ei_index: u32::MAX,
+            // Summary boundary (resume/materialize) carries no
+            // source-level ARRAY type spelling.
+            array_type_id: None,
+            interior_fields: Vec::new(),
+        }
+    }
+
+    /// Build the runtime BhDescr shape from a live ArrayDescr, preserving
+    /// the same structural fields RPython stores on ArrayDescr.  This is
+    /// used by resume/blackhole paths that receive a live `DescrRef` and
+    /// must not replace it with a kind-only side channel.
+    pub fn from_array_descr(array_descr: &dyn majit_ir::descr::ArrayDescr) -> Self {
+        // Round-trip ei_index from the live descr so a downstream
+        // make_descr_from_bh republishes it (`effectinfo.py:465`).
+        let ei_index = (array_descr as &dyn majit_ir::descr::Descr).get_ei_index();
+        BhDescr::Array {
+            base_size: array_descr.base_size(),
+            itemsize: array_descr.item_size(),
+            len_offset: array_descr.len_descr().map(|fd| fd.offset()),
+            type_id: array_descr.type_id(),
+            item_type: array_descr.item_type(),
+            is_array_of_pointers: array_descr.is_array_of_pointers(),
+            is_array_of_structs: array_descr.is_array_of_structs(),
+            is_item_signed: array_descr.is_item_signed(),
+            ei_index,
+            // The live `ArrayDescr` trait does not surface the
+            // codewriter's source-level type spelling; resume/blackhole
+            // paths reconstruct identity from structural fields only.
+            array_type_id: None,
             interior_fields: Vec::new(),
         }
     }
