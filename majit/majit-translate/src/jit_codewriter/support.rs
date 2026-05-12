@@ -12,7 +12,15 @@
 //! [`INLINE_CALLS_TO`] mirrors `support.py:444-449 inline_calls_to`
 //! verbatim — the four entries upstream's `find_all_graphs` BFS seeds
 //! so the inliner can always reach `int_abs` / `int_floordiv` /
-//! `int_mod` / `ll_math.ll_math_sqrt`.
+//! `int_mod` / `ll_math.ll_math_sqrt`.  Pyre does NOT synthesise a
+//! body graph for these helpers (pyre has no
+//! `MixLevelHelperAnnotator.constfunc` to fabricate a graph from a
+//! `pub extern "C"` function pointer); the BFS seed loop at
+//! `call.rs::find_all_graphs_bfs` therefore registers the helper
+//! fnaddrs but does not push them onto `todo`, mirroring upstream
+//! `@dont_look_inside` for the same helper.  See the
+//! PRE-EXISTING-ADAPTATION block at that callsite for the convergence
+//! path.
 //!
 //! [`builtin_func_for_spec`] is a line-by-line port of
 //! `support.py:767-808`. The RPython algorithm — cache lookup, list-or-dict
@@ -214,20 +222,28 @@ pub fn decode_builtin_call(
 /// `Index(n)` with `opargs[n]` (passthrough), while non-Index entries
 /// become constant injections.  Pyre's pure-function port emits this
 /// enum from [`parse_oopspec`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum NormalizeSlot {
     /// `support.py:713 argname2index[argname] = Index(n)` — positional
     /// passthrough.  `n` is the 0-based slot in the callee's
     /// argname list.
     Index(usize),
     /// `support.py:714 argtuple = eval(args, argname2index)` — integer
-    /// literal injection.  Upstream's `eval` accepts any Python literal
-    /// (strings, floats, nested tuples) but observed usage in
-    /// `rint.py` / `rstr.py` confines slots to identifiers + integer
-    /// literals; pyre's narrow port supports only the int case.
-    /// Extending the parser for additional literal types is a follow-up
-    /// (PRE-EXISTING-ADAPTATION).
+    /// literal injection.  Upstream wraps as `Constant(obj,
+    /// lltype.Signed)`.  Pyre uses this slot only for genuine
+    /// `lltype.Signed`-tagged constants: integer literals parsed by
+    /// [`parse_literal_slot`] hit this variant exclusively.  Char
+    /// literals (`'a'`) panic in the parser per the comment on
+    /// [`parse_literal_slot`] — RPython's `lltype.Char` has no
+    /// pyre IR analogue and conflating it with `lltype.Signed`
+    /// would be a NEW-DEVIATION.
     ConstInt(i64),
+    /// `support.py:714 argtuple = eval(args, argname2index)` — float
+    /// literal injection (e.g. `1.5`, `2.0e3`).  Upstream wraps as
+    /// `Constant(obj, lltype.Float)`.  Stored as the f64 bit pattern
+    /// to keep `PartialEq` / `Hash` derivable (`history.py:265
+    /// ConstFloat.getfloatstorage`).
+    ConstFloat(u64),
 }
 
 /// `support.py:717-724 normalize_opargs` return-shape.
@@ -239,14 +255,19 @@ pub enum NormalizeSlot {
 /// downstream) can decide how to materialise constants — pyre's
 /// constants are `OpKind::ConstInt` SSA ops whose creation needs
 /// graph-builder access at the callsite.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum NormalizedArg {
     /// `support.py:721 result.append(opargs[obj.n])` — pass an
     /// existing `ValueId` through verbatim.
     Pass(ValueId),
-    /// `support.py:723 result.append(Constant(obj, lltype.typeOf(obj)))`
-    /// — caller materialises a `ConstInt` op carrying this value.
+    /// `support.py:723 result.append(Constant(obj, lltype.Signed))`
+    /// — caller materialises an `OpKind::ConstInt(v)` op carrying
+    /// this value.
     ConstInt(i64),
+    /// `support.py:723 result.append(Constant(obj, lltype.Float))`
+    /// — caller materialises an `OpKind::ConstFloat(bits)` op
+    /// carrying this value (`bits` is the f64 bit pattern).
+    ConstFloat(u64),
 }
 
 /// `support.py:701-715 parse_oopspec(fnobj)` — pure-function port.
@@ -274,17 +295,33 @@ pub enum NormalizedArg {
 /// names, registered via `mark_oopspec_argnames`) and returns
 /// `(operation_name, argtuple)` matching the upstream 2-tuple.
 ///
-/// Divergences vs upstream `eval(args, argname2index)`:
-///   - String / float / nested-expression literals are not parsed.
-///     Upstream's `eval` accepts them in principle but the observed
-///     usage in `rint.py` / `rstr.py` is identifier + integer-literal
-///     only.  An unknown slot panics with a citation pointing back to
-///     the upstream `eval` and the convergence path.
-///   - The spec-has-no-`(` case (a structural divergence from
-///     upstream's `.split('(', 1)` which would raise ValueError)
-///     returns an empty `argtuple` with the bare spec as
-///     `operation_name`.  This handles pyre's `lib.rs:707-741`
-///     bare-name registrations gracefully.
+/// **NEW-DEVIATION** vs upstream `eval(args, argname2index)`:
+/// the inner expression is parsed by a narrow comma-split + per-slot
+/// literal recogniser ([`parse_literal_slot`]), NOT by a full Python
+/// `eval`.  The slots pyre recognises are exactly:
+///   - identifier (resolves to `Index(n)`),
+///   - integer literal,
+///   - float literal containing `.`, `e`, or `E` (`1.5`, `2.0e3`).
+///
+/// Every other slot form upstream's `eval` would accept panics here:
+/// char literals (`'a'`, `'\n'`, `'\x41'`), string literals
+/// (`'foo'`), nested-tuple expressions, arithmetic / boolean sub-
+/// expressions, and any other Python expression.  All current
+/// upstream `@oopspec(...)` decorations under `rpython/` use only
+/// identifier / integer / float literals (`grep -rn "@oopspec" rpython/`
+/// found zero `'<char>'` slot patterns); broaden the recogniser only
+/// when a real upstream decoration introduces a new slot kind, and
+/// at that point port the matching `NormalizeSlot::ConstChar(u8)` /
+/// `ConstStr(String)` variant + matching `OpKind::ConstChar` /
+/// `OpKind::ConstStr` materialisation so the constant carries the
+/// upstream `lltype.Char` / `lltype.Ptr(STR)` tag — speculative
+/// `ConstInt(byte)` fallback is NOT acceptable strict-parity
+/// because `lltype.Char` ≠ `lltype.Signed`.
+///
+/// The spec-has-no-`(` case (a structural divergence from upstream's
+/// `.split('(', 1)` which would raise ValueError) returns an empty
+/// `argtuple` with the bare spec as `operation_name`.  This handles
+/// pyre's `lib.rs:707-741` bare-name registrations gracefully.
 pub fn parse_oopspec(spec: &str, argnames: &[&str]) -> (String, Vec<NormalizeSlot>) {
     // `support.py:707 operation_name, args = ll_func.oopspec.split('(', 1)`
     let (operation_name, args_part) = match spec.split_once('(') {
@@ -314,33 +351,69 @@ pub fn parse_oopspec(spec: &str, argnames: &[&str]) -> (String, Vec<NormalizeSlo
         .collect();
     // `support.py:714 argtuple = eval(args, argname2index)`
     //
-    // Pyre's narrow expression parser: comma-split, identifier or
-    // integer literal per slot.  Empty slots (e.g. `"foo(x,)"` after
-    // the trailing-comma append from upstream :709) are ignored — they
-    // mirror the Python tuple syntax that lets `(x,)` produce a
-    // 1-tuple.
+    // Pyre's narrow expression parser: comma-split, then per-slot
+    // resolve as identifier (→ `Index(n)`) or Python literal.  Empty
+    // slots (e.g. `"foo(x,)"` after the trailing-comma append from
+    // upstream :709) are ignored — they mirror the Python tuple
+    // syntax that lets `(x,)` produce a 1-tuple.
     let argtuple: Vec<NormalizeSlot> = trimmed
         .split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(|s| match argname2index.get(s) {
-            Some(n) => NormalizeSlot::Index(*n),
-            None => match s.parse::<i64>() {
-                Ok(n) => NormalizeSlot::ConstInt(n),
-                Err(_) => panic!(
-                    "parse_oopspec: slot {s:?} in spec {spec:?} is neither a known \
-                     argname (one of {argnames:?}) nor an integer literal.  \
-                     Upstream `support.py:714 eval(args, argname2index)` would \
-                     also accept string / float / nested tuple expressions; \
-                     pyre's narrow port handles only the two observed-upstream \
-                     cases (Index + int).  Convergence path: extend this parser \
-                     for the additional literal types, then add matching \
-                     `NormalizeSlot` variants and `NormalizedArg` materialisation."
-                ),
-            },
-        })
+        .map(|s| parse_literal_slot(s, &argname2index, spec, argnames))
         .collect();
     (operation_name, argtuple)
+}
+
+/// Per-slot resolver for `parse_oopspec` — mirrors the
+/// `argname2index`-backed `eval` resolution one cell at a time.
+///
+/// Resolution order matches Python literal precedence:
+///   - bound identifier (`argname2index[s]`) → `Index(n)`
+///   - integer literal → `ConstInt(i64)`
+///   - float literal (contains `.`, `e`, or `E`) → `ConstFloat(bits)`
+///   - anything else → panic.  Notably **char literals** (`'a'`,
+///     `'\n'`, `'\x41'`) panic here even though upstream `eval`
+///     accepts them: RPython tags such constants `lltype.Char`,
+///     which has no `ConcreteType` variant in pyre — the
+///     `Constant('a', lltype.Char)` ≠ `Constant(97, lltype.Signed)`
+///     identity is load-bearing for descr-typed dispatch, and a
+///     `ConstInt(byte)` fallback would be a speculative NEW-DEVIATION
+///     with no upstream basis in the current `rpython/` source.
+fn parse_literal_slot(
+    s: &str,
+    argname2index: &std::collections::HashMap<&str, usize>,
+    spec: &str,
+    argnames: &[&str],
+) -> NormalizeSlot {
+    if let Some(n) = argname2index.get(s) {
+        return NormalizeSlot::Index(*n);
+    }
+    // Integer literal — must be tried before float because `"42"`
+    // parses successfully both as `i64` and `f64`, and `Constant(42,
+    // lltype.typeOf(42))` upstream yields `lltype.Signed` not Float.
+    if let Ok(n) = s.parse::<i64>() {
+        return NormalizeSlot::ConstInt(n);
+    }
+    // Float literal — `1.5`, `2.0e3`, `.5`, `inf`, etc.
+    if s.contains('.') || s.contains('e') || s.contains('E') {
+        if let Ok(f) = s.parse::<f64>() {
+            return NormalizeSlot::ConstFloat(f.to_bits());
+        }
+    }
+    panic!(
+        "parse_oopspec: slot {s:?} in spec {spec:?} is neither a known argname \
+         (one of {argnames:?}) nor a supported literal (int / float).  \
+         Upstream `support.py:714 eval(args, argname2index)` would additionally \
+         accept char literals (`lltype.Char`), string literals (`lltype.Ptr(STR)`), \
+         and nested-tuple literals.  Pyre has no `ConcreteType` variant for any \
+         of those, so a faithful port requires landing the matching variant \
+         (`NormalizeSlot::ConstChar` / `ConstStr` / ...) + materialisation site \
+         at `jtransform.rs::handle_builtin_call` BEFORE the upstream `@oopspec(...)` \
+         decoration that needs it can be honoured.  Speculative `ConstInt(byte)` \
+         fallbacks for char literals are NOT strict parity — `lltype.Char` ≠ \
+         `lltype.Signed`."
+    );
 }
 
 /// `support.py:717-724 normalize_opargs(argtuple, opargs)` — pure-function port.
@@ -367,8 +440,10 @@ pub fn normalize_opargs(argtuple: &[NormalizeSlot], opargs: &[ValueId]) -> Vec<N
             // `support.py:720-721 if isinstance(obj, Index):
             //                        result.append(opargs[obj.n])`
             NormalizeSlot::Index(n) => NormalizedArg::Pass(opargs[*n]),
-            // `support.py:722-723 else: result.append(Constant(obj, ...))`
+            // `support.py:722-723 else: result.append(Constant(obj, lltype.typeOf(obj)))`
+            // — one branch per lltype Constant flavour.
             NormalizeSlot::ConstInt(v) => NormalizedArg::ConstInt(*v),
+            NormalizeSlot::ConstFloat(bits) => NormalizedArg::ConstFloat(*bits),
         })
         .collect()
 }
@@ -1290,6 +1365,65 @@ mod tests {
                 NormalizedArg::ConstInt(2),
                 NormalizedArg::Pass(ValueId(33)),
                 NormalizedArg::Pass(ValueId(11)),
+            ]
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "is neither a known argname")]
+    fn parse_oopspec_rejects_char_literal_per_strict_parity() {
+        // RPython upstream's `eval(args, argname2index)` would produce
+        // `Constant('a', lltype.Char)` — a `lltype.Char`-tagged
+        // constant.  Pyre has no `ConcreteType::Char` variant, and
+        // `lltype.Char` ≠ `lltype.Signed`, so a `ConstInt(byte)`
+        // fallback would be a speculative NEW-DEVIATION.
+        // `parse_literal_slot` must panic on char literals until
+        // `NormalizeSlot::ConstChar(u8)` + `OpKind::ConstChar` land.
+        // Confirmed by `grep -rn '@oopspec' rpython/` returning zero
+        // char-literal slot patterns in current upstream — no
+        // production decoration is blocked by this panic.
+        let _ = super::parse_oopspec("foo('a', x)", &["x"]);
+    }
+
+    #[test]
+    fn parse_oopspec_recognises_float_literal() {
+        // `Constant(1.5, lltype.Float)` upstream → pyre's
+        // `NormalizeSlot::ConstFloat(bits)` carrying the f64 bit pattern.
+        let (name, argtuple) = super::parse_oopspec("foo(1.5, x)", &["x"]);
+        assert_eq!(name, "foo");
+        assert_eq!(
+            argtuple,
+            vec![
+                super::NormalizeSlot::ConstFloat(1.5f64.to_bits()),
+                super::NormalizeSlot::Index(0),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_oopspec_recognises_float_scientific_literal() {
+        // `2.0e3` is a Python float literal upstream `eval` accepts.
+        let (name, argtuple) = super::parse_oopspec("foo(2.0e3)", &[]);
+        assert_eq!(name, "foo");
+        assert_eq!(
+            argtuple,
+            vec![super::NormalizeSlot::ConstFloat(2000.0f64.to_bits())]
+        );
+    }
+
+    #[test]
+    fn normalize_opargs_emits_const_float_for_float_slot() {
+        let argtuple = vec![
+            super::NormalizeSlot::ConstFloat(3.14f64.to_bits()),
+            super::NormalizeSlot::Index(0),
+        ];
+        let opargs = vec![ValueId(7)];
+        let normalized = super::normalize_opargs(&argtuple, &opargs);
+        assert_eq!(
+            normalized,
+            vec![
+                super::NormalizedArg::ConstFloat(3.14f64.to_bits()),
+                super::NormalizedArg::Pass(ValueId(7)),
             ]
         );
     }

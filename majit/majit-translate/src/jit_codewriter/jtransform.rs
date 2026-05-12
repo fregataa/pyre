@@ -1068,68 +1068,59 @@ impl<'a> Transformer<'a> {
                 lhs,
                 rhs,
                 result_ty,
-            } if matches!(binop_name.as_str(), "mod" | "floordiv")
+            } if matches!(binop_name.as_str(), "mod" | "floordiv" | "div")
                 && self.get_value_kind(*lhs) == 'i'
                 && self.get_value_kind(*rhs) == 'i'
-                && *result_ty == ValueType::Int =>
+                && self.binop_result_is_int(op.result, result_ty) =>
             {
-                // RPython parity: `rewrite_op_int_mod` /
-                // `rewrite_op_int_floordiv` are name-keyed (`int_mod` /
-                // `int_floordiv`) — they only fire on the int-result
-                // op.  Pyre's `BinOp { op: "mod" | "floordiv" }` shape
-                // has no such name-baked typing, so the gate checks
-                // `result_ty == Int` explicitly to avoid pollution from
-                // a Ref/Float/State-typed BinOp slipping through and
-                // emitting an `int_mod/ii>i` opname onto a non-int SSA
-                // result.  `ValueType::Unknown` is NOT admitted: pyre's
-                // AST-time forward-reference gap that produces
-                // `Unknown` here is a separate upstream parity issue
-                // (`front/ast.rs::binary_result_value_type`'s
-                // `graph_value_type` fallback) and admitting it would
-                // widen this rewrite to SSA shapes whose semantics are
-                // not proven yet.  Cases that fall through with
-                // `Unknown` remain a pre-existing pyre gap surfacing
-                // as the `int_mod/ii>i` insns leak documented in
-                // `jitcode_runtime.rs::default_bh_builder_unwired_set_matches_task_85_snapshot`.
+                // **Rust low-level → RPython low-level.**  Pyre's
+                // `BinOp { op: "mod" | "floordiv" | "div" }` over i64
+                // operands comes from Rust's `%` / `/` operators,
+                // which are C-truncating primitives.  At the IR level
+                // these match RPython's low-level
+                // `llop.int_mod` / `llop.int_floordiv` — the C-trunc
+                // ops that the rtyper emits and that
+                // `support.py:255-271 _ll_2_int_floordiv` /
+                // `_ll_2_int_mod` are the no-branch helpers for
+                // (`_ll_2_*` are used "only if the RPython program
+                // uses `llop.int_floordiv()` explicitly", per the
+                // upstream comment).
+                //
+                // **NOT** Python `%` / `//` / `/` parity.  High-level
+                // Python ops are handled at the rtyper layer:
+                // `rint.py:246-262 rtype_mod` / `rtype_floordiv` (and
+                // their `rtype_inplace_*` siblings, plus
+                // `rtype_div = rtype_floordiv` for integer `/`) call
+                // `_rtype_call_helper(hop, 'py_mod'/'py_div', [...])`
+                // which invokes the *Python-floor* helpers
+                // `ll_int_py_mod` / `ll_int_py_div`
+                // (`rint.py:399-500`).  Pyre is NOT porting that
+                // path — it is mapping Rust's C-trunc primitives to
+                // the RPython C-trunc primitives.
+                //
+                // Pyre carries the same `int_div`-as-`int_floordiv`
+                // collapse at this layer: the rtyper-equivalent never
+                // produces an `int_div` op for integer operands
+                // (there is no such llop), so pyre routes
+                // `BinOp { op:"div" }` through the same
+                // `_ll_2_int_floordiv` residual as the `floordiv`
+                // canonical.
+                //
+                // The gate checks the result's proven concretetype
+                // explicitly so a Ref/Float/State-typed BinOp does not
+                // slip through and emit an `int_mod/ii>i` opname onto
+                // a non-int SSA result; when AST lowering left
+                // `result_ty == Unknown`, the rtyper-equivalent
+                // `type_state` is the carrier for `op.result.concretetype`.
                 let _ = result_ty;
-                let helper_name = if binop_name == "mod" {
-                    "_ll_2_int_mod"
+                let helper_key = if binop_name == "mod" {
+                    "mod"
                 } else {
-                    "_ll_2_int_floordiv"
+                    "floordiv"
                 };
-                let target = CallTarget::function_path([helper_name]);
-                let (funcptr, funcptr_op) = self.direct_funcptr_value(&target);
-                // `jtransform.py:469-470`: `op1 = [op1, SpaceOperation('-live-', [], None)]`
-                // fires only when `may_call_jitcodes or
-                // calldescr_canraise(calldescr)`.  Pyre's route-(a) emission
-                // is neither: `may_call_jitcodes` is structurally false for
-                // a residual call to an `extern "C"` helper, and the
-                // effect tag above is `ExtraEffect::CannotRaise` (mirrors
-                // `lloperation.py:203-204 'int_floordiv' / 'int_mod'`
-                // both flagged `LLOp(canfold=True)` with no canraise).
-                // Therefore NO `OpKind::Live` is emitted here.  This
-                // matches the bytecode shape upstream's
-                // `_do_builtin_call` produces for canfold/no-canraise
-                // helpers.
-                let mut ops = Vec::with_capacity(2);
-                ops.push(funcptr_op);
-                ops.push(SpaceOperation {
-                    result: op.result,
-                    kind: OpKind::CallResidual {
-                        funcptr: CallFuncPtr::Value(funcptr),
-                        descriptor: CallDescriptor::from_signature(
-                            &[majit_ir::value::Type::Int, majit_ir::value::Type::Int],
-                            majit_ir::value::Type::Int,
-                            EffectInfo::new(ExtraEffect::CannotRaise, OopSpecIndex::None),
-                        ),
-                        args_i: vec![*lhs, *rhs],
-                        args_r: vec![],
-                        args_f: vec![],
-                        result_kind: 'i',
-                        indirect_targets: None,
-                    },
-                });
-                RewriteResult::Replace(ops)
+                RewriteResult::Replace(
+                    self.emit_int_mod_or_floordiv_residual(helper_key, *lhs, *rhs, op.result),
+                )
             }
             // RPython `Transformer.rewrite_op_float_is_true(self, op)`
             // (`jtransform.py:1627-1631`):
@@ -1346,27 +1337,64 @@ impl<'a> Transformer<'a> {
                     },
                 }])
             }
-            // pyre front-end uses Rust's syn::BinOp / syn::UnOp identifiers
-            // (`add_assign`, `deref`) which have no RPython counterpart —
-            // RPython's flow-space never sees Python-level `+=` or `*x` as
-            // distinct ops (Python bytecode expands `+=` to BINARY_ADD
-            // followed by STORE_FAST, and `*x` disappears at rtyper). After
-            // the float/int coercion arms above have had a chance to match,
-            // the remaining in-place ops degenerate to their plain RPython
-            // binary opnames.
+            // pyre front-end emits assign-form binops (`add_assign`,
+            // `mod_assign`, `div_assign`, ...) from Rust's `+=` / `%=`
+            // / `/=` operators.  RPython has no analogue at this layer:
+            // Python bytecode expands `+=` to BINARY_ADD + STORE_FAST
+            // before the rtyper runs, so flow-space never sees an
+            // in-place op.  Pyre canonicalises the assign form here,
+            // dropping the `_assign` suffix; when the canonical name
+            // matches an integer op pyre routes through a residual
+            // helper above, emit the same residual directly so the
+            // result does not leak past the rewrite as a bare `mod` /
+            // `floordiv` / `div` op (this pass does not re-traverse
+            // its own Replace output).
+            //
+            // **Rust low-level → RPython low-level.**  Pyre's
+            // `mod_assign` / `div_assign` come from Rust's `%=` / `/=`
+            // on i64 (C-trunc primitive), matching RPython's
+            // `llop.int_mod` / `llop.int_floordiv` low-level llops.
+            // This is **not** a port of upstream's `rtype_inplace_mod
+            // = rtype_mod` / `rtype_inplace_div = rtype_inplace_floordiv`
+            // — those route the *Python-level* `%=` / `/=` through
+            // `_rtype_call_helper(hop, 'py_mod'/'py_div', ...)` to the
+            // Python-floor `ll_int_py_mod` / `ll_int_py_div` helpers
+            // (`rint.py:399-500`).  Pyre carries no Python-level
+            // `%=` / `/=` at this layer.
             OpKind::BinOp {
                 op: binop_name,
                 lhs,
                 rhs,
                 result_ty,
             } if canonical_assign_binop(binop_name).is_some() => {
-                let canonical = canonical_assign_binop(binop_name)
-                    .expect("guard checked assign binop")
-                    .to_string();
+                let canonical =
+                    canonical_assign_binop(binop_name).expect("guard checked assign binop");
+                // `rint.py:253-255`: `rtype_div = rtype_floordiv` (and
+                // `rtype_inplace_div = rtype_inplace_floordiv`) — integer
+                // `div` collapses to `floordiv` at the rtyper layer.
+                // `div_assign → "div"` from `canonical_assign_binop`,
+                // then this branch treats `"div"` as `floordiv` for the
+                // residual route, mirroring the plain `BinOp { op:"div" }`
+                // arm above.
+                let residual_key: Option<&'static str> = match canonical {
+                    "mod" => Some("mod"),
+                    "floordiv" | "div" => Some("floordiv"),
+                    _ => None,
+                };
+                if let Some(key) = residual_key {
+                    if self.get_value_kind(*lhs) == 'i'
+                        && self.get_value_kind(*rhs) == 'i'
+                        && self.binop_result_is_int(op.result, result_ty)
+                    {
+                        return RewriteResult::Replace(
+                            self.emit_int_mod_or_floordiv_residual(key, *lhs, *rhs, op.result),
+                        );
+                    }
+                }
                 RewriteResult::Replace(vec![SpaceOperation {
                     result: op.result,
                     kind: OpKind::BinOp {
-                        op: canonical,
+                        op: canonical.to_string(),
                         lhs: *lhs,
                         rhs: *rhs,
                         result_ty: result_ty.clone(),
@@ -1438,6 +1466,65 @@ impl<'a> Transformer<'a> {
             crate::jit_codewriter::type_state::ConcreteType::Void => Some(ValueType::Void),
             crate::jit_codewriter::type_state::ConcreteType::Unknown => None,
         }
+    }
+
+    fn binop_result_is_int(&self, result: Option<ValueId>, result_ty: &ValueType) -> bool {
+        if *result_ty == ValueType::Int {
+            return true;
+        }
+        let Some(result) = result else {
+            return false;
+        };
+        self.get_value_type(result) == Some(ValueType::Int)
+    }
+
+    /// Emit the `_ll_2_int_mod` / `_ll_2_int_floordiv` residual call
+    /// pair (funcptr-materialisation op + `CallResidual`) shared
+    /// between the plain `mod` / `floordiv` / `div` arm and the
+    /// `canonical_assign_binop` arm.  `helper_key` is `"mod"` for
+    /// the int-mod residual or anything else (`"floordiv"`, `"div"`)
+    /// for the int-floordiv residual — `rint.py:253-255 rtype_div =
+    /// rtype_floordiv` aliases integer `div` to `floordiv` at the
+    /// rtyper layer, and pyre carries that alias through here.
+    ///
+    /// `jtransform.py:469-470`'s `-live-` gate fires only on
+    /// `may_call_jitcodes or calldescr_canraise`; this residual is
+    /// neither (the helper is an `extern "C"` C-truncating arithmetic
+    /// primitive flagged `LLOp(canfold=True)` upstream —
+    /// `lloperation.py:203-204`), so no `OpKind::Live` follows.
+    fn emit_int_mod_or_floordiv_residual(
+        &mut self,
+        helper_key: &str,
+        lhs: ValueId,
+        rhs: ValueId,
+        result: Option<ValueId>,
+    ) -> Vec<SpaceOperation> {
+        let helper_name = if helper_key == "mod" {
+            "_ll_2_int_mod"
+        } else {
+            "_ll_2_int_floordiv"
+        };
+        let target = CallTarget::function_path([helper_name]);
+        let (funcptr, funcptr_op) = self.direct_funcptr_value(&target);
+        let mut ops = Vec::with_capacity(2);
+        ops.push(funcptr_op);
+        ops.push(SpaceOperation {
+            result,
+            kind: OpKind::CallResidual {
+                funcptr: CallFuncPtr::Value(funcptr),
+                descriptor: CallDescriptor::from_signature(
+                    &[majit_ir::value::Type::Int, majit_ir::value::Type::Int],
+                    majit_ir::value::Type::Int,
+                    EffectInfo::new(ExtraEffect::CannotRaise, OopSpecIndex::None),
+                ),
+                args_i: vec![lhs, rhs],
+                args_r: vec![],
+                args_f: vec![],
+                result_kind: 'i',
+                indirect_targets: None,
+            },
+        });
+        ops
     }
 
     /// RPython's float rtyper calls `hop.inputargs(Float, Float)`, which
@@ -2149,6 +2236,12 @@ impl<'a> Transformer<'a> {
                     for slot in normalized {
                         match slot {
                             NormalizedArg::Pass(vid) => eff.push(vid),
+                            // `support.py:723 Constant(obj, lltype.Signed)`.
+                            // Only integer literals (`lltype.Signed`-tagged)
+                            // reach this arm — `parse_literal_slot` panics
+                            // on char literals (`lltype.Char` has no pyre
+                            // `ConcreteType` analogue) and routes float
+                            // literals to `ConstFloat` below.
                             NormalizedArg::ConstInt(v) => {
                                 let vid = self.fresh_synthetic_value_typed(
                                     crate::jit_codewriter::type_state::ConcreteType::Signed,
@@ -2156,6 +2249,17 @@ impl<'a> Transformer<'a> {
                                 prefix.push(SpaceOperation {
                                     result: Some(vid),
                                     kind: OpKind::ConstInt(v),
+                                });
+                                eff.push(vid);
+                            }
+                            // `support.py:723 Constant(obj, lltype.Float)`
+                            NormalizedArg::ConstFloat(bits) => {
+                                let vid = self.fresh_synthetic_value_typed(
+                                    crate::jit_codewriter::type_state::ConcreteType::Float,
+                                );
+                                prefix.push(SpaceOperation {
+                                    result: Some(vid),
+                                    kind: OpKind::ConstFloat(bits),
                                 });
                                 eff.push(vid);
                             }
@@ -4650,6 +4754,330 @@ mod tests {
 
         assert_eq!(result_kind, 'i');
         assert_eq!(descriptor.result_ir_type(), majit_ir::Type::Int);
+    }
+
+    #[test]
+    fn int_mod_unknown_ast_result_rewrites_when_type_state_proves_signed() {
+        let mut graph = FunctionGraph::new("int_mod_body");
+        let lhs = graph
+            .push_op(
+                graph.startblock,
+                OpKind::Input {
+                    name: "lhs".into(),
+                    ty: ValueType::Unknown,
+                },
+                true,
+            )
+            .unwrap();
+        let rhs = graph
+            .push_op(
+                graph.startblock,
+                OpKind::Input {
+                    name: "rhs".into(),
+                    ty: ValueType::Unknown,
+                },
+                true,
+            )
+            .unwrap();
+        let result = graph
+            .push_op(
+                graph.startblock,
+                OpKind::BinOp {
+                    op: "mod".to_string(),
+                    lhs,
+                    rhs,
+                    result_ty: ValueType::Unknown,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result));
+
+        let mut type_state = TypeResolutionState::new();
+        type_state.concrete_types.insert(lhs, ConcreteType::Signed);
+        type_state.concrete_types.insert(rhs, ConcreteType::Signed);
+        type_state
+            .concrete_types
+            .insert(result, ConcreteType::Signed);
+        let config = GraphTransformConfig::default();
+        let mut cc = crate::call::CallControl::new();
+        let transformed = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .with_type_state(&type_state)
+            .transform(&graph);
+
+        let ops = &transformed.graph.block(graph.startblock).operations;
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "mod")),
+            "bare int_mod must not survive jtransform: {ops:?}"
+        );
+        let residual = ops
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::CallResidual {
+                    descriptor,
+                    result_kind,
+                    args_i,
+                    ..
+                } => Some((descriptor, *result_kind, args_i)),
+                _ => None,
+            })
+            .expect("mod must rewrite to residual helper call");
+        assert_eq!(residual.1, 'i');
+        assert_eq!(residual.2, &vec![lhs, rhs]);
+        assert_eq!(residual.0.result_ir_type(), majit_ir::Type::Int);
+        assert_eq!(residual.0.get_extra_info().oopspecindex, OopSpecIndex::None);
+    }
+
+    #[test]
+    fn mod_assign_rewrites_directly_to_int_mod_residual() {
+        // Rust low-level → RPython low-level: pyre constructs
+        // `mod_assign` from Rust's `%=` operator on i64, which has
+        // C-truncating remainder semantics.  That maps to RPython's
+        // explicit `llop.int_mod` route (`support.py:266-271
+        // _ll_2_int_mod`), not to Python-level `%=` / `rtype_mod`
+        // (`rint.py:260-262`, which calls `py_mod`).  The assign arm
+        // must emit the `_ll_2_int_mod` residual directly because
+        // `transform_op`'s Replace output is not re-traversed within
+        // the same pass — leaving a bare `mod` here would leak past
+        // the jtransform rewrite gate.
+        let mut graph = FunctionGraph::new("mod_assign_body");
+        let lhs = graph
+            .push_op(
+                graph.startblock,
+                OpKind::Input {
+                    name: "lhs".into(),
+                    ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let rhs = graph
+            .push_op(
+                graph.startblock,
+                OpKind::Input {
+                    name: "rhs".into(),
+                    ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let result = graph
+            .push_op(
+                graph.startblock,
+                OpKind::BinOp {
+                    op: "mod_assign".to_string(),
+                    lhs,
+                    rhs,
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result));
+
+        let mut type_state = TypeResolutionState::new();
+        type_state.concrete_types.insert(lhs, ConcreteType::Signed);
+        type_state.concrete_types.insert(rhs, ConcreteType::Signed);
+        type_state
+            .concrete_types
+            .insert(result, ConcreteType::Signed);
+        let config = GraphTransformConfig::default();
+        let mut cc = crate::call::CallControl::new();
+        let transformed = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .with_type_state(&type_state)
+            .transform(&graph);
+
+        let ops = &transformed.graph.block(graph.startblock).operations;
+        assert!(
+            !ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::BinOp { op, .. } if op == "mod_assign" || op == "mod"
+            )),
+            "mod_assign must not survive as a bare BinOp: {ops:?}"
+        );
+        let residual = ops
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::CallResidual {
+                    descriptor,
+                    result_kind,
+                    args_i,
+                    ..
+                } => Some((descriptor, *result_kind, args_i)),
+                _ => None,
+            })
+            .expect("mod_assign must rewrite to residual _ll_2_int_mod call");
+        assert_eq!(residual.1, 'i');
+        assert_eq!(residual.2, &vec![lhs, rhs]);
+        assert_eq!(residual.0.result_ir_type(), majit_ir::Type::Int);
+    }
+
+    #[test]
+    fn div_assign_rewrites_directly_to_int_floordiv_residual() {
+        // Rust low-level → RPython low-level: pyre constructs
+        // `div_assign` from Rust's `/=` operator on i64, which has
+        // C-truncating division semantics.  That maps to RPython's
+        // explicit `llop.int_floordiv` route (`support.py:255-264
+        // _ll_2_int_floordiv`), not to Python-level `/=` /
+        // `rtype_inplace_div` (`rint.py:253-255`, which aliases to
+        // `rtype_floordiv` and calls `py_div`).  The assign arm
+        // aliases `"div"` to `floordiv` and emits the residual
+        // directly so no bare `div` / `floordiv` survives this pass.
+        let mut graph = FunctionGraph::new("div_assign_body");
+        let lhs = graph
+            .push_op(
+                graph.startblock,
+                OpKind::Input {
+                    name: "lhs".into(),
+                    ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let rhs = graph
+            .push_op(
+                graph.startblock,
+                OpKind::Input {
+                    name: "rhs".into(),
+                    ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let result = graph
+            .push_op(
+                graph.startblock,
+                OpKind::BinOp {
+                    op: "div_assign".to_string(),
+                    lhs,
+                    rhs,
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result));
+
+        let mut type_state = TypeResolutionState::new();
+        type_state.concrete_types.insert(lhs, ConcreteType::Signed);
+        type_state.concrete_types.insert(rhs, ConcreteType::Signed);
+        type_state
+            .concrete_types
+            .insert(result, ConcreteType::Signed);
+        let config = GraphTransformConfig::default();
+        let mut cc = crate::call::CallControl::new();
+        let transformed = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .with_type_state(&type_state)
+            .transform(&graph);
+
+        let ops = &transformed.graph.block(graph.startblock).operations;
+        assert!(
+            !ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::BinOp { op, .. }
+                    if op == "div_assign" || op == "div" || op == "floordiv"
+            )),
+            "div_assign must not survive as a bare BinOp: {ops:?}"
+        );
+        let residual = ops
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::CallResidual {
+                    descriptor,
+                    result_kind,
+                    args_i,
+                    ..
+                } => Some((descriptor, *result_kind, args_i)),
+                _ => None,
+            })
+            .expect("div_assign must rewrite to residual _ll_2_int_floordiv call");
+        assert_eq!(residual.1, 'i');
+        assert_eq!(residual.2, &vec![lhs, rhs]);
+        assert_eq!(residual.0.result_ir_type(), majit_ir::Type::Int);
+    }
+
+    #[test]
+    fn plain_int_div_rewrites_directly_to_int_floordiv_residual() {
+        // `rint.py:253-255 rtype_div = rtype_floordiv`: a plain
+        // `BinOp { op:"div" }` over int operands (Rust `a / b` on
+        // i64s) routes through the same `_ll_2_int_floordiv`
+        // residual as `floordiv`.  RPython has no `int_div` op; the
+        // rtyper aliases `div` to `floordiv` for integer reprs.
+        let mut graph = FunctionGraph::new("int_div_body");
+        let lhs = graph
+            .push_op(
+                graph.startblock,
+                OpKind::Input {
+                    name: "lhs".into(),
+                    ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let rhs = graph
+            .push_op(
+                graph.startblock,
+                OpKind::Input {
+                    name: "rhs".into(),
+                    ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let result = graph
+            .push_op(
+                graph.startblock,
+                OpKind::BinOp {
+                    op: "div".to_string(),
+                    lhs,
+                    rhs,
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result));
+
+        let mut type_state = TypeResolutionState::new();
+        type_state.concrete_types.insert(lhs, ConcreteType::Signed);
+        type_state.concrete_types.insert(rhs, ConcreteType::Signed);
+        type_state
+            .concrete_types
+            .insert(result, ConcreteType::Signed);
+        let config = GraphTransformConfig::default();
+        let mut cc = crate::call::CallControl::new();
+        let transformed = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .with_type_state(&type_state)
+            .transform(&graph);
+
+        let ops = &transformed.graph.block(graph.startblock).operations;
+        assert!(
+            !ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::BinOp { op, .. } if op == "div" || op == "floordiv"
+            )),
+            "plain int div must not survive as a bare BinOp: {ops:?}"
+        );
+        let residual = ops
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::CallResidual {
+                    descriptor,
+                    result_kind,
+                    args_i,
+                    ..
+                } => Some((descriptor, *result_kind, args_i)),
+                _ => None,
+            })
+            .expect("int div must rewrite to residual _ll_2_int_floordiv call");
+        assert_eq!(residual.1, 'i');
+        assert_eq!(residual.2, &vec![lhs, rhs]);
+        assert_eq!(residual.0.result_ir_type(), majit_ir::Type::Int);
     }
 
     #[test]

@@ -1904,27 +1904,48 @@ impl CallControl {
         // produces.  Pyre cannot perform that synthesis: a host-bound
         // `extern "C"` function pointer carries no body the walker can
         // read, and pyre has no `MixLevelHelperAnnotator` to fabricate
-        // one.  The seed loop therefore:
-        //   (a) skips entries whose canonical name has no
-        //       `function_fnaddrs` registration (`int_abs`,
-        //       `ll_math.ll_math_sqrt` — not bound by pyre's host);
-        //   (b) registers the function pointer for bound entries
-        //       (`_ll_2_int_mod` / `_ll_2_int_floordiv` at
-        //       `pyre/jit_fnaddr.rs`) so downstream `direct_funcptr_value`
-        //       lookups succeed, but does not push the impl path onto
-        //       `todo` because `function_graphs.contains_key` fails
-        //       (no graph registered for an `extern "C"` helper).
-        // Both behaviours mirror upstream `@dont_look_inside` for the
-        // SAME helper — the trace cannot inline through it — but the
-        // pyre case is structurally broader: even helpers upstream
-        // WOULD inline through stay opaque here.  Convergence path:
-        // port `_ll_2_int_mod` / `_ll_2_int_floordiv` (and the other
-        // INLINE_CALLS_TO entries) as Rust-source bodies the walker
-        // can lower into a graph, register the graph via
-        // `register_function_graph(canonical_name)`, then the BFS seed
-        // arm below will push the impl path naturally.  Multi-session
-        // port: requires walker reach into majit-metainterp + a Rust
-        // analogue of `MixLevelHelperAnnotator.constfunc`.
+        // one.  Fabricating a one-op shim graph that calls the host
+        // helper would be a NEW-DEVIATION, not parity — the shim has
+        // no `oopspec` / `_jit_*_` hints, no canraise / effect
+        // analysis grounded in the helper body, and would override
+        // any real source-level helper graph registered later under
+        // the same canonical path.  The seed loop therefore:
+        //   (a) skips `int_abs` outright — pyre has no production
+        //       `_ll_1_int_abs` fnaddr binding and no helper body graph.
+        //       RPython `inline_calls_to` seeds the helper graph so the
+        //       JIT can look inside it (`support.py:443-449` /
+        //       `call.py:59-64`); a fnaddr-only binding would instead
+        //       make `int_abs` an opaque extern call.  The binding waits
+        //       for the rtyper-equivalent to synthesise the body graph
+        //       (the same gating that blocks `_ll_2_int_*` from being
+        //       seeded).
+        //   (b) skips `ll_math.ll_math_sqrt` — pyre has no
+        //       `ll_math_sqrt` analogue that raises
+        //       `ValueError("math domain error")` on negative input
+        //       per `ll_math.py:317-322`, so making the fnaddr
+        //       reachable would be a semantic regression (bare
+        //       `f64::sqrt()` returns NaN where upstream raises).
+        //   (c) registers the function pointer for the integer
+        //       residual-call entries (`_ll_2_int_floordiv` /
+        //       `_ll_2_int_mod` at `pyre/jit_fnaddr.rs`) so the
+        //       jtransform-emitted residual calls resolve to a real
+        //       C ABI address.  These do not push the impl path onto
+        //       `todo` either — `function_graphs.contains_key` fails
+        //       because no graph is registered for an `extern "C"`
+        //       helper.
+        // All three behaviours mirror upstream `@dont_look_inside`
+        // for the SAME helper — the trace cannot inline through it
+        // — but the pyre case is structurally broader: even helpers
+        // upstream WOULD inline through stay opaque here.  Convergence
+        // path: port the integer helpers as Rust-source bodies the
+        // walker can lower into a graph, register the graph via
+        // `register_function_graph(canonical_name)`, then the BFS
+        // seed arm below will push the impl path naturally.  Multi-
+        // session port: requires walker reach into majit-metainterp
+        // and a Rust analogue of `MixLevelHelperAnnotator.constfunc`.
+        // `ll_math_sqrt` additionally needs a pyre-side raise
+        // protocol (PyError emission from a residual C call) before
+        // the fnaddr can be safely bound.
         for (oopspec_name, ll_args, ll_res) in crate::support::INLINE_CALLS_TO {
             // `call.py:60-64`:
             //   c_func, _ = support.builtin_func_for_spec(self.rtyper,
@@ -1944,14 +1965,15 @@ impl CallControl {
             // panic inside `setup_extra_builtin` (mirroring
             // `support.py:687-690` raise-on-miss) from firing for
             // entries pyre's host has not bound — pyre's helpers
-            // (e.g. `int_abs`, `ll_math.ll_math_sqrt`) are not all
-            // registered as concrete C ABI intrinsics, so the seed
-            // loop honestly skips entries with no host binding rather
-            // than crashing.  Entries that ARE bound flow through
-            // `builtin_func_for_spec`, populating the rtyper-equivalent
-            // cache, and contribute their canonical-impl graph to the
-            // BFS seed when (and only when) a Rust-source graph has
-            // been registered under that canonical name.
+            // (`ll_math.ll_math_sqrt`) are not all registered as
+            // concrete C ABI intrinsics, so the seed loop honestly
+            // skips entries with no host binding rather than
+            // crashing.  Entries that ARE bound flow through
+            // `builtin_func_for_spec`, populating the rtyper-
+            // equivalent cache, and contribute their canonical-impl
+            // graph to the BFS seed when (and only when) a
+            // Rust-source graph has been registered under that
+            // canonical name.
             let canonical_path = CallPath::from_segments([format!(
                 "_ll_{}_{}",
                 ll_args.len(),

@@ -2735,29 +2735,42 @@ fn collect_jit_hints(attrs: &[syn::Attribute], sig: Option<&syn::Signature>) -> 
     // is available, emit a paired `"oopspec_argnames:arg1,arg2,..."`
     // hint so `lib.rs:598-600` can populate
     // `CallControl::mark_oopspec_argnames` alongside `mark_oopspec`.
-    // `support.py:713 argname2index = dict(zip(argnames, [Index(n) for n in range(nb_args)]))`
-    // requires the declaration-order names; `self` is skipped because
-    // upstream `co_varnames` for a method's lifted free function would
-    // not include it (RPython doesn't have `self`-as-receiver in
-    // oopspec helpers, and pyre's `#[oopspec(...)]` macro is only
-    // applied to free fns / static methods per
-    // `majit-macros/src/lib.rs:1316`).
+    //
+    // `support.py:713 argname2index = dict(zip(argnames, [Index(n) for n
+    // in range(nb_args)]))` requires the declaration-order names.
+    // Upstream's `co_varnames[:nb_args]` includes the method's
+    // `self` parameter when it's a bound method (Python's
+    // `co_varnames[0] = 'self'` convention), so for strict parity the
+    // Rust port maps `FnArg::Receiver` to the synthetic name `"self"`.
+    // Non-`Pat::Ident` patterns (tuple destructuring, wildcards) have
+    // no single name to bind — upstream `co_varnames` would record
+    // the destructured locals individually, but pyre's
+    // `argname2index` lookup is positional and cannot multiplex one
+    // slot to many names.  Emitting a `"_"` placeholder there would
+    // be a NEW-DEVIATION (the hint would shadow no real upstream
+    // identifier and silently mis-bind any oopspec literal that
+    // happens to spell `_`).  When such a pattern appears, refuse to
+    // emit the argnames hint entirely so `decode_builtin_call` falls
+    // back to the positional / bare-name path — the same behaviour
+    // upstream gets when `co_varnames` is unavailable.
     if saw_oopspec {
         if let Some(sig) = sig {
-            let argnames: Vec<String> = sig
-                .inputs
-                .iter()
-                .filter_map(|arg| match arg {
+            let mut argnames: Vec<String> = Vec::with_capacity(sig.inputs.len());
+            let mut skip_hint = false;
+            for arg in sig.inputs.iter() {
+                match arg {
+                    // `co_varnames[0]` for a bound method is `'self'`.
+                    syn::FnArg::Receiver(_) => argnames.push("self".to_string()),
                     syn::FnArg::Typed(pat_type) => match &*pat_type.pat {
-                        syn::Pat::Ident(ident) => Some(ident.ident.to_string()),
-                        _ => None,
+                        syn::Pat::Ident(ident) => argnames.push(ident.ident.to_string()),
+                        _ => {
+                            skip_hint = true;
+                            break;
+                        }
                     },
-                    // `&self` / `self` receivers carry no positional
-                    // argname for the oopspec parser to bind against.
-                    syn::FnArg::Receiver(_) => None,
-                })
-                .collect();
-            if !argnames.is_empty() {
+                }
+            }
+            if !skip_hint && !argnames.is_empty() {
                 hints.push(format!("oopspec_argnames:{}", argnames.join(",")));
             }
         }
@@ -12477,5 +12490,46 @@ mod tests {
             hint_count, 2,
             "wrapper must emit hint_promote for self and n (2 total); ops:\n{ops:#?}"
         );
+    }
+
+    // ── `collect_jit_hints` argname-threading parity tests ──────────
+
+    #[test]
+    fn collect_jit_hints_emits_oopspec_argnames_for_free_fn() {
+        // `support.py:705 argnames = ll_func.__code__.co_varnames[:nb_args]`
+        // — for a free function `fn foo(x, y, z)`, co_varnames is
+        // `('x', 'y', 'z')`.
+        let item: syn::ItemFn = syn::parse_quote! {
+            #[oopspec("foo(x, y)")]
+            fn foo(x: i64, y: i64) -> i64 { 0 }
+        };
+        let hints = super::collect_jit_hints_with_sig(&item.attrs, &item.sig);
+        assert!(hints.contains(&"oopspec:foo(x, y)".to_string()));
+        assert!(hints.contains(&"oopspec_argnames:x,y".to_string()));
+    }
+
+    #[test]
+    fn collect_jit_hints_includes_self_as_first_argname_for_method() {
+        // `support.py:705 argnames = ll_func.__code__.co_varnames[:nb_args]`
+        // — for a bound method `def foo(self, x): ...`, `co_varnames[:2]`
+        // is `('self', 'x')`.  Pyre maps `FnArg::Receiver` to "self"
+        // for strict parity.
+        let item: syn::ImplItemFn = syn::parse_quote! {
+            #[oopspec("foo(self, x)")]
+            fn foo(&self, x: i64) -> i64 { 0 }
+        };
+        let hints = super::collect_jit_hints_with_sig(&item.attrs, &item.sig);
+        assert!(hints.contains(&"oopspec_argnames:self,x".to_string()));
+    }
+
+    #[test]
+    fn collect_jit_hints_omits_argname_hint_when_no_oopspec() {
+        // No `#[oopspec(...)]` → no `oopspec_argnames:` hint emitted,
+        // even when the signature has positional params.
+        let item: syn::ItemFn = syn::parse_quote! {
+            fn foo(x: i64, y: i64) -> i64 { 0 }
+        };
+        let hints = super::collect_jit_hints_with_sig(&item.attrs, &item.sig);
+        assert!(hints.iter().all(|h| !h.starts_with("oopspec_argnames:")));
     }
 }

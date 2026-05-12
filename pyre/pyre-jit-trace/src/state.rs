@@ -8083,18 +8083,28 @@ mod tests {
             Some(majit_ir::Value::Float(_))
         ));
 
-        // Idempotent: calling twice does not shrink or duplicate. Constant
-        // dedup means the trailing slots map to the same OpRefs.
+        // Calling twice does not shrink. Int/Ref trailing slots resolve
+        // to the same OpRef via the `large_ints`/`refs` resume-memo dedup
+        // (resume.py:148-149/167-181). Float falls through `_newconst`
+        // (resume.py:183) which appends a fresh slot per call, so the
+        // second call re-mints `registers_f[2]` — value-equality, not
+        // identity-equality, is the upstream invariant for Float.
         let trailing_i_before = sym.registers_i[3];
         let trailing_r_before = sym.registers_r[4];
         let trailing_f_before = sym.registers_f[2];
+        let trailing_f_value_before = ctx
+            .constants_get_value(trailing_f_before)
+            .expect("first-call trailing float slot resolves to a constant");
         sym.setup_kind_register_banks(&mut ctx);
         assert_eq!(sym.registers_i.len(), 5);
         assert_eq!(sym.registers_r.len(), 5);
         assert_eq!(sym.registers_f.len(), 3);
         assert_eq!(sym.registers_i[3], trailing_i_before);
         assert_eq!(sym.registers_r[4], trailing_r_before);
-        assert_eq!(sym.registers_f[2], trailing_f_before);
+        let trailing_f_value_after = ctx
+            .constants_get_value(sym.registers_f[2])
+            .expect("second-call trailing float slot resolves to a constant");
+        assert_eq!(trailing_f_value_after, trailing_f_value_before);
 
         // SAFETY: drop the boxed JitCode; sym.jitcode now dangles but goes
         // out of scope at the end of this test.

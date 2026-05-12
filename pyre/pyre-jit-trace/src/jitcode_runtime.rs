@@ -1286,17 +1286,12 @@ mod tests {
         assert_eq!(id_a, id_b, "Or-grouped variants must share an arm_id");
     }
 
-    // Task #85 closure check: the strict builder covers nearly every
-    // opname in the generated insns table.  Earlier revisions kept this
-    // ignored while kind-flow bugs emitted pyre-only mixed signatures
-    // such as `int_ge/ir>i`; the codewriter/rtyper/jtransform parity
-    // fixes made those opnames disappear at the source.  One opname
-    // (`int_mod/ii>i`) still leaks through because pyre's AST-time
-    // `front/ast.rs::binary_result_value_type` falls back to
-    // `ValueType::Unknown` for forward-referenced operands, and the
-    // strict jtransform `rewrite_op_int_mod` arm only matches
-    // `result_ty == Int`.  Documented in
-    // `default_bh_builder_unwired_set_matches_task_85_snapshot`.
+    // Task #85 closure check: the strict builder covers every opname in
+    // the generated insns table.  Earlier revisions kept this ignored
+    // while kind-flow bugs emitted pyre-only mixed signatures such as
+    // `int_ge/ir>i` and a late `int_mod/ii>i` leak; those are now fixed
+    // at source typing / jtransform emission rather than by adding
+    // blackhole aliases.
     #[test]
     fn build_default_bh_builder_matches_insns_table() {
         // Slice 3a: the runtime-side `BlackholeInterpBuilder` is reachable
@@ -1304,10 +1299,7 @@ mod tests {
         // it must carry the same byte<->opname mapping as the build-time
         // insns bincode, and it must resolve the three well-known
         // opcodes (`live/`, `catch_exception/L`, `rvmprof_code/ii`) when
-        // they appear in the table.  Uses the report builder so the
-        // documented `int_mod/ii>i` leak does not panic the strict
-        // builder — the leak is tracked by
-        // `default_bh_builder_unwired_set_matches_task_85_snapshot`.
+        // they appear in the table.
         let (builder, _unwired) = build_default_bh_builder_with_unwired_report();
         let expected_live = insns_opname_to_byte().get("live/").copied();
         assert_eq!(Some(builder.op_live), expected_live);
@@ -1344,34 +1336,13 @@ mod tests {
     #[test]
     fn default_bh_builder_unwired_set_matches_task_85_snapshot() {
         // Task #85 lock-in: every generated opname must be wired by
-        // `wire_bhimpl_handlers`, OR be on this known-gap list with a
-        // cited upstream parity issue.  A new entry outside the list
-        // means codewriter / regalloc emitted a kind shape that no
-        // RPython blackhole handler has — fix at upstream emission, do
-        // NOT add a `*_r>i` / `*_ir>i` alias.
-        //
-        // Current expected entries:
-        //
-        // - `int_mod/ii>i` — RPython `jtransform.py:576-577
-        //   rewrite_op_int_mod = _do_builtin_call` replaces the bare
-        //   op with `direct_call(_ll_2_int_mod, ...)` BEFORE jitcode
-        //   emission, so upstream's `pipeline.insns` never carries
-        //   the bare opname.  Pyre's `jit_codewriter/jtransform.rs`
-        //   `BinOp { op: "mod" | "floordiv" }` arm rewrites only when
-        //   `result_ty == Int`; pyre's AST-time
-        //   `front/ast.rs::binary_result_value_type` falls back to
-        //   `Unknown` when either operand's `graph_value_type` returns
-        //   `None` (a forward-reference gap that the rtyper-equivalent
-        //   type_state pass resolves later), so `Unknown`-typed mods
-        //   slip through and leak into `pipeline.insns`.  Closing
-        //   this requires fixing the AST-time type inference so
-        //   `result_ty` is reliably `Int` for `i64 % i64`; it is NOT
-        //   closed by widening the rewrite gate to admit `Unknown`
-        //   (a previously-attempted shortcut that mixed two upstream
-        //   routes — see jtransform.rs comment).
+        // `wire_bhimpl_handlers`.  Any entry here means codewriter /
+        // regalloc emitted a kind shape that no RPython blackhole handler
+        // has — fix at upstream emission, do NOT add a `*_r>i` /
+        // `*_ir>i` alias.
         let (_builder, mut unwired) = build_default_bh_builder_with_unwired_report();
         unwired.sort();
-        let expected: Vec<String> = vec!["int_mod/ii>i".to_string()];
+        let expected: Vec<String> = vec![];
         assert_eq!(
             unwired, expected,
             "Task #85 unwired-opname snapshot drifted. If a new entry \

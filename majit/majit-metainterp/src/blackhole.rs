@@ -7461,11 +7461,6 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
         // entries removed: byte-reservation constants `BC_INT_FLOORDIV`
         // / `BC_INT_MOD` were retired in main's `5bcfcb3efbf` parity
         // fix, and no producer emits the `_pyre_u16` opname variants.
-        // The canonical `int_mod/ii>i` wire below stays because pyre's
-        // build-time assembler at
-        // `jit_codewriter/assembler.rs:2778-2789` `format!("int_{op}")`
-        // emits the canonical opname for `syn::BinOp::Rem` source-level
-        // `%` operators ahead of any jtransform-style direct-call rewrite.
         ("int_and_pyre_u16/ii>i", majit_translate::insns::BC_INT_AND),
         ("int_or_pyre_u16/ii>i", majit_translate::insns::BC_INT_OR),
         ("int_xor_pyre_u16/ii>i", majit_translate::insns::BC_INT_XOR),

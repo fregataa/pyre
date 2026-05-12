@@ -467,7 +467,7 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // string survives as the canonical CallPath, matching the segment
     // shape jtransform produces.
     //
-    // The Rust-source graphs for either helper family are NOT
+    // The Rust-source graphs for the integer helpers are NOT
     // registered in `CallControl::function_graphs` (pyre has no
     // `MixLevelHelperAnnotator` to materialise a graph from a `pub
     // extern "C"` function pointer), so `call.rs:1620-1670`
@@ -475,16 +475,35 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // `function_fnaddrs` lookup but cannot seed the BFS through the
     // helper's body — the helpers stay opaque to the inliner,
     // matching upstream behaviour for any `@dont_look_inside`
-    // oopspec helper.
-    push_fnaddr(
-        &mut entries,
-        "_ll_2_int_mod",
-        majit_metainterp::blackhole::_ll_2_int_mod as *const (),
-    );
+    // oopspec helper.  Two `support.py:inline_calls_to` entries
+    // are intentionally NOT bound:
+    //   * `_ll_1_int_abs` — RPython `inline_calls_to` seeds the
+    //     `int_abs` helper *graph* into the BFS for actual inlining
+    //     at `call.py:60-64 todo.append(c_func.value._obj.graph)`.
+    //     Pyre can register the fnaddr but cannot fabricate the
+    //     helper body graph from an `extern "C"` function pointer
+    //     (no `MixLevelHelperAnnotator.constfunc` analogue), so a
+    //     fnaddr-only binding would make `int_abs` an opaque extern
+    //     helper — the opposite of the upstream inlining intent.
+    //     No production pyre rewrite emits `direct_call(_ll_1_int_abs)`
+    //     so the binding is omitted until the rtyper-equivalent
+    //     can synthesise the body graph.
+    //   * `_ll_1_ll_math_ll_math_sqrt` — `rpython/rtyper/lltypesystem/
+    //     module/ll_math.py:317-322 ll_math_sqrt` raises
+    //     `ValueError("math domain error")` on negative input, and
+    //     Rust's `f64::sqrt()` returns NaN; making the fnaddr
+    //     reachable would be a silent semantic regression.
+    // See the PRE-EXISTING-ADAPTATION block at
+    // `call.rs::find_all_graphs_bfs` for the convergence path.
     push_fnaddr(
         &mut entries,
         "_ll_2_int_floordiv",
         majit_metainterp::blackhole::_ll_2_int_floordiv as *const (),
+    );
+    push_fnaddr(
+        &mut entries,
+        "_ll_2_int_mod",
+        majit_metainterp::blackhole::_ll_2_int_mod as *const (),
     );
 
     // `support.py:274 _ll_1_cast_uint_to_float` / `_ll_1_cast_float_to_uint`
