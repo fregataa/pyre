@@ -61,11 +61,14 @@
 //! a distinct id, mirroring two Python modules whose `__dict__`s
 //! happen to share a key.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 
 use crate::flowspace::model::{ConstValue, HostObject};
+use crate::flowspace::pygraph::PyGraph;
 
 /// Opaque module identity used to partition
 /// [`HOST_RUST_MODULE_GLOBALS`] entries by the file that registered
@@ -406,6 +409,203 @@ pub(super) fn register_module_global(module_id: ModuleId, name: &str, value: Con
     map.entry(module_id)
         .or_default()
         .insert(name.to_string(), value);
+}
+
+/// Walker-built pygraph registry keyed on `HostObject` identity.
+///
+/// **PRE-EXISTING-ADAPTATION (Position-2 adapter, walker-pass-only
+/// transient).** Upstream `TranslationContext._prebuilt_graphs` is a
+/// context-owned `RefCell<HashMap<…>>` (`translator.py:50`), so the
+/// regular path is `build_flow(func)` followed by
+/// `self.graphs.append(graph)` (`translator.py:55-61`). Pyre's walker
+/// has no `&TranslationContext` handle when it lowers `Item::Fn`
+/// bodies (the walker is the entry shim that *creates* the Translation
+/// downstream), so the `(host, pygraph)` pair has nowhere
+/// context-owned to land at write time.
+///
+/// **Convergence (2026-05-11): production entry points now drain this
+/// thread-local into `TranslationContext._walker_pygraphs` at
+/// Translation construction time** (see
+/// [`drain_walker_pygraphs`] + the call site in
+/// `interactive::Translation::from_rust_file_entry_point_*`). Once
+/// drained, the production
+/// `translator::TranslationContext::buildflowgraph` reads from the
+/// context-owned `_walker_pygraphs` dict — the thread-local is no
+/// longer consulted on the production path. Any prior-pass orphans
+/// that survive a Translation re-walk are also drained, leaving
+/// HOST_RUST_PYGRAPHS empty for the next walker run.
+///
+/// Test fixtures that call `register_rust_module` directly (without
+/// constructing a `Translation`) still consult [`lookup_walker_pygraph`]
+/// because they have no context to drain into; the thread-local is
+/// the per-test process-wide carrier in that path. Cross-test bleed
+/// is acceptable (each test mints fresh `ModuleId`s + fresh
+/// `HostObject` identities).
+///
+/// Full retirement of the thread-local requires Translator-binding
+/// through the walker entry surface (so the walker writes directly
+/// into `ctx._walker_pygraphs`); that is the multi-session work
+/// captured in plan
+/// `~/.claude/plans/annotator-monomorphization-tier1-abstract-lake.md`
+/// "Strict-parity Point 1: HOST_RUST_PYGRAPHS as Position-2 adapter".
+///
+/// Closes Codex audit 1.1 (2026-05-08): walker callsites in
+/// [`super::register::register_rust_module`] used to drop the
+/// `Rc<PyGraph>` returned by
+/// [`super::register::build_host_function_from_rust_in_module`] and
+/// register only the `HostObject` in the module-globals partition.
+/// Downstream `FunctionDesc.buildgraph` then routed through
+/// `translator.buildflowgraph`; when the entry was not the file's
+/// named entry-point its `_prebuilt_graphs` lookup missed and the
+/// fallback `build_flow(graph_func)` ran against `HostCode.co_code
+/// = []` — producing an empty / wrong graph for every
+/// walker-registered sibling fn or impl method.
+///
+/// Read order at `translator.rs:buildflowgraph` mirrors upstream's:
+/// explicit per-instance `_prebuilt_graphs.remove` seed first (the
+/// entry-point pair), then this walker registry as a second
+/// fallback before falling through to upstream `build_flow`.
+///
+/// `Rc<PyGraph>` is `!Send` / `!Sync`, so the registry is
+/// `thread_local!` rather than `Mutex<HashMap<…>>`. Cross-thread
+/// translator instances each carry their own walker-output snapshot,
+/// matching upstream's per-Python-thread `_prebuilt_graphs`
+/// `RefCell<HashMap<…>>` (no cross-thread sharing).
+///
+/// **Re-walk semantics (path-keyed [`ModuleId::for_path`])**: every
+/// walker pass-2 success `register_walker_pygraph`s the freshly
+/// minted `HostObject`. The prior walk's entries stay resident
+/// because their keys (the prior `HostObject`s) are no longer
+/// referenced from the module-globals partition (which the new walk
+/// last-writer-wins overwrote). They are inert orphans that
+/// `lookup_walker_pygraph` never consults — same shape as upstream
+/// `gc-collected def reload`. Acceptable for now; a follow-up may
+/// trim the registry by `module_id` partition during walker entry
+/// to release the orphans eagerly.
+thread_local! {
+    static HOST_RUST_PYGRAPHS: RefCell<HashMap<HostObject, Rc<PyGraph>>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Walker-side write: stash the `(host, pygraph)` pair the walker
+/// produced for `host` so a later
+/// `translator.buildflowgraph(host)` can resolve to the same
+/// pygraph instead of re-flowing against empty `HostCode.co_code`.
+///
+/// Last-writer-wins per `HostObject` identity; two walks that mint
+/// distinct host identities for the same source-name register
+/// independent entries (the prior entry stays resident as an
+/// inert orphan — see [`HOST_RUST_PYGRAPHS`]'s docstring).
+pub(super) fn register_walker_pygraph(host: HostObject, pygraph: Rc<PyGraph>) {
+    HOST_RUST_PYGRAPHS.with(|map| {
+        map.borrow_mut().insert(host, pygraph);
+    });
+}
+
+/// Public read: consult the walker pygraph registry for `host`.
+/// Returns `Some(pygraph)` when a prior
+/// [`register_walker_pygraph`] call wrote the pair, `None`
+/// otherwise.
+///
+/// Production callers should NOT use this directly — the
+/// `Translation::from_rust_*` entry points drain this registry into
+/// `TranslationContext._walker_pygraphs` at construction time, so
+/// `translator::TranslationContext::buildflowgraph` reads from the
+/// context-owned dict. The thread-local read here remains for
+/// (a) walker-internal helpers that resolve the entry-point pygraph
+/// during the same call where it was just written (e.g.
+/// `register::build_host_function_from_rust_file`'s post-walker
+/// lookup), and (b) test fixtures that exercise the walker without
+/// constructing a `Translation`.
+pub fn lookup_walker_pygraph(host: &HostObject) -> Option<Rc<PyGraph>> {
+    HOST_RUST_PYGRAPHS.with(|map| map.borrow().get(host).cloned())
+}
+
+/// Atomically take every `(host, pygraph)` pair written by the walker
+/// since the last drain (or process start). Returns the drained map;
+/// the thread-local is left empty.
+///
+/// Production callers (`Translation::from_rust_*` entry points) call
+/// this immediately after the walker pass + before the
+/// `TranslationContext` becomes the buildflowgraph reader of record,
+/// so the walker registry is a transient between
+/// `register_rust_module_at_with_source` and Translation construction.
+/// Each `Translation` ends up with its own independent
+/// `_walker_pygraphs: RefCell<HashMap<HostObject, Rc<PyGraph>>>`
+/// snapshot, eliminating the cross-context state leak the
+/// thread-local would otherwise impose. Mirrors upstream
+/// `TranslationContext._prebuilt_graphs` ownership semantic
+/// (`translator.py:50`).
+pub fn drain_walker_pygraphs() -> HashMap<HostObject, Rc<PyGraph>> {
+    HOST_RUST_PYGRAPHS.with(|map| std::mem::take(&mut *map.borrow_mut()))
+}
+
+/// Walker-built error registry keyed on `HostObject` identity —
+/// the parity counterpart of [`HOST_RUST_PYGRAPHS`] for the failure
+/// path. When `lower_body_into_pygraph` returns `Err(AdapterError)`
+/// the walker keeps the placeholder host in its module / class dict
+/// (mirroring upstream `pyopcode.py:1405 STORE_NAME` /
+/// `classdesc.py:634 add_source_attribute` populating the dict
+/// regardless of any later flow-analysis state). The error itself
+/// would otherwise be dropped at walker time, leaving downstream
+/// `TranslationContext::buildflowgraph` to surface only a generic
+/// "Rust-source adapter has no PyGraph" string. This registry plays
+/// the role of upstream's `FlowingError` value at
+/// `flowcontext.py:847` — the analysis-time error is preserved on
+/// the `HostObject` that points at the unanalysed body, so the
+/// later `buildflowgraph(host)` boundary can re-surface it with the
+/// original `AdapterError` Display rendering.
+///
+/// The walker writes via [`register_walker_error`] on each `Err`
+/// arm of `lower_body_into_pygraph` and clears via
+/// [`clear_walker_error`] on the matching `Ok` arm so a successful
+/// retry doesn't leave a stale entry. Production drains via
+/// [`drain_walker_errors`] into
+/// `TranslationContext._walker_errors`; the read path mirrors
+/// `_walker_pygraphs` (per-context dict, no thread-local
+/// fall-through on the production read path).
+thread_local! {
+    static HOST_RUST_WALKER_ERRORS: RefCell<HashMap<HostObject, String>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Walker-side write: stash the rendered error message for `host`
+/// so downstream `buildflowgraph(host)` can re-surface the original
+/// rejection cause.
+pub(super) fn register_walker_error(host: HostObject, message: String) {
+    HOST_RUST_WALKER_ERRORS.with(|map| {
+        map.borrow_mut().insert(host, message);
+    });
+}
+
+/// Walker-side write: drop a previously-recorded error for `host`.
+/// Called on the `Ok` arm of a retry so a successful pass overrides
+/// any prior iteration's failure record.
+pub(super) fn clear_walker_error(host: &HostObject) {
+    HOST_RUST_WALKER_ERRORS.with(|map| {
+        map.borrow_mut().remove(host);
+    });
+}
+
+/// Public read: consult the walker error registry for `host`.
+/// Returns `Some(message)` when a prior
+/// [`register_walker_error`] call wrote the pair, `None` otherwise.
+///
+/// Production callers should NOT use this directly — they consume
+/// the drained `TranslationContext._walker_errors` instead. The
+/// thread-local read here remains for test fixtures that exercise
+/// the walker without constructing a `Translation`.
+pub fn lookup_walker_error(host: &HostObject) -> Option<String> {
+    HOST_RUST_WALKER_ERRORS.with(|map| map.borrow().get(host).cloned())
+}
+
+/// Atomically take every `(host, message)` pair written by the
+/// walker since the last drain. Mirrors [`drain_walker_pygraphs`]
+/// — production callers drain immediately after the walker pass +
+/// before the `TranslationContext` becomes the buildflowgraph
+/// reader of record.
+pub fn drain_walker_errors() -> HashMap<HostObject, String> {
+    HOST_RUST_WALKER_ERRORS.with(|map| std::mem::take(&mut *map.borrow_mut()))
 }
 
 #[cfg(test)]

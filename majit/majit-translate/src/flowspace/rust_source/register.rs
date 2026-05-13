@@ -64,10 +64,11 @@ use syn::{
     ItemEnum, ItemFn, ItemStruct, Lit, Local, Pat, PatIdent, UnOp,
 };
 
-use super::build_flow::{AdapterError, build_flow_from_rust_in_module};
+use super::build_flow::{AdapterError, build_flow_from_rust_in_module_with_globals};
 use super::host_env::{
-    ModuleId, module_globals_lookup, module_globals_snapshot, pyre_stdlib_lookup,
-    register_module_global,
+    ModuleId, clear_walker_error, lookup_walker_pygraph, module_globals_lookup,
+    module_globals_snapshot, pyre_stdlib_lookup, register_module_global, register_walker_error,
+    register_walker_pygraph,
 };
 use crate::flowspace::bytecode::HostCode;
 use crate::flowspace::model::{ConstValue, Constant, GraphFunc, HostObject};
@@ -125,6 +126,8 @@ pub fn build_host_function_from_rust(
         ModuleId::fresh(),
         source_filename,
         source_text,
+        None,
+        None,
     )
 }
 
@@ -132,24 +135,78 @@ pub fn build_host_function_from_rust(
 /// [`build_host_function_from_rust_file`] — both lower the body
 /// under an explicit `module_id` so the body's `LOAD_GLOBAL`
 /// lookups resolve against the matching registry partition.
+///
+/// When `func_globals` is `Some(ns)` (Slice O21), the body's
+/// `LOAD_GLOBAL` lookups consult `ns.class_get(name)` instead of
+/// the module-globals partition — this is the inner-mod case where
+/// the fn's `__globals__` IS the inline mod's namespace dict, per
+/// Python `function.__globals__ = inner_mod.__dict__`. `None`
+/// preserves the outer-module fn shape (partition lookup keyed on
+/// `module_id`).
 fn build_host_function_from_rust_in_module(
     item_fn: &ItemFn,
     module_id: ModuleId,
     source_filename: Option<&str>,
     source_text: Option<&str>,
+    func_globals: Option<&HostObject>,
+    class_: Option<HostObject>,
 ) -> Result<(HostObject, Rc<PyGraph>), AdapterError> {
-    let mut graph = build_flow_from_rust_in_module(item_fn, module_id)?;
     let HostMetadataParts {
         host,
         host_code,
         gf,
-    } = build_host_metadata_parts(item_fn, module_id, source_filename, source_text)?;
+    } = build_host_metadata_parts(item_fn, module_id, source_filename, source_text, class_)?;
+    let pygraph = lower_body_into_pygraph(
+        item_fn,
+        module_id,
+        func_globals,
+        gf,
+        &host_code,
+        source_text,
+    )?;
+    Ok((host, pygraph))
+}
+
+/// Strict-parity Issue 1 split (2026-05-08): the body-lowering /
+/// PyGraph wrapping half of [`build_host_function_from_rust_in_module`].
+/// Pairs with [`build_host_metadata_parts`] so the walker can
+/// pre-register the `HostObject` (via `build_host_metadata_parts` +
+/// `register_module_global`) and only afterwards lower the body —
+/// mirroring upstream Python `def f` populating `module.__dict__`
+/// BEFORE flow analysis (`flowcontext.py:847 find_global` reads from
+/// the live module dict). This is the channel that makes direct
+/// (`fn f() { f() }`) and mutual recursion resolve in pyre's adapter.
+///
+/// `gf` and `host_code` MUST be the pair returned from
+/// `build_host_metadata_parts(item_fn, ...)` for the same `item_fn`,
+/// so the resulting `PyGraph.func` shares identity with the host's
+/// embedded `GraphFunc` (`graph.func` invariant per `pygraph.py:20`).
+fn lower_body_into_pygraph(
+    item_fn: &ItemFn,
+    module_id: ModuleId,
+    func_globals: Option<&HostObject>,
+    gf: GraphFunc,
+    host_code: &HostCode,
+    source_text: Option<&str>,
+) -> Result<Rc<PyGraph>, AdapterError> {
+    let mut graph =
+        build_flow_from_rust_in_module_with_globals(item_fn, module_id, func_globals.cloned())?;
 
     // upstream `PyGraph.__init__` (pygraph.py:20) assigns
     // `FunctionGraph.func = func` via `super().__init__`. Mirror that so
     // downstream helpers (`FlowContext::new`, `FunctionDesc.getuniquegraph`)
     // see the same GraphFunc the HostObject exposes.
     graph.func = Some(gf.clone());
+    // upstream `PyGraph.__init__` calls `super().__init__(self._sanitize_funcname(func), ...)`
+    // (pygraph.py:18-22) — when `func.class_` is set, the graph name
+    // becomes `Class.method` rather than the bare fn ident. Strict-parity
+    // (2026-05-10): `build_flow_from_rust_in_module_with_globals` doesn't
+    // know about `gf.class_` (it predates Audit 1.5), so re-stamp the
+    // graph name here through `PyGraph::sanitize_funcname` so impl-method
+    // graphs render as `Class.method` matching upstream `pygraph.py:24
+    // _sanitize_funcname`. Top-level fns (`gf.class_ == None`) round-trip
+    // to the same bare ident the builder produced.
+    graph.name = crate::flowspace::pygraph::PyGraph::sanitize_funcname(&gf);
     // upstream `model.py:35-47` exposes `FunctionGraph.source` as a
     // property-with-setter backed by `_source`. The Translation
     // constructor at `interactive.py:25` delegates to
@@ -164,7 +221,7 @@ fn build_host_function_from_rust_in_module(
         graph._source = Some(src.to_owned());
     }
 
-    let pygraph = Rc::new(PyGraph {
+    Ok(Rc::new(PyGraph {
         graph: Rc::new(RefCell::new(graph)),
         signature: RefCell::new(host_code.signature.clone()),
         // upstream `PyGraph.__init__`: `self.defaults =
@@ -173,8 +230,7 @@ fn build_host_function_from_rust_in_module(
         defaults: RefCell::new(Some(Vec::new())),
         access_directly: Cell::new(false),
         func: gf,
-    });
-    Ok((host, pygraph))
+    }))
 }
 
 /// File-aware sibling of [`build_host_function_from_rust`]: walk
@@ -216,7 +272,14 @@ pub fn build_host_function_from_rust_file(
     // the same id, mirroring upstream
     // `entry_point_a.__globals__ is entry_point_b.__globals__`
     // for two functions defined in the same Python module.
-    let module_id = register_rust_module_at(file, source_filename)?;
+    // Audit 1.2 (2026-05-08): walker now threads source_filename /
+    // source_text through to every walked fn's metadata, so the
+    // entry-point's `HostObject` registered in `module.__dict__`
+    // already carries the caller's source pair. We can drop the
+    // post-walk re-build and reuse the walker's host directly,
+    // mirroring upstream Python identity invariant
+    // `module.__dict__[entry] is caller.entry_point`.
+    let module_id = register_rust_module_at_with_source(file, source_filename, source_text)?;
 
     // Locate the entry-point fn. Upstream `interactive.py:14` takes
     // the function object directly; here the caller names it because
@@ -236,7 +299,35 @@ pub fn build_host_function_from_rust_file(
             ),
         })?;
 
-    build_host_function_from_rust_in_module(item_fn, module_id, source_filename, source_text)
+    // Audit 1.2 happy path: pass-2 of `register_rust_module_at_with_source`
+    // ran body lowering for every top-level `Item::Fn`, so when the
+    // body lowered successfully the resulting `HostObject` already
+    // sits in the module-globals registry under `entry_point_name`
+    // and its `PyGraph` is pinned in `HOST_RUST_PYGRAPHS`. Reuse
+    // both — that is the parity-orthodox identity invariant
+    // `module.__dict__[entry] is caller.entry_point`.
+    if let Some(ConstValue::HostObject(host)) = module_globals_lookup(module_id, entry_point_name)
+        && host.is_user_function()
+        && let Some(pygraph) = lookup_walker_pygraph(&host)
+    {
+        return Ok((host, pygraph));
+    }
+
+    // Walker miss: the body was un-lowerable during pass-2. Re-run
+    // the build directly so the caller receives the actual adapter
+    // error (e.g. `InvalidSignature`) rather than a generic "missing
+    // from registry" wrapper. This is the only path that mints a
+    // second `HostObject`; the post-walk re-build runs only on the
+    // failure trajectory and the registry has nothing usable to
+    // collide with.
+    build_host_function_from_rust_in_module(
+        item_fn,
+        module_id,
+        source_filename,
+        source_text,
+        None,
+        None,
+    )
 }
 
 /// Build a `HostObject::UserFunction` for `item_fn` carrying the
@@ -268,7 +359,14 @@ pub fn build_host_function_metadata_from_rust(
     // No walker pre-pass on the metadata-only path — module dict is
     // empty, matching upstream `func.__globals__ == {}` for a
     // function defined with no module bindings yet visible.
-    Ok(build_host_metadata_parts(item_fn, ModuleId::fresh(), source_filename, source_text)?.host)
+    Ok(build_host_metadata_parts(
+        item_fn,
+        ModuleId::fresh(),
+        source_filename,
+        source_text,
+        None,
+    )?
+    .host)
 }
 
 /// Walk a parsed Rust source `file` and register every top-level
@@ -286,44 +384,46 @@ pub fn build_host_function_metadata_from_rust(
 /// `module_globals_lookup` and return the registered value directly,
 /// matching upstream `flowcontext.py:847 w_globals.value[varname]`.
 ///
-/// ### Why no `Item::Fn`?
+/// ### `Item::Fn` registration (Slice O16)
 ///
 /// Upstream Python `def` populates `module.__dict__[name]` with a
-/// function object whose body lowering is deferred to
-/// `FunctionDesc.buildgraph` (`description.py:140`) at the first
-/// annotator-driven call site. The deferred lowering ALWAYS routes
-/// through `build_flow(GraphFunc)` which consumes Python bytecode
-/// from `func.__code__.co_code`.
+/// function object whose body is callable through the standard
+/// `LOAD_GLOBAL` → `simple_call` chain. The walker mirrors this:
+/// each top-level `Item::Fn` is eagerly lowered via
+/// `build_flow_from_rust_in_module`, and on success the resulting
+/// `HostObject::UserFunction` is registered under the fn's name.
+/// Sibling-fn calls in another fn's body (`fn caller() { helper() }`)
+/// then resolve through the registry as `Constant(HostObject)` and
+/// emit a clean `simple_call(<host>, args)` SpaceOperation.
 ///
-/// pyre's `HostCode` for an `Item::Fn` is constructed at
-/// `register.rs::build_host_metadata_parts` with **empty bytecode**
-/// (`CodeUnits::from(Vec::new())`) because the Rust-AST adapter is
-/// the only path that can actually lower the body. There is no
-/// connection from `FunctionDesc.buildgraph` back to
-/// `build_flow_from_rust` (the AST is not stored in `HostCode`,
-/// only the syntactic skeleton — `co_varnames` / `co_firstlineno` /
-/// `co_filename`). So a sibling-fn `HostObject` registered here
-/// would masquerade as a callable function but, on resolution, hand
-/// the annotator empty bytecode to "lower", silently producing a
-/// no-op graph or panicking.
+/// **Try-build-then-register-on-success**: when
+/// `build_flow_from_rust_in_module` rejects the body (e.g. `as T`
+/// cast — task #94, or other un-roadmapped constructs), the walker
+/// silently skips registration. The downstream resolver falls
+/// through to `Builder::resolve_path_constant`'s mint-or-fail path,
+/// matching the pre-O9 behavior for un-lowerable bodies.
 ///
-/// **PRE-EXISTING-ADAPTATION**: drop `Item::Fn` registration until
-/// the walker can either (a) eagerly build the
-/// `prebuilt_flow_graph` per Slice M2.5f and bind the registered
-/// `HostObject` to it, or (b) store the original `&syn::ItemFn` in
-/// a side table that `FunctionDesc.buildgraph` can consult. Both
-/// paths are multi-session work — see plan
-/// `~/.claude/plans/annotator-monomorphization-tier1-abstract-lake.md`
-/// (Phase M2.5g extern-Rust-helper registry walker epic). Until
-/// either lands, sibling fn name resolution falls through to the
-/// same mint-or-fail path that pre-O9 main exercised.
+/// **Forward references between sibling `Item::Fn`s resolve through
+/// the iterative pass-2 loop** (Slice O17). Pass 1 registers
+/// non-fn items in source order; pass 2 sweeps the deferred
+/// `Item::Fn` set repeatedly until no more registrations succeed.
+/// A caller-before-helper pattern (`fn caller() { helper() }`
+/// declared above `fn helper()`) takes two iterations: the first
+/// fails the caller (helper missing) and succeeds the helper; the
+/// second succeeds the caller against the now-registered helper.
+/// True mutual recursion between two un-otherwise-resolvable fns
+/// stays unregistered (no progress → loop terminates).
 ///
-/// The single entry-point fn that production callers actually want
-/// to lower is found directly via `file.items.iter().find_map(...)`
-/// in [`build_host_function_from_rust_file`] — that path bypasses
-/// the registry entirely and feeds the `&ItemFn` to
-/// `build_host_function_from_rust`, which DOES run the Rust-AST
-/// adapter and produce a real `prebuilt_flow_graph`.
+/// **Production-side double-build caveat**:
+/// [`build_host_function_from_rust_file`] calls
+/// [`register_rust_module_at`] FIRST (which now eagerly builds the
+/// entry-point fn during the walker pass) and then calls
+/// [`build_host_function_from_rust_in_module`] on the same fn to
+/// return a fresh `(HostObject, Rc<PyGraph>)`. The two builds
+/// produce distinct HostObjects whose qualnames are equal but
+/// whose underlying GraphFunc identities differ. Callers that compare
+/// the returned HostObject against a registry lookup must use
+/// qualname identity, not pointer identity.
 ///
 /// ### Re-registration semantics
 ///
@@ -374,10 +474,14 @@ pub fn build_host_function_metadata_from_rust(
 ///   `Builder::resolve_path_constant`'s mint-or-fail path at
 ///   call sites.
 ///
-/// Other `Item::*` kinds (`Item::Fn`, `Item::Use`, `Item::Mod`,
-/// `Item::Impl`, …) are silently skipped. `Item::Fn` for the
-/// parity reason above; the others as upstream-walker follow-ups
-/// (each populates `module.__dict__` at Python import time too).
+/// Other `Item::*` kinds (external-rooted `Item::Use`, generic
+/// `Item::Impl`, external `Item::Mod`, …) are silently skipped as
+/// upstream-walker follow-ups (each populates `module.__dict__` at
+/// Python import time too). Self-impl `Item::Impl` (Slice O18),
+/// trait `Item::Impl` (Slice O22), inline `Item::Mod` (Slices
+/// O19/O20), `Item::Fn` (Slices O16/O17), and local-rooted
+/// `Item::Use` (Slice O23 — single-segment alias / inline-mod
+/// cascade / group expansion / glob) ARE walked.
 /// **Immutable** `Item::Static` is admitted alongside `Item::Const`
 /// (Slice O12) — upstream Python's `module.__dict__` sees both
 /// shapes identically. `static mut FOO` is **NOT** registered
@@ -403,6 +507,782 @@ pub fn build_host_function_metadata_from_rust(
 /// behavior.
 pub fn register_rust_module(file: &File) -> Result<ModuleId, AdapterError> {
     register_rust_module_at(file, None)
+}
+
+/// Lifted from [`register_rust_module_at`] (Slice O18) so the inline-
+/// `Item::Mod` recursive helper [`register_items_into_namespace`]
+/// (Slice O20) can reuse the same shape. Carries a single self-impl
+/// method's `(target_class_path, method_name, body)` triple between
+/// pass 1 (collection) and pass 2 (lower-and-`class_set`).
+///
+/// Slice O24: `class_path` widened from `String` (single segment) to
+/// `Vec<String>` (1+ segments) so multi-segment self-types (`impl
+/// Trait for foo::Bar` where `foo` is a registered inline-mod
+/// namespace) cascade through [`try_resolve_use_path`] in pass 2.
+/// Length-1 paths preserve Slice O18 / O22 behavior; length-2+ paths
+/// add the inline-mod cascade pending external-crate / `crate::` /
+/// `super::` resolution (multi-session).
+struct DeferredImpl {
+    class_path: Vec<String>,
+    method_name: String,
+    item_fn: syn::ItemFn,
+}
+
+/// Slice O23: a single binding produced by flattening one `Item::Use`
+/// tree. Each leaf-level `UseTree::Name` / `UseTree::Rename` /
+/// `UseTree::Glob` becomes one or more `DeferredUse` entries
+/// (group expansion handled at flatten time). Resolution is deferred
+/// to the same pass-2 fixed-point loop that handles `Item::Fn`s and
+/// self-impl `Item::Impl`s so a `use foo::Bar` can pick up a sibling
+/// `mod foo { struct Bar; }` declared later in source order.
+///
+/// Mirrors Python `from x import y [as alias]`: each leaf adds one
+/// `module.__dict__[name] = x.y` binding (RPython parity through
+/// upstream `flowcontext.py:847 w_globals.value[varname]` reading
+/// the populated dict at `LOAD_GLOBAL` time).
+struct DeferredUse {
+    /// Local name to bind in the registry (or class dict for inner
+    /// mods). For `use foo::Bar` this is `"Bar"`; for `use foo::Bar
+    /// as Baz` this is `"Baz"`; for `use foo::*` this is empty (glob
+    /// expanded at resolution time, see [`UseKind::Glob`]).
+    binding_name: String,
+    /// Full path segments to resolve. For `use foo::Bar` this is
+    /// `["foo", "Bar"]`; for `use foo::*` this is `["foo"]` (the path
+    /// itself, the glob's contents come from cascading `class_dict_items`).
+    path_segments: Vec<String>,
+    /// `false` for `Name` / `Rename`, `true` for `Glob`. Glob
+    /// resolution iterates `path_segments`'s `class_dict_items` and
+    /// binds each entry under its original key (no rename — Python
+    /// `from x import *` parity).
+    glob: bool,
+}
+
+/// Slice O23: leading-segment classification for use-tree paths.
+///
+/// `Local` paths cascade through the local registry / namespace dict
+/// (single-session feasible). `External` paths root at `crate::`,
+/// `super::`, `self::`, or a well-known external crate root —
+/// resolution requires multi-file walking / external crate registry,
+/// so the use is silently skipped (matches Python's `ImportError`
+/// failing soft when the importing module re-runs and the name isn't
+/// available yet).
+enum UseRoot {
+    /// Path resolves through the local module's registry partition or
+    /// inline-mod namespace dict. The first segment is treated as a
+    /// top-level ident lookup; subsequent segments cascade via
+    /// `class_get`.
+    Local,
+    /// Path roots at `crate::` / `super::` / `self::` / leading-colon
+    /// / `std` / `core` / `alloc` / external workspace crates. Skipped
+    /// pending multi-file walker support.
+    External,
+}
+
+/// Recognise leading-segment idents that mark a use path as
+/// requiring multi-file resolution. Conservative match — accepts
+/// `crate` / `super` / `self` plus the well-known stdlib roots
+/// (`std`, `core`, `alloc`) and the project's external workspace
+/// crates (`pyre_object`, `pyre_jit`, `pyre_jit_trace`, `majit_*`,
+/// etc.). New external crates that crop up should be added here as
+/// they fail tests; no harm in over-skipping (failure mode is the
+/// pre-O23 behavior of falling through to `mint_unknown` / cascade
+/// resolution at call sites).
+fn classify_use_root(first_segment: &str) -> UseRoot {
+    let well_known_external = matches!(
+        first_segment,
+        "crate"
+            | "super"
+            | "self"
+            | "std"
+            | "core"
+            | "alloc"
+            | "pyre_object"
+            | "pyre_jit"
+            | "pyre_jit_trace"
+            | "pyre_interpreter"
+            | "pyre_module"
+            | "pyre_wasm"
+            | "pyrex"
+    ) || first_segment.starts_with("majit_");
+    well_known_external
+        .then_some(UseRoot::External)
+        .unwrap_or(UseRoot::Local)
+}
+
+/// Slice O23: flatten a `UseTree` into one or more [`DeferredUse`]
+/// entries. Recursive: `Path` extends the prefix, `Group` fans out,
+/// `Name` / `Rename` / `Glob` produce leaf entries.
+///
+/// Mirrors syn's UseTree variants:
+///
+/// - `UseTree::Name(name)` — `prefix::name` → `(name, prefix::name)`.
+/// - `UseTree::Rename(rename)` — `prefix::rename.ident as
+///   rename.rename` → `(rename.rename, prefix::rename.ident)`.
+/// - `UseTree::Path(path)` — extend prefix with `path.ident`,
+///   recurse into `path.tree`.
+/// - `UseTree::Group(group)` — recurse into each item with the same
+///   prefix.
+/// - `UseTree::Glob(_)` — emit a glob entry with `binding_name = ""`
+///   and `path_segments = prefix`.
+fn flatten_use_tree(tree: &syn::UseTree, prefix: Vec<String>, out: &mut Vec<DeferredUse>) {
+    match tree {
+        syn::UseTree::Name(name) => {
+            let n = name.ident.to_string();
+            let mut path = prefix;
+            path.push(n.clone());
+            out.push(DeferredUse {
+                binding_name: n,
+                path_segments: path,
+                glob: false,
+            });
+        }
+        syn::UseTree::Rename(rename) => {
+            let original = rename.ident.to_string();
+            let alias = rename.rename.to_string();
+            let mut path = prefix;
+            path.push(original);
+            out.push(DeferredUse {
+                binding_name: alias,
+                path_segments: path,
+                glob: false,
+            });
+        }
+        syn::UseTree::Path(path) => {
+            let mut new_prefix = prefix;
+            new_prefix.push(path.ident.to_string());
+            flatten_use_tree(&path.tree, new_prefix, out);
+        }
+        syn::UseTree::Group(group) => {
+            for item in &group.items {
+                flatten_use_tree(item, prefix.clone(), out);
+            }
+        }
+        syn::UseTree::Glob(_) => {
+            out.push(DeferredUse {
+                binding_name: String::new(),
+                path_segments: prefix,
+                glob: true,
+            });
+        }
+    }
+}
+
+/// Slice O23: cascade-resolve a single path through the local
+/// registry / namespace dict. Returns `Some(value)` on hit,
+/// `None` on miss (forward-ref retry candidate).
+///
+/// Mirrors upstream `flowcontext.py:861 LOAD_ATTR` →
+/// `op.getattr(w_obj, w_name).eval(self)`'s constfold step:
+/// each segment lookup is a `class_get` against the prior
+/// `HostObject::Class`. The initial segment lookup splits on
+/// whether the use is at module top level (`namespace=None`,
+/// hits the registry partition) or inside an inline mod
+/// (`namespace=Some`, hits the namespace's class dict).
+fn try_resolve_use_path(
+    segments: &[String],
+    module_id: ModuleId,
+    namespace: Option<&HostObject>,
+) -> Option<ConstValue> {
+    if segments.is_empty() {
+        return None;
+    }
+    let initial = match namespace {
+        Some(ns) => ns.class_get(&segments[0]),
+        None => module_globals_lookup(module_id, &segments[0]),
+    }?;
+    let mut current = initial;
+    for seg in &segments[1..] {
+        let next = match &current {
+            ConstValue::HostObject(h) => h.class_get(seg)?,
+            _ => return None,
+        };
+        current = next;
+    }
+    Some(current)
+}
+
+/// Slice O24: extract a target-class path from an `Item::Impl` self-
+/// type for the deferred-impl queue. Accepts `Type::Path` whose path
+/// has no `qself`, no leading colon, only lifetime-only per-segment
+/// generic args (Slice O25), and is rooted at a non-external first
+/// segment (per [`classify_use_root`]). Returns `None` for any other
+/// shape — the walker silently skips those impls (matches Slice
+/// O18's pre-O24 behavior of treating multi-segment / type-generic /
+/// external paths as out of scope).
+///
+/// Mirrors the input shape that [`try_resolve_use_path`] consumes,
+/// so pass 2 reuses the same cascade logic (Python parity:
+/// `getattr(getattr(getattr(module, "foo"), "bar"), "Baz")` for
+/// `foo::bar::Baz`).
+fn extract_impl_target_path(self_ty: &syn::Type) -> Option<Vec<String>> {
+    let tp = match self_ty {
+        syn::Type::Path(tp) => tp,
+        _ => return None,
+    };
+    if tp.qself.is_some() {
+        return None;
+    }
+    if tp.path.leading_colon.is_some() {
+        return None;
+    }
+    let mut segments = Vec::with_capacity(tp.path.segments.len());
+    for seg in &tp.path.segments {
+        if !is_lifetime_only_path_arguments(&seg.arguments) {
+            return None;
+        }
+        segments.push(seg.ident.to_string());
+    }
+    if segments.is_empty() {
+        return None;
+    }
+    if matches!(classify_use_root(&segments[0]), UseRoot::External) {
+        return None;
+    }
+    Some(segments)
+}
+
+/// Slice O25: a path-segment's `PathArguments` is "lifetime-only" if
+/// it carries no arguments (`PathArguments::None`) or only `Lifetime`
+/// args inside the angle brackets. Lifetimes have no Python parity
+/// (RPython lacks the borrow-checker concept), so the impl-target
+/// class identity for `Foo<'a>` is the same as `Foo` — the lifetime
+/// is purely a Rust-language adaptation that the walker drops at the
+/// adapter boundary. Type / const generic arguments still reject
+/// because they DO change the classdef identity (each
+/// instantiation = distinct classdef per
+/// `description.py:228-249 cachedgraph`); reification is a separate
+/// future slice.
+fn is_lifetime_only_path_arguments(args: &syn::PathArguments) -> bool {
+    match args {
+        syn::PathArguments::None => true,
+        syn::PathArguments::AngleBracketed(angled) => angled
+            .args
+            .iter()
+            .all(|a| matches!(a, syn::GenericArgument::Lifetime(_))),
+        syn::PathArguments::Parenthesized(_) => false,
+    }
+}
+
+/// Slice O25: an `Item::Impl`'s `generics` block is "lifetime-only"
+/// if every `GenericParam` is a `LifetimeParam` and the `where_clause`
+/// is either absent or contains only lifetime-bound predicates
+/// (`'a: 'b` shape). Type / const params reject because they need
+/// reification at impl-target time (separate future slice).
+///
+/// Mirrors the parity rationale of [`is_lifetime_only_path_arguments`]:
+/// `impl<'a> Trait for Foo<'a> { fn bar(&self) }` produces methods
+/// on the same `Foo` classdict as the non-generic `impl Trait for Foo
+/// { fn bar(&self) }` would — the `'a` carries no semantic the Python
+/// flow analysis observes.
+fn is_lifetime_only_generics(generics: &syn::Generics) -> bool {
+    if !generics
+        .params
+        .iter()
+        .all(|p| matches!(p, syn::GenericParam::Lifetime(_)))
+    {
+        return false;
+    }
+    if let Some(where_clause) = &generics.where_clause {
+        if !where_clause
+            .predicates
+            .iter()
+            .all(|p| matches!(p, syn::WherePredicate::Lifetime(_)))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Slice O20: recursive helper that walks `items` into the inline-mod
+/// `namespace` `HostObject::Class`, mirroring [`register_rust_module_at`]'s
+/// pass-1/pass-2 shape but redirecting the storage target from
+/// `register_module_global(module_id, …)` to `namespace.class_set(…)`.
+///
+/// Mirrors Python `mod foo: …` populating `mod.__dict__[name]` for
+/// every binding statement inside the mod body. Inner `Item::Mod`
+/// recursion lets `mod a { mod b { … } }` populate `a.b.<name>` via
+/// nested `class_set` calls; `Item::Fn` and self-impl `Item::Impl`
+/// inside the inner mod resolve their bodies and bind on the inner
+/// namespace's dict (NOT the outer module's globals — Rust scoping
+/// does not auto-import outer items into inner mods, so an `impl X`
+/// inside `mod foo` looks up `X` from `foo.__dict__` only).
+///
+/// Pass-2 fixed-point loop has the same termination bound as the
+/// outer walker: each iteration either makes progress (registers at
+/// least one fn / impl method) or exits via the no-progress check.
+///
+/// Const RHS evaluation runs in this mod's own scoped registry
+/// partition (`inner_const_scope`, freshly minted at entry): bare-
+/// name lookups that miss the per-mod `inner_bindings` do NOT fall
+/// through to the outer module's `module_globals_lookup` partition.
+/// Both Rust and Python require explicit `use super::X` to see
+/// outer items; the audit 1.4 fix retires the prior outer-fallback
+/// behavior so inner-mod const RHSes have the same scoping invariant
+/// as inner-mod fn bodies (`register_rust_module_inline_item_mod_inner_fn_does_not_see_outer_module_globals`).
+/// `super::` use trees are still classified `External` by
+/// `classify_use_root` (silently skipped pending multi-file walker),
+/// so this fix removes a leak rather than restricting any working
+/// use case.
+fn register_items_into_namespace<'a>(
+    namespace: &HostObject,
+    items: &'a [Item],
+    module_id: ModuleId,
+    source_filename: Option<&str>,
+    source_text: Option<&str>,
+) -> Result<(), AdapterError> {
+    // Inner-mod's own scoped const-eval partition (audit 1.4, 2026-05-08).
+    let inner_const_scope = ModuleId::fresh();
+    // Inner-mod's own module-globals registry partition (audit 1.3,
+    // 2026-05-08). Every `namespace.class_set(name, value)` mirror-
+    // registers `(name, value)` into this scope so inner-mod fn /
+    // impl-method metadata paths (`build_host_function_from_rust_in_module`
+    // → `build_host_metadata_parts`) snapshot the inner namespace's
+    // dict instead of the outer module's partition. Mirrors upstream
+    // Python `function.__globals__ = inner_mod.__dict__` for fns
+    // defined inside `mod foo: …`. Body-side `LOAD_GLOBAL` already
+    // routes through `func_globals: Some(namespace)` (Slice O21);
+    // this fix only closes the metadata divergence Issue 2.1's
+    // live re-snapshot reads through.
+    //
+    // The outer `module_id` parameter remains threaded through for
+    // bookkeeping that ties to the surrounding file (e.g. nested
+    // `register_items_into_namespace` recursion which mints its own
+    // fresh inner_module_scope at entry).
+    let inner_module_scope = ModuleId::fresh();
+    let mut inner_bindings: StdHashMap<String, ConstValue> = StdHashMap::new();
+    // Mirror helper: every namespace.class_set must also stamp the
+    // inner-mod registry partition so downstream metadata snapshots
+    // see the same content the body's class_get channel does.
+    let mirror_set = |name: &str, value: ConstValue| {
+        register_module_global(inner_module_scope, name, value.clone());
+        namespace.class_set(name, value);
+    };
+    let mut deferred_fns: Vec<&'a syn::ItemFn> = Vec::new();
+    let mut deferred_impls: Vec<DeferredImpl> = Vec::new();
+    let mut deferred_uses: Vec<DeferredUse> = Vec::new();
+    for inner in items {
+        match inner {
+            Item::Const(item_const) => {
+                let name = item_const.ident.to_string();
+                // Strict-parity (2026-05-10): propagate the full
+                // `eval_const_expr` outcome — including
+                // `AdapterError::Flowing` (NameError on unresolved
+                // single-segment Path) — exactly as the top-level
+                // `Item::Const` arm does at `register_rust_module_at`.
+                // Upstream `flowcontext.py:845 find_global` raises
+                // `FlowingError` after both globals and builtins miss;
+                // import-time const RHS surfaces that error directly.
+                // `inner_const_scope` (audit 1.4) is the per-mod
+                // ModuleId, so an outer ident only resolves through
+                // explicit `use super::X`. A bare miss is the
+                // parity-correct hard error.
+                if let Some(value) =
+                    eval_const_expr(&item_const.expr, &inner_bindings, inner_const_scope)?
+                {
+                    mirror_set(&name, value.clone());
+                    inner_bindings.insert(name, value);
+                }
+            }
+            Item::Static(item_static)
+                if matches!(item_static.mutability, syn::StaticMutability::None) =>
+            {
+                let name = item_static.ident.to_string();
+                if let Some(value) =
+                    eval_const_expr(&item_static.expr, &inner_bindings, inner_const_scope)?
+                {
+                    mirror_set(&name, value.clone());
+                    inner_bindings.insert(name, value);
+                }
+            }
+            Item::Enum(item_enum) => {
+                let name = item_enum.ident.to_string();
+                let host = build_host_class_from_enum(item_enum);
+                mirror_set(&name, ConstValue::HostObject(host));
+            }
+            Item::Struct(item_struct) => {
+                let name = item_struct.ident.to_string();
+                let host = build_host_class_from_struct(item_struct);
+                mirror_set(&name, ConstValue::HostObject(host));
+            }
+            Item::Fn(item_fn) => {
+                deferred_fns.push(item_fn);
+            }
+            Item::Mod(nested_item_mod) => {
+                let Some((_, nested_inner_items)) = &nested_item_mod.content else {
+                    continue;
+                };
+                let nested_name = nested_item_mod.ident.to_string();
+                let nested_namespace = HostObject::new_class(&nested_name, vec![]);
+                register_items_into_namespace(
+                    &nested_namespace,
+                    nested_inner_items,
+                    module_id,
+                    source_filename,
+                    source_text,
+                )?;
+                mirror_set(&nested_name, ConstValue::HostObject(nested_namespace));
+            }
+            // Slice O22 + O24 + O25: admit `impl Trait for Foo`
+            // alongside self-impl `impl Foo`, plus multi-segment
+            // self-types (`impl Trait for foo::Bar` where `foo` is a
+            // registered inline-mod, Slice O24) and lifetime-only
+            // generics (`impl<'a> Trait for Foo<'a>`, Slice O25).
+            // All shapes populate `<target>.classdict[method_name]`
+            // per upstream `classdesc.py:590-634 add_source_attribute`'s
+            // flat `self.classdict[name] = Constant(value)` assignment.
+            // The trait's identity is not consulted; closed-world
+            // dispatch through `bookkeeper.py:431-442 getmethoddesc`
+            // keys on `(originclassdef, name, …)`. Lifetime parameters
+            // carry no Python-observable semantic (RPython lacks the
+            // borrow concept) so `Foo<'a>` resolves to the same
+            // classdef as `Foo`.
+            //
+            // **PRE-EXISTING-ADAPTATION (trait-name namespace
+            // collapse).** Rust's trait method dispatch can
+            // disambiguate same-named methods from different traits
+            // (`<Foo as TraitA>::name` vs `<Foo as TraitB>::name`)
+            // through the trait identity carried in the call site.
+            // Upstream Python's flat class dict (`classdesc.py:590-634
+            // add_source_attribute`) cannot — it only knows
+            // `name → callable`. The walker therefore enforces
+            // convergence option (b): a *walker-time ban* on cross-
+            // trait method-name collisions, keyed on the resolved
+            // target `HostObject.identity_id()` so alias paths
+            // (`use a::Foo as X; use a::Foo as Y`) cannot sneak past
+            // the textual class-path key — see
+            // `seen_method_collisions` in both walkers (round-4
+            // 2026-05-11). Convergence option (a) — a trait-aware
+            // dispatch table keyed on `(trait_id, method_name)` — is
+            // still deferred (multi-session, no upstream basis) and
+            // would let two trait impls with the same method name
+            // coexist instead of erroring out. Today's closed-world
+            // `pyre-interpreter` codebase avoids such collisions so
+            // the ban surfaces as no observable regression.
+            //
+            // Type / const generic impls (`impl<T> Foo<T>`,
+            // `impl<E: Trait> X for E`) and external-rooted self-types
+            // (`impl Trait for crate::foo::Bar`) remain skipped —
+            // each is its own future slice (type-arg reification,
+            // cross-file resolution).
+            Item::Impl(item_impl) if is_lifetime_only_generics(&item_impl.generics) => {
+                let class_path = match extract_impl_target_path(&item_impl.self_ty) {
+                    Some(p) => p,
+                    None => continue,
+                };
+                for impl_item in &item_impl.items {
+                    if let syn::ImplItem::Fn(method) = impl_item {
+                        let method_name = method.sig.ident.to_string();
+                        let item_fn = syn::ItemFn {
+                            attrs: method.attrs.clone(),
+                            vis: method.vis.clone(),
+                            sig: method.sig.clone(),
+                            block: Box::new(method.block.clone()),
+                        };
+                        deferred_impls.push(DeferredImpl {
+                            class_path: class_path.clone(),
+                            method_name,
+                            item_fn,
+                        });
+                    }
+                }
+            }
+            // Slice O23: collect `Item::Use` bindings into the
+            // deferred queue. The pass-2 fixed-point loop retries
+            // them after every iteration's class / fn registrations
+            // so a `use foo::Bar` resolves once `mod foo { struct
+            // Bar; }` is registered (regardless of source order).
+            // Skip leading-`::` paths and paths rooted at well-known
+            // external prefixes (`crate::`, `super::`, `self::`,
+            // `std::`, `core::`, `alloc::`) — multi-file resolution
+            // is its own future slice.
+            Item::Use(item_use) => {
+                if item_use.leading_colon.is_some() {
+                    continue;
+                }
+                let mut staged: Vec<DeferredUse> = Vec::new();
+                flatten_use_tree(&item_use.tree, Vec::new(), &mut staged);
+                for du in staged {
+                    if du.path_segments.is_empty() {
+                        continue;
+                    }
+                    if matches!(classify_use_root(&du.path_segments[0]), UseRoot::External) {
+                        continue;
+                    }
+                    deferred_uses.push(du);
+                }
+            }
+            _ => {}
+        }
+    }
+    // Strict-parity (2026-05-11): pre-register every inner-mod fn's
+    // metadata-only host into the namespace dict BEFORE any body is
+    // lowered, mirroring the outer-walker pass-1 introduced by Issue 1.
+    // Forward references between inner-mod fns (`fn caller() {
+    // helper() }` ahead of `fn helper() { ... }`) need every sibling
+    // placeholder visible through `namespace.class_get(name)` at body
+    // lowering time so the body's `LOAD_GLOBAL helper` cascades through
+    // the inline-mod's class dict.
+    //
+    // Slice O21: pass `namespace` as `func_globals` so the inner-mod fn
+    // body's `LOAD_GLOBAL` lookups target the inline-mod's class dict
+    // (sibling fn / class / const) instead of the outer module's
+    // partition. Mirrors Python `function.__globals__ =
+    // inner_mod.__dict__`. `class_ = None`: inner-mod fns are
+    // module-scoped, not class-owned (audit 1.5 only stamps
+    // `GraphFunc.class_` for the impl-method path).
+    //
+    // Audit 1.3 (2026-05-08): pass `inner_module_scope` (not outer
+    // `module_id`) so `GraphFunc.module_globals_id` re-snapshots the
+    // inner namespace's dict rather than the outer module's partition.
+    //
+    // Audit 1.2 (2026-05-08): thread caller's source_filename /
+    // source_text into inner-mod fn metadata.
+    //
+    // `pending_inner_fns` carries the (name, host, gf, host_code,
+    // item_fn) tuple needed to retry `lower_body_into_pygraph` while
+    // keeping the host identity stable across iterations.
+    // `metadata_failed_fns` holds fns whose metadata extraction itself
+    // failed (e.g. arg-name extraction error); they fall back into
+    // `deferred_fns` as a residue set with no further retry. Fns whose
+    // bodies never lower keep their placeholder host in namespace dict
+    // — mirrors Python's import-time `def f` semantic where failure
+    // surfaces at later `buildflowgraph` time rather than at the
+    // walker pass.
+    let mut pending_inner_fns: Vec<(String, HostObject, GraphFunc, HostCode, &'a syn::ItemFn)> =
+        Vec::with_capacity(deferred_fns.len());
+    let mut metadata_failed_fns: Vec<&'a syn::ItemFn> = Vec::new();
+    for item_fn in deferred_fns.drain(..) {
+        let name = item_fn.sig.ident.to_string();
+        match build_host_metadata_parts(
+            item_fn,
+            inner_module_scope,
+            source_filename,
+            source_text,
+            None,
+        ) {
+            Ok(HostMetadataParts {
+                host,
+                host_code,
+                gf,
+            }) => {
+                mirror_set(&name, ConstValue::HostObject(host.clone()));
+                pending_inner_fns.push((name, host, gf, host_code, item_fn));
+            }
+            Err(_) => metadata_failed_fns.push(item_fn),
+        }
+    }
+    deferred_fns = metadata_failed_fns;
+
+    // Strict-parity (2026-05-11): impl-method handling splits into two
+    // phases — Phase A resolves the target class + builds metadata +
+    // `class_set`s the placeholder ONCE; Phase B retries body lowering
+    // with the host identity stable. `pending_inner_methods` carries
+    // the (host, gf, host_code, item_fn) tuple for Phase B. Methods
+    // whose target class never resolves stay in `deferred_impls` and
+    // never advance to Phase A.
+    let mut pending_inner_methods: Vec<(HostObject, GraphFunc, HostCode, syn::ItemFn)> = Vec::new();
+
+    // Strict-parity round-4 (2026-05-11): cross-trait method-name
+    // collision check, keyed on resolved HostObject identity. See
+    // outer-walker `seen_method_collisions` for the alias-path
+    // rationale; the inner-mod walker has the same exposure since
+    // `try_resolve_use_path` consults the namespace dict and a `use
+    // outer::Foo as X; use outer::Foo as Y;` cascade resolves both
+    // aliases to the same `Arc<HostObjectInner>`.
+    let mut seen_method_collisions: StdHashMap<(usize, String), Vec<String>> = StdHashMap::new();
+
+    loop {
+        let mut made_progress = false;
+
+        // Phase A (fns): retry pending bodies; host already in
+        // namespace dict from the pre-pass.
+        let mut still_pending_fns = Vec::with_capacity(pending_inner_fns.len());
+        for (name, host, gf, host_code, item_fn) in pending_inner_fns.drain(..) {
+            match lower_body_into_pygraph(
+                item_fn,
+                inner_module_scope,
+                Some(namespace),
+                gf.clone(),
+                &host_code,
+                source_text,
+            ) {
+                Ok(pygraph) => {
+                    clear_walker_error(&host);
+                    register_walker_pygraph(host, pygraph);
+                    made_progress = true;
+                }
+                Err(err) => {
+                    register_walker_error(host.clone(), err.to_string());
+                    still_pending_fns.push((name, host, gf, host_code, item_fn));
+                }
+            }
+        }
+        pending_inner_fns = still_pending_fns;
+
+        // Phase A (impls): for each unresolved impl, try resolving the
+        // target class. On success, build metadata + `class_set` the
+        // placeholder + push to `pending_inner_methods`. Inner-mod
+        // scoping (Slice O20 + O24) cascades the impl's target class
+        // path through the inline mod's own dict. An `impl X` inside
+        // `mod foo` that references an outer-module class without a
+        // matching inner declaration stays deferred — the outer-module
+        // scope is intentionally not consulted here.
+        //
+        // Slice O21: pass `namespace` as `func_globals` so the method
+        // body's `LOAD_GLOBAL` lookups target the inline-mod dict.
+        //
+        // Audit 1.5 (2026-05-08): pass the resolved target `class`
+        // through to `GraphFunc.class_` so the method's
+        // `HostObject::UserFunction` carries class-owned identity
+        // (mirrors upstream Python `func.class_` at `class Foo: def
+        // bar(self): ...`).
+        //
+        // Audit 1.3 (2026-05-08): pass `inner_module_scope` so
+        // `gf.module_globals_id` snapshots the inner namespace dict.
+        //
+        // Audit 1.2 (2026-05-08): thread caller's source_filename /
+        // source_text into the impl-method metadata.
+        let mut still_deferred_impls = Vec::with_capacity(deferred_impls.len());
+        for di in deferred_impls.drain(..) {
+            let class = match try_resolve_use_path(&di.class_path, module_id, Some(namespace)) {
+                Some(ConstValue::HostObject(h)) if h.is_class() => h,
+                _ => {
+                    still_deferred_impls.push(di);
+                    continue;
+                }
+            };
+            // Strict-parity round-4 (2026-05-11): identity-keyed
+            // collision check. See the outer-walker variant.
+            let collision_key = (class.identity_id(), di.method_name.clone());
+            if let Some(prior_path) = seen_method_collisions.get(&collision_key) {
+                return Err(AdapterError::Unsupported {
+                    reason: format!(
+                        "Cross-trait method-name collision on `{}::{}` \
+                         inside `mod {}`: a prior `impl … for {}` block \
+                         already wrote the method name into the flat \
+                         class dict (resolved host identity matches \
+                         across alias paths). Upstream \
+                         `classdesc.py:590-634 add_source_attribute` \
+                         has no trait-namespace channel; rename one \
+                         method or move the impls outside the inline mod.",
+                        di.class_path.join("::"),
+                        di.method_name,
+                        namespace.qualname(),
+                        prior_path.join("::"),
+                    ),
+                });
+            }
+            let parts = match build_host_metadata_parts(
+                &di.item_fn,
+                inner_module_scope,
+                source_filename,
+                source_text,
+                Some(class.clone()),
+            ) {
+                Ok(p) => p,
+                Err(_) => {
+                    still_deferred_impls.push(di);
+                    continue;
+                }
+            };
+            let HostMetadataParts {
+                host,
+                host_code,
+                gf,
+            } = parts;
+            seen_method_collisions.insert(collision_key, di.class_path.clone());
+            class.class_set(&di.method_name, ConstValue::HostObject(host.clone()));
+            pending_inner_methods.push((host, gf, host_code, di.item_fn));
+            made_progress = true;
+        }
+        deferred_impls = still_deferred_impls;
+
+        // Phase B (impls): retry pending method bodies; host already
+        // in class dict via the Phase A `class_set`.
+        let mut still_pending_methods = Vec::with_capacity(pending_inner_methods.len());
+        for (host, gf, host_code, item_fn) in pending_inner_methods.drain(..) {
+            match lower_body_into_pygraph(
+                &item_fn,
+                inner_module_scope,
+                Some(namespace),
+                gf.clone(),
+                &host_code,
+                source_text,
+            ) {
+                Ok(pygraph) => {
+                    clear_walker_error(&host);
+                    register_walker_pygraph(host, pygraph);
+                    made_progress = true;
+                }
+                Err(err) => {
+                    register_walker_error(host.clone(), err.to_string());
+                    still_pending_methods.push((host, gf, host_code, item_fn));
+                }
+            }
+        }
+        pending_inner_methods = still_pending_methods;
+
+        // Slice O23: retry deferred uses against the namespace dict.
+        // Each successful resolution binds `binding_name` →
+        // `resolved_value` via `class_set`; failure stays deferred
+        // (forward-ref retry next iteration). Mirrors Python
+        // `from x import y`: `module.__dict__["y"] = x.y` once `x.y`
+        // is resolvable.
+        let mut still_deferred_uses = Vec::with_capacity(deferred_uses.len());
+        for du in deferred_uses.drain(..) {
+            if du.glob {
+                let Some(ConstValue::HostObject(target)) =
+                    try_resolve_use_path(&du.path_segments, module_id, Some(namespace))
+                else {
+                    still_deferred_uses.push(du);
+                    continue;
+                };
+                if !target.is_class() {
+                    still_deferred_uses.push(du);
+                    continue;
+                }
+                // Strict-parity (2026-05-10): same import-star
+                // rule as the outer-module branch below. PyPy
+                // `import_all_from` skips leading-underscore names
+                // when the source object has no `__all__` analogue.
+                for (name, value) in target.class_dict_items() {
+                    if name.starts_with('_') {
+                        continue;
+                    }
+                    mirror_set(&name, value);
+                }
+                made_progress = true;
+                continue;
+            }
+            match try_resolve_use_path(&du.path_segments, module_id, Some(namespace)) {
+                Some(value) => {
+                    mirror_set(&du.binding_name, value);
+                    made_progress = true;
+                }
+                None => still_deferred_uses.push(du),
+            }
+        }
+        deferred_uses = still_deferred_uses;
+
+        if !made_progress
+            || (pending_inner_fns.is_empty()
+                && deferred_impls.is_empty()
+                && pending_inner_methods.is_empty()
+                && deferred_uses.is_empty())
+        {
+            break;
+        }
+    }
+    // `deferred_fns` (metadata-failed fns) and `pending_inner_fns` /
+    // `pending_inner_methods` residues whose bodies never lowered keep
+    // their placeholder hosts in the namespace / class dict — mirrors
+    // Python's import-time `def f` semantic where failure surfaces at
+    // later `buildflowgraph` time rather than at the walker pass.
+    let _ = deferred_fns;
+    let _ = pending_inner_fns;
+    let _ = pending_inner_methods;
+    Ok(())
 }
 
 /// Path-aware sibling of [`register_rust_module`]. When
@@ -452,6 +1332,26 @@ pub fn register_rust_module_at(
     file: &File,
     source_filename: Option<&str>,
 ) -> Result<ModuleId, AdapterError> {
+    register_rust_module_at_with_source(file, source_filename, None)
+}
+
+/// Audit 1.2 (2026-05-08) source-aware sibling of [`register_rust_module_at`].
+///
+/// Threads `source_filename` and `source_text` through to every
+/// `build_host_function_from_rust_in_module` call inside the walker
+/// so the resulting `GraphFunc.{filename, source}` of every walked fn
+/// carries the caller's source pair. The entry-point caller
+/// ([`build_host_function_from_rust_file`]) uses this to drop the
+/// post-walk re-build of the entry fn — it now looks up the
+/// walker-built `HostObject` + `PyGraph` from
+/// [`HOST_RUST_MODULE_GLOBALS`] and the walker pygraph registry,
+/// matching upstream Python `module.__dict__[entry] is
+/// caller.entry_point` identity.
+pub fn register_rust_module_at_with_source(
+    file: &File,
+    source_filename: Option<&str>,
+    source_text: Option<&str>,
+) -> Result<ModuleId, AdapterError> {
     let module_id = match source_filename {
         Some(path) => ModuleId::for_path(path),
         None => ModuleId::fresh(),
@@ -464,6 +1364,39 @@ pub fn register_rust_module_at(
     // X + 1`) resolve their forward dependencies through prior
     // entries.
     let mut const_bindings: StdHashMap<String, ConstValue> = StdHashMap::new();
+    // Two-pass walker (Slice O17): pass 1 registers `Item::Enum`,
+    // `Item::Struct`, `Item::Const`, `Item::Static` in source order.
+    // `Item::Fn` entries are collected into `deferred_fns` and
+    // resolved by an iterative pass-2 fixed-point loop below — this
+    // lets a fn earlier in source resolve a sibling fn declared
+    // later, mirroring upstream Python where module-import populates
+    // `module.__dict__` for every `def` before any function body
+    // actually runs (`flowcontext.py:847 w_globals.value[varname]`
+    // sees all sibling defs at lookup time).
+    let mut deferred_fns: Vec<&syn::ItemFn> = Vec::new();
+    // Slice O18 + Slice O22: `Item::Impl` for self-impl blocks
+    // (`impl Foo { … }`) AND trait impl blocks (`impl Trait for Foo
+    // { … }`) both add methods / associated fns into the target
+    // class's dict. Pass 1 collects each method into
+    // `deferred_impls`; pass 2 (alongside the `Item::Fn` sweep)
+    // tries to lower the body and call `class_set(method_name, ...)`
+    // on the resolved class. The class lookup is deferred to pass 2
+    // so an `impl Foo { … }` block declared above its `struct Foo {}`
+    // still resolves.
+    //
+    // Trait impls are treated identically to self-impls per upstream
+    // `classdesc.py:590-634 add_source_attribute`'s flat
+    // `self.classdict[name] = Constant(value)` shape — the trait
+    // identity is not consulted because closed-world dispatch through
+    // `bookkeeper.py:431-442 getmethoddesc` keys on
+    // `(originclassdef, name, …)`, not on the trait that defined
+    // the method.
+    let mut deferred_impls: Vec<DeferredImpl> = Vec::new();
+    // Slice O23: queue `Item::Use` bindings for the same pass-2
+    // fixed-point loop. Each iteration retries each unresolved use
+    // against the registry partition; mirrors Python's `from x import
+    // y` adding `module.__dict__["y"] = x.y` once `x.y` is in scope.
+    let mut deferred_uses: Vec<DeferredUse> = Vec::new();
     for item in &file.items {
         match item {
             Item::Enum(item_enum) => {
@@ -565,6 +1498,145 @@ pub fn register_rust_module_at(
                     const_bindings.insert(name, value);
                 }
             }
+            // `fn name(...) -> ... { ... }` — collect for pass 2.
+            // Mirrors Python `def name(...): ...` populating
+            // `module.__dict__[name]` with a function object; the
+            // iterative pass-2 loop below resolves both straight-line
+            // helper-before-caller and forward-ref helper-after-caller
+            // patterns.
+            Item::Fn(item_fn) => {
+                deferred_fns.push(item_fn);
+            }
+            // `mod foo { ... }` (Slice O19 / O20) — inline submodule.
+            // Inner items register on a fresh `HostObject::Class`
+            // namespace; the namespace is bound at the outer
+            // module's top level under the mod's ident. Mirrors
+            // Python `import foo` populating
+            // `module.__dict__["foo"]` with a module object whose
+            // attribute access (`foo.A`) traverses the inner
+            // namespace's dict — pyre's existing path-cascade
+            // resolver (`build_flow.rs::resolve_path_constant`)
+            // already handles `foo::A` by recursively `getattr`-ing
+            // along the segment chain.
+            //
+            // External `mod foo;` (no body) is silently skipped —
+            // resolving the file system is out of scope for this
+            // slice.
+            //
+            // Scope (Slice O20 widening): inner `Item::Const` /
+            // `Item::Static` / `Item::Enum` / `Item::Struct` /
+            // `Item::Fn` (with try-build-then-`class_set`-on-success)
+            // / self-impl `Item::Impl` (single bare ident self-type,
+            // no generics, no trait) / nested `Item::Mod`
+            // (recursive). Inner non-self impl variants
+            // (`impl Trait for X`, generic `impl<T> X<T>`) are
+            // skipped, mirroring the outer walker.
+            //
+            // Inner const evaluation uses a per-mod source-order
+            // bindings dict so consts within the mod resolve each
+            // other's forward refs; the outer module's
+            // `const_bindings` is not threaded in because Rust
+            // scoping does not auto-import outer items into inner
+            // mods (`use super::X` path resolution is its own
+            // future slice).
+            Item::Mod(item_mod) => {
+                let Some((_, inner_items)) = &item_mod.content else {
+                    continue;
+                };
+                let mod_name = item_mod.ident.to_string();
+                let namespace = HostObject::new_class(&mod_name, vec![]);
+                register_items_into_namespace(
+                    &namespace,
+                    inner_items,
+                    module_id,
+                    source_filename,
+                    source_text,
+                )?;
+                register_module_global(module_id, &mod_name, ConstValue::HostObject(namespace));
+            }
+            // `impl Foo { fn bar(...) { ... } ... }` (Slice O18) +
+            // `impl Trait for Foo { fn bar(...) { ... } ... }`
+            // (Slice O22) — both shapes contribute methods to the
+            // target class's dict. Mirrors upstream
+            // `classdesc.py:590-634 add_source_attribute`'s
+            // `self.classdict[name] = Constant(value)` flat
+            // assignment: RPython populates the class dict regardless
+            // of whether the method comes from a base class through
+            // inheritance, because `lookup_filter`
+            // (`classdesc.py:336-374`) does the subclass-aware
+            // filtering at lookup time. Closed-world dispatch
+            // (`bookkeeper.py:431-442 getmethoddesc` keys on
+            // `(originclassdef, name, …)`, not on the trait that
+            // defined the method) means trait identity is not
+            // consulted here.
+            //
+            // Slice O24 widens self-type to multi-segment paths
+            // (`impl Trait for foo::Bar` cascades through the
+            // inline-mod namespace dict). Slice O25 widens generics
+            // to lifetime-only (`impl<'a> Trait for Foo<'a>` —
+            // lifetimes have no Python parity, the impl-target class
+            // is identical to the non-generic shape).
+            //
+            // Type / const generic impls (`impl<T> Foo<T>`,
+            // `impl<E: Trait> X for E`) and external-rooted self-types
+            // (`impl Trait for crate::foo::Bar`) remain skipped —
+            // each is its own future slice (type-arg reification,
+            // cross-file resolution).
+            Item::Impl(item_impl) if is_lifetime_only_generics(&item_impl.generics) => {
+                let class_path = match extract_impl_target_path(&item_impl.self_ty) {
+                    Some(p) => p,
+                    None => continue,
+                };
+                for impl_item in &item_impl.items {
+                    if let syn::ImplItem::Fn(method) = impl_item {
+                        let method_name = method.sig.ident.to_string();
+                        // Convert ImplItemFn to ItemFn so it can flow
+                        // through `build_host_function_from_rust_in_module`.
+                        // Both shapes carry the same fields
+                        // (`attrs` / `vis` / `sig` / `block`); the
+                        // conversion is structural.
+                        let item_fn = syn::ItemFn {
+                            attrs: method.attrs.clone(),
+                            vis: method.vis.clone(),
+                            sig: method.sig.clone(),
+                            block: Box::new(method.block.clone()),
+                        };
+                        deferred_impls.push(DeferredImpl {
+                            class_path: class_path.clone(),
+                            method_name,
+                            item_fn,
+                        });
+                    }
+                }
+            }
+            // Slice O23: `Item::Use` queues bindings for the pass-2
+            // fixed-point loop. Mirrors Python `from x import y`:
+            // `module.__dict__["y"] = x.y` once `x.y` is in scope.
+            // Skip leading-`::`-rooted paths (`::std::result::Result`)
+            // and well-known external prefixes (`crate::`, `super::`,
+            // `self::`, `std::`, `core::`, `alloc::`) — multi-file /
+            // external-crate resolution is its own future slice.
+            // Glob imports (`use foo::*`) ARE handled: the path
+            // resolves to a `HostObject::Class` namespace and every
+            // entry of `class_dict_items` is mirrored into the
+            // current registry partition (mirrors Python `from x
+            // import *` copying every public name).
+            Item::Use(item_use) => {
+                if item_use.leading_colon.is_some() {
+                    continue;
+                }
+                let mut staged: Vec<DeferredUse> = Vec::new();
+                flatten_use_tree(&item_use.tree, Vec::new(), &mut staged);
+                for du in staged {
+                    if du.path_segments.is_empty() {
+                        continue;
+                    }
+                    if matches!(classify_use_root(&du.path_segments[0]), UseRoot::External) {
+                        continue;
+                    }
+                    deferred_uses.push(du);
+                }
+            }
             _ => {
                 // PRE-EXISTING-ADAPTATION (Issue 2.3): walker
                 // coverage is incomplete vs upstream
@@ -574,31 +1646,343 @@ pub fn register_rust_module_at(
                 // `from ... import ...`, nested `import`, …).
                 // Currently skipped:
                 //
-                // - **`Item::Fn`** — see "Why no Item::Fn?" doc on
-                //   this fn for the parity reason; convergence is
-                //   the M2.5g side-table walker epic.
-                // - **`Item::Use`** — re-export of another item's
-                //   binding. Upstream Python's `from x import y`
-                //   binds `module.__dict__["y"]` to the imported
-                //   value. Walker dispatch needs cross-file lookup
+                // - **`Item::Use` rooted at external prefixes**
+                //   (`crate::`, `super::`, `self::`, `std::`,
+                //   `core::`, `alloc::`, leading-`::`) — these need
+                //   cross-file / external-crate registry resolution
                 //   (which itself depends on per-module scoping —
-                //   see Issue 1.3).
-                // - **`Item::Mod`** — submodule. Upstream
-                //   `import x.y` binds `module.__dict__["x"]` to
-                //   the submodule. Walker dispatch needs nested
-                //   walking + module-object construction.
-                // - **`Item::Impl`** — Rust associates methods with
-                //   the type via `impl Foo { fn bar(&self) {} }`
-                //   instead of putting them in the class dict like
-                //   Python's `class Foo: def bar(self): ...`. The
-                //   walker needs to redirect `bar` into the
-                //   already-registered `Foo` class's class dict.
+                //   see Issue 1.3). Local-rooted `use` (single-
+                //   segment alias / inline-mod cascade / group
+                //   expansion / glob) IS walked by Slice O23 —
+                //   bindings register via `module.__dict__[name] =
+                //   value` per upstream `flowcontext.py:847
+                //   w_globals.value[varname]`.
+                // - **External `Item::Mod`** (file-system `mod foo;`)
+                //   — file-system resolution is out of scope. Inline
+                //   `mod foo { ... }` blocks ARE walked by Slices
+                //   O19 / O20 (see the `Item::Mod` arm above).
+                // - **`Item::Impl` (generic impls /
+                //   external-rooted self-types)** — generic impls
+                //   (`impl<T> Foo<T>`, `impl<E: Trait> X for E`)
+                //   require generic-arg reification (its own future
+                //   slice). External-rooted self-types
+                //   (`impl Trait for crate::foo::Bar`,
+                //   `impl Trait for ::leading::Anchor`) need cross-
+                //   file / external-crate registry resolution
+                //   (multi-session, see Issue 1.3). Self-impl blocks
+                //   (`impl Foo { fn bar() {} }`, Slice O18) +
+                //   trait impls (`impl Trait for Foo { fn bar() {} }`,
+                //   Slice O22) + multi-segment local-rooted
+                //   self-types (`impl Trait for foo::Bar` where
+                //   `foo` is a registered inline-mod, Slice O24) ARE
+                //   walked — methods become `class.class_set(name,
+                //   …)` entries paralleling Python's `class Foo:
+                //   def bar(self): ...` populating
+                //   `Foo.__dict__["bar"]` per upstream
+                //   `classdesc.py:590-634 add_source_attribute`.
+                //   Trait identity is not consulted: closed-world
+                //   dispatch through `bookkeeper.py:431-442
+                //   getmethoddesc` keys on `(originclassdef, name,
+                //   …)`, not on the trait that defined the method.
                 //
                 // Each follow-up slice extends this dispatch match
                 // without changing the call sites.
             }
         }
     }
+
+    // Strict-parity Issue 1 pre-pass (2026-05-08): register every
+    // deferred fn's metadata-only host into `module.__dict__` BEFORE
+    // any body is lowered. Mirrors upstream Python's import-time
+    // `def f` populating module dict ahead of flow analysis
+    // (`flowcontext.py:847 find_global` reads live module dict). With
+    // every sibling host already in place, body lowering supports
+    // direct recursion (`fn f() { f() }`) AND mutual recursion
+    // (`A` calls `B`, `B` calls `A`). Outer-module fns: `__globals__`
+    // IS the module dict, so the body lowering passes `None` for
+    // func_globals and lookups hit the partition keyed on
+    // `module_id`. `class_ = None`: top-level fns are module-scoped
+    // (audit 1.5).
+    //
+    // Audit 1.2: caller's `source_filename` / `source_text` are
+    // threaded so the entry-point path can re-use this walker-built
+    // host instead of re-building. When the caller passes `None`
+    // (e.g. `register_rust_module(file)` fixtures), the legacy
+    // empty-source behavior is preserved.
+    //
+    // `pending_fns` carries the (name, host, gf, host_code, item_fn)
+    // tuple needed by `lower_body_into_pygraph` for each placeholder.
+    // `metadata_failed` holds fns whose metadata extraction itself
+    // failed (e.g. arg-name extraction error); they go back into
+    // `deferred_fns` (which from this point is treated as a residue
+    // set — the iterative loop below does not retry them since the
+    // pre-register pass is one-shot). Fns whose bodies never lower
+    // keep their placeholder host in module dict — the post-loop pass
+    // does not roll them back, mirroring Python's import-time `def f`
+    // semantic where failure surfaces at later `buildflowgraph` time
+    // rather than at the walker pass.
+    let mut pending_fns: Vec<(String, HostObject, GraphFunc, HostCode, &syn::ItemFn)> =
+        Vec::with_capacity(deferred_fns.len());
+    let mut metadata_failed: Vec<&syn::ItemFn> = Vec::new();
+    for item_fn in deferred_fns.drain(..) {
+        let name = item_fn.sig.ident.to_string();
+        match build_host_metadata_parts(item_fn, module_id, source_filename, source_text, None) {
+            Ok(HostMetadataParts {
+                host,
+                host_code,
+                gf,
+            }) => {
+                register_module_global(module_id, &name, ConstValue::HostObject(host.clone()));
+                pending_fns.push((name, host, gf, host_code, item_fn));
+            }
+            Err(_) => metadata_failed.push(item_fn),
+        }
+    }
+    deferred_fns = metadata_failed;
+
+    // Strict-parity (2026-05-11): impl-method handling splits into two
+    // phases mirroring the inner walker. Phase A resolves the target
+    // class + builds metadata + `class_set`s the placeholder ONCE;
+    // Phase B retries body lowering with the host identity stable
+    // across iterations. `pending_methods` carries the (host, gf,
+    // host_code, item_fn) tuple for Phase B. Methods whose target
+    // class never resolves stay in `deferred_impls` and never advance
+    // to Phase A. Forward references between sibling methods on the
+    // same class (`fn caller() { self.helper() }` ahead of `fn
+    // helper(&self) { ... }`) need every sibling placeholder visible
+    // through `class.class_get(name)` at body lowering time.
+    let mut pending_methods: Vec<(HostObject, GraphFunc, HostCode, syn::ItemFn)> = Vec::new();
+
+    // Strict-parity round-4 (2026-05-11): cross-trait method-name
+    // collision check, keyed on the *resolved* target HostObject
+    // identity rather than the textual `class_path` from
+    // `extract_impl_target_path`. Two `use a::Foo as X; use a::Foo as
+    // Y; impl TraitA for X { fn name … } impl TraitB for Y { fn
+    // name … }` resolve `["X"]` and `["Y"]` through
+    // `try_resolve_use_path` to the *same* `Arc<HostObjectInner>`
+    // (`identity_id() == Arc::as_ptr(&inner) as usize`); a textual
+    // key would miss the alias and let the second `class_set`
+    // silently overwrite the first's entry, losing dispatch identity.
+    // The check therefore lives inside the Phase A resolution loop
+    // (after `try_resolve_use_path` succeeds, before metadata build).
+    // Map value carries the diagnostic class-path of the first
+    // sighting so the error message names both colliding paths.
+    let mut seen_method_collisions: StdHashMap<(usize, String), Vec<String>> = StdHashMap::new();
+
+    // Pass 2 (Slice O17 + Issue 1 retrofit): iteratively lower
+    // bodies, resolve impls and uses until no more progress is made.
+    // Each iteration retries every still-pending fn body — failures
+    // leave the placeholder host in module dict for the next
+    // iteration so a downstream impl/use sweep can resolve a
+    // transitive dependency. Loop terminates when a full sweep
+    // yields zero registrations.
+    //
+    // Bound: each iteration consumes at least one pending entry on
+    // success or exits via the no-progress check, so the loop runs
+    // at most `pending_fns.len() + deferred_impls.len() +
+    // deferred_uses.len() + 1` iterations.
+    loop {
+        let mut made_progress = false;
+        let mut still_pending = Vec::with_capacity(pending_fns.len());
+        for (name, host, gf, host_code, item_fn) in pending_fns.drain(..) {
+            match lower_body_into_pygraph(
+                item_fn,
+                module_id,
+                None,
+                gf.clone(),
+                &host_code,
+                source_text,
+            ) {
+                Ok(pygraph) => {
+                    clear_walker_error(&host);
+                    register_walker_pygraph(host, pygraph);
+                    made_progress = true;
+                }
+                Err(err) => {
+                    register_walker_error(host.clone(), err.to_string());
+                    still_pending.push((name, host, gf, host_code, item_fn));
+                }
+            }
+        }
+        pending_fns = still_pending;
+
+        // Phase A (impls): for each unresolved impl, try resolving
+        // the target class. On success, build metadata + `class_set`
+        // the placeholder + push to `pending_methods`. Slice O18 +
+        // O24: each method needs (a) the target class path resolvable
+        // through the registry partition (single segment) or via
+        // inline-mod cascade (multi-segment, Slice O24) to a
+        // `HostObject::Class` and (b) its body to lower cleanly.
+        // Successful entries `class.class_set(method_name, <host>)`
+        // to add the method to the class dict — mirrors Python `class
+        // Foo: def bar(self): ...` populating `Foo.__dict__["bar"]`.
+        // Methods whose target class never resolves (`impl Bar { … }`
+        // where `Bar` is absent or not a class) stay deferred but
+        // never make progress, so the loop termination condition
+        // still bounds them.
+        //
+        // Audit 1.5 (2026-05-08): thread the resolved target `class`
+        // so `GraphFunc.class_` carries class-owned identity for the
+        // impl method (mirrors upstream `func.class_` at `class Foo:
+        // def bar(self): ...`).
+        //
+        // Audit 1.2 (2026-05-08): same caller source_filename /
+        // source_text threading as the deferred_fn loop above.
+        let mut still_deferred_impls = Vec::with_capacity(deferred_impls.len());
+        for di in deferred_impls.drain(..) {
+            let class = match try_resolve_use_path(&di.class_path, module_id, None) {
+                Some(ConstValue::HostObject(h)) if h.is_class() => h,
+                _ => {
+                    still_deferred_impls.push(di);
+                    continue;
+                }
+            };
+            // Strict-parity round-4 (2026-05-11): collision check on
+            // the resolved HostObject identity. See
+            // `seen_method_collisions` declaration above for why the
+            // textual `class_path` key is insufficient.
+            let collision_key = (class.identity_id(), di.method_name.clone());
+            if let Some(prior_path) = seen_method_collisions.get(&collision_key) {
+                return Err(AdapterError::Unsupported {
+                    reason: format!(
+                        "Cross-trait method-name collision on `{}::{}`: \
+                         a prior `impl … for {}` block already wrote the \
+                         method name into the flat class dict (resolved \
+                         host identity matches across alias paths). \
+                         Upstream `classdesc.py:590-634 \
+                         add_source_attribute` has no trait-namespace \
+                         channel; rename one method or move the impls \
+                         into separate files.",
+                        di.class_path.join("::"),
+                        di.method_name,
+                        prior_path.join("::"),
+                    ),
+                });
+            }
+            let parts = match build_host_metadata_parts(
+                &di.item_fn,
+                module_id,
+                source_filename,
+                source_text,
+                Some(class.clone()),
+            ) {
+                Ok(p) => p,
+                Err(_) => {
+                    still_deferred_impls.push(di);
+                    continue;
+                }
+            };
+            let HostMetadataParts {
+                host,
+                host_code,
+                gf,
+            } = parts;
+            seen_method_collisions.insert(collision_key, di.class_path.clone());
+            class.class_set(&di.method_name, ConstValue::HostObject(host.clone()));
+            pending_methods.push((host, gf, host_code, di.item_fn));
+            made_progress = true;
+        }
+        deferred_impls = still_deferred_impls;
+
+        // Phase B (impls): retry pending method bodies; host already
+        // in class dict via the Phase A `class_set`.
+        let mut still_pending_methods = Vec::with_capacity(pending_methods.len());
+        for (host, gf, host_code, item_fn) in pending_methods.drain(..) {
+            match lower_body_into_pygraph(
+                &item_fn,
+                module_id,
+                None,
+                gf.clone(),
+                &host_code,
+                source_text,
+            ) {
+                Ok(pygraph) => {
+                    clear_walker_error(&host);
+                    register_walker_pygraph(host, pygraph);
+                    made_progress = true;
+                }
+                Err(err) => {
+                    register_walker_error(host.clone(), err.to_string());
+                    still_pending_methods.push((host, gf, host_code, item_fn));
+                }
+            }
+        }
+        pending_methods = still_pending_methods;
+
+        // Slice O23: retry deferred uses against the registry
+        // partition. Each successful resolution `register_module_global`s
+        // `binding_name` → `resolved_value`; failure stays deferred.
+        // Mirrors Python `from x import y`: `module.__dict__["y"] =
+        // x.y` once `x.y` is resolvable.
+        let mut still_deferred_uses = Vec::with_capacity(deferred_uses.len());
+        for du in deferred_uses.drain(..) {
+            if du.glob {
+                let Some(ConstValue::HostObject(target)) =
+                    try_resolve_use_path(&du.path_segments, module_id, None)
+                else {
+                    still_deferred_uses.push(du);
+                    continue;
+                };
+                if !target.is_class() {
+                    still_deferred_uses.push(du);
+                    continue;
+                }
+                // Strict-parity (2026-05-10): mirror Python `from foo
+                // import *` which skips leading-underscore names when
+                // the source module has no `__all__`
+                // (`pyopcode.py:2221 import_star_skip_underscore`). Rust
+                // glob import has different visibility semantics, but
+                // the comment above explicitly claims `from x import *`
+                // parity, so honour the underscore filter to match
+                // upstream's import-star semantic in absence of an
+                // `__all__` analogue.
+                for (name, value) in target.class_dict_items() {
+                    if name.starts_with('_') {
+                        continue;
+                    }
+                    register_module_global(module_id, &name, value);
+                }
+                made_progress = true;
+                continue;
+            }
+            match try_resolve_use_path(&du.path_segments, module_id, None) {
+                Some(value) => {
+                    register_module_global(module_id, &du.binding_name, value);
+                    made_progress = true;
+                }
+                None => still_deferred_uses.push(du),
+            }
+        }
+        deferred_uses = still_deferred_uses;
+
+        if !made_progress
+            || (pending_fns.is_empty()
+                && deferred_fns.is_empty()
+                && deferred_impls.is_empty()
+                && pending_methods.is_empty()
+                && deferred_uses.is_empty())
+        {
+            break;
+        }
+    }
+
+    // Strict-parity (2026-05-09): a fn whose body never lowered keeps
+    // its pre-registered placeholder host in `module.__dict__`. Mirrors
+    // upstream Python's `def f` populating the module dict at import
+    // time regardless of any later flow-analysis state — failure
+    // surfaces lazily when a caller actually invokes
+    // `buildflowgraph(callee)` on that host and finds no PyGraph
+    // attached, not at walker time. Rolling back the placeholder would
+    // diverge: a sibling fn that already captured the placeholder via
+    // `LOAD_GLOBAL` during its own body lowering would point at a host
+    // that is no longer present in the live module dict.
+    //
+    // `pending_methods` residue carries the same semantic for impl
+    // methods whose body never lowered: the `class_set` placeholder
+    // stays in the class dict and `buildflowgraph` reports the empty
+    // `co_code` lazily.
+    let _ = pending_fns;
+    let _ = pending_methods;
     Ok(module_id)
 }
 
@@ -1497,6 +2881,7 @@ fn build_host_metadata_parts(
     module_id: ModuleId,
     source_filename: Option<&str>,
     source_text: Option<&str>,
+    class_: Option<HostObject>,
 ) -> Result<HostMetadataParts, AdapterError> {
     let argnames = extract_argnames(item_fn)?;
     let name = item_fn.sig.ident.to_string();
@@ -1592,6 +2977,16 @@ fn build_host_metadata_parts(
     if let Some(src) = source_text {
         gf.source = Some(src.to_owned());
     }
+    // Audit 1.5 (2026-05-08): when the caller is the impl-method
+    // deferred path, thread the resolved target class through to
+    // `GraphFunc.class_` so downstream consumers see method-owned
+    // identity. Mirrors upstream Python `Foo.bar.__self_class__`
+    // / `func.class_` set at `class Foo: def bar(self): ...`
+    // creation time. `None` for non-impl paths (regular fns,
+    // entry-point fns, inner-mod siblings) keeps the legacy
+    // shape — class-less fns have no owner and upstream's
+    // `func.class_` defaults to absent.
+    gf.class_ = class_;
     let host = HostObject::new_user_function(gf.clone());
     Ok(HostMetadataParts {
         host,
@@ -1944,61 +3339,1911 @@ mod tests {
     }
 
     #[test]
-    fn register_rust_module_does_not_register_item_fn() {
-        // PRE-EXISTING-ADAPTATION (Issue 1.2 fix): top-level
-        // `Item::Fn` is INTENTIONALLY NOT registered into the
-        // module-globals registry. Upstream Python `def` would bind
-        // a function object whose `func.__code__.co_code` carries the
-        // body — `FunctionDesc.buildgraph` (`description.py:140`)
-        // calls `build_flow(GraphFunc)` to lower it on first call.
+    fn register_rust_module_registers_item_fn_on_successful_body_lowering() {
+        // Slice O16: top-level `Item::Fn` whose body lowers cleanly
+        // through `build_flow_from_rust_in_module` is registered as
+        // `HostObject::UserFunction` carrying a `prebuilt_flow_graph`.
+        // Mirrors upstream Python `def name(): ...` populating
+        // `module.__dict__[name]` with a callable function object
+        // (`flowcontext.py:847 w_globals.value[varname]`).
         //
-        // pyre's `HostCode` for an `Item::Fn` is built with empty
-        // bytecode (`build_host_metadata_parts` →
-        // `CodeUnits::from(Vec::new())`) because the Rust-AST adapter
-        // is the only path that lowers Rust source. There is no
-        // wire-back from `FunctionDesc.buildgraph` to
-        // `build_flow_from_rust`, so a registered sibling-fn
-        // `HostObject` would masquerade as callable but supply
-        // empty bytecode at lowering time. Until the walker can
-        // either eagerly build the prebuilt graph (Slice M2.5f) or
-        // store the AST in a side table for later replay (M2.5g),
-        // we leave sibling fns unresolved — same shape pre-O9 main
-        // exhibited.
-        //
-        // The single entry-point fn that production callers want is
-        // located directly via `file.items.iter().find_map(...)` in
-        // `build_host_function_from_rust_file`, bypassing the
-        // registry entirely. So this opt-out is invisible to the
-        // production path.
+        // The eager-build approach uses Slice M2.5f's
+        // `prebuilt_flow_graph` mechanism so downstream resolution
+        // gets a real graph, not the empty bytecode that motivated
+        // the prior Issue 1.2 PRE-EXISTING-ADAPTATION skip. Bodies
+        // the lowerer rejects (covered by
+        // `register_rust_module_skip_extends_to_unsupported_bodies`)
+        // remain unregistered, falling through to the resolver's
+        // mint-or-fail path.
 
         let src = "fn parity_probe_walker_alpha() -> i64 { 1 }
                    fn parity_probe_walker_beta(a: i64) -> i64 { a }";
         let file = syn::parse_file(src).expect("file fixture parses");
         let module_id = register_rust_module(&file).expect("walker must succeed");
 
+        for name in ["parity_probe_walker_alpha", "parity_probe_walker_beta"] {
+            match module_globals_lookup(module_id, name) {
+                Some(ConstValue::HostObject(host)) => {
+                    assert!(
+                        host.is_user_function(),
+                        "{name}: registered HostObject must be a UserFunction, got non-fn",
+                    );
+                }
+                other => panic!("{name}: expected HostObject(UserFunction), got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn register_rust_module_sibling_fn_resolves_from_caller_body() {
+        // Slice O16 acceptance: with eager-build sibling-fn
+        // registration, a caller's `LOAD_GLOBAL <sibling_name>`
+        // resolves to the registered HostObject and the call site
+        // emits a clean `simple_call(<host>, args)` SpaceOperation.
+        // Mirrors upstream Python where `def caller(): return
+        // helper(x)` resolves `helper` through `module.__dict__`
+        // (`flowcontext.py:847 w_globals.value[varname]`).
+        //
+        // Approach: walk the file (registers helper + caller), then
+        // re-build the caller fresh so its prebuilt PyGraph is
+        // observable from the test. Walking the freshly-built
+        // operations confirms the `LOAD_GLOBAL helper` cascade
+        // resolved through the module-globals registry instead of
+        // falling into the `mint_unknown` placeholder path.
+        use super::super::build_flow::build_flow_from_rust_in_module;
+        use crate::flowspace::model::Hlvalue;
+
+        let src = "
+            fn parity_probe_helper() -> i64 { 7 }
+            fn parity_probe_caller() -> i64 { parity_probe_helper() }
+        ";
+        let file = syn::parse_file(src).expect("sibling-call fixture parses");
+        let module_id = register_rust_module(&file).expect("walker succeeds");
+
+        // Both fns must register because both bodies lower cleanly.
+        for name in ["parity_probe_helper", "parity_probe_caller"] {
+            match module_globals_lookup(module_id, name) {
+                Some(ConstValue::HostObject(host)) => assert!(
+                    host.is_user_function(),
+                    "{name}: registered HostObject must be UserFunction"
+                ),
+                other => panic!("{name}: expected HostObject(UserFunction), got {other:?}"),
+            }
+        }
+
+        // Re-build the caller fresh against the now-populated
+        // registry. Iterate `simple_call` operations: at least one
+        // must reference the helper's HostObject (qualname-identity
+        // match). Pre-O16, the LOAD_GLOBAL would mint a placeholder
+        // and the cascade would emit a raw `getattr` chain instead.
+        let caller_fn = file
+            .items
+            .iter()
+            .find_map(|item| match item {
+                Item::Fn(f) if f.sig.ident == "parity_probe_caller" => Some(f),
+                _ => None,
+            })
+            .expect("caller fn present in fixture");
+        let graph = build_flow_from_rust_in_module(caller_fn, module_id)
+            .expect("caller body lowers cleanly with helper in registry");
+        let mut found = false;
+        for block_ref in graph.iterblocks() {
+            let block = block_ref.borrow();
+            for op in &block.operations {
+                if op.opname == "simple_call"
+                    && let Some(Hlvalue::Constant(c)) = op.args.first()
+                    && let ConstValue::HostObject(h) = &c.value
+                    && h.qualname() == "parity_probe_helper"
+                {
+                    found = true;
+                }
+            }
+        }
         assert!(
-            module_globals_lookup(module_id, "parity_probe_walker_alpha").is_none(),
-            "Item::Fn must NOT be registered (sibling-fn body-rebuild path missing)",
-        );
-        assert!(
-            module_globals_lookup(module_id, "parity_probe_walker_beta").is_none(),
-            "Item::Fn must NOT be registered (sibling-fn body-rebuild path missing)",
+            found,
+            "caller body must contain `simple_call(<helper-host>, ...)` via walker-registered \
+             sibling fn (LOAD_GLOBAL → HOST_RUST_MODULE_GLOBALS hit)"
         );
     }
 
     #[test]
-    fn register_rust_module_skip_extends_to_unsupported_bodies() {
-        // Same Issue 1.2 invariant: even if a fn body is something
-        // the lowerer would reject (`as T` cast — task #94), the
-        // walker still does not register it. The skip is uniform
-        // across `Item::Fn` regardless of body shape.
+    fn register_rust_module_forward_ref_between_sibling_fns_resolves() {
+        // Slice O17: two-pass walker iteratively registers `Item::Fn`s
+        // until stable. A caller-before-helper pattern resolves: the
+        // first pass-2 iteration fails the caller (helper missing),
+        // succeeds the helper; the second iteration succeeds the
+        // caller. Mirrors upstream Python where module-import binds
+        // `def helper` → `def caller` together so a runtime
+        // `caller()` finds `helper` regardless of source order
+        // (`flowcontext.py:847 w_globals.value[varname]`).
+        use super::super::build_flow::build_flow_from_rust_in_module;
+        use crate::flowspace::model::Hlvalue;
+
+        let src = "
+            fn parity_probe_fwd_caller() -> i64 { parity_probe_fwd_helper() }
+            fn parity_probe_fwd_helper() -> i64 { 42 }
+        ";
+        let file = syn::parse_file(src).expect("forward-ref fixture parses");
+        let module_id = register_rust_module(&file).expect("walker succeeds");
+
+        // Both fns must register because the iterative pass-2 loop
+        // unrolls the dependency.
+        for name in ["parity_probe_fwd_caller", "parity_probe_fwd_helper"] {
+            match module_globals_lookup(module_id, name) {
+                Some(ConstValue::HostObject(host)) => assert!(
+                    host.is_user_function(),
+                    "{name}: registered HostObject must be UserFunction (forward-ref resolved)"
+                ),
+                other => panic!(
+                    "{name}: forward-ref must register (Slice O17 two-pass walker), got {other:?}"
+                ),
+            }
+        }
+
+        // Re-build the caller fresh to confirm its body's
+        // `LOAD_GLOBAL parity_probe_fwd_helper` resolved through the
+        // registry (not mint).
+        let caller_fn = file
+            .items
+            .iter()
+            .find_map(|item| match item {
+                Item::Fn(f) if f.sig.ident == "parity_probe_fwd_caller" => Some(f),
+                _ => None,
+            })
+            .expect("caller fn present");
+        let graph = build_flow_from_rust_in_module(caller_fn, module_id)
+            .expect("caller body lowers cleanly with helper registered");
+        let mut found = false;
+        for block_ref in graph.iterblocks() {
+            let block = block_ref.borrow();
+            for op in &block.operations {
+                if op.opname == "simple_call"
+                    && let Some(Hlvalue::Constant(c)) = op.args.first()
+                    && let ConstValue::HostObject(h) = &c.value
+                    && h.qualname() == "parity_probe_fwd_helper"
+                {
+                    found = true;
+                }
+            }
+        }
+        assert!(
+            found,
+            "forward-ref `simple_call(<helper-host>, ...)` must resolve via walker registry"
+        );
+    }
+
+    #[test]
+    fn register_rust_module_unlowerable_fn_keeps_placeholder_host() {
+        // Slice O17 invariant + strict-parity (2026-05-09): the
+        // walker pre-registers every deferred fn's metadata host into
+        // `module.__dict__` before any body is lowered, mirroring
+        // Python's import-time `def f` populating the module dict
+        // ahead of flow analysis (`flowcontext.py:847 find_global`
+        // reads live module dict). A fn whose body the adapter
+        // rejects (`as T` cast, etc.) keeps its placeholder host —
+        // failure surfaces lazily at `buildflowgraph(host)` call time
+        // when no PyGraph is attached, not at walker time.
+        let src = "
+            fn parity_probe_fwd_caller_with_bad() -> i64 { parity_probe_bad_helper(0) }
+            fn parity_probe_bad_helper(x: u32) -> i64 { x as i64 }
+        ";
+        let file = syn::parse_file(src).expect("fixture parses");
+        let module_id = register_rust_module(&file).expect("walker terminates");
+        // Helper's body fails to lower (`as` cast rejected); its
+        // placeholder host stays in `module.__dict__` per PyPy's
+        // import-time `def` semantic — `module.__dict__["helper"]`
+        // is populated at import time regardless of any later flow
+        // failure. The host carries no attached PyGraph, so an
+        // actual call would surface the failure downstream.
+        assert!(
+            matches!(
+                module_globals_lookup(module_id, "parity_probe_bad_helper"),
+                Some(ConstValue::HostObject(ref h)) if h.is_user_function(),
+            ),
+            "helper placeholder host must remain in module dict",
+        );
+        assert!(
+            crate::flowspace::rust_source::lookup_walker_pygraph(&match module_globals_lookup(
+                module_id,
+                "parity_probe_bad_helper"
+            ) {
+                Some(ConstValue::HostObject(h)) => h,
+                _ => unreachable!(),
+            })
+            .is_none(),
+            "helper host carries no PyGraph because its body never lowered",
+        );
+        // Caller's body lowered against the placeholder helper host —
+        // matches PyPy's import-time `def` populating module dict
+        // before any flow analysis runs.
+        assert!(
+            matches!(
+                module_globals_lookup(module_id, "parity_probe_fwd_caller_with_bad"),
+                Some(ConstValue::HostObject(ref h)) if h.is_user_function()
+            ),
+            "caller fn must register because pre-register-once gave its body \
+             visibility into the placeholder helper host"
+        );
+    }
+
+    #[test]
+    fn register_rust_module_item_impl_methods_carry_class_owned_identity_audit_1_5() {
+        // Audit 1.5 (2026-05-08): impl methods registered into a
+        // class dict must carry `GraphFunc.class_ = Some(target
+        // class)` so downstream consumers see class-owned identity.
+        // Mirrors upstream Python `func.class_` populated when a
+        // `def bar(self): ...` lives inside `class Foo:`. Both the
+        // outer-walker path (`register_rust_module_at`) and the
+        // inner-mod path (`register_items_into_namespace`) must
+        // satisfy this invariant.
+        let src = "
+            struct ParityProbeAudit15Outer;
+            impl ParityProbeAudit15Outer {
+                fn outer_method() -> i64 { 1 }
+            }
+            mod parity_probe_audit_1_5_inner_mod {
+                struct InnerStruct;
+                impl InnerStruct {
+                    fn inner_method() -> i64 { 2 }
+                }
+            }
+        ";
+        let file = syn::parse_file(src).expect("audit-1.5 fixture parses");
+        let module_id = register_rust_module(&file).expect("walker succeeds");
+
+        // Outer-walker path: class registered, method has class_owned identity.
+        let outer_class = match module_globals_lookup(module_id, "ParityProbeAudit15Outer") {
+            Some(ConstValue::HostObject(h)) => h,
+            other => panic!("expected outer class HostObject, got {other:?}"),
+        };
+        let outer_method = match outer_class.class_get("outer_method") {
+            Some(ConstValue::HostObject(h)) => h,
+            other => panic!("expected outer_method HostObject, got {other:?}"),
+        };
+        let outer_gf = outer_method
+            .user_function()
+            .expect("outer method must be UserFunction");
+        match &outer_gf.class_ {
+            Some(owner) => assert!(
+                *owner == outer_class,
+                "outer_method.class_ must point at ParityProbeAudit15Outer"
+            ),
+            None => panic!(
+                "audit 1.5: outer_method GraphFunc.class_ must be Some(ParityProbeAudit15Outer); got None"
+            ),
+        }
+
+        // Inner-mod path: same invariant.
+        let inner_ns = match module_globals_lookup(module_id, "parity_probe_audit_1_5_inner_mod") {
+            Some(ConstValue::HostObject(h)) => h,
+            other => panic!("expected inner mod namespace HostObject, got {other:?}"),
+        };
+        let inner_class = match inner_ns.class_get("InnerStruct") {
+            Some(ConstValue::HostObject(h)) => h,
+            other => panic!("expected InnerStruct HostObject, got {other:?}"),
+        };
+        let inner_method = match inner_class.class_get("inner_method") {
+            Some(ConstValue::HostObject(h)) => h,
+            other => panic!("expected inner_method HostObject, got {other:?}"),
+        };
+        let inner_gf = inner_method
+            .user_function()
+            .expect("inner method must be UserFunction");
+        match &inner_gf.class_ {
+            Some(owner) => assert!(
+                *owner == inner_class,
+                "inner_method.class_ must point at InnerStruct"
+            ),
+            None => panic!(
+                "audit 1.5: inner_method GraphFunc.class_ must be Some(InnerStruct); got None"
+            ),
+        }
+    }
+
+    #[test]
+    fn register_rust_module_inline_item_mod_inner_fn_metadata_uses_inner_scope_audit_1_3() {
+        // Audit 1.3 (2026-05-08): inner-mod fn's `GraphFunc.module_globals_id`
+        // must point at a registry partition mirroring the inner
+        // namespace's class dict — NOT the outer module's partition.
+        // Mirrors upstream Python `function.__globals__ = inner_mod.__dict__`
+        // for fns defined inside `mod foo: ...`. The walker now mints
+        // `inner_module_scope` at `register_items_into_namespace`
+        // entry and mirrors every `namespace.class_set` into that
+        // registry partition; fn / impl-method body builders see this
+        // scope as their `module_id` so the metadata snapshot matches
+        // the body-side `class_get` channel.
+        let src = "
+            const OUTER_CONST_FOR_AUDIT_1_3: i64 = 11;
+            mod parity_probe_audit_1_3_inner_mod {
+                const INNER_CONST_FOR_AUDIT_1_3: i64 = 22;
+                fn references_inner_const() -> i64 { INNER_CONST_FOR_AUDIT_1_3 }
+            }
+        ";
+        let file = syn::parse_file(src).expect("audit-1.3 fixture parses");
+        let outer_module_id = register_rust_module(&file).expect("walker succeeds");
+
+        // Sanity: outer const IS registered under the outer module id.
+        assert_eq!(
+            module_globals_lookup(outer_module_id, "OUTER_CONST_FOR_AUDIT_1_3"),
+            Some(ConstValue::Int(11))
+        );
+
+        let ns = match module_globals_lookup(outer_module_id, "parity_probe_audit_1_3_inner_mod") {
+            Some(ConstValue::HostObject(h)) => h,
+            other => panic!("expected inner mod namespace, got {other:?}"),
+        };
+        let inner_fn = match ns.class_get("references_inner_const") {
+            Some(ConstValue::HostObject(h)) => h,
+            other => panic!("expected inner fn HostObject, got {other:?}"),
+        };
+        let gf = inner_fn.user_function().expect("inner fn is UserFunction");
+
+        // Audit 1.3 invariant: the metadata id is NOT the outer mod's.
+        assert_ne!(
+            gf.module_globals_id,
+            Some(outer_module_id),
+            "audit 1.3: inner-mod fn metadata must NOT point at outer module_id"
+        );
+        let inner_scope = gf
+            .module_globals_id
+            .expect("audit 1.3: inner-mod fn must carry a non-None module_globals_id");
+
+        // The inner scope's snapshot includes the inner const + the
+        // fn's own host (re-registered when the walker added it to
+        // namespace.class_set). It must NOT include the outer const.
+        let inner_snapshot = super::super::host_env::module_globals_snapshot_pub(inner_scope);
+        let inner_const_key = ConstValue::byte_str(b"INNER_CONST_FOR_AUDIT_1_3");
+        let outer_const_key = ConstValue::byte_str(b"OUTER_CONST_FOR_AUDIT_1_3");
+        assert_eq!(
+            inner_snapshot.get(&inner_const_key),
+            Some(&ConstValue::Int(22)),
+            "audit 1.3: inner-mod metadata snapshot must include inner const"
+        );
+        assert!(
+            inner_snapshot.get(&outer_const_key).is_none(),
+            "audit 1.3: inner-mod metadata snapshot must NOT include outer const"
+        );
+    }
+
+    #[test]
+    fn register_rust_module_impl_method_host_qualname_is_class_qualified_audit_1_5() {
+        // Audit 1.5 extension (2026-05-08): impl methods produce a
+        // `HostObject` whose `qualname` is `Class.method` (mirroring
+        // upstream Python `func.__qualname__` populated when a
+        // `def bar(self): ...` lives inside `class Foo:`). Module-
+        // scoped fns keep their bare ident as qualname.
+        let src = "
+            struct ParityProbeAudit15QualnameOuter;
+            impl ParityProbeAudit15QualnameOuter {
+                fn outer_method() -> i64 { 1 }
+            }
+            fn parity_probe_audit_1_5_qualname_free() -> i64 { 0 }
+        ";
+        let file = syn::parse_file(src).expect("qualname fixture parses");
+        let module_id = register_rust_module(&file).expect("walker succeeds");
+
+        // Class-owned method: qualname is `Outer.outer_method`.
+        let outer_class = match module_globals_lookup(module_id, "ParityProbeAudit15QualnameOuter")
+        {
+            Some(ConstValue::HostObject(h)) => h,
+            other => panic!("expected class HostObject, got {other:?}"),
+        };
+        let outer_method = match outer_class.class_get("outer_method") {
+            Some(ConstValue::HostObject(h)) => h,
+            other => panic!("expected method HostObject, got {other:?}"),
+        };
+        assert_eq!(
+            outer_method.qualname(),
+            "ParityProbeAudit15QualnameOuter.outer_method",
+            "audit 1.5 ext: impl method qualname must be `Class.method`"
+        );
+        // Short name (`__name__`) stays at the bare method ident —
+        // upstream Python `Foo.bar.__name__ == 'bar'`.
+        assert_eq!(
+            outer_method.simple_name(),
+            "outer_method",
+            "audit 1.5 ext: impl method `__name__` short-name must stay at the bare ident"
+        );
+
+        // Free fn: qualname is just the ident (no class prefix).
+        let free_fn = match module_globals_lookup(module_id, "parity_probe_audit_1_5_qualname_free")
+        {
+            Some(ConstValue::HostObject(h)) => h,
+            other => panic!("expected free fn HostObject, got {other:?}"),
+        };
+        assert_eq!(
+            free_fn.qualname(),
+            "parity_probe_audit_1_5_qualname_free",
+            "audit 1.5 ext: free fn qualname must remain bare ident"
+        );
+    }
+
+    #[test]
+    fn register_rust_module_direct_recursion_resolves_strict_parity_issue_1() {
+        // Strict-parity Issue 1 (2026-05-08): walker pre-registers
+        // metadata-only HostObject BEFORE body lowering so direct
+        // recursion `fn f() { f() }` resolves through the freshly-
+        // populated module dict — mirroring upstream Python's
+        // import-time `def f` populating `module.__dict__` BEFORE
+        // any flow analysis (`flowcontext.py:847 find_global` reads
+        // from the live module dict).
+        let src = "
+            fn parity_probe_strict_issue_1_recursive(n: i64) -> i64 {
+                parity_probe_strict_issue_1_recursive(n)
+            }
+        ";
+        let file = syn::parse_file(src).expect("recursive fixture parses");
+        let module_id = register_rust_module(&file).expect("walker terminates");
+        let host = match module_globals_lookup(module_id, "parity_probe_strict_issue_1_recursive") {
+            Some(ConstValue::HostObject(h)) => h,
+            other => panic!("expected recursive fn HostObject, got {other:?}"),
+        };
+        assert!(
+            host.is_user_function(),
+            "strict-parity Issue 1: direct-recursive fn must register under \
+             pre-register-then-lower walker shape"
+        );
+    }
+
+    #[test]
+    fn register_rust_module_mutual_recursion_resolves_strict_parity_issue_1() {
+        // Strict-parity Issue 1: pre-registration also unblocks
+        // mutual recursion (`A` calls `B`, `B` calls `A`). The
+        // outer-walker pass-2 registers both metadata hosts BEFORE
+        // either body is lowered, so each body's `LOAD_GLOBAL` finds
+        // its sibling in the module dict.
+        let src = "
+            fn parity_probe_mutrec_a(n: i64) -> i64 { parity_probe_mutrec_b(n) }
+            fn parity_probe_mutrec_b(n: i64) -> i64 { parity_probe_mutrec_a(n) }
+        ";
+        let file = syn::parse_file(src).expect("mutual-rec fixture parses");
+        let module_id = register_rust_module(&file).expect("walker terminates");
+        for name in ["parity_probe_mutrec_a", "parity_probe_mutrec_b"] {
+            match module_globals_lookup(module_id, name) {
+                Some(ConstValue::HostObject(h)) if h.is_user_function() => {}
+                other => panic!("expected mutual-rec {name} HostObject, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn register_rust_module_top_level_fn_carries_no_class_owner_audit_1_5() {
+        // Audit 1.5 (2026-05-08) negative invariant: top-level
+        // (module-scoped) fns are not class-owned, so
+        // `GraphFunc.class_` stays `None`. Mirrors upstream Python
+        // free-fn `func.class_` defaulting to absent.
+        let src = "fn parity_probe_audit_1_5_free_fn() -> i64 { 0 }";
+        let file = syn::parse_file(src).expect("free-fn fixture parses");
+        let module_id = register_rust_module(&file).expect("walker succeeds");
+        let host = match module_globals_lookup(module_id, "parity_probe_audit_1_5_free_fn") {
+            Some(ConstValue::HostObject(h)) => h,
+            other => panic!("expected free-fn HostObject, got {other:?}"),
+        };
+        let gf = host.user_function().expect("free fn is UserFunction");
+        assert!(
+            gf.class_.is_none(),
+            "audit 1.5: top-level fn GraphFunc.class_ must be None"
+        );
+    }
+
+    #[test]
+    fn register_rust_module_item_impl_self_block_populates_class_dict() {
+        // Slice O18: `impl Foo { ... }` self-impl blocks contribute
+        // associated fns / methods to the target class's dict via
+        // `class_set`. Mirrors Python `class Foo: def bar(self): ...`
+        // populating `Foo.__dict__["bar"]`. The walker resolves the
+        // class name in pass 2 so the impl block can appear above
+        // its `struct Foo` declaration in source.
+        let src = "
+            struct ParityProbeImplStruct;
+            impl ParityProbeImplStruct {
+                fn associated_helper() -> i64 { 7 }
+                fn second_helper(x: i64) -> i64 { x }
+            }
+        ";
+        let file = syn::parse_file(src).expect("self-impl fixture parses");
+        let module_id = register_rust_module(&file).expect("walker succeeds");
+
+        // The class itself is registered at module top level.
+        let class = match module_globals_lookup(module_id, "ParityProbeImplStruct") {
+            Some(ConstValue::HostObject(h)) => h,
+            other => panic!("expected class HostObject, got {other:?}"),
+        };
+        assert!(class.is_class());
+
+        // Each impl method becomes a class-dict entry.
+        for method_name in ["associated_helper", "second_helper"] {
+            match class.class_get(method_name) {
+                Some(ConstValue::HostObject(host)) => assert!(
+                    host.is_user_function(),
+                    "{method_name}: expected UserFunction in class dict"
+                ),
+                other => panic!(
+                    "{method_name}: expected HostObject(UserFunction) in class dict, got {other:?}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn register_rust_module_item_impl_works_when_struct_appears_after() {
+        // Slice O18 forward-resolution: `impl Foo { … }` declared
+        // ABOVE `struct Foo` still resolves because the class lookup
+        // is deferred to pass 2 (after pass 1 registers all
+        // structs/enums).
+        let src = "
+            impl ParityProbeReverseStruct {
+                fn helper() -> i64 { 1 }
+            }
+            struct ParityProbeReverseStruct;
+        ";
+        let file = syn::parse_file(src).expect("reverse-order impl fixture parses");
+        let module_id = register_rust_module(&file).expect("walker succeeds");
+        let class = match module_globals_lookup(module_id, "ParityProbeReverseStruct") {
+            Some(ConstValue::HostObject(h)) => h,
+            _ => unreachable!(),
+        };
+        match class.class_get("helper") {
+            Some(ConstValue::HostObject(host)) => assert!(host.is_user_function()),
+            other => panic!("expected helper in class dict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn register_rust_module_item_impl_skips_generic_blocks() {
+        // Slice O22 scope: generic impls (`impl<T> Foo<T>`,
+        // `impl<E: Trait> X for E`) and where-clause impls are out of
+        // scope (generic-arg reification is a future slice). The
+        // walker silently skips them; downstream resolution falls
+        // through to the resolver's mint-or-fail path. Self-impl
+        // (Slice O18) and trait impl (Slice O22) on a single bare
+        // self-type with no generics ARE walked — see
+        // `register_rust_module_item_impl_trait_for_class_populates_class_dict`.
+        let src = "
+            struct ParityProbeGenericSkipStruct;
+            impl<T> ParityProbeGenericSkipStruct {
+                fn generic_helper() -> i64 { 3 }
+            }
+        ";
+        let file = syn::parse_file(src).expect("skip fixture parses");
+        let module_id = register_rust_module(&file).expect("walker succeeds");
+        let class = match module_globals_lookup(module_id, "ParityProbeGenericSkipStruct") {
+            Some(ConstValue::HostObject(h)) => h,
+            _ => unreachable!(),
+        };
+        assert!(
+            class.class_get("generic_helper").is_none(),
+            "generic impl skipped"
+        );
+    }
+
+    #[test]
+    fn register_rust_module_item_impl_trait_for_class_populates_class_dict() {
+        // Slice O22: `impl Trait for Foo { fn bar(...) { ... } ... }`
+        // contributes methods to `Foo`'s class dict identically to a
+        // self-impl block. Mirrors upstream
+        // `classdesc.py:590-634 add_source_attribute`'s flat
+        // `self.classdict[name] = Constant(value)` assignment — the
+        // class dict is populated regardless of whether the method
+        // comes from a base class through inheritance, because
+        // `lookup_filter` (`classdesc.py:336-374`) does the
+        // subclass-aware filtering at lookup time. Closed-world
+        // dispatch through `bookkeeper.py:431-442 getmethoddesc`
+        // keys on `(originclassdef, name, …)`, not on the trait that
+        // defined the method.
+        let src = "
+            struct ParityProbeTraitImplStruct;
+            trait ParityProbeTraitImpl { fn t_method(&self) -> i64; }
+            impl ParityProbeTraitImpl for ParityProbeTraitImplStruct {
+                fn t_method(&self) -> i64 { 11 }
+            }
+        ";
+        let file = syn::parse_file(src).expect("trait-impl fixture parses");
+        let module_id = register_rust_module(&file).expect("walker succeeds");
+
+        let class = match module_globals_lookup(module_id, "ParityProbeTraitImplStruct") {
+            Some(ConstValue::HostObject(h)) => h,
+            other => panic!("expected class HostObject, got {other:?}"),
+        };
+        assert!(class.is_class());
+        match class.class_get("t_method") {
+            Some(ConstValue::HostObject(host)) => assert!(
+                host.is_user_function(),
+                "t_method: expected UserFunction in class dict"
+            ),
+            other => {
+                panic!("t_method: expected HostObject(UserFunction) in class dict, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn register_rust_module_item_impl_trait_resolves_when_struct_appears_after() {
+        // Slice O22 forward-resolution mirrors Slice O18: `impl Trait
+        // for Foo { … }` declared above `struct Foo` still resolves
+        // because the class lookup is deferred to pass 2.
+        let src = "
+            trait ParityProbeFwdTrait { fn fwd_method(&self) -> i64; }
+            impl ParityProbeFwdTrait for ParityProbeFwdStruct {
+                fn fwd_method(&self) -> i64 { 13 }
+            }
+            struct ParityProbeFwdStruct;
+        ";
+        let file = syn::parse_file(src).expect("forward-ref trait-impl fixture parses");
+        let module_id = register_rust_module(&file).expect("walker succeeds");
+        let class = match module_globals_lookup(module_id, "ParityProbeFwdStruct") {
+            Some(ConstValue::HostObject(h)) => h,
+            _ => unreachable!(),
+        };
+        match class.class_get("fwd_method") {
+            Some(ConstValue::HostObject(host)) => assert!(host.is_user_function()),
+            other => panic!("expected fwd_method in class dict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn register_rust_module_item_impl_trait_and_self_impl_coexist() {
+        // Slice O22: source-order entry into deferred_impls means a
+        // later-declared impl block last-writer-wins on the class
+        // dict, mirroring Python `Foo.bar = new_bar` overwriting the
+        // class-body `def bar(self): …`. Both `impl Foo` and `impl
+        // Trait for Foo` populate the same `Foo.classdict`; method
+        // names that don't collide coexist.
+        let src = "
+            struct ParityProbeMixedStruct;
+            trait ParityProbeMixedTrait { fn trait_method(&self) -> i64; }
+            impl ParityProbeMixedStruct {
+                fn self_method(&self) -> i64 { 17 }
+            }
+            impl ParityProbeMixedTrait for ParityProbeMixedStruct {
+                fn trait_method(&self) -> i64 { 19 }
+            }
+        ";
+        let file = syn::parse_file(src).expect("mixed impl fixture parses");
+        let module_id = register_rust_module(&file).expect("walker succeeds");
+        let class = match module_globals_lookup(module_id, "ParityProbeMixedStruct") {
+            Some(ConstValue::HostObject(h)) => h,
+            _ => unreachable!(),
+        };
+        for name in ["self_method", "trait_method"] {
+            match class.class_get(name) {
+                Some(ConstValue::HostObject(host)) => assert!(
+                    host.is_user_function(),
+                    "{name}: expected UserFunction in class dict"
+                ),
+                other => panic!("{name}: expected UserFunction, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn register_rust_module_inline_item_mod_namespaces_inner_items() {
+        // Slice O19: `mod foo { ... }` inline submodule binds a
+        // namespace `HostObject::Class` at the outer module level
+        // whose class dict carries every inner const / static / enum
+        // / struct. Mirrors Python `import foo` populating
+        // `module.__dict__["foo"]` such that `foo.A` traverses the
+        // inner namespace.
+        let src = "
+            mod parity_probe_inner {
+                const INNER_CONST: i64 = 42;
+                static INNER_STATIC: i64 = 99;
+                enum InnerEnum { Alpha, Beta }
+                struct InnerStruct;
+            }
+        ";
+        let file = syn::parse_file(src).expect("inline-mod fixture parses");
+        let module_id = register_rust_module(&file).expect("walker succeeds");
+
+        // The namespace itself is registered at module top level.
+        let ns = match module_globals_lookup(module_id, "parity_probe_inner") {
+            Some(ConstValue::HostObject(h)) => h,
+            other => panic!("expected namespace HostObject, got {other:?}"),
+        };
+        assert!(ns.is_class());
+
+        // Inner const → class dict entry as the literal value.
+        match ns.class_get("INNER_CONST") {
+            Some(ConstValue::Int(42)) => {}
+            other => panic!("expected Int(42), got {other:?}"),
+        }
+        match ns.class_get("INNER_STATIC") {
+            Some(ConstValue::Int(99)) => {}
+            other => panic!("expected Int(99), got {other:?}"),
+        }
+        // Inner enum → class with each variant on its dict.
+        match ns.class_get("InnerEnum") {
+            Some(ConstValue::HostObject(enum_class)) => {
+                assert!(enum_class.is_class());
+                assert!(enum_class.class_get("Alpha").is_some());
+                assert!(enum_class.class_get("Beta").is_some());
+            }
+            other => panic!("expected enum class HostObject, got {other:?}"),
+        }
+        match ns.class_get("InnerStruct") {
+            Some(ConstValue::HostObject(struct_class)) => {
+                assert!(struct_class.is_class());
+            }
+            other => panic!("expected struct class HostObject, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn register_rust_module_inline_item_mod_inner_const_forward_refs() {
+        // Slice O19 invariant: per-mod source-order `const_bindings`
+        // resolves forward refs between sibling consts INSIDE the
+        // mod (`const Y = X + 1` after `const X = 1`).
+        let src = "
+            mod parity_probe_inner_fwd {
+                const INNER_X: i64 = 10;
+                const INNER_Y: i64 = INNER_X + 1;
+            }
+        ";
+        let file = syn::parse_file(src).expect("inline-mod fixture parses");
+        let module_id = register_rust_module(&file).expect("walker succeeds");
+        let ns = match module_globals_lookup(module_id, "parity_probe_inner_fwd") {
+            Some(ConstValue::HostObject(h)) => h,
+            _ => unreachable!(),
+        };
+        match ns.class_get("INNER_Y") {
+            Some(ConstValue::Int(11)) => {}
+            other => panic!("expected Int(11) (10 + 1), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn register_rust_module_external_item_mod_skipped() {
+        // Slice O19: `mod foo;` (no body) resolves to a separate file
+        // — out of scope for this slice. Walker silently skips.
+        let src = "mod parity_probe_external_mod;";
+        let file = syn::parse_file(src).expect("external-mod fixture parses");
+        let module_id = register_rust_module(&file).expect("walker succeeds");
+        assert!(
+            module_globals_lookup(module_id, "parity_probe_external_mod").is_none(),
+            "external `mod foo;` (no body) must not produce a registry entry",
+        );
+    }
+
+    #[test]
+    fn register_rust_module_inline_item_mod_dispatches_inner_item_fn() {
+        // Slice O20: `Item::Fn` inside `mod foo { ... }` lowers and
+        // registers as `foo.<fn_name>` on the inner namespace. Mirrors
+        // Python `mod foo: def helper(): ...` populating
+        // `foo.__dict__["helper"]` with the function object.
+        let src = "
+            mod parity_probe_o20_fn_mod {
+                fn inner_helper() -> i64 { 5 }
+            }
+        ";
+        let file = syn::parse_file(src).expect("inline-mod-fn fixture parses");
+        let module_id = register_rust_module(&file).expect("walker succeeds");
+        let ns = match module_globals_lookup(module_id, "parity_probe_o20_fn_mod") {
+            Some(ConstValue::HostObject(h)) => h,
+            other => panic!("expected namespace HostObject, got {other:?}"),
+        };
+        match ns.class_get("inner_helper") {
+            Some(ConstValue::HostObject(host)) => assert!(
+                host.is_user_function(),
+                "expected inner fn lowered as UserFunction"
+            ),
+            other => panic!("expected fn HostObject in inner-mod dict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn register_rust_module_inline_item_mod_dispatches_inner_self_impl() {
+        // Slice O20: self-impl `Item::Impl` inside `mod foo { struct
+        // Bar; impl Bar { fn helper() {...} } }` resolves the target
+        // class against the inner namespace's dict and adds the
+        // method via `class_set`. Mirrors Python `class Bar: def
+        // helper(self): ...` nested inside a `mod`-like scope.
+        let src = "
+            mod parity_probe_o20_impl_mod {
+                struct InnerStruct;
+                impl InnerStruct {
+                    fn inner_method() -> i64 { 7 }
+                }
+            }
+        ";
+        let file = syn::parse_file(src).expect("inline-mod-impl fixture parses");
+        let module_id = register_rust_module(&file).expect("walker succeeds");
+        let ns = match module_globals_lookup(module_id, "parity_probe_o20_impl_mod") {
+            Some(ConstValue::HostObject(h)) => h,
+            other => panic!("expected namespace HostObject, got {other:?}"),
+        };
+        let class = match ns.class_get("InnerStruct") {
+            Some(ConstValue::HostObject(h)) => h,
+            other => panic!("expected struct in inner-mod dict, got {other:?}"),
+        };
+        match class.class_get("inner_method") {
+            Some(ConstValue::HostObject(host)) => assert!(
+                host.is_user_function(),
+                "expected impl method in inner class dict"
+            ),
+            other => panic!("expected method HostObject in inner class dict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn register_rust_module_inline_item_mod_dispatches_inner_trait_impl() {
+        // Slice O22: trait `Item::Impl` inside `mod foo { … }` resolves
+        // the target class against the inner namespace's dict (NOT the
+        // outer module's globals — Rust scoping does not auto-import
+        // outer items into inner mods) and adds the method via
+        // `class_set`. Mirrors Python `class Bar(Trait): def t_method
+        // (self): …` nested inside a `mod`-like scope.
+        let src = "
+            mod parity_probe_o22_inner_trait_mod {
+                struct InnerTraitStruct;
+                trait InnerTrait { fn inner_t_method(&self) -> i64; }
+                impl InnerTrait for InnerTraitStruct {
+                    fn inner_t_method(&self) -> i64 { 23 }
+                }
+            }
+        ";
+        let file = syn::parse_file(src).expect("inline-mod-trait-impl fixture parses");
+        let module_id = register_rust_module(&file).expect("walker succeeds");
+        let ns = match module_globals_lookup(module_id, "parity_probe_o22_inner_trait_mod") {
+            Some(ConstValue::HostObject(h)) => h,
+            other => panic!("expected namespace HostObject, got {other:?}"),
+        };
+        let class = match ns.class_get("InnerTraitStruct") {
+            Some(ConstValue::HostObject(h)) => h,
+            other => panic!("expected struct in inner-mod dict, got {other:?}"),
+        };
+        match class.class_get("inner_t_method") {
+            Some(ConstValue::HostObject(host)) => assert!(
+                host.is_user_function(),
+                "expected impl method in inner class dict"
+            ),
+            other => panic!("expected method HostObject in inner class dict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn register_rust_module_item_impl_multi_segment_self_type_inline_mod_cascade() {
+        // Slice O24: `impl Trait for foo::Bar` resolves the target
+        // class through the inline-mod cascade. `foo` is a registered
+        // `HostObject::Class` namespace from Slice O19, and `Bar` is
+        // its inner struct. Methods land on `foo.Bar`'s class dict
+        // exactly as for self-impl, mirroring upstream
+        // `classdesc.py:590-634 add_source_attribute`'s flat
+        // `self.classdict[name] = Constant(value)` shape (no
+        // distinction between single-segment and multi-segment paths
+        // — Python's `Foo.__dict__` is the same regardless of how
+        // `Foo` was reached).
+        let src = "
+            mod parity_probe_o24_outer_mod {
+                struct InnerCascadeStruct;
+            }
+            trait ParityProbeCascadeTrait { fn cascade_method(&self) -> i64; }
+            impl ParityProbeCascadeTrait for parity_probe_o24_outer_mod::InnerCascadeStruct {
+                fn cascade_method(&self) -> i64 { 29 }
+            }
+        ";
+        let file = syn::parse_file(src).expect("multi-segment self-type fixture parses");
+        let module_id = register_rust_module(&file).expect("walker succeeds");
+        let outer_ns = match module_globals_lookup(module_id, "parity_probe_o24_outer_mod") {
+            Some(ConstValue::HostObject(h)) => h,
+            _ => unreachable!(),
+        };
+        let inner_class = match outer_ns.class_get("InnerCascadeStruct") {
+            Some(ConstValue::HostObject(h)) => h,
+            other => panic!("expected inner class, got {other:?}"),
+        };
+        match inner_class.class_get("cascade_method") {
+            Some(ConstValue::HostObject(host)) => assert!(
+                host.is_user_function(),
+                "expected method registered on multi-segment self-type's class dict"
+            ),
+            other => panic!("expected cascade_method on inline-mod target class, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn register_rust_module_item_impl_multi_segment_resolves_after_inline_mod() {
+        // Slice O24: forward-reference variant — `impl X for foo::Bar`
+        // declared above `mod foo { struct Bar; }` still resolves
+        // because the cascade is retried in the pass-2 fixed-point
+        // loop. Mirrors Slice O17 / O18 forward-resolution behavior
+        // for fns / impls; the cascade just adds another lookup step.
+        let src = "
+            trait ParityProbeFwdCascadeTrait { fn fwd_cascade_method(&self) -> i64; }
+            impl ParityProbeFwdCascadeTrait for parity_probe_o24_fwd_mod::FwdCascadeStruct {
+                fn fwd_cascade_method(&self) -> i64 { 31 }
+            }
+            mod parity_probe_o24_fwd_mod {
+                struct FwdCascadeStruct;
+            }
+        ";
+        let file = syn::parse_file(src).expect("forward-ref multi-segment fixture parses");
+        let module_id = register_rust_module(&file).expect("walker succeeds");
+        let outer_ns = match module_globals_lookup(module_id, "parity_probe_o24_fwd_mod") {
+            Some(ConstValue::HostObject(h)) => h,
+            _ => unreachable!(),
+        };
+        let inner_class = match outer_ns.class_get("FwdCascadeStruct") {
+            Some(ConstValue::HostObject(h)) => h,
+            _ => unreachable!(),
+        };
+        match inner_class.class_get("fwd_cascade_method") {
+            Some(ConstValue::HostObject(host)) => assert!(host.is_user_function()),
+            other => panic!("expected fwd_cascade_method via forward-ref cascade, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn register_rust_module_item_impl_admits_lifetime_only_generics() {
+        // Slice O25: `impl<'a> Trait for Foo<'a>` populates `Foo`'s
+        // classdict identically to the non-generic shape because
+        // lifetime parameters have no Python-observable semantic
+        // (RPython lacks the borrow concept). Mirrors upstream
+        // `classdesc.py:590-634 add_source_attribute`'s
+        // `self.classdict[name] = Constant(value)` flat assignment —
+        // same target class, lifetime is dropped at the adapter
+        // boundary.
+        let src = "
+            struct ParityProbeLifetimeStruct;
+            trait ParityProbeLifetimeTrait { fn t_lt_method(&self) -> i64; }
+            impl<'a> ParityProbeLifetimeTrait for ParityProbeLifetimeStruct {
+                fn t_lt_method(&self) -> i64 { 41 }
+            }
+        ";
+        let file = syn::parse_file(src).expect("lifetime-impl fixture parses");
+        let module_id = register_rust_module(&file).expect("walker succeeds");
+        let class = match module_globals_lookup(module_id, "ParityProbeLifetimeStruct") {
+            Some(ConstValue::HostObject(h)) => h,
+            _ => unreachable!(),
+        };
+        match class.class_get("t_lt_method") {
+            Some(ConstValue::HostObject(host)) => assert!(host.is_user_function()),
+            other => panic!("expected t_lt_method on impl<'a> target, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn register_rust_module_item_impl_admits_lifetime_only_self_type_args() {
+        // Slice O25: self_ty `Foo<'a>` carries lifetime path-args.
+        // `extract_impl_target_path` accepts these because lifetimes
+        // do not change classdef identity. Class name resolves to
+        // `Foo` exactly as for the non-generic `impl Foo` shape.
+        let src = "
+            struct ParityProbeLtSelfStruct;
+            impl<'a> ParityProbeLtSelfStruct {
+                fn lt_self_method(&self) -> i64 { 43 }
+            }
+        ";
+        let file = syn::parse_file(src).expect("lifetime-self-type fixture parses");
+        let module_id = register_rust_module(&file).expect("walker succeeds");
+        let class = match module_globals_lookup(module_id, "ParityProbeLtSelfStruct") {
+            Some(ConstValue::HostObject(h)) => h,
+            _ => unreachable!(),
+        };
+        match class.class_get("lt_self_method") {
+            Some(ConstValue::HostObject(host)) => assert!(host.is_user_function()),
+            other => panic!("expected lt_self_method on impl<'a> Foo<'a> target, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn register_rust_module_item_impl_admits_lifetime_only_where_clause() {
+        // Slice O25: `where 'a: 'b` (lifetime-bound predicates) is
+        // admitted alongside lifetime-only `generics.params`. Type /
+        // const where-clauses still reject because they imply
+        // type-arg reification (separate future slice).
+        let src = "
+            struct ParityProbeLtWhereStruct;
+            trait ParityProbeLtWhereTrait { fn lt_where_method(&self) -> i64; }
+            impl<'a, 'b> ParityProbeLtWhereTrait for ParityProbeLtWhereStruct
+            where 'a: 'b
+            {
+                fn lt_where_method(&self) -> i64 { 47 }
+            }
+        ";
+        let file = syn::parse_file(src).expect("lifetime-where-clause fixture parses");
+        let module_id = register_rust_module(&file).expect("walker succeeds");
+        let class = match module_globals_lookup(module_id, "ParityProbeLtWhereStruct") {
+            Some(ConstValue::HostObject(h)) => h,
+            _ => unreachable!(),
+        };
+        match class.class_get("lt_where_method") {
+            Some(ConstValue::HostObject(host)) => assert!(host.is_user_function()),
+            other => panic!("expected method via lifetime-only where-clause, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn register_rust_module_item_impl_skips_external_rooted_self_type() {
+        // Slice O24 scope: paths rooted at `crate::` / `super::` /
+        // `self::` / `std::` / `core::` / `alloc::` (or leading-`::`)
+        // require multi-file resolution and are skipped. The walker
+        // silently drops the impl; downstream resolution falls
+        // through to the resolver's mint-or-fail path.
+        let src = "
+            struct ParitySkipExtSelfTyStruct;
+            impl crate::ParitySkipExtSelfTyStruct {
+                fn ext_method() -> i64 { 1 }
+            }
+            impl ::leading::AnchorTy {
+                fn leading_method() -> i64 { 2 }
+            }
+        ";
+        let file = syn::parse_file(src).expect("external self-type skip fixture parses");
+        let module_id = register_rust_module(&file).expect("walker succeeds");
+        // Local struct registered.
+        let local = match module_globals_lookup(module_id, "ParitySkipExtSelfTyStruct") {
+            Some(ConstValue::HostObject(h)) => h,
+            _ => unreachable!(),
+        };
+        // The `impl crate::ParitySkipExtSelfTyStruct { ... }` block
+        // is skipped because `crate::` is external-rooted, so its
+        // `ext_method` does NOT land on the local class's dict.
+        assert!(
+            local.class_get("ext_method").is_none(),
+            "external-rooted impl methods are skipped"
+        );
+    }
+
+    #[test]
+    fn register_rust_module_use_aliases_existing_module_global() {
+        // Slice O23: `use Foo as Bar;` rebinds an already-registered
+        // top-level name under a new alias in the module's registry
+        // partition. Mirrors Python `from foo import Foo as Bar`
+        // populating `module.__dict__["Bar"]` with the value bound to
+        // `module.__dict__["Foo"]`.
+        let src = "
+            struct ParityProbeUseAliasStruct;
+            use ParityProbeUseAliasStruct as ParityProbeUseAlias;
+        ";
+        let file = syn::parse_file(src).expect("use-alias fixture parses");
+        let module_id = register_rust_module(&file).expect("walker succeeds");
+        let original = module_globals_lookup(module_id, "ParityProbeUseAliasStruct")
+            .expect("original name registered");
+        let alias = module_globals_lookup(module_id, "ParityProbeUseAlias")
+            .expect("alias name registered via Slice O23 use walker");
+        assert_eq!(format!("{:?}", original), format!("{:?}", alias));
+    }
+
+    #[test]
+    fn register_rust_module_use_cascades_through_inline_mod() {
+        // Slice O23: `use foo::Bar;` resolves `Bar` through `foo`'s
+        // class dict (registered as a `HostObject::Class` namespace
+        // by Slice O19's inline-mod walker). Mirrors Python `from foo
+        // import Bar` populating `module.__dict__["Bar"]` with
+        // `foo.Bar`.
+        let src = "
+            mod parity_probe_o23_inline_mod {
+                struct InnerParityStruct;
+                const INNER_PARITY_CONST: i64 = 42;
+            }
+            use parity_probe_o23_inline_mod::InnerParityStruct;
+            use parity_probe_o23_inline_mod::INNER_PARITY_CONST as PARITY_ALIAS_CONST;
+        ";
+        let file = syn::parse_file(src).expect("use-cascade fixture parses");
+        let module_id = register_rust_module(&file).expect("walker succeeds");
+        let inner_struct = module_globals_lookup(module_id, "InnerParityStruct")
+            .expect("inner struct re-bound at outer level");
+        match inner_struct {
+            ConstValue::HostObject(h) => assert!(h.is_class()),
+            other => panic!("expected HostObject(class), got {other:?}"),
+        }
+        match module_globals_lookup(module_id, "PARITY_ALIAS_CONST") {
+            Some(ConstValue::Int(42)) => {}
+            other => panic!("expected Int(42) under alias, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn register_rust_module_use_group_expands_each_leaf() {
+        // Slice O23: `use foo::{Bar, Baz};` flattens to two
+        // bindings (`Bar`, `Baz`), each resolved independently
+        // through the inline-mod cascade. Mirrors Python `from foo
+        // import Bar, Baz` populating `module.__dict__["Bar"]` and
+        // `module.__dict__["Baz"]`.
+        let src = "
+            mod parity_probe_o23_group_mod {
+                struct AlphaProbe;
+                struct BetaProbe;
+                const GAMMA_PROBE: i64 = 7;
+            }
+            use parity_probe_o23_group_mod::{AlphaProbe, BetaProbe, GAMMA_PROBE};
+        ";
+        let file = syn::parse_file(src).expect("use-group fixture parses");
+        let module_id = register_rust_module(&file).expect("walker succeeds");
+        for name in ["AlphaProbe", "BetaProbe"] {
+            match module_globals_lookup(module_id, name) {
+                Some(ConstValue::HostObject(h)) => assert!(h.is_class(), "{name}: expected class"),
+                other => panic!("{name}: expected class, got {other:?}"),
+            }
+        }
+        match module_globals_lookup(module_id, "GAMMA_PROBE") {
+            Some(ConstValue::Int(7)) => {}
+            other => panic!("expected Int(7), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn register_rust_module_use_glob_mirrors_inline_mod_dict() {
+        // Slice O23: `use foo::*;` resolves `foo` to a namespace and
+        // copies every `class_dict_items` entry into the outer
+        // registry partition. Mirrors Python `from foo import *`
+        // populating `module.__dict__` with every public name in
+        // `foo`'s dict.
+        let src = "
+            mod parity_probe_o23_glob_mod {
+                const ALPHA_GLOB: i64 = 1;
+                const BETA_GLOB: i64 = 2;
+                struct GammaGlob;
+            }
+            use parity_probe_o23_glob_mod::*;
+        ";
+        let file = syn::parse_file(src).expect("use-glob fixture parses");
+        let module_id = register_rust_module(&file).expect("walker succeeds");
+        match module_globals_lookup(module_id, "ALPHA_GLOB") {
+            Some(ConstValue::Int(1)) => {}
+            other => panic!("expected Int(1), got {other:?}"),
+        }
+        match module_globals_lookup(module_id, "BETA_GLOB") {
+            Some(ConstValue::Int(2)) => {}
+            other => panic!("expected Int(2), got {other:?}"),
+        }
+        match module_globals_lookup(module_id, "GammaGlob") {
+            Some(ConstValue::HostObject(h)) => assert!(h.is_class()),
+            other => panic!("expected class, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn register_rust_module_inner_use_glob_skips_leading_underscore_names() {
+        // PyPy `from foo import *` skips names beginning with `_` when
+        // the source object has no `__all__`. The inner namespace branch
+        // must apply the same filter as the top-level branch.
+        let src = "
+            mod parity_probe_o23_inner_glob_outer {
+                mod source {
+                    const PUBLIC_INNER_GLOB: i64 = 9;
+                    const _PRIVATE_INNER_GLOB: i64 = 10;
+                    struct PublicInnerGlob;
+                    struct _PrivateInnerGlob;
+                }
+                use source::*;
+            }
+        ";
+        let file = syn::parse_file(src).expect("inner use-glob fixture parses");
+        let module_id = register_rust_module(&file).expect("walker succeeds");
+        let outer_ns = match module_globals_lookup(module_id, "parity_probe_o23_inner_glob_outer") {
+            Some(ConstValue::HostObject(h)) => h,
+            other => panic!("expected outer namespace, got {other:?}"),
+        };
+
+        assert_eq!(
+            outer_ns.class_get("PUBLIC_INNER_GLOB"),
+            Some(ConstValue::Int(9))
+        );
+        match outer_ns.class_get("PublicInnerGlob") {
+            Some(ConstValue::HostObject(h)) => assert!(h.is_class()),
+            other => panic!("expected public class mirrored into outer namespace, got {other:?}"),
+        }
+        assert!(
+            outer_ns.class_get("_PRIVATE_INNER_GLOB").is_none(),
+            "inner glob import must not mirror leading-underscore consts"
+        );
+        assert!(
+            outer_ns.class_get("_PrivateInnerGlob").is_none(),
+            "inner glob import must not mirror leading-underscore classes"
+        );
+    }
+
+    #[test]
+    fn register_rust_module_use_skips_external_crate_paths() {
+        // Slice O23: paths rooted at `crate::`, `super::`, `self::`,
+        // `std::`, `core::`, `alloc::` (or leading-`::`) are
+        // multi-file / external-crate resolution and skipped pending
+        // a future slice. The walker silently drops them; downstream
+        // resolution falls through to `mint_unknown` / cascade
+        // matching the pre-O23 behavior.
+        let src = "
+            use crate::SomeName;
+            use super::OtherName;
+            use std::cell::Cell;
+            use ::leading::Anchor;
+            mod pyre_object { struct LocalPyreObjectThing; }
+            mod majit_trace { struct LocalMajitTraceThing; }
+            mod pyrex { struct LocalPyrexThing; }
+            use pyre_object::LocalPyreObjectThing;
+            use majit_trace::LocalMajitTraceThing;
+            use pyrex::LocalPyrexThing;
+            struct ParitySkipExternalProbe;
+        ";
+        let file = syn::parse_file(src).expect("external-skip fixture parses");
+        let module_id = register_rust_module(&file).expect("walker succeeds");
+        // None of the external-rooted names are registered.
+        for name in [
+            "SomeName",
+            "OtherName",
+            "Cell",
+            "Anchor",
+            "LocalPyreObjectThing",
+            "LocalMajitTraceThing",
+            "LocalPyrexThing",
+        ] {
+            assert!(
+                module_globals_lookup(module_id, name).is_none(),
+                "{name}: expected NOT registered (external-rooted use)"
+            );
+        }
+        // The local struct is still registered (unrelated to the
+        // skipped uses).
+        assert!(module_globals_lookup(module_id, "ParitySkipExternalProbe").is_some());
+    }
+
+    #[test]
+    fn register_rust_module_use_resolves_forward_ref_via_fixed_point() {
+        // Slice O23: `use foo::Bar;` declared BEFORE `mod foo { struct
+        // Bar; }` still resolves because the use is queued in
+        // `deferred_uses` and retried in the same pass-2 fixed-point
+        // loop that handles deferred fns / impls. Mirrors source-order
+        // independence of Rust `use` statements (Python `from foo
+        // import Bar` is technically order-dependent, but the walker
+        // matches Rust's order-free semantic for in-file references).
+        let src = "
+            use parity_probe_o23_fwd_mod::FwdInner;
+            mod parity_probe_o23_fwd_mod {
+                struct FwdInner;
+            }
+        ";
+        let file = syn::parse_file(src).expect("use-forward-ref fixture parses");
+        let module_id = register_rust_module(&file).expect("walker succeeds");
+        match module_globals_lookup(module_id, "FwdInner") {
+            Some(ConstValue::HostObject(h)) => assert!(h.is_class()),
+            other => panic!("expected class via forward-ref resolution, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn register_rust_module_inline_item_mod_dispatches_inner_use() {
+        // Slice O23 inner walker: `use a::b;` inside `mod outer {
+        // mod inner { struct X; } use inner::X; }` resolves through
+        // the outer mod's namespace dict and binds `X` on the outer
+        // mod's class dict. Mirrors Python `class outer:
+        // class inner: X = ...; X = inner.X`.
+        let src = "
+            mod parity_probe_o23_inner_use_outer {
+                mod inner_provider {
+                    struct ProvidedInner;
+                }
+                use inner_provider::ProvidedInner;
+            }
+        ";
+        let file = syn::parse_file(src).expect("inner-use fixture parses");
+        let module_id = register_rust_module(&file).expect("walker succeeds");
+        let outer_ns = match module_globals_lookup(module_id, "parity_probe_o23_inner_use_outer") {
+            Some(ConstValue::HostObject(h)) => h,
+            _ => unreachable!(),
+        };
+        match outer_ns.class_get("ProvidedInner") {
+            Some(ConstValue::HostObject(h)) => assert!(h.is_class()),
+            other => panic!(
+                "expected ProvidedInner re-bound on outer namespace via Slice O23 inner-walker use, \
+                 got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn register_rust_module_inline_item_mod_independent_fns_both_register() {
+        // Slice O20: pass-2 fixed-point loop runs per-namespace and
+        // attempts every collected `Item::Fn` until no more progress.
+        // Two source-order-independent inner fns (no inter-fn calls)
+        // both land successfully — confirms the per-namespace pass-2
+        // sweep mirrors the outer walker's Slice O17 behavior for
+        // independent siblings.
+        let src = "
+            mod parity_probe_o20_indep_mod {
+                fn inner_first() -> i64 { 1 }
+                fn inner_second() -> i64 { 2 }
+            }
+        ";
+        let file = syn::parse_file(src).expect("inline-mod-indep fixture parses");
+        let module_id = register_rust_module(&file).expect("walker succeeds");
+        let ns = match module_globals_lookup(module_id, "parity_probe_o20_indep_mod") {
+            Some(ConstValue::HostObject(h)) => h,
+            other => panic!("expected namespace HostObject, got {other:?}"),
+        };
+        assert!(matches!(
+            ns.class_get("inner_first"),
+            Some(ConstValue::HostObject(h)) if h.is_user_function(),
+        ));
+        assert!(matches!(
+            ns.class_get("inner_second"),
+            Some(ConstValue::HostObject(h)) if h.is_user_function(),
+        ));
+    }
+
+    #[test]
+    fn register_rust_module_inline_item_mod_inner_sibling_call_resolves() {
+        // Slice O21: inner-mod fn `inner_caller` references sibling
+        // `inner_helper` through the inline-mod's namespace dict.
+        // `build_host_function_from_rust_in_module` now threads the
+        // namespace through `func_globals`, so the body's
+        // `LOAD_GLOBAL inner_helper` resolves via
+        // `namespace.class_get("inner_helper")` — mirrors Python
+        // `function.__globals__ = inner_mod.__dict__`.
+        //
+        // Pre-Slice-O21 this test asserted the caller stays
+        // UNREGISTERED (documented Slice O20 limitation). Convergence
+        // landed in O21 by adding the per-fn globals channel.
+        //
+        // Strict-parity (2026-05-11): the fixture's source order is
+        // `caller` BEFORE `helper`, exercising the inner walker's
+        // pre-register pass + pass-2 body retry — without it, caller's
+        // body lowers in iter 1 while `helper` is still absent from the
+        // namespace dict, so the caller's body fails and the
+        // placeholder host carries no PyGraph. The
+        // `lookup_walker_pygraph` assertions below catch that
+        // false-positive: an `is_user_function()` placeholder without a
+        // PyGraph passes the prior shape check but fails the new one.
+        let src = "
+            mod parity_probe_o21_sibling_call {
+                fn inner_caller() -> i64 { inner_helper() }
+                fn inner_helper() -> i64 { 1 }
+            }
+        ";
+        let file = syn::parse_file(src).expect("sibling-call fixture parses");
+        let module_id = register_rust_module(&file).expect("walker succeeds");
+        let ns = match module_globals_lookup(module_id, "parity_probe_o21_sibling_call") {
+            Some(ConstValue::HostObject(h)) => h,
+            _ => unreachable!(),
+        };
+        let helper_host = match ns.class_get("inner_helper") {
+            Some(ConstValue::HostObject(h)) if h.is_user_function() => h,
+            other => panic!("expected inner_helper UserFunction, got {other:?}"),
+        };
+        assert!(
+            crate::flowspace::rust_source::lookup_walker_pygraph(&helper_host).is_some(),
+            "inner_helper must carry a PyGraph after walker pass-2",
+        );
+        let caller_host = match ns.class_get("inner_caller") {
+            Some(ConstValue::HostObject(h)) if h.is_user_function() => h,
+            other => panic!("expected inner_caller UserFunction, got {other:?}"),
+        };
+        assert!(
+            crate::flowspace::rust_source::lookup_walker_pygraph(&caller_host).is_some(),
+            "Slice O21 + Strict-parity (2026-05-11): inner-mod fn body \
+             must lower into a PyGraph even when its sibling reference \
+             points at a fn declared LATER in source order. Without the \
+             inner walker's pre-register pass, the placeholder host \
+             stays in the namespace dict but carries no PyGraph — \
+             `is_user_function()` alone does not catch this regression.",
+        );
+    }
+
+    #[test]
+    fn register_rust_module_inline_item_mod_inner_impl_method_forward_ref_resolves() {
+        // Strict-parity (2026-05-11): inner-mod impl method forward
+        // reference. `caller` references sibling `helper` through
+        // `Self::helper(self)` AFTER `helper` is declared — but the
+        // walker processes impl items in source order. The Phase A
+        // pre-registers ALL methods (`class_set`s them onto the class
+        // dict in iter 1's Phase A) before the Phase B body retry
+        // loops on still-pending bodies, so the body's
+        // `LOAD_ATTR helper` cascades through `class_get("helper")`
+        // and finds the placeholder host even though `helper` is
+        // declared LATER in source order.
+        //
+        // Mirrors upstream Python `class Foo: def caller(self):
+        // self.helper(); def helper(self): pass` — class body executes
+        // both `def`s into `Foo.__dict__` before any flow analysis
+        // looks them up.
+        let src = "
+            mod parity_probe_inner_impl_fwd {
+                pub struct Foo;
+                impl Foo {
+                    pub fn caller(&self) -> i64 { self.helper() }
+                    pub fn helper(&self) -> i64 { 1 }
+                }
+            }
+        ";
+        let file = syn::parse_file(src).expect("inner-impl-fwd fixture parses");
+        let module_id = register_rust_module(&file).expect("walker succeeds");
+        let ns = match module_globals_lookup(module_id, "parity_probe_inner_impl_fwd") {
+            Some(ConstValue::HostObject(h)) => h,
+            _ => unreachable!(),
+        };
+        let foo = match ns.class_get("Foo") {
+            Some(ConstValue::HostObject(h)) if h.is_class() => h,
+            other => panic!("expected Foo class, got {other:?}"),
+        };
+        let helper_host = match foo.class_get("helper") {
+            Some(ConstValue::HostObject(h)) if h.is_user_function() => h,
+            other => panic!("expected Foo::helper UserFunction, got {other:?}"),
+        };
+        assert!(
+            crate::flowspace::rust_source::lookup_walker_pygraph(&helper_host).is_some(),
+            "Foo::helper must carry a PyGraph after walker pass-2",
+        );
+        let caller_host = match foo.class_get("caller") {
+            Some(ConstValue::HostObject(h)) if h.is_user_function() => h,
+            other => panic!("expected Foo::caller UserFunction, got {other:?}"),
+        };
+        assert!(
+            crate::flowspace::rust_source::lookup_walker_pygraph(&caller_host).is_some(),
+            "Strict-parity (2026-05-11): inner-mod impl method body \
+             must lower into a PyGraph even when its sibling method \
+             reference is to a method declared LATER in source order. \
+             Without the inner walker's Phase A class-dict pre-register \
+             pass, the placeholder method stays in the class dict but \
+             carries no PyGraph.",
+        );
+    }
+
+    #[test]
+    fn register_rust_module_top_level_impl_method_forward_ref_resolves() {
+        // Strict-parity (2026-05-11): top-level impl method forward
+        // reference. Same shape as the inner-mod test above but at
+        // module top level. Exercises the OUTER walker's Phase A
+        // class-dict pre-register pass (the new `pending_methods`
+        // queue at the outer walker).
+        let src = "
+            pub struct Foo;
+            impl Foo {
+                pub fn caller(&self) -> i64 { self.helper() }
+                pub fn helper(&self) -> i64 { 1 }
+            }
+        ";
+        let file = syn::parse_file(src).expect("outer-impl-fwd fixture parses");
+        let module_id = register_rust_module(&file).expect("walker succeeds");
+        let foo = match module_globals_lookup(module_id, "Foo") {
+            Some(ConstValue::HostObject(h)) if h.is_class() => h,
+            other => panic!("expected Foo class, got {other:?}"),
+        };
+        let helper_host = match foo.class_get("helper") {
+            Some(ConstValue::HostObject(h)) if h.is_user_function() => h,
+            other => panic!("expected Foo::helper UserFunction, got {other:?}"),
+        };
+        assert!(
+            crate::flowspace::rust_source::lookup_walker_pygraph(&helper_host).is_some(),
+            "Foo::helper must carry a PyGraph after walker pass-2",
+        );
+        let caller_host = match foo.class_get("caller") {
+            Some(ConstValue::HostObject(h)) if h.is_user_function() => h,
+            other => panic!("expected Foo::caller UserFunction, got {other:?}"),
+        };
+        assert!(
+            crate::flowspace::rust_source::lookup_walker_pygraph(&caller_host).is_some(),
+            "Strict-parity (2026-05-11): top-level impl method body \
+             must lower into a PyGraph even when its sibling method \
+             reference is to a method declared LATER in source order. \
+             Without the outer walker's Phase A class-dict pre-register \
+             pass, the placeholder method stays in the class dict but \
+             carries no PyGraph.",
+        );
+    }
+
+    #[test]
+    fn register_rust_module_top_level_impl_cross_trait_method_collision_rejected() {
+        // Strict-parity (2026-05-11, Item 5): two distinct trait
+        // impls writing the same method name to the same target type
+        // would collapse into a single classdict entry under the
+        // walker's flat `class_set(name, ...)` semantics, losing
+        // dispatch identity. The walker now detects this at pre-loop
+        // time and surfaces an `AdapterError::Unsupported`.
+        let src = "
+            pub struct Foo;
+            pub trait TraitA { fn name(&self) -> i64; }
+            pub trait TraitB { fn name(&self) -> i64; }
+            impl TraitA for Foo { fn name(&self) -> i64 { 1 } }
+            impl TraitB for Foo { fn name(&self) -> i64 { 2 } }
+        ";
+        let file = syn::parse_file(src).expect("collision fixture parses");
+        let err = register_rust_module(&file)
+            .expect_err("outer walker must reject cross-trait method-name collision");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("Cross-trait method-name collision"),
+            "outer-walker collision error must carry the diagnostic; got {msg:?}",
+        );
+        assert!(
+            msg.contains("Foo::name"),
+            "outer-walker collision error must name the method; got {msg:?}",
+        );
+    }
+
+    #[test]
+    fn register_rust_module_inline_item_mod_inner_impl_cross_trait_method_collision_rejected() {
+        // Strict-parity (2026-05-11, Item 5): same collision check as
+        // the outer-walker variant above, scoped to inline-mod impls.
+        let src = "
+            mod parity_probe_inner_collide {
+                pub struct Foo;
+                pub trait TraitA { fn name(&self) -> i64; }
+                pub trait TraitB { fn name(&self) -> i64; }
+                impl TraitA for Foo { fn name(&self) -> i64 { 1 } }
+                impl TraitB for Foo { fn name(&self) -> i64 { 2 } }
+            }
+        ";
+        let file = syn::parse_file(src).expect("inner collision fixture parses");
+        let err = register_rust_module(&file)
+            .expect_err("inner walker must reject cross-trait method-name collision");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("Cross-trait method-name collision"),
+            "inner-walker collision error must carry the diagnostic; got {msg:?}",
+        );
+        assert!(
+            msg.contains("Foo::name"),
+            "inner-walker collision error must name the method; got {msg:?}",
+        );
+    }
+
+    #[test]
+    fn register_rust_module_top_level_impl_cross_trait_alias_collision_rejected() {
+        // Strict-parity round-4 (2026-05-11): cross-trait collision
+        // with *aliased* receivers (`use Foo as X; use Foo as Y;`)
+        // resolves both class paths to the same `Arc<HostObjectInner>`
+        // — the textual class-path key (`["X"]` vs `["Y"]`) would
+        // miss the conflict, but the resolved `identity_id()` keying
+        // catches it. This pins the alias-path collision detection
+        // that the textual key from the prior round 3 fix could not.
+        let src = "
+            pub struct Foo;
+            pub trait TraitA { fn name(&self) -> i64; }
+            pub trait TraitB { fn name(&self) -> i64; }
+            use Foo as X;
+            use Foo as Y;
+            impl TraitA for X { fn name(&self) -> i64 { 1 } }
+            impl TraitB for Y { fn name(&self) -> i64 { 2 } }
+        ";
+        let file = syn::parse_file(src).expect("alias collision fixture parses");
+        let err = register_rust_module(&file)
+            .expect_err("outer walker must reject alias-rooted cross-trait collision");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("Cross-trait method-name collision"),
+            "outer-walker alias collision error must carry the diagnostic; got {msg:?}",
+        );
+        assert!(
+            msg.contains("identity matches across alias paths"),
+            "outer-walker alias collision error must mention identity match; got {msg:?}",
+        );
+    }
+
+    #[test]
+    fn register_rust_module_inline_item_mod_inner_impl_cross_trait_alias_collision_rejected() {
+        // Strict-parity round-4 (2026-05-11): inner-walker variant of
+        // the alias-path collision pin. `use Foo as X; use Foo as Y;`
+        // inside an inline mod cascade through the inner namespace
+        // dict — both aliases resolve to the same `Arc<HostObjectInner>`
+        // for `Foo`. The resolved-identity collision check catches the
+        // collision that a textual `(class_path, method_name)` key
+        // would miss.
+        let src = "
+            mod parity_probe_inner_alias_collide {
+                pub struct Foo;
+                pub trait TraitA { fn name(&self) -> i64; }
+                pub trait TraitB { fn name(&self) -> i64; }
+                use Foo as X;
+                use Foo as Y;
+                impl TraitA for X { fn name(&self) -> i64 { 1 } }
+                impl TraitB for Y { fn name(&self) -> i64 { 2 } }
+            }
+        ";
+        let file = syn::parse_file(src).expect("inner alias collision fixture parses");
+        let err = register_rust_module(&file)
+            .expect_err("inner walker must reject alias-rooted cross-trait collision");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("Cross-trait method-name collision"),
+            "inner-walker alias collision error must carry the diagnostic; got {msg:?}",
+        );
+        assert!(
+            msg.contains("identity matches across alias paths"),
+            "inner-walker alias collision error must mention identity match; got {msg:?}",
+        );
+    }
+
+    #[test]
+    fn register_rust_module_walker_error_registry_captures_body_lower_failure() {
+        // Strict-parity round-4 (2026-05-11): the walker keeps a
+        // sibling fn placeholder in the module dict when its body
+        // fails to lower (PyPy `pyopcode.py:1405 STORE_NAME` import-
+        // time semantic), but the original `AdapterError` would be
+        // dropped without a side channel. The new
+        // `HOST_RUST_WALKER_ERRORS` registry captures the rendered
+        // error so a downstream `buildflowgraph(host)` boundary can
+        // re-surface it. This test pins the capture at the walker
+        // layer: a sibling fn whose body uses a closure expression
+        // (rejected by `build_flow_from_rust` as
+        // `AdapterError::Unsupported { reason: "closure (not in
+        // roadmap scope)" }`) ends up in the module dict but with a
+        // populated walker-error entry.
+        let src = "
+            fn good_entry() -> i64 { 1 }
+            fn closure_body() -> i64 {
+                let f = |x: i64| x + 1;
+                f(0)
+            }
+        ";
+        let file = syn::parse_file(src).expect("walker-error fixture parses");
+        let module_id = register_rust_module(&file).expect("walker pass returns Ok overall");
+        let bad_host = match module_globals_lookup(module_id, "closure_body") {
+            Some(ConstValue::HostObject(h)) => h,
+            other => {
+                panic!("closure_body must stay in module dict as placeholder host, got {other:?}",)
+            }
+        };
+        // The placeholder host carries no PyGraph (body never lowered).
+        assert!(
+            crate::flowspace::rust_source::lookup_walker_pygraph(&bad_host).is_none(),
+            "body-failed host must NOT have a PyGraph attached",
+        );
+        // The walker error registry captures the original
+        // `AdapterError::Unsupported` rendering.
+        let captured = crate::flowspace::rust_source::lookup_walker_error(&bad_host)
+            .expect("walker must capture the body-lower AdapterError");
+        assert!(
+            captured.contains("closure"),
+            "captured walker error must name the rejected construct; got {captured:?}",
+        );
+        assert!(
+            captured.contains("unsupported construct"),
+            "captured walker error must come from AdapterError::Unsupported Display; got {captured:?}",
+        );
+        // Cleanup so subsequent tests don't see a stale entry —
+        // production drains via `Translation::drain_walker_pygraphs`,
+        // but this test exercises the walker without constructing a
+        // Translation.
+        let _ = crate::flowspace::rust_source::drain_walker_errors();
+        let _ = crate::flowspace::rust_source::drain_walker_pygraphs();
+    }
+
+    #[test]
+    fn register_rust_module_inline_item_mod_inner_fn_references_inner_const() {
+        // Slice O21 cross-shape lookup: inner-mod fn references an
+        // inner-mod const through the namespace dict. Const is
+        // populated as a `ConstValue::Int` directly (Slice O10
+        // generalization), so `func_globals.class_get("INNER_CONST")`
+        // returns `Some(ConstValue::Int(7))` and the body's `+`
+        // constfolds.
+        let src = "
+            mod parity_probe_o21_const_ref {
+                const INNER_CONST: i64 = 7;
+                fn reads_inner_const() -> i64 { INNER_CONST + 1 }
+            }
+        ";
+        let file = syn::parse_file(src).expect("inner-const-ref fixture parses");
+        let module_id = register_rust_module(&file).expect("walker succeeds");
+        let ns = match module_globals_lookup(module_id, "parity_probe_o21_const_ref") {
+            Some(ConstValue::HostObject(h)) => h,
+            _ => unreachable!(),
+        };
+        assert_eq!(ns.class_get("INNER_CONST"), Some(ConstValue::Int(7)));
+        assert!(
+            matches!(
+                ns.class_get("reads_inner_const"),
+                Some(ConstValue::HostObject(h)) if h.is_user_function(),
+            ),
+            "fn referencing an inner-mod const must resolve through \
+             the namespace's class_get channel"
+        );
+    }
+
+    #[test]
+    fn register_rust_module_inline_item_mod_inner_fn_does_not_see_outer_module_globals() {
+        // Slice O21 scoping invariant: with `func_globals = Some(ns)`,
+        // the global-lookup channel targets `ns.class_get(name)` ONLY
+        // — it does NOT fall through to `module_globals_lookup` for
+        // the outer module. Mirrors Python `function.__globals__`
+        // being a single dict, never a chain.
+        //
+        // Strict-parity (2026-05-10): the inner fn's placeholder host
+        // STAYS in the inner namespace even when its body fails to
+        // resolve `OUTER_CONST_FOR_O21_SCOPING` — mirrors Python's
+        // `def f` populating the namespace dict at class-body exec
+        // time regardless of any later flow-analysis state. The
+        // placeholder carries no attached PyGraph; downstream
+        // `buildflowgraph(host)` surfaces the lazy failure at the
+        // call site rather than retracting the dict entry here.
+        // The scoping invariant is now expressed as "the placeholder
+        // host has no PyGraph" rather than "the entry is absent".
+        let src = "
+            const OUTER_CONST_FOR_O21_SCOPING: i64 = 99;
+            mod parity_probe_o21_scoping {
+                fn references_outer() -> i64 { OUTER_CONST_FOR_O21_SCOPING }
+            }
+        ";
+        let file = syn::parse_file(src).expect("scoping fixture parses");
+        let module_id = register_rust_module(&file).expect("walker succeeds");
+        let ns = match module_globals_lookup(module_id, "parity_probe_o21_scoping") {
+            Some(ConstValue::HostObject(h)) => h,
+            _ => unreachable!(),
+        };
+        let host = match ns.class_get("references_outer") {
+            Some(ConstValue::HostObject(h)) => {
+                assert!(h.is_user_function());
+                h
+            }
+            other => {
+                panic!("inner-mod fn placeholder host must remain in namespace, got {other:?}")
+            }
+        };
+        assert!(
+            crate::flowspace::rust_source::lookup_walker_pygraph(&host).is_none(),
+            "inner-mod fn body must NOT have lowered (no PyGraph) — Rust \
+             scoping requires `use super::X`; the per-fn __globals__ \
+             carrier is a single dict, not a chain"
+        );
+        // Sanity: outer const IS registered at outer module level.
+        assert_eq!(
+            module_globals_lookup(module_id, "OUTER_CONST_FOR_O21_SCOPING"),
+            Some(ConstValue::Int(99))
+        );
+    }
+
+    #[test]
+    fn register_rust_module_inline_item_mod_inner_const_does_not_see_outer_module_globals() {
+        // Audit 1.4 invariant (2026-05-08) + strict-parity (2026-05-10):
+        // inner-mod const RHS bare names that miss the per-mod
+        // `inner_bindings` must NOT fall through to the outer module's
+        // `module_globals_lookup` partition. Both Rust and Python require
+        // explicit `use super::X` to reach outer items; `super::` is
+        // currently classified `External` by `classify_use_root` and
+        // silently skipped.
+        //
+        // Strict-parity (2026-05-10): unresolved single-segment Path
+        // raises `AdapterError::Flowing` (NameError mirroring upstream
+        // `flowcontext.py:845 find_global`), and the inner-mod walker
+        // now PROPAGATES that error verbatim — same shape as the
+        // top-level `Item::Const` arm. `register_rust_module` aborts
+        // the file on the bare-outer-ref fixture; this matches Python's
+        // import-time NameError on the same source-equivalent shape.
+        let src = "
+            const OUTER_CONST_FOR_AUDIT_1_4: i64 = 77;
+            mod parity_probe_audit_1_4_const_scoping {
+                const REFERENCES_OUTER: i64 = OUTER_CONST_FOR_AUDIT_1_4 + 1;
+            }
+        ";
+        let file = syn::parse_file(src).expect("audit-1.4 fixture parses");
+        let err = register_rust_module(&file)
+            .expect_err("inner-mod outer-ref must surface FlowingError, not silent-skip");
+        assert!(
+            matches!(err, AdapterError::Flowing { .. }),
+            "expected AdapterError::Flowing for unresolved outer ident, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn register_rust_module_outer_module_fn_unaffected_by_o21() {
+        // Slice O21 backward compatibility: outer-module fns
+        // continue to lower with `func_globals = None`, falling
+        // back to `module_globals_lookup(module_id, name)` for the
+        // sibling-fn channel (Slice O17 behavior).
+        let src = "
+            fn outer_caller() -> i64 { outer_helper() }
+            fn outer_helper() -> i64 { 42 }
+        ";
+        let file = syn::parse_file(src).expect("outer-fn fixture parses");
+        let module_id = register_rust_module(&file).expect("walker succeeds");
+        // Both fns register at module top level — pre-existing
+        // pass-2 fixed-point loop semantic.
+        assert!(matches!(
+            module_globals_lookup(module_id, "outer_caller"),
+            Some(ConstValue::HostObject(h)) if h.is_user_function(),
+        ));
+        assert!(matches!(
+            module_globals_lookup(module_id, "outer_helper"),
+            Some(ConstValue::HostObject(h)) if h.is_user_function(),
+        ));
+    }
+
+    #[test]
+    fn register_rust_module_inline_item_mod_dispatches_nested_mod() {
+        // Slice O20: `mod a { mod b { ... } }` walks recursively.
+        // Outer-mod namespace `a` carries nested-mod `b` as a
+        // `HostObject::Class` entry; `b`'s own dict carries inner
+        // items. Mirrors `a.b.X` attribute traversal.
+        let src = "
+            mod parity_probe_o20_outer_mod {
+                mod parity_probe_o20_inner_mod {
+                    const NESTED_CONST: i64 = 99;
+                    fn nested_fn() -> i64 { 0 }
+                    struct NestedStruct;
+                }
+            }
+        ";
+        let file = syn::parse_file(src).expect("nested-mod fixture parses");
+        let module_id = register_rust_module(&file).expect("walker succeeds");
+        let outer = match module_globals_lookup(module_id, "parity_probe_o20_outer_mod") {
+            Some(ConstValue::HostObject(h)) => h,
+            other => panic!("expected outer namespace HostObject, got {other:?}"),
+        };
+        let inner = match outer.class_get("parity_probe_o20_inner_mod") {
+            Some(ConstValue::HostObject(h)) => h,
+            other => panic!("expected nested namespace HostObject, got {other:?}"),
+        };
+        assert!(inner.is_class(), "nested mod must mint a class HostObject");
+        assert_eq!(inner.class_get("NESTED_CONST"), Some(ConstValue::Int(99)));
+        match inner.class_get("nested_fn") {
+            Some(ConstValue::HostObject(host)) => {
+                assert!(host.is_user_function(), "nested-mod fn must lower");
+            }
+            other => panic!("expected nested fn HostObject, got {other:?}"),
+        }
+        match inner.class_get("NestedStruct") {
+            Some(ConstValue::HostObject(host)) => assert!(host.is_class()),
+            other => panic!("expected nested struct class, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn register_rust_module_inline_item_mod_inner_impl_does_not_leak_to_outer() {
+        // Slice O20 scoping: `impl InnerStruct` inside `mod foo`
+        // looks up `InnerStruct` against `foo`'s namespace, NOT the
+        // outer module. If the same struct exists at outer level,
+        // the inner impl methods do NOT bind on the outer struct's
+        // class dict.
+        let src = "
+            struct ParityProbeO20OuterStruct;
+            mod parity_probe_o20_scope_mod {
+                struct ParityProbeO20OuterStruct;
+                impl ParityProbeO20OuterStruct {
+                    fn inner_only_method() -> i64 { 11 }
+                }
+            }
+        ";
+        let file = syn::parse_file(src).expect("scoping fixture parses");
+        let module_id = register_rust_module(&file).expect("walker succeeds");
+
+        // Outer struct exists at module top level...
+        let outer_struct = match module_globals_lookup(module_id, "ParityProbeO20OuterStruct") {
+            Some(ConstValue::HostObject(h)) => h,
+            other => panic!("expected outer struct, got {other:?}"),
+        };
+        // ... but it must NOT carry the inner-mod impl method.
+        assert!(
+            outer_struct.class_get("inner_only_method").is_none(),
+            "inner-mod impl method must not leak onto outer-module struct"
+        );
+
+        // The inner-mod struct DOES carry the method.
+        let inner_ns = match module_globals_lookup(module_id, "parity_probe_o20_scope_mod") {
+            Some(ConstValue::HostObject(h)) => h,
+            _ => unreachable!(),
+        };
+        let inner_struct = match inner_ns.class_get("ParityProbeO20OuterStruct") {
+            Some(ConstValue::HostObject(h)) => h,
+            _ => unreachable!(),
+        };
+        match inner_struct.class_get("inner_only_method") {
+            Some(ConstValue::HostObject(h)) => assert!(h.is_user_function()),
+            other => panic!("inner-mod struct must own the impl method, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn register_rust_module_unsupported_body_keeps_placeholder_host() {
+        // Strict-parity (2026-05-09): an Item::Fn whose body the
+        // lowerer rejects (e.g. `as T` cast — task #94) keeps its
+        // pre-registered placeholder host in `module.__dict__` —
+        // mirrors Python's import-time `def f` populating the
+        // module dict regardless of any later flow-analysis state.
+        // The host carries no attached PyGraph, so a downstream
+        // `buildflowgraph(host)` call would surface the failure
+        // lazily rather than at walker time.
 
         let src = "fn parity_probe_walker_with_cast(x: u32) -> i64 { x as i64 }";
         let file = syn::parse_file(src).expect("file fixture parses");
         let module_id = register_rust_module(&file).expect("walker must succeed");
+        let host = match module_globals_lookup(module_id, "parity_probe_walker_with_cast") {
+            Some(ConstValue::HostObject(h)) => {
+                assert!(h.is_user_function());
+                h
+            }
+            other => panic!("placeholder host must remain in module dict, got {other:?}"),
+        };
         assert!(
-            module_globals_lookup(module_id, "parity_probe_walker_with_cast").is_none(),
-            "Item::Fn skip is unconditional regardless of body lowerability",
+            crate::flowspace::rust_source::lookup_walker_pygraph(&host).is_none(),
+            "placeholder host must NOT carry a PyGraph because body never lowered",
         );
     }
 
@@ -2164,6 +5409,56 @@ mod tests {
              got keys: {:?}",
             host.class_dict_keys(),
         );
+    }
+
+    #[test]
+    fn build_host_function_from_rust_file_returns_walker_built_entry_audit_1_2() {
+        // Audit 1.2 (2026-05-08): the walker's pass-2 builds the
+        // entry-point fn alongside its siblings; `build_host_function_from_rust_file`
+        // now reuses that walker-built `HostObject` instead of
+        // re-building. The returned `host` must be the same Arc-
+        // identity as the one registered into `module.__dict__`,
+        // mirroring upstream Python `module.__dict__[entry] is
+        // caller.entry_point`.
+        let src = "fn parity_probe_audit_1_2_entry() -> i64 { 42 }";
+        let file = syn::parse_file(src).expect("audit-1.2 fixture parses");
+        let (host, pygraph) = build_host_function_from_rust_file(
+            &file,
+            "parity_probe_audit_1_2_entry",
+            Some("/parity_probe/audit_1_2_entry.rs"),
+            Some(src),
+        )
+        .expect("walker entry succeeds");
+
+        // Walker-built host lives in the registry under the entry name.
+        // For path-keyed modules, the id derives deterministically from
+        // the path so we can re-derive it for the lookup.
+        let module_id = ModuleId::for_path("/parity_probe/audit_1_2_entry.rs");
+        let walker_host = match module_globals_lookup(module_id, "parity_probe_audit_1_2_entry") {
+            Some(ConstValue::HostObject(h)) => h,
+            other => panic!("expected walker-registered host, got {other:?}"),
+        };
+        assert_eq!(
+            host, walker_host,
+            "audit 1.2: returned host must be the same Arc-identity as \
+             `module.__dict__[entry]`; pre-fix this was a separate post-walk build"
+        );
+
+        // The pygraph must come from the walker registry too —
+        // identity match against `lookup_walker_pygraph(host)`.
+        let walker_pygraph =
+            lookup_walker_pygraph(&walker_host).expect("walker pygraph pinned for entry");
+        assert!(
+            Rc::ptr_eq(&pygraph, &walker_pygraph),
+            "audit 1.2: returned pygraph must be the walker-registered Rc<PyGraph>"
+        );
+
+        // GraphFunc still reads the caller's source pair (audit 1.2 is
+        // about identity, not metadata loss).
+        let gf = host.user_function().expect("user function");
+        let code = gf.code.as_ref().expect("synthetic HostCode");
+        assert_eq!(code.co_filename, "/parity_probe/audit_1_2_entry.rs");
+        assert_eq!(gf.source.as_deref(), Some(src));
     }
 
     #[test]

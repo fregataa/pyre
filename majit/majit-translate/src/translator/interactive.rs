@@ -872,6 +872,20 @@ impl Translation {
             FlowingFlags::default(),
         ));
 
+        // Strict-parity (2026-05-11): the walker pre-pass above wrote
+        // every sibling-fn / impl-method `(host, pygraph)` pair into
+        // the thread-local `HOST_RUST_PYGRAPHS`. Drain the registry
+        // into `context._walker_pygraphs` so the (now-populated)
+        // `TranslationContext` owns the walker output instead of a
+        // process-wide thread-local — eliminating cross-context
+        // bleed-through and aligning the side channel with upstream
+        // `_prebuilt_graphs`'s context-ownership semantic
+        // (`translator.py:50`). After this drain, `buildflowgraph`
+        // reads from `context._walker_pygraphs` (read-not-pop) for
+        // anything that is not the per-instance `_prebuilt_graphs`
+        // entry-point seed.
+        context.drain_walker_pygraphs();
+
         // Upstream `interactive.py:25 buildflowgraph(entry_point)`
         // enters the non-prebuilt branch of
         // `translator.py:46-62 buildflowgraph`. That branch, after

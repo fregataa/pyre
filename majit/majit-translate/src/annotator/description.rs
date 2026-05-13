@@ -3307,7 +3307,18 @@ mod tests {
             None,
         );
         let err = fd.buildgraph(None, None).unwrap_err();
-        assert!(err.msg.unwrap_or_default().contains("BytecodeCorruption"));
+        // Strict-parity (2026-05-10): an empty `co_code` indicates either
+        // a Rust-source-adapter placeholder (body lowering failed at
+        // walker time) or a synthetic test fixture as in this case.
+        // `translator.buildflowgraph` now fails loud at this boundary
+        // rather than handing the metadata-only carrier to upstream
+        // `build_flow`, which previously surfaced the much-deeper
+        // `BytecodeCorruption` from parsing the empty stream.
+        let msg = err.msg.unwrap_or_default();
+        assert!(
+            msg.contains("Rust-source adapter has no PyGraph for this host"),
+            "expected fail-loud guard message, got {msg:?}",
+        );
     }
 
     #[test]

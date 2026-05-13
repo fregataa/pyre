@@ -556,21 +556,63 @@ impl HostObject {
     }
 
     pub fn new_user_function(graph_func: GraphFunc) -> Self {
-        let qualname = graph_func.name.clone();
+        // Audit 1.5 extension (2026-05-08): class-owned methods carry
+        // `Class.method`-shaped qualnames mirroring upstream Python
+        // `func.__qualname__` which `def bar(self): ...` inside a
+        // `class Foo:` produces. `gf.class_` is the resolved owner
+        // (set by the impl-method walker path); when absent the fn is
+        // module-scoped and qualname falls through to `gf.name` per
+        // upstream free-fn shape.
+        //
+        // `name` (the short `__name__` slot) stays at `code.co_name` /
+        // `gf.name` so callers reading the bare ident continue to see
+        // `bar`, not `Foo.bar`. `module_name` for class-owned methods
+        // derives from the owner class's module — `split_attr_name_module`
+        // would mistake the class name for a module otherwise.
+        let class_qualname = graph_func.class_.as_ref().and_then(|c| {
+            let q = c.qualname();
+            if q.is_empty() {
+                None
+            } else {
+                Some(q.to_string())
+            }
+        });
+        let qualname = match &class_qualname {
+            Some(class_q) => format!("{class_q}.{}", graph_func.name),
+            None => graph_func.name.clone(),
+        };
         let name = graph_func
             .code
             .as_ref()
             .map(|code| code.co_name.clone())
-            .unwrap_or_else(|| split_attr_name_module(&qualname).0);
+            .unwrap_or_else(|| {
+                // For class-owned fns the short name comes from
+                // `gf.name` directly (the class prefix is in qualname,
+                // not in `__name__`). For free fns we keep the
+                // historical fall-through to the rsplit so synthetic
+                // dotted-qualnames (e.g. `pkg.module.demo`) still
+                // surface their tail as `__name__`.
+                if class_qualname.is_some() {
+                    graph_func.name.clone()
+                } else {
+                    split_attr_name_module(&qualname).0
+                }
+            });
         // Upstream `func.__module__` lives on the function object —
-        // `GraphFunc::module` carries it directly. Fall back to the
-        // qualname split only when the GraphFunc was built without a
+        // `GraphFunc::module` carries it directly. Class-owned fns
+        // additionally consult the owner class's module when their
+        // own slot is unset, mirroring upstream `Foo.bar.__module__`
+        // == `Foo.__module__`. Free fns fall back to the qualname
+        // split only when the GraphFunc was built without a
         // `__module__` slot (synthetic-globals fixtures, descriptor-
         // class helpers).
-        let module_name = graph_func
-            .module
-            .clone()
-            .or_else(|| split_attr_name_module(&qualname).1);
+        let module_name = graph_func.module.clone().or_else(|| {
+            if let Some(class) = graph_func.class_.as_ref() {
+                class.module_name().map(str::to_owned)
+            } else {
+                split_attr_name_module(&qualname).1
+            }
+        });
         HostObject {
             inner: Arc::new(HostObjectInner {
                 qualname,

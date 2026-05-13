@@ -328,6 +328,7 @@ fn jit_marker_key_from_target(target: &CallTarget) -> Option<JitMarkerKey> {
     let CallTarget::Method {
         name,
         receiver_root: Some(receiver_root),
+        ..
     } = target
     else {
         return None;
@@ -4009,10 +4010,12 @@ fn call_target_matches_loose(pattern: &CallTarget, target: &CallTarget) -> bool 
             CallTarget::Method {
                 name: pn,
                 receiver_root: pr,
+                ..
             },
             CallTarget::Method {
                 name: tn,
                 receiver_root: tr,
+                ..
             },
         ) => {
             if pn != tn {

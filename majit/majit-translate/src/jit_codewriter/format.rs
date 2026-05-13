@@ -396,6 +396,7 @@ fn call_target_repr(target: &crate::model::CallTarget) -> String {
         CallTarget::Method {
             name,
             receiver_root,
+            ..
         } => match receiver_root {
             Some(root) => format!("$<* function '{root}.{name}'>"),
             None => format!("$<* function '{name}'>"),

@@ -119,7 +119,10 @@ mod host_env;
 pub mod register;
 
 pub use build_flow::{AdapterError, build_flow_from_rust, build_flow_from_rust_in_module};
-pub use host_env::ModuleId;
+pub use host_env::{
+    ModuleId, drain_walker_errors, drain_walker_pygraphs, lookup_walker_error,
+    lookup_walker_pygraph,
+};
 pub use register::{
     build_host_function_from_rust, build_host_function_from_rust_file,
     build_host_function_metadata_from_rust, register_rust_module, register_rust_module_at,

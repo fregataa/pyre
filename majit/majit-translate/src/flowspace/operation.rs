@@ -1952,16 +1952,27 @@ fn constfold_always_raises(kind: OpKind, args: &[&ConstValue]) -> Option<Flowing
                 "TypeError: ordering comparison not supported between distinct primitive types",
             ))
         }
-        // ValueError on negative shift count. Upstream
-        // `operator.lshift(_, -1)` / `operator.rshift(_, -1)` raise
-        // `ValueError: negative shift count` directly, captured by
-        // `PureOperation.constfold`'s try/except at
-        // `operation.py:120-127` and re-raised as `FlowingError`.
-        // Both base ops are pure; `lshift_ovf` is HLOperation default
-        // (`pure=False` per `add_operator(name + '_ovf', …)` at
-        // `:337-338`) so this whitelist arm is unreachable for it via
-        // the `pure()` gate.
-        (OpKind::LShift | OpKind::RShift, [_, ConstValue::Int(b)]) if *b < 0 => {
+        // TypeError / ValueError on shifts. Upstream does not inspect the
+        // RHS first; it calls `operator.lshift/rshift(lhs, rhs)` directly
+        // from `PureOperation.constfold` (`operation.py:120-127`). That
+        // means operand type dispatch wins before the "negative shift
+        // count" check: `1 << -1` raises `ValueError`, but `1.0 << -1`
+        // raises `TypeError` because float has no shift operation.
+        //
+        // Classify only carrier types whose Python builtins are known not
+        // to implement shifts. `HostObject` is left alone because a user
+        // object may define `__lshift__` / `__rshift__`.
+        (OpKind::LShift | OpKind::RShift, [lhs, rhs]) if shift_type_error(lhs, rhs) => {
+            Some(make_err("TypeError: unsupported operand type(s) for shift"))
+        }
+        // ValueError on negative shift count for int-shaped operands
+        // (`bool` is an `int` subclass). Both base ops are pure;
+        // `lshift_ovf` is HLOperation default (`pure=False` per
+        // `add_operator(name + '_ovf', …)` at `:337-338`) so this
+        // whitelist arm is unreachable for it via the `pure()` gate.
+        (OpKind::LShift | OpKind::RShift, [lhs, ConstValue::Int(b)])
+            if is_int_like(lhs) && *b < 0 =>
+        {
             Some(make_err("ValueError: negative shift count"))
         }
         _ => None,
@@ -2007,6 +2018,28 @@ fn is_int_like(v: &ConstValue) -> bool {
 /// `ZeroDivisionError` upstream).
 fn is_zero_numeric(v: &ConstValue) -> bool {
     is_zero_int_like(v) || matches!(v, ConstValue::Float(bits) if f64::from_bits(*bits) == 0.0)
+}
+
+/// Helper for [`constfold_always_raises`]: returns `true` when
+/// `operator.lshift/rshift(lhs, rhs)` would fail during operand type
+/// dispatch before any shift-count check. Mirrors Python's shift
+/// contract: only int-shaped operands (`int` / `bool`) are admitted by
+/// the builtin numeric path.
+fn shift_type_error(lhs: &ConstValue, rhs: &ConstValue) -> bool {
+    fn known_non_shift_operand(v: &ConstValue) -> bool {
+        matches!(
+            v,
+            ConstValue::Float(_)
+                | ConstValue::ByteStr(_)
+                | ConstValue::UniStr(_)
+                | ConstValue::Tuple(_)
+                | ConstValue::List(_)
+                | ConstValue::Dict(_)
+                | ConstValue::None
+        )
+    }
+    (known_non_shift_operand(lhs) || known_non_shift_operand(rhs))
+        && !(is_int_like(lhs) && is_int_like(rhs))
 }
 
 /// Helper for [`constfold_always_raises`]: returns `true` when `a`
@@ -3604,6 +3637,27 @@ mod tests {
                 "{kind:?}(_, -1): {}",
                 err.message,
             );
+        }
+        // Upstream calls `operator.lshift/rshift(lhs, rhs)` directly.
+        // Operand type dispatch happens before the negative-count check:
+        // `1 << -1` is ValueError, but `1.0 << -1` is TypeError.
+        for kind in [OpKind::LShift, OpKind::RShift] {
+            for args in [
+                vec![cf(1.0), ci(-1)],
+                vec![ci(1), cf(1.0)],
+                vec![cs("x"), ci(1)],
+            ] {
+                let op = HLOperation::new(kind, args);
+                let err = op
+                    .constfold()
+                    .expect_err("non-int shift operands must raise TypeError");
+                assert!(
+                    err.message.contains("TypeError")
+                        && !err.message.contains("negative shift count"),
+                    "{kind:?}: {}",
+                    err.message,
+                );
+            }
         }
         // RShift large positive count: Python arithmetic shift
         // saturates — `1 >> 64 == 0`, `-1 >> 64 == -1`. RShift is

@@ -2454,10 +2454,7 @@ mod tests {
         let op = SpaceOperation {
             result: Some(ValueId(3)),
             kind: OpKind::Call {
-                target: crate::model::CallTarget::Method {
-                    name: "push".into(),
-                    receiver_root: Some("Vec".into()),
-                },
+                target: crate::model::CallTarget::method("push", Some("Vec".into())),
                 args: vec![ValueId(1), ValueId(2)],
                 result_ty: ValueType::Int,
             },

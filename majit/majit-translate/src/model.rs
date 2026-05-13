@@ -224,6 +224,19 @@ pub enum CallTarget {
     Method {
         name: String,
         receiver_root: Option<String>,
+        /// Plan `annotator-monomorphization-tier1` phase M2.b — transient
+        /// transport only for the concrete receiver `ClassDefKey` that
+        /// the annotator's `lookup_filter` / `MethodDesc.selfclassdef`
+        /// picks per call site. **Never source of truth**: authority is
+        /// `MethodDesc(originclassdef/selfclassdef)` +
+        /// `SomeInstance.classdef`. This field is `None` everywhere
+        /// except in the narrow window between the annotator pass and
+        /// the call-resolution fold; serde + stable caches must never
+        /// observe `Some(_)` (enforced by `#[serde(skip)]` and the fold
+        /// pass that collapses `Some` targets to a concrete `CallPath`
+        /// before serialization).
+        #[serde(skip, default)]
+        classdef_hint: Option<crate::annotator::description::ClassDefKey>,
     },
     FunctionPath {
         segments: Vec<String>,
@@ -250,6 +263,35 @@ impl CallTarget {
         Self::Method {
             name: name.into(),
             receiver_root,
+            classdef_hint: None,
+        }
+    }
+
+    /// Plan M2.b constructor — attach the annotator's concrete-receiver
+    /// classdef decision to an already-built `CallTarget::Method`. Used
+    /// only by the fold pass that consumes MethodDesc-keyed decisions;
+    /// every other caller should go through [`Self::method`] to keep
+    /// `classdef_hint` at `None`.
+    pub fn method_with_classdef_hint(
+        name: impl Into<String>,
+        receiver_root: Option<String>,
+        classdef_hint: crate::annotator::description::ClassDefKey,
+    ) -> Self {
+        Self::Method {
+            name: name.into(),
+            receiver_root,
+            classdef_hint: Some(classdef_hint),
+        }
+    }
+
+    /// Plan M2.b accessor — read the classdef hint if present. Callers
+    /// must treat `None` as "annotator did not supply a decision";
+    /// falling back to `receiver_root` string is the pre-M3 heuristic
+    /// path and should be retired per plan phase M4.
+    pub fn classdef_hint(&self) -> Option<crate::annotator::description::ClassDefKey> {
+        match self {
+            CallTarget::Method { classdef_hint, .. } => *classdef_hint,
+            _ => None,
         }
     }
 
@@ -300,10 +342,12 @@ impl fmt::Display for CallTarget {
             CallTarget::Method {
                 name,
                 receiver_root: Some(receiver_root),
+                ..
             } => write!(f, "{receiver_root}.{name}"),
             CallTarget::Method {
                 name,
                 receiver_root: None,
+                ..
             } => f.write_str(name),
             CallTarget::FunctionPath { segments } => f.write_str(&segments.join("::")),
             CallTarget::SyntheticTransparentCtor { name } => {
@@ -2683,5 +2727,72 @@ mod tests {
             vec![unused_param],
             "non-canonical entry block (no incoming link) must keep its inputargs"
         );
+    }
+
+    // =========================================================
+    // Plan `annotator-monomorphization-tier1` phase M2.b tests —
+    // CallTarget::Method transient ClassDefKey transport.
+    // =========================================================
+
+    #[test]
+    fn call_target_method_default_classdef_hint_is_none() {
+        // Plan M2.b invariant: outside the narrow annotate→fold window,
+        // `classdef_hint` must be `None`. The public constructor is the
+        // stable entry point; callers using `CallTarget::method(...)`
+        // must never observe a `Some(_)` hint.
+        let t = CallTarget::method("foo", Some("Bar".to_string()));
+        assert_eq!(t.classdef_hint(), None);
+    }
+
+    #[test]
+    fn call_target_method_with_classdef_hint_holds_and_exposes_hint() {
+        use crate::annotator::description::ClassDefKey;
+        let hint = ClassDefKey::from_raw(0x1234);
+        let t = CallTarget::method_with_classdef_hint("foo", Some("Bar".to_string()), hint);
+        assert_eq!(t.classdef_hint(), Some(hint));
+        // The `name` + `receiver_root` must survive verbatim.
+        match &t {
+            CallTarget::Method {
+                name,
+                receiver_root,
+                classdef_hint,
+            } => {
+                assert_eq!(name, "foo");
+                assert_eq!(receiver_root.as_deref(), Some("Bar"));
+                assert_eq!(*classdef_hint, Some(hint));
+            }
+            other => panic!("expected CallTarget::Method, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn call_target_method_classdef_hint_is_skipped_by_serde() {
+        // Plan M2.b invariant: the hint must never reach serde
+        // surfaces. Serializing a `Some`-hint target and deserializing
+        // back must drop the hint to `None`.
+        use crate::annotator::description::ClassDefKey;
+        let hint = ClassDefKey::from_raw(0xDEAD);
+        let t = CallTarget::method_with_classdef_hint("foo", Some("Bar".to_string()), hint);
+        let json = serde_json::to_string(&t).expect("encode");
+        // The serialized JSON must not contain any classdef_hint field.
+        assert!(
+            !json.contains("classdef_hint"),
+            "serialized form leaks classdef_hint: {json}"
+        );
+        let round_trip: CallTarget = serde_json::from_str(&json).expect("decode");
+        assert_eq!(round_trip.classdef_hint(), None);
+        // But the stable surface (name, receiver_root) must survive.
+        match round_trip {
+            CallTarget::Method {
+                name,
+                receiver_root,
+                classdef_hint,
+            } => {
+                assert_eq!(name, "foo");
+                assert_eq!(receiver_root.as_deref(), Some("Bar"));
+                assert_eq!(classdef_hint, None);
+            }
+            other => panic!("expected CallTarget::Method, got {other:?}"),
+        }
     }
 }

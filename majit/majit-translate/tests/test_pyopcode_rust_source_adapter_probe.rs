@@ -185,23 +185,56 @@ fn adapter_rejects_execute_opcode_step_on_composite_match_pattern() {
     //   pairs the metadata HostObject with a stored `&syn::ItemFn`
     //   for replay, OR M2.5f-style eager prebuilt-graph
     //   construction at walker time.
-    //
+    // - 2026-05-07 — `d126c8d16d7` re-introduced eager Item::Fn
+    //   registration (the M2.5f-style prebuilt-graph path
+    //   convergence option). Walker now does try-build-then-
+    //   register-on-success: `Item::Fn`s whose bodies lower
+    //   cleanly register as `HostObject::UserFunction` carrying
+    //   the prebuilt PyGraph; bodies the walker rejects (e.g.
+    //   `as T`) stay unregistered, falling back to the resolver's
+    //   mint-or-fail path. Helpers' `as T` cast bodies (Slice 3)
+    //   continue to fail registration → probe stayed at
+    //   `UnboundLocal { name: "u32_as_i64" }` (the first cascade-
+    //   driven helper reference encountered in
+    //   `execute_opcode_step`).
+    // - 2026-05-08 — Epic B Slice 5 (first in-session slice):
+    //   `u32_as_i64` body rewritten from `x as i64` to
+    //   `i64::from(x)`. The lossless `From<u32> for i64` impl
+    //   lowers as `simple_call(getattr(<i64>, "from"), x)` per
+    //   `lower_call`, mirroring upstream's
+    //   `LOAD_GLOBAL r_longlong; LOAD_FAST x; CALL_FUNCTION 1`
+    //   (the RPython idiom for explicit widening at
+    //   `rlib/rarithmetic.py:303`). Walker registers `u32_as_i64`
+    //   with its prebuilt graph; the cascade in
+    //   `execute_opcode_step` now resolves the helper and walks
+    //   deeper, surfacing the closure expression as the new
+    //   un-roadmapped construct. The 3 sibling helpers
+    //   (`u32_as_usize` / `op_arg_as_usize` / `raise_kind_as_usize`)
+    //   stay un-rewritten this session because their u32 → usize
+    //   cast has no const-stable `From` impl on 32-bit hosts; the
+    //   helper bodies' `as usize` survives until a follow-up
+    //   slice replaces it with `usize::try_from(x).expect(...)`
+    //   or similar (no-`as`) idiom. Reaching either of those
+    //   helpers requires the closure rejection to lift first, so
+    //   the probe re-pins to the closure stuck point.
 
-    // Current rejection state (post-Issue-1.2): walker registers
-    // only `Item::Enum` / `Item::Struct` / literal `Item::Const`.
-    // The cast-removal Slice 3 helpers (`u32_as_i64` /
-    // `u32_as_usize` / `op_arg_as_usize` / `raise_kind_as_usize`)
-    // are top-level `Item::Fn` and therefore unresolved at call
-    // sites — adapter rejects with `UnboundLocal { name }` on the
-    // first cascade-driven helper reference.
+    // Current rejection state (post-Epic-B-Slice-5): walker
+    // registers `Item::Enum` / `Item::Struct` / `Item::Const` /
+    // `Item::Fn` (eagerly via `d126c8d16d7`'s prebuilt-graph
+    // path). `u32_as_i64` registers cleanly because its body now
+    // calls `i64::from(x)` (no `as`). The walker progresses past
+    // the helper into the closure expression at the next un-
+    // roadmapped body construct.
     //
     // The probe pins this state strictly:
     //
-    // - `UnboundLocal { name }` in the cast-removal helper set is
-    //   the expected post-Issue-1.2 state.
-    // - `Unsupported(closure)` would mean Item::Fn registration
-    //   was silently re-introduced (the walker registered fn names
-    //   again, masquerading as callables with empty bodies).
+    // - `Unsupported(closure)` in `execute_opcode_step` is the
+    //   post-Epic-B-Slice-5 expected state — the walker walked
+    //   past the cast-removal helper layer.
+    // - `UnboundLocal { name }` in the cast-removal helper set
+    //   would mean Item::Fn registration regressed (the walker
+    //   stopped registering helpers eagerly, rolling back to the
+    //   pre-`d126c8d16d7` Issue-1.2 state).
     // - Any earlier `Unsupported` reason (or-pattern, variant-
     //   path, composite, field-bindings, qualified-path, numeric-
     //   cast) means an O3/O4/O5/M2.5d slice silently regressed.
@@ -221,9 +254,23 @@ fn adapter_rejects_execute_opcode_step_on_composite_match_pattern() {
     let err = build_flow_from_rust_in_module(func, module_id)
         .err()
         .expect(
-            "adapter still has un-roadmapped constructs to walk past — see post-Issue-1.2 timeline",
+            "adapter still has un-roadmapped constructs to walk past — see post-Epic-B-Slice-5 timeline",
         );
     match err {
+        AdapterError::Unsupported { reason } => {
+            assert!(
+                reason.contains("closure"),
+                "post-Epic-B-Slice-5 state expects `Unsupported(closure ...)` after \
+                 the walker walked past the cast-removal helper layer; got \
+                 {reason:?}. If a different `Unsupported` reason surfaces, an \
+                 intermediate slice (M2.5d struct/tuple/cascade or O3/O4/O5 \
+                 host-env resolution) may have silently regressed. Re-pin \
+                 explicitly when a new construct unlocks past the closure."
+            );
+            eprintln!(
+                "adapter rejection at post-Epic-B-Slice-5 probe: Unsupported({reason}) — expected"
+            );
+        }
         AdapterError::UnboundLocal { name } => {
             const CAST_REMOVAL_SLICE3_HELPERS: &[&str] = &[
                 "u32_as_i64",
@@ -231,27 +278,36 @@ fn adapter_rejects_execute_opcode_step_on_composite_match_pattern() {
                 "op_arg_as_usize",
                 "raise_kind_as_usize",
             ];
-            assert!(
-                CAST_REMOVAL_SLICE3_HELPERS.contains(&name.as_str()),
-                "post-Issue-1.2 state expects an unresolved cast-removal helper from \
-                 {CAST_REMOVAL_SLICE3_HELPERS:?}, got {name:?}. If a different name \
-                 surfaces, the cascade walked past the cast-removal helper layer — \
-                 re-pin this list explicitly with the new helper name."
-            );
-            eprintln!("adapter rejection at post-Issue-1.2 probe: UnboundLocal({name}) — expected");
-        }
-        AdapterError::Unsupported { reason } => {
-            // If this branch hits, Item::Fn registration regressed
-            // — the closure rejection is downstream of helper
-            // resolution and should not be reachable without it.
+            // If this branch hits at one of the helpers, eager
+            // Item::Fn registration regressed — Epic B Slice 5
+            // expected `u32_as_i64` to register cleanly via
+            // `d126c8d16d7`'s prebuilt-graph walker path.
+            // Surfacing one of the unrewritten helpers
+            // (`u32_as_usize` / `op_arg_as_usize` /
+            // `raise_kind_as_usize`) means walker rejection on
+            // their `as T` body is now blocking before reaching
+            // the closure — that's NOT the post-Epic-B-Slice-5
+            // state because they're encountered AFTER the
+            // closure-bearing arm in source order.
+            if CAST_REMOVAL_SLICE3_HELPERS.contains(&name.as_str()) {
+                panic!(
+                    "PARITY REGRESSION: probe expected `Unsupported(closure ...)` \
+                     (post-Epic-B-Slice-5 state) but adapter rejected with \
+                     `UnboundLocal({name})`. Either eager Item::Fn registration \
+                     regressed past `d126c8d16d7` OR the `u32_as_i64` body \
+                     rewrite (`x as i64` → `i64::from(x)`) was reverted. See \
+                     timeline above."
+                );
+            }
             panic!(
-                "PARITY REGRESSION: probe expected `UnboundLocal(<cast-removal helper>)` \
-                 (post-Issue-1.2 state) but adapter rejected with `Unsupported({reason})`. \
-                 Item::Fn registration in `register_rust_module` may have been \
-                 re-introduced — see Issue 1.2 PRE-EXISTING-ADAPTATION."
+                "unexpected `UnboundLocal({name})`: the post-Epic-B-Slice-5 \
+                 state expects `Unsupported(closure)`. If `{name}` is a new \
+                 helper that should resolve via the walker, register it with \
+                 the appropriate Item::Fn body shape; otherwise this is a \
+                 silent slip and must be investigated."
             );
         }
-        other => panic!("expected AdapterError::UnboundLocal, got {other:?}"),
+        other => panic!("expected AdapterError::Unsupported, got {other:?}"),
     }
 }
 

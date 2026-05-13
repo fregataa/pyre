@@ -1350,31 +1350,47 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
 /// `majit/majit-translate/src/flowspace/rust_source/build_flow.rs:lower_cast`
 /// rejects. Upstream parity: RPython source uses `r_longlong(x)` /
 /// `widen(x)` (`rlib/rarithmetic.py:303`) — class/function calls,
-/// never `as` syntax. The flowspace adapter walks one function at a
-/// time, so this helper body's residual `as` cast is opaque to the
-/// analyzer that processes `execute_opcode_step`.
+/// never `as` syntax. The body uses `i64::from(x)` (lossless
+/// `From<u32>` impl) so the flowspace walker lowers it line-by-line
+/// as `simple_call(getattr(<i64>, "from"), x)` matching upstream's
+/// `LOAD_GLOBAL r_longlong; LOAD_FAST x; CALL_FUNCTION 1` shape.
+/// The helper is no longer `const fn` because `<i64 as From<u32>>::from`
+/// is not yet stable as const (see Rust issue #143874); none of the
+/// 38 call sites use the helper in a const context.
 #[inline]
-const fn u32_as_i64(x: u32) -> i64 {
-    x as i64
+fn u32_as_i64(x: u32) -> i64 {
+    i64::from(x)
 }
 
 /// Widen a `u32`-typed oparg to host-pointer-sized `usize`. See
-/// [`u32_as_i64`] for the parity rationale.
+/// [`u32_as_i64`] for the parity rationale. The body uses
+/// `usize::try_from(x).expect(...)` because Rust stdlib does not
+/// provide a `From<u32> for usize` impl (u32 → usize is not
+/// universally lossless: 16-bit hosts have `usize` smaller than u32).
+/// On supported pyre targets (64-bit Darwin) the conversion is
+/// always lossless, so the runtime `expect(...)` never trips. Walker
+/// lowers as `simple_call(getattr(<usize>, "try_from"), x).expect(…)`
+/// — `lower_method_call` then chains the `.expect` getattr+simple_call
+/// per `build_flow.rs:lower_method_call`. Drop `const fn` because
+/// neither `usize::try_from` nor `Result::expect` is yet stable as
+/// const.
 #[inline]
-const fn u32_as_usize(x: u32) -> usize {
-    x as usize
+fn u32_as_usize(x: u32) -> usize {
+    usize::try_from(x).expect("u32 fits in usize on supported pyre targets (64-bit only)")
 }
 
 /// Widen a raw [`OpArg`] to host-pointer-sized `usize`. Used at
 /// instruction sites that consume the oparg directly (no inner
 /// `Arg<T>::get` call) — currently `JumpForward` /
 /// `jump_target_forward` indirections at `pyopcode.rs:1809,1926`.
-/// `u32::from(arg)` is a trait-method call (lowers as
-/// `simple_call("u32::from", arg)`); the residual `as usize` lives
-/// inside this helper body, opaque to the per-function adapter walk.
+/// Composes `u32::from(arg)` (trait-method call lowered as
+/// `simple_call(getattr(<u32>, "from"), arg)`) with
+/// `usize::try_from(...).expect(…)` to keep the body adapter-friendly
+/// — see [`u32_as_usize`] for the u32 → usize parity rationale.
 #[inline]
 fn op_arg_as_usize(arg: OpArg) -> usize {
-    u32::from(arg) as usize
+    usize::try_from(u32::from(arg))
+        .expect("u32 fits in usize on supported pyre targets (64-bit only)")
 }
 
 /// Extract a [`RaiseKind`]'s discriminant as `usize`. Same parity
@@ -1383,11 +1399,13 @@ fn op_arg_as_usize(arg: OpArg) -> usize {
 /// at a `RaiseVarargs` arm has no flowspace counterpart. `u32::from`
 /// goes through the `From<RaiseKind> for u32` impl synthesized by
 /// `rustpython-compiler-core`'s `oparg_enum!` macro
-/// (`oparg.rs:215-219`); the residual `as usize` widens (`u32 ≤ usize`
-/// on every supported pyre target host) inside this helper body.
+/// (`oparg.rs:215-219`); the u32 → usize widening uses
+/// `usize::try_from(...).expect(…)` to match the rest of the
+/// cast-removal helper family — see [`u32_as_usize`].
 #[inline]
 fn raise_kind_as_usize(kind: RaiseKind) -> usize {
-    u32::from(kind) as usize
+    usize::try_from(u32::from(kind))
+        .expect("u32 fits in usize on supported pyre targets (64-bit only)")
 }
 
 pub fn execute_opcode_step<E: OpcodeStepExecutor>(

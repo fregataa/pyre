@@ -2412,6 +2412,7 @@ impl CallControl {
             CallTarget::Method {
                 name,
                 receiver_root,
+                ..
             } => self
                 .function_graphs
                 .get(&path)
@@ -2436,6 +2437,7 @@ impl CallControl {
             CallTarget::Method {
                 name,
                 receiver_root,
+                ..
             } => {
                 // RPython: direct_call → funcobj.graph. Try qualified path first
                 // so inherent methods resolve by direct graph linkage.

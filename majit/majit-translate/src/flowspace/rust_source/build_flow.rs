@@ -33,8 +33,8 @@ use syn::{
 };
 
 use crate::flowspace::model::{
-    Block, BlockRef, BlockRefExt, ConstValue, Constant, FunctionGraph, HOST_ENV, Hlvalue, Link,
-    SpaceOperation, Variable, c_last_exception,
+    Block, BlockRef, BlockRefExt, ConstValue, Constant, FunctionGraph, HOST_ENV, Hlvalue,
+    HostObject, Link, SpaceOperation, Variable, c_last_exception,
 };
 use crate::flowspace::operation::{HLOperation, OpKind};
 
@@ -110,6 +110,29 @@ pub fn build_flow_from_rust_in_module(
     func: &ItemFn,
     module_id: ModuleId,
 ) -> Result<FunctionGraph, AdapterError> {
+    build_flow_from_rust_in_module_with_globals(func, module_id, None)
+}
+
+/// Globals-aware entry (Slice O21): identical to
+/// [`build_flow_from_rust_in_module`] but lets the caller override
+/// the `LOAD_GLOBAL` lookup target with an inline-mod namespace
+/// `HostObject::Class`. Mirrors Python
+/// `function.__globals__ = inner_mod.__dict__` for fns registered
+/// inside an inline `mod foo { ... }` block — the per-fn globals
+/// carrier replaces `module_globals_lookup(module_id, ...)` for
+/// the duration of the lower.
+///
+/// `func_globals=None` falls back to module-level partition lookup,
+/// equivalent to the 2-arg entry; passing the inline-mod namespace
+/// `HostObject::Class` for `func_globals` lets inner-mod fn bodies
+/// resolve sibling inner-mod fns / consts / classes through the
+/// namespace's `class_get(name)` channel, fixing the documented
+/// Slice O20 limitation.
+pub fn build_flow_from_rust_in_module_with_globals(
+    func: &ItemFn,
+    module_id: ModuleId,
+    func_globals: Option<HostObject>,
+) -> Result<FunctionGraph, AdapterError> {
     validate_signature(func)?;
 
     let (inputargs, locals, local_unary_not_kinds) = collect_params(func)?;
@@ -128,6 +151,7 @@ pub fn build_flow_from_rust_in_module(
         loop_stack: Vec::new(),
         module_id,
         local_unary_not_kinds,
+        func_globals,
     };
 
     // Function body root: tail expression flows directly into the
@@ -351,12 +375,31 @@ struct Builder {
     /// module reference, and `LOAD_GLOBAL` reads that module's
     /// dict — not a process-shared registry. Issue 1.3 closure
     /// (2026-05-05): replaces the prior process-global lookup.
+    ///
+    /// When [`Self::func_globals`] is `Some`, the partition lookup
+    /// keyed on `module_id` is bypassed — the namespace dict is the
+    /// canonical `__globals__` carrier. `module_id` is kept for
+    /// downstream consumers (e.g. `mint_host_class` keys, error
+    /// rendering) that still need a stable module identity.
     module_id: ModuleId,
     /// Rust-only adapter metadata for the overloaded `!` token. Python
     /// bytecode already distinguishes `UNARY_NOT` from `UNARY_INVERT`;
     /// Rust source does not, so the adapter keeps the minimal local type
     /// fact needed to choose the matching RPython opcode.
     local_unary_not_kinds: HashMap<String, UnaryNotOperandKind>,
+    /// Per-fn `__globals__` carrier for inner-mod fns (Slice O21).
+    /// When `Some(ns)`, the fn was registered through Slice O20's
+    /// inline-mod walker so its globals lookup targets `ns`'s
+    /// `class_get(name)` (the inner mod's dict) instead of
+    /// `module_globals_lookup(self.module_id, name)`. Mirrors Python
+    /// `function.__globals__ = inner_mod.__dict__` — every function
+    /// has exactly one `__globals__`, never a chain.
+    ///
+    /// `None` for outer-module fns where `__globals__` IS the module
+    /// dict — partition lookup via `module_id` is the canonical
+    /// path. Outer fns whose source contains a sibling-fn call walk
+    /// through `module_globals_lookup` per Slice O17's pass-2 rules.
+    func_globals: Option<HostObject>,
 }
 
 impl Builder {
@@ -465,9 +508,10 @@ impl Builder {
     ///    closed-world `host_env::PYRE_STDLIB` registry (the
     ///    `__builtin__` analogue) yields a
     ///    `Constant(HostObject(<class>))` for `Ok` / `Some` / `Err` /
-    ///    `Result` / `Option`; otherwise `UnboundLocal`. `Item::Fn` is
-    ///    NOT in the module-globals registry (Issue 1.2
-    ///    PRE-EXISTING-ADAPTATION — see "uncovered" section below).
+    ///    `Result` / `Option`; otherwise `UnboundLocal`. Top-level
+    ///    `Item::Fn` whose body lowers cleanly is also registered
+    ///    (Slice O16 — try-build-then-register-on-success), exposing
+    ///    sibling helpers via `Constant(HostObject::UserFunction)`.
     ///    No on-demand minting at single-segment scope — a bare
     ///    PascalCase identifier could be a local, a unit struct, a
     ///    const, or a type, and the adapter cannot disambiguate
@@ -508,27 +552,40 @@ impl Builder {
     /// for every top-level `Item::Enum` / `Item::Struct` / literal
     /// `Item::Const`. What remains uncovered:
     ///
-    /// - **`Item::Fn` is intentionally NOT registered.** Slice O7
-    ///   originally registered sibling fns, but the walker has no
-    ///   way to wire `FunctionDesc.buildgraph`'s deferred-lowering
-    ///   path (`description.py:140` → `build_flow(GraphFunc)`) back
-    ///   to the Rust-AST adapter. A registered sibling fn would
-    ///   supply empty bytecode at lowering time. Reverted in the
-    ///   Issue 1.2 fix — see `register.rs::register_rust_module`'s
-    ///   "Why no Item::Fn?" docstring. The single entry-point fn
-    ///   that production callers want is found via
-    ///   `file.items.iter().find_map(...)` in
-    ///   `build_host_function_from_rust_file`, bypassing the
-    ///   registry.
-    /// - **`Item::Use`, `Item::Mod`, `Item::Impl`.** Walker dispatch
-    ///   deferred pending import-graph resolution (`Item::Use`,
-    ///   `Item::Mod`) and method-on-class redirection
-    ///   (`Item::Impl`). Compound `Item::Const` was closed by Issue
-    ///   2.4 (extended `eval_const_expr` for shifts / bitwise /
-    ///   comparisons / bool ops). Immutable `Item::Static` was
-    ///   closed by Slice O15 (`register.rs::register_rust_module`
-    ///   walks `static FOO: T = <expr>;` parallel to `Item::Const`;
-    ///   `static mut` is a documented PRE-EXISTING-ADAPTATION skip).
+    /// - **`Item::Fn` whose body the adapter rejects** (e.g. `as T`
+    ///   cast — task #94, or other un-roadmapped constructs).
+    ///   Slice O16 enables eager body lowering with skip-on-failure;
+    ///   bodies that lower cleanly DO register. Slice O17 added a
+    ///   two-pass iterative walker so forward references between
+    ///   sibling fns resolve (caller-before-helper pattern). The
+    ///   skip is the safety net for bodies the adapter cannot yet
+    ///   handle and for unbreakable mutual recursion — downstream
+    ///   lookups fall through to the same mint path that
+    ///   pre-O16 unconditionally exercised.
+    /// - **`Item::Use`** — re-export of another item's binding.
+    ///   Walker dispatch deferred pending cross-file lookup.
+    /// - **External `Item::Mod`** (file-system module) — deferred
+    ///   pending file-system resolution. Inline `mod foo { ... }`
+    ///   blocks ARE walked by Slices O19 / O20 / O21 — inner Const
+    ///   / Static / Enum / Struct become class-dict entries on a
+    ///   namespace `HostObject::Class` so `foo::A` resolves through
+    ///   the existing path-cascade (O19); inner `Item::Fn` /
+    ///   self-impl `Item::Impl` / nested `Item::Mod` recurse via a
+    ///   per-namespace pass-2 fixed-point loop (O20); and inner-
+    ///   mod fn / impl bodies' `LOAD_GLOBAL` lookups now route
+    ///   through the per-fn `__globals__` carrier so sibling-fn /
+    ///   inner-const / inner-class references resolve via the
+    ///   namespace's `class_get(name)` channel (O21). Cross-mod
+    ///   `use super::X` resolution remains a future slice.
+    /// - **Trait or generic `Item::Impl`.** Self-impl blocks are
+    ///   walked by Slice O18 — methods become class-dict entries;
+    ///   trait impls (`impl Trait for Foo`) and generic impls
+    ///   (`impl<T> Foo<T>`) remain deferred (each its own future
+    ///   slice).
+    ///
+    /// Compound `Item::Const` was closed by Issue 2.4 (extended
+    /// `eval_const_expr`); immutable `Item::Static` by Slice O15
+    /// (`static mut` documented as PRE-EXISTING-ADAPTATION skip).
     /// - **Third-party crate types** (`rustpython_compiler_core::Instruction`)
     ///   that pyre-interpreter references — the walker has no
     ///   visibility into upstream crate sources.
@@ -552,11 +609,50 @@ impl Builder {
     /// **Convergence path**: Slice O9 (production callsite cutover
     /// through [`super::register::build_host_function_from_rust_file`])
     /// and Slice O10 (`Item::Const` walker dispatch) both landed
-    /// 2026-05-04; Slice O12 / O15 added immutable `Item::Static`.
-    /// The remaining `mint_unknown` branch survives only for the
-    /// `Item::Fn` / `Item::Use` / `Item::Mod` / `Item::Impl` gaps
-    /// above, plus third-party crate types whose source the walker
-    /// cannot see. Once those are covered the branch becomes
+    /// 2026-05-04; Slice O12 / O15 added immutable `Item::Static`;
+    /// Slice O16 added `Item::Fn` eager body lowering with
+    /// skip-on-failure; Slice O17 added a two-pass iterative walker
+    /// resolving forward references between sibling fns; Slice O18
+    /// added self-impl `Item::Impl` blocks (methods → class dict);
+    /// Slice O19 added inline `Item::Mod` blocks (inner const /
+    /// static / enum / struct → namespace class dict); Slice O20
+    /// extended the inline-mod walker to inner `Item::Fn` /
+    /// self-impl `Item::Impl` / nested `Item::Mod` via a recursive
+    /// per-namespace pass-2 helper; Slice O21 plumbed a per-fn
+    /// `__globals__` carrier (`Builder::func_globals`) so inner-mod
+    /// fn / impl bodies see their inline-mod's class dict on
+    /// `LOAD_GLOBAL`, mirroring Python
+    /// `function.__globals__ = inner_mod.__dict__`.
+    /// Slice O22 added trait `Item::Impl` blocks
+    /// (`impl Trait for Foo { … }`) on a single bare self-type:
+    /// methods land in `Foo.classdict[name]` exactly as for self-impl,
+    /// matching upstream `classdesc.py:590-634 add_source_attribute`'s
+    /// flat `self.classdict[name] = Constant(value)` shape (the trait
+    /// identity is not consulted because closed-world dispatch through
+    /// `bookkeeper.py:431-442 getmethoddesc` keys on
+    /// `(originclassdef, name, …)`, not on the trait).
+    /// Slice O23 added local-rooted `Item::Use` walker dispatch
+    /// (single-segment alias / inline-mod cascade / group expansion /
+    /// glob), each binding registers via
+    /// `module.__dict__[name] = value` per upstream
+    /// `flowcontext.py:847 w_globals.value[varname]` parity.
+    /// Slice O24 added multi-segment local-rooted self-type lookup
+    /// for `Item::Impl` (`impl Trait for foo::Bar` where `foo` is a
+    /// registered inline-mod), so methods land on
+    /// `foo.Bar.classdict[name]` after the cascade resolves.
+    /// Slice O25 widened the `Item::Impl` walker to accept lifetime-
+    /// only generics (`impl<'a> Trait for Foo<'a>`, `where 'a: 'b`),
+    /// because lifetimes have no Python-observable semantic
+    /// (RPython lacks the borrow concept).
+    /// The remaining `mint_unknown` branch survives for
+    /// external-rooted `Item::Use` and external-rooted self-type
+    /// `Item::Impl` (`crate::`, `super::`, `self::`, `std::`,
+    /// `core::`, `alloc::`, leading-`::`), external `Item::Mod`,
+    /// type / const generic `Item::Impl` (`impl<T> Foo<T>`,
+    /// `impl<E: Trait> X for E`), the rejected subset of `Item::Fn`
+    /// (un-lowerable bodies / unbreakable mutual recursion), and
+    /// third-party crate types whose source the walker cannot see.
+    /// Once those are covered the branch becomes
     /// `AdapterError::UnboundLocal` (the closest local analogue of
     /// upstream's `FlowingError("global name '%s' is not defined")`).
     ///
@@ -757,25 +853,45 @@ impl Builder {
         if name == "None" {
             return Ok(Hlvalue::Constant(Constant::new(ConstValue::None)));
         }
-        // 3. Module-globals (`func_globals` analogue) — populated by
+        // 3. `function.__globals__` — populated by
         //    `register_rust_module` walking a `syn::File` at "import"
-        //    time, partitioned by `ModuleId`. Mirrors upstream
-        //    `flowcontext.py:284 self.w_globals = Constant(func.__globals__)`
-        //    + `:847 w_globals.value[varname]`: each function carries
-        //    a per-module reference, so two different modules with
-        //    the same top-level name see independent values. The
-        //    `Builder.module_id` field carries the id the walker
-        //    minted at registration time so this lookup hits the
-        //    matching partition. The registered value is a
-        //    `ConstValue` (Slice O10 generalization) so consts
-        //    (Item::Const) lift to `Int` / `Bool` / `byte_str`
-        //    directly without a HostObject wrapper, matching
-        //    upstream `find_global` returning `const(value)` for
-        //    any Python type. Body lowering for fn entries is still
-        //    deferred to `FunctionDesc.buildgraph` exactly as
-        //    upstream defers `build_flow(func)` until the annotator
-        //    walks a call site.
-        if let Some(value) = module_globals_lookup(self.module_id, name) {
+        //    time. Mirrors upstream `flowcontext.py:284 self.w_globals
+        //    = Constant(func.__globals__)` + `:847
+        //    w_globals.value[varname]`: each function carries a per-
+        //    function `__globals__` dict reference, and `LOAD_GLOBAL`
+        //    reads from THAT dict. Python parity says every function
+        //    has exactly one `__globals__`, never a chain.
+        //
+        //    The `Builder.func_globals` switch reflects two carrier
+        //    shapes:
+        //
+        //    - `None` (outer-module fn): the canonical `__globals__`
+        //      is `module_globals_lookup(module_id, name)` — the
+        //      registry partition keyed on `module_id`. Two different
+        //      modules with the same top-level name see independent
+        //      values per Issue 1.3 closure.
+        //    - `Some(ns)` (inner-mod fn, Slice O21): the canonical
+        //      `__globals__` is `ns.class_get(name)` — the inline-
+        //      mod namespace's class dict. Mirrors Python
+        //      `function.__globals__ = inner_mod.__dict__`. Outer-
+        //      module names are intentionally NOT visible (Rust
+        //      scoping does not auto-import outer items into inner
+        //      mods; `use super::X` is its own future slice).
+        //
+        //    Registered values are `ConstValue` (Slice O10
+        //    generalization) so consts (`Item::Const`) lift to `Int`
+        //    / `Bool` / `byte_str` directly without a HostObject
+        //    wrapper, matching upstream `find_global` returning
+        //    `const(value)` for any Python type. Body lowering for
+        //    fn entries is still deferred to
+        //    `FunctionDesc.buildgraph` exactly as upstream defers
+        //    `build_flow(func)` until the annotator walks a call
+        //    site.
+        let glb_hit = match &self.func_globals {
+            Some(ns) => ns.class_get(name),
+            None => module_globals_lookup(self.module_id, name),
+        };
+        if let Some(value) = glb_hit {
             return Ok(Hlvalue::Constant(Constant::new(value)));
         }
         // 4. Closed-world Rust-stdlib registry (`Ok` / `Some` / `Err`
