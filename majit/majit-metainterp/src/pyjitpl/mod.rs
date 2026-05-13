@@ -10425,8 +10425,7 @@ impl<M: Clone> MetaInterp<M> {
         let ctx = self.tracing.as_mut()?;
         // pyjitpl.py:2659: self.heapcache.invalidate_caches_varargs(opnum, descr, argboxes)
         let effectinfo = descr.as_call_descr().map(|cd| cd.get_extra_info());
-        ctx.heap_cache_mut()
-            .invalidate_caches_varargs(opnum, effectinfo, argboxes);
+        ctx.heapcache_invalidate_caches_varargs(opnum, effectinfo, argboxes);
         // pyjitpl.py:2660: op = self.history.record(opnum, argboxes, resvalue, descr)
         let op = ctx.record_op_with_descr(opnum, argboxes, descr);
         // pyjitpl.py:2661: self.attach_debug_info(op)
@@ -12370,11 +12369,7 @@ impl<M: Clone> MetaInterp<M> {
             };
             // pyjitpl.py:2072: heapcache.invalidate_caches_varargs(opnum1, descr, allboxes)
             if let Some(ctx) = self.tracing.as_mut() {
-                ctx.heap_cache_mut().invalidate_caches_varargs(
-                    opnum1,
-                    Some(effectinfo),
-                    &opref_args,
-                );
+                ctx.heapcache_invalidate_caches_varargs(opnum1, Some(effectinfo), &opref_args);
             }
             // pyjitpl.py:2074-2077: handle resbox void / make_result_of_lastop
             // — make_result_of_lastop's target_index plumbing is not

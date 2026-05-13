@@ -34,7 +34,22 @@ fn vb_remove(v: &mut Vec<bool>, opref: &OpRef) -> bool {
     }
 }
 
-use majit_ir::{EffectInfo, ExtraEffect, GcRef, OpCode, OpRef};
+use majit_ir::{EffectInfo, ExtraEffect, GcRef, OpCode, OpRef, Type};
+
+/// Value-equality predicate over constant OpRefs.  Mirrors
+/// `Const.same_constant` (history.py:204): two ConstInt/ConstFloat/
+/// ConstPtr instances are equal when they share the same subclass and
+/// underlying value, independent of Box identity.
+///
+/// The trait is defined here (not in `majit-ir`) because `majit-trace`
+/// is the lowest crate that needs the predicate (for the
+/// `_unique_const_heuristic` ConstPtr canonicalisation,
+/// heapcache.py:96-104) and the implementation lives in `majit-metainterp`
+/// where the `ConstantPool` storage sits.  `&dyn SameConstantOracle`
+/// keeps the heapcache layer agnostic of the pool's representation.
+pub trait SameConstantOracle {
+    fn same_constant(&self, a: OpRef, b: OpRef) -> bool;
+}
 
 // heapcache.py: HF_* flags stored per-box on RefFrontendOp.
 // In majit these are tracked via separate HashSets (is_unescaped,
@@ -126,18 +141,36 @@ impl CacheEntry {
     }
 
     /// heapcache.py:90-94 do_write_with_aliasing
-    #[allow(dead_code)]
-    pub fn do_write_with_aliasing(&mut self, ref_box: OpRef, fieldbox: OpRef, cache: &HeapCache) {
-        let ref_box = self._unique_const_heuristic(ref_box);
+    pub fn do_write_with_aliasing(
+        &mut self,
+        ref_box: OpRef,
+        fieldbox: OpRef,
+        cache: &HeapCache,
+        oracle: &dyn SameConstantOracle,
+    ) {
+        let ref_box = self._unique_const_heuristic(ref_box, oracle);
         let seen_alloc = self._seen_alloc(ref_box, cache);
         self._clear_cache_on_write(seen_alloc);
         self._getdict_mut(seen_alloc).insert(ref_box, fieldbox);
     }
 
-    /// heapcache.py:96-104 _unique_const_heuristic
-    pub fn _unique_const_heuristic(&mut self, ref_box: OpRef) -> OpRef {
+    /// heapcache.py:96-104 _unique_const_heuristic.
+    ///
+    /// Only ConstPtr operands are canonicalised; non-constant OpRefs and
+    /// non-Ref-typed constants pass through unchanged (matches the
+    /// `isinstance(ref_box, ConstPtr)` guard on heapcache.py:99).
+    /// `oracle.same_constant(last, ref_box)` is the value-aware
+    /// comparison upstream uses (history.py:204 `Const.same_constant`).
+    pub fn _unique_const_heuristic(
+        &mut self,
+        ref_box: OpRef,
+        oracle: &dyn SameConstantOracle,
+    ) -> OpRef {
+        if !(ref_box.is_constant() && ref_box.ty() == Some(Type::Ref)) {
+            return ref_box;
+        }
         if let Some(last) = self.last_const_box {
-            if last == ref_box {
+            if oracle.same_constant(last, ref_box) {
                 return last;
             }
         }
@@ -146,9 +179,13 @@ impl CacheEntry {
     }
 
     /// heapcache.py:106-114 read
-    #[allow(dead_code)]
-    pub fn read(&mut self, ref_box: OpRef, cache: &HeapCache) -> Option<OpRef> {
-        let ref_box = self._unique_const_heuristic(ref_box);
+    pub fn read(
+        &mut self,
+        ref_box: OpRef,
+        cache: &HeapCache,
+        oracle: &dyn SameConstantOracle,
+    ) -> Option<OpRef> {
+        let ref_box = self._unique_const_heuristic(ref_box, oracle);
         let seen_alloc = self._seen_alloc(ref_box, cache);
         self._getdict(seen_alloc)
             .get(&ref_box)
@@ -157,9 +194,14 @@ impl CacheEntry {
     }
 
     /// heapcache.py:116-119 read_now_known
-    #[allow(dead_code)]
-    pub fn read_now_known(&mut self, ref_box: OpRef, fieldbox: OpRef, cache: &HeapCache) {
-        let ref_box = self._unique_const_heuristic(ref_box);
+    pub fn read_now_known(
+        &mut self,
+        ref_box: OpRef,
+        fieldbox: OpRef,
+        cache: &HeapCache,
+        oracle: &dyn SameConstantOracle,
+    ) {
+        let ref_box = self._unique_const_heuristic(ref_box, oracle);
         let seen_alloc = self._seen_alloc(ref_box, cache);
         self._getdict_mut(seen_alloc).insert(ref_box, fieldbox);
     }
@@ -232,25 +274,53 @@ impl FieldUpdater {
         }
     }
 
-    pub fn getfield_now_known(&mut self, fieldbox: OpRef) {
-        self.currfieldbox = Some(fieldbox);
+    /// heapcache.py:139-140
+    ///
+    /// ```text
+    ///  def getfield_now_known(self, fieldbox):
+    ///      self.cache.read_now_known(self.ref_box, fieldbox)
+    /// ```
+    pub fn getfield_now_known(&mut self, fieldbox: OpRef, oracle: &dyn SameConstantOracle) {
+        let ref_box = self.ref_box;
+        let (cache, descr_index) = match self.cache_and_descr() {
+            Some(pair) => pair,
+            None => return,
+        };
+        let mut entry = cache.heap_cache.remove(&descr_index).unwrap_or_default();
+        entry.read_now_known(ref_box, fieldbox, cache, oracle);
+        cache.heap_cache.insert(descr_index, entry);
     }
 
-    pub fn setfield(&mut self, _fieldbox: OpRef) {
-        self.currfieldbox = Some(_fieldbox);
-        let Some(descr) = self.descr else {
-            return;
+    /// heapcache.py:142-143
+    ///
+    /// ```text
+    ///  def setfield(self, fieldbox):
+    ///      self.cache.do_write_with_aliasing(self.ref_box, fieldbox)
+    /// ```
+    pub fn setfield(&mut self, fieldbox: OpRef, oracle: &dyn SameConstantOracle) {
+        let ref_box = self.ref_box;
+        let (cache, descr_index) = match self.cache_and_descr() {
+            Some(pair) => pair,
+            None => return,
         };
-        // RPython writes through the cache updater; we keep the descriptor
-        // and target object in the updater.
-        if !self.cache.is_null() {
-            // SAFETY: `FieldUpdater` is only created by `HeapCache::get_field_updater`
-            // and tied to an active mutable borrow of that cache.
-            unsafe {
-                let cache = &mut *self.cache;
-                cache.setfield(self.ref_box, descr, _fieldbox);
-            }
+        let mut entry = cache.heap_cache.remove(&descr_index).unwrap_or_default();
+        entry.do_write_with_aliasing(ref_box, fieldbox, cache, oracle);
+        cache.heap_cache.insert(descr_index, entry);
+    }
+
+    fn cache_and_descr(&mut self) -> Option<(&mut HeapCache, u32)> {
+        let descr_index = self.descr?;
+        if self.cache.is_null() {
+            return None;
         }
+        // SAFETY: `cache` was supplied by `with_cache` which received
+        // an `&mut HeapCache`; the FieldUpdater's lifetime must not
+        // outlive that borrow (callers hold it stack-locally during
+        // a single trace step, matching upstream's pattern at
+        // pyjitpl.py:973-988 where `upd = heapcache.get_field_updater(...)`
+        // is consumed before any other heapcache operation).
+        let cache = unsafe { &mut *self.cache };
+        Some((cache, descr_index))
     }
 }
 
@@ -259,12 +329,18 @@ impl FieldUpdater {
 /// Tracks field values, known classes, and allocation status during
 /// a single trace recording session.
 pub struct HeapCache {
-    /// Field cache: (object_ref, field_descr_index) -> cached value.
-    field_cache: HashMap<(OpRef, u32), OpRef>,
-
+    /// heapcache.py:172 `self.heap_cache = {}` — maps descrs to
+    /// `CacheEntry`.  Field reads/writes for a given descr land in the
+    /// same `CacheEntry`, which owns the `cache_anything` /
+    /// `cache_seen_allocation` dicts and the `last_const_box`
+    /// `_unique_const_heuristic` LRU per heapcache.py:50-104.
     heap_cache: HashMap<u32, CacheEntry>,
     /// heapcache.py: `cached_arrayitems` — nested map descr → ConstInt-index → CacheEntry.
-    heap_array_cache: HashMap<u32, HashMap<u32, CacheEntry>>,
+    /// heapcache.py:557 `cache.get(index, None)` — array cache keyed by
+    /// the `ConstInt.getint()` value, not the index Box's identity. Two
+    /// distinct ConstInt boxes carrying the same `i64` index land in the
+    /// same slot, matching the upstream lookup semantics.
+    heap_array_cache: HashMap<u32, HashMap<i64, CacheEntry>>,
 
     /// Known class map: object_ref -> class pointer.
     /// RPython: CacheEntry 내부. Vec indexed by OpRef.0.
@@ -331,7 +407,6 @@ impl HeapCache {
     /// Create a new, empty heap cache.
     pub fn new() -> Self {
         HeapCache {
-            field_cache: HashMap::new(),
             heap_cache: HashMap::new(),
             heap_array_cache: HashMap::new(),
             known_class: Vec::new(),
@@ -630,17 +705,56 @@ impl HeapCache {
         }
     }
 
-    /// heapcache.py:259-281 mark_escaped_varargs.
-    /// RPython has both mark_escaped (specialize.arg(1) for opnum) and
-    /// mark_escaped_varargs.  pyre routes both through the same impl
-    /// since Rust does not need the per-opnum specialization.
-    pub fn mark_escaped_varargs(
+    /// heapcache.py:259-293 mark_escaped_varargs.
+    ///
+    /// Upstream splits the two flavors:
+    ///   * `mark_escaped` (line 232) handles SETFIELD_GC / SETARRAYITEM_GC
+    ///     and asserts `opnum != CALL_N`.
+    ///   * `mark_escaped_varargs` (line 259) handles CALL_N and special-cases
+    ///     ARRAYCOPY / ARRAYMOVE with constant starts+length+single-descr to
+    ///     skip arg escape entirely.
+    ///
+    /// `effectinfo` + `const_value` carry the upstream
+    /// `descr.get_extra_info()` lookups; the closure returns the
+    /// `ConstInt.getint()` value (heapcache.py:274-276 / :284-286).
+    pub fn mark_escaped_varargs<F: Fn(OpRef) -> Option<i64>>(
         &mut self,
         opnum: OpCode,
-        descr: Option<OpRef>,
+        effectinfo: Option<&EffectInfo>,
         argboxes: &[OpRef],
+        const_value: F,
     ) {
-        self.mark_escaped(opnum, descr, argboxes)
+        if opnum == OpCode::CallN {
+            if let Some(ei) = effectinfo {
+                if ei.single_write_descr_array.is_some() {
+                    // heapcache.py:272-281: CALL_N + OS_ARRAYCOPY with all
+                    // three index/length operands ConstInt → don't escape
+                    // argboxes.
+                    if ei.oopspecindex == majit_ir::OopSpecIndex::Arraycopy
+                        && argboxes.len() >= 6
+                        && const_value(argboxes[3]).is_some()
+                        && const_value(argboxes[4]).is_some()
+                        && const_value(argboxes[5]).is_some()
+                    {
+                        return;
+                    }
+                    // heapcache.py:282-290: CALL_N + OS_ARRAYMOVE with all
+                    // three operands ConstInt → don't escape argboxes.
+                    if ei.oopspecindex == majit_ir::OopSpecIndex::Arraymove
+                        && argboxes.len() >= 5
+                        && const_value(argboxes[2]).is_some()
+                        && const_value(argboxes[3]).is_some()
+                        && const_value(argboxes[4]).is_some()
+                    {
+                        return;
+                    }
+                }
+            }
+            // heapcache.py:291-293 fallback: escape all argboxes.
+            self._escape_argboxes(argboxes);
+            return;
+        }
+        self.mark_escaped(opnum, None, argboxes)
     }
 
     /// RPython: _escape_argboxes(*argboxes)
@@ -652,54 +766,84 @@ impl HeapCache {
         self._escape_argboxes(&args[1..]);
     }
 
-    /// Look up a cached field value.
+    /// heapcache.py:518-522 `getfield(self, box, descr)`.
     ///
-    /// Returns the OpRef that holds the value of `(obj, field_index)` if
-    /// it was previously read or written in this trace, or None.
-    pub fn getfield(&self, obj: OpRef, field_index: u32) -> Option<OpRef> {
-        self.getfield_cached(obj, field_index)
-    }
-
-    pub fn getfield_cached(&self, obj: OpRef, field_index: u32) -> Option<OpRef> {
-        self.field_cache.get(&(obj, field_index)).copied()
-    }
-
-    /// Record a field value (either from a GETFIELD result or a SETFIELD value).
+    /// ```text
+    ///  def getfield(self, box, descr):
+    ///      cache = self.heap_cache.get(descr, None)
+    ///      if cache:
+    ///          return cache.read(box)
+    ///      return None
+    /// ```
     ///
-    /// After `setfield_cached(obj, field_index, value)`, any subsequent
-    /// `getfield_cached(obj, field_index)` will return `Some(value)`.
+    /// `CacheEntry.read` (heapcache.py:106-114) handles the
+    /// `_unique_const_heuristic` ConstPtr canonicalisation and the
+    /// `maybe_replace_with_const` forwarding internally.  We take the
+    /// entry out of `heap_cache` for the duration of the call so the
+    /// borrow checker accepts `&mut entry` and `&self.heap_cache`'s
+    /// neighbour fields simultaneously, then put it back.
+    pub fn getfield_cached(
+        &mut self,
+        obj: OpRef,
+        field_index: u32,
+        oracle: &dyn SameConstantOracle,
+    ) -> Option<OpRef> {
+        let mut entry = self.heap_cache.remove(&field_index)?;
+        let result = entry.read(obj, self, oracle);
+        self.heap_cache.insert(field_index, entry);
+        result
+    }
+
+    /// heapcache.py:538-540 `setfield(self, box, fieldbox, descr)`.
     ///
-    /// When the object is not unescaped, this also invalidates entries for
-    /// the same field on other objects (aliasing).
-    pub fn setfield(&mut self, obj: OpRef, field_index: u32, value: OpRef) {
-        self.setfield_cached(obj, field_index, value);
+    /// ```text
+    ///  def setfield(self, box, fieldbox, descr):
+    ///      upd = self.get_field_updater(box, descr)
+    ///      upd.setfield(fieldbox)
+    /// ```
+    ///
+    /// The `upd.setfield` body is `cache.do_write_with_aliasing(ref_box,
+    /// fieldbox)` (heapcache.py:142-143), which handles
+    /// `_unique_const_heuristic`, `_clear_cache_on_write`, and the dict
+    /// insertion in one step.  Aliasing semantics:
+    /// `_clear_cache_on_write(seen_alloc)` clears `cache_anything` and,
+    /// when `seen_alloc` is false (the target may alias anything else),
+    /// also clears `cache_seen_allocation`, matching
+    /// heapcache.py:70-77.
+    pub fn setfield_cached(
+        &mut self,
+        obj: OpRef,
+        field_index: u32,
+        value: OpRef,
+        oracle: &dyn SameConstantOracle,
+    ) {
+        let mut entry = self.heap_cache.remove(&field_index).unwrap_or_default();
+        entry.do_write_with_aliasing(obj, value, self, oracle);
+        self.heap_cache.insert(field_index, entry);
     }
 
-    pub fn setfield_cached(&mut self, obj: OpRef, field_index: u32, value: OpRef) {
-        // heapcache.py:493 is_unescaped — version-gated through _check_flag.
-        let obj_is_unescaped = self.is_unescaped(obj);
-        if !obj_is_unescaped {
-            // Potential aliasing: clear all cached values for this field
-            // from objects that are not known-unescaped.
-            // Snapshot version + flags so the closure can re-check without
-            // borrowing self mutably.
-            let head_version = self.head_version;
-            let flags_snapshot: Vec<u32> = self.heapc_flags.clone();
-            self.field_cache.retain(|&(cached_obj, cached_field), _| {
-                if cached_field != field_index {
-                    return true;
-                }
-                // Keep entries for unescaped objects (no aliasing possible)
-                let i = cached_obj.raw() as usize;
-                let f = flags_snapshot.get(i).copied().unwrap_or(0);
-                Self::versioned_or(f, head_version) && (f as u8) & HF_IS_UNESCAPED != 0
-            });
-        }
-        self.field_cache.insert((obj, field_index), value);
-    }
-
-    pub fn getfield_now_known(&mut self, obj: OpRef, field_index: u32, value: OpRef) {
-        self.field_cache.insert((obj, field_index), value);
+    /// heapcache.py:534-536 `getfield_now_known(self, box, descr,
+    /// fieldbox)`.
+    ///
+    /// ```text
+    ///  def getfield_now_known(self, box, descr, fieldbox):
+    ///      upd = self.get_field_updater(box, descr)
+    ///      upd.getfield_now_known(fieldbox)
+    /// ```
+    ///
+    /// `upd.getfield_now_known` delegates to
+    /// `cache.read_now_known(ref_box, fieldbox)` (heapcache.py:116-119),
+    /// which records the value without the aliasing-clear step.
+    pub fn getfield_now_known(
+        &mut self,
+        obj: OpRef,
+        field_index: u32,
+        value: OpRef,
+        oracle: &dyn SameConstantOracle,
+    ) {
+        let mut entry = self.heap_cache.remove(&field_index).unwrap_or_default();
+        entry.read_now_known(obj, value, self, oracle);
+        self.heap_cache.insert(field_index, entry);
     }
 
     /// heapcache.py: invalidate_unescaped — clear cached values for
@@ -716,12 +860,16 @@ impl HeapCache {
             let f = flags_snapshot.get(i).copied().unwrap_or(0);
             Self::versioned_or(f, head_version) && (f as u8) & HF_IS_UNESCAPED != 0
         };
-        self.field_cache.retain(|&(obj, _), _| still_unescaped(obj));
-        // heapcache.py:542-552: iterate cached_arrayitems and invalidate
-        // per-CacheEntry entries whose box is no longer unescaped.
         let unescaped: Vec<bool> = (0..flags_snapshot.len())
             .map(|i| still_unescaped(OpRef::ref_op(i as u32)))
             .collect();
+        // heapcache.py:362-365 — `for cache in self.heap_cache.itervalues():
+        //                           cache.invalidate_unescaped()`.
+        for entry in self.heap_cache.values_mut() {
+            entry.invalidate_unescaped(&unescaped);
+        }
+        // heapcache.py:542-552: iterate cached_arrayitems and invalidate
+        // per-CacheEntry entries whose box is no longer unescaped.
         for caches in self.heap_array_cache.values_mut() {
             for cache in caches.values_mut() {
                 cache.invalidate_unescaped(&unescaped);
@@ -1002,17 +1150,19 @@ impl HeapCache {
     /// inside `clear_caches_varargs`; pyre threads the
     /// already-extracted EffectInfo through to avoid an extra
     /// `&dyn CallDescr` pass.
-    pub fn invalidate_caches_varargs(
+    pub fn invalidate_caches_varargs<F: Fn(OpRef) -> Option<i64>>(
         &mut self,
         opnum: OpCode,
         effectinfo: Option<&EffectInfo>,
         argboxes: &[OpRef],
+        oracle: &dyn SameConstantOracle,
+        const_value: F,
     ) {
-        self.mark_escaped_varargs(opnum, None, argboxes);
+        self.mark_escaped_varargs(opnum, effectinfo, argboxes, &const_value);
         if Self::_clear_caches_not_necessary(opnum) {
             return;
         }
-        self.clear_caches_varargs(opnum, effectinfo, argboxes);
+        self.clear_caches_varargs(opnum, effectinfo, argboxes, oracle, const_value);
     }
 
     /// heapcache.py:312-336
@@ -1077,21 +1227,25 @@ impl HeapCache {
     }
 
     /// RPython-compatible alias.
-    pub fn clear_caches(
+    pub fn clear_caches<F: Fn(OpRef) -> Option<i64>>(
         &mut self,
         opnum: OpCode,
         effectinfo: Option<&EffectInfo>,
         argboxes: &[OpRef],
+        oracle: &dyn SameConstantOracle,
+        const_value: F,
     ) {
-        self.clear_caches_varargs(opnum, effectinfo, argboxes)
+        self.clear_caches_varargs(opnum, effectinfo, argboxes, oracle, const_value)
     }
 
     /// heapcache.py:341-376 clear_caches_varargs.
-    pub fn clear_caches_varargs(
+    pub fn clear_caches_varargs<F: Fn(OpRef) -> Option<i64>>(
         &mut self,
         opnum: OpCode,
         effectinfo: Option<&EffectInfo>,
         argboxes: &[OpRef],
+        oracle: &dyn SameConstantOracle,
+        const_value: F,
     ) {
         self.need_guard_not_invalidated = true;
         // RPython `heapcache.py:341-345`:
@@ -1126,11 +1280,25 @@ impl HeapCache {
                 // heapcache.py:355-361 — well-defined oopspec dispatch.
                 let single_descr_idx = ei.single_write_descr_array.as_ref().map(|d| d.index());
                 if ei.oopspecindex == majit_ir::OopSpecIndex::Arraycopy {
-                    self._clear_caches_arraycopy(opnum, None, argboxes, single_descr_idx);
+                    self._clear_caches_arraycopy(
+                        opnum,
+                        None,
+                        argboxes,
+                        single_descr_idx,
+                        oracle,
+                        const_value,
+                    );
                     return;
                 }
                 if ei.oopspecindex == majit_ir::OopSpecIndex::Arraymove {
-                    self._clear_caches_arraymove(opnum, None, argboxes, single_descr_idx);
+                    self._clear_caches_arraymove(
+                        opnum,
+                        None,
+                        argboxes,
+                        single_descr_idx,
+                        oracle,
+                        const_value,
+                    );
                     return;
                 }
             }
@@ -1152,17 +1320,26 @@ impl HeapCache {
     }
 
     /// Parity alias for RPython cache invalidation entrypoint.
-    pub fn invalidate_caches(
+    pub fn invalidate_caches<F: Fn(OpRef) -> Option<i64>>(
         &mut self,
         opnum: OpCode,
         effectinfo: Option<&EffectInfo>,
         argboxes: &[OpRef],
+        oracle: &dyn SameConstantOracle,
+        const_value: F,
     ) {
         self.mark_escaped(opnum, None, argboxes);
         if Self::_clear_caches_not_necessary(opnum) {
             return;
         }
-        self.invalidate_caches_varargs(opnum, effectinfo, argboxes);
+        // `invalidate_caches_varargs` will re-issue `mark_escaped_varargs`
+        // (matching upstream's double-call shape at heapcache.py:215-216);
+        // do NOT also call `mark_escaped` for non-CALL_N argboxes here —
+        // upstream `invalidate_caches` (heapcache.py:212-216) ONLY does
+        // the `mark_escaped` for the SETFIELD/SETARRAYITEM special cases
+        // that `mark_escaped_varargs` would skip.  The 1:1 split is kept
+        // by `mark_escaped`'s opnum filter.
+        self.invalidate_caches_varargs(opnum, effectinfo, argboxes, oracle, const_value);
     }
 
     /// heapcache.py:378-381 _clear_caches_arraycopy
@@ -1173,12 +1350,14 @@ impl HeapCache {
     ///                                 argboxes[3], argboxes[4], argboxes[5],
     ///                                 effectinfo)
     /// ```
-    pub fn _clear_caches_arraycopy(
+    pub fn _clear_caches_arraycopy<F: Fn(OpRef) -> Option<i64>>(
         &mut self,
         _opnum: OpCode,
         _descr: Option<&EffectInfo>,
         argboxes: &[OpRef],
         single_write_descr_array: Option<u32>,
+        oracle: &dyn SameConstantOracle,
+        const_value: F,
     ) {
         // argboxes layout from RPython oopspec ll_arraycopy:
         //   [func, src, dst, srcstart, dststart, length]
@@ -1193,6 +1372,8 @@ impl HeapCache {
             argboxes[4],
             argboxes[5],
             single_write_descr_array,
+            oracle,
+            const_value,
         );
     }
 
@@ -1204,12 +1385,14 @@ impl HeapCache {
     ///                                 argboxes[2], argboxes[3], argboxes[4],
     ///                                 effectinfo)
     /// ```
-    pub fn _clear_caches_arraymove(
+    pub fn _clear_caches_arraymove<F: Fn(OpRef) -> Option<i64>>(
         &mut self,
         _opnum: OpCode,
         _descr: Option<&EffectInfo>,
         argboxes: &[OpRef],
         single_write_descr_array: Option<u32>,
+        oracle: &dyn SameConstantOracle,
+        const_value: F,
     ) {
         // argboxes layout from RPython oopspec ll_arraymove:
         //   [func, arr, srcstart, dststart, length]
@@ -1224,6 +1407,8 @@ impl HeapCache {
             argboxes[3],
             argboxes[4],
             single_write_descr_array,
+            oracle,
+            const_value,
         );
     }
 
@@ -1259,8 +1444,10 @@ impl HeapCache {
         length_box: OpRef,
         single_write_descr_array: Option<u32>,
         const_value: impl Fn(OpRef) -> Option<i64>,
+        oracle: &dyn SameConstantOracle,
     ) {
         let seen_allocation_of_target = self.saw_allocation(dest_box);
+        let seen_allocation_of_source = self.saw_allocation(source_box);
         let srcstart = const_value(source_start_box);
         let dststart = const_value(dest_start_box);
         let length = const_value(length_box);
@@ -1280,44 +1467,49 @@ impl HeapCache {
                 let i = index_current;
                 index_current += index_delta;
                 debug_assert!(i >= 0);
-                // heapcache.py:418-422: read the source value...
-                let value = self
+                // heapcache.py:418-422 — `indexcache.read(source_box)`.
+                // The cache entry's `_unique_const_heuristic` canonicalises
+                // the ConstPtr source so two distinct OpRefs for the same
+                // gcref share the same dict slot.
+                let raw_value = self
                     .heap_array_cache
-                    .get(&descr)
-                    .and_then(|m| m.get(&((srcstart + i) as u32)))
+                    .get_mut(&descr)
+                    .and_then(|m| m.get_mut(&(srcstart + i)))
                     .and_then(|entry| {
-                        // RPython: indexcache.read(box) — looks up `box`
-                        // in cache_anything / cache_seen_allocation.
-                        let saw = self.saw_allocation(source_box);
-                        if saw {
-                            entry.cache_seen_allocation.get(&source_box).copied()
-                        } else {
-                            entry.cache_anything.get(&source_box).copied()
-                        }
+                        let src = entry._unique_const_heuristic(source_box, oracle);
+                        let dict = entry._getdict(seen_allocation_of_source);
+                        dict.get(&src).copied()
                     });
+                // heapcache.py:113 `return maybe_replace_with_const(res_box)`
+                // — follow the FO_REPLACED_WITH_CONST forwarding so callers
+                // see the canonical const replacement, not the stale Box.
+                let value = raw_value.map(|v| self.maybe_replace_with_const(v));
                 // heapcache.py:423-429: ...and write it to the dest cell.
                 if let Some(value) = value {
-                    let dst_index = (dststart + i) as u32;
+                    let dst_index = dststart + i;
                     let entry = self
                         .heap_array_cache
                         .entry(descr)
                         .or_default()
                         .entry(dst_index)
                         .or_insert_with(CacheEntry::new);
-                    // RPython setarrayitem -> indexcache.do_write_with_aliasing.
-                    // We approximate by writing into the appropriate sub-map.
-                    if seen_allocation_of_target {
-                        entry.cache_seen_allocation.insert(dest_box, value);
-                    } else {
-                        entry.cache_anything.insert(dest_box, value);
-                    }
+                    // heapcache.py:90-94 `do_write_with_aliasing` —
+                    // canonicalise dest, then `_clear_cache_on_write(seen_alloc)`
+                    // BEFORE the insert so aliasing entries from prior
+                    // writes get dropped (escaped target → wipe whole
+                    // cache_anything; unescaped → only cache_anything).
+                    let dst = entry._unique_const_heuristic(dest_box, oracle);
+                    entry._clear_cache_on_write(seen_allocation_of_target);
+                    entry
+                        ._getdict_mut(seen_allocation_of_target)
+                        .insert(dst, value);
                 } else {
                     // heapcache.py:430-436: source had no cached value, so
                     // the dest's existing entry must be invalidated.
                     if let Some(idx_cache) = self
                         .heap_array_cache
                         .get_mut(&descr)
-                        .and_then(|m| m.get_mut(&((dststart + i) as u32)))
+                        .and_then(|m| m.get_mut(&(dststart + i)))
                     {
                         idx_cache._clear_cache_on_write(seen_allocation_of_target);
                     }
@@ -1339,9 +1531,13 @@ impl HeapCache {
         self.reset_keep_likely_virtuals();
     }
 
-    /// Convenience entrypoint with no constant resolution — falls through
-    /// to `reset_keep_likely_virtuals` whenever indices cannot be evaluated.
-    pub fn _clear_caches_arrayop(
+    /// `_clear_caches_arrayop` accepts a const-resolution closure so
+    /// production callers from `invalidate_caches_varargs` reach the
+    /// per-index copy branch of `_clear_caches_arrayop_with_consts`
+    /// (heapcache.py:393).  When the closure returns `None` for any
+    /// index/length operand, the branch falls through to whole-descr
+    /// clearing as upstream does (heapcache.py:438).
+    pub fn _clear_caches_arrayop<F: Fn(OpRef) -> Option<i64>>(
         &mut self,
         source_box: OpRef,
         dest_box: OpRef,
@@ -1349,6 +1545,8 @@ impl HeapCache {
         dest_start_box: OpRef,
         length_box: OpRef,
         single_write_descr_array: Option<u32>,
+        oracle: &dyn SameConstantOracle,
+        const_value: F,
     ) {
         self._clear_caches_arrayop_with_consts(
             source_box,
@@ -1357,136 +1555,144 @@ impl HeapCache {
             dest_start_box,
             length_box,
             single_write_descr_array,
-            |_| None,
+            const_value,
+            oracle,
         );
     }
 
     /// Alias kept for parity with older callsites.
-    pub fn invalidate_caches_varargs_alias(
+    pub fn invalidate_caches_varargs_alias<F: Fn(OpRef) -> Option<i64>>(
         &mut self,
         opnum: OpCode,
         effectinfo: Option<&EffectInfo>,
         argboxes: &[OpRef],
+        oracle: &dyn SameConstantOracle,
+        const_value: F,
     ) {
-        self.invalidate_caches_varargs(opnum, effectinfo, argboxes)
+        self.invalidate_caches_varargs(opnum, effectinfo, argboxes, oracle, const_value)
     }
 
-    /// RPython: get_field_updater(box, descr)
-    pub fn get_field_updater(&mut self, obj: OpRef, descr_index: u32) -> FieldUpdater {
-        let seen_allocation = self.saw_allocation(obj);
-        let fieldbox = self.heap_cache.get(&descr_index).and_then(|cache| {
-            if seen_allocation {
-                cache.cache_seen_allocation.get(&obj).copied()
-            } else {
-                cache.cache_anything.get(&obj).copied()
-            }
-        });
-        let updater = self
-            .heap_cache
-            .entry(descr_index)
-            .or_insert_with(CacheEntry::new);
-        let curr = if let Some(fieldbox) = fieldbox {
-            fieldbox
-        } else if seen_allocation {
-            updater
-                .cache_seen_allocation
-                .get(&obj)
-                .copied()
-                .unwrap_or(OpRef::NONE)
-        } else {
-            updater
-                .cache_anything
-                .get(&obj)
-                .copied()
-                .unwrap_or(OpRef::NONE)
-        };
-        FieldUpdater::with_cache(obj, self, descr_index, Some(curr))
-    }
-
-    /// RPython alias: allocate a per-descr/index array cache entry.
-    pub(crate) fn _get_or_make_array_cache_entry(
+    /// heapcache.py:524-532 `get_field_updater(self, box, descr)`.
+    ///
+    /// ```text
+    ///  def get_field_updater(self, box, descr):
+    ///      cache = self.heap_cache.get(descr, None)
+    ///      if cache is None:
+    ///          cache = self.heap_cache[descr] = CacheEntry(self)
+    ///          fieldbox = None
+    ///      else:
+    ///          fieldbox = cache.read(box)
+    ///      return FieldUpdater(box, cache, fieldbox)
+    /// ```
+    ///
+    /// `cache.read` (heapcache.py:106-114) handles the
+    /// `_unique_const_heuristic` ConstPtr canonicalisation and the
+    /// `maybe_replace_with_const` forwarding internally.  Need an
+    /// `oracle` parameter because pyre's `same_constant` lives on the
+    /// `ConstantPool` rather than on the box itself (no
+    /// `Const.same_constant` method).
+    pub fn get_field_updater(
         &mut self,
-        index: OpRef,
+        obj: OpRef,
         descr_index: u32,
-    ) -> Option<&mut CacheEntry> {
-        let index = index.raw();
-        Some(
-            self.heap_array_cache
-                .entry(descr_index)
-                .or_default()
-                .entry(index)
-                .or_insert_with(CacheEntry::new),
-        )
+        oracle: &dyn SameConstantOracle,
+    ) -> FieldUpdater {
+        let fieldbox = if let Some(mut entry) = self.heap_cache.remove(&descr_index) {
+            let result = entry.read(obj, self, oracle);
+            self.heap_cache.insert(descr_index, entry);
+            result
+        } else {
+            // heapcache.py:528 `cache = self.heap_cache[descr] = CacheEntry(self)`.
+            self.heap_cache.insert(descr_index, CacheEntry::new());
+            None
+        };
+        FieldUpdater::with_cache(obj, self, descr_index, fieldbox)
     }
 
     // ── Array item caching (RPython heapcache.py cached_arrayitems) ──
 
-    /// Look up a cached array item value.
-    pub fn getarrayitem(&self, array: OpRef, index: OpRef, descr: u32) -> Option<OpRef> {
-        self.getarrayitem_cache(array, index, descr)
-    }
-
-    /// heapcache.py:542-553 getarrayitem: ConstInt-only lookup into
-    /// heap_array_cache[descr][index].read(box).
-    pub fn getarrayitem_cache(&self, array: OpRef, index: OpRef, descr: u32) -> Option<OpRef> {
-        if !index.is_constant() {
-            return None;
-        }
-        let entry = self.heap_array_cache.get(&descr)?.get(&index.raw())?;
+    /// heapcache.py:542-553 `getarrayitem(self, box, indexbox, descr)`.
+    /// The caller supplies the index as the raw `i64` value extracted
+    /// via `ConstInt.getint()`; non-ConstInt inputs short-circuit to
+    /// `None` at the caller boundary so the cache key is always the
+    /// upstream-equivalent value, not the index Box's identity.
+    ///
+    /// `array` is routed through the indexcache's `_unique_const_heuristic`
+    /// (heapcache.py:550 `indexcache.read(box)`) so two distinct
+    /// ConstPtr OpRefs for the same gcref hit the same cache slot.
+    pub fn getarrayitem_cache(
+        &mut self,
+        array: OpRef,
+        index_value: i64,
+        descr: u32,
+        oracle: &dyn SameConstantOracle,
+    ) -> Option<OpRef> {
+        let entry = self
+            .heap_array_cache
+            .get_mut(&descr)?
+            .get_mut(&index_value)?;
+        let array = entry._unique_const_heuristic(array, oracle);
         let seen_alloc = self.saw_allocation(array);
+        let entry = self.heap_array_cache.get(&descr)?.get(&index_value)?;
         let opref = entry._getdict(seen_alloc).get(&array).copied()?;
         Some(self.maybe_replace_with_const(opref))
     }
 
-    /// Record an array item write.
-    pub fn setarrayitem(&mut self, array: OpRef, index: OpRef, descr: u32, value: OpRef) {
-        self.setarrayitem_cache(array, index, descr, value)
-    }
-
-    /// heapcache.py:573-585 setarrayitem: non-ConstInt clears the whole
-    /// descr submap; ConstInt writes via indexcache.do_write_with_aliasing.
-    pub fn setarrayitem_cache(&mut self, array: OpRef, index: OpRef, descr: u32, value: OpRef) {
-        if !index.is_constant() {
+    /// heapcache.py:573-585 `setarrayitem`. Non-ConstInt index (`None`
+    /// here) clears the whole descr submap; otherwise the cache entry
+    /// for `(descr, index_value)` writes through
+    /// `do_write_with_aliasing` which canonicalises `array` via
+    /// `_unique_const_heuristic` before keying.
+    pub fn setarrayitem_cache(
+        &mut self,
+        array: OpRef,
+        index_value: Option<i64>,
+        descr: u32,
+        value: OpRef,
+        oracle: &dyn SameConstantOracle,
+    ) {
+        let Some(index_value) = index_value else {
             if let Some(cache) = self.heap_array_cache.get_mut(&descr) {
                 cache.clear();
             }
             return;
-        }
+        };
         let seen_alloc = self.saw_allocation(array);
         let entry = self
             .heap_array_cache
             .entry(descr)
             .or_default()
-            .entry(index.raw())
+            .entry(index_value)
             .or_insert_with(CacheEntry::new);
+        // CacheEntry.do_write_with_aliasing internally canonicalises
+        // ConstPtr operands via `_unique_const_heuristic`, replicating
+        // heapcache.py:577 `indexcache.do_write_with_aliasing(box, ...)`.
+        let array = entry._unique_const_heuristic(array, oracle);
         entry._clear_cache_on_write(seen_alloc);
         entry._getdict_mut(seen_alloc).insert(array, value);
     }
 
-    /// Record an array item read.
-    pub fn getarrayitem_now_known_alias(
+    /// heapcache.py:565-568 `getarrayitem_now_known`. Same canonical
+    /// keying as `setarrayitem_cache` but without the alias clearing.
+    pub fn getarrayitem_now_known(
         &mut self,
         array: OpRef,
-        index: OpRef,
+        index_value: Option<i64>,
         descr: u32,
         value: OpRef,
+        oracle: &dyn SameConstantOracle,
     ) {
-        self.getarrayitem_now_known(array, index, descr, value);
-    }
-
-    /// heapcache.py:565-568 getarrayitem_now_known: ConstInt-only
-    /// read_now_known into indexcache.
-    pub fn getarrayitem_now_known(&mut self, array: OpRef, index: OpRef, descr: u32, value: OpRef) {
-        if !index.is_constant() {
+        let Some(index_value) = index_value else {
             return;
-        }
+        };
         let seen_alloc = self.saw_allocation(array);
         let entry = self
             .heap_array_cache
             .entry(descr)
             .or_default()
-            .entry(index.raw())
+            .entry(index_value)
             .or_insert_with(CacheEntry::new);
+        let array = entry._unique_const_heuristic(array, oracle);
         entry._getdict_mut(seen_alloc).insert(array, value);
     }
 
@@ -1768,7 +1974,9 @@ impl HeapCache {
         self.head_version += HF_VERSION_INC;
         self.likely_virtual_version = self.head_version;
         // heapcache.py:172-175: clear heap_cache + heap_array_cache.
-        self.field_cache.clear();
+        // Replacing `heap_cache = {}` drops every per-descr
+        // `CacheEntry`, which in turn drops the per-descr
+        // `last_const_box` `_unique_const_heuristic` LRU.
         self.heap_cache.clear();
         self.heap_array_cache.clear();
         // heapcache.py:176: need_guard_not_invalidated = True
@@ -1830,7 +2038,6 @@ impl HeapCache {
     pub fn reset_keep_likely_virtuals(&mut self) {
         assert!(self.head_version < HF_VERSION_MAX);
         self.head_version += HF_VERSION_INC;
-        self.field_cache.clear();
         self.heap_cache.clear();
         self.heap_array_cache.clear();
     }
@@ -1854,6 +2061,74 @@ impl Default for HeapCache {
 mod tests {
     use super::*;
 
+    /// Test fixture for `_unique_const_heuristic`: two ConstPtr OpRefs
+    /// `(typed-Ref, raw=10000)` and `(typed-Ref, raw=10001)` compare
+    /// equal under the oracle iff their pre-registered indices are.
+    struct FixedSameConstantOracle {
+        same_pairs: Vec<(OpRef, OpRef)>,
+    }
+
+    impl SameConstantOracle for FixedSameConstantOracle {
+        fn same_constant(&self, a: OpRef, b: OpRef) -> bool {
+            if a == b {
+                return true;
+            }
+            self.same_pairs
+                .iter()
+                .any(|&(x, y)| (x == a && y == b) || (x == b && y == a))
+        }
+    }
+
+    /// Identity-only oracle for tests that exercise non-ConstPtr OpRefs.
+    /// Same as `FixedSameConstantOracle { same_pairs: vec![] }` but
+    /// shorter at the callsite.
+    struct IdentitySameConstantOracle;
+
+    impl SameConstantOracle for IdentitySameConstantOracle {
+        fn same_constant(&self, a: OpRef, b: OpRef) -> bool {
+            a == b
+        }
+    }
+
+    const IDENTITY_ORACLE: &dyn SameConstantOracle = &IdentitySameConstantOracle;
+
+    /// `_unique_const_heuristic` collapses consecutive equal ConstPtr
+    /// arguments to the cached `last_const_box`, even when the two
+    /// OpRefs are distinct (post-dedup-retirement shape).
+    #[test]
+    fn unique_const_heuristic_canonicalises_to_last_via_same_constant() {
+        let mut entry = CacheEntry::new();
+        let a = OpRef::const_ptr(0);
+        let b = OpRef::const_ptr(1);
+        let oracle = FixedSameConstantOracle {
+            same_pairs: vec![(a, b)],
+        };
+        assert_eq!(entry._unique_const_heuristic(a, &oracle), a);
+        assert_eq!(entry._unique_const_heuristic(b, &oracle), a);
+    }
+
+    /// Non-constant OpRefs bypass the heuristic unchanged
+    /// (heapcache.py:99 `isinstance(ref_box, ConstPtr)` guard).
+    #[test]
+    fn unique_const_heuristic_skips_non_constant() {
+        let mut entry = CacheEntry::new();
+        let oracle = FixedSameConstantOracle { same_pairs: vec![] };
+        let op = OpRef::ref_op(7);
+        assert_eq!(entry._unique_const_heuristic(op, &oracle), op);
+        assert!(entry.last_const_box.is_none());
+    }
+
+    /// Non-Ref-typed constants (ConstInt / ConstFloat) bypass the
+    /// heuristic — upstream only canonicalises ConstPtr.
+    #[test]
+    fn unique_const_heuristic_skips_non_ref_constants() {
+        let mut entry = CacheEntry::new();
+        let oracle = FixedSameConstantOracle { same_pairs: vec![] };
+        let ci = OpRef::const_int(0);
+        assert_eq!(entry._unique_const_heuristic(ci, &oracle), ci);
+        assert!(entry.last_const_box.is_none());
+    }
+
     #[test]
     fn test_field_cache_basic() {
         let mut cache = HeapCache::new();
@@ -1861,10 +2136,13 @@ mod tests {
         let field = 1;
         let val = OpRef::ref_op(2);
 
-        assert_eq!(cache.getfield_cached(obj, field), None);
+        assert_eq!(cache.getfield_cached(obj, field, IDENTITY_ORACLE), None);
 
-        cache.getfield_now_known(obj, field, val);
-        assert_eq!(cache.getfield_cached(obj, field), Some(val));
+        cache.getfield_now_known(obj, field, val, IDENTITY_ORACLE);
+        assert_eq!(
+            cache.getfield_cached(obj, field, IDENTITY_ORACLE),
+            Some(val)
+        );
     }
 
     #[test]
@@ -1873,11 +2151,17 @@ mod tests {
         let obj = OpRef::ref_op(0);
         let field = 1;
 
-        cache.getfield_now_known(obj, field, OpRef::ref_op(10));
-        assert_eq!(cache.getfield_cached(obj, field), Some(OpRef::ref_op(10)));
+        cache.getfield_now_known(obj, field, OpRef::ref_op(10), IDENTITY_ORACLE);
+        assert_eq!(
+            cache.getfield_cached(obj, field, IDENTITY_ORACLE),
+            Some(OpRef::ref_op(10))
+        );
 
-        cache.getfield_now_known(obj, field, OpRef::ref_op(20));
-        assert_eq!(cache.getfield_cached(obj, field), Some(OpRef::ref_op(20)));
+        cache.getfield_now_known(obj, field, OpRef::ref_op(20), IDENTITY_ORACLE);
+        assert_eq!(
+            cache.getfield_cached(obj, field, IDENTITY_ORACLE),
+            Some(OpRef::ref_op(20))
+        );
     }
 
     #[test]
@@ -1888,43 +2172,89 @@ mod tests {
         let field = 5;
 
         // Both objects have a known field value
-        cache.getfield_now_known(obj_a, field, OpRef::ref_op(10));
-        cache.getfield_now_known(obj_b, field, OpRef::ref_op(20));
+        cache.getfield_now_known(obj_a, field, OpRef::ref_op(10), IDENTITY_ORACLE);
+        cache.getfield_now_known(obj_b, field, OpRef::ref_op(20), IDENTITY_ORACLE);
 
         // Writing to obj_a (which is NOT unescaped) should invalidate
         // obj_b's field cache for the same field (potential aliasing).
-        cache.setfield_cached(obj_a, field, OpRef::ref_op(30));
-        assert_eq!(cache.getfield_cached(obj_a, field), Some(OpRef::ref_op(30)));
-        assert_eq!(cache.getfield_cached(obj_b, field), None); // invalidated
+        cache.setfield_cached(obj_a, field, OpRef::ref_op(30), IDENTITY_ORACLE);
+        assert_eq!(
+            cache.getfield_cached(obj_a, field, IDENTITY_ORACLE),
+            Some(OpRef::ref_op(30))
+        );
+        assert_eq!(cache.getfield_cached(obj_b, field, IDENTITY_ORACLE), None); // invalidated
     }
 
+    /// heapcache.py:70-77 `_clear_cache_on_write(seen_alloc)`.  When the
+    /// write target is seen-allocated, only `cache_anything` is cleared
+    /// — entries for other seen-allocated boxes in
+    /// `cache_seen_allocation` survive because distinct
+    /// seen-allocation identities cannot alias each other.
     #[test]
-    fn test_setfield_no_aliasing_for_unescaped() {
+    fn test_setfield_seen_alloc_preserves_other_seen_alloc_entries() {
         let mut cache = HeapCache::new();
         let obj_a = OpRef::ref_op(0);
         let obj_b = OpRef::ref_op(1);
         let field = 5;
 
-        // obj_a is a newly allocated object
+        // Both targets have been observed allocating, so each lives in
+        // the seen-allocation bucket and they don't alias each other.
         cache.new_object(obj_a);
-        cache.getfield_now_known(obj_a, field, OpRef::ref_op(10));
-        cache.getfield_now_known(obj_b, field, OpRef::ref_op(20));
+        cache.new_object(obj_b);
+        cache.getfield_now_known(obj_a, field, OpRef::ref_op(10), IDENTITY_ORACLE);
+        cache.getfield_now_known(obj_b, field, OpRef::ref_op(20), IDENTITY_ORACLE);
 
-        // Writing to obj_a (unescaped) does NOT cause aliasing invalidation
-        cache.setfield_cached(obj_a, field, OpRef::ref_op(30));
-        assert_eq!(cache.getfield_cached(obj_a, field), Some(OpRef::ref_op(30)));
-        assert_eq!(cache.getfield_cached(obj_b, field), Some(OpRef::ref_op(20))); // preserved
+        // Writing to obj_a leaves obj_b's seen-alloc entry intact.
+        cache.setfield_cached(obj_a, field, OpRef::ref_op(30), IDENTITY_ORACLE);
+        assert_eq!(
+            cache.getfield_cached(obj_a, field, IDENTITY_ORACLE),
+            Some(OpRef::ref_op(30))
+        );
+        assert_eq!(
+            cache.getfield_cached(obj_b, field, IDENTITY_ORACLE),
+            Some(OpRef::ref_op(20))
+        );
+    }
+
+    /// heapcache.py:70-77 — when the write target is seen-allocated but
+    /// some other cached box is not, the non-seen-alloc entry lives in
+    /// `cache_anything` and is dropped by `_clear_cache_on_write` even
+    /// though the target itself is in `cache_seen_allocation`.
+    #[test]
+    fn test_setfield_seen_alloc_clears_cache_anything() {
+        let mut cache = HeapCache::new();
+        let obj_a = OpRef::ref_op(0);
+        let obj_b = OpRef::ref_op(1);
+        let field = 5;
+
+        cache.new_object(obj_a);
+        // obj_b is NOT new_object'd → lives in cache_anything.
+        cache.getfield_now_known(obj_a, field, OpRef::ref_op(10), IDENTITY_ORACLE);
+        cache.getfield_now_known(obj_b, field, OpRef::ref_op(20), IDENTITY_ORACLE);
+
+        cache.setfield_cached(obj_a, field, OpRef::ref_op(30), IDENTITY_ORACLE);
+        assert_eq!(
+            cache.getfield_cached(obj_a, field, IDENTITY_ORACLE),
+            Some(OpRef::ref_op(30))
+        );
+        assert_eq!(cache.getfield_cached(obj_b, field, IDENTITY_ORACLE), None);
     }
 
     #[test]
     fn test_invalidate_caches() {
         let mut cache = HeapCache::new();
-        cache.getfield_now_known(OpRef::ref_op(0), 1, OpRef::ref_op(10));
-        cache.getfield_now_known(OpRef::ref_op(1), 2, OpRef::ref_op(20));
+        cache.getfield_now_known(OpRef::ref_op(0), 1, OpRef::ref_op(10), IDENTITY_ORACLE);
+        cache.getfield_now_known(OpRef::ref_op(1), 2, OpRef::ref_op(20), IDENTITY_ORACLE);
 
         cache.reset_keep_likely_virtuals();
-        assert_eq!(cache.getfield_cached(OpRef::ref_op(0), 1), None);
-        assert_eq!(cache.getfield_cached(OpRef::ref_op(1), 2), None);
+        assert_eq!(
+            cache.getfield_cached(OpRef::ref_op(0), 1, IDENTITY_ORACLE),
+            None
+        );
+        assert_eq!(
+            cache.getfield_cached(OpRef::ref_op(1), 2, IDENTITY_ORACLE),
+            None
+        );
     }
 
     #[test]
@@ -1934,13 +2264,13 @@ mod tests {
         let unescaped_obj = OpRef::ref_op(1);
 
         cache.new_object(unescaped_obj);
-        cache.getfield_now_known(escaped_obj, 1, OpRef::ref_op(10));
-        cache.getfield_now_known(unescaped_obj, 1, OpRef::ref_op(20));
+        cache.getfield_now_known(escaped_obj, 1, OpRef::ref_op(10), IDENTITY_ORACLE);
+        cache.getfield_now_known(unescaped_obj, 1, OpRef::ref_op(20), IDENTITY_ORACLE);
 
         cache.invalidate_caches_for_escaped();
-        assert_eq!(cache.getfield_cached(escaped_obj, 1), None);
+        assert_eq!(cache.getfield_cached(escaped_obj, 1, IDENTITY_ORACLE), None);
         assert_eq!(
-            cache.getfield_cached(unescaped_obj, 1),
+            cache.getfield_cached(unescaped_obj, 1, IDENTITY_ORACLE),
             Some(OpRef::ref_op(20))
         );
     }
@@ -2001,12 +2331,15 @@ mod tests {
         let mut cache = HeapCache::new();
         cache.new_object(OpRef::ref_op(0));
         cache.class_now_known(OpRef::ref_op(0), GcRef(0x1000));
-        cache.getfield_now_known(OpRef::ref_op(0), 1, OpRef::ref_op(10));
+        cache.getfield_now_known(OpRef::ref_op(0), 1, OpRef::ref_op(10), IDENTITY_ORACLE);
 
         cache.reset();
         assert!(!cache.is_unescaped(OpRef::ref_op(0)));
         assert!(!cache.is_class_known(OpRef::ref_op(0)));
-        assert_eq!(cache.getfield_cached(OpRef::ref_op(0), 1), None);
+        assert_eq!(
+            cache.getfield_cached(OpRef::ref_op(0), 1, IDENTITY_ORACLE),
+            None
+        );
     }
 
     #[test]
@@ -2014,13 +2347,19 @@ mod tests {
         let mut cache = HeapCache::new();
         let obj = OpRef::ref_op(0);
 
-        cache.getfield_now_known(obj, 1, OpRef::ref_op(10));
-        cache.getfield_now_known(obj, 2, OpRef::ref_op(20));
+        cache.getfield_now_known(obj, 1, OpRef::ref_op(10), IDENTITY_ORACLE);
+        cache.getfield_now_known(obj, 2, OpRef::ref_op(20), IDENTITY_ORACLE);
 
         // Writing field 1 should not affect field 2
-        cache.setfield_cached(obj, 1, OpRef::ref_op(30));
-        assert_eq!(cache.getfield_cached(obj, 1), Some(OpRef::ref_op(30)));
-        assert_eq!(cache.getfield_cached(obj, 2), Some(OpRef::ref_op(20)));
+        cache.setfield_cached(obj, 1, OpRef::ref_op(30), IDENTITY_ORACLE);
+        assert_eq!(
+            cache.getfield_cached(obj, 1, IDENTITY_ORACLE),
+            Some(OpRef::ref_op(30))
+        );
+        assert_eq!(
+            cache.getfield_cached(obj, 2, IDENTITY_ORACLE),
+            Some(OpRef::ref_op(20))
+        );
     }
 
     #[test]

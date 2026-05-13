@@ -1891,9 +1891,10 @@ pub(crate) fn try_trace_const_boxed_int(
 /// RPython's `arraylen_gc` reads the GC array header — there is exactly one
 /// length per array, so RPython keeps a per-box `heapc_deps[0]` slot. pyre
 /// stores list/bytes/tuple lengths as plain struct fields, so the cached
-/// value lives in the regular field cache (`heap_cache.field_cache`).
-/// `opimpl_getfield_gc_i` already does that lookup, so this helper is now
-/// just a thin alias kept for source-stability with the call sites.
+/// value lives in `HeapCache.heap_cache[descr] -> CacheEntry`
+/// (heapcache.py:172).  `opimpl_getfield_gc_i` already does that lookup,
+/// so this helper is now just a thin alias kept for source-stability
+/// with the call sites.
 pub(crate) fn trace_arraylen_gc(ctx: &mut TraceCtx, obj: OpRef, descr: DescrRef) -> OpRef {
     opimpl_getfield_gc_i(ctx, obj, descr)
 }
@@ -1936,7 +1937,7 @@ pub(crate) fn opimpl_getfield_gc_i(ctx: &mut TraceCtx, obj: OpRef, descr: DescrR
     //
     // heapcache.py: check if this field was already read/written in this trace
     let field_index = descr.index();
-    if let Some(cached) = ctx.heap_cache().getfield_cached(obj, field_index) {
+    if let Some(cached) = ctx.heapcache_getfield_cached(obj, field_index) {
         // pyjitpl.py:923-947 `_opimpl_getfield_gc_any_pureornot` cache hit:
         //   if upd.currfieldbox is not None:
         //       self.metainterp.staticdata.profiler.count_ops(rop.GETFIELD_GC_I, Counters.HEAPCACHED_OPS)
@@ -1978,8 +1979,7 @@ pub(crate) fn opimpl_getfield_gc_i(ctx: &mut TraceCtx, obj: OpRef, descr: DescrR
         OpCode::GetfieldGcI
     };
     let result = ctx.record_op_with_descr(opcode, &[obj], descr);
-    ctx.heap_cache_mut()
-        .getfield_now_known(obj, field_index, result);
+    ctx.heapcache_getfield_now_known(obj, field_index, result);
     result
 }
 
@@ -1989,7 +1989,7 @@ pub(crate) fn opimpl_getfield_gc_i(ctx: &mut TraceCtx, obj: OpRef, descr: DescrR
 /// alias), so the tracer only records the GC op.
 pub(crate) fn opimpl_getfield_gc_r(ctx: &mut TraceCtx, obj: OpRef, descr: DescrRef) -> OpRef {
     let field_index = descr.index();
-    if let Some(cached) = ctx.heap_cache().getfield_cached(obj, field_index) {
+    if let Some(cached) = ctx.heapcache_getfield_cached(obj, field_index) {
         // pyjitpl.py:929-947 `_opimpl_getfield_gc_any_pureornot` cache hit.
         // RPython hardcodes `GETFIELD_GC_I` regardless of the rop variant
         // (`_i` / `_r` / `_f`); pyre matches the hardcode for parity.
@@ -2020,8 +2020,7 @@ pub(crate) fn opimpl_getfield_gc_r(ctx: &mut TraceCtx, obj: OpRef, descr: DescrR
         OpCode::GetfieldGcR
     };
     let result = ctx.record_op_with_descr(opcode, &[obj], descr);
-    ctx.heap_cache_mut()
-        .getfield_now_known(obj, field_index, result);
+    ctx.heapcache_getfield_now_known(obj, field_index, result);
     result
 }
 
@@ -2237,12 +2236,11 @@ pub(crate) fn frame_locals_cells_stack_array(ctx: &mut TraceCtx, frame: OpRef) -
 pub(crate) fn trace_array_getitem_value(ctx: &mut TraceCtx, array: OpRef, index: OpRef) -> OpRef {
     let descr = pyobject_gcarray_descr();
     let descr_idx = descr.index();
-    if let Some(cached) = ctx.heap_cache().getarrayitem_cache(array, index, descr_idx) {
+    if let Some(cached) = ctx.heapcache_getarrayitem(array, index, descr_idx) {
         return cached;
     }
     let result = ctx.record_op_with_descr(OpCode::GetarrayitemGcR, &[array, index], descr);
-    ctx.heap_cache_mut()
-        .getarrayitem_now_known(array, index, descr_idx, result);
+    ctx.heapcache_getarrayitem_now_known(array, index, descr_idx, result);
     result
 }
 
@@ -2254,12 +2252,11 @@ pub(crate) fn trace_raw_array_getitem_value(
 ) -> OpRef {
     let descr = pyobject_array_descr();
     let descr_idx = descr.index();
-    if let Some(cached) = ctx.heap_cache().getarrayitem_cache(array, index, descr_idx) {
+    if let Some(cached) = ctx.heapcache_getarrayitem(array, index, descr_idx) {
         return cached;
     }
     let result = ctx.record_op_with_descr(OpCode::GetarrayitemGcR, &[array, index], descr);
-    ctx.heap_cache_mut()
-        .getarrayitem_now_known(array, index, descr_idx, result);
+    ctx.heapcache_getarrayitem_now_known(array, index, descr_idx, result);
     result
 }
 
@@ -2282,12 +2279,11 @@ pub(crate) fn trace_items_block_getitem_value(
 ) -> OpRef {
     let descr = pyobject_gcarray_descr();
     let descr_idx = descr.index();
-    if let Some(cached) = ctx.heap_cache().getarrayitem_cache(block, index, descr_idx) {
+    if let Some(cached) = ctx.heapcache_getarrayitem(block, index, descr_idx) {
         return cached;
     }
     let result = ctx.record_op_with_descr(OpCode::GetarrayitemGcR, &[block, index], descr);
-    ctx.heap_cache_mut()
-        .getarrayitem_now_known(block, index, descr_idx, result);
+    ctx.heapcache_getarrayitem_now_known(block, index, descr_idx, result);
     result
 }
 
@@ -2302,8 +2298,7 @@ pub(crate) fn trace_items_block_setitem_value(
     let descr = pyobject_gcarray_descr();
     let descr_idx = descr.index();
     ctx.record_op_with_descr(OpCode::SetarrayitemGc, &[block, index, value], descr);
-    ctx.heap_cache_mut()
-        .setarrayitem_cache(block, index, descr_idx, value);
+    ctx.heapcache_setarrayitem(block, index, descr_idx, value);
 }
 
 pub(crate) fn trace_raw_int_array_getitem_value(
@@ -2337,8 +2332,7 @@ pub(crate) fn trace_raw_array_setitem_value(
     let descr = pyobject_array_descr();
     let descr_idx = descr.index();
     ctx.record_op_with_descr(OpCode::SetarrayitemGc, &[array, index, value], descr);
-    ctx.heap_cache_mut()
-        .setarrayitem_cache(array, index, descr_idx, value);
+    ctx.heapcache_setarrayitem(array, index, descr_idx, value);
 }
 
 pub(crate) fn trace_raw_int_array_setitem_value(
@@ -4024,8 +4018,7 @@ fn materialize_bridge_virtual(
                 signed,
             );
             ctx.record_op_with_descr(OpCode::SetfieldGc, &[struct_op, value], field_descr.clone());
-            ctx.heap_cache_mut()
-                .setfield_cached(struct_op, fd_info.index, value);
+            ctx.heapcache_setfield_cached(struct_op, fd_info.index, value);
         }
     }
 
@@ -8238,28 +8231,37 @@ mod tests {
             Some(majit_ir::Value::Float(_))
         ));
 
-        // Calling twice does not shrink. Int/Ref trailing slots resolve
-        // to the same OpRef via the `large_ints`/`refs` resume-memo dedup
-        // (resume.py:148-149/167-181). Float falls through `_newconst`
-        // (resume.py:183) which appends a fresh slot per call, so the
-        // second call re-mints `registers_f[2]` — value-equality, not
-        // identity-equality, is the upstream invariant for Float.
-        let trailing_i_before = sym.registers_i[3];
-        let trailing_r_before = sym.registers_r[4];
-        let trailing_f_before = sym.registers_f[2];
+        // Calling twice does not shrink the register banks. `history.py:220
+        // ConstInt`, `:261 ConstFloat`, `:307 ConstPtr` are all fresh-alloc
+        // per construction; `Const.same_constant` (history.py:204) is the
+        // upstream value-equality predicate. Assert value-equality across
+        // both calls via `constants_get_value` rather than OpRef identity,
+        // independent of whether the pool internally dedups.
+        let trailing_i_value_before = ctx
+            .constants_get_value(sym.registers_i[3])
+            .expect("first-call trailing int slot resolves to a constant");
+        let trailing_r_value_before = ctx
+            .constants_get_value(sym.registers_r[4])
+            .expect("first-call trailing ref slot resolves to a constant");
         let trailing_f_value_before = ctx
-            .constants_get_value(trailing_f_before)
+            .constants_get_value(sym.registers_f[2])
             .expect("first-call trailing float slot resolves to a constant");
         sym.setup_kind_register_banks(&mut ctx);
         assert_eq!(sym.registers_i.len(), 5);
         assert_eq!(sym.registers_r.len(), 5);
         assert_eq!(sym.registers_f.len(), 3);
-        assert_eq!(sym.registers_i[3], trailing_i_before);
-        assert_eq!(sym.registers_r[4], trailing_r_before);
-        let trailing_f_value_after = ctx
-            .constants_get_value(sym.registers_f[2])
-            .expect("second-call trailing float slot resolves to a constant");
-        assert_eq!(trailing_f_value_after, trailing_f_value_before);
+        assert_eq!(
+            ctx.constants_get_value(sym.registers_i[3]),
+            Some(trailing_i_value_before),
+        );
+        assert_eq!(
+            ctx.constants_get_value(sym.registers_r[4]),
+            Some(trailing_r_value_before),
+        );
+        assert_eq!(
+            ctx.constants_get_value(sym.registers_f[2]),
+            Some(trailing_f_value_before),
+        );
 
         // SAFETY: drop the boxed JitCode; sym.jitcode now dangles but goes
         // out of scope at the end of this test.

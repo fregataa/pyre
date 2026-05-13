@@ -35,7 +35,7 @@
 //! | `cast_int_to_float/i>f` | PARITY | i-bank read, record `CastIntToFloat`, f-bank write. RPython `pyjitpl.py:357 cast_int_to_float` (same exec-generated unary opimpl loop). |
 //! | `ptr_eq/rr>i`, `ptr_ne/rr>i` | PARITY | r-bank pair → record PtrEq/PtrNe → i-bank dst via `binop_ref_to_int_record`. RPython `pyjitpl.py:326-336` exec-generated comparison opimpls (b1 is b2 fast path omitted, same rationale as int comparisons). |
 //! | `getfield_gc_i/rd>i`, `getfield_gc_r/rd>r` | PARITY (heapcache-aware) | r-bank obj + descr → heapcache lookup. Cache hit returns cached OpRef without recording; cache miss records `OpCode::GetfieldGc<I,R>` + `getfield_now_known` writeback. RPython `pyjitpl.py:855-882 + 929-950 _opimpl_getfield_gc_any_pureornot`. ConstPtr fast-path (`pyjitpl.py:856-860`) deferred — pyre walker doesn't track ConstPtr identity (optimizer's job post-trace). The pyre-specific `id>X` shape (int source — kind-flow Task #85) stays unsupported. |
-//! | `setfield_gc_i/rid`, `setfield_gc_r/rrd` | PARITY (heapcache-aware, alias-clearing) | r-bank box + (i\|r)-bank valuebox + descr. If `getfield_cached(obj,descr) == Some(valuebox)` skip recording (RPython `if upd.currfieldbox is valuebox: return`); otherwise record `OpCode::SetfieldGc(obj, valuebox)` + `setfield_cached` write-through (alias-clearing — when obj is escaped, retain only unescaped-object cache entries for this field_index, mirroring RPython `FieldUpdater.setfield → do_write_with_aliasing`). RPython `pyjitpl.py:973-988 _opimpl_setfield_gc_any`. The disabled is_unescaped branch (`pyjitpl.py:981-988`) is intentionally not ported — RPython itself has it commented out. `iid` / `ird` (int box) shapes stay unsupported (Task #85 territory). |
+//! | `setfield_gc_i/rid`, `setfield_gc_r/rrd` | PARITY (heapcache-aware, alias-clearing) | r-bank box + (i\|r)-bank valuebox + descr. If `getfield_cached(obj,descr) == Some(valuebox)` skip recording (RPython `if upd.currfieldbox is valuebox: return`); otherwise record `OpCode::SetfieldGc(obj, valuebox)` + `setfield_cached` write-through. Aliasing semantics: `CacheEntry.do_write_with_aliasing` (heapcache.py:90-94) routes through `_clear_cache_on_write(seen_alloc)` — always wipes `cache_anything`, additionally wipes `cache_seen_allocation` when the write target itself isn't seen-allocated. RPython `pyjitpl.py:973-988 _opimpl_setfield_gc_any`. The disabled is_unescaped branch (`pyjitpl.py:981-988`) is intentionally not ported — RPython itself has it commented out. `iid` / `ird` (int box) shapes stay unsupported (Task #85 territory). |
 //! | `getarrayitem_gc_r/rid>r` | PARITY (heapcache-aware) | r-bank array + i-bank index + descr → heapcache `getarrayitem` lookup. Cache hit returns cached OpRef without IR; cache miss records `OpCode::GetarrayitemGcR(array, index)` + `getarrayitem_now_known` writeback. RPython `pyjitpl.py:639-688 _do_getarrayitem_gc_any`. `_i` / `_f` shapes don't appear in pyre's insns table today; would land mechanically when emitted. |
 //! | `setarrayitem_gc_r/rird` | PARITY (heapcache-aware) | r-bank array + i-bank index + r-bank value + descr. Always records `OpCode::SetarrayitemGc(array, index, value)` + `heapcache.setarrayitem(...)` write. RPython `pyjitpl.py:736-744 _opimpl_setarrayitem_gc_any` — no skip-on-redundant short-circuit because `setarrayitem` does aliasing-aware invalidation. `rrid` / `rrrd` / `rrfd` (Ref index) shapes stay unsupported (Task #85). |
 //! | `residual_call_r_r/iRd>r` | PRE-EXISTING-ADAPTATION (deferred slices for `direct_assembler_call` + `capture_resumedata`) | classifies the call by `EffectInfo`. Wired sub-cases: (1) release-gil via [`direct_call_release_gil`] — `CallReleaseGilI` + arglist `[savebox, funcbox] + argboxes[1:]` reshape per `pyjitpl.py:3675-3681`, plus the outer forces-branch `GUARD_NOT_FORCED` (`:2079`) + `GUARD_NO_EXCEPTION` (`:2082`); (2) loop-invariant heapcache via [`loopinvariant_lookup`] / [`loopinvariant_now_known`] per `pyjitpl.py:2088 + 2109`; (3) vable IR bookkeeping (`pyjitpl.py:2055-2080`) via [`maybe_walker_vable_and_vrefs_before_residual_call`] — emits FORCE_TOKEN + SETFIELD_GC only; the runtime heap mutations on `vinfo.tracing_before_residual_call` / `vrefinfo.tracing_before_residual_call` (`pyjitpl.py:3318-3330`) and the after-call helpers (`pyjitpl.py:3337-3366`) stay on the trait-driven leg (`state.rs MIFrame::vable_and_vrefs_before_residual_call`, `trace_opcode.rs:2193-2349`) since the walker can't observe a force without executing the callee. The remaining branches go through [`select_residual_call_opcode`]: `CallMayForce*` + `GuardNotForced` on the rest of the forces-virtual path (`pyjitpl.py:2017-2082`), `CallLoopinvariant*` on `EF_LOOPINVARIANT` (`pyjitpl.py:2087-2110`), `CallPure*` on elidable, otherwise `Call*`. `GuardNoException` follows whenever `effectinfo.check_can_raise(False)` is true (`pyjitpl.py:2082 handle_possible_exception`). `heapcache.invalidate_caches_varargs(call_opcode, ei, allboxes)` (`pyjitpl.py:2042 + 2659`) is wired around every recorded call op. `OS_NOT_IN_TRACE` is fail-loud-guarded up front via [`do_not_in_trace_call_result`] — `effect_info_for_call_flavor` stub never sets the index today (`flatten.rs:431`), making it dead until producers land. Same fail-loud treatment via [`do_jit_force_virtual_guard`] for `OS_JIT_FORCE_VIRTUAL` (stricter-than-PyPy — needs OpRef→concrete-pointer resolver, Task #45). Still deferred (each blocked on infrastructure absent from pyre-jit-trace): `direct_libffi_call` / `direct_assembler_call` specialization (`pyjitpl.py:1908-1990` — assembler_call paths route through `inline_call_*/dR>X` instead), KEEPALIVE for vablebox (only fires when `direct_assembler_call` returns a vablebox), and `num_live`-aware `capture_resumedata(after_residual_call=True)` on the guards (`pyjitpl.py:2078-2082 → 2586`). |
@@ -1231,8 +1231,7 @@ fn getarrayitem_gc_via_heapcache(
 
     let result = if let Some(cached) =
         ctx.trace_ctx
-            .heap_cache()
-            .getarrayitem(array, index, descr_index)
+            .heapcache_getarrayitem(array, index, descr_index)
     {
         // pyjitpl.py:639-673 `_do_getarrayitem_gc_any` cache hit:
         //   tobox = heapcache.getarrayitem(...)
@@ -1252,8 +1251,7 @@ fn getarrayitem_gc_via_heapcache(
             .trace_ctx
             .record_op_with_descr(opcode, &[array, index], descr);
         ctx.trace_ctx
-            .heap_cache_mut()
-            .getarrayitem_now_known(array, index, descr_index, resbox);
+            .heapcache_getarrayitem_now_known(array, index, descr_index, resbox);
         resbox
     };
 
@@ -1341,8 +1339,7 @@ fn setarrayitem_gc_via_heapcache(
     ctx.trace_ctx
         .record_op_with_descr(OpCode::SetarrayitemGc, &[array, index, value], descr);
     ctx.trace_ctx
-        .heap_cache_mut()
-        .setarrayitem(array, index, descr_index, value);
+        .heapcache_setarrayitem(array, index, descr_index, value);
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
@@ -1363,21 +1360,20 @@ fn setarrayitem_gc_via_heapcache(
 /// **Alias-clearing writeback**: goes through
 /// `HeapCache::setfield_cached` instead of `getfield_now_known`. The
 /// difference is the alias-clearing semantic that RPython's
-/// `FieldUpdater.setfield()` carries:
+/// `FieldUpdater.setfield()` carries (heapcache.py:142-143 routes to
+/// `CacheEntry.do_write_with_aliasing`):
 ///
-///   When the obj is NOT known-unescaped, ALL cached values for the
-///   same field on other (escaped) objects must be invalidated, since
-///   pointer aliasing means the SETFIELD could have written through
-///   `obj` and altered another object's view of the same field.
+///   `_clear_cache_on_write(seen_alloc)` (heapcache.py:70-77) wipes
+///   `cache_anything` unconditionally and additionally wipes
+///   `cache_seen_allocation` when the write target itself is not
+///   seen-allocated.  This conservatively kills any cached entry whose
+///   source-box might alias the SETFIELD target.
 ///
 /// `getfield_now_known` only inserts the new (obj, field, value) tuple
-/// — it does NOT clear sibling entries. Using it here meant a
+/// — it does NOT clear sibling entries.  Using it here meant a
 /// subsequent `getfield_gc(other_obj, same_field)` could return a
-/// stale value cached from before the SETFIELD. Switching to
-/// `setfield_cached` matches RPython's `do_write_with_aliasing` exactly
-/// (`heapcache.rs:667-688`): the helper checks `is_unescaped(obj)` and
-/// only retains entries for unescaped objects (which can't alias
-/// anything else).
+/// stale value cached from before the SETFIELD.  Switching to
+/// `setfield_cached` matches `do_write_with_aliasing` exactly.
 ///
 /// `value_bank` selects the valuebox source: `'i'` reads
 /// `registers_i[v]`, `'r'` reads `registers_r[v]`.
@@ -1404,8 +1400,7 @@ fn setfield_gc_via_heapcache(
     //   if upd.currfieldbox is valuebox:
     //       self.metainterp.staticdata.profiler.count_ops(rop.SETFIELD_GC, Counters.HEAPCACHED_OPS)
     //       return
-    let is_redundant =
-        ctx.trace_ctx.heap_cache().getfield_cached(obj, descr_index) == Some(valuebox);
+    let is_redundant = ctx.trace_ctx.heapcache_getfield_cached(obj, descr_index) == Some(valuebox);
     if is_redundant {
         ctx.trace_ctx.profiler().count_ops(
             OpCode::SetfieldGc,
@@ -1415,15 +1410,11 @@ fn setfield_gc_via_heapcache(
         ctx.trace_ctx
             .record_op_with_descr(OpCode::SetfieldGc, &[obj, valuebox], descr);
         // Write-through with alias-clearing semantics.
-        // RPython `upd.setfield(valuebox)` → heapcache's
-        // `do_write_with_aliasing`. Pyre's `setfield_cached`
-        // (`heapcache.rs:667-688`) implements the same semantics:
-        // when obj is not unescaped, retain only entries on unescaped
-        // objects for this field_index; otherwise insert without
-        // invalidation.
+        // RPython `upd.setfield(valuebox)` → `CacheEntry.do_write_with_aliasing`
+        // (heapcache.py:90-94): canonicalise via `_unique_const_heuristic`,
+        // `_clear_cache_on_write(seen_alloc)`, then insert.
         ctx.trace_ctx
-            .heap_cache_mut()
-            .setfield_cached(obj, descr_index, valuebox);
+            .heapcache_setfield_cached(obj, descr_index, valuebox);
     }
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
@@ -1466,8 +1457,7 @@ fn getfield_gc_via_heapcache(
     let descr = read_descr(code, op, 1, ctx)?;
     let descr_index = descr.index();
 
-    let result = if let Some(cached) = ctx.trace_ctx.heap_cache().getfield_cached(obj, descr_index)
-    {
+    let result = if let Some(cached) = ctx.trace_ctx.heapcache_getfield_cached(obj, descr_index) {
         // Cache hit (RPython pyjitpl.py:929-947 _opimpl_getfield_gc_any_pureornot):
         //   if upd.currfieldbox is not None:
         //       self.metainterp.staticdata.profiler.count_ops(rop.GETFIELD_GC_I, Counters.HEAPCACHED_OPS)
@@ -1484,8 +1474,7 @@ fn getfield_gc_via_heapcache(
         // Cache miss — record op + write through.
         let resbox = ctx.trace_ctx.record_op_with_descr(opcode, &[obj], descr);
         ctx.trace_ctx
-            .heap_cache_mut()
-            .getfield_now_known(obj, descr_index, resbox);
+            .heapcache_getfield_now_known(obj, descr_index, resbox);
         resbox
     };
 
@@ -2392,8 +2381,7 @@ fn direct_call_release_gil(
         _ => unreachable!("dst_bank validated above"),
     };
     ctx.trace_ctx
-        .heap_cache_mut()
-        .invalidate_caches_varargs(mayforce_opnum, Some(ei), allboxes);
+        .heapcache_invalidate_caches_varargs(mayforce_opnum, Some(ei), allboxes);
     // pyjitpl.py:1950 _opimpl_residual_call*: result writeback runs
     // BEFORE handle_possible_exception().  Write `result` into
     // `registers_*[dst]` here so the GUARD_NO_EXCEPTION fail_args
@@ -2650,8 +2638,7 @@ fn dispatch_residual_call_iRd_kind(
         // `_record_helper_varargs` invocation that runs inside
         // upstream's `executor.execute_varargs(opnum, ...)`.
         ctx.trace_ctx
-            .heap_cache_mut()
-            .invalidate_caches_varargs(call_opcode, Some(ei), &allboxes);
+            .heapcache_invalidate_caches_varargs(call_opcode, Some(ei), &allboxes);
         // pyjitpl.py:1950 _opimpl_residual_call*: the result lands in
         // `registers_*[reg_index]` BEFORE
         // `handle_possible_exception()` runs.  Write the dst here so
@@ -2823,8 +2810,7 @@ fn dispatch_residual_call_iIRd_kind(
         // walkthrough.  Same invalidation semantics; only the
         // arglist construction differs (boxes2 = i_args ++ r_args).
         ctx.trace_ctx
-            .heap_cache_mut()
-            .invalidate_caches_varargs(call_opcode, Some(ei), &allboxes);
+            .heapcache_invalidate_caches_varargs(call_opcode, Some(ei), &allboxes);
         // pyjitpl.py:1950 _opimpl_residual_call*: result writeback runs
         // BEFORE handle_possible_exception().  See
         // `dispatch_residual_call_iRd_kind` for the full citation.
@@ -2944,8 +2930,7 @@ fn dispatch_residual_call_iIRFd_kind(
             .record_op_with_descr(call_opcode, &allboxes, descr.clone());
 
         ctx.trace_ctx
-            .heap_cache_mut()
-            .invalidate_caches_varargs(call_opcode, Some(ei), &allboxes);
+            .heapcache_invalidate_caches_varargs(call_opcode, Some(ei), &allboxes);
         write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, recorded)?;
         if emit_guard_not_forced {
             ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
@@ -4047,6 +4032,17 @@ mod tests {
     fn distinct_const_refs(ctx: &mut TraceCtx, count: usize) -> Vec<OpRef> {
         (0..count)
             .map(|i| ctx.const_ref(0xC0DE_0000_i64 + i as i64))
+            .collect()
+    }
+
+    /// Companion of [`distinct_const_refs`] that mints Int-typed
+    /// ConstInt OpRefs.  Use this when a fixture needs to populate
+    /// integer-register slots — the heapcache array path keys on the
+    /// `ConstInt.getint()` value, so Ref-typed mints don't satisfy
+    /// `getarrayitem_cache`'s ConstInt precondition.
+    fn distinct_const_ints(ctx: &mut TraceCtx, count: usize) -> Vec<OpRef> {
+        (0..count)
+            .map(|i| ctx.const_int(1_000 + i as i64))
             .collect()
     }
 
@@ -8821,7 +8817,7 @@ mod tests {
         // already cached the field's value. RPython equivalent:
         // `heapcache.getfield_now_known(...)` after a prior fetch.
         let cached_field = tc.const_int(0xCAFE);
-        tc.heap_cache_mut().getfield_now_known(obj, 1, cached_field);
+        tc.heapcache_getfield_now_known(obj, 1, cached_field);
         let ops_before = tc.num_ops();
 
         let mut wc = WalkContext {
@@ -8960,7 +8956,7 @@ mod tests {
         let descr_pool: Vec<DescrRef> = vec![make_fail_descr(0), descr];
         let frame_done = done_descr_ref_for_tests();
         // Pre-cache valuebox as the current field value.
-        tc.heap_cache_mut().getfield_now_known(obj, 1, valuebox);
+        tc.heapcache_getfield_now_known(obj, 1, valuebox);
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
             registers_r: &mut regs_r,
@@ -9039,7 +9035,7 @@ mod tests {
         ),);
         // Cache must now know the new field value.
         assert_eq!(
-            tc.heap_cache().getfield_cached(obj, 1),
+            tc.heapcache_getfield_cached(obj, 1),
             Some(valuebox),
             "post-setfield, the heapcache must reflect the written value",
         );
@@ -9163,15 +9159,14 @@ mod tests {
         let code = [byte, 0x02, 0x03, 0x01, 0x00, 0x05];
         let mut tc = fresh_trace_ctx();
         let mut regs_r = distinct_const_refs(&mut tc, 8);
-        let mut regs_i = distinct_const_refs(&mut tc, 8);
+        let mut regs_i = distinct_const_ints(&mut tc, 8);
         let array = regs_r[2];
         let index = regs_i[3];
         let descr = field_descr_with_index(1);
         let descr_pool: Vec<DescrRef> = vec![make_fail_descr(0), descr];
         let frame_done = done_descr_ref_for_tests();
         let cached = tc.const_ref(0xCAFE_F00D);
-        tc.heap_cache_mut()
-            .getarrayitem_now_known(array, index, 1, cached);
+        tc.heapcache_getarrayitem_now_known(array, index, 1, cached);
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
             registers_r: &mut regs_r,
@@ -9215,7 +9210,7 @@ mod tests {
         let code = [byte, 0x02, 0x04, 0x06, 0x01, 0x00];
         let mut tc = fresh_trace_ctx();
         let mut regs_r = distinct_const_refs(&mut tc, 8);
-        let mut regs_i = distinct_const_refs(&mut tc, 8);
+        let mut regs_i = distinct_const_ints(&mut tc, 8);
         let array = regs_r[2];
         let index = regs_i[4];
         let value = regs_r[6];
@@ -9259,7 +9254,7 @@ mod tests {
         ));
         // Heapcache must reflect the write.
         assert_eq!(
-            tc.heap_cache().getarrayitem(array, index, 1),
+            tc.heapcache_getarrayitem(array, index, 1),
             Some(value),
             "post-setarrayitem, heapcache must reflect the written value",
         );

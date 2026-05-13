@@ -5364,11 +5364,10 @@ mod tests {
     fn jitcode_vable_reads_use_standard_boxes_without_heap_ops() {
         let mut builder = JitCodeBuilder::new();
         let vr = 0;
-        // Canonical vable encoding (Stage 3c) reads the live struct pointer
-        // from `registers_r[vable_reg]`; pre-seed it with the standard
-        // virtualizable identity so the trace path constant-folds the
-        // reads against `standard_virtualizable_box()`.
-        builder.load_const_r_value(vr, 999);
+        // The vable identity is threaded in as an argbox so the single
+        // ConstPtr Box that populates `virtualizable_boxes[-1]` also
+        // populates `ref_regs[vr]` — pyjitpl.py:1131 `box is standard_box`
+        // is an identity check, so the two sources MUST be the same Box.
         builder.load_const_i_value(0, 0);
         builder.vable_getfield_int_with_base(1, vr, 0);
         builder.vable_getarrayitem_int_with_base(2, vr, 0, 0);
@@ -5390,7 +5389,14 @@ mod tests {
         );
 
         let mut sym = DummySym::default();
-        let action = trace_jitcode(&mut ctx, &mut sym, &jitcode, 0, |_pc| 0);
+        let action = trace_jitcode_with_args(
+            &mut ctx,
+            &mut sym,
+            &jitcode,
+            0,
+            |_pc| 0,
+            &[(JitArgKind::Ref, vable_ref, 999)],
+        );
         assert!(matches!(action, TraceAction::Continue));
 
         let recorder = ctx.into_recorder();
@@ -5403,7 +5409,6 @@ mod tests {
         let obj_ptr = (&mut obj as *mut ResidualVable) as usize as i64;
 
         let mut builder = JitCodeBuilder::new();
-        builder.load_const_r_value(0, obj_ptr);
         let fn_idx = builder.add_fn_ptr(residual_no_force as *const ());
         builder.call_may_force_void_canonical_via_target(fn_idx, &[JitCallArg::reference(0)]);
         let jitcode = builder.finish();
@@ -5422,7 +5427,18 @@ mod tests {
         );
 
         let mut sym = DummySym::default();
-        let action = trace_jitcode(&mut ctx, &mut sym, &jitcode, 0, |_pc| 0);
+        // Thread the single vable ConstPtr Box through both the
+        // standard-box slot and the argument register so pyjitpl.py:1131
+        // `box is standard_box` (identity) holds, matching upstream's
+        // Box-flow invariant.
+        let action = trace_jitcode_with_args(
+            &mut ctx,
+            &mut sym,
+            &jitcode,
+            0,
+            |_pc| 0,
+            &[(JitArgKind::Ref, vable_ref, obj_ptr)],
+        );
         assert!(matches!(action, TraceAction::Continue));
         assert_eq!(obj.token, 0, "tracing side must restore TOKEN_NONE");
 
@@ -5463,7 +5479,6 @@ mod tests {
         let obj_ptr = (&mut obj as *mut ResidualVable) as usize as i64;
 
         let mut builder = JitCodeBuilder::new();
-        builder.load_const_r_value(0, obj_ptr);
         let fn_idx = builder.add_fn_ptr(residual_force as *const ());
         builder.call_may_force_void_canonical_via_target(fn_idx, &[JitCallArg::reference(0)]);
         let jitcode = builder.finish();
@@ -5482,7 +5497,14 @@ mod tests {
         );
 
         let mut sym = DummySym::default();
-        let action = trace_jitcode(&mut ctx, &mut sym, &jitcode, 0, |_pc| 0);
+        let action = trace_jitcode_with_args(
+            &mut ctx,
+            &mut sym,
+            &jitcode,
+            0,
+            |_pc| 0,
+            &[(JitArgKind::Ref, vable_ref, obj_ptr)],
+        );
         assert!(matches!(action, TraceAction::Abort));
         assert_eq!(obj.token, 0, "forced residual call must clear the token");
 
@@ -5614,7 +5636,6 @@ mod tests {
         let obj_ptr = (&mut obj as *mut ResidualVable) as usize as i64;
 
         let mut builder = JitCodeBuilder::new();
-        builder.load_const_r_value(0, obj_ptr);
         let fn_idx = builder.add_fn_ptr(residual_int_no_force as *const ());
         builder.call_may_force_int_canonical_via_target(fn_idx, &[JitCallArg::reference(0)], 1);
         let jitcode = builder.finish();
@@ -5633,7 +5654,14 @@ mod tests {
         );
 
         let mut sym = DummySym::default();
-        let action = trace_jitcode(&mut ctx, &mut sym, &jitcode, 0, |_pc| 0);
+        let action = trace_jitcode_with_args(
+            &mut ctx,
+            &mut sym,
+            &jitcode,
+            0,
+            |_pc| 0,
+            &[(JitArgKind::Ref, vable_ref, obj_ptr)],
+        );
         assert!(matches!(action, TraceAction::Continue));
         assert_eq!(obj.token, 0);
 
@@ -5667,7 +5695,6 @@ mod tests {
         let obj_ptr = (&mut obj as *mut ResidualVable) as usize as i64;
 
         let mut builder = JitCodeBuilder::new();
-        builder.load_const_r_value(0, obj_ptr);
         let fn_idx = builder.add_fn_ptr(residual_ref_no_force as *const ());
         builder.call_may_force_ref_canonical_via_target(fn_idx, &[JitCallArg::reference(0)], 1);
         let jitcode = builder.finish();
@@ -5686,7 +5713,14 @@ mod tests {
         );
 
         let mut sym = DummySym::default();
-        let action = trace_jitcode(&mut ctx, &mut sym, &jitcode, 0, |_pc| 0);
+        let action = trace_jitcode_with_args(
+            &mut ctx,
+            &mut sym,
+            &jitcode,
+            0,
+            |_pc| 0,
+            &[(JitArgKind::Ref, vable_ref, obj_ptr)],
+        );
         assert!(matches!(action, TraceAction::Continue));
         assert_eq!(obj.token, 0);
 
@@ -5720,7 +5754,6 @@ mod tests {
         let obj_ptr = (&mut obj as *mut ResidualVable) as usize as i64;
 
         let mut builder = JitCodeBuilder::new();
-        builder.load_const_r_value(0, obj_ptr);
         let fn_idx = builder.add_fn_ptr(residual_float_no_force as *const ());
         builder.call_may_force_float_canonical_via_target(fn_idx, &[JitCallArg::reference(0)], 1);
         let jitcode = builder.finish();
@@ -5739,7 +5772,14 @@ mod tests {
         );
 
         let mut sym = DummySym::default();
-        let action = trace_jitcode(&mut ctx, &mut sym, &jitcode, 0, |_pc| 0);
+        let action = trace_jitcode_with_args(
+            &mut ctx,
+            &mut sym,
+            &jitcode,
+            0,
+            |_pc| 0,
+            &[(JitArgKind::Ref, vable_ref, obj_ptr)],
+        );
         assert!(matches!(action, TraceAction::Continue));
         assert_eq!(obj.token, 0);
 

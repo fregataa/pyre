@@ -3443,14 +3443,16 @@ mod tests {
         assert_eq!(pool.get_value(const_arg), Some(majit_ir::Value::Int(42)));
     }
 
-    /// M4 step 2: same-value constants dedupe through the pool — two
-    /// TAGINT args with value 7 must resolve to the same OpRef.
+    /// M4 step 2: same-value TAGINT args round-trip to the same Value
+    /// through the pool. `history.py:220 ConstInt.__init__` is
+    /// fresh-alloc per call so the two OpRefs may differ; the
+    /// upstream value-equality predicate is `Const.same_constant`
+    /// (history.py:204).
     #[test]
-    fn test_byte_trace_iter_tagint_dedup_m4() {
+    fn test_byte_trace_iter_tagint_same_value_resolves_via_same_constant_m4() {
         let mut buf = TraceRecordBuffer::new(1, empty_sd());
         let _ = buf.record_input_arg(Type::Int);
         let _ = buf.record_op2(OpCode::IntAdd, Box::ResOp(0), Box::ConstInt(7), None);
-        // Second op's first arg is also `ConstInt(7)` — should dedupe.
         let _ = buf.record_op2(OpCode::IntAdd, Box::ConstInt(7), Box::ResOp(0), None);
 
         let mut pool = crate::constant_pool::ConstantPool::new();
@@ -3463,7 +3465,13 @@ mod tests {
         );
         let first = it.next().unwrap();
         let second = it.next().unwrap();
-        assert_eq!(first.args[1], second.args[0]);
+        drop(it);
+        assert!(pool.same_constant(first.args[1], second.args[0]));
+        assert_eq!(pool.get_value(first.args[1]), Some(majit_ir::Value::Int(7)));
+        assert_eq!(
+            pool.get_value(second.args[0]),
+            Some(majit_ir::Value::Int(7))
+        );
     }
 
     /// M4 step 3: guard opcode decode — the decoded Op's `descr` is

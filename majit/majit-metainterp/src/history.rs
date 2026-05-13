@@ -2428,10 +2428,19 @@ impl TraceCtx {
         // (`_escape_argboxes + invalidate_caches_for_escaped`) skipped
         // those branches.
         if let Some(call_descr) = descr.as_call_descr() {
+            self.constants.refresh_from_gc();
+            let constants = &self.constants;
+            let oracle: &dyn majit_trace::heapcache::SameConstantOracle = constants;
+            let const_value = |opref| match constants.get_value(opref) {
+                Some(majit_ir::Value::Int(n)) => Some(n),
+                _ => None,
+            };
             self.heap_cache.invalidate_caches_varargs(
                 opcode,
                 Some(call_descr.get_extra_info()),
                 &call_args,
+                oracle,
+                const_value,
             );
         }
         result
@@ -2468,10 +2477,19 @@ impl TraceCtx {
         // pyjitpl.py:2659 `_record_helper_varargs` parity (see
         // `call_typed` for the full rationale).
         if let Some(call_descr) = descr.as_call_descr() {
+            self.constants.refresh_from_gc();
+            let constants = &self.constants;
+            let oracle: &dyn majit_trace::heapcache::SameConstantOracle = constants;
+            let const_value = |opref| match constants.get_value(opref) {
+                Some(majit_ir::Value::Int(n)) => Some(n),
+                _ => None,
+            };
             self.heap_cache.invalidate_caches_varargs(
                 opcode,
                 Some(call_descr.get_extra_info()),
                 &call_args,
+                oracle,
+                const_value,
             );
         }
         result
@@ -2553,10 +2571,19 @@ impl TraceCtx {
             .record_op_with_descr(opcode, &call_args, descr.clone());
         // pyjitpl.py:2659 _record_helper_varargs heap invalidation parity.
         if let Some(call_descr) = descr.as_call_descr() {
+            self.constants.refresh_from_gc();
+            let constants = &self.constants;
+            let oracle: &dyn majit_trace::heapcache::SameConstantOracle = constants;
+            let const_value = |opref| match constants.get_value(opref) {
+                Some(majit_ir::Value::Int(n)) => Some(n),
+                _ => None,
+            };
             self.heap_cache.invalidate_caches_varargs(
                 opcode,
                 Some(call_descr.get_extra_info()),
                 &call_args,
+                oracle,
+                const_value,
             );
         }
         // pyjitpl.py:1947-1948: record_result_of_call_pure patches CALL → CALL_PURE
@@ -2946,10 +2973,19 @@ impl TraceCtx {
         // canonical helper marks args escaped and runs the heap-array
         // invalidation arm in one pass (heapcache.py:341-376).
         if let Some(call_descr) = descr.as_call_descr() {
+            self.constants.refresh_from_gc();
+            let constants = &self.constants;
+            let oracle: &dyn majit_trace::heapcache::SameConstantOracle = constants;
+            let const_value = |opref| match constants.get_value(opref) {
+                Some(majit_ir::Value::Int(n)) => Some(n),
+                _ => None,
+            };
             self.heap_cache.invalidate_caches_varargs(
                 opcode,
                 Some(call_descr.get_extra_info()),
                 &call_args,
+                oracle,
+                const_value,
             );
         }
         result
@@ -2996,10 +3032,19 @@ impl TraceCtx {
             .record_op_with_descr(opcode, &call_args, descr.clone());
         // pyjitpl.py:2070-2072 (see `call_family_typed` for rationale).
         if let Some(call_descr) = descr.as_call_descr() {
+            self.constants.refresh_from_gc();
+            let constants = &self.constants;
+            let oracle: &dyn majit_trace::heapcache::SameConstantOracle = constants;
+            let const_value = |opref| match constants.get_value(opref) {
+                Some(majit_ir::Value::Int(n)) => Some(n),
+                _ => None,
+            };
             self.heap_cache.invalidate_caches_varargs(
                 opcode,
                 Some(call_descr.get_extra_info()),
                 &call_args,
+                oracle,
+                const_value,
             );
         }
         result
@@ -3147,10 +3192,19 @@ impl TraceCtx {
         // arraymove fast-paths are honoured if a future descr
         // classification activates them.
         if let Some(call_descr) = descr.as_call_descr() {
+            self.constants.refresh_from_gc();
+            let constants = &self.constants;
+            let oracle: &dyn majit_trace::heapcache::SameConstantOracle = constants;
+            let const_value = |opref| match constants.get_value(opref) {
+                Some(majit_ir::Value::Int(n)) => Some(n),
+                _ => None,
+            };
             self.heap_cache.invalidate_caches_varargs(
                 opcode,
                 Some(call_descr.get_extra_info()),
                 &call_args,
+                oracle,
+                const_value,
             );
         }
         result
@@ -3193,10 +3247,19 @@ impl TraceCtx {
         // `call_typed`): every CALL family record routes through the
         // canonical heap_cache.invalidate_caches_varargs.
         if let Some(call_descr) = descr.as_call_descr() {
+            self.constants.refresh_from_gc();
+            let constants = &self.constants;
+            let oracle: &dyn majit_trace::heapcache::SameConstantOracle = constants;
+            let const_value = |opref| match constants.get_value(opref) {
+                Some(majit_ir::Value::Int(n)) => Some(n),
+                _ => None,
+            };
             self.heap_cache.invalidate_caches_varargs(
                 opcode,
                 Some(call_descr.get_extra_info()),
                 &call_args,
+                oracle,
+                const_value,
             );
         }
         // pyjitpl.py:2109 `call_loopinvariant_now_known(allboxes, descr, res)`
@@ -3436,10 +3499,19 @@ impl TraceCtx {
         // CALL_LOOPINVARIANT_* so escape / clear_caches_varargs paths
         // run exactly once per recorded op (heapcache.py:211).
         if let Some(call_descr) = descr.as_call_descr() {
+            self.constants.refresh_from_gc();
+            let constants = &self.constants;
+            let oracle: &dyn majit_trace::heapcache::SameConstantOracle = constants;
+            let const_value = |opref| match constants.get_value(opref) {
+                Some(majit_ir::Value::Int(n)) => Some(n),
+                _ => None,
+            };
             self.heap_cache.invalidate_caches_varargs(
                 opcode,
                 Some(call_descr.get_extra_info()),
                 &call_args,
+                oracle,
+                const_value,
             );
         }
         // Concrete resvalue is unknown to this legacy helper; pass 0.
@@ -3671,10 +3743,19 @@ impl TraceCtx {
         // loop-invariant helper's record skipped mark_escaped_varargs
         // (heapcache.py:211).
         if let Some(call_descr) = descr.as_call_descr() {
+            self.constants.refresh_from_gc();
+            let constants = &self.constants;
+            let oracle: &dyn majit_trace::heapcache::SameConstantOracle = constants;
+            let const_value = |opref| match constants.get_value(opref) {
+                Some(majit_ir::Value::Int(n)) => Some(n),
+                _ => None,
+            };
             self.heap_cache.invalidate_caches_varargs(
                 opcode,
                 Some(call_descr.get_extra_info()),
                 &call_args,
+                oracle,
+                const_value,
             );
         }
         // pyjitpl.py:2109 call_loopinvariant_now_known(allboxes, descr, res):
@@ -3735,8 +3816,15 @@ impl TraceCtx {
         // invalidation, but CALL_ASSEMBLER_* falls through to
         // reset_keep_likely_virtuals in heapcache.py:372-376 — same path as
         // CALL_MAY_FORCE_*.
+        self.constants.refresh_from_gc();
+        let constants = &self.constants;
+        let oracle: &dyn majit_trace::heapcache::SameConstantOracle = constants;
+        let const_value = |opref| match constants.get_value(opref) {
+            Some(majit_ir::Value::Int(n)) => Some(n),
+            _ => None,
+        };
         self.heap_cache
-            .invalidate_caches_varargs(opcode, None, args);
+            .invalidate_caches_varargs(opcode, None, args, oracle, const_value);
         result
     }
 

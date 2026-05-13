@@ -536,8 +536,7 @@ pub fn emit_box_int_inline(
     // Emit: SetfieldGc(v, intval, raw_int)
     let intval_idx = intval_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, raw_int], intval_descr);
-    ctx.heap_cache_mut()
-        .setfield_cached(new_op, intval_idx, raw_int);
+    ctx.heapcache_setfield_cached(new_op, intval_idx, raw_int);
     new_op
 }
 
@@ -573,16 +572,13 @@ pub fn emit_box_slice_inline(
     ctx.heap_cache_mut().new_object(new_op);
     let w_start_idx = w_start_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, w_start], w_start_descr);
-    ctx.heap_cache_mut()
-        .setfield_cached(new_op, w_start_idx, w_start);
+    ctx.heapcache_setfield_cached(new_op, w_start_idx, w_start);
     let w_stop_idx = w_stop_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, w_stop], w_stop_descr);
-    ctx.heap_cache_mut()
-        .setfield_cached(new_op, w_stop_idx, w_stop);
+    ctx.heapcache_setfield_cached(new_op, w_stop_idx, w_stop);
     let w_step_idx = w_step_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, w_step], w_step_descr);
-    ctx.heap_cache_mut()
-        .setfield_cached(new_op, w_step_idx, w_step);
+    ctx.heapcache_setfield_cached(new_op, w_step_idx, w_step);
     new_op
 }
 
@@ -598,8 +594,7 @@ pub fn emit_box_float_inline(
     ctx.heap_cache_mut().new_object(new_op);
     let floatval_idx = floatval_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, raw_float], floatval_descr);
-    ctx.heap_cache_mut()
-        .setfield_cached(new_op, floatval_idx, raw_float);
+    ctx.heapcache_setfield_cached(new_op, floatval_idx, raw_float);
     new_op
 }
 
@@ -710,59 +705,51 @@ pub fn emit_new_pyframe_inline_self_recursive(
     let ec_descr = pyframe_execution_context_descr();
     let ec_idx = ec_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, ec], ec_descr);
-    ctx.heap_cache_mut().setfield_cached(new_frame, ec_idx, ec);
+    ctx.heapcache_setfield_cached(new_frame, ec_idx, ec);
 
     let code_descr = pyframe_code_descr();
     let code_idx = code_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, pycode], code_descr);
-    ctx.heap_cache_mut()
-        .setfield_cached(new_frame, code_idx, pycode);
+    ctx.heapcache_setfield_cached(new_frame, code_idx, pycode);
 
     let globals_descr = pyframe_dict_storage_descr();
     let globals_idx = globals_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, w_globals], globals_descr);
-    ctx.heap_cache_mut()
-        .setfield_cached(new_frame, globals_idx, w_globals);
+    ctx.heapcache_setfield_cached(new_frame, globals_idx, w_globals);
 
     let locals_descr = pyframe_locals_cells_stack_descr();
     let locals_idx = locals_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, locals_array], locals_descr);
-    ctx.heap_cache_mut()
-        .setfield_cached(new_frame, locals_idx, locals_array);
+    ctx.heapcache_setfield_cached(new_frame, locals_idx, locals_array);
 
     let vsd = ctx.const_int(valuestackdepth as i64);
     let vsd_descr = pyframe_stack_depth_descr();
     let vsd_idx = vsd_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, vsd], vsd_descr);
-    ctx.heap_cache_mut()
-        .setfield_cached(new_frame, vsd_idx, vsd);
+    ctx.heapcache_setfield_cached(new_frame, vsd_idx, vsd);
 
     let neg_one = ctx.const_int(-1);
     let last_instr_descr = pyframe_next_instr_descr();
     let last_instr_idx = last_instr_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, neg_one], last_instr_descr);
-    ctx.heap_cache_mut()
-        .setfield_cached(new_frame, last_instr_idx, neg_one);
+    ctx.heapcache_setfield_cached(new_frame, last_instr_idx, neg_one);
 
     let null_ref = ctx.const_ref(pyre_object::PY_NULL as i64);
 
     let generator_descr = pyframe_f_generator_nowref_descr();
     let generator_idx = generator_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, null_ref], generator_descr);
-    ctx.heap_cache_mut()
-        .setfield_cached(new_frame, generator_idx, null_ref);
+    ctx.heapcache_setfield_cached(new_frame, generator_idx, null_ref);
 
     let yielding_descr = pyframe_w_yielding_from_descr();
     let yielding_idx = yielding_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, null_ref], yielding_descr);
-    ctx.heap_cache_mut()
-        .setfield_cached(new_frame, yielding_idx, null_ref);
+    ctx.heapcache_setfield_cached(new_frame, yielding_idx, null_ref);
 
     let backref_descr = pyframe_f_backref_descr();
     let backref_idx = backref_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, null_ref], backref_descr);
-    ctx.heap_cache_mut()
-        .setfield_cached(new_frame, backref_idx, null_ref);
+    ctx.heapcache_setfield_cached(new_frame, backref_idx, null_ref);
 
     new_frame
 }

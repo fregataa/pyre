@@ -547,7 +547,7 @@ fn getfield_gc_i_pureornot(
     use majit_ir::OpCode;
     // heapcache: check if this field was already read/written in this trace
     let field_index = descr.index();
-    if let Some(cached) = ctx.heap_cache().getfield_cached(obj, field_index) {
+    if let Some(cached) = ctx.heapcache_getfield_cached(obj, field_index) {
         return cached;
     }
     let opcode = if descr.is_always_pure() {
@@ -556,7 +556,7 @@ fn getfield_gc_i_pureornot(
         OpCode::GetfieldGcI
     };
     let result = ctx.record_op_with_descr(opcode, &[obj], descr);
-    ctx.heap_cache_mut().getfield_now_known(obj, field_index, result);
+    ctx.heapcache_getfield_now_known(obj, field_index, result);
     result
 }
 
@@ -610,7 +610,7 @@ pub fn trace_box_int(
     ctx.heap_cache_mut().new_object(obj);
     let intval_idx = intval_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[obj, value], intval_descr);
-    ctx.heap_cache_mut().setfield_cached(obj, intval_idx, value);
+    ctx.heapcache_setfield_cached(obj, intval_idx, value);
     obj
 }
 
@@ -683,7 +683,7 @@ fn getfield_gc_f_pureornot(
 ) -> majit_ir::OpRef {
     use majit_ir::OpCode;
     let field_index = descr.index();
-    if let Some(cached) = ctx.heap_cache().getfield_cached(obj, field_index) {
+    if let Some(cached) = ctx.heapcache_getfield_cached(obj, field_index) {
         return cached;
     }
     let opcode = if descr.is_always_pure() {
@@ -692,7 +692,7 @@ fn getfield_gc_f_pureornot(
         OpCode::GetfieldGcF
     };
     let result = ctx.record_op_with_descr(opcode, &[obj], descr);
-    ctx.heap_cache_mut().getfield_now_known(obj, field_index, result);
+    ctx.heapcache_getfield_now_known(obj, field_index, result);
     result
 }
 
@@ -729,7 +729,7 @@ pub fn trace_box_float(
     ctx.heap_cache_mut().new_object(obj);
     let floatval_idx = floatval_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[obj, value], floatval_descr);
-    ctx.heap_cache_mut().setfield_cached(obj, floatval_idx, value);
+    ctx.heapcache_setfield_cached(obj, floatval_idx, value);
     obj
 }
 
@@ -1073,11 +1073,11 @@ pub fn generated_binary_float_value(
             {
                 let ff_descr = crate::descr::float_floatval_descr();
                 let ff_idx = ff_descr.index();
-                if let Some(cached) = ctx.heap_cache().getfield_cached(obj, ff_idx) {
+                if let Some(cached) = ctx.heapcache_getfield_cached(obj, ff_idx) {
                     cached
                 } else {
                     let r = ctx.record_op_with_descr(OpCode::GetfieldGcPureF, &[obj], ff_descr);
-                    ctx.heap_cache_mut().getfield_now_known(obj, ff_idx, r);
+                    ctx.heapcache_getfield_now_known(obj, ff_idx, r);
                     r
                 }
             }
@@ -1697,7 +1697,7 @@ pub fn generated_list_append_by_strategy(
     let new_len = ctx.record_op(OpCode::IntAdd, &[len, one]);
     let len_descr_idx = len_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[list, new_len], len_descr);
-    ctx.heap_cache_mut().setfield_cached(list, len_descr_idx, new_len);
+    ctx.heapcache_setfield_cached(list, len_descr_idx, new_len);
 }
 
 /// Trace `lst.pop()` (no-arg form, equivalent to `pop_end`): guard_class
@@ -1775,7 +1775,7 @@ pub fn generated_list_pop_by_strategy(
             let null_ref = ctx.const_ref(0);
             crate::state::trace_items_block_setitem_value(ctx, items_block, last_index, null_ref);
             ctx.record_op_with_descr(OpCode::SetfieldGc, &[list, new_len], len_descr);
-            ctx.heap_cache_mut().setfield_cached(list, len_descr_idx, new_len);
+            ctx.heapcache_setfield_cached(list, len_descr_idx, new_len);
             item
         }
         1 => {
@@ -1787,7 +1787,7 @@ pub fn generated_list_pop_by_strategy(
             let raw =
                 crate::state::trace_raw_int_array_getitem_value(ctx, items_ptr, last_index);
             ctx.record_op_with_descr(OpCode::SetfieldGc, &[list, new_len], len_descr);
-            ctx.heap_cache_mut().setfield_cached(list, len_descr_idx, new_len);
+            ctx.heapcache_setfield_cached(list, len_descr_idx, new_len);
             let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
             crate::generated::trace_box_int(
                 ctx,
@@ -1807,7 +1807,7 @@ pub fn generated_list_pop_by_strategy(
             let raw =
                 crate::state::trace_raw_float_array_getitem_value(ctx, items_ptr, last_index);
             ctx.record_op_with_descr(OpCode::SetfieldGc, &[list, new_len], len_descr);
-            ctx.heap_cache_mut().setfield_cached(list, len_descr_idx, new_len);
+            ctx.heapcache_setfield_cached(list, len_descr_idx, new_len);
             let float_type_addr = &pyre_object::pyobject::FLOAT_TYPE as *const _ as i64;
             crate::trace_box_float(
                 ctx,
@@ -2587,7 +2587,7 @@ pub fn generated_iter_next_value(
     let ri_descr = crate::descr::range_iter_current_descr();
     let ri_descr_idx = ri_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[iter, next_current], ri_descr);
-    ctx.heap_cache_mut().setfield_cached(iter, ri_descr_idx, next_current);
+    ctx.heapcache_setfield_cached(iter, ri_descr_idx, next_current);
     Some((current, concrete_current))
 }
 "#);

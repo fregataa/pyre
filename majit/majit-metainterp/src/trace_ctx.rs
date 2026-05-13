@@ -282,6 +282,122 @@ impl TraceCtx {
         &mut self.heap_cache
     }
 
+    /// heapcache.py:542-553 `getarrayitem(box, indexbox, descr)` parity.
+    /// Extracts the index ConstInt's `getint()` value (returns `None`
+    /// on non-ConstInt operands, matching the upstream early-out at
+    /// `heapcache.py:543`) and routes the lookup through the indexcache
+    /// (heap_array_cache[descr][index_value]).  Inside the indexcache,
+    /// `array` is canonicalised by `_unique_const_heuristic` against
+    /// the per-CacheEntry `last_const_box` (heapcache.py:96-104) so two
+    /// distinct ConstPtr OpRefs for the same gcref share the same
+    /// cache slot.
+    pub fn heapcache_getarrayitem(
+        &mut self,
+        array: OpRef,
+        index: OpRef,
+        descr: u32,
+    ) -> Option<OpRef> {
+        let index_value = match self.constants.get_value(index)? {
+            Value::Int(n) => n,
+            _ => return None,
+        };
+        self.constants.refresh_from_gc();
+        let oracle: &dyn majit_trace::heapcache::SameConstantOracle = &self.constants;
+        self.heap_cache
+            .getarrayitem_cache(array, index_value, descr, oracle)
+    }
+
+    /// heapcache.py:573-585 `setarrayitem` parity.  `None` index_value
+    /// (non-ConstInt operand) clears the entire `descr` submap;
+    /// otherwise the write goes through the indexcache with `array`
+    /// canonicalised by `_unique_const_heuristic`.
+    pub fn heapcache_setarrayitem(&mut self, array: OpRef, index: OpRef, descr: u32, value: OpRef) {
+        let index_value = match self.constants.get_value(index) {
+            Some(Value::Int(n)) => Some(n),
+            _ => None,
+        };
+        self.constants.refresh_from_gc();
+        let oracle: &dyn majit_trace::heapcache::SameConstantOracle = &self.constants;
+        self.heap_cache
+            .setarrayitem_cache(array, index_value, descr, value, oracle)
+    }
+
+    /// heapcache.py:565-568 `getarrayitem_now_known` parity.
+    pub fn heapcache_getarrayitem_now_known(
+        &mut self,
+        array: OpRef,
+        index: OpRef,
+        descr: u32,
+        value: OpRef,
+    ) {
+        let index_value = match self.constants.get_value(index) {
+            Some(Value::Int(n)) => Some(n),
+            _ => None,
+        };
+        self.constants.refresh_from_gc();
+        let oracle: &dyn majit_trace::heapcache::SameConstantOracle = &self.constants;
+        self.heap_cache
+            .getarrayitem_now_known(array, index_value, descr, value, oracle)
+    }
+
+    /// heapcache.py:518-522 `getfield` parity.  Routes `obj` through
+    /// `_unique_const_heuristic` so two distinct ConstPtr OpRefs for
+    /// the same gcref share the same `(obj, field_index)` cache slot.
+    pub fn heapcache_getfield_cached(&mut self, obj: OpRef, field_index: u32) -> Option<OpRef> {
+        self.constants.refresh_from_gc();
+        let oracle: &dyn majit_trace::heapcache::SameConstantOracle = &self.constants;
+        self.heap_cache.getfield_cached(obj, field_index, oracle)
+    }
+
+    /// heapcache.py:538-540 `setfield` parity.  Same canonicalisation
+    /// as `heapcache_getfield_cached` plus alias-clearing semantics
+    /// when `obj` is not known-unescaped.
+    pub fn heapcache_setfield_cached(&mut self, obj: OpRef, field_index: u32, value: OpRef) {
+        self.constants.refresh_from_gc();
+        let oracle: &dyn majit_trace::heapcache::SameConstantOracle = &self.constants;
+        self.heap_cache
+            .setfield_cached(obj, field_index, value, oracle)
+    }
+
+    /// heapcache.py:534-536 `getfield_now_known` parity (no aliasing).
+    pub fn heapcache_getfield_now_known(&mut self, obj: OpRef, field_index: u32, value: OpRef) {
+        self.constants.refresh_from_gc();
+        let oracle: &dyn majit_trace::heapcache::SameConstantOracle = &self.constants;
+        self.heap_cache
+            .getfield_now_known(obj, field_index, value, oracle)
+    }
+
+    /// heapcache.py:211-216 `invalidate_caches_varargs` parity.
+    /// Routes through `clear_caches_varargs` → `_clear_caches_arraycopy` /
+    /// `_clear_caches_arraymove` → `_clear_caches_arrayop_with_consts`
+    /// where ConstPtr source/dest boxes are canonicalised by
+    /// `_unique_const_heuristic` (heapcache.py:96-104) via the
+    /// `SameConstantOracle` plumbed from `ConstantPool`.  `refresh_from_gc`
+    /// runs first so post-GC GCREF addresses are current.
+    ///
+    /// The `const_value` closure resolves `srcstart` / `dststart` /
+    /// `length` boxes to their `ConstInt.getint()` values
+    /// (heapcache.py:393 `isinstance(_, ConstInt) and ...getint()`).
+    /// Without it the per-index copy branch at heapcache.py:412-432
+    /// is unreachable and arraycopy/arraymove fall back to whole-descr
+    /// clearing.
+    pub fn heapcache_invalidate_caches_varargs(
+        &mut self,
+        opnum: majit_ir::OpCode,
+        effectinfo: Option<&majit_ir::EffectInfo>,
+        argboxes: &[OpRef],
+    ) {
+        self.constants.refresh_from_gc();
+        let constants = &self.constants;
+        let oracle: &dyn majit_trace::heapcache::SameConstantOracle = constants;
+        let const_value = |opref| match constants.get_value(opref) {
+            Some(Value::Int(n)) => Some(n),
+            _ => None,
+        };
+        self.heap_cache
+            .invalidate_caches_varargs(opnum, effectinfo, argboxes, oracle, const_value)
+    }
+
     /// pyjitpl.py:1087 parity: check if a quasi-immut guard is pending.
     pub fn pending_guard_not_invalidated_pc(&self) -> Option<usize> {
         self.pending_guard_not_invalidated_pc

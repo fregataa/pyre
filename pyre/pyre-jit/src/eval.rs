@@ -6289,17 +6289,39 @@ mod tests {
         assert_eq!(fail_args[1], ec_ref);
         // last_instr / valuestackdepth are guard-time-overridden by
         // flush_to_frame_for_guard (orgpc - 1, pre-opcode depth).
-        assert_eq!(fail_args[2], ctx.const_int(resume_pc as i64 - 1));
-        assert_eq!(fail_args[4], ctx.const_int(4));
+        // Compare via constants_get_value rather than re-minting a
+        // ConstInt and asserting OpRef identity — `history.py:220`
+        // ConstInt is fresh-alloc per construction; value-equality is
+        // the upstream invariant (`Const.same_constant`, history.py:204).
+        assert_eq!(
+            ctx.constants_get_value(fail_args[2]),
+            Some(majit_ir::Value::Int(resume_pc as i64 - 1)),
+        );
+        assert_eq!(
+            ctx.constants_get_value(fail_args[4]),
+            Some(majit_ir::Value::Int(4)),
+        );
         // pycode / debugdata / lastblock / w_globals are JIT-scope
         // invariant under CPython 3.14 bytecode (`lastblock` is mutated
         // only by SETUP_*/POP_BLOCK paths the tracer never enters) and
         // stay bound to the trace-start inputarg OpRefs the fixture
         // seeded above.
-        assert_eq!(fail_args[3], ctx.const_ref(0xdead));
-        assert_eq!(fail_args[5], ctx.const_ref(0xbeef));
-        assert_eq!(fail_args[6], ctx.const_ref(0xcafe));
-        assert_eq!(fail_args[7], ctx.const_ref(0xfeed));
+        assert_eq!(
+            ctx.constants_get_value(fail_args[3]),
+            Some(majit_ir::Value::Ref(majit_ir::GcRef(0xdead))),
+        );
+        assert_eq!(
+            ctx.constants_get_value(fail_args[5]),
+            Some(majit_ir::Value::Ref(majit_ir::GcRef(0xbeef))),
+        );
+        assert_eq!(
+            ctx.constants_get_value(fail_args[6]),
+            Some(majit_ir::Value::Ref(majit_ir::GcRef(0xcafe))),
+        );
+        assert_eq!(
+            ctx.constants_get_value(fail_args[7]),
+            Some(majit_ir::Value::Ref(majit_ir::GcRef(0xfeed))),
+        );
     }
 
     #[test]
