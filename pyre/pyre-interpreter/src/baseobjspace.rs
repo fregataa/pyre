@@ -2116,6 +2116,26 @@ unsafe fn is_type_like_w(obj: PyObjectRef) -> bool {
     !w_type.is_null() && isinstance_w(obj, w_type)
 }
 
+/// `space.isinstance_w(w_obj, space.w_text)` — PyPy parity helper for
+/// accepting `str` and any `str` subclass.  Used by `function.py:464`
+/// `fset_func_name` and similar gateway-level type checks where the
+/// upstream test is `isinstance_w(..., w_text)`, not exact-type
+/// equality.  pyre's `pyre_object::is_str` only matches the exact
+/// `STR_TYPE` tag and so rejects `class MyStr(str): pass` instances
+/// — this helper fills in the MRO walk.
+pub unsafe fn isinstance_str_w(obj: PyObjectRef) -> bool {
+    if obj.is_null() {
+        return false;
+    }
+    if pyre_object::is_str(obj) {
+        return true;
+    }
+    if let Some(str_type) = crate::typedef::gettypefor(&pyre_object::STR_TYPE) {
+        return isinstance_w(obj, str_type);
+    }
+    false
+}
+
 /// abstractinst.py:127-147 `p_abstract_issubclass_w`. Walks
 /// `w_derived.__bases__` looking for an identity match with `w_cls`.
 /// Recursion is bounded by avoiding the last entry of each `__bases__`
@@ -2908,6 +2928,30 @@ pub enum CompareOp {
 /// - None → false
 /// - bool → its value
 /// - int → nonzero
+
+/// `baseobjspace.py:1346-1353 isabstractmethod_w`:
+///
+/// ```python
+/// def isabstractmethod_w(self, w_obj):
+///     try:
+///         w_result = self.getattr(w_obj, self.newtext("__isabstractmethod__"))
+///     except OperationError as e:
+///         if e.match(self, self.w_AttributeError):
+///             return False
+///         raise
+///     return self.is_true(w_result)
+/// ```
+///
+/// Catches the AttributeError arm of the upstream try/except and
+/// reraises any other PyError so the caller (typedef descr_isabstract
+/// for staticmethod / classmethod) can propagate it.
+pub fn isabstractmethod_w(obj: PyObjectRef) -> Result<bool, crate::PyError> {
+    match getattr(obj, "__isabstractmethod__") {
+        Ok(w_result) => Ok(is_true(w_result)),
+        Err(e) if matches!(e.kind, crate::PyErrorKind::AttributeError) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
 
 pub fn is_true(obj: PyObjectRef) -> bool {
     let obj = unwrap_cell(obj);
@@ -3897,8 +3941,23 @@ pub fn dict_storage_to_dict(ns_ptr: *const crate::DictStorage) -> PyObjectRef {
 /// For other objects, looks up the attribute in the per-object side table.
 
 pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
-    let obj = unwrap_cell(obj);
-
+    // `pypy/interpreter/baseobjspace.py:1146-1162 getattr`:
+    //
+    //     def getattr(self, w_obj, w_name):
+    //         ...
+    //         w_descr = space.lookup(w_obj, '__getattribute__')
+    //         try:
+    //             return space.get_and_call_function(w_descr, w_obj, w_name)
+    //         except ...
+    //
+    // PyPy never auto-unwraps cells before `getattr`; the user sees the
+    // cell type's descriptor namespace (e.g. `cell_contents` from
+    // `nestedscope.py:Cell.typedef`).  Pyre previously prepended an
+    // `unwrap_cell` here to keep `LOAD_FAST` on a cellvar slot
+    // transparent, but the only valid escape of a cell to user-visible
+    // code is through `function.__closure__` indexing — where the cell
+    // is what the user wants.
+    //
     // pypy/module/_weakref/interp__weakref.py:356-394 — proxy_typedef_dict
     // wraps every space op in `force(space, w_obj)`. PyPy then dispatches
     // through the type's `__getattribute__` slot at the C level, so the
@@ -4598,18 +4657,13 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
                 _ => {}
             }
         }
-        // staticmethod/classmethod descriptor attributes
-        // PyPy: function.py StaticMethod.__func__, ClassMethod.__func__
-        if pyre_object::is_staticmethod(obj) {
-            if name == "__func__" || name == "__wrapped__" {
-                return Ok(pyre_object::w_staticmethod_get_func(obj));
-            }
-        }
-        if pyre_object::is_classmethod(obj) {
-            if name == "__func__" || name == "__wrapped__" {
-                return Ok(pyre_object::w_classmethod_get_func(obj));
-            }
-        }
+        // PyPy parity: `__func__` / `__wrapped__` for staticmethod and
+        // classmethod are bound through their typedef descriptors
+        // (`typedef.py:870-871, 884-885 interp_attrproperty_w(
+        // 'w_function')`); pyre registers the same descriptors in
+        // `init_staticmethod_type` / `init_classmethod_type`, so the
+        // generic type-dict fallback below reaches them.  The hardcoded
+        // arm previously here predated the descriptor registration.
         if crate::pycode::is_code(obj) {
             let code_ptr = crate::pycode::w_code_get_ptr(obj) as *const crate::CodeObject;
             if code_ptr.is_null() {
@@ -4620,6 +4674,28 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
                 "co_varnames" => {
                     let items = code
                         .varnames
+                        .iter()
+                        .map(|item| w_str_new(item.as_ref()))
+                        .collect();
+                    return Ok(w_tuple_new(items));
+                }
+                // `pycode.py:335-336 fget_co_cellvars`:
+                //     return space.newtuple([space.newtext(name)
+                //                            for name in self.co_cellvars])
+                "co_cellvars" => {
+                    let items = code
+                        .cellvars
+                        .iter()
+                        .map(|item| w_str_new(item.as_ref()))
+                        .collect();
+                    return Ok(w_tuple_new(items));
+                }
+                // `pycode.py:338-339 fget_co_freevars`:
+                //     return space.newtuple([space.newtext(name)
+                //                            for name in self.co_freevars])
+                "co_freevars" => {
+                    let items = code
+                        .freevars
                         .iter()
                         .map(|item| w_str_new(item.as_ref()))
                         .collect();
@@ -5356,21 +5432,14 @@ unsafe fn get(
         return Ok(found);
     }
 
-    // staticmethod: PyPy StaticMethod.descr_staticmethod_get → return w_function
-    if is_staticmethod(descr) {
-        return Ok(Some(w_staticmethod_get_func(descr)));
-    }
-
-    // classmethod: PyPy ClassMethod.descr_classmethod_get → func bound to class
-    if is_classmethod(descr) {
-        let func = w_classmethod_get_func(descr);
-        let receiver = if !w_type.is_null() { w_type } else { obj };
-        if receiver.is_null() || is_none(receiver) {
-            return Ok(Some(func));
-        }
-        let owner = crate::typedef::r#type(receiver).unwrap_or(PY_NULL);
-        return Ok(Some(pyre_object::w_method_new(func, receiver, owner)));
-    }
+    // `function.py:691-693 StaticMethod.descr_staticmethod_get` and
+    // `function.py:738-748 ClassMethod.descr_classmethod_get` are
+    // bound through their typedef `__get__` entries
+    // (`typedef.py:866, 883`) in `init_staticmethod_type` /
+    // `init_classmethod_type`.  The previous hardcoded fast-path here
+    // pre-dated the typedef registration; the generic fallback below
+    // now reaches them through `lookup_in_type_where(descr_type,
+    // '__get__')`.
 
     // General __get__: look up __get__ on the descriptor's own type MRO
     if let Some(descr_type) = crate::typedef::r#type(descr) {
@@ -5588,7 +5657,10 @@ fn descr_set___class__(w_obj: PyObjectRef, w_newcls: PyObjectRef) -> PyResult {
 }
 
 pub fn setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult {
-    let obj = unwrap_cell(obj);
+    // PyPy `baseobjspace.py:1164-1175 setattr` never auto-unwraps
+    // cells; cell descriptors (`cell_contents`, etc.) reach the cell
+    // typedef directly.  Matches the analogous comment on `getattr`
+    // above.
     let value = unwrap_cell(value);
     // pypy/module/_weakref/interp__weakref.py:356-394 — proxy delegation.
     // Mirrors the `__setattr__` entry that `register_proxy_typedef_dict`
@@ -5857,7 +5929,9 @@ fn raiseattrerror(obj: PyObjectRef, name: &str) -> PyError {
 ///
 /// PyPy: descroperation.py descr__delattr__
 pub fn delattr(obj: PyObjectRef, name: &str) -> PyResult {
-    let obj = unwrap_cell(obj);
+    // PyPy `baseobjspace.py:1176-1188 delattr` never auto-unwraps
+    // cells.  Matches the analogous comment on `getattr` / `setattr`
+    // above.
     // pypy/module/_weakref/interp__weakref.py:356-394 — proxy delegation
     // (matches the `__delattr__` entry installed by
     // `register_proxy_typedef_dict`).

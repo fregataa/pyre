@@ -1862,12 +1862,23 @@ fn builtin_getattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     }
 }
 
-/// `setattr(obj, name, value)` — direct call
+/// `pypy/module/__builtin__/operation.py:191-196 setattr`:
+///
+/// ```python
+/// def setattr(space, w_object, w_name, w_val):
+///     w_name = checkattrname(space, w_name)
+///     space.setattr(w_object, w_name, w_val)
+///     return space.w_None
+/// ```
+///
+/// The space-level `setattr` may raise (AttributeError on read-only
+/// descriptors, TypeError on wrong-type values, etc.) and PyPy
+/// propagates those errors — they are NOT swallowed here.
 fn builtin_setattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() == 3, "setattr() takes exactly three arguments");
     let obj = args[0];
     let name = unsafe { w_str_get_value(args[1]) };
-    let _ = crate::baseobjspace::setattr(obj, name, args[2]);
+    crate::baseobjspace::setattr(obj, name, args[2])?;
     Ok(w_none())
 }
 

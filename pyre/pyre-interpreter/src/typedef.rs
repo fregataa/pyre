@@ -546,7 +546,7 @@ pub fn init_typeobjects() {
         );
         reg.insert(
             &pyre_object::cellobject::CELL_TYPE as *const PyType as usize,
-            new_typeobject_with_base("cell", |_| {}, object_type) as usize,
+            new_typeobject_with_base("cell", init_cell_type, object_type) as usize,
         );
         reg.insert(
             &pyre_object::itertoolsmodule::COUNT_TYPE as *const PyType as usize,
@@ -4678,6 +4678,112 @@ fn init_member_descriptor_type(ns: &mut DictStorage) {
     dict_storage_store(ns, "__objclass__", make_getset_descriptor(objclass_getter));
 }
 
+/// `nestedscope.py:Cell` typedef.  PyPy `typedef.py:934-952 Cell.typedef`:
+///
+/// ```python
+/// Cell.typedef = TypeDef("cell",
+///     ...
+///     __repr__     = interp2app(Cell.descr__repr__),
+///     ...
+///     cell_contents= GetSetProperty(
+///         Cell.descr__cell_contents,
+///         Cell.descr_set_cell_contents,
+///         Cell.descr_del_cell_contents,
+///         cls=Cell),
+/// )
+/// ```
+///
+/// Only the user-visible read/write/delete of `cell_contents` is ported
+/// here.  `__eq__`/`__ne__`/`__lt__`/`__gt__`/`__le__`/`__ge__` cell-vs-cell
+/// comparisons (`nestedscope.py:9-19 make_cell_cmp`) and `__hash__ = None`
+/// remain unimplemented as a wider parity gap — they are not needed for
+/// the descriptor-on-tuple-of-cells path that motivates this work.
+fn init_cell_type(ns: &mut DictStorage) {
+    // `nestedscope.py:112-116 descr__cell_contents`:
+    //
+    //     def descr__cell_contents(self, space):
+    //         try:
+    //             return self.get()
+    //         except ValueError:
+    //             raise oefmt(space.w_ValueError, "Cell is empty")
+    //
+    // `Cell.get()` (`nestedscope.py:31-44`) raises `ValueError` when
+    // `self.w_value is None`.  Pyre represents an empty cell as
+    // `contents = PY_NULL`, so the null-pointer check below mirrors the
+    // upstream `self.w_value is None` test.
+    let cell_contents_getter = make_builtin_function_with_arity(
+        "cell_contents",
+        |args| {
+            let cell = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+            if cell.is_null() || !unsafe { pyre_object::is_cell(cell) } {
+                return Err(crate::PyError::type_error(
+                    "descriptor 'cell_contents' for 'cell' objects doesn't apply",
+                ));
+            }
+            let v = unsafe { pyre_object::w_cell_get(cell) };
+            if v.is_null() {
+                return Err(crate::PyError::value_error("Cell is empty"));
+            }
+            Ok(v)
+        },
+        2,
+    );
+    // `nestedscope.py:118-119 descr_set_cell_contents`:
+    //
+    //     def descr_set_cell_contents(self, space, w_value):
+    //         return self.set(w_value)
+    let cell_contents_setter = make_builtin_function_with_arity(
+        "cell_contents",
+        |args| {
+            let cell = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+            let w_value = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
+            if cell.is_null() || !unsafe { pyre_object::is_cell(cell) } {
+                return Err(crate::PyError::type_error(
+                    "descriptor 'cell_contents' for 'cell' objects doesn't apply",
+                ));
+            }
+            unsafe { pyre_object::w_cell_set(cell, w_value) };
+            Ok(pyre_object::w_none())
+        },
+        3,
+    );
+    // `nestedscope.py:121-125 descr_del_cell_contents`:
+    //
+    //     def descr_del_cell_contents(self, space):
+    //         try:
+    //             return self.delete()
+    //         except ValueError:
+    //             pass # CPython ignores it
+    //
+    // Pyre clears the cell to PY_NULL so a subsequent read raises the
+    // same `Cell is empty` message; the `ValueError` from
+    // `Cell.delete()` is swallowed per the upstream comment.
+    let cell_contents_deleter = make_builtin_function_with_arity(
+        "cell_contents",
+        |args| {
+            let cell = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+            if cell.is_null() || !unsafe { pyre_object::is_cell(cell) } {
+                return Err(crate::PyError::type_error(
+                    "descriptor 'cell_contents' for 'cell' objects doesn't apply",
+                ));
+            }
+            unsafe { pyre_object::w_cell_set(cell, pyre_object::PY_NULL) };
+            Ok(pyre_object::w_none())
+        },
+        2,
+    );
+    dict_storage_store(
+        ns,
+        "cell_contents",
+        make_getset_property_named(
+            cell_contents_getter,
+            cell_contents_setter,
+            cell_contents_deleter,
+            "cell_contents",
+        ),
+    );
+}
+
 /// `staticmethod.__new__(cls, func)` — PyPy: function.py StaticMethod.descr__new__
 fn init_staticmethod_type(ns: &mut DictStorage) {
     dict_storage_store(
@@ -4692,6 +4798,40 @@ fn init_staticmethod_type(ns: &mut DictStorage) {
             };
             Ok(pyre_object::propertyobject::w_staticmethod_new(func))
         }),
+    );
+    // `typedef.py:866 __get__ = interp2app(
+    //     StaticMethod.descr_staticmethod_get)`.  `function.py:691-693`:
+    //
+    //     def descr_staticmethod_get(self, w_obj, w_cls=None):
+    //         """staticmethod(x).__get__(obj[, type]) -> x"""
+    //         return self.w_function
+    //
+    // Arity 3 covers `__get__(self, obj, cls=None)`.  `args[0]` is the
+    // staticmethod instance; the remaining slots are ignored beyond the
+    // type guard.  Returning `w_function` without binding is the
+    // canonical staticmethod semantic (`function.py:864 …does not
+    // receive an implicit first argument`).
+    dict_storage_store(
+        ns,
+        "__get__",
+        make_builtin_function_with_arity(
+            "__get__",
+            |args| {
+                let sm = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                if !unsafe { pyre_object::propertyobject::is_staticmethod(sm) } {
+                    return Err(crate::PyError::type_error(
+                        "descriptor '__get__' requires a 'staticmethod' object",
+                    ));
+                }
+                let w_func = unsafe { pyre_object::propertyobject::w_staticmethod_get_func(sm) };
+                if w_func.is_null() {
+                    Ok(pyre_object::w_none())
+                } else {
+                    Ok(w_func)
+                }
+            },
+            3,
+        ),
     );
     // typedef.py:870-871 ─
     //   __func__ = interp_attrproperty_w('w_function', cls=StaticMethod),
@@ -4729,6 +4869,30 @@ fn init_staticmethod_type(ns: &mut DictStorage) {
             2,
         )),
     );
+    // typedef.py:872 `__isabstractmethod__ = GetSetProperty(
+    //     StaticMethod.descr_isabstract)`.  function.py:705-706:
+    //
+    //     def descr_isabstract(self, space):
+    //         return space.newbool(space.isabstractmethod_w(self.w_function))
+    //
+    // `baseobjspace.isabstractmethod_w` already factored above.
+    dict_storage_store(
+        ns,
+        "__isabstractmethod__",
+        make_getset_descriptor(make_builtin_function_with_arity(
+            "__isabstractmethod__",
+            |args| {
+                let sm = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+                if !unsafe { pyre_object::propertyobject::is_staticmethod(sm) } {
+                    return Ok(pyre_object::w_bool_from(false));
+                }
+                let func = unsafe { pyre_object::propertyobject::w_staticmethod_get_func(sm) };
+                let result = crate::baseobjspace::isabstractmethod_w(func)?;
+                Ok(pyre_object::w_bool_from(result))
+            },
+            2,
+        )),
+    );
 }
 
 /// `classmethod.__new__(cls, func)` — PyPy: function.py ClassMethod.descr__new__
@@ -4744,6 +4908,49 @@ fn init_classmethod_type(ns: &mut DictStorage) {
             };
             Ok(pyre_object::propertyobject::w_classmethod_new(func))
         }),
+    );
+    // `typedef.py:883 __get__ = interp2app(
+    //     ClassMethod.descr_classmethod_get)`.  `function.py:738-748`:
+    //
+    //     def descr_classmethod_get(self, space, w_obj, w_klass=None):
+    //         if space.is_none(w_klass):
+    //             w_klass = space.type(w_obj)
+    //         w_func = self.w_function
+    //         w_bound = space.get(w_func, w_klass, w_klass)
+    //         if w_bound is not w_func:
+    //             return w_bound
+    //         # the object doesn't have a get, but it might still be
+    //         # callable, so make a Method object
+    //         return Method(space, w_func, w_klass)
+    //
+    // The two branches collapse into a single `Method(func, klass)`
+    // construction because pyre's `w_method_new` is the same shape
+    // that `Function.descr_function_get` would return when
+    // `w_func.__get__(klass, klass)` fires.  This matches the
+    // pre-existing hardcoded classmethod arm in
+    // `baseobjspace::get` (`baseobjspace.rs:5420-5427`).
+    dict_storage_store(
+        ns,
+        "__get__",
+        make_builtin_function_with_arity(
+            "__get__",
+            |args| {
+                let cm = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                if !unsafe { pyre_object::propertyobject::is_classmethod(cm) } {
+                    return Err(crate::PyError::type_error(
+                        "descriptor '__get__' requires a 'classmethod' object",
+                    ));
+                }
+                let w_obj = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+                let mut w_klass = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
+                if w_klass.is_null() || unsafe { pyre_object::is_none(w_klass) } {
+                    w_klass = crate::typedef::r#type(w_obj).unwrap_or(pyre_object::PY_NULL);
+                }
+                let w_func = unsafe { pyre_object::propertyobject::w_classmethod_get_func(cm) };
+                Ok(pyre_object::w_method_new(w_func, w_klass, w_klass))
+            },
+            3,
+        ),
     );
     // typedef.py:884-885 ─
     //   __func__ = interp_attrproperty_w('w_function', cls=ClassMethod),
@@ -4775,6 +4982,28 @@ fn init_classmethod_type(ns: &mut DictStorage) {
         make_getset_descriptor(make_builtin_function_with_arity(
             "__wrapped__",
             classmethod_func_attr,
+            2,
+        )),
+    );
+    // typedef.py:886 `__isabstractmethod__ = GetSetProperty(
+    //     ClassMethod.descr_isabstract)`.  function.py:760-761:
+    //
+    //     def descr_isabstract(self, space):
+    //         return space.newbool(space.isabstractmethod_w(self.w_function))
+    dict_storage_store(
+        ns,
+        "__isabstractmethod__",
+        make_getset_descriptor(make_builtin_function_with_arity(
+            "__isabstractmethod__",
+            |args| {
+                let cm = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+                if !unsafe { pyre_object::propertyobject::is_classmethod(cm) } {
+                    return Ok(pyre_object::w_bool_from(false));
+                }
+                let func = unsafe { pyre_object::propertyobject::w_classmethod_get_func(cm) };
+                let result = crate::baseobjspace::isabstractmethod_w(func)?;
+                Ok(pyre_object::w_bool_from(result))
+            },
             2,
         )),
     );

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Phase 6 parity baseline runner.
+"""Parity baseline runner.
 
-Runs every script under `pyre/parity_tests/` against:
+Runs every script under `pyre/extra_tests/parity_tests/` against:
   - CPython (the system `python3`),
   - the pyre-dynasm binary (release build),
   - the pyre-cranelift binary (release build, if present).
@@ -10,12 +10,13 @@ A script passes when:
   - the process exits with code 0,
   - the last non-empty stdout line equals "OK".
 
-Any divergence between CPython and a pyre backend is a Phase 5
-regression: the dual-storage model has drifted from CPython
-observable semantics.
+Any divergence between CPython and a pyre backend is a parity
+regression: the runtime has drifted from CPython observable
+semantics.
 
 Usage:
-    python3 pyre/parity_tests/run.py [--dynasm-only|--cranelift-only]
+    python3 pyre/extra_tests/parity_tests/run.py
+        [--dynasm-only|--cranelift-only]
 
 Exit code is 0 iff every (script, backend) pair passed.
 """
@@ -29,7 +30,7 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-ROOT = HERE.parent.parent
+ROOT = HERE.parent.parent.parent
 TARGET_RELEASE = ROOT / "target" / "release"
 
 EXE = ".exe" if sys.platform == "win32" else ""

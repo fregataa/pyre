@@ -476,6 +476,9 @@ pub unsafe fn function_get_name(obj: PyObjectRef) -> &'static str {
 ///     self.set_qualname(qualname)
 /// ```
 ///
+/// `space.realutf8_w` accepts any `isinstance_w(w_name, w_text)` —
+/// `str` and its subclasses.  `isinstance_str_w` mirrors that.
+///
 /// # Safety
 /// `obj` must point to a valid `Function`.
 pub unsafe fn fset_func_qualname(
@@ -484,7 +487,7 @@ pub unsafe fn fset_func_qualname(
 ) -> Result<(), crate::PyError> {
     unsafe {
         _check_code_mutable(obj, "__qualname__")?; // function.py:477
-        if value.is_null() || !pyre_object::is_str(value) {
+        if !crate::baseobjspace::isinstance_str_w(value) {
             return Err(crate::PyError::type_error(
                 "__qualname__ must be set to a string object",
             ));
@@ -1120,7 +1123,7 @@ pub unsafe fn fset_func_text_signature(obj: PyObjectRef, value: PyObjectRef) {
     }
 }
 
-/// `function.py:411-419 fset_func_name` parity:
+/// `function.py:462-468 fset_func_name` parity:
 ///
 /// ```python
 /// def fset_func_name(self, space, w_name):
@@ -1128,16 +1131,20 @@ pub unsafe fn fset_func_text_signature(obj: PyObjectRef, value: PyObjectRef) {
 ///     if space.isinstance_w(w_name, space.w_text):
 ///         self.name = space.text_w(w_name)
 ///     else:
-///         raise oefmt(space.w_TypeError, "__name__ must be set to a string")
+///         raise oefmt(space.w_TypeError,
+///                     "__name__ must be set to a string object")
 /// ```
+///
+/// `isinstance_str_w` mirrors `space.isinstance_w(w_name, space.w_text)`
+/// — accepts `str` and any `str` subclass.
 ///
 /// # Safety
 /// `obj` must point to a valid `Function`.
 #[inline]
 pub unsafe fn fset_func_name(obj: PyObjectRef, name: PyObjectRef) -> Result<(), crate::PyError> {
     unsafe {
-        _check_code_mutable(obj, "__name__")?; // function.py:412
-        if name.is_null() || !pyre_object::is_str(name) {
+        _check_code_mutable(obj, "__name__")?; // function.py:463
+        if !crate::baseobjspace::isinstance_str_w(name) {
             return Err(crate::PyError::type_error(
                 "__name__ must be set to a string object",
             ));
@@ -1251,21 +1258,39 @@ pub unsafe fn fset_func_closure(obj: PyObjectRef, closure: PyObjectRef) {
     }
 }
 
-/// function.py:419-425 — `fget___module__`.
-/// Caches on first read: if w_module is PY_NULL (unset), computes from
-/// globals["__name__"] and stores into self.w_module. Always returns
-/// self.w_module afterwards.
+/// `function.py:503-509 fget___module__`:
 ///
-/// PY_NULL = RPython None (unset sentinel), w_none() = space.w_None.
-/// After fdel___module__, w_module is w_none() (not PY_NULL), so
-/// subsequent gets return None without re-computing from globals.
+/// ```python
+/// def fget___module__(self, space):
+///     if self.w_module is None:
+///         if self.w_func_globals is not None and not space.is_w(
+///                 self.w_func_globals, space.w_None):
+///             self.w_module = space.call_method(
+///                 self.w_func_globals, "get", space.newtext("__name__"))
+///         else:
+///             self.w_module = space.w_None
+///     return self.w_module
+/// ```
+///
+/// Caches on first read: if w_module is PY_NULL (RPython-level None,
+/// unset), computes from globals["__name__"] and stores into
+/// self.w_module.  PY_NULL = RPython `None`, w_none() = space.w_None.
+/// After fdel___module__ writes w_none(), subsequent reads return
+/// None without re-computing from globals.
+///
+/// PRE-EXISTING-ADAPTATION: pyre stores `w_func_globals` as a raw
+/// `*mut DictStorage` rather than a wrapped `W_DictObject`, so the
+/// upstream `space.is_w(self.w_func_globals, space.w_None)` arm at
+/// `function.py:505` collapses into the single null-pointer check
+/// here.  Phase 5 collapses the storage / W_DictObject split, after
+/// which the upstream arm-for-arm shape becomes expressible.
 #[inline]
 pub unsafe fn fget___module__(obj: PyObjectRef) -> PyObjectRef {
     unsafe {
         let func = obj as *mut Function;
-        // function.py:420: if self.w_module is None
+        // function.py:504: if self.w_module is None
         if (*func).w_module.is_null() {
-            // function.py:421-422: compute and cache
+            // function.py:505-506: globals.get("__name__")
             let globals = (*func).w_func_globals;
             if !globals.is_null() {
                 (*func).w_module = (*globals)
@@ -1273,11 +1298,11 @@ pub unsafe fn fget___module__(obj: PyObjectRef) -> PyObjectRef {
                     .copied()
                     .unwrap_or(pyre_object::w_none());
             } else {
-                // function.py:424: self.w_module = space.w_None
+                // function.py:508: self.w_module = space.w_None
                 (*func).w_module = pyre_object::w_none();
             }
         }
-        // function.py:425: return self.w_module
+        // function.py:509: return self.w_module
         (*func).w_module
     }
 }
@@ -1307,7 +1332,7 @@ pub unsafe fn descr_function__new__(
     }
 }
 
-/// `function.py:514-516 fset___module__` parity:
+/// `function.py:511-513 fset___module__` parity:
 ///
 /// ```python
 /// def fset___module__(self, space, w_module):
@@ -1317,13 +1342,13 @@ pub unsafe fn descr_function__new__(
 #[inline]
 pub unsafe fn fset___module__(obj: PyObjectRef, value: PyObjectRef) -> Result<(), crate::PyError> {
     unsafe {
-        _check_code_mutable(obj, "__module__")?; // function.py:515
+        _check_code_mutable(obj, "__module__")?; // function.py:512
         (*(obj as *mut Function)).w_module = value;
         Ok(())
     }
 }
 
-/// `function.py:518-520 fdel___module__` parity:
+/// `function.py:515-517 fdel___module__` parity:
 ///
 /// ```python
 /// def fdel___module__(self, space):
@@ -1333,8 +1358,8 @@ pub unsafe fn fset___module__(obj: PyObjectRef, value: PyObjectRef) -> Result<()
 #[inline]
 pub unsafe fn fdel___module__(obj: PyObjectRef) -> Result<(), crate::PyError> {
     unsafe {
-        _check_code_mutable(obj, "__module__")?; // function.py:519
-        // function.py:433: self.w_module = space.w_None
+        _check_code_mutable(obj, "__module__")?; // function.py:516
+        // function.py:517: self.w_module = space.w_None
         (*(obj as *mut Function)).w_module = pyre_object::w_none();
         Ok(())
     }
