@@ -3866,6 +3866,12 @@ extern "C" fn gc_write_barrier_shim(obj: u64) {
     with_cranelift_gc(|gc| gc.write_barrier(GcRef(obj as usize)));
 }
 
+/// aarch64/assembler.py:342 get_write_barrier_fn() after the inline
+/// COND_CALL_GC_WB flag test has already fired.
+extern "C" fn gc_jit_remember_young_pointer_shim(obj: u64) {
+    with_cranelift_gc(|gc| gc.jit_remember_young_pointer(GcRef(obj as usize)));
+}
+
 /// aarch64/assembler.py:352 get_write_barrier_from_array_fn()
 /// → incminimark.py:1606 jit_remember_young_pointer_from_array
 extern "C" fn gc_jit_remember_young_pointer_from_array_shim(obj: u64) {
@@ -5247,10 +5253,13 @@ fn ref_root_slots_with_future_regular_uses(
     ref_root_slots: &[(u32, usize)],
     defined_ref_vars: &HashSet<u32>,
 ) -> Vec<(u32, usize)> {
-    // RPython regalloc only reloads values it keeps in registers after a
-    // collecting call.  References that are live only as future failargs can
-    // remain frame-resident: the gcmap protects their slots, and failure
-    // recovery reads them from the frame if needed.
+    // RPython regalloc reloads values that remain live after a collecting
+    // call. Guard failargs are live uses too: failure recovery reads them
+    // after the call, and majit's failarg emission resolves OpRefs through
+    // the same variable/root-slot machinery as normal op args. Excluding
+    // failargs here leaves a Ref marked stale even though a later guard will
+    // use it, so the guard exit can copy an old frame-resident root slot into
+    // the deadframe instead of the post-GC value.
     ref_root_slots
         .iter()
         .filter(|(var_idx, _)| {
@@ -5258,7 +5267,7 @@ fn ref_root_slots_with_future_regular_uses(
                 && ops
                     .iter()
                     .skip(position + 1)
-                    .flat_map(|op| op.args.iter())
+                    .flat_map(|op| op.args.iter().chain(op.fail_args.iter().flatten()))
                     .any(|arg| arg.raw() == *var_idx)
         })
         .copied()
@@ -10606,7 +10615,7 @@ impl CraneliftBackend {
                             &mut builder,
                             ptr_type,
                             call_conv,
-                            gc_write_barrier_shim as *const () as usize,
+                            gc_jit_remember_young_pointer_shim as *const () as usize,
                             &[obj],
                             None,
                         );
@@ -15064,6 +15073,13 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
+    fn exception_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+    }
+
     fn pending_call_assembler_force_values() -> &'static Mutex<Vec<(i64, Option<i64>)>> {
         static VALUES: OnceLock<Mutex<Vec<(i64, Option<i64>)>>> = OnceLock::new();
         VALUES.get_or_init(|| Mutex::new(Vec::new()))
@@ -16851,6 +16867,7 @@ mod tests {
 
     #[test]
     fn test_guard_exception_exact_match_returns_value_and_clears_deadframe_exception() {
+        let _exception_guard = exception_test_guard();
         jit_exc_clear();
         clear_test_exception_call_log();
         set_test_exception_state(make_fake_exc(0x1111));
@@ -16898,6 +16915,7 @@ mod tests {
 
     #[test]
     fn test_guard_exception_exact_mismatch_preserves_deadframe_exception() {
+        let _exception_guard = exception_test_guard();
         jit_exc_clear();
         clear_test_exception_call_log();
         set_test_exception_state(make_fake_exc(0x2222));
@@ -16938,6 +16956,7 @@ mod tests {
 
     #[test]
     fn test_guard_no_exception_failure_preserves_deadframe_exception() {
+        let _exception_guard = exception_test_guard();
         jit_exc_clear();
         clear_test_exception_call_log();
         set_test_exception_state(make_fake_exc(0x1111));
@@ -16988,6 +17007,7 @@ mod tests {
 
     #[test]
     fn test_execute_token_ints_raw_preserves_exception_and_layout_metadata() {
+        let _exception_guard = exception_test_guard();
         jit_exc_clear();
         clear_test_exception_call_log();
         set_test_exception_state(make_fake_exc(0x1111));
@@ -17041,6 +17061,7 @@ mod tests {
 
     #[test]
     fn test_save_restore_exception_roundtrip_matches_rpython_order() {
+        let _exception_guard = exception_test_guard();
         jit_exc_clear();
         clear_test_exception_call_log();
         set_test_exception_state(make_fake_exc(0x3333));
@@ -17096,6 +17117,7 @@ mod tests {
 
     #[test]
     fn test_deadframe_exception_ref_survives_collection_after_execute_token() {
+        let _exception_guard = exception_test_guard();
         jit_exc_clear();
 
         let mut gc = MiniMarkGC::with_config(GcConfig {
@@ -21018,7 +21040,14 @@ mod tests {
 
     #[test]
     fn test_cond_call_gc_wb_executes_with_configured_runtime() {
-        let mut backend = make_gc_backend();
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 1 << 20,
+            large_object_threshold: 1 << 20,
+            ..GcConfig::default()
+        });
+        gc.register_type(TypeInfo::simple(16));
+        let obj = majit_gc::GcAllocator::alloc_oldgen_typed(&mut gc, 0, 16);
+        let mut backend = CraneliftBackend::with_gc_allocator(Box::new(gc));
 
         let inputargs = vec![InputArg::new_ref(0)];
         let ops = vec![
@@ -21038,12 +21067,7 @@ mod tests {
         let mut token = JitCellToken::new(1503);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
-        let mut raw = vec![0u64; 2];
-        unsafe {
-            *(raw.as_mut_ptr() as *mut GcHeader) = GcHeader::with_flags(9, flags::TRACK_YOUNG_PTRS);
-        }
-        let obj = GcRef(raw.as_mut_ptr() as usize + GcHeader::SIZE);
-
+        assert!(unsafe { (*header_of(obj.0)).has_flag(flags::TRACK_YOUNG_PTRS) });
         backend.execute_token(&token, &[Value::Ref(obj)]);
         assert!(!unsafe { (*header_of(obj.0)).has_flag(flags::TRACK_YOUNG_PTRS) });
     }
