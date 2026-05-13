@@ -30,6 +30,17 @@ COMPUTED_GOTO_THRESHOLD = 5
 # segment and cache without any dispatch benefit.
 COMPUTED_GOTO_MAX_SPARSE = 4
 
+def _split_exits(block):
+    """Return (non_default_links, default_link_or_None) for a switch block."""
+    non_default = []
+    defaultlink = None
+    for link in block.exits:
+        if link.exitcase == 'default':
+            defaultlink = link
+        else:
+            non_default.append(link)
+    return non_default, defaultlink
+
 def _use_computed_goto(non_default):
     if len(non_default) < COMPUTED_GOTO_THRESHOLD:
         return False
@@ -71,15 +82,19 @@ class FunctionCodeGenerator(object):
         self.illtypes = None
         self._uses_computed_goto = self._check_for_computed_goto()
 
-    def _check_for_computed_goto(self):
+    def _iter_computed_goto_blocks(self):
+        """Yield (block, non_default_links) for every block that uses computed goto."""
         for block in self.graph.iterblocks():
             if (block.exitswitch is not None and not block.canraise and
                     self.lltypemap_early(block.exitswitch) in (
                         Signed, Unsigned, SignedLongLong, UnsignedLongLong)):
-                non_default = [l for l in block.exits
-                               if l.exitcase != 'default']
+                non_default, _defaultlink = _split_exits(block)
                 if _use_computed_goto(non_default):
-                    return True
+                    yield block, non_default
+
+    def _check_for_computed_goto(self):
+        for _block, _non_default in self._iter_computed_goto_blocks():
+            return True
         return False
 
     def lltypemap_early(self, v):
@@ -248,15 +263,9 @@ class FunctionCodeGenerator(object):
 
         # Blocks that are targets of large switches must have labels so that
         # computed goto dispatch tables can reference them via &&blockN.
-        for block in graph.iterblocks():
-            if (block.exitswitch is not None and not block.canraise and
-                    self.lltypemap(block.exitswitch) in (
-                        Signed, Unsigned, SignedLongLong, UnsignedLongLong)):
-                non_default = [l for l in block.exits
-                               if l.exitcase != 'default']
-                if _use_computed_goto(non_default):
-                    for link in block.exits:
-                        self.inlinable_blocks.discard(link.target)
+        for block, _non_default in self._iter_computed_goto_blocks():
+            for link in block.exits:
+                self.inlinable_blocks.discard(link.target)
 
         yield ''
         for line in self.gen_goto(graph.startblock):
@@ -320,13 +329,8 @@ class FunctionCodeGenerator(object):
                         yield op
                 elif TYPE in (Signed, Unsigned, SignedLongLong,
                               UnsignedLongLong, Char, UniChar):
-                    defaultlink = None
                     expr = self.expr(block.exitswitch)
-                    non_default = [l for l in block.exits
-                                   if l.exitcase != 'default']
-                    for link in block.exits:
-                        if link.exitcase == 'default':
-                            defaultlink = link
+                    non_default, defaultlink = _split_exits(block)
                     if (TYPE not in (Char, UniChar) and
                             _use_computed_goto(non_default)):
                         for line in self.gen_computed_goto(
