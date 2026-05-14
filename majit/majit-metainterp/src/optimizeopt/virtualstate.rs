@@ -149,17 +149,6 @@ pub enum VirtualStateInfo {
         fielddescrs: Vec<DescrRef>,
         element_fields: Vec<Vec<(u32, Rc<VirtualStateInfoNode>)>>,
     },
-    /// Value is a virtual raw buffer (info.py:389 RawBufferPtrInfo).
-    VirtualRawBuffer {
-        /// info.py:389: self.func — the malloc function pointer.
-        func: i64,
-        size: usize,
-        /// rawbuffer.py:14-16: offsets (signed, see RawBuffer.offsets),
-        /// lengths (unsigned), per-entry child state.
-        entries: Vec<(i64, usize, Rc<VirtualStateInfoNode>)>,
-        /// rawbuffer.py:16: self.descrs — per-entry ArrayDescr.
-        descrs: Vec<DescrRef>,
-    },
     /// Value has a known class (non-null).
     ///
     /// virtualstate.py:505 NotVirtualStateInfoPtr with level=LEVEL_KNOWNCLASS.
@@ -277,11 +266,6 @@ impl VirtualStateInfoNode {
                     for (_, child) in fields {
                         child.enum_into(state);
                     }
-                }
-            }
-            VirtualStateInfo::VirtualRawBuffer { entries, .. } => {
-                for (_, _, child) in entries {
-                    child.enum_into(state);
                 }
             }
             VirtualStateInfo::KnownClass { .. }
@@ -475,50 +459,6 @@ impl VirtualStateInfo {
                 })
             }
 
-            // Virtual raw buffer
-            // resume.py:335,694: visit_vrawbuffer(func, size, offsets, descrs)
-            // — func and descrs are part of raw-buffer identity.
-            (
-                VirtualStateInfo::VirtualRawBuffer {
-                    func: f1,
-                    size: s1,
-                    entries: e1,
-                    descrs: d1,
-                },
-                VirtualStateInfo::VirtualRawBuffer {
-                    func: f2,
-                    size: s2,
-                    entries: e2,
-                    descrs: d2,
-                },
-            ) => {
-                if f1 != f2 || s1 != s2 || e1.len() != e2.len() {
-                    return false;
-                }
-                // rawbuffer.py:83: _descrs_are_compatible — two arraydescrs are
-                // compatible if they have the same basesize, itemsize and sign,
-                // even if they are not identical (unpack_arraydescr_size parity).
-                if d1.len() != d2.len()
-                    || !d1.iter().zip(d2.iter()).all(|(a, b)| {
-                        let (Some(a1), Some(a2)) = (a.as_array_descr(), b.as_array_descr()) else {
-                            // rawbuffer.py:86-87: unpack_arraydescr_size requires
-                            // array descrs. Non-array descrs are incompatible.
-                            return false;
-                        };
-                        a1.base_size() == a2.base_size()
-                            && a1.item_size() == a2.item_size()
-                            && a1.is_item_signed() == a2.is_item_signed()
-                    })
-                {
-                    return false;
-                }
-                e1.iter()
-                    .zip(e2.iter())
-                    .all(|((off1, len1, v1), (off2, len2, v2))| {
-                        off1 == off2 && len1 == len2 && v1.is_compatible(v2)
-                    })
-            }
-
             // KnownClass: other must have the same class (or be virtual with matching class).
             // RPython: KnownClass does NOT accept Unknown/NonNull in pure
             // compatibility check (raises VirtualStatesCantMatch). Guard
@@ -538,8 +478,7 @@ impl VirtualStateInfo {
                 | VirtualStateInfo::Virtual { .. }
                 | VirtualStateInfo::VArray { .. }
                 | VirtualStateInfo::VStruct { .. }
-                | VirtualStateInfo::VArrayStruct { .. }
-                | VirtualStateInfo::VirtualRawBuffer { .. } => true,
+                | VirtualStateInfo::VArrayStruct { .. } => true,
                 VirtualStateInfo::Constant(Value::Ref(r)) => !r.is_null(),
                 _ => false,
             },
@@ -566,7 +505,6 @@ impl VirtualStateInfo {
                 | VirtualStateInfo::VArray { .. }
                 | VirtualStateInfo::VStruct { .. }
                 | VirtualStateInfo::VArrayStruct { .. }
-                | VirtualStateInfo::VirtualRawBuffer { .. }
         )
     }
 
@@ -579,10 +517,6 @@ impl VirtualStateInfo {
             VirtualStateInfo::Unknown(tp) => Some(*tp),
             VirtualStateInfo::Constant(v) => Some(v.get_type()),
             VirtualStateInfo::IntBounded(_) => Some(Type::Int),
-            // info.py:867 `assert op.type == 'i'` in `getrawptrinfo`:
-            // raw pointer Boxes are int-typed; pointer-ness sits on
-            // RawBufferPtrInfo, not on the Box.type.
-            VirtualStateInfo::VirtualRawBuffer { .. } => Some(Type::Int),
             VirtualStateInfo::NonNull
             | VirtualStateInfo::KnownClass { .. }
             | VirtualStateInfo::Virtual { .. }
@@ -703,11 +637,6 @@ impl VirtualState {
                     }
                 }
             }
-            VirtualStateInfo::VirtualRawBuffer { entries, .. } => {
-                for (_, _, child) in entries {
-                    Self::reset_positions_walk(child, visited);
-                }
-            }
             VirtualStateInfo::Constant(_)
             | VirtualStateInfo::KnownClass { .. }
             | VirtualStateInfo::NonNull
@@ -773,10 +702,6 @@ impl VirtualState {
                 .iter()
                 .flat_map(|fields| fields.iter().map(|(_, child)| child))
                 .map(|child| Self::count_forced_boxes_for_entry_rc(child, visited))
-                .sum(),
-            VirtualStateInfo::VirtualRawBuffer { entries, .. } => entries
-                .iter()
-                .map(|(_, _, child)| Self::count_forced_boxes_for_entry_rc(child, visited))
                 .sum(),
             VirtualStateInfo::KnownClass { .. }
             | VirtualStateInfo::NonNull
@@ -1128,42 +1053,6 @@ impl VirtualState {
                 }
                 Ok(())
             }
-            VirtualStateInfo::VirtualRawBuffer { entries, .. } => {
-                // majit-only: VirtualRawBuffer mirrors VStruct semantics.
-                let resolved = ctx.get_box_replacement(opref);
-                // BoxRef-routing reader; cached once so the per-entry walk
-                // below doesn't re-clone PtrInfo per iteration.
-                let info_snapshot = ctx
-                    .get_box_replacement_box(resolved)
-                    .as_ref()
-                    .and_then(|b| ctx.peek_ptr_info(b));
-                let is_virtual = info_snapshot.as_ref().map_or(false, |pi| pi.is_virtual());
-                if !is_virtual {
-                    return Err(());
-                }
-                for (index, (_, _, entry_state)) in entries.iter().enumerate() {
-                    let entry_ref = info_snapshot
-                        .as_ref()
-                        .and_then(|info| match info {
-                            PtrInfo::VirtualRawBuffer(vinfo) => vinfo.values.get(index).copied(),
-                            _ => None,
-                        })
-                        .unwrap_or(OpRef::NONE);
-                    // virtualstate.py:196/274/352 parity for the
-                    // VirtualRawBuffer adaptation.
-                    if entry_state.position.get() > node.position.get() {
-                        Self::enum_forced_boxes_for_entry(
-                            entry_state,
-                            entry_ref,
-                            optimizer,
-                            ctx,
-                            boxes,
-                            force_boxes,
-                        )?;
-                    }
-                }
-                Ok(())
-            }
             VirtualStateInfo::KnownClass { .. }
             | VirtualStateInfo::NonNull
             | VirtualStateInfo::IntBounded(_)
@@ -1302,11 +1191,31 @@ impl VirtualState {
             return Err(());
         }
         let mut guards = Vec::new();
+        // virtualstate.py:24-37 `GenerateGuardState.renum` and :84-94
+        // `AbstractVirtualStateInfo.generate_guards` alias-consistency:
+        //
+        //     if self.position in state.renum:
+        //         if state.renum[self.position] != other.position:
+        //             raise VirtualStatesCantMatch(...)
+        //         # else: already-seen position, skip _generate_guards
+        //     else:
+        //         state.renum[self.position] = other.position
+        //         self._generate_guards(...)
+        //
+        // Catches the case where two distinct incoming positions map to
+        // the same expected virtual node (the trace assumes two values
+        // are aliased but the incoming disagrees), and short-circuits
+        // duplicate visits to a node already proven compatible. The same
+        // `HashMap` instance is threaded through every recursive call
+        // (virtualstate.py:174-176 struct field, :260-261 array item,
+        // :325-326 interior field) so nested virtual nodes share the
+        // alias namespace with their top-level parents.
+        let mut renum: HashMap<i32, i32> = HashMap::new();
 
         for (i, (expected, incoming)) in self.state.iter().zip(other.state.iter()).enumerate() {
             let box_opref = boxes.get(i).copied().unwrap_or(OpRef::NONE);
             let runtime_box = runtime_boxes.and_then(|rb| rb.get(i).copied());
-            if let Err(()) = Self::generate_guards_for_entry(
+            if let Err(()) = Self::generate_guards_for_entry_recursive(
                 i,
                 expected,
                 incoming,
@@ -1314,6 +1223,7 @@ impl VirtualState {
                 runtime_box,
                 ctx,
                 force_boxes,
+                &mut renum,
                 &mut guards,
             ) {
                 if std::env::var_os("MAJIT_LOG_JTET").is_some() {
@@ -1330,38 +1240,73 @@ impl VirtualState {
         Ok(guards)
     }
 
-    /// virtualstate.py per-entry generate_guards parity.
+    /// virtualstate.py per-entry generate_guards parity, recursive form.
     ///
-    /// Returns Ok(()) if the pair is compatible (possibly with guards),
-    /// Err(()) if fundamentally incompatible (VirtualStatesCantMatch).
+    /// Mirrors `AbstractVirtualStateInfo.generate_guards` (virtualstate.py:72-101)
+    /// + the per-subclass `_generate_guards` dispatch. The alias-consistency
+    /// check (virtualstate.py:84-94) lives at the entry of every recursive
+    /// call so nested virtual fields/items participate in the same renum
+    /// namespace.
     ///
     /// `runtime_box`: when Some, non-permanent guard emission is possible.
-    /// When None (generalization_of path), only structurally compatible
-    /// pairs are accepted.  RPython uses the concrete runtime value as an
-    /// "educated guess" (comment at virtualstate.py:551-555); majit does
-    /// not have concrete values so it optimistically emits guards whenever
-    /// runtime_box is Some.
+    /// When None (generalization_of path, or nested call from a virtual
+    /// parent), only structurally compatible pairs are accepted. RPython
+    /// uses the concrete runtime value as an "educated guess"
+    /// (virtualstate.py:551-555); pyre does not have a CPU at trace time,
+    /// so `get_runtime_field` / `get_runtime_item` (virtualstate.py:39-67)
+    /// degenerate to `None` for nested recursion — RPython's
+    /// `runtime_box is not None` gate at :493/:601 then suppresses
+    /// nested guard emission the same way.
     ///
     /// `force_boxes`: when true, Virtual incoming can be accepted by
     /// non-virtual targets (virtualstate.py:523-524 _generate_virtual_guards).
-    fn generate_guards_for_entry(
+    fn generate_guards_for_entry_recursive(
         arg_idx: usize,
-        expected: &VirtualStateInfo,
-        incoming: &VirtualStateInfo,
+        expected: &VirtualStateInfoNode,
+        incoming: &VirtualStateInfoNode,
         box_opref: OpRef,
         runtime_box: Option<OpRef>,
         ctx: &OptContext,
         force_boxes: bool,
+        renum: &mut HashMap<i32, i32>,
         guards: &mut Vec<GuardRequirement>,
     ) -> Result<(), ()> {
+        // virtualstate.py:83 `assert self.position != -1`. Pyre assigns
+        // positions in `enum_top_level`; sentinel -1 means a node was
+        // never enumerated, which is a constructor bug.
+        let exp_pos = expected.position.get();
+        let inc_pos = incoming.position.get();
+        debug_assert!(
+            exp_pos >= 0,
+            "expected entry {arg_idx} has unassigned position (enum_top_level not run?)"
+        );
+        // virtualstate.py:84-94: alias check + dedup. A matching prior
+        // entry short-circuits the recursion (already proven compatible).
+        match renum.get(&exp_pos).copied() {
+            Some(prev) if prev != inc_pos => {
+                if std::env::var_os("MAJIT_LOG_JTET").is_some() {
+                    eprintln!(
+                        "[jit][jte] renum alias mismatch arg_idx={arg_idx} expected.position={exp_pos} \
+                         prior_incoming={prev} current_incoming={inc_pos}"
+                    );
+                }
+                return Err(());
+            }
+            Some(_) => return Ok(()),
+            None => {
+                renum.insert(exp_pos, inc_pos);
+            }
+        }
+        let expected_info = &expected.info;
+        let incoming_info = &incoming.info;
         // virtualstate.py:523-524: force_boxes + Virtual incoming
         // → _generate_virtual_guards (check class compatibility only).
         // virtualstate.py:523-524: force_boxes + incoming virtual, expected non-virtual
-        if force_boxes && incoming.is_virtual() && !expected.is_virtual() {
-            return match expected {
+        if force_boxes && incoming_info.is_virtual() && !expected_info.is_virtual() {
+            return match expected_info {
                 VirtualStateInfo::Constant(_) => Err(()),
                 VirtualStateInfo::KnownClass { class_ptr } => {
-                    if let VirtualStateInfo::Virtual { known_class, .. } = incoming {
+                    if let VirtualStateInfo::Virtual { known_class, .. } = incoming_info {
                         if known_class.as_ref() == Some(class_ptr) {
                             Ok(())
                         } else {
@@ -1377,9 +1322,9 @@ impl VirtualState {
         // virtualstate.py:520-530: _generate_virtual_guards —
         // force_boxes + expected virtual, incoming non-virtual (forced box).
         // The forced box's known class must match the virtual's class.
-        if force_boxes && expected.is_virtual() && !incoming.is_virtual() {
-            if let VirtualStateInfo::KnownClass { class_ptr } = incoming {
-                let expected_class = match expected {
+        if force_boxes && expected_info.is_virtual() && !incoming_info.is_virtual() {
+            if let VirtualStateInfo::KnownClass { class_ptr } = incoming_info {
+                let expected_class = match expected_info {
                     VirtualStateInfo::Virtual { known_class, .. } => known_class.as_ref(),
                     _ => None,
                 };
@@ -1390,7 +1335,7 @@ impl VirtualState {
                 };
             }
             if matches!(
-                incoming,
+                incoming_info,
                 VirtualStateInfo::NonNull | VirtualStateInfo::Unknown(_)
             ) {
                 return Ok(());
@@ -1409,15 +1354,15 @@ impl VirtualState {
         // a Virtual/VArray/VStruct, the comparison is handled by the
         // VirtualStateInfo._generate_guards path (the main match below),
         // which does struct-level field comparison — not type-tag matching.
-        if !expected.is_virtual() {
-            if let Some(expected_type) = expected.info_type() {
-                if !info_type_matches(expected_type, incoming) {
+        if !expected_info.is_virtual() {
+            if let Some(expected_type) = expected_info.info_type() {
+                if !info_type_matches(expected_type, incoming_info) {
                     return Err(());
                 }
             }
         }
 
-        match (expected, incoming) {
+        match (expected_info, incoming_info) {
             // virtualstate.py:387-389: Unknown target accepts anything of
             // the same type (the isinstance check above already enforced
             // the type agreement).
@@ -1513,7 +1458,7 @@ impl VirtualState {
                 }
             }
             // NonNull accepts any virtual (virtual is always nonnull).
-            (VirtualStateInfo::NonNull, incoming) if incoming.is_virtual() => Ok(()),
+            (VirtualStateInfo::NonNull, other) if other.is_virtual() => Ok(()),
 
             // ── IntBounded target ── (virtualstate.py:483-499)
             (VirtualStateInfo::IntBounded(b1), VirtualStateInfo::IntBounded(b2))
@@ -1540,19 +1485,194 @@ impl VirtualState {
                 }
             }
 
-            // ── Virtual targets ── (virtualstate.py:141-320)
-            // Structural match delegated to is_compatible.
-            (expected_vs, incoming_vs) if expected_vs.is_virtual() => {
-                if expected_vs.is_compatible(incoming_vs) {
-                    Ok(())
-                } else {
-                    Err(())
+            // ── Virtual targets ──
+            // virtualstate.py:141-176 AbstractVirtualStructStateInfo._generate_guards
+            // virtualstate.py:206-216 VirtualStateInfo._generalization_of_structpart
+            //
+            // Structural prelude (descr / known_class / field count) then
+            // recurse into every paired fieldstate, threading `renum` so
+            // nested alias mismatches surface as virtualstate.py:84-94
+            // VirtualStatesCantMatch — not silently widened by a
+            // structural-only is_compatible.
+            (
+                VirtualStateInfo::Virtual {
+                    descr: ed,
+                    known_class: ekc,
+                    fields: ef,
+                    ..
+                },
+                VirtualStateInfo::Virtual {
+                    descr: id,
+                    known_class: ikc,
+                    fields: if_,
+                    ..
+                },
+            ) => {
+                if ed.index() != id.index() {
+                    return Err(());
                 }
+                match (ekc, ikc) {
+                    (Some(c1), Some(c2)) if c1 != c2 => return Err(()),
+                    (Some(_), None) => return Err(()),
+                    _ => {}
+                }
+                Self::generate_guards_recurse_named_fields(
+                    arg_idx,
+                    ef,
+                    if_,
+                    ctx,
+                    force_boxes,
+                    renum,
+                    guards,
+                )
+            }
+
+            // virtualstate.py:223-233 VStructStateInfo — same shape as
+            // Virtual but keyed by typedescr instead of vtable class.
+            (
+                VirtualStateInfo::VStruct {
+                    descr: ed,
+                    fields: ef,
+                    ..
+                },
+                VirtualStateInfo::VStruct {
+                    descr: id,
+                    fields: if_,
+                    ..
+                },
+            ) => {
+                if ed.index() != id.index() {
+                    return Err(());
+                }
+                Self::generate_guards_recurse_named_fields(
+                    arg_idx,
+                    ef,
+                    if_,
+                    ctx,
+                    force_boxes,
+                    renum,
+                    guards,
+                )
+            }
+
+            // virtualstate.py:236-261 VArrayStateInfo._generate_guards —
+            // arraydescr identity + length, then recurse over items.
+            (
+                VirtualStateInfo::VArray {
+                    descr: ed,
+                    items: ei,
+                    ..
+                },
+                VirtualStateInfo::VArray {
+                    descr: id,
+                    items: ii,
+                    ..
+                },
+            ) => {
+                if ed.index() != id.index() || ei.len() != ii.len() {
+                    return Err(());
+                }
+                for (ec, ic) in ei.iter().zip(ii.iter()) {
+                    Self::generate_guards_for_entry_recursive(
+                        arg_idx,
+                        ec,
+                        ic,
+                        OpRef::NONE,
+                        None,
+                        ctx,
+                        force_boxes,
+                        renum,
+                        guards,
+                    )?;
+                }
+                Ok(())
+            }
+
+            // virtualstate.py:286-326 VArrayStructStateInfo._generate_guards —
+            // arraydescr + length + fielddescrs identity then recurse over
+            // (element × field) cells.
+            (
+                VirtualStateInfo::VArrayStruct {
+                    descr: ed,
+                    fielddescrs: efd,
+                    element_fields: eef,
+                },
+                VirtualStateInfo::VArrayStruct {
+                    descr: id,
+                    fielddescrs: ifd,
+                    element_fields: ief,
+                },
+            ) => {
+                if ed.index() != id.index() || eef.len() != ief.len() {
+                    return Err(());
+                }
+                if efd.len() != ifd.len() {
+                    return Err(());
+                }
+                for (a, b) in efd.iter().zip(ifd.iter()) {
+                    if a.index() != b.index() {
+                        return Err(());
+                    }
+                }
+                for (e_fields, i_fields) in eef.iter().zip(ief.iter()) {
+                    Self::generate_guards_recurse_named_fields(
+                        arg_idx,
+                        e_fields,
+                        i_fields,
+                        ctx,
+                        force_boxes,
+                        renum,
+                        guards,
+                    )?;
+                }
+                Ok(())
             }
 
             // Fundamentally incompatible: VirtualStatesCantMatch.
             _ => Err(()),
         }
+    }
+
+    /// virtualstate.py:158-176 AbstractVirtualStructStateInfo per-field
+    /// recursion. Pairs every (descr_idx, fieldstate) in `expected_fields`
+    /// with the matching incoming entry and recurses with `runtime_box=None`
+    /// — pyre cannot fabricate `state.get_runtime_field` results at trace
+    /// time, and RPython's nested guard emission is itself gated on
+    /// `runtime_box is not None` at :493/:601/:603/:622.
+    fn generate_guards_recurse_named_fields(
+        arg_idx: usize,
+        expected_fields: &[(u32, Rc<VirtualStateInfoNode>)],
+        incoming_fields: &[(u32, Rc<VirtualStateInfoNode>)],
+        ctx: &OptContext,
+        force_boxes: bool,
+        renum: &mut HashMap<i32, i32>,
+        guards: &mut Vec<GuardRequirement>,
+    ) -> Result<(), ()> {
+        if expected_fields.len() != incoming_fields.len() {
+            return Err(());
+        }
+        for (idx, expected_child) in expected_fields {
+            let incoming_child = match incoming_fields
+                .iter()
+                .find(|(i, _)| i == idx)
+                .map(|(_, v)| v)
+            {
+                Some(child) => child,
+                None => return Err(()),
+            };
+            Self::generate_guards_for_entry_recursive(
+                arg_idx,
+                expected_child,
+                incoming_child,
+                OpRef::NONE,
+                None,
+                ctx,
+                force_boxes,
+                renum,
+                guards,
+            )?;
+        }
+        Ok(())
     }
 
     /// virtualstate.py: debug_print(hdr, bad, metainterp_sd)
@@ -1566,7 +1686,6 @@ impl VirtualState {
                 VirtualStateInfo::VArray { .. } => "VArray",
                 VirtualStateInfo::VStruct { .. } => "VStruct",
                 VirtualStateInfo::VArrayStruct { .. } => "VArrayStruct",
-                VirtualStateInfo::VirtualRawBuffer { .. } => "VRawBuf",
                 VirtualStateInfo::KnownClass { .. } => "KnownClass",
                 VirtualStateInfo::NonNull => "NonNull",
                 VirtualStateInfo::IntBounded(_) => "IntBounded",
@@ -1724,20 +1843,6 @@ fn deep_clone_node(
                 })
                 .collect(),
         },
-        VirtualStateInfo::VirtualRawBuffer {
-            func,
-            size,
-            entries,
-            descrs,
-        } => VirtualStateInfo::VirtualRawBuffer {
-            func: *func,
-            size: *size,
-            entries: entries
-                .iter()
-                .map(|(off, len, child)| (*off, *len, deep_clone_node(child, cache)))
-                .collect(),
-            descrs: descrs.clone(),
-        },
     };
     let new_rc = VirtualStateInfoNode::new_rc(cloned_info);
     cache.insert(key, Rc::clone(&new_rc));
@@ -1774,11 +1879,21 @@ pub enum GuardRequirement {
 }
 
 impl GuardRequirement {
-    /// Convert this guard requirement into a concrete Op, registering
-    /// constant args via ctx. RPython creates ConstInt/ConstPtr objects
-    /// inline in ResOperation args (virtualstate.py:401, 603); we
-    /// allocate constant OpRefs via make_constant_int/make_constant_ref.
-    pub fn to_op(&self, args: &[OpRef], ctx: &mut OptContext) -> Option<Op> {
+    /// Convert this guard requirement into the concrete Op stream that
+    /// upstream `extra_guards` would have appended. RPython creates
+    /// ConstInt/ConstPtr inline in ResOperation args (virtualstate.py:401,
+    /// 603, intutils.py:1264 `IntBound.make_guards`); pyre allocates
+    /// constant OpRefs via the closure-based pool seed.
+    ///
+    /// Most variants emit a single guard; `GuardBounds` expands to the
+    /// int_ge/int_le/int_and pairs of `IntBound::make_guards`
+    /// (intutils.py:1264-1289). The caller (unroll.rs:2856) iterates the
+    /// returned `Vec` and applies `rd_resume_position` /
+    /// `ResumeAtPositionDescr` only to entries that pass `is_guard()` —
+    /// matching unroll.py:335 `if isinstance(guard, GuardResOp)`. The
+    /// interleaved INT_GE / INT_LE / INT_AND producers in this stream
+    /// are NOT GuardResOp and therefore skip the resume stamp.
+    pub fn to_ops(&self, args: &[OpRef], ctx: &mut OptContext) -> Vec<Op> {
         match self {
             GuardRequirement::GuardClass {
                 arg_index,
@@ -1788,13 +1903,16 @@ impl GuardRequirement {
                 let arg = if !box_opref.is_none() {
                     *box_opref
                 } else {
-                    *args.get(*arg_index)?
+                    match args.get(*arg_index) {
+                        Some(a) => *a,
+                        None => return Vec::new(),
+                    }
                 };
                 // virtualstate.py:603: ConstInt(self.known_class)
                 let class_const = ctx.make_constant_int(expected_class.0 as i64);
                 let mut op = Op::new(OpCode::GuardClass, &[arg, class_const]);
                 op.fail_args = Some(Default::default());
-                Some(op)
+                vec![op]
             }
             GuardRequirement::GuardNonnull {
                 arg_index,
@@ -1803,11 +1921,14 @@ impl GuardRequirement {
                 let arg = if !box_opref.is_none() {
                     *box_opref
                 } else {
-                    *args.get(*arg_index)?
+                    match args.get(*arg_index) {
+                        Some(a) => *a,
+                        None => return Vec::new(),
+                    }
                 };
                 let mut op = Op::new(OpCode::GuardNonnull, &[arg]);
                 op.fail_args = Some(Default::default());
-                Some(op)
+                vec![op]
             }
             GuardRequirement::GuardValue {
                 arg_index,
@@ -1817,7 +1938,10 @@ impl GuardRequirement {
                 let arg = if !box_opref.is_none() {
                     *box_opref
                 } else {
-                    *args.get(*arg_index)?
+                    match args.get(*arg_index) {
+                        Some(a) => *a,
+                        None => return Vec::new(),
+                    }
                 };
                 // virtualstate.py:401: ResOperation(GUARD_VALUE,
                 // [box, self.constbox]). Preserve the Const object's type:
@@ -1830,16 +1954,53 @@ impl GuardRequirement {
                 };
                 let mut op = Op::new(OpCode::GuardValue, &[arg, val_const]);
                 op.fail_args = Some(Default::default());
-                Some(op)
+                vec![op]
             }
             GuardRequirement::GuardBounds {
-                arg_index: _,
-                box_opref: _,
-                bounds: _,
+                arg_index,
+                box_opref,
+                bounds,
             } => {
-                // IntBound guards are emitted as int_ge/int_le pairs
-                // For now, skip — intbounds pass handles these
-                None
+                let arg = if !box_opref.is_none() {
+                    *box_opref
+                } else {
+                    match args.get(*arg_index) {
+                        Some(a) => *a,
+                        None => return Vec::new(),
+                    }
+                };
+                // intutils.py:1264-1289 IntBound.make_guards parity:
+                // upstream appends INT_GE/INT_LE/INT_AND followed by
+                // GUARD_TRUE/GUARD_VALUE pairs into `extra_guards`. Each
+                // GUARD_* receives the producer `ResOperation` as its
+                // first arg via Python-object identity (intutils.py:1275);
+                // pyre uses one closure dispatching `GuardOpAlloc` so a
+                // fresh Int OpRef is installed on the producer's `pos`
+                // before the consumer guard captures the args.
+                use crate::optimizeopt::intutils::GuardOpAlloc;
+                let mut emitted = Vec::new();
+                let mut alloc = |req: GuardOpAlloc| -> OpRef {
+                    match req {
+                        GuardOpAlloc::Const(value) => {
+                            let pos = ctx.reserve_const_ref(value.get_type());
+                            ctx.seed_constant(pos, value);
+                            pos
+                        }
+                        GuardOpAlloc::IntResult => ctx.alloc_op_position_typed(majit_ir::Type::Int),
+                    }
+                };
+                bounds.make_guards(arg, &mut emitted, &mut alloc);
+                // Tag GUARD_TRUE / GUARD_VALUE with empty fail_args; the
+                // non-guard INT_GE / INT_LE / INT_AND producers keep the
+                // default. The caller (unroll.rs:2856) gates the
+                // rd_resume_position / descr stamp on `is_guard()` per
+                // unroll.py:335 `isinstance(guard, GuardResOp)`.
+                for op in &mut emitted {
+                    if matches!(op.opcode, OpCode::GuardTrue | OpCode::GuardValue) {
+                        op.fail_args = Some(Default::default());
+                    }
+                }
+                emitted
             }
         }
     }
@@ -2053,31 +2214,26 @@ fn export_single_value_inner(
                     element_fields,
                 };
             }
-            PtrInfo::VirtualRawBuffer(vinfo) => {
-                // info.py:445: visitor.visit_vrawbuffer(self.func, self.size, ...)
-                let entries = vinfo
-                    .offsets
-                    .iter()
-                    .zip(vinfo.lengths.iter())
-                    .zip(vinfo.values.iter())
-                    .map(|((&offset, &length), &value_ref)| {
-                        let val_state = export_single_value(value_ref, ctx, cache);
-                        (offset, length, val_state)
-                    })
-                    .collect();
-                return VirtualStateInfo::VirtualRawBuffer {
-                    func: vinfo.func,
-                    size: vinfo.size,
-                    entries,
-                    descrs: vinfo.descrs.clone(),
-                };
-            }
-            PtrInfo::VirtualRawSlice(_) => {
-                // RawSlicePtrInfo aliases its parent buffer; the parent is
-                // always exported separately. Slices have no independent
-                // virtual-state representation, so emit NonNull (matches
-                // RPython's `getlenbound` fallback for RawSlicePtrInfo).
-                return VirtualStateInfo::NonNull;
+            PtrInfo::VirtualRawBuffer(_) | PtrInfo::VirtualRawSlice(_) => {
+                // walkvirtual.py:20-24: VirtualVisitor.visit_vrawbuffer /
+                // visit_vrawslice raise NotImplementedError. RPython's
+                // VirtualStateConstructor inherits the abstract base and
+                // does not override either method, so a virtual raw buffer
+                // or raw slice reaching state export means an earlier pass
+                // (force_at_end_of_preamble) failed to materialize it.
+                //
+                // info.py:417 RawBufferPtrInfo.is_virtual returns True;
+                // info.py:464 RawSlicePtrInfo.is_virtual returns True when
+                // the parent is virtual. Both should be forced before this
+                // boundary. Match upstream by panicking — the alternative
+                // (silently exporting an invented virtual-state shape) is
+                // the pyre-side divergence flagged by audit.
+                panic!(
+                    "export_state: virtual raw buffer/slice reached state export — \
+                     visit_vrawbuffer/visit_vrawslice has no VirtualStateConstructor \
+                     override (walkvirtual.py:20-24); the buffer must be forced \
+                     before the loop boundary"
+                );
             }
             PtrInfo::NonNull { .. } => {
                 return VirtualStateInfo::NonNull;
@@ -2364,13 +2520,14 @@ mod tests {
     fn test_guard_value_preserves_ref_constant_type() {
         let mut ctx = OptContext::new(128);
         let expected = GcRef(0x1234);
-        let guard = GuardRequirement::GuardValue {
+        let emitted = GuardRequirement::GuardValue {
             arg_index: 0,
             box_opref: OpRef::ref_op(10),
             expected_value: Value::Ref(expected),
         }
-        .to_op(&[OpRef::ref_op(10)], &mut ctx)
-        .unwrap();
+        .to_ops(&[OpRef::ref_op(10)], &mut ctx);
+        assert_eq!(emitted.len(), 1);
+        let guard = &emitted[0];
 
         assert_eq!(guard.opcode, OpCode::GuardValue);
         assert_eq!(ctx.get_constant(guard.arg(1)), Some(Value::Ref(expected)));

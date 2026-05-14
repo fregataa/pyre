@@ -2426,57 +2426,53 @@ impl OptContext {
             }
         }
 
-        // Phase 3: generate guards — alloc_const directly allocates constant
-        // OpRefs, matching RPython where ConstInt/ConstPtr are created inline.
+        // Phase 3: generate guards — `alloc` dispatches `GuardOpAlloc`
+        // (intutils.rs). `Const(Value)` reserves a constant pool entry
+        // (RPython `ConstInt` / `ConstPtr`); `IntResult` materializes a
+        // fresh Int OpRef for an intermediate op's producer identity
+        // (intutils.py:1275, info.py:381/637, vstring.py:124).
+        use crate::optimizeopt::intutils::GuardOpAlloc;
         let mut arg_guards = Vec::new();
-        let mut alloc_const = |value: Value| -> OpRef {
-            let pos = self.reserve_const_ref(value.get_type());
-            self.seed_constant(pos, value);
-            pos
+        let mut alloc = |req: GuardOpAlloc| -> OpRef {
+            match req {
+                GuardOpAlloc::Const(value) => {
+                    let pos = self.reserve_const_ref(value.get_type());
+                    self.seed_constant(pos, value);
+                    pos
+                }
+                GuardOpAlloc::IntResult => self.alloc_op_position_typed(majit_ir::Type::Int),
+            }
         };
         // info.py:861 FloatConstInfo.make_guards / ConstPtrInfo path —
         // single-value info classes emit a GUARD_VALUE that pins `op` to
         // the recorded constant.
-        // info.py:861 FloatConstInfo.make_guards: emits GUARD_VALUE
-        // pinning `op` to the ConstFloat.
         let emit_const_guard =
             |arg: OpRef,
              value: &Value,
              guards: &mut Vec<Op>,
-             alloc: &mut dyn FnMut(Value) -> OpRef| {
-                let c = alloc(value.clone());
+             alloc: &mut dyn FnMut(GuardOpAlloc) -> OpRef| {
+                let c = alloc(GuardOpAlloc::Const(value.clone()));
                 guards.push(Op::new(OpCode::GuardValue, &[arg, c]));
             };
         for entry in &arg_entries {
             match &entry.info {
-                ForwardedInfo::Ptr(p) => {
-                    p.make_guards(entry.arg, &mut arg_guards, &mut alloc_const)
+                ForwardedInfo::Ptr(p) => p.make_guards(entry.arg, &mut arg_guards, &mut alloc),
+                ForwardedInfo::Int(b) => b.make_guards(entry.arg, &mut arg_guards, &mut alloc),
+                ForwardedInfo::FloatConst(f) => {
+                    emit_const_guard(entry.arg, &Value::Float(*f), &mut arg_guards, &mut alloc)
                 }
-                ForwardedInfo::Int(b) => {
-                    b.make_guards(entry.arg, &mut arg_guards, &mut alloc_const)
-                }
-                ForwardedInfo::FloatConst(f) => emit_const_guard(
-                    entry.arg,
-                    &Value::Float(*f),
-                    &mut arg_guards,
-                    &mut alloc_const,
-                ),
             }
         }
         let mut result_guards = Vec::new();
         if let Some((result_ref, info)) = &result_info {
             match info {
-                ForwardedInfo::Ptr(p) => {
-                    p.make_guards(*result_ref, &mut result_guards, &mut alloc_const)
-                }
-                ForwardedInfo::Int(b) => {
-                    b.make_guards(*result_ref, &mut result_guards, &mut alloc_const)
-                }
+                ForwardedInfo::Ptr(p) => p.make_guards(*result_ref, &mut result_guards, &mut alloc),
+                ForwardedInfo::Int(b) => b.make_guards(*result_ref, &mut result_guards, &mut alloc),
                 ForwardedInfo::FloatConst(f) => emit_const_guard(
                     *result_ref,
                     &Value::Float(*f),
                     &mut result_guards,
-                    &mut alloc_const,
+                    &mut alloc,
                 ),
             }
         }

@@ -126,6 +126,23 @@ pub struct IntBound {
     pub tmask: u64,
 }
 
+/// Allocation request passed to `IntBound::make_guards`'s closure.
+///
+/// `ResOperation(...)` in RPython is its own identity, so chaining
+/// `[op]` into the next guard's args needs no extra step. Pyre's
+/// flat-OpRef model requires two distinct allocations: constant pool
+/// entries (for `ConstInt(bound)` args) and fresh Int OpRefs (for the
+/// producer `INT_GE` / `INT_LE` / `INT_AND` result identity). One
+/// closure with this dispatch enum keeps the borrow of `OptContext`
+/// inside a single capture, which is what the borrow checker requires.
+pub enum GuardOpAlloc {
+    /// intutils.py:1270/1275/1281/1286 `ConstInt(...)` — constant pool entry.
+    Const(majit_ir::Value),
+    /// intutils.py:1275/1281/1286 `op = ResOperation(rop.INT_*, [...])`
+    /// then `[op]` — fresh Int OpRef for the producer's result identity.
+    IntResult,
+}
+
 impl IntBound {
     // ── Constructors ──
 
@@ -283,42 +300,64 @@ impl IntBound {
     /// pyre signature returned `Vec<(OpCode, i64)>` and the caller emitted
     /// every guard against `box` directly, dropping the chained guard pair
     /// and leaving the bound silently unenforced.
+    ///
+    /// RPython relies on Python-object identity: `op = ResOperation(...)`
+    /// and then `[op]` references the same object as the next guard's
+    /// first argument (intutils.py:1275-1284). Pyre's flat-OpRef model
+    /// has no implicit identity, so a fresh Int OpRef must be installed
+    /// on the producer's `pos` *before* the consumer guard is constructed.
+    /// The `alloc` closure dispatches on `GuardOpAlloc`:
+    ///
+    ///   * `Const(Value)` — reserve a constant pool entry (intutils.py
+    ///     `ConstInt(bound)` arg).
+    ///   * `IntResult` — allocate a fresh Int OpRef for the producer's
+    ///     result (the implicit identity of `ResOperation` in upstream).
     pub fn make_guards<F>(
         &self,
         box_ref: majit_ir::OpRef,
         guards: &mut Vec<crate::optimizeopt::Op>,
-        alloc_const: &mut F,
+        alloc: &mut F,
     ) where
-        F: FnMut(majit_ir::Value) -> majit_ir::OpRef,
+        F: FnMut(GuardOpAlloc) -> majit_ir::OpRef,
     {
         use crate::optimizeopt::Op;
         use majit_ir::{OpCode, Value};
 
         if self.is_constant() {
-            let c = alloc_const(Value::Int(self.upper));
+            let c = alloc(GuardOpAlloc::Const(Value::Int(self.upper)));
             guards.push(Op::new(OpCode::GuardValue, &[box_ref, c]));
             return;
         }
         if self.lower > i64::MIN {
-            let bound = alloc_const(Value::Int(self.lower));
-            let op = Op::new(OpCode::IntGe, &[box_ref, bound]);
+            let bound = alloc(GuardOpAlloc::Const(Value::Int(self.lower)));
+            let mut op = Op::new(OpCode::IntGe, &[box_ref, bound]);
+            // intutils.py:1275 `op = ResOperation(rop.INT_GE, ...)` then
+            // `[op]` — RPython uses the ResOperation object as identity.
+            // pyre allocates a fresh Int OpRef into `op.pos` so the next
+            // guard's arg vector captures the producer's result, not the
+            // sentinel `OpRef::NONE` left over from `Op::new`.
+            op.pos = alloc(GuardOpAlloc::IntResult);
             let op_pos = op.pos;
             guards.push(op);
             guards.push(Op::new(OpCode::GuardTrue, &[op_pos]));
         }
         if self.upper < i64::MAX {
-            let bound = alloc_const(Value::Int(self.upper));
-            let op = Op::new(OpCode::IntLe, &[box_ref, bound]);
+            let bound = alloc(GuardOpAlloc::Const(Value::Int(self.upper)));
+            let mut op = Op::new(OpCode::IntLe, &[box_ref, bound]);
+            // intutils.py:1281 INT_LE producer identity — see comment above.
+            op.pos = alloc(GuardOpAlloc::IntResult);
             let op_pos = op.pos;
             guards.push(op);
             guards.push(Op::new(OpCode::GuardTrue, &[op_pos]));
         }
         if !self.are_knownbits_implied() {
-            let mask = alloc_const(Value::Int(!self.tmask as i64));
-            let op = Op::new(OpCode::IntAnd, &[box_ref, mask]);
+            let mask = alloc(GuardOpAlloc::Const(Value::Int(!self.tmask as i64)));
+            let mut op = Op::new(OpCode::IntAnd, &[box_ref, mask]);
+            // intutils.py:1286 INT_AND producer identity — see comment above.
+            op.pos = alloc(GuardOpAlloc::IntResult);
             let op_pos = op.pos;
             guards.push(op);
-            let value = alloc_const(Value::Int(self.tvalue as i64));
+            let value = alloc(GuardOpAlloc::Const(Value::Int(self.tvalue as i64)));
             guards.push(Op::new(OpCode::GuardValue, &[op_pos, value]));
         }
     }

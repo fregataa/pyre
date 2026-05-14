@@ -414,9 +414,6 @@ impl Optimizer {
             | VirtualStateInfo::VArrayStruct { .. }
             | VirtualStateInfo::KnownClass { .. }
             | VirtualStateInfo::NonNull => majit_ir::Type::Ref,
-            // info.py:386 RawBufferPtrInfo — raw malloc pointer carried
-            // as Int (no GC tracking).
-            VirtualStateInfo::VirtualRawBuffer { .. } => majit_ir::Type::Int,
             VirtualStateInfo::IntBounded(_) => majit_ir::Type::Int,
             VirtualStateInfo::Unknown(tp) => *tp,
         };
@@ -563,40 +560,6 @@ impl Optimizer {
                                 fielddescrs: fielddescrs.clone(),
                                 element_fields: imported_elements,
                                 last_guard_pos: -1,
-                                cached_vinfo: std::cell::RefCell::new(None),
-                            },
-                        ),
-                    );
-                }
-            }
-            VirtualStateInfo::VirtualRawBuffer {
-                func,
-                size,
-                entries,
-                descrs,
-            } => {
-                let mut offsets = Vec::with_capacity(entries.len());
-                let mut lengths = Vec::with_capacity(entries.len());
-                let mut values = Vec::with_capacity(entries.len());
-                for (offset, length, entry_info) in entries {
-                    offsets.push(*offset);
-                    lengths.push(*length);
-                    values.push(Self::import_virtual_state_value(entry_info, ctx));
-                }
-                if let Some(b) = &opref_box {
-                    ctx.set_ptr_info(
-                        b,
-                        crate::optimizeopt::info::PtrInfo::VirtualRawBuffer(
-                            crate::optimizeopt::info::VirtualRawBufferInfo {
-                                func: *func,
-                                size: *size,
-                                offsets,
-                                lengths,
-                                descrs: descrs.clone(),
-                                values,
-                                last_guard_pos: -1,
-                                // resume.py:1452: calldescr from callinfo_for_oopspec
-                                calldescr: Some(majit_ir::make_raw_malloc_calldescr()),
                                 cached_vinfo: std::cell::RefCell::new(None),
                             },
                         ),
@@ -1100,50 +1063,6 @@ impl Optimizer {
                                 fielddescrs: fielddescrs.clone(),
                                 element_fields: imported_elements,
                                 last_guard_pos: -1,
-                                cached_vinfo: std::cell::RefCell::new(None),
-                            },
-                        ),
-                    );
-                }
-                opref
-            }
-            VirtualStateInfo::VirtualRawBuffer {
-                func,
-                size,
-                entries,
-                descrs,
-            } => {
-                // info.py:386 RawBufferPtrInfo — raw malloc pointer, Int.
-                let opref = ctx.alloc_op_position_typed(majit_ir::Type::Int);
-                let mut offsets = Vec::with_capacity(entries.len());
-                let mut lengths = Vec::with_capacity(entries.len());
-                let mut values = Vec::with_capacity(entries.len());
-                for (offset, length, entry_info) in entries {
-                    offsets.push(*offset);
-                    lengths.push(*length);
-                    values.push(Self::import_virtual_state_from_label_args_recurse(
-                        entry_info,
-                        imported_label_args,
-                        label_slot,
-                        ctx,
-                        walk_visited,
-                    ));
-                }
-                let opref_box = ctx.get_box_replacement_box(opref);
-                if let Some(b) = &opref_box {
-                    ctx.set_ptr_info(
-                        b,
-                        crate::optimizeopt::info::PtrInfo::VirtualRawBuffer(
-                            crate::optimizeopt::info::VirtualRawBufferInfo {
-                                func: *func,
-                                size: *size,
-                                offsets,
-                                lengths,
-                                descrs: descrs.clone(),
-                                values,
-                                last_guard_pos: -1,
-                                // resume.py:1452: calldescr from callinfo_for_oopspec
-                                calldescr: Some(majit_ir::make_raw_malloc_calldescr()),
                                 cached_vinfo: std::cell::RefCell::new(None),
                             },
                         ),
@@ -3238,6 +3157,21 @@ impl Optimizer {
             OptContext::with_inputarg_types(32, &types)
         });
 
+        // unroll.py:148-158 `_optimize_unrolled_loop` ordering:
+        //
+        //     self.optimizer.flush()
+        //     self.optimizer.optimize_force_at_the_end_of_preamble()
+        //     ...
+        //     virtual_state = self._jump_to_existing_trace(jump_op, ...)
+        //
+        // The flush+force pair runs BEFORE `_jump_to_existing_trace`; the
+        // VS is captured inside `_jump_to_existing_trace` (unroll.py:323
+        // `get_virtual_state(jump_op.getarglist())`) on the now-forwarded
+        // jump args. force_at_the_end_of_preamble (info.py:282) recurses
+        // into virtual fields but does NOT force the top-level virtuals,
+        // so the top-level VS shape is preserved. We therefore omit any
+        // pre-flush snapshot and let try_jump_to_existing_trace compute
+        // VS internally — matching RPython 1:1.
         self.flush(&mut ctx);
 
         // unroll.py:204-205: force_at_the_end_of_preamble for each jump arg
@@ -3303,7 +3237,11 @@ impl Optimizer {
             return (optimized_ops, true);
         }
 
-        // unroll.py:220-227: retrace limit reached, try force_boxes=True
+        // unroll.py:220-227: retrace limit reached, try force_boxes=True.
+        // Matches `_optimize_unrolled_loop`'s second call to
+        // `_jump_to_existing_trace(..., force_boxes=True)` (unroll.py:222);
+        // VS is recomputed inside that call from the current (post-force)
+        // jump_op.getarglist() — no pre-snapshot is reused.
         ctx.clear_newoperations();
         let vs2 = match Self::try_jump_to_existing_trace(
             &opt_unroll,

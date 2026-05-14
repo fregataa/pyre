@@ -2851,17 +2851,25 @@ impl OptUnroll {
             // RPython's `for guard in extra_guards.extra_guards` loop body is
             // also skipped in that case.
             for guard_req in &extra_guards {
-                if let Some(mut guard_op) = guard_req.to_op(&args, ctx) {
-                    let patch = ctx.patchguardop.as_ref().unwrap_or_else(|| {
-                        panic!(
-                            "unroll.py:333 invariant: patchguardop must be set \
-                             when extra_guards is non-empty (target_token #{}, \
-                             {} extra guard(s), force_boxes={})",
-                            tt_idx,
-                            extra_guards.len(),
-                            force_boxes,
-                        )
-                    });
+                let emitted = guard_req.to_ops(&args, ctx);
+                if emitted.is_empty() {
+                    continue;
+                }
+                // unroll.py:333 reads `patchguardop` once per loop iteration.
+                // Pull it eagerly so the stamp branch below stays cheap and
+                // the invariant is asserted before any op streams out.
+                let patch = ctx.patchguardop.as_ref().unwrap_or_else(|| {
+                    panic!(
+                        "unroll.py:333 invariant: patchguardop must be set \
+                         when extra_guards is non-empty (target_token #{}, \
+                         {} extra guard(s), force_boxes={})",
+                        tt_idx,
+                        extra_guards.len(),
+                        force_boxes,
+                    )
+                });
+                let rd_resume_position = patch.rd_resume_position;
+                for mut guard_op in emitted {
                     if std::env::var_os("MAJIT_LOG_JTET").is_some() {
                         let arg_values: Vec<_> = guard_op
                             .args
@@ -2873,9 +2881,21 @@ impl OptUnroll {
                             guard_op.opcode, guard_req, arg_values
                         );
                     }
-                    // unroll.py:336: guard.rd_resume_position = patchguardop.rd_resume_position
-                    guard_op.rd_resume_position = patch.rd_resume_position;
-                    guard_op.descr = Some(crate::optimizeopt::make_resume_at_position_descr());
+                    // unroll.py:335-337 line-by-line:
+                    //
+                    //     if isinstance(guard, GuardResOp):
+                    //         guard.rd_resume_position = patchguardop.rd_resume_position
+                    //         guard.setdescr(compile.ResumeAtPositionDescr())
+                    //     self.optimizer.send_extra_operation(guard)
+                    //
+                    // intutils.py:1264 IntBound.make_guards interleaves
+                    // INT_GE/INT_LE/INT_AND (non-GuardResOp) with their
+                    // GUARD_TRUE/GUARD_VALUE pairs; only the latter inherit
+                    // resume metadata. Mirror the type filter via `is_guard()`.
+                    if guard_op.opcode.is_guard() {
+                        guard_op.rd_resume_position = rd_resume_position;
+                        guard_op.descr = Some(crate::optimizeopt::make_resume_at_position_descr());
+                    }
                     optimizer.send_extra_operation(&guard_op, ctx);
                 }
             }

@@ -863,14 +863,17 @@ impl PtrInfo {
     ///
     /// Append guard operations to `short` that check this PtrInfo's
     /// properties hold for `op`. Used by use_box (shortpreamble.py:382).
-    /// `alloc_const` allocates a constant-namespace OpRef and seeds the
-    /// value — RPython equivalent: ConstInt(value) / ConstPtr(value).
+    /// `alloc` is the shared `GuardOpAlloc` dispatcher (intutils.rs):
+    /// `Const(Value)` reserves a constant pool entry (RPython
+    /// `ConstInt(value)` / `ConstPtr(value)`); `IntResult` allocates a
+    /// fresh Int OpRef for an intermediate op's producer identity.
     pub fn make_guards(
         &self,
         op: OpRef,
         short: &mut Vec<Op>,
-        alloc_const: &mut impl FnMut(Value) -> OpRef,
+        alloc: &mut impl FnMut(crate::optimizeopt::intutils::GuardOpAlloc) -> OpRef,
     ) {
+        use crate::optimizeopt::intutils::GuardOpAlloc;
         match self {
             // info.py:83-84: PtrInfo base — no-op
             PtrInfo::NonNull { .. } => {
@@ -881,7 +884,7 @@ impl PtrInfo {
                 // info.py:336-353: InstancePtrInfo.make_guards
                 if let Some(cls) = &info.known_class {
                     // remove_gctypeptr branch
-                    let class_ref = alloc_const(Value::Ref(*cls));
+                    let class_ref = alloc(GuardOpAlloc::Const(Value::Ref(*cls)));
                     short.push(Op::new(OpCode::GuardNonnullClass, &[op, class_ref]));
                 } else if let Some(descr) = &info.descr {
                     // info.py:346-351: descr-only branch.
@@ -892,7 +895,7 @@ impl PtrInfo {
                         .as_size_descr()
                         .map(|sd| sd.vtable() as i64)
                         .unwrap_or(0);
-                    let vtable_const = alloc_const(Value::Int(vtable));
+                    let vtable_const = alloc(GuardOpAlloc::Const(Value::Int(vtable)));
                     short.push(Op::new(OpCode::GuardSubclass, &[op, vtable_const]));
                 } else {
                     // info.py:353: fall back to AbstractStructPtrInfo →
@@ -911,13 +914,13 @@ impl PtrInfo {
                     .as_size_descr()
                     .map(|sd| sd.type_id() as i64)
                     .unwrap_or(0);
-                let type_id_const = alloc_const(Value::Int(type_id));
+                let type_id_const = alloc(GuardOpAlloc::Const(Value::Int(type_id)));
                 short.push(Op::new(OpCode::GuardNonnull, &[op]));
                 short.push(Op::new(OpCode::GuardGcType, &[op, type_id_const]));
             }
             PtrInfo::Constant(gcref) => {
                 // info.py:715-716: ConstPtrInfo.make_guards
-                let c = alloc_const(Value::Ref(*gcref));
+                let c = alloc(GuardOpAlloc::Const(Value::Ref(*gcref)));
                 short.push(Op::new(OpCode::GuardValue, &[op, c]));
             }
             PtrInfo::Array(info) => {
@@ -934,17 +937,24 @@ impl PtrInfo {
                     .as_array_descr()
                     .map(|ad| ad.type_id() as i64)
                     .unwrap_or(0);
-                let type_id_const = alloc_const(Value::Int(type_id));
+                let type_id_const = alloc(GuardOpAlloc::Const(Value::Int(type_id)));
                 short.push(Op::new(OpCode::GuardGcType, &[op, type_id_const]));
                 // Always emit ARRAYLEN_GC + bound guards: pyre's
                 // ArrayPtrInfo.lenbound is a plain `IntBound`, not an
                 // `Option`, so the parity check is on `is_unbounded()`
                 // rather than `is None`.
                 if !info.lenbound.is_unbounded() {
-                    let lenop = Op::with_descr(OpCode::ArraylenGc, &[op], info.descr.clone());
+                    let mut lenop = Op::with_descr(OpCode::ArraylenGc, &[op], info.descr.clone());
+                    // info.py:637 `lenop = ResOperation(ARRAYLEN_GC, [op])`
+                    // followed by `lenbound.make_guards(lenop, ...)` — the
+                    // `lenop` object is the consumer's box arg via Python
+                    // identity. Allocate a fresh Int OpRef on `lenop.pos`
+                    // so the chained INT_GE/INT_LE/INT_AND check against
+                    // the producer result, not the sentinel `OpRef::NONE`.
+                    lenop.pos = alloc(GuardOpAlloc::IntResult);
                     let lenop_pos = lenop.pos;
                     short.push(lenop);
-                    info.lenbound.make_guards(lenop_pos, short, alloc_const);
+                    info.lenbound.make_guards(lenop_pos, short, alloc);
                 }
             }
             // info.py:379-384 `AbstractRawPtrInfo.make_guards`:
@@ -963,8 +973,11 @@ impl PtrInfo {
             // Both `RawBufferPtrInfo` (info.py:386) and
             // `RawSlicePtrInfo` (info.py:459) inherit this override.
             PtrInfo::VirtualRawBuffer(_) | PtrInfo::VirtualRawSlice(_) => {
-                let zero = alloc_const(Value::Int(0));
-                let eq_op = Op::new(OpCode::IntEq, &[op, zero]);
+                let zero = alloc(GuardOpAlloc::Const(Value::Int(0)));
+                let mut eq_op = Op::new(OpCode::IntEq, &[op, zero]);
+                // info.py:381 `op = ResOperation(INT_EQ, [...])` then
+                // `[op]` — INT_EQ result identity for GUARD_FALSE.
+                eq_op.pos = alloc(GuardOpAlloc::IntResult);
                 let eq_pos = eq_op.pos;
                 short.push(eq_op);
                 short.push(Op::new(OpCode::GuardFalse, &[eq_pos]));
@@ -979,13 +992,17 @@ impl PtrInfo {
                         } else {
                             OpCode::Unicodelen
                         };
-                        let lenop = Op::new(lenop_code, &[op]);
+                        let mut lenop = Op::new(lenop_code, &[op]);
+                        // vstring.py:124 `lenop = ResOperation(STRLEN, [op])`
+                        // is consumed by `bound.make_guards(lenop, ...)`.
+                        // Materialize the producer result before the chain.
+                        lenop.pos = alloc(GuardOpAlloc::IntResult);
                         let lenop_pos = lenop.pos;
                         short.push(lenop);
                         // intutils.py:1264-1289 IntBound.make_guards: emits the
                         // chained INT_GE/INT_LE/INT_AND → GUARD_TRUE/GUARD_VALUE
                         // pairs against `lenop_pos`.
-                        bound.make_guards(lenop_pos, short, alloc_const);
+                        bound.make_guards(lenop_pos, short, alloc);
                     }
                 }
             }
