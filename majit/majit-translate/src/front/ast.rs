@@ -852,8 +852,9 @@ fn extract_elidable_promote_selector(attrs: &[syn::Attribute]) -> Option<Promote
 ///     the original body and the `#[elidable]` attribute (so
 ///     `collect_jit_hints` registers it via `mark_elidable`).
 ///   * RPython's `exec compile` synthesis of `def f(...)` becomes a
-///     `syn::Block` whose stmts are `let <arg> = hint_promote(<arg>);`
-///     for each selected arg, followed by the tail call.
+///     `syn::Block` whose stmts are
+///     `let <arg> = hint_promote_or_string(<arg>);` for each selected
+///     arg, followed by the tail call.
 ///   * The user-facing name keeps its identity (matching pyre's
 ///     proc-macro naming convention `_orig_<name>_unlikely_name` at
 ///     `majit-macros::elidable_promote`); RPython's `__name__ + "_promote"`
@@ -934,20 +935,46 @@ fn synthesize_elidable_promote_pair(
             ix.clone()
         }
     };
-    // jit.py:191-194 — `for arg in args: hint(arg, ...)`; `args` includes
-    // `self` since `_get_args(func)` reads `co_varnames` raw.  Rust forbids
-    // re-binding the `self` keyword, so the receiver is routed through a
-    // fresh `__self_promoted` local; non-receiver args keep RPython's
-    // shadow pattern (`let arg = hint_promote(arg);`).
+    // jit.py:191-194 — `for arg in args: hint(arg, promote=True,
+    // promote_string=True)`.  RPython emits a *single* dual-flag hint
+    // per arg and defers the dispatch to
+    // `rpython/jit/codewriter/jtransform.py:599-606`, which only
+    // matches `concretetype == lltype.Ptr(rstr.STR)`:
+    //
+    //   * `Ptr(rstr.STR)` → keep `promote_string`, delete `promote`
+    //     → emit `str_guard_value` (jit.py:615-631).
+    //   * everything else, **including `Ptr(rstr.UNICODE)`** → delete
+    //     `promote_string`, keep `promote` → emit
+    //     `<kind>_guard_value` with `kind = getkind(concretetype)`,
+    //     which is `"ref"` for any GC pointer
+    //     (`rpython/jit/metainterp/history.py:64-67`).  No
+    //     `unicode_guard_value` opname exists in RPython; the
+    //     unicode-specific `str_guard_value/OS_UNIEQ_NONNULL` shape
+    //     is only reachable via the dedicated `promote_unicode`
+    //     hint (`jit_codewriter/jtransform.py:632-648`,
+    //     `rpython/rlib/jit.py:130-131`), which `elidable_promote`
+    //     never emits.
+    //
+    // Pyre mirrors that shape line-by-line: every promoted arg gets
+    // `hint_promote_or_string`, and the `PromoteOrString` arm in
+    // `jit_codewriter/jtransform.rs` falls through to the plain
+    // `<kind>_guard_value` family because pyre lacks a
+    // `Ptr(rstr.STR)`-equivalent GC layout — `del hints['promote_string']`
+    // is the upstream `else` branch at `jtransform.py:603-606`.
+    //
+    // `args` includes `self` since `_get_args(func)` reads
+    // `co_varnames` raw.  Rust forbids re-binding the `self` keyword,
+    // so the receiver is routed through a fresh `__self_promoted`
+    // local; non-receiver args keep RPython's shadow pattern.
     let promote_self = promote_indices.iter().any(|&i| arg_names[i] == "self");
     let promote_stmts: Vec<syn::Stmt> = promote_indices
         .iter()
         .map(|&i| {
             let id = &arg_names[i];
             if id == "self" {
-                syn::parse_quote!(let __self_promoted = hint_promote(self);)
+                syn::parse_quote!(let __self_promoted = hint_promote_or_string(self);)
             } else {
-                syn::parse_quote!(let #id = hint_promote(#id);)
+                syn::parse_quote!(let #id = hint_promote_or_string(#id);)
             }
         })
         .collect();
@@ -3143,44 +3170,53 @@ fn lower_expr(
                     .and_then(|atid| extract_element_type_from_str(atid));
                 // RPython: getkind(op.result.concretetype) — resolve field type
                 // from struct field registry for the kind suffix (i/r/f).
-                let item_ty = elem_type
+                let item_field_type_string = elem_type
                     .as_ref()
                     .and_then(|owner| ctx.struct_fields.field_type(owner, &field_name))
+                    .map(ToOwned::to_owned);
+                let item_ty = item_field_type_string
+                    .as_deref()
                     .map(type_string_to_value_type)
                     .unwrap_or(ValueType::Unknown);
+                let result = graph.push_op(
+                    *block,
+                    OpKind::InteriorFieldRead {
+                        base,
+                        index,
+                        field: crate::model::FieldDescriptor::new(field_name, elem_type),
+                        item_ty,
+                        array_type_id,
+                    },
+                    true,
+                );
                 Ok(Lowered {
-                    value: graph.push_op(
-                        *block,
-                        OpKind::InteriorFieldRead {
-                            base,
-                            index,
-                            field: crate::model::FieldDescriptor::new(field_name, elem_type),
-                            item_ty,
-                            array_type_id,
-                        },
-                        true,
-                    ),
+                    value: result,
                     path_closed: false,
                 })
             } else {
                 let base = get_value!(lower_expr(graph, block, &field.base, options, ctx)?);
                 let field_name = member_name(&field.member);
-                let ty = field_value_type_from_expr(&field.base, &field.member, ctx)
+                let field_type_string =
+                    field_type_string_from_expr(&field.base, &field.member, ctx);
+                let ty = field_type_string
+                    .as_deref()
+                    .map(type_string_to_value_type)
                     .unwrap_or(ValueType::Unknown);
+                let result = graph.push_op(
+                    *block,
+                    OpKind::FieldRead {
+                        base,
+                        field: crate::model::FieldDescriptor::new(
+                            field_name,
+                            receiver_type_root(&field.base, ctx),
+                        ),
+                        ty,
+                        pure: false,
+                    },
+                    true,
+                );
                 Ok(Lowered {
-                    value: graph.push_op(
-                        *block,
-                        OpKind::FieldRead {
-                            base,
-                            field: crate::model::FieldDescriptor::new(
-                                field_name,
-                                receiver_type_root(&field.base, ctx),
-                            ),
-                            ty,
-                            pure: false,
-                        },
-                        true,
-                    ),
+                    value: result,
                     path_closed: false,
                 })
             }
@@ -3193,18 +3229,19 @@ fn lower_expr(
             let array_type_id = array_type_id_from_expr(&idx.expr, ctx);
             let item_ty = array_item_value_type_from_array_type_id(array_type_id.as_deref())
                 .unwrap_or(ValueType::Unknown);
+            let result = graph.push_op(
+                *block,
+                OpKind::ArrayRead {
+                    base,
+                    index,
+                    item_ty,
+                    nolength: nolength_from_array_type_id(array_type_id.as_deref()),
+                    array_type_id,
+                },
+                true,
+            );
             Ok(Lowered {
-                value: graph.push_op(
-                    *block,
-                    OpKind::ArrayRead {
-                        base,
-                        index,
-                        item_ty,
-                        nolength: nolength_from_array_type_id(array_type_id.as_deref()),
-                        array_type_id,
-                    },
-                    true,
-                ),
+                value: result,
                 path_closed: false,
             })
         }
@@ -3342,6 +3379,17 @@ fn lower_expr(
             // free functions returning `usize` / `bool` / `i64` propagate
             // a `Signed` result kind through rtyper instead of defaulting
             // to GcRef.
+            let call_return_type_string = if let syn::Expr::Path(p) = &*call.func {
+                let segments: Vec<String> = p
+                    .path
+                    .segments
+                    .iter()
+                    .map(|s| s.ident.to_string())
+                    .collect();
+                lookup_function_return_type(ctx, &segments).cloned()
+            } else {
+                None
+            };
             let result_ty = if let syn::Expr::Path(p) = &*call.func {
                 let segments: Vec<String> = p
                     .path
@@ -3351,23 +3399,25 @@ fn lower_expr(
                     .collect();
                 intrinsic_call_result_type(&segments)
                     .or_else(|| {
-                        lookup_function_return_type(ctx, &segments)
-                            .map(|s| type_string_to_value_type(s))
+                        call_return_type_string
+                            .as_deref()
+                            .map(type_string_to_value_type)
                     })
                     .unwrap_or(ValueType::Unknown)
             } else {
                 ValueType::Unknown
             };
+            let result = graph.push_op(
+                *block,
+                OpKind::Call {
+                    target,
+                    args,
+                    result_ty,
+                },
+                true,
+            );
             Ok(Lowered {
-                value: graph.push_op(
-                    *block,
-                    OpKind::Call {
-                        target,
-                        args,
-                        result_ty,
-                    },
-                    true,
-                ),
+                value: result,
                 path_closed: false,
             })
         }
@@ -3402,27 +3452,31 @@ fn lower_expr(
             // integer ops (otherwise `value_type_to_kind` defaults to
             // `'r'` and the result reaches the assembler as a Ref-kind
             // operand, surfacing as `int_ge/ir>i` etc.).
+            let method_return_type_string =
+                lookup_method_return_type(ctx, receiver_root.as_deref(), &mc.method)
+                    .or_else(|| {
+                        lookup_method_return_type(ctx, trait_bound_root.as_deref(), &mc.method)
+                    })
+                    .cloned();
             let result_ty = primitive_method_result_type(graph, &args, &mc.method)
                 .or_else(|| transparent_option_method_result_type(graph, &args, &mc.method))
                 .or_else(|| {
-                    lookup_method_return_type(ctx, receiver_root.as_deref(), &mc.method)
-                        .map(|s| type_string_to_value_type(s))
-                })
-                .or_else(|| {
-                    lookup_method_return_type(ctx, trait_bound_root.as_deref(), &mc.method)
-                        .map(|s| type_string_to_value_type(s))
+                    method_return_type_string
+                        .as_deref()
+                        .map(type_string_to_value_type)
                 })
                 .unwrap_or(ValueType::Unknown);
+            let result = graph.push_op(
+                *block,
+                OpKind::Call {
+                    target,
+                    args,
+                    result_ty,
+                },
+                true,
+            );
             Ok(Lowered {
-                value: graph.push_op(
-                    *block,
-                    OpKind::Call {
-                        target,
-                        args,
-                        result_ty,
-                    },
-                    true,
-                ),
+                value: result,
                 path_closed: false,
             })
         }
@@ -12241,7 +12295,7 @@ mod tests {
     /// `#[elidable_promote] fn foo(...)` source item must produce two
     /// `SemanticFunction`s — `_orig_foo_unlikely_name` carrying the
     /// `elidable` hint, and the user-facing wrapper `foo` whose body
-    /// is `hint_promote(arg); …; _orig_foo_unlikely_name(args)`.
+    /// is `hint_promote_or_string(arg); …; _orig_foo_unlikely_name(args)`.
     /// `rlib/jit.py:191` evaluates `args[int(i)]` in
     /// `elidable_promote.decorator`, which raises `IndexError` when
     /// the literal points past the function's argument list.  Pyre
@@ -12425,21 +12479,22 @@ mod tests {
             wrapper.hints
         );
         let ops = &wrapper.graph.block(wrapper.graph.startblock).operations;
-        // jit.py:192-194 — one `hint(arg, promote=True)` per selected
-        // arg.  With promote_args="all" and two args, exactly two
-        // hint_promote calls.
+        // jit.py:192-194 — one `hint(arg, promote=True, promote_string=
+        // True)` per selected arg, which pyre's synthesiser emits as
+        // `hint_promote_or_string(arg)`.  With promote_args="all" and
+        // two args, exactly two of these calls.
         let hint_count = ops
             .iter()
             .filter(|op| {
                 matches!(
                     &op.kind,
-                    OpKind::Call { target, .. } if target.path_segments().and_then(|s| s.last().copied()) == Some("hint_promote")
+                    OpKind::Call { target, .. } if target.path_segments().and_then(|s| s.last().copied()) == Some("hint_promote_or_string")
                 )
             })
             .count();
         assert_eq!(
             hint_count, 2,
-            "wrapper must emit hint_promote per arg; ops:\n{ops:#?}"
+            "wrapper must emit hint_promote_or_string per arg; ops:\n{ops:#?}"
         );
         // jit.py:195 — tail call to the renamed original.
         assert!(
@@ -12452,13 +12507,109 @@ mod tests {
         );
     }
 
+    /// `synthesize_elidable_promote_pair` always emits the dual hint
+    /// `hint_promote_or_string`, mirroring RPython jit.py:191-194
+    /// (`hint(arg, promote=True, promote_string=True)`).  The str /
+    /// unicode / plain dispatch happens at jtransform time
+    /// (`jit_codewriter/jtransform.py:599-606`), not at synthesis
+    /// time.  This test guards against regressing to a synth-time
+    /// classifier that pre-commits the str vs unicode choice.
+    #[test]
+    fn elidable_promote_routes_str_arg_to_hint_promote_or_string() {
+        let parsed = crate::parse::parse_source(
+            r#"
+            #[elidable_promote(promote_args = "all")]
+            pub fn lookup(s: &str) -> i64 { s.len() as i64 }
+        "#,
+        );
+        let program = build_semantic_program(&parsed).expect("source must lower");
+        let wrapper = program
+            .functions
+            .iter()
+            .find(|sf| sf.name == "lookup")
+            .expect("wrapper graph");
+        let ops = &wrapper.graph.block(wrapper.graph.startblock).operations;
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call { target, .. }
+                    if target.path_segments().and_then(|s| s.last().copied()) == Some("hint_promote_or_string")
+            )),
+            "wrapper must emit hint_promote_or_string for &str arg; ops:\n{ops:#?}"
+        );
+    }
+
+    /// Byte-string-like args (`&[u8]`, `Vec<u8>`, `Box<[u8]>`) also
+    /// get the dual hint `hint_promote_or_string`.  Pyre's
+    /// `PromoteOrString` rewrite arm falls through to plain
+    /// `ref_guard_value` (`jit_codewriter/jtransform.py:603-606 else
+    /// branch + :608-614`) because pyre lacks a `Ptr(rstr.STR)` GC
+    /// layout to satisfy the `if op.args[0].concretetype ==
+    /// lltype.Ptr(rstr.STR)` test at `jtransform.py:601`.
+    #[test]
+    fn elidable_promote_routes_u8_slice_to_hint_promote_or_string() {
+        let parsed = crate::parse::parse_source(
+            r#"
+            #[elidable_promote(promote_args = "all")]
+            pub fn count_bytes(b: &[u8]) -> i64 { b.len() as i64 }
+        "#,
+        );
+        let program = build_semantic_program(&parsed).expect("source must lower");
+        let wrapper = program
+            .functions
+            .iter()
+            .find(|sf| sf.name == "count_bytes")
+            .expect("wrapper graph");
+        let ops = &wrapper.graph.block(wrapper.graph.startblock).operations;
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call { target, .. }
+                    if target.path_segments().and_then(|s| s.last().copied()) == Some("hint_promote_or_string")
+            )),
+            "wrapper must emit hint_promote_or_string for &[u8] arg; ops:\n{ops:#?}"
+        );
+    }
+
+    /// Opaque pointers (`PyObjectRef`, `*const ()` aliases, generic
+    /// `Ref`-classed types) fall through to `hint_promote_or_string`,
+    /// the rewrite-time-dispatched dual hint whose `PromoteOrString`
+    /// arm defaults to plain promote.  This matches today's
+    /// `_get_immutable_code(func: PyObjectRef)` site at
+    /// `pyre-interpreter::function.rs:344`.
+    #[test]
+    fn elidable_promote_routes_pyobject_ref_to_hint_promote_or_string() {
+        let parsed = crate::parse::parse_source(
+            r#"
+            type PyObjectRef = *const ();
+            #[elidable_promote(promote_args = "all")]
+            pub unsafe fn fetch(p: PyObjectRef) -> i64 { 0 }
+        "#,
+        );
+        let program = build_semantic_program(&parsed).expect("source must lower");
+        let wrapper = program
+            .functions
+            .iter()
+            .find(|sf| sf.name == "fetch")
+            .expect("wrapper graph");
+        let ops = &wrapper.graph.block(wrapper.graph.startblock).operations;
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call { target, .. }
+                    if target.path_segments().and_then(|s| s.last().copied()) == Some("hint_promote_or_string")
+            )),
+            "wrapper must emit hint_promote_or_string for opaque pointer arg; ops:\n{ops:#?}"
+        );
+    }
+
     /// `rlib/jit.py:186, 191` — `_get_args(func)` reads `co_varnames`
     /// raw, so `self` is at index 0 and `promote_args='all'` covers it.
     /// Pyre can't shadow `self` with `let self = ...`, so the
     /// synthesizer routes the receiver through a fresh
     /// `__self_promoted` local and rewrites the tail call accordingly.
-    /// The wrapper graph must emit one `hint_promote` per argument
-    /// including the receiver.
+    /// The wrapper graph must emit one `hint_promote_or_string` per
+    /// argument including the receiver (jit.py:192-194 dual hint).
     #[test]
     fn elidable_promote_promotes_self_receiver_for_inherent_method() {
         let parsed = crate::parse::parse_source(
@@ -12482,13 +12633,14 @@ mod tests {
             .filter(|op| {
                 matches!(
                     &op.kind,
-                    OpKind::Call { target, .. } if target.path_segments().and_then(|s| s.last().copied()) == Some("hint_promote")
+                    OpKind::Call { target, .. } if target.path_segments().and_then(|s| s.last().copied()) == Some("hint_promote_or_string")
                 )
             })
             .count();
         assert_eq!(
             hint_count, 2,
-            "wrapper must emit hint_promote for self and n (2 total); ops:\n{ops:#?}"
+            "wrapper must emit hint_promote_or_string for self and n \
+             (2 total); ops:\n{ops:#?}"
         );
     }
 

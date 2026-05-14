@@ -36,7 +36,13 @@ pub enum ConcreteType {
     Unknown,
 }
 
-/// Type resolution state: `ValueId → ConcreteType`.
+/// Type resolution state: `ValueId → ConcreteType` map.
+///
+/// Pyre's analogue of RPython's per-`Variable.concretetype`
+/// annotation — for each `ValueId`, what `lltype` low-level type
+/// the rtyper assigned (collapsed to the four-way `Signed` /
+/// `GcRef` / `Float` / `Void` axis used by the JIT codewriter, per
+/// `rpython/jit/metainterp/history.py:45-71 getkind`).
 #[derive(Debug)]
 pub struct TypeResolutionState {
     pub concrete_types: HashMap<ValueId, ConcreteType>,

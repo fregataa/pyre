@@ -529,6 +529,26 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         majit_metainterp::blackhole::cast_float_to_uint as *const (),
     );
 
+    // `_ll_2_str_eq_nonnull` (`rpython/jit/codewriter/support.py:526-
+    // 538`) is the helper canonically registered by `jtransform.py:
+    // 620-624 _register_extra_helper(OS_STREQ_NONNULL, "str.eq_nonnull",
+    // ...)` and `:637-641 _register_extra_helper(OS_UNIEQ_NONNULL,
+    // "str.eq_nonnull", ...)`.  Pyre intentionally does NOT register
+    // a host fnaddr for it: there is no `rstr.STR`-equivalent GC
+    // layout in pyre-object today, so a registration would have to
+    // point at a panic-stub that fails at runtime — a parity
+    // violation against `support.py:526-538`'s real `s.chars[i]`
+    // comparison body.
+    //
+    // Pyre's type state has no `Ptr(rstr.STR)` / `Ptr(rstr.UNICODE)`
+    // channel yet: the elidable-promote dual hint (`PromoteOrString`)
+    // falls through to the plain `<kind>_guard_value` arm, and direct
+    // `hint_promote_string` / `hint_promote_unicode` calls fail loud
+    // in `jit_codewriter/jtransform.rs`.  Re-introduce the
+    // registration here together with a line-by-line port of
+    // `_ll_2_str_eq_nonnull`'s body in `majit-metainterp::blackhole`
+    // once pyre grows the backing GC struct.
+
     entries
 }
 
@@ -579,5 +599,25 @@ mod tests {
             tuple2
         );
         assert_eq!(bindings["pyre_interpreter::jit_build_tuple_2"], tuple2);
+    }
+
+    /// Negative parity guard: pyre intentionally does NOT publish a
+    /// host fnaddr for `_ll_2_str_eq_nonnull` (see the comment block
+    /// at `jit_trace_fnaddrs` next to the `cast_float_to_uint`
+    /// registration).  A stub registration would fail at runtime
+    /// inside any guard-failure recovery; better to surface the
+    /// missing helper at codewriter time via the fail-loud
+    /// `PromoteString` / `PromoteUnicode` rewrite arms.
+    #[test]
+    fn jit_trace_fnaddrs_omits_str_eq_nonnull_helper_until_rstr_str_layout_lands() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        assert_eq!(
+            bindings.get("_ll_2_str_eq_nonnull").copied(),
+            None,
+            "no `_ll_2_str_eq_nonnull` fnaddr should be published while pyre \
+             lacks an `rstr.STR`-equivalent GC layout — registering one would \
+             point at a panic-stub that fails at runtime, contradicting \
+             `rpython/jit/codewriter/support.py:526-538`'s real comparison body"
+        );
     }
 }

@@ -1433,28 +1433,49 @@ impl<'a> Transformer<'a> {
 
     /// RPython: `getkind(v.concretetype)` — get the kind of a value.
     /// Uses type_state if available, falls back to 'r' for unknown.
+    ///
+    /// Mirrors `rpython/jit/metainterp/history.py:45-71 getkind`: GC
+    /// pointers (`TYPE.TO._gckind != 'raw'`, history.py:66-67) collapse
+    /// to `"ref"`, raw pointers (`gckind == 'raw'`, history.py:64-65)
+    /// collapse to `"int"`, primitives map to `"int"` / `"float"` /
+    /// `"void"`.  The function therefore returns ONLY one of `'i'` /
+    /// `'r'` / `'f'` / `'v'`; sub-pointer distinctions like
+    /// `Ptr(rstr.STR)` vs `Ptr(rstr.UNICODE)` are NOT folded into the
+    /// kind char.
+    ///
+    /// Pyre currently has no `Ptr(rstr.STR)` / `Ptr(rstr.UNICODE)`
+    /// concrete-type channel because pyre-object lacks those GC layouts.
+    /// Re-introducing that distinction must happen at the hint dispatch
+    /// site, mirroring upstream's explicit
+    /// `op.args[0].concretetype == lltype.Ptr(rstr.STR)` checks, not by
+    /// overloading `getkind`.
+    ///
+    /// Refining this getter to return `'s'` / `'u'` would propagate
+    /// the refinement into unrelated rewrite arms
+    /// (`ptr_eq`/`ptr_ne` synthesis at line 775 above,
+    /// `kind_char_to_name` opname formation in `assembler.rs`,
+    /// `jit.assert_green` / `jit.isconstant` / `jit.isvirtual` etc.)
+    /// where RPython expects a plain `'r'`, breaking parity at every
+    /// such call site.
     fn get_value_kind(&self, v: ValueId) -> char {
-        if let Some(ct) = self.synth_kinds.get(&v) {
-            return match ct {
-                crate::jit_codewriter::type_state::ConcreteType::Signed => 'i',
-                crate::jit_codewriter::type_state::ConcreteType::GcRef => 'r',
-                crate::jit_codewriter::type_state::ConcreteType::Float => 'f',
-                crate::jit_codewriter::type_state::ConcreteType::Void => 'v',
-                crate::jit_codewriter::type_state::ConcreteType::Unknown => 'r',
-            };
-        }
-        if let Some(ts) = self.type_state {
+        let base = if let Some(ct) = self.synth_kinds.get(&v) {
+            ct
+        } else if let Some(ts) = self.type_state {
             if let Some(ct) = ts.concrete_types.get(&v) {
-                return match ct {
-                    crate::jit_codewriter::type_state::ConcreteType::Signed => 'i',
-                    crate::jit_codewriter::type_state::ConcreteType::GcRef => 'r',
-                    crate::jit_codewriter::type_state::ConcreteType::Float => 'f',
-                    crate::jit_codewriter::type_state::ConcreteType::Void => 'v',
-                    crate::jit_codewriter::type_state::ConcreteType::Unknown => 'r',
-                };
+                ct
+            } else {
+                &crate::jit_codewriter::type_state::ConcreteType::Unknown
             }
+        } else {
+            &crate::jit_codewriter::type_state::ConcreteType::Unknown
+        };
+        match base {
+            crate::jit_codewriter::type_state::ConcreteType::Signed => 'i',
+            crate::jit_codewriter::type_state::ConcreteType::GcRef => 'r',
+            crate::jit_codewriter::type_state::ConcreteType::Float => 'f',
+            crate::jit_codewriter::type_state::ConcreteType::Void => 'v',
+            crate::jit_codewriter::type_state::ConcreteType::Unknown => 'r',
         }
-        'r' // default: ref (most Python values are GC refs)
     }
 
     fn get_value_type(&self, v: ValueId) -> Option<ValueType> {
@@ -1638,59 +1659,67 @@ impl<'a> Transformer<'a> {
                 // `rpython/jit/codewriter/jtransform.py:615-631 promote_string`:
                 //     S = lltype.Ptr(rstr.STR)
                 //     assert op.args[0].concretetype == S
-                //     self._register_extra_helper(OS_STREQ_NONNULL,
-                //         "str.eq_nonnull", [S, S], lltype.Signed,
-                //         EF_ELIDABLE_CANNOT_RAISE)
-                //     descr, p = callinfocollection.callinfo_for_oopspec(
-                //         OS_STREQ_NONNULL)
-                //     c = Constant(p.adr.ptr, lltype.typeOf(p.adr.ptr))
-                //     op1 = SpaceOperation('str_guard_value',
-                //         [op.args[0], c, descr], op.result)
-                //     return [SpaceOperation('-live-', [], None), op1, None]
+                //     ...register OS_STREQ_NONNULL + emit str_guard_value...
                 //
-                // The upstream op shape is 3-input/1-output (`rid>r`):
-                // ref arg + helper fnptr constant + calldescr → result.
-                // Pyre's IR currently lacks the helper/descr extras on
-                // `GuardValue` and `_register_extra_helper` has not been
-                // ported (`OS_STREQ_NONNULL` is registered in
-                // `majit-ir::OopSpecIndex` but `callinfocollection.add`
-                // is never invoked for it), so producing the correct
-                // bytecode is not yet possible.  Emitting a 1-input
-                // `str_guard_value/r` op instead would silently
-                // disagree with the BH wire `str_guard_value/rid>r`
-                // and panic at assembly-time opname lookup.
+                // Pyre cannot satisfy `concretetype == Ptr(rstr.STR)`
+                // because pyre-object has no `rstr.STR`-equivalent GC
+                // struct (`rpython/rtyper/lltypesystem/rstr.py:1226-1237
+                // STR.become({hash, chars: Array(Char)})`).  Fail loud
+                // — same shape as upstream's `assert` failure — until
+                // the layout is ported and the helper body
+                // (`rpython/jit/codewriter/support.py:526-538
+                // _ll_2_str_eq_nonnull`) lands.
                 panic!(
-                    "rewrite_op_hint(promote_string=True) for `{target}`: \
-                     the str_guard_value emit chain is not yet wired in \
-                     pyre.  TODO: (1) extend `OpKind::GuardValue` with \
-                     optional `helper_fnptr_const` + `descr` fields per \
-                     jtransform.py:631 op shape; (2) port \
-                     `jtransform.py:2010-2029 _register_extra_helper` so \
-                     `callinfocollection.callinfo_for_oopspec(\
-                     OS_STREQ_NONNULL)` resolves at rewrite time; (3) \
-                     teach `assembler.rs::encode_op` an explicit \
-                     `OpKind::GuardValue` arm that emits the `rid>r` \
-                     argcode."
+                    "hint_promote_string reached `{target}` in `{graph_name}` \
+                     but pyre-object has no `rstr.STR`-equivalent GC \
+                     layout to satisfy `jtransform.py:619 assert \
+                     op.args[0].concretetype == lltype.Ptr(rstr.STR)`. \
+                     Port `rstr.py:1226-1237 STR` into pyre-object and \
+                     `support.py:526-538 _ll_2_str_eq_nonnull` into \
+                     `majit-metainterp::blackhole` before re-enabling \
+                     this rewrite arm."
                 )
             }
             crate::hints::VirtualizableHintKind::PromoteUnicode => {
-                // `rpython/jit/codewriter/jtransform.py:632-648 promote_unicode`
-                // emits the same `str_guard_value` opname as
-                // promote_string (jit.py:647); the
-                // `OS_UNIEQ_NONNULL` oopspec carries the unicode
-                // helper.  Same TODO chain as the PromoteString arm
-                // above — without `_register_extra_helper` /
-                // `callinfo_for_oopspec` we cannot produce the
-                // upstream-shaped 3-input op.
+                // `rpython/jit/codewriter/jtransform.py:632-648 promote_unicode`:
+                //     U = lltype.Ptr(rstr.UNICODE)
+                //     assert op.args[0].concretetype == U
+                //     ...register OS_UNIEQ_NONNULL + emit str_guard_value...
+                //
+                // Same parity blocker as `PromoteString`: pyre-object
+                // has no `rstr.UNICODE`-equivalent GC struct
+                // (`rpython/rtyper/lltypesystem/rstr.py:1238-1246
+                // UNICODE.become({hash, chars: Array(UniChar)})`).
                 panic!(
-                    "rewrite_op_hint(promote_unicode=True) for `{target}`: \
-                     the str_guard_value emit chain is not yet wired in \
-                     pyre.  TODO: same prerequisites as promote_string — \
-                     `OpKind::GuardValue` helper/descr extras, \
-                     `_register_extra_helper(OS_UNIEQ_NONNULL, \
-                     \"unicode.eq_nonnull\", ...)` port, and an explicit \
-                     `assembler.rs::encode_op` arm for the `rid>r` argcode."
+                    "hint_promote_unicode reached `{target}` in `{graph_name}` \
+                     but pyre-object has no `rstr.UNICODE`-equivalent \
+                     GC layout to satisfy `jtransform.py:636 assert \
+                     op.args[0].concretetype == lltype.Ptr(rstr.UNICODE)`."
                 )
+            }
+            crate::hints::VirtualizableHintKind::PromoteOrString => {
+                // `rpython/jit/codewriter/jtransform.py:599-606` —
+                // when a `hint(arg, ...)` carries both `promote=True`
+                // and `promote_string=True`, jtransform discards one
+                // based on `op.args[0].concretetype`:
+                //
+                //     if hints.get('promote_string') and hints.get('promote'):
+                //         hints = hints.copy()
+                //         if op.args[0].concretetype == lltype.Ptr(rstr.STR):
+                //             del hints['promote']
+                //         else:
+                //             del hints['promote_string']
+                //
+                // Pyre has no `Ptr(rstr.STR)` layout (see
+                // `PromoteString` arm above), so the upstream `if`
+                // branch is structurally unreachable — every dual-flag
+                // hint takes the `else` branch
+                // (`del hints['promote_string']`) and falls through
+                // to the plain `promote` arm, emitting
+                // `<kind>_guard_value` per `jit.py:608-614` +
+                // `getkind(Ptr) == "ref"` (`rpython/jit/metainterp/
+                // history.py:64`).
+                self.rewrite_op_hint_guard_value_family(op, target, args, graph_name)
             }
         }
     }
@@ -1728,6 +1757,14 @@ impl<'a> Transformer<'a> {
         if kind_char == 'v' {
             return RewriteResult::Keep;
         }
+        // jtransform.py:609 `assert op.args[0].concretetype !=
+        // lltype.Ptr(rstr.STR)` — pyre has no `Ptr(rstr.STR)` GC
+        // layout (`rpython/rtyper/lltypesystem/rstr.py:1226-1237`), so the
+        // upstream assertion is structurally satisfied by absence: no
+        // pyre value can carry that concretetype, hence no `Ptr(STR)`
+        // operand can reach this arm.  Re-introduce the assertion
+        // once pyre-object grows the layout and the `PromoteString` /
+        // `PromoteUnicode` arms can satisfy their upstream asserts.
         if let Some(result) = op.result {
             self.aliases.insert(result, base);
         }
@@ -5354,7 +5391,9 @@ mod tests {
         assert_eq!(ops.len(), 3, "got {ops:?}");
         assert!(matches!(ops[0].kind, OpKind::Live));
         match &ops[1].kind {
-            OpKind::GuardValue { value, kind_char } => {
+            OpKind::GuardValue {
+                value, kind_char, ..
+            } => {
                 assert_eq!(*value, v, "guard target must remain the input arg");
                 assert_eq!(*kind_char, 'r', "default kind without type-state");
             }
@@ -5368,57 +5407,6 @@ mod tests {
             }
             other => panic!("expected FieldRead, got {other:?}"),
         }
-    }
-
-    /// `rpython/jit/codewriter/jtransform.py:615-631 promote_string`
-    /// emits a 3-input `str_guard_value/rid>r` op (ref arg + helper
-    /// fnptr const + calldescr → result).  Pyre's `GuardValue`
-    /// variant does not yet carry the helper+descr extras and
-    /// `_register_extra_helper` (jit.py:2010-2029) is not ported, so
-    /// the rewrite arm panics with a TODO citation rather than
-    /// silently emitting a malformed 1-input shape.
-    #[test]
-    #[should_panic(expected = "str_guard_value emit chain is not yet wired")]
-    fn rewrite_graph_panics_on_hint_promote_string_until_helper_chain_lands() {
-        let mut graph = FunctionGraph::new("demo");
-        let v = graph.alloc_value();
-        graph.block_mut(graph.startblock).inputargs.push(v);
-        graph.push_op(
-            graph.startblock,
-            OpKind::Call {
-                target: CallTarget::function_path(["hint_promote_string"]),
-                args: vec![v],
-                result_ty: ValueType::Ref,
-            },
-            false,
-        );
-        graph.set_return(graph.startblock, None);
-        let _ = rewrite_graph(&graph, &GraphTransformConfig::default());
-    }
-
-    /// `rpython/jit/codewriter/jtransform.py:632-648 promote_unicode`
-    /// has the same 3-input `str_guard_value/rid>r` op shape as
-    /// promote_string; the unicode helper is wired via
-    /// `OS_UNIEQ_NONNULL` rather than `OS_STREQ_NONNULL`.  Same TODO
-    /// prerequisites — fail-loud until the IR + helper-registration
-    /// chain is complete.
-    #[test]
-    #[should_panic(expected = "str_guard_value emit chain is not yet wired")]
-    fn rewrite_graph_panics_on_hint_promote_unicode_until_helper_chain_lands() {
-        let mut graph = FunctionGraph::new("demo");
-        let v = graph.alloc_value();
-        graph.block_mut(graph.startblock).inputargs.push(v);
-        graph.push_op(
-            graph.startblock,
-            OpKind::Call {
-                target: CallTarget::function_path(["hint_promote_unicode"]),
-                args: vec![v],
-                result_ty: ValueType::Ref,
-            },
-            false,
-        );
-        graph.set_return(graph.startblock, None);
-        let _ = rewrite_graph(&graph, &GraphTransformConfig::default());
     }
 
     /// `jtransform.py:608` voidness guard — `if hints.get('promote')
@@ -5695,7 +5683,9 @@ mod tests {
                 "slot {i} should start with Live"
             );
             match &ops[i * 2 + 1].kind {
-                OpKind::GuardValue { value, kind_char } => {
+                OpKind::GuardValue {
+                    value, kind_char, ..
+                } => {
                     assert_eq!(*value, greens[i]);
                     assert_eq!(*kind_char, 'r');
                 }
@@ -5803,7 +5793,9 @@ mod tests {
         // promote_greens prefix: -live-, int_guard_value(g1), -live-, int_guard_value(g2)
         assert!(matches!(ops[0].kind, OpKind::Live));
         match &ops[1].kind {
-            OpKind::GuardValue { value, kind_char } => {
+            OpKind::GuardValue {
+                value, kind_char, ..
+            } => {
                 assert_eq!(*value, g1);
                 assert_eq!(*kind_char, 'i');
             }
@@ -5811,7 +5803,9 @@ mod tests {
         }
         assert!(matches!(ops[2].kind, OpKind::Live));
         match &ops[3].kind {
-            OpKind::GuardValue { value, kind_char } => {
+            OpKind::GuardValue {
+                value, kind_char, ..
+            } => {
                 assert_eq!(*value, g2);
                 assert_eq!(*kind_char, 'i');
             }
@@ -6673,5 +6667,85 @@ mod tests {
             (1, 1, 1),
             'v',
         );
+    }
+
+    /// `rpython/jit/codewriter/jtransform.py:599-606` — when a
+    /// `hint(arg, promote=True, promote_string=True)` carries both
+    /// flags, the rewrite drops one based on whether the arg's
+    /// `concretetype` is `Ptr(STR)`.  Pyre's `value_kind` is too
+    /// coarse to make that distinction (every pointer maps to `'r'`),
+    /// so `PromoteOrString` defaults to the plain `<kind>_guard_value`
+    /// path — `ref_guard_value` is safe for every Ref, including
+    /// non-string pointers.  Users who need the value-equality
+    /// `str_guard_value` shape invoke `hint_promote_string(x)`
+    /// explicitly.
+    #[test]
+    fn rewrite_graph_promote_or_string_picks_ref_guard_value_for_ref_arg() {
+        let mut graph = FunctionGraph::new("demo");
+        let v = graph.alloc_value();
+        graph.block_mut(graph.startblock).inputargs.push(v);
+        graph.push_op(
+            graph.startblock,
+            OpKind::Call {
+                target: CallTarget::function_path(["hint_promote_or_string"]),
+                args: vec![v],
+                result_ty: ValueType::Ref,
+            },
+            false,
+        );
+        graph.set_return(graph.startblock, None);
+
+        let result = rewrite_graph(&graph, &GraphTransformConfig::default());
+        let ops = &result.graph.block(graph.startblock).operations;
+        assert_eq!(ops.len(), 2);
+        assert!(matches!(ops[0].kind, OpKind::Live));
+        match &ops[1].kind {
+            OpKind::GuardValue { kind_char, .. } => {
+                assert_eq!(
+                    *kind_char, 'r',
+                    "Ref arg must default to ref_guard_value (no Ptr(STR) info)"
+                );
+            }
+            other => panic!("expected GuardValue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rewrite_graph_promote_or_string_picks_int_guard_value_for_int_arg() {
+        let mut graph = FunctionGraph::new("demo");
+        let v = graph.alloc_value();
+        graph.block_mut(graph.startblock).inputargs.push(v);
+        graph.push_op(
+            graph.startblock,
+            OpKind::Call {
+                target: CallTarget::function_path(["hint_promote_or_string"]),
+                args: vec![v],
+                result_ty: ValueType::Int,
+            },
+            false,
+        );
+        graph.set_return(graph.startblock, None);
+
+        // value_kind defaults to 'r' without an entry in type_state;
+        // seed `v` as `Signed` so the dual-hint arm sees an Int arg
+        // and routes through the plain `<kind>_guard_value` path
+        // instead of the str_guard_value helper chain.
+        let mut ts = TypeResolutionState::new();
+        ts.concrete_types.insert(v, ConcreteType::Signed);
+        let config = GraphTransformConfig::default();
+        let result = Transformer::new(&config)
+            .with_type_state(&ts)
+            .transform(&graph);
+        let ops = &result.graph.block(graph.startblock).operations;
+        assert!(matches!(ops[0].kind, OpKind::Live));
+        match &ops[1].kind {
+            OpKind::GuardValue { kind_char, .. } => {
+                assert_eq!(
+                    *kind_char, 'i',
+                    "Int arg must route through the int_guard_value path"
+                );
+            }
+            other => panic!("expected GuardValue, got {other:?}"),
+        }
     }
 }

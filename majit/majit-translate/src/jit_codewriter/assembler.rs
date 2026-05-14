@@ -2945,19 +2945,11 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
             // `int_guard_value` / `ref_guard_value` / `float_guard_value`
             // depending on the `getkind()` of the guarded arg.
             //
-            // RPython upstream also emits `str_guard_value` for
-            // `promote_string` (jit.py:631) and `promote_unicode`
-            // (jit.py:647), but that op has a 3-input `rid>r` shape
-            // (ref + helper fnptr const + calldescr) that pyre's
-            // `GuardValue` variant does not yet carry; the upstream
-            // chain depends on `_register_extra_helper` (jit.py:
-            // 2010-2029) populating `callinfo_for_oopspec`
-            // (`OS_STREQ_NONNULL` / `OS_UNIEQ_NONNULL`).  Until that
-            // chain lands, the rewrite arms in
-            // `jtransform.rs::rewrite_op_hint` panic when they would
-            // have produced a `kind_char ∈ {'s', 'u'}` `GuardValue`,
-            // so no such variant can reach the assembler.  The match
-            // arm below treats those chars as a bug.
+            // RPython also emits `str_guard_value` for `promote_string`
+            // (jit.py:631) / `promote_unicode` (jit.py:647), but pyre
+            // panics in those rewrite arms (pyre-object lacks an
+            // `rstr.STR` / `rstr.UNICODE` GC layout) so `kind_char` is
+            // always one of `'i'` / `'r'` / `'f'` here.
             format!("{}_guard_value", kind_char_to_name(*kind_char))
         }
         // RPython: getfield_vable_i, getfield_vable_r, getfield_vable_f
@@ -4235,5 +4227,32 @@ mod tests {
 
         let mut asm = Assembler::new();
         let _ = asm.assemble(&mut flat, &regallocs);
+    }
+
+    /// `rpython/jit/codewriter/jtransform.py:611` —
+    /// `<kind>_guard_value` family opname mapping:
+    ///   * `'i'` → `int_guard_value`
+    ///   * `'r'` → `ref_guard_value`
+    ///   * `'f'` → `float_guard_value`
+    ///
+    /// Pyre does not exercise the `str_guard_value` mapping
+    /// (`jtransform.py:631 promote_string` / `:647 promote_unicode`)
+    /// because the `PromoteString` / `PromoteUnicode` rewrite arms
+    /// panic before emitting — pyre-object has no `rstr.STR` /
+    /// `rstr.UNICODE` GC layout (`rpython/rtyper/lltypesystem/
+    /// rstr.py:1226-1246`).
+    #[test]
+    fn op_kind_to_opname_routes_guard_value_kind_chars() {
+        use crate::model::{OpKind, ValueId};
+        let value = ValueId(0);
+        let opnames = ['i', 'r', 'f'].map(|kc| {
+            op_kind_to_opname(&OpKind::GuardValue {
+                value,
+                kind_char: kc,
+            })
+        });
+        assert_eq!(opnames[0], "int_guard_value");
+        assert_eq!(opnames[1], "ref_guard_value");
+        assert_eq!(opnames[2], "float_guard_value");
     }
 }

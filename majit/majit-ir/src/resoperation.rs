@@ -293,11 +293,15 @@ impl OpRef {
 ///    every concrete ResOp subclass picks up its `type` attribute via
 ///    one of these three mixins.
 ///
-/// In pyre, [`OpRef`] carries only a numeric handle (CONST_BIT-encoded
-/// for constants, `pos` for inputargs and op results) and the type lives
-/// in side tables (`OptContext::value_types`, the constant pool, op
-/// result types). `AbstractValue` is the Rust analogue of an
-/// instantiated RPython value: `type` is intrinsic to the variant.
+/// In pyre, [`OpRef`] is the typed-variant model — each variant
+/// (`ConstInt` / `ConstFloat` / `ConstPtr` / `InputArgInt` /
+/// `InputArgFloat` / `InputArgRef` / `IntOp` / `FloatOp` / `RefOp` /
+/// `VoidOp`) encodes the RPython class's `type` attribute, so an
+/// `OpRef::IntOp(5)` and an `OpRef::RefOp(5)` are distinct identities
+/// even when their `raw()` payload matches.  `AbstractValue` is the
+/// Rust analogue of an instantiated RPython value: `type` is
+/// intrinsic to the variant, matching the class-level `type` attribute
+/// upstream.
 ///
 /// The `None` variant is a Rust adaptation for missing/sentinel
 /// references; in RPython missing values are Python `None` or absent

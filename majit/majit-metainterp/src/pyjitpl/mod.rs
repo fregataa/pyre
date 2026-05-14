@@ -12136,24 +12136,38 @@ impl<M: Clone> MetaInterp<M> {
     ///     self.history.record2(rop.VIRTUAL_REF_FINISH, vrefbox, virtualbox, None)
     ///     self.virtualref_boxes[i+1] = CONST_NULL
     /// ```
+    /// `rpython/jit/metainterp/pyjitpl.py:3395-3402`:
+    ///
+    /// ```python
+    /// def stop_tracking_virtualref(self, i):
+    ///     virtualbox = self.virtualref_boxes[i]
+    ///     vrefbox = self.virtualref_boxes[i+1]
+    ///     # record VIRTUAL_REF_FINISH here, which is before the actual
+    ///     # CALL_xxx is recorded
+    ///     self.history.record2(rop.VIRTUAL_REF_FINISH, vrefbox, virtualbox, None)
+    ///     # mark this situation by replacing the vrefbox with ConstPtr(NULL)
+    ///     self.virtualref_boxes[i+1] = CONST_NULL
+    /// ```
+    ///
+    /// Upstream callers iterate `range(0, len(virtualref_boxes), 2)`
+    /// (`pyjitpl.py:3362 vrefs_after_residual_call`), so the (i, i+1)
+    /// pair is always in range — no bounds guard exists upstream, and
+    /// none is added here.  An invariant violation will panic on
+    /// indexing, matching upstream's `IndexError`.
     pub fn stop_tracking_virtualref(&mut self, i: usize) {
-        if i + 1 >= self.virtualref_boxes.len() {
-            return;
-        }
         let virtualbox = self.virtualref_boxes[i].0;
         let vrefbox = self.virtualref_boxes[i + 1].0;
-        // pyjitpl.py:3381-3387: this function is only reachable during
-        // tracing (called from vrefs_after_residual_call / vable_after_
-        // residual_call, both predicated on an active trace).
+        // history.record2(rop.VIRTUAL_REF_FINISH, vrefbox, virtualbox, None)
+        // — upstream always records: `vrefs_after_residual_call` is only
+        // entered during an active trace.
         let ctx = self
             .tracing
             .as_mut()
             .expect("stop_tracking_virtualref called outside an active trace");
         ctx.record_op(OpCode::VirtualRefFinish, &[vrefbox, virtualbox]);
-        // pyjitpl.py:3378 `self.virtualref_boxes[i+1] = CONST_NULL`
-        // — ref-typed null preserves the slot's Ref type so subsequent
-        // fail-arg type recovery and ref-typed guard processing match
-        // upstream (history.py:361 `CONST_NULL = ConstPtr(ConstPtr.value)`).
+        // `self.virtualref_boxes[i+1] = CONST_NULL` (pyjitpl.py:3402)
+        // — ref-typed null per `history.py:361 CONST_NULL =
+        // ConstPtr(ConstPtr.value)`.
         let null_const = ctx.const_null();
         self.virtualref_boxes[i + 1] = (null_const, 0);
     }

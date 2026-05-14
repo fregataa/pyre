@@ -482,9 +482,9 @@ fn converge_raise_link(
             link_arg_concrete_type(state, src)
         };
         changed |= maybe_seed_concrete_type(state, *dst, src_ty);
-        if let LinkArg::Value(src) = src {
+        if let LinkArg::Value(src_vid) = src {
             let dst_ty = state.get(*dst).clone();
-            changed |= maybe_seed_concrete_type(state, *src, dst_ty);
+            changed |= maybe_seed_concrete_type(state, *src_vid, dst_ty);
         }
     }
     changed
