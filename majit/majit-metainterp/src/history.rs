@@ -2417,14 +2417,13 @@ impl TraceCtx {
         let descr = crate::call_descr::make_call_descr_for_opcode(opcode, arg_types, ret_type);
         let mut call_args = vec![func_ref];
         call_args.extend_from_slice(args);
-        let result = self
-            .recorder
-            .record_op_with_descr(opcode, &call_args, descr.clone());
-        // pyjitpl.py:2659 `_record_helper_varargs` parity: route every
-        // CALL family record through `heapcache.invalidate_caches_varargs`
-        // so the elidable / loopinvariant / arraycopy / arraymove
-        // fast-paths inside `clear_caches_varargs` (heapcache.py:341-376)
-        // run exactly once per call. The previous escape-only path
+        // pyjitpl.py:2683-2684 `_record_helper_varargs` parity:
+        // `heapcache.invalidate_caches_varargs(...)` runs BEFORE
+        // `self.history.record(...)`.  Routes every CALL family record
+        // through `invalidate_caches_varargs` so the elidable /
+        // loopinvariant / arraycopy / arraymove fast-paths inside
+        // `clear_caches_varargs` (heapcache.py:341-376) run exactly once
+        // per call.  The previous escape-only path
         // (`_escape_argboxes + invalidate_caches_for_escaped`) skipped
         // those branches.
         if let Some(call_descr) = descr.as_call_descr() {
@@ -2443,7 +2442,8 @@ impl TraceCtx {
                 const_value,
             );
         }
-        result
+        self.recorder
+            .record_op_with_descr(opcode, &call_args, descr.clone())
     }
 
     pub fn call_void_typed(&mut self, func_ptr: *const (), args: &[OpRef], arg_types: &[Type]) {
@@ -2471,11 +2471,8 @@ impl TraceCtx {
             crate::call_descr::make_call_descr_with_effect(arg_types, ret_type, effect_info);
         let mut call_args = vec![func_ref];
         call_args.extend_from_slice(args);
-        let result = self
-            .recorder
-            .record_op_with_descr(opcode, &call_args, descr.clone());
-        // pyjitpl.py:2659 `_record_helper_varargs` parity (see
-        // `call_typed` for the full rationale).
+        // pyjitpl.py:2683-2684 `_record_helper_varargs` parity (see
+        // `call_typed` for the full rationale): invalidate before record.
         if let Some(call_descr) = descr.as_call_descr() {
             self.constants.refresh_from_gc();
             let constants = &self.constants;
@@ -2492,7 +2489,8 @@ impl TraceCtx {
                 const_value,
             );
         }
-        result
+        self.recorder
+            .record_op_with_descr(opcode, &call_args, descr.clone())
     }
 
     pub fn call_void_typed_with_effect(
@@ -2565,11 +2563,8 @@ impl TraceCtx {
         );
         // pyjitpl.py:1943: patch_pos = self.metainterp.history.get_trace_position()
         let patch_pos = self.get_trace_position();
-        // pyjitpl.py:1944-1945: op = execute_and_record_varargs(opnum, ...)
-        let op = self
-            .recorder
-            .record_op_with_descr(opcode, &call_args, descr.clone());
-        // pyjitpl.py:2659 _record_helper_varargs heap invalidation parity.
+        // pyjitpl.py:2683-2684 _record_helper_varargs heap invalidation parity:
+        // invalidate before record.
         if let Some(call_descr) = descr.as_call_descr() {
             self.constants.refresh_from_gc();
             let constants = &self.constants;
@@ -2586,6 +2581,10 @@ impl TraceCtx {
                 const_value,
             );
         }
+        // pyjitpl.py:1944-1945: op = execute_and_record_varargs(opnum, ...)
+        let op = self
+            .recorder
+            .record_op_with_descr(opcode, &call_args, descr.clone());
         // pyjitpl.py:1947-1948: record_result_of_call_pure patches CALL → CALL_PURE
         // and populates call_pure_results.
         self.record_result_of_call_pure(
@@ -2964,14 +2963,18 @@ impl TraceCtx {
         let descr = make_call_may_force_descr(arg_types, ret_type);
         let mut call_args = vec![func_ref];
         call_args.extend_from_slice(args);
+        // pyjitpl.py:2053-2072 `do_residual_call` may-force branch:
+        // `direct_call_may_force` (line 2067) RECORDS first, then
+        // `heapcache.invalidate_caches_varargs(opnum1, descr, allboxes)`
+        // runs at line 2072 "based on the CALL_MAY_FORCE operation
+        // executed above in step 2".  This is the inverse of
+        // `_record_helper_varargs`'s invalidate-before-record (line
+        // 2683-2684); CALL_MAY_FORCE_* / CALL_RELEASE_GIL_* /
+        // CALL_ASSEMBLER_* go through this branch and must keep the
+        // record-then-invalidate order.
         let result = self
             .recorder
             .record_op_with_descr(opcode, &call_args, descr.clone());
-        // pyjitpl.py:2070-2072 `do_residual_call` may-force branch:
-        // `self.metainterp.heapcache.invalidate_caches_varargs(opnum1,
-        // descr, allboxes)` after recording the may-force op. The
-        // canonical helper marks args escaped and runs the heap-array
-        // invalidation arm in one pass (heapcache.py:341-376).
         if let Some(call_descr) = descr.as_call_descr() {
             self.constants.refresh_from_gc();
             let constants = &self.constants;
@@ -3027,10 +3030,11 @@ impl TraceCtx {
             crate::call_descr::make_call_descr_with_effect(arg_types, ret_type, effect_info);
         let mut call_args = vec![func_ref];
         call_args.extend_from_slice(args);
+        // pyjitpl.py:2053-2072 (see `call_family_typed` for rationale):
+        // record before invalidate.
         let result = self
             .recorder
             .record_op_with_descr(opcode, &call_args, descr.clone());
-        // pyjitpl.py:2070-2072 (see `call_family_typed` for rationale).
         if let Some(call_descr) = descr.as_call_descr() {
             self.constants.refresh_from_gc();
             let constants = &self.constants;
@@ -3183,14 +3187,16 @@ impl TraceCtx {
         call_args.push(savebox);
         call_args.push(funcbox);
         call_args.extend_from_slice(args);
+        // pyjitpl.py:2053-2072 `do_residual_call` release-gil branch:
+        // `direct_call_release_gil` (line 2064) records first, then
+        // `heapcache.invalidate_caches_varargs(opnum1, descr, allboxes)`
+        // runs at line 2072 with `opnum1 = CALL_MAY_FORCE_<tp>` from
+        // step 2 (line 2024/2029/2034/2039), NOT the CALL_RELEASE_GIL_*
+        // opnum of the recorded op.  Match upstream by passing the
+        // result-typed CALL_MAY_FORCE_* opnum to the invalidation call.
         let result = self
             .recorder
             .record_op_with_descr(opcode, &call_args, descr.clone());
-        // heapcache.py:341-376 clear_caches_varargs: release-gil falls
-        // through to `reset_keep_likely_virtuals`, the most aggressive
-        // arm. Pass the descr's effectinfo so the elidable / arraycopy /
-        // arraymove fast-paths are honoured if a future descr
-        // classification activates them.
         if let Some(call_descr) = descr.as_call_descr() {
             self.constants.refresh_from_gc();
             let constants = &self.constants;
@@ -3200,7 +3206,7 @@ impl TraceCtx {
                 _ => None,
             };
             self.heap_cache.invalidate_caches_varargs(
-                opcode,
+                OpCode::call_may_force_for_type(ret_type),
                 Some(call_descr.get_extra_info()),
                 &call_args,
                 oracle,
@@ -3240,12 +3246,10 @@ impl TraceCtx {
         let arg0_int = func_ptr as usize as i64;
         let mut call_args = vec![func_ref];
         call_args.extend_from_slice(args);
-        let _ = self
-            .recorder
-            .record_op_with_descr(opcode, &call_args, descr.clone());
-        // pyjitpl.py:2659 `_record_helper_varargs` parity (see
+        // pyjitpl.py:2683-2684 `_record_helper_varargs` parity (see
         // `call_typed`): every CALL family record routes through the
-        // canonical heap_cache.invalidate_caches_varargs.
+        // canonical heap_cache.invalidate_caches_varargs BEFORE the
+        // history record.
         if let Some(call_descr) = descr.as_call_descr() {
             self.constants.refresh_from_gc();
             let constants = &self.constants;
@@ -3262,6 +3266,9 @@ impl TraceCtx {
                 const_value,
             );
         }
+        let _ = self
+            .recorder
+            .record_op_with_descr(opcode, &call_args, descr.clone());
         // pyjitpl.py:2109 `call_loopinvariant_now_known(allboxes, descr, res)`
         // with `res = None` for void.  Evicts any prior typed entry sharing
         // this (descr, arg0) key so subsequent typed loop-invariant lookups
@@ -3490,14 +3497,11 @@ impl TraceCtx {
         }
         let mut call_args = vec![func_ref];
         call_args.extend_from_slice(args);
-        let result = self
-            .recorder
-            .record_op_with_descr(opcode, &call_args, descr.clone());
-        // pyjitpl.py:2659 `_record_helper_varargs` parity (mirror
+        // pyjitpl.py:2683-2684 `_record_helper_varargs` parity (mirror
         // `call_typed` at trace_ctx.rs:3083). Routes
-        // heapcache.invalidate_caches_varargs through the recorded
-        // CALL_LOOPINVARIANT_* so escape / clear_caches_varargs paths
-        // run exactly once per recorded op (heapcache.py:211).
+        // heapcache.invalidate_caches_varargs BEFORE the history record
+        // for the CALL_LOOPINVARIANT_* op so escape / clear_caches_varargs
+        // paths run exactly once per recorded op (heapcache.py:211).
         if let Some(call_descr) = descr.as_call_descr() {
             self.constants.refresh_from_gc();
             let constants = &self.constants;
@@ -3514,6 +3518,9 @@ impl TraceCtx {
                 const_value,
             );
         }
+        let result = self
+            .recorder
+            .record_op_with_descr(opcode, &call_args, descr.clone());
         // Concrete resvalue is unknown to this legacy helper; pass 0.
         self.heap_cache
             .call_loopinvariant_cache(descr_index, arg0_int, result, 0);
@@ -3732,16 +3739,11 @@ impl TraceCtx {
         }
         let mut call_args = vec![func_ref];
         call_args.extend_from_slice(args);
-        let result = self
-            .recorder
-            .record_op_with_descr(opcode, &call_args, descr.clone());
-        // pyjitpl.py:2659 `_record_helper_varargs` parity (mirror
+        // pyjitpl.py:2683-2684 `_record_helper_varargs` parity (mirror
         // `call_typed_with_effect` at trace_ctx.rs:3122). Routes
-        // heapcache.invalidate_caches_varargs through the recorded
-        // CALL_LOOPINVARIANT_* so escape / clear_caches_varargs paths
-        // run exactly once per recorded op — without this, the
-        // loop-invariant helper's record skipped mark_escaped_varargs
-        // (heapcache.py:211).
+        // heapcache.invalidate_caches_varargs BEFORE the history record
+        // of the CALL_LOOPINVARIANT_* op so escape / clear_caches_varargs
+        // paths run exactly once per recorded op (heapcache.py:211).
         if let Some(call_descr) = descr.as_call_descr() {
             self.constants.refresh_from_gc();
             let constants = &self.constants;
@@ -3758,6 +3760,9 @@ impl TraceCtx {
                 const_value,
             );
         }
+        let result = self
+            .recorder
+            .record_op_with_descr(opcode, &call_args, descr.clone());
         // pyjitpl.py:2109 call_loopinvariant_now_known(allboxes, descr, res):
         // store the concrete result so the next iteration's
         // `call_loopinvariant_known_result` returns it without re-executing
@@ -3810,12 +3815,14 @@ impl TraceCtx {
                 .and_then(JitDriverStaticData::virtualizable_arg_index),
         );
         let opcode = OpCode::call_assembler_for_type(result_type);
+        // pyjitpl.py:2053-2072 `do_residual_call` assembler-call branch:
+        // `direct_assembler_call` (line 2054) records first, then
+        // `heapcache.invalidate_caches_varargs(opnum1, descr, allboxes)`
+        // runs at line 2072 with `opnum1 = CALL_MAY_FORCE_<tp>` from
+        // step 2 (line 2024/2029/2034/2039), NOT the CALL_ASSEMBLER_*
+        // opnum of the recorded op.  Match upstream by passing the
+        // result-typed CALL_MAY_FORCE_* opnum to the invalidation call.
         let result = self.record_op_with_descr(opcode, args, descr);
-        // pyjitpl.py:2072 heapcache.invalidate_caches_varargs(opnum1, descr,
-        // allboxes).  RPython uses CALL_MAY_FORCE_* as the opnum for
-        // invalidation, but CALL_ASSEMBLER_* falls through to
-        // reset_keep_likely_virtuals in heapcache.py:372-376 — same path as
-        // CALL_MAY_FORCE_*.
         self.constants.refresh_from_gc();
         let constants = &self.constants;
         let oracle: &dyn majit_trace::heapcache::SameConstantOracle = constants;
@@ -3823,8 +3830,13 @@ impl TraceCtx {
             Some(majit_ir::Value::Int(n)) => Some(n),
             _ => None,
         };
-        self.heap_cache
-            .invalidate_caches_varargs(opcode, None, args, oracle, const_value);
+        self.heap_cache.invalidate_caches_varargs(
+            OpCode::call_may_force_for_type(result_type),
+            None,
+            args,
+            oracle,
+            const_value,
+        );
         result
     }
 

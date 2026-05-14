@@ -210,23 +210,21 @@ impl CacheEntry {
     /// public method (no underscore prefix) and `_invalidate_unescaped`
     /// is the helper that walks both caches.  pyre keeps the same
     /// public/private pair.
-    pub fn invalidate_unescaped(&mut self, unescaped: &[bool]) {
-        self._invalidate_unescaped(unescaped)
+    ///
+    /// `cache: &HeapCache` matches upstream's stored-back-reference
+    /// `self.heapcache` (heapcache.py:51 `self.heapcache = heapcache`)
+    /// so the per-entry filter calls the version-gated
+    /// `HeapCache.is_unescaped(ref_box)` (heapcache.py:127-130 / 457-460)
+    /// instead of any pre-snapshotted bit table.
+    pub fn invalidate_unescaped(&mut self, cache: &HeapCache) {
+        self._invalidate_unescaped(cache)
     }
 
-    pub fn _invalidate_unescaped(&mut self, unescaped: &[bool]) {
-        self.cache_anything.retain(|box_ref, _| {
-            unescaped
-                .get(box_ref.raw() as usize)
-                .copied()
-                .unwrap_or(false)
-        });
-        self.cache_seen_allocation.retain(|box_ref, _| {
-            unescaped
-                .get(box_ref.raw() as usize)
-                .copied()
-                .unwrap_or(false)
-        });
+    pub fn _invalidate_unescaped(&mut self, cache: &HeapCache) {
+        self.cache_anything
+            .retain(|&ref_box, _| cache.is_unescaped(ref_box));
+        self.cache_seen_allocation
+            .retain(|&ref_box, _| cache.is_unescaped(ref_box));
         if let Some(seen) = &mut self.quasiimmut_seen {
             seen.clear();
         }
@@ -850,31 +848,28 @@ impl HeapCache {
     /// escaped objects only. Unescaped (newly allocated) objects cannot
     /// be affected by external calls, so their caches are preserved.
     pub fn invalidate_caches_for_escaped(&mut self) {
-        // heapcache.py:493 — version-gated is_unescaped check via the
-        // shared (head_version, heapc_flags) snapshot pattern so the
-        // closure does not need to borrow self.
-        let head_version = self.head_version;
-        let flags_snapshot: Vec<u32> = self.heapc_flags.clone();
-        let still_unescaped = |obj: OpRef| -> bool {
-            let i = obj.raw() as usize;
-            let f = flags_snapshot.get(i).copied().unwrap_or(0);
-            Self::versioned_or(f, head_version) && (f as u8) & HF_IS_UNESCAPED != 0
-        };
-        let unescaped: Vec<bool> = (0..flags_snapshot.len())
-            .map(|i| still_unescaped(OpRef::ref_op(i as u32)))
-            .collect();
         // heapcache.py:362-365 — `for cache in self.heap_cache.itervalues():
         //                           cache.invalidate_unescaped()`.
-        for entry in self.heap_cache.values_mut() {
-            entry.invalidate_unescaped(&unescaped);
+        // Take/restore is the borrow-split equivalent of upstream's stored
+        // back-reference (`CacheEntry.heapcache`): the entries are removed
+        // so each `invalidate_unescaped` call receives a fresh `&HeapCache`
+        // to run the version-gated `is_unescaped(ref_box)` check
+        // (heapcache.py:127-130 / 457-460) without the borrow checker
+        // tripping over `entry` and `self.heap_cache` simultaneously.
+        let mut heap_cache = std::mem::take(&mut self.heap_cache);
+        for entry in heap_cache.values_mut() {
+            entry.invalidate_unescaped(self);
         }
+        self.heap_cache = heap_cache;
         // heapcache.py:542-552: iterate cached_arrayitems and invalidate
         // per-CacheEntry entries whose box is no longer unescaped.
-        for caches in self.heap_array_cache.values_mut() {
+        let mut heap_array_cache = std::mem::take(&mut self.heap_array_cache);
+        for caches in heap_array_cache.values_mut() {
             for cache in caches.values_mut() {
-                cache.invalidate_unescaped(&unescaped);
+                cache.invalidate_unescaped(self);
             }
         }
+        self.heap_array_cache = heap_array_cache;
     }
 
     /// heapcache.py:502-506
@@ -1303,15 +1298,22 @@ impl HeapCache {
                 }
             }
             // heapcache.py:362-369 — only invalidate things that escaped.
-            let unescaped = self.is_unescaped.clone();
-            for cache in self.heap_cache.values_mut() {
-                cache.invalidate_unescaped(&unescaped);
+            // Take/restore mirrors `CacheEntry.heapcache` back-reference so
+            // `invalidate_unescaped` calls the version-gated
+            // `HeapCache.is_unescaped(ref_box)` per entry (heapcache.py:127-130 /
+            // 457-460) rather than reading any pre-snapshotted bit table.
+            let mut heap_cache = std::mem::take(&mut self.heap_cache);
+            for cache in heap_cache.values_mut() {
+                cache.invalidate_unescaped(self);
             }
-            for caches in self.heap_array_cache.values_mut() {
+            self.heap_cache = heap_cache;
+            let mut heap_array_cache = std::mem::take(&mut self.heap_array_cache);
+            for caches in heap_array_cache.values_mut() {
                 for cache in caches.values_mut() {
-                    cache.invalidate_unescaped(&unescaped);
+                    cache.invalidate_unescaped(self);
                 }
             }
+            self.heap_array_cache = heap_array_cache;
             return;
         }
         // heapcache.py:372-376 — fallback: reset state for non-CALL ops
