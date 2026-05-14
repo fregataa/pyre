@@ -1335,7 +1335,9 @@ impl OptVirtualize {
 
         // virtualize.py:123-125: make_virtual(c_cls, newop, vref_descr)
         // → InstancePtrInfo(descr, known_class, is_virtual=True)
-        let known_class = Some(majit_ir::GcRef(crate::virtualref::VREF_TYPE_TAG as usize));
+        let known_class = Some(majit_ir::GcRef(
+            crate::virtualref::JIT_VIRTUAL_REF_VTABLE as usize,
+        ));
         let fields = vec![
             (VREF_VIRTUAL_TOKEN_FIELD_INDEX, token_ref),
             (VREF_FORCED_FIELD_INDEX, null_ref),
@@ -2104,7 +2106,7 @@ fn make_vref_field_descr(index: u32) -> DescrRef {
     })
 }
 
-/// Size descriptor for JitVirtualRef (24 bytes = type_tag + virtual_token + forced).
+/// Size descriptor for JitVirtualRef (24 bytes = super_.typeptr + virtual_token + forced).
 #[derive(Debug)]
 struct VRefSizeDescr;
 
@@ -2130,9 +2132,10 @@ impl majit_ir::SizeDescr for VRefSizeDescr {
     fn vtable(&self) -> usize {
         // virtualref.py:94-98: jit_virtual_ref_const_class — the vtable
         // identity used by is_virtual_ref(). Pyre stores this as the
-        // VREF_TYPE_TAG magic value at offset 0. NEW_WITH_VTABLE writes
-        // it at allocation time, matching RPython's gc.new_with_vtable().
-        crate::virtualref::VREF_TYPE_TAG as usize
+        // JIT_VIRTUAL_REF_VTABLE magic value at offset 0
+        // (super_.typeptr). NEW_WITH_VTABLE writes it at allocation
+        // time, matching RPython's gc.new_with_vtable().
+        crate::virtualref::JIT_VIRTUAL_REF_VTABLE as usize
     }
     fn is_immutable(&self) -> bool {
         false

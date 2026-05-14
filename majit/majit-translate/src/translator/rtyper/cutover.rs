@@ -1489,6 +1489,7 @@ mod tests {
                 graph.returnblock,
             )],
             framestate: None,
+            dead: false,
         };
         let returnblock = Block {
             id: graph.returnblock,
@@ -1497,6 +1498,7 @@ mod tests {
             exitswitch: None,
             exits: vec![],
             framestate: None,
+            dead: false,
         };
         graph.blocks = vec![startblock, returnblock];
 
@@ -1527,6 +1529,7 @@ mod tests {
                 graph.returnblock,
             )],
             framestate: None,
+            dead: false,
         };
         let returnblock = Block {
             id: graph.returnblock,
@@ -1535,6 +1538,7 @@ mod tests {
             exitswitch: None,
             exits: vec![],
             framestate: None,
+            dead: false,
         };
         graph.blocks = vec![startblock, returnblock];
 
@@ -1573,6 +1577,7 @@ mod tests {
                 graph.returnblock,
             )],
             framestate: None,
+            dead: false,
         };
         let returnblock = Block {
             id: graph.returnblock,
@@ -1581,6 +1586,7 @@ mod tests {
             exitswitch: None,
             exits: vec![],
             framestate: None,
+            dead: false,
         };
         graph.blocks = vec![startblock, returnblock];
 
@@ -1829,6 +1835,7 @@ fn id(x: &Foo) -> &Foo { x }
                 graph.returnblock,
             )],
             framestate: None,
+            dead: false,
         };
         let returnblock = Block {
             id: graph.returnblock,
@@ -1837,6 +1844,7 @@ fn id(x: &Foo) -> &Foo { x }
             exitswitch: None,
             exits: vec![],
             framestate: None,
+            dead: false,
         };
         graph.blocks = vec![startblock, returnblock];
 
@@ -1882,6 +1890,7 @@ fn id(x: &Foo) -> &Foo { x }
                 graph.returnblock,
             )],
             framestate: None,
+            dead: false,
         };
         let returnblock = Block {
             id: graph.returnblock,
@@ -1890,6 +1899,7 @@ fn id(x: &Foo) -> &Foo { x }
             exitswitch: None,
             exits: vec![],
             framestate: None,
+            dead: false,
         };
         graph.blocks = vec![startblock, returnblock];
 
@@ -1988,6 +1998,7 @@ fn fib(n: i64) -> i64 {
                 graph.returnblock,
             )],
             framestate: None,
+            dead: false,
         };
         let returnblock = Block {
             id: graph.returnblock,
@@ -1996,6 +2007,7 @@ fn fib(n: i64) -> i64 {
             exitswitch: None,
             exits: vec![],
             framestate: None,
+            dead: false,
         };
         graph.blocks = vec![startblock, returnblock];
 
@@ -2040,6 +2052,7 @@ fn fib(n: i64) -> i64 {
                 graph.returnblock,
             )],
             framestate: None,
+            dead: false,
         };
         let returnblock = Block {
             id: graph.returnblock,
@@ -2048,6 +2061,7 @@ fn fib(n: i64) -> i64 {
             exitswitch: None,
             exits: vec![],
             framestate: None,
+            dead: false,
         };
         graph.blocks = vec![startblock, returnblock];
 
@@ -2105,6 +2119,7 @@ fn fib(n: i64) -> i64 {
                 vec![LinkArg::Value(ValueId(2))],
                 graph.returnblock,
             )],
+            dead: false,
             framestate: None,
         };
         let returnblock = Block {
@@ -2113,6 +2128,7 @@ fn fib(n: i64) -> i64 {
             operations: vec![],
             exitswitch: None,
             exits: vec![],
+            dead: false,
             framestate: None,
         };
         graph.blocks = vec![startblock, returnblock];
@@ -2144,6 +2160,7 @@ fn fib(n: i64) -> i64 {
                 vec![LinkArg::Value(ValueId(10))],
                 callee_graph.returnblock,
             )],
+            dead: false,
             framestate: None,
         };
         let foo_return = Block {
@@ -2152,6 +2169,7 @@ fn fib(n: i64) -> i64 {
             operations: vec![],
             exitswitch: None,
             exits: vec![],
+            dead: false,
             framestate: None,
         };
         callee_graph.blocks = vec![foo_start, foo_return];

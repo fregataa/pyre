@@ -1974,6 +1974,7 @@ mod tests {
             exitswitch: None,
             exits: Vec::new(),
             framestate: None,
+            dead: false,
         };
         block.id = graph.startblock;
         graph.blocks = vec![block];
@@ -2045,6 +2046,7 @@ mod tests {
             exitswitch: None,
             exits: Vec::new(),
             framestate: None,
+            dead: false,
         };
         block.id = graph.startblock;
         graph.blocks = vec![block];
@@ -2099,6 +2101,7 @@ mod tests {
             exitswitch: None,
             exits: Vec::new(),
             framestate: None,
+            dead: false,
         };
         block.id = graph.startblock;
         graph.blocks = vec![block];
@@ -2137,6 +2140,7 @@ mod tests {
             exitswitch: None,
             exits: Vec::new(),
             framestate: None,
+            dead: false,
         };
         block.id = graph.startblock;
         graph.blocks = vec![block];
@@ -2799,6 +2803,7 @@ mod tests {
                 graph.returnblock,
             )],
             framestate: None,
+            dead: false,
         };
         let returnblock = Block {
             id: graph.returnblock,
@@ -2807,6 +2812,7 @@ mod tests {
             exitswitch: None,
             exits: vec![],
             framestate: None,
+            dead: false,
         };
         graph.blocks = vec![startblock, returnblock];
         graph
@@ -2877,6 +2883,7 @@ mod tests {
                 graph.returnblock,
             )],
             framestate: None,
+            dead: false,
         };
         let returnblock = Block {
             id: graph.returnblock,
@@ -2885,6 +2892,7 @@ mod tests {
             exitswitch: None,
             exits: vec![],
             framestate: None,
+            dead: false,
         };
         graph.blocks = vec![startblock, returnblock];
 
@@ -2938,6 +2946,7 @@ mod tests {
                 graph.returnblock,
             )],
             framestate: None,
+            dead: false,
         };
         let returnblock = Block {
             id: graph.returnblock,
@@ -2946,6 +2955,7 @@ mod tests {
             exitswitch: None,
             exits: vec![],
             framestate: None,
+            dead: false,
         };
         annotations.set(ValueId(3), ValueType::Int);
         graph.blocks = vec![startblock, returnblock];
@@ -3012,6 +3022,7 @@ mod tests {
                 ),
             ],
             framestate: None,
+            dead: false,
         };
         let returnblock = Block {
             id: graph.returnblock,
@@ -3020,6 +3031,7 @@ mod tests {
             exitswitch: None,
             exits: vec![],
             framestate: None,
+            dead: false,
         };
         let exceptblock = Block {
             id: graph.exceptblock,
@@ -3028,6 +3040,7 @@ mod tests {
             exitswitch: None,
             exits: vec![],
             framestate: None,
+            dead: false,
         };
         graph.blocks = vec![startblock, returnblock, exceptblock];
 
@@ -3082,6 +3095,7 @@ mod tests {
                 graph.returnblock,
             )],
             framestate: None,
+            dead: false,
         };
         let returnblock = Block {
             id: graph.returnblock,
@@ -3090,6 +3104,7 @@ mod tests {
             exitswitch: None,
             exits: vec![],
             framestate: None,
+            dead: false,
         };
         annotations.set(ValueId(3), ValueType::Int);
         graph.blocks = vec![startblock, returnblock];

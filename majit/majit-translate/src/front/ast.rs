@@ -10,9 +10,9 @@ use syn::{Item, ItemFn};
 use crate::ParsedInterpreter;
 use crate::flowspace::model::ConstValue;
 use crate::model::{
-    BlockId, CallTarget, ExitCase, ExitSwitch, FrameState, FrameStateEntry, FunctionGraph,
-    ImmutableRank, Link, LinkArg, OpKind, UnknownKind, UnsupportedExprKind, UnsupportedLiteralKind,
-    ValueId, ValueType, exception_exitcase,
+    BlockId, CallTarget, ExitCase, ExitSwitch, FrameState, FunctionGraph, ImmutableRank, Link,
+    LinkArg, OpKind, UnknownKind, UnsupportedExprKind, UnsupportedLiteralKind, ValueId, ValueType,
+    exception_exitcase,
 };
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1327,6 +1327,7 @@ pub fn lower_expr_into_graph(
         &empty_names,
         &empty_trait_names,
     );
+    ctx.assert_stack_empty_at_stmt_boundary("lower_expr_into_graph entry");
     let lowered = lower_expr(
         graph,
         &mut block,
@@ -1334,6 +1335,7 @@ pub fn lower_expr_into_graph(
         &AstGraphOptions::default(),
         &mut ctx,
     )?;
+    ctx.assert_stack_empty_at_stmt_boundary("lower_expr_into_graph exit");
     if graph.block(block).is_open() {
         graph.set_return(block, lowered.value);
     }
@@ -1481,6 +1483,36 @@ struct GraphBuildContext<'a> {
     /// restore would double-append the name and violate the slot
     /// invariant.
     local_first_bind_seen: std::collections::HashSet<String>,
+    /// Flow-space value stack analogous to `flowspace/flowcontext.py:
+    /// 314-345 FlowContext.stack`.  Empty until slice Z4.B+ converts
+    /// leaf `Expr` lowering (Lit / Path) to the push/pop walker shape;
+    /// scaffolded here so the stack-helper API surface (`pushvalue` /
+    /// `popvalue` / `peekvalue` / `popvalues` / `dropvaluesuntil`) can
+    /// be ported in advance and validated in isolation.  Cell type is
+    /// `ValueId` (pyre's flowspace::Variable identity surrogate); the
+    /// upstream's `Variable | Constant | FlowSignal` polymorphism is
+    /// closed to `ValueId` until Z4.E activates the SpamBlock chain
+    /// at Match merges and the FlowSignal cells need a tagged shape.
+    #[allow(dead_code)]
+    value_stack: Vec<ValueId>,
+    /// Pending FSException at the current flow point — analogue of
+    /// `flowcontext.py:354 self.last_exception`.  None until the Z4
+    /// walker (slice Z4.B+) populates a real value at SETUP_EXCEPT /
+    /// RAISE_VARARGS sites; scaffolded here so `getstate` /
+    /// `setstate` can construct / restore the full 5-tuple
+    /// `FrameState` shape ahead of the walker rewrite.
+    #[allow(dead_code)]
+    last_exception: Option<crate::flowspace::model::FSException>,
+    /// Pending frame-block stack at the current flow point — analogue
+    /// of `flowcontext.py:285 self.blockstack`.  Empty until the Z4
+    /// walker pushes `LoopBlock` / `ExceptBlock` / `FinallyBlock` /
+    /// `WithBlock` / `IterBlock` entries on SETUP_* opcode equivalents
+    /// (Z4.E+ for the loop variants; Z4.H+ for the exception-handling
+    /// variants).  Scaffolded here so `getstate` can populate the
+    /// `FrameState.blocklist` projection without a separate side
+    /// table.
+    #[allow(dead_code)]
+    blockstack: Vec<crate::flowspace::flowcontext::FrameBlock>,
 }
 
 #[derive(Debug, Clone)]
@@ -1866,7 +1898,7 @@ fn is_compound_assign(op: syn::BinOp) -> bool {
 ///     header_entry, vec![])`).  This routine pushes onto that
 ///     existing exit's `args` rather than re-closing the block.
 ///   - `pre_loop_snapshot` was produced by
-///     `ctx.snapshot_locals_for_link()` (or constructed from the same
+///     `ctx.getstate(0)` (or constructed from the same
 ///     ctx state) so its entries are in first-bind positional order.
 ///
 /// Returns the ordered list of header-phi names.
@@ -1879,36 +1911,43 @@ fn allocate_loop_header_phis(
     must_merge: &LoopBodyLocals,
 ) -> Vec<String> {
     let mut header_phi_names = Vec::new();
-    for entry in pre_loop_snapshot.entries.iter().filter_map(|e| e.as_ref()) {
+    for (slot_idx, entry_vid) in pre_loop_snapshot
+        .entries
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| e.map(|vid| (i, vid)))
+    {
+        let name = &ctx.local_first_bind_order[slot_idx];
         // `flowcontext.py:430 mergeblock` allocates a phi for every
         // mergeable local; `simplify.transform_dead_op_vars` then
         // DCEs the unread ones.  Pyre mirrors that: predicate is
         // `read_names ∪ rebound_names`, prune_dead_phis prunes the
         // transient `rebound-only-no-read` phi.
-        if !must_merge.read_names.contains(&entry.name)
-            && !must_merge.rebound_names.contains(&entry.name)
-        {
+        if !must_merge.read_names.contains(name) && !must_merge.rebound_names.contains(name) {
             continue;
         }
-        let value_type = entry.value_type.clone();
+        // Type lives on the op that produced `entry_vid` (mirrors
+        // upstream `Variable.concretetype` access pattern post-rtyper).
+        let value_type = graph_value_type(graph, entry_vid).unwrap_or(ValueType::Unknown);
+        let name = name.clone();
         let phi_vid = graph
             .push_op(
                 header_entry,
                 OpKind::Input {
-                    name: entry.name.clone(),
+                    name: name.clone(),
                     ty: value_type.clone(),
                 },
                 true,
             )
             .expect("OpKind::Input always produces a result");
-        graph.name_value(phi_vid, entry.name.clone());
+        graph.name_value(phi_vid, name.clone());
         graph.block_mut(header_entry).inputargs.push(phi_vid);
         graph.block_mut(pre_loop_block).exits[0]
             .args
-            .push(LinkArg::from(entry.value_id));
-        ctx.bind_local_id(entry.name.clone(), phi_vid, header_entry);
-        ctx.local_value_types.insert(entry.name.clone(), value_type);
-        header_phi_names.push(entry.name.clone());
+            .push(LinkArg::from(entry_vid));
+        ctx.bind_local_id(name.clone(), phi_vid, header_entry);
+        ctx.local_value_types.insert(name.clone(), value_type);
+        header_phi_names.push(name);
     }
     header_phi_names
 }
@@ -1991,7 +2030,269 @@ impl<'a> GraphBuildContext<'a> {
             loop_stack: Vec::new(),
             local_first_bind_order: Vec::new(),
             local_first_bind_seen: std::collections::HashSet::new(),
+            value_stack: Vec::new(),
+            last_exception: None,
+            blockstack: Vec::new(),
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Flow-space value-stack helpers (slice Z4.A scaffolding).
+    //
+    // Line-by-line port of `flowspace/flowcontext.py:317-345` —
+    // `stackdepth` / `pushvalue` / `popvalue` / `peekvalue` /
+    // `settopvalue` / `popvalues` / `dropvaluesuntil`.  Identifier names
+    // and behavioural shapes match upstream exactly.  Pyre's stack
+    // currently holds `ValueId` cells (graph-local Hlvalue identity
+    // surrogate); upstream's polymorphic `Variable | Constant |
+    // FlowSignal` shape is reached when Z4.E activates the SpamBlock
+    // chain at Match merges.
+    //
+    // None of these are wired into `lower_expr` yet (slice Z4.B+
+    // converts leaf variants); they're tested in isolation against
+    // upstream semantics to lock the API surface before consumers
+    // arrive.
+
+    /// `flowcontext.py:317-319` — current value stack size.
+    #[allow(dead_code)]
+    fn stackdepth(&self) -> usize {
+        self.value_stack.len()
+    }
+
+    /// `flowcontext.py:321-322 pushvalue(self, w_object)` — push onto
+    /// the value stack.
+    #[allow(dead_code)]
+    fn pushvalue(&mut self, vid: ValueId) {
+        self.value_stack.push(vid);
+    }
+
+    /// `flowcontext.py:324-325 popvalue(self)` — pop the topmost cell.
+    /// Panics when the stack is empty (upstream's `list.pop()` raises
+    /// `IndexError`; pyre raises `unwrap`).
+    #[allow(dead_code)]
+    fn popvalue(&mut self) -> ValueId {
+        self.value_stack
+            .pop()
+            .expect("popvalue: empty stack (flowcontext.py:325 list.pop on empty)")
+    }
+
+    /// `flowcontext.py:327-330 peekvalue(self, index_from_top=0)` —
+    /// look at the cell `index_from_top` positions below the top.
+    /// Top of stack is `peekvalue(0)`.
+    #[allow(dead_code)]
+    fn peekvalue(&self, index_from_top: usize) -> ValueId {
+        let len = self.value_stack.len();
+        assert!(
+            index_from_top < len,
+            "peekvalue: depth {index_from_top} exceeds stack size {len} (flowcontext.py:329)"
+        );
+        self.value_stack[len - 1 - index_from_top]
+    }
+
+    /// `flowcontext.py:332-334 settopvalue(self, w_object,
+    /// index_from_top=0)` — overwrite the cell `index_from_top`
+    /// positions below the top.
+    #[allow(dead_code)]
+    fn settopvalue(&mut self, vid: ValueId, index_from_top: usize) {
+        let len = self.value_stack.len();
+        assert!(
+            index_from_top < len,
+            "settopvalue: depth {index_from_top} exceeds stack size {len} (flowcontext.py:333)"
+        );
+        let idx = len - 1 - index_from_top;
+        self.value_stack[idx] = vid;
+    }
+
+    /// `flowcontext.py:336-341 popvalues(self, n)` — pop `n` cells in
+    /// stack order (oldest first), returning them as a `Vec`.  `n == 0`
+    /// returns an empty vec without touching the stack.
+    #[allow(dead_code)]
+    fn popvalues(&mut self, n: usize) -> Vec<ValueId> {
+        if n == 0 {
+            return Vec::new();
+        }
+        let len = self.value_stack.len();
+        assert!(
+            n <= len,
+            "popvalues: n={n} exceeds stack size {len} (flowcontext.py:339 negative slice)"
+        );
+        self.value_stack.split_off(len - n)
+    }
+
+    /// `flowcontext.py:343-344 dropvaluesuntil(self, finaldepth)` —
+    /// shrink the stack to exactly `finaldepth` cells.  Used by
+    /// `FrameBlock.cleanupstack` (`flowcontext.py:1335-1336`) when a
+    /// SETUP_* block is unwound.
+    #[allow(dead_code)]
+    fn dropvaluesuntil(&mut self, finaldepth: usize) {
+        let len = self.value_stack.len();
+        assert!(
+            finaldepth <= len,
+            "dropvaluesuntil: finaldepth {finaldepth} exceeds stack size {len} (flowcontext.py:344)"
+        );
+        self.value_stack.truncate(finaldepth);
+    }
+
+    /// `flowcontext.py:346-348 getstate(self, next_offset)` —
+    /// construct a `FrameState` from the current ctx fields.
+    ///
+    /// ```python
+    /// def getstate(self, next_offset):
+    ///     return FrameState(self.locals_w, self.stack[:],
+    ///             self.last_exception, self.blockstack[:], next_offset)
+    /// ```
+    ///
+    /// Pyre's locals projection (`entries`) is sourced from
+    /// `local_first_bind_order` indexed into `local_value_ids`.
+    /// `last_exception` and `blocklist` thread directly because
+    /// their cell types match between ctx and `FrameState`.
+    ///
+    /// PRE-EXISTING-ADAPTATION (`flowcontext.py:347 self.stack[:]`):
+    /// upstream copies `self.stack` (a `Vec<Hlvalue>`) into the new
+    /// `FrameState.stack`.  Pyre's ctx field is `value_stack:
+    /// Vec<ValueId>` (graph-local-id surrogate) while
+    /// `FrameState.stack` is `Vec<StackElem>` (Hlvalue cells per the
+    /// P1.B parity port).  There is no Hlvalue→ValueId bridge at the
+    /// AST frontend yet, so a line-by-line port is structurally
+    /// blocked.  The function below substitutes `Vec::new()` — a
+    /// no-op observed today because production never writes
+    /// `value_stack` (Z4.B.0 stmt-boundary tripwire enforces depth
+    /// 0); a leaf push in Z4.B.1+ would expose the bridge gap as
+    /// real lost state.  Convergence options (both retire this
+    /// PRE-EXISTING-ADAPTATION):
+    ///   (a) add a pyre-only `value_stack_surrogate: Vec<ValueId>`
+    ///       field on `FrameState`, cloned here and consumed by
+    ///       `setstate`, retired at Z2.5 once `stack` carries the
+    ///       fused domain;
+    ///   (b) land Z2.5 directly — introduce Hlvalue↔ValueId
+    ///       bidirectional mapping at GraphBuildContext, then map
+    ///       `value_stack` cells into `Hlvalue::Variable` here and
+    ///       restore via the inverse in `setstate`.
+    /// Both are tied to Z4.last (subsumes Z2.5 Hlvalue migration).
+    ///
+    /// Production capture path: every `set_branch` / `set_goto` site
+    /// in `Expr::If` / `Expr::Match` / loop variants stamps
+    /// `Block.framestate = Some(ctx.getstate(0))` so the lazy
+    /// installer can walk predecessor framestates back to a binding
+    /// site.  `next_offset = 0` until the Z4 walker rewrite threads
+    /// real bytecode-equivalent offsets through.
+    fn getstate(&self, next_offset: i64) -> FrameState {
+        let entries: Vec<Option<ValueId>> = self
+            .local_first_bind_order
+            .iter()
+            .map(|name| {
+                self.local_value_ids
+                    .get(name)
+                    .map(|&(value_id, _defining_block)| value_id)
+            })
+            .collect();
+        FrameState {
+            entries,
+            // PRE-EXISTING-ADAPTATION (see doc-comment): `value_stack`
+            // copy blocked on Hlvalue↔ValueId bridge (Z2.5).
+            // Substituted no-op produces an empty `FrameState.stack`
+            // — load-bearing once Z4.B.1+ leaves push cells onto
+            // `value_stack`.
+            stack: Vec::new(),
+            last_exception: self.last_exception.clone(),
+            blocklist: self.blockstack.clone(),
+            next_offset,
+        }
+    }
+
+    /// `flowcontext.py:350-356 setstate(self, state)` — reset the ctx
+    /// to a previously-captured `FrameState`.
+    ///
+    /// ```python
+    /// def setstate(self, state):
+    ///     self.locals_w = state.locals_w[:]
+    ///     self.stack = state.stack[:]
+    ///     self.last_exception = state.last_exception
+    ///     self.blockstack = state.blocklist[:]
+    ///     self._normalize_raise_signals()
+    /// ```
+    ///
+    /// Pyre's locals projection update goes through `local_value_ids`
+    /// — a name→(vid, defining_block) HashMap rather than upstream's
+    /// positional list, because pyre carries the (vid, BlockId)
+    /// reuse-gate.  `local_first_bind_order` is graph-wide append-
+    /// only and stays untouched (slot indices never reshuffle —
+    /// upstream `co_varnames` parity).  `last_exception` and
+    /// `blocklist` thread directly.  `_normalize_raise_signals`
+    /// (`flowcontext.py:358-362`) is a no-op for pyre because no
+    /// `RaiseImplicit` cells live on `value_stack` yet (Z4.H ports
+    /// the exception-handling sites).
+    ///
+    /// PRE-EXISTING-ADAPTATION (`flowcontext.py:352 self.stack =
+    /// state.stack[:]`): the mirror of the `getstate` gap above.
+    /// Upstream restores ctx stack from the FrameState's saved
+    /// `Vec<Hlvalue>`; pyre has no Hlvalue→ValueId bridge to
+    /// rehydrate `value_stack: Vec<ValueId>`, so the function below
+    /// substitutes `value_stack.clear()` — a no-op observed today
+    /// because `getstate` never captures anything (paired blind
+    /// spots).  Once Z4.B.1+ leaves push cells, this restore needs
+    /// the same Z2.5 bridge as `getstate`.
+    ///
+    /// Currently unused — `LocalBindingSnapshot::restore` continues
+    /// to be the production restore path; this is the structural
+    /// API surface ahead of the walker rewrite (Z4.B+).
+    #[allow(dead_code)]
+    fn setstate(&mut self, state: &FrameState) {
+        // Locals: rebind each name from `local_first_bind_order` to
+        // the slot's vid in `state.entries`, dropping the binding
+        // when the slot is `None`-killed.  The defining_block is set
+        // to `BlockId(0)` as a placeholder — the Z4 walker rewrite
+        // will need to thread the originating block alongside the
+        // vid (or retire the (vid, BlockId) gate entirely as part
+        // of Z2.5 absorption at Z4.last).
+        for (slot_idx, name) in self.local_first_bind_order.clone().iter().enumerate() {
+            match state.entries.get(slot_idx).copied().flatten() {
+                Some(vid) => {
+                    self.local_value_ids.insert(name.clone(), (vid, BlockId(0)));
+                }
+                None => {
+                    self.local_value_ids.remove(name);
+                }
+            }
+        }
+        // PRE-EXISTING-ADAPTATION (see doc-comment): upstream's
+        // `self.stack = state.stack[:]` blocked on Hlvalue↔ValueId
+        // bridge (Z2.5).  Substituted no-op clears the surrogate
+        // stack — load-bearing once Z4.B.1+ leaves push cells.
+        self.value_stack.clear();
+        self.last_exception = state.last_exception.clone();
+        self.blockstack = state.blocklist.clone();
+        // `_normalize_raise_signals` no-op until Z4.H wires
+        // RaiseImplicit cells onto `value_stack`.
+    }
+
+    /// Z4.B.0 tripwire — assert `value_stack` is empty at a statement
+    /// boundary.
+    ///
+    /// Upstream `flowcontext.py:413 handle_bytecode` runs once per
+    /// bytecode; at the simple-stmt level the Python compiler always
+    /// emits matching push/pop counts so the stack returns to zero
+    /// depth between simple stmts within a function body.
+    ///
+    /// Pyre's AST frontend collapses each Rust `syn::Stmt` to a single
+    /// dispatch through `lower_stmt`.  Once Z4.B.1+ wire leaf-`Expr`
+    /// pushes alongside the existing `lower_expr` returns, every
+    /// consumer (Stmt::Local STORE_FAST analogue, Stmt::Expr POP_TOP
+    /// analogue, every operator/call-arg site that today reads via
+    /// `get_value!(lower_expr(...))`) must pop in lockstep.  Any
+    /// imbalance trips this assert at the *next* statement boundary,
+    /// flagging the specific Stmt whose push/pop pair drifted.
+    ///
+    /// Today (Z4.B.0) `value_stack` is never written, so the assert
+    /// is a no-op safety net — its job is to be in place before
+    /// Z4.B.1 starts pushing.
+    fn assert_stack_empty_at_stmt_boundary(&self, where_: &str) {
+        debug_assert!(
+            self.value_stack.is_empty(),
+            "stmt-boundary stack imbalance at {where_}: depth {} expected 0 \
+             (flowcontext.py:413 simple-stmt invariant; Z4.B.0 tripwire)",
+            self.value_stack.len()
+        );
     }
 
     /// Bind a local name to a `(ValueId, defining_block)` pair, updating
@@ -2057,43 +2358,6 @@ impl LocalBindingSnapshot {
     }
 }
 
-impl<'a> GraphBuildContext<'a> {
-    /// Capture the current locals as a `FrameState` suitable for
-    /// threading through `Link.args` to a successor block.  Locals walk
-    /// `local_first_bind_order` (Stage A2) so the slot index of a name
-    /// is invariant across the lowering — every predecessor emit and
-    /// every successor consume line up at the same slot position.
-    /// Names that have been unbound by an enclosing `LocalBindingSnapshot
-    /// ::restore` are filtered out.  RPython parity: `co_varnames`
-    /// slot order (`flowspace/flowcontext.py:835 LOAD_FAST` reads
-    /// slots by index).
-    ///
-    /// Slice 2 / Stage A1 calls this at every `set_branch` / `set_goto`
-    /// site in `Expr::If` and stores the result on the closing block's
-    /// `Block.framestate` field; Slices 3-6 extend the callers to match
-    /// arms, loop headers, and `break` / `continue` joins.
-    fn snapshot_locals_for_link(&self) -> FrameState {
-        let entries = self
-            .local_first_bind_order
-            .iter()
-            .map(|name| {
-                self.local_value_ids
-                    .get(name)
-                    .map(|&(value_id, _defining_block)| FrameStateEntry {
-                        name: name.clone(),
-                        value_id,
-                        value_type: self
-                            .local_value_types
-                            .get(name)
-                            .cloned()
-                            .unwrap_or(ValueType::Unknown),
-                    })
-            })
-            .collect();
-        FrameState { entries }
-    }
-}
-
 /// Lazy cross-block local installer — Slice 2 of the Cat 2.1 epic.
 ///
 /// Triggered from `Expr::Path`'s cross-block branch when the local
@@ -2138,9 +2402,11 @@ impl<'a> GraphBuildContext<'a> {
 /// `translator/rtyper/legacy_resolve.rs`).
 ///
 /// Returns `Some(new_vid)` on success, `None` if any predecessor lacks
-/// a recorded snapshot or whose snapshot lacks `name`, or the
-/// snapshots disagree on `value_type`.  The call site falls back to
-/// the legacy naked-`Input` emit when `None` is returned.
+/// a recorded snapshot or whose snapshot lacks `name` (Slice P2
+/// retired the type-disagreement abort path — the wildcard fold
+/// widens disagreeing concrete kinds to Unknown instead).  The call
+/// site falls back to the legacy naked-`Input` emit when `None` is
+/// returned.
 /// `pre_allocated_vid`: when `Some(vid)`, use the caller-supplied
 /// ValueId for the fresh phi instead of allocating a new one.  Used
 /// by union callers (`Expr::If`, `Expr::Match`) that pre-allocate
@@ -2221,18 +2487,19 @@ fn lazy_install_local_at_current_block(
     // pass with the in-flight inputarg slot acting as the iteration
     // checkpoint.
     //
-    // Phase 1 (read-only): collect each predecessor's `(snap_vid,
-    // snap_type)` and decide whether the snapshot's vid is directly
-    // usable in `pred_block` or whether `pred_block` will need its
-    // own recursive install.  All predecessor snapshots must agree
-    // on `value_type` via the wildcard rule (`Unknown` is a wildcard
-    // — concrete-vs-concrete disagreement aborts before we mutate
-    // graph state).
+    // Phase 1 (read-only): collect each predecessor's snap_vid and
+    // decide whether the snapshot's vid is directly usable in
+    // `pred_block` or whether `pred_block` will need its own
+    // recursive install.  Predecessor snapshots fold their observed
+    // `graph_value_type` via the wildcard rule (`Unknown` carries
+    // the concrete sibling through; concrete-vs-different-concrete
+    // widens to Unknown — Slice P2 retired the abort-on-disagreement
+    // path, types are downstream concerns per
+    // `framestate.py:union`).
     struct PredSnap {
         pred_block: BlockId,
         exit_idx: usize,
         snap_vid: ValueId,
-        snap_type: ValueType,
         needs_recurse: bool,
     }
     let mut pred_snaps: Vec<PredSnap> = Vec::with_capacity(pred_edges.len());
@@ -2243,44 +2510,73 @@ fn lazy_install_local_at_current_block(
         // `set_branch` share the same close-time state; the per-edge
         // `ctx.exit_snapshots` HashMap is gone.  RPython parity:
         // `flowspace/flowcontext.py:38 SpamBlock.framestate`.
-        let (snap_vid, snap_type) = {
+        let snap_vid = {
             let snap = graph.block(*pred_block).framestate.as_ref()?;
-            let entry = snap.entries.iter().find_map(|slot| match slot {
-                Some(e) if e.name == name => Some(e),
-                _ => None,
-            })?;
-            (entry.value_id, entry.value_type.clone())
+            // `framestate.py:locals_w` is a positional slot vector;
+            // resolve `name → slot_idx` via the graph-wide first-bind
+            // order, mirroring upstream's `co_varnames.index(name)`
+            // lookup pattern.
+            let slot_idx = ctx.local_first_bind_order.iter().position(|n| n == name)?;
+            snap.entries.get(slot_idx).copied().flatten()?
         };
         let needs_recurse = !value_id_defined_in_block(graph, snap_vid, *pred_block);
-        // Tentative type from snap-only fold for non-recursive preds
-        // we can also consult `graph_value_type(snap_vid)`; for
-        // recursive preds the recursive install's value_type isn't
-        // known yet and we use snap_type as the best estimate.  The
-        // wildcard rule (`Unknown` absorbs concrete) is symmetric and
-        // never produces a kind disagreement when one side is
-        // Unknown.
-        let observed_type = if needs_recurse {
-            snap_type.clone()
-        } else {
-            graph_value_type(graph, snap_vid).unwrap_or_else(|| snap_type.clone())
-        };
+        // Type folds across predecessors via the wildcard rule:
+        // concrete-vs-Unknown carries the concrete kind through;
+        // concrete-vs-different-concrete widens to Unknown so the
+        // freshly-installed inputarg's `ty` is the most-general kind
+        // observable across this merge.  Mirrors upstream's pattern
+        // where flow-space `Variable` carries no type and rtyper
+        // assigns `concretetype` post-flow (`framestate.py:union`
+        // never inspects types).  Pyre's prior NEW-DEVIATION here
+        // failed the install on concrete disagreement; that gate
+        // was retired in slice P2 after a dry-run audit confirmed
+        // zero fixture / production conflicts (cargo lib 2557/0/3
+        // + check.py 14/14×2 PASS).
+        let observed_type = graph_value_type(graph, snap_vid).unwrap_or(ValueType::Unknown);
         match (&shared_value_type, &observed_type) {
             (None, _) => shared_value_type = Some(observed_type.clone()),
             (Some(prior), new) if prior == new => {}
             (Some(ValueType::Unknown), _) => shared_value_type = Some(observed_type.clone()),
             (Some(_), ValueType::Unknown) => {}
-            (Some(_), _) => return None,
+            (Some(_), _) => shared_value_type = Some(ValueType::Unknown),
         }
         pred_snaps.push(PredSnap {
             pred_block: *pred_block,
             exit_idx: *exit_idx,
             snap_vid,
-            snap_type,
             needs_recurse,
         });
     }
 
-    let value_type = shared_value_type.unwrap_or(ValueType::Unknown);
+    // If every predecessor's `graph_value_type(snap_vid)` returned
+    // Unknown (e.g. the snap_vid points to an Input op that was itself
+    // installed by an earlier lazy_install whose own predecessors
+    // could not resolve a concrete kind), fall back to
+    // `ctx.local_value_types[name]` — populated by `Stmt::Local`
+    // (`let mut x: bool = ...`), `allocate_loop_header_phis` (loop
+    // phi's resolved kind), and function-parameter registration.
+    //
+    // RPython parity: `Variable.concretetype` is the rtyper-side type
+    // tracking, which carries across cross-block reads independently
+    // of the framestate Hlvalue identity.  Pyre's `local_value_types`
+    // is the annotator-lattice analogue at the AST frontend.  Slice
+    // 2.3 retired the per-slot `FrameStateEntry::value_type` (NEW-
+    // DEVIATION); the convergence path defers type unification to a
+    // future annotator port.  Until that port lands, this fallback
+    // keeps the lazy installer's freshly-emitted Input op tagged with
+    // the lattice's best-known kind so downstream consumers
+    // (`expr_unary_not_operand_kind` and the assembler's per-kind
+    // copy invariant) see a concrete type for locals that were
+    // concretely-typed at let-binding time.
+    let value_type = shared_value_type.unwrap_or(ValueType::Unknown).clone();
+    let value_type = if matches!(value_type, ValueType::Unknown) {
+        ctx.local_value_types
+            .get(name)
+            .cloned()
+            .unwrap_or(ValueType::Unknown)
+    } else {
+        value_type
+    };
 
     // Phase 2 (graph mutation): push the outer `OpKind::Input` +
     // inputarg slot first, snapshot the prior ctx binding for
@@ -2344,31 +2640,19 @@ fn lazy_install_local_at_current_block(
         } else {
             snap.snap_vid
         };
-        let resolved_type =
-            graph_value_type(graph, resolved_vid).unwrap_or_else(|| snap.snap_type.clone());
-        // Phase 2 re-validation: Phase 1's `value_type` for needs_recurse
-        // preds was estimated from `snap_type` because the recursive
-        // install hadn't run yet.  The actual `resolved_type` after
-        // recursion may surface a concrete kind that disagrees with
-        // `value_type` (e.g. a deeper predecessor's snap stored
-        // `Unknown` but the install resolved to `Int`, or two recursive
-        // chains converged on disagreeing concrete kinds).  Concrete-
-        // vs-concrete disagreement here MUST roll back the outer
-        // Phase-2 push: otherwise the freshly-installed inputarg's
-        // `ty` mismatches the incoming link arg's kind classification
-        // and the assembler's `int_copy` / `ref_copy` / `float_copy`
-        // same-kind invariant trips at codegen.  `Unknown` remains a
-        // wildcard on either side — matches Phase 1's wildcard rule
-        // and `FrameState::union`'s per-slot semantics.
-        let kind_clash = match (&value_type, &resolved_type) {
-            (a, b) if a == b => false,
-            (ValueType::Unknown, _) | (_, ValueType::Unknown) => false,
-            _ => true,
-        };
-        if kind_clash {
-            rollback = true;
-            break;
-        }
+        // Phase 2 type-validation: retired in slice P2.  Phase 1's
+        // wildcard fold (`(Some(_), _) => Unknown` arm) widens
+        // disagreeing concrete kinds to Unknown so the freshly-
+        // installed inputarg's `ty` is the upper bound observable
+        // across this merge.  Per-link resolved-type validation here
+        // was a NEW-DEVIATION duplicating that fold; the audit dry-
+        // run confirmed it never fired on production fixtures.
+        // Types are downstream concerns (annotator + rtyper);
+        // flowspace's job is the merge shape, not the kind
+        // reconciliation.  The Unknown-source-pred retag below
+        // (driven by `unknown_predecessor_vids`) survives as the
+        // wildcard widening's link-arg side.
+        let resolved_type = graph_value_type(graph, resolved_vid).unwrap_or(ValueType::Unknown);
         if matches!(resolved_type, ValueType::Unknown) {
             unknown_predecessor_vids.push(resolved_vid);
         }
@@ -2623,6 +2907,11 @@ fn build_function_graph(
     // orderly termination: after `return x` there's nothing more to
     // walk but the graph is well-formed, so we break without
     // propagating.
+    // Z4.B.0 tripwire: function-body entry is a simple-stmt boundary
+    // (`flowcontext.py:413` first `handle_bytecode` call) — stack
+    // depth 0 expected.  Today `value_stack` is never written; the
+    // assert is a no-op safety net ahead of Z4.B.1's leaf-push.
+    ctx.assert_stack_empty_at_stmt_boundary("build_function_graph body entry");
     let lowered = lower_stmt_list_with_tail_value(
         &mut graph,
         &mut entry,
@@ -2630,6 +2919,10 @@ fn build_function_graph(
         options,
         &mut ctx,
     )?;
+    // Function-body exit mirrors the entry invariant: every leaf push
+    // must have a matching consumer pop somewhere in the body, so the
+    // top-level stack must be empty again when the walk completes.
+    ctx.assert_stack_empty_at_stmt_boundary("build_function_graph body exit");
 
     // Default terminator if none was set. RPython `RETURN_VALUE`
     // carries the evaluated tail expression into `graph.returnblock`;
@@ -2652,35 +2945,39 @@ fn build_function_graph(
     // close_stack, cannot_collect, gc_effects.
     let hints = collect_jit_hints(&func.attrs, Some(&func.sig));
 
-    // Direct port of `simplify.transform_dead_op_vars_in_blocks`
-    // (`rpython/translator/simplify.py:422`) — the dead-op subset of
-    // upstream's `simplify_graph` (`simplify.py:1075`).  The
-    // upstream algorithm uses backward dataflow with
-    // link-args-as-dependencies (not direct reads), which correctly
-    // retires body-dead phis whose only "reader" is the back-edge
-    // itself.  Running it here ensures downstream rtyper / jtransform
-    // / flatten / regalloc never see an unread phi or its dangling
-    // `Link.args` slot.
+    // RPython `simplify_graph(graph)` (`simplify.py:1075-1081`) runs
+    // a fixed list of passes; pyre runs the subset whose AST-graph
+    // dependencies have landed:
     //
-    // TODO(simplify_graph-full-port): pyre runs only the
-    // `transform_dead_op_vars` subset here.  The full upstream
-    // `simplify_graph` runs `all_passes`
-    // (`simplify.py:1060-1073`):
+    //     transform_dead_op_vars         — `prune_dead_phis` (Z2.x)
+    //     eliminate_empty_blocks         — `eliminate_empty_blocks`
+    //     remove_assertion_errors        — pending
+    //     remove_identical_vars_SSA      — pending
+    //     constfold_exitswitch           — handled in optimizeopt
+    //     remove_trivial_links           — pending
+    //     SSA_to_SSI                     — pending
+    //     coalesce_bool                  — pending
+    //     transform_ovfcheck             — pending
+    //     simplify_exceptions            — pending
+    //     transform_xxxitem              — pending
+    //     remove_dead_exceptions         — pending
     //
-    //     transform_dead_op_vars, eliminate_empty_blocks,
-    //     remove_assertion_errors, remove_identical_vars_SSA,
-    //     constfold_exitswitch, remove_trivial_links, SSA_to_SSI,
-    //     coalesce_bool, transform_ovfcheck, simplify_exceptions,
-    //     transform_xxxitem, remove_dead_exceptions
+    // `transform_dead_op_vars`: backward dataflow over operation
+    // operands + exitswitches + `Link.args`-as-dependencies.  Line-
+    // by-line port of `simplify.transform_dead_op_vars_in_blocks(blocks,
+    // graphs, translator=None)` (`simplify.py:422-524`).
     //
-    // pyre only ports the first.  The remainder are either deferred
-    // (no-op pyre IR doesn't need them yet) or handled by later
-    // phases under different names (e.g. constant folding lives in
-    // optimizeopt rather than as a flowspace-level
-    // constfold_exitswitch).  Convergence path: port each remaining
-    // pass under its upstream name as the corresponding pyre IR
-    // construct lands.
+    // `eliminate_empty_blocks`: collapse empty-block forwarding
+    // chains.  Line-by-line port of `simplify.py:52-69`.  No-op on
+    // pyre's tree-recursive Match/If lowering today (no chain
+    // emitted); becomes load-bearing once Z4's flowcontext-walker
+    // rewrite materialises intermediate `SpamBlock`s per fold step.
+    //
+    // Convergence path for the remaining `pending` passes: port each
+    // under its upstream name as the corresponding pyre IR construct
+    // lands.
     crate::model::prune_dead_phis(&mut graph);
+    crate::model::eliminate_empty_blocks(&mut graph);
 
     Ok(SemanticFunction {
         name: func.sig.ident.to_string(),
@@ -2886,6 +3183,30 @@ fn lower_stmt_list_with_tail_value(
 }
 
 fn lower_stmt(
+    graph: &mut FunctionGraph,
+    block: &mut BlockId,
+    stmt: &syn::Stmt,
+    options: &AstGraphOptions,
+    ctx: &mut GraphBuildContext,
+) -> Result<bool, FlowingError> {
+    // Z4.B.0 tripwire: simple-stmt boundary requires `value_stack`
+    // depth == 0 per `flowcontext.py:413 handle_bytecode` (each
+    // bytecode handler's net push/pop balances inside a simple-stmt
+    // window).  Today `value_stack` is never written; the assert is a
+    // no-op safety net.  Once Z4.B.1+ wires leaf push + consumer pop,
+    // a miscounted producer or consumer trips this assert at the next
+    // Stmt enter.  Bottom-of-stmt assert lives at the wrapper exit
+    // below so successful paths re-establish the invariant for the
+    // next stmt.
+    ctx.assert_stack_empty_at_stmt_boundary("lower_stmt entry");
+    let result = lower_stmt_inner(graph, block, stmt, options, ctx);
+    if result.is_ok() {
+        ctx.assert_stack_empty_at_stmt_boundary("lower_stmt exit (Ok)");
+    }
+    result
+}
+
+fn lower_stmt_inner(
     graph: &mut FunctionGraph,
     block: &mut BlockId,
     stmt: &syn::Stmt,
@@ -3558,7 +3879,7 @@ fn lower_expr(
             // duplication of Slice 2 collapses into a single field.
             // RPython parity: `flowspace/flowcontext.py:38
             // SpamBlock.framestate`.
-            let pre_branch_snapshot = ctx.snapshot_locals_for_link();
+            let pre_branch_snapshot = ctx.getstate(0);
             graph.set_branch(*block, cond, then_block, vec![], else_block, vec![]);
             graph.block_mut(*block).framestate = Some(pre_branch_snapshot);
 
@@ -3585,7 +3906,7 @@ fn lower_expr(
             // else-arm lowering mutates `ctx.local_value_ids`.  Used
             // only if then-arm is open (will `set_goto` to merge); a
             // closed arm's snapshot is unused.
-            let then_exit_snapshot = ctx.snapshot_locals_for_link();
+            let then_exit_snapshot = ctx.getstate(0);
 
             // Stage B1: restore pre-branch ctx state before lowering
             // the else-arm so its `LOAD_FAST`-style reads see the
@@ -3597,7 +3918,7 @@ fn lower_expr(
             if let Some((_, else_branch)) = &if_expr.else_branch {
                 else_lowered = lower_expr(graph, &mut else_block, else_branch, options, ctx)?;
             }
-            let else_exit_snapshot = ctx.snapshot_locals_for_link();
+            let else_exit_snapshot = ctx.getstate(0);
 
             // RPython `flowspace/flowcontext.py` merges via Link: a
             // branch whose path is closed (`return`/`raise`/`break`)
@@ -3657,66 +3978,49 @@ fn lower_expr(
             //     each predecessor's goto args, and rebinds ctx so
             //     post-merge reads of the name resolve to the new
             //     phi vid without re-driving the lazy installer.
-            //   - Concrete-vs-concrete kind disagreement returns
-            //     `Err(UnionError::TypeMismatch)` from
-            //     `FrameState::union` — a whole-state failure mirroring
-            //     PyPy `framestate.py:88 try/except UnionError: return
-            //     None` (see the `model::FrameState::union` doc comment
-            //     for the parity rationale).  rustc's type checker
-            //     rejects any valid Rust source that binds the same
-            //     local to two different concrete kinds across `if` /
-            //     `else` arms, so the `Err` arm is unreachable from
-            //     real input; `.expect(...)` documents the contract
-            //     and panics loudly if a hand-built fixture or a
-            //     frontend change ever breaks it.
+            //
+            // `FrameState::union` returns `Option<FrameState>` per
+            // `framestate.py:78-89`'s `try/except UnionError: return
+            // None` envelope.  Pyre's `entries` carry `Option<ValueId>`
+            // not `Option<Hlvalue>`, so the `framestate.py:117/126
+            // UnionError` paths (SpecTag mismatch, FlowSignal-type
+            // mismatch) cannot be raised against `entries`.  They
+            // remain reachable on the stack / exception projections
+            // once the Z4 walker populates them; until then the union
+            // is total on the AST frontend and the `.expect(...)`
+            // below documents that invariant.  Per-slot type
+            // unification across arms is annotator-side per upstream
+            // `framestate.py:union` (Hlvalue identity only) — there
+            // is no concrete-kind disagreement at union time.
             if then_open && else_open {
+                // `framestate.py:78` returns `None` from `union` on
+                // any per-projection `UnionError`.  The AST-frontend's
+                // entries domain (ValueId-identity) is total; the
+                // stack / last_exception / blocklist / next_offset
+                // projections are vestigially empty / None / 0, so
+                // `union` is currently infallible at this call site.
+                // The `expect` documents the invariant — when Z4
+                // walker activates the four vestigial projections,
+                // this site needs the upstream `flowcontext.py:431-
+                // 436 mergeblock` candidate-loop fallback (allocate
+                // a fresh SpamBlock when no candidate unioned).
                 let merged = then_exit_snapshot.union(&else_exit_snapshot, graph).expect(
-                    "rustc must have rejected differing concrete kinds across if/else arms",
+                    "AST frontend: union is total — entries domain has no UnionError, \
+                         stack / last_exception / blocklist / next_offset are vestigial \
+                         (framestate.py:78 None-return reachable only post-Z4 walker)",
                 );
                 // Carry-through Unknown→concrete widening at the
-                // union (`model::FrameState::union` wildcard
-                // rule) leaves the merged `value_type` concrete while
-                // the shared source `OpKind`'s `ty` may still be
-                // `Unknown` — `local_value_types` snapshots can
-                // disagree across arms even for the same vid (one
-                // arm bound the slot with an annotation, the other
-                // inferred-only).  Retag the source op now so
-                // `graph_value_type(vid)` agrees with the merged
-                // framestate at every consumer (mirrors the
-                // `Expr::Try` widening pattern used after `?`
-                // unwraps a `Result<T, E>`).  Fresh-phi slots
-                // (vid disagrees with then-arm's predecessor) are
-                // handled by the lazy installer's own retag pass at
-                // first post-merge read; they intentionally do not
-                // mutate the predecessor source here.
-                //
-                // Detection: a slot's vid was carry-through iff it
-                // matches the then-arm predecessor's vid for the
-                // same slot (`union` keeps the predecessor's
-                // vid on agreement, allocates a fresh one on
-                // disagreement).  Detection is symmetric — checking
-                // either predecessor works because agreement implies
-                // both predecessors share the vid.
-                for (slot_idx, slot) in merged.entries.iter().enumerate() {
-                    let Some(slot) = slot.as_ref() else {
-                        continue;
-                    };
-                    let then_vid = then_exit_snapshot
-                        .entries
-                        .get(slot_idx)
-                        .and_then(|e| e.as_ref())
-                        .map(|e| e.value_id);
-                    let is_carry_through = then_vid == Some(slot.value_id);
-                    if is_carry_through
-                        && !matches!(slot.value_type, ValueType::Unknown)
-                        && !matches!(
-                            graph_value_type(graph, slot.value_id),
-                            Some(ref t) if t == &slot.value_type,
-                        )
-                    {
-                        retag_result_value_type(graph, slot.value_id, slot.value_type.clone());
-                    }
-                }
+                // Type unification across arms is annotator-side per
+                // upstream `framestate.py:union` (Hlvalue identity
+                // only) — no per-slot value_type retag at union time.
+                // The prior carry-through retag block was a
+                // NEW-DEVIATION dependent on the retired
+                // `FrameStateEntry::value_type` field; it has been
+                // removed in Path-Z Slice 2.3.  Convergence: when
+                // pyre's annotator (`crate::annotator`) runs over
+                // AST-frontend graphs, `Variable.annotation` /
+                // `Variable.concretetype` carries the unified type
+                // and downstream consumers read from there.
                 for (slot_idx, slot) in merged.entries.iter().enumerate() {
                     if slot.is_some() {
                         continue;
@@ -3727,19 +4031,10 @@ fn lower_expr(
                     // `local_first_bind_seen` are graph-wide
                     // append-only and stay untouched (the slot index
                     // remains valid; future snapshots push `None` for
-                    // it).
-                    let name = then_exit_snapshot
-                        .entries
-                        .get(slot_idx)
-                        .and_then(|e| e.as_ref())
-                        .or_else(|| {
-                            else_exit_snapshot
-                                .entries
-                                .get(slot_idx)
-                                .and_then(|e| e.as_ref())
-                        })
-                        .map(|e| e.name.clone());
-                    if let Some(name) = name {
+                    // it).  Resolve `slot_idx → name` via
+                    // `local_first_bind_order` per the framestate
+                    // positional-zip invariant.
+                    if let Some(name) = ctx.local_first_bind_order.get(slot_idx).cloned() {
                         ctx.local_value_ids.remove(&name);
                         ctx.local_value_types.remove(&name);
                     }
@@ -3758,23 +4053,22 @@ fn lower_expr(
                 // == w2: return w1`); first post-merge read of those
                 // names still drives the lazy installer's same-block
                 // reuse path.
-                for (slot_idx, slot) in merged.entries.iter().enumerate() {
-                    let Some(slot) = slot.as_ref() else {
-                        continue;
-                    };
-                    let then_vid = then_exit_snapshot
-                        .entries
-                        .get(slot_idx)
-                        .and_then(|e| e.as_ref())
-                        .map(|e| e.value_id);
-                    let is_fresh_phi = then_vid != Some(slot.value_id);
+                for (slot_idx, slot_vid) in merged
+                    .entries
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, e)| e.map(|vid| (i, vid)))
+                {
+                    let then_vid = then_exit_snapshot.entries.get(slot_idx).copied().flatten();
+                    let is_fresh_phi = then_vid != Some(slot_vid);
                     if is_fresh_phi {
+                        let name = ctx.local_first_bind_order[slot_idx].clone();
                         let _ = lazy_install_local_at_current_block(
                             graph,
                             ctx,
                             merge_block,
-                            &slot.name,
-                            Some(slot.value_id),
+                            &name,
+                            Some(slot_vid),
                         );
                     }
                 }
@@ -4585,7 +4879,7 @@ fn lower_expr(
                 // `lazy_install_local_at_current_block` finds no
                 // snapshot and falls back to the legacy naked-`Input`
                 // emit, which loses the per-arm rebind information.
-                let arm_exit_snapshot = ctx.snapshot_locals_for_link();
+                let arm_exit_snapshot = ctx.getstate(0);
                 saved_locals.restore(ctx);
                 let arm_lowered = arm_lowered_result?;
                 // A closed arm (body is `return x` / `break` / `panic!`
@@ -4726,14 +5020,18 @@ fn lower_expr(
             // fragility shared with Expr::If, requiring a separate
             // ctx-restore strategy that lives outside this slice.
             if open_arm_snapshots.len() >= 2 {
-                // Concrete-vs-concrete kind disagreement returns
-                // `Err(UnionError::TypeMismatch)` (whole-state failure
-                // mirroring PyPy `framestate.py:88 try/except
-                // UnionError: return None`).  rustc's type checker
-                // rejects any valid Rust source that binds the same
-                // local to two different concrete kinds across match
-                // arms, so the `Err` arm is unreachable from real
-                // input; `.expect(...)` documents the contract.
+                // `FrameState::union` returns `Option<FrameState>`
+                // per `framestate.py:78-89`'s `try/except UnionError:
+                // return None` envelope.  The
+                // `framestate.py:117/126 UnionError` paths (SpecTag
+                // mismatch, FlowSignal-type mismatch) can only fire
+                // on the stack / exception projections, which are
+                // vestigially empty / `None` on the AST frontend
+                // until the Z4 walker populates them; the
+                // `.expect(...)` documents the AST-frontend total
+                // invariant.  Per-slot type unification across match
+                // arms is annotator-side per upstream
+                // `framestate.py:union` (Hlvalue identity only).
                 // Iterative left-fold over 2-way `FrameState::union`
                 // — direct port of upstream's `flowspace/
                 // flowcontext.py:430-436 mergeblock` loop:
@@ -4751,96 +5049,87 @@ fn lower_expr(
                 // local to two different concrete kinds, so the
                 // `.expect(...)` documents the contract.
                 //
-                // TODO(spamblock-recloseblock-port): upstream's
-                // mergeblock
+                // PRE-EXISTING-ADAPTATION (no SpamBlock /
+                // recloseblock chain — fused into direct construction).
+                // Upstream's `mergeblock` (`flowcontext.py:425-463`)
                 // generalises by creating a fresh `SpamBlock(newstate)`
-                // (`flowcontext.py:443`), marking the prior block
-                // dead via `block.dead = True` + `block.operations =
-                // ()` (`:455-456`), and patching the dead block's
-                // exits to forward to the new block via
+                // (`:443`), marking the prior block dead via
+                // `block.dead = True` + `block.operations = ()`
+                // (`:455-456`), and patching the dead block's exits
+                // to forward to the new block via
                 // `block.recloseblock(Link(outputargs, newblock))`
-                // (`:458-459`).  The post-cleanup CFG (after
-                // `simplify.eliminate_empty_blocks`) collapses the
-                // dead-block forwarding chain into a single
-                // multi-incoming merge block — which is exactly the
-                // shape pyre's static AST produces directly.
+                // (`:458-459`).  `simplify.eliminate_empty_blocks`
+                // (`simplify.py:52-69`) then collapses the dead-block
+                // forwarding chain into a single multi-incoming merge
+                // block — which is exactly the shape pyre's static
+                // AST produces directly.
                 //
-                // Convergence path: introduce a pendingblock-style
-                // worklist at `Expr::Match` lowering, emit one
-                // SpamBlock per fold step, mark intermediate blocks
-                // dead, and run an `eliminate_empty_blocks` pass
-                // before downstream rtyper / flatten / regalloc see
-                // the graph.  Multi-session — touches Expr::Match
-                // traversal, block lifecycle, and adds a
-                // `simplify_graph` pass equivalent.  Until then,
-                // pyre produces the post-cleanup CFG directly and
-                // the dataflow is parity-correct.
+                // Pyre's tree-recursive lowering has no per-bytecode
+                // dispatch loop, so the chain ceremony is fused into
+                // direct construction; the resulting CFG is the
+                // post-collapse upstream-orthodox shape.  The Block
+                // `dead` field, `model::eliminate_empty_blocks` pass,
+                // and the `simplify_graph` invocation in
+                // `build_function_graph` are all in place; once Z4's
+                // flowcontext-walker rewrite materialises intermediate
+                // SpamBlocks per fold step, the chain becomes load-
+                // bearing without further infrastructure changes.
                 let mut acc = open_arm_snapshots[0].clone();
                 for arm in &open_arm_snapshots[1..] {
+                    // Same `expect` rationale as the `Expr::If` site:
+                    // AST-frontend `union` is total today (entries
+                    // ValueId-identity, vestigial empty/None for the
+                    // other 4 projections).  Z4 walker activation
+                    // makes the None branch reachable; this site
+                    // then needs the upstream
+                    // `flowcontext.py:431-436` candidate-loop
+                    // fallback.
                     acc = acc.union(arm, graph).expect(
-                        "rustc must have rejected differing concrete kinds across match arms",
+                        "AST frontend: union is total — entries domain has no UnionError, \
+                         stack / last_exception / blocklist / next_offset are vestigial \
+                         (framestate.py:78 None-return reachable only post-Z4 walker)",
                     );
                 }
                 let merged = acc;
-                // Detection of "fresh phi" (vid allocated by `union`
-                // because per-arm vids disagreed): the merged slot's
-                // vid does NOT match the first arm's vid for the
-                // same slot.  When all arms agreed, the fold carried
-                // the agreed vid through, so the comparison is
-                // False and no fresh phi is emitted.
                 let first_arm = &open_arm_snapshots[0];
-                for (slot_idx, slot) in merged.entries.iter().enumerate() {
-                    let Some(slot) = slot.as_ref() else {
-                        continue;
-                    };
-                    let first_vid = first_arm
-                        .entries
-                        .get(slot_idx)
-                        .and_then(|e| e.as_ref())
-                        .map(|e| e.value_id);
-                    let is_carry_through = first_vid == Some(slot.value_id);
-                    if is_carry_through
-                        && !matches!(slot.value_type, ValueType::Unknown)
-                        && !matches!(
-                            graph_value_type(graph, slot.value_id),
-                            Some(ref t) if t == &slot.value_type,
-                        )
-                    {
-                        retag_result_value_type(graph, slot.value_id, slot.value_type.clone());
-                    }
-                }
+                // Type unification across arms is annotator-side per
+                // upstream `framestate.py:union` (Hlvalue identity
+                // only).  The prior carry-through retag block was a
+                // NEW-DEVIATION dependent on the retired
+                // `FrameStateEntry::value_type` field; it has been
+                // removed in Path-Z Slice 2.3 (mirrors the If/else
+                // counterpart).  Convergence: same as If/else —
+                // annotator/rtyper port handles type unification at
+                // its proper layer.
                 for (slot_idx, slot) in merged.entries.iter().enumerate() {
                     if slot.is_some() {
                         continue;
                     }
-                    let name = open_arm_snapshots.iter().find_map(|s| {
-                        s.entries
-                            .get(slot_idx)
-                            .and_then(|e| e.as_ref())
-                            .map(|e| e.name.clone())
-                    });
-                    if let Some(name) = name {
+                    // None-kill: resolve `slot_idx → name` via
+                    // `local_first_bind_order` per the framestate
+                    // positional-zip invariant (mirrors the If-merge
+                    // counterpart).
+                    if let Some(name) = ctx.local_first_bind_order.get(slot_idx).cloned() {
                         ctx.local_value_ids.remove(&name);
                         ctx.local_value_types.remove(&name);
                     }
                 }
-                for (slot_idx, slot) in merged.entries.iter().enumerate() {
-                    let Some(slot) = slot.as_ref() else {
-                        continue;
-                    };
-                    let first_vid = first_arm
-                        .entries
-                        .get(slot_idx)
-                        .and_then(|e| e.as_ref())
-                        .map(|e| e.value_id);
-                    let is_fresh_phi = first_vid != Some(slot.value_id);
+                for (slot_idx, slot_vid) in merged
+                    .entries
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, e)| e.map(|vid| (i, vid)))
+                {
+                    let first_vid = first_arm.entries.get(slot_idx).copied().flatten();
+                    let is_fresh_phi = first_vid != Some(slot_vid);
                     if is_fresh_phi {
+                        let name = ctx.local_first_bind_order[slot_idx].clone();
                         let _ = lazy_install_local_at_current_block(
                             graph,
                             ctx,
                             merge,
-                            &slot.name,
-                            Some(slot.value_id),
+                            &name,
+                            Some(slot_vid),
                         );
                     }
                 }
@@ -4881,7 +5170,7 @@ fn lower_expr(
             // stamp shape:
             // `flowspace/flowcontext.py:407-408 record_block(block)`.
             let pre_loop_block = *block;
-            let pre_loop_snapshot = ctx.snapshot_locals_for_link();
+            let pre_loop_snapshot = ctx.getstate(0);
             graph.set_goto(pre_loop_block, header_entry, vec![]);
 
             let must_merge = loop_body_locals(&w.body);
@@ -4907,7 +5196,7 @@ fn lower_expr(
             let mut header_tail = header_entry;
             let cond = get_value!(lower_expr(graph, &mut header_tail, &w.cond, options, ctx)?);
             let body_entry = graph.create_block();
-            let header_branch_snapshot = ctx.snapshot_locals_for_link();
+            let header_branch_snapshot = ctx.getstate(0);
             graph.set_branch(header_tail, cond, body_entry, vec![], exit, vec![]);
             graph.block_mut(header_tail).framestate = Some(header_branch_snapshot);
 
@@ -4943,7 +5232,7 @@ fn lower_expr(
                 // `flowspace/framestate.py:92 getoutputargs` produces
                 // the same slot-by-slot mapping for the closing
                 // predecessor link.
-                let body_tail_snapshot = ctx.snapshot_locals_for_link();
+                let body_tail_snapshot = ctx.getstate(0);
                 let header_phi_names = header_phi_name_list(graph, header_entry);
                 let back_edge_args = link_args_from_ctx(ctx, &header_phi_names);
                 graph.set_goto(body_tail, header_entry, back_edge_args);
@@ -4977,7 +5266,7 @@ fn lower_expr(
             let exit = graph.create_block();
 
             let pre_loop_block = *block;
-            let pre_loop_snapshot = ctx.snapshot_locals_for_link();
+            let pre_loop_snapshot = ctx.getstate(0);
             graph.set_goto(pre_loop_block, body_entry, vec![]);
 
             let must_merge = loop_body_locals(&l.body);
@@ -5011,7 +5300,7 @@ fn lower_expr(
                 // Audit Cat 2-1: stamp body-tail's framestate (see
                 // the matching `Expr::While` body-tail stamp for the
                 // cycle-safety rationale).
-                let body_tail_snapshot = ctx.snapshot_locals_for_link();
+                let body_tail_snapshot = ctx.getstate(0);
                 let header_phi_names = header_phi_name_list(graph, body_entry);
                 let back_edge_args = link_args_from_ctx(ctx, &header_phi_names);
                 graph.set_goto(body_tail, body_entry, back_edge_args);
@@ -5051,7 +5340,7 @@ fn lower_expr(
             let exit = graph.create_block();
 
             let pre_loop_block = *block;
-            let pre_loop_snapshot = ctx.snapshot_locals_for_link();
+            let pre_loop_snapshot = ctx.getstate(0);
             graph.set_goto(pre_loop_block, header_entry, vec![]);
 
             let must_merge = loop_body_locals(&f.body);
@@ -5084,7 +5373,7 @@ fn lower_expr(
             // or post-loop exit recurse back to the header and find
             // its exit-time snapshot (which already includes the
             // eager phis bound to ctx).
-            let header_branch_snapshot = ctx.snapshot_locals_for_link();
+            let header_branch_snapshot = ctx.getstate(0);
             if let Some(cond) = for_cond {
                 graph.set_branch(header_entry, cond, body_entry, vec![], exit, vec![]);
             } else {
@@ -5110,7 +5399,7 @@ fn lower_expr(
                 // Audit Cat 2-1: stamp body-tail's framestate (see
                 // the matching `Expr::While` body-tail stamp for the
                 // cycle-safety rationale).
-                let body_tail_snapshot = ctx.snapshot_locals_for_link();
+                let body_tail_snapshot = ctx.getstate(0);
                 let header_phi_names = header_phi_name_list(graph, header_entry);
                 let back_edge_args = link_args_from_ctx(ctx, &header_phi_names);
                 graph.set_goto(body_tail, header_entry, back_edge_args);
@@ -5150,7 +5439,7 @@ fn lower_expr(
                     // accompanied by a corresponding lazy-installed
                     // arg push onto this exit's link by the lazy
                     // installer's predecessor walk.
-                    let pre_break_snapshot = ctx.snapshot_locals_for_link();
+                    let pre_break_snapshot = ctx.getstate(0);
                     graph.set_goto(*block, frame.break_target, vec![]);
                     // Stamp the break source's framestate so the
                     // post-loop lazy installer can read the locals
@@ -5200,7 +5489,7 @@ fn lower_expr(
                     // the recursive install at the header short-
                     // circuits via the same-block graph-state
                     // idempotency check on `block.inputargs`.
-                    let pre_continue_snapshot = ctx.snapshot_locals_for_link();
+                    let pre_continue_snapshot = ctx.getstate(0);
                     let header_phi_names = header_phi_name_list(graph, frame.continue_target);
                     let args = link_args_from_ctx(ctx, &header_phi_names);
                     graph.set_goto(*block, frame.continue_target, args);
@@ -10956,12 +11245,13 @@ mod tests {
     // `co_varnames` slot order) + the rebind detection contract that
     // later slices depend on.
 
-    fn frame_entry(name: &str, vid: usize, ty: ValueType) -> Option<FrameStateEntry> {
-        Some(FrameStateEntry {
-            name: name.to_string(),
-            value_id: ValueId(vid),
-            value_type: ty,
-        })
+    fn frame_entry(_name: &str, vid: usize, _ty: ValueType) -> Option<ValueId> {
+        // `_name` and `_ty` are retained as positional readability cues
+        // for tests — the slot index in `FrameState.entries` (set by
+        // the surrounding fixture's vec! position) is the structural
+        // identity, and types live on the op that defines `vid` per
+        // upstream `Variable.concretetype`.
+        Some(ValueId(vid))
     }
 
     #[test]
@@ -10979,6 +11269,7 @@ mod tests {
                 frame_entry("a", 1, ValueType::Int),
                 frame_entry("b", 2, ValueType::Ref),
             ],
+            ..Default::default()
         };
         assert_eq!(
             frame.link_args(),
@@ -11002,11 +11293,18 @@ mod tests {
                 frame_entry("b", 2, ValueType::Ref),
                 frame_entry("a", 1, ValueType::Int),
             ],
+            ..Default::default()
         };
-        let collected: Vec<(&str, ValueId)> = frame.iter().map(|(n, v, _)| (n, v)).collect();
+        // `iter()` now yields `(slot_idx, ValueId, &ValueType)` —
+        // callers translate `slot_idx` to a name via
+        // `local_first_bind_order`.  The fixture above sets up
+        // entries [b=vid2, a=vid1] at slots [0, 1] so the iter walks
+        // the same positions; verifying the (slot, vid) pairs is the
+        // direct equivalent of the pre-Slice-2.2 (name, vid) check.
+        let collected: Vec<(usize, ValueId)> = frame.iter().collect();
         assert_eq!(
             collected,
-            vec![("b", ValueId(2)), ("a", ValueId(1))],
+            vec![(0, ValueId(2)), (1, ValueId(1))],
             "iter must walk stored (first-bind positional) order"
         );
     }
@@ -11018,23 +11316,16 @@ mod tests {
         // if w1 == w2: return w1`.
         let a = FrameState {
             entries: vec![frame_entry("x", 7, ValueType::Int)],
+            ..Default::default()
         };
         let b = FrameState {
             entries: vec![frame_entry("x", 7, ValueType::Int)],
+            ..Default::default()
         };
         let mut graph = crate::model::FunctionGraph::new("test");
         graph.set_next_value(100);
-        let merged = a
-            .union(&b, &mut graph)
-            .expect("matching states must union cleanly");
-        assert_eq!(
-            merged.entries,
-            vec![Some(crate::model::FrameStateEntry {
-                name: "x".to_string(),
-                value_id: ValueId(7),
-                value_type: ValueType::Int,
-            })]
-        );
+        let merged = a.union(&b, &mut graph).expect("test invariant: AST frontend union is total — entries domain has no UnionError, vestigial stack/exc/blocklist/next_offset (framestate.py:78)");
+        assert_eq!(merged.entries, vec![Some(ValueId(7))]);
         // No fresh allocation: `next_value` cursor stays at 100.
         assert_eq!(graph.next_value(), 100);
     }
@@ -11046,23 +11337,16 @@ mod tests {
         // 113-114 return Variable()`.
         let a = FrameState {
             entries: vec![frame_entry("x", 7, ValueType::Int)],
+            ..Default::default()
         };
         let b = FrameState {
             entries: vec![frame_entry("x", 8, ValueType::Int)],
+            ..Default::default()
         };
         let mut graph = crate::model::FunctionGraph::new("test");
         graph.set_next_value(100);
-        let merged = a
-            .union(&b, &mut graph)
-            .expect("disagreeing vids must produce a fresh phi vid without TypeMismatch");
-        assert_eq!(
-            merged.entries,
-            vec![Some(crate::model::FrameStateEntry {
-                name: "x".to_string(),
-                value_id: ValueId(100),
-                value_type: ValueType::Int,
-            })]
-        );
+        let merged = a.union(&b, &mut graph).expect("test invariant: AST frontend union is total — entries domain has no UnionError, vestigial stack/exc/blocklist/next_offset (framestate.py:78)");
+        assert_eq!(merged.entries, vec![Some(ValueId(100))]);
         // Fresh allocation consumed exactly one vid.
         assert_eq!(graph.next_value(), 101);
     }
@@ -11083,6 +11367,7 @@ mod tests {
                 frame_entry("only_a", 2, ValueType::Int),
                 None,
             ],
+            ..Default::default()
         };
         let b = FrameState {
             entries: vec![
@@ -11090,30 +11375,27 @@ mod tests {
                 None,
                 frame_entry("only_b", 3, ValueType::Int),
             ],
+            ..Default::default()
         };
         let mut graph = crate::model::FunctionGraph::new("test");
         graph.set_next_value(100);
-        let merged = a
-            .union(&b, &mut graph)
-            .expect("type-compatible slots must union cleanly");
+        let merged = a.union(&b, &mut graph).expect("test invariant: AST frontend union is total — entries domain has no UnionError, vestigial stack/exc/blocklist/next_offset (framestate.py:78)");
         assert_eq!(
             merged.entries.len(),
             3,
             "merged state must preserve positional length = max(len)"
         );
-        let names: Vec<&str> = merged
-            .entries
-            .iter()
-            .filter_map(|e| e.as_ref().map(|e| e.name.as_str()))
-            .collect();
-        assert_eq!(
-            names,
-            vec!["survivor"],
-            "one-sided slots must be killed (None-kill semantics)"
+        // Slot 0 is the shared survivor; slots 1 and 2 are the
+        // one-sided locals that must collapse via None-kill.  The
+        // positional shape is the structural identity (mirrors
+        // upstream `framestate.py:locals_w` slot-index convention).
+        assert!(
+            merged.entries[0].is_some(),
+            "shared survivor slot stays bound"
         );
         assert!(
             merged.entries[1].is_none() && merged.entries[2].is_none(),
-            "one-sided slots stay positionally as None"
+            "one-sided slots must be killed (None-kill semantics)"
         );
     }
 
@@ -11128,157 +11410,61 @@ mod tests {
         // wider side (`max(len)`).
         let early = FrameState {
             entries: vec![frame_entry("x", 1, ValueType::Int)],
+            ..Default::default()
         };
         let late = FrameState {
             entries: vec![
                 frame_entry("x", 1, ValueType::Int),
                 frame_entry("y_added_later", 2, ValueType::Int),
             ],
+            ..Default::default()
         };
         let mut graph = crate::model::FunctionGraph::new("test");
         graph.set_next_value(100);
-        let merged = early
-            .union(&late, &mut graph)
-            .expect("type-compatible slots must union cleanly");
+        let merged = early.union(&late, &mut graph).expect("test invariant: AST frontend union is total — entries domain has no UnionError, vestigial stack/exc/blocklist/next_offset (framestate.py:78)");
         assert_eq!(
             merged.entries.len(),
             2,
             "merged state must extend to wider predecessor's length"
         );
-        let names: Vec<&str> = merged
-            .entries
-            .iter()
-            .filter_map(|e| e.as_ref().map(|e| e.name.as_str()))
-            .collect();
-        assert_eq!(names, vec!["x"]);
+        // Slot 0 is the shared `x`; slot 1 is the late-added local
+        // missing on the shorter predecessor's snapshot, collapsing
+        // via None-kill on the position-extended union.
+        assert!(merged.entries[0].is_some(), "shared slot stays bound");
         assert!(merged.entries[1].is_none(), "padded slot stays as None");
     }
 
-    #[test]
-    fn frame_state_union_concrete_kind_disagreement_returns_type_mismatch() {
-        // RPython `flowspace/framestate.py:88 FrameState.union` wraps
-        // its inner `_union` in `try/except UnionError: return None`,
-        // and `flowcontext.py:430-436 mergeblock` reads that `None` as
-        // a **whole-state** "this candidate did not unify, retry /
-        // make_next_block" signal — NOT a per-slot drop.  Silently
-        // None-killing the slot would let post-merge reads of `x`
-        // surface as undefined-local instead of blocking the merge,
-        // which would reorder PyPy's mergeblock contract.
-        //
-        // Pyre surfaces the same shape as `Err(UnionError::TypeMismatch)`
-        // for the whole call.  Under valid Rust input rustc rejects
-        // any source that binds the same local to two different
-        // concrete kinds across arms (`Int` vs `Ref` here), so
-        // production callers `.expect(...)` the `Err` arm; this
-        // fixture bypasses the Rust frontend by constructing the
-        // framestates by hand to verify the failure path.
-        use crate::model::UnionError;
-        let a = FrameState {
-            entries: vec![frame_entry("x", 1, ValueType::Int)],
-        };
-        let b = FrameState {
-            entries: vec![frame_entry("x", 2, ValueType::Ref)],
-        };
-        let mut graph = crate::model::FunctionGraph::new("test");
-        graph.set_next_value(100);
-        let err = a
-            .union(&b, &mut graph)
-            .expect_err("concrete kind disagreement must surface UnionError::TypeMismatch");
-        assert_eq!(
-            err,
-            UnionError::TypeMismatch {
-                name: "x".to_string(),
-                self_type: ValueType::Int,
-                other_type: ValueType::Ref,
-            },
-        );
-        // `framestate.py:73-89 try/except UnionError: return None`
-        // discards a partially-built result; pyre's atomic two-pass
-        // implementation must not advance `graph.next_value()` when
-        // the union ultimately fails.  Slot 0 disagrees on vid (1 vs
-        // 2) which would have allocated a fresh vid in Pass 2, but
-        // Pass 1's TypeMismatch detection runs before any
-        // `graph.alloc_value()` call.
-        assert_eq!(
-            graph.next_value(),
-            100,
-            "no fresh allocation must occur when union returns Err"
-        );
-    }
+    // Path-Z Slice 2.3 retired the `UnionError::TypeMismatch`
+    // variant: per-slot type unification belongs on the annotator side
+    // (`Variable.annotation`, `framestate.py:union` is Hlvalue-identity
+    // only).  Two prior tests exercising that failure surface
+    // (`frame_state_union_concrete_kind_disagreement_returns_type_mismatch`
+    // and `frame_state_union_does_not_advance_vid_counter_on_late_type_mismatch`)
+    // are removed — the deviation they pinned no longer exists.
 
     #[test]
-    fn frame_state_union_does_not_advance_vid_counter_on_late_type_mismatch() {
-        // Slot 0 disagrees on vid only (would allocate a fresh vid in
-        // Pass 2); slot 1 disagrees on concrete kind (TypeMismatch).
-        // The atomic-on-error contract requires that slot 0's
-        // hypothetical fresh allocation is NOT committed because
-        // slot 1's failure aborts before Pass 2 runs.
-        use crate::model::UnionError;
-        let a = FrameState {
-            entries: vec![
-                frame_entry("x", 1, ValueType::Int),
-                frame_entry("y", 3, ValueType::Int),
-            ],
-        };
-        let b = FrameState {
-            entries: vec![
-                frame_entry("x", 2, ValueType::Int),
-                frame_entry("y", 4, ValueType::Ref),
-            ],
-        };
-        let mut graph = crate::model::FunctionGraph::new("test");
-        graph.set_next_value(100);
-        let err = a
-            .union(&b, &mut graph)
-            .expect_err("late-slot kind disagreement must surface UnionError::TypeMismatch");
-        assert!(matches!(err, UnionError::TypeMismatch { .. }));
-        assert_eq!(
-            graph.next_value(),
-            100,
-            "no fresh allocation must occur when union returns Err — \
-             even when an earlier slot would have triggered one in Pass 2"
-        );
-    }
-
-    #[test]
-    fn frame_state_union_treats_unknown_as_wildcard() {
-        // RPython `flowspace/Variable` is untyped at flowspace level,
-        // so `framestate.py:union` never raises on type mismatch — it
-        // produces a fresh `Variable` for any disagreement.  Pyre
-        // tracks ValueType to pin int/ref/float register banks for
-        // the typed pipeline, but `Unknown` is the explicit "no
-        // annotation captured" sentinel and is structurally a
-        // wildcard: an inferred-only bind on one arm and an annotated
-        // bind on the other are still the same slot.  TypeMismatch
-        // fires only when both sides are concrete and disagree.
+    fn frame_state_union_carries_through_same_vid() {
+        // RPython `flowspace/framestate.py:108-109 if w1 == w2: return
+        // w1`: matching Hlvalue identity carries through unchanged.
+        // Type unification is annotator-side post-Path-Z-Slice-2.3, so
+        // this fixture only verifies the vid-identity carry-through;
+        // any per-arm type metadata flows on `Variable.concretetype`
+        // at the rtyper layer.
         let inferred = FrameState {
             entries: vec![frame_entry("x", 1, ValueType::Unknown)],
+            ..Default::default()
         };
         let annotated = FrameState {
             entries: vec![frame_entry("x", 1, ValueType::Int)],
+            ..Default::default()
         };
         let mut graph = crate::model::FunctionGraph::new("test");
         graph.set_next_value(100);
-        // Carry-through: same vid, Unknown vs Int → resolves to Int.
-        let merged = inferred
-            .union(&annotated, &mut graph)
-            .expect("Unknown wildcard against concrete kind must union cleanly");
-        assert_eq!(
-            merged.entries,
-            vec![Some(crate::model::FrameStateEntry {
-                name: "x".to_string(),
-                value_id: ValueId(1),
-                value_type: ValueType::Int,
-            })]
-        );
-        // Symmetric: concrete on self, Unknown on other → still Int.
-        let merged_swap = annotated
-            .union(&inferred, &mut graph)
-            .expect("Unknown wildcard against concrete kind must union cleanly");
-        assert_eq!(
-            merged_swap.entries[0].as_ref().unwrap().value_type,
-            ValueType::Int
-        );
+        let merged = inferred.union(&annotated, &mut graph).expect("test invariant: AST frontend union is total — entries domain has no UnionError, vestigial stack/exc/blocklist/next_offset (framestate.py:78)");
+        assert_eq!(merged.entries, vec![Some(ValueId(1))]);
+        // Symmetric.
+        let merged_swap = annotated.union(&inferred, &mut graph).expect("test invariant: AST frontend union is total — entries domain has no UnionError, vestigial stack/exc/blocklist/next_offset (framestate.py:78)");
+        assert_eq!(merged_swap.entries, vec![Some(ValueId(1))]);
     }
 
     #[test]
@@ -11291,28 +11477,20 @@ mod tests {
         // allocation along the chain.
         let a = FrameState {
             entries: vec![frame_entry("x", 7, ValueType::Int)],
+            ..Default::default()
         };
         let b = FrameState {
             entries: vec![frame_entry("x", 7, ValueType::Int)],
+            ..Default::default()
         };
         let c = FrameState {
             entries: vec![frame_entry("x", 7, ValueType::Int)],
+            ..Default::default()
         };
         let mut graph = crate::model::FunctionGraph::new("test");
         graph.set_next_value(100);
-        let acc = a
-            .union(&b, &mut graph)
-            .expect("matching arms must union cleanly")
-            .union(&c, &mut graph)
-            .expect("matching arms must union cleanly");
-        assert_eq!(
-            acc.entries,
-            vec![Some(crate::model::FrameStateEntry {
-                name: "x".to_string(),
-                value_id: ValueId(7),
-                value_type: ValueType::Int,
-            })]
-        );
+        let acc = a.union(&b, &mut graph).expect("test invariant: AST frontend union is total — entries domain has no UnionError, vestigial stack/exc/blocklist/next_offset (framestate.py:78)").union(&c, &mut graph).expect("test invariant: AST frontend union is total — entries domain has no UnionError, vestigial stack/exc/blocklist/next_offset (framestate.py:78)");
+        assert_eq!(acc.entries, vec![Some(ValueId(7))]);
         assert_eq!(graph.next_value(), 100, "no fresh allocation expected");
     }
 
@@ -11326,34 +11504,26 @@ mod tests {
         // SpamBlock).
         let a = FrameState {
             entries: vec![frame_entry("x", 7, ValueType::Int)],
+            ..Default::default()
         };
         let b = FrameState {
             entries: vec![frame_entry("x", 7, ValueType::Int)],
+            ..Default::default()
         };
         let c = FrameState {
             entries: vec![frame_entry("x", 8, ValueType::Int)],
+            ..Default::default()
         };
         let mut graph = crate::model::FunctionGraph::new("test");
         graph.set_next_value(100);
-        let acc = a
-            .union(&b, &mut graph)
-            .expect("first fold step (carry-through) must succeed");
+        let acc = a.union(&b, &mut graph).expect("test invariant: AST frontend union is total — entries domain has no UnionError, vestigial stack/exc/blocklist/next_offset (framestate.py:78)");
         assert_eq!(
             graph.next_value(),
             100,
             "carry-through step must not allocate"
         );
-        let acc = acc
-            .union(&c, &mut graph)
-            .expect("disagreeing vids must produce a fresh phi without TypeMismatch");
-        assert_eq!(
-            acc.entries,
-            vec![Some(crate::model::FrameStateEntry {
-                name: "x".to_string(),
-                value_id: ValueId(100),
-                value_type: ValueType::Int,
-            })]
-        );
+        let acc = acc.union(&c, &mut graph).expect("test invariant: AST frontend union is total — entries domain has no UnionError, vestigial stack/exc/blocklist/next_offset (framestate.py:78)");
+        assert_eq!(acc.entries, vec![Some(ValueId(100))]);
         assert_eq!(
             graph.next_value(),
             101,
@@ -11373,27 +11543,26 @@ mod tests {
                 frame_entry("survivor", 1, ValueType::Int),
                 frame_entry("only_ab", 2, ValueType::Int),
             ],
+            ..Default::default()
         };
         let b = FrameState {
             entries: vec![
                 frame_entry("survivor", 1, ValueType::Int),
                 frame_entry("only_ab", 2, ValueType::Int),
             ],
+            ..Default::default()
         };
         let c = FrameState {
             entries: vec![frame_entry("survivor", 1, ValueType::Int)],
+            ..Default::default()
         };
         let mut graph = crate::model::FunctionGraph::new("test");
         graph.set_next_value(100);
-        let acc = a
-            .union(&b, &mut graph)
-            .expect("type-compatible slots must union cleanly")
-            .union(&c, &mut graph)
-            .expect("type-compatible slots must union cleanly");
+        let acc = a.union(&b, &mut graph).expect("test invariant: AST frontend union is total — entries domain has no UnionError, vestigial stack/exc/blocklist/next_offset (framestate.py:78)").union(&c, &mut graph).expect("test invariant: AST frontend union is total — entries domain has no UnionError, vestigial stack/exc/blocklist/next_offset (framestate.py:78)");
         assert_eq!(acc.entries.len(), 2);
-        assert_eq!(
-            acc.entries[0].as_ref().map(|e| e.name.as_str()),
-            Some("survivor"),
+        assert!(
+            acc.entries[0].is_some(),
+            "shared survivor slot stays bound across the fold chain"
         );
         assert!(
             acc.entries[1].is_none(),
@@ -11415,6 +11584,7 @@ mod tests {
                 frame_entry("a", 1, ValueType::Int),
                 frame_entry("b", 2, ValueType::Int),
             ],
+            ..Default::default()
         };
         let b = FrameState {
             entries: vec![
@@ -11422,20 +11592,20 @@ mod tests {
                 frame_entry("a", 1, ValueType::Int),
                 frame_entry("b", 2, ValueType::Int),
             ],
+            ..Default::default()
         };
         let mut graph = crate::model::FunctionGraph::new("test");
         graph.set_next_value(100);
-        let merged = a
-            .union(&b, &mut graph)
-            .expect("type-compatible slots must union cleanly");
-        let order: Vec<&str> = merged
-            .entries
-            .iter()
-            .filter_map(|e| e.as_ref().map(|e| e.name.as_str()))
-            .collect();
+        let merged = a.union(&b, &mut graph).expect("test invariant: AST frontend union is total — entries domain has no UnionError, vestigial stack/exc/blocklist/next_offset (framestate.py:78)");
+        // The fixture sets up slots [c=vid3, a=vid1, b=vid2] in that
+        // graph-wide first-bind order; the union must preserve those
+        // positional vids.  Slot 0 = c (vid 3), slot 1 = a (vid 1),
+        // slot 2 = b (vid 2) — direct port of upstream's positional
+        // `_union(locals_w_self, locals_w_other)` zip.
+        let vids: Vec<Option<ValueId>> = merged.entries.clone();
         assert_eq!(
-            order,
-            vec!["c", "a", "b"],
+            vids,
+            vec![Some(ValueId(3)), Some(ValueId(1)), Some(ValueId(2))],
             "merged slot order must follow graph-wide first-bind order"
         );
     }
@@ -11454,6 +11624,7 @@ mod tests {
                 frame_entry("b", 20, ValueType::Int),
                 frame_entry("c", 30, ValueType::Int),
             ],
+            ..Default::default()
         };
         let other = FrameState {
             entries: vec![
@@ -11461,12 +11632,11 @@ mod tests {
                 frame_entry("b", 99, ValueType::Int),
                 frame_entry("c", 30, ValueType::Int),
             ],
+            ..Default::default()
         };
         let mut graph = crate::model::FunctionGraph::new("test");
         graph.set_next_value(100);
-        let merged = pred
-            .union(&other, &mut graph)
-            .expect("type-compatible slots must union cleanly");
+        let merged = pred.union(&other, &mut graph).expect("test invariant: AST frontend union is total — entries domain has no UnionError, vestigial stack/exc/blocklist/next_offset (framestate.py:78)");
         let link_args = pred.getoutputargs(&merged);
         assert_eq!(
             link_args,
@@ -11487,6 +11657,7 @@ mod tests {
                 frame_entry("only_a", 22, ValueType::Int),
                 None,
             ],
+            ..Default::default()
         };
         let b = FrameState {
             entries: vec![
@@ -11494,12 +11665,11 @@ mod tests {
                 None,
                 frame_entry("only_b", 33, ValueType::Int),
             ],
+            ..Default::default()
         };
         let mut graph = crate::model::FunctionGraph::new("test");
         graph.set_next_value(100);
-        let merged = a
-            .union(&b, &mut graph)
-            .expect("type-compatible slots must union cleanly");
+        let merged = a.union(&b, &mut graph).expect("test invariant: AST frontend union is total — entries domain has no UnionError, vestigial stack/exc/blocklist/next_offset (framestate.py:78)");
         let link_args = a.getoutputargs(&merged);
         assert_eq!(
             link_args,
@@ -11621,7 +11791,7 @@ mod tests {
         // `pre_loop_snapshot` is produced by ctx in the real lowering;
         // mirror that here so the allocator walks the same first-bind
         // positional order Slice 5c.1 will feed it.
-        let pre_loop_snapshot = ctx.snapshot_locals_for_link();
+        let pre_loop_snapshot = ctx.getstate(0);
         assert_eq!(pre_loop_snapshot.entries.len(), 2);
 
         // `x` is read inside the body, `z` is body-only (rebound
@@ -12093,17 +12263,19 @@ mod tests {
         }
     }
 
-    /// Slice 5d nested-pattern coverage #3: a `loop` with NO `break`
-    /// (back-edge always closes; exit is dead).  The lowering should
-    /// succeed; the unreachable `*block = exit` post-loop is left for
-    /// the simplifier.  RPython parity for "endless" loops:
-    /// `flowspace/flowcontext.py:1378` — every `for`/`while`/`loop`
-    /// without an exit signal builds a graph whose post-loop block is
-    /// pruned by `simplify`.  This test does NOT assert pruning (that
-    /// is `simplify_graph`'s contract), only that `build_semantic_
-    /// program` succeeds.
+    /// Slice 5d nested-pattern coverage #3 (PyPy-parity revision):
+    /// a `loop` with NO `break` whose body contains only side-effect-
+    /// free ops.  After `prune_dead_phis` (RPython
+    /// `transform_dead_op_vars`, `simplify.py:422-524`) DCEs the
+    /// unobservable body, the loop header becomes an empty block whose
+    /// only exit is its own back-edge.  `eliminate_empty_blocks`
+    /// (`simplify.py:64`) detects this as `"the graph contains an
+    /// empty infinite loop"` and asserts — upstream marks such a graph
+    /// as a broken program (no observable termination, no observable
+    /// effects).  Pyre matches the assert.
     #[test]
-    fn loop_with_no_break_lowers_without_panic() {
+    #[should_panic(expected = "the graph contains an empty infinite loop")]
+    fn loop_with_no_break_panics_on_empty_infinite_loop_per_simplify_assert() {
         let parsed = crate::parse::parse_source(
             r#"
             fn example() -> i64 {
@@ -12683,5 +12855,284 @@ mod tests {
         };
         let hints = super::collect_jit_hints_with_sig(&item.attrs, &item.sig);
         assert!(hints.iter().all(|h| !h.starts_with("oopspec_argnames:")));
+    }
+
+    // ----------------------------------------------------------------
+    // Slice Z4.A: flow-space value-stack helper coverage.
+    //
+    // The helper API surface is ported from `flowspace/flowcontext.py:
+    // 317-345` ahead of any consumer (slice Z4.B+ converts `lower_expr`
+    // leaves to push/pop).  The tests below pin the upstream semantics:
+    // LIFO push/pop, `peekvalue(0)` = top, `popvalues(0)` = empty,
+    // `popvalues(n)` returns oldest-first, `dropvaluesuntil` shrinks.
+    // Run against an isolated `GraphBuildContext` instance — no graph
+    // wiring required because the value stack lives entirely on ctx.
+
+    fn z4a_test_ctx<'a>(
+        struct_fields: &'a StructFieldRegistry,
+        fn_return_types: &'a HashMap<String, String>,
+        known_struct_names: &'a std::collections::HashSet<String>,
+        known_trait_names: &'a std::collections::HashSet<String>,
+    ) -> GraphBuildContext<'a> {
+        GraphBuildContext::new(
+            struct_fields,
+            fn_return_types,
+            "",
+            known_struct_names,
+            known_trait_names,
+        )
+    }
+
+    #[test]
+    fn z4a_pushvalue_popvalue_round_trip_matches_flowcontext_lifo() {
+        let registry = StructFieldRegistry::default();
+        let fn_ret = HashMap::new();
+        let names = std::collections::HashSet::new();
+        let trait_names = std::collections::HashSet::new();
+        let mut ctx = z4a_test_ctx(&registry, &fn_ret, &names, &trait_names);
+        assert_eq!(ctx.stackdepth(), 0);
+        ctx.pushvalue(ValueId(7));
+        ctx.pushvalue(ValueId(11));
+        assert_eq!(ctx.stackdepth(), 2);
+        // `popvalue` returns the topmost cell — LIFO per
+        // `flowcontext.py:325 self.stack.pop()`.
+        assert_eq!(ctx.popvalue(), ValueId(11));
+        assert_eq!(ctx.popvalue(), ValueId(7));
+        assert_eq!(ctx.stackdepth(), 0);
+    }
+
+    #[test]
+    fn z4a_peekvalue_index_zero_is_top_per_flowcontext_tilde_indexing() {
+        let registry = StructFieldRegistry::default();
+        let fn_ret = HashMap::new();
+        let names = std::collections::HashSet::new();
+        let trait_names = std::collections::HashSet::new();
+        let mut ctx = z4a_test_ctx(&registry, &fn_ret, &names, &trait_names);
+        ctx.pushvalue(ValueId(1));
+        ctx.pushvalue(ValueId(2));
+        ctx.pushvalue(ValueId(3));
+        // `peekvalue(0)` is the top per upstream's `~0 == -1` indexing
+        // (`flowcontext.py:329`).
+        assert_eq!(ctx.peekvalue(0), ValueId(3));
+        assert_eq!(ctx.peekvalue(1), ValueId(2));
+        assert_eq!(ctx.peekvalue(2), ValueId(1));
+        // peekvalue is non-destructive.
+        assert_eq!(ctx.stackdepth(), 3);
+    }
+
+    #[test]
+    fn z4a_settopvalue_overwrites_at_index_from_top() {
+        let registry = StructFieldRegistry::default();
+        let fn_ret = HashMap::new();
+        let names = std::collections::HashSet::new();
+        let trait_names = std::collections::HashSet::new();
+        let mut ctx = z4a_test_ctx(&registry, &fn_ret, &names, &trait_names);
+        ctx.pushvalue(ValueId(1));
+        ctx.pushvalue(ValueId(2));
+        ctx.pushvalue(ValueId(3));
+        ctx.settopvalue(ValueId(99), 1);
+        assert_eq!(ctx.peekvalue(0), ValueId(3));
+        assert_eq!(ctx.peekvalue(1), ValueId(99));
+        assert_eq!(ctx.peekvalue(2), ValueId(1));
+    }
+
+    #[test]
+    fn z4a_popvalues_zero_returns_empty_without_touching_stack() {
+        // `flowcontext.py:337-338`: `if n == 0: return []` short-circuits
+        // before the slice — verify the stack is untouched.
+        let registry = StructFieldRegistry::default();
+        let fn_ret = HashMap::new();
+        let names = std::collections::HashSet::new();
+        let trait_names = std::collections::HashSet::new();
+        let mut ctx = z4a_test_ctx(&registry, &fn_ret, &names, &trait_names);
+        ctx.pushvalue(ValueId(1));
+        let popped = ctx.popvalues(0);
+        assert!(popped.is_empty());
+        assert_eq!(ctx.stackdepth(), 1);
+    }
+
+    #[test]
+    fn z4a_popvalues_n_returns_oldest_first_in_stack_order() {
+        // `flowcontext.py:339-340`: `values_w = self.stack[-n:]; del
+        // self.stack[-n:]` — slice preserves stack order so element 0
+        // is the OLDEST of the popped cells (deepest of the n).
+        let registry = StructFieldRegistry::default();
+        let fn_ret = HashMap::new();
+        let names = std::collections::HashSet::new();
+        let trait_names = std::collections::HashSet::new();
+        let mut ctx = z4a_test_ctx(&registry, &fn_ret, &names, &trait_names);
+        ctx.pushvalue(ValueId(10));
+        ctx.pushvalue(ValueId(20));
+        ctx.pushvalue(ValueId(30));
+        ctx.pushvalue(ValueId(40));
+        let popped = ctx.popvalues(3);
+        assert_eq!(popped, vec![ValueId(20), ValueId(30), ValueId(40)]);
+        assert_eq!(ctx.stackdepth(), 1);
+        assert_eq!(ctx.peekvalue(0), ValueId(10));
+    }
+
+    #[test]
+    fn z4a_dropvaluesuntil_truncates_to_finaldepth() {
+        // `flowcontext.py:343-344 dropvaluesuntil(self, finaldepth)` —
+        // shrink the stack to `finaldepth` cells.  Used by
+        // `FrameBlock.cleanupstack` (`flowcontext.py:1335-1336`) on
+        // SETUP_* unwinds.
+        let registry = StructFieldRegistry::default();
+        let fn_ret = HashMap::new();
+        let names = std::collections::HashSet::new();
+        let trait_names = std::collections::HashSet::new();
+        let mut ctx = z4a_test_ctx(&registry, &fn_ret, &names, &trait_names);
+        for v in 1..=5 {
+            ctx.pushvalue(ValueId(v));
+        }
+        ctx.dropvaluesuntil(2);
+        assert_eq!(ctx.stackdepth(), 2);
+        assert_eq!(ctx.peekvalue(0), ValueId(2));
+        assert_eq!(ctx.peekvalue(1), ValueId(1));
+    }
+
+    #[test]
+    #[should_panic(expected = "popvalue: empty stack")]
+    fn z4a_popvalue_panics_on_empty_stack_per_flowcontext_indexerror() {
+        // Upstream `flowcontext.py:325 self.stack.pop()` raises
+        // `IndexError` on an empty stack; pyre raises via `expect`.
+        let registry = StructFieldRegistry::default();
+        let fn_ret = HashMap::new();
+        let names = std::collections::HashSet::new();
+        let trait_names = std::collections::HashSet::new();
+        let mut ctx = z4a_test_ctx(&registry, &fn_ret, &names, &trait_names);
+        let _ = ctx.popvalue();
+    }
+
+    // ----------------------------------------------------------------
+    // Slice Z4.A.2 — `getstate` / `setstate` skeleton coverage.
+    //
+    // `getstate(next_offset)` constructs a `FrameState` from the
+    // current ctx fields per `flowcontext.py:346-348`; `setstate`
+    // restores ctx fields from a `FrameState` per `:350-356`.  The
+    // tests below pin upstream's positional-vs-name shape: locals
+    // round-trip through `local_first_bind_order`, the four other
+    // projections (stack / last_exception / blocklist / next_offset)
+    // thread directly between `FrameState` and ctx fields with the
+    // stack staying vestigial-empty until Z2.5 bridges Hlvalue
+    // identity at Z4.last.
+
+    #[test]
+    fn z4a2_getstate_constructs_frame_state_from_locals_and_blockstack() {
+        let registry = StructFieldRegistry::default();
+        let fn_ret = HashMap::new();
+        let names = std::collections::HashSet::new();
+        let trait_names = std::collections::HashSet::new();
+        let mut ctx = z4a_test_ctx(&registry, &fn_ret, &names, &trait_names);
+        ctx.bind_local_id("x".into(), ValueId(7), BlockId(0));
+        ctx.bind_local_id("y".into(), ValueId(11), BlockId(0));
+        // last_exception + blockstack stay at defaults (None, []).
+        let state = ctx.getstate(42);
+        assert_eq!(state.entries, vec![Some(ValueId(7)), Some(ValueId(11))]);
+        assert!(
+            state.stack.is_empty(),
+            "stack vestigial empty until Z2.5 bridges Hlvalue identity (flowcontext.py:347 self.stack[:])"
+        );
+        assert!(state.last_exception.is_none());
+        assert!(state.blocklist.is_empty());
+        assert_eq!(state.next_offset, 42);
+    }
+
+    #[test]
+    fn z4a2_setstate_restores_locals_and_drops_stack_per_flowcontext_normalize() {
+        // Round-trip: getstate → setstate → getstate.  Locals project
+        // back through `local_first_bind_order`, value_stack is wiped
+        // (vestigial, see `setstate` doc-comment).
+        let registry = StructFieldRegistry::default();
+        let fn_ret = HashMap::new();
+        let names = std::collections::HashSet::new();
+        let trait_names = std::collections::HashSet::new();
+        let mut ctx = z4a_test_ctx(&registry, &fn_ret, &names, &trait_names);
+        ctx.bind_local_id("x".into(), ValueId(1), BlockId(0));
+        ctx.bind_local_id("y".into(), ValueId(2), BlockId(0));
+        let captured = ctx.getstate(7);
+        // Mutate ctx after capture to verify setstate actually
+        // restores: rebind x to a fresh vid, push to value_stack.
+        ctx.bind_local_id("x".into(), ValueId(99), BlockId(1));
+        ctx.pushvalue(ValueId(123));
+        assert_eq!(ctx.stackdepth(), 1);
+        ctx.setstate(&captured);
+        // Locals back to captured shape.
+        assert_eq!(
+            ctx.local_value_ids.get("x").map(|&(vid, _)| vid),
+            Some(ValueId(1)),
+            "x must be restored to captured vid"
+        );
+        assert_eq!(
+            ctx.local_value_ids.get("y").map(|&(vid, _)| vid),
+            Some(ValueId(2)),
+            "y must be restored to captured vid"
+        );
+        // value_stack wiped (vestigial drop).
+        assert_eq!(
+            ctx.stackdepth(),
+            0,
+            "setstate clears value_stack until Z2.5 bridges Hlvalue identity"
+        );
+    }
+
+    #[test]
+    fn z4b0_assert_stack_empty_at_stmt_boundary_passes_when_value_stack_is_empty() {
+        // Z4.B.0 tripwire — today `value_stack` is never written by
+        // production code so this assert is a no-op safety net.  The
+        // test pins the helper's no-fire behaviour against an empty
+        // stack so a future regression (push without matching pop in
+        // Z4.B.1+) is caught at the next `lower_stmt` entry rather
+        // than silently leaking depth across statements.
+        let registry = StructFieldRegistry::default();
+        let fn_ret = HashMap::new();
+        let names = std::collections::HashSet::new();
+        let trait_names = std::collections::HashSet::new();
+        let ctx = z4a_test_ctx(&registry, &fn_ret, &names, &trait_names);
+        // Must not panic.
+        ctx.assert_stack_empty_at_stmt_boundary("z4b0_test");
+    }
+
+    #[test]
+    #[should_panic(expected = "stmt-boundary stack imbalance")]
+    fn z4b0_assert_stack_empty_at_stmt_boundary_panics_when_value_stack_carries_residue() {
+        // Inverse direction — once `value_stack` carries cells across
+        // a stmt boundary, the tripwire fires with the
+        // `flowcontext.py:413` invariant message.  Z4.B.1+ relies on
+        // this firing immediately so the offending Stmt is flagged
+        // rather than the imbalance propagating into later joins.
+        let registry = StructFieldRegistry::default();
+        let fn_ret = HashMap::new();
+        let names = std::collections::HashSet::new();
+        let trait_names = std::collections::HashSet::new();
+        let mut ctx = z4a_test_ctx(&registry, &fn_ret, &names, &trait_names);
+        ctx.pushvalue(ValueId(42));
+        ctx.assert_stack_empty_at_stmt_boundary("z4b0_negative_test");
+    }
+
+    #[test]
+    fn z4a2_setstate_drops_local_when_state_entry_is_none_killed() {
+        // None-killed slots collapse the binding so post-merge reads
+        // surface as undefined-local.  Mirrors the per-slot
+        // `framestate.py:110-111 if w1 or w2 is None: return None`
+        // semantic on the consumer side.
+        let registry = StructFieldRegistry::default();
+        let fn_ret = HashMap::new();
+        let names = std::collections::HashSet::new();
+        let trait_names = std::collections::HashSet::new();
+        let mut ctx = z4a_test_ctx(&registry, &fn_ret, &names, &trait_names);
+        ctx.bind_local_id("x".into(), ValueId(1), BlockId(0));
+        ctx.bind_local_id("y".into(), ValueId(2), BlockId(0));
+        // Build a FrameState whose y slot is None-killed.
+        let killed_state = FrameState {
+            entries: vec![Some(ValueId(1)), None],
+            ..Default::default()
+        };
+        ctx.setstate(&killed_state);
+        assert!(ctx.local_value_ids.contains_key("x"));
+        assert!(
+            !ctx.local_value_ids.contains_key("y"),
+            "None-killed slot must remove the binding from ctx"
+        );
     }
 }

@@ -240,7 +240,7 @@ thread_local! {
             pyre_libc_jitframe_tracer,
         );
         // virtualref.py — JIT_VIRTUAL_REF as a proper GC type.
-        // Layout: type_tag(u64, offset 0) | virtual_token(*mut u8, offset 8) | forced(*mut u8, offset 16)
+        // Layout: super_.typeptr(u64, offset 0) | virtual_token(*mut u8, offset 8) | forced(*mut u8, offset 16)
         //
         // PRE-EXISTING-ADAPTATION (GC trace divergence).  Upstream
         // `virtualref.py:17-20` declares both `virtual_token` and
@@ -249,8 +249,10 @@ thread_local! {
         // The `virtual_token` slot is intentionally outside the GC's
         // view because every runtime value it can hold lives outside
         // any GC heap: TOKEN_NONE (null), `token_tracing_rescall()`
-        // (static-backed dummy, see `majit-metainterp/src/virtualref.rs`
-        // `TRACING_RESCALL_DUMMY`), and active JITFRAME addresses
+        // (program-lifetime leaked `Box<ObjectHeader>` dummy lazily
+        // allocated by `allocate_tracing_rescall_dummy` and cached in
+        // `TRACING_RESCALL_DUMMY_PTR`, see `majit-metainterp/src/
+        // virtualref.rs:140-180`), and active JITFRAME addresses
         // (libc::calloc'd, see `register_libc_jitframe_tracer` above).
         // The optimizer-side descriptor at
         // `majit-metainterp/src/optimizeopt/virtualize.rs:make_vref_field_descr`
