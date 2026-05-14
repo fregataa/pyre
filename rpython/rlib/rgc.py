@@ -538,24 +538,14 @@ def ll_arrayclear(p):
 @jit.dont_look_inside
 @specialize.ll()
 def ll_arrayfill(p, item):
-    # Fill a GcPtr array with item, bypassing write barriers.
-    # Only safe when p is freshly allocated (always young in any GC):
-    # young arrays never need write barriers since the minor GC scans them all.
-    # we_are_translated() gates the bare_setarrayitem path: when running
-    # untranslated (tests), it falls back to a regular loop so the llinterp
-    # can execute it; when translated, bare_setarrayitem is constant-selected.
-    from rpython.rtyper.lltypesystem.lloperation import llop
+    # Fill p with item. Only called for freshly-allocated lists (always young),
+    # so write barriers inserted by the GC transformer are never-taken no-ops.
     from rpython.rlib.objectmodel import keepalive_until_here
     i = 0
     length = len(p)
-    if we_are_translated():
-        while i < length:
-            llop.bare_setarrayitem(lltype.Void, p, i, item)
-            i += 1
-    else:
-        while i < length:
-            p[i] = item
-            i += 1
+    while i < length:
+        p[i] = item
+        i += 1
     keepalive_until_here(p)
 
 
