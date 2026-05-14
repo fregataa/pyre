@@ -379,63 +379,64 @@ pub fn attach_raise_cause(exc: PyObjectRef, cause: Option<PyObjectRef>) -> Resul
     Ok(())
 }
 
-/// Test whether `exc_value` matches the exception type specification
-/// `exc_type` — a single exception class, a class name string, or a tuple
-/// of classes (for `except (A, B)` clauses). PyPy: pyopcode.py
-/// `CHECK_EXC_MATCH` → `_exception_match`.
+/// pyopcode.py:1032-1040 `cmp_exc_match(self, w_1, w_2)` line-by-line:
+///
+/// ```python
+/// def cmp_exc_match(self, w_1, w_2):
+///     space = self.space
+///     if space.isinstance_w(w_2, space.w_tuple):
+///         for w_type in space.fixedview(w_2):
+///             if not space.exception_is_valid_class_w(w_type):
+///                 raise oefmt(space.w_TypeError, CANNOT_CATCH_MSG)
+///     elif not space.exception_is_valid_class_w(w_2):
+///         raise oefmt(space.w_TypeError, CANNOT_CATCH_MSG)
+///     return space.exception_match(space.type(w_1), w_2)
+/// ```
+///
+/// `w_1` is `exc_value` (the exception instance, peeked from TOS at
+/// pyopcode.py:1852), `w_2` is `exc_type` (the type spec, popped at
+/// :1851). `space.type(w_1)` is the exception's class.
+///
+/// PRE-EXISTING-ADAPTATION: the upstream `raise oefmt(TypeError, ...)`
+/// path for an invalid `check_class` is degraded to `return false`
+/// because this helper does not propagate `PyResult`. Migrating the
+/// signature is queued for the `eval.rs` PyResult-propagation epic.
 pub fn check_exc_match_against(exc_value: PyObjectRef, exc_type: PyObjectRef) -> bool {
     unsafe {
+        // PRE-EXISTING-ADAPTATION: pyre callers may pass non-exception
+        // values through this helper (legacy paths). PyPy `cmp_exc_match`
+        // asserts `w_1` is an exception instance — pyre tolerates the
+        // looser shape and reports a match.
         if !pyre_object::is_exception(exc_value) {
             return true;
         }
-        // Tuple of exception classes — match any.
+        // pyopcode.py:1034-1039 class-validity gate.
         if pyre_object::is_tuple(exc_type) {
             let n = pyre_object::w_tuple_len(exc_type) as i64;
             for i in 0..n {
-                if let Some(elem) = pyre_object::w_tuple_getitem(exc_type, i) {
-                    if check_exc_match_against(exc_value, elem) {
-                        return true;
+                if let Some(w_type) = pyre_object::w_tuple_getitem(exc_type, i) {
+                    if !crate::baseobjspace::exception_is_valid_class_w(w_type) {
+                        return false;
                     }
                 }
             }
+        } else if !crate::baseobjspace::exception_is_valid_class_w(exc_type) {
             return false;
         }
-        let kind = pyre_object::w_exception_get_kind(exc_value);
-        if pyre_object::is_str(exc_type) {
-            let type_name = pyre_object::w_str_get_value(exc_type);
-            return pyre_object::exc_kind_matches(kind, type_name);
-        }
-        if crate::is_function(exc_type)
-            && crate::is_builtin_code(crate::getcode(exc_type) as pyre_object::PyObjectRef)
-        {
-            let type_name = crate::function_get_name(exc_type);
-            return pyre_object::exc_kind_matches(kind, type_name);
-        }
-        if pyre_object::is_type(exc_type) {
-            let type_name = pyre_object::w_type_get_name(exc_type);
-            if pyre_object::exc_kind_matches(kind, type_name) {
-                return true;
-            }
-            // ExcKind may not reflect the actual Python class hierarchy
-            // (e.g. FileNotFoundError created with ExcKind::Exception).
-            // Fall back to checking the exception's w_class MRO.
-            let w_class = (*exc_value).w_class;
-            if !w_class.is_null() && pyre_object::is_type(w_class) {
-                if std::ptr::eq(w_class, exc_type) {
-                    return true;
-                }
-                let mro = pyre_object::w_type_get_mro(w_class);
-                if !mro.is_null() {
-                    for &t in &*mro {
-                        if std::ptr::eq(t, exc_type) {
-                            return true;
-                        }
-                    }
-                }
-            }
+        // pyopcode.py:1040 `space.exception_match(space.type(w_1), w_2)`.
+        // `crate::typedef::r#type` is the `space.type` equivalent — it
+        // resolves `w_class` for objects whose specific class was already
+        // installed (post-`init_typeobjects`) AND for exception instances
+        // whose `w_class` slot still holds the generic `EXCEPTION_TYPE`
+        // stub (pre-registry-init internal `w_exception_new` callers, e.g.
+        // `PyError::value_error`) by falling back to the `ExcKind`-tag
+        // registry per typedef.rs:176-197.  Reading `(*exc_value).w_class`
+        // directly would miss the kind-tag fallback and reduce a generic
+        // builtin-raised exception to a no-match against `except ValueError`.
+        let Some(w_exc_class) = crate::typedef::r#type(exc_value) else {
             return false;
-        }
-        false
+        };
+        crate::baseobjspace::exception_match(w_exc_class, exc_type)
     }
 }
 

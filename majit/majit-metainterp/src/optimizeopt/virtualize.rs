@@ -352,7 +352,9 @@ impl OptVirtualize {
             last_guard_pos: -1,
             cached_vinfo: std::cell::RefCell::new(None),
         };
-        let b = ctx.ensure_box_at(source_op.pos.raw() as usize);
+        let b = ctx
+            .ensure_box(source_op.pos)
+            .expect("body-namespace OpRef must have a BoxRef slot");
         ctx.set_ptr_info(&b, PtrInfo::VirtualRawSlice(opinfo));
     }
 
@@ -379,7 +381,9 @@ impl OptVirtualize {
             calldescr: source_op.descr.clone(),
             cached_vinfo: std::cell::RefCell::new(None),
         };
-        let b = ctx.ensure_box_at(source_op.pos.raw() as usize);
+        let b = ctx
+            .ensure_box(source_op.pos)
+            .expect("body-namespace OpRef must have a BoxRef slot");
         ctx.set_ptr_info(&b, PtrInfo::VirtualRawBuffer(opinfo));
     }
 
@@ -425,7 +429,9 @@ impl OptVirtualize {
             last_guard_pos: -1,
             cached_vinfo: std::cell::RefCell::new(None),
         };
-        let b = ctx.ensure_box_at(op.pos.raw() as usize);
+        let b = ctx
+            .ensure_box(op.pos)
+            .expect("body-namespace OpRef must have a BoxRef slot");
         ctx.set_ptr_info(&b, PtrInfo::Virtual(vinfo));
         OptimizationResult::Remove
     }
@@ -439,7 +445,9 @@ impl OptVirtualize {
             last_guard_pos: -1,
             cached_vinfo: std::cell::RefCell::new(None),
         };
-        let b = ctx.ensure_box_at(op.pos.raw() as usize);
+        let b = ctx
+            .ensure_box(op.pos)
+            .expect("body-namespace OpRef must have a BoxRef slot");
         ctx.set_ptr_info(&b, PtrInfo::VirtualStruct(vinfo));
         OptimizationResult::Remove
     }
@@ -474,7 +482,9 @@ impl OptVirtualize {
                         last_guard_pos: -1,
                         cached_vinfo: std::cell::RefCell::new(None),
                     };
-                    let b = ctx.ensure_box_at(op.pos.raw() as usize);
+                    let b = ctx
+                        .ensure_box(op.pos)
+                        .expect("body-namespace OpRef must have a BoxRef slot");
                     ctx.set_ptr_info(&b, PtrInfo::VirtualArrayStruct(vinfo));
                 } else {
                     let items = vec![OpRef::NONE; size as usize];
@@ -485,7 +495,9 @@ impl OptVirtualize {
                         last_guard_pos: -1,
                         cached_vinfo: std::cell::RefCell::new(None),
                     };
-                    let b = ctx.ensure_box_at(op.pos.raw() as usize);
+                    let b = ctx
+                        .ensure_box(op.pos)
+                        .expect("body-namespace OpRef must have a BoxRef slot");
                     ctx.set_ptr_info(&b, PtrInfo::VirtualArray(vinfo));
                 }
                 return OptimizationResult::Remove;
@@ -1355,7 +1367,9 @@ impl OptVirtualize {
             last_guard_pos: -1,
             cached_vinfo: std::cell::RefCell::new(None),
         };
-        let b = ctx.ensure_box_at(op.pos.raw() as usize);
+        let b = ctx
+            .ensure_box(op.pos)
+            .expect("body-namespace OpRef must have a BoxRef slot");
         ctx.set_ptr_info(&b, PtrInfo::Virtual(vinfo));
 
         OptimizationResult::Remove
@@ -2587,7 +2601,9 @@ mod tests {
         // without destroying the tracked field state.
         // opencoder.py:259 inputarg_from_tp — vable is the sole Ref inputarg.
         let mut ctx = OptContext::with_inputarg_types(8, &[Type::Ref]);
-        let vable_box = ctx.ensure_box_at(OpRef::input_arg_ref(0).raw() as usize);
+        let vable_box = ctx
+            .ensure_box(OpRef::input_arg_ref(0))
+            .expect("body-namespace OpRef must have a BoxRef slot");
         ctx.set_ptr_info(
             &vable_box,
             PtrInfo::Virtualizable(VirtualizableFieldState {
@@ -3862,7 +3878,9 @@ mod tests {
 
         // Pre-populate VirtualRawBuffer info for specified OpRefs
         for &(opref, size) in raw_bufs {
-            let b = ctx.ensure_box_at(opref.raw() as usize);
+            let b = ctx
+                .ensure_box(opref)
+                .expect("body-namespace OpRef must have a BoxRef slot");
             ctx.set_ptr_info(
                 &b,
                 PtrInfo::VirtualRawBuffer(VirtualRawBufferInfo {

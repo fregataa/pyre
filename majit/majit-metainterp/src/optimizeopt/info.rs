@@ -3261,7 +3261,9 @@ mod tests {
         ctx.make_constant(OpRef::int_op(21), Value::Int(2));
 
         let source = OpRef::int_op(1);
-        let source_box = ctx.ensure_box_at(source.raw() as usize);
+        let source_box = ctx
+            .ensure_box(source)
+            .expect("body-namespace OpRef must have a BoxRef slot");
         ctx.set_ptr_info(
             &source_box,
             PtrInfo::Str(StrPtrInfo {
@@ -3311,7 +3313,9 @@ mod tests {
             last_guard_pos: -1,
             cached_vinfo: std::cell::RefCell::new(None),
         });
-        let pos2 = ctx.ensure_box_at(OpRef::int_op(2).raw() as usize);
+        let pos2 = ctx
+            .ensure_box(OpRef::int_op(2))
+            .expect("body-namespace OpRef must have a BoxRef slot");
         ctx.set_ptr_info(
             &pos2,
             PtrInfo::Str(StrPtrInfo {

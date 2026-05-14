@@ -241,18 +241,19 @@ pub struct TraceIterator<'a> {
     /// instance owns its own fresh `Rc<Box>` set so Phase 1 / Phase 2
     /// sub-Optimizers do not share `Box._forwarded` cells.
     ///
-    /// Layout: dense `Vec<BoxRef>` indexed by raw OpRef value.
-    /// `[0..p1_full_prefix.len())` are `Rc::clone`s of Phase 1's
-    /// `final_ctx.box_pool` (inputarg + emit BoxRefs) when
-    /// `p1_full_prefix` is `Some` — Phase 2 chain walks observe Phase 1's
-    /// accumulated `_forwarded` info naturally (`unroll.py` Phase 2 reads
-    /// Phase 1 `box._forwarded` through shared Python identity parity).
-    /// `import_state(targetargs, ...)` writes `Forwarded::Box(target)` on
-    /// each Phase 2 inputarg whose `target.raw() < num_inputs` — chain
-    /// walks land directly on Phase 1's inputarg BoxRef cell rather than a
-    /// Type::Void placeholder.
-    /// Remaining `[..start_fresh)` filled with placeholder
-    /// `BoxRef::new_resop(Type::Void)` for any unsnapshotted gap.
+    /// Layout: sparse `Vec<Option<BoxRef>>` (`BoxPool`) indexed by raw
+    /// OpRef value. `[0..p1_full_prefix.len())` are `Rc::clone`s of
+    /// Phase 1's `final_ctx.box_pool` slots (inputarg + emit BoxRefs)
+    /// when `p1_full_prefix` is `Some` — Phase 2 chain walks observe
+    /// Phase 1's accumulated `_forwarded` info naturally (`unroll.py`
+    /// Phase 2 reads Phase 1 `box._forwarded` through shared Python
+    /// identity parity). `import_state(targetargs, ...)` writes
+    /// `Forwarded::Box(target)` on each Phase 2 inputarg whose
+    /// `target.raw() < num_inputs` — chain walks land directly on
+    /// Phase 1's inputarg BoxRef cell.
+    /// Any gap between the Phase 1 prefix end and `start_fresh` stays
+    /// as `None` (resoperation.py:233-248 has no Box for positions not
+    /// produced by `ResOperation()` / `InputArg()`).
     /// Inputargs at `[start_fresh..start_fresh + num_inputargs)`.
     /// Op results pushed in `next()` for both void and non-void ops.
     pub box_pool: crate::r#box::BoxPool,
@@ -275,7 +276,7 @@ impl<'a> TraceIterator<'a> {
         force_inputargs: Option<&[OpRef]>,
         inputarg_types: &[majit_ir::Type],
         start_fresh: u32,
-        p1_full_prefix: Option<Vec<BoxRef>>,
+        p1_full_prefix: Option<Vec<Option<BoxRef>>>,
     ) -> Self {
         // self._cache = [None] * trace._index
         // The iterator's cache must be large enough to hold any raw trace
@@ -298,27 +299,38 @@ impl<'a> TraceIterator<'a> {
         let mut _cache: Vec<Option<OpRef>> = vec![None; cache_size];
         let mut _fresh = start_fresh;
         // Per-iter BoxRef pool. When `p1_full_prefix` is `Some` (Phase 2
-        // path), `[0..p1_full_prefix.len())` is `Rc::clone`s of Phase 1's
-        // `final_ctx.box_pool` — inputarg BoxRefs at `[0..num_inputs)` plus
-        // emit BoxRefs at `[num_inputs..p1_iter_fresh_hw)`. Chain walks via
+        // path), `[0..p1_full_prefix.len())` carries Phase 1's
+        // `final_ctx.box_pool` slots — `Some(BoxRef)` for inputarg + emit
+        // positions Phase 1 wrote, `None` for slots Phase 1 left empty
+        // (constant-namespace gap, skipped raw indices). Chain walks via
         // `Forwarded::Box(rc)` observe Phase 1's accumulated `_forwarded`
         // info naturally (`unroll.py` Phase 2 reads Phase 1 box._forwarded
         // through shared Python identity); `import_state` setting
         // `Forwarded::Box(target)` on Phase 2 inputargs lands the chain on
-        // the same Phase 1 inputarg cell rather than a Type::Void
-        // placeholder. Remaining `[p1_full_prefix.len()..start_fresh)` is
-        // filled with placeholder `BoxRef::new_resop(Type::Void)` only for
-        // any unsnapshotted gap (or all of `[..start_fresh)` when prefix is
-        // `None`). Phase 2 owns the Rc::cloned BoxRefs as its single-writer
-        // post-Phase-1-completion (audit memo Risk 1).
+        // the same Phase 1 inputarg cell. Remaining
+        // `[p1_full_prefix.len()..start_fresh)` stays `None` per
+        // resoperation.py:233-248 (no Box exists for positions no
+        // `ResOperation()` / `InputArg()` call produced); Phase 2
+        // materialises slots on demand as it pushes its own inputargs
+        // and op results. Phase 2 owns the Rc::cloned BoxRefs as its
+        // single-writer post-Phase-1-completion (audit memo Risk 1).
         let p1_prefix = p1_full_prefix.unwrap_or_default();
         let p1_end = p1_prefix.len().min(start_fresh as usize);
-        let mut box_pool: crate::r#box::BoxPool = p1_prefix
-            .into_iter()
-            .take(p1_end)
-            .chain((p1_end as u32..start_fresh).map(|i| BoxRef::new_resop(Type::Void, i)))
-            .collect::<Vec<_>>()
-            .into();
+        // Sparse pool: Phase 1's snapshot already carries `None` for
+        // positions never assigned a Box (constant-namespace gap,
+        // skipped raw slots); positions past the snapshot stay `None`
+        // (no Box exists yet) until a producer materializes via
+        // `ensure_box`.
+        let mut box_pool: crate::r#box::BoxPool = crate::r#box::BoxPool::from_slots(
+            p1_prefix
+                .into_iter()
+                .take(p1_end)
+                .chain(std::iter::repeat_n(
+                    None,
+                    (start_fresh as usize).saturating_sub(p1_end),
+                ))
+                .collect(),
+        );
         let inputargs: Vec<OpRef>;
         if let Some(force) = force_inputargs {
             // opencoder.py:259-262 self.inputargs =

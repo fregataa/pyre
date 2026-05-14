@@ -319,7 +319,7 @@ pub(crate) fn merge_backend_constants_from_ctx(
 ) {
     let live_positions = live_runtime_positions(&ctx.new_operations);
 
-    for (idx, b) in ctx.box_pool.iter().enumerate() {
+    for (idx, b) in ctx.box_pool.iter_indexed() {
         // make_constant excludes InputArg positions from self.constants writes
         // (mod.rs:3946) because regalloc.rs:1207 would treat them as inline
         // constants, but the InputArg's runtime value flows through the input
@@ -377,7 +377,7 @@ pub enum ImportedVirtualKind {
 }
 
 impl Optimizer {
-    fn is_constant_placeholder_op(op: &Op, box_pool: &[crate::r#box::BoxRef]) -> bool {
+    fn is_constant_placeholder_op(op: &Op, box_pool: &crate::r#box::BoxPool) -> bool {
         if !matches!(
             op.opcode,
             OpCode::SameAsI | OpCode::SameAsR | OpCode::SameAsF
@@ -2782,7 +2782,7 @@ impl Optimizer {
             // Give every such constant-only opref a fresh slot after the last
             // live op, mirroring RPython's separate constant identity.
             let mut next_const_pos = fni + ctx.new_operations.len() as u32;
-            for (idx, b) in ctx.box_pool.iter().enumerate() {
+            for (idx, b) in ctx.box_pool.iter_indexed() {
                 let old_idx = idx as u32;
                 if remap.contains_key(&old_idx) {
                     continue;
@@ -2844,7 +2844,7 @@ impl Optimizer {
                 let mut new_pool: Vec<Option<crate::r#box::BoxRef>> = vec![None; new_size];
 
                 // Pass 1: place remapped boxes at their post-remap target.
-                for (old_idx, b) in ctx.box_pool.iter().enumerate() {
+                for (old_idx, b) in ctx.box_pool.iter_indexed() {
                     let old_idx_u32 = old_idx as u32;
                     if old_idx < num_inputs {
                         continue;
@@ -2859,7 +2859,7 @@ impl Optimizer {
 
                 // Pass 2: inputargs at original indices + non-remapped
                 // entries that don't collide with a remap target.
-                for (old_idx, b) in ctx.box_pool.iter().enumerate() {
+                for (old_idx, b) in ctx.box_pool.iter_indexed() {
                     let old_idx_u32 = old_idx as u32;
                     if old_idx < num_inputs {
                         if old_idx < new_pool.len() {
@@ -2875,16 +2875,12 @@ impl Optimizer {
                     }
                 }
 
-                let materialized: Vec<crate::r#box::BoxRef> = new_pool
-                    .into_iter()
-                    .enumerate()
-                    .map(|(idx, opt)| {
-                        opt.unwrap_or_else(|| {
-                            crate::r#box::BoxRef::new_resop(majit_ir::Type::Void, idx as u32)
-                        })
-                    })
-                    .collect();
-                ctx.box_pool = crate::r#box::BoxPool::from(materialized);
+                // Sparse pool keyed by post-remap raw position.  Slots
+                // that no producer claimed stay `None` — RPython has no
+                // Box at those positions either (every Box is allocated
+                // by `ResOperation()` / `InputArg()` per
+                // resoperation.py:233-248).
+                ctx.box_pool = crate::r#box::BoxPool::from_slots(new_pool);
             }
 
             // Apply remap to all args and fail_args
@@ -3691,7 +3687,9 @@ impl Optimizer {
             // value_types entry at this reused pos — precisely the cross-type
             // mutation the invariant guard is designed to surface.
             ctx.register_value_type(op.pos, majit_ir::Type::Int);
-            let op_pos_box = ctx.ensure_box_at(op.pos.raw() as usize);
+            let op_pos_box = ctx
+                .ensure_box(op.pos)
+                .expect("body-namespace OpRef must have a BoxRef slot");
             ctx.with_intbound_mut(&op_pos_box, |bound| bound.make_bool());
         }
         let emitted = ctx.emit(op.clone());
@@ -5508,7 +5506,9 @@ mod tests {
         // for the test, every slot uses Ref to match the producer-side shape
         // (`inputarg_from_tp` per opencoder.py:259 with all Ref args).
         let mut ctx = OptContext::with_inputarg_types(32, &vec![Type::Ref; 1024]);
-        let b10 = ctx.ensure_box_at(10);
+        let b10 = ctx
+            .ensure_box(OpRef::int_op(10))
+            .expect("body-namespace OpRef must have a BoxRef slot");
         ctx.set_ptr_info(
             &b10,
             PtrInfo::VirtualStruct(VirtualStructInfo {
@@ -5520,7 +5520,9 @@ mod tests {
             }),
         );
         ctx.replace_op(OpRef::int_op(11), OpRef::int_op(20));
-        let b20 = ctx.ensure_box_at(20);
+        let b20 = ctx
+            .ensure_box(OpRef::int_op(20))
+            .expect("body-namespace OpRef must have a BoxRef slot");
         ctx.set_ptr_info(
             &b20,
             PtrInfo::VirtualStruct(VirtualStructInfo {
@@ -5562,7 +5564,9 @@ mod tests {
         let descr = make_size_descr(16);
         let field_descr: DescrRef = std::sync::Arc::new(TestDescr(0));
         let mut ctx = OptContext::with_inputarg_types(16, &[Type::Ref]);
-        let b10 = ctx.ensure_box_at(10);
+        let b10 = ctx
+            .ensure_box(OpRef::int_op(10))
+            .expect("body-namespace OpRef must have a BoxRef slot");
         ctx.set_ptr_info(
             &b10,
             PtrInfo::VirtualStruct(VirtualStructInfo {

@@ -1781,7 +1781,9 @@ impl OptIntBounds {
             let numbits = byte_size * 8;
             let start = -(1i64 << (numbits - 1));
             let stop = 1i64 << (numbits - 1);
-            let op_pos_box = ctx.ensure_box_at(op.pos.raw() as usize);
+            let op_pos_box = ctx
+                .ensure_box(op.pos)
+                .expect("body-namespace OpRef must have a BoxRef slot");
             let _ = ctx.with_intbound_mut(&op_pos_box, |bm| bm.intersect_const(start, stop - 1));
         }
     }
@@ -3123,7 +3125,9 @@ mod tests {
         pass.setup();
         for (opref, bound) in initial_bounds {
             // OpRef → BoxRef shim until this caller migrates (Phase D-2).
-            let op_box = ctx.ensure_box_at(opref.raw() as usize);
+            let op_box = ctx
+                .ensure_box(*opref)
+                .expect("body-namespace OpRef must have a BoxRef slot");
             ctx.setintbound(&op_box, bound);
         }
 
@@ -4108,7 +4112,9 @@ mod tests {
         // fresh one to drive the backward propagation step.
         let mut pass = OptIntBounds::new();
         // OpRef → BoxRef shim until this caller migrates (Phase D-2).
-        let i1_box = ctx.ensure_box_at(OpRef::int_op(1).raw() as usize);
+        let i1_box = ctx
+            .ensure_box(OpRef::int_op(1))
+            .expect("body-namespace OpRef must have a BoxRef slot");
         ctx.setintbound(&i1_box, &IntBound::bounded(-5, -1));
         pass.propagate_bounds_backward(OpRef::int_op(1), &mut ctx);
         let b0 = ctx.getintbound(OpRef::int_op(0));

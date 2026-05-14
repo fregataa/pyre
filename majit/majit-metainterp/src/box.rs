@@ -431,46 +431,133 @@ impl std::fmt::Debug for BoxRef {
 
 /// Encapsulated `BoxRef` storage for `OptContext` (Codex plan step 1).
 ///
-/// Wraps `Vec<BoxRef>` as a newtype so consumers index by `OpRef` raw
-/// position. `BoxRef._forwarded` is the authoritative PyPy-style storage;
-/// `BoxPool` only maps pyre's flat `OpRef` indices to those Box identities.
-/// `Deref` / `DerefMut` to `Vec<BoxRef>` keeps existing call sites working
-/// while the wrapper remains a thin container.
+/// Indexed by `OpRef` raw position. `BoxRef._forwarded` is the
+/// authoritative PyPy-style storage; `BoxPool` only maps pyre's flat
+/// `OpRef` indices to those Box identities.
+///
+/// Sparse via `Vec<Option<BoxRef>>` so positions skipped during pool
+/// extension (e.g. constant-namespace claims via `allocate_next_pos_raw`)
+/// stay `None` instead of producing Void filler boxes. PyPy's box-per-Box
+/// model has no filler analogue — every Box is constructed by
+/// `ResOperation()` or `InputArg()` at its real type.
 #[derive(Clone, Debug, Default)]
 pub struct BoxPool {
-    inner: Vec<BoxRef>,
+    inner: Vec<Option<BoxRef>>,
 }
 
 impl BoxPool {
     pub fn new() -> Self {
         Self::default()
     }
-}
 
-impl std::ops::Deref for BoxPool {
-    type Target = Vec<BoxRef>;
-    fn deref(&self) -> &Vec<BoxRef> {
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    /// Read `box_pool[idx]` — returns `Some(&BoxRef)` only for a
+    /// materialized slot; out-of-bounds and tombstoned slots return
+    /// `None`.
+    pub fn get(&self, idx: usize) -> Option<&BoxRef> {
+        self.inner.get(idx)?.as_ref()
+    }
+
+    /// `box_pool[idx] = Some(value)`; extends with `None` padding to
+    /// reach `idx`. Returns a clone of the installed BoxRef.
+    pub fn set(&mut self, idx: usize, value: BoxRef) -> BoxRef {
+        if idx >= self.inner.len() {
+            self.inner.resize(idx + 1, None);
+        }
+        self.inner[idx] = Some(value.clone());
+        value
+    }
+
+    /// Iterate over `(idx, &BoxRef)` for every materialized slot,
+    /// skipping `None` holes.
+    pub fn iter_indexed(&self) -> impl Iterator<Item = (usize, &BoxRef)> {
+        self.inner
+            .iter()
+            .enumerate()
+            .filter_map(|(i, b)| b.as_ref().map(|b| (i, b)))
+    }
+
+    /// Iterate over `&BoxRef` for every materialized slot, skipping
+    /// `None` holes. Use when caller does not need the index.
+    pub fn iter(&self) -> impl Iterator<Item = &BoxRef> {
+        self.inner.iter().filter_map(|b| b.as_ref())
+    }
+
+    /// Sequentially append a fully-typed BoxRef. Used by recorder /
+    /// history reconstruction where positions are dense (every op
+    /// gets a Box).
+    pub fn push(&mut self, value: BoxRef) {
+        self.inner.push(Some(value));
+    }
+
+    /// Drop trailing entries until `len() <= new_len`. Mirrors PyPy
+    /// recorder savepoint rollback (`recorder.py savepoint.restore`).
+    pub fn truncate(&mut self, new_len: usize) {
+        self.inner.truncate(new_len);
+    }
+
+    pub fn clear(&mut self) {
+        self.inner.clear();
+    }
+
+    /// Reserve capacity (does not affect `len`).
+    pub fn reserve(&mut self, additional: usize) {
+        self.inner.reserve(additional);
+    }
+
+    pub fn with_capacity(cap: usize) -> Self {
+        Self {
+            inner: Vec::with_capacity(cap),
+        }
+    }
+
+    /// Index into the slot returning `&Option<BoxRef>` for callers that
+    /// need to distinguish out-of-bounds (`None` from `inner.get`) from
+    /// materialized vs tombstoned. Rarely needed.
+    pub fn slot(&self, idx: usize) -> Option<&Option<BoxRef>> {
+        self.inner.get(idx)
+    }
+
+    /// Borrow the raw `Vec<Option<BoxRef>>` slot table. Used by
+    /// snapshot/replay paths that need to preserve None tombstones
+    /// alongside materialized boxes.
+    pub fn as_slots(&self) -> &[Option<BoxRef>] {
         &self.inner
     }
-}
 
-impl std::ops::DerefMut for BoxPool {
-    fn deref_mut(&mut self) -> &mut Vec<BoxRef> {
-        &mut self.inner
+    /// Take ownership of the raw `Vec<Option<BoxRef>>` slot table.
+    pub fn into_slots(self) -> Vec<Option<BoxRef>> {
+        self.inner
+    }
+
+    /// Build from a `Vec<Option<BoxRef>>` snapshot — reverse of
+    /// `into_slots()`.
+    pub fn from_slots(slots: Vec<Option<BoxRef>>) -> Self {
+        Self { inner: slots }
     }
 }
 
 impl From<Vec<BoxRef>> for BoxPool {
     fn from(inner: Vec<BoxRef>) -> Self {
-        Self { inner }
+        Self {
+            inner: inner.into_iter().map(Some).collect(),
+        }
     }
 }
 
-impl From<BoxPool> for Vec<BoxRef> {
-    fn from(pool: BoxPool) -> Self {
-        pool.inner
-    }
-}
+// No `impl From<BoxPool> for Vec<BoxRef>` — the natural body
+// (`pool.inner.into_iter().flatten().collect()`) drops `None` holes,
+// which would silently collapse the sparse position layout and break
+// `OpRef::raw() as usize` index lookups against the result. Callers
+// that need the raw slot table must use `BoxPool::into_slots()` and
+// keep working in `Vec<Option<BoxRef>>` shape.
 
 #[cfg(test)]
 mod tests {

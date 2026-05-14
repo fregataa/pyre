@@ -37,8 +37,8 @@ fn is_trace_runtime_ref(opref: OpRef, constants: &HashMap<u32, i64>) -> bool {
 }
 
 fn p1_full_prefix_from_box_pool_snapshot(
-    snapshot: Option<&[crate::r#box::BoxRef]>,
-) -> Option<Vec<crate::r#box::BoxRef>> {
+    snapshot: Option<&[Option<crate::r#box::BoxRef>]>,
+) -> Option<Vec<Option<crate::r#box::BoxRef>>> {
     snapshot.map(|pool| pool.to_vec())
 }
 
@@ -508,8 +508,10 @@ impl UnrollOptimizer {
                     // `box_pool.len()` ensures Phase 2 chain walks observe the
                     // real Phase 1 BoxRefs at every reachable position rather
                     // than Type::Void placeholders.
-                    let p1_full_prefix: Option<Vec<crate::r#box::BoxRef>> =
-                        opt_p1.final_ctx.as_ref().map(|c| c.box_pool.to_vec());
+                    let p1_full_prefix: Option<Vec<Option<crate::r#box::BoxRef>>> = opt_p1
+                        .final_ctx
+                        .as_ref()
+                        .map(|c| c.box_pool.as_slots().to_vec());
                     (state, consts_p1, p1_ops, p1_full_prefix)
                 }
                 None => {
@@ -1631,7 +1633,7 @@ pub struct ExportedState {
     /// retrace attempt (test fixtures, in-flight construction). Populated
     /// only by `export_state_with_bounds` at the canonical Phase 1 export
     /// site.
-    pub box_pool_snapshot: Option<Vec<crate::r#box::BoxRef>>,
+    pub box_pool_snapshot: Option<Vec<Option<crate::r#box::BoxRef>>>,
     /// Shadow stack rooting for GcRef values in exported_infos.
     /// (OpRef key, field kind, shadow stack index).
     rooted_refs: Vec<(OpRef, ExportedGcRefField, usize)>,
@@ -1923,7 +1925,11 @@ impl ExportedState {
         // _forwarded info; if GC moves a Ref between Phase 1 export and
         // retrace those reads see a stale handle.
         if let Some(snapshot) = &self.box_pool_snapshot {
-            for (i, b) in snapshot.iter().enumerate() {
+            for (i, b) in snapshot
+                .iter()
+                .enumerate()
+                .filter_map(|(i, b)| b.as_ref().map(|b| (i, b)))
+            {
                 let forwarded = b.get_forwarded();
                 if let crate::r#box::Forwarded::Info(opinfo) = &*forwarded {
                     match opinfo {
@@ -2061,7 +2067,7 @@ impl ExportedState {
                 }
                 ExportedGcRefField::BoxPoolInfoPtrInfoConstant(i) => {
                     if let Some(snapshot) = self.box_pool_snapshot.as_ref()
-                        && let Some(b) = snapshot.get(*i)
+                        && let Some(b) = snapshot.get(*i).and_then(|o| o.as_ref())
                     {
                         let new_info = {
                             let f = b.get_forwarded();
@@ -2081,7 +2087,7 @@ impl ExportedState {
                 }
                 ExportedGcRefField::BoxPoolInfoPtrInfoKnownClass(i) => {
                     if let Some(snapshot) = self.box_pool_snapshot.as_ref()
-                        && let Some(b) = snapshot.get(*i)
+                        && let Some(b) = snapshot.get(*i).and_then(|o| o.as_ref())
                     {
                         let new_info = {
                             let f = b.get_forwarded();
@@ -2103,7 +2109,7 @@ impl ExportedState {
                 }
                 ExportedGcRefField::BoxPoolBoxConstRef(i) => {
                     if let Some(snapshot) = self.box_pool_snapshot.as_ref()
-                        && let Some(b) = snapshot.get(*i)
+                        && let Some(b) = snapshot.get(*i).and_then(|o| o.as_ref())
                     {
                         // BoxKind::Const is immutable, so swap in a fresh
                         // ConstRef BoxRef carrying the updated handle.
@@ -2587,7 +2593,7 @@ impl OptUnroll {
         // to recreate that observation across the in-memory ExportedState
         // hand-off. Each entry is `Rc::clone` cheap; vec retention is
         // bounded by `ExportedState` lifetime.
-        state.box_pool_snapshot = Some(ctx.box_pool.to_vec());
+        state.box_pool_snapshot = Some(ctx.box_pool.as_slots().to_vec());
         // PRE-EXISTING-ADAPTATION: snapshot producer-side const values for
         // any const-namespace OpRef referenced by `short_boxes` op args.
         // Phase B.2 `ProducedShortOp::produce_op` reads raw OpRefs (not the
@@ -4801,12 +4807,20 @@ mod tests {
         let input1 = crate::r#box::BoxRef::new_inputarg(Type::Int, Some(1));
         let emit2 = crate::r#box::BoxRef::new_resop(Type::Ref, 2);
         let emit3 = crate::r#box::BoxRef::new_resop(Type::Int, 3);
-        let snapshot = vec![input0.clone(), input1.clone(), emit2.clone(), emit3.clone()];
+        let snapshot = vec![
+            Some(input0.clone()),
+            Some(input1.clone()),
+            Some(emit2.clone()),
+            Some(emit3.clone()),
+        ];
 
         let prefix =
             p1_full_prefix_from_box_pool_snapshot(Some(&snapshot)).expect("snapshot exists");
 
-        assert_eq!(prefix, vec![input0, input1, emit2, emit3]);
+        assert_eq!(
+            prefix,
+            vec![Some(input0), Some(input1), Some(emit2), Some(emit3)]
+        );
     }
 
     #[test]

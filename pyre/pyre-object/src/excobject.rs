@@ -137,12 +137,28 @@ impl crate::lltype::GcType for W_ExceptionObject {
 }
 
 /// Allocate a new exception object on the heap.
+///
+/// `ob_header.w_class` is populated from the per-`ExcKind` class
+/// registry (`register_exc_class_for_kind`) when the interpreter has
+/// finished installing builtin exception types; otherwise it falls
+/// back to the generic `EXCEPTION_TYPE` instantiate slot. Callers
+/// that rely on `space.type(w_exc)` returning the specific class
+/// (e.g. `cmp_exc_match` at `pyopcode.py:1040`) get the registered
+/// class once init has run; pre-init callers see the generic
+/// placeholder, matching the legacy "internal `w_exception_new`"
+/// path.
 pub fn w_exception_new(kind: ExcKind, message: &str) -> PyObjectRef {
     let message = crate::lltype::malloc_raw(message.to_string());
+    let w_class = lookup_exc_class_for_kind(kind);
+    let w_class = if w_class != PY_NULL {
+        w_class
+    } else {
+        get_instantiate(&EXCEPTION_TYPE)
+    };
     crate::lltype::malloc_typed(W_ExceptionObject {
         ob_header: PyObject {
             ob_type: &EXCEPTION_TYPE as *const PyType,
-            w_class: get_instantiate(&EXCEPTION_TYPE),
+            w_class,
         },
         kind,
         message,
@@ -152,6 +168,34 @@ pub fn w_exception_new(kind: ExcKind, message: &str) -> PyObjectRef {
         w_traceback: PY_NULL,
         suppress_context: false,
     }) as PyObjectRef
+}
+
+/// Per-`ExcKind` class-pointer registry. Populated by
+/// `pyre-interpreter::builtins::register_exc_class` during
+/// `install_default_builtins`; consumed by `w_exception_new` so each
+/// builtin-raised exception's `ob_header.w_class` points at the
+/// specific class object (rather than the generic `EXCEPTION_TYPE`).
+/// PyPy's equivalent is the `space.w_TypeError`/`space.w_ValueError`/
+/// ... attributes on `ObjSpace` — every exception instance returns
+/// its class through `space.type(w_exc)` unconditionally
+/// (baseobjspace.py:1367 `exception_getclass`).
+const EXC_KIND_COUNT: usize = (ExcKind::SystemError as u8 as usize) + 1;
+
+thread_local! {
+    static EXC_CLASS_BY_KIND: std::cell::Cell<[PyObjectRef; EXC_KIND_COUNT]> =
+        const { std::cell::Cell::new([PY_NULL; EXC_KIND_COUNT]) };
+}
+
+pub fn register_exc_class_for_kind(kind: ExcKind, cls: PyObjectRef) {
+    EXC_CLASS_BY_KIND.with(|cell| {
+        let mut table = cell.get();
+        table[kind as u8 as usize] = cls;
+        cell.set(table);
+    });
+}
+
+pub fn lookup_exc_class_for_kind(kind: ExcKind) -> PyObjectRef {
+    EXC_CLASS_BY_KIND.with(|cell| cell.get()[kind as u8 as usize])
 }
 
 /// `interp_exceptions.py:153 W_BaseException.descr_getargs` parity —
@@ -478,6 +522,8 @@ pub fn exc_kind_from_name(name: &str) -> Option<ExcKind> {
         "UnicodeDecodeError" => Some(ExcKind::UnicodeDecodeError),
         "UnicodeEncodeError" => Some(ExcKind::UnicodeEncodeError),
         "SystemExit" => Some(ExcKind::SystemExit),
+        "MemoryError" => Some(ExcKind::MemoryError),
+        "SystemError" => Some(ExcKind::SystemError),
         _ => None,
     }
 }
@@ -516,13 +562,49 @@ mod tests {
 
     #[test]
     fn test_exc_kind_from_name_roundtrip() {
+        // Every variant of ExcKind must round-trip through
+        // exc_kind_name → exc_kind_from_name so the per-kind class
+        // registry (`register_exc_class_for_kind`) plumbed by
+        // pyre-interpreter::builtins::register_exc_class can install a
+        // class pointer for every `w_exception_new(kind, ...)` callsite.
+        // A gap here would leave that kind's `ob_header.w_class` at the
+        // generic `EXCEPTION_TYPE` stub, breaking the "the object's
+        // class is the exception type" invariant on the w_class read
+        // path.
         for kind in [
+            ExcKind::BaseException,
+            ExcKind::Exception,
             ExcKind::TypeError,
             ExcKind::ValueError,
             ExcKind::ZeroDivisionError,
+            ExcKind::NameError,
+            ExcKind::IndexError,
+            ExcKind::KeyError,
+            ExcKind::AttributeError,
+            ExcKind::RuntimeError,
+            ExcKind::StopIteration,
+            ExcKind::OverflowError,
+            ExcKind::ArithmeticError,
+            ExcKind::ImportError,
+            ExcKind::NotImplementedError,
+            ExcKind::AssertionError,
+            ExcKind::ReferenceError,
+            ExcKind::GeneratorExit,
+            ExcKind::RecursionError,
+            ExcKind::OSError,
+            ExcKind::FileNotFoundError,
+            ExcKind::UnicodeDecodeError,
+            ExcKind::UnicodeEncodeError,
+            ExcKind::SystemExit,
+            ExcKind::MemoryError,
+            ExcKind::SystemError,
         ] {
             let name = exc_kind_name(kind);
-            assert_eq!(exc_kind_from_name(name), Some(kind));
+            assert_eq!(
+                exc_kind_from_name(name),
+                Some(kind),
+                "exc_kind_from_name({name:?}) round-trip failed for {kind:?}",
+            );
         }
     }
 

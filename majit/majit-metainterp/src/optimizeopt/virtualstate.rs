@@ -2552,7 +2552,9 @@ mod tests {
         // virtualstate.py:185 requires `info.is_virtual()` for the
         // VStruct walker to descend; mirror by attaching a virtual
         // PtrInfo to the corresponding OpRef.
-        let b11 = ctx.ensure_box_at(OpRef::ref_op(11).raw() as usize);
+        let b11 = ctx
+            .ensure_box(OpRef::ref_op(11))
+            .expect("body-namespace OpRef must have a BoxRef slot");
         ctx.set_ptr_info(
             &b11,
             PtrInfo::VirtualStruct(VirtualStructInfo {
@@ -2589,7 +2591,9 @@ mod tests {
         ]);
 
         let mut ctx = OptContext::new(16);
-        let b21 = ctx.ensure_box_at(OpRef::ref_op(21).raw() as usize);
+        let b21 = ctx
+            .ensure_box(OpRef::ref_op(21))
+            .expect("body-namespace OpRef must have a BoxRef slot");
         ctx.set_ptr_info(
             &b21,
             PtrInfo::VirtualStruct(VirtualStructInfo {
@@ -2647,8 +2651,12 @@ mod tests {
         let mut ctx = OptContext::new(64);
         // Both outer boxes resolve to a virtual struct whose field 0 is
         // the shared inner OpRef.
-        let outer_a_box = ctx.ensure_box_at(outer_a_ref.raw() as usize);
-        let outer_b_box = ctx.ensure_box_at(outer_b_ref.raw() as usize);
+        let outer_a_box = ctx
+            .ensure_box(outer_a_ref)
+            .expect("body-namespace OpRef must have a BoxRef slot");
+        let outer_b_box = ctx
+            .ensure_box(outer_b_ref)
+            .expect("body-namespace OpRef must have a BoxRef slot");
         ctx.set_ptr_info(
             &outer_a_box,
             PtrInfo::VirtualStruct(VirtualStructInfo {
@@ -2721,7 +2729,9 @@ mod tests {
             field_descrs: Vec::new(),
         }]);
         let mut ctx = OptContext::new(32);
-        let virtual_box = ctx.ensure_box_at(virtual_ref.raw() as usize);
+        let virtual_box = ctx
+            .ensure_box(virtual_ref)
+            .expect("body-namespace OpRef must have a BoxRef slot");
         ctx.set_ptr_info(
             &virtual_box,
             PtrInfo::VirtualStruct(VirtualStructInfo {
@@ -2781,7 +2791,9 @@ mod tests {
         let state = VirtualState::new(vec![VirtualStateInfo::NonNull]);
         // Generous Ref-typed inputarg pool for the test fixture.
         let mut ctx = OptContext::with_inputarg_types(32, &vec![Type::Ref; 1024]);
-        let virtual_box = ctx.ensure_box_at(virtual_ref.raw() as usize);
+        let virtual_box = ctx
+            .ensure_box(virtual_ref)
+            .expect("body-namespace OpRef must have a BoxRef slot");
         ctx.set_ptr_info(
             &virtual_box,
             PtrInfo::VirtualStruct(VirtualStructInfo {

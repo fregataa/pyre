@@ -488,15 +488,23 @@ impl PotentialShortOp {
                         if i == index {
                             continue;
                         }
-                        let tp = compound.res.ty().unwrap_or_else(|| {
-                            panic!(
-                                "compound short-preamble alias source {:?} has no \
-                                 variant tag; same_as_for_type requires Int/Ref/Float \
-                                 (shortpreamble.py:326-330)",
-                                compound.res
-                            )
-                        });
-                        let alias = OpRef::op_typed(sb.next_synthetic_pos, tp);
+                        // resoperation.py:1316-1323 OpHelpers.same_as_for_type:
+                        //   if tp == 'i': return rop.SAME_AS_I
+                        //   elif tp == 'r': return rop.SAME_AS_R
+                        //   else: assert tp == 'f'; return rop.SAME_AS_F
+                        // Void is rejected by the trailing assert tp == 'f'.
+                        let alias = match compound.res.ty() {
+                            Some(majit_ir::Type::Int) => OpRef::int_op(sb.next_synthetic_pos),
+                            Some(majit_ir::Type::Ref) => OpRef::ref_op(sb.next_synthetic_pos),
+                            Some(majit_ir::Type::Float) => OpRef::float_op(sb.next_synthetic_pos),
+                            Some(majit_ir::Type::Void) | None => panic!(
+                                "compound short-preamble alias source {:?} has \
+                                 type {:?}; same_as_for_type requires Int/Ref/Float \
+                                 (resoperation.py:1316-1323)",
+                                compound.res,
+                                compound.res.ty(),
+                            ),
+                        };
                         sb.next_synthetic_pos += 1;
                         alt.preamble_op.pos = alias;
                         alt.invented_name = true;

@@ -479,9 +479,10 @@ impl Trace {
         self.box_pool.get(position as usize)
     }
 
-    /// H-2.1: full BoxRef pool snapshot.
-    pub fn box_pool(&self) -> &[BoxRef] {
-        &self.box_pool
+    /// H-2.1: full BoxRef pool snapshot — borrows the sparse slot
+    /// table (`None` for skipped positions).
+    pub fn box_pool(&self) -> &[Option<BoxRef>] {
+        self.box_pool.as_slots()
     }
 }
 
@@ -615,9 +616,9 @@ mod tests {
         let pre_box_at_1 = rec.box_for_position(1).unwrap().as_ptr();
         let trace = rec.get_trace();
         assert_eq!(trace.box_pool.len(), 2);
-        assert_eq!(trace.box_pool[1].as_ptr(), pre_box_at_1);
-        assert!(trace.box_pool[0].is_inputarg());
-        assert!(trace.box_pool[1].is_resop());
+        assert_eq!(trace.box_pool.get(1).unwrap().as_ptr(), pre_box_at_1);
+        assert!(trace.box_pool.get(0).unwrap().is_inputarg());
+        assert!(trace.box_pool.get(1).unwrap().is_resop());
     }
 
     /// H-2.1 invariant: BoxRef identity is per-allocation. Two record calls

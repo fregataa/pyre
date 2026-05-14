@@ -6846,63 +6846,38 @@ unsafe fn trace_check_exc_match_against(
     exc_value: pyre_object::PyObjectRef,
     exc_type: pyre_object::PyObjectRef,
 ) -> bool {
+    // pyopcode.py:1032-1040 cmp_exc_match line-by-line port (kept in
+    // lockstep with `pyre-interpreter/src/eval.rs::check_exc_match_against`
+    // so the trace-time match equals the interpreter-time match).
     unsafe {
         if !pyre_object::is_exception(exc_value) {
             return true;
         }
+        // pyopcode.py:1034-1039 class-validity gate (TypeError raise
+        // degrades to `return false` because the trace helper has no
+        // PyResult propagation channel).
         if pyre_object::is_tuple(exc_type) {
             let n = pyre_object::w_tuple_len(exc_type) as i64;
             for i in 0..n {
-                if let Some(elem) = pyre_object::w_tuple_getitem(exc_type, i) {
-                    if trace_check_exc_match_against(exc_value, elem) {
-                        return true;
+                if let Some(w_type) = pyre_object::w_tuple_getitem(exc_type, i) {
+                    if !pyre_interpreter::baseobjspace::exception_is_valid_class_w(w_type) {
+                        return false;
                     }
                 }
             }
+        } else if !pyre_interpreter::baseobjspace::exception_is_valid_class_w(exc_type) {
             return false;
         }
-        let kind = pyre_object::w_exception_get_kind(exc_value);
-        if pyre_object::is_str(exc_type) {
-            let type_name = pyre_object::w_str_get_value(exc_type);
-            return pyre_object::exc_kind_matches(kind, type_name);
-        }
-        if pyre_interpreter::is_function(exc_type)
-            && pyre_interpreter::is_builtin_code(
-                pyre_interpreter::getcode(exc_type) as pyre_object::PyObjectRef
-            )
-        {
-            let type_name = pyre_interpreter::function_get_name(exc_type);
-            return pyre_object::exc_kind_matches(kind, type_name);
-        }
-        if pyre_object::is_type(exc_type) {
-            let type_name = pyre_object::w_type_get_name(exc_type);
-            if pyre_object::exc_kind_matches(kind, type_name) {
-                return true;
-            }
-            // ExcKind may not reflect the actual Python class hierarchy
-            // (e.g. FileNotFoundError created with ExcKind::Exception).
-            // Fall back to checking the exception's w_class MRO.
-            let w_class = (*exc_value).w_class;
-            if !w_class.is_null() && pyre_object::is_type(w_class) {
-                if std::ptr::eq(w_class, exc_type) {
-                    return true;
-                }
-                let mro = pyre_object::w_type_get_mro(w_class);
-                if !mro.is_null() {
-                    for &t in &*mro {
-                        if std::ptr::eq(t, exc_type) {
-                            return true;
-                        }
-                    }
-                }
-            }
+        // pyopcode.py:1040 `space.exception_match(space.type(w_1), w_2)`.
+        // `pyre_interpreter::typedef::r#type` is the `space.type` equivalent
+        // — it resolves the specific class for fully-installed exceptions
+        // AND falls back to the `ExcKind`-tag registry for instances
+        // whose `w_class` slot still holds the generic `EXCEPTION_TYPE`
+        // stub (pre-registry-init internal `w_exception_new` callers).
+        let Some(w_exc_class) = pyre_interpreter::typedef::r#type(exc_value) else {
             return false;
-        }
-        // Unrecognised type-spec format — eval.rs:130+ falls through to the
-        // legacy isinstance helper.  At trace time we don't have that path
-        // ported yet; report a structural mismatch loudly so the caller
-        // surfaces a tracer regression rather than silently emitting True.
-        false
+        };
+        pyre_interpreter::baseobjspace::exception_match(w_exc_class, exc_type)
     }
 }
 

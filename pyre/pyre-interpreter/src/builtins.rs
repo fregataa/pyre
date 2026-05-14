@@ -1470,10 +1470,20 @@ fn make_exc_type(
 /// Thread-local registry from exception class name (as used by
 /// `ExcKind → exc_kind_name`) to the W_TypeObject exposed in the builtins
 /// namespace. Populated at init-builtins time via `make_exc_type`.
+///
+/// Also propagates into `pyre_object::excobject`'s kind-indexed
+/// registry so `w_exception_new(kind, ...)` populates
+/// `ob_header.w_class` with the registered class — every
+/// builtin-raised exception then satisfies
+/// `space.type(w_exc) == registered class` per `baseobjspace.py:1367
+/// exception_getclass`.
 fn register_exc_class(name: &'static str, cls: PyObjectRef) {
     EXC_CLASS_REGISTRY.with(|r| {
         r.borrow_mut().insert(name, cls);
     });
+    if let Some(kind) = pyre_object::excobject::exc_kind_from_name(name) {
+        pyre_object::excobject::register_exc_class_for_kind(kind, cls);
+    }
 }
 
 /// Look up a builtin exception class by its `ExcKind` name. Returns
