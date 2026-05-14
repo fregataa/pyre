@@ -1470,6 +1470,49 @@ fn emit_frontend_newlist(
     )
 }
 
+fn emit_frontend_newslice(
+    graph: &mut super::flow::FunctionGraph,
+    block: &super::flow::BlockRef,
+    start: super::flow::FlowValue,
+    stop: super::flow::FlowValue,
+    step: super::flow::FlowValue,
+    offset: i64,
+) -> super::flow::Variable {
+    // flowcontext.py:1154-1161 BUILD_SLICE -> `op.newslice(w_start,
+    // w_end, w_step).eval(self)`. Preserve all three operands in the
+    // shadow graph so graph-side analysis sees the same dependency shape
+    // as RPython/PyPy, even while the bytecode-level SSA stream still uses
+    // the pyre helper-call adaptation below.
+    emit_graph_op_with_result(
+        graph,
+        block,
+        "newslice",
+        vec![start.into(), stop.into(), step.into()],
+        Kind::Ref,
+        offset,
+    )
+}
+
+fn emit_frontend_buildslice_shadow_graph(
+    graph: &mut super::flow::FunctionGraph,
+    block: &super::flow::BlockRef,
+    argc: pyre_interpreter::bytecode::BuildSliceArgCount,
+    start: super::flow::FlowValue,
+    stop: super::flow::FlowValue,
+    step: Option<super::flow::FlowValue>,
+    offset: i64,
+) -> super::flow::Variable {
+    use pyre_interpreter::bytecode::BuildSliceArgCount;
+    let step = match argc {
+        BuildSliceArgCount::Two => {
+            debug_assert!(step.is_none(), "BUILD_SLICE argc=2 must synthesize None");
+            super::flow::Constant::none().into()
+        }
+        BuildSliceArgCount::Three => step.expect("BUILD_SLICE argc=3 must preserve explicit step"),
+    };
+    emit_frontend_newslice(graph, block, start, stop, step, offset)
+}
+
 fn emit_frontend_setitem(
     _graph: &mut super::flow::FunctionGraph,
     block: &super::flow::BlockRef,
@@ -2065,6 +2108,7 @@ struct FnPtrIndices {
     load_const_fn: HelperHandle,
     store_subscr_fn: HelperHandle,
     build_list_fn: HelperHandle,
+    build_slice_fn: HelperHandle,
     normalize_raise_varargs_fn: HelperHandle,
     call_fn_0: HelperHandle,
     call_fn_2: HelperHandle,
@@ -2096,7 +2140,7 @@ struct FnPtrIndices {
 ///   exception-class `__init__`); arbitrary user code that observes
 ///   virtualizables.  Matches `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE`
 ///   (`effectinfo.py:23`) → `MayForce`.
-/// * `load_global_fn` / `build_list_fn`: namespace dict lookup +
+/// * `load_global_fn` / `build_list_fn` / `build_slice_fn`: namespace dict lookup +
 ///   list allocation; can raise (`NameError` / `MemoryError`) but do
 ///   not force virtuals — `EF_CAN_RAISE` → `Plain`.
 /// * `box_int_fn` / `load_const_fn`: kept on `Plain` until the
@@ -2194,6 +2238,14 @@ fn register_helper_fn_pointers(
     // Matches `EF_CAN_RAISE` (allocation can `MemoryError`) without
     // virtual-force.
     let build_list_fn = bind(assembler, cpu.build_list_fn as *const (), CallFlavor::Plain);
+    // `pypy/interpreter/pyopcode.py:1463-1472 BUILD_SLICE` calls
+    // `space.newslice(w_start, w_end, w_step)`.  Pyre mirrors that with
+    // a flat allocation helper; no user code runs, but allocation can fail.
+    let build_slice_fn = bind(
+        assembler,
+        cpu.build_slice_fn as *const (),
+        CallFlavor::Plain,
+    );
     // `bh_normalize_raise_varargs_fn` walks the exception class /
     // value pair and instantiates user `__init__` — arbitrary
     // user code that may observe virtualizables.  Matches
@@ -2240,6 +2292,7 @@ fn register_helper_fn_pointers(
         load_const_fn,
         store_subscr_fn,
         build_list_fn,
+        build_slice_fn,
         normalize_raise_varargs_fn,
         call_fn_0,
         call_fn_2,
@@ -2931,6 +2984,11 @@ impl CodeWriter {
                 HelperHandle {
                     idx: build_list_fn_idx,
                     flavor: _build_list_fn_flavor,
+                },
+            build_slice_fn:
+                HelperHandle {
+                    idx: build_slice_fn_idx,
+                    flavor: _build_slice_fn_flavor,
                 },
             normalize_raise_varargs_fn:
                 HelperHandle {
@@ -5760,13 +5818,14 @@ impl CodeWriter {
 
                     // flowcontext.py:1168 BUILD_LIST -> `op.newlist(*items).eval(self)`
                     // consumes all `itemcount` items and returns the list.
-                    // pyre's `build_list_fn` helper only accepts 0..=2 items, so
-                    // argc > 2 falls back to `abort_permanent` + interpreter —
+                    // pyre's `build_list_fn` helper accepts the small fixed
+                    // arities this bytecode lowering can pass directly; larger
+                    // lists fall back to `abort_permanent` + interpreter —
                     // silently dropping items was the prior behaviour and would
                     // have produced wrong list contents at runtime.
                     Instruction::BuildList { count } => {
                         let argc = count.get(op_arg) as usize;
-                        if argc > 2 {
+                        if argc > 3 {
                             for _ in 0..argc {
                                 let _ = emit_popvalue_ref!(ssarepr, current_depth);
                                 let _ = current_state
@@ -5793,8 +5852,8 @@ impl CodeWriter {
                             emit_ref_copy!(ssarepr, arg_regs[i], item_reg);
                             item_values_rev.push(item_value);
                         }
-                        // build_list_fn(argc, item0, item1) → list. The C ABI is
-                        // `extern "C" fn(i64, i64, i64)`; the helper dispatches
+                        // build_list_fn(argc, item0, item1, item2) → list. The C ABI is
+                        // `extern "C" fn(i64, i64, i64, i64)`; the helper dispatches
                         // internally by `argc`, so unused item slots may be any
                         // bit pattern. Encode unused slots as `ConstInt(0)` —
                         // routed through the int constants pool, matches
@@ -5828,6 +5887,63 @@ impl CodeWriter {
                                 build_list_fn_idx,
                                 argc,
                                 &arg_regs,
+                                stack_base + current_depth,
+                            ),
+                        );
+                        current_state.stack.push(result_value.into());
+                        current_depth += 1;
+                        emit_vsd!(current_depth);
+                    }
+
+                    // pyopcode.py:1463 BUILD_SLICE:
+                    //   if numargs == 3: w_step = popvalue()
+                    //   elif numargs == 2: w_step = space.w_None
+                    //   w_end = popvalue(); w_start = popvalue()
+                    //   pushvalue(space.newslice(w_start, w_end, w_step))
+                    Instruction::BuildSlice { argc } => {
+                        use pyre_interpreter::bytecode::BuildSliceArgCount;
+                        let argc = argc.get(op_arg);
+                        let raw_argc = match argc {
+                            BuildSliceArgCount::Two => 2usize,
+                            BuildSliceArgCount::Three => 3usize,
+                        };
+                        let step_info = if raw_argc == 3 {
+                            let reg = emit_popvalue_ref!(ssarepr, current_depth);
+                            let step_value = current_state
+                                .stack
+                                .pop()
+                                .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                            Some((reg, step_value))
+                        } else {
+                            None
+                        };
+                        let stop_reg = emit_popvalue_ref!(ssarepr, current_depth);
+                        let stop_value = current_state
+                            .stack
+                            .pop()
+                            .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                        let start_reg = emit_popvalue_ref!(ssarepr, current_depth);
+                        let start_value = current_state
+                            .stack
+                            .pop()
+                            .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                        let step_reg = step_info.as_ref().map(|(reg, _)| *reg);
+                        let result_value = emit_frontend_buildslice_shadow_graph(
+                            &mut graph,
+                            &current_block.block(),
+                            argc,
+                            start_value,
+                            stop_value,
+                            step_info.map(|(_, value)| value),
+                            py_pc as i64,
+                        );
+                        ssarepr.insns.push(
+                            super::flatten::build_build_slice_fn_residual_call_ir_r_insn(
+                                build_slice_fn_idx,
+                                raw_argc,
+                                start_reg,
+                                stop_reg,
+                                step_reg,
                                 stack_base + current_depth,
                             ),
                         );
@@ -8572,6 +8688,99 @@ mod tests {
         assert_eq!(op.offset, 44);
         assert_eq!(op.args, vec![item0.into(), item1.into(), item2.into()]);
         assert_eq!(op.result, Some(result.into()));
+    }
+
+    #[test]
+    fn emit_frontend_newslice_records_three_ref_operands() {
+        let start = Block::shared(Vec::new());
+        let mut graph = FunctionGraph::new("newslice", start.clone(), None);
+        let w_start = Variable::new(VariableId(22), Kind::Ref);
+        let w_stop = Variable::new(VariableId(23), Kind::Ref);
+        let w_step = Variable::new(VariableId(24), Kind::Ref);
+
+        let result = emit_frontend_newslice(
+            &mut graph,
+            &start,
+            w_start.into(),
+            w_stop.into(),
+            w_step.into(),
+            46,
+        );
+
+        let block = start.borrow();
+        let op = block
+            .operations
+            .last()
+            .expect("newslice op should be recorded");
+        assert_eq!(op.opname, "newslice");
+        assert_eq!(op.offset, 46);
+        assert_eq!(op.args, vec![w_start.into(), w_stop.into(), w_step.into()]);
+        assert_eq!(op.result, Some(result.into()));
+        assert_eq!(result.kind, Some(Kind::Ref));
+    }
+
+    #[test]
+    fn emit_frontend_buildslice_shadow_graph_two_arg_synthesizes_none_step() {
+        use pyre_interpreter::bytecode::BuildSliceArgCount;
+        let start = Block::shared(Vec::new());
+        let mut graph = FunctionGraph::new("build_slice_two", start.clone(), None);
+        let w_start = Variable::new(VariableId(25), Kind::Ref);
+        let w_stop = Variable::new(VariableId(26), Kind::Ref);
+
+        let result = emit_frontend_buildslice_shadow_graph(
+            &mut graph,
+            &start,
+            BuildSliceArgCount::Two,
+            w_start.into(),
+            w_stop.into(),
+            None,
+            47,
+        );
+
+        let block = start.borrow();
+        let op = block
+            .operations
+            .last()
+            .expect("BUILD_SLICE argc=2 should record newslice");
+        assert_eq!(op.opname, "newslice");
+        assert_eq!(op.offset, 47);
+        assert_eq!(
+            op.args,
+            vec![w_start.into(), w_stop.into(), Constant::none().into()],
+        );
+        assert_eq!(op.result, Some(result.into()));
+        assert_eq!(result.kind, Some(Kind::Ref));
+    }
+
+    #[test]
+    fn emit_frontend_buildslice_shadow_graph_three_arg_preserves_step() {
+        use pyre_interpreter::bytecode::BuildSliceArgCount;
+        let start = Block::shared(Vec::new());
+        let mut graph = FunctionGraph::new("build_slice_three", start.clone(), None);
+        let w_start = Variable::new(VariableId(27), Kind::Ref);
+        let w_stop = Variable::new(VariableId(28), Kind::Ref);
+        let w_step = Variable::new(VariableId(29), Kind::Ref);
+
+        let result = emit_frontend_buildslice_shadow_graph(
+            &mut graph,
+            &start,
+            BuildSliceArgCount::Three,
+            w_start.into(),
+            w_stop.into(),
+            Some(w_step.into()),
+            48,
+        );
+
+        let block = start.borrow();
+        let op = block
+            .operations
+            .last()
+            .expect("BUILD_SLICE argc=3 should record newslice");
+        assert_eq!(op.opname, "newslice");
+        assert_eq!(op.offset, 48);
+        assert_eq!(op.args, vec![w_start.into(), w_stop.into(), w_step.into()]);
+        assert_eq!(op.result, Some(result.into()));
+        assert_eq!(result.kind, Some(Kind::Ref));
     }
 
     #[test]

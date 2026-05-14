@@ -1253,11 +1253,11 @@ pub fn is_graph_only_artifact(insn: &Insn) -> bool {
     }
     matches!(
         opname.as_str(),
-        // Container subscript store / unary / call / list construction
-        // (emit_frontend_{setitem,bool,neg,simple_call,newlist}).
+        // Container subscript store / unary / call / sequence construction
+        // (emit_frontend_{setitem,bool,neg,simple_call,newlist,newslice}).
         // `setattr` and `getattr` are intentionally NOT here — see
         // function-level docstring for the abort_permanent rationale.
-        "setitem" | "bool" | "neg" | "simple_call" | "newlist"
+        "setitem" | "bool" | "neg" | "simple_call" | "newlist" | "newslice"
     )
 }
 
@@ -3098,23 +3098,23 @@ fn build_residual_call_ir_r_insn_from_int_only_operands(
 /// `newlist(items)` HLOp via `emit_frontend_newlist`); this is a
 /// clean factor refactor with no asymmetry.
 ///
-/// `build_list_fn` has C ABI `extern "C" fn(i64, i64, i64)` —
-/// always 3 i64 parameters dispatched internally by the leading
-/// `argc` (`bh_build_list_fn` per `cpu.rs`).  The trailing 2 slots
+/// `build_list_fn` has C ABI `extern "C" fn(i64, i64, i64, i64)` —
+/// always 4 i64 parameters dispatched internally by the leading
+/// `argc` (`bh_build_list_fn` per `cpu.rs`).  The trailing 3 slots
 /// hold real boxed-Ref pointers when the corresponding item is
 /// present, or `0` (dummy bit pattern, routed through the int
 /// constants pool per `make_three_lists` jtransform.py:437-445)
-/// when absent.  Per codewriter.rs:5945-5954, `argc > 2` falls
+/// when absent.  Per codewriter.rs:5945-5954, `argc > 3` falls
 /// through to `emit_abort_permanent` and never invokes this
-/// helper, so `argc ∈ {0, 1, 2}`.
+/// helper, so `argc ∈ {0, 1, 2, 3}`.
 ///
 /// Inline arg order from `emit_residual_call_shape` for call-args
 /// `[ConstInt(argc), maybe_Reg_or_ConstInt(item0),
-/// maybe_Reg_or_ConstInt(item1)]`:
+/// maybe_Reg_or_ConstInt(item1), maybe_Reg_or_ConstInt(item2)]`:
 ///   * `args_i` = leading argc + each absent item's `0` dummy.
 ///   * `args_r` = each present item's Reg.
 ///   * `arg_kinds` preserves call-order (NOT bucket-order): always
-///     `[Int, item0_kind, item1_kind]` where each item kind is
+///     `[Int, item0_kind, item1_kind, item2_kind]` where each item kind is
 ///     `Ref` when present and `Int` when dummy.
 ///
 /// Both `ListI` and `ListR` are always pushed because `args_i` is
@@ -3138,19 +3138,19 @@ pub fn build_build_list_fn_residual_call_ir_r_insn(
     arg_regs: &[u16],
     dst_reg: u16,
 ) -> Insn {
-    debug_assert!(
-        argc <= 2,
-        "BuildList helper only supports argc ∈ {{0, 1, 2}}"
+    assert!(
+        argc <= 3,
+        "BuildList helper only supports argc ∈ {{0, 1, 2, 3}}"
     );
-    debug_assert_eq!(arg_regs.len(), argc, "arg_regs length must match argc");
-    let mut arg_kinds: Vec<Kind> = Vec::with_capacity(3);
-    let mut args_i: Vec<Operand> = Vec::with_capacity(3);
-    let mut args_r: Vec<Operand> = Vec::with_capacity(2);
+    assert_eq!(arg_regs.len(), argc, "arg_regs length must match argc");
+    let mut arg_kinds: Vec<Kind> = Vec::with_capacity(4);
+    let mut args_i: Vec<Operand> = Vec::with_capacity(4);
+    let mut args_r: Vec<Operand> = Vec::with_capacity(3);
     // Leading argc slot — always Int.
     arg_kinds.push(Kind::Int);
     args_i.push(Operand::ConstInt(argc as i64));
-    // Trailing 2 slots — Ref if present, Int dummy `0` if absent.
-    for i in 0..2 {
+    // Trailing 3 slots — Ref if present, Int dummy `0` if absent.
+    for i in 0..3 {
         if i < argc {
             arg_kinds.push(Kind::Ref);
             args_r.push(Operand::Register(Register::new(Kind::Ref, arg_regs[i])));
@@ -3169,6 +3169,52 @@ pub fn build_build_list_fn_residual_call_ir_r_insn(
         "residual_call_ir_r",
         vec![
             Operand::ConstInt(build_list_fn_idx as i64),
+            Operand::ListOfKind(ListOfKind::new(Kind::Int, args_i)),
+            Operand::ListOfKind(ListOfKind::new(Kind::Ref, args_r)),
+            descr_operand,
+        ],
+        Register::new(Kind::Ref, dst_reg),
+    )
+}
+
+/// Construct the BUILD_SLICE helper call.  Mirrors
+/// `pypy/interpreter/pyopcode.py:1463-1472`: argc is 2 or 3, start/stop are
+/// refs, and step is either a ref (argc=3) or an ignored int dummy (argc=2).
+pub fn build_build_slice_fn_residual_call_ir_r_insn(
+    build_slice_fn_idx: u16,
+    argc: usize,
+    start_reg: u16,
+    stop_reg: u16,
+    step_reg: Option<u16>,
+    dst_reg: u16,
+) -> Insn {
+    assert!(
+        matches!((argc, step_reg), (2, None) | (3, Some(_))),
+        "BUILD_SLICE expects argc=2 without step or argc=3 with step"
+    );
+    let mut arg_kinds = vec![Kind::Int, Kind::Ref, Kind::Ref];
+    let mut args_i = vec![Operand::ConstInt(argc as i64)];
+    let mut args_r = vec![
+        Operand::Register(Register::new(Kind::Ref, start_reg)),
+        Operand::Register(Register::new(Kind::Ref, stop_reg)),
+    ];
+    if let Some(step_reg) = step_reg {
+        arg_kinds.push(Kind::Ref);
+        args_r.push(Operand::Register(Register::new(Kind::Ref, step_reg)));
+    } else {
+        arg_kinds.push(Kind::Int);
+        args_i.push(Operand::ConstInt(0));
+    }
+    let effect_info = effect_info_for_call_flavor(CallFlavor::Plain);
+    let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
+        effect_info,
+        arg_kinds,
+        result_kind: Some(Kind::Ref),
+    }));
+    Insn::op_with_result(
+        "residual_call_ir_r",
+        vec![
+            Operand::ConstInt(build_slice_fn_idx as i64),
             Operand::ListOfKind(ListOfKind::new(Kind::Int, args_i)),
             Operand::ListOfKind(ListOfKind::new(Kind::Ref, args_r)),
             descr_operand,
@@ -4847,7 +4893,15 @@ mod tests {
         }
         // Out-of-family opnames must return None so the lowering
         // arm falls through.
-        for opname in ["lt", "bool", "neg", "simple_call", "setitem", "newlist"] {
+        for opname in [
+            "lt",
+            "bool",
+            "neg",
+            "simple_call",
+            "setitem",
+            "newlist",
+            "newslice",
+        ] {
             assert_eq!(
                 binary_op_tag_for_opname(opname),
                 None,
@@ -6155,10 +6209,11 @@ mod tests {
     #[test]
     fn build_build_list_fn_residual_call_ir_r_insn_emits_residual_call_ir_r_for_argc_2() {
         // Task #48 micro-slice 13: BuildList factor refactor.  argc=2:
-        // both item slots are real Refs, no padding.  Expected shape:
-        // `[ConstInt(fn_idx), ListI([ConstInt(2)]), ListR([Reg(item0),
-        // Reg(item1)]), Descr(CallDescrStub{Plain, [Int, Ref, Ref]})]
-        // → Reg(Ref, dst)`.
+        // two item slots are real Refs, and the third trailing ABI slot
+        // is an Int dummy.  Expected shape:
+        // `[ConstInt(fn_idx), ListI([ConstInt(2), ConstInt(0)]),
+        // ListR([Reg(item0), Reg(item1)]),
+        // Descr(CallDescrStub{Plain, [Int, Ref, Ref, Int]})] → Reg(Ref, dst)`.
         let insn = build_build_list_fn_residual_call_ir_r_insn(
             /* build_list_fn_idx */ 18,
             /* argc */ 2,
@@ -6181,11 +6236,16 @@ mod tests {
                 }
                 if let Operand::ListOfKind(list) = &args[1] {
                     assert_eq!(list.kind, Kind::Int);
-                    assert_eq!(list.content.len(), 1, "argc=2 → ListI=[2] only");
+                    assert_eq!(list.content.len(), 2, "argc=2 → ListI=[2, 0]");
                     if let Operand::ConstInt(v) = &list.content[0] {
                         assert_eq!(*v, 2);
                     } else {
                         panic!("expected ConstInt(2) in ListI");
+                    }
+                    if let Operand::ConstInt(v) = &list.content[1] {
+                        assert_eq!(*v, 0);
+                    } else {
+                        panic!("expected trailing ConstInt(0) in ListI");
                     }
                 } else {
                     panic!("expected ListOfKind(Int) at args[1]");
@@ -6198,7 +6258,10 @@ mod tests {
                 }
                 if let Operand::Descr(rc) = &args[3] {
                     if let DescrOperand::CallDescrStub(stub) = &**rc {
-                        assert_eq!(stub.arg_kinds, vec![Kind::Int, Kind::Ref, Kind::Ref]);
+                        assert_eq!(
+                            stub.arg_kinds,
+                            vec![Kind::Int, Kind::Ref, Kind::Ref, Kind::Int],
+                        );
                         assert_eq!(
                             stub.effect_info,
                             effect_info_for_call_flavor(CallFlavor::Plain),
@@ -6216,13 +6279,13 @@ mod tests {
 
     #[test]
     fn build_build_list_fn_residual_call_ir_r_insn_pads_argc_0_and_1() {
-        // argc=0: no real items.  arg_kinds=[Int, Int, Int], args_i=
-        // [argc=0, dummy=0, dummy=0], args_r=[].  ListR is still
+        // argc=0: no real items.  arg_kinds=[Int, Int, Int, Int], args_i=
+        // [argc=0, dummy=0, dummy=0, dummy=0], args_r=[].  ListR is still
         // pushed (empty) because kinds="ir" includes 'r'.
         let argc_0 = build_build_list_fn_residual_call_ir_r_insn(18, 0, &[], 5);
         if let Insn::Op { args, .. } = &argc_0 {
             if let Operand::ListOfKind(list) = &args[1] {
-                assert_eq!(list.content.len(), 3, "argc=0 → ListI=[0, 0, 0]");
+                assert_eq!(list.content.len(), 4, "argc=0 → ListI=[0, 0, 0, 0]");
                 for op in &list.content {
                     if let Operand::ConstInt(v) = op {
                         assert_eq!(*v, 0);
@@ -6240,19 +6303,30 @@ mod tests {
             }
             if let Operand::Descr(rc) = &args[3] {
                 if let DescrOperand::CallDescrStub(stub) = &**rc {
-                    assert_eq!(stub.arg_kinds, vec![Kind::Int, Kind::Int, Kind::Int]);
+                    assert_eq!(
+                        stub.arg_kinds,
+                        vec![Kind::Int, Kind::Int, Kind::Int, Kind::Int],
+                    );
                 }
             }
         } else {
             panic!("expected Insn::Op");
         }
 
-        // argc=1: 1 real item, 1 padding.  arg_kinds=[Int, Ref, Int],
-        // args_i=[argc=1, dummy=0], args_r=[reg].
+        // argc=1: 1 real item, 2 padding slots.  arg_kinds=[Int, Ref, Int, Int],
+        // args_i=[argc=1, dummy=0, dummy=0], args_r=[reg].
         let argc_1 = build_build_list_fn_residual_call_ir_r_insn(18, 1, &[7], 5);
         if let Insn::Op { args, .. } = &argc_1 {
             if let Operand::ListOfKind(list) = &args[1] {
-                assert_eq!(list.content.len(), 2, "argc=1 → ListI=[1, 0]");
+                assert_eq!(list.content.len(), 3, "argc=1 → ListI=[1, 0, 0]");
+                let expected = [1, 0, 0];
+                for (op, expected) in list.content.iter().zip(expected) {
+                    if let Operand::ConstInt(v) = op {
+                        assert_eq!(*v, expected);
+                    } else {
+                        panic!("expected ConstInt in ListI");
+                    }
+                }
             } else {
                 panic!("expected ListOfKind(Int) at args[1]");
             }
@@ -6263,7 +6337,41 @@ mod tests {
             }
             if let Operand::Descr(rc) = &args[3] {
                 if let DescrOperand::CallDescrStub(stub) = &**rc {
-                    assert_eq!(stub.arg_kinds, vec![Kind::Int, Kind::Ref, Kind::Int]);
+                    assert_eq!(
+                        stub.arg_kinds,
+                        vec![Kind::Int, Kind::Ref, Kind::Int, Kind::Int],
+                    );
+                }
+            }
+        } else {
+            panic!("expected Insn::Op");
+        }
+
+        // argc=3: all trailing ABI slots are Refs.  arg_kinds=
+        // [Int, Ref, Ref, Ref], args_i=[argc=3], args_r=[reg, reg, reg].
+        let argc_3 = build_build_list_fn_residual_call_ir_r_insn(18, 3, &[7, 8, 9], 5);
+        if let Insn::Op { args, .. } = &argc_3 {
+            if let Operand::ListOfKind(list) = &args[1] {
+                assert_eq!(list.content.len(), 1, "argc=3 → ListI=[3]");
+                if let Operand::ConstInt(v) = &list.content[0] {
+                    assert_eq!(*v, 3);
+                } else {
+                    panic!("expected ConstInt(3) in ListI");
+                }
+            } else {
+                panic!("expected ListOfKind(Int) at args[1]");
+            }
+            if let Operand::ListOfKind(list) = &args[2] {
+                assert_eq!(list.content.len(), 3, "argc=3 → ListR=[reg, reg, reg]");
+            } else {
+                panic!("expected ListOfKind(Ref) at args[2]");
+            }
+            if let Operand::Descr(rc) = &args[3] {
+                if let DescrOperand::CallDescrStub(stub) = &**rc {
+                    assert_eq!(
+                        stub.arg_kinds,
+                        vec![Kind::Int, Kind::Ref, Kind::Ref, Kind::Ref],
+                    );
                 }
             }
         } else {
@@ -6281,14 +6389,18 @@ mod tests {
         let dst = Variable::new(VariableId(5), Kind::Ref);
         let descr = intern_call_descr_stub(
             effect_info_for_call_flavor(CallFlavor::Plain),
-            vec![Kind::Int, Kind::Ref, Kind::Ref],
+            vec![Kind::Int, Kind::Ref, Kind::Ref, Kind::Int],
             Some(Kind::Ref),
         );
         let dual_op = SpaceOperation::new(
             "residual_call_ir_r",
             vec![
                 Constant::signed(18).into(),
-                FlowListOfKind::new(Kind::Int, vec![Constant::signed(2).into()]).into(),
+                FlowListOfKind::new(
+                    Kind::Int,
+                    vec![Constant::signed(2).into(), Constant::signed(0).into()],
+                )
+                .into(),
                 FlowListOfKind::new(Kind::Ref, vec![item0.into(), item1.into()]).into(),
                 descr.into(),
             ],
@@ -6301,6 +6413,30 @@ mod tests {
             .expect("residual_call SpaceOperation must lower");
         let prod = build_build_list_fn_residual_call_ir_r_insn(18, 2, &[3, 4], 5);
         assert_eq!(format!("{prod:?}"), format!("{dual:?}"));
+    }
+
+    #[test]
+    #[should_panic(expected = "BuildList helper only supports argc")]
+    fn build_build_list_fn_residual_call_ir_r_insn_rejects_unsupported_argc() {
+        let _ = build_build_list_fn_residual_call_ir_r_insn(18, 4, &[1, 2, 3, 4], 5);
+    }
+
+    #[test]
+    #[should_panic(expected = "arg_regs length must match argc")]
+    fn build_build_list_fn_residual_call_ir_r_insn_rejects_arg_reg_mismatch() {
+        let _ = build_build_list_fn_residual_call_ir_r_insn(18, 2, &[1], 5);
+    }
+
+    #[test]
+    #[should_panic(expected = "BUILD_SLICE expects argc=2 without step or argc=3 with step")]
+    fn build_build_slice_fn_residual_call_ir_r_insn_rejects_two_arg_with_step() {
+        let _ = build_build_slice_fn_residual_call_ir_r_insn(19, 2, 1, 2, Some(3), 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "BUILD_SLICE expects argc=2 without step or argc=3 with step")]
+    fn build_build_slice_fn_residual_call_ir_r_insn_rejects_three_arg_without_step() {
+        let _ = build_build_slice_fn_residual_call_ir_r_insn(19, 3, 1, 2, None, 4);
     }
 
     #[test]
