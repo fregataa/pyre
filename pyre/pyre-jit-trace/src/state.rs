@@ -2635,6 +2635,90 @@ pub(crate) fn fail_arg_types_for_virtualizable_state(len: usize) -> Vec<Type> {
     crate::virtualizable_gen::virt_live_value_types(len.saturating_sub(n))
 }
 
+/// `pyjitpl.py:98-119 MIFrame.copy_constants` line-by-line port.
+///
+/// ```python
+/// def copy_constants(self, registers, constants, targetindex, ConstClass):
+///     num_regs_and_consts = targetindex + len(constants)
+///     if registers is None or len(registers) < num_regs_and_consts:
+///         registers = [missing] * num_regs_and_consts
+///     elif not we_are_translated():
+///         for i in range(len(registers)):
+///             registers[i] = missing
+///     for i in range(len(constants)):
+///         registers[targetindex] = ConstClass(constants[i])
+///         targetindex += 1
+///     return registers
+/// ```
+///
+/// `ConstClass(constants[i])` is supplied as the closure `mint`. The
+/// `elif not we_are_translated()` debug wipe is upstream-only
+/// (translation-time fill of stale slots with `missing`); pyre always
+/// runs the translated path. `MIFrame.setup` can be re-invoked on
+/// `free_frames_list` reused frames (`pyjitpl.py:2471`), and each call
+/// re-mints `ConstClass(constants[i])` unconditionally — the fill loop
+/// here matches that.
+///
+/// PRE-EXISTING ADAPTATIONS (pre-main divergences kept for now):
+///
+/// 1. Grow-in-place via `resize(num_regs_and_consts, NONE)` instead of
+///    full replacement `[missing] * num_regs_and_consts` (the
+///    `if registers is None or len(registers) < ...` arm at
+///    `pyjitpl.py:109`). Convergence is blocked by Adaptation 2 below:
+///    callers like `trace_opcode.rs:5466-5476` push callee args into
+///    `sym.registers_r[0..args.len()]` BEFORE invoking this helper, and
+///    a full replacement would zero those slots. Migrating to
+///    full-replace requires reordering the trace_opcode callee setup
+///    so the regalloc-color slot writes happen after
+///    `setup_kind_register_banks`, plus matching opcode-dispatch reads
+///    against the post-color slots rather than sequential
+///    `[0..nlocals)`. That is a multi-file restructuring outside this
+///    slice's scope.
+///
+/// 2. `registers_r` carries both pyre's semantic locals/stack mirror
+///    AND the post-regalloc-color Ref bank (see the wider doc on
+///    `setup_kind_register_banks` below). RPython's `registers_r` is a
+///    pure kind-specific Ref bank — semantic locals go through
+///    opcode-dispatch reads of `registers_r[color]`. Pyre's dual-role
+///    is what makes Adaptation 1 load-bearing; retiring one entails
+///    retiring both.
+///
+/// 3. Ref constants land via `ctx.const_ref(val)` — a plain Ref
+///    constant — instead of upstream's `ConstPtrJitCode` subclass
+///    (`history.py:361-365`) that carries an `opencoder_index = -1`
+///    cache field. Upstream uses that field to fast-path the trace
+///    encoder's pointer dedup at `opencoder.py:583-601
+///    _cached_const_ptr` (over its `_refs_dict`). Pyre lacks the
+///    per-instance cache: every `ctx.const_ref(val)` mints a fresh
+///    constant OpRef (`constant_pool.rs:57-103
+///    get_or_insert{,_typed}` — no HashMap-keyed dedup at this
+///    layer). The two upstream dedup layers exist independently in
+///    pyre:
+///      - **Trace encoding** (port of `opencoder.py:583
+///        _cached_const_ptr`): `opencoder.rs:1873 _encode_ptr` dedups
+///        by address via `_refs_dict: HashMap<u64, u32>`, mirroring
+///        upstream's `_refs_dict` lookup. The
+///        `ConstPtrJitCode.opencoder_index` cache that bypasses the
+///        dict has no pyre counterpart, but the underlying dedup is
+///        preserved.
+///      - **Resume-data numbering** (port of `resume.py:148-181
+///        ResumeDataLoopMemo.large_ints / .refs`):
+///        `resume.rs:3460-3490 ResumeDataLoopMemo.large_ints /
+///        .refs` memo separately dedups constants when assigning
+///        resume numbering tags.
+fn copy_constants<F>(registers: &mut Vec<OpRef>, constants: &[i64], targetindex: usize, mut mint: F)
+where
+    F: FnMut(i64) -> OpRef,
+{
+    let num_regs_and_consts = targetindex + constants.len();
+    if registers.len() < num_regs_and_consts {
+        registers.resize(num_regs_and_consts, OpRef::NONE);
+    }
+    for (i, &val) in constants.iter().enumerate() {
+        registers[targetindex + i] = mint(val);
+    }
+}
+
 impl PyreSym {
     pub(crate) fn new_uninit(frame: OpRef) -> Self {
         Self {
@@ -2693,8 +2777,17 @@ impl PyreSym {
     ///   - `registers_i[num_regs_i + i]` ← `ctx.const_int(constants_i[i])`
     ///   - `registers_r[num_regs_r + i]` ← `ctx.const_ref(constants_r[i])`
     ///   - `registers_f[num_regs_f + i]` ← `ctx.const_float(constants_f[i])`
-    /// `TraceCtx::const_*` dedup by value, so this fill is idempotent
-    /// across re-entries (`copy_constants` overwrite semantics).
+    /// `TraceCtx::const_int` / `const_ref` / `const_float` all mint a
+    /// fresh constant OpRef per call (`constant_pool.rs:57-103
+    /// get_or_insert{,_typed}`), matching RPython
+    /// `ConstClass(constants[i])`'s fresh-Box allocation
+    /// (`history.py:220/261/307`). Per-value dedup, where it exists
+    /// upstream, lives in the resume memo
+    /// (`resume.rs:3460-3490 ResumeDataLoopMemo.large_ints / .refs`
+    /// per `resume.py:148-181`), not in the constant pool. Re-entering
+    /// this helper therefore overwrites the trailing slots with freshly
+    /// minted OpRefs across all three banks, matching `copy_constants`
+    /// overwrite semantics line-by-line.
     ///
     /// `registers_r` carries the unified locals + stack-tail abstract
     /// register file (Stage 3.4 Phase C). Slice 3b-1 of the
@@ -2731,29 +2824,24 @@ impl PyreSym {
                 runtime_jc.constants_f.clone(),
             )
         };
-        let total_i = num_regs_i + constants_i.len();
-        let total_r = num_regs_r + constants_r.len();
-        let total_f = num_regs_f + constants_f.len();
-        if self.registers_i.len() < total_i {
-            self.registers_i.resize(total_i, OpRef::NONE);
-        }
-        if self.registers_r.len() < total_r {
-            self.registers_r.resize(total_r, OpRef::NONE);
-        }
-        if self.registers_f.len() < total_f {
-            self.registers_f.resize(total_f, OpRef::NONE);
-        }
-        // pyjitpl.py:97-119 copy_constants — overwrite trailing slots with
-        // the constant-pool OpRefs.
-        for (i, &val) in constants_i.iter().enumerate() {
-            self.registers_i[num_regs_i + i] = ctx.const_int(val);
-        }
-        for (i, &val) in constants_r.iter().enumerate() {
-            self.registers_r[num_regs_r + i] = ctx.const_ref(val);
-        }
-        for (i, &val) in constants_f.iter().enumerate() {
-            self.registers_f[num_regs_f + i] = ctx.const_float(val);
-        }
+        // pyjitpl.py:98-119 `MIFrame.copy_constants` line-by-line:
+        //   num_regs_and_consts = targetindex + len(constants)
+        //   if registers is None or len(registers) < num_regs_and_consts:
+        //       registers = [missing] * num_regs_and_consts
+        //   for i in range(len(constants)):
+        //       registers[targetindex] = ConstClass(constants[i])
+        //       targetindex += 1
+        // The "translation-time-only debug wipe" arm
+        // (`elif not we_are_translated()`) has no pyre analogue.
+        copy_constants(&mut self.registers_i, &constants_i, num_regs_i, |v| {
+            ctx.const_int(v)
+        });
+        copy_constants(&mut self.registers_r, &constants_r, num_regs_r, |v| {
+            ctx.const_ref(v)
+        });
+        copy_constants(&mut self.registers_f, &constants_f, num_regs_f, |v| {
+            ctx.const_float(v)
+        });
     }
 
     /// True when this frame is allowed to mirror writes into the

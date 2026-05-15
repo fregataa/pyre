@@ -5060,87 +5060,6 @@ impl OptContext {
         }
     }
 
-    /// `Box.type` strict accessor. Panics when no source carries a type for
-    /// `opref`, matching `history.py:802 record_same_as(box.type)`'s
-    /// no-guess-on-miss policy: RPython Boxes always have an intrinsic type,
-    /// so a missing type is a structural bug.
-    ///
-    /// Use this whenever the call site previously read a HashMap with
-    /// `unwrap_or(Type::Int|Ref)` — those defaults silently absorbed bugs
-    /// that would have been audible under the upstream invariant.  Sites
-    /// that legitimately need a fallback (e.g. inputarg-stub harnesses,
-    /// out-of-process compile.rs paths without an `OptContext`) should
-    /// stay on `opref_type` and document the deviation.
-    #[track_caller]
-    pub fn op_type_strict(&self, opref: OpRef) -> majit_ir::Type {
-        self.opref_type(opref).unwrap_or_else(|| {
-            panic!(
-                "op_type_strict: no Box.type for {:?} (resolved={:?}); \
-                 every OpRef must have a type via constant / value_types / \
-                 producer-op result_type. history.py:802 parity.",
-                opref,
-                self.get_box_replacement(opref),
-            )
-        })
-    }
-
-    /// Transitional: classify an [`OpRef`] into the [`AbstractValue`]
-    /// variant that matches its RPython class.
-    ///
-    /// RPython's `AbstractValue` carries `type` and class identity
-    /// (Const/InputArg/ResOp + i/r/f) intrinsically on the Python
-    /// object. In pyre, [`OpRef`] is a numeric handle and the type
-    /// information lives in side tables (constant pool, `value_types`,
-    /// `get_op_result_type`); this method composes those into the
-    /// canonical [`AbstractValue`] shape so callers can match on
-    /// RPython class identity directly.
-    ///
-    /// Phase 1 of the OpRef → AbstractValue migration ships this as a
-    /// non-breaking addition. Subsequent phases migrate construction
-    /// sites to thread typed values through the call graph; the final
-    /// phase replaces the [`OpRef`] tuple struct with an enum that IS
-    /// [`AbstractValue`], at which point this method becomes
-    /// unnecessary.
-    ///
-    /// Returns [`AbstractValue::None`] for [`OpRef::NONE`] and for
-    /// OpRefs whose type cannot be resolved (a bookkeeping bug, but
-    /// here treated as "unknown" rather than panicking — strict
-    /// `expect()` callers should consult `opref_type` directly first).
-    pub fn abstract_value(&self, opref: OpRef) -> majit_ir::AbstractValue {
-        use majit_ir::{AbstractValue, Type};
-        if opref.is_none() {
-            return AbstractValue::None;
-        }
-        let resolved = self.get_box_replacement(opref);
-        // Const family: constant-namespace OpRefs.
-        if resolved.is_constant() {
-            let idx = resolved.const_index();
-            return match self.get_constant(resolved).map(|v| v.get_type()) {
-                Some(Type::Int) => AbstractValue::ConstInt(idx),
-                Some(Type::Float) => AbstractValue::ConstFloat(idx),
-                Some(Type::Ref) => AbstractValue::ConstPtr(idx),
-                _ => AbstractValue::None,
-            };
-        }
-        let raw = resolved.raw();
-        let ty = self.opref_type(resolved);
-        // resoperation.py:719 AbstractInputArg parity: positions in the
-        // [inputarg_base, inputarg_base + num_inputs) range are
-        // InputArg{Int,Float,Ref}; everything else is an emitted
-        // AbstractResOp result.
-        let is_input_arg =
-            raw >= self.inputarg_base && raw < self.inputarg_base.saturating_add(self.num_inputs);
-        match (ty, is_input_arg) {
-            (Some(Type::Int), true) => AbstractValue::InputArgInt(raw),
-            (Some(Type::Float), true) => AbstractValue::InputArgFloat(raw),
-            (Some(Type::Ref), true) => AbstractValue::InputArgRef(raw),
-            (Some(Type::Int), false) => AbstractValue::IntOp(raw),
-            (Some(Type::Float), false) => AbstractValue::FloatOp(raw),
-            (Some(Type::Ref), false) => AbstractValue::RefOp(raw),
-            _ => AbstractValue::None,
-        }
-    }
-
     /// info.py:865-878 `getrawptrinfo(op)` parity (line-by-line port).
     ///
     /// ```python
@@ -5160,52 +5079,39 @@ impl OptContext {
     ///     return None
     /// ```
     ///
-    /// Line-by-line port of `info.py:865-878`. The `ConstInt` arm
-    /// (info.py:870-871) wraps the int bits as `ConstPtrInfo(GcRef)` —
-    /// the caller has selected `getrawptrinfo` because the `'i'`-typed
-    /// box is intended as a raw pointer (exception typeptr at
-    /// pyjitpl.py:3404, vtable class pointer at virtualstate.py:747).
-    pub fn getrawptrinfo(&self, opref: OpRef) -> Option<std::borrow::Cow<'_, PtrInfo>> {
-        // assert op.type == 'i'
-        debug_assert!(
-            matches!(self.opref_type(opref), Some(majit_ir::Type::Int) | None),
-            "getrawptrinfo: expected 'i'-typed OpRef, got {:?}",
-            self.opref_type(opref)
+    /// The `IntBound` branch maps onto `peek_ptr_info` returning `None`
+    /// when the forwarded slot is `Forwarded::IntBound` (rather than
+    /// `Forwarded::Info(PtrInfo)`), which already corresponds to
+    /// upstream's `isinstance(fw, IntBound): return None` early-out.
+    ///
+    /// The two `assert op.type == 'i'` are kept as `debug_assert_eq!`s
+    /// against `BoxRef::type_()` — strict `Type::Int` only, matching
+    /// upstream. Callers that materialize boxes via `ensure_box_at`
+    /// (which defaults to `Type::Void` for un-typed test fixtures)
+    /// must thread the correct `Type::Int` at the fixture boundary
+    /// instead of relaxing this helper.
+    pub fn getrawptrinfo(&self, op: &crate::r#box::BoxRef) -> Option<PtrInfo> {
+        // info.py:867 — `assert op.type == 'i'`.
+        debug_assert_eq!(
+            op.type_(),
+            majit_ir::Type::Int,
+            "getrawptrinfo: expected 'i'-typed BoxRef"
         );
-        // op = op.get_box_replacement()
-        let resolved = self.get_box_replacement(opref);
-        // assert op.type == 'i'
-        debug_assert!(matches!(
-            self.opref_type(resolved),
-            Some(majit_ir::Type::Int) | None
-        ));
-        // info.py:870-871 — `if isinstance(op, ConstInt): return
-        // ConstPtrInfo(op)`. RPython treats every ConstInt reaching
-        // `getrawptrinfo` as a raw pointer (the caller has selected this
-        // helper because it intends to read the `'i'`-typed box as a
-        // pointer — e.g. exception typeptr at pyjitpl.py:3404, vtable
-        // class pointer at virtualstate.py:747). The wrapped `ConstPtrInfo`
-        // exposes the int bits as a `GcRef` for downstream class /
-        // known-class queries.
-        if let Some(Value::Int(bits)) = self.get_constant(resolved) {
-            return Some(std::borrow::Cow::Owned(PtrInfo::Constant(majit_ir::GcRef(
-                bits as usize,
-            ))));
+        // info.py:868 — `op = op.get_box_replacement()`.
+        let terminal = op.get_box_replacement(false);
+        // info.py:869 — `assert op.type == 'i'`.
+        debug_assert_eq!(
+            terminal.type_(),
+            majit_ir::Type::Int,
+            "getrawptrinfo: terminal expected 'i'-typed BoxRef"
+        );
+        // info.py:870-871 — `if isinstance(op, ConstInt): return ConstPtrInfo(op)`.
+        if let Some(Value::Int(bits)) = terminal.const_value() {
+            return Some(PtrInfo::Constant(majit_ir::GcRef(bits as usize)));
         }
-        // fw = op.get_forwarded()
-        // if isinstance(fw, IntBound): return None  →  peek_ptr_info_via_box
-        //   only returns Some for Forwarded::Info(PtrInfo). An int-typed
-        //   box that holds Forwarded::IntBound returns None here, matching
-        //   the upstream early-return on IntBound forwarding.
-        // if fw is not None: assert isinstance(fw, AbstractRawPtrInfo); return fw
-        //   AbstractRawPtrInfo ↔ PtrInfo::VirtualRawBuffer / VirtualRawSlice
-        //   in majit (see is_raw_ptr).
-        // BoxRef-routing reader (H-3.2c slice 56). Always returns Owned —
-        // test callers binding `Cow::Borrowed` keep working through deref.
-        self.get_box_replacement_box(resolved)
-            .as_ref()
-            .and_then(|b| self.peek_ptr_info(b))
-            .map(std::borrow::Cow::Owned)
+        // info.py:872-878 — IntBound forwarding returns None;
+        // AbstractRawPtrInfo forwarding returns the info.
+        self.peek_ptr_info(&terminal)
     }
 
     /// info.py:880-894 `getptrinfo(op)` parity (line-by-line port).
@@ -5227,57 +5133,19 @@ impl OptContext {
     ///         return fw
     ///     return None
     /// ```
-    ///
-    /// `info.py:880-894 getptrinfo(op)` line-by-line port:
-    /// ```python
-    /// def getptrinfo(op):
-    ///     if op.type == 'i': return getrawptrinfo(op)
-    ///     elif op.type == 'f': return None
-    ///     assert op.type == 'r'
-    ///     op = get_box_replacement(op)
-    ///     assert op.type == 'r'
-    ///     if isinstance(op, ConstPtr):
-    ///         return ConstPtrInfo(op)
-    ///     fw = op.get_forwarded()
-    ///     if fw is not None:
-    ///         assert isinstance(fw, PtrInfo)
-    ///         return fw
-    ///     return None
-    /// ```
-    /// The Int arm folds `ConstInt` to `ConstPtrInfo` and otherwise
-    /// delegates to `peek_ptr_info` (info.py:865-878 `getrawptrinfo`).
-    /// The Float arm short-circuits to `None`. The Ref arm chain-walks
-    /// `get_box_replacement(op)` and reads the terminal's `_forwarded`
-    /// `PtrInfo` slot. The Void arm panics — `info.py:885 assert op.type
-    /// == 'r'` rejects Void boxes outright, and the sparse `BoxPool`
-    /// (`Vec<Option<BoxRef>>`) no longer produces synthetic Void filler
-    /// boxes that would smuggle a typed-erased pointer through this
-    /// helper.
+    /// The Int arm delegates to `getrawptrinfo` per `info.py:881-882`.
+    /// The Float arm short-circuits to `None`. The Void arm panics —
+    /// `info.py:885 assert op.type == 'r'` rejects Void boxes
+    /// outright, and the sparse `BoxPool` (`Vec<Option<BoxRef>>`) no
+    /// longer produces synthetic Void filler boxes that would smuggle
+    /// a typed-erased pointer through this helper.
     pub fn getptrinfo(&self, op: &crate::r#box::BoxRef) -> Option<PtrInfo> {
-        // info.py:880-894 line-by-line:
-        //   if op.type == 'i': return getrawptrinfo(op)
-        //   elif op.type == 'f': return None
-        //   assert op.type == 'r'
-        //   op = get_box_replacement(op)
-        //   assert op.type == 'r'
-        //   if isinstance(op, ConstPtr): return ConstPtrInfo(op)
-        //   fw = op.get_forwarded()
-        //   if fw is not None: assert isinstance(fw, PtrInfo); return fw
-        //   return None
         match op.type_() {
-            majit_ir::Type::Int => {
-                // info.py:882 — Int branch delegates to getrawptrinfo.
-                // info.py:865-878 getrawptrinfo: ConstInt → ConstPtrInfo
-                // (line 870-871); otherwise read the forwarded PtrInfo.
-                let terminal = op.get_box_replacement(false);
-                return match terminal.const_value() {
-                    Some(Value::Int(bits)) => {
-                        Some(PtrInfo::Constant(majit_ir::GcRef(bits as usize)))
-                    }
-                    _ => self.peek_ptr_info(&terminal),
-                };
-            }
+            // info.py:881-882 — `if op.type == 'i': return getrawptrinfo(op)`.
+            majit_ir::Type::Int => return self.getrawptrinfo(op),
+            // info.py:883-884 — `elif op.type == 'f': return None`.
             majit_ir::Type::Float => return None,
+            // info.py:885 — `assert op.type == 'r'`.
             majit_ir::Type::Ref => {}
             majit_ir::Type::Void => panic!(
                 "getptrinfo: op.type == 'v' (info.py:885 `assert op.type == 'r'`); \
@@ -5285,7 +5153,10 @@ impl OptContext {
                  carry no PtrInfo upstream",
             ),
         }
-        // info.py:886: op = get_box_replacement(op)
+        // info.py:886-893 type 'r' arm:
+        //   op = get_box_replacement(op)
+        //   if isinstance(op, ConstPtr): return ConstPtrInfo(op)
+        //   fw = op.get_forwarded(); if fw is not None: return fw
         let terminal = op.get_box_replacement(false);
         // info.py:887: assert op.type == 'r' — the chain walk must
         // preserve the Ref type tag (resoperation.py:802 record_same_as
@@ -5444,25 +5315,6 @@ impl OptContext {
             resolved.ptr_info().as_deref(),
             Some(PtrInfo::VirtualRawBuffer(_) | PtrInfo::VirtualRawSlice(_))
         )
-    }
-
-    /// info.py: op.set_forwarded(info) — set PtrInfo for an OpRef.
-    /// Ensure a PtrInfo exists for the given OpRef. Creates an empty
-    /// Instance if none exists, so that set_field can store values.
-    pub fn ensure_ptr_info(&mut self, opref: OpRef) {
-        if opref.is_constant() {
-            return;
-        }
-        use crate::optimizeopt::info::OpInfo;
-        // BoxRef-authoritative probe. `ensure_box` lazily allocates a
-        // placeholder when the recorder did not pre-seed this position.
-        let b = self
-            .ensure_box(opref)
-            .expect("body-namespace OpRef must have a BoxRef slot");
-        let already_set = !matches!(*b.get_forwarded(), crate::r#box::Forwarded::None);
-        if !already_set {
-            b.set_forwarded_info(OpInfo::Ptr(PtrInfo::instance(None, None)));
-        }
     }
 
     /// Set PtrInfo without clearing forwarding.
