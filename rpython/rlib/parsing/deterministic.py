@@ -651,6 +651,7 @@ class SetNFARunner(object):
         return nextstates
 
     def recognize(self, s):
+        # type: (str) -> bool
         self.states = self.automaton.start_states.copy()
         for char in s:
             nextstates = self.next_state(char)
