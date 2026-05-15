@@ -34,6 +34,7 @@ def compress_char_set(chars):
     return real_result
 
 def make_nice_charset_repr(chars):
+    # type: (str) -> str
     """Create a human-readable representation of a character set."""
     # Compress the letters & digits
     letters = set(chars) & set("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
