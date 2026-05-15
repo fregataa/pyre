@@ -124,6 +124,7 @@ class DFA(object):
         return (state, input) in self.transitions
 
     def get_all_chars(self):
+        # type: () -> set[str]
         """Return all input characters that appear in transitions."""
         all_chars = set()
         for (state, input) in self.transitions:
@@ -131,6 +132,7 @@ class DFA(object):
         return all_chars
 
     def optimize(self):
+        # type: () -> bool
         """Minimize the DFA by merging equivalent states. Returns True if merged."""
         all_chars = self.get_all_chars()
         # find mergeable
@@ -225,6 +227,7 @@ class DFA(object):
         return True
 
     def make_code(self):
+        # type: () -> Callable[[str], bool]
         """Generate and compile a Python function that recognizes the DFA's language."""
         from rpython.rlib.parsing.codebuilder import Codebuilder
         result = Codebuilder()
@@ -307,6 +310,7 @@ class DFA(object):
         return recognize
 
     def generate_lexing_code(self):
+        # type: () -> str
         """Return source code for a lexing function that integrates with a runner."""
         from rpython.rlib.parsing.codebuilder import Codebuilder
         result = Codebuilder()
@@ -408,6 +412,7 @@ return ~i""")
         return result
 
     def dot(self):
+        # type: () -> str
         """Generate a GraphViz DOT representation of the automaton."""
         result = ["graph G {"]
         for i in range(self.num_states):
@@ -669,6 +674,7 @@ class BacktrackingNFARunner(object):
         self.automaton = automaton
 
     def recognize(self, s):
+        # type: (str) -> bool
         """Check if the NFA accepts the given string using backtracking search."""
         def recurse(i, state):
             if i == len(s):
