@@ -64,6 +64,7 @@ class LexerError(Exception):
         self.args = (input, state, source_pos)
 
     def nice_error_message(self, filename="<unknown>"):
+        # type: (Optional[str]) -> str
         # + 1 is because source_pos is 0-based and humans 1-based
         result = ["  File %s, line %s" % (filename, self.source_pos.lineno + 1)]
         result.append(self.input.split("\n")[self.source_pos.lineno])
@@ -99,6 +100,7 @@ class DFA(object):
             self.unmergeable_states, self.names)), )
 
     def add_state(self, name=None, final=False, unmergeable=False):
+        # type: (Optional[str], Optional[bool], Optional[bool]) -> int
         """Add a new state to the automaton and return its id."""
         state = self.num_states
         self.num_states += 1
@@ -388,6 +390,7 @@ return ~i""")
         return result
 
     def get_runner(self):
+        # type: () -> DFARunner
         """Create and return a DFARunner for this automaton."""
         return DFARunner(self)
 
