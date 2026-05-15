@@ -1407,28 +1407,31 @@ impl<'a> Assembler386<'a> {
     /// (typically the slow-path's argument / result register, which
     /// holds non-Ref data across the call).
     ///
-    /// Indexes through `crate::x86::regalloc::all_core_regs()` /
-    /// `all_float_regs()` — the same ordering `regalloc::get_gcmap`
-    /// uses to encode bits via `core_reg_index`. The two lists diverge
-    /// on Windows (where R13 is removed from `all_core_regs`), so
-    /// indexing by `all_gen_regs` here would map R14/R15 to the wrong
-    /// slot relative to the gcmap.
+    /// Iterates `crate::x86::regalloc::all_core_regs()` / `all_float_regs()`
+    /// (the allocator pool — drops R13 and XMM5..XMM14 on Win64), but
+    /// indexes the slot via `core_reg_position` / `float_reg_position`,
+    /// matching `regalloc.py all_reg_indexes` — a FIXED table that pins
+    /// R14→11 / R15→12 regardless of whether R13 is in the iteration
+    /// pool.  An iteration-position scheme drifts by one for R14/R15
+    /// on Win64 (and shifts the XMM base too), desyncing this routine
+    /// from `save_regs_label` and the `core_reg_index`-driven gcmap.
     fn push_all_regs_to_jitframe(
         &mut self,
         ignored_regs: &[crate::regloc::RegLoc],
         withfloats: bool,
     ) {
-        for (idx, reg) in crate::x86::regalloc::all_core_regs().iter().enumerate() {
+        for reg in crate::x86::regalloc::all_core_regs().iter() {
             if ignored_regs.contains(reg) {
                 continue;
             }
-            let ofs = Self::slot_offset(idx);
+            let slot = core_reg_position(*reg).expect("push_all_regs: managed x86_64 GPR");
+            let ofs = Self::slot_offset(slot);
             dynasm!(self.mc ; .arch x64 ; mov [rbp + ofs], Rq(reg.value));
         }
         if withfloats {
-            let gpr_count = crate::x86::regalloc::all_core_regs().len();
-            for (idx, reg) in crate::x86::regalloc::all_float_regs().iter().enumerate() {
-                let ofs = Self::slot_offset(gpr_count + idx);
+            for reg in crate::x86::regalloc::all_float_regs().iter() {
+                let slot = float_reg_position(*reg).expect("push_all_regs: managed x86_64 XMM");
+                let ofs = Self::slot_offset(slot);
                 dynasm!(self.mc ; .arch x64 ; movsd [rbp + ofs], Rx(reg.value));
             }
         }
@@ -1440,17 +1443,18 @@ impl<'a> Assembler386<'a> {
         ignored_regs: &[crate::regloc::RegLoc],
         withfloats: bool,
     ) {
-        for (idx, reg) in crate::x86::regalloc::all_core_regs().iter().enumerate() {
+        for reg in crate::x86::regalloc::all_core_regs().iter() {
             if ignored_regs.contains(reg) {
                 continue;
             }
-            let ofs = Self::slot_offset(idx);
+            let slot = core_reg_position(*reg).expect("pop_all_regs: managed x86_64 GPR");
+            let ofs = Self::slot_offset(slot);
             dynasm!(self.mc ; .arch x64 ; mov Rq(reg.value), [rbp + ofs]);
         }
         if withfloats {
-            let gpr_count = crate::x86::regalloc::all_core_regs().len();
-            for (idx, reg) in crate::x86::regalloc::all_float_regs().iter().enumerate() {
-                let ofs = Self::slot_offset(gpr_count + idx);
+            for reg in crate::x86::regalloc::all_float_regs().iter() {
+                let slot = float_reg_position(*reg).expect("pop_all_regs: managed x86_64 XMM");
+                let ofs = Self::slot_offset(slot);
                 dynasm!(self.mc ; .arch x64 ; movsd Rx(reg.value), [rbp + ofs]);
             }
         }
@@ -1534,11 +1538,13 @@ impl<'a> Assembler386<'a> {
         }
     }
 
-    /// x86/assembler.py:1369-1377 `_reload_frame_if_necessary` parity:
+    /// x86/assembler.py:1369-1383 `_reload_frame_if_necessary` parity:
     ///
     /// ```python
     ///   MOV ecx, [rootstacktop]   // shadow stack top pointer
     ///   MOV ebp, [ecx - WORD]     // jf_ptr at top - WORD
+    ///   _write_barrier_fastpath(mc, wbdescr, [ebp], array=False,
+    ///                           is_frame=True)
     /// ```
     ///
     /// After a collecting helper call the GC may have copied the
@@ -1547,8 +1553,13 @@ impl<'a> Assembler386<'a> {
     /// `grow_jitframe` realloc path — so chasing `jf_forward` here
     /// reads the freed nursery slot. The shadow-stack entry IS
     /// rewritten by the GC visitor during copy, so the live jf_ptr
-    /// lives at `*(root_stack_top - WORD)`. Reload `rbp` from there
-    /// (matches the aarch64 and cranelift backends).
+    /// lives at `*(root_stack_top - WORD)`. Reload `rbp` from there.
+    ///
+    /// Then re-apply the non-array write barrier on the new jitframe
+    /// (`is_frame=True`): subsequent stores of nursery refs into
+    /// jitframe slots must be tracked by minor GC, otherwise an
+    /// old-gen jitframe holding a nursery pointer is missed during
+    /// the next collection and the slot ends up dangling.
     fn reload_frame_if_necessary(&mut self) {
         let rst_addr = majit_gc::shadow_stack::get_root_stack_top_addr() as i64;
         dynasm!(self.mc ; .arch x64
@@ -1556,6 +1567,15 @@ impl<'a> Assembler386<'a> {
             ; mov rcx, [rcx]            // rcx = *rst_addr = root_stack_top
             ; mov rbp, [rcx - 8]        // rbp = *(top - WORD) = jf_ptr
         );
+        if crate::runner::DYNASM_ACTIVE_GC.with(|cell| {
+            cell.borrow()
+                .as_ref()
+                .and_then(|gc| gc.get_write_barrier_descr())
+                .is_some()
+        }) {
+            let rbp_loc = Loc::Reg(crate::regloc::EBP);
+            self.emit_write_barrier_fastpath_kind(&[rbp_loc], false);
+        }
     }
 
     fn guard_gcmap_from_faillocs(
@@ -1749,6 +1769,29 @@ impl<'a> Assembler386<'a> {
         let rawstart = codebuf::buffer_ptr(&buffer) as usize;
         Self::patch_pending_failure_recoveries(rawstart, &stub_offsets);
 
+        if crate::majit_dump_enabled() {
+            let code = unsafe { std::slice::from_raw_parts(rawstart as *const u8, buffer.len()) };
+            eprintln!(
+                "[dynasm] BRIDGE CODE DUMP ({} bytes at {:#x}, entry +{:?}):",
+                code.len(),
+                rawstart,
+                entry
+            );
+            for (i, chunk) in code.chunks(4).enumerate() {
+                let word = u32::from_le_bytes([
+                    chunk.first().copied().unwrap_or(0),
+                    chunk.get(1).copied().unwrap_or(0),
+                    chunk.get(2).copied().unwrap_or(0),
+                    chunk.get(3).copied().unwrap_or(0),
+                ]);
+                eprint!("{:08x} ", word);
+                if (i + 1) % 8 == 0 {
+                    eprintln!();
+                }
+            }
+            eprintln!();
+        }
+
         // Load-bearing identity invariant for runtime dispatch: pyre's
         // guard-fail trampoline reads `jitframe.jf_descr_index` and indexes
         // `compiled.fail_descrs[idx]` directly (runner.rs::find_descr_by_ptr
@@ -1792,7 +1835,7 @@ impl<'a> Assembler386<'a> {
 
         // ── Run register allocator ──
         // assembler.py:537 prepare_loop / assembler.py:638 prepare_bridge
-        if std::env::var_os("MAJIT_J2PLAN_LOG").is_some() {
+        if crate::majit_j2plan_log_enabled() {
             let plan = crate::j2plan::TracePlan::build(inputargs, ops);
             eprintln!("[dynasm:j2plan] {}", plan.summary());
         }
@@ -1839,7 +1882,7 @@ impl<'a> Assembler386<'a> {
 
         let mut fail_index = 0u32;
 
-        if std::env::var_os("MAJIT_LOG").is_some() {
+        if crate::majit_log_enabled() {
             eprintln!(
                 "[dynasm] _assemble: {} ops → {} ra_ops, frame_depth={}",
                 ops.len(),
@@ -1856,7 +1899,7 @@ impl<'a> Assembler386<'a> {
                     continue;
                 }
                 RegAllocOp::Move { src, dst } => {
-                    if std::env::var_os("MAJIT_LOG").is_some() {
+                    if crate::majit_log_enabled() {
                         eprintln!("[dynasm] move: {:?} → {:?}", src, dst);
                     }
                     self.regalloc_mov(src, dst);
@@ -1869,7 +1912,7 @@ impl<'a> Assembler386<'a> {
                     gcmap,
                 } => {
                     let op = &ops[*op_index];
-                    if std::env::var_os("MAJIT_LOG").is_some() {
+                    if crate::majit_log_enabled() {
                         let al: Vec<String> = arglocs.iter().map(|l| format!("{:?}", l)).collect();
                         eprintln!(
                             "[dynasm] emit[{}]: {:?} args=[{}] result={:?}",
@@ -1897,7 +1940,7 @@ impl<'a> Assembler386<'a> {
                     faillocs,
                 } => {
                     let op = &ops[*op_index];
-                    if std::env::var_os("MAJIT_LOG").is_some() {
+                    if crate::majit_log_enabled() {
                         eprintln!(
                             "[dynasm] guard[{}]: {:?} args=[{}] faillocs={}",
                             op_index,
@@ -1922,7 +1965,7 @@ impl<'a> Assembler386<'a> {
                 }
                 RegAllocOp::PerformDiscard { op_index, arglocs } => {
                     let op = &ops[*op_index];
-                    if std::env::var_os("MAJIT_LOG").is_some() {
+                    if crate::majit_log_enabled() {
                         let al: Vec<String> = arglocs.iter().map(|l| format!("{:?}", l)).collect();
                         eprintln!(
                             "[dynasm] discard[{}]: {:?} args=[{}]",
@@ -1939,7 +1982,7 @@ impl<'a> Assembler386<'a> {
             }
         }
 
-        if std::env::var_os("MAJIT_LOG").is_some() {
+        if crate::majit_log_enabled() {
             eprintln!(
                 "[dynasm] _assemble done: pending_guard_tokens={} fail_index={}",
                 self.pending_guard_tokens.len(),
@@ -2614,6 +2657,176 @@ impl<'a> Assembler386<'a> {
                     }
                 }
             }
+            // ── x86/assembler.py:1701 _genop_gc_load_indexed ──
+            // Line-by-line port:
+            //   base_loc, ofs_loc, scale_loc, offset_loc, size_loc, sign_loc = arglocs
+            //   scale = get_scale(scale_loc.value)
+            //   src_addr = addr_add(base_loc, ofs_loc, offset_loc.value, scale)
+            //   self.load_from_mem(resloc, src_addr, size_loc, sign_loc)
+            //
+            // The regalloc passes the raw byte stride in `scale_loc`
+            // (x86/regalloc.py:1184); `get_scale` converts 1/2/4/8 →
+            // 0/1/2/3 SIB exponents. PyPy keeps the (1,2,4,8) check
+            // implicit through `valid_addressing_size`; we surface the
+            // unsupported factors as a panic to keep miscompiles loud.
+            //
+            // KNOWN ISSUE: this emission triggers a timing-dependent
+            // segfault on `spectral_norm`-style traces (function call +
+            // many iterations + later loop). Adding any eprintln in the
+            // dispatch hides the bug, so it is likely a stale
+            // base-array pointer surviving a minor GC during the inline
+            // jitframe-alloc fast path. Tracked separately as Task #21.
+            OpCode::GcLoadIndexedI | OpCode::GcLoadIndexedR | OpCode::GcLoadIndexedF => {
+                let (base_loc, ofs_loc, scale_loc, offset_loc, size_loc, sign_loc) = match arglocs {
+                    [b, o, sc, of, sz, sg] => (b, o, sc, of, sz, sg),
+                    _ => panic!(
+                        "GcLoadIndexed arglocs must be [base, ofs, scale, offset, size, sign] (got {} locs)",
+                        arglocs.len(),
+                    ),
+                };
+                let base = match base_loc {
+                    Loc::Reg(r) => r,
+                    other => panic!(
+                        "GcLoadIndexed base_loc must be Loc::Reg (regalloc contract), got {other:?}",
+                    ),
+                };
+                let ofs_reg = match ofs_loc {
+                    Loc::Reg(r) => r,
+                    other => panic!(
+                        "GcLoadIndexed ofs_loc must be Loc::Reg (regalloc contract), got {other:?}",
+                    ),
+                };
+                let factor = match scale_loc {
+                    Loc::Immed(i) => i.value,
+                    other => panic!(
+                        "GcLoadIndexed scale_loc must be Loc::Immed (regalloc contract), got {other:?}",
+                    ),
+                };
+                let offset = match offset_loc {
+                    Loc::Immed(i) => i.value as i32,
+                    other => panic!(
+                        "GcLoadIndexed offset_loc must be Loc::Immed (regalloc contract), got {other:?}",
+                    ),
+                };
+                let size = match size_loc {
+                    Loc::Immed(i) => i.value as usize,
+                    other => panic!(
+                        "GcLoadIndexed size_loc must be Loc::Immed (regalloc contract), got {other:?}",
+                    ),
+                };
+                let sign = match sign_loc {
+                    Loc::Immed(i) => i.value != 0,
+                    other => panic!(
+                        "GcLoadIndexed sign_loc must be Loc::Immed (regalloc contract), got {other:?}",
+                    ),
+                };
+                let dst = match result_loc {
+                    Some(Loc::Reg(r)) => r,
+                    other => panic!("GcLoadIndexed result_loc must be Loc::Reg, got {other:?}",),
+                };
+
+                // assembler.py:1645 `load_from_mem`: dispatch by (resloc.is_xmm,
+                // size, sign). PyPy's `addr_add` returns `AddressLoc(base,
+                // ofs, scale, disp)` which the encoder materializes as a
+                // SIB scaled-index addressing mode straight on the MOV
+                // template. dynasm-rs requires the SIB scale as a literal
+                // at macro expansion time, so we dispatch (factor, size,
+                // sign) through a `match` arm — functionally identical to
+                // PyPy's single `mc.MOV*(resloc, src_addr)` once the
+                // factor is bound. xmm targets always use MOVSD per
+                // load_from_mem:1649; integer targets pick MOV /
+                // MOVZX{8,16} / MOVSX{8,16,32} based on size+sign.
+                macro_rules! emit_load_scaled {
+                    ($scale:tt) => {{
+                        if dst.is_xmm {
+                            dynasm!(self.mc ; .arch x64
+                                ; movsd Rx(dst.value), [Rq(base.value) + Rq(ofs_reg.value) * $scale + offset]);
+                        } else {
+                            match size {
+                                1 => {
+                                    if sign {
+                                        dynasm!(self.mc ; .arch x64
+                                            ; movsx Rq(dst.value), BYTE [Rq(base.value) + Rq(ofs_reg.value) * $scale + offset]);
+                                    } else {
+                                        dynasm!(self.mc ; .arch x64
+                                            ; movzx Rq(dst.value), BYTE [Rq(base.value) + Rq(ofs_reg.value) * $scale + offset]);
+                                    }
+                                }
+                                2 => {
+                                    if sign {
+                                        dynasm!(self.mc ; .arch x64
+                                            ; movsx Rq(dst.value), WORD [Rq(base.value) + Rq(ofs_reg.value) * $scale + offset]);
+                                    } else {
+                                        dynasm!(self.mc ; .arch x64
+                                            ; movzx Rq(dst.value), WORD [Rq(base.value) + Rq(ofs_reg.value) * $scale + offset]);
+                                    }
+                                }
+                                4 => {
+                                    if sign {
+                                        dynasm!(self.mc ; .arch x64
+                                            ; movsxd Rq(dst.value), DWORD [Rq(base.value) + Rq(ofs_reg.value) * $scale + offset]);
+                                    } else {
+                                        dynasm!(self.mc ; .arch x64
+                                            ; mov Rd(dst.value), [Rq(base.value) + Rq(ofs_reg.value) * $scale + offset]);
+                                    }
+                                }
+                                _ => dynasm!(self.mc ; .arch x64
+                                    ; mov Rq(dst.value), [Rq(base.value) + Rq(ofs_reg.value) * $scale + offset]),
+                            }
+                        }
+                    }};
+                }
+                macro_rules! emit_load_unscaled {
+                    () => {{
+                        if dst.is_xmm {
+                            dynasm!(self.mc ; .arch x64
+                                ; movsd Rx(dst.value), [Rq(base.value) + Rq(ofs_reg.value) + offset]);
+                        } else {
+                            match size {
+                                1 => {
+                                    if sign {
+                                        dynasm!(self.mc ; .arch x64
+                                            ; movsx Rq(dst.value), BYTE [Rq(base.value) + Rq(ofs_reg.value) + offset]);
+                                    } else {
+                                        dynasm!(self.mc ; .arch x64
+                                            ; movzx Rq(dst.value), BYTE [Rq(base.value) + Rq(ofs_reg.value) + offset]);
+                                    }
+                                }
+                                2 => {
+                                    if sign {
+                                        dynasm!(self.mc ; .arch x64
+                                            ; movsx Rq(dst.value), WORD [Rq(base.value) + Rq(ofs_reg.value) + offset]);
+                                    } else {
+                                        dynasm!(self.mc ; .arch x64
+                                            ; movzx Rq(dst.value), WORD [Rq(base.value) + Rq(ofs_reg.value) + offset]);
+                                    }
+                                }
+                                4 => {
+                                    if sign {
+                                        dynasm!(self.mc ; .arch x64
+                                            ; movsxd Rq(dst.value), DWORD [Rq(base.value) + Rq(ofs_reg.value) + offset]);
+                                    } else {
+                                        dynasm!(self.mc ; .arch x64
+                                            ; mov Rd(dst.value), [Rq(base.value) + Rq(ofs_reg.value) + offset]);
+                                    }
+                                }
+                                _ => dynasm!(self.mc ; .arch x64
+                                    ; mov Rq(dst.value), [Rq(base.value) + Rq(ofs_reg.value) + offset]),
+                            }
+                        }
+                    }};
+                }
+                match factor {
+                    1 => emit_load_unscaled!(),
+                    2 => emit_load_scaled!(2),
+                    4 => emit_load_scaled!(4),
+                    8 => emit_load_scaled!(8),
+                    other => panic!(
+                        "x86 GcLoadIndexed: unsupported factor {other}; \
+                         load_supported_factors = (1, 2, 4, 8)"
+                    ),
+                }
+            }
             // Structural adaptation: PyPy's llsupport/rewrite.py:132-154
             // normally lowers SETARRAYITEM_* to GC_STORE(_INDEXED), but
             // pyre's CI also exercises direct backend emission paths before
@@ -2751,7 +2964,7 @@ impl<'a> Assembler386<'a> {
                 }
                 let tmpreg1 = Loc::Reg(crate::regloc::X86_64_SCRATCH_REG);
                 let tmpreg2 = Loc::Reg(crate::regloc::XMM15);
-                if std::env::var_os("MAJIT_LOG").is_some() {
+                if crate::majit_log_enabled() {
                     eprintln!(
                         "[dynasm] Jump remap: {} int src→dst, {} float src→dst",
                         src_locations1.len(),
@@ -2776,11 +2989,22 @@ impl<'a> Assembler386<'a> {
                     dynasm!(self.mc ; .arch x64 ; jmp =>label);
                 } else if let Some(target) = jump_descr.map(|descr| descr.ll_loop_code()) {
                     // External JUMP: direct JMP to target loop code.
-                    // assembler.py:2461 mc.JMP(imm(target))
+                    // assembler.py:2461 mc.JMP(imm(target)) — PyPy's
+                    // `LocationCodeBuilder._addr_as_reg_offset` (regloc.py:204)
+                    // stages a 64-bit absolute target through
+                    // `X86_64_SCRATCH_REG = r11`, never RAX.  Using RAX
+                    // here clobbers the loop-carried Ref that the
+                    // regalloc bound to it: a bridge whose body
+                    // succeeds and rejoins the trace loop returns with
+                    // RAX = `target` (a code address), and the next
+                    // iteration's GuardClass(RAX) then misreads RAX as
+                    // a Ref and SEGVs when it dereferences trace + 0x1B3
+                    // expecting a class pointer.
                     let addr = target as i64;
+                    let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
                     dynasm!(self.mc ; .arch x64
-                        ; mov rax, QWORD addr
-                        ; jmp rax
+                        ; mov Rq(scratch), QWORD addr
+                        ; jmp Rq(scratch)
                     );
                 }
             }
@@ -2858,7 +3082,7 @@ impl<'a> Assembler386<'a> {
             OpCode::Label => {
                 let label = self.mc.new_dynamic_label();
                 let label_descr = loop_target_descr(op);
-                if std::env::var_os("MAJIT_LOG").is_some() {
+                if crate::majit_log_enabled() {
                     eprintln!("[dynasm] LABEL: new DynamicLabel({:?})", label);
                 }
                 dynasm!(self.mc ; =>label);
@@ -3751,7 +3975,7 @@ impl<'a> Assembler386<'a> {
                 true,  // is_resume_guard
             ))
         };
-        if std::env::var_os("MAJIT_LOG").is_some() {
+        if crate::majit_log_enabled() {
             eprintln!(
                 "[dynasm] guard-token: fail_index={} op_index={} opcode={:?} fail_args={:?} fail_arg_types={:?} faillocs={:?}",
                 fail_index,
@@ -3851,7 +4075,7 @@ impl<'a> Assembler386<'a> {
             // metainterp side, so no separate local copy is kept here.
             descr_mut.meta_descr = op.descr.clone();
         }
-        if std::env::var_os("MAJIT_LOG").is_some() {
+        if crate::majit_log_enabled() {
             eprintln!(
                 "[dynasm] guard-token-slots: fail_index={} fail_arg_locs={:?} rd_locs={:?}",
                 fail_index, &descr.fail_arg_locs, &descr.rd_locs
@@ -3920,7 +4144,7 @@ impl<'a> Assembler386<'a> {
         let stub_start = self.mc.offset();
 
         let fail_label = guard_token.fail_label;
-        if std::env::var_os("MAJIT_LOG").is_some() {
+        if crate::majit_log_enabled() {
             eprintln!("[dynasm] recovery stub: binding {:?}", fail_label);
         }
         dynasm!(self.mc ; .arch x64 ; =>fail_label);
@@ -3975,7 +4199,7 @@ impl<'a> Assembler386<'a> {
         }
         dynasm!(self.mc ; .arch x64 ; ret);
 
-        if std::env::var_os("MAJIT_LOG").is_some() {
+        if crate::majit_log_enabled() {
             eprintln!(
                 "[dynasm] write_pending_failure_recoveries: {} tokens",
                 self.pending_guard_tokens.len()
@@ -3985,7 +4209,7 @@ impl<'a> Assembler386<'a> {
         for guard_token in std::mem::take(&mut self.pending_guard_tokens) {
             stub_offsets.push(self.generate_quick_failure(guard_token, save_regs_label));
         }
-        if std::env::var_os("MAJIT_LOG").is_some() {
+        if crate::majit_log_enabled() {
             eprintln!("[dynasm] write_pending done: {} stubs", stub_offsets.len());
         }
         stub_offsets
@@ -4040,7 +4264,7 @@ impl<'a> Assembler386<'a> {
         });
 
         // Verify patch was applied correctly
-        if std::env::var_os("MAJIT_LOG").is_some() {
+        if crate::majit_log_enabled() {
             let word = unsafe { (stub_addr as *const u32).read() };
             eprintln!(
                 "[patch-verify] stub_addr={:#x} first_word={:#010x} target={:#x}",
@@ -4689,11 +4913,15 @@ impl<'a> Assembler386<'a> {
             dynasm!(self.mc ; .arch x64 ; jmp =>label);
         } else if let Some(target) = jump_descr.map(|descr| descr.ll_loop_code()) {
             // assembler.py closing_jump parity: bridge jumps back to
-            // the original loop's LABEL via absolute address.
+            // the original loop's LABEL via absolute address. PyPy
+            // stages the 64-bit target through `X86_64_SCRATCH_REG`
+            // (r11), never RAX — using RAX here would clobber the
+            // loop-carried Ref the regalloc bound to it.
             let addr = target as i64;
+            let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
             dynasm!(self.mc ; .arch x64
-                ; mov rax, QWORD addr
-                ; jmp rax
+                ; mov Rq(scratch), QWORD addr
+                ; jmp Rq(scratch)
             );
         }
     }
