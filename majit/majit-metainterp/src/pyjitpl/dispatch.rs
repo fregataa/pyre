@@ -500,12 +500,12 @@ pub struct JitCodeMachine<'mi, S, R> {
     /// `record_state_guard`'s temporary `frame.pc = resume_pc` swap.
     /// State-field-JIT's `record_state_guard` snapshots reference this
     /// stable copy as the `SnapshotFrame.jitcode_index`, which the
-    /// resume-side `register_jitcode_factory` callback consumes to
-    /// rebuild the per-opcode JitCode.  RPython carries the equivalent
-    /// value as `MIFrame.jitcode.index` (its portal jitcode is monolithic,
-    /// so the index alone identifies the body); per-opcode majit needs
-    /// the program pc instead because the factory builds the body
-    /// on-demand.
+    /// resume-side `resolve_jitcode` closure consumes to rebuild the
+    /// per-opcode JitCode.  RPython carries the equivalent value as
+    /// `MIFrame.jitcode.index` (its portal jitcode is monolithic, so
+    /// the index alone identifies the body); per-loop-body majit
+    /// threads the program pc through the dispatch JitCode singleton
+    /// resolved from the driver.
     portal_pc: usize,
     /// Outer interpreter pc captured BEFORE the
     /// `MIFrame::setup_call` reset (frame.rs:946 sets `frame.pc = 0`),
@@ -728,13 +728,13 @@ where
                     None
                 };
             sym.populate_frame_int_regs(&mut self.frames.frames[0]);
-            // `self.portal_pc` is the trace_jitcode-entry program pc (set
-            // by `run_to_end` at portal entry). We pack `portal_pc + 1`
-            // into the snapshot's root `jitcode_index` so the resume-side
-            // factory rebuilds the *next* per-opcode JitCode on bridge
-            // exit; passing raw `portal_pc` would cause the factory to
-            // derive `pc - 1` for the trace's *current* op, which the
-            // bridge has already executed.
+            // `program_pc` is retained as a positional argument for
+            // diagnostic/debug surfaces only.  The resume-side closure
+            // resolves the root frame through `JitDriver::dispatch_jitcode`
+            // (RPython `metainterp_sd.jitcodes[portal_jd.index]`,
+            // `resume.py:1338-1340`), so this value is not consulted
+            // during blackhole reconstruction.  `self.portal_pc + 1`
+            // mirrors the historic "post-opcode-fetch" trace-entry pc.
             let program_pc = self.portal_pc + 1;
             let op_live = ctx.metainterp_sd().op_live as u8;
             let all_liveness = ctx.metainterp_sd().liveness_info.clone();
@@ -5383,12 +5383,19 @@ pub(crate) fn call_void_function(func_ptr: *const (), args: &[i64]) {
 /// emit a `SnapshotFrame` per `MIFrame` from outermost (root) to
 /// innermost (top). Parent snapshots pass `in_a_call = true`, matching
 /// `opencoder.py:769 _ensure_parent_resumedata`, so the in-flight inline
-/// call result register is cleared before liveness is read. The root frame
-/// packs `program_pc` into `jitcode_index`; non-root frames pack
-/// `MIFrame.parent_descr_idx` (set by `BC_INLINE_CALL` at sub-frame setup),
-/// so the resume-side `resolve_jitcode` callback can walk
-/// `parent.descrs[idx].as_jitcode()` rather than re-invoking the factory
-/// for sub-jitcodes that have no program-pc meaning.
+/// call result register is cleared before liveness is read.
+///
+/// `jitcode_index` mirrors RPython `resume.py:1338-1340`'s `jitcode_pos`
+/// (an index into `metainterp_sd.jitcodes`).  Per-driver pyre layout:
+/// - root frame → `0` sentinel; resume resolves through
+///   `JitDriver::dispatch_jitcode` (the singleton equivalent of
+///   `metainterp_sd.jitcodes[portal_jd.index]`).
+/// - non-root frames → `MIFrame.parent_descr_idx` (set by
+///   `BC_INLINE_CALL` at sub-frame setup); resume walks
+///   `parent.descrs[idx].as_jitcode()`.
+///
+/// `program_pc` is retained for diagnostic surfaces only; the resume
+/// closures ignore the root jitcode_index value.
 ///
 pub fn build_state_field_snapshot(
     frames: &mut MIFrameStack,
@@ -5398,6 +5405,7 @@ pub fn build_state_field_snapshot(
     pool: &mut crate::constant_pool::ConstantPool,
     after_residual_call: bool,
 ) -> crate::recorder::Snapshot {
+    let _ = program_pc;
     let frame_count = frames.frames.len();
     let mut snapshot_frames = Vec::with_capacity(frame_count);
     // Walk outer → inner (RPython _ensure_parent_resumedata convention).
@@ -5419,7 +5427,11 @@ pub fn build_state_field_snapshot(
             if is_top { after_residual_call } else { false },
         );
         let jitcode_index = if i == 0 {
-            program_pc
+            // resume.py:1338-1340 — root frame resolves to
+            // `metainterp_sd.jitcodes[portal_jd.index]` (pyre's
+            // `JitDriver::dispatch_jitcode` singleton); the snapshot
+            // value is ignored by the resolve closure.
+            0
         } else {
             frame.parent_descr_idx
         };
@@ -6407,7 +6419,10 @@ mod tests {
         assert!(snapshot.vable_boxes.is_empty());
         assert!(snapshot.vref_boxes.is_empty());
         let f = &snapshot.frames[0];
-        assert_eq!(f.jitcode_index, 42);
+        // Root frame jitcode_index is a sentinel `0`; resume resolves
+        // through `JitDriver::dispatch_jitcode` rather than reading this
+        // value (resume.py:1338-1340).
+        assert_eq!(f.jitcode_index, 0);
         assert_eq!(f.pc, pc as u32);
         assert_eq!(
             f.boxes,
@@ -6518,7 +6533,9 @@ mod tests {
         );
         assert_eq!(snapshot.frames.len(), 2);
         let root_frame = &snapshot.frames[0];
-        assert_eq!(root_frame.jitcode_index, 7);
+        // Root frame jitcode_index is a sentinel `0`; resume resolves
+        // through `JitDriver::dispatch_jitcode` (resume.py:1338-1340).
+        assert_eq!(root_frame.jitcode_index, 0);
         assert_eq!(
             root_frame.boxes,
             vec![crate::recorder::SnapshotTagged::Const(

@@ -700,27 +700,6 @@ pub struct JitDriver<S: JitState> {
     epoch_qmut: std::sync::Arc<std::sync::Mutex<crate::quasiimmut::QuasiImmut>>,
     /// Handle for the background invalidation thread.
     _invalidation_thread: Option<std::thread::JoinHandle<()>>,
-    /// RPython metainterp_sd.jitcodes parity: factory callback that
-    /// produces JitCode for a given (program, pc, op) triple.
-    /// Used by BlackholeInterpreter to resume from guard failure points.
-    /// Registered by #[jit_interp] macro at startup.
-    ///
-    /// Phase 4 Epic B.3-B.4: the factory accepts `&mut Assembler` so each
-    /// per-pc body can call `JitCodeBuilder::finalize_liveness(asm)` to
-    /// register its per-marker liveness triples and patch the BC_LIVE
-    /// 2-byte slots, mirroring `assembler.py:146-158`'s per-marker
-    /// `_encode_liveness → encode_offset` shape.
-    jitcode_factory: Option<
-        Box<
-            dyn Fn(
-                    &mut majit_translate::jit_codewriter::assembler::Assembler,
-                    &S::Env,
-                    usize,
-                    u8,
-                ) -> Option<crate::jitcode::JitCode>
-                + Send,
-        >,
-    >,
     /// Phase 4 Epic B.3-B.4 driver-shared `Assembler`: holds the
     /// `all_liveness` payload (`assembler.py:30`) populated incrementally
     /// by `__JitMeta::install_canonical_liveness` (canonical entry) and
@@ -754,14 +733,14 @@ pub struct JitDriver<S: JitState> {
                 + Send,
         >,
     >,
-    /// Slice 2.1: dispatch JitCode singleton, registered at install time
-    /// by `__JitMeta::install_canonical_liveness` (Slice 3 wires this).
-    /// `__trace_<fn>` invokes this singleton instead of the per-(pc, op)
-    /// factory; the legacy factory stays available during the transition
-    /// (Slice 5 deletes it).
+    /// Dispatch JitCode singleton, registered at install time by
+    /// `__JitMeta::install_canonical_liveness`.  `__trace_<fn>` invokes
+    /// this singleton; the resume-side `resolve_jitcode` closures
+    /// (`back_edge_internal`, `back_edge_or_run_compiled_internal`)
+    /// also clone it for the root frame of the multi-frame chain.
     ///
-    /// RPython parity: metainterp_sd.jitcodes[driver_idx] global registry
-    /// slot, scoped to the per-#[jit_interp] driver.
+    /// RPython parity: `metainterp_sd.jitcodes[portal_jd.index]` global
+    /// registry slot, scoped to the per-`#[jit_interp]` driver.
     dispatch_jitcode: Option<std::sync::Arc<crate::jitcode::JitCode>>,
 }
 
@@ -805,7 +784,6 @@ impl<S: JitState> JitDriver<S> {
             _invalidation_thread: Some(invalidation_thread),
             #[cfg(target_arch = "wasm32")]
             _invalidation_thread: None,
-            jitcode_factory: None,
             blackhole_allocator: None,
             portal_runner: None,
             dispatch_jitcode: None,
@@ -878,42 +856,6 @@ impl<S: JitState> JitDriver<S> {
         + 'static,
     ) {
         self.portal_runner = Some(Box::new(runner));
-    }
-
-    /// Register a JitCode factory callback for blackhole resume.
-    ///
-    /// RPython: `metainterp_sd.jitcodes` stores pre-compiled JitCodes.
-    /// In majit, the `#[jit_interp]` macro generates JitCode on-demand
-    /// from the interpreter bytecode. This callback provides that.
-    ///
-    /// Phase 4 Epic B.3-B.4 lifecycle invariant: each factory invocation
-    /// internally calls `JitCodeBuilder::finalize_liveness(asm)` to
-    /// register its per-marker liveness triples into the driver-shared
-    /// `Assembler` (cf. `JitDriver::shared_asm`).  RPython
-    /// `pyjitpl.py:2255` builds every JitCode before `finish_setup`
-    /// snapshots `metainterp_sd.liveness_info`; thereafter the table
-    /// must not grow.  Pyre's lazy factory means the **caller** is
-    /// responsible for pre-building every (pc, op) reachable from
-    /// blackhole resume *before* tracing starts (e.g.
-    /// `aheui-jit/src/lib.rs::mainloop` walks `pc=1..=program.size`,
-    /// then calls `JitDriver::sync_liveness_info_from_shared_asm`).
-    /// Subsequent runtime invocations rebuild identical JitCodes whose
-    /// per-marker triples dedup against the registered offsets, so
-    /// `shared_asm.all_liveness()` does not grow past the snapshot.
-    /// The blackhole-resume / multi-frame factory invocation sites in
-    /// this file assert that invariant fail-loud.
-    pub fn register_jitcode_factory(
-        &mut self,
-        factory: impl Fn(
-            &mut majit_translate::jit_codewriter::assembler::Assembler,
-            &S::Env,
-            usize,
-            u8,
-        ) -> Option<crate::jitcode::JitCode>
-        + Send
-        + 'static,
-    ) {
-        self.jitcode_factory = Some(Box::new(factory));
     }
 
     /// Register the dispatch JitCode singleton. Called once at install time
@@ -1133,80 +1075,6 @@ impl<S: JitState> JitDriver<S> {
             exception,
             call_assembler_fn,
         )
-    }
-
-    /// RPython resume_in_blackhole parity: resume from guard failure using
-    /// the jitcode-based BlackholeInterpreter.
-    ///
-    /// Uses the registered jitcode_factory to produce a JitCode for the
-    /// guard failure's resume_pc, then runs the BlackholeInterpreter from
-    /// that point to complete the iteration.
-    pub fn blackhole_resume_jitcode(
-        &self,
-        env: &S::Env,
-        resume_pc: usize,
-        resume_op: u8,
-        fail_values: &[i64],
-        inputarg_count: usize,
-    ) -> Option<crate::blackhole::BlackholeInterpreter> {
-        let factory = self.jitcode_factory.as_ref()?;
-        let jitcode = {
-            let mut asm = self.shared_asm.lock().expect("shared_asm poisoned");
-            // Phase 4 Epic B.3-B.4 lifecycle invariant: by the time
-            // blackhole resume calls the factory, the install-time
-            // pre-build (cf. `aheui-jit/src/lib.rs::mainloop`) must have
-            // registered every per-marker liveness triple this factory
-            // can produce, so `factory(...)`'s internal
-            // `JitCodeBuilder::finalize_liveness(asm)` only dedups —
-            // `all_liveness` does not grow.  Mirrors RPython
-            // `pyjitpl.py:2255`'s "all assemble done by finish_setup;
-            // metainterp_sd.liveness_info immutable thereafter" shape.
-            // Fail-loud if a consumer skipped pre-build and lets resume
-            // grow `all_liveness` past the snapshot in
-            // `staticdata.liveness_info`.
-            let liveness_len_before = asm.all_liveness().len();
-            let jitcode = factory(&mut asm, env, resume_pc, resume_op)?;
-            assert_eq!(
-                asm.all_liveness().len(),
-                liveness_len_before,
-                "blackhole_resume_jitcode factory grew shared_asm.all_liveness past \
-                 staticdata.liveness_info snapshot — caller must pre-build all (pc, op) \
-                 reachable from blackhole resume before tracing starts \
-                 (cf. JitDriver::sync_liveness_info_from_shared_asm)"
-            );
-            jitcode
-        };
-
-        // RPython `resume.py blackhole_from_resumedata` acquires the
-        // interpreter from `metainterp_sd.blackholeinterpbuilder`
-        // (`blackhole.py:287` `self.dispatch_loop = builder.dispatch_loop`).
-        // Use the inline-call-only builder so byte 17 (`BC_INLINE_CALL`)
-        // is wired to `handler_inline_call_pyre_nested` even when a
-        // resume jitcode emits one — Slice 3.3 retired the
-        // `dispatch_one::BC_INLINE_CALL` legacy arm so an empty builder
-        // would now panic on byte 17 instead of falling through.
-        // Mirrors the production `BH_BUILDER3` shape from
-        // `pyre-jit/src/call_jit.rs::resume_in_blackhole`.
-        let mut builder = crate::blackhole::build_inline_call_only_bh_builder();
-        let mut bh = builder.acquire_interp();
-        bh.setposition(std::sync::Arc::new(jitcode), 0);
-
-        // Set inputarg register values from fail_values
-        for (i, &val) in fail_values.iter().take(inputarg_count).enumerate() {
-            bh.setarg_i(i, val);
-        }
-
-        if crate::majit_log_enabled() {
-            eprintln!(
-                "[bh-jitcode] resume at pc={} op={} inputargs={}",
-                resume_pc, resume_op, inputarg_count
-            );
-        }
-
-        // Run the blackhole interpreter
-        bh.run();
-
-        Some(bh)
     }
 
     /// resume.py:1312 blackhole_from_resumedata parity: get the
@@ -2221,50 +2089,32 @@ impl<S: JitState> JitDriver<S> {
                 };
                 let rd_virtuals_slice = rd_virtuals_converted.as_deref();
 
-                // resume.py:1339: resolve jitcode from (jitcode_pos, pc).
+                // resume.py:1338-1340: `jitcode = jitcodes[jitcode_pos];
+                // curbh.setposition(jitcode, pc)`.  Per-driver
+                // pyre layout: root frame resolves to the dispatch
+                // JitCode singleton (RPython's `metainterp_sd.jitcodes`
+                // for the portal jitdriver slot); sub-frames index into
+                // the parent's `descrs` array per `BC_INLINE_CALL`'s
+                // `j` argcode (`blackhole.py:150-157`).
                 //
-                // Only state-field-JIT users (e.g., aheui via
-                // `register_jitcode_factory`) reach this path; pyre does not
-                // register a factory so `as_ref()?` short-circuits to None.
-                //
-                // Multi-frame state-field-JIT chain reconstruction
-                // (RPython `resume.py:1334-1340` parity): the root frame's
-                // `jitcode_index` holds the outer program pc (from
-                // `build_state_field_snapshot`'s `program_pc` argument);
-                // subsequent frames' `jitcode_index` holds
-                // `parent_descr_idx` (set by `BC_INLINE_CALL` at the
-                // sub-frame setup).  We thread the most-recently-resolved
-                // jitcode through `last_resolved` so
-                // `resolve_jitcode(parent_descr_idx, pc)` can walk
-                // `parent.descrs[idx].as_jitcode()` without re-invoking
-                // the factory.
+                // The snapshot's root `jitcode_index` is unused once
+                // the dispatch singleton is registered — the closure
+                // ignores it and clones `self.dispatch_jitcode`.
+                let _ = env;
+                let dispatch_jitcode = self.dispatch_jitcode.clone();
                 let last_resolved: std::cell::RefCell<
                     Option<std::sync::Arc<majit_metainterp::JitCode>>,
                 > = std::cell::RefCell::new(None);
                 let resolve_jitcode =
                     |jitcode_index: i32, pc: i32| -> Option<crate::resume::ResolvedJitCode> {
                         let resolved_jitcode = if last_resolved.borrow().is_none() {
-                            // Root frame: build via factory(program_pc).
-                            let factory = self.jitcode_factory.as_ref()?;
-                            let jitcode = {
-                                let mut asm = self.shared_asm.lock().expect("shared_asm poisoned");
-                                // Phase 4 Epic B.3-B.4 lifecycle invariant
-                                // (cf. `blackhole_resume_jitcode` site):
-                                // factory rebuild dedups against
-                                // pre-built triples — assert no growth.
-                                let liveness_len_before = asm.all_liveness().len();
-                                let jc = factory(&mut asm, env, jitcode_index as usize, 0)?;
-                                assert_eq!(
-                                    asm.all_liveness().len(),
-                                    liveness_len_before,
-                                    "multi-frame resolve_jitcode factory grew \
-                                     shared_asm.all_liveness past staticdata.liveness_info \
-                                     snapshot — caller must pre-build all (pc, op) reachable \
-                                     from blackhole resume before tracing starts"
-                                );
-                                jc
-                            };
-                            std::sync::Arc::new(jitcode)
+                            // Root frame: clone the dispatch JitCode
+                            // singleton registered at install time
+                            // (`register_dispatch_jitcode`).  Returns
+                            // None only when the proc-macro lowerer
+                            // rejected the dispatch body shape and
+                            // install skipped registration.
+                            dispatch_jitcode.as_ref()?.clone()
                         } else {
                             // Sub-frame: index into the parent's
                             // `descrs` array.  Mirrors RPython
@@ -4055,36 +3905,20 @@ impl<S: JitState> JitDriver<S> {
                 };
                 let rd_virtuals_slice = rd_virtuals_converted.as_deref();
 
-                // resume.py:1339 multi-frame state-field-JIT chain
-                // reconstruction (mirrors the loop_jit guard-fail path).
-                let jitcode_factory_ref = self.jitcode_factory.as_ref();
-                let shared_asm_ref = self.shared_asm.clone();
+                // resume.py:1338-1340 multi-frame state-field-JIT chain
+                // reconstruction (mirrors the loop_jit guard-fail path):
+                // root frame clones the dispatch JitCode singleton,
+                // sub-frames walk `parent.descrs[idx]` per
+                // `BC_INLINE_CALL`'s `j` argcode (`blackhole.py:150-157`).
+                let _ = env;
+                let dispatch_jitcode = self.dispatch_jitcode.clone();
                 let last_resolved: std::cell::RefCell<
                     Option<std::sync::Arc<majit_metainterp::JitCode>>,
                 > = std::cell::RefCell::new(None);
                 let resolve_jitcode =
                     |jitcode_index: i32, pc: i32| -> Option<crate::resume::ResolvedJitCode> {
                         let resolved_jitcode = if last_resolved.borrow().is_none() {
-                            let factory = jitcode_factory_ref?;
-                            let jitcode = {
-                                let mut asm = shared_asm_ref.lock().expect("shared_asm poisoned");
-                                // Phase 4 Epic B.3-B.4 lifecycle invariant
-                                // (cf. `blackhole_resume_jitcode` site):
-                                // factory rebuild dedups against
-                                // pre-built triples — assert no growth.
-                                let liveness_len_before = asm.all_liveness().len();
-                                let jc = factory(&mut asm, env, jitcode_index as usize, 0)?;
-                                assert_eq!(
-                                    asm.all_liveness().len(),
-                                    liveness_len_before,
-                                    "multi-frame resolve_jitcode factory grew \
-                                     shared_asm.all_liveness past staticdata.liveness_info \
-                                     snapshot — caller must pre-build all (pc, op) reachable \
-                                     from blackhole resume before tracing starts"
-                                );
-                                jc
-                            };
-                            std::sync::Arc::new(jitcode)
+                            dispatch_jitcode.as_ref()?.clone()
                         } else {
                             let parent = last_resolved
                                 .borrow()

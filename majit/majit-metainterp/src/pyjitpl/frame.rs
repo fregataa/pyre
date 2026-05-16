@@ -123,9 +123,8 @@ pub struct MIFrame {
     /// frames (`trace_jitcode` portal entry) carry `u32::MAX`. The
     /// snapshot-side `build_state_field_snapshot` packs this into
     /// `SnapshotFrame.jitcode_index` for non-root frames, and the
-    /// resume-side `register_jitcode_factory` callback uses it to walk
-    /// `parent.descrs[idx].as_jitcode()` instead of re-invoking the
-    /// factory.  RPython's equivalent is `frame.jitcode.index` —
+    /// resume-side `resolve_jitcode` closure uses it to walk
+    /// `parent.descrs[idx].as_jitcode()`.  RPython's equivalent is `frame.jitcode.index` —
     /// resolvable through `metainterp_sd.jitcodes[idx]` because RPython
     /// pre-registers every jitcode globally; per-opcode majit has no
     /// such global registry, so the parent-relative index threads the

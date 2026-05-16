@@ -400,13 +400,13 @@ pub(super) fn remove_repeated_live(
 /// walker matches the number of statements that actually survive into
 /// the lowered output.
 ///
-/// The runtime effect is no-op until the factory closure calls
-/// `JitCodeBuilder::finalize_liveness(&mut asm)` — until then,
+/// The runtime effect is no-op until the dispatch JitCode builder
+/// calls `JitCodeBuilder::finalize_liveness(&mut asm)` — until then,
 /// `pending_live_triples` accumulates per-builder records but the
 /// emitted `live/<00 00>` slot stays at offset 0, identical to the
-/// `live_placeholder()` shape it replaces.  `finalize_liveness` is wired
-/// in a follow-on slice (driver-shared `Arc<Mutex<Assembler>>` plumbing
-/// through `register_jitcode_factory`).
+/// `live_placeholder()` shape it replaces.  `finalize_liveness` runs
+/// against the driver-shared `Arc<Mutex<Assembler>>` snapshotted by
+/// `install_canonical_liveness` at install time.
 ///
 /// Each register index must fit in `u8` per RPython
 /// `rpython/jit/codewriter/assembler.py:225` — the bitset encoder

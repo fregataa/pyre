@@ -26,26 +26,12 @@ pub fn try_generate_jitcode_body(body: &Expr) -> Option<TokenStream> {
     try_generate_jitcode_body_inner(body, None).map(|p| p.body)
 }
 
-pub fn try_generate_jitcode_body_parts(
-    body: &Expr,
-    _config: Option<&LowererConfig>,
-) -> Option<GeneratedJitCodeBody> {
-    try_generate_jitcode_body_inner(body, _config)
-}
-
 #[allow(dead_code)]
 pub fn try_generate_jitcode_body_with_config(
     config: &LowererConfig,
     body: &Expr,
 ) -> Option<TokenStream> {
     try_generate_jitcode_body_inner(body, Some(config)).map(|p| p.body)
-}
-
-pub fn try_generate_jitcode_body_with_config_parts(
-    config: &LowererConfig,
-    body: &Expr,
-) -> Option<GeneratedJitCodeBody> {
-    try_generate_jitcode_body_inner(body, Some(config))
 }
 
 /// Per-caller-local layout descriptor produced by

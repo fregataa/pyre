@@ -17,10 +17,7 @@ pub(crate) use api::{
     try_generate_jitcode_body_parts_with_caller_bindings,
 };
 #[allow(unused_imports)]
-pub use api::{
-    try_generate_jitcode_body, try_generate_jitcode_body_parts,
-    try_generate_jitcode_body_with_config, try_generate_jitcode_body_with_config_parts,
-};
+pub use api::{try_generate_jitcode_body, try_generate_jitcode_body_with_config};
 pub(crate) use dispatch::lower_dispatch_body;
 pub(crate) use helpers::classify_param_type;
 pub(super) use helpers::helper_policy_path;

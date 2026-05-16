@@ -233,76 +233,61 @@ fn factory_does_not_grow_asm_after_prebuild() {
 
 #[test]
 fn distinct_arms_emit_distinct_bc_live_offsets() {
-    // The polymorphism core: at least two of the four arms must emit a
-    // BC_LIVE marker whose patched offset differs from the others.  If the
-    // macro pipeline regressed to "every arm uses canonical offset 0", all
-    // collected offsets would collapse to {0} and this assertion would
-    // fire.
+    // The polymorphism core: at least two of the per-arm sub-JitCodes
+    // embedded under the dispatch JitCode (`BC_INLINE_CALL` targets,
+    // jitcode_lower/dispatch.rs:1860-1872) must emit a BC_LIVE marker
+    // whose patched offset differs from the others.  If
+    // `compute_per_marker_liveness` regressed to "every arm uses
+    // canonical offset 0", the union of all per-arm offsets would
+    // collapse to {0} and this assertion would fire.
     //
-    // Note: this test still drives the per-arm factory
-    // (`__jitcode_polymorphic_mainloop`) rather than walking
-    // `dispatch.exec.descrs`.  The dispatch JitCode embeds each arm via
-    // `BC_INLINE_CALL` + `add_sub_jitcode`, but per the documented dispatch
-    // lowering path (`jitcode_lower.rs:5180-5202`), arms whose bodies
-    // reference outer-scope locals (`state.a`, `state.b`, ...) fall back to
-    // `__sub_builder.abort()` — those embedded arm jitcodes carry a single
-    // abort byte and zero BC_LIVE markers.  The per-arm prebuild emitted
-    // alongside `generate_jitcode_arm` (codegen_trace.rs) registers the
-    // distinct triples that the legacy per-arm factory's `finalize_liveness`
-    // patches into per-arm BC_LIVE slots, so this is where the polymorphism
-    // signal is observable.  Slice 5 deletes the legacy factory; at that
-    // point this test will need to switch to a per-arm prebuild walker that
-    // doesn't go through the embed/abort dispatch path.
+    // The dispatch JitCode body itself emits only the canonical
+    // `live_placeholder()` markers (jit_merge_point pre/post + the
+    // trailing -live- after each inline_call_*), so the per-pc
+    // distinctness signal lives in the embedded sub-JitCodes — one
+    // per arm — rather than the parent dispatch body.  Walk the
+    // descrs array and collect BC_LIVE offsets from each sub-JitCode.
     let mut asm = Assembler::new();
     let canonical: Vec<u8> = (0..4u8).collect();
     install_canonical_for_test(&mut asm, &canonical);
 
-    let program = [OP_GUARD_A, OP_SUM_AB, OP_SUM_ABC, OP_SUM_ABCD, OP_END];
+    let dispatch = __dispatch_jitcode_polymorphic_mainloop(&mut asm, 0i64)
+        .expect("dispatch lower must succeed for fixture");
 
-    // Collect the per-arm BC_LIVE offset sets.  Skip the leading canonical
-    // marker emitted by every arm at body offset 0 (codegen_trace.rs:175
-    // `live_placeholder()` without per-pc triple → always patches to the
-    // canonical entry at offset 0); the polymorphism signal lives in the
-    // remaining markers.
+    // Collect per-arm BC_LIVE offset sets from each sub-JitCode embedded
+    // in `dispatch.exec.descrs`.  Skip the leading canonical marker
+    // emitted by every sub-JitCode at body offset 0
+    // (jitcode_lower/dispatch.rs:1863 `__sub_builder.live_placeholder()`
+    // without per-pc triple → always patches to the canonical entry).
     let mut per_arm_offsets: Vec<Vec<u16>> = Vec::new();
-    for &op in &[OP_GUARD_A, OP_SUM_AB, OP_SUM_ABC, OP_SUM_ABCD] {
-        let jitcode = __jitcode_polymorphic_mainloop(&mut asm, &program, 1, op)
-            .unwrap_or_else(|| panic!("factory returned None for op={op}"));
-        let mut offs = collect_bc_live_offsets(&jitcode);
-        // drop the leading canonical marker (body offset 0)
-        if !offs.is_empty() {
-            offs.remove(0);
+    for d in dispatch.exec.descrs.iter() {
+        if let majit_metainterp::jitcode::RuntimeBhDescr::JitCode(jc) = d {
+            let mut offs = collect_bc_live_offsets(jc);
+            if !offs.is_empty() {
+                offs.remove(0);
+            }
+            per_arm_offsets.push(offs);
         }
-        per_arm_offsets.push(offs);
     }
 
-    // Sanity: each arm must emit at least one per-pc BC_LIVE marker
-    // (the lowerer always emits a `live_placeholder_with_triple` ahead of
-    // every conditional guard — the `if` condition in each arm).
-    for (op, offs) in [OP_GUARD_A, OP_SUM_AB, OP_SUM_ABC, OP_SUM_ABCD]
+    assert!(
+        !per_arm_offsets.is_empty(),
+        "dispatch JitCode must embed at least one sub-JitCode descr"
+    );
+
+    // Polymorphism: the union of *all* per-arm marker offsets must
+    // contain at least two distinct values.  A regression to "every arm
+    // uses the same triple" would collapse this set to size 1.
+    let all_offsets: std::collections::BTreeSet<u16> = per_arm_offsets
         .iter()
-        .zip(per_arm_offsets.iter())
-    {
-        assert!(
-            !offs.is_empty(),
-            "arm op={op} must emit at least one per-pc BC_LIVE marker; got none"
-        );
-    }
-
-    // Polymorphism: the union of *all* per-arm marker offsets must contain
-    // at least two distinct values.  A regression to "every arm uses the
-    // same triple" would collapse this set to size 1.
-    let mut all_offsets: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
-    for offs in &per_arm_offsets {
-        for &off in offs {
-            all_offsets.insert(off);
-        }
-    }
+        .flat_map(|offs| offs.iter().copied())
+        .collect();
     assert!(
         all_offsets.len() >= 2,
         "polymorphic per-pc liveness regressed: every per-pc BC_LIVE marker \
-         points at the same offset — saw {all_offsets:?} across arms \
-         OP_GUARD_A/OP_SUM_AB/OP_SUM_ABC/OP_SUM_ABCD"
+         across embedded sub-JitCodes points at the same offset — saw \
+         {all_offsets:?} across {} arms",
+        per_arm_offsets.len()
     );
 }
 

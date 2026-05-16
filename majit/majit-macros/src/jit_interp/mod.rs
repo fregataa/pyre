@@ -804,18 +804,7 @@ fn generate_merge_wrapper(config: &JitInterpConfig, func: &ItemFn) -> TokenStrea
             __env: &#env_type,
             __pc: usize,
         ) {
-            // Phase 4 Epic B.3-B.4: clone the driver-shared `Assembler`
-            // Arc before the `merge_point` mutable borrow so the trace
-            // closure can forward it into `#trace_fn_name`.  The lock is
-            // acquired *inside* `#trace_fn_name`, scoped tightly around
-            // the `JitCode` build only — `trace_jitcode_observer` runs
-            // outside the lock to mirror RPython's `pyjitpl.py:2255
-            // finish_setup` ordering (assembler is frozen before any
-            // tracing observation runs) and to avoid a deadlock if a
-            // recursive portal/residual callback re-enters this trace
-            // path on the same driver thread.
-            let __shared_asm = __driver.shared_asm();
-            // Slice 2.2: clone the dispatch JitCode Arc before the mutable
+            // Clone the dispatch JitCode Arc before the mutable
             // `merge_point` borrow so the closure can forward it to
             // `#trace_fn_name` without holding a `JitDriver` reference.
             let __dispatch_jitcode: Option<::std::sync::Arc<majit_metainterp::JitCode>> =
@@ -829,7 +818,6 @@ fn generate_merge_wrapper(config: &JitInterpConfig, func: &ItemFn) -> TokenStrea
                     return majit_metainterp::TraceAction::CloseLoop;
                 }
                 let __result = #trace_fn_name(
-                    &__shared_asm,
                     __ctx,
                     __sym,
                     __env,
