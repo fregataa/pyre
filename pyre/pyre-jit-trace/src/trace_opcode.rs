@@ -18,6 +18,18 @@ extern "C" fn trace_function_get_defaults(func: i64) -> i64 {
     unsafe { function_get_defaults(func as PyObjectRef) as i64 }
 }
 
+extern "C" fn trace_function_get_kwdefaults(func: i64) -> i64 {
+    let kwdefaults = unsafe { pyre_interpreter::function_get_kwdefaults(func as PyObjectRef) };
+    pyre_interpreter::baseobjspace::unwrap_cell(kwdefaults) as i64
+}
+
+extern "C" fn trace_dict_lookup_jit(dict: i64, key: i64) -> i64 {
+    unsafe {
+        pyre_object::w_dict_lookup(dict as PyObjectRef, key as PyObjectRef).unwrap_or(PY_NULL)
+            as i64
+    }
+}
+
 /// floatobject.py:561 `descr_pow` → `_pow(space, x, y)` parity.
 ///
 /// `_pow` in floatobject.py:799-881 takes two raw floats and returns a
@@ -7484,6 +7496,260 @@ impl OpcodeStepExecutor for MIFrame {
             full_args.extend_from_slice(&args);
             <Self as SharedOpcodeHandler>::call_callable(self, callable, &full_args)?
         };
+        <Self as SharedOpcodeHandler>::push_value(self, result)
+    }
+
+    fn call_kw(&mut self, nargs: usize) -> Result<(), Self::Error> {
+        use pyre_interpreter::bytecode::CodeFlags;
+
+        let kwarg_names_val = <Self as SharedOpcodeHandler>::pop_value(self)?;
+        let mut args = Vec::with_capacity(nargs);
+        for _ in 0..nargs {
+            args.push(<Self as SharedOpcodeHandler>::pop_value(self)?);
+        }
+        args.reverse();
+        let null_or_self = <Self as SharedOpcodeHandler>::pop_value(self)?;
+        let callable = <Self as SharedOpcodeHandler>::pop_value(self)?;
+
+        let concrete_kwnames = kwarg_names_val.concrete.to_pyobj();
+        let concrete_callable = callable.concrete.to_pyobj();
+
+        if null_or_self.concrete.to_pyobj() != PY_NULL {
+            args.insert(0, null_or_self);
+        }
+
+        // Determine nkw from the concrete kwarg_names tuple. PyPy's
+        // `CALL_FUNCTION_KW` immediately `interp_w`s the stack value as a
+        // tuple (pyopcode.py:1391), so treating an unavailable/non-tuple
+        // concrete value as "no kwargs" would record a plain positional call
+        // that PyPy would never execute.
+        if concrete_kwnames.is_null() || unsafe { !pyre_object::is_tuple(concrete_kwnames) } {
+            return Err(trace_abort_error(
+                "abort tracing CALL_KW without concrete keyword tuple",
+            ));
+        }
+        self.with_ctx(|this, ctx| {
+            this.implement_guard_value(ctx, kwarg_names_val.opref, concrete_kwnames as i64);
+        });
+        let nkw = unsafe { w_tuple_len(concrete_kwnames) };
+        if nkw > args.len() {
+            return Err(trace_abort_error(
+                "abort tracing CALL_KW with malformed keyword tuple",
+            ));
+        }
+
+        // Only trace the direct user-function keyword path here.  PyPy's
+        // `CALL_FUNCTION_KW` builds `Arguments(keyword_names_w, keywords_w)`
+        // and dispatches the same object through `space.call_args`
+        // (pyopcode.py:1386-1410), so methods, builtins, type calls, and
+        // arbitrary `__call__` objects all receive structured kwargs.
+        // Pyre's trace-side residual helpers still expose only flat
+        // positional slices for those callable shapes; forcing them through
+        // `call_callable` here would either discard the keyword-name tuple
+        // or re-bind receivers differently from PyPy.  Keep this as a
+        // structural adaptation until the trace ABI can carry `Arguments`.
+        let target_func = if nkw == 0 {
+            concrete_callable
+        } else if !concrete_callable.is_null()
+            && unsafe { is_function(concrete_callable) }
+            && unsafe {
+                !is_builtin_code(
+                    pyre_interpreter::getcode(concrete_callable) as pyre_object::PyObjectRef
+                )
+            }
+        {
+            concrete_callable
+        } else {
+            return Err(trace_abort_error(
+                "abort tracing CALL_KW for non-user-function callable",
+            ));
+        };
+
+        if nkw == 0 {
+            // No kwargs or not a user function — fall through to plain call.
+            let result = <Self as SharedOpcodeHandler>::call_callable(self, callable, &args)?;
+            return <Self as SharedOpcodeHandler>::push_value(self, result);
+        }
+
+        // Resolve kwargs to positional order at trace time.
+        let code_ptr = unsafe { pyre_interpreter::get_pycode(target_func) };
+        let code = unsafe { &*(code_ptr as *const CodeObject) };
+        let total_params = (code.arg_count + code.kwonlyarg_count) as usize;
+        let n_pos_params = code.arg_count as usize;
+        let n_posonly_params = code.posonlyarg_count as usize;
+        let has_varargs = code.flags.contains(CodeFlags::VARARGS);
+        let has_varkw = code.flags.contains(CodeFlags::VARKEYWORDS);
+        let n_pos = args.len() - nkw;
+
+        if has_varargs || has_varkw {
+            // PyPy's `Arguments._match_signature` writes a fully resolved
+            // frame scope for `*args` / `**kwargs` (argument.py:222-242).
+            // The trace-side residual helper below still calls the normal
+            // positional user-function path, whose `call_user_function`
+            // re-packs varargs/kwargs. Passing a pre-packed scope there
+            // double-packs `*args` and drops non-empty `**kwargs`. Until the
+            // JIT grows a resolved-scope helper matching
+            // `call_user_function_resolved`, keep this as a structural
+            // adaptation and let the interpreter handle these calls.
+            return Err(trace_abort_error(
+                "abort tracing CALL_KW for *args/**kwargs user function",
+            ));
+        }
+
+        // PyPy would raise the exact `ArgErr*` TypeError from
+        // `Arguments._match_signature` / `_match_keywords`
+        // (argument.py:259-321, 464-501).  The trace recorder cannot yet
+        // emit those exception paths with the right keyword metadata, and
+        // recording a partially resolved call would be worse than falling
+        // back to the interpreter.  Treat argument-mismatch keyword calls as
+        // structural aborts rather than residual calls.
+        if n_pos > n_pos_params {
+            return Err(trace_abort_error(
+                "abort tracing CALL_KW with too many positional args",
+            ));
+        }
+
+        let mut resolved: Vec<Option<FrontendOp>> = vec![None; total_params];
+
+        // Fill positional args.
+        for i in 0..n_pos.min(n_pos_params) {
+            resolved[i] = Some(args[i].clone());
+        }
+
+        // Match keyword args to parameter positions.
+        for ki in 0..nkw {
+            let kw_name_obj = unsafe { pyre_object::w_tuple_getitem(concrete_kwnames, ki as i64) };
+            let Some(kw_name_obj) = kw_name_obj else {
+                continue;
+            };
+            if !unsafe { pyre_object::is_str(kw_name_obj) } {
+                return Err(trace_abort_error(
+                    "abort tracing CALL_KW with non-string keyword name",
+                ));
+            }
+            let kw_str = unsafe { pyre_object::w_str_get_value(kw_name_obj) };
+            let kw_val = args[n_pos + ki].clone();
+
+            let mut matched = false;
+            for pi in 0..total_params {
+                if &*code.varnames[pi] == kw_str {
+                    if pi < n_posonly_params {
+                        return Err(trace_abort_error(
+                            "abort tracing CALL_KW with positional-only keyword",
+                        ));
+                    }
+                    if pi < n_pos.min(n_pos_params) {
+                        return Err(trace_abort_error(
+                            "abort tracing CALL_KW with duplicate keyword value",
+                        ));
+                    }
+                    // PyPy argument.py:_match_keywords overwrites
+                    // kwds_mapping[j - input_argcount] for duplicate
+                    // keyword names in malformed bytecode; the last value
+                    // then wins when _match_signature fills scope_w. Only
+                    // conflicts with already-filled positional parameters
+                    // raise ArgErrMultipleValues.
+                    resolved[pi] = Some(kw_val.clone());
+                    matched = true;
+                    break;
+                }
+            }
+            if !matched {
+                return Err(trace_abort_error(
+                    "abort tracing CALL_KW with unknown keyword",
+                ));
+            }
+        }
+
+        // Fill positional defaults.
+        let defaults_obj = unsafe { function_get_defaults(target_func) };
+        if !defaults_obj.is_null() {
+            self.with_ctx(|this, ctx| {
+                let defaults = ctx.call_ref_typed_with_effect(
+                    trace_function_get_defaults as *const (),
+                    &[callable.opref],
+                    &[Type::Ref],
+                    CANNOT_RAISE_NO_HEAP_EFFECT_INFO.clone(),
+                );
+                this.implement_guard_value(ctx, defaults, defaults_obj as i64);
+            });
+            let defaults_obj = pyre_interpreter::baseobjspace::unwrap_cell(defaults_obj);
+            if unsafe { pyre_object::is_tuple(defaults_obj) } {
+                let ndefaults = unsafe { w_tuple_len(defaults_obj) };
+                let first_default = n_pos_params.saturating_sub(ndefaults);
+                for pi in first_default..n_pos_params {
+                    if resolved[pi].is_none() {
+                        if let Some(v) = unsafe {
+                            pyre_object::w_tuple_getitem(defaults_obj, (pi - first_default) as i64)
+                        } {
+                            let opref = self.with_ctx(|_this, ctx| ctx.const_ref(v as i64));
+                            resolved[pi] =
+                                Some(FrontendOp::new(opref, ConcreteValue::from_pyobj(v)));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fill keyword-only defaults.
+        let kwdefaults = pyre_interpreter::baseobjspace::unwrap_cell(unsafe {
+            pyre_interpreter::function_get_kwdefaults(target_func)
+        });
+        if !kwdefaults.is_null() && unsafe { pyre_object::is_dict(kwdefaults) } {
+            let kwdefaults_opref = self.with_ctx(|this, ctx| {
+                let runtime_kwdefaults = ctx.call_ref_typed_with_effect(
+                    trace_function_get_kwdefaults as *const (),
+                    &[callable.opref],
+                    &[Type::Ref],
+                    CANNOT_RAISE_NO_HEAP_EFFECT_INFO.clone(),
+                );
+                this.implement_guard_value(ctx, runtime_kwdefaults, kwdefaults as i64);
+                runtime_kwdefaults
+            });
+            let nkwonly = code.kwonlyarg_count as usize;
+            for ki in 0..nkwonly {
+                let pi = n_pos_params + ki;
+                if resolved[pi].is_none() {
+                    let param_name = &code.varnames[pi];
+                    let key = pyre_object::w_str_new(param_name);
+                    if let Some(val) = unsafe { pyre_object::w_dict_lookup(kwdefaults, key) } {
+                        let opref = self.with_ctx(|this, ctx| {
+                            let key_opref = ctx.const_ref(key as i64);
+                            let val_opref = ctx.call_ref_typed_with_effect(
+                                trace_dict_lookup_jit as *const (),
+                                &[kwdefaults_opref, key_opref],
+                                &[Type::Ref, Type::Ref],
+                                CANNOT_RAISE_NO_HEAP_EFFECT_INFO.clone(),
+                            );
+                            this.implement_guard_value(ctx, val_opref, val as i64);
+                            val_opref
+                        });
+                        resolved[pi] = Some(FrontendOp::new(opref, ConcreteValue::from_pyobj(val)));
+                    }
+                }
+            }
+        }
+
+        if resolved.iter().any(Option::is_none) {
+            return Err(trace_abort_error(
+                "abort tracing CALL_KW with missing required arguments",
+            ));
+        }
+
+        // Build the resolved call scope. Missing required arguments were
+        // rejected above so no PY_NULL placeholder reaches the compiled call.
+        let mut final_args: Vec<FrontendOp> = Vec::with_capacity(total_params + 2);
+        for slot in resolved {
+            match slot {
+                Some(val) => final_args.push(val),
+                None => {
+                    let opref = self.with_ctx(|_this, ctx| ctx.const_ref(PY_NULL as i64));
+                    final_args.push(FrontendOp::new(opref, ConcreteValue::Null));
+                }
+            }
+        }
+
+        let result = <Self as SharedOpcodeHandler>::call_callable(self, callable, &final_args)?;
         <Self as SharedOpcodeHandler>::push_value(self, result)
     }
 
