@@ -204,6 +204,9 @@ class AppTestTypeObject(AppTestCpythonExtensionBase):
         raises(TypeError, descr, None)
         assert descr.__doc__ == "Copy the foo."
         assert descr.__text_signature__ == '($self, /)'
+        import inspect
+        assert not inspect.isbuiltin(descr)
+        assert inspect.ismethoddescriptor(descr)
 
     def test_cython_fake_classmethod(self):
         module = self.import_module(name='foo')

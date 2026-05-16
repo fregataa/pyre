@@ -153,7 +153,7 @@ from keyword import iskeyword
 from operator import attrgetter
 from collections import namedtuple, OrderedDict
 try:
-    from cpyext import is_cpyext_function as _is_cpyext_function
+    from cpyext import is_cpyext_builtin_function as _is_cpyext_function
 except ImportError:
     _is_cpyext_function = lambda obj: False
 
