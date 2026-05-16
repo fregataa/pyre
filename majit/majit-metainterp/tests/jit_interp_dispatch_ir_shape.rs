@@ -392,15 +392,14 @@ mod pre_promote {
     }
 }
 
-/// Slice 2.2: `__trace_dispatch_minimal` now accepts the dispatch JitCode
-/// singleton as an extra parameter forwarded from `__merge_dispatch_minimal`.
-/// When the dispatch JitCode is registered, the trace path uses it directly;
-/// when None (pre-Slice-3), it falls back to the per-(pc, op) legacy factory.
+/// `__trace_dispatch_minimal` accepts the dispatch JitCode singleton as an
+/// extra parameter forwarded from `__merge_dispatch_minimal`.  When the
+/// singleton is absent because dispatch lowering failed, the trace path
+/// aborts permanently instead of falling back to a per-(pc, op) factory.
 ///
 /// This test exercises the full trace path end-to-end: warmup threshold=1
 /// causes one pre-trace iteration, then the trace fires and records ops via
-/// the legacy fallback (Slice 3 not yet run). Correctness is the same
-/// regardless of which JitCode source is used.
+/// the registered dispatch JitCode.
 #[test]
 fn dispatch_minimal_traces_via_dispatch_jitcode_singleton() {
     // OP_INC_A increments state.a; threshold=1 ensures trace fires after 1 iter.

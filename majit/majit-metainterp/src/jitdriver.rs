@@ -794,9 +794,9 @@ impl<S: JitState> JitDriver<S> {
     }
 
     /// Phase 4 Epic B.3-B.4: borrow the driver-shared `Assembler` mutex
-    /// so callers (the macro-emitted `__JitMeta::install_canonical_liveness`
-    /// and the per-pc JitCode factory) can append liveness entries into
-    /// a single `all_liveness` table.
+    /// so macro-emitted install/prebuild paths can append dispatch and
+    /// embedded sub-JitCode liveness entries into a single `all_liveness`
+    /// table before `staticdata.liveness_info` is snapshotted.
     ///
     /// Returned `Arc<Mutex<...>>` is cheap to clone; clones share the
     /// same underlying mutex.
@@ -812,8 +812,8 @@ impl<S: JitState> JitDriver<S> {
     /// `pyjitpl.py:2264 self.liveness_info = "".join(asm.all_liveness)`.
     ///
     /// Must run while `staticdata` Arc is uniquely owned (i.e. before
-    /// the first trace clones it), after any pre-tracing factory builds
-    /// that register additional per-marker liveness entries.
+    /// the first trace clones it), after macro-emitted prebuild has
+    /// registered every per-marker liveness entry.
     pub fn sync_liveness_info_from_shared_asm(&mut self) {
         let asm_guard = self.shared_asm.lock().expect("shared_asm poisoned");
         self.meta.sync_liveness_info(asm_guard.all_liveness());
@@ -859,13 +859,13 @@ impl<S: JitState> JitDriver<S> {
     }
 
     /// Register the dispatch JitCode singleton. Called once at install time
-    /// by the macro-generated `__JitMeta::install_canonical_liveness` (Slice 3
-    /// wires the call site). After registration, `__trace_<fn>` can use this
-    /// singleton instead of the per-(pc, op) factory. The legacy factory
-    /// remains available during the transition; Slice 5 deletes it.
+    /// by the macro-generated `__JitMeta::install_canonical_liveness`.
+    /// `__trace_<fn>` clones this singleton for every trace iteration;
+    /// resume-side `resolve_jitcode` closures clone it for the root frame
+    /// (`resume.py:1338-1340`).
     ///
-    /// RPython parity: metainterp_sd.jitcodes[driver_idx] global registry
-    /// slot assignment, scoped to the per-#[jit_interp] driver.
+    /// RPython parity: `metainterp_sd.jitcodes[portal_jd.index]` global
+    /// registry slot assignment, scoped to the per-`#[jit_interp]` driver.
     pub fn register_dispatch_jitcode(&mut self, jitcode: crate::jitcode::JitCode) {
         // Slice (audit Issue #5) — cross-check the dispatch JitCode
         // body's `BC_JIT_MERGE_POINT` payload partition against the

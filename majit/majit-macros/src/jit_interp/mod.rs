@@ -1404,8 +1404,6 @@ fn rewrite_body(
                     // (avoids the cold `__merge_*` call when not tracing).  It does NOT
                     // add a second merge-point dispatch — `driver.merge_point` guards
                     // again internally, but the closure runs only once.
-                    //
-                    // Slice 5 will simplify further once the legacy factory is deleted.
                     let new_tokens: TokenStream = quote! {
                         if #driver.is_tracing() {
                             #merge_fn(&mut #driver, #env, #pc);

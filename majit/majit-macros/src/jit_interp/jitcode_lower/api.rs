@@ -56,10 +56,10 @@ pub(crate) struct CallerLocalLayout {
 
 /// Slice 1.2 of dispatch arm caller-local plumbing.
 ///
-/// Variant of [`try_generate_jitcode_body_parts`] that pre-binds a
-/// list of caller-locals as portal-input bindings on the sub-Lowerer
-/// before lowering the body.  The caller (slice 1.3 — dispatch arm
-/// emit at `lower_dispatch_chain`) collects them via
+/// Dispatch-arm lowering entry that pre-binds a list of caller-locals as
+/// portal-input bindings on the sub-Lowerer before lowering the body.
+/// The caller (slice 1.3 — dispatch arm emit at `lower_dispatch_chain`)
+/// collects them via
 /// [`collect_arm_caller_locals`] and threads the same list through
 /// `inline_call_<types>_v` as `(parent_reg, callee_reg)` pairs.
 ///
@@ -134,13 +134,11 @@ pub(crate) fn try_generate_jitcode_body_parts_with_caller_bindings(
     // Sole dispatch-arm-body lowerer entry — `lower_stmt`'s `Stmt::Macro`
     // recognition for `can_enter_jit!()` emits
     // `__builder.loop_header(__jdindex);` which references the
-    // `__jdindex: i64` parameter of the enclosing `__dispatch_jitcode_<fn>`
-    // fn (codegen_trace.rs:309-313).  The per-arm trace JitCode lowerer
-    // path (`try_generate_jitcode_body_inner` callers, including
-    // `generate_jitcode_arm` at codegen_trace.rs:367) lives inside
-    // `#jitcode_fn_name(__asm, program, pc, __op)` which has no
-    // `__jdindex` in scope, so this flag stays `false` there and the
-    // recognition gracefully returns `None` (falling back to abort).
+    // `__jdindex: i64` parameter of the enclosing `__dispatch_jitcode_<fn>`.
+    // The remaining public `try_generate_jitcode_body*` helpers are legacy
+    // test/API shims and do not set this flag, so they still reject
+    // `can_enter_jit!()` bodies instead of emitting a loop header without
+    // a driver index.
     lowerer.in_dispatch_arm_body = true;
 
     let (layout, max_pre_bound) = assign_caller_local_layout(caller_locals);

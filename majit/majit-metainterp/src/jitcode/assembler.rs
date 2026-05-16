@@ -149,9 +149,10 @@ pub struct JitCodeBuilder {
     /// offset 0.
     ///
     /// Mirrors the in-line `live` path (`assembler.py:146-158`) for
-    /// callers that cannot supply an `&mut Assembler` at body-emit time —
-    /// e.g. the macro-emitted per-pc JitCode factory which builds bodies
-    /// before the driver-shared `Assembler` is locked.
+    /// callers that cannot supply an `&mut Assembler` at body-emit time.
+    /// The macro-generated dispatch JitCode and embedded sub-JitCodes use
+    /// this deferred path, then finalize against the driver-shared
+    /// `Assembler` during install/prebuild.
     pending_live_triples: Vec<(usize, Vec<u8>, Vec<u8>, Vec<u8>)>,
     /// Phase 4 / Epic B.3-B.4: positions of leading-dummy `BC_LIVE` slots
     /// (`live_placeholder` without an explicit triple) whose 2-byte offset
@@ -1307,9 +1308,10 @@ impl JitCodeBuilder {
     ///
     /// Mirrors `assembler.py:146-158`'s per-marker
     /// `_encode_liveness(live_i, live_r, live_f) → encode_offset(pos)`
-    /// pair, deferred to a single post-emit pass for callers (the
-    /// `#[jit_interp]` per-pc JitCode factory) that can only acquire the
-    /// driver-shared `&mut Assembler` after the body is built.
+    /// pair, deferred to a single post-emit pass for callers that can only
+    /// acquire the driver-shared `&mut Assembler` after a JitCode body is
+    /// built.  The `#[jit_interp]` dispatch singleton and its embedded
+    /// sub-JitCodes use this path during install/prebuild.
     ///
     /// Idempotent: drains `pending_live_triples` and
     /// `pending_canonical_patches` so a second call is a no-op.

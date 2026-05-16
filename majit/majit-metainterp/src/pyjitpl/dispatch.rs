@@ -498,14 +498,13 @@ pub struct JitCodeMachine<'mi, S, R> {
     /// `frame.pc` starts as the program pc but may be overwritten by
     /// `BC_INLINE_CALL` (`frame.pc = frame.code_cursor`) or
     /// `record_state_guard`'s temporary `frame.pc = resume_pc` swap.
-    /// State-field-JIT's `record_state_guard` snapshots reference this
-    /// stable copy as the `SnapshotFrame.jitcode_index`, which the
-    /// resume-side `resolve_jitcode` closure consumes to rebuild the
-    /// per-opcode JitCode.  RPython carries the equivalent value as
-    /// `MIFrame.jitcode.index` (its portal jitcode is monolithic, so
-    /// the index alone identifies the body); per-loop-body majit
-    /// threads the program pc through the dispatch JitCode singleton
-    /// resolved from the driver.
+    /// Retained as a positional argument on the snapshot path for
+    /// diagnostic and debug surfaces only — the resume-side
+    /// `resolve_jitcode` closure clones `JitDriver::dispatch_jitcode`
+    /// for the root frame (RPython `metainterp_sd.jitcodes[portal_jd.index]`,
+    /// `resume.py:1338-1340`) without consulting the recorded value
+    /// (`build_state_field_snapshot` writes `0` into
+    /// `SnapshotFrame.jitcode_index` for the root).
     portal_pc: usize,
     /// Outer interpreter pc captured BEFORE the
     /// `MIFrame::setup_call` reset (frame.rs:946 sets `frame.pc = 0`),
@@ -5368,15 +5367,14 @@ pub(crate) fn call_void_function(func_ptr: *const (), args: &[i64]) {
 /// only used to materialize root state fields into the root frame's
 /// register banks before this PyPy-shaped walk.
 ///
-/// `program_pc` carries the outer interpreter pc (= what the
-/// state-field-JIT factory needs to rebuild the root per-opcode
-/// JitCode on blackhole resume). The top frame's `pc` here holds the
-/// *JitCode-internal* resume position (`record_state_guard` swapped
-/// it to the guard's orgpc just before this call), matching RPython's
-/// `pyjitpl.py:2596 frame.pc = resumepc` swap; intermediate frames
-/// keep their natural `pc` (= return-to byte position in their
-/// jitcode, set by `BC_INLINE_CALL` at `dispatch.rs frame.pc =
-/// frame.code_cursor`).
+/// `program_pc` carries the outer interpreter pc as diagnostic context
+/// only.  The root frame resumes through the registered dispatch JitCode
+/// singleton; the top frame's `pc` here holds the *JitCode-internal*
+/// resume position (`record_state_guard` swapped it to the guard's orgpc
+/// just before this call), matching RPython's `pyjitpl.py:2596
+/// frame.pc = resumepc` swap.  Intermediate frames keep their natural
+/// `pc` (= return-to byte position in their jitcode, set by
+/// `BC_INLINE_CALL` at `dispatch.rs frame.pc = frame.code_cursor`).
 ///
 /// Multi-frame walk parallels RPython
 /// `opencoder.py:819 capture_resumedata` + `_ensure_parent_resumedata`:
