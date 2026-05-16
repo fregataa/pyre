@@ -192,10 +192,7 @@ def _setup_ctypes_cache():
     # for unicode strings, do not use ctypes.c_wchar because ctypes
     # automatically converts arrays into unicode strings.
     # Pick the unsigned int that has the same size.
-    # On windows c_wchar is 16-bit, but in a wide build UniChar is 32 bits
-    if sys.maxunicode > 65535:
-        _ctypes_cache[lltype.UniChar] = ctypes.c_uint32
-    elif ctypes.sizeof(ctypes.c_wchar) == ctypes.sizeof(ctypes.c_uint16):
+    if ctypes.sizeof(ctypes.c_wchar) == ctypes.sizeof(ctypes.c_uint16):
         _ctypes_cache[lltype.UniChar] = ctypes.c_uint16
     else:
         _ctypes_cache[lltype.UniChar] = ctypes.c_uint32
