@@ -16,7 +16,7 @@ use std::sync::Arc;
 use dynasmrt::aarch64::Assembler;
 use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, ExecutableBuffer, dynasm};
 
-use majit_backend::{BackendError, ExitFrameLayout, ExitRecoveryLayout, ExitValueSourceLayout};
+use majit_backend::BackendError;
 use majit_ir::{
     FailDescr, InputArg, LoopTargetDescr, Op, OpCode, OpRef, OpTypeIndex, TargetArgLoc, Type,
 };
@@ -24,7 +24,6 @@ use majit_ir::{
 use crate::arch::*;
 use crate::codebuf;
 use crate::gcmap::{allocate_gcmap, gcmap_set_bit};
-use crate::guard::DynasmFailDescr;
 use crate::jitframe::{
     FIRST_ITEM_OFFSET, JF_DESCR_OFS, JF_FORCE_DESCR_OFS, JF_FRAME_OFS, JF_GCMAP_OFS,
     JF_GUARD_EXC_OFS,
@@ -1389,19 +1388,15 @@ impl<'a> AssemblerARM64<'a> {
             }
         }
 
-        // Load-bearing identity invariant for runtime dispatch: pyre's
-        // guard-fail trampoline reads `jitframe.jf_descr_index` and indexes
-        // `compiled.fail_descrs[idx]` directly (runner.rs::find_descr_by_ptr
-        // fast path + assembler-emitted store of `fail_index` into
-        // `jf_descr` slot).  Promoting from `debug_assert!` so a release
-        // build catches the position/fail_index mismatch eagerly rather
-        // than dispatching to the wrong descr at runtime.
-        assert!(
-            self.fail_descrs.iter().enumerate().all(|(i, d)| d
-                .as_fail_descr()
-                .map_or(false, |fd| fd.fail_index_per_trace() as usize == i)),
-            "fail_descrs position must equal fail_index"
-        );
+        // Position is the canonical fail_index identity (matching
+        // `llsupport/assembler.py`'s `_allgcrefs` index — PyPy does not
+        // carry per-emission `fail_index` on the descr itself).  Codegen
+        // increments the `fail_index` counter in lockstep with
+        // `fail_descrs.push`, so the contract is structural rather than
+        // descr-internal.  The earlier per-descr assertion was a pyre
+        // NEW DEVIATION removed in Session 7-Tα4: singleton FINISH
+        // descrs (`compile.py:623-662`) answer the trait-default `0`
+        // for `fail_index_per_trace()` regardless of their Vec position.
         Ok(CompiledCode {
             buffer,
             entry_offset: entry,
@@ -1518,19 +1513,15 @@ impl<'a> AssemblerARM64<'a> {
             eprintln!();
         }
 
-        // Load-bearing identity invariant for runtime dispatch: pyre's
-        // guard-fail trampoline reads `jitframe.jf_descr_index` and indexes
-        // `compiled.fail_descrs[idx]` directly (runner.rs::find_descr_by_ptr
-        // fast path + assembler-emitted store of `fail_index` into
-        // `jf_descr` slot).  Promoting from `debug_assert!` so a release
-        // build catches the position/fail_index mismatch eagerly rather
-        // than dispatching to the wrong descr at runtime.
-        assert!(
-            self.fail_descrs.iter().enumerate().all(|(i, d)| d
-                .as_fail_descr()
-                .map_or(false, |fd| fd.fail_index_per_trace() as usize == i)),
-            "fail_descrs position must equal fail_index"
-        );
+        // Position is the canonical fail_index identity (matching
+        // `llsupport/assembler.py`'s `_allgcrefs` index — PyPy does not
+        // carry per-emission `fail_index` on the descr itself).  Codegen
+        // increments the `fail_index` counter in lockstep with
+        // `fail_descrs.push`, so the contract is structural rather than
+        // descr-internal.  The earlier per-descr assertion was a pyre
+        // NEW DEVIATION removed in Session 7-Tα4: singleton FINISH
+        // descrs (`compile.py:623-662`) answer the trait-default `0`
+        // for `fail_index_per_trace()` regardless of their Vec position.
         Ok(CompiledCode {
             buffer,
             entry_offset: entry,
@@ -2593,10 +2584,12 @@ impl<'a> AssemblerARM64<'a> {
                 };
                 // FINISH op exit (DoneWithThisFrame* / ExitFrameWithExceptionDescr).
                 // `compile.py:185` skips these — not a `ResumeDescr`.
-                // `compile.py:665-674` link to the metainterp class-distinct
-                // singleton so trait forwarding routes is_finish /
-                // is_exit_frame_with_exception through the upstream class.
-                let meta_descr = if is_exit_exc {
+                // Singleton-direct push: machine code bakes the singleton
+                // ptr into jf_descr, and runner.rs::find_descr_by_ptr
+                // short-circuits FINISH/Exit/Propagate to the cpu-attached
+                // singleton before consulting the registry (see x86
+                // counterpart for full rationale).
+                let descr: majit_ir::DescrRef = if is_exit_exc {
                     self.cpu_handle
                         .read()
                         .unwrap()
@@ -2604,13 +2597,11 @@ impl<'a> AssemblerARM64<'a> {
                         .clone()
                 } else {
                     self.done_with_this_frame_descr_arc_for_type(result_type)
-                };
-                let descr: majit_ir::DescrRef = Arc::new(DynasmFailDescr::with_meta(
-                    fail_index,
-                    self.trace_id,
-                    fail_arg_types.clone(),
-                    meta_descr,
-                ));
+                }
+                .expect(
+                    "FINISH emission requires cpu-attached singleton — \
+                     call `attach_default_test_descrs` or use `MetaInterp::new`",
+                );
 
                 // Store result to jf_frame[0]
                 if let Some(result) = arglocs.first() {
@@ -4325,7 +4316,7 @@ impl<'a> AssemblerARM64<'a> {
     }
 
     /// FINISH: store result (if any), store descr ptr, return jf_ptr.
-    fn genop_finish(&mut self, op: &Op, fail_index: u32) {
+    fn genop_finish(&mut self, op: &Op, _fail_index: u32) {
         // compiler.rs:9667-9681 parity: trust explicit FINISH types only when
         // they match the actual result arity; otherwise infer from the op args.
         let finish_refs: Vec<OpRef> = op.args.iter().copied().collect();
@@ -4354,12 +4345,13 @@ impl<'a> AssemblerARM64<'a> {
             fail_arg_types[0]
         };
         let global_descr_ptr = self.done_with_this_frame_descr_ptr_for_type(result_type);
-        let descr: majit_ir::DescrRef = Arc::new(DynasmFailDescr::with_meta(
-            fail_index,
-            self.trace_id,
-            fail_arg_types.clone(),
-            self.done_with_this_frame_descr_arc_for_type(result_type),
-        ));
+        // Singleton-direct push (see OpCode::Finish above for rationale).
+        let descr: majit_ir::DescrRef = self
+            .done_with_this_frame_descr_arc_for_type(result_type)
+            .expect(
+                "genop_finish requires cpu-attached singleton — \
+                 call `attach_default_test_descrs` or use `MetaInterp::new`",
+            );
 
         // If there's a result argument, store it to jf_frame[0].
         // assembler.py:2291-2303 parity: float results use xmm0/MOVSD.

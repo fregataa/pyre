@@ -213,6 +213,7 @@ impl StoredExitLayout {
             source_op_index: self.source_op_index,
             exit_types: self.resolve_exit_types().to_vec(),
             is_finish: self.resolve_is_finish(),
+            is_exception_exit: self.resolve_is_exception_exit(),
             gc_ref_slots: self.gc_ref_slots.clone(),
             force_token_slots: self.force_token_slots.clone(),
             recovery_layout: self.recovery_layout.clone(),
@@ -283,6 +284,19 @@ impl StoredExitLayout {
             .as_ref()
             .and_then(|d| d.as_fail_descr())
             .is_some_and(|fd| fd.is_finish())
+    }
+
+    /// `compile.py:658-662 ExitFrameWithExceptionDescrRef`: read the
+    /// exception-finish discriminator from the canonical descr.  The
+    /// metainterp synthesis fallback at
+    /// `make_finish_fail_descr_typed([Type::Ref])` consults this so it
+    /// picks the right `_DoneWithThisFrameDescr` subclass when the
+    /// original `op.descr` is unavailable.
+    pub(crate) fn resolve_is_exception_exit(&self) -> bool {
+        self.descr
+            .as_ref()
+            .and_then(|d| d.as_fail_descr())
+            .is_some_and(|fd| fd.is_exit_frame_with_exception())
     }
 }
 
@@ -1559,6 +1573,7 @@ impl<M: Clone> MetaInterp<M> {
                     source_op_index: layout.source_op_index,
                     exit_types,
                     is_finish: layout.is_finish,
+                    is_exception_exit: layout.is_exception_exit,
                     gc_ref_slots,
                     force_token_slots: layout.force_token_slots,
                     recovery_layout: layout.recovery_layout,
@@ -1583,6 +1598,7 @@ impl<M: Clone> MetaInterp<M> {
                 source_op_index: Some(layout.op_index),
                 exit_types: layout.exit_types,
                 is_finish: layout.is_finish,
+                is_exception_exit: layout.is_exception_exit,
                 gc_ref_slots: layout.gc_ref_slots,
                 force_token_slots: layout.force_token_slots,
                 recovery_layout: layout.recovery_layout,
@@ -1629,6 +1645,7 @@ impl<M: Clone> MetaInterp<M> {
                         source_op_index: layout.source_op_index,
                         exit_types: layout.fail_arg_types,
                         is_finish: layout.is_finish,
+                        is_exception_exit: layout.is_exception_exit,
                         gc_ref_slots: layout.gc_ref_slots,
                         force_token_slots: layout.force_token_slots,
                         recovery_layout: layout.recovery_layout,
@@ -1683,6 +1700,7 @@ impl<M: Clone> MetaInterp<M> {
                             source_op_index: Some(layout.op_index),
                             exit_types: layout.exit_types,
                             is_finish: layout.is_finish,
+                            is_exception_exit: layout.is_exception_exit,
                             gc_ref_slots: layout.gc_ref_slots,
                             force_token_slots: layout.force_token_slots,
                             recovery_layout: layout.recovery_layout,
@@ -5607,11 +5625,15 @@ impl<M: Clone> MetaInterp<M> {
             self.staticdata
                 .exit_frame_with_exception_descr_ref
                 .clone()
-                .unwrap_or_else(|| crate::make_finish_fail_descr_typed(finish_arg_types.clone()))
+                .unwrap_or_else(|| {
+                    crate::make_finish_fail_descr_typed(finish_arg_types.clone(), true)
+                })
         } else {
             self.staticdata
                 .done_with_this_frame_descr_from_types(&finish_arg_types)
-                .unwrap_or_else(|| crate::make_finish_fail_descr_typed(finish_arg_types.clone()))
+                .unwrap_or_else(|| {
+                    crate::make_finish_fail_descr_typed(finish_arg_types.clone(), false)
+                })
         };
         recorder.finish(finish_args, finish_descr);
         // Task #70: snapshots live on TraceCtx; rebuild the TreeLoop with
@@ -6403,6 +6425,7 @@ impl<M: Clone> MetaInterp<M> {
                         .or_else(|| trace_layout_ref.and_then(|layout| layout.source_op_index)),
                     exit_types: layout.fail_arg_types,
                     is_finish: layout.is_finish,
+                    is_exception_exit: layout.is_exception_exit,
                     gc_ref_slots: layout.gc_ref_slots,
                     force_token_slots: layout.force_token_slots,
                     recovery_layout: layout.recovery_layout.or_else(|| {
@@ -6420,6 +6443,7 @@ impl<M: Clone> MetaInterp<M> {
                 source_op_index: None,
                 exit_types: result.typed_outputs.iter().map(Value::get_type).collect(),
                 is_finish: result.is_finish,
+                is_exception_exit: result.is_exit_frame_with_exception,
                 gc_ref_slots: result
                     .typed_outputs
                     .iter()
@@ -6543,6 +6567,7 @@ impl<M: Clone> MetaInterp<M> {
                 source_op_index: None,
                 exit_types: exit_types.clone(),
                 is_finish,
+                is_exception_exit: is_exit_frame_with_exception,
                 gc_ref_slots,
                 force_token_slots,
                 recovery_layout: None,
@@ -6568,6 +6593,7 @@ impl<M: Clone> MetaInterp<M> {
                     source_op_index: None,
                     exit_types: exit_types.clone(),
                     is_finish,
+                    is_exception_exit: is_exit_frame_with_exception,
                     gc_ref_slots,
                     force_token_slots,
                     recovery_layout: None,
@@ -6689,6 +6715,7 @@ impl<M: Clone> MetaInterp<M> {
                 source_op_index: None,
                 exit_types: exit_types.clone(),
                 is_finish,
+                is_exception_exit: is_exit_frame_with_exception,
                 gc_ref_slots: gc_ref_slots.clone(),
                 force_token_slots: force_token_slots.clone(),
                 recovery_layout: None,
@@ -6714,6 +6741,7 @@ impl<M: Clone> MetaInterp<M> {
                     source_op_index: None,
                     exit_types: exit_types.clone(),
                     is_finish,
+                    is_exception_exit: is_exit_frame_with_exception,
                     gc_ref_slots,
                     force_token_slots,
                     recovery_layout: None,
@@ -7295,21 +7323,11 @@ impl<M: Clone> MetaInterp<M> {
             }
 
             // `compile.py:185-186` `if isinstance(descr, ResumeDescr):
-            // descr.rd_loop_token = clt`.
-            //
-            // PRE-EXISTING-ADAPTATION (deep epic Phase E): the `descr`
-            // here is the metainterp-side `ResumeGuardDescr` attached to
-            // the IR op (`op.descr`).  At runtime,
-            // `cpu.get_latest_descr()` returns the BACKEND descr
-            // (`DynasmFailDescr` / `CraneliftFailDescr`) — a separate
-            // object built fresh during backend compile.  RPython has a
-            // single descr object per fail, so `compile.py:186` patches
-            // the same object `cpu.get_latest_descr()` will return.
-            // Pyre therefore stamps the backend descr post-compile
-            // (`runner.rs::compile_loop` / `compiler.rs::compile_loop`)
-            // gated on `is_resume_guard()`.  Convergence requires
-            // unifying the IR-side and backend-side descrs into a single
-            // object (multi-session epic).
+            // descr.rd_loop_token = clt`.  After the Session 6 / Session 7
+            // unification `cpu.get_latest_descr()` returns the same
+            // `ResumeGuardDescr` Arc the metainterp stamps here, so the
+            // backend-post-compile re-stamp (runner.rs::compile_loop /
+            // compiler.rs::compile_loop) writes through to the same object.
 
             // `compile.py:187-191` `if isinstance(descr, JitCellToken)`.
             //
@@ -9386,6 +9404,7 @@ impl<M: Clone> MetaInterp<M> {
                         .map(|values| values.iter().map(Value::get_type).collect())
                         .unwrap_or_default(),
                     is_finish: false,
+                    is_exception_exit: false,
                     gc_ref_slots: typed_fail_values
                         .map(|values| {
                             values
@@ -11675,13 +11694,13 @@ impl<M: Clone> MetaInterp<M> {
                     .exit_frame_with_exception_descr_ref
                     .clone()
                     .unwrap_or_else(|| {
-                        crate::make_finish_fail_descr_typed(finish_arg_types.clone())
+                        crate::make_finish_fail_descr_typed(finish_arg_types.clone(), true)
                     })
             } else {
                 self.staticdata
                     .done_with_this_frame_descr_from_types(&finish_arg_types)
                     .unwrap_or_else(|| {
-                        crate::make_finish_fail_descr_typed(finish_arg_types.clone())
+                        crate::make_finish_fail_descr_typed(finish_arg_types.clone(), false)
                     })
             };
             let outcome = self.compile_trace_finish(
@@ -13835,15 +13854,9 @@ impl MetaInterpStaticData {
         // lands on both the metainterp and the backend so FINISH-descr
         // identity matches across the fast-path comparisons in
         // `llmodel.py` and the `handle_fail` dispatch in pyjitpl.
-        //
-        // pyre currently attaches only to `MetaInterpStaticData`; backends
-        // keep their own `LazyLock<Arc<DynasmFailDescr>>` /
-        // `RegisteredLoopTarget` singletons.  Unification needs new
-        // `Backend::set_done_with_this_frame_descr_*` setters that take
-        // these Arcs, plus a runtime-path update so
-        // `done_with_this_frame_descr_int_ptr()` returns `Arc::as_ptr` of
-        // the stored Arc.  See the follow-up note in
-        // `compile.rs:1565-…` for the five-file surface.
+        // pyre attaches the same Arcs through `Backend::set_done_with_this_frame_descr_*`
+        // on the backend's `CpuDescrAttachments` (see
+        // `compile.rs::make_and_attach_done_descrs`).
         let mut sd = Self {
             op_live: -1,
             op_goto: -1,
@@ -19423,6 +19436,7 @@ mod tests {
             source_op_index: Some(3),
             exit_types: vec![Type::Int],
             is_finish: false,
+            is_exception_exit: false,
             gc_ref_slots: Vec::new(),
             force_token_slots: Vec::new(),
             recovery_layout: None,

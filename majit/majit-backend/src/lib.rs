@@ -693,6 +693,15 @@ pub struct FailDescrLayout {
     pub fail_arg_types: Vec<Type>,
     /// Whether this exit is a FINISH rather than a guard failure.
     pub is_finish: bool,
+    /// `compile.py:658-662 ExitFrameWithExceptionDescrRef` vs
+    /// `compile.py:640-647 DoneWithThisFrameDescrRef`: distinguishes the
+    /// exception-propagation FINISH from a normal-result FINISH that
+    /// happens to carry a single `Type::Ref` slot.  Read from the source
+    /// descr's `FailDescr::is_exit_frame_with_exception()` at layout
+    /// build time so the metainterp synthesis fallback at
+    /// `compile.rs:1132/1417` (when `op.descr` is missing) routes to the
+    /// correct `_DoneWithThisFrameDescr` subclass.
+    pub is_exception_exit: bool,
     /// Exit slot indices that hold rooted GC references.
     pub gc_ref_slots: Vec<usize>,
     /// Exit slot indices that carry opaque FORCE_TOKEN handles.
@@ -734,6 +743,9 @@ pub struct TerminalExitLayout {
     pub exit_types: Vec<Type>,
     /// Whether this exit is a `FINISH` rather than a `JUMP`.
     pub is_finish: bool,
+    /// `compile.py:658-662 ExitFrameWithExceptionDescrRef` discriminator;
+    /// see `FailDescrLayout::is_exception_exit`.
+    pub is_exception_exit: bool,
     /// Exit slot indices that hold rooted GC references.
     pub gc_ref_slots: Vec<usize>,
     /// Exit slot indices that carry opaque FORCE_TOKEN handles.
@@ -1336,9 +1348,9 @@ impl std::fmt::Debug for JitCellToken {
 // matching RPython's single-interpreter assumption).  `JitCellToken`
 // embeds `Rc<RdVirtualInfo>` and `Box<dyn Any + Send>` which are not
 // automatically `Sync`; marking the parent struct `Send + Sync` here
-// is sound under the same invariant that `DynasmFailDescr` /
-// `CraneliftFailDescr` rely on — a promise held by the JIT scheduler
-// that tokens are only touched from the JIT thread.  Backends store
+// is sound under the same invariant `CraneliftFailDescr` relies on —
+// a promise held by the JIT scheduler that tokens are only touched
+// from the JIT thread.  Backends store
 // `Weak<JitCellToken>` handles for cross-token `find_descr_by_ptr`
 // fallback and need these impls to satisfy their `Send` trait bound.
 unsafe impl Send for JitCellToken {}
@@ -1800,11 +1812,10 @@ pub trait Backend: Send {
     ///
     /// PyPy parity: under the unified ResumeGuardDescr identity the two
     /// paths return the same object, so the fallback is observationally
-    /// identical to the metainterp lookup.  During pyre's split-descr
-    /// gap (Phase E.3+ continued epic) the backend `CraneliftFailDescr`
-    /// / `DynasmFailDescr` already implement `Descr`, so the upcast
-    /// `Arc<BackendFailDescr> → Arc<dyn Descr>` is direct — no proxy
-    /// struct, no field-by-field reconstruction.
+    /// identical to the metainterp lookup.  After Slice 7-Tα7 the
+    /// dynasm backend hands back `ResumeGuardDescr` directly; the
+    /// cranelift backend still upcasts `Arc<CraneliftFailDescr>` →
+    /// `Arc<dyn Descr>` until the parallel Phase 7-Tβ collapse.
     fn compiled_bridge_descr_arc(
         &self,
         _original_token: &JitCellToken,
@@ -1886,6 +1897,7 @@ pub trait Backend: Send {
             trace_info: None,
             fail_arg_types: descr.fail_arg_types().to_vec(),
             is_finish: descr.is_finish(),
+            is_exception_exit: descr.is_exit_frame_with_exception(),
             gc_ref_slots: descr
                 .fail_arg_types()
                 .iter()
