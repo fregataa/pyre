@@ -2882,6 +2882,23 @@ impl CallControl {
                     if self.function_graphs.contains_key(&qualified) {
                         return Some(qualified);
                     }
+                    // PyPy `bookkeeper.getdesc(value)` returns one desc per
+                    // Python class regardless of how the type was spelled at
+                    // the call site (alias, fully-qualified, bare).  Pyre
+                    // carries types as strings, so a `use crate::pyframe::
+                    // PyFrame` receiver yields `crate::pyframe::PyFrame`
+                    // while the inherent `impl PyFrame { ... }` block in
+                    // pyframe.rs registers under the bare leaf.  Retry the
+                    // lookup with just the leaf segment so the cross-form
+                    // call resolves to the same graph identity.
+                    if let Some(leaf) = receiver.rsplit("::").next() {
+                        if leaf != receiver {
+                            let leaf_path = CallPath::for_impl_method(leaf, name.as_str());
+                            if self.function_graphs.contains_key(&leaf_path) {
+                                return Some(leaf_path);
+                            }
+                        }
+                    }
                 }
                 // Fall back to trait method resolution for polymorphic calls.
                 let impl_type = self.resolve_method_impl_type(name, receiver_root.as_deref())?;
