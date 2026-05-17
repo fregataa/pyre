@@ -228,7 +228,7 @@ class DFA(object):
 
     def make_code(self):
         # type: () -> Callable[[str], bool]
-        """Generate and compile a Python function that recognizes the DFA's language."""
+        """Generate and compile a RPython function that recognizes the DFA's language."""
         from rpython.rlib.parsing.codebuilder import Codebuilder
         result = Codebuilder()
         result.start_block("def recognize(input):")
