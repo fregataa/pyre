@@ -814,13 +814,19 @@ fn build_object_descr_group_with_def_path(
             .cloned()
             .collect();
         // `descr.py:108-118 get_size_descr` cache key — `path_hash`로
-        // 만들어진 lltype-object identity 대응값.  `register_keyed_size`
-        // 가 `LLType::Struct(path_hash(simple_name))` 슬롯에 first-write-wins
-        // 으로 등록하므로(`descr.py:25-47 setup_descrs` cache-iteration
-        // invariant) `simple_name` 의 path_hash 를 cache_key 로 저장한다.
-        // `def_path` 도 alias 로 publish 되지만 둘 다 같은 Arc 를 가리키므로
-        // round-trip 키 후보로 simple_name 슬롯이 first 인 simple 가 자연.
-        let cache_key = if !simple_name.is_empty() {
+        // 만들어진 lltype-object identity.  Prefer the canonical
+        // *def-path* qualifier (PyPy's `lltype.Struct` identity has
+        // a single module-path keyed slot); fall back to simple-name
+        // for legacy registrations without `def_path`.  Both
+        // `path_hash(simple_name)` and `path_hash(def_path)` are still
+        // dual-published as Arc aliases so untransformed bare-name
+        // analyzer lookups (pending the use_imports lexical resolver,
+        // [[orthodox-6item-2026-05-17]]) still hit.  Round-trip via
+        // `bh_size_spec_from_descr` lands on the canonical def-path
+        // slot.
+        let cache_key = if !def_path.is_empty() {
+            majit_ir::descr::path_hash(def_path)
+        } else if !simple_name.is_empty() {
             majit_ir::descr::path_hash(simple_name)
         } else {
             0
@@ -1487,11 +1493,13 @@ impl SizeDescr for PyreSizeDescr {
     }
 
     /// `descr.py:108-118 get_size_descr` cache identity 와 line-by-line
-    /// 동등: `register_keyed_size` 가 publish 한
-    /// `LLType::Struct(path_hash(simple_name))` 슬롯 키를 그대로 반환.
-    /// `bh_size_spec_from_descr` 역방향 reader 는 이 값을
-    /// `BhSizeSpec.type_id` 에 넣고 `simple_descr_group_from_bh_size` 는
-    /// `LLType::Struct(spec.type_id)` 로 publish 슬롯에 round-trip 한다.
+    /// 동등: `register_keyed_size` 가 publish 한 슬롯 키 (현재
+    /// `path_hash_stripped_crate(module_path!(), bare_name)` —
+    /// 즉 def-path 기반의 `path_hash("module::Bare")`).  매크로 publish
+    /// 시 `__majit_type_id()` 에서 계산되어 인스턴스 슬롯에 저장된
+    /// 값을 그대로 반환한다.  `bh_size_spec_from_descr` 역방향 reader 는
+    /// 이 값을 `BhSizeSpec.type_id` 에 넣고 `simple_descr_group_from_bh_size`
+    /// 는 `LLType::Struct(spec.type_id)` 로 publish 슬롯에 round-trip 한다.
     /// `type_id` (dense GC tid) 와 `cache_key` (structural identity) 는
     /// `descr.rs:1928-1934` 트레이트 doc 의 분리 contract 를 따른다.
     fn cache_key(&self) -> u64 {
@@ -2504,6 +2512,39 @@ fn field_descr_from_bh_field(
     parent: Option<&majit_translate::jitcode::BhSizeSpec>,
 ) -> DescrRef {
     if let Some(parent) = parent {
+        // `descr.py:218-239 get_field_descr` cache-hit: when the parent
+        // STRUCT is published in `_cache_size`, walk its
+        // `all_fielddescrs()` directly so the returned Arc is the
+        // runtime `PyreFieldDescr` (or analyzer-published
+        // `SimpleFieldDescr`).  Both back-reference the same parent
+        // SizeDescr via `parent_descr` (descr.py:200), so the
+        // `ParentBackedFieldDescr` wrapper is unnecessary on this path
+        // — analyzer raw-set Arcs and runtime allocator descrs share
+        // one identity slot.
+        if parent.type_id != 0 {
+            let key = majit_ir::descr::LLType::Struct(parent.type_id);
+            let parent_size = majit_ir::descr::gc_cache()
+                .lock()
+                .unwrap()
+                ._cache_size
+                .get(&key)
+                .cloned();
+            if let Some(parent_descr) = parent_size {
+                if let Some(parent_sd) = parent_descr.as_size_descr() {
+                    for fd in parent_sd.all_fielddescrs() {
+                        if fd.index_in_parent() == field.index_in_parent
+                            && (fd.field_name() == field.name
+                                || fd.field_name().ends_with(&format!(".{}", field.name)))
+                        {
+                            return fd.clone() as DescrRef;
+                        }
+                    }
+                }
+            }
+        }
+        // Cache miss / non-keyed parent — fall back to the legacy
+        // SimpleDescrGroup mint + `ParentBackedFieldDescr` wrapper so
+        // the cyclic parent_descr Weak still binds correctly.
         let group = simple_descr_group_from_bh_size(parent);
         if let Some((pos, _)) = parent.all_fielddescrs.iter().enumerate().find(|(_, spec)| {
             spec.index_in_parent == field.index_in_parent && spec.name == field.name
@@ -3028,6 +3069,29 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
             all_fielddescrs,
             ..
         } => {
+            // `descr.py:108-118 get_size_descr` cache-hit semantics:
+            // when the producer's `type_id` matches a runtime publish
+            // (`build_object_descr_group_with_def_path` →
+            // `register_keyed_size`), the published `Arc<PyreSizeDescr>`
+            // is the canonical object identity for that STRUCT.  Return
+            // it directly so analyzer side-tables, runtime allocations,
+            // and BhDescr round-trip all share one `Arc<dyn Descr>` —
+            // matching PyPy `cache[STRUCT]` per-tuple identity.  Falls
+            // through to the legacy mint path on cache miss (transient
+            // empty-field `bh_new` descrs from `pyre-jit/src/eval.rs`,
+            // test fixtures, etc.).
+            if *type_id != 0 {
+                let key = majit_ir::descr::LLType::Struct(*type_id);
+                let hit = majit_ir::descr::gc_cache()
+                    .lock()
+                    .unwrap()
+                    ._cache_size
+                    .get(&key)
+                    .cloned();
+                if let Some(descr) = hit {
+                    return descr;
+                }
+            }
             // RPython `descr.py:120 get_size_descr` → `:188 init_size_descr`
             // populates `SizeDescr.all_fielddescrs` (and the
             // `gc_fielddescrs` subset) from

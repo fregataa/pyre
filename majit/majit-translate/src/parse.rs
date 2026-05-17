@@ -200,13 +200,12 @@ fn walk_use_tree(
         syn::UseTree::Name(n) => {
             let alias = n.ident.to_string();
             prefix.push(alias.clone());
-            imports.insert(alias, prefix.join("::"));
+            imports.insert(alias, joined_use_path(prefix));
             prefix.pop();
         }
         syn::UseTree::Rename(r) => {
             prefix.push(r.ident.to_string());
-            let full = prefix.join("::");
-            imports.insert(r.rename.to_string(), full);
+            imports.insert(r.rename.to_string(), joined_use_path(prefix));
             prefix.pop();
         }
         syn::UseTree::Glob(_) => {
@@ -217,6 +216,23 @@ fn walk_use_tree(
                 walk_use_tree(sub, prefix, imports);
             }
         }
+    }
+}
+
+/// Join the accumulated `use` path segments and drop the leading
+/// `crate::` keyword when present.  Runtime `#[jit_struct]` hashes
+/// types through `majit_ir::descr::path_hash_stripped_crate`, which
+/// strips the leading `module_path!()` segment (the crate root) before
+/// hashing.  Analyzer-side `path_hash` must see the same namespace, so
+/// the `crate::` syntactic marker is dropped here at collection time
+/// rather than at every consumer.  `use other_crate::Foo` paths are
+/// kept verbatim — the analyzer's `STRUCT_ORIGIN_REGISTRY` does not
+/// cover external crates anyway.
+fn joined_use_path(segments: &[String]) -> String {
+    if segments.first().map(String::as_str) == Some("crate") {
+        segments[1..].join("::")
+    } else {
+        segments.join("::")
     }
 }
 
@@ -289,6 +305,7 @@ pub fn extract_trait_impls(
         "",
         struct_fields,
         fn_return_types,
+        &parsed.use_imports,
         known_struct_names,
         &known_trait_names,
         &mut impls,
@@ -301,6 +318,7 @@ fn collect_trait_impls_from_items(
     prefix: &str,
     struct_fields: &crate::front::StructFieldRegistry,
     fn_return_types: &std::collections::HashMap<String, String>,
+    use_imports: &std::collections::HashMap<String, String>,
     known_struct_names: &std::collections::HashSet<String>,
     known_trait_names: &std::collections::HashSet<String>,
     impls: &mut Vec<TraitImplInfo>,
@@ -315,8 +333,14 @@ fn collect_trait_impls_from_items(
                     let self_ty = &impl_block.self_ty;
                     let for_type = canonical_type_name(self_ty);
                     // Qualify bare type name with module prefix (RPython: unique type identity).
-                    let self_ty_root = type_root_ident(self_ty)
-                        .map(|t| crate::front::ast::qualify_type_name(&t, prefix));
+                    // Route through `qualify_type_name_with_imports` with the same
+                    // `parsed.use_imports` map graph build threads into
+                    // `GraphBuildContext` so trait-impl registration keys align
+                    // with use-site lookups when the receiver type is referenced
+                    // via a `use <path> as alias` form.
+                    let self_ty_root = type_root_ident(self_ty).map(|t| {
+                        crate::front::ast::qualify_type_name_with_imports(&t, prefix, use_imports)
+                    });
                     let mut methods: Vec<MethodInfo> = Vec::new();
                     for item in &impl_block.items {
                         if let syn::ImplItem::Fn(method) = item {
@@ -353,6 +377,7 @@ fn collect_trait_impls_from_items(
                                     struct_fields,
                                     fn_return_types,
                                     prefix,
+                                    use_imports,
                                     known_struct_names,
                                     known_trait_names,
                                 )?;
@@ -418,6 +443,7 @@ fn collect_trait_impls_from_items(
                                     struct_fields,
                                     fn_return_types,
                                     prefix,
+                                    use_imports,
                                     known_struct_names,
                                     known_trait_names,
                                 )?;
@@ -464,6 +490,7 @@ fn collect_trait_impls_from_items(
                         &mod_prefix,
                         struct_fields,
                         fn_return_types,
+                        use_imports,
                         known_struct_names,
                         known_trait_names,
                         impls,
@@ -525,6 +552,7 @@ pub fn extract_inherent_impl_methods(
         "",
         struct_fields,
         fn_return_types,
+        &parsed.use_imports,
         known_struct_names,
         &mut methods,
     )?;
@@ -536,6 +564,7 @@ fn collect_inherent_methods_from_items(
     prefix: &str,
     struct_fields: &crate::front::StructFieldRegistry,
     fn_return_types: &std::collections::HashMap<String, String>,
+    use_imports: &std::collections::HashMap<String, String>,
     known_struct_names: &std::collections::HashSet<String>,
     methods: &mut Vec<InherentMethodInfo>,
 ) -> Result<(), crate::front::ast::FlowingError> {
@@ -546,9 +575,13 @@ fn collect_inherent_methods_from_items(
                     continue;
                 }
                 let for_type = canonical_type_name(&impl_block.self_ty);
-                // Qualify bare type name with module prefix (RPython: unique type identity).
-                let self_ty_root = type_root_ident(&impl_block.self_ty)
-                    .map(|t| crate::front::ast::qualify_type_name(&t, prefix));
+                // Qualify bare type name with module prefix.  Route through
+                // `qualify_type_name_with_imports` so inherent-impl receiver
+                // resolution agrees with graph build's per-graph alias
+                // lookup (PyPy `bookkeeper.getdesc` single-source identity).
+                let self_ty_root = type_root_ident(&impl_block.self_ty).map(|t| {
+                    crate::front::ast::qualify_type_name_with_imports(&t, prefix, use_imports)
+                });
                 for sub in &impl_block.items {
                     if let syn::ImplItem::Fn(method) = sub {
                         let fake_fn = syn::ItemFn {
@@ -574,6 +607,7 @@ fn collect_inherent_methods_from_items(
                                 struct_fields,
                                 fn_return_types,
                                 prefix,
+                                use_imports,
                                 known_struct_names,
                                 &std::collections::HashSet::new(),
                             )?;
@@ -613,6 +647,7 @@ fn collect_inherent_methods_from_items(
                         &mod_prefix,
                         struct_fields,
                         fn_return_types,
+                        use_imports,
                         known_struct_names,
                         methods,
                     )?;
@@ -686,6 +721,7 @@ pub fn collect_function_graphs(
                 &metadata.struct_fields,
                 &metadata.fn_return_types,
                 "",
+                &parsed.use_imports,
                 &metadata.known_struct_names,
                 &metadata.known_trait_names,
             )?;

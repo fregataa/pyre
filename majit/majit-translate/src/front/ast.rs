@@ -165,16 +165,16 @@ impl StructFieldRegistry {
     /// `Vec<Point>`, this returns the full type string `"Vec<Point>"`.
     /// Callers use `array_element_type_from_str` to extract `"Point"`.
     ///
-    /// **Structural adaptation (parity rule §1):** RPython compares
-    /// `lltype.Ptr(GcStruct)` objects directly; field/method lookups
-    /// resolve by structural type identity. Pyre's analyser carries
-    /// type identity as strings, so exact registered keys are the
-    /// normal path. A receiver can still surface with an unavoidable
-    /// Rust crate prefix that was not present at registration time
-    /// (for example `pyre_object::rangeobject::W_RangeIterator` vs
-    /// `rangeobject::W_RangeIterator`). In that case, accept a suffix
-    /// recovery only when it is unique. Ambiguous leaf-name matches
-    /// return `None` instead of picking the first registered struct.
+    /// Resolution order: (1) exact registered key, then (2) canonical
+    /// lexical resolution through `STRUCT_ORIGIN_REGISTRY` (PyPy
+    /// `bookkeeper.getdesc(value)` analog) on the receiver leaf —
+    /// registration dual-publishes bare + canonical so both spellings
+    /// land at the same field list.  (3) crate-prefix-tolerant
+    /// suffix-match shim absorbs `pyre_object::rangeobject::W_X` vs
+    /// `rangeobject::W_X` divergence — orthogonal to lexical scope
+    /// resolution, kept for test entries (`parse::parse_source`)
+    /// that bypass `analyze_pipeline_from_parsed`'s
+    /// `register_struct_origins`.
     pub fn field_type(&self, owner: &str, field_name: &str) -> Option<&str> {
         self.lookup_fields(owner)?
             .iter()
@@ -184,6 +184,18 @@ impl StructFieldRegistry {
 
     fn lookup_fields(&self, owner: &str) -> Option<&[(String, String)]> {
         if let Some(fields) = self.fields.get(owner) {
+            return Some(fields.as_slice());
+        }
+        // Canonical lexical resolution: bare receiver leaves resolve
+        // through `STRUCT_ORIGIN_REGISTRY` (PyPy `bookkeeper.getdesc`
+        // analog).  Registration dual-publishes bare + canonical, so a
+        // miss on the exact owner falls through canonical-leaf lookup
+        // before the suffix-match shim below.
+        let receiver_leaf = owner.rsplit("::").next().unwrap_or(owner);
+        let canonical = majit_ir::descr::canonical_struct_name(receiver_leaf);
+        if canonical != receiver_leaf
+            && let Some(fields) = self.fields.get(&canonical)
+        {
             return Some(fields.as_slice());
         }
         let key = self.unique_suffix_owner_key(owner)?;
@@ -325,6 +337,7 @@ pub fn collect_program_metadata_pub(parsed_files: &[ParsedInterpreter]) -> Progr
         collect_fields_and_returns(
             &parsed.file.items,
             "",
+            &parsed.use_imports,
             &known_struct_names,
             &known_trait_names,
             &mut struct_fields,
@@ -384,15 +397,45 @@ pub(crate) fn collect_struct_origins(
     }
 }
 
-/// Qualify a bare type name with module prefix.
-/// "Foo" with prefix "a" → "a::Foo". Already-qualified "a::Foo" unchanged.
-/// Empty prefix → return bare name as-is.
-pub(crate) fn qualify_type_name(bare: &str, prefix: &str) -> String {
-    if prefix.is_empty() || bare.contains("::") {
-        bare.to_string()
-    } else {
-        format!("{}::{}", prefix, bare)
+/// Qualify a bare type name with module prefix or, when the resolver
+/// knows the canonical defining module, with the canonical prefix.
+///
+/// Resolves a per-source `use <path> as alias` table first, then the
+/// program-wide `STRUCT_ORIGIN_REGISTRY` canonical-defining-module
+/// table, then falls back to `prefix::bare`.
+///
+/// `bookkeeper.py:353-409 getdesc` resolves a bare identifier first in
+/// the frame's `f_globals` (the file's own imports), then in the
+/// program-wide scope summary; pyre's `STRUCT_ORIGIN_REGISTRY` plays
+/// the role of the program-wide scope, while `use_imports` carries
+/// the per-source `f_globals` slice.
+///
+/// `use_imports` is expected to be `GraphBuildContext.use_imports` —
+/// each entry maps a local alias (`use other_mod::Foo as Q` →
+/// `Q → other_mod::Foo`, plain `use other_mod::Foo` →
+/// `Foo → other_mod::Foo`) to the fully-qualified path.  Pass
+/// `&HashMap::new()` when the call site has no per-source scope
+/// (parse-time registration, test fixtures, `lower_expr_into_graph`);
+/// resolution then reduces to `STRUCT_ORIGIN_REGISTRY` + `prefix::bare`.
+pub(crate) fn qualify_type_name_with_imports(
+    bare: &str,
+    prefix: &str,
+    use_imports: &HashMap<String, String>,
+) -> String {
+    if bare.contains("::") {
+        return bare.to_string();
     }
+    if let Some(full) = use_imports.get(bare) {
+        return full.clone();
+    }
+    if prefix.is_empty() {
+        return bare.to_string();
+    }
+    let canonical = majit_ir::descr::canonical_struct_name(bare);
+    if canonical != bare {
+        return canonical;
+    }
+    format!("{}::{}", prefix, bare)
 }
 
 /// RPython: annotator whole-program type collection.
@@ -403,6 +446,7 @@ pub(crate) fn qualify_type_name(bare: &str, prefix: &str) -> String {
 fn collect_types_from_items(
     items: &[Item],
     prefix: &str,
+    use_imports: &HashMap<String, String>,
     known_struct_names: &mut std::collections::HashSet<String>,
     known_trait_names: &mut std::collections::HashSet<String>,
     struct_fields: &mut StructFieldRegistry,
@@ -418,6 +462,7 @@ fn collect_types_from_items(
     collect_fields_and_returns(
         items,
         prefix,
+        use_imports,
         known_struct_names,
         known_trait_names,
         struct_fields,
@@ -533,9 +578,19 @@ fn collect_trait_names(
 }
 
 /// Pass 1b: collect field types + fn return types using known_struct_names.
+///
+/// `use_imports` is the per-source `use <path> as alias` table — same
+/// map that lowering reads through `GraphBuildContext.use_imports`, so
+/// struct field type / fn return type metadata strings produced here
+/// land in the same name namespace as the parameter / local-binding
+/// type strings later mint by `qualify_type_name_with_imports`.  Without
+/// this thread-through, `bookkeeper.getdesc`-style alias resolution
+/// would diverge between metadata + lowering (PyPy single-frame
+/// `f_globals` walk: `rpython/annotator/bookkeeper.py:353`).
 fn collect_fields_and_returns(
     items: &[Item],
     prefix: &str,
+    use_imports: &HashMap<String, String>,
     known_struct_names: &std::collections::HashSet<String>,
     known_trait_names: &std::collections::HashSet<String>,
     struct_fields: &mut StructFieldRegistry,
@@ -554,9 +609,10 @@ fn collect_fields_and_returns(
                     .iter()
                     .filter_map(|f| {
                         let field_name = f.ident.as_ref()?.to_string();
-                        let field_type = qualified_full_type_string(
+                        let field_type = qualified_full_type_string_with_imports(
                             &f.ty,
                             prefix,
+                            use_imports,
                             known_struct_names,
                             known_trait_names,
                         )?;
@@ -575,6 +631,18 @@ fn collect_fields_and_returns(
                             .entry(bare_name.clone())
                             .or_default()
                             .extend(immutables.iter().cloned());
+                        // Canonical defining-module alias: `field_immutability`
+                        // callers route owner through `qualify_type_name`
+                        // non-empty-prefix canonical path; mirror the
+                        // `struct_fields` dual-publish below so the lookup
+                        // hits exactly under both spellings.
+                        let canonical = majit_ir::descr::canonical_struct_name(&bare_name);
+                        if canonical != bare_name {
+                            immutable_fields
+                                .entry(canonical)
+                                .or_default()
+                                .extend(immutables.iter().cloned());
+                        }
                     } else {
                         let qualified = format!("{}::{}", prefix, bare_name);
                         immutable_fields
@@ -588,7 +656,21 @@ fn collect_fields_and_returns(
                     }
                 }
                 if prefix.is_empty() {
-                    struct_fields.fields.insert(bare_name, fields);
+                    // Dual-publish under bare name + canonical defining-module
+                    // form when `STRUCT_ORIGIN_REGISTRY` (populated by
+                    // `analyze_pipeline_from_parsed:372`) supplies an
+                    // origin.  Use-site lookups now route through
+                    // `qualify_type_name` non-empty-prefix canonical path
+                    // (PyPy `bookkeeper.getdesc` analog) and land on the
+                    // canonical key directly without falling back to the
+                    // `unique_suffix_owner_key` shim.
+                    let canonical = majit_ir::descr::canonical_struct_name(&bare_name);
+                    struct_fields
+                        .fields
+                        .insert(bare_name.clone(), fields.clone());
+                    if canonical != bare_name {
+                        struct_fields.fields.insert(canonical, fields);
+                    }
                 } else {
                     let qualified = format!("{}::{}", prefix, bare_name);
                     struct_fields.fields.insert(qualified, fields);
@@ -597,9 +679,10 @@ fn collect_fields_and_returns(
             Item::Fn(func) => {
                 // RPython: op.result.concretetype — module-qualified return type.
                 let ret_ty = match &func.sig.output {
-                    syn::ReturnType::Type(_, ty) => qualified_full_type_string(
+                    syn::ReturnType::Type(_, ty) => qualified_full_type_string_with_imports(
                         ty,
                         prefix,
+                        use_imports,
                         known_struct_names,
                         known_trait_names,
                     ),
@@ -627,6 +710,7 @@ fn collect_fields_and_returns(
                 collect_nested_fn_returns(
                     &func.block.stmts,
                     prefix,
+                    use_imports,
                     known_struct_names,
                     known_trait_names,
                     fn_return_types,
@@ -643,9 +727,13 @@ fn collect_fields_and_returns(
             // (SCREAMING_SNAKE_CASE consts vs snake_case fns) keeps the
             // namespaces separate in pyre's source.
             Item::Const(c) => {
-                if let Some(ty) =
-                    qualified_full_type_string(&c.ty, prefix, known_struct_names, known_trait_names)
-                {
+                if let Some(ty) = qualified_full_type_string_with_imports(
+                    &c.ty,
+                    prefix,
+                    use_imports,
+                    known_struct_names,
+                    known_trait_names,
+                ) {
                     let key = if prefix.is_empty() {
                         c.ident.to_string()
                     } else {
@@ -659,17 +747,21 @@ fn collect_fields_and_returns(
                 for sub in &impl_block.items {
                     if let syn::ImplItem::Fn(method) = sub {
                         let ret_ty = match &method.sig.output {
-                            syn::ReturnType::Type(_, ty) => qualified_full_type_string(
-                                ty,
-                                prefix,
-                                known_struct_names,
-                                known_trait_names,
-                            ),
+                            syn::ReturnType::Type(_, ty) => {
+                                qualified_full_type_string_with_imports(
+                                    ty,
+                                    prefix,
+                                    use_imports,
+                                    known_struct_names,
+                                    known_trait_names,
+                                )
+                            }
                             syn::ReturnType::Default => Some("()".to_string()),
                         };
                         if let Some(ret_ty) = ret_ty {
                             if let Some(ref ty_root) = self_ty_root {
-                                let qualified_ty = qualify_type_name(ty_root, prefix);
+                                let qualified_ty =
+                                    qualify_type_name_with_imports(ty_root, prefix, use_imports);
                                 fn_return_types.insert(
                                     format!("{}::{}", qualified_ty, method.sig.ident),
                                     ret_ty,
@@ -688,14 +780,16 @@ fn collect_fields_and_returns(
                     // `lookup_function_return_type` /
                     // `expr_unary_not_operand_kind`.
                     if let syn::ImplItem::Const(item_const) = sub {
-                        if let Some(ty) = qualified_full_type_string(
+                        if let Some(ty) = qualified_full_type_string_with_imports(
                             &item_const.ty,
                             prefix,
+                            use_imports,
                             known_struct_names,
                             known_trait_names,
                         ) && let Some(ref ty_root) = self_ty_root
                         {
-                            let qualified_ty = qualify_type_name(ty_root, prefix);
+                            let qualified_ty =
+                                qualify_type_name_with_imports(ty_root, prefix, use_imports);
                             fn_return_types.insert(
                                 format!("{}::{}", qualified_ty, item_const.ident),
                                 ty.clone(),
@@ -710,16 +804,23 @@ fn collect_fields_and_returns(
                 }
             }
             Item::Trait(trait_def) => {
-                let trait_root = qualify_type_name(&trait_def.ident.to_string(), prefix);
+                let trait_root = qualify_type_name_with_imports(
+                    &trait_def.ident.to_string(),
+                    prefix,
+                    use_imports,
+                );
                 for sub in &trait_def.items {
                     if let syn::TraitItem::Fn(method) = sub {
                         let ret_ty = match &method.sig.output {
-                            syn::ReturnType::Type(_, ty) => qualified_full_type_string(
-                                ty,
-                                prefix,
-                                known_struct_names,
-                                known_trait_names,
-                            ),
+                            syn::ReturnType::Type(_, ty) => {
+                                qualified_full_type_string_with_imports(
+                                    ty,
+                                    prefix,
+                                    use_imports,
+                                    known_struct_names,
+                                    known_trait_names,
+                                )
+                            }
                             syn::ReturnType::Default => Some("()".to_string()),
                         };
                         if let Some(ret_ty) = ret_ty {
@@ -760,9 +861,10 @@ fn collect_fields_and_returns(
                             .iter()
                             .filter_map(|f| {
                                 let field_name = f.ident.as_ref()?.to_string();
-                                let field_type = qualified_full_type_string(
+                                let field_type = qualified_full_type_string_with_imports(
                                     &f.ty,
                                     prefix,
+                                    use_imports,
                                     known_struct_names,
                                     known_trait_names,
                                 )?;
@@ -785,6 +887,7 @@ fn collect_fields_and_returns(
                     collect_fields_and_returns(
                         sub_items,
                         &mod_prefix,
+                        use_imports,
                         known_struct_names,
                         known_trait_names,
                         struct_fields,
@@ -1141,6 +1244,7 @@ fn synthesize_elidable_promote_pair(
 fn collect_nested_fn_returns(
     stmts: &[syn::Stmt],
     prefix: &str,
+    use_imports: &HashMap<String, String>,
     known_struct_names: &std::collections::HashSet<String>,
     known_trait_names: &std::collections::HashSet<String>,
     fn_return_types: &mut HashMap<String, String>,
@@ -1148,9 +1252,13 @@ fn collect_nested_fn_returns(
     for stmt in stmts {
         if let syn::Stmt::Item(Item::Fn(nested)) = stmt {
             let ret_ty = match &nested.sig.output {
-                syn::ReturnType::Type(_, ty) => {
-                    qualified_full_type_string(ty, prefix, known_struct_names, known_trait_names)
-                }
+                syn::ReturnType::Type(_, ty) => qualified_full_type_string_with_imports(
+                    ty,
+                    prefix,
+                    use_imports,
+                    known_struct_names,
+                    known_trait_names,
+                ),
                 syn::ReturnType::Default => Some("()".to_string()),
             };
             if let Some(ret_ty) = ret_ty {
@@ -1164,6 +1272,7 @@ fn collect_nested_fn_returns(
             collect_nested_fn_returns(
                 &nested.block.stmts,
                 prefix,
+                use_imports,
                 known_struct_names,
                 known_trait_names,
                 fn_return_types,
@@ -1188,6 +1297,7 @@ fn build_graphs_from_items(
     options: &AstGraphOptions,
     struct_fields: &StructFieldRegistry,
     fn_return_types: &HashMap<String, String>,
+    use_imports: &HashMap<String, String>,
     known_struct_names: &std::collections::HashSet<String>,
     known_trait_names: &std::collections::HashSet<String>,
     functions: &mut Vec<SemanticFunction>,
@@ -1210,6 +1320,7 @@ fn build_graphs_from_items(
                         struct_fields,
                         fn_return_types,
                         prefix,
+                        use_imports,
                         known_struct_names,
                         known_trait_names,
                     )?;
@@ -1220,9 +1331,14 @@ fn build_graphs_from_items(
                 }
             }
             Item::Impl(impl_block) => {
-                // Qualify bare self type with module prefix (RPython: unique type identity).
-                let self_ty_root =
-                    type_root_ident(&impl_block.self_ty).map(|t| qualify_type_name(&t, prefix));
+                // Qualify bare self type with module prefix (RPython: unique
+                // type identity).  Route through the imports-aware variant
+                // so this graph-build self_ty_root matches the
+                // `parse::collect_trait_impls_from_items` /
+                // `parse::collect_inherent_methods_from_items` registration
+                // key when the receiver is a `use <path> as alias` form.
+                let self_ty_root = type_root_ident(&impl_block.self_ty)
+                    .map(|t| qualify_type_name_with_imports(&t, prefix, use_imports));
                 for sub in &impl_block.items {
                     if let syn::ImplItem::Fn(method) = sub {
                         let fake_fn = ItemFn {
@@ -1246,6 +1362,7 @@ fn build_graphs_from_items(
                                 struct_fields,
                                 fn_return_types,
                                 prefix,
+                                use_imports,
                                 known_struct_names,
                                 known_trait_names,
                             )?;
@@ -1267,6 +1384,7 @@ fn build_graphs_from_items(
                         options,
                         struct_fields,
                         fn_return_types,
+                        use_imports,
                         known_struct_names,
                         known_trait_names,
                         functions,
@@ -1297,6 +1415,7 @@ pub fn build_semantic_program_with_options(
     collect_types_from_items(
         &parsed.file.items,
         "",
+        &parsed.use_imports,
         &mut known_struct_names,
         &mut known_trait_names,
         &mut struct_fields,
@@ -1313,6 +1432,7 @@ pub fn build_semantic_program_with_options(
         options,
         &struct_fields,
         &fn_return_types,
+        &parsed.use_imports,
         &known_struct_names,
         &known_trait_names,
         &mut functions,
@@ -1352,6 +1472,7 @@ pub fn build_semantic_program_from_parsed_files_with_options(
         collect_fields_and_returns(
             &parsed.file.items,
             "",
+            &parsed.use_imports,
             &known_struct_names,
             &known_trait_names,
             &mut struct_fields,
@@ -1369,6 +1490,7 @@ pub fn build_semantic_program_from_parsed_files_with_options(
             options,
             &struct_fields,
             &fn_return_types,
+            &parsed.use_imports,
             &known_struct_names,
             &known_trait_names,
             &mut functions,
@@ -1406,6 +1528,7 @@ pub fn lower_expr_into_graph(
         &empty_registry,
         &empty_fn_ret,
         "",
+        HashMap::new(),
         &empty_names,
         &empty_trait_names,
     );
@@ -1429,6 +1552,7 @@ pub fn build_function_graph_pub(func: &ItemFn) -> Result<SemanticFunction, Flowi
     let empty_fn_ret = HashMap::new();
     let empty_names = std::collections::HashSet::new();
     let empty_trait_names = std::collections::HashSet::new();
+    let empty_use_imports = HashMap::new();
     build_function_graph(
         func,
         &AstGraphOptions::default(),
@@ -1436,6 +1560,7 @@ pub fn build_function_graph_pub(func: &ItemFn) -> Result<SemanticFunction, Flowi
         &empty_registry,
         &empty_fn_ret,
         "",
+        &empty_use_imports,
         &empty_names,
         &empty_trait_names,
     )
@@ -1447,6 +1572,7 @@ pub fn build_function_graph_with_self_ty_pub(
     struct_fields: &StructFieldRegistry,
     fn_return_types: &HashMap<String, String>,
     module_prefix: &str,
+    use_imports: &HashMap<String, String>,
     known_struct_names: &std::collections::HashSet<String>,
     known_trait_names: &std::collections::HashSet<String>,
 ) -> Result<SemanticFunction, FlowingError> {
@@ -1457,6 +1583,7 @@ pub fn build_function_graph_with_self_ty_pub(
         struct_fields,
         fn_return_types,
         module_prefix,
+        use_imports,
         known_struct_names,
         known_trait_names,
     )
@@ -1531,6 +1658,15 @@ struct GraphBuildContext<'a> {
     /// RPython: lltype identity is globally unique — bare "Foo" in mod "a"
     /// must resolve to "a::Foo" in struct_fields lookups.
     module_prefix: String,
+    /// Per-source `use <path> as alias` table — `(alias → fully_qualified_path)`
+    /// resolved from this source file's top-level `Item::Use` declarations.
+    /// PyPy peer: `bookkeeper.getdesc(value)` walks the host Python lexical
+    /// scope of the current frame's import resolutions; pyre carries names
+    /// as strings, so this map is the per-graph slice of
+    /// `CallControl.use_imports` aggregated by `analyze_pipeline_from_parsed`.
+    /// Empty when the file has no use-aliases or the build entry bypassed
+    /// the parsed-file plumbing (`parse::collect_function_graphs` tests).
+    use_imports: HashMap<String, String>,
     known_struct_names: &'a std::collections::HashSet<String>,
     known_trait_names: &'a std::collections::HashSet<String>,
     /// Loop targets active at the current lowering point.  Pushed on
@@ -2092,6 +2228,7 @@ impl<'a> GraphBuildContext<'a> {
         struct_fields: &'a StructFieldRegistry,
         fn_return_types: &'a HashMap<String, String>,
         module_prefix: &str,
+        use_imports: HashMap<String, String>,
         known_struct_names: &'a std::collections::HashSet<String>,
         known_trait_names: &'a std::collections::HashSet<String>,
     ) -> Self {
@@ -2108,6 +2245,7 @@ impl<'a> GraphBuildContext<'a> {
             struct_fields,
             fn_return_types,
             module_prefix: module_prefix.to_string(),
+            use_imports,
             known_struct_names,
             known_trait_names,
             loop_stack: Vec::new(),
@@ -2860,6 +2998,7 @@ fn build_function_graph(
     struct_fields: &StructFieldRegistry,
     fn_return_types: &HashMap<String, String>,
     module_prefix: &str,
+    use_imports: &HashMap<String, String>,
     known_struct_names: &std::collections::HashSet<String>,
     known_trait_names: &std::collections::HashSet<String>,
 ) -> Result<SemanticFunction, FlowingError> {
@@ -2872,6 +3011,7 @@ fn build_function_graph(
         struct_fields,
         fn_return_types,
         module_prefix,
+        use_imports.clone(),
         known_struct_names,
         known_trait_names,
     );
@@ -2929,16 +3069,21 @@ fn build_function_graph(
                 let name = canonical_pat_name(&pat_type.pat);
                 if let Some(type_root) = type_root_ident(&pat_type.ty) {
                     // Qualify bare type with module prefix for exact identity.
-                    let qualified = qualify_type_name(&type_root, &ctx.module_prefix);
+                    let qualified = qualify_type_name_with_imports(
+                        &type_root,
+                        &ctx.module_prefix,
+                        &ctx.use_imports,
+                    );
                     ctx.local_type_roots.insert(name.clone(), qualified);
                     if let Some(trait_root) = ctx.generic_trait_roots.get(&type_root) {
                         ctx.local_trait_bound_roots
                             .insert(name.clone(), trait_root.clone());
                     }
                 }
-                if let Some(full_type) = qualified_full_type_string(
+                if let Some(full_type) = qualified_full_type_string_with_imports(
                     &pat_type.ty,
                     &ctx.module_prefix,
+                    &ctx.use_imports,
                     ctx.known_struct_names,
                     ctx.known_trait_names,
                 ) {
@@ -3023,9 +3168,13 @@ fn build_function_graph(
 
     // RPython: op.result.concretetype — module-qualified for exact type identity.
     let return_type = match &func.sig.output {
-        syn::ReturnType::Type(_, ty) => {
-            qualified_full_type_string(ty, module_prefix, known_struct_names, known_trait_names)
-        }
+        syn::ReturnType::Type(_, ty) => qualified_full_type_string_with_imports(
+            ty,
+            module_prefix,
+            use_imports,
+            known_struct_names,
+            known_trait_names,
+        ),
         syn::ReturnType::Default => Some("()".to_string()),
     };
 
@@ -3215,6 +3364,7 @@ pub fn lower_stmt_pub(
         &empty_registry,
         &empty_fn_ret,
         "",
+        HashMap::new(),
         &empty_names,
         &empty_trait_names,
     );
@@ -3313,14 +3463,19 @@ fn lower_stmt_inner(
             if let syn::Pat::Type(pat_type) = &local.pat {
                 let name = canonical_pat_name(&pat_type.pat);
                 if let Some(type_root) = type_root_ident(&pat_type.ty) {
-                    let qualified = qualify_type_name(&type_root, &ctx.module_prefix);
+                    let qualified = qualify_type_name_with_imports(
+                        &type_root,
+                        &ctx.module_prefix,
+                        &ctx.use_imports,
+                    );
                     ctx.local_type_roots.insert(name.clone(), qualified);
                 }
                 ctx.local_value_types
                     .insert(name.clone(), classify_fn_arg_ty(&pat_type.ty));
-                if let Some(full_type) = qualified_full_type_string(
+                if let Some(full_type) = qualified_full_type_string_with_imports(
                     &pat_type.ty,
                     &ctx.module_prefix,
+                    &ctx.use_imports,
                     ctx.known_struct_names,
                     ctx.known_trait_names,
                 ) {
@@ -3414,12 +3569,15 @@ fn lower_stmt_inner(
                         // closure return type under the bare ident.
                         if let syn::Expr::Closure(closure) = &*init.expr {
                             let closure_ret = match &closure.output {
-                                syn::ReturnType::Type(_, ty) => qualified_full_type_string(
-                                    ty,
-                                    &ctx.module_prefix,
-                                    ctx.known_struct_names,
-                                    ctx.known_trait_names,
-                                ),
+                                syn::ReturnType::Type(_, ty) => {
+                                    qualified_full_type_string_with_imports(
+                                        ty,
+                                        &ctx.module_prefix,
+                                        &ctx.use_imports,
+                                        ctx.known_struct_names,
+                                        ctx.known_trait_names,
+                                    )
+                                }
                                 syn::ReturnType::Default => {
                                     expression_type_string(&closure.body, ctx)
                                 }
@@ -6531,6 +6689,26 @@ fn expr_unary_not_operand_kind(expr: &syn::Expr, ctx: &GraphBuildContext) -> Una
                     return kind;
                 }
             }
+            // Canonical-receiver fallback: Item::Impl associated-const
+            // and method registration goes through `qualify_type_name(
+            // self_ty_root, prefix)` which now resolves bare known-struct
+            // names to defining-module form via `STRUCT_ORIGIN_REGISTRY`
+            // (PyPy `bookkeeper.getdesc` analog).  Bare receiver paths
+            // here reach the canonical-registered key only via this
+            // explicit second lookup.
+            let canonical_recv = majit_ir::descr::canonical_struct_name(
+                &path.path.segments[n - 2].ident.to_string(),
+            );
+            if canonical_recv != path.path.segments[n - 2].ident.to_string() {
+                let canonical_key =
+                    format!("{}::{}", canonical_recv, path.path.segments[n - 1].ident);
+                if let Some(ty) = ctx.fn_return_types.get(&canonical_key) {
+                    let kind = type_string_to_unary_not_kind(ty);
+                    if kind != UnaryNotOperandKind::Unknown {
+                        return kind;
+                    }
+                }
+            }
             UnaryNotOperandKind::Unknown
         }
         syn::Expr::Path(path)
@@ -7036,6 +7214,23 @@ fn expr_unary_not_operand_kind(expr: &syn::Expr, ctx: &GraphBuildContext) -> Una
                             return kind;
                         }
                     }
+                    // Canonical-receiver fallback for the multi-segment
+                    // Impl call: same shape as `expr_unary_not_operand_kind`'s
+                    // Multi-segment Path arm and `lookup_function_return_type`'s
+                    // tail.  Item::Impl method registration goes through
+                    // `qualify_type_name(self_ty_root, prefix)` which now
+                    // resolves bare known-struct names to defining-module
+                    // form via `STRUCT_ORIGIN_REGISTRY`.
+                    let canonical_recv = majit_ir::descr::canonical_struct_name(&segments[n - 2]);
+                    if canonical_recv != segments[n - 2] {
+                        let canonical_key = format!("{}::{}", canonical_recv, segments[n - 1]);
+                        if let Some(ret) = ctx.fn_return_types.get(&canonical_key) {
+                            let kind = type_string_to_unary_not_kind(ret);
+                            if kind != UnaryNotOperandKind::Unknown {
+                                return kind;
+                            }
+                        }
+                    }
                 }
                 // External numeric type-conversion constructors —
                 // `BigInt::from(...)`, `BigUint::from(...)`,
@@ -7359,9 +7554,9 @@ fn receiver_type_root(expr: &syn::Expr, ctx: &GraphBuildContext) -> Option<Strin
             .path
             .get_ident()
             .and_then(|ident| ctx.local_type_roots.get(&ident.to_string()).cloned()),
-        syn::Expr::Cast(cast) => {
-            type_root_ident(&cast.ty).map(|root| qualify_type_name(&root, &ctx.module_prefix))
-        }
+        syn::Expr::Cast(cast) => type_root_ident(&cast.ty).map(|root| {
+            qualify_type_name_with_imports(&root, &ctx.module_prefix, &ctx.use_imports)
+        }),
         syn::Expr::Reference(reference) => receiver_type_root(&reference.expr, ctx),
         syn::Expr::Paren(paren) => receiver_type_root(&paren.expr, ctx),
         syn::Expr::Unary(unary) => match &unary.op {
@@ -7686,7 +7881,21 @@ fn lookup_method_return_type<'a>(
         return Some(ret);
     }
 
+    // Canonical-receiver exact-match: when the receiver is a bare
+    // known-struct name, route through `STRUCT_ORIGIN_REGISTRY` to its
+    // defining-module qualifier (PyPy `bookkeeper.getdesc` analog) and
+    // try the canonical key directly.  Avoids exercising the leaf-
+    // suffix uniqueness scan below for the common cross-module case.
     let receiver_leaf = receiver_root.rsplit("::").next().unwrap_or(receiver_root);
+    let canonical_recv = majit_ir::descr::canonical_struct_name(receiver_leaf);
+    if canonical_recv != receiver_leaf {
+        let canonical_key = format!("{}::{}", canonical_recv, method);
+        if let Some(ret) = ctx.fn_return_types.get(&canonical_key) {
+            return Some(ret);
+        }
+    }
+
+    let method_name = method.to_string();
     let method_name = method.to_string();
     // Rust imports can make the call-site owner path shorter or longer
     // than the impl key. Use the leaf owner only when it is unambiguous.
@@ -7853,9 +8062,10 @@ fn bind_pattern_locals(
         syn::Pat::Reference(reference) => bind_pattern_locals(&reference.pat, matched_type, ctx),
         syn::Pat::Paren(paren) => bind_pattern_locals(&paren.pat, matched_type, ctx),
         syn::Pat::Type(typed) => {
-            let explicit_type = qualified_full_type_string(
+            let explicit_type = qualified_full_type_string_with_imports(
                 &typed.ty,
                 &ctx.module_prefix,
+                &ctx.use_imports,
                 ctx.known_struct_names,
                 ctx.known_trait_names,
             );
@@ -8562,7 +8772,41 @@ pub(crate) fn qualified_full_type_string(
     known_struct_names: &std::collections::HashSet<String>,
     known_trait_names: &std::collections::HashSet<String>,
 ) -> Option<String> {
-    if prefix.is_empty() {
+    qualified_full_type_string_with_imports(
+        ty,
+        prefix,
+        &HashMap::new(),
+        known_struct_names,
+        known_trait_names,
+    )
+}
+
+/// `qualified_full_type_string` variant that consults a per-source
+/// `use <path> as alias` table when qualifying single-segment leaf
+/// types — keeps struct field / fn return metadata in the same name
+/// namespace as `qualify_type_name_with_imports`-driven
+/// parameter/local lowering, mirroring PyPy `bookkeeper.getdesc`'s
+/// single-frame `f_globals` resolution
+/// (`rpython/annotator/bookkeeper.py:353-409`).
+///
+/// `use_imports` is the per-source map collected by
+/// `parse::collect_use_imports`; an empty map reduces this back to
+/// `qualified_full_type_string`'s plain `prefix::Bar` /
+/// `canonical_struct_name` behaviour.
+pub(crate) fn qualified_full_type_string_with_imports(
+    ty: &syn::Type,
+    prefix: &str,
+    use_imports: &HashMap<String, String>,
+    known_struct_names: &std::collections::HashSet<String>,
+    known_trait_names: &std::collections::HashSet<String>,
+) -> Option<String> {
+    // Top-level files (`prefix=""`) still need to walk the match when a
+    // per-source `use_imports` table is available; PyPy `bookkeeper.getdesc`
+    // resolves bare names through the importing frame's `f_globals` even at
+    // module root (`rpython/annotator/bookkeeper.py:353`).  Only fall
+    // through to `full_type_string` when both qualification sources are
+    // empty.
+    if prefix.is_empty() && use_imports.is_empty() {
         return full_type_string(ty);
     }
     match ty {
@@ -8575,10 +8819,32 @@ pub(crate) fn qualified_full_type_string(
                     let name = seg.ident.to_string();
                     match &seg.arguments {
                         syn::PathArguments::None => {
-                            // Leaf type (no generics). Qualify if it looks like
-                            // a user struct: starts with uppercase, single segment.
-                            if path.path.segments.len() == 1 && known_struct_names.contains(&name) {
-                                qualify_type_name(&name, prefix)
+                            // Leaf type (no generics).  Qualify when the
+                            // single-segment name is a known user struct
+                            // (direct match) OR aliases to one via
+                            // `use foo::Bar as B` — for the rename case
+                            // `B` does not itself appear in
+                            // `known_struct_names`, but the resolved
+                            // target's leaf name does.  Non-struct
+                            // imports (`use foo::helper` for a fn,
+                            // `use external_crate::Item` for an external
+                            // type) leave the bare name unqualified so
+                            // their identity stays distinct from the
+                            // file's own struct namespace.  PyPy
+                            // `bookkeeper.getdesc(value)` binds the alias
+                            // to the original Python object identity.
+                            let alias_targets_struct = path.path.segments.len() == 1
+                                && use_imports.get(&name).is_some_and(|full| {
+                                    let leaf = full
+                                        .rsplit_once("::")
+                                        .map(|(_, l)| l)
+                                        .unwrap_or(full.as_str());
+                                    known_struct_names.contains(leaf)
+                                });
+                            if path.path.segments.len() == 1
+                                && (known_struct_names.contains(&name) || alias_targets_struct)
+                            {
+                                qualify_type_name_with_imports(&name, prefix, use_imports)
                             } else {
                                 name
                             }
@@ -8589,12 +8855,15 @@ pub(crate) fn qualified_full_type_string(
                                 .args
                                 .iter()
                                 .filter_map(|arg| match arg {
-                                    syn::GenericArgument::Type(t) => qualified_full_type_string(
-                                        t,
-                                        prefix,
-                                        known_struct_names,
-                                        known_trait_names,
-                                    ),
+                                    syn::GenericArgument::Type(t) => {
+                                        qualified_full_type_string_with_imports(
+                                            t,
+                                            prefix,
+                                            use_imports,
+                                            known_struct_names,
+                                            known_trait_names,
+                                        )
+                                    }
                                     _ => None,
                                 })
                                 .collect();
@@ -8610,12 +8879,21 @@ pub(crate) fn qualified_full_type_string(
                 .collect();
             Some(segments.join("::"))
         }
-        syn::Type::Reference(r) => {
-            qualified_full_type_string(&r.elem, prefix, known_struct_names, known_trait_names)
-        }
+        syn::Type::Reference(r) => qualified_full_type_string_with_imports(
+            &r.elem,
+            prefix,
+            use_imports,
+            known_struct_names,
+            known_trait_names,
+        ),
         syn::Type::Ptr(p) => {
-            let inner =
-                qualified_full_type_string(&p.elem, prefix, known_struct_names, known_trait_names)?;
+            let inner = qualified_full_type_string_with_imports(
+                &p.elem,
+                prefix,
+                use_imports,
+                known_struct_names,
+                known_trait_names,
+            )?;
             let mutability = if p.mutability.is_some() {
                 "*mut"
             } else {
@@ -8623,19 +8901,36 @@ pub(crate) fn qualified_full_type_string(
             };
             Some(format!("{mutability} {inner}"))
         }
-        syn::Type::Paren(p) => {
-            qualified_full_type_string(&p.elem, prefix, known_struct_names, known_trait_names)
-        }
-        syn::Type::Group(g) => {
-            qualified_full_type_string(&g.elem, prefix, known_struct_names, known_trait_names)
-        }
-        syn::Type::Slice(s) => {
-            qualified_full_type_string(&s.elem, prefix, known_struct_names, known_trait_names)
-                .map(|t| format!("[{}]", t))
-        }
+        syn::Type::Paren(p) => qualified_full_type_string_with_imports(
+            &p.elem,
+            prefix,
+            use_imports,
+            known_struct_names,
+            known_trait_names,
+        ),
+        syn::Type::Group(g) => qualified_full_type_string_with_imports(
+            &g.elem,
+            prefix,
+            use_imports,
+            known_struct_names,
+            known_trait_names,
+        ),
+        syn::Type::Slice(s) => qualified_full_type_string_with_imports(
+            &s.elem,
+            prefix,
+            use_imports,
+            known_struct_names,
+            known_trait_names,
+        )
+        .map(|t| format!("[{}]", t)),
         syn::Type::Array(a) => {
-            let elem =
-                qualified_full_type_string(&a.elem, prefix, known_struct_names, known_trait_names)?;
+            let elem = qualified_full_type_string_with_imports(
+                &a.elem,
+                prefix,
+                use_imports,
+                known_struct_names,
+                known_trait_names,
+            )?;
             let len_str = match &a.len {
                 syn::Expr::Lit(lit) => match &lit.lit {
                     syn::Lit::Int(int_lit) => int_lit.base10_digits().to_string(),
@@ -8651,7 +8946,13 @@ pub(crate) fn qualified_full_type_string(
                 .elems
                 .iter()
                 .map(|elem| {
-                    qualified_full_type_string(elem, prefix, known_struct_names, known_trait_names)
+                    qualified_full_type_string_with_imports(
+                        elem,
+                        prefix,
+                        use_imports,
+                        known_struct_names,
+                        known_trait_names,
+                    )
                 })
                 .collect();
             elems.map(|elems| format!("({})", elems.join(",")))
@@ -8833,9 +9134,10 @@ fn expression_type_string(expr: &syn::Expr, ctx: &GraphBuildContext) -> Option<S
             syn::UnOp::Deref(_) => expression_type_string(&unary.expr, ctx),
             _ => None,
         },
-        syn::Expr::Cast(cast) => qualified_full_type_string(
+        syn::Expr::Cast(cast) => qualified_full_type_string_with_imports(
             &cast.ty,
             &ctx.module_prefix,
+            &ctx.use_imports,
             ctx.known_struct_names,
             ctx.known_trait_names,
         ),
@@ -8991,9 +9293,10 @@ fn expression_type_string(expr: &syn::Expr, ctx: &GraphBuildContext) -> Option<S
                 && let syn::Expr::Closure(closure) = last
             {
                 let ret = match &closure.output {
-                    syn::ReturnType::Type(_, ty) => qualified_full_type_string(
+                    syn::ReturnType::Type(_, ty) => qualified_full_type_string_with_imports(
                         ty,
                         &ctx.module_prefix,
+                        &ctx.use_imports,
                         ctx.known_struct_names,
                         ctx.known_trait_names,
                     ),
@@ -9018,9 +9321,10 @@ fn expression_type_string(expr: &syn::Expr, ctx: &GraphBuildContext) -> Option<S
                 && let Some(receiver_ty) = expression_type_string(&mc.receiver, ctx)
             {
                 let body_ty = match &closure.output {
-                    syn::ReturnType::Type(_, ty) => qualified_full_type_string(
+                    syn::ReturnType::Type(_, ty) => qualified_full_type_string_with_imports(
                         ty,
                         &ctx.module_prefix,
+                        &ctx.use_imports,
                         ctx.known_struct_names,
                         ctx.known_trait_names,
                     ),
@@ -9266,6 +9570,23 @@ fn lookup_function_return_type<'a>(
         let bare_impl = format!("{}::{}", segments[n - 2], segments[n - 1]);
         if let Some(ret) = ctx.fn_return_types.get(&bare_impl) {
             return Some(ret);
+        }
+        // Canonical-receiver fallback: `Item::Impl` registration goes
+        // through `qualify_type_name(self_ty_root, prefix)` which now
+        // resolves bare known-struct names to their defining-module
+        // form via `STRUCT_ORIGIN_REGISTRY` (PyPy
+        // `bookkeeper.getdesc(value)` analog,
+        // `bookkeeper.py:353-409`).  Call sites that write the
+        // receiver in bare or use-site-qualified form land here; try
+        // the canonical-qualified key so the lookup matches the
+        // registered slot regardless of how the caller spelled the
+        // receiver.
+        let canonical_recv = majit_ir::descr::canonical_struct_name(&segments[n - 2]);
+        if canonical_recv != segments[n - 2] {
+            let canonical_key = format!("{}::{}", canonical_recv, segments[n - 1]);
+            if let Some(ret) = ctx.fn_return_types.get(&canonical_key) {
+                return Some(ret);
+            }
         }
     }
     None
@@ -11985,6 +12306,7 @@ mod tests {
             &empty_registry,
             &empty_fn_ret,
             "",
+            HashMap::new(),
             &empty_names,
             &empty_trait_names,
         );
@@ -13094,6 +13416,7 @@ mod tests {
             struct_fields,
             fn_return_types,
             "",
+            HashMap::new(),
             known_struct_names,
             known_trait_names,
         )

@@ -145,6 +145,32 @@ pub fn path_hash(s: &str) -> u64 {
     h.finish()
 }
 
+/// `path_hash` sibling that drops the leading `<crate>::` segment from
+/// `module_path` before hashing.  PyPy/RPython has no notion of a crate
+/// boundary — `lltype.Struct` identity is keyed on the Python module
+/// path alone (`descr.py:105 cache[STRUCT]`).  Pyre's `module_path!()`
+/// macro produces the full `crate::module::sub::...` form, whereas the
+/// analyzer-side `module_path_from_source_file` (and the hard-coded
+/// `build_object_descr_group_with_def_path` def-paths) strip the crate
+/// segment.  Stripping the crate here aligns the macro-emitted
+/// `__majit_type_id()` with both, giving a single `path_hash` namespace
+/// across analyzer / hard-coded runtime publish / generic `#[jit_struct]`
+/// runtime publish.
+///
+/// `module_path` empty or single-segment (no `::`) → hash the struct
+/// name alone (the segment IS the crate root; nothing to strip).
+pub fn path_hash_stripped_crate(module_path: &str, struct_name: &str) -> u64 {
+    let stripped_module = match module_path.split_once("::") {
+        Some((_crate, rest)) => rest,
+        None => "",
+    };
+    if stripped_module.is_empty() {
+        path_hash(struct_name)
+    } else {
+        path_hash(&format!("{}::{}", stripped_module, struct_name))
+    }
+}
+
 /// Use-import resolver / module-aware canonicalisation table.
 ///
 /// Maps `bare_struct_name → defining_module_path` as discovered by
@@ -485,6 +511,7 @@ impl GcCache {
         field_size: usize,
         field_type: Type,
         is_immutable: bool,
+        is_quasi_immutable: bool,
         flag: ArrayFlag,
         index_in_parent: usize,
     ) -> Arc<SimpleFieldDescr> {
@@ -514,6 +541,14 @@ impl GcCache {
         );
         // descr.py:228: index_in_parent (from heaptracker)
         fd.index_in_parent = index_in_parent;
+        // descr.py:229 `is_quasi_immutable = '%s?' in STRUCT._hints.get(
+        // '_immutable_fields_', ())` parity.  The analyzer side reads
+        // `#[jit_immutable_fields(..., "field?", ...)]` via
+        // `ImmutableRank::is_quasi_immutable` and threads the boolean
+        // through here so `jtransform.rewrite_op_getfield` emits the
+        // `record_quasiimmut_field` guard before the pure read
+        // (`jtransform.py:895-903`).
+        fd = fd.with_quasi_immutable(is_quasi_immutable);
         // descr.py:238: fielddescr.parent_descr = get_size_descr(gccache, STRUCT, vtable)
         if let Some(ref p) = parent {
             fd.parent_descr = Some(Arc::downgrade(p));

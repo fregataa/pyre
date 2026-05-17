@@ -458,6 +458,34 @@ fn analyze_pipeline_from_parsed(
     // `all_interiorfielddescrs` (the layout-provider path already carries
     // `is_immutable` on `StructFieldLayout`).
     call_control.immutable_fields_by_struct = program.immutable_fields.clone();
+    // `descr.py:364 ARRAY_INSIDE._immutable_field(None)` parity.
+    // Summarise `field[*]` annotations into the array-type-keyed set so
+    // `arraydescrof_concrete` can fold field-level immutability into the
+    // shared per-ARRAY descr's `is_pure` flag.
+    call_control.recompute_immutable_array_types();
+    // Thread per-source-file `parsed.module_path` + `use_imports`
+    // into CallControl as data carriers (orthodox PyPy
+    // `bookkeeper.position` + `frame.f_globals` lexical-resolution
+    // entry points, see [[orthodox-6item-2026-05-17]] item 2.3/2.4).
+    // Today's consumers normalise at the runtime path_hash boundary
+    // via `STRUCT_ORIGIN_REGISTRY` + `canonical_struct_name`; the
+    // carriers here let a future per-graph lexical resolver land
+    // without re-plumbing the parsed-source ingress.
+    call_control.parsed_module_paths = parsed_files.iter().map(|p| p.module_path.clone()).collect();
+    // `use_imports` aggregated across all parsed files —
+    // `parse::collect_use_imports` populates per-file map at
+    // `parse_source_with_module`; here we re-collect from the
+    // `ParsedInterpreter` slice the analyzer entry received.
+    let mut use_imports_agg: std::collections::HashMap<(String, String), String> =
+        std::collections::HashMap::new();
+    for parsed in parsed_files {
+        for (alias, full) in &parsed.use_imports {
+            use_imports_agg
+                .entry((parsed.module_path.clone(), alias.clone()))
+                .or_insert_with(|| full.clone());
+        }
+    }
+    call_control.use_imports = use_imports_agg;
     // Populate CallControl with layouts from the provider.
     for struct_name in program.struct_fields.fields.keys() {
         if let Some(layout) = provider.get_struct_layout(struct_name) {

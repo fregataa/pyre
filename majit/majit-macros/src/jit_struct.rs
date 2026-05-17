@@ -68,6 +68,7 @@ pub(crate) fn expand(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 ::std::mem::size_of::<#fty>(),
                 #ir_type_tok,
                 false,
+                false,
                 #flag_tok,
                 #idx,
             );
@@ -83,18 +84,20 @@ pub(crate) fn expand(_attr: TokenStream, item: TokenStream) -> TokenStream {
             /// Deterministic within a process; not stable across builds.
             /// Analogue of RPython's `lltype.Struct` Python-object identity.
             ///
-            /// Implementation: path-stable `path_hash(module_path::StructName)`
-            /// so analyzer-time and runtime mint sites can both compute the
-            /// same `LLType::Struct(_)` key without sharing a `TypeId::of`
-            /// runtime symbol — the codewriter's `cc.fielddescrof` can
-            /// resolve the same `gc_cache._cache_field` entry the
-            /// `__majit_register_descrs` runtime call populates. (Task #316.)
+            /// Implementation: `path_hash_stripped_crate` drops the
+            /// leading `<crate>::` segment from `module_path!()` before
+            /// hashing so analyzer-time / build.rs (`module_path_from_
+            /// source_file`) / hard-coded `build_object_descr_group_with_
+            /// def_path` def-paths and the macro-emitted runtime
+            /// registration share a single `path_hash` namespace.  PyPy
+            /// has no crate boundary in its `lltype.Struct` identity
+            /// (`descr.py:105 cache[STRUCT]`); the strip aligns pyre
+            /// with that convention.
             pub fn __majit_type_id() -> u64 {
-                ::majit_ir::descr::path_hash(concat!(
+                ::majit_ir::descr::path_hash_stripped_crate(
                     module_path!(),
-                    "::",
                     stringify!(#struct_name),
-                ))
+                )
             }
 
             /// Field names declared at macro-expansion time, in declaration order.

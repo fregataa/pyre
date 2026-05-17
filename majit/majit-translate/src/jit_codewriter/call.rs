@@ -625,6 +625,42 @@ pub struct CallControl {
     /// `rank` on `StructFieldLayout`).  Rank encoding follows
     /// `rpython/rtyper/rclass.py:644-678 _parse_field_list`.
     pub immutable_fields_by_struct: HashMap<String, Vec<(String, crate::model::ImmutableRank)>>,
+    /// `descr.py:364 is_pure = ARRAY_INSIDE._immutable_field(None)` parity.
+    /// Pre-computed at `set_struct_fields` time by walking
+    /// `immutable_fields_by_struct` for fields with `ImmutableRank::is_array()
+    /// && is_immutable()` (i.e. the `field[*]` syntax) and recording the
+    /// field's type string.  `arraydescrof_concrete` consults this set
+    /// when minting an `ArrayDescr` so the `is_pure` flag propagates from
+    /// the field-level annotation to the array-level descr — matching
+    /// `lltype.Array(_immutable=True)` semantics where the array TYPE
+    /// itself carries the immutability.  Pyre annotates per-field; the
+    /// summary collapses field-level marks to type-level lookup keys.
+    pub immutable_array_types: HashSet<String>,
+    /// Per-source-file module path collected from
+    /// `ParsedInterpreter.module_path` (`parse.rs:parse_source_with_module`).
+    /// Indexed by file order at `analyze_pipeline_from_parsed` invocation
+    /// time.  Each entry is the crate-stripped module path
+    /// (`build.rs::module_path_from_source_file`).
+    ///
+    /// PyPy bookkeeper resolves names lexically per source-file scope
+    /// (`bookkeeper.getdesc(value)` + `annrpython.Bookkeeper.position`).
+    /// Pyre's analyzer currently routes the canonicalisation through
+    /// the process-global `STRUCT_ORIGIN_REGISTRY` + `canonical_struct_name`
+    /// (`majit-ir/src/descr.rs:148-225`); this carrier records the
+    /// per-file module path so a future per-graph lexical resolver
+    /// (orthodox PyPy `getdesc` parity, see
+    /// [[orthodox-6item-2026-05-17]]) can consume it.
+    pub parsed_module_paths: Vec<String>,
+    /// Per-source-file `use` import map collected from
+    /// `ParsedInterpreter.use_imports` (`parse.rs::collect_use_imports`).
+    /// Keyed on `(source_module_path, alias)` → `fully_qualified_path`.
+    /// Mirrors PyPy bookkeeper's lexical/import-scope name resolution
+    /// (`annrpython.Bookkeeper.getdesc` + `frame.f_globals` lookups);
+    /// pyre's `qualify_type_name` does not yet consult this table,
+    /// awaiting the per-FunctionGraph use_imports carrier outlined in
+    /// [[orthodox-6item-2026-05-17]].  Populated here as the data
+    /// carrier so the future resolver lands without re-plumbing.
+    pub use_imports: HashMap<(String, String), String>,
 }
 
 /// Heuristic struct layout — NOT equivalent to RPython's `symbolic.get_field_token()`.
@@ -937,6 +973,29 @@ impl CallControl {
             oopspec_targets: HashMap::new(),
             oopspec_argnames: HashMap::new(),
             immutable_fields_by_struct: HashMap::new(),
+            immutable_array_types: HashSet::new(),
+            parsed_module_paths: Vec::new(),
+            use_imports: HashMap::new(),
+        }
+    }
+
+    /// Recompute `immutable_array_types` from
+    /// `immutable_fields_by_struct` + `struct_fields`.  Walks every
+    /// `(struct_name, field_name, rank)` triple, and when `rank` is an
+    /// `ImmutableArray` (or `QuasiImmutableArray` for the future quasi-
+    /// array path), records the field's type string into the set.
+    /// Called after both `immutable_fields_by_struct` and `struct_fields`
+    /// have been populated (`lib.rs::analyze_pipeline_from_parsed`).
+    pub fn recompute_immutable_array_types(&mut self) {
+        self.immutable_array_types.clear();
+        for (struct_name, fields) in self.immutable_fields_by_struct.iter() {
+            for (field_name, rank) in fields {
+                if rank.is_array() && rank.is_immutable() {
+                    if let Some(field_ty) = self.struct_fields.field_type(struct_name, field_name) {
+                        self.immutable_array_types.insert(field_ty.to_string());
+                    }
+                }
+            }
         }
     }
 
@@ -1146,6 +1205,15 @@ impl CallControl {
                 // stamped at descr.rs:526-528 inside `get_array_descr`),
                 // kept fully separate from `type_id` per the trait doc
                 // at descr.rs:2120-2131.
+                // `descr.py:364 is_pure = ARRAY_INSIDE._immutable_field(None)`
+                // parity: consult the array-type-keyed
+                // `immutable_array_types` set populated from `field[*]`
+                // annotations.  Field-level immutability collapses onto the
+                // array-type identity here so the shared per-ARRAY descr's
+                // `is_pure` propagates without per-call owner threading.
+                let is_pure = array_type_id
+                    .as_deref()
+                    .is_some_and(|aid| self.immutable_array_types.contains(aid));
                 let cached: majit_ir::descr::DescrRef =
                     majit_ir::descr::gc_cache().lock().unwrap().get_array_descr(
                         majit_ir::descr::LLType::Array(path_hash_u64),
@@ -1155,7 +1223,7 @@ impl CallControl {
                         ir_type,
                         nolength,
                         length_offset,
-                        false,  // is_pure (pyre lacks immutable-array surface)
+                        is_pure,
                         '\x00', // concrete_type (descr.py:366-370 Float-only marker)
                     );
                 let ad_arc: std::sync::Arc<dyn majit_ir::descr::ArrayDescr> =
@@ -1351,11 +1419,17 @@ impl CallControl {
                 // is the sole writer of this slot (the macro path
                 // discards the return).
                 //
-                // is_immutable=false: pyre's analyzer has no
-                // immutability annotation surface today; the
-                // conservative `false` keeps the optimizer from
-                // elision-folding stores. Upstream reads from
-                // `STRUCT._immutable_field(fieldname)` (`descr.py:229`).
+                // `descr.py:229 is_immutable = STRUCT._immutable_field(
+                // fieldname)` parity: consult
+                // `self.immutable_fields_by_struct` populated from
+                // `#[jit_immutable_fields("name", "name?", "name[*]", ...)]`
+                // attributes (`collect_immutable_field_attrs`,
+                // `front/ast.rs:437`).  `ImmutableRank::Immutable` and
+                // `ImmutableRank::ImmutableArray` map to plain
+                // `is_immutable=true`; `QuasiImmutable*` ranks map to
+                // `is_quasi_immutable=true` (the `record_quasiimmut_field`
+                // path `jtransform.py:895-903`).  Missing entry retains
+                // the mutable default.
                 // `descr.py:108-118 cache[STRUCT]` 단일 identity 와
                 // 정렬: 분석기측 `owner_root` 가 use-site 모듈 qualifier
                 // (`qualify_type_name(type_root, ctx.module_prefix)`,
@@ -1417,8 +1491,20 @@ impl CallControl {
                 // the cached SizeDescr (which may be a PyreSizeDescr
                 // if the runtime published the parent but not this
                 // field, or a SimpleSizeDescr from line above).
+                // `descr.py:229 STRUCT._immutable_field(fieldname)` parity.
+                let rank = self.field_immutability(Some(owner_root), field_name);
+                let is_immutable = rank.map(|r| r.is_immutable()).unwrap_or(false);
+                let is_quasi_immutable = rank.map(|r| r.is_quasi_immutable()).unwrap_or(false);
                 let descr = majit_ir::descr::gc_cache().lock().unwrap().get_field_descr(
-                    struct_key, field_name, offset, field_size, ir_type, false, flag, field_pos,
+                    struct_key,
+                    field_name,
+                    offset,
+                    field_size,
+                    ir_type,
+                    is_immutable,
+                    is_quasi_immutable,
+                    flag,
+                    field_pos,
                 );
                 descr.set_index(idx);
                 return Some(descr as majit_ir::descr::DescrRef);
@@ -1531,9 +1617,20 @@ impl CallControl {
                 if found.is_none() {
                     // No runtime publish for this `(STRUCT, fieldname)` —
                     // analyzer-only mint.
+                    let rank = self.field_immutability(Some(&elem_name), field_name);
+                    let is_immutable = rank.map(|r| r.is_immutable()).unwrap_or(false);
+                    let is_quasi_immutable = rank.map(|r| r.is_quasi_immutable()).unwrap_or(false);
                     let mut gc = majit_ir::descr::gc_cache().lock().unwrap();
                     let mint = gc.get_field_descr(
-                        struct_key, field_name, offset, field_size, ir_type, false, flag, field_pos,
+                        struct_key,
+                        field_name,
+                        offset,
+                        field_size,
+                        ir_type,
+                        is_immutable,
+                        is_quasi_immutable,
+                        flag,
+                        field_pos,
                     );
                     found = Some(mint as std::sync::Arc<dyn majit_ir::descr::FieldDescr>);
                 }
@@ -5200,7 +5297,7 @@ fn all_interiorfielddescrs(
         let mut result = Vec::new();
         for (
             index_in_parent,
-            (name, offset, field_size, field_type, is_immutable, flag, _is_quasi_immutable),
+            (name, offset, field_size, field_type, is_immutable, flag, is_quasi_immutable),
         ) in entries.iter().enumerate()
         {
             // `descr.py:435 fielddescr = get_field_descr(gc_ll_descr,
@@ -5240,6 +5337,7 @@ fn all_interiorfielddescrs(
                         *field_size,
                         *field_type,
                         *is_immutable,
+                        *is_quasi_immutable,
                         *flag,
                         index_in_parent,
                     )
@@ -5337,7 +5435,7 @@ fn all_interiorfielddescrs(
     let mut result = Vec::new();
     for (
         index_in_parent,
-        (name, fld_offset, field_size, field_type, is_immutable, _is_quasi_immutable, flag),
+        (name, fld_offset, field_size, field_type, is_immutable, is_quasi_immutable, flag),
     ) in entries.iter().enumerate()
     {
         // `descr.py:435` field-walk convergence — same rationale as the
@@ -5369,6 +5467,7 @@ fn all_interiorfielddescrs(
                     *field_size,
                     *field_type,
                     *is_immutable,
+                    *is_quasi_immutable,
                     *flag,
                     index_in_parent,
                 )
