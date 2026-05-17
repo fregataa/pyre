@@ -2615,54 +2615,39 @@ impl OptContext {
             }
         }
 
-        // Phase 3: generate guards — `alloc` dispatches `GuardOpAlloc`
-        // (intutils.rs). `Const(Value)` reserves a constant pool entry
-        // (RPython `ConstInt` / `ConstPtr`); `IntResult` materializes a
-        // fresh Int OpRef for an intermediate op's producer identity
-        // (intutils.py:1275, info.py:381/637, vstring.py:124).
-        use crate::optimizeopt::intutils::GuardOpAlloc;
+        // Phase 3: generate guards — `make_guards` takes `&mut self`
+        // directly. Constants seed via reserve_const_ref + seed_constant
+        // (mirroring `ConstInt` / `ConstPtr` inline construction); producer
+        // OpRefs come from `alloc_op_position_typed`.
         let mut arg_guards = Vec::new();
-        let mut alloc = |req: GuardOpAlloc| -> OpRef {
-            match req {
-                GuardOpAlloc::Const(value) => {
-                    let pos = self.reserve_const_ref(value.get_type());
-                    self.seed_constant(pos, value);
-                    pos
-                }
-                GuardOpAlloc::IntResult => self.alloc_op_position_typed(majit_ir::Type::Int),
-            }
-        };
         // info.py:861 FloatConstInfo.make_guards / ConstPtrInfo path —
         // single-value info classes emit a GUARD_VALUE that pins `op` to
         // the recorded constant.
-        let emit_const_guard =
-            |arg: OpRef,
-             value: &Value,
-             guards: &mut Vec<Op>,
-             alloc: &mut dyn FnMut(GuardOpAlloc) -> OpRef| {
-                let c = alloc(GuardOpAlloc::Const(value.clone()));
-                guards.push(Op::new(OpCode::GuardValue, &[arg, c]));
+        let emit_const_guard = |arg: OpRef, value: &Value, guards: &mut Vec<Op>, ctx: &mut Self| {
+            let c = {
+                let pos = ctx.reserve_const_ref(value.get_type());
+                ctx.seed_constant(pos, value.clone());
+                pos
             };
+            guards.push(Op::new(OpCode::GuardValue, &[arg, c]));
+        };
         for entry in &arg_entries {
             match &entry.info {
-                ForwardedInfo::Ptr(p) => p.make_guards(entry.arg, &mut arg_guards, &mut alloc),
-                ForwardedInfo::Int(b) => b.make_guards(entry.arg, &mut arg_guards, &mut alloc),
+                ForwardedInfo::Ptr(p) => p.make_guards(entry.arg, &mut arg_guards, self),
+                ForwardedInfo::Int(b) => b.make_guards(entry.arg, &mut arg_guards, self),
                 ForwardedInfo::FloatConst(f) => {
-                    emit_const_guard(entry.arg, &Value::Float(*f), &mut arg_guards, &mut alloc)
+                    emit_const_guard(entry.arg, &Value::Float(*f), &mut arg_guards, self)
                 }
             }
         }
         let mut result_guards = Vec::new();
         if let Some((result_ref, info)) = &result_info {
             match info {
-                ForwardedInfo::Ptr(p) => p.make_guards(*result_ref, &mut result_guards, &mut alloc),
-                ForwardedInfo::Int(b) => b.make_guards(*result_ref, &mut result_guards, &mut alloc),
-                ForwardedInfo::FloatConst(f) => emit_const_guard(
-                    *result_ref,
-                    &Value::Float(*f),
-                    &mut result_guards,
-                    &mut alloc,
-                ),
+                ForwardedInfo::Ptr(p) => p.make_guards(*result_ref, &mut result_guards, self),
+                ForwardedInfo::Int(b) => b.make_guards(*result_ref, &mut result_guards, self),
+                ForwardedInfo::FloatConst(f) => {
+                    emit_const_guard(*result_ref, &Value::Float(*f), &mut result_guards, self)
+                }
             }
         }
         (arg_guards, result_guards)
@@ -6316,6 +6301,26 @@ impl OptContext {
             return;
         }
         resolved.set_forwarded_info(OpInfo::ptr(info));
+    }
+
+    /// OpRef-direct variant of [`Self::set_ptr_info`] that mirrors RPython's
+    /// `op.set_forwarded(info)` callsite shape — the caller has an OpRef,
+    /// the storage walk is internal. RPython's box.set_forwarded is invoked
+    /// on the box itself: pyre's `OpRef` is value-typed (`Copy` u32 enum),
+    /// so the per-box mutable slot lives in `box_pool[idx]` and is reached
+    /// via `ensure_box`. This wrapper hides the BoxRef obtain step at every
+    /// callsite that doesn't have an unrelated reason to hold a BoxRef
+    /// (write-only ptr_info update).
+    ///
+    /// Constants (OpRef::ConstInt/ConstFloat/ConstPtr) and `OpRef::None`
+    /// silently no-op, matching upstream `Const.set_forwarded` assert.
+    pub fn set_ptr_info_for(&mut self, opref: OpRef, info: PtrInfo) {
+        if opref.is_none() || opref.is_constant() {
+            return;
+        }
+        if let Some(b) = self.ensure_box(opref) {
+            self.set_ptr_info(&b, info);
+        }
     }
 
     /// Lazy-allocate a `BoxRef::new_resop(Type::Void, idx)` placeholder at

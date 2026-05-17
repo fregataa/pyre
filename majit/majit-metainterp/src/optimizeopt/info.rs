@@ -5,7 +5,7 @@ pub use crate::optimizeopt::rawbuffer::{RawBuffer, RawBufferError};
 /// Translated from rpython/jit/metainterp/optimizeopt/info.py.
 /// Each operation can have associated analysis info (e.g., known integer bounds,
 /// pointer info, virtual object state).
-use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Value};
+use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Type, Value};
 
 fn lookup_field_descr(field_descrs: &[DescrRef], field_idx: u32) -> Option<DescrRef> {
     field_descrs.get(field_idx as usize).cloned()
@@ -895,17 +895,21 @@ impl PtrInfo {
     ///
     /// Append guard operations to `short` that check this PtrInfo's
     /// properties hold for `op`. Used by use_box (shortpreamble.py:382).
-    /// `alloc` is the shared `GuardOpAlloc` dispatcher (intutils.rs):
-    /// `Const(Value)` reserves a constant pool entry (RPython
-    /// `ConstInt(value)` / `ConstPtr(value)`); `IntResult` allocates a
-    /// fresh Int OpRef for an intermediate op's producer identity.
+    /// `ctx` plays the role of `optimizer` in the upstream signature:
+    /// constant-pool allocation goes through `reserve_const_ref` +
+    /// `seed_constant`, and producer-result identity through
+    /// `alloc_op_position_typed`.
     pub fn make_guards(
         &self,
         op: OpRef,
         short: &mut Vec<Op>,
-        alloc: &mut impl FnMut(crate::optimizeopt::intutils::GuardOpAlloc) -> OpRef,
+        ctx: &mut crate::optimizeopt::OptContext,
     ) {
-        use crate::optimizeopt::intutils::GuardOpAlloc;
+        let mut alloc_const = |ctx: &mut crate::optimizeopt::OptContext, value: Value| {
+            let pos = ctx.reserve_const_ref(value.get_type());
+            ctx.seed_constant(pos, value);
+            pos
+        };
         match self {
             // info.py:83-84: PtrInfo base — no-op
             PtrInfo::NonNull { .. } => {
@@ -913,25 +917,43 @@ impl PtrInfo {
                 short.push(Op::new(OpCode::GuardNonnull, &[op]));
             }
             PtrInfo::Instance(info) => {
-                // info.py:336-353: InstancePtrInfo.make_guards
+                // info.py:336-353 InstancePtrInfo.make_guards.
+                //
+                // Upstream branches on `optimizer.cpu.remove_gctypeptr`:
+                //   True  (rclass typeptr removed; typeid via gctypelayout)
+                //     known_class: GUARD_NONNULL_CLASS
+                //     descr-only:  GUARD_NONNULL + GUARD_SUBCLASS
+                //   False (typeptr retained at obj[0]):
+                //     known_class: GUARD_NONNULL + GUARD_IS_OBJECT + GUARD_CLASS
+                //     descr-only:  GUARD_NONNULL + GUARD_IS_OBJECT + GUARD_SUBCLASS
+                //
+                // Pyre's PyObject keeps `ob_type` at offset 0 (pyobject.rs:50)
+                // AND uses a separate GC header for typeid; many PyObjects
+                // (INSTANCE_TYPE, INT_TYPE, …) are static singletons with no
+                // GC header. The False-branch's GUARD_IS_OBJECT reads
+                // `obj - GcHeader::SIZE` (codegen.rs:797-802); applying it
+                // to a static PyObject SIGBUSes. Pyre therefore behaves as
+                // if `remove_gctypeptr=True` for the optimizer's guard
+                // generation, deferring the False-branch port until the GC
+                // layout migration retires static PyObjects (epic tracked
+                // separately, alongside heap-only object lifecycle).
                 if let Some(cls) = &info.known_class {
-                    // remove_gctypeptr branch
-                    let class_ref = alloc(GuardOpAlloc::Const(Value::Ref(*cls)));
+                    // info.py:344-345 True branch: GUARD_NONNULL_CLASS
+                    let class_ref = alloc_const(ctx, Value::Ref(*cls));
                     short.push(Op::new(OpCode::GuardNonnullClass, &[op, class_ref]));
                 } else if let Some(descr) = &info.descr {
-                    // info.py:346-351: descr-only branch.
-                    //   short.append(GUARD_NONNULL[op])
-                    //   short.append(GUARD_SUBCLASS[op, ConstInt(descr.get_vtable())])
-                    short.push(Op::new(OpCode::GuardNonnull, &[op]));
+                    // info.py:347 + :350 True branch: GUARD_NONNULL +
+                    // GUARD_SUBCLASS[op, ConstInt(descr.get_vtable())].
                     let vtable = descr
                         .as_size_descr()
                         .map(|sd| sd.vtable() as i64)
                         .unwrap_or(0);
-                    let vtable_const = alloc(GuardOpAlloc::Const(Value::Int(vtable)));
+                    let vtable_const = alloc_const(ctx, Value::Int(vtable));
+                    short.push(Op::new(OpCode::GuardNonnull, &[op]));
                     short.push(Op::new(OpCode::GuardSubclass, &[op, vtable_const]));
                 } else {
-                    // info.py:353: fall back to AbstractStructPtrInfo →
-                    // NonNullPtrInfo.make_guards (just GUARD_NONNULL).
+                    // info.py:353 fall-through with neither class nor
+                    // descr — base NonNullPtrInfo.make_guards.
                     short.push(Op::new(OpCode::GuardNonnull, &[op]));
                 }
             }
@@ -946,13 +968,13 @@ impl PtrInfo {
                     .as_size_descr()
                     .map(|sd| sd.type_id() as i64)
                     .unwrap_or(0);
-                let type_id_const = alloc(GuardOpAlloc::Const(Value::Int(type_id)));
+                let type_id_const = alloc_const(ctx, Value::Int(type_id));
                 short.push(Op::new(OpCode::GuardNonnull, &[op]));
                 short.push(Op::new(OpCode::GuardGcType, &[op, type_id_const]));
             }
             PtrInfo::Constant(gcref) => {
                 // info.py:715-716: ConstPtrInfo.make_guards
-                let c = alloc(GuardOpAlloc::Const(Value::Ref(*gcref)));
+                let c = alloc_const(ctx, Value::Ref(*gcref));
                 short.push(Op::new(OpCode::GuardValue, &[op, c]));
             }
             PtrInfo::Array(info) => {
@@ -969,7 +991,7 @@ impl PtrInfo {
                     .as_array_descr()
                     .map(|ad| ad.type_id() as i64)
                     .unwrap_or(0);
-                let type_id_const = alloc(GuardOpAlloc::Const(Value::Int(type_id)));
+                let type_id_const = alloc_const(ctx, Value::Int(type_id));
                 short.push(Op::new(OpCode::GuardGcType, &[op, type_id_const]));
                 // Always emit ARRAYLEN_GC + bound guards: pyre's
                 // ArrayPtrInfo.lenbound is a plain `IntBound`, not an
@@ -983,10 +1005,10 @@ impl PtrInfo {
                     // identity. Allocate a fresh Int OpRef on `lenop.pos`
                     // so the chained INT_GE/INT_LE/INT_AND check against
                     // the producer result, not the sentinel `OpRef::NONE`.
-                    lenop.pos = alloc(GuardOpAlloc::IntResult);
+                    lenop.pos = ctx.alloc_op_position_typed(Type::Int);
                     let lenop_pos = lenop.pos;
                     short.push(lenop);
-                    info.lenbound.make_guards(lenop_pos, short, alloc);
+                    info.lenbound.make_guards(lenop_pos, short, ctx);
                 }
             }
             // info.py:379-384 `AbstractRawPtrInfo.make_guards`:
@@ -1005,11 +1027,11 @@ impl PtrInfo {
             // Both `RawBufferPtrInfo` (info.py:386) and
             // `RawSlicePtrInfo` (info.py:459) inherit this override.
             PtrInfo::VirtualRawBuffer(_) | PtrInfo::VirtualRawSlice(_) => {
-                let zero = alloc(GuardOpAlloc::Const(Value::Int(0)));
+                let zero = alloc_const(ctx, Value::Int(0));
                 let mut eq_op = Op::new(OpCode::IntEq, &[op, zero]);
                 // info.py:381 `op = ResOperation(INT_EQ, [...])` then
                 // `[op]` — INT_EQ result identity for GUARD_FALSE.
-                eq_op.pos = alloc(GuardOpAlloc::IntResult);
+                eq_op.pos = ctx.alloc_op_position_typed(Type::Int);
                 let eq_pos = eq_op.pos;
                 short.push(eq_op);
                 short.push(Op::new(OpCode::GuardFalse, &[eq_pos]));
@@ -1028,13 +1050,13 @@ impl PtrInfo {
                         // vstring.py:124 `lenop = ResOperation(STRLEN, [op])`
                         // is consumed by `bound.make_guards(lenop, ...)`.
                         // Materialize the producer result before the chain.
-                        lenop.pos = alloc(GuardOpAlloc::IntResult);
+                        lenop.pos = ctx.alloc_op_position_typed(Type::Int);
                         let lenop_pos = lenop.pos;
                         short.push(lenop);
                         // intutils.py:1264-1289 IntBound.make_guards: emits the
                         // chained INT_GE/INT_LE/INT_AND → GUARD_TRUE/GUARD_VALUE
                         // pairs against `lenop_pos`.
-                        bound.make_guards(lenop_pos, short, alloc);
+                        bound.make_guards(lenop_pos, short, ctx);
                     }
                 }
             }
@@ -1423,9 +1445,7 @@ impl PtrInfo {
                         // invariant) and never silently drops the write.
                         let const_ref = GcRef(ptr.0);
                         ctx.make_constant(opref, Value::Ref(const_ref));
-                        if let Some(b) = ctx.ensure_box(opref) {
-                            ctx.set_ptr_info(&b, PtrInfo::Constant(const_ref));
-                        }
+                        ctx.set_ptr_info_for(opref, PtrInfo::Constant(const_ref));
                         return opref;
                     }
                 }
@@ -1535,11 +1555,11 @@ impl PtrInfo {
             PtrInfo::VirtualArray(vinfo) => {
                 // info.py:540-558 ArrayPtrInfo._force_elements
                 // RPython `op.set_forwarded(self)` (post-force) is
-                // unconditional; route through `ensure_box`.
+                // unconditional. `set_ptr_info_for` lazy-allocates the
+                // backing BoxRef via `ensure_box`, matching upstream's
+                // implicit "every Box exists" invariant.
                 let len = vinfo.items.len();
-                if let Some(b) = ctx.ensure_box(opref) {
-                    ctx.set_ptr_info(&b, PtrInfo::nonnull());
-                }
+                ctx.set_ptr_info_for(opref, PtrInfo::nonnull());
 
                 let len_ref = ctx.emit_constant_int(len as i64);
                 let alloc_opcode = if vinfo.clear {
@@ -1591,11 +1611,10 @@ impl PtrInfo {
                 // created with clear=True, so the original op is always
                 // NEW_ARRAY_CLEAR.
                 // RPython `op.set_forwarded(self)` (post-force) is
-                // unconditional; route through `ensure_box`.
+                // unconditional; set_ptr_info_for lazy-allocates the
+                // BoxRef.
                 let num_elements = vinfo.element_fields.len();
-                if let Some(b) = ctx.ensure_box(opref) {
-                    ctx.set_ptr_info(&b, PtrInfo::nonnull());
-                }
+                ctx.set_ptr_info_for(opref, PtrInfo::nonnull());
 
                 let len_ref = ctx.emit_constant_int(num_elements as i64);
                 let mut alloc_op = Op::new(OpCode::NewArrayClear, &[len_ref]);

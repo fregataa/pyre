@@ -24,6 +24,7 @@ use std::collections::HashMap;
 use std::ops::Deref;
 use std::rc::Rc;
 
+use majit_ir::descr::descr_identity;
 use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Type, Value};
 
 /// virtualstate.py: VirtualStatesCantMatch — raised when two virtual states
@@ -1263,14 +1264,36 @@ impl VirtualState {
     /// namespace.
     ///
     /// `runtime_box`: when Some, non-permanent guard emission is possible.
-    /// When None (generalization_of path, or nested call from a virtual
-    /// parent), only structurally compatible pairs are accepted. RPython
-    /// uses the concrete runtime value as an "educated guess"
-    /// (virtualstate.py:551-555); pyre does not have a CPU at trace time,
-    /// so `get_runtime_field` / `get_runtime_item` (virtualstate.py:39-67)
-    /// degenerate to `None` for nested recursion — RPython's
-    /// `runtime_box is not None` gate at :493/:601 then suppresses
-    /// nested guard emission the same way.
+    /// When None (generalization_of path, or no runtime guidance), only
+    /// structurally compatible pairs are accepted. RPython uses the
+    /// concrete runtime value as an "educated guess" (virtualstate.py:551-555).
+    ///
+    /// For nested struct/array recursion (virtualstate.py:148-176/241-261/292-326)
+    /// pyre threads the inner `fieldbox`/`fieldbox_runtime` through:
+    /// `get_known_class(opref)` (mod.rs:5174) reads optimizer-tracked
+    /// PtrInfo, so the parent's `info.fields[descr_idx]` / `info.items[i]`
+    /// OpRef serves as both `box` and `runtime_box`.
+    ///
+    /// **PRE-EXISTING-ADAPTATION** (not a pure port): RPython's
+    /// `GenerateGuardState.get_runtime_field` / `get_runtime_item` /
+    /// `get_runtime_interiorfield` (virtualstate.py:39-67) call
+    /// `cpu.bh_getfield_gc_*` / `bh_getarrayitem_gc_*` /
+    /// `bh_getinteriorfield_gc_*` to read the *concrete* value off the
+    /// runtime object and wrap it in a fresh `InputArg*`. pyre has no
+    /// equivalent concrete-read hook at virtualstate-match time
+    /// (`Cpu::bh_getfield_gc_*` exists on the backend trait but is not
+    /// plumbed through `OptContext`), so the inner OpRef is reused as a
+    /// proxy. Nested guard emission is therefore gated on the optimizer
+    /// having already recorded PtrInfo for the inner OpRef, not on a
+    /// concrete heap read — equivalent only when a SETFIELD/GETFIELD
+    /// already populated `info.fields`/`info.items`. NONE-placeholder
+    /// slots (`info.rs:755`) propagate as `runtime_box=None` so the
+    /// `runtime_box.is_some()` gates on NonNull / IntBounded arms
+    /// (:1474, :1500) reject the case, matching RPython's
+    /// `if fieldbox is None` skip at virtualstate.py:174.
+    ///
+    /// See `peek_parent_field_oprefs` and the per-variant
+    /// Virtual/VStruct/VArray/VArrayStruct match arms.
     ///
     /// `force_boxes`: when true, Virtual incoming can be accepted by
     /// non-virtual targets (virtualstate.py:523-524 _generate_virtual_guards).
@@ -1405,48 +1428,72 @@ impl VirtualState {
             }
 
             // ── KnownClass target ── (virtualstate.py:595-624)
+            //
+            // Three sub-branches with distinct opcodes per upstream:
+            // - LEVEL_UNKNOWN (:600-606) → GUARD_NONNULL_CLASS
+            // - LEVEL_NONNULL (:607-613) → GUARD_CLASS
+            // - LEVEL_KNOWNCLASS (:614-617) → no guard, identity check
+            // - LEVEL_CONSTANT (:618-624) → no guard, static cls_of_box check
+            //
+            // Every "with runtime guard" branch additionally requires
+            // `self.known_class.same_constant(cpu.cls_of_box(runtime_box))`
+            // (:601-602, :608-609, :620-621). pyre's `ctx.get_known_class`
+            // is the cls_of_box equivalent (mod.rs:5280): for Ref
+            // constants it reads typeptr at offset 0 via
+            // PtrInfo::get_known_class (info.rs:824-851). Without that
+            // match, RPython raises VirtualStatesCantMatch — pyre maps
+            // that to Err(()).
             (
                 VirtualStateInfo::KnownClass { class_ptr: c1 },
                 VirtualStateInfo::KnownClass { class_ptr: c2 },
             ) if c1 == c2 => Ok(()),
             (VirtualStateInfo::KnownClass { class_ptr }, VirtualStateInfo::Unknown(_)) => {
-                // virtualstate.py:600-606: runtime_box gate
-                if runtime_box.is_some() {
-                    guards.push(GuardRequirement::GuardClass {
-                        arg_index: arg_idx,
-                        box_opref,
-                        expected_class: *class_ptr,
-                    });
-                    Ok(())
-                } else {
-                    Err(())
+                // virtualstate.py:600-606 LEVEL_UNKNOWN branch.
+                let Some(rb) = runtime_box else {
+                    return Err(());
+                };
+                let Some(runtime_cls) = ctx.get_known_class(rb) else {
+                    return Err(());
+                };
+                if &runtime_cls != class_ptr {
+                    return Err(());
                 }
+                guards.push(GuardRequirement::GuardNonnullClass {
+                    arg_index: arg_idx,
+                    box_opref,
+                    expected_class: *class_ptr,
+                });
+                Ok(())
             }
             (VirtualStateInfo::KnownClass { class_ptr }, VirtualStateInfo::NonNull) => {
-                // virtualstate.py:607-613: runtime_box gate
-                if runtime_box.is_some() {
-                    guards.push(GuardRequirement::GuardClass {
-                        arg_index: arg_idx,
-                        box_opref,
-                        expected_class: *class_ptr,
-                    });
-                    Ok(())
-                } else {
-                    Err(())
+                // virtualstate.py:607-613 LEVEL_NONNULL branch.
+                let Some(rb) = runtime_box else {
+                    return Err(());
+                };
+                let Some(runtime_cls) = ctx.get_known_class(rb) else {
+                    return Err(());
+                };
+                if &runtime_cls != class_ptr {
+                    return Err(());
                 }
+                guards.push(GuardRequirement::GuardClass {
+                    arg_index: arg_idx,
+                    box_opref,
+                    expected_class: *class_ptr,
+                });
+                Ok(())
             }
             (
                 VirtualStateInfo::KnownClass { class_ptr },
                 VirtualStateInfo::Constant(Value::Ref(r)),
             ) if !r.is_null() => {
-                // virtualstate.py:618-624: runtime_box needed to verify
-                // the constant's class matches. Without it, reject.
-                if runtime_box.is_some() {
-                    guards.push(GuardRequirement::GuardClass {
-                        arg_index: arg_idx,
-                        box_opref,
-                        expected_class: *class_ptr,
-                    });
+                // virtualstate.py:618-624 LEVEL_CONSTANT branch.
+                // Static check only — `cls_of_box(other.constbox)` against
+                // self.known_class. No guard emitted; pass-or-fail decides.
+                // The runtime_box gate at :601/:608 is absent here because
+                // the constant's class is statically known from `r` itself.
+                let const_cls = PtrInfo::Constant(*r).get_known_class();
+                if const_cls.as_ref() == Some(class_ptr) {
                     Ok(())
                 } else {
                     Err(())
@@ -1503,22 +1550,27 @@ impl VirtualState {
             // virtualstate.py:141-176 AbstractVirtualStructStateInfo._generate_guards
             // virtualstate.py:206-216 VirtualStateInfo._generalization_of_structpart
             //
-            // Structural prelude (descr / known_class / field count) then
-            // recurse into every paired fieldstate, threading `renum` so
-            // nested alias mismatches surface as virtualstate.py:84-94
-            // VirtualStatesCantMatch — not silently widened by a
-            // structural-only is_compatible.
+            // Structural prelude (descr / known_class / fielddescrs
+            // length / per-position fielddescrs identity) then recurse
+            // positionally over `fieldstate`. RPython at :155-160
+            // strictly compares `fielddescrs[i] is self.fielddescrs[i]`
+            // — same order, same identity — and uses
+            // `fielddescrs[i].get_index()` to look up `_fields`. pyre
+            // mirrors this via `field_descrs` (parent-local order) +
+            // positional pairing.
             (
                 VirtualStateInfo::Virtual {
                     descr: ed,
                     known_class: ekc,
                     fields: ef,
+                    field_descrs: efd,
                     ..
                 },
                 VirtualStateInfo::Virtual {
                     descr: id,
                     known_class: ikc,
                     fields: if_,
+                    field_descrs: ifd,
                     ..
                 },
             ) => {
@@ -1530,10 +1582,26 @@ impl VirtualState {
                     (Some(_), None) => return Err(()),
                     _ => {}
                 }
-                Self::generate_guards_recurse_named_fields(
+                // virtualstate.py:149-151: opinfo = getptrinfo(box) +
+                // assert opinfo.is_virtual() AND isinstance(opinfo,
+                // AbstractStructPtrInfo). pyre's Virtual variant carries
+                // the per-virtual-field OpRef vector at `info.fields`.
+                let parent_fields = Self::peek_parent_field_oprefs(
+                    ctx,
+                    box_opref,
+                    runtime_box,
+                    |info| match info {
+                        PtrInfo::Virtual(v) => Some(v.fields.clone()),
+                        _ => None,
+                    },
+                );
+                Self::generate_guards_recurse_positional_fields(
                     arg_idx,
+                    efd,
+                    ifd,
                     ef,
                     if_,
+                    parent_fields.as_deref(),
                     ctx,
                     force_boxes,
                     renum,
@@ -1547,21 +1615,38 @@ impl VirtualState {
                 VirtualStateInfo::VStruct {
                     descr: ed,
                     fields: ef,
-                    ..
+                    field_descrs: efd,
                 },
                 VirtualStateInfo::VStruct {
                     descr: id,
                     fields: if_,
-                    ..
+                    field_descrs: ifd,
                 },
             ) => {
                 if ed.index() != id.index() {
                     return Err(());
                 }
-                Self::generate_guards_recurse_named_fields(
+                // virtualstate.py:309-310 (VStructStateInfo path):
+                // `opinfo = getptrinfo(box)` + isinstance check, then read
+                // `opinfo._fields[descr.get_index()]` per field. pyre's
+                // VirtualStruct stores the per-virtual-field OpRef vector
+                // identically to Virtual.
+                let parent_fields = Self::peek_parent_field_oprefs(
+                    ctx,
+                    box_opref,
+                    runtime_box,
+                    |info| match info {
+                        PtrInfo::VirtualStruct(s) => Some(s.fields.clone()),
+                        _ => None,
+                    },
+                );
+                Self::generate_guards_recurse_positional_fields(
                     arg_idx,
+                    efd,
+                    ifd,
                     ef,
                     if_,
+                    parent_fields.as_deref(),
                     ctx,
                     force_boxes,
                     renum,
@@ -1586,13 +1671,46 @@ impl VirtualState {
                 if ed.index() != id.index() || ei.len() != ii.len() {
                     return Err(());
                 }
-                for (ec, ic) in ei.iter().zip(ii.iter()) {
+                // virtualstate.py:251-256: `opinfo = getptrinfo(box)`,
+                // `fieldbox = opinfo._items[i]`, `fieldbox_runtime =
+                // state.get_runtime_item(runtime_box, arraydescr, i)`.
+                // pyre's VirtualArray stores `_items` as a dense `Vec<OpRef>`.
+                let parent_items: Option<Vec<OpRef>> = if runtime_box.is_some() {
+                    ctx.get_box_replacement_box(box_opref)
+                        .and_then(|b| ctx.getptrinfo(&b))
+                        .and_then(|info| match info {
+                            PtrInfo::VirtualArray(a) => Some(a.items.clone()),
+                            _ => None,
+                        })
+                } else {
+                    None
+                };
+                for (i, (ec, ic)) in ei.iter().zip(ii.iter()).enumerate() {
+                    // virtualstate.py:251-256 + :72-76: `fieldbox` and
+                    // `fieldbox_runtime` are both `None` when the parent's
+                    // `_items[i]` slot is unset. pyre's VirtualArrayInfo
+                    // initialises items as `vec![OpRef::NONE; length]`
+                    // (info.rs:755), so a NONE slot is the parity-equivalent
+                    // of RPython's `_items[i] is None` and must propagate
+                    // as `runtime_box=None`. Threading `Some(OpRef::NONE)`
+                    // instead would let downstream NonNull / IntBounded
+                    // arms emit a guard whose `box_opref` falls back to
+                    // `args[arg_index]` (to_ops :2160), promoting "no
+                    // guard for this item" into "guard on the parent".
+                    let inner = parent_items
+                        .as_ref()
+                        .and_then(|items| items.get(i).copied())
+                        .filter(|opref| !opref.is_none());
+                    let (recurse_box, recurse_runtime) = match inner {
+                        Some(opref) => (opref, Some(opref)),
+                        None => (OpRef::NONE, None),
+                    };
                     Self::generate_guards_for_entry_recursive(
                         arg_idx,
                         ec,
                         ic,
-                        OpRef::NONE,
-                        None,
+                        recurse_box,
+                        recurse_runtime,
                         ctx,
                         force_boxes,
                         renum,
@@ -1624,15 +1742,45 @@ impl VirtualState {
                     return Err(());
                 }
                 for (a, b) in efd.iter().zip(ifd.iter()) {
-                    if a.index() != b.index() {
+                    // virtualstate.py:303-305 VArrayStructStateInfo:
+                    // `if descr is not other.fielddescrs[j]: raise
+                    // VirtualStatesCantMatch`. Object identity, not
+                    // numeric index. pyre's Arc::as_ptr-keyed
+                    // `descr_identity` (descr.rs:1053) is the parity port —
+                    // DescrRef::index() is `u32::MAX` for cache-route
+                    // minted field descrs (descr.rs:506), so an index
+                    // compare would collapse distinct descrs.
+                    if descr_identity(a) != descr_identity(b) {
                         return Err(());
                     }
                 }
-                for (e_fields, i_fields) in eef.iter().zip(ief.iter()) {
-                    Self::generate_guards_recurse_named_fields(
+                for (elem_idx, (e_fields, i_fields)) in eef.iter().zip(ief.iter()).enumerate() {
+                    // virtualstate.py:286-326 VArrayStructStateInfo:
+                    // efd and ifd are equal per the identity check above,
+                    // so each element struct shares the same fielddescrs.
+                    //
+                    // virtualstate.py:309 `opinfo = getptrinfo(box)` +
+                    // :321-324: `fieldbox = opinfo._items[index]`,
+                    // `fieldbox_runtime = state.get_runtime_interiorfield(
+                    // runtime_box, descr, i)`. pyre's VirtualArrayStruct
+                    // stores `element_fields[elem_idx]` as a per-element
+                    // `(descr_idx, OpRef)` vector mirroring `_items`.
+                    let parent_fields =
+                        Self::peek_parent_field_oprefs(ctx, box_opref, runtime_box, |info| {
+                            match info {
+                                PtrInfo::VirtualArrayStruct(a) => {
+                                    a.element_fields.get(elem_idx).cloned()
+                                }
+                                _ => None,
+                            }
+                        });
+                    Self::generate_guards_recurse_positional_fields(
                         arg_idx,
+                        efd,
+                        ifd,
                         e_fields,
                         i_fields,
+                        parent_fields.as_deref(),
                         ctx,
                         force_boxes,
                         renum,
@@ -1647,46 +1795,152 @@ impl VirtualState {
         }
     }
 
-    /// virtualstate.py:158-176 AbstractVirtualStructStateInfo per-field
-    /// recursion. Pairs every (descr_idx, fieldstate) in `expected_fields`
-    /// with the matching incoming entry and recurses with `runtime_box=None`
-    /// — pyre cannot fabricate `state.get_runtime_field` results at trace
-    /// time, and RPython's nested guard emission is itself gated on
-    /// `runtime_box is not None` at :493/:601/:603/:622.
-    fn generate_guards_recurse_named_fields(
+    /// virtualstate.py:155-176 AbstractVirtualStructStateInfo._generate_guards
+    /// strict positional parity:
+    ///
+    /// ```python
+    /// if len(self.fielddescrs) != len(other.fielddescrs):
+    ///     raise VirtualStatesCantMatch("field descrs don't match")
+    /// for i in range(len(self.fielddescrs)):
+    ///     if other.fielddescrs[i] is not self.fielddescrs[i]:
+    ///         raise VirtualStatesCantMatch("field descrs don't match")
+    ///     ...
+    ///     self.fieldstate[i].generate_guards(other.fieldstate[i], ...)
+    /// ```
+    ///
+    /// Pyre stores `field_descrs` (parent-local order, line-by-line
+    /// `get_all_fielddescrs()`) and a parallel `fields` Vec keyed by
+    /// `field_slot_index` (FieldDescr.index_in_parent when a parent
+    /// SizeDescr is bound, else Descr.index — heap.rs:843). Iterate
+    /// `field_descrs` positionally, match by RPython `is`-identity
+    /// (Arc::as_ptr via `descr_identity`), then resolve each
+    /// (fielddescr, fieldstate) pair via the parent-local slot index.
+    fn generate_guards_recurse_positional_fields(
         arg_idx: usize,
+        expected_field_descrs: &[DescrRef],
+        incoming_field_descrs: &[DescrRef],
         expected_fields: &[(u32, Rc<VirtualStateInfoNode>)],
         incoming_fields: &[(u32, Rc<VirtualStateInfoNode>)],
+        parent_field_oprefs: Option<&[(u32, OpRef)]>,
         ctx: &OptContext,
         force_boxes: bool,
         renum: &mut HashMap<i32, i32>,
         guards: &mut Vec<GuardRequirement>,
     ) -> Result<(), ()> {
-        if expected_fields.len() != incoming_fields.len() {
+        // virtualstate.py:155: len check, raises "field descrs don't match".
+        if expected_field_descrs.len() != incoming_field_descrs.len() {
             return Err(());
         }
-        for (idx, expected_child) in expected_fields {
-            let incoming_child = match incoming_fields
-                .iter()
-                .find(|(i, _)| i == idx)
-                .map(|(_, v)| v)
+        for i in 0..expected_field_descrs.len() {
+            // virtualstate.py:159: `other.fielddescrs[i] is not self.fielddescrs[i]`.
+            // RPython uses Python object identity — pyre's port is
+            // `descr_identity` (descr.rs:1053 Arc::as_ptr). DescrRef::index()
+            // is the dense u32 GC tid; for cache-route minted field
+            // descrs that value is `u32::MAX` (descr.rs:506), so an
+            // index-based check would collapse distinct descrs together
+            // and admit cross-struct false matches.
+            if descr_identity(&expected_field_descrs[i])
+                != descr_identity(&incoming_field_descrs[i])
             {
-                Some(child) => child,
-                None => return Err(()),
+                return Err(());
+            }
+            // virtualstate.py:162: `opinfo._fields[self.fielddescrs[i].get_index()]`.
+            // `get_index()` is the parent-local field slot index, not
+            // the global Descr.index(); pyre's `info.fields` and
+            // `element_fields[i]` are populated via `field_slot_index`
+            // (heap.rs:843) / `descr_index` (virtualize.rs:1986), both
+            // of which read `FieldDescr.index_in_parent()` when a
+            // parent SizeDescr is bound (matching descr.py:228). Fall
+            // back to `Descr::index()` for descrs without a parent, the
+            // same fallback heap.rs picks up.
+            let descr_idx = expected_field_descrs[i]
+                .as_field_descr()
+                .filter(|fd| fd.get_parent_descr().is_some())
+                .map(|fd| fd.index_in_parent() as u32)
+                .unwrap_or_else(|| expected_field_descrs[i].index());
+            let expected_child = expected_fields
+                .iter()
+                .find(|(idx, _)| *idx == descr_idx)
+                .map(|(_, v)| v);
+            let incoming_child = incoming_fields
+                .iter()
+                .find(|(idx, _)| *idx == descr_idx)
+                .map(|(_, v)| v);
+            // virtualstate.py:161-167: when both the parent's `runtime_box`
+            // and its `opinfo._fields[descr.get_index()]` are available,
+            // thread the inner field's `fieldbox` AND `fieldbox_runtime`
+            // into the recursion.
+            //
+            // **PRE-EXISTING-ADAPTATION** (structural, not a "pure" port):
+            // RPython's `state.get_runtime_field(runtime_box, descr)`
+            // (virtualstate.py:48-55) calls `cpu.bh_getfield_gc_*` to
+            // read the *concrete* field value off the runtime object and
+            // wraps it in a fresh `InputArg*`. pyre has no equivalent
+            // concrete-read hook at virtualstate-match time, so the
+            // helper reuses the compile-time inner OpRef as both `box`
+            // and `runtime_box` and relies on `get_known_class(opref)`
+            // reading optimizer-tracked PtrInfo (mod.rs:5174). The
+            // upshot: nested guard emission is gated on whether the
+            // optimizer recorded info for the inner OpRef, not on a
+            // concrete runtime read — equivalent only when the optimizer
+            // already observed the producing SETFIELD/GETFIELD.
+            //
+            // virtualstate.py:72-76 + :161-167: when the parent's
+            // `opinfo._fields[descr.get_index()]` is `None`, RPython
+            // passes `fieldbox=None, fieldbox_runtime=None` and any
+            // downstream guard becomes a no-op. pyre's NONE-placeholder
+            // slot (`info.rs:755`) carries the same "unset" meaning and
+            // must be filtered out before being passed as a runtime
+            // sentinel — otherwise to_ops's fallback (:2160) would
+            // promote a missing-field guard onto the top-level arg.
+            let inner_box_opref = parent_field_oprefs
+                .and_then(|f| f.iter().find(|(idx, _)| *idx == descr_idx))
+                .map(|(_, opref)| *opref)
+                .filter(|opref| !opref.is_none());
+            let (recurse_box, recurse_runtime) = match inner_box_opref {
+                Some(inner) => (inner, Some(inner)),
+                None => (OpRef::NONE, None),
             };
-            Self::generate_guards_for_entry_recursive(
-                arg_idx,
-                expected_child,
-                incoming_child,
-                OpRef::NONE,
-                None,
-                ctx,
-                force_boxes,
-                renum,
-                guards,
-            )?;
+            // virtualstate.py:171-173: both fieldstate[i] None → skip;
+            // expected None vs incoming Some → still skip (RPython only
+            // recurses when expected is set); expected Some vs incoming
+            // None → VirtualStatesCantMatch.
+            match (expected_child, incoming_child) {
+                (None, _) => continue,
+                (Some(_), None) => return Err(()),
+                (Some(e), Some(i)) => {
+                    Self::generate_guards_for_entry_recursive(
+                        arg_idx,
+                        e,
+                        i,
+                        recurse_box,
+                        recurse_runtime,
+                        ctx,
+                        force_boxes,
+                        renum,
+                        guards,
+                    )?;
+                }
+            }
         }
         Ok(())
+    }
+
+    /// virtualstate.py:148-152 / :252-253 / :309-312 `opinfo = getptrinfo(box)`
+    /// when `runtime_box is not None`. Returns a clone of the relevant
+    /// inner-field OpRef vector (Virtual/VStruct/VArrayStruct[elem_idx])
+    /// or `None` when the parent has no runtime_box, no recorded PtrInfo,
+    /// or a PtrInfo of an incompatible variant.
+    fn peek_parent_field_oprefs(
+        ctx: &OptContext,
+        parent_box_opref: OpRef,
+        parent_runtime_box: Option<OpRef>,
+        extract: impl FnOnce(&PtrInfo) -> Option<Vec<(u32, OpRef)>>,
+    ) -> Option<Vec<(u32, OpRef)>> {
+        parent_runtime_box?;
+        let b = ctx.get_box_replacement_box(parent_box_opref)?;
+        let info = ctx.getptrinfo(&b)?;
+        extract(&info)
     }
 
     /// virtualstate.py: debug_print(hdr, bad, metainterp_sd)
@@ -1871,7 +2125,19 @@ fn deep_clone_node(
 #[derive(Clone, Debug)]
 pub enum GuardRequirement {
     /// Emit GUARD_CLASS on the arg at this index.
+    /// virtualstate.py:610 NotVirtualStateInfoPtr._generate_guards_knownclass,
+    /// LEVEL_NONNULL branch: `ResOperation(rop.GUARD_CLASS, [box, self.known_class])`.
     GuardClass {
+        arg_index: usize,
+        box_opref: OpRef,
+        expected_class: GcRef,
+    },
+    /// Emit GUARD_NONNULL_CLASS on the arg at this index.
+    /// virtualstate.py:603 NotVirtualStateInfoPtr._generate_guards_knownclass,
+    /// LEVEL_UNKNOWN branch: `ResOperation(rop.GUARD_NONNULL_CLASS, [box, self.known_class])`.
+    /// Distinct from `GuardClass` — the LEVEL_UNKNOWN incoming has no
+    /// proven non-nullness, so the combined guard is required.
+    GuardNonnullClass {
         arg_index: usize,
         box_opref: OpRef,
         expected_class: GcRef,
@@ -1922,9 +2188,30 @@ impl GuardRequirement {
                         None => return Vec::new(),
                     }
                 };
-                // virtualstate.py:603: ConstInt(self.known_class)
-                let class_const = ctx.make_constant_int(expected_class.0 as i64);
+                // virtualstate.py:610 GUARD_CLASS [box, self.known_class]
+                // — known_class is a ConstPtr to the class.
+                let class_const = ctx.make_constant_ref(*expected_class);
                 let mut op = Op::new(OpCode::GuardClass, &[arg, class_const]);
+                op.fail_args = Some(Default::default());
+                vec![op]
+            }
+            GuardRequirement::GuardNonnullClass {
+                arg_index,
+                box_opref,
+                expected_class,
+            } => {
+                let arg = if !box_opref.is_none() {
+                    *box_opref
+                } else {
+                    match args.get(*arg_index) {
+                        Some(a) => *a,
+                        None => return Vec::new(),
+                    }
+                };
+                // virtualstate.py:603 GUARD_NONNULL_CLASS [box, self.known_class]
+                // — known_class is a ConstPtr to the class.
+                let class_const = ctx.make_constant_ref(*expected_class);
+                let mut op = Op::new(OpCode::GuardNonnullClass, &[arg, class_const]);
                 op.fail_args = Some(Default::default());
                 vec![op]
             }
@@ -1991,22 +2278,11 @@ impl GuardRequirement {
                 // GUARD_TRUE/GUARD_VALUE pairs into `extra_guards`. Each
                 // GUARD_* receives the producer `ResOperation` as its
                 // first arg via Python-object identity (intutils.py:1275);
-                // pyre uses one closure dispatching `GuardOpAlloc` so a
-                // fresh Int OpRef is installed on the producer's `pos`
-                // before the consumer guard captures the args.
-                use crate::optimizeopt::intutils::GuardOpAlloc;
+                // pyre passes `&mut OptContext` directly so a fresh Int
+                // OpRef is installed on the producer's `pos` before the
+                // consumer guard captures the args.
                 let mut emitted = Vec::new();
-                let mut alloc = |req: GuardOpAlloc| -> OpRef {
-                    match req {
-                        GuardOpAlloc::Const(value) => {
-                            let pos = ctx.reserve_const_ref(value.get_type());
-                            ctx.seed_constant(pos, value);
-                            pos
-                        }
-                        GuardOpAlloc::IntResult => ctx.alloc_op_position_typed(majit_ir::Type::Int),
-                    }
-                };
-                bounds.make_guards(arg, &mut emitted, &mut alloc);
+                bounds.make_guards(arg, &mut emitted, ctx);
                 // Tag GUARD_TRUE / GUARD_VALUE with empty fail_args; the
                 // non-guard INT_GE / INT_LE / INT_AND producers keep the
                 // default. The caller (unroll.rs:2856) gates the
@@ -2483,6 +2759,12 @@ mod tests {
         // KnownClass and NonNull are Ref-typed; incoming must also be Ref.
         // RPython: NotVirtualStateInfoPtr._generate_guards requires
         // isinstance(other, NotVirtualStateInfoPtr).
+        //
+        // virtualstate.py:600-606 LEVEL_UNKNOWN branch additionally
+        // requires `self.known_class.same_constant(cpu.cls_of_box(runtime_box))`.
+        // The KnownClass slot here gates on a runtime_box whose
+        // constant-pool entry has a matching class via PtrInfo::Constant
+        // (info.rs:824-851 get_known_class → cls_of_box).
         let s1 = VirtualState::new(vec![
             VirtualStateInfo::KnownClass {
                 class_ptr: GcRef(0x100),
@@ -2494,17 +2776,26 @@ mod tests {
             VirtualStateInfo::Unknown(Type::Ref),
         ]);
 
+        let mut ctx = OptContext::new(128);
+        // Install a known_class Instance ptrinfo on boxes[0] so
+        // get_known_class returns GcRef(0x100), satisfying the
+        // virtualstate.py:601-602 runtime-class match. The box must be
+        // seeded with Type::Ref so getptrinfo's `op.type == 'r'`
+        // assertion (info.py:885) holds.
         let boxes = vec![OpRef::ref_op(100), OpRef::ref_op(101)];
-        let ctx = OptContext::new(128);
-        // runtime_boxes=Some enables non-permanent guard emission (RPython
-        // _jump_to_existing_trace path). With None, Unknown incoming → Err.
+        let b0 = ctx.ensure_box_at_typed(boxes[0].raw() as usize, Type::Ref);
+        ctx.set_ptr_info(
+            &b0,
+            crate::optimizeopt::info::PtrInfo::known_class(GcRef(0x100), false),
+        );
         let guards = s1
             .generate_guards(&s2, &boxes, Some(&boxes), &ctx, false)
             .unwrap();
         assert_eq!(guards.len(), 2);
+        // Unknown incoming → GUARD_NONNULL_CLASS (:603).
         assert!(matches!(
             &guards[0],
-            GuardRequirement::GuardClass { arg_index: 0, box_opref, .. } if *box_opref == OpRef::ref_op(100)
+            GuardRequirement::GuardNonnullClass { arg_index: 0, box_opref, .. } if *box_opref == OpRef::ref_op(100)
         ));
         assert!(matches!(
             &guards[1],
