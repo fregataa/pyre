@@ -110,7 +110,26 @@ pub fn opname_in_shadow_allow_list(instruction: &Instruction) -> bool {
             | Instruction::Resume { .. }
             | Instruction::Cache
             | Instruction::NotTaken
+            // M4.PoC.2: PopTop arm body is `inline_call_r_r/dR>r` into
+            // the `pop_value` sub-jitcode, followed by the standard
+            // `live/catch_exception/goto/reraise/ref_return/live/raise/
+            // ref_return` shoulder.  No `goto_if_not/iL` (which would
+            // need Int-bank concrete shadow), so the LoadFast blocker
+            // doesn't apply here.  See
+            // `pop_top_jitcode_op_sequence_matches_expected_shape` test
+            // for the locked-in arm shape.
+            | Instruction::PopTop
     )
+    // M4.PoC.1 LoadFast attempt (2026-05-17) panicked on fib_loop with
+    // `GotoIfNotValueNotConcrete { pc: 28, value: IntOp(35) }`.  The
+    // codewriter-emitted LoadFastCheck arm body contains a
+    // `goto_if_not/iL` whose value lives in the Int register bank;
+    // walker `dispatch_goto_if_not` falls into the strict-mode
+    // fail-loud path because `concrete_registers_i` doesn't exist.
+    // Blocker is the Int-bank concrete shadow plumbing — see
+    // `[[project-tracer-m4-cutover-decision]]` "Architectural blocker
+    // for the Int-bank shadow" section.  Allow-list expansion past
+    // PopTop into LoadFast/arithmetic/branch ops is gated on that work.
 }
 
 /// Carrier for the symbolic walker's record output — the trace ops it
@@ -257,6 +276,9 @@ pub fn shadow_validate_pre(
                 num_regs_r: jc.num_regs_r() as usize,
                 num_regs_i: jc.num_regs_i() as usize,
                 num_regs_f: jc.num_regs_f() as usize,
+                constants_i: jc.constants_i.as_slice(),
+                constants_r: jc.constants_r.as_slice(),
+                constants_f: jc.constants_f.as_slice(),
             })
     };
 
@@ -448,11 +470,27 @@ mod tests {
     }
 
     #[test]
-    fn pop_top_stays_out_of_shadow_allow_list_until_recursive_jitcode_closes() {
-        // PopTop's top-level arm recurses into a helper jitcode. The current
-        // first unsupported callee opname is `getfield_vable_i/rd>i`; listing
-        // PopTop here would claim parity before the recursive closure is wired.
-        assert!(!opname_in_shadow_allow_list(&Instruction::PopTop));
+    fn pop_top_is_in_shadow_allow_list() {
+        // PopTop blocker history (all closed):
+        //   1. (#73) sub-walk `registers_i` undersized at the callee
+        //      constant-pool slot — `RegisterOutOfRange { pc: 14, reg:
+        //      1, len: 1, bank: "i" }`.  Fixed by sizing each sub-walk
+        //      bank to `num_regs_and_consts_X` and pre-populating the
+        //      constant window via `TraceCtx::const_{int,ref,float}`
+        //      (RPython `pyjitpl.py:98-119 MIFrame.copy_constants`).
+        //   2. (#74) walker had no `goto_if_not/iL` handler —
+        //      `UnsupportedOpname { pc: 21, key: "goto_if_not/iL" }`.
+        //      Ported from `pyjitpl.py:511-526 opimpl_goto_if_not`
+        //      with concrete read via `TraceCtx::concrete_of_opref`
+        //      mirroring `switch/id`.
+        //
+        // PopTop arm body is `inline_call_r_r/dR>r` into the
+        // `pop_value` sub-jitcode, followed by the standard
+        // `live/catch_exception/goto/reraise/ref_return/live/raise/
+        // ref_return` shoulder. No `goto_if_not/iL` (which would
+        // need Int-bank concrete shadow — task #75), so the LoadFast
+        // blocker doesn't apply here.
+        assert!(opname_in_shadow_allow_list(&Instruction::PopTop));
     }
 
     #[test]

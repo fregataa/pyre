@@ -902,15 +902,56 @@ thread_local! {
             pyre_object::excobject::W_EXCEPTION_GC_PTR_OFFSETS.to_vec(),
         ));
         debug_assert_eq!(w_exception_tid, W_EXCEPTION_GC_TYPE_ID);
-        majit_gc::GcAllocator::register_vtable_for_type(
-            &mut gc,
-            &pyre_object::excobject::EXCEPTION_TYPE as *const _ as usize,
-            w_exception_tid,
-        );
-        pytype_to_tid.insert(
-            &pyre_object::excobject::EXCEPTION_TYPE as *const _ as usize,
-            w_exception_tid,
-        );
+        // Pre-register every per-ExcKind PyType to the same
+        // `W_ExceptionObject` GC tid — they share one storage layout
+        // (the per-kind discriminator lives in `ob_type`, payload is
+        // identical) so the GC must size them identically.  The
+        // `all_foreign_pytypes` loop below skips entries already in
+        // `pytype_to_tid`, so this pre-registration wins over its
+        // generic `object_subclass(sizeof(PyObject), parent_tid)`
+        // default which would underallocate `W_ExceptionObject`.
+        for kind_idx in 0u8..=(pyre_object::excobject::ExcKind::SystemError as u8) {
+            // Round-trip the byte through the enum so we don't depend
+            // on unsafe transmute; every value in [0, SystemError] is
+            // a valid `ExcKind` variant by construction.
+            let kind = match kind_idx {
+                0 => pyre_object::excobject::ExcKind::BaseException,
+                1 => pyre_object::excobject::ExcKind::Exception,
+                2 => pyre_object::excobject::ExcKind::TypeError,
+                3 => pyre_object::excobject::ExcKind::ValueError,
+                4 => pyre_object::excobject::ExcKind::ZeroDivisionError,
+                5 => pyre_object::excobject::ExcKind::NameError,
+                6 => pyre_object::excobject::ExcKind::IndexError,
+                7 => pyre_object::excobject::ExcKind::KeyError,
+                8 => pyre_object::excobject::ExcKind::AttributeError,
+                9 => pyre_object::excobject::ExcKind::RuntimeError,
+                10 => pyre_object::excobject::ExcKind::StopIteration,
+                11 => pyre_object::excobject::ExcKind::OverflowError,
+                12 => pyre_object::excobject::ExcKind::ArithmeticError,
+                13 => pyre_object::excobject::ExcKind::ImportError,
+                14 => pyre_object::excobject::ExcKind::NotImplementedError,
+                15 => pyre_object::excobject::ExcKind::AssertionError,
+                16 => pyre_object::excobject::ExcKind::ReferenceError,
+                17 => pyre_object::excobject::ExcKind::GeneratorExit,
+                18 => pyre_object::excobject::ExcKind::RecursionError,
+                19 => pyre_object::excobject::ExcKind::OSError,
+                20 => pyre_object::excobject::ExcKind::FileNotFoundError,
+                21 => pyre_object::excobject::ExcKind::UnicodeDecodeError,
+                22 => pyre_object::excobject::ExcKind::UnicodeEncodeError,
+                23 => pyre_object::excobject::ExcKind::SystemExit,
+                24 => pyre_object::excobject::ExcKind::MemoryError,
+                25 => pyre_object::excobject::ExcKind::SystemError,
+                _ => unreachable!(),
+            };
+            let pytype_ptr = pyre_object::excobject::exc_kind_to_pytype(kind)
+                as *const _ as usize;
+            majit_gc::GcAllocator::register_vtable_for_type(
+                &mut gc,
+                pytype_ptr,
+                w_exception_tid,
+            );
+            pytype_to_tid.insert(pytype_ptr, w_exception_tid);
+        }
         // W_GeneratorObject carries `frame_ptr: *mut u8` (opaque
         // PyFrame pointer, owned by the generator) plus three bools.
         // No direct `PyObjectRef` fields; the suspended frame's
@@ -6408,14 +6449,29 @@ mod tests {
         register_test_portal(&code, frame.pycode as *const ());
         let jitcode_index = trace_state::ensure_jitcode_index(frame.pycode as *const ())
             .expect("real trace-side jitcode registration must succeed");
+        // Resolve the per-local Ref-bank color via the regalloc-emitted
+        // `pyre_color_for_semantic_local` map.  Hardcoding reg indices
+        // (e.g. `&3` for local `i`) couples the test to the walker's
+        // pre-canonical regalloc strategy; querying the color map keeps
+        // the assertion shape regardless of which lowering path emits
+        // the jitcode.
+        let local_color_map = trace_state::local_slot_color_map_at(jitcode_index);
+        let color_i: u32 = (*local_color_map
+            .get(3)
+            .expect("regalloc must assign a color to local `i`"))
+        .into();
+        let color_a: u32 = (*local_color_map.get(0).expect("color for local a")).into();
+        let color_b: u32 = (*local_color_map.get(1).expect("color for local b")).into();
+        let color_c: u32 = (*local_color_map.get(2).expect("color for local c")).into();
         let resume_pc = (0..code.instructions.len())
             .find(|&pc| {
-                trace_state::frame_liveness_reg_indices_at(jitcode_index, pc as i32).contains(&3)
+                trace_state::frame_liveness_reg_indices_at(jitcode_index, pc as i32)
+                    .contains(&color_i)
             })
             .expect("compiled liveness should expose local i at some Python PC");
         let live_regs = trace_state::frame_liveness_reg_indices_at(jitcode_index, resume_pc as i32);
         assert!(
-            live_regs.contains(&3),
+            live_regs.contains(&color_i),
             "selected resume pc must decode the raw-int local slot"
         );
         assert_eq!(
@@ -6454,11 +6510,11 @@ mod tests {
             Value::Ref(GcRef(frame.w_globals as usize)), // w_globals
         ];
         for reg in live_regs.iter() {
-            match reg {
-                0 => values.push(Value::Ref(GcRef(w_int_new(1) as usize))), // local a
-                1 => values.push(Value::Ref(GcRef(w_int_new(2) as usize))), // local b
-                2 => values.push(Value::Ref(GcRef(w_int_new(3) as usize))), // local c
-                3 => values.push(Value::Int(7)),                            // local i
+            match *reg {
+                r if r == color_a => values.push(Value::Ref(GcRef(w_int_new(1) as usize))),
+                r if r == color_b => values.push(Value::Ref(GcRef(w_int_new(2) as usize))),
+                r if r == color_c => values.push(Value::Ref(GcRef(w_int_new(3) as usize))),
+                r if r == color_i => values.push(Value::Int(7)),
                 // pypy/module/pypyjit/interp_jit.py:68 reds = ['frame',
                 // 'ec'] — portal red args ride the live_r mask after
                 // codewriter commit 9f0d0f6c18 (interp_jit.py parity).
@@ -6717,7 +6773,20 @@ mod tests {
             .expect("real trace-side jitcode registration must succeed");
         let jitcode_index = trace_state::ensure_jitcode_index(frame.pycode as *const ())
             .expect("real trace-side jitcode index must exist");
-        let (resume_pc, _) = live_pc_containing_all(jitcode_index, &code, &[0]);
+        // Resolve local `b`'s Ref-bank color via the regalloc-emitted
+        // `pyre_color_for_semantic_local` map.  Hardcoding reg index 0
+        // couples the test to walker's pre-canonical local-slot identity;
+        // canonical `flatten_graph`'s regalloc-coalesced coloring may emit
+        // a different color for the inputarg.  Mirrors the
+        // [[project-flatten-graph-canonical-driver-2026-05-17]] Phase 4
+        // splice-gate convergence pattern landed for
+        // test_restore_guard_failure_uses_runtime_value_kinds_... .
+        let local_color_map = trace_state::local_slot_color_map_at(jitcode_index);
+        let color_b: u32 = (*local_color_map
+            .get(0)
+            .expect("regalloc must assign a color to local `b`"))
+        .into();
+        let (resume_pc, _) = live_pc_containing_all(jitcode_index, &code, &[color_b]);
 
         let run_case = |symbolic_type: Type, name: &str, expected_guard: Option<OpCode>| {
             let mut ctx = TraceCtx::for_test_types(&[symbolic_type]);

@@ -16,7 +16,7 @@
 //! `---` and generic `Op` instructions) plus `Operand` for everything
 //! that appears inside a tuple.
 
-use std::{collections::HashMap, rc::Rc};
+use std::rc::Rc;
 
 use majit_ir::Descr;
 use majit_translate::jit_codewriter::flatten::reorder_renaming_list;
@@ -79,6 +79,15 @@ impl Kind {
             Kind::Ref => 'r',
             Kind::Float => 'f',
         }
+    }
+
+    /// Dense slot index `0..3` for indexing `[T; 3]` arrays keyed by
+    /// `Kind`.  Pyre uses `[T; 3]` rather than `HashMap<Kind, T>` per
+    /// [[feedback-no-hashmap-ever]] — the RPython `regallocs` dict has
+    /// statically-known keys (`KINDS = ['int', 'ref', 'float']`) so the
+    /// Rust analog is position-indexed not hash-keyed.
+    pub fn index(self) -> usize {
+        self as usize
     }
 }
 
@@ -665,6 +674,45 @@ pub fn slot_for_call_flavor(flavor: CallFlavor) -> majit_metainterp::EffectInfoS
     }
 }
 
+/// Returns `true` for HLOp opnames that pyre's walker emits for shadow
+/// consistency with upstream `flowcontext.py` / `flowobject.py` but
+/// whose RPython-orthodox rtyper rewrites (typically `rclass.rtype_type`
+/// / `rclass.rtype_getattr`) pyre's pipeline does not run.  The
+/// canonical `flatten_graph` driver elides these HLOps under
+/// `lowering_ctx` so the resulting `SSARepr` doesn't emit a literal
+/// Insn opname that the runtime cannot dispatch.
+///
+/// `type` — emitted by `codewriter.rs::explicit_raise_exception_pair`
+/// mirroring `flowcontext.py:635 op.type(w_value)`.  The HLOp result
+/// Variable is consumed via `link.last_exception`; the link's
+/// `generate_last_exc` emits a `last_exception` Insn that produces the
+/// type via TLS, so eliding the `type` HLOp itself is safe (the
+/// Variable's color stays allocated and gets written by
+/// `last_exception` at the catch landing).  Upstream `rclass.py:828
+/// rtype_type` rewrites this to `getfield_gc_r(v, '__class__')` —
+/// pyre's runtime exception model bakes type into per-subclass
+/// `W_TypeObject` (see [[project-exception-per-kind-pytype]]) so the
+/// `getfield_gc_r` shape is not required.
+///
+/// `getattr` — emitted by `codewriter.rs::emit_frontend_getattr`
+/// mirroring `flowcontext.py:862-867 op.getattr(w_obj, w_attributename)`.
+/// Pyre's walker pairs every `emit_frontend_getattr` callsite with an
+/// inline `emit_abort_permanent!` (see codewriter.rs:6867 LoadAttr
+/// arm) because pyre's runtime cannot compile attribute lookups; the
+/// trace bails out to the interpreter before any consumer reads the
+/// HLOp's result Variable.  After the `emit_abort_permanent!` graph
+/// dual-write (codewriter.rs:3756), canonical's per-block iteration
+/// already emits the `abort_permanent` Insn that terminates the
+/// compiled trace — emitting a literal `getattr` Insn would be both
+/// unreachable at runtime AND undispatchable by the assembler.
+/// Upstream `rclass.py:838 rtype_getattr` would rewrite this to
+/// `getfield_gc_X(v, descr)` after rtyping; pyre's lack of rtyping
+/// keeps the HLOp unmodified, so eliding it under lowering_ctx is the
+/// production-safe path.
+fn is_pyre_canonical_elidable_hlop(opname: &str) -> bool {
+    matches!(opname, "type" | "getattr")
+}
+
 pub fn effect_info_for_call_flavor(flavor: CallFlavor) -> majit_ir::EffectInfo {
     use majit_ir::{EffectInfo, ExtraEffect};
     match flavor {
@@ -1154,9 +1202,52 @@ pub struct GraphFlattener<'a, F, C = fn(&Constant) -> Operand> {
     ssarepr: &'a mut SSARepr,
     get_register: F,
     lower_constant: C,
-    seen_blocks: HashMap<BlockRef, bool>,
-    block_names: HashMap<BlockRef, String>,
-    link_names: HashMap<LinkRef, String>,
+    /// `rpython/jit/codewriter/flatten.py:103 self.seen_blocks = {}` —
+    /// the recursive `make_bytecode_block` DFS tracks which blocks have
+    /// been emitted to short-circuit back-edges into `goto TLabel(block)`.
+    /// Per [[feedback-no-hashmap-ever]] pyre uses `Vec<BlockRef>` with
+    /// linear scan: graph block counts stay in the dozens for production
+    /// workloads, so O(N) `.contains()` is acceptable and matches the
+    /// upstream dict's "identity membership" semantics without a hash.
+    seen_blocks: Vec<BlockRef>,
+    /// `flatten.py` does not name blocks directly — the upstream
+    /// `Label(block)` shape uses the block's identity hash via Python's
+    /// default `__hash__`.  Pyre needs a stringly Label/TLabel name for
+    /// the runtime's PC-dispatch lookup, so this side-table assigns
+    /// sequential `block{N}` names on first sight.  Same Vec-scan rule
+    /// as `seen_blocks`.
+    block_names: Vec<(BlockRef, String)>,
+    /// Per-link counterpart to `block_names` for `Label(link)` /
+    /// `TLabel(link)` shapes emitted at canraise / switch sites.
+    link_names: Vec<(LinkRef, String)>,
+    /// Pyre-only side table mapping graph blocks to their Python PC.
+    /// When non-empty, `make_bytecode_block` emits an `Insn::PcAnchor
+    /// { py_pc }` immediately after the block-entry `Label` for blocks
+    /// present in this table, matching the walker's per-PC anchor
+    /// emission in `codewriter.rs::emit_mark_label_pc!`.  This makes
+    /// the canonical driver's output runtime-compatible with pyre's
+    /// `pc_anchor_positions` / `live_marker_indices_by_pc` lookups
+    /// without requiring runtime refactor.  Upstream RPython has no
+    /// per-PC anchor concept (RPython's runtime dispatch keys off the
+    /// recorded SpamBlock identity, not Python PC), so this is a pyre
+    /// adaptation layer.  Pre-seeded by the bridge entry
+    /// `flatten_graph_with_walker_slots`; empty for plain
+    /// `flatten_graph` test fixtures.
+    block_py_pcs: Vec<(BlockRef, usize)>,
+    /// Pyre-only force-alive Register operands threaded into every
+    /// `-live-` placeholder emitted by `make_bytecode_block` (matches
+    /// walker's `emit_live_placeholder!` macro at
+    /// `codewriter.rs::4329-4339`).  Walker keeps the portal red args
+    /// (`pypy/module/pypyjit/interp_jit.py:67 reds = ['frame', 'ec']`)
+    /// alive across every PC by emitting their Register operands into
+    /// each per-PC `-live-` — `compute_liveness` then propagates them
+    /// backward into the alive set per `liveness.py:11-12`.  Without
+    /// the operands the bridge's `setup_bridge_sym` sees the portal
+    /// `ec` register missing from the guard point's live R-bank set,
+    /// crashing `bridge_registers_r[portal_ec_reg]` lookup.  Pre-
+    /// seeded by `flatten_graph_with_walker_slots` from codewriter's
+    /// `portal_frame_reg` / `portal_ec_reg`.
+    live_force_alive_ops: Vec<Operand>,
     next_label_id: usize,
     include_all_exc_links: bool,
     /// `rpython/jit/codewriter/flatten.py:79 self.cpu = cpu`.
@@ -1194,9 +1285,11 @@ where
             ssarepr,
             get_register,
             lower_constant: flatten_constant_operand,
-            seen_blocks: HashMap::new(),
-            block_names: HashMap::new(),
-            link_names: HashMap::new(),
+            seen_blocks: Vec::new(),
+            block_names: Vec::new(),
+            link_names: Vec::new(),
+            block_py_pcs: Vec::new(),
+            live_force_alive_ops: Vec::new(),
             next_label_id: 0,
             include_all_exc_links: false,
             cpu: None,
@@ -1219,9 +1312,11 @@ where
             ssarepr,
             get_register,
             lower_constant,
-            seen_blocks: HashMap::new(),
-            block_names: HashMap::new(),
-            link_names: HashMap::new(),
+            seen_blocks: Vec::new(),
+            block_names: Vec::new(),
+            link_names: Vec::new(),
+            block_py_pcs: Vec::new(),
+            live_force_alive_ops: Vec::new(),
             next_label_id: 0,
             include_all_exc_links: false,
             cpu: None,
@@ -1249,9 +1344,11 @@ where
             ssarepr,
             get_register,
             lower_constant,
-            seen_blocks: HashMap::new(),
-            block_names: HashMap::new(),
-            link_names: HashMap::new(),
+            seen_blocks: Vec::new(),
+            block_names: Vec::new(),
+            link_names: Vec::new(),
+            block_py_pcs: Vec::new(),
+            live_force_alive_ops: Vec::new(),
             next_label_id: 0,
             include_all_exc_links: false,
             cpu: None,
@@ -1277,6 +1374,18 @@ where
         // splits out the per-op lowering (HLOp dispatch + arg /
         // result handling); the `emitline` call below matches
         // upstream's final push.
+        //
+        // Pyre-specific elide arm (canonical-driver-only): certain
+        // HLOps emitted by pyre's walker for shadow consistency with
+        // upstream `flowcontext.py` have no runtime Insn counterpart
+        // and would be unsafe to emit literally.  Elide them only
+        // under `lowering_ctx` (canonical production path); the
+        // non-lowering path keeps upstream passthrough behavior
+        // (preserves `graph_flattener_emits_generic_result_op` test
+        // semantics).  See [[project-flatten-graph-canonical-driver-2026-05-17]].
+        if self.lowering_ctx.is_some() && is_pyre_canonical_elidable_hlop(&op.opname) {
+            return;
+        }
         let insn = self.flatten_space_operation(op);
         self.emitline(insn);
     }
@@ -1295,22 +1404,22 @@ where
     }
 
     fn label_name_for_block(&mut self, block: &BlockRef) -> String {
-        if let Some(name) = self.block_names.get(block) {
+        if let Some((_, name)) = self.block_names.iter().find(|(b, _)| b == block) {
             return name.clone();
         }
         let name = format!("block{}", self.next_label_id);
         self.next_label_id += 1;
-        self.block_names.insert(block.clone(), name.clone());
+        self.block_names.push((block.clone(), name.clone()));
         name
     }
 
     fn label_name_for_link(&mut self, link: &LinkRef) -> String {
-        if let Some(name) = self.link_names.get(link) {
+        if let Some((_, name)) = self.link_names.iter().find(|(l, _)| l == link) {
             return name.clone();
         }
         let name = format!("link{}", self.next_label_id);
         self.next_label_id += 1;
-        self.link_names.insert(link.clone(), name.clone());
+        self.link_names.push((link.clone(), name.clone()));
         name
     }
 
@@ -1823,6 +1932,49 @@ where
         exitswitch: Option<super::flow::ExitSwitch>,
         handling_ovf: bool,
     ) {
+        // Diagnostic: surface walker-emitted switch shape on entry so
+        // the panic at `switch_llexitcase_key` includes the link
+        // inventory (exitcase + llexitcase per link) rather than
+        // forcing manual graph inspection.
+        if std::env::var_os("PYRE_PHASE3_SWITCH_DIAG").is_some() {
+            let exitcase_summary: Vec<String> = exits
+                .iter()
+                .map(|link| {
+                    let lb = link.borrow();
+                    format!(
+                        "(exitcase={:?}, llexitcase={:?})",
+                        lb.exitcase, lb.llexitcase
+                    )
+                })
+                .collect();
+            // Describe the source block's last few operations so we
+            // can identify which walker emit site produced this shape.
+            let block_summary = exits
+                .first()
+                .and_then(|link| link.borrow().prevblock.clone())
+                .and_then(|weak| weak.upgrade())
+                .map(|block_rc| {
+                    let b = block_rc.borrow();
+                    let last_ops: Vec<String> = b
+                        .operations
+                        .iter()
+                        .rev()
+                        .take(3)
+                        .rev()
+                        .map(|op| format!("{}@{}", op.opname, op.offset))
+                        .collect();
+                    format!("ops={} last_ops={:?}", b.operations.len(), last_ops,)
+                })
+                .unwrap_or_else(|| "<no-block>".to_string());
+            eprintln!(
+                "[phase3-switch-diag] insert_switch_exits: exits={} \
+                 exitswitch={:?} {} shape={:?}",
+                exits.len(),
+                exitswitch,
+                block_summary,
+                exitcase_summary,
+            );
+        }
         let Some(super::flow::ExitSwitch::Value(exitswitch)) = exitswitch else {
             // RPython `flatten.py:282-309 insert_switch_exits` is only
             // called via `insert_exits` when the block already has a
@@ -1847,6 +1999,22 @@ where
                 exitcase_summary,
             );
         };
+        // `flatten.py:275-276` `kind = getkind(block.exitswitch.concretetype)
+        // assert kind == 'int'    # XXX` — upstream enforces that a switch
+        // dispatches on a Signed/Int Variable.  Pyre's `Variable.kind` is
+        // already typed; assert structurally here so a walker non-orthodoxy
+        // that produced a non-Int exitswitch surfaces at flatten time
+        // rather than at runtime (or via a SwitchDictDescr key shape
+        // mismatch downstream).
+        let switch_kind = match &exitswitch {
+            FlowValue::Variable(variable) => variable.kind,
+            FlowValue::Constant(constant) => constant.kind,
+        };
+        assert!(
+            matches!(switch_kind, Some(Kind::Int)),
+            "flatten.py:275-276 invariant: switch exitswitch must be \
+             Int-kinded (got {switch_kind:?})"
+        );
         let mut switches: Vec<LinkRef> = exits
             .iter()
             .filter(|link| !is_default_exitcase(&link.borrow().exitcase))
@@ -1924,38 +2092,47 @@ where
         }
         pairs.sort_by_key(|(_, dst)| dst.index);
 
-        let mut renamings: HashMap<Kind, (Vec<RenameOperand>, Vec<RenameOperand>)> = HashMap::new();
+        // `[T; 3]` indexed by `Kind::index()` per [[feedback-no-hashmap-ever]].
+        // Mirrors `rpython/jit/codewriter/flatten.py:306-334 insert_renamings`
+        // which keys by kind string in a Python dict.
+        let mut renamings: [(Vec<RenameOperand>, Vec<RenameOperand>); 3] = [
+            (Vec::new(), Vec::new()),
+            (Vec::new(), Vec::new()),
+            (Vec::new(), Vec::new()),
+        ];
         for (src, dst) in pairs {
-            let (frm, to) = renamings.entry(dst.kind).or_default();
+            let (frm, to) = &mut renamings[dst.kind.index()];
             frm.push(src);
             to.push(RenameOperand::Register(dst));
         }
         for &kind in &Kind::ALL {
-            if let Some((frm, to)) = renamings.get(&kind) {
-                for (src, dst) in reorder_renaming_list(frm, to) {
-                    match (src, dst) {
-                        (Some(src), Some(RenameOperand::Register(dst))) => {
-                            self.emitline(Insn::op_with_result(
-                                format!("{}_copy", kind.as_str()),
-                                vec![src.into_operand()],
-                                dst,
-                            ));
-                        }
-                        (Some(RenameOperand::Register(src)), None) => {
-                            self.emitline(Insn::op(
-                                format!("{}_push", kind.as_str()),
-                                vec![Operand::Register(src)],
-                            ));
-                        }
-                        (None, Some(RenameOperand::Register(dst))) => {
-                            self.emitline(Insn::op_with_result(
-                                format!("{}_pop", kind.as_str()),
-                                Vec::new(),
-                                dst,
-                            ));
-                        }
-                        other => panic!("unexpected renaming step {other:?}"),
+            let (frm, to) = &renamings[kind.index()];
+            if frm.is_empty() {
+                continue;
+            }
+            for (src, dst) in reorder_renaming_list(frm, to) {
+                match (src, dst) {
+                    (Some(src), Some(RenameOperand::Register(dst))) => {
+                        self.emitline(Insn::op_with_result(
+                            format!("{}_copy", kind.as_str()),
+                            vec![src.into_operand()],
+                            dst,
+                        ));
                     }
+                    (Some(RenameOperand::Register(src)), None) => {
+                        self.emitline(Insn::op(
+                            format!("{}_push", kind.as_str()),
+                            vec![Operand::Register(src)],
+                        ));
+                    }
+                    (None, Some(RenameOperand::Register(dst))) => {
+                        self.emitline(Insn::op_with_result(
+                            format!("{}_pop", kind.as_str()),
+                            Vec::new(),
+                            dst,
+                        ));
+                    }
+                    other => panic!("unexpected renaming step {other:?}"),
                 }
             }
         }
@@ -1999,7 +2176,7 @@ where
     pub fn enforce_input_args(
         &mut self,
         graph: &super::flow::FunctionGraph,
-        regallocs: &mut std::collections::HashMap<Kind, super::regalloc::GraphAllocationResult>,
+        regallocs: &mut [super::regalloc::GraphAllocationResult; 3],
     ) {
         super::regalloc::enforce_input_args_simulation(graph, regallocs);
     }
@@ -2027,19 +2204,103 @@ where
             self.make_return(&args);
             return;
         }
-        if self.seen_blocks.contains_key(&block) {
+        if self.seen_blocks.contains(&block) {
             let target = self.tlabel_for_block(&block);
             self.emitline(Insn::op("goto", vec![target]));
             self.emitline(Insn::Unreachable);
             return;
         }
-        self.seen_blocks.insert(block.clone(), true);
+        self.seen_blocks.push(block.clone());
         let block_label = self.label_for_block(&block);
         self.emitline(block_label);
+        // Pyre adaptation: emit `Insn::PcAnchor { py_pc }` +
+        // placeholder `-live-` marker pairs INTERLEAVED with the
+        // block's ops based on `op.offset` (= py_pc the walker
+        // recorded the op at).  Walker emits PcAnchor + `-live-`
+        // immediately before dispatching each PC's bytecode
+        // (`codewriter.rs::emit_mark_label_pc!` followed by
+        // `emit_live_placeholder!()`), so the `-live-` placeholder
+        // sits right before that PC's ops.  `compute_liveness`'s
+        // backward walk captures the alive register set AT that
+        // marker position; bulk-emitting all anchors at block entry
+        // (the previous behaviour) collapses every PC's marker to
+        // "block entry" and produces a single alive set shared
+        // across all PCs — wrong liveness for any PC after the
+        // first.  Per-op interleaving here reconstructs the walker's
+        // per-PC marker positions so `filter_liveness_in_place`'s
+        // post-pass populates each PC's `-live-` with the correct
+        // alive set.  Owned PCs without any matching op (sparse
+        // walker emissions for synthetic-only PCs) emit a trailing
+        // PA + L pair after the op loop so `pc_anchor_positions`'s
+        // assert that every PC has an anchor still holds.  Synthetic
+        // graph ops (`offset == -1`, e.g. `abort_permanent`,
+        // `emit_vsd!` int_copy / setfield_vable_i bookkeeping)
+        // attach to whichever PC was most recently anchored, matching
+        // walker's emit-where-encountered behaviour.  Upstream
+        // RPython has no per-PC anchor concept; this is a pyre-only
+        // extension required by per-PC runtime dispatch.
+        let owned_pcs_sorted: Vec<usize> = {
+            let mut v: Vec<usize> = self
+                .block_py_pcs
+                .iter()
+                .filter_map(|(b, pc)| if b == &block { Some(*pc) } else { None })
+                .collect();
+            v.sort();
+            v.dedup();
+            v
+        };
+        let force_alive = self.live_force_alive_ops.clone();
         let operations = block.borrow().operations.clone();
         let exits_len = block.borrow().exits.len();
         let exitswitch_is_last_exception = block.borrow().canraise();
+        let mut anchored_pcs: Vec<usize> = Vec::new();
+        let mut current_pc: Option<usize> = None;
         for op in &operations {
+            // Determine whether this op carries an owned-PC offset.
+            // `op.offset >= 0` filters out synthetic ops (offset=-1)
+            // which attach to the most recently anchored PC.  Ops
+            // whose offset isn't in `owned_pcs_sorted` (rare — a
+            // graph op recorded with a non-owned PC) also attach to
+            // the current PC.
+            let target_pc: Option<usize> = if op.offset >= 0 {
+                let off = op.offset as usize;
+                if owned_pcs_sorted.contains(&off) {
+                    Some(off)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some(pc) = target_pc {
+                if Some(pc) != current_pc {
+                    // Emit anchors for all owned PCs at-or-before
+                    // `pc` that haven't been emitted yet.  Catches
+                    // "empty" PCs sitting between the previously
+                    // anchored PC and `pc` (PCs whose walker emit
+                    // contributed no real graph op) so every owned
+                    // PC ends up anchored in ascending order.
+                    for &p in &owned_pcs_sorted {
+                        if p <= pc && !anchored_pcs.contains(&p) {
+                            self.emitline(Insn::pc_anchor(p));
+                            self.emitline(Insn::op(OPNAME_LIVE.to_string(), force_alive.clone()));
+                            anchored_pcs.push(p);
+                        }
+                    }
+                    current_pc = Some(pc);
+                }
+            } else if current_pc.is_none() {
+                // Synthetic op precedes any real-PC op in this
+                // block.  Emit the first owned PC's anchor so the
+                // synthetic op attaches to it (matches walker's
+                // behaviour of always opening a block with PA + L).
+                if let Some(&first_pc) = owned_pcs_sorted.first() {
+                    self.emitline(Insn::pc_anchor(first_pc));
+                    self.emitline(Insn::op(OPNAME_LIVE.to_string(), force_alive.clone()));
+                    anchored_pcs.push(first_pc);
+                    current_pc = Some(first_pc);
+                }
+            }
             // `flatten.py:120-125` `_ovf` validity check: an overflow-
             // checked op must live in a canraise block with 2 or 3
             // exits; otherwise the rtyper-side guarantee that an
@@ -2058,6 +2319,21 @@ where
                 );
             }
             self.serialize_op(op);
+        }
+        // Emit anchors for any owned PCs that didn't appear in any
+        // op's `offset` (e.g. PCs whose walker emit produced only
+        // scaffold — PA + `-live-` — and no graph SpaceOp).
+        // `pc_anchor_positions` asserts every PC has an anchor; this
+        // tail emission satisfies that invariant.  These trailing
+        // anchors sit between the block's last op and `insert_exits`'s
+        // terminator emission — runtime entry into them would no-op
+        // through the terminator's goto / return because they carry
+        // no preceding ops in this block.
+        for &p in &owned_pcs_sorted {
+            if !anchored_pcs.contains(&p) {
+                self.emitline(Insn::pc_anchor(p));
+                self.emitline(Insn::op(OPNAME_LIVE.to_string(), force_alive.clone()));
+            }
         }
         self.insert_exits(&block, handling_ovf);
     }
@@ -2280,6 +2556,18 @@ fn flatten_constant_operand(constant: &super::flow::Constant) -> Operand {
         // sites resolve through the closure-based
         // `flatten_graph_with_lowering` path used today).
         (ConstantValue::Signed(value), Some(Kind::Ref)) => Operand::ConstRef(*value),
+        // Pre-rtype Python string constant.  Upstream RPython's
+        // `rtyper:specialize` substep interns the string into the static
+        // data section and rewrites the Constant to a
+        // `(Signed(addr), Kind::Ref)` post-rtype shape.  Pyre lacks the
+        // rtyper today, so the lowered Insn carries a placeholder
+        // `ConstRef(0)`.  Production callers route LOAD_ATTR /
+        // STORE_ATTR through `emit_abort_permanent!` (codewriter.rs
+        // ~6735, ~6756), so the placeholder is never executed.  When
+        // pyre's string-intern infrastructure lands and LOAD_ATTR
+        // production-flips, swap this arm for `Operand::ConstRef
+        // (intern_pool.resolve(s) as i64)`.
+        (ConstantValue::Str(_), Some(Kind::Ref)) => Operand::ConstRef(0),
         (ConstantValue::Opaque(_), Some(Kind::Ref)) => {
             panic!(
                 "GraphFlattener: opaque ref constants must be resolved \
@@ -2304,7 +2592,7 @@ fn flatten_constant_operand(constant: &super::flow::Constant) -> Operand {
 /// production-grade closure.  Tests that compare two SSARepr streams
 /// only compare opname + register kinds, so the `ConstRef(0)` value
 /// doesn't matter for those assertions.
-pub(super) fn flatten_constant_operand_for_probe(constant: &super::flow::Constant) -> Operand {
+pub(super) fn flatten_constant_operand_for_test(constant: &super::flow::Constant) -> Operand {
     match (&constant.value, constant.kind) {
         (ConstantValue::Opaque(_), Some(Kind::Ref)) => Operand::ConstRef(0),
         _ => flatten_constant_operand(constant),
@@ -2397,7 +2685,51 @@ pub fn flatten_graph_with_lowering<'a, F, C>(
 /// the SSARepr — useful for tests against structural-only graphs.
 pub fn flatten_graph<'a>(
     graph: &super::flow::FunctionGraph,
-    regallocs: &'a mut std::collections::HashMap<Kind, super::regalloc::GraphAllocationResult>,
+    regallocs: &'a mut [super::regalloc::GraphAllocationResult; 3],
+    include_all_exc_links: bool,
+    cpu: Option<&'a super::cpu::Cpu>,
+) -> SSARepr {
+    flatten_graph_with_walker_slots(
+        graph,
+        regallocs,
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        include_all_exc_links,
+        cpu,
+    )
+}
+
+/// Phase 4 bridge: `walker_slot_for_variable[var.id]` overrides the
+/// graph regalloc color so production can splice canonical Insns into
+/// the walker's SSARepr without Register-index mismatch.  Synthetic
+/// graph-only Variables (e.g. `last_exception` from
+/// `attach_catch_exception_edge`) have no entry and fall back to
+/// `regallocs[kind].getcolor(v)` per `flatten.py:382-391`.
+///
+/// Task #50 T6 epic slice 1 — `block_name_overrides` pre-seeds the
+/// flattener's `block_names` map so canonical's `Label(block)` /
+/// `tlabel_for_block(target)` emit walker-compatible `pc{N}` names
+/// (where N = block's FrameState `next_offset` = entry Python PC)
+/// instead of the default sequential `block{N}` scheme.  Walker emits
+/// `Label("pcN")` per Python PC (its per-PC dispatch convention);
+/// without the override canonical and walker disagree on every branch
+/// target label name even though they reference the same target
+/// block.  Pre-seeded overrides are first-wins per
+/// `label_name_for_block`'s lookup logic — entries not in the
+/// override list fall back to the `block{N}` default (used for blocks
+/// the walker created but never assigned a `pcN` to, e.g. the implicit
+/// graph startblock when its py_pc has no per-PC anchor).
+pub fn flatten_graph_with_walker_slots<'a>(
+    graph: &super::flow::FunctionGraph,
+    regallocs: &'a mut [super::regalloc::GraphAllocationResult; 3],
+    walker_slot_for_variable: &'a [Option<u16>],
+    block_name_overrides: &[(super::flow::BlockRef, String)],
+    link_name_overrides: &[(super::flow::LinkRef, String)],
+    block_py_pc_overrides: &[(super::flow::BlockRef, usize)],
+    live_force_alive_ops: &[Operand],
     include_all_exc_links: bool,
     cpu: Option<&'a super::cpu::Cpu>,
 ) -> SSARepr {
@@ -2410,13 +2742,21 @@ pub fn flatten_graph<'a>(
     // _include_all_exc_links, cpu)`.
     let lowering_ctx = cpu.and_then(|c| c.lowering_ctx.read().ok().and_then(|guard| *guard));
     let mut ssarepr = SSARepr::new(graph.name.clone());
-    // `flatten.py:382-391 getcolor(v)` — read
-    // `regallocs[kind].coloring[variable.id]` through the closure.
+    // `flatten.py:382-391 getcolor(v)`, prepended with the Phase 4
+    // bridge lookup documented on `flatten_graph_with_walker_slots`.
     let get_register = |variable: Variable| -> Register {
         let kind = variable.kind.unwrap_or(Kind::Ref);
-        let color = regallocs
-            .get(&kind)
-            .and_then(|r| r.coloring.get(&variable.id).copied())
+        let walker_slot = walker_slot_for_variable
+            .get(variable.id.0 as usize)
+            .copied()
+            .flatten();
+        if let Some(slot) = walker_slot {
+            return Register::new(kind, slot);
+        }
+        let color = regallocs[kind.index()]
+            .coloring
+            .get(&variable.id)
+            .copied()
             .unwrap_or(u16::MAX);
         Register::new(kind, color)
     };
@@ -2443,6 +2783,49 @@ pub fn flatten_graph<'a>(
     // `flatten.py:75 GraphFlattener.__init__ ._include_all_exc_links =
     // _include_all_exc_links`.
     flattener.include_all_exc_links = include_all_exc_links;
+    // Task #50 T6 epic slice 1 — pre-seed block_names with walker's
+    // `pc{N}` naming so `Label(block)` / `tlabel_for_block(target)`
+    // resolve to walker-compatible names.  Overrides land first in the
+    // Vec; `label_name_for_block` does a linear scan and returns the
+    // first matching entry, so subsequent default `block{N}` insertions
+    // for blocks not in the override list keep their fallback names.
+    for (block, name) in block_name_overrides {
+        flattener.block_names.push((block.clone(), name.clone()));
+    }
+    // Task #50 T6 epic slice 2 — pre-seed link_names with names that
+    // ALIAS the link to its target block's `pc{N}`.  Walker emits no
+    // separate link landing — its `goto_if_not Reg TLabel("pcN")`
+    // jumps directly to the target block's per-PC anchor.  Canonical
+    // emits `goto_if_not Reg TLabel(link_name)` + `Label(link_name)` +
+    // (optional renamings) + recursive `make_bytecode_block(target)`
+    // which emits `Label(target_block_name)`.  With the alias both
+    // canonical Label entries carry the same name string; the runtime's
+    // `pc_anchor_positions` first-wins resolves `pcN` to the link
+    // landing byte position, which then either no-ops (empty
+    // renamings) or runs the renamings before falling through to the
+    // target block's body.  Insn-level byte_equivalent improves
+    // because `TLabel` operand strings now match between walker and
+    // canonical.  Functionality-preserving — extra Label("pcN") emits
+    // are filtered by `count_real_ops` (Label is scaffold).
+    for (link, name) in link_name_overrides {
+        flattener.link_names.push((link.clone(), name.clone()));
+    }
+    // Task #50 T6 epic slice 4b — pre-seed block_py_pcs so
+    // `make_bytecode_block` emits `Insn::PcAnchor { py_pc }` after
+    // each block's Label, matching walker's per-PC anchor.  Makes
+    // canonical's SSARepr stream runtime-compatible with pyre's
+    // `pc_anchor_positions` lookup — necessary precondition for the
+    // Phase 4 production splice.  Upstream RPython has no per-PC
+    // anchor; this is a pyre adaptation layer.
+    for (block, py_pc) in block_py_pc_overrides {
+        flattener.block_py_pcs.push((block.clone(), *py_pc));
+    }
+    // Phase 4 slice 2 — pre-seed live force-alive ops so canonical's
+    // per-PC `-live-` placeholders carry the portal red args matching
+    // walker's `emit_live_placeholder!` shape.  Without these, the
+    // bridge's `setup_bridge_sym` crashes at portal_ec_reg lookup
+    // (compute_liveness misses the unforced register).
+    flattener.live_force_alive_ops = live_force_alive_ops.to_vec();
     // `flatten.py:69 flattener.generate_ssa_form()`.
     flattener.generate_ssa_form(graph);
     ssarepr
@@ -2452,7 +2835,7 @@ pub fn flatten_graph<'a>(
 /// [`flatten_op_to_insn_with_lowering`] as the passthrough fallback
 /// when no HLOp lowering matches.  Constant operands lower via the
 /// caller-supplied `lower_constant` closure (production threads its
-/// real `lower_constant`; tests pass `flatten_constant_operand_for_probe`).
+/// real `lower_constant`; tests pass `flatten_constant_operand_for_test`).
 fn flatten_op_to_insn<F, LC>(
     op: &super::flow::SpaceOperation,
     get_register: &mut F,
@@ -2489,7 +2872,7 @@ where
 /// Production callers (`GraphFlattener::flatten_arg` via
 /// `self.lower_constant`) thread the per-call closure that resolves
 /// `Opaque(Ref)` to the real `w_code` PyObject pointer.  Tests pass
-/// [`flatten_constant_operand_for_probe`] (a `ConstRef(0)` placeholder).
+/// [`flatten_constant_operand_for_test`] (a `ConstRef(0)` placeholder).
 /// Variable / list / descr / indirect-call-targets handling is the
 /// same in both cases; only constant operand lowering is pluggable.
 fn flatten_arg_with_lowering<F, LC>(
@@ -2639,6 +3022,30 @@ pub struct LoweringContext {
     /// so the residual_call Insn has no result Register and no
     /// `ListI` (no scalar Int args).
     pub store_subscr_fn_idx: u16,
+    /// `build_list_fn` descrs-pool index — see codewriter.rs:2401
+    /// (`bind(assembler, cpu.build_list_fn as *const (),
+    /// CallFlavor::Plain)`) for the production source.  BUILD_LIST
+    /// (single HLOp opname `newlist`) lowers to `residual_call_ir_r`
+    /// via [`build_build_list_fn_residual_call_ir_r_insn`] which
+    /// pads unused item slots with `ConstInt(0)` matching the
+    /// inline emit at codewriter.rs:6390-6398.  Walker only emits
+    /// `newlist` HLOp on graph for argc ≤ 3; argc > 3 emits
+    /// `abort_permanent` instead, so the canonical lowering arm
+    /// returns `None` (passthrough) on argc > 3.
+    pub build_list_fn_idx: u16,
+    /// `call_fn_N` descrs-pool indices for nargs ∈ 0..=8 — see
+    /// codewriter.rs:3206-3245 for the production source.  CALL
+    /// (single HLOp opname `simple_call`) lowers to
+    /// `residual_call_r_r(call_fn_N_idx, [callable, arg0, ...],
+    /// Descr) → reg` via [`build_call_fn_residual_call_r_r_insn`].
+    /// Indexed by nargs (`call_fn_idx_by_nargs[nargs]`) per
+    /// [[feedback-no-hashmap-ever]] — `[u16; 9]` keeps the
+    /// statically-known 0..=8 arity range position-indexed.
+    /// `simple_call` HLOps with nargs > 8 are walker non-orthodox
+    /// (the walker emits `abort_permanent` instead and skips the
+    /// HLOp record), so the lowering arm returns `None`
+    /// (passthrough) on nargs > 8.
+    pub call_fn_idx_by_nargs: [u16; 9],
 }
 
 /// Map a BINARY_OP HLOp opname (`add`/.../`xor`/`getitem` plus the
@@ -3021,7 +3428,7 @@ pub fn build_get_current_exception_fn_residual_call_r_r_insn(
 /// `arg_kinds = vec![Kind::Ref; ref_operands.len()]`, ResKind = Ref
 /// → kinds `"r"` + reskind `'r'` → opname `"residual_call_r_r"`.
 /// No leading `ListI` (empty `args_i`).  Variable-arity + flavor.
-fn build_residual_call_r_r_insn_from_operands(
+pub fn build_residual_call_r_r_insn_from_operands(
     fn_idx: u16,
     ref_operands: Vec<Operand>,
     flavor: CallFlavor,
@@ -3213,11 +3620,42 @@ pub fn build_build_list_fn_residual_call_ir_r_insn(
     arg_regs: &[u16],
     dst_reg: u16,
 ) -> Insn {
+    assert_eq!(arg_regs.len(), argc, "arg_regs length must match argc");
+    let item_operands: Vec<Operand> = arg_regs
+        .iter()
+        .map(|&reg| Operand::Register(Register::new(Kind::Ref, reg)))
+        .collect();
+    build_build_list_fn_residual_call_ir_r_insn_from_operands(
+        build_list_fn_idx,
+        argc,
+        item_operands,
+        dst_reg,
+    )
+}
+
+/// Operand-flexible variant of `build_build_list_fn_residual_call_ir_r_insn`.
+/// Each item slot can be a `Register` (resolved Variable) OR a `Const*`
+/// (lowered Constant via `flatten_arg`'s Constant arm).  Used by the
+/// canonical driver's `lower_newlist_hlop_to_insn` to handle graph
+/// `newlist` HLOps whose items are Constants — upstream RPython's
+/// rtype pass would have pre-loaded these into Variables, but pyre's
+/// graph carries the un-rewritten Constants per
+/// [[project-flatten-graph-canonical-driver-2026-05-17]].
+pub fn build_build_list_fn_residual_call_ir_r_insn_from_operands(
+    build_list_fn_idx: u16,
+    argc: usize,
+    item_operands: Vec<Operand>,
+    dst_reg: u16,
+) -> Insn {
     assert!(
         argc <= 3,
         "BuildList helper only supports argc ∈ {{0, 1, 2, 3}}"
     );
-    assert_eq!(arg_regs.len(), argc, "arg_regs length must match argc");
+    assert_eq!(
+        item_operands.len(),
+        argc,
+        "item_operands length must match argc"
+    );
     let mut arg_kinds: Vec<Kind> = Vec::with_capacity(4);
     let mut args_i: Vec<Operand> = Vec::with_capacity(4);
     let mut args_r: Vec<Operand> = Vec::with_capacity(3);
@@ -3225,10 +3663,11 @@ pub fn build_build_list_fn_residual_call_ir_r_insn(
     arg_kinds.push(Kind::Int);
     args_i.push(Operand::ConstInt(argc as i64));
     // Trailing 3 slots — Ref if present, Int dummy `0` if absent.
+    let mut item_iter = item_operands.into_iter();
     for i in 0..3 {
         if i < argc {
             arg_kinds.push(Kind::Ref);
-            args_r.push(Operand::Register(Register::new(Kind::Ref, arg_regs[i])));
+            args_r.push(item_iter.next().unwrap());
         } else {
             arg_kinds.push(Kind::Int);
             args_i.push(Operand::ConstInt(0));
@@ -3509,15 +3948,10 @@ where
 /// `None` when no arm matches, instead of falling through to the
 /// passthrough [`flatten_op_to_insn`].
 ///
-/// `GraphFlattener::flatten_space_operation` uses this
-/// variant to avoid double-handling of non-HLOp ops.  The dispatcher's
-/// passthrough fallback uses `flatten_arg_for_probe` (probe-side
-/// constant lowering, `Opaque(Ref) → ConstRef(0)` placeholder) which
-/// would silently corrupt production lowering of `jit_merge_point`'s
-/// pycode `Opaque(Ref)` constant; routing non-HLOp ops back into the
-/// existing `flatten_space_operation` passthrough preserves the
-/// production `self.lower_constant` behavior for those ops while still
-/// using the dispatcher for the four retired families.
+/// `GraphFlattener::flatten_space_operation` uses this variant to
+/// avoid double-handling of non-HLOp ops — the caller's own
+/// passthrough emits them, so the dispatcher must only claim the
+/// four retired families and leave everything else to the caller.
 pub fn try_flatten_retired_family_hlop_to_insn<F, LC>(
     op: &super::flow::SpaceOperation,
     ctx: &LoweringContext,
@@ -3540,7 +3974,145 @@ where
     if let Some(insn) = lower_setitem_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
+    if let Some(insn) = lower_newlist_hlop_to_insn(op, ctx, get_register, lower_constant) {
+        return Some(insn);
+    }
+    if let Some(insn) = lower_simple_call_hlop_to_insn(op, ctx, get_register, lower_constant) {
+        return Some(insn);
+    }
     None
+}
+
+/// Lower a CALL-family pre-rtype HLOp `simple_call(callable, arg0,
+/// arg1, ..., argN-1)` → `result: Ref` to the equivalent post-rtype
+/// `residual_call_r_r(ConstInt(call_fn_N_idx), ListR([callable,
+/// arg0, ...]), Descr) → reg` Insn.  Mirrors the inline emit at
+/// codewriter.rs:6171-6179 (`build_call_fn_residual_call_r_r_insn`).
+///
+/// Arity dispatch: nargs = op.args.len() - 1 selects
+/// `ctx.call_fn_idx_by_nargs[nargs]`.  Walker contract: CALL with
+/// nargs > 8 takes the `abort_permanent` branch (codewriter.rs:6118-
+/// 6133) and does NOT record `simple_call` on the graph, so a
+/// graph-side `simple_call` with nargs > 8 indicates walker
+/// non-orthodoxy — return `None` (passthrough).
+///
+/// Returns `None` for non-`simple_call` opnames so the caller can
+/// fall through to other lowering arms.
+pub fn lower_simple_call_hlop_to_insn<F, LC>(
+    op: &super::flow::SpaceOperation,
+    ctx: &LoweringContext,
+    get_register: &mut F,
+    lower_constant: &mut LC,
+) -> Option<Insn>
+where
+    F: FnMut(super::flow::Variable) -> Register,
+    LC: FnMut(&Constant) -> Operand,
+{
+    if op.opname != "simple_call" {
+        return None;
+    }
+    if op.args.is_empty() {
+        return None;
+    }
+    let nargs = op.args.len() - 1;
+    if nargs > 8 {
+        return None;
+    }
+    // First arg is the callable, rest are call arguments.  All Ref.
+    // Constant args are accepted via `lower_constant` (matches
+    // `flatten.py:340-345 flatten_arg`'s Constant arm); upstream
+    // RPython's rtype pass would have rewritten Constant args to
+    // pre-loaded Variables, but pyre's graph carries the un-rewritten
+    // Constants per [[project-flatten-graph-canonical-driver-2026-05-17]].
+    let mut operands: Vec<Operand> = Vec::with_capacity(op.args.len());
+    for arg in &op.args {
+        let operand = match arg {
+            super::flow::SpaceOperationArg::Value(super::flow::FlowValue::Variable(var)) => {
+                Operand::Register(get_register(*var))
+            }
+            super::flow::SpaceOperationArg::Value(super::flow::FlowValue::Constant(c)) => {
+                lower_constant(c)
+            }
+            _ => return None,
+        };
+        operands.push(operand);
+    }
+    let dst_reg = match &op.result {
+        Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
+        _ => return None,
+    };
+    Some(build_residual_call_r_r_insn_from_operands(
+        ctx.call_fn_idx_by_nargs[nargs],
+        operands,
+        CallFlavor::MayForce,
+        dst_reg,
+    ))
+}
+
+/// Lower a BUILD_LIST-family pre-rtype HLOp `newlist(items)` →
+/// `result: Ref` to the equivalent post-rtype `residual_call_ir_r(
+/// ConstInt(build_list_fn_idx), ListI([argc, dummies]),
+/// ListR([item_regs]), Descr) → reg` Insn.  Mirrors the inline
+/// emit at codewriter.rs:6390-6398
+/// (`push_walker_emit(build_build_list_fn_residual_call_ir_r_insn)`)
+/// which pads unused item slots with `ConstInt(0)`.
+///
+/// Walker contract: `emit_frontend_newlist` only fires for argc ≤ 3
+/// (codewriter.rs:6332-6346 — argc > 3 takes the `abort_permanent`
+/// branch which does NOT record a `newlist` HLOp on the graph), so a
+/// graph-side `newlist` with argc > 3 indicates a walker non-orthodoxy;
+/// return `None` (passthrough) rather than asserting, matching the
+/// other lowering arms' "no match → passthrough" pattern.
+///
+/// Returns `None` for non-`newlist` opnames so the caller can fall
+/// through to other lowering arms.
+pub fn lower_newlist_hlop_to_insn<F, LC>(
+    op: &super::flow::SpaceOperation,
+    ctx: &LoweringContext,
+    get_register: &mut F,
+    lower_constant: &mut LC,
+) -> Option<Insn>
+where
+    F: FnMut(super::flow::Variable) -> Register,
+    LC: FnMut(&Constant) -> Operand,
+{
+    if op.opname != "newlist" {
+        return None;
+    }
+    let argc = op.args.len();
+    if argc > 3 {
+        return None;
+    }
+    // Walker emits each item Variable into a fresh Ref scratch via
+    // `emit_ref_copy!(arg_regs[i], item_reg)` then passes those scratch
+    // regs to the helper.  The canonical entry doesn't see those
+    // inline `ref_copy`s — it reads the item Variables directly off
+    // the SpaceOperation and resolves them through `get_register`.
+    // Constant items lower via `lower_constant` per
+    // `flatten.py:340-345 flatten_arg`'s Constant arm.
+    let item_operands: Vec<Operand> = op
+        .args
+        .iter()
+        .map(|arg| match arg {
+            super::flow::SpaceOperationArg::Value(super::flow::FlowValue::Variable(var)) => {
+                Some(Operand::Register(get_register(*var)))
+            }
+            super::flow::SpaceOperationArg::Value(super::flow::FlowValue::Constant(c)) => {
+                Some(lower_constant(c))
+            }
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let dst_reg = match &op.result {
+        Some(super::flow::FlowValue::Variable(var)) => get_register(*var).index,
+        _ => return None,
+    };
+    Some(build_build_list_fn_residual_call_ir_r_insn_from_operands(
+        ctx.build_list_fn_idx,
+        argc,
+        item_operands,
+        dst_reg,
+    ))
 }
 
 /// Construct the SETITEM-family `residual_call_r_v` Insn from raw
@@ -4312,7 +4884,7 @@ mod tests {
         let cond = Variable::new(VariableId(0), Kind::Int);
         let retval = Variable::new(VariableId(1), Kind::Int);
         let start = Block::shared(vec![cond.into()]);
-        let mut graph = FunctionGraph::new("bool_branch", start.clone(), Some(retval));
+        let graph = FunctionGraph::new("bool_branch", start.clone(), Some(retval));
 
         start.borrow_mut().exitswitch = Some(ExitSwitch::Value(cond.into()));
         let false_link = Link::new(
@@ -4728,6 +5300,8 @@ mod tests {
             compare_op_fn_idx: 13,
             truth_fn_idx: 17,
             store_subscr_fn_idx: 19,
+            build_list_fn_idx: 0,
+            call_fn_idx_by_nargs: [0; 9],
         };
 
         let mut ssarepr = SSARepr::new("retired_families");
@@ -4853,6 +5427,8 @@ mod tests {
             compare_op_fn_idx: 13,
             truth_fn_idx: 17,
             store_subscr_fn_idx: 19,
+            build_list_fn_idx: 0,
+            call_fn_idx_by_nargs: [0; 9],
         };
 
         let mut ssarepr = SSARepr::new("multi_block_lowering");
@@ -4982,6 +5558,8 @@ mod tests {
             compare_op_fn_idx: 13,
             truth_fn_idx: 17,
             store_subscr_fn_idx: 19,
+            build_list_fn_idx: 0,
+            call_fn_idx_by_nargs: [0; 9],
         };
 
         let mut ssarepr = SSARepr::new("pyre_walker_2exit");
@@ -5161,6 +5739,8 @@ mod tests {
             compare_op_fn_idx: 13,
             truth_fn_idx: 17,
             store_subscr_fn_idx: 19,
+            build_list_fn_idx: 0,
+            call_fn_idx_by_nargs: [0; 9],
         });
 
         let mut regallocs = perform_graph_register_allocation_all_kinds(&graph);
@@ -5257,12 +5837,12 @@ mod tests {
     /// Test helper companion to `identity_register_mapper`: returns a
     /// closure suitable for passing as `lower_constant` to the
     /// `lower_*_hlop_to_insn` / dispatcher helpers.  Wraps
-    /// `flatten_constant_operand_for_probe` (the probe-side default;
-    /// `Opaque(Ref) → ConstRef(0)` placeholder) — the production-side
+    /// `flatten_constant_operand_for_test`
+    /// (`Opaque(Ref) → ConstRef(0)` placeholder) — the production-side
     /// `flatten_constant_operand` would panic on the placeholder
     /// fixtures these tests use.
-    fn probe_constant_lowering() -> impl FnMut(&Constant) -> Operand {
-        flatten_constant_operand_for_probe
+    fn test_constant_lowering() -> impl FnMut(&Constant) -> Operand {
+        flatten_constant_operand_for_test
     }
 
     #[test]
@@ -5345,9 +5925,11 @@ mod tests {
             compare_op_fn_idx: 0,
             truth_fn_idx: 0,
             store_subscr_fn_idx: 0,
+            build_list_fn_idx: 0,
+            call_fn_idx_by_nargs: [0; 9],
         };
         let mut get_register = identity_register_mapper();
-        let mut lower_constant = probe_constant_lowering();
+        let mut lower_constant = test_constant_lowering();
 
         let insn = lower_binary_op_hlop_to_insn(&op, &ctx, &mut get_register, &mut lower_constant)
             .expect("BINARY_OP HLOp must lower");
@@ -5427,9 +6009,11 @@ mod tests {
             compare_op_fn_idx: 0,
             truth_fn_idx: 0,
             store_subscr_fn_idx: 0,
+            build_list_fn_idx: 0,
+            call_fn_idx_by_nargs: [0; 9],
         };
         let mut get_register = identity_register_mapper();
-        let mut lower_constant = probe_constant_lowering();
+        let mut lower_constant = test_constant_lowering();
         assert!(
             lower_binary_op_hlop_to_insn(&op, &ctx, &mut get_register, &mut lower_constant)
                 .is_none()
@@ -5453,11 +6037,13 @@ mod tests {
             compare_op_fn_idx: 0,
             truth_fn_idx: 0,
             store_subscr_fn_idx: 0,
+            build_list_fn_idx: 0,
+            call_fn_idx_by_nargs: [0; 9],
         };
 
         let hlop = SpaceOperation::new("sub", vec![lhs.into(), rhs.into()], Some(result.into()), 0);
         let mut get_register = identity_register_mapper();
-        let mut lower_constant = probe_constant_lowering();
+        let mut lower_constant = test_constant_lowering();
         let lowered =
             lower_binary_op_hlop_to_insn(&hlop, &ctx, &mut get_register, &mut lower_constant)
                 .expect("BINARY_OP HLOp must lower");
@@ -5490,7 +6076,7 @@ mod tests {
         let dual = flatten_op_to_insn(
             &dual_op,
             &mut get_register,
-            &mut flatten_constant_operand_for_probe,
+            &mut flatten_constant_operand_for_test,
         )
         .expect("residual_call SpaceOperation must lower");
 
@@ -5547,9 +6133,11 @@ mod tests {
             compare_op_fn_idx: 13,
             truth_fn_idx: 0,
             store_subscr_fn_idx: 0,
+            build_list_fn_idx: 0,
+            call_fn_idx_by_nargs: [0; 9],
         };
         let mut get_register = identity_register_mapper();
-        let mut lower_constant = probe_constant_lowering();
+        let mut lower_constant = test_constant_lowering();
 
         let insn = lower_compare_op_hlop_to_insn(&op, &ctx, &mut get_register, &mut lower_constant)
             .expect("COMPARE_OP HLOp must lower");
@@ -5605,9 +6193,11 @@ mod tests {
             compare_op_fn_idx: 13,
             truth_fn_idx: 0,
             store_subscr_fn_idx: 0,
+            build_list_fn_idx: 0,
+            call_fn_idx_by_nargs: [0; 9],
         };
         let mut get_register = identity_register_mapper();
-        let mut lower_constant = probe_constant_lowering();
+        let mut lower_constant = test_constant_lowering();
         assert!(
             lower_compare_op_hlop_to_insn(&op, &ctx, &mut get_register, &mut lower_constant)
                 .is_none()
@@ -5629,10 +6219,12 @@ mod tests {
             compare_op_fn_idx: 17,
             truth_fn_idx: 0,
             store_subscr_fn_idx: 0,
+            build_list_fn_idx: 0,
+            call_fn_idx_by_nargs: [0; 9],
         };
         let hlop = SpaceOperation::new("eq", vec![lhs.into(), rhs.into()], Some(result.into()), 0);
         let mut get_register = identity_register_mapper();
-        let mut lower_constant = probe_constant_lowering();
+        let mut lower_constant = test_constant_lowering();
         let lowered =
             lower_compare_op_hlop_to_insn(&hlop, &ctx, &mut get_register, &mut lower_constant)
                 .expect("COMPARE_OP HLOp must lower");
@@ -5660,9 +6252,11 @@ mod tests {
             compare_op_fn_idx: 0,
             truth_fn_idx: 23,
             store_subscr_fn_idx: 0,
+            build_list_fn_idx: 0,
+            call_fn_idx_by_nargs: [0; 9],
         };
         let mut get_register = identity_register_mapper();
-        let mut lower_constant = probe_constant_lowering();
+        let mut lower_constant = test_constant_lowering();
 
         let insn = lower_bool_hlop_to_insn(&op, &ctx, &mut get_register, &mut lower_constant)
             .expect("BOOL HLOp must lower");
@@ -5718,9 +6312,11 @@ mod tests {
             compare_op_fn_idx: 0,
             truth_fn_idx: 23,
             store_subscr_fn_idx: 0,
+            build_list_fn_idx: 0,
+            call_fn_idx_by_nargs: [0; 9],
         };
         let mut get_register = identity_register_mapper();
-        let mut lower_constant = probe_constant_lowering();
+        let mut lower_constant = test_constant_lowering();
         assert!(
             lower_bool_hlop_to_insn(&op, &ctx, &mut get_register, &mut lower_constant).is_none()
         );
@@ -5739,10 +6335,12 @@ mod tests {
             compare_op_fn_idx: 0,
             truth_fn_idx: 31,
             store_subscr_fn_idx: 0,
+            build_list_fn_idx: 0,
+            call_fn_idx_by_nargs: [0; 9],
         };
         let hlop = SpaceOperation::new("bool", vec![cond.into()], Some(result.into()), 0);
         let mut get_register = identity_register_mapper();
-        let mut lower_constant = probe_constant_lowering();
+        let mut lower_constant = test_constant_lowering();
         let lowered = lower_bool_hlop_to_insn(&hlop, &ctx, &mut get_register, &mut lower_constant)
             .expect("BOOL HLOp must lower");
         let prod = build_truth_fn_residual_call_r_i_insn(31, 0, 1);
@@ -5774,9 +6372,11 @@ mod tests {
             compare_op_fn_idx: 0,
             truth_fn_idx: 0,
             store_subscr_fn_idx: 41,
+            build_list_fn_idx: 0,
+            call_fn_idx_by_nargs: [0; 9],
         };
         let mut get_register = identity_register_mapper();
-        let mut lower_constant = probe_constant_lowering();
+        let mut lower_constant = test_constant_lowering();
 
         let insn = lower_setitem_hlop_to_insn(&op, &ctx, &mut get_register, &mut lower_constant)
             .expect("SETITEM HLOp must lower");
@@ -5825,9 +6425,11 @@ mod tests {
             compare_op_fn_idx: 0,
             truth_fn_idx: 0,
             store_subscr_fn_idx: 41,
+            build_list_fn_idx: 0,
+            call_fn_idx_by_nargs: [0; 9],
         };
         let mut get_register = identity_register_mapper();
-        let mut lower_constant = probe_constant_lowering();
+        let mut lower_constant = test_constant_lowering();
         assert!(
             lower_setitem_hlop_to_insn(&op, &ctx, &mut get_register, &mut lower_constant).is_none()
         );
@@ -5861,6 +6463,8 @@ mod tests {
             compare_op_fn_idx: 0,
             truth_fn_idx: 0,
             store_subscr_fn_idx: 53,
+            build_list_fn_idx: 0,
+            call_fn_idx_by_nargs: [0; 9],
         };
         let hlop = SpaceOperation::new(
             "setitem",
@@ -5869,7 +6473,7 @@ mod tests {
             0,
         );
         let mut get_register = identity_register_mapper();
-        let mut lower_constant = probe_constant_lowering();
+        let mut lower_constant = test_constant_lowering();
         let lowered =
             lower_setitem_hlop_to_insn(&hlop, &ctx, &mut get_register, &mut lower_constant)
                 .expect("SETITEM HLOp must lower");
@@ -5892,10 +6496,12 @@ mod tests {
             compare_op_fn_idx: 19,
             truth_fn_idx: 31,
             store_subscr_fn_idx: 53,
+            build_list_fn_idx: 0,
+            call_fn_idx_by_nargs: [0; 9],
         };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
-        let mut lower_constant = probe_constant_lowering();
+        let mut lower_constant = test_constant_lowering();
         let dispatched =
             flatten_op_to_insn_with_lowering(&op, &ctx, &mut get_register_a, &mut lower_constant)
                 .expect("BINARY_OP HLOp must lower via dispatcher");
@@ -5919,10 +6525,12 @@ mod tests {
             compare_op_fn_idx: 19,
             truth_fn_idx: 31,
             store_subscr_fn_idx: 53,
+            build_list_fn_idx: 0,
+            call_fn_idx_by_nargs: [0; 9],
         };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
-        let mut lower_constant = probe_constant_lowering();
+        let mut lower_constant = test_constant_lowering();
         let dispatched =
             flatten_op_to_insn_with_lowering(&op, &ctx, &mut get_register_a, &mut lower_constant)
                 .expect("COMPARE_OP HLOp must lower via dispatcher");
@@ -5946,10 +6554,12 @@ mod tests {
             compare_op_fn_idx: 19,
             truth_fn_idx: 31,
             store_subscr_fn_idx: 53,
+            build_list_fn_idx: 0,
+            call_fn_idx_by_nargs: [0; 9],
         };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
-        let mut lower_constant = probe_constant_lowering();
+        let mut lower_constant = test_constant_lowering();
         let dispatched =
             flatten_op_to_insn_with_lowering(&op, &ctx, &mut get_register_a, &mut lower_constant)
                 .expect("BOOL HLOp must lower via dispatcher");
@@ -5978,10 +6588,12 @@ mod tests {
             compare_op_fn_idx: 19,
             truth_fn_idx: 31,
             store_subscr_fn_idx: 53,
+            build_list_fn_idx: 0,
+            call_fn_idx_by_nargs: [0; 9],
         };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
-        let mut lower_constant = probe_constant_lowering();
+        let mut lower_constant = test_constant_lowering();
         let dispatched =
             flatten_op_to_insn_with_lowering(&op, &ctx, &mut get_register_a, &mut lower_constant)
                 .expect("SETITEM HLOp must lower via dispatcher");
@@ -6024,17 +6636,19 @@ mod tests {
             compare_op_fn_idx: 19,
             truth_fn_idx: 31,
             store_subscr_fn_idx: 53,
+            build_list_fn_idx: 0,
+            call_fn_idx_by_nargs: [0; 9],
         };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
-        let mut lower_constant = probe_constant_lowering();
+        let mut lower_constant = test_constant_lowering();
         let dispatched =
             flatten_op_to_insn_with_lowering(&op, &ctx, &mut get_register_a, &mut lower_constant)
                 .expect("residual_call SpaceOperation must lower via dispatcher");
         let direct = flatten_op_to_insn(
             &op,
             &mut get_register_b,
-            &mut flatten_constant_operand_for_probe,
+            &mut flatten_constant_operand_for_test,
         )
         .expect("residual_call SpaceOperation must lower via passthrough");
         assert_eq!(format!("{dispatched:?}"), format!("{direct:?}"));
@@ -6151,7 +6765,7 @@ mod tests {
         let dual = flatten_op_to_insn(
             &dual_op,
             &mut get_register,
-            &mut flatten_constant_operand_for_probe,
+            &mut flatten_constant_operand_for_test,
         )
         .expect("residual_call SpaceOperation must lower");
         let prod = build_load_const_fn_residual_call_ir_r_insn(9, 17, 4, 5);
@@ -6286,7 +6900,7 @@ mod tests {
         let dual = flatten_op_to_insn(
             &dual_op,
             &mut get_register,
-            &mut flatten_constant_operand_for_probe,
+            &mut flatten_constant_operand_for_test,
         )
         .expect("residual_call SpaceOperation must lower");
         let prod = build_load_global_fn_residual_call_ir_r_insn(12, 5, 3, 4, 6, 7);
@@ -6517,7 +7131,7 @@ mod tests {
         let dual = flatten_op_to_insn(
             &dual_op,
             &mut get_register,
-            &mut flatten_constant_operand_for_probe,
+            &mut flatten_constant_operand_for_test,
         )
         .expect("residual_call SpaceOperation must lower");
         let prod = build_call_fn_residual_call_r_r_insn(33, 5, &[6, 7, 8], 9);
@@ -6646,7 +7260,7 @@ mod tests {
         let dual = flatten_op_to_insn(
             &dual_op,
             &mut get_register,
-            &mut flatten_constant_operand_for_probe,
+            &mut flatten_constant_operand_for_test,
         )
         .expect("residual_call SpaceOperation must lower");
         let prod = build_box_int_fn_residual_call_ir_r_insn(4, 42, 7);
@@ -6858,7 +7472,7 @@ mod tests {
         let dual = flatten_op_to_insn(
             &dual_op,
             &mut get_register,
-            &mut flatten_constant_operand_for_probe,
+            &mut flatten_constant_operand_for_test,
         )
         .expect("residual_call SpaceOperation must lower");
         let prod = build_build_list_fn_residual_call_ir_r_insn(18, 2, &[3, 4], 5);
@@ -7107,7 +7721,7 @@ mod tests {
         // `make_return` for the normal path expects the returnblock
         // input to be a single Variable; pass `res` as the return slot
         // (will be renamed via the normal link).
-        let mut graph = FunctionGraph::new(name, start.clone(), Some(res));
+        let graph = FunctionGraph::new(name, start.clone(), Some(res));
 
         super::super::flow::push_op(
             &start,
@@ -7143,6 +7757,8 @@ mod tests {
             compare_op_fn_idx: 0,
             truth_fn_idx: 0,
             store_subscr_fn_idx: 0,
+            build_list_fn_idx: 0,
+            call_fn_idx_by_nargs: [0; 9],
         };
         flatten_graph_with_lowering(
             &graph,
@@ -7395,7 +8011,7 @@ mod tests {
         let rhs = Variable::new(VariableId(1), Kind::Int);
         let res = Variable::new(VariableId(2), Kind::Int);
         let start = Block::shared(vec![lhs.into(), rhs.into()]);
-        let mut graph = FunctionGraph::new("ovf_no_catch", start.clone(), Some(res));
+        let graph = FunctionGraph::new("ovf_no_catch", start.clone(), Some(res));
         super::super::flow::push_op(
             &start,
             SpaceOperation::new(

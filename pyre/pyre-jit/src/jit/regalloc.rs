@@ -343,7 +343,7 @@ pub(super) fn perform_graph_register_allocation(
 }
 
 /// Run `perform_graph_register_allocation` once per `Kind` and collect
-/// the per-kind `GraphAllocationResult`s into a single map, mirroring
+/// the per-kind `GraphAllocationResult`s, mirroring
 /// `rpython/jit/codewriter/codewriter.py:44-46`:
 ///
 /// ```python
@@ -352,18 +352,21 @@ pub(super) fn perform_graph_register_allocation(
 ///     regallocs[kind] = perform_register_allocation(graph, kind)
 /// ```
 ///
-/// The resulting `HashMap<Kind, GraphAllocationResult>` is the direct
-/// analog of upstream's `regallocs` dict and is the input shape that a
-/// future `flatten_graph(graph, regallocs, ...)` driver will read.
-/// (Phase 1 of the production-wiring plan tracked as Task #224.)
+/// The resulting `[GraphAllocationResult; 3]` is indexed by
+/// `Kind::index()` (`Int=0, Ref=1, Float=2`).  Upstream uses a Python
+/// dict; pyre uses `[T; 3]` per [[feedback-no-hashmap-ever]] — the
+/// RPython `KINDS` list has 3 statically-known entries so the dict
+/// degenerates to a position-indexed array in any RPython-orthodox
+/// port.  This is the input shape that the canonical
+/// `flatten_graph(graph, regallocs, ...)` driver consumes.
 pub fn perform_graph_register_allocation_all_kinds(
     graph: &FlowGraph,
-) -> HashMap<Kind, GraphAllocationResult> {
-    let mut regallocs = HashMap::new();
-    for &kind in &Kind::ALL {
-        regallocs.insert(kind, perform_graph_register_allocation(graph, kind));
-    }
-    regallocs
+) -> [GraphAllocationResult; 3] {
+    [
+        perform_graph_register_allocation(graph, Kind::Int),
+        perform_graph_register_allocation(graph, Kind::Ref),
+        perform_graph_register_allocation(graph, Kind::Float),
+    ]
 }
 
 /// Mirrors `rpython/jit/codewriter/flatten.py:88-100 enforce_input_args`.
@@ -386,18 +389,20 @@ pub fn perform_graph_register_allocation_all_kinds(
 /// Tracks the production-wiring follow-up in Task #214.
 pub fn enforce_input_args_simulation(
     graph: &FlowGraph,
-    regallocs: &mut HashMap<Kind, GraphAllocationResult>,
+    regallocs: &mut [GraphAllocationResult; 3],
 ) {
     let inputargs = graph.startblock.borrow().inputargs.clone();
-    let mut numkinds: HashMap<Kind, u16> = HashMap::new();
+    // RPython `numkinds = {}` (flatten.py:91); pyre stores the per-kind
+    // counter in a `[u16; 3]` array indexed by `Kind::index()` per
+    // [[feedback-no-hashmap-ever]].
+    let mut numkinds: [u16; 3] = [0; 3];
     for arg in &inputargs {
         let Some(v) = arg.as_variable() else { continue };
         let Some(kind) = v.kind else { continue };
-        let realcol = *numkinds.get(&kind).unwrap_or(&0);
-        numkinds.insert(kind, realcol + 1);
-        let alloc = regallocs
-            .get_mut(&kind)
-            .expect("regallocs must contain an entry for every Kind seen in inputargs");
+        let kind_idx = kind.index();
+        let realcol = numkinds[kind_idx];
+        numkinds[kind_idx] = realcol + 1;
+        let alloc = &mut regallocs[kind_idx];
         // Inputarg never appeared in any instruction — coloring
         // skipped it. Swap is unnecessary because no register refers
         // to its color (mirrors the SSARepr-side `enforce_input_args`
@@ -446,8 +451,8 @@ pub fn enforce_input_args_simulation(
 /// Observation-only — no SSARepr or graph mutation.
 pub(super) fn count_link_renamings_per_kind(
     graph: &FlowGraph,
-    regallocs: &HashMap<Kind, GraphAllocationResult>,
-) -> HashMap<Kind, usize> {
+    regallocs: &[GraphAllocationResult; 3],
+) -> [usize; 3] {
     // Note: the `regallocs` passed in come from
     // `perform_graph_register_allocation_all_kinds`, which runs the
     // chordal coloring directly. Upstream `flatten_graph` follows
@@ -460,7 +465,7 @@ pub(super) fn count_link_renamings_per_kind(
     // otherwise the per-link step count is a lower bound, since the
     // swap can shift inputarg colors and re-introduce previously
     // coalesced renamings. Production wiring is Task #214.
-    let mut counts: HashMap<Kind, usize> = HashMap::new();
+    let mut counts: [usize; 3] = [0; 3];
     for block in graph.iterblocks() {
         let block_borrow = block.borrow();
         for link in &block_borrow.exits {
@@ -488,7 +493,13 @@ pub(super) fn count_link_renamings_per_kind(
             );
             let last_exception = link_borrow.last_exception;
             let last_exc_value = link_borrow.last_exc_value;
-            let mut per_kind: HashMap<Kind, (Vec<Register>, Vec<Register>)> = HashMap::new();
+            // Per-link per-kind (from, to) register pairs.  `[T; 3]`
+            // indexed by `Kind::index()` per [[feedback-no-hashmap-ever]].
+            let mut per_kind: [(Vec<Register>, Vec<Register>); 3] = [
+                (Vec::new(), Vec::new()),
+                (Vec::new(), Vec::new()),
+                (Vec::new(), Vec::new()),
+            ];
             for (arg, inputarg) in link_borrow.args.iter().zip(target_inputargs.iter()) {
                 let Some(src_value) = arg.as_ref() else {
                     continue;
@@ -499,9 +510,8 @@ pub(super) fn count_link_renamings_per_kind(
                 let Some(kind) = dst_var.kind else {
                     continue;
                 };
-                let Some(regalloc) = regallocs.get(&kind) else {
-                    continue;
-                };
+                let kind_idx = kind.index();
+                let regalloc = &regallocs[kind_idx];
                 let Some(&dst_color) = regalloc.coloring.get(&dst_var.id) else {
                     continue;
                 };
@@ -533,17 +543,17 @@ pub(super) fn count_link_renamings_per_kind(
                     if src_color == dst_color {
                         continue;
                     }
-                    let (frm, to) = per_kind.entry(kind).or_default();
+                    let (frm, to) = &mut per_kind[kind_idx];
                     frm.push(Register::new(kind, src_color));
                     to.push(Register::new(kind, dst_color));
                 } else if src_value.as_constant().is_some() {
                     // Constant src — always emits one renaming step.
-                    *counts.entry(kind).or_insert(0) += 1;
+                    counts[kind_idx] += 1;
                 }
             }
-            for (kind, (frm, to)) in per_kind {
-                let steps = reorder_renaming_list(&frm, &to);
-                *counts.entry(kind).or_insert(0) += steps.len();
+            for (kind_idx, (frm, to)) in per_kind.iter().enumerate() {
+                let steps = reorder_renaming_list(frm, to);
+                counts[kind_idx] += steps.len();
             }
         }
     }
@@ -596,8 +606,9 @@ pub(super) fn count_ssa_ops_per_opname(ssarepr: &SSARepr) -> HashMap<String, usi
 /// counts are tracked separately so the walker→flatten transition
 /// (Task #227) can be quantified before flipping the canonical SSARepr
 /// source.
-pub(super) fn count_ssa_copy_ops_per_kind(ssarepr: &SSARepr) -> HashMap<Kind, usize> {
-    let mut counts: HashMap<Kind, usize> = HashMap::new();
+pub(super) fn count_ssa_copy_ops_per_kind(ssarepr: &SSARepr) -> [usize; 3] {
+    // `[usize; 3]` indexed by `Kind::index()` per [[feedback-no-hashmap-ever]].
+    let mut counts: [usize; 3] = [0; 3];
     for insn in &ssarepr.insns {
         if let Insn::Op { opname, .. } = insn {
             for &kind in &Kind::ALL {
@@ -607,7 +618,7 @@ pub(super) fn count_ssa_copy_ops_per_kind(ssarepr: &SSARepr) -> HashMap<Kind, us
                     Kind::Float => "float_copy",
                 };
                 if opname == prefix {
-                    *counts.entry(kind).or_insert(0) += 1;
+                    counts[kind.index()] += 1;
                     break;
                 }
             }
@@ -645,13 +656,35 @@ pub(super) struct ExternalInputs {
 
 /// Result of `allocate_registers`.
 ///
-/// `rename` carries the per-kind `(pre_index → post_index)` map
-/// applied by `apply_rename`. `num_regs` carries the per-kind
-/// `max(color)+1` value the assembler stores in `JitCode.num_regs_*`
-/// (codewriter.py:62-67).
+/// `rename` carries the per-kind pre→post coloring map applied by
+/// `apply_rename`.  `[Vec<u16>; 3]` indexed by `Kind::index()` per
+/// [[feedback-no-hashmap-ever]] — each inner `Vec<u16>` is indexed by
+/// the pre-coloring slot and yields the post-coloring color.  Entries
+/// past the vector's length implicitly map to identity (no rename
+/// occurred for that slot).  Mirrors RPython's `(kind, pre) → post`
+/// dict at `codewriter.py:62-67` projected onto pyre's u16 slot space.
+///
+/// `num_regs` carries the per-kind `max(color)+1` value the assembler
+/// stores in `JitCode.num_regs_*` (codewriter.py:62-67).
 pub(super) struct AllocationResult {
-    pub rename: HashMap<(Kind, u16), u16>,
-    pub num_regs: HashMap<Kind, u16>,
+    pub rename: [Vec<u16>; 3],
+    /// Per-kind `max(coloring)+1` indexed by `Kind::index()` per
+    /// [[feedback-no-hashmap-ever]].  Mirrors RPython
+    /// `codewriter.py:62-67 num_regs[kind]` — pyre's `KINDS` array
+    /// of 3 statically-known kinds collapses the dict to `[u16; 3]`.
+    pub num_regs: [u16; 3],
+}
+
+/// Lookup helper for the kind-indexed rename vec: returns the post
+/// coloring for `pre`, falling back to identity when no rename was
+/// recorded.
+#[inline]
+pub(super) fn rename_lookup(rename: &[Vec<u16>; 3], kind: Kind, pre: u16) -> u16 {
+    rename[kind.index()]
+        .get(pre as usize)
+        .copied()
+        .filter(|&p| p != u16::MAX)
+        .unwrap_or(pre)
 }
 
 /// Run register allocation on `ssarepr` and produce the rename map
@@ -674,8 +707,10 @@ pub(super) fn allocate_registers(
     cfg_coalesce_pairs: &[(u16, u16)],
 ) -> AllocationResult {
     // codewriter.py:45-47 `for kind in KINDS:
-    //   regallocs[kind] = perform_register_allocation(graph, kind)`
-    let mut allocators: HashMap<Kind, RegAllocator> = HashMap::new();
+    //   regallocs[kind] = perform_register_allocation(graph, kind)`.
+    // `[RegAllocator; 3]` indexed by `Kind::index()` per
+    // [[feedback-no-hashmap-ever]].
+    let mut allocators: [RegAllocator; 3] = std::array::from_fn(|_| RegAllocator::new());
     for &kind in &Kind::ALL {
         let mut external: Vec<u16> = Vec::new();
         if kind == Kind::Ref {
@@ -705,8 +740,8 @@ pub(super) fn allocate_registers(
         } else {
             &[]
         };
-        let alloc = perform_register_allocation(ssarepr, kind, &external, cfg_pairs_for_kind);
-        allocators.insert(kind, alloc);
+        allocators[kind.index()] =
+            perform_register_allocation(ssarepr, kind, &external, cfg_pairs_for_kind);
     }
 
     // flatten.py:88-100 `enforce_input_args` — rotate inputarg colors
@@ -716,15 +751,27 @@ pub(super) fn allocate_registers(
     enforce_input_args(&mut allocators, nlocals, &inputs);
 
     // codewriter.py:62-67 `num_regs = {kind: max(coloring)+1 if coloring else 0}`.
-    let mut rename: HashMap<(Kind, u16), u16> = HashMap::new();
-    let mut num_regs: HashMap<Kind, u16> = HashMap::new();
-    for (&kind, alloc) in allocators.iter() {
+    // Per-kind rename map: `[Vec<u16>; 3]` indexed by `Kind::index()`,
+    // inner Vec keyed by pre-coloring slot.  Identity entries (no
+    // rename) are left as the slot's own index; `rename_lookup` returns
+    // identity for indices past the vector length.
+    let mut rename: [Vec<u16>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    let mut num_regs: [u16; 3] = [0; 3];
+    for &kind in &Kind::ALL {
+        let alloc = &allocators[kind.index()];
+        let max_pre = alloc.coloring.keys().copied().max().unwrap_or(0);
+        let kind_rename = &mut rename[kind.index()];
+        // Initialize to identity: index i → value i.
+        kind_rename.reserve_exact((max_pre as usize) + 1);
+        for i in 0..=max_pre {
+            kind_rename.push(i);
+        }
         for (&pre, &post) in alloc.coloring.iter() {
             if pre != post {
-                rename.insert((kind, pre), post);
+                kind_rename[pre as usize] = post;
             }
         }
-        num_regs.insert(kind, alloc.find_num_colors());
+        num_regs[kind.index()] = alloc.find_num_colors();
     }
     AllocationResult { rename, num_regs }
 }
@@ -752,14 +799,8 @@ pub(super) fn allocate_registers(
 /// trace-side Python-local mirror) followed by the portal red args
 /// (frame, ec). Int and Float kinds have no inputargs — see
 /// `ExternalInputs` docstring.
-fn enforce_input_args(
-    allocators: &mut HashMap<Kind, RegAllocator>,
-    nlocals: usize,
-    inputs: &ExternalInputs,
-) {
-    let alloc = allocators
-        .get_mut(&Kind::Ref)
-        .expect("Ref allocator must exist");
+fn enforce_input_args(allocators: &mut [RegAllocator; 3], nlocals: usize, inputs: &ExternalInputs) {
+    let alloc = &mut allocators[Kind::Ref.index()];
     let mut input_indices: Vec<u16> = (0..nlocals as u16).collect();
     // Phase 2.1c (plan staged-sauteeing-koala): stack slots no longer
     // rotated into fixed colors. The decoder consults
@@ -1166,8 +1207,8 @@ fn follow_label(
 /// but the handling is order-agnostic: if a `-live-` marker ever
 /// arrives here with registers, they'd be remapped consistently with
 /// the surrounding ops.
-pub(super) fn apply_rename(ssarepr: &mut SSARepr, rename: &HashMap<(Kind, u16), u16>) {
-    if rename.is_empty() {
+pub(super) fn apply_rename(ssarepr: &mut SSARepr, rename: &[Vec<u16>; 3]) {
+    if rename.iter().all(|v| v.is_empty()) {
         return;
     }
     for insn in ssarepr.insns.iter_mut() {
@@ -1185,7 +1226,7 @@ pub(super) fn apply_rename(ssarepr: &mut SSARepr, rename: &HashMap<(Kind, u16), 
     }
 }
 
-fn rename_operand(op: &mut Operand, rename: &HashMap<(Kind, u16), u16>) {
+fn rename_operand(op: &mut Operand, rename: &[Vec<u16>; 3]) {
     match op {
         Operand::Register(reg) => rename_register(reg, rename),
         Operand::ListOfKind(lst) => {
@@ -1198,10 +1239,8 @@ fn rename_operand(op: &mut Operand, rename: &HashMap<(Kind, u16), u16>) {
 }
 
 #[inline]
-fn rename_register(reg: &mut Register, rename: &HashMap<(Kind, u16), u16>) {
-    if let Some(&new) = rename.get(&(reg.kind, reg.index)) {
-        reg.index = new;
-    }
+fn rename_register(reg: &mut Register, rename: &[Vec<u16>; 3]) {
+    reg.index = rename_lookup(rename, reg.kind, reg.index);
 }
 
 #[cfg(test)]
@@ -1248,11 +1287,8 @@ mod tests {
         ]);
 
         let regallocs = perform_graph_register_allocation_all_kinds(&graph);
-        assert_eq!(regallocs.len(), 3);
         for &kind in &Kind::ALL {
-            let result = regallocs
-                .get(&kind)
-                .unwrap_or_else(|| panic!("missing regalloc for {kind:?}"));
+            let result = &regallocs[kind.index()];
             // Each kind has at least one variable (Int: v0 twice via
             // return link; Ref: vr in startblock inputargs; Float: vf).
             // Colorings never exceed num_colors.
@@ -1276,7 +1312,7 @@ mod tests {
         let v0 = flow_var(0, Kind::Int);
         let v1 = flow_var(1, Kind::Int);
         let start = Block::shared(vec![v0.into()]);
-        let mut graph = FunctionGraph::new("graph_regalloc", start.clone(), Some(v1));
+        let graph = FunctionGraph::new("graph_regalloc", start.clone(), Some(v1));
         push_op(
             &start,
             SpaceOperation::new("same_as", vec![v0.into()], Some(v1.into()), 0),
@@ -1329,7 +1365,7 @@ mod tests {
         let v0 = flow_var(0, Kind::Int);
         let v1 = flow_var(1, Kind::Int);
         let start = Block::shared(vec![v0.into()]);
-        let mut graph = FunctionGraph::new("graph_listofkind", start.clone(), Some(v1));
+        let graph = FunctionGraph::new("graph_listofkind", start.clone(), Some(v1));
         push_op(
             &start,
             SpaceOperation::new(
@@ -1388,8 +1424,8 @@ mod tests {
         let mut regallocs = perform_graph_register_allocation_all_kinds(&graph);
         enforce_input_args_simulation(&graph, &mut regallocs);
 
-        let ref_colors = &regallocs[&Kind::Ref].coloring;
-        let int_colors = &regallocs[&Kind::Int].coloring;
+        let ref_colors = &regallocs[Kind::Ref.index()].coloring;
+        let int_colors = &regallocs[Kind::Int.index()].coloring;
         assert_eq!(
             ref_colors.get(&a.id).copied(),
             Some(0),
@@ -1437,7 +1473,7 @@ mod tests {
             portal_inputs: true,
         };
         let result = allocate_registers(&ssarepr, 2, inputs, &[]);
-        let mut new = |old: u16| result.rename.get(&(Kind::Ref, old)).copied().unwrap_or(old);
+        let new = |old: u16| rename_lookup(&result.rename, Kind::Ref, old);
         // locals 0,1 → colors 0,1; portal regs → 2,3.
         assert_eq!(new(0), 0, "local 0 must keep color 0 after enforce");
         assert_eq!(new(1), 1, "local 1 must keep color 1 after enforce");
@@ -1468,7 +1504,7 @@ mod tests {
             portal_inputs: false,
         };
         let result = allocate_registers(&ssarepr, 1, inputs, &[]);
-        let mut new = |old: u16| result.rename.get(&(Kind::Ref, old)).copied().unwrap_or(old);
+        let new = |old: u16| rename_lookup(&result.rename, Kind::Ref, old);
         assert_eq!(new(0), 0, "local 0 stays at color 0 (enforce_input_args)");
         assert_eq!(
             new(100),
@@ -1476,8 +1512,8 @@ mod tests {
             "temp 100 reuses local 0's color (local dies before temp's def)"
         );
         assert_eq!(
-            result.num_regs.get(&Kind::Ref).copied(),
-            Some(1),
+            result.num_regs[Kind::Ref.index()],
+            1,
             "single color for the disjoint live ranges"
         );
     }
@@ -1506,9 +1542,9 @@ mod tests {
             portal_inputs: false,
         };
         let result = allocate_registers(&ssarepr, 0, inputs, &[]);
-        assert_eq!(result.num_regs.get(&Kind::Ref).copied(), Some(3));
-        assert_eq!(result.num_regs.get(&Kind::Int).copied(), Some(1));
-        assert_eq!(result.num_regs.get(&Kind::Float).copied(), Some(0));
+        assert_eq!(result.num_regs[Kind::Ref.index()], 3);
+        assert_eq!(result.num_regs[Kind::Int.index()], 1);
+        assert_eq!(result.num_regs[Kind::Float.index()], 0);
     }
 
     #[test]
@@ -1554,16 +1590,16 @@ mod tests {
             portal_inputs: false,
         };
         let result = allocate_registers(&ssarepr, 0, inputs, &[]);
-        let new5 = result.rename.get(&(Kind::Ref, 5)).copied().unwrap_or(5);
-        let new6 = result.rename.get(&(Kind::Ref, 6)).copied().unwrap_or(6);
+        let new5 = rename_lookup(&result.rename, Kind::Ref, 5);
+        let new6 = rename_lookup(&result.rename, Kind::Ref, 6);
         assert_eq!(
             new5, new6,
             "coalesce_variables should give ref_copy src and dst the same color (got {} vs {})",
             new5, new6
         );
         assert_eq!(
-            result.num_regs.get(&Kind::Ref).copied(),
-            Some(1),
+            result.num_regs[Kind::Ref.index()],
+            1,
             "after coalesce only one Ref color is needed"
         );
     }
@@ -1596,7 +1632,7 @@ mod tests {
             portal_inputs: false,
         };
         let result = allocate_registers(&ssarepr, 1, inputs, &[]);
-        let new50 = result.rename.get(&(Kind::Ref, 50)).copied().unwrap_or(50);
+        let new50 = rename_lookup(&result.rename, Kind::Ref, 50);
         assert_eq!(
             new50, 0,
             "non-inputarg reg 50 reuses dead inputarg 0's color (RPython parity)"
@@ -1634,9 +1670,9 @@ mod tests {
         ]);
         let regallocs = perform_graph_register_allocation_all_kinds(&graph);
         let counts = count_link_renamings_per_kind(&graph, &regallocs);
-        assert_eq!(counts.get(&Kind::Int).copied().unwrap_or(0), 0);
-        assert_eq!(counts.get(&Kind::Ref).copied().unwrap_or(0), 0);
-        assert_eq!(counts.get(&Kind::Float).copied().unwrap_or(0), 0);
+        assert_eq!(counts[Kind::Int.index()], 0);
+        assert_eq!(counts[Kind::Ref.index()], 0);
+        assert_eq!(counts[Kind::Float.index()], 0);
     }
 
     #[test]
@@ -1665,36 +1701,30 @@ mod tests {
         let mut coloring = HashMap::new();
         coloring.insert(v_src.id, 0u16);
         coloring.insert(v_dst.id, 1u16);
-        let mut regallocs: HashMap<Kind, GraphAllocationResult> = HashMap::new();
-        regallocs.insert(
-            Kind::Int,
+        // `[GraphAllocationResult; 3]` indexed by `Kind::index()`
+        // (`Int=0`, `Ref=1`, `Float=2`).  Empty per-kind entries for
+        // Ref/Float so the helper's `regallocs[idx]` short-circuits
+        // cleanly when `dst_var.kind` is Int.
+        let regallocs: [GraphAllocationResult; 3] = [
             GraphAllocationResult {
                 coloring,
                 num_colors: 2,
             },
-        );
-        // Empty per-kind entries for Ref/Float so the helper's
-        // `regallocs.get(&kind)` short-circuits cleanly.
-        regallocs.insert(
-            Kind::Ref,
             GraphAllocationResult {
                 coloring: HashMap::new(),
                 num_colors: 0,
             },
-        );
-        regallocs.insert(
-            Kind::Float,
             GraphAllocationResult {
                 coloring: HashMap::new(),
                 num_colors: 0,
             },
-        );
+        ];
 
         let counts = count_link_renamings_per_kind(&graph, &regallocs);
         // Single (v_src@0 → v_dst@1) pair: no cycle, one `int_copy` step.
-        assert_eq!(counts.get(&Kind::Int).copied().unwrap_or(0), 1);
-        assert_eq!(counts.get(&Kind::Ref).copied().unwrap_or(0), 0);
-        assert_eq!(counts.get(&Kind::Float).copied().unwrap_or(0), 0);
+        assert_eq!(counts[Kind::Int.index()], 1);
+        assert_eq!(counts[Kind::Ref.index()], 0);
+        assert_eq!(counts[Kind::Float.index()], 0);
     }
 
     #[test]
@@ -1750,8 +1780,8 @@ mod tests {
             .insns
             .push(op_use("ref_return", vec![reg(Kind::Ref, 1)]));
         let counts = count_ssa_copy_ops_per_kind(&ssarepr);
-        assert_eq!(counts.get(&Kind::Int).copied().unwrap_or(0), 2);
-        assert_eq!(counts.get(&Kind::Ref).copied().unwrap_or(0), 1);
-        assert_eq!(counts.get(&Kind::Float).copied().unwrap_or(0), 0);
+        assert_eq!(counts[Kind::Int.index()], 2);
+        assert_eq!(counts[Kind::Ref.index()], 1);
+        assert_eq!(counts[Kind::Float.index()], 0);
     }
 }

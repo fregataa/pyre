@@ -1053,7 +1053,6 @@ pub fn seed_compiled_trace_jitcode_test_state(
         sym.setup_kind_register_banks(ctx);
     }
 
-    let nlocals = sym.nlocals;
     for &(depth, opref) in stack_slots {
         // Match production stack writes: keep `registers_r` as a
         // semantic frame mirror. The encoder builds the color-indexed
@@ -1102,6 +1101,27 @@ pub fn stack_slot_color_map_at(jitcode_index: i32) -> Vec<u16> {
         sd.jitcodes
             .get(jitcode_index as usize)
             .map(|jc| jc.payload.metadata.stack_slot_color_map.clone())
+            .unwrap_or_default()
+    })
+}
+
+/// Return the per-semantic-local Ref-bank color assigned by regalloc for
+/// the registered jitcode at `jitcode_index`.  Forward map: local index
+/// `i` → post-rename color holding that local's Variable at trace-recorder
+/// snapshot time.  Empty vector when the jitcode hasn't been finalized.
+///
+/// Mirrors `stack_slot_color_map_at`'s contract for the local half of
+/// `locals_cells_stack_w`; used by `_with_compiled_trace_jitcode` tests
+/// that need to query "what register holds local N" without embedding a
+/// specific reg index that would couple to walker vs canonical regalloc
+/// strategies.
+pub fn local_slot_color_map_at(jitcode_index: i32) -> Vec<u16> {
+    ensure_finish_setup();
+    METAINTERP_SD.with(|r| {
+        let sd = r.borrow();
+        sd.jitcodes
+            .get(jitcode_index as usize)
+            .map(|jc| jc.payload.metadata.pyre_color_for_semantic_local.clone())
             .unwrap_or_default()
     })
 }
@@ -6156,25 +6176,20 @@ mod tests {
     //! upstream parity point, that reference is called out inline.
 
     use super::*;
-    use crate::descr::{list_float_items_len_descr, list_int_items_len_descr};
     use crate::helpers::TraceHelperAccess;
     use majit_metainterp::JitState;
     use majit_metainterp::resume::{MaterializedValue, MaterializedVirtual};
     use pyre_interpreter::bytecode::{BinaryOperator, CodeObject, ConstantData, Instruction};
     use pyre_interpreter::pyopcode::decode_instruction_at;
     use pyre_interpreter::{
-        BranchOpcodeHandler, IterOpcodeHandler, LocalOpcodeHandler, Mode, OpcodeStepExecutor,
-        PyErrorKind, SharedOpcodeHandler, compile_exec, compile_source,
+        LocalOpcodeHandler, Mode, OpcodeStepExecutor, PyErrorKind, SharedOpcodeHandler,
+        compile_exec, compile_source,
     };
     use pyre_object::OB_TYPE_OFFSET;
     use pyre_object::floatobject::w_float_get_value;
-    use pyre_object::listobject::{
-        w_list_can_append_without_realloc, w_list_getitem, w_list_uses_float_storage,
-        w_list_uses_int_storage,
-    };
+    use pyre_object::listobject::w_list_getitem;
     use pyre_object::pyobject::{INT_TYPE, LIST_TYPE, PyType, is_list};
     use std::cell::{Cell, UnsafeCell};
-    use std::rc::Rc;
 
     thread_local! {
         static TEST_CALLBACKS_INIT: Cell<bool> = const { Cell::new(false) };

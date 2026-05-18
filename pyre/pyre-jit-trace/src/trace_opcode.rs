@@ -4856,6 +4856,13 @@ impl MIFrame {
     /// it to `trace_call_callable` so the residual emits `jit_call_callable_0`
     /// on the *method*, not on the receiver (calling the list itself would be
     /// a TypeError).
+    ///
+    /// Currently unused — paired with the `list.pop` tracing abort at
+    /// `trace_call_callable` (`trace_opcode.rs:5141`); becomes the trace-
+    /// time replacement for that abort once guard-failure blackhole
+    /// resume is complete.  Kept in sync with `list_append_value` /
+    /// `list_reverse_value` so the wire-up is a one-line edit.
+    #[allow(dead_code)]
     pub(crate) fn list_pop_value(
         &mut self,
         callable: OpRef,
@@ -6626,6 +6633,15 @@ impl MIFrame {
 
     /// PyPy `RAISE_VARARGS` materialization paired with RPython
     /// pyjitpl.py:1690-1696 `opimpl_raise` bookkeeping.
+    ///
+    /// `GuardClass(exc_box, cls_const)` reads `ob_header.ob_type` at
+    /// `cpu.vtable_offset = OB_TYPE_OFFSET = 0`.  Pyre allocates each
+    /// `W_ExceptionObject` with `ob_type` pointing at the per-`ExcKind`
+    /// `PyType` static (`EXC_VALUE_ERROR_TYPE`, `EXC_OVERFLOW_ERROR_TYPE`,
+    /// …; `excobject.rs::exc_kind_to_pytype`), so this guard
+    /// discriminates the actual subclass.  Matches RPython's
+    /// `OBJECT.typeptr = specific class` (`rclass.py:167-174`) and
+    /// `opimpl_raise`'s `cls_of_box(exc)` shape (`pyjitpl.py:1687-1693`).
     fn seed_raised_exception(&mut self, exc_box: OpRef, concrete_exc: PyObjectRef) {
         if !concrete_exc.is_null() {
             let exc_class_ptr = unsafe {
@@ -8072,7 +8088,6 @@ impl OpcodeStepExecutor for MIFrame {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::rc::Rc;
 
     #[cfg(feature = "cranelift")]
     fn clear_pending_jit_exception() {
