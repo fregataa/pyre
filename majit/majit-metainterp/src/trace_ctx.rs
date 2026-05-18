@@ -656,6 +656,16 @@ impl TraceCtx {
         self.constants.raw_bits(opref)
     }
 
+    /// Typed counterpart to [`Self::const_value`] — returns the
+    /// `Value` (`Int`/`Ref`/`Float`/`Void`) directly instead of the
+    /// raw `i64` cast.  Task #297 convergence path: optimizer /
+    /// guard-recovery consumers that need to distinguish Ref vs Int
+    /// constants should migrate to this reader so the raw-i64 API can
+    /// retire once the backend `set_constants` signature flips.
+    pub fn const_typed_value(&self, opref: OpRef) -> Option<majit_ir::Value> {
+        self.constants.get_value(opref)
+    }
+
     /// Constant-fold a pure field read on a constant object pointer.
     /// If `obj` is a constant and `descr` is immutable, reads the field
     /// at runtime and returns the value as a constant OpRef.

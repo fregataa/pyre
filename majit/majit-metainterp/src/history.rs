@@ -1862,6 +1862,16 @@ impl TraceCtx {
         self.constants.raw_bits(opref)
     }
 
+    /// `history.py:204` `Const.same_constant`-adjacent typed reader.
+    /// Returns the typed `Value` (Int/Ref/Float/Void) for a constant
+    /// `OpRef`.  Task #297 convergence path: every `constant_value` /
+    /// `raw_bits` consumer that needs to distinguish primitive types
+    /// (rather than treat them all as `i64`) should migrate here.
+    /// Internally identical to [`ConstantPool::get_value`].
+    pub fn constant_typed_value(&self, opref: OpRef) -> Option<majit_ir::Value> {
+        self.constants.get_value(opref)
+    }
+
     /// `pyjitpl.py:2548 generate_guard()` parity: tracer-stage guards
     /// carry `descr=None`. The optimizer's `store_final_boxes_in_guard`
     /// (mod.rs:3417 with codex #1 fix) mints the descr via

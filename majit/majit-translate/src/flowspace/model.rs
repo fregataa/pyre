@@ -1616,6 +1616,18 @@ impl HostEnv {
         ] {
             self.insert_builtin(name, HostObject::new_builtin_callable(name));
         }
+        // Class-method qualnames used by `@typer_for(<class>.__init__)`
+        // decorators upstream (rbuiltin.py:264-305).  Pyre encodes them
+        // as single-string qualname builtins instead of resolving via
+        // descriptor lookup.  `EnvironmentError.__init__` (rbuiltin.py:269)
+        // is omitted — its body uses `r_self.setfield(v_self, 'errno', ...)`
+        // which requires InstanceRepr setfield trait plumbing that is
+        // not yet wired through `findbltintyper`; registering only the
+        // qualname without the typer body surfaces as a registry hit
+        // that returns no body, which is observably wrong.
+        for name in ["object.__init__"] {
+            self.insert_builtin(name, HostObject::new_builtin_callable(name));
+        }
     }
 
     fn bootstrap_std_modules(&mut self) {
@@ -1638,6 +1650,16 @@ impl HostEnv {
         // 직접 조회한다.
         let rarithmetic = HostObject::new_module("rpython.rlib.rarithmetic");
         rarithmetic.module_set("ovfcheck", HostObject::new_builtin_callable("ovfcheck"));
+        // `rbuiltin.py:221 @typer_for(rarithmetic.intmask)` /
+        // `rbuiltin.py:228 @typer_for(rarithmetic.longlongmask)`.
+        rarithmetic.module_set(
+            "intmask",
+            HostObject::new_builtin_callable("rarithmetic.intmask"),
+        );
+        rarithmetic.module_set(
+            "longlongmask",
+            HostObject::new_builtin_callable("rarithmetic.longlongmask"),
+        );
 
         os.module_set("fdopen", HostObject::new_builtin_callable("os.fdopen"));
         os.module_set("tmpfile", HostObject::new_builtin_callable("os.tmpfile"));
@@ -1696,6 +1718,90 @@ impl HostEnv {
             HostObject::new_builtin_callable("rpython.rlib.rpath.rsplitdrive"),
         );
 
+        // `rpython.rlib.objectmodel` — host-side namespace for typing-time
+        // helpers like `keepalive_until_here` (rbuiltin.py:643-648) whose
+        // RPython decorators look up the callable by module attribute.
+        let objectmodel = HostObject::new_module("rpython.rlib.objectmodel");
+        objectmodel.module_set(
+            "keepalive_until_here",
+            HostObject::new_builtin_callable("objectmodel.keepalive_until_here"),
+        );
+        objectmodel.module_set(
+            "free_non_gc_object",
+            HostObject::new_builtin_callable("objectmodel.free_non_gc_object"),
+        );
+
+        // `rpython.rtyper.lltypesystem.lltype` — typing-time callables that
+        // RPython routes through `@typer_for(lltype.<name>)` decorators
+        // (rbuiltin.py:412-415).  Pyre's surface DSL synthesises most
+        // `lltype.*` ops directly from `front/ast.rs` (no HostObject lookup
+        // in the production dispatch), so these entries currently exist
+        // only to make the BUILTIN_TYPER registry structurally match
+        // upstream — the dispatch flips on once the M2.5g extern-Rust-helper
+        // walker lands.
+        let lltype = HostObject::new_module("rpython.rtyper.lltypesystem.lltype");
+        lltype.module_set("typeOf", HostObject::new_builtin_callable("lltype.typeOf"));
+        lltype.module_set(
+            "nullptr",
+            HostObject::new_builtin_callable("lltype.nullptr"),
+        );
+        lltype.module_set(
+            "getRuntimeTypeInfo",
+            HostObject::new_builtin_callable("lltype.getRuntimeTypeInfo"),
+        );
+        lltype.module_set("Ptr", HostObject::new_builtin_callable("lltype.Ptr"));
+        lltype.module_set(
+            "identityhash",
+            HostObject::new_builtin_callable("lltype.identityhash"),
+        );
+        lltype.module_set(
+            "runtime_type_info",
+            HostObject::new_builtin_callable("lltype.runtime_type_info"),
+        );
+        lltype.module_set(
+            "direct_ptradd",
+            HostObject::new_builtin_callable("lltype.direct_ptradd"),
+        );
+        lltype.module_set(
+            "direct_fieldptr",
+            HostObject::new_builtin_callable("lltype.direct_fieldptr"),
+        );
+        lltype.module_set(
+            "direct_arrayitems",
+            HostObject::new_builtin_callable("lltype.direct_arrayitems"),
+        );
+        lltype.module_set(
+            "cast_opaque_ptr",
+            HostObject::new_builtin_callable("lltype.cast_opaque_ptr"),
+        );
+        lltype.module_set(
+            "length_of_simple_gcarray_from_opaque",
+            HostObject::new_builtin_callable("lltype.length_of_simple_gcarray_from_opaque"),
+        );
+        lltype.module_set(
+            "cast_pointer",
+            HostObject::new_builtin_callable("lltype.cast_pointer"),
+        );
+        lltype.module_set(
+            "render_immortal",
+            HostObject::new_builtin_callable("lltype.render_immortal"),
+        );
+        lltype.module_set("free", HostObject::new_builtin_callable("lltype.free"));
+        lltype.module_set("malloc", HostObject::new_builtin_callable("lltype.malloc"));
+
+        // `rpython.rtyper.lltypesystem.llmemory` — address-arithmetic
+        // and weakref typing callables routed through
+        // `@typer_for(llmemory.<name>)` decorators upstream.
+        let llmemory = HostObject::new_module("rpython.rtyper.lltypesystem.llmemory");
+        llmemory.module_set(
+            "cast_ptr_to_adr",
+            HostObject::new_builtin_callable("llmemory.cast_ptr_to_adr"),
+        );
+        llmemory.module_set(
+            "cast_int_to_adr",
+            HostObject::new_builtin_callable("llmemory.cast_int_to_adr"),
+        );
+
         let mut mods = self.modules.lock().unwrap();
         mods.insert("__builtin__".into(), self.builtin_module.clone());
         mods.insert("os".into(), os);
@@ -1703,6 +1809,9 @@ impl HostEnv {
         mods.insert("rpython.rlib.rfile".into(), rfile);
         mods.insert("rpython.rlib.rpath".into(), rpath);
         mods.insert("rpython.rlib.rarithmetic".into(), rarithmetic);
+        mods.insert("rpython.rlib.objectmodel".into(), objectmodel);
+        mods.insert("rpython.rtyper.lltypesystem.lltype".into(), lltype);
+        mods.insert("rpython.rtyper.lltypesystem.llmemory".into(), llmemory);
     }
 
     /// upstream `getattr(__builtin__, name)` — `flowcontext.py:851`.

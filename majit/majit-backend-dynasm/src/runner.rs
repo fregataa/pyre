@@ -2910,6 +2910,15 @@ impl Backend for DynasmBackend {
         Some(source_descr)
     }
 
+    fn find_source_fail_descr(
+        &self,
+        token: &JitCellToken,
+        trace_id: u64,
+        fail_index: u32,
+    ) -> Option<Arc<dyn majit_ir::Descr>> {
+        Self::try_find_descr(token, trace_id, fail_index)
+    }
+
     fn update_fail_descr_recovery_layout(
         &mut self,
         token: &JitCellToken,

@@ -1288,10 +1288,37 @@ impl MixLevelHelperAnnotator {
     /// error so call sites (e.g. `rtyper_finish_helpers`) fail loudly
     /// instead of silently running un-optimised helper graphs.
     pub fn backend_optimize(&self) -> Result<(), TyperError> {
+        // Line-by-line skeleton matching the upstream four-line body.
+        // The `backend_optimizations(translator, newgraphs, ...)` call
+        // is the load-bearing step that's blocked on the backendopt
+        // port; we capture the surrounding lines so the structure is
+        // visible at audit time and the convergence is mechanical
+        // once the call is implementable.
+
+        // upstream: translator = self.rtyper.annotator.translator
+        let _translator = self
+            .rtyper
+            .upgrade()
+            .and_then(|r| r.annotator.upgrade())
+            .map(|a| a.translator.clone());
+        // upstream: newgraphs = list(self.newgraphs)
+        let _newgraphs: Vec<_> = self.newgraphs.borrow().clone();
+        // upstream: backend_optimizations(translator, newgraphs,
+        //                                  secondary=True,
+        //                                  inline_graph_from_anywhere=True,
+        //                                  **flags)
+        // Blocked on `rpython/translator/backendopt/all.py` port; surface
+        // the error before reaching `newgraphs.clear()` so the call
+        // chain fails loudly (rather than silently running un-optimised
+        // helper graphs).
         Err(TyperError::message(
             "annlowlevel.py:277 MixLevelHelperAnnotator.backend_optimize port pending \
              (blocked on rpython/translator/backendopt/all.py port)",
         ))
+        // upstream: self.newgraphs.clear() — only runs after a
+        // successful backend_optimizations return; the stub never
+        // reaches it.  When the call lands, restore the clear-after
+        // ordering.
     }
 }
 

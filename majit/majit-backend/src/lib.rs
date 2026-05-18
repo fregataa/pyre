@@ -1825,6 +1825,25 @@ pub trait Backend: Send {
         None
     }
 
+    /// `history.py:125` `cpu.get_latest_descr(deadframe)` parity — return
+    /// the source `FailDescr` Arc keyed by `(token, trace_id, fail_index)`
+    /// **without** gating on whether a bridge has already been compiled
+    /// for it.  `compiled_bridge_descr_arc` answers "does the bridge exist
+    /// and what's its source descr"; this answers "what descr would a
+    /// bridge for this guard be compiled from", which is the form a
+    /// pre-compile lookup (`bridge_source_descr`) needs.
+    ///
+    /// Returns `None` for backends without a token-keyed descr store
+    /// (bare-backend tests).  Production dynasm / cranelift override.
+    fn find_source_fail_descr(
+        &self,
+        _token: &JitCellToken,
+        _trace_id: u64,
+        _fail_index: u32,
+    ) -> Option<Arc<dyn Descr>> {
+        None
+    }
+
     /// Inspect static exit layouts for any compiled trace owned by this token.
     ///
     /// This is the trace-id keyed counterpart to the root/bridge-specific

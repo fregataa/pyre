@@ -7820,27 +7820,30 @@ impl<M: Clone> MetaInterp<M> {
                 return Some(descr.clone());
             }
         }
-        // `warmspot.py:1022` `cpu.get_latest_descr(deadframe)` parity:
-        // when `op.descr` is unavailable on the primary path (post-retrace
-        // exit_layouts eviction, synthetic / cut-tentative ops) the
-        // backend still owns the live FailDescr Arc via its per-token
-        // `fail_descrs` vec — same identity pyre's runtime guard-failure
-        // helpers received as `descr_addr` and the same identity PyPy's
-        // deadframe carries.  Walk the current token first, then
-        // `previous_tokens` (matches `bridge_was_compiled`).  The full
-        // Unified-Descr identity flip (jf_descr embedding the meta Arc
-        // address) is the structural fix that lets this fallback retire;
-        // until then it covers exit_layouts eviction.
+        // `history.py:125` / `warmspot.py:1022` `cpu.get_latest_descr
+        // (deadframe)` parity: when `op.descr` is unavailable on the
+        // primary path (post-retrace exit_layouts eviction, synthetic /
+        // cut-tentative ops) the backend still owns the live FailDescr
+        // Arc via its per-token `fail_descrs` vec — same identity pyre's
+        // runtime guard-failure helpers received as `descr_addr` and the
+        // same identity PyPy's deadframe carries.  Walk the current
+        // token first, then `previous_tokens`.  `find_source_fail_descr`
+        // returns the source descr unconditionally — the bridge-existence
+        // check is only relevant to `bridge_was_compiled`, which is a
+        // separate question.  The full Unified-Descr identity flip
+        // (jf_descr embedding the meta Arc address) is the structural fix
+        // that lets this fallback retire; until then it covers
+        // exit_layouts eviction.
         if let Some(descr) =
             self.backend
-                .compiled_bridge_descr_arc(&compiled.token, trace_id, fail_index)
+                .find_source_fail_descr(&compiled.token, trace_id, fail_index)
         {
             return Some(descr);
         }
         for prev_token in &compiled.previous_tokens {
             if let Some(descr) = self
                 .backend
-                .compiled_bridge_descr_arc(prev_token, trace_id, fail_index)
+                .find_source_fail_descr(prev_token, trace_id, fail_index)
             {
                 return Some(descr);
             }

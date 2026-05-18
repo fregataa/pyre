@@ -69,10 +69,9 @@
 //!    site is documented inline and the structural call order is
 //!    preserved.
 //! 4. **`AnsiLogger`** at upstream `:17-19` (`log = AnsiLogger("translation")`)
-//!    is not ported. The driver's `log.info(...)` calls land as
-//!    `println!` lines; the format strings match upstream verbatim so
-//!    the observable text is identical modulo ANSI colouring. Same
-//!    convergence path as [`crate::translator::timing::Timer::pprint`].
+//!    is routed through the [`LOG`] module-level static; the
+//!    `TranslationDriver::info(...)` method delegates to `LOG.info(...)`.
+//!    Sister convergence with [`crate::translator::timing::Timer::pprint`].
 
 use std::any::Any;
 use std::cell::{Cell, RefCell};
@@ -84,8 +83,14 @@ use crate::config::config::{Config, ConfigError, ConfigValue, OptionValue};
 use crate::config::translationoption::{
     _GLOBAL_TRANSLATIONCONFIG, get_combined_translation_config,
 };
+use crate::tool::ansi_print::AnsiLogger;
 use crate::translator::targetspec::TargetSpecDict;
 use crate::translator::timing::{SystemClock, Timer};
+
+/// Upstream `driver.py:19` `log = AnsiLogger("translation")`.  Module-
+/// level logger for the translation driver; `TranslationDriver::info`
+/// dispatches through this static.
+pub static LOG: AnsiLogger = AnsiLogger::new("translation");
 use crate::translator::tool::taskengine::{
     SimpleTaskEngine, TaskEngineHooks, TaskError, TaskOutput,
 };
@@ -1164,11 +1169,10 @@ impl TranslationDriver {
         })
     }
 
-    /// Upstream `info(self, msg)` at `:250-251`.
+    /// Upstream `info(self, msg)` at `:250-251` — `log.info(msg)` via
+    /// the module-level [`LOG`] `AnsiLogger("translation")`.
     pub fn info(&self, msg: &str) {
-        // Upstream `log.info(msg)`. AnsiLogger not ported — see
-        // module docstring for the convergence path.
-        println!("{msg}");
+        LOG.info(msg);
     }
 
     /// Upstream `_profile(self, goal, func)` at `:253-260`:

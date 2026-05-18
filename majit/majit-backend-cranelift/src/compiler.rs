@@ -14018,6 +14018,20 @@ impl majit_backend::Backend for CraneliftBackend {
         Some(source_descr as Arc<dyn majit_ir::Descr>)
     }
 
+    fn find_source_fail_descr(
+        &self,
+        token: &JitCellToken,
+        trace_id: u64,
+        fail_index: u32,
+    ) -> Option<Arc<dyn majit_ir::Descr>> {
+        let compiled = token
+            .compiled
+            .as_ref()
+            .and_then(|compiled| compiled.downcast_ref::<CompiledLoop>())?;
+        let descr = find_fail_descr_in_fail_descrs(&compiled.fail_descrs, trace_id, fail_index)?;
+        Some(descr as Arc<dyn majit_ir::Descr>)
+    }
+
     fn compiled_trace_fail_descr_layouts(
         &self,
         token: &JitCellToken,

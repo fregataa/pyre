@@ -36,20 +36,10 @@
 //!         ...
 //! ```
 //!
-//! Two adaptations apply:
+//! One adaptation applies (the former logger-substitution PRE-EXISTING-
+//! ADAPTATION retired at `Timer.pprint` once `tool::ansi_print` landed):
 //!
-//! 1. **Logger substitution** (bounded PRE-EXISTING-ADAPTATION).
-//!    Upstream uses `rpython.tool.ansi_print.AnsiLogger("Timer")` for
-//!    the coloured `pprint` output. Our port has no ansi-logger port
-//!    and the driver layer itself is still being stood up, so
-//!    `pprint` emits plain stdout lines via `println!`. The format
-//!    strings are preserved verbatim so the observable text matches
-//!    upstream (modulo ANSI colour codes). *Convergence path*: when
-//!    `tool::ansi_print` ports, swap `println!` for the logger call
-//!    at `driver.py:250 log.info(msg)` / `Timer.pprint`'s
-//!    `log.bold(...)`.
-//!
-//! 2. **Injectable clock** (unavoidable Rust-language adaptation).
+//! 1. **Injectable clock** (unavoidable Rust-language adaptation).
 //!    Upstream passes `timer=time.time` as a constructor kwarg so
 //!    tests can inject a deterministic clock. The Rust port expresses
 //!    this through the `TimeSource` trait — default implementation
@@ -59,6 +49,13 @@
 
 use std::cell::{Cell, RefCell};
 use std::time::Instant;
+
+use crate::tool::ansi_print::AnsiLogger;
+
+/// Upstream `timing.py:9` `log = AnsiLogger("Timer")` module-level
+/// logger.  Routes `Timer.pprint`'s coloured bold output through the
+/// shared logger sink.
+pub static LOG: AnsiLogger = AnsiLogger::new("Timer");
 
 /// Pluggable clock source, matching upstream's `timer=time.time`
 /// constructor arg at `timing.py:12`. Returns a monotonically non-
@@ -222,25 +219,25 @@ impl<T: TimeSource> Timer<T> {
     }
 
     /// Upstream `Timer.pprint(self)` at `timing.py:38-51`. Emits the
-    /// per-event table + total row; ANSI colour bolding from
-    /// `rpython.tool.ansi_print.AnsiLogger` is dropped — see the
-    /// module docstring for the convergence path.
+    /// per-event table + total row through the module-level
+    /// [`LOG`] `AnsiLogger("Timer")`'s `bold` channel, line-by-line
+    /// matching upstream's four `log.bold(...)` calls.
     pub fn pprint(&self) {
         let total_line = {
             let spacing = " ".repeat(30 - "Total:".len());
             format!("Total:{spacing} --- {:.1} s", self.ttime())
         };
-        println!("Timings:");
+        LOG.bold("Timings:");
         for (event, time) in self.events.borrow().iter() {
             let spacing = " ".repeat(30 - event.len());
             let first = format!("{event}{spacing} --- ");
             let second = format!("{time:.1} s");
             let additional_spaces =
                 " ".repeat(total_line.len().saturating_sub(first.len() + second.len()));
-            println!("{first}{additional_spaces}{second}");
+            LOG.bold(&format!("{first}{additional_spaces}{second}"));
         }
-        println!("{}", "=".repeat(total_line.len()));
-        println!("{total_line}");
+        LOG.bold(&"=".repeat(total_line.len()));
+        LOG.bold(&total_line);
     }
 
     /// Readonly accessor for the recorded events. Upstream exposes

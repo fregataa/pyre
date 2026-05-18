@@ -8,6 +8,33 @@
 //! stack (gcreftracer.py:GCREFTRACER parity). GC's walk_roots updates
 //! shadow stack entries in place; refresh_from_gc copies updated values
 //! back to the HashMap before consumption.
+//!
+//! ## Task #297 migration status (typed `Value` over raw `i64`)
+//!
+//! Internal storage is already `HashMap<u32, Value>` (Slice 2A landed in
+//! `eeb4e15cbe`'s ConstantPool unification on main).  Remaining work is
+//! the **external API surface** flip — the `_raw` family below still
+//! returns raw `i64`/`HashMap<u32, i64>` for backend compatibility,
+//! since the four backend `set_constants` signatures still take
+//! `HashMap<u32, i64>`.  Inventory:
+//!
+//!   * `into_inner` / `snapshot_raw` / `raw_bits` — raw `i64` egress.
+//!     Two production wrappers (`history.rs:1862 constant_value`,
+//!     `trace_ctx.rs:656 const_value`) read through `raw_bits` only and
+//!     feed integer-typed regalloc consumers (offsets, sizes, scales),
+//!     so the lossy cast happens to be observation-safe today; the
+//!     migration switches them to the typed `get_value` once each
+//!     `set_constants` flips signature.
+//!   * `into_inner_typed` / `snapshot` / `get_value` — typed `Value`
+//!     egress, used by everything that needs to distinguish
+//!     `Value::Int`/`Float`/`Ref` (history merges, resume data, etc.).
+//!
+//! Convergence path: when backend `set_constants` accepts
+//! `HashMap<u32, Value>`, drop `into_inner` + `snapshot_raw` +
+//! `raw_bits` + `value_to_raw_bits` and rename the `_typed` variants to
+//! the canonical names.  Multi-file scope (~100 callsites across 4
+//! backends + every backend-local `const_value` reader); ship as its
+//! own session per the agent plan at `1fd250d2c2`.
 
 use std::collections::HashMap;
 
@@ -136,14 +163,12 @@ impl ConstantPool {
 
     /// Get the type of a constant, if recorded.
     ///
-    /// Reads the typed OpRef variant tag (ConstInt/ConstFloat/ConstPtr per
-    /// history.py:220/261/307) at priority-0 via `opref.ty()`. Falls back
-    /// to the stored `Value` variant for Untyped OpRefs (legacy callers
-    /// that reconstruct via `OpRef::from_raw`).
+    /// `history.py:220/261/307` — ConstInt/ConstFloat/ConstPtr `.type` is
+    /// pinned at construction. The typed `OpRef` variant tag carries the
+    /// same information, so `opref.ty()` is the sole authoritative
+    /// source. Returns `None` only for `OpRef::None`.
     pub fn constant_type(&self, opref: OpRef) -> Option<Type> {
-        opref
-            .ty()
-            .or_else(|| self.constants.get(&opref.raw()).map(|v| v.get_type()))
+        opref.ty()
     }
 
     /// pyjitpl.py:3572 executor.constant_from_op(a) parity:

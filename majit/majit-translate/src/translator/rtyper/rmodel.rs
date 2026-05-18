@@ -407,6 +407,17 @@ pub trait Repr: Debug + std::any::Any {
         None
     }
 
+    /// RPython `InstanceRepr.gcflavor` (`rclass.py:478`) reach-through.
+    /// Returns the upstream-string form (`"gc"` / `"raw"`) for reprs
+    /// that carry a GC flavor (`InstanceRepr`); `None` for every other
+    /// repr.  Used by `rbuiltin.rtype_free_non_gc_object` to read the
+    /// flavor without an `std::any::Any` downcast.  Default `None`
+    /// matches upstream where only `InstanceRepr` (and its subclasses)
+    /// expose `gcflavor` as a class attribute.
+    fn gc_flavor_str(&self) -> Option<&'static str> {
+        None
+    }
+
     /// RPython `Repr.setup(self)` (`rmodel.py:35-59`).
     ///
     /// ```python

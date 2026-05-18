@@ -23,9 +23,14 @@
 //!   `special_memory_pressure` + `mutate_*` quasi-immutable fields
 //!   (rclass.py:534-546). Phase R2-D, gated on `classdesc.get_param`
 //!   / bookkeeper `memory_pressure_types`.
-//! * `ClassRepr.init_vtable` + `fill_vtable_root` + `setup_vtable`
-//!   (rclass.py:296-418) — needs `lltype.malloc(immortal=True)`,
-//!   `attachRuntimeTypeInfo`, `RuntimeTypeInfo`. Phase R3.
+//!
+//! Phase R3 landed (`ClassRepr.init_vtable` at [`ClassRepr::init_vtable`]
+//! line 838, `fill_vtable_root` at [`ClassRepr::fill_vtable_root`] line
+//! 891, `setup_vtable` at [`ClassRepr::setup_vtable`] line 678,
+//! `getvtable` at line 1023, `getruntime` at line 1042) — full
+//! `lltype.malloc(immortal=True)` / `attachRuntimeTypeInfo` /
+//! `RuntimeTypeInfo` wiring is in place; the `RootClassRepr.init_vtable`
+//! override (rclass.py:435-437) is at line 1682.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -2623,6 +2628,14 @@ impl Repr for InstanceRepr {
 
     fn class_name(&self) -> &'static str {
         "InstanceRepr"
+    }
+
+    /// RPython `InstanceRepr.gcflavor` (rclass.py:478) — surface the
+    /// per-class flavor as the upstream-string form ('gc' / 'raw') so
+    /// callers (`rbuiltin.rtype_free_non_gc_object`) can read it
+    /// without an `std::any::Any` downcast.
+    fn gc_flavor_str(&self) -> Option<&'static str> {
+        Some(self.gcflavor.llflavor())
     }
 
     fn repr_class_id(&self) -> ReprClassId {

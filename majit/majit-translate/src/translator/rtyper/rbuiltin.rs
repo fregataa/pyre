@@ -49,7 +49,7 @@ use crate::translator::rtyper::extregistry::{self, ExtRegistryEntry};
 use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
 use crate::translator::rtyper::pairtype::ReprClassId;
 use crate::translator::rtyper::rmodel::{RTypeResult, Repr, ReprState};
-use crate::translator::rtyper::rtyper::{HighLevelOp, RPythonTyper};
+use crate::translator::rtyper::rtyper::{ConvertedTo, HighLevelOp, RPythonTyper};
 
 /// RPython `BUILTIN_TYPER = {}` (rbuiltin.py:14).
 ///
@@ -84,30 +84,73 @@ fn builtin_typer_map() -> &'static Mutex<HashMap<HostObject, BuiltinTyperFn>> {
 /// entries are silently skipped so bootstrap stays robust when the
 /// host environment is partially populated.
 ///
-/// Upstream rbuiltin.py continues with many more `@typer_for` entries
-/// past `list` (the last one registered here). The outstanding
-/// backlog — all needing additional [`HOST_ENV`] plumbing (module-
-/// qualified names + per-callable `HostObject`s) plus per-typer body
-/// ports:
+/// Module-qualified `@typer_for(<module>.<attr>)` entries (rarithmetic,
+/// objectmodel, lltype) reach the registry via the separate
+/// `module_entries` loop further down — `HOST_ENV.import_module
+/// (...).module_get(<attr>)`.
 ///
-///   * rbuiltin.py:221-231 — `rarithmetic.intmask` /
-///     `rarithmetic.longlongmask`
+/// Outstanding backlog from upstream rbuiltin.py — each batch needs its
+/// own dependent infra (HOST_ENV entry, helper-graph registration hook,
+/// inputarg coercion primitive, or `Repr` trait extension) before the
+/// per-typer body can land:
+///
 ///   * rbuiltin.py:234-255 — `min` / `max` (need `ll_min` / `ll_max`
 ///     helper-graph registration via `gendirectcall`)
-///   * rbuiltin.py:258-261 — `reversed`
-///   * rbuiltin.py:264-305 — `object.__init__` /
-///     `EnvironmentError.__init__` / `WindowsError.__init__`
-///   * rbuiltin.py:307-340 — `objectmodel.hlinvoke`
+///   * rbuiltin.py:258-261 — `reversed` (need `Repr::newiter` trait
+///     method + iterator repr family)
+///   * rbuiltin.py:264-305 — `object.__init__` is trivial and landed.
+///     `EnvironmentError.__init__` / `WindowsError.__init__` need
+///     `InstanceRepr::setfield` (rclass.py:511) to lower the
+///     `r_self.setfield(v_self, 'errno' / 'strerror' / 'filename' /
+///     'winerror', ...)` calls; until that helper lands the qualname
+///     `HostObject`s stay unregistered.
+///   * rbuiltin.py:307-340 — `objectmodel.hlinvoke` (PBC-callable
+///     dispatch)
 ///   * rbuiltin.py:342-344 — `range` / `xrange` / `enumerate`
-///     (delegates to `rrange.py`)
-///   * rbuiltin.py:349-460 — `lltype.malloc` / `free` / `typeOf` /
-///     `nullptr` / `cast_*` family
-///   * rbuiltin.py:462-600 — `llmemory.*` + `objectmodel.instantiate`
-///   * rbuiltin.py:700-782 — weakref family
+///     (delegate to ported `rrange.py`)
+///   * rbuiltin.py:349-460 — `lltype.malloc` / `free` family fully
+///     landed (parse_kwds-driven flag plumbing for `flavor` / `zero` /
+///     `track_allocation` / `add_memory_pressure` / `nonmovable`,
+///     `malloc_varsize` opname switch on `nb_args == 2`).
+///     `cast_pointer` / `cast_opaque_ptr` /
+///     `length_of_simple_gcarray_from_opaque` / `direct_fieldptr` /
+///     `direct_arrayitems` / `direct_ptradd` / `render_immortal` are
+///     landed.  Outstanding: `cast_primitive` (rbuiltin.py:471, needs
+///     `gen_cast` helper + the cast-table at `rbuiltin.py:480+`).
+///   * rbuiltin.py:462-600 — `llmemory.*` family (need `Address` /
+///     `_fakeaddress` ports — Task #234).  `cast_ptr_to_int` /
+///     `cast_int_to_ptr` (rbuiltin.py:543/551) are reached today
+///     through `OpKind::UnaryOp { op: "cast_ptr_to_int" / "cast_int_to_ptr" }`
+///     synthesised by `front/ast.rs:cast_op_name`; the BUILTIN_TYPER
+///     registration is deferred because upstream's `simple_call(lltype.X,
+///     ...)` shape differs in arity from the surfaced 1-arg op.
+///   * rbuiltin.py:632-648 — `objectmodel.free_non_gc_object` landed
+///     via `Repr::gc_flavor_str()` (default `None`, `InstanceRepr`
+///     overrides) — the `std::any::Any` downcast that the original
+///     port used is retired.  `keepalive_until_here` landed
+///     (registry-shape).
+///   * rbuiltin.py:651-687 — `llmemory.cast_*_adr` family: two of
+///     four landed (`cast_ptr_to_adr` / `cast_int_to_adr`).
+///     `cast_adr_to_ptr` / `cast_adr_to_int` both blocked on
+///     `raddress.AddressRepr` port — upstream asserts
+///     `isinstance(hop.args_r[0], raddress.AddressRepr)` in both
+///     bodies (rbuiltin.py:659, 667).  Free function `offsetof`
+///     (rbuiltin.py:621) blocked on `Symbolic` offset value support
+///     in `ConstValue` (upstream returns the `AddressOffset` instance
+///     as a Signed constant; pyre's `ConstValue` enum has no
+///     symbolic variant).
+///   * rbuiltin.py:688-715 — `objectmodel.instantiate` (PBC handling +
+///     `rclass.rtype_new_instance`)
+///   * rbuiltin.py:717-742 — `OrderedDict` / `objectmodel.r_dict` /
+///     `objectmodel.r_ordereddict` (need `DictRepr::DICT` /
+///     `ll_newdict` / `custom_eq_hash` interface)
+///   * rbuiltin.py:744-782 — weakref family (`weakref.ref`,
+///     `llmemory.weakref_create/deref`, `cast_ptr_to_weakrefptr`,
+///     `cast_weakrefptr_to_ptr` — need `WeakrefRepr` port)
 ///
 /// Each batch is a natural stand-alone commit once its dependent
-/// infra (HOST_ENV entry, helper-graph registration hook, or inputarg
-/// coercion primitives) lands.
+/// infra (HOST_ENV entry, helper-graph registration hook, `Repr`
+/// trait method, or inputarg coercion primitive) lands.
 fn install_default_typers(map: &mut HashMap<HostObject, BuiltinTyperFn>) {
     let entries: &[(&str, BuiltinTyperFn)] = &[
         // rbuiltin.py:172-176
@@ -126,9 +169,143 @@ fn install_default_typers(map: &mut HashMap<HostObject, BuiltinTyperFn>) {
         ("bytearray", rtype_builtin_bytearray),
         // rbuiltin.py:209-211
         ("list", rtype_builtin_list),
+        // rbuiltin.py:709-715
+        ("hasattr", rtype_builtin_hasattr),
+        // rbuiltin.py:264-267
+        ("object.__init__", rtype_object__init__),
     ];
     for (name, typer) in entries {
         if let Some(host) = HOST_ENV.lookup_builtin(name) {
+            map.insert(host, *typer);
+        }
+    }
+
+    // Module-qualified `@typer_for(<module>.<attr>)` entries — RPython
+    // resolves these via `from rpython.rlib import rarithmetic` plus
+    // `rarithmetic.intmask` attribute lookup at decorator time.  The
+    // Rust port mirrors the path by looking up the host module via
+    // `HOST_ENV.import_module(...).module_get(<attr>)`.
+    let module_entries: &[(&str, &str, BuiltinTyperFn)] = &[
+        // rbuiltin.py:220-225
+        ("rpython.rlib.rarithmetic", "intmask", rtype_intmask),
+        // rbuiltin.py:227-231
+        (
+            "rpython.rlib.rarithmetic",
+            "longlongmask",
+            rtype_longlongmask,
+        ),
+        // rbuiltin.py:643-648
+        (
+            "rpython.rlib.objectmodel",
+            "keepalive_until_here",
+            rtype_keepalive_until_here,
+        ),
+        // rbuiltin.py:632-640
+        (
+            "rpython.rlib.objectmodel",
+            "free_non_gc_object",
+            rtype_free_non_gc_object,
+        ),
+        // rbuiltin.py:412-418 — `rtype_const_result` is registered for
+        // four upstream callables.  Pyre's `front/ast.rs` synthesises
+        // the production dispatch path; these entries keep the registry
+        // structurally aligned with upstream until M2.5g lands.
+        (
+            "rpython.rtyper.lltypesystem.lltype",
+            "typeOf",
+            rtype_const_result,
+        ),
+        (
+            "rpython.rtyper.lltypesystem.lltype",
+            "nullptr",
+            rtype_const_result,
+        ),
+        (
+            "rpython.rtyper.lltypesystem.lltype",
+            "getRuntimeTypeInfo",
+            rtype_const_result,
+        ),
+        (
+            "rpython.rtyper.lltypesystem.lltype",
+            "Ptr",
+            rtype_const_result,
+        ),
+        // rbuiltin.py:559-563
+        (
+            "rpython.rtyper.lltypesystem.lltype",
+            "identityhash",
+            rtype_identity_hash,
+        ),
+        // rbuiltin.py:565-572
+        (
+            "rpython.rtyper.lltypesystem.lltype",
+            "runtime_type_info",
+            rtype_runtime_type_info,
+        ),
+        // rbuiltin.py:463-469
+        (
+            "rpython.rtyper.lltypesystem.lltype",
+            "direct_ptradd",
+            rtype_direct_ptradd,
+        ),
+        // rbuiltin.py:446-453
+        (
+            "rpython.rtyper.lltypesystem.lltype",
+            "direct_fieldptr",
+            rtype_direct_fieldptr,
+        ),
+        // rbuiltin.py:455-461
+        (
+            "rpython.rtyper.lltypesystem.lltype",
+            "direct_arrayitems",
+            rtype_direct_arrayitems,
+        ),
+        // rbuiltin.py:429-436
+        (
+            "rpython.rtyper.lltypesystem.lltype",
+            "cast_opaque_ptr",
+            rtype_cast_opaque_ptr,
+        ),
+        // rbuiltin.py:438-444
+        (
+            "rpython.rtyper.lltypesystem.lltype",
+            "length_of_simple_gcarray_from_opaque",
+            rtype_length_of_simple_gcarray_from_opaque,
+        ),
+        // rbuiltin.py:420-427
+        (
+            "rpython.rtyper.lltypesystem.lltype",
+            "cast_pointer",
+            rtype_cast_pointer_typer,
+        ),
+        // rbuiltin.py:403-410
+        (
+            "rpython.rtyper.lltypesystem.lltype",
+            "render_immortal",
+            rtype_render_immortal,
+        ),
+        // rbuiltin.py:387-401
+        ("rpython.rtyper.lltypesystem.lltype", "free", rtype_free),
+        // rbuiltin.py:349-385
+        ("rpython.rtyper.lltypesystem.lltype", "malloc", rtype_malloc),
+        // rbuiltin.py:651-657
+        (
+            "rpython.rtyper.lltypesystem.llmemory",
+            "cast_ptr_to_adr",
+            rtype_cast_ptr_to_adr,
+        ),
+        // rbuiltin.py:680-685
+        (
+            "rpython.rtyper.lltypesystem.llmemory",
+            "cast_int_to_adr",
+            rtype_cast_int_to_adr,
+        ),
+    ];
+    for (module_name, attr_name, typer) in module_entries {
+        if let Some(host) = HOST_ENV
+            .import_module(module_name)
+            .and_then(|m| m.module_get(attr_name))
+        {
             map.insert(host, *typer);
         }
     }
@@ -912,6 +1089,937 @@ fn rtype_builtin_bytearray(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) 
 /// ```
 fn rtype_builtin_list(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
     arg_repr(hop, 0)?.rtype_bltn_list(hop)
+}
+
+/// RPython `@typer_for(rarithmetic.intmask) def rtype_intmask(hop)`
+/// (rbuiltin.py:220-225).
+///
+/// ```python
+/// @typer_for(rarithmetic.intmask)
+/// def rtype_intmask(hop):
+///     hop.exception_cannot_occur()
+///     vlist = hop.inputargs(lltype.Signed)
+///     return vlist[0]
+/// ```
+fn rtype_intmask(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    hop.exception_cannot_occur()?;
+    let vlist = hop.inputargs(vec![ConvertedTo::LowLevelType(&LowLevelType::Signed)])?;
+    Ok(vlist.into_iter().next())
+}
+
+/// RPython `@typer_for(rarithmetic.longlongmask) def rtype_longlongmask(hop)`
+/// (rbuiltin.py:227-231).
+///
+/// ```python
+/// @typer_for(rarithmetic.longlongmask)
+/// def rtype_longlongmask(hop):
+///     hop.exception_cannot_occur()
+///     vlist = hop.inputargs(lltype.SignedLongLong)
+///     return vlist[0]
+/// ```
+fn rtype_longlongmask(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    hop.exception_cannot_occur()?;
+    let vlist = hop.inputargs(vec![ConvertedTo::LowLevelType(
+        &LowLevelType::SignedLongLong,
+    )])?;
+    Ok(vlist.into_iter().next())
+}
+
+/// RPython `@typer_for(hasattr) def rtype_builtin_hasattr(hop)`
+/// (rbuiltin.py:709-715).
+///
+/// ```python
+/// @typer_for(hasattr)
+/// def rtype_builtin_hasattr(hop):
+///     hop.exception_cannot_occur()
+///     if hop.s_result.is_constant():
+///         return hop.inputconst(lltype.Bool, hop.s_result.const)
+///     raise TyperError("hasattr is only suported on a constant")
+/// ```
+fn rtype_builtin_hasattr(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    use crate::annotator::model::SomeObjectTrait;
+    use crate::flowspace::model::Hlvalue;
+
+    hop.exception_cannot_occur()?;
+    let const_val = {
+        let s_result_borrow = hop.s_result.borrow();
+        let s = s_result_borrow.as_ref().ok_or_else(|| {
+            TyperError::message("rtype_builtin_hasattr: s_result missing".to_string())
+        })?;
+        if !s.is_constant() {
+            return Err(TyperError::message(
+                "hasattr is only suported on a constant".to_string(),
+            ));
+        }
+        s.const_().cloned().ok_or_else(|| {
+            TyperError::message(
+                "rtype_builtin_hasattr: is_constant() true but const_() None".to_string(),
+            )
+        })?
+    };
+    let c = HighLevelOp::inputconst(&LowLevelType::Bool, &const_val)?;
+    Ok(Some(Hlvalue::Constant(c)))
+}
+
+/// RPython `@typer_for(lltype.identityhash) def rtype_identity_hash(hop)`
+/// (rbuiltin.py:559-563).
+///
+/// ```python
+/// @typer_for(lltype.identityhash)
+/// def rtype_identity_hash(hop):
+///     vlist = hop.inputargs(hop.args_r[0])
+///     hop.exception_cannot_occur()
+///     return hop.genop('gc_identityhash', vlist, resulttype=lltype.Signed)
+/// ```
+fn rtype_identity_hash(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    use crate::translator::rtyper::rtyper::GenopResult;
+
+    let r_arg = arg_repr(hop, 0)?;
+    let vlist = hop.inputargs(vec![ConvertedTo::Repr(r_arg.as_ref())])?;
+    hop.exception_cannot_occur()?;
+    Ok(hop.genop(
+        "gc_identityhash",
+        vlist,
+        GenopResult::LLType(LowLevelType::Signed),
+    ))
+}
+
+/// RPython `@typer_for(lltype.runtime_type_info) def rtype_runtime_type_info(hop)`
+/// (rbuiltin.py:565-572).
+///
+/// ```python
+/// @typer_for(lltype.runtime_type_info)
+/// def rtype_runtime_type_info(hop):
+///     assert isinstance(hop.args_r[0], rptr.PtrRepr)
+///     vlist = hop.inputargs(hop.args_r[0])
+///     hop.exception_cannot_occur()
+///     return hop.genop('runtime_type_info', vlist,
+///                      resulttype=hop.r_result.lowleveltype)
+/// ```
+///
+fn rtype_runtime_type_info(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    use crate::translator::rtyper::rtyper::GenopResult;
+
+    let r_arg = arg_repr(hop, 0)?;
+    // upstream `assert isinstance(hop.args_r[0], rptr.PtrRepr)`
+    if !matches!(r_arg.repr_class_id(), ReprClassId::PtrRepr) {
+        return Err(TyperError::message(format!(
+            "rtype_runtime_type_info: hop.args_r[0] must be PtrRepr, got {:?}",
+            r_arg.repr_class_id()
+        )));
+    }
+    let vlist = hop.inputargs(vec![ConvertedTo::Repr(r_arg.as_ref())])?;
+    hop.exception_cannot_occur()?;
+    let lltype = {
+        let r_result_borrow = hop.r_result.borrow();
+        r_result_borrow
+            .as_ref()
+            .ok_or_else(|| {
+                TyperError::message("rtype_runtime_type_info: r_result missing".to_string())
+            })?
+            .lowleveltype()
+            .clone()
+    };
+    Ok(hop.genop("runtime_type_info", vlist, GenopResult::LLType(lltype)))
+}
+
+/// RPython `@typer_for(lltype.cast_pointer) def rtype_cast_pointer(hop)`
+/// (rbuiltin.py:420-427).
+///
+/// ```python
+/// @typer_for(lltype.cast_pointer)
+/// def rtype_cast_pointer(hop):
+///     assert hop.args_s[0].is_constant()
+///     assert isinstance(hop.args_r[1], rptr.PtrRepr)
+///     v_type, v_input = hop.inputargs(lltype.Void, hop.args_r[1])
+///     hop.exception_cannot_occur()
+///     return hop.genop('cast_pointer', [v_input],
+///                      resulttype=hop.r_result.lowleveltype)
+/// ```
+///
+fn rtype_cast_pointer_typer(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    use crate::annotator::model::SomeObjectTrait;
+    use crate::translator::rtyper::rtyper::GenopResult;
+
+    // upstream `assert hop.args_s[0].is_constant()`
+    {
+        let args_s = hop.args_s.borrow();
+        let s0 = args_s.first().ok_or_else(|| {
+            TyperError::message("rtype_cast_pointer: hop.args_s[0] missing".to_string())
+        })?;
+        if !s0.is_constant() {
+            return Err(TyperError::message(
+                "rtype_cast_pointer: hop.args_s[0] must be a constant".to_string(),
+            ));
+        }
+    }
+    let r_arg1 = arg_repr(hop, 1)?;
+    // upstream `assert isinstance(hop.args_r[1], rptr.PtrRepr)`
+    if !matches!(r_arg1.repr_class_id(), ReprClassId::PtrRepr) {
+        return Err(TyperError::message(format!(
+            "rtype_cast_pointer: hop.args_r[1] must be PtrRepr, got {:?}",
+            r_arg1.repr_class_id()
+        )));
+    }
+    let vlist = hop.inputargs(vec![
+        ConvertedTo::LowLevelType(&LowLevelType::Void),
+        ConvertedTo::Repr(r_arg1.as_ref()),
+    ])?;
+    hop.exception_cannot_occur()?;
+    let v_input = vlist
+        .into_iter()
+        .nth(1)
+        .ok_or_else(|| TyperError::message("rtype_cast_pointer: missing v_input".to_string()))?;
+    let lltype = {
+        let r_result_borrow = hop.r_result.borrow();
+        r_result_borrow
+            .as_ref()
+            .ok_or_else(|| TyperError::message("rtype_cast_pointer: r_result missing".to_string()))?
+            .lowleveltype()
+            .clone()
+    };
+    Ok(hop.genop("cast_pointer", vec![v_input], GenopResult::LLType(lltype)))
+}
+
+/// RPython `@typer_for(llmemory.cast_ptr_to_adr) def rtype_cast_ptr_to_adr(hop)`
+/// (rbuiltin.py:651-657).
+///
+/// ```python
+/// @typer_for(llmemory.cast_ptr_to_adr)
+/// def rtype_cast_ptr_to_adr(hop):
+///     vlist = hop.inputargs(hop.args_r[0])
+///     assert isinstance(vlist[0].concretetype, lltype.Ptr)
+///     hop.exception_cannot_occur()
+///     return hop.genop('cast_ptr_to_adr', vlist,
+///                      resulttype=llmemory.Address)
+/// ```
+///
+fn rtype_cast_ptr_to_adr(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    use crate::flowspace::model::Hlvalue;
+    use crate::translator::rtyper::rtyper::GenopResult;
+
+    let r_arg0 = arg_repr(hop, 0)?;
+    let vlist = hop.inputargs(vec![ConvertedTo::Repr(r_arg0.as_ref())])?;
+    // upstream `assert isinstance(vlist[0].concretetype, lltype.Ptr)`
+    {
+        let v0 = vlist.first().ok_or_else(|| {
+            TyperError::message("rtype_cast_ptr_to_adr: inputargs returned empty list".to_string())
+        })?;
+        let concrete = match v0 {
+            Hlvalue::Variable(var) => var.concretetype(),
+            Hlvalue::Constant(c) => c.concretetype.clone(),
+        };
+        if !matches!(concrete, Some(LowLevelType::Ptr(_))) {
+            return Err(TyperError::message(format!(
+                "rtype_cast_ptr_to_adr: vlist[0].concretetype must be Ptr(...), got {concrete:?}"
+            )));
+        }
+    }
+    hop.exception_cannot_occur()?;
+    Ok(hop.genop(
+        "cast_ptr_to_adr",
+        vlist,
+        GenopResult::LLType(LowLevelType::Address),
+    ))
+}
+
+/// RPython `@typer_for(getattr(object.__init__, 'im_func', object.__init__))`
+/// `def rtype_object__init__(hop)` (rbuiltin.py:264-267).
+///
+/// ```python
+/// @typer_for(getattr(object.__init__, 'im_func', object.__init__))
+/// def rtype_object__init__(hop):
+///     hop.exception_cannot_occur()
+/// ```
+///
+/// Trivial body — only declares the call cannot raise; implicit None
+/// return.  Upstream's `getattr(..., 'im_func', ...)` unwraps the
+/// Python-2 bound-method `__init__` descriptor; pyre uses a single
+/// `"object.__init__"` qualname key in HOST_ENV instead.
+fn rtype_object__init__(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    hop.exception_cannot_occur()?;
+    Ok(None)
+}
+
+/// RPython `@typer_for(llmemory.cast_int_to_adr) def rtype_cast_int_to_adr(hop)`
+/// (rbuiltin.py:680-685).
+///
+/// ```python
+/// @typer_for(llmemory.cast_int_to_adr)
+/// def rtype_cast_int_to_adr(hop):
+///     v_input, = hop.inputargs(lltype.Signed)
+///     hop.exception_cannot_occur()
+///     return hop.genop('cast_int_to_adr', [v_input],
+///                      resulttype=llmemory.Address)
+/// ```
+fn rtype_cast_int_to_adr(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    use crate::translator::rtyper::rtyper::GenopResult;
+
+    let vlist = hop.inputargs(vec![ConvertedTo::LowLevelType(&LowLevelType::Signed)])?;
+    hop.exception_cannot_occur()?;
+    Ok(hop.genop(
+        "cast_int_to_adr",
+        vlist,
+        GenopResult::LLType(LowLevelType::Address),
+    ))
+}
+
+/// RPython `@typer_for(lltype.malloc) def rtype_malloc(hop, i_flavor=None, ...)`
+/// (rbuiltin.py:349-385).
+///
+/// Six keyword-index parameters: `flavor`, `immortal`, `zero`,
+/// `track_allocation`, `add_memory_pressure`, `nonmovable`.  Each
+/// supplied keyword extends the `flags` dict that becomes the second
+/// `genop` argument.  `nb_args == 2` routes through `malloc_varsize`
+/// with a second Signed `size` operand.
+///
+/// Upstream `nonmovable` stores the Hlvalue itself
+/// (`flags['nonmovable'] = v_nonmovable`, rbuiltin.py:374), unlike every
+/// other arm which reads `.value`.  Pyre's `ConstValue::Dict` map
+/// cannot carry an `Hlvalue` payload, so a supplied `nonmovable=`
+/// keyword surfaces as a `TyperError` rather than silently storing
+/// `.value` (which would be an observable shape divergence).
+/// Production callers don't pass `nonmovable=`, so this never fires
+/// today.
+fn rtype_malloc(hop: &HighLevelOp, kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    use crate::flowspace::model::Hlvalue;
+    use crate::translator::rtyper::rmodel::impossible_repr;
+    use crate::translator::rtyper::rtyper::GenopResult;
+
+    let i_flavor = kwds_i.get("i_flavor").copied();
+    let i_immortal = kwds_i.get("i_immortal").copied();
+    let i_zero = kwds_i.get("i_zero").copied();
+    let i_track_allocation = kwds_i.get("i_track_allocation").copied();
+    let i_add_memory_pressure = kwds_i.get("i_add_memory_pressure").copied();
+    let i_nonmovable = kwds_i.get("i_nonmovable").copied();
+
+    // upstream: vlist = [hop.inputarg(lltype.Void, arg=0)]
+    let v_first = hop.inputarg(ConvertedTo::LowLevelType(&LowLevelType::Void), 0)?;
+    let mut vlist = vec![v_first];
+    let mut opname = String::from("malloc");
+
+    let _ = i_immortal; // upstream `i_immortal` is parse_kwds-only, never read from `flags`
+    // upstream `(i_flavor, lltype.Void)` — `impossible_repr` is the
+    // RPython `r_void = VoidRepr()` singleton (rmodel.py:359), the
+    // Repr counterpart of `lltype.Void`; routing the flavor slot
+    // through it pins the coercion to Void independent of `args_r[i]`.
+    let r_void: Arc<dyn Repr> = impossible_repr();
+    let kw = parse_kwds(
+        hop,
+        &[
+            (i_flavor, Some(r_void.clone())),
+            (i_immortal, None),
+            (i_zero, None),
+            (i_track_allocation, None),
+            (i_add_memory_pressure, None),
+            (i_nonmovable, None),
+        ],
+    )?;
+    let v_flavor = &kw[0];
+    let v_zero = &kw[2];
+    let v_track_allocation = &kw[3];
+    let v_add_memory_pressure = &kw[4];
+    let v_nonmovable = &kw[5];
+
+    // upstream `v_X.value` reads `.value` from the Hlvalue.  A
+    // Constant carries `.value`; a Variable raises AttributeError.
+    // Surface a TyperError matching the AttributeError instead of
+    // silently dropping the flag — the former is observably the same
+    // failure mode upstream, the latter is a silent shape divergence.
+    let constant_value = |hl: &Hlvalue, slot: &str| -> Result<ConstValue, TyperError> {
+        match hl {
+            Hlvalue::Constant(c) => Ok(c.value.clone()),
+            Hlvalue::Variable(_) => Err(TyperError::message(format!(
+                "rtype_malloc: `{slot}=` keyword value must be a constant — \
+                 upstream `v_{slot}.value` access raises AttributeError on a Variable"
+            ))),
+        }
+    };
+
+    let mut flags_map = HashMap::new();
+    // upstream: flags = {'flavor': 'gc'}
+    flags_map.insert(
+        ConstValue::ByteStr(b"flavor".to_vec()),
+        ConstValue::ByteStr(b"gc".to_vec()),
+    );
+    if let Some(v) = v_flavor.as_ref() {
+        flags_map.insert(
+            ConstValue::ByteStr(b"flavor".to_vec()),
+            constant_value(v, "flavor")?,
+        );
+    }
+    if i_zero.is_some() {
+        let v = v_zero.as_ref().ok_or_else(|| {
+            TyperError::message("rtype_malloc: parse_kwds returned None for `zero` slot")
+        })?;
+        flags_map.insert(
+            ConstValue::ByteStr(b"zero".to_vec()),
+            constant_value(v, "zero")?,
+        );
+    }
+    if i_track_allocation.is_some() {
+        let v = v_track_allocation.as_ref().ok_or_else(|| {
+            TyperError::message(
+                "rtype_malloc: parse_kwds returned None for `track_allocation` slot",
+            )
+        })?;
+        flags_map.insert(
+            ConstValue::ByteStr(b"track_allocation".to_vec()),
+            constant_value(v, "track_allocation")?,
+        );
+    }
+    if i_add_memory_pressure.is_some() {
+        let v = v_add_memory_pressure.as_ref().ok_or_else(|| {
+            TyperError::message(
+                "rtype_malloc: parse_kwds returned None for `add_memory_pressure` slot",
+            )
+        })?;
+        flags_map.insert(
+            ConstValue::ByteStr(b"add_memory_pressure".to_vec()),
+            constant_value(v, "add_memory_pressure")?,
+        );
+    }
+    if i_nonmovable.is_some() {
+        // upstream `flags['nonmovable'] = v_nonmovable` stores the
+        // Hlvalue itself; `ConstValue::Dict` here is keyed and valued
+        // over `ConstValue` and cannot carry an `Hlvalue`.  Surface a
+        // TyperError rather than silently storing `.value` and call
+        // attention to the missing carrier whenever a caller actually
+        // supplies `nonmovable=`.  Production callers don't.
+        let _ = v_nonmovable;
+        return Err(TyperError::message(
+            "rtype_malloc: `nonmovable=` keyword cannot be ported line-by-line — \
+             upstream stores the Hlvalue in the flags dict but `ConstValue::Dict` \
+             carries `ConstValue` payloads only"
+                .to_string(),
+        ));
+    }
+    let cflags = HighLevelOp::inputconst(&LowLevelType::Void, &ConstValue::Dict(flags_map))?;
+    vlist.push(Hlvalue::Constant(cflags));
+
+    let nb_args = hop.nb_args();
+    if !(1..=2).contains(&nb_args) {
+        return Err(TyperError::message(format!(
+            "rtype_malloc: assertion `1 <= nb_args <= 2` failed (nb_args={nb_args})"
+        )));
+    }
+    if nb_args == 2 {
+        let v_size = hop.inputarg(ConvertedTo::LowLevelType(&LowLevelType::Signed), 1)?;
+        vlist.push(v_size);
+        opname.push_str("_varsize");
+    }
+
+    let lltype = {
+        let r_result_borrow = hop.r_result.borrow();
+        r_result_borrow
+            .as_ref()
+            .ok_or_else(|| TyperError::message("rtype_malloc: r_result missing".to_string()))?
+            .lowleveltype()
+            .clone()
+    };
+    // upstream rbuiltin.py:383-384
+    hop.has_implicit_exception("MemoryError");
+    hop.exception_is_here()?;
+    Ok(hop.genop(&opname, vlist, GenopResult::LLType(lltype)))
+}
+
+/// RPython `@typer_for(lltype.free) def rtype_free(hop, i_flavor, i_track_allocation=None)`
+/// (rbuiltin.py:387-401).
+///
+/// ```python
+/// @typer_for(lltype.free)
+/// def rtype_free(hop, i_flavor, i_track_allocation=None):
+///     vlist = [hop.inputarg(hop.args_r[0], arg=0)]
+///     v_flavor, v_track_allocation = parse_kwds(hop,
+///         (i_flavor, lltype.Void),
+///         (i_track_allocation, None))
+///     #
+///     assert v_flavor is not None and v_flavor.value == 'raw'
+///     flags = {'flavor': 'raw'}
+///     if i_track_allocation is not None:
+///         flags['track_allocation'] = v_track_allocation.value
+///     vlist.append(hop.inputconst(lltype.Void, flags))
+///     #
+///     hop.exception_cannot_occur()
+///     hop.genop('free', vlist)
+/// ```
+///
+/// `i_flavor` is the required keyword index; absent or non-`'raw'`
+/// flavor surfaces a `TyperError` matching the upstream assertion.
+fn rtype_free(hop: &HighLevelOp, kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    use crate::flowspace::model::Hlvalue;
+    use crate::translator::rtyper::rmodel::impossible_repr;
+    use crate::translator::rtyper::rtyper::GenopResult;
+
+    let i_flavor = kwds_i.get("i_flavor").copied().ok_or_else(|| {
+        TyperError::message(
+            "rtype_free: required `flavor` keyword not present in kwds_i".to_string(),
+        )
+    })?;
+    let i_track_allocation = kwds_i.get("i_track_allocation").copied();
+    let r_arg0 = arg_repr(hop, 0)?;
+    let v_first = hop.inputarg(r_arg0.as_ref(), 0)?;
+    let mut vlist = vec![v_first];
+    // upstream `(i_flavor, lltype.Void)` — see `rtype_malloc` comment.
+    let r_void: Arc<dyn Repr> = impossible_repr();
+    let kw = parse_kwds(
+        hop,
+        &[(Some(i_flavor), Some(r_void)), (i_track_allocation, None)],
+    )?;
+    let v_flavor = kw[0].as_ref().ok_or_else(|| {
+        TyperError::message(
+            "rtype_free: parse_kwds returned None for required `flavor` slot".to_string(),
+        )
+    })?;
+    let flavor_value = match v_flavor {
+        Hlvalue::Constant(c) => &c.value,
+        Hlvalue::Variable(_) => {
+            return Err(TyperError::message(
+                "rtype_free: `flavor` keyword must be a constant".to_string(),
+            ));
+        }
+    };
+    let flavor_is_raw = matches!(flavor_value, ConstValue::ByteStr(b) if b == b"raw")
+        || matches!(flavor_value, ConstValue::UniStr(s) if s == "raw");
+    if !flavor_is_raw {
+        return Err(TyperError::message(format!(
+            "rtype_free: assertion `v_flavor.value == 'raw'` failed (got {flavor_value:?})"
+        )));
+    }
+    let mut flags_map = HashMap::new();
+    flags_map.insert(
+        ConstValue::ByteStr(b"flavor".to_vec()),
+        ConstValue::ByteStr(b"raw".to_vec()),
+    );
+    if i_track_allocation.is_some() {
+        let v = kw.get(1).and_then(|slot| slot.as_ref()).ok_or_else(|| {
+            TyperError::message(
+                "rtype_free: parse_kwds returned None for `track_allocation` slot".to_string(),
+            )
+        })?;
+        match v {
+            Hlvalue::Constant(c) => {
+                flags_map.insert(
+                    ConstValue::ByteStr(b"track_allocation".to_vec()),
+                    c.value.clone(),
+                );
+            }
+            Hlvalue::Variable(_) => {
+                return Err(TyperError::message(
+                    "rtype_free: `track_allocation=` keyword value must be a constant — \
+                     upstream `v_track_allocation.value` access raises AttributeError on a Variable"
+                        .to_string(),
+                ));
+            }
+        }
+    }
+    let cflags = HighLevelOp::inputconst(&LowLevelType::Void, &ConstValue::Dict(flags_map))?;
+    vlist.push(Hlvalue::Constant(cflags));
+    hop.exception_cannot_occur()?;
+    Ok(hop.genop("free", vlist, GenopResult::Void))
+}
+
+/// RPython `@typer_for(objectmodel.free_non_gc_object) def rtype_free_non_gc_object(hop)`
+/// (rbuiltin.py:632-640).
+///
+/// ```python
+/// @typer_for(objectmodel.free_non_gc_object)
+/// def rtype_free_non_gc_object(hop):
+///     hop.exception_cannot_occur()
+///     vinst, = hop.inputargs(hop.args_r[0])
+///     flavor = hop.args_r[0].gcflavor
+///     assert flavor != 'gc'
+///     flags = {'flavor': flavor}
+///     cflags = hop.inputconst(lltype.Void, flags)
+///     return hop.genop('free', [vinst, cflags])
+/// ```
+///
+/// The `flags` Python dict is lowered to `ConstValue::Dict` keyed on
+/// the byte-string `"flavor"` with the `Flavor::llflavor()` byte-string
+/// as value, matching the runtime shape the `free` llop-handler reads.
+fn rtype_free_non_gc_object(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    use crate::flowspace::model::Hlvalue;
+    use crate::translator::rtyper::rtyper::GenopResult;
+
+    hop.exception_cannot_occur()?;
+    let r_arg0 = arg_repr(hop, 0)?;
+    let vlist = hop.inputargs(vec![ConvertedTo::Repr(r_arg0.as_ref())])?;
+    let vinst = vlist.into_iter().next().ok_or_else(|| {
+        TyperError::message("rtype_free_non_gc_object: missing vinst".to_string())
+    })?;
+    // upstream: flavor = hop.args_r[0].gcflavor
+    let flavor_str = r_arg0.gc_flavor_str().ok_or_else(|| {
+        TyperError::message(
+            "rtype_free_non_gc_object: args_r[0] has no gcflavor (not an InstanceRepr-shaped repr)"
+                .to_string(),
+        )
+    })?;
+    // upstream: assert flavor != 'gc'
+    if flavor_str == "gc" {
+        return Err(TyperError::message(
+            "rtype_free_non_gc_object: assertion `flavor != 'gc'` failed".to_string(),
+        ));
+    }
+    let mut flags_map = HashMap::new();
+    flags_map.insert(
+        ConstValue::ByteStr(b"flavor".to_vec()),
+        ConstValue::ByteStr(flavor_str.as_bytes().to_vec()),
+    );
+    let cflags = HighLevelOp::inputconst(&LowLevelType::Void, &ConstValue::Dict(flags_map))?;
+    Ok(hop.genop(
+        "free",
+        vec![vinst, Hlvalue::Constant(cflags)],
+        GenopResult::Void,
+    ))
+}
+
+/// RPython `@typer_for(lltype.cast_opaque_ptr) def rtype_cast_opaque_ptr(hop)`
+/// (rbuiltin.py:429-436).
+///
+/// ```python
+/// @typer_for(lltype.cast_opaque_ptr)
+/// def rtype_cast_opaque_ptr(hop):
+///     assert hop.args_s[0].is_constant()
+///     assert isinstance(hop.args_r[1], rptr.PtrRepr)
+///     v_type, v_input = hop.inputargs(lltype.Void, hop.args_r[1])
+///     hop.exception_cannot_occur()
+///     return hop.genop('cast_opaque_ptr', [v_input],
+///                      resulttype=hop.r_result.lowleveltype)
+/// ```
+fn rtype_cast_opaque_ptr(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    use crate::annotator::model::SomeObjectTrait;
+    use crate::translator::rtyper::rtyper::GenopResult;
+
+    // upstream `assert hop.args_s[0].is_constant()`
+    {
+        let args_s = hop.args_s.borrow();
+        let s0 = args_s.first().ok_or_else(|| {
+            TyperError::message("rtype_cast_opaque_ptr: hop.args_s[0] missing".to_string())
+        })?;
+        if !s0.is_constant() {
+            return Err(TyperError::message(
+                "rtype_cast_opaque_ptr: hop.args_s[0] must be a constant".to_string(),
+            ));
+        }
+    }
+    let r_arg1 = arg_repr(hop, 1)?;
+    // upstream `assert isinstance(hop.args_r[1], rptr.PtrRepr)`
+    if !matches!(r_arg1.repr_class_id(), ReprClassId::PtrRepr) {
+        return Err(TyperError::message(format!(
+            "rtype_cast_opaque_ptr: hop.args_r[1] must be PtrRepr, got {:?}",
+            r_arg1.repr_class_id()
+        )));
+    }
+    let vlist = hop.inputargs(vec![
+        ConvertedTo::LowLevelType(&LowLevelType::Void),
+        ConvertedTo::Repr(r_arg1.as_ref()),
+    ])?;
+    hop.exception_cannot_occur()?;
+    let v_input = vlist
+        .into_iter()
+        .nth(1)
+        .ok_or_else(|| TyperError::message("rtype_cast_opaque_ptr: missing v_input".to_string()))?;
+    let lltype = {
+        let r_result_borrow = hop.r_result.borrow();
+        r_result_borrow
+            .as_ref()
+            .ok_or_else(|| {
+                TyperError::message("rtype_cast_opaque_ptr: r_result missing".to_string())
+            })?
+            .lowleveltype()
+            .clone()
+    };
+    Ok(hop.genop(
+        "cast_opaque_ptr",
+        vec![v_input],
+        GenopResult::LLType(lltype),
+    ))
+}
+
+/// RPython `@typer_for(lltype.length_of_simple_gcarray_from_opaque)`
+/// `def rtype_length_of_simple_gcarray_from_opaque(hop)`
+/// (rbuiltin.py:438-444).
+///
+/// ```python
+/// @typer_for(lltype.length_of_simple_gcarray_from_opaque)
+/// def rtype_length_of_simple_gcarray_from_opaque(hop):
+///     assert isinstance(hop.args_r[0], rptr.PtrRepr)
+///     v_opaque_ptr, = hop.inputargs(hop.args_r[0])
+///     hop.exception_cannot_occur()
+///     return hop.genop('length_of_simple_gcarray_from_opaque', [v_opaque_ptr],
+///                      resulttype=hop.r_result.lowleveltype)
+/// ```
+fn rtype_length_of_simple_gcarray_from_opaque(
+    hop: &HighLevelOp,
+    _kwds_i: &HashMap<String, usize>,
+) -> RTypeResult {
+    use crate::translator::rtyper::rtyper::GenopResult;
+
+    let r_arg = arg_repr(hop, 0)?;
+    let vlist = hop.inputargs(vec![ConvertedTo::Repr(r_arg.as_ref())])?;
+    hop.exception_cannot_occur()?;
+    let lltype = {
+        let r_result_borrow = hop.r_result.borrow();
+        r_result_borrow
+            .as_ref()
+            .ok_or_else(|| {
+                TyperError::message(
+                    "rtype_length_of_simple_gcarray_from_opaque: r_result missing".to_string(),
+                )
+            })?
+            .lowleveltype()
+            .clone()
+    };
+    Ok(hop.genop(
+        "length_of_simple_gcarray_from_opaque",
+        vlist,
+        GenopResult::LLType(lltype),
+    ))
+}
+
+/// RPython `@typer_for(lltype.direct_fieldptr) def rtype_direct_fieldptr(hop)`
+/// (rbuiltin.py:446-453).
+///
+/// ```python
+/// @typer_for(lltype.direct_fieldptr)
+/// def rtype_direct_fieldptr(hop):
+///     assert isinstance(hop.args_r[0], rptr.PtrRepr)
+///     assert hop.args_s[1].is_constant()
+///     vlist = hop.inputargs(hop.args_r[0], lltype.Void)
+///     hop.exception_cannot_occur()
+///     return hop.genop('direct_fieldptr', vlist,
+///                      resulttype=hop.r_result.lowleveltype)
+/// ```
+///
+fn rtype_direct_fieldptr(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    use crate::annotator::model::SomeObjectTrait;
+    use crate::translator::rtyper::rtyper::GenopResult;
+
+    let r_arg = arg_repr(hop, 0)?;
+    // upstream `assert isinstance(hop.args_r[0], rptr.PtrRepr)`
+    if !matches!(r_arg.repr_class_id(), ReprClassId::PtrRepr) {
+        return Err(TyperError::message(format!(
+            "rtype_direct_fieldptr: hop.args_r[0] must be PtrRepr, got {:?}",
+            r_arg.repr_class_id()
+        )));
+    }
+    // upstream `assert hop.args_s[1].is_constant()`
+    {
+        let args_s = hop.args_s.borrow();
+        let s1 = args_s.get(1).ok_or_else(|| {
+            TyperError::message("rtype_direct_fieldptr: hop.args_s[1] missing".to_string())
+        })?;
+        if !s1.is_constant() {
+            return Err(TyperError::message(
+                "rtype_direct_fieldptr: hop.args_s[1] must be a constant".to_string(),
+            ));
+        }
+    }
+    let vlist = hop.inputargs(vec![
+        ConvertedTo::Repr(r_arg.as_ref()),
+        ConvertedTo::LowLevelType(&LowLevelType::Void),
+    ])?;
+    hop.exception_cannot_occur()?;
+    let lltype = {
+        let r_result_borrow = hop.r_result.borrow();
+        r_result_borrow
+            .as_ref()
+            .ok_or_else(|| {
+                TyperError::message("rtype_direct_fieldptr: r_result missing".to_string())
+            })?
+            .lowleveltype()
+            .clone()
+    };
+    Ok(hop.genop("direct_fieldptr", vlist, GenopResult::LLType(lltype)))
+}
+
+/// RPython `@typer_for(lltype.direct_arrayitems) def rtype_direct_arrayitems(hop)`
+/// (rbuiltin.py:455-461).
+///
+/// ```python
+/// @typer_for(lltype.direct_arrayitems)
+/// def rtype_direct_arrayitems(hop):
+///     assert isinstance(hop.args_r[0], rptr.PtrRepr)
+///     vlist = hop.inputargs(hop.args_r[0])
+///     hop.exception_cannot_occur()
+///     return hop.genop('direct_arrayitems', vlist,
+///                      resulttype=hop.r_result.lowleveltype)
+/// ```
+fn rtype_direct_arrayitems(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    use crate::translator::rtyper::rtyper::GenopResult;
+
+    let r_arg = arg_repr(hop, 0)?;
+    // upstream `assert isinstance(hop.args_r[0], rptr.PtrRepr)`
+    if !matches!(r_arg.repr_class_id(), ReprClassId::PtrRepr) {
+        return Err(TyperError::message(format!(
+            "rtype_direct_arrayitems: hop.args_r[0] must be PtrRepr, got {:?}",
+            r_arg.repr_class_id()
+        )));
+    }
+    let vlist = hop.inputargs(vec![ConvertedTo::Repr(r_arg.as_ref())])?;
+    hop.exception_cannot_occur()?;
+    let lltype = {
+        let r_result_borrow = hop.r_result.borrow();
+        r_result_borrow
+            .as_ref()
+            .ok_or_else(|| {
+                TyperError::message("rtype_direct_arrayitems: r_result missing".to_string())
+            })?
+            .lowleveltype()
+            .clone()
+    };
+    Ok(hop.genop("direct_arrayitems", vlist, GenopResult::LLType(lltype)))
+}
+
+/// RPython `@typer_for(lltype.direct_ptradd) def rtype_direct_ptradd(hop)`
+/// (rbuiltin.py:463-469).
+///
+/// ```python
+/// @typer_for(lltype.direct_ptradd)
+/// def rtype_direct_ptradd(hop):
+///     assert isinstance(hop.args_r[0], rptr.PtrRepr)
+///     vlist = hop.inputargs(hop.args_r[0], lltype.Signed)
+///     hop.exception_cannot_occur()
+///     return hop.genop('direct_ptradd', vlist,
+///                      resulttype=hop.r_result.lowleveltype)
+/// ```
+///
+fn rtype_direct_ptradd(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    use crate::translator::rtyper::rtyper::GenopResult;
+
+    let r_arg = arg_repr(hop, 0)?;
+    // upstream `assert isinstance(hop.args_r[0], rptr.PtrRepr)`
+    if !matches!(r_arg.repr_class_id(), ReprClassId::PtrRepr) {
+        return Err(TyperError::message(format!(
+            "rtype_direct_ptradd: hop.args_r[0] must be PtrRepr, got {:?}",
+            r_arg.repr_class_id()
+        )));
+    }
+    let vlist = hop.inputargs(vec![
+        ConvertedTo::Repr(r_arg.as_ref()),
+        ConvertedTo::LowLevelType(&LowLevelType::Signed),
+    ])?;
+    hop.exception_cannot_occur()?;
+    let lltype = {
+        let r_result_borrow = hop.r_result.borrow();
+        r_result_borrow
+            .as_ref()
+            .ok_or_else(|| {
+                TyperError::message("rtype_direct_ptradd: r_result missing".to_string())
+            })?
+            .lowleveltype()
+            .clone()
+    };
+    Ok(hop.genop("direct_ptradd", vlist, GenopResult::LLType(lltype)))
+}
+
+/// RPython `@typer_for(objectmodel.keepalive_until_here) def rtype_keepalive_until_here(hop)`
+/// (rbuiltin.py:643-648).
+///
+/// ```python
+/// @typer_for(objectmodel.keepalive_until_here)
+/// def rtype_keepalive_until_here(hop):
+///     hop.exception_cannot_occur()
+///     for v in hop.args_v:
+///         hop.genop('keepalive', [v], resulttype=lltype.Void)
+///     return hop.inputconst(lltype.Void, None)
+/// ```
+fn rtype_keepalive_until_here(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    use crate::flowspace::model::Hlvalue;
+    use crate::translator::rtyper::rtyper::GenopResult;
+
+    hop.exception_cannot_occur()?;
+    let args_v: Vec<Hlvalue> = hop.args_v.borrow().clone();
+    for v in args_v {
+        let _ = hop.genop("keepalive", vec![v], GenopResult::Void);
+    }
+    let void_const = HighLevelOp::inputconst(&LowLevelType::Void, &ConstValue::None)?;
+    Ok(Some(Hlvalue::Constant(void_const)))
+}
+
+/// RPython `@typer_for(lltype.render_immortal) def rtype_render_immortal(hop, i_track_allocation=None)`
+/// (rbuiltin.py:403-410).
+///
+/// ```python
+/// @typer_for(lltype.render_immortal)
+/// def rtype_render_immortal(hop, i_track_allocation=None):
+///     vlist = [hop.inputarg(hop.args_r[0], arg=0)]
+///     v_track_allocation = parse_kwds(hop,
+///         (i_track_allocation, None))
+///     hop.exception_cannot_occur()
+///     if i_track_allocation is None or v_track_allocation.value:
+///         hop.genop('track_alloc_stop', vlist)
+/// ```
+///
+/// Upstream quirk: `parse_kwds` returns a list, so `v_track_allocation`
+/// is `[hlval]`, not the inner element.  The `or v_track_allocation.value`
+/// branch raises `AttributeError` if `i_track_allocation` is `Some` —
+/// production callers never supply the `track_allocation` keyword, so
+/// the bug never surfaces upstream.  Pyre surfaces a `TyperError` in
+/// the same case rather than silently emitting a Void constant, since
+/// upstream observably fails the moment the keyword is supplied.
+fn rtype_render_immortal(hop: &HighLevelOp, kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    use crate::translator::rtyper::rtyper::GenopResult;
+
+    let i_track_allocation = kwds_i.get("i_track_allocation").copied();
+    let r_arg0 = arg_repr(hop, 0)?;
+    let v_first = hop.inputarg(r_arg0.as_ref(), 0)?;
+    let vlist = vec![v_first];
+    let _kw = parse_kwds(hop, &[(i_track_allocation, None)])?;
+    hop.exception_cannot_occur()?;
+    if i_track_allocation.is_some() {
+        // upstream `v_track_allocation.value` is `list.value` → AttributeError.
+        return Err(TyperError::message(
+            "rtype_render_immortal: `track_allocation=` keyword triggers an \
+             AttributeError upstream (parse_kwds returns a list, and the \
+             upstream `v_track_allocation.value` access fails); production \
+             callers never supply the keyword"
+                .to_string(),
+        ));
+    }
+    let _ = hop.genop("track_alloc_stop", vlist, GenopResult::Void);
+    // upstream has no `return` — implicit `None`.
+    Ok(None)
+}
+
+/// RPython `@typer_for(lltype.typeOf)` / `@typer_for(lltype.nullptr)` /
+/// `@typer_for(lltype.getRuntimeTypeInfo)` / `@typer_for(lltype.Ptr)`
+/// (rbuiltin.py:412-418). Single shared body — the result annotation
+/// is constant by the time these typers fire, so the typed result is
+/// just `inputconst(r_result.lowleveltype, s_result.const)`.
+///
+/// ```python
+/// def rtype_const_result(hop):
+///     hop.exception_cannot_occur()
+///     return hop.inputconst(hop.r_result.lowleveltype, hop.s_result.const)
+/// ```
+///
+/// Note on dispatch reach: pyre's surface DSL synthesises most
+/// `lltype.*` ops directly from `front/ast.rs` (no HostObject lookup
+/// on the production path).  Registration below mirrors upstream's
+/// `BUILTIN_TYPER` shape structurally; dispatch flips on once the
+/// M2.5g extern-Rust-helper walker lands.
+fn rtype_const_result(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    use crate::flowspace::model::Hlvalue;
+
+    hop.exception_cannot_occur()?;
+    let const_val = hop
+        .s_result
+        .borrow()
+        .as_ref()
+        .and_then(|s| s.const_().cloned())
+        .ok_or_else(|| {
+            TyperError::message("rtype_const_result: s_result is not a constant".to_string())
+        })?;
+    let lltype = {
+        let r_result_borrow = hop.r_result.borrow();
+        let r_result = r_result_borrow.as_ref().ok_or_else(|| {
+            TyperError::message("rtype_const_result: r_result missing".to_string())
+        })?;
+        r_result.lowleveltype().clone()
+    };
+    let c = HighLevelOp::inputconst(&lltype, &const_val)?;
+    Ok(Some(Hlvalue::Constant(c)))
 }
 
 /// RPython `@typer_for(lltype.cast_ptr_to_int)` (rbuiltin.py:543-548):
@@ -1840,11 +2948,23 @@ mod tests {
     }
 
     #[test]
-    fn install_default_typers_registers_bool_int_float_chr_from_host_env() {
-        // HOST_ENV.lookup_builtin populates `bool`/`int`/`float`/`chr`
-        // at bootstrap — the BUILTIN_TYPER map must carry a typer for
-        // each after the OnceLock init fires.
-        for name in ["bool", "int", "float", "chr"] {
+    fn install_default_typers_registers_baseline_builtins_from_host_env() {
+        // rbuiltin.py:172-211 + 709-715 — `@typer_for(<builtin>)` entries
+        // that reach the registry via the bare `lookup_builtin` path
+        // (HOST_ENV `builtins` table).  `unichr` is Python 2-only and
+        // absent from pyre's HOST_ENV bootstrap, so the silent-skip on
+        // missing entries leaves it out of BUILTIN_TYPER — excluded
+        // from this assertion deliberately.
+        for name in [
+            "bool",
+            "int",
+            "float",
+            "chr",
+            "unicode",
+            "bytearray",
+            "list",
+            "hasattr",
+        ] {
             let host = HOST_ENV
                 .lookup_builtin(name)
                 .unwrap_or_else(|| panic!("HOST_ENV missing builtin {name}"));
@@ -1853,6 +2973,226 @@ mod tests {
                 "BUILTIN_TYPER missing entry for `{name}`"
             );
         }
+    }
+
+    #[test]
+    fn install_default_typers_registers_intmask_longlongmask_from_rarithmetic_module() {
+        // rbuiltin.py:220-231 — `@typer_for(rarithmetic.intmask)` /
+        // `@typer_for(rarithmetic.longlongmask)` reach the registry via
+        // module-attribute lookup, not the bare `builtins` table.
+        for attr in ["intmask", "longlongmask"] {
+            let host = HOST_ENV
+                .import_module("rpython.rlib.rarithmetic")
+                .and_then(|m| m.module_get(attr))
+                .unwrap_or_else(|| panic!("HOST_ENV missing rarithmetic.{attr}"));
+            assert!(
+                lookup_typer(&host).is_some(),
+                "BUILTIN_TYPER missing entry for `rarithmetic.{attr}`"
+            );
+        }
+    }
+
+    #[test]
+    fn install_default_typers_registers_keepalive_until_here_from_objectmodel_module() {
+        // rbuiltin.py:643-648 — `@typer_for(objectmodel.keepalive_until_here)`.
+        let host = HOST_ENV
+            .import_module("rpython.rlib.objectmodel")
+            .and_then(|m| m.module_get("keepalive_until_here"))
+            .expect("HOST_ENV missing objectmodel.keepalive_until_here");
+        assert!(
+            lookup_typer(&host).is_some(),
+            "BUILTIN_TYPER missing entry for `objectmodel.keepalive_until_here`"
+        );
+    }
+
+    #[test]
+    fn install_default_typers_registers_const_result_typers_from_lltype_module() {
+        // rbuiltin.py:412-418 — four upstream callables share the
+        // `rtype_const_result` body.  Pin the registry hit for each.
+        for attr in ["typeOf", "nullptr", "getRuntimeTypeInfo", "Ptr"] {
+            let host = HOST_ENV
+                .import_module("rpython.rtyper.lltypesystem.lltype")
+                .and_then(|m| m.module_get(attr))
+                .unwrap_or_else(|| panic!("HOST_ENV missing lltype.{attr}"));
+            assert!(
+                lookup_typer(&host).is_some(),
+                "BUILTIN_TYPER missing entry for `lltype.{attr}`"
+            );
+        }
+    }
+
+    #[test]
+    fn install_default_typers_registers_identityhash_from_lltype_module() {
+        // rbuiltin.py:559-563 — `@typer_for(lltype.identityhash)`.
+        let host = HOST_ENV
+            .import_module("rpython.rtyper.lltypesystem.lltype")
+            .and_then(|m| m.module_get("identityhash"))
+            .expect("HOST_ENV missing lltype.identityhash");
+        assert!(
+            lookup_typer(&host).is_some(),
+            "BUILTIN_TYPER missing entry for `lltype.identityhash`"
+        );
+    }
+
+    #[test]
+    fn install_default_typers_registers_runtime_type_info_from_lltype_module() {
+        // rbuiltin.py:565-572 — `@typer_for(lltype.runtime_type_info)`.
+        let host = HOST_ENV
+            .import_module("rpython.rtyper.lltypesystem.lltype")
+            .and_then(|m| m.module_get("runtime_type_info"))
+            .expect("HOST_ENV missing lltype.runtime_type_info");
+        assert!(
+            lookup_typer(&host).is_some(),
+            "BUILTIN_TYPER missing entry for `lltype.runtime_type_info`"
+        );
+    }
+
+    #[test]
+    fn install_default_typers_registers_direct_ptradd_from_lltype_module() {
+        // rbuiltin.py:463-469 — `@typer_for(lltype.direct_ptradd)`.
+        let host = HOST_ENV
+            .import_module("rpython.rtyper.lltypesystem.lltype")
+            .and_then(|m| m.module_get("direct_ptradd"))
+            .expect("HOST_ENV missing lltype.direct_ptradd");
+        assert!(
+            lookup_typer(&host).is_some(),
+            "BUILTIN_TYPER missing entry for `lltype.direct_ptradd`"
+        );
+    }
+
+    #[test]
+    fn install_default_typers_registers_direct_fieldptr_and_arrayitems_from_lltype_module() {
+        // rbuiltin.py:446-453 / 455-461 — `@typer_for(lltype.direct_fieldptr)` /
+        // `@typer_for(lltype.direct_arrayitems)`.
+        for attr in ["direct_fieldptr", "direct_arrayitems"] {
+            let host = HOST_ENV
+                .import_module("rpython.rtyper.lltypesystem.lltype")
+                .and_then(|m| m.module_get(attr))
+                .unwrap_or_else(|| panic!("HOST_ENV missing lltype.{attr}"));
+            assert!(
+                lookup_typer(&host).is_some(),
+                "BUILTIN_TYPER missing entry for `lltype.{attr}`"
+            );
+        }
+    }
+
+    #[test]
+    fn install_default_typers_registers_cast_opaque_ptr_and_length_of_gcarray_from_lltype_module() {
+        // rbuiltin.py:429-436 / 438-444 — `@typer_for(lltype.cast_opaque_ptr)` /
+        // `@typer_for(lltype.length_of_simple_gcarray_from_opaque)`.
+        for attr in ["cast_opaque_ptr", "length_of_simple_gcarray_from_opaque"] {
+            let host = HOST_ENV
+                .import_module("rpython.rtyper.lltypesystem.lltype")
+                .and_then(|m| m.module_get(attr))
+                .unwrap_or_else(|| panic!("HOST_ENV missing lltype.{attr}"));
+            assert!(
+                lookup_typer(&host).is_some(),
+                "BUILTIN_TYPER missing entry for `lltype.{attr}`"
+            );
+        }
+    }
+
+    #[test]
+    fn install_default_typers_registers_cast_pointer_from_lltype_module() {
+        // rbuiltin.py:420-427 — `@typer_for(lltype.cast_pointer)`.
+        let host = HOST_ENV
+            .import_module("rpython.rtyper.lltypesystem.lltype")
+            .and_then(|m| m.module_get("cast_pointer"))
+            .expect("HOST_ENV missing lltype.cast_pointer");
+        assert!(
+            lookup_typer(&host).is_some(),
+            "BUILTIN_TYPER missing entry for `lltype.cast_pointer`"
+        );
+    }
+
+    #[test]
+    fn install_default_typers_registers_render_immortal_from_lltype_module() {
+        // rbuiltin.py:403-410 — `@typer_for(lltype.render_immortal)`.
+        let host = HOST_ENV
+            .import_module("rpython.rtyper.lltypesystem.lltype")
+            .and_then(|m| m.module_get("render_immortal"))
+            .expect("HOST_ENV missing lltype.render_immortal");
+        assert!(
+            lookup_typer(&host).is_some(),
+            "BUILTIN_TYPER missing entry for `lltype.render_immortal`"
+        );
+    }
+
+    #[test]
+    fn install_default_typers_registers_cast_ptr_to_adr_from_llmemory_module() {
+        // rbuiltin.py:651-657 — `@typer_for(llmemory.cast_ptr_to_adr)`.
+        let host = HOST_ENV
+            .import_module("rpython.rtyper.lltypesystem.llmemory")
+            .and_then(|m| m.module_get("cast_ptr_to_adr"))
+            .expect("HOST_ENV missing llmemory.cast_ptr_to_adr");
+        assert!(
+            lookup_typer(&host).is_some(),
+            "BUILTIN_TYPER missing entry for `llmemory.cast_ptr_to_adr`"
+        );
+    }
+
+    #[test]
+    fn install_default_typers_registers_object_init_qualname_builtin() {
+        // rbuiltin.py:264-267 — `@typer_for(object.__init__)`.
+        let host = HOST_ENV
+            .lookup_builtin("object.__init__")
+            .expect("HOST_ENV missing `object.__init__` qualname builtin");
+        assert!(
+            lookup_typer(&host).is_some(),
+            "BUILTIN_TYPER missing entry for `object.__init__`"
+        );
+    }
+
+    #[test]
+    fn install_default_typers_registers_cast_int_to_adr_from_llmemory_module() {
+        // rbuiltin.py:680-685 — `@typer_for(llmemory.cast_int_to_adr)`.
+        let host = HOST_ENV
+            .import_module("rpython.rtyper.lltypesystem.llmemory")
+            .and_then(|m| m.module_get("cast_int_to_adr"))
+            .expect("HOST_ENV missing llmemory.cast_int_to_adr");
+        assert!(
+            lookup_typer(&host).is_some(),
+            "BUILTIN_TYPER missing entry for `llmemory.cast_int_to_adr`"
+        );
+    }
+
+    #[test]
+    fn install_default_typers_registers_malloc_from_lltype_module() {
+        // rbuiltin.py:349-385 — `@typer_for(lltype.malloc)`.
+        let host = HOST_ENV
+            .import_module("rpython.rtyper.lltypesystem.lltype")
+            .and_then(|m| m.module_get("malloc"))
+            .expect("HOST_ENV missing lltype.malloc");
+        assert!(
+            lookup_typer(&host).is_some(),
+            "BUILTIN_TYPER missing entry for `lltype.malloc`"
+        );
+    }
+
+    #[test]
+    fn install_default_typers_registers_free_from_lltype_module() {
+        // rbuiltin.py:387-401 — `@typer_for(lltype.free)`.
+        let host = HOST_ENV
+            .import_module("rpython.rtyper.lltypesystem.lltype")
+            .and_then(|m| m.module_get("free"))
+            .expect("HOST_ENV missing lltype.free");
+        assert!(
+            lookup_typer(&host).is_some(),
+            "BUILTIN_TYPER missing entry for `lltype.free`"
+        );
+    }
+
+    #[test]
+    fn install_default_typers_registers_free_non_gc_object_from_objectmodel_module() {
+        // rbuiltin.py:632-640 — `@typer_for(objectmodel.free_non_gc_object)`.
+        let host = HOST_ENV
+            .import_module("rpython.rlib.objectmodel")
+            .and_then(|m| m.module_get("free_non_gc_object"))
+            .expect("HOST_ENV missing objectmodel.free_non_gc_object");
+        assert!(
+            lookup_typer(&host).is_some(),
+            "BUILTIN_TYPER missing entry for `objectmodel.free_non_gc_object`"
+        );
     }
 
     #[test]

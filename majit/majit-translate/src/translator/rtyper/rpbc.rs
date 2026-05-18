@@ -925,15 +925,25 @@ pub(crate) mod tests {
 }
 
 // =====================================================================
-// rpbc.py:177-372 — FunctionReprBase + FunctionRepr
+// rpbc.py:177-994 — full PBC Repr hierarchy
 //
-// Upstream builds the full Repr hierarchy over SomePBC. The slice
-// ported here covers the degenerate path used by `convert_desc_or_const`
-// for class-attr method slots: `SomePBC` with exactly one
-// `DescKind::Function` description and `can_be_None=False`. All other
-// shapes (FunctionsPBCRepr / SmallFunctionSetPBCRepr / getFrozenPBCRepr
-// / ClassesPBCRepr / MethodsPBCRepr / MethodOfFrozenPBCRepr) still
-// surface as `MissingRTypeOperation` from `rtyper_makerepr`.
+// Concrete classes ported below mirror upstream's hierarchy:
+//   FunctionReprBase  (rpbc.py:177-221)  — shared base, composed-in
+//   FunctionRepr      (rpbc.py:315-371)  — single concrete function PBC
+//   FunctionsPBCRepr  (rpbc.py:224-313)  — multi-function PBC
+//   SmallFunctionSetPBCRepr (rpbc.py:393-516)
+//   SingleFrozenPBCRepr     (rpbc.py:635-662)
+//   MultipleUnrelatedFrozenPBCRepr (rpbc.py:675-711)
+//   MultipleFrozenPBCRepr   (rpbc.py:728-800)
+//   MethodOfFrozenPBCRepr   (rpbc.py:844-911)
+//   ClassesPBCRepr          (rclass-adjacent PBC dispatch)
+//   MethodsPBCRepr          (method PBC dispatch)
+//
+// Pyre composes rather than inherits — see [`FunctionReprBase`] for the
+// composition layout; each concrete struct embeds the shared base as a
+// field and overrides the lowleveltype + dispatch body.  Pair-type arms
+// (rpbc.py:373-633 `__extend__(pairtype(...))`) live alongside their
+// owning concrete reprs below.
 // =====================================================================
 
 use crate::flowspace::model::{ConstValue, Constant, GraphKey, Hlvalue};
