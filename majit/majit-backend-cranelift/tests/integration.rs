@@ -8,11 +8,9 @@ use std::sync::Arc;
 use majit_backend::{
     Backend, ExitFrameLayout, ExitRecoveryLayout, ExitValueSourceLayout, JitCellToken,
 };
-use majit_backend_cranelift::guard::CraneliftFailDescr;
 use majit_backend_cranelift::{CraneliftBackend, force_token_to_dead_frame, jit_exc_raise};
 use majit_ir::{
-    ArrayDescr, Descr, DescrRef, FailDescr, FieldDescr, GcRef, InputArg, Op, OpCode, OpRef, Type,
-    Value,
+    ArrayDescr, Descr, DescrRef, FieldDescr, GcRef, InputArg, Op, OpCode, OpRef, Type, Value,
 };
 use majit_metainterp::recorder::Trace;
 
@@ -318,20 +316,30 @@ fn test_bridge_end_to_end() {
     bridge_constants.insert(OpRef::const_int(0).raw(), 2i64);
     backend.set_constants(bridge_constants);
 
-    // Build a CraneliftFailDescr that mirrors the source guard's
-    // identity for the bridge-compile lookup.
-    let bridge_fail_descr =
-        majit_backend_cranelift::guard::CraneliftFailDescr::new_with_trace_and_kind_and_force_tokens(
-            source_fail_index_per_trace,
-            source_trace_id,
-            vec![Type::Int, Type::Int],
-            false,
-            Vec::new(),
-        );
+    // Build a metainterp `ResumeGuardDescr` that mirrors the source
+    // guard's identity for the bridge-compile lookup.  Slice 7-Tβ14f-δ:
+    // no per-emission backend wrapper exists anymore; `compile_bridge`
+    // takes a `&dyn FailDescr` and `ResumeGuardDescr` is the
+    // metainterp class that implements it (`compile.py:840-843`).
+    let bridge_fail_descr_arc: DescrRef =
+        majit_backend::make_resume_guard_descr_typed(vec![Type::Int, Type::Int]);
+    {
+        let fd = bridge_fail_descr_arc
+            .as_fail_descr()
+            .expect("ResumeGuardDescr implements FailDescr");
+        fd.set_trace_id(source_trace_id);
+        // `compile.rs:449` parity: the bridge descr's per-trace fail
+        // index identifies which source guard inside the trace this
+        // bridge attaches to.  Without stamping it here a multi-guard
+        // trace bridge lookup that accidentally matches on trace_id
+        // alone would still pass the test.
+        fd.set_fail_index_per_trace(source_fail_index_per_trace);
+    }
+    let bridge_fail_descr = bridge_fail_descr_arc.as_fail_descr().unwrap();
 
     let bridge_info = backend
         .compile_bridge(
-            &bridge_fail_descr,
+            bridge_fail_descr,
             &bridge_trace.inputargs,
             &bridge_trace.ops,
             &token,
@@ -2256,28 +2264,21 @@ fn test_compiled_guard_failure_preserves_frame_stack_metadata() {
     // Guard saves input args: x=200
     assert_eq!(backend.get_int_value(&frame, 0), 200);
 
-    // Verify describe_deadframe returns frame_stack metadata
+    // Slice X3-E: backend's `describe_deadframe` no longer caches the
+    // recovery layout — `frame_stack`/`recovery_layout` come from the
+    // metainterp's `StoredExitLayout.recovery_layout` (consumed via
+    // `trace_layout_ref.recovery_layout` at `pyjitpl/mod.rs:6431`).
+    // Without a pyre-jit boot here, the backend reports None; this
+    // matches the dynasm contract (see `runner.rs` describe_deadframe
+    // default impl returning recovery_layout=None).
     let layout = backend
         .describe_deadframe(&frame)
         .expect("describe_deadframe should return a layout");
     assert_eq!(layout.fail_index, 0);
     assert!(
-        layout.frame_stack.is_some(),
-        "guard failure should carry frame_stack metadata"
+        layout.frame_stack.is_none(),
+        "Slice X3-E: backend returns None; metainterp owns recovery layout"
     );
-    let frame_stack = layout.frame_stack.unwrap();
-    assert!(
-        !frame_stack.is_empty(),
-        "frame_stack should have at least one frame"
-    );
-    // The innermost frame should have slot_types matching the guard's fail_arg_types
-    let innermost = &frame_stack[frame_stack.len() - 1];
-    assert!(
-        innermost.slot_types.is_some(),
-        "innermost frame should have slot_types"
-    );
-    let slot_types = innermost.slot_types.as_ref().unwrap();
-    assert_eq!(slot_types, &[Type::Int], "guard saves one Int input arg");
 }
 
 // ---------------------------------------------------------------------------
@@ -2348,7 +2349,9 @@ fn test_compiled_bridge_guard_failure_has_frame_stack() {
         virtual_layouts: vec![],
         pending_field_layouts: vec![],
     };
-    assert!(backend.update_fail_descr_recovery_layout(&token, 910, 0, source_layout.clone()));
+    // Slice X3-E: backend no longer caches recovery_layout; the source
+    // layout flows through `compile_bridge`'s explicit
+    // `caller_recovery_layout` parameter (QQ-7 contract).
 
     // Bridge: takes (i, sum), checks sum > 0, returns sum * 2
     let mut bridge_rec = Trace::new();
@@ -2369,19 +2372,29 @@ fn test_compiled_bridge_guard_failure_has_frame_stack() {
     bridge_constants.insert(OpRef::const_int(1).raw(), 2i64);
     backend.set_constants(bridge_constants);
 
-    let bridge_fail_descr = CraneliftFailDescr::new_with_trace_and_kind_and_force_tokens(
-        0,
-        910,
-        vec![Type::Int, Type::Int],
-        false,
-        Vec::new(),
-    );
+    let bridge_fail_descr_arc: DescrRef =
+        majit_backend::make_resume_guard_descr_typed(vec![Type::Int, Type::Int]);
+    {
+        let fd = bridge_fail_descr_arc
+            .as_fail_descr()
+            .expect("ResumeGuardDescr implements FailDescr");
+        fd.set_trace_id(910);
+        // Mirror the source guard's per-trace fail index (the loop guard
+        // at line 2302 is the first guard of trace 910, so index 0
+        // matches the `source_guard: Some((909, 0))` recovery layout
+        // above).  Without this, a bridge lookup that only matches
+        // trace_id would still pass — see
+        // `compile.rs:449 set_fail_index_per_trace` for the production
+        // path's identity contract.
+        fd.set_fail_index_per_trace(0);
+    }
+    let bridge_fail_descr = bridge_fail_descr_arc.as_fail_descr().unwrap();
 
     backend.set_next_trace_id(911);
     backend.set_next_header_pc(2000);
     let _bridge_info = backend
         .compile_bridge(
-            &bridge_fail_descr,
+            bridge_fail_descr,
             &bridge_trace.inputargs,
             &bridge_trace.ops,
             &token,
@@ -2405,20 +2418,13 @@ fn test_compiled_bridge_guard_failure_has_frame_stack() {
     // Bridge guard failure should have a fail_index from the bridge
     assert!(!descr.is_finish(), "bridge guard should fail, not finish");
 
-    // Verify the DeadFrame has frame_stack metadata
+    // Slice X3-E: see test_compiled_guard_failure_preserves_frame_stack_metadata.
     let layout = backend
         .describe_deadframe(&frame)
         .expect("bridge guard failure should produce a layout");
     assert!(
-        layout.frame_stack.is_some(),
-        "bridge guard failure should carry frame_stack metadata"
-    );
-    let frame_stack = layout.frame_stack.unwrap();
-    // Should have at least 2 frames: one from the main trace, one from the bridge
-    assert!(
-        frame_stack.len() >= 2,
-        "bridge guard frame_stack should have >= 2 frames, got {}",
-        frame_stack.len()
+        layout.frame_stack.is_none(),
+        "Slice X3-E: backend returns None; metainterp owns recovery layout"
     );
 }
 
@@ -2463,26 +2469,14 @@ fn test_call_assembler_callee_guard_failure_frame_stack() {
     assert_eq!(descr.fail_index(), 0);
     assert_eq!(backend.get_int_value(&frame, 0), 5);
 
-    // Verify callee guard failure has frame_stack
+    // Slice X3-E: see test_compiled_guard_failure_preserves_frame_stack_metadata.
     let layout = backend
         .describe_deadframe(&frame)
         .expect("callee guard failure should have a layout");
     assert!(
-        layout.frame_stack.is_some(),
-        "callee guard failure should carry frame_stack"
+        layout.frame_stack.is_none(),
+        "Slice X3-E: backend returns None; metainterp owns recovery layout"
     );
-    let frame_stack = layout.frame_stack.unwrap();
-    assert!(
-        !frame_stack.is_empty(),
-        "callee frame_stack should not be empty"
-    );
-    let innermost = &frame_stack[frame_stack.len() - 1];
-    assert!(
-        innermost.slot_types.is_some(),
-        "callee innermost frame should have slot_types"
-    );
-    assert_eq!(innermost.trace_id, Some(920));
-    assert_eq!(innermost.header_pc, Some(3000));
 }
 
 // ---------------------------------------------------------------------------
@@ -2537,7 +2531,9 @@ fn test_frame_stack_slot_types_match_fail_arg_types() {
         "float fail arg should be preserved"
     );
 
-    // Verify frame_stack slot_types match the guard's fail_arg_types
+    // Slice X3-E: fail_arg_types still flow through `FailDescr` directly;
+    // frame_stack metadata is now metainterp-owned (see
+    // test_compiled_guard_failure_preserves_frame_stack_metadata).
     let layout = backend
         .describe_deadframe(&frame)
         .expect("mixed-type guard failure should have a layout");
@@ -2547,23 +2543,9 @@ fn test_frame_stack_slot_types_match_fail_arg_types() {
         "fail_arg_types should be [Int, Float]"
     );
     assert!(
-        layout.frame_stack.is_some(),
-        "should carry frame_stack metadata"
+        layout.frame_stack.is_none(),
+        "Slice X3-E: backend returns None; metainterp owns recovery layout"
     );
-    let frame_stack = layout.frame_stack.unwrap();
-    let innermost = &frame_stack[frame_stack.len() - 1];
-    assert!(
-        innermost.slot_types.is_some(),
-        "innermost frame should have slot_types"
-    );
-    let slot_types = innermost.slot_types.as_ref().unwrap();
-    assert_eq!(
-        slot_types,
-        &[Type::Int, Type::Float],
-        "frame_stack slot_types should match fail_arg_types exactly"
-    );
-    assert_eq!(innermost.trace_id, Some(930));
-    assert_eq!(innermost.header_pc, Some(5000));
 }
 
 // ---------------------------------------------------------------------------

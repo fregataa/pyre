@@ -1708,21 +1708,24 @@ impl<S: JitState> JitDriver<S> {
                     // returns the green_key; the actual `Arc<JitCellToken>`
                     // is the `token` field of the freshly-installed
                     // `CompiledEntry` in `self.compiled_loops`.
-                    let install_token = std::sync::Arc::clone(
-                        &self
-                            .meta
-                            .compiled_loops
-                            .get(&green_key)
-                            .expect(
-                                "compile_simple_loop returned Some(green_key) ⇒ \
-                                 compiled_loops has the new CompiledEntry",
-                            )
-                            .token,
-                    );
+                    let install_token = self
+                        .meta
+                        .compiled_loops
+                        .get(&green_key)
+                        .expect(
+                            "compile_simple_loop returned Some(green_key) ⇒ \
+                             compiled_loops has the new CompiledEntry",
+                        )
+                        .live_token();
                     // `warmstate.py:339-348` redirect+record_jump_to chain
-                    // routed through MetaInterp's caller-side helper.
-                    self.meta
-                        .attach_procedure_with_redirect(green_key, install_token);
+                    // routed through MetaInterp's caller-side helper.  Skip
+                    // the redirect when MemoryManager has already evicted
+                    // the freshly-installed token (rare; eviction is
+                    // independent of this insertion path).
+                    if let Some(install_token) = install_token {
+                        self.meta
+                            .attach_procedure_with_redirect(green_key, install_token);
+                    }
                 }
                 // Blackhole transition: clear all driver tracing state.
                 self.sym = None;

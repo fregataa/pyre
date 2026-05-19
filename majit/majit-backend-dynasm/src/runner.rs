@@ -9,7 +9,7 @@ use std::sync::Mutex;
 /// rpython/jit/backend/x86/runner.py AbstractX86CPU.
 use std::sync::atomic::Ordering;
 
-use majit_backend::{AsmInfo, Backend, BackendError, DeadFrame, ExitRecoveryLayout, JitCellToken};
+use majit_backend::{AsmInfo, Backend, BackendError, DeadFrame, JitCellToken};
 use majit_ir::{FailDescr, GcRef, InputArg, Op, OpRef, Type, Value};
 
 #[cfg(target_arch = "aarch64")]
@@ -3055,13 +3055,15 @@ impl Backend for DynasmBackend {
         source_trace_id: u64,
         source_fail_index: u32,
     ) -> Option<Arc<dyn majit_ir::Descr>> {
-        let source_descr =
-            Self::try_find_descr(original_token, source_trace_id, source_fail_index)?;
-        let bridge_addr = self.lookup_bridge_addr(Arc::as_ptr(&source_descr) as *const () as usize);
-        if bridge_addr == 0 {
-            return None;
-        }
-        Some(source_descr)
+        // Trait contract (majit-backend/lib.rs:1797-1816): identity
+        // recovery for `bridge_source_descr` when the metainterp side
+        // cannot produce the descr (synthetic / cut-tentative ops,
+        // post-retrace stale traces).  Whether a bridge is currently
+        // attached is irrelevant — the bridge-compilation path needs
+        // the source descr identity regardless.  Matches cranelift's
+        // `compiled_bridge_descr_arc` (compiler.rs:14290), which does
+        // not gate on bridge attachment either.
+        Self::try_find_descr(original_token, source_trace_id, source_fail_index)
     }
 
     fn find_source_fail_descr(
@@ -3071,23 +3073,6 @@ impl Backend for DynasmBackend {
         fail_index: u32,
     ) -> Option<Arc<dyn majit_ir::Descr>> {
         Self::try_find_descr(token, trace_id, fail_index)
-    }
-
-    fn update_fail_descr_recovery_layout(
-        &mut self,
-        token: &JitCellToken,
-        trace_id: u64,
-        fail_index: u32,
-        _recovery_layout: ExitRecoveryLayout,
-    ) -> bool {
-        // Slice NN: backend no longer caches recovery_layout (PyPy parity —
-        // `resume.py:450-488` decodes on-demand).  The metainterp's
-        // `StoredExitLayout.recovery_layout` is the canonical store;
-        // `patch_backend_guard_recovery_layouts_for_trace` updates it
-        // directly without round-tripping through the backend.  Return
-        // `true` for descrs we know about so the patch loop's "did patch"
-        // tracking stays accurate.
-        Self::try_find_descr(token, trace_id, fail_index).is_some()
     }
 
     /// `pyjitpl.py:2297 self.cpu.setup_once()` parity, dispatched by

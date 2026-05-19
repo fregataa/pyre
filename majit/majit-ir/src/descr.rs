@@ -1124,6 +1124,71 @@ pub trait LoopTargetDescr: Descr {
     fn is_preamble_target(&self) -> bool;
     fn ll_loop_code(&self) -> usize;
     fn set_ll_loop_code(&self, loop_code: usize);
+    /// `assembler.py:2456-2462 closing_jump` reads `_ll_loop_code`
+    /// at JMP-emit time.  Cranelift needs the *address* of the slot
+    /// (not its value) so the in-code dispatch can load the latest
+    /// entry on every call.  Default impl panics: only
+    /// `LoopTargetDescr` impls backed by an `AtomicUsize` slot can
+    /// support a stable address.
+    fn ll_loop_code_ptr(&self) -> *const std::sync::atomic::AtomicUsize {
+        panic!(
+            "ll_loop_code_ptr requires an AtomicUsize-backed slot \
+             (LoopTargetDescr impl: {})",
+            std::any::type_name::<Self>(),
+        );
+    }
+
+    /// Cranelift parity for `assembler.py:990-993 TargetToken._ll_loop_code`
+    /// per-LABEL entry: PyPy stores each TargetToken's instruction address
+    /// directly, so a JMP lands at the LABEL's first instruction (skipping
+    /// any preamble that precedes a different LABEL).  Cranelift can't expose
+    /// internal block addresses, so the body function takes a `label_index`
+    /// parameter and `br_table`s to the right per-LABEL entry block at
+    /// runtime.  This slot records WHICH LABEL within the compiled body
+    /// function this TargetToken refers to (0 for the first LABEL, 1 for
+    /// the second, ...).  Set by `compile_loop`'s LABEL-registration loop
+    /// at codegen completion.  Read by `emit_attached_loop_dispatch` so the
+    /// source body's `return_call_indirect` passes the right index to the
+    /// target body's `br_table` entry.
+    ///
+    /// Dynasm backend ignores this slot; PyPy x86 instead emits the LABEL
+    /// address directly into `_ll_loop_code`.
+    fn label_block_id(&self) -> u32 {
+        0
+    }
+    /// Default panics so an incomplete `LoopTargetDescr` migration that
+    /// reaches `set_dispatch_target` is surfaced loudly instead of
+    /// silently dropping `block_id` and routing multi-LABEL entries to
+    /// block 0.  Matches the panic-by-default discipline on the
+    /// `FailDescr` write-side defaults.
+    fn set_label_block_id(&self, _id: u32) {
+        panic!(
+            "set_label_block_id requires an AtomicU32-backed slot \
+             (LoopTargetDescr impl: {})",
+            std::any::type_name::<Self>(),
+        );
+    }
+    fn label_block_id_ptr(&self) -> *const std::sync::atomic::AtomicU32 {
+        panic!(
+            "label_block_id_ptr requires an AtomicU32-backed slot \
+             (LoopTargetDescr impl: {})",
+            std::any::type_name::<Self>(),
+        );
+    }
+
+    /// Publish `(ll_loop_code, label_block_id)` as one coherent dispatch
+    /// target.  Readers gate on `ll_loop_code != 0` (Acquire) and then
+    /// read `label_block_id` via baked address, so `label_block_id` MUST
+    /// become visible before `ll_loop_code` is non-zero — otherwise a
+    /// reader can observe the new code pointer alongside the stale
+    /// initial `label_block_id = 0` and route into the wrong block.
+    /// Default impl stores `label_block_id` first, then `ll_loop_code`,
+    /// matching the readiness ordering.
+    fn set_dispatch_target(&self, loop_code: usize, block_id: u32) {
+        self.set_label_block_id(block_id);
+        self.set_ll_loop_code(loop_code);
+    }
+
     fn target_arglocs(&self) -> Vec<TargetArgLoc>;
     fn set_target_arglocs(&self, arglocs: Vec<TargetArgLoc>);
 
@@ -1142,7 +1207,6 @@ pub trait LoopTargetDescr: Descr {
 
 #[derive(Debug, Default)]
 struct BasicLoopTargetDescrState {
-    ll_loop_code: usize,
     target_arglocs: Vec<TargetArgLoc>,
     /// `history.py:493 self.original_jitcell_token`. Backfilled at
     /// compile-time once the owning JitCellToken is created.
@@ -1153,6 +1217,23 @@ struct BasicLoopTargetDescrState {
 struct BasicLoopTargetDescr {
     token_id: u64,
     is_preamble_target: bool,
+    /// `history.py:470` `TargetToken._ll_loop_code` parity: a single
+    /// integer recording the address of the loop's compiled entry
+    /// point.  RPython sets this with a plain `setattr` (atomic w.r.t.
+    /// the GIL); pyre uses `AtomicUsize` so cranelift-emitted in-code
+    /// `closing_jump` dispatch can read it without holding a Mutex.
+    /// Offset of this field is baked into the JIT'd code via
+    /// `loop_target_ll_loop_code_ptr` so a `JMP imm(target)` parity
+    /// instruction can load the latest entry address.
+    ll_loop_code: std::sync::atomic::AtomicUsize,
+    /// `assembler.py:990-993 TargetToken._ll_loop_code` per-LABEL parity:
+    /// records which LABEL within the body function (0 for first LABEL,
+    /// 1 for second, ...) so cranelift's per-LABEL `br_table` dispatch
+    /// can route the `return_call_indirect` to the right entry block.
+    /// Set by cranelift `compile_loop`'s LABEL-registration loop after
+    /// codegen; default 0 covers single-LABEL traces and dynasm (which
+    /// ignores the slot and uses raw LABEL addresses in `_ll_loop_code`).
+    label_block_id: std::sync::atomic::AtomicU32,
     state: Mutex<BasicLoopTargetDescrState>,
 }
 
@@ -1161,6 +1242,8 @@ impl BasicLoopTargetDescr {
         Self {
             token_id,
             is_preamble_target,
+            ll_loop_code: std::sync::atomic::AtomicUsize::new(0),
+            label_block_id: std::sync::atomic::AtomicU32::new(0),
             state: Mutex::new(BasicLoopTargetDescrState::default()),
         }
     }
@@ -1194,11 +1277,30 @@ impl LoopTargetDescr for BasicLoopTargetDescr {
     }
 
     fn ll_loop_code(&self) -> usize {
-        self.state.lock().unwrap().ll_loop_code
+        self.ll_loop_code.load(std::sync::atomic::Ordering::Acquire)
     }
 
     fn set_ll_loop_code(&self, loop_code: usize) {
-        self.state.lock().unwrap().ll_loop_code = loop_code;
+        self.ll_loop_code
+            .store(loop_code, std::sync::atomic::Ordering::Release);
+    }
+
+    fn ll_loop_code_ptr(&self) -> *const std::sync::atomic::AtomicUsize {
+        &self.ll_loop_code as *const _
+    }
+
+    fn label_block_id(&self) -> u32 {
+        self.label_block_id
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn set_label_block_id(&self, id: u32) {
+        self.label_block_id
+            .store(id, std::sync::atomic::Ordering::Release);
+    }
+
+    fn label_block_id_ptr(&self) -> *const std::sync::atomic::AtomicU32 {
+        &self.label_block_id as *const _
     }
 
     fn target_arglocs(&self) -> Vec<TargetArgLoc> {
@@ -1673,6 +1775,22 @@ pub trait FailDescr: Descr {
         None
     }
 
+    /// Pyre-only cranelift cross-loop JUMP target publish (Slice 7-Tβ8).
+    /// Writes the target `DescrRef` into the per-emission slot read
+    /// back via `target_descr` / `is_external_jump`.  Default panics —
+    /// only Resume-family descrs (`ResumeGuardDescr` /
+    /// `ResumeGuardCopiedDescr` + their subclass wrappers) own the
+    /// slot.  Callers reach this through trait dispatch on whatever
+    /// descr the JUMP synthesised carries.
+    fn set_external_jump_target(&self, _target: DescrRef) {
+        panic!(
+            "set_external_jump_target invoked on a FailDescr that does \
+             not carry the per-emission external_jump_target slot \
+             (only Resume-family descrs synthesised for cross-loop \
+             JUMP exits in cranelift collect_guards own it)"
+        );
+    }
+
     /// history.py:137-139: exits_early()
     /// Is this guard a guard_early_exit or moved before one?
     fn exits_early(&self) -> bool {
@@ -1829,7 +1947,18 @@ pub trait FailDescr: Descr {
     /// Backends may override this to distinguish rooted refs from opaque
     /// handles that reuse `Type::Ref`, such as FORCE_TOKEN values.
     fn is_gc_ref_slot(&self, slot: usize) -> bool {
-        matches!(self.fail_arg_types().get(slot), Some(Type::Ref))
+        if !matches!(self.fail_arg_types().get(slot), Some(Type::Ref)) {
+            return false;
+        }
+        // Exclude force-token positions: their Type::Ref typing is
+        // synthetic — they carry opaque virtualizable handles (FORCE_TOKEN
+        // op output), not real GC pointers.  The retired
+        // `CraneliftFailDescr` wrapper performed this exclusion explicitly
+        // before computing `fail_descr_gc_map`; the metainterp
+        // `ResumeGuardDescr` now owns the slot list directly, so the
+        // exclusion moves to this trait default and is inherited by every
+        // Resume-family impl that overrides `force_token_slots()`.
+        !self.force_token_slots().contains(&slot)
     }
 
     /// Exit slot indices that carry opaque force-token handles.
@@ -1840,6 +1969,167 @@ pub trait FailDescr: Descr {
     /// lock.
     fn force_token_slots(&self) -> Vec<usize> {
         Vec::new()
+    }
+
+    /// Pyre-only per-emission write of the force-token slot list.
+    /// `assembler.py:write_failure_recovery_description` bakes the
+    /// equivalent GC map into machine code at codegen time per
+    /// emission; the slot list is the cranelift analog and follows
+    /// the same per-emission classification as `rd_locs`
+    /// (`assembler.py:279`).
+    ///
+    /// Default panics — only `ResumeGuardDescr`-family carries the
+    /// slot.  Callers must gate by `is_resume_guard() ||
+    /// is_resume_guard_copied()` before invoking, mirroring
+    /// `set_trace_id` / `set_rd_*` / `set_adr_jump_offset`.
+    /// Implementations must sort+dedup so consumers can `binary_search`.
+    fn set_force_token_slots(&self, _slots: Vec<usize>) {
+        panic!(
+            "set_force_token_slots invoked on a FailDescr that does not \
+             carry the per-emission force_token_slots slot (only \
+             ResumeGuardDescr / ResumeGuardCopiedDescr own it)"
+        );
+    }
+
+    /// Pyre-only per-emission failure counter.  PyPy carries the
+    /// equivalent jitcounter hash in the per-descr `status` slot
+    /// (`compile.py:683` `AbstractResumeGuardDescr._attrs_ =
+    /// ('status',)`) — both `ResumeGuardDescr` and
+    /// `ResumeGuardCopiedDescr` get their own status by inheritance
+    /// from `AbstractResumeGuardDescr`.  Pyre's counter follows the
+    /// same per-emission classification.  Default returns 0 for
+    /// descrs that never compile bridges.
+    fn fail_count(&self) -> u32 {
+        0
+    }
+
+    /// Pyre-only per-emission failure-count increment.  Returns the
+    /// post-increment value.  Default panics — only Resume-family
+    /// guards carry the counter (`compile.py:683`
+    /// `AbstractResumeGuardDescr._attrs_ = ('status',)`).  Callers
+    /// must gate by `is_resume_guard() || is_resume_guard_copied()`.
+    fn increment_fail_count(&self) -> u32 {
+        panic!(
+            "increment_fail_count invoked on a FailDescr that does not \
+             carry a fail_count slot (compile.py:683 `_attrs_` only on \
+             AbstractResumeGuardDescr / ResumeGuardCopiedDescr)"
+        );
+    }
+
+    /// Pyre-only per-emission `CompiledTraceInfo` slot.  Returned as
+    /// `Arc<dyn Any + Send + Sync>` so the trait can live in
+    /// `majit-ir` without depending on `majit-backend`'s
+    /// `CompiledTraceInfo`; concrete callers downcast.  Per-emission
+    /// classification matches `record_loop_or_bridge`
+    /// (`compile.py:185-186`) which stamps the loop-token-equivalent
+    /// data on each emitted descr; copied descrs in the same trace
+    /// share the same `CompiledTraceInfo` value but write into their
+    /// own slot.  Default `None`.
+    fn trace_info_any(&self) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
+        None
+    }
+
+    /// Pyre-only per-emission `CompiledTraceInfo` slot write.  Caller
+    /// passes an `Arc<CompiledTraceInfo>` upcast to `Arc<dyn Any>`;
+    /// the impl downcasts.  Default panics — only Resume-family
+    /// guards own the slot.  Callers must gate by `is_resume_guard()
+    /// || is_resume_guard_copied()`.
+    fn set_trace_info_any(&self, _info: std::sync::Arc<dyn std::any::Any + Send + Sync>) {
+        panic!(
+            "set_trace_info_any invoked on a FailDescr that does not \
+             carry the per-emission trace_info slot (only Resume-family \
+             guards reached by record_loop_or_bridge at compile.py:185)"
+        );
+    }
+
+    /// Pyre-only cranelift bridge-attach cell addresses.  Returns
+    /// `(code_ptr_addr, frame_depth_addr)` — heap-pinned `usize`
+    /// addresses cranelift's `emit_attached_bridge_dispatch` bakes
+    /// into machine code as immediates.  Per-emission: each emitted
+    /// descr (including `ResumeGuardCopiedDescr`) can have a bridge
+    /// attached, so the cell addresses must be distinct per emission.
+    /// Default `None` for descrs that never carry bridges (singletons
+    /// / synthetic FINISH).
+    fn bridge_cache_addrs(&self) -> Option<(usize, usize)> {
+        None
+    }
+
+    /// Pyre-only cranelift bridge code-pointer read.  Returns 0 when
+    /// no bridge is attached.  Per-emission classification (see
+    /// `bridge_cache_addrs`).
+    fn bridge_code_ptr(&self) -> usize {
+        0
+    }
+
+    /// Pyre-only cranelift bridge cache publish.  Atomic-stores
+    /// `(code_ptr, frame_depth)` into the cells whose addresses
+    /// `bridge_cache_addrs` reported.  Default panics — only
+    /// Resume-family guards carry bridge cache cells.  Callers
+    /// gate by `is_resume_guard() || is_resume_guard_copied()`.
+    fn store_bridge_caches(&self, _code_ptr: usize, _frame_depth: usize) {
+        panic!(
+            "store_bridge_caches invoked on a FailDescr that does not \
+             carry the per-emission bridge cache cells (only \
+             ResumeGuardDescr / ResumeGuardCopiedDescr own them)"
+        );
+    }
+
+    /// Pyre-only cranelift bridge dispatch payload read (type-erased
+    /// raw pointer, backend re-Arcs via `Arc::from_raw`).  Null when
+    /// no bridge has been attached.  Default null.
+    fn bridge_dispatch_load(&self) -> *mut () {
+        std::ptr::null_mut()
+    }
+
+    /// Pyre-only cranelift bridge dispatch payload publish.  Atomic-
+    /// swaps `new_ptr` in and registers `drop_fn` for cleanup at
+    /// descr teardown.  Returns the previous payload so the caller
+    /// can reclaim.
+    ///
+    /// `drop_fn` is `unsafe fn` because it reconstructs an `Arc` from
+    /// the raw pointer the caller published; the contract between the
+    /// publisher and `drop_fn` is unsafe by construction.
+    ///
+    /// Default panics — only Resume-family guards own the dispatch
+    /// cell.  Silent default would immediately leak `new_ptr`
+    /// (caller already transferred ownership by `Arc::into_raw`).
+    /// Callers must gate by `is_resume_guard() ||
+    /// is_resume_guard_copied()`.
+    fn bridge_dispatch_swap(&self, _new_ptr: *mut (), _drop_fn: unsafe fn(*mut ())) -> *mut () {
+        panic!(
+            "bridge_dispatch_swap invoked on a FailDescr that does not \
+             carry the per-emission bridge_dispatch_cell (only \
+             ResumeGuardDescr / ResumeGuardCopiedDescr own it); the \
+             silent default would leak the supplied new_ptr"
+        );
+    }
+
+    /// Pyre-only per-emission slot: index of the trace op that produced
+    /// this guard at codegen.  Classified per-emission alongside
+    /// `history.py:132 AbstractFailDescr._attrs_` `rd_locs` /
+    /// `adr_jump_offset` — `assembler.py:279`
+    /// `guardtok.faildescr.rd_locs = positions` writes onto the per-
+    /// emitted descr without chasing `prev`, and the source op index
+    /// shares that classification (one codegen emission = one op).
+    /// Default `None` for non-resume FailDescrs.  Overridden on both
+    /// `ResumeGuardDescr` and `ResumeGuardCopiedDescr` so the cranelift
+    /// backend never has to chase `prev_descr` to find the storage —
+    /// the chase would conflate multiple `ResumeGuardCopiedDescr`
+    /// siblings sharing a donor (optimizer.py:691 / optimizeopt/mod.rs).
+    fn source_op_index(&self) -> Option<usize> {
+        None
+    }
+
+    /// Pyre-only per-emission slot write.  See `source_op_index` for
+    /// the per-emission rationale.  Default panics — only Resume-family
+    /// guards own the slot.  Callers must gate by
+    /// `is_resume_guard() || is_resume_guard_copied()`.
+    fn set_source_op_index(&self, _source_op_index: usize) {
+        panic!(
+            "set_source_op_index invoked on a FailDescr that does not \
+             carry the per-emission source_op_index slot (only \
+             ResumeGuardDescr / ResumeGuardCopiedDescr own it)"
+        );
     }
 
     /// `compile.py:683` `AbstractResumeGuardDescr._attrs_ = ('status',)`

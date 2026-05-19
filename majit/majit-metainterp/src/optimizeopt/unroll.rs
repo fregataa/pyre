@@ -2355,7 +2355,6 @@ impl TargetToken {
 
 #[derive(Debug, Default)]
 struct LoopTargetDescrState {
-    ll_loop_code: usize,
     target_arglocs: Vec<majit_ir::TargetArgLoc>,
     /// `history.py:493 self.original_jitcell_token`. Backfilled once the
     /// owning JitCellToken is created (`pyjitpl/mod.rs:3853` etc., the
@@ -2367,6 +2366,17 @@ struct LoopTargetDescrState {
 struct LoopTargetDescr {
     token_id: u64,
     is_preamble_target: bool,
+    /// `history.py:470` `TargetToken._ll_loop_code` parity (PyPy stores
+    /// a plain integer GIL-atomic; pyre uses `AtomicUsize` so the
+    /// cranelift backend's in-code `closing_jump` dispatch can read
+    /// the slot via a baked address without taking a Mutex).
+    ll_loop_code: std::sync::atomic::AtomicUsize,
+    /// `assembler.py:990-993` per-LABEL `_ll_loop_code` parity for the
+    /// cranelift backend: records which LABEL within the compiled body
+    /// function this TargetToken corresponds to (0 for first LABEL, 1
+    /// for second, ...) so cranelift's `br_table` body-entry dispatch
+    /// can route to the right per-LABEL entry block.
+    label_block_id: std::sync::atomic::AtomicU32,
     state: Mutex<LoopTargetDescrState>,
 }
 
@@ -2375,6 +2385,8 @@ impl LoopTargetDescr {
         Self {
             token_id,
             is_preamble_target,
+            ll_loop_code: std::sync::atomic::AtomicUsize::new(0),
+            label_block_id: std::sync::atomic::AtomicU32::new(0),
             state: Mutex::new(LoopTargetDescrState::default()),
         }
     }
@@ -2408,11 +2420,30 @@ impl majit_ir::LoopTargetDescr for LoopTargetDescr {
     }
 
     fn ll_loop_code(&self) -> usize {
-        self.state.lock().unwrap().ll_loop_code
+        self.ll_loop_code.load(std::sync::atomic::Ordering::Acquire)
     }
 
     fn set_ll_loop_code(&self, loop_code: usize) {
-        self.state.lock().unwrap().ll_loop_code = loop_code;
+        self.ll_loop_code
+            .store(loop_code, std::sync::atomic::Ordering::Release);
+    }
+
+    fn ll_loop_code_ptr(&self) -> *const std::sync::atomic::AtomicUsize {
+        &self.ll_loop_code as *const _
+    }
+
+    fn label_block_id(&self) -> u32 {
+        self.label_block_id
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn set_label_block_id(&self, id: u32) {
+        self.label_block_id
+            .store(id, std::sync::atomic::Ordering::Release);
+    }
+
+    fn label_block_id_ptr(&self) -> *const std::sync::atomic::AtomicU32 {
+        &self.label_block_id as *const _
     }
 
     fn target_arglocs(&self) -> Vec<majit_ir::TargetArgLoc> {

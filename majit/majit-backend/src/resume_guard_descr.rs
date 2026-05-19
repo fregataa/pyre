@@ -8,18 +8,49 @@
 //! per-emission wrapper `DynasmFailDescr` was retired (Slice 7-Tα7);
 //! the cranelift counterpart still carries codegen-bound payload
 //! pending Phase 7-Tβ.
+//!
+//! # Concurrency invariant (audited 2026-05-19)
+//!
+//! Several slots — `trace_info` (`AtomicPtr<CompiledTraceInfo>`),
+//! `bridge_dispatch_cell` (`AtomicPtr<()>`), and `bridge_code_ptr_cache`
+//! / `bridge_frame_depth_cache` — are accessed through atomics so that
+//! JIT-baked machine code can read them without a Mutex.  The
+//! `Arc::into_raw` / `Arc::increment_strong_count` / `Arc::from_raw`
+//! protocol used on the dispatch / trace_info cells has a textbook
+//! `load → retain` window that is unsafe under truly concurrent
+//! publishers or droppers.  The protocol relies on this invariant:
+//!
+//! - `set_trace_info`, `bridge_dispatch_swap`, and the corresponding
+//!   readers all execute on pyre's single JIT thread (RPython GIL
+//!   parity).  All call paths originate from `MetaInterp` / backend
+//!   codegen, both serial.
+//! - `Drop::drop` for `ResumeGuardDescr` runs when the last `Arc<dyn
+//!   FailDescr>` is released; a reader inside `trace_info()` /
+//!   `bridge_dispatch_load()` necessarily holds such an `Arc` for the
+//!   borrow lifetime, so drop cannot interleave with the load → retain
+//!   window.
+//! - The only background thread spawned by the driver
+//!   (`jitdriver.rs:762 invalidation_thread`) touches a
+//!   `Mutex<QuasiImmut>` and never reaches into `ResumeGuardDescr`.
+//!
+//! These three facts together close the race CodeRabbit and Codex
+//! flagged on PR #68 (Critical #6/#10/#13).  Any future change that
+//! introduces multi-threaded descr publishing or compilation MUST
+//! replace this protocol with a hazard-pointer / RCU scheme — atomics
+//! alone do not suffice.
 
 use std::any::Any;
 use std::cell::UnsafeCell;
 use std::rc::Rc;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use majit_ir::{
     AccumInfo, Const, Descr, DescrRef, FailDescr, GuardPendingFieldEntry, RdVirtualInfo, Type,
 };
 
 use crate::CompiledLoopToken;
+use crate::CompiledTraceInfo;
 use crate::ExitRecoveryLayout;
 use crate::rd_payload::RdPayload;
 use crate::resume_value::ResumeData;
@@ -124,16 +155,6 @@ pub struct ResumeGuardDescr {
     pub trace_id: AtomicU64,
     /// Pyre-only: per-trace `fail_index` assigned by `build_guard_metadata`.
     pub fail_index_per_trace: AtomicU32,
-    /// Pyre-only cache: cranelift bakes recovery decisions at codegen and
-    /// reads them back at deopt time through `recovery_layout_ref`.  Stored
-    /// here (rather than on `CraneliftFailDescr`) so the meta Arc is the
-    /// single source of truth, matching Phase A's `_attrs_` migration shape.
-    /// Will be removed entirely once `rebuild_state_after_failure` is
-    /// re-ported to drive `ResumeDataDirectReader` on-demand from `rd_numb`
-    /// / `rd_consts` / `rd_virtuals` / `rd_pendingfields` (PyPy's
-    /// `assembler.py::rebuild_locs_from_resumedata` shape — no pre-baked
-    /// `ExitRecoveryLayout`).
-    pub recovery_layout: UnsafeCell<Option<Arc<ExitRecoveryLayout>>>,
     /// Codegen-time trace-op index for the originating guard op
     /// (`pyjitpl._compile_one_block` parity — the live op object passed
     /// at compile time has an implicit index in `loop.operations`).
@@ -143,6 +164,95 @@ pub struct ResumeGuardDescr {
     /// meta Arc is the single source of truth.  `None` for synthetic
     /// FINISH / external-JUMP descrs that have no associated trace op.
     pub source_op_index: UnsafeCell<Option<usize>>,
+    /// Force-token slot positions for runtime GC-root filtering.
+    /// PyPy encodes the same information into the machine code's
+    /// GC-map immediates (`assembler.py` handles force-token slot
+    /// produce/consume inline); cranelift IR has no equivalent inline
+    /// encoding so the vector lives on the descr.  Migrated here from
+    /// `CraneliftFailDescr::force_token_slots_cell` (Slice 7-Tβ7) so
+    /// the meta Arc is the single source of truth.  Sorted and deduped
+    /// at write time so `is_force_token_slot` can use `binary_search`.
+    pub force_token_slots: UnsafeCell<Vec<usize>>,
+    /// `AbstractResumeGuardDescr.handle_fail` (`compile.py:701-717`)
+    /// drives `must_compile` via `jitcounter.tick(status_hash)` in
+    /// RPython.  Pyre keeps a raw per-descr counter (Slice 7-Tβ9):
+    /// the cranelift dispatch hot path calls `increment_fail_count()`
+    /// once per guard failure to drive the same threshold logic.
+    /// Migrated here from `CraneliftFailDescr::fail_count` so the
+    /// meta Arc is the single source of truth.
+    pub fail_count: AtomicU32,
+    /// Per-descr `CompiledTraceInfo` cell (Slice 7-Tβ10).  PyPy
+    /// recovers the same state on demand from `cpu.asmmemmgr_blocks` +
+    /// `compiled_loop_token`; cranelift parks the per-trace metadata
+    /// (input types / header_pc / source_guard tuple) here so the
+    /// deopt and CALL_ASSEMBLER overlay paths can read it without a
+    /// per-trace table lookup.  Migrated here from
+    /// `CraneliftFailDescr::trace_info_cell` so the meta Arc is the
+    /// single source of truth.
+    ///
+    /// Null on construction.  Written via
+    /// `Arc::into_raw(Arc::new(info))`; `Drop` reclaims the Arc.
+    pub trace_info: AtomicPtr<CompiledTraceInfo>,
+    /// Per-descr external-JUMP target cell (Slice 7-Tβ8 / cranelift-
+    /// only NEW DEVIATION).  PyPy's `assembler.py:2456-2462 closing_jump`
+    /// emits a raw inter-function JMP to `target_token._ll_loop_code`
+    /// at codegen time, so no per-descr slot exists upstream.  Cranelift
+    /// IR cannot emit raw inter-function JMPs, so cross-loop JUMP descrs
+    /// park the target `DescrRef` here; the dispatcher reads it and re-
+    /// enters the target loop via the registered
+    /// `JitCellToken.number -> RegisteredLoopTarget` metadata.
+    /// Membership (`OnceLock.get().is_some()`) is the canonical
+    /// `is_external_jump` predicate.
+    ///
+    /// Write-once: set at codegen finalisation.  Migrated here from
+    /// `CraneliftFailDescr::external_jump_target_cell` so the meta Arc
+    /// is the single source of truth (Slice 7-Tβ8).
+    pub external_jump_target: OnceLock<DescrRef>,
+    /// Bridge code-pointer cache (Slice 7-Tβ11 / cranelift-only NEW
+    /// DEVIATION).  PyPy's `assembler.py:987 patch_jump_for_descr`
+    /// rewrites the guard JMP target in place when a bridge is
+    /// attached; cranelift cannot patch finalised code, so the
+    /// JIT-baked dispatch loads the bridge code-pointer from this
+    /// cell at runtime.  Migrated here from
+    /// `CraneliftFailDescr::bridge_code_ptr_cache` so the meta Arc is
+    /// the single source of truth.
+    ///
+    /// `Box` gives the `AtomicUsize` a heap-pinned address that
+    /// survives `Arc::clone` of the meta descr; cranelift's
+    /// `emit_attached_bridge_dispatch` (compiler.rs:5347) embeds this
+    /// address as an immediate.  `0` = no bridge attached.
+    pub bridge_code_ptr_cache: Box<AtomicUsize>,
+    /// Bridge frame-depth cache (Slice 7-Tβ11).  Same shape as
+    /// `bridge_code_ptr_cache`; baked into the dispatch path so the
+    /// runtime can verify the JIT frame can fit the bridge inputs
+    /// before re-entering.
+    pub bridge_frame_depth_cache: Box<AtomicUsize>,
+    /// Bridge dispatch cell (Slice 7-Tβ12 / cranelift-only NEW
+    /// DEVIATION).  PyPy's `assembler.py:987 patch_jump_for_descr`
+    /// rewrites the guard JMP target in place; cranelift cannot patch
+    /// finalised code, so the runtime guard-failure dispatch loads
+    /// the published `Arc<BridgeData>` raw pointer from this cell
+    /// (via `bridge_dispatch_load` below) and reconstructs the Arc
+    /// via `Arc::increment_strong_count + Arc::from_raw`.
+    ///
+    /// Type-erased to `*mut ()` because `BridgeData` lives in
+    /// `majit-backend-cranelift` (downstream crate) and majit-backend
+    /// must not depend on it.  The matching cleanup is registered by
+    /// the backend on first `bridge_dispatch_swap` so `Drop` can
+    /// reclaim the published Arc without knowing its concrete type.
+    ///
+    /// The cell's address is not JIT-baked (runtime reads only), so a
+    /// plain `AtomicPtr<()>` suffices — `Arc::new(self)` pins the
+    /// surrounding `ResumeGuardDescr`, and the field address is then
+    /// stable across `Arc::clone` calls.  Null on construction (no
+    /// bridge attached).
+    pub bridge_dispatch_cell: AtomicPtr<()>,
+    /// Type-aware cleanup function the backend registers on first
+    /// `bridge_dispatch_swap`.  `Drop` invokes this with the cell's
+    /// final non-null payload so the published `Arc<BridgeData>` is
+    /// reclaimed by the owning crate.  `OnceLock` so the registration
+    /// is idempotent across re-attach.
+    pub bridge_dispatch_drop_fn: OnceLock<unsafe fn(*mut ())>,
 }
 
 // Safety: single-threaded JIT (RPython GIL parity).
@@ -179,8 +289,15 @@ impl Descr for ResumeGuardDescr {
             rd_loop_token_clt: UnsafeCell::new(None),
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
-            recovery_layout: UnsafeCell::new(None),
             source_op_index: UnsafeCell::new(None),
+            force_token_slots: UnsafeCell::new(Vec::new()),
+            fail_count: AtomicU32::new(0),
+            trace_info: AtomicPtr::new(std::ptr::null_mut()),
+            external_jump_target: OnceLock::new(),
+            bridge_code_ptr_cache: Box::new(AtomicUsize::new(0)),
+            bridge_frame_depth_cache: Box::new(AtomicUsize::new(0)),
+            bridge_dispatch_cell: AtomicPtr::new(std::ptr::null_mut()),
+            bridge_dispatch_drop_fn: OnceLock::new(),
         }))
     }
 }
@@ -308,6 +425,122 @@ impl FailDescr for ResumeGuardDescr {
             .expect("set_rd_loop_token_clt expected Arc<CompiledLoopToken>");
         unsafe { *self.rd_loop_token_clt.get() = Some(typed) };
     }
+    fn source_op_index(&self) -> Option<usize> {
+        // Safety: single-threaded JIT.
+        unsafe { *self.source_op_index.get() }
+    }
+    fn set_source_op_index(&self, source_op_index: usize) {
+        // Safety: single-threaded JIT.
+        unsafe { *self.source_op_index.get() = Some(source_op_index) };
+    }
+    fn force_token_slots(&self) -> Vec<usize> {
+        // Safety: single-threaded JIT.
+        unsafe { (&*self.force_token_slots.get()).clone() }
+    }
+    fn set_force_token_slots(&self, mut slots: Vec<usize>) {
+        slots.sort_unstable();
+        slots.dedup();
+        // Safety: single-threaded JIT.
+        unsafe { *self.force_token_slots.get() = slots };
+    }
+    fn fail_count(&self) -> u32 {
+        self.fail_count.load(Ordering::Relaxed)
+    }
+    fn increment_fail_count(&self) -> u32 {
+        self.fail_count.fetch_add(1, Ordering::Relaxed) + 1
+    }
+    fn trace_info_any(&self) -> Option<Arc<dyn Any + Send + Sync>> {
+        let ptr = self.trace_info.load(Ordering::Acquire);
+        if ptr.is_null() {
+            None
+        } else {
+            // Safety: stored via `Arc::into_raw(Arc::new(info))` in
+            // `set_trace_info_any` / `set_trace_info`.  Bump the strong
+            // count and reconstruct so the caller gets an owning Arc
+            // without taking ownership from the cell.
+            //
+            // The `load` → `increment_strong_count` window is sound under
+            // pyre's single-JIT-thread invariant (RPython GIL parity):
+            // `set_trace_info_any` and `Drop::drop` only run on the JIT
+            // compiler thread.  Reads happen either from the same thread
+            // (codegen helpers like `fail_descr_trace_info`) or from JIT-
+            // baked code executed under the same GIL-equivalent
+            // serialization.  A re-publishing `set_trace_info_any` cannot
+            // interleave between this load and the strong-count bump,
+            // so the pointed-to `Arc` cannot be freed mid-protocol.  The
+            // atomic primitive exists so JIT-baked machine code can
+            // address the cell without a lock; cross-thread concurrency
+            // is not part of the invariant.
+            unsafe {
+                Arc::increment_strong_count(ptr as *const CompiledTraceInfo);
+                let arc = Arc::from_raw(ptr as *const CompiledTraceInfo);
+                Some(arc as Arc<dyn Any + Send + Sync>)
+            }
+        }
+    }
+    fn set_trace_info_any(&self, info: Arc<dyn Any + Send + Sync>) {
+        let typed: Arc<CompiledTraceInfo> = info
+            .downcast::<CompiledTraceInfo>()
+            .expect("set_trace_info_any expected Arc<CompiledTraceInfo>");
+        let new_ptr = Arc::into_raw(typed) as *mut CompiledTraceInfo;
+        let old_ptr = self.trace_info.swap(new_ptr, Ordering::AcqRel);
+        if !old_ptr.is_null() {
+            // Safety: prior swap produced this pointer via the same
+            // `Arc::into_raw(Arc::new(...))` invariant.
+            unsafe { drop(Arc::from_raw(old_ptr as *const CompiledTraceInfo)) };
+        }
+    }
+    fn bridge_cache_addrs(&self) -> Option<(usize, usize)> {
+        Some((
+            self.bridge_code_ptr_cache.as_ref() as *const _ as usize,
+            self.bridge_frame_depth_cache.as_ref() as *const _ as usize,
+        ))
+    }
+    fn bridge_code_ptr(&self) -> usize {
+        self.bridge_code_ptr_cache.load(Ordering::Acquire)
+    }
+    fn store_bridge_caches(&self, code_ptr: usize, frame_depth: usize) {
+        self.bridge_frame_depth_cache
+            .store(frame_depth, Ordering::Release);
+        self.bridge_code_ptr_cache
+            .store(code_ptr, Ordering::Release);
+    }
+    fn bridge_dispatch_load(&self) -> *mut () {
+        self.bridge_dispatch_cell.load(Ordering::Acquire)
+    }
+    fn bridge_dispatch_swap(&self, new_ptr: *mut (), drop_fn: unsafe fn(*mut ())) -> *mut () {
+        // Forward to the inherent method so the re-attach cleanup-fn
+        // identity assertion lives in one place.
+        ResumeGuardDescr::bridge_dispatch_swap(self, new_ptr, drop_fn)
+    }
+
+    /// `assembler.py:2456-2462 closing_jump` parity: external JUMP exits
+    /// are routed through a synthesised `ResumeGuardDescr` whose
+    /// `external_jump_target` slot carries the cross-loop TargetToken
+    /// `DescrRef` (Slice 7-Tβ8).  Membership in the slot IS the
+    /// external-JUMP predicate.  Slice 7-Tβ14f override: prior to
+    /// CraneliftFailDescr deletion the predicate lived on the backend
+    /// wrapper; with the wrapper gone the FailDescr trait impl must
+    /// answer directly.
+    fn is_external_jump(&self) -> bool {
+        self.external_jump_target.get().is_some()
+    }
+
+    /// `history.py:470` `TargetToken._ll_loop_code` parity: when this
+    /// descr is the synthesised cross-loop JUMP exit, surface the target
+    /// `DescrRef` the dispatcher re-enters via.  `None` for regular
+    /// guard descrs.  Slice 7-Tβ14f override (see `is_external_jump`).
+    fn target_descr(&self) -> Option<DescrRef> {
+        self.external_jump_target.get().cloned()
+    }
+
+    /// Trait override of `set_external_jump_target` forwarding to the
+    /// inherent method (Slice 7-Tβ8); reuses the same write-once
+    /// semantics so trait dispatch on `&dyn FailDescr` lands here for
+    /// the cross-loop JUMP target publish in `collect_guards`.
+    fn set_external_jump_target(&self, target: DescrRef) {
+        ResumeGuardDescr::set_external_jump_target(self, target);
+    }
 }
 
 /// compile.py:840-843 `ResumeGuardDescr` parity: a fresh guard descr
@@ -332,34 +565,19 @@ pub fn make_resume_guard_descr_typed(types: Vec<Type>) -> DescrRef {
         rd_loop_token_clt: UnsafeCell::new(None),
         trace_id: AtomicU64::new(0),
         fail_index_per_trace: AtomicU32::new(0),
-        recovery_layout: UnsafeCell::new(None),
         source_op_index: UnsafeCell::new(None),
+        force_token_slots: UnsafeCell::new(Vec::new()),
+        fail_count: AtomicU32::new(0),
+        trace_info: AtomicPtr::new(std::ptr::null_mut()),
+        external_jump_target: OnceLock::new(),
+        bridge_code_ptr_cache: Box::new(AtomicUsize::new(0)),
+        bridge_frame_depth_cache: Box::new(AtomicUsize::new(0)),
+        bridge_dispatch_cell: AtomicPtr::new(std::ptr::null_mut()),
+        bridge_dispatch_drop_fn: OnceLock::new(),
     })
 }
 
 impl ResumeGuardDescr {
-    /// Read the cached recovery_layout (clone of the stored `Arc` contents).
-    /// Returns `None` when codegen has not yet stamped a layout.  Pyre-only
-    /// cache (no PyPy counterpart); the eventual orthodox port replaces
-    /// callers with on-demand `ResumeDataDirectReader` decoding from `rd_*`.
-    pub fn recovery_layout(&self) -> Option<ExitRecoveryLayout> {
-        // Safety: single-threaded JIT (RPython GIL parity); same access
-        // contract as the sibling `vector_info` / `rd_locs` UnsafeCells.
-        unsafe {
-            (*self.recovery_layout.get())
-                .as_ref()
-                .map(|a| (**a).clone())
-        }
-    }
-
-    /// Write the cached recovery_layout.  Wraps the layout in an `Arc` to
-    /// keep `recovery_layout()`'s clone-on-read path cheap when consumers
-    /// only need a snapshot.
-    pub fn set_recovery_layout(&self, layout: ExitRecoveryLayout) {
-        // Safety: single-threaded JIT.
-        unsafe { *self.recovery_layout.get() = Some(Arc::new(layout)) };
-    }
-
     /// Read the codegen-time `source_op_index` (Slice 7-Tβ6).  `None`
     /// when codegen has not yet stamped one (synthetic descrs minted
     /// outside `_compile_one_block`).
@@ -372,5 +590,196 @@ impl ResumeGuardDescr {
     pub fn set_source_op_index(&self, source_op_index: usize) {
         // Safety: single-threaded JIT.
         unsafe { *self.source_op_index.get() = Some(source_op_index) };
+    }
+
+    /// Read the codegen-time `force_token_slots` (Slice 7-Tβ7).
+    /// Returns `&[]` when codegen has not stamped any slots (the
+    /// common case for guards that do not produce force tokens).
+    pub fn force_token_slots(&self) -> &[usize] {
+        // Safety: single-threaded JIT.
+        unsafe { &*self.force_token_slots.get() }
+    }
+
+    /// Write the codegen-time `force_token_slots` (Slice 7-Tβ7).
+    /// Sorts + dedups so the stored vector satisfies the
+    /// `binary_search` invariant used by
+    /// `CraneliftFailDescr::is_force_token_slot`.
+    pub fn set_force_token_slots(&self, mut slots: Vec<usize>) {
+        slots.sort_unstable();
+        slots.dedup();
+        // Safety: single-threaded JIT.
+        unsafe { *self.force_token_slots.get() = slots };
+    }
+
+    /// Increment the per-descr `fail_count` (Slice 7-Tβ9).  Returns
+    /// the post-increment value.  Mirrors PyPy's `jitcounter.tick`
+    /// semantics: one increment per observed guard failure, drives
+    /// `must_compile` threshold in `compile.py:701-717`.
+    pub fn increment_fail_count(&self) -> u32 {
+        self.fail_count.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// Read the per-descr `fail_count` (Slice 7-Tβ9).
+    pub fn get_fail_count(&self) -> u32 {
+        self.fail_count.load(Ordering::Relaxed)
+    }
+
+    /// Publish the per-trace `CompiledTraceInfo` into the descr-local
+    /// atomic cell (Slice 7-Tβ10).  Any previously published Arc is
+    /// reclaimed by the swap.
+    pub fn set_trace_info(&self, info: CompiledTraceInfo) {
+        let new_ptr = Arc::into_raw(Arc::new(info)) as *mut CompiledTraceInfo;
+        let old_ptr = self.trace_info.swap(new_ptr, Ordering::AcqRel);
+        if !old_ptr.is_null() {
+            // Safety: prior `set_trace_info` published this pointer;
+            // reclaim ownership and drop.
+            unsafe { drop(Arc::from_raw(old_ptr as *const CompiledTraceInfo)) };
+        }
+    }
+
+    /// Read the per-trace `CompiledTraceInfo` (Slice 7-Tβ10).
+    /// Returns an owned clone of the published value, or `None` when
+    /// no trace info has been published.  Lock-free.
+    ///
+    /// The `load` → `increment_strong_count` window relies on pyre's
+    /// single-JIT-thread invariant (RPython GIL parity): no concurrent
+    /// `set_trace_info` / `Drop::drop` can interleave between the load
+    /// and the strong-count bump because all publishers run on the JIT
+    /// compiler thread and readers run under the same serialization.
+    /// The `AtomicPtr` exists so JIT-baked machine code can read the
+    /// cell without a mutex, not to support cross-thread publishing.
+    pub fn trace_info(&self) -> Option<CompiledTraceInfo> {
+        let ptr = self.trace_info.load(Ordering::Acquire);
+        if ptr.is_null() {
+            None
+        } else {
+            // Safety: `ptr` was produced by `Arc::into_raw(Arc::new(info))`
+            // in `set_trace_info`; increment_strong_count + from_raw
+            // yields an extra owning Arc the caller can deref + clone.
+            // Single-thread invariant above prevents UAF.
+            unsafe {
+                Arc::increment_strong_count(ptr as *const CompiledTraceInfo);
+                let arc = Arc::from_raw(ptr as *const CompiledTraceInfo);
+                Some((*arc).clone())
+            }
+        }
+    }
+
+    /// Publish the external-JUMP target (Slice 7-Tβ8).  Write-once;
+    /// panics if invoked twice on the same descr (mirrors PyPy's
+    /// `assembler.py:2456-2462 closing_jump` codegen-time finality —
+    /// the target is determined at trace emission and never revised).
+    pub fn set_external_jump_target(&self, target: DescrRef) {
+        self.external_jump_target
+            .set(target)
+            .expect("external_jump_target already published");
+    }
+
+    /// Read the external-JUMP target (Slice 7-Tβ8).  `None` for
+    /// regular guard descrs (the common case); `Some` only for the
+    /// cranelift-synthesised cross-loop JUMP descrs.
+    pub fn external_jump_target(&self) -> Option<DescrRef> {
+        self.external_jump_target.get().cloned()
+    }
+
+    /// Predicate (`is_external_jump` parity) — membership in the
+    /// external-JUMP target cell (Slice 7-Tβ8).
+    pub fn is_external_jump(&self) -> bool {
+        self.external_jump_target.get().is_some()
+    }
+
+    /// Heap-pinned addresses of the two bridge-cache atomic cells
+    /// (Slice 7-Tβ11) suitable for baking into JIT machine code as
+    /// immediates.  Returns `(code_ptr_addr, frame_depth_addr)`.
+    pub fn bridge_cache_addrs(&self) -> (usize, usize) {
+        (
+            self.bridge_code_ptr_cache.as_ref() as *const _ as usize,
+            self.bridge_frame_depth_cache.as_ref() as *const _ as usize,
+        )
+    }
+
+    /// Atomically store the bridge code-pointer + frame-depth caches
+    /// (Slice 7-Tβ11).  Called from cranelift `attach_bridge` after
+    /// the bridge has been compiled.
+    pub fn store_bridge_caches(&self, code_ptr: usize, frame_depth: usize) {
+        self.bridge_frame_depth_cache
+            .store(frame_depth, Ordering::Release);
+        self.bridge_code_ptr_cache
+            .store(code_ptr, Ordering::Release);
+    }
+
+    /// Read the cached bridge code-pointer (Slice 7-Tβ11).  `0` when
+    /// no bridge is attached.
+    pub fn bridge_code_ptr(&self) -> usize {
+        self.bridge_code_ptr_cache.load(Ordering::Acquire)
+    }
+
+    /// Read the type-erased bridge dispatch cell (Slice 7-Tβ12).
+    /// Returns the published raw pointer for the backend to
+    /// reconstruct its concrete `Arc<BridgeData>` via
+    /// `Arc::increment_strong_count + Arc::from_raw`.  Null when no
+    /// bridge has been attached.
+    pub fn bridge_dispatch_load(&self) -> *mut () {
+        self.bridge_dispatch_cell.load(Ordering::Acquire)
+    }
+
+    /// Atomic-swap a new bridge dispatch payload into the cell and
+    /// register the backend-supplied cleanup function (Slice 7-Tβ12).
+    /// Returns the previous payload so the backend can reclaim its
+    /// owned `Arc`.  The cleanup function is registered once
+    /// (idempotent) and invoked by `Drop` on any payload still in the
+    /// cell at descr teardown.
+    pub fn bridge_dispatch_swap(&self, new_ptr: *mut (), drop_fn: unsafe fn(*mut ())) -> *mut () {
+        // Re-attach must use the same cleanup function the first
+        // attach registered: `Drop` reclaims the surviving payload via
+        // the stored `drop_fn`, so a mismatched destructor on a later
+        // re-attach would type-pun the payload and corrupt the
+        // backend's owned Arc.  Compare function pointers by raw
+        // address — `fn` is `Copy` and equality on raw fn-pointers is
+        // well-defined for monomorphised functions baked at codegen.
+        if let Some(existing) = self.bridge_dispatch_drop_fn.get() {
+            assert_eq!(
+                *existing as usize, drop_fn as usize,
+                "bridge_dispatch_swap re-attach registered a different cleanup fn \
+                 for the same descr — payload type-shape must be stable across \
+                 re-attach (otherwise Drop would type-pun the survivor)",
+            );
+        } else {
+            let _ = self.bridge_dispatch_drop_fn.set(drop_fn);
+        }
+        self.bridge_dispatch_cell.swap(new_ptr, Ordering::AcqRel)
+    }
+}
+
+impl Drop for ResumeGuardDescr {
+    fn drop(&mut self) {
+        // Slice 7-Tβ10: reclaim any published `Arc<CompiledTraceInfo>`
+        // by swapping the cell to null and reconstructing the Arc so
+        // its Drop runs.
+        let ptr = self.trace_info.swap(std::ptr::null_mut(), Ordering::AcqRel);
+        if !ptr.is_null() {
+            // Safety: produced by `Arc::into_raw(Arc::new(info))` in
+            // `set_trace_info`.
+            unsafe { drop(Arc::from_raw(ptr as *const CompiledTraceInfo)) };
+        }
+        // Slice 7-Tβ12: reclaim any published bridge dispatch payload
+        // via the backend-registered cleanup function.  Swap-to-null
+        // first so a concurrent reader either sees the still-live
+        // pointer (and bumps the strong count) or null (and skips).
+        let bridge_ptr = self
+            .bridge_dispatch_cell
+            .swap(std::ptr::null_mut(), Ordering::AcqRel);
+        if !bridge_ptr.is_null() {
+            if let Some(drop_fn) = self.bridge_dispatch_drop_fn.get() {
+                // Safety: `drop_fn` was registered via `bridge_dispatch_swap`
+                // alongside the payload at `bridge_ptr`; the publisher's
+                // safety contract is that the function reclaims a value of
+                // the same shape the publisher published.
+                unsafe { drop_fn(bridge_ptr) };
+            }
+            // else: payload published with no cleanup registered — a
+            // backend bug.  Leaks rather than risks reading the wrong
+            // concrete type.
+        }
     }
 }
