@@ -682,3 +682,39 @@ def test_computed_goto_correctness():
     for i in range(8):
         assert f(i) == 100 + i
     assert f(99) == -1
+
+def test_computed_goto_negative_cases():
+    # Switches with negative case values must produce valid C label names.
+    # A label like _cgoto_N_-1 is invalid C; it must be encoded (e.g. _cgoto_N_n1).
+    def dispatch(opcode):
+        if opcode == -4: return 10
+        elif opcode == -3: return 20
+        elif opcode == -2: return 30
+        elif opcode == -1: return 40
+        elif opcode == 0: return 50
+        else: return -1
+
+    c_src = get_generated_c_source(dispatch, [int])
+    assert '_cgoto_' in c_src, "expected computed goto table in C source"
+    # A label name containing '-' would be a C syntax error.
+    import re
+    assert not re.search(r'_cgoto_\d+_-', c_src), \
+        "negative case values must not produce '-' in C label names"
+
+def test_computed_goto_negative_cases_correctness():
+    # Verify computed goto with negative cases produces correct results.
+    def dispatch(opcode):
+        if opcode == -4: return 10
+        elif opcode == -3: return 20
+        elif opcode == -2: return 30
+        elif opcode == -1: return 40
+        elif opcode == 0: return 50
+        else: return -1
+
+    f = compile(dispatch, [int])
+    assert f(-4) == 10
+    assert f(-3) == 20
+    assert f(-2) == 30
+    assert f(-1) == 40
+    assert f(0) == 50
+    assert f(99) == -1

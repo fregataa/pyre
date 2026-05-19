@@ -379,8 +379,12 @@ class FunctionCodeGenerator(object):
         table_size = max_val - min_val + 1
 
         # Per-case entry label: _cgoto_N_CASE (N=switch block, CASE=opcode).
+        # Negative values use 'n' prefix so the label is a valid C identifier.
         def case_label(exitcase):
-            return '_cgoto_%d_%d' % (myblocknum, int(exitcase))
+            v = int(exitcase)
+            if v < 0:
+                return '_cgoto_%d_n%d' % (myblocknum, -v)
+            return '_cgoto_%d_%d' % (myblocknum, v)
 
         if defaultlink is not None:
             default_label = '_cgoto_%d_default' % myblocknum
