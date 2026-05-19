@@ -17,9 +17,7 @@ use dynasmrt::aarch64::Assembler;
 use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, ExecutableBuffer, dynasm};
 
 use majit_backend::BackendError;
-use majit_ir::{
-    FailDescr, InputArg, LoopTargetDescr, Op, OpCode, OpRef, OpTypeIndex, TargetArgLoc, Type,
-};
+use majit_ir::{FailDescr, InputArg, Op, OpCode, OpRc, OpRef, OpTypeIndex, TargetArgLoc, Type};
 
 use crate::arch::*;
 use crate::codebuf;
@@ -44,18 +42,12 @@ enum ResolvedArg {
     Const(i64),
 }
 
-fn loop_target_descr(op: &Op) -> Option<&dyn LoopTargetDescr> {
-    op.descr
-        .as_deref()
-        .and_then(majit_ir::Descr::as_loop_target_descr)
-}
-
 /// Pointer-identity key for `target_tokens_currently_compiling`. PyPy
 /// x86/assembler.py:93 keys it by the descr Python object itself; we use
 /// the underlying allocation address of the `Arc<dyn Descr>` so two
 /// distinct TargetToken descriptors are never confused.
 fn loop_target_id(op: &Op) -> Option<usize> {
-    op.descr.as_ref().map(majit_ir::descr_identity)
+    op.getdescr().as_ref().map(majit_ir::descr_identity)
 }
 
 fn target_argloc_from_loc(loc: Loc) -> TargetArgLoc {
@@ -235,9 +227,9 @@ pub struct AssemblerARM64<'a> {
     /// Mirrors `OpTypeIndex::op_pos`.
     op_pos: Vec<u32>,
     /// Constants: OpRef index (>= 10000) → i64 value.
-    constants: HashMap<u32, i64>,
+    constants: majit_ir::VecAssoc<u32, i64>,
     /// Constant type annotations for float immediates and fail args.
-    constant_types: HashMap<u32, Type>,
+    constant_types: majit_ir::VecAssoc<u32, Type>,
     /// Next available frame slot index.
     next_slot: usize,
     /// Condition code from the most recent CMP/TEST instruction,
@@ -362,7 +354,6 @@ impl<'a> AssemblerARM64<'a> {
         let type_index = OpTypeIndex::from_parts(
             self.inputargs,
             self.operations,
-            &self.constant_types,
             &self.inputarg_pos,
             &self.op_pos,
         );
@@ -376,7 +367,7 @@ impl<'a> AssemblerARM64<'a> {
     pub(crate) fn new(
         trace_id: u64,
         header_pc: u64,
-        constants: HashMap<u32, i64>,
+        constants: majit_ir::VecAssoc<u32, i64>,
         vtable_offset: Option<usize>,
         classptr_to_typeid: HashMap<i64, u32>,
         guard_gc_type_info: Option<GuardGcTypeInfo>,
@@ -404,7 +395,7 @@ impl<'a> AssemblerARM64<'a> {
             inputarg_pos,
             op_pos,
             constants,
-            constant_types: HashMap::new(),
+            constant_types: majit_ir::VecAssoc::new(),
             next_slot: 0,
             guard_success_cc: None,
             target_tokens_currently_compiling: HashMap::new(),
@@ -2165,18 +2156,8 @@ impl<'a> AssemblerARM64<'a> {
             | OpCode::Strlen
             | OpCode::Unicodelen => {
                 if let (Some(Loc::Reg(base)), Some(Loc::Reg(dst))) = (arglocs.first(), result_loc) {
-                    let ofs = op
-                        .descr
-                        .as_ref()
-                        .and_then(|d| d.as_field_descr())
-                        .map(|fd| fd.offset() as i32)
-                        .unwrap_or(0);
-                    let field_size = op
-                        .descr
-                        .as_ref()
-                        .and_then(|d| d.as_field_descr())
-                        .map(|fd| fd.field_size())
-                        .unwrap_or(8);
+                    let ofs = op.with_field_descr(|fd| fd.offset() as i32).unwrap_or(0);
+                    let field_size = op.with_field_descr(|fd| fd.field_size()).unwrap_or(8);
                     if dst.is_xmm {
                         dynasm!(self.mc ; .arch aarch64 ; ldr D(dst.value), [X(base.value), ofs as u32]);
                     } else {
@@ -2211,10 +2192,7 @@ impl<'a> AssemblerARM64<'a> {
                     (arglocs.first(), arglocs.get(1), result_loc)
                 {
                     let (base_size, item_size, signed) = op
-                        .descr
-                        .as_ref()
-                        .and_then(|d| d.as_array_descr())
-                        .map(|ad| {
+                        .with_array_descr(|ad| {
                             (
                                 ad.base_size() as i32,
                                 ad.item_size() as i32,
@@ -2269,10 +2247,7 @@ impl<'a> AssemblerARM64<'a> {
                     (arglocs.first(), arglocs.get(1), arglocs.get(2))
                 {
                     let (base_size, item_size) = op
-                        .descr
-                        .as_ref()
-                        .and_then(|d| d.as_array_descr())
-                        .map(|ad| (ad.base_size() as i32, ad.item_size() as i32))
+                        .with_array_descr(|ad| (ad.base_size() as i32, ad.item_size() as i32))
                         .unwrap_or((0, 8));
                     let index_reg = 16u8;
                     let value_reg = 17u8;
@@ -2335,18 +2310,8 @@ impl<'a> AssemblerARM64<'a> {
             // ── Memory stores: opassembler.rs emit_op_setfield_regalloc ──
             OpCode::SetfieldGc | OpCode::SetfieldRaw => {
                 if let (Some(Loc::Reg(base)), Some(val_loc)) = (arglocs.first(), arglocs.get(1)) {
-                    let ofs = op
-                        .descr
-                        .as_ref()
-                        .and_then(|d| d.as_field_descr())
-                        .map(|fd| fd.offset() as i32)
-                        .unwrap_or(0);
-                    let field_size = op
-                        .descr
-                        .as_ref()
-                        .and_then(|d| d.as_field_descr())
-                        .map(|fd| fd.field_size())
-                        .unwrap_or(8);
+                    let ofs = op.with_field_descr(|fd| fd.offset() as i32).unwrap_or(0);
+                    let field_size = op.with_field_descr(|fd| fd.field_size()).unwrap_or(8);
                     self.emit_op_setfield_regalloc(base, val_loc, ofs, field_size);
                 } else {
                     self.genop_discard_setfield(op);
@@ -2371,10 +2336,7 @@ impl<'a> AssemblerARM64<'a> {
                     let nsize = match arglocs.get(3) {
                         Some(Loc::Immed(i)) => i.value,
                         _ => op
-                            .descr
-                            .as_ref()
-                            .and_then(|d| d.as_array_descr())
-                            .map(|ad| {
+                            .with_array_descr(|ad| {
                                 let s = ad.item_size() as i64;
                                 if ad.is_item_signed() { -s } else { s }
                             })
@@ -2462,10 +2424,7 @@ impl<'a> AssemblerARM64<'a> {
                     let nsize = match arglocs.get(3) {
                         Some(Loc::Immed(i)) => i.value,
                         _ => op
-                            .descr
-                            .as_ref()
-                            .and_then(|d| d.as_array_descr())
-                            .map(|ad| {
+                            .with_array_descr(|ad| {
                                 let s = ad.item_size() as i64;
                                 if ad.is_item_signed() { -s } else { s }
                             })
@@ -2534,7 +2493,8 @@ impl<'a> AssemblerARM64<'a> {
             }
             // ── Control flow ──
             OpCode::Jump => {
-                let jump_descr = loop_target_descr(op);
+                let descr_arc = op.getdescr();
+                let jump_descr = descr_arc.as_ref().and_then(|d| d.as_loop_target_descr());
                 let target_arglocs = jump_descr
                     .map(|descr| {
                         descr
@@ -2575,7 +2535,7 @@ impl<'a> AssemblerARM64<'a> {
                         Loc::Frame(crate::regloc::FrameLoc::new(i, dst_ofs, false))
                     };
                     let arg_tp = op
-                        .args
+                        .getarglist()
                         .get(i)
                         .and_then(|arg| self.opref_type_at(*arg, Some(op_index)))
                         .unwrap_or(Type::Int);
@@ -2625,10 +2585,7 @@ impl<'a> AssemblerARM64<'a> {
                 // when the FINISH was emitted for
                 // `pyjitpl.py:3238 compile_exit_frame_with_exception`.
                 let is_exit_exc = op
-                    .descr
-                    .as_ref()
-                    .and_then(|d| d.as_fail_descr())
-                    .map(|fd| fd.is_exit_frame_with_exception())
+                    .with_fail_descr(|fd| fd.is_exit_frame_with_exception())
                     .unwrap_or(false);
                 let global_descr_ptr = if is_exit_exc {
                     self.exit_frame_with_exception_descr_ref_ptr()
@@ -2688,7 +2645,8 @@ impl<'a> AssemblerARM64<'a> {
             }
             OpCode::Label => {
                 let label = self.mc.new_dynamic_label();
-                let label_descr = loop_target_descr(op);
+                let descr_arc = op.getdescr();
+                let label_descr = descr_arc.as_ref().and_then(|d| d.as_loop_target_descr());
                 if crate::majit_log_enabled() {
                     eprintln!(
                         "[dynasm] LABEL: new DynamicLabel({:?}) arglocs={:?}",
@@ -2710,7 +2668,7 @@ impl<'a> AssemblerARM64<'a> {
                     if let Some(id) = loop_target_id(op) {
                         self.target_tokens_currently_compiling.insert(id, label);
                     }
-                    if let Some(descr_ref) = op.descr.as_ref() {
+                    if let Some(descr_ref) = op.getdescr() {
                         self.compiled_target_tokens.push(descr_ref.clone());
                     }
                 }
@@ -2775,8 +2733,8 @@ impl<'a> AssemblerARM64<'a> {
                         dynasm!(self.mc ; .arch aarch64 ; mov X(rv), x0);
                     }
                 }
-                if !op.pos.is_none() {
-                    self.store_rax_to_result(op.pos);
+                if !op.pos.get().is_none() {
+                    self.store_rax_to_result(op.pos.get());
                 }
             }
             // aarch64/assembler.py:715 malloc_cond_varsize_frame
@@ -2870,19 +2828,14 @@ impl<'a> AssemblerARM64<'a> {
                 // CALL_ASSEMBLER store sequence that follows.
                 self.emit_propagate_memory_error_if_null(0);
                 dynasm!(self.mc ; .arch aarch64 ; =>done);
-                if !op.pos.is_none() {
-                    self.store_rax_to_result(op.pos);
+                if !op.pos.get().is_none() {
+                    self.store_rax_to_result(op.pos.get());
                 }
             }
             // aarch64/assembler.py:738 malloc_cond_varsize
             // arglocs = [lengthloc, imm(itemsize), imm(kind)]
             OpCode::CallMallocNurseryVarsize => {
-                let base_size = op
-                    .descr
-                    .as_ref()
-                    .and_then(|d| d.as_array_descr())
-                    .map(|ad| ad.base_size())
-                    .unwrap_or(16) as i64;
+                let base_size = op.with_array_descr(|ad| ad.base_size()).unwrap_or(16) as i64;
                 let itemsize = match arglocs.get(1) {
                     Some(Loc::Immed(i)) => i.value,
                     _ => 8,
@@ -2919,8 +2872,8 @@ impl<'a> AssemblerARM64<'a> {
                 // the result store so the null pointer never reaches
                 // subsequent typed stores.
                 self.emit_propagate_memory_error_if_null(0);
-                if !op.pos.is_none() {
-                    self.store_rax_to_result(op.pos);
+                if !op.pos.get().is_none() {
+                    self.store_rax_to_result(op.pos.get());
                 }
             }
             // aarch64/opassembler.py:258 `emit_op_check_memory_error` →
@@ -3420,7 +3373,7 @@ impl<'a> AssemblerARM64<'a> {
         // routing the writes through the trait at codegen time lets readers
         // consume the canonical metainterp identity before
         // `build_guard_metadata` (`compile.rs:232`) re-stamps.
-        if let Some(d) = op.descr.as_ref() {
+        if let Some(d) = op.getdescr() {
             if d.is_resume_guard() || d.is_resume_guard_copied() {
                 if let Some(fd) = d.as_fail_descr() {
                     fd.set_fail_index_per_trace(fail_index);
@@ -3430,7 +3383,7 @@ impl<'a> AssemblerARM64<'a> {
         }
         let descr: majit_ir::DescrRef = if let Some(pre) = self.pending_force_descr.take() {
             pre
-        } else if let Some(d) = op.descr.clone() {
+        } else if let Some(d) = op.getdescr() {
             // Guard exit — `compile.py:185` ResumeGuardDescr family.
             // Use the metainterp `AbstractFailDescr` Arc from `op.descr`
             // directly; per-trace fail_index / trace_id were stamped
@@ -3465,7 +3418,7 @@ impl<'a> AssemblerARM64<'a> {
                 fail_index,
                 op_index,
                 op.opcode,
-                op.fail_args.as_ref(),
+                op.getfailargs(),
                 descr_fd.fail_arg_types(),
                 faillocs
             );
@@ -3695,7 +3648,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; add x0, x0, x1
         );
-        self.store_rax_to_result(op.pos);
+        self.store_rax_to_result(op.pos.get());
     }
 
     /// INT_SUB: result = arg0 - arg1
@@ -3705,7 +3658,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; sub x0, x0, x1
         );
-        self.store_rax_to_result(op.pos);
+        self.store_rax_to_result(op.pos.get());
     }
 
     /// INT_MUL: result = arg0 * arg1
@@ -3715,7 +3668,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; mul x0, x0, x1
         );
-        self.store_rax_to_result(op.pos);
+        self.store_rax_to_result(op.pos.get());
     }
 
     /// INT_AND: result = arg0 & arg1
@@ -3725,7 +3678,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; and x0, x0, x1
         );
-        self.store_rax_to_result(op.pos);
+        self.store_rax_to_result(op.pos.get());
     }
 
     /// INT_OR: result = arg0 | arg1
@@ -3735,7 +3688,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; orr x0, x0, x1
         );
-        self.store_rax_to_result(op.pos);
+        self.store_rax_to_result(op.pos.get());
     }
 
     /// INT_XOR: result = arg0 ^ arg1
@@ -3745,7 +3698,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; eor x0, x0, x1
         );
-        self.store_rax_to_result(op.pos);
+        self.store_rax_to_result(op.pos.get());
     }
 
     /// INT_NEG: result = -arg0
@@ -3754,7 +3707,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; neg x0, x0
         );
-        self.store_rax_to_result(op.pos);
+        self.store_rax_to_result(op.pos.get());
     }
 
     /// INT_INVERT: result = ~arg0
@@ -3763,7 +3716,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; mvn x0, x0
         );
-        self.store_rax_to_result(op.pos);
+        self.store_rax_to_result(op.pos.get());
     }
 
     /// INT_LSHIFT: result = arg0 << arg1
@@ -3773,7 +3726,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; lsl x0, x0, x1
         );
-        self.store_rax_to_result(op.pos);
+        self.store_rax_to_result(op.pos.get());
     }
 
     /// INT_RSHIFT: result = arg0 >> arg1 (arithmetic/signed)
@@ -3783,7 +3736,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; asr x0, x0, x1
         );
-        self.store_rax_to_result(op.pos);
+        self.store_rax_to_result(op.pos.get());
     }
 
     /// UINT_RSHIFT: result = arg0 >> arg1 (logical/unsigned)
@@ -3793,7 +3746,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; lsr x0, x0, x1
         );
-        self.store_rax_to_result(op.pos);
+        self.store_rax_to_result(op.pos.get());
     }
 
     // ----------------------------------------------------------------
@@ -3806,7 +3759,7 @@ impl<'a> AssemblerARM64<'a> {
         self.load_arg_to_rax(op.arg(0));
         self.load_arg_to_rcx(op.arg(1));
         dynasm!(self.mc ; .arch aarch64 ; adds x0, x0, x1);
-        self.store_rax_to_result(op.pos);
+        self.store_rax_to_result(op.pos.get());
         self.guard_success_cc = Some(CC_NO);
     }
 
@@ -3815,7 +3768,7 @@ impl<'a> AssemblerARM64<'a> {
         self.load_arg_to_rax(op.arg(0));
         self.load_arg_to_rcx(op.arg(1));
         dynasm!(self.mc ; .arch aarch64 ; subs x0, x0, x1);
-        self.store_rax_to_result(op.pos);
+        self.store_rax_to_result(op.pos.get());
         self.guard_success_cc = Some(CC_NO);
     }
 
@@ -3834,7 +3787,7 @@ impl<'a> AssemblerARM64<'a> {
             ; cmp x3, x4
             ; mov x0, x2
         );
-        self.store_rax_to_result(op.pos);
+        self.store_rax_to_result(op.pos.get());
         self.guard_success_cc = Some(CC_E);
     }
 
@@ -3858,8 +3811,8 @@ impl<'a> AssemblerARM64<'a> {
         self.guard_success_cc = Some(cc);
 
         // Also materialize the boolean result for non-guard consumers.
-        if !op.pos.is_none() {
-            self.emit_setcc_to_result(cc, op.pos);
+        if !op.pos.get().is_none() {
+            self.emit_setcc_to_result(cc, op.pos.get());
         }
     }
 
@@ -3894,8 +3847,8 @@ impl<'a> AssemblerARM64<'a> {
             ; cmp x0, 0
         );
         self.guard_success_cc = Some(CC_NE);
-        if !op.pos.is_none() {
-            self.emit_setcc_to_result(CC_NE, op.pos);
+        if !op.pos.get().is_none() {
+            self.emit_setcc_to_result(CC_NE, op.pos.get());
         }
     }
 
@@ -3906,8 +3859,8 @@ impl<'a> AssemblerARM64<'a> {
             ; cmp x0, 0
         );
         self.guard_success_cc = Some(CC_E);
-        if !op.pos.is_none() {
-            self.emit_setcc_to_result(CC_E, op.pos);
+        if !op.pos.get().is_none() {
+            self.emit_setcc_to_result(CC_E, op.pos.get());
         }
     }
 
@@ -3982,17 +3935,14 @@ impl<'a> AssemblerARM64<'a> {
     /// `op.fail_arg_types`.
     fn infer_fail_arg_types(&self, op: &Op, op_index: Option<usize>) -> Vec<Type> {
         if op.opcode == OpCode::Finish || op.opcode == OpCode::Jump {
-            if let Some(descr_types) = op
-                .descr
-                .as_ref()
-                .and_then(|d| d.as_fail_descr())
-                .map(|fd| fd.fail_arg_types().to_vec())
-            {
+            if let Some(descr_types) = op.with_fail_descr(|fd| fd.fail_arg_types().to_vec()) {
                 if !descr_types.is_empty() {
                     return descr_types;
                 }
             }
-        } else if let Some(fd) = op.descr.as_ref().and_then(|d| d.as_fail_descr()) {
+        }
+        let descr_arc = op.getdescr();
+        if let Some(fd) = descr_arc.as_ref().and_then(|d| d.as_fail_descr()) {
             // Step A (43c64ee0bb) installs op.descr = ResumeGuardDescr
             // with post-numbering fail_arg_types via
             // store_final_boxes_in_guard (optimizeopt/mod.rs:3393-3404).
@@ -4000,21 +3950,21 @@ impl<'a> AssemblerARM64<'a> {
             // op.fail_arg_types only for sharing-path guards
             // (optimizeopt/mod.rs:3068-3088) where op.descr=None.
             let dt = fd.fail_arg_types();
-            let expected_len = op.fail_args.as_ref().map(|fa| fa.len()).unwrap_or(0);
+            let expected_len = op.getfailargs().map(|fa| fa.len()).unwrap_or(0);
             if dt.len() == expected_len && !dt.is_empty() {
                 return dt.to_vec();
             }
         }
-        if let Some(ref ts) = op.fail_arg_types {
+        if let Some(ts) = op.get_fail_arg_types() {
             let expected_len = if op.opcode == OpCode::Finish || op.opcode == OpCode::Jump {
-                op.args.len()
+                op.num_args()
             } else {
-                op.fail_args.as_ref().map(|fa| fa.len()).unwrap_or(0)
+                op.getfailargs().map(|fa| fa.len()).unwrap_or(0)
             };
             if ts.len() == expected_len {
-                ts.clone()
+                ts.to_vec()
             } else if op.opcode == OpCode::Finish || op.opcode == OpCode::Jump {
-                op.args
+                op.getarglist()
                     .iter()
                     .map(|opref| {
                         self.opref_type_at(*opref, op_index).unwrap_or_else(|| {
@@ -4027,7 +3977,7 @@ impl<'a> AssemblerARM64<'a> {
                         })
                     })
                     .collect()
-            } else if let Some(ref fa) = op.fail_args {
+            } else if let Some(fa) = op.getfailargs() {
                 fa.iter()
                     .map(|opref| {
                         if opref.is_none() {
@@ -4058,7 +4008,7 @@ impl<'a> AssemblerARM64<'a> {
             } else {
                 Vec::new()
             }
-        } else if let Some(ref fa) = op.fail_args {
+        } else if let Some(fa) = op.getfailargs() {
             fa.iter()
                 .map(|opref| {
                     if opref.is_none() {
@@ -4115,7 +4065,7 @@ impl<'a> AssemblerARM64<'a> {
         // Stamp the metainterp `AbstractFailDescr` Arc from `next_op.descr`
         // here so `append_guard_token_with_faillocs` does not need a second
         // pass through `unsafe { Arc::as_ptr as *mut }`.
-        if let Some(d) = next_op.descr.as_ref() {
+        if let Some(d) = next_op.getdescr() {
             if d.is_resume_guard() || d.is_resume_guard_copied() {
                 if let Some(fd) = d.as_fail_descr() {
                     fd.set_fail_index_per_trace(fail_index);
@@ -4123,7 +4073,7 @@ impl<'a> AssemblerARM64<'a> {
                 }
             }
         }
-        let descr: majit_ir::DescrRef = if let Some(d) = next_op.descr.clone() {
+        let descr: majit_ir::DescrRef = if let Some(d) = next_op.getdescr() {
             // Same staleness guard as the main guard-emission path: keep
             // descriptor `fail_arg_types` in sync with the inferred list
             // so downstream GC-map / rd_locs readers see the right Ref
@@ -4171,10 +4121,10 @@ impl<'a> AssemblerARM64<'a> {
     fn genop_label(&mut self, op: &Op) {
         // Emit preamble→canonical copies BEFORE the label.
         // Two-pass push/pop: safely handles slot overlaps.
-        let n_label = op.args.len();
+        let n_label = op.num_args();
         // Pass 1: push source values
         for i in 0..n_label {
-            let arg_ref = op.args[i];
+            let arg_ref = op.arg(i);
             if arg_ref.is_none() {
                 let dst = Self::slot_offset(i);
                 dynasm!(self.mc ; .arch aarch64 ; ldr x0, [x29, dst as u32] ; str x0, [sp, #-16]!);
@@ -4198,23 +4148,24 @@ impl<'a> AssemblerARM64<'a> {
         // Bind the LABEL — JUMP targets here (after the copies).
         let label = self.mc.new_dynamic_label();
         dynasm!(self.mc ; .arch aarch64 ; =>label);
-        if let Some(descr) = loop_target_descr(op) {
+        let descr_arc = op.getdescr();
+        if let Some(descr) = descr_arc.as_ref().and_then(|d| d.as_loop_target_descr()) {
             descr.set_ll_loop_code(self.mc.offset().0);
             if let Some(id) = loop_target_id(op) {
                 self.target_tokens_currently_compiling.insert(id, label);
             }
-            if let Some(descr_ref) = op.descr.as_ref() {
+            if let Some(descr_ref) = op.getdescr() {
                 self.compiled_target_tokens.push(descr_ref.clone());
             }
         }
 
         // Remap: Label's arg[i] → canonical slot i
-        for (i, &arg_ref) in op.args.iter().enumerate() {
+        for (i, &arg_ref) in op.getarglist().iter().enumerate() {
             if !arg_ref.is_none() {
                 self.opref_to_slot.insert(arg_ref, i);
             }
         }
-        self.next_slot = self.next_slot.max(op.args.len());
+        self.next_slot = self.next_slot.max(op.num_args());
     }
 
     /// jump.py:66 _move: emit a single slot-to-slot or const-to-slot move.
@@ -4236,9 +4187,9 @@ impl<'a> AssemblerARM64<'a> {
     fn genop_jump(&mut self, op: &Op) {
         // Build src→dst move list.
         // Each entry: (src_offset_or_const, dst_offset, is_const, const_val)
-        let n = op.args.len();
+        let n = op.num_args();
         let mut moves: Vec<(i32, i32, bool, i64)> = Vec::with_capacity(n);
-        for (i, &arg_ref) in op.args.iter().enumerate() {
+        for (i, &arg_ref) in op.getarglist().iter().enumerate() {
             let dst = Self::slot_offset(i);
             match self.resolve_opref(arg_ref) {
                 ResolvedArg::Slot(src) => moves.push((src, dst, false, 0)),
@@ -4328,7 +4279,8 @@ impl<'a> AssemblerARM64<'a> {
             }
         }
 
-        let jump_descr = loop_target_descr(op);
+        let descr_arc = op.getdescr();
+        let jump_descr = descr_arc.as_ref().and_then(|d| d.as_loop_target_descr());
         if let Some(label) =
             loop_target_id(op).and_then(|k| self.target_tokens_currently_compiling.get(&k).copied())
         {
@@ -4346,10 +4298,10 @@ impl<'a> AssemblerARM64<'a> {
     fn genop_finish(&mut self, op: &Op, _fail_index: u32) {
         // compiler.rs:9667-9681 parity: trust explicit FINISH types only when
         // they match the actual result arity; otherwise infer from the op args.
-        let finish_refs: Vec<OpRef> = op.args.iter().copied().collect();
-        let fail_arg_types = if let Some(ref explicit) = op.fail_arg_types {
+        let finish_refs: Vec<OpRef> = op.getarglist().iter().copied().collect();
+        let fail_arg_types = if let Some(explicit) = op.get_fail_arg_types() {
             if explicit.len() == finish_refs.len() {
-                explicit.clone()
+                explicit.to_vec()
             } else {
                 finish_refs
                     .iter()
@@ -4436,10 +4388,10 @@ impl<'a> AssemblerARM64<'a> {
     fn genop_same_as(&mut self, op: &Op) {
         let arg = op.arg(0);
         if let Some(&slot) = self.opref_to_slot.get(&arg) {
-            self.opref_to_slot.insert(op.pos, slot);
+            self.opref_to_slot.insert(op.pos.get(), slot);
         } else {
             self.load_arg_to_rax(arg);
-            self.store_rax_to_result(op.pos);
+            self.store_rax_to_result(op.pos.get());
         }
     }
 
@@ -4505,7 +4457,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; fadd d0, d0, d1
         );
-        self.store_d0_to_result(op.pos);
+        self.store_d0_to_result(op.pos.get());
     }
 
     /// FLOAT_SUB: result = arg0 - arg1
@@ -4515,7 +4467,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; fsub d0, d0, d1
         );
-        self.store_d0_to_result(op.pos);
+        self.store_d0_to_result(op.pos.get());
     }
 
     /// FLOAT_MUL: result = arg0 * arg1
@@ -4525,7 +4477,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; fmul d0, d0, d1
         );
-        self.store_d0_to_result(op.pos);
+        self.store_d0_to_result(op.pos.get());
     }
 
     /// FLOAT_TRUEDIV: result = arg0 / arg1
@@ -4535,7 +4487,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; fdiv d0, d0, d1
         );
-        self.store_d0_to_result(op.pos);
+        self.store_d0_to_result(op.pos.get());
     }
 
     /// FLOAT_NEG: result = -arg0
@@ -4546,7 +4498,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; fneg d0, d0
         );
-        self.store_d0_to_result(op.pos);
+        self.store_d0_to_result(op.pos.get());
     }
 
     /// CAST_INT_TO_FLOAT: result = (f64)arg0
@@ -4555,7 +4507,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; scvtf d0, x0
         );
-        self.store_d0_to_result(op.pos);
+        self.store_d0_to_result(op.pos.get());
     }
 
     /// CAST_FLOAT_TO_INT: result = (i64)arg0 (truncation)
@@ -4564,7 +4516,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; fcvtzs x0, d0
         );
-        self.store_rax_to_result(op.pos);
+        self.store_rax_to_result(op.pos.get());
     }
 
     // ----------------------------------------------------------------
@@ -4575,21 +4527,13 @@ impl<'a> AssemblerARM64<'a> {
     /// Extract the byte offset from an op's FieldDescr.
     /// Returns 0 if no field descriptor is present.
     fn field_offset_from_descr(op: &Op) -> i32 {
-        op.descr
-            .as_ref()
-            .and_then(|d| d.as_field_descr())
-            .map(|fd| fd.offset() as i32)
-            .unwrap_or(0)
+        op.with_field_descr(|fd| fd.offset() as i32).unwrap_or(0)
     }
 
     /// Extract the field size from an op's FieldDescr.
     /// Returns 8 (WORD) if no field descriptor is present.
     fn field_size_from_descr(op: &Op) -> usize {
-        op.descr
-            .as_ref()
-            .and_then(|d| d.as_field_descr())
-            .map(|fd| fd.field_size())
-            .unwrap_or(8)
+        op.with_field_descr(|fd| fd.field_size()).unwrap_or(8)
     }
 
     /// GETFIELD_GC_*: result = [arg0 + offset]
@@ -4618,7 +4562,7 @@ impl<'a> AssemblerARM64<'a> {
             ),
         }
 
-        self.store_rax_to_result(op.pos);
+        self.store_rax_to_result(op.pos.get());
     }
 
     /// SETFIELD_GC: [arg0 + offset] = arg1
@@ -4651,10 +4595,7 @@ impl<'a> AssemblerARM64<'a> {
     /// The base_size and item_size come from the op's ArrayDescr.
     fn genop_getarrayitem(&mut self, op: &Op) {
         let (base_size, item_size) = op
-            .descr
-            .as_ref()
-            .and_then(|d| d.as_array_descr())
-            .map(|ad| (ad.base_size() as i32, ad.item_size() as i32))
+            .with_array_descr(|ad| (ad.base_size() as i32, ad.item_size() as i32))
             .unwrap_or((8, 8));
 
         // Load array pointer and index.
@@ -4693,17 +4634,14 @@ impl<'a> AssemblerARM64<'a> {
             ),
         }
 
-        self.store_rax_to_result(op.pos);
+        self.store_rax_to_result(op.pos.get());
     }
 
     /// SETARRAYITEM_GC: array[index] = value
     /// arg0 = array pointer, arg1 = index, arg2 = value.
     fn genop_discard_setarrayitem(&mut self, op: &Op) {
         let (base_size, item_size) = op
-            .descr
-            .as_ref()
-            .and_then(|d| d.as_array_descr())
-            .map(|ad| (ad.base_size() as i32, ad.item_size() as i32))
+            .with_array_descr(|ad| (ad.base_size() as i32, ad.item_size() as i32))
             .unwrap_or((8, 8));
 
         // Load array pointer.
@@ -4757,11 +4695,8 @@ impl<'a> AssemblerARM64<'a> {
     /// The length field location comes from the ArrayDescr's len_descr().
     fn genop_arraylen(&mut self, op: &Op) {
         let len_offset = op
-            .descr
-            .as_ref()
-            .and_then(|d| d.as_array_descr())
-            .and_then(|ad| ad.len_descr())
-            .map(|ld| ld.offset() as i32)
+            .with_array_descr(|ad| ad.len_descr().map(|ld| ld.offset() as i32))
+            .flatten()
             .unwrap_or(0); // Default: length at offset 0 in array header
 
         // Load array pointer.
@@ -4772,7 +4707,7 @@ impl<'a> AssemblerARM64<'a> {
             ; ldr x0, [x0, len_offset as u32]
         );
 
-        self.store_rax_to_result(op.pos);
+        self.store_rax_to_result(op.pos.get());
     }
 
     // ----------------------------------------------------------------
@@ -4974,21 +4909,18 @@ impl<'a> AssemblerARM64<'a> {
     /// genop_call_i = genop_call_r = genop_call_f = genop_call_n
     fn genop_call(&mut self, op: &Op) {
         self._genop_call(op);
-        if !op.pos.is_none() {
+        if !op.pos.get().is_none() {
             if op.opcode.result_type() == Type::Float {
-                self.store_d0_to_result(op.pos);
+                self.store_d0_to_result(op.pos.get());
             } else {
-                self.store_rax_to_result(op.pos);
+                self.store_rax_to_result(op.pos.get());
             }
         }
     }
 
     fn genop_call_with_arglocs(&mut self, op: &Op, arglocs: &[Loc]) {
         let can_collect = op
-            .descr
-            .as_ref()
-            .and_then(|descr| descr.as_call_descr())
-            .map(|descr| descr.get_extra_info().check_can_collect())
+            .with_call_descr(|descr| descr.get_extra_info().check_can_collect())
             .unwrap_or(false);
         if can_collect {
             if let Some(gcmap) = self.pending_malloc_nursery_gcmap {
@@ -5000,11 +4932,11 @@ impl<'a> AssemblerARM64<'a> {
             self.reload_frame_if_necessary();
             self.pop_gcmap();
         }
-        if !op.pos.is_none() {
+        if !op.pos.get().is_none() {
             if op.opcode.result_type() == Type::Float {
-                self.store_d0_to_result(op.pos);
+                self.store_d0_to_result(op.pos.get());
             } else {
-                self.store_rax_to_result(op.pos);
+                self.store_rax_to_result(op.pos.get());
             }
         }
     }
@@ -5026,7 +4958,10 @@ impl<'a> AssemblerARM64<'a> {
     /// Uses regalloc-provided arglocs to load callee arguments instead of
     /// resolve_opref(), which drops register-carried values to Const(0).
     fn genop_call_assembler(&mut self, op: &Op, arglocs: &[Loc]) {
-        let call_descr = op.descr.as_ref().and_then(|d| d.as_call_descr());
+        let __descr_arc_call_descr = op.getdescr();
+        let call_descr = __descr_arc_call_descr
+            .as_ref()
+            .and_then(|d| d.as_call_descr());
         let expansion = call_descr.and_then(|d| d.vable_expansion());
         if expansion.is_none() {
             let frame_loc = arglocs
@@ -5042,10 +4977,8 @@ impl<'a> AssemblerARM64<'a> {
             self.emit_load_to_rax(frame_loc);
 
             let target_addr: Option<usize> = op
-                .descr
-                .as_ref()
-                .and_then(|d| d.as_call_descr())
-                .and_then(|cd| cd.call_target_token())
+                .with_call_descr(|cd| cd.call_target_token())
+                .flatten()
                 .and_then(|token| self.call_assembler_targets.get(&token).copied())
                 .filter(|&addr| addr != 0);
             let is_resolved = target_addr.is_some() || self.self_entry_label.is_some();
@@ -5078,8 +5011,8 @@ impl<'a> AssemblerARM64<'a> {
                         ; mov x0, xzr
                     );
                 }
-                if !op.pos.is_none() {
-                    self.store_rax_to_result(op.pos);
+                if !op.pos.get().is_none() {
+                    self.store_rax_to_result(op.pos.get());
                 }
                 return;
             }
@@ -5153,13 +5086,13 @@ impl<'a> AssemblerARM64<'a> {
             // RPython `BaseAssembler.call_assembler` joins helper/fast paths
             // here without another frame reload.  The collecting target/helper
             // calls above already reload in `Aarch64CallBuilder.pop_gcmap`.
-            if !op.pos.is_none() {
-                self.store_rax_to_result(op.pos);
+            if !op.pos.get().is_none() {
+                self.store_rax_to_result(op.pos.get());
             }
             return;
         }
 
-        let num_args = op.args.len();
+        let num_args = op.num_args();
         let num_expanded_items = expansion
             .map(|exp| 1 + exp.scalar_fields.len() + exp.num_array_items)
             .unwrap_or(num_args);
@@ -5299,10 +5232,7 @@ impl<'a> AssemblerARM64<'a> {
         // assembler.py:320 _call_assembler_emit_call(descr._ll_function_addr, ...)
         // Resolve target address from descr.call_target_token() or self_entry_label.
         let target_addr: Option<usize> = op
-            .descr
-            .as_ref()
-            .and_then(|d| d.as_loop_token_descr())
-            .map(|td| td.loop_token_number())
+            .with_loop_token_descr(|td| td.loop_token_number())
             .and_then(|token| self.call_assembler_targets.get(&token).copied());
 
         // Exclude address 0 (pending token placeholder) to avoid calling null.
@@ -5430,8 +5360,8 @@ impl<'a> AssemblerARM64<'a> {
         } // end if is_resolved
 
         // Store result to the output slot (rax/x0 holds result).
-        if !op.pos.is_none() {
-            self.store_rax_to_result(op.pos);
+        if !op.pos.get().is_none() {
+            self.store_rax_to_result(op.pos.get());
         }
 
         // Restore callee-saved regs clobbered by this sequence.
@@ -5820,34 +5750,19 @@ impl<'a> AssemblerARM64<'a> {
     /// aarch64/assembler.py:682 malloc_cond parity.
     /// Inline nursery bump allocation for NEW.
     fn genop_new(&mut self, op: &Op) {
-        let obj_size = op
-            .descr
-            .as_ref()
-            .and_then(|d| d.as_size_descr())
-            .map(|sd| sd.size())
-            .unwrap_or(16) as i64;
+        let obj_size = op.with_size_descr(|sd| sd.size()).unwrap_or(16) as i64;
         self.emit_mov_imm64(0, obj_size);
         self.emit_mov_imm64(2, libc::malloc as *const () as i64);
         dynasm!(self.mc ; .arch aarch64 ; blr x2);
         self.inline_memzero(obj_size);
-        if !op.pos.is_none() {
-            self.store_rax_to_result(op.pos);
+        if !op.pos.get().is_none() {
+            self.store_rax_to_result(op.pos.get());
         }
     }
 
     fn genop_new_with_vtable(&mut self, op: &Op) {
-        let obj_size = op
-            .descr
-            .as_ref()
-            .and_then(|d| d.as_size_descr())
-            .map(|sd| sd.size())
-            .unwrap_or(16) as i64;
-        let vtable = op
-            .descr
-            .as_ref()
-            .and_then(|d| d.as_size_descr())
-            .map(|sd| sd.vtable())
-            .unwrap_or(0) as i64;
+        let obj_size = op.with_size_descr(|sd| sd.size()).unwrap_or(16) as i64;
+        let vtable = op.with_size_descr(|sd| sd.vtable()).unwrap_or(0) as i64;
         self.emit_mov_imm64(0, obj_size);
         self.emit_mov_imm64(2, libc::malloc as *const () as i64);
         dynasm!(self.mc ; .arch aarch64 ; blr x2);
@@ -5856,18 +5771,15 @@ impl<'a> AssemblerARM64<'a> {
             self.emit_mov_imm64(1, vtable);
             dynasm!(self.mc ; .arch aarch64 ; str x1, [x0]);
         }
-        if !op.pos.is_none() {
-            self.store_rax_to_result(op.pos);
+        if !op.pos.get().is_none() {
+            self.store_rax_to_result(op.pos.get());
         }
     }
 
     /// NEW_ARRAY / NEW_ARRAY_CLEAR: allocate an array.
     fn genop_new_array(&mut self, op: &Op) {
         let (base_size, item_size) = op
-            .descr
-            .as_ref()
-            .and_then(|d| d.as_array_descr())
-            .map(|ad| (ad.base_size() as i64, ad.item_size() as i64))
+            .with_array_descr(|ad| (ad.base_size() as i64, ad.item_size() as i64))
             .unwrap_or((8, 8));
         self.genop_alloc_varsize(op, base_size, item_size);
     }
@@ -5883,7 +5795,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; mov x0, x29
         );
-        self.store_rax_to_result(op.pos);
+        self.store_rax_to_result(op.pos.get());
     }
 
     /// STRLEN / UNICODELEN: result = string.length
@@ -5897,11 +5809,8 @@ impl<'a> AssemblerARM64<'a> {
         // in the JIT descr model.  Upstream emits `GC_LOAD_I` reading
         // `ArrayDescr.lendescr.offset`; the direct path mirrors that.
         let offset = op
-            .descr
-            .as_ref()
-            .and_then(|d| d.as_array_descr())
-            .and_then(|ad| ad.len_descr())
-            .map(|ld| ld.offset() as i32)
+            .with_array_descr(|ad| ad.len_descr().map(|ld| ld.offset() as i32))
+            .flatten()
             .unwrap_or_else(|| Self::field_offset_from_descr(op));
         self.load_arg_to_rax(op.arg(0));
 
@@ -5909,7 +5818,7 @@ impl<'a> AssemblerARM64<'a> {
             ; ldr x0, [x0, offset as u32]
         );
 
-        self.store_rax_to_result(op.pos);
+        self.store_rax_to_result(op.pos.get());
     }
 
     /// STRGETITEM / UNICODEGETITEM: result = string[index]
@@ -5919,10 +5828,7 @@ impl<'a> AssemblerARM64<'a> {
     /// token basesize overshoots the first char by 1.
     fn genop_strgetitem(&mut self, op: &Op) {
         let (mut base_size, item_size) = op
-            .descr
-            .as_ref()
-            .and_then(|d| d.as_array_descr())
-            .map(|ad| (ad.base_size() as i32, ad.item_size() as i32))
+            .with_array_descr(|ad| (ad.base_size() as i32, ad.item_size() as i32))
             .unwrap_or((17, 1)); // rstr.STR token defaults (basesize=17, itemsize=1)
         if op.opcode == OpCode::Strgetitem {
             debug_assert_eq!(item_size, 1, "STRGETITEM itemsize must be 1");
@@ -5961,7 +5867,7 @@ impl<'a> AssemblerARM64<'a> {
             ),
         }
 
-        self.store_rax_to_result(op.pos);
+        self.store_rax_to_result(op.pos.get());
     }
 
     // ================================================================
@@ -5971,16 +5877,16 @@ impl<'a> AssemblerARM64<'a> {
     /// assembler.py:1817 genop_save_exc_class — stub: returns 0.
     fn genop_save_exc_class(&mut self, op: &Op) {
         dynasm!(self.mc ; .arch aarch64 ; mov x0, 0);
-        if !op.pos.is_none() {
-            self.store_rax_to_result(op.pos);
+        if !op.pos.get().is_none() {
+            self.store_rax_to_result(op.pos.get());
         }
     }
 
     /// assembler.py:1827 genop_save_exception — stub: returns 0.
     fn genop_save_exception(&mut self, op: &Op) {
         dynasm!(self.mc ; .arch aarch64 ; mov x0, 0);
-        if !op.pos.is_none() {
-            self.store_rax_to_result(op.pos);
+        if !op.pos.get().is_none() {
+            self.store_rax_to_result(op.pos.get());
         }
     }
 
@@ -5995,7 +5901,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; sdiv x0, x0, x1
         );
-        self.store_rax_to_result(op.pos);
+        self.store_rax_to_result(op.pos.get());
     }
 
     /// INT_MOD: result = arg0 % arg1 (signed)
@@ -6006,7 +5912,7 @@ impl<'a> AssemblerARM64<'a> {
             ; sdiv x2, x0, x1
             ; msub x0, x2, x1, x0
         );
-        self.store_rax_to_result(op.pos);
+        self.store_rax_to_result(op.pos.get());
     }
 
     /// UINT_MUL_HIGH: upper 64 bits of unsigned multiply
@@ -6016,7 +5922,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; umulh x0, x0, x1
         );
-        self.store_rax_to_result(op.pos);
+        self.store_rax_to_result(op.pos.get());
     }
 
     /// INT_SIGNEXT: sign-extend from num_bytes width to 64 bits.
@@ -6034,7 +5940,7 @@ impl<'a> AssemblerARM64<'a> {
                 ; asr x0, x0, sh32
             );
         }
-        self.store_rax_to_result(op.pos);
+        self.store_rax_to_result(op.pos.get());
     }
 
     // ================================================================
@@ -6047,7 +5953,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; fabs d0, d0
         );
-        self.store_d0_to_result(op.pos);
+        self.store_d0_to_result(op.pos.get());
     }
 
     /// FLOAT_LT/LE/EQ/NE/GT/GE: float comparison.
@@ -6082,8 +5988,8 @@ impl<'a> AssemblerARM64<'a> {
         }
         dynasm!(self.mc ; .arch aarch64 ; cmp x0, 0);
         self.guard_success_cc = Some(CC_NE);
-        if !op.pos.is_none() {
-            self.store_rax_to_result(op.pos);
+        if !op.pos.get().is_none() {
+            self.store_rax_to_result(op.pos.get());
         }
     }
 
@@ -6094,7 +6000,7 @@ impl<'a> AssemblerARM64<'a> {
             ; fcvt s0, d0
             ; fmov w0, s0
         );
-        self.store_rax_to_result(op.pos);
+        self.store_rax_to_result(op.pos.get());
     }
 
     /// CAST_SINGLEFLOAT_TO_FLOAT: f32 (bits in lower 32) → f64
@@ -6104,7 +6010,7 @@ impl<'a> AssemblerARM64<'a> {
             ; fmov s0, w0
             ; fcvt d0, s0
         );
-        self.store_d0_to_result(op.pos);
+        self.store_d0_to_result(op.pos.get());
     }
 
     // ================================================================
@@ -6154,7 +6060,7 @@ impl<'a> AssemblerARM64<'a> {
 
         let itemsize = self.resolve_const_or(op.arg(2), 8) as i32;
         self.emit_load_from_rax_sized(itemsize);
-        self.store_rax_to_result(op.pos);
+        self.store_rax_to_result(op.pos.get());
     }
 
     /// GC_LOAD_INDEXED_I/R/F: load from base + base_offset + index * scale.
@@ -6177,7 +6083,7 @@ impl<'a> AssemblerARM64<'a> {
         }
 
         self.emit_load_from_rax_sized(itemsize);
-        self.store_rax_to_result(op.pos);
+        self.store_rax_to_result(op.pos.get());
     }
 
     /// GC_STORE: store value to base + offset.
@@ -6232,7 +6138,7 @@ impl<'a> AssemblerARM64<'a> {
 
         self.emit_load_from_rax_sized(size as i32);
         let _ = offset; // offset is in the descriptor, not used for raw_load
-        self.store_rax_to_result(op.pos);
+        self.store_rax_to_result(op.pos.get());
     }
 
     /// RAW_STORE: store value to base + offset using descriptor.
@@ -6255,10 +6161,7 @@ impl<'a> AssemblerARM64<'a> {
     /// GETINTERIORFIELD_GC_I/R/F: load field from array-of-structs element.
     fn genop_getinteriorfield(&mut self, op: &Op) {
         let (base_size, item_size, field_offset, field_size) = op
-            .descr
-            .as_ref()
-            .and_then(|d| d.as_interior_field_descr())
-            .map(|id| {
+            .with_interior_field_descr(|id| {
                 let ad = id.array_descr();
                 let fd = id.field_descr();
                 (
@@ -6284,16 +6187,13 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64 ; add x0, x0, x1);
 
         self.emit_load_from_rax_sized(field_size as i32);
-        self.store_rax_to_result(op.pos);
+        self.store_rax_to_result(op.pos.get());
     }
 
     /// SETINTERIORFIELD_GC/RAW: write field in array-of-structs element.
     fn genop_discard_setinteriorfield(&mut self, op: &Op) {
         let (base_size, item_size, field_offset, field_size) = op
-            .descr
-            .as_ref()
-            .and_then(|d| d.as_interior_field_descr())
-            .map(|id| {
+            .with_interior_field_descr(|id| {
                 let ad = id.array_descr();
                 let fd = id.field_descr();
                 (
@@ -6349,8 +6249,8 @@ impl<'a> AssemblerARM64<'a> {
 
         dynasm!(self.mc ; .arch aarch64 ; =>skip_label);
 
-        if !op.pos.is_none() {
-            self.store_rax_to_result(op.pos);
+        if !op.pos.get().is_none() {
+            self.store_rax_to_result(op.pos.get());
         }
     }
 
@@ -6364,10 +6264,7 @@ impl<'a> AssemblerARM64<'a> {
     /// token basesize overshoots the first char by 1; UNICODE does not.
     fn genop_discard_strsetitem(&mut self, op: &Op) {
         let (mut base_size, item_size) = op
-            .descr
-            .as_ref()
-            .and_then(|d| d.as_array_descr())
-            .map(|ad| (ad.base_size() as i32, ad.item_size() as i32))
+            .with_array_descr(|ad| (ad.base_size() as i32, ad.item_size() as i32))
             .unwrap_or((17, 1));
         if op.opcode == OpCode::Strsetitem {
             debug_assert_eq!(item_size, 1, "STRSETITEM itemsize must be 1");
@@ -6402,10 +6299,7 @@ impl<'a> AssemblerARM64<'a> {
     /// handling (`rewrite.py:1049-1053`).
     fn genop_discard_copystrcontent(&mut self, op: &Op) {
         let (mut base_size, item_size) = op
-            .descr
-            .as_ref()
-            .and_then(|d| d.as_array_descr())
-            .map(|ad| (ad.base_size() as i64, ad.item_size() as i64))
+            .with_array_descr(|ad| (ad.base_size() as i64, ad.item_size() as i64))
             .unwrap_or((16, 1));
         // rewrite.py:1049-1053 `rewrite_copy_str_content` — COPYSTRCONTENT
         // uses `str_descr.basesize - 1` to skip the `extra_item_after_alloc`
@@ -6483,10 +6377,7 @@ impl<'a> AssemblerARM64<'a> {
     /// Fallback used only when the descr is missing (should never happen
     /// for NEWSTR/NEWUNICODE after `inject_builtin_string_descrs`).
     fn array_token_from_descr(op: &Op, fallback_base: i64, fallback_item: i64) -> (i64, i64) {
-        op.descr
-            .as_ref()
-            .and_then(|d| d.as_array_descr())
-            .map(|ad| (ad.base_size() as i64, ad.item_size() as i64))
+        op.with_array_descr(|ad| (ad.base_size() as i64, ad.item_size() as i64))
             .unwrap_or((fallback_base, fallback_item))
     }
 
@@ -6529,8 +6420,8 @@ impl<'a> AssemblerARM64<'a> {
             ; str x1, [x0, 8]                    // store length at offset 8
         );
 
-        if !op.pos.is_none() {
-            self.store_rax_to_result(op.pos);
+        if !op.pos.get().is_none() {
+            self.store_rax_to_result(op.pos.get());
         }
     }
 
@@ -6538,10 +6429,7 @@ impl<'a> AssemblerARM64<'a> {
     /// arg(0)=base, arg(1)=start, arg(2)=size, arg(3)=scale_start, arg(4)=scale_size.
     fn genop_discard_zero_array(&mut self, op: &Op) {
         let (base_size, _) = op
-            .descr
-            .as_ref()
-            .and_then(|d| d.as_array_descr())
-            .map(|ad| (ad.base_size() as i64, ad.item_size() as i64))
+            .with_array_descr(|ad| (ad.base_size() as i64, ad.item_size() as i64))
             .unwrap_or((8, 8));
 
         let scale_start = self.resolve_const_or(op.arg(3), 1);
@@ -6604,7 +6492,7 @@ impl<'a> AssemblerARM64<'a> {
             dynasm!(self.mc ; .arch aarch64 ; add x0, x0, baseofs as u32);
         }
 
-        self.store_rax_to_result(op.pos);
+        self.store_rax_to_result(op.pos.get());
     }
 
     // ----------------------------------------------------------------
@@ -6613,12 +6501,12 @@ impl<'a> AssemblerARM64<'a> {
 
     /// Populate the constants map. Called by the frontend before assembly
     /// if constant OpRefs are used (OpRef.0 >= 10000).
-    pub fn set_constants(&mut self, constants: HashMap<u32, i64>) {
+    pub fn set_constants(&mut self, constants: majit_ir::VecAssoc<u32, i64>) {
         self.constants = constants;
     }
 
     /// Set constant type annotations for the next compile call.
-    pub fn set_constant_types(&mut self, constant_types: HashMap<u32, majit_ir::Type>) {
+    pub fn set_constant_types(&mut self, constant_types: majit_ir::VecAssoc<u32, majit_ir::Type>) {
         self.constant_types = constant_types;
     }
 }

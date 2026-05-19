@@ -301,7 +301,7 @@ impl Drop for ObserverGuard {
 /// `Value::Void` means the vable layout was not available at read time (heap
 /// fallback) — callers substitute zero to preserve pre-existing behaviour for
 /// test-only paths. All three helpers must match the encoding convention used
-/// by `value_to_backend_constant_bits` (optimizeopt/optimizer.rs).
+/// by `Const::as_raw_i64()` (majit-ir/src/value.rs).
 fn value_as_int_bits(value: Value) -> i64 {
     match value {
         Value::Int(v) => v,
@@ -5737,7 +5737,7 @@ mod tests {
         let set_token = recorder.get_op_by_pos(OpRef::void_op(1)).unwrap();
         assert_eq!(set_token.opcode, OpCode::SetfieldGc);
         assert_eq!(
-            set_token.descr.as_ref().map(|d| d.index()),
+            set_token.getdescr().map(|d| d.index()),
             Some(info.token_field_descr().index())
         );
         assert_eq!(
@@ -6441,7 +6441,8 @@ mod tests {
             .find(|op| op.opcode == OpCode::GuardFalse)
             .expect("BC_GOTO_IF_NOT_INT_LT must record a GuardFalse op");
         assert_eq!(
-            guard.rd_resume_position, 0,
+            guard.rd_resume_position.get(),
+            0,
             "guard's rd_resume_position must point at the captured snapshot",
         );
     }
@@ -6481,7 +6482,8 @@ mod tests {
             .find(|op| op.opcode == OpCode::GuardFalse)
             .expect("guard recorded");
         assert_eq!(
-            guard.rd_resume_position, -1,
+            guard.rd_resume_position.get(),
+            -1,
             "non-state-field guard keeps the -1 sentinel",
         );
     }

@@ -230,7 +230,7 @@ pub struct TraceCtx {
     /// pyjitpl.py:2397: call_pure_results — maps constant argument tuples
     /// to their concrete result values, recorded during tracing.
     /// Passed to the optimizer for cross-iteration CALL_PURE folding.
-    pub(crate) call_pure_results: std::collections::HashMap<Vec<Value>, Value>,
+    pub(crate) call_pure_results: crate::optimizeopt::vec_assoc::VecAssoc<Vec<Value>, Value>,
     /// Cached `warmstate.trace_limit` snapshot for this tracing session.
     /// pyjitpl.py:2789 reads `self.jitdriver_sd.warmstate.trace_limit` each
     /// call; pyre snapshots it at `setup_tracing` time (warmstate owns the
@@ -548,7 +548,7 @@ impl TraceCtx {
             is_bridge_trace: false,
             portal_call_depth_fn: None,
             callinfocollection: None,
-            call_pure_results: std::collections::HashMap::new(),
+            call_pure_results: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             trace_limit: DEFAULT_TRACE_LIMIT,
             snapshots: Vec::new(),
             resumekey_original_loop_token: None,
@@ -608,7 +608,7 @@ impl TraceCtx {
             is_bridge_trace: false,
             portal_call_depth_fn: None,
             callinfocollection: None,
-            call_pure_results: std::collections::HashMap::new(),
+            call_pure_results: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             trace_limit: DEFAULT_TRACE_LIMIT,
             snapshots: Vec::new(),
             resumekey_original_loop_token: None,
@@ -2411,7 +2411,7 @@ mod tests {
             .ops
             .iter()
             .filter(|op| op.opcode != OpCode::Jump)
-            .cloned()
+            .map(|rc| (**rc).clone())
             .collect()
     }
 
@@ -3489,27 +3489,27 @@ mod tests {
         assert_eq!(ops.len(), 5);
         assert_eq!(ops[0].opcode, OpCode::SetfieldGc);
         assert_eq!(
-            ops[0].descr.as_ref().map(|d| d.index()),
+            ops[0].getdescr().map(|d| d.index()),
             Some(info.static_field_descr(0).index())
         );
         assert_eq!(ops[1].opcode, OpCode::GetfieldGcR);
         assert_eq!(
-            ops[1].descr.as_ref().map(|d| d.index()),
+            ops[1].getdescr().map(|d| d.index()),
             Some(info.array_pointer_field_descr(0).index())
         );
         assert_eq!(ops[2].opcode, OpCode::SetarrayitemGc);
         assert_eq!(
-            ops[2].descr.as_ref().map(|d| d.index()),
+            ops[2].getdescr().map(|d| d.index()),
             Some(info.array_item_descr(0).index())
         );
         assert_eq!(ops[3].opcode, OpCode::SetarrayitemGc);
         assert_eq!(
-            ops[3].descr.as_ref().map(|d| d.index()),
+            ops[3].getdescr().map(|d| d.index()),
             Some(info.array_item_descr(0).index())
         );
         assert_eq!(ops[4].opcode, OpCode::SetfieldGc);
         assert_eq!(
-            ops[4].descr.as_ref().map(|d| d.index()),
+            ops[4].getdescr().map(|d| d.index()),
             Some(info.token_field_descr().index())
         );
     }
@@ -3592,22 +3592,22 @@ mod tests {
         assert_eq!(ops.len(), 4, "no trailing token-NULL setfield");
         assert_eq!(ops[0].opcode, OpCode::SetfieldGc);
         assert_eq!(
-            ops[0].descr.as_ref().map(|d| d.index()),
+            ops[0].getdescr().map(|d| d.index()),
             Some(info.static_field_descr(0).index())
         );
         assert_eq!(ops[1].opcode, OpCode::GetfieldGcR);
         assert_eq!(
-            ops[1].descr.as_ref().map(|d| d.index()),
+            ops[1].getdescr().map(|d| d.index()),
             Some(info.array_pointer_field_descr(0).index())
         );
         assert_eq!(ops[2].opcode, OpCode::SetarrayitemGc);
         assert_eq!(
-            ops[2].descr.as_ref().map(|d| d.index()),
+            ops[2].getdescr().map(|d| d.index()),
             Some(info.array_item_descr(0).index())
         );
         assert_eq!(ops[3].opcode, OpCode::SetarrayitemGc);
         assert_eq!(
-            ops[3].descr.as_ref().map(|d| d.index()),
+            ops[3].getdescr().map(|d| d.index()),
             Some(info.array_item_descr(0).index())
         );
     }
@@ -3718,18 +3718,18 @@ mod tests {
         assert_eq!(ops.len(), 5);
         assert_eq!(ops[0].opcode, OpCode::GetfieldGcI);
         assert_eq!(
-            ops[0].descr.as_ref().map(|d| d.index()),
+            ops[0].getdescr().map(|d| d.index()),
             Some(info.static_field_descr(0).index())
         );
         assert_eq!(ops[1].opcode, OpCode::GetfieldGcR);
         assert_eq!(
-            ops[1].descr.as_ref().map(|d| d.index()),
+            ops[1].getdescr().map(|d| d.index()),
             Some(info.array_pointer_field_descr(0).index())
         );
         for k in 0..3 {
             assert_eq!(ops[2 + k].opcode, OpCode::GetarrayitemGcI);
             assert_eq!(
-                ops[2 + k].descr.as_ref().map(|d| d.index()),
+                ops[2 + k].getdescr().map(|d| d.index()),
                 Some(info.array_item_descr(0).index())
             );
         }

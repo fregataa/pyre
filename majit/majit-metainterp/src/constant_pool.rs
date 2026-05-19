@@ -3,46 +3,30 @@
 //! RPython manages constants implicitly in Trace — ConstPtr boxes are
 //! GC-managed objects, so GC can update them when objects move.
 //!
-//! majit stores Ref constants as raw i64 in a HashMap, invisible to GC.
-//! To achieve RPython parity, Ref constants are rooted on the shadow
-//! stack (gcreftracer.py:GCREFTRACER parity). GC's walk_roots updates
-//! shadow stack entries in place; refresh_from_gc copies updated values
-//! back to the HashMap before consumption.
+//! majit stores Ref constants as raw i64 entries in a VecAssoc,
+//! invisible to GC. To achieve RPython parity, Ref constants are rooted
+//! on the shadow stack (gcreftracer.py:GCREFTRACER parity). GC's
+//! walk_roots updates shadow stack entries in place; refresh_from_gc
+//! copies updated values back to the VecAssoc before consumption.
 //!
-//! ## Task #297 migration status (typed `Value` over raw `i64`)
+//! Internal storage is `VecAssoc<u32, Value>`.  Production callers and
+//! `Backend::set_constants_pool` consume the typed `VecAssoc<u32,
+//! Const>` shape.  The remaining raw-`i64` egress paths are:
 //!
-//! Internal storage is already `HashMap<u32, Value>` (Slice 2A landed in
-//! `eeb4e15cbe`'s ConstantPool unification on main).  Remaining work is
-//! the **external API surface** flip — the `_raw` family below still
-//! returns raw `i64`/`HashMap<u32, i64>` for backend compatibility,
-//! since the four backend `set_constants` signatures still take
-//! `HashMap<u32, i64>`.  Inventory:
-//!
-//!   * `into_inner` / `snapshot_raw` / `raw_bits` — raw `i64` egress.
-//!     Two production wrappers (`history.rs:1862 constant_value`,
-//!     `trace_ctx.rs:656 const_value`) read through `raw_bits` only and
-//!     feed integer-typed regalloc consumers (offsets, sizes, scales),
-//!     so the lossy cast happens to be observation-safe today; the
-//!     migration switches them to the typed `get_value` once each
-//!     `set_constants` flips signature.
+//!   * `into_inner` / `raw_bits` — raw `i64` readers kept for
+//!     integer-typed regalloc consumers (offsets, sizes, scales) in
+//!     `dynasm/regalloc.rs` and parity-test helpers. `raw_bits`
+//!     round-trips through `as_raw_i64()` without information loss for
+//!     integer constants.
 //!   * `into_inner_typed` / `snapshot` / `get_value` — typed `Value`
-//!     egress, used by everything that needs to distinguish
-//!     `Value::Int`/`Float`/`Ref` (history merges, resume data, etc.).
-//!
-//! Convergence path: when backend `set_constants` accepts
-//! `HashMap<u32, Value>`, drop `into_inner` + `snapshot_raw` +
-//! `raw_bits` + `value_to_raw_bits` and rename the `_typed` variants to
-//! the canonical names.  Multi-file scope (~100 callsites across 4
-//! backends + every backend-local `const_value` reader); ship as its
-//! own session per the agent plan at `1fd250d2c2`.
-
-use std::collections::HashMap;
+//!     egress, used by callers that need to distinguish
+//!     `Value::Int`/`Float`/`Ref`.
 
 use majit_gc::shadow_stack;
-use majit_ir::{GcRef, OpRef, Type, Value};
+use majit_ir::{GcRef, OpRef, Type, Value, VecAssoc};
 
 /// Encode a typed `Value` to the raw `i64` shape used by the legacy
-/// backend boundary (`set_constants(HashMap<u32, i64>)`).
+/// backend boundary.
 fn value_to_raw_bits(value: &Value) -> i64 {
     match value {
         Value::Int(v) => *v,
@@ -68,20 +52,19 @@ fn value_to_raw_bits(value: &Value) -> i64 {
 /// serialization dedup (`resume.py:148-181 large_ints`/`refs`) is a
 /// separate concern that lives in `resume.rs`.
 ///
-/// Storage shape: `HashMap<u32, Value>` mirrors RPython where each
+/// Storage shape: `VecAssoc<u32, Value>` mirrors RPython where each
 /// `ConstInt/ConstFloat/ConstPtr` Box carries `.type` intrinsically
-/// (history.py:220/261/307). The legacy split `(HashMap<u32, i64>,
-/// HashMap<u32, Type>)` is retired — type rides on the `Value` variant
-/// tag, eliminating the lockstep risk between value and type maps.
+/// (history.py:220/261/307). Type rides on the `Value` variant tag,
+/// eliminating the lockstep risk between value and type maps.
 ///
 /// gcreftracer.py parity: Ref-typed constants are pushed onto the GC
 /// shadow stack so that GC can trace and update them if objects move.
-/// On consumption (into_inner / snapshot), the HashMap is refreshed
+/// On consumption (into_inner / snapshot), the VecAssoc is refreshed
 /// from the shadow stack to pick up any GC-updated pointers.
 pub struct ConstantPool {
     /// Keyed by OpRef.0 (tagged constant value, i.e. index | CONST_BIT).
     /// `Value` carries type intrinsically (history.py:220 box.type).
-    constants: HashMap<u32, Value>,
+    constants: VecAssoc<u32, Value>,
     /// Zero-based counter for allocating new constant indices.
     next_const_idx: u32,
     /// gcreftracer.py parity: (OpRef key, shadow stack index) for each
@@ -90,15 +73,37 @@ pub struct ConstantPool {
     rooted_refs: Vec<(u32, usize)>,
     /// Shadow stack depth at pool creation. release_roots pops to here.
     shadow_stack_base: usize,
+    /// opencoder.py:484 `self._bigints = []` parity. Dense per-pool
+    /// storage of non-small-int constant values, in mint order. Slot
+    /// `bigints[k] = (opref_raw, value)` where `opref_raw =
+    /// opref.raw()` for the k-th ConstInt minted. Populated alongside
+    /// `constants` VecAssoc as a structural mirror; consumers continue
+    /// to use the VecAssoc until subsequent slices migrate readers.
+    bigints: Vec<(u32, i64)>,
+    /// opencoder.py:486 `self._floats = []` parity. Dense per-pool
+    /// storage of ConstFloat constants in mint order. Slot
+    /// `floats[k] = (opref_raw, bit_pattern)` for the k-th
+    /// ConstFloat minted.
+    floats: Vec<(u32, i64)>,
+    /// opencoder.py:482 `self._refs = [lltype.nullptr(llmemory.GCREF.TO)]`
+    /// parity. Dense per-pool storage of ConstPtr constants in mint
+    /// order. Slot `refs[k] = (opref_raw, gc_addr)` for the k-th
+    /// ConstPtr minted. RPython prepends a null sentinel at index 0;
+    /// pyre tracks every minted ConstPtr including null values, so
+    /// the sentinel slot is not pre-seeded here.
+    refs: Vec<(u32, i64)>,
 }
 
 impl ConstantPool {
     pub fn new() -> Self {
         ConstantPool {
-            constants: HashMap::new(),
+            constants: VecAssoc::new(),
             next_const_idx: 0,
             rooted_refs: Vec::new(),
             shadow_stack_base: shadow_stack::depth(),
+            bigints: Vec::new(),
+            floats: Vec::new(),
+            refs: Vec::new(),
         }
     }
 
@@ -114,6 +119,10 @@ impl ConstantPool {
         let opref = OpRef::const_int(self.next_const_idx);
         self.next_const_idx += 1;
         self.constants.insert(opref.raw(), Value::Int(value));
+        // opencoder.py:621 `self._bigints.append(value)` parity:
+        // structural mirror of the VecAssoc write into the dense
+        // per-pool Vec.
+        self.bigints.push((opref.raw(), value));
         opref
     }
 
@@ -134,12 +143,17 @@ impl ConstantPool {
                 self.next_const_idx += 1;
                 self.constants
                     .insert(opref.raw(), Value::Float(f64::from_bits(value as u64)));
+                // opencoder.py:627 `self._floats.append(box.getfloatstorage())`
+                // parity.
+                self.floats.push((opref.raw(), value));
                 opref
             }
             Type::Int => {
                 let opref = OpRef::const_int(self.next_const_idx);
                 self.next_const_idx += 1;
                 self.constants.insert(opref.raw(), Value::Int(value));
+                // opencoder.py:621 `self._bigints.append(value)` parity.
+                self.bigints.push((opref.raw(), value));
                 opref
             }
             Type::Ref => {
@@ -147,6 +161,8 @@ impl ConstantPool {
                 self.next_const_idx += 1;
                 self.constants
                     .insert(opref.raw(), Value::Ref(GcRef(value as usize)));
+                // opencoder.py:598 `self._refs.append(addr)` parity.
+                self.refs.push((opref.raw(), value));
                 // gcreftracer.py: non-null Ref constants must be rooted
                 // on the shadow stack so the GC can update them when
                 // objects move. One root per ConstPtr mint mirrors
@@ -161,7 +177,33 @@ impl ConstantPool {
         }
     }
 
-    /// Get the type of a constant, if recorded.
+    /// opencoder.py:484 `_bigints` accessor. Returns the dense per-pool
+    /// storage of `ConstInt` constants in mint order. Each entry is
+    /// `(opref_raw, value)` where `opref_raw = const_int_opref.raw()`.
+    pub fn bigints(&self) -> &[(u32, i64)] {
+        &self.bigints
+    }
+
+    /// opencoder.py:486 `_floats` accessor. Returns the dense per-pool
+    /// storage of `ConstFloat` constants in mint order. Each entry is
+    /// `(opref_raw, bit_pattern)` where the bit pattern is the i64
+    /// reinterpret of the `f64` value (`history.py:265
+    /// ConstFloat.getfloatstorage`).
+    pub fn floats(&self) -> &[(u32, i64)] {
+        &self.floats
+    }
+
+    /// opencoder.py:482 `_refs` accessor. Returns the dense per-pool
+    /// storage of `ConstPtr` constants in mint order. Each entry is
+    /// `(opref_raw, gc_address)`. RPython prepends a null sentinel at
+    /// index 0; pyre tracks every minted ConstPtr including null
+    /// values so the slot 0 is the first minted ConstPtr (not a
+    /// pre-seeded null).
+    pub fn refs(&self) -> &[(u32, i64)] {
+        &self.refs
+    }
+
+    /// Get the type of a constant.
     ///
     /// `history.py:220/261/307` — ConstInt/ConstFloat/ConstPtr `.type` is
     /// pinned at construction. The typed `OpRef` variant tag carries the
@@ -235,7 +277,7 @@ impl ConstantPool {
         }
     }
 
-    /// Update HashMap from shadow stack — GC may have moved Ref objects.
+    /// Update constants map from shadow stack — GC may have moved Ref objects.
     /// gcreftracer.py:gcrefs_trace parity.
     ///
     /// `rooted_refs` is populated only by `get_or_insert_typed` under
@@ -245,6 +287,13 @@ impl ConstantPool {
         for &(opref_key, ss_idx) in &self.rooted_refs {
             let current = shadow_stack::get(ss_idx);
             self.constants.insert(opref_key, Value::Ref(current));
+            // Mirror the GC update into the dense `refs` pool so it
+            // stays consistent with `constants`. The entry was appended
+            // by `get_or_insert_typed(_, Ref)`; its raw key is unique
+            // per mint, so the first match is the right slot.
+            if let Some(slot) = self.refs.iter_mut().find(|(k, _)| *k == opref_key) {
+                slot.1 = current.0 as i64;
+            }
         }
     }
 
@@ -264,34 +313,35 @@ impl ConstantPool {
         }
     }
 
-    /// Consume the pool and return the legacy raw-bits map.
+    /// Consume the pool and return the raw-bits map.
     ///
     /// The raw-bits view is preserved for backend / parity-print
-    /// consumers that still operate on `HashMap<u32, i64>`.  Each
+    /// consumers that still operate on `i64` payloads. Each
     /// `Value` is lowered via `value_to_raw_bits`.
-    pub fn into_inner(mut self) -> HashMap<u32, i64> {
+    pub fn into_inner(mut self) -> VecAssoc<u32, i64> {
         self.refresh_from_gc();
         let constants = std::mem::take(&mut self.constants);
         self.release_roots();
-        constants
-            .into_iter()
-            .map(|(k, v)| (k, value_to_raw_bits(&v)))
-            .collect()
+        let mut out: VecAssoc<u32, i64> = VecAssoc::new();
+        for (k, v) in constants.into_iter() {
+            out.insert(k, value_to_raw_bits(&v));
+        }
+        out
     }
 
-    /// Consume the pool, returning the canonical typed `HashMap<u32,
+    /// Consume the pool, returning the canonical typed `VecAssoc<u32,
     /// Value>` — matching RPython's `Const(value)` Box model where
     /// `ConstInt/ConstFloat/ConstPtr` (history.py:220/261/307) carry
     /// their value as a typed instance attribute.
-    pub fn into_inner_typed(mut self) -> HashMap<u32, Value> {
+    pub fn into_inner_typed(mut self) -> VecAssoc<u32, Value> {
         self.refresh_from_gc();
         let constants = std::mem::take(&mut self.constants);
         self.release_roots();
         constants
     }
 
-    /// Get a mutable reference to the inner constants map (typed).
-    pub fn as_mut(&mut self) -> &mut HashMap<u32, Value> {
+    /// Get a mutable reference to the inner constants pool (typed).
+    pub fn as_mut(&mut self) -> &mut VecAssoc<u32, Value> {
         &mut self.constants
     }
 
@@ -303,8 +353,8 @@ impl ConstantPool {
         self.next_const_idx = self.next_const_idx.max(raw_idx + 1);
     }
 
-    /// Get a shared reference to the inner constants map (typed).
-    pub fn as_ref(&self) -> &HashMap<u32, Value> {
+    /// Get a shared reference to the inner constants pool (typed).
+    pub fn as_ref(&self) -> &VecAssoc<u32, Value> {
         &self.constants
     }
 
@@ -314,34 +364,12 @@ impl ConstantPool {
         self.constants.get(&opref.raw()).map(value_to_raw_bits)
     }
 
-    /// Clone the constants map without consuming the pool, returning
-    /// the typed `Value` shape. Refreshes from GC first to pick up
-    /// moved Ref pointers.
-    pub fn snapshot(&mut self) -> HashMap<u32, Value> {
+    /// Clone the constants pool without consuming it, returning the
+    /// typed `Value` shape. Refreshes from GC first to pick up moved
+    /// Ref pointers.
+    pub fn snapshot(&mut self) -> VecAssoc<u32, Value> {
         self.refresh_from_gc();
         self.constants.clone()
-    }
-
-    /// Legacy raw-bits snapshot for callers that still operate on
-    /// `HashMap<u32, i64>`. Each entry is lowered via `value_to_raw_bits`.
-    /// Refreshes from GC first.
-    pub fn snapshot_raw(&mut self) -> HashMap<u32, i64> {
-        self.refresh_from_gc();
-        self.constants
-            .iter()
-            .map(|(&k, v)| (k, value_to_raw_bits(v)))
-            .collect()
-    }
-
-    /// Clone the per-OpRef `Type` map without consuming the pool, by
-    /// projecting each stored `Value`'s variant.  history.py:220/261/307
-    /// box.type parity — every Const Box pins its `.type` intrinsically,
-    /// so the projection is total.
-    pub fn constant_types_snapshot(&self) -> HashMap<u32, Type> {
-        self.constants
-            .iter()
-            .map(|(&k, v)| (k, v.get_type()))
-            .collect()
     }
 }
 
@@ -475,5 +503,27 @@ mod tests {
             pool.same_constant(a, b),
             "two get_or_insert_typed(_, Ref) calls must satisfy same_constant"
         );
+    }
+
+    /// opencoder.py:482/484/486 `_refs`/`_bigints`/`_floats` parity:
+    /// the dense per-pool Vecs grow in mint order, independently of
+    /// each other. A mixed mint sequence should leave each Vec dense
+    /// (no gaps) with one entry per same-kind mint.
+    #[test]
+    fn dense_pools_grow_independently_per_kind() {
+        let mut pool = ConstantPool::new();
+        let i0 = pool.get_or_insert(7);
+        let f0 = pool.get_or_insert_typed(0x4000_0000_0000_0000, Type::Float);
+        let i1 = pool.get_or_insert_typed(13, Type::Int);
+        let r0 = pool.get_or_insert_typed(0, Type::Ref);
+        let r1 = pool.get_or_insert_typed(0xdead_beef, Type::Ref);
+        assert_eq!(pool.bigints().len(), 2);
+        assert_eq!(pool.bigints()[0], (i0.raw(), 7));
+        assert_eq!(pool.bigints()[1], (i1.raw(), 13));
+        assert_eq!(pool.floats().len(), 1);
+        assert_eq!(pool.floats()[0], (f0.raw(), 0x4000_0000_0000_0000));
+        assert_eq!(pool.refs().len(), 2);
+        assert_eq!(pool.refs()[0], (r0.raw(), 0));
+        assert_eq!(pool.refs()[1], (r1.raw(), 0xdead_beef));
     }
 }

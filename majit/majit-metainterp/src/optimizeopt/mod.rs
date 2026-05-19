@@ -6,6 +6,7 @@
 /// Operations flow through the chain: IntBounds → Rewrite → Virtualize → String →
 /// Pure → Guard → Simplify → Heap (configurable).
 pub mod bridgeopt;
+pub mod dense_value_pool;
 pub mod dependency;
 pub mod earlyforce;
 pub mod guard;
@@ -14,6 +15,7 @@ pub mod info;
 pub mod intbounds;
 pub mod intdiv;
 pub mod intutils;
+pub mod vec_assoc;
 // optimize module is at crate::optimize (RPython: metainterp/optimize.py)
 pub mod optimizer;
 pub mod pure;
@@ -31,13 +33,11 @@ pub mod virtualstate;
 pub mod vstring;
 // walkvirtual moved to crate::walkvirtual (RPython: metainterp/walkvirtual.py)
 
-use std::collections::{HashMap, HashSet};
-
 use crate::optimizeopt::intutils::IntBound;
 use crate::resume::SnapshotBox;
 use info::{EnsuredPtrInfo, PtrInfo};
-use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Type, Value};
-use std::collections::VecDeque;
+use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRc, OpRef, Type, Value};
+use std::collections::{HashMap, VecDeque};
 
 pub type SnapshotBoxes = Vec<Option<Vec<SnapshotBox>>>;
 pub type SnapshotFrameSizes = Vec<Option<Vec<usize>>>;
@@ -478,8 +478,10 @@ impl ImportedShortPureOp {
         //     and the info would be lost. We move `replay.pos` to the
         //     pre-allocated body-visible OpRef (`result`) so it has its
         //     own slot.
-        replay.pos = if invented_name { result } else { source };
-        replay.descr = descr.clone();
+        replay.pos.set(if invented_name { result } else { source });
+        if let Some(d) = descr.clone() {
+            replay.setdescr(d);
+        }
         // shortpreamble.py:116-120: pop.op = self.orig_op.copy_and_change(...)
         // for invented (the alt identifier) or self.res for non-invented.
         // pyre's `source` IS the alt identifier for invented (the synthetic
@@ -535,8 +537,15 @@ pub use crate::optimizeopt::info::{StringConstantAllocator, StringContentResolve
 pub struct OptContext {
     /// The output operation list being built.
     pub new_operations: Vec<Op>,
-    /// Constants for constant-namespace OpRefs, keyed by const_index().
-    pub const_pool: HashMap<u32, Value>,
+    /// Constants for constant-namespace OpRefs, indexed by
+    /// `OpRef::const_index()`. Vec-backed dense pool — replaces the
+    /// earlier `HashMap<u32, Value>`.
+    ///
+    /// `opencoder.py:482-486` upstream uses three per-type lists
+    /// (`_refs`, `_bigints`, `_floats`). Pyre's per-type split lands in
+    /// a follow-up slice; for now the single dense pool removes the
+    /// HashMap divergence without forcing the index-namespace split.
+    pub const_pool: crate::optimizeopt::dense_value_pool::DenseValuePool,
     /// RPython: mapping dict in inline_short_preamble — separate from _forwarded.
     /// Maps Phase 1 source OpRefs to Phase 2 short arg OpRefs.
     /// Number of input arguments, used to offset emitted op positions
@@ -590,9 +599,12 @@ pub struct OptContext {
     /// (base_len, short_args): virtual field values start at base_len
     /// within short_args. Used by install_imported_virtuals.
     pub imported_virtual_args: Option<(usize, Vec<OpRef>)>,
-    /// RPython shortpreamble.py / rewrite.py: imported CALL_LOOPINVARIANT
-    /// results keyed by constant function pointer.
-    pub imported_loop_invariant_results: HashMap<i64, OpRef>,
+    /// `rewrite.py:39` `self.loop_invariant_results = {}` — keyed by
+    /// constant function pointer. PyPy uses a dict; pyre replaces it
+    /// with a Vec of `(func_ptr, source_opref)` pairs and linear-scan
+    /// dedup. CALL_LOOPINVARIANT is rare and the live set per trace is
+    /// tiny, so O(n) lookup is acceptable.
+    pub imported_loop_invariant_results: Vec<(i64, OpRef)>,
     /// Phase 2 imported virtuals (from Phase 1 export). Used by
     /// store_final_boxes_in_guard to resolve NONE positions
     /// inherited from Phase 1 virtualization.
@@ -603,20 +615,33 @@ pub struct OptContext {
     /// Tracks which imported short facts are actually consumed by the body.
     pub imported_short_preamble_builder:
         Option<crate::optimizeopt::shortpreamble::ShortPreambleBuilder>,
-    /// RPython optimizer.py: quasi_immutable_deps — collected during optimization.
-    /// (object_ptr, field_index) pairs identifying specific quasi-immutable
-    /// slots the trace depends on. After compilation, per-slot watchers
-    /// are registered.
-    pub quasi_immutable_deps: HashSet<(u64, u32)>,
-    /// info.py:716-721: ConstPtrInfo._get_info — const_infos stores
-    /// StructPtrInfo for constant GC objects, keyed by pointer address.
-    /// RPython: optheap.const_infos[ref] = StructPtrInfo(descr)
-    pub const_infos: HashMap<usize, crate::optimizeopt::info::PtrInfo>,
-    /// Dedup imported short fact uses so the builder stays in first-use order.
-    imported_short_preamble_used: HashSet<OpRef>,
-    /// unroll.py:37 / optimizer.py:354: potential_extra_ops[op] = preamble_op
-    /// Populated by force_op_from_preamble, consumed by force_box.
-    pub(crate) potential_extra_ops: HashMap<OpRef, crate::optimizeopt::info::PreambleOp>,
+    /// `optimizer.py:243` `self.quasi_immutable_deps = None` (initialized
+    /// lazily as a dict in `heap.py:806-808`). Each entry pairs an
+    /// `(object_ptr, field_index)` quasi-immutable slot the trace
+    /// depends on; PyPy uses `dict[k] = None` for set semantics, but the
+    /// HashMap house rule forbids that — pyre uses a Vec with
+    /// linear-scan dedup. Typical size is small (< a few dozen entries
+    /// per trace), so O(n) inserts are acceptable.
+    pub quasi_immutable_deps: Vec<(u64, u32)>,
+    /// `info.py:722` `optheap.const_infos.get(ref, None)` /
+    /// `info.py:725` `optheap.const_infos[ref] = info`. Stores
+    /// `StructPtrInfo` / `ArrayPtrInfo` for constant GC objects keyed
+    /// by pointer address. PyPy uses `new_ref_dict()`; the house rule
+    /// forbids hash containers, so pyre uses a Vec-backed associative
+    /// container with linear-scan lookup.
+    pub const_infos:
+        crate::optimizeopt::vec_assoc::VecAssoc<usize, crate::optimizeopt::info::PtrInfo>,
+    /// Dedup imported short fact uses so the builder stays in first-use
+    /// order. PyPy uses dict-as-set; pyre uses a Vec with linear-scan
+    /// dedup (small per trace).
+    imported_short_preamble_used: Vec<OpRef>,
+    /// `unroll.py:37` `self.optunroll.potential_extra_ops[op] = preamble_op` /
+    /// `optimizer.py:354` `preamble_op = self.optunroll.potential_extra_ops.pop(op)`.
+    /// PyPy uses a dict keyed by the box; pyre uses a Vec of `(OpRef,
+    /// PreambleOp)` with linear-scan insert/pop/contains. The pool stays
+    /// small per trace (one entry per imported pure short-preamble op),
+    /// so O(n) operations are acceptable.
+    pub(crate) potential_extra_ops: Vec<(OpRef, crate::optimizeopt::info::PreambleOp)>,
     /// RPython unroll.py: live ExtendedShortPreambleBuilder while replaying an
     /// existing target token's short preamble.
     active_short_preamble_producer:
@@ -706,11 +731,6 @@ pub struct OptContext {
     pub snapshot_vref_boxes: SnapshotBoxes,
     /// Per-guard per-frame (jitcode_index, pc) from tracing-time snapshots.
     pub snapshot_frame_pcs: SnapshotFramePcs,
-    /// ConstantPool type map, cloned from `Optimizer.constant_types` at
-    /// `transfer_state_to_context`. Carries the intrinsic
-    /// Const{Int,Float,Ptr} type per OpRef raw — used by short_preamble
-    /// + BoxEnv numbering paths.
-    pub constant_types: HashMap<u32, majit_ir::Type>,
     /// Inputarg types indexed by slot, mirroring `Optimizer.trace_inputarg_types`
     /// (recorder side `InputArg{Int,Ref,Float}.tp`). Slot `i` corresponds to
     /// `OpRef(inputarg_base + i)`. Populated in `setup_optimizations` so
@@ -1485,9 +1505,14 @@ impl crate::walkvirtual::VirtualVisitor for RdVirtualInfoBuilder {
 }
 
 impl OptContext {
-    /// RPython optimizer.py: add to quasi_immutable_deps
+    /// `optimizer.py:243` quasi-immutable dep registration with
+    /// dict-as-set semantics (`heap.py:807-808`
+    /// `self.optimizer.quasi_immutable_deps[qmutdescr.qmut] = None`).
+    /// Vec-backed set with linear-scan dedup.
     pub fn add_quasi_immutable_dep(&mut self, dep: (u64, u32)) {
-        self.quasi_immutable_deps.insert(dep);
+        if !self.quasi_immutable_deps.contains(&dep) {
+            self.quasi_immutable_deps.push(dep);
+        }
     }
 
     /// RPython Box.type invariant: each OpRef's type is fixed at creation
@@ -1519,7 +1544,12 @@ impl OptContext {
             );
         }
         #[cfg(debug_assertions)]
-        if let Some(producer) = self.new_operations.iter().rev().find(|o| o.pos == opref) {
+        if let Some(producer) = self
+            .new_operations
+            .iter()
+            .rev()
+            .find(|o| o.pos.get() == opref)
+        {
             debug_assert_eq!(
                 producer.type_, tp,
                 "register_value_type: Op.type_ ({:?}) disagrees with \
@@ -1533,7 +1563,7 @@ impl OptContext {
     pub fn new(estimated_ops: usize) -> Self {
         OptContext {
             new_operations: Vec::with_capacity(estimated_ops),
-            const_pool: HashMap::new(),
+            const_pool: crate::optimizeopt::dense_value_pool::DenseValuePool::new(),
             num_inputs: 0,
             inputarg_base: 0,
             next_pos: 0,
@@ -1544,12 +1574,12 @@ impl OptContext {
             pending_finish_guard_postprocess: None,
             imported_short_pure_ops: Vec::new(),
             imported_virtual_args: None,
-            imported_loop_invariant_results: HashMap::new(),
+            imported_loop_invariant_results: Vec::new(),
             imported_short_preamble_builder: None,
-            const_infos: HashMap::new(),
-            imported_short_preamble_used: HashSet::new(),
+            const_infos: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            imported_short_preamble_used: Vec::new(),
 
-            potential_extra_ops: HashMap::new(),
+            potential_extra_ops: Vec::new(),
             active_short_preamble_producer: None,
             exported_short_boxes: Vec::new(),
 
@@ -1571,14 +1601,13 @@ impl OptContext {
             string_length_resolver: None,
             string_content_resolver: None,
             string_constant_alloc: None,
-            quasi_immutable_deps: HashSet::new(),
+            quasi_immutable_deps: Vec::new(),
             snapshot_boxes: Vec::new(),
             snapshot_frame_sizes: Vec::new(),
             snapshot_vable_boxes: Vec::new(),
             snapshot_vref_boxes: Vec::new(),
             snapshot_frame_pcs: Vec::new(),
 
-            constant_types: HashMap::new(),
             inputarg_types: Vec::new(),
             phase1_emit_ops: Vec::new(),
             last_guard_idx: None,
@@ -1661,7 +1690,7 @@ impl OptContext {
     ) -> Self {
         OptContext {
             new_operations: Vec::with_capacity(estimated_ops),
-            const_pool: HashMap::new(),
+            const_pool: crate::optimizeopt::dense_value_pool::DenseValuePool::new(),
             num_inputs: num_inputs as u32,
             inputarg_base,
             next_pos: start_next_pos,
@@ -1672,12 +1701,12 @@ impl OptContext {
             pending_finish_guard_postprocess: None,
             imported_short_pure_ops: Vec::new(),
             imported_virtual_args: None,
-            imported_loop_invariant_results: HashMap::new(),
+            imported_loop_invariant_results: Vec::new(),
             imported_short_preamble_builder: None,
-            const_infos: HashMap::new(),
-            imported_short_preamble_used: HashSet::new(),
+            const_infos: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            imported_short_preamble_used: Vec::new(),
 
-            potential_extra_ops: HashMap::new(),
+            potential_extra_ops: Vec::new(),
             active_short_preamble_producer: None,
             exported_short_boxes: Vec::new(),
 
@@ -1699,14 +1728,13 @@ impl OptContext {
             string_length_resolver: None,
             string_content_resolver: None,
             string_constant_alloc: None,
-            quasi_immutable_deps: HashSet::new(),
+            quasi_immutable_deps: Vec::new(),
             snapshot_boxes: Vec::new(),
             snapshot_frame_sizes: Vec::new(),
             snapshot_vable_boxes: Vec::new(),
             snapshot_vref_boxes: Vec::new(),
             snapshot_frame_pcs: Vec::new(),
 
-            constant_types: HashMap::new(),
             inputarg_types: Vec::new(),
             phase1_emit_ops: Vec::new(),
             last_guard_idx: None,
@@ -1773,7 +1801,7 @@ impl OptContext {
     pub fn emit_constant_int(&mut self, value: i64) -> OpRef {
         let pos_ref = self.reserve_pos_typed(Type::Int);
         let mut op = Op::new(OpCode::SameAsI, &[pos_ref]);
-        op.pos = pos_ref;
+        op.pos.set(pos_ref);
         let opref = self.emit_extra(self.current_pass_idx, op);
         self.make_constant(opref, Value::Int(value));
         opref
@@ -1784,7 +1812,7 @@ impl OptContext {
     pub fn emit_constant_ref(&mut self, value: GcRef) -> OpRef {
         let pos_ref = self.reserve_pos_typed(Type::Ref);
         let mut op = Op::new(OpCode::SameAsR, &[pos_ref]);
-        op.pos = pos_ref;
+        op.pos.set(pos_ref);
         let opref = self.emit_extra(self.current_pass_idx, op);
         self.make_constant(opref, Value::Ref(value));
         opref
@@ -1795,7 +1823,7 @@ impl OptContext {
     pub fn emit_constant_float(&mut self, value: f64) -> OpRef {
         let pos_ref = self.reserve_pos_typed(Type::Float);
         let mut op = Op::new(OpCode::SameAsF, &[pos_ref]);
-        op.pos = pos_ref;
+        op.pos.set(pos_ref);
         let opref = self.emit_extra(self.current_pass_idx, op);
         self.make_constant(opref, Value::Float(value));
         opref
@@ -2050,6 +2078,7 @@ impl OptContext {
     /// debug-assertion site at the surviving emit/emit_extra
     /// producer surfaces.
     fn debug_assert_box_type_invariant(op: &Op) {
+        let pos = op.pos.get();
         debug_assert_eq!(
             op.type_,
             op.opcode.result_type(),
@@ -2057,16 +2086,16 @@ impl OptContext {
              {:?} (opcode={:?}) — Slice 0.1 dual-source contract violation",
             op.type_,
             op.opcode.result_type(),
-            op.pos,
+            pos,
             op.opcode,
         );
-        if let Some(variant_tp) = op.pos.ty() {
+        if let Some(variant_tp) = pos.ty() {
             debug_assert_eq!(
                 variant_tp, op.type_,
                 "OpRef variant tag ({:?}) disagrees with Op.type_ ({:?}) at \
                  {:?} (opcode={:?}) — typed-factory mismatch \
                  (history.py:220 / resoperation.py:1693 Box.type parity)",
-                variant_tp, op.type_, op.pos, op.opcode,
+                variant_tp, op.type_, pos, op.opcode,
             );
         }
     }
@@ -2076,12 +2105,12 @@ impl OptContext {
     /// If the op has no pos assigned (NONE), sets it to `num_inputs + idx`
     /// so the backend's variable numbering stays consistent.
     pub fn emit(&mut self, mut op: Op) -> OpRef {
-        if op.pos.is_none() || op.pos.is_constant() {
+        if op.pos.get().is_none() || op.pos.get().is_constant() {
             // Slice 0.5 follow-up: tag the freshly allocated position with
             // the producer op's result type so the variant-tag readers
             // (`opref_type`/`OptBoxEnv::get_type`) resolve at priority 0
             // (resoperation.py:1693 `opclasses[opnum].type` parity).
-            op.pos = self.reserve_pos_typed(op.result_type());
+            op.pos.set(self.reserve_pos_typed(op.result_type()));
         } else {
             // Step 2 Commit D1/D2 invariants (Box identity plan, Step 7):
             //
@@ -2116,14 +2145,17 @@ impl OptContext {
             // invariants here so any regression is caught at the emit
             // site rather than at a downstream symptom.
             debug_assert!(
-                !self.new_operations.iter().any(|e| e.pos == op.pos),
+                !self
+                    .new_operations
+                    .iter()
+                    .any(|e| e.pos.get() == op.pos.get()),
                 "emit: OpRef collision at {:?} — new_operations already contains this position. \
                  Phase 2 should run through a fresh TraceIterator (Commit D1) and Phase 1's \
                  reserve_pos() should be monotonic above all raw trace positions.",
-                op.pos,
+                op.pos.get(),
             );
             let has_op_fwd = self
-                .get_box_replacement_box(op.pos)
+                .get_box_replacement_box(op.pos.get())
                 .map_or(false, |b| self.has_op_forwarding(&b));
             debug_assert!(
                 !(has_op_fwd && op.result_type() != majit_ir::Type::Void),
@@ -2131,11 +2163,11 @@ impl OptContext {
                  import_state should only forward inputarg slots in \
                  [inputarg_base..inputarg_base + num_inputs), and Phase 2 op results \
                  live in a disjoint range [p2_high_water..) (Commit D1).",
-                op.pos,
+                op.pos.get(),
             );
-            self.next_pos = self.next_pos.max(op.pos.raw().saturating_add(1));
+            self.next_pos = self.next_pos.max(op.pos.get().raw().saturating_add(1));
         }
-        let pos_ref = op.pos;
+        let pos_ref = op.pos.get();
         // RPython parity: emit() does NOT clear forwarding.
         // In RPython, Box._forwarded is never cleared by emit — each Box
         // has unique identity. The forwarding set by import_box must
@@ -2202,13 +2234,13 @@ impl OptContext {
     /// passes (including the caller) to avoid re-absorption loops.
     /// `after_pass_idx`: index of the calling pass (op starts from idx+1).
     pub fn emit_extra(&mut self, after_pass_idx: usize, mut op: Op) -> OpRef {
-        if op.pos.is_none() {
+        if op.pos.get().is_none() {
             // Slice 0.5 follow-up: typed allocation, same rationale as `emit`.
-            op.pos = self.reserve_pos_typed(op.result_type());
+            op.pos.set(self.reserve_pos_typed(op.result_type()));
         } else {
-            self.next_pos = self.next_pos.max(op.pos.raw().saturating_add(1));
+            self.next_pos = self.next_pos.max(op.pos.get().raw().saturating_add(1));
         }
-        let pos_ref = op.pos;
+        let pos_ref = op.pos.get();
         // Slice 0.5: queued ops carry their intrinsic `op.type_` (Slice
         // 0.1 / resoperation.py:1693 parity). Once the queued op flushes
         // through `propagate_one` into `new_operations`, `op_at` resolves
@@ -2230,7 +2262,7 @@ impl OptContext {
                 .iter()
                 .map(|entry| {
                     (
-                        entry.op.pos,
+                        entry.op.pos.get(),
                         crate::optimizeopt::shortpreamble::ProducedShortOp {
                             kind: entry.kind.clone(),
                             preamble_op: entry.op.clone(),
@@ -2245,7 +2277,7 @@ impl OptContext {
             &produced,
             short_inputargs,
         );
-        for (&const_idx, value) in &self.const_pool {
+        for (const_idx, value) in self.const_pool.iter() {
             builder.note_known_constant(Self::const_ref_for_value(const_idx, value));
         }
         self.imported_short_preamble_builder = Some(builder);
@@ -2276,10 +2308,13 @@ impl OptContext {
         short_args: &[OpRef],
         short_inputargs: &[OpRef],
         short_boxes: &[(OpRef, crate::optimizeopt::shortpreamble::ProducedShortOp)],
-        short_box_const_values: &HashMap<OpRef, majit_ir::Value>,
-        result_map: &HashMap<OpRef, OpRef>,
-        mut imported_constants: &mut HashMap<OpRef, OpRef>,
-        exported_infos: &HashMap<OpRef, crate::optimizeopt::info::OpInfo>,
+        short_box_const_values: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, majit_ir::Value>,
+        result_map: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
+        mut imported_constants: &mut crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
+        exported_infos: &crate::optimizeopt::vec_assoc::VecAssoc<
+            OpRef,
+            crate::optimizeopt::info::OpInfo,
+        >,
     ) -> bool {
         use crate::optimizeopt::shortpreamble::{
             PreambleOpKind, ProducedShortOp, ShortPreambleBuilder,
@@ -2364,7 +2399,8 @@ impl OptContext {
         }
 
         let mut produced: Vec<(OpRef, ProducedShortOp)> = Vec::with_capacity(short_boxes.len());
-        let mut produced_results: HashMap<OpRef, OpRef> = HashMap::new();
+        let mut produced_results: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef> =
+            crate::optimizeopt::vec_assoc::VecAssoc::new();
         // shortpreamble.py:PreambleOp.add_op_to_short — Pure ops whose
         // opcode is a Call get rewritten to the CallPure* equivalent so
         // the short preamble can replay the cached call without
@@ -2396,25 +2432,26 @@ impl OptContext {
         // also dispatches via `classify_short_arg`) keeps the two consume
         // sites locked to a single rule, mirroring RPython's single
         // `produce_arg` path.
-        let resolve_arg = |arg: OpRef,
-                           ctx: &mut Self,
-                           produced_results: &HashMap<OpRef, OpRef>,
-                           imported_constants: &mut HashMap<OpRef, OpRef>|
-         -> Option<OpRef> {
-            crate::optimizeopt::shortpreamble::classify_short_arg(
-                ctx,
-                arg,
-                short_inputargs,
-                short_args,
-                produced_results,
-                imported_constants,
-                short_box_const_values,
-            )
-            .map(|cls| match cls {
-                crate::optimizeopt::ImportedShortPureArg::OpRef(r) => r,
-                crate::optimizeopt::ImportedShortPureArg::Const(_, r) => r,
-            })
-        };
+        let resolve_arg =
+            |arg: OpRef,
+             ctx: &mut Self,
+             produced_results: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
+             imported_constants: &mut crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>|
+             -> Option<OpRef> {
+                crate::optimizeopt::shortpreamble::classify_short_arg(
+                    ctx,
+                    arg,
+                    short_inputargs,
+                    short_args,
+                    produced_results,
+                    imported_constants,
+                    short_box_const_values,
+                )
+                .map(|cls| match cls {
+                    crate::optimizeopt::ImportedShortPureArg::OpRef(r) => r,
+                    crate::optimizeopt::ImportedShortPureArg::Const(_, r) => r,
+                })
+            };
 
         for (source, produced_op) in short_boxes {
             // Some ProducedShortOps (PreambleOpKind::Heap with non-getfield /
@@ -2426,8 +2463,8 @@ impl OptContext {
             };
             match produced_op.kind {
                 PreambleOpKind::Pure => {
-                    let mut resolved_args = Vec::with_capacity(produced_op.preamble_op.args.len());
-                    for &arg in &produced_op.preamble_op.args {
+                    let mut resolved_args = Vec::with_capacity(produced_op.preamble_op.num_args());
+                    for &arg in produced_op.preamble_op.getarglist().iter() {
                         let Some(resolved) =
                             resolve_arg(arg, self, &produced_results, &mut imported_constants)
                         else {
@@ -2439,8 +2476,10 @@ impl OptContext {
                         pure_call_opcode(produced_op.preamble_op.opcode),
                         &resolved_args,
                     );
-                    op.pos = replay_pos(*source, produced_op);
-                    op.descr = produced_op.preamble_op.descr.clone();
+                    op.pos.set(replay_pos(*source, produced_op));
+                    if let Some(d) = produced_op.preamble_op.getdescr() {
+                        op.setdescr(d);
+                    }
                     let new_pop = ProducedShortOp {
                         kind: PreambleOpKind::Pure,
                         preamble_op: op,
@@ -2455,7 +2494,7 @@ impl OptContext {
                 }
                 PreambleOpKind::Heap => {
                     let result_type = produced_op.preamble_op.result_type();
-                    let descr = match produced_op.preamble_op.descr.clone() {
+                    let descr = match produced_op.preamble_op.getdescr() {
                         Some(d) => d,
                         None => continue,
                     };
@@ -2474,8 +2513,8 @@ impl OptContext {
                                 majit_ir::Type::Void => return false,
                             };
                             let mut op = Op::new(opcode, &[obj]);
-                            op.pos = replay_pos(*source, produced_op);
-                            op.descr = Some(descr);
+                            op.pos.set(replay_pos(*source, produced_op));
+                            op.setdescr(descr);
                             ProducedShortOp {
                                 kind: PreambleOpKind::Heap,
                                 preamble_op: op,
@@ -2510,8 +2549,8 @@ impl OptContext {
                                 None => return false,
                             };
                             let mut op = Op::new(opcode, &[obj, index_opref]);
-                            op.pos = replay_pos(*source, produced_op);
-                            op.descr = Some(descr);
+                            op.pos.set(replay_pos(*source, produced_op));
+                            op.setdescr(descr);
                             ProducedShortOp {
                                 kind: PreambleOpKind::Heap,
                                 preamble_op: op,
@@ -2541,7 +2580,7 @@ impl OptContext {
                         return false;
                     }
                     let mut op = Op::new(loop_invariant_opcode(result_type), &[func_opref]);
-                    op.pos = replay_pos(*source, produced_op);
+                    op.pos.set(replay_pos(*source, produced_op));
                     let new_pop = ProducedShortOp {
                         kind: PreambleOpKind::LoopInvariant,
                         preamble_op: op,
@@ -2559,7 +2598,7 @@ impl OptContext {
         }
 
         let mut builder = ShortPreambleBuilder::new(short_args, &produced, short_inputargs);
-        for (&const_idx, value) in &self.const_pool {
+        for (const_idx, value) in self.const_pool.iter() {
             builder.note_known_constant(Self::const_ref_for_value(const_idx, value));
         }
         for &opref in imported_constants.values() {
@@ -2589,7 +2628,11 @@ impl OptContext {
         let result = self.get_box_replacement(preamble_op.op);
         let result_type = preamble_op.preamble_op.result_type();
         let is_constant = self.get_constant(preamble_source).is_some();
-        if self.imported_short_preamble_used.insert(preamble_source) {
+        let first_use = !self.imported_short_preamble_used.contains(&preamble_source);
+        if first_use {
+            self.imported_short_preamble_used.push(preamble_source);
+        }
+        if first_use {
             // unroll.py:32: use_box(op, preamble_op.preamble_op, self).
             // RPython passes the preamble_op directly — no lookup miss possible.
             // majit prefers the produced_short_boxes lookup (Phase-2 remapped pos)
@@ -2628,7 +2671,9 @@ impl OptContext {
             // alt) so the alt's `replace_op(...)` chain at
             // `forwarded[pop.op]` does not collide with the replay's
             // info at `forwarded[pop.preamble_op.pos]`.
-            if let Some(info) = self.take_preamble_forwarded_opinfo(preamble_op.preamble_op.pos) {
+            if let Some(info) =
+                self.take_preamble_forwarded_opinfo(preamble_op.preamble_op.pos.get())
+            {
                 self.setinfo_from_preamble_item_option(result, &info, None);
             }
             // RPython PreambleOp carries Box.type intrinsically. Slice 0.5:
@@ -2650,7 +2695,13 @@ impl OptContext {
                         preamble_op.invented_name
                     );
                 }
-                self.potential_extra_ops.insert(key, preamble_op.clone());
+                // `unroll.py:37` dict-assign semantics — overwrite if the
+                // key already exists, otherwise append.
+                if let Some(entry) = self.potential_extra_ops.iter_mut().find(|(k, _)| *k == key) {
+                    entry.1 = preamble_op.clone();
+                } else {
+                    self.potential_extra_ops.push((key, preamble_op.clone()));
+                }
             }
         }
         // unroll.py:38 `return preamble_op.op`. RPython's `preamble_op.op`
@@ -2761,7 +2812,7 @@ impl OptContext {
             is_input: bool,
         }
         let mut arg_entries: Vec<ArgEntry> = Vec::new();
-        for &arg in preamble_op.args.iter() {
+        for &arg in preamble_op.getarglist().iter() {
             // Branch 1: shortpreamble.py:384 `isinstance(arg, Const): continue`.
             if arg.is_constant() || arg.is_none() {
                 continue;
@@ -2779,7 +2830,8 @@ impl OptContext {
             // returning None is the equivalent.
         }
         let result_info: Option<(OpRef, ForwardedInfo)> =
-            snapshot_forwarded(self, preamble_op.pos).map(|info| (preamble_op.pos, info));
+            snapshot_forwarded(self, preamble_op.pos.get())
+                .map(|info| (preamble_op.pos.get(), info));
 
         // Phase 2 (mutable): clear non-input arg slots — PyPy
         // `arg.set_forwarded(None)` (shortpreamble.py:397). Branch 2 (input
@@ -2950,7 +3002,9 @@ impl OptContext {
         &mut self,
         op: OpRef,
         preamble_info_handle: &std::rc::Rc<std::cell::RefCell<PtrInfo>>,
-        exported_infos: Option<&HashMap<OpRef, crate::optimizeopt::info::OpInfo>>,
+        exported_infos: Option<
+            &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::info::OpInfo>,
+        >,
     ) {
         let op = self.get_box_replacement(op);
         // unroll.py:55: if op.get_forwarded() is not None: return
@@ -3102,7 +3156,10 @@ impl OptContext {
     fn setinfo_from_preamble_list(
         &mut self,
         items: &[OpRef],
-        exported_infos: &HashMap<OpRef, crate::optimizeopt::info::OpInfo>,
+        exported_infos: &crate::optimizeopt::vec_assoc::VecAssoc<
+            OpRef,
+            crate::optimizeopt::info::OpInfo,
+        >,
     ) {
         for &item in items {
             if item.is_none() {
@@ -3143,7 +3200,10 @@ impl OptContext {
         &mut self,
         op: OpRef,
         preamble_info: &crate::optimizeopt::info::OpInfo,
-        exported_infos: &HashMap<OpRef, crate::optimizeopt::info::OpInfo>,
+        exported_infos: &crate::optimizeopt::vec_assoc::VecAssoc<
+            OpRef,
+            crate::optimizeopt::info::OpInfo,
+        >,
     ) {
         use crate::optimizeopt::info::OpInfo;
         // unroll.py:53-54 `op = get_box_replacement(op)`
@@ -3206,7 +3266,9 @@ impl OptContext {
         &mut self,
         op: OpRef,
         preamble_info: &crate::optimizeopt::info::OpInfo,
-        exported_infos: Option<&HashMap<OpRef, crate::optimizeopt::info::OpInfo>>,
+        exported_infos: Option<
+            &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::info::OpInfo>,
+        >,
     ) {
         use crate::optimizeopt::info::OpInfo;
         let target = self.get_box_replacement(op);
@@ -3239,12 +3301,35 @@ impl OptContext {
         }
     }
 
-    /// optimizer.py:354: potential_extra_ops.pop(op)
+    /// `optimizer.py:354` `preamble_op = self.optunroll.potential_extra_ops.pop(op)`.
     pub fn take_potential_extra_op(
         &mut self,
         result: OpRef,
     ) -> Option<crate::optimizeopt::info::PreambleOp> {
-        self.potential_extra_ops.remove(&result)
+        let idx = self
+            .potential_extra_ops
+            .iter()
+            .position(|(k, _)| *k == result)?;
+        Some(self.potential_extra_ops.swap_remove(idx).1)
+    }
+
+    /// `unroll.py:37` `self.optunroll.potential_extra_ops[op] = preamble_op` —
+    /// dict-assign semantics: overwrite if `key` exists, else append.
+    pub fn set_potential_extra_op(
+        &mut self,
+        key: OpRef,
+        preamble_op: crate::optimizeopt::info::PreambleOp,
+    ) {
+        if let Some(entry) = self.potential_extra_ops.iter_mut().find(|(k, _)| *k == key) {
+            entry.1 = preamble_op;
+        } else {
+            self.potential_extra_ops.push((key, preamble_op));
+        }
+    }
+
+    /// Dict-`in` parity for `potential_extra_ops`.
+    pub fn has_potential_extra_op(&self, key: OpRef) -> bool {
+        self.potential_extra_ops.iter().any(|(k, _)| *k == key)
     }
 
     pub fn activate_short_preamble_producer(
@@ -3264,7 +3349,18 @@ impl OptContext {
         &self,
     ) -> Option<crate::optimizeopt::shortpreamble::ShortPreamble> {
         self.active_short_preamble_producer.as_ref().map(|builder| {
-            builder.build_short_preamble_struct(&HashMap::new(), &self.constant_types)
+            // history.py:220/261/307: `Const` boxes carry both type and
+            // value intrinsically. Pyre's typed `majit_ir::Const` enum
+            // unifies the legacy `(loop_constants, loop_constant_types)`
+            // parallel maps into a single `VecAssoc<u32, Const>`. This
+            // path has no values to seed (the optimizer's
+            // `make_constant` chain populates the producer's known
+            // constants directly), so an empty `loop_constants` suffices.
+            let empty_loop_constants: crate::optimizeopt::vec_assoc::VecAssoc<
+                u32,
+                majit_ir::Const,
+            > = crate::optimizeopt::vec_assoc::VecAssoc::new();
+            builder.build_short_preamble_struct(&empty_loop_constants)
         })
     }
 
@@ -3285,27 +3381,19 @@ impl OptContext {
                 // across compilations via GC tracing. In majit, we must
                 // snapshot the constant pool so build_short_preamble_struct
                 // can capture referenced constants.
-                let value_to_raw = |val: &majit_ir::Value| -> i64 {
-                    match val {
-                        majit_ir::Value::Int(v) => *v,
-                        majit_ir::Value::Float(f) => f.to_bits() as i64,
-                        majit_ir::Value::Ref(r) => r.0 as i64,
-                        majit_ir::Value::Void => 0,
-                    }
-                };
-                let value_to_type = |val: &majit_ir::Value| -> majit_ir::Type {
-                    match val {
-                        majit_ir::Value::Int(_) => majit_ir::Type::Int,
-                        majit_ir::Value::Float(_) => majit_ir::Type::Float,
-                        majit_ir::Value::Ref(_) => majit_ir::Type::Ref,
-                        majit_ir::Value::Void => majit_ir::Type::Void,
-                    }
-                };
-                let mut loop_constants: HashMap<u32, i64> = self
-                    .const_pool
-                    .iter()
-                    .map(|(&i, val)| (Self::const_ref_for_value(i, val).raw(), value_to_raw(val)))
-                    .collect();
+                // history.py:220/261/307 `Const` carries both type and
+                // value intrinsically. Pyre's `majit_ir::Const` enum
+                // captures the same shape so the legacy
+                // `(loop_constants: u32->i64, loop_constant_types:
+                // u32->Type)` parallel maps unify into a single
+                // `VecAssoc<u32, Const>`.
+                let mut loop_constants: crate::optimizeopt::vec_assoc::VecAssoc<
+                    u32,
+                    majit_ir::Const,
+                > = crate::optimizeopt::vec_assoc::VecAssoc::new();
+                for (i, val) in self.const_pool.iter() {
+                    loop_constants.insert(Self::const_ref_for_value(i, val).raw(), val.to_const());
+                }
                 // `initialize_imported_short_preamble_builder_from_exported_ops`
                 // (mod.rs:1693) imports cross-trace constants by allocating a
                 // fresh local OpRef via `alloc_op_position()` and seeding it
@@ -3319,28 +3407,13 @@ impl OptContext {
                 for (idx, b) in self.box_pool.iter_indexed() {
                     if let crate::r#box::Forwarded::Box(target) = &*b.get_forwarded() {
                         if let Some(val) = target.const_value() {
-                            loop_constants
-                                .entry(idx as u32)
-                                .or_insert(value_to_raw(&val));
+                            if !loop_constants.contains_key(&(idx as u32)) {
+                                loop_constants.insert(idx as u32, val.to_const());
+                            }
                         }
                     }
                 }
-                let mut loop_constant_types = self.constant_types.clone();
-                for (&i, val) in &self.const_pool {
-                    loop_constant_types
-                        .entry(Self::const_ref_for_value(i, val).raw())
-                        .or_insert(value_to_type(val));
-                }
-                for (idx, b) in self.box_pool.iter_indexed() {
-                    if let crate::r#box::Forwarded::Box(target) = &*b.get_forwarded() {
-                        if let Some(val) = target.const_value() {
-                            loop_constant_types
-                                .entry(idx as u32)
-                                .or_insert(value_to_type(&val));
-                        }
-                    }
-                }
-                builder.build_short_preamble_struct(&loop_constants, &loop_constant_types)
+                builder.build_short_preamble_struct(&loop_constants)
             })
     }
 
@@ -3352,7 +3425,7 @@ impl OptContext {
                     .extra_same_as()
                     .iter()
                     .map(|op| ImportedShortAlias {
-                        result: op.pos,
+                        result: op.pos.get(),
                         same_as_source: op.arg(0),
                         same_as_opcode: op.opcode,
                     })
@@ -4492,7 +4565,7 @@ impl OptContext {
                     return;
                 };
                 let fields = v.fields.clone();
-                let ci = self.const_infos.entry(key).or_insert_with(|| {
+                let ci = self.const_infos.entry_or_insert_with(key, || {
                     PtrInfo::Struct(StructPtrInfo {
                         descr,
                         fields: Vec::new(),
@@ -4507,7 +4580,7 @@ impl OptContext {
             PtrInfo::Struct(v) if !v.fields.is_empty() => {
                 let descr = v.descr.clone();
                 let fields = v.fields.clone();
-                let ci = self.const_infos.entry(key).or_insert_with(|| {
+                let ci = self.const_infos.entry_or_insert_with(key, || {
                     PtrInfo::Struct(StructPtrInfo {
                         descr,
                         fields: Vec::new(),
@@ -4526,7 +4599,7 @@ impl OptContext {
                     .iter()
                     .map(|&(k, r)| (k, FieldEntry::Value(r)))
                     .collect();
-                let ci = self.const_infos.entry(key).or_insert_with(|| {
+                let ci = self.const_infos.entry_or_insert_with(key, || {
                     PtrInfo::Struct(StructPtrInfo {
                         descr,
                         fields: Vec::new(),
@@ -4545,7 +4618,7 @@ impl OptContext {
                     .iter()
                     .map(|&(k, r)| (k, FieldEntry::Value(r)))
                     .collect();
-                let ci = self.const_infos.entry(key).or_insert_with(|| {
+                let ci = self.const_infos.entry_or_insert_with(key, || {
                     PtrInfo::Struct(StructPtrInfo {
                         descr,
                         fields: Vec::new(),
@@ -4563,7 +4636,7 @@ impl OptContext {
                 let descr = v.descr.clone();
                 let lenbound = v.lenbound.clone();
                 let items = v.items.clone();
-                let ci = self.const_infos.entry(key).or_insert_with(|| {
+                let ci = self.const_infos.entry_or_insert_with(key, || {
                     PtrInfo::Array(ArrayPtrInfo {
                         descr,
                         lenbound,
@@ -4580,7 +4653,7 @@ impl OptContext {
                 let len = v.items.len() as i64;
                 let items: Vec<FieldEntry> =
                     v.items.iter().map(|&r| FieldEntry::Value(r)).collect();
-                let ci = self.const_infos.entry(key).or_insert_with(|| {
+                let ci = self.const_infos.entry_or_insert_with(key, || {
                     PtrInfo::Array(ArrayPtrInfo {
                         descr,
                         lenbound: IntBound::from_constant(len),
@@ -4690,7 +4763,7 @@ impl OptContext {
         if !op.opcode.is_call_pure() {
             return false;
         }
-        let Some(ref descr) = op.descr else {
+        let Some(descr) = op.getdescr() else {
             return false;
         };
         let Some(cd) = descr.as_call_descr() else {
@@ -4733,8 +4806,8 @@ impl OptContext {
         // compile.py:925-926: GUARD_NOT_FORCED* must never share —
         // invent_fail_descr_for_op asserts copied_from_descr is None.
         let can_share = self.last_guard_idx.is_some()
-            && op.descr.is_none()
-            && op.rd_resume_position < 0
+            && !op.has_descr()
+            && op.rd_resume_position.get() < 0
             && opnum != OpCode::GuardNotForced
             && opnum != OpCode::GuardNotForced2;
 
@@ -4754,7 +4827,7 @@ impl OptContext {
             // matched the production Optimizer in name only and used to
             // silently leave `op.descr = None` when the donor lacked a
             // descr.  Tighten to RPython parity.
-            let donor_descr = self.new_operations[idx].descr.clone().expect(
+            let donor_descr = self.new_operations[idx].getdescr().expect(
                 "optimizer.py:691 assert isinstance(last_descr, \
                      ResumeGuardDescr): donor guard has no descr",
             );
@@ -4765,13 +4838,17 @@ impl OptContext {
                  ResumeGuardDescr subclass",
                 donor_descr.index()
             );
-            op.descr = Some(match opnum {
+            op.setdescr(match opnum {
                 OpCode::GuardException | OpCode::GuardNoException => {
                     crate::compile::make_resume_guard_copied_exc_descr(donor_descr)
                 }
                 _ => crate::compile::make_resume_guard_copied_descr(donor_descr),
             });
-            op.fail_args = self.new_operations[idx].fail_args.clone();
+            // optimizer.py:722: guard_op.setfailargs(last_guard_op.getfailargs())
+            match self.new_operations[idx].getfailargs() {
+                Some(fa) => op.setfailargs(fa.iter().copied().collect()),
+                None => op.clearfailargs(),
+            }
             // bridgeopt.py parity: fail_arg_types carry the types the
             // serializer used when writing the class-knowledge bitfield in
             // rd_numb (memo.finish() uses numb_state.livebox_types). A
@@ -4779,7 +4856,10 @@ impl OptContext {
             // layout, so the sharer must inherit fail_arg_types too —
             // otherwise `deserialize_optimizer_knowledge` (bridgeopt.rs:911)
             // reconstructs a different Ref-set and reads past the buffer.
-            op.fail_arg_types = self.new_operations[idx].fail_arg_types.clone();
+            match self.new_operations[idx].get_fail_arg_types() {
+                Some(types) => op.set_fail_arg_types(types.to_vec()),
+                None => op.clear_fail_arg_types(),
+            }
             // optimizer.py:698-699: _maybe_replace_guard_value after copy.
             if op.opcode == OpCode::GuardValue {
                 self.maybe_replace_guard_value(op);
@@ -4796,7 +4876,7 @@ impl OptContext {
             // optimizer.py:680-683: force_box on fail_args for unrolling.
             // Mirrors Optimizer.force_box contract: resolve replacement,
             // handle tracked preamble ops, force virtuals.
-            if let Some(ref fa) = op.fail_args {
+            if let Some(fa) = op.getfailargs() {
                 let fargs: Vec<OpRef> = fa.iter().copied().collect();
                 for farg in fargs {
                     if !farg.is_none() {
@@ -4847,9 +4927,12 @@ impl OptContext {
             1 => OpCode::GuardTrue,
             _ => return, // optimizer.py:775: strange code, just disable
         };
-        op.opcode = new_opcode;
-        op.args.clear();
-        op.args.push(arg0);
+        // optimizer.py:803 newop = self.replace_op_with(op, opnum,
+        //                                  [op.getarg(0)], descr)
+        // — produce a fresh op with new opcode and trimmed args, descr
+        // unchanged.  copy_and_change preserves fail_args / rd_resume_position
+        // / fail_arg_types for guard ops (resoperation.py:498-503).
+        *op = op.copy_and_change(new_opcode, Some(&[arg0]), None);
     }
 
     /// optimizer.py:345-364 force_box — inline equivalent for
@@ -4926,13 +5009,11 @@ impl OptContext {
         // limited to the standalone test entry.  Either way only fresh
         // descrs reach this function.
         assert!(
-            op.descr.as_ref().map_or(true, |d| d.is_resume_guard()),
+            op.getdescr().map_or(true, |d| d.is_resume_guard()),
             "optimizer.py:723 store_final_boxes_in_guard expects \
              ResumeGuardDescr, got non-resume descr (kind={:?}, copied={})",
-            op.descr.as_ref().map(|d| d.index()),
-            op.descr
-                .as_ref()
-                .map_or(false, |d| d.is_resume_guard_copied())
+            op.getdescr().map(|d| d.index()),
+            op.getdescr().map_or(false, |d| d.is_resume_guard_copied())
         );
 
         // resume.py:397 `assert not storage.rd_numb` — finish() runs at
@@ -4941,11 +5022,7 @@ impl OptContext {
         // livebox set and break bridge attachment.  Promoted from
         // debug_assert! so release builds catch double-finish too.
         assert!(
-            op.descr
-                .as_ref()
-                .and_then(|d| d.as_fail_descr())
-                .and_then(|fd| fd.rd_numb())
-                .is_none(),
+            op.resolved_rd_numb().is_none(),
             "resume.py:397 finish() invoked twice on the same ResumeGuardDescr"
         );
 
@@ -4956,7 +5033,7 @@ impl OptContext {
         // capture_resumedata (tracer guards) or patchguardop copy
         // (unroll.py:336/409). No fallback — the position is always set
         // before store_final_boxes_in_guard runs.
-        let resume_pos = op.rd_resume_position;
+        let resume_pos = op.rd_resume_position.get();
         let has_snapshot = snapshot_contains(&self.snapshot_boxes, resume_pos);
         // resume.py:396-397: `assert resume_position >= 0` —
         // RPython asserts the position is set before calling
@@ -4979,10 +5056,10 @@ impl OptContext {
             let fallback_pos = self
                 .patchguardop
                 .as_ref()
-                .map(|p| p.rd_resume_position)
+                .map(|p| p.rd_resume_position.get())
                 .filter(|&p| snapshot_contains(&self.snapshot_boxes, p));
             if let Some(fb_pos) = fallback_pos {
-                op.rd_resume_position = fb_pos;
+                op.rd_resume_position.set(fb_pos);
                 // resume.py:570 _add_optimizer_sections: forward knowledge
                 // to the patchguardop snapshot so heap/class/loopinvariant
                 // sections are serialized into rd_numb. RPython's finish()
@@ -5002,7 +5079,9 @@ impl OptContext {
                  resume_pos={}) has no snapshot and no patchguardop \
                  ancestor — RPython resume.py:397 \
                  `assert resume_position >= 0` parity",
-                op.opcode, op.pos, op.rd_resume_position
+                op.opcode,
+                op.pos.get(),
+                op.rd_resume_position.get()
             );
         }
 
@@ -5010,16 +5089,16 @@ impl OptContext {
         // including guards with rd_virtuals. The snapshot uses original boxes
         // and PtrInfo to correctly assign TAGVIRTUAL via _number_boxes.
         // _number_virtuals then builds rd_virtuals from PtrInfo.
-        let snapshot_boxes = snapshot_get(&self.snapshot_boxes, op.rd_resume_position)
+        let snapshot_boxes = snapshot_get(&self.snapshot_boxes, op.rd_resume_position.get())
             .cloned()
             .unwrap_or_default();
-        let vable_oprefs = snapshot_get(&self.snapshot_vable_boxes, op.rd_resume_position)
+        let vable_oprefs = snapshot_get(&self.snapshot_vable_boxes, op.rd_resume_position.get())
             .cloned()
             .unwrap_or_default();
-        let vref_oprefs = snapshot_get(&self.snapshot_vref_boxes, op.rd_resume_position)
+        let vref_oprefs = snapshot_get(&self.snapshot_vref_boxes, op.rd_resume_position.get())
             .cloned()
             .unwrap_or_default();
-        let frame_pcs = snapshot_get(&self.snapshot_frame_pcs, op.rd_resume_position)
+        let frame_pcs = snapshot_get(&self.snapshot_frame_pcs, op.rd_resume_position.get())
             .cloned()
             .unwrap_or_default();
 
@@ -5027,7 +5106,7 @@ impl OptContext {
         // Pass ORIGINAL (unresolved) snapshot boxes. _number_boxes calls
         // env.get_box_replacement per-box, which resolves through the
         // replacement chain while preserving virtual identity.
-        let frame_sizes = snapshot_get(&self.snapshot_frame_sizes, op.rd_resume_position);
+        let frame_sizes = snapshot_get(&self.snapshot_frame_sizes, op.rd_resume_position.get());
         let mut snapshot = if let Some(sizes) = frame_sizes.filter(|s| s.len() > 1) {
             // Multi-frame: split snapshot_boxes into per-frame chunks.
             let mut frames = Vec::new();
@@ -5087,7 +5166,9 @@ impl OptContext {
                 .collect();
             eprintln!(
                 "[jit][guard-resume] pos={:?} snapshot={:?} vable={:?}",
-                op.pos, snapshot_debug, vable_debug
+                op.pos.get(),
+                snapshot_debug,
+                vable_debug
             );
         }
 
@@ -5106,7 +5187,7 @@ impl OptContext {
         if majit_log_enabled() && op.opcode == OpCode::GuardNotForced2 {
             eprintln!(
                 "[jit][guard-resume] pos={:?} liveboxes={:?} rd_virtuals={} livebox_types={:?}",
-                op.pos,
+                op.pos.get(),
                 liveboxes,
                 rd_virtuals.len(),
                 livebox_types
@@ -5130,7 +5211,7 @@ impl OptContext {
             .collect();
 
         op.store_final_boxes(liveboxes);
-        op.fail_arg_types = Some(new_types.clone());
+        op.set_fail_arg_types(new_types.clone());
         // optimizer.py:722-730 `store_final_boxes_in_guard` parity:
         //   if op.getdescr() is not None:
         //       descr = op.getdescr()
@@ -5148,7 +5229,7 @@ impl OptContext {
         // (`is_resume_at_position()`, `loop_version()`) survive
         // `store_final_boxes_in_guard` (compile.py:1035-1043, mirrored
         // at pyjitpl/mod.rs:6799 `is_resume_at_position()`).
-        match op.descr.as_ref() {
+        match op.getdescr() {
             Some(existing) => {
                 if let Some(fd) = existing.as_fail_descr() {
                     fd.set_fail_arg_types(new_types);
@@ -5167,7 +5248,7 @@ impl OptContext {
                 // dispatch via `is_guard_exc()` / `is_guard_forced()`
                 // without reshaping this match arm.
                 use majit_ir::OpCode;
-                op.descr = Some(match op.opcode {
+                op.setdescr(match op.opcode {
                     OpCode::GuardNotForced | OpCode::GuardNotForced2 => {
                         crate::compile::make_resume_guard_forced_descr_typed(new_types)
                     }
@@ -5195,7 +5276,8 @@ impl OptContext {
         } else {
             Some(pending_setfields)
         };
-        if let Some(fd) = op.descr.as_ref().and_then(|d| d.as_fail_descr()) {
+        let __descr_arc = op.getdescr();
+        if let Some(fd) = __descr_arc.as_ref().and_then(|d| d.as_fail_descr()) {
             fd.set_rd_numb(Some(rd_numb));
             fd.set_rd_consts(Some(rd_consts));
             fd.set_rd_virtuals(descr_rd_virtuals);
@@ -5280,7 +5362,7 @@ impl OptContext {
         let opref = self.get_box_replacement(opref);
         self.new_operations
             .iter()
-            .find(|op| op.pos == opref)
+            .find(|op| op.pos.get() == opref)
             .cloned()
     }
 
@@ -5398,7 +5480,7 @@ impl OptContext {
         if gcref.is_null() {
             return None;
         }
-        let descr = op.descr.as_ref()?;
+        let descr = op.getdescr()?;
         let fd = descr.as_field_descr()?;
         let addr = gcref.0 + fd.offset();
         // llmodel.py:467-478 read_int_at_mem / read_ref_at_mem dispatch.
@@ -5445,7 +5527,12 @@ impl OptContext {
     /// (via a maintained index or layout invariant) is deferred to a
     /// later slice once those mutation patterns are stabilised.
     pub fn op_at(&self, opref: OpRef) -> Option<&Op> {
-        if let Some(op) = self.new_operations.iter().rev().find(|op| op.pos == opref) {
+        if let Some(op) = self
+            .new_operations
+            .iter()
+            .rev()
+            .find(|op| op.pos.get() == opref)
+        {
             return Some(op);
         }
         // Phase 1 emit-op fallback (history.py:220 box.type parity for
@@ -5455,7 +5542,10 @@ impl OptContext {
         // / descr fields refer to Phase 1's namespace and should not be
         // dereferenced through this path (Phase 2 callers only consume
         // `op.type_` via `get_op_result_type` / `opref_type`).
-        self.phase1_emit_ops.iter().rev().find(|op| op.pos == opref)
+        self.phase1_emit_ops
+            .iter()
+            .rev()
+            .find(|op| op.pos.get() == opref)
     }
 
     /// RPython box.type parity: find the result type of the operation
@@ -6344,21 +6434,16 @@ impl OptContext {
             ));
         }
         let addr = gcref.0;
-        use std::collections::hash_map::Entry;
-        match self.const_infos.entry(addr) {
-            // info.py:722-725: info = optheap.const_infos.get(ref, None)
-            //                  if info is None: info = StructPtrInfo(descr)
-            //                  optheap.const_infos[ref] = info
-            Entry::Occupied(e) => Some(e.into_mut()),
-            Entry::Vacant(e) => {
-                // info.py:724: StructPtrInfo(descr)
-                let info = match parent_descr {
-                    Some(d) => PtrInfo::struct_ptr(d),
-                    None => PtrInfo::instance(None, None),
-                };
-                Some(e.insert(info))
+        // info.py:722-725: info = optheap.const_infos.get(ref, None)
+        //                  if info is None: info = StructPtrInfo(descr)
+        //                  optheap.const_infos[ref] = info
+        Some(self.const_infos.entry_or_insert_with(addr, || {
+            // info.py:724: StructPtrInfo(descr)
+            match parent_descr {
+                Some(d) => PtrInfo::struct_ptr(d),
+                None => PtrInfo::instance(None, None),
             }
-        }
+        }))
     }
 
     /// info.py:728-735 `ConstPtrInfo._get_array_info(descr, optheap)`
@@ -6407,14 +6492,12 @@ impl OptContext {
             ));
         }
         let addr = gcref.0;
-        use std::collections::hash_map::Entry;
-        match self.const_infos.entry(addr) {
-            Entry::Occupied(e) => Some(e.into_mut()),
-            Entry::Vacant(e) => Some(e.insert(crate::optimizeopt::info::PtrInfo::array(
+        Some(self.const_infos.entry_or_insert_with(addr, || {
+            crate::optimizeopt::info::PtrInfo::array(
                 descr,
                 crate::optimizeopt::intutils::IntBound::nonnegative(),
-            ))),
-        }
+            )
+        }))
     }
 
     /// info.py:750-752 `ConstPtrInfo.setfield` + info.py:203-211
@@ -6442,11 +6525,7 @@ impl OptContext {
         let arg0 = self.get_box_replacement(op.arg(0));
         if arg0.is_constant() || self.get_constant(arg0).is_some() {
             // info.py:750-752 ConstPtrInfo.setfield → _get_info(parent_descr, optheap)
-            let parent_descr = op
-                .descr
-                .as_ref()
-                .and_then(|d| d.as_field_descr())
-                .and_then(|fd| fd.get_parent_descr());
+            let parent_descr = op.with_field_descr(|fd| fd.get_parent_descr()).flatten();
             if let Some(info) = self.get_const_info_mut(arg0, parent_descr) {
                 info.setfield(field_idx, value);
             }
@@ -6471,7 +6550,7 @@ impl OptContext {
         let arg0 = self.get_box_replacement(op.arg(0));
         if arg0.is_constant() || self.get_constant(arg0).is_some() {
             // info.py:746-748 ConstPtrInfo.setitem → _get_array_info.
-            if let Some(descr) = op.descr.clone() {
+            if let Some(descr) = op.getdescr() {
                 if let Some(info) = self.get_const_info_array_mut(arg0, descr) {
                     info.setitem(index, value);
                 }
@@ -6706,10 +6785,11 @@ impl OptContext {
             //     else:
             //         opinfo = info.StructPtrInfo(parent_descr)
             //     opinfo.init_fields(parent_descr, descr.get_index())
-            let field_descr = op
-                .descr
-                .as_ref()
-                .and_then(|d| d.as_field_descr())
+            let ensure_field_descr_arc = op
+                .getdescr()
+                .expect("ensure_ptr_info_arg0: field op without FieldDescr");
+            let field_descr = ensure_field_descr_arc
+                .as_field_descr()
                 .expect("ensure_ptr_info_arg0: field op without FieldDescr");
             // optimizer.py:479-484: parent_descr.is_object() decides Instance vs Struct.
             let parent_descr = field_descr.get_parent_descr().unwrap_or_else(|| {
@@ -6719,7 +6799,7 @@ impl OptContext {
                      offset={} field_type={:?}; the FieldDescr implementation must \
                      override get_parent_descr() for parity with optimizer.py:478",
                     op.opcode,
-                    op.descr,
+                    op.getdescr(),
                     field_descr.field_name(),
                     field_descr.index_in_parent(),
                     field_descr.offset(),
@@ -6749,8 +6829,7 @@ impl OptContext {
             // optimizer.py:485-487: getarrayitem / setarrayitem_gc / arraylen_gc
             // → ArrayPtrInfo(op.getdescr())
             let descr = op
-                .descr
-                .clone()
+                .getdescr()
                 .expect("ensure_ptr_info_arg0: array op without descr");
             PtrInfo::array(descr, crate::optimizeopt::intutils::IntBound::nonnegative())
         } else if op.opcode == OpCode::GuardClass || op.opcode == OpCode::GuardNonnullClass {
@@ -6847,7 +6926,7 @@ impl OptContext {
         }
         self.new_operations
             .get(guard_pos as usize)
-            .and_then(|op| op.descr.as_ref())
+            .and_then(|op| op.getdescr())
             .map_or(false, |descr| descr.is_resume_at_position())
     }
 
@@ -7012,7 +7091,7 @@ pub trait Optimization {
     /// Only OptPure consumes this; other passes ignore it.
     fn set_call_pure_results(
         &mut self,
-        _results: &std::collections::HashMap<Vec<majit_ir::Value>, majit_ir::Value>,
+        _results: &crate::optimizeopt::vec_assoc::VecAssoc<Vec<majit_ir::Value>, majit_ir::Value>,
     ) {
     }
 
@@ -7048,7 +7127,7 @@ pub trait Optimization {
     fn export_cached_fields(
         &self,
         _ctx: &mut OptContext,
-        _available_boxes: Option<&std::collections::HashMap<OpRef, ()>>,
+        _available_boxes: Option<&[OpRef]>,
     ) -> Vec<(OpRef, majit_ir::DescrRef, OpRef)> {
         Vec::new()
     }
@@ -7066,7 +7145,7 @@ pub trait Optimization {
     fn export_cached_arrayitems(
         &self,
         _ctx: &mut OptContext,
-        _available_boxes: Option<&std::collections::HashMap<OpRef, ()>>,
+        _available_boxes: Option<&[OpRef]>,
     ) -> Vec<(OpRef, i64, majit_ir::DescrRef, OpRef)> {
         Vec::new()
     }
@@ -7098,8 +7177,8 @@ pub trait Optimization {
         &self,
         _args: &[OpRef],
         _ctx: &OptContext,
-    ) -> HashMap<OpRef, IntBound> {
-        HashMap::new()
+    ) -> crate::optimizeopt::vec_assoc::VecAssoc<OpRef, IntBound> {
+        crate::optimizeopt::vec_assoc::VecAssoc::new()
     }
 
     /// optimizer.py: is_virtual(opref)
@@ -7133,10 +7212,10 @@ where
     let mut next_resume_pos = 0i32;
     for op in seeded.iter_mut().filter(|op| op.opcode.is_guard()) {
         let snapshot_boxes = snapshot_for_guard(op);
-        let resume_pos = if op.rd_resume_position >= 0
-            && !snapshot_contains(&snapshots, op.rd_resume_position)
+        let resume_pos = if op.rd_resume_position.get() >= 0
+            && !snapshot_contains(&snapshots, op.rd_resume_position.get())
         {
-            op.rd_resume_position
+            op.rd_resume_position.get()
         } else {
             while snapshot_contains(&snapshots, next_resume_pos) {
                 next_resume_pos += 1;
@@ -7145,7 +7224,7 @@ where
             next_resume_pos += 1;
             resume_pos
         };
-        op.rd_resume_position = resume_pos;
+        op.rd_resume_position.set(resume_pos);
         snapshot_insert(
             &mut snapshots,
             resume_pos,
@@ -8337,7 +8416,7 @@ mod ensure_ptr_info_arg0_tests {
     use super::*;
     use crate::optimizeopt::info::{ArrayPtrInfo, EnsuredPtrInfo, PtrInfo};
     use crate::optimizeopt::intutils::IntBound;
-    use majit_ir::{Descr, DescrRef, GcRef, Op, OpCode, OpRef, SizeDescr, Type, Value};
+    use majit_ir::{Descr, DescrRef, GcRef, Op, OpCode, OpRc, OpRef, SizeDescr, Type, Value};
     use std::sync::Arc;
 
     #[derive(Debug)]
@@ -8422,7 +8501,7 @@ mod ensure_ptr_info_arg0_tests {
         // carry the Ref variant tag (resoperation.py:615 RefOp).
         let descr: DescrRef = Arc::new(TestFieldDescr { index: 0, parent });
         let mut op = Op::with_descr(OpCode::GetfieldGcI, &[OpRef::input_arg_ref(0)], descr);
-        op.pos = OpRef::int_op(1);
+        op.pos.set(OpRef::int_op(1));
         op
     }
 
@@ -8433,7 +8512,7 @@ mod ensure_ptr_info_arg0_tests {
             is_object: false,
         });
         let mut op = Op::with_descr(OpCode::ArraylenGc, &[OpRef::input_arg_ref(0)], descr);
-        op.pos = OpRef::int_op(1);
+        op.pos.set(OpRef::int_op(1));
         op
     }
 
@@ -8494,7 +8573,7 @@ mod ensure_ptr_info_arg0_tests {
                 is_object: false,
             });
             let mut op = Op::with_descr(OpCode::Strlen, &[OpRef::input_arg_ref(0)], descr);
-            op.pos = OpRef::int_op(1);
+            op.pos.set(OpRef::int_op(1));
             op
         };
         let mut info = ctx.ensure_ptr_info_arg0(&op);
@@ -8523,7 +8602,7 @@ mod ensure_ptr_info_arg0_tests {
                 is_object: false,
             });
             let mut op = Op::with_descr(OpCode::Strlen, &[OpRef::input_arg_ref(0)], descr);
-            op.pos = OpRef::int_op(1);
+            op.pos.set(OpRef::int_op(1));
             op
         };
         let mut info = ctx.ensure_ptr_info_arg0(&op);
@@ -8822,7 +8901,7 @@ mod intbound_invariant_tests {
 #[cfg(test)]
 mod imported_short_preamble_fallback_tests {
     use super::*;
-    use majit_ir::{Op, OpCode, OpRef};
+    use majit_ir::{Op, OpCode, OpRc, OpRef};
 
     #[test]
     fn force_op_from_preamble_replays_pop_without_builder_lookup() {
@@ -8836,7 +8915,7 @@ mod imported_short_preamble_fallback_tests {
         );
 
         let mut replay_op = Op::new(OpCode::IntAdd, &[OpRef::int_op(7), OpRef::int_op(8)]);
-        replay_op.pos = OpRef::int_op(14);
+        replay_op.pos.set(OpRef::int_op(14));
         // shortpreamble.py:120 non-invented PureOp.produce_op: `op = self.res`.
         // pop.op carries the body-visible OpRef directly (no forwarding chain
         // installed for non-invented Pure).
@@ -8855,10 +8934,10 @@ mod imported_short_preamble_fallback_tests {
         assert_eq!(sp.ops.len(), 1);
         assert_eq!(sp.ops[0].op.opcode, OpCode::IntAdd);
         assert_eq!(
-            sp.ops[0].op.args.as_slice(),
+            &*sp.ops[0].op.getarglist(),
             &[OpRef::int_op(7), OpRef::int_op(8)]
         );
-        assert_eq!(sp.ops[0].op.pos, OpRef::int_op(14));
+        assert_eq!(sp.ops[0].op.pos.get(), OpRef::int_op(14));
     }
 }
 

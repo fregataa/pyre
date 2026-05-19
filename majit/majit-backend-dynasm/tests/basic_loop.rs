@@ -12,12 +12,21 @@ use std::sync::{LazyLock, Mutex};
 
 use majit_backend::{Backend, JitCellToken};
 use majit_ir::{
-    GcRef, InputArg, Op, OpCode, OpRef, Type, Value, make_array_descr, make_loop_target_descr,
+    Const, GcRef, InputArg, Op, OpCode, OpRc, OpRef, Type, Value, VecAssoc, make_array_descr,
+    make_loop_target_descr,
 };
 
 use majit_backend_dynasm::runner::DynasmBackend;
 
 static EXCEPTION_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+/// Wrap a `Vec<Op>` into `Vec<OpRc>` so test fixtures keep their
+/// `let mut foo_op = Op::new(...); foo_op.set...(...)` mutation
+/// style while feeding `Backend::compile_loop` which expects
+/// `&[Rc<Op>]` (95f767e0b8 trace-storage boundary).
+fn to_rc(ops: Vec<Op>) -> Vec<OpRc> {
+    ops.into_iter().map(std::rc::Rc::new).collect()
+}
 
 #[test]
 fn test_just_finish() {
@@ -29,11 +38,10 @@ fn test_just_finish() {
     let inputargs = vec![];
 
     let mut finish_op = Op::new(OpCode::Finish, &[]);
-    finish_op.pos = OpRef::void_op(0);
-    finish_op.fail_arg_types = Some(vec![]);
-    finish_op.fail_args = Some(vec![].into());
-
-    let ops = vec![finish_op];
+    finish_op.pos.set(OpRef::void_op(0));
+    finish_op.set_fail_arg_types(vec![]);
+    finish_op.setfailargs(vec![].into());
+    let ops = to_rc(vec![finish_op]);
 
     let result = backend.compile_loop(&inputargs, &ops, &mut token);
     assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
@@ -54,25 +62,21 @@ fn test_simple_int_add() {
     let const_1 = OpRef::const_int(1);
 
     // Set constant: OpRef::const_int(1) = 1
-    let mut constants = HashMap::new();
-    constants.insert(OpRef::const_int(1).raw(), 1i64);
-    backend.set_constants(constants);
+    let mut constants: VecAssoc<u32, Const> = VecAssoc::new();
+    constants.insert(OpRef::const_int(1).raw(), Const::Int(1));
+    backend.set_constants_pool(constants);
 
-    let inputargs = vec![InputArg {
-        tp: Type::Int,
-        index: 0,
-    }];
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
     let i0 = inputargs[0].opref();
 
     let mut add_op = Op::new(OpCode::IntAdd, &[i0, const_1]);
-    add_op.pos = OpRef::int_op(1); // result is OpRef::int_op(1)
+    add_op.pos.set(OpRef::int_op(1)); // result is OpRef::int_op(1)
 
     let mut finish_op = Op::new(OpCode::Finish, &[OpRef::int_op(1)]);
-    finish_op.pos = OpRef::void_op(2);
-    finish_op.fail_arg_types = Some(vec![Type::Int]);
-    finish_op.fail_args = Some(vec![OpRef::int_op(1)].into());
-
-    let ops = vec![add_op, finish_op];
+    finish_op.pos.set(OpRef::void_op(2));
+    finish_op.set_fail_arg_types(vec![Type::Int]);
+    finish_op.setfailargs(vec![OpRef::int_op(1)].into());
+    let ops = to_rc(vec![add_op, finish_op]);
 
     // Compile
     let result = backend.compile_loop(&inputargs, &ops, &mut token);
@@ -98,25 +102,21 @@ fn test_finish_infers_int_type_when_explicit_types_are_empty() {
 
     let const_1 = OpRef::const_int(1);
 
-    let mut constants = HashMap::new();
-    constants.insert(const_1.raw(), 1i64);
-    backend.set_constants(constants);
+    let mut constants: VecAssoc<u32, Const> = VecAssoc::new();
+    constants.insert(const_1.raw(), Const::Int(1));
+    backend.set_constants_pool(constants);
 
-    let inputargs = vec![InputArg {
-        tp: Type::Int,
-        index: 0,
-    }];
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
     let i0 = inputargs[0].opref();
 
     let mut add_op = Op::new(OpCode::IntAdd, &[i0, const_1]);
-    add_op.pos = OpRef::int_op(1);
+    add_op.pos.set(OpRef::int_op(1));
 
     let mut finish_op = Op::new(OpCode::Finish, &[OpRef::int_op(1)]);
-    finish_op.pos = OpRef::void_op(2);
-    finish_op.fail_arg_types = Some(vec![]);
-    finish_op.fail_args = Some(vec![OpRef::int_op(1)].into());
-
-    let ops = vec![add_op, finish_op];
+    finish_op.pos.set(OpRef::void_op(2));
+    finish_op.set_fail_arg_types(vec![]);
+    finish_op.setfailargs(vec![OpRef::int_op(1)].into());
+    let ops = to_rc(vec![add_op, finish_op]);
 
     let result = backend.compile_loop(&inputargs, &ops, &mut token);
     assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
@@ -138,24 +138,20 @@ fn test_float_add() {
     let const_half = OpRef::const_float(1);
 
     // constant 0.5 as raw bits
-    let mut constants = HashMap::new();
-    constants.insert(OpRef::const_float(1).raw(), 0.5f64.to_bits() as i64);
-    backend.set_constants(constants);
+    let mut constants: VecAssoc<u32, Const> = VecAssoc::new();
+    constants.insert(OpRef::const_float(1).raw(), Const::Float(0.5));
+    backend.set_constants_pool(constants);
 
-    let inputargs = vec![InputArg {
-        tp: Type::Float,
-        index: 0,
-    }];
+    let inputargs = vec![InputArg::from_type(Type::Float, 0)];
 
     let mut add_op = Op::new(OpCode::FloatAdd, &[i0, const_half]);
-    add_op.pos = OpRef::float_op(1);
+    add_op.pos.set(OpRef::float_op(1));
 
     let mut finish_op = Op::new(OpCode::Finish, &[OpRef::float_op(1)]);
-    finish_op.pos = OpRef::void_op(2);
-    finish_op.fail_arg_types = Some(vec![Type::Float]);
-    finish_op.fail_args = Some(vec![OpRef::float_op(1)].into());
-
-    let ops = vec![add_op, finish_op];
+    finish_op.pos.set(OpRef::void_op(2));
+    finish_op.set_fail_arg_types(vec![Type::Float]);
+    finish_op.setfailargs(vec![OpRef::float_op(1)].into());
+    let ops = to_rc(vec![add_op, finish_op]);
 
     let result = backend.compile_loop(&inputargs, &ops, &mut token);
     assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
@@ -183,39 +179,32 @@ fn test_setarrayitem_raw_float_roundtrip() {
 
     let const_index = OpRef::const_int(3);
 
-    let mut constants = HashMap::new();
-    constants.insert(const_index.raw(), 3i64);
-    backend.set_constants(constants);
+    let mut constants: VecAssoc<u32, Const> = VecAssoc::new();
+    constants.insert(const_index.raw(), Const::Int(3));
+    backend.set_constants_pool(constants);
 
     let array_descr = make_array_descr(0, 8, Type::Float);
 
     let inputargs = vec![
-        InputArg {
-            tp: Type::Ref,
-            index: 0,
-        },
-        InputArg {
-            tp: Type::Float,
-            index: 1,
-        },
+        InputArg::from_type(Type::Ref, 0),
+        InputArg::from_type(Type::Float, 1),
     ];
     let base = inputargs[0].opref();
     let value = inputargs[1].opref();
 
     let mut set_op = Op::new(OpCode::SetarrayitemRaw, &[base, const_index, value]);
-    set_op.pos = OpRef::void_op(2);
-    set_op.descr = Some(array_descr.clone());
+    set_op.pos.set(OpRef::void_op(2));
+    set_op.setdescr(array_descr.clone());
 
     let mut get_op = Op::new(OpCode::GetarrayitemRawF, &[base, const_index]);
-    get_op.pos = OpRef::float_op(3);
-    get_op.descr = Some(array_descr);
+    get_op.pos.set(OpRef::float_op(3));
+    get_op.setdescr(array_descr);
 
     let mut finish_op = Op::new(OpCode::Finish, &[OpRef::float_op(3)]);
-    finish_op.pos = OpRef::void_op(4);
-    finish_op.fail_arg_types = Some(vec![Type::Float]);
-    finish_op.fail_args = Some(vec![OpRef::float_op(3)].into());
-
-    let ops = vec![set_op, get_op, finish_op];
+    finish_op.pos.set(OpRef::void_op(4));
+    finish_op.set_fail_arg_types(vec![Type::Float]);
+    finish_op.setfailargs(vec![OpRef::float_op(3)].into());
+    let ops = to_rc(vec![set_op, get_op, finish_op]);
     let result = backend.compile_loop(&inputargs, &ops, &mut token);
     assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
 
@@ -238,37 +227,27 @@ fn test_setarrayitem_raw_float_roundtrip_with_variable_index() {
     let array_descr = make_array_descr(0, 8, Type::Float);
 
     let inputargs = vec![
-        InputArg {
-            tp: Type::Ref,
-            index: 0,
-        },
-        InputArg {
-            tp: Type::Int,
-            index: 1,
-        },
-        InputArg {
-            tp: Type::Float,
-            index: 2,
-        },
+        InputArg::from_type(Type::Ref, 0),
+        InputArg::from_type(Type::Int, 1),
+        InputArg::from_type(Type::Float, 2),
     ];
     let base = inputargs[0].opref();
     let index = inputargs[1].opref();
     let value = inputargs[2].opref();
 
     let mut set_op = Op::new(OpCode::SetarrayitemRaw, &[base, index, value]);
-    set_op.pos = OpRef::void_op(3);
-    set_op.descr = Some(array_descr.clone());
+    set_op.pos.set(OpRef::void_op(3));
+    set_op.setdescr(array_descr.clone());
 
     let mut get_op = Op::new(OpCode::GetarrayitemRawF, &[base, index]);
-    get_op.pos = OpRef::float_op(4);
-    get_op.descr = Some(array_descr);
+    get_op.pos.set(OpRef::float_op(4));
+    get_op.setdescr(array_descr);
 
     let mut finish_op = Op::new(OpCode::Finish, &[OpRef::float_op(4)]);
-    finish_op.pos = OpRef::void_op(5);
-    finish_op.fail_arg_types = Some(vec![Type::Float]);
-    finish_op.fail_args = Some(vec![OpRef::float_op(4)].into());
-
-    let ops = vec![set_op, get_op, finish_op];
+    finish_op.pos.set(OpRef::void_op(5));
+    finish_op.set_fail_arg_types(vec![Type::Float]);
+    finish_op.setfailargs(vec![OpRef::float_op(4)].into());
+    let ops = to_rc(vec![set_op, get_op, finish_op]);
     let result = backend.compile_loop(&inputargs, &ops, &mut token);
     assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
 
@@ -298,40 +277,36 @@ fn test_guard_and_loop() {
     backend.attach_default_test_descrs();
     let mut token = JitCellToken::new(1);
 
-    let mut constants = HashMap::new();
-    constants.insert(OpRef::const_int(1).raw(), 1i64);
-    constants.insert(OpRef::const_int(5).raw(), 5i64);
-    backend.set_constants(constants);
+    let mut constants: VecAssoc<u32, Const> = VecAssoc::new();
+    constants.insert(OpRef::const_int(1).raw(), Const::Int(1));
+    constants.insert(OpRef::const_int(5).raw(), Const::Int(5));
+    backend.set_constants_pool(constants);
 
-    let inputargs = vec![InputArg {
-        tp: Type::Int,
-        index: 0,
-    }];
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
     let loop_descr = make_loop_target_descr(token.number, false);
 
     let mut label_op = Op::new(OpCode::Label, &[OpRef::input_arg_int(0)]);
-    label_op.pos = OpRef::void_op(100);
-    label_op.descr = Some(loop_descr.clone());
+    label_op.pos.set(OpRef::void_op(100));
+    label_op.setdescr(loop_descr.clone());
 
     let mut add_op = Op::new(
         OpCode::IntAdd,
         &[OpRef::input_arg_int(0), OpRef::const_int(1)],
     );
-    add_op.pos = OpRef::int_op(1);
+    add_op.pos.set(OpRef::int_op(1));
 
     let mut lt_op = Op::new(OpCode::IntLt, &[OpRef::int_op(1), OpRef::const_int(5)]);
-    lt_op.pos = OpRef::int_op(2);
+    lt_op.pos.set(OpRef::int_op(2));
 
     let mut guard_op = Op::new(OpCode::GuardTrue, &[OpRef::int_op(2)]);
-    guard_op.pos = OpRef::void_op(3);
-    guard_op.fail_arg_types = Some(vec![Type::Int]);
-    guard_op.fail_args = Some(vec![OpRef::int_op(1)].into());
-
+    guard_op.pos.set(OpRef::void_op(3));
+    guard_op.set_fail_arg_types(vec![Type::Int]);
+    guard_op.setfailargs(vec![OpRef::int_op(1)].into());
     let mut jump_op = Op::new(OpCode::Jump, &[OpRef::int_op(1)]);
-    jump_op.pos = OpRef::void_op(4);
-    jump_op.descr = Some(loop_descr);
+    jump_op.pos.set(OpRef::void_op(4));
+    jump_op.setdescr(loop_descr);
 
-    let ops = vec![label_op, add_op, lt_op, guard_op, jump_op];
+    let ops = to_rc(vec![label_op, add_op, lt_op, guard_op, jump_op]);
 
     let result = backend.compile_loop(&inputargs, &ops, &mut token);
     assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
@@ -354,21 +329,15 @@ fn test_float_loop_carried_across_jump() {
     backend.attach_default_test_descrs();
     let mut token = JitCellToken::new(1);
 
-    let mut constants = HashMap::new();
-    constants.insert(OpRef::const_int(5).raw(), 5i64);
-    constants.insert(OpRef::const_float(10).raw(), 0.5f64.to_bits() as i64);
-    constants.insert(OpRef::const_int(1).raw(), 1i64);
-    backend.set_constants(constants);
+    let mut constants: VecAssoc<u32, Const> = VecAssoc::new();
+    constants.insert(OpRef::const_int(5).raw(), Const::Int(5));
+    constants.insert(OpRef::const_float(10).raw(), Const::Float(0.5));
+    constants.insert(OpRef::const_int(1).raw(), Const::Int(1));
+    backend.set_constants_pool(constants);
 
     let inputargs = vec![
-        InputArg {
-            tp: Type::Float,
-            index: 0,
-        },
-        InputArg {
-            tp: Type::Int,
-            index: 1,
-        },
+        InputArg::from_type(Type::Float, 0),
+        InputArg::from_type(Type::Int, 1),
     ];
     let loop_descr = make_loop_target_descr(token.number, false);
 
@@ -376,48 +345,47 @@ fn test_float_loop_carried_across_jump() {
         OpCode::Label,
         &[OpRef::input_arg_float(0), OpRef::input_arg_int(1)],
     );
-    label_op.pos = OpRef::void_op(100);
-    label_op.descr = Some(loop_descr.clone());
+    label_op.pos.set(OpRef::void_op(100));
+    label_op.setdescr(loop_descr.clone());
 
     let mut lt_op = Op::new(
         OpCode::IntLt,
         &[OpRef::input_arg_int(1), OpRef::const_int(5)],
     );
-    lt_op.pos = OpRef::int_op(2);
+    lt_op.pos.set(OpRef::int_op(2));
 
     let mut guard_op = Op::new(OpCode::GuardTrue, &[OpRef::int_op(2)]);
-    guard_op.pos = OpRef::void_op(3);
-    guard_op.fail_arg_types = Some(vec![Type::Float, Type::Int]);
-    guard_op.fail_args = Some(vec![OpRef::input_arg_float(0), OpRef::input_arg_int(1)].into());
-
+    guard_op.pos.set(OpRef::void_op(3));
+    guard_op.set_fail_arg_types(vec![Type::Float, Type::Int]);
+    guard_op.setfailargs(vec![OpRef::input_arg_float(0), OpRef::input_arg_int(1)].into());
     let mut cast_op = Op::new(OpCode::CastIntToFloat, &[OpRef::input_arg_int(1)]);
-    cast_op.pos = OpRef::float_op(4);
+    cast_op.pos.set(OpRef::float_op(4));
 
     let mut mul_op = Op::new(
         OpCode::FloatMul,
         &[OpRef::float_op(4), OpRef::const_float(10)],
     );
-    mul_op.pos = OpRef::float_op(5);
+    mul_op.pos.set(OpRef::float_op(5));
 
     let mut add_op = Op::new(
         OpCode::FloatAdd,
         &[OpRef::input_arg_float(0), OpRef::float_op(5)],
     );
-    add_op.pos = OpRef::float_op(6);
+    add_op.pos.set(OpRef::float_op(6));
 
     let mut inc_op = Op::new(
         OpCode::IntAdd,
         &[OpRef::input_arg_int(1), OpRef::const_int(1)],
     );
-    inc_op.pos = OpRef::int_op(7);
+    inc_op.pos.set(OpRef::int_op(7));
 
     let mut jump_op = Op::new(OpCode::Jump, &[OpRef::float_op(6), OpRef::int_op(7)]);
-    jump_op.pos = OpRef::void_op(8);
-    jump_op.descr = Some(loop_descr);
+    jump_op.pos.set(OpRef::void_op(8));
+    jump_op.setdescr(loop_descr);
 
-    let ops = vec![
+    let ops = to_rc(vec![
         label_op, lt_op, guard_op, cast_op, mul_op, add_op, inc_op, jump_op,
-    ];
+    ]);
 
     let result = backend.compile_loop(&inputargs, &ops, &mut token);
     assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
@@ -456,38 +424,36 @@ fn test_gc_typeinfo_guards_use_dynasm_emit() {
 
     let const_child_tid = OpRef::const_int(1);
     let const_root_vtable = OpRef::const_int(2);
-    let mut constants = HashMap::new();
-    constants.insert(const_child_tid.raw(), child_tid as i64);
-    constants.insert(const_root_vtable.raw(), root_vtable as i64);
-    backend.set_constants(constants);
+    let mut constants: VecAssoc<u32, Const> = VecAssoc::new();
+    constants.insert(const_child_tid.raw(), Const::Int(child_tid as i64));
+    constants.insert(const_root_vtable.raw(), Const::Int(root_vtable as i64));
+    backend.set_constants_pool(constants);
 
-    let inputargs = vec![InputArg {
-        tp: Type::Ref,
-        index: 0,
-    }];
+    let inputargs = vec![InputArg::from_type(Type::Ref, 0)];
     let i0 = inputargs[0].opref();
 
     let mut guard_gc_type = Op::new(OpCode::GuardGcType, &[i0, const_child_tid]);
-    guard_gc_type.pos = OpRef::void_op(1);
-    guard_gc_type.fail_arg_types = Some(vec![]);
-    guard_gc_type.fail_args = Some(vec![].into());
-
+    guard_gc_type.pos.set(OpRef::void_op(1));
+    guard_gc_type.set_fail_arg_types(vec![]);
+    guard_gc_type.setfailargs(vec![].into());
     let mut guard_is_object = Op::new(OpCode::GuardIsObject, &[i0]);
-    guard_is_object.pos = OpRef::void_op(2);
-    guard_is_object.fail_arg_types = Some(vec![]);
-    guard_is_object.fail_args = Some(vec![].into());
-
+    guard_is_object.pos.set(OpRef::void_op(2));
+    guard_is_object.set_fail_arg_types(vec![]);
+    guard_is_object.setfailargs(vec![].into());
     let mut guard_subclass = Op::new(OpCode::GuardSubclass, &[i0, const_root_vtable]);
-    guard_subclass.pos = OpRef::void_op(3);
-    guard_subclass.fail_arg_types = Some(vec![]);
-    guard_subclass.fail_args = Some(vec![].into());
-
+    guard_subclass.pos.set(OpRef::void_op(3));
+    guard_subclass.set_fail_arg_types(vec![]);
+    guard_subclass.setfailargs(vec![].into());
     let mut finish_op = Op::new(OpCode::Finish, &[]);
-    finish_op.pos = OpRef::void_op(4);
-    finish_op.fail_arg_types = Some(vec![]);
-    finish_op.fail_args = Some(vec![].into());
-
-    let ops = vec![guard_gc_type, guard_is_object, guard_subclass, finish_op];
+    finish_op.pos.set(OpRef::void_op(4));
+    finish_op.set_fail_arg_types(vec![]);
+    finish_op.setfailargs(vec![].into());
+    let ops = to_rc(vec![
+        guard_gc_type,
+        guard_is_object,
+        guard_subclass,
+        finish_op,
+    ]);
     let result = backend.compile_loop(&inputargs, &ops, &mut token);
     assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
 
@@ -512,25 +478,22 @@ fn test_gc_typeinfo_guards_side_exit_on_mismatch() {
         let mut token = JitCellToken::new(45);
 
         let const_child_tid = OpRef::const_int(1);
-        let mut constants = HashMap::new();
-        constants.insert(const_child_tid.raw(), child_tid as i64);
-        backend.set_constants(constants);
+        let mut constants: VecAssoc<u32, Const> = VecAssoc::new();
+        constants.insert(const_child_tid.raw(), Const::Int(child_tid as i64));
+        backend.set_constants_pool(constants);
 
-        let inputargs = vec![InputArg {
-            tp: Type::Ref,
-            index: 0,
-        }];
+        let inputargs = vec![InputArg::from_type(Type::Ref, 0)];
         let i0 = inputargs[0].opref();
         let mut guard_gc_type = Op::new(OpCode::GuardGcType, &[i0, const_child_tid]);
-        guard_gc_type.pos = OpRef::void_op(1);
-        guard_gc_type.fail_arg_types = Some(vec![Type::Ref]);
-        guard_gc_type.fail_args = Some(vec![i0].into());
+        guard_gc_type.pos.set(OpRef::void_op(1));
+        guard_gc_type.set_fail_arg_types(vec![Type::Ref]);
+        guard_gc_type.setfailargs(vec![i0].into());
         let mut finish_op = Op::new(OpCode::Finish, &[]);
-        finish_op.pos = OpRef::void_op(2);
-        finish_op.fail_arg_types = Some(vec![]);
-        finish_op.fail_args = Some(vec![].into());
-
-        let result = backend.compile_loop(&inputargs, &[guard_gc_type, finish_op], &mut token);
+        finish_op.pos.set(OpRef::void_op(2));
+        finish_op.set_fail_arg_types(vec![]);
+        finish_op.setfailargs(vec![].into());
+        let ops = to_rc(vec![guard_gc_type, finish_op]);
+        let result = backend.compile_loop(&inputargs, &ops, &mut token);
         assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
         let frame = backend.execute_token(&token, &[Value::Ref(root_obj)]);
         assert!(
@@ -550,21 +513,18 @@ fn test_gc_typeinfo_guards_side_exit_on_mismatch() {
         backend.set_gc_allocator(Box::new(gc));
         let mut token = JitCellToken::new(46);
 
-        let inputargs = vec![InputArg {
-            tp: Type::Ref,
-            index: 0,
-        }];
+        let inputargs = vec![InputArg::from_type(Type::Ref, 0)];
         let i0 = inputargs[0].opref();
         let mut guard_is_object = Op::new(OpCode::GuardIsObject, &[i0]);
-        guard_is_object.pos = OpRef::void_op(1);
-        guard_is_object.fail_arg_types = Some(vec![Type::Ref]);
-        guard_is_object.fail_args = Some(vec![i0].into());
+        guard_is_object.pos.set(OpRef::void_op(1));
+        guard_is_object.set_fail_arg_types(vec![Type::Ref]);
+        guard_is_object.setfailargs(vec![i0].into());
         let mut finish_op = Op::new(OpCode::Finish, &[]);
-        finish_op.pos = OpRef::void_op(2);
-        finish_op.fail_arg_types = Some(vec![]);
-        finish_op.fail_args = Some(vec![].into());
-
-        let result = backend.compile_loop(&inputargs, &[guard_is_object, finish_op], &mut token);
+        finish_op.pos.set(OpRef::void_op(2));
+        finish_op.set_fail_arg_types(vec![]);
+        finish_op.setfailargs(vec![].into());
+        let ops = to_rc(vec![guard_is_object, finish_op]);
+        let result = backend.compile_loop(&inputargs, &ops, &mut token);
         assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
         let frame = backend.execute_token(&token, &[Value::Ref(raw_obj)]);
         assert!(
@@ -590,25 +550,22 @@ fn test_gc_typeinfo_guards_side_exit_on_mismatch() {
         let mut token = JitCellToken::new(47);
 
         let const_root_a_vtable = OpRef::const_int(1);
-        let mut constants = HashMap::new();
-        constants.insert(const_root_a_vtable.raw(), root_a_vtable as i64);
-        backend.set_constants(constants);
+        let mut constants: VecAssoc<u32, Const> = VecAssoc::new();
+        constants.insert(const_root_a_vtable.raw(), Const::Int(root_a_vtable as i64));
+        backend.set_constants_pool(constants);
 
-        let inputargs = vec![InputArg {
-            tp: Type::Ref,
-            index: 0,
-        }];
+        let inputargs = vec![InputArg::from_type(Type::Ref, 0)];
         let i0 = inputargs[0].opref();
         let mut guard_subclass = Op::new(OpCode::GuardSubclass, &[i0, const_root_a_vtable]);
-        guard_subclass.pos = OpRef::void_op(1);
-        guard_subclass.fail_arg_types = Some(vec![Type::Ref]);
-        guard_subclass.fail_args = Some(vec![i0].into());
+        guard_subclass.pos.set(OpRef::void_op(1));
+        guard_subclass.set_fail_arg_types(vec![Type::Ref]);
+        guard_subclass.setfailargs(vec![i0].into());
         let mut finish_op = Op::new(OpCode::Finish, &[]);
-        finish_op.pos = OpRef::void_op(2);
-        finish_op.fail_arg_types = Some(vec![]);
-        finish_op.fail_args = Some(vec![].into());
-
-        let result = backend.compile_loop(&inputargs, &[guard_subclass, finish_op], &mut token);
+        finish_op.pos.set(OpRef::void_op(2));
+        finish_op.set_fail_arg_types(vec![]);
+        finish_op.setfailargs(vec![].into());
+        let ops = to_rc(vec![guard_subclass, finish_op]);
+        let result = backend.compile_loop(&inputargs, &ops, &mut token);
         assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
         let frame = backend.execute_token(&token, &[Value::Ref(root_b_obj)]);
         assert!(
@@ -630,23 +587,21 @@ fn test_exception_guards_use_dynasm_emit() {
 
     let expected_class = 0x5151_0000_i64;
     let const_expected_class = OpRef::const_int(1);
-    let mut constants = HashMap::new();
-    constants.insert(const_expected_class.raw(), expected_class);
-    backend.set_constants(constants);
+    let mut constants: VecAssoc<u32, Const> = VecAssoc::new();
+    constants.insert(const_expected_class.raw(), Const::Int(expected_class));
+    backend.set_constants_pool(constants);
 
     let inputargs = vec![];
 
     let mut guard_exception = Op::new(OpCode::GuardException, &[const_expected_class]);
-    guard_exception.pos = OpRef::ref_op(0);
-    guard_exception.fail_arg_types = Some(vec![]);
-    guard_exception.fail_args = Some(vec![].into());
-
+    guard_exception.pos.set(OpRef::ref_op(0));
+    guard_exception.set_fail_arg_types(vec![]);
+    guard_exception.setfailargs(vec![].into());
     let mut finish_op = Op::new(OpCode::Finish, &[OpRef::ref_op(0)]);
-    finish_op.pos = OpRef::void_op(1);
-    finish_op.fail_arg_types = Some(vec![Type::Ref]);
-    finish_op.fail_args = Some(vec![OpRef::ref_op(0)].into());
-
-    let ops = vec![guard_exception, finish_op];
+    finish_op.pos.set(OpRef::void_op(1));
+    finish_op.set_fail_arg_types(vec![Type::Ref]);
+    finish_op.setfailargs(vec![OpRef::ref_op(0)].into());
+    let ops = to_rc(vec![guard_exception, finish_op]);
     let result = backend.compile_loop(&inputargs, &ops, &mut token);
     assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
 
@@ -674,16 +629,14 @@ fn test_guard_no_exception_and_always_fails_emit_side_exits() {
 
     let inputargs = vec![];
     let mut guard_no_exception = Op::new(OpCode::GuardNoException, &[]);
-    guard_no_exception.pos = OpRef::void_op(0);
-    guard_no_exception.fail_arg_types = Some(vec![]);
-    guard_no_exception.fail_args = Some(vec![].into());
-
+    guard_no_exception.pos.set(OpRef::void_op(0));
+    guard_no_exception.set_fail_arg_types(vec![]);
+    guard_no_exception.setfailargs(vec![].into());
     let mut finish_op = Op::new(OpCode::Finish, &[]);
-    finish_op.pos = OpRef::void_op(1);
-    finish_op.fail_arg_types = Some(vec![]);
-    finish_op.fail_args = Some(vec![].into());
-
-    let ops = vec![guard_no_exception, finish_op];
+    finish_op.pos.set(OpRef::void_op(1));
+    finish_op.set_fail_arg_types(vec![]);
+    finish_op.setfailargs(vec![].into());
+    let ops = to_rc(vec![guard_no_exception, finish_op]);
     let result = backend.compile_loop(&inputargs, &ops, &mut token);
     assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
 
@@ -706,14 +659,14 @@ fn test_guard_no_exception_and_always_fails_emit_side_exits() {
     always_backend.attach_default_test_descrs();
     let mut always_token = JitCellToken::new(44);
     let mut guard_always_fails = Op::new(OpCode::GuardAlwaysFails, &[]);
-    guard_always_fails.pos = OpRef::void_op(0);
-    guard_always_fails.fail_arg_types = Some(vec![]);
-    guard_always_fails.fail_args = Some(vec![].into());
+    guard_always_fails.pos.set(OpRef::void_op(0));
+    guard_always_fails.set_fail_arg_types(vec![]);
+    guard_always_fails.setfailargs(vec![].into());
     let mut finish_op = Op::new(OpCode::Finish, &[]);
-    finish_op.pos = OpRef::void_op(1);
-    finish_op.fail_arg_types = Some(vec![]);
-    finish_op.fail_args = Some(vec![].into());
-    let ops = vec![guard_always_fails, finish_op];
+    finish_op.pos.set(OpRef::void_op(1));
+    finish_op.set_fail_arg_types(vec![]);
+    finish_op.setfailargs(vec![].into());
+    let ops = to_rc(vec![guard_always_fails, finish_op]);
     let result = always_backend.compile_loop(&[], &ops, &mut always_token);
     assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
     let frame = always_backend.execute_token(&always_token, &[]);

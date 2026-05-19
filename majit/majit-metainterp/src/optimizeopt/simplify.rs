@@ -26,9 +26,8 @@ impl OptSimplify {
     /// Convert a CALL_PURE_* or CALL_LOOPINVARIANT_* to the corresponding CALL_*.
     fn rewrite_call(op: &Op) -> Op {
         let new_opcode = OpCode::call_for_type(op.result_type());
-        let mut new_op = Op::new(new_opcode, &op.args);
-        new_op.descr = op.descr.clone();
-        new_op.pos = op.pos;
+        let new_op = op.copy_and_change(new_opcode, None, None);
+        new_op.pos.set(op.pos.get());
         new_op
     }
 }
@@ -56,7 +55,7 @@ impl Optimization for OptSimplify {
             // VIRTUAL_REF -> SAME_AS_R (just forward the first arg)
             OpCode::VirtualRefR => {
                 let mut new_op = Op::new(OpCode::SameAsR, &[op.arg(0)]);
-                new_op.pos = op.pos;
+                new_op.pos.set(op.pos.get());
                 OptimizationResult::Emit(new_op)
             }
 
@@ -96,7 +95,7 @@ mod tests {
         opt.add_pass(Box::new(OptSimplify::new()));
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(ops);
         opt.snapshot_boxes = snapshots;
-        opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 1024)
+        opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024)
     }
 
     #[test]
@@ -112,7 +111,7 @@ mod tests {
             assert_eq!(result.len(), 1);
             assert_eq!(result[0].opcode, expected_op);
             assert_eq!(
-                result[0].args.as_slice(),
+                &*result[0].getarglist(),
                 &[OpRef::int_op(0), OpRef::int_op(1)]
             );
         }
@@ -142,7 +141,7 @@ mod tests {
         let result = run_pass(&ops);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::SameAsR);
-        assert_eq!(result[0].args.as_slice(), &[OpRef::int_op(0)]);
+        assert_eq!(&*result[0].getarglist(), &[OpRef::int_op(0)]);
     }
 
     #[test]
@@ -187,7 +186,7 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::CallI);
         assert_eq!(
-            result[0].args.as_slice(),
+            &*result[0].getarglist(),
             &[OpRef::int_op(0), OpRef::int_op(1), OpRef::int_op(2)]
         );
     }

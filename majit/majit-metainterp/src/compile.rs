@@ -13,7 +13,6 @@
 //! difference vs upstream is the use of cells, not a separate module.
 
 use std::cell::UnsafeCell;
-use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -28,6 +27,7 @@ use majit_ir::{
     AccumInfo, Const, Descr, DescrRef, FailDescr, GcRef, GuardPendingFieldEntry, InputArg, Op,
     OpCode, OpRef, RdVirtualInfo, Type, Value,
 };
+use std::collections::HashMap;
 
 use crate::blackhole::ExceptionState;
 use crate::history::TreeLoop;
@@ -87,7 +87,10 @@ pub fn wire_clt_loop_token_wref(token: &Arc<JitCellToken>) {
 /// Box.type values available at the guard's numbering point, not later
 /// operations in the same trace. `value_types` is the incremental
 /// guard-point map maintained by `build_guard_metadata`.
-fn fail_arg_type(opref: &OpRef, value_types: &HashMap<u32, Type>) -> Type {
+fn fail_arg_type(
+    opref: &OpRef,
+    value_types: &crate::optimizeopt::vec_assoc::VecAssoc<u32, Type>,
+) -> Type {
     if *opref == OpRef::NONE {
         return Type::Ref;
     }
@@ -251,7 +254,7 @@ impl<'a> CompileData<'a> {
         &self.trace.inputargs
     }
 
-    pub fn operations(&self) -> &'a [Op] {
+    pub fn operations(&self) -> &'a [majit_ir::OpRc] {
         &self.trace.ops
     }
 
@@ -264,7 +267,7 @@ impl<'a> CompileData<'a> {
 pub struct PreambleCompileData<'a> {
     pub base: CompileData<'a>,
     pub runtime_boxes: &'a [OpRef],
-    pub call_pure_results: &'a HashMap<Vec<Value>, Value>,
+    pub call_pure_results: &'a crate::optimizeopt::vec_assoc::VecAssoc<Vec<Value>, Value>,
     pub enable_opts: &'a [String],
 }
 
@@ -272,7 +275,7 @@ impl<'a> PreambleCompileData<'a> {
     pub fn new(
         trace: &'a TreeLoop,
         runtime_boxes: &'a [OpRef],
-        call_pure_results: &'a HashMap<Vec<Value>, Value>,
+        call_pure_results: &'a crate::optimizeopt::vec_assoc::VecAssoc<Vec<Value>, Value>,
         enable_opts: &'a [String],
     ) -> Self {
         Self {
@@ -288,7 +291,7 @@ impl<'a> PreambleCompileData<'a> {
 pub struct SimpleCompileData<'a> {
     pub base: CompileData<'a>,
     pub resumestorage: Option<&'a ResumeStorage>,
-    pub call_pure_results: &'a HashMap<Vec<Value>, Value>,
+    pub call_pure_results: &'a crate::optimizeopt::vec_assoc::VecAssoc<Vec<Value>, Value>,
     pub enable_opts: &'a [String],
 }
 
@@ -296,7 +299,7 @@ impl<'a> SimpleCompileData<'a> {
     pub fn new(
         trace: &'a TreeLoop,
         resumestorage: Option<&'a ResumeStorage>,
-        call_pure_results: &'a HashMap<Vec<Value>, Value>,
+        call_pure_results: &'a crate::optimizeopt::vec_assoc::VecAssoc<Vec<Value>, Value>,
         enable_opts: &'a [String],
     ) -> Self {
         Self {
@@ -313,7 +316,7 @@ pub struct BridgeCompileData<'a> {
     pub base: CompileData<'a>,
     pub runtime_boxes: &'a [OpRef],
     pub resumestorage: Option<&'a ResumeStorage>,
-    pub call_pure_results: &'a HashMap<Vec<Value>, Value>,
+    pub call_pure_results: &'a crate::optimizeopt::vec_assoc::VecAssoc<Vec<Value>, Value>,
     pub inline_short_preamble: bool,
     pub enable_opts: &'a [String],
 }
@@ -323,7 +326,7 @@ impl<'a> BridgeCompileData<'a> {
         trace: &'a TreeLoop,
         runtime_boxes: &'a [OpRef],
         resumestorage: Option<&'a ResumeStorage>,
-        call_pure_results: &'a HashMap<Vec<Value>, Value>,
+        call_pure_results: &'a crate::optimizeopt::vec_assoc::VecAssoc<Vec<Value>, Value>,
         inline_short_preamble: bool,
         enable_opts: &'a [String],
     ) -> Self {
@@ -343,7 +346,7 @@ pub struct UnrolledLoopData<'a> {
     pub base: CompileData<'a>,
     pub celltoken: &'a Arc<JitCellToken>,
     pub state: &'a crate::optimizeopt::unroll::ExportedState,
-    pub call_pure_results: &'a HashMap<Vec<Value>, Value>,
+    pub call_pure_results: &'a crate::optimizeopt::vec_assoc::VecAssoc<Vec<Value>, Value>,
     pub enable_opts: &'a [String],
 }
 
@@ -352,7 +355,7 @@ impl<'a> UnrolledLoopData<'a> {
         trace: &'a TreeLoop,
         celltoken: &'a Arc<JitCellToken>,
         state: &'a crate::optimizeopt::unroll::ExportedState,
-        call_pure_results: &'a HashMap<Vec<Value>, Value>,
+        call_pure_results: &'a crate::optimizeopt::vec_assoc::VecAssoc<Vec<Value>, Value>,
         enable_opts: &'a [String],
     ) -> Self {
         Self {
@@ -379,13 +382,17 @@ pub(crate) fn build_guard_metadata(
     inputargs: &[InputArg],
     ops: &[majit_ir::Op],
     pc: u64,
-    constant_types: &std::collections::HashMap<u32, Type>,
+    constants: &crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Const>,
 ) -> (
-    HashMap<u32, crate::resume::ResumeLayoutSummary>,
-    HashMap<u32, StoredExitLayout>,
+    crate::optimizeopt::vec_assoc::VecAssoc<u32, crate::resume::ResumeLayoutSummary>,
+    crate::optimizeopt::vec_assoc::VecAssoc<u32, StoredExitLayout>,
 ) {
-    let mut result = HashMap::new();
-    let mut exit_layouts = HashMap::new();
+    let mut result: crate::optimizeopt::vec_assoc::VecAssoc<
+        u32,
+        crate::resume::ResumeLayoutSummary,
+    > = crate::optimizeopt::vec_assoc::VecAssoc::new();
+    let mut exit_layouts: crate::optimizeopt::vec_assoc::VecAssoc<u32, StoredExitLayout> =
+        crate::optimizeopt::vec_assoc::VecAssoc::new();
     let mut fail_index = 0u32;
     let mut resume_memo = ResumeDataLoopMemo::new();
     // RPython box.type parity: type lookup is `inputarg.tp` /
@@ -402,15 +409,20 @@ pub(crate) fn build_guard_metadata(
     // Mirror main's incremental walk: maintain `value_types` seeded
     // from inputargs + constants, then insert each op's result type
     // before consulting it.
-    let mut value_types: HashMap<u32, Type> =
-        inputargs.iter().map(|arg| (arg.index, arg.tp)).collect();
-    for (&idx, &tp) in constant_types {
-        value_types.entry(idx).or_insert(tp);
+    let mut value_types: crate::optimizeopt::vec_assoc::VecAssoc<u32, Type> =
+        crate::optimizeopt::vec_assoc::VecAssoc::new();
+    for arg in inputargs.iter() {
+        value_types.insert(arg.index, arg.tp);
+    }
+    for (&idx, c) in constants.iter() {
+        if !value_types.contains_key(&idx) {
+            value_types.insert(idx, c.get_type());
+        }
     }
 
     for (op_idx, op) in ops.iter().enumerate() {
-        if !op.pos.is_none() && op.result_type() != Type::Void {
-            value_types.insert(op.pos.raw(), op.result_type());
+        if !op.pos.get().is_none() && op.result_type() != Type::Void {
+            value_types.insert(op.pos.get().raw(), op.result_type());
         }
 
         let is_guard = op.opcode.is_guard();
@@ -440,10 +452,10 @@ pub(crate) fn build_guard_metadata(
             // lookups can resolve through the descr Arc directly.
             // Skip non-resume FailDescrs (whose
             // `set_fail_index_per_trace` panics by default).
-            if let Some(fd) = op.descr.as_ref().and_then(|d| d.as_fail_descr()) {
+            let __descr_arc = op.getdescr();
+            if let Some(fd) = __descr_arc.as_ref().and_then(|d| d.as_fail_descr()) {
                 if op
-                    .descr
-                    .as_ref()
+                    .getdescr()
                     .map_or(false, |d| d.is_resume_guard() || d.is_resume_guard_copied())
                 {
                     fd.set_fail_index_per_trace(fail_index);
@@ -462,11 +474,7 @@ pub(crate) fn build_guard_metadata(
         // post-numbering type vector, so descr-first priority no longer
         // exposes stale tracer types. Fall back to `op.fail_arg_types`
         // and finally the incremental guard-point `value_types` map.
-        let descr_types = op
-            .descr
-            .as_ref()
-            .and_then(|d| d.as_fail_descr())
-            .map(|fd| fd.fail_arg_types());
+        let descr_types = op.with_fail_descr(|fd| fd.fail_arg_types().to_vec());
         let exit_types: Vec<Type> = if is_finish {
             // FINISH ops are always emitted with one of the
             // `_DoneWithThisFrameDescr` family (compile.py:623-672) or
@@ -477,26 +485,26 @@ pub(crate) fn build_guard_metadata(
             // `cpu.get_*_value(deadframe, 0)` keyed by the descr
             // class, not by per-arg inference.
             if let Some(types) = descr_types {
-                if types.len() == op.args.len() {
+                if types.len() == op.num_args() {
                     types.to_vec()
                 } else {
                     // Arity mismatch (synthetic test ops without a
                     // type-shaped descr): reconstruct per-arg from the
                     // incremental `value_types`. Production FINISH always
                     // matches the descr arity.
-                    op.args
+                    op.getarglist()
                         .iter()
                         .map(|opref| value_types.get(&opref.raw()).copied().unwrap_or(Type::Int))
                         .collect()
                 }
             } else {
                 // No descr — synthetic test FINISH only.
-                op.args
+                op.getarglist()
                     .iter()
                     .map(|opref| value_types.get(&opref.raw()).copied().unwrap_or(Type::Int))
                     .collect()
             }
-        } else if let Some(ref fail_args) = op.fail_args {
+        } else if let Some(fail_args) = op.getfailargs() {
             // `store_final_boxes_in_guard` (resume.py:397) writes the
             // reduced liveboxes' types authoritatively. Prefer the descr's
             // fail_arg_types (single source of truth, matches RPython
@@ -504,7 +512,7 @@ pub(crate) fn build_guard_metadata(
             // `fail_arg_types` on sharing-path (no descr); fall back to
             // per-arg reconstruction via guard-point `value_types` when arity
             // mismatches.
-            let fa_types = op.fail_arg_types.as_ref();
+            let fa_types = op.get_fail_arg_types();
             if let Some(types) = descr_types {
                 if types.len() == fail_args.len() {
                     types.to_vec()
@@ -516,7 +524,7 @@ pub(crate) fn build_guard_metadata(
                             if let Some(&tp) = types.get(i) {
                                 return tp;
                             }
-                            if let Some(fa) = fa_types {
+                            if let Some(fa) = fa_types.as_ref() {
                                 if let Some(&tp) = fa.get(i) {
                                     return tp;
                                 }
@@ -559,8 +567,8 @@ pub(crate) fn build_guard_metadata(
             }
         } else if let Some(dt) = descr_types {
             dt.to_vec()
-        } else if let Some(ref types) = op.fail_arg_types {
-            types.clone()
+        } else if let Some(types) = op.get_fail_arg_types() {
+            types.to_vec()
         } else {
             inputargs.iter().map(|arg| arg.tp).collect()
         };
@@ -585,7 +593,7 @@ pub(crate) fn build_guard_metadata(
                 let fvc_ref: Option<&dyn Fn(i32, i32) -> usize> =
                     fvc.as_ref().map(|f| f as &dyn Fn(i32, i32) -> usize);
                 let (_num_failargs, vable_values, _vref_values, frames) =
-                    rebuild_from_numbering(rd_numb_bytes, rd_consts_data, &exit_types, fvc_ref);
+                    rebuild_from_numbering(&rd_numb_bytes, &rd_consts_data, &exit_types, fvc_ref);
                 let vable_array = vable_values
                     .iter()
                     .map(|val| match val {
@@ -632,8 +640,7 @@ pub(crate) fn build_guard_metadata(
                 // No rd_numb: single frame, 1:1 mapping (fail_args[i] → state[i]).
                 builder.push_frame(0, pc);
                 let num_slots = op
-                    .fail_args
-                    .as_ref()
+                    .getfailargs()
                     .map(|fa| fa.len())
                     .unwrap_or(exit_types.len());
                 for slot_idx in 0..num_slots {
@@ -655,12 +662,15 @@ pub(crate) fn build_guard_metadata(
                 Some(crate::resume::ResumeStorage::new(
                     numb.to_vec(),
                     op.resolved_rd_consts()
+                        .as_deref()
                         .map(<[Const]>::to_vec)
                         .unwrap_or_default(),
                     op.resolved_rd_virtuals()
+                        .as_deref()
                         .map(<[std::rc::Rc<majit_ir::RdVirtualInfo>]>::to_vec)
                         .unwrap_or_default(),
                     op.resolved_rd_pendingfields()
+                        .as_deref()
                         .map(<[majit_ir::GuardPendingFieldEntry]>::to_vec)
                         .unwrap_or_default(),
                 ))
@@ -693,8 +703,12 @@ pub(crate) fn build_guard_metadata(
                     let fvc = majit_ir::resumedata::get_frame_value_count_fn();
                     let fvc_ref: Option<&dyn Fn(i32, i32) -> usize> =
                         fvc.as_ref().map(|f| f as &dyn Fn(i32, i32) -> usize);
-                    let (num_failargs, vable_values, vref_values, frames) =
-                        rebuild_from_numbering(rd_numb_bytes, rd_consts_data, &exit_types, fvc_ref);
+                    let (num_failargs, vable_values, vref_values, frames) = rebuild_from_numbering(
+                        &rd_numb_bytes,
+                        &rd_consts_data,
+                        &exit_types,
+                        fvc_ref,
+                    );
                     debug_assert!(
                         vref_values.len() & 1 == 0,
                         "vref_values length must be even, got {}",
@@ -741,7 +755,8 @@ pub(crate) fn build_guard_metadata(
             // resume.py:576-860 parity: resolve fieldnums tags for recovery.
             // Follow `descr.prev` so sharing-path guards see the donor's
             // const pool (compile.py:849 get_resumestorage).
-            let rd_consts_ref = op.resolved_rd_consts().unwrap_or(&[]);
+            let rd_consts_arc = op.resolved_rd_consts();
+            let rd_consts_ref: &[Const] = rd_consts_arc.as_deref().unwrap_or(&[]);
             let resolve_tagged_source = |tagged: i16| -> ExitValueSourceLayout {
                 let (val, tagbits) = majit_ir::resumedata::untag(tagged);
                 match tagbits {
@@ -1005,7 +1020,7 @@ pub(crate) fn build_guard_metadata(
                             // pf_op is always a descr-bearing setfield op.
                             let descr = pf
                                 .descr
-                                .as_ref()
+                                .clone()
                                 .expect("resume.py:1000 PENDINGFIELDSTRUCT.lldescr must be set");
                             // resume.py:1003-1007: itemindex >= 0 → setarrayitem.
                             let item_index = if descr.as_array_descr().is_some() {
@@ -1083,7 +1098,7 @@ pub(crate) fn build_guard_metadata(
                 recovery_layout,
                 resume_layout,
                 storage,
-                descr: op.descr.clone(),
+                descr: op.getdescr(),
                 op_arg_types_for_jump: None,
             },
         );
@@ -1094,7 +1109,7 @@ pub(crate) fn build_guard_metadata(
 }
 
 pub(crate) fn merge_backend_exit_layouts(
-    exit_layouts: &mut HashMap<u32, StoredExitLayout>,
+    exit_layouts: &mut crate::optimizeopt::vec_assoc::VecAssoc<u32, StoredExitLayout>,
     backend_layouts: &[FailDescrLayout],
     ops: &[majit_ir::Op],
 ) {
@@ -1132,7 +1147,7 @@ pub(crate) fn merge_backend_exit_layouts(
         let descr_from_op = layout
             .source_op_index
             .and_then(|idx| ops.get(idx))
-            .and_then(|op| op.descr.clone())
+            .and_then(|op| op.getdescr())
             .or_else(|| {
                 Some(if layout.is_finish {
                     make_finish_fail_descr_typed(
@@ -1144,18 +1159,16 @@ pub(crate) fn merge_backend_exit_layouts(
                 })
             });
         let entry: &mut StoredExitLayout =
-            exit_layouts
-                .entry(layout.fail_index)
-                .or_insert_with(|| StoredExitLayout {
-                    source_op_index: layout.source_op_index,
-                    gc_ref_slots: layout.gc_ref_slots.clone(),
-                    force_token_slots: layout.force_token_slots.clone(),
-                    recovery_layout: layout.recovery_layout.clone(),
-                    resume_layout: None,
-                    storage: storage_from_backend.clone(),
-                    descr: descr_from_op.clone(),
-                    op_arg_types_for_jump: None,
-                });
+            exit_layouts.entry_or_insert_with(layout.fail_index, || StoredExitLayout {
+                source_op_index: layout.source_op_index,
+                gc_ref_slots: layout.gc_ref_slots.clone(),
+                force_token_slots: layout.force_token_slots.clone(),
+                recovery_layout: layout.recovery_layout.clone(),
+                resume_layout: None,
+                storage: storage_from_backend.clone(),
+                descr: descr_from_op.clone(),
+                op_arg_types_for_jump: None,
+            });
         entry.source_op_index = layout.source_op_index;
         // Backfill descr if the entry was inserted before `op.descr` was
         // available (or the op walk produced a fresh handle). Keeps
@@ -1191,7 +1204,9 @@ pub(crate) fn merge_backend_exit_layouts(
 /// Guards that HAVE recovery_layout (all production guards after backend
 /// merge) must satisfy the full invariant. Guards without (only possible
 /// in unit tests with mock backends) are warned but not fatal.
-pub(crate) fn validate_exit_layouts(exit_layouts: &HashMap<u32, StoredExitLayout>) {
+pub(crate) fn validate_exit_layouts(
+    exit_layouts: &crate::optimizeopt::vec_assoc::VecAssoc<u32, StoredExitLayout>,
+) {
     for (&fail_index, layout) in exit_layouts {
         if layout.resolve_is_finish() {
             continue;
@@ -1395,7 +1410,7 @@ pub(crate) fn enrich_resume_layout_with_frame_stack(
 }
 
 pub(crate) fn merge_backend_terminal_exit_layouts(
-    terminal_exit_layouts: &mut HashMap<usize, StoredExitLayout>,
+    terminal_exit_layouts: &mut crate::optimizeopt::vec_assoc::VecAssoc<usize, StoredExitLayout>,
     backend_layouts: &[TerminalExitLayout],
     ops: &[majit_ir::Op],
 ) {
@@ -1421,7 +1436,7 @@ pub(crate) fn merge_backend_terminal_exit_layouts(
             Some(op) => op.opcode == OpCode::Jump,
             None => !layout.is_finish,
         };
-        let descr_from_op = source_op.and_then(|op| op.descr.clone()).or_else(|| {
+        let descr_from_op = source_op.and_then(|op| op.getdescr()).or_else(|| {
             Some(if layout.is_finish {
                 make_finish_fail_descr_typed(layout.exit_types.clone(), layout.is_exception_exit)
             } else {
@@ -1429,9 +1444,8 @@ pub(crate) fn merge_backend_terminal_exit_layouts(
             })
         });
         let op_arg_types_for_jump = is_jump.then(|| layout.exit_types.clone());
-        let entry = terminal_exit_layouts
-            .entry(layout.op_index)
-            .or_insert_with(|| StoredExitLayout {
+        let entry =
+            terminal_exit_layouts.entry_or_insert_with(layout.op_index, || StoredExitLayout {
                 source_op_index: Some(layout.op_index),
                 gc_ref_slots: layout.gc_ref_slots.clone(),
                 force_token_slots: layout.force_token_slots.clone(),
@@ -1532,7 +1546,6 @@ pub(crate) fn find_fail_index_for_exit_op(ops: &[majit_ir::Op], op_index: usize)
 pub(crate) fn infer_terminal_exit_layout(
     inputargs: &[InputArg],
     ops: &[majit_ir::Op],
-    constant_types: &HashMap<u32, Type>,
     owning_key: u64,
     trace_id: u64,
     op_index: usize,
@@ -1543,9 +1556,9 @@ pub(crate) fn infer_terminal_exit_layout(
         return None;
     }
     let fail_index = find_fail_index_for_exit_op(ops, op_index).unwrap_or(u32::MAX);
-    let type_index = majit_ir::OpTypeIndex::new(inputargs, ops, constant_types);
+    let type_index = majit_ir::OpTypeIndex::new(inputargs, ops);
     let exit_types: Vec<Type> = op
-        .args
+        .getarglist()
         .iter()
         .map(|opref| {
             type_index
@@ -1554,7 +1567,7 @@ pub(crate) fn infer_terminal_exit_layout(
         })
         .collect();
     let force_token_slots: Vec<usize> = op
-        .args
+        .getarglist()
         .iter()
         .enumerate()
         .filter_map(|(slot, opref)| {
@@ -1573,7 +1586,7 @@ pub(crate) fn infer_terminal_exit_layout(
         })
         .collect();
     let is_exception_exit = op
-        .descr
+        .getdescr()
         .as_ref()
         .and_then(|d| d.as_fail_descr())
         .is_some_and(|fd| fd.is_exit_frame_with_exception());
@@ -1596,16 +1609,14 @@ pub(crate) fn infer_terminal_exit_layout(
 pub(crate) fn build_terminal_exit_layouts(
     inputargs: &[InputArg],
     ops: &[majit_ir::Op],
-    constant_types: &HashMap<u32, Type>,
-) -> HashMap<usize, StoredExitLayout> {
-    let mut layouts = HashMap::new();
+) -> crate::optimizeopt::vec_assoc::VecAssoc<usize, StoredExitLayout> {
+    let mut layouts: crate::optimizeopt::vec_assoc::VecAssoc<usize, StoredExitLayout> =
+        crate::optimizeopt::vec_assoc::VecAssoc::new();
     for (op_index, op) in ops.iter().enumerate() {
         if op.opcode != OpCode::Finish && op.opcode != OpCode::Jump {
             continue;
         }
-        if let Some(layout) =
-            infer_terminal_exit_layout(inputargs, ops, constant_types, 0, 0, op_index)
-        {
+        if let Some(layout) = infer_terminal_exit_layout(inputargs, ops, 0, 0, op_index) {
             // For JUMP exits the descr is `LoopTargetDescr`
             // (`history.py:470`), which has no `fail_arg_types`.  Cache
             // the per-arg types so `StoredExitLayout::resolve_exit_types()`
@@ -1624,7 +1635,7 @@ pub(crate) fn build_terminal_exit_layouts(
                     recovery_layout: None,
                     resume_layout: None,
                     storage: None,
-                    descr: op.descr.clone(),
+                    descr: op.getdescr(),
                     op_arg_types_for_jump,
                 },
             );
@@ -1651,14 +1662,7 @@ pub(crate) fn terminal_exit_layout_for_trace(
             return Some(layout.public(owning_key, trace_id, fail_index));
         }
     }
-    infer_terminal_exit_layout(
-        &trace.inputargs,
-        &trace.ops,
-        &trace.constant_types,
-        owning_key,
-        trace_id,
-        op_index,
-    )
+    infer_terminal_exit_layout(&trace.inputargs, &trace.ops, owning_key, trace_id, op_index)
 }
 
 pub(crate) fn decode_values_with_layout(
@@ -1683,42 +1687,44 @@ pub(crate) fn decode_values_with_layout(
 
 pub(crate) fn normalize_closing_jump_args(
     mut ops: Vec<Op>,
-    constants: &std::collections::HashMap<u32, majit_ir::Value>,
+    constants: &majit_ir::VecAssoc<u32, majit_ir::Value>,
     num_inputs: usize,
 ) -> Vec<Op> {
     let Some(label_args) = ops
         .iter()
         .rev()
         .find(|op| op.opcode == OpCode::Label)
-        .map(|op| op.args.clone())
+        .map(|op| op.getarglist_copy())
     else {
         return ops;
     };
 
-    let defined: std::collections::HashSet<OpRef> = ops
+    let defined: majit_ir::vec_set::VecSet<OpRef> = ops
         .iter()
-        .filter(|op| op.result_type() != majit_ir::Type::Void && !op.pos.is_none())
-        .map(|op| op.pos)
+        .filter(|op| op.result_type() != majit_ir::Type::Void && !op.pos.get().is_none())
+        .map(|op| op.pos.get())
         .collect();
 
     let Some(jump) = ops.iter_mut().rfind(|op| op.opcode == OpCode::Jump) else {
         return ops;
     };
 
-    for (idx, arg) in jump.args.iter_mut().enumerate() {
+    // optimizer.py:651-652 setarg loop parity.
+    for idx in 0..jump.num_args() {
         if idx >= label_args.len() {
             break;
         }
+        let arg = jump.arg(idx);
         if constants.contains_key(&arg.raw()) {
             continue;
         }
         if (arg.raw() as usize) < num_inputs {
             continue;
         }
-        if defined.contains(arg) {
+        if defined.contains(&arg) {
             continue;
         }
-        *arg = label_args[idx];
+        jump.setarg(idx, label_args[idx]);
     }
 
     ops
@@ -1784,7 +1790,7 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
     vable_array_lengths: &[usize],
     num_red_args: usize,
     index_of_virtualizable: usize,
-    constants: &mut HashMap<u32, majit_ir::Value>,
+    constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
 ) {
     // PRE-EXISTING-ADAPTATION (Rust language constraint, not a logic
     // divergence): RPython `compile.py:425-461` calls
@@ -1847,24 +1853,24 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
         let mut emitted = op.clone();
         let mut replaced = false;
 
-        for i in 0..op.args.len() {
-            let orig_arg = op.args[i];
+        for i in 0..op.num_args() {
+            let orig_arg = op.arg(i);
             let arg = get_local_box_replacement(forwarding, orig_arg);
             if orig_arg != arg {
                 if !replaced {
                     emitted = op.copy_and_change(op.opcode, None, None);
-                    if op.result_type() != Type::Void && !op.pos.is_none() {
+                    if op.result_type() != Type::Void && !op.pos.get().is_none() {
                         let new_pos = OpRef::op_typed(*next_opref, op.result_type());
                         *next_opref += 1;
-                        emitted.pos = new_pos;
+                        emitted.pos.set(new_pos);
                         // compile.py:414-418 `orig_op.set_forwarded(op)`:
                         // in the flat OpRef model this temporary vector is
                         // the local equivalent of Box._forwarded.
-                        set_local_forwarded(forwarding, op.pos, new_pos);
+                        set_local_forwarded(forwarding, op.pos.get(), new_pos);
                     }
                     replaced = true;
                 }
-                emitted.args[i] = arg;
+                emitted.setarg(i, arg);
             }
         }
 
@@ -1872,7 +1878,7 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
             if !replaced {
                 emitted = op.copy_and_change(op.opcode, None, None);
             }
-            if let Some(fail_args) = emitted.fail_args.as_mut() {
+            if let Some(fail_args) = emitted.fail_args_mut() {
                 for arg in fail_args.iter_mut() {
                     *arg = get_local_box_replacement(forwarding, *arg);
                 }
@@ -1905,9 +1911,9 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
     let max_runtime_ref = ops
         .iter()
         .flat_map(|op| {
-            std::iter::once(op.pos)
-                .chain(op.args.iter().copied())
-                .chain(op.fail_args.iter().flatten().copied())
+            std::iter::once(op.pos.get())
+                .chain(op.getarglist_copy())
+                .chain(op.getfailargs().into_iter().flatten())
         })
         .chain(expanded_inputargs.iter().map(|ia| ia.opref()))
         .filter(|opref| !opref.is_none() && !opref.is_constant())
@@ -1959,8 +1965,8 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
         let new_opref = OpRef::op_typed(next_opref, field.field_type);
         next_opref += 1;
         let mut op = Op::new(opcode, &[vable_box]);
-        op.pos = new_opref;
-        op.descr = Some(descr);
+        op.pos.set(new_opref);
+        op.setdescr(descr);
         extra_ops.push(op);
         set_local_forwarded(&mut forwarding, old_opref, new_opref);
         i += 1;
@@ -1979,8 +1985,8 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
         let array_opref = OpRef::ref_op(next_opref);
         next_opref += 1;
         let mut arr_load = Op::new(OpCode::GetfieldGcR, &[vable_box]);
-        arr_load.pos = array_opref;
-        arr_load.descr = Some(array_field_descr.clone());
+        arr_load.pos.set(array_opref);
+        arr_load.setdescr(array_field_descr.clone());
         extra_ops.push(arr_load);
 
         let array_descr = vinfo
@@ -2017,8 +2023,8 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
                 let ptr_opref = OpRef::int_op(next_opref);
                 next_opref += 1;
                 let mut ptr_load = Op::new(OpCode::GetfieldGcI, &[array_opref]);
-                ptr_load.pos = ptr_opref;
-                ptr_load.descr = Some(majit_ir::descr::make_field_descr(
+                ptr_load.pos.set(ptr_opref);
+                ptr_load.setdescr(majit_ir::descr::make_field_descr(
                     ptr_offset,
                     std::mem::size_of::<usize>(),
                     Type::Int,
@@ -2051,8 +2057,8 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
             let new_opref = OpRef::op_typed(next_opref, vinfo.array_fields[ai].item_type);
             next_opref += 1;
             let mut elem_op = Op::new(item_opcode, &[item_base, const_opref]);
-            elem_op.pos = new_opref;
-            elem_op.descr = Some(item_descr.clone());
+            elem_op.pos.set(new_opref);
+            elem_op.setdescr(item_descr.clone());
             extra_ops.push(elem_op);
             set_local_forwarded(&mut forwarding, old_opref, new_opref);
             i += 1;
@@ -2111,8 +2117,11 @@ pub(crate) fn strip_stray_overflow_guards(ops: Vec<Op>) -> Vec<Op> {
 }
 
 pub(crate) fn enrich_guard_resume_layouts_for_trace(
-    resume_layouts: &mut HashMap<u32, crate::resume::ResumeLayoutSummary>,
-    exit_layouts: &mut HashMap<u32, StoredExitLayout>,
+    resume_layouts: &mut crate::optimizeopt::vec_assoc::VecAssoc<
+        u32,
+        crate::resume::ResumeLayoutSummary,
+    >,
+    exit_layouts: &mut crate::optimizeopt::vec_assoc::VecAssoc<u32, StoredExitLayout>,
     trace_id: u64,
     inputargs: &[InputArg],
     trace_info: Option<&CompiledTraceInfo>,
@@ -2135,7 +2144,7 @@ pub(crate) fn enrich_guard_resume_layouts_for_trace(
 }
 
 pub(crate) fn patch_guard_recovery_layouts_for_trace(
-    exit_layouts: &mut HashMap<u32, StoredExitLayout>,
+    exit_layouts: &mut crate::optimizeopt::vec_assoc::VecAssoc<u32, StoredExitLayout>,
 ) {
     // Backend no longer caches a per-descr recovery layout; the
     // metainterp's `StoredExitLayout.recovery_layout` cache is the
@@ -2157,7 +2166,7 @@ pub(crate) fn patch_backend_terminal_recovery_layouts_for_trace(
     backend: &mut dyn majit_backend::Backend,
     token: &majit_backend::JitCellToken,
     trace_id: u64,
-    terminal_exit_layouts: &mut HashMap<usize, StoredExitLayout>,
+    terminal_exit_layouts: &mut crate::optimizeopt::vec_assoc::VecAssoc<usize, StoredExitLayout>,
 ) {
     for (&op_index, exit_layout) in terminal_exit_layouts.iter_mut() {
         let Some(resume_layout) = exit_layout.resume_layout.as_ref() else {
@@ -2418,29 +2427,25 @@ pub fn compile_tmp_callback(
     // are minted via `OpRef::const_typed` so each one is a Const{Int,
     // Float,Ptr} (history.py:220/261/307).
     const CONST_BASE: u32 = 10_000;
-    let mut constants: HashMap<u32, i64> = HashMap::new();
-    let mut constant_types: HashMap<u32, Type> = HashMap::new();
+    let mut constants: majit_ir::VecAssoc<u32, majit_ir::Const> = majit_ir::VecAssoc::new();
     // `compile.py:1126` funcbox = ConstInt(adr2int(k)).
     let funcbox_ref = OpRef::const_int(CONST_BASE);
-    constants.insert(funcbox_ref.raw(), jitdriver_sd.portal_runner_adr);
-    // Lockstep with backend `set_constant_types`: raw-u32 keyed readers
-    // (regalloc fail_args, GC rewrite) need the side table.
-    constant_types.insert(funcbox_ref.raw(), Type::Int);
+    constants.insert(
+        funcbox_ref.raw(),
+        majit_ir::Const::Int(jitdriver_sd.portal_runner_adr),
+    );
     // Green boxes follow in declaration order.
     let mut callargs: Vec<OpRef> = Vec::with_capacity(1 + greenboxes.len() + inputargs.len());
     callargs.push(funcbox_ref);
     for (i, gb) in greenboxes.iter().enumerate() {
-        let (raw, tp) = match *gb {
-            Value::Int(v) => (v, Type::Int),
-            Value::Ref(r) => (r.0 as i64, Type::Ref),
-            Value::Float(f) => (f.to_bits() as i64, Type::Float),
+        let (c, tp) = match *gb {
+            Value::Int(v) => (majit_ir::Const::Int(v), Type::Int),
+            Value::Ref(r) => (majit_ir::Const::Ref(r), Type::Ref),
+            Value::Float(f) => (majit_ir::Const::Float(f), Type::Float),
             Value::Void => panic!("compile_tmp_callback: void greenbox"),
         };
         let g_ref = OpRef::const_typed(CONST_BASE + 1 + i as u32, tp);
-        constants.insert(g_ref.raw(), raw);
-        // Lockstep with backend `set_constant_types`: raw-u32 keyed
-        // readers (regalloc fail_args, GC rewrite) need the side table.
-        constant_types.insert(g_ref.raw(), tp);
+        constants.insert(g_ref.raw(), c);
         callargs.push(g_ref);
     }
     // Red args — inputargs occupy contiguous low OpRefs. Use
@@ -2487,7 +2492,7 @@ pub fn compile_tmp_callback(
         // resoperation.py:564-638 IntOp/FloatOp/RefOp mixin: the result
         // box of a typed CALL is a typed ResOp variant.
         let call_result_ref = OpRef::op_typed(num_inputs, jitdriver_sd.result_type);
-        call_op.pos = call_result_ref;
+        call_op.pos.set(call_result_ref);
         vec![call_result_ref]
     };
     //
@@ -2496,17 +2501,19 @@ pub fn compile_tmp_callback(
     //   FINISH(finishargs, descr=jd.portal_finishtoken)].
     let mut guard_op = Op::with_descr(OpCode::GuardNoException, &[], propagate_exc_descr);
     // `compile.py:1144` `operations[1].setfailargs([])` — no fail args.
-    guard_op.fail_args = Some(smallvec![]);
+    guard_op.setfailargs(smallvec![]);
     let finish_op = Op::with_descr(OpCode::Finish, &finishargs, portal_finishtoken);
-    let operations = vec![call_op, guard_op, finish_op];
+    let operations: Vec<majit_ir::OpRc> = vec![call_op, guard_op, finish_op]
+        .into_iter()
+        .map(std::rc::Rc::new)
+        .collect();
     //
     // `compile.py:1145` `operations = get_deep_immutable_oplist(operations)` —
     // pyre has no immutable-list transformation.
     //
     // `compile.py:1146` `cpu.compile_loop(inputargs, operations, jitcell_token,
     // log=False)`.
-    backend.set_constants(constants);
-    backend.set_constant_types(constant_types);
+    backend.set_constants_pool(constants);
     backend.compile_loop(
         &inputargs,
         &operations,
@@ -2585,15 +2592,19 @@ mod tests {
             fd.set_rd_numb(Some(rd_numb));
             fd.set_rd_consts(Some(rd_consts));
         }
-        guard.descr = Some(descr);
-        guard.fail_args = Some(smallvec::smallvec![
+        guard.setdescr(descr);
+        guard.setfailargs(smallvec::smallvec![
             OpRef::input_arg_ref(0),
             OpRef::input_arg_int(1)
         ]);
-        guard.fail_arg_types = Some(vec![Type::Ref, Type::Int]);
+        guard.set_fail_arg_types(vec![Type::Ref, Type::Int]);
 
-        let (_resume_data, exit_layouts) =
-            build_guard_metadata(&inputargs, &[guard], 8, &HashMap::new());
+        let (_resume_data, exit_layouts) = build_guard_metadata(
+            &inputargs,
+            &[guard],
+            8,
+            &crate::optimizeopt::vec_assoc::VecAssoc::new(),
+        );
         let exit = exit_layouts.get(&0).expect("guard exit layout");
 
         let resume_layout = exit.resume_layout.as_ref().expect("resume_layout");
@@ -2634,17 +2645,21 @@ mod tests {
             .as_fail_descr()
             .unwrap()
             .set_fail_arg_types(fail_arg_types.clone());
-        guard.descr = Some(descr);
-        guard.fail_args = Some(smallvec::smallvec![
+        guard.setdescr(descr);
+        guard.setfailargs(smallvec::smallvec![
             OpRef::input_arg_ref(0),
             OpRef::input_arg_ref(1),
             OpRef::input_arg_ref(2),
             OpRef::input_arg_ref(3)
         ]);
-        guard.fail_arg_types = Some(fail_arg_types);
+        guard.set_fail_arg_types(fail_arg_types);
 
-        let (_resume_data, exit_layouts) =
-            build_guard_metadata(&inputargs, &[guard], 0, &HashMap::new());
+        let (_resume_data, exit_layouts) = build_guard_metadata(
+            &inputargs,
+            &[guard],
+            0,
+            &crate::optimizeopt::vec_assoc::VecAssoc::new(),
+        );
         let exit = exit_layouts.get(&0).expect("guard exit layout");
 
         assert_eq!(
@@ -2662,14 +2677,14 @@ mod tests {
         let mut ops = vec![
             {
                 let mut op = Op::new(OpCode::SameAsR, &[OpRef::input_arg_ref(1)]);
-                op.pos = OpRef::ref_op(10);
+                op.pos.set(OpRef::ref_op(10));
                 op
             },
             Op::new(OpCode::Label, &[OpRef::input_arg_ref(0), OpRef::ref_op(10)]),
             {
                 let mut op = Op::new(OpCode::GetfieldGcPureI, &[OpRef::ref_op(10)]);
-                op.pos = OpRef::int_op(11);
-                op.descr = Some(majit_ir::descr::make_field_descr(
+                op.pos.set(OpRef::int_op(11));
+                op.setdescr(majit_ir::descr::make_field_descr(
                     16,
                     8,
                     Type::Int,
@@ -2679,7 +2694,7 @@ mod tests {
             },
         ];
         let mut inputargs = vec![InputArg::new_ref(0), InputArg::new_ref(1)];
-        let mut constants: HashMap<u32, majit_ir::Value> = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
 
         patch_new_loop_to_load_virtualizable_fields(
             &mut ops,
@@ -2694,21 +2709,21 @@ mod tests {
         assert_eq!(inputargs, vec![InputArg::new_ref(0)]);
         assert_eq!(ops.len(), 4);
         assert_eq!(ops[0].opcode, OpCode::GetfieldGcR);
-        let vable_field = ops[0].pos;
+        let vable_field = ops[0].pos.get();
 
         assert_eq!(ops[1].opcode, OpCode::SameAsR);
-        assert_eq!(ops[1].args.as_slice(), &[vable_field]);
-        let forwarded_same_as = ops[1].pos;
+        assert_eq!(&*ops[1].getarglist(), &[vable_field]);
+        let forwarded_same_as = ops[1].pos.get();
         assert_ne!(forwarded_same_as, OpRef::ref_op(10));
 
         assert_eq!(ops[2].opcode, OpCode::Label);
         assert_eq!(
-            ops[2].args.as_slice(),
+            &*ops[2].getarglist(),
             &[OpRef::input_arg_ref(0), forwarded_same_as]
         );
 
         assert_eq!(ops[3].opcode, OpCode::GetfieldGcPureI);
-        assert_eq!(ops[3].args.as_slice(), &[forwarded_same_as]);
+        assert_eq!(&*ops[3].getarglist(), &[forwarded_same_as]);
     }
 
     #[test]
@@ -2738,7 +2753,7 @@ mod tests {
             InputArg::new_ref(1),
             InputArg::new_ref(2),
         ];
-        let mut constants: HashMap<u32, majit_ir::Value> = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
 
         patch_new_loop_to_load_virtualizable_fields(
             &mut ops,
@@ -2754,15 +2769,15 @@ mod tests {
         assert_eq!(ops.len(), 5);
         assert_eq!(ops[0].opcode, OpCode::GetfieldGcR);
         assert_eq!(ops[1].opcode, OpCode::GetfieldGcI);
-        assert_eq!(ops[1].args.as_slice(), &[ops[0].pos]);
+        assert_eq!(&*ops[1].getarglist(), &[ops[0].pos.get()]);
         assert_eq!(ops[2].opcode, OpCode::GetarrayitemRawR);
-        assert_eq!(ops[2].args[0], ops[1].pos);
+        assert_eq!(ops[2].arg(0), ops[1].pos.get());
         assert_eq!(ops[3].opcode, OpCode::GetarrayitemRawR);
-        assert_eq!(ops[3].args[0], ops[1].pos);
+        assert_eq!(ops[3].arg(0), ops[1].pos.get());
         assert_eq!(ops[4].opcode, OpCode::Label);
         assert_eq!(
-            ops[4].args.as_slice(),
-            &[OpRef::input_arg_ref(0), ops[2].pos, ops[3].pos]
+            &*ops[4].getarglist(),
+            &[OpRef::input_arg_ref(0), ops[2].pos.get(), ops[3].pos.get()]
         );
     }
 }
@@ -4936,8 +4951,7 @@ impl FailDescr for CompileLoopVersionDescr {
 /// ResumeGuardDescr)`).
 pub fn make_compile_loop_version_descr_from(source_op: &majit_ir::Op) -> DescrRef {
     let src_descr = source_op
-        .descr
-        .as_ref()
+        .getdescr()
         .expect("guard.py:90: self.op.getdescr() must exist");
     // compile.py:862 `other = other.get_resumestorage()`: if the source
     // is a `ResumeGuardCopiedDescr`, resolve to its `prev` so we read

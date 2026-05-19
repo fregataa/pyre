@@ -8,7 +8,7 @@
 
 use std::fmt;
 
-use majit_ir::{InputArg, Op, OpCode, OpRef};
+use majit_ir::{InputArg, Op, OpCode, OpRc, OpRef};
 
 /// A lowered dynasm-backend operation.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -180,7 +180,7 @@ pub(crate) struct DeoptSpillPoint {
 
 impl TracePlan {
     pub(crate) fn build(inputargs: &[InputArg], ops: &[Op]) -> Self {
-        let lowered: Vec<LirOp> = ops.iter().map(lower_op).collect();
+        let lowered: Vec<LirOp> = ops.iter().map(|op| lower_op(op)).collect();
         let live_points = compute_live_points(&lowered);
         let deopt_spill_points = compute_deopt_spill_points(&lowered);
         let max_live = live_points
@@ -236,13 +236,13 @@ impl fmt::Display for TracePlanSummary<'_> {
 fn lower_op(op: &Op) -> LirOp {
     match op.opcode {
         OpCode::Label => LirOp::Label {
-            args: op.args.to_vec(),
+            args: op.getarglist().to_vec(),
         },
         OpCode::Jump => LirOp::Jump {
-            args: op.args.to_vec(),
+            args: op.getarglist().to_vec(),
         },
         OpCode::Finish => LirOp::Finish {
-            args: op.args.to_vec(),
+            args: op.getarglist().to_vec(),
         },
         OpCode::IntAdd
         | OpCode::IntAddOvf
@@ -256,22 +256,22 @@ fn lower_op(op: &Op) -> LirOp {
         | OpCode::IntLshift
         | OpCode::IntRshift
         | OpCode::UintRshift
-            if op.args.len() >= 2 =>
+            if op.num_args() >= 2 =>
         {
             LirOp::IntBin {
                 kind: int_bin_kind(op.opcode),
-                dst: op.pos,
-                lhs: op.args[0],
-                rhs: op.args[1],
+                dst: op.pos.get(),
+                lhs: op.arg(0),
+                rhs: op.arg(1),
             }
         }
         OpCode::IntNeg | OpCode::IntInvert | OpCode::IntIsTrue | OpCode::IntIsZero
-            if !op.args.is_empty() =>
+            if op.num_args() != 0 =>
         {
             LirOp::IntUnary {
                 kind: int_unary_kind(op.opcode),
-                dst: op.pos,
-                arg: op.args[0],
+                dst: op.pos.get(),
+                arg: op.arg(0),
             }
         }
         OpCode::IntLt
@@ -288,88 +288,88 @@ fn lower_op(op: &Op) -> LirOp {
         | OpCode::PtrNe
         | OpCode::InstancePtrEq
         | OpCode::InstancePtrNe
-            if op.args.len() >= 2 =>
+            if op.num_args() >= 2 =>
         {
             LirOp::IntCmp {
                 kind: int_cmp_kind(op.opcode),
-                dst: op.pos,
-                lhs: op.args[0],
-                rhs: op.args[1],
+                dst: op.pos.get(),
+                lhs: op.arg(0),
+                rhs: op.arg(1),
             }
         }
-        OpCode::GcLoadI | OpCode::GcLoadR | OpCode::GcLoadF if op.args.len() >= 2 => LirOp::Load {
+        OpCode::GcLoadI | OpCode::GcLoadR | OpCode::GcLoadF if op.num_args() >= 2 => LirOp::Load {
             kind: LoadKind::Gc,
-            dst: op.pos,
-            base: op.args[0],
-            offset: Some(op.args[1]),
+            dst: op.pos.get(),
+            base: op.arg(0),
+            offset: Some(op.arg(1)),
             index: None,
             scale: None,
-            size: op.args.get(2).copied(),
+            size: op.getarglist().get(2).copied(),
         },
         OpCode::GcLoadIndexedI | OpCode::GcLoadIndexedR | OpCode::GcLoadIndexedF
-            if op.args.len() >= 5 =>
+            if op.num_args() >= 5 =>
         {
             LirOp::Load {
                 kind: LoadKind::GcIndexed,
-                dst: op.pos,
-                base: op.args[0],
-                offset: Some(op.args[3]),
-                index: Some(op.args[1]),
-                scale: Some(op.args[2]),
-                size: Some(op.args[4]),
+                dst: op.pos.get(),
+                base: op.arg(0),
+                offset: Some(op.arg(3)),
+                index: Some(op.arg(1)),
+                scale: Some(op.arg(2)),
+                size: Some(op.arg(4)),
             }
         }
-        OpCode::RawLoadI | OpCode::RawLoadF if op.args.len() >= 2 => LirOp::Load {
+        OpCode::RawLoadI | OpCode::RawLoadF if op.num_args() >= 2 => LirOp::Load {
             kind: LoadKind::Raw,
-            dst: op.pos,
-            base: op.args[0],
-            offset: Some(op.args[1]),
+            dst: op.pos.get(),
+            base: op.arg(0),
+            offset: Some(op.arg(1)),
             index: None,
             scale: None,
             size: None,
         },
-        OpCode::GcStore if op.args.len() >= 4 => LirOp::Store {
+        OpCode::GcStore if op.num_args() >= 4 => LirOp::Store {
             kind: StoreKind::Gc,
-            base: op.args[0],
-            offset: Some(op.args[1]),
+            base: op.arg(0),
+            offset: Some(op.arg(1)),
             index: None,
             scale: None,
-            value: op.args[2],
-            size: Some(op.args[3]),
+            value: op.arg(2),
+            size: Some(op.arg(3)),
         },
-        OpCode::GcStoreIndexed if op.args.len() >= 6 => LirOp::Store {
+        OpCode::GcStoreIndexed if op.num_args() >= 6 => LirOp::Store {
             kind: StoreKind::GcIndexed,
-            base: op.args[0],
-            offset: Some(op.args[4]),
-            index: Some(op.args[1]),
-            scale: Some(op.args[3]),
-            value: op.args[2],
-            size: Some(op.args[5]),
+            base: op.arg(0),
+            offset: Some(op.arg(4)),
+            index: Some(op.arg(1)),
+            scale: Some(op.arg(3)),
+            value: op.arg(2),
+            size: Some(op.arg(5)),
         },
-        OpCode::RawStore if op.args.len() >= 3 => LirOp::Store {
+        OpCode::RawStore if op.num_args() >= 3 => LirOp::Store {
             kind: StoreKind::Raw,
-            base: op.args[0],
-            offset: Some(op.args[1]),
+            base: op.arg(0),
+            offset: Some(op.arg(1)),
             index: None,
             scale: None,
-            value: op.args[2],
+            value: op.arg(2),
             size: None,
         },
         opcode if opcode.is_guard() => LirOp::Guard {
             kind: guard_kind(opcode),
-            args: op.args.to_vec(),
-            fail_args: op.fail_args.as_deref().unwrap_or(&[]).to_vec(),
+            args: op.getarglist().to_vec(),
+            fail_args: op.getfailargs().map(|fa| fa.to_vec()).unwrap_or_default(),
         },
         opcode if opcode.is_call() => LirOp::Call {
             opcode,
             dst: result_ref(op),
-            args: op.args.to_vec(),
+            args: op.getarglist().to_vec(),
         },
         opcode => LirOp::Opcode {
             opcode,
             dst: result_ref(op),
-            args: op.args.to_vec(),
-            fail_args: op.fail_args.as_deref().unwrap_or(&[]).to_vec(),
+            args: op.getarglist().to_vec(),
+            fail_args: op.getfailargs().map(|fa| fa.to_vec()).unwrap_or_default(),
         },
     }
 }
@@ -490,10 +490,10 @@ fn guard_kind(opcode: OpCode) -> GuardKind {
 }
 
 fn result_ref(op: &Op) -> Option<OpRef> {
-    if op.pos.is_none() || op.opcode.result_type().is_void() {
+    if op.pos.get().is_none() || op.opcode.result_type().is_void() {
         None
     } else {
-        Some(op.pos)
+        Some(op.pos.get())
     }
 }
 
@@ -626,7 +626,7 @@ fn add_refs(live: &mut Vec<OpRef>, args: &[OpRef]) {
 
 #[cfg(test)]
 mod tests {
-    use majit_ir::{InputArg, Op, OpCode, OpRef, Type};
+    use majit_ir::{InputArg, Op, OpCode, OpRc, OpRef, Type};
 
     use super::{GuardKind, IntBinKind, IntCmpKind, LirOp, TracePlan};
 
@@ -637,26 +637,22 @@ mod tests {
         let c10 = OpRef::const_int(10);
 
         let mut label = Op::new(OpCode::Label, &[i0]);
-        label.pos = OpRef::int_op(10);
+        label.pos.set(OpRef::int_op(10));
 
         let mut add = Op::new(OpCode::IntAdd, &[i0, c1]);
-        add.pos = OpRef::int_op(1);
+        add.pos.set(OpRef::int_op(1));
 
         let mut lt = Op::new(OpCode::IntLt, &[OpRef::int_op(1), c10]);
-        lt.pos = OpRef::int_op(2);
+        lt.pos.set(OpRef::int_op(2));
 
         let mut guard = Op::new(OpCode::GuardTrue, &[OpRef::int_op(2)]);
-        guard.pos = OpRef::int_op(3);
-        guard.fail_args = Some(vec![OpRef::int_op(1)].into());
-
+        guard.pos.set(OpRef::int_op(3));
+        guard.setfailargs(vec![OpRef::int_op(1)].into());
         let mut jump = Op::new(OpCode::Jump, &[OpRef::int_op(1)]);
-        jump.pos = OpRef::int_op(4);
+        jump.pos.set(OpRef::int_op(4));
 
         let plan = TracePlan::build(
-            &[InputArg {
-                tp: Type::Int,
-                index: 0,
-            }],
+            &[InputArg::from_type(Type::Int, 0)],
             &[label, add, lt, guard, jump],
         );
 
@@ -691,23 +687,19 @@ mod tests {
         let c1 = OpRef::const_int(1);
 
         let mut add = Op::new(OpCode::IntAdd, &[i0, c1]);
-        add.pos = OpRef::int_op(1);
+        add.pos.set(OpRef::int_op(1));
 
         let mut is_true = Op::new(OpCode::IntIsTrue, &[OpRef::int_op(1)]);
-        is_true.pos = OpRef::int_op(2);
+        is_true.pos.set(OpRef::int_op(2));
 
         let mut guard = Op::new(OpCode::GuardTrue, &[OpRef::int_op(2)]);
-        guard.pos = OpRef::int_op(3);
-        guard.fail_args = Some(vec![OpRef::int_op(1)].into());
-
+        guard.pos.set(OpRef::int_op(3));
+        guard.setfailargs(vec![OpRef::int_op(1)].into());
         let mut finish = Op::new(OpCode::Finish, &[]);
-        finish.pos = OpRef::int_op(4);
+        finish.pos.set(OpRef::int_op(4));
 
         let plan = TracePlan::build(
-            &[InputArg {
-                tp: Type::Int,
-                index: 0,
-            }],
+            &[InputArg::from_type(Type::Int, 0)],
             &[add, is_true, guard, finish],
         );
 
@@ -734,23 +726,19 @@ mod tests {
         let c1 = OpRef::const_int(1);
 
         let mut add = Op::new(OpCode::IntAdd, &[i0, c1]);
-        add.pos = OpRef::int_op(1);
+        add.pos.set(OpRef::int_op(1));
 
         let mut is_true = Op::new(OpCode::IntIsTrue, &[OpRef::int_op(1)]);
-        is_true.pos = OpRef::int_op(2);
+        is_true.pos.set(OpRef::int_op(2));
 
         let mut guard = Op::new(OpCode::GuardTrue, &[OpRef::int_op(2)]);
-        guard.pos = OpRef::int_op(3);
-        guard.fail_args = Some(vec![OpRef::int_op(1)].into());
-
+        guard.pos.set(OpRef::int_op(3));
+        guard.setfailargs(vec![OpRef::int_op(1)].into());
         let mut jump = Op::new(OpCode::Jump, &[OpRef::int_op(1)]);
-        jump.pos = OpRef::int_op(4);
+        jump.pos.set(OpRef::int_op(4));
 
         let plan = TracePlan::build(
-            &[InputArg {
-                tp: Type::Int,
-                index: 0,
-            }],
+            &[InputArg::from_type(Type::Int, 0)],
             &[add, is_true, guard, jump],
         );
 
@@ -767,7 +755,7 @@ mod tests {
         let size = OpRef::const_int(8);
 
         let mut load = Op::new(OpCode::GcLoadIndexedI, &[base, index, scale, offset, size]);
-        load.pos = OpRef::int_op(3);
+        load.pos.set(OpRef::int_op(3));
         let store = Op::new(
             OpCode::GcStoreIndexed,
             &[base, index, value, scale, offset, size],
@@ -775,18 +763,9 @@ mod tests {
 
         let plan = TracePlan::build(
             &[
-                InputArg {
-                    tp: Type::Ref,
-                    index: base.raw(),
-                },
-                InputArg {
-                    tp: Type::Int,
-                    index: index.raw(),
-                },
-                InputArg {
-                    tp: Type::Int,
-                    index: value.raw(),
-                },
+                InputArg::from_type(Type::Ref, base.raw()),
+                InputArg::from_type(Type::Int, index.raw()),
+                InputArg::from_type(Type::Int, value.raw()),
             ],
             &[load, store],
         );
@@ -820,14 +799,11 @@ mod tests {
     fn lowers_misc_opcode_without_fallback() {
         let i0 = OpRef::int_op(0);
         let mut same_as = Op::new(OpCode::SameAsI, &[i0]);
-        same_as.pos = OpRef::int_op(1);
+        same_as.pos.set(OpRef::int_op(1));
         let debug = Op::new(OpCode::JitDebug, &[]);
 
         let plan = TracePlan::build(
-            &[InputArg {
-                tp: Type::Int,
-                index: i0.raw(),
-            }],
+            &[InputArg::from_type(Type::Int, i0.raw())],
             &[same_as, debug],
         );
 
@@ -853,18 +829,13 @@ mod tests {
     fn lowers_remaining_guard_kinds_without_fallback() {
         let i0 = OpRef::int_op(0);
         let mut is_object = Op::new(OpCode::GuardIsObject, &[i0]);
-        is_object.pos = OpRef::int_op(1);
-        is_object.fail_args = Some(vec![i0].into());
-
+        is_object.pos.set(OpRef::int_op(1));
+        is_object.setfailargs(vec![i0].into());
         let mut future = Op::new(OpCode::GuardFutureCondition, &[]);
-        future.pos = OpRef::int_op(2);
-        future.fail_args = Some(vec![i0].into());
-
+        future.pos.set(OpRef::int_op(2));
+        future.setfailargs(vec![i0].into());
         let plan = TracePlan::build(
-            &[InputArg {
-                tp: Type::Ref,
-                index: i0.raw(),
-            }],
+            &[InputArg::from_type(Type::Ref, i0.raw())],
             &[is_object, future],
         );
 

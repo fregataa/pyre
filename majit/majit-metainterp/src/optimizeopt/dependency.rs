@@ -4,10 +4,12 @@
 //! between operations in a loop body. Used by the vector optimizer to
 //! identify independent operations that can be packed into SIMD instructions.
 
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::BinaryHeap;
+
+use majit_ir::vec_set::VecSet;
 
 use crate::optimizeopt::schedule::Pack;
-use majit_ir::{Op, OpCode, OpRef};
+use majit_ir::{Op, OpCode, OpRc, OpRef};
 
 // ── dependency.py:15-50: LOAD/MODIFY_COMPLEX_OBJ tables ─────────
 
@@ -66,23 +68,23 @@ fn side_effect_arguments(
     if op.opcode.is_complex_modify() {
         // dependency.py:218-230: known complex modification patterns
         if let Some((obj_idx, cell_idx)) = modify_complex_obj_args(op.opcode) {
-            if obj_idx < op.args.len() {
-                if cell_idx >= 0 && (cell_idx as usize) < op.args.len() {
-                    result.push((op.args[obj_idx], Some(op.args[cell_idx as usize]), true));
-                    for j in (cell_idx as usize + 1)..op.args.len() {
-                        result.push((op.args[j], None, false));
+            if obj_idx < op.num_args() {
+                if cell_idx >= 0 && (cell_idx as usize) < op.num_args() {
+                    result.push((op.arg(obj_idx), Some(op.arg(cell_idx as usize)), true));
+                    for j in (cell_idx as usize + 1)..op.num_args() {
+                        result.push((op.arg(j), None, false));
                     }
                 } else {
-                    result.push((op.args[obj_idx], None, true));
-                    for j in (obj_idx + 1)..op.args.len() {
-                        result.push((op.args[j], None, false));
+                    result.push((op.arg(obj_idx), None, true));
+                    for j in (obj_idx + 1)..op.num_args() {
+                        result.push((op.arg(j), None, false));
                     }
                 }
             }
         }
     } else {
         // dependency.py:232-240: generic side effect
-        for arg in &op.args {
+        for arg in op.getarglist().iter() {
             // dependency.py:237: arg.is_constant() or arg.type == 'f' → not destroyed
             if arg.is_constant() || arg_type_of(*arg) == majit_ir::Type::Float {
                 result.push((*arg, None, false));
@@ -177,10 +179,8 @@ impl Node {
         if self.op.opcode.is_guard() {
             // dependency.py:203: descr = self.op.getdescr(); return descr.exits_early()
             self.op
-                .descr
-                .as_ref()
-                .and_then(|d| d.as_fail_descr())
-                .is_some_and(|fd| fd.exits_early())
+                .with_fail_descr(|fd| fd.exits_early())
+                .unwrap_or(false)
         } else {
             false
         }
@@ -202,13 +202,13 @@ impl Node {
 pub struct DependencyGraph {
     pub nodes: Vec<Node>,
     /// dependency.py:567: memory_refs — node index → MemoryRef
-    pub memory_refs: HashMap<usize, MemoryRef>,
+    pub memory_refs: crate::optimizeopt::vec_assoc::VecAssoc<usize, MemoryRef>,
     /// dependency.py:569: index_vars — OpRef → IndexVar
-    pub index_vars: HashMap<OpRef, IndexVar>,
+    pub index_vars: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, IndexVar>,
     /// dependency.py:571: guards — guard node indices
     pub guards: Vec<usize>,
     /// dependency.py:565: invariant_vars — loop-invariant variables
-    pub invariant_vars: HashMap<OpRef, ()>,
+    pub invariant_vars: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, ()>,
 }
 
 impl DependencyGraph {
@@ -223,10 +223,10 @@ impl DependencyGraph {
 
         let mut graph = DependencyGraph {
             nodes,
-            memory_refs: HashMap::new(),
-            index_vars: HashMap::new(),
+            memory_refs: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            index_vars: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             guards: Vec::new(),
-            invariant_vars: HashMap::new(),
+            invariant_vars: crate::optimizeopt::vec_assoc::VecAssoc::new(),
         };
 
         graph.build_dependencies(ops, constant_of);
@@ -259,13 +259,13 @@ impl DependencyGraph {
 
             // dependency.py:622-624: define result variable
             if op.opcode.result_type() != majit_ir::Type::Void {
-                tracker.define(op.pos, i);
+                tracker.define(op.pos.get(), i);
             }
 
             // dependency.py:626-644: build edges based on op type
             if op.opcode.is_always_pure() || op.opcode.is_final() {
                 // dependency.py:628-629: pure/final — depend on all args
-                let args: Vec<OpRef> = op.args.to_vec();
+                let args: Vec<OpRef> = op.getarglist().to_vec();
                 for arg in &args {
                     Self::depends_on_arg_static(&tracker, *arg, i, &mut self.nodes);
                 }
@@ -311,7 +311,7 @@ impl DependencyGraph {
             return;
         }
         // dependency.py:714-715: true dependencies on args
-        for arg in &op.args.to_vec() {
+        for arg in op.getarglist().iter() {
             Self::depends_on_arg_static(tracker, *arg, guard_idx, &mut self.nodes);
         }
         // dependency.py:717: guard_argument_protection
@@ -321,7 +321,7 @@ impl DependencyGraph {
             return;
         }
         // dependency.py:723-735: fail_args dependencies — iterate ALL redefinitions
-        if let Some(ref fail_args) = op.fail_args {
+        if let Some(fail_args) = op.getfailargs() {
             let fa = fail_args.to_vec();
             for arg in &fa {
                 if arg.is_none() {
@@ -345,7 +345,7 @@ impl DependencyGraph {
     fn guard_argument_protection(&mut self, guard_idx: usize, tracker: &mut DefTracker) {
         let op = self.nodes[guard_idx].op.clone();
         // dependency.py:657-664: redefine non-constant, non-int, non-float args (pointers)
-        for arg in &op.args.to_vec() {
+        for arg in op.getarglist().iter() {
             if arg.is_constant() || arg.is_none() {
                 continue;
             }
@@ -405,11 +405,11 @@ impl DependencyGraph {
             // dependency.py:742-751: LOAD_COMPLEX_OBJ dispatch
             // (opnum, complex_obj_arg_idx, index_arg_idx)
             let (cobj_idx, index_idx) = load_complex_obj_args(op.opcode);
-            if cobj_idx < op.args.len() {
-                let cobj = op.args[cobj_idx];
-                if index_idx >= 0 && (index_idx as usize) < op.args.len() {
+            if cobj_idx < op.num_args() {
+                let cobj = op.arg(cobj_idx);
+                if index_idx >= 0 && (index_idx as usize) < op.num_args() {
                     // dependency.py:747-748: argcell-aware depends_on
-                    let index_var = op.args[index_idx as usize];
+                    let index_var = op.arg(index_idx as usize);
                     Self::depends_on_arg_static(tracker, cobj, node_idx, &mut self.nodes);
                     Self::depends_on_arg_static(tracker, index_var, node_idx, &mut self.nodes);
                 } else {
@@ -424,7 +424,7 @@ impl DependencyGraph {
                 // Look up the defining op's result type
                 nodes_ref
                     .iter()
-                    .find(|n| n.op.pos == opref)
+                    .find(|n| n.op.pos.get() == opref)
                     .map(|n| n.op.opcode.result_type())
                     .unwrap_or(majit_ir::Type::Int)
             };
@@ -549,18 +549,21 @@ impl DependencyGraph {
     /// args come from independent sources (no data dependency between them).
     pub fn find_packable_groups(&self) -> Vec<Pack> {
         let mut groups: Vec<Pack> = Vec::new();
-        let mut used: HashSet<usize> = HashSet::new();
+        let mut used: VecSet<usize> = VecSet::new();
 
         // Group by opcode
-        let mut by_opcode: HashMap<OpCode, Vec<usize>> = HashMap::new();
+        let mut by_opcode: crate::optimizeopt::vec_assoc::VecAssoc<OpCode, Vec<usize>> =
+            crate::optimizeopt::vec_assoc::VecAssoc::new();
         for (i, node) in self.nodes.iter().enumerate() {
             if node.op.opcode.to_vector().is_some() && !node.op.opcode.is_guard() {
-                by_opcode.entry(node.op.opcode).or_default().push(i);
+                by_opcode
+                    .entry_or_insert_with(node.op.opcode, Vec::new)
+                    .push(i);
             }
         }
 
         // For each opcode, find independent pairs/groups
-        for (opcode, indices) in &by_opcode {
+        for (opcode, indices) in by_opcode.iter() {
             let vec_opcode = match opcode.to_vector() {
                 Some(v) => v,
                 None => continue,
@@ -801,14 +804,14 @@ impl IndexVar {
     /// In RPython this is `ConstInt(value)` — an inline constant box.
     /// In majit, constants need explicit OpRef allocation.
     pub fn get_operations(&self, mut next_const: impl FnMut(i64) -> OpRef) -> Vec<majit_ir::Op> {
-        use majit_ir::{Op, OpCode};
+        use majit_ir::{Op, OpCode, OpRc};
         let mut var = self.var;
         let mut tolist = Vec::new();
         if self.coefficient_mul != 1 {
             // dependency.py:1069: args = [var, ConstInt(self.coefficient_mul)]
             let c = next_const(self.coefficient_mul);
             let op = Op::new(OpCode::IntMul, &[var, c]);
-            var = op.pos;
+            var = op.pos.get();
             tolist.push(op);
         }
         // dependency.py:1072-1074: coefficient_div != 1 → assert 0
@@ -820,7 +823,7 @@ impl IndexVar {
             // dependency.py:1076: args = [var, ConstInt(self.constant)]
             let c = next_const(self.constant);
             let op = Op::new(OpCode::IntAdd, &[var, c]);
-            var = op.pos;
+            var = op.pos.get();
             tolist.push(op);
         }
         if self.constant < 0 {
@@ -829,7 +832,7 @@ impl IndexVar {
             let op = Op::new(OpCode::IntSub, &[var, c]);
             #[allow(unused_assignments)]
             {
-                var = op.pos;
+                var = op.pos.get();
             }
             tolist.push(op);
         }
@@ -853,7 +856,7 @@ impl IndexVar {
         let ops = self.get_operations(next_const);
         let mut last = self.var;
         for op in ops {
-            last = op.pos;
+            last = op.pos.get();
             new_ops.push(op);
         }
         last
@@ -1008,7 +1011,7 @@ impl Dependency {
 /// that define it, enabling def-use chain queries.
 pub struct DefTracker {
     /// OpRef → list of (defining node index, optional memory ref cell)
-    pub defs: HashMap<OpRef, Vec<(usize, Option<usize>)>>,
+    pub defs: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, Vec<(usize, Option<usize>)>>,
     /// Nodes with side effects (non-pure).
     pub non_pure: Vec<usize>,
 }
@@ -1016,7 +1019,7 @@ pub struct DefTracker {
 impl DefTracker {
     pub fn new(_graph: &DependencyGraph) -> Self {
         DefTracker {
-            defs: HashMap::new(),
+            defs: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             non_pure: Vec::new(),
         }
     }
@@ -1033,8 +1036,7 @@ impl DefTracker {
             return;
         }
         self.defs
-            .entry(arg)
-            .or_insert_with(Vec::new)
+            .entry_or_insert_with(arg, Vec::new)
             .push((node_idx, None));
     }
 
@@ -1080,9 +1082,9 @@ impl DefTracker {
 /// combinations, and recognizes array access patterns for MemoryRef.
 pub struct IntegralForwardModification<'a> {
     /// OpRef → IndexVar mapping
-    pub index_vars: HashMap<OpRef, IndexVar>,
+    pub index_vars: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, IndexVar>,
     /// Node index → MemoryRef mapping
-    pub memory_refs: HashMap<usize, MemoryRef>,
+    pub memory_refs: crate::optimizeopt::vec_assoc::VecAssoc<usize, MemoryRef>,
     /// Callback to resolve constant OpRef → i64 value.
     /// dependency.py:885-888: is_const_integral + box.getint()
     constant_of: &'a dyn Fn(OpRef) -> Option<i64>,
@@ -1091,8 +1093,8 @@ pub struct IntegralForwardModification<'a> {
 impl<'a> IntegralForwardModification<'a> {
     pub fn new(constant_of: &'a dyn Fn(OpRef) -> Option<i64>) -> Self {
         IntegralForwardModification {
-            index_vars: HashMap::new(),
-            memory_refs: HashMap::new(),
+            index_vars: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            memory_refs: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             constant_of,
         }
     }
@@ -1118,9 +1120,9 @@ impl<'a> IntegralForwardModification<'a> {
 
     /// dependency.py:896-920: operation_INT_ADD / operation_INT_SUB.
     fn inspect_additive(&mut self, op: &Op, is_sub: bool) {
-        let result = op.pos;
-        let a0 = op.args[0];
-        let a1 = op.args[1];
+        let result = op.pos.get();
+        let a0 = op.arg(0);
+        let a1 = op.arg(1);
         if Self::is_const(a0) && Self::is_const(a1) {
             let mut idx = IndexVar::new(result);
             let v0 = self.const_val(a0).unwrap_or(0);
@@ -1158,9 +1160,9 @@ impl<'a> IntegralForwardModification<'a> {
 
     /// dependency.py:922-948: operation_INT_MUL.
     fn inspect_multiplicative(&mut self, op: &Op) {
-        let result = op.pos;
-        let a0 = op.args[0];
-        let a1 = op.args[1];
+        let result = op.pos.get();
+        let a0 = op.arg(0);
+        let a1 = op.arg(1);
         if Self::is_const(a0) && Self::is_const(a1) {
             let mut idx = IndexVar::new(result);
             let v0 = self.const_val(a0).unwrap_or(0);
@@ -1189,13 +1191,13 @@ impl<'a> IntegralForwardModification<'a> {
     /// dependency.py:950-975: inspect array access ops.
     /// Only creates MemoryRef for primitive array accesses (dependency.py:954).
     fn inspect_array_access(&mut self, op: &Op, node_idx: usize, raw_access: bool) {
-        if op.args.len() < 2 {
+        if op.num_args() < 2 {
             return;
         }
-        let array = op.args[0];
-        let index = op.args[1];
+        let array = op.arg(0);
+        let index = op.arg(1);
         let idx_var = self.get_or_create(index);
-        if let Some(ref descr) = op.descr {
+        if let Some(descr) = op.getdescr() {
             // dependency.py:954: descr.is_array_of_primitives()
             let is_prim = descr
                 .as_array_descr()
@@ -1206,7 +1208,7 @@ impl<'a> IntegralForwardModification<'a> {
             }
             let mref = MemoryRef {
                 array,
-                descr: descr.clone(),
+                descr,
                 index_var: idx_var,
                 raw_access,
             };

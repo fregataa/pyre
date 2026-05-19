@@ -396,27 +396,27 @@ pub fn diff_recorded_ops(production: &[Op], shadow: &[Op]) -> Option<String> {
                 idx, p.opcode, s.opcode,
             ));
         }
-        if p.args.as_slice() != s.args.as_slice() {
+        if *p.getarglist() != *s.getarglist() {
             return Some(format!(
                 "shadow_walker: op[{}] ({:?}) args mismatch — \
                  production={:?}, shadow={:?}",
                 idx,
                 p.opcode,
-                p.args.as_slice(),
-                s.args.as_slice(),
+                &*p.getarglist(),
+                &*s.getarglist(),
             ));
         }
-        match (&p.descr, &s.descr) {
+        match (p.getdescr(), s.getdescr()) {
             (None, None) => {}
             (Some(pd), Some(sd)) => {
-                if !std::sync::Arc::ptr_eq(pd, sd) {
+                if !std::sync::Arc::ptr_eq(&pd, &sd) {
                     return Some(format!(
                         "shadow_walker: op[{}] ({:?}) descr identity mismatch — \
                          production={:p}, shadow={:p}",
                         idx,
                         p.opcode,
-                        std::sync::Arc::as_ptr(pd),
-                        std::sync::Arc::as_ptr(sd),
+                        std::sync::Arc::as_ptr(&pd),
+                        std::sync::Arc::as_ptr(&sd),
                     ));
                 }
             }
@@ -441,17 +441,12 @@ mod tests {
     use majit_ir::{DescrRef, OpCode, OpRef};
 
     fn op(opcode: OpCode, args: &[OpRef], descr: Option<DescrRef>) -> Op {
-        Op {
-            opcode,
-            args: args.iter().copied().collect(),
-            descr,
-            pos: OpRef::op_typed(0, opcode.result_type()),
-            type_: opcode.result_type(),
-            fail_args: None,
-            fail_arg_types: None,
-            rd_resume_position: -1,
-            vecinfo: None,
-        }
+        let mut op = match descr {
+            Some(d) => Op::with_descr(opcode, args, d),
+            None => Op::new(opcode, args),
+        };
+        op.pos.set(OpRef::op_typed(0, opcode.result_type()));
+        op
     }
 
     #[test]

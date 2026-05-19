@@ -6,13 +6,11 @@
 //!
 //! This is the RPython equivalent of `rpython/jit/metainterp/blackhole.py`.
 
-use std::collections::HashMap;
-
 use crate::jitexc::JitException;
 use crate::resume::{
     MaterializedVirtual, ResolvedPendingFieldWrite, ResumeData, ResumeDataExt, ResumeLayoutSummary,
 };
-use majit_ir::{GcRef, Op, OpCode};
+use majit_ir::{GcRef, Op, OpCode, OpRc, VecAssoc};
 
 /// blackhole.py:1068 parity: typed payload decoded from merge-point
 /// bytecode operands. Corresponds to the 6 lists in
@@ -187,8 +185,8 @@ pub enum BlackholeResult {
 #[allow(deprecated)]
 pub fn blackhole_execute(
     ops: &[Op],
-    constants: &HashMap<u32, i64>,
-    initial_values: &HashMap<u32, i64>,
+    constants: &VecAssoc<u32, i64>,
+    initial_values: &VecAssoc<u32, i64>,
     start_index: usize,
 ) -> BlackholeResult {
     blackhole_execute_with_exception(
@@ -206,8 +204,8 @@ pub fn blackhole_execute(
 #[deprecated(note = "use BlackholeInterpreter for RPython-parity jitcode execution")]
 pub fn blackhole_execute_with_memory(
     ops: &[Op],
-    constants: &HashMap<u32, i64>,
-    initial_values: &HashMap<u32, i64>,
+    constants: &VecAssoc<u32, i64>,
+    initial_values: &VecAssoc<u32, i64>,
     start_index: usize,
     memory: &dyn BlackholeMemory,
 ) -> BlackholeResult {
@@ -226,17 +224,17 @@ pub fn blackhole_execute_with_memory(
 /// RPython _run_forever parity: Jump loops back to Label.
 pub fn blackhole_execute_full(
     ops: &[Op],
-    constants: &HashMap<u32, i64>,
-    initial_values: &HashMap<u32, i64>,
+    constants: &VecAssoc<u32, i64>,
+    initial_values: &VecAssoc<u32, i64>,
     start_index: usize,
     initial_exception: ExceptionState,
     memory: &dyn BlackholeMemory,
 ) -> (BlackholeResult, ExceptionState) {
     let mut merged = initial_values.clone();
     for (&k, &v) in constants {
-        merged.entry(k).or_insert(v);
+        merged.entry_or_insert_with(k, || v);
     }
-    let mut tv = TraceValues::from_hashmap(&merged);
+    let mut tv = TraceValues::from_vec_assoc(&merged);
     drop(merged);
     let mut exc_state = initial_exception;
 
@@ -248,7 +246,7 @@ pub fn blackhole_execute_full(
         .unwrap_or(0);
     let label_inputarg_positions: Vec<u32> = ops
         .get(label_index)
-        .map(|op| op.args.iter().map(|a| a.raw()).collect())
+        .map(|op| op.getarglist().iter().map(|a| a.raw()).collect())
         .unwrap_or_default();
 
     let mut op_idx = start_index;
@@ -259,18 +257,15 @@ pub fn blackhole_execute_full(
 
         match result {
             OpResult::Value(v) => {
-                if !op.pos.is_none() {
-                    tv.set(op.pos.raw(), v);
+                if !op.pos.get().is_none() {
+                    tv.set(op.pos.get().raw(), v);
                 }
             }
             OpResult::Void => {}
             OpResult::Finish(args) => {
                 let vals: Vec<i64> = args.iter().map(|&r| tv.resolve(r)).collect();
                 let vtypes = op
-                    .descr
-                    .as_ref()
-                    .and_then(|d| d.as_fail_descr())
-                    .map(|fd| fd.fail_arg_types().to_vec())
+                    .with_fail_descr(|fd| fd.fail_arg_types().to_vec())
                     .unwrap_or_default();
                 return (
                     BlackholeResult::Finish {
@@ -291,7 +286,7 @@ pub fn blackhole_execute_full(
                 continue;
             }
             OpResult::GuardFailed => {
-                let fail_values = if let Some(ref fail_args) = op.fail_args {
+                let fail_values = if let Some(fail_args) = op.getfailargs() {
                     fail_args.iter().map(|&r| tv.resolve(r)).collect()
                 } else {
                     vec![]
@@ -327,144 +322,120 @@ fn execute_one_with_memory(
     match op.opcode {
         // Memory access ops with real backend
         OpCode::GcLoadI => {
-            let base = values.resolve(op.args[0]);
-            let offset = values.resolve(op.args[1]);
+            let base = values.resolve(op.arg(0));
+            let offset = values.resolve(op.arg(1));
             OpResult::Value(memory.gc_load_i(base, offset))
         }
         OpCode::GcLoadR => {
-            let base = values.resolve(op.args[0]);
-            let offset = values.resolve(op.args[1]);
+            let base = values.resolve(op.arg(0));
+            let offset = values.resolve(op.arg(1));
             OpResult::Value(memory.gc_load_r(base, offset))
         }
         OpCode::GcLoadF => {
-            let base = values.resolve(op.args[0]);
-            let offset = values.resolve(op.args[1]);
+            let base = values.resolve(op.arg(0));
+            let offset = values.resolve(op.arg(1));
             OpResult::Value(memory.gc_load_f(base, offset))
         }
         OpCode::GcStore => {
-            let base = values.resolve(op.args[0]);
-            let offset = values.resolve(op.args[1]);
-            let value = values.resolve(op.args[2]);
+            let base = values.resolve(op.arg(0));
+            let offset = values.resolve(op.arg(1));
+            let value = values.resolve(op.arg(2));
             memory.gc_store(base, offset, value);
             OpResult::Void
         }
         OpCode::GcLoadIndexedI => {
-            let base = values.resolve(op.args[0]);
-            let index = values.resolve(op.args[1]);
-            let scale = values.resolve(op.args[2]);
-            let offset = values.resolve(op.args[3]);
+            let base = values.resolve(op.arg(0));
+            let index = values.resolve(op.arg(1));
+            let scale = values.resolve(op.arg(2));
+            let offset = values.resolve(op.arg(3));
             OpResult::Value(memory.gc_load_indexed_i(base, index, scale, offset))
         }
         OpCode::GcLoadIndexedR => {
-            let base = values.resolve(op.args[0]);
-            let index = values.resolve(op.args[1]);
-            let scale = values.resolve(op.args[2]);
-            let offset = values.resolve(op.args[3]);
+            let base = values.resolve(op.arg(0));
+            let index = values.resolve(op.arg(1));
+            let scale = values.resolve(op.arg(2));
+            let offset = values.resolve(op.arg(3));
             OpResult::Value(memory.gc_load_indexed_r(base, index, scale, offset))
         }
         OpCode::GcLoadIndexedF => {
-            let base = values.resolve(op.args[0]);
-            let index = values.resolve(op.args[1]);
-            let scale = values.resolve(op.args[2]);
-            let offset = values.resolve(op.args[3]);
+            let base = values.resolve(op.arg(0));
+            let index = values.resolve(op.arg(1));
+            let scale = values.resolve(op.arg(2));
+            let offset = values.resolve(op.arg(3));
             OpResult::Value(memory.gc_load_indexed_f(base, index, scale, offset))
         }
         OpCode::GcStoreIndexed => {
-            let base = values.resolve(op.args[0]);
-            let index = values.resolve(op.args[1]);
-            let value = values.resolve(op.args[2]);
-            let scale = values.resolve(op.args[3]);
-            let offset = values.resolve(op.args[4]);
+            let base = values.resolve(op.arg(0));
+            let index = values.resolve(op.arg(1));
+            let value = values.resolve(op.arg(2));
+            let scale = values.resolve(op.arg(3));
+            let offset = values.resolve(op.arg(4));
             memory.gc_store_indexed(base, index, scale, offset, value);
             OpResult::Void
         }
         OpCode::ArraylenGc => {
-            let base = values.resolve(op.args[0]);
+            let base = values.resolve(op.arg(0));
             OpResult::Value(memory.arraylen(base))
         }
         OpCode::Strlen | OpCode::Unicodelen => {
-            let base = values.resolve(op.args[0]);
+            let base = values.resolve(op.arg(0));
             OpResult::Value(memory.strlen(base))
         }
         // ── Field access via descr offset ──
         OpCode::GetfieldGcI | OpCode::GetfieldRawI | OpCode::GetfieldGcPureI => {
-            let base = values.resolve(op.args[0]);
-            let offset = op
-                .descr
-                .as_ref()
-                .and_then(|d| d.as_field_descr())
-                .map_or(0, |f| f.offset() as i64);
+            let base = values.resolve(op.arg(0));
+            let offset = op.with_field_descr(|f| f.offset() as i64).unwrap_or(0);
             OpResult::Value(memory.gc_load_i(base, offset))
         }
         OpCode::GetfieldGcR | OpCode::GetfieldRawR | OpCode::GetfieldGcPureR => {
-            let base = values.resolve(op.args[0]);
-            let offset = op
-                .descr
-                .as_ref()
-                .and_then(|d| d.as_field_descr())
-                .map_or(0, |f| f.offset() as i64);
+            let base = values.resolve(op.arg(0));
+            let offset = op.with_field_descr(|f| f.offset() as i64).unwrap_or(0);
             OpResult::Value(memory.gc_load_r(base, offset))
         }
         OpCode::GetfieldGcF | OpCode::GetfieldRawF | OpCode::GetfieldGcPureF => {
-            let base = values.resolve(op.args[0]);
-            let offset = op
-                .descr
-                .as_ref()
-                .and_then(|d| d.as_field_descr())
-                .map_or(0, |f| f.offset() as i64);
+            let base = values.resolve(op.arg(0));
+            let offset = op.with_field_descr(|f| f.offset() as i64).unwrap_or(0);
             OpResult::Value(memory.gc_load_f(base, offset))
         }
         OpCode::SetfieldGc | OpCode::SetfieldRaw => {
-            let base = values.resolve(op.args[0]);
-            let value = values.resolve(op.args[1]);
-            let offset = op
-                .descr
-                .as_ref()
-                .and_then(|d| d.as_field_descr())
-                .map_or(0, |f| f.offset() as i64);
+            let base = values.resolve(op.arg(0));
+            let value = values.resolve(op.arg(1));
+            let offset = op.with_field_descr(|f| f.offset() as i64).unwrap_or(0);
             memory.gc_store(base, offset, value);
             OpResult::Void
         }
         // ── Array access via descr ──
         OpCode::GetarrayitemGcI | OpCode::GetarrayitemRawI | OpCode::GetarrayitemGcPureI => {
-            let base = values.resolve(op.args[0]);
-            let index = values.resolve(op.args[1]);
+            let base = values.resolve(op.arg(0));
+            let index = values.resolve(op.arg(1));
             let (item_size, base_ofs) = op
-                .descr
-                .as_ref()
-                .and_then(|d| d.as_array_descr())
-                .map_or((1, 0), |a| (a.item_size() as i64, a.base_size() as i64));
+                .with_array_descr(|a| (a.item_size() as i64, a.base_size() as i64))
+                .unwrap_or((1, 0));
             OpResult::Value(memory.gc_load_indexed_i(base, index, item_size, base_ofs))
         }
         OpCode::GetarrayitemGcR | OpCode::GetarrayitemRawR | OpCode::GetarrayitemGcPureR => {
-            let base = values.resolve(op.args[0]);
-            let index = values.resolve(op.args[1]);
+            let base = values.resolve(op.arg(0));
+            let index = values.resolve(op.arg(1));
             let (item_size, base_ofs) = op
-                .descr
-                .as_ref()
-                .and_then(|d| d.as_array_descr())
-                .map_or((1, 0), |a| (a.item_size() as i64, a.base_size() as i64));
+                .with_array_descr(|a| (a.item_size() as i64, a.base_size() as i64))
+                .unwrap_or((1, 0));
             OpResult::Value(memory.gc_load_indexed_r(base, index, item_size, base_ofs))
         }
         OpCode::GetarrayitemGcF | OpCode::GetarrayitemRawF | OpCode::GetarrayitemGcPureF => {
-            let base = values.resolve(op.args[0]);
-            let index = values.resolve(op.args[1]);
+            let base = values.resolve(op.arg(0));
+            let index = values.resolve(op.arg(1));
             let (item_size, base_ofs) = op
-                .descr
-                .as_ref()
-                .and_then(|d| d.as_array_descr())
-                .map_or((1, 0), |a| (a.item_size() as i64, a.base_size() as i64));
+                .with_array_descr(|a| (a.item_size() as i64, a.base_size() as i64))
+                .unwrap_or((1, 0));
             OpResult::Value(memory.gc_load_indexed_f(base, index, item_size, base_ofs))
         }
         OpCode::SetarrayitemGc | OpCode::SetarrayitemRaw => {
-            let base = values.resolve(op.args[0]);
-            let index = values.resolve(op.args[1]);
-            let value = values.resolve(op.args[2]);
+            let base = values.resolve(op.arg(0));
+            let index = values.resolve(op.arg(1));
+            let value = values.resolve(op.arg(2));
             let (item_size, base_ofs) = op
-                .descr
-                .as_ref()
-                .and_then(|d| d.as_array_descr())
-                .map_or((1, 0), |a| (a.item_size() as i64, a.base_size() as i64));
+                .with_array_descr(|a| (a.item_size() as i64, a.base_size() as i64))
+                .unwrap_or((1, 0));
             memory.gc_store_indexed(base, index, item_size, base_ofs, value);
             OpResult::Void
         }
@@ -474,13 +445,19 @@ fn execute_one_with_memory(
         | OpCode::CallMayForceI
         | OpCode::CallReleaseGilI
         | OpCode::CallLoopinvariantI => {
-            let func = values.resolve(op.args[0]);
-            let args: Vec<i64> = op.args[1..].iter().map(|&r| values.resolve(r)).collect();
+            let func = values.resolve(op.arg(0));
+            let args: Vec<i64> = op.getarglist()[1..]
+                .iter()
+                .map(|&r| values.resolve(r))
+                .collect();
             OpResult::Value(memory.call_i(func, &args))
         }
         OpCode::CallR | OpCode::CallPureR | OpCode::CallMayForceR | OpCode::CallLoopinvariantR => {
-            let func = values.resolve(op.args[0]);
-            let args: Vec<i64> = op.args[1..].iter().map(|&r| values.resolve(r)).collect();
+            let func = values.resolve(op.arg(0));
+            let args: Vec<i64> = op.getarglist()[1..]
+                .iter()
+                .map(|&r| values.resolve(r))
+                .collect();
             OpResult::Value(memory.call_r(func, &args))
         }
         OpCode::CallF
@@ -488,8 +465,11 @@ fn execute_one_with_memory(
         | OpCode::CallMayForceF
         | OpCode::CallReleaseGilF
         | OpCode::CallLoopinvariantF => {
-            let func = values.resolve(op.args[0]);
-            let args: Vec<i64> = op.args[1..].iter().map(|&r| values.resolve(r)).collect();
+            let func = values.resolve(op.arg(0));
+            let args: Vec<i64> = op.getarglist()[1..]
+                .iter()
+                .map(|&r| values.resolve(r))
+                .collect();
             OpResult::Value(memory.call_f(func, &args))
         }
         OpCode::CallN
@@ -497,47 +477,71 @@ fn execute_one_with_memory(
         | OpCode::CallMayForceN
         | OpCode::CallReleaseGilN
         | OpCode::CallLoopinvariantN => {
-            let func = values.resolve(op.args[0]);
-            let args: Vec<i64> = op.args[1..].iter().map(|&r| values.resolve(r)).collect();
+            let func = values.resolve(op.arg(0));
+            let args: Vec<i64> = op.getarglist()[1..]
+                .iter()
+                .map(|&r| values.resolve(r))
+                .collect();
             memory.call_n(func, &args);
             OpResult::Void
         }
         // CallAssembler — delegate to call dispatch
         OpCode::CallAssemblerI => {
-            let func = values.resolve(op.args[0]);
-            let args: Vec<i64> = op.args[1..].iter().map(|&r| values.resolve(r)).collect();
+            let func = values.resolve(op.arg(0));
+            let args: Vec<i64> = op.getarglist()[1..]
+                .iter()
+                .map(|&r| values.resolve(r))
+                .collect();
             OpResult::Value(memory.call_i(func, &args))
         }
         OpCode::CallAssemblerR => {
-            let func = values.resolve(op.args[0]);
-            let args: Vec<i64> = op.args[1..].iter().map(|&r| values.resolve(r)).collect();
+            let func = values.resolve(op.arg(0));
+            let args: Vec<i64> = op.getarglist()[1..]
+                .iter()
+                .map(|&r| values.resolve(r))
+                .collect();
             OpResult::Value(memory.call_r(func, &args))
         }
         OpCode::CallAssemblerF => {
-            let func = values.resolve(op.args[0]);
-            let args: Vec<i64> = op.args[1..].iter().map(|&r| values.resolve(r)).collect();
+            let func = values.resolve(op.arg(0));
+            let args: Vec<i64> = op.getarglist()[1..]
+                .iter()
+                .map(|&r| values.resolve(r))
+                .collect();
             OpResult::Value(memory.call_f(func, &args))
         }
         OpCode::CallAssemblerN => {
-            let func = values.resolve(op.args[0]);
-            let args: Vec<i64> = op.args[1..].iter().map(|&r| values.resolve(r)).collect();
+            let func = values.resolve(op.arg(0));
+            let args: Vec<i64> = op.getarglist()[1..]
+                .iter()
+                .map(|&r| values.resolve(r))
+                .collect();
             memory.call_n(func, &args);
             OpResult::Void
         }
         // CondCallValue — delegate to call dispatch
         OpCode::CondCallValueI => {
-            let func = values.resolve(op.args[0]);
-            let args: Vec<i64> = op.args[1..].iter().map(|&r| values.resolve(r)).collect();
+            let func = values.resolve(op.arg(0));
+            let args: Vec<i64> = op.getarglist()[1..]
+                .iter()
+                .map(|&r| values.resolve(r))
+                .collect();
             OpResult::Value(memory.call_i(func, &args))
         }
         OpCode::CondCallValueR => {
-            let func = values.resolve(op.args[0]);
-            let args: Vec<i64> = op.args[1..].iter().map(|&r| values.resolve(r)).collect();
+            let func = values.resolve(op.arg(0));
+            let args: Vec<i64> = op.getarglist()[1..]
+                .iter()
+                .map(|&r| values.resolve(r))
+                .collect();
             OpResult::Value(memory.call_r(func, &args))
         }
         OpCode::CondCallN => {
-            let func = values.resolve(op.args[0]);
-            let args: Vec<i64> = op.args[1..].iter().map(|&r| values.resolve(r)).collect();
+            let func = values.resolve(op.arg(0));
+            let args: Vec<i64> = op.getarglist()[1..]
+                .iter()
+                .map(|&r| values.resolve(r))
+                .collect();
             memory.call_n(func, &args);
             OpResult::Void
         }
@@ -556,8 +560,8 @@ pub type CallAssemblerFn = dyn Fn(i64) -> i64;
 
 pub(crate) fn blackhole_execute_with_state(
     ops: &[Op],
-    constants: &HashMap<u32, i64>,
-    initial_values: &HashMap<u32, i64>,
+    constants: &VecAssoc<u32, i64>,
+    initial_values: &VecAssoc<u32, i64>,
     start_index: usize,
     initial_exception: ExceptionState,
 ) -> (BlackholeResult, ExceptionState) {
@@ -573,17 +577,17 @@ pub(crate) fn blackhole_execute_with_state(
 
 pub(crate) fn blackhole_execute_with_state_ca(
     ops: &[Op],
-    constants: &HashMap<u32, i64>,
-    initial_values: &HashMap<u32, i64>,
+    constants: &VecAssoc<u32, i64>,
+    initial_values: &VecAssoc<u32, i64>,
     start_index: usize,
     initial_exception: ExceptionState,
     call_assembler_fn: Option<&CallAssemblerFn>,
 ) -> (BlackholeResult, ExceptionState) {
     let mut merged = initial_values.clone();
     for (&k, &v) in constants {
-        merged.entry(k).or_insert(v);
+        merged.entry_or_insert_with(k, || v);
     }
-    let mut tv = TraceValues::from_hashmap(&merged);
+    let mut tv = TraceValues::from_vec_assoc(&merged);
     drop(merged);
     let mut exc_state = initial_exception;
 
@@ -611,7 +615,7 @@ pub(crate) fn blackhole_execute_with_state_ca(
         let guard_idx = start_index.saturating_sub(1);
         let fail_values = ops
             .get(guard_idx)
-            .and_then(|op| op.fail_args.as_ref())
+            .and_then(|op| op.getfailargs())
             .map(|args| {
                 args.iter()
                     .map(|a| {
@@ -642,7 +646,7 @@ pub(crate) fn blackhole_execute_with_state_ca(
     // Label's args define the loop's inputargs (their OpRef positions).
     let label_inputarg_positions: Vec<u32> = ops
         .get(label_index)
-        .map(|op| op.args.iter().map(|a| a.raw()).collect())
+        .map(|op| op.getarglist().iter().map(|a| a.raw()).collect())
         .unwrap_or_default();
 
     let mut op_idx = start_index;
@@ -654,8 +658,8 @@ pub(crate) fn blackhole_execute_with_state_ca(
 
         match result {
             OpResult::Value(v) => {
-                if !op.pos.is_none() {
-                    tv.set(op.pos.raw(), v);
+                if !op.pos.get().is_none() {
+                    tv.set(op.pos.get().raw(), v);
                 }
             }
             OpResult::Void => {}
@@ -665,19 +669,16 @@ pub(crate) fn blackhole_execute_with_state_ca(
                 if call_assembler_fn.is_some() && op.opcode.is_call_assembler() =>
             {
                 let ca_fn = call_assembler_fn.unwrap();
-                let frame_ptr = tv.resolve(op.args[0]);
+                let frame_ptr = tv.resolve(op.arg(0));
                 let result = ca_fn(frame_ptr);
-                if !op.pos.is_none() {
-                    tv.set(op.pos.raw(), result);
+                if !op.pos.get().is_none() {
+                    tv.set(op.pos.get().raw(), result);
                 }
             }
             OpResult::Finish(args) => {
                 let vals: Vec<i64> = args.iter().map(|&r| tv.resolve(r)).collect();
                 let vtypes = op
-                    .descr
-                    .as_ref()
-                    .and_then(|d| d.as_fail_descr())
-                    .map(|fd| fd.fail_arg_types().to_vec())
+                    .with_fail_descr(|fd| fd.fail_arg_types().to_vec())
                     .unwrap_or_default();
                 return (
                     BlackholeResult::Finish {
@@ -699,7 +700,7 @@ pub(crate) fn blackhole_execute_with_state_ca(
                 continue;
             }
             OpResult::GuardFailed => {
-                let fail_values = if let Some(ref fail_args) = op.fail_args {
+                let fail_values = if let Some(fail_args) = op.getfailargs() {
                     fail_args.iter().map(|&r| tv.resolve(r)).collect()
                 } else {
                     vec![]
@@ -732,8 +733,8 @@ pub(crate) fn blackhole_execute_with_state_ca(
 #[deprecated(note = "use BlackholeInterpreter for RPython-parity jitcode execution")]
 pub fn blackhole_execute_with_exception(
     ops: &[Op],
-    constants: &HashMap<u32, i64>,
-    initial_values: &HashMap<u32, i64>,
+    constants: &VecAssoc<u32, i64>,
+    initial_values: &VecAssoc<u32, i64>,
     start_index: usize,
     initial_exception: ExceptionState,
 ) -> BlackholeResult {
@@ -751,8 +752,8 @@ pub fn blackhole_execute_with_exception(
 #[deprecated(note = "use BlackholeInterpreter for RPython-parity jitcode execution")]
 pub fn blackhole_with_virtuals(
     ops: &[Op],
-    constants: &HashMap<u32, i64>,
-    initial_values: &HashMap<u32, i64>,
+    constants: &VecAssoc<u32, i64>,
+    initial_values: &VecAssoc<u32, i64>,
     start_index: usize,
     resume_data: Option<&ResumeData>,
 ) -> BlackholeResult {
@@ -770,8 +771,8 @@ pub fn blackhole_with_virtuals(
 #[deprecated(note = "use BlackholeInterpreter for RPython-parity jitcode execution")]
 pub fn blackhole_with_resume_layout(
     ops: &[Op],
-    constants: &HashMap<u32, i64>,
-    initial_values: &HashMap<u32, i64>,
+    constants: &VecAssoc<u32, i64>,
+    initial_values: &VecAssoc<u32, i64>,
     start_index: usize,
     resume_layout: Option<&ResumeLayoutSummary>,
 ) -> BlackholeResult {
@@ -787,8 +788,8 @@ pub fn blackhole_with_resume_layout(
 
 fn blackhole_with_recovery_layout(
     ops: &[Op],
-    constants: &HashMap<u32, i64>,
-    initial_values: &HashMap<u32, i64>,
+    constants: &VecAssoc<u32, i64>,
+    initial_values: &VecAssoc<u32, i64>,
     start_index: usize,
     resume_data: Option<&ResumeData>,
     resume_layout: Option<&ResumeLayoutSummary>,
@@ -2490,7 +2491,7 @@ impl BlackholeInterpBuilder {
     /// assembler's `insns` dict. For now, all dispatch table entries are
     /// placeholder handlers — real `bhimpl_*` methods are wired in
     /// incrementally as Phase D progresses.
-    pub fn setup_insns(&mut self, insns: &std::collections::HashMap<String, u8>) {
+    pub fn setup_insns(&mut self, insns: &majit_ir::vec_assoc::VecAssoc<String, u8>) {
         assert!(insns.len() <= 256, "too many instructions!");
         // RPython blackhole.py:68-71: build reverse table.
         //
@@ -3101,7 +3102,7 @@ mod tests {
 
     fn mk_op(opcode: OpCode, args: &[OpRef], pos: u32) -> Op {
         let mut op = Op::new(opcode, args);
-        op.pos = OpRef::int_op(pos);
+        op.pos.set(OpRef::int_op(pos));
         op
     }
 
@@ -3116,11 +3117,11 @@ mod tests {
             mk_op(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)], 2),
             mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
-        let mut initial = HashMap::new();
+        let mut initial: VecAssoc<u32, i64> = VecAssoc::new();
         initial.insert(0, 10i64);
         initial.insert(1, 20i64);
 
-        match blackhole_execute(&ops, &HashMap::new(), &initial, 0) {
+        match blackhole_execute(&ops, &VecAssoc::new(), &initial, 0) {
             BlackholeResult::Finish { values: vals, .. } => assert_eq!(vals, vec![30]),
             other => panic!(
                 "expected Finish, got {:?}",
@@ -3139,10 +3140,10 @@ mod tests {
             mk_op(OpCode::GuardTrue, &[OpRef::int_op(0)], OpRef::NONE.raw()),
             mk_op(OpCode::Finish, &[OpRef::int_op(0)], OpRef::NONE.raw()),
         ];
-        let mut initial = HashMap::new();
+        let mut initial: VecAssoc<u32, i64> = VecAssoc::new();
         initial.insert(0, 1i64);
 
-        match blackhole_execute(&ops, &HashMap::new(), &initial, 0) {
+        match blackhole_execute(&ops, &VecAssoc::new(), &initial, 0) {
             BlackholeResult::Finish { values: vals, .. } => assert_eq!(vals, vec![1]),
             _ => panic!("expected Finish"),
         }
@@ -3155,10 +3156,10 @@ mod tests {
             mk_op(OpCode::GuardNoException, &[], OpRef::NONE.raw()),
             mk_op(OpCode::Finish, &[OpRef::int_op(0)], OpRef::NONE.raw()),
         ];
-        let mut initial = HashMap::new();
+        let mut initial: VecAssoc<u32, i64> = VecAssoc::new();
         initial.insert(0, 42i64);
 
-        match blackhole_execute(&ops, &HashMap::new(), &initial, 0) {
+        match blackhole_execute(&ops, &VecAssoc::new(), &initial, 0) {
             BlackholeResult::Finish { values: vals, .. } => assert_eq!(vals, vec![42]),
             _ => panic!("expected Finish when no exception is pending"),
         }
@@ -3167,19 +3168,18 @@ mod tests {
     #[test]
     fn test_blackhole_initial_exception_fails_guard_no_exception_without_restore() {
         let mut guard_op = mk_op(OpCode::GuardNoException, &[], OpRef::NONE.raw());
-        guard_op.fail_args = Some(smallvec::smallvec![OpRef::int_op(0)]);
-
+        guard_op.setfailargs(smallvec::smallvec![OpRef::int_op(0)]);
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::int_op(0)], OpRef::NONE.raw()),
             guard_op,
             mk_op(OpCode::Finish, &[OpRef::int_op(0)], OpRef::NONE.raw()),
         ];
-        let mut initial = HashMap::new();
+        let mut initial: VecAssoc<u32, i64> = VecAssoc::new();
         initial.insert(0, 42i64);
 
         match blackhole_execute_with_exception(
             &ops,
-            &HashMap::new(),
+            &VecAssoc::new(),
             &initial,
             0,
             ExceptionState {
@@ -3200,12 +3200,12 @@ mod tests {
             mk_op(OpCode::GuardException, &[OpRef::int_op(0)], 1),
             mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
-        let mut initial = HashMap::new();
+        let mut initial: VecAssoc<u32, i64> = VecAssoc::new();
         initial.insert(0, 100i64);
 
         match blackhole_execute_with_exception(
             &ops,
-            &HashMap::new(),
+            &VecAssoc::new(),
             &initial,
             0,
             ExceptionState {
@@ -3241,11 +3241,11 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-        let mut initial = HashMap::new();
+        let mut initial: VecAssoc<u32, i64> = VecAssoc::new();
         initial.insert(0, 100i64); // exc_class
         initial.insert(1, 200i64); // exc_value
 
-        match blackhole_execute(&ops, &HashMap::new(), &initial, 0) {
+        match blackhole_execute(&ops, &VecAssoc::new(), &initial, 0) {
             BlackholeResult::Finish { values: vals, .. } => assert_eq!(vals, vec![100, 200]),
             _ => panic!("expected Finish"),
         }
@@ -3255,8 +3255,7 @@ mod tests {
     fn test_blackhole_guard_no_exception_fails_with_exception() {
         // RestoreException then GuardNoException should fail.
         let mut guard_op = mk_op(OpCode::GuardNoException, &[], OpRef::NONE.raw());
-        guard_op.fail_args = Some(smallvec::smallvec![OpRef::int_op(0)]);
-
+        guard_op.setfailargs(smallvec::smallvec![OpRef::int_op(0)]);
         let ops = vec![
             mk_op(
                 OpCode::Label,
@@ -3271,11 +3270,11 @@ mod tests {
             guard_op,
             mk_op(OpCode::Finish, &[OpRef::int_op(0)], OpRef::NONE.raw()),
         ];
-        let mut initial = HashMap::new();
+        let mut initial: VecAssoc<u32, i64> = VecAssoc::new();
         initial.insert(0, 100i64);
         initial.insert(1, 200i64);
 
-        match blackhole_execute(&ops, &HashMap::new(), &initial, 0) {
+        match blackhole_execute(&ops, &VecAssoc::new(), &initial, 0) {
             BlackholeResult::GuardFailed { .. } => {} // expected
             _ => panic!("expected GuardFailed when exception is pending"),
         }
@@ -3299,11 +3298,11 @@ mod tests {
             mk_op(OpCode::GuardException, &[OpRef::int_op(0)], 2),
             mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
-        let mut initial = HashMap::new();
+        let mut initial: VecAssoc<u32, i64> = VecAssoc::new();
         initial.insert(0, 100i64); // exc_class
         initial.insert(1, 200i64); // exc_value
 
-        match blackhole_execute(&ops, &HashMap::new(), &initial, 0) {
+        match blackhole_execute(&ops, &VecAssoc::new(), &initial, 0) {
             BlackholeResult::Finish { values: vals, .. } => {
                 // GuardException should return the exc_value
                 assert_eq!(vals, vec![200]);
@@ -3315,17 +3314,16 @@ mod tests {
     #[test]
     fn test_blackhole_guard_fails() {
         let mut guard_op = mk_op(OpCode::GuardTrue, &[OpRef::int_op(0)], OpRef::NONE.raw());
-        guard_op.fail_args = Some(smallvec::smallvec![OpRef::int_op(0)]);
-
+        guard_op.setfailargs(smallvec::smallvec![OpRef::int_op(0)]);
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::int_op(0)], OpRef::NONE.raw()),
             guard_op,
             mk_op(OpCode::Finish, &[OpRef::int_op(0)], OpRef::NONE.raw()),
         ];
-        let mut initial = HashMap::new();
+        let mut initial: VecAssoc<u32, i64> = VecAssoc::new();
         initial.insert(0, 0i64);
 
-        match blackhole_execute(&ops, &HashMap::new(), &initial, 0) {
+        match blackhole_execute(&ops, &VecAssoc::new(), &initial, 0) {
             BlackholeResult::GuardFailed { fail_values, .. } => {
                 assert_eq!(fail_values, vec![0]);
             }
@@ -3349,10 +3347,10 @@ mod tests {
             mk_op(opcode, &[OpRef::int_op(0), OpRef::int_op(1)], 2),
             mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
-        let mut initial = HashMap::new();
+        let mut initial: VecAssoc<u32, i64> = VecAssoc::new();
         initial.insert(0, a);
         initial.insert(1, b);
-        match blackhole_execute(&ops, &HashMap::new(), &initial, 0) {
+        match blackhole_execute(&ops, &VecAssoc::new(), &initial, 0) {
             BlackholeResult::Finish { values, .. } => values[0],
             other => panic!(
                 "expected Finish for {:?}, got {:?}",
@@ -3372,9 +3370,9 @@ mod tests {
             mk_op(opcode, &[OpRef::int_op(0)], 1),
             mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
-        let mut initial = HashMap::new();
+        let mut initial: VecAssoc<u32, i64> = VecAssoc::new();
         initial.insert(0, a);
-        match blackhole_execute(&ops, &HashMap::new(), &initial, 0) {
+        match blackhole_execute(&ops, &VecAssoc::new(), &initial, 0) {
             BlackholeResult::Finish { values, .. } => values[0],
             other => panic!(
                 "expected Finish for {:?}, got {:?}",
@@ -3602,7 +3600,7 @@ mod tests {
     #[test]
     fn test_executor_same_as_zero_arg_constant_placeholder() {
         let op = mk_op(OpCode::SameAsI, &[], 8);
-        let mut values = HashMap::new();
+        let mut values: VecAssoc<u32, i64> = VecAssoc::new();
         values.insert(8, 123);
         let mut exc = ExceptionState::default();
         match execute_one(&op, &values, &mut exc) {
@@ -3822,12 +3820,12 @@ mod tests {
             OpRef::int_op(10_001),
             OpRef::int_op(10_002),
         ];
-        let mut constants = HashMap::new();
+        let mut constants: VecAssoc<u32, i64> = VecAssoc::new();
         constants.insert(10_000, 1i64);
         constants.insert(10_001, 2i64);
         constants.insert(10_002, 3i64);
 
-        let mut values: HashMap<u32, i64> = constants.clone();
+        let mut values: VecAssoc<u32, i64> = constants.clone();
         let mut exc = ExceptionState::default();
 
         for opcode in OpCode::all() {
@@ -3835,12 +3833,12 @@ mod tests {
             let arity = opcode.arity().unwrap_or(3) as usize;
             let args = &dummy_args[..arity.min(3)];
             let mut op = Op::new(opcode, args);
-            op.pos = OpRef::int_op(opcode.as_u16() as u32 + 20_000);
+            op.pos.set(OpRef::int_op(opcode.as_u16() as u32 + 20_000));
 
             let result = execute_one(&op, &values, &mut exc);
             // Store the result so subsequent ops can reference it
             if let OpResult::Value(v) = &result {
-                values.insert(op.pos.raw(), *v);
+                values.insert(op.pos.get().raw(), *v);
             }
 
             match result {
@@ -3873,7 +3871,6 @@ mod tests {
     mod bh_interp_tests {
         use super::super::*;
         use crate::jitcode::JitCodeBuilder;
-        use std::collections::HashMap;
 
         /// C.5.1 — strict-dispatch builder for bare-new() unit fixtures.
         ///
@@ -3896,7 +3893,8 @@ mod tests {
         fn build_test_bh_builder() -> BlackholeInterpBuilder {
             use majit_translate::insns;
             let mut builder = BlackholeInterpBuilder::new();
-            let mut entries: HashMap<String, u8> = HashMap::new();
+            let mut entries: majit_ir::vec_assoc::VecAssoc<String, u8> =
+                majit_ir::vec_assoc::VecAssoc::new();
             entries.insert("int_copy_pyre_u16/i>i".to_string(), insns::BC_MOVE_I);
             entries.insert("ref_copy_pyre_u16/r>r".to_string(), insns::BC_MOVE_R);
             entries.insert("int_add_pyre_u16/ii>i".to_string(), insns::BC_INT_ADD);
@@ -4496,7 +4494,8 @@ mod tests {
             // Opcode 0 = "live/" (liveness marker, skip 2 bytes)
             // Opcode 1 = "int_add/ii>i" (3 register bytes: a, b, dst)
             // Opcode 2 = "int_return/i" (1 register byte)
-            let mut insns = HashMap::new();
+            let mut insns: majit_ir::vec_assoc::VecAssoc<String, u8> =
+                majit_ir::vec_assoc::VecAssoc::new();
             insns.insert("live/".to_string(), 0u8);
             insns.insert("int_add/ii>i".to_string(), 1u8);
             insns.insert("int_return/i".to_string(), 2u8);
@@ -4540,7 +4539,8 @@ mod tests {
             // majit-translate assembler.rs FieldRead/FieldWrite/ArrayRead
             // /VableFieldRead/VableFieldWrite derive the opname kind
             // suffix from the value/result register kind.
-            let mut insns = HashMap::new();
+            let mut insns: majit_ir::vec_assoc::VecAssoc<String, u8> =
+                majit_ir::vec_assoc::VecAssoc::new();
             insns.insert("getfield_gc_i/id>i".to_string(), 0u8);
             insns.insert("getfield_gc_r/id>r".to_string(), 1u8);
             insns.insert("setfield_gc_i/iid".to_string(), 2u8);
@@ -4571,7 +4571,8 @@ mod tests {
             // assembler.rs:2106-2130,2226-2250 negative asserts). Kept as
             // guard tests so any regression that reintroduces a `_v` key
             // surfaces at setup_insns time rather than at first dispatch.
-            let mut insns = HashMap::new();
+            let mut insns: majit_ir::vec_assoc::VecAssoc<String, u8> =
+                majit_ir::vec_assoc::VecAssoc::new();
             insns.insert("setfield_gc_v/rid".to_string(), 0u8);
             insns.insert("setfield_gc_v/iid".to_string(), 1u8);
             insns.insert("setfield_gc_v/ird".to_string(), 2u8);
@@ -4608,7 +4609,8 @@ mod tests {
             // RPython blackhole integer arithmetic is `@arguments("i", "i",
             // returns="i")` (blackhole.py:458+). Ref/int-mixed `int_*`
             // opnames are kind-flow bugs, not alternate blackhole surfaces.
-            let mut insns = HashMap::new();
+            let mut insns: majit_ir::vec_assoc::VecAssoc<String, u8> =
+                majit_ir::vec_assoc::VecAssoc::new();
             let fake_opnames = [
                 "int_add/ri>i",
                 "int_add/ir>i",
@@ -7301,7 +7303,6 @@ pub fn pyre_production_cpu() -> &'static dyn majit_backend::Backend {
 /// `pipeline.insns` ↔ `wellknown_bh_insns` table-unification epic
 /// that this minimal install side-steps.
 pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
-    use std::collections::HashMap;
     let mut builder = BlackholeInterpBuilder::new();
     // Sub-slice C.2.0 (`subslice_c2_attempt_failure_cpu_prereq_2026_05_07.md`):
     // wire the blackhole cpu BEFORE C.2.1 vable canonical routing.
@@ -7315,7 +7316,7 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     {
         builder.cpu = Some(pyre_production_cpu());
     }
-    let mut insns = HashMap::new();
+    let mut insns: majit_ir::vec_assoc::VecAssoc<String, u8> = majit_ir::vec_assoc::VecAssoc::new();
     insns.insert(
         "inline_call_pyre_nested/P".to_string(),
         majit_translate::insns::BC_INLINE_CALL,

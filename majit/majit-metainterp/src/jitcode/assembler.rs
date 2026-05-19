@@ -29,13 +29,13 @@ pub struct JitCodeBuilder {
     /// against runtime-emitted bytecode.  Recording happens through
     /// `start_instr` / `write_insn`; every helper that pushes an opcode
     /// byte goes through one of those.
-    startpoints: std::collections::HashSet<usize>,
+    startpoints: majit_ir::vec_set::VecSet<usize>,
     /// RPython `assembler.py:176` `self.alllabels.add(len(self.code))` —
     /// every TLabel emit records the bytecode offset of the 2-byte
     /// label slot so `JitCode.follow_jump` (RPython `jitcode.py:108-109`)
     /// can fire its non-translated `assert position in self._alllabels`
     /// debug check.  Populated by `push_label_ref`.
-    alllabels: std::collections::HashSet<usize>,
+    alllabels: majit_ir::vec_set::VecSet<usize>,
     num_regs_i: u16,
     num_regs_r: u16,
     num_regs_f: u16,
@@ -75,7 +75,7 @@ pub struct JitCodeBuilder {
     /// different trace wrappers that share a concrete function pointer.
     /// Drained into `JitCodeExecState.call_descr_to_call_target` at
     /// `finish()`.
-    call_descr_to_call_target: std::collections::HashMap<u16, JitCallTarget>,
+    call_descr_to_call_target: crate::optimizeopt::vec_assoc::VecAssoc<u16, JitCallTarget>,
     /// RPython `jitcode.py:47 self._resulttypes = resulttypes` —
     /// per-instruction result-kind char keyed by end-of-instruction
     /// position (`assembler.py:217-219`).  Consumed by
@@ -87,7 +87,7 @@ pub struct JitCodeBuilder {
     /// — pyre's encoding writes operands AFTER the opcode byte, so
     /// `self.code.len()` after the last `push_u*` call equals the
     /// end-of-instruction position the reader sees as `frame.pc`.
-    resulttypes: std::collections::HashMap<usize, char>,
+    resulttypes: crate::optimizeopt::vec_assoc::VecAssoc<usize, char>,
     /// Pending result-kind for a generic `write_insn("...>X")` call.
     /// RPython records the kind after all operands have been emitted
     /// (`assembler.py:217-219`).  In this builder the opcode helper

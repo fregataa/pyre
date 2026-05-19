@@ -129,6 +129,22 @@ impl Value {
             _ => panic!("expected Ref, got {:?}", self),
         }
     }
+
+    /// Project a `Value` into a `Const`.  Mirrors RPython where
+    /// `ConstInt`/`ConstFloat`/`ConstPtr` (history.py:220/261/307) are
+    /// the only concrete constant classes — there is no `ConstVoid`,
+    /// so `Value::Void` panics rather than fabricate one.
+    pub fn to_const(&self) -> Const {
+        match self {
+            Value::Int(v) => Const::Int(*v),
+            Value::Float(f) => Const::Float(*f),
+            Value::Ref(r) => Const::Ref(*r),
+            Value::Void => panic!(
+                "Value::to_const: Void has no Const equivalent \
+                 (history.py:220/261/307 — no ConstVoid upstream)"
+            ),
+        }
+    }
 }
 
 /// A constant value known at trace time.
@@ -209,12 +225,47 @@ impl Const {
 
 /// An input argument to a loop or bridge.
 ///
-/// Mirrors rpython/jit/metainterp/resoperation.py InputArg* classes.
-#[derive(Clone, Debug, PartialEq)]
+/// Mirrors rpython/jit/metainterp/resoperation.py AbstractInputArg
+/// (`InputArgInt` / `InputArgFloat` / `InputArgRef` at lines 719/727/739).
+///
+/// `forwarded` is the inline `_forwarded` slot from
+/// `resoperation.py:700` (`AbstractInputArg._attrs_ = ('_forwarded',
+/// 'position')`). Initial value is `Forwarded::None`. Cloning matches
+/// `copy_and_change` (`resoperation.py:323`) by resetting to `None` —
+/// a fresh inputarg is a fresh `_forwarded`.
+#[derive(Debug)]
 pub struct InputArg {
     pub tp: Type,
     /// Index in the inputargs list.
     pub index: u32,
+    /// resoperation.py:235 `_forwarded` slot, inherited from
+    /// `AbstractResOpOrInputArg`.
+    pub forwarded: std::cell::RefCell<crate::forwarded::Forwarded>,
+}
+
+impl Clone for InputArg {
+    /// resoperation.py:323 `copy_and_change` allocates a fresh ResOp /
+    /// InputArg whose `_forwarded` is `None`; pyre's `clone` mirrors
+    /// that contract.
+    fn clone(&self) -> Self {
+        InputArg {
+            tp: self.tp,
+            index: self.index,
+            forwarded: std::cell::RefCell::new(crate::forwarded::Forwarded::None),
+        }
+    }
+}
+
+impl PartialEq for InputArg {
+    /// PyPy compares `AbstractInputArg`s by Python object identity
+    /// (`AbstractValue.same_box` at `resoperation.py:38`). Pyre's
+    /// value-typed `InputArg` stands in for that identity via
+    /// `(tp, index)` tuple equality; `_forwarded` is excluded because
+    /// it is per-instance analysis state and does not participate in
+    /// the identity check.
+    fn eq(&self, other: &Self) -> bool {
+        self.tp == other.tp && self.index == other.index
+    }
 }
 
 impl InputArg {
@@ -222,6 +273,7 @@ impl InputArg {
         InputArg {
             tp: Type::Int,
             index,
+            forwarded: std::cell::RefCell::new(crate::forwarded::Forwarded::None),
         }
     }
 
@@ -229,6 +281,7 @@ impl InputArg {
         InputArg {
             tp: Type::Ref,
             index,
+            forwarded: std::cell::RefCell::new(crate::forwarded::Forwarded::None),
         }
     }
 
@@ -236,11 +289,16 @@ impl InputArg {
         InputArg {
             tp: Type::Float,
             index,
+            forwarded: std::cell::RefCell::new(crate::forwarded::Forwarded::None),
         }
     }
 
     pub fn from_type(tp: Type, index: u32) -> Self {
-        InputArg { tp, index }
+        InputArg {
+            tp,
+            index,
+            forwarded: std::cell::RefCell::new(crate::forwarded::Forwarded::None),
+        }
     }
 
     /// Returns the OpRef referencing this input arg's slot.

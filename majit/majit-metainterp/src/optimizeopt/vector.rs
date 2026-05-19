@@ -30,9 +30,8 @@
 /// - Only operates on loop bodies (Label..Jump)
 /// - Requires array load/store patterns for memory access vectorization
 /// - Guards in the loop body prevent full vectorization (conservative)
-use std::collections::{HashMap, HashSet};
-
-use majit_ir::{Op, OpCode, OpRef};
+use majit_ir::vec_set::VecSet;
+use majit_ir::{Op, OpCode, OpRc, OpRef};
 
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
 
@@ -106,12 +105,12 @@ impl VectorLoop {
         let label_args = self
             .label
             .as_ref()
-            .map(|l| l.args.clone())
+            .map(|l| l.getarglist_copy())
             .unwrap_or_default();
         let jump_args = self
             .jump
             .as_ref()
-            .map(|j| j.args.clone())
+            .map(|j| j.getarglist_copy())
             .unwrap_or_default();
 
         let prohibit = [
@@ -122,14 +121,15 @@ impl VectorLoop {
 
         let base_offset = original_body
             .iter()
-            .map(|op| op.pos.raw())
+            .map(|op| op.pos.get().raw())
             .max()
             .unwrap_or(0)
             + 1;
 
         for u in 0..count {
             let offset = base_offset + (u as u32) * (original_body.len() as u32);
-            let mut remap = std::collections::HashMap::new();
+            let mut remap: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef> =
+                crate::optimizeopt::vec_assoc::VecAssoc::new();
 
             // Map label args → jump args (or remapped jump args)
             for (i, la) in label_args.iter().enumerate() {
@@ -146,17 +146,19 @@ impl VectorLoop {
                     continue;
                 }
                 let mut new_op = op.clone();
-                let new_pos = op.pos.with_raw(op.pos.raw() + offset);
-                if !op.pos.is_none() {
-                    remap.insert(op.pos, new_pos);
+                let new_pos = op.pos.get().with_raw(op.pos.get().raw() + offset);
+                if !op.pos.get().is_none() {
+                    remap.insert(op.pos.get(), new_pos);
                 }
-                new_op.pos = new_pos;
-                for arg in &mut new_op.args {
-                    if let Some(&mapped) = remap.get(arg) {
-                        *arg = mapped;
+                new_op.pos.set(new_pos);
+                // optimizer.py:651-652 setarg loop parity.
+                for i in 0..new_op.num_args() {
+                    let arg = new_op.arg(i);
+                    if let Some(&mapped) = remap.get(&arg) {
+                        new_op.setarg(i, mapped);
                     }
                 }
-                if let Some(ref mut fa) = new_op.fail_args {
+                if let Some(fa) = new_op.fail_args_mut() {
                     for arg in fa.iter_mut() {
                         if let Some(&mapped) = remap.get(arg) {
                             *arg = mapped;
@@ -169,8 +171,10 @@ impl VectorLoop {
 
         // Update jump args
         if let Some(ref mut jump) = self.jump {
-            for _arg in &mut jump.args {
-                // Use latest remap if available
+            // Use latest remap if available — currently a placeholder; loop
+            // body intentionally empty (preserved from original).
+            for _i in 0..jump.num_args() {
+                // optimizer.py:651-652 setarg loop parity (placeholder).
             }
         }
         self.unroll_factor = count + 1;
@@ -181,7 +185,7 @@ impl VectorLoop {
 /// to find related vectorizable operations.
 pub fn follow_def_use_chain(ops: &[Op], start: usize, max_depth: usize) -> Vec<usize> {
     let mut chain = vec![start];
-    let result_ref = ops[start].pos;
+    let result_ref = ops[start].pos.get();
     if result_ref.is_none() {
         return chain;
     }
@@ -193,11 +197,11 @@ pub fn follow_def_use_chain(ops: &[Op], start: usize, max_depth: usize) -> Vec<u
             if chain.contains(&i) {
                 continue;
             }
-            for arg in &op.args {
+            for arg in op.getarglist().iter() {
                 if current_refs.contains(arg) {
                     chain.push(i);
-                    if !op.pos.is_none() {
-                        next_refs.push(op.pos);
+                    if !op.pos.get().is_none() {
+                        next_refs.push(op.pos.get());
                     }
                     break;
                 }
@@ -220,8 +224,8 @@ fn pre_emit_guard_accum(state: &VecScheduleState, op: &mut Op) {
     if !op.opcode.is_guard() {
         return;
     }
-    if let Some(ref fa) = op.fail_args {
-        let mut new_fa = fa.clone();
+    if let Some(fa) = op.getfailargs() {
+        let mut new_fa: smallvec::SmallVec<[majit_ir::OpRef; 3]> = fa.iter().copied().collect();
         for (fi, arg) in new_fa.iter_mut().enumerate() {
             if arg.is_none() {
                 continue;
@@ -236,7 +240,8 @@ fn pre_emit_guard_accum(state: &VecScheduleState, op: &mut Op) {
                     .getvector_of_box(*arg)
                     .map(|(_, vec_ref)| vec_ref)
                     .unwrap_or(*arg);
-                if let Some(ref descr) = op.descr {
+                let __descr_arc_descr = op.getdescr();
+                if let Some(ref descr) = __descr_arc_descr.as_ref() {
                     if let Some(fail_descr) = descr.as_fail_descr() {
                         fail_descr.attach_vector_info(majit_ir::AccumInfo {
                             // resume.py:31 prev — attach_vector_info links this
@@ -258,16 +263,16 @@ fn pre_emit_guard_accum(state: &VecScheduleState, op: &mut Op) {
                 *arg = entry.seed;
             }
         }
-        op.fail_args = Some(new_fa);
+        op.setfailargs(new_fa);
     }
 }
 
 /// schedule.py:697-736: ensure_args_unpacked — unpack vector-boxed args
 /// for a scalar op, respecting seen/invariant/accumulation state.
-fn ensure_args_unpacked(state: &mut VecScheduleState, op: &mut Op, seen: &mut HashSet<OpRef>) {
+fn ensure_args_unpacked(state: &mut VecScheduleState, op: &mut Op, seen: &mut VecSet<OpRef>) {
     // schedule.py:702-706: unpack immediate-use args
-    for j in 0..op.args.len() {
-        let arg = op.args[j];
+    for j in 0..op.num_args() {
+        let arg = op.arg(j);
         if arg.is_constant() || seen.contains(&arg) {
             continue; // schedule.py:719: already seen
         }
@@ -281,12 +286,12 @@ fn ensure_args_unpacked(state: &mut VecScheduleState, op: &mut Op, seen: &mut Ha
             let unpacked = unpack_from_vector(state, vec_ref, pos, 1);
             state.renamer.start_renaming(arg, unpacked);
             seen.insert(unpacked);
-            op.args[j] = unpacked;
+            op.setarg(j, unpacked);
         }
     }
     // schedule.py:708-716: unpack guard failargs
     if op.opcode.is_guard() {
-        if let Some(ref mut fail_args) = op.fail_args {
+        if let Some(fail_args) = op.fail_args_mut() {
             for arg in fail_args.iter_mut() {
                 if arg.is_constant() || seen.contains(arg) {
                     continue;
@@ -346,7 +351,8 @@ impl VectorizingOptimizer {
         let mut smallest = 0usize;
         for op in ops {
             if op.opcode.is_getarrayitem() || op.opcode.is_setarrayitem() {
-                if let Some(ref descr) = op.descr {
+                let __descr_arc_descr = op.getdescr();
+                if let Some(ref descr) = __descr_arc_descr.as_ref() {
                     if let Some(ad) = descr.as_array_descr() {
                         let item_size = ad.item_size();
                         if smallest == 0 || item_size < smallest {
@@ -410,7 +416,7 @@ impl VectorizingOptimizer {
     fn follow_def_uses(pack_set: &mut PackSet, pack: &Pack, graph: &DependencyGraph) {
         let left_idx = pack.members[0];
         let right_idx = *pack.members.last().unwrap();
-        let left_opref = graph.nodes[left_idx].op.pos;
+        let left_opref = graph.nodes[left_idx].op.pos.get();
 
         // vector.py:446-447: for ldep in pack.leftmost(node=True).provides()
         let l_users: Vec<usize> = graph.nodes[left_idx].users.clone();
@@ -420,7 +426,7 @@ impl VectorizingOptimizer {
                 // vector.py:451-453: left = pack.leftmost();
                 // args = lnode.getoperation().getarglist();
                 // if left not in args: continue
-                if !graph.nodes[l_user].op.args.contains(&left_opref) {
+                if !graph.nodes[l_user].op.getarglist().contains(&left_opref) {
                     continue;
                 }
                 let l_op = &graph.nodes[l_user].op;
@@ -442,7 +448,7 @@ impl VectorizingOptimizer {
     fn follow_use_defs(pack_set: &mut PackSet, pack: &Pack, graph: &DependencyGraph) {
         let left_idx = pack.members[0];
         let right_idx = *pack.members.last().unwrap();
-        let left_args = graph.nodes[left_idx].op.args.to_vec();
+        let left_args = graph.nodes[left_idx].op.getarglist().to_vec();
 
         // vector.py:429-430: for ldep in pack.leftmost(True).depends()
         let l_deps: Vec<usize> = graph.nodes[left_idx].deps.clone();
@@ -452,7 +458,7 @@ impl VectorizingOptimizer {
                 // vector.py:434-437: left = lnode.getoperation();
                 // args = pack.leftmost().getarglist();
                 // if left not in args: continue
-                let dep_opref = graph.nodes[l_dep].op.pos;
+                let dep_opref = graph.nodes[l_dep].op.pos.get();
                 if !left_args.contains(&dep_opref) {
                     continue;
                 }
@@ -578,7 +584,7 @@ impl VectorizingOptimizer {
         for &arg in &self.label_args {
             sched_state.inputargs.insert(arg, ());
         }
-        let mut seen: HashSet<OpRef> = HashSet::new();
+        let mut seen: VecSet<OpRef> = VecSet::new();
         for &arg in &self.label_args {
             seen.insert(arg);
         }
@@ -595,8 +601,8 @@ impl VectorizingOptimizer {
             }
             // schedule.py:998: getleftmostseed = leftmost.getarg(position)
             let pos = pack.position.max(0) as usize;
-            let seed = if pos < first_op.args.len() {
-                first_op.args[pos]
+            let seed = if pos < first_op.num_args() {
+                first_op.arg(pos)
             } else {
                 OpRef::NONE
             };
@@ -608,7 +614,7 @@ impl VectorizingOptimizer {
                     continue;
                 }
                 sched_state.accumulation.insert(
-                    op.pos,
+                    op.pos.get(),
                     AccumEntry {
                         seed,
                         operator,
@@ -627,8 +633,8 @@ impl VectorizingOptimizer {
             let bytesize: i32 = self
                 .body_ops
                 .iter()
-                .find(|op| op.pos == seed)
-                .and_then(|op| op.vecinfo.as_ref())
+                .find(|op| op.pos.get() == seed)
+                .and_then(|op| op.get_vecinfo())
                 .map(|vi| vi.getbytesize() as i32)
                 .unwrap_or(8);
             // vector.py:827,840: vec_reg_size // bytesize
@@ -639,7 +645,7 @@ impl VectorizingOptimizer {
             // vector.py:844-853: create zero vector (reduce_init == 0 for '+')
             let vec_create =
                 sched_state.create_vec_op(OpCode::VecI, &[], datatype, bytesize, signed, count);
-            let zero_vec = vec_create.pos;
+            let zero_vec = vec_create.pos.get();
             sched_state.invariant_oplist.push(vec_create);
 
             // VEC_INT_XOR(zero_vec, zero_vec) → all zeros
@@ -651,7 +657,7 @@ impl VectorizingOptimizer {
                 signed,
                 count,
             );
-            let zeroed_vec = xor_op.pos;
+            let zeroed_vec = xor_op.pos.get();
             sched_state.invariant_oplist.push(xor_op);
 
             // vector.py:866-869: pack the seed scalar into position 0
@@ -665,7 +671,7 @@ impl VectorizingOptimizer {
                 signed,
                 count,
             );
-            let seed_vec = pack_op.pos;
+            let seed_vec = pack_op.pos.get();
             sched_state.invariant_oplist.push(pack_op);
 
             // vector.py:870-871: accumulation[seed] = pack
@@ -684,7 +690,8 @@ impl VectorizingOptimizer {
         }
 
         // Build node→pack mapping
-        let mut node_to_pack: HashMap<usize, usize> = HashMap::new();
+        let mut node_to_pack: crate::optimizeopt::vec_assoc::VecAssoc<usize, usize> =
+            crate::optimizeopt::vec_assoc::VecAssoc::new();
         for (pi, group) in profitable.iter().enumerate() {
             for &idx in &group.members {
                 node_to_pack.insert(idx, pi);
@@ -719,7 +726,7 @@ impl VectorizingOptimizer {
                         sched_state.renamer.rename(&mut member_op);
                         // unpack=False → skip ensure_args_unpacked
 
-                        seen.insert(member_op.pos);
+                        seen.insert(member_op.pos.get());
                         // Write renamed op back for turn_into_vector to use
                         self.body_ops[member_idx] = member_op;
                     }
@@ -740,7 +747,7 @@ impl VectorizingOptimizer {
                 ensure_args_unpacked(&mut sched_state, &mut scalar_op, &mut seen);
 
                 // schedule.py:136: seen[op] = None
-                seen.insert(scalar_op.pos);
+                seen.insert(scalar_op.pos.get());
                 sched_state.append_to_oplist(scalar_op);
             }
         }
@@ -770,7 +777,7 @@ impl Optimization for VectorizingOptimizer {
             OpCode::Label => {
                 self.in_loop = true;
                 // schedule.py:669: save label inputargs for prepare()
-                self.label_args = op.args.to_vec();
+                self.label_args = op.getarglist().to_vec();
                 OptimizationResult::Emit(op.clone())
             }
             OpCode::Jump if self.in_loop => {
@@ -851,11 +858,12 @@ fn is_float_opcode(opcode: OpCode) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use majit_ir::{Op, OpCode, OpRef};
+    use majit_ir::{Op, OpCode, OpRc, OpRef};
 
     fn assign_positions(ops: &mut [Op], base: u32) {
         for (i, op) in ops.iter_mut().enumerate() {
-            op.pos = OpRef::op_typed(base + i as u32, op.result_type());
+            op.pos
+                .set(OpRef::op_typed(base + i as u32, op.result_type()));
         }
     }
 
@@ -1099,11 +1107,8 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(VectorizingOptimizer::new()));
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut std::collections::HashMap::new(),
-            1024,
-        );
+        let result =
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
 
         // No loop to vectorize, ops should pass through
         // (pre-label ops are buffered but emitted when we hit non-Label)
@@ -1134,11 +1139,8 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(VectorizingOptimizer::new()));
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut std::collections::HashMap::new(),
-            1024,
-        );
+        let result =
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
 
         // Should still have Label and Jump
         assert!(result.iter().any(|op| op.opcode == OpCode::Label));
@@ -1556,7 +1558,7 @@ mod tests {
         ];
         let mut positioned = ops;
         for (i, op) in positioned.iter_mut().enumerate() {
-            op.pos = OpRef::op_typed(i as u32, op.result_type());
+            op.pos.set(OpRef::op_typed(i as u32, op.result_type()));
         }
         let analysis = GuardAnalysis::analyze(&positioned);
         assert_eq!(analysis.hoistable.len(), 1);
@@ -1586,7 +1588,7 @@ mod tests {
             ), // 3: independent
         ];
         for (i, op) in ops.iter_mut().enumerate() {
-            op.pos = OpRef::op_typed(i as u32, op.result_type());
+            op.pos.set(OpRef::op_typed(i as u32, op.result_type()));
         }
         let chain = follow_def_use_chain(&ops, 0, 10);
         assert!(chain.contains(&0));
@@ -1614,7 +1616,7 @@ mod tests {
             Op::new(OpCode::Jump, &[OpRef::int_op(3)]),           // back-edge
         ];
         for (i, op) in ops.iter_mut().enumerate() {
-            op.pos = OpRef::op_typed(i as u32, op.result_type());
+            op.pos.set(OpRef::op_typed(i as u32, op.result_type()));
         }
         let vloop = VectorLoop::from_trace(&ops).unwrap();
         assert_eq!(vloop.body_len(), 2); // IntAdd + IntMul

@@ -5,7 +5,7 @@ pub use crate::optimizeopt::rawbuffer::{RawBuffer, RawBufferError};
 /// Translated from rpython/jit/metainterp/optimizeopt/info.py.
 /// Each operation can have associated analysis info (e.g., known integer bounds,
 /// pointer info, virtual object state).
-use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Type, Value};
+use majit_ir::{AbstractInfo, DescrRef, ForwardableValue, GcRef, Op, OpCode, OpRef, Type, Value};
 
 fn lookup_field_descr(field_descrs: &[DescrRef], field_idx: u32) -> Option<DescrRef> {
     field_descrs.get(field_idx as usize).cloned()
@@ -154,6 +154,29 @@ impl std::fmt::Debug for OpInfo {
         }
     }
 }
+
+/// `info.py:17` `class AbstractInfo(AbstractValue)`. The Rust trait is a
+/// marker; OpInfo (which collapses RPython's AbstractInfo subclass tree
+/// into one enum) plugs directly into `Forwarded::Info(Rc<dyn
+/// AbstractInfo>)`.
+impl ForwardableValue for OpInfo {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    /// `info.py:20` `is_info_class = True`.
+    fn is_info_class(&self) -> bool {
+        true
+    }
+
+    /// `info.py:706` `ConstPtrInfo.is_constant` / `info.py:851`
+    /// `FloatConstInfo.is_constant` / `intutils.py IntBound.is_constant`.
+    fn is_constant(&self) -> bool {
+        OpInfo::is_constant(self)
+    }
+}
+
+impl AbstractInfo for OpInfo {}
 
 impl OpInfo {
     /// Helper for constructing `OpInfo::Ptr` from owned `PtrInfo` —
@@ -1031,8 +1054,8 @@ impl PtrInfo {
                     // identity. Allocate a fresh Int OpRef on `lenop.pos`
                     // so the chained INT_GE/INT_LE/INT_AND check against
                     // the producer result, not the sentinel `OpRef::NONE`.
-                    lenop.pos = ctx.alloc_op_position_typed(Type::Int);
-                    let lenop_pos = lenop.pos;
+                    lenop.pos.set(ctx.alloc_op_position_typed(Type::Int));
+                    let lenop_pos = lenop.pos.get();
                     short.push(lenop);
                     info.lenbound.make_guards(lenop_pos, short, ctx);
                 }
@@ -1057,8 +1080,8 @@ impl PtrInfo {
                 let mut eq_op = Op::new(OpCode::IntEq, &[op, zero]);
                 // info.py:381 `op = ResOperation(INT_EQ, [...])` then
                 // `[op]` — INT_EQ result identity for GUARD_FALSE.
-                eq_op.pos = ctx.alloc_op_position_typed(Type::Int);
-                let eq_pos = eq_op.pos;
+                eq_op.pos.set(ctx.alloc_op_position_typed(Type::Int));
+                let eq_pos = eq_op.pos.get();
                 short.push(eq_op);
                 short.push(Op::new(OpCode::GuardFalse, &[eq_pos]));
             }
@@ -1076,8 +1099,8 @@ impl PtrInfo {
                         // vstring.py:124 `lenop = ResOperation(STRLEN, [op])`
                         // is consumed by `bound.make_guards(lenop, ...)`.
                         // Materialize the producer result before the chain.
-                        lenop.pos = ctx.alloc_op_position_typed(Type::Int);
-                        let lenop_pos = lenop.pos;
+                        lenop.pos.set(ctx.alloc_op_position_typed(Type::Int));
+                        let lenop_pos = lenop.pos.get();
                         short.push(lenop);
                         // intutils.py:1264-1289 IntBound.make_guards: emits the
                         // chained INT_GE/INT_LE/INT_AND → GUARD_TRUE/GUARD_VALUE
@@ -1538,8 +1561,8 @@ impl PtrInfo {
                 // Preserve that identity here instead of inventing a fresh
                 // OpRef, so later passes (earlyforce → heap → call) all talk
                 // about the same concrete allocation.
-                new_op.pos = opref;
-                new_op.descr = Some(vinfo.descr.clone());
+                new_op.pos.set(opref);
+                new_op.setdescr(vinfo.descr.clone());
                 let alloc_ref = emit_op(ctx, new_op);
                 // info.py:152 `newop.set_forwarded(self)` — unconditional.
                 // Route through `ensure_box` so the just-emitted alloc op
@@ -1569,7 +1592,7 @@ impl PtrInfo {
                         "force_box: field_idx must resolve through descr.get_all_fielddescrs()[i]",
                     );
                     let mut set_op = Op::new(OpCode::SetfieldGc, &[alloc_ref, value_ref]);
-                    set_op.descr = Some(descr);
+                    set_op.setdescr(descr);
                     emit_op(ctx, set_op);
                 }
                 alloc_ref
@@ -1590,8 +1613,8 @@ impl PtrInfo {
                 // Preserve that identity here instead of inventing a fresh
                 // OpRef, so later passes (earlyforce → heap → call) all talk
                 // about the same concrete allocation.
-                new_op.pos = opref;
-                new_op.descr = Some(vinfo.descr.clone());
+                new_op.pos.set(opref);
+                new_op.setdescr(vinfo.descr.clone());
                 let alloc_ref = emit_op(ctx, new_op);
                 // info.py:152 `newop.set_forwarded(self)` — unconditional.
                 if let Some(b) = ctx.ensure_box(alloc_ref) {
@@ -1613,7 +1636,7 @@ impl PtrInfo {
                         "force_box: field_idx must resolve through descr.get_all_fielddescrs()[i]",
                     );
                     let mut set_op = Op::new(OpCode::SetfieldGc, &[alloc_ref, value_ref]);
-                    set_op.descr = Some(descr);
+                    set_op.setdescr(descr);
                     emit_op(ctx, set_op);
                 }
                 alloc_ref
@@ -1634,8 +1657,8 @@ impl PtrInfo {
                     OpCode::NewArray
                 };
                 let mut alloc_op = Op::new(alloc_opcode, &[len_ref]);
-                alloc_op.pos = opref;
-                alloc_op.descr = Some(vinfo.descr.clone());
+                alloc_op.pos.set(opref);
+                alloc_op.setdescr(vinfo.descr.clone());
                 let alloc_ref = emit_op(ctx, alloc_op);
                 if opref != alloc_ref {
                     ctx.replace_op(opref, alloc_ref);
@@ -1668,7 +1691,7 @@ impl PtrInfo {
                     let subbox = force_child(item_ref, ctx);
                     let idx_ref = ctx.emit_constant_int(i as i64);
                     let mut set_op = Op::new(OpCode::SetarrayitemGc, &[alloc_ref, idx_ref, subbox]);
-                    set_op.descr = Some(descr.clone());
+                    set_op.setdescr(descr.clone());
                     emit_op(ctx, set_op);
                 }
                 // info.py:557: optforce.pure_from_args(ARRAYLEN_GC, [op], ConstInt(len))
@@ -1688,8 +1711,8 @@ impl PtrInfo {
 
                 let len_ref = ctx.emit_constant_int(num_elements as i64);
                 let mut alloc_op = Op::new(OpCode::NewArrayClear, &[len_ref]);
-                alloc_op.pos = opref;
-                alloc_op.descr = Some(vinfo.descr.clone());
+                alloc_op.pos.set(opref);
+                alloc_op.setdescr(vinfo.descr.clone());
                 let alloc_ref = emit_op(ctx, alloc_op);
                 if opref != alloc_ref {
                     ctx.replace_op(opref, alloc_ref);
@@ -1722,7 +1745,9 @@ impl PtrInfo {
                         let subbox = force_child(value_ref, ctx);
                         let mut set_op =
                             Op::new(OpCode::SetinteriorfieldGc, &[alloc_ref, idx_ref, subbox]);
-                        set_op.descr = fielddescrs.get(field_idx as usize).cloned();
+                        if let Some(d) = fielddescrs.get(field_idx as usize).cloned() {
+                            set_op.setdescr(d);
+                        }
                         emit_op(ctx, set_op);
                     }
                 }
@@ -1740,8 +1765,10 @@ impl PtrInfo {
                 let func_ref = ctx.emit_constant_int(func);
                 let size_ref = ctx.emit_constant_int(size as i64);
                 let mut call_op = Op::new(OpCode::CallI, &[func_ref, size_ref]);
-                call_op.pos = opref;
-                call_op.descr = calldescr;
+                call_op.pos.set(opref);
+                if let Some(d) = calldescr {
+                    call_op.setdescr(d);
+                }
                 let alloc_ref = emit_op(ctx, call_op);
 
                 // info.py:152 unconditional set_forwarded.
@@ -1762,7 +1789,7 @@ impl PtrInfo {
                     let offset_ref = ctx.emit_constant_int(offset);
                     let mut store_op =
                         Op::new(OpCode::RawStore, &[alloc_ref, offset_ref, value_ref]);
-                    store_op.descr = Some(descr);
+                    store_op.setdescr(descr);
                     emit_op(ctx, store_op);
                 }
 
@@ -1794,7 +1821,7 @@ impl PtrInfo {
                 let parent_forced = ctx.get_box_replacement(parent_forced);
                 let offset_ref = ctx.emit_constant_int(slice.offset as i64);
                 let mut add_op = Op::new(OpCode::IntAdd, &[parent_forced, offset_ref]);
-                add_op.pos = opref;
+                add_op.pos.set(opref);
                 let new_ref = emit_op(ctx, add_op);
                 // Preserve raw-slice identity; mark non-virtual via
                 // `parent = OpRef::NONE` (RPython `self.parent = None`).
@@ -1869,7 +1896,7 @@ impl PtrInfo {
                     OpCode::Newstr
                 };
                 let mut newstr_op = Op::new(new_opcode, &[lengthbox]);
-                newstr_op.pos = opref;
+                newstr_op.pos.set(opref);
                 let newop = emit_op(ctx, newstr_op);
 
                 // vstring.py:98: newop.set_forwarded(self) — unconditional.
@@ -3250,7 +3277,7 @@ mod tests {
             OpCode::GetarrayitemGcI,
             &[OpRef::int_op(10), OpRef::const_int(0)],
         );
-        replay.pos = OpRef::int_op(88);
+        replay.pos.set(OpRef::int_op(88));
         let pop = PreambleOp {
             op: OpRef::int_op(88),
             invented_name: false,

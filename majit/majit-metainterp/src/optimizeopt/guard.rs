@@ -35,9 +35,8 @@
 /// Consecutive guards on different values are kept but, when both lack a
 /// descriptor, the second inherits the first's descriptor so the backend
 /// can share resume data.
-use std::collections::{HashMap, HashSet};
-
-use majit_ir::{DescrRef, Op, OpCode, OpRef};
+use majit_ir::vec_set::VecSet;
+use majit_ir::{DescrRef, Op, OpCode, OpRc, OpRef};
 
 use crate::optimizeopt::dependency::IndexVar;
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
@@ -56,7 +55,7 @@ impl GuardKey {
     fn from_op(op: &Op) -> Self {
         GuardKey {
             opcode: op.opcode,
-            args: op.args.to_vec(),
+            args: op.getarglist().to_vec(),
         }
     }
 }
@@ -87,7 +86,7 @@ impl Guard {
         index: usize,
         guard_op: Op,
         cmp_op: Op,
-        index_vars: &HashMap<OpRef, IndexVar>,
+        index_vars: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, IndexVar>,
     ) -> Self {
         let lhs_arg = cmp_op.arg(0);
         let lhs = index_vars
@@ -117,7 +116,7 @@ impl Guard {
         index: usize,
         guard_op: &Op,
         cmp_op: &Op,
-        index_vars: &HashMap<OpRef, IndexVar>,
+        index_vars: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, IndexVar>,
     ) -> Option<Self> {
         if !guard_op.opcode.is_guard() {
             return None;
@@ -203,9 +202,9 @@ impl Guard {
         var: &IndexVar,
         old_arg: OpRef,
         new_ops: &mut Vec<Op>,
-        renamer: &mut HashMap<OpRef, OpRef>,
+        renamer: &mut crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
         next_const_pos: &mut u32,
-        const_values: &mut HashMap<OpRef, i64>,
+        const_values: &mut crate::optimizeopt::vec_assoc::VecAssoc<OpRef, i64>,
     ) -> OpRef {
         if var.is_identity() {
             return var.var;
@@ -222,7 +221,7 @@ impl Guard {
         });
         let mut last = var.var;
         for op in ops {
-            last = op.pos;
+            last = op.pos.get();
             new_ops.push(op);
         }
         // guard.py:131: opt.renamer.start_renaming(old_arg, box)
@@ -242,9 +241,9 @@ impl Guard {
         other: &Guard,
         label_args: &[OpRef],
         new_ops: &mut Vec<Op>,
-        renamer: &mut HashMap<OpRef, OpRef>,
+        renamer: &mut crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
         next_const_pos: &mut u32,
-        const_values: &mut HashMap<OpRef, i64>,
+        const_values: &mut crate::optimizeopt::vec_assoc::VecAssoc<OpRef, i64>,
     ) -> Option<Op> {
         if self.op.opcode != other.op.opcode {
             return None;
@@ -290,10 +289,10 @@ impl Guard {
         // make_compile_loop_version_descr_from reference-shares each
         // Arc<[T]> slot from the donor onto the fresh descr.
         let fresh_descr = crate::compile::make_compile_loop_version_descr_from(&self.op);
-        let mut guard_op = Op::new(self.op.opcode, &[compare.pos]);
-        guard_op.descr = Some(fresh_descr);
+        let mut guard_op = Op::new(self.op.opcode, &[compare.pos.get()]);
+        guard_op.setdescr(fresh_descr);
         // guard.py:94: guard.setfailargs(loop.label.getarglist_copy())
-        guard_op.fail_args = Some(label_args.into());
+        guard_op.setfailargs(label_args.into());
         // copy_all_attributes_from parity: compile.py:861-872 copies
         // rd_consts / rd_pendingfields / rd_virtuals / rd_numb.  In
         // pyre these live on the FailDescr (compile.py:855 `_attrs_`)
@@ -301,8 +300,13 @@ impl Guard {
         // reference-shares the donor's payload onto the fresh descr,
         // so `guard_op.descr.fail_descr().rd_*()` returns the donor's
         // values automatically.
-        guard_op.fail_arg_types = self.op.fail_arg_types.clone();
-        guard_op.rd_resume_position = self.op.rd_resume_position;
+        match self.op.get_fail_arg_types() {
+            Some(types) => guard_op.set_fail_arg_types(types.to_vec()),
+            None => guard_op.clear_fail_arg_types(),
+        }
+        guard_op
+            .rd_resume_position
+            .set(self.op.rd_resume_position.get());
         // guard.py:95: opt.emit_operation(guard)
         new_ops.push(guard_op.clone());
         Some(guard_op)
@@ -342,21 +346,27 @@ impl Guard {
         // ResumeGuardCopiedDescr.prev via get_resumestorage()).
         let my_descr = self
             .op
-            .descr
-            .as_ref()
+            .getdescr()
             .expect("guard.py:120 myop.getdescr() must exist");
         let donor_descr = other
             .op
-            .descr
-            .as_ref()
+            .getdescr()
             .expect("guard.py:121 otherop.getdescr() must exist");
         // compile.py:861-872 / 840-842: in-place copy preserving
         // myop.descr identity (`fail_index` / status / subtype tag).
-        crate::compile::copy_all_attributes_from(my_descr, donor_descr);
-        self.op.rd_resume_position = other.op.rd_resume_position;
+        crate::compile::copy_all_attributes_from(&my_descr, &donor_descr);
+        self.op
+            .rd_resume_position
+            .set(other.op.rd_resume_position.get());
         // guard.py:123: myop.setfailargs(otherop.getfailargs()[:])
-        self.op.fail_args = other.op.fail_args.clone();
-        self.op.fail_arg_types = other.op.fail_arg_types.clone();
+        match other.op.getfailargs() {
+            Some(fa) => self.op.setfailargs(fa.iter().copied().collect()),
+            None => self.op.clearfailargs(),
+        }
+        match other.op.get_fail_arg_types() {
+            Some(types) => self.op.set_fail_arg_types(types.to_vec()),
+            None => self.op.clear_fail_arg_types(),
+        }
     }
 
     /// guard.py:134-147: emit_operations(opt)
@@ -366,9 +376,9 @@ impl Guard {
     pub fn emit_operations(
         &mut self,
         new_ops: &mut Vec<Op>,
-        renamer: &mut HashMap<OpRef, OpRef>,
+        renamer: &mut crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
         next_const_pos: &mut u32,
-        const_values: &mut HashMap<OpRef, i64>,
+        const_values: &mut crate::optimizeopt::vec_assoc::VecAssoc<OpRef, i64>,
     ) {
         // guard.py:136-137: lhs/rhs via emit_varops
         let lhs = Self::emit_varops(
@@ -391,11 +401,22 @@ impl Guard {
         let cmp_op = Op::new(self.cmp_op.opcode, &[lhs, rhs]);
         new_ops.push(cmp_op.clone());
         // guard.py:142-144: guard = ResOperation(opnum, [cmp_op], descr)
-        let mut guard = Op::new(self.op.opcode, &[cmp_op.pos]);
-        guard.descr = self.op.descr.clone();
-        guard.fail_args = self.op.fail_args.clone();
-        guard.fail_arg_types = self.op.fail_arg_types.clone();
-        guard.rd_resume_position = self.op.rd_resume_position;
+        let mut guard = Op::new(self.op.opcode, &[cmp_op.pos.get()]);
+        if let Some(d) = self.op.getdescr() {
+            guard.setdescr(d);
+        }
+        // guard.py:143: guard.setfailargs(self.op.getfailargs()[:])
+        match self.op.getfailargs() {
+            Some(fa) => guard.setfailargs(fa.iter().copied().collect()),
+            None => guard.clearfailargs(),
+        }
+        match self.op.get_fail_arg_types() {
+            Some(types) => guard.set_fail_arg_types(types.to_vec()),
+            None => guard.clear_fail_arg_types(),
+        }
+        guard
+            .rd_resume_position
+            .set(self.op.rd_resume_position.get());
         // compile.py:855 _attrs_ on descr; Arc-clone above shares them.
         new_ops.push(guard.clone());
         // guard.py:145-147
@@ -410,7 +431,7 @@ impl Guard {
         if self.index > 0 {
             // guard.py:154: if operations[self.index-1] is self.cmp_op
             if let Some(ref prev) = ops[self.index - 1] {
-                if prev.pos == self.cmp_op.pos {
+                if prev.pos.get() == self.cmp_op.pos.get() {
                     ops[self.index - 1] = None;
                 }
             }
@@ -425,36 +446,36 @@ impl Guard {
 /// proper descr/fail_args, and optionally eliminates array bound checks.
 pub struct GuardStrengthenOpt {
     /// guard.py:168
-    pub index_vars: HashMap<OpRef, IndexVar>,
+    pub index_vars: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, IndexVar>,
     /// guard.py:169
     _newoperations: Vec<Op>,
     /// guard.py:170
     pub strength_reduced: usize,
     /// guard.py:171
-    pub strongest_guards: HashMap<OpRef, Vec<Guard>>,
+    pub strongest_guards: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, Vec<Guard>>,
     /// guard.py:172
-    guards: HashMap<usize, Option<Guard>>,
+    guards: crate::optimizeopt::vec_assoc::VecAssoc<usize, Option<Guard>>,
     /// renamer.py: Renamer — maps old OpRef → new OpRef for renamed vars.
-    renamer: HashMap<OpRef, OpRef>,
+    renamer: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
     /// Zero-based counter for constant-namespace OpRef allocation.
     next_const_pos: u32,
     /// Materialized constant values: OpRef → i64.
     /// RPython uses ConstInt boxes inline; majit stores const values here.
-    pub const_values: HashMap<OpRef, i64>,
+    pub const_values: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, i64>,
 }
 
 impl GuardStrengthenOpt {
     /// guard.py:167
-    pub fn new(index_vars: HashMap<OpRef, IndexVar>) -> Self {
+    pub fn new(index_vars: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, IndexVar>) -> Self {
         GuardStrengthenOpt {
             index_vars,
             _newoperations: Vec::new(),
             strength_reduced: 0,
-            strongest_guards: HashMap::new(),
-            guards: HashMap::new(),
-            renamer: HashMap::new(),
+            strongest_guards: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            guards: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            renamer: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             next_const_pos: 0,
-            const_values: HashMap::new(),
+            const_values: crate::optimizeopt::vec_assoc::VecAssoc::new(),
         }
     }
 
@@ -469,7 +490,7 @@ impl GuardStrengthenOpt {
             }
             // guard.py:183: Guard.of(op.getarg(0), operations, i, self.index_vars)
             let bool_arg = op.arg(0);
-            let cmp_op = ops.iter().rfind(|o| o.pos == bool_arg);
+            let cmp_op = ops.iter().rfind(|o| o.pos.get() == bool_arg);
             if let Some(cmp) = cmp_op {
                 if let Some(guard) = Guard::of(i, op, cmp, &self.index_vars) {
                     let lk = guard.getleftkey();
@@ -486,7 +507,7 @@ impl GuardStrengthenOpt {
         if key.is_none() {
             return;
         }
-        let others = self.strongest_guards.entry(key).or_default();
+        let others = self.strongest_guards.entry_or_insert_with(key, Vec::new);
         if !others.is_empty() {
             let mut replaced = false;
             for i in 0..others.len() {
@@ -516,7 +537,7 @@ impl GuardStrengthenOpt {
     /// guard.py:221-249: eliminate_guards(loop)
     pub fn eliminate_guards(&mut self, ops: &[Op]) -> Vec<Op> {
         // guard.py:222: self.renamer = Renamer()
-        self.renamer = HashMap::new();
+        self.renamer = crate::optimizeopt::vec_assoc::VecAssoc::new();
         self._newoperations = Vec::with_capacity(ops.len());
 
         // Take guards out of self to satisfy borrow checker.
@@ -553,7 +574,7 @@ impl GuardStrengthenOpt {
             }
             // guard.py:239-245: non-void index_var → emit_operations + rename
             if op.opcode.result_type() != majit_ir::Type::Void {
-                if let Some(index_var) = index_vars.get(&op.pos) {
+                if let Some(index_var) = index_vars.get(&op.pos.get()) {
                     if !index_var.is_identity() {
                         let ncp = &mut self.next_const_pos;
                         let cv = &mut self.const_values;
@@ -563,7 +584,7 @@ impl GuardStrengthenOpt {
                             cv.insert(cref, value);
                             cref
                         });
-                        self.renamer.insert(op.pos, result);
+                        self.renamer.insert(op.pos.get(), result);
                         continue;
                     }
                 }
@@ -593,7 +614,7 @@ impl GuardStrengthenOpt {
         info: &mut super::version::LoopVersionInfo,
         label_args: &[OpRef],
         user_code: bool,
-    ) -> (Vec<Op>, HashMap<OpRef, i64>) {
+    ) -> (Vec<Op>, crate::optimizeopt::vec_assoc::VecAssoc<OpRef, i64>) {
         self.collect_guard_information(ops);
         let mut result = self.eliminate_guards(ops);
 
@@ -607,7 +628,8 @@ impl GuardStrengthenOpt {
             if !op.opcode.is_guard() {
                 continue;
             }
-            if let Some(ref descr) = op.descr {
+            let __descr_arc_descr = op.getdescr();
+            if let Some(ref descr) = __descr_arc_descr.as_ref() {
                 if let Some(fd) = descr.as_fail_descr() {
                     if fd.loop_version() {
                         // `version.py:32-36 leads_to[descr]` keys by descr
@@ -636,9 +658,10 @@ impl GuardStrengthenOpt {
 
     /// renamer.py:20-22: rename(op) — apply renamer map to op args.
     fn rename_op(&self, op: &mut Op) {
-        for arg in op.args.iter_mut() {
-            if let Some(&replacement) = self.renamer.get(arg) {
-                *arg = replacement;
+        for i in 0..op.num_args() {
+            let arg = op.arg(i);
+            if let Some(&replacement) = self.renamer.get(&arg) {
+                op.setarg(i, replacement);
             }
         }
     }
@@ -686,7 +709,8 @@ impl GuardStrengthenOpt {
 
         // guard.py:283-299
         let mut opt_ops: Vec<Option<Op>> = ops.drain(..).map(Some).collect();
-        let guards_snapshot: HashMap<OpRef, Vec<Guard>> = self.strongest_guards.clone();
+        let guards_snapshot: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, Vec<Guard>> =
+            self.strongest_guards.clone();
         for guards in guards_snapshot.values() {
             if guards.len() <= 1 {
                 continue;
@@ -718,8 +742,7 @@ impl GuardStrengthenOpt {
                     // `version_info` (stale `leads_to` entry).
                     let other_descr = other
                         .op
-                        .descr
-                        .as_ref()
+                        .getdescr()
                         .expect("guard.py:295 other.op.getdescr() must exist");
                     assert!(
                         other_descr.as_fail_descr().is_some(),
@@ -730,8 +753,7 @@ impl GuardStrengthenOpt {
                     other.set_to_none(&mut opt_ops);
                     // guard.py:297-299: info.track(transitive_guard, descr, version)
                     let tg_descr = tg
-                        .descr
-                        .as_ref()
+                        .getdescr()
                         .expect("guard.py:297 transitive_guard.descr must exist");
                     assert!(
                         tg_descr.as_fail_descr().is_some(),
@@ -757,23 +779,23 @@ impl GuardStrengthenOpt {
 
 impl Default for GuardStrengthenOpt {
     fn default() -> Self {
-        Self::new(HashMap::new())
+        Self::new(crate::optimizeopt::vec_assoc::VecAssoc::new())
     }
 }
 
 pub struct OptGuard {
     /// Set of guard conditions already verified in the trace.
-    seen: HashSet<GuardKey>,
+    seen: VecSet<GuardKey>,
 
     /// Set of values known to be truthy (guarded by `guard_true` or
     /// `guard_nonnull`).
-    truthy_values: HashSet<OpRef>,
+    truthy_values: VecSet<OpRef>,
 
     /// guard.py: values with known class (from GuardClass/GuardNonnullClass).
-    known_classes: std::collections::HashMap<OpRef, majit_ir::GcRef>,
+    known_classes: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, majit_ir::GcRef>,
 
     /// guard.py: values known to be specific constants (from GuardValue).
-    known_constants: std::collections::HashMap<OpRef, i64>,
+    known_constants: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, i64>,
 
     /// Descriptor of the last emitted guard, used for consecutive-guard
     /// fusion.
@@ -783,10 +805,10 @@ pub struct OptGuard {
 impl OptGuard {
     pub fn new() -> Self {
         OptGuard {
-            seen: HashSet::new(),
-            truthy_values: HashSet::new(),
-            known_classes: std::collections::HashMap::new(),
-            known_constants: std::collections::HashMap::new(),
+            seen: VecSet::new(),
+            truthy_values: VecSet::new(),
+            known_classes: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            known_constants: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             last_guard_descr: None,
         }
     }
@@ -921,7 +943,7 @@ impl OptGuard {
                 // Fallback: seen as a previous GuardClass with same args
                 let class_key = GuardKey {
                     opcode: OpCode::GuardClass,
-                    args: op.args.to_vec(),
+                    args: op.getarglist().to_vec(),
                 };
                 self.seen.contains(&class_key)
             }
@@ -934,9 +956,9 @@ impl OptGuard {
     /// If the current guard has no descriptor and the previous guard had
     /// one, reuse it.
     fn try_fuse_descr(&self, op: &mut Op) {
-        if op.descr.is_none() {
+        if !op.has_descr() {
             if let Some(ref descr) = self.last_guard_descr {
-                op.descr = Some(descr.clone());
+                op.setdescr(descr.clone());
             }
         }
     }
@@ -999,7 +1021,7 @@ impl Optimization for OptGuard {
         self.try_fuse_descr(&mut fused_op);
 
         // Track this guard's descriptor for the next consecutive guard.
-        self.last_guard_descr = fused_op.descr.clone();
+        self.last_guard_descr = fused_op.getdescr();
 
         OptimizationResult::Emit(fused_op)
     }
@@ -1032,9 +1054,10 @@ mod tests {
     /// a missing donor.
     fn assign_positions(ops: &mut [Op], base: u32) {
         for (i, op) in ops.iter_mut().enumerate() {
-            op.pos = OpRef::op_typed(base + i as u32, op.result_type());
-            if op.opcode.is_guard() && op.descr.is_none() {
-                op.descr = Some(crate::compile::make_resume_guard_descr_typed(Vec::new()));
+            op.pos
+                .set(OpRef::op_typed(base + i as u32, op.result_type()));
+            if op.opcode.is_guard() && !op.has_descr() {
+                op.setdescr(crate::compile::make_resume_guard_descr_typed(Vec::new()));
             }
         }
     }
@@ -1044,7 +1067,7 @@ mod tests {
         opt.add_pass(Box::new(OptGuard::new()));
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(ops);
         opt.snapshot_boxes = snapshots;
-        opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 1024)
+        opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024)
     }
 
     // ── Redundant Guard Removal ─────────────────────────────────────────
@@ -1384,11 +1407,8 @@ mod tests {
         opt.trace_inputarg_types = vec![majit_ir::Type::Int; 1024];
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut std::collections::HashMap::new(),
-            1024,
-        );
+        let result =
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
         let guard_count = result
             .iter()
             .filter(|o| o.opcode == OpCode::GuardNoOverflow)
@@ -1439,19 +1459,18 @@ mod tests {
                     OpCode::GuardValue,
                     &[OpRef::int_op(100), OpRef::int_op(200)],
                 );
-                op.pos = OpRef::void_op(0);
+                op.pos.set(OpRef::void_op(0));
                 op
             },
             Op::new(OpCode::IntAdd, &[OpRef::int_op(100), OpRef::int_op(101)]),
         ];
-        ops[1].pos = OpRef::int_op(1);
+        ops[1].pos.set(OpRef::int_op(1));
 
         // Pre-seed constant 1 for OpRef::int_op(200)
         let mut opt = crate::optimizeopt::optimizer::Optimizer::new();
         opt.add_pass(Box::new(crate::optimizeopt::rewrite::OptRewrite::new()));
-        let mut constants = std::collections::HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         constants.insert(200u32, majit_ir::Value::Int(1));
-        opt.constant_types.insert(200, majit_ir::Type::Int);
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);

@@ -18,7 +18,7 @@ use std::collections::HashMap;
 
 use majit_backend::BackendError;
 use majit_gc::header::{GcHeader, TYPE_ID_MASK};
-use majit_ir::{InputArg, Op, OpCode, OpRef, Type};
+use majit_ir::{InputArg, Op, OpCode, OpRc, OpRef, Type};
 use wasm_encoder::{
     BlockType, CodeSection, EntityType, ExportKind, ExportSection, Function, FunctionSection,
     ImportSection, InstructionSink, MemArg, MemoryType, Module, TypeSection, ValType,
@@ -124,11 +124,14 @@ fn collect_guards_and_vars(inputargs: &[InputArg], ops: &[Op]) -> (Vec<GuardExit
 
     let mut fail_index = 0u32;
     for op in ops {
-        if op.pos != OpRef::NONE && !op.pos.is_constant() && op.pos.raw() + 1 > max_var {
-            max_var = op.pos.raw() + 1;
+        if op.pos.get() != OpRef::NONE
+            && !op.pos.get().is_constant()
+            && op.pos.get().raw() + 1 > max_var
+        {
+            max_var = op.pos.get().raw() + 1;
         }
         if op.opcode == OpCode::Label {
-            for &a in &op.args {
+            for &a in op.getarglist().iter() {
                 if a != OpRef::NONE && !a.is_constant() && a.raw() + 1 > max_var {
                     max_var = a.raw() + 1;
                 }
@@ -136,23 +139,20 @@ fn collect_guards_and_vars(inputargs: &[InputArg], ops: &[Op]) -> (Vec<GuardExit
         }
 
         if op.opcode.is_guard() || op.opcode == OpCode::Finish {
-            let fail_args = op
-                .fail_args
-                .as_ref()
-                .map(|fa| fa.as_slice())
-                .unwrap_or(&op.args);
+            let fail_args: Vec<OpRef> = op
+                .getfailargs()
+                .map(|fa| fa.to_vec())
+                .unwrap_or_else(|| op.getarglist().to_vec());
             let fail_arg_types = op
-                .fail_arg_types
-                .as_ref()
-                .cloned()
+                .get_fail_arg_types()
                 .unwrap_or_else(|| fail_args.iter().map(|_| Type::Int).collect());
 
             guards.push(GuardExit {
                 fail_index,
-                fail_arg_refs: fail_args.to_vec(),
+                fail_arg_refs: fail_args,
                 fail_arg_types,
                 is_finish: op.opcode == OpCode::Finish,
-                meta_descr: op.descr.clone(),
+                meta_descr: op.getdescr(),
             });
             fail_index += 1;
         }
@@ -165,7 +165,7 @@ fn collect_guards_and_vars(inputargs: &[InputArg], ops: &[Op]) -> (Vec<GuardExit
 pub fn build_wasm_module(
     inputargs: &[InputArg],
     ops: &[Op],
-    constants: &HashMap<u32, i64>,
+    constants: &majit_ir::VecAssoc<u32, i64>,
     vtable_offset: Option<usize>,
     classptr_to_typeid: &HashMap<i64, u32>,
     guard_gc_type_info: &GuardGcTypeInfo,
@@ -237,7 +237,7 @@ pub fn build_wasm_module(
 fn build_function(
     inputargs: &[InputArg],
     ops: &[Op],
-    constants: &HashMap<u32, i64>,
+    constants: &majit_ir::VecAssoc<u32, i64>,
     num_vars: u32,
     jit_call_idx: Option<u32>,
     vtable_offset: Option<usize>,
@@ -270,7 +270,7 @@ fn build_function(
 
             OpCode::Jump => {
                 let label_args = find_label_args(ops);
-                for (i, &jump_arg) in op.args.iter().enumerate() {
+                for (i, &jump_arg) in op.getarglist().iter().enumerate() {
                     if i < label_args.len() {
                         let target_local = 1 + label_args[i].raw();
                         emit_resolve(&mut sink, constants, jump_arg);
@@ -448,7 +448,7 @@ fn build_function(
                 },
             ),
             OpCode::IntIsTrue => {
-                let vi = op.pos.raw();
+                let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     emit_resolve(&mut sink, constants, op.arg(0));
                     sink.i64_const(0);
@@ -458,7 +458,7 @@ fn build_function(
                 }
             }
             OpCode::IntIsZero => {
-                let vi = op.pos.raw();
+                let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     emit_resolve(&mut sink, constants, op.arg(0));
                     sink.i64_eqz();
@@ -470,7 +470,7 @@ fn build_function(
             // ── Extended integer ops ──
             OpCode::IntSignext => {
                 // int_signext(val, num_bytes): sign-extend from num_bytes width
-                let vi = op.pos.raw();
+                let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     emit_resolve(&mut sink, constants, op.arg(0));
                     // num_bytes is arg(1), typically a constant
@@ -491,7 +491,7 @@ fn build_function(
             }
             OpCode::IntForceGeZero => {
                 // max(val, 0)
-                let vi = op.pos.raw();
+                let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     emit_resolve(&mut sink, constants, op.arg(0));
                     // if val < 0, use 0; else use val
@@ -517,7 +517,7 @@ fn build_function(
 
             // ── Float floor/mod ──
             OpCode::FloatFloorDiv => {
-                let vi = op.pos.raw();
+                let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     emit_resolve(&mut sink, constants, op.arg(0));
                     sink.f64_reinterpret_i64();
@@ -532,7 +532,7 @@ fn build_function(
 
             // ── Float/Int conversions ──
             OpCode::CastFloatToInt => {
-                let vi = op.pos.raw();
+                let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     emit_resolve(&mut sink, constants, op.arg(0));
                     sink.f64_reinterpret_i64();
@@ -541,7 +541,7 @@ fn build_function(
                 }
             }
             OpCode::CastIntToFloat => {
-                let vi = op.pos.raw();
+                let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     emit_resolve(&mut sink, constants, op.arg(0));
                     sink.f64_convert_i64_s();
@@ -551,7 +551,7 @@ fn build_function(
             }
             OpCode::ConvertFloatBytesToLonglong | OpCode::ConvertLonglongBytesToFloat => {
                 // These are bitcast (no-op on the i64 representation)
-                let vi = op.pos.raw();
+                let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     emit_resolve(&mut sink, constants, op.arg(0));
                     sink.local_set(1 + vi);
@@ -560,7 +560,7 @@ fn build_function(
 
             // ── Pointer/Int conversions ──
             OpCode::CastPtrToInt | OpCode::CastIntToPtr | OpCode::CastOpaquePtr => {
-                let vi = op.pos.raw();
+                let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     emit_resolve(&mut sink, constants, op.arg(0));
                     sink.local_set(1 + vi);
@@ -569,7 +569,7 @@ fn build_function(
 
             // ── SameAs (forwarding) ──
             OpCode::SameAsI | OpCode::SameAsR | OpCode::SameAsF => {
-                let vi = op.pos.raw();
+                let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     emit_resolve(&mut sink, constants, op.arg(0));
                     sink.local_set(1 + vi);
@@ -578,7 +578,7 @@ fn build_function(
 
             // ── Field access (direct memory operations) ──
             OpCode::GetfieldGcI | OpCode::GetfieldGcPureI | OpCode::GetfieldRawI => {
-                let vi = op.pos.raw();
+                let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     emit_resolve(&mut sink, constants, op.arg(0)); // struct ptr (i64)
                     sink.i32_wrap_i64(); // convert to i32 address
@@ -588,7 +588,7 @@ fn build_function(
                 }
             }
             OpCode::GetfieldGcR | OpCode::GetfieldGcPureR | OpCode::GetfieldRawR => {
-                let vi = op.pos.raw();
+                let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     emit_resolve(&mut sink, constants, op.arg(0));
                     sink.i32_wrap_i64();
@@ -613,7 +613,7 @@ fn build_function(
 
             // ── Float field access ──
             OpCode::GetfieldGcF | OpCode::GetfieldGcPureF | OpCode::GetfieldRawF => {
-                let vi = op.pos.raw();
+                let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     emit_resolve(&mut sink, constants, op.arg(0));
                     sink.i32_wrap_i64();
@@ -630,7 +630,7 @@ fn build_function(
 
             // ── Array access ──
             OpCode::ArraylenGc => {
-                let vi = op.pos.raw();
+                let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     emit_resolve(&mut sink, constants, op.arg(0)); // array ptr
                     sink.i32_wrap_i64();
@@ -640,7 +640,7 @@ fn build_function(
                 }
             }
             OpCode::GetarrayitemGcI | OpCode::GetarrayitemGcPureI | OpCode::GetarrayitemRawI => {
-                let vi = op.pos.raw();
+                let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     // addr = base + base_size + index * item_size
                     emit_array_addr(&mut sink, constants, op);
@@ -649,7 +649,7 @@ fn build_function(
                 }
             }
             OpCode::GetarrayitemGcR | OpCode::GetarrayitemGcPureR | OpCode::GetarrayitemRawR => {
-                let vi = op.pos.raw();
+                let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     emit_array_addr(&mut sink, constants, op);
                     sink.i32_load(MemArg {
@@ -669,7 +669,7 @@ fn build_function(
 
             // ── Interior field access ──
             OpCode::GetinteriorfieldGcI | OpCode::GetinteriorfieldGcR => {
-                let vi = op.pos.raw();
+                let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     // getinteriorfield(array, index, offset)
                     emit_resolve(&mut sink, constants, op.arg(0)); // array ptr
@@ -690,7 +690,7 @@ fn build_function(
 
             // ── String/Unicode ops (direct memory access) ──
             OpCode::Strlen | OpCode::Unicodelen => {
-                let vi = op.pos.raw();
+                let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     emit_resolve(&mut sink, constants, op.arg(0));
                     sink.i32_wrap_i64();
@@ -700,7 +700,7 @@ fn build_function(
                 }
             }
             OpCode::Strgetitem | OpCode::Unicodegetitem => {
-                let vi = op.pos.raw();
+                let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     // str[index]: base + header_size + index
                     emit_resolve(&mut sink, constants, op.arg(0));
@@ -721,7 +721,7 @@ fn build_function(
 
             // ── GC memory ops ──
             OpCode::GcLoadI => {
-                let vi = op.pos.raw();
+                let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     emit_resolve(&mut sink, constants, op.arg(0));
                     sink.i32_wrap_i64();
@@ -731,7 +731,7 @@ fn build_function(
                 }
             }
             OpCode::GcLoadR => {
-                let vi = op.pos.raw();
+                let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     emit_resolve(&mut sink, constants, op.arg(0));
                     sink.i32_wrap_i64();
@@ -755,7 +755,7 @@ fn build_function(
 
             // ── Raw memory access ──
             OpCode::RawLoadI => {
-                let vi = op.pos.raw();
+                let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     emit_resolve(&mut sink, constants, op.arg(0)); // ptr
                     sink.i32_wrap_i64();
@@ -797,7 +797,7 @@ fn build_function(
             // header, not at `obj[0]`.
             OpCode::GuardGcType => {
                 let _ = classptr_to_typeid; // typeid is already an immediate
-                if op.args.len() >= 2 {
+                if op.num_args() >= 2 {
                     emit_resolve(&mut sink, constants, op.arg(0));
                     // header address = obj - GcHeader::SIZE
                     sink.i64_const(GcHeader::SIZE as i64);
@@ -1014,7 +1014,7 @@ fn build_function(
                 // These may appear in traces that materialize strings.
                 // Use CALL trampoline if available, otherwise skip.
                 if let Some(jit_call) = jit_call_idx {
-                    let vi = op.pos.raw();
+                    let vi = op.pos.get().raw();
                     sink.local_get(0);
                     emit_resolve(&mut sink, constants, op.arg(0)); // length
                     sink.i64_store(mem64(CALL_ARGS_OFS));
@@ -1041,7 +1041,7 @@ fn build_function(
 
             // ── Misc ops ──
             OpCode::NurseryPtrIncrement => {
-                let vi = op.pos.raw();
+                let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     emit_resolve(&mut sink, constants, op.arg(0));
                     emit_resolve(&mut sink, constants, op.arg(1));
@@ -1058,7 +1058,7 @@ fn build_function(
             }
             OpCode::LoadFromGcTable => {
                 // Load from GC reference table — treat as field load
-                let vi = op.pos.raw();
+                let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     emit_resolve(&mut sink, constants, op.arg(0));
                     sink.local_set(1 + vi);
@@ -1091,12 +1091,12 @@ fn build_function(
             | OpCode::CallMayForceF
             | OpCode::CallAssemblerF
             | OpCode::CallReleaseGilF => {
-                let vi = op.pos.raw();
+                let vi = op.pos.get().raw();
                 let jit_call = jit_call_idx.expect("CALL op present but jit_call not imported");
 
                 // args[0] = func_ptr, args[1..] = call arguments
                 let func_ptr_ref = op.arg(0);
-                let call_args = &op.args[1..];
+                let call_args = &op.getarglist()[1..];
 
                 // Store func_ptr to call area
                 sink.local_get(0);
@@ -1145,7 +1145,7 @@ fn build_function(
 
             // ── Misc ──
             OpCode::ForceToken => {
-                let vi = op.pos.raw();
+                let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     sink.i64_const(0); // sentinel force token
                     sink.local_set(1 + vi);
@@ -1154,7 +1154,7 @@ fn build_function(
 
             // Float operations
             OpCode::FloatAdd | OpCode::FloatSub | OpCode::FloatMul | OpCode::FloatTrueDiv => {
-                let vi = op.pos.raw();
+                let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     // Values stored as i64 (bitcast from f64)
                     emit_resolve(&mut sink, constants, op.arg(0));
@@ -1181,7 +1181,7 @@ fn build_function(
                 }
             }
             OpCode::FloatNeg => {
-                let vi = op.pos.raw();
+                let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     emit_resolve(&mut sink, constants, op.arg(0));
                     sink.f64_reinterpret_i64();
@@ -1191,7 +1191,7 @@ fn build_function(
                 }
             }
             OpCode::FloatAbs => {
-                let vi = op.pos.raw();
+                let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     emit_resolve(&mut sink, constants, op.arg(0));
                     sink.f64_reinterpret_i64();
@@ -1232,13 +1232,17 @@ fn build_function(
 fn find_label_args(ops: &[Op]) -> Vec<OpRef> {
     for op in ops {
         if op.opcode == OpCode::Label {
-            return op.args.clone().to_vec();
+            return op.getarglist().to_vec();
         }
     }
     Vec::new()
 }
 
-fn emit_resolve(sink: &mut InstructionSink<'_>, constants: &HashMap<u32, i64>, opref: OpRef) {
+fn emit_resolve(
+    sink: &mut InstructionSink<'_>,
+    constants: &majit_ir::VecAssoc<u32, i64>,
+    opref: OpRef,
+) {
     if opref.is_constant() {
         let val = constants.get(&opref.raw()).copied().unwrap_or(0);
         sink.i64_const(val);
@@ -1249,7 +1253,8 @@ fn emit_resolve(sink: &mut InstructionSink<'_>, constants: &HashMap<u32, i64>, o
 
 /// Extract field offset from op's descr (FieldDescr).
 fn field_offset_from_descr(op: &Op) -> u64 {
-    if let Some(ref descr) = op.descr {
+    let __descr_arc_descr = op.getdescr();
+    if let Some(ref descr) = __descr_arc_descr.as_ref() {
         if let Some(fd) = descr.as_field_descr() {
             return fd.offset() as u64;
         }
@@ -1266,16 +1271,14 @@ fn array_len_offset_from_descr(_op: &Op) -> u64 {
 
 /// Compute array element address: base + base_size + index * item_size.
 /// Leaves i32 address on the wasm stack.
-fn emit_array_addr(sink: &mut InstructionSink<'_>, constants: &HashMap<u32, i64>, op: &Op) {
-    let (base_size, item_size) = if let Some(ref descr) = op.descr {
-        if let Some(ad) = descr.as_array_descr() {
-            (ad.base_size() as u64, ad.item_size() as u64)
-        } else {
-            (16, 8) // default
-        }
-    } else {
-        (16, 8)
-    };
+fn emit_array_addr(
+    sink: &mut InstructionSink<'_>,
+    constants: &majit_ir::VecAssoc<u32, i64>,
+    op: &Op,
+) {
+    let (base_size, item_size) = op
+        .with_array_descr(|ad| (ad.base_size() as u64, ad.item_size() as u64))
+        .unwrap_or((16, 8));
     emit_resolve(sink, constants, op.arg(0)); // array ptr
     sink.i32_wrap_i64();
     // base + base_size + index * item_size
@@ -1292,7 +1295,7 @@ fn emit_array_addr(sink: &mut InstructionSink<'_>, constants: &HashMap<u32, i64>
 
 fn emit_guard_true(
     sink: &mut InstructionSink<'_>,
-    constants: &HashMap<u32, i64>,
+    constants: &majit_ir::VecAssoc<u32, i64>,
     guard_idx: u32,
     op: &Op,
     has_loop: bool,
@@ -1304,7 +1307,7 @@ fn emit_guard_true(
 
 fn emit_guard_false(
     sink: &mut InstructionSink<'_>,
-    constants: &HashMap<u32, i64>,
+    constants: &majit_ir::VecAssoc<u32, i64>,
     guard_idx: u32,
     op: &Op,
     has_loop: bool,
@@ -1318,7 +1321,7 @@ fn emit_guard_false(
 /// Common guard exit: condition is on stack (i32), emit if + exit.
 fn emit_guard_if_exit(
     sink: &mut InstructionSink<'_>,
-    constants: &HashMap<u32, i64>,
+    constants: &majit_ir::VecAssoc<u32, i64>,
     guard_idx: u32,
     op: &Op,
     has_loop: bool,
@@ -1333,15 +1336,14 @@ fn emit_guard_if_exit(
 
 fn emit_guard_exit(
     sink: &mut InstructionSink<'_>,
-    constants: &HashMap<u32, i64>,
+    constants: &majit_ir::VecAssoc<u32, i64>,
     guard_idx: u32,
     op: &Op,
 ) {
-    let fail_args = op
-        .fail_args
-        .as_ref()
-        .map(|fa| fa.as_slice())
-        .unwrap_or(&op.args);
+    let fail_args: Vec<OpRef> = op
+        .getfailargs()
+        .map(|fa| fa.to_vec())
+        .unwrap_or_else(|| op.getarglist().to_vec());
 
     for (i, &arg_ref) in fail_args.iter().enumerate() {
         let offset = FRAME_SLOT_BASE + i as u64 * SLOT_SIZE;
@@ -1411,11 +1413,11 @@ fn apply_binop(sink: &mut InstructionSink<'_>, op: BinOp) {
 
 fn emit_binop(
     sink: &mut InstructionSink<'_>,
-    constants: &HashMap<u32, i64>,
+    constants: &majit_ir::VecAssoc<u32, i64>,
     op: &Op,
     binop: BinOp,
 ) {
-    let vi = op.pos.raw();
+    let vi = op.pos.get().raw();
     if OpRef::raw_is_constant(vi) {
         return;
     }
@@ -1430,7 +1432,7 @@ fn emit_binop(
 /// is handled by checking after the fact (simplified for wasm MVP).
 fn emit_ovf_binop(
     sink: &mut InstructionSink<'_>,
-    constants: &HashMap<u32, i64>,
+    constants: &majit_ir::VecAssoc<u32, i64>,
     op: &Op,
     binop: BinOp,
 ) {
@@ -1502,11 +1504,11 @@ enum FloatCmp {
 
 fn emit_float_cmp(
     sink: &mut InstructionSink<'_>,
-    constants: &HashMap<u32, i64>,
+    constants: &majit_ir::VecAssoc<u32, i64>,
     op: &Op,
     cmp: FloatCmp,
 ) {
-    let vi = op.pos.raw();
+    let vi = op.pos.get().raw();
     if OpRef::raw_is_constant(vi) {
         return;
     }
@@ -1538,8 +1540,13 @@ fn emit_float_cmp(
     sink.local_set(1 + vi);
 }
 
-fn emit_cmp(sink: &mut InstructionSink<'_>, constants: &HashMap<u32, i64>, op: &Op, cmpop: CmpOp) {
-    let vi = op.pos.raw();
+fn emit_cmp(
+    sink: &mut InstructionSink<'_>,
+    constants: &majit_ir::VecAssoc<u32, i64>,
+    op: &Op,
+    cmpop: CmpOp,
+) {
+    let vi = op.pos.get().raw();
     if OpRef::raw_is_constant(vi) {
         return;
     }
@@ -1554,12 +1561,12 @@ fn emit_cmp(sink: &mut InstructionSink<'_>, constants: &HashMap<u32, i64>, op: &
 
 fn emit_unary_vi(
     sink: &mut InstructionSink<'_>,
-    constants: &HashMap<u32, i64>,
+    constants: &majit_ir::VecAssoc<u32, i64>,
     op: &Op,
     prefix: impl FnOnce(&mut InstructionSink<'_>),
     suffix: impl FnOnce(&mut InstructionSink<'_>),
 ) {
-    let vi = op.pos.raw();
+    let vi = op.pos.get().raw();
     if !OpRef::raw_is_constant(vi) {
         prefix(sink);
         emit_resolve(sink, constants, op.arg(0));

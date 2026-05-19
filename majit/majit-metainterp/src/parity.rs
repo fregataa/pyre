@@ -1,10 +1,9 @@
 //! Test-only trace comparison utilities — no RPython equivalent.
 //! Used by integration tests for structural trace parity validation.
 
-use std::collections::HashMap;
-
 use crate::history::TreeLoop;
-use majit_ir::{Op, OpRef, Type};
+use crate::optimizeopt::vec_assoc::VecAssoc;
+use majit_ir::{Op, OpRc, OpRef, Type};
 
 /// A small, stable parity case format for comparing majit traces against
 /// RPython-derived expectations.
@@ -22,20 +21,22 @@ pub struct TraceParityCase<'a> {
 #[derive(Default)]
 struct VarRenumbering {
     next_id: u32,
-    ids: HashMap<OpRef, u32>,
+    ids: VecAssoc<OpRef, u32>,
 }
 
 impl VarRenumbering {
     fn id_for(&mut self, opref: OpRef) -> u32 {
-        *self.ids.entry(opref).or_insert_with(|| {
-            let id = self.next_id;
-            self.next_id += 1;
-            id
-        })
+        if let Some(&id) = self.ids.get(&opref) {
+            return id;
+        }
+        let id = self.next_id;
+        self.next_id += 1;
+        self.ids.insert(opref, id);
+        id
     }
 }
 
-fn render_arg(arg: OpRef, constants: &HashMap<u32, i64>, vars: &mut VarRenumbering) -> String {
+fn render_arg(arg: OpRef, constants: &VecAssoc<u32, i64>, vars: &mut VarRenumbering) -> String {
     if let Some(value) = constants.get(&arg.raw()) {
         value.to_string()
     } else {
@@ -43,9 +44,9 @@ fn render_arg(arg: OpRef, constants: &HashMap<u32, i64>, vars: &mut VarRenumberi
     }
 }
 
-fn render_op(op: &Op, constants: &HashMap<u32, i64>, vars: &mut VarRenumbering) -> String {
+fn render_op(op: &Op, constants: &VecAssoc<u32, i64>, vars: &mut VarRenumbering) -> String {
     let args = op
-        .args
+        .getarglist()
         .iter()
         .map(|&arg| render_arg(arg, constants, vars))
         .collect::<Vec<_>>()
@@ -54,10 +55,10 @@ fn render_op(op: &Op, constants: &HashMap<u32, i64>, vars: &mut VarRenumbering) 
     let mut line = if op.opcode.is_guard() || op.opcode.result_type() == Type::Void {
         format!("{:?}({args})", op.opcode)
     } else {
-        format!("v{} = {:?}({args})", vars.id_for(op.pos), op.opcode)
+        format!("v{} = {:?}({args})", vars.id_for(op.pos.get()), op.opcode)
     };
 
-    if let Some(fail_args) = &op.fail_args {
+    if let Some(fail_args) = op.getfailargs() {
         let fail_args = fail_args
             .iter()
             .map(|&arg| render_arg(arg, constants, vars))
@@ -78,7 +79,7 @@ fn render_op(op: &Op, constants: &HashMap<u32, i64>, vars: &mut VarRenumbering) 
 /// shifting op-result IDs and breaking the stable line format
 /// parity cases expect (mirrors RPython `opimpl_*` trace shapes that
 /// assume the inputarg slot numbering is the canonical prefix).
-pub fn normalize_trace(trace: &TreeLoop, constants: &HashMap<u32, i64>) -> Vec<String> {
+pub fn normalize_trace(trace: &TreeLoop, constants: &VecAssoc<u32, i64>) -> Vec<String> {
     let mut vars = VarRenumbering::default();
     for inputarg in &trace.inputargs {
         // Pre-allocate v0..vN for the inputarg slots. RPython inputargs
@@ -96,7 +97,7 @@ pub fn normalize_trace(trace: &TreeLoop, constants: &HashMap<u32, i64>) -> Vec<S
 
 /// Normalize an op slice into the same stable line format used by
 /// [`normalize_trace`].
-pub fn normalize_ops(ops: &[Op], constants: &HashMap<u32, i64>) -> Vec<String> {
+pub fn normalize_ops(ops: &[Op], constants: &VecAssoc<u32, i64>) -> Vec<String> {
     let mut vars = VarRenumbering::default();
     ops.iter()
         .map(|op| render_op(op, constants, &mut vars))
@@ -106,7 +107,7 @@ pub fn normalize_ops(ops: &[Op], constants: &HashMap<u32, i64>) -> Vec<String> {
 /// Assert that a trace matches a normalized parity case.
 pub fn assert_trace_parity(
     trace: &TreeLoop,
-    constants: &HashMap<u32, i64>,
+    constants: &VecAssoc<u32, i64>,
     case: &TraceParityCase<'_>,
 ) {
     let actual = normalize_trace(trace, constants);
@@ -130,7 +131,10 @@ mod tests {
     use crate::{TraceCtx, make_fail_descr};
     use majit_ir::{OpCode, Type};
 
-    fn finish_trace_ctx(mut ctx: TraceCtx, finish_args: &[OpRef]) -> (TreeLoop, HashMap<u32, i64>) {
+    fn finish_trace_ctx(
+        mut ctx: TraceCtx,
+        finish_args: &[OpRef],
+    ) -> (TreeLoop, VecAssoc<u32, i64>) {
         ctx.finish(finish_args, make_fail_descr(finish_args.len()));
         let constants = std::mem::take(&mut ctx.constants).into_inner();
         let trace = ctx.into_tree_loop();

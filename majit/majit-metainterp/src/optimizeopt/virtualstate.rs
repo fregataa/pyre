@@ -20,7 +20,7 @@
 /// position-numbered enum_forced_boxes dedup (virtualstate.py:196, 274,
 /// 352) prevents revisiting it.
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::ops::Deref;
 use std::rc::Rc;
 
@@ -75,7 +75,7 @@ impl VirtualStatesCantMatch {
 pub(crate) struct GenerateGuardState<'a> {
     pub ctx: &'a mut OptContext,
     pub extra_guards: &'a mut Vec<GuardRequirement>,
-    pub renum: HashMap<i32, i32>,
+    pub renum: crate::optimizeopt::vec_assoc::VecAssoc<i32, i32>,
     pub bad: HashSet<*const VirtualStateInfoNode>,
     pub force_boxes: bool,
 }
@@ -656,7 +656,7 @@ impl VirtualState {
     /// next `enum_top_level` traversal mirrors a fresh RPython
     /// VirtualState.__init__ over fresh subclass instances.
     fn reset_positions(state: &[Rc<VirtualStateInfoNode>]) {
-        let mut visited: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut visited: majit_ir::vec_set::VecSet<usize> = majit_ir::vec_set::VecSet::new();
         for node in state {
             Self::reset_positions_walk(node, &mut visited);
         }
@@ -664,7 +664,7 @@ impl VirtualState {
 
     fn reset_positions_walk(
         node: &Rc<VirtualStateInfoNode>,
-        visited: &mut std::collections::HashSet<usize>,
+        visited: &mut majit_ir::vec_set::VecSet<usize>,
     ) {
         let key = Rc::as_ptr(node) as usize;
         if !visited.insert(key) {
@@ -707,7 +707,7 @@ impl VirtualState {
     /// recursive nested Rcs participate in the dedup.
     pub fn count_forced_boxes_for_entry_static(
         rc: &Rc<VirtualStateInfoNode>,
-        visited: &mut std::collections::HashMap<usize, OpRef>,
+        visited: &mut crate::optimizeopt::vec_assoc::VecAssoc<usize, OpRef>,
     ) -> usize {
         // RPython virtualstate.py:111 first-visit guard via
         // `position == -1` — every visited node is recorded so a later
@@ -724,20 +724,17 @@ impl VirtualState {
         //   would each return 1 because they don't recurse through
         //   `_rc` and therefore never insert themselves; the dedup
         //   would silently fail and `numnotvirtuals` would over-count.
-        use std::collections::hash_map::Entry;
         let key = Rc::as_ptr(rc) as usize;
-        match visited.entry(key) {
-            Entry::Occupied(_) => return 0,
-            Entry::Vacant(e) => {
-                e.insert(OpRef::NONE);
-            }
+        if visited.contains_key(&key) {
+            return 0;
         }
+        visited.insert(key, OpRef::NONE);
         Self::count_forced_boxes_for_entry(rc, visited)
     }
 
     fn count_forced_boxes_for_entry(
         info: &VirtualStateInfo,
-        visited: &mut std::collections::HashMap<usize, OpRef>,
+        visited: &mut crate::optimizeopt::vec_assoc::VecAssoc<usize, OpRef>,
     ) -> usize {
         match info {
             VirtualStateInfo::Constant(_) => 0,
@@ -774,16 +771,13 @@ impl VirtualState {
     /// `is_some()` check, leaking NONE into downstream lookups.
     fn count_forced_boxes_for_entry_rc(
         rc: &Rc<VirtualStateInfoNode>,
-        visited: &mut std::collections::HashMap<usize, OpRef>,
+        visited: &mut crate::optimizeopt::vec_assoc::VecAssoc<usize, OpRef>,
     ) -> usize {
-        use std::collections::hash_map::Entry;
         let key = Rc::as_ptr(rc) as usize;
-        match visited.entry(key) {
-            Entry::Occupied(_) => return 0,
-            Entry::Vacant(e) => {
-                e.insert(OpRef::NONE);
-            }
+        if visited.contains_key(&key) {
+            return 0;
         }
+        visited.insert(key, OpRef::NONE);
         Self::count_forced_boxes_for_entry(rc, visited)
     }
 
@@ -1254,7 +1248,7 @@ impl VirtualState {
         let mut state = GenerateGuardState {
             ctx,
             extra_guards: &mut guards,
-            renum: HashMap::new(),
+            renum: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             bad: HashSet::new(),
             force_boxes,
         };
@@ -1273,7 +1267,7 @@ impl VirtualState {
         // the same expected virtual node (the trace assumes two values
         // are aliased but the incoming disagrees), and short-circuits
         // duplicate visits to a node already proven compatible. The same
-        // `HashMap` instance is threaded through every recursive call
+        // `VecAssoc` instance is threaded through every recursive call
         // (virtualstate.py:174-176 struct field, :260-261 array item,
         // :325-326 interior field) so nested virtual nodes share the
         // alias namespace with their top-level parents. Now lives on
@@ -2168,10 +2162,10 @@ impl Clone for VirtualState {
     /// subclass instances per VirtualState — this manual impl reproduces
     /// that invariant.
     fn clone(&self) -> Self {
-        let mut cache: std::collections::HashMap<
+        let mut cache: crate::optimizeopt::vec_assoc::VecAssoc<
             *const VirtualStateInfoNode,
             Rc<VirtualStateInfoNode>,
-        > = std::collections::HashMap::new();
+        > = crate::optimizeopt::vec_assoc::VecAssoc::new();
         let cloned: Vec<Rc<VirtualStateInfoNode>> = self
             .state
             .iter()
@@ -2186,7 +2180,10 @@ impl Clone for VirtualState {
 /// `<VirtualState as Clone>::clone`.
 fn deep_clone_node(
     src: &Rc<VirtualStateInfoNode>,
-    cache: &mut std::collections::HashMap<*const VirtualStateInfoNode, Rc<VirtualStateInfoNode>>,
+    cache: &mut crate::optimizeopt::vec_assoc::VecAssoc<
+        *const VirtualStateInfoNode,
+        Rc<VirtualStateInfoNode>,
+    >,
 ) -> Rc<VirtualStateInfoNode> {
     let key = Rc::as_ptr(src);
     if let Some(hit) = cache.get(&key) {
@@ -2338,7 +2335,7 @@ impl GuardRequirement {
                 // — known_class is a ConstPtr to the class.
                 let class_const = ctx.make_constant_ref(*expected_class);
                 let mut op = Op::new(OpCode::GuardClass, &[arg, class_const]);
-                op.fail_args = Some(Default::default());
+                op.setfailargs(Default::default());
                 vec![op]
             }
             GuardRequirement::GuardNonnullClass {
@@ -2358,7 +2355,7 @@ impl GuardRequirement {
                 // — known_class is a ConstPtr to the class.
                 let class_const = ctx.make_constant_ref(*expected_class);
                 let mut op = Op::new(OpCode::GuardNonnullClass, &[arg, class_const]);
-                op.fail_args = Some(Default::default());
+                op.setfailargs(Default::default());
                 vec![op]
             }
             GuardRequirement::GuardNonnull {
@@ -2374,7 +2371,7 @@ impl GuardRequirement {
                     }
                 };
                 let mut op = Op::new(OpCode::GuardNonnull, &[arg]);
-                op.fail_args = Some(Default::default());
+                op.setfailargs(Default::default());
                 vec![op]
             }
             GuardRequirement::GuardValue {
@@ -2403,7 +2400,7 @@ impl GuardRequirement {
                     Value::Void => unreachable!("LEVEL_CONSTANT cannot be Void"),
                 };
                 let mut op = Op::new(OpCode::GuardValue, &[arg, val_const]);
-                op.fail_args = Some(Default::default());
+                op.setfailargs(Default::default());
                 vec![op]
             }
             GuardRequirement::GuardBounds {
@@ -2436,7 +2433,7 @@ impl GuardRequirement {
                 // unroll.py:335 `isinstance(guard, GuardResOp)`.
                 for op in &mut emitted {
                     if matches!(op.opcode, OpCode::GuardTrue | OpCode::GuardValue) {
-                        op.fail_args = Some(Default::default());
+                        op.setfailargs(Default::default());
                     }
                 }
                 emitted
@@ -2479,15 +2476,15 @@ pub fn export_state(oprefs: &[OpRef], ctx: &OptContext) -> VirtualState {
 /// then overwrite" pattern from leaking the stub to in-flight recursive
 /// callers.
 pub(crate) struct ExportCache {
-    pub finished: HashMap<OpRef, Rc<VirtualStateInfoNode>>,
-    pub in_progress: std::collections::HashSet<OpRef>,
+    pub finished: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, Rc<VirtualStateInfoNode>>,
+    pub in_progress: majit_ir::vec_set::VecSet<OpRef>,
 }
 
 impl ExportCache {
     pub fn new() -> Self {
         Self {
-            finished: HashMap::new(),
-            in_progress: std::collections::HashSet::new(),
+            finished: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            in_progress: majit_ir::vec_set::VecSet::new(),
         }
     }
 }

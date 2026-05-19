@@ -9,8 +9,8 @@ use std::sync::Mutex;
 /// rpython/jit/backend/x86/runner.py AbstractX86CPU.
 use std::sync::atomic::Ordering;
 
-use majit_backend::{AsmInfo, Backend, BackendError, DeadFrame, JitCellToken};
-use majit_ir::{FailDescr, GcRef, InputArg, Op, OpRef, Type, Value};
+use majit_backend::{AsmInfo, Backend, BackendError, DeadFrame, ExitRecoveryLayout, JitCellToken};
+use majit_ir::{FailDescr, GcRef, InputArg, Op, OpRc, OpRef, Type, Value};
 
 #[cfg(target_arch = "aarch64")]
 use crate::aarch64::assembler::{AssemblerARM64 as Asm, CompiledCode};
@@ -649,9 +649,9 @@ pub struct DynasmBackend {
     /// Next header PC (green key).
     next_header_pc: u64,
     /// Constants for the next compilation.
-    constants: std::collections::HashMap<u32, i64>,
+    constants: majit_ir::VecAssoc<u32, i64>,
     /// Constant type annotations for GC rewriter.
-    constant_types: std::collections::HashMap<u32, majit_ir::Type>,
+    constant_types: majit_ir::VecAssoc<u32, majit_ir::Type>,
     /// llmodel.py:64-69 self.vtable_offset — byte offset of the typeptr
     /// field inside instance objects. None when gcremovetypeptr is enabled.
     vtable_offset: Option<usize>,
@@ -699,6 +699,20 @@ pub struct DynasmBackend {
 }
 
 impl DynasmBackend {
+    /// Legacy test-only entry point.  Production code routes the typed
+    /// pool through `Backend::set_constants_pool`; this raw-`i64`
+    /// helper is retained for in-crate tests that construct
+    /// `VecAssoc<u32, i64>` literals by hand.
+    pub fn set_constants(&mut self, constants: majit_ir::VecAssoc<u32, i64>) {
+        self.constants = constants;
+    }
+
+    /// Legacy test-only entry point — counterpart to `set_constants`
+    /// above; production callers route through `set_constants_pool`.
+    pub fn set_constant_types(&mut self, constant_types: majit_ir::VecAssoc<u32, majit_ir::Type>) {
+        self.constant_types = constant_types;
+    }
+
     #[inline]
     fn raw_mem_ptr(addr: i64, offset: i64) -> usize {
         assert_ne!(
@@ -759,8 +773,8 @@ impl DynasmBackend {
         DynasmBackend {
             next_trace_id: 1,
             next_header_pc: 0,
-            constants: std::collections::HashMap::new(),
-            constant_types: std::collections::HashMap::new(),
+            constants: majit_ir::VecAssoc::new(),
+            constant_types: majit_ir::VecAssoc::new(),
             vtable_offset: None,
             descr_attachments: Arc::new(std::sync::RwLock::new(
                 crate::guard::CpuDescrAttachments::default(),
@@ -906,7 +920,7 @@ impl DynasmBackend {
     /// gc.py:525-531 parity: build a GcRewriterImpl from the active GC.
     fn gc_rewriter(
         &self,
-        constant_types: &std::collections::HashMap<u32, majit_ir::Type>,
+        constant_types: &majit_ir::VecAssoc<u32, majit_ir::Type>,
     ) -> Option<majit_gc::rewrite::GcRewriterImpl> {
         with_dynasm_active_gc(|gc| {
             let ct = constant_types.clone();
@@ -1005,14 +1019,14 @@ impl DynasmBackend {
             .enumerate()
             .map(|(op_idx, op)| {
                 let mut n = op.clone();
-                if n.result_type() != Type::Void && n.pos.is_none() {
+                if n.result_type() != Type::Void && n.pos.get().is_none() {
                     let pos = num_inputs + op_idx as u32;
-                    n.pos = match n.result_type() {
+                    n.pos.set(match n.result_type() {
                         Type::Int => OpRef::int_op(pos),
                         Type::Float => OpRef::float_op(pos),
                         Type::Ref => OpRef::ref_op(pos),
                         Type::Void => unreachable!("filtered above"),
-                    };
+                    });
                 }
                 n
             })
@@ -1038,15 +1052,14 @@ impl DynasmBackend {
         // `constant_types_with_inputargs` build at compiler.rs:7042.
         let mut constant_types = self.constant_types.clone();
         for ia in inputargs.iter() {
-            constant_types.entry(ia.index).or_insert(ia.tp);
+            constant_types.entry_or_insert_with(ia.index, || ia.tp);
         }
         if let Some(rewriter) = self.gc_rewriter(&constant_types) {
             use majit_gc::GcRewriter;
-            let constants = &self.constants;
             let (result, new_constants, new_constant_types) =
-                rewriter.rewrite_for_gc_with_constants(&normalized, constants);
+                rewriter.rewrite_for_gc_with_constants(&normalized, &self.constants);
             for (k, v) in new_constants {
-                self.constants.entry(k).or_insert(v);
+                self.constants.entry_or_insert_with(k, || v);
             }
             for (k, tp) in new_constant_types {
                 // rewrite.py creates fresh ConstInt boxes for sizes, offsets
@@ -1054,7 +1067,7 @@ impl DynasmBackend {
                 // ConstInt object; pyre imports the rewriter's explicit
                 // side-channel type entry instead of guessing from the raw
                 // constant key.
-                self.constant_types.entry(k).or_insert(tp);
+                self.constant_types.entry_or_insert_with(k, || tp);
             }
             result
         } else {
@@ -1147,7 +1160,7 @@ impl DynasmBackend {
     fn collect_classptr_typeid_table(
         &self,
         ops: &[Op],
-        constants: &std::collections::HashMap<u32, i64>,
+        constants: &majit_ir::VecAssoc<u32, i64>,
     ) -> std::collections::HashMap<i64, u32> {
         let mut table = std::collections::HashMap::new();
         if self.vtable_offset.is_some() || DYNASM_ACTIVE_GC.with(|cell| cell.borrow().is_none()) {
@@ -1159,9 +1172,9 @@ impl DynasmBackend {
             if matches!(
                 op.opcode,
                 majit_ir::OpCode::GuardClass | majit_ir::OpCode::GuardNonnullClass
-            ) && op.args.len() >= 2
+            ) && op.num_args() >= 2
             {
-                if let Some(&classptr) = constants.get(&op.args[1].raw()) {
+                if let Some(&classptr) = constants.get(&op.arg(1).raw()) {
                     if let Some(tid) = self.lookup_typeid_from_classptr(classptr as usize) {
                         table.insert(classptr, tid);
                     }
@@ -1181,15 +1194,15 @@ impl DynasmBackend {
     fn collect_classptr_subclass_range_table(
         &self,
         ops: &[Op],
-        constants: &std::collections::HashMap<u32, i64>,
+        constants: &majit_ir::VecAssoc<u32, i64>,
     ) -> std::collections::HashMap<i64, (i64, i64)> {
         let mut table = std::collections::HashMap::new();
         if DYNASM_ACTIVE_GC.with(|cell| cell.borrow().is_none()) {
             return table;
         }
         for op in ops {
-            if op.opcode == majit_ir::OpCode::GuardSubclass && op.args.len() >= 2 {
-                if let Some(&classptr) = constants.get(&op.args[1].raw()) {
+            if op.opcode == majit_ir::OpCode::GuardSubclass && op.num_args() >= 2 {
+                if let Some(&classptr) = constants.get(&op.arg(1).raw()) {
                     if let Some(range) =
                         with_dynasm_active_gc(|gc| gc.subclass_range(classptr as usize)).flatten()
                     {
@@ -1590,15 +1603,21 @@ impl Backend for DynasmBackend {
     fn compile_loop(
         &mut self,
         inputargs: &[InputArg],
-        ops: &[Op],
+        ops: &[OpRc],
         token: &mut JitCellToken,
     ) -> Result<AsmInfo, BackendError> {
+        // Deep-clone Op out of OpRc for the internal pipeline. Backend
+        // stages do not depend on shared `_forwarded` identity with the
+        // trace; the optimizer has already resolved forwarding by the
+        // time ops reach `compile_loop` (history.py:528 vs. the
+        // backend-emit `Vec<Op>` boundary).
+        let ops_owned: Vec<Op> = ops.iter().map(|rc| (**rc).clone()).collect();
         token.inputarg_types = inputargs.iter().map(|ia| ia.tp).collect();
         let trace_id = self.next_trace_id;
         self.next_trace_id += 1;
         let header_pc = self.next_header_pc;
         // gc.py:109 rewrite_assembler parity: run GC rewriter before regalloc.
-        let prepared_ops = self.prepare_ops_for_compile(inputargs, ops);
+        let prepared_ops = self.prepare_ops_for_compile(inputargs, &ops_owned);
         let constants = std::mem::take(&mut self.constants);
         let constant_types = std::mem::take(&mut self.constant_types);
         let typeid_table = self.collect_classptr_typeid_table(&prepared_ops, &constants);
@@ -1707,15 +1726,13 @@ impl Backend for DynasmBackend {
         })
     }
 
-    fn set_constants(&mut self, constants: std::collections::HashMap<u32, i64>) {
-        self.constants = constants;
-    }
-
-    fn set_constant_types(
-        &mut self,
-        constant_types: std::collections::HashMap<u32, majit_ir::Type>,
-    ) {
-        self.constant_types = constant_types;
+    fn set_constants_pool(&mut self, constants: majit_ir::VecAssoc<u32, majit_ir::Const>) {
+        self.constants.clear();
+        self.constant_types.clear();
+        for (&k, c) in constants.iter() {
+            self.constants.insert(k, c.as_raw_i64());
+            self.constant_types.insert(k, c.get_type());
+        }
     }
 
     fn set_next_trace_id(&mut self, trace_id: u64) {
@@ -1791,15 +1808,18 @@ impl Backend for DynasmBackend {
         &mut self,
         fail_descr: &dyn FailDescr,
         inputargs: &[InputArg],
-        ops: &[Op],
+        ops: &[OpRc],
         original_token: &JitCellToken,
         _previous_tokens: &[std::sync::Arc<JitCellToken>],
         _caller_recovery_layout: Option<&majit_backend::ExitRecoveryLayout>,
     ) -> Result<AsmInfo, BackendError> {
+        // Deep-clone Op out of OpRc for the internal pipeline (see
+        // compile_loop above for rationale).
+        let ops_owned: Vec<Op> = ops.iter().map(|rc| (**rc).clone()).collect();
         let trace_id = self.next_trace_id;
         self.next_trace_id += 1;
 
-        let prepared_ops = self.prepare_ops_for_compile(inputargs, ops);
+        let prepared_ops = self.prepare_ops_for_compile(inputargs, &ops_owned);
         let constants = std::mem::take(&mut self.constants);
         let constant_types = std::mem::take(&mut self.constant_types);
         if crate::majit_log_enabled() && trace_id == 2 {
@@ -3215,10 +3235,10 @@ mod tests {
         }
     }
 
-    fn mk_op(opcode: OpCode, args: &[OpRef], pos: u32) -> Op {
-        let mut op = Op::new(opcode, args);
-        op.pos = OpRef::op_typed(pos, opcode.result_type());
-        op
+    fn mk_op(opcode: OpCode, args: &[OpRef], pos: u32) -> majit_ir::OpRc {
+        let op = Op::new(opcode, args);
+        op.pos.set(OpRef::op_typed(pos, opcode.result_type()));
+        std::rc::Rc::new(op)
     }
 
     fn make_call_assembler_descr(
@@ -3438,7 +3458,7 @@ mod tests {
         gc.register_type(TypeInfo::simple(24));
 
         let mut backend = DynasmBackend::new();
-        let mut consts = HashMap::new();
+        let mut consts: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         consts.insert(10000, 32_i64);
         consts.insert(10001, -8_i64);
         consts.insert(10002, 1_i64);
@@ -3510,7 +3530,7 @@ mod tests {
         gc.register_type(TypeInfo::simple(24));
 
         let mut backend = DynasmBackend::new();
-        let mut consts = HashMap::new();
+        let mut consts: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         consts.insert(10000, 32_i64);
         consts.insert(10001, -8_i64);
         consts.insert(10002, 1_i64);
@@ -3589,7 +3609,7 @@ mod tests {
         gc.register_type(TypeInfo::simple(24));
 
         let mut backend = DynasmBackend::new();
-        let mut consts = HashMap::new();
+        let mut consts: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         consts.insert(10000, 32_i64);
         consts.insert(10001, -8_i64);
         consts.insert(10002, 1_i64);
@@ -3679,7 +3699,7 @@ mod tests {
         let payload = gc.alloc_with_type(payload_tid, 16);
 
         let mut backend = DynasmBackend::new();
-        let mut consts = HashMap::new();
+        let mut consts: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         consts.insert(10000, 264_i64);
         consts.insert(10001, 256_i64);
         consts.insert(10002, 8_i64);
@@ -3751,7 +3771,7 @@ mod tests {
         assert_eq!(backend.get_ref_value(&direct, 0), payload);
 
         let mut call = mk_op(OpCode::CallAssemblerR, &[OpRef::input_arg_ref(0)], 1);
-        call.descr = Some(make_call_assembler_descr(
+        call.setdescr(make_call_assembler_descr(
             &callee_token,
             vec![Type::Ref],
             Type::Ref,
@@ -3777,7 +3797,7 @@ mod tests {
         let mut backend = make_call_assembler_backend();
 
         let inputargs = vec![InputArg::new_int(0)];
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 1);
         constants.insert(101, 0);
         backend.set_constants(constants);
@@ -3788,7 +3808,7 @@ mod tests {
         // referenced via `OpRef::input_arg_int(0)`. Variant-aware Eq/Hash
         // treats `IntOp(0)` and `InputArgInt(0)` as disjoint Box classes.
         let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(1)], OpRef::NONE.raw());
-        guard.fail_args = Some(vec![OpRef::input_arg_int(0)].into());
+        guard.setfailargs(vec![OpRef::input_arg_int(0)].into());
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
@@ -3804,7 +3824,7 @@ mod tests {
             ),
             {
                 let mut call = mk_op(OpCode::CallAssemblerI, &[OpRef::int_op(2)], 3);
-                call.descr = Some(make_call_assembler_descr(
+                call.setdescr(make_call_assembler_descr(
                     &token,
                     vec![Type::Int],
                     Type::Int,
@@ -3820,7 +3840,7 @@ mod tests {
         let guard_fail_index = backend.get_latest_descr(&failed).fail_index();
         let guard_trace_id = backend.get_latest_descr(&failed).trace_id();
         let guard_descr = DynasmBackend::find_descr(&token, guard_trace_id, guard_fail_index);
-        backend.set_constants(HashMap::new());
+        backend.set_constants(majit_ir::VecAssoc::new());
         let bridge_ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
@@ -3867,7 +3887,7 @@ mod tests {
         backend.set_gc_allocator(Box::new(gc));
 
         let inputargs = vec![InputArg::new_int(0), InputArg::new_ref(1)];
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 1);
         constants.insert(101, 0);
         backend.set_constants(constants);
@@ -3875,7 +3895,7 @@ mod tests {
         let mut token = JitCellToken::new(1603);
         backend.register_pending_target(token.number, vec![Type::Int, Type::Ref], 2, 2, -1);
         let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw());
-        guard.fail_args = Some(vec![OpRef::input_arg_int(0), OpRef::input_arg_ref(1)].into());
+        guard.setfailargs(vec![OpRef::input_arg_int(0), OpRef::input_arg_ref(1)].into());
         let ops = vec![
             mk_op(
                 OpCode::Label,
@@ -3899,7 +3919,7 @@ mod tests {
                     &[OpRef::int_op(3), OpRef::input_arg_ref(1)],
                     4,
                 );
-                call.descr = Some(make_call_assembler_descr(
+                call.setdescr(make_call_assembler_descr(
                     &token,
                     vec![Type::Int, Type::Ref],
                     Type::Ref,
@@ -3914,7 +3934,7 @@ mod tests {
         let guard_fail_index = backend.get_latest_descr(&failed).fail_index();
         let guard_trace_id = backend.get_latest_descr(&failed).trace_id();
         let guard_descr = DynasmBackend::find_descr(&token, guard_trace_id, guard_fail_index);
-        backend.set_constants(HashMap::new());
+        backend.set_constants(majit_ir::VecAssoc::new());
         let bridge_ops = vec![
             mk_op(
                 OpCode::Label,
@@ -3965,7 +3985,7 @@ mod tests {
         backend.set_gc_allocator(Box::new(gc));
 
         let inputargs = vec![InputArg::new_ref(0), InputArg::new_int(1)];
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 1);
         constants.insert(101, 0);
         backend.set_constants(constants);
@@ -3975,7 +3995,7 @@ mod tests {
         backend.register_pending_target(token.number, vec![Type::Ref, Type::Int], 2, 2, 0);
 
         let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw());
-        guard.fail_args = Some(vec![OpRef::input_arg_ref(0)].into());
+        guard.setfailargs(vec![OpRef::input_arg_ref(0)].into());
         let ops = vec![
             mk_op(
                 OpCode::Label,
@@ -3999,7 +4019,7 @@ mod tests {
                     &[OpRef::input_arg_ref(0), OpRef::int_op(3)],
                     4,
                 );
-                call.descr = Some(make_call_assembler_descr(
+                call.setdescr(make_call_assembler_descr(
                     &token,
                     vec![Type::Ref, Type::Int],
                     Type::Ref,
@@ -4014,7 +4034,7 @@ mod tests {
         let guard_fail_index = backend.get_latest_descr(&failed).fail_index();
         let guard_trace_id = backend.get_latest_descr(&failed).trace_id();
         let guard_descr = DynasmBackend::find_descr(&token, guard_trace_id, guard_fail_index);
-        backend.set_constants(HashMap::new());
+        backend.set_constants(majit_ir::VecAssoc::new());
         let bridge_ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
             mk_op(
@@ -4068,7 +4088,7 @@ mod tests {
         let field_descr: DescrRef =
             Arc::new(majit_ir::SimpleFieldDescr::new(0, 16, 8, Type::Int, false));
         let mut entry_getfield = mk_op(OpCode::GetfieldRawI, &[OpRef::input_arg_ref(0)], 2);
-        entry_getfield.descr = Some(field_descr);
+        entry_getfield.setdescr(field_descr);
         let callee_ops = vec![
             mk_op(
                 OpCode::Label,
@@ -4102,7 +4122,7 @@ mod tests {
             &[OpRef::input_arg_ref(0), OpRef::input_arg_int(1)],
             2,
         );
-        call.descr = Some(make_call_assembler_descr_with_expansion(
+        call.setdescr(make_call_assembler_descr_with_expansion(
             &callee_token,
             vec![Type::Ref, Type::Int],
             Type::Int,
@@ -4150,7 +4170,7 @@ mod tests {
         backend.set_gc_allocator(Box::new(gc));
 
         let inputargs = vec![InputArg::new_ref(0), InputArg::new_int(1)];
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 1);
         constants.insert(101, 0);
         backend.set_constants(constants);
@@ -4160,7 +4180,7 @@ mod tests {
         backend.register_pending_target(token.number, vec![Type::Ref, Type::Int], 2, 2, 0);
 
         let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw());
-        guard.fail_args = Some(vec![OpRef::input_arg_ref(0)].into());
+        guard.setfailargs(vec![OpRef::input_arg_ref(0)].into());
         let ops = vec![
             mk_op(
                 OpCode::Label,
@@ -4184,7 +4204,7 @@ mod tests {
                     &[OpRef::input_arg_ref(0), OpRef::int_op(3)],
                     4,
                 );
-                call.descr = Some(make_call_assembler_descr(
+                call.setdescr(make_call_assembler_descr(
                     &token,
                     vec![Type::Ref, Type::Int],
                     Type::Ref,
@@ -4199,11 +4219,11 @@ mod tests {
         let guard_fail_index = backend.get_latest_descr(&failed).fail_index();
         let guard_trace_id = backend.get_latest_descr(&failed).trace_id();
         let guard_descr = DynasmBackend::find_descr(&token, guard_trace_id, guard_fail_index);
-        backend.set_constants(HashMap::new());
+        backend.set_constants(majit_ir::VecAssoc::new());
         let field_descr: DescrRef =
             Arc::new(majit_ir::SimpleFieldDescr::new(0, 16, 8, Type::Int, false));
         let mut getfield = mk_op(OpCode::GetfieldRawI, &[OpRef::input_arg_ref(0)], 1);
-        getfield.descr = Some(field_descr);
+        getfield.setdescr(field_descr);
         let bridge_ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
             getfield,
@@ -4254,7 +4274,7 @@ mod tests {
         backend.set_gc_allocator(Box::new(gc));
 
         let inputargs = vec![InputArg::new_ref(0), InputArg::new_int(1)];
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 1);
         constants.insert(101, 2);
         backend.set_constants(constants);
@@ -4266,17 +4286,16 @@ mod tests {
         let field_descr: DescrRef =
             Arc::new(majit_ir::SimpleFieldDescr::new(0, 16, 8, Type::Int, false));
         let mut entry_getfield = mk_op(OpCode::GetfieldRawI, &[OpRef::input_arg_ref(0)], 2);
-        entry_getfield.descr = Some(field_descr.clone());
+        entry_getfield.setdescr(field_descr.clone());
 
         let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(3)], OpRef::NONE.raw());
-        guard.fail_args = Some(vec![OpRef::input_arg_ref(0)].into());
-
+        guard.setfailargs(vec![OpRef::input_arg_ref(0)].into());
         let mut call1 = mk_op(
             OpCode::CallAssemblerI,
             &[OpRef::input_arg_ref(0), OpRef::int_op(4)],
             6,
         );
-        call1.descr = Some(make_call_assembler_descr(
+        call1.setdescr(make_call_assembler_descr(
             &token,
             vec![Type::Ref, Type::Int],
             Type::Int,
@@ -4286,7 +4305,7 @@ mod tests {
             &[OpRef::input_arg_ref(0), OpRef::int_op(5)],
             7,
         );
-        call2.descr = Some(make_call_assembler_descr(
+        call2.setdescr(make_call_assembler_descr(
             &token,
             vec![Type::Ref, Type::Int],
             Type::Int,
@@ -4326,9 +4345,9 @@ mod tests {
         let guard_fail_index = backend.get_latest_descr(&failed).fail_index();
         let guard_trace_id = backend.get_latest_descr(&failed).trace_id();
         let guard_descr = DynasmBackend::find_descr(&token, guard_trace_id, guard_fail_index);
-        backend.set_constants(HashMap::new());
+        backend.set_constants(majit_ir::VecAssoc::new());
         let mut bridge_getfield = mk_op(OpCode::GetfieldRawI, &[OpRef::input_arg_ref(0)], 1);
-        bridge_getfield.descr = Some(field_descr);
+        bridge_getfield.setdescr(field_descr);
         let bridge_ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
             bridge_getfield,
@@ -4380,7 +4399,7 @@ mod tests {
         backend.set_gc_allocator(Box::new(gc));
 
         let inputargs = vec![InputArg::new_ref(0)];
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, wrong_vtable as i64);
         backend.set_constants(constants);
 
@@ -4390,7 +4409,7 @@ mod tests {
             &[OpRef::input_arg_ref(0), OpRef::int_op(100)],
             OpRef::NONE.raw(),
         );
-        guard.fail_args = Some(vec![OpRef::input_arg_ref(0)].into());
+        guard.setfailargs(vec![OpRef::input_arg_ref(0)].into());
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
             guard,
@@ -4407,7 +4426,7 @@ mod tests {
         let guard_trace_id = backend.get_latest_descr(&failed).trace_id();
         let guard_descr = DynasmBackend::find_descr(&token, guard_trace_id, guard_fail_index);
 
-        let mut bridge_constants = HashMap::new();
+        let mut bridge_constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         bridge_constants.insert(200, return_ref_passthrough as *const () as usize as i64);
         backend.set_constants(bridge_constants);
         let mut bridge_value = mk_op(
@@ -4415,7 +4434,7 @@ mod tests {
             &[OpRef::input_arg_ref(0), OpRef::int_op(200)],
             1,
         );
-        bridge_value.descr = Some(make_plain_call_descr(vec![], Type::Ref));
+        bridge_value.setdescr(make_plain_call_descr(vec![], Type::Ref));
         let bridge_ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
             bridge_value,
@@ -4470,7 +4489,7 @@ mod tests {
         backend.set_gc_allocator(Box::new(gc));
 
         let inputargs = vec![InputArg::new_ref(0), InputArg::new_ref(1)];
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, wrong_vtable as i64);
         backend.set_constants(constants);
 
@@ -4480,7 +4499,7 @@ mod tests {
             &[OpRef::input_arg_ref(1), OpRef::int_op(100)],
             OpRef::NONE.raw(),
         );
-        guard.fail_args = Some(vec![OpRef::input_arg_ref(0), OpRef::input_arg_ref(1)].into());
+        guard.setfailargs(vec![OpRef::input_arg_ref(0), OpRef::input_arg_ref(1)].into());
         let ops = vec![
             mk_op(
                 OpCode::Label,
@@ -4504,11 +4523,11 @@ mod tests {
         let guard_trace_id = backend.get_latest_descr(&failed).trace_id();
         let guard_descr = DynasmBackend::find_descr(&token, guard_trace_id, guard_fail_index);
 
-        backend.set_constants(HashMap::new());
+        backend.set_constants(majit_ir::VecAssoc::new());
         let field_descr: DescrRef =
             Arc::new(majit_ir::SimpleFieldDescr::new(0, 16, 8, Type::Int, false));
         let mut getfield = mk_op(OpCode::GetfieldRawI, &[OpRef::input_arg_ref(0)], 2);
-        getfield.descr = Some(field_descr);
+        getfield.setdescr(field_descr);
         let bridge_ops = vec![
             mk_op(
                 OpCode::Label,
@@ -4562,7 +4581,7 @@ mod tests {
         backend.set_gc_allocator(Box::new(gc));
 
         let inputargs = vec![InputArg::new_ref(0)];
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(200, return_ref_passthrough as *const () as usize as i64);
         backend.set_constants(constants);
 
@@ -4572,7 +4591,7 @@ mod tests {
             &[OpRef::input_arg_ref(0), OpRef::int_op(200)],
             1,
         );
-        passthrough.descr = Some(make_plain_call_descr(vec![], Type::Ref));
+        passthrough.setdescr(make_plain_call_descr(vec![], Type::Ref));
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
             passthrough,
@@ -4617,7 +4636,7 @@ mod tests {
             .compile_loop(&callee_inputargs, &callee_ops, &mut callee_token)
             .unwrap();
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(200, return_ref_passthrough as usize as i64);
         backend.set_constants(constants);
 
@@ -4626,9 +4645,9 @@ mod tests {
             &[OpRef::int_op(200), OpRef::input_arg_ref(0)],
             1,
         );
-        plain_call.descr = Some(make_plain_call_descr(vec![Type::Ref], Type::Ref));
+        plain_call.setdescr(make_plain_call_descr(vec![Type::Ref], Type::Ref));
         let mut call_asm = mk_op(OpCode::CallAssemblerR, &[OpRef::ref_op(1)], 2);
-        call_asm.descr = Some(make_call_assembler_descr(
+        call_asm.setdescr(make_call_assembler_descr(
             &callee_token,
             vec![Type::Ref],
             Type::Ref,
@@ -4682,7 +4701,7 @@ mod tests {
             .compile_loop(&callee_inputargs, &callee_ops, &mut callee_token)
             .unwrap();
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(201, return_ref_passthrough as *const () as usize as i64);
         backend.set_constants(constants);
 
@@ -4691,13 +4710,13 @@ mod tests {
             &[OpRef::int_op(201), OpRef::input_arg_ref(0)],
             2,
         );
-        plain_call.descr = Some(make_plain_call_descr(vec![Type::Ref], Type::Ref));
+        plain_call.setdescr(make_plain_call_descr(vec![Type::Ref], Type::Ref));
         let mut call_asm = mk_op(
             OpCode::CallAssemblerR,
             &[OpRef::ref_op(2), OpRef::input_arg_ref(1)],
             3,
         );
-        call_asm.descr = Some(make_call_assembler_descr(
+        call_asm.setdescr(make_call_assembler_descr(
             &callee_token,
             vec![Type::Ref, Type::Ref],
             Type::Ref,
@@ -4738,7 +4757,7 @@ mod tests {
         TEST_HELPER_ALLOC_TYPE_ID.store(payload_tid, Ordering::Relaxed);
 
         let mut backend = DynasmBackend::new();
-        let mut consts = HashMap::new();
+        let mut consts: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         consts.insert(
             203,
             alloc_marked_ref_collecting as *const () as usize as i64,
@@ -4762,13 +4781,13 @@ mod tests {
             .unwrap();
 
         let mut plain_call = mk_op(OpCode::CallR, &[OpRef::int_op(203)], 1);
-        plain_call.descr = Some(make_plain_call_descr(vec![], Type::Ref));
+        plain_call.setdescr(make_plain_call_descr(vec![], Type::Ref));
         let mut call_asm = mk_op(
             OpCode::CallAssemblerR,
             &[OpRef::input_arg_ref(1), OpRef::input_arg_ref(0)],
             2,
         );
-        call_asm.descr = Some(make_call_assembler_descr(
+        call_asm.setdescr(make_call_assembler_descr(
             &callee_token,
             vec![Type::Ref, Type::Ref],
             Type::Ref,
@@ -4779,7 +4798,7 @@ mod tests {
             call_asm,
             mk_op(OpCode::Finish, &[OpRef::ref_op(2)], OpRef::NONE.raw()),
         ];
-        let mut caller_consts = HashMap::new();
+        let mut caller_consts: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         caller_consts.insert(
             203,
             alloc_marked_ref_collecting as *const () as usize as i64,
@@ -4823,7 +4842,7 @@ mod tests {
         install_call_assembler_test_layout();
 
         let mut backend = DynasmBackend::new();
-        let mut consts = HashMap::new();
+        let mut consts: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         consts.insert(202, 32_i64);
         backend.set_constants(consts);
         backend.set_gc_allocator(Box::new(gc));
@@ -4847,7 +4866,7 @@ mod tests {
             &[OpRef::input_arg_ref(0), OpRef::input_arg_ref(1)],
             2,
         );
-        call_asm.descr = Some(make_call_assembler_descr(
+        call_asm.setdescr(make_call_assembler_descr(
             &callee_token,
             vec![Type::Ref, Type::Ref],
             Type::Ref,
@@ -4889,7 +4908,7 @@ mod tests {
         install_call_assembler_test_layout();
 
         let mut backend = DynasmBackend::new();
-        let mut consts = HashMap::new();
+        let mut consts: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         consts.insert(202, 32_i64);
         backend.set_constants(consts);
         backend.set_gc_allocator(Box::new(gc));
@@ -4912,7 +4931,7 @@ mod tests {
         assert_eq!(backend.get_ref_value(&direct, 0), payload);
 
         let mut call = mk_op(OpCode::CallAssemblerR, &[OpRef::input_arg_ref(0)], 1);
-        call.descr = Some(make_call_assembler_descr(
+        call.setdescr(make_call_assembler_descr(
             &callee_token,
             vec![Type::Ref],
             Type::Ref,
@@ -4950,7 +4969,7 @@ mod tests {
         TEST_HELPER_ALLOC_TYPE_ID.store(payload_tid, Ordering::Relaxed);
 
         let mut backend = DynasmBackend::new();
-        let mut consts = HashMap::new();
+        let mut consts: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         consts.insert(203, alloc_marked_ref as *const () as usize as i64);
         backend.set_constants(consts);
         backend.set_gc_allocator(Box::new(gc));
@@ -4966,14 +4985,14 @@ mod tests {
             .compile_loop(&callee_inputargs, &callee_ops, &mut callee_token)
             .unwrap();
 
-        let mut consts = HashMap::new();
+        let mut consts: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         consts.insert(203, alloc_marked_ref as *const () as usize as i64);
         backend.set_constants(consts);
 
         let mut plain_call = mk_op(OpCode::CallR, &[OpRef::int_op(203)], 1);
-        plain_call.descr = Some(make_plain_call_descr(vec![], Type::Ref));
+        plain_call.setdescr(make_plain_call_descr(vec![], Type::Ref));
         let mut call = mk_op(OpCode::CallAssemblerR, &[OpRef::ref_op(1)], 2);
-        call.descr = Some(make_call_assembler_descr(
+        call.setdescr(make_call_assembler_descr(
             &callee_token,
             vec![Type::Ref],
             Type::Ref,
@@ -5015,13 +5034,13 @@ mod tests {
         TEST_HELPER_ALLOC_TYPE_ID.store(payload_tid, Ordering::Relaxed);
 
         let mut backend = DynasmBackend::new();
-        let mut consts = HashMap::new();
+        let mut consts: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         consts.insert(205, alloc_marked_ref as *const () as usize as i64);
         backend.set_constants(consts);
         backend.set_gc_allocator(Box::new(gc));
 
         let mut plain_call = mk_op(OpCode::CallR, &[OpRef::int_op(205)], 0);
-        plain_call.descr = Some(make_plain_call_descr(vec![], Type::Ref));
+        plain_call.setdescr(make_plain_call_descr(vec![], Type::Ref));
         let ops = vec![
             plain_call,
             mk_op(OpCode::Finish, &[OpRef::ref_op(0)], OpRef::NONE.raw()),
@@ -5056,7 +5075,7 @@ mod tests {
         TEST_HELPER_ALLOC_TYPE_ID.store(payload_tid, Ordering::Relaxed);
 
         let mut backend = DynasmBackend::new();
-        let mut consts = HashMap::new();
+        let mut consts: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         consts.insert(
             206,
             alloc_marked_ref_collecting as *const () as usize as i64,
@@ -5065,7 +5084,7 @@ mod tests {
         backend.set_gc_allocator(Box::new(gc));
 
         let mut plain_call = mk_op(OpCode::CallR, &[OpRef::int_op(206)], 0);
-        plain_call.descr = Some(make_plain_call_descr(vec![], Type::Ref));
+        plain_call.setdescr(make_plain_call_descr(vec![], Type::Ref));
         let ops = vec![
             plain_call,
             mk_op(OpCode::Finish, &[OpRef::ref_op(0)], OpRef::NONE.raw()),
@@ -5255,13 +5274,13 @@ fn builtin_string_hash_field_descr(opcode: majit_ir::OpCode) -> Option<majit_ir:
 
 fn inject_builtin_string_descrs(ops: &mut [Op]) {
     for op in ops {
-        if op.descr.is_some() {
+        if op.has_descr() {
             continue;
         }
         if let Some(descr) = builtin_string_array_descr(op.opcode) {
-            op.descr = Some(descr);
+            op.setdescr(descr);
         } else if let Some(descr) = builtin_string_hash_field_descr(op.opcode) {
-            op.descr = Some(descr);
+            op.setdescr(descr);
         }
     }
 }

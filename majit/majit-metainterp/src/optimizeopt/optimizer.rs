@@ -12,7 +12,7 @@ use crate::optimizeopt::{
     virtualize::{OptVirtualize, VirtualizableConfig},
     vstring::OptString,
 };
-use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Type};
+use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRc, OpRef, Type};
 
 use crate::optimizeopt::info::PtrInfo;
 use crate::optimizeopt::{SnapshotBoxes, SnapshotFramePcs, SnapshotFrameSizes};
@@ -48,7 +48,8 @@ pub struct Optimizer {
     /// (via get_constant_box) → result value, carried across
     /// loop iterations so the optimizer can constant-fold repeated
     /// pure calls. RPython uses value-based equality for keys.
-    pub call_pure_results: std::collections::HashMap<Vec<majit_ir::Value>, majit_ir::Value>,
+    pub call_pure_results:
+        crate::optimizeopt::vec_assoc::VecAssoc<Vec<majit_ir::Value>, majit_ir::Value>,
     /// optimizer.py: `_last_guard_op` — tracks the last emitted guard
     /// for guard sharing and descriptor fusion.
     ///
@@ -68,7 +69,7 @@ pub struct Optimizer {
     /// a fresh OpRef per emitted guard so OpRef → Op is bijective on
     /// the guard subspace, matching RPython's object-identity keying.
     /// No site re-uses an OpRef across distinct guard ops.
-    replaces_guard: std::collections::HashMap<OpRef, Op>,
+    replaces_guard: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, Op>,
     /// optimizer.py: `pendingfields` — heap fields that need to be
     /// written back before the next guard (lazy set forcing).
     pendingfields: Vec<Op>,
@@ -79,10 +80,7 @@ pub struct Optimizer {
     /// pairs identifying the specific quasi-immutable slot that compiled
     /// code depends on. After compilation, each dependency gets the loop's
     /// invalidation flag registered as a per-slot watcher.
-    pub quasi_immutable_deps: std::collections::HashSet<(u64, u32)>,
-    /// Types of constant OpRefs from ConstantPool.constant_types.
-    /// Used to distinguish Ref constants from Int in guard fail_args.
-    pub constant_types: std::collections::HashMap<u32, majit_ir::Type>,
+    pub quasi_immutable_deps: Vec<(u64, u32)>,
     /// RPython unroll.py: import_state — virtual structures to inject at Phase 2 start.
     /// Maps the original loop-carried input slot to a recursive abstract
     /// description of the virtual's field values.
@@ -233,118 +231,35 @@ pub struct Optimizer {
     pub emitted_operations: std::collections::HashSet<OpRef>,
 }
 
-/// Lower a typed-`Value` constants pool back to the legacy
-/// `(HashMap<u32, i64>, HashMap<u32, Type>)` shape expected by the
-/// backend's `set_constants` / `set_constant_types` boundary.
+/// Lower a typed-`Value` constants pool into the dense
+/// `VecAssoc<u32, Const>` shape consumed by pyre-side guard metadata
+/// builders, CompiledTrace storage, and the backend's
+/// `set_constants_pool` boundary.
 ///
-/// history.py:220/261/307: `ConstInt/ConstFloat/ConstPtr` pin
-/// `Box.type` at construction, so the lowering is total — every
-/// `Value` round-trips to a single `(i64, Type)` pair.
-pub(crate) fn lower_typed_constants_to_backend(
-    constants: &std::collections::HashMap<u32, majit_ir::Value>,
-) -> (
-    std::collections::HashMap<u32, i64>,
-    std::collections::HashMap<u32, Type>,
-) {
-    let mut bits = std::collections::HashMap::with_capacity(constants.len());
-    let mut types = std::collections::HashMap::with_capacity(constants.len());
+/// history.py:220/261/307 `ConstInt/ConstFloat/ConstPtr` are the only
+/// constant classes — `Value::Void` panics rather than fabricate a
+/// nonexistent `ConstVoid`.
+pub(crate) fn lower_typed_constants_to_const_pool(
+    constants: &majit_ir::VecAssoc<u32, majit_ir::Value>,
+) -> crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Const> {
+    let mut pool = crate::optimizeopt::vec_assoc::VecAssoc::new();
     for (&k, v) in constants {
-        bits.insert(k, value_to_backend_constant_bits(v));
-        types.insert(k, v.get_type());
+        pool.insert(k, v.to_const());
     }
-    (bits, types)
-}
-
-fn type_for_backend_constant(
-    raw_key: u32,
-    ops: &[Op],
-    constant_types: &std::collections::HashMap<u32, Type>,
-) -> Type {
-    // Use explicit constant_types first (from ConstantPool),
-    // then fall back to ops result_type, then Int.
-    //
-    // The `ops` fallback compares by raw u32 (not OpRef Eq) because
-    // `raw_key` came from a HashMap key and has no variant tag while
-    // production `op.pos` is a typed body variant (IntOp / RefOp / …).
-    // Variant-aware Eq would always miss; raw comparison restores
-    // pre-Phase-3 semantics for the rare path where constant_types is
-    // empty.
-    constant_types
-        .get(&raw_key)
-        .copied()
-        .or_else(|| {
-            ops.iter()
-                .find(|op| op.pos.raw() == raw_key)
-                .map(|op| op.result_type())
-        })
-        .unwrap_or(Type::Int)
-}
-
-fn value_for_backend_constant(raw: i64, tp: Type) -> majit_ir::Value {
-    match tp {
-        Type::Ref => majit_ir::Value::Ref(majit_ir::GcRef(raw as usize)),
-        Type::Float => majit_ir::Value::Float(f64::from_bits(raw as u64)),
-        Type::Int => majit_ir::Value::Int(raw),
-        // history.py:220 / 261 / 307: every Const Box pins a non-Void
-        // `.type`. There is no `ConstVoid` class upstream, so a Void
-        // here means the resolver lost the type and is silently
-        // retagging the value — refuse rather than mint a spurious
-        // ConstInt(raw).
-        Type::Void => panic!(
-            "value_from_backend_constant_bits_typed: raw={raw:?} resolved to Type::Void; \
-             no ConstVoid class upstream (history.py:220)"
-        ),
-    }
-}
-
-/// Reconstruct a typed `OpRef` (and resolved `Type`) from a
-/// backend-constants HashMap key.  The raw u32 distinguishes
-/// const-namespace (`CONST_BIT` set) from op-namespace; the type comes
-/// from `constant_types` first, then a raw-keyed lookup against `ops`.
-/// Produces typed body / const variants so the OpRef downstream of
-/// `seed_constant` carries the variant tag (history.py:220 /
-/// resoperation.py:567).
-fn opref_and_type_for_backend_constant(
-    raw_key: u32,
-    ops: &[Op],
-    constant_types: &std::collections::HashMap<u32, Type>,
-) -> (OpRef, Type) {
-    let tp = type_for_backend_constant(raw_key, ops, constant_types);
-    let opref = if OpRef::raw_is_constant(raw_key) {
-        OpRef::const_typed(OpRef::raw_const_index(raw_key), tp)
-    } else {
-        OpRef::op_typed(raw_key, tp)
-    };
-    (opref, tp)
-}
-
-pub(crate) fn value_to_backend_constant_bits(value: &majit_ir::Value) -> i64 {
-    match value {
-        majit_ir::Value::Int(v) => *v,
-        majit_ir::Value::Ref(r) => r.0 as i64,
-        majit_ir::Value::Float(f) => f.to_bits() as i64,
-        // history.py:220/261/307 — only ConstInt/ConstFloat/ConstPtr
-        // exist upstream; there is no `ConstVoid` class. A Void constant
-        // reaching the backend boundary indicates a bookkeeping bug;
-        // surface it instead of silently lowering to a zero Int payload.
-        majit_ir::Value::Void => panic!(
-            "value_to_backend_constant_bits: Value::Void has no constant lowering \
-             (no ConstVoid upstream)"
-        ),
-    }
+    pool
 }
 
 fn live_runtime_positions(ops: &[Op]) -> Vec<bool> {
     let live_limit = ops
         .iter()
-        .filter(|op| !op.pos.is_none() && !op.pos.is_constant())
-        .map(|op| op.pos.raw() as usize + 1)
+        .filter(|op| !op.pos.get().is_none() && !op.pos.get().is_constant())
+        .map(|op| op.pos.get().raw() as usize + 1)
         .max()
         .unwrap_or(0);
     let mut live_positions = vec![false; live_limit];
     for op in ops {
-        if !op.pos.is_none() && !op.pos.is_constant() {
-            live_positions[op.pos.raw() as usize] = true;
+        if !op.pos.get().is_none() && !op.pos.get().is_constant() {
+            live_positions[op.pos.get().raw() as usize] = true;
         }
     }
     live_positions
@@ -352,7 +267,7 @@ fn live_runtime_positions(ops: &[Op]) -> Vec<bool> {
 
 pub(crate) fn sanitize_backend_constants_for_ops(
     ops: &[Op],
-    constants: &mut std::collections::HashMap<u32, majit_ir::Value>,
+    constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
 ) {
     let live_positions = live_runtime_positions(ops);
     constants
@@ -362,7 +277,7 @@ pub(crate) fn sanitize_backend_constants_for_ops(
 /// Export newly-discovered constants from `OptContext` into the
 /// optimizer's `constants: HashMap<u32, Value>` value pool. The
 /// backend boundary lowers the typed `Value` map back to its raw
-/// `i64` shape via `value_to_backend_constant_bits` when the
+/// `i64` shape via `Value::to_const().as_raw_i64()` when the
 /// `set_constants` call is made.
 ///
 /// history.py:220/261/307 box.type parity: `ConstInt/ConstFloat/ConstPtr`
@@ -372,7 +287,7 @@ pub(crate) fn sanitize_backend_constants_for_ops(
 /// `constant_types` side table.
 pub(crate) fn merge_backend_constants_from_ctx(
     ctx: &OptContext,
-    constants: &mut std::collections::HashMap<u32, majit_ir::Value>,
+    constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
 ) {
     let live_positions = live_runtime_positions(&ctx.new_operations);
 
@@ -395,9 +310,9 @@ pub(crate) fn merge_backend_constants_from_ctx(
             continue;
         }
         let key = OptContext::op_ref_for_value(idx as u32, &value).raw();
-        constants.entry(key).or_insert_with(|| value);
+        constants.entry_or_insert_with(key, || value);
     }
-    for (&const_idx, value) in &ctx.const_pool {
+    for (const_idx, value) in ctx.const_pool.iter() {
         let key = OptContext::const_ref_for_value(const_idx, value).raw();
         constants.insert(key, value.clone());
     }
@@ -439,7 +354,7 @@ impl Optimizer {
         ) {
             return false;
         }
-        let idx = op.pos.raw() as usize;
+        let idx = op.pos.get().raw() as usize;
         let Some(b) = box_pool.get(idx) else {
             return false;
         };
@@ -449,7 +364,7 @@ impl Optimizer {
         if target.const_value().is_none() {
             return false;
         }
-        op.args.is_empty() || op.args.iter().all(|arg| arg.is_none())
+        op.num_args() == 0 || op.getarglist().iter().all(|arg| arg.is_none())
     }
 
     fn import_virtual_state_value(
@@ -697,11 +612,11 @@ impl Optimizer {
         // Non-virtual states advance label_slot without creating entries.
         // Virtual states create entries with fields from label_args.
         // Build a map from inputarg_index to imported_virtual for virtual lookup.
-        let iv_map: std::collections::HashMap<usize, &_> = self
-            .imported_virtuals
-            .iter()
-            .map(|iv| (iv.inputarg_index, iv))
-            .collect();
+        let mut iv_map: crate::optimizeopt::vec_assoc::VecAssoc<usize, &_> =
+            crate::optimizeopt::vec_assoc::VecAssoc::new();
+        for iv in &self.imported_virtuals {
+            iv_map.insert(iv.inputarg_index, iv);
+        }
         let all_states = self
             .imported_loop_state
             .as_ref()
@@ -714,8 +629,8 @@ impl Optimizer {
         // The map value caches the imported Phase 2 OpRef for the first
         // visit so subsequent revisits resolve to the same box (mirroring
         // RPython's setinfo_from_preamble.get_forwarded sharing).
-        let mut walk_visited: std::collections::HashMap<usize, OpRef> =
-            std::collections::HashMap::new();
+        let mut walk_visited: crate::optimizeopt::vec_assoc::VecAssoc<usize, OpRef> =
+            crate::optimizeopt::vec_assoc::VecAssoc::new();
         for (state_idx, state_info) in all_states.iter().enumerate() {
             if let Some(iv) = iv_map.get(&state_idx) {
                 // Virtual state: process fields recursively, consuming slots
@@ -829,8 +744,8 @@ impl Optimizer {
                 .expect("imported virtual leaf missing box.type");
             let same_as_op = majit_ir::OpCode::same_as_for_type(tp);
             let mut op = majit_ir::Op::new(same_as_op, &[*label_arg]);
-            op.pos = ctx.reserve_pos_typed(tp);
-            let fresh = op.pos;
+            op.pos.set(ctx.reserve_pos_typed(tp));
+            let fresh = op.pos.get();
             // Op.type_ carries `tp` intrinsically (resoperation.py:1693
             // SAME_AS_*.type parity); the immediate push below makes
             // op_at(fresh) the authoritative type source. No
@@ -844,7 +759,8 @@ impl Optimizer {
         // unroll.py:55: if op.get_forwarded() is not None: return
         // Skip heads that already have PtrInfo (duplicate entries from
         // aliased JUMP args sharing the same VirtualState position).
-        let mut installed_heads = std::collections::HashSet::new();
+        let mut installed_heads: majit_ir::vec_set::VecSet<OpRef> =
+            majit_ir::vec_set::VecSet::new();
         for entry in entries {
             if !installed_heads.insert(entry.head) {
                 continue;
@@ -909,7 +825,7 @@ impl Optimizer {
         imported_label_args: &[OpRef],
         label_slot: &mut usize,
         ctx: &mut OptContext,
-        walk_visited: &mut std::collections::HashMap<usize, OpRef>,
+        walk_visited: &mut crate::optimizeopt::vec_assoc::VecAssoc<usize, OpRef>,
     ) -> OpRef {
         let key = std::rc::Rc::as_ptr(rc) as usize;
         if let Some(&cached) = walk_visited.get(&key) {
@@ -934,7 +850,7 @@ impl Optimizer {
         imported_label_args: &[OpRef],
         label_slot: &mut usize,
         ctx: &mut OptContext,
-        walk_visited: &mut std::collections::HashMap<usize, OpRef>,
+        walk_visited: &mut crate::optimizeopt::vec_assoc::VecAssoc<usize, OpRef>,
     ) -> OpRef {
         use crate::optimizeopt::virtualstate::VirtualStateInfo;
 
@@ -1140,13 +1056,12 @@ impl Optimizer {
             passes: Vec::new(),
             pureop_historylength: crate::jit::PARAMETERS.pureop_historylength as usize,
             final_num_inputs: 0,
-            call_pure_results: std::collections::HashMap::new(),
+            call_pure_results: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             last_guard_op_idx: None,
-            replaces_guard: std::collections::HashMap::new(),
+            replaces_guard: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             pendingfields: Vec::new(),
             can_replace_guards: true,
-            quasi_immutable_deps: std::collections::HashSet::new(),
-            constant_types: std::collections::HashMap::new(),
+            quasi_immutable_deps: Vec::new(),
             imported_virtuals: Vec::new(),
             trace_inputarg_types: Vec::new(),
             runtime_boxes: Vec::new(),
@@ -1201,7 +1116,10 @@ impl Optimizer {
 
     /// Look up a previously recorded CALL_PURE result.
     pub fn get_call_pure_result(&self, args: &[majit_ir::Value]) -> Option<&majit_ir::Value> {
-        self.call_pure_results.get(args)
+        self.call_pure_results
+            .iter()
+            .find(|(k, _)| k.as_slice() == args)
+            .map(|(_, v)| v)
     }
 
     /// bridgeopt.py:124-185: deserialize_optimizer_knowledge
@@ -1258,7 +1176,7 @@ impl Optimizer {
     /// the emit set even though it was substituted post-hoc rather
     /// than directly emitted via `_emit_operation`.
     pub fn replace_guard_op(&mut self, old_pos: OpRef, new_guard: Op) {
-        let new_pos = new_guard.pos;
+        let new_pos = new_guard.pos.get();
         self.replaces_guard.insert(old_pos, new_guard);
         self.emitted_operations.insert(new_pos);
     }
@@ -1374,12 +1292,13 @@ impl Optimizer {
         self.can_replace_guards = true;
     }
 
-    /// optimizer.py: quasi_immutable_deps[qmut] = None
-    /// Track a quasi-immutable field dependency. `dep` is (object_ptr,
-    /// field_index) identifying the specific slot the compiled loop
-    /// depends on. After compilation, a per-slot watcher is registered.
+    /// `optimizer.py:243` + `heap.py:807-808`
+    /// `self.quasi_immutable_deps[qmutdescr.qmut] = None`. Vec-backed
+    /// set with linear-scan dedup.
     pub fn add_quasi_immutable_dep(&mut self, dep: (u64, u32)) {
-        self.quasi_immutable_deps.insert(dep);
+        if !self.quasi_immutable_deps.contains(&dep) {
+            self.quasi_immutable_deps.push(dep);
+        }
     }
 
     /// optimizer.py: produce_potential_short_preamble_ops(sb)
@@ -1398,7 +1317,7 @@ impl Optimizer {
     pub fn export_all_cached_fields(
         &self,
         ctx: &mut OptContext,
-        available_boxes: Option<&std::collections::HashMap<OpRef, ()>>,
+        available_boxes: Option<&[OpRef]>,
     ) -> Vec<(OpRef, majit_ir::DescrRef, OpRef)> {
         let mut result = Vec::new();
         for pass in &self.passes {
@@ -1411,7 +1330,7 @@ impl Optimizer {
     pub fn export_all_cached_arrayitems(
         &self,
         ctx: &mut OptContext,
-        available_boxes: Option<&std::collections::HashMap<OpRef, ()>>,
+        available_boxes: Option<&[OpRef]>,
     ) -> Vec<(OpRef, i64, majit_ir::DescrRef, OpRef)> {
         let mut result = Vec::new();
         for pass in &self.passes {
@@ -1631,7 +1550,7 @@ impl Optimizer {
     /// The exported loop state should record the boxes that survive the end of
     /// the preamble after virtuals have been forced into a loop-carried shape.
     pub fn force_at_the_end_of_preamble(&mut self, opref: OpRef, ctx: &mut OptContext) -> OpRef {
-        let mut rec = std::collections::HashSet::new();
+        let mut rec: majit_ir::vec_set::VecSet<OpRef> = majit_ir::vec_set::VecSet::new();
         self.force_at_the_end_of_preamble_rec(opref, ctx, &mut rec)
     }
 
@@ -1639,7 +1558,7 @@ impl Optimizer {
         &mut self,
         opref: OpRef,
         ctx: &mut OptContext,
-        rec: &mut std::collections::HashSet<OpRef>,
+        rec: &mut majit_ir::vec_set::VecSet<OpRef>,
     ) -> OpRef {
         let resolved = ctx.get_box_replacement(opref);
         let resolved_box = ctx.get_box_replacement_box(resolved);
@@ -1860,10 +1779,7 @@ impl Optimizer {
     /// Mirrors PyPy exactly: ignore `MemoryError`-only effects when deciding
     /// whether a CALL_PURE breaks guard resume-data sharing.
     pub fn is_call_pure_pure_canraise(op: &Op) -> bool {
-        op.descr
-            .as_ref()
-            .and_then(|d| d.as_call_descr())
-            .map(|cd| cd.get_extra_info().check_can_raise(true))
+        op.with_call_descr(|cd| cd.get_extra_info().check_can_raise(true))
             .unwrap_or(true)
     }
 
@@ -1892,7 +1808,7 @@ impl Optimizer {
     /// Returns the optimized operation list.
     /// optimizer.py:517: propagate_all_forward(trace, call_pure_results, flush)
     pub fn propagate_all_forward(&mut self, ops: &[Op]) -> Vec<Op> {
-        self.optimize_with_constants(ops, &mut std::collections::HashMap::new())
+        self.optimize_with_constants(ops, &mut majit_ir::VecAssoc::new())
     }
 
     /// Run all optimization passes, with known constants pre-populated.
@@ -1908,7 +1824,7 @@ impl Optimizer {
     pub fn optimize_with_constants(
         &mut self,
         ops: &[Op],
-        constants: &mut std::collections::HashMap<u32, majit_ir::Value>,
+        constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
     ) -> Vec<Op> {
         self.optimize_with_constants_and_inputs(ops, constants, 0)
     }
@@ -1924,7 +1840,7 @@ impl Optimizer {
     pub fn optimize_with_constants_and_inputs(
         &mut self,
         ops: &[Op],
-        constants: &mut std::collections::HashMap<u32, majit_ir::Value>,
+        constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
         num_inputs: usize,
     ) -> Vec<Op> {
         // Ensure new ops get positions beyond all original trace positions.
@@ -1932,7 +1848,7 @@ impl Optimizer {
         // force materializations) must not collide with them.
         let max_pos = ops
             .iter()
-            .map(|op| op.pos)
+            .map(|op| op.pos.get())
             .filter(|op| !op.is_none() && !op.is_constant())
             .map(|op| op.raw())
             .max()
@@ -1952,7 +1868,7 @@ impl Optimizer {
     pub fn optimize_with_constants_and_inputs_at(
         &mut self,
         ops: &[Op],
-        constants: &mut std::collections::HashMap<u32, majit_ir::Value>,
+        constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
         num_inputs: usize,
         inputarg_base: u32,
         start_next_pos: u32,
@@ -2038,8 +1954,8 @@ impl Optimizer {
         // the Box.type retype invariant.
         let max_input = ops
             .iter()
-            .filter(|op| !op.pos.is_none() && op.result_type() != majit_ir::Type::Void)
-            .map(|op| op.pos.raw())
+            .filter(|op| !op.pos.get().is_none() && op.result_type() != majit_ir::Type::Void)
+            .map(|op| op.pos.get().raw())
             .max()
             .unwrap_or(0);
         let max_snapshot = self
@@ -2066,15 +1982,14 @@ impl Optimizer {
         // during optimization (rewrite.rs / simplify.rs). No synthetic
         // fallback — RPython relies solely on the actual GFC from tracing.
 
-        // RPython resume.py parity: pass snapshot_boxes and constant_types
-        // to OptContext so emit() can call store_final_boxes_in_guard inline
-        // at each guard emission (not post-assembly).
+        // RPython resume.py parity: pass snapshot_boxes to OptContext so
+        // emit() can call store_final_boxes_in_guard inline at each guard
+        // emission (not post-assembly).
         ctx.snapshot_boxes = self.snapshot_boxes.clone();
         ctx.snapshot_frame_sizes = self.snapshot_frame_sizes.clone();
         ctx.snapshot_vable_boxes = self.snapshot_vable_boxes.clone();
         ctx.snapshot_vref_boxes = self.snapshot_vref_boxes.clone();
         ctx.snapshot_frame_pcs = self.snapshot_frame_pcs.clone();
-        ctx.constant_types = self.constant_types.clone();
 
         sanitize_backend_constants_for_ops(ops, constants);
         // Pre-populate known constants so passes can see them.
@@ -2103,7 +2018,7 @@ impl Optimizer {
         // so new allocations (intdiv, make_guards) don't collide with
         // constants inherited from a previous phase.
         if !ctx.const_pool.is_empty() {
-            let max_idx = ctx.const_pool.keys().max().copied().unwrap_or(0);
+            let max_idx = ctx.const_pool.max_index().unwrap_or(0);
             ctx.next_const_idx = ctx.next_const_idx.max(max_idx + 1);
         }
 
@@ -2191,7 +2106,7 @@ impl Optimizer {
                     OpRef::input_arg_typed(pos, ctx.inputarg_type_at_strict(i))
                 })
                 .collect();
-            let source_set: std::collections::HashSet<OpRef> =
+            let source_set: majit_ir::vec_set::VecSet<OpRef> =
                 typed_inputargs.iter().copied().collect();
             let targetargs: Vec<OpRef> = (0..n)
                 .map(|i| {
@@ -2312,7 +2227,7 @@ impl Optimizer {
         let pre_jump_resolved_args = last_op
             .as_ref()
             .filter(|op| op.opcode == OpCode::Jump)
-            .map(|jump_op| jump_op.args.clone());
+            .map(|jump_op| jump_op.getarglist_copy());
 
         // RPython optimizer.py:552-556 (_propagate_all_forward):
         //     if flush:
@@ -2345,7 +2260,7 @@ impl Optimizer {
             let inputarg_types = self.trace_inputarg_types.clone();
             // Phase 1: resolve and call force_at_the_end_of_preamble on all args
             let resolved_args: Vec<OpRef> = terminal_op
-                .args
+                .getarglist()
                 .iter()
                 .map(|&arg| ctx.get_box_replacement(arg))
                 .collect();
@@ -2355,8 +2270,11 @@ impl Optimizer {
             // Phase 2: re-resolve after forcing (force may have changed forwarding)
             // and fix Ref→non-Ref type crossings by force_box
             let mut force_needed: Vec<usize> = Vec::new();
-            for (i, arg) in terminal_op.args.iter_mut().enumerate() {
-                let resolved = ctx.get_box_replacement(*arg);
+            // optimizer.py:651-652 force_box loop parity:
+            //   for i in range(op.numargs()): op.setarg(i, force_box(...))
+            for i in 0..terminal_op.num_args() {
+                let arg = terminal_op.arg(i);
+                let resolved = ctx.get_box_replacement(arg);
                 let expected_ref =
                     i < inputarg_types.len() && inputarg_types[i] == majit_ir::Type::Ref;
                 // setup_optimizations seeds `trace_inputarg_types` into
@@ -2372,7 +2290,7 @@ impl Optimizer {
                     ctx.opref_type(resolved) == Some(majit_ir::Type::Ref) || resolved_has_ptr_info;
                 if expected_ref && !resolved_is_ref && !ctx.is_constant(resolved) {
                     let arg_is_virtual = ctx
-                        .get_box_replacement_box(*arg)
+                        .get_box_replacement_box(arg)
                         .as_ref()
                         .map_or(false, |b| ctx.is_virtual(b));
                     if arg_is_virtual {
@@ -2390,13 +2308,13 @@ impl Optimizer {
                         // allowing Ref -> Float/Int type substitution at the JUMP.
                     }
                 } else {
-                    *arg = resolved;
+                    terminal_op.setarg(i, resolved);
                 }
             }
             for i in force_needed {
-                let original = terminal_op.args[i];
+                let original = terminal_op.arg(i);
                 let forced = self.force_box(original, &mut ctx);
-                terminal_op.args[i] = ctx.get_box_replacement(forced);
+                terminal_op.setarg(i, ctx.get_box_replacement(forced));
             }
             if self.skip_flush {
                 // flush=False: store for caller to consume.
@@ -2425,7 +2343,7 @@ impl Optimizer {
         // phase-wide OpRef→Type side table.
         self.phase1_emit_ops.clear();
         for op in &ctx.new_operations {
-            if !op.pos.is_none() && op.type_ != majit_ir::Type::Void {
+            if !op.pos.get().is_none() && op.type_ != majit_ir::Type::Void {
                 self.phase1_emit_ops.push(op.clone());
             }
         }
@@ -2466,7 +2384,7 @@ impl Optimizer {
             // — VS captured AFTER force + flush.
             let original_jump_args = pre_jump_resolved_args.clone()
                 .unwrap_or_else(|| {
-                    jump.args.iter()
+                    jump.getarglist().iter()
                         .map(|&a| ctx.get_box_replacement(a))
                         .collect()
                 });
@@ -2489,15 +2407,15 @@ impl Optimizer {
             // per phase; majit's flat OpRef space needs an explicit SameAs
             // alias so nia[j] points outside the body inputarg position range.
             {
-                let mut seen = std::collections::HashSet::new();
+                let mut seen: majit_ir::vec_set::VecSet<OpRef> = majit_ir::vec_set::VecSet::new();
                 // RPython parity: positions already holding an emitted op
                 // are phase 1 results, not body inputarg sources. Only
                 // the UNUSED positions in 0..num_inputs correspond to
                 // trace inputargs (`InputArgRef/Int/Float` in RPython).
-                let emitted_positions: std::collections::HashSet<OpRef> = ctx
+                let emitted_positions: majit_ir::vec_set::VecSet<OpRef> = ctx
                     .new_operations
                     .iter()
-                    .map(|op| op.pos)
+                    .map(|op| op.pos.get())
                     .filter(|p| !p.is_none())
                     .collect();
                 let original_args = resolved_args.clone();
@@ -2535,7 +2453,7 @@ impl Optimizer {
                     let same_as = OpCode::same_as_for_type(arg_type);
                     let fresh = ctx.alloc_op_position_typed(arg_type);
                     let mut op = Op::new(same_as, &[orig]);
-                    op.pos = fresh;
+                    op.pos.set(fresh);
                     // unroll.py:146 + compile.py:327 parity: accumulate the
                     // alias op in `extra_same_as` and splice it between the
                     // preamble body and the label at final assembly. Emitting
@@ -2673,11 +2591,12 @@ impl Optimizer {
                     // same resolved value. Independent get_box_replacement
                     // calls can diverge when forwarding chains differ.
                     // Use canonical_result (resolved key) for both.
-                    preamble_op.pos = canonical_result;
-                    for arg in &mut preamble_op.args {
-                        *arg = ctx.get_box_replacement(*arg);
+                    preamble_op.pos.set(canonical_result);
+                    // optimizer.py:651-652 force_box loop parity.
+                    for i in 0..preamble_op.num_args() {
+                        preamble_op.setarg(i, ctx.get_box_replacement(preamble_op.arg(i)));
                     }
-                    if let Some(fail_args) = preamble_op.fail_args.as_mut() {
+                    if let Some(fail_args) = preamble_op.fail_args_mut() {
                         for arg in fail_args {
                             *arg = ctx.get_box_replacement(*arg);
                         }
@@ -2696,16 +2615,16 @@ impl Optimizer {
                     eprintln!(
                         "[jit] exported_short_box: kind={:?} pos={:?} opcode={:?} args={:?} descr_idx={:?} invented={} same_as_source={:?}",
                         entry.kind,
-                        entry.op.pos,
+                        entry.op.pos.get(),
                         entry.op.opcode,
-                        entry.op.args,
-                        entry.op.descr.as_ref().map(|d| d.index()),
+                        entry.op.getarglist(),
+                        entry.op.getdescr().map(|d| d.index()),
                         entry.invented_name,
                         entry.same_as_source,
                     );
                 }
             }
-            let exported_int_bounds = self.collect_exported_int_bounds(&jump.args, &mut ctx);
+            let exported_int_bounds = self.collect_exported_int_bounds(&jump.getarglist(), &mut ctx);
             // RPython unroll.py:186-193 + compile.py:1084: `info.renamed_inputargs`
             // are the fresh per-iteration boxes from `trace.get_iter()`. They
             // live in this run's iteration namespace, not the original
@@ -2785,7 +2704,7 @@ impl Optimizer {
             let all_refs: Vec<OpRef> = ctx
                 .new_operations
                 .iter()
-                .flat_map(|op| op.args.iter().copied())
+                .flat_map(|op| op.getarglist_copy())
                 .filter(|r| !r.is_none())
                 .collect();
             for opref in all_refs {
@@ -2863,7 +2782,8 @@ impl Optimizer {
         // This ensures no position collisions between input block params and ops.
         if num_virtual_inputs > 0 {
             let fni = self.final_num_inputs as u32;
-            let mut remap = std::collections::HashMap::new();
+            let mut remap: crate::optimizeopt::vec_assoc::VecAssoc<u32, u32> =
+                crate::optimizeopt::vec_assoc::VecAssoc::new();
 
             // Virtual input positions: optimizer used num_inputs+k, backend needs num_inputs+k
             for k in 0..num_virtual_inputs {
@@ -2877,9 +2797,9 @@ impl Optimizer {
             // Op positions: reassign ALL ops to start from final_num_inputs.
             for (new_idx, op) in ctx.new_operations.iter_mut().enumerate() {
                 let new_pos = fni + new_idx as u32;
-                if !op.pos.is_none() {
-                    remap.insert(op.pos.raw(), new_pos);
-                    op.pos = op.pos.with_raw(new_pos);
+                if !op.pos.get().is_none() {
+                    remap.insert(op.pos.get().raw(), new_pos);
+                    op.pos.set(op.pos.get().with_raw(new_pos));
                 }
             }
 
@@ -2995,12 +2915,13 @@ impl Optimizer {
 
             // Apply remap to all args and fail_args
             for op in &mut ctx.new_operations {
-                for arg in &mut op.args {
+                for i in 0..op.num_args() {
+                    let arg = op.arg(i);
                     if let Some(&new_pos) = remap.get(&arg.raw()) {
-                        *arg = arg.with_raw(new_pos);
+                        op.setarg(i, arg.with_raw(new_pos));
                     }
                 }
-                if let Some(ref mut fail_args) = op.fail_args {
+                if let Some(fail_args) = op.fail_args_mut() {
                     for arg in fail_args.iter_mut() {
                         if let Some(&new_pos) = remap.get(&arg.raw()) {
                             *arg = arg.with_raw(new_pos);
@@ -3050,11 +2971,20 @@ impl Optimizer {
                 }
                 // Remap exported short boxes
                 for entry in &mut state.exported_short_boxes {
-                    remap_opref(&mut entry.op.pos);
-                    for arg in &mut entry.op.args {
-                        remap_opref(arg);
+                    // Cell::get() returns a copy; the previous
+                    // `remap_opref(&mut entry.op.pos.get())` mutated that
+                    // temporary and never wrote back.  Read into a local,
+                    // remap, then `set(...)` to persist the new OpRef on
+                    // the Cell.
+                    let mut new_pos = entry.op.pos.get();
+                    remap_opref(&mut new_pos);
+                    entry.op.pos.set(new_pos);
+                    for i in 0..entry.op.num_args() {
+                        let mut arg = entry.op.arg(i);
+                        remap_opref(&mut arg);
+                        entry.op.setarg(i, arg);
                     }
-                    if let Some(ref mut fa) = entry.op.fail_args {
+                    if let Some(fa) = entry.op.fail_args_mut() {
                         for arg in fa.iter_mut() {
                             remap_opref(arg);
                         }
@@ -3114,7 +3044,7 @@ impl Optimizer {
             );
             if cmf_count == 0 && gnf_count > 0 {
                 for (i, op) in ops.iter().enumerate() {
-                    eprintln!("[opt] idx={} {:?} pos={:?}", i, op.opcode, op.pos);
+                    eprintln!("[opt] idx={} {:?} pos={:?}", i, op.opcode, op.pos.get());
                 }
             }
         }
@@ -3139,7 +3069,7 @@ impl Optimizer {
     pub(crate) fn optimize_bridge(
         &mut self,
         ops: &[Op],
-        constants: &mut std::collections::HashMap<u32, majit_ir::Value>,
+        constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
         num_inputs: usize,
         front_target_tokens: &mut Vec<crate::optimizeopt::unroll::TargetToken>,
         runtime_boxes: &[OpRef],
@@ -3173,7 +3103,7 @@ impl Optimizer {
         let pre_opt_jump_args: Vec<OpRef> = ops
             .last()
             .filter(|op| op.opcode == OpCode::Jump)
-            .map(|op| op.args.to_vec())
+            .map(|op| op.getarglist().to_vec())
             .unwrap_or_default();
 
         // unroll.py:193: info, ops = self.propagate_all_forward(trace, ...)
@@ -3188,10 +3118,10 @@ impl Optimizer {
         let max_op_pos = ops
             .iter()
             .filter_map(|op| {
-                if op.pos.is_none() || op.pos.is_constant() {
+                if op.pos.get().is_none() || op.pos.get().is_constant() {
                     None
                 } else {
-                    Some(op.pos.raw())
+                    Some(op.pos.get().raw())
                 }
             })
             .max();
@@ -3218,7 +3148,7 @@ impl Optimizer {
         }
 
         let terminal_jump = terminal_jump.unwrap();
-        let jump_args = terminal_jump.args.to_vec();
+        let jump_args = terminal_jump.getarglist().to_vec();
 
         // unroll.py:198-200: not inline_short_preamble → jump_to_preamble
         // RPython calls send_extra_operation(jump_op) which forces virtuals
@@ -3240,10 +3170,14 @@ impl Optimizer {
                         .unwrap_or_else(|| vec![majit_ir::Type::Ref; ni]);
                     OptContext::with_inputarg_types(32, &types)
                 });
-                // unroll.py:240-242: jump_to_preamble → send_extra_operation
-                let mut jump_op = terminal_jump.clone();
-                jump_op.args = pre_opt_jump_args.clone().into();
-                jump_op.descr = Some(preamble_token.as_jump_target_descr());
+                // unroll.py:239-240: jump_to_preamble →
+                //   jump_op = jump_op.copy_and_change(rop.JUMP, descr=...)
+                //   self.send_extra_operation(jump_op)
+                let jump_op = terminal_jump.copy_and_change(
+                    OpCode::Jump,
+                    Some(&pre_opt_jump_args),
+                    Some(Some(preamble_token.as_jump_target_descr())),
+                );
                 self.send_extra_operation(&jump_op, &mut ctx);
                 let mut result = optimized_ops;
                 result.extend(ctx.new_operations.drain(..));
@@ -3310,9 +3244,12 @@ impl Optimizer {
             Err(()) => {
                 if let Some(preamble_token) = front_target_tokens.first() {
                     ctx.clear_newoperations();
-                    let mut jump_op = terminal_jump.clone();
-                    jump_op.args = pre_opt_jump_args.clone().into();
-                    jump_op.descr = Some(preamble_token.as_jump_target_descr());
+                    // unroll.py:239-240 jump_to_preamble parity.
+                    let jump_op = terminal_jump.copy_and_change(
+                        OpCode::Jump,
+                        Some(&pre_opt_jump_args),
+                        Some(Some(preamble_token.as_jump_target_descr())),
+                    );
                     self.send_extra_operation(&jump_op, &mut ctx);
                     let mut result = optimized_ops;
                     result.extend(ctx.new_operations.drain(..));
@@ -3386,9 +3323,12 @@ impl Optimizer {
         }
         if let Some(preamble_token) = front_target_tokens.first() {
             ctx.clear_newoperations();
-            let mut jump_op = terminal_jump.clone();
-            jump_op.args = pre_opt_jump_args.into();
-            jump_op.descr = Some(preamble_token.as_jump_target_descr());
+            // unroll.py:239-240 jump_to_preamble parity.
+            let jump_op = terminal_jump.copy_and_change(
+                OpCode::Jump,
+                Some(&pre_opt_jump_args),
+                Some(Some(preamble_token.as_jump_target_descr())),
+            );
             self.send_extra_operation(&jump_op, &mut ctx);
             let mut result = optimized_ops;
             result.extend(ctx.new_operations.drain(..));
@@ -3449,11 +3389,12 @@ impl Optimizer {
         &self,
         args: &[OpRef],
         ctx: &mut OptContext,
-    ) -> std::collections::HashMap<OpRef, crate::optimizeopt::intutils::IntBound> {
-        let mut exported = std::collections::HashMap::new();
+    ) -> crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::intutils::IntBound>
+    {
+        let mut exported = crate::optimizeopt::vec_assoc::VecAssoc::new();
         for pass in &self.passes {
-            for (opref, bound) in pass.export_arg_int_bounds(args, ctx) {
-                exported.insert(opref, bound);
+            for (opref, bound) in pass.export_arg_int_bounds(args, ctx).iter() {
+                exported.insert(*opref, bound.clone());
             }
         }
         exported
@@ -3521,8 +3462,9 @@ impl Optimizer {
         // post-`replace_op(_, const_target)` and de-sync from the
         // numbering snapshot.
         let mut resolved_op = op.clone();
-        for arg in &mut resolved_op.args {
-            *arg = ctx.get_box_replacement(*arg);
+        // optimizer.py:651-652 force_box loop parity.
+        for i in 0..resolved_op.num_args() {
+            resolved_op.setarg(i, ctx.get_box_replacement(resolved_op.arg(i)));
         }
 
         let mut current_op = resolved_op;
@@ -3533,7 +3475,7 @@ impl Optimizer {
             current_op.opcode,
             OpCode::SameAsI | OpCode::SameAsR | OpCode::SameAsF
         ) {
-            ctx.make_equal_to(current_op.pos, current_op.arg(0));
+            ctx.make_equal_to(current_op.pos.get(), current_op.arg(0));
             return;
         }
 
@@ -3568,8 +3510,8 @@ impl Optimizer {
                     debug_assert!(
                         !(current_op.opcode.is_guard()
                             && op.opcode.is_guard()
-                            && current_op.rd_resume_position >= 0
-                            && op.rd_resume_position < 0),
+                            && current_op.rd_resume_position.get() >= 0
+                            && op.rd_resume_position.get() < 0),
                         "Replace dropped rd_resume_position: {:?} -> {:?}",
                         current_op.opcode,
                         op.opcode,
@@ -3596,8 +3538,8 @@ impl Optimizer {
                     debug_assert!(
                         !(current_op.opcode.is_guard()
                             && op.opcode.is_guard()
-                            && current_op.rd_resume_position >= 0
-                            && op.rd_resume_position < 0),
+                            && current_op.rd_resume_position.get() >= 0
+                            && op.rd_resume_position.get() < 0),
                         "Restart dropped rd_resume_position: {:?} -> {:?}",
                         current_op.opcode,
                         op.opcode,
@@ -3685,7 +3627,7 @@ impl Optimizer {
         // optimizer.py:623-625: force_box on every arg unconditionally.
         for i in 0..op.num_args() {
             let arg = ctx.get_box_replacement(op.arg(i));
-            op.args[i] = self.force_box(arg, ctx);
+            op.setarg(i, self.force_box(arg, ctx));
         }
         // optimizer.py:626: self.metainterp_sd.profiler.count(Counters.OPT_OPS).
         // Pyre defers the fold into JitStatsCounters via update_counters
@@ -3701,14 +3643,14 @@ impl Optimizer {
 
             // optimizer.py:632-635: replaces_guard check BEFORE emit_guard_operation.
             if self.can_replace_guards {
-                if let Some(replacement) = self.replaces_guard.remove(&op.pos) {
-                    let target_pos = replacement.pos.raw() as usize;
+                if let Some(replacement) = self.replaces_guard.remove(&op.pos.get()) {
+                    let target_pos = replacement.pos.get().raw() as usize;
                     if target_pos < ctx.new_operations.len() {
                         if std::env::var_os("MAJIT_LOG").is_some() {
                             eprintln!(
                                 "[opt] guard replacement op={:?} pos={:?} target_index={} len={}",
                                 op.opcode,
-                                op.pos,
+                                op.pos.get(),
                                 target_pos,
                                 ctx.new_operations.len()
                             );
@@ -3730,15 +3672,15 @@ impl Optimizer {
                         // replacement guard without resume payload, which
                         // would silently overwrite the slot.  Match RPython
                         // by panicking instead of skipping.
-                        let old_descr = ctx.new_operations[target_pos].descr.as_ref().expect(
+                        let old_descr = ctx.new_operations[target_pos].getdescr().expect(
                             "optimizer.py:716 old_descr = old_op.getdescr(): \
                                  replaced guard slot has no descr",
                         );
-                        let new_descr = op.descr.as_ref().expect(
+                        let new_descr = op.getdescr().expect(
                             "optimizer.py:717 new_descr = new_op.getdescr(): \
                              replacement guard has no descr",
                         );
-                        crate::compile::copy_all_attributes_from(new_descr, old_descr);
+                        crate::compile::copy_all_attributes_from(&new_descr, &old_descr);
                         ctx.new_operations[target_pos] = op.clone();
                         ctx.in_final_emission = saved_in_final_emission;
                         return;
@@ -3769,14 +3711,14 @@ impl Optimizer {
                 majit_ir::Type::Int,
                 "returns_bool op must have int result: {:?} pos={:?} args={:?}",
                 op.opcode,
-                op.pos,
-                op.args
+                op.pos.get(),
+                op.getarglist()
             );
             // Slice 0.5: returns_bool ops are constructed Int-typed
             // (asserted above) and `Op.type_ == Int` already provides the
             // type to `opref_type` via the priority-2 op_at fast path.
             let op_pos_box = ctx
-                .ensure_box(op.pos)
+                .ensure_box(op.pos.get())
                 .expect("body-namespace OpRef must have a BoxRef slot");
             ctx.with_intbound_mut(&op_pos_box, |bound| bound.make_bool());
         }
@@ -3911,8 +3853,8 @@ impl Optimizer {
         // (`assert copied_from_descr is None`).  They are never on the
         // sharing chain.  Mirrors the OptContext path at
         // optimizeopt/mod.rs:3061-3066.
-        let shared = op.descr.is_none()
-            && op.rd_resume_position < 0
+        let shared = !op.has_descr()
+            && op.rd_resume_position.get() < 0
             && self.last_guard_op_idx.is_some()
             && opcode != OpCode::GuardNotForced
             && opcode != OpCode::GuardNotForced2;
@@ -3974,7 +3916,7 @@ impl Optimizer {
                             (pf_op.arg(0), pf_op.arg(1), -1i32)
                         };
                         majit_ir::GuardPendingFieldEntry {
-                            descr: pf_op.descr.clone(),
+                            descr: pf_op.getdescr(),
                             item_index,
                             target: ctx.get_box_replacement(target),
                             value: ctx.get_box_replacement(value),
@@ -4006,7 +3948,7 @@ impl Optimizer {
             // post-finish (mod.rs::store_final_boxes_in_guard).
             op = Self::store_final_boxes_in_guard(op, ctx, knowledge, pending_for_finish);
             // optimizer.py:681-683: force_box on each fail_arg for unrolling.
-            if let Some(ref fa) = op.fail_args {
+            if let Some(fa) = op.getfailargs() {
                 let fargs: Vec<OpRef> = fa.iter().copied().collect();
                 for farg in fargs {
                     if !farg.is_none() {
@@ -4074,15 +4016,14 @@ impl Optimizer {
         // would make `op.descr.fail_descr().rd_*()` reads fall back
         // to empty slices) or a two-hop prev.
         let last_descr = last
-            .descr
-            .as_ref()
+            .getdescr()
             .expect("optimizer.py:691 last_guard_op.getdescr() must exist");
         assert!(
             !last_descr.is_resume_guard_copied(),
             "optimizer.py:691 assert isinstance(last_descr, ResumeGuardDescr): \
              ResumeGuardCopiedDescr forbidden as sharing donor"
         );
-        op.descr = Some({
+        op.setdescr({
             use majit_ir::OpCode;
             match op.opcode {
                 OpCode::GuardException | OpCode::GuardNoException => {
@@ -4091,8 +4032,12 @@ impl Optimizer {
                 _ => crate::compile::make_resume_guard_copied_descr(last_descr.clone()),
             }
         });
-        op.fail_args = last.fail_args.clone();
-        op.rd_resume_position = last.rd_resume_position;
+        // optimizer.py:722: guard_op.setfailargs(last_guard_op.getfailargs())
+        match last.getfailargs() {
+            Some(fa) => op.setfailargs(fa.iter().copied().collect()),
+            None => op.clearfailargs(),
+        }
+        op.rd_resume_position.set(last.rd_resume_position.get());
         // bridgeopt.py parity: the class-knowledge bitfield baked into
         // rd_numb is indexed by the donor's per-livebox type layout.
         // `deserialize_optimizer_knowledge` reads that bitfield using the
@@ -4102,7 +4047,11 @@ impl Optimizer {
         // the bridge code falls back to the bridge tracer's (unboxed)
         // inputarg types, and the Ref count disagrees with the serializer
         // → rd_numb over-read. See memory/fannkuch_reg20_root_cause.md.
-        op.fail_arg_types = last.fail_arg_types.clone();
+        if let Some(types) = last.get_fail_arg_types() {
+            op.set_fail_arg_types(types.to_vec());
+        } else {
+            op.clear_fail_arg_types();
+        }
         // ResumeGuardCopiedDescr(prev) parity (compile.py:849
         // `get_resumestorage(): return prev`): the descr-side `prev`
         // pointer (set by `make_resume_guard_copied_descr` above)
@@ -4147,7 +4096,7 @@ impl Optimizer {
         // in rd_numb during numbering, and the liveboxes returned by
         // `finish()` / `descr.store_final_boxes` remain TAGBOX-only for
         // backend regalloc.
-        if let Some(ref mut fail_args) = op.fail_args {
+        if let Some(fail_args) = op.fail_args_mut() {
             for fa_idx in 0..fail_args.len() {
                 if !fail_args[fa_idx].is_none() {
                     fail_args[fa_idx] = ctx.get_box_replacement_not_const(fail_args[fa_idx]);
@@ -4286,14 +4235,22 @@ impl Optimizer {
         };
         // optimizer.py:776: replace_op_with(op, opnum, [op.getarg(0)], descr)
         let mut newop = Op::new(new_opcode, &[arg0]);
-        newop.pos = op.pos;
-        newop.descr = op.descr.clone();
-        newop.fail_args = op.fail_args.clone();
-        newop.fail_arg_types = op.fail_arg_types.clone();
+        newop.pos.set(op.pos.get());
+        if let Some(d) = op.getdescr() {
+            newop.setdescr(d);
+        }
+        match op.getfailargs() {
+            Some(fa) => newop.setfailargs(fa.iter().copied().collect()),
+            None => newop.clearfailargs(),
+        }
+        match op.get_fail_arg_types() {
+            Some(types) => newop.set_fail_arg_types(types.to_vec()),
+            None => newop.clear_fail_arg_types(),
+        }
         // compile.py:855 _attrs_ live on the descr; Arc-clone of
         // op.descr above shares the donor's RdPayload, so newop's
         // FailDescr::rd_* readers see the same data.
-        newop.rd_resume_position = op.rd_resume_position;
+        newop.rd_resume_position.set(op.rd_resume_position.get());
         newop
     }
 }
@@ -4367,7 +4324,7 @@ mod tests {
         let pool = vec![b0.clone()];
         opt.set_pending_box_pool(pool);
         let ops: Vec<Op> = Vec::new();
-        let mut constants = std::collections::HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         let _ = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1);
         // Pending pool drained.
         assert!(opt.pending_box_pool.is_empty());
@@ -4386,7 +4343,7 @@ mod tests {
                 // Check if second arg is constant 0
                 if let Some(0) = ctx.get_constant_int(op.arg(1)) {
                     // Replace with first arg
-                    ctx.replace_op(op.pos, op.arg(0));
+                    ctx.replace_op(op.pos.get(), op.arg(0));
                     return OptimizationResult::Remove;
                 }
             }
@@ -4423,8 +4380,8 @@ mod tests {
 
     impl Optimization for RemoveAsConstant {
         fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-            if op.pos == self.target {
-                ctx.make_constant(op.pos, majit_ir::Value::Int(self.value));
+            if op.pos.get() == self.target {
+                ctx.make_constant(op.pos.get(), majit_ir::Value::Int(self.value));
                 return OptimizationResult::Remove;
             }
             OptimizationResult::PassOn
@@ -4460,8 +4417,8 @@ mod tests {
 
     impl Optimization for RemoveAsTypedConstant {
         fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-            if op.pos == self.target {
-                ctx.make_constant(op.pos, self.value.clone());
+            if op.pos.get() == self.target {
+                ctx.make_constant(op.pos.get(), self.value.clone());
                 return OptimizationResult::Remove;
             }
             OptimizationResult::PassOn
@@ -4479,8 +4436,8 @@ mod tests {
 
     impl Optimization for MarkAsTypedConstantButKeep {
         fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-            if op.pos == self.target {
-                ctx.make_constant(op.pos, self.value.clone());
+            if op.pos.get() == self.target {
+                ctx.make_constant(op.pos.get(), self.value.clone());
             }
             OptimizationResult::PassOn
         }
@@ -4606,7 +4563,7 @@ mod tests {
 
                 let alloc = ctx.emit_extra(ctx.current_pass_idx, Op::new(OpCode::New, &[]));
                 let mut set = Op::new(OpCode::SetfieldGc, &[alloc, OpRef::int_op(0)]);
-                set.descr = Some(self.field_descr.clone());
+                set.setdescr(self.field_descr.clone());
                 ctx.emit_extra(ctx.current_pass_idx, set);
             }
             OptimizationResult::PassOn
@@ -4661,7 +4618,7 @@ mod tests {
         fn propagate_forward(&mut self, op: &Op, _ctx: &mut OptContext) -> OptimizationResult {
             if op.opcode == OpCode::IntAdd {
                 let mut restarted = Op::new(OpCode::IntSub, &[op.arg(0), op.arg(1)]);
-                restarted.pos = op.pos;
+                restarted.pos.set(op.pos.get());
                 return OptimizationResult::Restart(restarted);
             }
             OptimizationResult::PassOn
@@ -4679,11 +4636,8 @@ mod tests {
             OpCode::IntAdd,
             &[OpRef::int_op(0), OpRef::int_op(1)],
         )];
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut std::collections::HashMap::new(),
-            1024,
-        );
+        let result =
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::IntAdd);
     }
@@ -4701,9 +4655,9 @@ mod tests {
             OpCode::IntMul,
             &[OpRef::int_op(0), OpRef::int_op(1)],
         )];
-        ops[0].pos = OpRef::int_op(2);
+        ops[0].pos.set(OpRef::int_op(2));
         let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 2);
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 2);
 
         assert_eq!(
             hits.get(),
@@ -4744,14 +4698,15 @@ mod tests {
             Op::new(OpCode::Finish, &[OpRef::int_op(9)]),
         ];
         for (idx, op) in ops.iter_mut().enumerate() {
-            op.pos = OpRef::op_typed((idx as u32) + 3, op.opcode.result_type());
+            op.pos
+                .set(OpRef::op_typed((idx as u32) + 3, op.opcode.result_type()));
         }
 
         let mut opt = Optimizer::default_pipeline();
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
         let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 3);
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 3);
 
         let call_count = result
             .iter()
@@ -4806,7 +4761,7 @@ mod tests {
             &[],
             crate::compile::make_resume_guard_forced_descr_typed(guard_types_a.clone()),
         );
-        guard_a.fail_args = Some(
+        guard_a.setfailargs(
             vec![
                 OpRef::int_op(0),
                 OpRef::int_op(2000),
@@ -4818,7 +4773,7 @@ mod tests {
             ]
             .into(),
         );
-        guard_a.fail_arg_types = Some(guard_types_a);
+        guard_a.set_fail_arg_types(guard_types_a);
         let get_a_type = Op::with_descr(
             OpCode::GetfieldGcPureI,
             &[OpRef::int_op(3)],
@@ -4839,7 +4794,7 @@ mod tests {
             &[],
             crate::compile::make_resume_guard_forced_descr_typed(guard_types_b.clone()),
         );
-        guard_b.fail_args = Some(
+        guard_b.setfailargs(
             vec![
                 OpRef::int_op(0),
                 OpRef::int_op(2002),
@@ -4852,7 +4807,7 @@ mod tests {
             ]
             .into(),
         );
-        guard_b.fail_arg_types = Some(guard_types_b);
+        guard_b.set_fail_arg_types(guard_types_b);
         let get_b_type = Op::with_descr(
             OpCode::GetfieldGcPureI,
             &[OpRef::int_op(6)],
@@ -4875,24 +4830,26 @@ mod tests {
             finish,
         ];
         for (idx, op) in ops.iter_mut().enumerate() {
-            op.pos = OpRef::op_typed((idx as u32) + 3, op.opcode.result_type());
+            op.pos
+                .set(OpRef::op_typed((idx as u32) + 3, op.opcode.result_type()));
         }
-        call_a.pos = ops[0].pos;
-        call_b.pos = ops[4].pos;
+        call_a.pos.set(ops[0].pos.get());
+        call_b.pos.set(ops[4].pos.get());
 
         let mut opt = Optimizer::default_pipeline();
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
         let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 3);
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 3);
 
-        let call_positions: std::collections::HashSet<_> = result
+        let call_positions: majit_ir::vec_set::VecSet<_> = result
             .iter()
             .filter(|op| op.opcode == OpCode::CallMayForceR)
-            .map(|op| op.pos)
+            .map(|op| op.pos.get())
             .collect();
         assert!(
-            call_positions.contains(&call_a.pos) && call_positions.contains(&call_b.pos),
+            call_positions.contains(&call_a.pos.get())
+                && call_positions.contains(&call_b.pos.get()),
             "optimized trace lost CallMayForceR producer(s): {result:?}"
         );
         let guarded = result
@@ -4926,13 +4883,11 @@ mod tests {
             Op::new(OpCode::Jump, &[]),
         ];
         for (i, op) in ops.iter_mut().enumerate() {
-            op.pos = OpRef::op_typed(i as u32, op.opcode.result_type());
+            op.pos
+                .set(OpRef::op_typed(i as u32, op.opcode.result_type()));
         }
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut std::collections::HashMap::new(),
-            1024,
-        );
+        let result =
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
         // The duplicate INT_ADD should be eliminated by CSE (OptPure).
         let add_count = result.iter().filter(|o| o.opcode == OpCode::IntAdd).count();
         assert_eq!(add_count, 1, "CSE should eliminate duplicate INT_ADD");
@@ -4951,17 +4906,15 @@ mod tests {
             Op::new(OpCode::GetfieldRawI, &[OpRef::int_op(4)]),
             Op::new(OpCode::IntGt, &[OpRef::int_op(5), OpRef::int_op(1)]),
         ];
-        ops[0].pos = OpRef::int_op(3);
-        ops[1].pos = OpRef::int_op(4);
-        ops[2].pos = OpRef::int_op(5);
-        ops[3].pos = OpRef::int_op(6);
-
-        let mut constants = std::collections::HashMap::new();
+        ops[0].pos.set(OpRef::int_op(3));
+        ops[1].pos.set(OpRef::int_op(4));
+        ops[2].pos.set(OpRef::int_op(5));
+        ops[3].pos.set(OpRef::int_op(6));
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         constants.insert(1u32, majit_ir::Value::Int(27));
-        opt.constant_types.insert(1, Type::Int);
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 3);
 
-        let positions: Vec<_> = result.iter().map(|op| op.pos).collect();
+        let positions: Vec<_> = result.iter().map(|op| op.pos.get()).collect();
         assert_eq!(
             positions,
             vec![
@@ -4990,19 +4943,17 @@ mod tests {
             Op::new(OpCode::GetfieldRawI, &[OpRef::int_op(0)]),
             Op::new(OpCode::IntGt, &[OpRef::int_op(3), OpRef::int_op(1)]),
         ];
-        ops[0].pos = OpRef::int_op(3);
-        ops[1].pos = OpRef::int_op(4);
-        ops[2].pos = OpRef::int_op(5);
-        ops[3].pos = OpRef::int_op(6);
-
-        let mut constants = std::collections::HashMap::new();
+        ops[0].pos.set(OpRef::int_op(3));
+        ops[1].pos.set(OpRef::int_op(4));
+        ops[2].pos.set(OpRef::int_op(5));
+        ops[3].pos.set(OpRef::int_op(6));
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         constants.insert(1u32, majit_ir::Value::Int(27));
-        opt.constant_types.insert(1, Type::Int);
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 3);
 
-        assert_eq!(result[0].pos, OpRef::int_op(5));
-        assert_eq!(result[1].pos, OpRef::int_op(6));
-        assert_eq!(result[2].pos, OpRef::int_op(7));
+        assert_eq!(result[0].pos.get(), OpRef::int_op(5));
+        assert_eq!(result[1].pos.get(), OpRef::int_op(6));
+        assert_eq!(result[2].pos.get(), OpRef::int_op(7));
         assert_eq!(result[2].arg(0), OpRef::int_op(5));
         assert_eq!(constants.get(&5), None);
         assert_eq!(constants.get(&8), Some(&majit_ir::Value::Int(123)));
@@ -5020,17 +4971,14 @@ mod tests {
             OpCode::IntGt,
             &[OpRef::int_op(0), OpRef::int_op(1)],
         )];
-        ops[0].pos = OpRef::int_op(3);
-
-        let mut constants = std::collections::HashMap::new();
+        ops[0].pos.set(OpRef::int_op(3));
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         constants.insert(0u32, majit_ir::Value::Int(40));
         constants.insert(1u32, majit_ir::Value::Int(5));
-        opt.constant_types.insert(0, Type::Int);
-        opt.constant_types.insert(1, Type::Int);
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 3);
 
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].pos, OpRef::int_op(3));
+        assert_eq!(result[0].pos.get(), OpRef::int_op(3));
         assert_eq!(constants.get(&3), None);
     }
 
@@ -5042,19 +4990,15 @@ mod tests {
             OpCode::IntGt,
             &[OpRef::int_op(0), OpRef::int_op(1)],
         )];
-        ops[0].pos = OpRef::int_op(3);
-
-        let mut constants = std::collections::HashMap::new();
+        ops[0].pos.set(OpRef::int_op(3));
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         constants.insert(0u32, majit_ir::Value::Int(40));
         constants.insert(1u32, majit_ir::Value::Int(5));
         constants.insert(3u32, majit_ir::Value::Int(1));
-        opt.constant_types.insert(0, Type::Int);
-        opt.constant_types.insert(1, Type::Int);
-        opt.constant_types.insert(3, Type::Int);
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 3);
 
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].pos, OpRef::int_op(3));
+        assert_eq!(result[0].pos.get(), OpRef::int_op(3));
         assert_eq!(result[0].opcode, OpCode::IntGt);
         assert_eq!(constants.get(&3), None);
     }
@@ -5068,10 +5012,10 @@ mod tests {
             Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)]),
             Op::new(OpCode::Jump, &[OpRef::int_op(2)]),
         ];
-        ops[0].pos = OpRef::int_op(2);
-        ops[1].pos = OpRef::void_op(3);
+        ops[0].pos.set(OpRef::int_op(2));
+        ops[1].pos.set(OpRef::void_op(3));
 
-        let mut constants = std::collections::HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
 
         assert_eq!(result.len(), 1);
@@ -5081,7 +5025,7 @@ mod tests {
             .as_ref()
             .expect("skip_flush should preserve terminal jump");
         assert_eq!(terminal.opcode, OpCode::Jump);
-        assert_eq!(terminal.args.as_ref(), &[OpRef::int_op(2)]);
+        assert_eq!(&*terminal.getarglist(), &[OpRef::int_op(2)]);
     }
 
     #[test]
@@ -5096,7 +5040,7 @@ mod tests {
         // descrless GuardNonnull below — give it a real descr so
         // OptContext::emit_guard_operation finds a valid donor.
         let mut guard_true = Op::new(OpCode::GuardTrue, &[OpRef::int_op(100)]);
-        guard_true.descr = Some(crate::compile::make_resume_guard_descr_typed(Vec::new()));
+        guard_true.setdescr(crate::compile::make_resume_guard_descr_typed(Vec::new()));
         let mut ops = vec![
             guard_true,
             Op::new(OpCode::IntAdd, &[OpRef::int_op(100), OpRef::int_op(101)]),
@@ -5104,15 +5048,13 @@ mod tests {
             Op::new(OpCode::Finish, &[]),
         ];
         for (i, op) in ops.iter_mut().enumerate() {
-            op.pos = OpRef::op_typed(i as u32, op.opcode.result_type());
+            op.pos
+                .set(OpRef::op_typed(i as u32, op.opcode.result_type()));
         }
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut std::collections::HashMap::new(),
-            1024,
-        );
+        let result =
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
         let ctx = OptContext::new(result.len());
         // Just verify the counting methods work
         assert_eq!(Optimizer::get_count_of_ops(&ctx), 0); // empty ctx
@@ -5131,7 +5073,7 @@ mod tests {
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
         let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 0);
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 0);
 
         assert!(
             result.iter().any(|op| op.opcode == OpCode::GuardValue),
@@ -5172,10 +5114,10 @@ mod tests {
             Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)]),
             Op::new(OpCode::Jump, &[OpRef::int_op(0), OpRef::int_op(1)]),
         ];
-        ops[0].pos = OpRef::int_op(2);
-        ops[1].pos = OpRef::void_op(3);
+        ops[0].pos.set(OpRef::int_op(2));
+        ops[1].pos.set(OpRef::void_op(3));
 
-        let mut constants = std::collections::HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
 
         // force_all_lazy_setfields emits lazy SetfieldGc before JUMP.
@@ -5209,12 +5151,12 @@ mod tests {
 
                 let alloc_a = ctx.emit_extra(ctx.current_pass_idx, Op::new(OpCode::New, &[]));
                 let mut set_a = Op::new(OpCode::SetfieldGc, &[alloc_a, OpRef::int_op(0)]);
-                set_a.descr = Some(self.field_descr.clone());
+                set_a.setdescr(self.field_descr.clone());
                 ctx.emit_extra(ctx.current_pass_idx, set_a);
 
                 let alloc_b = ctx.emit_extra(ctx.current_pass_idx, Op::new(OpCode::New, &[]));
                 let mut set_b = Op::new(OpCode::SetfieldGc, &[alloc_b, OpRef::int_op(1)]);
-                set_b.descr = Some(self.field_descr.clone());
+                set_b.setdescr(self.field_descr.clone());
                 ctx.emit_extra(ctx.current_pass_idx, set_b);
             }
             OptimizationResult::PassOn
@@ -5238,27 +5180,28 @@ mod tests {
             Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)]),
             Op::new(OpCode::Jump, &[OpRef::int_op(0), OpRef::int_op(1)]),
         ];
-        ops[0].pos = OpRef::int_op(2);
-        ops[1].pos = OpRef::void_op(3);
+        ops[0].pos.set(OpRef::int_op(2));
+        ops[1].pos.set(OpRef::void_op(3));
 
-        let mut constants = std::collections::HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
-
-        let op_index: std::collections::HashMap<_, _> = result
-            .iter()
-            .enumerate()
-            .map(|(idx, op)| (op.pos, idx))
-            .collect();
 
         for set_op in result.iter().filter(|op| op.opcode == OpCode::SetfieldGc) {
             let alloc_ref = set_op.arg(0);
             let new_idx = result
                 .iter()
-                .position(|op| op.opcode == OpCode::New && op.pos == alloc_ref)
+                .position(|op| op.opcode == OpCode::New && op.pos.get() == alloc_ref)
                 .unwrap_or_else(|| panic!("missing New for {alloc_ref:?} in {result:?}"));
-            let set_idx = *op_index
-                .get(&set_op.pos)
-                .unwrap_or_else(|| panic!("missing setfield pos {:?} in {:?}", set_op.pos, result));
+            let set_idx = result
+                .iter()
+                .position(|op| op.pos.get() == set_op.pos.get())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "missing setfield pos {:?} in {:?}",
+                        set_op.pos.get(),
+                        result
+                    )
+                });
             assert!(
                 new_idx < set_idx,
                 "matching New must appear before SetfieldGc; got {:?}",
@@ -5285,23 +5228,23 @@ mod tests {
             Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)]),
             Op::new(OpCode::Jump, &[OpRef::int_op(0), OpRef::int_op(1)]),
         ];
-        ops[0].pos = OpRef::int_op(2);
-        ops[1].pos = OpRef::void_op(3);
+        ops[0].pos.set(OpRef::int_op(2));
+        ops[1].pos.set(OpRef::void_op(3));
 
-        let mut constants = std::collections::HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
 
-        let new_positions: std::collections::HashSet<_> = result
+        let new_positions: majit_ir::vec_set::VecSet<_> = result
             .iter()
             .filter(|op| op.opcode == OpCode::New)
-            .map(|op| op.pos.raw())
+            .map(|op| op.pos.get().raw())
             .collect();
         assert!(
             !new_positions.is_empty(),
             "expected force-like New op in optimized trace; got {:?}",
             result
         );
-        for pos in &new_positions {
+        for pos in new_positions.iter() {
             assert!(
                 !constants.contains_key(pos),
                 "live New position v{pos} must not collide with exported int constant map {:?}; trace {:?}",
@@ -5332,23 +5275,23 @@ mod tests {
             Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)]),
             Op::new(OpCode::Jump, &[OpRef::int_op(0), OpRef::int_op(1)]),
         ];
-        ops[0].pos = OpRef::int_op(66);
-        ops[1].pos = OpRef::void_op(67);
+        ops[0].pos.set(OpRef::int_op(66));
+        ops[1].pos.set(OpRef::void_op(67));
 
-        let mut constants = std::collections::HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         constants.insert(OpRef::const_int(0).raw(), majit_ir::Value::Int(472));
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
 
-        let new_positions: std::collections::HashSet<_> = result
+        let new_positions: majit_ir::vec_set::VecSet<_> = result
             .iter()
             .filter(|op| op.opcode == OpCode::New)
-            .map(|op| op.pos.raw())
+            .map(|op| op.pos.get().raw())
             .collect();
         // With high-bit constant namespace, constant OpRefs never collide with
         // operation positions, so the New op lands at next_pos (68) directly.
-        assert_eq!(
-            new_positions,
-            std::collections::HashSet::from([68]),
+        assert_eq!(new_positions.len(), 1, "got {:?}", result);
+        assert!(
+            new_positions.contains(&68),
             "queued New should get next available slot; got {:?}",
             result
         );
@@ -5390,8 +5333,7 @@ mod tests {
         let field_descr = majit_ir::make_field_descr(8, 8, Type::Int, majit_ir::ArrayFlag::Signed);
 
         let mut guard = Op::new(OpCode::GuardTrue, &[OpRef::int_op(10)]);
-        guard.fail_args = Some(vec![OpRef::int_op(0)].into());
-
+        guard.setfailargs(vec![OpRef::int_op(0)].into());
         let mut ops = vec![
             Op::with_descr(OpCode::New, &[], size_descr),
             Op::with_descr(
@@ -5403,14 +5345,12 @@ mod tests {
             Op::new(OpCode::Jump, &[]),
         ];
         for (i, op) in ops.iter_mut().enumerate() {
-            op.pos = OpRef::op_typed(i as u32, op.opcode.result_type());
+            op.pos
+                .set(OpRef::op_typed(i as u32, op.opcode.result_type()));
         }
 
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut std::collections::HashMap::new(),
-            1024,
-        );
+        let result =
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
         let guard = result
             .iter()
             .find(|op| op.opcode == OpCode::GuardTrue)
@@ -5426,10 +5366,7 @@ mod tests {
             guard.resolved_rd_virtuals().is_some(),
             "virtual structure should be encoded into rd_virtuals tree"
         );
-        let fail_args = guard
-            .fail_args
-            .as_ref()
-            .expect("guard should keep fail args");
+        let fail_args = guard.getfailargs().expect("guard should keep fail args");
         // resume.py:411-417 parity: liveboxes is TAGBOX-only.  The virtual
         // p0 is encoded into rd_virtuals; only its int field (OpRef::int_op(11))
         // survives in liveboxes.
@@ -5475,7 +5412,7 @@ mod tests {
             &[OpRef::int_op(50)],
         ));
 
-        let mut constants = std::collections::HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         let result = opt.optimize_with_constants_and_inputs_at(&[], &mut constants, 3, 0, 0);
 
         assert!(result.is_empty());
@@ -5526,7 +5463,7 @@ mod tests {
     #[test]
     fn test_is_call_pure_pure_canraise_ignores_memoryerror_only() {
         let mut op = Op::new(OpCode::CallPureI, &[OpRef::int_op(0), OpRef::int_op(1)]);
-        op.descr = Some(Arc::new(TestCallDescr {
+        op.setdescr(Arc::new(TestCallDescr {
             idx: 400,
             effect: EffectInfo::new(ExtraEffect::ElidableOrMemoryError, OopSpecIndex::None),
             result_type: majit_ir::Type::Int,
@@ -5540,7 +5477,7 @@ mod tests {
     #[test]
     fn test_is_call_pure_pure_canraise_true_for_other_raising_effects() {
         let mut op = Op::new(OpCode::CallPureI, &[OpRef::int_op(0), OpRef::int_op(1)]);
-        op.descr = Some(Arc::new(TestCallDescr {
+        op.setdescr(Arc::new(TestCallDescr {
             idx: 401,
             effect: EffectInfo::new(ExtraEffect::ElidableCanRaise, OopSpecIndex::None),
             result_type: majit_ir::Type::Int,
@@ -5707,7 +5644,7 @@ mod tests {
         assert!(!ctx.in_final_emission);
         assert!(ctx.new_operations.iter().any(|op| op.opcode == OpCode::New));
         assert!(ctx.new_operations.iter().any(|op| {
-            op.opcode == OpCode::SetfieldGc && op.arg(1) == OpRef::int_op(11) && op.descr.is_some()
+            op.opcode == OpCode::SetfieldGc && op.arg(1) == OpRef::int_op(11) && op.has_descr()
         }));
         // info.py:146-151: force_box emits the ORIGINAL box op, so the
         // forced GuardNonnull keeps arg(0) = OpRef::ref_op(10) (matches the virtual's
@@ -5725,7 +5662,7 @@ mod tests {
         let mut ctx = OptContext::with_inputarg_types(16, &[Type::Ref]);
 
         let mut preamble_op = Op::new(OpCode::IntGe, &[OpRef::int_op(3), OpRef::int_op(10_000)]);
-        preamble_op.pos = OpRef::int_op(14);
+        preamble_op.pos.set(OpRef::int_op(14));
         ctx.make_constant(OpRef::int_op(10_000), majit_ir::Value::Int(0));
         ctx.initialize_imported_short_preamble_builder(
             &[OpRef::int_op(0)],
@@ -5738,21 +5675,21 @@ mod tests {
                 same_as_source: None,
             }],
         );
-        ctx.potential_extra_ops.insert(
+        ctx.set_potential_extra_op(
             OpRef::int_op(14),
             crate::optimizeopt::info::PreambleOp {
                 op: OpRef::int_op(14),
                 invented_name: false,
                 preamble_op: {
                     let mut op = majit_ir::Op::new(majit_ir::OpCode::SameAsI, &[OpRef::int_op(14)]);
-                    op.pos = OpRef::op_typed(14, op.result_type());
+                    op.pos.set(OpRef::op_typed(14, op.result_type()));
                     op
                 },
             },
         );
 
         let mut guard = Op::new(OpCode::GuardTrue, &[OpRef::int_op(14)]);
-        guard.pos = OpRef::op_typed(15, guard.result_type());
+        guard.pos.set(OpRef::op_typed(15, guard.result_type()));
         let (mut seeded_ops, snapshots) =
             super::super::seed_empty_guard_snapshots(std::slice::from_ref(&guard));
         ctx.snapshot_boxes = snapshots;
@@ -5781,20 +5718,18 @@ mod tests {
             Op::new(OpCode::GuardTrue, &[OpRef::int_op(100)]),
             Op::new(OpCode::Finish, &[]),
         ];
-        ops[1].fail_args = Some(vec![OpRef::int_op(100), OpRef::int_op(101)].into());
+        ops[1].setfailargs(vec![OpRef::int_op(100), OpRef::int_op(101)].into());
         for (i, op) in ops.iter_mut().enumerate() {
-            op.pos = OpRef::op_typed(i as u32, op.opcode.result_type());
+            op.pos
+                .set(OpRef::op_typed(i as u32, op.opcode.result_type()));
         }
 
         let (ops, snapshots) = super::super::seed_guard_snapshots_with(&ops, |_| {
             vec![OpRef::int_op(100), OpRef::int_op(101)]
         });
         opt.snapshot_boxes = snapshots;
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut std::collections::HashMap::new(),
-            1024,
-        );
+        let result =
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
 
         let guard = result
             .iter()

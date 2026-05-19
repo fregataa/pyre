@@ -12,7 +12,7 @@
 //! port `BlackholeInterpreter.setup_insns` so the metainterp can consume
 //! this type directly, eliminating the fork.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ops::Deref;
 use std::sync::OnceLock;
 
@@ -101,17 +101,17 @@ pub struct JitCodeBody {
     /// set is empty. `blackhole.py:86 dispatch_loop` consults
     /// `_startpoints is not None` to gate its non-translated `pc in
     /// self._startpoints` assertion.
-    pub startpoints: Option<HashSet<usize>>,
+    pub startpoints: Option<majit_ir::vec_set::VecSet<usize>>,
     /// RPython `jitcode.py:41` `self._alllabels = alllabels` — debug-only
     /// set of bytecode offsets that are label targets.
     /// `setup(..., alllabels=None)` (jitcode.py:24) is the upstream
     /// default; assembled jitcodes always populate `Some(set)`.
-    pub alllabels: Option<HashSet<usize>>,
+    pub alllabels: Option<majit_ir::vec_set::VecSet<usize>>,
     /// RPython `jitcode.py:42` `self._resulttypes = resulttypes` —
     /// debug-only map from bytecode offset to result type char.  `None`
     /// is the exact `JitCode.setup(..., resulttypes=None)` sentinel;
     /// assembled jitcodes store `Some(dict)`, even when the dict is empty.
-    pub resulttypes: Option<HashMap<usize, char>>,
+    pub resulttypes: Option<majit_ir::vec_assoc::VecAssoc<usize, char>>,
     /// RPython `jitcode.py:20` `self._ssarepr = None` — debug: the
     /// flattened SSA representation, kept for `dump()` output. Set by
     /// `Assembler.assemble` (assembler.py:49 `jitcode._ssarepr = ssarepr`).

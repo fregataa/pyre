@@ -17,7 +17,7 @@ use std::sync::Arc;
 use failguard::{CompiledWasmLoop, WasmFailDescr, WasmFrameData};
 use majit_backend::{AsmInfo, BackendError, DeadFrame, JitCellToken};
 use majit_gc::GcAllocator;
-use majit_ir::{FailDescr, GcRef, InputArg, Op, Value};
+use majit_ir::{FailDescr, GcRef, InputArg, Op, OpRc, Value};
 
 thread_local! {
     /// llmodel.py self.gc_ll_descr — owned by the active wasm
@@ -127,7 +127,7 @@ fn wasm_gc_owns_object(addr: usize) -> bool {
 pub struct WasmBackend {
     trace_counter: u64,
     /// Optimizer constant pool (constant-namespace OpRef → i64 value).
-    constants: HashMap<u32, i64>,
+    constants: majit_ir::VecAssoc<u32, i64>,
     /// llmodel.py:64-69 self.vtable_offset.
     vtable_offset: Option<usize>,
 }
@@ -136,7 +136,7 @@ impl WasmBackend {
     pub fn new() -> Self {
         WasmBackend {
             trace_counter: 0,
-            constants: HashMap::new(),
+            constants: majit_ir::VecAssoc::new(),
             vtable_offset: None,
         }
     }
@@ -210,9 +210,9 @@ impl WasmBackend {
             if matches!(
                 op.opcode,
                 majit_ir::OpCode::GuardClass | majit_ir::OpCode::GuardNonnullClass
-            ) && op.args.len() >= 2
+            ) && op.num_args() >= 2
             {
-                if let Some(&classptr) = self.constants.get(&op.args[1].raw()) {
+                if let Some(&classptr) = self.constants.get(&op.arg(1).raw()) {
                     if let Some(tid) = self.lookup_typeid_from_classptr(classptr as usize) {
                         table.insert(classptr, tid);
                     }
@@ -255,8 +255,8 @@ impl WasmBackend {
             // assembler.py:1971-1974: (subclassrange_min, subclassrange_max)
             // for every constant GuardSubclass arg1.
             for op in ops {
-                if op.opcode == majit_ir::OpCode::GuardSubclass && op.args.len() >= 2 {
-                    if let Some(&classptr) = self.constants.get(&op.args[1].raw()) {
+                if op.opcode == majit_ir::OpCode::GuardSubclass && op.num_args() >= 2 {
+                    if let Some(&classptr) = self.constants.get(&op.arg(1).raw()) {
                         if let Some(range) = gc.subclass_range(classptr as usize) {
                             info.subclass_ranges.insert(classptr, range);
                         }
@@ -271,13 +271,13 @@ impl WasmBackend {
     /// Collect constants from ops (constant OpRefs that appear as args).
     fn collect_constants_from_ops(&mut self, ops: &[Op]) {
         for op in ops {
-            for &arg in &op.args {
+            for &arg in op.getarglist().iter() {
                 if arg.is_constant() && !self.constants.contains_key(&arg.raw()) {
                     // Default to 0 if not already registered
                     self.constants.insert(arg.raw(), 0);
                 }
             }
-            if let Some(ref fail_args) = op.fail_args {
+            if let Some(fail_args) = op.getfailargs() {
                 for &arg in fail_args.iter() {
                     if arg.is_constant() && !self.constants.contains_key(&arg.raw()) {
                         self.constants.insert(arg.raw(), 0);
@@ -294,9 +294,11 @@ impl majit_backend::Backend for WasmBackend {
     fn compile_loop(
         &mut self,
         inputargs: &[InputArg],
-        ops: &[Op],
+        ops: &[OpRc],
         token: &mut JitCellToken,
     ) -> Result<AsmInfo, BackendError> {
+        let ops_owned: Vec<Op> = ops.iter().map(|rc| (**rc).clone()).collect();
+        let ops: &[Op] = &ops_owned;
         self.collect_constants_from_ops(ops);
         let trace_id = self.trace_counter;
         self.trace_counter += 1;
@@ -356,22 +358,25 @@ impl majit_backend::Backend for WasmBackend {
         })
     }
 
-    fn set_constants(&mut self, constants: HashMap<u32, i64>) {
-        self.constants = constants;
+    fn set_constants_pool(&mut self, constants: majit_ir::VecAssoc<u32, majit_ir::Const>) {
+        self.constants.clear();
+        for (&k, c) in constants.iter() {
+            self.constants.insert(k, c.as_raw_i64());
+        }
     }
 
     fn set_next_trace_id(&mut self, trace_id: u64) {
         self.trace_counter = trace_id;
     }
 
-    // `set_constant_types` / `set_next_header_pc` use the trait default
-    // (no-op) — wasm does not currently honour either value.
+    // `set_next_header_pc` uses the trait default (no-op) — wasm does
+    // not currently honour it.
 
     fn compile_bridge(
         &mut self,
         _fail_descr: &dyn FailDescr,
         _inputargs: &[InputArg],
-        _ops: &[Op],
+        _ops: &[OpRc],
         _original_token: &JitCellToken,
         _previous_tokens: &[std::sync::Arc<JitCellToken>],
         _caller_recovery_layout: Option<&majit_backend::ExitRecoveryLayout>,

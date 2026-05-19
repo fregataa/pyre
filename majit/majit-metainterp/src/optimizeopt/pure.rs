@@ -4,9 +4,7 @@
 ///
 /// When the same pure operation is seen again with the same arguments,
 /// the cached result is returned instead of recomputing.
-use std::collections::HashMap;
-
-use majit_ir::{GcRef, Op, OpCode, OpRef, Value};
+use majit_ir::{GcRef, Op, OpCode, OpRc, OpRef, Value};
 
 use crate::optimizeopt::info::PreambleOp;
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
@@ -38,8 +36,8 @@ impl PureOpKey {
     fn from_op(op: &Op) -> Self {
         PureOpKey {
             opcode: op.opcode,
-            args: op.args.to_vec(),
-            descr_identity: op.descr.as_ref().map(majit_ir::descr::descr_identity),
+            args: op.getarglist().to_vec(),
+            descr_identity: op.getdescr().as_ref().map(majit_ir::descr::descr_identity),
         }
     }
 
@@ -49,8 +47,8 @@ impl PureOpKey {
     fn from_call_op(op: &Op, start_index: usize) -> Self {
         PureOpKey {
             opcode: OpCode::call_pure_for_type(op.result_type()),
-            args: op.args[start_index..].to_vec(),
-            descr_identity: op.descr.as_ref().map(majit_ir::descr::descr_identity),
+            args: op.getarglist()[start_index..].to_vec(),
+            descr_identity: op.getdescr().as_ref().map(majit_ir::descr::descr_identity),
         }
     }
 }
@@ -330,7 +328,7 @@ pub struct OptPure {
     /// optimizer.py: call_pure_results passed into propagate_all_forward.
     /// RPython keys are lists of constant boxes (value-based equality).
     /// Keys are the constant Values that _can_optimize_call_pure builds.
-    call_pure_results: HashMap<Vec<Value>, Value>,
+    call_pure_results: crate::optimizeopt::vec_assoc::VecAssoc<Vec<Value>, Value>,
     /// shortpreamble.py:124-126: PureOp.produce_op stores PreambleOp in
     /// optpure's cache. In majit, PreambleOp entries stored here are
     /// searched with forwarding-aware matching (force_preamble_op pattern).
@@ -360,7 +358,7 @@ impl OptPure {
             last_emitted_was_removed: false,
             known_result_call_pure: Vec::new(),
             extra_call_pure: Vec::new(),
-            call_pure_results: HashMap::new(),
+            call_pure_results: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             preamble_pure_ops: Vec::new(),
         }
     }
@@ -451,7 +449,7 @@ impl OptPure {
     /// pure.py: pure(opnum, op)
     pub fn pure(&mut self, op: &Op) {
         let key = PureOpKey::from_op(op);
-        self.cache.insert(key, op.pos);
+        self.cache.insert(key, op.pos.get());
     }
 
     /// Record a pure operation with explicit args.
@@ -546,14 +544,14 @@ impl OptPure {
     ///   `self._same_args(known_result_op, op, 1, start_index)` → args check
     /// No opcode comparison.
     fn lookup_known_result(&self, op: &Op, start_index: usize, ctx: &OptContext) -> Option<OpRef> {
-        let op_descr_identity = op.descr.as_ref().map(majit_ir::descr::descr_identity);
+        let op_descr_identity = op.getdescr().as_ref().map(majit_ir::descr::descr_identity);
         for entry in &self.known_result_call_pure {
             if entry.descr_identity != op_descr_identity {
                 continue;
             }
             // _same_args(known_op, op, 1, start_index):
             // entry.args is already known_op.args[1..], so compare from 0.
-            if Self::_same_args(&entry.args, &op.args, 0, start_index, ctx) {
+            if Self::_same_args(&entry.args, &op.getarglist(), 0, start_index, ctx) {
                 return Some(entry.result);
             }
         }
@@ -567,10 +565,7 @@ impl OptPure {
     }
 
     fn call_pure_can_raise(op: &Op) -> bool {
-        op.descr
-            .as_ref()
-            .and_then(|d| d.as_call_descr())
-            .map(|cd| cd.get_extra_info().check_can_raise(true))
+        op.with_call_descr(|cd| cd.get_extra_info().check_can_raise(true))
             .unwrap_or(true)
     }
 
@@ -578,7 +573,7 @@ impl OptPure {
     /// Searches preamble entries with forwarding-aware arg matching.
     /// On match, forces PreambleOp (in-place replacement) and returns result.
     fn force_preamble_op(&mut self, op: &Op, ctx: &mut OptContext) -> Option<OpRef> {
-        let descr_identity = op.descr.as_ref().map(majit_ir::descr::descr_identity);
+        let descr_identity = op.getdescr().as_ref().map(majit_ir::descr::descr_identity);
         for entry in &mut self.preamble_pure_ops {
             if entry.opcode != op.opcode {
                 continue;
@@ -586,28 +581,29 @@ impl OptPure {
             if entry.descr_identity != descr_identity {
                 continue;
             }
-            if entry.args.len() != op.args.len() {
+            if entry.args.len() != op.num_args() {
                 continue;
             }
             // pure.py:62 lookup1: `box0.same_box(get_box_replacement(op.getarg(0)))`.
             // Both stored and query are walked through the forwarding chain
             // (the caller already walks the query at lookup; the stored arg
             // is walked here line-by-line per pure.py:62, :72-73).
-            let args_match = entry
-                .args
-                .iter()
-                .zip(op.args.iter())
-                .all(|(&stored, &query)| {
-                    let s = ctx.get_box_replacement(stored);
-                    let q = ctx.get_box_replacement(query);
-                    if s == q {
-                        return true;
-                    }
-                    matches!(
-                        (ctx.get_constant(s), ctx.get_constant(q)),
-                        (Some(a), Some(b)) if a == b
-                    )
-                });
+            let args_match =
+                entry
+                    .args
+                    .iter()
+                    .zip(op.getarglist().iter())
+                    .all(|(&stored, &query)| {
+                        let s = ctx.get_box_replacement(stored);
+                        let q = ctx.get_box_replacement(query);
+                        if s == q {
+                            return true;
+                        }
+                        matches!(
+                            (ctx.get_constant(s), ctx.get_constant(q)),
+                            (Some(a), Some(b)) if a == b
+                        )
+                    });
             if args_match {
                 // pure.py:50-55: force_preamble_op — isinstance check → force → replace
                 if let Some(result) = entry.forced_result {
@@ -635,12 +631,12 @@ impl OptPure {
             if entry.descr.as_ref().map(majit_ir::descr::descr_identity) != descr_identity {
                 continue;
             }
-            if entry.args.len() != op.args.len() {
+            if entry.args.len() != op.num_args() {
                 continue;
             }
             // same_box: identity for non-constants, same_constant for constants.
             let mut args_match = true;
-            for (expected, &arg) in entry.args.iter().zip(op.args.iter()) {
+            for (expected, &arg) in entry.args.iter().zip(op.getarglist().iter()) {
                 match expected {
                     crate::optimizeopt::ImportedShortPureArg::OpRef(expected_ref) => {
                         if arg != *expected_ref {
@@ -792,7 +788,13 @@ impl OptPure {
             0
         };
         // pure.py:255: self._same_args(old_op, op, old_start_index, start_index)
-        Self::_same_args(old_op_args, &op.args, old_start_index, start_index, ctx)
+        Self::_same_args(
+            old_op_args,
+            &op.getarglist(),
+            old_start_index,
+            start_index,
+            ctx,
+        )
     }
 }
 
@@ -881,7 +883,7 @@ fn constant_ptr_value(arg: OpRef, ctx: &OptContext) -> Option<usize> {
 }
 
 fn try_constant_fold_pure_getfield(op: &Op, ctx: &OptContext) -> Option<Value> {
-    let descr = op.descr.as_ref()?;
+    let descr = op.getdescr()?;
     let field_descr = descr.as_field_descr()?;
     let addr = constant_ptr_value(op.arg(0), ctx)? + field_descr.offset();
 
@@ -1011,7 +1013,7 @@ impl Optimization for OptPure {
             if op.opcode == OpCode::GuardNoOverflow {
                 // Try constant folding on the OVF op.
                 if let Some(folded) = try_constant_fold_int_value(&postponed, ctx) {
-                    ctx.find_or_record_constant_int(postponed.pos, folded);
+                    ctx.find_or_record_constant_int(postponed.pos.get(), folded);
                     self.last_emitted_was_removed = true;
                     return OptimizationResult::Remove; // guard also removed
                 }
@@ -1019,7 +1021,7 @@ impl Optimization for OptPure {
                 // pure.py:50-55: force_preamble_op replaces the OVF op
                 // with the preamble's cached result.
                 if let Some(cached_ref) = self.force_preamble_op(&postponed, ctx) {
-                    ctx.replace_op(postponed.pos, cached_ref);
+                    ctx.replace_op(postponed.pos.get(), cached_ref);
                     self.last_emitted_was_removed = true;
                     return OptimizationResult::Remove; // guard also removed
                 }
@@ -1032,7 +1034,7 @@ impl Optimization for OptPure {
                 if let Some(cached_ref) = self.lookup_pure(&key, ctx) {
                     if Self::_can_reuse_oldop(postponed.opcode, postponed.opcode, true) {
                         let cached_ref = ctx.get_box_replacement(cached_ref);
-                        ctx.replace_op(postponed.pos, cached_ref);
+                        ctx.replace_op(postponed.pos.get(), cached_ref);
                         self.last_emitted_was_removed = true;
                         return OptimizationResult::Remove; // guard also removed
                     }
@@ -1050,7 +1052,7 @@ impl Optimization for OptPure {
                 if let Some(non_ovf) = non_ovf_opcode {
                     let non_ovf_key = PureOpKey {
                         opcode: non_ovf,
-                        args: postponed.args.to_vec(),
+                        args: postponed.getarglist().to_vec(),
                         descr_identity: None,
                     };
                     if let Some(cached_ref) = self.lookup_pure(&non_ovf_key, ctx) {
@@ -1067,17 +1069,17 @@ impl Optimization for OptPure {
                 // force_box step here before recording the postponed op.
                 for i in 0..postponed.num_args() {
                     let arg = ctx.get_box_replacement(postponed.arg(i));
-                    postponed.args[i] = self.force_box(arg, ctx);
+                    postponed.setarg(i, self.force_box(arg, ctx));
                 }
                 // Record and emit both the OVF op and the guard.
-                self.cache.insert(key, postponed.pos);
+                self.cache.insert(key, postponed.pos.get());
                 ctx.emit(postponed);
                 return OptimizationResult::PassOn; // guard passes through
             } else {
                 // Not a GUARD_NO_OVERFLOW: emit the postponed op now.
                 for i in 0..postponed.num_args() {
                     let arg = ctx.get_box_replacement(postponed.arg(i));
-                    postponed.args[i] = self.force_box(arg, ctx);
+                    postponed.setarg(i, self.force_box(arg, ctx));
                 }
                 ctx.emit(postponed);
             }
@@ -1098,8 +1100,8 @@ impl Optimization for OptPure {
         if op.opcode == OpCode::RecordKnownResult {
             if op.num_args() >= 2 {
                 self.known_result_call_pure.push(KnownResultEntry {
-                    descr_identity: op.descr.as_ref().map(majit_ir::descr::descr_identity),
-                    args: op.args[1..].to_vec(),
+                    descr_identity: op.getdescr().as_ref().map(majit_ir::descr::descr_identity),
+                    args: op.getarglist()[1..].to_vec(),
                     result: op.arg(0),
                 });
             }
@@ -1109,13 +1111,13 @@ impl Optimization for OptPure {
         if op.opcode.is_always_pure() {
             // Constant folding: all args are constants → compute at opt time.
             if let Some(folded_value) = try_constant_fold_pure_value(op, ctx) {
-                ctx.make_constant(op.pos, folded_value);
+                ctx.make_constant(op.pos.get(), folded_value);
                 self.last_emitted_was_removed = true;
                 return OptimizationResult::Remove;
             }
 
             if let Some(cached_ref) = self.force_preamble_op(op, ctx) {
-                ctx.replace_op(op.pos, cached_ref);
+                ctx.replace_op(op.pos.get(), cached_ref);
                 self.last_emitted_was_removed = true;
                 return OptimizationResult::Remove;
             }
@@ -1125,12 +1127,12 @@ impl Optimization for OptPure {
             // CSE: exact same operation already computed?
             if let Some(cached_ref) = self.lookup_pure(&key, ctx) {
                 let cached_ref = ctx.get_box_replacement(cached_ref);
-                ctx.replace_op(op.pos, cached_ref);
+                ctx.replace_op(op.pos.get(), cached_ref);
                 self.last_emitted_was_removed = true;
                 return OptimizationResult::Remove;
             }
 
-            self.cache.insert(key, op.pos);
+            self.cache.insert(key, op.pos.get());
             self.short_preamble_pure_ops.push(op.clone());
             return OptimizationResult::PassOn;
         }
@@ -1140,11 +1142,11 @@ impl Optimization for OptPure {
         // pure.py:236-238: optimize_COND_CALL_VALUE_I/R → start_index=1
         if op.opcode.is_call_pure() || op.opcode.is_cond_call_value() {
             let start_index: usize = if op.opcode.is_cond_call_value() { 1 } else { 0 };
-            let op_descr_identity = op.descr.as_ref().map(majit_ir::descr::descr_identity);
+            let op_descr_identity = op.getdescr().as_ref().map(majit_ir::descr::descr_identity);
 
             // pure.py:191-196: _can_optimize_call_pure(op, start_index=1).
             if let Some(value) = self.lookup_call_pure_result(op, start_index, ctx) {
-                ctx.make_constant(op.pos, value);
+                ctx.make_constant(op.pos.get(), value);
                 self.last_emitted_was_removed = true;
                 return OptimizationResult::Remove;
             }
@@ -1153,19 +1155,21 @@ impl Optimization for OptPure {
             // optimize_call_pure_old with adjusted start_index.
             for &pos in &self.call_pure_positions {
                 if let Some(old_op) = ctx.new_operations.get(pos) {
-                    let old_descr_identity =
-                        old_op.descr.as_ref().map(majit_ir::descr::descr_identity);
+                    let old_descr_identity = old_op
+                        .getdescr()
+                        .as_ref()
+                        .map(majit_ir::descr::descr_identity);
                     if Self::optimize_call_pure_old(
                         op,
                         old_op.opcode,
-                        &old_op.args,
+                        &old_op.getarglist(),
                         old_descr_identity,
                         op_descr_identity,
                         start_index,
                         ctx,
                     ) {
-                        let cached_ref = ctx.get_box_replacement(old_op.pos);
-                        ctx.replace_op(op.pos, cached_ref);
+                        let cached_ref = ctx.get_box_replacement(old_op.pos.get());
+                        ctx.replace_op(op.pos.get(), cached_ref);
                         self.last_emitted_was_removed = true;
                         return OptimizationResult::Remove;
                     }
@@ -1221,20 +1225,20 @@ impl Optimization for OptPure {
                     }
                 };
                 let cached_ref = ctx.get_box_replacement(entry_result);
-                ctx.replace_op(op.pos, cached_ref);
+                ctx.replace_op(op.pos.get(), cached_ref);
                 self.last_emitted_was_removed = true;
                 return OptimizationResult::Remove;
             }
             // pure.py:211-220: known_result_call_pure.
             if let Some(result_ref) = self.lookup_known_result(op, start_index, ctx) {
                 let result_ref = ctx.get_box_replacement(result_ref);
-                ctx.replace_op(op.pos, result_ref);
+                ctx.replace_op(op.pos.get(), result_ref);
                 self.last_emitted_was_removed = true;
                 return OptimizationResult::Remove;
             }
 
             let key = PureOpKey::from_call_op(op, start_index);
-            self.cache.insert(key, op.pos);
+            self.cache.insert(key, op.pos.get());
             self.call_pure_positions.push(ctx.new_operations.len());
             if start_index == 0 {
                 // pure.py:222-225: replace CALL_PURE with CALL.
@@ -1265,7 +1269,10 @@ impl Optimization for OptPure {
         // preamble_pure_ops also NOT cleared — populated during import.
     }
 
-    fn set_call_pure_results(&mut self, results: &HashMap<Vec<Value>, Value>) {
+    fn set_call_pure_results(
+        &mut self,
+        results: &crate::optimizeopt::vec_assoc::VecAssoc<Vec<Value>, Value>,
+    ) {
         self.call_pure_results = results.clone();
     }
 
@@ -1305,8 +1312,10 @@ impl Optimization for OptPure {
                 })
                 .collect::<Vec<_>>();
             let mut imported_op = Op::new(entry.opcode, &imported_args);
-            imported_op.pos = entry.result;
-            imported_op.descr = entry.descr.clone();
+            imported_op.pos.set(entry.result);
+            if let Some(d) = entry.descr.clone() {
+                imported_op.setdescr(d);
+            }
             self.short_preamble_pure_ops.push(imported_op);
             let resolved_args: Vec<OpRef> = entry
                 .args
@@ -1352,7 +1361,7 @@ mod tests {
         preamble_op: Op,
         label_arg_idx: Option<usize>,
     ) {
-        let source = preamble_op.pos;
+        let source = preamble_op.pos.get();
         let short_inputargs: Vec<OpRef> = match label_arg_idx {
             Some(idx) => (0..=idx as u32).map(OpRef::int_op).collect(),
             None => vec![OpRef::int_op(0)],
@@ -1371,14 +1380,14 @@ mod tests {
         // Keep the source result available to use_box() exactly like the
         // imported short preamble path does after unroll import.
         if source != OpRef::NONE {
-            ctx.potential_extra_ops.insert(
+            ctx.set_potential_extra_op(
                 source,
                 crate::optimizeopt::info::PreambleOp {
                     op: source,
                     invented_name: false,
                     preamble_op: {
                         let mut same_as = Op::new(OpCode::SameAsI, &[source]);
-                        same_as.pos = source;
+                        same_as.pos.set(source);
                         same_as
                     },
                 },
@@ -1396,7 +1405,7 @@ mod tests {
             // resoperation.py:1693 parity). Argument OpRefs in these
             // fixtures must use the matching typed factory at the same
             // raw N to satisfy variant-aware Eq against `op.pos`.
-            op.pos = OpRef::op_typed(i as u32, op.result_type());
+            op.pos.set(OpRef::op_typed(i as u32, op.result_type()));
         }
     }
 
@@ -1412,11 +1421,8 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure::new()));
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut std::collections::HashMap::new(),
-            1024,
-        );
+        let result =
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
 
         // Only the first IntAdd should remain.
         assert_eq!(result.len(), 1);
@@ -1435,11 +1441,8 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure::new()));
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut std::collections::HashMap::new(),
-            1024,
-        );
+        let result =
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
 
         assert_eq!(result.len(), 2);
     }
@@ -1456,11 +1459,8 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure::new()));
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut std::collections::HashMap::new(),
-            1024,
-        );
+        let result =
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
 
         assert_eq!(result.len(), 1);
     }
@@ -1477,11 +1477,8 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure::new()));
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut std::collections::HashMap::new(),
-            1024,
-        );
+        let result =
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
 
         assert_eq!(result.len(), 2);
     }
@@ -1498,11 +1495,8 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure::new()));
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut std::collections::HashMap::new(),
-            1024,
-        );
+        let result =
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
 
         assert_eq!(result.len(), 2);
     }
@@ -1522,11 +1516,8 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure::new()));
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut std::collections::HashMap::new(),
-            1024,
-        );
+        let result =
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
 
         assert_eq!(result.len(), 1);
     }
@@ -1542,16 +1533,13 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure::new()));
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut std::collections::HashMap::new(),
-            1024,
-        );
+        let result =
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::CallI);
         assert_eq!(
-            result[0].args.as_slice(),
+            &*result[0].getarglist(),
             &[OpRef::int_op(0), OpRef::int_op(1)]
         );
     }
@@ -1566,15 +1554,12 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure::new()));
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut std::collections::HashMap::new(),
-            1024,
-        );
+        let result =
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::CallR);
-        assert_eq!(result[0].pos.ty(), Some(Type::Ref));
+        assert_eq!(result[0].pos.get().ty(), Some(Type::Ref));
     }
 
     #[test]
@@ -1588,11 +1573,8 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure::new()));
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut std::collections::HashMap::new(),
-            1024,
-        );
+        let result =
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::SetfieldGc);
@@ -1610,11 +1592,8 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure::new()));
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut std::collections::HashMap::new(),
-            1024,
-        );
+        let result =
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
 
         assert_eq!(result.len(), 1);
     }
@@ -1631,11 +1610,8 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure::new()));
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut std::collections::HashMap::new(),
-            1024,
-        );
+        let result =
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
 
         assert_eq!(result.len(), 1);
     }
@@ -1667,14 +1643,11 @@ mod tests {
             last_emitted_was_removed: false,
             known_result_call_pure: Vec::new(),
             extra_call_pure: Vec::new(),
-            call_pure_results: HashMap::new(),
+            call_pure_results: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             preamble_pure_ops: Vec::new(),
         }));
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut std::collections::HashMap::new(),
-            1024,
-        );
+        let result =
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
 
         // All 17 unique ops should be emitted, plus the re-inserted one
         // (since the first was evicted from the LRU cache of size 16).
@@ -1690,14 +1663,14 @@ mod tests {
         // Simulate: op0 = int_add(a, b)
         let op0 = Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)]);
         let mut op0 = op0;
-        op0.pos = OpRef::int_op(2);
+        op0.pos.set(OpRef::int_op(2));
         let result0 = pass.propagate_forward(&op0, &mut ctx);
         assert!(matches!(result0, OptimizationResult::PassOn));
 
         // Simulate: op1 = int_add(a, b) with same args
         let op1 = Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)]);
         let mut op1 = op1;
-        op1.pos = OpRef::int_op(3);
+        op1.pos.set(OpRef::int_op(3));
         let result1 = pass.propagate_forward(&op1, &mut ctx);
         assert!(matches!(result1, OptimizationResult::Remove));
     }
@@ -1733,11 +1706,8 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure::new()));
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut std::collections::HashMap::new(),
-            1024,
-        );
+        let result =
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
 
         assert_eq!(result.len(), 1);
     }
@@ -1752,11 +1722,8 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure::new()));
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut std::collections::HashMap::new(),
-            1024,
-        );
+        let result =
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
 
         assert_eq!(result.len(), 1);
     }
@@ -1773,11 +1740,8 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure::new()));
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut std::collections::HashMap::new(),
-            1024,
-        );
+        let result =
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
 
         assert_eq!(result.len(), 1);
     }
@@ -1797,17 +1761,14 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure::new()));
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut std::collections::HashMap::new(),
-            1024,
-        );
+        let result =
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
 
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].opcode, OpCode::CallF);
-        assert_eq!(result[0].pos.ty(), Some(Type::Float));
+        assert_eq!(result[0].pos.get().ty(), Some(Type::Float));
         assert_eq!(result[1].opcode, OpCode::CallN);
-        assert_eq!(result[1].pos.ty(), Some(Type::Void));
+        assert_eq!(result[1].pos.get().ty(), Some(Type::Void));
     }
 
     #[test]
@@ -1822,11 +1783,8 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure::new()));
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut std::collections::HashMap::new(),
-            1024,
-        );
+        let result =
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
 
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].opcode, OpCode::IntAdd);
@@ -1848,10 +1806,9 @@ mod tests {
         ];
         assign_positions(&mut ops);
 
-        let mut constants = std::collections::HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         constants.insert(100u32, majit_ir::Value::Int(0xCAFE)); // func pointer must be a known constant
         let mut opt = Optimizer::new();
-        opt.constant_types.insert(100, majit_ir::Type::Int);
         opt.add_pass(Box::new(crate::optimizeopt::rewrite::OptRewrite::new()));
         opt.add_pass(Box::new(OptPure::new()));
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
@@ -1879,11 +1836,8 @@ mod tests {
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(crate::optimizeopt::rewrite::OptRewrite::new()));
         opt.add_pass(Box::new(OptPure::new()));
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut std::collections::HashMap::new(),
-            1024,
-        );
+        let result =
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
 
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].opcode, OpCode::CallI);
@@ -1904,11 +1858,8 @@ mod tests {
             let mut opt = Optimizer::new();
             opt.add_pass(Box::new(crate::optimizeopt::rewrite::OptRewrite::new()));
             opt.add_pass(Box::new(OptPure::new()));
-            let result = opt.optimize_with_constants_and_inputs(
-                &ops,
-                &mut std::collections::HashMap::new(),
-                1024,
-            );
+            let result =
+                opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
 
             assert_eq!(result.len(), 1);
             assert_eq!(result[0].opcode, expected_op);
@@ -1934,15 +1885,12 @@ mod tests {
         assign_positions(&mut ops);
 
         // Each func pointer must be a known constant for OptRewrite CSE.
-        let mut constants: std::collections::HashMap<u32, majit_ir::Value> =
-            std::collections::HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         for i in 0..20u32 {
             constants.insert(i + 100, majit_ir::Value::Int((i + 100) as i64));
         }
         let mut opt = Optimizer::new();
-        for i in 0..20u32 {
-            opt.constant_types.insert(i + 100, majit_ir::Type::Int);
-        }
+        for i in 0..20u32 {}
         opt.add_pass(Box::new(crate::optimizeopt::rewrite::OptRewrite::new()));
         opt.add_pass(Box::new(OptPure::new()));
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
@@ -1968,10 +1916,9 @@ mod tests {
         ];
         assign_positions(&mut ops);
 
-        let mut constants = std::collections::HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         constants.insert(200u32, majit_ir::Value::Int(0xBEEF)); // func pointer must be a known constant
         let mut opt = Optimizer::new();
-        opt.constant_types.insert(200, majit_ir::Type::Int);
         opt.add_pass(Box::new(crate::optimizeopt::rewrite::OptRewrite::new()));
         opt.add_pass(Box::new(OptPure::new()));
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
@@ -1994,13 +1941,11 @@ mod tests {
         ];
         assign_positions(&mut ops);
 
-        let mut constants = std::collections::HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         constants.insert(10_000u32, majit_ir::Value::Int(3));
         constants.insert(10_001u32, majit_ir::Value::Int(4));
 
         let mut opt = Optimizer::new();
-        opt.constant_types.insert(10_000, majit_ir::Type::Int);
-        opt.constant_types.insert(10_001, majit_ir::Type::Int);
         opt.add_pass(Box::new(OptPure::new()));
         let result = opt.optimize_with_constants(&ops, &mut constants);
 
@@ -2021,13 +1966,11 @@ mod tests {
         ];
         assign_positions(&mut ops);
 
-        let mut constants = std::collections::HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         constants.insert(10_000u32, majit_ir::Value::Int(3));
         constants.insert(10_001u32, majit_ir::Value::Int(5));
 
         let mut opt = Optimizer::new();
-        opt.constant_types.insert(10_000, majit_ir::Type::Int);
-        opt.constant_types.insert(10_001, majit_ir::Type::Int);
         opt.add_pass(Box::new(OptPure::new()));
         let result = opt.optimize_with_constants(&ops, &mut constants);
 
@@ -2051,11 +1994,8 @@ mod tests {
         opt.add_pass(Box::new(OptPure::new()));
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut std::collections::HashMap::new(),
-            1024,
-        );
+        let result =
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
 
         // First pair stays, second pair CSE'd → 3 ops total
         let ovf_count = result
@@ -2078,13 +2018,11 @@ mod tests {
         ];
         assign_positions(&mut ops);
 
-        let mut constants = std::collections::HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         constants.insert(10_000u32, majit_ir::Value::Int(3));
         constants.insert(10_001u32, majit_ir::Value::Int(4));
 
         let mut opt = Optimizer::new();
-        opt.constant_types.insert(10_000, majit_ir::Type::Int);
-        opt.constant_types.insert(10_001, majit_ir::Type::Int);
         opt.add_pass(Box::new(OptPure::new()));
         let result = opt.optimize_with_constants(&ops, &mut constants);
 
@@ -2118,7 +2056,7 @@ mod tests {
 
         let descr = make_field_descr_full(1, 0, 8, Type::Int, true);
         let mut op = Op::with_descr(OpCode::GetfieldGcPureI, &[OpRef::ref_op(10)], descr);
-        op.pos = OpRef::int_op(0);
+        op.pos.set(OpRef::int_op(0));
 
         let mut pass = OptPure::new();
         let mut ctx = OptContext::with_num_inputs(4, 0);
@@ -2145,7 +2083,7 @@ mod tests {
 
         let descr = make_field_descr_full(2, 0, 8, Type::Float, true);
         let mut op = Op::with_descr(OpCode::GetfieldGcPureF, &[OpRef::ref_op(10)], descr);
-        op.pos = OpRef::float_op(0);
+        op.pos.set(OpRef::float_op(0));
 
         let mut pass = OptPure::new();
         let mut ctx = OptContext::with_num_inputs(4, 0);
@@ -2174,7 +2112,7 @@ mod tests {
 
         let descr = make_field_descr_full(3, 0, std::mem::size_of::<usize>(), Type::Ref, true);
         let mut op = Op::with_descr(OpCode::GetfieldGcPureR, &[OpRef::ref_op(10)], descr);
-        op.pos = OpRef::ref_op(0);
+        op.pos.set(OpRef::ref_op(0));
 
         let mut pass = OptPure::new();
         let mut ctx = OptContext::with_num_inputs(4, 0);
@@ -2201,7 +2139,7 @@ mod tests {
     fn test_constant_fold_getfield_gc_pure_does_not_treat_int_constant_as_gc_pointer() {
         let descr = make_field_descr_full(4, 0, 8, Type::Int, true);
         let mut op = Op::with_descr(OpCode::GetfieldGcPureI, &[OpRef::int_op(10)], descr);
-        op.pos = OpRef::int_op(0);
+        op.pos.set(OpRef::int_op(0));
 
         let mut pass = OptPure::new();
         let mut ctx = OptContext::with_num_inputs(4, 0);
@@ -2230,11 +2168,8 @@ mod tests {
         opt.add_pass(Box::new(OptPure::new()));
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut std::collections::HashMap::new(),
-            1024,
-        );
+        let result =
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
 
         // Second CALL_PURE → removed (CSE), its GUARD_NO_EXCEPTION → removed
         let gne_count = result
@@ -2268,7 +2203,7 @@ mod tests {
         pass.pure_from_args2(OpCode::IntAdd, c5_a, x, OpRef::int_op(42));
 
         let mut q = Op::new(OpCode::IntAdd, &[c5_b, x]);
-        q.pos = OpRef::int_op(99);
+        q.pos.set(OpRef::int_op(99));
         assert_eq!(
             pass.get_pure_result(&q, &ctx),
             Some(OpRef::int_op(42)),
@@ -2277,7 +2212,7 @@ mod tests {
 
         // A non-constant slot mismatch must still miss.
         let mut q_miss = Op::new(OpCode::IntAdd, &[c5_b, OpRef::int_op(8)]);
-        q_miss.pos = OpRef::int_op(100);
+        q_miss.pos.set(OpRef::int_op(100));
         assert_eq!(pass.get_pure_result(&q_miss, &ctx), None);
     }
 
@@ -2297,7 +2232,7 @@ mod tests {
         pass.pure_from_args2(OpCode::IntAdd, canonical_arg, other_arg, result);
 
         let mut q = Op::new(OpCode::IntAdd, &[query_arg, other_arg]);
-        q.pos = OpRef::int_op(99);
+        q.pos.set(OpRef::int_op(99));
         assert_eq!(
             pass.get_pure_result(&q, &ctx),
             Some(result),
@@ -2311,7 +2246,7 @@ mod tests {
 
         // Manually record a pure operation via the API
         let mut op = Op::new(OpCode::IntAdd, &[OpRef::int_op(10), OpRef::int_op(20)]);
-        op.pos = OpRef::int_op(0);
+        op.pos.set(OpRef::int_op(0));
         pass.pure(&op);
 
         let ctx = OptContext::new(0);
@@ -2327,7 +2262,7 @@ mod tests {
             OpRef::int_op(5),
         );
         let mut lookup_mul = Op::new(OpCode::IntMul, &[OpRef::int_op(30), OpRef::int_op(40)]);
-        lookup_mul.pos = OpRef::int_op(99);
+        lookup_mul.pos.set(OpRef::int_op(99));
         assert!(pass.get_pure_result(&lookup_mul, &ctx).is_some());
     }
 
@@ -2434,7 +2369,7 @@ mod tests {
             crate::optimizeopt::shortpreamble::PreambleOpKind::Pure
         ));
         assert_eq!(collected[0].1.preamble_op.opcode, OpCode::IntAdd);
-        assert_eq!(collected[0].1.preamble_op.pos, OpRef::int_op(2));
+        assert_eq!(collected[0].1.preamble_op.pos.get(), OpRef::int_op(2));
     }
 
     #[test]
@@ -2475,8 +2410,8 @@ mod tests {
         pass.install_preamble_pure_ops(&ctx);
 
         let mut op = Op::new(OpCode::CallPureI, &[const_opref, OpRef::int_op(0)]);
-        op.pos = OpRef::int_op(2);
-        op.descr = Some(call_descr);
+        op.pos.set(OpRef::int_op(2));
+        op.setdescr(call_descr);
         let result = pass.propagate_forward(&op, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_box_replacement(OpRef::int_op(2)), OpRef::int_op(1));
@@ -2489,7 +2424,7 @@ mod tests {
         pass.setup();
 
         let mut op = Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)]);
-        op.pos = OpRef::int_op(2);
+        op.pos.set(OpRef::int_op(2));
         let result = pass.propagate_forward(&op, &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
 
@@ -2518,8 +2453,8 @@ mod tests {
             OpCode::CallPureI,
             &[OpRef::int_op(100), OpRef::int_op(0), OpRef::int_op(1)],
         );
-        op.pos = OpRef::int_op(2);
-        op.descr = Some(majit_ir::descr::make_call_descr(
+        op.pos.set(OpRef::int_op(2));
+        op.setdescr(majit_ir::descr::make_call_descr(
             vec![
                 majit_ir::Type::Int,
                 majit_ir::Type::Int,
@@ -2567,8 +2502,8 @@ mod tests {
             OpCode::CallLoopinvariantI,
             &[OpRef::int_op(100), OpRef::int_op(0)],
         );
-        op.pos = OpRef::int_op(2);
-        op.descr = Some(majit_ir::descr::make_call_descr(
+        op.pos.set(OpRef::int_op(2));
+        op.setdescr(majit_ir::descr::make_call_descr(
             vec![majit_ir::Type::Int, majit_ir::Type::Int],
             majit_ir::Type::Int,
             majit_ir::EffectInfo::new(
@@ -2690,11 +2625,8 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure::new()));
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut std::collections::HashMap::new(),
-            1024,
-        );
+        let result =
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
 
         // First COND_CALL_VALUE emitted, second removed by CSE
         assert_eq!(result.len(), 1);
@@ -2713,14 +2645,14 @@ mod tests {
         opt.record_call_pure_result(vec![Value::Int(0xCAFE), Value::Int(7)], Value::Int(42));
         opt.add_pass(Box::new(OptPure::new()));
 
-        let mut constants = std::collections::HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         constants.insert(OpRef::const_int(0).raw(), majit_ir::Value::Int(0xCAFE));
         constants.insert(OpRef::const_int(1).raw(), majit_ir::Value::Int(7));
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1);
 
         assert!(result.is_empty());
         assert_eq!(
-            constants.get(&ops[0].pos.raw()),
+            constants.get(&ops[0].pos.get().raw()),
             Some(&majit_ir::Value::Int(42))
         );
     }

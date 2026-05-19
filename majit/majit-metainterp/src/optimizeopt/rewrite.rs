@@ -3,7 +3,7 @@
 /// Translated from rpython/jit/metainterp/optimizeopt/rewrite.py.
 /// Rewrites operations into equivalent, cheaper operations.
 /// This includes constant folding for pure ops and algebraic identities.
-use majit_ir::{Op, OpCode, OpRef, Value};
+use majit_ir::{Op, OpCode, OpRc, OpRef, Value};
 
 use crate::optimizeopt::info::PreambleOp;
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult, intdiv};
@@ -60,22 +60,22 @@ enum Nullness {
 pub struct OptRewrite {
     /// rewrite.py: bool_result_cache — maps (opcode, arg0, arg1) → result OpRef.
     /// Used by find_rewritable_bool to check if inverse/reflex was computed.
-    bool_result_cache: std::collections::HashMap<(OpCode, OpRef, OpRef), OpRef>,
+    bool_result_cache: crate::optimizeopt::vec_assoc::VecAssoc<(OpCode, OpRef, OpRef), OpRef>,
     /// rewrite.py:39: loop_invariant_results — cache for CALL_LOOPINVARIANT results.
     /// Key: function pointer (arg0 as i64).
     /// Value: Direct(OpRef) or Preamble(PreambleOp) — RPython isinstance check.
-    loop_invariant_results: std::collections::HashMap<i64, LoopInvariantEntry>,
+    loop_invariant_results: crate::optimizeopt::vec_assoc::VecAssoc<i64, LoopInvariantEntry>,
     /// rewrite.py:40: loop_invariant_producer — maps func_ptr → emitted Call op.
     /// Used by produce_potential_short_preamble_ops (rewrite.py:45-47).
-    loop_invariant_producer: std::collections::HashMap<i64, Op>,
+    loop_invariant_producer: crate::optimizeopt::vec_assoc::VecAssoc<i64, Op>,
 }
 
 impl OptRewrite {
     pub fn new() -> Self {
         OptRewrite {
-            bool_result_cache: std::collections::HashMap::new(),
-            loop_invariant_results: std::collections::HashMap::new(),
-            loop_invariant_producer: std::collections::HashMap::new(),
+            bool_result_cache: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            loop_invariant_results: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            loop_invariant_producer: crate::optimizeopt::vec_assoc::VecAssoc::new(),
         }
     }
 
@@ -164,18 +164,18 @@ impl OptRewrite {
         // Constant fold
         if let (Some(a), Some(b)) = (ctx.get_constant_int(arg0), ctx.get_constant_int(arg1)) {
             if let Some(result) = self.try_fold_binary_int(OpCode::IntAdd, a, b) {
-                ctx.make_constant(op.pos, Value::Int(result));
+                ctx.make_constant(op.pos.get(), Value::Int(result));
                 return OptimizationResult::Remove;
             }
         }
 
         // add_zero: int_add(x, 0) => x
         if let Some(0) = ctx.get_constant_int(arg1) {
-            ctx.replace_op(op.pos, arg0);
+            ctx.replace_op(op.pos.get(), arg0);
             return OptimizationResult::Remove;
         }
         if let Some(0) = ctx.get_constant_int(arg0) {
-            ctx.replace_op(op.pos, arg1);
+            ctx.replace_op(op.pos.get(), arg1);
             return OptimizationResult::Remove;
         }
 
@@ -187,7 +187,7 @@ impl OptRewrite {
                         let x = inner.arg(0);
                         let c = self.emit_constant_int(ctx, c1.wrapping_add(c2));
                         let mut new_op = Op::new(OpCode::IntAdd, &[x, c]);
-                        new_op.pos = op.pos;
+                        new_op.pos.set(op.pos.get());
                         return OptimizationResult::Emit(new_op);
                     }
                 }
@@ -202,7 +202,7 @@ impl OptRewrite {
                         let x = inner.arg(0);
                         let c = self.emit_constant_int(ctx, c2.wrapping_sub(c1));
                         let mut new_op = Op::new(OpCode::IntAdd, &[x, c]);
-                        new_op.pos = op.pos;
+                        new_op.pos.set(op.pos.get());
                         return OptimizationResult::Emit(new_op);
                     }
                 }
@@ -217,7 +217,7 @@ impl OptRewrite {
                         let x = inner.arg(1);
                         let c = self.emit_constant_int(ctx, c1.wrapping_add(c2));
                         let mut new_op = Op::new(OpCode::IntSub, &[c, x]);
-                        new_op.pos = op.pos;
+                        new_op.pos.set(op.pos.get());
                         return OptimizationResult::Emit(new_op);
                     }
                 }
@@ -228,7 +228,7 @@ impl OptRewrite {
         if arg0 == arg1 {
             let one = self.emit_constant_int(ctx, 1);
             let mut new_op = Op::new(OpCode::IntLshift, &[arg0, one]);
-            new_op.pos = op.pos;
+            new_op.pos.set(op.pos.get());
             return OptimizationResult::Emit(new_op);
         }
 
@@ -244,25 +244,25 @@ impl OptRewrite {
         // Constant fold
         if let (Some(a), Some(b)) = (ctx.get_constant_int(arg0), ctx.get_constant_int(arg1)) {
             if let Some(result) = self.try_fold_binary_int(OpCode::IntSub, a, b) {
-                ctx.make_constant(op.pos, Value::Int(result));
+                ctx.make_constant(op.pos.get(), Value::Int(result));
                 return OptimizationResult::Remove;
             }
         }
 
         // sub_zero: int_sub(x, 0) => x
         if let Some(0) = ctx.get_constant_int(arg1) {
-            ctx.replace_op(op.pos, arg0);
+            ctx.replace_op(op.pos.get(), arg0);
             return OptimizationResult::Remove;
         }
         // sub_from_zero: int_sub(0, x) => int_neg(x)
         if let Some(0) = ctx.get_constant_int(arg0) {
             let mut new_op = Op::new(OpCode::IntNeg, &[arg1]);
-            new_op.pos = op.pos;
+            new_op.pos.set(op.pos.get());
             return OptimizationResult::Emit(new_op);
         }
         // sub_x_x: int_sub(x, x) => 0
         if arg0 == arg1 {
-            ctx.make_constant(op.pos, Value::Int(0));
+            ctx.make_constant(op.pos.get(), Value::Int(0));
             return OptimizationResult::Remove;
         }
 
@@ -274,7 +274,7 @@ impl OptRewrite {
                         let x = inner.arg(0);
                         let c = self.emit_constant_int(ctx, c2.wrapping_sub(c1));
                         let mut new_op = Op::new(OpCode::IntSub, &[x, c]);
-                        new_op.pos = op.pos;
+                        new_op.pos.set(op.pos.get());
                         return OptimizationResult::Emit(new_op);
                     }
                 }
@@ -284,7 +284,7 @@ impl OptRewrite {
         // sub_add: int_sub(int_add(x, y), y) => x
         if let Some(inner) = ctx.get_producing_op(arg0) {
             if inner.opcode == OpCode::IntAdd && inner.arg(1) == arg1 {
-                ctx.replace_op(op.pos, inner.arg(0));
+                ctx.replace_op(op.pos.get(), inner.arg(0));
                 return OptimizationResult::Remove;
             }
         }
@@ -293,7 +293,7 @@ impl OptRewrite {
         if let Some(inner) = ctx.get_producing_op(arg1) {
             if inner.opcode == OpCode::IntAdd && inner.arg(1) == arg0 {
                 let mut new_op = Op::new(OpCode::IntNeg, &[inner.arg(0)]);
-                new_op.pos = op.pos;
+                new_op.pos.set(op.pos.get());
                 return OptimizationResult::Emit(new_op);
             }
         }
@@ -306,7 +306,7 @@ impl OptRewrite {
                         let x = inner.arg(0);
                         let c = self.emit_constant_int(ctx, c1.wrapping_add(c2));
                         let mut new_op = Op::new(OpCode::IntSub, &[x, c]);
-                        new_op.pos = op.pos;
+                        new_op.pos.set(op.pos.get());
                         return OptimizationResult::Emit(new_op);
                     }
                     // sub_sub_left_c_x_c: int_sub(int_sub(C1, x), C2) => int_sub(C1-C2, x)
@@ -314,7 +314,7 @@ impl OptRewrite {
                         let x = inner.arg(1);
                         let c = self.emit_constant_int(ctx, c1.wrapping_sub(c2));
                         let mut new_op = Op::new(OpCode::IntSub, &[c, x]);
-                        new_op.pos = op.pos;
+                        new_op.pos.set(op.pos.get());
                         return OptimizationResult::Emit(new_op);
                     }
                 }
@@ -326,7 +326,7 @@ impl OptRewrite {
             if let Some(inner) = ctx.get_producing_op(arg0) {
                 if inner.opcode == OpCode::IntInvert {
                     let mut new_op = Op::new(OpCode::IntNeg, &[inner.arg(0)]);
-                    new_op.pos = op.pos;
+                    new_op.pos.set(op.pos.get());
                     return OptimizationResult::Emit(new_op);
                 }
             }
@@ -339,7 +339,7 @@ impl OptRewrite {
                     (ctx.get_int_bound(inner.arg(0)), ctx.get_int_bound(arg1))
                 {
                     if bx.and_bound(&by).known_eq_const(0) {
-                        ctx.replace_op(op.pos, inner.arg(0));
+                        ctx.replace_op(op.pos.get(), inner.arg(0));
                         return OptimizationResult::Remove;
                     }
                 }
@@ -350,7 +350,7 @@ impl OptRewrite {
                     (ctx.get_int_bound(inner.arg(0)), ctx.get_int_bound(arg1))
                 {
                     if bx.and_bound(&by).known_eq_const(0) {
-                        ctx.replace_op(op.pos, inner.arg(0));
+                        ctx.replace_op(op.pos.get(), inner.arg(0));
                         return OptimizationResult::Remove;
                     }
                 }
@@ -369,29 +369,29 @@ impl OptRewrite {
         // Constant fold
         if let (Some(a), Some(b)) = (ctx.get_constant_int(arg0), ctx.get_constant_int(arg1)) {
             if let Some(result) = self.try_fold_binary_int(OpCode::IntMul, a, b) {
-                ctx.make_constant(op.pos, Value::Int(result));
+                ctx.make_constant(op.pos.get(), Value::Int(result));
                 return OptimizationResult::Remove;
             }
         }
 
         // x * 0 -> 0 (absorbing element)
         if let Some(0) = ctx.get_constant_int(arg1) {
-            ctx.make_constant(op.pos, Value::Int(0));
+            ctx.make_constant(op.pos.get(), Value::Int(0));
             return OptimizationResult::Remove;
         }
         // 0 * x -> 0
         if let Some(0) = ctx.get_constant_int(arg0) {
-            ctx.make_constant(op.pos, Value::Int(0));
+            ctx.make_constant(op.pos.get(), Value::Int(0));
             return OptimizationResult::Remove;
         }
         // x * 1 -> x (identity)
         if let Some(1) = ctx.get_constant_int(arg1) {
-            ctx.replace_op(op.pos, arg0);
+            ctx.replace_op(op.pos.get(), arg0);
             return OptimizationResult::Remove;
         }
         // 1 * x -> x
         if let Some(1) = ctx.get_constant_int(arg0) {
-            ctx.replace_op(op.pos, arg1);
+            ctx.replace_op(op.pos.get(), arg1);
             return OptimizationResult::Remove;
         }
         // Strength reduction: x * 2^n -> x << n
@@ -400,13 +400,13 @@ impl OptRewrite {
                 let shift = c.trailing_zeros() as i64;
                 let shift_ref = self.emit_constant_int(ctx, shift);
                 let mut new_op = Op::new(OpCode::IntLshift, &[arg0, shift_ref]);
-                new_op.pos = op.pos;
+                new_op.pos.set(op.pos.get());
                 return OptimizationResult::Emit(new_op);
             }
             // rewrite.py: x * (-1) -> INT_NEG(x)
             if c == -1 {
                 let mut neg = Op::new(OpCode::IntNeg, &[arg0]);
-                neg.pos = op.pos;
+                neg.pos.set(op.pos.get());
                 return OptimizationResult::Replace(neg);
             }
             // rewrite.py: x * (-(2^n)) -> -(x << n)
@@ -417,7 +417,7 @@ impl OptRewrite {
                     let shift_ref = self.emit_constant_int(ctx, shift);
                     let shifted = ctx.emit(Op::new(OpCode::IntLshift, &[arg0, shift_ref]));
                     let mut neg = Op::new(OpCode::IntNeg, &[shifted]);
-                    neg.pos = op.pos;
+                    neg.pos.set(op.pos.get());
                     return OptimizationResult::Emit(neg);
                 }
             }
@@ -427,13 +427,13 @@ impl OptRewrite {
                 let shift = c.trailing_zeros() as i64;
                 let shift_ref = self.emit_constant_int(ctx, shift);
                 let mut new_op = Op::new(OpCode::IntLshift, &[arg1, shift_ref]);
-                new_op.pos = op.pos;
+                new_op.pos.set(op.pos.get());
                 return OptimizationResult::Emit(new_op);
             }
             // (-1) * x -> INT_NEG(x)
             if c == -1 {
                 let mut neg = Op::new(OpCode::IntNeg, &[arg1]);
-                neg.pos = op.pos;
+                neg.pos.set(op.pos.get());
                 return OptimizationResult::Replace(neg);
             }
         }
@@ -443,7 +443,7 @@ impl OptRewrite {
             if inner.opcode == OpCode::IntLshift {
                 if let Some(1) = ctx.get_constant_int(inner.arg(0)) {
                     let mut new_op = Op::new(OpCode::IntLshift, &[arg0, inner.arg(1)]);
-                    new_op.pos = op.pos;
+                    new_op.pos.set(op.pos.get());
                     return OptimizationResult::Emit(new_op);
                 }
             }
@@ -461,33 +461,33 @@ impl OptRewrite {
         // Constant fold
         if let (Some(a), Some(b)) = (ctx.get_constant_int(arg0), ctx.get_constant_int(arg1)) {
             if let Some(result) = self.try_fold_binary_int(OpCode::IntFloorDiv, a, b) {
-                ctx.make_constant(op.pos, Value::Int(result));
+                ctx.make_constant(op.pos.get(), Value::Int(result));
                 return OptimizationResult::Remove;
             }
         }
 
         // x // 1 -> x (identity)
         if let Some(1) = ctx.get_constant_int(arg1) {
-            ctx.replace_op(op.pos, arg0);
+            ctx.replace_op(op.pos.get(), arg0);
             return OptimizationResult::Remove;
         }
 
         // x // (-1) -> INT_NEG(x)
         if let Some(-1) = ctx.get_constant_int(arg1) {
             let mut neg = Op::new(OpCode::IntNeg, &[arg0]);
-            neg.pos = op.pos;
+            neg.pos.set(op.pos.get());
             return OptimizationResult::Replace(neg);
         }
 
         // 0 // x -> 0 (zero dividend)
         if let Some(0) = ctx.get_constant_int(arg0) {
-            ctx.make_constant(op.pos, Value::Int(0));
+            ctx.make_constant(op.pos.get(), Value::Int(0));
             return OptimizationResult::Remove;
         }
 
         // x // x -> 1 (self-division, x != 0 guaranteed by semantics)
         if arg0 == arg1 {
-            ctx.make_constant(op.pos, Value::Int(1));
+            ctx.make_constant(op.pos.get(), Value::Int(1));
             return OptimizationResult::Remove;
         }
 
@@ -499,7 +499,7 @@ impl OptRewrite {
                 let shift = divisor.trailing_zeros();
                 let shift_ref = self.emit_constant_int(ctx, shift as i64);
                 let result_ref = ctx.emit(Op::new(OpCode::IntRshift, &[arg0, shift_ref]));
-                ctx.replace_op(op.pos, result_ref);
+                ctx.replace_op(op.pos.get(), result_ref);
                 return OptimizationResult::Remove;
             }
 
@@ -507,7 +507,7 @@ impl OptRewrite {
             if divisor >= 3 {
                 let result =
                     intdiv::division_operations(arg0, divisor, false, ctx.current_pass_idx, ctx);
-                ctx.replace_op(op.pos, result);
+                ctx.replace_op(op.pos.get(), result);
                 return OptimizationResult::Remove;
             }
         }
@@ -525,32 +525,32 @@ impl OptRewrite {
         // Constant fold
         if let (Some(a), Some(b)) = (ctx.get_constant_int(arg0), ctx.get_constant_int(arg1)) {
             if let Some(result) = self.try_fold_binary_int(OpCode::IntMod, a, b) {
-                ctx.make_constant(op.pos, Value::Int(result));
+                ctx.make_constant(op.pos.get(), Value::Int(result));
                 return OptimizationResult::Remove;
             }
         }
 
         // x % 1 -> 0 (any integer mod 1 is 0)
         if let Some(1) = ctx.get_constant_int(arg1) {
-            ctx.make_constant(op.pos, Value::Int(0));
+            ctx.make_constant(op.pos.get(), Value::Int(0));
             return OptimizationResult::Remove;
         }
 
         // x % (-1) -> 0 (any integer mod -1 is 0)
         if let Some(-1) = ctx.get_constant_int(arg1) {
-            ctx.make_constant(op.pos, Value::Int(0));
+            ctx.make_constant(op.pos.get(), Value::Int(0));
             return OptimizationResult::Remove;
         }
 
         // 0 % x -> 0 (zero dividend)
         if let Some(0) = ctx.get_constant_int(arg0) {
-            ctx.make_constant(op.pos, Value::Int(0));
+            ctx.make_constant(op.pos.get(), Value::Int(0));
             return OptimizationResult::Remove;
         }
 
         // x % x -> 0 (self-modulo)
         if arg0 == arg1 {
-            ctx.make_constant(op.pos, Value::Int(0));
+            ctx.make_constant(op.pos.get(), Value::Int(0));
             return OptimizationResult::Remove;
         }
 
@@ -559,7 +559,7 @@ impl OptRewrite {
             if divisor >= 3 && divisor.count_ones() != 1 {
                 let result =
                     intdiv::modulo_operations(arg0, divisor, false, ctx.current_pass_idx, ctx);
-                ctx.replace_op(op.pos, result);
+                ctx.replace_op(op.pos.get(), result);
                 return OptimizationResult::Remove;
             }
         }
@@ -576,32 +576,32 @@ impl OptRewrite {
         // Constant fold
         if let (Some(a), Some(b)) = (ctx.get_constant_int(arg0), ctx.get_constant_int(arg1)) {
             if let Some(result) = self.try_fold_binary_int(OpCode::IntAnd, a, b) {
-                ctx.make_constant(op.pos, Value::Int(result));
+                ctx.make_constant(op.pos.get(), Value::Int(result));
                 return OptimizationResult::Remove;
             }
         }
 
         // x & 0 -> 0
         if let Some(0) = ctx.get_constant_int(arg1) {
-            ctx.make_constant(op.pos, Value::Int(0));
+            ctx.make_constant(op.pos.get(), Value::Int(0));
             return OptimizationResult::Remove;
         }
         if let Some(0) = ctx.get_constant_int(arg0) {
-            ctx.make_constant(op.pos, Value::Int(0));
+            ctx.make_constant(op.pos.get(), Value::Int(0));
             return OptimizationResult::Remove;
         }
         // x & -1 -> x (all bits set = identity)
         if let Some(-1) = ctx.get_constant_int(arg1) {
-            ctx.replace_op(op.pos, arg0);
+            ctx.replace_op(op.pos.get(), arg0);
             return OptimizationResult::Remove;
         }
         if let Some(-1) = ctx.get_constant_int(arg0) {
-            ctx.replace_op(op.pos, arg1);
+            ctx.replace_op(op.pos.get(), arg1);
             return OptimizationResult::Remove;
         }
         // and_x_x: int_and(a, a) => a
         if arg0 == arg1 {
-            ctx.replace_op(op.pos, arg0);
+            ctx.replace_op(op.pos.get(), arg0);
             return OptimizationResult::Remove;
         }
 
@@ -613,7 +613,7 @@ impl OptRewrite {
                         let x = inner.arg(0);
                         let c = self.emit_constant_int(ctx, c1 & c2);
                         let mut new_op = Op::new(OpCode::IntAnd, &[x, c]);
-                        new_op.pos = op.pos;
+                        new_op.pos.set(op.pos.get());
                         return OptimizationResult::Emit(new_op);
                     }
                 }
@@ -623,7 +623,7 @@ impl OptRewrite {
         // and_absorb: int_and(a, int_and(a, b)) => int_and(a, b)
         if let Some(inner) = ctx.get_producing_op(arg1) {
             if inner.opcode == OpCode::IntAnd && inner.arg(0) == arg0 {
-                ctx.replace_op(op.pos, arg1);
+                ctx.replace_op(op.pos.get(), arg1);
                 return OptimizationResult::Remove;
             }
         }
@@ -632,7 +632,7 @@ impl OptRewrite {
         if let Some(c) = ctx.get_constant_int(arg1) {
             if let Some(bound) = ctx.get_int_bound(arg0) {
                 if bound.lower >= 0 && bound.upper <= (c & !(c.wrapping_add(1))) {
-                    ctx.replace_op(op.pos, arg0);
+                    ctx.replace_op(op.pos.get(), arg0);
                     return OptimizationResult::Remove;
                 }
             }
@@ -642,12 +642,12 @@ impl OptRewrite {
         if let (Some(ba), Some(bb)) = (ctx.get_int_bound(arg0), ctx.get_int_bound(arg1)) {
             let result_bound = ba.and_bound(&bb);
             if result_bound.is_constant() {
-                ctx.make_constant(op.pos, Value::Int(result_bound.get_constant_int()));
+                ctx.make_constant(op.pos.get(), Value::Int(result_bound.get_constant_int()));
                 return OptimizationResult::Remove;
             }
             // and_idempotent: int_and(x, y) => x (if y.ones | x.zeros == -1)
             if (bb.tvalue | (!ba.tvalue & !ba.tmask)) == u64::MAX {
-                ctx.replace_op(op.pos, arg0);
+                ctx.replace_op(op.pos.get(), arg0);
                 return OptimizationResult::Remove;
             }
         }
@@ -660,7 +660,7 @@ impl OptRewrite {
                 {
                     if by.and_bound(&bz).known_eq_const(0) {
                         let mut new_op = Op::new(OpCode::IntAnd, &[inner.arg(0), arg1]);
-                        new_op.pos = op.pos;
+                        new_op.pos.set(op.pos.get());
                         return OptimizationResult::Emit(new_op);
                     }
                 }
@@ -679,32 +679,32 @@ impl OptRewrite {
         // Constant fold
         if let (Some(a), Some(b)) = (ctx.get_constant_int(arg0), ctx.get_constant_int(arg1)) {
             if let Some(result) = self.try_fold_binary_int(OpCode::IntOr, a, b) {
-                ctx.make_constant(op.pos, Value::Int(result));
+                ctx.make_constant(op.pos.get(), Value::Int(result));
                 return OptimizationResult::Remove;
             }
         }
 
         // x | 0 -> x
         if let Some(0) = ctx.get_constant_int(arg1) {
-            ctx.replace_op(op.pos, arg0);
+            ctx.replace_op(op.pos.get(), arg0);
             return OptimizationResult::Remove;
         }
         if let Some(0) = ctx.get_constant_int(arg0) {
-            ctx.replace_op(op.pos, arg1);
+            ctx.replace_op(op.pos.get(), arg1);
             return OptimizationResult::Remove;
         }
         // x | -1 -> -1
         if let Some(-1) = ctx.get_constant_int(arg1) {
-            ctx.make_constant(op.pos, Value::Int(-1));
+            ctx.make_constant(op.pos.get(), Value::Int(-1));
             return OptimizationResult::Remove;
         }
         if let Some(-1) = ctx.get_constant_int(arg0) {
-            ctx.make_constant(op.pos, Value::Int(-1));
+            ctx.make_constant(op.pos.get(), Value::Int(-1));
             return OptimizationResult::Remove;
         }
         // or_x_x: int_or(a, a) => a
         if arg0 == arg1 {
-            ctx.replace_op(op.pos, arg0);
+            ctx.replace_op(op.pos.get(), arg0);
             return OptimizationResult::Remove;
         }
 
@@ -716,7 +716,7 @@ impl OptRewrite {
                         let x = inner.arg(0);
                         let c = self.emit_constant_int(ctx, c1 | c2);
                         let mut new_op = Op::new(OpCode::IntOr, &[x, c]);
-                        new_op.pos = op.pos;
+                        new_op.pos.set(op.pos.get());
                         return OptimizationResult::Emit(new_op);
                     }
                 }
@@ -726,7 +726,7 @@ impl OptRewrite {
         // or_absorb: int_or(a, int_or(a, b)) => int_or(a, b)
         if let Some(inner) = ctx.get_producing_op(arg1) {
             if inner.opcode == OpCode::IntOr && inner.arg(0) == arg0 {
-                ctx.replace_op(op.pos, arg1);
+                ctx.replace_op(op.pos.get(), arg1);
                 return OptimizationResult::Remove;
             }
         }
@@ -746,7 +746,7 @@ impl OptRewrite {
                     let x = inner0.arg(0);
                     let c = self.emit_constant_int(ctx, c1 | c2);
                     let mut new_op = Op::new(OpCode::IntAnd, &[x, c]);
-                    new_op.pos = op.pos;
+                    new_op.pos.set(op.pos.get());
                     return OptimizationResult::Emit(new_op);
                 }
             }
@@ -756,12 +756,12 @@ impl OptRewrite {
         if let (Some(ba), Some(bb)) = (ctx.get_int_bound(arg0), ctx.get_int_bound(arg1)) {
             let result_bound = ba.or_bound(&bb);
             if result_bound.is_constant() {
-                ctx.make_constant(op.pos, Value::Int(result_bound.get_constant_int()));
+                ctx.make_constant(op.pos.get(), Value::Int(result_bound.get_constant_int()));
                 return OptimizationResult::Remove;
             }
             // or_idempotent: int_or(x, y) => x (if x.ones | y.zeros == -1)
             if (ba.tvalue | (!bb.tvalue & !bb.tmask)) == u64::MAX {
-                ctx.replace_op(op.pos, arg0);
+                ctx.replace_op(op.pos.get(), arg0);
                 return OptimizationResult::Remove;
             }
         }
@@ -778,34 +778,34 @@ impl OptRewrite {
         // Constant fold
         if let (Some(a), Some(b)) = (ctx.get_constant_int(arg0), ctx.get_constant_int(arg1)) {
             if let Some(result) = self.try_fold_binary_int(OpCode::IntXor, a, b) {
-                ctx.make_constant(op.pos, Value::Int(result));
+                ctx.make_constant(op.pos.get(), Value::Int(result));
                 return OptimizationResult::Remove;
             }
         }
 
         // x ^ 0 -> x
         if let Some(0) = ctx.get_constant_int(arg1) {
-            ctx.replace_op(op.pos, arg0);
+            ctx.replace_op(op.pos.get(), arg0);
             return OptimizationResult::Remove;
         }
         if let Some(0) = ctx.get_constant_int(arg0) {
-            ctx.replace_op(op.pos, arg1);
+            ctx.replace_op(op.pos.get(), arg1);
             return OptimizationResult::Remove;
         }
         // x ^ x -> 0
         if arg0 == arg1 {
-            ctx.make_constant(op.pos, Value::Int(0));
+            ctx.make_constant(op.pos.get(), Value::Int(0));
             return OptimizationResult::Remove;
         }
         // x ^ -1 -> ~x (INT_INVERT)
         if let Some(-1) = ctx.get_constant_int(arg1) {
             let mut new_op = Op::new(OpCode::IntInvert, &[arg0]);
-            new_op.pos = op.pos;
+            new_op.pos.set(op.pos.get());
             return OptimizationResult::Emit(new_op);
         }
         if let Some(-1) = ctx.get_constant_int(arg0) {
             let mut new_op = Op::new(OpCode::IntInvert, &[arg1]);
-            new_op.pos = op.pos;
+            new_op.pos.set(op.pos.get());
             return OptimizationResult::Emit(new_op);
         }
 
@@ -817,7 +817,7 @@ impl OptRewrite {
                         let x = inner.arg(0);
                         let c = self.emit_constant_int(ctx, c1 ^ c2);
                         let mut new_op = Op::new(OpCode::IntXor, &[x, c]);
-                        new_op.pos = op.pos;
+                        new_op.pos.set(op.pos.get());
                         return OptimizationResult::Emit(new_op);
                     }
                 }
@@ -827,7 +827,7 @@ impl OptRewrite {
         // xor_absorb: int_xor(int_xor(a, b), b) => a
         if let Some(inner) = ctx.get_producing_op(arg0) {
             if inner.opcode == OpCode::IntXor && inner.arg(1) == arg1 {
-                ctx.replace_op(op.pos, inner.arg(0));
+                ctx.replace_op(op.pos.get(), inner.arg(0));
                 return OptimizationResult::Remove;
             }
         }
@@ -837,7 +837,7 @@ impl OptRewrite {
             if let Some(bound) = ctx.get_int_bound(arg0) {
                 if bound.is_bool() {
                     let mut new_op = Op::new(OpCode::IntIsZero, &[arg0]);
-                    new_op.pos = op.pos;
+                    new_op.pos.set(op.pos.get());
                     return OptimizationResult::Emit(new_op);
                 }
             }
@@ -855,19 +855,19 @@ impl OptRewrite {
         // Constant fold
         if let (Some(a), Some(b)) = (ctx.get_constant_int(arg0), ctx.get_constant_int(arg1)) {
             if let Some(result) = self.try_fold_binary_int(OpCode::IntLshift, a, b) {
-                ctx.make_constant(op.pos, Value::Int(result));
+                ctx.make_constant(op.pos.get(), Value::Int(result));
                 return OptimizationResult::Remove;
             }
         }
 
         // x << 0 -> x
         if let Some(0) = ctx.get_constant_int(arg1) {
-            ctx.replace_op(op.pos, arg0);
+            ctx.replace_op(op.pos.get(), arg0);
             return OptimizationResult::Remove;
         }
         // 0 << x -> 0
         if let Some(0) = ctx.get_constant_int(arg0) {
-            ctx.make_constant(op.pos, Value::Int(0));
+            ctx.make_constant(op.pos.get(), Value::Int(0));
             return OptimizationResult::Remove;
         }
 
@@ -879,7 +879,7 @@ impl OptRewrite {
                         if ctx.get_constant_int(inner.arg(1)) == Some(c1) {
                             let mask = self.emit_constant_int(ctx, (-1i64).wrapping_shl(c1 as u32));
                             let mut new_op = Op::new(OpCode::IntAnd, &[inner.arg(0), mask]);
-                            new_op.pos = op.pos;
+                            new_op.pos.set(op.pos.get());
                             return OptimizationResult::Emit(new_op);
                         }
                     }
@@ -888,7 +888,7 @@ impl OptRewrite {
                         if ctx.get_constant_int(inner.arg(1)) == Some(c1) {
                             let mask = self.emit_constant_int(ctx, (-1i64).wrapping_shl(c1 as u32));
                             let mut new_op = Op::new(OpCode::IntAnd, &[inner.arg(0), mask]);
-                            new_op.pos = op.pos;
+                            new_op.pos.set(op.pos.get());
                             return OptimizationResult::Emit(new_op);
                         }
                     }
@@ -903,7 +903,7 @@ impl OptRewrite {
                                         self.emit_constant_int(ctx, c2.wrapping_shl(c1 as u32));
                                     let mut new_op =
                                         Op::new(OpCode::IntAnd, &[inner2.arg(0), mask]);
-                                    new_op.pos = op.pos;
+                                    new_op.pos.set(op.pos.get());
                                     return OptimizationResult::Emit(new_op);
                                 }
                                 // lshift_and_urshift
@@ -914,7 +914,7 @@ impl OptRewrite {
                                         self.emit_constant_int(ctx, c2.wrapping_shl(c1 as u32));
                                     let mut new_op =
                                         Op::new(OpCode::IntAnd, &[inner2.arg(0), mask]);
-                                    new_op.pos = op.pos;
+                                    new_op.pos.set(op.pos.get());
                                     return OptimizationResult::Emit(new_op);
                                 }
                             }
@@ -934,7 +934,7 @@ impl OptRewrite {
                             if c < 64 {
                                 let cv = self.emit_constant_int(ctx, c);
                                 let mut new_op = Op::new(OpCode::IntLshift, &[inner.arg(0), cv]);
-                                new_op.pos = op.pos;
+                                new_op.pos.set(op.pos.get());
                                 return OptimizationResult::Emit(new_op);
                             }
                         }
@@ -955,19 +955,19 @@ impl OptRewrite {
         // Constant fold
         if let (Some(a), Some(b)) = (ctx.get_constant_int(arg0), ctx.get_constant_int(arg1)) {
             if let Some(result) = self.try_fold_binary_int(OpCode::IntRshift, a, b) {
-                ctx.make_constant(op.pos, Value::Int(result));
+                ctx.make_constant(op.pos.get(), Value::Int(result));
                 return OptimizationResult::Remove;
             }
         }
 
         // x >> 0 -> x
         if let Some(0) = ctx.get_constant_int(arg1) {
-            ctx.replace_op(op.pos, arg0);
+            ctx.replace_op(op.pos.get(), arg0);
             return OptimizationResult::Remove;
         }
         // 0 >> x -> 0
         if let Some(0) = ctx.get_constant_int(arg0) {
-            ctx.make_constant(op.pos, Value::Int(0));
+            ctx.make_constant(op.pos.get(), Value::Int(0));
             return OptimizationResult::Remove;
         }
 
@@ -975,7 +975,7 @@ impl OptRewrite {
         if let (Some(ba), Some(bb)) = (ctx.get_int_bound(arg0), ctx.get_int_bound(arg1)) {
             let result_bound = ba.rshift_bound(&bb);
             if result_bound.is_constant() {
-                ctx.make_constant(op.pos, Value::Int(result_bound.get_constant_int()));
+                ctx.make_constant(op.pos.get(), Value::Int(result_bound.get_constant_int()));
                 return OptimizationResult::Remove;
             }
         }
@@ -987,7 +987,7 @@ impl OptRewrite {
                     (ctx.get_int_bound(inner.arg(0)), ctx.get_int_bound(arg1))
                 {
                     if bx.lshift_bound_cannot_overflow(&by) {
-                        ctx.replace_op(op.pos, inner.arg(0));
+                        ctx.replace_op(op.pos.get(), inner.arg(0));
                         return OptimizationResult::Remove;
                     }
                 }
@@ -1003,7 +1003,7 @@ impl OptRewrite {
                             let c = (c1 + c2).min(63);
                             let cv = self.emit_constant_int(ctx, c);
                             let mut new_op = Op::new(OpCode::IntRshift, &[inner.arg(0), cv]);
-                            new_op.pos = op.pos;
+                            new_op.pos.set(op.pos.get());
                             return OptimizationResult::Emit(new_op);
                         }
                     }
@@ -1023,19 +1023,19 @@ impl OptRewrite {
         // Constant fold
         if let (Some(a), Some(b)) = (ctx.get_constant_int(arg0), ctx.get_constant_int(arg1)) {
             if let Some(result) = self.try_fold_binary_int(OpCode::UintRshift, a, b) {
-                ctx.make_constant(op.pos, Value::Int(result));
+                ctx.make_constant(op.pos.get(), Value::Int(result));
                 return OptimizationResult::Remove;
             }
         }
 
         // x >>> 0 -> x
         if let Some(0) = ctx.get_constant_int(arg1) {
-            ctx.replace_op(op.pos, arg0);
+            ctx.replace_op(op.pos.get(), arg0);
             return OptimizationResult::Remove;
         }
         // 0 >>> x -> 0
         if let Some(0) = ctx.get_constant_int(arg0) {
-            ctx.make_constant(op.pos, Value::Int(0));
+            ctx.make_constant(op.pos.get(), Value::Int(0));
             return OptimizationResult::Remove;
         }
 
@@ -1043,7 +1043,7 @@ impl OptRewrite {
         if let (Some(ba), Some(bb)) = (ctx.get_int_bound(arg0), ctx.get_int_bound(arg1)) {
             let result_bound = ba.urshift_bound(&bb);
             if result_bound.is_constant() {
-                ctx.make_constant(op.pos, Value::Int(result_bound.get_constant_int()));
+                ctx.make_constant(op.pos.get(), Value::Int(result_bound.get_constant_int()));
                 return OptimizationResult::Remove;
             }
         }
@@ -1058,7 +1058,7 @@ impl OptRewrite {
                         let mask = ((-1i64 as u64).wrapping_shl(c as u32) >> (c as u32)) as i64;
                         let mask_ref = self.emit_constant_int(ctx, mask);
                         let mut new_op = Op::new(OpCode::IntAnd, &[inner.arg(0), mask_ref]);
-                        new_op.pos = op.pos;
+                        new_op.pos.set(op.pos.get());
                         return OptimizationResult::Emit(new_op);
                     }
                 }
@@ -1076,7 +1076,7 @@ impl OptRewrite {
 
         if let Some(a) = ctx.get_constant_int(arg0) {
             if let Some(result) = self.try_fold_unary_int(OpCode::IntNeg, a) {
-                ctx.make_constant(op.pos, Value::Int(result));
+                ctx.make_constant(op.pos.get(), Value::Int(result));
                 return OptimizationResult::Remove;
             }
         }
@@ -1084,7 +1084,7 @@ impl OptRewrite {
         // neg_neg: int_neg(int_neg(x)) => x
         if let Some(inner) = ctx.get_producing_op(arg0) {
             if inner.opcode == OpCode::IntNeg {
-                ctx.replace_op(op.pos, inner.arg(0));
+                ctx.replace_op(op.pos.get(), inner.arg(0));
                 return OptimizationResult::Remove;
             }
         }
@@ -1098,7 +1098,7 @@ impl OptRewrite {
 
         if let Some(a) = ctx.get_constant_int(arg0) {
             if let Some(result) = self.try_fold_unary_int(OpCode::IntInvert, a) {
-                ctx.make_constant(op.pos, Value::Int(result));
+                ctx.make_constant(op.pos.get(), Value::Int(result));
                 return OptimizationResult::Remove;
             }
         }
@@ -1106,7 +1106,7 @@ impl OptRewrite {
         // invert_invert: int_invert(int_invert(x)) => x
         if let Some(inner) = ctx.get_producing_op(arg0) {
             if inner.opcode == OpCode::IntInvert {
-                ctx.replace_op(op.pos, inner.arg(0));
+                ctx.replace_op(op.pos.get(), inner.arg(0));
                 return OptimizationResult::Remove;
             }
         }
@@ -1150,7 +1150,7 @@ impl OptRewrite {
             if let Some(bound) = ctx.get_int_bound(arg0) {
                 if bound.is_bool() {
                     // make_equal_to: replace INT_IS_TRUE result with arg0.
-                    ctx.replace_op(op.pos, arg0);
+                    ctx.replace_op(op.pos.get(), arg0);
                     return OptimizationResult::Remove;
                 }
             }
@@ -1162,7 +1162,7 @@ impl OptRewrite {
                 if ctx.get_constant_int(inner.arg(1)) == Some(i64::MIN) {
                     let zero = self.emit_constant_int(ctx, 0);
                     let mut new_op = Op::new(OpCode::IntLt, &[inner.arg(0), zero]);
-                    new_op.pos = op.pos;
+                    new_op.pos.set(op.pos.get());
                     return OptimizationResult::Emit(new_op);
                 }
             }
@@ -1201,7 +1201,7 @@ impl OptRewrite {
             (ctx.get_constant(arg0), ctx.get_constant(arg1))
         {
             let same = left == right;
-            ctx.make_constant(op.pos, Value::Int((same ^ expect_isnot) as i64));
+            ctx.make_constant(op.pos.get(), Value::Int((same ^ expect_isnot) as i64));
             return OptimizationResult::Remove;
         }
         let arg0_box = ctx.get_box_replacement_box(arg0);
@@ -1221,11 +1221,11 @@ impl OptRewrite {
             } else {
                 expect_isnot
             };
-            ctx.make_constant(op.pos, Value::Int(intres as i64));
+            ctx.make_constant(op.pos.get(), Value::Int(intres as i64));
             return OptimizationResult::Remove;
         }
         if is_virtual1 {
-            ctx.make_constant(op.pos, Value::Int(expect_isnot as i64));
+            ctx.make_constant(op.pos.get(), Value::Int(expect_isnot as i64));
             return OptimizationResult::Remove;
         }
 
@@ -1239,7 +1239,7 @@ impl OptRewrite {
 
         // rewrite.py:532-533: same object
         if arg0 == arg1 {
-            ctx.make_constant(op.pos, Value::Int(!expect_isnot as i64));
+            ctx.make_constant(op.pos.get(), Value::Int(!expect_isnot as i64));
             return OptimizationResult::Remove;
         }
 
@@ -1249,7 +1249,7 @@ impl OptRewrite {
             let cls1 = info1.as_ref().and_then(|i| i.get_known_class());
             if let (Some(c0), Some(c1)) = (cls0, cls1) {
                 if c0 != c1 {
-                    ctx.make_constant(op.pos, Value::Int(expect_isnot as i64));
+                    ctx.make_constant(op.pos.get(), Value::Int(expect_isnot as i64));
                     return OptimizationResult::Remove;
                 }
             }
@@ -1261,7 +1261,7 @@ impl OptRewrite {
             let lb1 = info1.clone().and_then(|mut i| i.getlenbound(None));
             if let (Some(lb0), Some(lb1)) = (lb0, lb1) {
                 if lb0.known_ne(&lb1) {
-                    ctx.make_constant(op.pos, Value::Int(expect_isnot as i64));
+                    ctx.make_constant(op.pos.get(), Value::Int(expect_isnot as i64));
                     return OptimizationResult::Remove;
                 }
             }
@@ -1284,11 +1284,11 @@ impl OptRewrite {
     ) -> OptimizationResult {
         match self.getnullness(arg, ctx) {
             Nullness::Nonnull => {
-                ctx.make_constant(op.pos, Value::Int(expect_nonnull as i64));
+                ctx.make_constant(op.pos.get(), Value::Int(expect_nonnull as i64));
                 OptimizationResult::Remove
             }
             Nullness::Null => {
-                ctx.make_constant(op.pos, Value::Int(!expect_nonnull as i64));
+                ctx.make_constant(op.pos.get(), Value::Int(!expect_nonnull as i64));
                 OptimizationResult::Remove
             }
             Nullness::Unknown => OptimizationResult::PassOn,
@@ -1300,19 +1300,19 @@ impl OptRewrite {
         let arg0 = op.arg(0);
 
         if let Some(a) = ctx.get_constant_int(arg0) {
-            ctx.make_constant(op.pos, Value::Int(if a < 0 { 0 } else { a }));
+            ctx.make_constant(op.pos.get(), Value::Int(if a < 0 { 0 } else { a }));
             return OptimizationResult::Remove;
         }
 
         // force_ge_zero_pos: int_force_ge_zero(x) => x (if x known nonneg)
         if let Some(bound) = ctx.get_int_bound(arg0) {
             if bound.known_nonnegative() {
-                ctx.replace_op(op.pos, arg0);
+                ctx.replace_op(op.pos.get(), arg0);
                 return OptimizationResult::Remove;
             }
             // force_ge_zero_neg: int_force_ge_zero(x) => 0 (if x known negative)
             if bound.upper < 0 {
-                ctx.make_constant(op.pos, Value::Int(0));
+                ctx.make_constant(op.pos.get(), Value::Int(0));
                 return OptimizationResult::Remove;
             }
         }
@@ -1332,7 +1332,7 @@ impl OptRewrite {
             ctx.get_constant_int(arg2),
         ) {
             let result = (a <= b && b < c) as i64;
-            ctx.make_constant(op.pos, Value::Int(result));
+            ctx.make_constant(op.pos.get(), Value::Int(result));
             return OptimizationResult::Remove;
         }
 
@@ -1348,7 +1348,7 @@ impl OptRewrite {
 
         if let (Some(a), Some(b)) = (ctx.get_constant_int(arg0), ctx.get_constant_int(arg1)) {
             if let Some(result) = self.try_fold_binary_int(op.opcode, a, b) {
-                ctx.make_constant(op.pos, Value::Int(result));
+                ctx.make_constant(op.pos.get(), Value::Int(result));
                 return OptimizationResult::Remove;
             }
         }
@@ -1357,7 +1357,7 @@ impl OptRewrite {
         if op.opcode == OpCode::IntEq {
             if let (Some(bx), Some(by)) = (ctx.get_int_bound(arg0), ctx.get_int_bound(arg1)) {
                 if bx.known_ne(&by) {
-                    ctx.make_constant(op.pos, Value::Int(0));
+                    ctx.make_constant(op.pos.get(), Value::Int(0));
                     return OptimizationResult::Remove;
                 }
             }
@@ -1366,26 +1366,26 @@ impl OptRewrite {
         if op.opcode == OpCode::IntNe {
             if let (Some(bx), Some(by)) = (ctx.get_int_bound(arg0), ctx.get_int_bound(arg1)) {
                 if bx.known_ne(&by) {
-                    ctx.make_constant(op.pos, Value::Int(1));
+                    ctx.make_constant(op.pos.get(), Value::Int(1));
                     return OptimizationResult::Remove;
                 }
             }
         }
         // eq_same: int_eq(x, x) => 1
         if op.opcode == OpCode::IntEq && arg0 == arg1 {
-            ctx.make_constant(op.pos, Value::Int(1));
+            ctx.make_constant(op.pos.get(), Value::Int(1));
             return OptimizationResult::Remove;
         }
         // ne_same: int_ne(x, x) => 0
         if op.opcode == OpCode::IntNe && arg0 == arg1 {
-            ctx.make_constant(op.pos, Value::Int(0));
+            ctx.make_constant(op.pos.get(), Value::Int(0));
             return OptimizationResult::Remove;
         }
         // eq_zero: int_eq(x, 0) => int_is_zero(x)
         if op.opcode == OpCode::IntEq {
             if let Some(0) = ctx.get_constant_int(arg1) {
                 let mut new_op = Op::new(OpCode::IntIsZero, &[arg0]);
-                new_op.pos = op.pos;
+                new_op.pos.set(op.pos.get());
                 return OptimizationResult::Emit(new_op);
             }
         }
@@ -1393,7 +1393,7 @@ impl OptRewrite {
         if op.opcode == OpCode::IntNe {
             if let Some(0) = ctx.get_constant_int(arg1) {
                 let mut new_op = Op::new(OpCode::IntIsTrue, &[arg0]);
-                new_op.pos = op.pos;
+                new_op.pos.set(op.pos.get());
                 return OptimizationResult::Emit(new_op);
             }
         }
@@ -1402,7 +1402,7 @@ impl OptRewrite {
             if let Some(1) = ctx.get_constant_int(arg1) {
                 if let Some(bound) = ctx.get_int_bound(arg0) {
                     if bound.is_bool() {
-                        ctx.replace_op(op.pos, arg0);
+                        ctx.replace_op(op.pos.get(), arg0);
                         return OptimizationResult::Remove;
                     }
                 }
@@ -1418,7 +1418,7 @@ impl OptRewrite {
                             && inner_eq.arg(0) == inner_sub.arg(0)
                             && inner_eq.arg(1) == arg1
                         {
-                            ctx.make_constant(op.pos, Value::Int(0));
+                            ctx.make_constant(op.pos.get(), Value::Int(0));
                             return OptimizationResult::Remove;
                         }
                     }
@@ -1429,7 +1429,7 @@ impl OptRewrite {
         // rewrite.py: postprocess — record comparison result for
         // find_rewritable_bool (inverse/reflex lookup).
         self.bool_result_cache
-            .insert((op.opcode, arg0, arg1), op.pos);
+            .insert((op.opcode, arg0, arg1), op.pos.get());
 
         OptimizationResult::PassOn
     }
@@ -1683,13 +1683,15 @@ impl OptRewrite {
                     // one. This path writes directly into new_operations, so
                     // perform the descr copy inline before replacing the op.
                     let new_descr = crate::compile::make_resume_guard_descr_typed(
-                        old_guard.fail_arg_types.clone().unwrap_or_default(),
+                        old_guard
+                            .get_fail_arg_types()
+                            .map(|t| t.to_vec())
+                            .unwrap_or_default(),
                     );
                     let old_descr = old_guard
-                        .descr
-                        .as_ref()
+                        .getdescr()
                         .expect("strengthened GUARD_CLASS donor must carry a descr");
-                    crate::compile::copy_all_attributes_from(&new_descr, old_descr);
+                    crate::compile::copy_all_attributes_from(&new_descr, &old_descr);
                     let combined = old_guard.copy_and_change(
                         OpCode::GuardNonnullClass,
                         Some(&[old_guard.arg(0), op.arg(1)]),
@@ -1810,7 +1812,7 @@ impl OptRewrite {
         }
         let arg2 = op.arg(2);
         if let Some(1) = ctx.get_constant_int(arg2) {
-            ctx.replace_op(op.pos, op.arg(1));
+            ctx.replace_op(op.pos.get(), op.arg(1));
             ctx.last_op_removed = true;
             return true;
         }
@@ -1833,7 +1835,7 @@ impl OptRewrite {
 
         // rewrite.py:774-777: b1.known_eq_const(0) → 0
         if b1.known_eq_const(0) {
-            ctx.make_constant(op.pos, Value::Int(0));
+            ctx.make_constant(op.pos.get(), Value::Int(0));
             ctx.last_op_removed = true;
             return Some(OptimizationResult::Remove);
         }
@@ -1848,7 +1850,7 @@ impl OptRewrite {
         }
         // rewrite.py:785-788: x % 1 → 0
         if val == 1 {
-            ctx.make_constant(op.pos, Value::Int(0));
+            ctx.make_constant(op.pos.get(), Value::Int(0));
             ctx.last_op_removed = true;
             return Some(OptimizationResult::Remove);
         }
@@ -1858,7 +1860,7 @@ impl OptRewrite {
         if val & (val - 1) == 0 {
             let mask = ctx.make_constant_int(val - 1);
             let mut and_op = Op::new(OpCode::IntAnd, &[arg1, mask]);
-            and_op.pos = op.pos;
+            and_op.pos.set(op.pos.get());
             ctx.emit_extra(ctx.current_pass_idx, and_op);
             ctx.last_op_removed = true;
             return Some(OptimizationResult::Remove);
@@ -1872,7 +1874,7 @@ impl OptRewrite {
             ctx.current_pass_idx,
             ctx,
         );
-        ctx.replace_op(op.pos, result_ref);
+        ctx.replace_op(op.pos.get(), result_ref);
         ctx.last_op_removed = true;
         Some(OptimizationResult::Remove)
     }
@@ -1893,7 +1895,7 @@ impl OptRewrite {
 
         // rewrite.py:726-729: b1.known_eq_const(0) → 0
         if b1.known_eq_const(0) {
-            ctx.make_constant(op.pos, Value::Int(0));
+            ctx.make_constant(op.pos.get(), Value::Int(0));
             ctx.last_op_removed = true;
             return Some(OptimizationResult::Remove);
         }
@@ -1911,7 +1913,7 @@ impl OptRewrite {
                     let shiftbound = ctx.getintbound(shiftvar);
                     if shiftbound.known_nonnegative() && shiftbound.known_lt_const(63) {
                         let mut rshift_op = Op::new(OpCode::IntRshift, &[arg1, shiftvar]);
-                        rshift_op.pos = op.pos;
+                        rshift_op.pos.set(op.pos.get());
                         ctx.emit_extra(ctx.current_pass_idx, rshift_op);
                         ctx.last_op_removed = true;
                         return Some(OptimizationResult::Remove);
@@ -1925,7 +1927,7 @@ impl OptRewrite {
         if val == -1 {
             if b1.known_gt_const(i64::MIN) {
                 let mut neg_op = Op::new(OpCode::IntNeg, &[arg1]);
-                neg_op.pos = op.pos;
+                neg_op.pos.set(op.pos.get());
                 ctx.emit_extra(ctx.current_pass_idx, neg_op);
                 ctx.last_op_removed = true;
                 return Some(OptimizationResult::Remove);
@@ -1937,7 +1939,7 @@ impl OptRewrite {
         }
         // rewrite.py:752-755: x // 1 → x
         if val == 1 {
-            ctx.replace_op(op.pos, arg1);
+            ctx.replace_op(op.pos.get(), arg1);
             ctx.last_op_removed = true;
             return Some(OptimizationResult::Remove);
         }
@@ -1946,7 +1948,7 @@ impl OptRewrite {
             let shift = val.trailing_zeros() as i64;
             let shift_const = ctx.make_constant_int(shift);
             let mut rshift_op = Op::new(OpCode::IntRshift, &[arg1, shift_const]);
-            rshift_op.pos = op.pos;
+            rshift_op.pos.set(op.pos.get());
             ctx.emit_extra(ctx.current_pass_idx, rshift_op);
             ctx.last_op_removed = true;
             return Some(OptimizationResult::Remove);
@@ -1960,7 +1962,7 @@ impl OptRewrite {
             ctx.current_pass_idx,
             ctx,
         );
-        ctx.replace_op(op.pos, result_ref);
+        ctx.replace_op(op.pos.get(), result_ref);
         ctx.last_op_removed = true;
         Some(OptimizationResult::Remove)
     }
@@ -2016,8 +2018,8 @@ impl OptRewrite {
         }
 
         // rewrite.py:612,617: extrainfo.single_write_descr_array sanity check
-        let call_descr = match &op.descr {
-            Some(d) => d.clone(),
+        let call_descr = match op.getdescr() {
+            Some(d) => d,
             None => return false,
         };
         let cd = match call_descr.as_call_descr() {
@@ -2144,7 +2146,7 @@ impl OptRewrite {
                 let opcode = OpCode::getarrayitem_for_type(item_type);
                 let idx_const = ctx.make_constant_int(index + source_start);
                 let mut getop = Op::new(opcode, &[source_box, idx_const]);
-                getop.descr = Some(arraydescr.clone());
+                getop.setdescr(arraydescr.clone());
                 let pos = ctx.emit_extra(pass_idx, getop);
                 Some(pos)
             };
@@ -2165,7 +2167,7 @@ impl OptRewrite {
                 // rewrite.py:666-670: emit SETARRAYITEM_GC
                 let idx_const = ctx.make_constant_int(index + dest_start);
                 let mut setop = Op::new(OpCode::SetarrayitemGc, &[dest_box, idx_const, val]);
-                setop.descr = Some(arraydescr.clone());
+                setop.setdescr(arraydescr.clone());
                 ctx.emit_extra(pass_idx, setop);
             }
         }
@@ -2177,7 +2179,7 @@ impl OptRewrite {
             return OptimizationResult::PassOn;
         }
         let arg0 = op.arg(0);
-        ctx.replace_op(op.pos, arg0);
+        ctx.replace_op(op.pos.get(), arg0);
         OptimizationResult::Remove
     }
 
@@ -2213,7 +2215,7 @@ impl OptRewrite {
         // First try direct constant (fast path)
         if let Some(val) = ctx.get_constant_int(cached_ref) {
             let result = 1 - val;
-            ctx.make_constant(op.pos, Value::Int(result));
+            ctx.make_constant(op.pos.get(), Value::Int(result));
             return Some(OptimizationResult::Remove);
         }
         // rewrite.py:61-65: b.known_eq_const(1) / b.known_eq_const(0)
@@ -2221,10 +2223,10 @@ impl OptRewrite {
         // even without being a constant in the optimizer's sense.
         if let Some(bound) = ctx.get_int_bound(cached_ref) {
             if bound.known_eq_const(1) {
-                ctx.make_constant(op.pos, Value::Int(0));
+                ctx.make_constant(op.pos.get(), Value::Int(0));
                 return Some(OptimizationResult::Remove);
             } else if bound.known_eq_const(0) {
-                ctx.make_constant(op.pos, Value::Int(1));
+                ctx.make_constant(op.pos.get(), Value::Int(1));
                 return Some(OptimizationResult::Remove);
             }
         }
@@ -2253,7 +2255,7 @@ impl OptRewrite {
         if let Some(reflex_opcode) = op.opcode.bool_reflex() {
             let key = (reflex_opcode, arg1, arg0);
             if let Some(&cached_ref) = self.bool_result_cache.get(&key) {
-                ctx.replace_op(op.pos, cached_ref);
+                ctx.replace_op(op.pos.get(), cached_ref);
                 return Some(OptimizationResult::Remove);
             }
 
@@ -2308,7 +2310,7 @@ impl OptRewrite {
 
         if let (Some(a), Some(b)) = (ctx.get_constant_float(arg0), ctx.get_constant_float(arg1)) {
             if let Some(result) = self.try_fold_binary_float(OpCode::FloatAdd, a, b) {
-                ctx.make_constant(op.pos, Value::Float(result));
+                ctx.make_constant(op.pos.get(), Value::Float(result));
                 return OptimizationResult::Remove;
             }
         }
@@ -2316,14 +2318,14 @@ impl OptRewrite {
         // x + 0.0 -> x
         if let Some(v) = ctx.get_constant_float(arg1) {
             if v == 0.0 {
-                ctx.replace_op(op.pos, arg0);
+                ctx.replace_op(op.pos.get(), arg0);
                 return OptimizationResult::Remove;
             }
         }
         // 0.0 + x -> x
         if let Some(v) = ctx.get_constant_float(arg0) {
             if v == 0.0 {
-                ctx.replace_op(op.pos, arg1);
+                ctx.replace_op(op.pos.get(), arg1);
                 return OptimizationResult::Remove;
             }
         }
@@ -2338,7 +2340,7 @@ impl OptRewrite {
 
         if let (Some(a), Some(b)) = (ctx.get_constant_float(arg0), ctx.get_constant_float(arg1)) {
             if let Some(result) = self.try_fold_binary_float(OpCode::FloatSub, a, b) {
-                ctx.make_constant(op.pos, Value::Float(result));
+                ctx.make_constant(op.pos.get(), Value::Float(result));
                 return OptimizationResult::Remove;
             }
         }
@@ -2346,7 +2348,7 @@ impl OptRewrite {
         // x - 0.0 -> x
         if let Some(v) = ctx.get_constant_float(arg1) {
             if v == 0.0 {
-                ctx.replace_op(op.pos, arg0);
+                ctx.replace_op(op.pos.get(), arg0);
                 return OptimizationResult::Remove;
             }
         }
@@ -2361,7 +2363,7 @@ impl OptRewrite {
 
         if let (Some(a), Some(b)) = (ctx.get_constant_float(arg0), ctx.get_constant_float(arg1)) {
             if let Some(result) = self.try_fold_binary_float(OpCode::FloatMul, a, b) {
-                ctx.make_constant(op.pos, Value::Float(result));
+                ctx.make_constant(op.pos.get(), Value::Float(result));
                 return OptimizationResult::Remove;
             }
         }
@@ -2369,26 +2371,26 @@ impl OptRewrite {
         // x * 1.0 -> x
         if let Some(v) = ctx.get_constant_float(arg1) {
             if v == 1.0 {
-                ctx.replace_op(op.pos, arg0);
+                ctx.replace_op(op.pos.get(), arg0);
                 return OptimizationResult::Remove;
             }
             // rewrite.py: x * -1.0 -> FLOAT_NEG(x)
             if v == -1.0 {
                 let mut neg = Op::new(OpCode::FloatNeg, &[arg0]);
-                neg.pos = op.pos;
+                neg.pos.set(op.pos.get());
                 return OptimizationResult::Replace(neg);
             }
         }
         // 1.0 * x -> x
         if let Some(v) = ctx.get_constant_float(arg0) {
             if v == 1.0 {
-                ctx.replace_op(op.pos, arg1);
+                ctx.replace_op(op.pos.get(), arg1);
                 return OptimizationResult::Remove;
             }
             // -1.0 * x -> FLOAT_NEG(x)
             if v == -1.0 {
                 let mut neg = Op::new(OpCode::FloatNeg, &[arg1]);
-                neg.pos = op.pos;
+                neg.pos.set(op.pos.get());
                 return OptimizationResult::Replace(neg);
             }
         }
@@ -2403,7 +2405,7 @@ impl OptRewrite {
 
         if let (Some(a), Some(b)) = (ctx.get_constant_float(arg0), ctx.get_constant_float(arg1)) {
             if let Some(result) = self.try_fold_binary_float(OpCode::FloatTrueDiv, a, b) {
-                ctx.make_constant(op.pos, Value::Float(result));
+                ctx.make_constant(op.pos.get(), Value::Float(result));
                 return OptimizationResult::Remove;
             }
         }
@@ -2411,13 +2413,13 @@ impl OptRewrite {
         // x / 1.0 -> x
         if let Some(v) = ctx.get_constant_float(arg1) {
             if v == 1.0 {
-                ctx.replace_op(op.pos, arg0);
+                ctx.replace_op(op.pos.get(), arg0);
                 return OptimizationResult::Remove;
             }
             // rewrite.py: x / -1.0 -> FLOAT_NEG(x)
             if v == -1.0 {
                 let mut neg = Op::new(OpCode::FloatNeg, &[arg0]);
-                neg.pos = op.pos;
+                neg.pos.set(op.pos.get());
                 return OptimizationResult::Replace(neg);
             }
             // rewrite.py: x / const → x * (1/const) when const is an exact power of 2.
@@ -2428,7 +2430,7 @@ impl OptRewrite {
                 let recip = 1.0 / v;
                 let recip_ref = self.emit_constant_float(ctx, recip);
                 let mut new_op = Op::new(OpCode::FloatMul, &[arg0, recip_ref]);
-                new_op.pos = op.pos;
+                new_op.pos.set(op.pos.get());
                 return OptimizationResult::Emit(new_op);
             }
         }
@@ -2441,15 +2443,15 @@ impl OptRewrite {
         let arg0 = op.arg(0);
 
         if let Some(a) = ctx.get_constant_float(arg0) {
-            ctx.make_constant(op.pos, Value::Float(-a));
+            ctx.make_constant(op.pos.get(), Value::Float(-a));
             return OptimizationResult::Remove;
         }
 
         // FloatNeg(FloatNeg(x)) -> x (double negation elimination)
-        if let Some(inner_op) = ctx.new_operations.iter().find(|o| o.pos == arg0) {
+        if let Some(inner_op) = ctx.new_operations.iter().find(|o| o.pos.get() == arg0) {
             if inner_op.opcode == OpCode::FloatNeg {
                 let inner_arg = inner_op.arg(0);
-                ctx.replace_op(op.pos, inner_arg);
+                ctx.replace_op(op.pos.get(), inner_arg);
                 return OptimizationResult::Remove;
             }
         }
@@ -2462,7 +2464,7 @@ impl OptRewrite {
         let arg0 = op.arg(0);
 
         if let Some(a) = ctx.get_constant_float(arg0) {
-            ctx.make_constant(op.pos, Value::Float(a.abs()));
+            ctx.make_constant(op.pos.get(), Value::Float(a.abs()));
             return OptimizationResult::Remove;
         }
 
@@ -2470,7 +2472,7 @@ impl OptRewrite {
         let v = ctx.get_box_replacement(arg0);
         if let Some(arg_op) = ctx.get_producing_op(v) {
             if arg_op.opcode == OpCode::FloatAbs {
-                ctx.replace_op(op.pos, v);
+                ctx.replace_op(op.pos.get(), v);
                 return OptimizationResult::Remove;
             }
         }
@@ -2485,7 +2487,7 @@ impl OptRewrite {
 
         if let (Some(a), Some(b)) = (ctx.get_constant_float(arg0), ctx.get_constant_float(arg1)) {
             if let Some(result) = self.try_fold_binary_float(OpCode::FloatFloorDiv, a, b) {
-                ctx.make_constant(op.pos, Value::Float(result));
+                ctx.make_constant(op.pos.get(), Value::Float(result));
                 return OptimizationResult::Remove;
             }
         }
@@ -2500,7 +2502,7 @@ impl OptRewrite {
 
         if let (Some(a), Some(b)) = (ctx.get_constant_float(arg0), ctx.get_constant_float(arg1)) {
             if let Some(result) = self.try_fold_binary_float(OpCode::FloatMod, a, b) {
-                ctx.make_constant(op.pos, Value::Float(result));
+                ctx.make_constant(op.pos.get(), Value::Float(result));
                 return OptimizationResult::Remove;
             }
         }
@@ -2699,9 +2701,11 @@ impl Optimization for OptRewrite {
                 }
                 if let Some(c) = ctx.get_constant_int(op.arg(0)) {
                     if c != 0 {
-                        let mut call_op = Op::new(OpCode::CallN, &op.args[1..]);
-                        call_op.pos = op.pos;
-                        call_op.descr = op.descr.clone();
+                        let mut call_op = Op::new(OpCode::CallN, &op.getarglist()[1..]);
+                        call_op.pos.set(op.pos.get());
+                        if let Some(d) = op.getdescr() {
+                            call_op.setdescr(d);
+                        }
                         ctx.last_op_removed = false;
                         return OptimizationResult::Replace(call_op);
                     }
@@ -2715,7 +2719,7 @@ impl Optimization for OptRewrite {
                 let nullness = self.getnullness(arg0, ctx);
                 // rewrite.py:486-489: INFO_NONNULL → result is arg(0)
                 if nullness == Nullness::Nonnull {
-                    ctx.replace_op(op.pos, op.arg(0));
+                    ctx.replace_op(op.pos.get(), op.arg(0));
                     ctx.last_op_removed = true;
                     return OptimizationResult::Remove;
                 }
@@ -2726,9 +2730,11 @@ impl Optimization for OptRewrite {
                     } else {
                         OpCode::CallPureR
                     };
-                    let mut call_op = Op::new(call_opcode, &op.args[1..]);
-                    call_op.pos = op.pos;
-                    call_op.descr = op.descr.clone();
+                    let mut call_op = Op::new(call_opcode, &op.getarglist()[1..]);
+                    call_op.pos.set(op.pos.get());
+                    if let Some(d) = op.getdescr() {
+                        call_op.setdescr(d);
+                    }
                     ctx.last_op_removed = false;
                     return OptimizationResult::Replace(call_op);
                 }
@@ -2746,7 +2752,7 @@ impl Optimization for OptRewrite {
                     //     self.pure_from_args2(rop.INSTANCE_PTR_EQ, arg1, arg0, op)
                     let arg0 = ctx.get_box_replacement(op.arg(0));
                     let arg1 = ctx.get_box_replacement(op.arg(1));
-                    ctx.register_pure_from_args2(OpCode::InstancePtrEq, op.pos, arg1, arg0);
+                    ctx.register_pure_from_args2(OpCode::InstancePtrEq, op.pos.get(), arg1, arg0);
                 }
                 return self.optimize_oois_ooisnot(op, false, instance, ctx);
             }
@@ -2756,7 +2762,7 @@ impl Optimization for OptRewrite {
                     // rewrite.py:568-571 optimize_INSTANCE_PTR_NE: same swap.
                     let arg0 = ctx.get_box_replacement(op.arg(0));
                     let arg1 = ctx.get_box_replacement(op.arg(1));
-                    ctx.register_pure_from_args2(OpCode::InstancePtrNe, op.pos, arg1, arg0);
+                    ctx.register_pure_from_args2(OpCode::InstancePtrNe, op.pos.get(), arg1, arg0);
                 }
                 return self.optimize_oois_ooisnot(op, true, instance, ctx);
             }
@@ -2764,16 +2770,16 @@ impl Optimization for OptRewrite {
             // ── Cast round-trip elimination ──
             // rewrite.py:807-813: register pure inverse for CSE, then emit.
             OpCode::CastPtrToInt => {
-                ctx.register_pure_from_args1(OpCode::CastIntToPtr, op.pos, op.arg(0));
+                ctx.register_pure_from_args1(OpCode::CastIntToPtr, op.pos.get(), op.arg(0));
                 OptimizationResult::PassOn
             }
             OpCode::CastIntToPtr => {
-                ctx.register_pure_from_args1(OpCode::CastPtrToInt, op.pos, op.arg(0));
+                ctx.register_pure_from_args1(OpCode::CastPtrToInt, op.pos.get(), op.arg(0));
                 OptimizationResult::PassOn
             }
             // jtransform.py:1264-1266: CAST_OPAQUE_PTR is identity (no-op).
             OpCode::CastOpaquePtr => {
-                ctx.replace_op(op.pos, op.arg(0));
+                ctx.replace_op(op.pos.get(), op.arg(0));
                 OptimizationResult::Remove
             }
 
@@ -2786,7 +2792,7 @@ impl Optimization for OptRewrite {
             OpCode::ConvertFloatBytesToLonglong => {
                 ctx.register_pure_from_args1(
                     OpCode::ConvertLonglongBytesToFloat,
-                    op.pos,
+                    op.pos.get(),
                     op.arg(0),
                 );
                 OptimizationResult::PassOn
@@ -2794,7 +2800,7 @@ impl Optimization for OptRewrite {
             OpCode::ConvertLonglongBytesToFloat => {
                 ctx.register_pure_from_args1(
                     OpCode::ConvertFloatBytesToLonglong,
-                    op.pos,
+                    op.pos.get(),
                     op.arg(0),
                 );
                 OptimizationResult::PassOn
@@ -2838,7 +2844,8 @@ impl Optimization for OptRewrite {
             // Constant-fold and CSE are handled by pure.rs; here we
             // only do oopspec-specific simplifications.
             OpCode::CallPureI | OpCode::CallPureR | OpCode::CallPureF | OpCode::CallPureN => {
-                if let Some(ref descr) = op.descr {
+                let __descr_arc_descr = op.getdescr();
+                if let Some(ref descr) = __descr_arc_descr.as_ref() {
                     if let Some(cd) = descr.as_call_descr() {
                         let ei = cd.get_extra_info();
                         match ei.oopspecindex {
@@ -2876,7 +2883,11 @@ impl Optimization for OptRewrite {
                     // RPython: LoopInvariantOp.produce_op stores PreambleOp
                     // in loop_invariant_results during import. Transfer from
                     // ctx.imported_loop_invariant_results on first access.
-                    if let Some(&source) = ctx.imported_loop_invariant_results.get(&func_val) {
+                    if let Some(&(_, source)) = ctx
+                        .imported_loop_invariant_results
+                        .iter()
+                        .find(|(k, _)| *k == func_val)
+                    {
                         if !self.loop_invariant_results.contains_key(&func_val) {
                             // RPython shortpreamble.py:158-159. Cat-2.2 dual-slot:
                             // `produce_loop_invariant` installs
@@ -2890,7 +2901,7 @@ impl Optimization for OptRewrite {
                             // dual-slot rule (mod.rs:1817 replay_pos).
                             let replay_pos = ctx.get_box_replacement(source);
                             let mut replay = Op::new(OpCode::SameAsI, &[source]);
-                            replay.pos = replay_pos;
+                            replay.pos.set(replay_pos);
                             self.loop_invariant_results.insert(
                                 func_val,
                                 LoopInvariantEntry::Preamble(PreambleOp {
@@ -2915,24 +2926,22 @@ impl Optimization for OptRewrite {
                             LoopInvariantEntry::Direct(r) => r,
                         };
                         let cached_result = ctx.get_box_replacement(cached_result);
-                        ctx.replace_op(op.pos, cached_result);
+                        ctx.replace_op(op.pos.get(), cached_result);
                         ctx.last_op_removed = true;
                         return OptimizationResult::Remove;
                     }
                     // Cache miss: demote and record result
                     self.loop_invariant_results
-                        .insert(func_val, LoopInvariantEntry::Direct(op.pos));
+                        .insert(func_val, LoopInvariantEntry::Direct(op.pos.get()));
                     // rewrite.py:30-31: _callback records producer op
                     let call_opcode = OpCode::call_for_type(op.result_type());
-                    let mut producer = Op::new(call_opcode, &op.args);
-                    producer.pos = op.pos;
-                    producer.descr = op.descr.clone();
+                    let producer = op.copy_and_change(call_opcode, None, None);
+                    producer.pos.set(op.pos.get());
                     self.loop_invariant_producer.insert(func_val, producer);
                 }
                 let call_opcode = OpCode::call_for_type(op.result_type());
-                let mut new_op = Op::new(call_opcode, &op.args);
-                new_op.pos = op.pos;
-                new_op.descr = op.descr.clone();
+                let new_op = op.copy_and_change(call_opcode, None, None);
+                new_op.pos.set(op.pos.get());
                 ctx.last_op_removed = false;
                 OptimizationResult::Emit(new_op)
             }
@@ -3017,7 +3026,8 @@ impl Optimization for OptRewrite {
 
             // rewrite.py:574-584: optimize_CALL_N — dispatch on oopspecindex
             OpCode::CallN | OpCode::CallI | OpCode::CallR => {
-                if let Some(ref descr) = op.descr {
+                let __descr_arc_descr = op.getdescr();
+                if let Some(ref descr) = __descr_arc_descr.as_ref() {
                     if let Some(cd) = descr.as_call_descr() {
                         let ei = cd.get_extra_info();
                         match ei.oopspecindex {
@@ -3172,7 +3182,8 @@ mod tests {
     /// Helper: assign positions to ops so the optimizer can track them.
     fn with_positions(ops: &mut [Op]) {
         for (i, op) in ops.iter_mut().enumerate() {
-            op.pos = OpRef::op_typed(i as u32, op.opcode.result_type());
+            op.pos
+                .set(OpRef::op_typed(i as u32, op.opcode.result_type()));
         }
     }
 
@@ -3185,8 +3196,9 @@ mod tests {
         for op in ops.iter() {
             // Resolve forwarded arguments
             let mut resolved = op.clone();
-            for arg in &mut resolved.args {
-                *arg = ctx.get_box_replacement(*arg);
+            // optimizer.py:651-652 setarg loop parity.
+            for i in 0..resolved.num_args() {
+                resolved.setarg(i, ctx.get_box_replacement(resolved.arg(i)));
             }
 
             match pass.propagate_forward(&resolved, &mut ctx) {
@@ -3677,8 +3689,9 @@ mod tests {
         // Simulate the optimizer loop
         for (i, op) in ops.iter().enumerate() {
             let mut resolved = op.clone();
-            for arg in &mut resolved.args {
-                *arg = ctx.get_box_replacement(*arg);
+            // optimizer.py:651-652 setarg loop parity.
+            for i in 0..resolved.num_args() {
+                resolved.setarg(i, ctx.get_box_replacement(resolved.arg(i)));
             }
             match pass.propagate_forward(&resolved, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
@@ -3728,8 +3741,9 @@ mod tests {
         let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             for op in &ops {
                 let mut resolved = op.clone();
-                for arg in &mut resolved.args {
-                    *arg = ctx.get_box_replacement(*arg);
+                // optimizer.py:651-652 setarg loop parity.
+                for i in 0..resolved.num_args() {
+                    resolved.setarg(i, ctx.get_box_replacement(resolved.arg(i)));
                 }
                 match pass.propagate_forward(&resolved, &mut ctx) {
                     OptimizationResult::Emit(emitted) => {
@@ -4311,7 +4325,7 @@ mod tests {
             OptimizationResult::Replace(op) => {
                 assert_eq!(op.opcode, OpCode::CallN);
                 // Should have args [func, arg1] (condition arg stripped)
-                assert_eq!(op.args.len(), 2);
+                assert_eq!(op.num_args(), 2);
                 assert_eq!(op.arg(0), OpRef::int_op(1));
                 assert_eq!(op.arg(1), OpRef::int_op(2));
             }
@@ -4372,7 +4386,7 @@ mod tests {
         match result {
             OptimizationResult::Replace(op) => {
                 assert_eq!(op.opcode, OpCode::CallPureI);
-                assert_eq!(op.args.len(), 2);
+                assert_eq!(op.num_args(), 2);
                 assert_eq!(op.arg(0), OpRef::int_op(1));
                 assert_eq!(op.arg(1), OpRef::int_op(2));
             }
@@ -4618,7 +4632,7 @@ mod tests {
     fn test_guard_future_condition_records_and_removes() {
         // rewrite.py: GUARD_FUTURE_CONDITION → record in patchguardop + remove
         let mut op = Op::new(OpCode::GuardFutureCondition, &[]);
-        op.pos = OpRef::void_op(0);
+        op.pos.set(OpRef::void_op(0));
         let mut ctx = OptContext::new(1);
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&op, &mut ctx);
@@ -4639,18 +4653,16 @@ mod tests {
                     OpCode::GuardValue,
                     &[OpRef::int_op(100), OpRef::int_op(200)],
                 );
-                op.pos = OpRef::void_op(0);
+                op.pos.set(OpRef::void_op(0));
                 op
             },
             Op::new(OpCode::Finish, &[]),
         ];
-        ops[1].pos = OpRef::void_op(1);
-
+        ops[1].pos.set(OpRef::void_op(1));
         let mut opt = crate::optimizeopt::optimizer::Optimizer::new();
         opt.add_pass(Box::new(OptRewrite::new()));
-        let mut constants = std::collections::HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         constants.insert(200u32, majit_ir::Value::Int(0));
-        opt.constant_types.insert(200, majit_ir::Type::Int);
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
@@ -4672,9 +4684,8 @@ mod tests {
 
         let mut opt = crate::optimizeopt::optimizer::Optimizer::new();
         opt.add_pass(Box::new(OptRewrite::new()));
-        let mut constants = std::collections::HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         constants.insert(200u32, majit_ir::Value::Int(-1));
-        opt.constant_types.insert(200, majit_ir::Type::Int);
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
 
         assert!(
@@ -4697,10 +4708,9 @@ mod tests {
 
         let mut opt = crate::optimizeopt::optimizer::Optimizer::new();
         opt.add_pass(Box::new(OptRewrite::new()));
-        let mut constants = std::collections::HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         // Float constant as Value::Float
         constants.insert(200u32, majit_ir::Value::Float(-1.0));
-        opt.constant_types.insert(200, majit_ir::Type::Float);
         // Need float constant support in ctx — skip for now, just test no crash
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
         assert!(!result.is_empty());
@@ -4719,9 +4729,8 @@ mod tests {
         with_positions(&mut ops);
         let mut opt = crate::optimizeopt::optimizer::Optimizer::new();
         opt.add_pass(Box::new(OptRewrite::new()));
-        let mut constants = std::collections::HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         constants.insert(200u32, majit_ir::Value::Int(0));
-        opt.constant_types.insert(200, majit_ir::Type::Int);
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
         assert!(
             !result.iter().any(|o| o.opcode == OpCode::CondCallN),
@@ -4742,9 +4751,8 @@ mod tests {
         with_positions(&mut ops);
         let mut opt = crate::optimizeopt::optimizer::Optimizer::new();
         opt.add_pass(Box::new(OptRewrite::new()));
-        let mut constants = std::collections::HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         constants.insert(200u32, majit_ir::Value::Int(1));
-        opt.constant_types.insert(200, majit_ir::Type::Int);
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
         assert!(
             result.iter().any(|o| o.opcode == OpCode::CallN),

@@ -3,19 +3,19 @@
 //! Mirrors RPython's `optimizeopt/renamer.py`.
 //! Used during loop unrolling to rename OpRefs from one iteration to the next.
 
-use std::collections::HashMap;
-
 use majit_ir::{Op, OpRef};
+
+use crate::optimizeopt::vec_assoc::VecAssoc;
 
 /// renamer.py:3-58: Renamer — maps old OpRefs to new OpRefs during unrolling.
 pub struct Renamer {
-    rename_map: HashMap<OpRef, OpRef>,
+    rename_map: VecAssoc<OpRef, OpRef>,
 }
 
 impl Renamer {
     pub fn new() -> Self {
         Renamer {
-            rename_map: HashMap::new(),
+            rename_map: VecAssoc::new(),
         }
     }
 
@@ -36,16 +36,21 @@ impl Renamer {
 
     /// renamer.py:20-31: rename — apply renaming to all args and fail_args of an op.
     pub fn rename(&self, op: &mut Op) -> bool {
-        for arg in op.args.iter_mut() {
-            if let Some(&renamed) = self.rename_map.get(arg) {
-                *arg = renamed;
+        // renamer.py:21-23:
+        //   for i, arg in enumerate(op.getarglist()):
+        //       arg = self.rename_map.get(arg, arg)
+        //       op.setarg(i, arg)
+        for i in 0..op.num_args() {
+            let arg = op.arg(i);
+            if let Some(&renamed) = self.rename_map.get(&arg) {
+                op.setarg(i, renamed);
             }
         }
 
         if op.opcode.is_guard() {
             // renamer.py:27: TODO op.rd_snapshot = self.rename_rd_snapshot(...)
             // renamer.py:28-29: failargs = self.rename_failargs(op, clone=True)
-            if let Some(ref mut fail_args) = op.fail_args {
+            if let Some(fail_args) = op.fail_args_mut() {
                 let cloned: Vec<OpRef> = fail_args
                     .iter()
                     .map(|arg| self.rename_map.get(arg).copied().unwrap_or(*arg))

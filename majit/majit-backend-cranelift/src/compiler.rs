@@ -30,7 +30,7 @@ use majit_gc::rewrite::GcRewriterImpl;
 use majit_gc::{GcAllocator, GcMap, GcRewriter, WriteBarrierDescr};
 use majit_ir::{
     AccumInfo, CallDescr, Descr, DescrRef, EffectInfo, FailDescr, GcRef, InputArg, OopSpecIndex,
-    Op, OpCode, OpRef, OpTypeIndex, Type, Value,
+    Op, OpCode, OpRc, OpRef, OpTypeIndex, Type, Value,
 };
 
 mod slice_x2_probe {
@@ -1178,7 +1178,7 @@ fn build_vec_float_oprefs(ops: &[Op], num_inputs: usize) -> HashSet<u32> {
 /// I64X2 if needed). If it's a constant, splats it to fill all lanes.
 fn resolve_opref_vec_int(
     builder: &mut FunctionBuilder,
-    constants: &HashMap<u32, i64>,
+    constants: &majit_ir::VecAssoc<u32, i64>,
     vec_oprefs: &HashSet<u32>,
     vec_float_oprefs: &HashSet<u32>,
     opref: OpRef,
@@ -1205,7 +1205,7 @@ fn resolve_opref_vec_int(
 /// bitcast to F64X2 if needed. If scalar, bitcast to f64 then splat.
 fn resolve_opref_vec_float(
     builder: &mut FunctionBuilder,
-    constants: &HashMap<u32, i64>,
+    constants: &majit_ir::VecAssoc<u32, i64>,
     vec_oprefs: &HashSet<u32>,
     vec_float_oprefs: &HashSet<u32>,
     opref: OpRef,
@@ -2215,7 +2215,7 @@ fn collect_call_assembler_expectations(ops: &[Op]) -> Result<HashMap<u64, u64>, 
         ) {
             continue;
         }
-        let descr = op.descr.as_ref().ok_or_else(|| {
+        let descr = op.getdescr().ok_or_else(|| {
             unsupported_semantics(opcode, "call-assembler op must have a descriptor")
         })?;
         let call_descr = descr.as_call_descr().ok_or_else(|| {
@@ -3805,7 +3805,7 @@ fn opref_is_op_result_var(opref: OpRef) -> bool {
 
 fn resolve_opref(
     builder: &mut FunctionBuilder,
-    constants: &HashMap<u32, i64>,
+    constants: &majit_ir::VecAssoc<u32, i64>,
     opref: OpRef,
 ) -> CValue {
     // RPython parity (`llgraph/runner.py:1124, 1177`): both op args and
@@ -3864,7 +3864,7 @@ fn resolve_opref(
 
 fn resolve_binop(
     builder: &mut FunctionBuilder,
-    constants: &HashMap<u32, i64>,
+    constants: &majit_ir::VecAssoc<u32, i64>,
     op: &Op,
 ) -> (CValue, CValue) {
     let a = resolve_opref(builder, constants, op.arg(0));
@@ -3874,7 +3874,7 @@ fn resolve_binop(
 
 fn emit_icmp(
     builder: &mut FunctionBuilder,
-    constants: &HashMap<u32, i64>,
+    constants: &majit_ir::VecAssoc<u32, i64>,
     cc: IntCC,
     op: &Op,
     vi: u32,
@@ -3887,7 +3887,7 @@ fn emit_icmp(
 
 fn emit_fcmp(
     builder: &mut FunctionBuilder,
-    constants: &HashMap<u32, i64>,
+    constants: &majit_ir::VecAssoc<u32, i64>,
     cc: FloatCC,
     op: &Op,
     vi: u32,
@@ -3973,10 +3973,10 @@ fn checked_cl_type_for_size(
 }
 
 fn op_var_index(op: &Op, op_idx: usize, num_inputs: usize) -> usize {
-    if op.pos.is_none() {
+    if op.pos.get().is_none() {
         num_inputs + op_idx
     } else {
-        op.pos.raw() as usize
+        op.pos.get().raw() as usize
     }
 }
 
@@ -4056,7 +4056,7 @@ fn op_dereferences_first_arg(opcode: majit_ir::OpCode) -> bool {
 fn validate_oprefs_for_compile(
     inputargs: &[InputArg],
     ops: &[Op],
-    constants: &HashMap<u32, i64>,
+    constants: &majit_ir::VecAssoc<u32, i64>,
 ) -> Result<(), BackendError> {
     let num_inputs = inputargs.len();
     // RPython rewrite.py:397 + regalloc invariant: at the current op,
@@ -4074,7 +4074,7 @@ fn validate_oprefs_for_compile(
     for (op_idx, op) in ops.iter().enumerate() {
         if op.opcode == majit_ir::OpCode::Label {
             // LABEL params are introduced at the label block.
-            for &arg in &op.args {
+            for &arg in op.getarglist().iter() {
                 if !arg.is_none() {
                     seen.insert(arg.raw());
                 }
@@ -4358,8 +4358,8 @@ fn build_known_values_set(inputargs: &[InputArg], ops: &[Op]) -> HashSet<u32> {
         known.insert(input.index);
     }
     for op in ops {
-        if op.result_type() != Type::Void && !op.pos.is_none() {
-            known.insert(op.pos.raw());
+        if op.result_type() != Type::Void && !op.pos.get().is_none() {
+            known.insert(op.pos.get().raw());
         }
     }
     known
@@ -4368,7 +4368,7 @@ fn build_known_values_set(inputargs: &[InputArg], ops: &[Op]) -> HashSet<u32> {
 fn build_force_token_set(inputargs: &[InputArg], ops: &[Op]) -> Result<HashSet<u32>, BackendError> {
     let mut force_tokens = HashSet::new();
     for (op_idx, op) in ops.iter().enumerate() {
-        if op.pos.is_none() {
+        if op.pos.get().is_none() {
             continue;
         }
         let result_var = op_var_index(op, op_idx, inputargs.len()) as u32;
@@ -4377,7 +4377,7 @@ fn build_force_token_set(inputargs: &[InputArg], ops: &[Op]) -> Result<HashSet<u
             continue;
         }
         if op.opcode == OpCode::CallAssemblerR {
-            let descr = op.descr.as_ref().ok_or_else(|| {
+            let descr = op.getdescr().ok_or_else(|| {
                 unsupported_semantics(op.opcode, "call-assembler op must have a descriptor")
             })?;
             let call_descr = descr.as_call_descr().ok_or_else(|| {
@@ -4435,11 +4435,11 @@ fn build_type_overrides(
             // resolves by raw u32 (variant-blind) so a typed `IntOp(n)`
             // still finds the inputarg at slot n. Synthetic ops without
             // `.pos` cannot collide with an inputarg slot anyway.
-            if op.pos.is_none() {
+            if op.pos.get().is_none() {
                 continue;
             }
-            let var_idx = op.pos.raw();
-            if let Some(ia_type) = type_index.inputarg_type(op.pos) {
+            let var_idx = op.pos.get().raw();
+            if let Some(ia_type) = type_index.inputarg_type(op.pos.get()) {
                 if ia_type != result_type {
                     op_def_positions.insert(var_idx, op_idx);
                 }
@@ -4456,11 +4456,13 @@ fn build_type_overrides(
     let mut jumps_by_descr: Vec<(u32, usize)> = Vec::new();
     for (op_idx, op) in ops.iter().enumerate() {
         if op.opcode == OpCode::Label {
-            if let Some(ref d) = op.descr {
+            let __descr_arc_d = op.getdescr();
+            if let Some(ref d) = __descr_arc_d.as_ref() {
                 label_by_descr.insert(d.index(), op_idx);
             }
         } else if op.opcode == OpCode::Jump {
-            if let Some(ref d) = op.descr {
+            let __descr_arc_d = op.getdescr();
+            if let Some(ref d) = __descr_arc_d.as_ref() {
                 jumps_by_descr.push((d.index(), op_idx));
             }
         }
@@ -4480,11 +4482,11 @@ fn build_type_overrides(
         };
         let label_op = &ops[label_idx];
         let jump_op = &ops[*jump_idx];
-        for (i, &label_arg) in label_op.args.iter().enumerate() {
+        for (i, &label_arg) in label_op.getarglist().iter().enumerate() {
             if label_arg.is_none() {
                 continue;
             }
-            let Some(&jump_arg) = jump_op.args.get(i) else {
+            let Some(&jump_arg) = jump_op.getarglist().get(i) else {
                 continue;
             };
             if jump_arg.is_none() {
@@ -4548,10 +4550,10 @@ fn build_ref_root_slots(
     if let Some((jump_idx, jump)) = ops
         .iter()
         .enumerate()
-        .rfind(|(_, op)| op.opcode == OpCode::Jump && op.args.len() == inputargs.len())
+        .rfind(|(_, op)| op.opcode == OpCode::Jump && op.num_args() == inputargs.len())
     {
         let num_inputs = inputargs.len();
-        for (i, &arg) in jump.args.iter().enumerate() {
+        for (i, &arg) in jump.getarglist().iter().enumerate() {
             if i >= num_inputs {
                 break;
             }
@@ -4593,11 +4595,13 @@ fn build_ref_root_slots(
     // Build the set of inputarg OpRef raw values actually used in ops.
     let mut used_inputargs: HashSet<u32> = HashSet::new();
     for op in ops.iter() {
-        for &arg in op
-            .args
-            .iter()
-            .chain(op.fail_args.iter().flat_map(|fa| fa.iter()))
-        {
+        for &arg in op.getarglist().iter().chain(
+            op.getfailargs()
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .iter(),
+        ) {
             if inputarg_oprefs.contains(&arg.raw()) {
                 used_inputargs.insert(arg.raw());
             }
@@ -4667,11 +4671,13 @@ fn normalize_ops_for_codegen_simple(inputargs: &[InputArg], ops: &[Op]) -> Vec<O
         .map(|(op_idx, op)| {
             let mut normalized = op.clone();
             let rt = normalized.result_type();
-            if rt != Type::Void && normalized.pos.is_none() {
+            if rt != Type::Void && normalized.pos.get().is_none() {
                 // op_typed mints the typed Int/Float/Ref variant
                 // (resoperation.py:564-638 AbstractResOp + IntOp/FloatOp/
                 // RefOp mixins) — the Void branch is filtered above.
-                normalized.pos = OpRef::op_typed(num_inputs + op_idx as u32, rt);
+                normalized
+                    .pos
+                    .set(OpRef::op_typed(num_inputs + op_idx as u32, rt));
             }
             normalized
         })
@@ -4680,20 +4686,20 @@ fn normalize_ops_for_codegen_simple(inputargs: &[InputArg], ops: &[Op]) -> Vec<O
 
 fn inject_builtin_string_descrs(ops: &mut [Op]) {
     for op in ops {
-        if op.descr.is_some() {
+        if op.has_descr() {
             continue;
         }
         if let Some(descr) = builtin_string_array_descr(op.opcode) {
-            op.descr = Some(descr);
+            op.setdescr(descr);
         } else if let Some(descr) = builtin_string_hash_field_descr(op.opcode) {
-            op.descr = Some(descr);
+            op.setdescr(descr);
         }
     }
 }
 
 fn resolve_opref_or_imm(
     builder: &mut FunctionBuilder,
-    constants: &HashMap<u32, i64>,
+    constants: &majit_ir::VecAssoc<u32, i64>,
     known_values: &HashSet<u32>,
     opref: OpRef,
 ) -> CValue {
@@ -4718,7 +4724,7 @@ fn resolve_opref_or_imm(
 
 fn resolve_failarg_opref(
     builder: &mut FunctionBuilder,
-    constants: &HashMap<u32, i64>,
+    constants: &majit_ir::VecAssoc<u32, i64>,
     jf_ptr: CValue,
     ref_root_slots: &[(u32, usize)],
     stale_ref_vars: &HashSet<u32>,
@@ -4738,7 +4744,7 @@ fn resolve_failarg_opref(
 }
 
 fn resolve_constant_i64(
-    constants: &HashMap<u32, i64>,
+    constants: &majit_ir::VecAssoc<u32, i64>,
     known_values: &HashSet<u32>,
     opcode: OpCode,
     opref: OpRef,
@@ -4759,7 +4765,7 @@ fn resolve_constant_i64(
     Ok(opref.raw() as i64)
 }
 
-fn resolve_rewriter_immediate_i64(constants: &HashMap<u32, i64>, opref: OpRef) -> i64 {
+fn resolve_rewriter_immediate_i64(constants: &majit_ir::VecAssoc<u32, i64>, opref: OpRef) -> i64 {
     constants.get(&opref.raw()).copied().unwrap_or_else(|| {
         if opref.is_constant() {
             opref.const_index() as i64
@@ -4893,7 +4899,7 @@ fn emit_store_to_addr(
 
 fn emit_dynamic_offset_addr(
     builder: &mut FunctionBuilder,
-    constants: &HashMap<u32, i64>,
+    constants: &majit_ir::VecAssoc<u32, i64>,
     known_values: &HashSet<u32>,
     base_arg: OpRef,
     offset_arg: OpRef,
@@ -4905,7 +4911,7 @@ fn emit_dynamic_offset_addr(
 
 fn emit_scaled_index_addr(
     builder: &mut FunctionBuilder,
-    constants: &HashMap<u32, i64>,
+    constants: &majit_ir::VecAssoc<u32, i64>,
     base_arg: OpRef,
     index_arg: OpRef,
     scale: i64,
@@ -5177,7 +5183,11 @@ fn ref_root_slots_with_future_regular_uses(
                 && ops
                     .iter()
                     .skip(position + 1)
-                    .flat_map(|op| op.args.iter().chain(op.fail_args.iter().flatten()))
+                    .flat_map(|op| {
+                        op.getarglist_copy()
+                            .into_iter()
+                            .chain(op.getfailargs().into_iter().flatten())
+                    })
                     .any(|arg| arg.raw() == *var_idx)
         })
         .copied()
@@ -5416,7 +5426,7 @@ fn emit_collecting_gc_call(
 
 fn emit_indirect_call_from_parts(
     builder: &mut FunctionBuilder,
-    constants: &HashMap<u32, i64>,
+    constants: &majit_ir::VecAssoc<u32, i64>,
     func_ref: OpRef,
     arg_refs: &[OpRef],
     call_descr: &dyn CallDescr,
@@ -5771,7 +5781,7 @@ fn emit_attached_loop_dispatch(
 ///   3. _call_footer
 fn emit_guard_exit(
     builder: &mut FunctionBuilder,
-    constants: &HashMap<u32, i64>,
+    constants: &majit_ir::VecAssoc<u32, i64>,
     jf_ptr: CValue,
     info: &GuardInfo,
     ref_root_slots: &[(u32, usize)],
@@ -6904,11 +6914,11 @@ fn resolve_fail_arg_types(
 pub struct CraneliftBackend {
     module: JITModule,
     func_ctx: FunctionBuilderContext,
-    constants: HashMap<u32, i64>,
+    constants: majit_ir::VecAssoc<u32, i64>,
     /// rewrite.py:930 parity — type annotations for constant OpRefs.
     /// Set by `set_constant_types` before each compile call; used by
     /// the GC rewriter to check `v.type == 'r'` on constant values.
-    constant_types: HashMap<u32, majit_ir::Type>,
+    constant_types: majit_ir::VecAssoc<u32, majit_ir::Type>,
     /// compile.py: self.metainterp_sd.callinfocollection — used by
     /// recovery_layout building for VStr/VUni Concat/Slice func ptr
     /// lookups (resume.py:1143-1188).
@@ -6938,6 +6948,20 @@ pub struct CraneliftBackend {
 }
 
 impl CraneliftBackend {
+    /// Legacy test-only entry point.  Production code passes the typed
+    /// pool through `Backend::set_constants_pool`; this raw-`i64`
+    /// helper is retained for in-crate tests that construct
+    /// `HashMap<u32, i64>` literals by hand.
+    pub fn set_constants(&mut self, constants: majit_ir::VecAssoc<u32, i64>) {
+        self.constants = constants;
+    }
+
+    /// Legacy test-only entry point — counterpart to `set_constants`
+    /// above; production callers route through `set_constants_pool`.
+    pub fn set_constant_types(&mut self, constant_types: majit_ir::VecAssoc<u32, majit_ir::Type>) {
+        self.constant_types = constant_types;
+    }
+
     /// llmodel.py:467-478 read_int_at_mem(gcref, ofs, size, sign).
     ///
     /// PRE-EXISTING-ADAPTATION: RPython's `llop.raw_load(STYPE, gcref, ofs)`
@@ -7093,8 +7117,8 @@ impl CraneliftBackend {
         CraneliftBackend {
             module,
             func_ctx,
-            constants: HashMap::new(),
-            constant_types: HashMap::new(),
+            constants: majit_ir::VecAssoc::new(),
+            constant_types: majit_ir::VecAssoc::new(),
             callinfocollection: None,
             func_counter: 0,
             trace_counter: 1,
@@ -7224,7 +7248,10 @@ impl CraneliftBackend {
     // below so `compile_tmp_callback` and other backend-agnostic
     // consumers can reach them through `&mut dyn Backend`.
 
-    fn gc_rewriter(&self, constant_types: &HashMap<u32, majit_ir::Type>) -> Option<GcRewriterImpl> {
+    fn gc_rewriter(
+        &self,
+        constant_types: &majit_ir::VecAssoc<u32, majit_ir::Type>,
+    ) -> Option<GcRewriterImpl> {
         let ct = constant_types.clone();
         with_cranelift_gc(|gc| GcRewriterImpl {
             nursery_free_addr: gc.nursery_free_addr(),
@@ -7342,8 +7369,8 @@ impl CraneliftBackend {
         &mut self,
         inputargs: &[InputArg],
         ops: &[Op],
-        constants: &HashMap<u32, i64>,
-        constant_types: &HashMap<u32, majit_ir::Type>,
+        constants: &majit_ir::VecAssoc<u32, i64>,
+        constant_types: &majit_ir::VecAssoc<u32, majit_ir::Type>,
     ) -> Vec<Op> {
         let mut normalized = normalize_ops_for_codegen_simple(inputargs, ops);
         inject_builtin_string_descrs(&mut normalized);
@@ -7360,16 +7387,14 @@ impl CraneliftBackend {
         // values that ops reference, regardless of namespace.
         let mut constant_types_with_inputargs = constant_types.clone();
         for ia in inputargs.iter() {
-            constant_types_with_inputargs
-                .entry(ia.index)
-                .or_insert(ia.tp);
+            constant_types_with_inputargs.entry_or_insert_with(ia.index, || ia.tp);
         }
         if let Some(rewriter) = self.gc_rewriter(&constant_types_with_inputargs) {
             let (result, new_constants, new_constant_types) =
                 rewriter.rewrite_for_gc_with_constants(&normalized, constants);
             // Merge GC rewriter's new constants into self.constants
             for (k, v) in new_constants {
-                self.constants.entry(k).or_insert(v);
+                self.constants.entry_or_insert_with(k, || v);
             }
             for (k, tp) in new_constant_types {
                 // rewrite.py creates fresh ConstInt boxes for sizes, offsets
@@ -7377,7 +7402,7 @@ impl CraneliftBackend {
                 // ConstInt object; pyre imports the rewriter's explicit
                 // side-channel type entry instead of guessing from the raw
                 // constant key.
-                self.constant_types.entry(k).or_insert(tp);
+                self.constant_types.entry_or_insert_with(k, || tp);
             }
             result
         } else {
@@ -7681,7 +7706,7 @@ impl CraneliftBackend {
 
         let num_inputs = inputargs.len();
         let known_values = build_known_values_set(inputargs, ops);
-        let type_index = OpTypeIndex::new(inputargs, ops, &self.constant_types);
+        let type_index = OpTypeIndex::new(inputargs, ops);
         let (type_overrides, _op_def_positions) = build_type_overrides(inputargs, ops, &type_index);
         let ref_root_slots =
             build_ref_root_slots(inputargs, ops, &type_index, &type_overrides, &force_tokens)?;
@@ -7715,11 +7740,13 @@ impl CraneliftBackend {
         let longevity: HashMap<u32, usize> = {
             let mut m: HashMap<u32, usize> = HashMap::new();
             for (i, op) in ops.iter().enumerate() {
-                for &arg in op
-                    .args
-                    .iter()
-                    .chain(op.fail_args.iter().flat_map(|fa| fa.iter()))
-                {
+                for &arg in op.getarglist().iter().chain(
+                    op.getfailargs()
+                        .into_iter()
+                        .flatten()
+                        .collect::<Vec<_>>()
+                        .iter(),
+                ) {
                     let idx = arg.raw();
                     if ref_root_slots.iter().any(|(vi, _)| *vi == idx) {
                         m.entry(idx)
@@ -7899,12 +7926,7 @@ impl CraneliftBackend {
         // lower them as external jumps (rewriter.py LABEL/JUMP redirect parity).
         let label_arity_by_descr: HashMap<u32, usize> = label_indices
             .iter()
-            .filter_map(|&li| {
-                ops[li]
-                    .descr
-                    .as_ref()
-                    .map(|d| (d.index(), ops[li].args.len()))
-            })
+            .filter_map(|&li| ops[li].getdescr().map(|d| (d.index(), ops[li].num_args())))
             .collect();
 
         if std::env::var_os("MAJIT_DUMP_CLIF").is_some() {
@@ -7912,8 +7934,8 @@ impl CraneliftBackend {
                 eprintln!(
                     "[label-dump] idx={} args.len={} args={:?}",
                     li,
-                    ops[li].args.len(),
-                    ops[li].args
+                    ops[li].num_args(),
+                    &*ops[li].getarglist()
                 );
             }
         }
@@ -7969,11 +7991,13 @@ impl CraneliftBackend {
                 var_types.insert(vi as u32, cl_type);
             }
             // Declare ALL referenced OpRefs: fail_args, op args, etc.
-            for &arg in op
-                .args
-                .iter()
-                .chain(op.fail_args.iter().flat_map(|fa| fa.iter()))
-            {
+            for &arg in op.getarglist().iter().chain(
+                op.getfailargs()
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+                    .iter(),
+            ) {
                 if !arg.is_none()
                     && !declared_vars.contains(&arg.raw())
                     && !constants.contains_key(&arg.raw())
@@ -7998,7 +8022,7 @@ impl CraneliftBackend {
             if op.opcode != OpCode::Label {
                 continue;
             }
-            for &arg in &op.args {
+            for &arg in op.getarglist().iter() {
                 if arg.is_none() || declared_vars.contains(&arg.raw()) {
                     continue;
                 }
@@ -8012,12 +8036,12 @@ impl CraneliftBackend {
 
         // Compute loop_param_count early so legacy vars are included.
         let loop_param_count = if let Some(&li) = label_indices.last() {
-            ops[li].args.len()
+            ops[li].num_args()
         } else {
             ops.iter()
                 .rev()
                 .find(|op| op.opcode == OpCode::Jump)
-                .map(|op| op.args.len())
+                .map(|op| op.num_args())
                 .unwrap_or(num_inputs)
         };
 
@@ -8151,10 +8175,10 @@ impl CraneliftBackend {
         let mut label_blocks_by_descr = HashMap::new();
         for &label_idx in &label_indices {
             let block = builder.create_block();
-            for _ in 0..ops[label_idx].args.len() {
+            for _ in 0..ops[label_idx].num_args() {
                 builder.append_block_param(block, cl_types::I64);
             }
-            if let Some(descr_index) = ops[label_idx].descr.as_ref().map(|descr| descr.index()) {
+            if let Some(descr_index) = ops[label_idx].getdescr().map(|descr| descr.index()) {
                 label_blocks_by_descr.insert(descr_index, block);
             }
             label_blocks.push((label_idx, block));
@@ -8222,7 +8246,7 @@ impl CraneliftBackend {
 
                 // Continue with preamble label block for var binding
                 builder.switch_to_block(entry_label_block);
-                for (i, &arg_ref) in ops[entry_label_idx].args.iter().enumerate() {
+                for (i, &arg_ref) in ops[entry_label_idx].getarglist().iter().enumerate() {
                     let param = builder.block_params(entry_label_block)[i];
                     if !arg_ref.is_none() {
                         builder.def_var(var(arg_ref.raw()), param);
@@ -8243,7 +8267,7 @@ impl CraneliftBackend {
                 let vals: Vec<CValue> = entry_input_vals.clone();
                 builder.ins().jump(entry_label_block, &block_args(&vals));
                 builder.switch_to_block(entry_label_block);
-                for (i, &arg_ref) in ops[entry_label_idx].args.iter().enumerate() {
+                for (i, &arg_ref) in ops[entry_label_idx].getarglist().iter().enumerate() {
                     let param = builder.block_params(entry_label_block)[i];
                     if !arg_ref.is_none() {
                         builder.def_var(var(arg_ref.raw()), param);
@@ -8312,14 +8336,14 @@ impl CraneliftBackend {
                         .unwrap_or(false);
                     if !prev_terminated {
                         let vals: Vec<CValue> = ops[op_idx]
-                            .args
+                            .getarglist()
                             .iter()
                             .map(|&r| resolve_opref(&mut builder, &constants, r))
                             .collect();
                         builder.ins().jump(*label_block, &block_args(&vals));
                     }
                     builder.switch_to_block(*label_block);
-                    for (i, &arg_ref) in ops[op_idx].args.iter().enumerate() {
+                    for (i, &arg_ref) in ops[op_idx].getarglist().iter().enumerate() {
                         let param = builder.block_params(*label_block)[i];
                         if !arg_ref.is_none() && !constants.contains_key(&arg_ref.raw()) {
                             builder.def_var(var(arg_ref.raw()), param);
@@ -9140,7 +9164,7 @@ impl CraneliftBackend {
                     let info = &guard_infos[guard_idx];
                     guard_idx += 1;
 
-                    let cond = resolve_opref(&mut builder, &constants, op.args[0]);
+                    let cond = resolve_opref(&mut builder, &constants, op.arg(0));
                     let zero = builder.ins().iconst(cl_types::I64, 0);
                     let is_false = builder.ins().icmp(IntCC::Equal, cond, zero);
                     let exit_block = builder.create_block();
@@ -9203,8 +9227,8 @@ impl CraneliftBackend {
                     let info = &guard_infos[guard_idx];
                     guard_idx += 1;
 
-                    let obj_ptr = resolve_opref(&mut builder, &constants, op.args[0]);
-                    let expected_tid = resolve_opref(&mut builder, &constants, op.args[1]);
+                    let obj_ptr = resolve_opref(&mut builder, &constants, op.arg(0));
+                    let expected_tid = resolve_opref(&mut builder, &constants, op.arg(1));
 
                     // Load header word from obj_ptr - GcHeader::SIZE
                     let hdr_addr = builder.ins().iadd_imm(obj_ptr, -(GcHeader::SIZE as i64));
@@ -9281,7 +9305,7 @@ impl CraneliftBackend {
                          installed a TYPE_INFO layout)"
                     );
 
-                    let loc_object = resolve_opref(&mut builder, &constants, op.args[0]);
+                    let loc_object = resolve_opref(&mut builder, &constants, op.arg(0));
                     // assembler.py:1931-1932 MOV32 loc_typeid, mem(loc_object, 0).
                     // majit's GC header sits at `obj - GcHeader::SIZE`
                     // (see the GuardGcType arm above); the typeid occupies
@@ -9394,14 +9418,12 @@ impl CraneliftBackend {
                          installed a TYPE_INFO / rclass.CLASSTYPE layout)"
                     );
 
-                    let loc_object = resolve_opref(&mut builder, &constants, op.args[0]);
+                    let loc_object = resolve_opref(&mut builder, &constants, op.arg(0));
                     // assembler.py:1971 vtable_ptr = loc_check_against_class
                     //   .getint(): the bounds are resolved at codegen time,
                     //   so arg1 must be an immediate class pointer.
-                    let loc_check_against_class = constants
-                        .get(&op.args[1].raw())
-                        .copied()
-                        .unwrap_or_else(|| {
+                    let loc_check_against_class =
+                        constants.get(&op.arg(1).raw()).copied().unwrap_or_else(|| {
                             panic!(
                                 "x86/assembler.py:1971 vtable_ptr = \
                                  loc_check_against_class.getint(): \
@@ -9552,8 +9574,8 @@ impl CraneliftBackend {
                     // x86/assembler.py:1845-1850 _restore_exception:
                     //   MOV [pos_exc_value], excvalloc
                     //   MOV [pos_exception], exctploc
-                    let exc_type = resolve_opref(&mut builder, &constants, op.args[0]);
-                    let value = resolve_opref(&mut builder, &constants, op.args[1]);
+                    let exc_type = resolve_opref(&mut builder, &constants, op.arg(0));
+                    let value = resolve_opref(&mut builder, &constants, op.arg(1));
                     let exc_val_addr = builder.ins().iconst(ptr_type, jit_exc_value_addr() as i64);
                     let exc_type_addr = builder.ins().iconst(ptr_type, jit_exc_type_addr() as i64);
                     builder
@@ -9568,7 +9590,7 @@ impl CraneliftBackend {
                     // — emit `is_null?` branch into the propagate path (a tail
                     // that mirrors `_build_propagate_exception_path`,
                     // x86/assembler.py:328-345 / aarch64/assembler.py:559-577).
-                    let ptr_val = resolve_opref(&mut builder, &constants, op.args[0]);
+                    let ptr_val = resolve_opref(&mut builder, &constants, op.arg(0));
                     let zero = builder.ins().iconst(cl_types::I64, 0);
                     let is_null = builder.ins().icmp(IntCC::Equal, ptr_val, zero);
                     let propagate_block = builder.create_block();
@@ -9650,7 +9672,7 @@ impl CraneliftBackend {
                 | OpCode::CallLoopinvariantR
                 | OpCode::CallLoopinvariantF
                 | OpCode::CallLoopinvariantN => {
-                    let descr = op.descr.as_ref().expect("call op must have a descriptor");
+                    let descr = op.getdescr().expect("call op must have a descriptor");
                     let call_descr = descr
                         .as_call_descr()
                         .expect("call op descriptor must be a CallDescr");
@@ -9659,7 +9681,7 @@ impl CraneliftBackend {
                         &mut builder,
                         &constants,
                         op.arg(0),
-                        &op.args[1..],
+                        &op.getarglist()[1..],
                         call_descr,
                         call_conv,
                         ptr_type,
@@ -9694,7 +9716,7 @@ impl CraneliftBackend {
                 | OpCode::CallAssemblerR
                 | OpCode::CallAssemblerF
                 | OpCode::CallAssemblerN => {
-                    let descr = op.descr.as_ref().ok_or_else(|| {
+                    let descr = op.getdescr().ok_or_else(|| {
                         unsupported_semantics(op.opcode, "call-assembler op must have a descriptor")
                     })?;
                     let call_descr = descr.as_call_descr().ok_or_else(|| {
@@ -9709,7 +9731,7 @@ impl CraneliftBackend {
                     // optional virtualizable.  The descriptor's arg_types are
                     // the pre-rewrite CALL_ASSEMBLER shape and must not be
                     // compared with the rewritten op arity here.
-                    if op.args.is_empty() || op.args.len() > 2 {
+                    if op.num_args() == 0 || op.num_args() > 2 {
                         return Err(unsupported_semantics(
                             op.opcode,
                             "post-rewrite call-assembler must carry callee frame plus optional virtualizable",
@@ -9764,7 +9786,7 @@ impl CraneliftBackend {
                             3,
                         ));
                         let args_ptr = builder.ins().stack_addr(ptr_type, args_slot, 0);
-                        let frame_val = resolve_opref(&mut builder, &constants, op.args[0]);
+                        let frame_val = resolve_opref(&mut builder, &constants, op.arg(0));
                         builder.ins().store(
                             MemFlags::trusted(),
                             frame_val,
@@ -9825,7 +9847,7 @@ impl CraneliftBackend {
                             } else if let Some(&(_, arg_idx)) =
                                 expansion.arg_overrides.iter().find(|(s, _)| *s == slot)
                             {
-                                let val = resolve_opref(&mut builder, &constants, op.args[arg_idx]);
+                                let val = resolve_opref(&mut builder, &constants, op.arg(arg_idx));
                                 builder.ins().stack_store(val, args_slot, ofs);
                             } else {
                                 let val = builder.ins().load(
@@ -9843,7 +9865,7 @@ impl CraneliftBackend {
                                 .stack_addr(ptr_type, args_slot, JF_FRAME_ITEM0_OFS);
                         (args_ptr, args_data_ptr)
                     } else {
-                        let args_ptr = resolve_opref(&mut builder, &constants, op.args[0]);
+                        let args_ptr = resolve_opref(&mut builder, &constants, op.arg(0));
                         let args_data_ptr =
                             builder.ins().iadd_imm(args_ptr, JF_FRAME_ITEM0_OFS as i64);
                         (args_ptr, args_data_ptr)
@@ -10273,7 +10295,7 @@ impl CraneliftBackend {
                     }
 
                     // x86/assembler.py:2236: self._genop_call(op, arglocs, result_loc)
-                    let descr = op.descr.as_ref().expect("call op must have a descriptor");
+                    let descr = op.getdescr().expect("call op must have a descriptor");
                     let call_descr = descr
                         .as_call_descr()
                         .expect("call op descriptor must be a CallDescr");
@@ -10282,7 +10304,7 @@ impl CraneliftBackend {
                         &mut builder,
                         &constants,
                         op.arg(0),
-                        &op.args[1..],
+                        &op.getarglist()[1..],
                         call_descr,
                         call_conv,
                         ptr_type,
@@ -10341,8 +10363,7 @@ impl CraneliftBackend {
                     }
 
                     let descr = op
-                        .descr
-                        .as_ref()
+                        .getdescr()
                         .expect("call_release_gil op must have a descriptor");
                     let call_descr = descr
                         .as_call_descr()
@@ -10406,8 +10427,8 @@ impl CraneliftBackend {
                         func_ptr_raw
                     };
 
-                    let mut args: Vec<CValue> = Vec::with_capacity(op.args.len() - 2);
-                    for (i, &arg_ref) in op.args[2..].iter().enumerate() {
+                    let mut args: Vec<CValue> = Vec::with_capacity(op.num_args() - 2);
+                    for (i, &arg_ref) in op.getarglist()[2..].iter().enumerate() {
                         let raw = resolve_opref(&mut builder, &constants, arg_ref);
                         if i < arg_types.len() && arg_types[i] == Type::Float {
                             args.push(builder.ins().bitcast(cl_types::F64, MemFlags::new(), raw));
@@ -10475,13 +10496,13 @@ impl CraneliftBackend {
                     builder.switch_to_block(call_block);
                     builder.seal_block(call_block);
 
-                    if let Some(descr) = op.descr.as_ref() {
+                    if let Some(descr) = op.getdescr() {
                         if let Some(call_descr) = descr.as_call_descr() {
                             let _ = emit_indirect_call_from_parts(
                                 &mut builder,
                                 &constants,
                                 op.arg(1),
-                                &op.args[2..],
+                                &op.getarglist()[2..],
                                 call_descr,
                                 call_conv,
                                 ptr_type,
@@ -10530,13 +10551,13 @@ impl CraneliftBackend {
                     builder.seal_block(call_block);
 
                     let mut call_result = cond; // fallback
-                    if let Some(descr) = op.descr.as_ref() {
+                    if let Some(descr) = op.getdescr() {
                         if let Some(call_descr) = descr.as_call_descr() {
                             if let Some(result) = emit_indirect_call_from_parts(
                                 &mut builder,
                                 &constants,
                                 op.arg(1),
-                                &op.args[2..],
+                                &op.getarglist()[2..],
                                 call_descr,
                                 call_conv,
                                 ptr_type,
@@ -10718,8 +10739,7 @@ impl CraneliftBackend {
                         return Err(missing_gc_runtime(op.opcode));
                     }
                     let descr = op
-                        .descr
-                        .as_ref()
+                        .getdescr()
                         .expect("CallMallocNurseryVarsize must have an ArrayDescr");
                     let ad = descr
                         .as_array_descr()
@@ -10869,7 +10889,7 @@ impl CraneliftBackend {
                     let is_array = op.opcode == OpCode::CondCallGcWbArray;
 
                     // Load flag byte from object header.
-                    let rw = self.gc_rewriter(&HashMap::new());
+                    let rw = self.gc_rewriter(&majit_ir::VecAssoc::new());
                     let wb_byteofs = rw
                         .as_ref()
                         .map(|r| r.wb_descr.jit_wb_if_flag_byteofs as i32)
@@ -11116,10 +11136,7 @@ impl CraneliftBackend {
                     }
                 }
                 OpCode::RawLoadI | OpCode::RawLoadF => {
-                    let descr = op
-                        .descr
-                        .as_ref()
-                        .expect("raw load op must have a descriptor");
+                    let descr = op.getdescr().expect("raw load op must have a descriptor");
                     let ad = descr
                         .as_array_descr()
                         .expect("raw load descriptor must be an ArrayDescr");
@@ -11151,7 +11168,7 @@ impl CraneliftBackend {
                 OpCode::GcStore => {
                     // rewrite.py:140-158 emit_gc_store_or_indexed parity.
                     // 4-arg form: GC_STORE(base, ConstInt(offset), value, ConstInt(size))
-                    if op.args.len() >= 4 {
+                    if op.num_args() >= 4 {
                         let item_size = resolve_constant_i64(
                             &constants,
                             &known_values,
@@ -11277,10 +11294,7 @@ impl CraneliftBackend {
                 | OpCode::GetfieldGcPureI
                 | OpCode::GetfieldGcPureR
                 | OpCode::GetfieldGcPureF => {
-                    let descr = op
-                        .descr
-                        .as_ref()
-                        .expect("getfield op must have a descriptor");
+                    let descr = op.getdescr().expect("getfield op must have a descriptor");
                     let fd = descr
                         .as_field_descr()
                         .expect("getfield descriptor must be a FieldDescr");
@@ -11301,10 +11315,7 @@ impl CraneliftBackend {
                 // ── Field access (setfield) ──
                 // args[0] = base, args[1] = value
                 OpCode::SetfieldGc | OpCode::SetfieldRaw => {
-                    let descr = op
-                        .descr
-                        .as_ref()
-                        .expect("setfield op must have a descriptor");
+                    let descr = op.getdescr().expect("setfield op must have a descriptor");
                     let fd = descr
                         .as_field_descr()
                         .expect("setfield descriptor must be a FieldDescr");
@@ -11334,8 +11345,7 @@ impl CraneliftBackend {
                 | OpCode::GetarrayitemGcPureR
                 | OpCode::GetarrayitemGcPureF => {
                     let descr = op
-                        .descr
-                        .as_ref()
+                        .getdescr()
                         .expect("getarrayitem op must have a descriptor");
                     let ad = descr
                         .as_array_descr()
@@ -11365,8 +11375,7 @@ impl CraneliftBackend {
                 // args[0] = base, args[1] = index, args[2] = value
                 OpCode::SetarrayitemGc | OpCode::SetarrayitemRaw => {
                     let descr = op
-                        .descr
-                        .as_ref()
+                        .getdescr()
                         .expect("setarrayitem op must have a descriptor");
                     let ad = descr
                         .as_array_descr()
@@ -11396,8 +11405,7 @@ impl CraneliftBackend {
                 | OpCode::GetinteriorfieldGcR
                 | OpCode::GetinteriorfieldGcF => {
                     let descr = op
-                        .descr
-                        .as_ref()
+                        .getdescr()
                         .expect("getinteriorfield op must have a descriptor");
                     let id = descr
                         .as_interior_field_descr()
@@ -11426,8 +11434,7 @@ impl CraneliftBackend {
 
                 OpCode::SetinteriorfieldGc | OpCode::SetinteriorfieldRaw => {
                     let descr = op
-                        .descr
-                        .as_ref()
+                        .getdescr()
                         .expect("setinteriorfield op must have a descriptor");
                     let id = descr
                         .as_interior_field_descr()
@@ -11455,10 +11462,7 @@ impl CraneliftBackend {
                 }
 
                 OpCode::RawStore => {
-                    let descr = op
-                        .descr
-                        .as_ref()
-                        .expect("raw store op must have a descriptor");
+                    let descr = op.getdescr().expect("raw store op must have a descriptor");
                     let ad = descr
                         .as_array_descr()
                         .expect("raw store descriptor must be an ArrayDescr");
@@ -11484,10 +11488,7 @@ impl CraneliftBackend {
                 // These load the length field from the object header using
                 // the array descriptor's len_descr.
                 OpCode::ArraylenGc => {
-                    let descr = op
-                        .descr
-                        .as_ref()
-                        .expect("arraylen op must have a descriptor");
+                    let descr = op.getdescr().expect("arraylen op must have a descriptor");
                     let ad = descr
                         .as_array_descr()
                         .expect("arraylen descriptor must be an ArrayDescr");
@@ -11515,8 +11516,7 @@ impl CraneliftBackend {
                     // These use the array descriptor attached to the op.
                     // The length is at len_descr().offset() from the base pointer.
                     let descr = op
-                        .descr
-                        .as_ref()
+                        .getdescr()
                         .expect("strlen/unicodelen op must have a descriptor");
                     let ad = descr
                         .as_array_descr()
@@ -11546,8 +11546,7 @@ impl CraneliftBackend {
                     // `builtin_string_hash_field_descr` above.  The assert
                     // `size == WORD` at rewrite.py:286,292 mirrors here.
                     let descr = op
-                        .descr
-                        .as_ref()
+                        .getdescr()
                         .expect("strhash/unicodehash op must have a descriptor");
                     let fd = descr
                         .as_field_descr()
@@ -11576,8 +11575,7 @@ impl CraneliftBackend {
                     // rewrite.py:299/311 subtracts it before emitting the
                     // address arithmetic.  UNICODE has no extra item.
                     let descr = op
-                        .descr
-                        .as_ref()
+                        .getdescr()
                         .expect("str/unicodegetitem op must have a descriptor");
                     let ad = descr
                         .as_array_descr()
@@ -11613,8 +11611,7 @@ impl CraneliftBackend {
                     // rewrite.py:307-318 parity.  See STRGETITEM note above
                     // for the `basesize -= 1` rationale.
                     let descr = op
-                        .descr
-                        .as_ref()
+                        .getdescr()
                         .expect("str/unicodesetitem op must have a descriptor");
                     let ad = descr
                         .as_array_descr()
@@ -11650,8 +11647,7 @@ impl CraneliftBackend {
                     // addresses skip the extra null character for STR, just
                     // like STR{GET,SET}ITEM.
                     let descr = op
-                        .descr
-                        .as_ref()
+                        .getdescr()
                         .expect("copystr/unicodecontent op must have a descriptor");
                     let ad = descr
                         .as_array_descr()
@@ -11704,10 +11700,7 @@ impl CraneliftBackend {
                 // [base + descr.base_size + start*scale_start,
                 //  base + descr.base_size + start*scale_start + size*scale_size)
                 OpCode::ZeroArray => {
-                    let descr = op
-                        .descr
-                        .as_ref()
-                        .expect("zero_array op must have a descriptor");
+                    let descr = op.getdescr().expect("zero_array op must have a descriptor");
                     let ad = descr
                         .as_array_descr()
                         .expect("zero_array descriptor must be an ArrayDescr");
@@ -11763,7 +11756,7 @@ impl CraneliftBackend {
                 // ── Control flow ──
                 OpCode::Jump => {
                     let vals: Vec<CValue> = op
-                        .args
+                        .getarglist()
                         .iter()
                         .map(|&r| resolve_opref(&mut builder, &constants, r))
                         .collect();
@@ -11777,17 +11770,16 @@ impl CraneliftBackend {
                     // into block params, so the runtime num_block_params is
                     // unreliable — compare against the arity captured before
                     // codegen).
-                    let local_target_arity_matches = op.descr.as_ref().is_some_and(|d| {
+                    let local_target_arity_matches = op.getdescr().is_some_and(|d| {
                         label_arity_by_descr
                             .get(&d.index())
                             .copied()
-                            .is_some_and(|arity| arity == op.args.len())
+                            .is_some_and(|arity| arity == op.num_args())
                     });
                     let target_block = if local_target_arity_matches {
-                        op.descr
-                            .as_ref()
+                        op.getdescr()
                             .and_then(|descr| label_blocks_by_descr.get(&descr.index()).copied())
-                    } else if op.descr.is_some() {
+                    } else if op.has_descr() {
                         // Descr present but either points outside this function
                         // (bridge → main loop) or to a local label with
                         // mismatched arity — compile as external jump.
@@ -11942,7 +11934,7 @@ impl CraneliftBackend {
                 // materializes it by returning the underlying object reference.
                 // args[0] = the real object, args[1] = vref_id
                 OpCode::VirtualRefI | OpCode::VirtualRefR => {
-                    let obj = resolve_opref(&mut builder, &constants, op.args[0]);
+                    let obj = resolve_opref(&mut builder, &constants, op.arg(0));
                     builder.def_var(var(vi), obj);
                     if op.opcode == OpCode::VirtualRefR {
                         let cur_jf = builder.use_var(jf_ptr_var);
@@ -11962,7 +11954,7 @@ impl CraneliftBackend {
                 OpCode::VecGuardTrue => {
                     let info = &guard_infos[guard_idx];
                     guard_idx += 1;
-                    let cond = resolve_opref(&mut builder, &constants, op.args[0]);
+                    let cond = resolve_opref(&mut builder, &constants, op.arg(0));
                     let zero = builder.ins().iconst(cl_types::I64, 0);
                     let is_false = builder.ins().icmp(IntCC::Equal, cond, zero);
                     let exit_block = builder.create_block();
@@ -11994,7 +11986,7 @@ impl CraneliftBackend {
                 OpCode::VecGuardFalse => {
                     let info = &guard_infos[guard_idx];
                     guard_idx += 1;
-                    let cond = resolve_opref(&mut builder, &constants, op.args[0]);
+                    let cond = resolve_opref(&mut builder, &constants, op.arg(0));
                     let zero = builder.ins().iconst(cl_types::I64, 0);
                     let is_true = builder.ins().icmp(IntCC::NotEqual, cond, zero);
                     let exit_block = builder.create_block();
@@ -12039,14 +12031,14 @@ impl CraneliftBackend {
                             &constants,
                             &vec_oprefs,
                             &vec_float_oprefs,
-                            op.args[0],
+                            op.arg(0),
                         );
                         let b = resolve_opref_vec_int(
                             &mut builder,
                             &constants,
                             &vec_oprefs,
                             &vec_float_oprefs,
-                            op.args[1],
+                            op.arg(1),
                         );
                         let result = match op.opcode {
                             OpCode::VecIntAdd => builder.ins().iadd(a, b),
@@ -12059,8 +12051,8 @@ impl CraneliftBackend {
                         };
                         builder.def_var(var(vi), result);
                     } else {
-                        let a = resolve_opref(&mut builder, &constants, op.args[0]);
-                        let b = resolve_opref(&mut builder, &constants, op.args[1]);
+                        let a = resolve_opref(&mut builder, &constants, op.arg(0));
+                        let b = resolve_opref(&mut builder, &constants, op.arg(1));
                         let result = match op.opcode {
                             OpCode::VecIntAdd => builder.ins().iadd(a, b),
                             OpCode::VecIntSub => builder.ins().isub(a, b),
@@ -12085,14 +12077,14 @@ impl CraneliftBackend {
                             &constants,
                             &vec_oprefs,
                             &vec_float_oprefs,
-                            op.args[0],
+                            op.arg(0),
                         );
                         let b = resolve_opref_vec_float(
                             &mut builder,
                             &constants,
                             &vec_oprefs,
                             &vec_float_oprefs,
-                            op.args[1],
+                            op.arg(1),
                         );
                         let result = match op.opcode {
                             OpCode::VecFloatAdd => builder.ins().fadd(a, b),
@@ -12103,8 +12095,8 @@ impl CraneliftBackend {
                         };
                         builder.def_var(var(vi), result);
                     } else {
-                        let a = resolve_opref(&mut builder, &constants, op.args[0]);
-                        let b = resolve_opref(&mut builder, &constants, op.args[1]);
+                        let a = resolve_opref(&mut builder, &constants, op.arg(0));
+                        let b = resolve_opref(&mut builder, &constants, op.arg(1));
                         let fa = builder.ins().bitcast(cl_types::F64, MemFlags::new(), a);
                         let fb = builder.ins().bitcast(cl_types::F64, MemFlags::new(), b);
                         let fresult = match op.opcode {
@@ -12128,12 +12120,12 @@ impl CraneliftBackend {
                             &constants,
                             &vec_oprefs,
                             &vec_float_oprefs,
-                            op.args[0],
+                            op.arg(0),
                         );
                         let result = builder.ins().fneg(a);
                         builder.def_var(var(vi), result);
                     } else {
-                        let a = resolve_opref(&mut builder, &constants, op.args[0]);
+                        let a = resolve_opref(&mut builder, &constants, op.arg(0));
                         let fa = builder.ins().bitcast(cl_types::F64, MemFlags::new(), a);
                         let fresult = builder.ins().fneg(fa);
                         let result = builder
@@ -12150,12 +12142,12 @@ impl CraneliftBackend {
                             &constants,
                             &vec_oprefs,
                             &vec_float_oprefs,
-                            op.args[0],
+                            op.arg(0),
                         );
                         let result = builder.ins().fabs(a);
                         builder.def_var(var(vi), result);
                     } else {
-                        let a = resolve_opref(&mut builder, &constants, op.args[0]);
+                        let a = resolve_opref(&mut builder, &constants, op.arg(0));
                         let fa = builder.ins().bitcast(cl_types::F64, MemFlags::new(), a);
                         let fresult = builder.ins().fabs(fa);
                         let result = builder
@@ -12173,14 +12165,14 @@ impl CraneliftBackend {
                             &constants,
                             &vec_oprefs,
                             &vec_float_oprefs,
-                            op.args[0],
+                            op.arg(0),
                         );
                         let b = resolve_opref_vec_int(
                             &mut builder,
                             &constants,
                             &vec_oprefs,
                             &vec_float_oprefs,
-                            op.args[1],
+                            op.arg(1),
                         );
                         let xored = builder.ins().bxor(a, b);
                         // Result is declared as F64X2, bitcast from I64X2
@@ -12189,8 +12181,8 @@ impl CraneliftBackend {
                             .bitcast(cl_types::F64X2, MemFlags::new(), xored);
                         builder.def_var(var(vi), result);
                     } else {
-                        let a = resolve_opref(&mut builder, &constants, op.args[0]);
-                        let b = resolve_opref(&mut builder, &constants, op.args[1]);
+                        let a = resolve_opref(&mut builder, &constants, op.arg(0));
+                        let b = resolve_opref(&mut builder, &constants, op.arg(1));
                         let result = builder.ins().bxor(a, b);
                         builder.def_var(var(vi), result);
                     }
@@ -12199,8 +12191,8 @@ impl CraneliftBackend {
                 // ── Vector comparison/test operations ──
                 // These always produce scalar results (I64), not vectors.
                 OpCode::VecFloatEq => {
-                    let a = resolve_opref(&mut builder, &constants, op.args[0]);
-                    let b = resolve_opref(&mut builder, &constants, op.args[1]);
+                    let a = resolve_opref(&mut builder, &constants, op.arg(0));
+                    let b = resolve_opref(&mut builder, &constants, op.arg(1));
                     let fa = builder.ins().bitcast(cl_types::F64, MemFlags::new(), a);
                     let fb = builder.ins().bitcast(cl_types::F64, MemFlags::new(), b);
                     let cmp = builder.ins().fcmp(FloatCC::Equal, fa, fb);
@@ -12209,8 +12201,8 @@ impl CraneliftBackend {
                 }
 
                 OpCode::VecFloatNe => {
-                    let a = resolve_opref(&mut builder, &constants, op.args[0]);
-                    let b = resolve_opref(&mut builder, &constants, op.args[1]);
+                    let a = resolve_opref(&mut builder, &constants, op.arg(0));
+                    let b = resolve_opref(&mut builder, &constants, op.arg(1));
                     let fa = builder.ins().bitcast(cl_types::F64, MemFlags::new(), a);
                     let fb = builder.ins().bitcast(cl_types::F64, MemFlags::new(), b);
                     let cmp = builder.ins().fcmp(FloatCC::NotEqual, fa, fb);
@@ -12219,7 +12211,7 @@ impl CraneliftBackend {
                 }
 
                 OpCode::VecIntIsTrue => {
-                    let a = resolve_opref(&mut builder, &constants, op.args[0]);
+                    let a = resolve_opref(&mut builder, &constants, op.arg(0));
                     let zero = builder.ins().iconst(cl_types::I64, 0);
                     let cmp = builder.ins().icmp(IntCC::NotEqual, a, zero);
                     let result = builder.ins().uextend(cl_types::I64, cmp);
@@ -12227,16 +12219,16 @@ impl CraneliftBackend {
                 }
 
                 OpCode::VecIntEq => {
-                    let a = resolve_opref(&mut builder, &constants, op.args[0]);
-                    let b = resolve_opref(&mut builder, &constants, op.args[1]);
+                    let a = resolve_opref(&mut builder, &constants, op.arg(0));
+                    let b = resolve_opref(&mut builder, &constants, op.arg(1));
                     let cmp = builder.ins().icmp(IntCC::Equal, a, b);
                     let result = builder.ins().uextend(cl_types::I64, cmp);
                     builder.def_var(var(vi), result);
                 }
 
                 OpCode::VecIntNe => {
-                    let a = resolve_opref(&mut builder, &constants, op.args[0]);
-                    let b = resolve_opref(&mut builder, &constants, op.args[1]);
+                    let a = resolve_opref(&mut builder, &constants, op.arg(0));
+                    let b = resolve_opref(&mut builder, &constants, op.arg(1));
                     let cmp = builder.ins().icmp(IntCC::NotEqual, a, b);
                     let result = builder.ins().uextend(cl_types::I64, cmp);
                     builder.def_var(var(vi), result);
@@ -12244,21 +12236,21 @@ impl CraneliftBackend {
 
                 OpCode::VecIntSignext => {
                     // Sign-extend a narrower integer value to i64
-                    let a = resolve_opref(&mut builder, &constants, op.args[0]);
+                    let a = resolve_opref(&mut builder, &constants, op.arg(0));
                     builder.def_var(var(vi), a); // already i64
                 }
 
                 // ── Vector cast operations ──
                 // These operate on scalar elements, not full vectors.
                 OpCode::VecCastFloatToInt => {
-                    let a = resolve_opref(&mut builder, &constants, op.args[0]);
+                    let a = resolve_opref(&mut builder, &constants, op.arg(0));
                     let fa = builder.ins().bitcast(cl_types::F64, MemFlags::new(), a);
                     let result = builder.ins().fcvt_to_sint(cl_types::I64, fa);
                     builder.def_var(var(vi), result);
                 }
 
                 OpCode::VecCastIntToFloat => {
-                    let a = resolve_opref(&mut builder, &constants, op.args[0]);
+                    let a = resolve_opref(&mut builder, &constants, op.arg(0));
                     let fresult = builder.ins().fcvt_from_sint(cl_types::F64, a);
                     let result = builder
                         .ins()
@@ -12267,7 +12259,7 @@ impl CraneliftBackend {
                 }
 
                 OpCode::VecCastFloatToSinglefloat => {
-                    let a = resolve_opref(&mut builder, &constants, op.args[0]);
+                    let a = resolve_opref(&mut builder, &constants, op.arg(0));
                     let fa = builder.ins().bitcast(cl_types::F64, MemFlags::new(), a);
                     let f32val = builder.ins().fdemote(cl_types::F32, fa);
                     let result = builder
@@ -12278,7 +12270,7 @@ impl CraneliftBackend {
                 }
 
                 OpCode::VecCastSinglefloatToFloat => {
-                    let a = resolve_opref(&mut builder, &constants, op.args[0]);
+                    let a = resolve_opref(&mut builder, &constants, op.arg(0));
                     let a_trunc = builder.ins().ireduce(cl_types::I32, a);
                     let f32val = builder
                         .ins()
@@ -12322,14 +12314,14 @@ impl CraneliftBackend {
                             &constants,
                             &vec_oprefs,
                             &vec_float_oprefs,
-                            op.args[0],
+                            op.arg(0),
                         );
-                        let scalar = resolve_opref(&mut builder, &constants, op.args[1]);
-                        let lane = constants.get(&op.args[2].raw()).copied().unwrap_or(0) as u8;
+                        let scalar = resolve_opref(&mut builder, &constants, op.arg(1));
+                        let lane = constants.get(&op.arg(2).raw()).copied().unwrap_or(0) as u8;
                         let result = builder.ins().insertlane(vec_val, scalar, lane);
                         builder.def_var(var(vi), result);
                     } else {
-                        let scalar = resolve_opref(&mut builder, &constants, op.args[1]);
+                        let scalar = resolve_opref(&mut builder, &constants, op.arg(1));
                         builder.def_var(var(vi), scalar);
                     }
                 }
@@ -12343,18 +12335,18 @@ impl CraneliftBackend {
                             &constants,
                             &vec_oprefs,
                             &vec_float_oprefs,
-                            op.args[0],
+                            op.arg(0),
                         );
-                        let scalar_i = resolve_opref(&mut builder, &constants, op.args[1]);
+                        let scalar_i = resolve_opref(&mut builder, &constants, op.arg(1));
                         let scalar_f =
                             builder
                                 .ins()
                                 .bitcast(cl_types::F64, MemFlags::new(), scalar_i);
-                        let lane = constants.get(&op.args[2].raw()).copied().unwrap_or(0) as u8;
+                        let lane = constants.get(&op.arg(2).raw()).copied().unwrap_or(0) as u8;
                         let result = builder.ins().insertlane(vec_val, scalar_f, lane);
                         builder.def_var(var(vi), result);
                     } else {
-                        let scalar = resolve_opref(&mut builder, &constants, op.args[1]);
+                        let scalar = resolve_opref(&mut builder, &constants, op.arg(1));
                         builder.def_var(var(vi), scalar);
                     }
                 }
@@ -12367,13 +12359,13 @@ impl CraneliftBackend {
                             &constants,
                             &vec_oprefs,
                             &vec_float_oprefs,
-                            op.args[0],
+                            op.arg(0),
                         );
-                        let lane = constants.get(&op.args[1].raw()).copied().unwrap_or(0) as u8;
+                        let lane = constants.get(&op.arg(1).raw()).copied().unwrap_or(0) as u8;
                         let result = builder.ins().extractlane(vec_val, lane);
                         builder.def_var(var(vi), result);
                     } else {
-                        let vec_val = resolve_opref(&mut builder, &constants, op.args[0]);
+                        let vec_val = resolve_opref(&mut builder, &constants, op.arg(0));
                         builder.def_var(var(vi), vec_val);
                     }
                 }
@@ -12386,9 +12378,9 @@ impl CraneliftBackend {
                             &constants,
                             &vec_oprefs,
                             &vec_float_oprefs,
-                            op.args[0],
+                            op.arg(0),
                         );
-                        let lane = constants.get(&op.args[1].raw()).copied().unwrap_or(0) as u8;
+                        let lane = constants.get(&op.arg(1).raw()).copied().unwrap_or(0) as u8;
                         let scalar_f = builder.ins().extractlane(vec_val, lane);
                         let result =
                             builder
@@ -12396,7 +12388,7 @@ impl CraneliftBackend {
                                 .bitcast(cl_types::I64, MemFlags::new(), scalar_f);
                         builder.def_var(var(vi), result);
                     } else {
-                        let vec_val = resolve_opref(&mut builder, &constants, op.args[0]);
+                        let vec_val = resolve_opref(&mut builder, &constants, op.arg(0));
                         builder.def_var(var(vi), vec_val);
                     }
                 }
@@ -12404,11 +12396,11 @@ impl CraneliftBackend {
                 OpCode::VecExpandI => {
                     if USE_NATIVE_SIMD {
                         // Broadcast scalar to all lanes
-                        let scalar = resolve_opref(&mut builder, &constants, op.args[0]);
+                        let scalar = resolve_opref(&mut builder, &constants, op.arg(0));
                         let result = builder.ins().splat(cl_types::I64X2, scalar);
                         builder.def_var(var(vi), result);
                     } else {
-                        let scalar = resolve_opref(&mut builder, &constants, op.args[0]);
+                        let scalar = resolve_opref(&mut builder, &constants, op.arg(0));
                         builder.def_var(var(vi), scalar);
                     }
                 }
@@ -12416,7 +12408,7 @@ impl CraneliftBackend {
                 OpCode::VecExpandF => {
                     if USE_NATIVE_SIMD {
                         // Broadcast scalar f64 to all lanes
-                        let scalar_i = resolve_opref(&mut builder, &constants, op.args[0]);
+                        let scalar_i = resolve_opref(&mut builder, &constants, op.arg(0));
                         let scalar_f =
                             builder
                                 .ins()
@@ -12424,7 +12416,7 @@ impl CraneliftBackend {
                         let result = builder.ins().splat(cl_types::F64X2, scalar_f);
                         builder.def_var(var(vi), result);
                     } else {
-                        let scalar = resolve_opref(&mut builder, &constants, op.args[0]);
+                        let scalar = resolve_opref(&mut builder, &constants, op.arg(0));
                         builder.def_var(var(vi), scalar);
                     }
                 }
@@ -12433,9 +12425,9 @@ impl CraneliftBackend {
                 OpCode::VecLoadI | OpCode::VecLoadF => {
                     if USE_NATIVE_SIMD {
                         // Load 128 bits (2x i64 or 2x f64) from memory
-                        let base = resolve_opref(&mut builder, &constants, op.args[0]);
-                        let offset_val = if op.args.len() > 1 {
-                            resolve_opref(&mut builder, &constants, op.args[1])
+                        let base = resolve_opref(&mut builder, &constants, op.arg(0));
+                        let offset_val = if op.num_args() > 1 {
+                            resolve_opref(&mut builder, &constants, op.arg(1))
                         } else {
                             builder.ins().iconst(cl_types::I64, 0)
                         };
@@ -12448,9 +12440,9 @@ impl CraneliftBackend {
                         let result = builder.ins().load(load_type, MemFlags::trusted(), addr, 0);
                         builder.def_var(var(vi), result);
                     } else {
-                        let base = resolve_opref(&mut builder, &constants, op.args[0]);
-                        let offset_val = if op.args.len() > 1 {
-                            resolve_opref(&mut builder, &constants, op.args[1])
+                        let base = resolve_opref(&mut builder, &constants, op.arg(0));
+                        let offset_val = if op.num_args() > 1 {
+                            resolve_opref(&mut builder, &constants, op.arg(1))
                         } else {
                             builder.ins().iconst(cl_types::I64, 0)
                         };
@@ -12466,13 +12458,13 @@ impl CraneliftBackend {
                 OpCode::VecStore => {
                     if USE_NATIVE_SIMD {
                         // Store 128 bits to memory
-                        let base = resolve_opref(&mut builder, &constants, op.args[0]);
-                        let offset_val = if op.args.len() > 2 {
-                            resolve_opref(&mut builder, &constants, op.args[1])
+                        let base = resolve_opref(&mut builder, &constants, op.arg(0));
+                        let offset_val = if op.num_args() > 2 {
+                            resolve_opref(&mut builder, &constants, op.arg(1))
                         } else {
                             builder.ins().iconst(cl_types::I64, 0)
                         };
-                        let value_ref = op.args[op.args.len() - 1];
+                        let value_ref = op.arg(op.num_args() - 1);
                         let value = if vec_oprefs.contains(&value_ref.raw()) {
                             builder.use_var(var(value_ref.raw()))
                         } else {
@@ -12481,14 +12473,14 @@ impl CraneliftBackend {
                         let addr = builder.ins().iadd(base, offset_val);
                         builder.ins().store(MemFlags::trusted(), value, addr, 0);
                     } else {
-                        let base = resolve_opref(&mut builder, &constants, op.args[0]);
-                        let offset_val = if op.args.len() > 2 {
-                            resolve_opref(&mut builder, &constants, op.args[1])
+                        let base = resolve_opref(&mut builder, &constants, op.arg(0));
+                        let offset_val = if op.num_args() > 2 {
+                            resolve_opref(&mut builder, &constants, op.arg(1))
                         } else {
                             builder.ins().iconst(cl_types::I64, 0)
                         };
                         let value =
-                            resolve_opref(&mut builder, &constants, op.args[op.args.len() - 1]);
+                            resolve_opref(&mut builder, &constants, op.arg(op.num_args() - 1));
                         let addr = builder.ins().iadd(base, offset_val);
                         builder.ins().store(MemFlags::trusted(), value, addr, 0);
                     }
@@ -12499,7 +12491,8 @@ impl CraneliftBackend {
                 // or rewritten by the GC rewriter. If they reach the backend,
                 // we call out to a runtime helper.
                 OpCode::New | OpCode::NewWithVtable => {
-                    let sd = op.descr.as_ref().and_then(|d| d.as_size_descr());
+                    let __descr_arc_sd = op.getdescr();
+                    let sd = __descr_arc_sd.as_ref().and_then(|d| d.as_size_descr());
                     let (size, type_id, vtable) = sd.map_or((16, 0, 0usize), |sd| {
                         (sd.size() as i64, sd.type_id() as i64, sd.vtable())
                     });
@@ -12601,8 +12594,9 @@ impl CraneliftBackend {
                     }
                     let length =
                         resolve_opref_or_imm(&mut builder, &constants, &known_values, op.arg(0));
+                    let __descr_arc = op.getdescr();
                     let (base_size, item_size) =
-                        if let Some(ad) = op.descr.as_ref().and_then(|d| d.as_array_descr()) {
+                        if let Some(ad) = __descr_arc.as_ref().and_then(|d| d.as_array_descr()) {
                             (
                                 builder.ins().iconst(cl_types::I64, ad.base_size() as i64),
                                 builder.ins().iconst(cl_types::I64, ad.item_size() as i64),
@@ -12771,8 +12765,7 @@ impl CraneliftBackend {
                     // UNICODE basesize = 16. Allocated bytes per rstr.malloc
                     // are `basesize + n * itemsize`.
                     let descr = op
-                        .descr
-                        .as_ref()
+                        .getdescr()
                         .expect("newstr/newunicode op must have an ArrayDescr");
                     let ad = descr
                         .as_array_descr()
@@ -12989,11 +12982,11 @@ impl CraneliftBackend {
             if op.opcode != OpCode::Label {
                 continue;
             }
-            if let Some(descr_ref) = op.descr.as_ref() {
+            if let Some(descr_ref) = op.getdescr() {
                 if let Some(target) = descr_ref.as_loop_target_descr() {
                     target.set_dispatch_target(body_ptr as usize, label_block_id);
                 }
-                register_loop_target(descr_ref, entry.clone());
+                register_loop_target(&descr_ref, entry.clone());
             }
             label_block_id += 1;
         }
@@ -13064,9 +13057,9 @@ fn precompute_max_output_slots(inputargs: &[InputArg], ops: &[Op]) -> usize {
         .iter()
         .filter(|op| op.opcode == OpCode::Label)
         .filter_map(|op| {
-            op.descr
+            op.getdescr()
                 .as_ref()
-                .map(|d| (majit_ir::descr_identity(d), op.args.len()))
+                .map(|d| (majit_ir::descr_identity(d), op.num_args()))
         })
         .collect();
     let num_inputs = inputargs.len();
@@ -13075,22 +13068,22 @@ fn precompute_max_output_slots(inputargs: &[InputArg], ops: &[Op]) -> usize {
         let is_guard = op.opcode.is_guard();
         let is_finish = op.opcode == OpCode::Finish;
         let is_external_jump = op.opcode == OpCode::Jump
-            && op.descr.as_ref().map_or(false, |d| {
+            && op.getdescr().as_ref().map_or(false, |d| {
                 let id = majit_ir::descr_identity(d);
                 match label_arity_by_descr
                     .iter()
                     .find(|(label_id, _)| *label_id == id)
                 {
                     None => true,
-                    Some(&(_, arity)) => arity != op.args.len(),
+                    Some(&(_, arity)) => arity != op.num_args(),
                 }
             });
         if !is_guard && !is_finish && !is_external_jump {
             continue;
         }
         let n = if is_finish || is_external_jump {
-            op.args.len()
-        } else if let Some(ref fa) = op.fail_args {
+            op.num_args()
+        } else if let Some(fa) = op.getfailargs() {
             fa.len()
         } else {
             num_inputs
@@ -13113,12 +13106,12 @@ fn collect_guards(
     header_pc: u64,
     source_guard: Option<(u64, u32)>,
     caller_layout: Option<&ExitRecoveryLayout>,
-    constants: &HashMap<u32, i64>,
-    constant_types: &HashMap<u32, Type>,
+    constants: &majit_ir::VecAssoc<u32, i64>,
+    constant_types: &majit_ir::VecAssoc<u32, Type>,
     attached_descrs: majit_backend::AttachedDescrPtrs,
 ) -> Result<(), BackendError> {
     let num_inputs = inputargs.len();
-    let type_index = OpTypeIndex::new(inputargs, ops, constant_types);
+    let type_index = OpTypeIndex::new(inputargs, ops);
     let (type_overrides, op_def_positions) = build_type_overrides(inputargs, ops, &type_index);
 
     // Map Label descr index → block arity, used to distinguish internal vs
@@ -13130,7 +13123,7 @@ fn collect_guards(
     let label_arity_by_descr: HashMap<u32, usize> = ops
         .iter()
         .filter(|op| op.opcode == OpCode::Label)
-        .filter_map(|op| op.descr.as_ref().map(|d| (d.index(), op.args.len())))
+        .filter_map(|op| op.getdescr().map(|d| (d.index(), op.num_args())))
         .collect();
 
     for (op_idx, op) in ops.iter().enumerate() {
@@ -13140,11 +13133,10 @@ fn collect_guards(
         // target with mismatched arity (treated as external for parity).
         let is_external_jump = op.opcode == OpCode::Jump
             && op
-                .descr
-                .as_ref()
+                .getdescr()
                 .map_or(false, |d| match label_arity_by_descr.get(&d.index()) {
                     None => true,
-                    Some(&arity) => arity != op.args.len(),
+                    Some(&arity) => arity != op.num_args(),
                 });
 
         if !is_guard && !is_finish && !is_external_jump {
@@ -13154,15 +13146,14 @@ fn collect_guards(
         let fail_index = fail_descrs.len() as u32;
 
         let (fail_arg_refs, fail_arg_types) = if is_finish || is_external_jump {
-            let refs: Vec<OpRef> = op.args.iter().copied().collect();
+            let refs: Vec<OpRef> = op.getarglist().iter().copied().collect();
             // Use the descriptor's explicit types for FINISH args — these are
             // set by the tracer and represent the caller's view of the return
             // type, which may differ from the op's inferred type (e.g. New
             // produces Ref but the value is treated as Int by the caller).
-            let types = if let Some(fd) = op.descr.as_ref().and_then(|d| d.as_fail_descr()) {
-                let dt = fd.fail_arg_types();
+            let types = if let Some(dt) = op.with_fail_descr(|fd| fd.fail_arg_types().to_vec()) {
                 if dt.len() == refs.len() {
-                    dt.to_vec()
+                    dt
                 } else {
                     infer_fail_arg_types(&refs, &type_index, &type_overrides, op_idx)?
                 }
@@ -13170,9 +13161,12 @@ fn collect_guards(
                 infer_fail_arg_types(&refs, &type_index, &type_overrides, op_idx)?
             };
             (refs, types)
-        } else if let Some(ref fa) = op.fail_args {
+        } else if let Some(fa) = op.getfailargs() {
             let refs: Vec<OpRef> = fa.iter().copied().collect();
-            let descr_fd = op.descr.as_ref().and_then(|d| d.as_fail_descr());
+            let __descr_arc_descr_fd = op.getdescr();
+            let descr_fd = __descr_arc_descr_fd
+                .as_ref()
+                .and_then(|d| d.as_fail_descr());
             // store_final_boxes_in_guard (optimizeopt/mod.rs:3393-3404)
             // sets op.descr to a fresh ResumeGuardDescr whose
             // fail_arg_types match the reduced liveboxes — prefer the
@@ -13182,11 +13176,11 @@ fn collect_guards(
             // inheriting the donor's op.fail_arg_types instead; that is
             // the only path left where op-level types are load-bearing.
             let types = match (
-                descr_fd.map(|fd| fd.fail_arg_types()),
-                op.fail_arg_types.as_ref(),
+                descr_fd.map(|fd| fd.fail_arg_types().to_vec()),
+                op.get_fail_arg_types().map(|t| t.to_vec()),
             ) {
-                (Some(dt), _) if dt.len() == refs.len() => dt.to_vec(),
-                (_, Some(explicit)) if explicit.len() == refs.len() => explicit.clone(),
+                (Some(dt), _) if dt.len() == refs.len() => dt,
+                (_, Some(explicit)) if explicit.len() == refs.len() => explicit,
                 _ => resolve_fail_arg_types(
                     &refs,
                     descr_fd,
@@ -13211,9 +13205,10 @@ fn collect_guards(
                 .iter()
                 .map(|ia| OpRef::input_arg_typed(ia.index, ia.tp))
                 .collect();
+            let fb_descr_arc = op.getdescr();
             let types = resolve_fail_arg_types(
                 &refs,
-                op.descr.as_ref().and_then(|d| d.as_fail_descr()),
+                fb_descr_arc.as_ref().and_then(|d| d.as_fail_descr()),
                 &type_index,
                 &type_overrides,
                 &op_def_positions,
@@ -13247,8 +13242,12 @@ fn collect_guards(
                 let fvc = get_frame_value_count_fn();
                 let fvc_ref: Option<&dyn Fn(i32, i32) -> usize> =
                     fvc.as_ref().map(|f| f as &dyn Fn(i32, i32) -> usize);
-                let (_nfa, _vable, _vref, frames) =
-                    rebuild_from_numbering(rd_numb_bytes, rd_consts_data, &fail_arg_types, fvc_ref);
+                let (_nfa, _vable, _vref, frames) = rebuild_from_numbering(
+                    &rd_numb_bytes,
+                    &rd_consts_data,
+                    &fail_arg_types,
+                    fvc_ref,
+                );
                 frames.last().map(|f| f.pc as u64)
             } else {
                 None
@@ -13281,12 +13280,12 @@ fn collect_guards(
         {
             let rd_vi = op.resolved_rd_virtuals();
             use majit_ir::resumedata::{self, RebuiltValue, rebuild_from_numbering};
-            let rd_consts_ref: &[majit_ir::Const] = rd_consts_data;
+            let rd_consts_ref: &[majit_ir::Const] = &rd_consts_data;
             let fvc = majit_ir::resumedata::get_frame_value_count_fn();
             let fvc_ref: Option<&dyn Fn(i32, i32) -> usize> =
                 fvc.as_ref().map(|f| f as &dyn Fn(i32, i32) -> usize);
             let (_num_failargs, _vable_values, _vref_values, frames) =
-                rebuild_from_numbering(rd_numb_bytes, rd_consts_data, &fail_arg_types, fvc_ref);
+                rebuild_from_numbering(&rd_numb_bytes, &rd_consts_data, &fail_arg_types, fvc_ref);
 
             // Rebuild frame slots from rd_numb values.
             // Track Virtual(vidx) → slot_idx for target_slot in virtual_layouts.
@@ -13598,15 +13597,14 @@ fn collect_guards(
         // `meta_descr`) before wrapping it in `Arc::new`.
         let external_jump_target: Option<majit_ir::DescrRef> = if is_external_jump {
             Some(
-                op.descr
-                    .as_ref()
-                    .cloned()
+                op.getdescr()
                     .expect("external JUMP must carry a TargetToken descr"),
             )
         } else {
             None
         };
-        let accum_info = if let Some(fd) = op.descr.as_ref().and_then(|d| d.as_fail_descr()) {
+        let descr_arc = op.getdescr();
+        let accum_info = if let Some(fd) = descr_arc.as_ref().and_then(|d| d.as_fail_descr()) {
             // `history.py:132` `AbstractFailDescr._attrs_` `rd_vector_info`
             // lives on the metainterp `AbstractFailDescr`; backend reads
             // forward through `meta_descr` so no local copy is needed.
@@ -13639,8 +13637,7 @@ fn collect_guards(
             //
             // `is_exit_frame_with_exception` vs DoneWithThisFrame
             // routing mirrors lines 12992-13001 below.
-            let is_exit_exc = op
-                .descr
+            let is_exit_exc = descr_arc
                 .as_ref()
                 .and_then(|d| d.as_fail_descr())
                 .map(|fd| FailDescr::is_exit_frame_with_exception(fd))
@@ -13673,7 +13670,7 @@ fn collect_guards(
                 // meta-side slots for `force_token_slots` (Slice 7-Tβ7)
                 // and `external_jump_target` (Slice 7-Tβ8) are reachable.
                 majit_backend::make_resume_guard_descr_typed(fail_arg_types.clone())
-            } else if let Some(d) = op.descr.clone() {
+            } else if let Some(d) = op.getdescr() {
                 // Preserve `op.descr` identity for every guard that carries
                 // one — including non-Resume FailDescrs (PropagateExceptionDescr
                 // attached to GUARD_NO_EXCEPTION by `compile_tmp_callback`
@@ -13740,7 +13737,7 @@ fn collect_guards(
                 fail_index,
                 op_idx,
                 op.opcode,
-                op.fail_args.as_ref(),
+                op.getfailargs(),
                 as_fd(&descr).fail_arg_types(),
             );
         }
@@ -13751,7 +13748,7 @@ fn collect_guards(
         // make_a_counter_per_value: for GUARD_VALUE, encode fail_arg
         // index + type tag in status (overrides store_hash).
         if op.opcode == majit_ir::OpCode::GuardValue {
-            if let Some(fa) = op.fail_args.as_ref() {
+            if let Some(fa) = op.getfailargs() {
                 let arg0 = op.arg(0);
                 if let Some(idx) = fa.iter().position(|&r| r == arg0) {
                     let type_tag = match as_fd(&descr).fail_arg_types().get(idx) {
@@ -13816,7 +13813,7 @@ fn collect_guards(
         // whose inputarg layout differs (`assembler.py:990-993` per-
         // LABEL `_ll_loop_code` parity gate).
         let external_jump_ll_loop_code_addr = if is_external_jump {
-            op.descr
+            op.getdescr()
                 .as_ref()
                 .and_then(|d| d.as_loop_target_descr())
                 .map(|ltd| {
@@ -13855,14 +13852,14 @@ fn collect_guards(
 fn collect_terminal_exit_layouts(
     ops: &[Op],
     inputargs: &[InputArg],
-    constant_types: &HashMap<u32, Type>,
+    constant_types: &majit_ir::VecAssoc<u32, Type>,
     force_tokens: &HashSet<u32>,
     trace_id: u64,
     header_pc: u64,
     source_guard: Option<(u64, u32)>,
     caller_layout: Option<&ExitRecoveryLayout>,
 ) -> Result<Vec<TerminalExitLayout>, BackendError> {
-    let type_index = OpTypeIndex::new(inputargs, ops, constant_types);
+    let type_index = OpTypeIndex::new(inputargs, ops);
     let (type_overrides, _op_def_positions) = build_type_overrides(inputargs, ops, &type_index);
     let mut layouts = Vec::new();
     let mut fail_index = 0u32;
@@ -13874,9 +13871,9 @@ fn collect_terminal_exit_layouts(
 
         if is_finish || is_jump {
             let exit_types =
-                infer_fail_arg_types(op.args.as_slice(), &type_index, &type_overrides, op_index)?;
+                infer_fail_arg_types(&op.getarglist(), &type_index, &type_overrides, op_index)?;
             let force_token_slots: Vec<usize> = op
-                .args
+                .getarglist()
                 .iter()
                 .enumerate()
                 .filter_map(|(slot, opref)| force_tokens.contains(&opref.raw()).then_some(slot))
@@ -13911,7 +13908,7 @@ fn collect_terminal_exit_layouts(
                 exit_types,
                 is_finish,
                 is_exception_exit: op
-                    .descr
+                    .getdescr()
                     .as_ref()
                     .and_then(|d| d.as_fail_descr())
                     .is_some_and(|fd| fd.is_exit_frame_with_exception()),
@@ -13944,9 +13941,13 @@ impl majit_backend::Backend for CraneliftBackend {
     fn compile_loop(
         &mut self,
         inputargs: &[InputArg],
-        ops: &[Op],
+        ops: &[OpRc],
         token: &mut JitCellToken,
     ) -> Result<AsmInfo, BackendError> {
+        // Deep-clone Op out of OpRc for the internal pipeline (post-optimizer
+        // boundary; backend stages do not depend on `_forwarded` sharing).
+        let ops_owned: Vec<Op> = ops.iter().map(|rc| (**rc).clone()).collect();
+        let ops: &[Op] = &ops_owned;
         token.inputarg_types = inputargs.iter().map(|ia| ia.tp).collect();
         // Pass the address of the invalidation flag so GUARD_NOT_INVALIDATED
         // can load from it at runtime.
@@ -13999,12 +14000,13 @@ impl majit_backend::Backend for CraneliftBackend {
         Ok(info)
     }
 
-    fn set_constants(&mut self, constants: HashMap<u32, i64>) {
-        self.constants = constants;
-    }
-
-    fn set_constant_types(&mut self, constant_types: HashMap<u32, majit_ir::Type>) {
-        self.constant_types = constant_types;
+    fn set_constants_pool(&mut self, constants: majit_ir::VecAssoc<u32, majit_ir::Const>) {
+        self.constants.clear();
+        self.constant_types.clear();
+        for (&k, c) in constants.iter() {
+            self.constants.insert(k, c.as_raw_i64());
+            self.constant_types.insert(k, c.get_type());
+        }
     }
 
     fn set_next_trace_id(&mut self, trace_id: u64) {
@@ -14083,11 +14085,13 @@ impl majit_backend::Backend for CraneliftBackend {
         &mut self,
         fail_descr: &dyn FailDescr,
         inputargs: &[InputArg],
-        ops: &[Op],
+        ops: &[OpRc],
         original_token: &JitCellToken,
         previous_tokens: &[std::sync::Arc<JitCellToken>],
         caller_recovery_layout: Option<&majit_backend::ExitRecoveryLayout>,
     ) -> Result<AsmInfo, BackendError> {
+        let ops_owned: Vec<Op> = ops.iter().map(|rc| (**rc).clone()).collect();
+        let ops: &[Op] = &ops_owned;
         let invalidated_arc = original_token.invalidated.clone();
         let flag_ptr =
             Arc::as_ptr(&invalidated_arc) as *const std::sync::atomic::AtomicBool as usize;
@@ -15575,10 +15579,10 @@ mod tests {
     use majit_ir::descr::{Descr, EffectInfo, ExtraEffect, SizeDescr};
     use std::collections::HashMap;
 
-    fn mk_op(opcode: OpCode, args: &[OpRef], pos: u32) -> Op {
-        let mut o = Op::new(opcode, args);
-        o.pos = OpRef::op_typed(pos, opcode.result_type());
-        o
+    fn mk_op(opcode: OpCode, args: &[OpRef], pos: u32) -> majit_ir::OpRc {
+        let o = Op::new(opcode, args);
+        o.pos.set(OpRef::op_typed(pos, opcode.result_type()));
+        std::rc::Rc::new(o)
     }
 
     /// llsupport/gc.py:563 GcLLDescr_framework
@@ -15602,10 +15606,15 @@ mod tests {
         assert_eq!(unknown, None);
     }
 
-    fn mk_op_with_descr(opcode: OpCode, args: &[OpRef], pos: u32, descr: majit_ir::DescrRef) -> Op {
-        let mut o = Op::with_descr(opcode, args, descr);
-        o.pos = OpRef::op_typed(pos, opcode.result_type());
-        o
+    fn mk_op_with_descr(
+        opcode: OpCode,
+        args: &[OpRef],
+        pos: u32,
+        descr: majit_ir::DescrRef,
+    ) -> majit_ir::OpRc {
+        let o = Op::with_descr(opcode, args, descr);
+        o.pos.set(OpRef::op_typed(pos, opcode.result_type()));
+        std::rc::Rc::new(o)
     }
 
     /// Test helper: synthesise a `ResumeGuardDescr` with `trace_id`
@@ -16004,7 +16013,7 @@ mod tests {
 
     fn assert_compile_unsupported(
         inputargs: Vec<InputArg>,
-        ops: Vec<Op>,
+        ops: Vec<majit_ir::OpRc>,
         token_number: u64,
         opcode: OpCode,
         expected_detail: &str,
@@ -16048,7 +16057,7 @@ mod tests {
             mk_op(OpCode::Jump, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 1i64);
         constants.insert(101, 1_000_000i64);
         backend.set_constants(constants);
@@ -16364,7 +16373,7 @@ mod tests {
             mk_op(OpCode::Jump, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 0i64);
         constants.insert(101, 1i64);
         backend.set_constants(constants);
@@ -16444,7 +16453,7 @@ mod tests {
             &[OpRef::input_arg_int(0)],
             OpRef::NONE.raw(),
         );
-        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[
+        guard.setfailargs(smallvec::SmallVec::from_slice(&[
             OpRef::input_arg_ref(1),
             OpRef::input_arg_int(0),
         ]));
@@ -16649,7 +16658,7 @@ mod tests {
             &[OpRef::input_arg_int(0)],
             OpRef::NONE.raw(),
         );
-        guard.fail_args = Some(smallvec::smallvec![OpRef::input_arg_int(0)]);
+        guard.setfailargs(smallvec::smallvec![OpRef::input_arg_int(0)]);
         let root_ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             guard,
@@ -16744,7 +16753,7 @@ mod tests {
             &[OpRef::input_arg_int(0)],
             OpRef::NONE.raw(),
         );
-        guard.fail_args = Some(smallvec::smallvec![OpRef::input_arg_int(0)]);
+        guard.setfailargs(smallvec::smallvec![OpRef::input_arg_int(0)]);
         let root_ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             guard,
@@ -16813,7 +16822,7 @@ mod tests {
             &[OpRef::input_arg_int(0)],
             OpRef::NONE.raw(),
         );
-        bridge_guard.fail_args = Some(smallvec::smallvec![OpRef::input_arg_int(0)]);
+        bridge_guard.setfailargs(smallvec::smallvec![OpRef::input_arg_int(0)]);
         let bridge_ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             bridge_guard,
@@ -16883,7 +16892,7 @@ mod tests {
             &[OpRef::input_arg_int(0)],
             OpRef::NONE.raw(),
         );
-        root_guard.fail_args = Some(smallvec::smallvec![OpRef::input_arg_int(0)]);
+        root_guard.setfailargs(smallvec::smallvec![OpRef::input_arg_int(0)]);
         let root_ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             root_guard,
@@ -16949,7 +16958,7 @@ mod tests {
             &[OpRef::input_arg_int(0)],
             OpRef::NONE.raw(),
         );
-        bridge_guard.fail_args = Some(smallvec::smallvec![OpRef::input_arg_int(0)]);
+        bridge_guard.setfailargs(smallvec::smallvec![OpRef::input_arg_int(0)]);
         let bridge_ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             bridge_guard,
@@ -17122,7 +17131,7 @@ mod tests {
             ),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 1i64);
         constants.insert(101, 0i64);
         backend.set_constants(constants);
@@ -17209,7 +17218,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, add_two as *const () as i64);
         backend.set_constants(constants);
 
@@ -17249,7 +17258,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, multiply as *const () as i64);
         backend.set_constants(constants);
 
@@ -17293,7 +17302,7 @@ mod tests {
             ),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, increment_counter as *const () as i64);
         backend.set_constants(constants);
 
@@ -17334,7 +17343,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::float_op(2)], OpRef::NONE.raw()),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, add_doubles as *const () as i64);
         backend.set_constants(constants);
 
@@ -17369,7 +17378,7 @@ mod tests {
             mk_op(OpCode::Jump, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, add_one as *const () as i64);
         constants.insert(101, 100i64);
         backend.set_constants(constants);
@@ -17437,7 +17446,7 @@ mod tests {
             mk_op(OpCode::Jump, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, log_char as *const () as i64);
         constants.insert(101, 32);
         constants.insert(102, log_num as *const () as i64);
@@ -17468,7 +17477,7 @@ mod tests {
 
         let inputargs = vec![InputArg::new_int(0)];
         let mut guard = mk_op(OpCode::GuardException, &[OpRef::int_op(101)], 1);
-        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(0)]));
+        guard.setfailargs(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(0)]));
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
@@ -17481,7 +17490,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::ref_op(1)], OpRef::NONE.raw()),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, maybe_raise_test_exception as *const () as i64);
         constants.insert(101, 0x1111);
         backend.set_constants(constants);
@@ -17516,7 +17525,7 @@ mod tests {
 
         let inputargs = vec![InputArg::new_int(0)];
         let mut guard = mk_op(OpCode::GuardException, &[OpRef::int_op(101)], 1);
-        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(0)]));
+        guard.setfailargs(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(0)]));
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
@@ -17529,7 +17538,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::ref_op(1)], OpRef::NONE.raw()),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, maybe_raise_test_exception as *const () as i64);
         constants.insert(101, 0x1111);
         backend.set_constants(constants);
@@ -17557,7 +17566,7 @@ mod tests {
 
         let inputargs = vec![InputArg::new_int(0)];
         let mut guard = mk_op(OpCode::GuardNoException, &[], OpRef::NONE.raw());
-        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(0)]));
+        guard.setfailargs(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(0)]));
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
@@ -17574,7 +17583,7 @@ mod tests {
             ),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, maybe_raise_test_exception as *const () as i64);
         backend.set_constants(constants);
 
@@ -17608,7 +17617,7 @@ mod tests {
 
         let inputargs = vec![InputArg::new_int(0)];
         let mut guard = mk_op(OpCode::GuardNoException, &[], OpRef::NONE.raw());
-        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(0)]));
+        guard.setfailargs(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(0)]));
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
@@ -17625,7 +17634,7 @@ mod tests {
             ),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, maybe_raise_test_exception as *const () as i64);
         backend.set_constants(constants);
 
@@ -17663,7 +17672,7 @@ mod tests {
 
         let inputargs = vec![InputArg::new_int(0)];
         let mut guard = mk_op(OpCode::GuardException, &[OpRef::int_op(101)], 3);
-        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(0)]));
+        guard.setfailargs(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(0)]));
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
@@ -17689,7 +17698,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::ref_op(3)], OpRef::NONE.raw()),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, maybe_raise_test_exception as *const () as i64);
         constants.insert(101, 0x3333);
         constants.insert(103, 0);
@@ -17735,7 +17744,7 @@ mod tests {
 
         let inputargs = vec![InputArg::new_int(0)];
         let mut guard = mk_op(OpCode::GuardNoException, &[], OpRef::NONE.raw());
-        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(0)]));
+        guard.setfailargs(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(0)]));
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
@@ -17752,7 +17761,7 @@ mod tests {
             ),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, maybe_raise_test_exception as *const () as i64);
         backend.set_constants(constants);
 
@@ -17859,7 +17868,7 @@ mod tests {
             ),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, set_value as *const () as i64);
         backend.set_constants(constants);
 
@@ -17912,7 +17921,7 @@ mod tests {
             ),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, set_value2 as *const () as i64);
         backend.set_constants(constants);
 
@@ -17953,7 +17962,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, compute as *const () as i64);
         backend.set_constants(constants);
 
@@ -17993,7 +18002,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, compute2 as *const () as i64);
         backend.set_constants(constants);
 
@@ -18022,7 +18031,7 @@ mod tests {
             mk_op(OpCode::Jump, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 1i64);
         backend.set_constants(constants);
 
@@ -18107,7 +18116,7 @@ mod tests {
         ];
 
         // Test: value matches -> guard passes, reaches Finish
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 42i64);
         backend.set_constants(constants);
 
@@ -18120,7 +18129,7 @@ mod tests {
         assert_eq!(backend.get_int_value(&frame, 0), 42);
 
         // Test: value doesn't match -> guard fails
-        let mut constants2 = HashMap::new();
+        let mut constants2: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants2.insert(100, 42i64);
         backend.set_constants(constants2);
 
@@ -18763,7 +18772,7 @@ mod tests {
             ),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 0xCAFE_BABEu64 as i64);
         backend.set_constants(constants);
 
@@ -19162,7 +19171,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 4);
         constants.insert(101, -4);
         backend.set_constants(constants);
@@ -19204,7 +19213,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::ref_op(2)], OpRef::NONE.raw()),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 8);
         constants.insert(101, 16);
         constants.insert(102, 8);
@@ -19248,7 +19257,7 @@ mod tests {
             ),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 8);
         constants.insert(101, 8);
         backend.set_constants(constants);
@@ -19309,7 +19318,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::int_op(3)], OpRef::NONE.raw()),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 4);
         constants.insert(101, 8);
         constants.insert(102, 4);
@@ -19349,7 +19358,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 0);
         backend.set_constants(constants);
 
@@ -19394,7 +19403,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::float_op(2)], OpRef::NONE.raw()),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 2);
         backend.set_constants(constants);
 
@@ -19443,7 +19452,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::int_op(3)], OpRef::NONE.raw()),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 2);
         constants.insert(101, 8);
         backend.set_constants(constants);
@@ -19580,7 +19589,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 0i64); // guard: x > 0
         constants.insert(101, 2i64); // x * 2
         backend.set_constants(constants);
@@ -19606,7 +19615,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
 
-        let mut bridge_constants = HashMap::new();
+        let mut bridge_constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         bridge_constants.insert(100, 100i64);
         backend.set_constants(bridge_constants);
 
@@ -19710,7 +19719,7 @@ mod tests {
             OpRef::NONE.raw(),
         );
         // Explicit fail_args: save both i0 and i1 plus the computed sum (i0+i1)
-        guard_op.fail_args = Some(smallvec::SmallVec::from_slice(&[
+        guard_op.setfailargs(smallvec::SmallVec::from_slice(&[
             OpRef::input_arg_int(0),
             OpRef::input_arg_int(1),
         ]));
@@ -19757,7 +19766,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::int_op(3)], OpRef::NONE.raw()),
         ];
 
-        let mut bridge_constants = HashMap::new();
+        let mut bridge_constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         bridge_constants.insert(100, 1000i64);
         backend.set_constants(bridge_constants);
 
@@ -19805,7 +19814,7 @@ mod tests {
             &[OpRef::input_arg_int(0)],
             OpRef::NONE.raw(),
         );
-        guard_op.fail_args = Some(smallvec::SmallVec::from_slice(&[
+        guard_op.setfailargs(smallvec::SmallVec::from_slice(&[
             OpRef::input_arg_float(1),
             OpRef::input_arg_ref(2),
         ]));
@@ -19855,7 +19864,7 @@ mod tests {
             &[OpRef::input_arg_int(0)],
             OpRef::NONE.raw(),
         );
-        guard_op.fail_args = Some(smallvec::SmallVec::from_slice(&[
+        guard_op.setfailargs(smallvec::SmallVec::from_slice(&[
             OpRef::input_arg_int(0),
             OpRef::input_arg_ref(1),
             OpRef::input_arg_float(2),
@@ -19924,7 +19933,7 @@ mod tests {
             ),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 4);
         constants.insert(101, 8);
         constants.insert(102, 1);
@@ -19985,7 +19994,7 @@ mod tests {
             ),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 4);
         constants.insert(101, 4);
         backend.set_constants(constants);
@@ -20051,7 +20060,7 @@ mod tests {
         let descr = make_call_descr(vec![Type::Ref, Type::Int], Type::Void);
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let mut guard_op = mk_op(OpCode::GuardNotForced, &[], OpRef::NONE.raw());
-        guard_op.fail_args = Some(smallvec::SmallVec::from_slice(&[
+        guard_op.setfailargs(smallvec::SmallVec::from_slice(&[
             OpRef::input_arg_int(1),
             OpRef::input_arg_int(0),
         ]));
@@ -20080,7 +20089,7 @@ mod tests {
             ),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(
             100,
             maybe_force_and_return_void as *const () as usize as i64,
@@ -20127,7 +20136,7 @@ mod tests {
         let descr = make_call_descr(vec![Type::Ref, Type::Int], Type::Void);
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let mut guard_op = mk_op(OpCode::GuardNotForced, &[], OpRef::NONE.raw());
-        guard_op.fail_args = Some(smallvec::SmallVec::from_slice(&[
+        guard_op.setfailargs(smallvec::SmallVec::from_slice(&[
             OpRef::input_arg_int(1),
             OpRef::input_arg_int(0),
         ]));
@@ -20156,7 +20165,7 @@ mod tests {
             ),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(
             100,
             maybe_force_and_return_void as *const () as usize as i64,
@@ -20202,7 +20211,7 @@ mod tests {
         let descr = make_call_descr(vec![Type::Ref, Type::Int], Type::Int);
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let mut guard_op = mk_op(OpCode::GuardNotForced, &[], OpRef::NONE.raw());
-        guard_op.fail_args = Some(smallvec::SmallVec::from_slice(&[
+        guard_op.setfailargs(smallvec::SmallVec::from_slice(&[
             OpRef::input_arg_int(1),
             OpRef::int_op(3),
             OpRef::input_arg_int(0),
@@ -20229,7 +20238,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::int_op(4)], OpRef::NONE.raw()),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(
             100,
             maybe_force_and_return_int_isolated as *const () as usize as i64,
@@ -20261,7 +20270,7 @@ mod tests {
         let descr = make_call_descr(vec![Type::Ref, Type::Int], Type::Int);
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let mut guard_op = mk_op(OpCode::GuardNotForced, &[], OpRef::NONE.raw());
-        guard_op.fail_args = Some(smallvec::SmallVec::from_slice(&[
+        guard_op.setfailargs(smallvec::SmallVec::from_slice(&[
             OpRef::input_arg_int(1),
             OpRef::int_op(3),
             OpRef::input_arg_int(0),
@@ -20287,7 +20296,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::int_op(3)], OpRef::NONE.raw()),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, maybe_force_and_return_int as *const () as usize as i64);
         backend.set_constants(constants);
 
@@ -20332,7 +20341,7 @@ mod tests {
         let descr = make_call_descr(vec![Type::Ref, Type::Int], Type::Float);
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let mut guard_op = mk_op(OpCode::GuardNotForced, &[], OpRef::NONE.raw());
-        guard_op.fail_args = Some(smallvec::SmallVec::from_slice(&[
+        guard_op.setfailargs(smallvec::SmallVec::from_slice(&[
             OpRef::input_arg_int(1),
             OpRef::float_op(3),
             OpRef::input_arg_int(0),
@@ -20358,7 +20367,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::float_op(3)], OpRef::NONE.raw()),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(
             100,
             maybe_force_and_return_float as *const () as usize as i64,
@@ -20406,7 +20415,7 @@ mod tests {
             ),
             mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
-        let mut callee_constants = HashMap::new();
+        let mut callee_constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         callee_constants.insert(100, 2);
         backend.set_constants(callee_constants);
 
@@ -20426,7 +20435,7 @@ mod tests {
             ),
             mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
-        backend.set_constants(HashMap::new());
+        backend.set_constants(majit_ir::VecAssoc::new());
 
         let mut caller_token = JitCellToken::new(1500_201);
         backend
@@ -20508,14 +20517,14 @@ mod tests {
             ),
             mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 7);
         backend.set_constants(constants);
         backend
             .compile_loop(&callee_inputargs, &callee_ops, &mut deferred_target)
             .unwrap();
 
-        backend.set_constants(HashMap::new());
+        backend.set_constants(majit_ir::VecAssoc::new());
         let frame = backend.execute_token(&caller, &[Value::Int(5)]);
         assert_eq!(backend.get_int_value(&frame, 0), 12);
     }
@@ -20552,7 +20561,7 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-        backend.set_constants(HashMap::new());
+        backend.set_constants(majit_ir::VecAssoc::new());
         backend
             .compile_loop(&callee_inputargs, &callee_ops, &mut deferred_target)
             .unwrap();
@@ -20590,7 +20599,7 @@ mod tests {
         backend.set_next_trace_id(1500_247);
         let callee_inputargs = vec![InputArg::new_int(0)];
         let mut guard_op = mk_op(OpCode::GuardNotForced2, &[], OpRef::NONE.raw());
-        guard_op.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::int_op(1)]));
+        guard_op.setfailargs(smallvec::SmallVec::from_slice(&[OpRef::int_op(1)]));
         let callee_ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
@@ -20602,7 +20611,7 @@ mod tests {
             guard_op,
             mk_op(OpCode::Finish, &[OpRef::ref_op(2)], OpRef::NONE.raw()),
         ];
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 10);
         backend.set_constants(constants);
         let err = backend
@@ -20635,7 +20644,7 @@ mod tests {
             .unwrap();
 
         let mut guard_op = mk_op(OpCode::GuardNotForced2, &[], OpRef::NONE.raw());
-        guard_op.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::ref_op(1)]));
+        guard_op.setfailargs(smallvec::SmallVec::from_slice(&[OpRef::ref_op(1)]));
         let force_token_ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
             mk_op(OpCode::ForceToken, &[], 1),
@@ -20678,7 +20687,7 @@ mod tests {
         let mut backend = CraneliftBackend::new();
 
         let inputargs = vec![InputArg::new_int(0)];
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 1);
         constants.insert(101, 0);
         backend.set_constants(constants);
@@ -20723,7 +20732,7 @@ mod tests {
         assert_eq!(failed_descr.fail_index(), guard_fd.fail_index());
         assert_eq!(guard_fd.fail_count(), 1);
 
-        backend.set_constants(HashMap::new());
+        backend.set_constants(majit_ir::VecAssoc::new());
         let bridge_ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
@@ -20760,7 +20769,7 @@ mod tests {
         {
             let mut backend = CraneliftBackend::new();
             let inputargs = vec![InputArg::new_int(0)];
-            let mut constants = HashMap::new();
+            let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
             constants.insert(100, 1);
             constants.insert(101, 0);
             backend.set_constants(constants);
@@ -20793,7 +20802,7 @@ mod tests {
             let failed = backend.execute_token(&token, &[Value::Int(0)]);
             let guard_descr = get_latest_descr_from_deadframe(&failed)
                 .expect("base-case guard should produce a valid descr");
-            backend.set_constants(HashMap::new());
+            backend.set_constants(majit_ir::VecAssoc::new());
             let bridge_ops = vec![
                 mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
                 mk_op(
@@ -20838,14 +20847,14 @@ mod tests {
             ),
             mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 7);
         backend.set_constants(constants);
         backend
             .compile_loop(&callee_inputargs, &callee_ops, &mut deferred_target)
             .unwrap();
 
-        backend.set_constants(HashMap::new());
+        backend.set_constants(majit_ir::VecAssoc::new());
         let frame = backend.execute_token(&caller, &[Value::Int(5)]);
         assert_eq!(backend.get_int_value(&frame, 0), 12);
     }
@@ -20883,7 +20892,7 @@ mod tests {
 
         let inputargs = vec![InputArg::new_int(0)];
         let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(1)], OpRef::NONE.raw());
-        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(0)]));
+        guard.setfailargs(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(0)]));
         let root_ops = vec![
             mk_op_with_descr(
                 OpCode::Label,
@@ -20904,7 +20913,7 @@ mod tests {
             ),
         ];
 
-        let mut root_constants = HashMap::new();
+        let mut root_constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         root_constants.insert(100, 0);
         backend.set_constants(root_constants);
 
@@ -20917,7 +20926,7 @@ mod tests {
         let guard_descr =
             get_latest_descr_from_deadframe(&failed).expect("guard should produce a descr");
 
-        let mut bridge_constants = HashMap::new();
+        let mut bridge_constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         bridge_constants.insert(101, 5);
         backend.set_constants(bridge_constants);
         let bridge_ops = vec![
@@ -20938,7 +20947,7 @@ mod tests {
             .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, &[], None)
             .unwrap();
 
-        backend.set_constants(HashMap::new());
+        backend.set_constants(majit_ir::VecAssoc::new());
         let frame = backend.execute_token(&token, &[Value::Int(0)]);
         let descr = backend.get_latest_descr(&frame);
         assert!(descr.is_finish());
@@ -20957,7 +20966,7 @@ mod tests {
 
         let inputargs = vec![InputArg::new_int(0)];
         let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(1)], OpRef::NONE.raw());
-        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(0)]));
+        guard.setfailargs(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(0)]));
         let root_ops = vec![
             mk_op_with_descr(
                 OpCode::Label,
@@ -20978,7 +20987,7 @@ mod tests {
             ),
         ];
 
-        let mut root_constants = HashMap::new();
+        let mut root_constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         root_constants.insert(100, 0);
         backend.set_constants(root_constants);
 
@@ -20991,7 +21000,7 @@ mod tests {
         let guard_descr =
             get_latest_descr_from_deadframe(&failed).expect("guard should produce a descr");
 
-        let mut bridge_constants = HashMap::new();
+        let mut bridge_constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         bridge_constants.insert(101, 5);
         bridge_constants.insert(102, 1);
         backend.set_constants(bridge_constants);
@@ -21014,7 +21023,7 @@ mod tests {
             .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, &[], None)
             .unwrap();
 
-        backend.set_constants(HashMap::new());
+        backend.set_constants(majit_ir::VecAssoc::new());
         let frame = backend.execute_token(&token, &[Value::Int(0)]);
         let descr = backend.get_latest_descr(&frame);
         assert!(descr.is_finish());
@@ -21034,7 +21043,7 @@ mod tests {
             InputArg::new_ref(2),
         ];
         let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(4)], OpRef::NONE.raw());
-        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[
+        guard.setfailargs(smallvec::SmallVec::from_slice(&[
             OpRef::input_arg_ref(0),
             OpRef::input_arg_int(1),
             OpRef::input_arg_ref(2),
@@ -21061,7 +21070,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::ref_op(3)], OpRef::NONE.raw()),
         ];
 
-        let mut root_constants = HashMap::new();
+        let mut root_constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         root_constants.insert(100, 0);
         backend.set_constants(root_constants);
 
@@ -21081,7 +21090,7 @@ mod tests {
         let guard_descr =
             get_latest_descr_from_deadframe(&failed).expect("guard should produce a descr");
 
-        let mut bridge_constants = HashMap::new();
+        let mut bridge_constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         bridge_constants.insert(101, 5);
         backend.set_constants(bridge_constants);
         let bridge_ops = vec![
@@ -21116,7 +21125,7 @@ mod tests {
             .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, &[], None)
             .unwrap();
 
-        backend.set_constants(HashMap::new());
+        backend.set_constants(majit_ir::VecAssoc::new());
         let frame = backend.execute_token(
             &token,
             &[Value::Ref(GcRef(0)), Value::Int(77), Value::Ref(old_ref)],
@@ -21135,7 +21144,7 @@ mod tests {
 
         let inputargs = vec![InputArg::new_int(0)];
         let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(1)], OpRef::NONE.raw());
-        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(0)]));
+        guard.setfailargs(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(0)]));
         let root_ops = vec![
             mk_op_with_descr(
                 OpCode::Label,
@@ -21169,7 +21178,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::int_op(3)], OpRef::NONE.raw()),
         ];
 
-        let mut root_constants = HashMap::new();
+        let mut root_constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         root_constants.insert(100, 0);
         root_constants.insert(101, 10);
         backend.set_constants(root_constants);
@@ -21183,7 +21192,7 @@ mod tests {
         let guard_descr =
             get_latest_descr_from_deadframe(&failed).expect("guard should produce a descr");
 
-        let mut bridge_constants = HashMap::new();
+        let mut bridge_constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         bridge_constants.insert(102, 5);
         backend.set_constants(bridge_constants);
         let bridge_ops = vec![
@@ -21204,7 +21213,7 @@ mod tests {
             .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, &[], None)
             .unwrap();
 
-        backend.set_constants(HashMap::new());
+        backend.set_constants(majit_ir::VecAssoc::new());
         let frame = backend.execute_token(&token, &[Value::Int(0)]);
         let descr = backend.get_latest_descr(&frame);
         assert!(descr.is_finish());
@@ -21221,7 +21230,7 @@ mod tests {
 
         let inputargs = vec![InputArg::new_int(0)];
         let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(1)], OpRef::NONE.raw());
-        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(0)]));
+        guard.setfailargs(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(0)]));
         let root_ops = vec![
             mk_op_with_descr(
                 OpCode::Label,
@@ -21268,7 +21277,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::int_op(5)], OpRef::NONE.raw()),
         ];
 
-        let mut root_constants = HashMap::new();
+        let mut root_constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         root_constants.insert(100, 0);
         root_constants.insert(101, 10);
         root_constants.insert(102, 20);
@@ -21283,7 +21292,7 @@ mod tests {
         let guard_descr =
             get_latest_descr_from_deadframe(&failed).expect("guard should produce a descr");
 
-        let mut bridge_constants = HashMap::new();
+        let mut bridge_constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         bridge_constants.insert(103, 5);
         backend.set_constants(bridge_constants);
         let bridge_ops = vec![
@@ -21304,7 +21313,7 @@ mod tests {
             .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, &[], None)
             .unwrap();
 
-        backend.set_constants(HashMap::new());
+        backend.set_constants(majit_ir::VecAssoc::new());
         let frame = backend.execute_token(&token, &[Value::Int(0)]);
         let descr = backend.get_latest_descr(&frame);
         assert!(descr.is_finish());
@@ -21361,7 +21370,7 @@ mod tests {
                 start_descr,
             ),
         ];
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 1);
         backend.set_constants(constants);
 
@@ -21439,7 +21448,7 @@ mod tests {
         let mut backend = make_gc_backend();
         // Constants: 10000=32(size), 10001=-8(tid_ofs), 10002=7(tid),
         // 10003=8(word), 10004=0(vtable_ofs), 10005=0xDEAD(vtable)
-        let mut consts = HashMap::new();
+        let mut consts: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         consts.insert(10000, 32_i64);
         consts.insert(10001, -8_i64);
         consts.insert(10002, 7_i64);
@@ -21489,7 +21498,7 @@ mod tests {
         let mut backend = make_gc_backend();
         // Constants: 10000=56(total_size), 10001=-8(tid_ofs), 10002=1(tid1),
         // 10003=8(word), 10004=24(incr), 10005=2(tid2)
-        let mut consts = HashMap::new();
+        let mut consts: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         consts.insert(10000, 56_i64);
         consts.insert(10001, -8_i64);
         consts.insert(10002, 1_i64);
@@ -21551,7 +21560,7 @@ mod tests {
     fn test_gc_varsize_alloc_and_length_init_with_configured_runtime() {
         let mut backend = make_gc_backend();
         // Constants: 10000=0(len_ofs), 10001=8(size), 10002=0(kind), 10003=8(itemsize)
-        let mut consts = HashMap::new();
+        let mut consts: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         consts.insert(10000, 0_i64);
         consts.insert(10001, 8_i64);
         consts.insert(10002, 0_i64); // FLAG_ARRAY
@@ -21598,7 +21607,7 @@ mod tests {
     #[test]
     fn test_gc_call_malloc_array_helper_with_configured_runtime() {
         let mut backend = make_gc_backend();
-        let mut consts = HashMap::new();
+        let mut consts: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         consts.insert(10000, gc_malloc_array_helper as *const () as i64);
         consts.insert(10001, 8_i64);
         consts.insert(10002, 7_i64);
@@ -21715,13 +21724,13 @@ mod tests {
         //   p2 = call_malloc_nursery(size)  # this overflows
         //   guard_nonnull(p2, descr=faildescr) [p0, p1, p2]
         //   finish(p2, descr=finaldescr)
-        let mut consts = HashMap::new();
+        let mut consts: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         consts.insert(10000, alloc_size as i64);
         backend.set_constants(consts);
         let size_arg = OpRef::int_op(10000);
         let inputargs = vec![];
         let mut guard = mk_op(OpCode::GuardNonnull, &[OpRef::ref_op(2)], OpRef::NONE.raw());
-        guard.fail_args = Some(smallvec::smallvec![
+        guard.setfailargs(smallvec::smallvec![
             OpRef::ref_op(0),
             OpRef::ref_op(1),
             OpRef::ref_op(2)
@@ -21800,7 +21809,7 @@ mod tests {
         ];
 
         let mut token = JitCellToken::new(1505_1);
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 111);
         constants.insert(101, 222);
         backend.set_constants(constants);
@@ -21869,7 +21878,7 @@ mod tests {
             ),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 777);
         backend.set_constants(constants);
 
@@ -21898,26 +21907,27 @@ mod tests {
         // ref_!(Newstr,...))) — the str pointer references must use the
         // Ref-typed OpRef variant.
         let str0 = OpRef::ref_op(0);
+        let op = |oc, args: &[OpRef]| std::rc::Rc::new(Op::new(oc, args));
         let ops = vec![
-            Op::new(OpCode::Newstr, &[OpRef::int_op(100)]),
-            Op::new(
+            op(OpCode::Newstr, &[OpRef::int_op(100)]),
+            op(
                 OpCode::Strsetitem,
                 &[str0, OpRef::int_op(101), OpRef::int_op(200)],
             ),
-            Op::new(
+            op(
                 OpCode::Strsetitem,
                 &[str0, OpRef::int_op(102), OpRef::int_op(201)],
             ),
-            Op::new(
+            op(
                 OpCode::Strsetitem,
                 &[str0, OpRef::int_op(103), OpRef::int_op(202)],
             ),
-            Op::new(OpCode::Strgetitem, &[str0, OpRef::int_op(102)]),
-            Op::new(OpCode::Strlen, &[str0]),
-            Op::new(OpCode::Finish, &[OpRef::int_op(4), OpRef::int_op(5)]),
+            op(OpCode::Strgetitem, &[str0, OpRef::int_op(102)]),
+            op(OpCode::Strlen, &[str0]),
+            op(OpCode::Finish, &[OpRef::int_op(4), OpRef::int_op(5)]),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 3);
         constants.insert(101, 0);
         constants.insert(102, 1);
@@ -21946,18 +21956,19 @@ mod tests {
         // pointers; both must reference back as Ref-typed OpRefs.
         let src = OpRef::ref_op(0);
         let dst = OpRef::ref_op(3);
+        let op = |oc, args: &[OpRef]| std::rc::Rc::new(Op::new(oc, args));
         let ops = vec![
-            Op::new(OpCode::Newstr, &[OpRef::int_op(100)]),
-            Op::new(
+            op(OpCode::Newstr, &[OpRef::int_op(100)]),
+            op(
                 OpCode::Strsetitem,
                 &[src, OpRef::int_op(101), OpRef::int_op(200)],
             ),
-            Op::new(
+            op(
                 OpCode::Strsetitem,
                 &[src, OpRef::int_op(102), OpRef::int_op(201)],
             ),
-            Op::new(OpCode::Newstr, &[OpRef::int_op(100)]),
-            Op::new(
+            op(OpCode::Newstr, &[OpRef::int_op(100)]),
+            op(
                 OpCode::Copystrcontent,
                 &[
                     src,
@@ -21967,11 +21978,11 @@ mod tests {
                     OpRef::int_op(100),
                 ],
             ),
-            Op::new(OpCode::Strgetitem, &[dst, OpRef::int_op(102)]),
-            Op::new(OpCode::Finish, &[OpRef::int_op(5)]),
+            op(OpCode::Strgetitem, &[dst, OpRef::int_op(102)]),
+            op(OpCode::Finish, &[OpRef::int_op(5)]),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 2);
         constants.insert(101, 0);
         constants.insert(102, 1);
@@ -21996,18 +22007,19 @@ mod tests {
         // ref_!(...,Newunicode,...))) — references to the unicode
         // pointer use the Ref-typed OpRef variant.
         let buf = OpRef::ref_op(0);
+        let op = |oc, args: &[OpRef]| std::rc::Rc::new(Op::new(oc, args));
         let ops = vec![
-            Op::new(OpCode::Newunicode, &[OpRef::int_op(100)]),
-            Op::new(
+            op(OpCode::Newunicode, &[OpRef::int_op(100)]),
+            op(
                 OpCode::Unicodesetitem,
                 &[buf, OpRef::int_op(101), OpRef::int_op(200)],
             ),
-            Op::new(OpCode::Unicodegetitem, &[buf, OpRef::int_op(101)]),
-            Op::new(OpCode::Unicodelen, &[buf]),
-            Op::new(OpCode::Finish, &[OpRef::int_op(2), OpRef::int_op(3)]),
+            op(OpCode::Unicodegetitem, &[buf, OpRef::int_op(101)]),
+            op(OpCode::Unicodelen, &[buf]),
+            op(OpCode::Finish, &[OpRef::int_op(2), OpRef::int_op(3)]),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 1);
         constants.insert(101, 0);
         constants.insert(200, 0x2603);
@@ -22026,21 +22038,22 @@ mod tests {
         let mut backend = CraneliftBackend::new();
 
         let inputargs = vec![InputArg::new_ref(0)];
+        let op = |oc, args: &[OpRef]| std::rc::Rc::new(Op::new(oc, args));
         let ops = vec![
-            Op::new(OpCode::Label, &[OpRef::input_arg_ref(0)]),
-            Op::new(OpCode::Strhash, &[OpRef::input_arg_ref(0)]),
-            Op::new(OpCode::Strlen, &[OpRef::input_arg_ref(0)]),
-            Op::new(
+            op(OpCode::Label, &[OpRef::input_arg_ref(0)]),
+            op(OpCode::Strhash, &[OpRef::input_arg_ref(0)]),
+            op(OpCode::Strlen, &[OpRef::input_arg_ref(0)]),
+            op(
                 OpCode::Strgetitem,
                 &[OpRef::input_arg_ref(0), OpRef::int_op(100)],
             ),
-            Op::new(
+            op(
                 OpCode::Finish,
                 &[OpRef::int_op(2), OpRef::int_op(3), OpRef::int_op(4)],
             ),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 1);
         backend.set_constants(constants);
 
@@ -22068,21 +22081,22 @@ mod tests {
         let mut backend = CraneliftBackend::new();
 
         let inputargs = vec![InputArg::new_ref(0)];
+        let op = |oc, args: &[OpRef]| std::rc::Rc::new(Op::new(oc, args));
         let ops = vec![
-            Op::new(OpCode::Label, &[OpRef::input_arg_ref(0)]),
-            Op::new(OpCode::Unicodehash, &[OpRef::input_arg_ref(0)]),
-            Op::new(OpCode::Unicodelen, &[OpRef::input_arg_ref(0)]),
-            Op::new(
+            op(OpCode::Label, &[OpRef::input_arg_ref(0)]),
+            op(OpCode::Unicodehash, &[OpRef::input_arg_ref(0)]),
+            op(OpCode::Unicodelen, &[OpRef::input_arg_ref(0)]),
+            op(
                 OpCode::Unicodegetitem,
                 &[OpRef::input_arg_ref(0), OpRef::int_op(100)],
             ),
-            Op::new(
+            op(
                 OpCode::Finish,
                 &[OpRef::int_op(2), OpRef::int_op(3), OpRef::int_op(4)],
             ),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 0);
         backend.set_constants(constants);
 
@@ -22137,7 +22151,7 @@ mod tests {
             ),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(
             100,
             collect_nursery_via_runtime as *const () as usize as i64,
@@ -22194,7 +22208,7 @@ mod tests {
             ),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(
             100,
             collect_nursery_via_runtime_void as *const () as usize as i64,
@@ -22324,9 +22338,9 @@ mod tests {
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
 
         // Build a guard with explicit fail_args so we can inspect them.
-        let mut guard_op = Op::new(OpCode::GuardNotInvalidated, &[]);
-        guard_op.pos = OpRef::int_op(OpRef::NONE.raw());
-        guard_op.fail_args = Some(smallvec::SmallVec::from_slice(&[
+        let guard_op = Op::new(OpCode::GuardNotInvalidated, &[]);
+        guard_op.pos.set(OpRef::int_op(OpRef::NONE.raw()));
+        guard_op.setfailargs(smallvec::SmallVec::from_slice(&[
             OpRef::input_arg_int(0),
             OpRef::input_arg_int(1),
         ]));
@@ -22337,7 +22351,7 @@ mod tests {
                 &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
                 OpRef::NONE.raw(),
             ),
-            guard_op,
+            std::rc::Rc::new(guard_op),
             mk_op(
                 OpCode::IntAdd,
                 &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
@@ -22376,10 +22390,9 @@ mod tests {
         // Loop: i = i + 1; guard_not_invalidated; guard i < limit; jump
         let inputargs = vec![InputArg::new_int(0)];
 
-        let mut guard_inv = Op::new(OpCode::GuardNotInvalidated, &[]);
-        guard_inv.pos = OpRef::int_op(OpRef::NONE.raw());
-        guard_inv.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::int_op(1)]));
-
+        let guard_inv = Op::new(OpCode::GuardNotInvalidated, &[]);
+        guard_inv.pos.set(OpRef::int_op(OpRef::NONE.raw()));
+        guard_inv.setfailargs(smallvec::SmallVec::from_slice(&[OpRef::int_op(1)]));
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
@@ -22387,13 +22400,13 @@ mod tests {
                 &[OpRef::input_arg_int(0), OpRef::int_op(100)],
                 1,
             ), // i = i + 1
-            guard_inv, // guard_not_invalidated
+            std::rc::Rc::new(guard_inv), // guard_not_invalidated
             mk_op(OpCode::IntLt, &[OpRef::int_op(1), OpRef::int_op(101)], 2), // i < 1000000
             mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw()),
             mk_op(OpCode::Jump, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 1i64);
         constants.insert(101, 1_000_000i64);
         backend.set_constants(constants);
@@ -22427,13 +22440,12 @@ mod tests {
 
         let inputargs = vec![InputArg::new_int(0)];
 
-        let mut guard_inv = Op::new(OpCode::GuardNotInvalidated, &[]);
-        guard_inv.pos = OpRef::int_op(OpRef::NONE.raw());
-        guard_inv.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(0)]));
-
+        let guard_inv = Op::new(OpCode::GuardNotInvalidated, &[]);
+        guard_inv.pos.set(OpRef::int_op(OpRef::NONE.raw()));
+        guard_inv.setfailargs(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(0)]));
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
-            guard_inv,
+            std::rc::Rc::new(guard_inv),
             mk_op(
                 OpCode::Finish,
                 &[OpRef::input_arg_int(0)],
@@ -22480,7 +22492,7 @@ mod tests {
             &[OpRef::input_arg_int(0)],
             OpRef::NONE.raw(),
         );
-        guard1.fail_args = Some(smallvec::SmallVec::from_slice(&[
+        guard1.setfailargs(smallvec::SmallVec::from_slice(&[
             OpRef::input_arg_int(0),
             OpRef::input_arg_int(1),
         ]));
@@ -22490,7 +22502,7 @@ mod tests {
             2,
         );
         let mut guard2 = mk_op(OpCode::GuardFalse, &[OpRef::int_op(2)], OpRef::NONE.raw());
-        guard2.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::int_op(2)]));
+        guard2.setfailargs(smallvec::SmallVec::from_slice(&[OpRef::int_op(2)]));
         let ops = vec![
             mk_op(
                 OpCode::Label,
@@ -22549,7 +22561,7 @@ mod tests {
             &[OpRef::input_arg_int(0)],
             OpRef::NONE.raw(),
         );
-        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[
+        guard.setfailargs(smallvec::SmallVec::from_slice(&[
             OpRef::input_arg_int(0),
             OpRef::input_arg_ref(1),
             OpRef::input_arg_float(2),
@@ -22601,7 +22613,7 @@ mod tests {
     #[test]
     fn test_all_opcodes_covered_in_backend() {
         let mut backend = CraneliftBackend::new();
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 42i64);
         constants.insert(101, 7i64);
         backend.set_constants(constants);
@@ -22617,7 +22629,7 @@ mod tests {
             mk_op(OpCode::IntGt, &[OpRef::int_op(1), OpRef::int_op(101)], 2),
             {
                 let mut g = mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw());
-                g.fail_args = Some(smallvec::smallvec![OpRef::input_arg_int(0)]);
+                g.setfailargs(smallvec::smallvec![OpRef::input_arg_int(0)]);
                 g
             },
             mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),

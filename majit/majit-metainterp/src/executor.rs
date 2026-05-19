@@ -3,8 +3,6 @@
 //! Mirrors RPython's `executor.py`: executes individual JIT IR operations
 //! by dispatching on the opcode and computing the result.
 
-use std::collections::HashMap;
-
 use majit_ir::{GcRef, Op, OpCode, OpRef};
 
 use crate::blackhole::ExceptionState;
@@ -35,7 +33,7 @@ fn read_typeid(obj_ptr: i64) -> Option<u32> {
 /// Op results (non-constant OpRef) → `results` Vec, direct indexed.
 /// Constants (constant-namespace OpRef) → `constants` Vec, indexed by const_index.
 ///
-/// Replaces `HashMap<u32, i64>` on the hot path with O(1) Vec indexing.
+/// Replaces `VecAssoc<u32, i64>` on the hot path with O(1) Vec indexing.
 pub(crate) struct TraceValues {
     /// Op results, indexed by OpRef.0 (operation namespace).
     pub results: Vec<i64>,
@@ -51,7 +49,7 @@ impl TraceValues {
         }
     }
 
-    pub fn from_hashmap(map: &HashMap<u32, i64>) -> Self {
+    pub fn from_vec_assoc(map: &crate::optimizeopt::vec_assoc::VecAssoc<u32, i64>) -> Self {
         // Index-keyed pool namespace probe (Slice P3 category E):
         // raw u32 keys carry the constant-namespace bit directly, so use
         // the bit-helpers rather than minting a typed `OpRef` solely
@@ -118,12 +116,12 @@ impl TraceValues {
 }
 
 /// Trait for resolving OpRef → i64 values in trace execution.
-/// Allows both HashMap (legacy) and TraceValues (fast) backends.
+/// Allows both VecAssoc (legacy) and TraceValues (fast) backends.
 pub(crate) trait ValueStore {
     fn resolve(&self, opref: OpRef) -> i64;
 }
 
-impl ValueStore for HashMap<u32, i64> {
+impl ValueStore for crate::optimizeopt::vec_assoc::VecAssoc<u32, i64> {
     #[inline(always)]
     fn resolve(&self, opref: OpRef) -> i64 {
         self.get(&opref.raw()).copied().unwrap_or(0)
@@ -154,8 +152,8 @@ pub(crate) fn execute_one(
     match op.opcode {
         // ── Control flow ──
         OpCode::Label => OpResult::Void,
-        OpCode::Finish => OpResult::Finish(op.args.to_vec()),
-        OpCode::Jump => OpResult::Jump(op.args.to_vec()),
+        OpCode::Finish => OpResult::Finish(op.getarglist().to_vec()),
+        OpCode::Jump => OpResult::Jump(op.getarglist().to_vec()),
 
         // ── Integer arithmetic ──
         OpCode::IntAdd => {
@@ -281,9 +279,9 @@ pub(crate) fn execute_one(
         }
         OpCode::IntBetween => {
             // int_between(a, b, c) => a <= b < c
-            let a = values.resolve(op.args[0]);
-            let b = values.resolve(op.args[1]);
-            let c = values.resolve(op.args[2]);
+            let a = values.resolve(op.arg(0));
+            let b = values.resolve(op.arg(1));
+            let c = values.resolve(op.arg(2));
             OpResult::Value((a <= b && b < c) as i64)
         }
 
@@ -457,7 +455,7 @@ pub(crate) fn execute_one(
             // Guard expects an exception of a specific class.
             // arg(0) is the expected exception class.
             if exc.is_pending() {
-                let expected_class = values.resolve(op.args[0]);
+                let expected_class = values.resolve(op.arg(0));
                 if exc.exc_class == expected_class {
                     // Match — return the exception value and clear exception state.
                     let (_, val) = exc.clear();
@@ -559,14 +557,14 @@ pub(crate) fn execute_one(
         }
         OpCode::RestoreException => {
             // Restore exception state from (class, value) args.
-            let cls = values.resolve(op.args[0]);
-            let val = values.resolve(op.args[1]);
+            let cls = values.resolve(op.arg(0));
+            let val = values.resolve(op.arg(1));
             exc.set(cls, val);
             OpResult::Void
         }
         OpCode::CheckMemoryError => {
             // If the allocation returned null, set a MemoryError exception.
-            let ptr = values.resolve(op.args[0]);
+            let ptr = values.resolve(op.arg(0));
             if ptr == 0 {
                 // Set a generic memory error (class=1 by convention).
                 exc.set(1, 0);
@@ -682,9 +680,11 @@ pub(crate) fn execute_one(
         | OpCode::GetfieldGcPureR
         | OpCode::GetfieldGcPureF => OpResult::Value(0),
         OpCode::SetfieldGc | OpCode::SetfieldRaw => {
-            let resolved_args: Vec<i64> = op.args.iter().map(|&r| values.resolve(r)).collect();
+            let resolved_args: Vec<i64> =
+                op.getarglist().iter().map(|&r| values.resolve(r)).collect();
             if let (Some(&obj_ptr), Some(&value)) = (resolved_args.first(), resolved_args.get(1)) {
-                if let Some(fd) = op.descr.as_ref().and_then(|d| d.as_field_descr()) {
+                let __descr_arc = op.getdescr();
+                if let Some(fd) = __descr_arc.as_ref().and_then(|d| d.as_field_descr()) {
                     let offset = fd.offset();
                     if obj_ptr != 0 {
                         unsafe {
@@ -718,11 +718,7 @@ pub(crate) fn execute_one(
         // IR blackhole may encounter New+SetfieldGc when the trace
         // contains unoptimized allocation (e.g. result_type=Ref finish).
         OpCode::New | OpCode::NewWithVtable => {
-            let size = op
-                .descr
-                .as_ref()
-                .and_then(|d| d.as_size_descr())
-                .map_or(16, |sd| sd.size());
+            let size = op.with_size_descr(|sd| sd.size()).unwrap_or(16);
             let layout = std::alloc::Layout::from_size_align(size, 8)
                 .unwrap_or(std::alloc::Layout::new::<[u8; 16]>());
             let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
@@ -918,7 +914,7 @@ pub(crate) fn execute_one(
         }
         OpCode::VecPackI | OpCode::VecPackF => {
             // pack(vec, scalar, lane, count) -> return scalar
-            let scalar = values.resolve(op.args[1]);
+            let scalar = values.resolve(op.arg(1));
             OpResult::Value(scalar)
         }
         OpCode::VecExpandI | OpCode::VecExpandF => {
@@ -975,33 +971,33 @@ pub(crate) fn execute_one(
 }
 
 pub(crate) fn binop(values: &(impl ValueStore + ?Sized), op: &Op) -> (i64, i64) {
-    let a = values.resolve(op.args[0]);
-    let b = values.resolve(op.args[1]);
+    let a = values.resolve(op.arg(0));
+    let b = values.resolve(op.arg(1));
     (a, b)
 }
 
 pub(crate) fn unop(values: &(impl ValueStore + ?Sized), op: &Op) -> i64 {
-    values.resolve(op.args[0])
+    values.resolve(op.arg(0))
 }
 
 pub(crate) fn same_as_value(values: &(impl ValueStore + ?Sized), op: &Op) -> i64 {
     if op.num_args() > 0 {
         unop(values, op)
-    } else if !op.pos.is_none() {
-        values.resolve(op.pos)
+    } else if !op.pos.get().is_none() {
+        values.resolve(op.pos.get())
     } else {
         0
     }
 }
 
 pub(crate) fn float_binop(values: &(impl ValueStore + ?Sized), op: &Op) -> (f64, f64) {
-    let a = f64::from_bits(values.resolve(op.args[0]) as u64);
-    let b = f64::from_bits(values.resolve(op.args[1]) as u64);
+    let a = f64::from_bits(values.resolve(op.arg(0)) as u64);
+    let b = f64::from_bits(values.resolve(op.arg(1)) as u64);
     (a, b)
 }
 
 pub(crate) fn float_unop(values: &(impl ValueStore + ?Sized), op: &Op) -> f64 {
-    f64::from_bits(values.resolve(op.args[0]) as u64)
+    f64::from_bits(values.resolve(op.arg(0)) as u64)
 }
 
 /// rpython/jit/metainterp/executor.py:524-528 `execute_varargs(cpu, metainterp, opnum, argboxes, descr)`.

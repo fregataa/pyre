@@ -7,7 +7,7 @@
 use smallvec::SmallVec;
 
 use crate::descr::DescrRef;
-use crate::value::{Const, GcRef, Type};
+use crate::value::{GcRef, Type};
 
 /// Index into an operation list, used as a reference to an operation's
 /// result. Variant-tagged enum mirroring RPython's `AbstractValue` class
@@ -984,14 +984,50 @@ pub trait BoxEnv {
     }
 }
 
+/// Shared-identity handle to an `Op`.
+///
+/// Mirrors RPython's object-identity model: `resoperation.py:250
+/// AbstractResOp` instances are plain Python objects, so every consumer
+/// (`history.py:528 TreeLoop.operations`, `optimizer.py:562 trace.next()`,
+/// short preamble export, resume metadata, backend input lists) reaches
+/// the **same** ResOperation object and reads/writes `_forwarded`
+/// through that shared identity.  Pyre's analog: every consumer holds
+/// the same `Rc<Op>` and reads/writes `forwarded`/`descr`/...  through
+/// the interior-mutable slots.
+///
+/// This alias is the migration target for `Vec<Op>` storage sites
+/// (BoxPool removal plan Slice 1).  Sites already migrated traffic in
+/// `OpRc`; the remaining `Vec<Op>` sites keep the legacy clone-on-copy
+/// shape until they are migrated and `BoxPool` retires (Slice 8).
+pub type OpRc = std::rc::Rc<Op>;
+
 /// A single IR operation.
-#[derive(Clone, Debug)]
+///
+/// Mirrors `rpython/jit/metainterp/resoperation.py:250` `AbstractResOp`.
+/// `forwarded` is the inline `_forwarded` slot from
+/// `resoperation.py:234` (`AbstractResOpOrInputArg._attrs_ =
+/// ('_forwarded',)`). Cloning resets the slot to `None` to match
+/// `copy_and_change` (`resoperation.py:323`).
+#[derive(Debug)]
 pub struct Op {
     pub opcode: OpCode,
-    pub args: SmallVec<[OpRef; 3]>,
-    pub descr: Option<DescrRef>,
-    /// Index of this op in the trace (set by the trace builder).
-    pub pos: OpRef,
+    /// `resoperation.py:281 AbstractResOp` operand list. `RefCell` so
+    /// `setarg` / `initarglist` can mutate through a shared `Op` reached
+    /// via `Rc<Op>` (BoxPool removal Slice 1 prep) — RPython writes
+    /// `op._args[i] = ...` on the same Python object the trace list,
+    /// optimizer state, and backend input lists all observe.
+    pub args: std::cell::RefCell<SmallVec<[OpRef; 3]>>,
+    /// `resoperation.py:460 ResOpWithDescr._descr` parity.  `RefCell`
+    /// so the optimizer can stamp a descr onto a shared `Op` reached
+    /// through `Rc<Op>` (BoxPool removal Slice 1 prep): RPython's
+    /// `op.setdescr(...)` writes through the same slot every observer
+    /// sees.
+    pub descr: std::cell::RefCell<Option<DescrRef>>,
+    /// Index of this op in the trace (set by the trace builder). `Cell`
+    /// so the position can be patched via `&Op` once the op is shared
+    /// (the trace-iterator finalizer and unroll's resume-position
+    /// retargeting both mutate `pos` after construction).
+    pub pos: std::cell::Cell<OpRef>,
     /// resoperation.py:1693 `opclasses[opnum].type` parity (Box.type intrinsic).
     /// Mirrors RPython's `op.type` class attribute set by `optypes[opnum]`
     /// (`resoperation.py:1597`). Populated at construction from
@@ -999,19 +1035,60 @@ pub struct Op {
     pub type_: Type,
     /// For guard ops: values to store in the dead frame on guard failure.
     /// Mirrors rpython/jit/metainterp/resoperation.py getfailargs/setfailargs.
-    /// If None, the backend falls back to storing input args.
-    pub fail_args: Option<SmallVec<[OpRef; 3]>>,
+    /// If None, the backend falls back to storing input args.  `RefCell` so
+    /// the optimizer can rewrite fail_args on a shared `Op` reached
+    /// through `Rc<Op>` (BoxPool removal Slice 1 prep): RPython writes
+    /// `op._fail_args = [...]` on the same Python object the trace list,
+    /// optimizer state, and backend input list all see.
+    pub fail_args: std::cell::RefCell<Option<SmallVec<[OpRef; 3]>>>,
     /// Types of fail_args, set by the optimizer from constant_types.
     /// When present, the backend uses these instead of inferring types.
-    pub fail_arg_types: Option<Vec<Type>>,
+    /// `RefCell` so the optimizer can stamp types onto a shared `Op`
+    /// reached through `Rc<Op>` (BoxPool removal Slice 1 prep): RPython
+    /// writes `op.fail_arg_types = [...]` on the same Python object the
+    /// trace/backend/short preamble all observe.
+    pub fail_arg_types: std::cell::RefCell<Option<Vec<Type>>>,
     /// resoperation.py: GuardResOp.rd_resume_position — index of the
     /// guard in the trace for resume data lookup. Set by unroll when
     /// creating extra guards from short preamble / virtual state.
-    /// -1 means unset.
-    pub rd_resume_position: i32,
+    /// -1 means unset. `Cell` so that mutators reachable via `&Op` (the
+    /// shared-trace identity model from `Vec<Rc<Op>>`) can update the
+    /// slot without requiring `&mut Op`.
+    pub rd_resume_position: std::cell::Cell<i32>,
     /// resoperation.py:156-200: VectorizationInfo — per-op vector metadata.
     /// Set by the vectorizer to track SIMD lane count, byte size, signedness.
-    pub vecinfo: Option<Box<VectorizationInfo>>,
+    /// `RefCell` so the vectorizer can stamp metadata onto a shared `Op`
+    /// reached through `Rc<Op>` (BoxPool removal Slice 1 prep): RPython's
+    /// `forwarded_vecinfo(op)` (schedule.py:479-486) writes through the
+    /// same `_vector_info` slot every observer sees.
+    pub vecinfo: std::cell::RefCell<Option<Box<VectorizationInfo>>>,
+    /// resoperation.py:234 `_forwarded` slot from
+    /// `AbstractResOpOrInputArg`. Carries forwarding targets and
+    /// analysis info during optimization. See
+    /// `crate::forwarded::Forwarded` for the slot variants.
+    pub forwarded: std::cell::RefCell<crate::forwarded::Forwarded>,
+}
+
+impl Clone for Op {
+    /// `resoperation.py:323` `copy_and_change` constructs a fresh
+    /// `ResOperation` whose `_forwarded` is the default (`None`). Pyre's
+    /// `Op::clone()` mirrors that contract — cloning an op produces a
+    /// fresh `Forwarded::None` slot rather than aliasing the source's
+    /// analysis state.
+    fn clone(&self) -> Self {
+        Op {
+            opcode: self.opcode,
+            args: std::cell::RefCell::new(self.args.borrow().clone()),
+            descr: std::cell::RefCell::new(self.descr.borrow().clone()),
+            pos: std::cell::Cell::new(self.pos.get()),
+            type_: self.type_,
+            fail_args: std::cell::RefCell::new(self.fail_args.borrow().clone()),
+            fail_arg_types: std::cell::RefCell::new(self.fail_arg_types.borrow().clone()),
+            rd_resume_position: std::cell::Cell::new(self.rd_resume_position.get()),
+            vecinfo: std::cell::RefCell::new(self.vecinfo.borrow().clone()),
+            forwarded: std::cell::RefCell::new(crate::forwarded::Forwarded::None),
+        }
+    }
 }
 
 /// resoperation.py:156-200: Per-op vector metadata for the vectorizer.
@@ -1080,41 +1157,49 @@ impl VectorizationInfo {
     }
 }
 
+impl AsRef<Op> for Op {
+    fn as_ref(&self) -> &Op {
+        self
+    }
+}
+
 impl Op {
     pub fn new(opcode: OpCode, args: &[OpRef]) -> Self {
         Op {
             opcode,
-            args: SmallVec::from_slice(args),
-            descr: None,
-            pos: OpRef::NONE,
+            args: std::cell::RefCell::new(SmallVec::from_slice(args)),
+            descr: std::cell::RefCell::new(None),
+            pos: std::cell::Cell::new(OpRef::NONE),
             type_: opcode.result_type(),
-            fail_args: None,
-            fail_arg_types: None,
-            rd_resume_position: -1,
-            vecinfo: None,
+            fail_args: std::cell::RefCell::new(None),
+            fail_arg_types: std::cell::RefCell::new(None),
+            rd_resume_position: std::cell::Cell::new(-1),
+            vecinfo: std::cell::RefCell::new(None),
+            forwarded: std::cell::RefCell::new(crate::forwarded::Forwarded::None),
         }
     }
 
     pub fn with_descr(opcode: OpCode, args: &[OpRef], descr: DescrRef) -> Self {
         Op {
             opcode,
-            args: SmallVec::from_slice(args),
-            descr: Some(descr),
-            pos: OpRef::NONE,
+            args: std::cell::RefCell::new(SmallVec::from_slice(args)),
+            descr: std::cell::RefCell::new(Some(descr)),
+            pos: std::cell::Cell::new(OpRef::NONE),
             type_: opcode.result_type(),
-            fail_args: None,
-            fail_arg_types: None,
-            rd_resume_position: -1,
-            vecinfo: None,
+            fail_args: std::cell::RefCell::new(None),
+            fail_arg_types: std::cell::RefCell::new(None),
+            rd_resume_position: std::cell::Cell::new(-1),
+            vecinfo: std::cell::RefCell::new(None),
+            forwarded: std::cell::RefCell::new(crate::forwarded::Forwarded::None),
         }
     }
 
     pub fn arg(&self, idx: usize) -> OpRef {
-        self.args[idx]
+        self.args.borrow()[idx]
     }
 
     pub fn num_args(&self) -> usize {
-        self.args.len()
+        self.args.borrow().len()
     }
 
     pub fn result_type(&self) -> Type {
@@ -1141,27 +1226,30 @@ impl Op {
     ) -> Op {
         let new_args: SmallVec<[OpRef; 3]> = match args {
             Some(a) => SmallVec::from_slice(a),
-            None => self.args.clone(),
+            None => self.args.borrow().clone(),
         };
         let new_descr = match descr {
             Some(d) => d,
-            None => self.descr.clone(),
+            None => self.descr.borrow().clone(),
         };
-        let mut newop = Op {
+        let newop = Op {
             opcode,
-            args: new_args,
-            descr: new_descr,
-            pos: self.pos,
+            args: std::cell::RefCell::new(new_args),
+            descr: std::cell::RefCell::new(new_descr),
+            pos: std::cell::Cell::new(self.pos.get()),
             type_: opcode.result_type(),
-            fail_args: None,
-            fail_arg_types: None,
-            rd_resume_position: -1,
+            fail_args: std::cell::RefCell::new(None),
+            fail_arg_types: std::cell::RefCell::new(None),
+            rd_resume_position: std::cell::Cell::new(-1),
             // resoperation.py:511-518 VectorOp/VectorGuardOp.copy_and_change
             // copy datatype/bytesize/signed/count from the source.  pyre
             // collapses VectorOp/VectorGuardOp into Op, so the same copy
             // happens unconditionally — None for scalar ops, Some(_) for
             // vector ops which is what RPython's Vector* subclasses do.
-            vecinfo: self.vecinfo.clone(),
+            vecinfo: std::cell::RefCell::new(self.vecinfo.borrow().clone()),
+            // resoperation.py:323 `ResOperation(opnum, args[:], descr)` —
+            // a freshly constructed op starts with `_forwarded = None`.
+            forwarded: std::cell::RefCell::new(crate::forwarded::Forwarded::None),
         };
         // resoperation.py:498-503 GuardResOp.copy_and_change:
         //   newop.setfailargs(self.getfailargs())
@@ -1171,38 +1259,40 @@ impl Op {
         // (compile.py:855 `_attrs_`); the descr Arc was already copied
         // above, so newop reads the same payload through descr.fail_descr().
         if opcode.is_guard() || self.opcode.is_guard() {
-            newop.fail_args = self.fail_args.clone();
-            newop.fail_arg_types = self.fail_arg_types.clone();
-            newop.rd_resume_position = self.rd_resume_position;
+            let mut newop = newop;
+            *newop.fail_args.borrow_mut() = self.fail_args.borrow().clone();
+            *newop.fail_arg_types.borrow_mut() = self.fail_arg_types.borrow().clone();
+            newop.rd_resume_position.set(self.rd_resume_position.get());
+            return newop;
         }
         newop
     }
 
-    /// `compile.py:849 ResumeGuardCopiedDescr.get_resumestorage(): return prev`
-    /// parity. Reads `rd_numb` from `op.descr` — `ResumeGuardCopiedDescr`
-    /// chases `prev` automatically.
-    pub fn resolved_rd_numb(&self) -> Option<&[u8]> {
-        self.descr.as_ref()?.as_fail_descr()?.rd_numb()
+    /// True iff the descr slot is populated. Matches
+    /// `op.getdescr() is not None`.
+    ///
+    /// This sits in `resoperation.rs` (rather than the sibling
+    /// `op_descr` module hosting the closure-bearing accessors) so the
+    /// build-script source analyzer that reads this file can resolve
+    /// the bool return type when callers in the same file write
+    /// `!op.has_descr()`.
+    pub fn has_descr(&self) -> bool {
+        self.descr.borrow().is_some()
     }
 
-    /// Same as `resolved_rd_numb` but for the `rd_consts` const pool.
-    pub fn resolved_rd_consts(&self) -> Option<&[Const]> {
-        self.descr.as_ref()?.as_fail_descr()?.rd_consts()
-    }
-
-    /// Same as `resolved_rd_numb` but for the `rd_virtuals` table.
-    pub fn resolved_rd_virtuals(&self) -> Option<&[std::rc::Rc<RdVirtualInfo>]> {
-        self.descr.as_ref()?.as_fail_descr()?.rd_virtuals()
-    }
-
-    /// Same as `resolved_rd_numb` but for the `rd_pendingfields` table.
-    pub fn resolved_rd_pendingfields(&self) -> Option<&[GuardPendingFieldEntry]> {
-        self.descr.as_ref()?.as_fail_descr()?.rd_pendingfields()
-    }
+    // `getdescr` / `setdescr` / `cleardescr` /
+    // `project_descr` / `with_*_descr` / `resolved_rd_*` /
+    // `getfailargs` / `setfailargs` / `getfailargs_copy` /
+    // `get_fail_arg_types` / `set_fail_arg_types` /
+    // `has_failargs` / `has_fail_arg_types` live in
+    // `crate::op_descr` so the closure-bearing accessors don't have to
+    // pass through the build-script source analyzer (which reads
+    // `resoperation.rs` for the `RdVirtualInfo` enum and chokes on
+    // `impl FnOnce` parameter types).
     /// compile.py: ResumeGuardDescr.store_final_boxes(guard_op, boxes, metainterp_sd)
     ///   guard_op.setfailargs(boxes)
     /// compile.py:874-876 store_final_boxes
-    pub fn store_final_boxes(&mut self, boxes: Vec<OpRef>) {
+    pub fn store_final_boxes(&self, boxes: Vec<OpRef>) {
         // optimizer.py:745-749: check no duplicates (debug only)
         #[cfg(debug_assertions)]
         {
@@ -1213,7 +1303,7 @@ impl Op {
                 }
             }
         }
-        self.fail_args = Some(boxes.into());
+        *self.fail_args.borrow_mut() = Some(boxes.into());
     }
 }
 
@@ -1221,14 +1311,14 @@ impl std::fmt::Display for Op {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.opcode.is_guard() {
             write!(f, "{:?}(", self.opcode)?;
-            for (i, arg) in self.args.iter().enumerate() {
+            for (i, arg) in self.getarglist().iter().enumerate() {
                 if i > 0 {
                     write!(f, ", ")?;
                 }
                 write!(f, "v{}", arg.raw())?;
             }
             write!(f, ")")?;
-            if let Some(ref fa) = self.fail_args {
+            if let Some(fa) = self.getfailargs() {
                 write!(f, " [")?;
                 for (i, arg) in fa.iter().enumerate() {
                     if i > 0 {
@@ -1240,8 +1330,8 @@ impl std::fmt::Display for Op {
             }
             Ok(())
         } else if self.result_type() != Type::Void {
-            write!(f, "v{} = {:?}(", self.pos.raw(), self.opcode)?;
-            for (i, arg) in self.args.iter().enumerate() {
+            write!(f, "v{} = {:?}(", self.pos.get().raw(), self.opcode)?;
+            for (i, arg) in self.getarglist().iter().enumerate() {
                 if i > 0 {
                     write!(f, ", ")?;
                 }
@@ -1250,7 +1340,7 @@ impl std::fmt::Display for Op {
             write!(f, ")")
         } else {
             write!(f, "{:?}(", self.opcode)?;
-            for (i, arg) in self.args.iter().enumerate() {
+            for (i, arg) in self.getarglist().iter().enumerate() {
                 if i > 0 {
                     write!(f, ", ")?;
                 }
@@ -1261,32 +1351,46 @@ impl std::fmt::Display for Op {
     }
 }
 
+/// Lookup-by-u32 abstraction so `format_trace` can accept any
+/// constant-pool shape (`HashMap<u32, V>`, `VecAssoc<u32, V>`, …)
+/// without prescribing the underlying container.
+pub trait ConstLookup<V> {
+    fn lookup(&self, key: u32) -> Option<&V>;
+}
+
+impl<V> ConstLookup<V> for std::collections::HashMap<u32, V> {
+    fn lookup(&self, key: u32) -> Option<&V> {
+        self.get(&key)
+    }
+}
+
 /// Format a trace (list of ops) with optional constants for debugging.
 ///
 /// Generic over the constants value type so both the optimizer-side
 /// typed `Value` pool and the backend-side legacy `i64` pool format
 /// uniformly through their `Debug` impls.
-pub fn format_trace<V: std::fmt::Debug>(
-    ops: &[Op],
-    constants: &std::collections::HashMap<u32, V>,
+pub fn format_trace<V: std::fmt::Debug, T: AsRef<Op>, C: ConstLookup<V>>(
+    ops: &[T],
+    constants: &C,
 ) -> String {
     use std::fmt::Write;
     let mut out = String::new();
     for op in ops {
+        let op: &Op = op.as_ref();
         // Replace known constants in display
         write!(out, "  ").unwrap();
         if op.opcode.is_guard() {
             write!(out, "{:?}(", op.opcode).unwrap();
         } else if op.type_ != Type::Void {
-            write!(out, "v{} = {:?}(", op.pos.raw(), op.opcode).unwrap();
+            write!(out, "v{} = {:?}(", op.pos.get().raw(), op.opcode).unwrap();
         } else {
             write!(out, "{:?}(", op.opcode).unwrap();
         }
-        for (i, arg) in op.args.iter().enumerate() {
+        for (i, arg) in op.getarglist().iter().enumerate() {
             if i > 0 {
                 write!(out, ", ").unwrap();
             }
-            if let Some(val) = constants.get(&arg.raw()) {
+            if let Some(val) = constants.lookup(arg.raw()) {
                 write!(out, "{val:?}").unwrap();
             } else {
                 write!(out, "v{}", arg.raw()).unwrap();
@@ -1294,19 +1398,19 @@ pub fn format_trace<V: std::fmt::Debug>(
         }
         write!(out, ")").unwrap();
         // Render descriptor if present (parity with RPython's logger repr_of_descr)
-        if let Some(ref descr) = op.descr {
+        if let Some(descr) = op.getdescr() {
             let repr = descr.repr();
             if !repr.is_empty() {
                 write!(out, " descr=<{repr}>").unwrap();
             }
         }
-        if let Some(ref fa) = op.fail_args {
+        if let Some(fa) = op.getfailargs() {
             write!(out, " [").unwrap();
             for (i, arg) in fa.iter().enumerate() {
                 if i > 0 {
                     write!(out, ", ").unwrap();
                 }
-                if let Some(val) = constants.get(&arg.raw()) {
+                if let Some(val) = constants.lookup(arg.raw()) {
                     write!(out, "{val:?}").unwrap();
                 } else {
                     write!(out, "v{}", arg.raw()).unwrap();
@@ -3100,7 +3204,10 @@ mod tests {
             let mut __op = Op {
                 $($field)*
                 type_: Type::Void,
-                vecinfo: None,
+                vecinfo: std::cell::RefCell::new(None),
+                forwarded: std::cell::RefCell::new(
+                    crate::forwarded::Forwarded::None,
+                ),
             };
             __op.type_ = __op.opcode.result_type();
             __op
@@ -3945,11 +4052,11 @@ mod tests {
         let rhs = OpRef::int_op(1);
         let op = Op::new(OpCode::IntAdd, &[lhs, rhs]);
         assert_eq!(op.opcode, OpCode::IntAdd);
-        assert_eq!(op.args.len(), 2);
-        assert_eq!(op.args[0], lhs);
-        assert_eq!(op.args[1], rhs);
-        assert!(op.descr.is_none());
-        assert!(op.fail_args.is_none());
+        assert_eq!(op.num_args(), 2);
+        assert_eq!(op.arg(0), lhs);
+        assert_eq!(op.arg(1), rhs);
+        assert!(op.getdescr().is_none());
+        assert!(op.getfailargs().is_none());
         assert_eq!(op.result_type(), Type::Int);
         assert_eq!(op.num_args(), 2);
     }
@@ -4164,34 +4271,34 @@ mod tests {
         let ops = vec![
             op! {
                 opcode: OpCode::IntAdd,
-                args: smallvec::smallvec![OpRef::int_op(1), OpRef::int_op(2)],
-                descr: None,
-                pos: OpRef::int_op(3),
-                fail_args: None,
+                args: std::cell::RefCell::new(smallvec::smallvec![OpRef::int_op(1), OpRef::int_op(2)]),
+                descr: std::cell::RefCell::new(None),
+                pos: std::cell::Cell::new(OpRef::int_op(3)),
+                fail_args: std::cell::RefCell::new(None),
 
-                fail_arg_types: None,
-                rd_resume_position: -1,
+                fail_arg_types: std::cell::RefCell::new(None),
+                rd_resume_position: std::cell::Cell::new(-1),
             },
             op! {
                 opcode: OpCode::IntAdd,
-                args: smallvec::smallvec![OpRef::int_op(3), OpRef::int_op(10_000)],
-                descr: None,
-                pos: OpRef::int_op(4),
-                fail_args: None,
+                args: std::cell::RefCell::new(smallvec::smallvec![OpRef::int_op(3), OpRef::int_op(10_000)]),
+                descr: std::cell::RefCell::new(None),
+                pos: std::cell::Cell::new(OpRef::int_op(4)),
+                fail_args: std::cell::RefCell::new(None),
 
-                fail_arg_types: None,
-                rd_resume_position: -1,
+                fail_arg_types: std::cell::RefCell::new(None),
+                rd_resume_position: std::cell::Cell::new(-1),
             },
             op! {
                 opcode: OpCode::Jump,
-                args: smallvec::smallvec![OpRef::int_op(0), OpRef::int_op(4), OpRef::int_op(3)],
-                descr: None,
-                pos: OpRef::NONE,
-                fail_args: None,
+                args: std::cell::RefCell::new(smallvec::smallvec![OpRef::int_op(0), OpRef::int_op(4), OpRef::int_op(3)]),
+                descr: std::cell::RefCell::new(None),
+                pos: std::cell::Cell::new(OpRef::NONE),
+                fail_args: std::cell::RefCell::new(None),
 
 
-                fail_arg_types: None,
-                rd_resume_position: -1,
+                fail_arg_types: std::cell::RefCell::new(None),
+                rd_resume_position: std::cell::Cell::new(-1),
             },
         ];
         let mut constants = std::collections::HashMap::new();
@@ -4206,13 +4313,13 @@ mod tests {
     fn test_op_display_int_result() {
         let op = op! {
             opcode: OpCode::IntAdd,
-            args: smallvec::smallvec![OpRef::int_op(1), OpRef::int_op(2)],
-            descr: None,
-            pos: OpRef::int_op(6),
-            fail_args: None,
+            args: std::cell::RefCell::new(smallvec::smallvec![OpRef::int_op(1), OpRef::int_op(2)]),
+            descr: std::cell::RefCell::new(None),
+            pos: std::cell::Cell::new(OpRef::int_op(6)),
+            fail_args: std::cell::RefCell::new(None),
 
-            fail_arg_types: None,
-            rd_resume_position: -1,
+            fail_arg_types: std::cell::RefCell::new(None),
+            rd_resume_position: std::cell::Cell::new(-1),
         };
         let s = format!("{op}");
         assert_eq!(s, "v6 = IntAdd(v1, v2)");
@@ -4222,13 +4329,13 @@ mod tests {
     fn test_op_display_void() {
         let op = op! {
             opcode: OpCode::SetfieldGc,
-            args: smallvec::smallvec![OpRef::int_op(0), OpRef::int_op(1)],
-            descr: None,
-            pos: OpRef::NONE,
-            fail_args: None,
+            args: std::cell::RefCell::new(smallvec::smallvec![OpRef::int_op(0), OpRef::int_op(1)]),
+            descr: std::cell::RefCell::new(None),
+            pos: std::cell::Cell::new(OpRef::NONE),
+            fail_args: std::cell::RefCell::new(None),
 
-            fail_arg_types: None,
-            rd_resume_position: -1,
+            fail_arg_types: std::cell::RefCell::new(None),
+            rd_resume_position: std::cell::Cell::new(-1),
         };
         let s = format!("{op}");
         assert_eq!(s, "SetfieldGc(v0, v1)");
@@ -4238,14 +4345,14 @@ mod tests {
     fn test_op_display_guard_with_fail_args() {
         let op = op! {
             opcode: OpCode::GuardTrue,
-            args: smallvec::smallvec![OpRef::int_op(0)],
-            descr: None,
-            pos: OpRef::NONE,
-            fail_args: Some(smallvec::smallvec![OpRef::int_op(0), OpRef::int_op(1)]),
+            args: std::cell::RefCell::new(smallvec::smallvec![OpRef::int_op(0)]),
+            descr: std::cell::RefCell::new(None),
+            pos: std::cell::Cell::new(OpRef::NONE),
+            fail_args: std::cell::RefCell::new(Some(smallvec::smallvec![OpRef::int_op(0), OpRef::int_op(1)])),
 
 
-            fail_arg_types: None,
-            rd_resume_position: -1,
+            fail_arg_types: std::cell::RefCell::new(None),
+            rd_resume_position: std::cell::Cell::new(-1),
         };
         let s = format!("{op}");
         assert_eq!(s, "GuardTrue(v0) [v0, v1]");
@@ -4255,13 +4362,13 @@ mod tests {
     fn test_op_display_guard_without_fail_args() {
         let op = op! {
             opcode: OpCode::GuardTrue,
-            args: smallvec::smallvec![OpRef::int_op(0)],
-            descr: None,
-            pos: OpRef::NONE,
-            fail_args: None,
+            args: std::cell::RefCell::new(smallvec::smallvec![OpRef::int_op(0)]),
+            descr: std::cell::RefCell::new(None),
+            pos: std::cell::Cell::new(OpRef::NONE),
+            fail_args: std::cell::RefCell::new(None),
 
-            fail_arg_types: None,
-            rd_resume_position: -1,
+            fail_arg_types: std::cell::RefCell::new(None),
+            rd_resume_position: std::cell::Cell::new(-1),
         };
         let s = format!("{op}");
         assert_eq!(s, "GuardTrue(v0)");
@@ -4271,13 +4378,13 @@ mod tests {
     fn test_format_trace_constants_rendered_with_values() {
         let ops = vec![op! {
             opcode: OpCode::IntAdd,
-            args: smallvec::smallvec![OpRef::int_op(0), OpRef::int_op(10_000)],
-            descr: None,
-            pos: OpRef::int_op(1),
-            fail_args: None,
+            args: std::cell::RefCell::new(smallvec::smallvec![OpRef::int_op(0), OpRef::int_op(10_000)]),
+            descr: std::cell::RefCell::new(None),
+            pos: std::cell::Cell::new(OpRef::int_op(1)),
+            fail_args: std::cell::RefCell::new(None),
 
-            fail_arg_types: None,
-            rd_resume_position: -1,
+            fail_arg_types: std::cell::RefCell::new(None),
+            rd_resume_position: std::cell::Cell::new(-1),
         }];
         let mut constants = std::collections::HashMap::new();
         constants.insert(10_000, 42);
@@ -4291,34 +4398,34 @@ mod tests {
         let ops = vec![
             op! {
                 opcode: OpCode::IntAdd,
-                args: smallvec::smallvec![OpRef::int_op(0), OpRef::int_op(10_000)],
-                descr: None,
-                pos: OpRef::int_op(1),
-                fail_args: None,
+                args: std::cell::RefCell::new(smallvec::smallvec![OpRef::int_op(0), OpRef::int_op(10_000)]),
+                descr: std::cell::RefCell::new(None),
+                pos: std::cell::Cell::new(OpRef::int_op(1)),
+                fail_args: std::cell::RefCell::new(None),
 
-                fail_arg_types: None,
-                rd_resume_position: -1,
+                fail_arg_types: std::cell::RefCell::new(None),
+                rd_resume_position: std::cell::Cell::new(-1),
             },
             op! {
                 opcode: OpCode::GuardTrue,
-                args: smallvec::smallvec![OpRef::int_op(0)],
-                descr: None,
-                pos: OpRef::NONE,
-                fail_args: Some(smallvec::smallvec![OpRef::int_op(0), OpRef::int_op(1)]),
+                args: std::cell::RefCell::new(smallvec::smallvec![OpRef::int_op(0)]),
+                descr: std::cell::RefCell::new(None),
+                pos: std::cell::Cell::new(OpRef::NONE),
+                fail_args: std::cell::RefCell::new(Some(smallvec::smallvec![OpRef::int_op(0), OpRef::int_op(1)])),
 
-                fail_arg_types: None,
-                rd_resume_position: -1,
+                fail_arg_types: std::cell::RefCell::new(None),
+                rd_resume_position: std::cell::Cell::new(-1),
             },
             op! {
                 opcode: OpCode::Finish,
-                args: smallvec::smallvec![OpRef::int_op(1)],
-                descr: None,
-                pos: OpRef::NONE,
-                fail_args: None,
+                args: std::cell::RefCell::new(smallvec::smallvec![OpRef::int_op(1)]),
+                descr: std::cell::RefCell::new(None),
+                pos: std::cell::Cell::new(OpRef::NONE),
+                fail_args: std::cell::RefCell::new(None),
 
 
-                fail_arg_types: None,
-                rd_resume_position: -1,
+                fail_arg_types: std::cell::RefCell::new(None),
+                rd_resume_position: std::cell::Cell::new(-1),
             },
         ];
         let mut constants = std::collections::HashMap::new();
@@ -4331,14 +4438,14 @@ mod tests {
     fn test_format_trace_constants_in_fail_args() {
         let ops = vec![op! {
             opcode: OpCode::GuardTrue,
-            args: smallvec::smallvec![OpRef::int_op(0)],
-            descr: None,
-            pos: OpRef::NONE,
-            fail_args: Some(smallvec::smallvec![OpRef::int_op(0), OpRef::int_op(10_000)]),
+            args: std::cell::RefCell::new(smallvec::smallvec![OpRef::int_op(0)]),
+            descr: std::cell::RefCell::new(None),
+            pos: std::cell::Cell::new(OpRef::NONE),
+            fail_args: std::cell::RefCell::new(Some(smallvec::smallvec![OpRef::int_op(0), OpRef::int_op(10_000)])),
 
 
-            fail_arg_types: None,
-            rd_resume_position: -1,
+            fail_arg_types: std::cell::RefCell::new(None),
+            rd_resume_position: std::cell::Cell::new(-1),
         }];
         let mut constants = std::collections::HashMap::new();
         constants.insert(10_000, 99);
@@ -4363,44 +4470,44 @@ mod tests {
         let ops = vec![
             op! {
                 opcode: OpCode::Label,
-                args: smallvec::smallvec![OpRef::int_op(0), OpRef::int_op(1), OpRef::int_op(2)],
-                descr: None,
-                pos: OpRef::NONE,
-                fail_args: None,
+                args: std::cell::RefCell::new(smallvec::smallvec![OpRef::int_op(0), OpRef::int_op(1), OpRef::int_op(2)]),
+                descr: std::cell::RefCell::new(None),
+                pos: std::cell::Cell::new(OpRef::NONE),
+                fail_args: std::cell::RefCell::new(None),
 
-                fail_arg_types: None,
-                rd_resume_position: -1,
+                fail_arg_types: std::cell::RefCell::new(None),
+                rd_resume_position: std::cell::Cell::new(-1),
             },
             op! {
                 opcode: OpCode::IntAdd,
-                args: smallvec::smallvec![OpRef::int_op(1), OpRef::int_op(2)],
-                descr: None,
-                pos: OpRef::int_op(3),
-                fail_args: None,
+                args: std::cell::RefCell::new(smallvec::smallvec![OpRef::int_op(1), OpRef::int_op(2)]),
+                descr: std::cell::RefCell::new(None),
+                pos: std::cell::Cell::new(OpRef::int_op(3)),
+                fail_args: std::cell::RefCell::new(None),
 
-                fail_arg_types: None,
-                rd_resume_position: -1,
+                fail_arg_types: std::cell::RefCell::new(None),
+                rd_resume_position: std::cell::Cell::new(-1),
             },
             op! {
                 opcode: OpCode::IntAdd,
-                args: smallvec::smallvec![OpRef::int_op(3), OpRef::int_op(10_000)],
-                descr: None,
-                pos: OpRef::int_op(4),
-                fail_args: None,
+                args: std::cell::RefCell::new(smallvec::smallvec![OpRef::int_op(3), OpRef::int_op(10_000)]),
+                descr: std::cell::RefCell::new(None),
+                pos: std::cell::Cell::new(OpRef::int_op(4)),
+                fail_args: std::cell::RefCell::new(None),
 
-                fail_arg_types: None,
-                rd_resume_position: -1,
+                fail_arg_types: std::cell::RefCell::new(None),
+                rd_resume_position: std::cell::Cell::new(-1),
             },
             op! {
                 opcode: OpCode::Jump,
-                args: smallvec::smallvec![OpRef::int_op(0), OpRef::int_op(4), OpRef::int_op(3)],
-                descr: None,
-                pos: OpRef::NONE,
-                fail_args: None,
+                args: std::cell::RefCell::new(smallvec::smallvec![OpRef::int_op(0), OpRef::int_op(4), OpRef::int_op(3)]),
+                descr: std::cell::RefCell::new(None),
+                pos: std::cell::Cell::new(OpRef::NONE),
+                fail_args: std::cell::RefCell::new(None),
 
 
-                fail_arg_types: None,
-                rd_resume_position: -1,
+                fail_arg_types: std::cell::RefCell::new(None),
+                rd_resume_position: std::cell::Cell::new(-1),
             },
         ];
         let mut constants = std::collections::HashMap::new();
@@ -4426,44 +4533,44 @@ mod tests {
         let ops = vec![
             op! {
                 opcode: OpCode::IntSub,
-                args: smallvec::smallvec![OpRef::int_op(0), OpRef::int_op(10_000)],
-                descr: None,
-                pos: OpRef::int_op(1),
-                fail_args: None,
+                args: std::cell::RefCell::new(smallvec::smallvec![OpRef::int_op(0), OpRef::int_op(10_000)]),
+                descr: std::cell::RefCell::new(None),
+                pos: std::cell::Cell::new(OpRef::int_op(1)),
+                fail_args: std::cell::RefCell::new(None),
 
-                fail_arg_types: None,
-                rd_resume_position: -1,
+                fail_arg_types: std::cell::RefCell::new(None),
+                rd_resume_position: std::cell::Cell::new(-1),
             },
             op! {
                 opcode: OpCode::IntGt,
-                args: smallvec::smallvec![OpRef::int_op(1), OpRef::int_op(10_001)],
-                descr: None,
-                pos: OpRef::int_op(2),
-                fail_args: None,
+                args: std::cell::RefCell::new(smallvec::smallvec![OpRef::int_op(1), OpRef::int_op(10_001)]),
+                descr: std::cell::RefCell::new(None),
+                pos: std::cell::Cell::new(OpRef::int_op(2)),
+                fail_args: std::cell::RefCell::new(None),
 
-                fail_arg_types: None,
-                rd_resume_position: -1,
+                fail_arg_types: std::cell::RefCell::new(None),
+                rd_resume_position: std::cell::Cell::new(-1),
             },
             op! {
                 opcode: OpCode::GuardTrue,
-                args: smallvec::smallvec![OpRef::int_op(2)],
-                descr: None,
-                pos: OpRef::NONE,
-                fail_args: Some(smallvec::smallvec![OpRef::int_op(0), OpRef::int_op(1)]),
+                args: std::cell::RefCell::new(smallvec::smallvec![OpRef::int_op(2)]),
+                descr: std::cell::RefCell::new(None),
+                pos: std::cell::Cell::new(OpRef::NONE),
+                fail_args: std::cell::RefCell::new(Some(smallvec::smallvec![OpRef::int_op(0), OpRef::int_op(1)])),
 
-                fail_arg_types: None,
-                rd_resume_position: -1,
+                fail_arg_types: std::cell::RefCell::new(None),
+                rd_resume_position: std::cell::Cell::new(-1),
             },
             op! {
                 opcode: OpCode::Finish,
-                args: smallvec::smallvec![OpRef::int_op(1)],
-                descr: None,
-                pos: OpRef::NONE,
-                fail_args: None,
+                args: std::cell::RefCell::new(smallvec::smallvec![OpRef::int_op(1)]),
+                descr: std::cell::RefCell::new(None),
+                pos: std::cell::Cell::new(OpRef::NONE),
+                fail_args: std::cell::RefCell::new(None),
 
 
-                fail_arg_types: None,
-                rd_resume_position: -1,
+                fail_arg_types: std::cell::RefCell::new(None),
+                rd_resume_position: std::cell::Cell::new(-1),
             },
         ];
         let mut constants = std::collections::HashMap::new();
@@ -4486,13 +4593,13 @@ mod tests {
         ));
         let ops = vec![op! {
             opcode: OpCode::DebugMergePoint,
-            args: smallvec::smallvec![],
-            descr: Some(descr),
-            pos: OpRef::NONE,
-            fail_args: None,
+            args: std::cell::RefCell::new(smallvec::smallvec![]),
+            descr: std::cell::RefCell::new(Some(descr)),
+            pos: std::cell::Cell::new(OpRef::NONE),
+            fail_args: std::cell::RefCell::new(None),
 
-            fail_arg_types: None,
-            rd_resume_position: -1,
+            fail_arg_types: std::cell::RefCell::new(None),
+            rd_resume_position: std::cell::Cell::new(-1),
         }];
         let constants: std::collections::HashMap<u32, i64> = std::collections::HashMap::new();
         let output = format_trace(&ops, &constants);
@@ -4517,64 +4624,64 @@ mod tests {
         let ops = vec![
             op! {
                 opcode: OpCode::Label,
-                args: smallvec::smallvec![OpRef::int_op(0), OpRef::int_op(1)],
-                descr: None,
-                pos: OpRef::NONE,
-                fail_args: None,
+                args: std::cell::RefCell::new(smallvec::smallvec![OpRef::int_op(0), OpRef::int_op(1)]),
+                descr: std::cell::RefCell::new(None),
+                pos: std::cell::Cell::new(OpRef::NONE),
+                fail_args: std::cell::RefCell::new(None),
 
-                fail_arg_types: None,
-                rd_resume_position: -1,
+                fail_arg_types: std::cell::RefCell::new(None),
+                rd_resume_position: std::cell::Cell::new(-1),
             },
             op! {
                 opcode: OpCode::IntAdd,
-                args: smallvec::smallvec![OpRef::int_op(0), OpRef::int_op(1)],
-                descr: None,
-                pos: OpRef::int_op(2),
-                fail_args: None,
+                args: std::cell::RefCell::new(smallvec::smallvec![OpRef::int_op(0), OpRef::int_op(1)]),
+                descr: std::cell::RefCell::new(None),
+                pos: std::cell::Cell::new(OpRef::int_op(2)),
+                fail_args: std::cell::RefCell::new(None),
 
-                fail_arg_types: None,
-                rd_resume_position: -1,
+                fail_arg_types: std::cell::RefCell::new(None),
+                rd_resume_position: std::cell::Cell::new(-1),
             },
             op! {
                 opcode: OpCode::IntLt,
-                args: smallvec::smallvec![OpRef::int_op(2), OpRef::int_op(10_000)],
-                descr: None,
-                pos: OpRef::int_op(3),
-                fail_args: None,
+                args: std::cell::RefCell::new(smallvec::smallvec![OpRef::int_op(2), OpRef::int_op(10_000)]),
+                descr: std::cell::RefCell::new(None),
+                pos: std::cell::Cell::new(OpRef::int_op(3)),
+                fail_args: std::cell::RefCell::new(None),
 
-                fail_arg_types: None,
-                rd_resume_position: -1,
+                fail_arg_types: std::cell::RefCell::new(None),
+                rd_resume_position: std::cell::Cell::new(-1),
             },
             op! {
                 opcode: OpCode::GuardTrue,
-                args: smallvec::smallvec![OpRef::int_op(3)],
-                descr: None,
-                pos: OpRef::NONE,
-                fail_args: Some(smallvec::smallvec![OpRef::int_op(0), OpRef::int_op(2)]),
+                args: std::cell::RefCell::new(smallvec::smallvec![OpRef::int_op(3)]),
+                descr: std::cell::RefCell::new(None),
+                pos: std::cell::Cell::new(OpRef::NONE),
+                fail_args: std::cell::RefCell::new(Some(smallvec::smallvec![OpRef::int_op(0), OpRef::int_op(2)])),
 
-                fail_arg_types: None,
-                rd_resume_position: -1,
+                fail_arg_types: std::cell::RefCell::new(None),
+                rd_resume_position: std::cell::Cell::new(-1),
             },
             op! {
                 opcode: OpCode::IntSub,
-                args: smallvec::smallvec![OpRef::int_op(0), OpRef::int_op(10_001)],
-                descr: None,
-                pos: OpRef::int_op(4),
-                fail_args: None,
+                args: std::cell::RefCell::new(smallvec::smallvec![OpRef::int_op(0), OpRef::int_op(10_001)]),
+                descr: std::cell::RefCell::new(None),
+                pos: std::cell::Cell::new(OpRef::int_op(4)),
+                fail_args: std::cell::RefCell::new(None),
 
-                fail_arg_types: None,
-                rd_resume_position: -1,
+                fail_arg_types: std::cell::RefCell::new(None),
+                rd_resume_position: std::cell::Cell::new(-1),
             },
             op! {
                 opcode: OpCode::Jump,
-                args: smallvec::smallvec![OpRef::int_op(4), OpRef::int_op(2)],
-                descr: None,
-                pos: OpRef::NONE,
-                fail_args: None,
+                args: std::cell::RefCell::new(smallvec::smallvec![OpRef::int_op(4), OpRef::int_op(2)]),
+                descr: std::cell::RefCell::new(None),
+                pos: std::cell::Cell::new(OpRef::NONE),
+                fail_args: std::cell::RefCell::new(None),
 
 
-                fail_arg_types: None,
-                rd_resume_position: -1,
+                fail_arg_types: std::cell::RefCell::new(None),
+                rd_resume_position: std::cell::Cell::new(-1),
             },
         ];
         let mut constants = std::collections::HashMap::new();
@@ -4600,24 +4707,24 @@ mod tests {
         let ops = vec![
             op! {
                 opcode: OpCode::GuardTrue,
-                args: smallvec::smallvec![OpRef::int_op(0)],
-                descr: None,
-                pos: OpRef::NONE,
-                fail_args: Some(smallvec::smallvec![OpRef::int_op(0)]),
+                args: std::cell::RefCell::new(smallvec::smallvec![OpRef::int_op(0)]),
+                descr: std::cell::RefCell::new(None),
+                pos: std::cell::Cell::new(OpRef::NONE),
+                fail_args: std::cell::RefCell::new(Some(smallvec::smallvec![OpRef::int_op(0)])),
 
-                fail_arg_types: None,
-                rd_resume_position: -1,
+                fail_arg_types: std::cell::RefCell::new(None),
+                rd_resume_position: std::cell::Cell::new(-1),
             },
             op! {
                 opcode: OpCode::GuardFalse,
-                args: smallvec::smallvec![OpRef::int_op(1)],
-                descr: None,
-                pos: OpRef::NONE,
-                fail_args: Some(smallvec::smallvec![OpRef::int_op(0), OpRef::int_op(1), OpRef::int_op(2)]),
+                args: std::cell::RefCell::new(smallvec::smallvec![OpRef::int_op(1)]),
+                descr: std::cell::RefCell::new(None),
+                pos: std::cell::Cell::new(OpRef::NONE),
+                fail_args: std::cell::RefCell::new(Some(smallvec::smallvec![OpRef::int_op(0), OpRef::int_op(1), OpRef::int_op(2)])),
 
 
-                fail_arg_types: None,
-                rd_resume_position: -1,
+                fail_arg_types: std::cell::RefCell::new(None),
+                rd_resume_position: std::cell::Cell::new(-1),
             },
         ];
         let constants: std::collections::HashMap<u32, i64> = std::collections::HashMap::new();

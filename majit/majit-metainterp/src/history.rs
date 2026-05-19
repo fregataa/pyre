@@ -5,7 +5,7 @@
 /// that forms a loop (ending with JUMP) or an exit (ending with FINISH).
 ///
 /// Reference: rpython/jit/metainterp/history.py TreeLoop
-use majit_ir::{DescrRef, InputArg, Op, OpCode, OpRef, Type, Value};
+use majit_ir::{DescrRef, InputArg, Op, OpCode, OpRc, OpRef, Type, Value};
 
 use crate::r#box::BoxRef;
 
@@ -40,7 +40,15 @@ pub struct TreeLoop {
     /// Input arguments to the trace (loop header variables).
     pub inputargs: Vec<InputArg>,
     /// The recorded operations, in execution order.
-    pub ops: Vec<Op>,
+    ///
+    /// `history.py:528` `# self.operations = list of ResOperations` —
+    /// PyPy's `TreeLoop.operations` holds Python references that are the
+    /// *same* objects reached from recorder build-time, optimizer
+    /// forwarding state, short preamble export, resume metadata, and
+    /// backend input lists. Pyre uses `Rc<Op>` so every consumer that
+    /// holds an `OpRc` reads and writes `forwarded`/`descr`/... through
+    /// the shared identity (BoxPool removal plan slice 1).
+    pub ops: Vec<OpRc>,
     /// opencoder.py parity: per-guard snapshots captured during tracing.
     /// Indexed by the guard op's `rd_resume_position`.
     pub snapshots: Vec<crate::recorder::Snapshot>,
@@ -66,10 +74,14 @@ impl TreeLoop {
     }
 
     /// Create a new trace from input arguments and operations.
+    ///
+    /// `ops` are wrapped in `Rc` at construction so that every downstream
+    /// consumer reaches the same `Op` object (history.py:528 PyPy
+    /// `TreeLoop.operations` semantic).
     pub fn new(inputargs: Vec<InputArg>, ops: Vec<Op>) -> Self {
         TreeLoop {
             inputargs,
-            ops,
+            ops: ops.into_iter().map(std::rc::Rc::new).collect(),
             snapshots: Vec::new(),
             box_pool: crate::r#box::BoxPool::new(),
         }
@@ -83,7 +95,7 @@ impl TreeLoop {
     ) -> Self {
         TreeLoop {
             inputargs,
-            ops,
+            ops: ops.into_iter().map(std::rc::Rc::new).collect(),
             snapshots,
             box_pool: crate::r#box::BoxPool::new(),
         }
@@ -96,6 +108,26 @@ impl TreeLoop {
     pub fn with_box_pool(
         inputargs: Vec<InputArg>,
         ops: Vec<Op>,
+        snapshots: Vec<crate::recorder::Snapshot>,
+        box_pool: impl Into<crate::r#box::BoxPool>,
+    ) -> Self {
+        TreeLoop {
+            inputargs,
+            ops: ops.into_iter().map(std::rc::Rc::new).collect(),
+            snapshots,
+            box_pool: box_pool.into(),
+        }
+    }
+
+    /// Construct from `Vec<OpRc>` directly, preserving shared identity for
+    /// callers that already track Op via `Rc`. This is the canonical
+    /// constructor used internally once consumers traffic in `OpRc`; the
+    /// `new` / `with_snapshots` / `with_box_pool` overloads above wrap a
+    /// `Vec<Op>` into `Vec<OpRc>` for legacy test sites still building
+    /// ops by value.
+    pub fn from_oprc(
+        inputargs: Vec<InputArg>,
+        ops: Vec<OpRc>,
         snapshots: Vec<crate::recorder::Snapshot>,
         box_pool: impl Into<crate::r#box::BoxPool>,
     ) -> Self {
@@ -130,12 +162,12 @@ impl TreeLoop {
     }
 
     /// Iterate over all operations.
-    pub fn iter_ops(&self) -> impl Iterator<Item = &Op> {
+    pub fn iter_ops(&self) -> impl Iterator<Item = &OpRc> {
         self.ops.iter()
     }
 
     /// Iterate over all guard operations.
-    pub fn iter_guards(&self) -> impl Iterator<Item = &Op> {
+    pub fn iter_guards(&self) -> impl Iterator<Item = &OpRc> {
         self.ops.iter().filter(|op| op.opcode.is_guard())
     }
 
@@ -145,7 +177,7 @@ impl TreeLoop {
     }
 
     /// Get the final operation (Jump or Finish).
-    pub fn get_final_op(&self) -> Option<&Op> {
+    pub fn get_final_op(&self) -> Option<&OpRc> {
         self.ops.last().filter(|op| op.opcode.is_final())
     }
 
@@ -156,7 +188,7 @@ impl TreeLoop {
 
     /// Split at Label: returns (preamble_ops, body_ops).
     /// If no Label, returns (all_ops, empty).
-    pub fn split_at_label(&self) -> (&[Op], &[Op]) {
+    pub fn split_at_label(&self) -> (&[OpRc], &[OpRc]) {
         match self.find_label() {
             Some(pos) => (&self.ops[..pos], &self.ops[pos..]),
             None => (&self.ops, &[]),
@@ -211,8 +243,8 @@ impl TreeLoop {
         if self.ops.is_empty() {
             return true;
         }
-        let mut seen = std::collections::HashSet::new();
-        let mut op_positions = std::collections::HashSet::new();
+        let mut seen: majit_ir::vec_set::VecSet<OpRef> = majit_ir::vec_set::VecSet::new();
+        let mut op_positions: majit_ir::vec_set::VecSet<OpRef> = majit_ir::vec_set::VecSet::new();
         // history.py:564-565: inputargs must not contain constants
         for ia in &self.inputargs {
             let ia_ref = OpRef::input_arg_typed(ia.index, ia.tp);
@@ -230,7 +262,7 @@ impl TreeLoop {
             // PyPy's operation objects are unique by allocation. Rust traces
             // carry that identity in OpRef positions, so duplicate positions
             // are structurally invalid before considering dataflow.
-            if !op.pos.is_none() && !op_positions.insert(op.pos) {
+            if !op.pos.get().is_none() && !op_positions.insert(op.pos.get()) {
                 return false;
             }
             // history.py:576-578: ovf ops must be followed by guard_overflow
@@ -244,7 +276,7 @@ impl TreeLoop {
                 }
             }
             // history.py:579-581: each arg must be Const or in seen
-            for arg in &op.args {
+            for arg in op.getarglist().iter() {
                 if arg.is_none() {
                     return false;
                 }
@@ -254,11 +286,11 @@ impl TreeLoop {
             }
             // history.py:582-593: guard checks
             if op.opcode.is_guard() {
-                if check_descr && op.descr.is_none() {
+                if check_descr && !op.has_descr() {
                     return false;
                 }
                 // history.py:588-591: fail_args validation
-                if let Some(ref fa) = op.fail_args {
+                if let Some(fa) = op.getfailargs() {
                     for arg in fa.iter() {
                         if arg.is_none() {
                             continue;
@@ -273,14 +305,14 @@ impl TreeLoop {
                 }
             } else if check_descr {
                 // history.py:592-593: non-guard ops must have no fail_args
-                if op.fail_args.is_some() {
+                if op.has_failargs() {
                     return false;
                 }
             }
             // history.py:594-595: if op produces a value, add to seen
             if op.opcode.result_type() != Type::Void {
-                if !op.pos.is_none() {
-                    if !seen.insert(op.pos) {
+                if !op.pos.get().is_none() {
+                    if !seen.insert(op.pos.get()) {
                         return false;
                     }
                 }
@@ -288,7 +320,7 @@ impl TreeLoop {
             // history.py:596-602: LABEL resets seen
             if op.opcode == OpCode::Label {
                 seen.clear();
-                for arg in &op.args {
+                for arg in op.getarglist().iter() {
                     if arg.is_none() || arg.is_constant() {
                         return false;
                     }
@@ -305,7 +337,7 @@ impl TreeLoop {
         }
         // history.py:605-608: if a JUMP has a target, it must be TargetToken.
         if last.opcode == OpCode::Jump {
-            if let Some(descr) = last.descr.as_ref() {
+            if let Some(descr) = last.getdescr() {
                 if descr.as_loop_target_descr().is_none() {
                     return false;
                 }
@@ -340,15 +372,17 @@ impl TreeLoop {
         original_box_types: &[majit_ir::Type],
         inputarg_consts: &[OpRef],
     ) -> TreeLoop {
-        use std::collections::{HashMap, HashSet, VecDeque};
+        use majit_ir::vec_set::VecSet;
+        use std::collections::VecDeque;
 
         let num_original_inputargs = self.inputargs.len() as u32;
         let cut_ops = &self.ops[start.op_index..];
 
         // Phase 1: Build initial remap from original_boxes → new inputargs.
         // Each new inputarg carries the type recorded in `original_box_types[i]`.
-        let mut remap: HashMap<OpRef, OpRef> = HashMap::new();
-        let original_set: HashSet<OpRef> = original_boxes.iter().copied().collect();
+        let mut remap: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef> =
+            crate::optimizeopt::vec_assoc::VecAssoc::new();
+        let original_set: VecSet<OpRef> = original_boxes.iter().copied().collect();
         for (i, &old_ref) in original_boxes.iter().enumerate() {
             remap.insert(
                 old_ref,
@@ -357,10 +391,10 @@ impl TreeLoop {
         }
 
         // Collect all OpRefs defined by post-cut ops.
-        let defined_after_cut: HashSet<OpRef> = cut_ops
+        let defined_after_cut: VecSet<OpRef> = cut_ops
             .iter()
-            .filter(|op| !op.pos.is_none())
-            .map(|op| op.pos)
+            .filter(|op| !op.pos.get().is_none())
+            .map(|op| op.pos.get())
             .collect();
 
         // Phase 2: Find escaped refs — referenced after cut, defined before
@@ -372,7 +406,7 @@ impl TreeLoop {
                 && !defined_after_cut.contains(r)
         };
 
-        let mut escaped_set: HashSet<OpRef> = HashSet::new();
+        let mut escaped_set: VecSet<OpRef> = VecSet::new();
         let mut queue: VecDeque<OpRef> = VecDeque::new();
 
         // Seed with refs used by post-cut ops (args only, not fail_args).
@@ -380,7 +414,7 @@ impl TreeLoop {
         // OpRef::NONE (resume data handles materialization). Only regular
         // op args seed escaped refs for prefix re-emission.
         for op in cut_ops {
-            for arg in &op.args {
+            for arg in op.getarglist().iter() {
                 if is_pre_cut_ref(arg) && escaped_set.insert(*arg) {
                     queue.push_back(*arg);
                 }
@@ -396,7 +430,7 @@ impl TreeLoop {
             }
             let op_idx = (esc_ref.raw() - num_original_inputargs) as usize;
             if let Some(op) = self.ops.get(op_idx) {
-                for arg in &op.args {
+                for arg in op.getarglist().iter() {
                     if is_pre_cut_ref(arg) && escaped_set.insert(*arg) {
                         queue.push_back(*arg);
                     }
@@ -443,10 +477,7 @@ impl TreeLoop {
         let new_inputargs: Vec<InputArg> = new_ia_types
             .iter()
             .enumerate()
-            .map(|(i, &tp)| InputArg {
-                index: i as u32,
-                tp,
-            })
+            .map(|(i, &tp)| InputArg::from_type(tp, i as u32))
             .collect();
 
         // Build a fresh `box_pool` mirroring the new namespace. Inputargs
@@ -486,9 +517,9 @@ impl TreeLoop {
         // Also assign fresh refs for post-cut ops (shifted by prefix count).
         let prefix_count = op_escaped.len() as u32;
         for (i, op) in cut_ops.iter().enumerate() {
-            if !op.pos.is_none() {
+            if !op.pos.get().is_none() {
                 remap.insert(
-                    op.pos,
+                    op.pos.get(),
                     OpRef::op_typed(
                         new_inputargs_count + prefix_count + i as u32,
                         op.opcode.result_type(),
@@ -512,14 +543,21 @@ impl TreeLoop {
         for (pi, &r) in op_escaped.iter().enumerate() {
             let op_idx = (r.raw() - num_original_inputargs) as usize;
             let orig_op = &self.ops[op_idx];
-            let mut new_op = orig_op.clone();
-            new_op.pos =
-                OpRef::op_typed(new_inputargs_count + pi as u32, new_op.opcode.result_type());
-            for arg in new_op.args.iter_mut() {
-                *arg = remap_ref(arg);
+            // Deep-clone through the Rc: re-emitted prefix ops must have
+            // fresh identity (new pos, fresh _forwarded) per
+            // history.py:551-558 cut_trace_from re-emission.
+            let mut new_op: Op = (**orig_op).clone();
+            new_op.pos.set(OpRef::op_typed(
+                new_inputargs_count + pi as u32,
+                new_op.opcode.result_type(),
+            ));
+            // optimizer.py:651-652 setarg loop parity.
+            for i in 0..new_op.num_args() {
+                let arg = new_op.arg(i);
+                new_op.setarg(i, remap_ref(&arg));
             }
             // Prefix ops don't need fail_args (they're not guards).
-            new_op.fail_args = None;
+            new_op.clearfailargs();
             prefix_ops.push(new_op);
         }
 
@@ -527,15 +565,20 @@ impl TreeLoop {
         let mut new_ops: Vec<Op> = Vec::with_capacity(prefix_ops.len() + cut_ops.len());
         new_ops.extend(prefix_ops);
         for (i, op) in cut_ops.iter().enumerate() {
-            let mut new_op = op.clone();
-            new_op.pos = OpRef::op_typed(
+            // Deep-clone through the Rc: re-emitted post-cut ops carry
+            // fresh identity in the new trace per history.py:cut_trace_from
+            // semantics (RPython makes new ResOperation objects).
+            let mut new_op: Op = (**op).clone();
+            new_op.pos.set(OpRef::op_typed(
                 new_inputargs_count + prefix_count + i as u32,
                 new_op.opcode.result_type(),
-            );
-            for arg in new_op.args.iter_mut() {
-                *arg = remap_ref(arg);
+            ));
+            // optimizer.py:651-652 setarg loop parity.
+            for j in 0..new_op.num_args() {
+                let arg = new_op.arg(j);
+                new_op.setarg(j, remap_ref(&arg));
             }
-            if let Some(ref mut fa) = new_op.fail_args {
+            if let Some(fa) = new_op.fail_args_mut() {
                 for arg in fa.iter_mut() {
                     *arg = remap_ref(arg);
                 }
@@ -697,7 +740,7 @@ mod tests {
         // Guards in a trace carry fail_args.
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let mut guard = Op::new(OpCode::GuardTrue, &[OpRef::input_arg_int(0)]);
-        guard.fail_args = Some(smallvec::smallvec![
+        guard.setfailargs(smallvec::smallvec![
             OpRef::input_arg_int(0),
             OpRef::input_arg_int(1)
         ]);
@@ -714,7 +757,7 @@ mod tests {
 
         let guards: Vec<_> = trace.iter_guards().collect();
         assert_eq!(guards.len(), 1);
-        let fa = guards[0].fail_args.as_ref().unwrap();
+        let fa = guards[0].getfailargs().unwrap();
         assert_eq!(fa.len(), 2);
         assert_eq!(fa[0], OpRef::input_arg_int(0));
         assert_eq!(fa[1], OpRef::input_arg_int(1));
@@ -818,10 +861,9 @@ mod tests {
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
 
         let mut g0 = Op::new(OpCode::GuardTrue, &[OpRef::input_arg_int(0)]);
-        g0.fail_args = Some(smallvec::smallvec![OpRef::input_arg_int(0)]);
-
+        g0.setfailargs(smallvec::smallvec![OpRef::input_arg_int(0)]);
         let mut g1 = Op::new(OpCode::GuardFalse, &[OpRef::input_arg_int(1)]);
-        g1.fail_args = Some(smallvec::smallvec![
+        g1.setfailargs(smallvec::smallvec![
             OpRef::input_arg_int(0),
             OpRef::input_arg_int(1)
         ]);
@@ -840,8 +882,8 @@ mod tests {
         let guards: Vec<_> = trace.iter_guards().collect();
         assert_eq!(guards.len(), 2);
 
-        assert_eq!(guards[0].fail_args.as_ref().unwrap().len(), 1);
-        assert_eq!(guards[1].fail_args.as_ref().unwrap().len(), 2);
+        assert_eq!(guards[0].getfailargs().unwrap().len(), 1);
+        assert_eq!(guards[1].getfailargs().unwrap().len(), 2);
     }
 
     #[test]
@@ -856,7 +898,7 @@ mod tests {
 
         let guards: Vec<_> = trace.iter_guards().collect();
         assert_eq!(guards.len(), 1);
-        assert!(guards[0].fail_args.is_none());
+        assert!(!guards[0].has_failargs());
     }
 
     #[test]
@@ -912,13 +954,13 @@ mod tests {
         let trace = TreeLoop::new(inputargs, ops);
 
         // Call op has descr
-        assert!(trace.ops[0].descr.is_some());
-        assert_eq!(trace.ops[0].descr.as_ref().unwrap().index(), 42);
+        assert!(trace.ops[0].has_descr());
+        assert_eq!(trace.ops[0].getdescr().unwrap().index(), 42);
         // Guard op has descr
-        assert!(trace.ops[1].descr.is_some());
-        assert_eq!(trace.ops[1].descr.as_ref().unwrap().index(), 42);
+        assert!(trace.ops[1].has_descr());
+        assert_eq!(trace.ops[1].getdescr().unwrap().index(), 42);
         // Jump op has no descr
-        assert!(trace.ops[2].descr.is_none());
+        assert!(!trace.ops[2].has_descr());
     }
 
     #[test]
@@ -978,7 +1020,7 @@ mod tests {
         let mut prev = OpRef::input_arg_int(0);
         for i in 0..100 {
             let mut op = Op::new(OpCode::IntAdd, &[prev, OpRef::input_arg_int(0)]);
-            op.pos = OpRef::int_op(i + 1);
+            op.pos.set(OpRef::int_op(i + 1));
             ops.push(op);
             prev = OpRef::int_op(i + 1);
         }
@@ -1010,7 +1052,7 @@ mod tests {
         );
         let mut guard_op = Op::new(OpCode::GuardTrue, &[OpRef::int_op(2)]);
         // fail_args referencing input args (0, 1) and the add result (2)
-        guard_op.fail_args = Some(smallvec::smallvec![
+        guard_op.setfailargs(smallvec::smallvec![
             OpRef::input_arg_int(0),
             OpRef::input_arg_int(1),
             OpRef::int_op(2)
@@ -1024,7 +1066,7 @@ mod tests {
         let trace = TreeLoop::new(inputargs, ops);
 
         let guard = trace.iter_guards().next().unwrap();
-        let fa = guard.fail_args.as_ref().unwrap();
+        let fa = guard.getfailargs().unwrap();
         // All referenced OpRefs are valid: 0, 1 are inputargs; 2 is the add op
         assert!(fa.iter().all(|r| r.raw() <= 2));
         assert_eq!(fa.len(), 3);
@@ -1036,18 +1078,16 @@ mod tests {
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
 
         let mut g0 = Op::new(OpCode::GuardTrue, &[OpRef::input_arg_int(0)]);
-        g0.fail_args = Some(smallvec::smallvec![]);
-
+        g0.setfailargs(smallvec::smallvec![]);
         let mut g1 = Op::new(OpCode::GuardFalse, &[OpRef::input_arg_int(1)]);
-        g1.fail_args = Some(smallvec::smallvec![OpRef::input_arg_int(0)]);
-
+        g1.setfailargs(smallvec::smallvec![OpRef::input_arg_int(0)]);
         let add = Op::new(
             OpCode::IntAdd,
             &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
         );
 
         let mut g2 = Op::new(OpCode::GuardTrue, &[OpRef::input_arg_int(0)]);
-        g2.fail_args = Some(smallvec::smallvec![
+        g2.setfailargs(smallvec::smallvec![
             OpRef::input_arg_int(0),
             OpRef::input_arg_int(1),
             OpRef::int_op(2)
@@ -1067,9 +1107,9 @@ mod tests {
 
         let guards: Vec<_> = trace.iter_guards().collect();
         assert_eq!(guards.len(), 3);
-        assert_eq!(guards[0].fail_args.as_ref().unwrap().len(), 0);
-        assert_eq!(guards[1].fail_args.as_ref().unwrap().len(), 1);
-        assert_eq!(guards[2].fail_args.as_ref().unwrap().len(), 3);
+        assert_eq!(guards[0].getfailargs().unwrap().len(), 0);
+        assert_eq!(guards[1].getfailargs().unwrap().len(), 1);
+        assert_eq!(guards[2].getfailargs().unwrap().len(), 3);
     }
 
     #[test]
@@ -1086,10 +1126,10 @@ mod tests {
         let trace = TreeLoop::new(inputargs, ops);
         let mut trace2 = trace.clone();
 
-        trace2.ops.push(Op::new(
+        trace2.ops.push(std::rc::Rc::new(Op::new(
             OpCode::IntSub,
             &[OpRef::input_arg_int(0), OpRef::input_arg_int(0)],
-        ));
+        )));
         assert_eq!(trace.num_ops(), 2);
         assert_eq!(trace2.num_ops(), 3);
     }
@@ -1132,7 +1172,7 @@ mod tests {
     fn test_check_consistency_valid() {
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let mut op0 = Op::new(OpCode::IntAdd, &[iarg(0), iarg(1)]);
-        op0.pos = iop(2);
+        op0.pos.set(iop(2));
         let ops = vec![op0, Op::new(OpCode::Jump, &[iop(2)])];
         let trace = TreeLoop::new(inputargs, ops);
         assert!(trace.check_consistency());
@@ -1179,7 +1219,7 @@ mod tests {
         let inputargs = vec![InputArg::new_int(0)];
         let const_ref = OpRef::const_int(0);
         let mut op0 = Op::new(OpCode::IntAdd, &[iarg(0), const_ref]);
-        op0.pos = iop(1);
+        op0.pos.set(iop(1));
         let ops = vec![op0, Op::new(OpCode::Finish, &[iop(1)])];
         let trace = TreeLoop::new(inputargs, ops);
         assert!(trace.check_consistency());
@@ -1190,7 +1230,7 @@ mod tests {
         // history.py:576-578: ovf must be followed by guard_overflow
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let mut op0 = Op::new(OpCode::IntAddOvf, &[iarg(0), iarg(1)]);
-        op0.pos = iop(2);
+        op0.pos.set(iop(2));
         let ops = vec![op0, Op::new(OpCode::Finish, &[iop(2)])];
         let trace = TreeLoop::new(inputargs, ops);
         assert!(!trace.check_consistency());
@@ -1200,9 +1240,9 @@ mod tests {
     fn test_check_consistency_ovf_followed_by_guard() {
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let mut op0 = Op::new(OpCode::IntAddOvf, &[iarg(0), iarg(1)]);
-        op0.pos = iop(2);
+        op0.pos.set(iop(2));
         let mut guard = Op::new(OpCode::GuardNoOverflow, &[]);
-        guard.descr = Some(std::sync::Arc::new(DummyGuardDescr));
+        guard.setdescr(std::sync::Arc::new(DummyGuardDescr));
         let ops = vec![op0, guard, Op::new(OpCode::Finish, &[iop(2)])];
         let trace = TreeLoop::new(inputargs, ops);
         assert!(trace.check_consistency());
@@ -1214,7 +1254,7 @@ mod tests {
         // including overflow guards.
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let mut op0 = Op::new(OpCode::IntAddOvf, &[iarg(0), iarg(1)]);
-        op0.pos = iop(2);
+        op0.pos.set(iop(2));
         let ops = vec![
             op0,
             Op::new(OpCode::GuardNoOverflow, &[]),
@@ -1229,8 +1269,8 @@ mod tests {
         // history.py:590: fail_args must not contain constants
         let inputargs = vec![InputArg::new_int(0)];
         let mut guard = Op::new(OpCode::GuardTrue, &[iarg(0)]);
-        guard.fail_args = Some(smallvec::smallvec![OpRef::const_int(0)]);
-        guard.descr = Some(std::sync::Arc::new(DummyGuardDescr));
+        guard.setfailargs(smallvec::smallvec![OpRef::const_int(0)]);
+        guard.setdescr(std::sync::Arc::new(DummyGuardDescr));
         let ops = vec![guard, Op::new(OpCode::Finish, &[])];
         let trace = TreeLoop::new(inputargs, ops);
         assert!(!trace.check_consistency());
@@ -1241,8 +1281,8 @@ mod tests {
         // history.py:591: fail_args entries must be in seen
         let inputargs = vec![InputArg::new_int(0)];
         let mut guard = Op::new(OpCode::GuardTrue, &[iarg(0)]);
-        guard.fail_args = Some(smallvec::smallvec![iop(99)]);
-        guard.descr = Some(std::sync::Arc::new(DummyGuardDescr));
+        guard.setfailargs(smallvec::smallvec![iop(99)]);
+        guard.setdescr(std::sync::Arc::new(DummyGuardDescr));
         let ops = vec![guard, Op::new(OpCode::Finish, &[])];
         let trace = TreeLoop::new(inputargs, ops);
         assert!(!trace.check_consistency());
@@ -1253,7 +1293,7 @@ mod tests {
         // history.py:596-602: LABEL resets the seen set to its args
         let inputargs = vec![InputArg::new_int(0)];
         let mut op0 = Op::new(OpCode::IntAdd, &[iarg(0), iarg(0)]);
-        op0.pos = iop(1);
+        op0.pos.set(iop(1));
         // LABEL introduces a fresh scope with iarg(0) only
         let label = Op::new(OpCode::Label, &[iarg(0)]);
         // iop(1) was defined before label, so it's no longer in seen
@@ -1266,7 +1306,7 @@ mod tests {
     fn test_check_consistency_label_valid() {
         let inputargs = vec![InputArg::new_int(0)];
         let mut op0 = Op::new(OpCode::IntAdd, &[iarg(0), iarg(0)]);
-        op0.pos = iop(1);
+        op0.pos.set(iop(1));
         let label = Op::new(OpCode::Label, &[iop(1)]);
         let ops = vec![op0, label, Op::new(OpCode::Jump, &[iop(1)])];
         let trace = TreeLoop::new(inputargs, ops);
@@ -1277,9 +1317,9 @@ mod tests {
     fn test_check_consistency_duplicate_op_position_invalid() {
         let inputargs = vec![InputArg::new_int(0)];
         let mut op0 = Op::new(OpCode::IntAdd, &[iarg(0), iarg(0)]);
-        op0.pos = iop(1);
+        op0.pos.set(iop(1));
         let mut op1 = Op::new(OpCode::IntSub, &[iop(1), iarg(0)]);
-        op1.pos = iop(1);
+        op1.pos.set(iop(1));
         let ops = vec![op0, op1, Op::new(OpCode::Finish, &[iop(1)])];
         let trace = TreeLoop::new(inputargs, ops);
         assert!(!trace.check_consistency());
@@ -1289,7 +1329,7 @@ mod tests {
     fn test_check_consistency_jump_descr_must_be_target_token() {
         let inputargs = vec![InputArg::new_int(0)];
         let mut jump = Op::new(OpCode::Jump, &[iarg(0)]);
-        jump.descr = Some(std::sync::Arc::new(DummyGuardDescr));
+        jump.setdescr(std::sync::Arc::new(DummyGuardDescr));
         let trace = TreeLoop::new(inputargs, vec![jump]);
         assert!(!trace.check_consistency());
     }
@@ -1341,34 +1381,25 @@ mod tests {
         // without a matching inputarg would cache-miss in `_get`.
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let mut add = Op::new(OpCode::IntAdd, &[iarg(0), iarg(1)]);
-        add.pos = iop(2);
+        add.pos.set(iop(2));
         let ops = vec![add, Op::new(OpCode::Jump, &[iop(2)])];
         let trace = TreeLoop::new(inputargs, ops);
         let mut iter = trace.get_iter();
         assert!(!iter.done());
         // Walk one op via TraceIterator.next() — opencoder.py:362-406.
         let r = iter.next().unwrap();
-        assert_eq!(r.pos, iop(2));
-        assert_eq!(r.args[0], iarg(0));
-        assert_eq!(r.args[1], iarg(1));
+        assert_eq!(r.pos.get(), iop(2));
+        assert_eq!(r.arg(0), iarg(0));
+        assert_eq!(r.arg(1), iarg(1));
         assert_eq!(iter.pos, 1);
     }
 
     #[test]
     fn test_inputarg_types_all() {
         let inputargs = vec![
-            InputArg {
-                index: 0,
-                tp: Type::Int,
-            },
-            InputArg {
-                index: 1,
-                tp: Type::Ref,
-            },
-            InputArg {
-                index: 2,
-                tp: Type::Float,
-            },
+            InputArg::new_int(0),
+            InputArg::new_ref(1),
+            InputArg::new_float(2),
         ];
         let trace = TreeLoop::new(inputargs, vec![Op::new(OpCode::Finish, &[])]);
         let types = trace.inputarg_types();
@@ -1387,14 +1418,14 @@ mod tests {
         let mut ops = Vec::new();
         // Pre-cut ops (2 inputargs → first op is BoxInt at position 2)
         let mut op0 = Op::new(OpCode::IntAdd, &[iarg(0), iarg(1)]);
-        op0.pos = iop(2);
+        op0.pos.set(iop(2));
         ops.push(op0);
         // Post-cut ops
         let mut op1 = Op::new(OpCode::IntMul, &[iarg(0), iarg(1)]);
-        op1.pos = iop(3);
+        op1.pos.set(iop(3));
         ops.push(op1);
         let mut op2 = Op::new(OpCode::Jump, &[iop(3)]);
-        op2.pos = vop(4);
+        op2.pos.set(vop(4));
         ops.push(op2);
         let trace = TreeLoop::new(inputargs, ops);
 
@@ -1406,10 +1437,10 @@ mod tests {
         assert_eq!(cut.inputargs.len(), 2);
         assert_eq!(cut.ops.len(), 2); // IntMul + Jump
         assert_eq!(cut.ops[0].opcode, OpCode::IntMul);
-        assert_eq!(cut.ops[0].args[0], iarg(0)); // remapped from iarg(0)
-        assert_eq!(cut.ops[0].args[1], iarg(1)); // remapped from iarg(1)
+        assert_eq!(cut.ops[0].arg(0), iarg(0)); // remapped from iarg(0)
+        assert_eq!(cut.ops[0].arg(1), iarg(1)); // remapped from iarg(1)
         assert_eq!(cut.ops[1].opcode, OpCode::Jump);
-        assert_eq!(cut.ops[1].args[0], iop(2)); // remapped from iop(3) → new idx 2
+        assert_eq!(cut.ops[1].arg(0), iop(2)); // remapped from iop(3) → new idx 2
     }
 
     #[test]
@@ -1420,14 +1451,14 @@ mod tests {
         let mut ops = Vec::new();
         // op0: v2 = int_add(v0, v1) — before cut
         let mut op0 = Op::new(OpCode::IntAdd, &[iarg(0), iarg(1)]);
-        op0.pos = iop(2);
+        op0.pos.set(iop(2));
         ops.push(op0);
         // op1: v3 = int_mul(v2, v0) — after cut, references v2 (escaped!)
         let mut op1 = Op::new(OpCode::IntMul, &[iop(2), iarg(0)]);
-        op1.pos = iop(3);
+        op1.pos.set(iop(3));
         ops.push(op1);
         let mut op2 = Op::new(OpCode::Jump, &[iop(3)]);
-        op2.pos = vop(4);
+        op2.pos.set(vop(4));
         ops.push(op2);
         let trace = TreeLoop::new(inputargs, ops);
 
@@ -1451,15 +1482,15 @@ mod tests {
         let mut ops = Vec::new();
         // pre-cut: noop
         let mut op0 = Op::new(OpCode::IntAdd, &[iarg(0), iarg(0)]);
-        op0.pos = iop(1);
+        op0.pos.set(iop(1));
         ops.push(op0);
         // post-cut: uses a constant
         let const_ref = OpRef::const_int(0);
         let mut op1 = Op::new(OpCode::IntAdd, &[iarg(0), const_ref]);
-        op1.pos = iop(2);
+        op1.pos.set(iop(2));
         ops.push(op1);
         let mut op2 = Op::new(OpCode::Jump, &[iop(2)]);
-        op2.pos = vop(3);
+        op2.pos.set(vop(3));
         ops.push(op2);
         let trace = TreeLoop::new(inputargs, ops);
 
@@ -1470,7 +1501,7 @@ mod tests {
         let cut = trace.cut_trace_from(start, &original_boxes, &original_box_types);
         assert_eq!(cut.ops.len(), 2);
         // Constant ref should be preserved as-is
-        assert_eq!(cut.ops[0].args[1], const_ref);
+        assert_eq!(cut.ops[0].arg(1), const_ref);
     }
 
     #[test]
@@ -1480,18 +1511,18 @@ mod tests {
         let mut ops = Vec::new();
         // v1 = int_add(v0, v0) — before cut
         let mut op0 = Op::new(OpCode::IntAdd, &[iarg(0), iarg(0)]);
-        op0.pos = iop(1);
+        op0.pos.set(iop(1));
         ops.push(op0);
         // v2 = int_mul(v1, v0) — before cut
         let mut op1 = Op::new(OpCode::IntMul, &[iop(1), iarg(0)]);
-        op1.pos = iop(2);
+        op1.pos.set(iop(2));
         ops.push(op1);
         // v3 = int_sub(v2, v0) — after cut, references v2 (escaped, depends on v1)
         let mut op2 = Op::new(OpCode::IntSub, &[iop(2), iarg(0)]);
-        op2.pos = iop(3);
+        op2.pos.set(iop(3));
         ops.push(op2);
         let mut op3 = Op::new(OpCode::Jump, &[iop(3)]);
-        op3.pos = vop(4);
+        op3.pos.set(vop(4));
         ops.push(op3);
         let trace = TreeLoop::new(inputargs, ops);
 
@@ -1508,7 +1539,7 @@ mod tests {
         assert_eq!(cut.ops[2].opcode, OpCode::IntSub);
         assert_eq!(cut.ops[3].opcode, OpCode::Jump);
         // Verify remapping chain: v2's arg should reference re-emitted v1
-        assert_eq!(cut.ops[1].args[0], iop(1)); // v1 → prefix idx 0 → BoxInt at position 1
+        assert_eq!(cut.ops[1].arg(0), iop(1)); // v1 → prefix idx 0 → BoxInt at position 1
     }
 
     // ══════════════════════════════════════════════════════════════════
@@ -1579,7 +1610,7 @@ mod tests {
         let guards: Vec<_> = trace.iter_guards().collect();
         assert_eq!(guards.len(), 1);
 
-        let fail_args = guards[0].fail_args.as_ref().unwrap();
+        let fail_args = guards[0].getfailargs().unwrap();
         assert_eq!(fail_args.len(), 2);
         assert_eq!(fail_args[0], i0);
         assert_eq!(fail_args[1], i1);
@@ -1631,9 +1662,9 @@ mod tests {
         rec.close_loop(&[ref2, i1]);
         let trace = rec.get_trace();
 
-        assert_eq!(trace.ops[0].pos, ref0);
-        assert_eq!(trace.ops[1].pos, ref1);
-        assert_eq!(trace.ops[2].pos, ref2);
+        assert_eq!(trace.ops[0].pos.get(), ref0);
+        assert_eq!(trace.ops[1].pos.get(), ref1);
+        assert_eq!(trace.ops[2].pos.get(), ref2);
     }
 
     #[test]
@@ -2675,7 +2706,9 @@ impl TraceCtx {
 
     /// pyjitpl.py:2397 + compile.py:221: take call_pure_results for
     /// passing to the optimizer.
-    pub fn take_call_pure_results(&mut self) -> std::collections::HashMap<Vec<Value>, Value> {
+    pub fn take_call_pure_results(
+        &mut self,
+    ) -> crate::optimizeopt::vec_assoc::VecAssoc<Vec<Value>, Value> {
         std::mem::take(&mut self.call_pure_results)
     }
 
@@ -4296,12 +4329,8 @@ mod history_record_tests {
         let trace = recorder.get_trace();
         let call_op = &trace.ops[0];
         let arg_types = call_op
-            .descr
-            .as_ref()
-            .and_then(|descr| descr.as_call_descr())
-            .expect("call op should carry CallDescr")
-            .arg_types()
-            .to_vec();
+            .with_call_descr(|cd| cd.arg_types().to_vec())
+            .expect("call op should carry CallDescr");
         (arg_types, call_op.opcode)
     }
 
@@ -4309,7 +4338,7 @@ mod history_record_tests {
         let mut recorder = ctx.recorder;
         recorder.close_loop(jump_args);
         let mut trace = recorder.get_trace();
-        trace.ops.remove(0)
+        (*trace.ops.remove(0)).clone()
     }
 
     #[test]
@@ -4377,16 +4406,13 @@ mod history_record_tests {
         let _ = ctx.call_assembler_ref_typed(&token, &args, &[Type::Ref, Type::Float, Type::Int]);
         let op = take_single_call_op(ctx, &args);
         assert_eq!(op.opcode, OpCode::CallAssemblerR);
-        assert_eq!(op.args.as_slice(), &args);
-        let call_descr = op
-            .descr
-            .as_ref()
-            .and_then(|descr| descr.as_call_descr())
+        assert_eq!(&*op.getarglist(), &args);
+        let descr_arc = op.getdescr().expect("call op must carry descr");
+        let call_descr = descr_arc
+            .as_call_descr()
             .expect("call op should carry CallDescr");
-        let loop_token = op
-            .descr
-            .as_ref()
-            .and_then(|descr| descr.as_loop_token_descr())
+        let loop_token = descr_arc
+            .as_loop_token_descr()
             .expect("call op should carry loop-token metadata");
         assert_eq!(call_descr.arg_types(), &[Type::Ref, Type::Float, Type::Int]);
         assert_eq!(call_descr.call_target_token(), Some(777));
@@ -4409,11 +4435,10 @@ mod history_record_tests {
 
         let op = take_single_call_op(ctx, &[frame]);
         assert_eq!(op.opcode, OpCode::CallAssemblerR);
-        assert_eq!(op.args.as_slice(), &[frame]);
-        let call_descr = op
-            .descr
-            .as_ref()
-            .and_then(|descr| descr.as_call_descr())
+        assert_eq!(&*op.getarglist(), &[frame]);
+        let cd_arc = op.getdescr().expect("op must have descr");
+        let call_descr = cd_arc
+            .as_call_descr()
             .expect("red-only CA should still carry a CallDescr");
         assert_eq!(call_descr.arg_types(), &[Type::Ref]);
         assert_eq!(call_descr.call_target_token(), Some(999));

@@ -33,7 +33,7 @@ compile_error!("majit-metainterp requires a backend: enable feature \"cranelift\
 use crate::history::TreeLoop;
 use crate::warmstate::{HotResult, WarmEnterState};
 use majit_ir::descr::DescrRef;
-use majit_ir::{Const, FailDescr, GcRef, InputArg, Op, OpCode, OpRef, Type, Value};
+use majit_ir::{Const, FailDescr, GcRef, InputArg, Op, OpCode, OpRc, OpRef, Type, Value};
 
 use crate::blackhole::{BlackholeResult, ExceptionState, blackhole_execute_with_state_ca};
 use crate::compile;
@@ -128,17 +128,26 @@ pub enum CompileOutcome {
 struct SimpleCompileViews<'a> {
     data: compile::SimpleCompileData<'a>,
     trace_snapshots: Vec<crate::recorder::Snapshot>,
+    /// Deep-cloned `Op` copies of the trace's `Vec<OpRc>` storage.
+    /// The optimizer pipeline still threads `&[Op]` internally; the
+    /// `TreeLoop.ops`-side `Rc<Op>` identity is preserved by re-wrapping
+    /// at the post-optimize boundary (see `TreeLoop::new`).
     trace_ops: Vec<Op>,
 }
 
 fn make_simple_compile_views<'a>(
     trace: &'a TreeLoop,
-    call_pure_results: &'a HashMap<Vec<Value>, Value>,
+    call_pure_results: &'a crate::optimizeopt::vec_assoc::VecAssoc<Vec<Value>, Value>,
     enable_opts: &'a [String],
 ) -> SimpleCompileViews<'a> {
     let data = compile::SimpleCompileData::new(trace, None, call_pure_results, enable_opts);
     let trace_snapshots = data.base.snapshots().to_vec();
-    let trace_ops = data.base.operations().to_vec();
+    let trace_ops: Vec<Op> = data
+        .base
+        .operations()
+        .iter()
+        .map(|rc| (**rc).clone())
+        .collect();
     SimpleCompileViews {
         data,
         trace_snapshots,
@@ -151,14 +160,17 @@ pub(crate) struct CompiledTrace {
     pub(crate) inputargs: Vec<InputArg>,
     /// Optimized ops for blackhole fallback from compiled guard failures.
     pub(crate) ops: Vec<majit_ir::Op>,
-    /// Constant pool paired with `ops` for blackhole fallback.
-    pub(crate) constants: HashMap<u32, i64>,
-    /// Constant types for the constant pool entries.
-    pub(crate) constant_types: HashMap<u32, Type>,
+    /// Typed constant pool paired with `ops` for blackhole fallback.
+    /// history.py:220/261/307 `ConstInt`/`ConstFloat`/`ConstPtr` pin
+    /// type with value, so `Const` carries both — the legacy
+    /// `(constants: HashMap<u32, i64>, constant_types: HashMap<u32, Type>)`
+    /// parallel pair has been collapsed.
+    pub(crate) constants: crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Const>,
     /// Static exit metadata for each guard/finish in this trace.
-    pub(crate) exit_layouts: HashMap<u32, StoredExitLayout>,
+    pub(crate) exit_layouts: crate::optimizeopt::vec_assoc::VecAssoc<u32, StoredExitLayout>,
     /// Static exit metadata for terminal FINISH/JUMP ops, keyed by op index.
-    pub(crate) terminal_exit_layouts: HashMap<usize, StoredExitLayout>,
+    pub(crate) terminal_exit_layouts:
+        crate::optimizeopt::vec_assoc::VecAssoc<usize, StoredExitLayout>,
 }
 
 #[derive(Debug, Clone)]
@@ -309,9 +321,8 @@ impl StoredExitLayout {
 /// via is_const/get_const (resume.py:157 getconst parity).
 /// Decode a raw virtualizable-slot `i64` from `VirtualizableInfo::read_all_boxes`
 /// into the typed `majit_ir::Value` the parallel virtualizable concrete
-/// shadow expects. Mirrors the inverse of `value_to_backend_constant_bits`
-/// (optimizeopt/optimizer.rs) so the shadow never disagrees with the
-/// register-shadow encoding.
+/// shadow expects. Mirrors the inverse of `Const::as_raw_i64()` so the
+/// shadow never disagrees with the register-shadow encoding.
 fn heap_value_for(ty: Type, bits: i64) -> Value {
     match ty {
         Type::Int => Value::Int(bits),
@@ -323,7 +334,7 @@ fn heap_value_for(ty: Type, bits: i64) -> Value {
 
 fn snapshot_map_from_trace_snapshots(
     trace_snapshots: &[crate::recorder::Snapshot],
-    constants: &mut std::collections::HashMap<u32, majit_ir::Value>,
+    constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
 ) -> (
     SnapshotBoxes,
     SnapshotFrameSizes,
@@ -497,7 +508,7 @@ fn translate_trace_iter_box_map(
 /// reference (op args, fail_args, snapshot boxes, vable boxes,
 /// `pending_bridge_rd.liveboxes`) through the iterator's `_cache`.
 fn prepare_bridge_trace_for_optimizer(
-    bridge_ops: &[Op],
+    bridge_ops: &[OpRc],
     bridge_inputargs: &[InputArg],
     snapshot_boxes: SnapshotBoxes,
     snapshot_frame_sizes: SnapshotFrameSizes,
@@ -564,17 +575,17 @@ fn normalize_root_loop_entry_contract(
         .iter()
         .rev()
         .find(|op| op.opcode == OpCode::Jump);
-    let jump_arg_count = last_jump.map(|op| op.args.len()).unwrap_or(0);
+    let jump_arg_count = last_jump.map(|op| op.num_args()).unwrap_or(0);
     let label_op = optimized_ops
         .iter()
         .rev()
         .find(|op| op.opcode == OpCode::Label);
-    let label_arg_count = label_op.map(|op| op.args.len()).unwrap_or(0);
+    let label_arg_count = label_op.map(|op| op.num_args()).unwrap_or(0);
     let label_descr_index = label_op
-        .and_then(|op| op.descr.as_ref())
+        .and_then(|op| op.getdescr())
         .map(|descr| descr.index());
     let jump_targets_current_loop = last_jump.is_some_and(|op| {
-        let jump_descr_index = op.descr.as_ref().map(|descr| descr.index());
+        let jump_descr_index = op.getdescr().map(|descr| descr.index());
         match (jump_descr_index, label_descr_index) {
             (Some(jump_idx), Some(label_idx)) => jump_idx == label_idx,
             (None, None) => true,
@@ -617,7 +628,7 @@ pub(crate) struct CompiledEntry<M> {
     /// Trace id of the root compiled loop.
     pub(crate) root_trace_id: u64,
     /// Metadata for the root loop and any attached bridges, keyed by trace id.
-    pub(crate) traces: HashMap<u64, CompiledTrace>,
+    pub(crate) traces: crate::optimizeopt::vec_assoc::VecAssoc<u64, CompiledTrace>,
     /// RPython parity: previous compiled entries for this green_key.
     /// In RPython, JitCellToken keeps all target_tokens' code alive.
     /// In majit, each retrace produces a new Cranelift function;
@@ -694,13 +705,13 @@ fn compute_next_global_opref(inputargs: &[InputArg], ops: &[majit_ir::Op]) -> u3
     let from_ops = ops
         .iter()
         .map(|op| {
-            let mut hw = opref_high_water(op.pos);
-            for a in &op.args {
+            let mut hw = opref_high_water(op.pos.get());
+            for a in op.getarglist().iter() {
                 hw = hw.max(opref_high_water(*a));
             }
-            if let Some(fa) = &op.fail_args {
+            if let Some(fa) = op.getfailargs() {
                 for a in fa {
-                    hw = hw.max(opref_high_water(*a));
+                    hw = hw.max(opref_high_water(a));
                 }
             }
             hw
@@ -734,8 +745,10 @@ pub struct PartialTrace {
     pub(crate) ops: Vec<Op>,
     /// Inputargs from the partial trace.
     pub(crate) inputargs: Vec<InputArg>,
-    /// Constants from the partial trace.
-    pub(crate) constants: HashMap<u32, i64>,
+    /// Typed constants from the partial trace.  `Const` (history.py:220/261/307)
+    /// carries both value and type, so the merge in `compile_retrace`
+    /// no longer needs a parallel `constant_types` lookup.
+    pub(crate) constants: crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Const>,
 }
 
 /// The meta-tracing JIT engine.
@@ -814,7 +827,7 @@ pub struct ActiveTraceSession<M: Clone> {
 pub struct MetaInterp<M: Clone> {
     pub(crate) warm_state: WarmEnterState,
     pub(crate) backend: BackendImpl,
-    pub(crate) compiled_loops: HashMap<u64, CompiledEntry<M>>,
+    pub(crate) compiled_loops: crate::optimizeopt::vec_assoc::VecAssoc<u64, CompiledEntry<M>>,
     pub(crate) tracing: Option<TraceCtx>,
     pub(crate) next_trace_id: u64,
     /// RPython metainterp_sd.virtualref_info — shared VirtualRefInfo.
@@ -900,7 +913,8 @@ pub struct MetaInterp<M: Clone> {
     pub(crate) virtualref_boxes: Vec<(OpRef, usize)>,
     /// compile.py:288-290 parity: preamble target tokens saved from Phase 1
     /// even when Phase 2 raises InvalidLoop.
-    pending_preamble_tokens: HashMap<u64, Vec<crate::optimizeopt::unroll::TargetToken>>,
+    pending_preamble_tokens:
+        crate::optimizeopt::vec_assoc::VecAssoc<u64, Vec<crate::optimizeopt::unroll::TargetToken>>,
     // pyjitpl.py:2289 `self.staticdata.all_descrs = self.cpu.setup_descrs()` now
     // lives on MetaInterpStaticData (RPython `metainterp_sd.all_descrs`).
     // Access via `self.staticdata.all_descrs` / `&mut self.staticdata.all_descrs`.
@@ -1076,7 +1090,7 @@ pub struct MetaInterp<M: Clone> {
     /// Memoized symbolic names for boxes (debug/log output only).
     /// Pyre uses simple `OpRef → String` mapping; populated lazily by
     /// the on-demand log formatter.
-    pub box_names_memo: std::collections::HashMap<OpRef, String>,
+    pub box_names_memo: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, String>,
 
     /// pyjitpl.py:2412 `self.trace_length_at_last_tco = -1`.
     ///
@@ -1363,14 +1377,16 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         _owning_key: u64,
         entry: CompiledEntry<M>,
-        merged_traces: &mut HashMap<u64, CompiledTrace>,
+        merged_traces: &mut crate::optimizeopt::vec_assoc::VecAssoc<u64, CompiledTrace>,
     ) -> Vec<std::sync::Weak<JitCellToken>> {
         // `entry.token` is already `Weak<JitCellToken>`; push it directly.
         let mut previous_tokens = Vec::with_capacity(1 + entry.previous_tokens.len());
         previous_tokens.push(entry.token);
         previous_tokens.extend(entry.previous_tokens);
         for (tid, ct) in entry.traces {
-            merged_traces.entry(tid).or_insert(ct);
+            if !merged_traces.contains_key(&tid) {
+                merged_traces.insert(tid, ct);
+            }
         }
         previous_tokens
     }
@@ -1472,19 +1488,14 @@ impl<M: Clone> MetaInterp<M> {
         // at `descr.rs:1065`). The HashMap was keyed on the per-trace
         // counter, so descr-side identity must read the per-trace slot.
         let op_index = trace.ops.iter().position(|op| {
-            op.descr
-                .as_ref()
-                .and_then(|descr| descr.as_fail_descr())
-                .is_some_and(|descr| descr.fail_index_per_trace() == fail_index)
+            op.with_fail_descr(|descr| descr.fail_index_per_trace() == fail_index)
+                .unwrap_or(false)
         })?;
         let op = trace.ops.get(op_index)?;
-        if let Some(types) = &op.fail_arg_types {
-            return Some(types.clone());
+        if let Some(types) = op.get_fail_arg_types() {
+            return Some(types.to_vec());
         }
-        op.descr
-            .as_ref()
-            .and_then(|descr| descr.as_fail_descr())
-            .map(|descr| descr.fail_arg_types().to_vec())
+        op.with_fail_descr(|descr| descr.fail_arg_types().to_vec())
             .filter(|types| !types.is_empty())
     }
 
@@ -1670,7 +1681,8 @@ impl<M: Clone> MetaInterp<M> {
             self.backend
                 .compiled_trace_fail_descr_layouts(token, trace_id)
         }) {
-            let mut merged = HashMap::new();
+            let mut merged: crate::optimizeopt::vec_assoc::VecAssoc<u32, CompiledExitLayout> =
+                crate::optimizeopt::vec_assoc::VecAssoc::new();
             for layout in exit_layouts.drain(..) {
                 merged.insert(layout.fail_index, layout);
             }
@@ -1695,7 +1707,7 @@ impl<M: Clone> MetaInterp<M> {
                     },
                 );
             }
-            exit_layouts = merged.into_values().collect();
+            exit_layouts = merged.into_iter().map(|(_, v)| v).collect();
             exit_layouts.sort_by_key(|layout| layout.fail_index);
         }
 
@@ -1723,7 +1735,10 @@ impl<M: Clone> MetaInterp<M> {
             self.backend
                 .compiled_trace_terminal_exit_layouts(token, trace_id)
         }) {
-            let mut merged = HashMap::new();
+            let mut merged: crate::optimizeopt::vec_assoc::VecAssoc<
+                usize,
+                CompiledTerminalExitLayout,
+            > = crate::optimizeopt::vec_assoc::VecAssoc::new();
             for layout in terminal_exit_layouts.drain(..) {
                 merged.insert(layout.op_index, layout);
             }
@@ -1751,7 +1766,7 @@ impl<M: Clone> MetaInterp<M> {
                     },
                 );
             }
-            terminal_exit_layouts = merged.into_values().collect();
+            terminal_exit_layouts = merged.into_iter().map(|(_, v)| v).collect();
             terminal_exit_layouts.sort_by_key(|layout| layout.op_index);
         }
 
@@ -1771,7 +1786,7 @@ impl<M: Clone> MetaInterp<M> {
         let mut this = MetaInterp {
             warm_state: WarmEnterState::new(threshold),
             backend: BackendImpl::new(),
-            compiled_loops: HashMap::new(),
+            compiled_loops: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             tracing: None,
             next_trace_id: 1,
             virtualref_info: crate::virtualref::VirtualRefInfo::new(),
@@ -1798,7 +1813,7 @@ impl<M: Clone> MetaInterp<M> {
             last_quasi_immutable_deps: Vec::new(),
             retrace_after_bridge: false,
             virtualref_boxes: Vec::new(),
-            pending_preamble_tokens: HashMap::new(),
+            pending_preamble_tokens: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             pending_frontend_boxes: None,
             cls_of_box: Some(default_cls_of_box),
             issubclass: Some(default_issubclass),
@@ -1818,7 +1833,7 @@ impl<M: Clone> MetaInterp<M> {
             class_of_last_exc_is_const: false,
             forced_virtualizable: 0,
             ovf_flag: false,
-            box_names_memo: std::collections::HashMap::new(),
+            box_names_memo: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             trace_length_at_last_tco: -1,
             active_trace_session: None,
         };
@@ -3744,7 +3759,7 @@ impl<M: Clone> MetaInterp<M> {
     pub fn finish_trace_for_parity(
         &mut self,
         finish_args: &[OpRef],
-    ) -> Option<(TreeLoop, HashMap<u32, i64>)> {
+    ) -> Option<(TreeLoop, majit_ir::VecAssoc<u32, i64>)> {
         self.force_finish_trace = false;
         let mut ctx = self.tracing.take()?;
         let green_key = ctx.green_key;
@@ -3797,7 +3812,7 @@ impl<M: Clone> MetaInterp<M> {
         &self,
         inputargs: &mut Vec<InputArg>,
         ops: &mut Vec<Op>,
-        constants: &mut HashMap<u32, majit_ir::Value>,
+        constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
         driver_descriptor: Option<&crate::jitdriver::JitDriverStaticData>,
         orig_vable_ptr: *const u8,
     ) {
@@ -4158,7 +4173,16 @@ impl<M: Clone> MetaInterp<M> {
         ctx.constants.refresh_from_gc();
         let mut constants = ctx.constants.into_inner_typed();
 
-        let trace_ops = preamble_data.base.operations().to_vec();
+        // Materialize Vec<Op> from the trace's `Vec<OpRc>` so the
+        // optimizer's `&[Op]` surface gets owned data. The deep-clone
+        // mirrors PyPy's `cls()` fresh ResOperation per iteration —
+        // optimizer mutations don't leak into TreeLoop.ops identity.
+        let trace_ops: Vec<Op> = preamble_data
+            .base
+            .operations()
+            .iter()
+            .map(|rc| (**rc).clone())
+            .collect();
         if crate::majit_log_enabled() {
             eprintln!("--- trace (before opt) ---");
             eprint!("{}", majit_ir::format_trace(&trace_ops, &constants));
@@ -4212,10 +4236,10 @@ impl<M: Clone> MetaInterp<M> {
             snapshot_vref_map,
             snapshot_pc_map,
         ) = snapshot_map_from_trace_snapshots(&trace_snapshots, &mut constants);
-        // history.py:220 box.type parity: every Const Box pins its `.type`
-        // intrinsically, so the optimizer's seed-side `constant_types`
-        // table is just the per-entry type tag derived from `constants`.
-        unroll_opt.constant_types = constants.iter().map(|(&k, v)| (k, v.get_type())).collect();
+        // history.py:220/261/307 — `Const{Int,Float,Ptr}.type` is an
+        // intrinsic attribute on the Box itself, so no raw-u32 type
+        // side-table propagation is needed; callers recover the type
+        // through `OpRef::ty()` / `Const::get_type()`.
         unroll_opt.snapshot_boxes = snapshot_map.clone();
         unroll_opt.snapshot_frame_sizes = snapshot_frame_size_map.clone();
         unroll_opt.snapshot_vable_boxes = snapshot_vable_map.clone();
@@ -4261,20 +4285,13 @@ impl<M: Clone> MetaInterp<M> {
                     {
                         let mut retry_constants = constants_snapshot;
                         let mut simple_opt = Optimizer::default_pipeline();
-                        simple_opt.constant_types = retry_constants
-                            .iter()
-                            .map(|(&k, v)| (k, v.get_type()))
-                            .collect();
-                        // history.py:_make_op parity — see the
-                        // function-entry compile path below.
+                        // history.py:220/261/307: `Const.type` /
+                        // `InputArg.type` are intrinsic on the box;
+                        // no raw-u32 type side-table propagation is
+                        // needed (callers read via `OpRef::ty()`).
                         let inputarg_types: Vec<majit_ir::Type> =
                             trace.inputargs.iter().map(|ia| ia.tp).collect();
                         simple_opt.trace_inputarg_types = inputarg_types.clone();
-                        for (i, &tp) in inputarg_types.iter().enumerate() {
-                            simple_opt
-                                .constant_types
-                                .insert(OpRef::input_arg_typed(i as u32, tp).raw(), tp);
-                        }
                         simple_opt.snapshot_boxes = snapshot_map.clone();
                         simple_opt.snapshot_frame_sizes = snapshot_frame_size_map.clone();
                         simple_opt.snapshot_vable_boxes = snapshot_vable_map.clone();
@@ -4384,7 +4401,7 @@ impl<M: Clone> MetaInterp<M> {
                     .map(|ia| ia.opref())
                     .collect::<Vec<_>>(),
             );
-            label_op.pos = majit_ir::OpRef::NONE;
+            label_op.pos.set(majit_ir::OpRef::NONE);
             optimized_ops.insert(0, label_op);
         }
         let (inputargs, optimized_ops) = match normalize_root_loop_entry_contract(
@@ -4419,7 +4436,7 @@ impl<M: Clone> MetaInterp<M> {
             eprint!("{}", majit_ir::format_trace(&compiled_ops, &constants));
             for op in &compiled_ops {
                 if op.opcode == majit_ir::OpCode::GuardNotInvalidated {
-                    if let Some(ref fa) = op.fail_args {
+                    if let Some(fa) = op.getfailargs() {
                         let raw: Vec<String> = fa
                             .iter()
                             .map(|a| format!("OpRef::from_raw({})", a.raw()))
@@ -4474,20 +4491,20 @@ impl<M: Clone> MetaInterp<M> {
                 .last_mut()
                 .filter(|op| op.opcode == OpCode::Jump)
             {
-                jump_op.descr = Some(target_token.as_jump_target_descr());
+                jump_op.setdescr(target_token.as_jump_target_descr());
             }
             if let Some(label_op) = compiled_ops
                 .iter_mut()
                 .find(|op| op.opcode == OpCode::Label)
             {
-                label_op.descr = Some(target_token.as_jump_target_descr());
+                label_op.setdescr(target_token.as_jump_target_descr());
             } else {
                 let mut label_op = majit_ir::Op::new(
                     majit_ir::OpCode::Label,
                     &inputargs.iter().map(|ia| ia.opref()).collect::<Vec<_>>(),
                 );
-                label_op.pos = majit_ir::OpRef::NONE;
-                label_op.descr = Some(target_token.as_jump_target_descr());
+                label_op.pos.set(majit_ir::OpRef::NONE);
+                label_op.setdescr(target_token.as_jump_target_descr());
                 compiled_ops.insert(0, label_op);
             }
             vec![target_token]
@@ -4529,15 +4546,10 @@ impl<M: Clone> MetaInterp<M> {
             driver_descriptor.as_ref(),
             orig_vable_ptr_loop,
         );
-        // Backend boundary: lower typed `Value` pool to the legacy
-        // `(i64, Type)` pair the backend's `set_constants` /
-        // `set_constant_types` API consumes.
-        let (backend_constants, backend_constant_types) =
-            crate::optimizeopt::optimizer::lower_typed_constants_to_backend(&constants);
-        let compiled_constants = backend_constants.clone();
-        let compiled_constant_types = backend_constant_types.clone();
-        self.backend.set_constants(backend_constants);
-        self.backend.set_constant_types(backend_constant_types);
+        let compiled_constants_typed =
+            crate::optimizeopt::optimizer::lower_typed_constants_to_const_pool(&constants);
+        self.backend
+            .set_constants_pool(compiled_constants_typed.clone());
         // resume.py:1143-1188 parity — VStr/VUni Concat/Slice guard-exit
         // materialization needs the staticdata.callinfocollection to
         // resolve OS_STR_CONCAT / OS_UNI_CONCAT / OS_STR_SLICE /
@@ -4545,10 +4557,17 @@ impl<M: Clone> MetaInterp<M> {
         // handle VStr/VUni at the backend layer (dynasm) get a no-op.
         self.backend
             .set_callinfocollection(self.callinfocollection.clone());
+        // Wrap optimizer-output `Vec<Op>` into `Vec<OpRc>` for the
+        // backend's `&[OpRc]` boundary (history.py:528 ResOperation
+        // identity at trace level).
+        let compiled_ops_rc: Vec<majit_ir::OpRc> = compiled_ops
+            .iter()
+            .map(|op| std::rc::Rc::new(op.clone()))
+            .collect();
         let compile_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.backend.compile_loop(
                 &inputargs,
-                &compiled_ops,
+                &compiled_ops_rc,
                 Arc::get_mut(&mut token)
                     .expect("JitCellToken must stay uniquely owned until backend compile"),
             )
@@ -4579,8 +4598,7 @@ impl<M: Clone> MetaInterp<M> {
                         }
                     } else {
                         self.pending_preamble_tokens
-                            .entry(green_key)
-                            .or_insert_with(|| unroll_opt.target_tokens.clone());
+                            .entry_or_insert_with(green_key, || unroll_opt.target_tokens.clone());
                     }
                 }
                 self.warm_state.abort_tracing(green_key, !is_invalid_loop);
@@ -4610,13 +4628,10 @@ impl<M: Clone> MetaInterp<M> {
                     &inputargs,
                     &compiled_ops,
                     green_key,
-                    &compiled_constant_types,
+                    &compiled_constants_typed,
                 );
-                let mut terminal_exit_layouts = compile::build_terminal_exit_layouts(
-                    &inputargs,
-                    &compiled_ops,
-                    &compiled_constant_types,
-                );
+                let mut terminal_exit_layouts =
+                    compile::build_terminal_exit_layouts(&inputargs, &compiled_ops);
                 if let Some(backend_layouts) =
                     self.backend.compiled_fail_descr_layouts(token.as_ref())
                 {
@@ -4661,14 +4676,13 @@ impl<M: Clone> MetaInterp<M> {
                 let mut next_global_opref = unroll_opt
                     .next_global_opref
                     .max(compute_next_global_opref(&inputargs, &compiled_ops));
-                let mut traces = HashMap::new();
+                let mut traces = crate::optimizeopt::vec_assoc::VecAssoc::new();
                 traces.insert(
                     trace_id,
                     CompiledTrace {
                         inputargs: inputargs.clone(),
                         ops: compiled_ops,
-                        constants: compiled_constants,
-                        constant_types: compiled_constant_types.clone(),
+                        constants: compiled_constants_typed.clone(),
                         exit_layouts,
                         terminal_exit_layouts,
                     },
@@ -4905,15 +4919,9 @@ impl<M: Clone> MetaInterp<M> {
             .enumerate()
             .map(|(i, &tp)| majit_ir::InputArg::from_type(tp, i as u32))
             .collect();
-        let (mut constants, mut constant_types) = {
-            // history.py:220 box.type parity: ConstantPool stores typed
-            // `Value` intrinsically — the snapshot is already the
-            // canonical shape; the legacy `constant_types` view is a
-            // pure projection used by the bridge entry path.
-            let typed = ctx.constants.snapshot();
-            let types = ctx.constants.constant_types_snapshot();
-            (typed, types)
-        };
+        // history.py:220 box.type parity: ConstantPool stores typed
+        // `Value` intrinsically — the snapshot is the canonical shape.
+        let mut constants = ctx.constants.snapshot();
         let call_pure_results = ctx.call_pure_results.clone();
         let trace_snapshots = ctx.snapshots().to_vec();
         let (
@@ -4923,23 +4931,10 @@ impl<M: Clone> MetaInterp<M> {
             snapshot_vref_boxes,
             snapshot_frame_pcs,
         ) = snapshot_map_from_trace_snapshots(&trace_snapshots, &mut constants);
-        // Re-sync legacy `constant_types` view: snapshot_map_from_trace_snapshots
-        // may have minted fresh ConstInt/ConstFloat/ConstPtr entries.
-        for (&k, v) in &constants {
-            constant_types.entry(k).or_insert_with(|| v.get_type());
-        }
-        // Lower back to the legacy `i64` pool for the bridge compilation
-        // helpers below (compile_bridge / compile_entry_bridge consume the
-        // legacy backend shape directly).
-        let constants: HashMap<u32, i64> = constants
-            .iter()
-            .map(|(&k, v)| {
-                (
-                    k,
-                    crate::optimizeopt::optimizer::value_to_backend_constant_bits(v),
-                )
-            })
-            .collect();
+        // Lower the typed `Value` pool to the dense `VecAssoc<u32, Const>`
+        // shape the bridge compilation helpers consume.
+        let bridge_constants =
+            crate::optimizeopt::optimizer::lower_typed_constants_to_const_pool(&constants);
 
         // pyjitpl.py:3195 finally: always cut — pop the tentative JUMP/FINISH.
         ctx.cut_trace(cut_at);
@@ -5011,8 +5006,7 @@ impl<M: Clone> MetaInterp<M> {
                     fail_descr,
                     &bridge_ops,
                     &bridge_inputargs,
-                    constants,
-                    constant_types,
+                    bridge_constants,
                     snapshot_boxes,
                     snapshot_frame_sizes,
                     snapshot_vable_boxes,
@@ -5042,8 +5036,7 @@ impl<M: Clone> MetaInterp<M> {
                     entry_meta,
                     &bridge_ops,
                     &bridge_inputargs,
-                    constants,
-                    constant_types,
+                    bridge_constants,
                     snapshot_boxes,
                     snapshot_frame_sizes,
                     snapshot_vable_boxes,
@@ -5073,7 +5066,7 @@ impl<M: Clone> MetaInterp<M> {
         green_key: u64,
         ops: Vec<Op>,
         inputargs: Vec<InputArg>,
-        constants: HashMap<u32, i64>,
+        constants: crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Const>,
         exported_state: crate::optimizeopt::unroll::ExportedState,
     ) {
         if crate::majit_log_enabled() {
@@ -5148,7 +5141,6 @@ impl<M: Clone> MetaInterp<M> {
             orig_vable_ptr_retrace,
             loop_jitcell_token,
             mut constants,
-            mut constant_types,
             trace,
             call_pure_results,
         ) = {
@@ -5169,11 +5161,8 @@ impl<M: Clone> MetaInterp<M> {
             let orig_vable_ptr_retrace =
                 self.orig_vable_ptr_from_trace_ctx(&ctx, driver_descriptor.as_ref());
             // history.py:220 box.type parity: ConstantPool stores typed
-            // `Value` intrinsically — the snapshot is already the
-            // canonical shape; the legacy `constant_types` view is a
-            // pure projection used by `apply_partial_trace_into`.
-            let constants: HashMap<u32, majit_ir::Value> = ctx.constants.snapshot();
-            let constant_types = ctx.constants.constant_types_snapshot();
+            // `Value` intrinsically — the snapshot is the canonical shape.
+            let constants: majit_ir::VecAssoc<u32, majit_ir::Value> = ctx.constants.snapshot();
             let initial_inputarg_consts = ctx.initial_inputarg_consts.clone();
             let call_pure_results = ctx.take_call_pure_results();
 
@@ -5209,13 +5198,12 @@ impl<M: Clone> MetaInterp<M> {
                 orig_vable_ptr_retrace,
                 loop_jitcell_token,
                 constants,
-                constant_types,
                 trace,
                 call_pure_results,
             )
         };
 
-        let trace_ops = {
+        let trace_ops: Vec<Op> = {
             let loop_data = compile::UnrolledLoopData::new(
                 &trace,
                 &loop_jitcell_token,
@@ -5223,7 +5211,12 @@ impl<M: Clone> MetaInterp<M> {
                 &call_pure_results,
                 self.warm_state.get_enable_opts(),
             );
-            loop_data.base.operations().to_vec()
+            loop_data
+                .base
+                .operations()
+                .iter()
+                .map(|rc| (**rc).clone())
+                .collect()
         };
 
         if crate::majit_log_enabled() {
@@ -5259,9 +5252,8 @@ impl<M: Clone> MetaInterp<M> {
             retrace_snapshot_vref_boxes,
             retrace_snapshot_frame_pcs,
         ) = snapshot_map_from_trace_snapshots(&trace.snapshots, &mut constants);
-        // history.py:220 box.type parity: derive `constant_types` from
-        // the typed `Value` pool (each pool entry pins its box class).
-        unroll_opt.constant_types = constants.iter().map(|(&k, v)| (k, v.get_type())).collect();
+        // history.py:220/261/307 — `Const.type` is intrinsic on the
+        // box; no raw-u32 type side-table propagation is needed.
         unroll_opt.snapshot_boxes = retrace_snapshot_boxes;
         unroll_opt.snapshot_frame_sizes = retrace_snapshot_frame_sizes;
         unroll_opt.snapshot_vable_boxes = retrace_snapshot_vable_boxes;
@@ -5306,16 +5298,12 @@ impl<M: Clone> MetaInterp<M> {
         // ops (JUMP excluded), matching RPython's partial_trace.operations.
         let mut combined_ops = partial.ops;
         combined_ops.extend(body_ops);
-        // Merge constants from partial trace with new constants. The
-        // partial trace was serialized in the legacy backend `i64` shape;
-        // promote each entry to a typed `Value` via its companion type
-        // tag (constant_types) — history.py:220 box.type parity.
-        for (k, v) in partial.constants {
-            let tp = constant_types
-                .get(&k)
-                .copied()
-                .unwrap_or(majit_ir::Type::Int);
-            constants.entry(k).or_insert_with(|| heap_value_for(tp, v));
+        // Merge constants from partial trace with new constants.  Partial
+        // trace stores `Const` (history.py:220/261/307) intrinsically, so
+        // `Const::to_value()` recovers the typed `Value` without a
+        // parallel type lookup.
+        for (k, c) in partial.constants {
+            constants.entry_or_insert_with(k, || c.to_value());
         }
 
         // compile.py:1075-1085 + 379-393 parity: the partial trace saved by
@@ -5371,15 +5359,10 @@ impl<M: Clone> MetaInterp<M> {
             driver_descriptor.as_ref(),
             orig_vable_ptr_retrace,
         );
-        // Backend boundary: lower typed `Value` pool to the legacy
-        // `(i64, Type)` pair the backend's `set_constants` /
-        // `set_constant_types` API consumes.
-        let (backend_constants, backend_constant_types) =
-            crate::optimizeopt::optimizer::lower_typed_constants_to_backend(&constants);
-        let compiled_constants = backend_constants.clone();
-        let compiled_constant_types = backend_constant_types.clone();
-        self.backend.set_constants(backend_constants);
-        self.backend.set_constant_types(backend_constant_types);
+        let compiled_constants_typed =
+            crate::optimizeopt::optimizer::lower_typed_constants_to_const_pool(&constants);
+        self.backend
+            .set_constants_pool(compiled_constants_typed.clone());
         // resume.py:1143-1188 parity — VStr/VUni Concat/Slice guard-exit
         // materialization needs the staticdata.callinfocollection to
         // resolve OS_STR_CONCAT / OS_UNI_CONCAT / OS_STR_SLICE /
@@ -5404,9 +5387,14 @@ impl<M: Clone> MetaInterp<M> {
         self.backend.set_next_header_pc(green_key);
 
         let compile_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // Wrap to `Vec<OpRc>` for the backend's trait boundary.
+            let combined_ops_rc: Vec<majit_ir::OpRc> = combined_ops
+                .iter()
+                .map(|op| std::rc::Rc::new(op.clone()))
+                .collect();
             self.backend.compile_loop(
                 &inputargs,
-                &combined_ops,
+                &combined_ops_rc,
                 Arc::get_mut(&mut token)
                     .expect("JitCellToken must stay uniquely owned until backend compile"),
             )
@@ -5464,13 +5452,10 @@ impl<M: Clone> MetaInterp<M> {
                     &inputargs,
                     &combined_ops,
                     green_key,
-                    &compiled_constant_types,
+                    &compiled_constants_typed,
                 );
-                let mut terminal_exit_layouts = compile::build_terminal_exit_layouts(
-                    &inputargs,
-                    &combined_ops,
-                    &compiled_constant_types,
-                );
+                let mut terminal_exit_layouts =
+                    compile::build_terminal_exit_layouts(&inputargs, &combined_ops);
                 if let Some(backend_layouts) =
                     self.backend.compiled_fail_descr_layouts(token.as_ref())
                 {
@@ -5508,14 +5493,13 @@ impl<M: Clone> MetaInterp<M> {
                 let mut next_global_opref = unroll_opt
                     .next_global_opref
                     .max(compute_next_global_opref(&inputargs, &combined_ops));
-                let mut traces = HashMap::new();
+                let mut traces = crate::optimizeopt::vec_assoc::VecAssoc::new();
                 traces.insert(
                     trace_id,
                     CompiledTrace {
                         inputargs: inputargs.clone(),
                         ops: combined_ops,
-                        constants: compiled_constants,
-                        constant_types: compiled_constant_types.clone(),
+                        constants: compiled_constants_typed.clone(),
                         exit_layouts,
                         terminal_exit_layouts,
                     },
@@ -5742,18 +5726,15 @@ impl<M: Clone> MetaInterp<M> {
             Optimizer::default_pipeline()
         };
         optimizer.all_descrs = std::mem::take(&mut *self.staticdata.all_descrs.lock().unwrap());
-        optimizer.constant_types = constants.iter().map(|(&k, v)| (k, v.get_type())).collect();
         optimizer.call_pure_results = simple_data.call_pure_results.clone();
         // history.py:_make_op parity: every InputArg carries its type
         // from the recorder. Propagate those raw recorder types to the
         // optimizer without further reconciliation.
         let inputarg_types: Vec<majit_ir::Type> = trace.inputargs.iter().map(|ia| ia.tp).collect();
         optimizer.trace_inputarg_types = inputarg_types.clone();
-        for (i, &tp) in inputarg_types.iter().enumerate() {
-            optimizer
-                .constant_types
-                .insert(OpRef::input_arg_typed(i as u32, tp).raw(), tp);
-        }
+        // history.py:220/261/307 — `Const.type` / `InputArg.type` are
+        // intrinsic on the box itself; no raw-u32 type side-table
+        // propagation is needed.
         // resume.py parity: convert tracing-time snapshots to flat OpRef
         // vectors so the optimizer can rebuild fail_args from snapshot in
         // store_final_boxes_in_guard (RPython ResumeDataVirtualAdder.finish).
@@ -5764,14 +5745,6 @@ impl<M: Clone> MetaInterp<M> {
             snapshot_vref_map,
             snapshot_pc_map,
         ) = snapshot_map_from_trace_snapshots(&trace_snapshots, &mut constants);
-        // history.py:220 box.type parity: derive the optimizer's
-        // `constant_types` from the typed-`Value` pool (the box class is
-        // pinned on every `Value`). Then re-stamp inputarg slot types
-        // (op-position slots for fresh inputargs are not in `constants`).
-        optimizer.constant_types = constants.iter().map(|(&k, v)| (k, v.get_type())).collect();
-        for (i, &tp) in inputarg_types.iter().enumerate() {
-            optimizer.constant_types.insert(i as u32, tp);
-        }
         // compile.py:92-96 SimpleCompileData.optimize → optimize_loop parity.
         // Wire snapshot data through to the optimizer so guard
         // store_final_boxes_in_guard (mod.rs:2261) can properly populate
@@ -5832,7 +5805,7 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.update_counters(&self.staticdata.profiler);
         // RPython compile.py:234 parity: transfer quasi-immutable deps
         // from optimizer to MetaInterp for post-compile watcher registration.
-        self.last_quasi_immutable_deps = optimizer.quasi_immutable_deps.drain().collect();
+        self.last_quasi_immutable_deps = std::mem::take(&mut optimizer.quasi_immutable_deps);
 
         if crate::majit_log_enabled() {
             eprintln!(
@@ -5893,12 +5866,7 @@ impl<M: Clone> MetaInterp<M> {
         if let Some(first_guard_types) = optimized_ops
             .iter()
             .find(|op| op.opcode.is_guard())
-            .and_then(|op| {
-                op.descr
-                    .as_ref()
-                    .and_then(|d| d.as_fail_descr())
-                    .map(|fd| fd.fail_arg_types().to_vec())
-            })
+            .and_then(|op| op.with_fail_descr(|fd| fd.fail_arg_types().to_vec()))
         {
             for (i, ia) in inputargs.iter_mut().enumerate() {
                 if let Some(&tp) = first_guard_types.get(i) {
@@ -5928,15 +5896,10 @@ impl<M: Clone> MetaInterp<M> {
             orig_vable_ptr,
         );
 
-        // Backend boundary: lower typed `Value` pool to the legacy
-        // `(i64, Type)` pair the backend's `set_constants` /
-        // `set_constant_types` API consumes.
-        let (backend_constants, backend_constant_types) =
-            crate::optimizeopt::optimizer::lower_typed_constants_to_backend(&constants);
-        let compiled_constants = backend_constants.clone();
-        let compiled_constant_types = backend_constant_types.clone();
-        self.backend.set_constants(backend_constants);
-        self.backend.set_constant_types(backend_constant_types);
+        let compiled_constants_typed =
+            crate::optimizeopt::optimizer::lower_typed_constants_to_const_pool(&constants);
+        self.backend
+            .set_constants_pool(compiled_constants_typed.clone());
         // resume.py:1143-1188 parity — VStr/VUni Concat/Slice guard-exit
         // materialization needs the staticdata.callinfocollection to
         // resolve OS_STR_CONCAT / OS_UNI_CONCAT / OS_STR_SLICE /
@@ -5944,9 +5907,13 @@ impl<M: Clone> MetaInterp<M> {
         // handle VStr/VUni at the backend layer (dynasm) get a no-op.
         self.backend
             .set_callinfocollection(self.callinfocollection.clone());
+        let optimized_ops_rc: Vec<majit_ir::OpRc> = optimized_ops
+            .iter()
+            .map(|op| std::rc::Rc::new(op.clone()))
+            .collect();
         match self.backend.compile_loop(
             &inputargs,
-            &optimized_ops,
+            &optimized_ops_rc,
             Arc::get_mut(&mut token)
                 .expect("JitCellToken must stay uniquely owned until backend compile"),
         ) {
@@ -5959,13 +5926,10 @@ impl<M: Clone> MetaInterp<M> {
                     &inputargs,
                     &optimized_ops,
                     green_key,
-                    &compiled_constant_types,
+                    &compiled_constants_typed,
                 );
-                let mut terminal_exit_layouts = compile::build_terminal_exit_layouts(
-                    &inputargs,
-                    &optimized_ops,
-                    &compiled_constant_types,
-                );
+                let mut terminal_exit_layouts =
+                    compile::build_terminal_exit_layouts(&inputargs, &optimized_ops);
                 if let Some(backend_layouts) =
                     self.backend.compiled_fail_descr_layouts(token.as_ref())
                 {
@@ -6001,14 +5965,13 @@ impl<M: Clone> MetaInterp<M> {
                 );
                 self.take_back_all_descrs(std::mem::take(&mut optimizer.all_descrs));
                 let mut next_global_opref = compute_next_global_opref(&inputargs, &optimized_ops);
-                let mut traces = HashMap::new();
+                let mut traces = crate::optimizeopt::vec_assoc::VecAssoc::new();
                 traces.insert(
                     trace_id,
                     CompiledTrace {
                         inputargs: trace.inputargs.clone(),
                         ops: optimized_ops,
-                        constants: compiled_constants,
-                        constant_types: compiled_constant_types.clone(),
+                        constants: compiled_constants_typed.clone(),
                         exit_layouts,
                         terminal_exit_layouts,
                     },
@@ -6160,15 +6123,12 @@ impl<M: Clone> MetaInterp<M> {
             Optimizer::default_pipeline()
         };
         optimizer.all_descrs = std::mem::take(&mut *self.staticdata.all_descrs.lock().unwrap());
-        optimizer.constant_types = constants.iter().map(|(&k, v)| (k, v.get_type())).collect();
         optimizer.call_pure_results = simple_data.call_pure_results.clone();
-        // history.py InputArg.type parity: each `InputArg` already carries
-        // its type in the typed OpRef variant tag (`InputArg::opref()` calls
-        // `OpRef::input_arg_typed(idx, tp)` in majit-ir/src/value.rs:253).
-        // `opref_type` (optimizer/mod.rs:5016) reads `resolved.ty()` from the
-        // variant tag at priority-0 before consulting any side table, so the
-        // legacy `constant_types.insert(ia.opref().raw(), ia.tp)` writes
-        // were redundant for typed inputargs.
+        // history.py:220/261/307 — `Const.type` / `InputArg.type` are
+        // intrinsic on the box itself (recovered via `OpRef::ty()` from
+        // the typed variant tag), so no raw-u32 type side-table
+        // propagation is needed for either pooled constants or
+        // inputargs.
 
         let (
             snapshot_map,
@@ -6177,14 +6137,6 @@ impl<M: Clone> MetaInterp<M> {
             snapshot_vref_map,
             snapshot_pc_map,
         ) = snapshot_map_from_trace_snapshots(&trace_snapshots, &mut constants);
-        // history.py:220 box.type parity: derive the optimizer's
-        // `constant_types` from the typed-`Value` pool (each `Value`
-        // pins its box class intrinsically).
-        optimizer.constant_types = constants.iter().map(|(&k, v)| (k, v.get_type())).collect();
-        // RPython Box.type parity: register inputarg types.
-        for ia in &trace.inputargs {
-            optimizer.constant_types.insert(ia.index, ia.tp);
-        }
         optimizer.snapshot_boxes = snapshot_map;
         optimizer.snapshot_frame_sizes = snapshot_frame_size_map;
         optimizer.snapshot_vable_boxes = snapshot_vable_map;
@@ -6223,7 +6175,7 @@ impl<M: Clone> MetaInterp<M> {
 
         // optimizer.py:557 self.resumedata_memo.update_counters(profiler)
         optimizer.update_counters(&self.staticdata.profiler);
-        self.last_quasi_immutable_deps = optimizer.quasi_immutable_deps.drain().collect();
+        self.last_quasi_immutable_deps = std::mem::take(&mut optimizer.quasi_immutable_deps);
 
         let num_ops_after = optimized_ops.len();
         if crate::majit_log_enabled() {
@@ -6270,14 +6222,14 @@ impl<M: Clone> MetaInterp<M> {
             .last_mut()
             .filter(|op| op.opcode == OpCode::Jump)
         {
-            jump_op.descr = Some(target_token.as_jump_target_descr());
+            jump_op.setdescr(target_token.as_jump_target_descr());
         }
         let mut label_op = majit_ir::Op::new(
             majit_ir::OpCode::Label,
             &inputargs.iter().map(|ia| ia.opref()).collect::<Vec<_>>(),
         );
-        label_op.pos = majit_ir::OpRef::NONE;
-        label_op.descr = Some(target_token.as_jump_target_descr());
+        label_op.pos.set(majit_ir::OpRef::NONE);
+        label_op.setdescr(target_token.as_jump_target_descr());
         compiled_ops.insert(0, label_op);
 
         // compile.py:504-511 send_loop_to_backend virtualizable hook —
@@ -6292,15 +6244,10 @@ impl<M: Clone> MetaInterp<M> {
             driver_descriptor.as_ref(),
             orig_vable_ptr_simple,
         );
-        // Backend boundary: lower typed `Value` pool to the legacy
-        // `(i64, Type)` pair the backend's `set_constants` /
-        // `set_constant_types` API consumes.
-        let (backend_constants, backend_constant_types) =
-            crate::optimizeopt::optimizer::lower_typed_constants_to_backend(&constants);
-        let compiled_constants = backend_constants.clone();
-        let compiled_constant_types = backend_constant_types.clone();
-        self.backend.set_constants(backend_constants);
-        self.backend.set_constant_types(backend_constant_types);
+        let compiled_constants_typed =
+            crate::optimizeopt::optimizer::lower_typed_constants_to_const_pool(&constants);
+        self.backend
+            .set_constants_pool(compiled_constants_typed.clone());
         // resume.py:1143-1188 parity — VStr/VUni Concat/Slice guard-exit
         // materialization needs the staticdata.callinfocollection to
         // resolve OS_STR_CONCAT / OS_UNI_CONCAT / OS_STR_SLICE /
@@ -6308,9 +6255,13 @@ impl<M: Clone> MetaInterp<M> {
         // handle VStr/VUni at the backend layer (dynasm) get a no-op.
         self.backend
             .set_callinfocollection(self.callinfocollection.clone());
+        let compiled_ops_rc: Vec<majit_ir::OpRc> = compiled_ops
+            .iter()
+            .map(|op| std::rc::Rc::new(op.clone()))
+            .collect();
         match self.backend.compile_loop(
             &inputargs,
-            &compiled_ops,
+            &compiled_ops_rc,
             Arc::get_mut(&mut token)
                 .expect("JitCellToken must stay uniquely owned until backend compile"),
         ) {
@@ -6323,13 +6274,10 @@ impl<M: Clone> MetaInterp<M> {
                     &inputargs,
                     &compiled_ops,
                     green_key,
-                    &compiled_constant_types,
+                    &compiled_constants_typed,
                 );
-                let mut terminal_exit_layouts = compile::build_terminal_exit_layouts(
-                    &inputargs,
-                    &compiled_ops,
-                    &compiled_constant_types,
-                );
+                let mut terminal_exit_layouts =
+                    compile::build_terminal_exit_layouts(&inputargs, &compiled_ops);
                 if let Some(backend_layouts) =
                     self.backend.compiled_fail_descr_layouts(token.as_ref())
                 {
@@ -6365,14 +6313,13 @@ impl<M: Clone> MetaInterp<M> {
                 );
                 self.take_back_all_descrs(std::mem::take(&mut optimizer.all_descrs));
                 let mut next_global_opref = compute_next_global_opref(&inputargs, &compiled_ops);
-                let mut traces = HashMap::new();
+                let mut traces = crate::optimizeopt::vec_assoc::VecAssoc::new();
                 traces.insert(
                     trace_id,
                     CompiledTrace {
                         inputargs: trace.inputargs.clone(),
                         ops: compiled_ops,
-                        constants: compiled_constants,
-                        constant_types: compiled_constant_types,
+                        constants: compiled_constants_typed,
                         exit_layouts,
                         terminal_exit_layouts,
                     },
@@ -7222,21 +7169,16 @@ impl<M: Clone> MetaInterp<M> {
             // `OpTypeIndex::opref_type_at`'s constant_types miss to the
             // hard-panic boundary (`history.py:220` parity), so reuse
             // the saved map instead.
-            let type_index = majit_ir::OpTypeIndex::new(
-                &root_trace.inputargs,
-                &root_trace.ops,
-                &root_trace.constant_types,
-            );
+            let type_index = majit_ir::OpTypeIndex::new(&root_trace.inputargs, &root_trace.ops);
             if let Some((label_index, label)) = root_trace.ops.iter().enumerate().find(|(_, op)| {
                 op.opcode == OpCode::Label
                     && op
-                        .descr
-                        .as_ref()
+                        .getdescr()
                         .is_some_and(|descr| descr.index() == target_descr.index())
             }) {
                 return Some(
                     label
-                        .args
+                        .getarglist()
                         .iter()
                         .map(|arg| {
                             type_index
@@ -7345,7 +7287,7 @@ impl<M: Clone> MetaInterp<M> {
             // can hold the descr value while still freely mutating
             // `op.descr` to land the `compile.py:191/202 cleardescr()`
             // calls on the JitCellToken/TargetToken branches below.
-            let Some(descr) = op.descr.clone() else {
+            let Some(descr) = op.getdescr() else {
                 // `compile.py:184` returns `None` for ops without a
                 // descr; the subsequent `isinstance` checks all fail.
                 continue;
@@ -7468,7 +7410,7 @@ impl<M: Clone> MetaInterp<M> {
                     // no longer needed and is released to break any
                     // loop ↔ JitCellToken cycle a downstream consumer
                     // (e.g., debug/tests) might form.
-                    op.descr = None;
+                    op.cleardescr();
                     continue;
                 }
             }
@@ -7524,7 +7466,7 @@ impl<M: Clone> MetaInterp<M> {
                     // `if not we_are_translated()` (test-only debug
                     // aid); pyre has no consumer of that weakref so
                     // the cleardescr stands alone.
-                    op.descr = None;
+                    op.cleardescr();
                 }
             }
         }
@@ -7893,7 +7835,7 @@ impl<M: Clone> MetaInterp<M> {
             if let Some(descr) = trace
                 .exit_layouts
                 .get(&fail_index)
-                .and_then(|layout| layout.descr.as_ref())
+                .and_then(|layout| layout.descr.clone())
                 .filter(|d| d.is_resume_guard() || d.is_resume_guard_copied())
             {
                 return Some(descr.clone());
@@ -8179,8 +8121,7 @@ impl<M: Clone> MetaInterp<M> {
         meta: M,
         bridge_ops: &[majit_ir::Op],
         bridge_inputargs: &[majit_ir::InputArg],
-        constants: HashMap<u32, i64>,
-        constant_types: HashMap<u32, Type>,
+        bridge_constants: crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Const>,
         snapshot_boxes: SnapshotBoxes,
         snapshot_frame_sizes: SnapshotFrameSizes,
         snapshot_vable_boxes: SnapshotBoxes,
@@ -8216,13 +8157,19 @@ impl<M: Clone> MetaInterp<M> {
         let bridge_runtime_boxes: Vec<OpRef> = bridge_ops
             .last()
             .filter(|op| op.opcode == OpCode::Jump)
-            .map(|op| op.args.to_vec())
+            .map(|op| op.getarglist().to_vec())
             .unwrap_or_default();
         // unroll.py:187 `trace = trace.get_iter()`: mint fresh InputArg /
         // ResOperation objects in a disjoint OpRef namespace
         // (`opencoder.py:259-262 self.inputargs = [rop.inputarg_from_tp(...)]`).
+        // Wrap `&[Op]` into `Vec<OpRc>` for the prepare_bridge_trace_for_optimizer
+        // boundary (history.py:528 identity at trace level).
+        let bridge_ops_rc: Vec<majit_ir::OpRc> = bridge_ops
+            .iter()
+            .map(|op| std::rc::Rc::new(op.clone()))
+            .collect();
         let prepared = prepare_bridge_trace_for_optimizer(
-            bridge_ops,
+            &bridge_ops_rc,
             bridge_inputargs,
             snapshot_boxes,
             snapshot_frame_sizes,
@@ -8246,17 +8193,10 @@ impl<M: Clone> MetaInterp<M> {
         // history.py:220 box.type parity: promote the legacy `i64` pool
         // to a typed `Value` map for the optimizer's intrinsic Const
         // class identity.
-        let mut constants: HashMap<u32, majit_ir::Value> = constants
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = bridge_constants
             .iter()
-            .map(|(&k, &raw)| {
-                let tp = constant_types
-                    .get(&k)
-                    .copied()
-                    .unwrap_or(majit_ir::Type::Int);
-                (k, heap_value_for(tp, raw))
-            })
+            .map(|(&k, c)| (k, c.to_value()))
             .collect();
-        optimizer.constant_types = constant_types.clone();
         // bridge_inputargs already carry their type via the typed `InputArg`
         // variant + `OpRef::input_arg_typed(index, tp)` reconstruction;
         // see optimizer.rs:5016 `opref_type` priority-0 variant-tag read.
@@ -8339,15 +8279,16 @@ impl<M: Clone> MetaInterp<M> {
                         InputArg::from_type(tp, opref.raw())
                     })
                     .collect();
-                // retrace_needed serializes the legacy `i64` shape into
-                // PartialTrace; lower the typed pool back at the boundary.
-                let (retrace_bits, _retrace_types) =
-                    crate::optimizeopt::optimizer::lower_typed_constants_to_backend(&constants);
+                // PartialTrace now stores the typed `Const` pool directly;
+                // `compile_retrace`'s merge reads `Const::to_value()` without
+                // a parallel type lookup.
+                let retrace_constants =
+                    crate::optimizeopt::optimizer::lower_typed_constants_to_const_pool(&constants);
                 self.retrace_needed(
                     green_key,
                     optimized_ops.clone(),
                     renamed_inputargs,
-                    retrace_bits,
+                    retrace_constants,
                     es,
                 );
             }
@@ -8357,13 +8298,8 @@ impl<M: Clone> MetaInterp<M> {
 
         let mut optimized_ops = compile::strip_stray_overflow_guards(optimized_ops);
         let num_optimized_ops = optimized_ops.len();
-        // Backend boundary: lower typed `Value` pool to the legacy
-        // `(i64, Type)` pair the backend's `set_constants` /
-        // `set_constant_types` API consumes.
-        let (backend_constants, backend_constant_types) =
-            crate::optimizeopt::optimizer::lower_typed_constants_to_backend(&constants);
-        let compiled_constants = backend_constants.clone();
-        let compiled_constant_types = backend_constant_types.clone();
+        let compiled_constants_typed =
+            crate::optimizeopt::optimizer::lower_typed_constants_to_const_pool(&constants);
         let trace_id = self.alloc_trace_id();
 
         if crate::majit_log_enabled() {
@@ -8374,13 +8310,16 @@ impl<M: Clone> MetaInterp<M> {
             for (i, op) in optimized_ops.iter().enumerate() {
                 eprintln!(
                     "[jit][entry-bridge] op[{i}] {:?} pos={:?} args={:?} descr={:?}",
-                    op.opcode, op.pos, op.args, op.descr
+                    op.opcode,
+                    op.pos.get(),
+                    op.getarglist(),
+                    op.descr
                 );
             }
         }
 
-        self.backend.set_constants(backend_constants);
-        self.backend.set_constant_types(backend_constant_types);
+        self.backend
+            .set_constants_pool(compiled_constants_typed.clone());
         // resume.py:1143-1188 parity — VStr/VUni Concat/Slice guard-exit
         // materialization needs the staticdata.callinfocollection to
         // resolve OS_STR_CONCAT / OS_UNI_CONCAT / OS_STR_SLICE /
@@ -8400,9 +8339,13 @@ impl<M: Clone> MetaInterp<M> {
         }
 
         let compile_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let optimized_ops_rc: Vec<majit_ir::OpRc> = optimized_ops
+                .iter()
+                .map(|op| std::rc::Rc::new(op.clone()))
+                .collect();
             self.backend.compile_loop(
                 bridge_inputargs,
-                &optimized_ops,
+                &optimized_ops_rc,
                 Arc::get_mut(&mut token)
                     .expect("JitCellToken must stay uniquely owned until backend compile"),
             )
@@ -8422,13 +8365,10 @@ impl<M: Clone> MetaInterp<M> {
                     bridge_inputargs,
                     &optimized_ops,
                     original_green_key,
-                    &compiled_constant_types,
+                    &compiled_constants_typed,
                 );
-                let mut terminal_exit_layouts = compile::build_terminal_exit_layouts(
-                    bridge_inputargs,
-                    &optimized_ops,
-                    &compiled_constant_types,
-                );
+                let mut terminal_exit_layouts =
+                    compile::build_terminal_exit_layouts(bridge_inputargs, &optimized_ops);
                 if let Some(backend_layouts) =
                     self.backend.compiled_fail_descr_layouts(token.as_ref())
                 {
@@ -8465,14 +8405,13 @@ impl<M: Clone> MetaInterp<M> {
                 self.take_back_all_descrs(std::mem::take(&mut optimizer.all_descrs));
                 let mut next_global_opref =
                     compute_next_global_opref(bridge_inputargs, &optimized_ops);
-                let mut traces = HashMap::new();
+                let mut traces = crate::optimizeopt::vec_assoc::VecAssoc::new();
                 traces.insert(
                     trace_id,
                     CompiledTrace {
                         inputargs: bridge_inputargs.to_vec(),
                         ops: optimized_ops,
-                        constants: compiled_constants,
-                        constant_types: compiled_constant_types,
+                        constants: compiled_constants_typed,
                         exit_layouts,
                         terminal_exit_layouts,
                     },
@@ -8557,14 +8496,13 @@ impl<M: Clone> MetaInterp<M> {
         fail_descr: &dyn majit_ir::FailDescr,
         bridge_ops: &[majit_ir::Op],
         bridge_inputargs: &[majit_ir::InputArg],
-        constants: HashMap<u32, i64>,
-        constant_types: HashMap<u32, Type>,
+        bridge_constants: crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Const>,
         snapshot_boxes: SnapshotBoxes,
         snapshot_frame_sizes: SnapshotFrameSizes,
         snapshot_vable_boxes: SnapshotBoxes,
         snapshot_vref_boxes: SnapshotBoxes,
         snapshot_frame_pcs: SnapshotFramePcs,
-        call_pure_results: HashMap<Vec<Value>, Value>,
+        call_pure_results: crate::optimizeopt::vec_assoc::VecAssoc<Vec<Value>, Value>,
     ) -> bool {
         if !self.compiled_loops.contains_key(&green_key) {
             return false;
@@ -8714,7 +8652,7 @@ impl<M: Clone> MetaInterp<M> {
         let bridge_runtime_boxes: Vec<OpRef> = bridge_ops
             .last()
             .filter(|op| op.opcode == OpCode::Jump)
-            .map(|op| op.args.to_vec())
+            .map(|op| op.getarglist().to_vec())
             .unwrap_or_default();
         let bridge_trace_data =
             TreeLoop::with_snapshots(bridge_inputargs.to_vec(), bridge_ops.to_vec(), Vec::new());
@@ -8739,8 +8677,12 @@ impl<M: Clone> MetaInterp<M> {
         // unroll.py:187 `trace = trace.get_iter()`: mint fresh InputArg /
         // ResOperation objects in a disjoint OpRef namespace
         // (`opencoder.py:259-262 self.inputargs = [rop.inputarg_from_tp(...)]`).
+        let bridge_ops_rc: Vec<majit_ir::OpRc> = bridge_ops
+            .iter()
+            .map(|op| std::rc::Rc::new(op.clone()))
+            .collect();
         let prepared = prepare_bridge_trace_for_optimizer(
-            bridge_ops,
+            &bridge_ops_rc,
             bridge_inputargs,
             snapshot_boxes,
             snapshot_frame_sizes,
@@ -8763,17 +8705,10 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.set_pending_box_pool(prepared.box_pool);
         // history.py:220 box.type parity: promote the legacy `i64` pool
         // to a typed `Value` map.
-        let mut constants: HashMap<u32, majit_ir::Value> = constants
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = bridge_constants
             .iter()
-            .map(|(&k, &raw)| {
-                let tp = constant_types
-                    .get(&k)
-                    .copied()
-                    .unwrap_or(majit_ir::Type::Int);
-                (k, heap_value_for(tp, raw))
-            })
+            .map(|(&k, c)| (k, c.to_value()))
             .collect();
-        optimizer.constant_types = constant_types.clone();
         optimizer.call_pure_results = bridge_call_pure_results;
         // history.py InputArg.type parity: each `InputArg` carries its type
         // in the typed OpRef variant tag (`OpRef::input_arg_typed`); the
@@ -8890,15 +8825,16 @@ impl<M: Clone> MetaInterp<M> {
                             InputArg::from_type(tp, opref.raw())
                         })
                         .collect();
-                // retrace_needed serializes the legacy `i64` shape into
-                // PartialTrace; lower the typed pool back at the boundary.
-                let (retrace_bits, _retrace_types) =
-                    crate::optimizeopt::optimizer::lower_typed_constants_to_backend(&constants);
+                // PartialTrace now stores the typed `Const` pool directly;
+                // `compile_retrace`'s merge reads `Const::to_value()` without
+                // a parallel type lookup.
+                let retrace_constants =
+                    crate::optimizeopt::optimizer::lower_typed_constants_to_const_pool(&constants);
                 self.retrace_needed(
                     green_key,
                     optimized_ops.clone(),
                     renamed_inputargs,
-                    retrace_bits,
+                    retrace_constants,
                     es,
                 );
             }
@@ -8909,13 +8845,8 @@ impl<M: Clone> MetaInterp<M> {
         let mut optimized_ops = compile::strip_stray_overflow_guards(optimized_ops);
 
         let num_optimized_ops = optimized_ops.len();
-        // Backend boundary: lower typed `Value` pool to the legacy
-        // `(i64, Type)` pair the backend's `set_constants` /
-        // `set_constant_types` API consumes.
-        let (backend_constants, backend_constant_types) =
-            crate::optimizeopt::optimizer::lower_typed_constants_to_backend(&constants);
-        let compiled_constants = backend_constants.clone();
-        let compiled_constant_types = backend_constant_types.clone();
+        let compiled_constants_typed =
+            crate::optimizeopt::optimizer::lower_typed_constants_to_const_pool(&constants);
         let bridge_trace_id = self.alloc_trace_id();
 
         if crate::majit_log_enabled() {
@@ -8923,8 +8854,8 @@ impl<M: Clone> MetaInterp<M> {
             eprint!("{}", majit_ir::format_trace(&optimized_ops, &constants));
         }
 
-        self.backend.set_constants(backend_constants);
-        self.backend.set_constant_types(backend_constant_types);
+        self.backend
+            .set_constants_pool(compiled_constants_typed.clone());
         // resume.py:1143-1188 parity — VStr/VUni Concat/Slice guard-exit
         // materialization needs the staticdata.callinfocollection to
         // resolve OS_STR_CONCAT / OS_UNI_CONCAT / OS_STR_SLICE /
@@ -8976,11 +8907,16 @@ impl<M: Clone> MetaInterp<M> {
                 .get(&fail_descr.trace_id())
                 .and_then(|tr| tr.exit_layouts.get(&fail_descr.fail_index_per_trace()))
                 .and_then(|sl| sl.recovery_layout.clone());
+            // Wrap to `Vec<OpRc>` for the backend's trait boundary.
+            let optimized_ops_rc_for_bridge: Vec<majit_ir::OpRc> = optimized_ops
+                .iter()
+                .map(|op| std::rc::Rc::new(op.clone()))
+                .collect();
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 self.backend.compile_bridge(
                     fail_descr,
                     bridge_inputargs,
-                    &optimized_ops,
+                    &optimized_ops_rc_for_bridge,
                     &source_jct,
                     previous_tokens,
                     caller_recovery_layout.as_ref(),
@@ -9045,13 +8981,10 @@ impl<M: Clone> MetaInterp<M> {
                         bridge_inputargs,
                         &optimized_ops,
                         green_key,
-                        &compiled_constant_types,
+                        &compiled_constants_typed,
                     );
-                    let mut terminal_exit_layouts = compile::build_terminal_exit_layouts(
-                        bridge_inputargs,
-                        &optimized_ops,
-                        &compiled_constant_types,
-                    );
+                    let mut terminal_exit_layouts =
+                        compile::build_terminal_exit_layouts(bridge_inputargs, &optimized_ops);
                     if let Some(backend_layouts) = self.backend.compiled_bridge_fail_descr_layouts(
                         source_jct.as_ref(),
                         source_trace_id,
@@ -9101,8 +9034,7 @@ impl<M: Clone> MetaInterp<M> {
                         CompiledTrace {
                             inputargs: bridge_inputargs.to_vec(),
                             ops: optimized_ops,
-                            constants: compiled_constants,
-                            constant_types: compiled_constant_types,
+                            constants: compiled_constants_typed,
                             exit_layouts,
                             terminal_exit_layouts,
                         },
@@ -9233,12 +9165,7 @@ impl<M: Clone> MetaInterp<M> {
         // Int/Ref mismatch. Reserve bridge's pool past the parent's
         // highest const index so every new allocation is disjoint.
         if let Some((_, source_trace)) = Self::trace_for_exit(compiled, norm_tid) {
-            let max_const = source_trace
-                .constants
-                .keys()
-                .copied()
-                .chain(source_trace.constant_types.keys().copied())
-                .max();
+            let max_const = source_trace.constants.keys().copied().max();
             if let (Some(max), Some(ref mut ctx)) = (max_const, self.tracing.as_mut()) {
                 ctx.constants.reserve_index_past(max);
             }
@@ -9656,15 +9583,14 @@ impl<M: Clone> MetaInterp<M> {
         // `compile.rs:301`), like RPython's `compile.py:184
         // op.getdescr()` predicate.
         let guard_op_index = trace.ops.iter().position(|op| {
-            op.descr
-                .as_ref()
-                .and_then(|descr| descr.as_fail_descr())
-                .is_some_and(|descr| descr.fail_index_per_trace() == fail_index)
+            op.with_fail_descr(|descr| descr.fail_index_per_trace() == fail_index)
+                .unwrap_or(false)
         })?;
         let guard_op = trace.ops.get(guard_op_index)?;
-        let fail_args = guard_op.fail_args.as_ref()?;
+        let fail_args = guard_op.getfailargs()?;
 
-        let mut initial_values = HashMap::with_capacity(fail_args.len());
+        let mut initial_values: crate::optimizeopt::vec_assoc::VecAssoc<u32, i64> =
+            crate::optimizeopt::vec_assoc::VecAssoc::with_capacity(fail_args.len());
         for (arg, value) in fail_args.iter().zip(fail_values.iter().copied()) {
             initial_values.insert(arg.raw(), value);
         }
@@ -9691,9 +9617,16 @@ impl<M: Clone> MetaInterp<M> {
             ));
         }
 
+        // Lower typed `Const` pool to the legacy `(u32 → i64)` shape the
+        // blackhole interpreter consumes; `Const::as_raw_i64()` projects
+        // each variant to its encoded `rd_consts[idx].0` bits.
+        let mut constants_va: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
+        for (&k, c) in trace.constants.iter() {
+            constants_va.insert(k, c.as_raw_i64());
+        }
         Some(blackhole_execute_with_state_ca(
             &trace.ops,
-            &trace.constants,
+            &constants_va,
             &initial_values,
             guard_op_index + 1,
             exception,
@@ -9862,9 +9795,7 @@ impl<M: Clone> MetaInterp<M> {
                     let fallback_fail_index = trace
                         .ops
                         .get(guard_index)
-                        .and_then(|op| op.descr.as_ref())
-                        .and_then(|descr| descr.as_fail_descr())
-                        .map(|fd| fd.fail_index_per_trace())
+                        .and_then(|op| op.with_fail_descr(|fd| fd.fail_index_per_trace()))
                         .unwrap_or(fail_index);
                     let exit_layout = Self::compiled_exit_layout_from_trace(
                         trace,
@@ -9946,9 +9877,7 @@ impl<M: Clone> MetaInterp<M> {
                     let fallback_fail_index = trace
                         .ops
                         .get(guard_index)
-                        .and_then(|op| op.descr.as_ref())
-                        .and_then(|descr| descr.as_fail_descr())
-                        .map(|fd| fd.fail_index_per_trace())
+                        .and_then(|op| op.with_fail_descr(|fd| fd.fail_index_per_trace()))
                         .unwrap_or(fail_index);
                     let exit_layout = Self::compiled_exit_layout_from_trace(
                         trace,
@@ -10164,9 +10093,7 @@ impl<M: Clone> MetaInterp<M> {
                     let fallback_fail_index = trace
                         .ops
                         .get(guard_index)
-                        .and_then(|op| op.descr.as_ref())
-                        .and_then(|descr| descr.as_fail_descr())
-                        .map(|fd| fd.fail_index_per_trace())
+                        .and_then(|op| op.with_fail_descr(|fd| fd.fail_index_per_trace()))
                         .unwrap_or(fail_index);
                     let exit_layout = Self::compiled_exit_layout_from_trace(
                         trace,
@@ -10248,9 +10175,7 @@ impl<M: Clone> MetaInterp<M> {
                     let fallback_fail_index = trace
                         .ops
                         .get(guard_index)
-                        .and_then(|op| op.descr.as_ref())
-                        .and_then(|descr| descr.as_fail_descr())
-                        .map(|fd| fd.fail_index_per_trace())
+                        .and_then(|op| op.with_fail_descr(|fd| fd.fail_index_per_trace()))
                         .unwrap_or(fail_index);
                     let exit_layout = Self::compiled_exit_layout_from_trace(
                         trace,
@@ -13866,7 +13791,7 @@ pub struct MetaInterpStaticData {
     /// across the metainterp / trace / bridge pipelines (mirroring
     /// `all_descrs` above).
     pub dispatch_array_descr_cache:
-        std::sync::Mutex<std::collections::HashMap<DispatchArrayDescrKey, DescrRef>>,
+        std::sync::Mutex<crate::optimizeopt::vec_assoc::VecAssoc<DispatchArrayDescrKey, DescrRef>>,
     /// pyjitpl.py:2199-2200 `self.profiler = ProfilerClass()` —
     /// `metainterp_sd.profiler` is the shared counter sink hit from
     /// every metainterp / optimizer / heapcache / tracer site
@@ -13891,13 +13816,14 @@ pub struct MetaInterpStaticData {
 #[derive(Debug, Default)]
 pub struct MetaInterpGlobalData {
     /// pyjitpl.py:2308-2318 `addr2name`: `fnaddr → name` for debugging.
-    pub addr2name: Option<std::collections::HashMap<usize, String>>,
+    pub addr2name: Option<crate::optimizeopt::vec_assoc::VecAssoc<usize, String>>,
     /// pyjitpl.py:2326-2343 `indirectcall_dict`: `fnaddr → JitCode`.
     /// Stores the current runtime-adapter `JitCode`; the helper that
     /// builds this dict is intentionally type-agnostic so canonical
     /// codewriter jitcodes can reuse the same semantics.
-    pub indirectcall_dict:
-        Option<std::collections::HashMap<usize, std::sync::Arc<crate::jitcode::JitCode>>>,
+    pub indirectcall_dict: Option<
+        crate::optimizeopt::vec_assoc::VecAssoc<usize, std::sync::Arc<crate::jitcode::JitCode>>,
+    >,
     /// pyjitpl.py:2293-2303 `initialized` — guards `_setup_once` so the
     /// runtime side-effects (profiler start, jitlog setup) fire once.
     pub initialized: bool,
@@ -13906,8 +13832,9 @@ pub struct MetaInterpGlobalData {
 fn build_indirectcall_dict<T>(
     targets: &[std::sync::Arc<T>],
     fnaddr_of: impl Fn(&T) -> usize,
-) -> std::collections::HashMap<usize, std::sync::Arc<T>> {
-    let mut d = std::collections::HashMap::new();
+) -> crate::optimizeopt::vec_assoc::VecAssoc<usize, std::sync::Arc<T>> {
+    let mut d: crate::optimizeopt::vec_assoc::VecAssoc<usize, std::sync::Arc<T>> =
+        crate::optimizeopt::vec_assoc::VecAssoc::new();
     for jitcode in targets {
         let fnaddr = fnaddr_of(jitcode);
         debug_assert!(
@@ -13921,7 +13848,7 @@ fn build_indirectcall_dict<T>(
 
 fn bytecode_for_address_in_targets<T>(
     targets: &[std::sync::Arc<T>],
-    cache: &mut Option<std::collections::HashMap<usize, std::sync::Arc<T>>>,
+    cache: &mut Option<crate::optimizeopt::vec_assoc::VecAssoc<usize, std::sync::Arc<T>>>,
     fnaddress: usize,
     fnaddr_of: impl Fn(&T) -> usize,
 ) -> Option<std::sync::Arc<T>> {
@@ -14250,7 +14177,7 @@ impl MetaInterpStaticData {
     ///
     /// Pyre's blackhole-side `setup_insns` lives separately in
     /// `crate::blackhole::BlackholeInterpBuilder::setup_insns`.
-    pub fn setup_insns(&mut self, insns: &std::collections::HashMap<String, u8>) {
+    pub fn setup_insns(&mut self, insns: &majit_ir::vec_assoc::VecAssoc<String, u8>) {
         // pyjitpl.py:2228-2229: opcode_names/opcode_implementations init.
         // RPython sizes by `len(insns)` because its assembler assigns
         // opnums sequentially from 0, so `len(insns) == max(opnum) + 1`.
@@ -14575,7 +14502,8 @@ impl MetaInterpStaticData {
     pub fn get_name_from_address(&self, addr: usize) -> String {
         let mut gd = self.globaldata.lock().unwrap();
         let dict = gd.addr2name.get_or_insert_with(|| {
-            let mut d = std::collections::HashMap::new();
+            let mut d: crate::optimizeopt::vec_assoc::VecAssoc<usize, String> =
+                crate::optimizeopt::vec_assoc::VecAssoc::new();
             for (i, key) in self._addr2name_keys.iter().enumerate() {
                 if let Some(value) = self._addr2name_values.get(i) {
                     d.insert(*key, value.clone());
@@ -15749,7 +15677,7 @@ mod metainterp_static_data_tests {
             .iter()
             .find(|op| op.opcode == OpCode::CallI)
             .expect("CallI must be recorded");
-        assert_eq!(op.pos, opref);
+        assert_eq!(op.pos.get(), opref);
     }
 
     extern "C" fn cond_call_void_helper(_cond: i64, _func_addr: i64) {}
@@ -16046,7 +15974,7 @@ mod metainterp_static_data_tests {
             .iter()
             .find(|op| op.opcode == OpCode::CallI)
             .expect("CallI must be recorded");
-        assert_eq!(op.pos, opref);
+        assert_eq!(op.pos.get(), opref);
     }
 
     #[test]
@@ -16183,7 +16111,7 @@ mod metainterp_static_data_tests {
             .iter()
             .find(|op| op.opcode == OpCode::CallMayForceI)
             .expect("CallMayForceI must be recorded");
-        assert_eq!(call_op.pos, opref);
+        assert_eq!(call_op.pos.get(), opref);
         assert!(
             ctx.recorder
                 .ops()
@@ -16278,11 +16206,11 @@ mod metainterp_static_data_tests {
             .iter()
             .find(|op| op.opcode == OpCode::CallI)
             .expect("CallI must be recorded");
-        assert_eq!(op.pos, opref);
-        assert_eq!(op.args.len(), 3);
-        assert_eq!(op.args[0], funcbox_ref);
-        assert_eq!(op.args[1], OpRef::int_op(1));
-        assert_eq!(op.args[2], OpRef::int_op(2));
+        assert_eq!(op.pos.get(), opref);
+        assert_eq!(op.num_args(), 3);
+        assert_eq!(op.arg(0), funcbox_ref);
+        assert_eq!(op.arg(1), OpRef::int_op(1));
+        assert_eq!(op.arg(2), OpRef::int_op(2));
     }
 
     #[test]
@@ -16446,12 +16374,12 @@ mod metainterp_static_data_tests {
                 .iter()
                 .filter(|op| op.opcode == OpCode::GuardException);
             let op = matches.next().expect("GuardException must be recorded");
-            assert_eq!(op.args.len(), 1);
+            assert_eq!(op.num_args(), 1);
             let typeptr = ctx
-                .constants_get_value(op.args[0])
+                .constants_get_value(op.arg(0))
                 .expect("typeptr constant");
             assert_eq!(typeptr, majit_ir::Value::Int(0xc1a55));
-            op.pos
+            op.pos.get()
         };
 
         // pyjitpl.py:3392: class_of_last_exc_is_const = True after.
@@ -16725,7 +16653,7 @@ mod metainterp_static_data_tests {
             .find(|op| op.opcode == OpCode::GuardException)
             .expect("GuardException must be recorded");
         let typeptr = ctx
-            .constants_get_value(op.args[0])
+            .constants_get_value(op.arg(0))
             .expect("typeptr constant");
         assert_eq!(typeptr, majit_ir::Value::Int(0xcafef00d));
     }
@@ -16876,10 +16804,10 @@ mod metainterp_static_data_tests {
             .filter(|op| op.opcode == OpCode::EnterPortalFrame);
         let op = matches.next().expect("EnterPortalFrame must be recorded");
         assert!(matches.next().is_none(), "expected exactly one record");
-        assert_eq!(op.args.len(), 2);
-        let jd_no = ctx.constants_get_value(op.args[0]).expect("jd_no constant");
+        assert_eq!(op.num_args(), 2);
+        let jd_no = ctx.constants_get_value(op.arg(0)).expect("jd_no constant");
         let unique_id = ctx
-            .constants_get_value(op.args[1])
+            .constants_get_value(op.arg(1))
             .expect("unique_id constant");
         assert_eq!(jd_no, majit_ir::Value::Int(3));
         assert_eq!(unique_id, majit_ir::Value::Int(0xfeed));
@@ -16903,8 +16831,8 @@ mod metainterp_static_data_tests {
             .filter(|op| op.opcode == OpCode::LeavePortalFrame);
         let op = matches.next().expect("LeavePortalFrame must be recorded");
         assert!(matches.next().is_none(), "expected exactly one record");
-        assert_eq!(op.args.len(), 1);
-        let jd_no = ctx.constants_get_value(op.args[0]).expect("jd_no constant");
+        assert_eq!(op.num_args(), 1);
+        let jd_no = ctx.constants_get_value(op.arg(0)).expect("jd_no constant");
         assert_eq!(jd_no, majit_ir::Value::Int(7));
     }
 
@@ -16942,15 +16870,15 @@ mod metainterp_static_data_tests {
             .expect("LeavePortalFrame must be recorded");
 
         assert_eq!(
-            ctx.constants_get_value(enter.args[0]),
+            ctx.constants_get_value(enter.arg(0)),
             Some(majit_ir::Value::Int(5))
         );
         assert_eq!(
-            ctx.constants_get_value(enter.args[1]),
+            ctx.constants_get_value(enter.arg(1)),
             Some(majit_ir::Value::Int(0xfeed))
         );
         assert_eq!(
-            ctx.constants_get_value(leave.args[0]),
+            ctx.constants_get_value(leave.arg(0)),
             Some(majit_ir::Value::Int(5))
         );
     }
@@ -17093,7 +17021,8 @@ mod metainterp_static_data_tests {
     #[test]
     fn setup_insns_populates_opcode_names() {
         let mut sd = MetaInterpStaticData::new();
-        let mut insns = std::collections::HashMap::new();
+        let mut insns: majit_ir::vec_assoc::VecAssoc<String, u8> =
+            majit_ir::vec_assoc::VecAssoc::new();
         insns.insert("foo".to_string(), 0u8);
         insns.insert("bar".to_string(), 1u8);
         sd.setup_insns(&insns);
@@ -17106,7 +17035,8 @@ mod metainterp_static_data_tests {
     fn setup_insns_caches_opcode_ids_or_minus_one() {
         // pyjitpl.py:2236-2243: each cached id is `insns.get(...) ?? -1`.
         let mut sd = MetaInterpStaticData::new();
-        let mut insns = std::collections::HashMap::new();
+        let mut insns: majit_ir::vec_assoc::VecAssoc<String, u8> =
+            majit_ir::vec_assoc::VecAssoc::new();
         insns.insert("live/".to_string(), 5u8);
         insns.insert("goto/L".to_string(), 6u8);
         insns.insert("catch_exception/L".to_string(), 7u8);
@@ -17129,7 +17059,8 @@ mod metainterp_static_data_tests {
     #[test]
     fn setup_insns_leaves_missing_opcode_ids_at_minus_one() {
         let mut sd = MetaInterpStaticData::new();
-        let mut insns = std::collections::HashMap::new();
+        let mut insns: majit_ir::vec_assoc::VecAssoc<String, u8> =
+            majit_ir::vec_assoc::VecAssoc::new();
         insns.insert("foo".to_string(), 0u8);
         sd.setup_insns(&insns);
         assert_eq!(sd.op_live, -1);
@@ -17357,26 +17288,26 @@ mod tests {
         set_savedata_ref_on_deadframe,
     };
     use majit_ir::descr::{CallDescr, Descr, EffectInfo, ExtraEffect};
-    use majit_ir::{DescrRef, InputArg, Op, OpCode, OpRef, Type, Value};
+    use majit_ir::{DescrRef, InputArg, Op, OpCode, OpRc, OpRef, Type, Value};
     use std::sync::{Arc, Mutex, OnceLock};
 
     fn mk_op(opcode: OpCode, args: &[OpRef], pos: u32) -> Op {
-        let mut op = Op::new(opcode, args);
-        op.pos = if pos == OpRef::NONE.raw() {
+        let op = Op::new(opcode, args);
+        op.pos.set(if pos == OpRef::NONE.raw() {
             OpRef::NONE
         } else {
             OpRef::op_typed(pos, opcode.result_type())
-        };
+        });
         op
     }
 
     fn mk_op_with_descr(opcode: OpCode, args: &[OpRef], pos: u32, descr: DescrRef) -> Op {
-        let mut op = Op::with_descr(opcode, args, descr);
-        op.pos = if pos == OpRef::NONE.raw() {
+        let op = Op::with_descr(opcode, args, descr);
+        op.pos.set(if pos == OpRef::NONE.raw() {
             OpRef::NONE
         } else {
             OpRef::op_typed(pos, opcode.result_type())
-        };
+        });
         op
     }
 
@@ -17501,8 +17432,12 @@ mod tests {
             cls_of_box: None,
         };
 
+        let bridge_ops_rc: Vec<majit_ir::OpRc> = bridge_ops
+            .iter()
+            .map(|op| std::rc::Rc::new(op.clone()))
+            .collect();
         let prepared = prepare_bridge_trace_for_optimizer(
-            &bridge_ops,
+            &bridge_ops_rc,
             &bridge_inputargs,
             snapshot_boxes,
             Vec::new(),
@@ -17521,18 +17456,18 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(10, Type::Int), (11, Type::Ref)]
         );
-        assert_eq!(prepared.ops[0].pos, OpRef::ref_op(12));
+        assert_eq!(prepared.ops[0].pos.get(), OpRef::ref_op(12));
         assert_eq!(
-            prepared.ops[0].args.to_vec(),
+            prepared.ops[0].getarglist().to_vec(),
             vec![OpRef::input_arg_ref(11)]
         );
-        assert_eq!(prepared.ops[1].pos, OpRef::int_op(13));
+        assert_eq!(prepared.ops[1].pos.get(), OpRef::int_op(13));
         assert_eq!(
-            prepared.ops[1].args.to_vec(),
+            prepared.ops[1].getarglist().to_vec(),
             vec![OpRef::input_arg_int(10), OpRef::input_arg_int(10)]
         );
         assert_eq!(
-            prepared.ops[2].args.to_vec(),
+            prepared.ops[2].getarglist().to_vec(),
             vec![OpRef::ref_op(12), OpRef::int_op(13)]
         );
         assert_eq!(
@@ -17590,19 +17525,19 @@ mod tests {
                 start_descr,
             ),
         ];
-        let mut constants = HashMap::new();
-        constants.insert(100, 1);
-        constants.insert(101, 2);
-        let mut traces = HashMap::new();
+        let mut constants: crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Const> =
+            crate::optimizeopt::vec_assoc::VecAssoc::new();
+        constants.insert(100, majit_ir::Const::Int(1));
+        constants.insert(101, majit_ir::Const::Int(2));
+        let mut traces = crate::optimizeopt::vec_assoc::VecAssoc::new();
         traces.insert(
             trace_id,
             CompiledTrace {
                 inputargs: inputargs.clone(),
                 ops,
                 constants,
-                constant_types: HashMap::new(),
-                exit_layouts: HashMap::new(),
-                terminal_exit_layouts: HashMap::new(),
+                exit_layouts: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+                terminal_exit_layouts: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             },
         );
         meta.warm_state_mut()
@@ -17747,7 +17682,8 @@ mod tests {
             pending_field_layouts: vec![],
         };
 
-        let mut exit_layouts = HashMap::new();
+        let mut exit_layouts: crate::optimizeopt::vec_assoc::VecAssoc<u32, StoredExitLayout> =
+            crate::optimizeopt::vec_assoc::VecAssoc::new();
         exit_layouts.insert(
             fail_index,
             StoredExitLayout {
@@ -17767,16 +17703,15 @@ mod tests {
             },
         );
 
-        let mut traces = HashMap::new();
+        let mut traces = crate::optimizeopt::vec_assoc::VecAssoc::new();
         traces.insert(
             trace_id,
             CompiledTrace {
                 inputargs: vec![],
                 ops: vec![],
-                constants: HashMap::new(),
-                constant_types: HashMap::new(),
+                constants: crate::optimizeopt::vec_assoc::VecAssoc::new(),
                 exit_layouts,
-                terminal_exit_layouts: HashMap::new(),
+                terminal_exit_layouts: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             },
         );
 
@@ -17837,7 +17772,8 @@ mod tests {
         writer.patch_current_size(0);
         let rd_numb = writer.create_numbering();
 
-        let mut exit_layouts = HashMap::new();
+        let mut exit_layouts: crate::optimizeopt::vec_assoc::VecAssoc<u32, StoredExitLayout> =
+            crate::optimizeopt::vec_assoc::VecAssoc::new();
         exit_layouts.insert(
             fail_index,
             StoredExitLayout {
@@ -17863,16 +17799,15 @@ mod tests {
             },
         );
 
-        let mut traces = HashMap::new();
+        let mut traces = crate::optimizeopt::vec_assoc::VecAssoc::new();
         traces.insert(
             trace_id,
             CompiledTrace {
                 inputargs: vec![],
                 ops: vec![],
-                constants: HashMap::new(),
-                constant_types: HashMap::new(),
+                constants: crate::optimizeopt::vec_assoc::VecAssoc::new(),
                 exit_layouts,
-                terminal_exit_layouts: HashMap::new(),
+                terminal_exit_layouts: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             },
         );
 
@@ -17969,7 +17904,7 @@ mod tests {
             &[OpRef::input_arg_int(0)],
             OpRef::NONE.raw(),
         );
-        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(0)]));
+        guard.setfailargs(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(0)]));
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             guard,
@@ -17979,7 +17914,13 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-        attach_procedure_to_interp_entry(&mut meta, green_key, &inputargs, ops, HashMap::new());
+        attach_procedure_to_interp_entry(
+            &mut meta,
+            green_key,
+            &inputargs,
+            ops,
+            crate::optimizeopt::vec_assoc::VecAssoc::new(),
+        );
 
         let (trace_id, fail_index) = {
             let entry = meta.compiled_loops.get(&green_key).expect("compiled entry");
@@ -18111,19 +18052,23 @@ mod tests {
         green_key: u64,
         inputargs: &[InputArg],
         ops: Vec<Op>,
-        constants: HashMap<u32, i64>,
+        constants_typed: crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Const>,
     ) {
-        meta.backend.set_constants(constants.clone());
+        meta.backend.set_constants_pool(constants_typed.clone());
         let mut token = JitCellToken::new(green_key + 1000);
         let trace_id = meta.alloc_trace_id();
         meta.backend.set_next_trace_id(trace_id);
+        let ops_rc: Vec<majit_ir::OpRc> = ops.iter().cloned().map(std::rc::Rc::new).collect();
         meta.backend
-            .compile_loop(inputargs, &ops, &mut token)
+            .compile_loop(inputargs, &ops_rc, &mut token)
             .expect("loop should compile");
-        let (mut resume_data, mut exit_layouts) =
-            compile::build_guard_metadata(inputargs, &ops, green_key, &HashMap::new());
-        let mut terminal_exit_layouts =
-            compile::build_terminal_exit_layouts(inputargs, &ops, &HashMap::new());
+        let (mut resume_data, mut exit_layouts) = compile::build_guard_metadata(
+            inputargs,
+            &ops,
+            green_key,
+            &crate::optimizeopt::vec_assoc::VecAssoc::new(),
+        );
+        let mut terminal_exit_layouts = compile::build_terminal_exit_layouts(inputargs, &ops);
         if let Some(backend_layouts) = meta.backend.compiled_fail_descr_layouts(&token) {
             compile::merge_backend_exit_layouts(&mut exit_layouts, &backend_layouts, &ops);
         }
@@ -18149,14 +18094,13 @@ mod tests {
             trace_id,
             &mut terminal_exit_layouts,
         );
-        let mut traces = HashMap::new();
+        let mut traces = crate::optimizeopt::vec_assoc::VecAssoc::new();
         traces.insert(
             trace_id,
             CompiledTrace {
                 inputargs: inputargs.to_vec(),
                 ops,
-                constants,
-                constant_types: HashMap::new(),
+                constants: constants_typed,
                 exit_layouts,
                 terminal_exit_layouts,
             },
@@ -18206,7 +18150,7 @@ mod tests {
             &[OpRef::input_arg_int(0)],
             OpRef::NONE.raw(),
         );
-        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(0)]));
+        guard.setfailargs(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(0)]));
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             guard,
@@ -18216,7 +18160,13 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-        attach_procedure_to_interp_entry(&mut meta, green_key, &inputargs, ops, HashMap::new());
+        attach_procedure_to_interp_entry(
+            &mut meta,
+            green_key,
+            &inputargs,
+            ops,
+            crate::optimizeopt::vec_assoc::VecAssoc::new(),
+        );
 
         let (trace_id, fail_index) = {
             let entry = meta.compiled_loops.get(&green_key).expect("compiled entry");
@@ -18284,7 +18234,7 @@ mod tests {
             &[OpRef::input_arg_int(0)],
             OpRef::NONE.raw(),
         );
-        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(0)]));
+        guard.setfailargs(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(0)]));
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             guard,
@@ -18294,7 +18244,13 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-        attach_procedure_to_interp_entry(&mut meta, green_key, &inputargs, ops, HashMap::new());
+        attach_procedure_to_interp_entry(
+            &mut meta,
+            green_key,
+            &inputargs,
+            ops,
+            crate::optimizeopt::vec_assoc::VecAssoc::new(),
+        );
 
         let (trace_id, fail_index, expected_source_op_index, expected_rd_numb, expected_exit_types) = {
             let entry = meta.compiled_loops.get(&green_key).expect("compiled entry");
@@ -18375,7 +18331,7 @@ mod tests {
             &[OpRef::input_arg_int(0)],
             OpRef::NONE.raw(),
         );
-        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(0)]));
+        guard.setfailargs(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(0)]));
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             guard,
@@ -18385,7 +18341,13 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-        attach_procedure_to_interp_entry(&mut meta, green_key, &inputargs, ops, HashMap::new());
+        attach_procedure_to_interp_entry(
+            &mut meta,
+            green_key,
+            &inputargs,
+            ops,
+            crate::optimizeopt::vec_assoc::VecAssoc::new(),
+        );
 
         let (trace_id, fail_index) = {
             let entry = meta.compiled_loops.get(&green_key).expect("compiled entry");
@@ -18453,7 +18415,7 @@ mod tests {
         let descr = make_call_descr(vec![Type::Ref, Type::Int], Type::Void);
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let mut guard_op = mk_op(OpCode::GuardNotForced, &[], OpRef::NONE.raw());
-        guard_op.fail_args = Some(smallvec::SmallVec::from_slice(&[
+        guard_op.setfailargs(smallvec::SmallVec::from_slice(&[
             OpRef::int_op(1),
             OpRef::int_op(0),
         ]));
@@ -18481,10 +18443,11 @@ mod tests {
             guard_op,
             mk_op(OpCode::Finish, &[OpRef::int_op(0)], OpRef::NONE.raw()),
         ];
-        let mut constants = HashMap::new();
+        let mut constants: crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Const> =
+            crate::optimizeopt::vec_assoc::VecAssoc::new();
         constants.insert(
             100,
-            maybe_force_and_return_void as *const () as usize as i64,
+            majit_ir::Const::Int(maybe_force_and_return_void as *const () as usize as i64),
         );
         attach_procedure_to_interp_entry(meta, green_key, &inputargs, ops, constants);
     }
@@ -18562,6 +18525,7 @@ mod tests {
             .ops
             .into_iter()
             .filter(|op| op.opcode != OpCode::Jump)
+            .map(|rc| (*rc).clone())
             .collect()
     }
 
@@ -18952,7 +18916,7 @@ mod tests {
                 meta: (),
                 front_target_tokens: Vec::new(),
                 root_trace_id: 0,
-                traces: HashMap::new(),
+                traces: crate::optimizeopt::vec_assoc::VecAssoc::new(),
                 previous_tokens: Vec::new(),
                 next_global_opref: 0,
             },
@@ -18992,12 +18956,8 @@ mod tests {
             .into_iter()
             .find(|op| op.opcode == OpCode::CallAssemblerI)
             .expect("CALL_ASSEMBLER_I recorded");
-        let call_descr = call
-            .descr
-            .as_ref()
-            .and_then(|descr| descr.as_call_descr())
-            .expect("call descr");
-        assert_eq!(call_descr.call_target_token(), Some(4242));
+        let call_token = call.with_call_descr(|cd| cd.call_target_token()).flatten();
+        assert_eq!(call_token, Some(4242));
     }
 
     #[test]
@@ -19073,12 +19033,8 @@ mod tests {
             .into_iter()
             .find(|op| op.opcode == OpCode::CallAssemblerI)
             .expect("CALL_ASSEMBLER_I recorded");
-        let call_descr = call
-            .descr
-            .as_ref()
-            .and_then(|descr| descr.as_call_descr())
-            .expect("call descr");
-        assert_eq!(call_descr.call_target_token(), Some(token_number));
+        let call_token2 = call.with_call_descr(|cd| cd.call_target_token()).flatten();
+        assert_eq!(call_token2, Some(token_number));
     }
 
     #[test]
@@ -19467,7 +19423,7 @@ mod tests {
         let _const_one = OpRef::int_op(100);
         let const_zero = OpRef::int_op(101);
         let mut guard_op = mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw());
-        guard_op.fail_args = Some(smallvec::SmallVec::from_slice(&[
+        guard_op.setfailargs(smallvec::SmallVec::from_slice(&[
             OpRef::input_arg_int(0),
             OpRef::input_arg_int(1),
         ]));
@@ -19485,7 +19441,7 @@ mod tests {
             mk_op(OpCode::IntGt, &[OpRef::int_op(2), const_zero], 3),
             {
                 let mut g = mk_op(OpCode::GuardTrue, &[OpRef::int_op(3)], OpRef::NONE.raw());
-                g.fail_args = Some(smallvec::SmallVec::from_slice(&[
+                g.setfailargs(smallvec::SmallVec::from_slice(&[
                     OpRef::input_arg_int(0),
                     OpRef::input_arg_int(1),
                 ]));
@@ -19497,9 +19453,10 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-        let mut constants = HashMap::new();
-        constants.insert(100, 1);
-        constants.insert(101, 0);
+        let mut constants: crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Const> =
+            crate::optimizeopt::vec_assoc::VecAssoc::new();
+        constants.insert(100, majit_ir::Const::Int(1));
+        constants.insert(101, majit_ir::Const::Int(0));
         attach_procedure_to_interp_entry(&mut meta, green_key, &inputargs, ops, constants);
 
         // The bridge hook is set. We verify the hook mechanism is correctly wired.

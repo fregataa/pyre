@@ -14,7 +14,6 @@
 //!
 //! This module provides the Rust equivalent of RPython's `virtualizable.py`.
 
-use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 
 use majit_ir::{DescrRef, Type, descr::descr_identity};
@@ -158,10 +157,10 @@ pub struct VirtualizableInfo {
     _array_field_descrs: Vec<DescrRef>,
     /// virtualizable.py:81-82: self.static_field_by_descrs = {descr: i ...}
     /// Map from descriptor identity (Arc pointer address) to field index.
-    pub static_field_by_descrs: HashMap<usize, usize>,
+    pub static_field_by_descrs: crate::optimizeopt::vec_assoc::VecAssoc<usize, usize>,
     /// virtualizable.py:83-84: self.array_field_by_descrs = {descr: i ...}
     /// Map from descriptor identity (Arc pointer address) to array field index.
-    pub array_field_by_descrs: HashMap<usize, usize>,
+    pub array_field_by_descrs: crate::optimizeopt::vec_assoc::VecAssoc<usize, usize>,
     /// virtualizable.py:294-295 `clear_vable_ptr`: function pointer to
     /// `clear_vable_token`, callable from JIT-compiled COND_CALL.
     /// Signature: `extern "C" fn(*mut u8)`. Stored as raw address so
@@ -230,8 +229,8 @@ impl VirtualizableInfo {
             vable_token_descr: None,
             _static_field_descrs: Vec::new(),
             _array_field_descrs: Vec::new(),
-            static_field_by_descrs: HashMap::new(),
-            array_field_by_descrs: HashMap::new(),
+            static_field_by_descrs: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            array_field_by_descrs: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             clear_vable_ptr: None,
             clear_vable_descr: None,
         }
@@ -335,19 +334,15 @@ impl VirtualizableInfo {
             })
             .collect();
         // virtualizable.py:81-82: self.static_field_by_descrs = {descr: i ...}
-        self.static_field_by_descrs = self
-            ._static_field_descrs
-            .iter()
-            .enumerate()
-            .map(|(i, d)| (descr_identity(d), i))
-            .collect();
+        self.static_field_by_descrs = crate::optimizeopt::vec_assoc::VecAssoc::new();
+        for (i, d) in self._static_field_descrs.iter().enumerate() {
+            self.static_field_by_descrs.insert(descr_identity(d), i);
+        }
         // virtualizable.py:83-84: self.array_field_by_descrs = {descr: i ...}
-        self.array_field_by_descrs = self
-            ._array_field_descrs
-            .iter()
-            .enumerate()
-            .map(|(i, d)| (descr_identity(d), i))
-            .collect();
+        self.array_field_by_descrs = crate::optimizeopt::vec_assoc::VecAssoc::new();
+        for (i, d) in self._array_field_descrs.iter().enumerate() {
+            self.array_field_by_descrs.insert(descr_identity(d), i);
+        }
     }
 
     /// Build a FieldDescr carrying parent_descr (+ optional vinfo backref).
@@ -577,7 +572,7 @@ impl VirtualizableInfo {
     }
 
     /// virtualizable.py:81: vinfo.static_field_by_descrs[fielddescr]
-    /// Descriptor-identity lookup (O(1) via HashMap).
+    /// Descriptor-identity lookup (linear scan via VecAssoc).
     pub fn static_field_by_descr(&self, descr: &DescrRef) -> Option<usize> {
         self.static_field_by_descrs
             .get(&descr_identity(descr))
@@ -585,7 +580,7 @@ impl VirtualizableInfo {
     }
 
     /// virtualizable.py:83: vinfo.array_field_by_descrs[arrayfielddescr]
-    /// Descriptor-identity lookup (O(1) via HashMap).
+    /// Descriptor-identity lookup (linear scan via VecAssoc).
     pub fn array_field_by_descr(&self, descr: &DescrRef) -> Option<usize> {
         self.array_field_by_descrs
             .get(&descr_identity(descr))

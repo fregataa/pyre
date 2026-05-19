@@ -10,7 +10,8 @@ use majit_backend::{
 };
 use majit_backend_cranelift::{CraneliftBackend, force_token_to_dead_frame, jit_exc_raise};
 use majit_ir::{
-    ArrayDescr, Descr, DescrRef, FieldDescr, GcRef, InputArg, Op, OpCode, OpRef, Type, Value,
+    ArrayDescr, Descr, DescrRef, FailDescr, FieldDescr, GcRef, InputArg, Op, OpCode, OpRc, OpRef,
+    Type, Value,
 };
 use majit_metainterp::recorder::Trace;
 
@@ -77,7 +78,7 @@ fn test_simple_arithmetic() {
 
     // Compile directly without optimizer (RPython test_compile_linear_loop parity)
     let mut backend = CraneliftBackend::new();
-    let mut constants = HashMap::new();
+    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
     constants.insert(OpRef::const_int(0).raw(), 1i64);
     backend.set_constants(constants);
 
@@ -119,7 +120,7 @@ fn test_sum_loop() {
 
     // Compile
     let mut backend = CraneliftBackend::new();
-    let mut constants = HashMap::new();
+    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
     constants.insert(OpRef::const_int(0).raw(), 1i64);
     constants.insert(OpRef::const_int(1).raw(), 0i64);
     backend.set_constants(constants);
@@ -197,7 +198,7 @@ fn test_guard_failure_path() {
 
     // Compile
     let mut backend = CraneliftBackend::new();
-    let mut constants = HashMap::new();
+    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
     constants.insert(OpRef::const_int(0).raw(), 0i64);
     constants.insert(OpRef::const_int(1).raw(), 2i64);
     backend.set_constants(constants);
@@ -261,7 +262,7 @@ fn test_bridge_end_to_end() {
 
     // Compile main loop
     let mut backend = CraneliftBackend::new();
-    let mut constants = HashMap::new();
+    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
     constants.insert(OpRef::const_int(0).raw(), 1i64);
     constants.insert(OpRef::const_int(1).raw(), 0i64);
     backend.set_constants(constants);
@@ -312,7 +313,7 @@ fn test_bridge_end_to_end() {
     bridge_rec.finish(&[result], make_descr(1));
     let bridge_trace = bridge_rec.get_trace();
 
-    let mut bridge_constants = HashMap::new();
+    let mut bridge_constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
     bridge_constants.insert(OpRef::const_int(0).raw(), 2i64);
     backend.set_constants(bridge_constants);
 
@@ -415,7 +416,7 @@ fn build_magic_div_trace(m: i64, token_id: u64) -> (CraneliftBackend, JitCellTok
     rec.finish(&[result], make_descr(0));
     let trace = rec.get_trace();
 
-    let mut constants = HashMap::new();
+    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
     constants.insert(OpRef::const_int(0).raw(), k as i64);
     constants.insert(OpRef::const_int(1).raw(), i as i64);
     constants.insert(OpRef::const_int(2).raw(), 63i64);
@@ -455,7 +456,7 @@ fn build_magic_mod_trace(m: i64, token_id: u64) -> (CraneliftBackend, JitCellTok
     rec.finish(&[remainder], make_descr(0));
     let trace = rec.get_trace();
 
-    let mut constants = HashMap::new();
+    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
     constants.insert(OpRef::const_int(0).raw(), k as i64);
     constants.insert(OpRef::const_int(1).raw(), i as i64);
     constants.insert(OpRef::const_int(2).raw(), 63i64);
@@ -496,7 +497,7 @@ fn build_power_of_two_div_trace(divisor: i64, token_id: u64) -> (CraneliftBacken
     rec.finish(&[result], make_descr(0));
     let trace = rec.get_trace();
 
-    let mut constants = HashMap::new();
+    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
     constants.insert(OpRef::const_int(0).raw(), 63i64);
     constants.insert(OpRef::const_int(1).raw(), divisor - 1);
     constants.insert(OpRef::const_int(2).raw(), shift as i64);
@@ -693,7 +694,7 @@ fn test_vec_int_add_simd() {
     let trace = rec.get_trace();
 
     let mut backend = CraneliftBackend::new();
-    let mut constants = HashMap::new();
+    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
     constants.insert(OpRef::const_int(0).raw(), 0i64);
     constants.insert(OpRef::const_int(1).raw(), 1i64);
     constants.insert(OpRef::const_int(2).raw(), 2i64);
@@ -755,7 +756,7 @@ fn test_vec_int_sub_simd() {
     let trace = rec.get_trace();
 
     let mut backend = CraneliftBackend::new();
-    let mut constants = HashMap::new();
+    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
     constants.insert(OpRef::const_int(0).raw(), 0i64);
     constants.insert(OpRef::const_int(1).raw(), 1i64);
     constants.insert(OpRef::const_int(2).raw(), 2i64);
@@ -804,7 +805,7 @@ fn test_vec_int_mul_simd() {
     let trace = rec.get_trace();
 
     let mut backend = CraneliftBackend::new();
-    let mut constants = HashMap::new();
+    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
     constants.insert(OpRef::const_int(0).raw(), 0i64);
     constants.insert(OpRef::const_int(1).raw(), 1i64);
     constants.insert(OpRef::const_int(2).raw(), 2i64);
@@ -857,7 +858,7 @@ fn test_vec_expand_add_simd() {
     let trace = rec.get_trace();
 
     let mut backend = CraneliftBackend::new();
-    let mut constants = HashMap::new();
+    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
     constants.insert(OpRef::const_int(0).raw(), 0i64);
     constants.insert(OpRef::const_int(1).raw(), 1i64);
     constants.insert(OpRef::const_int(2).raw(), 2i64);
@@ -918,7 +919,7 @@ fn test_vec_float_add_simd() {
     let trace = rec.get_trace();
 
     let mut backend = CraneliftBackend::new();
-    let mut constants = HashMap::new();
+    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
     constants.insert(OpRef::const_int(0).raw(), 0i64);
     constants.insert(OpRef::const_int(1).raw(), 1i64);
     constants.insert(OpRef::const_int(2).raw(), 2i64);
@@ -997,7 +998,7 @@ fn test_vec_chained_add_mul_simd() {
     let trace = rec.get_trace();
 
     let mut backend = CraneliftBackend::new();
-    let mut constants = HashMap::new();
+    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
     constants.insert(OpRef::const_int(0).raw(), 0i64);
     constants.insert(OpRef::const_int(1).raw(), 1i64);
     constants.insert(OpRef::const_int(2).raw(), 2i64);
@@ -1109,10 +1110,10 @@ fn call_descr_can_raise(idx: u32) -> DescrRef {
 }
 
 /// Assign sequential positions to ops starting at `base`.
-fn assign_positions(ops: &mut [Op], base: u32) {
+fn assign_positions(ops: &mut [OpRc], base: u32) {
     for (i, op) in ops.iter_mut().enumerate() {
         let pos = base + i as u32;
-        op.pos = OpRef::op_typed(pos, op.result_type());
+        op.pos.set(OpRef::op_typed(pos, op.result_type()));
     }
 }
 
@@ -1298,7 +1299,7 @@ fn test_threadlocalref_get_basic() {
     let trace = rec.get_trace();
 
     let mut backend = CraneliftBackend::new();
-    let mut constants = HashMap::new();
+    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
     constants.insert(OpRef::const_int(0).raw(), 0i64); // offset 0
     backend.set_constants(constants);
 
@@ -1350,7 +1351,7 @@ fn test_threadlocalref_get_multiple_slots() {
     let trace = rec.get_trace();
 
     let mut backend = CraneliftBackend::new();
-    let mut constants = HashMap::new();
+    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
     constants.insert(OpRef::const_int(0).raw(), 0i64);
     constants.insert(OpRef::const_int(1).raw(), 8i64);
     backend.set_constants(constants);
@@ -1390,7 +1391,7 @@ fn test_threadlocalref_set_and_read_roundtrip() {
     let trace = rec.get_trace();
 
     let mut backend = CraneliftBackend::new();
-    let mut constants = HashMap::new();
+    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
     constants.insert(OpRef::const_int(0).raw(), 16i64); // offset 16 -> slot index 2
     backend.set_constants(constants);
 
@@ -1526,7 +1527,7 @@ fn test_call_release_gil_i_compiles_and_executes() {
     let trace = rec.get_trace();
 
     let mut backend = CraneliftBackend::new();
-    let mut constants = HashMap::new();
+    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
     constants.insert(OpRef::const_int(0).raw(), 0i64);
     constants.insert(
         OpRef::const_int(1).raw(),
@@ -1578,7 +1579,7 @@ fn test_call_release_gil_i_no_args() {
     let trace = rec.get_trace();
 
     let mut backend = CraneliftBackend::new();
-    let mut constants = HashMap::new();
+    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
     constants.insert(OpRef::const_int(0).raw(), 0i64);
     constants.insert(
         OpRef::const_int(1).raw(),
@@ -1623,7 +1624,7 @@ fn test_call_release_gil_n_void_return() {
     let trace = rec.get_trace();
 
     let mut backend = CraneliftBackend::new();
-    let mut constants = HashMap::new();
+    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
     constants.insert(OpRef::const_int(0).raw(), 0i64);
     constants.insert(
         OpRef::const_int(1).raw(),
@@ -1668,7 +1669,7 @@ fn test_call_release_gil_result_flows_through_trace() {
     let trace = rec.get_trace();
 
     let mut backend = CraneliftBackend::new();
-    let mut constants = HashMap::new();
+    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
     constants.insert(OpRef::const_int(0).raw(), 0i64);
     constants.insert(
         OpRef::const_int(1).raw(),
@@ -1787,7 +1788,7 @@ fn test_raw_store_load_int_roundtrip() {
     let trace = rec.get_trace();
 
     let mut backend = CraneliftBackend::new();
-    let mut constants = HashMap::new();
+    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
     constants.insert(OpRef::const_int(0).raw(), 0i64); // offset 0
     backend.set_constants(constants);
 
@@ -1829,7 +1830,7 @@ fn test_raw_store_load_float_roundtrip() {
     let trace = rec.get_trace();
 
     let mut backend = CraneliftBackend::new();
-    let mut constants = HashMap::new();
+    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
     constants.insert(OpRef::const_int(0).raw(), 0i64);
     backend.set_constants(constants);
 
@@ -1878,7 +1879,7 @@ fn test_raw_ops_different_offsets_no_interference() {
     let trace = rec.get_trace();
 
     let mut backend = CraneliftBackend::new();
-    let mut constants = HashMap::new();
+    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
     constants.insert(OpRef::const_int(0).raw(), 0i64);
     constants.insert(OpRef::const_int(1).raw(), 8i64);
     backend.set_constants(constants);
@@ -1926,7 +1927,7 @@ fn test_raw_load_unsigned_byte() {
     let trace = rec.get_trace();
 
     let mut backend = CraneliftBackend::new();
-    let mut constants = HashMap::new();
+    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
     constants.insert(OpRef::const_int(0).raw(), 0i64);
     backend.set_constants(constants);
 
@@ -2034,7 +2035,7 @@ fn test_call_release_gil_with_guard_not_forced() {
     let trace = rec.get_trace();
 
     let mut backend = CraneliftBackend::new();
-    let mut constants = HashMap::new();
+    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
     constants.insert(
         OpRef::const_int(0).raw(),
         ffi_add_no_force as *const () as usize as i64,
@@ -2098,7 +2099,7 @@ fn test_call_may_force_with_forcing_semantics() {
     let trace = rec.get_trace();
 
     let mut backend = CraneliftBackend::new();
-    let mut constants = HashMap::new();
+    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
     constants.insert(
         OpRef::const_int(0).raw(),
         ffi_maybe_force as *const () as usize as i64,
@@ -2177,7 +2178,7 @@ fn test_ffi_call_exception_propagation() {
     let trace = rec.get_trace();
 
     let mut backend = CraneliftBackend::new();
-    let mut constants = HashMap::new();
+    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
     constants.insert(OpRef::const_int(0).raw(), 0i64);
     constants.insert(
         OpRef::const_int(1).raw(),
@@ -2241,7 +2242,7 @@ fn test_compiled_guard_failure_preserves_frame_stack_metadata() {
     let trace = rec.get_trace();
 
     let mut backend = CraneliftBackend::new();
-    let mut constants = HashMap::new();
+    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
     constants.insert(OpRef::const_int(0).raw(), 5i64);
     constants.insert(OpRef::const_int(1).raw(), 100i64);
     backend.set_constants(constants);
@@ -2304,7 +2305,7 @@ fn test_compiled_bridge_guard_failure_has_frame_stack() {
     let trace = rec.get_trace();
 
     let mut backend = CraneliftBackend::new();
-    let mut constants = HashMap::new();
+    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
     constants.insert(OpRef::const_int(0).raw(), 1i64);
     constants.insert(OpRef::const_int(1).raw(), 0i64);
     backend.set_constants(constants);
@@ -2367,7 +2368,7 @@ fn test_compiled_bridge_guard_failure_has_frame_stack() {
     bridge_rec.finish(&[bresult], make_descr(11));
     let bridge_trace = bridge_rec.get_trace();
 
-    let mut bridge_constants = HashMap::new();
+    let mut bridge_constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
     bridge_constants.insert(OpRef::const_int(0).raw(), 0i64);
     bridge_constants.insert(OpRef::const_int(1).raw(), 2i64);
     backend.set_constants(bridge_constants);
@@ -2437,19 +2438,24 @@ fn test_call_assembler_callee_guard_failure_frame_stack() {
     // Compile a callee trace with a guard that fails:
     //   input(x) -> cmp = x > 10 -> guard_true(cmp) -> finish(x)
     let callee_inputargs = vec![InputArg::new_int(0)];
+    let op = |oc, args: &[OpRef]| std::rc::Rc::new(Op::new(oc, args));
+    let op_d = |oc, args: &[OpRef], d| std::rc::Rc::new(Op::with_descr(oc, args, d));
     let mut callee_ops = vec![
-        Op::new(OpCode::Label, &[OpRef::input_arg_int(0)]),
-        Op::new(
+        op(OpCode::Label, &[OpRef::input_arg_int(0)]),
+        op(
             OpCode::IntGt,
             &[OpRef::input_arg_int(0), OpRef::const_int(0)],
         ),
-        Op::with_descr(OpCode::GuardTrue, &[OpRef::int_op(1)], make_descr(0)),
-        Op::with_descr(OpCode::Finish, &[OpRef::input_arg_int(0)], make_descr(1)),
+        op_d(OpCode::GuardTrue, &[OpRef::int_op(1)], make_descr(0)),
+        op_d(OpCode::Finish, &[OpRef::input_arg_int(0)], make_descr(1)),
     ];
     assign_positions(&mut callee_ops, 0);
 
     let mut backend = CraneliftBackend::new();
-    backend.set_constants(HashMap::from([(OpRef::const_int(0).raw(), 10i64)]));
+    backend.set_constants(majit_ir::VecAssoc::from([(
+        OpRef::const_int(0).raw(),
+        10i64,
+    )]));
 
     backend.set_next_trace_id(920);
     backend.set_next_header_pc(3000);
@@ -2505,7 +2511,7 @@ fn test_frame_stack_slot_types_match_fail_arg_types() {
     let trace = rec.get_trace();
 
     let mut backend = CraneliftBackend::new();
-    let mut constants = HashMap::new();
+    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
     constants.insert(OpRef::const_int(0).raw(), 0i64);
     backend.set_constants(constants);
 
@@ -2613,7 +2619,7 @@ fn test_ffi_exchange_buffer_pattern() {
     let trace = rec.get_trace();
 
     let mut backend = CraneliftBackend::new();
-    let mut constants = HashMap::new();
+    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
     constants.insert(OpRef::const_int(0).raw(), 16i64);
     constants.insert(OpRef::const_int(1).raw(), 32i64);
     constants.insert(OpRef::const_int(2).raw(), 0i64);

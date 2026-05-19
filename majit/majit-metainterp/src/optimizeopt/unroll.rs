@@ -20,7 +20,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use majit_ir::{DescrRef, Op, OpCode, OpRef, Type, Value};
+use majit_ir::{DescrRef, Op, OpCode, OpRc, OpRef, Type, Value};
 
 use crate::optimizeopt::{
     OptContext, Optimization, OptimizationResult, SnapshotBoxes, SnapshotFramePcs,
@@ -28,11 +28,17 @@ use crate::optimizeopt::{
 };
 use crate::resume::SnapshotBox;
 
-fn is_trace_constant_ref(opref: OpRef, constants: &HashMap<u32, majit_ir::Value>) -> bool {
+fn is_trace_constant_ref(
+    opref: OpRef,
+    constants: &majit_ir::VecAssoc<u32, majit_ir::Value>,
+) -> bool {
     !opref.is_none() && constants.contains_key(&opref.raw())
 }
 
-fn is_trace_runtime_ref(opref: OpRef, constants: &HashMap<u32, majit_ir::Value>) -> bool {
+fn is_trace_runtime_ref(
+    opref: OpRef,
+    constants: &majit_ir::VecAssoc<u32, majit_ir::Value>,
+) -> bool {
     !opref.is_none() && !is_trace_constant_ref(opref, constants)
 }
 
@@ -64,8 +70,6 @@ pub struct UnrollOptimizer {
     /// warmstate.py: max_retrace_guards parameter. If a compiled trace has
     /// more guards than this, retracing is permanently disabled.
     pub max_retrace_guards: u32,
-    /// Constant type hints from ConstantPool, propagated to inner Optimizer.
-    pub constant_types: std::collections::HashMap<u32, majit_ir::Type>,
     /// compile.py:362: pre-imported ExportedState for compile_retrace.
     /// When set, Phase 1 (preamble) is skipped and Phase 2 uses this state
     /// directly, matching UnrolledLoopData.optimize → optimize_peeled_loop.
@@ -128,7 +132,8 @@ pub struct UnrollOptimizer {
     pub callinfocollection: Option<std::sync::Arc<majit_ir::CallInfoCollection>>,
     /// compile.py:221 + optimizer.py:530: call_pure_results from tracing.
     /// Passed through to the inner Optimizer for cross-iteration CALL_PURE folding.
-    pub call_pure_results: std::collections::HashMap<Vec<majit_ir::Value>, majit_ir::Value>,
+    pub call_pure_results:
+        crate::optimizeopt::vec_assoc::VecAssoc<Vec<majit_ir::Value>, majit_ir::Value>,
     /// virtualstate.py:26-27 `GenerateGuardState.__init__: self.cpu =
     /// optimizer.cpu`. Propagated to the inner phase-1/phase-2
     /// `Optimizer.cls_of_box_fn` so virtualstate match can read the
@@ -143,7 +148,6 @@ impl UnrollOptimizer {
             short_preamble: None,
             target_tokens: Vec::new(),
             retraced_count: 0,
-            constant_types: std::collections::HashMap::new(),
             // unroll.py:215/265 reads
             // `warmrunnerdescr.memory_manager.{retrace_limit,max_retrace_guards}`.
             // Production callers (pyjitpl/mod.rs:4109,5170) override
@@ -169,7 +173,7 @@ impl UnrollOptimizer {
             phase1_patchguardop: None,
             next_global_opref: 0,
             callinfocollection: None,
-            call_pure_results: std::collections::HashMap::new(),
+            call_pure_results: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             cls_of_box_fn: None,
         }
     }
@@ -204,7 +208,7 @@ impl UnrollOptimizer {
         );
         let mut result = body_ops.to_vec();
         if let Some(jump) = result.iter_mut().rfind(|op| op.opcode == OpCode::Jump) {
-            jump.descr = Some(preamble_target.as_jump_target_descr());
+            jump.setdescr(preamble_target.as_jump_target_descr());
         }
         result
     }
@@ -238,7 +242,7 @@ impl UnrollOptimizer {
     pub fn optimize_trace_with_constants(
         &mut self,
         ops: &[Op],
-        constants: &mut std::collections::HashMap<u32, majit_ir::Value>,
+        constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
     ) -> Vec<Op> {
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::default_pipeline();
         optimizer.add_pass(Box::new(OptUnroll::new()));
@@ -255,7 +259,7 @@ impl UnrollOptimizer {
     pub fn optimize_trace_with_constants_and_inputs(
         &mut self,
         ops: &[Op],
-        constants: &mut std::collections::HashMap<u32, majit_ir::Value>,
+        constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
         num_inputs: usize,
     ) -> (Vec<Op>, usize) {
         self.optimize_trace_with_constants_and_inputs_vable(ops, constants, num_inputs, None)
@@ -271,7 +275,7 @@ impl UnrollOptimizer {
     pub fn optimize_trace_with_constants_and_inputs_vable(
         &mut self,
         ops: &[Op],
-        constants: &mut std::collections::HashMap<u32, majit_ir::Value>,
+        constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
         num_inputs: usize,
         vable_config: Option<crate::optimizeopt::virtualize::VirtualizableConfig>,
     ) -> (Vec<Op>, usize) {
@@ -292,7 +296,7 @@ impl UnrollOptimizer {
     pub fn optimize_trace_with_constants_and_inputs_vable_out(
         &mut self,
         ops: &[Op],
-        constants: &mut std::collections::HashMap<u32, majit_ir::Value>,
+        constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
         num_inputs: usize,
         vable_config: Option<crate::optimizeopt::virtualize::VirtualizableConfig>,
         phase1_out: Option<&mut Option<(Vec<Op>, ExportedState)>>,
@@ -345,7 +349,6 @@ impl UnrollOptimizer {
                 None => crate::optimizeopt::optimizer::Optimizer::default_pipeline(),
             };
             opt_p1.all_descrs = std::mem::take(&mut self.all_descrs);
-            opt_p1.constant_types = self.constant_types.clone();
             opt_p1.callinfocollection = self.callinfocollection.clone();
             opt_p1.cls_of_box_fn = self.cls_of_box_fn;
             opt_p1.trace_inputarg_types = self.trace_inputarg_types.clone();
@@ -381,10 +384,16 @@ impl UnrollOptimizer {
             // per-arg type list (length must equal `num_inputs`).
             let p1_inputarg_types: &[majit_ir::Type] = &self.trace_inputarg_types;
             debug_assert_eq!(p1_inputarg_types.len(), num_inputs);
+            // Wrap input ops as `Vec<OpRc>` so TraceIterator's `&[OpRc]`
+            // surface receives shared identity (history.py:528). The
+            // deep-clone here corresponds to PyPy's `cls()` per-op fresh
+            // allocation inside `TraceIterator.next` (opencoder.py:399-401).
+            let ops_oprc: Vec<majit_ir::OpRc> =
+                ops.iter().map(|op| std::rc::Rc::new(op.clone())).collect();
             let mut p1_iter = crate::opencoder::TraceIterator::new(
-                ops,
+                &ops_oprc,
                 0,
-                ops.len(),
+                ops_oprc.len(),
                 None,
                 p1_inputarg_types,
                 0,    // start_fresh = 0 — inputargs at [0..num_inputs)
@@ -398,7 +407,7 @@ impl UnrollOptimizer {
             opt_p1.runtime_boxes = ops
                 .iter()
                 .rfind(|op| op.opcode == OpCode::Jump)
-                .map(|op| op.args.to_vec())
+                .map(|op| op.getarglist().to_vec())
                 .unwrap_or_default();
             // Slice 77b.B: hand opt_p1 the per-iter BoxRef pool that p1_iter
             // allocated (slice 77b.A). trace.get_iter() per-call
@@ -493,10 +502,10 @@ impl UnrollOptimizer {
                         next_iteration_args: Vec::new(),
                         end_arg_types: Vec::new(),
                         virtual_state: state.virtual_state.clone(),
-                        exported_infos: std::collections::HashMap::new(),
+                        exported_infos: crate::optimizeopt::vec_assoc::VecAssoc::new(),
                         exported_short_boxes: Vec::new(),
                         short_boxes: Vec::new(),
-                        short_box_const_values: std::collections::HashMap::new(),
+                        short_box_const_values: crate::optimizeopt::vec_assoc::VecAssoc::new(),
                         short_preamble: None,
                         renamed_inputargs: state.renamed_inputargs.clone(),
                         renamed_inputarg_types: state.renamed_inputarg_types.clone(),
@@ -582,7 +591,7 @@ impl UnrollOptimizer {
                 exported_state.end_args.len(),
                 p1_patchguardop
                     .as_ref()
-                    .map(|p| p.rd_resume_position)
+                    .map(|p| p.rd_resume_position.get())
                     .unwrap_or(-99),
             );
         }
@@ -603,7 +612,6 @@ impl UnrollOptimizer {
             None => crate::optimizeopt::optimizer::Optimizer::default_pipeline(),
         };
         opt_p2.all_descrs = std::mem::take(&mut self.all_descrs);
-        opt_p2.constant_types = self.constant_types.clone();
         opt_p2.callinfocollection = self.callinfocollection.clone();
         opt_p2.cls_of_box_fn = self.cls_of_box_fn;
         opt_p2.trace_inputarg_types = self.trace_inputarg_types.clone();
@@ -702,10 +710,13 @@ impl UnrollOptimizer {
         // as Phase 1 (Phase 2 walks the body half of the same trace).
         let p2_inputarg_types: &[majit_ir::Type] = &self.trace_inputarg_types;
         debug_assert_eq!(p2_inputarg_types.len(), body_num_inputs);
+        // Wrap into `Vec<OpRc>` for TraceIterator's `&[OpRc]` surface.
+        let ops_oprc: Vec<majit_ir::OpRc> =
+            ops.iter().map(|op| std::rc::Rc::new(op.clone())).collect();
         let mut iter = crate::opencoder::TraceIterator::new(
-            &ops,
+            &ops_oprc,
             0,
-            ops.len(),
+            ops_oprc.len(),
             None,
             p2_inputarg_types,
             phase2_inputarg_base, // fresh inputargs at [phase2_inputarg_base..)
@@ -833,7 +844,7 @@ impl UnrollOptimizer {
             for op in &p2_ops {
                 if op.opcode.is_guard() {
                     let rd_numb_len = op.resolved_rd_numb().map(|s| s.len()).unwrap_or(0);
-                    if let Some(ref fa) = op.fail_args {
+                    if let Some(fa) = op.getfailargs() {
                         let fa_raw: Vec<String> = fa
                             .iter()
                             .map(|a| format!("OpRef::from_raw({})", a.raw()))
@@ -841,15 +852,18 @@ impl UnrollOptimizer {
                         eprintln!(
                             "[jit] p2 guard {:?} pos={:?} resume_pos={} rd_numb={} fail_args_raw=[{}]",
                             op.opcode,
-                            op.pos,
-                            op.rd_resume_position,
+                            op.pos.get(),
+                            op.rd_resume_position.get(),
                             rd_numb_len,
                             fa_raw.join(", ")
                         );
                     } else {
                         eprintln!(
                             "[jit] p2 guard {:?} pos={:?} resume_pos={} rd_numb={} fail_args_raw=<none>",
-                            op.opcode, op.pos, op.rd_resume_position, rd_numb_len,
+                            op.opcode,
+                            op.pos.get(),
+                            op.rd_resume_position.get(),
+                            rd_numb_len,
                         );
                     }
                 }
@@ -869,7 +883,9 @@ impl UnrollOptimizer {
             for (i, op) in p2_ops.iter().enumerate() {
                 eprintln!(
                     "[jit] p2[{i}]: {:?} pos={:?} args={:?}",
-                    op.opcode, op.pos, op.args
+                    op.opcode,
+                    op.pos.get(),
+                    op.getarglist()
                 );
             }
         }
@@ -920,12 +936,12 @@ impl UnrollOptimizer {
         // trusting the stale copy.
         let body_jump_args: Vec<OpRef> = body_terminal_op
             .as_ref()
-            .map(|jump| jump.args.to_vec())
+            .map(|jump| jump.getarglist().to_vec())
             .or_else(|| {
                 p2_ops
                     .iter()
                     .rfind(|op| op.opcode == OpCode::Jump)
-                    .map(|jump| jump.args.to_vec())
+                    .map(|jump| jump.getarglist().to_vec())
             })
             .unwrap_or_default();
         let (imported_short_preamble_builder, rebuilt_imported_short_preamble) =
@@ -1004,8 +1020,8 @@ impl UnrollOptimizer {
                 // short_preamble_jump / extra_same_as fill via the
                 // canonical RPython path.
                 {
-                    let mut visited_force: std::collections::HashSet<OpRef> =
-                        std::collections::HashSet::new();
+                    let mut visited_force: majit_ir::vec_set::VecSet<OpRef> =
+                        majit_ir::vec_set::VecSet::new();
                     for op in p2_ops.iter() {
                         if op.opcode == OpCode::Jump {
                             // The terminal jump's args are already
@@ -1013,11 +1029,11 @@ impl UnrollOptimizer {
                             // (unroll.py:126-127) above.
                             continue;
                         }
-                        let arg_iter = op
-                            .args
+                        let arg_list = op.getarglist_copy();
+                        let arg_iter = arg_list
                             .iter()
                             .copied()
-                            .chain(op.fail_args.iter().flatten().copied());
+                            .chain(op.getfailargs().into_iter().flatten());
                         for arg in arg_iter {
                             if !is_trace_runtime_ref(arg, &consts_p2) {
                                 continue;
@@ -1026,8 +1042,10 @@ impl UnrollOptimizer {
                                 continue;
                             }
                             let resolved = final_ctx.get_box_replacement(arg);
-                            let needs_force = final_ctx.potential_extra_ops.contains_key(&arg)
-                                || final_ctx.potential_extra_ops.contains_key(&resolved);
+                            let needs_force = final_ctx
+                                .potential_extra_ops
+                                .iter()
+                                .any(|(k, _)| *k == arg || *k == resolved);
                             if needs_force {
                                 let _ = opt_p2.force_box(arg, &mut final_ctx);
                             }
@@ -1049,21 +1067,22 @@ impl UnrollOptimizer {
             // exported_state.short_boxes` parity: consume the eagerly-derived
             // ProducedShortOp list stored on ExportedState at export time.
             //
-            // history.py:220 box.type parity: `build_short_preamble_from_produced_boxes`
-            // still consumes the legacy `(i64, Type)` shape; lower the
-            // typed `Value` pool back at the call boundary.
-            let (consts_p1_bits, consts_p1_types) =
-                crate::optimizeopt::optimizer::lower_typed_constants_to_backend(&consts_p1);
-            let mut loop_constant_types = self.constant_types.clone();
-            for (&k, &tp) in &consts_p1_types {
-                loop_constant_types.entry(k).or_insert(tp);
+            // history.py:220/261/307 `Const` carries both type and value
+            // intrinsically. Pyre's typed `majit_ir::Const` unifies the
+            // legacy `(i64, Type)` parallel maps into a single
+            // `VecAssoc<u32, Const>`; the conversion from typed `Value`
+            // happens directly at the call boundary, with no parallel
+            // `loop_constant_types` side-table.
+            let mut loop_constants: crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Const> =
+                crate::optimizeopt::vec_assoc::VecAssoc::new();
+            for (&k, v) in consts_p1.iter() {
+                loop_constants.insert(k, v.to_const());
             }
             crate::optimizeopt::shortpreamble::build_short_preamble_from_produced_boxes(
                 &exported_end_args,
                 &exported_short_inputargs,
                 &exported_short_boxes_produced,
-                &consts_p1_bits,
-                &loop_constant_types,
+                &loop_constants,
             )
         });
         // shortpreamble.py:414-425 parity: store PtrInfo for each inputarg.
@@ -1128,12 +1147,12 @@ impl UnrollOptimizer {
         let jump_to_self = {
             let body_jump_args: Vec<OpRef> = body_terminal_op
                 .as_ref()
-                .map(|jump| jump.args.to_vec())
+                .map(|jump| jump.getarglist().to_vec())
                 .or_else(|| {
                     body_ops
                         .iter()
                         .rfind(|o| o.opcode == OpCode::Jump)
-                        .map(|j| j.args.to_vec())
+                        .map(|j| j.getarglist().to_vec())
                 })
                 .unwrap_or_default();
             let mut current_label_args = label_args.clone();
@@ -1141,7 +1160,7 @@ impl UnrollOptimizer {
             // when two virtuals share the same OpRef. Allocate fresh
             // OpRefs for duplicates so the LABEL carries independent slots.
             {
-                let mut seen_used = std::collections::HashSet::new();
+                let mut seen_used = majit_ir::vec_set::VecSet::new();
                 let mut next_fresh = current_label_args
                     .iter()
                     .chain(initial_sp.used_boxes.iter())
@@ -1377,7 +1396,7 @@ impl UnrollOptimizer {
                 let redirected_jump_descr_idx = redirected_tail_ops
                     .iter()
                     .rfind(|o| o.opcode == OpCode::Jump)
-                    .and_then(|o| o.descr.as_ref())
+                    .and_then(|o| o.getdescr())
                     .map(|d| d.index());
                 if redirected_jump_descr_idx != current_body_descr_idx {
                     // RPython parity: the Cranelift backend can't jump to
@@ -1432,14 +1451,14 @@ impl UnrollOptimizer {
                 .clone();
             let preamble_arity = exported_renamed_inputargs.len();
             if std::env::var_os("MAJIT_LOG").is_some() {
-                let body_jump_arity = body_terminal_op.as_ref().map(|j| j.args.len()).unwrap_or(0);
+                let body_jump_arity = body_terminal_op.as_ref().map(|j| j.num_args()).unwrap_or(0);
                 eprintln!(
                     "[jit] jump_to_preamble: body_jump_args={} preamble_arity={} start_label_args={:?}",
                     body_jump_arity, preamble_arity, exported_renamed_inputargs,
                 );
             }
             if let Some(mut end_jump) = body_terminal_op {
-                end_jump.descr = Some(preamble_target.as_jump_target_descr());
+                end_jump.setdescr(preamble_target.as_jump_target_descr());
                 if let Some(mut final_ctx) = opt_p2.final_ctx.take() {
                     // unroll.py:238-242 parity: jump_to_preamble retargets
                     // the live end_jump and routes it through
@@ -1493,12 +1512,12 @@ impl UnrollOptimizer {
         // RPython Box parity: drop duplicate-position ops. In RPython
         // each Box is unique so collisions can't happen. Keep first.
         {
-            let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+            let mut seen: majit_ir::vec_set::VecSet<u32> = majit_ir::vec_set::VecSet::new();
             combined.retain(|op| {
-                if op.pos.is_none() || op.result_type() == Type::Void {
+                if op.pos.get().is_none() || op.result_type() == Type::Void {
                     return true;
                 }
-                seen.insert(op.pos.raw())
+                seen.insert(op.pos.get().raw())
             });
         }
         crate::optimizeopt::optimizer::sanitize_backend_constants_for_ops(
@@ -1516,11 +1535,6 @@ impl UnrollOptimizer {
             eprintln!("[jit] consts_p2: {:?}", sorted_consts);
         }
         *constants = consts_p2;
-        // Merge Phase 2 constant types back so build_guard_metadata
-        // can resolve Phase 2 allocated constants for rd_virtuals.
-        for (k, v) in &opt_p2.constant_types {
-            self.constant_types.entry(*k).or_insert(*v);
-        }
         (combined, p2_ni)
     }
 
@@ -1540,7 +1554,7 @@ impl UnrollOptimizer {
     /// Remap a list of OpRefs through a forwarding mapping.
     /// Constant OpRefs are left unchanged because they are not remapped.
     pub fn map_args(
-        mapping: &std::collections::HashMap<OpRef, OpRef>,
+        mapping: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
         args: &[OpRef],
     ) -> Vec<OpRef> {
         args.iter()
@@ -1576,7 +1590,7 @@ fn closing_loop_contract_arity(ops: &[Op], fallback: usize) -> usize {
     ops.iter()
         .rev()
         .find_map(|op| match op.opcode {
-            OpCode::Label | OpCode::Jump => Some(op.args.len()),
+            OpCode::Label | OpCode::Jump => Some(op.num_args()),
             _ => None,
         })
         .unwrap_or(fallback)
@@ -1615,7 +1629,8 @@ pub struct ExportedState {
     /// dispatched via `isinstance` in `setinfo_from_preamble` (unroll.py:53-98).
     /// Majit uses the existing `OpInfo` enum (info.rs:137) as the discriminated
     /// union of these three cases.
-    pub exported_infos: HashMap<OpRef, crate::optimizeopt::info::OpInfo>,
+    pub exported_infos:
+        crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::info::OpInfo>,
     /// RPython shortpreamble.py: produced short boxes in preamble order.
     /// This preserves the original preamble ops so the active path can build
     /// short preambles without re-extracting them from the peeled trace.
@@ -1648,7 +1663,7 @@ pub struct ExportedState {
     /// already does this at `optimizer.rs:1927`; bridges and unit tests
     /// remain the open cases). At that point `classify_short_arg` can
     /// read from `ctx.get_constant(arg)` exclusively.
-    pub short_box_const_values: HashMap<OpRef, majit_ir::Value>,
+    pub short_box_const_values: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, majit_ir::Value>,
     /// Short preamble builder for bridge entry.
     pub short_preamble: Option<crate::optimizeopt::shortpreamble::ShortPreamble>,
     /// Renamed inputargs from the preamble.
@@ -1734,7 +1749,10 @@ impl ExportedState {
         end_args: Vec<OpRef>,
         next_iteration_args: Vec<OpRef>,
         virtual_state: crate::optimizeopt::virtualstate::VirtualState,
-        exported_infos: HashMap<OpRef, crate::optimizeopt::info::OpInfo>,
+        exported_infos: crate::optimizeopt::vec_assoc::VecAssoc<
+            OpRef,
+            crate::optimizeopt::info::OpInfo,
+        >,
         exported_short_boxes: Vec<crate::optimizeopt::shortpreamble::PreambleOp>,
         renamed_inputargs: Vec<OpRef>,
         renamed_inputarg_types: Vec<Type>,
@@ -1758,7 +1776,7 @@ impl ExportedState {
             exported_infos,
             exported_short_boxes,
             short_boxes,
-            short_box_const_values: HashMap::new(),
+            short_box_const_values: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             short_preamble: None,
             renamed_inputargs,
             renamed_inputarg_types,
@@ -1793,12 +1811,12 @@ impl ExportedState {
             }
         };
         let visit_op = |op: &Op, visit: &mut dyn FnMut(OpRef)| {
-            visit(op.pos);
-            for &arg in &op.args {
+            visit(op.pos.get());
+            for &arg in op.getarglist().iter() {
                 visit(arg);
             }
-            if let Some(ref fail_args) = op.fail_args {
-                for &arg in fail_args {
+            if let Some(fail_args) = op.getfailargs() {
+                for arg in fail_args {
                     visit(arg);
                 }
             }
@@ -1896,7 +1914,7 @@ impl ExportedState {
         let mut keys: Vec<OpRef> = self.exported_infos.keys().copied().collect();
         keys.sort_by_key(|k| k.raw());
         for key in keys {
-            if let OpInfo::Ptr(rc) = &self.exported_infos[&key] {
+            if let Some(OpInfo::Ptr(rc)) = self.exported_infos.get(&key) {
                 let info = rc.borrow();
                 match &*info {
                     // RPython ConstPtrInfo: GcRef constant stored directly in
@@ -2218,12 +2236,14 @@ impl ExportedState {
             // Re-share slots that originally aliased: walk the snapshot
             // map and copy each group's first canonical Rc into every
             // peer slot, restoring the pre-GC `Rc::as_ptr` equivalences.
-            let mut canonical_by_old: std::collections::HashMap<usize, Rc<VirtualStateInfoNode>> =
-                std::collections::HashMap::new();
+            let mut canonical_by_old: crate::optimizeopt::vec_assoc::VecAssoc<
+                usize,
+                Rc<VirtualStateInfoNode>,
+            > = crate::optimizeopt::vec_assoc::VecAssoc::new();
             for (slot_idx, &old_ptr) in original_ptrs.iter().enumerate() {
-                let entry = canonical_by_old
-                    .entry(old_ptr)
-                    .or_insert_with(|| Rc::clone(&self.virtual_state.state[slot_idx]));
+                let entry = canonical_by_old.entry_or_insert_with(old_ptr, || {
+                    Rc::clone(&self.virtual_state.state[slot_idx])
+                });
                 if !Rc::ptr_eq(entry, &self.virtual_state.state[slot_idx]) {
                     self.virtual_state.state[slot_idx] = Rc::clone(entry);
                 }
@@ -2473,8 +2493,10 @@ pub struct UnrollInfo {
     pub target_token: u64,
     /// Extra same_as ops added during finalization.
     pub extra_same_as: Vec<Op>,
-    /// Quasi-immutable dependencies discovered during optimization.
-    pub quasi_immutable_deps: std::collections::HashSet<(u64, u32)>,
+    /// Quasi-immutable dependencies discovered during optimization
+    /// (`optimizer.py:243` + `heap.py:807-808`). Vec-backed set with
+    /// linear-scan dedup.
+    pub quasi_immutable_deps: Vec<(u64, u32)>,
     /// Extra ops to insert before the label (from bridge inlining).
     pub extra_before_label: Vec<Op>,
 }
@@ -2526,7 +2548,9 @@ impl OptUnroll {
         renamed_inputargs: &[OpRef],
         optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
         ctx: &mut OptContext,
-        exported_int_bounds: Option<&HashMap<OpRef, crate::optimizeopt::intutils::IntBound>>,
+        exported_int_bounds: Option<
+            &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::intutils::IntBound>,
+        >,
     ) -> ExportedState {
         // unroll.py:454: end_args = [force_at_the_end_of_preamble(a) ...]
         let end_args: Vec<OpRef> = ctx.preamble_end_args.clone().unwrap_or_else(|| {
@@ -2542,7 +2566,10 @@ impl OptUnroll {
         // the same post-force, post-flush state RPython feeds in.
         let virtual_state = crate::optimizeopt::virtualstate::export_state(&end_args, ctx);
         // unroll.py:459-461: infos = {}; for arg in end_args: _expand_info(arg, infos)
-        let mut infos: HashMap<OpRef, crate::optimizeopt::info::OpInfo> = HashMap::new();
+        let mut infos: crate::optimizeopt::vec_assoc::VecAssoc<
+            OpRef,
+            crate::optimizeopt::info::OpInfo,
+        > = crate::optimizeopt::vec_assoc::VecAssoc::new();
         for &arg in &end_args {
             self.expand_info(arg, ctx, exported_int_bounds, &mut infos);
         }
@@ -2583,7 +2610,7 @@ impl OptUnroll {
                 &exported_short_boxes,
             );
         for (_, produced_op) in &short_boxes_for_info {
-            let op = produced_op.preamble_op.pos;
+            let op = produced_op.preamble_op.pos.get();
             if !op.is_constant() {
                 self.expand_info(op, ctx, exported_int_bounds, &mut infos);
             }
@@ -2671,7 +2698,7 @@ impl OptUnroll {
         state.phase1_emit_high_water = optimizer
             .phase1_emit_ops
             .iter()
-            .map(|op| op.pos.raw().saturating_add(1))
+            .map(|op| op.pos.get().raw().saturating_add(1))
             .max()
             .unwrap_or(0);
         // Capture the full Phase 1 BoxRef pool so a subsequent
@@ -2693,7 +2720,7 @@ impl OptUnroll {
         // populated; without this snapshot, the import path silently
         // skips the short op.
         for (_, produced) in &state.short_boxes {
-            for &arg in &produced.preamble_op.args {
+            for &arg in produced.preamble_op.getarglist().iter() {
                 if !arg.is_constant() {
                     continue;
                 }
@@ -2713,8 +2740,13 @@ impl OptUnroll {
         &self,
         arg: OpRef,
         ctx: &OptContext,
-        exported_int_bounds: Option<&HashMap<OpRef, crate::optimizeopt::intutils::IntBound>>,
-        infos: &mut HashMap<OpRef, crate::optimizeopt::info::OpInfo>,
+        exported_int_bounds: Option<
+            &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::intutils::IntBound>,
+        >,
+        infos: &mut crate::optimizeopt::vec_assoc::VecAssoc<
+            OpRef,
+            crate::optimizeopt::info::OpInfo,
+        >,
     ) {
         let resolved = ctx.get_box_replacement(arg);
         if infos.contains_key(&resolved) {
@@ -2762,8 +2794,13 @@ impl OptUnroll {
         &self,
         opref: OpRef,
         ctx: &OptContext,
-        exported_int_bounds: Option<&HashMap<OpRef, crate::optimizeopt::intutils::IntBound>>,
-        infos: &mut HashMap<OpRef, crate::optimizeopt::info::OpInfo>,
+        exported_int_bounds: Option<
+            &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::intutils::IntBound>,
+        >,
+        infos: &mut crate::optimizeopt::vec_assoc::VecAssoc<
+            OpRef,
+            crate::optimizeopt::info::OpInfo,
+        >,
     ) {
         let opref_box = ctx.get_box_replacement_box(opref);
         let fields: Vec<OpRef> = match opref_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
@@ -2967,11 +3004,11 @@ impl OptUnroll {
                         force_boxes,
                     )
                 });
-                let rd_resume_position = patch.rd_resume_position;
+                let rd_resume_position = patch.rd_resume_position.get();
                 for mut guard_op in emitted {
                     if std::env::var_os("MAJIT_LOG_JTET").is_some() {
                         let arg_values: Vec<_> = guard_op
-                            .args
+                            .getarglist()
                             .iter()
                             .map(|&arg| (arg, ctx.get_constant(arg)))
                             .collect();
@@ -2992,8 +3029,8 @@ impl OptUnroll {
                     // GUARD_TRUE/GUARD_VALUE pairs; only the latter inherit
                     // resume metadata. Mirror the type filter via `is_guard()`.
                     if guard_op.opcode.is_guard() {
-                        guard_op.rd_resume_position = rd_resume_position;
-                        guard_op.descr = Some(crate::optimizeopt::make_resume_at_position_descr());
+                        guard_op.rd_resume_position.set(rd_resume_position);
+                        guard_op.setdescr(crate::optimizeopt::make_resume_at_position_descr());
                     }
                     optimizer.send_extra_operation(&guard_op, ctx);
                 }
@@ -3081,41 +3118,34 @@ impl OptUnroll {
                             ctx,
                         );
                         if let Some(builder) = ctx.take_active_short_preamble_producer() {
-                            // RPython parity: extract constant pool from
-                            // OptContext. In RPython, Const objects in short
-                            // preamble ops are GC-tracked and survive across
-                            // compilations. build_short_preamble_struct scans
-                            // all op args to capture referenced constants.
-                            let mut loop_constants: HashMap<u32, i64> = HashMap::new();
-                            let mut loop_constant_types: HashMap<u32, majit_ir::Type> =
-                                optimizer.constant_types.clone();
-                            for (&const_idx, val) in &ctx.const_pool {
-                                let (raw, tp) = match val {
-                                    majit_ir::Value::Int(v) => (*v, majit_ir::Type::Int),
-                                    majit_ir::Value::Float(f) => {
-                                        (f.to_bits() as i64, majit_ir::Type::Float)
-                                    }
-                                    majit_ir::Value::Ref(r) => (r.0 as i64, majit_ir::Type::Ref),
-                                    majit_ir::Value::Void => (0, majit_ir::Type::Void),
-                                };
-                                let opref = OpRef::const_typed(const_idx, tp);
-                                loop_constants.insert(opref.raw(), raw);
-                                loop_constant_types.entry(opref.raw()).or_insert(tp);
+                            // history.py:220/261/307: `Const` carries both
+                            // type and value intrinsically. Pyre's typed
+                            // `majit_ir::Const` enum unifies the legacy
+                            // `(loop_constants, loop_constant_types)`
+                            // parallel maps into a single
+                            // `VecAssoc<u32, Const>`; the type tag rides on
+                            // the `Const` arm so no companion `Type` map is
+                            // needed.
+                            let mut loop_constants: crate::optimizeopt::vec_assoc::VecAssoc<
+                                u32,
+                                majit_ir::Const,
+                            > = crate::optimizeopt::vec_assoc::VecAssoc::new();
+                            for (const_idx, val) in ctx.const_pool.iter() {
+                                let c = val.to_const();
+                                let opref = OpRef::const_typed(const_idx, c.get_type());
+                                loop_constants.insert(opref.raw(), c);
                             }
-                            // Merge previous short preamble's constants.
                             // RPython's Const objects survive across compilations
                             // via GC tracing. In majit, we must carry forward
                             // constants from the previous build that may not
                             // exist in the current Phase 2 context.
-                            for (&k, &(v, tp)) in &sp.constants {
-                                loop_constants.entry(k).or_insert(v);
-                                loop_constant_types.entry(k).or_insert(tp);
+                            for (&k, &c) in &sp.constants {
+                                if !loop_constants.contains_key(&k) {
+                                    loop_constants.insert(k, c);
+                                }
                             }
                             target_token.short_preamble =
-                                Some(builder.build_short_preamble_struct(
-                                    &loop_constants,
-                                    &loop_constant_types,
-                                ));
+                                Some(builder.build_short_preamble_struct(&loop_constants));
                             target_token.short_preamble_producer = Some(builder);
                         }
                     } else {
@@ -3146,7 +3176,7 @@ impl OptUnroll {
             let mut jump_args = target_args;
             jump_args.extend(extra);
             let mut jump = Op::new(OpCode::Jump, &jump_args);
-            jump.descr = Some(target_token.as_jump_target_descr());
+            jump.setdescr(target_token.as_jump_target_descr());
             optimizer.send_extra_operation(&jump, ctx);
             return None; // successfully jumped
         }
@@ -3176,13 +3206,9 @@ impl OptUnroll {
         // constant pool. These OpRefs aren't in the bridge's context.
         // Register them as constants in the bridge's OptContext so the ops
         // can reference them correctly.
-        for (&idx, &(val, tp)) in &short_preamble.constants {
-            let value = match tp {
-                majit_ir::Type::Int => majit_ir::Value::Int(val),
-                majit_ir::Type::Ref => majit_ir::Value::Ref(majit_ir::GcRef(val as usize)),
-                majit_ir::Type::Float => majit_ir::Value::Float(f64::from_bits(val as u64)),
-                majit_ir::Type::Void => majit_ir::Value::Int(val),
-            };
+        for (&idx, &c) in &short_preamble.constants {
+            let tp = c.get_type();
+            let value = c.to_value();
             // history.py:220/261/307: ConstInt/ConstFloat/ConstPtr are
             // disjoint Box subclasses pinned to `box.type` at construction.
             // Mint the typed `OpRef::const_*` variant so the imported
@@ -3199,17 +3225,21 @@ impl OptUnroll {
             // `make_constant` early-returns on const-namespace OpRefs
             // (history.py:208 — Const.is_constant() == True), so
             // const_pool registration is the explicit seed below.
-            // Side-table type write keeps raw-u32 keyed readers in
-            // lockstep (optimizer.py:Const.type is intrinsic on the
-            // Box, history.py:220/261/307).
-            ctx.const_pool.entry(idx).or_insert(value);
-            optimizer
-                .constant_types
-                .entry(typed_opref.raw())
-                .or_insert(tp);
+            // history.py:220/261/307 — `Const.type` is intrinsic on the
+            // Box itself, so no parallel raw-u32 type side-table is
+            // needed (callers recover the type via `OpRef::ty()` or
+            // `Const::get_type()`).
+            //
+            // `short_preamble.constants` is keyed by `arg.raw()` (CONST_BIT
+            // set); `OptContext.const_pool` is Vec-backed dense-indexed by
+            // `OpRef::const_index()` (CONST_BIT masked). Use the masked
+            // index to avoid resizing the Vec to ~2 GiB slots.
+            ctx.const_pool
+                .entry_or_insert_with(typed_opref.const_index(), || value);
         }
 
-        let mut mapping: HashMap<OpRef, OpRef> = HashMap::new();
+        let mut mapping: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef> =
+            crate::optimizeopt::vec_assoc::VecAssoc::new();
 
         for (i, &short_inputarg) in short_preamble.inputargs.iter().enumerate() {
             if let Some(&jump_arg) = jump_args.get(i) {
@@ -3252,7 +3282,9 @@ impl OptUnroll {
         if let Some(ref phase1) = short_preamble.phase1_inputargs {
             for (i, &phase1_inputarg) in phase1.iter().enumerate() {
                 if let Some(&jump_arg) = jump_args.get(i) {
-                    mapping.entry(phase1_inputarg).or_insert(jump_arg);
+                    if !mapping.contains_key(&phase1_inputarg) {
+                        mapping.insert(phase1_inputarg, jump_arg);
+                    }
                 }
             }
         }
@@ -3315,7 +3347,8 @@ impl OptUnroll {
                 let mut new_op = sp_op.clone();
                 // unroll.py:404: _map_args(mapping, sop.getarglist())
                 // Const passes through unchanged, non-Const must be in mapping.
-                for arg in &mut new_op.args {
+                for i in 0..new_op.num_args() {
+                    let arg = new_op.arg(i);
                     // unroll.py:367: isinstance(box, Const) — true Const objects
                     // only (ConstInt/ConstPtr/ConstFloat). make_constant'd values
                     // are NOT Const objects — they are regular boxes with forwarded
@@ -3328,8 +3361,8 @@ impl OptUnroll {
                     // jump_args, extended by mapping[sop] = op). Missing keys
                     // indicate a structural mismatch (e.g., cross-loop bridge
                     // with incompatible short preamble). Raise InvalidLoop.
-                    match mapping.get(arg) {
-                        Some(&mapped) => *arg = mapped,
+                    match mapping.get(&arg) {
+                        Some(&mapped) => new_op.setarg(i, mapped),
                         None => {
                             // RPython: _map_args raises KeyError for unmapped
                             // args. This is equivalent to InvalidLoop — the
@@ -3358,31 +3391,23 @@ impl OptUnroll {
                     // the new guard reads None for every rd_* until
                     // store_final_boxes_in_guard repopulates them from the live
                     // snapshot.
-                    new_op.descr = Some(crate::optimizeopt::make_resume_at_position_descr());
-                    new_op.fail_args = None;
-                    new_op.fail_arg_types = None;
+                    new_op.setdescr(crate::optimizeopt::make_resume_at_position_descr());
+                    new_op.clearfailargs();
+                    new_op.clear_fail_arg_types();
                     // unroll.py:409: op.rd_resume_position = patchguardop.rd_resume_position
                     // RPython: patchguardop is always set (from GUARD_FUTURE_CONDITION).
                     if let Some(ref patch) = ctx.patchguardop {
-                        new_op.rd_resume_position = patch.rd_resume_position;
+                        new_op
+                            .rd_resume_position
+                            .set(patch.rd_resume_position.get());
                     }
                     // Re-register guard constant args from preamble's constant pool.
-                    for &arg in &new_op.args {
-                        if let Some(&(val, tp)) = short_preamble.constants.get(&arg.raw()) {
-                            let value = match tp {
-                                majit_ir::Type::Int => majit_ir::Value::Int(val),
-                                majit_ir::Type::Ref => {
-                                    majit_ir::Value::Ref(majit_ir::GcRef(val as usize))
-                                }
-                                majit_ir::Type::Float => {
-                                    majit_ir::Value::Float(f64::from_bits(val as u64))
-                                }
-                                majit_ir::Type::Void => majit_ir::Value::Int(val),
-                            };
-                            ctx.make_constant(arg, value);
+                    for &arg in new_op.getarglist().iter() {
+                        if let Some(&c) = short_preamble.constants.get(&arg.raw()) {
+                            ctx.make_constant(arg, c.to_value());
                         }
                     }
-                } else if let Some(ref mut fail_args) = new_op.fail_args {
+                } else if let Some(fail_args) = new_op.fail_args_mut() {
                     for arg in fail_args.iter_mut() {
                         if let Some(&mapped) = mapping.get(arg) {
                             *arg = mapped;
@@ -3390,10 +3415,10 @@ impl OptUnroll {
                     }
                 }
                 let new_ref = ctx.alloc_op_position_typed(new_op.result_type());
-                new_op.pos = new_ref;
+                new_op.pos.set(new_ref);
                 // unroll.py:412-414: mapping[sop] = op; i += 1; send_extra_operation(op)
                 // RPython sets mapping BEFORE send_extra_operation.
-                mapping.insert(sp_op.pos, new_ref);
+                mapping.insert(sp_op.pos.get(), new_ref);
                 replay_index += 1;
                 optimizer.send_extra_operation(&new_op, ctx);
             }
@@ -3412,7 +3437,7 @@ impl OptUnroll {
                         {
                             *jump_arg
                         } else {
-                            mapping[jump_arg]
+                            *mapping.get(jump_arg).expect("mapping missing jump_arg")
                         };
                         ctx.get_box_replacement(mapped)
                     })
@@ -3575,7 +3600,8 @@ impl OptUnroll {
         // before `produce_op` runs; majit must allocate the result OpRef
         // with the typed allocator so `opref_type` resolution doesn't
         // depend on a downstream `register_value_type` patch.
-        let mut result_map: HashMap<OpRef, OpRef> = HashMap::new();
+        let mut result_map: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef> =
+            crate::optimizeopt::vec_assoc::VecAssoc::new();
         for (source, produced) in &exported_state.short_boxes {
             let result_type = produced.preamble_op.result_type();
             let result = match produced.kind {
@@ -3609,7 +3635,8 @@ impl OptUnroll {
                 result_map.insert(*source, result);
             }
         }
-        let mut imported_constants: HashMap<OpRef, OpRef> = HashMap::new();
+        let mut imported_constants: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef> =
+            crate::optimizeopt::vec_assoc::VecAssoc::new();
         let from_short_boxes = ctx.initialize_imported_short_preamble_builder_from_short_boxes(
             &short_args,
             &exported_state.short_inputargs,
@@ -3636,7 +3663,8 @@ impl OptUnroll {
         // `Some(source)` (Phase 1 OpRef = `self.res`); for invented Pure the
         // value is the body-visible OpRef per `replay_pos` in
         // `initialize_imported_short_preamble_builder_from_short_boxes`.
-        let mut produced_results: HashMap<OpRef, OpRef> = HashMap::new();
+        let mut produced_results: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef> =
+            crate::optimizeopt::vec_assoc::VecAssoc::new();
         for (_, produced) in &exported_state.short_boxes {
             let produced_result = produced.produce_op(
                 ctx,
@@ -3655,9 +3683,9 @@ impl OptUnroll {
                         crate::optimizeopt::shortpreamble::PreambleOpKind::InputArg
                             | crate::optimizeopt::shortpreamble::PreambleOpKind::Guard
                     )
-                    || !result_map.contains_key(&produced.preamble_op.pos),
+                    || !result_map.contains_key(&produced.preamble_op.pos.get()),
                 "ProducedShortOp::produce_op failed for source {:?} kind {:?}",
-                produced.preamble_op.pos,
+                produced.preamble_op.pos.get(),
                 produced.kind
             );
         }
@@ -3685,7 +3713,9 @@ impl OptUnroll {
         &self,
         opref: OpRef,
         ctx: &OptContext,
-        exported_int_bounds: Option<&HashMap<OpRef, crate::optimizeopt::intutils::IntBound>>,
+        exported_int_bounds: Option<
+            &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::intutils::IntBound>,
+        >,
     ) -> Option<crate::optimizeopt::info::OpInfo> {
         use crate::optimizeopt::info::{OpInfo, PtrInfo};
         let resolved = ctx.get_box_replacement(opref);
@@ -3769,7 +3799,10 @@ impl OptUnroll {
         &self,
         opref: OpRef,
         info: &crate::optimizeopt::info::OpInfo,
-        exported_infos: &HashMap<OpRef, crate::optimizeopt::info::OpInfo>,
+        exported_infos: &crate::optimizeopt::vec_assoc::VecAssoc<
+            OpRef,
+            crate::optimizeopt::info::OpInfo,
+        >,
         ctx: &mut OptContext,
     ) {
         ctx.setinfo_from_preamble_item(opref, info, exported_infos);
@@ -3782,7 +3815,9 @@ pub(crate) fn export_state(
     renamed_inputargs: &[OpRef],
     optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
     ctx: &mut OptContext,
-    exported_int_bounds: Option<&HashMap<OpRef, crate::optimizeopt::intutils::IntBound>>,
+    exported_int_bounds: Option<
+        &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::intutils::IntBound>,
+    >,
 ) -> ExportedState {
     OptUnroll::new().export_state_with_bounds(
         jump_args,
@@ -3930,7 +3965,7 @@ fn assemble_peeled_trace(
     body_num_inputs: usize,
     jump_to_self: bool,
     imported_short_aliases: &[crate::optimizeopt::ImportedShortAlias],
-    constants: &std::collections::HashMap<u32, majit_ir::Value>,
+    constants: &majit_ir::VecAssoc<u32, majit_ir::Value>,
     start_label_descr: Option<DescrRef>,
     loop_label_descr: Option<DescrRef>,
 ) -> Vec<Op> {
@@ -3980,7 +4015,7 @@ fn emit_alias_same_as_for_imports(
 ) {
     for alias in imported_short_aliases {
         let mut op = Op::new(alias.same_as_opcode, &[alias.same_as_source]);
-        op.pos = alias.result;
+        op.pos.set(alias.result);
         result.push(op);
     }
 }
@@ -3996,7 +4031,7 @@ fn assemble_peeled_trace_with_jump_args(
     inputarg_base: u32,
     jump_to_self: bool,
     imported_short_aliases: &[crate::optimizeopt::ImportedShortAlias],
-    constants: &std::collections::HashMap<u32, majit_ir::Value>,
+    constants: &majit_ir::VecAssoc<u32, majit_ir::Value>,
     start_label_descr: Option<DescrRef>,
     loop_label_descr: Option<DescrRef>,
     _p1_end_args: &[OpRef],
@@ -4050,8 +4085,8 @@ fn assemble_peeled_trace_with_jump_args(
 
     if let Some(start_label_descr) = start_label_descr {
         let mut start_label = Op::new(OpCode::Label, start_label_args);
-        start_label.pos = OpRef::NONE;
-        start_label.descr = Some(start_label_descr);
+        start_label.pos.set(OpRef::NONE);
+        start_label.setdescr(start_label_descr);
         result.push(start_label);
     }
 
@@ -4068,13 +4103,13 @@ fn assemble_peeled_trace_with_jump_args(
     // are referenced by the body Label args and must not be reused.
     let result_max = result
         .iter()
-        .map(|op| op.pos.raw())
+        .map(|op| op.pos.get().raw())
         .filter(|&p| p != u32::MAX)
         .max()
         .unwrap_or(inputarg_base + body_num_inputs as u32);
     let p1_all_max = p1_ops
         .iter()
-        .map(|op| op.pos.raw())
+        .map(|op| op.pos.get().raw())
         .filter(|&p| p != u32::MAX)
         .max()
         .unwrap_or(0);
@@ -4098,8 +4133,8 @@ fn assemble_peeled_trace_with_jump_args(
     // typed variants from `inputarg_types` so this set's OpRefs match the
     // typed mints used at trace start / Phase 2 import under variant-aware
     // Eq.
-    let preamble_defs: std::collections::HashSet<OpRef> = {
-        let mut s: std::collections::HashSet<OpRef> = (0..body_num_inputs)
+    let preamble_defs: majit_ir::vec_set::VecSet<OpRef> = {
+        let mut s: majit_ir::vec_set::VecSet<OpRef> = (0..body_num_inputs)
             .map(|i| {
                 let pos = inputarg_base + i as u32;
                 // history.py:220 box.type / resoperation.py:719/727/739
@@ -4114,8 +4149,11 @@ fn assemble_peeled_trace_with_jump_args(
             })
             .collect();
         for op in &result {
-            if !op.pos.is_none() && op.opcode != OpCode::Jump && op.result_type() != Type::Void {
-                s.insert(op.pos);
+            if !op.pos.get().is_none()
+                && op.opcode != OpCode::Jump
+                && op.result_type() != Type::Void
+            {
+                s.insert(op.pos.get());
             }
         }
         s
@@ -4143,15 +4181,15 @@ fn assemble_peeled_trace_with_jump_args(
         }
     }
     for op in p2_ops.iter() {
-        if is_trace_runtime_ref(op.pos, constants) {
-            max_pos = max_pos.max(op.pos.raw().saturating_add(1));
+        if is_trace_runtime_ref(op.pos.get(), constants) {
+            max_pos = max_pos.max(op.pos.get().raw().saturating_add(1));
         }
-        for &arg in op.args.iter() {
+        for &arg in op.getarglist().iter() {
             if is_trace_runtime_ref(arg, constants) {
                 max_pos = max_pos.max(arg.raw().saturating_add(1));
             }
         }
-        if let Some(ref fa) = op.fail_args {
+        if let Some(fa) = op.getfailargs() {
             for &arg in fa.iter() {
                 if is_trace_runtime_ref(arg, constants) {
                     max_pos = max_pos.max(arg.raw().saturating_add(1));
@@ -4173,8 +4211,8 @@ fn assemble_peeled_trace_with_jump_args(
     // OpRef can be appended directly to full_label_args — the JUMP's
     // mapped_base_args path picks up the corresponding fresh value on the
     // next iteration. The filter only needs to skip filtered_extra_jump_args.
-    let mut carried_source_slots: std::collections::HashSet<OpRef> =
-        std::collections::HashSet::new();
+    let mut carried_source_slots: majit_ir::vec_set::VecSet<OpRef> =
+        majit_ir::vec_set::VecSet::new();
     carried_source_slots.extend(filtered_extra_jump_args.iter().copied());
     // `label_set` tracks which OpRefs are already carried by the label so
     // that the body-use-before-def pass doesn't add the same OpRef twice
@@ -4184,10 +4222,10 @@ fn assemble_peeled_trace_with_jump_args(
     // is NOT the Issue 1 dedup — which drops distinct Boxes that happen
     // to share an OpRef — it is RPython parity: the same Box appears
     // once in the label arglist.
-    let mut label_set: std::collections::HashSet<OpRef> = full_label_args.iter().copied().collect();
+    let mut label_set: majit_ir::vec_set::VecSet<OpRef> = full_label_args.iter().copied().collect();
     let mut fallthrough_aliases = Vec::new();
     {
-        let mut seen_body_defs = std::collections::HashSet::new();
+        let mut seen_body_defs = majit_ir::vec_set::VecSet::new();
         for op in p2_ops {
             // compile.py assembles the loop LABEL from `label_op` plus
             // short-preamble `used_boxes`; the terminal JUMP's target-local
@@ -4198,11 +4236,12 @@ fn assemble_peeled_trace_with_jump_args(
             if op.opcode == OpCode::Jump {
                 continue;
             }
-            let all_refs = op
-                .args
+            let op_args = op.getarglist_copy();
+            let all_refs = op_args
                 .iter()
-                .chain(op.fail_args.as_ref().into_iter().flat_map(|fa| fa.iter()));
-            for &arg in all_refs {
+                .copied()
+                .chain(op.getfailargs().into_iter().flatten());
+            for arg in all_refs {
                 if !is_trace_runtime_ref(arg, constants) {
                     continue; // skip NONE and constants
                 }
@@ -4237,15 +4276,15 @@ fn assemble_peeled_trace_with_jump_args(
                         });
                     if tp != Type::Void {
                         let mut same_as = Op::new(OpCode::same_as_for_type(tp), &[source]);
-                        same_as.pos = arg;
+                        same_as.pos.set(arg);
                         fallthrough_aliases.push(same_as);
                     }
                 }
                 full_label_args.push(arg);
                 label_set.insert(arg);
             }
-            if op.result_type() != Type::Void && !op.pos.is_none() {
-                seen_body_defs.insert(op.pos);
+            if op.result_type() != Type::Void && !op.pos.get().is_none() {
+                seen_body_defs.insert(op.pos.get());
             }
         }
     }
@@ -4257,8 +4296,12 @@ fn assemble_peeled_trace_with_jump_args(
     // shadows a real Box-bearing op at the same raw position, and
     // variant-aware Hash matches when downstream consumers compare
     // label_op.pos against Op-keyed maps.
-    label_op.pos = OpRef::op_typed(label_pos, label_op.result_type());
-    label_op.descr = loop_label_descr;
+    label_op
+        .pos
+        .set(OpRef::op_typed(label_pos, label_op.result_type()));
+    if let Some(d) = loop_label_descr {
+        label_op.setdescr(d);
+    }
     result.extend(fallthrough_aliases);
     result.push(label_op);
 
@@ -4270,7 +4313,7 @@ fn assemble_peeled_trace_with_jump_args(
         .unwrap_or(label_pos);
     let max_emitted_pos = result
         .iter()
-        .map(|op| op.pos.raw())
+        .map(|op| op.pos.get().raw())
         .filter(|&p| p != u32::MAX)
         .max()
         .unwrap_or(label_pos);
@@ -4285,7 +4328,7 @@ fn assemble_peeled_trace_with_jump_args(
     // position already emitted into `result`.
     let max_p2_pos = p2_ops
         .iter()
-        .map(|op| op.pos.raw())
+        .map(|op| op.pos.get().raw())
         .filter(|&p| p != u32::MAX)
         .max()
         .unwrap_or(0);
@@ -4296,8 +4339,9 @@ fn assemble_peeled_trace_with_jump_args(
             .max(max_p2_pos)
             .saturating_add(1),
     );
-    let mut body_result_remap: HashMap<OpRef, OpRef> = HashMap::new();
-    let visible_before_label: std::collections::HashSet<OpRef> = full_label_args
+    let mut body_result_remap: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef> =
+        crate::optimizeopt::vec_assoc::VecAssoc::new();
+    let visible_before_label: majit_ir::vec_set::VecSet<OpRef> = full_label_args
         .iter()
         .copied()
         .chain(preamble_defs.iter().copied())
@@ -4312,7 +4356,8 @@ fn assemble_peeled_trace_with_jump_args(
     // RPython's Box identity makes this implicit — the alias's Box is
     // the same Python object that body ops already hold. Pyre's flat
     // OpRef model needs an explicit forwarding registration here.
-    let mut assembly_alias_remap: HashMap<OpRef, OpRef> = HashMap::new();
+    let mut assembly_alias_remap: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef> =
+        crate::optimizeopt::vec_assoc::VecAssoc::new();
     // Keep the assembly-only alias map separate from the general `_forwarded`
     // walk. PyPy has object identity for these short-preamble boxes; pyre needs
     // the explicit jump_source -> label_arg substitution, but must not follow
@@ -4340,7 +4385,7 @@ fn assemble_peeled_trace_with_jump_args(
         // Only map non-Void ops that actually produce a result.
         // Void ops (SetfieldGc, guards, Jump) don't define values at
         // their position — mapping them creates phantom OpRefs.
-        if op.pos.raw() != u32::MAX && op.result_type() != Type::Void {
+        if op.pos.get().raw() != u32::MAX && op.result_type() != Type::Void {
             // history.py:220 box.type / resoperation.py:567/589/615 IntOp /
             // RefOp / FloatOp.type — the fresh result Box inherits the
             // producing op's type tag so downstream readers (`opref_type`
@@ -4348,65 +4393,71 @@ fn assemble_peeled_trace_with_jump_args(
             // see the correct `box.type` instead of a default-int guess.
             let fresh = OpRef::op_typed(next_body_pos, op.result_type());
             next_body_pos = next_free_pos(next_body_pos.saturating_add(1));
-            body_result_remap.insert(op.pos, fresh);
+            body_result_remap.insert(op.pos.get(), fresh);
         }
     }
 
-    let mut seen_body_defs = std::collections::HashSet::new();
+    let mut seen_body_defs = majit_ir::vec_set::VecSet::new();
     let mut current_inner_label_index: Option<usize> = None;
-    let mut defs_since_inner_label: std::collections::HashSet<OpRef> =
-        std::collections::HashSet::new();
+    let mut defs_since_inner_label: majit_ir::vec_set::VecSet<OpRef> =
+        majit_ir::vec_set::VecSet::new();
     for (op_idx, op) in p2_ops.iter().enumerate() {
         let mut new_op = op.clone();
-        let mut original_args = op.args.clone();
-        if let Some(&mapped_pos) = body_result_remap.get(&op.pos) {
-            new_op.pos = mapped_pos;
+        let mut original_args = op.getarglist_copy();
+        if let Some(&mapped_pos) = body_result_remap.get(&op.pos.get()) {
+            new_op.pos.set(mapped_pos);
         }
         // Body op args were already resolved at emit time by
         // optimizer.py:614-625 / Optimizer::emit_operation. Do not walk
         // forwarding chains again here: postprocess_GUARD_TRUE/FALSE may have
         // installed Const forwarding after the guard was emitted, and PyPy keeps
         // the guard's original runtime argument.
-        let remap_body_arg = |arg: OpRef,
-                              assembly_alias_remap: &HashMap<OpRef, OpRef>,
-                              body_result_remap: &HashMap<OpRef, OpRef>,
-                              seen_body_defs: &std::collections::HashSet<OpRef>,
-                              visible_before_label: &std::collections::HashSet<OpRef>|
-         -> OpRef {
-            if let Some(&mapped) = assembly_alias_remap.get(&arg) {
-                return mapped;
-            }
-            if let Some(&mapped) = body_result_remap.get(&arg) {
-                if seen_body_defs.contains(&arg) || !visible_before_label.contains(&arg) {
+        let remap_body_arg =
+            |arg: OpRef,
+             assembly_alias_remap: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
+             body_result_remap: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
+             seen_body_defs: &majit_ir::vec_set::VecSet<OpRef>,
+             visible_before_label: &majit_ir::vec_set::VecSet<OpRef>|
+             -> OpRef {
+                if let Some(&mapped) = assembly_alias_remap.get(&arg) {
                     return mapped;
                 }
-            }
-            arg
-        };
-        for arg in &mut new_op.args {
-            *arg = remap_body_arg(
-                *arg,
-                &assembly_alias_remap,
-                &body_result_remap,
-                &seen_body_defs,
-                &visible_before_label,
+                if let Some(&mapped) = body_result_remap.get(&arg) {
+                    if seen_body_defs.contains(&arg) || !visible_before_label.contains(&arg) {
+                        return mapped;
+                    }
+                }
+                arg
+            };
+        // optimizer.py:651-652 force_box loop pattern:
+        //   for i in range(op.numargs()): op.setarg(i, ...)
+        for i in 0..new_op.num_args() {
+            new_op.setarg(
+                i,
+                remap_body_arg(
+                    new_op.arg(i),
+                    &assembly_alias_remap,
+                    &body_result_remap,
+                    &seen_body_defs,
+                    &visible_before_label,
+                ),
             );
         }
         if new_op.opcode == OpCode::Label {
-            let mut seen_after_label_defs = std::collections::HashSet::new();
+            let mut seen_after_label_defs = majit_ir::vec_set::VecSet::new();
             let mut extra_inner_sources = Vec::new();
-            let mut extra_inner_set = std::collections::HashSet::new();
-            let label_arg_set: std::collections::HashSet<OpRef> = original_args
+            let mut extra_inner_set = majit_ir::vec_set::VecSet::new();
+            let label_arg_set: majit_ir::vec_set::VecSet<OpRef> = original_args
                 .iter()
                 .copied()
                 .filter(|arg| !arg.is_none())
                 .collect();
             for later_op in p2_ops.iter().skip(op_idx + 1) {
                 for arg in later_op
-                    .args
+                    .getarglist()
                     .iter()
                     .copied()
-                    .chain(later_op.fail_args.iter().flatten().copied())
+                    .chain(later_op.getfailargs().into_iter().flatten())
                 {
                     if arg.is_none()
                         || constants.contains_key(&arg.raw())
@@ -4432,8 +4483,8 @@ fn assemble_peeled_trace_with_jump_args(
                         extra_inner_sources.push(arg);
                     }
                 }
-                if later_op.result_type() != Type::Void && !later_op.pos.is_none() {
-                    seen_after_label_defs.insert(later_op.pos);
+                if later_op.result_type() != Type::Void && !later_op.pos.get().is_none() {
+                    seen_after_label_defs.insert(later_op.pos.get());
                 }
             }
             // RPython Box parity: do not dedup the inner-label extension
@@ -4445,6 +4496,9 @@ fn assemble_peeled_trace_with_jump_args(
             // already dedups by box identity (`extra_inner_set.contains`),
             // so each source_arg appears at most once — which is the
             // RPython-parity behavior for Box-keyed live-in sets.
+            // unroll.py:301 label_op.initarglist(label_op.getarglist() +
+            //                                    sb.used_boxes)
+            let mut extended_args: smallvec::SmallVec<[OpRef; 3]> = new_op.getarglist_copy();
             for &source_arg in &extra_inner_sources {
                 // optimizer.py:614-625 freeze: do not follow ctx forwarding
                 // chains here; postprocess Const forwarding on body ops would
@@ -4461,9 +4515,10 @@ fn assemble_peeled_trace_with_jump_args(
                     &seen_body_defs,
                     &visible_before_label,
                 );
-                new_op.args.push(mapped_arg);
+                extended_args.push(mapped_arg);
                 original_args.push(source_arg);
             }
+            new_op.initarglist(extended_args);
         }
         if new_op.opcode == OpCode::Jump {
             // unroll.py:238-242 jump_to_preamble sends the live JUMP after
@@ -4471,7 +4526,7 @@ fn assemble_peeled_trace_with_jump_args(
             // the trace inputarg slots OpRef(0)..OpRef(start_label_args.len());
             // remap those positional refs to start_label_args[i].
             let mapped_base_args: Vec<OpRef> = new_op
-                .args
+                .getarglist()
                 .iter()
                 .map(|&arg| {
                     if jump_to_self {
@@ -4482,7 +4537,7 @@ fn assemble_peeled_trace_with_jump_args(
                 })
                 .collect();
             let target_label_args: Vec<OpRef> = current_inner_label_index
-                .and_then(|label_idx| result.get(label_idx).map(|op| op.args.to_vec()))
+                .and_then(|label_idx| result.get(label_idx).map(|op| op.getarglist().to_vec()))
                 .unwrap_or_else(|| full_label_args.clone());
             let target_base_len = if current_inner_label_index.is_some() {
                 original_args.len()
@@ -4525,13 +4580,14 @@ fn assemble_peeled_trace_with_jump_args(
                     jump_args.push(extra_arg);
                 }
             }
-            new_op.args = jump_args.into();
+            // unroll.py-style bulk replace: jump arity is finalized here.
+            new_op.initarglist(jump_args.into());
         }
         // RPython resume.py parity: fail_args capture guard-point state
         // (the snapshot), not the body's final state. body_result_remap
         // applies only to values body-defined AND not visible before the
         // label, so snapshot refs to label args stay intact.
-        if let Some(ref mut fa) = new_op.fail_args {
+        if let Some(fa) = new_op.fail_args_mut() {
             for a in fa.iter_mut() {
                 if let Some(&mapped) = body_result_remap.get(a) {
                     if seen_body_defs.contains(a) && !visible_before_label.contains(a) {
@@ -4542,12 +4598,12 @@ fn assemble_peeled_trace_with_jump_args(
         }
         if let Some(label_idx) = current_inner_label_index {
             let mut extra_live_args = Vec::new();
-            let label_args = &result[label_idx].args;
+            let label_args = result[label_idx].getarglist_copy();
             for arg in new_op
-                .args
+                .getarglist()
                 .iter()
                 .copied()
-                .chain(new_op.fail_args.iter().flatten().copied())
+                .chain(new_op.getfailargs().into_iter().flatten())
             {
                 if arg.is_none()
                     || constants.contains_key(&arg.raw())
@@ -4560,13 +4616,15 @@ fn assemble_peeled_trace_with_jump_args(
                 extra_live_args.push(arg);
             }
             if !extra_live_args.is_empty() {
-                let existing: std::collections::HashSet<OpRef> =
-                    result[label_idx].args.iter().copied().collect();
-                result[label_idx].args.extend(
+                let existing: majit_ir::vec_set::VecSet<OpRef> =
+                    result[label_idx].getarglist().iter().copied().collect();
+                let mut new_args = result[label_idx].getarglist_copy();
+                new_args.extend(
                     extra_live_args
                         .into_iter()
                         .filter(|arg| !existing.contains(arg)),
                 );
+                result[label_idx].initarglist(new_args);
             }
         }
         // RPython parity: each guard in the assembled trace owns a
@@ -4584,9 +4642,9 @@ fn assemble_peeled_trace_with_jump_args(
             current_inner_label_index = Some(result.len() - 1);
             defs_since_inner_label.clear();
         }
-        if op.result_type() != Type::Void && !op.pos.is_none() {
-            seen_body_defs.insert(op.pos);
-            defs_since_inner_label.insert(result.last().unwrap().pos);
+        if op.result_type() != Type::Void && !op.pos.get().is_none() {
+            seen_body_defs.insert(op.pos.get());
+            defs_since_inner_label.insert(result.last().unwrap().pos.get());
         }
     }
 
@@ -4672,7 +4730,11 @@ impl OptUnroll {
     /// closes that collision and lets the Box.type invariant enforce
     /// itself uniformly at `emit()` / `emit_extra()` /
     /// `propagate_from_pass_range`.
-    fn peel_iteration(&self, jump_op: &Op, ctx: &mut OptContext) -> HashMap<OpRef, OpRef> {
+    fn peel_iteration(
+        &self,
+        jump_op: &Op,
+        ctx: &mut OptContext,
+    ) -> crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef> {
         // First pass: reserve peeled-iteration positions, tagged with each
         // source op's result type (Slice 0.5 follow-up — `OpRef.ty()`
         // matches RPython's `box.type` at allocation time).
@@ -4681,23 +4743,26 @@ impl OptUnroll {
             .iter()
             .map(|op| ctx.reserve_pos_typed(op.result_type()))
             .collect();
-        let mut ref_map: HashMap<OpRef, OpRef> = HashMap::new();
+        let mut ref_map: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef> =
+            crate::optimizeopt::vec_assoc::VecAssoc::new();
         for (op, &new_pos) in self.buffer.iter().zip(peeled_positions.iter()) {
-            ref_map.insert(op.pos, new_pos);
+            ref_map.insert(op.pos.get(), new_pos);
         }
 
         // Emit peeled iteration with remapped refs.
         for (op, &new_pos) in self.buffer.iter().zip(peeled_positions.iter()) {
             let mut peeled = op.clone();
-            peeled.pos = new_pos;
-            for arg in &mut peeled.args {
-                if let Some(&new_ref) = ref_map.get(arg) {
-                    *arg = new_ref;
+            peeled.pos.set(new_pos);
+            // optimizer.py:651-652 setarg loop parity.
+            for i in 0..peeled.num_args() {
+                let arg = peeled.arg(i);
+                if let Some(&new_ref) = ref_map.get(&arg) {
+                    peeled.setarg(i, new_ref);
                 }
                 // Args referencing ops outside the buffer (e.g., input args)
                 // are kept as-is.
             }
-            if let Some(ref mut fa) = peeled.fail_args {
+            if let Some(fa) = peeled.fail_args_mut() {
                 for arg in fa.iter_mut() {
                     if let Some(&new_ref) = ref_map.get(arg) {
                         *arg = new_ref;
@@ -4709,7 +4774,7 @@ impl OptUnroll {
                 // opencoder.py:391-401 parity: trace iteration strips guard
                 // descrs, keeping only rd_resume_position. optimizer.py then
                 // invents a fresh opcode-appropriate descr at emission time.
-                peeled.descr = None;
+                peeled.cleardescr();
             }
             ctx.emit(peeled);
         }
@@ -4717,8 +4782,8 @@ impl OptUnroll {
         // Emit Label between peeled and original body.
         // The Label's args match the Jump's args, forming the loop header.
         let label_pos = ctx.reserve_pos_typed(OpCode::Label.result_type());
-        let mut label_op = Op::new(OpCode::Label, &jump_op.args);
-        label_op.pos = label_pos;
+        let mut label_op = Op::new(OpCode::Label, &jump_op.getarglist());
+        label_op.pos.set(label_pos);
         ctx.emit(label_op);
 
         // Reserve body positions, tagged per source op (Slice 0.5 follow-up).
@@ -4727,21 +4792,24 @@ impl OptUnroll {
             .iter()
             .map(|op| ctx.reserve_pos_typed(op.result_type()))
             .collect();
-        let mut orig_ref_map: HashMap<OpRef, OpRef> = HashMap::new();
+        let mut orig_ref_map: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef> =
+            crate::optimizeopt::vec_assoc::VecAssoc::new();
         for (op, &new_pos) in self.buffer.iter().zip(body_positions.iter()) {
-            orig_ref_map.insert(op.pos, new_pos);
+            orig_ref_map.insert(op.pos.get(), new_pos);
         }
 
         // Emit original body ops with remapped positions and refs.
         for (op, &new_pos) in self.buffer.iter().zip(body_positions.iter()) {
             let mut body_op = op.clone();
-            body_op.pos = new_pos;
-            for arg in &mut body_op.args {
-                if let Some(&new_ref) = orig_ref_map.get(arg) {
-                    *arg = new_ref;
+            body_op.pos.set(new_pos);
+            // optimizer.py:651-652 setarg loop parity.
+            for i in 0..body_op.num_args() {
+                let arg = body_op.arg(i);
+                if let Some(&new_ref) = orig_ref_map.get(&arg) {
+                    body_op.setarg(i, new_ref);
                 }
             }
-            if let Some(ref mut fa) = body_op.fail_args {
+            if let Some(fa) = body_op.fail_args_mut() {
                 for arg in fa.iter_mut() {
                     if let Some(&new_ref) = orig_ref_map.get(arg) {
                         *arg = new_ref;
@@ -4753,7 +4821,7 @@ impl OptUnroll {
                 // Same opencoder.py guard-descr stripping as the peeled copy.
                 // ResumeAtPositionDescr is inline_short_preamble-only
                 // (unroll.py:406-409), not normal peeled body guard state.
-                body_op.descr = None;
+                body_op.cleardescr();
             }
             ctx.emit(body_op);
         }
@@ -4767,7 +4835,7 @@ fn fresh_snapshot_key(ctx: &OptContext) -> i32 {
 
 fn remap_snapshot_boxes(
     boxes: &[SnapshotBox],
-    ref_map: &HashMap<OpRef, OpRef>,
+    ref_map: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
 ) -> Vec<SnapshotBox> {
     boxes
         .iter()
@@ -4778,9 +4846,9 @@ fn remap_snapshot_boxes(
 fn clone_guard_snapshot_remapped(
     ctx: &mut OptContext,
     guard: &mut Op,
-    ref_map: &HashMap<OpRef, OpRef>,
+    ref_map: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
 ) {
-    let old_pos = guard.rd_resume_position;
+    let old_pos = guard.rd_resume_position.get();
     if old_pos < 0 {
         return;
     }
@@ -4818,7 +4886,7 @@ fn clone_guard_snapshot_remapped(
     if let Some(frame_sizes) = snapshot_get(&ctx.snapshot_frame_sizes, old_pos).cloned() {
         snapshot_insert(&mut ctx.snapshot_frame_sizes, new_pos, frame_sizes);
     }
-    guard.rd_resume_position = new_pos;
+    guard.rd_resume_position.set(new_pos);
 }
 
 impl Default for OptUnroll {
@@ -4847,15 +4915,17 @@ impl Optimization for OptUnroll {
             // Emit the final Jump with remapped args pointing to the
             // body iteration's ops.
             let mut jump = op.clone();
-            for arg in &mut jump.args {
-                if let Some(&new_ref) = orig_ref_map.get(arg) {
-                    *arg = new_ref;
+            // optimizer.py:651-652 setarg loop parity.
+            for i in 0..jump.num_args() {
+                let arg = jump.arg(i);
+                if let Some(&new_ref) = orig_ref_map.get(&arg) {
+                    jump.setarg(i, new_ref);
                 }
             }
             // Reserve the Jump's own position so it lands above any
             // inputarg range and above every body op allocated by
             // peel_iteration. Jump is Void-typed.
-            jump.pos = ctx.reserve_pos_typed(jump.result_type());
+            jump.pos.set(ctx.reserve_pos_typed(jump.result_type()));
             return OptimizationResult::Emit(jump);
         }
 
@@ -4884,12 +4954,12 @@ mod tests {
     use super::*;
     use crate::optimizeopt::optimizer::Optimizer;
     use majit_ir::GcRef;
-    use std::collections::HashMap;
 
     /// Assign sequential positions to ops starting from `base`.
     fn assign_positions(ops: &mut [Op], base: u32) {
         for (i, op) in ops.iter_mut().enumerate() {
-            op.pos = OpRef::op_typed(base + i as u32, op.opcode.result_type());
+            op.pos
+                .set(OpRef::op_typed(base + i as u32, op.opcode.result_type()));
         }
     }
 
@@ -4921,7 +4991,7 @@ mod tests {
             vec![OpRef::int_op(52)],
             vec![OpRef::int_op(109), OpRef::const_int(3)],
             crate::optimizeopt::virtualstate::VirtualState::new(Vec::new()),
-            HashMap::new(),
+            crate::optimizeopt::vec_assoc::VecAssoc::new(),
             Vec::new(),
             vec![OpRef::int_op(14)],
             Vec::new(),
@@ -4947,13 +5017,12 @@ mod tests {
             // snapshot so remapping can verify the TraceIterator cache
             // semantics that RPython gets from opencoder.py.
             guard
-                .fail_args
-                .as_deref()
+                .getfailargs()
                 .map(|fail_args| fail_args.iter().copied().collect())
                 .unwrap_or_default()
         });
         opt.snapshot_boxes = snapshots;
-        opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 1024)
+        opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024)
     }
 
     // ── Basic peeling ─────────────────────────────────────────────────
@@ -4996,7 +5065,7 @@ mod tests {
         let body_ops = vec![
             {
                 let mut op = Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)]);
-                op.pos = OpRef::int_op(2);
+                op.pos.set(OpRef::int_op(2));
                 op
             },
             Op::new(
@@ -5009,11 +5078,11 @@ mod tests {
         let result = UnrollOptimizer::jump_to_preamble(&body_ops, &preamble_target);
         assert_eq!(result[1].opcode, OpCode::Jump);
         assert_eq!(
-            result[1].args.as_slice(),
+            &*result[1].getarglist(),
             &[OpRef::int_op(0), OpRef::int_op(2), OpRef::int_op(50)]
         );
         assert_eq!(
-            result[1].descr.as_ref().map(|descr| descr.repr()),
+            result[1].getdescr().map(|descr| descr.repr()),
             Some("LoopTargetDescr(start:7)".to_string())
         );
     }
@@ -5036,20 +5105,20 @@ mod tests {
     fn test_replace_terminal_jump_appends_when_body_prefix_has_no_jump() {
         let body_ops = vec![{
             let mut op = Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)]);
-            op.pos = OpRef::int_op(2);
+            op.pos.set(OpRef::int_op(2));
             op
         }];
         let mut jump = Op::new(OpCode::Jump, &[OpRef::int_op(2)]);
-        jump.descr = Some(TargetToken::new_preamble(7).as_jump_target_descr());
+        jump.setdescr(TargetToken::new_preamble(7).as_jump_target_descr());
 
         let result = replace_terminal_jump(&body_ops, jump);
 
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].opcode, OpCode::IntAdd);
         assert_eq!(result[1].opcode, OpCode::Jump);
-        assert_eq!(result[1].args.as_slice(), &[OpRef::int_op(2)]);
+        assert_eq!(&*result[1].getarglist(), &[OpRef::int_op(2)]);
         assert_eq!(
-            result[1].descr.as_ref().map(|descr| descr.repr()),
+            result[1].getdescr().map(|descr| descr.repr()),
             Some("LoopTargetDescr(start:7)".to_string())
         );
     }
@@ -5137,7 +5206,7 @@ mod tests {
         assert_eq!(result.len(), 6);
 
         // All positions should be unique.
-        let positions: Vec<OpRef> = result.iter().map(|op| op.pos).collect();
+        let positions: Vec<OpRef> = result.iter().map(|op| op.pos.get()).collect();
         for (i, pos) in positions.iter().enumerate() {
             for (j, other) in positions.iter().enumerate() {
                 if i != j {
@@ -5183,9 +5252,9 @@ mod tests {
         assert_eq!(peeled_add.opcode, OpCode::IntAdd);
         assert_eq!(peeled_mul.opcode, OpCode::IntMul);
         // peeled_mul should reference peeled_add's position, not original op0.
-        assert_eq!(peeled_mul.args[0], peeled_add.pos);
+        assert_eq!(peeled_mul.arg(0), peeled_add.pos.get());
         // Second arg (input ref) should be unchanged.
-        assert_eq!(peeled_mul.args[1], OpRef::int_op(101));
+        assert_eq!(peeled_mul.arg(1), OpRef::int_op(101));
 
         // Original body:
         let body_add = &result[3];
@@ -5193,8 +5262,8 @@ mod tests {
         assert_eq!(body_add.opcode, OpCode::IntAdd);
         assert_eq!(body_mul.opcode, OpCode::IntMul);
         // body_mul should reference body_add's position.
-        assert_eq!(body_mul.args[0], body_add.pos);
-        assert_eq!(body_mul.args[1], OpRef::int_op(101));
+        assert_eq!(body_mul.arg(0), body_add.pos.get());
+        assert_eq!(body_mul.arg(1), OpRef::int_op(101));
     }
 
     #[test]
@@ -5209,12 +5278,12 @@ mod tests {
         let result = run_unroll_pass(&ops);
 
         // Peeled add should still reference v100 and v101.
-        assert_eq!(result[0].args[0], OpRef::int_op(100));
-        assert_eq!(result[0].args[1], OpRef::int_op(101));
+        assert_eq!(result[0].arg(0), OpRef::int_op(100));
+        assert_eq!(result[0].arg(1), OpRef::int_op(101));
 
         // Body add should also reference v100 and v101.
-        assert_eq!(result[2].args[0], OpRef::int_op(100));
-        assert_eq!(result[2].args[1], OpRef::int_op(101));
+        assert_eq!(result[2].arg(0), OpRef::int_op(100));
+        assert_eq!(result[2].arg(1), OpRef::int_op(101));
     }
 
     // ── Guard preservation ────────────────────────────────────────────
@@ -5251,7 +5320,7 @@ mod tests {
             Op::new(OpCode::IntAdd, &[OpRef::int_op(100), OpRef::int_op(101)]),
             {
                 let mut guard = Op::new(OpCode::GuardTrue, &[OpRef::int_op(100)]);
-                guard.fail_args = Some(vec![OpRef::int_op(0)].into()); // refs op0
+                guard.setfailargs(vec![OpRef::int_op(0)].into()); // refs op0
                 guard
             },
             Op::new(OpCode::Jump, &[]),
@@ -5263,9 +5332,9 @@ mod tests {
         // Check peeled guard's fail_args.
         let peeled_guard = &result[1];
         assert_eq!(peeled_guard.opcode, OpCode::GuardTrue);
-        let peeled_add_pos = result[0].pos;
+        let peeled_add_pos = result[0].pos.get();
         assert_eq!(
-            peeled_guard.fail_args.as_ref().unwrap()[0],
+            peeled_guard.getfailargs().unwrap()[0],
             peeled_add_pos,
             "peeled guard's fail_args should reference peeled add"
         );
@@ -5273,9 +5342,9 @@ mod tests {
         // Check body guard's fail_args.
         let body_guard = &result[4]; // after Label (idx 3) and body_add (idx 3)
         assert_eq!(body_guard.opcode, OpCode::GuardTrue);
-        let body_add_pos = result[3].pos;
+        let body_add_pos = result[3].pos.get();
         assert_eq!(
-            body_guard.fail_args.as_ref().unwrap()[0],
+            body_guard.getfailargs().unwrap()[0],
             body_add_pos,
             "body guard's fail_args should reference body add"
         );
@@ -5300,9 +5369,10 @@ mod tests {
         let jump = result.last().unwrap();
         assert_eq!(jump.opcode, OpCode::Jump);
 
-        let body_add_pos = result[2].pos;
+        let body_add_pos = result[2].pos.get();
         assert_eq!(
-            jump.args[0], body_add_pos,
+            jump.arg(0),
+            body_add_pos,
             "Jump arg should reference body add, not original"
         );
     }
@@ -5319,9 +5389,9 @@ mod tests {
         let result = run_unroll_pass(&ops);
 
         let label = result.iter().find(|o| o.opcode == OpCode::Label).unwrap();
-        let jump_args = &ops.last().unwrap().args;
+        let jump_args = ops.last().unwrap().getarglist_copy();
         assert_eq!(
-            label.args.as_slice(),
+            &*label.getarglist(),
             jump_args.as_slice(),
             "Label args should match original Jump args"
         );
@@ -5392,11 +5462,8 @@ mod tests {
         opt.trace_inputarg_types = vec![majit_ir::Type::Ref; 1024];
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut std::collections::HashMap::new(),
-            1024,
-        );
+        let result =
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
 
         // Expect: peeled_add, peeled_guard, Label, body_add, body_guard, Jump = 6
         assert_eq!(result.len(), 6);
@@ -5404,7 +5471,7 @@ mod tests {
         // All ops should have valid (non-NONE) positions.
         for op in &result {
             assert!(
-                !op.pos.is_none(),
+                !op.pos.get().is_none(),
                 "op {:?} should have a valid pos",
                 op.opcode
             );
@@ -5434,22 +5501,22 @@ mod tests {
             .collect();
         assert_eq!(guards.len(), 2);
         for guard in &guards {
-            assert!(guard.descr.is_some(), "guard should have a descriptor");
+            assert!(guard.has_descr(), "guard should have a descriptor");
             assert!(
-                guard.descr.as_ref().unwrap().is_resume_guard(),
+                guard.getdescr().unwrap().is_resume_guard(),
                 "optimizer.py:723: descr must be a ResumeGuardDescr subtype"
             );
         }
-        let peel_index = guards[0].descr.as_ref().unwrap().index();
-        let body_index = guards[1].descr.as_ref().unwrap().index();
+        let peel_index = guards[0].getdescr().unwrap().index();
+        let body_index = guards[1].getdescr().unwrap().index();
         assert_ne!(peel_index, original_index);
         assert_ne!(body_index, original_index);
         assert_ne!(
             peel_index, body_index,
             "peeled and body guards must own distinct freshly invented descrs"
         );
-        assert!(!guards[0].descr.as_ref().unwrap().is_resume_at_position());
-        assert!(!guards[1].descr.as_ref().unwrap().is_resume_at_position());
+        assert!(!guards[0].getdescr().unwrap().is_resume_at_position());
+        assert!(!guards[1].getdescr().unwrap().is_resume_at_position());
     }
 
     // ── Chain of references ───────────────────────────────────────────
@@ -5477,24 +5544,24 @@ mod tests {
         assert_eq!(result.len(), 8);
 
         // Peeled iteration refs:
-        let p0 = result[0].pos;
-        let p1 = result[1].pos;
-        let _p2 = result[2].pos;
-        assert_eq!(result[1].args[0], p0, "peeled v1 should ref peeled v0");
-        assert_eq!(result[2].args[0], p1, "peeled v2 should ref peeled v1");
-        assert_eq!(result[2].args[1], p0, "peeled v2 should ref peeled v0");
+        let p0 = result[0].pos.get();
+        let p1 = result[1].pos.get();
+        let _p2 = result[2].pos.get();
+        assert_eq!(result[1].arg(0), p0, "peeled v1 should ref peeled v0");
+        assert_eq!(result[2].arg(0), p1, "peeled v2 should ref peeled v1");
+        assert_eq!(result[2].arg(1), p0, "peeled v2 should ref peeled v0");
 
         // Body refs:
-        let b0 = result[4].pos;
-        let b1 = result[5].pos;
-        let b2 = result[6].pos;
-        assert_eq!(result[5].args[0], b0, "body v1 should ref body v0");
-        assert_eq!(result[6].args[0], b1, "body v2 should ref body v1");
-        assert_eq!(result[6].args[1], b0, "body v2 should ref body v0");
+        let b0 = result[4].pos.get();
+        let b1 = result[5].pos.get();
+        let b2 = result[6].pos.get();
+        assert_eq!(result[5].arg(0), b0, "body v1 should ref body v0");
+        assert_eq!(result[6].arg(0), b1, "body v2 should ref body v1");
+        assert_eq!(result[6].arg(1), b0, "body v2 should ref body v0");
 
         // Jump should reference body v2.
         let jump = &result[7];
-        assert_eq!(jump.args[0], b2, "Jump should ref body v2");
+        assert_eq!(jump.arg(0), b2, "Jump should ref body v2");
     }
 
     #[test]
@@ -5511,8 +5578,7 @@ mod tests {
             Op::new(OpCode::Jump, &[OpRef::int_op(0)]),
         ];
         assign_positions(&mut ops, 2);
-        let mut constants: std::collections::HashMap<u32, majit_ir::Value> =
-            std::collections::HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         let (result, _) =
             unroll_opt.optimize_trace_with_constants_and_inputs(&ops, &mut constants, 2);
         // The optimizer processes the trace; result should not be empty
@@ -5536,7 +5602,8 @@ mod tests {
         use crate::optimizeopt::intutils::IntBound;
 
         let mut ctx = crate::optimizeopt::OptContext::with_num_inputs(4, 0);
-        let mut exported_bounds = std::collections::HashMap::new();
+        let mut exported_bounds: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, IntBound> =
+            crate::optimizeopt::vec_assoc::VecAssoc::new();
         exported_bounds.insert(OpRef::int_op(21), IntBound::bounded(10, 20));
 
         let exported = export_state(
@@ -5548,7 +5615,7 @@ mod tests {
         );
 
         assert_eq!(
-            match &exported.exported_infos[&OpRef::int_op(21)] {
+            match exported.exported_infos.get(&OpRef::int_op(21)).unwrap() {
                 crate::optimizeopt::info::OpInfo::IntBound(b) => {
                     let b = b.borrow();
                     Some((b.lower, b.upper))
@@ -5608,7 +5675,7 @@ mod tests {
                         &[OpRef::int_op(10)],
                         field_descr.clone(),
                     );
-                    op.pos = OpRef::int_op(11);
+                    op.pos.set(OpRef::int_op(11));
                     op
                 },
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Heap,
@@ -5669,7 +5736,7 @@ mod tests {
                         &[OpRef::const_ptr(23)],
                         field_descr.clone(),
                     );
-                    op.pos = OpRef::int_op(11);
+                    op.pos.set(OpRef::int_op(11));
                     op
                 },
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Pure,
@@ -5727,7 +5794,7 @@ mod tests {
             .push(crate::optimizeopt::shortpreamble::PreambleOp {
                 op: {
                     let mut op = Op::new(OpCode::CallLoopinvariantI, &[func]);
-                    op.pos = OpRef::int_op(11);
+                    op.pos.set(OpRef::int_op(11));
                     op
                 },
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::LoopInvariant,
@@ -5752,8 +5819,11 @@ mod tests {
         import_short_preamble_state(&targetargs, &label_args, &exported, &mut ctx2);
 
         assert_eq!(
-            ctx2.imported_loop_invariant_results.get(&func_ptr),
-            Some(&OpRef::int_op(11))
+            ctx2.imported_loop_invariant_results
+                .iter()
+                .find(|(k, _)| *k == func_ptr)
+                .map(|(_, v)| *v),
+            Some(OpRef::int_op(11))
         );
         assert_eq!(ctx2.get_constant(func), None);
         assert_eq!(
@@ -5772,11 +5842,11 @@ mod tests {
             vec![source],
             vec![source],
             crate::optimizeopt::virtualstate::VirtualState::new(Vec::new()),
-            HashMap::new(),
+            crate::optimizeopt::vec_assoc::VecAssoc::new(),
             vec![crate::optimizeopt::shortpreamble::PreambleOp {
                 op: {
                     let mut op = Op::new(OpCode::CallLoopinvariantI, &[func]);
-                    op.pos = source;
+                    op.pos.set(source);
                     op
                 },
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::LoopInvariant,
@@ -5800,8 +5870,11 @@ mod tests {
         // Phase 1 source directly (RPython `shortpreamble.py:120 op = self.res`).
         let _ = phase2_result;
         assert_eq!(
-            ctx.imported_loop_invariant_results.get(&func_ptr),
-            Some(&source)
+            ctx.imported_loop_invariant_results
+                .iter()
+                .find(|(k, _)| *k == func_ptr)
+                .map(|(_, v)| *v),
+            Some(source)
         );
     }
 
@@ -5823,7 +5896,7 @@ mod tests {
             &[crate::optimizeopt::shortpreamble::PreambleOp {
                 op: {
                     let mut op = Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)]);
-                    op.pos = OpRef::int_op(20);
+                    op.pos.set(OpRef::int_op(20));
                     op
                 },
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Pure,
@@ -5853,7 +5926,7 @@ mod tests {
         // RPython `unroll.py:34-37` seeds `potential_extra_ops` so a later
         // `force_box` will run `add_preamble_op` (shortpreamble.py:432-440).
         assert!(
-            ctx.potential_extra_ops.contains_key(&OpRef::int_op(20)),
+            ctx.has_potential_extra_op(OpRef::int_op(20)),
             "force_op_from_preamble_op must seed potential_extra_ops"
         );
         // RPython parity: `force_op_from_preamble` does NOT call
@@ -5871,7 +5944,7 @@ mod tests {
         assert_eq!(sp.used_boxes, vec![OpRef::int_op(20)]);
         assert_eq!(sp.jump_args, vec![OpRef::int_op(20)]);
         assert!(
-            !ctx.potential_extra_ops.contains_key(&OpRef::int_op(20)),
+            !ctx.has_potential_extra_op(OpRef::int_op(20)),
             "force_box must consume the potential_extra_ops entry"
         );
     }
@@ -5910,7 +5983,7 @@ mod tests {
                         &[OpRef::ref_op(3)],
                         majit_ir::descr::make_field_descr_full(56, 0, 8, Type::Ref, false),
                     );
-                    op.pos = OpRef::ref_op(19);
+                    op.pos.set(OpRef::ref_op(19));
                     op
                 },
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Heap,
@@ -5949,7 +6022,7 @@ mod tests {
         // `force_op_from_preamble_op` keys potential_extra_ops by
         // `preamble_source` (non-invented) per `unroll.py:34-37`.
         assert!(
-            ctx.potential_extra_ops.contains_key(&OpRef::ref_op(19)),
+            ctx.has_potential_extra_op(OpRef::ref_op(19)),
             "force_op_from_preamble_op must seed potential_extra_ops by source"
         );
 
@@ -5964,7 +6037,7 @@ mod tests {
         assert_eq!(sp.used_boxes, vec![OpRef::ref_op(14)]);
         assert_eq!(sp.jump_args, vec![OpRef::ref_op(19)]);
         assert!(
-            !ctx.potential_extra_ops.contains_key(&OpRef::ref_op(19)),
+            !ctx.has_potential_extra_op(OpRef::ref_op(19)),
             "force_box must consume the potential_extra_ops entry"
         );
     }
@@ -5977,7 +6050,7 @@ mod tests {
             .push(crate::optimizeopt::shortpreamble::PreambleOp {
                 op: {
                     let mut op = Op::new(OpCode::IntAdd, &[OpRef::int_op(12), OpRef::int_op(13)]);
-                    op.pos = OpRef::int_op(30);
+                    op.pos.set(OpRef::int_op(30));
                     op
                 },
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Pure,
@@ -6028,13 +6101,13 @@ mod tests {
     fn test_assemble_peeled_trace_emits_extra_same_as_before_label() {
         let p1_ops = vec![{
             let mut op = Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)]);
-            op.pos = OpRef::int_op(3);
+            op.pos.set(OpRef::int_op(3));
             op
         }];
         let p2_ops = vec![
             {
                 let mut op = Op::new(OpCode::IntMul, &[OpRef::int_op(50), OpRef::int_op(0)]);
-                op.pos = OpRef::int_op(1);
+                op.pos.set(OpRef::int_op(1));
                 op
             },
             Op::new(OpCode::Jump, &[OpRef::int_op(50)]),
@@ -6053,43 +6126,43 @@ mod tests {
                 same_as_source: OpRef::int_op(10),
                 same_as_opcode: OpCode::SameAsI,
             }],
-            &std::collections::HashMap::new(),
+            &majit_ir::VecAssoc::new(),
             None,
             None,
         );
 
         assert_eq!(combined[0].opcode, OpCode::IntAdd);
         assert_eq!(combined[1].opcode, OpCode::SameAsI);
-        assert_eq!(combined[1].args.as_slice(), &[OpRef::int_op(10)]);
+        assert_eq!(&*combined[1].getarglist(), &[OpRef::int_op(10)]);
         assert_eq!(combined[2].opcode, OpCode::Label);
         assert_eq!(combined[3].opcode, OpCode::IntMul);
-        assert_eq!(combined[3].args[0], combined[1].pos);
+        assert_eq!(combined[3].arg(0), combined[1].pos.get());
         assert_eq!(combined[4].opcode, OpCode::Jump);
-        assert_eq!(combined[4].args[0], combined[1].pos);
+        assert_eq!(combined[4].arg(0), combined[1].pos.get());
     }
 
     #[test]
     fn test_assemble_peeled_trace_preserves_visible_label_arg_until_body_redef() {
         let p1_ops = vec![{
             let mut op = Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)]);
-            op.pos = OpRef::int_op(11);
+            op.pos.set(OpRef::int_op(11));
             op
         }];
         let p2_ops = vec![
             {
                 let mut op = Op::new(OpCode::IntGe, &[OpRef::int_op(11), OpRef::const_int(0)]);
-                op.pos = OpRef::int_op(4);
+                op.pos.set(OpRef::int_op(4));
                 op
             },
             {
                 let mut op = Op::new(OpCode::IntAdd, &[OpRef::int_op(11), OpRef::const_int(1)]);
-                op.pos = OpRef::int_op(11);
+                op.pos.set(OpRef::int_op(11));
                 op
             },
             Op::new(OpCode::Jump, &[OpRef::int_op(11)]),
         ];
 
-        let mut constants = std::collections::HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         constants.insert(OpRef::const_int(0).raw(), majit_ir::Value::Int(2));
         constants.insert(OpRef::const_int(1).raw(), majit_ir::Value::Int(1));
 
@@ -6108,22 +6181,22 @@ mod tests {
         );
 
         assert_eq!(combined[1].opcode, OpCode::Label);
-        assert_eq!(combined[1].args.as_slice(), &[OpRef::int_op(11)]);
+        assert_eq!(&*combined[1].getarglist(), &[OpRef::int_op(11)]);
         assert_eq!(combined[2].opcode, OpCode::IntGe);
-        assert_eq!(combined[2].args[0], OpRef::int_op(11));
+        assert_eq!(combined[2].arg(0), OpRef::int_op(11));
         assert_eq!(combined[3].opcode, OpCode::IntAdd);
-        assert_eq!(combined[3].args[0], OpRef::int_op(11));
-        assert_ne!(combined[3].pos, OpRef::int_op(11));
+        assert_eq!(combined[3].arg(0), OpRef::int_op(11));
+        assert_ne!(combined[3].pos.get(), OpRef::int_op(11));
         assert_eq!(combined[4].opcode, OpCode::Jump);
-        assert_eq!(combined[4].args[0], combined[3].pos);
+        assert_eq!(combined[4].arg(0), combined[3].pos.get());
     }
 
     #[test]
     fn test_assemble_peeled_trace_preserves_visible_preamble_box_over_body_collision() {
         let p1_ops = vec![{
             let mut op = Op::new(OpCode::GetfieldGcR, &[OpRef::int_op(3)]);
-            op.pos = OpRef::int_op(19);
-            op.descr = Some(majit_ir::descr::make_field_descr_full(
+            op.pos.set(OpRef::int_op(19));
+            op.setdescr(majit_ir::descr::make_field_descr_full(
                 56,
                 0,
                 8,
@@ -6135,7 +6208,7 @@ mod tests {
         let p2_ops = vec![
             {
                 let mut op = Op::new(OpCode::SetfieldGc, &[OpRef::int_op(25), OpRef::int_op(19)]);
-                op.descr = Some(majit_ir::descr::make_field_descr_full(
+                op.setdescr(majit_ir::descr::make_field_descr_full(
                     57,
                     8,
                     8,
@@ -6146,13 +6219,13 @@ mod tests {
             },
             {
                 let mut op = Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::const_int(1)]);
-                op.pos = OpRef::int_op(19);
+                op.pos.set(OpRef::int_op(19));
                 op
             },
             Op::new(OpCode::Jump, &[OpRef::int_op(19)]),
         ];
 
-        let mut constants = std::collections::HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         constants.insert(OpRef::const_int(1).raw(), majit_ir::Value::Int(1));
 
         let combined = assemble_peeled_trace(
@@ -6171,11 +6244,11 @@ mod tests {
 
         assert_eq!(combined[1].opcode, OpCode::Label);
         assert_eq!(combined[2].opcode, OpCode::SetfieldGc);
-        assert_eq!(combined[2].args[1], OpRef::int_op(19));
+        assert_eq!(combined[2].arg(1), OpRef::int_op(19));
         assert_eq!(combined[3].opcode, OpCode::IntAdd);
-        assert_ne!(combined[3].pos, OpRef::int_op(19));
+        assert_ne!(combined[3].pos.get(), OpRef::int_op(19));
         assert_eq!(combined[4].opcode, OpCode::Jump);
-        assert_eq!(combined[4].args[0], combined[3].pos);
+        assert_eq!(combined[4].arg(0), combined[3].pos.get());
     }
 
     #[test]
@@ -6187,13 +6260,13 @@ mod tests {
         // than the raw inputarg position OpRef::int_op(0).
         let p1_ops = vec![{
             let mut op = Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)]);
-            op.pos = OpRef::int_op(3);
+            op.pos.set(OpRef::int_op(3));
             op
         }];
         let p2_ops = vec![
             {
                 let mut op = Op::new(OpCode::IntMul, &[OpRef::int_op(50), OpRef::int_op(10)]);
-                op.pos = OpRef::int_op(1);
+                op.pos.set(OpRef::int_op(1));
                 op
             },
             Op::new(OpCode::Jump, &[OpRef::int_op(10), OpRef::int_op(50)]),
@@ -6212,20 +6285,20 @@ mod tests {
                 same_as_source: OpRef::int_op(10),
                 same_as_opcode: OpCode::SameAsI,
             }],
-            &std::collections::HashMap::new(),
+            &majit_ir::VecAssoc::new(),
             None,
             None,
         );
 
         assert_eq!(combined[2].opcode, OpCode::Label);
         assert_eq!(
-            combined[2].args.as_slice(),
-            &[OpRef::int_op(10), combined[1].pos]
+            &*combined[2].getarglist(),
+            &[OpRef::int_op(10), combined[1].pos.get()]
         );
         assert_eq!(combined[4].opcode, OpCode::Jump);
         assert_eq!(
-            combined[4].args.as_slice(),
-            &[OpRef::int_op(10), combined[1].pos]
+            &*combined[4].getarglist(),
+            &[OpRef::int_op(10), combined[1].pos.get()]
         );
     }
 
@@ -6233,7 +6306,7 @@ mod tests {
     fn test_assemble_peeled_trace_keeps_used_box_with_stale_constant_entry() {
         let p1_ops = vec![{
             let mut op = Op::new(OpCode::SameAsI, &[OpRef::int_op(37)]);
-            op.pos = OpRef::void_op(857);
+            op.pos.set(OpRef::void_op(857));
             op
         }];
         let p2_ops = vec![
@@ -6242,7 +6315,7 @@ mod tests {
                     OpCode::GuardValue,
                     &[OpRef::void_op(857), OpRef::const_int(0)],
                 );
-                op.fail_args = Some(vec![OpRef::void_op(857)].into());
+                op.setfailargs(vec![OpRef::void_op(857)].into());
                 op
             },
             Op::new(
@@ -6255,7 +6328,7 @@ mod tests {
                 ],
             ),
         ];
-        let constants = std::collections::HashMap::from([
+        let constants = majit_ir::VecAssoc::from([
             (OpRef::void_op(857).raw(), majit_ir::Value::Int(2)),
             (OpRef::const_int(0).raw(), majit_ir::Value::Int(2)),
         ]);
@@ -6281,7 +6354,7 @@ mod tests {
 
         assert_eq!(combined[1].opcode, OpCode::Label);
         assert_eq!(
-            combined[1].args.as_slice(),
+            &*combined[1].getarglist(),
             &[
                 OpRef::int_op(10),
                 OpRef::int_op(22),
@@ -6291,12 +6364,12 @@ mod tests {
         );
         assert_eq!(combined[2].opcode, OpCode::GuardValue);
         assert_eq!(
-            combined[2].args.as_slice(),
+            &*combined[2].getarglist(),
             &[OpRef::void_op(857), OpRef::const_int(0)]
         );
         assert_eq!(combined[3].opcode, OpCode::Jump);
         assert_eq!(
-            combined[3].args.as_slice(),
+            &*combined[3].getarglist(),
             &[
                 OpRef::int_op(10),
                 OpRef::int_op(22),
@@ -6314,8 +6387,8 @@ mod tests {
         let p2_ops = vec![
             {
                 let mut op = Op::new(OpCode::GetfieldGcPureI, &[OpRef::int_op(50)]);
-                op.pos = OpRef::int_op(1);
-                op.descr = Some(majit_ir::make_field_descr(
+                op.pos.set(OpRef::int_op(1));
+                op.setdescr(majit_ir::make_field_descr(
                     0,
                     8,
                     majit_ir::Type::Int,
@@ -6339,7 +6412,7 @@ mod tests {
                 same_as_source: OpRef::int_op(10),
                 same_as_opcode: OpCode::SameAsI,
             }],
-            &std::collections::HashMap::new(),
+            &majit_ir::VecAssoc::new(),
             None,
             None,
         );
@@ -6349,11 +6422,11 @@ mod tests {
             .position(|op| op.opcode == OpCode::Label)
             .expect("label");
         let label = &combined[label_idx];
-        let extra_label_arg = label.args[1];
-        assert_eq!(label.args.as_slice(), &[OpRef::int_op(10), extra_label_arg]);
+        let extra_label_arg = label.arg(1);
+        assert_eq!(&*label.getarglist(), &[OpRef::int_op(10), extra_label_arg]);
         let body_getfield = &combined[label_idx + 1];
         assert_eq!(body_getfield.opcode, OpCode::GetfieldGcPureI);
-        assert_eq!(body_getfield.args.as_slice(), &[extra_label_arg]);
+        assert_eq!(&*body_getfield.getarglist(), &[extra_label_arg]);
     }
 
     #[test]
@@ -6366,18 +6439,18 @@ mod tests {
         let p2_ops = vec![
             {
                 let mut op = Op::new(OpCode::GuardTrue, &[OpRef::int_op(64)]);
-                op.fail_args = Some(vec![OpRef::int_op(64)].into());
+                op.setfailargs(vec![OpRef::int_op(64)].into());
                 op
             },
             {
                 let mut op = Op::new(OpCode::IntAdd, &[OpRef::int_op(10), OpRef::const_int(0)]);
-                op.pos = OpRef::int_op(64);
+                op.pos.set(OpRef::int_op(64));
                 op
             },
             Op::new(OpCode::Jump, &[OpRef::int_op(64)]),
         ];
         let constants =
-            std::collections::HashMap::from([(OpRef::const_int(0).raw(), majit_ir::Value::Int(1))]);
+            majit_ir::VecAssoc::from([(OpRef::const_int(0).raw(), majit_ir::Value::Int(1))]);
 
         let combined = assemble_peeled_trace(
             &[],
@@ -6395,21 +6468,20 @@ mod tests {
 
         assert_eq!(combined[0].opcode, OpCode::Label);
         assert_eq!(
-            combined[0].args.as_slice(),
+            &*combined[0].getarglist(),
             &[OpRef::int_op(10), OpRef::int_op(64)]
         );
         assert_eq!(combined[1].opcode, OpCode::GuardTrue);
-        assert_eq!(combined[1].args.as_slice(), &[OpRef::int_op(64)]);
+        assert_eq!(&*combined[1].getarglist(), &[OpRef::int_op(64)]);
         assert_eq!(
             combined[1]
-                .fail_args
-                .as_ref()
+                .getfailargs()
                 .expect("guard fail args")
                 .as_slice(),
             &[OpRef::int_op(64)]
         );
         assert_eq!(combined[2].opcode, OpCode::IntAdd);
-        assert_ne!(combined[2].pos, OpRef::int_op(64));
+        assert_ne!(combined[2].pos.get(), OpRef::int_op(64));
     }
 
     #[test]
@@ -6426,7 +6498,7 @@ mod tests {
                     OpRef::int_op(4),
                 ],
             );
-            jump.descr = Some(start_descr.clone());
+            jump.setdescr(start_descr.clone());
             jump
         }];
 
@@ -6445,7 +6517,7 @@ mod tests {
             5,
             false,
             &[],
-            &std::collections::HashMap::new(),
+            &majit_ir::VecAssoc::new(),
             Some(start_descr),
             None,
         );
@@ -6458,7 +6530,7 @@ mod tests {
         // must not derive a different arg contract by inspecting that descr.
         // The caller is responsible for constructing the preamble-shaped Jump.
         assert_eq!(
-            combined[2].args.as_slice(),
+            &*combined[2].getarglist(),
             &[
                 OpRef::int_op(100),
                 OpRef::int_op(101),
@@ -6476,12 +6548,12 @@ mod tests {
         let p2_ops = vec![
             {
                 let mut op = Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)]);
-                op.pos = OpRef::int_op(2);
+                op.pos.set(OpRef::int_op(2));
                 op
             },
             {
                 let mut jump = Op::new(OpCode::Jump, &[OpRef::int_op(0), OpRef::int_op(1)]);
-                jump.descr = Some(start_descr.clone());
+                jump.setdescr(start_descr.clone());
                 jump
             },
         ];
@@ -6495,7 +6567,7 @@ mod tests {
             2,
             false,
             &[],
-            &std::collections::HashMap::new(),
+            &majit_ir::VecAssoc::new(),
             Some(start_descr),
             Some(loop_descr),
         );
@@ -6503,7 +6575,7 @@ mod tests {
         let jump = combined.last().expect("assembled jump");
         assert_eq!(jump.opcode, OpCode::Jump);
         assert_eq!(
-            jump.args.as_slice(),
+            &*jump.getarglist(),
             &[OpRef::int_op(100), OpRef::int_op(101)]
         );
     }
@@ -6515,7 +6587,7 @@ mod tests {
         let p2_ops = vec![
             {
                 let mut op = Op::new(OpCode::IntAdd, &[OpRef::int_op(10), OpRef::const_int(0)]);
-                op.pos = OpRef::int_op(20);
+                op.pos.set(OpRef::int_op(20));
                 op
             },
             {
@@ -6523,12 +6595,12 @@ mod tests {
                     OpCode::Jump,
                     &[OpRef::int_op(10), OpRef::int_op(50), OpRef::int_op(60)],
                 );
-                jump.descr = Some(start_descr.clone());
+                jump.setdescr(start_descr.clone());
                 jump
             },
         ];
         let constants =
-            std::collections::HashMap::from([(OpRef::const_int(0).raw(), majit_ir::Value::Int(1))]);
+            majit_ir::VecAssoc::from([(OpRef::const_int(0).raw(), majit_ir::Value::Int(1))]);
 
         let combined = assemble_peeled_trace(
             &[],
@@ -6548,16 +6620,16 @@ mod tests {
             .iter()
             .find(|op| {
                 op.opcode == OpCode::Label
-                    && op.descr.as_ref().map(|descr| descr.repr())
+                    && op.getdescr().map(|descr| descr.repr())
                         == Some("LoopTargetDescr(1)".to_string())
             })
             .expect("body label");
-        assert_eq!(body_label.args.as_slice(), &[OpRef::int_op(10)]);
+        assert_eq!(&*body_label.getarglist(), &[OpRef::int_op(10)]);
 
         let jump = combined.last().expect("assembled jump");
         assert_eq!(jump.opcode, OpCode::Jump);
         assert_eq!(
-            jump.args.as_slice(),
+            &*jump.getarglist(),
             &[OpRef::int_op(10), OpRef::int_op(50), OpRef::int_op(60)]
         );
     }
@@ -6567,13 +6639,13 @@ mod tests {
         let p2_ops = vec![
             {
                 let mut op = Op::new(OpCode::New, &[]);
-                op.pos = OpRef::ref_op(1);
+                op.pos.set(OpRef::ref_op(1));
                 op
             },
             Op::new(OpCode::SetfieldGc, &[OpRef::ref_op(1), OpRef::int_op(0)]),
             Op::new(OpCode::Jump, &[OpRef::int_op(0)]),
         ];
-        let constants = std::collections::HashMap::from([
+        let constants = majit_ir::VecAssoc::from([
             (2_u32, majit_ir::Value::Int(606)),
             (4_u32, majit_ir::Value::Int(611)),
         ]);
@@ -6594,10 +6666,10 @@ mod tests {
 
         assert_eq!(combined[0].opcode, OpCode::Label);
         assert_eq!(combined[1].opcode, OpCode::New);
-        assert_ne!(combined[1].pos, OpRef::int_op(2));
-        assert_ne!(combined[1].pos, OpRef::int_op(4));
+        assert_ne!(combined[1].pos.get(), OpRef::int_op(2));
+        assert_ne!(combined[1].pos.get(), OpRef::int_op(4));
         assert_eq!(combined[2].opcode, OpCode::SetfieldGc);
-        assert_eq!(combined[2].args[0], combined[1].pos);
+        assert_eq!(combined[2].arg(0), combined[1].pos.get());
     }
 
     #[test]
@@ -6613,8 +6685,7 @@ mod tests {
         // `label_arg.is_constant()` predicate.
         let const_extra = OpRef::const_int(7);
         let p2_ops = vec![Op::new(OpCode::Jump, &[OpRef::int_op(10)])];
-        let constants =
-            std::collections::HashMap::from([(const_extra.raw(), majit_ir::Value::Int(606))]);
+        let constants = majit_ir::VecAssoc::from([(const_extra.raw(), majit_ir::Value::Int(606))]);
 
         let combined = assemble_peeled_trace(
             &[],
@@ -6632,7 +6703,7 @@ mod tests {
 
         assert_eq!(combined[0].opcode, OpCode::Label);
         assert_eq!(
-            combined[0].args.as_slice(),
+            &*combined[0].getarglist(),
             &[OpRef::int_op(10), OpRef::int_op(8)]
         );
     }
@@ -6645,12 +6716,12 @@ mod tests {
         // The assembler is therefore a passthrough for inputarg references
         // — no source_slot input_remap needed. This test verifies that
         // pre-resolved body args survive intact.
-        let mut constants = std::collections::HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         constants.insert(OpRef::const_int(0).raw(), majit_ir::Value::Int(1));
         let p2_ops = vec![
             {
                 let mut op = Op::new(OpCode::IntAdd, &[OpRef::int_op(200), OpRef::const_int(0)]);
-                op.pos = OpRef::int_op(20);
+                op.pos.set(OpRef::int_op(20));
                 op
             },
             Op::new(OpCode::Jump, &[OpRef::int_op(200)]),
@@ -6672,14 +6743,14 @@ mod tests {
 
         assert_eq!(combined[0].opcode, OpCode::Label);
         assert_eq!(
-            combined[0].args.as_slice(),
+            &*combined[0].getarglist(),
             &[OpRef::int_op(200), OpRef::int_op(300)]
         );
         assert_eq!(combined[1].opcode, OpCode::IntAdd);
-        assert_eq!(combined[1].args[0], OpRef::int_op(200));
+        assert_eq!(combined[1].arg(0), OpRef::int_op(200));
         assert_eq!(combined[2].opcode, OpCode::Jump);
         assert_eq!(
-            combined[2].args.as_slice(),
+            &*combined[2].getarglist(),
             &[OpRef::int_op(200), OpRef::int_op(300)]
         );
     }
@@ -6689,7 +6760,7 @@ mod tests {
         let body_ops = vec![
             {
                 let mut op = Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)]);
-                op.pos = OpRef::void_op(3);
+                op.pos.set(OpRef::void_op(3));
                 op
             },
             Op::new(OpCode::Jump, &[OpRef::int_op(0)]),
@@ -6697,7 +6768,7 @@ mod tests {
         let redirected_tail = vec![
             {
                 let mut op = Op::new(OpCode::GuardTrue, &[OpRef::void_op(3)]);
-                op.fail_args = Some(vec![OpRef::void_op(3)].into());
+                op.setfailargs(vec![OpRef::void_op(3)].into());
                 op
             },
             Op::new(OpCode::Jump, &[OpRef::void_op(3), OpRef::int_op(4)]),
@@ -6709,7 +6780,7 @@ mod tests {
         assert_eq!(spliced[1].opcode, OpCode::GuardTrue);
         assert_eq!(spliced[2].opcode, OpCode::Jump);
         assert_eq!(
-            spliced[2].args.as_slice(),
+            &*spliced[2].getarglist(),
             &[OpRef::void_op(3), OpRef::int_op(4)]
         );
     }

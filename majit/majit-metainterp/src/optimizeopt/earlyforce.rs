@@ -8,7 +8,7 @@
 /// earlyforce.py:32: self.optimizer.optearlyforce = self
 /// The pass registers itself so force_at_the_end_of_preamble can route
 /// forced operations starting from earlyforce.next (= heap).
-use majit_ir::{Op, OpCode};
+use majit_ir::{Op, OpCode, OpRc};
 
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
 
@@ -25,7 +25,8 @@ impl OptEarlyForce {
         if !op.opcode.is_call() {
             return false;
         }
-        if let Some(ref descr) = op.descr {
+        let __descr_arc_descr = op.getdescr();
+        if let Some(ref descr) = __descr_arc_descr.as_ref() {
             if let Some(cd) = descr.as_call_descr() {
                 let ei = cd.get_extra_info();
                 return ei.oopspecindex == majit_ir::OopSpecIndex::RawFree;
@@ -111,7 +112,7 @@ mod tests {
     fn assign_positions(ops: &mut [Op]) {
         for (i, op) in ops.iter_mut().enumerate() {
             let pos = i as u32;
-            op.pos = OpRef::op_typed(pos, op.result_type());
+            op.pos.set(OpRef::op_typed(pos, op.result_type()));
         }
     }
 
@@ -125,11 +126,8 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptEarlyForce::new()));
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut std::collections::HashMap::new(),
-            1024,
-        );
+        let result =
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::CallMayForceN);
@@ -145,11 +143,8 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptEarlyForce::new()));
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut std::collections::HashMap::new(),
-            1024,
-        );
+        let result =
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::IntAdd);
@@ -165,11 +160,8 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptEarlyForce::new()));
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut std::collections::HashMap::new(),
-            1024,
-        );
+        let result =
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::CallAssemblerI);
@@ -179,7 +171,7 @@ mod tests {
     fn test_earlyforce_guard_not_forced() {
         // GUARD_NOT_FORCED should have its fail_args resolved.
         let mut guard = Op::new(OpCode::GuardNotForced, &[]);
-        guard.fail_args = Some(Default::default());
+        guard.setfailargs(Default::default());
         let mut ops = vec![guard];
         assign_positions(&mut ops);
 
@@ -187,15 +179,12 @@ mod tests {
         opt.add_pass(Box::new(OptEarlyForce::new()));
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut std::collections::HashMap::new(),
-            1024,
-        );
+        let result =
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::GuardNotForced);
-        assert!(result[0].fail_args.is_some());
+        assert!(result[0].has_failargs());
     }
 
     #[test]
@@ -211,11 +200,8 @@ mod tests {
 
             let mut opt = Optimizer::new();
             opt.add_pass(Box::new(OptEarlyForce::new()));
-            let result = opt.optimize_with_constants_and_inputs(
-                &ops,
-                &mut std::collections::HashMap::new(),
-                1024,
-            );
+            let result =
+                opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
             assert_eq!(result.len(), 1, "{opcode:?} should be handled");
         }
     }
@@ -231,11 +217,8 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptEarlyForce::new()));
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut std::collections::HashMap::new(),
-            1024,
-        );
+        let result =
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::SetfieldGc);

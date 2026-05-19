@@ -26,7 +26,6 @@
 //! works for the warmstate side, but actual token frees only happen
 //! once Slices 3.5–3.6 prune the other strong owners.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -62,10 +61,11 @@ pub struct MemoryManager {
     /// at `memmgr.py:13-14`).
     ///
     /// **Pointer-key soundness:** `*const JitCellToken` is used **only
-    /// as HashMap key**.  The Arc value held alongside guarantees the
+    /// as an associative-container key**. The Arc value held alongside guarantees the
     /// pointee is alive for the lifetime of the entry, so pointer
     /// identity is stable until removal.
-    pub alive_loops: HashMap<*const JitCellToken, Arc<JitCellToken>>,
+    pub alive_loops:
+        crate::optimizeopt::vec_assoc::VecAssoc<*const JitCellToken, Arc<JitCellToken>>,
 
     /// `warmstate.py:299-302` `set_param_retrace_limit` writes here.
     /// `unroll.py:215` reader.
@@ -96,7 +96,7 @@ impl MemoryManager {
             // memmgr.py:26 check_frequency = -1
             check_frequency: -1,
             max_age: 0,
-            alive_loops: HashMap::new(),
+            alive_loops: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             // rlib/jit.py:588 PARAMETERS defaults.
             retrace_limit: 0,
             max_retrace_guards: 15,
@@ -172,8 +172,7 @@ impl MemoryManager {
             looptoken.generation.set(self.current_generation);
             let key: *const JitCellToken = Arc::as_ptr(looptoken);
             self.alive_loops
-                .entry(key)
-                .or_insert_with(|| Arc::clone(looptoken));
+                .entry_or_insert_with(key, || Arc::clone(looptoken));
         }
     }
 
@@ -233,7 +232,7 @@ impl MemoryManager {
     /// debug_print("Loop tokens left:  ", newtotal)
     /// debug_stop("jit-mem-collect")
     /// ```
-    /// Pyre uses `HashMap::retain` to fuse the iterate + delete steps.
+    /// Pyre uses `VecAssoc::retain` to fuse the iterate + delete steps.
     /// PRE-EXISTING-ADAPTATION: pyre uses a single `MAJIT_LOG` switch
     /// instead of `rlib/debug.py debug_start/stop` per-channel
     /// registry.  Channel name embedded in the message prefix

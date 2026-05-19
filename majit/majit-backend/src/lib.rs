@@ -7,7 +7,7 @@ use std::cell::Cell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use majit_ir::{Const, Descr, FailDescr, GcRef, InputArg, Op, Type, Value};
+use majit_ir::{Const, Descr, FailDescr, GcRef, InputArg, Op, OpRc, Type, Value};
 
 pub mod call_stub;
 pub mod finish_descrs;
@@ -1487,19 +1487,18 @@ pub trait Backend: Send {
     fn compile_loop(
         &mut self,
         inputargs: &[InputArg],
-        ops: &[Op],
+        ops: &[OpRc],
         token: &mut JitCellToken,
     ) -> Result<AsmInfo, BackendError>;
 
-    /// Register constant OpRef → i64 values consumed by the next
-    /// `compile_loop` / `compile_bridge` call.  Default is no-op — only
-    /// backends that honour constants at emit time override.  The
-    /// companion `set_constant_types` carries the per-OpRef `Type`
-    /// tag.
-    fn set_constants(&mut self, _constants: std::collections::HashMap<u32, i64>) {}
-
-    /// Register constant OpRef → `Type` annotations.
-    fn set_constant_types(&mut self, _constant_types: std::collections::HashMap<u32, Type>) {}
+    /// Register the typed constant pool (`OpRef` → `Const`) consumed by
+    /// the next `compile_loop` / `compile_bridge` call.  `Const` carries
+    /// both value and `Type` (history.py:220/261/307
+    /// ConstInt/ConstFloat/ConstPtr `.type` parity).
+    ///
+    /// Default is a no-op — only backends that honour constants at emit
+    /// time override.
+    fn set_constants_pool(&mut self, _constants: majit_ir::VecAssoc<u32, Const>) {}
 
     /// Force the next `compile_loop` / `compile_bridge` call to stamp
     /// this trace id on exits.
@@ -1584,7 +1583,7 @@ pub trait Backend: Send {
         &mut self,
         fail_descr: &dyn FailDescr,
         inputargs: &[InputArg],
-        ops: &[Op],
+        ops: &[OpRc],
         original_token: &JitCellToken,
         previous_tokens: &[std::sync::Arc<JitCellToken>],
         caller_recovery_layout: Option<&ExitRecoveryLayout>,

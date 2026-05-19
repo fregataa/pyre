@@ -13,33 +13,30 @@ fn validate_wasm(bytes: &[u8]) {
 
 fn make_op(opcode: OpCode, args: &[OpRef], pos: OpRef) -> Op {
     let mut op = Op::new(opcode, args);
-    op.pos = pos;
+    op.pos.set(pos);
     op
 }
 
 fn make_guard(opcode: OpCode, args: &[OpRef], fail_args: &[OpRef]) -> Op {
     let mut op = Op::new(opcode, args);
-    op.fail_args = Some(smallvec![fail_args[0]; 0]);
+    op.setfailargs(smallvec![fail_args[0]; 0]);
     let mut fa: smallvec::SmallVec<[OpRef; 3]> = smallvec::SmallVec::new();
     for &a in fail_args {
         fa.push(a);
     }
-    op.fail_args = Some(fa);
+    op.setfailargs(fa);
     op
 }
 
 #[test]
 fn test_empty_trace() {
-    let inputargs = vec![InputArg {
-        index: 0,
-        tp: Type::Int,
-    }];
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
     let ops = vec![{
         let mut op = Op::new(OpCode::Finish, &[OpRef::input_arg_int(0)]);
-        op.fail_args = Some(smallvec![OpRef::input_arg_int(0)]);
+        op.setfailargs(smallvec![OpRef::input_arg_int(0)]);
         op
     }];
-    let constants = HashMap::new();
+    let constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
     let (bytes, guards) = codegen::build_wasm_module(
         &inputargs,
         &ops,
@@ -59,19 +56,13 @@ fn test_int_add_loop() {
     // Label(i, sum) -> IntAdd(sum, i) -> IntAdd(i, 1) -> IntLt(i, 100)
     // -> GuardTrue -> Jump(new_i, new_sum)
     let inputargs = vec![
-        InputArg {
-            index: 0,
-            tp: Type::Int,
-        }, // i
-        InputArg {
-            index: 1,
-            tp: Type::Int,
-        }, // sum
+        InputArg::from_type(Type::Int, 0), // i
+        InputArg::from_type(Type::Int, 1), // sum
     ];
 
     let const_1 = OpRef::const_int(0);
     let const_100 = OpRef::const_int(1);
-    let mut constants = HashMap::new();
+    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
     constants.insert(OpRef::const_int(0).raw(), 1i64);
     constants.insert(OpRef::const_int(1).raw(), 100i64);
 
@@ -120,14 +111,8 @@ fn test_int_add_loop() {
 #[test]
 fn test_float_ops() {
     let inputargs = vec![
-        InputArg {
-            index: 0,
-            tp: Type::Float,
-        },
-        InputArg {
-            index: 1,
-            tp: Type::Float,
-        },
+        InputArg::from_type(Type::Float, 0),
+        InputArg::from_type(Type::Float, 1),
     ];
 
     let ops = vec![
@@ -160,12 +145,12 @@ fn test_float_ops() {
         ),
         {
             let mut op = Op::new(OpCode::Finish, &[OpRef::float_op(7)]);
-            op.fail_args = Some(smallvec![OpRef::float_op(7)]);
+            op.setfailargs(smallvec![OpRef::float_op(7)]);
             op
         },
     ];
 
-    let constants = HashMap::new();
+    let constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
     let (bytes, guards) = codegen::build_wasm_module(
         &inputargs,
         &ops,
@@ -181,13 +166,10 @@ fn test_float_ops() {
 
 #[test]
 fn test_call_generates_import() {
-    let inputargs = vec![InputArg {
-        index: 0,
-        tp: Type::Int,
-    }];
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
 
     let func_ptr = OpRef::const_int(0);
-    let mut constants = HashMap::new();
+    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
     constants.insert(OpRef::const_int(0).raw(), 42i64); // fake func_ptr
 
     let ops = vec![
@@ -198,7 +180,7 @@ fn test_call_generates_import() {
         ),
         {
             let mut op = Op::new(OpCode::Finish, &[OpRef::int_op(1)]);
-            op.fail_args = Some(smallvec![OpRef::int_op(1)]);
+            op.setfailargs(smallvec![OpRef::int_op(1)]);
             op
         },
     ];
@@ -235,14 +217,8 @@ fn test_call_generates_import() {
 #[test]
 fn test_guard_types() {
     let inputargs = vec![
-        InputArg {
-            index: 0,
-            tp: Type::Int,
-        },
-        InputArg {
-            index: 1,
-            tp: Type::Int,
-        },
+        InputArg::from_type(Type::Int, 0),
+        InputArg::from_type(Type::Int, 1),
     ];
 
     let ops = vec![
@@ -283,13 +259,13 @@ fn test_guard_types() {
         // GuardNoOverflow (0 args)
         {
             let mut op = Op::new(OpCode::GuardNoOverflow, &[]);
-            op.fail_args = Some(smallvec![OpRef::input_arg_int(0)]);
+            op.setfailargs(smallvec![OpRef::input_arg_int(0)]);
             op
         },
         // GuardNotInvalidated (0 args, always pass)
         {
             let mut op = Op::new(OpCode::GuardNotInvalidated, &[]);
-            op.fail_args = Some(smallvec![OpRef::input_arg_int(0)]);
+            op.setfailargs(smallvec![OpRef::input_arg_int(0)]);
             op
         },
         Op::new(
@@ -298,7 +274,7 @@ fn test_guard_types() {
         ),
     ];
 
-    let constants = HashMap::new();
+    let constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
     let (bytes, guards) = codegen::build_wasm_module(
         &inputargs,
         &ops,
@@ -320,13 +296,10 @@ fn test_guard_types() {
 /// classptr — no `mem32[obj + 0]` read, no classptr→typeid lookup.
 #[test]
 fn test_guard_gc_type_uses_immediate_typeid() {
-    let inputargs = vec![InputArg {
-        index: 0,
-        tp: Type::Int,
-    }];
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
 
     // OpRef::const_int(0) holds the immediate typeid 0x42
-    let mut constants = HashMap::new();
+    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
     constants.insert(OpRef::const_int(0).raw(), 0x42_i64);
 
     let ops = vec![
@@ -384,10 +357,7 @@ fn enabled_guard_gc_type_info() -> codegen::GuardGcTypeInfo {
 /// runs; the resulting module must validate as legal wasm.
 #[test]
 fn test_guard_is_object_lowers_to_typeinfo_test() {
-    let inputargs = vec![InputArg {
-        index: 0,
-        tp: Type::Int,
-    }];
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
 
     let ops = vec![
         Op::new(OpCode::Label, &[OpRef::input_arg_int(0)]),
@@ -399,7 +369,7 @@ fn test_guard_is_object_lowers_to_typeinfo_test() {
         Op::new(OpCode::Jump, &[OpRef::input_arg_int(0)]),
     ];
 
-    let constants = HashMap::new();
+    let constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
     let (bytes, guards) = codegen::build_wasm_module(
         &inputargs,
         &ops,
@@ -421,10 +391,7 @@ fn test_guard_is_object_lowers_to_typeinfo_test() {
 /// lowering runs to completion.
 #[test]
 fn test_guard_subclass_lowers_to_subclassrange_check() {
-    let inputargs = vec![InputArg {
-        index: 0,
-        tp: Type::Int,
-    }];
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
 
     // history.py:307 `ConstPtr.type = 'r'` — vtable pointers are
     // ref-typed Const boxes. Use the typed `OpRef::const_ptr` factory
@@ -432,7 +399,7 @@ fn test_guard_subclass_lowers_to_subclassrange_check() {
     // identity, mirroring the `OpRef::const_int` pattern used in
     // `test_guard_gc_type_lowers_to_typeid_check` above.
     let class_constant = OpRef::const_ptr(0);
-    let mut constants = HashMap::new();
+    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
     constants.insert(class_constant.raw(), 0xCAFEi64);
 
     let ops = vec![
@@ -472,10 +439,7 @@ fn test_guard_subclass_lowers_to_subclassrange_check() {
 
 #[test]
 fn test_sameas_and_conversions() {
-    let inputargs = vec![InputArg {
-        index: 0,
-        tp: Type::Int,
-    }];
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
 
     let ops = vec![
         make_op(
@@ -517,12 +481,12 @@ fn test_sameas_and_conversions() {
         ),
         {
             let mut op = Op::new(OpCode::Finish, &[OpRef::int_op(9)]);
-            op.fail_args = Some(smallvec![OpRef::int_op(9)]);
+            op.setfailargs(smallvec![OpRef::int_op(9)]);
             op
         },
     ];
 
-    let constants = HashMap::new();
+    let constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
     let (bytes, _) = codegen::build_wasm_module(
         &inputargs,
         &ops,
@@ -538,14 +502,8 @@ fn test_sameas_and_conversions() {
 #[test]
 fn test_overflow_ops() {
     let inputargs = vec![
-        InputArg {
-            index: 0,
-            tp: Type::Int,
-        },
-        InputArg {
-            index: 1,
-            tp: Type::Int,
-        },
+        InputArg::from_type(Type::Int, 0),
+        InputArg::from_type(Type::Int, 1),
     ];
 
     let ops = vec![
@@ -556,7 +514,7 @@ fn test_overflow_ops() {
         ),
         {
             let mut op = Op::new(OpCode::GuardNoOverflow, &[]);
-            op.fail_args = Some(smallvec![OpRef::int_op(2)]);
+            op.setfailargs(smallvec![OpRef::int_op(2)]);
             op
         },
         make_op(
@@ -566,17 +524,17 @@ fn test_overflow_ops() {
         ),
         {
             let mut op = Op::new(OpCode::GuardNoOverflow, &[]);
-            op.fail_args = Some(smallvec![OpRef::int_op(3)]);
+            op.setfailargs(smallvec![OpRef::int_op(3)]);
             op
         },
         {
             let mut op = Op::new(OpCode::Finish, &[OpRef::int_op(2)]);
-            op.fail_args = Some(smallvec![OpRef::int_op(2)]);
+            op.setfailargs(smallvec![OpRef::int_op(2)]);
             op
         },
     ];
 
-    let constants = HashMap::new();
+    let constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
     let (bytes, guards) = codegen::build_wasm_module(
         &inputargs,
         &ops,
