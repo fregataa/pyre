@@ -30,9 +30,29 @@ pub use majit_translate::liveness::{
 ///     remove_repeated_live(ssarepr)
 /// ```
 pub fn compute_liveness(ssarepr: &mut SSARepr) {
+    compute_liveness_with_protected(ssarepr, None);
+}
+
+/// `compute_liveness` variant that passes a per-PC-live protection
+/// bitmap down to the internal `remove_repeated_live` call.  See
+/// [`remove_repeated_live_with_protected`].
+pub fn compute_liveness_with_protected(
+    ssarepr: &mut SSARepr,
+    protected_per_pc_live: Option<&[bool]>,
+) {
+    let _ = compute_liveness_with_remap(ssarepr, protected_per_pc_live);
+}
+
+/// `compute_liveness_with_protected` variant that also returns the
+/// position remap produced by the trailing `remove_repeated_live`
+/// pass.  See [`remove_repeated_live_with_remap`].
+pub fn compute_liveness_with_remap(
+    ssarepr: &mut SSARepr,
+    protected_per_pc_live: Option<&[bool]>,
+) -> Vec<usize> {
     let mut label2alive: HashMap<String, HashSet<Register>> = HashMap::new();
     while _compute_liveness_must_continue(ssarepr, &mut label2alive) {}
-    remove_repeated_live(ssarepr);
+    remove_repeated_live_with_remap(ssarepr, protected_per_pc_live)
 }
 
 /// `liveness.py:25-80` `_compute_liveness_must_continue(ssarepr, label2alive)`.
@@ -79,15 +99,8 @@ fn _compute_liveness_must_continue(
         let insn = ssarepr.insns[i].clone();
 
         // `liveness.py:36-42` `if isinstance(insn[0], Label)`.
-        //
-        // Pyre's `Insn::PcAnchor { py_pc }` is the per-PC anchor variant
-        // synthesized by the walker; it shares Label's snapshot-and-merge
-        // semantic, keyed on `pc_label_name(py_pc)` so the resulting
-        // `label2alive` entry matches what `TLabel("pc{N}")` branches
-        // resolve to.
         let label_name = match &insn {
             Insn::Label(label) => Some(label.name.clone()),
-            Insn::PcAnchor { py_pc } => Some(super::flatten::pc_label_name(*py_pc)),
             _ => None,
         };
         if let Some(name) = label_name {
@@ -255,46 +268,84 @@ impl LiveItem {
 /// `Label` markers) into a single `-live-` whose arguments are the union
 /// of all collapsed markers.
 pub fn remove_repeated_live(ssarepr: &mut SSARepr) {
+    remove_repeated_live_with_protected(ssarepr, None);
+}
+
+/// `remove_repeated_live` with an optional bitmap of SSARepr positions
+/// whose `-live-` markers must NOT be folded into a preceding run.
+///
+/// Used by the walker's per-PC dispatch: walker tracks each per-PC
+/// `-live-` position and passes it in so the merge breaks at every
+/// Python PC boundary, preserving each PC's distinct `-live-` marker
+/// for `pc_map` resolution.
+pub fn remove_repeated_live_with_protected(
+    ssarepr: &mut SSARepr,
+    protected_per_pc_live: Option<&[bool]>,
+) {
+    let _ = remove_repeated_live_with_remap(ssarepr, protected_per_pc_live);
+}
+
+/// `remove_repeated_live_with_protected` variant that also returns a
+/// position remap.  `remap[old_idx] = new_idx` where `new_idx` is the
+/// index in the rebuilt `ssarepr.insns` that the original entry at
+/// `old_idx` maps to.  Entries that were merged into a preceding
+/// `-live-` marker map to that surviving marker's new index.
+///
+/// Used by T6.1 to keep walker-tracked per-PC live-marker positions
+/// valid across `compute_liveness` (which may shift indices when
+/// non-protected `-live-` markers are folded away).
+pub fn remove_repeated_live_with_remap(
+    ssarepr: &mut SSARepr,
+    protected_per_pc_live: Option<&[bool]>,
+) -> Vec<usize> {
     // `liveness.py:83-85` `last_i_pos = None; i = 0; res = []`.
     let mut res: Vec<Insn> = Vec::with_capacity(ssarepr.insns.len());
+    let mut remap: Vec<usize> = vec![0usize; ssarepr.insns.len()];
     let mut i = 0usize;
+
+    let is_protected = |idx: usize| -> bool {
+        protected_per_pc_live
+            .and_then(|p| p.get(idx).copied())
+            .unwrap_or(false)
+    };
 
     while i < ssarepr.insns.len() {
         // `liveness.py:87` `insn = ssarepr.insns[i]`.
         let insn = ssarepr.insns[i].clone();
         // `liveness.py:88-91`.
         if !insn.is_live() {
+            remap[i] = res.len();
             res.push(insn);
             i += 1;
             continue;
         }
         // `liveness.py:92-95` — collect `lives` and `labels` runs.
-        let _last_i_pos = i;
         i += 1;
         let mut labels: Vec<Insn> = Vec::new();
+        let mut label_old_positions: Vec<usize> = Vec::new();
         let mut lives: Vec<Insn> = vec![insn];
+        let mut live_old_positions: Vec<usize> = vec![i - 1];
 
         // `liveness.py:97-106` inner loop.
         //
-        // Task #227.5 item 6: pyre emits `Label("pc{N}")` at every
-        // Python PC entry as a per-PC anchor (pyre-specific
-        // construct; upstream RPython has no per-PC Labels — only
-        // block-entry Labels).  `remove_repeated_live` must NOT
-        // merge `-live-` runs across `Label("pc{N}")` boundaries —
-        // otherwise consecutive per-PC live markers collapse into
-        // one and `live_marker_indices_by_pc` loses the per-PC
-        // mapping.  Other Labels (catch_landing, link-target) keep
-        // merging per upstream `liveness.py:99-100`.  This carveout
-        // is the necessary structural adaptation for pyre's per-PC
-        // Label model.
+        // `protected_per_pc_live[i]` breaks the merge at walker-recorded
+        // per-PC `-live-` positions so each Python PC retains its own
+        // `-live-` marker (the walker-tracked side-table populates the
+        // bitmap; `filter_liveness_in_place` is the sole production
+        // caller and always supplies it).  Block-identity /
+        // catch-landing / link-target labels keep merging per upstream
+        // `liveness.py:99-100`.
         while i < ssarepr.insns.len() {
             let next = ssarepr.insns[i].clone();
             if next.is_live() {
+                if is_protected(i) {
+                    break;
+                }
+                live_old_positions.push(i);
                 lives.push(next);
                 i += 1;
-            } else if matches!(&next, Insn::PcAnchor { .. }) {
-                break;
             } else if matches!(next, Insn::Label(_)) {
+                label_old_positions.push(i);
                 labels.push(next);
                 i += 1;
             } else {
@@ -304,7 +355,11 @@ pub fn remove_repeated_live(ssarepr: &mut SSARepr) {
 
         // `liveness.py:107-110`.
         if lives.len() == 1 {
-            res.extend(labels);
+            for (k, label) in labels.into_iter().enumerate() {
+                remap[label_old_positions[k]] = res.len();
+                res.push(label);
+            }
+            remap[live_old_positions[0]] = res.len();
             res.push(lives.into_iter().next().unwrap());
             continue;
         }
@@ -328,7 +383,10 @@ pub fn remove_repeated_live(ssarepr: &mut SSARepr) {
                 }
             }
         }
-        res.extend(labels);
+        for (k, label) in labels.into_iter().enumerate() {
+            remap[label_old_positions[k]] = res.len();
+            res.push(label);
+        }
         // `liveness.py:115` `res.append(('-live-', ) + tuple(sorted(liveset)))`.
         //
         // Python's `sorted(set_of_mixed_objects)` raises `TypeError` in
@@ -345,6 +403,10 @@ pub fn remove_repeated_live(ssarepr: &mut SSARepr) {
             (LiveItem::TLabel(_), LiveItem::Register(_)) => std::cmp::Ordering::Greater,
             (LiveItem::TLabel(la), LiveItem::TLabel(lb)) => la.name.cmp(&lb.name),
         });
+        let merged_new_pos = res.len();
+        for &pos in &live_old_positions {
+            remap[pos] = merged_new_pos;
+        }
         res.push(Insn::live(
             sorted.into_iter().map(LiveItem::into_operand).collect(),
         ));
@@ -352,6 +414,7 @@ pub fn remove_repeated_live(ssarepr: &mut SSARepr) {
 
     // `liveness.py:116` `ssarepr.insns = res`.
     ssarepr.insns = res;
+    remap
 }
 
 #[cfg(test)]

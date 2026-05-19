@@ -208,47 +208,25 @@ impl TLabel {
     }
 }
 
-/// pyre-only naming convention for the per-Python-PC anchor label that
-/// the walker emits at every PC entry.  Upstream RPython's `flatten.py`
-/// emits exactly one `Label(block)` per SpamBlock; the JIT resumes only
-/// at `jit_merge_point` boundaries (loop headers + guard fail bounce
-/// points) so per-PC anchors are unnecessary.  Pyre's runtime instead
-/// resumes at arbitrary Python PCs (blackhole bridge-resume, inline
-/// call tracing), which requires a per-PC byte-offset table populated
-/// from anchor positions in the assembled JitCode.
+/// Upstream-orthodox per-block label naming.  `rpython/jit/codewriter/
+/// flatten.py:116` emits `Label(block)` once per `SpamBlock` using
+/// Python object identity as the implicit name.  Pyre serializes the
+/// block's `Rc` pointer to a stable per-run string for use in
+/// `Insn::Label` / `Operand::TLabel`.
 ///
-/// All five emit / branch sites that materialise the `pc{N}` naming
-/// route through these helpers so the convention is single-sourced.
-/// A future Phase 4 step can rename the marker shape (e.g.,
-/// `Insn::PcAnchor { py_pc }` distinct from `Insn::Label`) by changing
-/// only these two functions plus the runtime consumers
-/// (`pc_anchor_positions` / `live_marker_indices_by_pc`).
-pub fn pc_label_name(py_pc: usize) -> String {
-    format!("pc{py_pc}")
+/// Two distinct `BlockRef`s always produce distinct names within a
+/// single CodeWriter run (`Rc::as_ptr` is stable across clones); the
+/// name is not stable across runs, matching upstream's per-run object
+/// identity.  All walker block-identity label emits and branch target
+/// constructions route through this helper.
+pub fn block_label_name(block: &super::flow::BlockRef) -> String {
+    format!("block{}", block.as_ptr_addr())
 }
 
-/// Companion to [`pc_label_name`] producing the matching `TLabel`
-/// branch target.  Walker `goto Label("pc{N}")` callsites build the
-/// target via this helper.
-pub fn pc_tlabel(py_pc: usize) -> TLabel {
-    TLabel::new(pc_label_name(py_pc))
-}
-
-/// Recover the Python PC index from a `Insn::PcAnchor`, or `None`
-/// for any other Insn shape.  Consumed by the runtime's
-/// `pc_anchor_positions` / `live_marker_indices_by_pc` scans.
-///
-/// `Insn::Label("pc{N}")` was the transitional shape before the
-/// `Insn::PcAnchor` variant landed; every walker emit site and every
-/// in-tree test fixture now produces `Insn::PcAnchor` directly, so the
-/// recognition path is retired and `Insn::Label` is reserved purely
-/// for upstream-orthodox block / link / catch-landing labels.
-pub fn label_pc_index(insn: &Insn) -> Option<usize> {
-    if let Insn::PcAnchor { py_pc } = insn {
-        Some(*py_pc)
-    } else {
-        None
-    }
+/// Companion to [`block_label_name`] producing the matching `TLabel`
+/// branch target.
+pub fn block_tlabel(block: &super::flow::BlockRef) -> TLabel {
+    TLabel::new(block_label_name(block))
 }
 
 /// `flatten.py:28-33` `class Register(object)`.
@@ -1102,19 +1080,11 @@ pub const OPNAME_LIVE: &str = "-live-";
 /// representation where `insn[0] == '-live-'` is the discriminator.
 #[derive(Debug, Clone)]
 pub enum Insn {
-    /// `(Label(name),)` — block-entry marker.
+    /// `(Label(name),)` — block-entry marker.  Names are produced via
+    /// `block_label_name(&block)` (Rc-pointer-based), matching upstream
+    /// `flatten.py:116 self.emitline(Label(block))` per-SpamBlock
+    /// emission.
     Label(Label),
-    /// pyre-only per-PC anchor marker emitted by the walker at every
-    /// Python PC entry.  Semantically equivalent to a block-entry
-    /// `Insn::Label` with the synthesized name `pc_label_name(py_pc)`,
-    /// but kept as a distinct variant so the runtime can structurally
-    /// distinguish "block entry per `flatten.py:116`" from "per-PC
-    /// anchor for any-PC resume (pyre's NEW-DEVIATION; upstream PyPy
-    /// only resumes at `jit_merge_point` boundaries)".  The assembler
-    /// records the byte position under `pc_label_name(py_pc)` in
-    /// `label_positions` so existing `TLabel("pc{N}")` branch targets
-    /// continue to resolve.
-    PcAnchor { py_pc: usize },
     /// `('---',)` — unreachable marker; clears the liveness pass's alive
     /// set (`liveness.py:70`).
     Unreachable,
@@ -1157,14 +1127,6 @@ impl Insn {
             args,
             result: None,
         }
-    }
-
-    /// pyre-only per-PC anchor for `py_pc`.  Walker emits one per
-    /// Python PC entry; the runtime resolves `pc{N}` jumps via
-    /// `pc_anchor_positions` / `live_marker_indices_by_pc` scans
-    /// against this variant.
-    pub fn pc_anchor(py_pc: usize) -> Self {
-        Insn::PcAnchor { py_pc }
     }
 
     /// `true` iff this instruction is a `-live-` marker.
@@ -1220,34 +1182,6 @@ pub struct GraphFlattener<'a, F, C = fn(&Constant) -> Operand> {
     /// Per-link counterpart to `block_names` for `Label(link)` /
     /// `TLabel(link)` shapes emitted at canraise / switch sites.
     link_names: Vec<(LinkRef, String)>,
-    /// Pyre-only side table mapping graph blocks to their Python PC.
-    /// When non-empty, `make_bytecode_block` emits an `Insn::PcAnchor
-    /// { py_pc }` immediately after the block-entry `Label` for blocks
-    /// present in this table, matching the walker's per-PC anchor
-    /// emission in `codewriter.rs::emit_mark_label_pc!`.  This makes
-    /// the canonical driver's output runtime-compatible with pyre's
-    /// `pc_anchor_positions` / `live_marker_indices_by_pc` lookups
-    /// without requiring runtime refactor.  Upstream RPython has no
-    /// per-PC anchor concept (RPython's runtime dispatch keys off the
-    /// recorded SpamBlock identity, not Python PC), so this is a pyre
-    /// adaptation layer.  Pre-seeded by the bridge entry
-    /// `flatten_graph_with_walker_slots`; empty for plain
-    /// `flatten_graph` test fixtures.
-    block_py_pcs: Vec<(BlockRef, usize)>,
-    /// Pyre-only force-alive Register operands threaded into every
-    /// `-live-` placeholder emitted by `make_bytecode_block` (matches
-    /// walker's `emit_live_placeholder!` macro at
-    /// `codewriter.rs::4329-4339`).  Walker keeps the portal red args
-    /// (`pypy/module/pypyjit/interp_jit.py:67 reds = ['frame', 'ec']`)
-    /// alive across every PC by emitting their Register operands into
-    /// each per-PC `-live-` — `compute_liveness` then propagates them
-    /// backward into the alive set per `liveness.py:11-12`.  Without
-    /// the operands the bridge's `setup_bridge_sym` sees the portal
-    /// `ec` register missing from the guard point's live R-bank set,
-    /// crashing `bridge_registers_r[portal_ec_reg]` lookup.  Pre-
-    /// seeded by `flatten_graph_with_walker_slots` from codewriter's
-    /// `portal_frame_reg` / `portal_ec_reg`.
-    live_force_alive_ops: Vec<Operand>,
     next_label_id: usize,
     include_all_exc_links: bool,
     /// `rpython/jit/codewriter/flatten.py:79 self.cpu = cpu`.
@@ -1288,8 +1222,6 @@ where
             seen_blocks: Vec::new(),
             block_names: Vec::new(),
             link_names: Vec::new(),
-            block_py_pcs: Vec::new(),
-            live_force_alive_ops: Vec::new(),
             next_label_id: 0,
             include_all_exc_links: false,
             cpu: None,
@@ -1315,8 +1247,6 @@ where
             seen_blocks: Vec::new(),
             block_names: Vec::new(),
             link_names: Vec::new(),
-            block_py_pcs: Vec::new(),
-            live_force_alive_ops: Vec::new(),
             next_label_id: 0,
             include_all_exc_links: false,
             cpu: None,
@@ -1347,8 +1277,6 @@ where
             seen_blocks: Vec::new(),
             block_names: Vec::new(),
             link_names: Vec::new(),
-            block_py_pcs: Vec::new(),
-            live_force_alive_ops: Vec::new(),
             next_label_id: 0,
             include_all_exc_links: false,
             cpu: None,
@@ -1963,49 +1891,6 @@ where
         exitswitch: Option<super::flow::ExitSwitch>,
         handling_ovf: bool,
     ) {
-        // Diagnostic: surface walker-emitted switch shape on entry so
-        // the panic at `switch_llexitcase_key` includes the link
-        // inventory (exitcase + llexitcase per link) rather than
-        // forcing manual graph inspection.
-        if std::env::var_os("PYRE_PHASE3_SWITCH_DIAG").is_some() {
-            let exitcase_summary: Vec<String> = exits
-                .iter()
-                .map(|link| {
-                    let lb = link.borrow();
-                    format!(
-                        "(exitcase={:?}, llexitcase={:?})",
-                        lb.exitcase, lb.llexitcase
-                    )
-                })
-                .collect();
-            // Describe the source block's last few operations so we
-            // can identify which walker emit site produced this shape.
-            let block_summary = exits
-                .first()
-                .and_then(|link| link.borrow().prevblock.clone())
-                .and_then(|weak| weak.upgrade())
-                .map(|block_rc| {
-                    let b = block_rc.borrow();
-                    let last_ops: Vec<String> = b
-                        .operations
-                        .iter()
-                        .rev()
-                        .take(3)
-                        .rev()
-                        .map(|op| format!("{}@{}", op.opname, op.offset))
-                        .collect();
-                    format!("ops={} last_ops={:?}", b.operations.len(), last_ops,)
-                })
-                .unwrap_or_else(|| "<no-block>".to_string());
-            eprintln!(
-                "[phase3-switch-diag] insert_switch_exits: exits={} \
-                 exitswitch={:?} {} shape={:?}",
-                exits.len(),
-                exitswitch,
-                block_summary,
-                exitcase_summary,
-            );
-        }
         let Some(super::flow::ExitSwitch::Value(exitswitch)) = exitswitch else {
             // RPython `flatten.py:282-309 insert_switch_exits` is only
             // called via `insert_exits` when the block already has a
@@ -2244,94 +2129,21 @@ where
         self.seen_blocks.push(block.clone());
         let block_label = self.label_for_block(&block);
         self.emitline(block_label);
-        // Pyre adaptation: emit `Insn::PcAnchor { py_pc }` +
-        // placeholder `-live-` marker pairs INTERLEAVED with the
-        // block's ops based on `op.offset` (= py_pc the walker
-        // recorded the op at).  Walker emits PcAnchor + `-live-`
-        // immediately before dispatching each PC's bytecode
-        // (`codewriter.rs::emit_mark_label_pc!` followed by
-        // `emit_live_placeholder!()`), so the `-live-` placeholder
-        // sits right before that PC's ops.  `compute_liveness`'s
-        // backward walk captures the alive register set AT that
-        // marker position; bulk-emitting all anchors at block entry
-        // (the previous behaviour) collapses every PC's marker to
-        // "block entry" and produces a single alive set shared
-        // across all PCs — wrong liveness for any PC after the
-        // first.  Per-op interleaving here reconstructs the walker's
-        // per-PC marker positions so `filter_liveness_in_place`'s
-        // post-pass populates each PC's `-live-` with the correct
-        // alive set.  Owned PCs without any matching op (sparse
-        // walker emissions for synthetic-only PCs) emit a trailing
-        // PA + L pair after the op loop so `pc_anchor_positions`'s
-        // assert that every PC has an anchor still holds.  Synthetic
-        // graph ops (`offset == -1`, e.g. `abort_permanent`,
-        // `emit_vsd!` int_copy / setfield_vable_i bookkeeping)
-        // attach to whichever PC was most recently anchored, matching
-        // walker's emit-where-encountered behaviour.  Upstream
-        // RPython has no per-PC anchor concept; this is a pyre-only
-        // extension required by per-PC runtime dispatch.
-        let owned_pcs_sorted: Vec<usize> = {
-            let mut v: Vec<usize> = self
-                .block_py_pcs
-                .iter()
-                .filter_map(|(b, pc)| if b == &block { Some(*pc) } else { None })
-                .collect();
-            v.sort();
-            v.dedup();
-            v
-        };
-        let force_alive = self.live_force_alive_ops.clone();
+        // `flatten.py:106-128` make_bytecode_block emits Label(block)
+        // at entry, then ops via `serialize_op`, then `insert_exits`.
+        // No per-PC anchors, no `-live-` interleaving — those come
+        // from `insert_exits`' canraise path (`flatten.py:259-260`,
+        // `flatten.py:285`) and from the liveness post-pass
+        // (`liveness.py:11-12`).  Pyre's earlier per-PC PA + `-live-`
+        // interleaving here was a pyre-only adaptation for runtime
+        // PC dispatch via per-PC `Insn::Label("pc{N}")`; that runtime
+        // mechanism remains on the walker side until the T6 epic
+        // retires it, but canonical now matches upstream's structure
+        // exactly.
         let operations = block.borrow().operations.clone();
         let exits_len = block.borrow().exits.len();
         let exitswitch_is_last_exception = block.borrow().canraise();
-        let mut anchored_pcs: Vec<usize> = Vec::new();
-        let mut current_pc: Option<usize> = None;
         for op in &operations {
-            // Determine whether this op carries an owned-PC offset.
-            // `op.offset >= 0` filters out synthetic ops (offset=-1)
-            // which attach to the most recently anchored PC.  Ops
-            // whose offset isn't in `owned_pcs_sorted` (rare — a
-            // graph op recorded with a non-owned PC) also attach to
-            // the current PC.
-            let target_pc: Option<usize> = if op.offset >= 0 {
-                let off = op.offset as usize;
-                if owned_pcs_sorted.contains(&off) {
-                    Some(off)
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-            if let Some(pc) = target_pc {
-                if Some(pc) != current_pc {
-                    // Emit anchors for all owned PCs at-or-before
-                    // `pc` that haven't been emitted yet.  Catches
-                    // "empty" PCs sitting between the previously
-                    // anchored PC and `pc` (PCs whose walker emit
-                    // contributed no real graph op) so every owned
-                    // PC ends up anchored in ascending order.
-                    for &p in &owned_pcs_sorted {
-                        if p <= pc && !anchored_pcs.contains(&p) {
-                            self.emitline(Insn::pc_anchor(p));
-                            self.emitline(Insn::op(OPNAME_LIVE.to_string(), force_alive.clone()));
-                            anchored_pcs.push(p);
-                        }
-                    }
-                    current_pc = Some(pc);
-                }
-            } else if current_pc.is_none() {
-                // Synthetic op precedes any real-PC op in this
-                // block.  Emit the first owned PC's anchor so the
-                // synthetic op attaches to it (matches walker's
-                // behaviour of always opening a block with PA + L).
-                if let Some(&first_pc) = owned_pcs_sorted.first() {
-                    self.emitline(Insn::pc_anchor(first_pc));
-                    self.emitline(Insn::op(OPNAME_LIVE.to_string(), force_alive.clone()));
-                    anchored_pcs.push(first_pc);
-                    current_pc = Some(first_pc);
-                }
-            }
             // `flatten.py:120-125` `_ovf` validity check: an overflow-
             // checked op must live in a canraise block with 2 or 3
             // exits; otherwise the rtyper-side guarantee that an
@@ -2350,21 +2162,6 @@ where
                 );
             }
             self.serialize_op(op);
-        }
-        // Emit anchors for any owned PCs that didn't appear in any
-        // op's `offset` (e.g. PCs whose walker emit produced only
-        // scaffold — PA + `-live-` — and no graph SpaceOp).
-        // `pc_anchor_positions` asserts every PC has an anchor; this
-        // tail emission satisfies that invariant.  These trailing
-        // anchors sit between the block's last op and `insert_exits`'s
-        // terminator emission — runtime entry into them would no-op
-        // through the terminator's goto / return because they carry
-        // no preceding ops in this block.
-        for &p in &owned_pcs_sorted {
-            if !anchored_pcs.contains(&p) {
-                self.emitline(Insn::pc_anchor(p));
-                self.emitline(Insn::op(OPNAME_LIVE.to_string(), force_alive.clone()));
-            }
         }
         self.insert_exits(&block, handling_ovf);
     }
@@ -2720,50 +2517,6 @@ pub fn flatten_graph<'a>(
     include_all_exc_links: bool,
     cpu: Option<&'a super::cpu::Cpu>,
 ) -> SSARepr {
-    flatten_graph_with_walker_slots(
-        graph,
-        regallocs,
-        &[],
-        &[],
-        &[],
-        &[],
-        &[],
-        include_all_exc_links,
-        cpu,
-    )
-}
-
-/// Phase 4 bridge: `walker_slot_for_variable[var.id]` overrides the
-/// graph regalloc color so production can splice canonical Insns into
-/// the walker's SSARepr without Register-index mismatch.  Synthetic
-/// graph-only Variables (e.g. `last_exception` from
-/// `attach_catch_exception_edge`) have no entry and fall back to
-/// `regallocs[kind].getcolor(v)` per `flatten.py:382-391`.
-///
-/// Task #50 T6 epic slice 1 — `block_name_overrides` pre-seeds the
-/// flattener's `block_names` map so canonical's `Label(block)` /
-/// `tlabel_for_block(target)` emit walker-compatible `pc{N}` names
-/// (where N = block's FrameState `next_offset` = entry Python PC)
-/// instead of the default sequential `block{N}` scheme.  Walker emits
-/// `Label("pcN")` per Python PC (its per-PC dispatch convention);
-/// without the override canonical and walker disagree on every branch
-/// target label name even though they reference the same target
-/// block.  Pre-seeded overrides are first-wins per
-/// `label_name_for_block`'s lookup logic — entries not in the
-/// override list fall back to the `block{N}` default (used for blocks
-/// the walker created but never assigned a `pcN` to, e.g. the implicit
-/// graph startblock when its py_pc has no per-PC anchor).
-pub fn flatten_graph_with_walker_slots<'a>(
-    graph: &super::flow::FunctionGraph,
-    regallocs: &'a mut [super::regalloc::GraphAllocationResult; 3],
-    walker_slot_for_variable: &'a [Option<u16>],
-    block_name_overrides: &[(super::flow::BlockRef, String)],
-    link_name_overrides: &[(super::flow::LinkRef, String)],
-    block_py_pc_overrides: &[(super::flow::BlockRef, usize)],
-    live_force_alive_ops: &[Operand],
-    include_all_exc_links: bool,
-    cpu: Option<&'a super::cpu::Cpu>,
-) -> SSARepr {
     // `flatten.py:68 flattener.enforce_input_args()`.  Upstream stores
     // `regallocs` on `self.regallocs` and the method mutates it
     // in place; pyre's `get_register` closure (constructed below)
@@ -2773,17 +2526,9 @@ pub fn flatten_graph_with_walker_slots<'a>(
     // _include_all_exc_links, cpu)`.
     let lowering_ctx = cpu.and_then(|c| c.lowering_ctx.read().ok().and_then(|guard| *guard));
     let mut ssarepr = SSARepr::new(graph.name.clone());
-    // `flatten.py:382-391 getcolor(v)`, prepended with the Phase 4
-    // bridge lookup documented on `flatten_graph_with_walker_slots`.
+    // `flatten.py:382-391 getcolor(v)`.
     let get_register = |variable: Variable| -> Register {
         let kind = variable.kind.unwrap_or(Kind::Ref);
-        let walker_slot = walker_slot_for_variable
-            .get(variable.id.0 as usize)
-            .copied()
-            .flatten();
-        if let Some(slot) = walker_slot {
-            return Register::new(kind, slot);
-        }
         let color = regallocs[kind.index()]
             .coloring
             .get(&variable.id)
@@ -2814,49 +2559,6 @@ pub fn flatten_graph_with_walker_slots<'a>(
     // `flatten.py:75 GraphFlattener.__init__ ._include_all_exc_links =
     // _include_all_exc_links`.
     flattener.include_all_exc_links = include_all_exc_links;
-    // Task #50 T6 epic slice 1 — pre-seed block_names with walker's
-    // `pc{N}` naming so `Label(block)` / `tlabel_for_block(target)`
-    // resolve to walker-compatible names.  Overrides land first in the
-    // Vec; `label_name_for_block` does a linear scan and returns the
-    // first matching entry, so subsequent default `block{N}` insertions
-    // for blocks not in the override list keep their fallback names.
-    for (block, name) in block_name_overrides {
-        flattener.block_names.push((block.clone(), name.clone()));
-    }
-    // Task #50 T6 epic slice 2 — pre-seed link_names with names that
-    // ALIAS the link to its target block's `pc{N}`.  Walker emits no
-    // separate link landing — its `goto_if_not Reg TLabel("pcN")`
-    // jumps directly to the target block's per-PC anchor.  Canonical
-    // emits `goto_if_not Reg TLabel(link_name)` + `Label(link_name)` +
-    // (optional renamings) + recursive `make_bytecode_block(target)`
-    // which emits `Label(target_block_name)`.  With the alias both
-    // canonical Label entries carry the same name string; the runtime's
-    // `pc_anchor_positions` first-wins resolves `pcN` to the link
-    // landing byte position, which then either no-ops (empty
-    // renamings) or runs the renamings before falling through to the
-    // target block's body.  Insn-level byte_equivalent improves
-    // because `TLabel` operand strings now match between walker and
-    // canonical.  Functionality-preserving — extra Label("pcN") emits
-    // are filtered by `count_real_ops` (Label is scaffold).
-    for (link, name) in link_name_overrides {
-        flattener.link_names.push((link.clone(), name.clone()));
-    }
-    // Task #50 T6 epic slice 4b — pre-seed block_py_pcs so
-    // `make_bytecode_block` emits `Insn::PcAnchor { py_pc }` after
-    // each block's Label, matching walker's per-PC anchor.  Makes
-    // canonical's SSARepr stream runtime-compatible with pyre's
-    // `pc_anchor_positions` lookup — necessary precondition for the
-    // Phase 4 production splice.  Upstream RPython has no per-PC
-    // anchor; this is a pyre adaptation layer.
-    for (block, py_pc) in block_py_pc_overrides {
-        flattener.block_py_pcs.push((block.clone(), *py_pc));
-    }
-    // Phase 4 slice 2 — pre-seed live force-alive ops so canonical's
-    // per-PC `-live-` placeholders carry the portal red args matching
-    // walker's `emit_live_placeholder!` shape.  Without these, the
-    // bridge's `setup_bridge_sym` crashes at portal_ec_reg lookup
-    // (compute_liveness misses the unforced register).
-    flattener.live_force_alive_ops = live_force_alive_ops.to_vec();
     // `flatten.py:69 flattener.generate_ssa_form()`.
     flattener.generate_ssa_form(graph);
     ssarepr
@@ -4312,31 +4014,18 @@ mod tests {
     use crate::jit::flow::{FlowListOfKind, VariableId};
 
     #[test]
-    fn pc_anchor_round_trip_matches_py_pc() {
-        for py_pc in [0usize, 1, 42, 99, 123_456] {
-            assert_eq!(pc_label_name(py_pc), format!("pc{py_pc}"));
-            let insn = Insn::pc_anchor(py_pc);
-            assert_eq!(
-                label_pc_index(&insn),
-                Some(py_pc),
-                "round-trip py_pc={py_pc}"
-            );
-        }
-    }
-
-    #[test]
-    fn label_pc_index_rejects_non_anchor_insns() {
-        // Block / link / catch-landing labels must be rejected — only
-        // `Insn::PcAnchor` returns Some(py_pc).
-        for name in ["block0", "block42", "link1", "catch_landing_3"] {
-            assert_eq!(
-                label_pc_index(&Insn::Label(Label::new(name))),
-                None,
-                "label_pc_index must reject Label({name:?})"
-            );
-        }
-        assert_eq!(label_pc_index(&Insn::Unreachable), None);
-        assert_eq!(label_pc_index(&Insn::op("plain", vec![])), None);
+    fn block_label_name_yields_distinct_per_block() {
+        use super::super::flow::Block;
+        let b1 = Block::shared(Vec::new());
+        let b2 = Block::shared(Vec::new());
+        let n1 = block_label_name(&b1);
+        let n2 = block_label_name(&b2);
+        assert_ne!(n1, n2, "distinct BlockRefs must produce distinct names");
+        // Same `Rc` cloned must round-trip.
+        let b1_again = b1.clone();
+        assert_eq!(block_label_name(&b1_again), n1);
+        // TLabel companion carries the same string.
+        assert_eq!(block_tlabel(&b1).name, n1);
     }
 
     #[test]

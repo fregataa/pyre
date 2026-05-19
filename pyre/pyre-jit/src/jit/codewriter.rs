@@ -716,6 +716,13 @@ impl SpamBlockRef {
     fn per_block_ssarepr(&self) -> Vec<super::flatten::Insn> {
         self.0.borrow().per_block_ssarepr.clone()
     }
+
+    /// Length of the per-block accumulator without cloning.  Used by
+    /// the T6.1 walker-time PC dispatch tracker to record per-PC
+    /// `-live-` marker positions at emit time.
+    fn per_block_ssarepr_len(&self) -> usize {
+        self.0.borrow().per_block_ssarepr.len()
+    }
 }
 
 impl PartialEq for SpamBlockRef {
@@ -753,14 +760,10 @@ fn push_walker_emit(current_block: &SpamBlockRef, insn: super::flatten::Insn) {
 /// mixed push_front / push_back) so this pass undoes the materialisation
 /// when the layout makes it redundant.
 ///
-/// The next-block label is recognised in two shapes:
-/// * `Insn::Label(L)` — upstream-orthodox block / link / catch-landing
-///   labels (`flatten.py:116 self.emit(Label(block))`).
-/// * `Insn::PcAnchor { py_pc }` — pyre's per-PC anchor introduced
-///   when the transitional `Label("pcN")` shape was retired. The
-///   matching `goto TLabel("pcN")` carries the name produced by
-///   `pc_label_name(py_pc)`; both shapes resolve to the same string
-///   key, so the strip recogniser unifies them.
+/// The next-block label is recognised as `Insn::Label(L)`, matching
+/// upstream's `flatten.py:116 self.emit(Label(block))` block / link /
+/// catch-landing labels.  The corresponding `goto TLabel(...)` carries
+/// the same name, so a single string-key match suffices.
 ///
 /// **Mutates** each block's `Vec<Insn>` in place to drop the strip
 /// tail; appends moved (not cloned) into the output `Vec`.
@@ -780,63 +783,44 @@ fn strip_walker_block_boundary_goto(
         // py_pc would fail to strip because the immediate next
         // entry in `all_walker_blocks` is the now-empty dead block,
         // not the supersede newblock that holds the matching
-        // `Label(pcN)` / `PcAnchor{N}` first insn.
-        let next_label_name: Option<String> = (i + 1..n)
-            .find_map(|j| blocks[j].first().map(|first| (j, first)))
-            .and_then(|(_, first)| match first {
-                super::flatten::Insn::Label(l) => Some(l.name.clone()),
-                super::flatten::Insn::PcAnchor { py_pc } => {
-                    Some(super::flatten::pc_label_name(*py_pc))
-                }
-                _ => None,
-            });
-        let first_label_for_diag = blocks[i].first().and_then(|insn| match insn {
-            super::flatten::Insn::Label(l) => Some(l.name.clone()),
-            super::flatten::Insn::PcAnchor { py_pc } => Some(super::flatten::pc_label_name(*py_pc)),
-            _ => None,
-        });
+        // `Label(pcN)` first insn.
+        // T6.1 Slice 4: block-entry emits both `Label("block{addr}")`
+        // (RPython-orthodox) and `Label("pcN")` (per-PC anchor) at the
+        // first PC of the block.  The strip's `goto Label("pcN")`
+        // target may match the SECOND leading label of the next block,
+        // not the first — so scan the entire leading-label cluster
+        // rather than just `first()`.
+        let next_label_names: Vec<String> = (i + 1..n)
+            .flat_map(|j| {
+                blocks[j]
+                    .iter()
+                    .take_while(|insn| matches!(insn, super::flatten::Insn::Label(_)))
+                    .filter_map(|insn| match insn {
+                        super::flatten::Insn::Label(l) => Some(l.name.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
         let block_insns = &mut blocks[i];
         let len = block_insns.len();
-        let (strip_tail, goto_target_for_diag) = if len >= 2 {
-            match (
-                &block_insns[len - 2],
-                &block_insns[len - 1],
-                next_label_name.as_deref(),
-            ) {
+        let strip_tail = if len >= 2 {
+            match (&block_insns[len - 2], &block_insns[len - 1]) {
                 (
                     super::flatten::Insn::Op { opname, args, .. },
                     super::flatten::Insn::Unreachable,
-                    Some(next_name),
                 ) if opname == "goto"
                     && args.len() == 1
-                    && matches!(&args[0], Operand::TLabel(target) if target.name == next_name) =>
+                    && matches!(&args[0], Operand::TLabel(target)
+                        if next_label_names.iter().any(|n| n == &target.name)) =>
                 {
-                    (2, None)
+                    2
                 }
-                (
-                    super::flatten::Insn::Op { opname, args, .. },
-                    super::flatten::Insn::Unreachable,
-                    _,
-                ) if opname == "goto" && args.len() == 1 => {
-                    let target = match &args[0] {
-                        Operand::TLabel(t) => Some(t.name.clone()),
-                        _ => None,
-                    };
-                    (0, target)
-                }
-                _ => (0, None),
+                _ => 0,
             }
         } else {
-            (0, None)
+            0
         };
-        if std::env::var_os("PYRE_PHASE3_STRIP_DIAG").is_some() {
-            if let Some(target) = goto_target_for_diag {
-                eprintln!(
-                    "[phase3-strip-no-match] block_index={} block_first={:?} goto_target={} next_label={:?}",
-                    i, first_label_for_diag, target, next_label_name,
-                );
-            }
-        }
         block_insns.truncate(len - strip_tail);
         drained.append(block_insns);
     }
@@ -853,6 +837,422 @@ fn fresh_variable_for_state(
     }
 }
 
+/// Walker post-walk `insert_renamings` — port of
+/// `rpython/jit/codewriter/flatten.py:306-334`.
+///
+/// `flatten.py:306-334 insert_renamings` runs after each `make_link`
+/// call and emits `<kind>_copy/_push/_pop` ops for every link arg →
+/// target inputarg pair whose post-regalloc colors differ.  Pyre's
+/// walker emits SSARepr inline per Python PC and never runs
+/// `insert_renamings` itself, so links whose link.arg / target.inputarg
+/// map to different walker slots have no equivalent walker emission.
+///
+/// This helper closes the gap by running the same renaming logic
+/// post-walk:
+///   * Single-exit blocks: splice the link's renamings into the
+///     source block's `per_block_ssarepr` BEFORE the terminator
+///     (matches `flatten.py:154 self.insert_renamings(link)` which
+///     runs BEFORE the recursive `make_bytecode_block(link.target)`).
+///   * Multi-exit blocks (POP_JUMP_IF_*, canraise switches): each
+///     exit's renamings are per-edge.  Walker's `goto_if_not` /
+///     `switch` ends the source block; we splice per-link renamings
+///     at the target's entry — but only when the target has a unique
+///     predecessor (otherwise multiple edges' renamings would collide
+///     at the same entry).
+///
+/// **Known incompleteness — multi-predecessor targets.**  Loop
+/// headers, merge blocks, and any other block with `in_degree > 1`
+/// SKIP renamings.  Upstream `flatten.py:306` runs
+/// `insert_renamings(link)` for EVERY link unconditionally, splicing
+/// each link's renamings between its own `Label(link)` and the
+/// recursive `make_bytecode_block(link.target)`.  Pyre's walker
+/// collapses every edge into the target block's entry label, so two
+/// incoming edges with different `(link.arg → target.inputarg)` color
+/// pairings would emit conflicting `<kind>_copy` ops at the same
+/// position.  Faithful upstream parity requires either per-link
+/// trampoline blocks or distinct per-link labels (T6 epic territory);
+/// until that lands, edges that need a copy through a
+/// multi-predecessor target are silently elided here.
+fn walker_post_walk_insert_renamings(
+    graph: &super::flow::FunctionGraph,
+    walker_slot_for_variable: &[Option<u16>],
+    regallocs: &[super::regalloc::GraphAllocationResult; 3],
+    all_walker_blocks: &[SpamBlockRef],
+    walker_pc_live_marker_pos: &mut [Vec<(SpamBlockRef, usize)>],
+) {
+    // Variable → walker slot resolver: bridge first, then graph
+    // regalloc fallback.  Shared regalloc instance (computed once
+    // outside) guarantees same colors as the canonical driver →
+    // byte-equivalent renamings.
+    let get_color = |variable: &super::flow::Variable| -> u16 {
+        if let Some(Some(slot)) = walker_slot_for_variable
+            .get(variable.id.0 as usize)
+            .copied()
+        {
+            return slot;
+        }
+        let kind = variable.kind.unwrap_or(Kind::Ref);
+        regallocs[kind.index()]
+            .coloring
+            .get(&variable.id)
+            .copied()
+            .unwrap_or(u16::MAX)
+    };
+
+    // Reachability DFS from startblock — matches canonical's
+    // `generate_ssa_form` recursive descent (flatten.py:103-104).
+    // `graph.iterblocks()` may include unreachable / pyre-walker-only
+    // blocks (supersede candidates that canonical doesn't visit via
+    // `seen_blocks`); processing them would emit ref_copies for
+    // Variables canonical never sees.
+    let mut reachable: Vec<super::flow::BlockRef> = Vec::new();
+    let mut stack: Vec<super::flow::BlockRef> = vec![graph.startblock.clone()];
+    while let Some(b) = stack.pop() {
+        if reachable.iter().any(|r| r == &b) {
+            continue;
+        }
+        if b.borrow().dead {
+            continue;
+        }
+        reachable.push(b.clone());
+        for exit in &b.borrow().exits {
+            if let Some(target) = exit.borrow().target.clone() {
+                stack.push(target);
+            }
+        }
+    }
+
+    // Pre-compute in-degree per reachable block (number of incoming
+    // links) to identify unique-predecessor targets for multi-exit
+    // insert_renamings.  Multi-predecessor targets (loop headers,
+    // merge points) need per-link trampoline blocks because canonical
+    // emits each link's renamings between `Label(link)` and
+    // `Label(target_block)`, but pyre's walker collapses link labels
+    // to the target's `pc{N}`, losing the per-edge distinction at
+    // the target's entry.  Splicing per-link renamings at a
+    // multi-predecessor target would mix the renamings of different
+    // edges, breaking semantics.
+    let mut in_degree: Vec<(super::flow::BlockRef, usize)> = Vec::new();
+    for b in &reachable {
+        for exit in &b.borrow().exits {
+            if let Some(t) = exit.borrow().target.clone() {
+                if let Some(entry) = in_degree.iter_mut().find(|(r, _)| r == &t) {
+                    entry.1 += 1;
+                } else {
+                    in_degree.push((t, 1));
+                }
+            }
+        }
+    }
+    let in_degree_of = |b: &super::flow::BlockRef| -> usize {
+        in_degree
+            .iter()
+            .find(|(r, _)| r == b)
+            .map(|(_, n)| *n)
+            .unwrap_or(0)
+    };
+
+    // Single-exit blocks: splice each link's renamings into the
+    // source block's `per_block_ssarepr` BEFORE the terminator
+    // (matches `flatten.py:154 self.insert_renamings(link)` running
+    // before the recursive `make_bytecode_block(link.target)`).
+    for block_ref in &reachable {
+        if block_ref.borrow().exits.len() != 1 {
+            continue;
+        }
+        let link_ref = block_ref.borrow().exits[0].clone();
+        if let Some(shift) = emit_link_renamings_into_block(
+            block_ref,
+            &link_ref,
+            &get_color,
+            all_walker_blocks,
+            SpliceSite::SourceBeforeTerminator,
+        ) {
+            shift_walker_pc_tracked_offsets(walker_pc_live_marker_pos, &shift);
+        }
+    }
+
+    // Multi-exit blocks (POP_JUMP_IF_*, canraise switches): each
+    // exit's renamings are per-edge.  Walker's goto_if_not / switch
+    // ends the source block; canonical emits each link's renamings
+    // between `Label(link)` and the target block's body.  For pyre,
+    // splice per-link renamings at the target's entry — but only
+    // when target has unique predecessor (otherwise multiple edges'
+    // renamings would collide at the same entry).  Multi-predecessor
+    // targets remain canonical_unmatched until walker grows distinct
+    // per-link labels (T6 epic) or per-link trampoline blocks.
+    for block_ref in &reachable {
+        let exits = block_ref.borrow().exits.clone();
+        if exits.len() < 2 {
+            continue;
+        }
+        for link_ref in exits {
+            let Some(target_ref) = link_ref.borrow().target.clone() else {
+                continue;
+            };
+            if in_degree_of(&target_ref) > 1 {
+                continue;
+            }
+            if let Some(shift) = emit_link_renamings_into_block(
+                block_ref,
+                &link_ref,
+                &get_color,
+                all_walker_blocks,
+                SpliceSite::TargetAfterAnchor,
+            ) {
+                shift_walker_pc_tracked_offsets(walker_pc_live_marker_pos, &shift);
+            }
+        }
+    }
+}
+
+/// Apply a splice's offset shift to the walker-tracked PC anchor /
+/// live-marker side-tables.  Called immediately after
+/// `emit_link_renamings_into_block` reports a non-empty insertion so
+/// any recorded (block_ref, offset) pair whose offset has been pushed
+/// forward by the insertion stays consistent with the post-splice
+/// `per_block_ssarepr` layout.
+fn shift_walker_pc_tracked_offsets(
+    walker_pc_live_marker_pos: &mut [Vec<(SpamBlockRef, usize)>],
+    shift: &SpliceShift,
+) {
+    let SpliceShift {
+        block_ref,
+        insert_pos,
+        count,
+    } = shift;
+    for entries in walker_pc_live_marker_pos.iter_mut() {
+        for (block, offset) in entries.iter_mut() {
+            if block == block_ref && *offset >= *insert_pos {
+                *offset += *count;
+            }
+        }
+    }
+}
+
+/// Description of a `Vec::insert` shift produced by
+/// [`emit_link_renamings_into_block`]: `count` insns were inserted at
+/// `insert_pos` inside `block_ref`'s `per_block_ssarepr`.
+struct SpliceShift {
+    block_ref: SpamBlockRef,
+    insert_pos: usize,
+    count: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SpliceSite {
+    /// Splice into source block's `per_block_ssarepr` BEFORE the
+    /// trailing terminator (goto / *_return).  Single-exit case.
+    SourceBeforeTerminator,
+    /// Splice into target block's `per_block_ssarepr` AFTER its
+    /// leading Label / `-live-` scaffold.  Multi-exit case with
+    /// unique-predecessor target.
+    TargetAfterAnchor,
+}
+
+fn emit_link_renamings_into_block<F>(
+    source_block: &super::flow::BlockRef,
+    link_ref: &super::flow::LinkRef,
+    get_color: &F,
+    all_walker_blocks: &[SpamBlockRef],
+    site: SpliceSite,
+) -> Option<SpliceShift>
+where
+    F: Fn(&super::flow::Variable) -> u16,
+{
+    let link_borrow = link_ref.borrow();
+    let target_ref = link_borrow.target.clone()?;
+    let target_borrow = target_ref.borrow();
+    if link_borrow.args.len() != target_borrow.inputargs.len() {
+        return None;
+    }
+    // Skip blocks whose target is `returnblock`/`exceptblock`
+    // (`is_final && exits.is_empty()`).  Walker's RETURN_VALUE /
+    // RAISE handlers already emit `ref_return` / `raise` INLINE
+    // at the source block referencing the source stack-slot
+    // color (walker NEW-DEVIATION: upstream defers the return op
+    // to `make_return(target.inputargs)` AFTER insert_renamings
+    // copies link.args → target.inputargs).  Splicing a
+    // `ref_copy stack_color → target_inputarg_color` BEFORE
+    // walker's existing `ref_return stack_color` leaves walker's
+    // terminator reading the un-copied source slot and breaks
+    // SSA allocator coalescing on trivial return functions.
+    if target_borrow.is_final && target_borrow.exits.is_empty() {
+        return None;
+    }
+
+    // `flatten.py:308-311` pair extraction.  Skip pairs whose
+    // src is `last_exception` / `last_exc_value` (they route
+    // through `generate_last_exc` separately, flatten.py:336-347).
+    let mut pairs: Vec<(u16, u16, Kind)> = Vec::new();
+    for (i, arg) in link_borrow.args.iter().enumerate() {
+        let Some(src_value) = arg.as_ref() else {
+            continue;
+        };
+        let Some(src_variable) = src_value.as_variable() else {
+            continue;
+        };
+        let Some(dst_variable) = target_borrow.inputargs[i].as_variable() else {
+            continue;
+        };
+        if Some(src_variable) == link_borrow.last_exception
+            || Some(src_variable) == link_borrow.last_exc_value
+        {
+            continue;
+        }
+        let src_color = get_color(&src_variable);
+        let dst_color = get_color(&dst_variable);
+        let kind = dst_variable.kind.unwrap_or(Kind::Ref);
+        if src_color != dst_color {
+            pairs.push((src_color, dst_color, kind));
+        }
+    }
+    drop(target_borrow);
+    drop(link_borrow);
+
+    if pairs.is_empty() {
+        return None;
+    }
+    // `flatten.py:312 lst.sort(key=lambda(v, w): w.index)`.
+    pairs.sort_by_key(|(_, dst, _)| *dst);
+
+    // `flatten.py:316-318` group by kind; `[T; 3]` indexed by
+    // `Kind::index()` per [[feedback-no-hashmap-ever]].
+    let mut renamings: [(Vec<u16>, Vec<u16>); 3] = [
+        (Vec::new(), Vec::new()),
+        (Vec::new(), Vec::new()),
+        (Vec::new(), Vec::new()),
+    ];
+    for (src, dst, kind) in pairs {
+        let bucket = &mut renamings[kind.index()];
+        bucket.0.push(src);
+        bucket.1.push(dst);
+    }
+
+    // `flatten.py:319-333` per-kind emit via `reorder_renaming_list`.
+    let mut emitted: Vec<super::flatten::Insn> = Vec::new();
+    for &kind in &Kind::ALL {
+        let (frm, to) = &renamings[kind.index()];
+        if frm.is_empty() {
+            continue;
+        }
+        for (src, dst) in majit_translate::jit_codewriter::flatten::reorder_renaming_list(frm, to) {
+            match (src, dst) {
+                (Some(src), Some(dst)) => {
+                    emitted.push(super::flatten::Insn::op_with_result(
+                        format!("{}_copy", kind.as_str()),
+                        vec![super::flatten::Operand::reg(kind, src)],
+                        super::flatten::Register::new(kind, dst),
+                    ));
+                }
+                (Some(src), None) => {
+                    emitted.push(super::flatten::Insn::op(
+                        format!("{}_push", kind.as_str()),
+                        vec![super::flatten::Operand::reg(kind, src)],
+                    ));
+                }
+                (None, Some(dst)) => {
+                    emitted.push(super::flatten::Insn::op_with_result(
+                        format!("{}_pop", kind.as_str()),
+                        Vec::new(),
+                        super::flatten::Register::new(kind, dst),
+                    ));
+                }
+                (None, None) => unreachable!(
+                    "reorder_renaming_list never yields (None, None) per majit/flatten.rs"
+                ),
+            }
+        }
+    }
+
+    if emitted.is_empty() {
+        return None;
+    }
+
+    let splice_block = match site {
+        SpliceSite::SourceBeforeTerminator => source_block.clone(),
+        SpliceSite::TargetAfterAnchor => target_ref,
+    };
+    let Some(spam) = all_walker_blocks
+        .iter()
+        .find(|s| !s.dead() && s.block() == splice_block)
+    else {
+        return None;
+    };
+    let mut spam_borrow = spam.0.borrow_mut();
+    let insns = &mut spam_borrow.per_block_ssarepr;
+    let insert_pos = match site {
+        SpliceSite::SourceBeforeTerminator => {
+            // Forward-scan for the FIRST terminator op and splice
+            // immediately before it.  The caller guards on
+            // `block_ref.borrow().exits.len() == 1`, so the block has
+            // exactly one link and therefore at most one terminator —
+            // the first match is the terminator for the link we are
+            // emitting renamings for, matching `flatten.py:154
+            // insert_renamings(link)` which runs immediately before
+            // `make_bytecode_block(link.target)` (whose first emit is
+            // `goto Label(block)` when target is in `seen_blocks`).
+            //
+            // Trailing content after the terminator (next linear PC's
+            // `Label + -live-` scaffold accumulated under
+            // supersede / fall-through when the same SpamBlock spans
+            // multiple Python PCs) stays AFTER the terminator — it is
+            // not another terminator, so first-match cannot land
+            // there.
+            let terminators = [
+                "goto",
+                "int_return",
+                "ref_return",
+                "float_return",
+                "void_return",
+                "raise",
+                "reraise",
+            ];
+            let mut pos = insns.len();
+            for (i, insn) in insns.iter().enumerate() {
+                if let super::flatten::Insn::Op { opname, .. } = insn {
+                    if terminators.contains(&opname.as_str()) {
+                        pos = i;
+                        break;
+                    }
+                }
+            }
+            pos
+        }
+        SpliceSite::TargetAfterAnchor => {
+            // Skip target's leading scaffold (Label / `-live-`).
+            // Renamings land between the entry label and the first
+            // semantic op so that runtime dispatch into the target
+            // lands on the label, falls through the `-live-`
+            // placeholder, then through the renamings before any
+            // semantic op consumes the target.inputarg registers.
+            let mut pos = 0;
+            for insn in insns.iter() {
+                match insn {
+                    super::flatten::Insn::Label(_) => {
+                        pos += 1;
+                    }
+                    super::flatten::Insn::Op { opname, .. } if opname == "-live-" => {
+                        pos += 1;
+                    }
+                    _ => break,
+                }
+            }
+            pos
+        }
+    };
+    let count = emitted.len();
+    for (offset, insn) in emitted.into_iter().enumerate() {
+        insns.insert(insert_pos + offset, insn);
+    }
+    drop(spam_borrow);
+    Some(SpliceShift {
+        block_ref: spam.clone(),
+        insert_pos,
+        count,
+    })
+}
+
 fn append_exit(block: &super::flow::BlockRef, link: super::flow::LinkRef) {
     append_exit_tagged(block, link, "append_exit");
 }
@@ -860,37 +1260,10 @@ fn append_exit(block: &super::flow::BlockRef, link: super::flow::LinkRef) {
 fn append_exit_tagged(
     block: &super::flow::BlockRef,
     link: super::flow::LinkRef,
-    tag: &'static str,
+    _tag: &'static str,
 ) {
     link.borrow_mut().prevblock = Some(block.downgrade());
     block.borrow_mut().exits.push(link.clone());
-    if std::env::var_os("PYRE_PHASE3_APPEND_EXIT_DIAG").is_some() {
-        let target_addr = link
-            .borrow()
-            .target
-            .as_ref()
-            .map(|t| format!("{:p}", &*t.borrow() as *const _))
-            .unwrap_or_else(|| "<none>".to_string());
-        let b = block.borrow();
-        let exits_summary: Vec<String> = b
-            .exits
-            .iter()
-            .map(|l| {
-                let lb = l.borrow();
-                format!("(ec={:?},llec={:?})", lb.exitcase, lb.llexitcase)
-            })
-            .collect();
-        eprintln!(
-            "[phase3-append-exit] tag={tag} block_addr={:p} → target_addr={} \
-             ops={} exits_now={} exitswitch={:?} shape={:?}",
-            &*b as *const _,
-            target_addr,
-            b.operations.len(),
-            b.exits.len(),
-            b.exitswitch,
-            exits_summary,
-        );
-    }
 }
 
 /// atomically append `link` to `block.exits` and
@@ -1211,16 +1584,6 @@ fn mergeblock(
     pendingblocks: &mut VecDeque<SpamBlockRef>,
     all_walker_blocks: &mut Vec<SpamBlockRef>,
 ) -> SpamBlockRef {
-    if std::env::var_os("PYRE_PHASE3_MERGEBLOCK_DIAG").is_some() {
-        eprintln!(
-            "[phase3-mergeblock] next_offset={} current_block_addr={:p} \
-             current_block_exits={} candidates_at_offset={}",
-            next_offset,
-            &*currentblock.block().borrow() as *const _,
-            currentblock.block().borrow().exits.len(),
-            joinpoints.get(&next_offset).map_or(0, |v| v.len()),
-        );
-    }
     let candidates = joinpoints.entry(next_offset).or_default();
     for index in 0..candidates.len() {
         let block = candidates[index].clone();
@@ -1291,33 +1654,10 @@ fn mergeblock(
         //     self.pendingblocks.append(newblock)
         //
         // Phase A.4 matches upstream: the supersede newblock IS
-        // re-walked under widened inputargs.  Its emit appends a
-        // duplicate `Label("pcN")` + `-live-` pair to ssarepr.insns,
-        // but `pc_anchor_positions` (first-wins) and
-        // `live_marker_indices_by_pc` (last-takes) ensure the
-        // original dead block's bytes remain the runtime canonical
-        // emission for `pcN`.  The supersede re-walk's bytes are
-        // unreachable via pcN labels.
-        if std::env::var_os("PYRE_PHASE3_SUPERSEDE_DIAG").is_some() {
-            let dead_exits_summary: Vec<String> = block
-                .block()
-                .borrow()
-                .exits
-                .iter()
-                .map(|l| {
-                    let lb = l.borrow();
-                    format!("(ec={:?},llec={:?})", lb.exitcase, lb.llexitcase)
-                })
-                .collect();
-            eprintln!(
-                "[phase3-supersede] at next_offset={} dead_exits_before={} \
-                 dead_shape={:?} dead_exitswitch={:?}",
-                next_offset,
-                block.block().borrow().exits.len(),
-                dead_exits_summary,
-                block.block().borrow().exitswitch,
-            );
-        }
+        // re-walked under widened inputargs.  The dead block's
+        // walker accumulator is cleared by `mark_dead`, so the
+        // drain skips it and only the newblock's bytes reach the
+        // final SSARepr.
         block.mark_dead();
         block.block().borrow_mut().operations.clear();
         block.block().borrow_mut().exitswitch = None;
@@ -2628,103 +2968,6 @@ fn register_helper_fn_pointers(
 /// `Label("pcN")` + `-live-` pair per Python PC, including dead
 /// bytecodes that never execute, whereas upstream RPython only
 /// flattens reachable flow-graph blocks.
-use super::flatten::label_pc_index;
-
-fn pc_anchor_positions(ssarepr: &super::flatten::SSARepr, num_pcs: usize) -> Vec<usize> {
-    // Per-PC anchor positions are resolved from `Insn::PcAnchor { py_pc }`
-    // entries.
-    //
-    // Pyre vs RPython label keying (structural difference): RPython uses
-    // `Label(block)` per SpamBlock object (`flatten.py:116
-    // self.emitline(Label(block))`), so two SpamBlocks reaching the same
-    // Python PC carry distinct Label values. Pyre keys labels by Python
-    // PC (`pc{N}` via `pc_label_name`), so two alive SpamBlocks both
-    // joining at PC N emit `Insn::PcAnchor { py_pc: N }` independently —
-    // both can survive R5's dead-block filter when neither is superseded.
-    //
-    // The runtime resolves `pc{N}` to the FIRST anchor in the drained
-    // stream (first-wins below). Subsequent alive duplicates belong to
-    // sibling joinpoint blocks that are reachable from the first anchor
-    // via fall-through inside the walker's PC-sequential emission, so
-    // the first anchor is the canonical entry point per pyre's runtime
-    // dispatch contract. Eliminating duplicates entirely requires
-    // switching pyre's label key from `pc{N}` to block-identity (the
-    // Task #227 walker restructure), at which point this first-wins
-    // semantics retires.
-    let mut positions = vec![usize::MAX; num_pcs];
-    for (insn_idx, insn) in ssarepr.insns.iter().enumerate() {
-        if let Some(py_pc) = label_pc_index(insn) {
-            assert!(
-                py_pc < num_pcs,
-                "pc_anchor_positions: Label pc{py_pc} out of range {num_pcs}"
-            );
-            if positions[py_pc] == usize::MAX {
-                positions[py_pc] = insn_idx;
-            }
-        }
-    }
-    for py_pc in 0..num_pcs {
-        assert_ne!(
-            positions[py_pc],
-            usize::MAX,
-            "pc_anchor_positions: missing Label('pc{py_pc}') for py_pc {py_pc}"
-        );
-    }
-    positions
-}
-
-fn live_marker_indices_by_pc(ssarepr: &super::flatten::SSARepr, num_pcs: usize) -> Vec<usize> {
-    // Map py_pc → anchor insn_idx via `Insn::PcAnchor { py_pc }` entries.
-    // Reuses `pc_anchor_positions`'s first-wins semantics; the documented
-    // pyre-vs-RPython label-keying difference there applies here too.
-    // Position-indexed `Vec<usize>` matches the no-HashMap invariant
-    // (memory `feedback-no-hashmap-ever`).
-    let positions = pc_anchor_positions(ssarepr, num_pcs);
-    // Sort (anchor_idx, py_pc) by anchor_idx to compute scan boundaries
-    // for the per-anchor `-live-` lookup.
-    let mut anchors: Vec<(usize, usize)> = positions
-        .iter()
-        .enumerate()
-        .map(|(py_pc, &insn_idx)| (insn_idx, py_pc))
-        .collect();
-    anchors.sort_by_key(|(insn_idx, _)| *insn_idx);
-    let mut live_indices = vec![usize::MAX; num_pcs];
-    for (anchor_pos, (anchor_idx, py_pc)) in anchors.iter().enumerate() {
-        let end = anchors
-            .get(anchor_pos + 1)
-            .map(|(next_idx, _)| *next_idx)
-            .unwrap_or(ssarepr.insns.len());
-        // Take the LAST -live- marker per anchor pair.
-        // jtransform.py:1708-1712 emits two -live- ops around
-        // jit_merge_point: op3 before (for inlined short preambles)
-        // and op2 after (for do_recursive_call / guard resume).
-        // Pyre's pc_map and filter_liveness_in_place must resolve
-        // to op2 (after jit_merge_point) so that blackhole guard-
-        // failure resume lands past the merge point — otherwise the
-        // blackhole immediately hits bhimpl_jit_merge_point →
-        // ContinueRunningNormally.  Last-wins picks op2.
-        //
-        // For non-merge-point PCs and sibling joinpoint blocks
-        // at the same py_pc, only one -live- exists per anchor
-        // range so first/last are equivalent.
-        let mut live_idx: Option<usize> = None;
-        for insn_idx in (anchor_idx + 1)..end {
-            if ssarepr.insns[insn_idx].is_live() {
-                live_idx = Some(insn_idx);
-            }
-        }
-        live_indices[*py_pc] = live_idx.unwrap_or_else(|| {
-            panic!(
-                "live_marker_indices_by_pc: missing -live- marker for py_pc {} in range {}..{}",
-                py_pc,
-                anchor_idx + 1,
-                end
-            )
-        });
-    }
-    live_indices
-}
-
 fn filter_liveness_in_place(
     ssarepr: &mut super::flatten::SSARepr,
     code: &CodeObject,
@@ -2733,12 +2976,41 @@ fn filter_liveness_in_place(
     stack_slot_color_map: &[u16],
     portal_frame_reg: u16,
     portal_ec_reg: u16,
-) {
+    walker_tracked_pc_live_indices: Option<&[usize]>,
+) -> Vec<usize> {
     use super::flatten::{Kind as SsaKind, Operand as SsaOperand};
-    super::liveness::compute_liveness(ssarepr);
+    // Walker-tracked positions are required: per-PC `-live-` markers
+    // need an explicit protection bitmap so `remove_repeated_live`
+    // doesn't merge across PCs, and the post-merge `live_markers`
+    // vector is built by translating the walker-tracked positions
+    // through the `remove_repeated_live` remap.  The walker's
+    // `walker_pc_live_marker_pos` side-table is the authoritative
+    // source since T6.1 Slice 6 retired the per-PC `Insn::Label`
+    // emission.
+    let walker_tracked = walker_tracked_pc_live_indices
+        .filter(|walker_tracked| walker_tracked.len() == code.instructions.len())
+        .expect(
+            "filter_liveness_in_place: walker_tracked_pc_live_indices must be Some with one \
+             entry per Python PC since T6.1 Slice 6 retired per-PC label emission",
+        );
+    let mut protected_per_pc_live: Vec<bool> = vec![false; ssarepr.insns.len()];
+    for &idx in walker_tracked {
+        if let Some(slot) = protected_per_pc_live.get_mut(idx) {
+            *slot = true;
+        }
+    }
+    let remap = super::liveness::compute_liveness_with_remap(
+        ssarepr,
+        Some(protected_per_pc_live.as_slice()),
+    );
     let live_vars = pyre_jit_trace::state::liveness_for(code as *const _);
     let nlocals = code.varnames.len();
-    let live_markers = live_marker_indices_by_pc(ssarepr, code.instructions.len());
+    // Walker-tracked indices are captured in the
+    // PRE-`remove_repeated_live` ssarepr; translate through the
+    // remap to land on the corresponding NEW index after the merge
+    // pass.
+    let live_markers: Vec<usize> = walker_tracked.iter().map(|&old| remap[old]).collect();
+    let live_markers_out = live_markers.clone();
     for (py_pc, insn_idx) in live_markers.into_iter().enumerate() {
         let existing = match ssarepr.insns.get_mut(insn_idx) {
             Some(insn) if insn.is_live() => insn.live_args_mut().unwrap(),
@@ -2881,6 +3153,7 @@ fn filter_liveness_in_place(
         }
         existing.extend(non_register);
     }
+    live_markers_out
 }
 
 /// Decode `code.exceptiontable` into the structures the dispatch loop
@@ -3254,23 +3527,21 @@ impl CodeWriter {
         // __init__ argument; majit's JitCodeBuilder::set_name mirrors that).
         let mut assembler = SSAReprEmitter::new();
         assembler.set_name(code.obj_name.to_string());
-        // grow an `SSARepr` alongside the direct
-        // `JitCodeBuilder` calls. Currently only a handful of handlers
-        // (`ref_return` below) dual-emit an `Insn::Op`; the remaining
-        // bytecode handlers still route through the builder only. When
-        // every handler has been converted, `ssarepr` becomes the
-        // authoritative input to `jit::assembler::Assembler::assemble`
-        // (Phase 3c switchover) and the direct builder calls disappear.
-        // See `pyre/pyre-jit/src/jit/B6_CODEWRITER_PIPELINE_PLAN.md`.
+        // Grow an `SSARepr` per-block via `push_walker_emit`; at drain
+        // time the per-block accumulators concatenate into
+        // `ssarepr.insns` which feeds
+        // `jit::assembler::Assembler::assemble`.
         let mut ssarepr = SSARepr::new(code.obj_name.to_string());
 
-        // Phase 4 production-flip bridge: each entry maps a graph
-        // `Variable.id` to the SSARepr slot the walker assigned when
-        // emitting the dual-write.  `flatten::flatten_graph_with_walker_slots`
-        // consults it so the canonical-emitted Register matches the walker
-        // slot, enabling per-graph byte-equivalence before the production
-        // splice.  Synthetic graph-only Variables (no walker counterpart)
-        // leave their entry as `None` and fall back to graph regalloc.
+        // Walker slot bridge: each entry maps a graph `Variable.id`
+        // to the SSARepr slot the walker assigned when emitting the
+        // dual-write.  `walker_post_walk_insert_renamings`
+        // consults it so post-walk `insert_renamings` emits `<kind>_copy`
+        // ops against the same walker slots the surrounding inline emits
+        // wrote, matching `flatten.py:306-334` color-resolution semantics
+        // under shared regalloc.  Synthetic graph-only Variables (no
+        // walker counterpart) leave their entry as `None` and fall back
+        // to graph regalloc.
         let mut walker_slot_for_variable: Vec<Option<u16>> = Vec::new();
         // Seed the bridge with the portal `(frame, ec)` red Variables —
         // upstream `jtransform.py:840` threads `frame` (and `ec`) as the
@@ -3529,6 +3800,22 @@ impl CodeWriter {
             all_walker_blocks.push(start_block.clone());
             joinpoints.insert(0, vec![start_block]);
         }
+        // Walker-time PC dispatch tracker.  Records every per-PC
+        // `-live-` marker as `(SpamBlockRef, offset_in_block)` so a
+        // drain-time resolver can pick the FIRST entry whose block
+        // contributes non-empty content to the final SSARepr
+        // (supersede / `mark_dead` clears the per-block accumulator,
+        // so the canonical answer comes from the first entry in a
+        // *live* block).  Vec-of-Vec mirrors `flowcontext.py:42
+        // SpamBlock` where multiple SpamBlocks can record into the
+        // same py_pc through joinpoint candidates
+        // (`flowcontext.py:426 candidates =
+        // self.joinpoints.setdefault(...)`).  Populated at walker
+        // emit time so the runtime can resolve `pc_map` from
+        // walker-tracked positions, without per-PC `Insn::Label`
+        // anchors in the final SSARepr (T6.1 Slice 6).
+        let mut walker_pc_live_marker_pos: Vec<Vec<(SpamBlockRef, usize)>> =
+            vec![Vec::new(); num_instrs];
         let mut catch_landing_blocks: HashMap<u16, SpamBlockRef> =
             HashMap::with_capacity(catch_sites.len());
         for site in &catch_sites {
@@ -3609,14 +3896,12 @@ impl CodeWriter {
         let mut pendingblocks: VecDeque<SpamBlockRef> = VecDeque::new();
         // Upstream `build_flow` relies on `block.dead` alone
         // (`flowcontext.py:404 if not block.dead: record_block(block)`).
-        // Pyre matched this in Phase A.4: the per-PC `emitted_pc_starts`
-        // skip is retired; supersede may re-walk a PC under widened
-        // framestate, producing duplicate `Label("pcN")` + `-live-`
-        // pairs.  Both `pc_anchor_positions` and
-        // `live_marker_indices_by_pc` use first-wins / last-takes
-        // semantics so the runtime canonical bytes are the dead
-        // block's emit; the supersede newblock's re-walk emit is
-        // unreachable via pcN labels.
+        // Pyre matches this: supersede may re-walk a PC under widened
+        // framestate, producing duplicate `-live-` markers.
+        // `walker_pc_live_marker_pos` uses first-live-wins resolution
+        // so the runtime canonical bytes are the dead block's emit;
+        // the supersede newblock's re-walk emit is unreachable
+        // through the resolved `pc_map`.
 
         // interp_jit.py:118 `pypyjitdriver.can_enter_jit(...)` is called in
         // `jump_absolute` (`jumpto < next_instr` branch), i.e. at each
@@ -3674,7 +3959,7 @@ impl CodeWriter {
         // prepares to flip `flatten_graph(graph, regallocs)` as the
         // source of truth.
         macro_rules! emit_vsd {
-            ($depth:expr) => {
+            ($depth:expr, $py_pc:expr) => {
                 if is_portal {
                     let depth_value = (stack_base_absolute + $depth as usize) as i64;
                     // Graph-side shadow: produce a fresh Int Variable
@@ -3682,12 +3967,16 @@ impl CodeWriter {
                     // in a matching `setfield_vable_i` op. Mirrors jtransform.py:844 +
                     // jtransform.py:925 so graph regalloc observes the
                     // liverange of the VSD-sync scratch.
-                    // Graph offsets for these synthetic shadow ops use -1
-                    // — they're emission-time bookkeeping, not tied to a
-                    // Python bytecode PC. `SpaceOperation.offset` is
-                    // advisory in regalloc (`regalloc.rs::make_dependencies`
-                    // doesn't read it); -1 simply distinguishes them from
-                    // real py_pc-anchored ops.
+                    //
+                    // Phase 4 endgame Slice F — record graph offset as the
+                    // walker's current py_pc.  Walker emits emit_vsd!
+                    // INLINE during each PC's handler; canonical
+                    // make_bytecode_block (flatten.rs:2258-2303) sorts ops
+                    // by op.offset for per-PC label interleaving, and
+                    // offset=-1 routes synthetic ops to current_pc (the
+                    // last anchored PC), landing them in the wrong PC's
+                    // region when emit_vsd ran mid-stream.  Recording
+                    // py_pc anchors the synthetic to its actual owning PC.
                     let v_depth: super::flow::FlowValue =
                         super::flow::Constant::signed(depth_value).into();
                     record_graph_op(
@@ -3699,7 +3988,7 @@ impl CodeWriter {
                             VABLE_VALUESTACKDEPTH_FIELD_IDX,
                         ),
                         None,
-                        -1,
+                        ($py_pc) as i64,
                     );
                     emit_vable_setfield_int_const!(
                         portal_frame_reg,
@@ -3877,24 +4166,15 @@ impl CodeWriter {
         macro_rules! emit_goto {
             ($target_py_pc:expr) => {{
                 let target_py_pc = $target_py_pc;
-                let insn = Insn::op(
-                    "goto",
-                    vec![Operand::TLabel(super::flatten::pc_tlabel(target_py_pc))],
-                );
-                push_walker_emit(&current_block, insn);
-                // `rpython/jit/codewriter/flatten.py:111-112`: an
-                // unconditional goto implicitly ends a block so the
-                // liveness pass (`liveness.py:68-69`) can reset the alive
-                // set.
-                push_walker_emit(&current_block, Insn::Unreachable);
-                // `flatten.py:161` `self.emitline('goto',
-                // TLabel(link.target))` is the serialised view of the
-                // same edge.  Phase A.4 retired the back-edge skip
-                // (was Phase 4.C); back-edge mergeblock now creates a
-                // re-walked supersede block, which the relaxed
-                // `live_marker_indices_by_pc` last-takes semantics
-                // tolerates.
-                mergeblock(
+                // T6.1 Slice 5: mergeblock first to learn the target
+                // SpamBlock, then emit `goto` against its block-identity
+                // `TLabel("block{addr}")`.  Mirrors upstream
+                // `flatten.py:161 self.emitline('goto',
+                // TLabel(link.target))` where `link.target` is a Block
+                // identity, not a PC.  The per-PC `Label("pcN")` at the
+                // target's first PC remains a valid branch target until
+                // Slice 6 retires the per-PC labels.
+                let target_block = mergeblock(
                     code,
                     &mut graph,
                     &mut joinpoints,
@@ -3910,6 +4190,18 @@ impl CodeWriter {
                     &mut pendingblocks,
                     &mut all_walker_blocks,
                 );
+                let insn = Insn::op(
+                    "goto",
+                    vec![Operand::TLabel(super::flatten::block_tlabel(
+                        &target_block.block(),
+                    ))],
+                );
+                push_walker_emit(&current_block, insn);
+                // `rpython/jit/codewriter/flatten.py:111-112`: an
+                // unconditional goto implicitly ends a block so the
+                // liveness pass (`liveness.py:68-69`) can reset the alive
+                // set.
+                push_walker_emit(&current_block, Insn::Unreachable);
                 needs_fallthrough = false;
             }};
         }
@@ -4258,9 +4550,9 @@ impl CodeWriter {
                     // terminator emit (`emit_goto!`, `emit_ref_return!`,
                     // `emit_raise!`, `emit_reraise!`, POP_JUMP_IF) and
                     // no joinpoint exists at `py_pc`, this arm still
-                    // returns `current_block` so PcAnchor + `-live-`
-                    // are emitted for pyre's per-PC dispatch invariants
-                    // (`pc_anchor_positions`).  The
+                    // returns `current_block` so the per-PC `-live-`
+                    // marker is emitted for pyre's per-PC dispatch
+                    // invariant (`walker_pc_live_marker_pos`).  The
                     // `block_closed_by_terminator` gate after
                     // `emit_live_placeholder!()` then suppresses op
                     // dispatch into the closed block — mirroring
@@ -4316,22 +4608,28 @@ impl CodeWriter {
                     // fallthrough to whichever block lands next in
                     // walker-pop order.
                     if needs_fallthrough {
+                        // T6.1 Slice 5: emit goto against the new
+                        // block's identity TLabel, matching upstream
+                        // `flatten.py:161` `TLabel(link.target)` where
+                        // `link.target` is a Block, not a PC.
                         let goto_insn = Insn::op(
                             "goto",
-                            vec![Operand::TLabel(super::flatten::pc_tlabel(py_pc))],
+                            vec![Operand::TLabel(super::flatten::block_tlabel(
+                                &new_block.block(),
+                            ))],
                         );
                         push_walker_emit(&current_block, goto_insn);
                         push_walker_emit(&current_block, Insn::Unreachable);
                     }
                     block_switch_pending = true;
                 } else {
-                    // No switch — same block continues at py_pc.  Just
-                    // mark the Label so post-walk dispatch resolves
-                    // `pcN` to this position.  No goto / fallthrough
-                    // bookkeeping needed because `current_block`
-                    // doesn't change.
+                    // No switch — same block continues at py_pc.
+                    // Pyre's runtime `pc_map` is sourced from the
+                    // `walker_pc_live_marker_pos` side-table at drain
+                    // time (see `walker_tracked_pc_live_indices`), so
+                    // we emit only one `Label(block)` per FunctionGraph
+                    // block matching `flatten.py:116`.
                     needs_fallthrough = true;
-                    push_walker_emit(&current_block, Insn::pc_anchor(py_pc));
                 }
             }};
         }
@@ -4433,18 +4731,18 @@ impl CodeWriter {
             ($cond:expr, $py_pc:expr) => {{
                 let cond = $cond;
                 let py_pc = $py_pc;
-                let insn = Insn::op(
-                    "goto_if_not",
-                    vec![
-                        Operand::reg(Kind::Int, cond),
-                        Operand::TLabel(super::flatten::pc_tlabel(py_pc)),
-                    ],
-                );
-                push_walker_emit(&current_block, insn);
-                // `flatten.py:240-267` linkfalse mergeblock.  Phase A.4
-                // retired the back-edge skip so this fires on every
-                // emit, matching upstream's `set_branch` semantic.
-                mergeblock(
+                // `flatten.py:259` — emit bare `-live-` (empty
+                // force_alive) IMMEDIATELY before the guard.  Canonical
+                // (`flatten.rs:1888`) does the same; the bare marker
+                // seeds the guard's liveness snapshot for blackhole
+                // reconstruction.  The per-PC `-live-` with portal red
+                // args lives at the START of each PC's emission, not
+                // here.
+                push_walker_emit(&current_block, Insn::live(Vec::new()));
+                // T6.1 Slice 5: mergeblock first to learn target block
+                // identity, then emit the guard with block-identity
+                // `TLabel`.  `flatten.py:240-267` linkfalse mergeblock.
+                let target_block = mergeblock(
                     code,
                     &mut graph,
                     &mut joinpoints,
@@ -4460,25 +4758,27 @@ impl CodeWriter {
                     &mut pendingblocks,
                     &mut all_walker_blocks,
                 );
+                let insn = Insn::op(
+                    "goto_if_not",
+                    vec![
+                        Operand::reg(Kind::Int, cond),
+                        Operand::TLabel(super::flatten::block_tlabel(&target_block.block())),
+                    ],
+                );
+                push_walker_emit(&current_block, insn);
             }};
         }
         macro_rules! emit_goto_if_not_int_is_zero {
             ($cond:expr, $py_pc:expr) => {{
                 let cond = $cond;
                 let py_pc = $py_pc;
-                let insn = Insn::op(
-                    "goto_if_not_int_is_zero",
-                    vec![
-                        Operand::reg(Kind::Int, cond),
-                        Operand::TLabel(super::flatten::pc_tlabel(py_pc)),
-                    ],
-                );
-                push_walker_emit(&current_block, insn);
-                // same as `emit_goto_if_not!` — the
-                // specialised `int_is_zero` form is the pyre-port of
-                // `flatten.py:247` `goto_if_not_int_is_zero`; Link
-                // shape is identical.
-                mergeblock(
+                // `flatten.py:259` bare `-live-` precedes the guard.
+                push_walker_emit(&current_block, Insn::live(Vec::new()));
+                // T6.1 Slice 5: mergeblock first to learn target block,
+                // then emit guard with block-identity `TLabel`.
+                // `flatten.py:247` `goto_if_not_int_is_zero` shape is
+                // identical to `goto_if_not` save for the opname.
+                let target_block = mergeblock(
                     code,
                     &mut graph,
                     &mut joinpoints,
@@ -4494,6 +4794,14 @@ impl CodeWriter {
                     &mut pendingblocks,
                     &mut all_walker_blocks,
                 );
+                let insn = Insn::op(
+                    "goto_if_not_int_is_zero",
+                    vec![
+                        Operand::reg(Kind::Int, cond),
+                        Operand::TLabel(super::flatten::block_tlabel(&target_block.block())),
+                    ],
+                );
+                push_walker_emit(&current_block, insn);
             }};
         }
 
@@ -4883,9 +5191,10 @@ impl CodeWriter {
         // reconstruction and the per-push cost is recovered only as the
         // optimizer port progresses.
         macro_rules! emit_pushvalue_ref {
-            ($depth:ident, $src:expr, $src_value:expr) => {{
+            ($depth:ident, $src:expr, $src_value:expr, $py_pc:expr) => {{
                 let src_reg = $src;
                 let src_value: super::flow::FlowValue = $src_value;
+                let pushvalue_ref_py_pc: i64 = ($py_pc) as i64;
                 emit_ref_copy!(stack_base + $depth, src_reg);
                 if is_portal {
                     let depth_value = (stack_base_absolute + $depth as usize) as i64;
@@ -4909,7 +5218,7 @@ impl CodeWriter {
                             src_value.into(),
                         ),
                         None,
-                        -1,
+                        pushvalue_ref_py_pc,
                     );
                     emit_vable_setarrayitem_ref_const_idx!(
                         portal_frame_reg,
@@ -4919,7 +5228,7 @@ impl CodeWriter {
                     );
                 }
                 $depth += 1;
-                emit_vsd!($depth);
+                emit_vsd!($depth, pushvalue_ref_py_pc);
             }};
         }
 
@@ -4940,8 +5249,9 @@ impl CodeWriter {
         // All current callers pass `PY_NULL`; the parameter is retained
         // for surface symmetry with `emit_pushvalue_ref!`.
         macro_rules! emit_pushvalue_ref_const {
-            ($depth:ident, $value:expr) => {{
+            ($depth:ident, $value:expr, $py_pc:expr) => {{
                 let value: i64 = $value;
+                let pushvalue_const_py_pc: i64 = ($py_pc) as i64;
                 debug_assert_eq!(
                     value,
                     pyre_object::PY_NULL as i64,
@@ -4961,7 +5271,7 @@ impl CodeWriter {
                             super::flow::Constant::none().into(),
                         ),
                         None,
-                        -1,
+                        pushvalue_const_py_pc,
                     );
                     emit_vable_setarrayitem_ref_const_idx_const_value!(
                         portal_frame_reg,
@@ -4976,7 +5286,7 @@ impl CodeWriter {
                     emit_ref_const_copy!(stack_base + $depth, value);
                 }
                 $depth += 1;
-                emit_vsd!($depth);
+                emit_vsd!($depth, pushvalue_const_py_pc);
             }};
         }
 
@@ -4997,13 +5307,14 @@ impl CodeWriter {
         // assembler.py:109 null ref handling). flatten.rs:1163 lowers
         // it to `ConstRef(0)`.
         macro_rules! emit_popvalue_ref {
-            ($depth:ident) => {{
+            ($depth:ident, $py_pc:expr) => {{
                 // Do not change this to a plain `$depth -= 1` until the
                 // portal stack-depth model is fully aligned with PyPy's
                 // assert-on-underflow behavior.  The direct parity change
                 // makes `synth/comprehensions` crash on both dynasm and
                 // cranelift (`python3 pyre/check.py --synthetic-only
                 // --synthetic-pattern comprehensions.py`).
+                let popvalue_ref_py_pc: i64 = ($py_pc) as i64;
                 $depth = $depth.saturating_sub(1);
                 let popped_reg = stack_base + $depth;
                 if is_portal {
@@ -5019,7 +5330,7 @@ impl CodeWriter {
                             super::flow::Constant::none().into(),
                         ),
                         None,
-                        -1,
+                        popvalue_ref_py_pc,
                     );
                     emit_vable_setarrayitem_ref_const_idx_const_value!(
                         portal_frame_reg,
@@ -5028,7 +5339,7 @@ impl CodeWriter {
                         pyre_object::PY_NULL as i64
                     );
                 }
-                emit_vsd!($depth);
+                emit_vsd!($depth, popvalue_ref_py_pc);
                 popped_reg
             }};
         }
@@ -5041,8 +5352,9 @@ impl CodeWriter {
         // `locals_cells_stack_w` slot mirrors the value loaded into the
         // stack-side SSA register.
         macro_rules! emit_load_fast_ref {
-            ($depth:ident, $reg:expr) => {{
+            ($depth:ident, $reg:expr, $py_pc:expr) => {{
                 let reg = $reg;
+                let load_fast_py_pc: i64 = ($py_pc) as i64;
                 if is_portal {
                     let local_slot = local_to_vable_slot(reg as usize) as i64;
                     let stack_slot = (stack_base_absolute + $depth as usize) as i64;
@@ -5084,7 +5396,7 @@ impl CodeWriter {
                         "getarrayitem_vable_r",
                         vable_getarrayitem_ref_graph_args(frame_var.into(), v_local_idx.into()),
                         Kind::Ref,
-                        -1,
+                        load_fast_py_pc,
                     );
                     pair_walker_slot(
                         &mut walker_slot_for_variable,
@@ -5103,7 +5415,7 @@ impl CodeWriter {
                             loaded.clone().into(),
                         ),
                         None,
-                        -1,
+                        load_fast_py_pc,
                     );
                     emit_vable_setarrayitem_ref_const_idx!(
                         portal_frame_reg,
@@ -5113,7 +5425,7 @@ impl CodeWriter {
                     );
                     current_state.stack.push(loaded);
                     $depth += 1;
-                    emit_vsd!($depth);
+                    emit_vsd!($depth, load_fast_py_pc);
                 } else {
                     let loaded = current_state
                         .locals_w
@@ -5121,22 +5433,32 @@ impl CodeWriter {
                         .and_then(|value| value.clone())
                         .unwrap_or_else(|| fresh_ref_value(&mut graph));
                     current_state.stack.push(loaded.clone());
-                    emit_pushvalue_ref!($depth, reg, loaded);
+                    emit_pushvalue_ref!($depth, reg, loaded, load_fast_py_pc);
                 }
             }};
         }
 
-        // jtransform.py:1898 `do_fixed_list_setitem` vable case +
-        // post-store reg_N mirror. STORE_FAST and its super-inst
-        // relatives (StoreFastLoadFast, StoreFastStoreFast) all
-        // perform the same dual-write pair: when the frame is
-        // portal-virtualizable, write `stored_reg` into the vable
-        // array slot for the local; in every case, `ref_copy` it
-        // into reg_N so super-inst consumers reading reg_N directly
-        // (LoadFastLoadFast / LoadFastBorrowLoadFastBorrow) see the
-        // post-store value. The reg==vable invariant established
-        // here is the foundation for the LFLF vable flip — see
-        // memo super_inst_candidate1_probe_scope_2026_04_23.
+        // `pypy/interpreter/pyframe.py:?? STORE_FAST` lowers
+        // `self.locals_cells_stack_w[varindex] = w_newvalue` to a
+        // single `setarrayitem_vable_r` via `jtransform.py:1898
+        // do_fixed_list_setitem` (vable branch).  Upstream's local
+        // model is the virtualizable array — there is NO separate
+        // local register that mirrors the array slot.  LOAD_FAST
+        // reads via `getarrayitem_vable_r` from the same array
+        // (`jtransform.py:1877 do_fixed_list_getitem`), so the
+        // mirror is redundant on portal frames where push/pop
+        // routes through the array.
+        //
+        // Non-portal frames have no vable; the inline `ref_copy`
+        // is their only stack-maintenance mechanism and LOAD_FAST
+        // (`codewriter.rs:5094-5101 else branch`) reads
+        // Reg(Ref, reg) directly.  Keep the mirror for those.
+        //
+        // Phase 4 endgame slice: dropping the portal mirror is the
+        // first step in retiring walker's raw-register local model.
+        // Subsequent slices will retire the equivalent push-side
+        // `emit_ref_copy!` in `emit_pushvalue_ref!` and the various
+        // CALL / catch-landing inline ref_copies.
         macro_rules! emit_store_local_with_mirror {
             ($reg:expr, $stored_reg:expr) => {{
                 let reg = $reg;
@@ -5148,8 +5470,9 @@ impl CodeWriter {
                         local_to_vable_slot(reg as usize) as i64,
                         stored_reg
                     );
+                } else {
+                    emit_ref_copy!(reg, stored_reg);
                 }
-                emit_ref_copy!(reg, stored_reg);
             }};
         }
 
@@ -5179,12 +5502,11 @@ impl CodeWriter {
                 let start_pc = pending_state.next_offset;
                 // Phase A.4 mirrors upstream's `flowcontext.py:404 if not
                 // block.dead: record_block(block)` identity-only check.
-                // Supersede re-walks under widened framestate produce
-                // duplicate `Label("pcN")` + `-live-` pairs in ssarepr;
-                // `pc_anchor_positions` (first-wins) and
-                // `live_marker_indices_by_pc` (last-takes) keep the
-                // original dead block's bytes canonical for `pcN`
-                // dispatch.
+                // Supersede re-walks under widened framestate may
+                // produce duplicate `-live-` markers for a Python PC;
+                // the walker-tracked `walker_pc_live_marker_pos`
+                // first-live-wins resolver picks the original dead
+                // block's marker as canonical for `pc_map`.
                 current_block = pending_block;
                 current_state = pending_state;
                 current_depth = current_state.stack.len() as u16;
@@ -5193,6 +5515,21 @@ impl CodeWriter {
                 // start of every new block iteration so a previous
                 // block's queued switch doesn't bleed into this one.
                 block_switch_pending = false;
+                // Block-entry `Label(block)` per `flatten.py:116
+                // self.emitline(Label(block))`.  Emitted at the moment
+                // a freshly-popped block becomes `current_block`,
+                // mirroring upstream's recursive `make_bytecode_block`
+                // top.  Skipped when the per-block accumulator already
+                // contains content (mergeblock candidate joins emit
+                // into the block before the pop in some flows).
+                if current_block.per_block_ssarepr_len() == 0 {
+                    push_walker_emit(
+                        &current_block,
+                        super::flatten::Insn::Label(super::flatten::Label::new(
+                            super::flatten::block_label_name(&current_block.block()),
+                        )),
+                    );
+                }
                 // Note — upstream `flowcontext.py:407-416`
                 // drives per-block op accumulation via `while True:
                 // handle_bytecode(...)` until a terminator, then
@@ -5245,23 +5582,13 @@ impl CodeWriter {
                     if block_switch_pending {
                         break;
                     }
-                    // `emit_mark_label_pc!` just pushed `Insn::PcAnchor
-                    // { py_pc }` into the current block's per-block
-                    // accumulator (see the same-block arm at codewriter.rs
-                    // ~3957).  PcAnchor is pyre's per-Python-PC anchor —
-                    // a NEW-DEVIATION from upstream RPython, whose
-                    // `flatten.py` only emits `Label(block)` at block
-                    // entry (`flatten.py:116`) because RPython's runtime
-                    // has no per-PC dispatch concept.  Pyre's blackhole /
-                    // bridge dispatch resolves resume PCs through
-                    // `pc_anchor_positions` (codewriter.rs:2427) +
-                    // `live_marker_indices_by_pc`, both of which scan for
-                    // PcAnchor entries, so the per-PC anchor must stay
-                    // alongside the upstream-orthodox block Labels until
-                    // the dispatcher is refactored to look up by block
-                    // identity instead of py_pc.  `remove_repeated_live`
-                    // breaks its merge run on PcAnchor so each PC keeps
-                    // its own `-live-` marker.
+                    // T6.1 Slice 6: per-PC `Insn::Label("pc{N}")`
+                    // emission retired.  The walker emits one
+                    // block-identity `Label(block)` at block entry
+                    // (`flatten.py:116` parity) and tracks each
+                    // Python PC's `-live-` marker position in
+                    // `walker_pc_live_marker_pos` for `pc_map`
+                    // population at finalize time.
                     depth_at_pc[py_pc] = current_depth;
 
                     // jtransform.py:1708-1712 emits [op3, op1, op2]:
@@ -5335,19 +5662,29 @@ impl CodeWriter {
                     }
 
                     emit_live_placeholder!();
+                    // Record the per-PC `-live-` marker position at
+                    // walker emit time.  `emit_live_placeholder!()`
+                    // pushed the `-live-` as the last insn in
+                    // `current_block.per_block_ssarepr`.  Record EVERY
+                    // emit (not just first) — `mark_dead` later may
+                    // clear the recorded block's accumulator, so the
+                    // drain-time resolver picks the first entry whose
+                    // block contributes non-empty content to the
+                    // final SSARepr.
+                    let offset = current_block.per_block_ssarepr_len() - 1;
+                    walker_pc_live_marker_pos[py_pc].push((current_block.clone(), offset));
 
                     // Dead-code dispatch gate: `current_block` has already
                     // been closed by a previous terminator emit (`emit_goto!`,
                     // `emit_ref_return!`, `emit_raise!`, `emit_reraise!`,
                     // POP_JUMP_IF) that appended a normal-flow / bool /
                     // raise / return exit, and no joinpoint exists at
-                    // `py_pc`.  PcAnchor + `-live-` have been emitted to
-                    // satisfy pyre's per-PC dispatch invariants
-                    // (`pc_anchor_positions`, `live_marker_indices_by_pc`),
-                    // but dispatching the op would append more SpaceOps and
-                    // potentially more exits (orphan `(None,None)` link) to
-                    // the closed block.  Upstream
-                    // `rpython/flowspace/flowcontext.py:407-475` never
+                    // `py_pc`.  The per-PC `-live-` has been emitted to
+                    // satisfy pyre's per-PC dispatch invariant
+                    // (`walker_pc_live_marker_pos`), but dispatching the
+                    // op would append more SpaceOps and potentially more
+                    // exits (orphan `(None,None)` link) to the closed
+                    // block.  Upstream `flowcontext.py:407-475` never
                     // reaches dead-code PCs because `StopFlowing` from
                     // `closeblock` pops the next pending block; pyre's
                     // PC-sequential walker scans through but skips dispatch.
@@ -5432,7 +5769,7 @@ impl CodeWriter {
                         Instruction::LoadFast { var_num }
                         | Instruction::LoadFastBorrow { var_num } => {
                             let reg = var_num.get(op_arg).as_usize() as u16;
-                            emit_load_fast_ref!(current_depth, reg);
+                            emit_load_fast_ref!(current_depth, reg, py_pc);
                         }
 
                         // jtransform.py:1898 do_fixed_list_setitem vable case:
@@ -5443,7 +5780,7 @@ impl CodeWriter {
                         // in scope).
                         Instruction::StoreFast { var_num } => {
                             let reg = var_num.get(op_arg).as_usize() as u16;
-                            let stored_reg = emit_popvalue_ref!(current_depth);
+                            let stored_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let stored = current_state
                                 .stack
                                 .pop()
@@ -5549,7 +5886,7 @@ impl CodeWriter {
                                 .unwrap_or_else(|| fresh_ref_value(&mut graph));
                             current_state.stack.push(stack_value);
                             current_depth += 1;
-                            emit_vsd!(current_depth);
+                            emit_vsd!(current_depth, py_pc);
                         }
 
                         Instruction::LoadConst { consti } => {
@@ -5607,22 +5944,13 @@ impl CodeWriter {
                             // about to consume its result Variable.
                             //
                             // Walker emits the inline `residual_call_ir_r`
-                            // (line 5424) unconditionally for every
-                            // LoadConst regardless of constant shape — the
-                            // runtime must materialize the value into the
-                            // dst_slot register either way.  The graph
-                            // dual-write must mirror that emit so the
-                            // canonical `flatten_graph` driver sees the
-                            // same residual_call_ir_r count.  Previously
-                            // skipped for "recognised Ref" constants (None
-                            // / Bool / Str) under the rationale that
-                            // upstream `jtransform.py` inlines the
-                            // constant; but pyre's pipeline doesn't run
-                            // that inlining pass, so skipping the
-                            // dual-write while still emitting inline
-                            // created a structural divergence visible via
-                            // `PYRE_PHASE3_CANONICAL_OPNAME_DIFF=1`
-                            // (residual_call_ir_r walker > canonical).
+                            // unconditionally for every LoadConst regardless
+                            // of constant shape — the runtime must
+                            // materialize the value into the dst_slot
+                            // register either way.  The graph dual-write
+                            // mirrors that emit so the canonical
+                            // `flatten_graph` driver sees the same
+                            // residual_call_ir_r count.
                             let value = if let Some(pycode_var) = pycode_graph_var {
                                 let loaded = record_residual_call_graph_op(
                                     &mut graph,
@@ -5659,7 +5987,7 @@ impl CodeWriter {
                             };
                             current_state.stack.push(value);
                             current_depth += 1;
-                            emit_vsd!(current_depth);
+                            emit_vsd!(current_depth, py_pc);
                         }
 
                         // CPython super-instructions LOAD_FAST_LOAD_FAST /
@@ -5674,8 +6002,8 @@ impl CodeWriter {
                             let pair = var_nums.get(op_arg);
                             let reg_a = u32::from(pair.idx_1()) as u16;
                             let reg_b = u32::from(pair.idx_2()) as u16;
-                            emit_load_fast_ref!(current_depth, reg_a);
-                            emit_load_fast_ref!(current_depth, reg_b);
+                            emit_load_fast_ref!(current_depth, reg_a, py_pc);
+                            emit_load_fast_ref!(current_depth, reg_b, py_pc);
                         }
 
                         // Super-instruction STORE_FAST; LOAD_FAST: pop TOS into
@@ -5686,7 +6014,7 @@ impl CodeWriter {
                             let pair = var_nums.get(op_arg);
                             let store_reg = u32::from(pair.idx_1()) as u16;
                             let load_reg = u32::from(pair.idx_2()) as u16;
-                            let stored_reg = emit_popvalue_ref!(current_depth);
+                            let stored_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let stored = current_state
                                 .stack
                                 .pop()
@@ -5806,7 +6134,7 @@ impl CodeWriter {
                                 );
                                 current_state.stack.push(loaded);
                                 current_depth += 1;
-                                emit_vsd!(current_depth);
+                                emit_vsd!(current_depth, py_pc);
                             } else {
                                 if let Some(slot) =
                                     current_state.locals_w.get_mut(store_reg as usize)
@@ -5819,7 +6147,7 @@ impl CodeWriter {
                                     .and_then(|value| value.clone())
                                     .unwrap_or_else(|| fresh_ref_value(&mut graph));
                                 current_state.stack.push(loaded.clone());
-                                emit_pushvalue_ref!(current_depth, load_reg, loaded);
+                                emit_pushvalue_ref!(current_depth, load_reg, loaded, py_pc);
                             }
                         }
 
@@ -5831,21 +6159,21 @@ impl CodeWriter {
                             // before the call executes; no write-back conflicts
                             // because ResKind::Void.
                             current_depth -= 1;
-                            emit_vsd!(current_depth);
+                            emit_vsd!(current_depth, py_pc);
                             let key_value = current_state
                                 .stack
                                 .pop()
                                 .unwrap_or_else(|| fresh_ref_value(&mut graph));
                             let key_reg = stack_base + current_depth;
                             current_depth -= 1;
-                            emit_vsd!(current_depth);
+                            emit_vsd!(current_depth, py_pc);
                             let obj_value = current_state
                                 .stack
                                 .pop()
                                 .unwrap_or_else(|| fresh_ref_value(&mut graph));
                             let obj_reg = stack_base + current_depth;
                             current_depth -= 1;
-                            emit_vsd!(current_depth);
+                            emit_vsd!(current_depth, py_pc);
                             let stored_value = current_state
                                 .stack
                                 .pop()
@@ -5877,7 +6205,7 @@ impl CodeWriter {
                         }
 
                         Instruction::PopTop => {
-                            let _ = emit_popvalue_ref!(current_depth);
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let _ = current_state.stack.pop();
                             // flowcontext.py:891 `self.popvalue()`; regalloc.py:
                             // discard = just decrement depth, no bytecode.
@@ -5885,7 +6213,11 @@ impl CodeWriter {
 
                         Instruction::PushNull => {
                             current_state.stack.push(null_stack_sentinel());
-                            emit_pushvalue_ref_const!(current_depth, pyre_object::PY_NULL as i64);
+                            emit_pushvalue_ref_const!(
+                                current_depth,
+                                pyre_object::PY_NULL as i64,
+                                py_pc
+                            );
                         }
 
                         // jtransform.py: rewrite_op_int_add etc.
@@ -5903,13 +6235,13 @@ impl CodeWriter {
                                 .expect("unsupported binary op tag in jitcode lowering")
                                 as i64;
                             // Pop rhs (blackhole will see vsd reflect this pop).
-                            let rhs_reg = emit_popvalue_ref!(current_depth);
+                            let rhs_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let rhs_value = current_state
                                 .stack
                                 .pop()
                                 .unwrap_or_else(|| fresh_ref_value(&mut graph));
                             // Pop lhs.
-                            let lhs_reg = emit_popvalue_ref!(current_depth);
+                            let lhs_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let lhs_value = current_state
                                 .stack
                                 .pop()
@@ -5947,7 +6279,7 @@ impl CodeWriter {
                             );
                             current_state.stack.push(result_value.into());
                             current_depth += 1;
-                            emit_vsd!(current_depth);
+                            emit_vsd!(current_depth, py_pc);
                         }
 
                         // jtransform.py: rewrite_op_int_lt, optimize_goto_if_not
@@ -5955,12 +6287,12 @@ impl CodeWriter {
                             // Same stack-direct pattern as BinaryOp — see its comment.
                             let op_kind = opname.get(op_arg);
                             let op_val = compare_op_tag(op_kind);
-                            let rhs_reg = emit_popvalue_ref!(current_depth);
+                            let rhs_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let rhs_value = current_state
                                 .stack
                                 .pop()
                                 .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                            let lhs_reg = emit_popvalue_ref!(current_depth);
+                            let lhs_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let lhs_value = current_state
                                 .stack
                                 .pop()
@@ -5996,7 +6328,7 @@ impl CodeWriter {
                             );
                             current_state.stack.push(result_value.into());
                             current_depth += 1;
-                            emit_vsd!(current_depth);
+                            emit_vsd!(current_depth, py_pc);
                         }
 
                         // flatten.py:240-260 + blackhole.py:865-869. truth_fn returns
@@ -6017,7 +6349,7 @@ impl CodeWriter {
                             // TOS), so there is no staging copy — mirrors upstream
                             // flatten.py:240-260 which feeds the Variable straight to
                             // `goto_if_not`.
-                            let cond_reg = emit_popvalue_ref!(current_depth);
+                            let cond_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let cond_value = current_state
                                 .stack
                                 .pop()
@@ -6128,7 +6460,7 @@ impl CodeWriter {
                             );
                             // A-slice 7: see PopJumpIfFalse — no obj_tmp0 staging
                             // needed; the residual call reads the popped stack slot.
-                            let cond_reg = emit_popvalue_ref!(current_depth);
+                            let cond_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let cond_value = current_state
                                 .stack
                                 .pop()
@@ -6251,7 +6583,7 @@ impl CodeWriter {
 
                         // flatten.py: int_return / ref_return
                         Instruction::ReturnValue => {
-                            let retval_reg = emit_popvalue_ref!(current_depth);
+                            let retval_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let retval = current_state
                                 .stack
                                 .pop()
@@ -6377,7 +6709,8 @@ impl CodeWriter {
                                 current_state.stack.push(null_stack_sentinel());
                                 emit_pushvalue_ref_const!(
                                     current_depth,
-                                    pyre_object::PY_NULL as i64
+                                    pyre_object::PY_NULL as i64,
+                                    py_pc
                                 );
                             }
                             current_state.stack.push(result_value.clone());
@@ -6387,7 +6720,7 @@ impl CodeWriter {
                             // `emit_ref_copy!(stack_base + current_depth, loaded_dst_reg)`
                             // inside `emit_pushvalue_ref!` is the identity copy
                             // elided by `emit_ref_copy!`'s `dst != src` guard.
-                            emit_pushvalue_ref!(current_depth, loaded_dst_reg, result_value);
+                            emit_pushvalue_ref!(current_depth, loaded_dst_reg, result_value, py_pc);
                         }
 
                         // RPython jtransform.py: rewrite_op_direct_call →
@@ -6407,7 +6740,7 @@ impl CodeWriter {
                             let mut arg_regs_rev: Vec<u16> = Vec::with_capacity(nargs);
                             let mut graph_arg_values_rev = Vec::with_capacity(nargs);
                             for _ in 0..nargs {
-                                let arg_reg = emit_popvalue_ref!(current_depth);
+                                let arg_reg = emit_popvalue_ref!(current_depth, py_pc);
                                 let arg_value = current_state
                                     .stack
                                     .pop()
@@ -6427,12 +6760,12 @@ impl CodeWriter {
                             let arg_regs: Vec<u16> = arg_regs_rev.iter().rev().copied().collect();
                             let arg_values: Vec<super::flow::FlowValue> =
                                 graph_arg_values_rev.iter().rev().cloned().collect();
-                            let callable_reg = emit_popvalue_ref!(current_depth);
+                            let callable_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let callable_value = current_state
                                 .stack
                                 .pop()
                                 .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                            let _ = emit_popvalue_ref!(current_depth); // NULL (discard)
+                            let _ = emit_popvalue_ref!(current_depth, py_pc); // NULL (discard)
                             let _null_or_self = current_state
                                 .stack
                                 .pop()
@@ -6551,14 +6884,11 @@ impl CodeWriter {
                                     ),
                                 );
                                 // Graph-side residual_call_r_r dual-write
-                                // retired (2026-05-17) — replaced by canonical
-                                // driver's `lower_simple_call_hlop_to_insn`
-                                // arm which lowers the `simple_call` HLOp
+                                // retired — replaced by canonical driver's
+                                // `lower_simple_call_hlop_to_insn` arm
+                                // which lowers the `simple_call` HLOp
                                 // recorded above into the same
-                                // `residual_call_r_r` Insn shape.  Keeping
-                                // both produced a double-emission (visible
-                                // via `PYRE_PHASE3_CANONICAL_OPNAME_DIFF=1`
-                                // as `residual_call_r_r delta=+1`).  Matches
+                                // `residual_call_r_r` Insn shape.  Matches
                                 // upstream RPython where `simple_call` IS the
                                 // graph form and `residual_call_r_r` only
                                 // appears post-flatten.
@@ -6566,7 +6896,7 @@ impl CodeWriter {
                             }
                             current_state.stack.push(call_result_value);
                             current_depth += 1;
-                            emit_vsd!(current_depth);
+                            emit_vsd!(current_depth, py_pc);
                         }
 
                         // Python 3.13: ToBool converts TOS to bool before branch.
@@ -6576,7 +6906,7 @@ impl CodeWriter {
 
                         // RPython bhimpl_int_neg: -obj via binary_op(0, obj, NB_SUBTRACT)
                         Instruction::UnaryNegative => {
-                            let operand_reg = emit_popvalue_ref!(current_depth);
+                            let operand_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let operand_value = current_state
                                 .stack
                                 .pop()
@@ -6678,7 +7008,7 @@ impl CodeWriter {
                             }
                             current_state.stack.push(negated.into());
                             current_depth += 1;
-                            emit_vsd!(current_depth);
+                            emit_vsd!(current_depth, py_pc);
                         }
 
                         // JumpBackwardNoInterrupt reuses `backward_jump_target`:
@@ -6707,7 +7037,7 @@ impl CodeWriter {
                             let argc = count.get(op_arg) as usize;
                             if argc > 3 {
                                 for _ in 0..argc {
-                                    let _ = emit_popvalue_ref!(current_depth);
+                                    let _ = emit_popvalue_ref!(current_depth, py_pc);
                                     let _ = current_state
                                         .stack
                                         .pop()
@@ -6716,13 +7046,13 @@ impl CodeWriter {
                                 emit_abort_permanent!();
                                 current_state.stack.push(fresh_ref_value(&mut graph));
                                 current_depth += 1;
-                                emit_vsd!(current_depth);
+                                emit_vsd!(current_depth, py_pc);
                                 continue;
                             }
                             let mut arg_regs_rev: Vec<u16> = Vec::with_capacity(argc);
                             let mut item_values_rev = Vec::with_capacity(argc);
                             for _ in 0..argc {
-                                let item_reg = emit_popvalue_ref!(current_depth);
+                                let item_reg = emit_popvalue_ref!(current_depth, py_pc);
                                 let item_value = current_state
                                     .stack
                                     .pop()
@@ -6784,7 +7114,7 @@ impl CodeWriter {
                             );
                             current_state.stack.push(result_value.into());
                             current_depth += 1;
-                            emit_vsd!(current_depth);
+                            emit_vsd!(current_depth, py_pc);
                         }
 
                         // pyopcode.py:1463 BUILD_SLICE:
@@ -6800,7 +7130,7 @@ impl CodeWriter {
                                 BuildSliceArgCount::Three => 3usize,
                             };
                             let step_info = if raw_argc == 3 {
-                                let reg = emit_popvalue_ref!(current_depth);
+                                let reg = emit_popvalue_ref!(current_depth, py_pc);
                                 let step_value = current_state
                                     .stack
                                     .pop()
@@ -6809,12 +7139,12 @@ impl CodeWriter {
                             } else {
                                 None
                             };
-                            let stop_reg = emit_popvalue_ref!(current_depth);
+                            let stop_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let stop_value = current_state
                                 .stack
                                 .pop()
                                 .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                            let start_reg = emit_popvalue_ref!(current_depth);
+                            let start_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let start_value = current_state
                                 .stack
                                 .pop()
@@ -6847,7 +7177,7 @@ impl CodeWriter {
                             );
                             current_state.stack.push(result_value.into());
                             current_depth += 1;
-                            emit_vsd!(current_depth);
+                            emit_vsd!(current_depth, py_pc);
                         }
 
                         // pyopcode.py:690 RAISE_VARARGS: argc=0 reraise,
@@ -6871,7 +7201,7 @@ impl CodeWriter {
                                         .stack
                                         .pop()
                                         .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                                    let cause_reg = emit_popvalue_ref!(current_depth);
+                                    let cause_reg = emit_popvalue_ref!(current_depth, py_pc);
                                     (
                                         super::flatten::Operand::Register(
                                             super::flatten::Register::new(
@@ -6914,7 +7244,7 @@ impl CodeWriter {
                                     .stack
                                     .pop()
                                     .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                                let exc_reg = emit_popvalue_ref!(current_depth);
+                                let exc_reg = emit_popvalue_ref!(current_depth, py_pc);
                                 // pyopcode.py:711 `exception_is_valid_obj_as_class_w`
                                 // normalization + `set_cause` attachment.  Call ABI
                                 // reads inputs before writing the result; the
@@ -6990,7 +7320,7 @@ impl CodeWriter {
                             // the interpreter; pushing `None` for `prev` breaks
                             // nested exception state (pyopcode.py:786 saves the
                             // previous sys_exc_info so `POP_EXCEPT` can restore it).
-                            let exc_reg = emit_popvalue_ref!(current_depth);
+                            let exc_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let exc_value = current_state
                                 .stack
                                 .pop()
@@ -7069,9 +7399,9 @@ impl CodeWriter {
                             );
                             let prev_value = fresh_ref_value(&mut graph);
                             current_state.stack.push(prev_value.clone());
-                            emit_pushvalue_ref!(current_depth, scratch_prev, prev_value);
+                            emit_pushvalue_ref!(current_depth, scratch_prev, prev_value, py_pc);
                             current_state.stack.push(exc_value.clone());
-                            emit_pushvalue_ref!(current_depth, scratch_exc, exc_value);
+                            emit_pushvalue_ref!(current_depth, scratch_exc, exc_value, py_pc);
                         }
 
                         Instruction::CheckExcMatch => {
@@ -7085,7 +7415,7 @@ impl CodeWriter {
                             // time, but pyre's shadow graph cannot observe the
                             // runtime exception type; the residual helper owns
                             // the check.
-                            let match_type_reg = emit_popvalue_ref!(current_depth);
+                            let match_type_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let match_type_value = current_state
                                 .stack
                                 .pop()
@@ -7147,7 +7477,7 @@ impl CodeWriter {
                             );
                             let result_value = fresh_ref_value(&mut graph);
                             current_state.stack.push(result_value.clone());
-                            emit_pushvalue_ref!(current_depth, scratch_match, result_value);
+                            emit_pushvalue_ref!(current_depth, scratch_match, result_value, py_pc);
                         }
 
                         Instruction::PopExcept => {
@@ -7160,7 +7490,7 @@ impl CodeWriter {
                             // `POP_EXCEPT` the outer handler's exception must be
                             // reinstated as the "current" one so a bare `raise`
                             // re-propagates it.
-                            let prev_reg = emit_popvalue_ref!(current_depth);
+                            let prev_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let prev_value = current_state
                                 .stack
                                 .pop()
@@ -7216,10 +7546,10 @@ impl CodeWriter {
                             let oparg_count = depth.get(op_arg) as usize;
                             if oparg_count >= 1 {
                                 // Discard lasti.
-                                let _ = emit_popvalue_ref!(current_depth);
+                                let _ = emit_popvalue_ref!(current_depth, py_pc);
                                 let _ = current_state.stack.pop();
                             }
-                            let exc_reg = emit_popvalue_ref!(current_depth);
+                            let exc_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let exc_value = current_state
                                 .stack
                                 .pop()
@@ -7236,7 +7566,7 @@ impl CodeWriter {
                             emit_abort_permanent!();
                             current_state.stack.push(fresh_ref_value(&mut graph));
                             current_depth += 1;
-                            emit_vsd!(current_depth);
+                            emit_vsd!(current_depth, py_pc);
                         }
 
                         Instruction::Copy { i } => {
@@ -7247,7 +7577,8 @@ impl CodeWriter {
                                 emit_pushvalue_ref!(
                                     current_depth,
                                     stack_base + current_depth - 1,
-                                    duplicated
+                                    duplicated,
+                                    py_pc
                                 );
                             } else {
                                 // CPython COPY n (n>1): pushes PEEK(n) where
@@ -7268,7 +7599,7 @@ impl CodeWriter {
                                     .unwrap_or_else(|| fresh_ref_value(&mut graph));
                                 current_state.stack.push(src_value.clone());
                                 let src_reg = stack_base + current_depth.saturating_sub(d as u16);
-                                emit_pushvalue_ref!(current_depth, src_reg, src_value);
+                                emit_pushvalue_ref!(current_depth, src_reg, src_value, py_pc);
                             }
                         }
 
@@ -7282,7 +7613,7 @@ impl CodeWriter {
                             // codewriter time, so do not invent a graph op here.
                             emit_abort_permanent!();
                             current_depth += 1;
-                            emit_vsd!(current_depth);
+                            emit_vsd!(current_depth, py_pc);
                         }
                         Instruction::StoreName { .. } | Instruction::StoreGlobal { .. } => {
                             // flowcontext.py marks STORE_NAME unsupported, but the
@@ -7291,7 +7622,7 @@ impl CodeWriter {
                             emit_abort_permanent!();
                             let _ = current_state.stack.pop();
                             current_depth = current_depth.saturating_sub(1);
-                            emit_vsd!(current_depth);
+                            emit_vsd!(current_depth, py_pc);
                         }
                         Instruction::MakeFunction { .. } => {
                             // Pops code object (TOS), pushes function. Net: 0.
@@ -7306,13 +7637,13 @@ impl CodeWriter {
                             let attr_name =
                                 super::flow::Constant::string(code.names[name_idx].as_str());
                             current_depth = current_depth.saturating_sub(1);
-                            emit_vsd!(current_depth);
+                            emit_vsd!(current_depth, py_pc);
                             let obj_value = current_state
                                 .stack
                                 .pop()
                                 .unwrap_or_else(|| fresh_ref_value(&mut graph));
                             current_depth = current_depth.saturating_sub(1);
-                            emit_vsd!(current_depth);
+                            emit_vsd!(current_depth, py_pc);
                             let stored_value = current_state
                                 .stack
                                 .pop()
@@ -7351,7 +7682,7 @@ impl CodeWriter {
                             if attr.is_method() {
                                 current_state.stack.push(null_stack_sentinel());
                                 current_depth += 1;
-                                emit_vsd!(current_depth);
+                                emit_vsd!(current_depth, py_pc);
                             }
                         }
 
@@ -7363,7 +7694,7 @@ impl CodeWriter {
                             let reg_a = u32::from(pair.idx_1()) as u16;
                             let reg_b = u32::from(pair.idx_2()) as u16;
                             for reg in [reg_a, reg_b] {
-                                let stored_reg = emit_popvalue_ref!(current_depth);
+                                let stored_reg = emit_popvalue_ref!(current_depth, py_pc);
                                 let stored = current_state
                                     .stack
                                     .pop()
@@ -7427,7 +7758,7 @@ impl CodeWriter {
                             // push next item: net +1
                             emit_abort_permanent!();
                             current_depth += 1;
-                            emit_vsd!(current_depth);
+                            emit_vsd!(current_depth, py_pc);
                         }
 
                         Instruction::EndFor => {
@@ -7439,7 +7770,7 @@ impl CodeWriter {
                         Instruction::PopIter => {
                             // pop iterator: net -1
                             current_depth = current_depth.saturating_sub(1);
-                            emit_vsd!(current_depth);
+                            emit_vsd!(current_depth, py_pc);
                         }
 
                         // BinarySlice: obj[start:stop] — pops 3 (stop, start, obj), pushes 1 (result).
@@ -8190,7 +8521,7 @@ impl CodeWriter {
                         );
                     }
                     depth += 1;
-                    emit_vsd!(depth);
+                    emit_vsd!(depth, site.handler_py_pc);
                     exc_slot += 1;
                 }
                 // `flatten.py:336-347 generate_last_exc` emits
@@ -8269,7 +8600,7 @@ impl CodeWriter {
                 // `residual_call_*` (via `flatten_arg` Descr handling +
                 // per-shape variant routing) lands.
                 depth += 1;
-                emit_vsd!(depth);
+                emit_vsd!(depth, site.handler_py_pc);
                 emit_goto!(site.handler_py_pc);
             }
         } // end outer drain loop (Phase 4 slice 4)
@@ -8297,43 +8628,200 @@ impl CodeWriter {
         // Drain per-block accumulators into ssarepr.insns in
         // walker-block-creation order.  Mirrors `codewriter.py:53
         // flatten_graph(graph, regallocs, cpu)` shape — block-by-block
-        // emit, no PC interleaving.  Walker-creation order is canonical
-        // because Phase A.4's first-wins `pc_anchor_positions` semantics
-        // depend on the dead block's emit landing before its supersede
-        // newblock's re-walked duplicate.
+        // emit, no PC interleaving.
         //
         // Peel-off optimisation: at every block-switch boundary the
-        // walker emits a defensive `goto TLabel("pcN") + Unreachable`
+        // walker emits a defensive `goto TLabel(block) + Unreachable`
         // pair (the eventual drain order is not known at yield time
         // since `pendingblocks` is mixed push_front / push_back).  This
         // pass strips the pair when the next block actually opens with
-        // a per-PC anchor for the SAME N — turning a runtime no-op
-        // branch into implicit fall-through.  Pyre's per-PC anchor is
-        // `Insn::PcAnchor { py_pc: N }` (NEW-DEVIATION from upstream;
-        // RPython's per-block `Label(block)` has no per-PC concept);
-        // `strip_walker_block_boundary_goto` unifies both anchor shapes
-        // through `pc_label_name(N)`.  Upstream `flatten.py:106-155
+        // a `Label` matching the goto target — turning a runtime no-op
+        // branch into implicit fall-through.  Upstream `flatten.py:106-155
         // make_link` skips the goto outright via recursive descent +
         // `seen_blocks` (`flatten.py:110-113`); pyre's two-phase
         // emit-then-strip approach converges to the same byte stream.
+        //
+        // Compute graph regallocs ONCE pre-drain so walker
+        // insert_renamings and any downstream consumer share identical
+        // colors (HashMap iteration non-determinism between two
+        // separate regalloc calls would otherwise diverge bridge-
+        // fallback Variables' colors).
+        let mut _graph_regallocs =
+            super::regalloc::perform_graph_register_allocation_all_kinds(&graph);
+        super::regalloc::enforce_input_args_simulation(&graph, &mut _graph_regallocs);
+        // Seed `walker_slot_for_variable` with block inputarg slots
+        // BEFORE `walker_post_walk_insert_renamings` reads
+        // it.  The same pairing pass also runs downstream (idempotent
+        // via `pair_walker_slot_if_absent`), but the post-walk
+        // `insert_renamings` color resolution needs the bridge entries
+        // present at the moment the helper runs.
+        for spam in &all_walker_blocks {
+            let Some(state) = spam.framestate() else {
+                continue;
+            };
+            for (idx, value) in state.mergeable().iter().enumerate() {
+                if let Some(super::flow::FlowValue::Variable(v)) = value {
+                    if let Some(slot) = state.mergeable_index_to_slot(idx) {
+                        pair_walker_slot_if_absent(
+                            &mut walker_slot_for_variable,
+                            Some(v.clone()),
+                            slot,
+                        );
+                    }
+                }
+            }
+        }
+        // Walker-tracked per-PC `-live-` marker positions exposed to
+        // the post-drain `pc_map` computation.  Populated inside the
+        // drain block below; consumed by `filter_liveness_in_place`
+        // (translated through the `remove_repeated_live` remap) as the
+        // sole source for `pc_map`.
+        let mut walker_tracked_pc_live_indices_out: Option<Vec<usize>> = None;
         {
-            // RPython parity: `iterblocks` (`flowspace/model.py:55-77`)
-            // enumerates every reachable block including dead ones;
-            // the "no codegen" semantics ride on `block.operations`
-            // being the empty tuple after `mergeblock` cleared it
-            // (`flowcontext.py:455-457`).  Pyre mirrors that in
-            // `SpamBlockRef::mark_dead` by clearing
-            // `per_block_ssarepr` alongside the `dead` flag, so the
-            // unfiltered drain below yields zero insns from dead
-            // blocks while still preserving their position in walker-
-            // creation order (relevant for the supersede newblock's
-            // first-wins `pc_anchor_positions` lookup since the dead
-            // block's now-empty entry no longer competes).
-            let mut blocks: Vec<Vec<super::flatten::Insn>> = all_walker_blocks
+            // Phase 4 endgame — walker post-walk insert_renamings.
+            // Run BEFORE the per-block drain so the splice positions
+            // land in the per_block_ssarepr accumulators.  Mirrors
+            // `flatten.py:154 self.insert_renamings(link)` for the
+            // simple unconditional single-exit case (loop back-edges,
+            // straight-line forward jumps).  Multi-exit blocks
+            // (POP_JUMP_IF_*, canraise) require per-link positional
+            // injection between source-block terminator and each
+            // target-block Label — separate future slice.
+            walker_post_walk_insert_renamings(
+                &graph,
+                &walker_slot_for_variable,
+                &_graph_regallocs,
+                &all_walker_blocks,
+                &mut walker_pc_live_marker_pos,
+            );
+            // Reorder all_walker_blocks per `graph.iterblocks()` DFS
+            // pre-order so the drain matches canonical `make_bytecode_block`
+            // (`flatten.py:107-156`) emission order.  Canonical recurses
+            // into each link's target immediately after emitting the
+            // source's body; iterblocks (`flowspace/model.py:55-77`)
+            // produces the same pre-order via explicit reversed-stack
+            // DFS.  Walker emits per-PC into pendingblocks queue order
+            // which diverges from DFS — block-boundary `goto pcX` ops
+            // whose target isn't the immediately-next walker block
+            // survive `strip_walker_block_boundary_goto` and produce
+            // walker_unmatched against canonical.  Post-walk reorder
+            // by DFS aligns the drain so the strip catches them.
+            //
+            // Dead supersede blocks have empty `per_block_ssarepr`
+            // (cleared by `mark_dead`), so their position in the order
+            // doesn't contribute insns.  Synthetic walker blocks
+            // (catch-landings, blocks not reachable in graph DFS)
+            // append in their original creation order after the
+            // DFS-matched prefix.
+            let dfs_blocks = graph.iterblocks();
+            let mut reordered: Vec<SpamBlockRef> = Vec::with_capacity(all_walker_blocks.len());
+            let mut placed: Vec<bool> = vec![false; all_walker_blocks.len()];
+            for gb in &dfs_blocks {
+                for (idx, spam) in all_walker_blocks.iter().enumerate() {
+                    if !placed[idx] && spam.block() == *gb {
+                        reordered.push(spam.clone());
+                        placed[idx] = true;
+                    }
+                }
+            }
+            for (idx, spam) in all_walker_blocks.iter().enumerate() {
+                if !placed[idx] {
+                    reordered.push(spam.clone());
+                }
+            }
+            let mut blocks: Vec<Vec<super::flatten::Insn>> = reordered
                 .iter()
                 .map(|block| block.per_block_ssarepr())
                 .collect();
+            // Resolve walker-tracked PC live-marker positions to
+            // absolute SSARepr indices using POST-STRIP prefix lengths.
+            // Captured BEFORE strip mutates `blocks` so per-block
+            // offsets stay aligned — strip only truncates the trailing
+            // `goto + Unreachable` pair from a block tail, so the
+            // `-live-` marker positions (which never live in the tail)
+            // are invariant.  Picks the FIRST entry per PC whose block
+            // contributes non-empty content to the final SSARepr.
+            let walker_tracked_pc_indices: Option<Vec<usize>> = {
+                // Compute each block's post-strip length without invoking
+                // `strip_walker_block_boundary_goto` directly: that helper
+                // moves block insns into its return value (via
+                // `Vec::append`), which would zero-out the source blocks
+                // and corrupt the resolver's offset math.  Mirror the
+                // helper's strip-detection rule (goto+Unreachable tail
+                // whose target matches a leading label in any subsequent
+                // block) but only measure the resulting length here.
+                let post_strip_lens: Vec<usize> = (0..blocks.len())
+                    .map(|i| {
+                        let next_label_names: Vec<String> = (i + 1..blocks.len())
+                            .flat_map(|j| {
+                                blocks[j]
+                                    .iter()
+                                    .take_while(|insn| {
+                                        matches!(insn, super::flatten::Insn::Label(_))
+                                    })
+                                    .filter_map(|insn| match insn {
+                                        super::flatten::Insn::Label(l) => Some(l.name.clone()),
+                                        _ => None,
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                            .collect();
+                        let len = blocks[i].len();
+                        let strip_tail = if len >= 2 {
+                            match (&blocks[i][len - 2], &blocks[i][len - 1]) {
+                                (
+                                    super::flatten::Insn::Op { opname, args, .. },
+                                    super::flatten::Insn::Unreachable,
+                                ) if opname == "goto"
+                                    && args.len() == 1
+                                    && matches!(&args[0], Operand::TLabel(target)
+                                        if next_label_names.iter().any(|n| n == &target.name)) =>
+                                {
+                                    2
+                                }
+                                _ => 0,
+                            }
+                        } else {
+                            0
+                        };
+                        len - strip_tail
+                    })
+                    .collect();
+                let mut post_strip_block_starts: Vec<usize> = Vec::with_capacity(blocks.len());
+                let mut running = 0usize;
+                for &len in &post_strip_lens {
+                    post_strip_block_starts.push(running);
+                    running += len;
+                }
+                let resolve_walker_pc =
+                    |records: &Vec<Vec<(SpamBlockRef, usize)>>| -> Option<Vec<usize>> {
+                        let mut translated: Vec<usize> = Vec::with_capacity(records.len());
+                        for py_pc_entries in records {
+                            let resolved = py_pc_entries.iter().find_map(|(block_ref, offset)| {
+                                let block_pos = reordered.iter().position(|b| b == block_ref)?;
+                                if post_strip_lens[block_pos] == 0 {
+                                    return None;
+                                }
+                                if *offset >= post_strip_lens[block_pos] {
+                                    return None;
+                                }
+                                Some(post_strip_block_starts[block_pos] + offset)
+                            });
+                            match resolved {
+                                Some(idx) => translated.push(idx),
+                                None => return None,
+                            }
+                        }
+                        Some(translated)
+                    };
+                resolve_walker_pc(&walker_pc_live_marker_pos)
+            };
             ssarepr.insns = strip_walker_block_boundary_goto(&mut blocks);
+            // Walker-tracked per-PC `-live-` positions are the sole
+            // source of truth for `pc_map`; downstream consumers
+            // (`filter_liveness_in_place`, `pc_map`) translate them
+            // through the `remove_repeated_live` remap.
+            walker_tracked_pc_live_indices_out = walker_tracked_pc_indices;
         }
 
         // codewriter.py:45-47 `for kind in KINDS:
@@ -8399,616 +8887,11 @@ impl CodeWriter {
         // graph-side allocator unconditionally first surfaces any
         // graph topology that the allocator can't process before any
         // downstream code reads from it.
-        let mut _graph_regallocs =
-            super::regalloc::perform_graph_register_allocation_all_kinds(&graph);
-        super::regalloc::enforce_input_args_simulation(&graph, &mut _graph_regallocs);
-
-        // Env-gated invocation of the canonical
-        // `flatten_graph(graph, regallocs, _include_all_exc_links, cpu)`
-        // matching upstream `rpython/jit/codewriter/flatten.py:63-70`.
-        // The result is captured in `canonical_ssarepr` and compared
-        // against the walker-emitted `ssarepr` via op-count diagnostic.
-        // Canonical runs unconditionally per upstream
-        // `codewriter.py:53` — panics fail loud as walker-orthodoxy
-        // regressions.  When `canonical_unmatched=0` AND every Python
-        // PC has a canonical `pc{N}` Label anchor (`pc_coverage_complete`),
-        // the production splice below swaps walker's `ssarepr.insns`
-        // with canonical's; otherwise walker emit is retained.
-        // Diagnostic logs (`[phase3-canonical-*]`) are gated on
-        // `PYRE_PHASE3_CANONICAL_FLATTEN_DIAG=1`.
-        let phase3_diag_on = std::env::var_os("PYRE_PHASE3_CANONICAL_FLATTEN_DIAG").is_some();
-        {
-            // First pass: inventory of Opaque(Ref) constants per
-            // SpaceOp.  These are the line-by-line porting gaps that
-            // need either an upstream-orthodox `rtype_opaque_constants`
-            // pass (matching `rpython/rtyper/rtyper.py:specialize`
-            // substep) or per-call `lower_constant` closure.
-            fn count_opaque_in_arg(
-                arg: &super::flow::SpaceOperationArg,
-                opname: &str,
-                acc: &mut (usize, Vec<(String, String)>),
-            ) {
-                match arg {
-                    super::flow::SpaceOperationArg::Value(super::flow::FlowValue::Constant(c)) => {
-                        if let super::flow::ConstantValue::Opaque(o) = &c.value {
-                            if c.kind == Some(super::flatten::Kind::Ref) || c.kind.is_none() {
-                                acc.0 += 1;
-                                if acc.1.len() < 8 {
-                                    acc.1.push((opname.to_string(), o.repr().to_string()));
-                                }
-                            }
-                        }
-                    }
-                    super::flow::SpaceOperationArg::ListOfKind(list) => {
-                        for inner in &list.content {
-                            if let super::flow::FlowValue::Constant(c) = inner {
-                                if let super::flow::ConstantValue::Opaque(o) = &c.value {
-                                    acc.0 += 1;
-                                    if acc.1.len() < 8 {
-                                        acc.1.push((
-                                            format!("{opname}[list]"),
-                                            o.repr().to_string(),
-                                        ));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            let mut acc: (usize, Vec<(String, String)>) = (0, Vec::new());
-            for block in graph.iterblocks() {
-                for op in &block.borrow().operations {
-                    for arg in &op.args {
-                        count_opaque_in_arg(arg, &op.opname, &mut acc);
-                    }
-                }
-            }
-            if phase3_diag_on && acc.0 > 0 {
-                eprintln!(
-                    "[phase3-canonical-flatten] graph={:?} opaque_ref_count={} samples={:?}",
-                    code.obj_name.as_str(),
-                    acc.0,
-                    acc.1,
-                );
-            }
-            // Pre-flight enumeration of multi-exit blocks whose
-            // exit-link shape may trip `flatten.py:272-296`
-            // `insert_switch_exits`.  Surfaces walker non-orthodoxies
-            // where multiple exits carry inconsistent llexitcase /
-            // exitcase pairs.
-            if std::env::var_os("PYRE_PHASE3_MULTIEXIT_DIAG").is_some() {
-                for (block_index, block_rc) in graph.iterblocks().iter().enumerate() {
-                    let b = block_rc.borrow();
-                    let last_ops: Vec<String> = b
-                        .operations
-                        .iter()
-                        .rev()
-                        .take(3)
-                        .rev()
-                        .map(|op| format!("{}@{}", op.opname, op.offset))
-                        .collect();
-                    let shape: Vec<String> = b
-                        .exits
-                        .iter()
-                        .map(|link| {
-                            let lb = link.borrow();
-                            format!(
-                                "(exitcase={:?}, llexitcase={:?})",
-                                lb.exitcase, lb.llexitcase
-                            )
-                        })
-                        .collect();
-                    eprintln!(
-                        "[phase3-block-diag] graph={:?} block#{} exits={} \
-                         is_final={} exitswitch={:?} inputargs_len={} ops={} \
-                         last_ops={:?} shape={:?}",
-                        code.obj_name.as_str(),
-                        block_index,
-                        b.exits.len(),
-                        b.is_final,
-                        b.exitswitch,
-                        b.inputargs.len(),
-                        b.operations.len(),
-                        last_ops,
-                        shape,
-                    );
-                }
-            }
-            // `flatten_graph` is panic-free across all 18 production
-            // benches as of Slice 8b (commit `28b8e0849d`).  Upstream
-            // `rpython/jit/codewriter/codewriter.py:53` calls it
-            // unconditionally without any safety net; pyre matches that
-            // shape now.  Any future panic surfaces directly — a
-            // walker non-orthodoxy that needs porting per the same
-            // pattern as Slices 4-8.
-            //
-            // Post-walk pairing pass.  Walker per-PC emits seed
-            // `walker_slot_for_variable` for Variables it directly
-            // produces (HLOp results, push/pop slot writes).  Block
-            // INPUTARGS — the Variables in `block.inputargs` set by
-            // `initialize_spam_block` / `make_next_block` / `mergeblock`
-            // from `state.getvariables()` — are NOT seeded by per-PC
-            // emits.  Without the pairing here, canonical
-            // `insert_renamings` would resolve inputarg destinations
-            // via graph regalloc fallback, producing Register indices
-            // that diverge from the walker's slot-numbered destinations.
-            // Walk every block's FrameState `mergeable()` and pair each
-            // Variable with its `mergeable_index_to_slot()` (locals at
-            // `0..nlocals`, stack at `nlocals..nlocals+stackdepth`).
-            // The last_exception pair / portal_extras tail returns
-            // `None` from `mergeable_index_to_slot` and is skipped.
-            for spam in &all_walker_blocks {
-                let Some(state) = spam.framestate() else {
-                    continue;
-                };
-                for (idx, value) in state.mergeable().iter().enumerate() {
-                    if let Some(super::flow::FlowValue::Variable(v)) = value {
-                        if let Some(slot) = state.mergeable_index_to_slot(idx) {
-                            pair_walker_slot_if_absent(
-                                &mut walker_slot_for_variable,
-                                Some(v.clone()),
-                                slot,
-                            );
-                        }
-                    }
-                }
-            }
-            // Task #50 T6 epic slice 1 — derive (BlockRef, pc{N}) name
-            // overrides from `all_walker_blocks` and pass to canonical
-            // so its `Label(block)` / `tlabel_for_block(target)` emit
-            // walker-compatible `pc{N}` names.  Each SpamBlock's
-            // FrameState carries `next_offset` = entry Python PC; that's
-            // the same N walker uses in `emit_mark_label_pc!(py_pc)`.
-            // Blocks without a FrameState (synthetic catch-landing
-            // blocks the walker doesn't anchor at a specific PC) are
-            // skipped — they keep canonical's default `block{N}` name.
-            let mut block_name_overrides: Vec<(super::flow::BlockRef, String)> = Vec::new();
-            for spam in &all_walker_blocks {
-                if let Some(state) = spam.framestate() {
-                    block_name_overrides.push((
-                        spam.block(),
-                        super::flatten::pc_label_name(state.next_offset),
-                    ));
-                }
-            }
-            // Task #50 T6 epic slice 2 — derive (LinkRef, pc{N}) name
-            // overrides for each link in the graph whose target block
-            // has a `pc{N}` name in block_name_overrides above.  The
-            // alias makes canonical's `tlabel_for_link(link)` emit the
-            // same `pc{N}` string that walker uses in `goto_if_not Reg
-            // TLabel("pcN")`, closing the dominant remaining TLabel
-            // operand divergence in byte_equivalent.  Canonical still
-            // emits `Label("pcN")` at the link landing (extra Label
-            // filtered by `count_real_ops` since Label is scaffold);
-            // the runtime's `pc_anchor_positions` first-wins resolves
-            // `pcN` to the link landing byte position which no-ops
-            // (empty renamings for non-portal walker shape) before
-            // falling through to the target block's body.  Links whose
-            // target lacks a FrameState (canonical's synthetic blocks
-            // like returnblock / exceptblock) are skipped — they keep
-            // canonical's default `link{N}` naming.
-            let mut link_name_overrides: Vec<(super::flow::LinkRef, String)> = Vec::new();
-            for graph_block in graph.iterblocks() {
-                for link in &graph_block.borrow().exits {
-                    let Some(target) = link.borrow().target.clone() else {
-                        continue;
-                    };
-                    // Find the target block's pre-seeded pc{N} name via
-                    // the linear scan on block_name_overrides (matches
-                    // canonical's `label_name_for_block` first-match
-                    // semantics).
-                    if let Some((_, name)) = block_name_overrides.iter().find(|(b, _)| b == &target)
-                    {
-                        link_name_overrides.push((link.clone(), name.clone()));
-                    }
-                }
-            }
-            // Task #50 T6 epic slice 4b/4d — derive `(BlockRef, py_pc)`
-            // pairs so canonical emits `Insn::PcAnchor { py_pc }` +
-            // `-live-` placeholder for EVERY Python PC, matching
-            // walker's per-PC anchor shape.  Walker emits PcAnchor +
-            // `-live-` for every py_pc in `0..num_instrs` (per-PC
-            // dispatch is pyre's runtime contract), and
-            // `pc_anchor_positions` asserts every PC has an anchor.
-            // For each py_pc, find the owning SpamBlock via the
-            // most-recent block-entry PC <= py_pc rule (walker's
-            // sequential dispatch behaviour — once it enters a block
-            // it stays there until a block-switch).  Canonical bulk-
-            // emits all anchors a block owns at block entry.
-            // Necessary precondition for the Phase 4 production
-            // splice: with per-PC PcAnchor + `-live-` present,
-            // canonical's SSARepr is runtime-compatible with pyre's
-            // `pc_anchor_positions` / `live_marker_indices_by_pc`
-            // lookups.
-            let mut sorted_entries: Vec<(&SpamBlockRef, usize)> = all_walker_blocks
-                .iter()
-                .filter_map(|s| s.framestate().map(|fs| (s, fs.next_offset)))
-                .collect();
-            // Stable sort preserves walker creation order for ties
-            // (supersede dead+live pair sharing the same entry pc —
-            // the live one's bytes win via dead-block's empty
-            // per_block_ssarepr).
-            sorted_entries.sort_by_key(|(_, pc)| *pc);
-            let mut block_py_pc_overrides: Vec<(super::flow::BlockRef, usize)> = Vec::new();
-            for py_pc in 0..code.instructions.len() {
-                // Most-recent entry <= py_pc owns this PC.
-                let owning = sorted_entries
-                    .iter()
-                    .rev()
-                    .find(|(_, entry_pc)| *entry_pc <= py_pc)
-                    .map(|(s, _)| s.block());
-                if let Some(block) = owning {
-                    block_py_pc_overrides.push((block, py_pc));
-                }
-            }
-            // Phase 4 slice 2 — derive force-alive operands matching
-            // walker's `emit_live_placeholder!` at codewriter.rs:4329.
-            // Portal red args (`reds=['frame', 'ec']`) must reach
-            // `compute_liveness` via per-PC `-live-` operands so the
-            // bridge's `setup_bridge_sym` finds them in the guard's
-            // live R-bank set.
-            let mut live_force_alive_ops: Vec<super::flatten::Operand> = Vec::new();
-            if portal_frame_reg != u16::MAX {
-                live_force_alive_ops.push(super::flatten::Operand::Register(
-                    super::flatten::Register::new(super::flatten::Kind::Ref, portal_frame_reg),
-                ));
-            }
-            if portal_ec_reg != u16::MAX {
-                live_force_alive_ops.push(super::flatten::Operand::Register(
-                    super::flatten::Register::new(super::flatten::Kind::Ref, portal_ec_reg),
-                ));
-            }
-            let canonical_ssarepr = super::flatten::flatten_graph_with_walker_slots(
-                &graph,
-                &mut _graph_regallocs,
-                &walker_slot_for_variable,
-                &block_name_overrides,
-                &link_name_overrides,
-                &block_py_pc_overrides,
-                &live_force_alive_ops,
-                true,
-                Some(self.cpu()),
-            );
-            // Op-only counts (filter out scaffold: Label, PcAnchor,
-            // `-live-`).  Walker emits per-PC PcAnchor + `-live-` for
-            // runtime dispatch (NEW-DEVIATION from upstream).  Canonical
-            // doesn't.  Subtracting scaffold yields a more accurate
-            // gap signal: if walker_ops > canonical_ops, walker has
-            // extra inline emits (over-emission); if equal, only the
-            // scaffold differs (expected pre-tracer-rewrite Task #50).
-            fn count_real_ops(ssarepr: &super::flatten::SSARepr) -> usize {
-                ssarepr
-                    .insns
-                    .iter()
-                    .filter(|insn| match insn {
-                        super::flatten::Insn::Op { opname, .. } => opname != "-live-",
-                        _ => false,
-                    })
-                    .count()
-            }
-            let walker_ops = count_real_ops(&ssarepr);
-            let canonical_ops = count_real_ops(&canonical_ssarepr);
-            // Phase 4 byte-equivalent gate: compare Insn::Op Debug
-            // representations between walker and canonical (Insn does
-            // not derive PartialEq).  Debug formats fold Register
-            // indices + Constant payloads so this surfaces walker_slot
-            // alignment failures alongside structural diffs.  scaffold
-            // (`-live-`, PcAnchor, Label) is filtered out per
-            // `count_real_ops`.
-            fn op_debug_strings(ssarepr: &super::flatten::SSARepr) -> Vec<String> {
-                ssarepr
-                    .insns
-                    .iter()
-                    .filter_map(|insn| match insn {
-                        super::flatten::Insn::Op { opname, .. } if opname != "-live-" => {
-                            Some(format!("{insn:?}"))
-                        }
-                        _ => None,
-                    })
-                    .collect()
-            }
-            let walker_op_set = op_debug_strings(&ssarepr);
-            let canonical_op_set = op_debug_strings(&canonical_ssarepr);
-            let mut matched = 0usize;
-            let mut remaining_canonical: Vec<bool> = vec![true; canonical_op_set.len()];
-            for w in &walker_op_set {
-                for (i, c) in canonical_op_set.iter().enumerate() {
-                    if remaining_canonical[i] && w == c {
-                        remaining_canonical[i] = false;
-                        matched += 1;
-                        break;
-                    }
-                }
-            }
-            let walker_unmatched = walker_op_set.len() - matched;
-            let canonical_unmatched = remaining_canonical.iter().filter(|b| **b).count();
-            let byte_equivalent = walker_unmatched == 0 && canonical_unmatched == 0;
-            if phase3_diag_on {
-                eprintln!(
-                    "[phase3-canonical-flatten] graph={:?} walker_insns={} canonical_insns={} \
-                     delta_insns={:+} walker_ops={} canonical_ops={} delta_ops={:+} \
-                     byte_equivalent={} walker_unmatched={} canonical_unmatched={}",
-                    code.obj_name.as_str(),
-                    ssarepr.insns.len(),
-                    canonical_ssarepr.insns.len(),
-                    canonical_ssarepr.insns.len() as i64 - ssarepr.insns.len() as i64,
-                    walker_ops,
-                    canonical_ops,
-                    canonical_ops as i64 - walker_ops as i64,
-                    byte_equivalent,
-                    walker_unmatched,
-                    canonical_unmatched,
-                );
-            }
-            if std::env::var_os("PYRE_PHASE3_BYTE_DIFF_SAMPLES").is_some() && !byte_equivalent {
-                let mut consumed: Vec<bool> = vec![true; canonical_op_set.len()];
-                // Re-run the match to find canonical's matched indices.
-                for w in &walker_op_set {
-                    for (i, c) in canonical_op_set.iter().enumerate() {
-                        if consumed[i] && w == c {
-                            consumed[i] = false;
-                            break;
-                        }
-                    }
-                }
-                let mut walker_unmatched_samples: Vec<&String> = Vec::new();
-                let mut consumed_for_walker: Vec<bool> = vec![true; canonical_op_set.len()];
-                for w in &walker_op_set {
-                    let mut found = false;
-                    for (i, c) in canonical_op_set.iter().enumerate() {
-                        if consumed_for_walker[i] && w == c {
-                            consumed_for_walker[i] = false;
-                            found = true;
-                            break;
-                        }
-                    }
-                    if !found && walker_unmatched_samples.len() < 16 {
-                        walker_unmatched_samples.push(w);
-                    }
-                }
-                let canonical_unmatched_samples: Vec<&String> = consumed
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, b)| **b)
-                    .map(|(i, _)| &canonical_op_set[i])
-                    .take(16)
-                    .collect();
-                eprintln!(
-                    "[phase3-canonical-flatten-walker-unmatched] graph={:?} samples={:?}",
-                    code.obj_name.as_str(),
-                    walker_unmatched_samples,
-                );
-                eprintln!(
-                    "[phase3-canonical-flatten-canonical-unmatched] graph={:?} samples={:?}",
-                    code.obj_name.as_str(),
-                    canonical_unmatched_samples,
-                );
-            }
-            // Per-opname multiset diff (env-gated separately).  Surfaces
-            // the specific opnames where walker over-emits vs canonical.
-            // Opnames present only on walker side: pyre walker non-orthodoxy
-            // candidates for graph-side porting.  Opnames present only on
-            // canonical side: canonical driver emits something the walker
-            // doesn't (rare; usually `int_copy`/`ref_copy` from canonical's
-            // `insert_renamings` that walker emits inline elsewhere).
-            if std::env::var_os("PYRE_PHASE3_CANONICAL_OPNAME_DIFF").is_some() {
-                fn opname_counts(ssarepr: &super::flatten::SSARepr) -> Vec<(String, usize)> {
-                    let mut pairs: Vec<(String, usize)> = Vec::new();
-                    for insn in &ssarepr.insns {
-                        if let super::flatten::Insn::Op { opname, .. } = insn {
-                            if opname == "-live-" {
-                                continue;
-                            }
-                            if let Some(entry) = pairs.iter_mut().find(|(k, _)| k == opname) {
-                                entry.1 += 1;
-                            } else {
-                                pairs.push((opname.clone(), 1));
-                            }
-                        }
-                    }
-                    pairs
-                }
-                let walker_counts = opname_counts(&ssarepr);
-                let canonical_counts = opname_counts(&canonical_ssarepr);
-                for (opname, w_count) in &walker_counts {
-                    let c_count = canonical_counts
-                        .iter()
-                        .find(|(k, _)| k == opname)
-                        .map(|(_, n)| *n)
-                        .unwrap_or(0);
-                    if *w_count != c_count {
-                        eprintln!(
-                            "[phase3-canonical-opname-diff] graph={:?} opname={:?} \
-                             walker={} canonical={} delta={:+}",
-                            code.obj_name.as_str(),
-                            opname,
-                            w_count,
-                            c_count,
-                            c_count as i64 - *w_count as i64,
-                        );
-                    }
-                }
-                for (opname, c_count) in &canonical_counts {
-                    if !walker_counts.iter().any(|(k, _)| k == opname) {
-                        eprintln!(
-                            "[phase3-canonical-opname-diff] graph={:?} opname={:?} \
-                             walker=0 canonical={} delta=+{} (canonical-only)",
-                            code.obj_name.as_str(),
-                            opname,
-                            c_count,
-                            c_count,
-                        );
-                    }
-                }
-            }
-            // Phase 4 production splice — env-gated.  When
-            // `PYRE_PHASE4_USE_CANONICAL=1` AND canonical's stream is a
-            // strict subset of walker's (canonical_unmatched=0), swap
-            // walker's `ssarepr.insns` with canonical's.  Canonical's
-            // stream is the upstream-orthodox emission (recursive
-            // `make_bytecode_block` DFS + `insert_renamings` at link
-            // boundaries) per `flatten.py:67-83 generate_ssa_form`;
-            // walker's stream carries pyre-only NEW-DEVIATION
-            // scaffold (per-PC defensive goto, inline ref_copy for
-            // stack push/pop) that the canonical driver omits.  With
-            // slices 4b/4c canonical also emits `Insn::PcAnchor` +
-            // `-live-` placeholder so the runtime's
-            // `pc_anchor_positions` / `live_marker_indices_by_pc`
-            // lookups consume it without modification.
-            //
-            // Gate on `canonical_unmatched == 0` (canonical is subset
-            // of walker): swapping in canonical can only REMOVE ops
-            // walker had (the pyre-only scaffold).  All ops canonical
-            // emits also appear in walker, so the runtime semantics
-            // are preserved.  Graphs with `canonical_unmatched > 0`
-            // (fannkuch's 3 insert_renamings ref_copies) are skipped
-            // for now — those require canonical-side ops walker
-            // doesn't have, which would change runtime behavior in
-            // ways that need per-bench verification.
-            //
-            // ENV-GATE REASON: `-live-` args are just
-            // `force_alive` seeds at emit time; actual liveness is
-            // computed by `filter_liveness_in_place` from surrounding
-            // SSARepr ops.  Canonical's stream differs structurally
-            // (canonical insert_renamings ref_copy at link
-            // boundaries; walker emits inline ref_copy at
-            // pushvalue/popvalue) so filter_liveness produces
-            // different per-PC live sets.  Tests in
-            // `eval.rs::test_*_with_compiled_trace_jitcode` query
-            // liveness at specific PCs and fail when canonical's
-            // stream propagates.  Closing requires walker's
-            // ref_copy emission ordering to match canonical's
-            // post-walk insert_renamings — a structural walker
-            // refactor that's a multi-session epic.
-            if canonical_unmatched == 0 && std::env::var_os("PYRE_PHASE4_USE_CANONICAL").is_some() {
-                // Phase 4 slice 3 — PC coverage gate.  pyre's runtime
-                // dispatch (`pc_anchor_positions` at codewriter.rs:2585)
-                // asserts every Python PC has a `pc{N}` Label anchor.
-                // Canonical only emits anchors for blocks it visits via
-                // `make_bytecode_block` DFS; canraise blocks without
-                // trailing `-live-` early-return after the normal link
-                // (`flatten.py:206-217`), skipping catch-link target
-                // blocks and dropping their PcAnchors.  raise_catch_loop
-                // hits this — 68 of 97 PCs missing.  Skip splice when
-                // canonical's anchors don't cover every py_pc; walker
-                // emit remains the production path for those graphs.
-                // Setting `include_all_exc_links=true` would route through
-                // the catch links but exposes walker non-orthodoxy
-                // (7-arg empty-exits final blocks pyre's walker emits at
-                // catch landings); those need separate structural
-                // walker work to retire.
-                let num_pcs = code.instructions.len();
-                let mut emitted_pcs: Vec<usize> = Vec::new();
-                for insn in &canonical_ssarepr.insns {
-                    if let Some(pc) = label_pc_index(insn) {
-                        if !emitted_pcs.contains(&pc) {
-                            emitted_pcs.push(pc);
-                        }
-                    }
-                }
-                let pc_coverage_complete = (0..num_pcs).all(|pc| emitted_pcs.contains(&pc));
-                if !pc_coverage_complete {
-                    if phase3_diag_on {
-                        eprintln!(
-                            "[phase4-production-splice-skip] graph={:?} \
-                             emitted_pcs={} num_pcs={} (canraise / catch-link \
-                             skip — walker emit retained)",
-                            code.obj_name.as_str(),
-                            emitted_pcs.len(),
-                            num_pcs,
-                        );
-                    }
-                } else {
-                    if phase3_diag_on {
-                        eprintln!(
-                            "[phase4-production-splice] graph={:?} walker_insns={} → canonical_insns={}",
-                            code.obj_name.as_str(),
-                            ssarepr.insns.len(),
-                            canonical_ssarepr.insns.len(),
-                        );
-                    }
-                    ssarepr.insns = canonical_ssarepr.insns;
-                }
-            }
-        }
-
-        // Phase 3 (b) Slice 2/3a: env-gated diagnostic that compares
-        // the per-kind ceiling each allocator computes plus the
-        // pre-color Variable set size each one sees.  Slice 3a's
-        // additional `ssa_var_count` / `graph_var_count` lets us
-        // discriminate the divergence root cause:
         //
-        // - `var_count` MATCH but `num_regs` differs → same Variable
-        //   set, different interference structure → Plan B walker-
-        //   order territory.
-        // - `var_count` DIFFERS → different Variable sets → Sub-plan
-        //   B1 / Plan A record_graph_op coverage gap.
-        //
-        // `ssa_var_count` is the distinct `(Kind, idx)` set across
-        // every `Insn::Op` Register operand + result + nested
-        // `ListOfKind` content in the pre-rename SSARepr.
-        // `graph_var_count` is `_graph_regallocs[kind].coloring.len()`
-        // which `perform_graph_register_allocation` populates with one
-        // entry per pre-allocation graph Variable of that kind.
-        // Off-default so production stays silent.
-        if std::env::var_os("PYRE_PHASE3_REGALLOC_DIVERGENCE").is_some() {
-            // Per-kind distinct (Kind, idx) slot index collection.
-            // Kind has exactly 3 variants — index by `Kind as usize`
-            // into a fixed-size `[Vec<u16>; 3]` rather than a HashMap
-            // ([[feedback-no-hashmap-ever]]).  Distinct count =
-            // `sort_unstable + dedup + len`.
-            let mut ssa_slots: [Vec<u16>; 3] = [Vec::new(), Vec::new(), Vec::new()];
-            fn collect_register(op: &super::flatten::Operand, acc: &mut [Vec<u16>; 3]) {
-                match op {
-                    super::flatten::Operand::Register(r) => {
-                        acc[r.kind as usize].push(r.index);
-                    }
-                    super::flatten::Operand::ListOfKind(list) => {
-                        for inner in list.iter() {
-                            collect_register(inner, acc);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            for insn in &ssarepr.insns {
-                if let super::flatten::Insn::Op { args, result, .. } = insn {
-                    for arg in args {
-                        collect_register(arg, &mut ssa_slots);
-                    }
-                    if let Some(r) = result {
-                        ssa_slots[r.kind as usize].push(r.index);
-                    }
-                }
-            }
-            for slots in ssa_slots.iter_mut() {
-                slots.sort_unstable();
-                slots.dedup();
-            }
-            for &kind in &super::flatten::Kind::ALL {
-                let ssa = alloc_result.num_regs[kind.index()];
-                let graph = _graph_regallocs[kind.index()].num_colors;
-                if ssa != graph {
-                    let ssa_var_count = ssa_slots[kind.index()].len();
-                    let graph_var_count = _graph_regallocs[kind.index()].coloring.len();
-                    eprintln!(
-                        "[phase3-regalloc-divergence] graph={:?} kind={:?} ssa_num_regs={} \
-                         graph_num_colors={} delta={:+} ssa_var_count={} graph_var_count={} \
-                         var_delta={:+}",
-                        code.obj_name.as_str(),
-                        kind,
-                        ssa,
-                        graph,
-                        graph as i32 - ssa as i32,
-                        ssa_var_count,
-                        graph_var_count,
-                        graph_var_count as i32 - ssa_var_count as i32,
-                    );
-                }
-            }
-        }
+        // Phase 4 endgame: `_graph_regallocs` is now computed earlier
+        // (pre-drain) so walker insert_renamings shares the same
+        // colors as canonical's pass below.  The duplicate compute is
+        // retired; we reuse the shared instance.
 
         super::regalloc::apply_rename(&mut ssarepr, &alloc_result.rename);
 
@@ -9078,7 +8961,7 @@ impl CodeWriter {
         // pass writes into each `-live-` marker are already the
         // post-rename colors. `filter_liveness_in_place` then splits
         // them into live_i/live_r/live_f per assembler.py:150-152.
-        filter_liveness_in_place(
+        let post_remove_live_indices = filter_liveness_in_place(
             &mut ssarepr,
             code,
             &depth_at_pc,
@@ -9086,14 +8969,22 @@ impl CodeWriter {
             &stack_slot_color_map,
             portal_frame_reg,
             portal_ec_reg,
+            walker_tracked_pc_live_indices_out.as_deref(),
         );
         // Runtime entry/liveness lookups expect the byte offset of the
         // surviving `-live-` marker for each Python PC
         // (`jitcode.get_live_vars_info` first checks `code[pc] ==
-        // op_live`). `remove_repeated_live` may move that marker away
-        // from the per-PC `Label("pcN")` anchor, so record the final
-        // per-PC live-marker positions here instead of the label indices.
-        let pc_map = live_marker_indices_by_pc(&ssarepr, num_instrs);
+        // op_live`).  The walker-tracked `walker_pc_live_marker_pos`
+        // side-table — translated through the `remove_repeated_live`
+        // remap by `filter_liveness_in_place` — is the sole source of
+        // per-PC `-live-` positions; assert one entry per Python PC.
+        assert_eq!(
+            post_remove_live_indices.len(),
+            num_instrs,
+            "filter_liveness_in_place must return one entry per Python PC; \
+             walker-tracked side-table was unavailable"
+        );
+        let pc_map = post_remove_live_indices.clone();
 
         // codewriter.py:62-67 num_regs[kind] = max(coloring)+1
         // (or 0 if coloring is empty). Pass through to the Assembler
@@ -9688,67 +9579,49 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    /// R4 regression test: tail-strip pass must recognise the
-    /// `Insn::PcAnchor { py_pc }` shape the walker emits at PC block
-    /// boundaries (commit 0b016d9bde retired the transitional
-    /// `Insn::Label("pcN")` shape, but the strip recogniser still
-    /// only matched `Insn::Label`, so the defensive
-    /// `goto pcN; ---` pair was left in the drained stream — extra
-    /// control-flow RPython's recursive `make_link` would never
-    /// emit per `flatten.py:106-155`).
+    /// Tail-strip pass folds a `goto + Unreachable` tail into the
+    /// following block when the goto's target name matches a leading
+    /// `Insn::Label` in that block.
     #[test]
-    fn strip_walker_block_boundary_goto_strips_against_pc_anchor() {
-        use super::super::flatten::{Insn, Operand, pc_label_name, pc_tlabel};
+    fn strip_walker_block_boundary_goto_folds_matching_label_tails() {
+        use super::super::flatten::{Insn, Label as FlatLabel, Operand, TLabel};
 
-        let goto = Insn::op("goto", vec![Operand::TLabel(pc_tlabel(7))]);
-        let trailing_unreachable = Insn::Unreachable;
-        let block_a = vec![
+        let target_name = "block_target_7".to_string();
+        let goto = Insn::op(
+            "goto",
+            vec![Operand::TLabel(TLabel::new(target_name.clone()))],
+        );
+        let block_a = vec![Insn::live(Vec::new()), goto, Insn::Unreachable];
+        let block_b = vec![
+            Insn::Label(FlatLabel::new(target_name.clone())),
             Insn::live(Vec::new()),
-            goto.clone(),
-            trailing_unreachable.clone(),
         ];
-        let block_b = vec![Insn::pc_anchor(7), Insn::live(Vec::new())];
         let mut blocks = vec![block_a, block_b];
 
         let drained = super::strip_walker_block_boundary_goto(&mut blocks);
 
-        // Block A's goto + Unreachable were stripped; block B's
-        // PcAnchor opens the fall-through directly.
         assert_eq!(
             drained.len(),
             3,
-            "expected [live, PcAnchor, live] after strip, got {drained:?}",
+            "expected [live, label, live] after strip, got {drained:?}",
         );
         assert!(matches!(drained[0], Insn::Op { ref opname, .. } if opname == "-live-"));
-        assert!(matches!(drained[1], Insn::PcAnchor { py_pc: 7 },));
+        assert!(matches!(&drained[1], Insn::Label(l) if l.name == target_name));
         assert!(matches!(drained[2], Insn::Op { ref opname, .. } if opname == "-live-"));
 
         // The strip should NOT fire when the goto target doesn't
-        // match the next block's anchor.
-        let goto_to_99 = Insn::op("goto", vec![Operand::TLabel(pc_tlabel(99))]);
-        let block_a = vec![Insn::live(Vec::new()), goto_to_99, Insn::Unreachable];
-        let block_b = vec![Insn::pc_anchor(7)];
+        // match the next block's label.
+        let other_name = "block_other_99".to_string();
+        let goto_to_other = Insn::op("goto", vec![Operand::TLabel(TLabel::new(other_name))]);
+        let block_a = vec![Insn::live(Vec::new()), goto_to_other, Insn::Unreachable];
+        let block_b = vec![Insn::Label(FlatLabel::new(target_name))];
         let mut blocks = vec![block_a, block_b];
         let drained = super::strip_walker_block_boundary_goto(&mut blocks);
         assert_eq!(
             drained.len(),
             4,
-            "goto/--- must remain when target != next block's PcAnchor",
+            "goto/--- must remain when target != next block's label",
         );
-
-        // Sanity for the upstream-orthodox `Insn::Label` shape — strip
-        // still works (R4 doesn't regress the Label case).
-        use super::super::flatten::Label as FlatLabel;
-        let label_name = pc_label_name(11);
-        let goto = Insn::op("goto", vec![Operand::TLabel(pc_tlabel(11))]);
-        let block_a = vec![Insn::live(Vec::new()), goto, Insn::Unreachable];
-        let block_b = vec![
-            Insn::Label(FlatLabel::new(label_name)),
-            Insn::live(Vec::new()),
-        ];
-        let mut blocks = vec![block_a, block_b];
-        let drained = super::strip_walker_block_boundary_goto(&mut blocks);
-        assert_eq!(drained.len(), 3, "Insn::Label strip path must also fire");
     }
 
     fn make_runtime_jitcode_with_fnaddr(fnaddr: usize) -> Arc<majit_metainterp::jitcode::JitCode> {
@@ -10721,63 +10594,6 @@ mod tests {
     }
 
     #[test]
-    fn pc_anchor_and_live_marker_rescan_follow_final_ssarepr_order() {
-        let mut ssarepr = SSARepr::new("t");
-        ssarepr.insns.push(Insn::pc_anchor(0));
-        ssarepr
-            .insns
-            .push(Insn::live(vec![Operand::Register(Register::new(
-                Kind::Ref,
-                0,
-            ))]));
-        // PcAnchor is a merge boundary in `remove_repeated_live`, so
-        // each PC keeps its own `-live-` marker without cross-PC
-        // merge-then-reorder.  The anchor scan resolves each PC anchor
-        // at its PcAnchor position; the live marker for each PC stays
-        // at its pre-merge position.
-        ssarepr.insns.push(Insn::pc_anchor(1));
-        ssarepr
-            .insns
-            .push(Insn::live(vec![Operand::Register(Register::new(
-                Kind::Ref,
-                1,
-            ))]));
-
-        crate::jit::liveness::remove_repeated_live(&mut ssarepr);
-
-        // Anchor positions: PcAnchor(0)@0, PcAnchor(1)@2.
-        assert_eq!(pc_anchor_positions(&ssarepr, 2), vec![0, 2]);
-        // Per-PC `-live-` boundaries: live(R0) at index 1,
-        // live(R1) at index 3.
-        assert_eq!(live_marker_indices_by_pc(&ssarepr, 2), vec![1, 3]);
-    }
-
-    #[test]
-    fn live_marker_indices_by_pc_last_wins_for_two_live_per_anchor() {
-        // jtransform.py:1708-1712 emits two -live- around jit_merge_point:
-        //   op3 (-live-) → op1 (jit_merge_point) → op2 (-live-)
-        // last-wins must resolve to op2 so blackhole resume lands past jmp.
-        let mut ssarepr = SSARepr::new("t");
-        // PC 0: single -live- (no merge point)
-        ssarepr.insns.push(Insn::pc_anchor(0));
-        ssarepr
-            .insns
-            .push(Insn::live(vec![Operand::Register(Register::new(
-                Kind::Ref,
-                0,
-            ))]));
-        // PC 1: two -live- (merge point PC) — op3 at idx 3, op2 at idx 5
-        ssarepr.insns.push(Insn::pc_anchor(1));
-        ssarepr.insns.push(Insn::live(vec![])); // op3 (before jmp)
-        ssarepr
-            .insns
-            .push(Insn::op("jit_merge_point", vec![Operand::ConstInt(0)]));
-        ssarepr.insns.push(Insn::live(vec![])); // op2 (after jmp)
-
-        assert_eq!(live_marker_indices_by_pc(&ssarepr, 2), vec![1, 5]);
-    }
-
-    #[test]
     fn filter_liveness_drops_non_lv_live_colors_from_live_r() {
         let code = pyre_interpreter::compile_exec("x = 1\n").expect("source must compile");
         let live_vars = pyre_jit_trace::state::liveness_for(&code as *const _);
@@ -10785,9 +10601,14 @@ mod tests {
             .find(|&py_pc| live_vars.is_reachable(py_pc))
             .expect("compiled code must have a reachable pc");
 
+        // One `-live-` marker per Python PC, recorded in walker-
+        // tracked indices.  filter_liveness_in_place protects each
+        // recorded position from the `remove_repeated_live` merge.
         let mut ssarepr = SSARepr::new("t");
-        for py_pc in 0..code.instructions.len() {
-            ssarepr.insns.push(Insn::pc_anchor(py_pc));
+        let mut walker_tracked_pc_live_indices: Vec<usize> =
+            Vec::with_capacity(code.instructions.len());
+        for _py_pc in 0..code.instructions.len() {
+            walker_tracked_pc_live_indices.push(ssarepr.insns.len());
             ssarepr.insns.push(Insn::live(vec![
                 Operand::Register(Register::new(Kind::Ref, 0)),
                 Operand::Register(Register::new(Kind::Ref, 7)),
@@ -10798,7 +10619,7 @@ mod tests {
         let depth_at_pc: Vec<u16> = vec![0; code.instructions.len()];
         let local_color_map: Vec<u16> = (0..code.varnames.len() as u16).collect();
         let stack_slot_color_map: Vec<u16> = Vec::new();
-        filter_liveness_in_place(
+        let post_remove_live_indices = filter_liveness_in_place(
             &mut ssarepr,
             &code,
             &depth_at_pc,
@@ -10806,9 +10627,10 @@ mod tests {
             &stack_slot_color_map,
             u16::MAX,
             u16::MAX,
+            Some(&walker_tracked_pc_live_indices),
         );
 
-        let live_idx = live_marker_indices_by_pc(&ssarepr, code.instructions.len())[reachable_pc];
+        let live_idx = post_remove_live_indices[reachable_pc];
         let live_args = ssarepr.insns[live_idx]
             .live_args()
             .expect("reachable pc must keep a -live- marker");
