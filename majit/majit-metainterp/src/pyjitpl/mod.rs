@@ -10297,18 +10297,15 @@ impl<M: Clone> MetaInterp<M> {
     ///
     /// Returns `true` if retracing was started, `false` if not possible.
     pub fn start_retrace(&mut self, green_key: u64, fail_index: u32, live_values: &[i64]) -> bool {
-        let Some(root_trace_id) = self.compiled_loops.get(&green_key).map(|c| c.root_trace_id)
-        else {
+        let Some(compiled) = self.compiled_loops.get(&green_key) else {
             return false;
         };
+        let root_trace_id = compiled.root_trace_id;
         // Test-only entry: look up the source descr Arc from the
         // compiled trace's exit_layouts (the production path obtains
         // it from `cpu.get_latest_descr(deadframe)` and threads it
         // through `start_bridge_tracing`).
         let descr_arc = {
-            let Some(compiled) = self.compiled_loops.get(&green_key) else {
-                return false;
-            };
             let Some(trace) = Self::trace_for_exit(compiled, root_trace_id).map(|(_, t)| t) else {
                 return false;
             };
