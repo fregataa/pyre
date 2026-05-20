@@ -2237,12 +2237,12 @@ impl SomeValue {
                 // upstream.
                 if let Some(c) = sb.base.const_box.as_ref()
                     && let crate::flowspace::model::ConstValue::HostObject(_) = &c.value
-                    && let Some(entry) =
-                        crate::translator::rtyper::extregistry::lookup(&c.value)
+                    && let Some(entry) = crate::translator::rtyper::extregistry::lookup(&c.value)
                     && matches!(
                         entry,
                         crate::translator::rtyper::extregistry::ExtRegistryEntry::EnterLeaveMarker { .. }
                             | crate::translator::rtyper::extregistry::ExtRegistryEntry::LoopHeader { .. }
+                            | crate::translator::rtyper::extregistry::ExtRegistryEntry::ForType { .. }
                     )
                 {
                     return entry.compute_annotation_with_kwds(&bk, &kwds_s);

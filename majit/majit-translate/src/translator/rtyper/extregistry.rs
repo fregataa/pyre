@@ -112,6 +112,27 @@ pub enum ExtRegistryEntry {
     ///     # _about_ = self.loop_header (bound method)
     /// ```
     LoopHeader { meta: Arc<JitDriverMeta> },
+    /// Upstream `rpython/rlib/rarithmetic.py:572-582`:
+    ///
+    /// ```python
+    /// class ForTypeEntry(extregistry.ExtRegistryEntry):
+    ///     _about_ = int_type
+    ///     def compute_result_annotation(self, *args_s, **kwds_s):
+    ///         return SomeInteger(knowntype=int_type)
+    ///     def specialize_call(self, hop):
+    ///         v_result, = hop.inputargs(hop.r_result.lowleveltype)
+    ///         hop.exception_cannot_occur()
+    ///         return v_result
+    /// ```
+    ///
+    /// Matches the class object created by `build_int` (rarithmetic.py:
+    /// 546-600).  `instance` carries the class HostObject so
+    /// `compute_result_annotation` can store `knowntype=instance` per
+    /// upstream; signedness is derived from the knowntype itself inside
+    /// `SomeInteger::new_with_knowntype` (`unsigned = knowntype(-1) > 0`
+    /// per model.py:222), so no separate `unsigned` carrier is needed
+    /// here — that would duplicate state RPython does not.
+    ForType { instance: HostObject },
 }
 
 /// Small Send-able annotation payload for static HostObject type
@@ -151,6 +172,9 @@ pub enum ExtRegistryEntryKey {
     LoopHeader {
         driver_identity: usize,
     },
+    ForType {
+        instance_identity: usize,
+    },
 }
 
 impl ExtRegistryEntry {
@@ -178,6 +202,9 @@ impl ExtRegistryEntry {
             }
             ExtRegistryEntry::LoopHeader { meta } => ExtRegistryEntryKey::LoopHeader {
                 driver_identity: meta.id.identity_id(),
+            },
+            ExtRegistryEntry::ForType { instance } => ExtRegistryEntryKey::ForType {
+                instance_identity: instance.identity_id(),
             },
         }
     }
@@ -260,6 +287,23 @@ impl ExtRegistryEntry {
                 None,
                 Some(crate::rlib::jit_marker::LOOP_HEADER_METHOD_NAME.to_string()),
             ))),
+            // upstream extregistry.py:58-67 base implementation —
+            // `ForTypeEntry` inherits `compute_annotation` returning
+            // `SomeBuiltin(self.compute_result_annotation,
+            //              methodname=getattr(self.instance, '__name__', None))`.
+            // The actual `compute_result_annotation` runs at simple_call
+            // time via [`Self::compute_annotation_with_kwds`].
+            ExtRegistryEntry::ForType { instance, .. } => {
+                let mut result = SomeBuiltin::new(
+                    instance.qualname().to_string(),
+                    None,
+                    Some(instance.qualname().to_string()),
+                );
+                result.base.const_box = Some(crate::flowspace::model::Constant::new(
+                    ConstValue::HostObject(instance.clone()),
+                ));
+                Ok(SomeValue::Builtin(result))
+            }
         }
     }
 
@@ -291,6 +335,27 @@ impl ExtRegistryEntry {
             // `annmodel.s_None` and ignores any kwds (loop_header
             // takes only `self` upstream).
             ExtRegistryEntry::LoopHeader { .. } => Ok(s_none()),
+            // upstream rarithmetic.py:574-577 — `ForTypeEntry.\
+            // compute_result_annotation(self, *args_s, **kwds_s)` returns
+            // `SomeInteger(knowntype=int_type)`.  The instance is the int
+            // class object (`r_uint`, `r_ulonglong`, ...); pyre records
+            // it via `KnownType::Ruint` for r_uint and falls back to the
+            // generic untyped class until the KnownType enum gains entries
+            // for other ForType instances.  Signedness is derived inside
+            // `new_with_knowntype` per model.py:222 — no separate
+            // `unsigned` argument is passed (matches `SomeInteger(
+            // knowntype=int_type)` upstream).
+            ExtRegistryEntry::ForType { instance } => {
+                let knowntype = if instance.qualname() == "rarithmetic.r_uint" {
+                    crate::annotator::model::KnownType::Ruint
+                } else {
+                    crate::annotator::model::KnownType::Other
+                };
+                let _ = bookkeeper;
+                Ok(SomeValue::Integer(
+                    crate::annotator::model::SomeInteger::new_with_knowntype(false, knowntype),
+                ))
+            }
             other => other.compute_annotation_bk(bookkeeper),
         }
     }
@@ -337,6 +402,23 @@ impl ExtRegistryEntry {
                      specialize_marker_call (rbuiltin.rs::BuiltinFunctionRepr::_call) — \
                      `findbltintyper` cannot capture marker meta in a function pointer",
                 ))
+            }
+            // upstream rarithmetic.py:579-582 — `ForTypeEntry.\
+            // specialize_call(self, hop)` reads `hop.inputarg(hop.r_result.\
+            // lowleveltype, arg=1)` and returns it directly.  Pyre's
+            // `rtype_r_uint` (rbuiltin.rs) mirrors this verbatim;
+            // returning the function pointer here completes the
+            // extregistry dispatch surface end-to-end.
+            ExtRegistryEntry::ForType { instance, .. } => {
+                if instance.qualname() == "rarithmetic.r_uint" {
+                    Ok(super::rbuiltin::rtype_r_uint as BuiltinTyperFn)
+                } else {
+                    Err(TyperError::message(format!(
+                        "ExtRegistryEntry::ForType: specialize_call for {} is not yet wired \
+                         (rarithmetic.r_uint is the only int-class instance registered today)",
+                        instance.qualname()
+                    )))
+                }
             }
         }
     }
@@ -518,6 +600,19 @@ pub fn register_host_value(host: HostObject, entry: ExtRegistryEntry) -> Result<
     }
     registry.insert(host, entry);
     Ok(())
+}
+
+/// Register `rarithmetic.r_uint` as an `ExtRegistryEntry::ForType`
+/// value-level entry mirroring upstream `ForTypeEntry(_about_=r_uint)`
+/// (rarithmetic.py:572-582).  Called from `HOST_ENV::populate_host_env`
+/// so the registration runs once during the first HOST_ENV access; a
+/// duplicate registration call is tolerated since `populate_host_env`
+/// is itself OnceLock-gated.
+pub fn register_r_uint(host: HostObject) {
+    let mut registry = host_value_registry().lock().unwrap();
+    registry
+        .entry(host.clone())
+        .or_insert(ExtRegistryEntry::ForType { instance: host });
 }
 
 /// Rust equivalent of `AutoRegisteringType._register_type`.

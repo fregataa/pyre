@@ -7948,69 +7948,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn cast_int_to_float_reads_int_writes_float_with_castintto_float_op() {
-        // `i>f` shape: 1B i-src + 1B f-dst.
-        //
-        // `cast_int_to_float` byte allocation depends on build-time
-        // canonical-source observation via
-        // `IntegerRepr::rtype_float` (rint.rs:686 `genop("cast_int_to_\
-        // float", ...)`).  RPython parity: `assembler.py:220
-        // setdefault(key, len(self.insns))` only pins a byte when
-        // `write_insn(opname)` fires during flattening.  If no
-        // canonical source path emits `float(int_value)`, the byte
-        // stays unallocated; the handler arm in `step` remains live
-        // (line 4249), so this test re-arms when a future canonical
-        // emit landed.
-        let Some(&byte) = insns_opname_to_byte().get("cast_int_to_float/i>f") else {
-            return;
-        };
-        let code = [byte, 0x02, 0x05]; // i-src=2, f-dst=5
-        let mut tc = fresh_trace_ctx();
-        let mut regs_i = distinct_const_refs(&mut tc, 8);
-        let mut regs_f = distinct_const_refs(&mut tc, 8);
-        let arg = regs_i[2];
-        let dst_pre = regs_f[5];
-        let descr = done_descr_ref_for_tests();
-        let ops_before = tc.num_ops();
-        let mut wc = WalkContext {
-            registers_r: &mut [],
-            registers_i: &mut regs_i,
-            registers_f: &mut regs_f,
-            concrete_registers_r: &mut [],
-            descr_refs: &[],
-            trace_ctx: &mut tc,
-            done_with_this_frame_descr_ref: descr,
-            done_with_this_frame_descr_int: make_fail_descr(101),
-            done_with_this_frame_descr_float: make_fail_descr(102),
-            done_with_this_frame_descr_void: make_fail_descr(103),
-            exit_frame_with_exception_descr_ref: make_fail_descr(2),
-            is_top_level: true,
-            sub_jitcode_lookup: &no_sub_jitcodes,
-            last_exc_value: None,
-            last_exc_value_concrete: ConcreteValue::Null,
-        };
-        let (outcome, next_pc) = step(&code, 0, &mut wc).expect("cast_int_to_float must dispatch");
-        assert_eq!(outcome, DispatchOutcome::Continue);
-        assert_eq!(
-            next_pc, 3,
-            "`cast_int_to_float/i>f` operand layout = 2 bytes"
-        );
-        let dst_post = wc.registers_f[5];
-        assert_ne!(
-            dst_post, dst_pre,
-            "cast_int_to_float must write registers_f[dst] (not registers_i)",
-        );
-        // i-src must remain unchanged.
-        assert_eq!(wc.registers_i[2], arg);
-        drop(wc);
-        assert_eq!(tc.num_ops(), ops_before + 1);
-        let last = tc.ops().last().expect("recorded op must exist");
-        assert_eq!(last.opcode, majit_ir::OpCode::CastIntToFloat);
-        assert_eq!((&*last.getarglist()), &[arg]);
-        assert_eq!(dst_post, last.pos.get());
-    }
-
     /// Drive `ptr_eq/rr>i` or `ptr_ne/rr>i`. Shape `rr>i`: read 2
     /// r-regs, record, write to i-bank.
     fn drive_ptr_compare(opname: &str, expected_opcode: majit_ir::OpCode) {

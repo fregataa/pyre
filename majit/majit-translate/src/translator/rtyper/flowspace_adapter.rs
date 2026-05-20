@@ -885,16 +885,29 @@ pub fn translate_op(
                     //    resolution still respects the same scope
                     //    boundary.
                     //
-                    // The fallback IS implicitly bounded by HOST_ENV's
-                    // curation: `import_module` returns `Some` only for
-                    // prefixes registered in `flowspace/model.rs::\
-                    // populate_host_env` (currently `rpython.rlib.*`,
-                    // `rpython.rtyper.*`, `os`, `sys`, `__builtin__`).
-                    // An arbitrary user path that misses both
-                    // PyreCallRegistry and HOST_ENV falls through to
-                    // the final `TyperError` — surfaced loudly so
-                    // missing registrations show up at typing time
-                    // rather than as a silent host-attribute call.
+                    // PRE-EXISTING-ADAPTATION: Layer 3 is wider than upstream's
+                    // LOAD_GLOBAL + LOAD_ATTR chain.  Upstream requires the leading
+                    // module (`lltype`, `rarithmetic`, ...) to be in the caller's
+                    // per-function `frame.globals`, populated by the function's
+                    // `from ... import` statements (`flowcontext.py:845-866`).
+                    // Pyre's frontend reads `syn::Expr::Path` segments verbatim
+                    // (`front/ast.rs::canonical_call_target` at line 7572) — it
+                    // qualifies 1-segment paths with the file's `module_prefix` but
+                    // does NOT consult `use_imports`, so the typer here cannot tell
+                    // which caller's import scope a path came from.  Implicit
+                    // gating exists at the Rust compilation layer (the path must
+                    // resolve at compile time, requiring a `use` statement, an
+                    // absolute path, or the prelude), but that gating is
+                    // file-scoped (Rust `use` is module-level), not
+                    // function-scoped like upstream's `frame.globals`.  An
+                    // unregistered prefix routes to the explicit `TyperError`
+                    // below; an HOST_ENV-curated path resolves without the
+                    // per-function gate that upstream's bytecode loop applies.
+                    // Convergence path: thread per-file `use_imports`
+                    // (`ParsedInterpreter.use_imports`, aggregated in
+                    // `CallControl::use_imports`) to `translate_op` via the
+                    // graph's source-file identity, then gate Layer 3 on
+                    // `segments[0]` membership in the caller's `use_imports`.
                     let callable_host = if let Some(entry) = call_registry.lookup(&key) {
                         entry.host_object.clone()
                     } else if segments.len() == 1

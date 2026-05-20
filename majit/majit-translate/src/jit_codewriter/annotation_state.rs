@@ -60,6 +60,26 @@ pub fn valuetype_to_someshell(vt: &ValueType) -> Option<SomeValue> {
             // flags={})` (model.py:438).  Upstream-orthodox abstract
             // instance for cases where the bookkeeper has not yet
             // narrowed the ClassDef.
+            //
+            // PRE-EXISTING-ADAPTATION (typed-ref-someptr-followup-epic
+            // Phase 3, blocked on M2.5g): for typed `&Foo` Rust
+            // references the upstream-orthodox lift is
+            // `SomePtr(ll_ptrtype)` (`llannotation.py:64-70`), not
+            // `SomeInstance(classdef=None)`.  Pyre's
+            // `front/ast.rs::classify_fn_arg_ty` collapses `&T`/`*T`
+            // into `ValueType::Ref` without a Ptr-carrier variant
+            // because the surface DSL has no `lltype.*` HostObject,
+            // so this fallback receives both genuine "un-narrowed
+            // instance" cases AND typed-ref cases.  Producers that
+            // already know the operand is a typed pointer should call
+            // `AnnotationState::set_some(vid, SomeValue::Ptr(
+            // SomePtr::new(t)))` directly to bypass this fallback —
+            // the downstream `cast_ptr_to_int` typer's late
+            // InstanceRepr→PtrRepr swap (`rbuiltin.rs:2174-2194`)
+            // exists specifically because no such producer is wired
+            // for typed `&Foo` yet.  Convergence: M2.5g registry
+            // walker lands → frontend lifts typed `&Foo` directly to
+            // `SomeValue::Ptr` at `value_type_for_type` time.
             Some(SomeValue::Instance(SomeInstance::new(
                 None,
                 false,

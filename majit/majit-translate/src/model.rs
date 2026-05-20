@@ -2480,6 +2480,26 @@ pub struct FunctionGraph {
     /// `with_return_type(rt)` after construction (parse.rs +
     /// lib.rs:430-512 trait-method + free-fn registration).
     pub return_type: Option<String>,
+    /// Source-file module path the function was lifted from (e.g.
+    /// `pyre_jit::jit::trace`).  RPython equivalent: every
+    /// `FunctionDesc` carries `pyobj.__globals__` via its source
+    /// module, which `flowspace/flowcontext.py:845-866 LOAD_GLOBAL`
+    /// consults for per-function name resolution.  Pyre's analogue:
+    /// the source-file's `module_prefix` plus the file's
+    /// `use_imports` (aggregated in `CallControl::use_imports` keyed
+    /// by `(module_path, alias)`); this field carries the
+    /// `module_path` so downstream typer passes can recover the
+    /// caller's per-file import scope without threading the entire
+    /// program context through `translate_op`.
+    ///
+    /// `None` for synthetic test-fixture graphs constructed via
+    /// `FunctionGraph::new("name")`; production paths populate via
+    /// `with_source_module(mp)` from `lib.rs` (where
+    /// `parsed.module_path` is available).  Downstream consumers
+    /// treat `None` as "no per-file scope known" and fall through to
+    /// the unrestricted HOST_ENV-curated path resolution that pyre
+    /// uses today.
+    pub source_module: Option<String>,
 }
 
 impl FunctionGraph {
@@ -2552,6 +2572,7 @@ impl FunctionGraph {
             value_names: std::collections::HashMap::new(),
             variable_to_vid,
             return_type: None,
+            source_module: None,
         }
     }
 
@@ -2563,6 +2584,17 @@ impl FunctionGraph {
     /// to `CallControl::return_types` for `None`-carrying graphs.
     pub fn with_return_type(mut self, rt: impl Into<String>) -> Self {
         self.return_type = Some(rt.into());
+        self
+    }
+
+    /// Builder-style setter for `source_module`. Production
+    /// registration paths populate from `ParsedInterpreter.module_path`
+    /// at lib.rs graph-construction sites; test fixtures may skip and
+    /// leave `None`.  Used by downstream typer passes to recover the
+    /// caller's per-file `use_imports` for import-scope-aware
+    /// resolution (`flowspace_adapter.rs::translate_op` Layer 3).
+    pub fn with_source_module(mut self, mp: impl Into<String>) -> Self {
+        self.source_module = Some(mp.into());
         self
     }
 

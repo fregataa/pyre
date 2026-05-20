@@ -306,16 +306,12 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
     // semantics.
     analyzer_for(&mut reg, "rarithmetic.intmask", rarith_intmask);
     analyzer_for(&mut reg, "rarithmetic.longlongmask", rarith_longlongmask);
-    // PRE-EXISTING-ADAPTATION (Task #344 — extregistry port):
-    // `build_int.ForTypeEntry(_about_ = r_uint).compute_result_\
-    // annotation` (rarithmetic.py:572-577) returns
-    // `SomeInteger(knowntype=r_uint, unsigned=True)`.  Upstream dispatch
-    // goes through `extregistry.lookup_type` per the class object;
-    // pyre routes through `BUILTIN_ANALYZERS[qualname]` keyed by
-    // `"rarithmetic.r_uint"` because no extregistry port exists yet.
-    // The body below reproduces the same observable `SomeInteger`
-    // shape so coercion converges; only dispatch lookup diverges.
-    analyzer_for(&mut reg, "rarithmetic.r_uint", rarith_r_uint);
+    // `rarithmetic.r_uint` is routed via
+    // `ExtRegistryEntry::ForType` (rarithmetic.py:572-582 `ForTypeEntry`):
+    // bookkeeper's BUILTIN_ANALYZERS miss falls through to
+    // `extregistry.lookup`, which returns the SomeBuiltin whose
+    // `compute_result_annotation` produces
+    // `SomeInteger(knowntype=Ruint, unsigned=True)`.
     // lltype.py:2367-2382 — `@analyzer_for(cast_ptr_to_int)` and
     // `@analyzer_for(cast_int_to_ptr)`.  The Rust frontend lowers
     // `Expr::Cast { Ref ↔ Int }` to a `simple_call` against the
@@ -2260,7 +2256,13 @@ mod tests {
         let cases: &[(&str, &str)] = &[
             ("rpython.rlib.rarithmetic", "intmask"),
             ("rpython.rlib.rarithmetic", "longlongmask"),
-            ("rpython.rlib.rarithmetic", "r_uint"),
+            // `rarithmetic.r_uint` is intentionally absent from
+            // BUILTIN_ANALYZERS — bookkeeper.rs:1913 misses, then
+            // falls through to the extregistry path at line 1960
+            // which finds `ExtRegistryEntry::ForType` and returns the
+            // SomeBuiltin whose `compute_result_annotation` produces
+            // `SomeInteger(unsigned=True, knowntype=Ruint)`.  See
+            // `flowspace/model.rs::populate_host_env::register_r_uint`.
             ("rpython.rlib.objectmodel", "keepalive_until_here"),
             ("rpython.rlib.objectmodel", "free_non_gc_object"),
             ("rpython.rtyper.lltypesystem.lltype", "cast_ptr_to_int"),

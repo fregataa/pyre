@@ -205,16 +205,12 @@ fn install_default_typers(map: &mut HashMap<HostObject, BuiltinTyperFn>) {
             "longlongmask",
             rtype_longlongmask,
         ),
-        // PRE-EXISTING-ADAPTATION (Task #344 — extregistry port):
-        // `ForTypeEntry(_about_ = r_uint).specialize_call(hop)`
-        // (rarithmetic.py:579-582).  Upstream dispatch is the
-        // extregistry `_about_` lookup keyed on the class object;
-        // pyre keys on `("rpython.rlib.rarithmetic", "r_uint")` in
-        // BUILTIN_TYPER `module_entries` because no extregistry port
-        // exists yet.  Body is parity-correct (rtype_r_uint mirrors
-        // `inputargs(hop.r_result.lowleveltype)` + `exception_cannot_\
-        // occur`).
-        ("rpython.rlib.rarithmetic", "r_uint", rtype_r_uint),
+        // `rarithmetic.r_uint` dispatches via
+        // `ExtRegistryEntry::ForType::specialize_call`
+        // (rarithmetic.py:579-582), routed through
+        // `BuiltinFunctionRepr::findbltintyper` (`rbuiltin.rs:444-457`)
+        // when the qualname-keyed BUILTIN_TYPER misses.  No
+        // module_entries row is needed here.
         // rbuiltin.py:643-648
         (
             "rpython.rlib.objectmodel",
@@ -1190,7 +1186,7 @@ fn rtype_longlongmask(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RT
 /// on the qualname-keyed BUILTIN_TYPER `module_entries` table because
 /// no extregistry port exists yet.  Body is parity-correct — only
 /// the dispatch lookup diverges.
-fn rtype_r_uint(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+pub(super) fn rtype_r_uint(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
     let result_lltype = {
         let r_result_borrow = hop.r_result.borrow();
         let r_result = r_result_borrow
@@ -2158,23 +2154,27 @@ pub fn rtype_cast_ptr_to_int(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>
     use crate::translator::rtyper::rmodel::PtrRepr;
     use crate::translator::rtyper::rtyper::{ConvertedTo, GenopResult};
 
-    // TODO(typed-ref-someptr-followup-epic Phase 2,
-    // `~/.claude/plans/typed-ref-someptr-followup-epic.md`): pyre's
-    // surface DSL has no `lltype.*` HostObject (M2.5g extern Rust
-    // helper registry walker epic), so typed `&Foo` references lift
-    // to `SomeInstance(classdef=None)` instead of upstream's
-    // `SomePtr(ll_ptrtype)`.  That makes `hop.args_r[0]` arrive as
-    // `InstanceRepr` (lowleveltype `Ptr(GcStruct(OBJECT))`) rather
-    // than `PtrRepr`, so the upstream
+    // PRE-EXISTING-ADAPTATION (typed-ref-someptr-followup-epic
+    // `~/.claude/plans/typed-ref-someptr-followup-epic.md` —
+    // Phase 2 landed 2026-05-05, this block IS the Phase 2 swap):
+    // pyre's surface DSL has no `lltype.*` HostObject, so typed
+    // `&Foo` references lift to `SomeInstance(classdef=None)` instead
+    // of upstream's `SomePtr(ll_ptrtype)`.  That makes
+    // `hop.args_r[0]` arrive as `InstanceRepr` (lowleveltype
+    // `Ptr(GcStruct(OBJECT))`) rather than `PtrRepr`, so the upstream
     // `assert isinstance(hop.args_r[0], rptr.PtrRepr)` cannot run
     // directly.  The operand's concretetype is already a `Ptr(...)`
     // (`InstanceRepr.lowleveltype`), so we relabel `args_r[0]` as
     // `PtrRepr(operand_lltype)`; the relabel is a noop at LL because
-    // the underlying lowleveltype is unchanged.  Convergence path:
-    // M2.5g lands → frontend lifts typed `&Foo` to
-    // `SomeValue::Ptr(SomePtr::new(t))` directly → this swap retires
-    // (`rptr.py:13-14 SomePtr.rtyper_makerepr` produces `PtrRepr`
-    // upstream).
+    // the underlying lowleveltype is unchanged.  Convergence path
+    // (epic Phase 3, blocked on M2.5g extern-Rust-helper registry
+    // walker): once M2.5g lands, the frontend gains a typed-`&Foo`
+    // catalog and lifts `&Foo` directly to
+    // `SomeValue::Ptr(SomePtr::new(t))` via
+    // `set_some(vid, ...)` at the lift site
+    // (`front/ast.rs::value_type_for_type`).  At that point this
+    // swap retires (`rptr.py:13-14 SomePtr.rtyper_makerepr` already
+    // produces `PtrRepr` upstream).
     let needs_swap = hop.args_r.borrow()[0]
         .as_ref()
         .map_or(false, |r| r.repr_class_id() != ReprClassId::PtrRepr);

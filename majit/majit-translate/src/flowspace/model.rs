@@ -1660,28 +1660,19 @@ impl HostEnv {
             "longlongmask",
             HostObject::new_builtin_callable("rarithmetic.longlongmask"),
         );
-        // PRE-EXISTING-ADAPTATION (Task #344 — extregistry port):
-        // upstream models `r_uint` as the class object created via
-        // `build_int('r_uint', False, LONG_BIT)` (rarithmetic.py:546-600).
-        // Annotation / typing dispatch happens through an
-        // `extregistry.ExtRegistryEntry` with `_about_ = r_uint`
-        // (rarithmetic.py:572-582) — `compute_result_annotation` returns
-        // `SomeInteger(knowntype=r_uint, unsigned=True)` and
-        // `specialize_call` emits `inputargs(Unsigned)` then returns.
-        // The dispatch surface for a `_about_` extregistry entry is
-        // distinct from `BUILTIN_ANALYZERS` (`rbuiltin.py:14-15`) — the
-        // bookkeeper consults `extregistry.lookup_type` per class type
-        // rather than `BUILTIN_ANALYZERS` per qualname.  Pyre has no
-        // extregistry port yet, so `r_uint` is registered here as a
-        // builtin callable instead; the annotator (rarith_r_uint) and
-        // the typer (rtype_r_uint) reproduce the same observable
-        // `SomeInteger(unsigned=True)` and `inputargs(Unsigned)` output.
-        // Dispatch shape converges once extregistry lands; result
-        // coercion is unaffected.
-        rarithmetic.module_set(
-            "r_uint",
-            HostObject::new_builtin_callable("rarithmetic.r_uint"),
-        );
+        // Upstream `r_uint` is the class object created via
+        // `build_int('r_uint', False, LONG_BIT)` (rarithmetic.py:546-600),
+        // dispatched via `ForTypeEntry(extregistry.ExtRegistryEntry)`
+        // (rarithmetic.py:572-582).  The HostObject registered here is
+        // the carrier the extregistry entry keys on; the bootstrap
+        // [`crate::translator::rtyper::extregistry::register_r_uint`]
+        // call wires `ExtRegistryEntry::ForType` so `compute_result_\
+        // annotation` returns `SomeInteger(unsigned=True,
+        // knowntype=Ruint)` and `specialize_call` routes through
+        // `rtype_r_uint`.
+        let r_uint_host = HostObject::new_builtin_callable("rarithmetic.r_uint");
+        rarithmetic.module_set("r_uint", r_uint_host.clone());
+        crate::translator::rtyper::extregistry::register_r_uint(r_uint_host);
 
         os.module_set("fdopen", HostObject::new_builtin_callable("os.fdopen"));
         os.module_set("tmpfile", HostObject::new_builtin_callable("os.tmpfile"));

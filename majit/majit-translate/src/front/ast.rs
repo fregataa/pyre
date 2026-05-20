@@ -3406,6 +3406,11 @@ fn build_function_graph(
     crate::model::prune_dead_phis(&mut graph);
     crate::model::eliminate_empty_blocks(&mut graph);
 
+    let graph = if module_prefix.is_empty() {
+        graph
+    } else {
+        graph.with_source_module(module_prefix)
+    };
     Ok(SemanticFunction {
         name: func.sig.ident.to_string(),
         graph,
@@ -8968,29 +8973,17 @@ pub(crate) fn classify_fn_arg_ty(ty: &syn::Type) -> crate::model::ValueType {
                 return ValueType::Ref;
             }
             match name.as_str() {
-                // `rlib/rarithmetic.py` + `lltype.Signed` family.
-                //
-                // TODO(unsigned-producer-flip): `u8`/`u16`/`u32`/`u64`/
-                // `usize` should lift to `ValueType::Unsigned` to match
-                // `lltype.Unsigned`'s rtyper dispatch (`rbool.py:77-83
-                // uint_is_true`, `rint.py` cast family).  The flip
-                // currently breaks downstream pyre-source analysis —
-                // `annotator/unaryop.rs:445 getattr` raises
-                // `AnnotatorError: Cannot find attribute` on
-                // const-folded paths, and `setinteriorfield_gc_r` join
-                // points mix `'r'` (Ref) and `'i'` (Int) kinds causing
-                // an `assembler.rs:581 int_copy` kind-mismatch panic.
-                // Reverting to `ValueType::Int` keeps the surface DSL
-                // monomorphic-int while the `cast_builtin_name`
-                // Unsigned arms (route through
-                // `simple_call(rarithmetic.intmask|r_uint, v)` per
-                // Slices A.4a / A.4b / A.4c) remain scaffolded for
-                // the eventual producer-side flip.  Convergence path:
-                // walk all
-                // `OpKind::Input { ty: Int }` consumers reachable from
-                // `PYRE_JIT_GRAPH_SOURCES`, narrow the ones that take
-                // u* (currently widened-to-i64 via `as i64`) onto a
-                // dedicated `Unsigned` arm, then flip the producer.
+                // `lltype.Signed` family.  Unsigned parity for u* is
+                // blocked on (a) PyFrame's Rust-struct → classdef
+                // pipeline propagating Unsigned fields without
+                // collapsing the receiver's classdef to None (panics
+                // at `annotator/unaryop.rs:444` with
+                // `getattr "locals_cells_stack_w" on Instance(classdef:
+                // None)`) and (b) `setinteriorfield_gc_r` coercion
+                // bridging Ref/Int kinds at join points (panics at
+                // `assembler.rs:964` with
+                // `encode_regorconst_source: Register kind Ref does
+                // not match variant-expected kind Int`).
                 "i8" | "i16" | "i32" | "i64" | "isize" | "u8" | "u16" | "u32" | "u64" | "usize"
                 | "char" => ValueType::Int,
                 // `lltype.Bool` annotates as `SomeBool(SomeInteger)`
