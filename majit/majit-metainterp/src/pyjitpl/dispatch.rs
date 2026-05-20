@@ -4524,6 +4524,17 @@ where
                 // pyjitpl.py:2017 — vrefs walk + vinfo stamp before the call.
                 ctx.vrefs_before_residual_call();
                 let active_vable = self.prepare_standard_virtualizable_before_residual_call(ctx);
+                // PRE-EXISTING-ADAPTATION (`pyjitpl.py:2033 do_residual_call`
+                // float-result branch): pyre's `call_assembler` wrapper at
+                // `concrete_ptr` is an `extern "C" fn(...) -> i64` whose
+                // result carries the f64 pre-packed via `f64::to_bits()`.
+                // See `blackhole.rs:10163-10170` for the wrapper-ABI
+                // analysis — calling through `call_float_function`
+                // (`extern "C" fn(...) -> f64`) here would transmute the
+                // i64-returning wrapper through a float-ABI signature and
+                // break the dynasm/cranelift call convention.  The i64
+                // result is stored directly into `registers_f` via
+                // `set_float_reg` per RPython's `longlong.ZEROF` packing.
                 let concrete = call_int_function(concrete_ptr, &concrete_args);
                 // `pyjitpl.py:2046-2049 vrefs_after_residual_call`.
                 ctx.vrefs_after_residual_call();
@@ -5727,25 +5738,35 @@ pub fn build_state_field_snapshot(
     // resume reader (`resume.py:1404 consume_vable_info` ↔
     // `resume.rs:6477`) reads the first entry as the virtualizable
     // pointer, so this reorder is load-bearing.
+    // `opencoder.py:718-726 _list_of_boxes_virtualizable` /
+    // `opencoder.py:712-717 _list_of_boxes` encode every list element
+    // unconditionally via `_add_box_to_storage(box)` — no per-element
+    // skip.  RPython relies on every box on `virtualref_boxes` /
+    // `virtualizable_boxes` being typed; we mirror that invariant by
+    // requiring `OpRef::ty()` to be `Some` rather than silently dropping
+    // misshapen entries (which would shrink the snapshot relative to
+    // upstream and desync the resume reader).
     let mut vable_boxes_snap: Vec<crate::recorder::SnapshotTagged> = Vec::new();
     if !virtualizable_boxes.is_empty() {
-        if let Some(last) = virtualizable_boxes.last() {
-            if let Some(ty) = last.ty() {
-                vable_boxes_snap.push(crate::recorder::SnapshotTagged::Box(*last, ty));
-            }
-        }
+        let last = virtualizable_boxes.last().copied().unwrap();
+        let last_ty = last
+            .ty()
+            .expect("build_state_field_snapshot: virtualizable identity must be typed");
+        vable_boxes_snap.push(crate::recorder::SnapshotTagged::Box(last, last_ty));
         for opref in &virtualizable_boxes[..virtualizable_boxes.len() - 1] {
-            if let Some(ty) = opref.ty() {
-                vable_boxes_snap.push(crate::recorder::SnapshotTagged::Box(*opref, ty));
-            }
+            let ty = opref
+                .ty()
+                .expect("build_state_field_snapshot: virtualizable_boxes entry must be typed");
+            vable_boxes_snap.push(crate::recorder::SnapshotTagged::Box(*opref, ty));
         }
     }
     let vref_boxes_snap: Vec<crate::recorder::SnapshotTagged> = virtualref_boxes
         .iter()
-        .flat_map(|(opref, _ptr)| {
-            opref
+        .map(|(opref, _ptr)| {
+            let ty = opref
                 .ty()
-                .map(|ty| crate::recorder::SnapshotTagged::Box(*opref, ty))
+                .expect("build_state_field_snapshot: virtualref_boxes entry must be typed");
+            crate::recorder::SnapshotTagged::Box(*opref, ty)
         })
         .collect();
     crate::recorder::Snapshot {

@@ -1055,6 +1055,8 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 frames: &mut majit_metainterp::MIFrameStack,
                 __op_live: u8,
                 __all_liveness: &[u8],
+                __virtualizable_boxes: &[majit_ir::OpRef],
+                __virtualref_boxes: &[(majit_ir::OpRef, usize)],
             ) -> Option<majit_metainterp::recorder::Snapshot> {
                 use majit_metainterp::JitCodeSym as _;
                 if frames.frames.is_empty() {
@@ -1069,14 +1071,19 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                     __root.int_values[..__n].to_vec();
                 sym.populate_frame_int_regs(__root);
                 let mut __pool = majit_metainterp::ConstantPool::new();
+                // pyjitpl.py:2586-2610 `capture_resumedata(framestack,
+                // virtualizable_boxes, virtualref_boxes,
+                // last_snapshot)` — the snapshot must carry the live
+                // vable + vref box lists or the resume reader sees
+                // empty arrays on guard failure.
                 let __snapshot = majit_metainterp::build_state_field_snapshot(
                     frames,
                     __op_live,
                     __all_liveness,
                     &mut __pool,
                     false,
-                    &[],
-                    &[],
+                    __virtualizable_boxes,
+                    __virtualref_boxes,
                 );
                 let __root = &mut frames.frames[0];
                 __root.int_regs[..__n].copy_from_slice(&__saved_int_regs);

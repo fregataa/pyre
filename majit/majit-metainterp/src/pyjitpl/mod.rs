@@ -3748,10 +3748,11 @@ impl<M: Clone> MetaInterp<M> {
         vref
     }
 
-    /// pyjitpl.py:1819-1832 `opimpl_virtual_ref_finish` parity.
-    /// LIFO `virtualref_boxes.pop()` / `assert box == lastbox`, then
-    /// `is_virtual_ref(vrefbox)` gates the recorded VIRTUAL_REF_FINISH.
-    pub fn opimpl_virtual_ref_finish(&mut self, _vref: OpRef, virtual_obj: OpRef) {
+    /// pyjitpl.py:1819-1832 `opimpl_virtual_ref_finish(box)` parity —
+    /// single `box` arg per `@arguments("box")` decorator (the leaving
+    /// frame's virtual object).  The vrefbox is reconstituted via
+    /// `virtualref_boxes.pop()`, not passed in.
+    pub fn opimpl_virtual_ref_finish(&mut self, virtual_obj: OpRef) {
         let Some(ctx) = self.tracing.as_mut() else {
             return;
         };
@@ -4126,6 +4127,19 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     fn compile_loop_body(&mut self, jump_args: &[OpRef], meta: M) -> CompileOutcome {
+        // pyjitpl.py:2995 `assert len(self.virtualref_boxes) == 0,
+        // "missing virtual_ref_finish()?"` — every `opimpl_virtual_ref`
+        // must have a matching `opimpl_virtual_ref_finish` before the
+        // loop header is reached.  A non-empty stack here means the
+        // trace exited a frame without firing finish, leaving stale
+        // (virtualbox, vrefbox) pairs that would smuggle a forced
+        // virtualref into the next iteration.
+        if let Some(ctx) = self.tracing.as_ref() {
+            debug_assert!(
+                ctx.virtualref_boxes.is_empty(),
+                "reached_loop_header: virtualref_boxes must be empty — missing virtual_ref_finish()?"
+            );
+        }
         // pyjitpl.py:2993-3007: if partial_trace is set, the previous
         // compilation attempt requested a retrace. Verify the green_key
         // matches and dispatch to compile_retrace.
@@ -14191,18 +14205,24 @@ impl MetaInterpStaticData {
         // `make_jitcodes` time.
 
         // pyjitpl.py:2267 `self.virtualref_info = codewriter.callcontrol.virtualref_info`
-        // PRE-EXISTING-ADAPTATION: `callcontrol.virtualref_info` carries
-        // the opaque codewriter-time
+        //
+        // PRE-EXISTING-ADAPTATION: the literal assignment is intentionally
+        // omitted because pyre's `VirtualRefInfo` is constructed at module-
+        // init time via cached generators (`vref_size_descr()` +
+        // `make_vref_field_descr_typed(...)`) that yield process-singleton
+        // `DescrRef` Arcs, while `callcontrol.virtualref_info` carries the
+        // separate codewriter-time
         // [`majit_translate::jit_codewriter::call::VirtualRefInfoHandle`]
-        // (`u32` descr indices), but the staticdata slot now holds live
-        // `DescrRef` Arcs (`virtualref.py:32-42`) initialized in
-        // `MetaInterpStaticData::new` via the cached
-        // `vref_size_descr()` / `make_vref_field_descr_typed(...)`
-        // generators.  Bridging the handle into the live-Arc shape
-        // requires the handle trait to yield `DescrRef` Arcs rather
-        // than `u32` — until then the forwarding is a no-op and every
-        // downstream reader picks up the `VirtualRefInfo::default`
-        // already on staticdata.
+        // representation (`u32` descr indices for the dispatch encoder).
+        // Both sides therefore reference the SAME underlying descriptors —
+        // the metainterp side via `Arc::ptr_eq`, the translate side via the
+        // `0x1000_0081 / 0x1000_0101 / 0x7F10` constants in
+        // `DefaultVirtualRefInfoHandle` — and the staticdata slot's
+        // `VirtualRefInfo::default()` already matches what the literal
+        // assignment would install.  Convergence to the literal shape
+        // requires the handle trait to expose `DescrRef` Arcs (currently
+        // blocked by the `majit-translate` ⊥ `majit-metainterp` crate
+        // boundary, since `VirtualRefInfo` is a metainterp type).
 
         // pyjitpl.py:2268 `self.callinfocollection = codewriter.callcontrol.callinfocollection`
         self.callinfocollection = callcontrol.callinfocollection.clone();
@@ -15040,7 +15060,8 @@ mod metainterp_static_data_tests {
             .filter(|op| op.opcode == OpCode::VirtualRefFinish)
             .count();
 
-        meta.opimpl_virtual_ref_finish(vref, virtual_obj);
+        let _ = vref;
+        meta.opimpl_virtual_ref_finish(virtual_obj);
 
         let ctx = meta.tracing.as_ref().unwrap();
         assert!(ctx.virtualref_boxes.is_empty());

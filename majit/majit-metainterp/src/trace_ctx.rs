@@ -384,6 +384,21 @@ pub struct TraceCtx {
     /// `MetaInterp` is per-`_compile_and_run_once` and pyre's
     /// per-trace counterpart is this `TraceCtx`; cross-trace
     /// MetaInterp would otherwise carry stale pairs.
+    ///
+    /// PRE-EXISTING-ADAPTATION (`pyjitpl.py:3523 replace_box`): RPython
+    /// reads `box.getref_base()` off the Box object itself, so swapping
+    /// the Box via `replace_box` automatically picks up whatever
+    /// concrete pointer the replacement Box carries.  Pyre's `(OpRef,
+    /// usize)` sidecar caches the concrete pointer next to the OpRef,
+    /// so `replace_box` would need a paired ptr-update to stay
+    /// strictly RPython-shaped.  Today this relies on the invariant
+    /// "replacement OpRefs point at the same concrete `JitVirtualRef*`
+    /// as the original" — true for every current `replace_box`
+    /// caller (CONST_NULL replacement after force, vrefbox re-aliasing
+    /// after `vrefs_after_residual_call`).  A future replace-with-
+    /// different-pointer caller would require flipping this carrier
+    /// to a Box-backed shape (cross-crate change touching `history.rs:1762`
+    /// `History::replace_box`).
     pub(crate) virtualref_boxes: Vec<(OpRef, usize)>,
 }
 

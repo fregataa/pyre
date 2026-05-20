@@ -1348,12 +1348,30 @@ impl<S: JitState> JitDriver<S> {
                 // path captures uniformly via the framestack walk.
                 let op_live = self.meta.staticdata.op_live as u8;
                 let all_liveness = self.meta.staticdata.liveness_info.clone();
+                // pyjitpl.py:2586 `capture_resumedata(framestack,
+                // virtualizable_boxes, virtualref_boxes,
+                // last_snapshot)` — pull the live box lists off the
+                // active trace ctx before borrowing `self.meta.framestack`
+                // mutably below.  Cloning is acceptable because this is
+                // the segmented-loop force path (slow path).
+                let (vable_boxes, vref_boxes) = self
+                    .meta
+                    .trace_ctx()
+                    .map(|ctx| {
+                        (
+                            ctx.virtualizable_boxes.clone().unwrap_or_default(),
+                            ctx.virtualref_boxes.clone(),
+                        )
+                    })
+                    .unwrap_or_default();
                 let pre_snapshot = self.sym.as_ref().and_then(|sym| {
                     S::populate_frame_for_guard(
                         sym,
                         &mut self.meta.framestack,
                         op_live,
                         &all_liveness,
+                        &vable_boxes,
+                        &vref_boxes,
                     )
                 });
                 let mut current_live = self
@@ -3627,6 +3645,21 @@ impl<S: JitState> JitDriver<S> {
         // Arc to the decoder so it borrows the guard-owned pool (no
         // clone) and can thread the same handle into
         // `ResumeDataResult`.
+        //
+        // PRE-EXISTING-ADAPTATION (`pyjitpl.py:3424
+        // rebuild_state_after_failure`): `ResumeDataResult.virtualref_values`
+        // and `.virtualizable_values` are decoded into the result struct
+        // but NOT yet restored into the new bridge tracer's
+        // `TraceCtx::virtualref_boxes` / `virtualizable_boxes`, and the
+        // matching `vrefinfo.continue_tracing(vref, virtual)`
+        // (`virtualref.py:122-129`, invoked through
+        // `ResumeDataReader::consume_virtualref_info` →
+        // `resume.rs:6476`) is not fired on the bridge-entry path.
+        // The bridge therefore starts with empty vref/vable state.
+        // Bridge tracing of code that crossed an active `virtual_ref`
+        // scope will mis-trace until the restore path is wired
+        // (multi-session: needs box materialization from
+        // `RebuiltValue::Box(idx, kind)` + pointer recovery).
         let resume_data_result = S::rebuild_from_resumedata(
             &mut trace_meta,
             &retrace.fail_types,

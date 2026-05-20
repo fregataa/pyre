@@ -450,6 +450,8 @@ pub trait JitState: Sized {
         _frames: &mut crate::pyjitpl::MIFrameStack,
         _op_live: u8,
         _all_liveness: &[u8],
+        _virtualizable_boxes: &[OpRef],
+        _virtualref_boxes: &[(OpRef, usize)],
     ) -> Option<crate::recorder::Snapshot> {
         None
     }
