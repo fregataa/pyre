@@ -2130,7 +2130,7 @@ impl Optimizer {
                             )
                         });
                         let fresh = ctx.alloc_op_position_typed(tp);
-                        ctx.replace_op(source, fresh);
+                        ctx.make_equal_to(source, fresh);
                         fresh
                     } else {
                         source
@@ -2481,7 +2481,7 @@ impl Optimizer {
                                         )
                                     });
                                     let ff = ctx.alloc_op_position_typed(tp);
-                                    ctx.replace_op(ff, orig_field);
+                                    ctx.make_equal_to(ff, orig_field);
                                     field.1 = ff;
                                 }
                                 crate::optimizeopt::info::PtrInfo::Virtual(vinfo)
@@ -4343,7 +4343,7 @@ mod tests {
                 // Check if second arg is constant 0
                 if let Some(0) = ctx.get_constant_int(op.arg(1)) {
                     // Replace with first arg
-                    ctx.replace_op(op.pos.get(), op.arg(0));
+                    ctx.make_equal_to(op.pos.get(), op.arg(0));
                     return OptimizationResult::Remove;
                 }
             }
@@ -5571,7 +5571,7 @@ mod tests {
                 avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),
         );
-        ctx.replace_op(OpRef::int_op(11), OpRef::int_op(20));
+        ctx.make_equal_to(OpRef::int_op(11), OpRef::int_op(20));
         let b20 = ctx
             .ensure_box(OpRef::int_op(20))
             .expect("body-namespace OpRef must have a BoxRef slot");

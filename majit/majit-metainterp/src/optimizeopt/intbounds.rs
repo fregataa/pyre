@@ -1767,7 +1767,7 @@ impl OptIntBounds {
             let stop = 1i64 << (numbits - 1);
             if b.is_within_range(start, stop - 1) {
                 // The value already fits; replace with the input.
-                ctx.replace_op(op.pos.get(), op.arg(0));
+                ctx.make_equal_to(op.pos.get(), op.arg(0));
                 return OptimizationResult::Remove;
             }
         }

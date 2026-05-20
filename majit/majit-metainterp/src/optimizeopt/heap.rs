@@ -2017,7 +2017,7 @@ impl OptHeap {
                 if *lazy_obj == obj {
                     // MUST_ALIAS: lazy_set targets the same struct → return rhs
                     let cached = lazy_op.arg(1);
-                    ctx.replace_op(op.pos.get(), cached);
+                    ctx.make_equal_to(op.pos.get(), cached);
                     return OptimizationResult::Remove;
                 }
                 // heap.py:67-75 possible_aliasing_two_infos:
@@ -2052,13 +2052,13 @@ impl OptHeap {
                             ctx.structinfo_setfield(op, field_idx, cached);
                             self.field_cache(&descr).register_info(obj);
                             let cached = ctx.get_box_replacement(cached);
-                            ctx.replace_op(op.pos.get(), cached);
+                            ctx.make_equal_to(op.pos.get(), cached);
                             return OptimizationResult::Remove;
                         }
                         crate::optimizeopt::info::FieldEntry::Value(cached) => {
                             if !cached.is_none() {
                                 let cached = ctx.get_box_replacement(cached);
-                                ctx.replace_op(op.pos.get(), cached);
+                                ctx.make_equal_to(op.pos.get(), cached);
                                 return OptimizationResult::Remove;
                             }
                         }
@@ -2114,7 +2114,7 @@ impl OptHeap {
         // Check immutable field cache first — these survive all invalidation.
         if let Some(&cached) = self.immutable_cached_fields.get(&key) {
             let cached = ctx.get_box_replacement(cached);
-            ctx.replace_op(op.pos.get(), cached);
+            ctx.make_equal_to(op.pos.get(), cached);
             return OptimizationResult::Remove;
         }
 
@@ -2128,13 +2128,13 @@ impl OptHeap {
                         ctx.structinfo_setfield(op, field_idx, cached);
                         self.field_cache(&descr).register_info(obj);
                         let cached = ctx.get_box_replacement(cached);
-                        ctx.replace_op(op.pos.get(), cached);
+                        ctx.make_equal_to(op.pos.get(), cached);
                         return OptimizationResult::Remove;
                     }
                     crate::optimizeopt::info::FieldEntry::Value(cached) => {
                         if !cached.is_none() {
                             let cached = ctx.get_box_replacement(cached);
-                            ctx.replace_op(op.pos.get(), cached);
+                            ctx.make_equal_to(op.pos.get(), cached);
                             return OptimizationResult::Remove;
                         }
                     }
@@ -2148,7 +2148,7 @@ impl OptHeap {
             if !qi_cached.is_none() {
                 // Subsequent read: reuse the cached value.
                 let qi_cached = ctx.get_box_replacement(qi_cached);
-                ctx.replace_op(op.pos.get(), qi_cached);
+                ctx.make_equal_to(op.pos.get(), qi_cached);
                 return OptimizationResult::Remove;
             }
             // First read after QUASIIMMUT_FIELD: emit the load, then cache
@@ -2571,7 +2571,7 @@ impl OptHeap {
                     if *lazy_obj == array {
                         // MUST_ALIAS: lazy_set targets the same array → return rhs
                         let cached = lazy_op.arg(2);
-                        ctx.replace_op(op.pos.get(), cached);
+                        ctx.make_equal_to(op.pos.get(), cached);
                         return OptimizationResult::Remove;
                     }
                     // heap.py:108 possible_aliasing_two_infos
@@ -2603,13 +2603,13 @@ impl OptHeap {
                                     .register_info(array);
                                 ctx.arrayinfo_setitem(op, const_index as usize, cached);
                                 let cached = ctx.get_box_replacement(cached);
-                                ctx.replace_op(op.pos.get(), cached);
+                                ctx.make_equal_to(op.pos.get(), cached);
                                 return OptimizationResult::Remove;
                             }
                             crate::optimizeopt::info::FieldEntry::Value(cached) => {
                                 if !cached.is_none() {
                                     let cached = ctx.get_box_replacement(cached);
-                                    ctx.replace_op(op.pos.get(), cached);
+                                    ctx.make_equal_to(op.pos.get(), cached);
                                     return OptimizationResult::Remove;
                                 }
                             }
@@ -2665,7 +2665,7 @@ impl OptHeap {
                     .register_info(array);
                 ctx.arrayinfo_setitem(op, const_index as usize, cached);
                 let cached = ctx.get_box_replacement(cached);
-                ctx.replace_op(op.pos.get(), cached);
+                ctx.make_equal_to(op.pos.get(), cached);
                 return OptimizationResult::Remove;
             }
             if let Some(cai) = self
@@ -2681,13 +2681,13 @@ impl OptHeap {
                                 .register_info(array);
                             ctx.arrayinfo_setitem(op, const_index as usize, cached);
                             let cached = ctx.get_box_replacement(cached);
-                            ctx.replace_op(op.pos.get(), cached);
+                            ctx.make_equal_to(op.pos.get(), cached);
                             return OptimizationResult::Remove;
                         }
                         crate::optimizeopt::info::FieldEntry::Value(cached) => {
                             if !cached.is_none() {
                                 let cached = ctx.get_box_replacement(cached);
-                                ctx.replace_op(op.pos.get(), cached);
+                                ctx.make_equal_to(op.pos.get(), cached);
                                 return OptimizationResult::Remove;
                             }
                         }
@@ -2743,7 +2743,7 @@ impl OptHeap {
             let indexbox = ctx.get_box_replacement(op.arg(1));
             if let Some(submap) = self.get_cached_array_submap(descr_idx) {
                 if let Some(cached) = submap.lookup_cached(arrayinfo, indexbox, ctx) {
-                    ctx.replace_op(op.pos.get(), cached);
+                    ctx.make_equal_to(op.pos.get(), cached);
                     return OptimizationResult::Remove;
                 }
             }

@@ -1543,7 +1543,7 @@ impl VirtualState {
                 let Some(runtime_cls) = state
                     .ctx
                     .get_known_class(&rb_box)
-                    .or_else(|| state.ctx.cls_of_box(rb))
+                    .or_else(|| state.ctx.cls_of_box(&rb_box))
                 else {
                     return Err(());
                 };
@@ -1572,7 +1572,7 @@ impl VirtualState {
                 let Some(runtime_cls) = state
                     .ctx
                     .get_known_class(&rb_box)
-                    .or_else(|| state.ctx.cls_of_box(rb))
+                    .or_else(|| state.ctx.cls_of_box(&rb_box))
                 else {
                     return Err(());
                 };

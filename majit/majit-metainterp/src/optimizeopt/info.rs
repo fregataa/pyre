@@ -1577,7 +1577,7 @@ impl PtrInfo {
                     );
                 }
                 if opref != alloc_ref {
-                    ctx.replace_op(opref, alloc_ref);
+                    ctx.make_equal_to(opref, alloc_ref);
                 }
                 for (field_idx, value_ref) in std::mem::take(&mut vinfo.fields) {
                     let value_ref = force_child(value_ref, ctx);
@@ -1627,7 +1627,7 @@ impl PtrInfo {
                     );
                 }
                 if opref != alloc_ref {
-                    ctx.replace_op(opref, alloc_ref);
+                    ctx.make_equal_to(opref, alloc_ref);
                 }
                 for (field_idx, value_ref) in std::mem::take(&mut vinfo.fields) {
                     let value_ref = force_child(value_ref, ctx);
@@ -1661,7 +1661,7 @@ impl PtrInfo {
                 alloc_op.setdescr(vinfo.descr.clone());
                 let alloc_ref = emit_op(ctx, alloc_op);
                 if opref != alloc_ref {
-                    ctx.replace_op(opref, alloc_ref);
+                    ctx.make_equal_to(opref, alloc_ref);
                 }
 
                 // info.py:542: const = optforce.optimizer.new_const_item(self.descr)
@@ -1715,7 +1715,7 @@ impl PtrInfo {
                 alloc_op.setdescr(vinfo.descr.clone());
                 let alloc_ref = emit_op(ctx, alloc_op);
                 if opref != alloc_ref {
-                    ctx.replace_op(opref, alloc_ref);
+                    ctx.make_equal_to(opref, alloc_ref);
                 }
 
                 // info.py:672: fielddescrs = op.getdescr().get_all_fielddescrs()
@@ -1776,7 +1776,7 @@ impl PtrInfo {
                     ctx.set_ptr_info(&b, PtrInfo::nonnull());
                 }
                 if opref != alloc_ref {
-                    ctx.replace_op(opref, alloc_ref);
+                    ctx.make_equal_to(opref, alloc_ref);
                 }
 
                 // info.py:425: CHECK_MEMORY_ERROR
@@ -1839,7 +1839,7 @@ impl PtrInfo {
                     );
                 }
                 if opref != new_ref {
-                    ctx.replace_op(opref, new_ref);
+                    ctx.make_equal_to(opref, new_ref);
                 }
                 new_ref
             }
@@ -1917,7 +1917,7 @@ impl PtrInfo {
 
                 // vstring.py:99-100: op.set_forwarded(newop)
                 if opref != newop {
-                    ctx.replace_op(opref, newop);
+                    ctx.make_equal_to(opref, newop);
                 }
 
                 // vstring.py:101-102: initialize_forced_string(op, optstring, op, CONST_0, mode)

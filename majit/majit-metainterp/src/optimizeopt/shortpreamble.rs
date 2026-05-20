@@ -1317,7 +1317,7 @@ impl ProducedShortOp {
         // and corrupts the SAME_AS in `extra_same_as`.
         // Non-invented re-uses self.res directly without forwarding.
         if self.invented_name {
-            ctx.replace_op(source, result_opref);
+            ctx.make_equal_to(source, result_opref);
         }
         // `result_opref` is a typed synthetic alias minted by
         // `add_op_to_short` via `ctx.alloc_op_position_typed(arg_type)`
@@ -1465,7 +1465,7 @@ impl ProducedShortOp {
         // Cat-2.2 alignment: forward `source -> result_opref` after the
         // PtrInfo / const-info side tables have been seeded (so the seeds
         // see the unforwarded source key consistent with `pop.op = source`).
-        ctx.replace_op(source, result_opref);
+        ctx.make_equal_to(source, result_opref);
         // see produce_pure: extra_same_as collected lazily by
         // imported_short_preamble_builder; eager push would be a dual-write.
         Some(source)
@@ -1576,7 +1576,7 @@ impl ProducedShortOp {
         }
         // Cat-2.2 alignment: forward `source -> result_opref` after the
         // const-info / ArrayPtrInfo side tables have been seeded.
-        ctx.replace_op(source, result_opref);
+        ctx.make_equal_to(source, result_opref);
         // see produce_pure: extra_same_as collected lazily by
         // imported_short_preamble_builder; eager push would be a dual-write.
         Some(source)
@@ -1624,7 +1624,7 @@ impl ProducedShortOp {
         // get_box_replacement uniformly.
         let result_opref = *result_map.get(&source)?;
         let _ = result_type;
-        ctx.replace_op(source, result_opref);
+        ctx.make_equal_to(source, result_opref);
         // `rewrite.py:31` `self.opt.loop_invariant_results[key] = old_op` —
         // dict-as-map semantics; pyre's Vec-backed parity overwrites the
         // entry when `func_ptr` already exists (PyPy dict behavior),

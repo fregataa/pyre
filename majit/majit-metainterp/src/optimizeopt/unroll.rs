@@ -3526,7 +3526,7 @@ impl OptUnroll {
             // makes this hold by construction in production callers.
             debug_assert!(source != *target, "import_state: source is target");
             // source.set_forwarded(target)
-            ctx.replace_op(source, *target);
+            ctx.make_equal_to(source, *target);
             if crate::optimizeopt::majit_log_enabled() {
                 eprintln!("[jit] import_state_map[{i}]: source={source:?} target={target:?}");
             }
@@ -4376,7 +4376,7 @@ fn assemble_peeled_trace_with_jump_args(
         );
         if let Some(&jump_source) = filtered_extra_jump_args.get(i) {
             if !jump_source.is_none() && jump_source != source_slot {
-                ctx.replace_op(jump_source, extended_label_arg);
+                ctx.make_equal_to(jump_source, extended_label_arg);
                 assembly_alias_remap.insert(jump_source, extended_label_arg);
             }
         }
@@ -6002,7 +6002,7 @@ mod tests {
         // replace_op, but the test still walks the get_box_replacement
         // chain inside force_box's add_preamble_op, so install a manual
         // forwarding to the body-visible OpRef to exercise that path.
-        ctx.replace_op(OpRef::ref_op(19), OpRef::ref_op(14));
+        ctx.make_equal_to(OpRef::ref_op(19), OpRef::ref_op(14));
         let pop = crate::optimizeopt::info::PreambleOp {
             op: OpRef::ref_op(19),
             invented_name: produced.invented_name,

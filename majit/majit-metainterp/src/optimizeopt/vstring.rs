@@ -570,7 +570,7 @@ impl OptString {
         if let Some(idx) = ctx.get_constant_int(idx_ref) {
             if let Some(ch_ref) = self.strgetitem(str_ref, idx, ctx) {
                 let ch_resolved = ctx.get_box_replacement(ch_ref);
-                ctx.replace_op(op.pos.get(), ch_resolved);
+                ctx.make_equal_to(op.pos.get(), ch_resolved);
                 return OptimizationResult::Remove;
             }
         }
@@ -1205,7 +1205,7 @@ impl OptString {
                 self.strgetitem(op.arg(2), 0, ctx),
             ) {
                 let result = self.int_sub(char1, char2, ctx);
-                ctx.replace_op(op.pos.get(), result);
+                ctx.make_equal_to(op.pos.get(), result);
                 return OptimizationResult::Remove;
             }
         }
@@ -1270,7 +1270,7 @@ impl OptString {
                     .unwrap_or(false);
                 if did_shrink {
                     // vstring.py:849: self.make_equal_to(op, op.getarg(1))
-                    ctx.replace_op(op.pos.get(), arg1);
+                    ctx.make_equal_to(op.pos.get(), arg1);
                     return OptimizationResult::Remove;
                 }
             }

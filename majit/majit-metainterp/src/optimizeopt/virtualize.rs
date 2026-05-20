@@ -685,7 +685,7 @@ impl OptVirtualize {
                 _ => None,
             };
             if let Some(val_ref) = field_val {
-                ctx.replace_op(op.pos.get(), val_ref);
+                ctx.make_equal_to(op.pos.get(), val_ref);
                 return OptimizationResult::Remove;
             }
             // heaptracker.py:66 typeptr exclusion: typeptr is excluded from
@@ -797,7 +797,7 @@ impl OptVirtualize {
                     if item_ref.is_none() {
                         return OptimizationResult::InvalidLoop;
                     }
-                    ctx.replace_op(op.pos.get(), item_ref);
+                    ctx.make_equal_to(op.pos.get(), item_ref);
                     return OptimizationResult::Remove;
                 }
             }
@@ -867,7 +867,7 @@ impl OptVirtualize {
                 if fld.is_none() {
                     return OptimizationResult::InvalidLoop;
                 }
-                ctx.replace_op(op.pos.get(), fld.unwrap());
+                ctx.make_equal_to(op.pos.get(), fld.unwrap());
                 return OptimizationResult::Remove;
             }
         }
@@ -1011,7 +1011,7 @@ impl OptVirtualize {
                 };
                 // rawbuffer.py:120: read_value(offset, length, descr)
                 if let Ok(val_ref) = vinfo.read_value(lookup_offset, ad.item_size(), &descr) {
-                    ctx.replace_op(op.pos.get(), val_ref);
+                    ctx.make_equal_to(op.pos.get(), val_ref);
                     return OptimizationResult::Remove;
                 }
             }
@@ -1191,7 +1191,7 @@ impl OptVirtualize {
                             // make_nonnull + emit.
                             if let Ok(val_ref) = vinfo.read_value(lookup_offset, itemsize_u, &descr)
                             {
-                                ctx.replace_op(op.pos.get(), val_ref);
+                                ctx.make_equal_to(op.pos.get(), val_ref);
                                 return OptimizationResult::Remove;
                             }
                         }
