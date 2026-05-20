@@ -1927,14 +1927,6 @@ mod oparg_with_body_local_method_call_green {
         fn len(&self) -> usize {
             self.bytes.len()
         }
-
-        /// Required by the `__trace_*` legacy-factory fallback path
-        /// (`codegen_trace.rs:129 program.get_op(pc)`); the trace-fn
-        /// signature is generic over `env_type`.
-        #[allow(dead_code)]
-        fn get_op(&self, pc: usize) -> u8 {
-            self.bytes[pc]
-        }
     }
 
     impl Index<usize> for MockProgram {

@@ -1747,14 +1747,23 @@ impl TraceCtx {
     /// pyre splits `MetaInterp.replace_box` across two layers:
     ///
     ///   * `TraceCtx::replace_box` (this method) handles the
-    ///     `virtualizable_boxes` + `heap_cache` walks. This is what
-    ///     `is_nonstandard_virtualizable` Step 4 calls.
+    ///     `virtualref_boxes` + `virtualizable_boxes` + `heap_cache`
+    ///     walks — every piece of per-trace box state that lives on
+    ///     `TraceCtx`.  This is what `is_nonstandard_virtualizable`
+    ///     Step 4 calls directly.
     ///
     ///   * `MetaInterp::replace_box` (in pyjitpl.rs) is the structural
     ///     mirror of the full RPython entry point; it adds the
-    ///     `virtualref_boxes` walk and the framestack walk on top of
-    ///     this `TraceCtx::replace_box`.
+    ///     framestack walk on top of this `TraceCtx::replace_box`.
     pub fn replace_box(&mut self, oldbox: OpRef, newbox: OpRef) {
+        // pyjitpl.py:3502-3505 virtualref_boxes walk.  RPython runs
+        // this before the virtualizable_boxes walk; pyre matches the
+        // order.
+        for slot in self.virtualref_boxes.iter_mut() {
+            if slot.0 == oldbox {
+                slot.0 = newbox;
+            }
+        }
         // pyjitpl.py:3506-3511 virtualizable_boxes walk.
         if let Some(boxes) = self.virtualizable_boxes.as_mut() {
             for slot in boxes.iter_mut() {

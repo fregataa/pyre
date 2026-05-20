@@ -307,6 +307,73 @@ pub trait GreenFieldInfoHandle: std::fmt::Debug + Send + Sync {
     fn contains_green_field(&self, gtype: &str, fieldname: &str) -> bool;
 }
 
+/// `virtualref.py VirtualRefInfo` opaque carrier handle.
+///
+/// PRE-EXISTING-ADAPTATION: same crate-boundary reasoning as
+/// `VirtualizableInfoHandle`.  `VirtualRefInfo` is defined in
+/// `majit-metainterp::virtualref` (the JIT runtime side); codewriter
+/// sits below metainterp in the crate graph and cannot import it.
+/// Hosts implement this trait on `VirtualRefInfo` so
+/// `CodeWriter.setup_vrefinfo` (`codewriter.py:91-94`) can store the
+/// instance on `CallControl.virtualref_info`
+/// (`call.py:22 virtualref_info = None`) for later forwarding to
+/// `metainterp_sd.virtualref_info = codewriter.callcontrol.virtualref_info`
+/// (`pyjitpl.py:2267`).  The three accessors expose the three `u32`
+/// descriptor indices the rebuilt `VirtualRefInfo` consumes on the
+/// metainterp side — `descr_virtual_token` / `descr_forced` index the
+/// `JitVirtualRef` field descriptors, `descr_size` indexes the struct
+/// size descriptor.
+pub trait VirtualRefInfoHandle: std::fmt::Debug + Send + Sync {
+    /// `virtualref.py:48 jit_virtual_ref_vtable` ↔ pyre
+    /// `VirtualRefInfo.descr_virtual_token` — field descr index for
+    /// `JitVirtualRef.virtual_token`.
+    fn descr_virtual_token(&self) -> u32;
+    /// `virtualref.py:49 jit_virtual_ref_vtable` ↔ pyre
+    /// `VirtualRefInfo.descr_forced` — field descr index for
+    /// `JitVirtualRef.forced`.
+    fn descr_forced(&self) -> u32;
+    /// `virtualref.py:48-49` size token ↔ pyre
+    /// `VirtualRefInfo.descr_size` — size descr index for the
+    /// `JitVirtualRef` struct itself.
+    fn descr_size(&self) -> u32;
+}
+
+/// `warmspot.py:262 VirtualRefInfo(self)` ↔ majit codewriter-time
+/// stand-in.  The trait values are the
+/// `majit_metainterp::virtualref::descr` constants; this handle
+/// duplicates them so [`CodeWriter::setup_vrefinfo`] can run before
+/// `make_jitcodes` without majit-translate taking a `majit-metainterp`
+/// dependency.  The constants are mirrored in
+/// `majit_metainterp::virtualref::descr::{VIRTUAL_TOKEN, FORCED,
+/// VREF_SIZE}`; the inverse-direction parity test in
+/// `majit_metainterp::virtualref::tests::default_handle_constants_match`
+/// asserts the two stay aligned.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DefaultVirtualRefInfoHandle;
+
+impl DefaultVirtualRefInfoHandle {
+    /// Mirrors `majit_metainterp::virtualref::descr::VIRTUAL_TOKEN`
+    /// (= `VREF_FIELD_VIRTUAL_TOKEN`, offset=8, Ref).
+    pub const DESCR_VIRTUAL_TOKEN: u32 = 0x1000_0081;
+    /// Mirrors `majit_metainterp::virtualref::descr::FORCED`
+    /// (= `VREF_FIELD_FORCED`, offset=16, Ref).
+    pub const DESCR_FORCED: u32 = 0x1000_0101;
+    /// Mirrors `majit_metainterp::virtualref::descr::VREF_SIZE`.
+    pub const DESCR_SIZE: u32 = 0x7F10;
+}
+
+impl VirtualRefInfoHandle for DefaultVirtualRefInfoHandle {
+    fn descr_virtual_token(&self) -> u32 {
+        Self::DESCR_VIRTUAL_TOKEN
+    }
+    fn descr_forced(&self) -> u32 {
+        Self::DESCR_FORCED
+    }
+    fn descr_size(&self) -> u32 {
+        Self::DESCR_SIZE
+    }
+}
+
 /// Codewriter-internal `GreenFieldInfoHandle` built directly from a
 /// jitdriver's `greens` list during `make_virtualizable_infos`.
 ///
@@ -519,6 +586,17 @@ pub struct CallControl {
 
     /// RPython: `CallControl.unfinished_graphs` — graphs pending assembly.
     unfinished_graphs: Vec<CallPath>,
+
+    /// `call.py:22 virtualref_info = None` — class-level default,
+    /// populated by `CodeWriter.setup_vrefinfo`
+    /// (`codewriter.py:91-94`) before
+    /// `MetaInterpStaticData.finish_setup` reads it at
+    /// `pyjitpl.py:2267 self.virtualref_info =
+    /// codewriter.callcontrol.virtualref_info`.  Stored behind the
+    /// opaque [`VirtualRefInfoHandle`] trait so metainterp can rebuild
+    /// its concrete `VirtualRefInfo` without codewriter taking a
+    /// metainterp dependency.
+    pub virtualref_info: Option<std::sync::Arc<dyn VirtualRefInfoHandle>>,
 
     /// RPython: `CallControl.callinfocollection` (call.py:31).
     /// Stores oopspec function info for builtin call handling.
@@ -951,6 +1029,7 @@ impl CallControl {
             builtin_factory_registry: std::cell::RefCell::new(HashMap::new()),
             finished_jitcodes: Vec::new(),
             unfinished_graphs: Vec::new(),
+            virtualref_info: None,
             callinfocollection: majit_ir::CallInfoCollection::new(),
             descr_indices: DescrIndexRegistry::default(),
             virtualizable_analyzer: majit_ir::effectinfo::VirtualizableAnalyzer,
@@ -1863,6 +1942,31 @@ impl CallControl {
     /// RPython: `setup_jitdriver(jitdriver_sd)` + `grab_initial_jitcodes()`.
     pub fn mark_portal(&mut self, path: CallPath) {
         self.portal_targets.insert(path);
+    }
+
+    /// `codewriter.py:91-94 CodeWriter.setup_vrefinfo(self, vrefinfo)`.
+    ///
+    /// ```python
+    /// def setup_vrefinfo(self, vrefinfo):
+    ///     # must be called at most once
+    ///     assert self.callcontrol.virtualref_info is None
+    ///     self.callcontrol.virtualref_info = vrefinfo
+    /// ```
+    ///
+    /// In pyre the body is split between
+    /// `pyre-jit::CodeWriter::setup_vrefinfo` (the warm-entry wrapper)
+    /// and this method on the underlying `CallControl`.  Mirrors
+    /// `setup_jitdriver` immediately above, which uses the same
+    /// codewriter-wrapper-to-callcontrol routing for
+    /// `codewriter.py:96-99`.
+    pub fn setup_vrefinfo(&mut self, vrefinfo: std::sync::Arc<dyn VirtualRefInfoHandle>) {
+        // codewriter.py:93 `assert self.callcontrol.virtualref_info is None`.
+        assert!(
+            self.virtualref_info.is_none(),
+            "setup_vrefinfo: must be called at most once (codewriter.py:92)"
+        );
+        // codewriter.py:94 `self.callcontrol.virtualref_info = vrefinfo`.
+        self.virtualref_info = Some(vrefinfo);
     }
 
     /// Register a JitDriver with its green/red/virtualizable layout.

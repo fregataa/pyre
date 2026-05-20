@@ -544,30 +544,15 @@ pub struct JitCodeMachine<'mi, S, R> {
     class_of_last_exc_is_const: bool,
     cls_of_box: Option<fn(i64) -> i64>,
     issubclass: Option<fn(i64, i64) -> bool>,
-    /// Outer interpreter program pc captured at `run_to_end` entry.
-    ///
-    /// `frame.pc` starts as the program pc but may be overwritten by
-    /// `BC_INLINE_CALL` (`frame.pc = frame.code_cursor`) or
-    /// `record_state_guard`'s temporary `frame.pc = resume_pc` swap.
-    /// Retained as a positional argument on the snapshot path for
-    /// diagnostic and debug surfaces only — the resume-side
-    /// `resolve_jitcode` closure clones `JitDriver::dispatch_jitcode`
-    /// for the root frame (RPython `metainterp_sd.jitcodes[portal_jd.index]`,
-    /// `resume.py:1338-1340`) without consulting the recorded value
-    /// (`build_state_field_snapshot` writes `0` into
-    /// `SnapshotFrame.jitcode_index` for the root).
-    portal_pc: usize,
     /// Outer interpreter pc captured BEFORE the
     /// `MIFrame::setup_call` reset (frame.rs:946 sets `frame.pc = 0`),
     /// supplied by callers that walk through `setup_call` between
     /// `MIFrame::setup` and `run_to_end`.  When `Some(pc)`, `run_to_end`
-    /// anchors `self.portal_pc` on this value instead of the
-    /// post-`setup_call` zero — so guard snapshots
-    /// (`build_state_field_snapshot` consumers reading `portal_pc + 1`)
-    /// land at the actual interpreter pc rather than `0 + 1 == 1`.
-    /// Mirrors RPython's portal pc handling where the outer interpreter
-    /// pc is preserved across `setup_call` (the new callee frame's pc=0
-    /// lives on a separate frame).
+    /// uses it for the `sym.begin_portal_op(pc)` hook and diagnostic
+    /// eprintln output instead of the post-`setup_call` zero.  Mirrors
+    /// RPython's portal pc handling where the outer interpreter pc is
+    /// preserved across `setup_call` (the new callee frame's pc=0 lives
+    /// on a separate frame).
     outer_program_pc: Option<usize>,
     /// `pyjitpl.py:1527` `MetaInterp.seen_loop_header_for_jdindex` parity.
     ///
@@ -679,6 +664,13 @@ where
         active: Option<ActiveStandardVirtualizable>,
     ) -> TraceAction {
         if Self::finish_standard_virtualizable_after_residual_call(active) {
+            // pyjitpl.py:3373-3375 `raise SwitchToBlackhole(ABORT_ESCAPE,
+            // raising_exception=True)` — stash the upstream-orthodox
+            // abort reason + `raising_exception` flag on TraceCtx so
+            // jitdriver-side `aborted_tracing(stb.reason)` fires with
+            // `ABORT_ESCAPE` instead of the generic too-long fallback.
+            ctx.pending_switch_to_blackhole =
+                Some(crate::pyjitpl::SwitchToBlackhole::abort_escape());
             TraceAction::Abort
         } else {
             ctx.guard_not_forced(sym.total_slots());
@@ -778,23 +770,23 @@ where
                     None
                 };
             sym.populate_frame_int_regs(&mut self.frames.frames[0]);
-            // `program_pc` is retained as a positional argument for
-            // diagnostic/debug surfaces only.  The resume-side closure
-            // resolves the root frame through `JitDriver::dispatch_jitcode`
-            // (RPython `metainterp_sd.jitcodes[portal_jd.index]`,
-            // `resume.py:1338-1340`), so this value is not consulted
-            // during blackhole reconstruction.  `self.portal_pc + 1`
-            // mirrors the historic "post-opcode-fetch" trace-entry pc.
-            let program_pc = self.portal_pc + 1;
             let op_live = ctx.metainterp_sd().op_live as u8;
             let all_liveness = ctx.metainterp_sd().liveness_info.clone();
+            // `pyjitpl.py:2610` `_snapshot_box_list` — clone the per-trace
+            // virtualizable / virtualref boxes so the snapshot builder
+            // can read them without keeping a `&TraceCtx` borrow alive
+            // alongside `&mut ctx.constants`.  Both vectors are short
+            // (one per live `@jit.virtualizable`, two per live vref).
+            let virtualizable_snapshot = ctx.virtualizable_boxes.clone().unwrap_or_default();
+            let virtualref_snapshot = ctx.virtualref_boxes.clone();
             let snapshot = build_state_field_snapshot(
                 self.frames,
-                program_pc as u32,
                 op_live,
                 &all_liveness,
                 &mut ctx.constants,
                 after_residual_call,
+                &virtualizable_snapshot,
+                &virtualref_snapshot,
             );
             for idx in 0..n {
                 // RPython pyjitpl.py:180-193 leaves the parent frame's
@@ -1094,7 +1086,6 @@ where
             class_of_last_exc_is_const: false,
             cls_of_box: None,
             issubclass: None,
-            portal_pc: 0,
             outer_program_pc: None,
             // pyjitpl.py:2882 / :2916 — sentinel "no loop_header seen yet".
             seen_loop_header_for_jdindex: -1,
@@ -1115,9 +1106,9 @@ where
     /// `run_to_end`.  `setup_call` resets `frame.pc = 0`
     /// (`frame.rs:946`) — preserving the new callee frame's "fresh"
     /// pc-zero entry per RPython's `MIFrame.setup_call` shape — but
-    /// that destroys the OUTER interpreter pc that `run_to_end` needs
-    /// for `self.portal_pc`.  Captures the pre-`setup_call` pc on the
-    /// machine so `run_to_end` can anchor on the outer-interpreter
+    /// that destroys the OUTER interpreter pc that `run_to_end` uses
+    /// for `sym.begin_portal_op`.  Captures the pre-`setup_call` pc on
+    /// the machine so `run_to_end` can anchor on the outer-interpreter
     /// program pc rather than the freshly-zeroed callee frame pc.
     pub fn set_outer_program_pc(&mut self, pc: usize) {
         self.outer_program_pc = Some(pc);
@@ -1405,8 +1396,8 @@ where
     }
 
     pub fn run_to_end(&mut self, ctx: &mut TraceCtx, sym: &mut S, runtime: &R) -> TraceAction {
-        // Stable program-pc anchor for state-field-JIT snapshots — the
-        // outer interpreter pc that `trace_jitcode` was invoked with.
+        // Stable program-pc anchor for the state-field-JIT portal op —
+        // the outer interpreter pc that `trace_jitcode` was invoked with.
         // Survives `BC_INLINE_CALL`'s `frame.pc = frame.code_cursor`
         // mutation and `record_state_guard`'s `frame.pc = resume_pc`
         // swap, both of which corrupt the live `frame.pc` past the
@@ -1416,17 +1407,15 @@ where
         // go through `MIFrame::setup_call` between `MIFrame::setup` and
         // `run_to_end` (e.g. `trace_jitcode` / `trace_jitcode_observer`
         // wrappers) capture the outer pc BEFORE the `setup_call` reset
-        // (`frame.rs:946 self.pc = 0`).  Without that, `frame.pc`
-        // observed here would be the freshly-zeroed callee entry, and
-        // `build_state_field_snapshot`'s `portal_pc + 1` would land on
-        // `1` regardless of the actual interpreter pc — corrupting
-        // bridge resume.  Falls back to `frame.pc` for callers that
-        // skip `setup_call` (e.g. legacy `framestack`-borrow paths
-        // where the frame is already populated upstream).
+        // (`frame.rs:946 self.pc = 0`).  Without that, the portal-op
+        // bookkeeping and diagnostics would anchor on the freshly-zeroed
+        // callee entry instead of the actual interpreter pc.  Falls back
+        // to `frame.pc` for callers that skip `setup_call` (e.g. legacy
+        // `framestack`-borrow paths where the frame is already populated
+        // upstream).
         let portal_pc = self
             .outer_program_pc
             .unwrap_or_else(|| self.frames.current_mut().pc);
-        self.portal_pc = portal_pc;
         sym.begin_portal_op(portal_pc);
         while !self.frames.is_empty() {
             // Catch panics from BigInt overflow in runtime stack operations.
@@ -3066,12 +3055,22 @@ where
                     if in_observer_mode() {
                         record_observed_void_call(concrete_ptr, &concrete_args);
                     }
-                    // pyjitpl.py:3687-3692 if self.last_exc_value: raise
-                    // SwitchToBlackhole(ABORT_ESCAPE, raising_exception=True).
+                    // `pyjitpl.py:3711-3716 do_not_in_trace_call`:
+                    //     if self.last_exc_value:
+                    //         raise SwitchToBlackhole(Counters.ABORT_ESCAPE,
+                    //                                  raising_exception=True)
                     // The exception value stays on `BH_LAST_EXC_VALUE`
                     // for the blackhole replay; do not clear it here.
+                    // Mirror `finalize_standard_virtualizable_may_force`
+                    // (`dispatch.rs:637-639`) by stashing
+                    // `SwitchToBlackhole::abort_escape()` on TraceCtx so
+                    // the jitdriver-side `TraceAction::Abort` consumer
+                    // fires `aborted_tracing(ABORT_ESCAPE)` instead of
+                    // the generic too-long fallback.
                     let exc = crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
                     if exc != 0 {
+                        ctx.pending_switch_to_blackhole =
+                            Some(crate::pyjitpl::SwitchToBlackhole::abort_escape());
                         return TraceAction::Abort;
                     }
                 } else {
@@ -3115,7 +3114,16 @@ where
                     //    non-NULL again, and every reader gates on
                     //    `last_exc_value` first.
                     self.clear_exception();
+                    // pyjitpl.py:3317-3324 `vable_and_vrefs_before_residual_call`
+                    // walks vrefs FIRST (stamps TOKEN_TRACING_RESCALL), then the
+                    // virtualizable.  Pyre splits the call into
+                    // `ctx.vrefs_before_residual_call()` + the vinfo branch in
+                    // `prepare_standard_virtualizable_before_residual_call`.
+                    // Without the vrefs stamp, `vrefs_after_residual_call`
+                    // misreads a fresh vref's `TOKEN_NONE` as "forced" and
+                    // wrongly emits `VIRTUAL_REF_FINISH` + `CONST_NULL`.
                     let active_vable = if is_forces {
+                        ctx.vrefs_before_residual_call();
                         self.prepare_standard_virtualizable_before_residual_call(ctx)
                     } else {
                         None
@@ -3144,6 +3152,29 @@ where
                     }
                     if in_observer_mode() {
                         record_observed_void_call(concrete_ptr, &concrete_args);
+                    }
+                    // pyjitpl.py:2046-2049 — after the residual call,
+                    // walk the vrefs.  If any were forced by the call
+                    // then VIRTUAL_REF_FINISH is recorded BEFORE any
+                    // CALL op is recorded.  RPython's `MetaInterp`
+                    // owns `virtualref_boxes`; pyre's per-trace
+                    // counterpart is on `TraceCtx` so the state-field
+                    // dispatch can reach the same data through `ctx`.
+                    //
+                    // Gated on `is_forces` because pyjitpl.py:2007-2049
+                    // runs `vable_and_vrefs_before_residual_call` +
+                    // `vrefs_after_residual_call` only inside the
+                    // `assembler_call or check_forces_virtual_or_virtualizable()`
+                    // branch.  The plain / release_gil / loopinvariant
+                    // path (pyjitpl.py:2084-2117) goes through
+                    // `execute_varargs` which never invokes either
+                    // hook — calling the after-hook there would see
+                    // tokens still at TOKEN_NONE (because the before-hook
+                    // never stamped TOKEN_TRACING_RESCALL) and
+                    // incorrectly record VIRTUAL_REF_FINISH for live
+                    // vrefs.
+                    if is_forces {
+                        ctx.vrefs_after_residual_call();
                     }
                     // 3. record IR (`history.record` →
                     //    `_record_helper_varargs`). pyjitpl.py:1995-2068
@@ -3343,8 +3374,15 @@ where
                     if in_observer_mode() {
                         record_observed_void_call(concrete_ptr, &concrete_args);
                     }
+                    // `pyjitpl.py:3711-3716 do_not_in_trace_call`:
+                    //     if self.last_exc_value: raise SwitchToBlackhole(
+                    //         Counters.ABORT_ESCAPE, raising_exception=True)
+                    // Same stash pattern as the void OS_NOT_IN_TRACE arm
+                    // above (`dispatch.rs:3022-3025`).
                     let exc = crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
                     if exc != 0 {
+                        ctx.pending_switch_to_blackhole =
+                            Some(crate::pyjitpl::SwitchToBlackhole::abort_escape());
                         return TraceAction::Abort;
                     }
                     let _ = dst;
@@ -3384,8 +3422,10 @@ where
                     // pyjitpl.py:2005-2010 MAY_FORCE_I branch parity:
                     //     clear_exception  ← FIRST
                     //     vable_and_vrefs_before_residual_call
+                    // (vrefs walk + vinfo stamp; see void arm for full citation).
                     self.clear_exception();
                     let active_vable = if is_forces {
+                        ctx.vrefs_before_residual_call();
                         self.prepare_standard_virtualizable_before_residual_call(ctx)
                     } else {
                         None
@@ -3412,6 +3452,13 @@ where
                     };
                     if in_observer_mode() {
                         record_observed_int_call(concrete_ptr, &concrete_args, concrete);
+                    }
+                    // pyjitpl.py:2046-2049 — vrefs_after_residual_call
+                    // (see void arm for the explanation; gated on
+                    // `is_forces` because the before-hook only stamps
+                    // TOKEN_TRACING_RESCALL in that branch).
+                    if is_forces {
+                        ctx.vrefs_after_residual_call();
                     }
                     let effect_info = calldescr.extra_info.clone();
                     // pyjitpl.py:2111-2115 do_residual_call plain branch:
@@ -3621,8 +3668,15 @@ where
                     if in_observer_mode() {
                         record_observed_void_call(concrete_ptr, &concrete_args);
                     }
+                    // `pyjitpl.py:3711-3716 do_not_in_trace_call`:
+                    //     if self.last_exc_value: raise SwitchToBlackhole(
+                    //         Counters.ABORT_ESCAPE, raising_exception=True)
+                    // Same stash pattern as the void OS_NOT_IN_TRACE arm
+                    // above (`dispatch.rs:3022-3025`).
                     let exc = crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
                     if exc != 0 {
+                        ctx.pending_switch_to_blackhole =
+                            Some(crate::pyjitpl::SwitchToBlackhole::abort_escape());
                         return TraceAction::Abort;
                     }
                     let _ = dst;
@@ -3661,9 +3715,11 @@ where
                     }
 
                     // pyjitpl.py:2005-2010 MAY_FORCE_R branch parity:
-                    // clear_exception precedes vable_and_vrefs_before_residual_call.
+                    // clear_exception precedes vable_and_vrefs_before_residual_call
+                    // (vrefs walk + vinfo stamp; see void arm for full citation).
                     self.clear_exception();
                     let active_vable = if is_forces {
+                        ctx.vrefs_before_residual_call();
                         self.prepare_standard_virtualizable_before_residual_call(ctx)
                     } else {
                         None
@@ -3687,6 +3743,13 @@ where
                     };
                     if in_observer_mode() {
                         record_observed_ref_call(concrete_ptr, &concrete_args, concrete);
+                    }
+                    // pyjitpl.py:2046-2049 — vrefs_after_residual_call
+                    // (see void arm for the explanation; gated on
+                    // `is_forces` because the before-hook only stamps
+                    // TOKEN_TRACING_RESCALL in that branch).
+                    if is_forces {
+                        ctx.vrefs_after_residual_call();
                     }
                     let effect_info = calldescr.extra_info.clone();
                     // pyjitpl.py:2111-2117 do_residual_call plain branch —
@@ -3858,8 +3921,15 @@ where
                     if in_observer_mode() {
                         record_observed_void_call(concrete_ptr, &concrete_args);
                     }
+                    // `pyjitpl.py:3711-3716 do_not_in_trace_call`:
+                    //     if self.last_exc_value: raise SwitchToBlackhole(
+                    //         Counters.ABORT_ESCAPE, raising_exception=True)
+                    // Same stash pattern as the void OS_NOT_IN_TRACE arm
+                    // above (`dispatch.rs:3022-3025`).
                     let exc = crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
                     if exc != 0 {
+                        ctx.pending_switch_to_blackhole =
+                            Some(crate::pyjitpl::SwitchToBlackhole::abort_escape());
                         return TraceAction::Abort;
                     }
                     let _ = dst;
@@ -3892,9 +3962,11 @@ where
                     }
 
                     // pyjitpl.py:2005-2010 MAY_FORCE_F branch parity:
-                    // clear_exception precedes vable_and_vrefs_before_residual_call.
+                    // clear_exception precedes vable_and_vrefs_before_residual_call
+                    // (vrefs walk + vinfo stamp; see void arm for full citation).
                     self.clear_exception();
                     let active_vable = if is_forces {
+                        ctx.vrefs_before_residual_call();
                         self.prepare_standard_virtualizable_before_residual_call(ctx)
                     } else {
                         None
@@ -3922,6 +3994,13 @@ where
                             &concrete_args,
                             concrete.to_bits() as i64,
                         );
+                    }
+                    // pyjitpl.py:2046-2049 — vrefs_after_residual_call
+                    // (see void arm for the explanation; gated on
+                    // `is_forces` because the before-hook only stamps
+                    // TOKEN_TRACING_RESCALL in that branch).
+                    if is_forces {
+                        ctx.vrefs_after_residual_call();
                     }
                     let effect_info = calldescr.extra_info.clone();
                     // pyjitpl.py:2111-2121 do_residual_call plain branch —
@@ -4019,10 +4098,11 @@ where
             //   1. clear_exception
             //   2. vable_and_vrefs_before_residual_call
             //   3. execute (CALL_MAY_FORCE_N via executor.execute_varargs)
-            //   4. vrefs_after_residual_call  (PRE-EXISTING-ADAPTATION: stub)
+            //   4. vrefs_after_residual_call
             //   5. record (CALL_ASSEMBLER_N via direct_assembler_call)
             //   6. vable_after_residual_call + GUARD_NOT_FORCED
-            //   7. handle_possible_exception (GUARD_NO_EXCEPTION / unwind)
+            //   7. KEEPALIVE on vablebox (`pyjitpl.py:2080-2081`)
+            //   8. handle_possible_exception (GUARD_NO_EXCEPTION / unwind)
             jitcode::insns::BC_CALL_ASSEMBLER_VOID => {
                 let (fn_ptr_idx, arg_regs) = {
                     let frame = self.frames.current_mut();
@@ -4053,9 +4133,17 @@ where
                 // 1. clear_exception (pyjitpl.py:2010)
                 self.clear_exception();
                 // 2. vable_and_vrefs_before_residual_call (pyjitpl.py:2017)
+                //    — vrefs walk FIRST stamps TOKEN_TRACING_RESCALL on every
+                //    live vref so `vrefs_after_residual_call` distinguishes
+                //    forced vs untouched; then the virtualizable half.
+                ctx.vrefs_before_residual_call();
                 let active_vable = self.prepare_standard_virtualizable_before_residual_call(ctx);
                 // 3. execute (pyjitpl.py:2039-2042, tp == 'v')
                 call_void_function(concrete_ptr, &concrete_args);
+                // 4. `pyjitpl.py:2046-2049 vrefs_after_residual_call` —
+                //    fire VIRTUAL_REF_FINISH for any vref forced by the
+                //    callee BEFORE the CALL_ASSEMBLER record below.
+                ctx.vrefs_after_residual_call();
                 // 5. record CALL_ASSEMBLER_N (pyjitpl.py:2053-2055
                 //    direct_assembler_call → history.record_nospec)
                 match _runtime.jitcell_token_arc_for_number(token_number) {
@@ -4066,13 +4154,24 @@ where
                 }
                 // 6. vable_after_residual_call + GUARD_NOT_FORCED
                 //    (pyjitpl.py:2078-2079)
+                let vable_opref = active_vable.as_ref().map(|a| a.vable_opref);
                 if matches!(
                     Self::finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
                     TraceAction::Abort
                 ) {
                     return TraceAction::Abort;
                 }
-                // 7. handle_possible_exception (pyjitpl.py:2082)
+                // 7. `pyjitpl.py:2080-2081`:
+                //        if vablebox is not None:
+                //            self.metainterp.history.record1(rop.KEEPALIVE,
+                //                                            vablebox, None)
+                //    Assembler-call branch threads the active vable
+                //    box through KEEPALIVE so the optimizer does not
+                //    DCE the box across the asm-side call boundary.
+                if let Some(vbox) = vable_opref {
+                    ctx.record_op(majit_ir::OpCode::Keepalive, &[vbox]);
+                }
+                // 8. handle_possible_exception (pyjitpl.py:2082)
                 match self.finish_call_assembler_exception_path(ctx, sym) {
                     TraceAction::Continue => {}
                     action => return action,
@@ -4281,18 +4380,27 @@ where
                     .jitcode
                     .call_assembler_target(fn_ptr_idx);
                 self.clear_exception();
+                // pyjitpl.py:2017 — vrefs walk + vinfo stamp before the call.
+                ctx.vrefs_before_residual_call();
                 let active_vable = self.prepare_standard_virtualizable_before_residual_call(ctx);
                 let concrete = call_int_function(concrete_ptr, &concrete_args);
+                // `pyjitpl.py:2046-2049 vrefs_after_residual_call`.
+                ctx.vrefs_after_residual_call();
                 let traced = match _runtime.jitcell_token_arc_for_number(token_number) {
                     Some(arc) => ctx.call_assembler_int_arc_typed(arc, &args, &arg_types),
                     None => ctx.call_assembler_int_by_number_typed(token_number, &args, &arg_types),
                 };
                 self.set_int_reg(dst, Some(traced), Some(concrete));
+                let vable_opref = active_vable.as_ref().map(|a| a.vable_opref);
                 if matches!(
                     Self::finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
                     TraceAction::Abort
                 ) {
                     return TraceAction::Abort;
+                }
+                // `pyjitpl.py:2080-2081` KEEPALIVE on the vable box.
+                if let Some(vbox) = vable_opref {
+                    ctx.record_op(majit_ir::OpCode::Keepalive, &[vbox]);
                 }
                 match self.finish_call_assembler_exception_path(ctx, sym) {
                     TraceAction::Continue => {}
@@ -4342,18 +4450,27 @@ where
                     .jitcode
                     .call_assembler_target(fn_ptr_idx);
                 self.clear_exception();
+                // pyjitpl.py:2017 — vrefs walk + vinfo stamp before the call.
+                ctx.vrefs_before_residual_call();
                 let active_vable = self.prepare_standard_virtualizable_before_residual_call(ctx);
                 let concrete = call_int_function(concrete_ptr, &concrete_args);
+                // `pyjitpl.py:2046-2049 vrefs_after_residual_call`.
+                ctx.vrefs_after_residual_call();
                 let traced = match _runtime.jitcell_token_arc_for_number(token_number) {
                     Some(arc) => ctx.call_assembler_ref_arc_typed(arc, &args, &arg_types),
                     None => ctx.call_assembler_ref_by_number_typed(token_number, &args, &arg_types),
                 };
                 self.set_ref_reg(dst, Some(traced), Some(concrete));
+                let vable_opref = active_vable.as_ref().map(|a| a.vable_opref);
                 if matches!(
                     Self::finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
                     TraceAction::Abort
                 ) {
                     return TraceAction::Abort;
+                }
+                // `pyjitpl.py:2080-2081` KEEPALIVE on the vable box.
+                if let Some(vbox) = vable_opref {
+                    ctx.record_op(majit_ir::OpCode::Keepalive, &[vbox]);
                 }
                 match self.finish_call_assembler_exception_path(ctx, sym) {
                     TraceAction::Continue => {}
@@ -4403,8 +4520,12 @@ where
                     .jitcode
                     .call_assembler_target(fn_ptr_idx);
                 self.clear_exception();
+                // pyjitpl.py:2017 — vrefs walk + vinfo stamp before the call.
+                ctx.vrefs_before_residual_call();
                 let active_vable = self.prepare_standard_virtualizable_before_residual_call(ctx);
                 let concrete = call_int_function(concrete_ptr, &concrete_args);
+                // `pyjitpl.py:2046-2049 vrefs_after_residual_call`.
+                ctx.vrefs_after_residual_call();
                 let traced = match _runtime.jitcell_token_arc_for_number(token_number) {
                     Some(arc) => ctx.call_assembler_float_arc_typed(arc, &args, &arg_types),
                     None => {
@@ -4412,11 +4533,16 @@ where
                     }
                 };
                 self.set_float_reg(dst, Some(traced), Some(concrete));
+                let vable_opref = active_vable.as_ref().map(|a| a.vable_opref);
                 if matches!(
                     Self::finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
                     TraceAction::Abort
                 ) {
                     return TraceAction::Abort;
+                }
+                // `pyjitpl.py:2080-2081` KEEPALIVE on the vable box.
+                if let Some(vbox) = vable_opref {
+                    ctx.record_op(majit_ir::OpCode::Keepalive, &[vbox]);
                 }
                 match self.finish_call_assembler_exception_path(ctx, sym) {
                     TraceAction::Continue => {}
@@ -5520,14 +5646,12 @@ pub(crate) fn call_void_function(func_ptr: *const (), args: &[i64]) {
 /// only used to materialize root state fields into the root frame's
 /// register banks before this PyPy-shaped walk.
 ///
-/// `program_pc` carries the outer interpreter pc as diagnostic context
-/// only.  The root frame resumes through the registered dispatch JitCode
-/// singleton; the top frame's `pc` here holds the *JitCode-internal*
-/// resume position (`record_state_guard` swapped it to the guard's orgpc
-/// just before this call), matching RPython's `pyjitpl.py:2596
-/// frame.pc = resumepc` swap.  Intermediate frames keep their natural
-/// `pc` (= return-to byte position in their jitcode, set by
-/// `BC_INLINE_CALL` at `dispatch.rs frame.pc = frame.code_cursor`).
+/// The top frame's `pc` here holds the *JitCode-internal* resume position
+/// (`record_state_guard` swapped it to the guard's orgpc just before this
+/// call), matching RPython's `pyjitpl.py:2596 frame.pc = resumepc` swap.
+/// Intermediate frames keep their natural `pc` (= return-to byte position
+/// in their jitcode, set by `BC_INLINE_CALL` at
+/// `dispatch.rs frame.pc = frame.code_cursor`).
 ///
 /// Multi-frame walk parallels RPython
 /// `opencoder.py:819 capture_resumedata` + `_ensure_parent_resumedata`:
@@ -5544,19 +5668,15 @@ pub(crate) fn call_void_function(func_ptr: *const (), args: &[i64]) {
 /// - non-root frames → `MIFrame.parent_descr_idx` (set by
 ///   `BC_INLINE_CALL` at sub-frame setup); resume walks
 ///   `parent.descrs[idx].as_jitcode()`.
-///
-/// `program_pc` is retained for diagnostic surfaces only; the resume
-/// closures ignore the root jitcode_index value.
-///
 pub fn build_state_field_snapshot(
     frames: &mut MIFrameStack,
-    program_pc: u32,
     op_live: u8,
     all_liveness: &[u8],
     pool: &mut crate::constant_pool::ConstantPool,
     after_residual_call: bool,
+    virtualizable_boxes: &[OpRef],
+    virtualref_boxes: &[(OpRef, usize)],
 ) -> crate::recorder::Snapshot {
-    let _ = program_pc;
     let frame_count = frames.frames.len();
     let mut snapshot_frames = Vec::with_capacity(frame_count);
     // Walk outer → inner (RPython _ensure_parent_resumedata convention).
@@ -5592,10 +5712,45 @@ pub fn build_state_field_snapshot(
             boxes,
         });
     }
+    // `pyjitpl.py:2610` `_snapshot_box_list(virtualizable_boxes /
+    // virtualref_boxes)` — both lists are appended to the snapshot
+    // as `SnapshotTagged::Box(opref, type)` entries.  The type
+    // comes from `OpRef::ty()` which carries the SSA-level result
+    // type that `_number_boxes` (`resume.py:210-216`) uses for
+    // TAG_BOX encoding on the resume side.
+    //
+    // `opencoder.py:718-726 _list_of_boxes_virtualizable` reorders
+    // the virtualizable list: the virtualizable identity (stored at
+    // `boxes[-1]` per `TraceCtx::init_virtualizable_boxes`) is moved
+    // to the FRONT, then the rest follow in original order.  The
+    // resume reader (`resume.py:1404 consume_vable_info` ↔
+    // `resume.rs:6477`) reads the first entry as the virtualizable
+    // pointer, so this reorder is load-bearing.
+    let mut vable_boxes_snap: Vec<crate::recorder::SnapshotTagged> = Vec::new();
+    if !virtualizable_boxes.is_empty() {
+        if let Some(last) = virtualizable_boxes.last() {
+            if let Some(ty) = last.ty() {
+                vable_boxes_snap.push(crate::recorder::SnapshotTagged::Box(*last, ty));
+            }
+        }
+        for opref in &virtualizable_boxes[..virtualizable_boxes.len() - 1] {
+            if let Some(ty) = opref.ty() {
+                vable_boxes_snap.push(crate::recorder::SnapshotTagged::Box(*opref, ty));
+            }
+        }
+    }
+    let vref_boxes_snap: Vec<crate::recorder::SnapshotTagged> = virtualref_boxes
+        .iter()
+        .flat_map(|(opref, _ptr)| {
+            opref
+                .ty()
+                .map(|ty| crate::recorder::SnapshotTagged::Box(*opref, ty))
+        })
+        .collect();
     crate::recorder::Snapshot {
         frames: snapshot_frames,
-        vable_boxes: Vec::new(),
-        vref_boxes: Vec::new(),
+        vable_boxes: vable_boxes_snap,
+        vref_boxes: vref_boxes_snap,
     }
 }
 
@@ -6561,11 +6716,12 @@ mod tests {
 
         let snapshot = build_state_field_snapshot(
             &mut stack,
-            42,
             jitcode::insns::BC_LIVE,
             asm.all_liveness(),
             &mut pool,
             false,
+            &[],
+            &[],
         );
 
         assert_eq!(snapshot.frames.len(), 1);
@@ -6623,11 +6779,12 @@ mod tests {
 
         let snapshot = build_state_field_snapshot(
             &mut stack,
-            0,
             jitcode::insns::BC_LIVE,
             asm.all_liveness(),
             &mut pool,
             false,
+            &[],
+            &[],
         );
 
         let f = &snapshot.frames[0];
@@ -6678,11 +6835,12 @@ mod tests {
 
         let snapshot = build_state_field_snapshot(
             &mut stack,
-            7,
             jitcode::insns::BC_LIVE,
             asm.all_liveness(),
             &mut pool,
             false,
+            &[],
+            &[],
         );
         assert_eq!(snapshot.frames.len(), 2);
         let root_frame = &snapshot.frames[0];
@@ -6737,11 +6895,12 @@ mod tests {
 
         let snapshot = build_state_field_snapshot(
             &mut stack,
-            0,
             jitcode::insns::BC_LIVE,
             asm.all_liveness(),
             &mut pool,
             false,
+            &[],
+            &[],
         );
 
         let f = &snapshot.frames[0];

@@ -876,8 +876,6 @@ pub struct MetaInterp<M: Clone> {
     pub(crate) compiled_loops: crate::optimizeopt::vec_assoc::VecAssoc<u64, CompiledEntry<M>>,
     pub(crate) tracing: Option<TraceCtx>,
     pub(crate) next_trace_id: u64,
-    /// RPython metainterp_sd.virtualref_info — shared VirtualRefInfo.
-    pub(crate) virtualref_info: crate::virtualref::VirtualRefInfo,
     /// JIT hooks for profiling and debugging.
     pub(crate) hooks: JitHooks,
     /// Pre-allocated token number for the trace currently being recorded.
@@ -954,9 +952,6 @@ pub struct MetaInterp<M: Clone> {
     /// Set by compile_bridge when optimizer returns retrace_requested=true.
     /// Checked by compile_bridge_trace to return RetraceNeeded.
     pub(crate) retrace_after_bridge: bool,
-    /// pyjitpl.py:3317 virtualref_boxes: pairs of (symbolic OpRef, concrete ptr).
-    /// Managed by opimpl_virtual_ref/opimpl_virtual_ref_finish.
-    pub(crate) virtualref_boxes: Vec<(OpRef, usize)>,
     /// compile.py:288-290 parity: preamble target tokens saved from Phase 1
     /// even when Phase 2 raises InvalidLoop.
     pending_preamble_tokens:
@@ -1220,7 +1215,7 @@ impl<M: Clone> MetaInterp<M> {
     /// `VirtualRefInfo` handed to `blackhole_from_resumedata` /
     /// `consume_virtualref_info` so JIT_VIRTUAL_REF handles decode.
     pub fn virtualref_info(&self) -> &crate::virtualref::VirtualRefInfo {
-        &self.virtualref_info
+        &self.staticdata.virtualref_info
     }
 
     /// framework.py `root_walker.walk_roots` parity for the JIT-side
@@ -1843,7 +1838,6 @@ impl<M: Clone> MetaInterp<M> {
             compiled_loops: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             tracing: None,
             next_trace_id: 1,
-            virtualref_info: crate::virtualref::VirtualRefInfo::new(),
             hooks: JitHooks::default(),
             pending_token: None,
             stats: JitStatsCounters::default(),
@@ -1866,7 +1860,6 @@ impl<M: Clone> MetaInterp<M> {
             potential_retrace_position: None,
             last_quasi_immutable_deps: Vec::new(),
             retrace_after_bridge: false,
-            virtualref_boxes: Vec::new(),
             pending_preamble_tokens: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             pending_frontend_boxes: None,
             cls_of_box: Some(default_cls_of_box),
@@ -2724,7 +2717,7 @@ impl<M: Clone> MetaInterp<M> {
         // live `VirtualRefInfo` from `MetaInterp.virtualref_info` so
         // OptVirtualize emit sites read the same cpu-attached descrs
         // PyPy's `cpu.fielddescrof(JIT_VIRTUAL_REF, ...)` would.
-        opt.set_vrefinfo(self.virtualref_info.clone());
+        opt.set_vrefinfo(self.virtualref_info().clone());
         // optimizer.py:787-789: constant_fold — allocate immutable objects
         // at compile time. Uses Box::leak for permanent allocation (immutable
         // objects are never freed, matching RPython's prebuilt constants).
@@ -3326,24 +3319,12 @@ impl<M: Clone> MetaInterp<M> {
                 frame.replace_active_box_in_frame(oldbox, newbox, oldbox_type);
             }
         }
-        // pyjitpl.py:3502-3505: virtualref_boxes walk
-        for slot in self.virtualref_boxes.iter_mut() {
-            if slot.0 == oldbox {
-                slot.0 = newbox;
-            }
-        }
         if let Some(ctx) = self.tracing.as_mut() {
-            // pyjitpl.py:3506-3512:
-            //     boxes = self.virtualizable_boxes
-            //     for i in range(len(boxes)):
-            //         if boxes[i] is oldbox:
-            //             boxes[i] = newbox
-            //     self.heapcache.replace_box(oldbox, newbox)
-            //
-            // The trace-context portion (virtualizable_boxes walk +
-            // heap_cache walk) lives on `TraceCtx::replace_box` so the
-            // trace_ctx-only call site in `_nonstandard_virtualizable`
-            // Step 4 shares the same helper.
+            // pyjitpl.py:3502-3512 virtualref_boxes + virtualizable_boxes
+            // + heapcache walks.  All three live on `TraceCtx`
+            // (`virtualref_boxes` per Item 3.3 move) and are unified
+            // inside `TraceCtx::replace_box`, shared with the state-field
+            // `_nonstandard_virtualizable` Step 4 caller.
             ctx.replace_box(oldbox, newbox);
         }
     }
@@ -3737,40 +3718,74 @@ impl<M: Clone> MetaInterp<M> {
             return OpRef::NONE;
         };
         // pyjitpl.py:1804: virtual_ref_during_tracing(virtual_obj)
-        let vref_info = crate::virtualref::VirtualRefInfo::new();
-        let vref_ptr = vref_info.virtual_ref_during_tracing(virtual_obj_ptr as *mut u8);
+        // `vrefinfo = self.staticdata.virtualref_info` (pyjitpl.py:1314).
+        let vref_ptr = self
+            .staticdata
+            .virtualref_info
+            .virtual_ref_during_tracing(virtual_obj_ptr as *mut u8);
         // pyjitpl.py:1805: cindex = ConstInt(len(virtualref_boxes) // 2)
-        let cindex = ctx.const_int((self.virtualref_boxes.len() / 2) as i64);
-        // pyjitpl.py:1806: record VIRTUAL_REF(box, cindex)
-        let vref = ctx.record_op(OpCode::VirtualRefR, &[virtual_obj, cindex]);
+        let cindex = ctx.const_int((ctx.virtualref_boxes.len() / 2) as i64);
+        // pyjitpl.py:1806-1807:
+        //   resbox = metainterp.history.record2(rop.VIRTUAL_REF, box, cindex, vref)
+        //   self.metainterp.heapcache.new(resbox)
+        // `TraceCtx::virtual_ref` bundles both so the heapcache `new`
+        // is not skipped (the inline `ctx.record_op(VirtualRefR, ...)`
+        // form bypassed `heap_cache.new_object` — pyjitpl.py:1807 parity).
+        let vref = ctx.virtual_ref(virtual_obj, cindex);
         // pyjitpl.py:1814: virtualref_boxes += [virtualbox, vrefbox]
-        self.virtualref_boxes.push((virtual_obj, virtual_obj_ptr));
-        self.virtualref_boxes.push((vref, vref_ptr as usize));
+        ctx.virtualref_boxes.push((virtual_obj, virtual_obj_ptr));
+        ctx.virtualref_boxes.push((vref, vref_ptr as usize));
         vref
     }
 
-    /// pyjitpl.py:1819-1831 opimpl_virtual_ref_finish parity.
-    /// Checks is_virtual_ref() on concrete vref before recording.
-    pub fn opimpl_virtual_ref_finish(&mut self, vref: OpRef, _virtual_obj: OpRef) {
+    /// pyjitpl.py:1819-1832 `opimpl_virtual_ref_finish` parity.
+    /// LIFO `virtualref_boxes.pop()` / `assert box == lastbox`, then
+    /// `is_virtual_ref(vrefbox)` gates the recorded VIRTUAL_REF_FINISH.
+    pub fn opimpl_virtual_ref_finish(&mut self, _vref: OpRef, virtual_obj: OpRef) {
         let Some(ctx) = self.tracing.as_mut() else {
             return;
         };
-        // pyjitpl.py:1827: check is_virtual_ref(vrefbox)
-        let vref_ptr = self
+        // `pyjitpl.py:1820-1822`:
+        //     vrefbox = metainterp.virtualref_boxes.pop()
+        //     lastbox = metainterp.virtualref_boxes.pop()
+        let (vrefbox, vref_ptr) = ctx
             .virtualref_boxes
-            .last()
-            .map(|&(_, ptr)| ptr)
-            .unwrap_or(0);
-        let vref_info = crate::virtualref::VirtualRefInfo::new();
-        let is_vref = vref_ptr != 0 && unsafe { vref_info.is_virtual_ref(vref_ptr as *const u8) };
+            .pop()
+            .expect("opimpl_virtual_ref_finish: missing vrefbox");
+        let (lastbox, lastbox_ptr) = ctx
+            .virtualref_boxes
+            .pop()
+            .expect("opimpl_virtual_ref_finish: missing virtualbox");
+        // `pyjitpl.py:1823 assert box.getref_base() == lastbox.getref_base()`
+        // — compare the concrete ref base, not the SSA OpRef.  PyPy permits
+        // alias boxes that share `getref_base()` but differ in box identity;
+        // an `OpRef`-identity assert would reject those.  Look up
+        // `virtual_obj`'s ref value through `ctx.constants` when it is a
+        // ConstPtr, falling back to the pre-pop side-table pointer that the
+        // matching `opimpl_virtual_ref(virtual_obj, virtual_obj_ptr)`
+        // recorded as `lastbox_ptr`.
+        let virtual_obj_ptr = match ctx.constants.get_value(virtual_obj) {
+            Some(Value::Ref(r)) => r.as_usize(),
+            _ => lastbox_ptr,
+        };
+        debug_assert_eq!(
+            virtual_obj_ptr, lastbox_ptr,
+            "opimpl_virtual_ref_finish: leaving frame ref != top virtualref ref \
+             (virtual_obj={:?}, lastbox={:?})",
+            virtual_obj, lastbox
+        );
+        // pyjitpl.py:1826-1832 `vrefinfo = ...; vref = vrefbox.getref_base();
+        //   if vrefinfo.is_virtual_ref(vref): record VIRTUAL_REF_FINISH`.
+        let is_vref = vref_ptr != 0
+            && unsafe {
+                self.staticdata
+                    .virtualref_info
+                    .is_virtual_ref(vref_ptr as *const u8)
+            };
         if is_vref {
-            // pyjitpl.py:3371: VIRTUAL_REF_FINISH(vrefbox, NULL)
+            // pyjitpl.py:1831-1832 `VIRTUAL_REF_FINISH(vrefbox, nullbox)`.
             let null = ctx.const_ref(0);
-            let _ = ctx.record_op(OpCode::VirtualRefFinish, &[vref, null]);
-        }
-        if self.virtualref_boxes.len() >= 2 {
-            self.virtualref_boxes.pop();
-            self.virtualref_boxes.pop();
+            let _ = ctx.record_op(OpCode::VirtualRefFinish, &[vrefbox, null]);
         }
     }
 
@@ -9348,7 +9363,7 @@ impl<M: Clone> MetaInterp<M> {
             deadframe_types.as_deref(),
             rd_virtuals.as_deref(),
             storage.map(|s| s.rd_pendingfields.as_slice()),
-            Some(&self.virtualref_info as &dyn crate::resume::VRefInfo),
+            Some(&self.staticdata.virtualref_info as &dyn crate::resume::VRefInfo),
             vinfo.map(|v| v.as_ref() as &dyn crate::resume::VirtualizableInfo),
             None, // ginfo — pyre has no greenfield mechanism
             &allocator,
@@ -10601,8 +10616,9 @@ impl<M: Clone> MetaInterp<M> {
         self.framestack.current_mut().setup_call(original_boxes);
         // pyjitpl.py:3272: assert self.portal_call_depth == 0
         debug_assert_eq!(self.portal_call_depth, 0);
-        // pyjitpl.py:3273: self.virtualref_boxes = []
-        self.virtualref_boxes.clear();
+        // pyjitpl.py:3273 `self.virtualref_boxes = []` is implicit: the
+        // backing vector lives on `TraceCtx`, which is fresh for every
+        // `MetaInterp::setup_tracing` cycle.
     }
 
     /// pyjitpl.py:3400-3406 `MetaInterp.rebuild_state_after_failure` —
@@ -12403,16 +12419,22 @@ impl<M: Clone> MetaInterp<M> {
     pub fn vable_and_vrefs_before_residual_call(&mut self) {
         // pyjitpl.py:3318-3324 — vrefinfo loop over odd indices.
         let vref_ptrs: Vec<usize> = self
-            .virtualref_boxes
-            .iter()
-            .enumerate()
-            .filter_map(|(i, (_, ptr))| (i % 2 == 1).then_some(*ptr))
-            .collect();
+            .tracing
+            .as_ref()
+            .map(|ctx| {
+                ctx.virtualref_boxes
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, (_, ptr))| (i % 2 == 1).then_some(*ptr))
+                    .collect()
+            })
+            .unwrap_or_default();
         for vref_ptr in vref_ptrs {
             // SAFETY: vref_ptr was registered by `opimpl_virtual_ref` with a
             // valid JitVirtualRef pointer; we only flip its token field.
             unsafe {
-                self.virtualref_info
+                self.staticdata
+                    .virtualref_info
                     .tracing_before_residual_call(vref_ptr as *mut u8);
             }
         }
@@ -12454,22 +12476,8 @@ impl<M: Clone> MetaInterp<M> {
     ///             self.stop_tracking_virtualref(i)
     /// ```
     pub fn vrefs_after_residual_call(&mut self) {
-        let mut forced_pairs: Vec<usize> = Vec::new();
-        let mut i = 0;
-        while i + 1 < self.virtualref_boxes.len() {
-            let vref_ptr = self.virtualref_boxes[i + 1].1;
-            // SAFETY: vref_ptr was registered by `opimpl_virtual_ref`.
-            let forced = unsafe {
-                self.virtualref_info
-                    .tracing_after_residual_call(vref_ptr as *mut u8)
-            };
-            if forced {
-                forced_pairs.push(i);
-            }
-            i += 2;
-        }
-        for pair_index in forced_pairs {
-            self.stop_tracking_virtualref(pair_index);
+        if let Some(ctx) = self.tracing.as_mut() {
+            ctx.vrefs_after_residual_call();
         }
     }
 
@@ -12545,26 +12553,21 @@ impl<M: Clone> MetaInterp<M> {
     /// none is added here.  An invariant violation will panic on
     /// indexing, matching upstream's `IndexError`.
     pub fn stop_tracking_virtualref(&mut self, i: usize) {
-        let virtualbox = self.virtualref_boxes[i].0;
-        let vrefbox = self.virtualref_boxes[i + 1].0;
-        // pyjitpl.py:3370 `self.history.record2(rop.VIRTUAL_REF_FINISH,
+        // `pyjitpl.py:3370` `self.history.record2(rop.VIRTUAL_REF_FINISH,
         // vrefbox, virtualbox, None)` — the active history is the
         // `MetaInterp.history` attribute and is never None when this
-        // method runs. Pyre's `MetaInterp.tracing` is the structural
+        // method runs.  Pyre's `MetaInterp.tracing` is the structural
         // counterpart; treating it as Optional here is a pyre-only test
         // fixture concession that contradicts upstream invariant.
-        // pyjitpl.py:3372 `self.virtualref_boxes[i+1] = CONST_NULL` is
-        // unconditional — the ref-typed null preserves the slot's Ref
-        // type for subsequent fail-arg type recovery and ref-typed
-        // guard processing (history.py:361
-        // `CONST_NULL = ConstPtr(ConstPtr.value)`).
+        // `pyjitpl.py:3372` `self.virtualref_boxes[i+1] = CONST_NULL`
+        // is unconditional — the ref-typed null preserves the slot's
+        // Ref type for subsequent fail-arg type recovery and ref-typed
+        // guard processing (`history.py:361 CONST_NULL = ConstPtr(...)`).
         let ctx = self
             .tracing
             .as_mut()
             .expect("stop_tracking_virtualref: MetaInterp.history is unconditional in upstream");
-        ctx.record_op(OpCode::VirtualRefFinish, &[vrefbox, virtualbox]);
-        let null_const = ctx.const_null();
-        self.virtualref_boxes[i + 1] = (null_const, 0);
+        ctx.stop_tracking_virtualref(i);
     }
 
     /// pyjitpl.py:2153-2172 `MIFrame._do_jit_force_virtual(allboxes, descr, pc)`.
@@ -13768,6 +13771,14 @@ pub struct MetaInterpStaticData {
     /// upstream `finish_setup(codewriter)` callback because pyre's
     /// codewriter pipeline is split across crates.
     pub jitdrivers_sd: Vec<crate::jitdriver::JitDriverStaticData>,
+    /// pyjitpl.py:1314 / 2267 `metainterp_sd.virtualref_info` — shared
+    /// `VirtualRefInfo` descriptor block.  Per-process singleton:
+    /// descriptor indices for the `virtual_token` / `forced` fields and
+    /// the `JitVirtualRef` size.  RPython places this on
+    /// `metainterp_sd` and every consumer (optimizer,
+    /// resume rebuild, tracing-side `vrefinfo.tracing_*_residual_call`)
+    /// reads it from there.
+    pub virtualref_info: crate::virtualref::VirtualRefInfo,
     /// `compile.py:667-671` `make_and_attach_done_descrs(targets)`
     /// attaches these five singletons to every target.  RPython calls
     /// `make_and_attach_done_descrs([self, cpu])` at
@@ -14170,8 +14181,18 @@ impl MetaInterpStaticData {
         // `make_jitcodes` time.
 
         // pyjitpl.py:2267 `self.virtualref_info = codewriter.callcontrol.virtualref_info`
-        // PRE-EXISTING-ADAPTATION: pyre's `CallControl` does not yet
-        // carry `virtualref_info`.
+        // PRE-EXISTING-ADAPTATION: `callcontrol.virtualref_info` carries
+        // the opaque codewriter-time
+        // [`majit_translate::jit_codewriter::call::VirtualRefInfoHandle`]
+        // (`u32` descr indices), but the staticdata slot now holds live
+        // `DescrRef` Arcs (`virtualref.py:32-42`) initialized in
+        // `MetaInterpStaticData::new` via the cached
+        // `vref_size_descr()` / `make_vref_field_descr_typed(...)`
+        // generators.  Bridging the handle into the live-Arc shape
+        // requires the handle trait to yield `DescrRef` Arcs rather
+        // than `u32` — until then the forwarding is a no-op and every
+        // downstream reader picks up the `VirtualRefInfo::default`
+        // already on staticdata.
 
         // pyjitpl.py:2268 `self.callinfocollection = codewriter.callcontrol.callinfocollection`
         self.callinfocollection = callcontrol.callinfocollection.clone();
@@ -14981,6 +15002,48 @@ mod metainterp_static_data_tests {
     }
 
     #[test]
+    fn opimpl_virtual_ref_finish_accepts_const_null_replacement_after_escape() {
+        // pyjitpl.py:3362-3372 `stop_tracking_virtualref` replaces the
+        // tracked vref slot with CONST_NULL when a residual call forced
+        // the vref.  The later `opimpl_virtual_ref_finish(box)` pops
+        // that CONST_NULL and simply skips the second VIRTUAL_REF_FINISH;
+        // it does not compare against the original vref op.
+        use crate::BackEdgeAction;
+        let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
+        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+        assert!(matches!(action, BackEdgeAction::StartedTracing));
+
+        let mut real_object = 0_u64;
+        let real_ptr = &mut real_object as *mut u64 as usize;
+        let virtual_obj = meta.trace_ctx().unwrap().const_ref(real_ptr as i64);
+        let vref = meta.opimpl_virtual_ref(virtual_obj, real_ptr);
+
+        meta.trace_ctx().unwrap().stop_tracking_virtualref(0);
+        let finish_count_before = meta
+            .tracing
+            .as_ref()
+            .unwrap()
+            .recorder
+            .ops()
+            .iter()
+            .filter(|op| op.opcode == OpCode::VirtualRefFinish)
+            .count();
+
+        meta.opimpl_virtual_ref_finish(vref, virtual_obj);
+
+        let ctx = meta.tracing.as_ref().unwrap();
+        assert!(ctx.virtualref_boxes.is_empty());
+        let finish_count_after = ctx
+            .recorder
+            .ops()
+            .iter()
+            .filter(|op| op.opcode == OpCode::VirtualRefFinish)
+            .count();
+        assert_eq!(finish_count_after, finish_count_before);
+    }
+
+    #[test]
     fn finishframe_raises_done_with_this_frame_void_when_stack_exhausted() {
         // pyjitpl.py:2493-2496: result_type == VOID + resultbox is None
         // → raise DoneWithThisFrameVoid().
@@ -15239,8 +15302,10 @@ mod metainterp_static_data_tests {
         meta.perform_call(mainjitcode.clone(), &[], None)
             .unwrap_err();
         assert_eq!(meta.framestack.len(), 1);
-        // Pre-populate virtualref_boxes to verify it gets cleared.
-        meta.virtualref_boxes.push((OpRef::int_op(99), 99));
+        // `pyjitpl.py:3273 self.virtualref_boxes = []` is structurally
+        // enforced now: the backing vector lives on `TraceCtx`, which
+        // is rebuilt per `MetaInterp::setup_tracing` cycle, so no
+        // pre-populate / re-assert is needed here.
 
         meta.initialize_state_from_start(mainjitcode, &[(JitArgKind::Int, OpRef::int_op(7), 7)]);
         assert_eq!(meta.framestack.len(), 1);
@@ -15249,7 +15314,6 @@ mod metainterp_static_data_tests {
             Some(OpRef::int_op(7))
         );
         assert_eq!(meta.framestack.current_mut().int_values[0], Some(7));
-        assert!(meta.virtualref_boxes.is_empty());
         // pyjitpl.py:3272 assert.
         assert_eq!(meta.portal_call_depth, 0);
     }

@@ -101,6 +101,29 @@ impl CodeWriter {
         }
     }
 
+    /// `codewriter.py:91-94 CodeWriter.setup_vrefinfo(self, vrefinfo)`.
+    ///
+    /// ```python
+    /// def setup_vrefinfo(self, vrefinfo):
+    ///     # must be called at most once
+    ///     assert self.callcontrol.virtualref_info is None
+    ///     self.callcontrol.virtualref_info = vrefinfo
+    /// ```
+    ///
+    /// RPython's `CodeWriter` owns `self.callcontrol`; pyre keeps
+    /// `CallControl` outside the `CodeWriter` (passed by `&mut` to
+    /// `transform_graph_to_jitcode`), so the wrapper takes
+    /// `callcontrol` as an explicit parameter and delegates to
+    /// [`CallControl::setup_vrefinfo`].  The at-most-once assertion
+    /// lives in the delegate.
+    pub fn setup_vrefinfo(
+        &self,
+        callcontrol: &mut CallControl,
+        vrefinfo: Arc<dyn crate::call::VirtualRefInfoHandle>,
+    ) {
+        callcontrol.setup_vrefinfo(vrefinfo);
+    }
+
     /// Get-or-build the program-wide `PyreCallRegistry` for the
     /// PYRE_RTYPER dual-gate.  Builds once per CodeWriter run and
     /// caches; subsequent calls reuse the same `Rc`.  The registry

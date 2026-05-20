@@ -338,6 +338,53 @@ pub struct TraceCtx {
     /// which deref's the pointer to invoke `executor::do_getfield_gc_*`.
     /// The fat pointer is `*const dyn Backend` (16 bytes on 64-bit).
     pub(crate) cpu: Option<*const dyn majit_backend::Backend>,
+    /// `pyjitpl.py:3389-3390` `raise SwitchToBlackhole(ABORT_ESCAPE,
+    /// raising_exception=True)` — RPython surfaces the abort reason and
+    /// the `raising_exception` flag as a real Python exception that
+    /// propagates out of `interpret()` to `_compile_and_run_once`
+    /// (`pyjitpl.py:2907-2916`), where the catch site invokes
+    /// `run_blackhole_interp_to_cancel_tracing(stb)` (`pyjitpl.py:2949`).
+    /// That helper does TWO things: (1) `aborted_tracing(stb.reason)`
+    /// accounting, (2) `convert_and_run_from_pyjitpl(self,
+    /// stb.raising_exception)` — converting the framestack into
+    /// blackhole interpreters and running them with the
+    /// `raising_exception` flag so the eventual exception is preserved
+    /// (`pyjitpl.py:3391-3393` comment).
+    ///
+    /// PRE-EXISTING-ADAPTATION: pyre's `TraceAction::Abort` carries no
+    /// payload, so the dispatch site (`finalize_standard_virtualizable_may_force`)
+    /// stashes the full `SwitchToBlackhole` here and the jitdriver-side
+    /// consumer drains it.  Currently only `stb.reason` is consumed —
+    /// the consumer mirrors only `pyjitpl.py:2491` `aborted_tracing(reason)`
+    /// accounting.  `stb.raising_exception` is preserved on this struct
+    /// but the `convert_and_run_from_pyjitpl` invocation
+    /// (`blackhole.rs:3011`, ported from `blackhole.py:1798`) is NOT yet
+    /// wired through this path; the helper-side exception raised during
+    /// the residual call is therefore silently dropped at the abort
+    /// boundary rather than re-raised via blackhole as RPython does.
+    /// Full `pyjitpl.py:2907 / 2949` cancel-tracing semantics needs
+    /// `BlackholeInterpBuilder` + `last_exc_value` plumbed to the
+    /// `TraceAction::Abort` consumer and a JitException return surface
+    /// on the back-edge runner — multi-session followup.
+    ///
+    /// `None` outside the brief window between the dispatch-site stash
+    /// and the jitdriver-side drain.
+    pub(crate) pending_switch_to_blackhole: Option<crate::pyjitpl::SwitchToBlackhole>,
+
+    /// `pyjitpl.py:3317 MetaInterp.virtualref_boxes`: pairs of `[virtualbox,
+    /// vrefbox]` for every `opimpl_virtual_ref` ↔ `opimpl_virtual_ref_finish`
+    /// LIFO scope.  Pyre stores `(OpRef, usize)` so the symbolic SSA value
+    /// and the concrete `JitVirtualRef*` pointer both live in one slot:
+    /// the OpRef feeds `replace_box` / `vrefs_after_residual_call`
+    /// re-tagging; the ptr feeds `vrefinfo.tracing_after_residual_call`
+    /// / `is_virtual_ref` runtime probes that decide whether a residual
+    /// call forced the ref or whether `VIRTUAL_REF_FINISH` should fire.
+    ///
+    /// Lives on `TraceCtx` (not `MetaInterp`) because RPython's
+    /// `MetaInterp` is per-`_compile_and_run_once` and pyre's
+    /// per-trace counterpart is this `TraceCtx`; cross-trace
+    /// MetaInterp would otherwise carry stale pairs.
+    pub(crate) virtualref_boxes: Vec<(OpRef, usize)>,
 }
 
 /// rlib/jit.py:592 default `trace_limit` — mirrored here so standalone
@@ -625,6 +672,100 @@ impl TraceCtx {
         result
     }
 
+    /// `pyjitpl.py:3317-3324 MetaInterp.vable_and_vrefs_before_residual_call`
+    /// — the vrefs half (the virtualizable-info half lives on
+    /// `JitCodeMachine::prepare_standard_virtualizable_before_residual_call`).
+    ///
+    /// ```python
+    /// vrefinfo = self.staticdata.virtualref_info
+    /// for i in range(1, len(self.virtualref_boxes), 2):
+    ///     vrefbox = self.virtualref_boxes[i]
+    ///     vref = vrefbox.getref_base()
+    ///     vrefinfo.tracing_before_residual_call(vref)
+    /// ```
+    ///
+    /// Stamps `TOKEN_TRACING_RESCALL` on every live vref's FORCE_TOKEN
+    /// field so `tracing_after_residual_call` can distinguish "forced
+    /// during the call" (token differs) from "untouched" (still
+    /// `TOKEN_TRACING_RESCALL`).  Without this pre-call stamp the
+    /// post-call check sees `TOKEN_NONE` on every fresh vref and
+    /// incorrectly flags it as forced.
+    pub fn vrefs_before_residual_call(&mut self) {
+        let mut i = 1;
+        while i < self.virtualref_boxes.len() {
+            let vref_ptr = self.virtualref_boxes[i].1;
+            // SAFETY: `vref_ptr` was registered by `opimpl_virtual_ref`
+            // with a valid `JitVirtualRef*`; `tracing_before_residual_call`
+            // only writes the token field.
+            unsafe {
+                self.metainterp_sd
+                    .virtualref_info
+                    .tracing_before_residual_call(vref_ptr as *mut u8);
+            }
+            i += 2;
+        }
+    }
+
+    /// `pyjitpl.py:3358-3367 MetaInterp.vrefs_after_residual_call`.
+    ///
+    /// ```python
+    /// def vrefs_after_residual_call(self):
+    ///     vrefinfo = self.staticdata.virtualref_info
+    ///     for i in range(0, len(self.virtualref_boxes), 2):
+    ///         vrefbox = self.virtualref_boxes[i+1]
+    ///         vref = vrefbox.getref_base()
+    ///         if vrefinfo.tracing_after_residual_call(vref):
+    ///             self.stop_tracking_virtualref(i)
+    /// ```
+    pub fn vrefs_after_residual_call(&mut self) {
+        let mut forced_pairs: Vec<usize> = Vec::new();
+        let mut i = 0;
+        while i + 1 < self.virtualref_boxes.len() {
+            let vref_ptr = self.virtualref_boxes[i + 1].1;
+            // SAFETY: `vref_ptr` was registered by `opimpl_virtual_ref`
+            // with a valid `JitVirtualRef*`; `tracing_after_residual_call`
+            // only reads the token field.
+            let forced = unsafe {
+                self.metainterp_sd
+                    .virtualref_info
+                    .tracing_after_residual_call(vref_ptr as *mut u8)
+            };
+            if forced {
+                forced_pairs.push(i);
+            }
+            i += 2;
+        }
+        for pair_index in forced_pairs {
+            self.stop_tracking_virtualref(pair_index);
+        }
+    }
+
+    /// `pyjitpl.py:3395-3402 MetaInterp.stop_tracking_virtualref(i)`.
+    ///
+    /// ```python
+    /// def stop_tracking_virtualref(self, i):
+    ///     virtualbox = self.virtualref_boxes[i]
+    ///     vrefbox = self.virtualref_boxes[i+1]
+    ///     # record VIRTUAL_REF_FINISH here, which is before the actual
+    ///     # CALL_xxx is recorded
+    ///     self.history.record2(rop.VIRTUAL_REF_FINISH, vrefbox, virtualbox, None)
+    ///     # mark this situation by replacing the vrefbox with ConstPtr(NULL)
+    ///     self.virtualref_boxes[i+1] = CONST_NULL
+    /// ```
+    pub fn stop_tracking_virtualref(&mut self, i: usize) {
+        let virtualbox = self.virtualref_boxes[i].0;
+        let vrefbox = self.virtualref_boxes[i + 1].0;
+        // `history.record2(VIRTUAL_REF_FINISH, vrefbox, virtualbox, None)`.
+        Self::do_record_op(
+            &mut self.recorder,
+            &self.constants,
+            OpCode::VirtualRefFinish,
+            &[vrefbox, virtualbox],
+        );
+        let null_const = self.const_null();
+        self.virtualref_boxes[i + 1] = (null_const, 0);
+    }
+
     /// Create a standalone TraceCtx for testing or external use.
     ///
     /// Internally synthesizes a fresh `Arc<MetaInterpStaticData>` —
@@ -720,6 +861,8 @@ impl TraceCtx {
             resumekey_original_loop_token: None,
             opref_concrete: std::collections::HashMap::new(),
             cpu: None,
+            pending_switch_to_blackhole: None,
+            virtualref_boxes: Vec::new(),
         }
     }
 
@@ -781,6 +924,8 @@ impl TraceCtx {
             resumekey_original_loop_token: None,
             opref_concrete: std::collections::HashMap::new(),
             cpu: None,
+            pending_switch_to_blackhole: None,
+            virtualref_boxes: Vec::new(),
         }
     }
 

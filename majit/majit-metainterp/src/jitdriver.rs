@@ -1744,17 +1744,58 @@ impl<S: JitState> JitDriver<S> {
                 if crate::majit_log_enabled() && self.meta.bridge_info().is_some() {
                     eprintln!("[bridge] Abort during bridge tracing");
                 }
-                // pyjitpl.py:2788-2807 blackhole_if_trace_too_long runs the
-                // segmenting / disable bookkeeping and returns the abort
-                // reason.  Unwind once with abort_trace_live + aborted_tracing
-                // matching RPython's `raise SwitchToBlackhole(ABORT_TOO_LONG)`
-                // → `_interpret` handler → `aborted_tracing(reason)` shape.
-                let reason = self
+                // `pyjitpl.py:2491` `except SwitchToBlackhole as stb:
+                // self.aborted_tracing(stb.reason)` — the
+                // `aborted_tracing(reason)` accounting half of RPython's
+                // abort handling.  Dispatch-side
+                // `finalize_standard_virtualizable_may_force` stashes
+                // `SwitchToBlackhole(ABORT_ESCAPE, raising_exception=True)`
+                // (`pyjitpl.py:3389-3390`) on
+                // `TraceCtx::pending_switch_to_blackhole`; drain it
+                // here so `stb.reason` flows into
+                // `aborted_tracing(reason)`.  Falls back to the
+                // `blackhole_if_trace_too_long`-derived
+                // `AbortReason::Generic` for the
+                // `SwitchToBlackhole(ABORT_TOO_LONG)`
+                // path (`pyjitpl.py:2807`).
+                //
+                // PRE-EXISTING-ADAPTATION: virtualizable-escape aborts
+                // in RPython actually flow through
+                // `pyjitpl.py:2907-2916 _compile_and_run_once` →
+                // `pyjitpl.py:2949 run_blackhole_interp_to_cancel_tracing(stb)`,
+                // which calls `aborted_tracing(stb.reason)` AND
+                // `convert_and_run_from_pyjitpl(self,
+                // stb.raising_exception)` — the latter converts the
+                // framestack into blackhole interpreters and runs them
+                // with the `raising_exception` flag so the residual
+                // call's eventual exception is preserved
+                // (`pyjitpl.py:3391-3393` comment).  Pyre wires only
+                // the accounting half here; the `convert_and_run_from_pyjitpl`
+                // helper exists at `blackhole.rs:3011` (port of
+                // `blackhole.py:1798`) but is not yet invoked from
+                // this consumer, so `stb.raising_exception` is
+                // currently a no-op and the helper-side exception is
+                // dropped at the abort boundary.  Full cancel-tracing
+                // semantics requires `BlackholeInterpBuilder` +
+                // `last_exc_value` plumbed here and a JitException
+                // return surface on the back-edge runner —
+                // multi-session followup.
+                let pending_reason = self
                     .meta
-                    .blackhole_if_trace_too_long()
-                    .unwrap_or(AbortReason::Generic);
+                    .tracing
+                    .as_mut()
+                    .and_then(|t| t.pending_switch_to_blackhole.take())
+                    .map(|stb| stb.reason);
+                let reason_int = match pending_reason {
+                    Some(r) => r,
+                    None => self
+                        .meta
+                        .blackhole_if_trace_too_long()
+                        .unwrap_or(AbortReason::Generic)
+                        .as_int(),
+                };
                 self.meta.abort_trace_live(false);
-                self.meta.aborted_tracing(reason.as_int());
+                self.meta.aborted_tracing(reason_int);
                 self.sym = None;
                 self.meta.clear_trace_session();
             }
@@ -2185,7 +2226,10 @@ impl<S: JitState> JitDriver<S> {
                     Some(&exit_layout.exit_types),
                     rd_virtuals_slice,
                     Some(&storage.rd_pendingfields), // rd_guard_pendingfields
-                    Some(&self.meta_interp().virtualref_info as &dyn crate::resume::VRefInfo),
+                    Some(
+                        &self.meta_interp().staticdata.virtualref_info
+                            as &dyn crate::resume::VRefInfo,
+                    ),
                     None, // vinfo
                     None, // ginfo
                     allocator,
@@ -4006,7 +4050,10 @@ impl<S: JitState> JitDriver<S> {
                     Some(exit_layout.exit_types.as_slice()),
                     rd_virtuals_slice,
                     Some(&storage.rd_pendingfields), // rd_guard_pendingfields
-                    Some(&self.meta_interp().virtualref_info as &dyn crate::resume::VRefInfo),
+                    Some(
+                        &self.meta_interp().staticdata.virtualref_info
+                            as &dyn crate::resume::VRefInfo,
+                    ),
                     None, // vinfo
                     None, // ginfo
                     allocator,

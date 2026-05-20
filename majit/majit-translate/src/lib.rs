@@ -946,6 +946,22 @@ fn build_canonical_opcode_dispatch(
     // invariant).
     let mut codewriter = codewriter::CodeWriter::new();
 
+    // `warmspot.py:262-264` `vrefinfo = VirtualRefInfo(self);
+    //  self.codewriter.setup_vrefinfo(vrefinfo)` — installs the
+    // virtualref descr-index carrier on the codewriter's callcontrol
+    // BEFORE `make_jitcodes` runs (line 281 in warmspot).  Pyre uses
+    // a const-backed `DefaultVirtualRefInfoHandle` so majit-translate
+    // can perform the install without depending on majit-metainterp
+    // (the concrete `VirtualRefInfo` lives there).  The runtime path
+    // through `MetaInterpStaticData::finish_setup` reads the handle
+    // back at `pyjitpl.py:2267 self.virtualref_info = codewriter.
+    // callcontrol.virtualref_info` parity, so this site is the
+    // codewrite-time anchor for that read.
+    codewriter.setup_vrefinfo(
+        call_control,
+        std::sync::Arc::new(call::DefaultVirtualRefInfoHandle),
+    );
+
     // Phase 1: RPython grab_initial_jitcodes + drain portal + callees.
     // RPython call.py:145-148.
     call_control.grab_initial_jitcodes();
