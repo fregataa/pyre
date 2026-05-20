@@ -32,7 +32,7 @@
 //! `function_graph_to_flowspace`:
 //!
 //! 1. **Annotation lift** — clone pyre's
-//!    `AnnotationState.some_values` (`ValueId → Rc<SomeValue>`,
+//!    `graph.variable(vid).annotation` cells (`Rc<RefCell<Option<Rc<SomeValue>>>>`,
 //!    `Variable.annotation` analogue) onto freshly-allocated
 //!    `flowspace::Variable`s. Variable identity is block-local per
 //!    `flowspace/model.py:checkgraph`; the adapter keeps a
@@ -53,7 +53,7 @@
 //!    returnblock's inputarg is materialised as the canonical
 //!    flowspace return `Variable`.
 //!
-//! [`crate::translator::rtyper::cutover::specialize_legacy_graph_with_registry_seed`]
+//! [`crate::translator::rtyper::cutover::specialize_legacy_graph_with_registry_returning_value_to_var`]
 //! drives this adapter, runs `RPythonTyper::specialize`, and returns
 //! the per-`ValueId` `Variable` map + per-`ValueId` `Constant.concretetype`
 //! `LowLevelType` table that consumers project to `ConcreteType` on demand.
@@ -67,7 +67,6 @@ use crate::flowspace::model::{
     FunctionGraph as FlowspaceGraph, HOST_ENV, Hlvalue, HostObject, Link as FlowspaceLink,
     SpaceOperation as FlowspaceOp, Variable, c_last_exception,
 };
-use crate::jit_codewriter::annotation_state::AnnotationState;
 use crate::model::{
     BlockId, ExitCase, ExitSwitch, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueId,
 };
@@ -94,23 +93,33 @@ pub use crate::jit_codewriter::annotation_state::valuetype_to_someshell;
 /// `Variable::new` allocates a fresh process-wide identity
 /// (`flowspace/model.rs:2042`). Identity correspondence is preserved
 /// out-of-band by [`ValueIdToVariable`].
-fn seed_variable(vid: ValueId, annotations: &AnnotationState) -> Variable {
+fn seed_variable(vid: ValueId, legacy: &FunctionGraph) -> Variable {
     let var = Variable::new();
-    // Copy the precise per-`ValueId` `SomeValue` onto
-    // `Variable.annotation`, matching upstream `_setbinding(v, s_value)`
-    // semantics (`rpython/annotator/annrpython.py:333-340`).
+    // Copy the precise per-`Variable.annotation` `SomeValue` shell
+    // from the legacy graph onto the freshly minted Variable,
+    // matching upstream `_setbinding(v, s_value)` semantics
+    // (`rpython/annotator/annrpython.py:333-340`).
     //
-    // Invariant from `AnnotationState::set`: every non-`Unknown`
-    // `ValueType` write pairs with a `some_values` shell via
-    // `valuetype_to_someshell`, and `Unknown` writes clear
-    // `some_values` outright.  `Some(s)` therefore covers every
-    // populated entry; a missing entry corresponds to either an
-    // unpopulated slot or `ValueType::Unknown`, both of which leave
-    // `Variable.annotation` empty — the rtyper then fails at
-    // `bindingrepr` with `KeyError: no binding for arg` on first
-    // touch, surfacing the producer-side gap rather than silently
-    // bridging to `GcRef` via a fabricated `SomeInstance(None)` shell.
-    if let Some(s) = annotations.some(vid) {
+    // Source: tests that hand-seed annotations call
+    // `legacy_annotator::setbinding(&legacy.variable(vid), ty)` before
+    // reaching here;
+    // the production `addpendingblock` flowin path leaves
+    // `legacy.variable(vid).annotation` empty so the fresh Variable
+    // starts unannotated and flowin populates it via `setbinding`.
+    // The dual-gate baseline that calls `legacy_annotator::annotate`
+    // runs AFTER specialize completes (cutover.rs:dual_gate_check /
+    // dual_gate_check_with_registry baseline section), so the wider
+    // legacy lift never reaches this site.
+    //
+    // A missing entry corresponds to either an unpopulated slot or
+    // `ValueType::Unknown`, both of which leave `Variable.annotation`
+    // empty — the rtyper then fails at `bindingrepr` with `KeyError:
+    // no binding for arg` on first touch, surfacing the producer-
+    // side gap rather than silently bridging to `GcRef` via a
+    // fabricated `SomeInstance(None)` shell.
+    if let Some(legacy_var) = legacy.variable(vid)
+        && let Some(s) = legacy_var.annotation.borrow().as_ref()
+    {
         *var.annotation.borrow_mut() = Some(s.clone());
     }
     var
@@ -160,17 +169,19 @@ fn seed_variable(vid: ValueId, annotations: &AnnotationState) -> Variable {
 /// (`build_value_to_variable_map_*`); production cutover code must use
 /// the per-block maps owned by `function_graph_to_flowspace`.
 #[cfg(test)]
-pub(crate) fn build_value_to_variable_map(
-    legacy: &FunctionGraph,
-    annotations: &AnnotationState,
-) -> ValueIdToVariable {
+pub(crate) fn build_value_to_variable_map(legacy: &FunctionGraph) -> ValueIdToVariable {
+    // Callers that hand-seed test fixtures must write directly to
+    // `legacy.variable(vid).annotation` via
+    // `legacy_annotator::setbinding(&var, ty)` before invoking this so
+    // downstream `seed_variable` reads through the orthodox
+    // `Variable.annotation` carrier.
     let mut map: ValueIdToVariable = HashMap::new();
     for block in &legacy.blocks {
         // Class 1a — block-inputarg definitions.
         let inputarg_vids = block.inputarg_value_ids(legacy);
         for vid in &inputarg_vids {
             map.entry(*vid)
-                .or_insert_with(|| seed_variable(*vid, annotations));
+                .or_insert_with(|| seed_variable(*vid, legacy));
         }
 
         // Per-block name → inputarg-Variable lookup for `OpKind::Input`
@@ -212,25 +223,23 @@ pub(crate) fn build_value_to_variable_map(
                 name_to_inputarg_var
                     .get(name.as_str())
                     .cloned()
-                    .unwrap_or_else(|| seed_variable(result, annotations))
+                    .unwrap_or_else(|| seed_variable(result, legacy))
             } else {
-                seed_variable(result, annotations)
+                seed_variable(result, legacy)
             };
             map.insert(result, var);
         }
         // Class 3 — exitswitch-referenced values.
         if let Some(crate::model::ExitSwitch::Value(var)) = &block.exitswitch {
             if let Some(vid) = legacy.value_id_of(var) {
-                map.entry(vid)
-                    .or_insert_with(|| seed_variable(vid, annotations));
+                map.entry(vid).or_insert_with(|| seed_variable(vid, legacy));
             }
         }
         // Class 2 — link-side sentinels.
         for link in &block.exits {
             for arg in &link.args {
                 if let Some(vid) = arg.as_value(legacy) {
-                    map.entry(vid)
-                        .or_insert_with(|| seed_variable(vid, annotations));
+                    map.entry(vid).or_insert_with(|| seed_variable(vid, legacy));
                 }
             }
             if let Some(vid) = link
@@ -238,16 +247,14 @@ pub(crate) fn build_value_to_variable_map(
                 .as_ref()
                 .and_then(|a| a.as_value(legacy))
             {
-                map.entry(vid)
-                    .or_insert_with(|| seed_variable(vid, annotations));
+                map.entry(vid).or_insert_with(|| seed_variable(vid, legacy));
             }
             if let Some(vid) = link
                 .last_exc_value
                 .as_ref()
                 .and_then(|a| a.as_value(legacy))
             {
-                map.entry(vid)
-                    .or_insert_with(|| seed_variable(vid, annotations));
+                map.entry(vid).or_insert_with(|| seed_variable(vid, legacy));
             }
         }
     }
@@ -1208,7 +1215,8 @@ pub struct FlowspaceAdapterOutput {
     /// via `Constant::with_concretetype` (`flowspace_adapter.rs:518-527`),
     /// matching RPython's `Constant.concretetype` ground truth.  Slice 2
     /// reads the per-`ValueId` `LowLevelType` directly so the projector
-    /// does not have to reconstruct the kind from `AnnotationState`.
+    /// does not have to reconstruct the kind from the reduced legacy
+    /// `ValueType` view.
     pub constant_concretetypes: HashMap<ValueId, LowLevelType>,
     /// `BlockId → flowspace::BlockRef` mapping. Includes the canonical
     /// `returnblock` and `exceptblock` (mapped to the
@@ -1333,14 +1341,13 @@ fn link_extravar_to_hlvalue(
     graph: &FunctionGraph,
     value_map: &mut HashMap<ValueId, Hlvalue>,
     value_to_var: &mut ValueIdToVariable,
-    annotations: &AnnotationState,
 ) -> Result<Hlvalue, TyperError> {
     match arg.as_value(graph) {
         Some(vid) => {
             if let Some(existing) = value_map.get(&vid).cloned() {
                 return Ok(existing);
             }
-            let var = seed_variable(vid, annotations);
+            let var = seed_variable(vid, graph);
             value_to_var.entry(vid).or_insert_with(|| var.clone());
             let hlvalue = Hlvalue::Variable(var);
             value_map.insert(vid, hlvalue.clone());
@@ -1360,7 +1367,7 @@ fn link_extravar_to_hlvalue(
 }
 
 /// Derive per-inputarg `SomeValue` cells for a subject's startblock,
-/// preferring the explicit `seed_annotations` source (test-fixture
+/// preferring an explicit `Variable.annotation` seed (test-fixture
 /// hand-built graphs without front-end Input ops) and falling through
 /// to the `OpKind::Input { name, ty }` ops the front-end emits at
 /// `front/ast.rs:2107-2125` (self) and `:2168-2184` (typed params).
@@ -1369,8 +1376,9 @@ fn link_extravar_to_hlvalue(
 /// position order.
 ///
 /// Resolution order per inputarg `vid`:
-/// 1. `seed_annotations.get_some_value(vid)` (`Slice 12.2` test entry)
-///    — minimal fixtures supply Variable-shape annotations explicitly.
+/// 1. `legacy.variable(vid).annotation` — minimal fixtures supply
+///    Variable-shape annotations explicitly via
+///    `legacy_annotator::setbinding(&var, ty)`.
 /// 2. Matching `OpKind::Input { ty }` op result == `vid` at the
 ///    startblock — production graphs from `front/ast.rs`.
 ///
@@ -1380,14 +1388,13 @@ fn link_extravar_to_hlvalue(
 ///   divergence (every typed param emits the Input op alongside the
 ///   inputargs registration in the front pass; a missing Input op
 ///   means the producer wired the inputarg without declaring its
-///   type and no seed_annotations entry was supplied either).
+///   type and no `Variable.annotation` shell was supplied either).
 /// - `valuetype_to_someshell(ty)` returns `None` for the resolved
 ///   `ValueType` (only `ValueType::Unknown`) — the inputarg's type
 ///   is an annotation gap; the helper surfaces it the same way
 ///   `seed_variable` does (`flowspace_adapter.rs:99-115`).
 pub(crate) fn derive_subject_inputcells(
     legacy: &FunctionGraph,
-    seed_annotations: Option<&crate::jit_codewriter::annotation_state::AnnotationState>,
 ) -> Result<Vec<crate::annotator::model::SomeValue>, TyperError> {
     let startblock = &legacy.blocks[legacy.startblock.0];
     let mut input_ty_by_result: HashMap<ValueId, &crate::model::ValueType> = HashMap::new();
@@ -1402,13 +1409,15 @@ pub(crate) fn derive_subject_inputcells(
     let startblock_vids = startblock.inputarg_value_ids(legacy);
     let mut cells = Vec::with_capacity(startblock_vids.len());
     for (idx, vid) in startblock_vids.iter().enumerate() {
-        // 1. Explicit SomeValue seed (test fixtures and any caller
-        //    that wants to bypass the ValueType projection).
-        if let Some(seed) = seed_annotations {
-            if let Some(rc) = seed.some_values.get(vid) {
-                cells.push((**rc).clone());
-                continue;
-            }
+        // 1. Explicit SomeValue seed published onto
+        //    `legacy.variable(vid).annotation` (test fixtures seed via
+        //    `legacy_annotator::setbinding(&var, ty)` before invoking
+        //    this function).
+        if let Some(var) = legacy.variable(*vid)
+            && let Some(rc) = var.annotation.borrow().as_ref()
+        {
+            cells.push((**rc).clone());
+            continue;
         }
         // 2. Front-end Input op at the startblock.
         if let Some(ty) = input_ty_by_result.get(vid) {
@@ -1423,14 +1432,14 @@ pub(crate) fn derive_subject_inputcells(
             cells.push(shell);
             continue;
         }
-        // No further fallback: `AnnotationState::set` always writes
-        // `some_values` for non-`Unknown` `ValueType`s, so reaching here
-        // implies the inputarg has neither an explicit SomeValue seed
-        // nor a startblock Input op.
+        // No further fallback: every typed parameter emits the Input
+        // op alongside the inputargs registration; reaching here implies
+        // the inputarg has neither a published `Variable.annotation`
+        // shell nor a startblock Input op.
         return Err(TyperError::message(format!(
             "derive_subject_inputcells: startblock.inputargs[{idx}] \
              ({vid:?}) has no matching `OpKind::Input {{ ty }}` op at \
-             the startblock and no `seed_annotations.some_values` entry — \
+             the startblock and no `Variable.annotation` shell — \
              front-end producer divergence (every typed parameter emits \
              the Input op alongside the inputargs registration; see \
              `front/ast.rs:2107-2184`)"
@@ -1439,10 +1448,9 @@ pub(crate) fn derive_subject_inputcells(
     Ok(cells)
 }
 
-/// One-way conversion from the legacy `crate::model::FunctionGraph` +
-/// `AnnotationState` pair into a `flowspace::FunctionGraph` whose
-/// blocks carry `Hlvalue` operands and per-value `SomeValue`
-/// annotations on its `Variable`s.
+/// One-way conversion from the legacy `crate::model::FunctionGraph`
+/// into a `flowspace::FunctionGraph` whose blocks carry `Hlvalue`
+/// operands and per-value `SomeValue` annotations on its `Variable`s.
 ///
 /// Two-pass topology assembly:
 ///
@@ -1463,57 +1471,30 @@ pub(crate) fn derive_subject_inputcells(
 /// unported OpKind variant surfaces a fail-loud `TyperError` from this
 /// function. Trivial graphs (only `Input` / `ConstInt` / `ConstFloat`
 /// op definitions) flow through cleanly.
+///
+/// Phase 2 (addpendingblock conversion) — production path no longer
+/// pre-seeds `Variable.annotation` from `legacy_annotator::annotate`.
+/// Once the cutover entry queues the subject's startblock onto the
+/// orthodox `addpendingblock` queue
+/// (`cutover.rs:specialize_legacy_graph_with_registry_returning_value_to_var`),
+/// `complete_pending_blocks` drives `flowin` which writes
+/// `Variable.annotation` for every reachable inputarg and op result.
+/// Carrying the legacy pre-seed alongside flowin caused
+/// `setbinding: new value does not contain old` panics at
+/// `annrpython.rs:459` whenever flowin's `follow_link` computed a
+/// narrower annotation (e.g., constant-tracking `SomeInteger{const,
+/// nonneg}`) than legacy_annotator's wider lift.
+///
+/// Test fixtures that hand-roll minimal SSA graphs without
+/// production-shape `OpKind::Input { ty }` ops must seed
+/// `legacy.variable(vid).annotation` directly via
+/// `legacy_annotator::setbinding(&var, ValueType::…)` before calling
+/// this function so `seed_variable` reads the right shell.
 pub fn function_graph_to_flowspace(
     legacy: &FunctionGraph,
     // Slice A.2 plumbing — see [`translate_op`].
     call_registry: &crate::translator::rtyper::pyre_call_registry::PyreCallRegistry,
 ) -> Result<FlowspaceAdapterOutput, TyperError> {
-    function_graph_to_flowspace_with_seed_annotations(legacy, None, call_registry)
-}
-
-/// Slice 12.2 — explicit annotation seed entry for unit-test fixtures
-/// that build minimal SSA graphs without `OpKind::Input { ty }` ops.
-///
-/// Production callers go through [`function_graph_to_flowspace`] and
-/// rely on the internal `legacy_annotator::annotate(legacy)` call to
-/// recover types from production-shape Input / FieldRead / Call ops
-/// the front-end emits.  Tests that hand-roll an SSA graph without
-/// those ops must seed the annotator-state explicitly so
-/// `seed_variable` can attach `Variable.annotation` shells the rtyper
-/// reads at `bindingrepr` time.
-///
-/// `seed_annotations: None` keeps the production path; `Some(state)`
-/// lets the test override the internal computation with hand-built
-/// `(ValueId, ValueType)` pairs.
-pub fn function_graph_to_flowspace_with_seed_annotations(
-    legacy: &FunctionGraph,
-    seed_annotations: Option<&AnnotationState>,
-    call_registry: &crate::translator::rtyper::pyre_call_registry::PyreCallRegistry,
-) -> Result<FlowspaceAdapterOutput, TyperError> {
-    // Phase 2 (addpendingblock conversion) — production path no longer
-    // pre-seeds `Variable.annotation` from `legacy_annotator::annotate`.
-    // Once the cutover entry queues the subject's startblock onto the
-    // orthodox `addpendingblock` queue
-    // (`cutover.rs:specialize_legacy_graph_with_registry_seed`),
-    // `complete_pending_blocks` drives `flowin` which writes
-    // `Variable.annotation` for every reachable inputarg and op result.
-    // Carrying the legacy pre-seed alongside flowin caused
-    // `setbinding: new value does not contain old` panics at
-    // `annrpython.rs:459` whenever flowin's `follow_link` computed a
-    // narrower annotation (e.g., constant-tracking `SomeInteger{const,
-    // nonneg}`) than legacy_annotator's wider lift.
-    //
-    // Test fixtures keep the explicit `seed_annotations` injection so
-    // hand-built minimal SSA graphs that bypass front-end Input ops can
-    // still seed the `value_to_var` shells `seed_variable` reads.
-    let empty_annotations;
-    let annotations: &AnnotationState = match seed_annotations {
-        Some(s) => s,
-        None => {
-            empty_annotations = AnnotationState::new();
-            &empty_annotations
-        }
-    };
     let mut value_to_var: ValueIdToVariable = HashMap::new();
     let mut constant_hlvalues: HashMap<ValueId, Hlvalue> = HashMap::new();
     let mut constant_concretetypes: HashMap<ValueId, LowLevelType> = HashMap::new();
@@ -1550,7 +1531,7 @@ pub fn function_graph_to_flowspace_with_seed_annotations(
         let legacy_inputarg_vids = legacy_block.inputarg_value_ids(legacy);
         let mut inputargs: Vec<Hlvalue> = Vec::with_capacity(legacy_inputarg_vids.len());
         for vid in legacy_inputarg_vids {
-            let var = seed_variable(vid, annotations);
+            let var = seed_variable(vid, legacy);
             value_to_var.entry(vid).or_insert_with(|| var.clone());
             local_inputs.insert(vid, var.clone());
             inputargs.push(Hlvalue::Variable(var));
@@ -1586,7 +1567,7 @@ pub fn function_graph_to_flowspace_with_seed_annotations(
         .find(|b| b.id == legacy.returnblock)
         .and_then(|b| b.inputarg_value_ids(legacy).first().copied())
         .map(|vid| {
-            let var = seed_variable(vid, annotations);
+            let var = seed_variable(vid, legacy);
             value_to_var.entry(vid).or_insert_with(|| var.clone());
             Hlvalue::Variable(var)
         })
@@ -1611,7 +1592,7 @@ pub fn function_graph_to_flowspace_with_seed_annotations(
         if legacy_exceptblock.inputargs.len() == 2 {
             let mut except_inputargs = Vec::with_capacity(2);
             for vid in legacy_exceptblock.inputarg_value_ids(legacy) {
-                let var = seed_variable(vid, annotations);
+                let var = seed_variable(vid, legacy);
                 value_to_var.entry(vid).or_insert_with(|| var.clone());
                 except_inputargs.push(Hlvalue::Variable(var));
             }
@@ -1744,7 +1725,7 @@ pub fn function_graph_to_flowspace_with_seed_annotations(
                 .and_then(|v| legacy.value_id_of(v))
             {
                 if !value_map.contains_key(&result) {
-                    let var = seed_variable(result, annotations);
+                    let var = seed_variable(result, legacy);
                     value_to_var.entry(result).or_insert_with(|| var.clone());
                     value_map.insert(result, Hlvalue::Variable(var));
                 }
@@ -1772,26 +1753,14 @@ pub fn function_graph_to_flowspace_with_seed_annotations(
                 .last_exception
                 .as_ref()
                 .map(|arg| {
-                    link_extravar_to_hlvalue(
-                        arg,
-                        legacy,
-                        &mut link_value_map,
-                        &mut value_to_var,
-                        annotations,
-                    )
+                    link_extravar_to_hlvalue(arg, legacy, &mut link_value_map, &mut value_to_var)
                 })
                 .transpose()?;
             let last_exc_value = legacy_link
                 .last_exc_value
                 .as_ref()
                 .map(|arg| {
-                    link_extravar_to_hlvalue(
-                        arg,
-                        legacy,
-                        &mut link_value_map,
-                        &mut value_to_var,
-                        annotations,
-                    )
+                    link_extravar_to_hlvalue(arg, legacy, &mut link_value_map, &mut value_to_var)
                 })
                 .transpose()?;
             let target = block_map.get(&legacy_link.target).cloned().ok_or_else(|| {
@@ -1885,6 +1854,7 @@ mod tests {
     use crate::model::{
         Block, BlockId, FunctionGraph as LegacyGraph, OpKind, SpaceOperation, ValueType,
     };
+    use crate::translator::rtyper::legacy_annotator::setbinding;
     use crate::translator::rtyper::pyre_call_registry::PyreCallRegistry;
 
     /// Test helper — project ValueIds to backing Variables for
@@ -2027,9 +1997,13 @@ mod tests {
 
     #[test]
     fn seed_variable_attaches_lifted_annotation_observable_via_clone() {
-        let mut annotations = AnnotationState::new();
-        annotations.set(ValueId(7), ValueType::Int);
-        let var = seed_variable(ValueId(7), &annotations);
+        let mut graph = LegacyGraph::new("seed_test");
+        // Allocate ValueIds up to 7 so `graph.variable(ValueId(7))` resolves.
+        while graph.next_value() <= 7 {
+            graph.alloc_value();
+        }
+        setbinding(&graph.must_variable(ValueId(7)), ValueType::Int);
+        let var = seed_variable(ValueId(7), &graph);
 
         // Reference semantics: the annotation Rc-shares across clones
         // (flowspace/model.rs:2010-2018), so a clone observes the same
@@ -2047,18 +2021,17 @@ mod tests {
 
     #[test]
     fn seed_variable_unknown_value_id_leaves_annotation_empty_for_failloud() {
-        // Cat 2.4 fix: missing entries in AnnotationState.some_values
-        // resolve to ValueType::Unknown via AnnotationState::get
-        // (annotation_state.rs).  The adapter must NOT fabricate a
-        // SomeInstance(classdef=None) shell for these — that would
-        // silently bridge an annotation gap to GcRef via the
+        // Cat 2.4 fix: missing entries on `graph.variable(vid).annotation`
+        // (either unregistered vid OR registered without a published
+        // shell) MUST NOT fabricate a SomeInstance(classdef=None) — that
+        // would silently bridge an annotation gap to GcRef via the
         // resolver-stage backfill at the wrong layer. Instead, leave
         // Variable.annotation empty so `bindingrepr` panics with
         // `KeyError: no binding for arg`
         // (annotator/annrpython.rs:418), surfacing the producer-side
         // gap as a fail-loud signal.
-        let annotations = AnnotationState::new();
-        let var = seed_variable(ValueId(42), &annotations);
+        let graph = LegacyGraph::new("seed_unknown_test");
+        let var = seed_variable(ValueId(42), &graph);
         let ann = var.annotation.borrow();
         assert!(
             ann.is_none(),
@@ -2091,12 +2064,11 @@ mod tests {
 
     #[test]
     fn build_value_to_variable_map_seeds_inputargs_and_op_results() {
-        let mut annotations = AnnotationState::new();
-        annotations.set(ValueId(1), ValueType::Int);
-        annotations.set(ValueId(2), ValueType::Ref);
         let graph = legacy_graph_with_inputarg_and_result(ValueId(1), ValueId(2));
 
-        let map = build_value_to_variable_map(&graph, &annotations);
+        setbinding(&graph.must_variable(ValueId(1)), ValueType::Int);
+        setbinding(&graph.must_variable(ValueId(2)), ValueType::Ref);
+        let map = build_value_to_variable_map(&graph);
 
         assert_eq!(
             map.len(),
@@ -2132,11 +2104,6 @@ mod tests {
         // Two ops both reading the same inputarg (legacy graphs are SSA
         // — every ValueId has one definition, but multiple readers).
         // Slice 1a must produce one Variable identity per ValueId.
-        let mut annotations = AnnotationState::new();
-        annotations.set(ValueId(1), ValueType::Int);
-        annotations.set(ValueId(2), ValueType::Int);
-        annotations.set(ValueId(3), ValueType::Int);
-
         let mut graph = LegacyGraph::new("dedup_test");
         // ValueId(0..2) are canonical (returnvar / etype / evalue);
         // alloc one more so ValueId(3) has a backing Variable.
@@ -2165,7 +2132,10 @@ mod tests {
         block.id = graph.startblock;
         graph.blocks = vec![block];
 
-        let map = build_value_to_variable_map(&graph, &annotations);
+        setbinding(&graph.must_variable(ValueId(1)), ValueType::Int);
+        setbinding(&graph.must_variable(ValueId(2)), ValueType::Int);
+        setbinding(&graph.must_variable(ValueId(3)), ValueType::Int);
+        let map = build_value_to_variable_map(&graph);
 
         assert_eq!(map.len(), 3, "three distinct ValueIds → three Variables");
         // The identity invariant: the inputarg's Variable is one fresh
@@ -2186,10 +2156,6 @@ mod tests {
         // `concretetype` write reaches both — otherwise the body's
         // BinOp lookup hits a fresh Variable with no concretetype and
         // trips genop's "wrong level!" assertion.
-        let mut annotations = AnnotationState::new();
-        annotations.set(ValueId(1), ValueType::Int);
-        annotations.set(ValueId(2), ValueType::Int); // rebind of same name
-
         let mut graph = LegacyGraph::new("rebind_alias");
         let mut block = Block {
             id: BlockId(0),
@@ -2220,7 +2186,9 @@ mod tests {
         block.id = graph.startblock;
         graph.blocks = vec![block];
 
-        let map = build_value_to_variable_map(&graph, &annotations);
+        setbinding(&graph.must_variable(ValueId(1)), ValueType::Int);
+        setbinding(&graph.must_variable(ValueId(2)), ValueType::Int);
+        let map = build_value_to_variable_map(&graph);
         assert_eq!(
             map[&ValueId(1)],
             map[&ValueId(2)],
@@ -2232,11 +2200,6 @@ mod tests {
 
     #[test]
     fn build_value_to_hlvalue_map_inlines_const_defines() {
-        let mut annotations = AnnotationState::new();
-        annotations.set(ValueId(1), ValueType::Int);
-        annotations.set(ValueId(2), ValueType::Int);
-        annotations.set(ValueId(3), ValueType::Float);
-
         let mut graph = LegacyGraph::new("const_inline");
         // ValueId(0..2) are canonical (returnvar / etype / evalue);
         // alloc one more so ValueId(3) has a backing Variable.
@@ -2265,7 +2228,10 @@ mod tests {
         block.id = graph.startblock;
         graph.blocks = vec![block];
 
-        let var_map = build_value_to_variable_map(&graph, &annotations);
+        setbinding(&graph.must_variable(ValueId(1)), ValueType::Int);
+        setbinding(&graph.must_variable(ValueId(2)), ValueType::Int);
+        setbinding(&graph.must_variable(ValueId(3)), ValueType::Float);
+        let var_map = build_value_to_variable_map(&graph);
         let hl_map = build_value_to_hlvalue_map(&graph, &var_map);
 
         // Inputarg keeps its Variable identity.
@@ -2348,7 +2314,7 @@ mod tests {
         graph.push_inputarg(entry, y_vid);
         graph.push_inputarg(entry, z_vid);
 
-        let cells = derive_subject_inputcells(&graph, None)
+        let cells = derive_subject_inputcells(&graph)
             .expect("typed Input ops must project to definite SomeValue cells");
         assert_eq!(cells.len(), 3);
         assert!(
@@ -2374,7 +2340,7 @@ mod tests {
         let entry = graph.startblock;
         let orphan = graph.alloc_value();
         graph.push_inputarg(entry, orphan);
-        let err = derive_subject_inputcells(&graph, None)
+        let err = derive_subject_inputcells(&graph)
             .expect_err("inputarg without matching Input op must surface as TyperError");
         let msg = format!("{err}");
         assert!(
@@ -2398,7 +2364,7 @@ mod tests {
             )
             .unwrap();
         graph.push_inputarg(entry, vid);
-        let err = derive_subject_inputcells(&graph, None)
+        let err = derive_subject_inputcells(&graph)
             .expect_err("ValueType::Unknown has no SomeValue projection");
         let msg = format!("{err}");
         assert!(
@@ -3088,8 +3054,6 @@ mod tests {
 
     #[test]
     fn function_graph_to_flowspace_minimal_identity_return_assembles_graph() {
-        let mut annotations = AnnotationState::new();
-        annotations.set(ValueId(1), ValueType::Int);
         let legacy = legacy_minimal_identity_return_graph();
 
         let output = function_graph_to_flowspace(&legacy, &empty_call_registry())
@@ -3136,10 +3100,6 @@ mod tests {
         // graph's returnblock must use the SAME Variable identity (so
         // RPythonTyper.getreturnvar finds the right Variable —
         // rtyper.rs:1633-1638).
-        let mut annotations = AnnotationState::new();
-        annotations.set(ValueId(1), ValueType::Int);
-        annotations.set(ValueId(2), ValueType::Int);
-
         let mut graph = LegacyGraph::new("with_return_var");
         let startblock = Block {
             id: graph.startblock,
@@ -3195,10 +3155,6 @@ mod tests {
         // build_value_to_hlvalue_map inlines it into Link.args as
         // Hlvalue::Constant — Slice 1c's link translation must use that
         // mapping rather than wrapping the unused Variable.
-        let mut annotations = AnnotationState::new();
-        annotations.set(ValueId(1), ValueType::Int);
-        annotations.set(ValueId(2), ValueType::Int);
-
         let mut graph = LegacyGraph::new("const_link_arg");
         let startblock = Block {
             id: graph.startblock,
@@ -3225,7 +3181,6 @@ mod tests {
             framestate: None,
             dead: false,
         };
-        annotations.set(ValueId(3), ValueType::Int);
         graph.blocks = vec![startblock, returnblock];
 
         let output = function_graph_to_flowspace(&graph, &empty_call_registry())
@@ -3255,14 +3210,6 @@ mod tests {
         // RPython checkgraph defines exception-link extravars before
         // validating link.args. Pyre's legacy graph represents those
         // as fresh ValueIds whose only definition site is the link.
-        let mut annotations = AnnotationState::new();
-        annotations.set(ValueId(1), ValueType::Int);
-        annotations.set(ValueId(2), ValueType::Int);
-        annotations.set(ValueId(3), ValueType::Int);
-        annotations.set(ValueId(4), ValueType::Int);
-        annotations.set(ValueId(10), ValueType::Int);
-        annotations.set(ValueId(11), ValueType::Ref);
-
         let mut graph = LegacyGraph::new("canraise_with_extravars");
         graph.set_next_value(12); // pre-allocate up to ValueId(11) for extravars
         let startblock = Block {
@@ -3345,10 +3292,6 @@ mod tests {
         // before reaching the adapter) must surface that op's
         // translate_op error from inside Pass 2, not silently emit a
         // partial graph.
-        let mut annotations = AnnotationState::new();
-        annotations.set(ValueId(1), ValueType::Int);
-        annotations.set(ValueId(2), ValueType::Int);
-
         let mut graph = LegacyGraph::new("unported_op");
         let inputargs = block_inputargs(&mut graph, &[ValueId(1)]);
         let arg_var = graph.must_variable(ValueId(1));
@@ -3383,7 +3326,6 @@ mod tests {
             framestate: None,
             dead: false,
         };
-        annotations.set(ValueId(3), ValueType::Int);
         graph.blocks = vec![startblock, returnblock];
 
         let err = function_graph_to_flowspace(&graph, &empty_call_registry())

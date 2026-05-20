@@ -37,20 +37,24 @@ pub fn analyze_function(func: &SemanticFunction, config: &PipelineConfig) -> Pip
     let original_blocks = graph.blocks.len();
 
     // Pass 1: Annotation (RPython annotator)
-    let annotations = annotate(graph);
-    // `some_values` count tracks the orthodox `Variable.annotation`
-    // analogue (set whenever a non-Unknown ValueType is written; cleared
-    // on Unknown).  Test gate is `> 0` so the Unknown-clearing edge case
-    // (which would lower the count vs the prior `types.len()` form)
-    // does not affect the assertion in `analyze_program_runs`.
-    let annotations_count = annotations.some_values.len();
+    annotate(graph);
+    // Count populated `Variable.annotation` cells on the graph.
+    // `legacy_annotator::annotate` writes every non-Unknown
+    // `ValueType` through `setbinding`, which publishes the matching
+    // `SomeValue` shell into `Variable.annotation`; this enumeration
+    // tracks the orthodox `Variable.annotation` slot directly.  Test
+    // gate is `> 0`.
+    let annotations_count = graph
+        .iter_variables()
+        .filter(|(_, v)| v.annotation.borrow().is_some())
+        .count();
 
     // Pass 2: Type resolution (RPython rtyper) — commits per-Variable
     // `concretetype` cells via `graph.set_concretetype_inline`, so
     // downstream consumers read kinds via `graph.concretetype(v)`.
     // The returned scratch state is unused here (legacy_pipeline does
     // not run the dual-gate comparison).
-    resolve_types(graph, &annotations);
+    resolve_types(graph);
     // Pass 2b: rtyper-equivalent indirect_call lowering. RPython's rtyper
     // (rpbc.py:199-217) always emits `indirect_call(funcptr, *args,
     // c_graphs)` before jtransform sees the graph. Pyre's canonical

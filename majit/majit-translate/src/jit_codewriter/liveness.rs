@@ -74,8 +74,10 @@ pub fn compute_liveness(
 /// `Variable` has a single `(kind, color)` via
 /// `getkind(v.concretetype)` + `regallocs[kind]`.  When `graph` is
 /// supplied (production path) the lookup reads kind via
-/// `graph.concretetype(v)` and color via `RegAllocResult::color_for`,
-/// projecting through the backing Variable; a miss panics — PyPy
+/// `graph.concretetype(v)` and color via
+/// `RegAllocResult::color_for_variable(&var)`, projecting the
+/// `ValueId` to a `&Variable` once via `graph.variable(vid)`; a
+/// miss panics — PyPy
 /// would never fall back to other classes.  Without `graph` (test
 /// fixtures with no kind source), the helper returns `None`
 /// because the new Variable-keyed `coloring` map cannot be queried
@@ -100,6 +102,7 @@ fn value_to_register_with_graph(
         ConcreteType::Float => Some(RegKind::Float),
         ConcreteType::Void | ConcreteType::Unknown => None,
     };
+    let var = graph.variable(v);
     if let Some(kind) = kind {
         let ra = regallocs.get(&kind).unwrap_or_else(|| {
             panic!(
@@ -107,23 +110,25 @@ fn value_to_register_with_graph(
                  but regallocs map is missing the entry",
             )
         });
-        let color = ra.color_for(graph, v).unwrap_or_else(|| {
-            let other_classes: Vec<_> = [RegKind::Int, RegKind::Ref, RegKind::Float]
-                .iter()
-                .filter(|k| **k != kind)
-                .filter(|k| {
-                    regallocs
-                        .get(*k)
-                        .is_some_and(|ra| ra.contains_value(graph, v))
-                })
-                .copied()
-                .collect();
-            panic!(
-                "value_to_register: graph declared kind {kind:?} for {v:?} \
-                 but regallocs[{kind:?}] has no coloring (other classes with a \
-                 coloring: {other_classes:?})",
-            )
-        });
+        let color = var
+            .and_then(|var| ra.color_for_variable(var))
+            .unwrap_or_else(|| {
+                let other_classes: Vec<_> = [RegKind::Int, RegKind::Ref, RegKind::Float]
+                    .iter()
+                    .filter(|k| **k != kind)
+                    .filter(|k| {
+                        regallocs
+                            .get(*k)
+                            .is_some_and(|ra| var.is_some_and(|var| ra.contains_variable(var)))
+                    })
+                    .copied()
+                    .collect();
+                panic!(
+                    "value_to_register: graph declared kind {kind:?} for {v:?} \
+                     but regallocs[{kind:?}] has no coloring (other classes with a \
+                     coloring: {other_classes:?})",
+                )
+            });
         return Some(Register::new(kind, color));
     }
     // Void / Unknown — fall through to KINDS scan via Variable
@@ -131,7 +136,7 @@ fn value_to_register_with_graph(
     let mut found: Option<Register> = None;
     for kind in [RegKind::Int, RegKind::Ref, RegKind::Float] {
         if let Some(ra) = regallocs.get(&kind) {
-            if let Some(color) = ra.color_for(graph, v) {
+            if let Some(color) = var.and_then(|var| ra.color_for_variable(var)) {
                 if let Some(prev) = found {
                     panic!(
                         "value_to_register: ValueId {v:?} colored in multiple regalloc \
@@ -194,9 +199,10 @@ fn remove_repeated_live(ops: &mut Vec<FlatOp>) {
 /// Walks backward through the instruction sequence. At each `-live-`
 /// marker, expands it to include all values alive at that point.
 /// Reads each `FlatOp::Op` operand's kind via `graph.concretetype(v)`
-/// and color via `RegAllocResult::color_for(graph, v)` — both routed
-/// through the backing `Variable` so the lookup matches upstream
-/// `flatten.py:382 getcolor` line-for-line.
+/// and color via `RegAllocResult::color_for_variable(&var)` — the
+/// `ValueId → &Variable` projection happens once per lookup via
+/// `graph.variable(vid)`, matching upstream `flatten.py:382 getcolor`
+/// line-for-line.
 fn compute_liveness_pass_with_graph(
     ops: &mut [FlatOp],
     label2alive: &mut HashMap<Label, HashSet<Register>>,

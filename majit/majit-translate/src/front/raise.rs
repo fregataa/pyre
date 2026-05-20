@@ -126,7 +126,8 @@
 //!   opaque Call targets any more — that earlier deviation is removed
 //!   by the same change that introduced this module.
 
-use crate::model::{BlockId, CallTarget, FunctionGraph, OpKind, ValueId, ValueType};
+use crate::flowspace::model::Variable;
+use crate::model::{BlockId, CallTarget, FunctionGraph, OpKind, ValueType};
 
 /// Close `block` with an `(etype, evalue)` Link to `exceptblock`
 /// whose values come from the canonical RPython `exc_from_raise`
@@ -141,7 +142,7 @@ use crate::model::{BlockId, CallTarget, FunctionGraph, OpKind, ValueId, ValueTyp
 /// `Vec<ValueId>` → `Vec<LinkArg>` migration tracked separately
 /// (multi-session).
 ///
-/// `message_args` is the pre-evaluated list of message ValueIds
+/// `message_args` is the pre-evaluated list of message `Variable`s
 /// (side effects already on the graph from the caller's walk).
 /// Empty for bare `panic!()` / `assert!(cond)`; single element for
 /// `panic!(msg)` / `assert!(cond, msg)`; multiple for
@@ -154,7 +155,7 @@ pub fn lower_exc_from_raise(
     graph: &mut FunctionGraph,
     block: BlockId,
     exc_class_name: &str,
-    message_args: Vec<ValueId>,
+    message_args: Vec<Variable>,
 ) {
     // `op.simple_call(const(exc_class), *args)` — upstream
     // `flowcontext.py:614/623`.  The class is carried as the second
@@ -163,33 +164,29 @@ pub fn lower_exc_from_raise(
     // reconstruct `(op, const_class, args…)` from `(path[0], path[1],
     // op.args)`.  This is a documented PRE-EXISTING-ADAPTATION — see
     // the module-level docstring for why it stands until the
-    // `Vec<ValueId>` → `Vec<LinkArg>` migration lands.
+    // `Vec<Variable>` → `Vec<LinkArg>` migration lands.
     let simple_call_target = CallTarget::function_path(["simple_call", exc_class_name]);
-    let message_arg_vars: Vec<crate::flowspace::model::Variable> = message_args
-        .iter()
-        .map(|v| graph.must_variable(*v))
-        .collect();
     let evalue = graph
         .push_op(
             block,
             OpKind::Call {
                 target: simple_call_target,
-                args: message_arg_vars,
+                args: message_args,
                 result_ty: ValueType::Ref,
             },
             true,
         )
         .expect("op.simple_call(exc_class, ...) must produce a Ref exception instance");
+    let evalue_var = graph.must_variable(evalue);
     // `op.type(evalue)` — upstream `flowcontext.py:600` tail line
     // (`w_type = op.type(w_value).eval(self)`).
     let type_target = CallTarget::function_path(["type"]);
-    let evalue_var = graph.must_variable(evalue);
     let etype = graph
         .push_op(
             block,
             OpKind::Call {
                 target: type_target,
-                args: vec![evalue_var],
+                args: vec![evalue_var.clone()],
                 result_ty: ValueType::Ref,
             },
             true,
@@ -199,6 +196,5 @@ pub fn lower_exc_from_raise(
     // the block with the `(etype, evalue)` Link to the graph's
     // `exceptblock`.
     let etype_var = graph.must_variable(etype);
-    let evalue_arg = graph.must_variable(evalue);
-    graph.set_raise_values(block, etype_var, evalue_arg);
+    graph.set_raise_values(block, etype_var, evalue_var);
 }

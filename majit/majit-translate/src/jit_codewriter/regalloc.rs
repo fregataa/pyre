@@ -221,24 +221,6 @@ impl RegAllocator {
         }
     }
 
-    /// Project a `ValueId` to its backing
-    /// [`crate::flowspace::model::Variable`] on the graph — every
-    /// `ValueId` minted via `alloc_value_with_type` carries one
-    /// (RPython parity: `flowspace/model.py:280` Variable instance
-    /// per slot).  Panics if the projection fails so a missing
-    /// Variable surfaces as a hard regalloc gap, not a silent skip.
-    fn var(graph: &FunctionGraph, v: ValueId) -> crate::flowspace::model::Variable {
-        graph
-            .variable(v)
-            .unwrap_or_else(|| {
-                panic!(
-                    "regalloc: ValueId {v:?} has no backing Variable on graph {:?}",
-                    graph.name,
-                )
-            })
-            .clone()
-    }
-
     /// RPython: `RegAllocator.make_dependencies()` — regalloc.py:26-77.
     /// Per-block die_at analysis.
     fn make_dependencies(
@@ -429,12 +411,13 @@ impl RegAllocator {
 /// Result of register allocation for one kind.
 ///
 /// `coloring` is keyed on the backing
-/// [`crate::flowspace::model::Variable`] for each `ValueId` —
+/// [`crate::flowspace::model::Variable`] —
 /// matching upstream RPython's `coloring: dict[Variable, int]`
-/// (`tool/algo/regalloc.py:31`).  Consumers project a `ValueId` to
-/// its Variable via [`crate::model::FunctionGraph::variable`]; the
-/// helpers [`Self::color_for`] / [`Self::contains_value`] perform
-/// the projection in one call so call sites stay terse.
+/// (`tool/algo/regalloc.py:31`).  Consumers hold `&Variable` directly
+/// (post-Slice-7.10: `flatten.rs:GraphFlattener::getcolor(&Variable)`,
+/// `liveness::value_to_register_with_graph` projects through
+/// `graph.variable(vid)` once) and call [`Self::color_for_variable`]
+/// / [`Self::contains_variable`].
 #[derive(Debug, Clone)]
 pub struct RegAllocResult {
     pub coloring: HashMap<crate::flowspace::model::Variable, usize>,
@@ -442,34 +425,15 @@ pub struct RegAllocResult {
 }
 
 impl RegAllocResult {
-    /// Look up the register color assigned to `v` — projects
-    /// through `graph.variable(v)` to the backing Variable, then
-    /// delegates to [`Self::color_for_variable`].  Returns `None`
-    /// when the slot has no backing Variable or no coloring (Void
-    /// / Unknown / different kind class).
-    pub fn color_for(&self, graph: &crate::model::FunctionGraph, v: ValueId) -> Option<usize> {
-        let var = graph.variable(v)?;
-        self.color_for_variable(var)
-    }
-
-    /// Variable-keyed sibling of [`Self::color_for`] — no graph
-    /// indirection needed when the caller already holds a
-    /// [`crate::flowspace::model::Variable`].  Matches upstream
-    /// `coloring: dict[Variable, int]`
-    /// (`tool/algo/regalloc.py:31`).
+    /// Look up the register color assigned to `var` — matches upstream
+    /// `coloring: dict[Variable, int]` (`tool/algo/regalloc.py:31`).
+    /// Returns `None` when the Variable has no coloring (Void /
+    /// Unknown / different kind class).
     pub fn color_for_variable(&self, var: &crate::flowspace::model::Variable) -> Option<usize> {
         self.coloring.get(var).copied()
     }
 
-    /// `true` iff `v` has a coloring in this kind class.
-    pub fn contains_value(&self, graph: &crate::model::FunctionGraph, v: ValueId) -> bool {
-        match graph.variable(v) {
-            Some(var) => self.contains_variable(var),
-            None => false,
-        }
-    }
-
-    /// Variable-keyed sibling of [`Self::contains_value`].
+    /// `true` iff `var` has a coloring in this kind class.
     pub fn contains_variable(&self, var: &crate::flowspace::model::Variable) -> bool {
         self.coloring.contains_key(var)
     }
@@ -706,8 +670,8 @@ mod tests {
         graph.set_concretetype(v2, ConcreteType::Signed);
         let result = perform_register_allocation(&graph, RegKind::Int);
         assert_ne!(
-            result.color_for(&graph, v0),
-            result.color_for(&graph, v1),
+            result.color_for_variable(&graph.must_variable(v0)),
+            result.color_for_variable(&graph.must_variable(v1)),
             "v0 and v1 are simultaneously alive → different registers"
         );
         // v2 can share with v0 or v1 (they die before v2's definition)
@@ -737,7 +701,10 @@ mod tests {
         graph.set_concretetype(v0, ConcreteType::Signed);
         graph.set_concretetype(v1, ConcreteType::Signed);
         let result = perform_register_allocation(&graph, RegKind::Int);
-        assert_eq!(result.color_for(&graph, v0), result.color_for(&graph, v1));
+        assert_eq!(
+            result.color_for_variable(&graph.must_variable(v0)),
+            result.color_for_variable(&graph.must_variable(v1)),
+        );
         assert_eq!(result.num_regs, 1);
     }
 

@@ -50,7 +50,7 @@ use crate::annotator::description::{ClassDefKey, DescEntry};
 use crate::annotator::model::{DescKind, SomePBC, SomeValue};
 use crate::flowspace::model::{ConstValue, Constant, Hlvalue, HostObject, Variable};
 use crate::jit_codewriter::type_state::ConcreteType;
-use crate::model::{BlockId, FunctionGraph, OpKind, SpaceOperation, ValueId};
+use crate::model::{BlockId, FunctionGraph, OpKind, SpaceOperation};
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{
     self, _ptr, ForwardReference, LowLevelType, Ptr, PtrTarget, RUNTIME_TYPE_INFO, StructType,
@@ -64,10 +64,10 @@ use crate::translator::rtyper::rtyper::{GenopResult, HighLevelOp, LowLevelOpList
 // ---------------------------------------------------------------------
 
 /// Insert a `VtableMethodPtr` op at `(block_id, op_index)` and return the
-/// produced funcptr ValueId. Updates `type_state` so downstream passes
-/// (`build_value_kinds`, regalloc, flatten) see the funcptr as integer
-/// kind — matching `int_guard_value(op.args[0])` in
-/// `jtransform.py:546`.
+/// produced funcptr Variable. Writes the funcptr's `concretetype` cell to
+/// `Signed` so downstream passes (`build_value_kinds`, regalloc, flatten)
+/// see the funcptr as integer kind — matching `int_guard_value(op.args[0])`
+/// in `jtransform.py:546`.
 ///
 /// RPython equivalent: `ClassRepr.getclsfield(vcls, attr, llops)`
 /// (`rclass.py:371-377`), which appends `cast_pointer + getfield(vtable,
@@ -81,28 +81,26 @@ pub fn class_get_method_ptr(
     graph: &mut FunctionGraph,
     block_id: BlockId,
     op_index: usize,
-    receiver: ValueId,
+    receiver: Variable,
     trait_root: String,
     method_name: String,
-) -> ValueId {
-    let funcptr = graph.alloc_value();
-    let funcptr_var = graph.must_variable(funcptr);
-    let receiver_var = graph.must_variable(receiver);
+) -> Variable {
+    let funcptr_vid = graph.alloc_value();
+    let funcptr_var = graph.must_variable(funcptr_vid);
     let op = SpaceOperation {
-        result: Some(funcptr_var),
+        result: Some(funcptr_var.clone()),
         kind: OpKind::VtableMethodPtr {
-            receiver: receiver_var,
+            receiver,
             trait_root,
             method_name,
         },
     };
     graph.blocks[block_id.0].operations.insert(op_index, op);
-    // RPython parity: every Variable carries `concretetype` inline.
-    // Pyre writes through the backing Variable's `concretetype` cell
-    // directly (RPython `rtyper.py:258 v.concretetype = ...`), so
-    // downstream consumers read kinds via `graph.concretetype(v)`.
-    graph.set_concretetype(funcptr, ConcreteType::Signed);
-    funcptr
+    // RPython parity: every Variable carries `concretetype` inline
+    // (`rtyper.py:258 v.concretetype = ...`).  Write through the
+    // backing cell so downstream consumers see Signed.
+    FunctionGraph::set_concretetype_of_inline(&funcptr_var, ConcreteType::Signed);
+    funcptr_var
 }
 
 // ---------------------------------------------------------------------

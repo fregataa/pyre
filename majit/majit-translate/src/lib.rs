@@ -1681,7 +1681,8 @@ mod tests {
         // each backing Variable as it builds, so downstream consumers
         // can read kinds via `graph.concretetype(v)` without a
         // separate publish step.
-        rtype::resolve_types(&result.graph, &annotate::annotate(&result.graph));
+        annotate::annotate(&result.graph);
+        rtype::resolve_types(&result.graph);
         let mut result = result;
         crate::regalloc::augment_canonical_exceptblock_on_graph(&mut result.graph);
         let mut regallocs = crate::regalloc::perform_all_register_allocations(&result.graph);

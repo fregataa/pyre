@@ -22,7 +22,7 @@ use crate::call::CallControl;
 use crate::flatten::RegKind;
 use crate::jitcode::JitCode;
 use crate::jtransform::GraphTransformConfig;
-use crate::model::{FunctionGraph, ValueId};
+use crate::model::FunctionGraph;
 use crate::parse::CallPath;
 
 /// Output of `CodeWriter::make_jitcodes` — the populated JitCode registry
@@ -170,7 +170,8 @@ impl CodeWriter {
         // (`pyre_call_registry.rs:210-234`), which lazily builds a single
         // `(RPythonAnnotator, RPythonTyper)` pair on first use and
         // returns the cached pair on every subsequent
-        // `specialize_legacy_graph_with_registry_seed` call.  The
+        // `specialize_legacy_graph_with_registry_returning_value_to_var`
+        // call.  The
         // registry itself is cached on the `CodeWriter`
         // (`real_rtyper_registry`), so all per-graph subjects of one
         // CodeWriter share the same annotator + rtyper, matching
@@ -284,7 +285,6 @@ impl CodeWriter {
         };
         match outcome {
             Ok(crate::translator::rtyper::cutover::DualGateOutcome::Match {
-                real_annotations: _,
                 real_value_to_var,
             }) => {
                 // Commit each real-rtyper Variable's `concretetype`
@@ -306,13 +306,15 @@ impl CodeWriter {
                         graph.name,
                     );
                 }
-                let annotations = crate::translator::rtyper::legacy_annotator::annotate(graph);
+                crate::translator::rtyper::legacy_annotator::annotate(graph);
                 // `resolve_types` commits per-Variable concretetype
                 // cells at the resolver boundary.  Skip arm has no
                 // flowspace Variable surface — the legacy walker stays
-                // the only source of types for these graphs.
-                let _ =
-                    crate::translator::rtyper::legacy_resolve::resolve_types(graph, &annotations);
+                // the only source of types for these graphs.  Reads
+                // annotations off `graph.variable(vid).annotation`
+                // populated by the preceding `annotate` post-loop
+                // publish.
+                crate::translator::rtyper::legacy_resolve::resolve_types(graph);
                 None
             }
             Err(diff) => panic!(
@@ -446,9 +448,9 @@ impl CodeWriter {
         // `post_result > pre-jtransform` falls out of
         // `graph.set_concretetype`'s "preserve richer existing iff
         // getkind matches" semantic.
-        for (value, kind) in &post_result_types {
+        for (var, kind) in &post_result_types {
             if !matches!(kind, crate::model::ConcreteType::Unknown) {
-                rewritten.graph.set_concretetype(*value, kind.clone());
+                crate::model::FunctionGraph::set_concretetype_of_inline(var, kind.clone());
             }
         }
         // Long-term parity hydration: when the dual-gate Match arm

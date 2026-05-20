@@ -6511,7 +6511,8 @@ fn lower_expr(
                             // walks the same op sequence as the
                             // flowspace port at
                             // `flowspace/flowcontext.rs:1189`.
-                            let mut message_args: Vec<ValueId> = Vec::new();
+                            let mut message_args: Vec<crate::flowspace::model::Variable> =
+                                Vec::new();
                             for rest in it {
                                 // The fail-branch walk is independent
                                 // of the pass-branch walk; a
@@ -6525,7 +6526,7 @@ fn lower_expr(
                                 let lowered =
                                     lower_expr(graph, &mut fail_block, rest, options, ctx)?;
                                 if let Some(v) = lowered.value {
-                                    message_args.push(v);
+                                    message_args.push(graph.must_variable(v));
                                 }
                             }
                             let _ = &macro_name; // name is only used for diagnostics; class is fixed.
@@ -6579,7 +6580,7 @@ fn lower_expr(
                     // the shared `exc_from_raise` lowering
                     // (`front::raise::lower_exc_from_raise` →
                     // `flowcontext.rs:1189` parity).
-                    let mut message_args: Vec<ValueId> = Vec::new();
+                    let mut message_args: Vec<crate::flowspace::model::Variable> = Vec::new();
                     if let Ok(args) = m.mac.parse_body_with(
                         syn::punctuated::Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated,
                     ) {
@@ -6594,7 +6595,7 @@ fn lower_expr(
                                 return Ok(Lowered::path_closed());
                             }
                             if let Some(v) = lowered.value {
-                                message_args.push(v);
+                                message_args.push(graph.must_variable(v));
                             }
                         }
                     }

@@ -16,7 +16,8 @@
 
 use std::collections::HashMap;
 
-use crate::model::{FunctionGraph, OpKind, ValueId, ValueType};
+use crate::flowspace::model::Variable;
+use crate::model::{FunctionGraph, OpKind, ValueType};
 
 /// Re-export the canonical [`ConcreteType`] from [`crate::model`].
 ///
@@ -153,20 +154,17 @@ pub(crate) fn authoritative_result_type_from_op(kind: &OpKind) -> Option<Concret
 }
 
 /// Walk the rewritten graph and collect every op-result that carries an
-/// authoritative `ConcreteType` (per-op declaration).  Feeds
-/// [`merge_synth_kinds`]'s `post_result` lane.
-pub(crate) fn authoritative_result_types(graph: &FunctionGraph) -> HashMap<ValueId, ConcreteType> {
+/// authoritative `ConcreteType` (per-op declaration), keyed on the backing
+/// [`Variable`].  Feeds [`merge_synth_kinds`]'s `post_result` lane.
+pub(crate) fn authoritative_result_types(graph: &FunctionGraph) -> HashMap<Variable, ConcreteType> {
     let mut result = HashMap::new();
     for block in &graph.blocks {
         for op in &block.operations {
             let Some(var) = op.result.as_ref() else {
                 continue;
             };
-            let Some(vid) = graph.value_id_of(var) else {
-                continue;
-            };
             if let Some(concrete) = authoritative_result_type_from_op(&op.kind) {
-                result.insert(vid, concrete);
+                result.insert(var.clone(), concrete);
             }
         }
     }

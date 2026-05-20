@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::flowspace::model::{ConstValue, Constant};
+use crate::flowspace::model::{ConstValue, Constant, Variable};
 use crate::model::{
     BlockId, ExitCase, ExitSwitch, FunctionGraph, Link, LinkArg, SpaceOperation, ValueId,
 };
@@ -403,10 +403,10 @@ pub fn flatten_graph(
 /// aliasing rules.  Call this from the codewriter immediately after
 /// `perform_all_register_allocations`, before [`flatten_graph`].
 pub fn enforce_input_args(graph: &FunctionGraph, regallocs: &mut HashMap<RegKind, RegAllocResult>) {
-    let inputargs = graph.block(graph.startblock).inputarg_value_ids(graph);
+    let inputargs = graph.block(graph.startblock).inputargs.clone();
     let mut numkinds: HashMap<RegKind, usize> = HashMap::new();
-    for v in inputargs {
-        let Some((kind, curcol)) = lookup_kind_color(v, graph, regallocs) else {
+    for var in &inputargs {
+        let Some((kind, curcol)) = lookup_kind_color(var, regallocs) else {
             continue;
         };
         let realcol = numkinds.get(&kind).copied().unwrap_or(0);
@@ -418,7 +418,7 @@ pub fn enforce_input_args(graph: &FunctionGraph, regallocs: &mut HashMap<RegKind
             // them tighter).
             assert!(
                 curcol > realcol,
-                "enforce_input_args: inputarg {v:?} (kind {kind:?}) has \
+                "enforce_input_args: inputarg {var:?} (kind {kind:?}) has \
                  curcol={curcol} < realcol={realcol} — regalloc ordering \
                  violates the dense `0..N` invariant",
             );
@@ -520,10 +520,10 @@ impl<'a> GraphFlattener<'a> {
     /// rtyper), the lookup falls back to scanning regallocs in
     /// [`KINDS`] order.  The strict path mirrors RPython's
     /// "kind-then-color" 1:1 invariant.
-    pub fn getcolor(&mut self, v: ValueId) -> Register {
-        let (kind, color) = self
-            .kind_color_of(v)
-            .unwrap_or_else(|| panic!("getcolor: ValueId {v:?} not assigned a color by regalloc"));
+    pub fn getcolor(&mut self, var: &Variable) -> Register {
+        let (kind, color) = self.kind_color_of(var).unwrap_or_else(|| {
+            panic!("getcolor: Variable {var:?} not assigned a color by regalloc")
+        });
         let key = (
             kind,
             u16::try_from(color).expect("register color > u16::MAX"),
@@ -545,9 +545,9 @@ impl<'a> GraphFlattener<'a> {
     /// `Void` / `Unknown` fall through to the bare regalloc scan
     /// because both kinds skip regalloc partitioning entirely
     /// (`flatten.py:325`).
-    fn kind_color_of(&self, v: ValueId) -> Option<(RegKind, usize)> {
+    fn kind_color_of(&self, var: &Variable) -> Option<(RegKind, usize)> {
         use crate::model::ConcreteType;
-        let declared = self.graph.concretetype(v).clone();
+        let declared = FunctionGraph::concretetype_of(var);
         let kind = match declared {
             ConcreteType::Signed => Some(RegKind::Int),
             ConcreteType::GcRef => Some(RegKind::Ref),
@@ -557,24 +557,24 @@ impl<'a> GraphFlattener<'a> {
         if let Some(kind) = kind {
             let ra = self.regallocs.get(&kind).unwrap_or_else(|| {
                 panic!(
-                    "kind_color_of: graph declared kind {kind:?} for {v:?} \
+                    "kind_color_of: graph declared kind {kind:?} for {var:?} \
                      but regallocs map is missing the entry (graph {:?})",
                     self.graph.name,
                 )
             });
-            let color = ra.color_for(self.graph, v).unwrap_or_else(|| {
+            let color = ra.color_for_variable(var).unwrap_or_else(|| {
                 let other_classes: Vec<_> = [RegKind::Int, RegKind::Ref, RegKind::Float]
                     .iter()
                     .filter(|k| **k != kind)
                     .filter(|k| {
                         self.regallocs
                             .get(*k)
-                            .is_some_and(|ra| ra.contains_value(self.graph, v))
+                            .is_some_and(|ra| ra.contains_variable(var))
                     })
                     .copied()
                     .collect();
                 panic!(
-                    "kind_color_of: graph declared kind {kind:?} for {v:?} \
+                    "kind_color_of: graph declared kind {kind:?} for {var:?} \
                      but regallocs[{kind:?}] has no coloring (other classes with a \
                      coloring: {other_classes:?}; graph {:?})",
                     self.graph.name,
@@ -582,7 +582,7 @@ impl<'a> GraphFlattener<'a> {
             });
             return Some((kind, color));
         }
-        lookup_kind_color(v, self.graph, self.regallocs)
+        lookup_kind_color(var, self.regallocs)
     }
 
     /// Companion to [`Self::getcolor`] that mirrors upstream's
@@ -590,13 +590,7 @@ impl<'a> GraphFlattener<'a> {
     /// or the [`ConstValue`] verbatim (Constant case).
     pub fn getoperand(&mut self, arg: &LinkArg) -> RegOrConst {
         match arg {
-            LinkArg::Value(var) => {
-                let vid = self
-                    .graph
-                    .value_id_of(var)
-                    .expect("getoperand: link-arg Variable must be registered on graph");
-                RegOrConst::Reg(self.getcolor(vid))
-            }
+            LinkArg::Value(var) => RegOrConst::Reg(self.getcolor(var)),
             LinkArg::Const(c) => RegOrConst::Const(c.clone()),
         }
     }
@@ -617,20 +611,17 @@ impl<'a> GraphFlattener<'a> {
     /// that constructed a GraphFlattener without going through
     /// [`flatten_graph`].
     pub fn enforce_input_args(&mut self) {
-        let inputargs = self
-            .graph
-            .block(self.graph.startblock)
-            .inputarg_value_ids(self.graph);
+        let inputargs = self.graph.block(self.graph.startblock).inputargs.clone();
         let mut numkinds: HashMap<RegKind, usize> = HashMap::new();
-        for v in inputargs {
-            let Some((kind, curcol)) = lookup_kind_color(v, self.graph, self.regallocs) else {
+        for var in &inputargs {
+            let Some((kind, curcol)) = lookup_kind_color(var, self.regallocs) else {
                 continue;
             };
             let realcol = numkinds.get(&kind).copied().unwrap_or(0);
             numkinds.insert(kind, realcol + 1);
             debug_assert_eq!(
                 curcol, realcol,
-                "GraphFlattener::enforce_input_args: startblock inputarg {v:?} \
+                "GraphFlattener::enforce_input_args: startblock inputarg {var:?} \
                  (kind {kind:?}) still has curcol={curcol} ≠ realcol={realcol}; \
                  caller must invoke the free-function pre-pass \
                  `crate::flatten::enforce_input_args(graph, &mut regallocs)` \
@@ -715,9 +706,7 @@ impl<'a> GraphFlattener<'a> {
         let resolve_arg_kind = |this: &Self, arg: &LinkArg| -> char {
             match arg {
                 LinkArg::Value(var) => this
-                    .graph
-                    .value_id_of(var)
-                    .and_then(|vid| this.kind_color_of(vid))
+                    .kind_color_of(var)
                     .map(|(k, _)| match k {
                         RegKind::Int => 'i',
                         RegKind::Ref => 'r',
@@ -775,13 +764,7 @@ impl<'a> GraphFlattener<'a> {
     /// surrounding variant fixing the kind.
     fn return_operand(&mut self, arg: &LinkArg, _expected_kind: RegKind) -> RegOrConst {
         match arg {
-            LinkArg::Value(var) => {
-                let vid = self
-                    .graph
-                    .value_id_of(var)
-                    .expect("return_operand: link-arg Variable must be registered on graph");
-                RegOrConst::Reg(self.getcolor(vid))
-            }
+            LinkArg::Value(var) => RegOrConst::Reg(self.getcolor(var)),
             LinkArg::Const(c) => RegOrConst::Const(c.clone()),
         }
     }
@@ -870,20 +853,19 @@ impl<'a> GraphFlattener<'a> {
             }
             // Skip Void inputargs (no color assigned by regalloc) — the
             // `flatten.py:309 v.concretetype is not lltype.Void` filter.
-            let dst = match self.try_getcolor(*w) {
+            let Some(dst_var) = self.graph.variable(*w) else {
+                continue;
+            };
+            let dst_var = dst_var.clone();
+            let dst = match self.try_getcolor(&dst_var) {
                 Some(r) => r,
                 None => continue,
             };
             let src = match v {
-                LinkArg::Value(var) => {
-                    let Some(value) = self.graph.value_id_of(var) else {
-                        continue;
-                    };
-                    match self.try_getcolor(value) {
-                        Some(r) => RegOrConst::Reg(r),
-                        None => continue,
-                    }
-                }
+                LinkArg::Value(var) => match self.try_getcolor(var) {
+                    Some(r) => RegOrConst::Reg(r),
+                    None => continue,
+                },
                 LinkArg::Const(c) => RegOrConst::Const(c.clone()),
             };
             // `flatten.py:314 if v == w: continue` — color-level
@@ -962,16 +944,8 @@ impl<'a> GraphFlattener<'a> {
         result: Option<ValueId>,
         target: Label,
     ) -> Option<FlatOp> {
-        let (name, lhs_vid, rhs_vid) = match kind {
-            crate::model::OpKind::BinOp { op, lhs, rhs, .. } => (
-                op.as_str(),
-                self.graph
-                    .value_id_of(lhs)
-                    .expect("BinOp.lhs must have a backing ValueId"),
-                self.graph
-                    .value_id_of(rhs)
-                    .expect("BinOp.rhs must have a backing ValueId"),
-            ),
+        let (name, lhs_var, rhs_var) = match kind {
+            crate::model::OpKind::BinOp { op, lhs, rhs, .. } => (op.as_str(), lhs, rhs),
             _ => return None,
         };
         let opcode = match name {
@@ -982,9 +956,10 @@ impl<'a> GraphFlattener<'a> {
         };
         let dst_vid =
             result.expect("overflow-checked arithmetic op needs a result for flatten parity");
-        let lhs = self.getcolor(lhs_vid);
-        let rhs = self.getcolor(rhs_vid);
-        let dst = self.getcolor(dst_vid);
+        let dst_var = self.graph.must_variable(dst_vid);
+        let lhs = self.getcolor(lhs_var);
+        let rhs = self.getcolor(rhs_var);
+        let dst = self.getcolor(&dst_var);
         Some(FlatOp::IntBinOpJumpIfOvf {
             op: opcode,
             target,
@@ -1001,13 +976,15 @@ impl<'a> GraphFlattener<'a> {
         }
         for (v, w) in link.args.iter().zip(target_inputargs.iter()) {
             if Some(v) == link.last_exception.as_ref() {
-                let dst = self.getcolor(*w);
+                let dst_var = self.graph.must_variable(*w);
+                let dst = self.getcolor(&dst_var);
                 self.emitline(FlatOp::LastException { dst });
             }
         }
         for (v, w) in link.args.iter().zip(target_inputargs.iter()) {
             if Some(v) == link.last_exc_value.as_ref() {
-                let dst = self.getcolor(*w);
+                let dst_var = self.graph.must_variable(*w);
+                let dst = self.getcolor(&dst_var);
                 self.emitline(FlatOp::LastExcValue { dst });
             }
         }
@@ -1016,8 +993,8 @@ impl<'a> GraphFlattener<'a> {
     /// Resolve a [`ValueId`] to its dedup'd [`Register`], returning
     /// `None` for Void slots that regalloc skipped.  Companion to
     /// [`Self::getcolor`] which panics in that case.
-    fn try_getcolor(&mut self, v: ValueId) -> Option<Register> {
-        let (kind, color) = self.kind_color_of(v)?;
+    fn try_getcolor(&mut self, var: &Variable) -> Option<Register> {
+        let (kind, color) = self.kind_color_of(var)?;
         let key = (
             kind,
             u16::try_from(color).expect("register color > u16::MAX"),
@@ -1152,10 +1129,6 @@ impl<'a> GraphFlattener<'a> {
                 Some(ExitSwitch::Value(cond)) => cond,
                 _ => unreachable!(),
             };
-            let cond_vid = self
-                .graph
-                .value_id_of(&cond)
-                .expect("bool-branch ExitSwitch::Value must have a backing ValueId");
             // `linkfalse, linktrue = block.exits;
             //  if linkfalse.llexitcase == True: linkfalse, linktrue = linktrue, linkfalse`.
             let (linkfalse, linktrue) = if bool_llexitcase(&exits[0]) == Some(true) {
@@ -1171,7 +1144,7 @@ impl<'a> GraphFlattener<'a> {
             });
             let false_landing = Label(self.next_label);
             self.next_label += 1;
-            let cond_reg = self.getcolor(cond_vid);
+            let cond_reg = self.getcolor(&cond);
             self.emitline(FlatOp::GotoIfNot {
                 cond: cond_reg,
                 target: false_landing,
@@ -1194,11 +1167,7 @@ impl<'a> GraphFlattener<'a> {
                 Some(ExitSwitch::Value(cond)) => cond,
                 _ => unreachable!(),
             };
-            let cond_vid = self
-                .graph
-                .value_id_of(&cond)
-                .expect("switch ExitSwitch::Value must have a backing ValueId");
-            let kind = value_kind(cond_vid, self.graph, self.regallocs);
+            let kind = value_kind(&cond, self.regallocs);
             assert_eq!(kind, 'i', "switch exitswitch must be int");
             // `switches = [link for link in block.exits if link.exitcase != 'default']`.
             // `switches.sort(key=lambda link: link.llexitcase)`.
@@ -1236,7 +1205,7 @@ impl<'a> GraphFlattener<'a> {
             self.emitline(FlatOp::Live {
                 live_values: Vec::new(),
             });
-            let value_reg = self.getcolor(cond_vid);
+            let value_reg = self.getcolor(&cond);
             self.emitline(FlatOp::Switch {
                 value: value_reg,
                 targets: targets.clone(),
@@ -1318,17 +1287,16 @@ fn last_op_result(
 /// most one class colors `v`.  Multi-class hits panic — a kind-
 /// provenance bug upstream — to preserve the RPython 1:1 invariant.
 fn lookup_kind_color(
-    v: ValueId,
-    graph: &FunctionGraph,
+    var: &Variable,
     regallocs: &HashMap<RegKind, RegAllocResult>,
 ) -> Option<(RegKind, usize)> {
     let mut found: Option<(RegKind, usize)> = None;
     for kind in KINDS {
         if let Some(ra) = regallocs.get(&kind) {
-            if let Some(color) = ra.color_for(graph, v) {
+            if let Some(color) = ra.color_for_variable(var) {
                 if let Some((prev_kind, _)) = found {
                     panic!(
-                        "lookup_kind_color: ValueId {v:?} colored in multiple regalloc \
+                        "lookup_kind_color: Variable {var:?} colored in multiple regalloc \
                          classes ({prev_kind:?} and {kind:?}) — RPython `getkind` must \
                          give exactly one",
                     );
@@ -1400,18 +1368,14 @@ fn compute_num_values(graph: &FunctionGraph, ops: &[FlatOp]) -> usize {
 /// nondeterministic `HashMap` order) and panics on multi-class hits
 /// to mirror RPython's `getkind(v.concretetype)` 1:1 invariant.
 /// Returns `'v'` for Void-typed values that regalloc skipped.
-fn value_kind(
-    value: ValueId,
-    graph: &FunctionGraph,
-    regallocs: &HashMap<RegKind, RegAllocResult>,
-) -> char {
+fn value_kind(var: &Variable, regallocs: &HashMap<RegKind, RegAllocResult>) -> char {
     let mut found: Option<RegKind> = None;
     for kind in KINDS {
         if let Some(ra) = regallocs.get(&kind) {
-            if ra.contains_value(graph, value) {
+            if ra.contains_variable(var) {
                 if let Some(prev) = found {
                     panic!(
-                        "value_kind: ValueId {value:?} colored in multiple regalloc \
+                        "value_kind: Variable {var:?} colored in multiple regalloc \
                          classes ({prev:?} and {kind:?}) — RPython `getkind` must \
                          give exactly one",
                     );
@@ -1439,10 +1403,7 @@ pub(crate) fn linkarg_kind(
     regallocs: &HashMap<RegKind, RegAllocResult>,
 ) -> char {
     match arg {
-        LinkArg::Value(var) => match graph.value_id_of(var) {
-            Some(v) => value_kind(v, graph, regallocs),
-            None => 'v',
-        },
+        LinkArg::Value(var) => value_kind(var, regallocs),
         LinkArg::Const(c) => constant_kind(c),
     }
 }

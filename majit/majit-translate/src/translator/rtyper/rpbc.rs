@@ -363,16 +363,14 @@ pub fn lower_indirect_calls(graph: &mut JitFunctionGraph, call_control: &CallCon
         };
         let receiver_var = args
             .first()
-            .expect("dyn-Trait method call must have a receiver arg");
-        let receiver = graph
-            .value_id_of(receiver_var)
-            .expect("dyn-Trait receiver must have a backing ValueId");
+            .expect("dyn-Trait method call must have a receiver arg")
+            .clone();
         // RPython rclass.py:371-377 (condensed into a single op).
-        let funcptr = rclass::class_get_method_ptr(
+        let funcptr_var = rclass::class_get_method_ptr(
             graph,
             block_id,
             oi,
-            receiver,
+            receiver_var,
             trait_root.clone(),
             method_name.clone(),
         );
@@ -400,7 +398,6 @@ pub fn lower_indirect_calls(graph: &mut JitFunctionGraph, call_control: &CallCon
         };
         // The original Call op is now at index `oi + 1` because
         // `class_get_method_ptr` inserted `VtableMethodPtr` at `oi`.
-        let funcptr_var = graph.must_variable(funcptr);
         graph.blocks[bid].operations[oi + 1] = SpaceOperation {
             result,
             kind: OpKind::IndirectCall {
@@ -821,8 +818,8 @@ pub(crate) mod tests {
             .count();
         assert_eq!(pre_indirect, 1, "expected 1 Indirect Call pre-lowering");
 
-        let annotations = annotate(&graph);
-        resolve_types(&graph, &annotations);
+        annotate(&graph);
+        resolve_types(&graph);
         lower_indirect_calls(&mut graph, &cc);
 
         // Post-lowering: invariant — zero Indirect targets.
@@ -886,8 +883,8 @@ pub(crate) mod tests {
         graph.set_return(graph.startblock, None);
 
         let pre_ops_len = graph.blocks[graph.startblock.0].operations.len();
-        let annotations = annotate(&graph);
-        resolve_types(&graph, &annotations);
+        annotate(&graph);
+        resolve_types(&graph);
         lower_indirect_calls(&mut graph, &cc);
 
         // Same op count; the Call op survives untouched.

@@ -59,7 +59,6 @@ use crate::flowspace::argument::Signature;
 use crate::flowspace::model::{ConstValue, Constant, GraphFunc, GraphRef, Variable};
 use crate::flowspace::pygraph::PyGraph;
 use crate::front;
-use crate::jit_codewriter::annotation_state::{AnnotationState, somevalue_to_valuetype};
 use crate::jit_codewriter::type_state::ConcreteType;
 use crate::model::{FunctionGraph as LegacyGraph, ValueId, ValueType};
 use crate::translator::rtyper::error::TyperError;
@@ -130,6 +129,36 @@ pub fn lowleveltype_to_concrete(ll: &LowLevelType) -> Result<ConcreteType, Typer
 // subject call sites without any pre-seed.  The prior pre-seed was
 // a workaround for the missing dispatch.
 
+/// RAII guard that snapshots every live `legacy_graph.variable(vid).
+/// annotation` cell and restores it on `Drop`, isolating the
+/// dual-gate baseline's `legacy_annotator::annotate` writes from any
+/// subsequent reader on the same graph.  See the `dual_gate_check`
+/// doc for the failure mode this prevents.
+struct LegacyAnnotationGuard<'a> {
+    graph: &'a LegacyGraph,
+    snapshot: Vec<(usize, Option<Rc<crate::annotator::model::SomeValue>>)>,
+}
+
+impl<'a> LegacyAnnotationGuard<'a> {
+    fn snapshot(graph: &'a LegacyGraph) -> Self {
+        let snapshot = graph
+            .iter_variables()
+            .map(|(vid, var)| (vid.0, var.annotation.borrow().clone()))
+            .collect();
+        Self { graph, snapshot }
+    }
+}
+
+impl Drop for LegacyAnnotationGuard<'_> {
+    fn drop(&mut self) {
+        for (idx, ann) in self.snapshot.drain(..) {
+            if let Some(var) = self.graph.variable(ValueId(idx)) {
+                *var.annotation.borrow_mut() = ann;
+            }
+        }
+    }
+}
+
 /// Run `specialize_legacy_graph` and diff against `legacy_state`.
 ///
 /// Returns `Err(message)` when:
@@ -150,6 +179,21 @@ pub fn lowleveltype_to_concrete(ll: &LowLevelType) -> Result<ConcreteType, Typer
 /// per-graph divergence comparison once Slice 12.2 narrowed legacy
 /// usage to the Skip arm.  The legacy-baseline diff stays here so
 /// anchor tests can keep validating the LL→Concrete projection.
+///
+/// Both `dual_gate_check` and `dual_gate_check_with_registry` wrap
+/// the baseline in a [`LegacyAnnotationGuard`] so the dual-gate
+/// comparison is side-effect-free on `legacy_graph.variable.annotation`.
+/// Without the guard the baseline's `legacy_annotator::annotate` would
+/// publish the wider legacy lift onto the graph's annotation cells
+/// (Slice 6.1 contract); a subsequent real-path pass over the same
+/// `legacy_graph` would then see the residue at
+/// `flowspace_adapter::seed_variable` (which copies
+/// `legacy.variable(vid).annotation` onto the fresh flowspace
+/// Variable) and trip `flowin`'s `setbinding: new value does not
+/// contain old` monotonicity assertion when the wider legacy seed
+/// later gets narrowed.  The guard's `Drop` restores the pre-baseline
+/// `.annotation` slot contents on every exit path (success, panic,
+/// or early `Err` return).
 #[cfg(test)]
 pub(crate) fn dual_gate_check(legacy_graph: &LegacyGraph) -> Result<(), String> {
     // The real path goes through `RPythonTyper::specialize`, which
@@ -177,6 +221,43 @@ pub(crate) fn dual_gate_check(legacy_graph: &LegacyGraph) -> Result<(), String> 
             return Err(format!("real path panicked: {msg}"));
         }
     };
+
+    // Defensive baseline diff against the legacy walker.  Mirrors the
+    // `_with_registry` variant (cutover.rs:370-373): runs after the
+    // real path's flowin so `graph.variable(vid).annotation` is not
+    // pre-populated with the legacy walker's wider lift before
+    // `seed_variable` runs (orthodox `_setbinding` monotonicity).
+    // `legacy_resolve::resolve_types` writes `graph.concretetype` from
+    // the post-publish `graph.variable.annotation` cells; the
+    // comparison loop below reads `graph.concretetype` directly.
+    //
+    // The annotation guard snapshots every live
+    // `legacy_graph.variable(vid).annotation` cell before the baseline
+    // and restores the snapshot on `Drop` (end of this function's
+    // scope, including early returns and panic unwinds).  Without it
+    // the wider legacy lift would persist as residue on the graph
+    // (Slice 6.1 made `annotate` write directly to
+    // `Variable.annotation`); a subsequent dual-gate pass over the
+    // same `legacy_graph` would then trip the orthodox
+    // `_setbinding` monotonicity check in flowin.
+    let _annotation_guard = LegacyAnnotationGuard::snapshot(legacy_graph);
+    let baseline = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        super::legacy_annotator::annotate(legacy_graph);
+        super::legacy_resolve::resolve_types(legacy_graph);
+    }));
+    if let Err(payload) = baseline {
+        let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
+            (*s).to_string()
+        } else if let Some(s) = payload.downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "<unrecognised panic payload>".to_string()
+        };
+        return Err(format!(
+            "dual-gate baseline panicked (legacy walker crashed before \
+             comparison could run): {msg}"
+        ));
+    }
 
     let mut divergences: Vec<String> = Vec::new();
 
@@ -257,12 +338,6 @@ pub enum DualGateOutcome {
     /// is pyre-only scaffolding that retires once the legacy walker
     /// itself retires (Step 5 / Task #127).
     Match {
-        /// Per-session annotator's `Variable.annotation` SomeValue
-        /// lattice nodes projected onto a `ValueId`-keyed
-        /// `AnnotationState`.  Slice 12.1 reader output — what the
-        /// orthodox post-jtransform merge consumes instead of the
-        /// per-graph `legacy_annotator::annotate(graph)` recompute.
-        real_annotations: AnnotationState,
         /// `ValueId → flowspace::Variable` mapping built by the
         /// flowspace adapter.  Each Variable carries the
         /// `RPythonTyper`-set `concretetype` inline (`flowspace/
@@ -305,9 +380,8 @@ pub enum DualGateOutcome {
 ///
 /// - `Ok(DualGateOutcome::Match)` when the real path succeeds.  The
 ///   real path's `ValueIdToVariable` map (with each
-///   `Variable.concretetype` cell populated) and `AnnotationState`
-///   are the authoritative source for production consumption (Slice
-///   12.1 reader output).
+///   `Variable.concretetype` cell populated) is the authoritative
+///   source for production consumption.
 /// - `Ok(DualGateOutcome::Skip(reason))` when the real path failed
 ///   on a known-unported feature (registry miss / adapter
 ///   invariant break / unimplemented rtyper op).  Callers fall back
@@ -335,8 +409,8 @@ pub fn dual_gate_check_with_registry(
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         specialize_legacy_graph_with_registry_returning_value_to_var(legacy_graph, call_registry)
     }));
-    let (real_annotations, real_value_to_var, real_constants) = match result {
-        Ok(Ok(triple)) => triple,
+    let (real_value_to_var, real_constants) = match result {
+        Ok(Ok(pair)) => pair,
         Ok(Err(e)) => {
             let msg = format!("{e}");
             if is_known_unported(&msg) {
@@ -373,9 +447,15 @@ pub fn dual_gate_check_with_registry(
     // `legacy_graph.set_concretetype_inline`; the comparison reads
     // legacy-side kinds back from those graph cells (resolve_types
     // returns `()`).
+    //
+    // The annotation guard isolates this comparison-only pass from
+    // the rest of the program: see `dual_gate_check`'s doc for the
+    // failure mode (residue from baseline's `legacy_annotator::
+    // annotate` poisoning a subsequent `seed_variable` read).
+    let _annotation_guard = LegacyAnnotationGuard::snapshot(legacy_graph);
     let baseline = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let legacy_annotations = super::legacy_annotator::annotate(legacy_graph);
-        super::legacy_resolve::resolve_types(legacy_graph, &legacy_annotations);
+        super::legacy_annotator::annotate(legacy_graph);
+        super::legacy_resolve::resolve_types(legacy_graph);
     }));
     if let Err(payload) = baseline {
         let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
@@ -398,10 +478,7 @@ pub fn dual_gate_check_with_registry(
             "dual-gate divergence: {divergence}"
         )));
     }
-    Ok(DualGateOutcome::Match {
-        real_annotations,
-        real_value_to_var,
-    })
+    Ok(DualGateOutcome::Match { real_value_to_var })
 }
 
 /// Per-`ValueId` diff between the real path's `Variable.concretetype`
@@ -438,7 +515,8 @@ fn project_value_to_var_to_map(
     }
     // `Constant.concretetype` is the ground truth for constant operands
     // — read it from the adapter's per-`ValueId` map rather than
-    // attempting to reconstruct from `AnnotationState`.
+    // attempting to reconstruct from the reduced legacy `ValueType`
+    // view.
     for (vid, lltype) in constant_concretetypes {
         if let Ok(kind) = lowleveltype_to_concrete(lltype) {
             real_state.insert(*vid, kind);
@@ -551,12 +629,12 @@ pub(crate) fn is_known_unported(msg: &str) -> bool {
         // succeeding.
         || msg.contains("MissingRTypeAttribute")
         // Variable's `.annotation` slot empty at `bindingrepr`
-        // lookup time — the AnnotationState produced for some
-        // ValueIds carries `Unknown`, and `valuetype_to_someshell`
-        // returns `None` for `Unknown` (intentionally fail-loud
-        // for "annotation gap" so producers know which ValueId
-        // missed seeding, see `seed_variable` at
-        // `flowspace_adapter.rs:96-115`).  Closing the gap means
+        // lookup time — `ValueType::Unknown` has no
+        // annotation-stage shell and `valuetype_to_someshell` returns
+        // `None` for it (intentionally fail-loud for "annotation gap"
+        // so producers know which ValueId missed seeding, see
+        // `seed_variable` at `flowspace_adapter.rs:96-115`).  Closing
+        // the gap means
         // tightening the front-end / annotator producers so every
         // ValueId has a non-`Unknown` annotation; the gate skips
         // until then.
@@ -807,7 +885,8 @@ pub fn populate_call_registry_from_call_graphs(
 // retired the seed; the empty annotator made the pass a no-op).
 // The matching `ProgramSpecializeState` flag and its accessors were
 // retired alongside.  Per-session
-// `specialize_legacy_graph_with_registry_seed` now runs the
+// `specialize_legacy_graph_with_registry_returning_value_to_var`
+// now runs the
 // orthodox flow directly: lift subject graph -> seed subject blocks
 // -> compute_at_fixpoint (drives pycall->recursivecall to discover
 // callees) -> RPythonTyper::specialize.
@@ -871,20 +950,6 @@ pub fn lift_callee_to_pygraph(
     signature: Signature,
     nested_registry: &PyreCallRegistry,
 ) -> Result<Rc<PyGraph>, TyperError> {
-    lift_callee_to_pygraph_seed(callee_graph, None, signature, nested_registry)
-}
-
-/// Slice 12.2 — seeded lift entry mirroring
-/// [`function_graph_to_flowspace_with_seed_annotations`].  Production
-/// goes through [`lift_callee_to_pygraph`]; test fixtures with
-/// minimal SSA shapes pass `Some(&AnnotationState)` so `seed_variable`
-/// has type info to attach to each `Variable`.
-pub(crate) fn lift_callee_to_pygraph_seed(
-    callee_graph: &LegacyGraph,
-    seed_annotations: Option<&AnnotationState>,
-    signature: Signature,
-    nested_registry: &PyreCallRegistry,
-) -> Result<Rc<PyGraph>, TyperError> {
     // The adapter also returns `value_to_var` and `constant_concretetypes`
     // side maps, but every legacy consumer of those was a dead-write
     // path into `PyreCallRegistry` (Issue 2.5 retirement, 2026-05-07).
@@ -893,10 +958,14 @@ pub(crate) fn lift_callee_to_pygraph_seed(
     // specialise; downstream readers must consult those fields directly
     // (`history.py:204` `same_constant`, `model.py:438` `Variable.
     // concretetype`).  The ByValueId side map was a pyre-only divergence.
+    //
+    // Test fixtures that hand-roll minimal SSA shapes must seed
+    // `callee_graph.variable(vid).annotation` directly via
+    // `legacy_annotator::setbinding(&var, ValueType::…)` before calling
+    // this so `seed_variable` has type info to attach.
     let FlowspaceAdapterOutput { graph, .. } =
-        crate::translator::rtyper::flowspace_adapter::function_graph_to_flowspace_with_seed_annotations(
+        crate::translator::rtyper::flowspace_adapter::function_graph_to_flowspace(
             callee_graph,
-            seed_annotations,
             nested_registry,
         )?;
     // Pyre's synthetic `GraphFunc` mirrors `description.py:193-203
@@ -1056,31 +1125,7 @@ pub fn specialize_legacy_graph(
     let registry = crate::translator::rtyper::pyre_call_registry::PyreCallRegistry::new(Rc::new(
         crate::annotator::bookkeeper::Bookkeeper::new(),
     ));
-    let (_, value_to_var, constants) =
-        specialize_legacy_graph_with_registry_seed(legacy, None, &registry)?;
-    Ok((value_to_var, constants))
-}
-
-/// Slice 12.2 — test-only entry that lets fixtures hand-build a
-/// minimal SSA graph without `OpKind::Input { ty }` ops and seed the
-/// adapter's annotation-state explicitly.
-///
-/// Production graphs from `front/ast.rs` always carry the typed
-/// Input / FieldRead / Call ops the legacy walker can recover types
-/// from; minimal anchor-test fixtures construct skeletal SSA shapes
-/// where the legacy walker has no shape to work with, so they need
-/// to inject `(ValueId, ValueType)` pairs explicitly.
-#[cfg(test)]
-pub(crate) fn specialize_legacy_graph_with_seed_annotations(
-    legacy: &LegacyGraph,
-    seed_annotations: &AnnotationState,
-) -> Result<(ValueIdToVariable, HashMap<ValueId, LowLevelType>), TyperError> {
-    let registry = crate::translator::rtyper::pyre_call_registry::PyreCallRegistry::new(Rc::new(
-        crate::annotator::bookkeeper::Bookkeeper::new(),
-    ));
-    let (_, value_to_var, constants) =
-        specialize_legacy_graph_with_registry_seed(legacy, Some(seed_annotations), &registry)?;
-    Ok((value_to_var, constants))
+    specialize_legacy_graph_with_registry_returning_value_to_var(legacy, &registry)
 }
 
 /// `specialize_legacy_graph_with_registry` extended return shape that
@@ -1091,41 +1136,16 @@ pub(crate) fn specialize_legacy_graph_with_seed_annotations(
 /// `graph.set_concretetype_inline` at the dual-gate `Match` arm);
 /// `constants` feeds [`project_value_to_var_to_state`] for the
 /// dual-gate baseline comparison.
+///
+/// Test fixtures that hand-roll minimal SSA shapes without
+/// production-shape `OpKind::Input { ty }` ops must seed
+/// `legacy.variable(vid).annotation` directly via
+/// `legacy_annotator::setbinding(&var, ValueType::...)` before calling
+/// this so `seed_variable` has type info to attach.
 pub fn specialize_legacy_graph_with_registry_returning_value_to_var(
     legacy: &LegacyGraph,
     call_registry: &crate::translator::rtyper::pyre_call_registry::PyreCallRegistry,
-) -> Result<
-    (
-        AnnotationState,
-        ValueIdToVariable,
-        HashMap<ValueId, LowLevelType>,
-    ),
-    TyperError,
-> {
-    specialize_legacy_graph_with_registry_seed(legacy, None, call_registry)
-}
-
-/// Internal driver shared by the production
-/// [`specialize_legacy_graph_with_registry`] entry and the
-/// test-only seeded variant
-/// [`specialize_legacy_graph_with_seed_annotations`].
-///
-/// `seed_annotations: None` keeps the production path
-/// (`function_graph_to_flowspace` runs the internal legacy walker);
-/// `Some(state)` lets fixtures override that walker so minimal SSA
-/// graphs without `OpKind::Input { ty }` ops still type-check.
-pub(crate) fn specialize_legacy_graph_with_registry_seed(
-    legacy: &LegacyGraph,
-    seed_annotations: Option<&AnnotationState>,
-    call_registry: &crate::translator::rtyper::pyre_call_registry::PyreCallRegistry,
-) -> Result<
-    (
-        AnnotationState,
-        ValueIdToVariable,
-        HashMap<ValueId, LowLevelType>,
-    ),
-    TyperError,
-> {
+) -> Result<(ValueIdToVariable, HashMap<ValueId, LowLevelType>), TyperError> {
     // Slice 3 v2 — RPython parity path.
     //
     // Upstream `RPythonTyper.specialize` runs ONCE per `Translator`,
@@ -1146,9 +1166,8 @@ pub(crate) fn specialize_legacy_graph_with_registry_seed(
         value_to_var,
         constant_concretetypes,
         block_map: _,
-    } = crate::translator::rtyper::flowspace_adapter::function_graph_to_flowspace_with_seed_annotations(
+    } = crate::translator::rtyper::flowspace_adapter::function_graph_to_flowspace(
         legacy,
-        seed_annotations,
         call_registry,
     )?;
 
@@ -1178,10 +1197,7 @@ pub(crate) fn specialize_legacy_graph_with_registry_seed(
     // themselves into `all_blocks`/`annotated` through the same
     // bindinputargs path on first arrival.
     let subject_inputcells =
-        crate::translator::rtyper::flowspace_adapter::derive_subject_inputcells(
-            legacy,
-            seed_annotations,
-        )?;
+        crate::translator::rtyper::flowspace_adapter::derive_subject_inputcells(legacy)?;
     let (startblock, exceptblock) = {
         let g = graph.borrow();
         (g.startblock.clone(), g.exceptblock.clone())
@@ -1328,58 +1344,14 @@ pub(crate) fn specialize_legacy_graph_with_registry_seed(
         lowleveltype_to_concrete(lltype)?;
     }
 
-    // ── Step 5 — read back per-ValueId AnnotationState ────────────
-    //
-    // Slice 12.1: project the per-session annotator's `Variable.annotation`
-    // SomeValue lattice nodes back onto a `ValueId`-keyed `AnnotationState`,
-    // mirroring `RPythonAnnotator.bindings` lookup in
-    // `annrpython.py:395-426`.  The reader output is what the orthodox
-    // post-jtransform merge consumes instead of the per-graph
-    // `legacy_annotator::annotate(graph)` recompute — the legacy walker
-    // re-derives types from `OpKind` shapes alone, the rtyper-passed
-    // annotator carries the result of the bookkeeper-driven annotation
-    // fixed-point.
-    let real_annotations = read_annotations_from_value_to_var(&value_to_var);
-    Ok((real_annotations, value_to_var, constant_concretetypes))
-}
-
-/// Project per-session `Variable.annotation` SomeValue lattice nodes onto
-/// a `ValueId`-keyed `AnnotationState`.  Mirrors RPython's
-/// `RPythonAnnotator.bindings[arg]` lookup
-/// (`annrpython.py:395-426 annotation()` / `:417-426 binding()`).
-///
-/// For each (ValueId, Variable) entry:
-/// - if the rtyper / annotator attached a `SomeValue`, store both the
-///   precise lattice node in `some_values[vid]` and a reduced
-///   `ValueType` discriminator in `types[vid]`;
-/// - otherwise leave the slot empty so consumers fall through to the
-///   `valuetype_to_someshell(Unknown)` fail-loud the same way as the
-///   legacy walker's `ValueType::Unknown` slots.
-fn read_annotations_from_value_to_var(
-    value_to_var: &HashMap<ValueId, Variable>,
-) -> AnnotationState {
-    let mut state = AnnotationState::new();
-    for (&vid, var) in value_to_var {
-        let annotation = var.annotation.borrow();
-        let Some(rc_some) = annotation.as_ref() else {
-            continue;
-        };
-        // After Slice 5.6 (`AnnotationState::get` reads from
-        // `some_values` via `somevalue_to_valuetype`) the `types` slot
-        // is dead-write from every consumer's perspective; only the
-        // orthodox `some_values` shell needs to be published here.  The
-        // RPython `Variable.annotation` (`flowspace/model.py:280`)
-        // already carries the precise shell on `var`; we forward the
-        // same Rc to the legacy-baseline cutover comparator.
-        state.some_values.insert(vid, rc_some.clone());
-    }
-    state
+    Ok((value_to_var, constant_concretetypes))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::{Block, BlockId, LinkArg, ValueId, ValueType};
+    use crate::translator::rtyper::legacy_annotator::setbinding;
 
     fn link_to_returnblock(args: Vec<LinkArg>, returnblock_id: BlockId) -> crate::model::Link {
         crate::model::Link::new_mixed(args, returnblock_id, None)
@@ -1521,9 +1493,6 @@ mod tests {
         // the adapter + annotator-surface seeding + specialize +
         // projection chain works end-to-end on a graph the rtyper can
         // resolve without any unported OpKind variants.
-        let mut annotations = AnnotationState::new();
-        annotations.set(ValueId(1), ValueType::Int);
-
         let mut graph = LegacyGraph::new("identity_int");
         let startblock = Block {
             id: graph.startblock,
@@ -1548,9 +1517,9 @@ mod tests {
         };
         graph.blocks = vec![startblock, returnblock];
 
+        setbinding(&graph.must_variable(ValueId(1)), ValueType::Int);
         let (value_to_var, _constants) =
-            specialize_legacy_graph_with_seed_annotations(&graph, &annotations)
-                .expect("identity int graph must specialize");
+            specialize_legacy_graph(&graph).expect("identity int graph must specialize");
 
         assert_eq!(
             kind_of_in(&value_to_var, ValueId(1)),
@@ -1562,9 +1531,6 @@ mod tests {
     #[test]
     fn specialize_legacy_graph_minimal_float_identity_resolves_float() {
         let _lock = anchor_lock();
-        let mut annotations = AnnotationState::new();
-        annotations.set(ValueId(1), ValueType::Float);
-
         let mut graph = LegacyGraph::new("identity_float");
         let startblock = Block {
             id: graph.startblock,
@@ -1589,9 +1555,9 @@ mod tests {
         };
         graph.blocks = vec![startblock, returnblock];
 
+        setbinding(&graph.must_variable(ValueId(1)), ValueType::Float);
         let (value_to_var, _constants) =
-            specialize_legacy_graph_with_seed_annotations(&graph, &annotations)
-                .expect("identity float graph must specialize");
+            specialize_legacy_graph(&graph).expect("identity float graph must specialize");
 
         assert_eq!(
             kind_of_in(&value_to_var, ValueId(1)),
@@ -1611,9 +1577,6 @@ mod tests {
         // `Ptr(GcStruct(OBJECT))` and `lowleveltype_to_concrete`
         // collapses any GC pointer to `ConcreteType::GcRef`, matching
         // legacy `resolve_types(Ref) -> GcRef`.
-        let mut annotations = AnnotationState::new();
-        annotations.set(ValueId(1), ValueType::Ref);
-
         let mut graph = LegacyGraph::new("identity_ref");
         let startblock = Block {
             id: graph.startblock,
@@ -1638,9 +1601,9 @@ mod tests {
         };
         graph.blocks = vec![startblock, returnblock];
 
-        let (value_to_var, _constants) =
-            specialize_legacy_graph_with_seed_annotations(&graph, &annotations)
-                .expect("Ref-typed inputarg must specialize via SomeInstance(classdef=None)");
+        setbinding(&graph.must_variable(ValueId(1)), ValueType::Ref);
+        let (value_to_var, _constants) = specialize_legacy_graph(&graph)
+            .expect("Ref-typed inputarg must specialize via SomeInstance(classdef=None)");
         assert_eq!(
             kind_of_in(&value_to_var, ValueId(1)),
             ConcreteType::GcRef,
@@ -1704,12 +1667,14 @@ mod tests {
             .clone()
     }
 
-    fn run_legacy_resolve(graph: &LegacyGraph) {
-        let annotations = crate::translator::rtyper::legacy_annotator::annotate(graph);
-        // resolve_types writes through `graph.set_concretetype_inline`;
-        // `dual_gate_check` reads its legacy-side kinds from
-        // `graph.concretetype` directly.  resolve_types returns `()`.
-        crate::translator::rtyper::legacy_resolve::resolve_types(graph, &annotations);
+    fn run_legacy_resolve(_graph: &LegacyGraph) {
+        // No-op since `dual_gate_check` runs its own baseline (the
+        // legacy walker after the real path) — pre-warming
+        // `graph.concretetype` here would write the wider legacy lift
+        // onto `graph.variable.annotation` BEFORE the real path's
+        // `seed_variable` runs and trip the orthodox `_setbinding`
+        // monotonicity check.  Kept as a no-op adapter so the call
+        // sites below can be retired without a separate sweep.
     }
 
     #[test]
@@ -1864,10 +1829,6 @@ fn id(x: &Foo) -> &Foo { x }
         // preserves pyre IR's `!x` semantics (consumed verbatim
         // downstream) until the frontend desugars `!cond` to
         // `bool` + branch and bitwise `!int` to `invert`.
-        let mut annotations = AnnotationState::new();
-        annotations.set(ValueId(1), ValueType::Int);
-        annotations.set(ValueId(2), ValueType::Int);
-
         let mut graph = LegacyGraph::new("not_int");
         let startblock = Block {
             id: graph.startblock,
@@ -1919,10 +1880,6 @@ fn id(x: &Foo) -> &Foo { x }
         // operand could silently fold a real value load.  Until
         // the frontend either removes `deref` ops or proves the
         // invariant, the adapter must surface fail-loud.
-        let mut annotations = AnnotationState::new();
-        annotations.set(ValueId(1), ValueType::Int);
-        annotations.set(ValueId(2), ValueType::Int);
-
         let mut graph = LegacyGraph::new("deref_int");
         let startblock = Block {
             id: graph.startblock,
@@ -2028,9 +1985,6 @@ fn fib(n: i64) -> i64 {
         // elsewhere and the absence of a result keeps the SSA chain
         // intact.  Specialize must succeed and project the Int operand
         // to `Signed`.
-        let mut annotations = AnnotationState::new();
-        annotations.set(ValueId(1), ValueType::Int);
-
         let mut graph = LegacyGraph::new("guard_passthrough");
         let inputargs = block_inputargs(&mut graph, &[ValueId(1)]);
         let v1_var = graph.must_variable(ValueId(1));
@@ -2063,9 +2017,9 @@ fn fib(n: i64) -> i64 {
         };
         graph.blocks = vec![startblock, returnblock];
 
-        let (value_to_var, _constants) =
-            specialize_legacy_graph_with_seed_annotations(&graph, &annotations)
-                .expect("GuardValue must be a no-op for the rtyper adapter");
+        setbinding(&graph.must_variable(ValueId(1)), ValueType::Int);
+        let (value_to_var, _constants) = specialize_legacy_graph(&graph)
+            .expect("GuardValue must be a no-op for the rtyper adapter");
         assert_eq!(
             kind_of_in(&value_to_var, ValueId(1)),
             ConcreteType::Signed,
@@ -2080,10 +2034,6 @@ fn fib(n: i64) -> i64 {
         // requires rclass.rs lowering) must surface the variant's
         // fail-loud message — confirms the adapter's TyperError flows
         // through the full specialize pipeline.
-        let mut annotations = AnnotationState::new();
-        annotations.set(ValueId(1), ValueType::Int);
-        annotations.set(ValueId(2), ValueType::Int);
-
         let mut graph = LegacyGraph::new("unported_call");
         let startblock = Block {
             id: graph.startblock,
@@ -2149,10 +2099,6 @@ fn fib(n: i64) -> i64 {
         // bookkeeper's `specialize` pass).  The anchor accepts either
         // outcome and locks the failure mode so future slices can
         // flip the assertion.
-        let mut annotations = AnnotationState::new();
-        annotations.set(ValueId(1), ValueType::Int);
-        annotations.set(ValueId(2), ValueType::Int);
-
         let mut graph = LegacyGraph::new("call_resolved");
         let startblock = Block {
             id: graph.startblock,
@@ -2201,8 +2147,6 @@ fn fib(n: i64) -> i64 {
         // Build a leaf callee `fn foo(x: i64) -> i64 { x }` —
         // identity returns the inputarg, no nested Calls so a
         // child `PyreCallRegistry` can stay empty during the lift.
-        let mut callee_annotations = AnnotationState::new();
-        callee_annotations.set(ValueId(10), ValueType::Int);
         let mut callee_graph = LegacyGraph::new("foo");
         let foo_start = Block {
             id: callee_graph.startblock,
@@ -2229,9 +2173,9 @@ fn fib(n: i64) -> i64 {
         let leaf_registry = crate::translator::rtyper::pyre_call_registry::PyreCallRegistry::new(
             std::rc::Rc::new(crate::annotator::bookkeeper::Bookkeeper::new()),
         );
-        let pygraph = lift_callee_to_pygraph_seed(
+        setbinding(&callee_graph.must_variable(ValueId(10)), ValueType::Int);
+        let pygraph = lift_callee_to_pygraph(
             &callee_graph,
-            Some(&callee_annotations),
             crate::flowspace::argument::Signature::new(vec!["x".to_string()], None, None),
             &leaf_registry,
         )
@@ -2242,8 +2186,10 @@ fn fib(n: i64) -> i64 {
             pygraph,
         );
 
-        let (_annotations, value_to_var, _constants) =
-            specialize_legacy_graph_with_registry_seed(&graph, Some(&annotations), &registry)
+        setbinding(&graph.must_variable(ValueId(1)), ValueType::Int);
+        setbinding(&graph.must_variable(ValueId(2)), ValueType::Int);
+        let (value_to_var, _constants) =
+            specialize_legacy_graph_with_registry_returning_value_to_var(&graph, &registry)
                 .expect("Slice A.4 cache pre-fill must let the leaf Call resolve end-to-end");
         // Slice A.4 closes the loop:
         //   1. Slice A.3c emits `simple_call(host_obj_const, *args)`.
@@ -2600,6 +2546,6 @@ fn cross_block(x: i64, cond: bool) -> i64 {
     // dead-pass `build_program_rtyper` and `ensure_program_specialize`
     // helpers, since after Step 3 they ran a no-op against an empty
     // annotator.  Per-session annotator construction inside
-    // `specialize_legacy_graph_with_registry_seed` is the only
-    // remaining production lifecycle.
+    // `specialize_legacy_graph_with_registry_returning_value_to_var`
+    // is the only remaining production lifecycle.
 }

@@ -3025,11 +3025,22 @@ impl FunctionGraph {
     /// when the Variable's cell is `None` (pre-rtyper window).
     pub fn concretetype(&self, v: ValueId) -> ConcreteType {
         match self.value_variables.get(v.0) {
-            Some(Some(var)) => match var.concretetype.borrow().as_ref() {
-                Some(lltype) => getkind(lltype),
-                None => ConcreteType::Unknown,
-            },
+            Some(Some(var)) => Self::concretetype_of(var),
             _ => ConcreteType::Unknown,
+        }
+    }
+
+    /// Variable-keyed mirror of [`Self::concretetype`] — reads the
+    /// `Variable.concretetype` cell directly without going through the
+    /// `value_variables` ValueId index.  RPython's resolver iterates
+    /// `Variable` instances directly (`rtyper.py:258 v.concretetype =
+    /// ...`); use this when the caller already holds a `&Variable`
+    /// (e.g. `OpKind::BinOp.lhs / .rhs`, `block.inputargs[i]`) to
+    /// skip the `ValueId → Variable` round-trip.
+    pub fn concretetype_of(var: &crate::flowspace::model::Variable) -> ConcreteType {
+        match var.concretetype.borrow().as_ref() {
+            Some(lltype) => getkind(lltype),
+            None => ConcreteType::Unknown,
         }
     }
 
@@ -3082,6 +3093,16 @@ impl FunctionGraph {
         let Some(Some(var)) = self.value_variables.get(v.0) else {
             return;
         };
+        Self::set_concretetype_of_inline(var, ty);
+    }
+
+    /// Variable-keyed mirror of [`Self::set_concretetype_inline`] —
+    /// writes through the `Variable.concretetype` cell directly,
+    /// preserving a richer rtyper-written `LowLevelType` when its
+    /// `getkind` already matches `ty`.  Used by passes that already
+    /// hold a `&Variable` and want to skip the `ValueId → Variable`
+    /// lookup.
+    pub fn set_concretetype_of_inline(var: &crate::flowspace::model::Variable, ty: ConcreteType) {
         let preserve_existing = matches!(
             (ty, var.concretetype.borrow().as_ref()),
             (kind, Some(existing)) if getkind(existing) == kind

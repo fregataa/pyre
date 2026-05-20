@@ -10,25 +10,33 @@
 //! + [`crate::translator::rtyper::cutover::lift_callee_to_pygraph`]) and
 //! the Skip-fallback in
 //! [`crate::jit_codewriter::codewriter::transform_graph_to_jitcode`]
-//! still consume an [`AnnotationState`] produced by this `annotate()`.
-//! A follow-up retirement slice drops both consumers and this file
+//! still drive this `annotate()` for its side-effect: populating each
+//! `graph.variable(vid).annotation` cell via [`setbinding`].  A
+//! follow-up retirement slice drops both consumers and this file
 //! together once the dual-gate Skip categories close.
 //!
 //! Propagates ValueType annotations through the graph by analyzing
 //! each op's inputs and computing the output type. Iterates to
 //! fixpoint when Block.inputargs (Phi nodes) need widening.
 
-use crate::flowspace::model::ConstValue;
-use crate::jit_codewriter::annotation_state::{AnnotationState, somevalue_to_valuetype};
-use crate::model::{FunctionGraph, Link, LinkArg, OpKind, ValueId, ValueType};
+use std::rc::Rc;
 
-/// Run annotation propagation to fixpoint.
+use crate::annotator::model::SomeValue;
+use crate::flowspace::model::{ConstValue, Variable};
+use crate::jit_codewriter::annotation_state::{somevalue_to_valuetype, valuetype_to_someshell};
+use crate::model::{FunctionGraph, Link, LinkArg, OpKind, ValueType};
+
+/// Run annotation propagation to fixpoint, writing each binding
+/// directly into the orthodox `Variable.annotation` cell
+/// (`flowspace/model.py:Variable.annotation`).
 ///
 /// RPython equivalent: `RPythonAnnotator.complete()` — processes all
-/// blocks until no annotation changes.
-pub fn annotate(graph: &FunctionGraph) -> AnnotationState {
-    let mut state = AnnotationState::new();
-
+/// blocks until no annotation changes.  All bindings land on
+/// `graph.variable(vid).annotation`; callers that want a flat
+/// `ValueType` discriminator read via `read_binding` (tests) or
+/// `somevalue_to_valuetype(&graph.variable(vid).annotation.borrow())`
+/// (production).
+pub fn annotate(graph: &FunctionGraph) {
     // RPython parity gap: `annrpython.py:RPythonAnnotator.complete()`
     // never seeds exceptblock inputargs — they receive `SomeInstance`
     // annotations only through `follow_raise_link` (`annrpython.py:
@@ -39,19 +47,32 @@ pub fn annotate(graph: &FunctionGraph) -> AnnotationState {
     // resolution (`Signed` / `GcRef`) regardless of whether the graph
     // actually raises — without the pre-seed, `dual_gate_check` diverges
     // on every trivial identity function (`anchor_int_identity_dual_
-    // gate_agrees` etc.).  This pre-seed retires only when the real
-    // rtyper's exceptblock-handling path itself aligns with upstream
-    // (i.e. `None`-annotation → exclude from build_value_kinds, not
-    // backfill to `Signed`/`GcRef`).
+    // gate_agrees` etc.).  `rpython/jit/codewriter/flatten.py:169-172`
+    // assumes `etype: Int, evalue: Ref` unconditionally; pyre mirrors
+    // that by seeding the annotator state up front.  This pre-seed
+    // retires only when the real rtyper's exceptblock-handling path
+    // itself aligns with upstream (i.e. `None`-annotation → exclude
+    // from build_value_kinds, not backfill to `Signed`/`GcRef`).
     if let Some(exceptblock) = graph.blocks.get(graph.exceptblock.0) {
-        let exceptblock_vids = exceptblock.inputarg_value_ids(graph);
-        if let Some(&etype) = exceptblock_vids.first() {
-            state.set(etype, ValueType::Int);
+        if let Some(etype) = exceptblock.inputargs.first() {
+            setbinding(etype, ValueType::Int);
         }
-        if let Some(&evalue) = exceptblock_vids.get(1) {
-            state.set(evalue, ValueType::Ref);
+        if let Some(evalue) = exceptblock.inputargs.get(1) {
+            setbinding(evalue, ValueType::Ref);
         }
     }
+    // `returnblock.inputargs[0]` deliberately stays unseeded here.
+    // `set_return(_, None)` wires a `LinkArg::Const(Constant(None,
+    // concretetype=Some(VOID)))` (model.rs:set_return) and the
+    // rtyper-layer projection in
+    // `legacy_resolve::link_arg_concrete_type` honours
+    // `value.concretetype` to materialise `ConcreteType::Void` on the
+    // returnblock inputarg, matching
+    // `pairtype(Repr, NoneRepr).convert_from_to → inputconst(Void, None)`
+    // (`rpython/rtyper/rnone.py:48`).  Pre-seeding `Ref` at annotation
+    // stage would collapse a real `Float`/`Int` return into
+    // `union_type(Ref, Float|Int) == Unknown`.
+
     // Process all blocks (simple single-pass for acyclic; loops need fixpoint)
     let mut changed = true;
     let mut iterations = 0;
@@ -64,12 +85,12 @@ pub fn annotate(graph: &FunctionGraph) -> AnnotationState {
         for block in &graph.blocks {
             // Propagate annotations through ops in this block
             for op in &block.operations {
-                if let Some(result) = op.registered_result_value_id(graph) {
-                    let inferred = infer_op_type(&op.kind, &state, graph);
-                    let current = state.get(result);
+                if let Some(result) = op.result.as_ref() {
+                    let inferred = infer_op_type(&op.kind);
+                    let current = read_binding(result);
                     let merged = union_type(&current, &inferred);
                     if merged != current {
-                        state.set(result, merged);
+                        setbinding(result, merged);
                         changed = true;
                     }
                 }
@@ -81,83 +102,122 @@ pub fn annotate(graph: &FunctionGraph) -> AnnotationState {
             // `link.args[i]` annotation into `link.target.inputargs[i]`.
             for link in &block.exits {
                 let link_changed = if link_is_raise_like(link) {
-                    follow_raise_link(&mut state, graph, link)
+                    follow_raise_link(graph, link)
                 } else {
-                    follow_link(&mut state, graph, link)
+                    follow_link(graph, link)
                 };
                 changed |= link_changed;
             }
         }
     }
+}
 
-    state
+/// Read the legacy `ValueType` discriminator out of
+/// `var.annotation`.  Returns `Unknown` when the slot is empty —
+/// consistent with [`setbinding`]'s invariant (every non-`Unknown`
+/// setbinding writes a paired shell; `Unknown` clears it).
+fn read_binding(var: &Variable) -> ValueType {
+    var.annotation
+        .borrow()
+        .as_ref()
+        .map(|s| somevalue_to_valuetype(s))
+        .unwrap_or(ValueType::Unknown)
+}
+
+/// Read the precise `SomeValue` shell out of `var.annotation`, or
+/// `None` when the producer left the slot empty.
+fn read_binding_some(var: &Variable) -> Option<Rc<SomeValue>> {
+    var.annotation.borrow().clone()
+}
+
+/// Write a `ValueType` binding to `var.annotation` via the matching
+/// `SomeValue` shell.  Doubles as the cfg(test) seed helper that
+/// fixtures use to attach annotations directly to the orthodox
+/// `Variable.annotation` cell.
+///
+/// RPython `RPythonAnnotator.setbinding(arg, s_value)`
+/// (`annrpython.py:289-294`):
+///
+/// ```python
+/// def setbinding(self, arg, s_value):
+///     if arg in self.bindings:
+///         assert s_value.contains(self.bindings[arg])
+///     self.bindings[arg] = s_value
+/// ```
+///
+/// The containment check enforces monotonicity (`s_new ⊇ s_old`); a
+/// non-monotone re-binding is a producer-side error.  `ValueType::
+/// Unknown` has no upstream annotation-stage counterpart; setting it
+/// clears any stale shell so the downstream rtyper fails fast at
+/// `bindingrepr` instead of silently bridging to `GcRef`.
+pub(crate) fn setbinding(var: &Variable, ty: ValueType) {
+    if let Some(shell) = valuetype_to_someshell(&ty) {
+        let new_val = Rc::new(shell);
+        let mut slot = var.annotation.borrow_mut();
+        if let Some(existing) = slot.as_ref() {
+            assert!(
+                new_val.contains(existing.as_ref()),
+                "legacy_annotator::setbinding: non-monotone re-binding at \
+                 Variable {var:?}; new value {:?} does not contain previous \
+                 value {:?} (annrpython.py:292)",
+                new_val,
+                existing.as_ref(),
+            );
+        }
+        *slot = Some(new_val);
+    } else {
+        *var.annotation.borrow_mut() = None;
+    }
 }
 
 fn link_is_raise_like(link: &Link) -> bool {
     link.last_exception.is_some() && link.last_exc_value.is_some()
 }
 
-fn follow_link(state: &mut AnnotationState, graph: &FunctionGraph, link: &Link) -> bool {
+fn follow_link(graph: &FunctionGraph, link: &Link) -> bool {
     let mut changed = false;
     let target_block = graph.block(link.target);
-    let target_vids = target_block.inputarg_value_ids(graph);
-    for (dst, src) in target_vids.iter().zip(link.args.iter()) {
-        changed |= merge_value_type(state, *dst, link_arg_type(state, graph, src));
+    for (dst, src) in target_block.inputargs.iter().zip(link.args.iter()) {
+        changed |= merge_value_type(dst, link_arg_type(src));
     }
     changed
 }
 
-fn follow_raise_link(state: &mut AnnotationState, graph: &FunctionGraph, link: &Link) -> bool {
+fn follow_raise_link(graph: &FunctionGraph, link: &Link) -> bool {
     let mut changed = false;
-    if let Some(value) = link.last_exc_value.as_ref().and_then(|a| a.as_value(graph)) {
-        changed |= merge_value_type(state, value, ValueType::Ref);
+    if let Some(value) = link.last_exc_value.as_ref().and_then(|a| a.as_variable()) {
+        changed |= merge_value_type(value, ValueType::Ref);
     }
-    if let Some(value) = link.last_exception.as_ref().and_then(|a| a.as_value(graph)) {
-        changed |= merge_value_type(state, value, ValueType::Int);
+    if let Some(value) = link.last_exception.as_ref().and_then(|a| a.as_variable()) {
+        changed |= merge_value_type(value, ValueType::Int);
     }
 
     let target_block = graph.block(link.target);
-    let target_vids = target_block.inputarg_value_ids(graph);
-    for (dst, src) in target_vids.iter().zip(link.args.iter()) {
+    for (dst, src) in target_block.inputargs.iter().zip(link.args.iter()) {
         let src_ty = if Some(src) == link.last_exception.as_ref() {
             ValueType::Int
         } else if Some(src) == link.last_exc_value.as_ref() {
             ValueType::Ref
         } else {
-            link_arg_type(state, graph, src)
+            link_arg_type(src)
         };
-        changed |= merge_value_type(state, *dst, src_ty);
+        changed |= merge_value_type(dst, src_ty);
     }
     changed
 }
 
-fn link_arg_type(state: &AnnotationState, graph: &FunctionGraph, src: &LinkArg) -> ValueType {
+fn link_arg_type(src: &LinkArg) -> ValueType {
     match src {
-        // After the Variable cutover, `as_value(graph)` returning
-        // `None` means the link references a `Variable` the graph
-        // never registered — i.e. malformed graph metadata.  Silently
-        // degrading to `Unknown` would mask that and could let the
-        // legacy-baseline dual-gate comparison pass with degraded
-        // types; fail loud so the producer's contract violation
-        // surfaces here.
-        LinkArg::Value(var) => {
-            let vid = src.as_value(graph).unwrap_or_else(|| {
-                panic!(
-                    "link_arg_type: LinkArg::Value references Variable {var:?} \
-                     that is not registered on the graph — malformed link.args"
-                )
-            });
-            state.get(vid)
-        }
+        LinkArg::Value(var) => read_binding(var),
         LinkArg::Const(value) => const_value_type(&value.value),
     }
 }
 
-fn merge_value_type(state: &mut AnnotationState, dst: ValueId, src_ty: ValueType) -> bool {
-    let current = state.get(dst);
+fn merge_value_type(dst: &Variable, src_ty: ValueType) -> bool {
+    let current = read_binding(dst);
     let merged = union_type(&current, &src_ty);
     if merged != current {
-        state.set(dst, merged);
+        setbinding(dst, merged);
         true
     } else {
         false
@@ -208,7 +268,7 @@ fn const_value_type(value: &ConstValue) -> ValueType {
 ///
 /// RPython equivalent: annotator dispatch (e.g., `annotate_int_add`
 /// returns `SomeInteger()`).
-fn infer_op_type(kind: &OpKind, state: &AnnotationState, graph: &FunctionGraph) -> ValueType {
+fn infer_op_type(kind: &OpKind) -> ValueType {
     match kind {
         OpKind::Input { ty, .. } => ty.clone(),
         OpKind::ConstInt(_) => ValueType::Int,
@@ -229,7 +289,7 @@ fn infer_op_type(kind: &OpKind, state: &AnnotationState, graph: &FunctionGraph) 
             if result_ty != &ValueType::Unknown {
                 return result_ty.clone();
             }
-            infer_call_result_type(target, args, state)
+            infer_call_result_type(target, args)
         }
         OpKind::GuardTrue { .. } | OpKind::GuardFalse { .. } => ValueType::Void,
         OpKind::VableFieldRead { ty, .. } => ty.clone(),
@@ -244,10 +304,7 @@ fn infer_op_type(kind: &OpKind, state: &AnnotationState, graph: &FunctionGraph) 
             if result_ty != &ValueType::Unknown {
                 result_ty.clone()
             } else {
-                graph
-                    .value_id_of(operand)
-                    .map(|vid| state.get(vid))
-                    .unwrap_or(ValueType::Unknown)
+                read_binding(operand)
             }
         }
         // RPython `rfloat.py:rtype_neg` / `intop.py:rtype_neg`: `neg`
@@ -268,15 +325,13 @@ fn infer_op_type(kind: &OpKind, state: &AnnotationState, graph: &FunctionGraph) 
             } else {
                 // RPython `intop.rtype_neg` / `rfloat.rtype_neg` dispatch
                 // on the operand `SomeValue`'s lowleveltype.  Read the
-                // orthodox `Variable.annotation` analogue
-                // (`some_values`) so a Float operand keeps its Float
-                // result; absent/Unknown-cleared operands default to Int
-                // matching the historical `.types.get(...).unwrap_or(Int)`
-                // semantics for the dominant "operand not yet annotated"
-                // case.
-                graph
-                    .value_id_of(operand)
-                    .and_then(|vid| state.some(vid).map(|s| somevalue_to_valuetype(s)))
+                // orthodox `Variable.annotation` cell so a Float operand
+                // keeps its Float result; absent/Unknown-cleared
+                // operands default to Int matching the historical
+                // `.types.get(...).unwrap_or(Int)` semantics for the
+                // dominant "operand not yet annotated" case.
+                read_binding_some(operand)
+                    .map(|s| somevalue_to_valuetype(&s))
                     .unwrap_or(ValueType::Int)
             }
         }
@@ -328,7 +383,6 @@ fn kind_char_to_value_type(kind: char) -> ValueType {
 fn infer_call_result_type(
     target: &crate::model::CallTarget,
     _args: &[crate::flowspace::model::Variable],
-    _state: &AnnotationState,
 ) -> ValueType {
     if crate::call::is_int_arithmetic_target(target) {
         return ValueType::Int;
@@ -369,8 +423,8 @@ mod tests {
         let v = graph.push_op(entry, OpKind::ConstInt(42), true).unwrap();
         graph.set_return(entry, Some(graph.must_variable(v)));
 
-        let state = annotate(&graph);
-        assert_eq!(state.get(v), ValueType::Int);
+        annotate(&graph);
+        assert_eq!(read_binding(&graph.must_variable(v)), ValueType::Int);
     }
 
     #[test]
@@ -393,8 +447,8 @@ mod tests {
             .unwrap();
         graph.set_return(entry, Some(graph.must_variable(v)));
 
-        let state = annotate(&graph);
-        assert_eq!(state.get(v), ValueType::Int);
+        annotate(&graph);
+        assert_eq!(read_binding(&graph.must_variable(v)), ValueType::Int);
     }
 
     #[test]
@@ -418,10 +472,10 @@ mod tests {
             .unwrap();
         graph.set_return(entry, Some(graph.must_variable(result)));
 
-        let state = annotate(&graph);
-        assert_eq!(state.get(a), ValueType::Int);
-        assert_eq!(state.get(b), ValueType::Int);
-        assert_eq!(state.get(result), ValueType::Int);
+        annotate(&graph);
+        assert_eq!(read_binding(&graph.must_variable(a)), ValueType::Int);
+        assert_eq!(read_binding(&graph.must_variable(b)), ValueType::Int);
+        assert_eq!(read_binding(&graph.must_variable(result)), ValueType::Int);
     }
 
     #[test]
@@ -445,8 +499,8 @@ mod tests {
             .unwrap();
         graph.set_return(entry, Some(graph.must_variable(result)));
 
-        let state = annotate(&graph);
-        assert_eq!(state.get(result), ValueType::Int);
+        annotate(&graph);
+        assert_eq!(read_binding(&graph.must_variable(result)), ValueType::Int);
     }
 
     #[test]
@@ -467,10 +521,10 @@ mod tests {
         graph.set_goto(entry, target, vec![val_var]);
         graph.set_return(target, Some(graph.must_variable(phi)));
 
-        let state = annotate(&graph);
+        annotate(&graph);
         // Phi should inherit Int from val via Link propagation
         assert_eq!(
-            state.get(phi),
+            read_binding(&graph.must_variable(phi)),
             ValueType::Int,
             "Phi node should receive Int annotation from Link args"
         );
@@ -502,11 +556,17 @@ mod tests {
             ],
         );
 
-        let state = annotate(&graph);
-        assert_eq!(state.get(last_exception), ValueType::Int);
-        assert_eq!(state.get(last_exc_value), ValueType::Ref);
-        assert_eq!(state.get(etype), ValueType::Int);
-        assert_eq!(state.get(evalue), ValueType::Ref);
+        annotate(&graph);
+        assert_eq!(
+            read_binding(&graph.must_variable(last_exception)),
+            ValueType::Int
+        );
+        assert_eq!(
+            read_binding(&graph.must_variable(last_exc_value)),
+            ValueType::Ref
+        );
+        assert_eq!(read_binding(&graph.must_variable(etype)), ValueType::Int);
+        assert_eq!(read_binding(&graph.must_variable(evalue)), ValueType::Ref);
     }
 
     #[test]
@@ -529,10 +589,10 @@ mod tests {
             .unwrap();
         graph.set_return(entry, Some(graph.must_variable(result)));
 
-        let state = annotate(&graph);
+        annotate(&graph);
         let ret = graph.block(graph.returnblock).inputarg_value_ids(&graph)[0];
-        assert_eq!(state.get(result), ValueType::Float);
-        assert_eq!(state.get(ret), ValueType::Float);
+        assert_eq!(read_binding(&graph.must_variable(result)), ValueType::Float);
+        assert_eq!(read_binding(&graph.must_variable(ret)), ValueType::Float);
     }
 
     #[test]
@@ -552,15 +612,16 @@ mod tests {
         let entry = graph.startblock;
         graph.set_return(entry, None);
 
-        let annotations = annotate(&graph);
+        annotate(&graph);
         let ret = graph.block(graph.returnblock).inputarg_value_ids(&graph)[0];
+        let ret_var = graph.must_variable(ret);
         assert_eq!(
-            annotations.get(ret),
+            read_binding(&ret_var),
             ValueType::Ref,
             "annotation-layer projection of Constant(None) follows SomeNone → Ref",
         );
 
-        legacy_resolve::resolve_types(&graph, &annotations);
+        legacy_resolve::resolve_types(&graph);
         assert_eq!(
             graph.concretetype(ret),
             crate::jit_codewriter::type_state::ConcreteType::Void,

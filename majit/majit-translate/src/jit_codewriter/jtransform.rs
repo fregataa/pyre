@@ -228,9 +228,11 @@ pub struct Transformer<'a> {
         crate::flowspace::model::Variable,
         (crate::flowspace::model::Variable, usize, usize, bool),
     >,
-    /// RPython: `Transformer.vable_flags`.
+    /// RPython: `Transformer.vable_flags`. Keyed by Variable identity
+    /// matching upstream `self.vable_flags[op.args[0]] = ...`
+    /// (`jtransform.py` populates with `Variable` objects).
     #[allow(dead_code)]
-    vable_flags: std::collections::HashMap<ValueId, VableFlag>,
+    vable_flags: std::collections::HashMap<crate::flowspace::model::Variable, VableFlag>,
     /// Value aliases from identity rewrites (same_as / hint rewriting).
     aliases: std::collections::HashMap<
         crate::flowspace::model::Variable,
@@ -6433,8 +6435,8 @@ mod tests {
         );
         graph.set_return(graph.startblock, None);
 
-        let annotations = annotate(&graph);
-        resolve_types(&graph, &annotations);
+        annotate(&graph);
+        resolve_types(&graph);
         lower_indirect_calls(&mut graph, &cc);
 
         let config = GraphTransformConfig::default();
@@ -6527,8 +6529,8 @@ mod tests {
         );
         graph.set_return(graph.startblock, None);
 
-        let annotations = annotate(&graph);
-        resolve_types(&graph, &annotations);
+        annotate(&graph);
+        resolve_types(&graph);
         lower_indirect_calls(&mut graph, &cc);
 
         let config = GraphTransformConfig::default();
@@ -6684,8 +6686,8 @@ mod tests {
         );
         graph.set_return(graph.startblock, None);
 
-        let annotations = annotate(&graph);
-        resolve_types(&graph, &annotations);
+        annotate(&graph);
+        resolve_types(&graph);
         lower_indirect_calls(&mut graph, &cc);
 
         let config = GraphTransformConfig::default();
@@ -6937,8 +6939,8 @@ mod tests {
         );
         graph.set_return(graph.startblock, None);
 
-        let annotations = annotate(&graph);
-        resolve_types(&graph, &annotations);
+        annotate(&graph);
+        resolve_types(&graph);
         lower_indirect_calls(&mut graph, &cc);
 
         let config = GraphTransformConfig::default();

@@ -9,13 +9,14 @@
 //! This file remains because:
 //!   * `dual_gate_check_with_registry`
 //!     ([`crate::translator::rtyper::cutover`]) still compares the real
-//!     path against `resolve_types(graph, &annotations)` for parity
-//!     diff, and
+//!     path against `legacy_annotator::annotate(graph)` followed by
+//!     `resolve_types(graph)` for parity diff, and
 //!   * `transform_graph_to_jitcode`
 //!     ([`crate::jit_codewriter::codewriter`]) calls
 //!     `resolve_rewritten_types(...)` to merge the post-jtransform
 //!     `result_kind` declarations with `merge_synth_kinds`, and falls
-//!     back to `legacy_state` (`resolve_types(graph, &annotations)`)
+//!     back to the legacy walker (`annotate(graph)` then
+//!     `resolve_types(graph)`)
 //!     when the dual-gate Skip-classifies.
 //!
 //! Retirement drops both consumers and this file together once Skip
@@ -26,10 +27,10 @@
 
 use std::collections::HashMap;
 
-use crate::flowspace::model::ConstValue;
-use crate::jit_codewriter::annotation_state::{AnnotationState, somevalue_to_valuetype};
+use crate::flowspace::model::{ConstValue, Variable};
+use crate::jit_codewriter::annotation_state::somevalue_to_valuetype;
 use crate::jit_codewriter::type_state::{
-    ConcreteType, authoritative_result_types, kind_char_to_concrete, valuetype_to_concrete,
+    ConcreteType, kind_char_to_concrete, valuetype_to_concrete,
 };
 use crate::model::{FunctionGraph, Link, LinkArg, OpKind, ValueId};
 
@@ -41,25 +42,37 @@ use crate::model::{FunctionGraph, Link, LinkArg, OpKind, ValueId};
 /// Result is committed through `graph.set_concretetype_inline` for
 /// every populated `ValueId`; downstream consumers read kinds via
 /// `graph.concretetype(v)` (`getkind(v.concretetype)`).
-pub fn resolve_types(graph: &FunctionGraph, annotations: &AnnotationState) {
-    // Walk the orthodox `some_values` map (RPython `Variable.annotation`
-    // analogue).  `Unknown`-projected entries never reach this loop
-    // because `AnnotationState::set` removes the `some_values` slot on
-    // `Unknown`; non-`Unknown` `valuetype_to_concrete` outputs always
-    // produce a concrete kind, so every iteration commits a real
+pub fn resolve_types(graph: &FunctionGraph) {
+    // Walk the orthodox `Variable.annotation` slot on every registered
+    // graph variable (RPython `Variable.annotation`).  `Unknown`-projected
+    // entries never appear because `legacy_annotator::setbinding` clears
+    // the slot on `Unknown` — non-`Unknown` `valuetype_to_concrete`
+    // outputs always produce a concrete kind, so every populated cell
+    // commits a real
     // `graph.set_concretetype_inline` write.
-    for (&vid, rc_some) in &annotations.some_values {
-        let vtype = somevalue_to_valuetype(rc_some);
-        let concrete = valuetype_to_concrete(&vtype);
-        graph.set_concretetype_inline(vid, concrete);
+    for (vid, var) in graph.iter_variables() {
+        let ann = var.annotation.borrow();
+        if let Some(rc_some) = ann.as_ref() {
+            let vtype = somevalue_to_valuetype(rc_some);
+            let concrete = valuetype_to_concrete(&vtype);
+            graph.set_concretetype_inline(vid, concrete);
+        }
     }
 
     // Resolve from ops with explicit type info
     for block in &graph.blocks {
-        // Resolve inputargs (Phi nodes) from annotations
+        // Resolve inputargs (Phi nodes) from `Variable.annotation`
         for vid in block.inputarg_value_ids(graph) {
             if graph.concretetype(vid) == ConcreteType::Unknown {
-                let vtype = annotations.get(vid);
+                let vtype = graph
+                    .variable(vid)
+                    .and_then(|v| {
+                        v.annotation
+                            .borrow()
+                            .as_ref()
+                            .map(|rc| somevalue_to_valuetype(rc))
+                    })
+                    .unwrap_or(crate::model::ValueType::Unknown);
                 let concrete = valuetype_to_concrete(&vtype);
                 if concrete != ConcreteType::Unknown {
                     graph.set_concretetype_inline(vid, concrete);
@@ -171,15 +184,9 @@ pub fn resolve_types(graph: &FunctionGraph, annotations: &AnnotationState) {
                         // keys need `cast_ptr_to_int` insertion in
                         // jtransform, not a type override in the
                         // rtyper.
-                        let lhs_vid = graph
-                            .value_id_of(lhs)
-                            .expect("BinOp.lhs has backing ValueId");
-                        let rhs_vid = graph
-                            .value_id_of(rhs)
-                            .expect("BinOp.rhs has backing ValueId");
-                        changed |= maybe_seed_concrete_type(graph, lhs_vid, ConcreteType::Signed);
-                        changed |= maybe_seed_concrete_type(graph, rhs_vid, ConcreteType::Signed);
-                        if let Some(result) = op.registered_result_value_id(graph) {
+                        changed |= maybe_seed_concrete_type(lhs, ConcreteType::Signed);
+                        changed |= maybe_seed_concrete_type(rhs, ConcreteType::Signed);
+                        if let Some(result) = op.result.as_ref() {
                             // RPython rtyper resolves an `add` whose
                             // operands are both `lltype.Float` to
                             // `float_add` directly (`rfloat.py
@@ -193,16 +200,13 @@ pub fn resolve_types(graph: &FunctionGraph, annotations: &AnnotationState) {
                             // to `float_add` (etc.) and insert
                             // `cast_int_to_float` for mixed int/float
                             // operands, keeping IR/regalloc consistent.
-                            let lhs_float = graph.concretetype(lhs_vid) == ConcreteType::Float;
-                            let rhs_float = graph.concretetype(rhs_vid) == ConcreteType::Float;
-                            let any_float = lhs_float || rhs_float;
-                            let both_numeric = matches!(
-                                graph.concretetype(lhs_vid),
-                                ConcreteType::Signed | ConcreteType::Float
-                            ) && matches!(
-                                graph.concretetype(rhs_vid),
-                                ConcreteType::Signed | ConcreteType::Float
-                            );
+                            let lhs_ty = FunctionGraph::concretetype_of(lhs);
+                            let rhs_ty = FunctionGraph::concretetype_of(rhs);
+                            let any_float =
+                                lhs_ty == ConcreteType::Float || rhs_ty == ConcreteType::Float;
+                            let both_numeric =
+                                matches!(lhs_ty, ConcreteType::Signed | ConcreteType::Float)
+                                    && matches!(rhs_ty, ConcreteType::Signed | ConcreteType::Float);
                             // Mirror jtransform's float-rewrite set
                             // (`jit_codewriter/jtransform.rs`):
                             // arithmetic `add/sub/mul/div` →
@@ -224,13 +228,12 @@ pub fn resolve_types(graph: &FunctionGraph, annotations: &AnnotationState) {
                                 } else {
                                     ConcreteType::Float
                                 };
-                                if graph.concretetype(result) != target {
-                                    graph.set_concretetype_inline(result, target);
+                                if FunctionGraph::concretetype_of(result) != target {
+                                    FunctionGraph::set_concretetype_of_inline(result, target);
                                     changed = true;
                                 }
                             } else if !any_float || !both_numeric {
-                                changed |=
-                                    maybe_seed_concrete_type(graph, result, ConcreteType::Signed);
+                                changed |= maybe_seed_concrete_type(result, ConcreteType::Signed);
                             }
                         }
                     }
@@ -239,25 +242,23 @@ pub fn resolve_types(graph: &FunctionGraph, annotations: &AnnotationState) {
                         operand,
                         ..
                     } if is_int_unop(opname) => {
-                        let operand_vid = graph
-                            .value_id_of(operand)
-                            .expect("UnaryOp.operand has backing ValueId");
-                        changed |=
-                            maybe_seed_concrete_type(graph, operand_vid, ConcreteType::Signed);
-                        if let Some(result) = op.registered_result_value_id(graph) {
+                        changed |= maybe_seed_concrete_type(operand, ConcreteType::Signed);
+                        if let Some(result) = op.result.as_ref() {
                             // Same Float-operand override as the BinOp
                             // arm above.  Unary `neg` on a Float
                             // returns Float (`float_neg`).
                             let operand_float =
-                                graph.concretetype(operand_vid) == ConcreteType::Float;
+                                FunctionGraph::concretetype_of(operand) == ConcreteType::Float;
                             if operand_float && opname == "neg" {
-                                if graph.concretetype(result) != ConcreteType::Float {
-                                    graph.set_concretetype_inline(result, ConcreteType::Float);
+                                if FunctionGraph::concretetype_of(result) != ConcreteType::Float {
+                                    FunctionGraph::set_concretetype_of_inline(
+                                        result,
+                                        ConcreteType::Float,
+                                    );
                                     changed = true;
                                 }
                             } else {
-                                changed |=
-                                    maybe_seed_concrete_type(graph, result, ConcreteType::Signed);
+                                changed |= maybe_seed_concrete_type(result, ConcreteType::Signed);
                             }
                         }
                     }
@@ -281,25 +282,18 @@ pub fn resolve_types(graph: &FunctionGraph, annotations: &AnnotationState) {
                         // would surface as `cast_int_to_float/r>f`
                         // at the assembler.  Re-seed Signed here so
                         // pass 2 converges to the same operand kind.
-                        let operand_vid = graph
-                            .value_id_of(operand)
-                            .expect("UnaryOp.operand has backing ValueId");
-                        changed |=
-                            maybe_seed_concrete_type(graph, operand_vid, ConcreteType::Signed);
+                        changed |= maybe_seed_concrete_type(operand, ConcreteType::Signed);
                     }
                     OpKind::UnaryOp {
                         op: opname,
                         operand,
                         ..
                     } if is_identity_unop(opname) => {
-                        if let Some(result) = op.registered_result_value_id(graph) {
-                            let operand_vid = graph
-                                .value_id_of(operand)
-                                .expect("UnaryOp.operand has backing ValueId");
-                            let operand_ty = graph.concretetype(operand_vid);
-                            let result_ty = graph.concretetype(result);
-                            changed |= maybe_seed_concrete_type(graph, result, operand_ty);
-                            changed |= maybe_seed_concrete_type(graph, operand_vid, result_ty);
+                        if let Some(result) = op.result.as_ref() {
+                            let operand_ty = FunctionGraph::concretetype_of(operand);
+                            let result_ty = FunctionGraph::concretetype_of(result);
+                            changed |= maybe_seed_concrete_type(result, operand_ty);
+                            changed |= maybe_seed_concrete_type(operand, result_ty);
                         }
                     }
                     _ => {}
@@ -404,8 +398,7 @@ fn link_is_raise_like(link: &Link) -> bool {
 
 fn convert_link(graph: &FunctionGraph, link: &Link) {
     let target_block = graph.block(link.target);
-    let target_vids = target_block.inputarg_value_ids(graph);
-    for (dst, src) in target_vids.iter().zip(link.args.iter()) {
+    for (dst, src) in target_block.inputargs.iter().zip(link.args.iter()) {
         // A `LinkArg::Const(_)` whose `concretetype` carries a
         // construction-site repr (e.g. `set_return`'s
         // `Constant(None, concretetype=Void)`) is authoritative —
@@ -419,60 +412,44 @@ fn convert_link(graph: &FunctionGraph, link: &Link) {
         if let LinkArg::Const(value) = src
             && let Some(lltype) = value.concretetype.as_ref()
         {
-            graph.set_concretetype_inline(*dst, crate::model::getkind(lltype));
+            FunctionGraph::set_concretetype_of_inline(dst, crate::model::getkind(lltype));
             continue;
         }
-        let _ = maybe_seed_concrete_type(graph, *dst, link_arg_concrete_type(graph, src));
+        let _ = maybe_seed_concrete_type(dst, link_arg_concrete_type(src));
     }
 }
 
 fn convert_raise_link(graph: &FunctionGraph, link: &Link) {
-    if let Some(value) = link.last_exception.as_ref().and_then(|a| a.as_value(graph)) {
-        let _ = maybe_seed_concrete_type(graph, value, ConcreteType::Signed);
+    if let Some(value) = link.last_exception.as_ref().and_then(|a| a.as_variable()) {
+        let _ = maybe_seed_concrete_type(value, ConcreteType::Signed);
     }
-    if let Some(value) = link.last_exc_value.as_ref().and_then(|a| a.as_value(graph)) {
-        let _ = maybe_seed_concrete_type(graph, value, ConcreteType::GcRef);
+    if let Some(value) = link.last_exc_value.as_ref().and_then(|a| a.as_variable()) {
+        let _ = maybe_seed_concrete_type(value, ConcreteType::GcRef);
     }
 
     let target_block = graph.block(link.target);
-    let target_vids = target_block.inputarg_value_ids(graph);
-    for (dst, src) in target_vids.iter().zip(link.args.iter()) {
+    for (dst, src) in target_block.inputargs.iter().zip(link.args.iter()) {
         let src_ty = if Some(src) == link.last_exception.as_ref() {
             ConcreteType::Signed
         } else if Some(src) == link.last_exc_value.as_ref() {
             ConcreteType::GcRef
         } else {
-            link_arg_concrete_type(graph, src)
+            link_arg_concrete_type(src)
         };
-        let _ = maybe_seed_concrete_type(graph, *dst, src_ty);
+        let _ = maybe_seed_concrete_type(dst, src_ty);
     }
 }
 
 fn converge_link(graph: &FunctionGraph, link: &Link) -> bool {
     let mut changed = false;
     let target_block = graph.block(link.target);
-    let target_vids = target_block.inputarg_value_ids(graph);
-    for (dst, src) in target_vids.iter().zip(link.args.iter()) {
+    for (dst, src) in target_block.inputargs.iter().zip(link.args.iter()) {
         match src {
-            LinkArg::Value(var) => {
-                // After the Variable cutover, `as_value(graph) == None`
-                // means the link references a `Variable` the graph
-                // never registered — malformed link metadata.  Silently
-                // skipping convergence would let the dual-gate baseline
-                // pass with degraded types and hide the producer bug;
-                // mirror the `legacy_annotator::link_arg_type`
-                // expect-style contract instead.
-                let src_vid = src.as_value(graph).unwrap_or_else(|| {
-                    panic!(
-                        "converge_link: LinkArg::Value references Variable \
-                         {var:?} that is not registered on the graph — \
-                         malformed link.args"
-                    )
-                });
-                let src_ty = graph.concretetype(src_vid);
-                let dst_ty = graph.concretetype(*dst);
-                changed |= maybe_seed_concrete_type(graph, *dst, src_ty);
-                changed |= maybe_seed_concrete_type(graph, src_vid, dst_ty);
+            LinkArg::Value(src_var) => {
+                let src_ty = FunctionGraph::concretetype_of(src_var);
+                let dst_ty = FunctionGraph::concretetype_of(dst);
+                changed |= maybe_seed_concrete_type(dst, src_ty);
+                changed |= maybe_seed_concrete_type(src_var, dst_ty);
             }
             LinkArg::Const(_) => {
                 // Route through `link_arg_concrete_type` so the
@@ -481,8 +458,7 @@ fn converge_link(graph: &FunctionGraph, link: &Link) -> bool {
                 // honoured here too — bypassing it would let
                 // `const_value_to_concrete(&value.value)` default
                 // `None → GcRef` and shadow the Void write.
-                changed |=
-                    maybe_seed_concrete_type(graph, *dst, link_arg_concrete_type(graph, src));
+                changed |= maybe_seed_concrete_type(dst, link_arg_concrete_type(src));
             }
         }
     }
@@ -491,61 +467,34 @@ fn converge_link(graph: &FunctionGraph, link: &Link) -> bool {
 
 fn converge_raise_link(graph: &FunctionGraph, link: &Link) -> bool {
     let mut changed = false;
-    if let Some(value) = link.last_exception.as_ref().and_then(|a| a.as_value(graph)) {
-        changed |= maybe_seed_concrete_type(graph, value, ConcreteType::Signed);
+    if let Some(value) = link.last_exception.as_ref().and_then(|a| a.as_variable()) {
+        changed |= maybe_seed_concrete_type(value, ConcreteType::Signed);
     }
-    if let Some(value) = link.last_exc_value.as_ref().and_then(|a| a.as_value(graph)) {
-        changed |= maybe_seed_concrete_type(graph, value, ConcreteType::GcRef);
+    if let Some(value) = link.last_exc_value.as_ref().and_then(|a| a.as_variable()) {
+        changed |= maybe_seed_concrete_type(value, ConcreteType::GcRef);
     }
 
     let target_block = graph.block(link.target);
-    let target_vids = target_block.inputarg_value_ids(graph);
-    for (dst, src) in target_vids.iter().zip(link.args.iter()) {
+    for (dst, src) in target_block.inputargs.iter().zip(link.args.iter()) {
         let src_ty = if Some(src) == link.last_exception.as_ref() {
             ConcreteType::Signed
         } else if Some(src) == link.last_exc_value.as_ref() {
             ConcreteType::GcRef
         } else {
-            link_arg_concrete_type(graph, src)
+            link_arg_concrete_type(src)
         };
-        changed |= maybe_seed_concrete_type(graph, *dst, src_ty);
-        // For LinkArg::Value, propagate the dst kind back to the src
-        // Variable.  `as_value(graph) == None` after the Variable
-        // cutover means malformed link metadata (the LinkArg::Const
-        // arm exits early); fail loud rather than silently skip the
-        // back-propagation.
-        if let LinkArg::Value(var) = src {
-            let src_vid = src.as_value(graph).unwrap_or_else(|| {
-                panic!(
-                    "converge_raise_link: LinkArg::Value references Variable \
-                     {var:?} that is not registered on the graph — \
-                     malformed link.args"
-                )
-            });
-            let dst_ty = graph.concretetype(*dst);
-            changed |= maybe_seed_concrete_type(graph, src_vid, dst_ty);
+        changed |= maybe_seed_concrete_type(dst, src_ty);
+        if let LinkArg::Value(src_var) = src {
+            let dst_ty = FunctionGraph::concretetype_of(dst);
+            changed |= maybe_seed_concrete_type(src_var, dst_ty);
         }
     }
     changed
 }
 
-fn link_arg_concrete_type(graph: &FunctionGraph, src: &LinkArg) -> ConcreteType {
+fn link_arg_concrete_type(src: &LinkArg) -> ConcreteType {
     match src {
-        // After the Variable cutover an unregistered LinkArg::Value
-        // is malformed metadata — fail loud rather than degrading to
-        // `Unknown` which would let the dual-gate baseline pass with
-        // missing kinds and mask producer bugs.  Mirrors the
-        // `legacy_annotator::link_arg_type` contract.
-        LinkArg::Value(var) => {
-            let vid = src.as_value(graph).unwrap_or_else(|| {
-                panic!(
-                    "link_arg_concrete_type: LinkArg::Value references Variable \
-                     {var:?} that is not registered on the graph — \
-                     malformed link.args"
-                )
-            });
-            graph.concretetype(vid)
-        }
+        LinkArg::Value(var) => FunctionGraph::concretetype_of(var),
         // RPython `pairtype(Repr, NoneRepr).convert_from_to`
         // (`rpython/rtyper/rnone.py:48`) emits `inputconst(Void, None)`
         // when None flows into a `NoneRepr` target; the symmetric
@@ -566,14 +515,16 @@ fn link_arg_concrete_type(graph: &FunctionGraph, src: &LinkArg) -> ConcreteType 
     }
 }
 
-fn maybe_seed_concrete_type(graph: &FunctionGraph, dst: ValueId, src_ty: ConcreteType) -> bool {
-    if graph.concretetype(dst) == ConcreteType::Unknown && src_ty != ConcreteType::Unknown {
+fn maybe_seed_concrete_type(dst: &Variable, src_ty: ConcreteType) -> bool {
+    if FunctionGraph::concretetype_of(dst) == ConcreteType::Unknown
+        && src_ty != ConcreteType::Unknown
+    {
         // RPython parity: `rtyper.py:258 v.concretetype = ...` writes the
         // resolved kind inline on the Variable as soon as the resolver
         // knows it.  Pyre's iterative build mirrors that by publishing
-        // through `graph.set_concretetype_inline` so `graph.concretetype(v)`
+        // through the Variable cell so subsequent `concretetype_of(dst)`
         // sees the kind during the same pass.
-        graph.set_concretetype_inline(dst, src_ty);
+        FunctionGraph::set_concretetype_of_inline(dst, src_ty);
         true
     } else {
         false
@@ -702,8 +653,8 @@ mod tests {
         let v = graph.push_op(entry, OpKind::ConstInt(42), true).unwrap();
         graph.set_return(entry, Some(graph.must_variable(v)));
 
-        let annotations = annotate::annotate(&graph);
-        resolve_types(&graph, &annotations);
+        annotate::annotate(&graph);
+        resolve_types(&graph);
         assert_eq!(graph.concretetype(v), ConcreteType::Signed);
     }
 
@@ -727,8 +678,8 @@ mod tests {
             .unwrap();
         graph.set_return(entry, Some(graph.must_variable(v)));
 
-        let annotations = annotate::annotate(&graph);
-        resolve_types(&graph, &annotations);
+        annotate::annotate(&graph);
+        resolve_types(&graph);
         assert_eq!(graph.concretetype(v), ConcreteType::GcRef);
     }
 
@@ -743,8 +694,8 @@ mod tests {
         graph.set_goto(entry, target, vec![val_var]);
         graph.set_return(target, Some(graph.must_variable(phi)));
 
-        let annotations = annotate::annotate(&graph);
-        resolve_types(&graph, &annotations);
+        annotate::annotate(&graph);
+        resolve_types(&graph);
         assert_eq!(graph.concretetype(phi), ConcreteType::Signed);
     }
 
@@ -788,8 +739,8 @@ mod tests {
             .unwrap();
         graph.set_return(entry, Some(graph.must_variable(result)));
 
-        let annotations = annotate::annotate(&graph);
-        resolve_types(&graph, &annotations);
+        annotate::annotate(&graph);
+        resolve_types(&graph);
         assert_eq!(graph.concretetype(lhs), ConcreteType::Signed);
         assert_eq!(graph.concretetype(rhs), ConcreteType::Signed);
         assert_eq!(graph.concretetype(result), ConcreteType::Signed);
@@ -835,8 +786,8 @@ mod tests {
             .unwrap();
         graph.set_return(entry, Some(graph.must_variable(result)));
 
-        let annotations = annotate::annotate(&graph);
-        resolve_types(&graph, &annotations);
+        annotate::annotate(&graph);
+        resolve_types(&graph);
         assert_eq!(graph.concretetype(lhs), ConcreteType::Signed);
         assert_eq!(graph.concretetype(rhs), ConcreteType::Signed);
         assert_eq!(graph.concretetype(result), ConcreteType::Signed);
@@ -870,8 +821,8 @@ mod tests {
             .unwrap();
         graph.set_return(entry, Some(graph.must_variable(alias)));
 
-        let annotations = annotate::annotate(&graph);
-        resolve_types(&graph, &annotations);
+        annotate::annotate(&graph);
+        resolve_types(&graph);
         assert_eq!(graph.concretetype(value), ConcreteType::GcRef);
         assert_eq!(graph.concretetype(alias), ConcreteType::GcRef);
     }
@@ -895,8 +846,8 @@ mod tests {
             .unwrap();
         graph.set_return(entry, Some(graph.must_variable(alias)));
 
-        let annotations = annotate::annotate(&graph);
-        resolve_types(&graph, &annotations);
+        annotate::annotate(&graph);
+        resolve_types(&graph);
         assert_eq!(graph.concretetype(value), ConcreteType::Signed);
         assert_eq!(graph.concretetype(alias), ConcreteType::Signed);
     }
@@ -936,8 +887,8 @@ mod tests {
             .unwrap();
         graph.set_return(target, Some(graph.must_variable(result)));
 
-        let annotations = annotate::annotate(&graph);
-        resolve_types(&graph, &annotations);
+        annotate::annotate(&graph);
+        resolve_types(&graph);
         assert_eq!(graph.concretetype(phi), ConcreteType::Signed);
         assert_eq!(graph.concretetype(src), ConcreteType::Signed);
         assert_eq!(graph.concretetype(result), ConcreteType::Signed);
@@ -959,8 +910,8 @@ mod tests {
             .unwrap();
         graph.set_return(entry, Some(graph.must_variable(value)));
 
-        let annotations = annotate::annotate(&graph);
-        resolve_types(&graph, &annotations);
+        annotate::annotate(&graph);
+        resolve_types(&graph);
         assert_eq!(graph.concretetype(value), ConcreteType::GcRef);
     }
 
@@ -990,8 +941,8 @@ mod tests {
             ],
         );
 
-        let annotations = annotate::annotate(&graph);
-        resolve_types(&graph, &annotations);
+        annotate::annotate(&graph);
+        resolve_types(&graph);
         assert_eq!(graph.concretetype(last_exception), ConcreteType::Signed);
         assert_eq!(graph.concretetype(last_exc_value), ConcreteType::GcRef);
         assert_eq!(graph.concretetype(etype), ConcreteType::Signed);

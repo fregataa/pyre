@@ -69,8 +69,6 @@ use crate::annotator::description::{DescEntry, FunctionDesc, GraphCacheKey};
 use crate::flowspace::argument::Signature;
 use crate::flowspace::model::{ConstValue, Constant, GraphFunc, HostObject};
 use crate::flowspace::pygraph::PyGraph;
-use crate::model::ValueId;
-use crate::translator::rtyper::flowspace_adapter::ValueIdToVariable;
 use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
 
 /// Stable hashable key for a function path.
@@ -158,7 +156,8 @@ impl PyreFunctionEntry {
 }
 
 /// Per-program registry. Constructed once per `analyze_program` /
-/// `specialize_legacy_graph_with_registry_seed` driver invocation; shares
+/// `specialize_legacy_graph_with_registry_returning_value_to_var`
+/// driver invocation; shares
 /// its `Bookkeeper` with the `RPythonAnnotator` so pre-registered
 /// entries are visible to the rtyper's `getdesc` lookup.
 ///
@@ -184,7 +183,8 @@ pub struct PyreCallRegistry {
     aliases: RefCell<HashMap<FunctionPathKey, FunctionPathKey>>,
     /// Lazily-constructed `(RPythonAnnotator, RPythonTyper)` pair
     /// shared by every per-session
-    /// `specialize_legacy_graph_with_registry_seed` call against this
+    /// `specialize_legacy_graph_with_registry_returning_value_to_var`
+    /// call against this
     /// registry.  RPython parity: `Translator.buildannotator()` /
     /// `:buildrtyper()` (`translator.py:73-83`) construct exactly one
     /// of each per Translator, and `RPythonTyper.specialize` runs
@@ -279,9 +279,10 @@ impl PyreCallRegistry {
     }
 
     /// The bookkeeper backing this registry — exposed so
-    /// `specialize_legacy_graph_with_registry_seed` can pass the same
-    /// bookkeeper to `RPythonAnnotator::new`, ensuring pre-registered
-    /// entries are visible to the rtyper's `getdesc` lookup.
+    /// `specialize_legacy_graph_with_registry_returning_value_to_var`
+    /// can pass the same bookkeeper to `RPythonAnnotator::new`, ensuring
+    /// pre-registered entries are visible to the rtyper's `getdesc`
+    /// lookup.
     pub fn bookkeeper(&self) -> &Rc<Bookkeeper> {
         &self.bookkeeper
     }
