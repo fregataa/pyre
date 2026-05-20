@@ -29,17 +29,20 @@ use crate::model::{FunctionGraph, Link, LinkArg, OpKind, ValueId, ValueType};
 pub fn annotate(graph: &FunctionGraph) -> AnnotationState {
     let mut state = AnnotationState::new();
 
-    // Seed the terminal pseudo-block inputargs. RPython `flowspace/
-    // model.py:17-18` `returnblock = Block([return_var])` and
-    // `exceptblock = Block([etype, evalue])` carry implicit types that
-    // later Link propagation confirms but never introduces for Links
-    // that never reach the block.  Raising-only or void functions can
-    // leave these args untyped, which later drops them from
-    // `build_value_kinds` and trips the assembler's
-    // `lookup_reg_with_kind` panic.  `rpython/jit/codewriter/flatten.py:
-    // 169-172` assumes `etype: Int, evalue: Ref` and `return_var:
-    // <result_type>` unconditionally; pyre mirrors that by seeding the
-    // annotator state up front.
+    // RPython parity gap: `annrpython.py:RPythonAnnotator.complete()`
+    // never seeds exceptblock inputargs — they receive `SomeInstance`
+    // annotations only through `follow_raise_link` (`annrpython.py:
+    // 614-618 typeof([v_last_exc_value])`) when an actual raise reaches
+    // the block, and stay `None` for unreachable exceptblocks.  Pyre's
+    // legacy walker pre-seeds `etype: Int, evalue: Ref` because the
+    // dual-gate baseline must match the real rtyper's exceptblock
+    // resolution (`Signed` / `GcRef`) regardless of whether the graph
+    // actually raises — without the pre-seed, `dual_gate_check` diverges
+    // on every trivial identity function (`anchor_int_identity_dual_
+    // gate_agrees` etc.).  This pre-seed retires only when the real
+    // rtyper's exceptblock-handling path itself aligns with upstream
+    // (i.e. `None`-annotation → exclude from build_value_kinds, not
+    // backfill to `Signed`/`GcRef`).
     if let Some(exceptblock) = graph.blocks.get(graph.exceptblock.0) {
         let exceptblock_vids = exceptblock.inputarg_value_ids(graph);
         if let Some(&etype) = exceptblock_vids.first() {
@@ -49,30 +52,6 @@ pub fn annotate(graph: &FunctionGraph) -> AnnotationState {
             state.set(evalue, ValueType::Ref);
         }
     }
-    // `returnblock.inputargs[0]` must not be pre-seeded to `Ref`.
-    // Doing so collapses a real `Float`/`Int` return into
-    // `union_type(Ref, Float|Int) == Unknown`, which the legacy rtyper
-    // then backfills to `GcRef`.  Seed only the pyre-only synthetic
-    // `return None` placeholder values here; normal non-void returns
-    // are inferred from the incoming Link args.
-    if let Some(returnblock) = graph.blocks.get(graph.returnblock.0)
-        && let Some(&ret) = returnblock.inputarg_value_ids(graph).first()
-    {
-        for block in &graph.blocks {
-            for link in &block.exits {
-                if link.target != graph.returnblock {
-                    continue;
-                }
-                if let Some(src) = link.args.first().and_then(|a| a.as_value(graph))
-                    && is_synthetic_return_void_value(graph, src)
-                {
-                    state.set(src, ValueType::Void);
-                    state.set(ret, ValueType::Void);
-                }
-            }
-        }
-    }
-
     // Process all blocks (simple single-pass for acyclic; loops need fixpoint)
     let mut changed = true;
     let mut iterations = 0;
@@ -85,7 +64,7 @@ pub fn annotate(graph: &FunctionGraph) -> AnnotationState {
         for block in &graph.blocks {
             // Propagate annotations through ops in this block
             for op in &block.operations {
-                if let Some(result) = op.result.as_ref().and_then(|v| graph.value_id_of(v)) {
+                if let Some(result) = op.registered_result_value_id(graph) {
                     let inferred = infer_op_type(&op.kind, &state, graph);
                     let current = state.get(result);
                     let merged = union_type(&current, &inferred);
@@ -193,7 +172,24 @@ fn const_value_type(value: &ConstValue) -> ValueType {
         | ConstValue::LLAddress(_) => ValueType::Int,
         ConstValue::Float(_) => ValueType::Float,
         ConstValue::Placeholder => ValueType::Unknown,
-        ConstValue::Atom(_)
+        // RPython `Constant(None)` is annotated as `SomeNone`
+        // (`rpython/annotator/annrpython.py:273 immutablevalue(None)`
+        // → `SomeNone()` per `annotator/model.py:603`), distinct from
+        // `SomeInteger` / `SomeString`.  Pyre's `ValueType` lacks a
+        // dedicated `SomeNone` variant, so collapse to `Ref` — the
+        // closest match for the dominant downstream consumer where
+        // None flows into a `Ptr` target and the rtyper emits
+        // `inputconst(Ptr, None)` per `pairtype(NoneRepr, Repr).
+        // convert_from_to` (`rpython/rtyper/rnone.py:58`).  For the
+        // `Constant(None) → NoneRepr` target case (where the rtyper
+        // returns `inputconst(Void, None)` per `rnone.py:48`),
+        // construction sites such as `set_return` write the target
+        // repr onto `Constant.concretetype`; the rtyping-layer
+        // projection at `legacy_resolve::link_arg_concrete_type` then
+        // honours that hint to materialise `Void` without forcing
+        // every None through the annotation layer as `Void`.
+        ConstValue::None
+        | ConstValue::Atom(_)
         | ConstValue::Dict(_)
         | ConstValue::ByteStr(_)
         | ConstValue::UniStr(_)
@@ -201,31 +197,11 @@ fn const_value_type(value: &ConstValue) -> ValueType {
         | ConstValue::List(_)
         | ConstValue::Graphs(_)
         | ConstValue::LowLevelType(_)
-        | ConstValue::None
         | ConstValue::Code(_)
         | ConstValue::LLPtr(_)
         | ConstValue::Function(_)
         | ConstValue::HostObject(_) => ValueType::Ref,
     }
-}
-
-fn is_synthetic_return_void_value(graph: &FunctionGraph, value: ValueId) -> bool {
-    let Some(target) = graph.variable(value).cloned() else {
-        return true;
-    };
-    for block in &graph.blocks {
-        if block.inputargs.contains(&target) {
-            return false;
-        }
-        if block
-            .operations
-            .iter()
-            .any(|op| op.result.as_ref() == Some(&target))
-        {
-            return false;
-        }
-    }
-    true
 }
 
 /// Infer the output type of an operation from its inputs.
@@ -560,13 +536,35 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_void_return_stays_void() {
+    fn synthetic_void_return_carries_void_concretetype() {
+        // `set_return(_, None)` wires `LinkArg::Const(Constant(None,
+        // concretetype=Void))` per `flowcontext.py:687-689` +
+        // `:1232-1236`.  At the annotation layer, `Constant(None)`
+        // projects to `Ref` (pyre's nearest mapping for upstream's
+        // `SomeNone` — see `const_value_type`).  The rtyping-layer
+        // projection at [`super::legacy_resolve::link_arg_concrete_type`]
+        // then honours the construction-site `concretetype=Void` to
+        // materialise `Void` on the returnblock inputarg, matching
+        // `pairtype(Repr, NoneRepr).convert_from_to → inputconst(Void, None)`
+        // (`rpython/rtyper/rnone.py:48`).
+        use super::super::legacy_resolve;
         let mut graph = FunctionGraph::new("void_return");
         let entry = graph.startblock;
         graph.set_return(entry, None);
 
-        let state = annotate(&graph);
+        let annotations = annotate(&graph);
         let ret = graph.block(graph.returnblock).inputarg_value_ids(&graph)[0];
-        assert_eq!(state.get(ret), ValueType::Void);
+        assert_eq!(
+            annotations.get(ret),
+            ValueType::Ref,
+            "annotation-layer projection of Constant(None) follows SomeNone → Ref",
+        );
+
+        legacy_resolve::resolve_types(&graph, &annotations);
+        assert_eq!(
+            graph.concretetype(ret),
+            crate::jit_codewriter::type_state::ConcreteType::Void,
+            "rtyping-layer projection honours Constant.concretetype=Void from set_return",
+        );
     }
 }

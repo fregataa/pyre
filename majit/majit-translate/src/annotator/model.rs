@@ -2576,8 +2576,25 @@ impl Eq for AnnotatorError {}
 
 impl fmt::Display for AnnotatorError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Some(msg) = &self.msg {
-            write!(f, "\n\n{msg}")?;
+        // Line-by-line port of `AnnotatorError.__str__`
+        // (`rpython/annotator/model.py:719-725`):
+        //
+        //     def __str__(self):
+        //         s = "\n\n%s" % self.msg
+        //         if self.source is not None:
+        //             s += "\n\n"
+        //             s += self.source
+        //         return s
+        //
+        // Upstream's `%s` formats `None` literally as `"None"` when
+        // `self.msg is None` — pyre matches via `Option::Display`
+        // (None → "None") to keep producer-side telemetry symmetric.
+        // The `block` slot is pyre-only diagnostic state; rendering it
+        // here would deviate from upstream and is the reporting
+        // layer's concern, not the exception's.
+        match &self.msg {
+            Some(msg) => write!(f, "\n\n{msg}")?,
+            None => write!(f, "\n\nNone")?,
         }
         if let Some(source) = &self.source {
             write!(f, "\n\n{source}")?;

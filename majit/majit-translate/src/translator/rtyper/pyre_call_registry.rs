@@ -141,6 +141,20 @@ impl PyreFunctionEntry {
             .borrow_mut()
             .insert(GraphCacheKey::None, pygraph);
     }
+
+    /// Record a per-entry lift failure so consumers surfacing through
+    /// `cachedgraph` see the producer-side error instead of the
+    /// generic `buildflowgraph: missing code object` fallback.  Called
+    /// from `cutover::populate_call_registry_from_call_graphs`'s Pass
+    /// 2 when `lift_callee_to_pygraph` returns Err.
+    pub fn record_lift_error(&self, message: String) {
+        self.function_desc.borrow().record_pyre_lift_error(message);
+    }
+
+    /// Read the recorded per-entry lift error, if any.
+    pub fn lift_error_message(&self) -> Option<String> {
+        self.function_desc.borrow().pyre_lift_error_message()
+    }
 }
 
 /// Per-program registry. Constructed once per `analyze_program` /
