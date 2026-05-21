@@ -1703,6 +1703,66 @@ class AppTestSlots(AppTestCpythonExtensionBase):
         obj = module.new_obj()
         assert 'B12' in str(obj)
 
+    def test_multiple_inheritance_python_subclass_of_two_cpytypes(self):
+        # Regression test: Python code must be able to create a class that
+        # inherits from two cpytype bases that share the same solid base
+        # (i.e. have equivalent layouts), as pybind11 does with Base1/Base2.
+        # The previous fix (issue 5481) only covered the case where the new
+        # type itself was a cpytype (created via PyType_Ready); this covers
+        # the Python-level "class MI1(B1, B2):" case.
+        module = self.import_extension('foo', [
+           ("get_bases", "METH_NOARGS",
+            '''
+                /* Simulate two independent pybind11-style types: both have the
+                   same tp_basicsize (larger than PyObject but smaller than
+                   PyHeapTypeObject), both inherit from the same base. */
+                typedef struct { PyObject_HEAD; void *holder; } PybindInst;
+                Py_ssize_t inst_size = (Py_ssize_t)sizeof(PybindInst);
+
+                /* Shared object base (analogous to pybind11_object). */
+                PyTypeObject *ObjBase;
+                ObjBase = (PyTypeObject*)PyType_Type.tp_alloc(&PyType_Type, 0);
+                PyObject *nobj = PyUnicode_FromString("ObjBase");
+                ObjBase->tp_name = "ObjBase";
+                ObjBase->tp_basicsize = inst_size;
+                ((PyHeapTypeObject*)ObjBase)->ht_name = nobj;
+                ((PyHeapTypeObject*)ObjBase)->ht_qualname = nobj;
+                ObjBase->tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE | Py_TPFLAGS_HEAPTYPE;
+                if (PyType_Ready(ObjBase) < 0) return NULL;
+
+                PyTypeObject *B1, *B2;
+                B1 = (PyTypeObject*)PyType_Type.tp_alloc(&PyType_Type, 0);
+                B2 = (PyTypeObject*)PyType_Type.tp_alloc(&PyType_Type, 0);
+
+                PyObject *n1 = PyUnicode_FromString("B1");
+                PyObject *n2 = PyUnicode_FromString("B2");
+                B1->tp_name = "B1";
+                B2->tp_name = "B2";
+                B1->tp_basicsize = inst_size;
+                B2->tp_basicsize = inst_size;
+                ((PyHeapTypeObject*)B1)->ht_name = n1;
+                ((PyHeapTypeObject*)B2)->ht_name = n2;
+                ((PyHeapTypeObject*)B1)->ht_qualname = n1;
+                ((PyHeapTypeObject*)B2)->ht_qualname = n2;
+                B1->tp_base = ObjBase; Py_INCREF(ObjBase);
+                B2->tp_base = ObjBase; Py_INCREF(ObjBase);
+                B1->tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE | Py_TPFLAGS_HEAPTYPE;
+                B2->tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE | Py_TPFLAGS_HEAPTYPE;
+                if (PyType_Ready(B1) < 0) return NULL;
+                if (PyType_Ready(B2) < 0) return NULL;
+
+                return PyTuple_Pack(2, B1, B2);
+            '''
+            ),
+            ])
+        B1, B2 = module.get_bases()
+        # This must not raise "instance layout conflicts in multiple inheritance"
+        class MI1(B1, B2):
+            pass
+        obj = MI1()
+        assert isinstance(obj, B1)
+        assert isinstance(obj, B2)
+
     def test_multiple_inheritance_fetch_tp_bases(self):
         module = self.import_extension('foo', [
            ("foo", "METH_O",

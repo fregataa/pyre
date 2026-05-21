@@ -1375,7 +1375,9 @@ def check_and_find_best_base(space, bases_w, is_cpytype=False):
         if isinstance(w_base, W_TypeObject):
             layout = w_base.layout
             if not best_layout.issublayout(layout):
-                if is_cpytype and _layouts_equivalent(best_layout, layout):
+                if _layouts_equivalent(best_layout, layout) and (
+                        is_cpytype or
+                        (w_base.is_cpytype() and w_bestbase.is_cpytype())):
                     continue
                 raise oefmt(space.w_TypeError,
                             "instance layout conflicts in multiple inheritance")
