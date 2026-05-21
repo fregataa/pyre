@@ -138,22 +138,23 @@ pub fn _convert_const(_space: PyObjectRef, w_a: PyObjectRef) -> PyObjectRef {
 /// `code_ptr` must be a valid pointer to a `CodeObject` obtained
 /// via `Box::into_raw`.
 pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: bool) -> PyObjectRef {
-    // The `(code_ptr as usize) % align != 0` check is inlined into both
-    // branches rather than extracted into a `let valid_code = ...` shared
-    // binding: the let-binding form drops the `cast_ptr_to_int` emission
-    // for `(code_ptr as usize)` inside the codewriter, leaving an
-    // unwired `int_mod/ri>i` opname in the jitcode (Task #141).
-    let fast_natural_arity = if code_ptr.is_null()
-        || (code_ptr as usize) % std::mem::align_of::<crate::CodeObject>() != 0
-    {
+    // RPython pointer alignment idiom (`rpython/memory/gc/minimarkpage.py:159
+    // ll_assert((nsize & (WORD-1)) == 0, "malloc: size is not aligned")`):
+    // bitwise AND of `cast_ptr_to_int(p)` against `(power_of_two_align - 1)`
+    // gives the misalignment residual.  The pyre frontend's `Expr::Cast`
+    // emits `cast_ptr_to_int` for `(Ref, Int)` casts (`front/ast.rs:8503`),
+    // so casting through `i64` (not `usize`) routes the pointer through
+    // the proper LL conversion.  `align_of::<T>()` is always a power of
+    // two — `& (align - 1)` is equivalent to `% align` for power-of-two
+    // alignments and matches the RPython pattern bit-for-bit.
+    let align_mask = std::mem::align_of::<crate::CodeObject>() as i64 - 1;
+    let fast_natural_arity = if code_ptr.is_null() || (code_ptr as i64) & align_mask != 0 {
         crate::gateway::HOPELESS
     } else {
         compute_flatcall(unsafe { &*(code_ptr as *const crate::CodeObject) })
     };
     // `pycode.py:198 self._globals_caches = [None] * len(self.co_names_w)`.
-    let globals_caches = if code_ptr.is_null()
-        || (code_ptr as usize) % std::mem::align_of::<crate::CodeObject>() != 0
-    {
+    let globals_caches = if code_ptr.is_null() || (code_ptr as i64) & align_mask != 0 {
         std::ptr::null_mut()
     } else {
         let code_ref = unsafe { &*(code_ptr as *const crate::CodeObject) };

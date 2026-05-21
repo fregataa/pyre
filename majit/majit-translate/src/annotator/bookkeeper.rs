@@ -29,7 +29,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::{Rc, Weak};
 
-use super::argument::{ArgumentsForTranslation, complex_args, simple_args};
+use super::argument::{ArgumentsForTranslation, simple_args};
 use super::classdesc::{ClassDef, ClassDesc};
 use super::description::{
     CallFamily, ClassAttrFamily, ClassDefKey, DescEntry, DescKey, FrozenAttrFamily, FrozenDesc,
@@ -284,6 +284,22 @@ pub struct Bookkeeper {
     /// observable.
     pub needs_generic_instantiate:
         RefCell<std::collections::BTreeMap<ClassDefKey, Rc<RefCell<ClassDef>>>>,
+    /// PRE-EXISTING-ADAPTATION (no upstream).  Pyre struct parameters
+    /// (`Ref` / `State` `ValueType`s) lack a Python `HostObject` /
+    /// `ClassDesc` identity — they're Rust struct types known only by a
+    /// qualified type-root string (e.g. `crate::pyframe::PyFrame`).
+    /// The rtyper adapter still needs `SomeInstance(classdef=stub)` so
+    /// `s_getattr` has an `attrs` HashMap to walk, so the bookkeeper
+    /// caches a synthetic ClassDef per type-root name here — wrapping a
+    /// fresh `HostObject::new_class` + `ClassDesc::new_shell` pair.
+    pub pyre_stub_classdefs: RefCell<HashMap<String, Rc<RefCell<ClassDef>>>>,
+    /// PRE-EXISTING-ADAPTATION (no upstream).  Pyre-only struct-field
+    /// metadata snapshot (`struct_name -> [(field_name, type_string)]`)
+    /// used by [`Self::get_pyre_classdef_by_name`] to populate the
+    /// synthetic `ClassDef.attrs`.  `None` for unit-test fixtures that
+    /// build the bookkeeper directly, in which case
+    /// `get_pyre_classdef_by_name` leaves `attrs` empty.
+    pub pyre_struct_fields: RefCell<Option<Rc<crate::front::StructFieldRegistry>>>,
 }
 
 impl std::fmt::Debug for Bookkeeper {
@@ -455,7 +471,18 @@ impl Bookkeeper {
             pending_specializations: RefCell::new(Vec::new()),
             position_entered: std::cell::Cell::new(false),
             needs_generic_instantiate: RefCell::new(std::collections::BTreeMap::new()),
+            pyre_stub_classdefs: RefCell::new(HashMap::new()),
+            pyre_struct_fields: RefCell::new(None),
         }
+    }
+
+    /// PRE-EXISTING-ADAPTATION (no upstream).  Wire the pyre-only
+    /// `StructFieldRegistry` so [`Self::get_pyre_classdef_by_name`]
+    /// can populate the synthetic stub `ClassDef.attrs` from
+    /// struct-field metadata.  Idempotent: a second call overwrites
+    /// the previous registry.
+    pub fn set_pyre_struct_fields(&self, registry: Rc<crate::front::StructFieldRegistry>) {
+        *self.pyre_struct_fields.borrow_mut() = Some(registry);
     }
 
     /// Push a classdef into [`Self::needs_generic_instantiate`] unless
@@ -1229,6 +1256,258 @@ impl Bookkeeper {
     /// `bookkeeper.classdefs` read access.
     pub fn classdef_snapshot(&self) -> Vec<Rc<RefCell<ClassDef>>> {
         self.classdefs.borrow().clone()
+    }
+
+    /// PRE-EXISTING-ADAPTATION (no upstream).  Return a cached synthetic
+    /// ClassDef stub for a pyre type-root name (qualified Rust path
+    /// string such as `crate::pyframe::PyFrame`).  Used by the rtyper
+    /// adapter's `seed_variable` to project pyre `Ref` / `State`
+    /// parameters into `SomeInstance(classdef=stub)` so `s_getattr`'s
+    /// `attrs` walk has somewhere to land.
+    ///
+    /// The first call for a given name fabricates a fresh
+    /// `HostObject::new_class(name, vec![])` + `ClassDesc::new_shell`
+    /// pair and wraps them in `ClassDef::new` (skipping
+    /// `register_classdef` so the stub never leaks into
+    /// `bookkeeper.classdefs` — `normalizecalls` iterators stay
+    /// upstream-orthodox).  Subsequent calls hit the cache.
+    pub fn get_pyre_classdef_by_name(self: &Rc<Self>, name: &str) -> Rc<RefCell<ClassDef>> {
+        if let Some(cached) = self.pyre_stub_classdefs.borrow().get(name) {
+            return cached.clone();
+        }
+        // Phase 1 — iterative discovery.  Walk the registry's field-
+        // graph rooted at `name`, fabricating an empty stub ClassDef
+        // for every reachable struct name BEFORE any attribute is
+        // projected.  Using an explicit work-list keeps the recursion
+        // bound at type-string nesting depth (Vec<Vec<…>>, ≤5 typical)
+        // instead of the registry's struct-chain depth (200+ would
+        // otherwise overflow the build worker's stack).
+        let mut to_fabricate: Vec<String> = vec![name.to_string()];
+        while let Some(n) = to_fabricate.pop() {
+            if self.pyre_stub_classdefs.borrow().contains_key(&n) {
+                continue;
+            }
+            let pyobj = crate::flowspace::model::HostObject::new_class(n.clone(), Vec::new());
+            let desc = Rc::new(RefCell::new(super::classdesc::ClassDesc::new_shell(
+                self,
+                pyobj,
+                n.clone(),
+            )));
+            let classdef = super::classdesc::ClassDef::new(self, &desc);
+            self.pyre_stub_classdefs
+                .borrow_mut()
+                .insert(n.clone(), classdef);
+            let referenced: Vec<String> = {
+                let guard = self.pyre_struct_fields.borrow();
+                if let Some(reg) = guard.as_ref() {
+                    if let Some(fields) = reg.fields.get(&n) {
+                        let mut out: Vec<String> = Vec::new();
+                        for (field_name, field_ty) in fields {
+                            if field_name == "__class__" {
+                                continue;
+                            }
+                            collect_referenced_struct_names(field_ty, reg, &mut out);
+                        }
+                        out
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    Vec::new()
+                }
+            };
+            for r in referenced {
+                if !self.pyre_stub_classdefs.borrow().contains_key(&r) {
+                    to_fabricate.push(r);
+                }
+            }
+        }
+        // Phase 2 — projection.  Project struct-field metadata into
+        // the requested root stub's `classdef.attrs`.  Inner stubs
+        // reached transitively through field references stay
+        // attrs-empty until they too are requested as a root — at
+        // that point the cache hit at the top of this function
+        // short-circuits, so inner-stub attrs remain empty for the
+        // bookkeeper's lifetime.  Tasks #58 / #63 track the gap vs
+        // `add_source_for_attribute` (classdesc.py:189-216).
+        let fields_to_project: Option<Vec<(String, String)>> = {
+            let guard = self.pyre_struct_fields.borrow();
+            guard.as_ref().and_then(|r| r.fields.get(name).cloned())
+        };
+        if let Some(fields) = fields_to_project {
+            let classdef = self
+                .pyre_stub_classdefs
+                .borrow()
+                .get(name)
+                .cloned()
+                .expect("phase-1 fabrication invariant: root name is always cached");
+            for (field_name, field_ty) in &fields {
+                if field_name == "__class__" {
+                    continue;
+                }
+                let s_value = self.project_pyre_field_type(field_ty);
+                let mut classdef_mut = classdef.borrow_mut();
+                let attr = classdef_mut
+                    .attrs
+                    .entry(field_name.clone())
+                    .or_insert_with(|| super::classdesc::Attribute::new(field_name.clone()));
+                if matches!(attr.s_value, SomeValue::Impossible) {
+                    attr.s_value = s_value;
+                }
+            }
+        }
+        self.pyre_stub_classdefs
+            .borrow()
+            .get(name)
+            .cloned()
+            .expect("phase-1 fabrication invariant: root name is always cached after the loop")
+    }
+
+    /// PRE-EXISTING-ADAPTATION (no upstream).  Project a Rust type
+    /// string (`"Vec<i32>"`, `"Option<PyFrame>"`, `"HashMap<String,
+    /// Box<W_Obj>>"`, …) into a `SomeValue` matching what RPython
+    /// `s_getattr` would observe for a class attribute seeded with a
+    /// value of that type.  Used by [`Self::get_pyre_classdef_by_name`]
+    /// to populate the synthetic stub's `attrs`.  Bare named types
+    /// (`PyFrame`, `W_DictObject`) resolve to
+    /// `SomeInstance(stub)` only when the registry contains a matching
+    /// entry; unknown bare names fall to `Impossible`.
+    pub fn project_pyre_field_type(self: &Rc<Self>, field_ty: &str) -> SomeValue {
+        let t = field_ty.trim();
+        let stripped = t
+            .trim_start_matches('&')
+            .trim_start_matches("mut ")
+            .trim_start_matches("*const ")
+            .trim_start_matches("*mut ")
+            .trim();
+        match stripped {
+            "i8" | "i16" | "i32" | "i64" | "isize" | "u8" | "u16" | "u32" | "u64" | "usize" => {
+                return super::model::s_int();
+            }
+            "f32" => return SomeValue::SingleFloat(super::model::SomeSingleFloat::new()),
+            "f64" => return SomeValue::Float(super::model::SomeFloat::new()),
+            "bool" => return super::model::s_bool(),
+            "String" | "str" => return super::model::s_str0(),
+            "char" => return SomeValue::Char(super::model::SomeChar::new(false)),
+            "()" => return super::model::s_none(),
+            _ => {}
+        }
+        for list_wrapper in ["Vec<", "VecDeque<"] {
+            if let Some(inner) = strip_generic_one(stripped, list_wrapper) {
+                let s_inner = self.project_pyre_field_type(inner);
+                let listdef =
+                    super::listdef::ListDef::new(Some(self.clone()), s_inner, false, false);
+                return SomeValue::List(super::model::SomeList::new(listdef));
+            }
+        }
+        if let Some(rest) = stripped.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            let inner = match rest.find(';') {
+                Some(semi) => rest[..semi].trim(),
+                None => rest.trim(),
+            };
+            let s_inner = self.project_pyre_field_type(inner);
+            let listdef = super::listdef::ListDef::new(Some(self.clone()), s_inner, false, false);
+            return SomeValue::List(super::model::SomeList::new(listdef));
+        }
+        if let Some(inner) = strip_generic_one(stripped, "Option<") {
+            let s_inner = self.project_pyre_field_type(inner);
+            let s_none = super::model::s_none();
+            return super::model::unionof([&s_inner, &s_none]).unwrap_or(SomeValue::Impossible);
+        }
+        if let Some(inner) = strip_generic_one(stripped, "Result<") {
+            let parts = split_generic_args(inner);
+            if parts.len() == 2 {
+                let s_ok = self.project_pyre_field_type(parts[0]);
+                let s_err = self.project_pyre_field_type(parts[1]);
+                return super::model::unionof([&s_ok, &s_err]).unwrap_or(SomeValue::Impossible);
+            }
+        }
+        for dict_wrapper in ["HashMap<", "BTreeMap<", "IndexMap<"] {
+            if let Some(inner) = strip_generic_one(stripped, dict_wrapper) {
+                let parts = split_generic_args(inner);
+                if parts.len() == 2 {
+                    let s_key = self.project_pyre_field_type(parts[0]);
+                    let s_val = self.project_pyre_field_type(parts[1]);
+                    let dictdef = super::dictdef::DictDef::new(
+                        Some(self.clone()),
+                        s_key,
+                        s_val,
+                        false,
+                        false,
+                        false,
+                    );
+                    return SomeValue::Dict(super::model::SomeDict::new(dictdef));
+                }
+            }
+        }
+        for set_wrapper in ["HashSet<", "BTreeSet<", "IndexSet<"] {
+            if let Some(inner) = strip_generic_one(stripped, set_wrapper) {
+                let s_key = self.project_pyre_field_type(inner);
+                let s_val = super::model::s_none();
+                let dictdef = super::dictdef::DictDef::new(
+                    Some(self.clone()),
+                    s_key,
+                    s_val,
+                    false,
+                    false,
+                    false,
+                );
+                return SomeValue::Dict(super::model::SomeDict::new(dictdef));
+            }
+        }
+        if let Some(inner) = stripped.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
+            let parts = split_generic_args(inner);
+            if !parts.is_empty() {
+                let items: Vec<SomeValue> = parts
+                    .iter()
+                    .map(|p| self.project_pyre_field_type(p))
+                    .collect();
+                return SomeValue::Tuple(super::model::SomeTuple::new(items));
+            }
+        }
+        for wrapper in [
+            "Rc<",
+            "Arc<",
+            "Box<",
+            "RefCell<",
+            "Cell<",
+            "Pin<",
+            "NonNull<",
+            "NonZero<",
+            "MaybeUninit<",
+            "ManuallyDrop<",
+            "UnsafeCell<",
+            "Wrapping<",
+            "Reverse<",
+        ] {
+            if let Some(inner) = strip_generic_one(stripped, wrapper) {
+                return self.project_pyre_field_type(inner);
+            }
+        }
+        if let Some(inner) = strip_generic_one(stripped, "Cow<") {
+            let parts = split_generic_args(inner);
+            if parts.len() == 2 {
+                return self.project_pyre_field_type(parts[1]);
+            }
+        }
+        let registered = {
+            let guard = self.pyre_struct_fields.borrow();
+            guard
+                .as_ref()
+                .map(|r| r.fields.contains_key(stripped))
+                .unwrap_or(false)
+        };
+        if !registered {
+            return SomeValue::Impossible;
+        }
+        if let Some(cached) = self.pyre_stub_classdefs.borrow().get(stripped) {
+            return SomeValue::Instance(super::model::SomeInstance::new(
+                Some(cached.clone()),
+                false,
+                std::collections::BTreeMap::new(),
+            ));
+        }
+        SomeValue::Impossible
     }
 
     /// RPython `Bookkeeper.getuniqueclassdef(cls)` (bookkeeper.py:282-287):
@@ -2066,6 +2345,118 @@ impl Default for Bookkeeper {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Walk `field_ty`'s type-string structure and collect every bare-named
+/// type that the `StructFieldRegistry` recognises.  Used by
+/// [`Bookkeeper::get_pyre_classdef_by_name`]'s phase-1 discovery pass
+/// to pre-fabricate stub ClassDefs for every reachable struct before
+/// any attribute is projected.  Recursion bound is type-string nesting
+/// (Vec<Vec<…>>) which is shallow, NOT the registry's field-graph
+/// depth.
+fn collect_referenced_struct_names(
+    field_ty: &str,
+    reg: &crate::front::StructFieldRegistry,
+    out: &mut Vec<String>,
+) {
+    let stripped = field_ty
+        .trim()
+        .trim_start_matches('&')
+        .trim_start_matches("mut ")
+        .trim_start_matches("*const ")
+        .trim_start_matches("*mut ")
+        .trim();
+    match stripped {
+        "i8" | "i16" | "i32" | "i64" | "isize" | "u8" | "u16" | "u32" | "u64" | "usize" | "f32"
+        | "f64" | "bool" | "String" | "str" | "char" | "()" => return,
+        _ => {}
+    }
+    for wrapper in [
+        "Vec<",
+        "VecDeque<",
+        "Option<",
+        "Rc<",
+        "Arc<",
+        "Box<",
+        "RefCell<",
+        "Cell<",
+        "Pin<",
+        "NonNull<",
+        "NonZero<",
+        "MaybeUninit<",
+        "ManuallyDrop<",
+        "UnsafeCell<",
+        "Wrapping<",
+        "Reverse<",
+        "HashSet<",
+        "BTreeSet<",
+        "IndexSet<",
+    ] {
+        if let Some(inner) = strip_generic_one(stripped, wrapper) {
+            collect_referenced_struct_names(inner, reg, out);
+            return;
+        }
+    }
+    for wrapper in ["HashMap<", "BTreeMap<", "IndexMap<", "Result<", "Cow<"] {
+        if let Some(inner) = strip_generic_one(stripped, wrapper) {
+            for part in split_generic_args(inner) {
+                collect_referenced_struct_names(part, reg, out);
+            }
+            return;
+        }
+    }
+    if let Some(rest) = stripped.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
+        for part in split_generic_args(rest) {
+            collect_referenced_struct_names(part, reg, out);
+        }
+        return;
+    }
+    if let Some(rest) = stripped.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+        let inner = match rest.find(';') {
+            Some(semi) => rest[..semi].trim(),
+            None => rest.trim(),
+        };
+        collect_referenced_struct_names(inner, reg, out);
+        return;
+    }
+    if reg.fields.contains_key(stripped) {
+        out.push(stripped.to_string());
+    }
+}
+
+/// Strip `Wrapper<` prefix and matching `>` suffix from a type string,
+/// returning the inner generic-args slice unchanged.  Returns `None` if
+/// the prefix is absent OR the suffix is not `>`.
+fn strip_generic_one<'a>(input: &'a str, prefix: &str) -> Option<&'a str> {
+    input.strip_prefix(prefix).and_then(|s| s.strip_suffix('>'))
+}
+
+/// Split a generic-args slice on top-level `,` boundaries, respecting
+/// nested `<>` / `()` / `[]` depth.
+fn split_generic_args(input: &str) -> Vec<&str> {
+    let mut out: Vec<&str> = Vec::new();
+    let mut depth: i32 = 0;
+    let mut start: usize = 0;
+    let bytes = input.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'<' | b'(' | b'[' => depth += 1,
+            b'>' | b')' | b']' => depth -= 1,
+            b',' if depth == 0 => {
+                let segment = input[start..i].trim();
+                if !segment.is_empty() {
+                    out.push(segment);
+                }
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    let tail = input[start..].trim();
+    if !tail.is_empty() {
+        out.push(tail);
+    }
+    out
 }
 
 /// RPython `hasattr(x, '_freeze_'); assert x._freeze_() is True`

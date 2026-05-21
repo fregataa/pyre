@@ -341,6 +341,31 @@ pub fn analyze_multiple_pipeline_with_fnaddr_bindings(
     )
 }
 
+/// Register a free-function graph under one alias path.  Panics if the
+/// same alias is already mapped to a different `func.name` — this is
+/// the parity guard against silent cross-crate name-tail collisions.
+/// Same-name re-registration (e.g. a function reachable through more
+/// than one well-known crate alias) is treated as idempotent.
+fn register_function_graph_alias(
+    graphs: &mut std::collections::HashMap<crate::parse::CallPath, crate::model::FunctionGraph>,
+    sources: &mut std::collections::HashMap<crate::parse::CallPath, String>,
+    path: crate::parse::CallPath,
+    source_name: &str,
+    graph: &crate::model::FunctionGraph,
+) {
+    if let Some(prev) = sources.get(&path) {
+        assert!(
+            prev == source_name,
+            "function-graph alias collision at {}: previously registered by {prev:?}, now {source_name:?}; \
+             cross-crate name-tail aliasing must not silently route to a different graph",
+            path.canonical_key(),
+        );
+        return;
+    }
+    sources.insert(path.clone(), source_name.to_string());
+    graphs.insert(path, graph.clone());
+}
+
 fn analyze_pipeline_from_parsed(
     parsed_files: &[parse::ParsedInterpreter],
     config: &AnalyzeConfig,
@@ -381,6 +406,24 @@ fn analyze_pipeline_from_parsed(
     let mut canonical_trait_impls = Vec::new();
     let mut canonical_inherent_methods = Vec::new();
     let mut canonical_function_graphs = std::collections::HashMap::new();
+    // `bookkeeper.py:353-409 getdesc` / `newfuncdesc` keys on the host
+    // function-object identity, so two unrelated `crate_a::helper` and
+    // `crate_b::helper` resolve to distinct `FunctionDesc` instances.
+    // Pyre's call registry is keyed on `CallPath` segment strings, and
+    // the alias expansion below intentionally registers each free
+    // function under every well-known pyre-crate prefix
+    // (`pyre_interpreter` / `pyre_object` / `pyre_jit`).  Without a
+    // collision check the second registration silently overwrites the
+    // first when two source crates happen to define a function with
+    // the same tail segments, so the call resolver may then route to
+    // the wrong graph.  `canonical_function_alias_source` records the
+    // canonical `func.name` that won each alias slot so a later
+    // mismatched registration panics with a diagnostic instead of
+    // silently aliasing across crates.
+    let mut canonical_function_alias_source: std::collections::HashMap<
+        crate::parse::CallPath,
+        String,
+    > = std::collections::HashMap::new();
 
     for parsed in parsed_files {
         canonical_trait_impls.extend(
@@ -419,12 +462,44 @@ fn analyze_pipeline_from_parsed(
             // func.name may be "a::helper" for module-internal functions.
             let segments: Vec<&str> = func.name.split("::").collect();
             let path = parse::CallPath::from_segments(segments.iter().copied());
-            canonical_function_graphs.insert(path, graph.clone());
+            register_function_graph_alias(
+                &mut canonical_function_graphs,
+                &mut canonical_function_alias_source,
+                path,
+                &func.name,
+                &graph,
+            );
             // Also register under ["crate", ...segments].
             let mut crate_segs = vec!["crate"];
             crate_segs.extend(segments.iter().copied());
             let crate_path = parse::CallPath::from_segments(crate_segs);
-            canonical_function_graphs.insert(crate_path, graph);
+            register_function_graph_alias(
+                &mut canonical_function_graphs,
+                &mut canonical_function_alias_source,
+                crate_path,
+                &func.name,
+                &graph,
+            );
+            // Cross-crate callsites prefix the call path with the
+            // crate name (`pyre_interpreter::pyframe_get_pycode`).
+            // `canonical_call_target` does not rewrite that prefix,
+            // so the same graph needs to be reachable under every
+            // well-known pyre crate-name alias.  Each pyre crate's
+            // source set is included in `PYRE_JIT_GRAPH_SOURCES` so
+            // the alias resolves to exactly the same FunctionGraph
+            // regardless of which crate the callee lived in.
+            for crate_alias in &["pyre_interpreter", "pyre_object", "pyre_jit"] {
+                let mut alias_segs = vec![*crate_alias];
+                alias_segs.extend(segments.iter().copied());
+                let alias_path = parse::CallPath::from_segments(alias_segs);
+                register_function_graph_alias(
+                    &mut canonical_function_graphs,
+                    &mut canonical_function_alias_source,
+                    alias_path,
+                    &func.name,
+                    &graph,
+                );
+            }
         }
     }
 
@@ -498,6 +573,16 @@ fn analyze_pipeline_from_parsed(
     // (`elidable`, `loop_invariant`, `unroll_safe`, `jit_look_inside`)
     // so `JitPolicy::look_inside_graph` sees the same metadata RPython
     // reads off `func._jit_*_` / `_elidable_function_`.
+    //
+    // RPython parity: hints live on `graph.func` and survive alias
+    // routing because the call path resolves to a single function
+    // object identity (`policy.py:48` / `call.py:126`).  Pyre keys
+    // hints on `CallPath` segments, so cross-crate callsites under
+    // `pyre_interpreter::` / `pyre_object::` / `pyre_jit::` prefixes
+    // (registered alongside bare + `crate::` in
+    // `register_function_graph_alias`) must see the same hints —
+    // missing them silently disables `_jit_look_inside_` etc. for
+    // alias callers.
     for func in &program.functions {
         if !func.self_ty_root.is_none() || func.hints.is_empty() {
             continue;
@@ -512,7 +597,21 @@ fn analyze_pipeline_from_parsed(
         let mut crate_segs = vec!["crate"];
         crate_segs.extend(segments.iter().copied());
         let crate_path = parse::CallPath::from_segments(crate_segs);
-        call_control.register_function_graph_with_hints(crate_path, graph, func.hints.clone());
+        call_control.register_function_graph_with_hints(
+            crate_path,
+            graph.clone(),
+            func.hints.clone(),
+        );
+        for crate_alias in &["pyre_interpreter", "pyre_object", "pyre_jit"] {
+            let mut alias_segs = vec![*crate_alias];
+            alias_segs.extend(segments.iter().copied());
+            let alias_path = parse::CallPath::from_segments(alias_segs);
+            call_control.register_function_graph_with_hints(
+                alias_path,
+                graph.clone(),
+                func.hints.clone(),
+            );
+        }
     }
     // RPython: op.result.concretetype — register return types per function.
     // Each function's return type is registered under its exact canonical path(s).
@@ -530,6 +629,16 @@ fn analyze_pipeline_from_parsed(
                 call_control.return_types.insert(path, ret_type.clone());
             } else {
                 // free function: register under qualified segments.
+                //
+                // RPython parity: return type lives on graph identity and
+                // surfaces uniformly to every callsite (`call.py:223-230`).
+                // Pyre keys `return_types` on `CallPath`; cross-crate
+                // callers reach the graph through `pyre_interpreter::` /
+                // `pyre_object::` / `pyre_jit::` aliases registered by
+                // `register_function_graph_alias`, so the same prefix set
+                // must carry the return type — without it,
+                // `signature validate` falls back to Ref and the direct-
+                // call type tail goes silent.
                 let segments: Vec<&str> = func.name.split("::").collect();
                 let path = crate::parse::CallPath::from_segments(segments.iter().copied());
                 call_control.return_types.insert(path, ret_type.clone());
@@ -539,6 +648,14 @@ fn analyze_pipeline_from_parsed(
                 call_control
                     .return_types
                     .insert(crate_path, ret_type.clone());
+                for crate_alias in &["pyre_interpreter", "pyre_object", "pyre_jit"] {
+                    let mut alias_segs = vec![*crate_alias];
+                    alias_segs.extend(segments.iter().copied());
+                    let alias_path = crate::parse::CallPath::from_segments(alias_segs);
+                    call_control
+                        .return_types
+                        .insert(alias_path, ret_type.clone());
+                }
             }
         }
     }
@@ -978,7 +1095,7 @@ fn build_canonical_opcode_dispatch(
     //
     // `arm.flattened` is set after `drain_pending_graphs` from the
     // assembled jitcode's `body._ssarepr`; the previous eager
-    // dual_gate→lower_indirect_calls→jtransform→resolve_rewritten_types→
+    // dual_gate→lower_indirect_calls→jtransform→merge_synth_kinds→
     // regalloc→flatten chain at this site duplicated the work that
     // `transform_graph_to_jitcode` does inside the drain loop, so we
     // register the arm bodies here and let the canonical pipeline

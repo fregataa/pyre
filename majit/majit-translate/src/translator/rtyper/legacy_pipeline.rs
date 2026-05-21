@@ -1,25 +1,33 @@
-//! Legacy end-to-end analysis pipeline — transitional production driver.
+//! Legacy end-to-end analysis pipeline — test-anchor scaffolding.
 //!
 //! TODO(retire-legacy-pipeline): majit-local driver that sequences the
 //! ad-hoc `legacy_annotator::annotate → legacy_resolve::resolve_types →
-//! flatten_with_types` chain.  No upstream `rpython/` counterpart —
+//! flatten_graph` chain.  No upstream `rpython/` counterpart —
 //! orthodox `translator/driver.py` (TranslationDriver +
 //! SimpleTaskEngine) drives a different shape (per-function build_types
 //! after BFS-from-entry, no separate flatten driver), so this file is
 //! not a port target.
 //!
-//! The legacy chain remains the production analysis driver for
-//! `lib.rs::analyze_pipeline_from_parsed` — the BFS-from-portal
-//! candidate set drives the per-function annotate → rtype → jtransform
-//! → flatten chain that feeds `build_canonical_opcode_dispatch`.
-//! Retirement requires migrating the production caller to the
-//! real-rtyper path ([`crate::translator::rtyper::cutover`]) end-to-end.
+//! As of Z2.5 Slice 7af this entire module is `#[cfg(test)]`-gated
+//! (mod.rs:21).  Production analysis goes through
+//! `lib::analyze_pipeline_from_parsed` →
+//! `build_canonical_opcode_dispatch` → the real-rtyper path
+//! ([`crate::translator::rtyper::cutover`]) end-to-end.  The Skip arm
+//! of `cutover::dual_gate_check_with_registry` still calls
+//! `legacy_annotator::annotate` + `legacy_resolve::resolve_types_into_graph`
+//! directly when the real path classifies a graph as unported, but
+//! that path does not route through this module.
+//!
+//! This file persists as a parallel pipeline driver so dual-gate
+//! fixture tests (`legacy_pipeline::tests`,
+//! `lib::test_pyopcode_pipeline`) can rebuild the pre-cutover
+//! per-function annotate → rtype → jtransform → flatten chain on
+//! hand-built `SemanticProgram` fixtures without going through the
+//! real-rtyper session machinery.  Retirement closes alongside the
+//! Skip-arm legacy fallback (Task #127).
 //!
 //! RPython-orthodox chain (when fully ported):
 //!   flowspace → annotator → rtyper → jtransform → flatten
-//!
-//! This module provides a single entry point that runs all passes
-//! in sequence on a SemanticProgram.
 
 use crate::call::CallControl;
 use crate::flatten;
@@ -32,7 +40,7 @@ use crate::translator::rtyper::legacy_resolve::resolve_types;
 ///
 /// RPython equivalent: translate a single function through
 /// flowspace → annotator → rtyper → jtransform → flatten.
-pub fn analyze_function(func: &SemanticFunction, config: &PipelineConfig) -> PipelineResult {
+pub(crate) fn analyze_function(func: &SemanticFunction, config: &PipelineConfig) -> PipelineResult {
     let graph = &func.graph;
     let original_blocks = graph.blocks.len();
 
@@ -131,7 +139,7 @@ pub fn analyze_function(func: &SemanticFunction, config: &PipelineConfig) -> Pip
 }
 
 /// Run the full pipeline on all functions in a program.
-pub fn analyze_program(
+pub(crate) fn analyze_program(
     program: &crate::front::SemanticProgram,
     config: &PipelineConfig,
 ) -> ProgramPipelineResult {
@@ -152,7 +160,7 @@ pub fn analyze_program(
 /// actually need.  The filter closure lets the canonical caller pass a
 /// `CallControl::is_candidate`-driven test so legacy_pipeline iterates
 /// the same BFS-reachable set the canonical jitcode emitter consumes.
-pub fn analyze_program_filtered<F>(
+pub(crate) fn analyze_program_filtered<F>(
     functions: &[crate::front::SemanticFunction],
     config: &PipelineConfig,
     keep: F,

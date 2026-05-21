@@ -604,13 +604,13 @@ mod tests {
 
     #[test]
     fn no_more_blocks_to_annotate_drains_pending_specializations() {
-        use std::rc::Rc;
+        use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let ann = super::super::annrpython::RPythonAnnotator::new(None, None, None, false);
-        let counter = Rc::new(AtomicUsize::new(0));
+        let counter = Arc::new(AtomicUsize::new(0));
         {
-            let c = Rc::clone(&counter);
+            let c = Arc::clone(&counter);
             ann.bookkeeper
                 .pending_specializations
                 .borrow_mut()
@@ -619,7 +619,7 @@ mod tests {
                 }));
         }
         {
-            let c = Rc::clone(&counter);
+            let c = Arc::clone(&counter);
             ann.bookkeeper
                 .pending_specializations
                 .borrow_mut()

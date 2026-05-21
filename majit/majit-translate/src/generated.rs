@@ -23,10 +23,14 @@
 //!
 //! ## What this module provides
 //!
-//! `all_jitcodes()` → `&'static AllJitCodes`, the process-wide registry
-//! keyed by `CallPath`. First call performs the full pipeline via
-//! `analyze_multiple_pipeline`. Subsequent calls are O(1) reads of a
-//! `OnceLock`.
+//! `with_all_jitcodes(|reg| …)` → closure access to the per-thread
+//! pyre-interpreter JitCode registry keyed by `CallPath`. First call on
+//! a thread performs the full pipeline via `analyze_multiple_pipeline`;
+//! subsequent calls are O(1) reads of a `thread_local!` `OnceCell`.
+//! The closure form (rather than `&'static`) avoids forcing
+//! `AllJitCodes: Sync`, which would in turn force the interior cells of
+//! `Variable` to become thread-safe wrappers — a deviation from
+//! RPython's single-thread annotator invariant.
 //!
 //! `AllJitCodes` itself lives on the parity layer at
 //! `crate::codewriter::AllJitCodes` and is re-exported here as a
@@ -61,7 +65,7 @@
 //! to thread `&fnaddr_bindings` — doing so would either (1) introduce a
 //! `majit-translate` ⇒ `pyre-interpreter` dependency that breaks the
 //! `majit/* ⊥ pyre/*` invariant, or (2) require parameterising the
-//! `OnceLock` (forfeiting memoisation). Both are wrong shapes for what
+//! `OnceCell` (forfeiting memoisation). Both are wrong shapes for what
 //! is, in practice, a test fixture.**
 //!
 //! ## Why this wraps the full pipeline
@@ -102,7 +106,7 @@
 //! additionally emits `cargo:rerun-if-changed=...` on the same paths so
 //! cargo rebuilds this crate when either source file changes.
 
-use std::sync::OnceLock;
+use std::cell::OnceCell;
 
 pub use crate::codewriter::AllJitCodes;
 
@@ -173,16 +177,33 @@ const PYRE_JIT_GRAPH_SOURCES: &[(&str, &str)] = &[
     (include_str!("../../../pyre/pyre-jit/src/eval.rs"), "eval"),
 ];
 
-static ALL_JITCODES: OnceLock<AllJitCodes> = OnceLock::new();
+thread_local! {
+    /// Per-thread cache for the pyre-interpreter JitCode registry.
+    ///
+    /// The registry is `thread_local!` rather than a process-wide
+    /// `static OnceLock<…>` because `AllJitCodes` transitively holds
+    /// `Variable` graphs whose interior `RefCell` / `Cell` cells are
+    /// !Sync — matching RPython's single-thread annotator invariant.
+    /// All callers below this layer are single-thread test fixtures.
+    static ALL_JITCODES: OnceCell<AllJitCodes> = const { OnceCell::new() };
+}
 
-/// Access the process-wide pyre-interpreter JitCode registry.
+/// Access the per-thread pyre-interpreter JitCode registry through a
+/// closure.
 ///
-/// First call performs the full pipeline (see [`build`]). Subsequent calls
-/// are O(1). A panic inside `build` poisons the `OnceLock` and every
-/// subsequent caller will panic too — by design, since a malformed
-/// handler graph is a hard parity violation that should surface loudly.
-pub fn all_jitcodes() -> &'static AllJitCodes {
-    ALL_JITCODES.get_or_init(build)
+/// First call on a given thread performs the full pipeline (see
+/// [`build`]). Subsequent calls are O(1). A panic inside `build`
+/// poisons the cell on that thread and every subsequent caller on the
+/// same thread will panic too — by design, since a malformed handler
+/// graph is a hard parity violation that should surface loudly.
+///
+/// The closure form (rather than `-> &'static AllJitCodes`) avoids the
+/// `T: Sync` requirement that a process-wide static would impose;
+/// `AllJitCodes` carries `Variable` graphs whose interior-mutability
+/// cells are intentionally !Sync to match RPython's single-thread
+/// annotator invariant.
+pub fn with_all_jitcodes<R>(f: impl FnOnce(&AllJitCodes) -> R) -> R {
+    ALL_JITCODES.with(|cell| f(cell.get_or_init(build)))
 }
 
 fn build() -> AllJitCodes {
@@ -216,10 +237,10 @@ fn build() -> AllJitCodes {
     // - The binding-aware public entry points
     //   (`analyze_multiple_pipeline_with_*_fnaddr_bindings`) work for
     //   nongeneric helper surfaces whose concrete fnaddrs are known to a
-    //   caller. `generated::all_jitcodes()` is different: it caches one
-    //   process-wide, monomorphization-neutral registry in a `OnceLock`,
-    //   so it cannot pick one concrete instantiation without changing the
-    //   meaning of the graph set it exposes.
+    //   caller. `generated::with_all_jitcodes` is different: it caches one
+    //   per-thread, monomorphization-neutral registry in a thread-local
+    //   `OnceCell`, so it cannot pick one concrete instantiation without
+    //   changing the meaning of the graph set it exposes.
     //
     // In short, this registry is parity-accurate for graph discovery and
     // JitCode bodies, but intentionally not for `fnaddr`. The symbolic
@@ -243,32 +264,32 @@ fn build() -> AllJitCodes {
 
 #[cfg(test)]
 mod tests {
-    use super::all_jitcodes;
+    use super::with_all_jitcodes;
     use crate::call::symbolic_fnaddr_for_path;
     use crate::parse::CallPath;
 
     #[test]
     fn generic_handler_graphs_keep_symbolic_fnaddr_surface() {
-        let reg = all_jitcodes();
-
-        for path in [
-            CallPath::from_segments(["execute_opcode_step"]),
-            CallPath::from_segments(["opcode_load_const"]),
-            CallPath::from_segments(["opcode_build_list"]),
-        ] {
-            let jitcode = reg
-                .by_path
-                .get(&path)
-                .unwrap_or_else(|| panic!("missing JitCode for path {:?}", path.segments));
-            assert_eq!(
-                jitcode.fnaddr,
-                symbolic_fnaddr_for_path(&path),
-                "generated::all_jitcodes() unexpectedly stopped using the symbolic fnaddr \
-                 fallback for {:?}; if this became a real fnaddr, update the contract \
-                 comment above with the chosen monomorphization strategy",
-                path.segments
-            );
-        }
+        with_all_jitcodes(|reg| {
+            for path in [
+                CallPath::from_segments(["execute_opcode_step"]),
+                CallPath::from_segments(["opcode_load_const"]),
+                CallPath::from_segments(["opcode_build_list"]),
+            ] {
+                let jitcode = reg
+                    .by_path
+                    .get(&path)
+                    .unwrap_or_else(|| panic!("missing JitCode for path {:?}", path.segments));
+                assert_eq!(
+                    jitcode.fnaddr,
+                    symbolic_fnaddr_for_path(&path),
+                    "generated::with_all_jitcodes unexpectedly stopped using the symbolic fnaddr \
+                     fallback for {:?}; if this became a real fnaddr, update the contract \
+                     comment above with the chosen monomorphization strategy",
+                    path.segments
+                );
+            }
+        });
     }
 
     /// Phase D acceptance: `eval_loop_jit` is the portal (upstream
@@ -284,25 +305,23 @@ mod tests {
     /// shape Phase D eliminates.
     #[test]
     fn eval_loop_jit_portal_produces_jitcode_with_handler_closure() {
-        let reg = all_jitcodes();
-        let portal = CallPath::from_segments(["eval_loop_jit"]);
-        assert!(
-            reg.by_path.contains_key(&portal),
-            "Phase D parity: eval_loop_jit must have a JitCode after \
-             analyze_multiple_pipeline runs (production seeds portal via \
-             setup_jitdriver, find_all_graphs BFSes from it). Missing the \
-             entry means the portal fallback unexpectedly chose \
-             execute_opcode_step."
-        );
-        // The portal seed + BFS must bring `execute_opcode_step` (match
-        // dispatch, reached via `eval_loop_jit → execute_opcode_step` at
-        // `pyre-jit/src/eval.rs:1355`) into the candidate set.
-        assert!(
-            reg.by_path
-                .contains_key(&CallPath::from_segments(["execute_opcode_step"])),
-            "Phase D parity: execute_opcode_step must reach candidate_graphs \
-             as a BFS callee from eval_loop_jit; a JitCode must be present \
-             for it."
-        );
+        with_all_jitcodes(|reg| {
+            let portal = CallPath::from_segments(["eval_loop_jit"]);
+            assert!(
+                reg.by_path.contains_key(&portal),
+                "Phase D parity: eval_loop_jit must have a JitCode after \
+                 analyze_multiple_pipeline runs (production seeds portal via \
+                 setup_jitdriver, find_all_graphs BFSes from it). Missing the \
+                 entry means the portal fallback unexpectedly chose \
+                 execute_opcode_step."
+            );
+            assert!(
+                reg.by_path
+                    .contains_key(&CallPath::from_segments(["execute_opcode_step"])),
+                "Phase D parity: execute_opcode_step must reach candidate_graphs \
+                 as a BFS callee from eval_loop_jit; a JitCode must be present \
+                 for it."
+            );
+        });
     }
 }

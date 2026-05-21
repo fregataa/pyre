@@ -467,8 +467,11 @@ pub struct GraphFlattener<'a> {
     /// Per-block canonical [`Label`].  `flatten.py` uses `Label(block)` /
     /// `TLabel(block)` keyed by block identity; here a single counter
     /// allocates a fresh [`Label`] per block on first reference and
-    /// caches it so back-edges see the same label.
-    pub block_labels: HashMap<BlockId, Label>,
+    /// caches it so back-edges see the same label.  Vec indexed by
+    /// `BlockId.0` (legacy graph BlockIds are dense — `LegacyGraph`
+    /// allocates `BlockId(0..n)` sequentially), sized at construction
+    /// to `graph.blocks.len()`.
+    pub block_labels: Vec<Option<Label>>,
     /// Counter shared between block labels and link landing pads.
     pub next_label: usize,
     pub ssarepr: SSARepr,
@@ -486,7 +489,7 @@ impl<'a> GraphFlattener<'a> {
             _include_all_exc_links,
             seen_blocks: std::collections::HashSet::new(),
             registers: HashMap::new(),
-            block_labels: HashMap::new(),
+            block_labels: vec![None; graph.blocks.len()],
             next_label: 0,
             ssarepr: SSARepr {
                 name: graph.name.clone(),
@@ -1246,12 +1249,12 @@ impl<'a> GraphFlattener<'a> {
     }
 
     fn block_label(&mut self, bid: BlockId) -> Label {
-        if let Some(&label) = self.block_labels.get(&bid) {
+        if let Some(label) = self.block_labels[bid.0] {
             return label;
         }
         let label = Label(self.next_label);
         self.next_label += 1;
-        self.block_labels.insert(bid, label);
+        self.block_labels[bid.0] = Some(label);
         label
     }
 

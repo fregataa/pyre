@@ -265,7 +265,13 @@ pub extern "C" fn pyre_stack_set_length_fraction(frac: f64) {
 pub extern "C" fn pyre_stack_too_big_slowpath(current: usize) -> u8 {
     let max_stack_size = PYRE_STACKTOOBIG.stack_length.load(Ordering::Relaxed);
     // stack.c:38-40 OP_THREADLOCALREF_ADDR + baseptr = tl1->stack_end.
-    let baseptr = TL_STACK_END.with(|c| c.get());
+    // Explicit `usize` annotation pins the variable kind to Signed for
+    // the pyre annotator; `Cell::get()` through a `thread_local!`
+    // `.with` closure isn't resolved by the front-end, which would
+    // otherwise default the binding to the GcRef Unknown sentinel
+    // (`jtransform.rs:1588 ConcreteType::Unknown => 'r'`) and emit a
+    // mixed-kind `int_ne/ri>i` at the `!= 0` compare below.
+    let baseptr: usize = TL_STACK_END.with(|c| c.get());
 
     if baseptr != 0 {
         // stack.c:46 diff = baseptr - curptr  (signed). We model the

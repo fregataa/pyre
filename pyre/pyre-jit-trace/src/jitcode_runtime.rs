@@ -19,6 +19,7 @@
 //!
 //! Phase D-1 Step 2 of the eval-loop automation plan.
 
+use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
@@ -28,12 +29,36 @@ use majit_translate::opcode_dispatch::PipelineOpcodeArm;
 use majit_translate::{CallPath, OpcodeDispatchSelector};
 use pyre_interpreter::bytecode::Instruction;
 
-/// Deserialized `pipeline.jitcodes` — RPython `all_jitcodes[]` from
-/// codewriter.py:89.  Dense: `ALL_JITCODES[i].index == i` (RPython
-/// codewriter.py:80 invariant, preserved by
-/// `collect_jitcodes_in_alloc_order`). Use `get_jitcode_by_index` or
-/// direct indexing for lookup by `entry_jitcode_index`.
-static ALL_JITCODES: LazyLock<Vec<Arc<JitCode>>> = LazyLock::new(|| {
+thread_local! {
+    /// Per-thread cached `&'static` to the build-time `pipeline.jitcodes`
+    /// table.  Set on first access (see [`load_all_jitcodes`]).
+    ///
+    /// `thread_local!` rather than a process-wide `static` because the
+    /// `JitCode` payload transitively holds `Variable` graphs whose
+    /// interior `RefCell` / `Cell` cells are intentionally !Sync (parity
+    /// with RPython's single-thread annotator + GIL invariant).  The JIT
+    /// runtime is single-threaded by construction (Python GIL), so a
+    /// per-thread cache matches the RPython module-level dict semantics
+    /// without forcing `Variable` to become thread-safe.
+    ///
+    /// The cached value is a `&'static [Arc<JitCode>]` — produced via
+    /// `Box::leak` on the first call per thread so downstream consumers
+    /// can keep their existing `'static` lifetime contracts
+    /// (`SubJitCodeBody::code: &'static [u8]`, walker `WalkContext`
+    /// lifetimes, etc.).  The leak is one-time per thread; a typical
+    /// single-threaded JIT runtime leaks once for the process lifetime,
+    /// matching the previous `LazyLock<Vec<...>>` storage.
+    static ALL_JITCODES: OnceCell<&'static [Arc<JitCode>]> = const { OnceCell::new() };
+
+    /// Per-thread cached `&'static` to the build-time
+    /// `pipeline.opcode_dispatch` table.  Same single-thread invariant
+    /// and `Box::leak` strategy as `ALL_JITCODES` —
+    /// `PipelineOpcodeArm.flattened: Option<SSARepr>` transitively
+    /// embeds `Variable`.
+    static ALL_OPCODE_ARMS: OnceCell<&'static [PipelineOpcodeArm]> = const { OnceCell::new() };
+}
+
+fn load_all_jitcodes() -> &'static [Arc<JitCode>] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/opcode_jitcodes.bin"));
     let vec: Vec<Arc<JitCode>> = bincode::deserialize(BYTES).unwrap_or_else(|e| {
         panic!(
@@ -54,26 +79,24 @@ static ALL_JITCODES: LazyLock<Vec<Arc<JitCode>>> = LazyLock::new(|| {
             jc.index(),
         );
     }
-    vec
-});
+    Box::leak(vec.into_boxed_slice())
+}
 
-/// Deserialized `pipeline.opcode_dispatch` — the arm table. Each entry
-/// carries `arm_id`, `selector`, and `entry_jitcode_index` (logical index
-/// into `ALL_JITCODES` via `.index`).
-static ALL_OPCODE_ARMS: LazyLock<Vec<PipelineOpcodeArm>> = LazyLock::new(|| {
+fn load_all_opcode_arms() -> &'static [PipelineOpcodeArm] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/opcode_dispatch.bin"));
-    bincode::deserialize(BYTES).unwrap_or_else(|e| {
+    let vec: Vec<PipelineOpcodeArm> = bincode::deserialize(BYTES).unwrap_or_else(|e| {
         panic!(
             "pyre-jit-trace: failed to deserialize opcode_dispatch.bin \
              ({} bytes): {e}",
             BYTES.len(),
         )
-    })
-});
+    });
+    Box::leak(vec.into_boxed_slice())
+}
 
 /// RPython: `metainterp_sd.jitcodes` — full all_jitcodes table.
 pub fn all_jitcodes() -> &'static [Arc<JitCode>] {
-    &ALL_JITCODES
+    ALL_JITCODES.with(|cell| *cell.get_or_init(load_all_jitcodes))
 }
 
 /// RPython: `metainterp_sd.jitcodes[index]` where `index == jitcode.index`.
@@ -82,7 +105,7 @@ pub fn all_jitcodes() -> &'static [Arc<JitCode>] {
 /// index. The dense invariant (`ALL_JITCODES[i].index == i`) is asserted
 /// at load time, so direct vec indexing is correct.
 pub fn get_jitcode_by_index(index: usize) -> Option<Arc<JitCode>> {
-    ALL_JITCODES.get(index).cloned()
+    all_jitcodes().get(index).cloned()
 }
 
 /// Cached index of the build-time portal jitcode within `ALL_JITCODES`.
@@ -102,8 +125,17 @@ pub fn get_jitcode_by_index(index: usize) -> Option<Arc<JitCode>> {
 /// scan below picks up the `eval_loop_jit` jitcode whose
 /// `jitdriver_sd` is populated by `assign_portal_jitdriver_indices`
 /// (`pyre-jit/src/jit/codewriter.rs:6544` — call.py:148 deferred port).
-static PORTAL_JITCODE_INDEX: LazyLock<Option<usize>> = LazyLock::new(|| {
-    let mut hits = ALL_JITCODES
+thread_local! {
+    /// Cached portal jitcode index for the current thread.  See
+    /// `portal_jitcode` for the resolution semantics.  `thread_local!`
+    /// because its initializer iterates `ALL_JITCODES` (also
+    /// thread_local).
+    static PORTAL_JITCODE_INDEX: OnceCell<Option<usize>> = const { OnceCell::new() };
+}
+
+fn compute_portal_jitcode_index() -> Option<usize> {
+    let all = all_jitcodes();
+    let mut hits = all
         .iter()
         .enumerate()
         .filter(|(_, jc)| jc.jitdriver_sd().is_some())
@@ -122,7 +154,7 @@ static PORTAL_JITCODE_INDEX: LazyLock<Option<usize>> = LazyLock::new(|| {
         );
     }
     first
-});
+}
 
 /// RPython: `metainterp_sd.jitcodes[jitdriver_sd.mainjitcode.index]`
 /// (warmspot.py:281-282 + call.py:147-148) — the single portal jitcode
@@ -142,19 +174,19 @@ static PORTAL_JITCODE_INDEX: LazyLock<Option<usize>> = LazyLock::new(|| {
 /// G.2 introduces this accessor as the surface that G.3 will plug
 /// callee dispatch into; G.2 itself does not redirect any caller.
 pub fn portal_jitcode() -> Option<Arc<JitCode>> {
-    let idx = (*PORTAL_JITCODE_INDEX)?;
-    ALL_JITCODES.get(idx).cloned()
+    let idx = PORTAL_JITCODE_INDEX.with(|cell| *cell.get_or_init(compute_portal_jitcode_index))?;
+    get_jitcode_by_index(idx)
 }
 
 /// RPython: opcode dispatch arm table (analogue of PyPy's per-opcode
 /// Python methods). One `PipelineOpcodeArm` per Rust `match` arm.
 pub fn all_opcode_arms() -> &'static [PipelineOpcodeArm] {
-    &ALL_OPCODE_ARMS
+    ALL_OPCODE_ARMS.with(|cell| *cell.get_or_init(load_all_opcode_arms))
 }
 
 /// Returns the arm with the given `arm_id`.
 pub fn get_arm(arm_id: usize) -> Option<&'static PipelineOpcodeArm> {
-    ALL_OPCODE_ARMS.iter().find(|a| a.arm_id == arm_id)
+    all_opcode_arms().iter().find(|a| a.arm_id == arm_id)
 }
 
 /// Convenience: resolve `arm_id` → entry jitcode. Returns `None` if arm

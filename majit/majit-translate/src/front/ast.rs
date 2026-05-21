@@ -7982,9 +7982,7 @@ fn canonical_call_target(expr: &syn::Expr, ctx: &GraphBuildContext) -> CallTarge
                 .iter()
                 .map(|seg| seg.ident.to_string())
                 .collect();
-            if is_transparent_result_option_ctor(&segments)
-                && !registered_function_path(&segments, ctx)
-            {
+            if is_synthetic_ctor_path(&segments) && !registered_function_path(&segments, ctx) {
                 return CallTarget::synthetic_transparent_ctor(
                     segments
                         .last()
@@ -8007,10 +8005,41 @@ fn canonical_call_target(expr: &syn::Expr, ctx: &GraphBuildContext) -> CallTarge
     }
 }
 
-fn is_transparent_result_option_ctor(segments: &[String]) -> bool {
+/// Decide whether `segments` should be lowered as
+/// `CallTarget::SyntheticTransparentCtor` instead of `FunctionPath`.
+///
+/// Two disjoint groups share the same routing decision but receive
+/// different downstream treatment:
+///
+/// * **Result/Option elision whitelist** (`Ok`/`Err`/`Some`):
+///   - flowspace_adapter routes via `HostObject::new_class(name, [])`
+///     → `ClassDesc` → `SomeInstance(classdef)`.
+///   - jtransform `is_synthetic_result_option_ctor` then re-elides the
+///     single-arg call back to its inner value, matching upstream
+///     `lloperation:cast_to_ptr` semantics for `Ok(x)` / `Err(e)` /
+///     `Some(v)`.
+///
+/// * **Pyre-side `Class::Variant` ctors** (`LoopResult::Done` etc.):
+///   - flowspace_adapter routes identically via
+///     `HostObject::new_class(name, [])` → `SomeInstance(classdef)`.
+///   - jtransform does **not** elide them (they are real values, not
+///     transparent wrappers); the call lowers to a normal instance
+///     construction.
+///   - Upstream RPython gets the same shape by lifting each enum
+///     variant as a Class with a registered `__init__` FunctionDesc;
+///     pyre's surface DSL lacks that lifting pass today so the route
+///     is gated explicitly until a `sym_enum_variant` analyser pass
+///     lands.
+///
+/// Both groups must skip the `PyreCallRegistry` function-path lookup
+/// because neither is registered there; the discriminator is the
+/// caller's check at `canonical_call_target` that
+/// `registered_function_path` returns false.
+fn is_synthetic_ctor_path(segments: &[String]) -> bool {
     let path: Vec<&str> = segments.iter().map(String::as_str).collect();
     matches!(
         path.as_slice(),
+        // Result/Option transparent wrappers — elided at jtransform.
         ["Ok"]
             | ["Err"]
             | ["Some"]
@@ -8026,6 +8055,13 @@ fn is_transparent_result_option_ctor(segments: &[String]) -> bool {
             | ["core", "result", "Result", "Ok"]
             | ["core", "result", "Result", "Err"]
             | ["core", "option", "Option", "Some"]
+            // Pyre-side `Class::Variant` ctors — classdesc-routed,
+            // not elided.
+            | ["LoopResult", "Done"]
+            | ["LoopResult", "ContinueRunningNormally"]
+            | ["JitAction", "Return"]
+            | ["JitAction", "Continue"]
+            | ["StepResult", "Continue"]
     )
 }
 

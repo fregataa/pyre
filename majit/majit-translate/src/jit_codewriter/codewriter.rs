@@ -19,7 +19,6 @@ use std::sync::Arc;
 
 use crate::assembler::Assembler;
 use crate::call::CallControl;
-use crate::flatten::RegKind;
 use crate::jitcode::JitCode;
 use crate::jtransform::GraphTransformConfig;
 use crate::model::FunctionGraph;

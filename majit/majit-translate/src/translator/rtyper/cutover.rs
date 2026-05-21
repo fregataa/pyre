@@ -88,7 +88,7 @@ use crate::translator::rtyper::rtyper::RPythonTyper;
 /// `getkind: …not supported…` payload only and re-raises everything
 /// else (so an assertion or logic bug inside `getkind` is NOT
 /// silently rebranded as a missing-rtype error in the dual gate).
-pub fn lowleveltype_to_concrete(ll: &LowLevelType) -> Result<ConcreteType, TyperError> {
+pub(crate) fn lowleveltype_to_concrete(ll: &LowLevelType) -> Result<ConcreteType, TyperError> {
     let ll_clone = ll.clone();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::model::getkind(&ll_clone)
@@ -322,7 +322,7 @@ pub(crate) fn dual_gate_check(legacy_graph: &LegacyGraph) -> Result<(), String> 
 /// transitional scaffolding that retires once every owning epic in
 /// `is_known_unported`'s table converges.
 #[derive(Debug)]
-pub enum DualGateOutcome {
+pub(crate) enum DualGateOutcome {
     /// Real path completed without panicking and (when the legacy
     /// walker also succeeded as defensive baseline) every legacy-
     /// known `ValueId` carried the same `ConcreteType` in the real
@@ -397,7 +397,7 @@ pub enum DualGateOutcome {
 /// to the legacy walker output, matching main's pre-Slice-12.2
 /// contract.  Anchor tests use [`dual_gate_check`] directly for
 /// hand-built fixtures.
-pub fn dual_gate_check_with_registry(
+pub(crate) fn dual_gate_check_with_registry(
     legacy_graph: &LegacyGraph,
     call_registry: &PyreCallRegistry,
 ) -> Result<DualGateOutcome, String> {
@@ -757,7 +757,7 @@ pub(crate) fn is_known_unported(msg: &str) -> bool {
 /// 2. `lift_callee_to_pygraph` + `prefill_default_cache` per entry
 ///    so `cachedgraph` (`description.rs:1037-1039`) hits at the
 ///    rtyper's `direct_call`.
-pub fn populate_call_registry_from_call_graphs(
+pub(crate) fn populate_call_registry_from_call_graphs(
     function_graphs: &std::collections::HashMap<crate::parse::CallPath, LegacyGraph>,
     registry: &PyreCallRegistry,
 ) -> Result<(), TyperError> {
@@ -945,7 +945,7 @@ fn signature_for_graph(graph: &LegacyGraph) -> Signature {
 /// For leaf callees (no `OpKind::Call` ops in the body) the registry
 /// is unused; nested callees recursively consult it as the adapter
 /// processes the callee's own `OpKind::Call` ops.
-pub fn lift_callee_to_pygraph(
+pub(crate) fn lift_callee_to_pygraph(
     callee_graph: &LegacyGraph,
     signature: Signature,
     nested_registry: &PyreCallRegistry,
@@ -1070,7 +1070,7 @@ fn signature_for(func: &front::SemanticFunction) -> Signature {
 ///
 /// Annotation seeding lives inside [`function_graph_to_flowspace`]
 /// after Slice 12.2; this walker plumbs only the program + registry.
-pub fn populate_call_registry_from_program(
+pub(crate) fn populate_call_registry_from_program(
     program: &front::SemanticProgram,
     registry: &PyreCallRegistry,
 ) -> Result<(), TyperError> {

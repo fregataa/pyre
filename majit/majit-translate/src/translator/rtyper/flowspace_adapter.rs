@@ -1559,6 +1559,21 @@ pub fn function_graph_to_flowspace(
                 if let Hlvalue::Constant(c) = &hlvalue {
                     if let Some(ct) = &c.concretetype {
                         constant_concretetypes.insert(vid, ct.clone());
+                        // Also stamp the lltype onto the legacy graph's
+                        // orphan Variable cell for this const-define
+                        // result.  The rtyper consumes `Hlvalue::Constant`
+                        // surfaces for const-defines and never reads the
+                        // legacy Variable cell directly, so the write is
+                        // additive — `RPythonTyper.specialize` won't
+                        // overwrite this slot.  Downstream consumers
+                        // reading `graph.concretetype(v)` (RPython parity
+                        // for `getkind(v.concretetype)`) then see the
+                        // const kind inline, without depending on the
+                        // post-rtyper `apply_to_graph(constant_concretetypes, …)`
+                        // bridge.
+                        if let Some(var) = legacy.variable(vid) {
+                            var.set_concretetype(Some(ct.clone()));
+                        }
                     }
                 }
                 constant_hlvalues.insert(vid, hlvalue);

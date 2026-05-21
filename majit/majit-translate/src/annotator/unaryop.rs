@@ -109,6 +109,7 @@ pub fn init(
     init_someptr_overrides(reg);
     init_somenone_overrides(reg);
     init_someweakref_overrides(reg);
+    init_someinstance_overrides(reg);
 }
 
 /// Module-import time side effect mirroring
@@ -3529,6 +3530,89 @@ fn init_somenone_overrides(
         Specialization {
             apply: Box::new(|_ann, _hl| s_impossible_value()),
             can_only_throw: CanOnlyThrow::Absent,
+        },
+    );
+}
+
+// =====================================================================
+// unaryop.py:833-865 — class __extend__(SomeInstance)
+// =====================================================================
+
+fn init_someinstance_overrides(
+    reg: &mut std::collections::HashMap<
+        OpKind,
+        std::collections::HashMap<SomeValueTag, Specialization>,
+    >,
+) {
+    // unaryop.py:833-842 — SomeInstance.getattr(self, s_attr).
+    //
+    //   def getattr(self, s_attr):
+    //       if not(s_attr.is_constant() and isinstance(s_attr.const, str)):
+    //           raise AnnotatorError("A variable argument to getattr is not RPython")
+    //       attr = s_attr.const
+    //       if attr == '__class__':
+    //           return self.classdef.read_attr__class__()
+    //       getbookkeeper().record_getattr(self.classdef.classdesc, attr)
+    //       return self.classdef.s_getattr(attr, self.flags)
+    register(
+        reg,
+        OpKind::GetAttr,
+        SomeValueTag::Instance,
+        Specialization {
+            apply: Box::new(|ann, hl| {
+                let s_self = ann
+                    .annotation(&hl.args[0])
+                    .expect("instance.getattr: self unbound");
+                let s_attr = ann
+                    .annotation(&hl.args[1])
+                    .expect("instance.getattr: attr unbound");
+                let inst = match &s_self {
+                    SomeValue::Instance(inst) => inst.clone(),
+                    other => panic!(
+                        "AnnotatorError: SomeInstance.getattr dispatched on non-instance: {:?}",
+                        other
+                    ),
+                };
+                let attr = s_attr
+                    .const_()
+                    .and_then(ConstValue::as_pystr)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "AnnotatorError: A variable argument to getattr is not RPython: {:?}",
+                            s_attr
+                        )
+                    });
+                let classdef = inst.classdef.as_ref().unwrap_or_else(|| {
+                    panic!(
+                        "AnnotatorError: SomeInstance.getattr({:?}) on classdef-less instance",
+                        attr
+                    )
+                });
+                // unaryop.py:838-839 — `if attr == '__class__':
+                //                          return self.classdef.read_attr__class__()`.
+                if attr == "__class__" {
+                    return super::classdesc::ClassDef::read_attr__class__(classdef);
+                }
+                // unaryop.py:840 — `getbookkeeper().record_getattr(
+                //                       self.classdef.classdesc, attr)`.
+                let classdesc = classdef.borrow().classdesc.clone();
+                ann.bookkeeper
+                    .record_getattr(&classdesc, &attr)
+                    .unwrap_or_else(|err| {
+                        panic!(
+                            "AnnotatorError: SomeInstance.getattr({attr:?}) \
+                             record_getattr failed: {err:?}"
+                        )
+                    });
+                // unaryop.py:841 — `return self.classdef.s_getattr(attr, self.flags)`.
+                super::classdesc::ClassDef::s_getattr(classdef, &attr, &inst.flags).unwrap_or_else(
+                    |err| {
+                        panic!("AnnotatorError: SomeInstance.s_getattr({attr:?}) failed: {err:?}")
+                    },
+                )
+            }),
+            can_only_throw: CanOnlyThrow::List(vec![]),
         },
     );
 }

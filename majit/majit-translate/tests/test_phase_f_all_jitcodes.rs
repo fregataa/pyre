@@ -16,45 +16,49 @@
 //! against `generated` yet (Phase G), so baseline `./pyre/check.py`
 //! 14/14+14/14 is unaffected.
 
-use majit_translate::generated::all_jitcodes;
+use majit_translate::generated::with_all_jitcodes;
 
 #[test]
 fn all_jitcodes_covers_every_opcode_handler() {
-    let reg = all_jitcodes();
-
-    // Every `opcode_*` freestanding handler in pyopcode.rs must appear
-    // in the registry. The Phase E.0.1 harness confirmed the transform
-    // pipeline covers 28+; Phase F must preserve that count.
-    assert!(
-        reg.len() >= 28,
-        "expected >=28 JitCodes in the registry, got {}",
-        reg.len()
-    );
+    with_all_jitcodes(|reg| {
+        // Every `opcode_*` freestanding handler in pyopcode.rs must appear
+        // in the registry. The Phase E.0.1 harness confirmed the transform
+        // pipeline covers 28+; Phase F must preserve that count.
+        assert!(
+            reg.len() >= 28,
+            "expected >=28 JitCodes in the registry, got {}",
+            reg.len()
+        );
+    });
 }
 
 #[test]
 fn all_jitcodes_indices_match_alloc_order() {
     // Mirrors RPython `codewriter.py:80` invariant: in_order[i].index == i.
-    for (i, jc) in all_jitcodes().in_order.iter().enumerate() {
-        assert_eq!(
-            jc.try_index(),
-            Some(i),
-            "in_order[{}].index = {:?} (expected {})",
-            i,
-            jc.try_index(),
-            i
-        );
-    }
+    with_all_jitcodes(|reg| {
+        for (i, jc) in reg.in_order.iter().enumerate() {
+            assert_eq!(
+                jc.try_index(),
+                Some(i),
+                "in_order[{}].index = {:?} (expected {})",
+                i,
+                jc.try_index(),
+                i
+            );
+        }
+    });
 }
 
 #[test]
 fn all_jitcodes_is_memoised() {
-    // `OnceLock`-backed: two calls must return the same `&'static`.
-    let a: *const _ = all_jitcodes();
-    let b: *const _ = all_jitcodes();
+    // Thread-local `OnceCell` memoisation: two calls on the same thread
+    // must hand the closure the same registry address (the OnceCell
+    // location is stable in TLS once initialised).
+    let a = with_all_jitcodes(|reg| reg as *const _);
+    let b = with_all_jitcodes(|reg| reg as *const _);
     assert!(
         std::ptr::eq(a, b),
-        "all_jitcodes() returned different pointers on successive calls"
+        "with_all_jitcodes() returned different pointers on successive calls"
     );
 }
 
@@ -65,37 +69,40 @@ fn all_jitcodes_entries_have_bodies() {
     // a populated `body.code`. An empty body would mean the assembler
     // ran without emitting anything, which never happens on a non-trivial
     // handler graph.
-    for jc in &all_jitcodes().in_order {
-        assert!(
-            !jc.code.is_empty(),
-            "JitCode `{}` has an empty code body",
-            jc.name
-        );
-    }
+    with_all_jitcodes(|reg| {
+        for jc in &reg.in_order {
+            assert!(
+                !jc.code.is_empty(),
+                "JitCode `{}` has an empty code body",
+                jc.name
+            );
+        }
+    });
 }
 
 #[test]
 fn all_jitcodes_by_path_matches_in_order() {
-    let reg = all_jitcodes();
-    // Every entry of `in_order` must be reachable through `by_path`
-    // (same Arc, so pointer-equal). `by_path` may contain strictly
-    // more entries if the registry later tracks graph-only records
-    // without JitCodes, but today the two should agree on the JitCode
-    // set.
-    for jc in &reg.in_order {
-        let mut found = false;
-        for other in reg.by_path.values() {
-            if std::sync::Arc::ptr_eq(jc, other) {
-                found = true;
-                break;
+    with_all_jitcodes(|reg| {
+        // Every entry of `in_order` must be reachable through `by_path`
+        // (same Arc, so pointer-equal). `by_path` may contain strictly
+        // more entries if the registry later tracks graph-only records
+        // without JitCodes, but today the two should agree on the JitCode
+        // set.
+        for jc in &reg.in_order {
+            let mut found = false;
+            for other in reg.by_path.values() {
+                if std::sync::Arc::ptr_eq(jc, other) {
+                    found = true;
+                    break;
+                }
             }
+            assert!(
+                found,
+                "in_order entry `{}` is not reachable through by_path",
+                jc.name
+            );
         }
-        assert!(
-            found,
-            "in_order entry `{}` is not reachable through by_path",
-            jc.name
-        );
-    }
+    });
 }
 
 #[test]
@@ -110,17 +117,18 @@ fn all_jitcodes_registry_contains_inherent_impl_methods() {
     // `self.peek()` / `self.push()` (inherent helpers defined on
     // `PyFrame` in `pyre/pyre-interpreter/src/pyframe.rs`); all four
     // graphs must appear in the registry.
-    let reg = all_jitcodes();
-    let names: std::collections::HashSet<&str> =
-        reg.by_path.values().map(|jc| jc.name.as_str()).collect();
-    for required in ["push", "pop", "peek", "check_exc_match"] {
-        assert!(
-            names.contains(required),
-            "inherent impl method `{}` is missing from the JitCode registry \
-             — `generated::build()` lost the full-context pipeline output",
-            required
-        );
-    }
+    with_all_jitcodes(|reg| {
+        let names: std::collections::HashSet<&str> =
+            reg.by_path.values().map(|jc| jc.name.as_str()).collect();
+        for required in ["push", "pop", "peek", "check_exc_match"] {
+            assert!(
+                names.contains(required),
+                "inherent impl method `{}` is missing from the JitCode registry \
+                 — `generated::build()` lost the full-context pipeline output",
+                required
+            );
+        }
+    });
 }
 
 /// Loop-free `opcode_*` helpers defined in
@@ -167,23 +175,24 @@ fn all_jitcodes_registry_contains_loop_free_shared_opcode_helpers() {
     // are the "base-class methods" for impls that don't override; the
     // fix binds them to a direct `[<Trait>, <method>]` key so
     // `target_to_path` resolves identically to the upstream MRO walk.
-    let reg = all_jitcodes();
-    let names: std::collections::HashSet<&str> =
-        reg.by_path.values().map(|jc| jc.name.as_str()).collect();
-    let missing: Vec<&&str> = SHARED_OPCODE_HELPERS_INLINABLE
-        .iter()
-        .filter(|n| !names.contains(*n))
-        .collect();
-    assert!(
-        missing.is_empty(),
-        "Loop-free shared_opcode helpers missing from JitCode registry: \
-         {missing:?}. Upstream `codewriter.py:74 make_jitcodes` would \
-         have transformed these as inline graphs. Check that \
-         `lib.rs::analyze_pipeline_from_parsed` still calls \
-         `call_control.register_function_graph(direct_path, graph)` for \
-         every `impl_info` whose `for_type` starts with `<default \
-         methods of `."
-    );
+    with_all_jitcodes(|reg| {
+        let names: std::collections::HashSet<&str> =
+            reg.by_path.values().map(|jc| jc.name.as_str()).collect();
+        let missing: Vec<&&str> = SHARED_OPCODE_HELPERS_INLINABLE
+            .iter()
+            .filter(|n| !names.contains(*n))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "Loop-free shared_opcode helpers missing from JitCode registry: \
+             {missing:?}. Upstream `codewriter.py:74 make_jitcodes` would \
+             have transformed these as inline graphs. Check that \
+             `lib.rs::analyze_pipeline_from_parsed` still calls \
+             `call_control.register_function_graph(direct_path, graph)` for \
+             every `impl_info` whose `for_type` starts with `<default \
+             methods of `."
+        );
+    });
 }
 
 #[test]
@@ -196,22 +205,23 @@ fn loopy_shared_opcode_helpers_rejected_by_policy() {
     // reject them verbatim. Their absence from the registry is the
     // expected parity outcome — the portal reaches them through
     // `residual_call_*` instead.
-    let reg = all_jitcodes();
-    let names: std::collections::HashSet<&str> =
-        reg.by_path.values().map(|jc| jc.name.as_str()).collect();
-    for n in SHARED_OPCODE_HELPERS_LOOP_REJECTED {
-        assert!(
-            !names.contains(n),
-            "Loop-carrying shared_opcode helper `{n}` unexpectedly \
-             reached the JitCode registry. Upstream \
-             `rpython/jit/codewriter/policy.py:56 look_inside_graph` \
-             rejects looped graphs without `_jit_unroll_safe_`. If pyre \
-             now admits this helper, verify that either (a) the helper \
-             gained an `unroll_safe` hint deliberately, or (b) \
-             `find_backedges` lost its loop detection — the latter is a \
-             parity regression."
-        );
-    }
+    with_all_jitcodes(|reg| {
+        let names: std::collections::HashSet<&str> =
+            reg.by_path.values().map(|jc| jc.name.as_str()).collect();
+        for n in SHARED_OPCODE_HELPERS_LOOP_REJECTED {
+            assert!(
+                !names.contains(n),
+                "Loop-carrying shared_opcode helper `{n}` unexpectedly \
+                 reached the JitCode registry. Upstream \
+                 `rpython/jit/codewriter/policy.py:56 look_inside_graph` \
+                 rejects looped graphs without `_jit_unroll_safe_`. If pyre \
+                 now admits this helper, verify that either (a) the helper \
+                 gained an `unroll_safe` hint deliberately, or (b) \
+                 `find_backedges` lost its loop detection — the latter is a \
+                 parity regression."
+            );
+        }
+    });
 }
 
 #[test]

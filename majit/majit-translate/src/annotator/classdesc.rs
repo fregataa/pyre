@@ -2745,7 +2745,17 @@ impl ClassDef {
         }
 
         // upstream: self.bookkeeper.update_attr(self, newattr).
-        if let Some(bk) = this.borrow().bookkeeper.upgrade() {
+        //
+        // Extract `bk` into a `let` so the `this.borrow()` temporary
+        // is dropped at the end of the `let` statement.  Inlining
+        // the borrow into the `if let` scrutinee keeps the temporary
+        // alive through the if-let body (the Rust 2024 scrutinee-
+        // scoping change drops the temp before the `else` branch,
+        // not before the true branch), which would conflict with
+        // `update_attr`'s `clsdef.borrow_mut()` for the same `this`
+        // ClassDef.
+        let bk_opt = this.borrow().bookkeeper.upgrade();
+        if let Some(bk) = bk_opt {
             bk.update_attr(this, attr)?;
         }
         Ok(())

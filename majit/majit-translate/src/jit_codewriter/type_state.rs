@@ -171,6 +171,99 @@ pub(crate) fn authoritative_result_types(graph: &FunctionGraph) -> HashMap<Varia
     result
 }
 
+/// Test-only replacement for the retired `legacy_annotator::annotate` +
+/// `legacy_resolve::resolve_types` walker pair.  Walks every op,
+/// stamps each `op.result.concretetype` cell from
+/// [`authoritative_result_type_from_op`], then propagates kinds
+/// through PHI edges so block inputargs adopt their incoming source
+/// kind (mirrors `rtyper.py`'s type-inference fix-point on
+/// inputargs).  Pure side effect on the graph's Variable cells
+/// (interior mutability); returns nothing.
+#[cfg(test)]
+pub(crate) fn seed_concretetypes_for_tests(graph: &FunctionGraph) {
+    // Pass 1: op-result stamps from authoritative_result_type_from_op.
+    for block in &graph.blocks {
+        for op in &block.operations {
+            let Some(var) = op.result.as_ref() else {
+                continue;
+            };
+            let Some(vid) = graph.value_id_of(var) else {
+                continue;
+            };
+            if let Some(ct) = authoritative_result_type_from_op(&op.kind) {
+                graph.set_concretetype_inline(vid, ct);
+            }
+        }
+    }
+    // Pass 2: PHI propagation — for each block inputarg, adopt the
+    // unique incoming link.args[i] kind (widen to GcRef on divergence).
+    // Iterate to fixpoint for back-edges.
+    loop {
+        let mut changed = false;
+        let mut per_inputarg: std::collections::HashMap<
+            crate::model::ValueId,
+            std::collections::HashSet<ConcreteType>,
+        > = std::collections::HashMap::new();
+        for src_block in &graph.blocks {
+            for link in &src_block.exits {
+                let target_block = graph.block(link.target);
+                for (i, arg) in link.args.iter().enumerate() {
+                    let Some(inputarg) = target_block.inputargs.get(i) else {
+                        continue;
+                    };
+                    let Some(inputarg_vid) = graph.value_id_of(inputarg) else {
+                        continue;
+                    };
+                    let src_kind = match arg {
+                        crate::model::LinkArg::Value(v) => {
+                            let Some(vid) = graph.value_id_of(v) else {
+                                continue;
+                            };
+                            let k = graph.concretetype(vid);
+                            if matches!(k, ConcreteType::Unknown) {
+                                continue;
+                            }
+                            k
+                        }
+                        crate::model::LinkArg::Const(c) => {
+                            kind_char_to_concrete(crate::jit_codewriter::flatten::constant_kind(c))
+                        }
+                    };
+                    per_inputarg
+                        .entry(inputarg_vid)
+                        .or_default()
+                        .insert(src_kind);
+                }
+            }
+        }
+        for (vid, kinds) in per_inputarg {
+            let current = graph.concretetype(vid);
+            let resolved = if kinds.len() == 1 {
+                kinds.into_iter().next().unwrap()
+            } else {
+                ConcreteType::GcRef
+            };
+            let needs_update = match current {
+                ConcreteType::Unknown => true,
+                existing if existing == resolved => false,
+                _ => true,
+            };
+            if needs_update {
+                let stamp = if matches!(current, ConcreteType::Unknown) {
+                    resolved
+                } else {
+                    ConcreteType::GcRef
+                };
+                graph.set_concretetype_inline(vid, stamp);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+}
+
 // `build_value_kinds` retired — the regalloc / flatten / assemble
 // pipeline now reads kinds straight off `graph.concretetype(v)`
 // (which routes to each `ValueId`'s backing

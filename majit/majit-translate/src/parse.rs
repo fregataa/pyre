@@ -802,7 +802,9 @@ fn extract_match_arms(expr: &ExprMatch, sig: &syn::Signature) -> Vec<ExtractedOp
             // adapter rejects as "adapter cross-block body Input"
             // (the dominant Cat 2.1 Skip family).  PyPy/RPython parity:
             // each per-opcode handler method receives the
-            // dispatcher's parameters in its formal signature.
+            // dispatcher's parameters in its formal signature
+            // (`pypy/interpreter/pyopcode.py:519`,
+            // `rpython/flowspace/model.py:28 startblock.inputargs`).
             crate::front::ast::lower_expr_into_graph_with_signature(
                 &mut graph,
                 &arm.body,
