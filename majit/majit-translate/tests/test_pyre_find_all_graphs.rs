@@ -24,8 +24,8 @@
 use std::path::PathBuf;
 
 use majit_translate::{
-    CallPath, ParsedInterpreter, build_semantic_program_from_parsed_files, call::CallControl,
-    extract_trait_impls, front::ast::build_function_graph_pub, parse_source,
+    CallPath, CallTarget, OpKind, ParsedInterpreter, build_semantic_program_from_parsed_files,
+    call::CallControl, extract_trait_impls, front::ast::build_function_graph_pub, parse_source,
     policy::DefaultJitPolicy,
 };
 use syn::{Item, ItemFn};
@@ -208,20 +208,84 @@ fn find_all_graphs_closure_reaches_handler_graphs_from_dispatch_portal() {
         pyframe_method_paths.len()
     );
 
-    // Emit summary so the BFS outcome is readable from `cargo test --nocapture`.
-    // Deep discovery beyond the portal is gated by whether `execute_opcode_step`
-    // itself lowers cleanly through front::ast — that readiness is a Phase C/D
-    // scope item, not the parity oracle here. The parity claim of this test
-    // is narrow: "seeding a single dispatch portal is the RPython-orthodox
-    // shape for find_all_graphs".
+    // Deep-BFS oracle (Phase M5).
+    //
+    // RPython `call.py:77-90 find_all_graphs` BFS visits every callee of
+    // every candidate graph and inserts the callee into `candidate_graphs`
+    // when `policy.look_inside_graph` accepts.  Two invariants follow for
+    // pyre's closed-world dispatch:
+    //
+    // 1. Every `opcode_*` helper is a candidate after BFS — because the
+    //    portal `execute_opcode_step` direct-calls each helper via the
+    //    generated dispatch table.  This is the strict shape of
+    //    `call.py:97 graphs_from(op)` returning `[funcobj.graph]` for a
+    //    direct_call site: the callee graph MUST be reachable.
+    //
+    // 2. For every `OpKind::Call` site inside a candidate opcode helper
+    //    whose target is `CallTarget::Method`, if the method name has a
+    //    registered `PyFrame::<name>` impl, that impl must be a candidate.
+    //    The closed-world set is OpcodeStepExecutor → only PyFrame, so the
+    //    BFS-internal `target_to_path` lookup (`call.rs:3007-3056`)
+    //    converges on `PyFrame::<name>` whether the resolver picks the
+    //    receiver-root or trait-wildcard branch.
+    for name in &helper_names {
+        let p = CallPath::from_segments([name.clone()]);
+        assert!(
+            cc.is_candidate(&p),
+            "find_all_graphs did not reach opcode helper `{name}` from portal"
+        );
+    }
+
+    // `policy.py:71-83 look_inside_graph` rejects callees whose graphs
+    // carry backedges — pyre's `DefaultJitPolicy` mirrors this at
+    // `jit_codewriter/policy.rs:166-171`.  Excluding loopy PyFrame
+    // graphs from the oracle is the strict parity stance: an opcode
+    // helper that calls into a loopy PyFrame method still reaches the
+    // method *as a residual call*, not as a BFS candidate, and that
+    // matches upstream behaviour for `@dont_look_inside`-equivalent
+    // sites.  Without this filter the assertion would fire on any
+    // PyFrame method whose implementation contains a Rust `for` /
+    // `while` / `loop` (e.g. `ensure_iter_value` at
+    // `pyre-interpreter/src/eval.rs:1257`), which is not a BFS gap.
+    let mut missing: Vec<(String, String)> = Vec::new();
+    for helper_name in &helper_names {
+        let helper_path = CallPath::from_segments([helper_name.clone()]);
+        let helper_graph = cc
+            .function_graphs()
+            .get(&helper_path)
+            .expect("helper graph registered above");
+        for block in &helper_graph.blocks {
+            for op in &block.operations {
+                let OpKind::Call {
+                    target: CallTarget::Method { name: m_name, .. },
+                    ..
+                } = &op.kind
+                else {
+                    continue;
+                };
+                let pyframe_path = CallPath::for_impl_method("PyFrame", m_name);
+                let Some(pyframe_graph) = cc.function_graphs().get(&pyframe_path) else {
+                    continue;
+                };
+                if !majit_translate::policy::find_backedges(pyframe_graph).is_empty() {
+                    continue;
+                }
+                if !cc.is_candidate(&pyframe_path) {
+                    missing.push((helper_name.clone(), m_name.clone()));
+                }
+            }
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "find_all_graphs missed loop-free PyFrame methods referenced from opcode helpers: {missing:?}"
+    );
+
+    // Diagnostic summary — keep `--nocapture` readable.
     let candidate_count = cc
         .function_graphs()
         .keys()
         .filter(|p| cc.is_candidate(p))
-        .count();
-    let helper_candidate_count = helper_names
-        .iter()
-        .filter(|n| cc.is_candidate(&CallPath::from_segments([(*n).clone()])))
         .count();
     let pyframe_candidates: Vec<&CallPath> = cc
         .function_graphs()
@@ -233,7 +297,7 @@ fn find_all_graphs_closure_reaches_handler_graphs_from_dispatch_portal() {
          helpers_in_candidates={} pyframe_methods_registered={} \
          candidates={} pyframe_in_candidates={}",
         helper_names.len(),
-        helper_candidate_count,
+        helper_names.len(),
         pyframe_method_paths.len(),
         candidate_count,
         pyframe_candidates.len(),

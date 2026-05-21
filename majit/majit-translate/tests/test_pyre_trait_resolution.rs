@@ -176,7 +176,7 @@ fn resolve_super_inst_method_calls_against_pyframe_impls() {
     ];
 
     for name in required_methods {
-        let via_concrete = cc.resolve_method(name, Some("PyFrame"));
+        let via_concrete = cc.resolve_method(name, Some("PyFrame"), None);
         assert!(
             via_concrete.is_some(),
             "`{}` did not resolve against PyFrame receiver; impl count = {}",

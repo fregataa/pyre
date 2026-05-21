@@ -1207,6 +1207,55 @@ impl Bookkeeper {
         rc
     }
 
+    /// Pyre-side adapter for the codewriter-time bound-method discovery
+    /// pattern that mirrors `bookkeeper.py:383-397` (the regular-method
+    /// branch of `getdesc(pyobj)`): given a receiver classdef and a
+    /// method name, walk the MRO read-only for a `SomePBC` attribute
+    /// whose `descriptions` contain a `MethodDesc`, then route through
+    /// `getmethoddesc` so the upstream `methoddescs` cache is primed.
+    ///
+    /// `None` when no MRO entry exposes a Method PBC for `name` — the
+    /// receiver is either unannotated for this method or carries a
+    /// non-method attribute (e.g. data attribute).
+    ///
+    /// The walk is intentionally non-mutating (no `find_attribute` /
+    /// `generalize_attr_internal` / `update_attr`) so callers can run
+    /// it at codewriter time without triggering an annotator reflow.
+    /// This is the structural difference from `bookkeeper.py:392`'s
+    /// `classdef.find_attribute(name)` call: upstream tolerates the
+    /// reflow because the call lives inside `getdesc` during
+    /// annotation; pyre's producer runs post-annotator and must stay
+    /// pure-read.
+    pub fn getmethoddesc_for_attribute(
+        self: &Rc<Self>,
+        receiver_classdef: &Rc<RefCell<super::classdesc::ClassDef>>,
+        name: &str,
+    ) -> Option<Rc<RefCell<super::description::MethodDesc>>> {
+        use super::description::DescEntry;
+        use super::model::SomeValue;
+        let mro = super::classdesc::ClassDef::getmro(receiver_classdef);
+        for cdef in mro {
+            let s_value = cdef.borrow().attrs.get(name).map(|a| a.s_value.clone());
+            let Some(SomeValue::PBC(pbc)) = s_value else {
+                continue;
+            };
+            for entry in pbc.descriptions.values() {
+                let DescEntry::Method(md) = entry else {
+                    continue;
+                };
+                let md_borrow = md.borrow();
+                return Some(self.getmethoddesc(
+                    &md_borrow.funcdesc,
+                    md_borrow.originclassdef,
+                    md_borrow.selfclassdef,
+                    &md_borrow.name,
+                    md_borrow.flags.clone(),
+                ));
+            }
+        }
+        None
+    }
+
     /// RPython `Bookkeeper.get_classpbc_attr_families(attrname)`
     /// (bookkeeper.py:447-456).
     ///
@@ -3692,6 +3741,54 @@ mod tests {
         let a = bk.getmethoddesc(&fd, origin, self_def, "m", flags.clone());
         let b = bk.getmethoddesc(&fd, origin, self_def, "m", flags.clone());
         assert!(Rc::ptr_eq(&a, &b));
+    }
+
+    /// `getmethoddesc_for_attribute` mirrors the regular-method branch
+    /// of `bookkeeper.py:383-397 getdesc`: walks the receiver classdef's
+    /// MRO read-only, picks the first Method PBC, and routes through
+    /// `getmethoddesc` so the upstream `methoddescs` cache is primed.
+    /// Missing attribute → `None`.
+    #[test]
+    fn getmethoddesc_for_attribute_walks_mro_and_primes_cache() {
+        use crate::annotator::classdesc::Attribute;
+        use crate::annotator::description::DescEntry;
+        use crate::annotator::model::{SomePBC, SomeValue};
+
+        let bk = bk();
+        let pyobj = HostObject::new_class("PyFrame", vec![]);
+        let desc = Rc::new(RefCell::new(
+            crate::annotator::classdesc::ClassDesc::new_shell(&bk, pyobj, "PyFrame".into()),
+        ));
+        let classdef = crate::annotator::classdesc::ClassDef::new(&bk, &desc);
+        let classdef_key = crate::annotator::description::ClassDefKey::from_classdef(&classdef);
+
+        // Mint a MethodDesc via getmethoddesc and seed the attrs.
+        let gf = GraphFunc::new("push", Constant::new(ConstValue::Dict(Default::default())));
+        let host = HostObject::new_user_function(gf);
+        let fd = bk.getdesc(&host).unwrap().as_function().unwrap();
+        let md = bk.getmethoddesc(
+            &fd,
+            classdef_key,
+            Some(classdef_key),
+            "push",
+            std::collections::BTreeMap::new(),
+        );
+        let pbc = SomePBC::new([DescEntry::Method(md.clone())], false);
+        let mut attr = Attribute::new("push");
+        attr.s_value = SomeValue::PBC(pbc);
+        classdef.borrow_mut().attrs.insert("push".into(), attr);
+
+        // Idempotent on cache hit: returns the cached MethodDesc rc.
+        let returned = bk
+            .getmethoddesc_for_attribute(&classdef, "push")
+            .expect("expected Method PBC under push");
+        assert!(Rc::ptr_eq(&returned, &md));
+
+        // Missing attribute → None.
+        assert!(
+            bk.getmethoddesc_for_attribute(&classdef, "absent")
+                .is_none()
+        );
     }
 
     #[test]

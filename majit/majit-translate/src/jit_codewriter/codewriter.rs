@@ -381,6 +381,18 @@ impl CodeWriter {
         // resolves, so jtransform reads kinds via
         // `graph.concretetype(v)` (the upstream `getkind(v.concretetype)`
         // path) without a separate publish step here.
+        // Annotator monomorphization producer — for every Call(Method)
+        // op in the graph, look up the receiver's annotated flowspace
+        // Variable via `real_value_to_var` and stamp its concrete
+        // `ClassDefKey` onto `CallTarget::Method.classdef_hint`. The
+        // resolver fast path in `CallControl::resolve_method` /
+        // `resolve_method_impl_type` then bypasses the receiver-root
+        // heuristic (mirrors `bookkeeper.py:431-442 getmethoddesc`
+        // classdef-keyed dispatch). Ops whose receiver carries no
+        // SomeInstance annotation are left untouched.
+        if let Some(value_to_var) = real_value_to_var.as_ref() {
+            stamp_classdef_hints_on_graph(&mut graph_owned, value_to_var, callcontrol);
+        }
         let graph = &graph_owned;
 
         // RPython codewriter.py:37 `portal_jd =
@@ -735,6 +747,111 @@ impl Default for CodeWriter {
     }
 }
 
+/// Codewriter-time producer for `CallTarget::Method.classdef_hint`.
+///
+/// Walks every `OpKind::Call { target: CallTarget::Method { .. }, .. }`
+/// in `graph`, looks up the receiver's annotated flowspace `Variable`
+/// via the dual-gate `value_to_var` map, extracts
+/// `SomeInstance.classdef` (`model.py:1054`) when present, and stamps
+/// the resulting `ClassDefKey` onto the op's `classdef_hint` field.
+/// The corresponding `(ClassDefKey → shortname)` pair is registered on
+/// `callcontrol` so [`crate::call::CallControl::resolve_method`] /
+/// [`crate::call::CallControl::resolve_method_impl_type`] can take the
+/// classdef-keyed fast path — mirroring upstream's
+/// `bookkeeper.py:431-442 getmethoddesc` keying on the concrete
+/// `ClassDef` reference rather than a source-syntax string.
+///
+/// Receivers whose annotation is `None` (annotator did not bind them)
+/// or whose `SomeInstance` carries `classdef = None` (`object`-only
+/// instances per `model.py:1056`) leave the hint untouched; the
+/// existing receiver-root heuristic still runs for those sites until
+/// slices C4-C6 retire it.
+fn stamp_classdef_hints_on_graph(
+    graph: &mut FunctionGraph,
+    value_to_var: &crate::translator::rtyper::flowspace_adapter::ValueIdToVariable,
+    callcontrol: &mut CallControl,
+) {
+    use crate::annotator::description::ClassDefKey;
+    use crate::annotator::model::SomeValue;
+    use crate::model::{CallTarget, OpKind};
+    let mut stamps: Vec<(usize, usize, ClassDefKey, String)> = Vec::new();
+    for (b_idx, block) in graph.blocks.iter().enumerate() {
+        for (o_idx, op) in block.operations.iter().enumerate() {
+            let OpKind::Call {
+                target:
+                    CallTarget::Method {
+                        classdef_hint: None,
+                        name: method_name,
+                        ..
+                    },
+                args,
+                ..
+            } = &op.kind
+            else {
+                continue;
+            };
+            let Some(receiver) = args.first() else {
+                continue;
+            };
+            let Some(vid) = graph.value_id_of(receiver) else {
+                continue;
+            };
+            let Some(annotated_var) = value_to_var.get(&vid) else {
+                continue;
+            };
+            let annotation = annotated_var.annotation.borrow();
+            let Some(rc_someval) = annotation.as_ref() else {
+                continue;
+            };
+            let SomeValue::Instance(inst) = &**rc_someval else {
+                continue;
+            };
+            let Some(classdef_rc) = &inst.classdef else {
+                continue;
+            };
+            let key = ClassDefKey::from_classdef(classdef_rc);
+            // Prime the upstream-orthodox `bookkeeper.methoddescs`
+            // cache by routing the receiver classdef + method name
+            // through `Bookkeeper.getmethoddesc_for_attribute`, which
+            // mirrors the regular-method branch of `bookkeeper.py:383-397
+            // getdesc`. The returned MethodDesc rc is discarded — the
+            // call is invoked for its cache-priming side-effect only,
+            // so the upstream-orthodox MethodDesc identity is reachable
+            // for any future PyPy-orthodox consumer that navigates the
+            // receiver classdef's bookkeeper backlink.
+            if let Some(bk) = classdef_rc.borrow().bookkeeper.upgrade() {
+                let _ = bk.getmethoddesc_for_attribute(classdef_rc, method_name);
+            }
+            // Store the fully qualified `ClassDef.name` (RPython
+            // `classdef.py:36 self.name = self.classdesc.name`,
+            // `module.Class` form) rather than `shortname`. The leaf-only
+            // spelling collapses distinct classdefs that share the same
+            // unqualified name (`pkg1.C` vs `pkg2.C`) onto a single
+            // side-table value, which can hand back the wrong registered
+            // graph when `trait_method_graphs` carries multiple impls
+            // under bare `C`. PRE-EXISTING-ADAPTATION on the
+            // `classdef_impl_types` map itself (no upstream basis in
+            // `bookkeeper.py`); retired when `trait_method_graphs` is
+            // re-keyed on the upstream-orthodox `MethodDesc` identity
+            // directly so dispatch consumes `bookkeeper.methoddescs`
+            // primed above.
+            let impl_type = classdef_rc.borrow().name.clone();
+            stamps.push((b_idx, o_idx, key, impl_type));
+        }
+    }
+    for (b_idx, o_idx, key, impl_type) in stamps {
+        callcontrol.register_classdef_impl_type(key, impl_type);
+        let op = &mut graph.blocks[b_idx].operations[o_idx];
+        if let OpKind::Call {
+            target: CallTarget::Method { classdef_hint, .. },
+            ..
+        } = &mut op.kind
+        {
+            *classdef_hint = Some(key);
+        }
+    }
+}
+
 /// Mirror of `FUNC.RESULT` in `rpython/jit/codewriter/call.py:181-187`.
 ///
 /// Upstream reads `lltype.typeOf(fnptr).TO.RESULT` from the function
@@ -757,5 +874,232 @@ fn graph_result_kind(graph: &FunctionGraph) -> char {
         ConcreteType::Float => 'f',
         ConcreteType::Void => 'v',
         ConcreteType::Unknown => 'v',
+    }
+}
+
+#[cfg(test)]
+mod stamp_classdef_hints_tests {
+    use super::*;
+    use crate::annotator::bookkeeper::Bookkeeper;
+    use crate::annotator::classdesc::{ClassDef, ClassDesc};
+    use crate::annotator::description::ClassDefKey;
+    use crate::annotator::model::{SomeInstance, SomeValue};
+    use crate::flowspace::model::{HostObject, Variable};
+    use crate::model::{CallTarget, OpKind, ValueType};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    fn make_classdef(name: &str) -> Rc<RefCell<ClassDef>> {
+        let bk = Rc::new(Bookkeeper::new());
+        let pyobj = HostObject::new_class(name, vec![]);
+        let desc = Rc::new(RefCell::new(ClassDesc::new_shell(&bk, pyobj, name.into())));
+        ClassDef::new(&bk, &desc)
+    }
+
+    /// End-to-end producer test: a Call(Method) op whose receiver
+    /// carries an annotated `SomeInstance(classdef=PyFrame)` gets a
+    /// `classdef_hint` stamped, and the `(key → "PyFrame")` binding is
+    /// registered into `CallControl.classdef_impl_types` so the
+    /// resolver can take the classdef-keyed fast path. Mirrors
+    /// `bookkeeper.py:431-442 getmethoddesc` keying on concrete
+    /// classdef rather than receiver source-syntax string.
+    #[test]
+    fn stamp_classdef_hints_on_graph_stamps_hint_and_registers_impl_type() {
+        let classdef = make_classdef("PyFrame");
+        let expected_key = ClassDefKey::from_classdef(&classdef);
+
+        // Synthetic flowspace Variable annotated SomeInstance(PyFrame).
+        let recv_var = Variable::new();
+        *recv_var.annotation.borrow_mut() = Some(Rc::new(SomeValue::Instance(SomeInstance::new(
+            Some(classdef.clone()),
+            false,
+            Default::default(),
+        ))));
+
+        let mut graph = FunctionGraph::new("producer_test");
+        let recv_vid = graph.ensure_variable_registered(&recv_var);
+        let _result_vid = graph
+            .push_op(
+                graph.startblock,
+                OpKind::Call {
+                    target: CallTarget::method("push_value", Some("H".to_string())),
+                    args: vec![recv_var.clone()],
+                    result_ty: ValueType::Unknown,
+                },
+                true,
+            )
+            .expect("push_op should succeed");
+        let mut value_to_var = std::collections::HashMap::new();
+        value_to_var.insert(recv_vid, recv_var.clone());
+
+        let mut callcontrol = CallControl::new();
+        stamp_classdef_hints_on_graph(&mut graph, &value_to_var, &mut callcontrol);
+
+        // Op's classdef_hint must be Some(expected_key).
+        let op = &graph.blocks[graph.startblock.0].operations[0];
+        let OpKind::Call { target, .. } = &op.kind else {
+            panic!("expected Call op");
+        };
+        assert_eq!(target.classdef_hint(), Some(expected_key));
+
+        // Side-table must have the (key → "PyFrame") binding so the
+        // resolver fast path resolves to the registered impl.
+        assert_eq!(
+            callcontrol.classdef_impl_type_for_test(expected_key),
+            Some("PyFrame"),
+        );
+    }
+
+    /// Receivers whose annotation is `None` (annotator did not bind
+    /// them) leave the hint untouched and do not poison the
+    /// side-table. The string-keyed heuristic still runs for those
+    /// sites until slices C4-C6 retire it.
+    #[test]
+    fn stamp_classdef_hints_on_graph_skips_unannotated_receiver() {
+        let recv_var = Variable::new();
+        // No annotation bound.
+        let mut graph = FunctionGraph::new("producer_test");
+        let recv_vid = graph.ensure_variable_registered(&recv_var);
+        graph
+            .push_op(
+                graph.startblock,
+                OpKind::Call {
+                    target: CallTarget::method("push_value", Some("H".to_string())),
+                    args: vec![recv_var.clone()],
+                    result_ty: ValueType::Unknown,
+                },
+                true,
+            )
+            .expect("push_op should succeed");
+        let mut value_to_var = std::collections::HashMap::new();
+        value_to_var.insert(recv_vid, recv_var.clone());
+
+        let mut callcontrol = CallControl::new();
+        stamp_classdef_hints_on_graph(&mut graph, &value_to_var, &mut callcontrol);
+
+        let op = &graph.blocks[graph.startblock.0].operations[0];
+        let OpKind::Call { target, .. } = &op.kind else {
+            panic!("expected Call op");
+        };
+        assert_eq!(target.classdef_hint(), None);
+        // No registration must have happened either.
+        assert_eq!(
+            callcontrol.classdef_impl_type_for_test(ClassDefKey::from_raw(0)),
+            None,
+        );
+    }
+
+    /// When the receiver classdef's `attrs[method_name].s_value` carries
+    /// a `SomePBC` with a `MethodDesc`, the producer routes the receiver
+    /// classdef + method name through `Bookkeeper.getmethoddesc_for_attribute`
+    /// so the upstream-orthodox `bookkeeper.methoddescs` cache (per
+    /// `bookkeeper.py:431-442 getmethoddesc`) is populated. The cache
+    /// is the real PyPy structure; pyre stores no separate
+    /// MethodDescKey side-table on CallControl.
+    #[test]
+    fn stamp_classdef_hints_on_graph_primes_bookkeeper_methoddescs() {
+        use crate::annotator::bookkeeper::MethodDescKey;
+        use crate::annotator::classdesc::Attribute;
+        use crate::annotator::description::{DescEntry, DescKey, FunctionDesc};
+        use crate::annotator::model::SomePBC;
+        use crate::flowspace::argument::Signature;
+
+        let bk = Rc::new(Bookkeeper::new());
+        let pyobj = HostObject::new_class("PyFrame", vec![]);
+        let desc = Rc::new(RefCell::new(ClassDesc::new_shell(
+            &bk,
+            pyobj,
+            "PyFrame".into(),
+        )));
+        let classdef = ClassDef::new(&bk, &desc);
+        let classdef_key = ClassDefKey::from_classdef(&classdef);
+
+        // Mint an upstream-shaped MethodDesc via bookkeeper.getmethoddesc
+        // and bind it as a Method PBC under `attrs[push_value]`.
+        let funcdesc = Rc::new(RefCell::new(FunctionDesc::new(
+            bk.clone(),
+            None,
+            "push_value",
+            Signature::new(vec!["self".into(), "v".into()], None, None),
+            None,
+            None,
+        )));
+        let md = bk.getmethoddesc(
+            &funcdesc,
+            classdef_key,
+            Some(classdef_key),
+            "push_value",
+            std::collections::BTreeMap::new(),
+        );
+        let pbc = SomePBC::new([DescEntry::Method(md.clone())], false);
+        let mut attr = Attribute::new("push_value");
+        attr.s_value = SomeValue::PBC(pbc);
+        classdef
+            .borrow_mut()
+            .attrs
+            .insert("push_value".into(), attr);
+
+        // Receiver Variable annotated SomeInstance(PyFrame).
+        let recv_var = Variable::new();
+        *recv_var.annotation.borrow_mut() = Some(Rc::new(SomeValue::Instance(SomeInstance::new(
+            Some(classdef.clone()),
+            false,
+            Default::default(),
+        ))));
+
+        let mut graph = FunctionGraph::new("producer_test");
+        let recv_vid = graph.ensure_variable_registered(&recv_var);
+        graph
+            .push_op(
+                graph.startblock,
+                OpKind::Call {
+                    target: CallTarget::method("push_value", Some("H".to_string())),
+                    args: vec![recv_var.clone()],
+                    result_ty: ValueType::Unknown,
+                },
+                true,
+            )
+            .expect("push_op should succeed");
+        let mut value_to_var = std::collections::HashMap::new();
+        value_to_var.insert(recv_vid, recv_var.clone());
+
+        let mut callcontrol = CallControl::new();
+        stamp_classdef_hints_on_graph(&mut graph, &value_to_var, &mut callcontrol);
+
+        // Producer primed bookkeeper.methoddescs (the upstream-orthodox
+        // cache) so the MethodDescKey shape resolves to the same
+        // MethodDesc Rc through the bookkeeper backlink. PyPy's actual
+        // structure — no separate pyre side-table.
+        let md_borrow = md.borrow();
+        let key = MethodDescKey {
+            funcdesc_id: DescKey::from_rc(&md_borrow.funcdesc),
+            originclassdef: md_borrow.originclassdef,
+            selfclassdef: md_borrow.selfclassdef,
+            name: md_borrow.name.clone(),
+            flags: md_borrow
+                .flags
+                .iter()
+                .map(|(k, v)| (k.clone(), *v))
+                .collect(),
+        };
+        let cached_md = bk
+            .methoddescs
+            .borrow()
+            .get(&key)
+            .cloned()
+            .expect("producer should prime bookkeeper.methoddescs");
+        assert!(
+            Rc::ptr_eq(&cached_md, &md),
+            "primed entry should be the same MethodDesc rc as the originally-minted one",
+        );
+
+        // The legacy `classdef_impl_types` side-table still carries the
+        // cached qualified `classdef.name` for the existing
+        // string-keyed dispatch. PRE-EXISTING-ADAPTATION; retired when
+        // `trait_method_graphs` is re-keyed on MethodDesc identity.
+        assert_eq!(
+            callcontrol.classdef_impl_type_for_test(classdef_key),
+            Some("PyFrame"),
+        );
     }
 }

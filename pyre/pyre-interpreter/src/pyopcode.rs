@@ -1479,11 +1479,18 @@ where
 
         Instruction::LoadFast { var_num } | Instruction::LoadFastBorrow { var_num } => {
             let idx = var_num.get(op_arg).as_usize();
-            let name = code
-                .varnames
-                .get(idx)
-                .map(|s| s.as_ref())
-                .unwrap_or("<cell>");
+            // closure-free, Option-pattern-free `varnames.get(idx)` rewrite to
+            // keep the body within the Rust-AST adapter's RPython-orthodox
+            // subset (Position-2 adaptation per the annotator-monomorphization
+            // plan; RPython has no closure or sum-type-destructure analogue
+            // at the annotator layer). The bounds check stays a plain `<`
+            // comparison + indexed access so the lowered op sequence stays
+            // `lt + getitem` rather than walking into an `Option<&str>` enum.
+            let name = if idx < code.varnames.len() {
+                code.varnames[idx].as_ref()
+            } else {
+                "<cell>"
+            };
             executor.load_fast_checked(idx, name)?;
             Ok(StepResult::Continue)
         }
@@ -1508,11 +1515,13 @@ where
 
         Instruction::LoadFastCheck { var_num } => {
             let idx = var_num.get(op_arg).as_usize();
-            let name = code
-                .varnames
-                .get(idx)
-                .map(|s| s.as_ref())
-                .unwrap_or("<cell>");
+            // closure-free, Option-pattern-free rewrite — see LoadFast above
+            // for the rationale.
+            let name = if idx < code.varnames.len() {
+                code.varnames[idx].as_ref()
+            } else {
+                "<cell>"
+            };
             executor.load_fast_checked(idx, name)?;
             Ok(StepResult::Continue)
         }
@@ -1831,7 +1840,12 @@ where
             let oparg_val = u32::from(format.get(op_arg));
             let has_format_spec = (oparg_val & 1) != 0;
             if has_format_spec {
-                let _ = executor.pop_value()?;
+                // `let _ = expr?` rewritten as a plain expression-statement to
+                // stay inside the Rust-AST adapter's RPython-orthodox subset
+                // (Position-2 adaptation; the adapter's `lower_let` accepts
+                // `Pat::Ident` / `Pat::Type(Pat::Ident)` only — there is no
+                // upstream analogue for binding `_`).
+                executor.pop_value()?;
             }
             // Stack: [value, expression_str] — wrap as a 2-tuple interpolation.
             OpcodeStepExecutor::build_tuple(executor, 2)?;
@@ -2089,11 +2103,16 @@ where
         // RustPython: frame.rs LoadSpecial, delegates to get_special_method.
         // Pyre: delegate to load_method with the special method name.
         Instruction::LoadSpecial { method } => {
+            // Last arm is `_` (covers `SpecialMethod::AExit`) so the
+            // Rust-AST adapter's variant cascade has the wildcard arm
+            // it needs to close the final isinstance fork (Position-2
+            // adaptation; the adapter cannot enumerate the variant
+            // universe from `syn::ItemFn` alone).
             let name = match method.get(op_arg) {
                 SpecialMethod::Enter => "__enter__",
                 SpecialMethod::Exit => "__exit__",
                 SpecialMethod::AEnter => "__aenter__",
-                SpecialMethod::AExit => "__aexit__",
+                _ => "__aexit__",
             };
             executor.load_method(name)?;
             Ok(StepResult::Continue)

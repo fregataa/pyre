@@ -998,29 +998,49 @@ fn lower_block(
                         lower_for(b, for_expr)?;
                         continue;
                     }
-                    // `if cond { body }` without `else` is a statement
-                    // producing `()` (upstream Python: `None` via the
-                    // implicit RETURN_VALUE on `if x: body` fallthrough
-                    // — `flowcontext.py:756 POP_JUMP_IF_FALSE`). Treat
-                    // it the same as while/loop: always a statement,
-                    // never a tail. When it IS the last stmt, the
-                    // function falls through to the implicit-None tail
-                    // handled by `lower_block`'s terminal fallback.
+                    // `if` / `if-else` at statement position. Two
+                    // sub-cases routed through this arm:
+                    //   - `!is_last` — not the block's tail. Rust
+                    //     requires the if-expression to be `()`-typed
+                    //     here, so its value (if any) is unused.
+                    //   - `semi.is_some()` — explicit trailing `;`
+                    //     discards the if-expression value regardless
+                    //     of position (including tail).
                     //
-                    // `lower_if_without_else` unconditionally falls
-                    // through (the Bool(false) exit shortcuts to
-                    // join, so join is always reachable), so it never
-                    // produces `Terminated` — but match structurally
-                    // so a future slice that tightens this invariant
-                    // forwards termination out of the enclosing block
-                    // correctly.
+                    // Upstream analogue (CPython 2.x bytecode for a
+                    // Python `if cond: body1 else: body2` statement):
+                    // `POP_JUMP_IF_FALSE` (`flowcontext.py:756`) +
+                    // body bytecodes + `JUMP_FORWARD`. Neither arm
+                    // pushes a value, so the join state's
+                    // `mergeable = locals_w + stack`
+                    // (`framestate.py:33`) carries no extra slot. We
+                    // therefore pass `produces_value=false` so
+                    // `lower_if` emits the join's `inputargs` from the
+                    // merged locals alone.
+                    //
+                    // `lower_if` returns `BlockExit::FallThrough` if at
+                    // least one arm falls through, `BlockExit::Terminated`
+                    // if every arm terminates via `return` — thread
+                    // termination out so a `return` inside an arm
+                    // closes the enclosing block correctly.
+                    Expr::If(if_expr) if !is_last || semi.is_some() => {
+                        // Body's tail value is discarded. Pass
+                        // `at_boundary=false` so the body never
+                        // collapses an Ok/Some/Err tail — there's no
+                        // return edge to feed.
+                        match lower_if(b, if_expr, false, false)? {
+                            BlockExit::FallThrough(_) => continue,
+                            BlockExit::Terminated => return Ok(BlockExit::Terminated),
+                        }
+                    }
+                    // `if cond { body }` (without `else`) as the tail
+                    // statement of a `() -> ()` block. The body's
+                    // value is always `()`, so the if-without-else
+                    // lowering (`lower_if_without_else`) already
+                    // returns `Constant(None)` without growing the
+                    // value stack — no `produces_value` flag needed.
                     Expr::If(if_expr) if if_expr.else_branch.is_none() => {
-                        // `if cond { body }` as a statement: body's
-                        // tail value is discarded (the join produces
-                        // implicit None). Pass `at_boundary=false` so
-                        // the body never collapses an Ok/Some/Err
-                        // tail — there's no return edge to feed.
-                        match lower_if(b, if_expr, false)? {
+                        match lower_if(b, if_expr, false, false)? {
                             BlockExit::FallThrough(_) => continue,
                             BlockExit::Terminated => return Ok(BlockExit::Terminated),
                         }
@@ -1503,7 +1523,7 @@ fn lower_expr(b: &mut Builder, expr: &Expr) -> Result<Hlvalue, AdapterError> {
         // `simple_call(<host class>, x)` op (or stays a Constant)
         // instead of being collapsed by Slice O4. The collapse is
         // upstream-orthodox only at the function-return edge.
-        Expr::If(if_expr) => match lower_if(b, if_expr, false)? {
+        Expr::If(if_expr) => match lower_if(b, if_expr, false, true)? {
             BlockExit::FallThrough(v) => Ok(v),
             // Every branch terminated via `return` — the if-
             // expression has no reachable value. Upstream bytecode
@@ -1770,10 +1790,17 @@ fn lower_else_arm(
     b: &mut Builder,
     else_expr: &Expr,
     at_boundary: bool,
+    produces_value: bool,
 ) -> Result<BlockExit, AdapterError> {
     match else_expr {
+        // The block's tail value is discarded by the enclosing `lower_if`
+        // when `produces_value` is `false`, so the inner lowering can
+        // proceed unchanged — only the join shape (built by `lower_if`)
+        // depends on `produces_value`.
         Expr::Block(block_expr) => lower_block(b, &block_expr.block, at_boundary),
-        Expr::If(nested_if) => lower_if(b, nested_if, at_boundary),
+        // Chained `else if` inherits the outer if-expression's value-
+        // position status so the nested join matches the outer shape.
+        Expr::If(nested_if) => lower_if(b, nested_if, at_boundary, produces_value),
         _ => Err(AdapterError::Unsupported {
             reason: "`else` branch is neither a block nor an `if` — syn's grammar \
                 should forbid this; if it fires, please file a bug citing the \
@@ -1783,10 +1810,31 @@ fn lower_else_arm(
     }
 }
 
+/// Lower an `if-else` expression.
+///
+/// `produces_value` distinguishes value-position from statement-position
+/// uses, mirroring upstream's framestate discipline:
+///
+/// - `true` (value position): the join receives the if-expression's
+///   value via a `tail_var` slot at the head of its inputargs, and
+///   each arm's outgoing Link prepends its arm-tail value. Upstream
+///   bytecode analogue: arms push a value before the join (e.g.
+///   ternary `x if c else y` emits `LOAD x` / `LOAD y` in each arm
+///   before `JUMP_FORWARD` to the join PC).
+/// - `false` (statement position): the join carries only the merged
+///   locals — no value-stack slot. Upstream
+///   `framestate.py:33 mergeable = locals_w + stack` merges locals
+///   and stack as-is; a statement-position `if cond: body1 else: body2`
+///   in CPython 2.x bytecode is `POP_JUMP_IF_FALSE` + body bytecodes
+///   + `JUMP_FORWARD`, where neither arm pushes a value, so the join
+///   framestate's stack equals the pre-fork stack with no growth. The
+///   `Constant(None)` returned here mirrors the implicit-`None` value
+///   convention used by `lower_if_without_else`.
 fn lower_if(
     b: &mut Builder,
     if_expr: &ExprIf,
     at_boundary: bool,
+    produces_value: bool,
 ) -> Result<BlockExit, AdapterError> {
     // 1. Evaluate condition into the current block, then coerce via
     //    `bool(cond)` — mirrors upstream POP_JUMP_IF_FALSE at
@@ -1798,7 +1846,10 @@ fn lower_if(
 
     // Extract the else-less path early so the rest of `lower_if` can
     // assume `else_expr` is present; the common `bool(cond)` +
-    // locals-snapshot steps are shared.
+    // locals-snapshot steps are shared. `lower_if_without_else`
+    // never grows the value stack (statement-form analogue) and
+    // returns `Constant(None)` as the if-expression's value, so the
+    // `produces_value` distinction does not apply to its shape.
     let Some((_else_tok, else_expr)) = &if_expr.else_branch else {
         return lower_if_without_else(b, cond, &if_expr.then_branch);
     };
@@ -1823,7 +1874,7 @@ fn lower_if(
         if value {
             return lower_block(b, &if_expr.then_branch, at_boundary);
         }
-        return lower_else_arm(b, else_expr, at_boundary);
+        return lower_else_arm(b, else_expr, at_boundary, produces_value);
     }
 
     // 2. Snapshot state at the fork point. Upstream `FrameState.copy()`
@@ -1885,7 +1936,7 @@ fn lower_if(
         ops: Vec::new(),
         locals: else_locals,
     });
-    let else_exit = lower_else_arm(b, else_expr, at_boundary)?;
+    let else_exit = lower_else_arm(b, else_expr, at_boundary, produces_value)?;
     let else_capture = capture_arm_exit(b, else_exit);
 
     // 7. Fork the post-branch wiring by which arms fell through.
@@ -1905,17 +1956,33 @@ fn lower_if(
         (Some(cap), None) | (None, Some(cap)) => {
             // Exactly one branch reached the post-if PC. Build a
             // single-predecessor join: the branch's tail value is the
-            // if-expression's value, and its locals snapshot feeds
-            // the join's inputargs.
-            let (_join_block, tail_var) = build_if_join_block(&merged_names, b, &cap);
+            // if-expression's value (only when `produces_value`), and
+            // its locals snapshot feeds the join's inputargs.
+            let (_join_block, tail_var) =
+                build_if_join_block(&merged_names, b, &cap, produces_value);
             Ok(BlockExit::FallThrough(tail_var))
         }
         (Some(then_cap), Some(else_cap)) => {
             // Canonical case — both branches reach the join.
-            // inputargs = [tail_var, local_var_0, …].
-            let tail_var = Hlvalue::Variable(Variable::new());
-            let mut join_inputargs: Vec<Hlvalue> = Vec::with_capacity(merged_names.len() + 1);
-            join_inputargs.push(tail_var.clone());
+            // Inputargs shape:
+            //  - `produces_value`: [tail_var, local_var_0, ...]
+            //  - statement form:   [local_var_0, ...] (no tail slot)
+            // The latter mirrors upstream
+            // `framestate.py:33 mergeable = locals_w + stack` for a
+            // statement `if cond: body1 else: body2` where neither arm
+            // pushes a value (POP_JUMP_IF_FALSE + JUMP_FORWARD pair,
+            // `flowcontext.py:756`).
+            let tail_var = if produces_value {
+                Some(Hlvalue::Variable(Variable::new()))
+            } else {
+                None
+            };
+            let tail_extra = if tail_var.is_some() { 1 } else { 0 };
+            let mut join_inputargs: Vec<Hlvalue> =
+                Vec::with_capacity(merged_names.len() + tail_extra);
+            if let Some(t) = &tail_var {
+                join_inputargs.push(t.clone());
+            }
             let mut join_locals: HashMap<String, Hlvalue> = HashMap::new();
             for name in &merged_names {
                 let fresh = Hlvalue::Variable(Variable::named(name));
@@ -1927,9 +1994,15 @@ fn lower_if(
             // Close each arm's tail block with a Link into the join.
             // `branch_link_args` reads from the arm's locals snapshot
             // — branch-local `let` bindings (names absent from
-            // merged_names) never reach the join.
+            // merged_names) never reach the join. `tail_var.is_some()`
+            // toggles the head-slot prepend so the link's arity matches
+            // the join's inputargs.
             {
-                let link_args = branch_link_args(&then_cap.tail, &merged_names, &then_cap.locals);
+                let link_args = branch_link_args(
+                    tail_var.as_ref().map(|_| &then_cap.tail),
+                    &merged_names,
+                    &then_cap.locals,
+                );
                 let link = Rc::new(RefCell::new(Link::new(
                     link_args,
                     Some(join_block.clone()),
@@ -1939,7 +2012,11 @@ fn lower_if(
                 then_cap.block.closeblock(vec![link]);
             }
             {
-                let link_args = branch_link_args(&else_cap.tail, &merged_names, &else_cap.locals);
+                let link_args = branch_link_args(
+                    tail_var.as_ref().map(|_| &else_cap.tail),
+                    &merged_names,
+                    &else_cap.locals,
+                );
                 let link = Rc::new(RefCell::new(Link::new(
                     link_args,
                     Some(join_block.clone()),
@@ -1954,7 +2031,9 @@ fn lower_if(
                 ops: Vec::new(),
                 locals: join_locals,
             });
-            Ok(BlockExit::FallThrough(tail_var))
+            Ok(BlockExit::FallThrough(tail_var.unwrap_or_else(|| {
+                Hlvalue::Constant(Constant::new(ConstValue::None))
+            })))
         }
     }
 }
@@ -1971,10 +2050,18 @@ fn build_if_join_block(
     merged_names: &[String],
     b: &mut Builder,
     cap: &ArmCapture,
+    produces_value: bool,
 ) -> (BlockRef, Hlvalue) {
-    let tail_var = Hlvalue::Variable(Variable::new());
-    let mut join_inputargs: Vec<Hlvalue> = Vec::with_capacity(merged_names.len() + 1);
-    join_inputargs.push(tail_var.clone());
+    let tail_var = if produces_value {
+        Some(Hlvalue::Variable(Variable::new()))
+    } else {
+        None
+    };
+    let tail_extra = if tail_var.is_some() { 1 } else { 0 };
+    let mut join_inputargs: Vec<Hlvalue> = Vec::with_capacity(merged_names.len() + tail_extra);
+    if let Some(t) = &tail_var {
+        join_inputargs.push(t.clone());
+    }
     let mut join_locals: HashMap<String, Hlvalue> = HashMap::new();
     for name in merged_names {
         let fresh = Hlvalue::Variable(Variable::named(name));
@@ -1984,8 +2071,13 @@ fn build_if_join_block(
     let join_block = Block::shared(join_inputargs);
 
     // Close the surviving arm's tail block with the one-and-only Link
-    // into the join.
-    let link_args = branch_link_args(&cap.tail, merged_names, &cap.locals);
+    // into the join. `tail` is `None` for statement form so the link
+    // arity matches the join's `merged_names`-only inputargs.
+    let link_args = branch_link_args(
+        tail_var.as_ref().map(|_| &cap.tail),
+        merged_names,
+        &cap.locals,
+    );
     let link = Rc::new(RefCell::new(Link::new(
         link_args,
         Some(join_block.clone()),
@@ -2000,7 +2092,8 @@ fn build_if_join_block(
         ops: Vec::new(),
         locals: join_locals,
     });
-    (join_block, tail_var)
+    let tail_value = tail_var.unwrap_or_else(|| Hlvalue::Constant(Constant::new(ConstValue::None)));
+    (join_block, tail_value)
 }
 
 /// Lower `if cond { body }` without an `else` branch.
@@ -2297,7 +2390,7 @@ fn lower_short_circuit(
     let rhs_exit_block = b.current.block.clone();
     let rhs_exit_ops = std::mem::take(&mut b.current.ops);
     let rhs_exit_locals = std::mem::take(&mut b.current.locals);
-    let rhs_link_args = branch_link_args(&rhs_raw, &merged_names, &rhs_exit_locals);
+    let rhs_link_args = branch_link_args(Some(&rhs_raw), &merged_names, &rhs_exit_locals);
     let rhs_to_join = Rc::new(RefCell::new(Link::new(
         rhs_link_args,
         Some(join_block.clone()),
@@ -2520,19 +2613,28 @@ fn branch_block_with_inputargs(merged_names: &[String]) -> (BlockRef, HashMap<St
 
 /// Build the `Link.args` a branch carries into the join block.
 ///
-/// Head slot: the branch's tail expression value.
+/// Head slot (optional): the branch's tail expression value when the
+/// join carries a value-stack slot. `None` for statement-position
+/// joins — upstream `framestate.py:33 mergeable = locals_w + stack`
+/// merges locals and stack as-is, and a statement `if cond: body
+/// else: body` (`flowcontext.py:756` POP_JUMP_IF_FALSE +
+/// JUMP_FORWARD) leaves the stack unchanged across the join.
+///
 /// Tail slots: one per merged local name, in the caller-provided
 /// order. Each slot holds the branch's current SSA value for that
 /// name. `merged_names` is sourced from the pre-fork locals, so every
 /// name is guaranteed to be present in `branch_locals` because every
 /// branch inherits the full pre-fork set on entry.
 fn branch_link_args(
-    tail: &Hlvalue,
+    tail: Option<&Hlvalue>,
     merged_names: &[String],
     branch_locals: &HashMap<String, Hlvalue>,
 ) -> Vec<Hlvalue> {
-    let mut out = Vec::with_capacity(merged_names.len() + 1);
-    out.push(tail.clone());
+    let tail_extra = if tail.is_some() { 1 } else { 0 };
+    let mut out = Vec::with_capacity(merged_names.len() + tail_extra);
+    if let Some(t) = tail {
+        out.push(t.clone());
+    }
     for name in merged_names {
         let value = branch_locals
             .get(name)
@@ -2619,7 +2721,7 @@ fn lower_arm_body(
         // function's return value continues to collapse Ok/Some/Err
         // tails per the Slice O4 PRE-EXISTING-ADAPTATION.
         Expr::Block(block_expr) => lower_block(b, &block_expr.block, at_boundary),
-        Expr::If(if_expr) => lower_if(b, if_expr, at_boundary),
+        Expr::If(if_expr) => lower_if(b, if_expr, at_boundary, true),
         Expr::Match(match_expr) => lower_match(b, match_expr, at_boundary),
         // `return` is itself a boundary site regardless of context;
         // `lower_return` routes through `lower_value_boundary` directly.
@@ -2825,7 +2927,7 @@ fn lower_match(
     // 9. Close each surviving arm's exit block with a Link into the
     //    join.
     for cap in arm_captures.into_iter().flatten() {
-        let link_args = branch_link_args(&cap.tail, &merged_names, &cap.locals);
+        let link_args = branch_link_args(Some(&cap.tail), &merged_names, &cap.locals);
         let link = Rc::new(RefCell::new(Link::new(
             link_args,
             Some(join_block.clone()),

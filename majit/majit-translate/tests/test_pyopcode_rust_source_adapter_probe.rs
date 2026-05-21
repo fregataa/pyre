@@ -1,6 +1,5 @@
 //! Probe: run the Rust-AST adapter on the real
-//! `pyre-interpreter::execute_opcode_step` portal and capture the
-//! current rejection point.
+//! `pyre-interpreter::execute_opcode_step` portal.
 //!
 //! Serves the `M2.5e — pass the real pyopcode.rs through the adapter`
 //! milestone from the annotator-monomorphization plan (see
@@ -10,12 +9,14 @@
 //! with every opcode branch represented and every method call carrying
 //! a resolvable receiver classdef.
 //!
-//! Today the adapter stops at the first `AdapterError::Unsupported`
-//! that comes out of walking the function body. This test pins the
-//! exact category of that stop so regressions surface early, and so
-//! future adapter extensions have a visible "does it get further now?"
-//! signal: every M2.5d/e slice that lands should either move the
-//! rejection point deeper into the body or eliminate it.
+//! Status (2026-05-17, post Epic #94 Slice 6 + `Expr::If` statement-
+//! position generalization): the with-walker oracle now asserts the
+//! adapter lowers `execute_opcode_step` end-to-end. The without-
+//! walker oracle still rejects at the cast-removal helper layer
+//! (no per-module registry to resolve `u32_as_i64` &c through), and
+//! the signature-shape oracle continues to verify `validate_signature`
+//! independently. Regression detection: any of the three failing
+//! signals an upstream slice silently broke.
 //!
 //! RPython parity note: upstream `flowspace/objspace.py:38-53
 //! build_flow(func)` consumes Python bytecode end-to-end. The Rust-AST
@@ -46,7 +47,7 @@ fn find_fn<'a>(file: &'a File, name: &str) -> &'a syn::ItemFn {
 }
 
 #[test]
-fn adapter_rejects_execute_opcode_step_on_composite_match_pattern() {
+fn adapter_accepts_execute_opcode_step_when_walker_registers_module() {
     let file = parse_pyopcode();
     let func = find_fn(&file, "execute_opcode_step");
 
@@ -218,97 +219,65 @@ fn adapter_rejects_execute_opcode_step_on_composite_match_pattern() {
     //   helpers requires the closure rejection to lift first, so
     //   the probe re-pins to the closure stuck point.
 
-    // Current rejection state (post-Epic-B-Slice-5): walker
-    // registers `Item::Enum` / `Item::Struct` / `Item::Const` /
-    // `Item::Fn` (eagerly via `d126c8d16d7`'s prebuilt-graph
-    // path). `u32_as_i64` registers cleanly because its body now
-    // calls `i64::from(x)` (no `as`). The walker progresses past
-    // the helper into the closure expression at the next un-
-    // roadmapped body construct.
+    // 2026-05-17 — Epic #94 Slice 6 (closure-free LoadFast/LoadFastCheck
+    // varnames lookup + `let _ = expr?;` rewrite + LoadSpecial wildcard
+    // tail arm) plus the `Expr::If` statement-position generalization in
+    // `lower_block` advanced the walker past every previously-pinned
+    // stuck point. The Position-2 adapter now lowers
+    // `execute_opcode_step` end-to-end when invoked alongside the
+    // module-globals walker. This is the M2.5e end-to-end milestone
+    // from `annotator-monomorphization-tier1-abstract-lake.md`.
     //
-    // The probe pins this state strictly:
+    // Timeline (the rejection history this oracle previously pinned —
+    // each entry was a slice that moved the stuck point deeper, see
+    // earlier commits for the full chain): or-pattern → unit variant
+    // (`Pat::Path`) → rest-only composite → struct-variant field-
+    // binding cascade → wrapper-transparency O2/O3/O4/O5 → cast-
+    // removal Slice 3 helpers (`u32_as_i64` via `i64::from`) →
+    // closure in LoadFast → composite let-pattern → if-else as
+    // statement → `let _ = expr?` → variant-cascade wildcard tail
+    // arm. Closing the last items advanced the walker past the
+    // function's terminal arm.
     //
-    // - `Unsupported(closure)` in `execute_opcode_step` is the
-    //   post-Epic-B-Slice-5 expected state — the walker walked
-    //   past the cast-removal helper layer.
-    // - `UnboundLocal { name }` in the cast-removal helper set
-    //   would mean Item::Fn registration regressed (the walker
-    //   stopped registering helpers eagerly, rolling back to the
-    //   pre-`d126c8d16d7` Issue-1.2 state).
-    // - Any earlier `Unsupported` reason (or-pattern, variant-
-    //   path, composite, field-bindings, qualified-path, numeric-
-    //   cast) means an O3/O4/O5/M2.5d slice silently regressed.
+    // The probe pins the **success** state strictly:
     //
-    // Either way the change is a deliberate, audited progression
-    // and not a silent slip.
-    // Issue 1.3 (per-module scoping): `register_rust_module` mints
-    // a fresh `ModuleId` and returns it; `build_flow_from_rust_in_module`
-    // threads the same id through body lowering so the cascade's
-    // `LOAD_GLOBAL` resolutions hit the just-walked partition.
-    // (Pre-Issue-1.3, the registry was process-global, so a separate
-    // `build_flow_from_rust(func)` call after `register_rust_module(&file)`
-    // saw the same registry — that path no longer exists; the id
-    // must be threaded explicitly.)
+    // - `build_flow_from_rust_in_module` returns Ok(graph) for
+    //   `execute_opcode_step` after `register_rust_module` has
+    //   populated the per-module registry.
+    // - The resulting `FunctionGraph` carries multiple blocks (the
+    //   outer `match instruction` cascade) and `checkgraph` passes.
+    // - If this regresses to an `Err(_)`, an intermediate slice
+    //   silently broke; treat as a parity regression and locate the
+    //   slice via the error message.
+    //
+    // Per-module scoping (Issue 1.3, 2026-05-05):
+    // `register_rust_module` mints a fresh `ModuleId` and returns it;
+    // `build_flow_from_rust_in_module` threads the same id through
+    // body lowering so the cascade's `LOAD_GLOBAL` resolutions hit
+    // the just-walked partition.
     let file_for_walker = parse_pyopcode();
     let module_id = register_rust_module(&file_for_walker).expect("walker must succeed");
-    let err = build_flow_from_rust_in_module(func, module_id)
-        .err()
-        .expect(
-            "adapter still has un-roadmapped constructs to walk past — see post-Epic-B-Slice-5 timeline",
-        );
-    match err {
-        AdapterError::Unsupported { reason } => {
-            assert!(
-                reason.contains("closure"),
-                "post-Epic-B-Slice-5 state expects `Unsupported(closure ...)` after \
-                 the walker walked past the cast-removal helper layer; got \
-                 {reason:?}. If a different `Unsupported` reason surfaces, an \
-                 intermediate slice (M2.5d struct/tuple/cascade or O3/O4/O5 \
-                 host-env resolution) may have silently regressed. Re-pin \
-                 explicitly when a new construct unlocks past the closure."
-            );
-            eprintln!(
-                "adapter rejection at post-Epic-B-Slice-5 probe: Unsupported({reason}) — expected"
-            );
-        }
-        AdapterError::UnboundLocal { name } => {
-            const CAST_REMOVAL_SLICE3_HELPERS: &[&str] = &[
-                "u32_as_i64",
-                "u32_as_usize",
-                "op_arg_as_usize",
-                "raise_kind_as_usize",
-            ];
-            // If this branch hits at one of the helpers, eager
-            // Item::Fn registration regressed — Epic B Slice 5
-            // expected `u32_as_i64` to register cleanly via
-            // `d126c8d16d7`'s prebuilt-graph walker path.
-            // Surfacing one of the unrewritten helpers
-            // (`u32_as_usize` / `op_arg_as_usize` /
-            // `raise_kind_as_usize`) means walker rejection on
-            // their `as T` body is now blocking before reaching
-            // the closure — that's NOT the post-Epic-B-Slice-5
-            // state because they're encountered AFTER the
-            // closure-bearing arm in source order.
-            if CAST_REMOVAL_SLICE3_HELPERS.contains(&name.as_str()) {
-                panic!(
-                    "PARITY REGRESSION: probe expected `Unsupported(closure ...)` \
-                     (post-Epic-B-Slice-5 state) but adapter rejected with \
-                     `UnboundLocal({name})`. Either eager Item::Fn registration \
-                     regressed past `d126c8d16d7` OR the `u32_as_i64` body \
-                     rewrite (`x as i64` → `i64::from(x)`) was reverted. See \
-                     timeline above."
-                );
-            }
-            panic!(
-                "unexpected `UnboundLocal({name})`: the post-Epic-B-Slice-5 \
-                 state expects `Unsupported(closure)`. If `{name}` is a new \
-                 helper that should resolve via the walker, register it with \
-                 the appropriate Item::Fn body shape; otherwise this is a \
-                 silent slip and must be investigated."
-            );
-        }
-        other => panic!("expected AdapterError::Unsupported, got {other:?}"),
-    }
+    let graph = build_flow_from_rust_in_module(func, module_id)
+        .expect("Position-2 adapter lowers execute_opcode_step end-to-end (M2.5e milestone)");
+    majit_translate::flowspace::model::checkgraph(&graph);
+    // Structural sanity: the outer `match instruction` produces a
+    // cascade of blocks (one isinstance fork per non-wildcard arm),
+    // so the resulting graph must carry strictly more than the
+    // startblock + returnblock pair a constant-return function
+    // produces.
+    let block_count = graph.iterblocks().len();
+    assert!(
+        block_count > 2,
+        "execute_opcode_step's outer match cascade must materialize \
+         multiple blocks; got block_count={block_count} (a 2-block \
+         graph would mean the body lowered to a single constant)"
+    );
+    // The exact statement-position `if/else` join shape is pinned by
+    // `statement_position_if_else_join_has_only_merged_local_inputargs`
+    // in `test_rust_source_adapter_through_build_types.rs`. Keep this
+    // real-portal probe focused on end-to-end adapter acceptance so it
+    // does not reject legitimate value-position joins whose result is
+    // unused by later code.
 }
 
 #[test]
