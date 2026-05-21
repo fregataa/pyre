@@ -15,7 +15,7 @@ PyPy v7.3.22: release of python 2.7, 3.11, released 2026-xx-xx
 
 The PyPy team is proud to release version 7.3.23 of PyPy after the previous
 release on April 26, 2026. This is a bug-fix release that fixes an overeager
-warning about unused coroutines, and some problems around multiple inheritence
+warning about unused coroutines, and some problems around multiple inheritance
 in c-extensions.
 
 The release includes two different interpreters:
