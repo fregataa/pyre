@@ -1382,8 +1382,8 @@ def check_and_find_best_base(space, bases_w, is_cpytype=False):
     return w_bestbase
 
 def _layouts_equivalent(l1, l2):
-    """Return True if two Layout objects are structurally identical — same
-    typedef, nslots, slot names, and base chain — but are different Python
+    """Return True if two Layout objects are structurally identical - same
+    typedef, nslots, slot names, and base chain - but are different Python
     objects because force_new_layout created them independently.
 
     Used to allow multiple inheritance between two cpytypes that have the same
