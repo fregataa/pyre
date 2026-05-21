@@ -2220,12 +2220,27 @@ fn allocate_loop_header_phis(
     must_merge: &LoopBodyLocals,
 ) -> Vec<String> {
     let mut header_phi_names = Vec::new();
-    for (slot_idx, entry_vid) in pre_loop_snapshot
-        .entries
+    // Walk `pre_loop_snapshot.locals_w` per upstream
+    // `framestate.py:19 self.locals_w` — pyre's `getstate` populates
+    // the `Hlvalue` carrier in lockstep with `entries`, so the walk is
+    // bit-identical to a `pre_loop_snapshot.entries` traversal while
+    // keeping the read side in agreement with the upstream source of
+    // truth.  Materialise the (slot_idx, vid) pairs up front so the
+    // immutable `graph` borrow held by `locals_w_view` (derivation
+    // fallback through `graph.variable`) releases before the mutable
+    // `push_op` / `push_inputarg` / `block_mut` calls below.
+    let pre_loop_pairs: Vec<(usize, ValueId)> = pre_loop_snapshot
+        .locals_w_view(graph)
         .iter()
         .enumerate()
-        .filter_map(|(i, e)| e.map(|vid| (i, vid)))
-    {
+        .filter_map(|(i, slot)| match slot {
+            Some(crate::flowspace::model::Hlvalue::Variable(v)) => {
+                graph.value_id_of(v).map(|vid| (i, vid))
+            }
+            _ => None,
+        })
+        .collect();
+    for (slot_idx, entry_vid) in pre_loop_pairs {
         let name = &ctx.local_first_bind_order[slot_idx];
         // `flowcontext.py:430 mergeblock` allocates a phi for every
         // mergeable local; `simplify.transform_dead_op_vars` then
@@ -2917,13 +2932,21 @@ fn lazy_install_local_at_current_block(
         // `ctx.exit_snapshots` HashMap is gone.  RPython parity:
         // `flowspace/flowcontext.py:38 SpamBlock.framestate`.
         let snap_vid = {
-            let snap = graph.block(*pred_block).framestate.as_ref()?;
             // `framestate.py:locals_w` is a positional slot vector;
             // resolve `name → slot_idx` via the graph-wide first-bind
             // order, mirroring upstream's `co_varnames.index(name)`
-            // lookup pattern.
+            // lookup pattern.  Consult `snap.locals_w` per upstream's
+            // source of truth — pyre's `getstate` populates the
+            // `Hlvalue` carrier in lockstep with `entries`, so a
+            // `locals_w`-driven lookup recovers the same ValueId.
             let slot_idx = ctx.local_first_bind_order.iter().position(|n| n == name)?;
-            snap.entries.get(slot_idx).copied().flatten()?
+            let snap = graph.block(*pred_block).framestate.as_ref()?;
+            let view = snap.locals_w_view(graph);
+            let cell = view.get(slot_idx)?;
+            match cell {
+                Some(crate::flowspace::model::Hlvalue::Variable(v)) => graph.value_id_of(v)?,
+                _ => return None,
+            }
         };
         let needs_recurse = !value_id_defined_in_block(graph, snap_vid, *pred_block);
         // Type folds across predecessors via the wildcard rule:
@@ -4076,8 +4099,17 @@ fn lower_if_expr(
                  stack / last_exception / blocklist / next_offset are vestigial \
                  (framestate.py:78 None-return reachable only post-Z4 walker)",
         );
-        for (slot_idx, slot) in merged.entries.iter().enumerate() {
-            if slot.is_some() {
+        // Locals projection walks `merged.locals_w` per upstream
+        // `framestate.py:19 self.locals_w` — pyre's `union` populates
+        // the `Hlvalue` carrier in lockstep with `entries`, so this
+        // walk is bit-identical to a `merged.entries` traversal while
+        // keeping the read side in agreement with the upstream source
+        // of truth.  Materialise the view once and reuse across the
+        // None-kill + phi-install passes.
+        let merged_locals_w = merged.locals_w_view(graph);
+        let then_locals_w = then_exit_snapshot.locals_w_view(graph);
+        for (slot_idx, slot) in merged_locals_w.iter().enumerate() {
+            if matches!(slot, Some(crate::flowspace::model::Hlvalue::Variable(_))) {
                 continue;
             }
             if let Some(name) = ctx.local_first_bind_order.get(slot_idx).cloned() {
@@ -4085,13 +4117,31 @@ fn lower_if_expr(
                 ctx.local_value_types.remove(&name);
             }
         }
-        for (slot_idx, slot_vid) in merged
-            .entries
+        // Materialise (slot_idx, merged_vid, then_vid) tuples up front
+        // so the immutable `graph` borrow inside the locals_w walk
+        // releases before the mutable `lazy_install_local_at_current_block`
+        // call below.
+        let phi_candidates: Vec<(usize, ValueId, Option<ValueId>)> = merged_locals_w
             .iter()
             .enumerate()
-            .filter_map(|(i, e)| e.map(|vid| (i, vid)))
-        {
-            let then_vid = then_exit_snapshot.entries.get(slot_idx).copied().flatten();
+            .filter_map(|(i, slot)| match slot {
+                Some(crate::flowspace::model::Hlvalue::Variable(v)) => {
+                    graph.value_id_of(v).map(|vid| {
+                        let then_vid = then_locals_w.get(i).and_then(|slot| match slot {
+                            Some(crate::flowspace::model::Hlvalue::Variable(v)) => {
+                                graph.value_id_of(v)
+                            }
+                            _ => None,
+                        });
+                        (i, vid, then_vid)
+                    })
+                }
+                _ => None,
+            })
+            .collect();
+        drop(merged_locals_w);
+        drop(then_locals_w);
+        for (slot_idx, slot_vid, then_vid) in phi_candidates {
             let is_fresh_phi = then_vid != Some(slot_vid);
             if is_fresh_phi {
                 let name = ctx.local_first_bind_order[slot_idx].clone();
@@ -5736,8 +5786,17 @@ fn lower_expr(
                 // counterpart).  Convergence: same as If/else —
                 // annotator/rtyper port handles type unification at
                 // its proper layer.
-                for (slot_idx, slot) in merged.entries.iter().enumerate() {
-                    if slot.is_some() {
+                // Locals projection walks `merged.locals_w` per
+                // upstream `framestate.py:19 self.locals_w` — pyre's
+                // `union` populates the `Hlvalue` carrier in lockstep
+                // with `entries`, so the walk is bit-identical while
+                // keeping the read side in agreement with the upstream
+                // source of truth.  Materialise the view once and
+                // reuse across the None-kill + phi-install passes.
+                let merged_locals_w = merged.locals_w_view(graph);
+                let first_arm_locals_w = first_arm.locals_w_view(graph);
+                for (slot_idx, slot) in merged_locals_w.iter().enumerate() {
+                    if matches!(slot, Some(crate::flowspace::model::Hlvalue::Variable(_))) {
                         continue;
                     }
                     // None-kill: resolve `slot_idx → name` via
@@ -5749,13 +5808,32 @@ fn lower_expr(
                         ctx.local_value_types.remove(&name);
                     }
                 }
-                for (slot_idx, slot_vid) in merged
-                    .entries
+                // Materialise (slot_idx, merged_vid, first_arm_vid)
+                // tuples up front so the immutable `graph` borrow inside
+                // the locals_w walk releases before
+                // `lazy_install_local_at_current_block`'s mutable call.
+                let phi_candidates: Vec<(usize, ValueId, Option<ValueId>)> = merged_locals_w
                     .iter()
                     .enumerate()
-                    .filter_map(|(i, e)| e.map(|vid| (i, vid)))
-                {
-                    let first_vid = first_arm.entries.get(slot_idx).copied().flatten();
+                    .filter_map(|(i, slot)| match slot {
+                        Some(crate::flowspace::model::Hlvalue::Variable(v)) => {
+                            graph.value_id_of(v).map(|vid| {
+                                let first_vid =
+                                    first_arm_locals_w.get(i).and_then(|slot| match slot {
+                                        Some(crate::flowspace::model::Hlvalue::Variable(v)) => {
+                                            graph.value_id_of(v)
+                                        }
+                                        _ => None,
+                                    });
+                                (i, vid, first_vid)
+                            })
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                drop(merged_locals_w);
+                drop(first_arm_locals_w);
+                for (slot_idx, slot_vid, first_vid) in phi_candidates {
                     let is_fresh_phi = first_vid != Some(slot_vid);
                     if is_fresh_phi {
                         let name = ctx.local_first_bind_order[slot_idx].clone();

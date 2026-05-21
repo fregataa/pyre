@@ -1210,7 +1210,7 @@ impl FrameState {
     /// derivation mirrors what `FrameState::union` and
     /// `GraphBuildContext::getstate` already do, so the result is
     /// bit-identical to the carrier they would have produced.
-    fn locals_w_view<'a>(
+    pub(crate) fn locals_w_view<'a>(
         &'a self,
         graph: &FunctionGraph,
     ) -> std::borrow::Cow<'a, [Option<crate::flowspace::model::Hlvalue>]> {
@@ -1343,44 +1343,57 @@ impl FrameState {
             Some(crate::flowspace::model::FSException::new(w_type, w_value))
         };
         // `framestate.py:79 locals = _union(self.locals_w, other.locals_w)`.
-        // Run LAST so `graph.alloc_value()` only fires when the
-        // failure-prone projections above have succeeded.
+        // Run LAST so the `ensure_variable_registered` cursor advance
+        // only fires when the failure-prone projections above have
+        // succeeded.
         //
-        // Pyre's `entries` carry `Option<ValueId>` (graph-local Hlvalue
-        // identity surrogate) instead of upstream `Option<Hlvalue>`;
-        // until Z2.5 (Hlvalue migration, subsumed into Z4.last) lands
-        // the per-slot match below stands in for upstream's polymorphic
-        // `union(w1, w2)` (`framestate.py:105-128`), specialised to the
-        // ValueId-identity domain — the ValueId-equal carry-through
-        // mirrors `if w1 == w2: return w1`, the None-kill mirrors
-        // `if w1 is None or w2 is None: return None`, and the fresh
-        // alloc mirrors `return Variable()` for unequal-but-defined
-        // cells.  ValueId-vs-ValueId never raises UnionError (no
-        // SpecTag analogue in pyre's locals projection), so the
-        // locals fold is total.
-        let len = std::cmp::max(self.entries.len(), other.entries.len());
-        let merged: Vec<Option<ValueId>> = (0..len)
+        // Direct line-by-line port: walk `self.locals_w` and
+        // `other.locals_w` positionally and dispatch each cell pair
+        // through `flowspace::framestate::union` (Hlvalue-domain
+        // per-cell union — `framestate.py:105-128`).  Upstream
+        // `_union(seq1, seq2)` zips equal-length sequences; pyre's
+        // AST frontend can grow the locals projection across the
+        // sub-block boundary when a name is first bound on one side,
+        // so we extend to `max(len, len)` and treat the trailing
+        // unpadded slot as `None` (per-cell `union` returns
+        // `Ok(None)` when either side is `None`, matching upstream
+        // `framestate.py:110-111` undefined-local kill).
+        let self_view = self.locals_w_view(graph);
+        let other_view = other.locals_w_view(graph);
+        let len = std::cmp::max(self_view.len(), other_view.len());
+        // Per `framestate.py:78-89`, a `UnionError` raised by ANY
+        // per-cell `union(w1, w2)` is caught at the FrameState level
+        // and the whole `FrameState.union` returns `None`.  Collect
+        // into `Result<Vec<_>, UnionError>` and propagate failure via
+        // `.ok()?` so a SpecTag/FlowSignal disagreement in the locals
+        // projection aborts the merge rather than silently None-
+        // killing the offending slot.
+        let locals_w: Vec<Option<crate::flowspace::model::Hlvalue>> = (0..len)
             .map(|i| {
-                let s = self.entries.get(i).copied().flatten();
-                let o = other.entries.get(i).copied().flatten();
-                match (s, o) {
-                    (None, _) | (_, None) => None,
-                    (Some(s_vid), Some(o_vid)) if s_vid == o_vid => Some(s_vid),
-                    (Some(_), Some(_)) => Some(graph.alloc_value()),
-                }
+                let w1 = self_view.get(i).and_then(|c| c.as_ref());
+                let w2 = other_view.get(i).and_then(|c| c.as_ref());
+                crate::flowspace::framestate::union(w1, w2)
             })
-            .collect();
-        // `framestate.py:113-114 union` mints a fresh `Variable()` at
-        // every disagreeing-cell position in the stack / exception
-        // projections.  Pair each such Variable identity with a pyre
-        // ValueId so that when the merged FrameState later becomes a
-        // predecessor of another merge, the Hlvalue→ValueId bridge
-        // resolves without silently allocating a fresh slot at the
-        // read site.  The walker registers a Variable iff its identity
-        // is absent from both predecessors — carry-through Variables
-        // (`framestate.py:108 if w1 == w2: return w1`) are already
-        // registered at their upstream definition site and are
-        // skipped without touching the allocator cursor.
+            .collect::<Result<Vec<_>, _>>()
+            .ok()?;
+        drop(self_view);
+        drop(other_view);
+        // `framestate.py:113-114 union` mints a fresh `Variable()`
+        // at every disagreeing-cell position across the locals /
+        // stack / exception projections.  Pair each such Variable
+        // identity with a pyre ValueId so that when the merged
+        // FrameState later becomes a predecessor of another merge,
+        // the Hlvalue→ValueId bridge resolves without silently
+        // allocating a fresh slot at the read site.  Carry-through
+        // Variables (`framestate.py:108 if w1 == w2: return w1`)
+        // are already registered at their upstream definition site
+        // and `ensure_variable_registered`'s idempotent lookup
+        // leaves them alone.
+        for cell in locals_w.iter().flatten() {
+            if let crate::flowspace::model::Hlvalue::Variable(v) = cell {
+                graph.ensure_variable_registered(v);
+            }
+        }
         graph.register_phi_variables_in_stack_exc(
             &self.stack,
             &other.stack,
@@ -1389,28 +1402,30 @@ impl FrameState {
             &other.last_exception,
             &last_exception,
         );
-        // Derive the `Hlvalue` carrier in lockstep with `entries`.
-        // `graph.variable(vid)` returns the backing Variable at every
-        // defined slot (every ValueId minted via
-        // `alloc_value_with_variable` /
-        // `ensure_variable_registered` / rtyper handoff has one);
-        // `None` slots stay `None`.  Production read sites still
-        // consume `entries`; this parallel carrier exists so future
-        // substeps can swap them over slot-by-slot before flipping
-        // the construction direction.
-        let locals_w: Vec<Option<crate::flowspace::model::Hlvalue>> = merged
+        // Derive `entries` from `locals_w` — `locals_w` is now the
+        // primary carrier matching `framestate.py:19 self.locals_w`,
+        // and `entries` is a backward-compatibility view for callers
+        // that have not yet migrated.  `Hlvalue::Variable(v)` →
+        // `graph.value_id_of(v)` recovers the ValueId paired at
+        // either an upstream definition site or the
+        // `ensure_variable_registered` walk above;
+        // `Hlvalue::Constant(_)` cells carry no ValueId (Constants
+        // are not ValueId-bound in the pyre IR), so they collapse
+        // to `None` in the `entries` view — matching the prior
+        // ValueId-only locals fold's lossy projection on the few
+        // sites where a Constant could land in locals via
+        // `setstate`.
+        let entries: Vec<Option<ValueId>> = locals_w
             .iter()
             .map(|slot| {
-                slot.and_then(|vid| {
-                    graph
-                        .variable(vid)
-                        .cloned()
-                        .map(crate::flowspace::model::Hlvalue::Variable)
+                slot.as_ref().and_then(|hv| match hv {
+                    crate::flowspace::model::Hlvalue::Variable(v) => graph.value_id_of(v),
+                    crate::flowspace::model::Hlvalue::Constant(_) => None,
                 })
             })
             .collect();
         Some(FrameState {
-            entries: merged,
+            entries,
             locals_w,
             stack,
             last_exception,
@@ -3277,6 +3292,30 @@ impl FunctionGraph {
         target: BlockId,
         args: Vec<crate::flowspace::model::Variable>,
     ) {
+        // `flowspace/model.py:114 Link.__init__` asserts
+        // `len(args) == len(target.inputargs)` at construction time.
+        // `set_goto` is a production-only wrapper whose `target` is
+        // a fully-formed block (inputargs already populated by the
+        // caller path); enforce the assert here so a mismatch
+        // surfaces at the recloseblock site rather than as an
+        // unbalanced subst dict in `eliminate_empty_blocks`
+        // (`simplify.py:513`).  The inliner uses
+        // `set_control_flow_metadata` directly when threading
+        // remapped exits whose targets may transiently lack
+        // inputargs; that lower-level path intentionally bypasses
+        // this assert.
+        let target_inputarg_count = self.block(target).inputargs.len();
+        assert_eq!(
+            args.len(),
+            target_inputarg_count,
+            "set_goto: args.len() ({}) != target.inputargs.len() ({}) — \
+             block {:?} → target {:?} on graph {:?}",
+            args.len(),
+            target_inputarg_count,
+            block,
+            target,
+            self.name,
+        );
         let link = Link::from_variables(self, args, target, None);
         self.set_control_flow_metadata(block, None, vec![link]);
     }
@@ -3311,7 +3350,25 @@ impl FunctionGraph {
         target_state: &FrameState,
     ) {
         let outputargs = pred_state.getoutputargs(target_state, self);
-        // RPython `flowspace/model.py:114 Link.__init__` asserts
+        // Backfill ancestor-defined Variable args into `block`'s
+        // inputargs + predecessor link args via the eager-threading
+        // helper.  When `target_state.mergeable` carries a carry-through
+        // Variable (e.g. the function parameter `cond` that flows
+        // unchanged through both arms of an `if`), `getoutputargs`
+        // returns it as `LinkArg::Value(cond)` — but `block` may not
+        // define `cond` locally, so the Link.args would reference an
+        // undefined operand (`flowspace_adapter.rs:1324`).  Walking
+        // back through the predecessor chain to add `cond` as a
+        // `block.inputargs` entry restores the
+        // `flowspace/flowcontext.py:407-408 setstate(block.framestate)`
+        // shape that the AST walker doesn't produce eagerly (task #91
+        // prereq).
+        for arg in &outputargs {
+            if let LinkArg::Value(var) = arg {
+                self.ensure_variable_at_block(block, var);
+            }
+        }
+        // `flowspace/model.py:114 Link.__init__` asserts
         // `len(args) == len(target.inputargs)` at construction time.
         // Run the same check here so a framestate-driven recloseblock
         // catches the mismatch at the merge-close site rather than
@@ -3333,6 +3390,95 @@ impl FunctionGraph {
         self.set_control_flow_metadata(block, None, vec![link]);
     }
 
+    /// Backfill `var` as a definition reachable at `block`.
+    ///
+    /// Cycle-safe top-down: adds `var` to `block.inputargs` BEFORE
+    /// recursing into predecessors so a back-edge that reaches `block`
+    /// again finds the in-progress slot via
+    /// [`Self::variable_defined_in_block`] and short-circuits.  For
+    /// each predecessor edge `(pred_block, exit_idx)`, recursively
+    /// ensures `pred_block` defines `var`, then appends
+    /// `LinkArg::Value(var)` to `pred_block.exits[exit_idx].args` so
+    /// the arity invariant `len(link.args) == len(target.inputargs)`
+    /// is preserved.
+    ///
+    /// Returns `true` when `var` is now reachable at `block` (was
+    /// already defined, or newly threaded).  Returns `false` only when
+    /// `block` has no predecessors AND `var` is not defined locally
+    /// — a malformed graph state callers should treat as a bug.
+    ///
+    /// `flowspace/flowcontext.py:407-408 setstate(block.framestate)`
+    /// populates `block.inputargs` with all carry-through Variables at
+    /// block entry by walking top-down.  Pyre's AST walker doesn't do
+    /// this eagerly (task #91), so when a framestate-driven merge
+    /// (`create_block_from_framestate`) surfaces an ancestor-defined
+    /// Variable in `block.inputargs`, this helper backfills the
+    /// predecessor chain bottom-up to the same final graph shape.
+    pub fn ensure_variable_at_block(
+        &mut self,
+        block: BlockId,
+        var: &crate::flowspace::model::Variable,
+    ) -> bool {
+        if self.variable_defined_in_block(block, var) {
+            return true;
+        }
+        let pred_edges: Vec<(BlockId, usize)> = self
+            .blocks
+            .iter()
+            .flat_map(|b| {
+                let bid = b.id;
+                b.exits.iter().enumerate().filter_map(move |(i, exit)| {
+                    if exit.target == block {
+                        Some((bid, i))
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect();
+        if pred_edges.is_empty() {
+            return false;
+        }
+        self.block_mut(block).inputargs.push(var.clone());
+        for (pred_block, exit_idx) in pred_edges {
+            let ok = self.ensure_variable_at_block(pred_block, var);
+            assert!(
+                ok,
+                "ensure_variable_at_block: predecessor {:?} cannot define \
+                 Variable id={} when threading to block {:?} on graph {:?} \
+                 — graph corruption: no transitive predecessor chain leads \
+                 to a definition site",
+                pred_block,
+                var.id(),
+                block,
+                self.name,
+            );
+            self.block_mut(pred_block).exits[exit_idx]
+                .args
+                .push(LinkArg::Value(var.clone()));
+        }
+        true
+    }
+
+    /// `true` iff `var` is defined inside `block` — either as a
+    /// `Block.inputargs` entry or as the result of one of its
+    /// `operations`.  `flowspace/model.py:checkgraph` —
+    /// every operand referenced from a block must be defined in that
+    /// block.
+    pub fn variable_defined_in_block(
+        &self,
+        block: BlockId,
+        var: &crate::flowspace::model::Variable,
+    ) -> bool {
+        let b = self.block(block);
+        if b.inputargs.contains(var) {
+            return true;
+        }
+        b.operations
+            .iter()
+            .any(|op| op.result.as_ref() == Some(var))
+    }
+
     /// Shorthand for the boolean-branch shape — two Links with
     /// `Bool(false)` / `Bool(true)` exitcases, `exitswitch =
     /// ExitSwitch::Value(cond)`.  Upstream equivalent:
@@ -3349,6 +3495,32 @@ impl FunctionGraph {
         if_false: BlockId,
         false_args: Vec<crate::flowspace::model::Variable>,
     ) {
+        // `flowspace/model.py:114 Link.__init__` arity assert per
+        // arm — same rationale as `set_goto`.
+        let true_inputarg_count = self.block(if_true).inputargs.len();
+        assert_eq!(
+            true_args.len(),
+            true_inputarg_count,
+            "set_branch: true_args.len() ({}) != if_true.inputargs.len() ({}) — \
+             block {:?} → if_true {:?} on graph {:?}",
+            true_args.len(),
+            true_inputarg_count,
+            block,
+            if_true,
+            self.name,
+        );
+        let false_inputarg_count = self.block(if_false).inputargs.len();
+        assert_eq!(
+            false_args.len(),
+            false_inputarg_count,
+            "set_branch: false_args.len() ({}) != if_false.inputargs.len() ({}) — \
+             block {:?} → if_false {:?} on graph {:?}",
+            false_args.len(),
+            false_inputarg_count,
+            block,
+            if_false,
+            self.name,
+        );
         let false_link =
             Link::from_variables(self, false_args, if_false, Some(ExitCase::Bool(false)))
                 .with_llexitcase_from_exitcase();
@@ -4481,6 +4653,220 @@ mod tests {
             ..Default::default()
         };
         graph.set_goto_from_framestate(pred, target, &pred_state, &target_state);
+    }
+
+    /// `ensure_variable_at_block` short-circuits when the Variable is
+    /// already in `block.inputargs` — no graph mutation, returns true.
+    #[test]
+    fn ensure_variable_at_block_idempotent_on_existing_inputarg() {
+        use crate::flowspace::model::Variable;
+        let mut graph = FunctionGraph::new("ensure_var_idempotent_input");
+        let block = graph.create_block();
+        let v = Variable::new();
+        graph.alloc_value_with_variable(v.clone());
+        graph.block_mut(block).inputargs.push(v.clone());
+
+        let inputargs_before = graph.block(block).inputargs.len();
+        let ok = graph.ensure_variable_at_block(block, &v);
+        assert!(ok, "Variable already in inputargs reports success");
+        assert_eq!(
+            graph.block(block).inputargs.len(),
+            inputargs_before,
+            "no duplicate inputarg insertion",
+        );
+    }
+
+    /// `ensure_variable_at_block` short-circuits when the Variable is
+    /// already the result of an op in `block` — definition-by-op-result.
+    #[test]
+    fn ensure_variable_at_block_idempotent_on_existing_op_result() {
+        use crate::flowspace::model::Variable;
+        let mut graph = FunctionGraph::new("ensure_var_idempotent_op");
+        let block = graph.create_block();
+        let _v = graph.push_op(
+            block,
+            OpKind::Input {
+                name: "x".to_string(),
+                ty: ValueType::Unknown,
+            },
+            true,
+        );
+        let var = graph.block(block).operations[0]
+            .result
+            .as_ref()
+            .unwrap()
+            .clone();
+
+        let inputargs_before = graph.block(block).inputargs.len();
+        let ok = graph.ensure_variable_at_block(block, &var);
+        assert!(ok, "op-result definition reports success");
+        assert_eq!(
+            graph.block(block).inputargs.len(),
+            inputargs_before,
+            "no inputarg insertion when op result already defines var",
+        );
+    }
+
+    /// `ensure_variable_at_block` returns false when `block` has no
+    /// predecessors AND `var` is not defined locally — the malformed
+    /// graph case callers should treat as a bug.
+    #[test]
+    fn ensure_variable_at_block_returns_false_on_orphan_block_without_definition() {
+        use crate::flowspace::model::Variable;
+        let mut graph = FunctionGraph::new("ensure_var_orphan");
+        let orphan = graph.create_block();
+        let v = Variable::new();
+        graph.alloc_value_with_variable(v.clone());
+        let ok = graph.ensure_variable_at_block(orphan, &v);
+        assert!(!ok, "no predecessors + not defined => fails (no threading)");
+        assert!(
+            graph.block(orphan).inputargs.is_empty(),
+            "failure path performs no mutation",
+        );
+    }
+
+    /// `ensure_variable_at_block` threads a Variable defined in a
+    /// predecessor through one intermediate block: appends to the
+    /// predecessor's exit args + adds to the block's inputargs.
+    /// Mirrors the carry-through case in `flowspace/flowcontext.py:407
+    /// setstate(block.framestate)` at block entry.
+    #[test]
+    fn ensure_variable_at_block_threads_one_level_through_predecessor() {
+        use crate::flowspace::model::Variable;
+        let mut graph = FunctionGraph::new("ensure_var_one_level");
+        let pred = graph.create_block();
+        let target = graph.create_block();
+        let v = Variable::new();
+        graph.alloc_value_with_variable(v.clone());
+        // Define v in pred via an Input op result.
+        let _ = graph.push_op(
+            pred,
+            OpKind::Input {
+                name: "p".to_string(),
+                ty: ValueType::Unknown,
+            },
+            true,
+        );
+        // Override the op result Variable to `v` so the definition
+        // predicate matches.
+        graph.block_mut(pred).operations[0].result = Some(v.clone());
+        graph.set_goto(pred, target, vec![]);
+
+        let ok = graph.ensure_variable_at_block(target, &v);
+        assert!(ok, "predecessor defines v => threading succeeds");
+        assert_eq!(
+            graph.block(target).inputargs.len(),
+            1,
+            "target gains v as inputarg",
+        );
+        assert!(graph.block(target).inputargs.contains(&v));
+        assert_eq!(
+            graph.block(pred).exits[0].args.len(),
+            1,
+            "pred exit args grow by one entry",
+        );
+        assert!(
+            matches!(&graph.block(pred).exits[0].args[0], LinkArg::Value(var) if var.id() == v.id()),
+            "pred exit args carry the same Variable identity",
+        );
+    }
+
+    /// `ensure_variable_at_block` recurses through two levels: the
+    /// intermediate block also gains the inputarg and the deepest
+    /// predecessor's exit args grow.
+    #[test]
+    fn ensure_variable_at_block_threads_two_levels_through_predecessor_chain() {
+        use crate::flowspace::model::Variable;
+        let mut graph = FunctionGraph::new("ensure_var_two_level");
+        let root = graph.create_block();
+        let mid = graph.create_block();
+        let leaf = graph.create_block();
+        let v = Variable::new();
+        graph.alloc_value_with_variable(v.clone());
+        let _ = graph.push_op(
+            root,
+            OpKind::Input {
+                name: "p".to_string(),
+                ty: ValueType::Unknown,
+            },
+            true,
+        );
+        graph.block_mut(root).operations[0].result = Some(v.clone());
+        graph.set_goto(root, mid, vec![]);
+        graph.set_goto(mid, leaf, vec![]);
+
+        let ok = graph.ensure_variable_at_block(leaf, &v);
+        assert!(ok, "two-level chain threading succeeds");
+        assert!(
+            graph.block(leaf).inputargs.contains(&v),
+            "leaf gains v inputarg",
+        );
+        assert!(
+            graph.block(mid).inputargs.contains(&v),
+            "mid gains v inputarg",
+        );
+        assert_eq!(
+            graph.block(root).exits[0].args.len(),
+            1,
+            "root exit args grow",
+        );
+        assert_eq!(
+            graph.block(mid).exits[0].args.len(),
+            1,
+            "mid exit args grow",
+        );
+    }
+
+    /// Cycle-safe: a back-edge predecessor finds the in-progress
+    /// inputarg slot via `variable_defined_in_block` and short-circuits.
+    /// Loop shape: `header → body_tail → header`.
+    #[test]
+    fn ensure_variable_at_block_handles_back_edge_without_infinite_recursion() {
+        use crate::flowspace::model::Variable;
+        let mut graph = FunctionGraph::new("ensure_var_back_edge");
+        let entry = graph.create_block();
+        let header = graph.create_block();
+        let body_tail = graph.create_block();
+        let v = Variable::new();
+        graph.alloc_value_with_variable(v.clone());
+        let _ = graph.push_op(
+            entry,
+            OpKind::Input {
+                name: "p".to_string(),
+                ty: ValueType::Unknown,
+            },
+            true,
+        );
+        graph.block_mut(entry).operations[0].result = Some(v.clone());
+        graph.set_goto(entry, header, vec![]);
+        graph.set_goto(header, body_tail, vec![]);
+        graph.set_goto(body_tail, header, vec![]);
+
+        let ok = graph.ensure_variable_at_block(header, &v);
+        assert!(ok, "back-edge cycle is handled");
+        assert!(
+            graph.block(header).inputargs.contains(&v),
+            "header inputarg seeded",
+        );
+        assert!(
+            graph.block(body_tail).inputargs.contains(&v),
+            "body_tail inputarg also seeded — back-edge predecessor demanded v",
+        );
+        assert_eq!(
+            graph.block(entry).exits[0].args.len(),
+            1,
+            "entry → header link args extended",
+        );
+        assert_eq!(
+            graph.block(body_tail).exits[0].args.len(),
+            1,
+            "body_tail → header link args extended",
+        );
+        assert_eq!(
+            graph.block(header).exits[0].args.len(),
+            1,
+            "header → body_tail link args extended (body_tail demands v)",
+        );
     }
 
     /// `framestate.py:50-51 getvariables` walks `locals + flatten(stack) +
