@@ -5403,6 +5403,61 @@ fn lower_expr(
                 return Ok(Lowered::no_value());
             }
             let source_ty = graph_value_type(graph, operand);
+            // `Ref → Unsigned` has no single-call canonical in upstream
+            // RPython.  `llmemory.cast_adr_to_uint(addr)` is defined as
+            // `r_uint(cast_adr_to_int(addr))` (llmemory.py), and
+            // `cast_ptr_to_int(p)` returns `Signed`, so the
+            // Rust `ptr as usize` surface lowers to the same two-step
+            // composition: `cast_ptr_to_int(p)` → intermediate `Signed`,
+            // then `r_uint(intermediate)` → `Unsigned`.  Routing
+            // through `same_as` would propagate the operand's Ref
+            // concretetype to the result and leak a kind-mismatched
+            // `int_mod/ri>i` opname when the result is later used as
+            // an integer operand (Task #141 / Task #85 lock-in at
+            // `pyre-jit-trace/src/jitcode_runtime.rs:1340`).
+            if source_ty.as_ref() == Some(&ValueType::Ref) && result_ty == ValueType::Unsigned {
+                let operand_var = graph.must_variable(operand);
+                let intermediate = graph
+                    .push_op(
+                        *block,
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath {
+                                segments: [
+                                    "rpython",
+                                    "rtyper",
+                                    "lltypesystem",
+                                    "lltype",
+                                    "cast_ptr_to_int",
+                                ]
+                                .iter()
+                                .map(|s| s.to_string())
+                                .collect(),
+                            },
+                            args: vec![operand_var],
+                            result_ty: ValueType::Int,
+                        },
+                        true,
+                    )
+                    .expect("cast_ptr_to_int call op must produce a result ValueId");
+                let intermediate_var = graph.must_variable(intermediate);
+                return Ok(Lowered {
+                    value: graph.push_op(
+                        *block,
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath {
+                                segments: ["rpython", "rlib", "rarithmetic", "r_uint"]
+                                    .iter()
+                                    .map(|s| s.to_string())
+                                    .collect(),
+                            },
+                            args: vec![intermediate_var],
+                            result_ty: ValueType::Unsigned,
+                        },
+                        true,
+                    ),
+                    path_closed: false,
+                });
+            }
             // RPython has no `expr as T` syntax — numeric conversions go
             // through `int(v)` / `float(v)` / `bool(v)` builtin calls
             // (`rbuiltin.py:178-189 rtype_builtin_int/float/bool`), and
