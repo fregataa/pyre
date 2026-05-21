@@ -138,7 +138,7 @@ pub struct UnrollOptimizer {
     /// the inner phase-1/phase-2 `Optimizer.cpu` at spawn time so
     /// `cpu.cls_of_box(runtime_box)` reads (virtualstate.py:601/:608/:620)
     /// and any future `bh_*` calls resolve to the same backend services.
-    pub cpu: Option<std::sync::Arc<dyn crate::cpu::Cpu>>,
+    pub cpu: std::sync::Arc<dyn crate::cpu::Cpu>,
 }
 
 impl UnrollOptimizer {
@@ -173,7 +173,7 @@ impl UnrollOptimizer {
             next_global_opref: 0,
             callinfocollection: None,
             call_pure_results: crate::optimizeopt::vec_assoc::VecAssoc::new(),
-            cpu: None,
+            cpu: crate::cpu::default_cpu(),
         }
     }
 

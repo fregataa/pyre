@@ -209,7 +209,7 @@ pub struct Optimizer {
     /// backend services every Optimization sub-class reaches via
     /// `self.optimizer.cpu.<method>()`.  Propagated to `OptContext.cpu`
     /// at `setup_optimizations` time.
-    pub cpu: Option<std::sync::Arc<dyn crate::cpu::Cpu>>,
+    pub cpu: std::sync::Arc<dyn crate::cpu::Cpu>,
     /// optimizer.py:246 `self._emittedoperations = {}`. Tracks the
     /// set of OpRefs the optimizer has emitted (or that
     /// `replace_guard_op` substituted in place of an emitted op).
@@ -1105,7 +1105,7 @@ impl Optimizer {
             opt_guards_emitted: 0,
             opt_guards_shared_emitted: 0,
             pending_box_pool: crate::r#box::BoxPool::new(),
-            cpu: None,
+            cpu: crate::cpu::default_cpu(),
             emitted_operations: std::collections::HashSet::new(),
         }
     }

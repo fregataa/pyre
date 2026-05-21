@@ -542,7 +542,7 @@ pub struct JitCodeMachine<'mi, S, R> {
     last_exception_box: Option<OpRef>,
     last_exception_value: i64,
     class_of_last_exc_is_const: bool,
-    cpu: Option<std::sync::Arc<dyn crate::cpu::Cpu>>,
+    cpu: std::sync::Arc<dyn crate::cpu::Cpu>,
     issubclass: Option<fn(i64, i64) -> bool>,
     /// Outer interpreter pc captured BEFORE the
     /// `MIFrame::setup_call` reset (frame.rs:946 sets `frame.pc = 0`),
@@ -1084,7 +1084,7 @@ where
             last_exception_box: None,
             last_exception_value: 0,
             class_of_last_exc_is_const: false,
-            cpu: None,
+            cpu: crate::cpu::default_cpu(),
             issubclass: None,
             outer_program_pc: None,
             // pyjitpl.py:2882 / :2916 — sentinel "no loop_header seen yet".
@@ -1093,7 +1093,7 @@ where
         }
     }
 
-    pub fn set_cpu(&mut self, cpu: Option<std::sync::Arc<dyn crate::cpu::Cpu>>) {
+    pub fn set_cpu(&mut self, cpu: std::sync::Arc<dyn crate::cpu::Cpu>) {
         self.cpu = cpu;
     }
 
@@ -1115,15 +1115,11 @@ where
     }
 
     fn read_typeptr_from_exception(&self, exc_value: i64) -> i64 {
-        if let Some(cpu) = self.cpu.as_ref() {
-            cpu.cls_of_box(exc_value)
-        } else {
-            // Standalone trace_jitcode() tests do not have a MetaInterp
-            // backend installed.  Keep the existing conservative fallback
-            // used by BC_LAST_EXCEPTION until typed exception dispatch is
-            // wired end-to-end.
-            exc_value
-        }
+        // model.py:199-201: ConstPtr wrap then cpu.cls_of_box(box).
+        let const_box = crate::r#box::BoxRef::new_const(majit_ir::Value::Ref(majit_ir::GcRef(
+            exc_value as usize,
+        )));
+        self.cpu.cls_of_box(&const_box)
     }
 
     /// rclass.ll_issubclass parity (mirrors blackhole-side
@@ -5901,7 +5897,11 @@ mod tests {
     extern "C" fn residual_void_no_args() {}
 
     extern "C" fn residual_void_raises() {
-        crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0xfeed));
+        // exc payload must be a valid OBJECTPTR (typeptr at offset 0) so
+        // `DefaultCpu::cls_of_box` can dereference per model.py:199-201.
+        let exc_typeptr: &'static usize = Box::leak(std::boxed::Box::new(0xc1a55_usize));
+        let exc_raw = exc_typeptr as *const usize as i64;
+        crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_raw));
     }
 
     extern "C" fn residual_force(vable: i64) {
@@ -6407,8 +6407,12 @@ mod tests {
 
     #[test]
     fn raise_catch_inline_call_routes_to_handler_and_preserves_last_exc_value() {
+        // exc payload must be a valid OBJECTPTR (typeptr at offset 0) so
+        // `DefaultCpu::cls_of_box` can dereference per model.py:199-201.
+        let exc_typeptr: &'static usize = Box::leak(std::boxed::Box::new(0xc1a55_usize));
+        let exc_raw = exc_typeptr as *const usize as i64;
         let mut callee = JitCodeBuilder::new();
-        callee.load_const_r_value(0, 0xfeed);
+        callee.load_const_r_value(0, exc_raw);
         callee.emit_raise(0);
         let callee = callee.finish();
 
@@ -6439,8 +6443,10 @@ mod tests {
 
     #[test]
     fn raise_catch_inline_call_routes_to_handler_and_preserves_last_exception() {
+        let exc_typeptr: &'static usize = Box::leak(std::boxed::Box::new(0xc1a55_usize));
+        let exc_raw = exc_typeptr as *const usize as i64;
         let mut callee = JitCodeBuilder::new();
-        callee.load_const_r_value(0, 0xfeed);
+        callee.load_const_r_value(0, exc_raw);
         callee.emit_raise(0);
         let callee = callee.finish();
 
@@ -6478,8 +6484,10 @@ mod tests {
         // the normal `TraceAction::Finish` path runs `finish_and_compile`
         // (jitdriver.rs:1031). Previously this returned `TraceAction::Abort`,
         // dropping the trace without closing / compiling.
+        let exc_typeptr: &'static usize = Box::leak(std::boxed::Box::new(0xc1a55_usize));
+        let exc_raw = exc_typeptr as *const usize as i64;
         let mut builder = JitCodeBuilder::new();
-        builder.load_const_r_value(0, 0xfeed);
+        builder.load_const_r_value(0, exc_raw);
         builder.emit_raise(0);
         let jitcode = builder.finish();
 

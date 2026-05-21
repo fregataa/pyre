@@ -966,11 +966,8 @@ pub struct MetaInterp<M: Clone> {
     /// `cls_of_box(box)` (model.py:199-201) and, going forward, the
     /// rest of the AbstractCPU surface (`bh_*` runtime calls, GC type
     /// info accessors, etc.).  Default: `Some(default_cpu())` — the
-    /// lltype typeptr-at-offset-0 layout. `None` only in dispatch test
-    /// fixtures that exercise the raw exc_value fallback in
-    /// `read_typeptr_from_exception` (e.g. `raise_catch_inline_call_*`
-    /// which raises non-memory raw `i64` values like `0xfeed`).
-    pub(crate) cpu: Option<std::sync::Arc<dyn crate::cpu::Cpu>>,
+    /// lltype typeptr-at-offset-0 layout.
+    pub(crate) cpu: std::sync::Arc<dyn crate::cpu::Cpu>,
 
     /// model.py:266-273 + RPython `rclass.ll_issubclass` parity: callback
     /// that decides whether `typeptr` is a subclass of `bounding_class`.
@@ -1877,7 +1874,7 @@ impl<M: Clone> MetaInterp<M> {
             retrace_after_bridge: false,
             pending_preamble_tokens: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             pending_frontend_boxes: None,
-            cpu: Some(crate::cpu::default_cpu()),
+            cpu: crate::cpu::default_cpu(),
             issubclass: Some(default_issubclass),
             staticdata: std::sync::Arc::new(MetaInterpStaticData::new()),
             framestack: crate::pyjitpl::MIFrameStack::empty(),
@@ -2845,14 +2842,14 @@ impl<M: Clone> MetaInterp<M> {
     /// Callers with a richer backend can install via the underlying
     /// `cpu` field directly.
     pub fn set_cls_of_box(&mut self, f: fn(i64) -> i64) {
-        self.cpu = Some(crate::cpu::cpu_from_cls_of_box_fn(f));
+        self.cpu = crate::cpu::cpu_from_cls_of_box_fn(f);
     }
 
     /// Install a full `Cpu` trait object (model.py:39 `AbstractCPU`).
     /// Future ports use this to attach backend services beyond
     /// `cls_of_box`.
     pub fn set_cpu(&mut self, cpu: std::sync::Arc<dyn crate::cpu::Cpu>) {
-        self.cpu = Some(cpu);
+        self.cpu = cpu;
     }
 
     /// model.py:266-273 + RPython `rclass.ll_issubclass` — override the
@@ -8837,10 +8834,7 @@ impl<M: Clone> MetaInterp<M> {
                     liveboxes,
                     livebox_types,
                     all_descrs: self.staticdata.all_descrs.lock().unwrap().clone(),
-                    cpu: self
-                        .cpu
-                        .clone()
-                        .expect("MetaInterp.cpu unset (seeded by MetaInterp::new)"),
+                    cpu: self.cpu.clone(),
                 })
             });
             let Some(tok) = compiled.live_token() else {
@@ -11419,14 +11413,13 @@ impl<M: Clone> MetaInterp<M> {
     /// raw pointer in `last_exc_value`; the typeptr lives at the head
     /// of every `OBJECT` instance per the RPython object layout.
     fn read_typeptr_from_exception(&self, exc_value: i64) -> i64 {
-        if let Some(cpu) = self.cpu.as_ref() {
-            cpu.cls_of_box(exc_value)
-        } else {
-            // No callback wired yet — fall back to the class pointer
-            // of the exception object itself.  Conservative; the
-            // GUARD_EXCEPTION will simply store this raw pointer.
-            exc_value
-        }
+        // model.py:199-201 cpu.cls_of_box(box) — ConstPtr wrap then
+        // dispatch to the trait so DefaultCpu walks the GcRef and
+        // does the typeptr-at-offset-0 dereference.
+        let const_box = crate::r#box::BoxRef::new_const(majit_ir::Value::Ref(majit_ir::GcRef(
+            exc_value as usize,
+        )));
+        self.cpu.cls_of_box(&const_box)
     }
 
     /// Run `JitCodeMachine` against `MetaInterp::framestack` per the
@@ -16862,7 +16855,7 @@ mod metainterp_static_data_tests {
         meta.finish_setup_descrs_for_jitdrivers();
         // Override cls_of_box so we can inject a known typeptr without
         // dereferencing a raw pointer.
-        meta.cpu = Some(crate::cpu::cpu_from_cls_of_box_fn(|_| 0xc1a55));
+        meta.cpu = crate::cpu::cpu_from_cls_of_box_fn(|_| 0xc1a55);
         meta.last_exc_value = 0xfeed;
 
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
@@ -16911,7 +16904,7 @@ mod metainterp_static_data_tests {
         use crate::BackEdgeAction;
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
-        meta.cpu = Some(crate::cpu::cpu_from_cls_of_box_fn(|_| 0xc1a55));
+        meta.cpu = crate::cpu::cpu_from_cls_of_box_fn(|_| 0xc1a55);
         meta.last_exc_value = 0xfeed;
         meta.class_of_last_exc_is_const = true;
 
@@ -17140,7 +17133,7 @@ mod metainterp_static_data_tests {
 
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
-        meta.cpu = Some(crate::cpu::cpu_from_cls_of_box_fn(|_| 0xcafef00d));
+        meta.cpu = crate::cpu::cpu_from_cls_of_box_fn(|_| 0xcafef00d);
         meta.last_exc_value = 0xbeef;
 
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);

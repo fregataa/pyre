@@ -798,139 +798,6 @@ impl OptPure {
     }
 }
 
-/// Try to constant-fold a pure operation when all arguments are constants.
-///
-/// RPython equivalent: pure.py constant folding in optimize_default().
-/// Returns the constant result value if successful.
-fn try_constant_fold_int_value(op: &Op, ctx: &OptContext) -> Option<i64> {
-    // Only fold binary int operations for now (most common case).
-    if op.num_args() != 2 {
-        return None;
-    }
-    let a = ctx.get_constant_int(op.arg(0))?;
-    let b = ctx.get_constant_int(op.arg(1))?;
-
-    let result = match op.opcode {
-        OpCode::IntAdd | OpCode::IntAddOvf => a.checked_add(b)?,
-        OpCode::IntSub | OpCode::IntSubOvf => a.checked_sub(b)?,
-        OpCode::IntMul | OpCode::IntMulOvf => a.checked_mul(b)?,
-        OpCode::IntAnd => Some(a & b)?,
-        OpCode::IntOr => Some(a | b)?,
-        OpCode::IntXor => Some(a ^ b)?,
-        OpCode::IntLshift if b >= 0 && b < 64 => Some(a << b)?,
-        OpCode::IntRshift if b >= 0 && b < 64 => Some(a >> b)?,
-        OpCode::UintRshift if b >= 0 && b < 64 => Some((a as u64 >> b as u64) as i64)?,
-        OpCode::IntLt => Some(if a < b { 1 } else { 0 })?,
-        OpCode::IntLe => Some(if a <= b { 1 } else { 0 })?,
-        OpCode::IntGt => Some(if a > b { 1 } else { 0 })?,
-        OpCode::IntGe => Some(if a >= b { 1 } else { 0 })?,
-        OpCode::IntEq => Some(if a == b { 1 } else { 0 })?,
-        OpCode::IntNe => Some(if a != b { 1 } else { 0 })?,
-        OpCode::UintLt => Some(if (a as u64) < (b as u64) { 1 } else { 0 })?,
-        OpCode::UintLe => Some(if (a as u64) <= (b as u64) { 1 } else { 0 })?,
-        OpCode::UintGe => Some(if (a as u64) >= (b as u64) { 1 } else { 0 })?,
-        OpCode::UintGt => Some(if (a as u64) > (b as u64) { 1 } else { 0 })?,
-        OpCode::IntFloorDiv if b != 0 => {
-            // Python-style floor division
-            let (q, r) = (a / b, a % b);
-            if (r != 0) && ((r ^ b) < 0) {
-                Some(q - 1)
-            } else {
-                Some(q)
-            }
-        }?,
-        OpCode::IntMod if b != 0 => {
-            let r = a % b;
-            if (r != 0) && ((r ^ b) < 0) {
-                Some(r + b)
-            } else {
-                Some(r)
-            }
-        }?,
-        _ => return None,
-    };
-
-    Some(result)
-}
-
-fn constant_ptr_value(arg: OpRef, ctx: &OptContext) -> Option<usize> {
-    let resolved = ctx.get_box_replacement(arg);
-    // RPython parity: Ref-typed inputargs must not be treated as compile-time
-    // constant pointers. In RPython, inputarg Box.value is unknown until
-    // guard_value establishes it. pyre's seed_constant pre-populates
-    // trace-time Ref values that try_constant_fold_pure_getfield would
-    // dereference — reading fields from objects that may differ at runtime.
-    // Only explicit Const forwarding from guard_value is a genuine constant.
-    let ia_base = ctx.inputarg_base as usize;
-    let ia_end = ia_base + ctx.num_inputs();
-    if (resolved.raw() as usize) >= ia_base && (resolved.raw() as usize) < ia_end {
-        // BoxRef-routing reader (H-3.2c slice 58). `resolved` is already
-        // the Vec chain terminal; BoxRef walk advances at most one step to
-        // the make_constant-mirrored fresh `BoxRef::new_const(value)`.
-        let b = ctx.get_box_replacement_box(resolved)?;
-        // Forwarded::Box(constbox) — Const-namespace BoxRef terminal.
-        if let Some(Value::Ref(ptr)) = b.const_value() {
-            if !ptr.is_null() {
-                return Some(ptr.as_usize());
-            }
-        }
-        return None;
-    }
-    match ctx.get_constant(arg)? {
-        Value::Ref(ptr) if !ptr.is_null() => Some(ptr.as_usize()),
-        _ => None,
-    }
-}
-
-fn try_constant_fold_pure_getfield(op: &Op, ctx: &OptContext) -> Option<Value> {
-    let descr = op.getdescr()?;
-    let field_descr = descr.as_field_descr()?;
-    let addr = constant_ptr_value(op.arg(0), ctx)? + field_descr.offset();
-
-    match op.opcode {
-        OpCode::GetfieldGcPureI => {
-            let value = match (field_descr.field_size(), field_descr.is_field_signed()) {
-                (8, true) => unsafe { *(addr as *const i64) },
-                (8, false) => unsafe { *(addr as *const u64) as i64 },
-                (4, true) => unsafe { *(addr as *const i32) as i64 },
-                (4, false) => unsafe { *(addr as *const u32) as i64 },
-                (2, true) => unsafe { *(addr as *const i16) as i64 },
-                (2, false) => unsafe { *(addr as *const u16) as i64 },
-                (1, true) => unsafe { *(addr as *const i8) as i64 },
-                (1, false) => unsafe { *(addr as *const u8) as i64 },
-                _ => return None,
-            };
-            Some(Value::Int(value))
-        }
-        OpCode::GetfieldGcPureF => {
-            if field_descr.field_size() != std::mem::size_of::<f64>() {
-                return None;
-            }
-            Some(Value::Float(unsafe { *(addr as *const f64) }))
-        }
-        OpCode::GetfieldGcPureR => {
-            if field_descr.field_size() != std::mem::size_of::<usize>() {
-                return None;
-            }
-            Some(Value::Ref(GcRef(unsafe { *(addr as *const usize) })))
-        }
-        _ => None,
-    }
-}
-
-fn try_constant_fold_pure_value(op: &Op, ctx: &OptContext) -> Option<Value> {
-    if let Some(result) = try_constant_fold_int_value(op, ctx) {
-        return Some(Value::Int(result));
-    }
-
-    match op.opcode {
-        OpCode::GetfieldGcPureI | OpCode::GetfieldGcPureR | OpCode::GetfieldGcPureF => {
-            try_constant_fold_pure_getfield(op, ctx)
-        }
-        _ => None,
-    }
-}
-
 impl Default for OptPure {
     fn default() -> Self {
         Self::new()
@@ -1011,8 +878,11 @@ impl Optimization for OptPure {
         // Handle the postponed OVF op when we see GUARD_NO_OVERFLOW.
         if let Some(mut postponed) = self.postponed_op.take() {
             if op.opcode == OpCode::GuardNoOverflow {
-                // Try constant folding on the OVF op.
-                if let Some(folded) = try_constant_fold_int_value(&postponed, ctx) {
+                // pure.py:122-128 — same constant_fold(op) call as the
+                // non-OVF branch. `execute_binary_int_const` skips the
+                // fold via checked_* when the OVF op would overflow, so
+                // the guard is preserved naturally in that case.
+                if let Some(Value::Int(folded)) = ctx.constant_fold(&postponed) {
                     ctx.find_or_record_constant_int(postponed.pos.get(), folded);
                     self.last_emitted_was_removed = true;
                     return OptimizationResult::Remove; // guard also removed
@@ -1121,11 +991,26 @@ impl Optimization for OptPure {
         }
 
         if op.opcode.is_always_pure() {
-            // Constant folding: all args are constants → compute at opt time.
-            if let Some(folded_value) = try_constant_fold_pure_value(op, ctx) {
-                ctx.make_constant(op.pos.get(), folded_value);
-                self.last_emitted_was_removed = true;
-                return OptimizationResult::Remove;
+            // pure.py:121-128:
+            //     for i in range(op.numargs()):
+            //         if self.get_constant_box(op.getarg(i)) is None:
+            //             break
+            //     else:
+            //         resbox = self.optimizer.constant_fold(op)
+            //         self.optimizer.make_constant(op, resbox)
+            //         return
+            let all_args_const = (0..op.num_args()).all(|i| {
+                ctx.get_box_replacement_box(op.arg(i))
+                    .as_ref()
+                    .and_then(|b| ctx.get_constant_box(b))
+                    .is_some()
+            });
+            if all_args_const {
+                if let Some(folded_value) = ctx.constant_fold(op) {
+                    ctx.make_constant(op.pos.get(), folded_value);
+                    self.last_emitted_was_removed = true;
+                    return OptimizationResult::Remove;
+                }
             }
 
             if let Some(cached_ref) = self.force_preamble_op(op, ctx) {
@@ -2105,10 +1990,7 @@ mod tests {
         ctx.make_constant(OpRef::ref_op(10), Value::Ref(GcRef(ptr)));
         pass.setup();
 
-        assert_eq!(
-            try_constant_fold_pure_value(&op, &ctx),
-            Some(Value::Int(123))
-        );
+        assert_eq!(ctx.constant_fold(&op), Some(Value::Int(123)));
         let result = pass.propagate_forward(&op, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_constant_int(OpRef::int_op(0)), Some(123));
@@ -2132,10 +2014,7 @@ mod tests {
         ctx.make_constant(OpRef::ref_op(10), Value::Ref(GcRef(ptr)));
         pass.setup();
 
-        assert_eq!(
-            try_constant_fold_pure_value(&op, &ctx),
-            Some(Value::Float(3.5))
-        );
+        assert_eq!(ctx.constant_fold(&op), Some(Value::Float(3.5)));
         let result = pass.propagate_forward(&op, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_constant_float(OpRef::float_op(0)), Some(3.5));
@@ -2162,7 +2041,7 @@ mod tests {
         pass.setup();
 
         assert_eq!(
-            try_constant_fold_pure_value(&op, &ctx),
+            ctx.constant_fold(&op),
             Some(Value::Ref(GcRef(0x1234_5678usize)))
         );
         let result = pass.propagate_forward(&op, &mut ctx);
@@ -2188,7 +2067,7 @@ mod tests {
         ctx.make_constant(OpRef::int_op(10), Value::Int(2));
         pass.setup();
 
-        assert_eq!(try_constant_fold_pure_value(&op, &ctx), None);
+        assert_eq!(ctx.constant_fold(&op), None);
         let result = pass.propagate_forward(&op, &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
         assert_eq!(ctx.get_constant(OpRef::int_op(0)), None);

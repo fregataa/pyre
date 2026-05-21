@@ -1327,3 +1327,342 @@ pub fn execute_varargs<M: Clone>(
     }
     result
 }
+
+/// executor.py:555 `execute_nonspec_const` for binary integer opcodes.
+///
+/// Returns the folded `i64` result when the operation is recognized and
+/// the result is well-defined; returns `None` to abort folding when:
+///   * the opcode is not a recognized binary int op
+///   * an OVF arithmetic op (IntAddOvf/SubOvf/MulOvf) overflows —
+///     RPython's `do_int_add_ovf` then hits
+///     `assert metainterp is not None` (executor.py:287) which
+///     AssertionErrors in the `constant_fold` path (metainterp=None);
+///     pyre prefers the softer `None` skip so the op stays in the
+///     trace and the runtime guard fires
+///   * a shift count is outside `0..64` (mirrors
+///     `blackhole.py:258 check_shift_count`)
+///   * IntFloorDiv / IntMod with a zero divisor
+///
+/// Non-OVF IntAdd/IntSub/IntMul match `bhimpl_int_add/_sub/_mul`
+/// (`blackhole.py:459-468`) which compute `intmask(a + b)` — i.e.
+/// wrapping i64 arithmetic. Earlier `checked_*` use here would have
+/// aborted the fold on a representable wrapping result.
+///
+/// Mirrors the `do_int_*` entries at executor.py:279-309 (OVF) +
+/// `EXECUTE_BY_NUM_ARGS` binary-int rows (the unrolled dispatch table
+/// generated at executor.py:495-498).
+pub fn execute_binary_int_const(opcode: OpCode, a: i64, b: i64) -> Option<i64> {
+    let result = match opcode {
+        OpCode::IntAdd => a.wrapping_add(b),
+        OpCode::IntSub => a.wrapping_sub(b),
+        OpCode::IntMul => a.wrapping_mul(b),
+        OpCode::IntAddOvf => a.checked_add(b)?,
+        OpCode::IntSubOvf => a.checked_sub(b)?,
+        OpCode::IntMulOvf => a.checked_mul(b)?,
+        OpCode::IntAnd => a & b,
+        OpCode::IntOr => a | b,
+        OpCode::IntXor => a ^ b,
+        OpCode::IntLshift if b >= 0 && b < 64 => a << b,
+        OpCode::IntRshift if b >= 0 && b < 64 => a >> b,
+        OpCode::UintRshift if b >= 0 && b < 64 => (a as u64 >> b as u64) as i64,
+        OpCode::IntLt => (a < b) as i64,
+        OpCode::IntLe => (a <= b) as i64,
+        OpCode::IntGt => (a > b) as i64,
+        OpCode::IntGe => (a >= b) as i64,
+        OpCode::IntEq => (a == b) as i64,
+        OpCode::IntNe => (a != b) as i64,
+        OpCode::UintLt => ((a as u64) < (b as u64)) as i64,
+        OpCode::UintLe => ((a as u64) <= (b as u64)) as i64,
+        OpCode::UintGe => ((a as u64) >= (b as u64)) as i64,
+        OpCode::UintGt => ((a as u64) > (b as u64)) as i64,
+        OpCode::IntFloorDiv if b != 0 => {
+            let (q, r) = (a / b, a % b);
+            if (r != 0) && ((r ^ b) < 0) { q - 1 } else { q }
+        }
+        OpCode::IntMod if b != 0 => {
+            let r = a % b;
+            if (r != 0) && ((r ^ b) < 0) { r + b } else { r }
+        }
+        OpCode::IntSignext if b >= 1 && b <= 8 => {
+            // blackhole.py:568 bhimpl_int_signext → support.py:30 int_signext.
+            // Sign-extend `a` from `b` bytes. b=8 yields shift=0, i.e.
+            // identity — matches the upstream r_uint round-trip when the
+            // mask `(1 << 64) - 1` covers the whole word.
+            let shift = 64 - b * 8;
+            (a << shift) >> shift
+        }
+        OpCode::UintMulHigh => {
+            // blackhole.py bhimpl_uint_mul_high — high 64 of (a as u64) * (b as u64).
+            (((a as u64) as u128 * (b as u64) as u128) >> 64) as i64
+        }
+        _ => return None,
+    };
+    Some(result)
+}
+
+/// executor.py:495-498 ptr-compare row of EXECUTE_BY_NUM_ARGS.
+/// Mirrors blackhole.py bhimpl_ptr_eq/_ne and instance_ptr_eq/_ne —
+/// straight pointer identity once both args are constant references.
+pub fn execute_ptr_compare_const(opcode: OpCode, a: usize, b: usize) -> Option<i64> {
+    let result = match opcode {
+        OpCode::PtrEq | OpCode::InstancePtrEq => a == b,
+        OpCode::PtrNe | OpCode::InstancePtrNe => a != b,
+        _ => return None,
+    };
+    Some(result as i64)
+}
+
+/// executor.py:495-498 unary-int row of EXECUTE_BY_NUM_ARGS, the
+/// 1-arg variant. Mirrors blackhole.py:528-566 bhimpl_int_neg /
+/// _invert / _is_zero / _is_true / _force_ge_zero.
+///
+/// Returns `None` for unrecognized opcodes so the caller can fall
+/// through to other dispatch paths (executor.py:559's `assert False`
+/// shape is reserved for non-matching opnums via the unrolled match).
+pub fn execute_unary_int_const(opcode: OpCode, a: i64) -> Option<i64> {
+    let result = match opcode {
+        OpCode::IntNeg => a.wrapping_neg(),
+        OpCode::IntInvert => !a,
+        OpCode::IntIsZero => (a == 0) as i64,
+        OpCode::IntIsTrue => (a != 0) as i64,
+        OpCode::IntForceGeZero => a.max(0),
+        _ => return None,
+    };
+    Some(result)
+}
+
+/// executor.py:495-498 unary-float row mirrors blackhole.py float
+/// unops: bhimpl_float_neg / _abs.
+pub fn execute_unary_float_const(opcode: OpCode, a: f64) -> Option<f64> {
+    let result = match opcode {
+        OpCode::FloatNeg => -a,
+        OpCode::FloatAbs => a.abs(),
+        _ => return None,
+    };
+    Some(result)
+}
+
+/// executor.py:495-498 binary-float row. Float arithmetic + comparisons
+/// (comparisons return bool wrapped as 0/1 in the caller). Mirrors
+/// blackhole.py bhimpl_float_add/_sub/_mul/_truediv (`:697-718`).
+/// FLOAT_TRUEDIV with `b == 0.0` is NOT folded — Python/RPython `a / b`
+/// raises ZeroDivisionError at runtime, and silently folding to ±inf/NaN
+/// would erase that exception path. The runtime executor still performs
+/// `a / b` per `blackhole.py:717`; only trace-time folding is suppressed.
+pub fn execute_binary_float_const(opcode: OpCode, a: f64, b: f64) -> Option<f64> {
+    let result = match opcode {
+        OpCode::FloatAdd => a + b,
+        OpCode::FloatSub => a - b,
+        OpCode::FloatMul => a * b,
+        OpCode::FloatTrueDiv if b != 0.0 => a / b,
+        _ => return None,
+    };
+    Some(result)
+}
+
+/// executor.py:495-498 float→bool row. Mirrors blackhole.py
+/// bhimpl_float_lt/_le/_eq/_ne/_gt/_ge.
+pub fn execute_float_compare_const(opcode: OpCode, a: f64, b: f64) -> Option<i64> {
+    let result = match opcode {
+        OpCode::FloatLt => a < b,
+        OpCode::FloatLe => a <= b,
+        OpCode::FloatEq => a == b,
+        OpCode::FloatNe => a != b,
+        OpCode::FloatGt => a > b,
+        OpCode::FloatGe => a >= b,
+        _ => return None,
+    };
+    Some(result as i64)
+}
+
+/// executor.py:555 `execute_nonspec_const` free function — the
+/// generic opnum dispatch invoked by `optimizer.py:810 constant_fold`
+/// once every arg has been resolved to a `Const*` via
+/// `get_constant_box`. Mirrors the RPython structure:
+///
+/// ```python
+/// def execute_nonspec_const(cpu, metainterp, opnum, argboxes,
+///                           descr=None, type='i'):
+///     for num in unrolled_range:
+///         if num == opnum:
+///             return wrap_constant(_execute_arglist(cpu, metainterp, num,
+///                                                    argboxes, descr))
+///     assert False
+/// ```
+///
+/// `_execute_arglist` (executor.py:563-610) selects
+/// `EXECUTE_BY_NUM_ARGS[arity, withdescr][opnum]` and raises
+/// `NotImplementedError` (`:610`) only when no function is registered
+/// for the opnum. *Helper-level* failures — wrapping vs OVF
+/// mismatches, divide-by-zero, NaN-cast, invalid shift counts — are
+/// not panics in PyPy: they either compute the wrapping result
+/// (`bhimpl_int_add`'s `intmask(a + b)`), follow the exception path
+/// (FLOAT_TRUEDIV `b == 0.0`, CAST_FLOAT_TO_INT NaN), or
+/// AssertionError under `metainterp=None` (OVF). Pyre keeps the
+/// softer skip — return `None` so `pure.rs` re-emits the op — which
+/// stays line-by-line aligned with the runtime path RPython would
+/// take when the constant-fold prediction is unsafe.
+///
+/// `_type` is accepted for signature parity with RPython's `type`
+/// parameter; it is not consulted because the Value variant in
+/// `argboxes` already determines the result type via the helper that
+/// fires.
+pub fn execute_nonspec_const(
+    cpu: &dyn crate::cpu::Cpu,
+    opnum: OpCode,
+    argboxes: &[majit_ir::Value],
+    descr: Option<&majit_ir::descr::DescrRef>,
+    _type: majit_ir::Type,
+) -> Option<majit_ir::Value> {
+    use majit_ir::Value;
+    let arity = argboxes.len();
+
+    // ── arity == 1 row of EXECUTE_BY_NUM_ARGS ──
+    if arity == 1 {
+        let a = argboxes[0];
+        // executor.py:314-321 `do_same_as_i/r/f` — identity fold for
+        // SAME_AS_I/R/F (`bhimpl_int_same_as` etc., `blackhole.py:455`).
+        match opnum {
+            OpCode::SameAsI | OpCode::SameAsR | OpCode::SameAsF => return Some(a),
+            _ => {}
+        }
+        if let Value::Int(i) = a {
+            if let Some(folded) = execute_unary_int_const(opnum, i) {
+                return Some(Value::Int(folded));
+            }
+        }
+        if let Value::Float(f) = a {
+            if let Some(folded) = execute_unary_float_const(opnum, f) {
+                return Some(Value::Float(folded));
+            }
+        }
+        if let Some(folded) = execute_cast_const(opnum, a) {
+            return Some(folded);
+        }
+        // GETFIELD_GC_PURE_I/R/F — withdescr arity-1.
+        if let (Value::Ref(struct_ref), Some(d)) = (a, descr) {
+            if let Some(fd) = d.as_field_descr() {
+                if struct_ref.is_null() {
+                    return None;
+                }
+                return match opnum {
+                    OpCode::GetfieldGcPureI => {
+                        // llmodel.py:467-478 read_int_at_mem only handles
+                        // sizes in `unroll_basic_sizes`; unknown sizes
+                        // raise NotImplementedError. Pre-filter so the
+                        // fold skips instead of relying on the trait impl
+                        // to recover a sentinel.
+                        match fd.field_size() {
+                            1 | 2 | 4 | 8 => {
+                                Some(Value::Int(cpu.bh_getfield_gc_i(struct_ref.0, fd)))
+                            }
+                            _ => None,
+                        }
+                    }
+                    OpCode::GetfieldGcPureR => {
+                        Some(Value::Ref(cpu.bh_getfield_gc_r(struct_ref.0, fd)))
+                    }
+                    OpCode::GetfieldGcPureF => {
+                        Some(Value::Float(cpu.bh_getfield_gc_f(struct_ref.0, fd)))
+                    }
+                    _ => None,
+                };
+            }
+        }
+    }
+
+    // ── arity == 2 row of EXECUTE_BY_NUM_ARGS ──
+    if arity == 2 {
+        if let (Value::Int(a), Value::Int(b)) = (argboxes[0], argboxes[1]) {
+            if let Some(folded) = execute_binary_int_const(opnum, a, b) {
+                return Some(Value::Int(folded));
+            }
+        }
+        if let (Value::Float(a), Value::Float(b)) = (argboxes[0], argboxes[1]) {
+            if let Some(folded) = execute_binary_float_const(opnum, a, b) {
+                return Some(Value::Float(folded));
+            }
+            if let Some(folded) = execute_float_compare_const(opnum, a, b) {
+                return Some(Value::Int(folded));
+            }
+        }
+        if let (Value::Ref(a), Value::Ref(b)) = (argboxes[0], argboxes[1]) {
+            if let Some(folded) = execute_ptr_compare_const(opnum, a.0, b.0) {
+                return Some(Value::Int(folded));
+            }
+        }
+    }
+
+    // ── arity == 3 row of EXECUTE_BY_NUM_ARGS ──
+    if arity == 3 {
+        // executor.py `do_int_between` -> blackhole.py:560
+        // `bhimpl_int_between(a, b, c): return a <= b < c`.
+        if let (Value::Int(a), Value::Int(b), Value::Int(c)) =
+            (argboxes[0], argboxes[1], argboxes[2])
+        {
+            if opnum == OpCode::IntBetween {
+                return Some(Value::Int((a <= b && b < c) as i64));
+            }
+        }
+    }
+
+    // executor.py:610 `raise NotImplementedError` only fires for opnums
+    // with no EXECUTE_BY_NUM_ARGS entry — every always-pure op in PyPy
+    // has an entry, so the call simply returns. Pyre's helpers also
+    // return `None` on safety-guard skips (OVF overflow, FLOAT_TRUEDIV
+    // by zero, CAST_FLOAT_TO_INT non-finite, invalid shift counts,
+    // Slice H opcodes pending dedicated ports — ArraylenGc / Strlen /
+    // Strgetitem / Unicodelen / Unicodegetitem / GetarrayitemGcPure[IRF]
+    // / LoadFromGcTable / LoadEffectiveAddress). All routes converge
+    // here as a plain `None`; the caller (`OptContext::constant_fold`
+    // → `pure.rs:1002`) treats `None` as "do not fold" and emits the
+    // op verbatim.
+    None
+}
+
+/// executor.py cross-type cast fold:
+///   CAST_FLOAT_TO_INT / CAST_INT_TO_FLOAT — true numeric conversion
+///   CAST_FLOAT_TO_SINGLEFLOAT / CAST_SINGLEFLOAT_TO_FLOAT — f64↔f32 bits
+///   CONVERT_FLOAT_BYTES_TO_LONGLONG / CONVERT_LONGLONG_BYTES_TO_FLOAT —
+///       reinterpret-bits pass-through (Value carries f64 bits already
+///       as i64 in pyre's TraceValues; the cast just relabels)
+///   CAST_PTR_TO_INT / CAST_INT_TO_PTR — pointer reinterpret
+/// Mirrors blackhole.py bhimpl_cast_*.
+pub fn execute_cast_const(opcode: OpCode, arg: majit_ir::Value) -> Option<majit_ir::Value> {
+    use majit_ir::{GcRef, Value};
+    match (opcode, arg) {
+        (OpCode::CastFloatToInt, Value::Float(f)) => {
+            // blackhole.py:800-808 `bhimpl_cast_float_to_int = int(int(a))`.
+            // Python `int(f)` raises OverflowError on ±Inf, ValueError on
+            // NaN, and OverflowError on values outside the C long range
+            // (untranslated). Skip fold in those cases — emit the cast op
+            // so runtime takes the exception/long-cast path. The safe
+            // i64 window is `i64::MIN ..= i64::MAX`; `i64::MAX + 1` rounds
+            // to the same f64 as `i64::MAX` (precision loss), so use the
+            // strictly-less-than upper bound `9.223372036854776e18`.
+            if !f.is_finite() {
+                return None;
+            }
+            if f < (i64::MIN as f64) || f >= 9.223372036854776e18_f64 {
+                return None;
+            }
+            Some(Value::Int(f as i64))
+        }
+        (OpCode::CastIntToFloat, Value::Int(i)) => Some(Value::Float(i as f64)),
+        (OpCode::CastFloatToSinglefloat, Value::Float(f)) => {
+            Some(Value::Int((f as f32).to_bits() as i64))
+        }
+        (OpCode::CastSinglefloatToFloat, Value::Int(i)) => {
+            Some(Value::Float(f32::from_bits(i as u32) as f64))
+        }
+        (OpCode::ConvertFloatBytesToLonglong, Value::Float(f)) => {
+            Some(Value::Int(f.to_bits() as i64))
+        }
+        (OpCode::ConvertLonglongBytesToFloat, Value::Int(i)) => {
+            Some(Value::Float(f64::from_bits(i as u64)))
+        }
+        (OpCode::CastPtrToInt, Value::Ref(r)) => Some(Value::Int(r.0 as i64)),
+        (OpCode::CastIntToPtr, Value::Int(i)) => Some(Value::Ref(GcRef(i as usize))),
+        _ => None,
+    }
+}

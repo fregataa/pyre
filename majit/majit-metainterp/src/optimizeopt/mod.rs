@@ -784,7 +784,7 @@ pub struct OptContext {
     /// because it has no direct backref to the surrounding Optimizer.
     /// Used by `cls_of_box(&BoxRef)` (mod.rs body) and reachable by
     /// future `bh_*` ports.
-    pub cpu: Option<std::sync::Arc<dyn crate::cpu::Cpu>>,
+    pub cpu: std::sync::Arc<dyn crate::cpu::Cpu>,
     /// llmodel.py:55 `self.remove_gctypeptr =
     /// translator.config.translation.gcremovetypeptr`. model.py:26
     /// default is `False`; PyPy x86 enables `--gcremovetypeptr` which
@@ -927,6 +927,16 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
         // directly, but doing replacement first matches upstream order
         // and is robust against forwarding chains.
         let resolved = self.ctx.get_box_replacement(opref);
+        // Inputarg slot (history.py:220 `InputArg{Int,Ref,Float}.type`
+        // parity per resoperation.py:719/727/739). The recorder-seeded
+        // `inputarg_types[idx]` is the canonical Box.type source for
+        // slot positions; a cross-phase caller that minted the OpRef
+        // with `input_arg_int(idx)` for a Ref-typed slot would mismatch
+        // the variant tag against the actual recorder type, so consult
+        // the side-table first for inputarg-positioned OpRefs.
+        if let Some(tp) = self.ctx.inputarg_type(resolved) {
+            return tp;
+        }
         // OpRef enum carries box.type in the variant tag; reading the tag
         // on the resolved box is the line-by-line equivalent of upstream
         // `box.type` (resoperation.py:29 / history.py:220). `None` and
@@ -946,13 +956,6 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
             if op.type_ != majit_ir::Type::Void {
                 return op.type_;
             }
-        }
-        // Inputarg slot (history.py:220 `InputArg{Int,Ref,Float}.type`
-        // parity per resoperation.py:719/727/739).  Read-only against
-        // `inputarg_types` — must not materialize a fresh Box, see
-        // `inputarg_type`'s PRE-EXISTING-ADAPTATION note.
-        if let Some(tp) = self.ctx.inputarg_type(resolved) {
-            return tp;
         }
         // PtrInfo presence → Ref type (for non-emitted ops like input args)
         let resolved_has_info = self
@@ -1617,7 +1620,7 @@ impl OptContext {
             last_guard_idx: None,
             last_seen_snapshot_pos: None,
             box_pool: crate::r#box::BoxPool::new(),
-            cpu: None,
+            cpu: crate::cpu::default_cpu(),
             remove_gctypeptr: true,
             last_op_removed: false,
         }
@@ -1744,7 +1747,7 @@ impl OptContext {
             last_guard_idx: None,
             last_seen_snapshot_pos: None,
             box_pool: crate::r#box::BoxPool::new(),
-            cpu: None,
+            cpu: crate::cpu::default_cpu(),
             remove_gctypeptr: true,
             last_op_removed: false,
         }
@@ -5330,12 +5333,39 @@ impl OptContext {
         None
     }
 
-    /// optimizer.py:783-790: constant_fold(op).
-    /// Calls protect_speculative_operation, then execute_nonspec_const.
-    /// Returns None on SpeculativeError (fold skipped).
+    /// optimizer.py:810-816 `constant_fold(op)`:
+    ///
+    /// ```python
+    /// def constant_fold(self, op):
+    ///     self.protect_speculative_operation(op)
+    ///     argboxes = [self.get_constant_box(op.getarg(i))
+    ///                 for i in range(op.numargs())]
+    ///     return execute_nonspec_const(self.cpu, None,
+    ///                                    op.getopnum(), argboxes,
+    ///                                    op.getdescr(), op.type)
+    /// ```
+    ///
+    /// Returns `None` when `protect_speculative_operation` rejects the
+    /// op (RPython raises SpeculativeError) or when any arg fails to
+    /// resolve to a `ConstInt`/`ConstPtr`/`ConstFloat` via
+    /// `get_constant_box`. The pre-check at pure.rs:993-1006 normally
+    /// ensures every arg is constant before this is called, so the
+    /// `?` short-circuits would only fire after a structural change to
+    /// the caller.
     pub fn constant_fold(&self, op: &Op) -> Option<Value> {
         self.protect_speculative_operation(op)?;
-        self.execute_nonspec_const(op)
+        let mut argboxes: Vec<Value> = Vec::with_capacity(op.num_args());
+        for i in 0..op.num_args() {
+            let b = self.get_box_replacement_box(op.arg(i))?;
+            argboxes.push(self.get_constant_box(&b)?);
+        }
+        crate::executor::execute_nonspec_const(
+            self.cpu.as_ref(),
+            op.opcode,
+            &argboxes,
+            op.getdescr().as_ref(),
+            op.result_type(),
+        )
     }
 
     /// optimizer.py:791-840: protect_speculative_operation(op).
@@ -5357,84 +5387,6 @@ impl OptContext {
             }
         }
         Some(())
-    }
-
-    /// executor.py:555 execute_nonspec_const → _execute_arglist →
-    /// do_getfield_gc_i → cpu.bh_getfield_gc_i → llmodel.py:467
-    /// read_int_at_mem → llop.raw_load(TYPE, gcref, ofs).
-    ///
-    /// RPython's constant_fold is ultimately a direct memory read.
-    /// Safety is ensured by protect_speculative_operation (null + type
-    /// check) BEFORE this function is called.
-    ///
-    /// GC safety: Ref constants are rooted on the shadow stack via
-    /// ConstantPool (gcreftracer.py parity). GC updates shadow stack
-    /// entries in place; refresh_from_gc propagates to the HashMap
-    /// before optimization reads them. Constants are live during
-    /// optimization (no Python allocations trigger GC).
-    fn execute_nonspec_const(&self, op: &Op) -> Option<Value> {
-        if !op.opcode.is_getfield() {
-            return None;
-        }
-        let arg0 = op.arg(0);
-        let resolved = self.get_box_replacement(arg0);
-        // Resolve the receiver GcRef via the BoxRef chain only — never via
-        // `self.constants[]` (which `seed_constant` pre-populates with
-        // trace-time Ref values that may not match runtime; same
-        // parity rationale as `pure.rs:835` `constant_ptr_value`). Two
-        // valid sources, both PyPy `getinfo()`-equivalent:
-        //   (a) walker advanced to a Const-namespace OpRef → const_pool
-        //   (b) BoxRef terminal carries `Forwarded::Box(constbox)` →
-        //       `BoxKind::Const.value` (orthodox `optimizer.py:432`)
-        let gcref = if resolved.is_constant() {
-            let v = self.const_pool.get(&resolved.const_index()).copied()?;
-            let b = crate::r#box::BoxRef::new_const(v);
-            match self.get_constant_box(&b)? {
-                Value::Ref(r) => r,
-                _ => return None,
-            }
-        } else {
-            let b = self.get_box_replacement_box(resolved)?;
-            if let Some(Value::Ref(r)) = b.const_value() {
-                r
-            } else {
-                return None;
-            }
-        };
-        if gcref.is_null() {
-            return None;
-        }
-        let descr = op.getdescr()?;
-        let fd = descr.as_field_descr()?;
-        let addr = gcref.0 + fd.offset();
-        // llmodel.py:467-478 read_int_at_mem / read_ref_at_mem dispatch.
-        match (fd.field_type(), fd.field_size()) {
-            (majit_ir::Type::Int, 8) => Some(Value::Int(unsafe { *(addr as *const i64) })),
-            (majit_ir::Type::Int, 4) => {
-                if fd.is_field_signed() {
-                    Some(Value::Int(unsafe { *(addr as *const i32) as i64 }))
-                } else {
-                    Some(Value::Int(unsafe { *(addr as *const u32) as i64 }))
-                }
-            }
-            (majit_ir::Type::Int, 2) => {
-                if fd.is_field_signed() {
-                    Some(Value::Int(unsafe { *(addr as *const i16) as i64 }))
-                } else {
-                    Some(Value::Int(unsafe { *(addr as *const u16) as i64 }))
-                }
-            }
-            (majit_ir::Type::Int, 1) => Some(Value::Int(unsafe { *(addr as *const u8) as i64 })),
-            (majit_ir::Type::Float, 8) => {
-                let bits = unsafe { *(addr as *const u64) };
-                Some(Value::Float(f64::from_bits(bits)))
-            }
-            (majit_ir::Type::Ref, _) => {
-                let ptr = unsafe { *(addr as *const usize) };
-                Some(Value::Ref(majit_ir::GcRef(ptr)))
-            }
-            _ => None,
-        }
     }
 
     /// Look up the producing `Op` for an OpRef in `new_operations`.
@@ -5525,7 +5477,19 @@ impl OptContext {
     /// assumptions about it.
     pub fn opref_type(&self, opref: OpRef) -> Option<majit_ir::Type> {
         let resolved = self.get_box_replacement(opref);
-        // 0. RPython `AbstractValue.type` (resoperation.py:29) parity. The
+        // 0. Inputarg slot (recorder-side `InputArg{Int,Ref,Float}.tp`,
+        //    history.py:220 parity per resoperation.py:719/727/739).
+        //    `inputarg_types[idx]` is the canonical Box.type source
+        //    for slot positions — a cross-phase caller that minted the
+        //    OpRef with `input_arg_int(idx)` for a Ref-typed slot would
+        //    mismatch the variant tag against the recorder's actual
+        //    type, so consult the side-table first for inputarg
+        //    positions.  Returns `None` for non-inputarg OpRefs, which
+        //    falls through to the variant-tag step.
+        if let Some(tp) = self.inputarg_type(resolved) {
+            return Some(tp);
+        }
+        // 1. RPython `AbstractValue.type` (resoperation.py:29) parity. The
         //    OpRef enum encodes `box.type` directly in the variant tag
         //    (`ConstInt`/`InputArgInt`/`IntOp` → Int, etc.), so reading
         //    the tag is the line-by-line equivalent of upstream `box.type`.
@@ -5533,23 +5497,15 @@ impl OptContext {
         if let Some(tp) = resolved.ty() {
             return Some(tp);
         }
-        // 1. Seeded constant — read the intrinsic Rust shape (history.py:220
+        // 2. Seeded constant — read the intrinsic Rust shape (history.py:220
         //    `ConstInt.type = INT` parity).
         if let Some(val) = self.get_constant(resolved) {
             return Some(val.get_type());
         }
-        // 2. Producing op's intrinsic `type_` (resoperation.py:1693
+        // 3. Producing op's intrinsic `type_` (resoperation.py:1693
         //    `opclasses[opnum].type` parity). Slice 0.1 populates this
         //    at construction; this is the primary fast path post-Slice-0.5.
         if let Some(tp) = self.get_op_result_type(resolved) {
-            return Some(tp);
-        }
-        // 3. Inputarg slot (recorder-side `InputArg{Int,Ref,Float}.tp`,
-        //    history.py:220 parity per resoperation.py:719/727/739).
-        //    Read-only against `inputarg_types` — must not materialize
-        //    a fresh Box, see `inputarg_type`'s PRE-EXISTING-ADAPTATION
-        //    note.
-        if let Some(tp) = self.inputarg_type(resolved) {
             return Some(tp);
         }
         // 5. PtrInfo-derived type (history.py:220 box.type parity for
@@ -6092,9 +6048,8 @@ impl OptContext {
     /// Walks the BoxRef chain to its constant `Value::Ref(gcref)` payload
     /// (`box.getref_base()` parity) and dispatches `cpu.cls_of_box(raw)`
     /// through the `Cpu` trait object stored at `self.cpu`.  Returns
-    /// `None` when: (a) the box does not resolve to a concrete
-    /// `Value::Ref`, (b) `cpu` is unset (synthetic fixtures that never
-    /// installed a backend), or (c) the gcref is null.
+    /// `None` when the box does not resolve to a concrete `Value::Ref` or
+    /// the gcref is null (`DefaultCpu::cls_of_box` reports both as 0).
     ///
     /// Caller shape mirrors `optimizer.cpu.cls_of_box(box)` — every
     /// invocation (`info.rs`, `virtualstate.rs`, `rewrite.rs`,
@@ -6102,14 +6057,10 @@ impl OptContext {
     /// `bh_*` runtime calls will land on the same `Cpu` trait and lose
     /// the `OptContext::cls_of_box` wrapper as that surface fills out.
     pub fn cls_of_box(&self, op: &crate::r#box::BoxRef) -> Option<majit_ir::GcRef> {
-        // resoperation.py:57-68 walker on the runtime Box, then read the
-        // ConstPtr value off the terminal (`history.py:307 ConstPtr.value`).
-        let raw = match op.get_box_replacement(false).const_value()? {
-            Value::Ref(gcref) if !gcref.is_null() => gcref.0 as i64,
-            _ => return None,
-        };
-        let cpu = self.cpu.as_ref()?;
-        let typeptr = cpu.cls_of_box(raw);
+        // model.py:199-201 `cpu.cls_of_box(box)` — DefaultCpu walks the
+        // BoxRef to its Const terminal and dereferences the GcRef
+        // typeptr-at-offset-0. Returns 0 for non-Ref / null boxes.
+        let typeptr = self.cpu.cls_of_box(op);
         if typeptr == 0 {
             None
         } else {
