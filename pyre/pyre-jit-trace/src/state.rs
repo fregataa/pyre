@@ -2023,22 +2023,14 @@ pub(crate) fn opimpl_getfield_gc_i(ctx: &mut TraceCtx, obj: OpRef, descr: DescrR
         // pyjitpl.py:934-945 cache-hit sanity check (int arm). The
         // line-by-line port runs `executor.execute(cpu, mi, opnum,
         // fielddescr, box)` and asserts `resvalue ==
-        // upd.currfieldbox.getint()`.  Const boxes read from the
-        // constant pool; non-Const recorded op results read from the
-        // `opref_concrete` Box.value analog stamped on the miss path.
-        let expected_int = if cached.is_constant() {
-            match ctx.constants_get_value(cached) {
-                Some(majit_ir::Value::Int(n)) => Some(n),
-                _ => None,
-            }
-        } else {
-            match ctx.lookup_opref_concrete(cached) {
-                Some(majit_ir::Value::Int(n)) => Some(n),
-                _ => None,
-            }
+        // upd.currfieldbox.getint()`.  `cached.value` carries the
+        // upstream Box payload directly — no side-table.
+        let expected_int = match cached.value {
+            majit_ir::Value::Int(n) => Some(n),
+            _ => None,
         };
         if let Some(cached_int) = expected_int {
-            if let majit_ir::Value::Ref(struct_ref) = ctx.concrete_of_opref(obj) {
+            if let Some(majit_ir::Value::Ref(struct_ref)) = ctx.box_value(obj) {
                 let struct_ptr = struct_ref.0 as i64;
                 if struct_ptr != usize::MAX as i64 && struct_ptr != 0 {
                     if let Some(majit_ir::Value::Int(loaded)) =
@@ -2062,7 +2054,7 @@ pub(crate) fn opimpl_getfield_gc_i(ctx: &mut TraceCtx, obj: OpRef, descr: DescrR
             OpCode::GetfieldGcI,
             majit_metainterp::counters::HEAPCACHED_OPS,
         );
-        return cached;
+        return cached.opref;
     }
     // pyjitpl.py:1074-1089: quasi-immutable field handling.
     // Record the field as quasi-immut known so subsequent reads skip
@@ -2095,15 +2087,25 @@ pub(crate) fn opimpl_getfield_gc_i(ctx: &mut TraceCtx, obj: OpRef, descr: DescrR
         OpCode::GetfieldGcI
     };
     let result = ctx.record_op_with_descr(opcode, &[obj], descr.clone());
-    if let majit_ir::Value::Ref(struct_ref) = ctx.concrete_of_opref(obj) {
+    // pyjitpl.py:948-949 `resbox = execute_with_descr(...); upd.getfield_now_known(resbox)`.
+    // `resbox` carries the loaded value; pair the recorded opref with
+    // the live int from `field_sanity_load` so the cache HeapBox
+    // mirrors RPython's executor-returned Box.
+    let live_value = if let Some(majit_ir::Value::Ref(struct_ref)) = ctx.box_value(obj) {
         let struct_ptr = struct_ref.0 as i64;
         if struct_ptr != usize::MAX as i64 && struct_ptr != 0 {
-            if let Some(live) = ctx.field_sanity_load(struct_ptr, &descr, majit_ir::Type::Int) {
-                ctx.set_opref_concrete(result, live);
-            }
+            ctx.field_sanity_load(struct_ptr, &descr, majit_ir::Type::Int)
+                .unwrap_or(majit_ir::Value::Void)
+        } else {
+            majit_ir::Value::Void
         }
+    } else {
+        majit_ir::Value::Void
+    };
+    if !matches!(live_value, majit_ir::Value::Void) {
+        ctx.set_opref_concrete(result, live_value);
     }
-    ctx.heapcache_getfield_now_known(obj, field_index, result);
+    ctx.heapcache_getfield_now_known(obj, field_index, majit_ir::HeapBox::new(result, live_value));
     result
 }
 
@@ -2115,19 +2117,13 @@ pub(crate) fn opimpl_getfield_gc_r(ctx: &mut TraceCtx, obj: OpRef, descr: DescrR
     let field_index = descr.index();
     if let Some(cached) = ctx.heapcache_getfield_cached(obj, field_index) {
         // pyjitpl.py:934-945 cache-hit sanity check (ref arm).
-        let expected_ref = if cached.is_constant() {
-            match ctx.constants_get_value(cached) {
-                Some(majit_ir::Value::Ref(r)) => Some(r),
-                _ => None,
-            }
-        } else {
-            match ctx.lookup_opref_concrete(cached) {
-                Some(majit_ir::Value::Ref(r)) => Some(r),
-                _ => None,
-            }
+        // `cached.value` is the upstream `getref_base()` payload.
+        let expected_ref = match cached.value {
+            majit_ir::Value::Ref(r) => Some(r),
+            _ => None,
         };
         if let Some(cached_ref) = expected_ref {
-            if let majit_ir::Value::Ref(struct_ref) = ctx.concrete_of_opref(obj) {
+            if let Some(majit_ir::Value::Ref(struct_ref)) = ctx.box_value(obj) {
                 let struct_ptr = struct_ref.0 as i64;
                 if struct_ptr != usize::MAX as i64 && struct_ptr != 0 {
                     if let Some(majit_ir::Value::Ref(loaded)) =
@@ -2151,7 +2147,7 @@ pub(crate) fn opimpl_getfield_gc_r(ctx: &mut TraceCtx, obj: OpRef, descr: DescrR
             OpCode::GetfieldGcI,
             majit_metainterp::counters::HEAPCACHED_OPS,
         );
-        return cached;
+        return cached.opref;
     }
     if descr.is_quasi_immutable() {
         if ctx.heap_cache().is_quasi_immut_known(obj, field_index) {
@@ -2174,15 +2170,24 @@ pub(crate) fn opimpl_getfield_gc_r(ctx: &mut TraceCtx, obj: OpRef, descr: DescrR
         OpCode::GetfieldGcR
     };
     let result = ctx.record_op_with_descr(opcode, &[obj], descr.clone());
-    if let majit_ir::Value::Ref(struct_ref) = ctx.concrete_of_opref(obj) {
+    // pyjitpl.py:948-949 `resbox = execute_with_descr(...); upd.getfield_now_known(resbox)`.
+    // Pair the recorded opref with the live ref so the cache HeapBox
+    // mirrors RPython's executor-returned Box.
+    let live_value = if let Some(majit_ir::Value::Ref(struct_ref)) = ctx.box_value(obj) {
         let struct_ptr = struct_ref.0 as i64;
         if struct_ptr != usize::MAX as i64 && struct_ptr != 0 {
-            if let Some(live) = ctx.field_sanity_load(struct_ptr, &descr, majit_ir::Type::Ref) {
-                ctx.set_opref_concrete(result, live);
-            }
+            ctx.field_sanity_load(struct_ptr, &descr, majit_ir::Type::Ref)
+                .unwrap_or(majit_ir::Value::Void)
+        } else {
+            majit_ir::Value::Void
         }
+    } else {
+        majit_ir::Value::Void
+    };
+    if !matches!(live_value, majit_ir::Value::Void) {
+        ctx.set_opref_concrete(result, live_value);
     }
-    ctx.heapcache_getfield_now_known(obj, field_index, result);
+    ctx.heapcache_getfield_now_known(obj, field_index, majit_ir::HeapBox::new(result, live_value));
     result
 }
 
@@ -2399,11 +2404,50 @@ pub(crate) fn trace_array_getitem_value(ctx: &mut TraceCtx, array: OpRef, index:
     let descr = pyobject_gcarray_descr();
     let descr_idx = descr.index();
     if let Some(cached) = ctx.heapcache_getarrayitem(array, index, descr_idx) {
-        return cached;
+        return cached.opref;
     }
-    let result = ctx.record_op_with_descr(OpCode::GetarrayitemGcR, &[array, index], descr);
-    ctx.heapcache_getarrayitem_now_known(array, index, descr_idx, result);
+    let result = ctx.record_op_with_descr(OpCode::GetarrayitemGcR, &[array, index], descr.clone());
+    let live_value = array_load_for_cache(ctx, array, index, &descr, majit_ir::Type::Ref);
+    if !matches!(live_value, majit_ir::Value::Void) {
+        ctx.set_opref_concrete(result, live_value);
+    }
+    ctx.heapcache_getarrayitem_now_known(
+        array,
+        index,
+        descr_idx,
+        majit_ir::HeapBox::new(result, live_value),
+    );
     result
+}
+
+/// Helper: project (array, index) operands and dispatch
+/// `array_sanity_load` to recover the executor-returned payload for
+/// the fresh GetarrayitemGc<I|R|F> result.  Mirrors
+/// `rpython/jit/metainterp/executor.py:117` `do_getarrayitem_gc_*`
+/// which reads `arraybox.getref_base()` / `indexbox.getint()` from
+/// the Box directly — pyre's `box_value` exposes the same chain (Const
+/// pool / standard-virtualizable shadow / `opref_concrete` stamp) so
+/// any operand whose Box.value is known unblocks the sanity load
+/// (not gated on the Const-only fast path).
+fn array_load_for_cache(
+    ctx: &majit_metainterp::TraceCtx,
+    array: OpRef,
+    index: OpRef,
+    descr: &DescrRef,
+    kind: majit_ir::Type,
+) -> majit_ir::Value {
+    let Some(majit_ir::Value::Ref(array_ref)) = ctx.box_value(array) else {
+        return majit_ir::Value::Void;
+    };
+    let array_ptr = array_ref.0 as i64;
+    if array_ptr == usize::MAX as i64 || array_ptr == 0 {
+        return majit_ir::Value::Void;
+    }
+    let Some(majit_ir::Value::Int(index_value)) = ctx.box_value(index) else {
+        return majit_ir::Value::Void;
+    };
+    ctx.array_sanity_load(array_ptr, index_value, descr, kind)
+        .unwrap_or(majit_ir::Value::Void)
 }
 
 /// Read from frame's locals_cells_stack_w — namespace access path.
@@ -2415,10 +2459,19 @@ pub(crate) fn trace_raw_array_getitem_value(
     let descr = pyobject_array_descr();
     let descr_idx = descr.index();
     if let Some(cached) = ctx.heapcache_getarrayitem(array, index, descr_idx) {
-        return cached;
+        return cached.opref;
     }
-    let result = ctx.record_op_with_descr(OpCode::GetarrayitemGcR, &[array, index], descr);
-    ctx.heapcache_getarrayitem_now_known(array, index, descr_idx, result);
+    let result = ctx.record_op_with_descr(OpCode::GetarrayitemGcR, &[array, index], descr.clone());
+    let live_value = array_load_for_cache(ctx, array, index, &descr, majit_ir::Type::Ref);
+    if !matches!(live_value, majit_ir::Value::Void) {
+        ctx.set_opref_concrete(result, live_value);
+    }
+    ctx.heapcache_getarrayitem_now_known(
+        array,
+        index,
+        descr_idx,
+        majit_ir::HeapBox::new(result, live_value),
+    );
     result
 }
 
@@ -2442,10 +2495,19 @@ pub(crate) fn trace_items_block_getitem_value(
     let descr = pyobject_gcarray_descr();
     let descr_idx = descr.index();
     if let Some(cached) = ctx.heapcache_getarrayitem(block, index, descr_idx) {
-        return cached;
+        return cached.opref;
     }
-    let result = ctx.record_op_with_descr(OpCode::GetarrayitemGcR, &[block, index], descr);
-    ctx.heapcache_getarrayitem_now_known(block, index, descr_idx, result);
+    let result = ctx.record_op_with_descr(OpCode::GetarrayitemGcR, &[block, index], descr.clone());
+    let live_value = array_load_for_cache(ctx, block, index, &descr, majit_ir::Type::Ref);
+    if !matches!(live_value, majit_ir::Value::Void) {
+        ctx.set_opref_concrete(result, live_value);
+    }
+    ctx.heapcache_getarrayitem_now_known(
+        block,
+        index,
+        descr_idx,
+        majit_ir::HeapBox::new(result, live_value),
+    );
     result
 }
 
@@ -2460,7 +2522,16 @@ pub(crate) fn trace_items_block_setitem_value(
     let descr = pyobject_gcarray_descr();
     let descr_idx = descr.index();
     ctx.record_op_with_descr(OpCode::SetarrayitemGc, &[block, index, value], descr);
-    ctx.heapcache_setarrayitem(block, index, descr_idx, value);
+    // Box.value parity for cache write — see `box_value` doc in
+    // trace_ctx.rs; `None` collapses to Void so cache-hit sanity
+    // check skips when no Box.value is known.
+    let payload = ctx.box_value(value).unwrap_or(majit_ir::Value::Void);
+    ctx.heapcache_setarrayitem(
+        block,
+        index,
+        descr_idx,
+        majit_ir::HeapBox::new(value, payload),
+    );
 }
 
 pub(crate) fn trace_raw_int_array_getitem_value(
@@ -2494,7 +2565,15 @@ pub(crate) fn trace_raw_array_setitem_value(
     let descr = pyobject_array_descr();
     let descr_idx = descr.index();
     ctx.record_op_with_descr(OpCode::SetarrayitemGc, &[array, index, value], descr);
-    ctx.heapcache_setarrayitem(array, index, descr_idx, value);
+    // Box.value parity for cache write — see `box_value` doc in
+    // trace_ctx.rs.
+    let payload = ctx.box_value(value).unwrap_or(majit_ir::Value::Void);
+    ctx.heapcache_setarrayitem(
+        array,
+        index,
+        descr_idx,
+        majit_ir::HeapBox::new(value, payload),
+    );
 }
 
 pub(crate) fn trace_raw_int_array_setitem_value(
@@ -4253,7 +4332,20 @@ fn materialize_bridge_virtual(
                 signed,
             );
             ctx.record_op_with_descr(OpCode::SetfieldGc, &[struct_op, value], field_descr.clone());
-            ctx.heapcache_setfield_cached(struct_op, fd_info.index, value);
+            // Bridge virtual rematerialisation — `box_value` resolves
+            // Const pool / standard-virtualizable / `opref_concrete`
+            // stamp.  Non-Const values whose runtime concrete was
+            // stamped at the original record site (or threaded from
+            // the parent guard's fail_args via `set_opref_concrete`)
+            // carry their Box.value into the cache entry.  `None`
+            // collapses to Void so cache-hit sanity check skips for
+            // unstamped non-Const operands.
+            let payload = ctx.box_value(value).unwrap_or(majit_ir::Value::Void);
+            ctx.heapcache_setfield_cached(
+                struct_op,
+                fd_info.index,
+                majit_ir::HeapBox::new(value, payload),
+            );
         }
     }
 

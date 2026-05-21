@@ -1147,6 +1147,15 @@ fn binop_int_record(
     let a = read_int_reg(code, op, 0, ctx)?;
     let b = read_int_reg(code, op, 1, ctx)?;
     let result = ctx.trace_ctx.record_op(opcode, &[a, b]);
+    // Box(value) parity: stamp the result from the operands' Box.value
+    // carriers (BoxInt(value) — matches dispatch.rs trace_binop_i).
+    if let (Some(majit_ir::Value::Int(la)), Some(majit_ir::Value::Int(rb))) =
+        (ctx.trace_ctx.box_value(a), ctx.trace_ctx.box_value(b))
+    {
+        let folded = majit_metainterp::eval_binop_i(opcode, la, rb);
+        ctx.trace_ctx
+            .set_opref_concrete(result, majit_ir::Value::Int(folded));
+    }
     let dst = code[op.pc + 3] as usize;
     let len = ctx.registers_i.len();
     let slot = ctx
@@ -1477,13 +1486,57 @@ fn getarrayitem_gc_via_heapcache_with_index_bank(
             OpCode::GetarrayitemGcI,
             majit_metainterp::counters::HEAPCACHED_OPS,
         );
-        cached
+        cached.opref
     } else {
         let resbox = ctx
             .trace_ctx
-            .record_op_with_descr(opcode, &[array, index], descr);
-        ctx.trace_ctx
-            .heapcache_getarrayitem_now_known(array, index, descr_index, resbox);
+            .record_op_with_descr(opcode, &[array, index], descr.clone());
+        // Box.value parity: `box_value` exposes the resolution chain
+        // PyPy reads off `arraybox.getref_base()` / `indexbox.getint()`
+        // (`rpython/jit/metainterp/executor.py:117`).  Any operand
+        // whose Box.value is known unblocks `array_sanity_load`, not
+        // just Const-pool entries (`pyjitpl.py:648-666 resbox =
+        // execute_with_descr(...); getarrayitem_now_known(...)`
+        // parity).
+        let load_type = match opcode {
+            OpCode::GetarrayitemGcI | OpCode::GetarrayitemGcPureI => Some(majit_ir::Type::Int),
+            OpCode::GetarrayitemGcR | OpCode::GetarrayitemGcPureR => Some(majit_ir::Type::Ref),
+            OpCode::GetarrayitemGcF | OpCode::GetarrayitemGcPureF => Some(majit_ir::Type::Float),
+            _ => None,
+        };
+        let live_value = if let (
+            Some(ty),
+            Some(majit_ir::Value::Ref(array_ref)),
+            Some(majit_ir::Value::Int(index_value)),
+        ) = (
+            load_type,
+            ctx.trace_ctx.box_value(array),
+            ctx.trace_ctx.box_value(index),
+        ) {
+            let array_ptr = array_ref.0 as i64;
+            if array_ptr != usize::MAX as i64 && array_ptr != 0 {
+                ctx.trace_ctx
+                    .array_sanity_load(array_ptr, index_value, &descr, ty)
+                    .unwrap_or(majit_ir::Value::Void)
+            } else {
+                majit_ir::Value::Void
+            }
+        } else {
+            majit_ir::Value::Void
+        };
+        // Stamp the loaded value as Box.value of the recorded result
+        // (RPython `Box(value)` constructor analog) so subsequent
+        // consumers see the runtime concrete instead of the
+        // GcRef(usize::MAX) sentinel.
+        if !matches!(live_value, majit_ir::Value::Void) {
+            ctx.trace_ctx.set_opref_concrete(resbox, live_value);
+        }
+        ctx.trace_ctx.heapcache_getarrayitem_now_known(
+            array,
+            index,
+            descr_index,
+            majit_ir::HeapBox::new(resbox, live_value),
+        );
         resbox
     };
 
@@ -1564,8 +1617,23 @@ fn setarrayitem_gc_via_heapcache(
 
     ctx.trace_ctx
         .record_op_with_descr(OpCode::SetarrayitemGc, &[array, index, value], descr);
-    ctx.trace_ctx
-        .heapcache_setarrayitem(array, index, descr_index, value);
+    // Box.value parity: `box_value` resolves Const pool /
+    // standard-virtualizable / `opref_concrete` stamp; `None` for
+    // ops whose runtime result was not computed at trace time
+    // collapses to `Value::Void` so the downstream cache-hit sanity
+    // check skips.  Mirrors PyPy's `upd.setfield(valuebox)`
+    // (heapcache.py:142) where `valuebox.getint()/getref_base()`
+    // payload travels with the Box.
+    let value_payload = ctx
+        .trace_ctx
+        .box_value(value)
+        .unwrap_or(majit_ir::Value::Void);
+    ctx.trace_ctx.heapcache_setarrayitem(
+        array,
+        index,
+        descr_index,
+        majit_ir::HeapBox::new(value, value_payload),
+    );
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
@@ -1626,7 +1694,11 @@ fn setfield_gc_via_heapcache(
     //   if upd.currfieldbox is valuebox:
     //       self.metainterp.staticdata.profiler.count_ops(rop.SETFIELD_GC, Counters.HEAPCACHED_OPS)
     //       return
-    let is_redundant = ctx.trace_ctx.heapcache_getfield_cached(obj, descr_index) == Some(valuebox);
+    let is_redundant = ctx
+        .trace_ctx
+        .heapcache_getfield_cached(obj, descr_index)
+        .map(|b| b.opref)
+        == Some(valuebox);
     if is_redundant {
         ctx.trace_ctx.profiler().count_ops(
             OpCode::SetfieldGc,
@@ -1635,12 +1707,25 @@ fn setfield_gc_via_heapcache(
     } else {
         ctx.trace_ctx
             .record_op_with_descr(OpCode::SetfieldGc, &[obj, valuebox], descr);
-        // Write-through with alias-clearing semantics.
-        // RPython `upd.setfield(valuebox)` → `CacheEntry.do_write_with_aliasing`
-        // (heapcache.py:90-94): canonicalise via `_unique_const_heuristic`,
-        // `_clear_cache_on_write(seen_alloc)`, then insert.
-        ctx.trace_ctx
-            .heapcache_setfield_cached(obj, descr_index, valuebox);
+        // Write-through with alias-clearing semantics
+        // (`heapcache.py:90-94 do_write_with_aliasing`).  Box.value
+        // parity: `box_value` resolves Const pool /
+        // standard-virtualizable / `opref_concrete` stamp; `None`
+        // collapses to `Value::Void` so the downstream cache-hit
+        // sanity check skips for ops whose runtime result was not
+        // computed at trace time.  Mirrors PyPy's
+        // `upd.setfield(valuebox)` (heapcache.py:142) where
+        // `valuebox.getint()/getref_base()` payload travels with the
+        // Box.
+        let valuebox_payload = ctx
+            .trace_ctx
+            .box_value(valuebox)
+            .unwrap_or(majit_ir::Value::Void);
+        ctx.trace_ctx.heapcache_setfield_cached(
+            obj,
+            descr_index,
+            majit_ir::HeapBox::new(valuebox, valuebox_payload),
+        );
     }
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
@@ -1695,12 +1780,50 @@ fn getfield_gc_via_heapcache(
             OpCode::GetfieldGcI,
             majit_metainterp::counters::HEAPCACHED_OPS,
         );
-        cached
+        cached.opref
     } else {
-        // Cache miss — record op + write through.
-        let resbox = ctx.trace_ctx.record_op_with_descr(opcode, &[obj], descr);
-        ctx.trace_ctx
-            .heapcache_getfield_now_known(obj, descr_index, resbox);
+        // Cache miss — record op + write through.  `box_value`
+        // resolves the Box.value chain PyPy reads off
+        // `box.getref_base()` in `executor.do_getfield_gc_*`
+        // (`executor.py:188`); the sanity load fires whenever the
+        // struct pointer is known (Const, vable shadow, or stamped),
+        // mirroring `pyjitpl.py:948-949 resbox = execute_with_descr(...);
+        // upd.getfield_now_known(resbox)`.
+        let resbox = ctx
+            .trace_ctx
+            .record_op_with_descr(opcode, &[obj], descr.clone());
+        let load_type = match opcode {
+            OpCode::GetfieldGcI | OpCode::GetfieldGcPureI => Some(majit_ir::Type::Int),
+            OpCode::GetfieldGcR | OpCode::GetfieldGcPureR => Some(majit_ir::Type::Ref),
+            OpCode::GetfieldGcF | OpCode::GetfieldGcPureF => Some(majit_ir::Type::Float),
+            _ => None,
+        };
+        let live_value = if let (Some(ty), Some(majit_ir::Value::Ref(struct_ref))) =
+            (load_type, ctx.trace_ctx.box_value(obj))
+        {
+            let struct_ptr = struct_ref.0 as i64;
+            if struct_ptr != usize::MAX as i64 && struct_ptr != 0 {
+                ctx.trace_ctx
+                    .field_sanity_load(struct_ptr, &descr, ty)
+                    .unwrap_or(majit_ir::Value::Void)
+            } else {
+                majit_ir::Value::Void
+            }
+        } else {
+            majit_ir::Value::Void
+        };
+        // Stamp the loaded value as the Box.value of the recorded
+        // result so subsequent reads (cache hits + non-Const
+        // `concrete_of_opref` consumers) see the real runtime
+        // concrete instead of the GcRef(usize::MAX) sentinel.
+        if !matches!(live_value, majit_ir::Value::Void) {
+            ctx.trace_ctx.set_opref_concrete(resbox, live_value);
+        }
+        ctx.trace_ctx.heapcache_getfield_now_known(
+            obj,
+            descr_index,
+            majit_ir::HeapBox::new(resbox, live_value),
+        );
         resbox
     };
 
@@ -1908,6 +2031,13 @@ fn unop_int_record(
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let a = read_int_reg(code, op, 0, ctx)?;
     let result = ctx.trace_ctx.record_op(opcode, &[a]);
+    // Box(value) parity: stamp the unary result from the operand's
+    // Box.value carrier (matches dispatch.rs trace_unary_i).
+    if let Some(majit_ir::Value::Int(n)) = ctx.trace_ctx.box_value(a) {
+        let folded = majit_metainterp::eval_unary_i(opcode, n);
+        ctx.trace_ctx
+            .set_opref_concrete(result, majit_ir::Value::Int(folded));
+    }
     let dst = code[op.pc + 2] as usize;
     let len = ctx.registers_i.len();
     let slot = ctx
@@ -1939,6 +2069,19 @@ fn binop_ref_to_int_record(
     let a = read_ref_reg(code, op, 0, ctx)?;
     let b = read_ref_reg(code, op, 1, ctx)?;
     let result = ctx.trace_ctx.record_op(opcode, &[a, b]);
+    // Box(value) parity: stamp the bool result from the operands' Box.value
+    // carriers (matches dispatch.rs trace_binop_r_to_i).
+    if let (Some(majit_ir::Value::Ref(la)), Some(majit_ir::Value::Ref(rb))) =
+        (ctx.trace_ctx.box_value(a), ctx.trace_ctx.box_value(b))
+    {
+        let folded = match opcode {
+            OpCode::PtrEq | OpCode::InstancePtrEq => (la == rb) as i64,
+            OpCode::PtrNe | OpCode::InstancePtrNe => (la != rb) as i64,
+            _ => panic!("binop_ref_to_int_record: unsupported opcode {opcode:?}"),
+        };
+        ctx.trace_ctx
+            .set_opref_concrete(result, majit_ir::Value::Int(folded));
+    }
     let dst = code[op.pc + 3] as usize;
     let len = ctx.registers_i.len();
     let slot = ctx
@@ -1980,6 +2123,12 @@ fn ptr_nonzero_record(
     let box_ = read_ref_reg(code, op, 0, ctx)?;
     let null_const = ctx.trace_ctx.const_null();
     let result = ctx.trace_ctx.record_op(OpCode::PtrNe, &[box_, null_const]);
+    // Box(value) parity: stamp the nullity result from the operand's
+    // Box.value carrier (matches dispatch.rs trace_ptr_nullity nonzero=true).
+    if let Some(majit_ir::Value::Ref(r)) = ctx.trace_ctx.box_value(box_) {
+        ctx.trace_ctx
+            .set_opref_concrete(result, majit_ir::Value::Int((r.0 != 0) as i64));
+    }
     let dst = code[op.pc + 2] as usize;
     let len = ctx.registers_i.len();
     let slot = ctx
@@ -2073,6 +2222,16 @@ fn binop_float_to_int_record(
     let a = read_float_reg(code, op, 0, ctx)?;
     let b = read_float_reg(code, op, 1, ctx)?;
     let result = ctx.trace_ctx.record_op(opcode, &[a, b]);
+    // Box(value) parity: stamp the bool result from the operands' Box.value
+    // carriers (matches dispatch.rs GOTO_IF_NOT_FLOAT_* + trace_float_compare).
+    if let (Some(majit_ir::Value::Float(fa)), Some(majit_ir::Value::Float(fb))) =
+        (ctx.trace_ctx.box_value(a), ctx.trace_ctx.box_value(b))
+    {
+        let folded =
+            majit_metainterp::eval_float_cmp(opcode, fa.to_bits() as i64, fb.to_bits() as i64);
+        ctx.trace_ctx
+            .set_opref_concrete(result, majit_ir::Value::Int(folded));
+    }
     let dst = code[op.pc + 3] as usize;
     let len = ctx.registers_i.len();
     let slot = ctx
@@ -2100,6 +2259,13 @@ fn cast_int_to_float_record(
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let a = read_int_reg(code, op, 0, ctx)?;
     let result = ctx.trace_ctx.record_op(OpCode::CastIntToFloat, &[a]);
+    // Box.value parity — if `a`'s runtime concrete is known, stamp
+    // the cast result with the corresponding float bit-pattern so
+    // downstream `box_value(result)` callers see the live value.
+    if let Some(majit_ir::Value::Int(n)) = ctx.trace_ctx.box_value(a) {
+        ctx.trace_ctx
+            .set_opref_concrete(result, majit_ir::Value::Float(n as f64));
+    }
     let dst = code[op.pc + 2] as usize;
     let len = ctx.registers_f.len();
     let slot = ctx
@@ -2130,6 +2296,15 @@ fn binop_float_record(
     let a = read_float_reg(code, op, 0, ctx)?;
     let b = read_float_reg(code, op, 1, ctx)?;
     let result = ctx.trace_ctx.record_op(opcode, &[a, b]);
+    // Box(value) parity: stamp the result from the operands' Box.value
+    // carriers (matches dispatch.rs trace_binop_f).
+    if let (Some(majit_ir::Value::Float(fa)), Some(majit_ir::Value::Float(fb))) =
+        (ctx.trace_ctx.box_value(a), ctx.trace_ctx.box_value(b))
+    {
+        let bits = majit_metainterp::eval_binop_f(opcode, fa.to_bits() as i64, fb.to_bits() as i64);
+        ctx.trace_ctx
+            .set_opref_concrete(result, majit_ir::Value::Float(f64::from_bits(bits as u64)));
+    }
     let dst = code[op.pc + 3] as usize;
     let len = ctx.registers_f.len();
     let slot = ctx
@@ -2157,6 +2332,13 @@ fn unop_float_record(
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let a = read_float_reg(code, op, 0, ctx)?;
     let result = ctx.trace_ctx.record_op(opcode, &[a]);
+    // Box(value) parity: stamp the unary float result (matches dispatch.rs
+    // trace_unary_f — FloatNeg / FloatAbs).
+    if let Some(majit_ir::Value::Float(fa)) = ctx.trace_ctx.box_value(a) {
+        let bits = majit_metainterp::eval_unary_f(opcode, fa.to_bits() as i64);
+        ctx.trace_ctx
+            .set_opref_concrete(result, majit_ir::Value::Float(f64::from_bits(bits as u64)));
+    }
     let dst = code[op.pc + 2] as usize;
     let len = ctx.registers_f.len();
     let slot = ctx
@@ -4269,9 +4451,12 @@ fn handle(
             let a = read_int_reg(code, op, 0, ctx)?;
             let result = ctx.trace_ctx.record_op(OpCode::CastIntToPtr, &[a]);
             let dst = code[op.pc + 2] as usize;
-            // Recorded CastIntToPtr — walker doesn't compute the
-            // concrete pointer value (would need the Int-bank concrete
-            // shadow which Step 2.2 doesn't add).
+            // Box(value) parity: bit-cast the operand's Box.value
+            // (BoxInt(n) → BoxRef(n as ptr)).
+            if let Some(majit_ir::Value::Int(n)) = ctx.trace_ctx.box_value(a) {
+                ctx.trace_ctx
+                    .set_opref_concrete(result, majit_ir::Value::Ref(majit_ir::GcRef(n as usize)));
+            }
             write_ref_reg(ctx, op.pc, dst, result, ConcreteValue::Null)?;
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
@@ -4279,6 +4464,12 @@ fn handle(
         "cast_ptr_to_int/r>i" => {
             let a = read_ref_reg(code, op, 0, ctx)?;
             let result = ctx.trace_ctx.record_op(OpCode::CastPtrToInt, &[a]);
+            // Box(value) parity: bit-cast the operand's Box.value
+            // (BoxRef(p) → BoxInt(p as i64)).
+            if let Some(majit_ir::Value::Ref(r)) = ctx.trace_ctx.box_value(a) {
+                ctx.trace_ctx
+                    .set_opref_concrete(result, majit_ir::Value::Int(r.0 as i64));
+            }
             let dst = code[op.pc + 2] as usize;
             let len = ctx.registers_i.len();
             let slot = ctx
@@ -10308,7 +10499,11 @@ mod tests {
         // already cached the field's value. RPython equivalent:
         // `heapcache.getfield_now_known(...)` after a prior fetch.
         let cached_field = tc.const_int(0xCAFE);
-        tc.heapcache_getfield_now_known(obj, 1, cached_field);
+        tc.heapcache_getfield_now_known(
+            obj,
+            1,
+            majit_ir::HeapBox::new(cached_field, majit_ir::Value::Int(0xCAFE)),
+        );
         let ops_before = tc.num_ops();
 
         let mut wc = WalkContext {
@@ -10595,7 +10790,10 @@ mod tests {
         let descr_pool: Vec<DescrRef> = vec![make_fail_descr(0), descr];
         let frame_done = done_descr_ref_for_tests();
         // Pre-cache valuebox as the current field value.
-        tc.heapcache_getfield_now_known(obj, 1, valuebox);
+        let valuebox_payload = tc
+            .constants_get_value(valuebox)
+            .unwrap_or(majit_ir::Value::Void);
+        tc.heapcache_getfield_now_known(obj, 1, majit_ir::HeapBox::new(valuebox, valuebox_payload));
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
             registers_r: &mut regs_r,
@@ -10676,9 +10874,10 @@ mod tests {
             &last.getdescr().expect("SetfieldGc must carry descr"),
             &descr,
         ),);
-        // Cache must now know the new field value.
+        // Cache must now know the new field value.  Box identity-only
+        // check — value payload is Void in walker-emitted writes.
         assert_eq!(
-            tc.heapcache_getfield_cached(obj, 1),
+            tc.heapcache_getfield_cached(obj, 1).map(|b| b.opref),
             Some(valuebox),
             "post-setfield, the heapcache must reflect the written value",
         );
@@ -10813,7 +11012,15 @@ mod tests {
         let descr_pool: Vec<DescrRef> = vec![make_fail_descr(0), descr];
         let frame_done = done_descr_ref_for_tests();
         let cached = tc.const_ref(0xCAFE_F00D);
-        tc.heapcache_getarrayitem_now_known(array, index, 1, cached);
+        let cached_payload = tc
+            .constants_get_value(cached)
+            .unwrap_or(majit_ir::Value::Void);
+        tc.heapcache_getarrayitem_now_known(
+            array,
+            index,
+            1,
+            majit_ir::HeapBox::new(cached, cached_payload),
+        );
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
             registers_r: &mut regs_r,
@@ -10969,9 +11176,10 @@ mod tests {
             &last.getdescr().expect("must carry array descr"),
             &descr,
         ));
-        // Heapcache must reflect the write.
+        // Heapcache must reflect the write.  Box identity-only check —
+        // value payload is Void in walker-emitted writes.
         assert_eq!(
-            tc.heapcache_getarrayitem(array, index, 1),
+            tc.heapcache_getarrayitem(array, index, 1).map(|b| b.opref),
             Some(value),
             "post-setarrayitem, heapcache must reflect the written value",
         );

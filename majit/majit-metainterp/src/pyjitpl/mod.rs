@@ -10,9 +10,8 @@ pub use dispatch::{
     trace_jitcode_observer_with_args_and_runtime, trace_jitcode_with_args,
     trace_jitcode_with_args_and_runtime,
 };
-pub(crate) use dispatch::{
-    call_int_function, call_ref_function, call_void_function, eval_binop_f, eval_binop_i,
-};
+pub(crate) use dispatch::{call_int_function, call_ref_function, call_void_function};
+pub use dispatch::{eval_binop_f, eval_binop_i, eval_float_cmp, eval_unary_f, eval_unary_i};
 pub use frame::{MIFrame, MIFrameStack};
 
 use std::collections::HashMap;

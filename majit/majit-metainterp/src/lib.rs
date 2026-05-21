@@ -76,6 +76,7 @@ pub use jitcode::{
 };
 pub use jitdriver::{DeclarativeJitDriver, JitDriver, JitDriverStaticData};
 pub use majit_backend::CompiledTraceInfo;
+pub use pyjitpl::{eval_binop_f, eval_binop_i, eval_float_cmp, eval_unary_f, eval_unary_i};
 // Re-export the canonical translate-side Assembler so macro-emitted
 // state-field JIT setup (e.g. `__JitMeta::install_canonical_liveness`)
 // can build a fresh Assembler without forcing each user crate to

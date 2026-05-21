@@ -166,7 +166,7 @@ impl Value {
 /// `FieldUpdater.currfieldbox = fieldbox` where `fieldbox` is the Box
 /// returned by `executor.execute(...)` and therefore carries the
 /// just-loaded value alongside its identity.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HeapBox {
     pub opref: crate::resoperation::OpRef,
     pub value: Value,

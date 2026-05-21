@@ -1814,7 +1814,7 @@ where
                         ),
                     }
                 };
-                let (opref, reg_concrete) = if let Some(cached_opref) = cached {
+                let (opref, reg_concrete) = if let Some(cached) = cached {
                     // pyjitpl.py:646 `count_ops(rop.GETARRAYITEM_GC_I,
                     // Counters.HEAPCACHED_OPS)` — folded-away op accounting.
                     ctx.profiler().count_ops(
@@ -1833,19 +1833,17 @@ where
                     // (`mark_escaped` does not escape the read,
                     // `clear_caches_not_necessary` returns True), so
                     // the heapcache state is intentionally left
-                    // untouched.  Pyre recovers `tobox.getint()`
-                    // either via the constant pool (ConstInt cached
-                    // oprefs) or via the unified `opref_concrete`
-                    // Box.value analog (dispatch tracks via the typed
-                    // `array_cache_track_concrete_int` accessor);
-                    // untracked op-result oprefs from non-dispatch
-                    // callers fall through without a check.
-                    let expected =
-                        ctx.array_cache_lookup_concrete_int(cached_opref)
-                            .or_else(|| match ctx.constants_get_value(cached_opref) {
-                                Some(majit_ir::Value::Int(n)) => Some(n),
-                                _ => None,
-                            });
+                    // untouched.  `cached.value` is the upstream
+                    // `tobox.getint()` payload — populated on the
+                    // MISS branch (when the dispatch register carried
+                    // the live concrete) and preserved by the cache
+                    // entry across hits.  `Value::Void` payloads
+                    // (entries seeded without a live concrete) skip
+                    // the check.
+                    let expected = match cached.value {
+                        majit_ir::Value::Int(n) => Some(n),
+                        _ => None,
+                    };
                     // Cache hit propagates the stale `tobox.getint()`
                     // into the destination on mismatch — pyjitpl.py:669
                     // returns `tobox` so the caller sees the cached
@@ -1883,7 +1881,7 @@ where
                     } else {
                         concrete
                     };
-                    (cached_opref, reg_concrete)
+                    (cached.opref, reg_concrete)
                 } else {
                     let opref = ctx.record_op_with_descr(
                         OpCode::GetarrayitemGcI,
@@ -1891,13 +1889,21 @@ where
                         descr,
                     );
                     // pyjitpl.py:671-672 `heapcache.getarrayitem_now_known`.
+                    // Pair the recorded opref with the live `concrete`
+                    // payload — mirrors RPython's `resbox` Box carrying
+                    // both identity and value from `executor.execute`.
+                    // `Box.value` parity: stamp the result OpRef so
+                    // subsequent `box_value(opref)` / `concrete_of_opref`
+                    // consumers see the runtime concrete (the value lives
+                    // on the Box in RPython; pyre's OpRef carries it
+                    // through `opref_concrete`).
+                    ctx.set_opref_concrete(opref, majit_ir::Value::Int(concrete));
                     ctx.heapcache_getarrayitem_now_known(
                         array_opref,
                         index_opref,
                         descr_index,
-                        opref,
+                        majit_ir::HeapBox::new(opref, majit_ir::Value::Int(concrete)),
                     );
-                    ctx.array_cache_track_concrete_int(opref, concrete);
                     (opref, concrete)
                 };
                 self.set_int_reg(dst, Some(opref), Some(reg_concrete));
@@ -2209,6 +2215,7 @@ where
                 let (src, src_value) = self.read_int_reg(src_idx);
                 let cond_value = if src_value == 0 { 1 } else { 0 };
                 let cond = ctx.record_op(OpCode::IntIsZero, &[src]);
+                ctx.set_opref_concrete(cond, majit_ir::Value::Int(cond_value));
                 let guard = if cond_value == 0 {
                     OpCode::GuardFalse
                 } else {
@@ -2248,6 +2255,7 @@ where
                 };
                 let cond_value = eval_binop_i(opcode, lhs_value, rhs_value);
                 let cond = ctx.record_op(opcode, &[lhs, rhs]);
+                ctx.set_opref_concrete(cond, majit_ir::Value::Int(cond_value));
                 let guard = if cond_value == 0 {
                     OpCode::GuardFalse
                 } else {
@@ -2288,6 +2296,7 @@ where
                     _ => unreachable!(),
                 };
                 let cond = ctx.record_op(opcode, &[lhs, rhs]);
+                ctx.set_opref_concrete(cond, majit_ir::Value::Int(taken as i64));
                 let guard = if taken {
                     OpCode::GuardTrue
                 } else {
@@ -2321,6 +2330,7 @@ where
                     _ => unreachable!(),
                 };
                 let cond = ctx.record_op(opcode, &[lhs, rhs]);
+                ctx.set_opref_concrete(cond, majit_ir::Value::Int(taken as i64));
                 let guard = if taken {
                     OpCode::GuardTrue
                 } else {
@@ -2354,6 +2364,7 @@ where
                     _ => unreachable!(),
                 };
                 let cond = ctx.record_op(opcode, &[src, null]);
+                ctx.set_opref_concrete(cond, majit_ir::Value::Int(cond_value));
                 let guard = if cond_value == 0 {
                     OpCode::GuardFalse
                 } else {
@@ -4873,7 +4884,12 @@ where
             }
         }
         let value = eval_binop_i(opcode, lhs_value, rhs_value);
-        self.set_int_reg(dst, Some(ctx.record_op(opcode, &[lhs, rhs])), Some(value));
+        let opref = ctx.record_op(opcode, &[lhs, rhs]);
+        // `Box(value)` parity: stamp the result OpRef with its
+        // runtime concrete so downstream `box_value(opref)` consumers
+        // see the value (matches PyPy `BoxInt(value)` carrier).
+        ctx.set_opref_concrete(opref, majit_ir::Value::Int(value));
+        self.set_int_reg(dst, Some(opref), Some(value));
     }
 
     fn trace_unary_i(&mut self, ctx: &mut TraceCtx, opcode: OpCode) {
@@ -4885,7 +4901,9 @@ where
         };
         let (src, src_value) = self.read_int_reg(src_idx);
         let value = eval_unary_i(opcode, src_value);
-        self.set_int_reg(dst, Some(ctx.record_op(opcode, &[src])), Some(value));
+        let opref = ctx.record_op(opcode, &[src]);
+        ctx.set_opref_concrete(opref, majit_ir::Value::Int(value));
+        self.set_int_reg(dst, Some(opref), Some(value));
     }
 
     /// Ref binop tracer helper returning an int result.
@@ -4910,7 +4928,9 @@ where
             OpCode::PtrNe | OpCode::InstancePtrNe => (lhs_value != rhs_value) as i64,
             other => panic!("trace_binop_r_to_i: unsupported opcode {other:?}"),
         };
-        self.set_int_reg(dst, Some(ctx.record_op(opcode, &[lhs, rhs])), Some(value));
+        let opref = ctx.record_op(opcode, &[lhs, rhs]);
+        ctx.set_opref_concrete(opref, majit_ir::Value::Int(value));
+        self.set_int_reg(dst, Some(opref), Some(value));
     }
 
     /// Unary ref nullity checks trace as PTR_EQ/PTR_NE against CONST_NULL.
@@ -4933,7 +4953,9 @@ where
         } else {
             (src_value == 0) as i64
         };
-        self.set_int_reg(dst, Some(ctx.record_op(opcode, &[src, null])), Some(value));
+        let opref = ctx.record_op(opcode, &[src, null]);
+        ctx.set_opref_concrete(opref, majit_ir::Value::Int(value));
+        self.set_int_reg(dst, Some(opref), Some(value));
     }
 
     /// Per-opname float binop tracer helper.
@@ -4948,7 +4970,9 @@ where
         let (lhs, lhs_value) = self.read_float_reg(lhs_idx);
         let (rhs, rhs_value) = self.read_float_reg(rhs_idx);
         let value = eval_binop_f(opcode, lhs_value, rhs_value);
-        self.set_float_reg(dst, Some(ctx.record_op(opcode, &[lhs, rhs])), Some(value));
+        let opref = ctx.record_op(opcode, &[lhs, rhs]);
+        ctx.set_opref_concrete(opref, majit_ir::Value::Float(f64::from_bits(value as u64)));
+        self.set_float_reg(dst, Some(opref), Some(value));
     }
 
     fn trace_unary_f(&mut self, ctx: &mut TraceCtx, opcode: OpCode) {
@@ -4960,7 +4984,9 @@ where
         };
         let (src, src_value) = self.read_float_reg(src_idx);
         let value = eval_unary_f(opcode, src_value);
-        self.set_float_reg(dst, Some(ctx.record_op(opcode, &[src])), Some(value));
+        let opref = ctx.record_op(opcode, &[src]);
+        ctx.set_opref_concrete(opref, majit_ir::Value::Float(f64::from_bits(value as u64)));
+        self.set_float_reg(dst, Some(opref), Some(value));
     }
 }
 
@@ -5117,11 +5143,11 @@ pub(crate) fn fastpath_same_boxes(opcode: OpCode) -> Option<i64> {
     }
 }
 
-pub(crate) fn eval_binop_i(opcode: OpCode, lhs: i64, rhs: i64) -> i64 {
+pub fn eval_binop_i(opcode: OpCode, lhs: i64, rhs: i64) -> i64 {
     match opcode {
-        OpCode::IntAdd => lhs.wrapping_add(rhs),
-        OpCode::IntSub => lhs.wrapping_sub(rhs),
-        OpCode::IntMul => lhs.wrapping_mul(rhs),
+        OpCode::IntAdd | OpCode::IntAddOvf => lhs.wrapping_add(rhs),
+        OpCode::IntSub | OpCode::IntSubOvf => lhs.wrapping_sub(rhs),
+        OpCode::IntMul | OpCode::IntMulOvf => lhs.wrapping_mul(rhs),
         OpCode::IntFloorDiv => {
             if rhs == 0 {
                 0
@@ -5157,7 +5183,7 @@ pub(crate) fn eval_binop_i(opcode: OpCode, lhs: i64, rhs: i64) -> i64 {
     }
 }
 
-pub(crate) fn eval_unary_i(opcode: OpCode, value: i64) -> i64 {
+pub fn eval_unary_i(opcode: OpCode, value: i64) -> i64 {
     match opcode {
         OpCode::IntNeg => value.wrapping_neg(),
         OpCode::IntInvert => !value,
@@ -5166,7 +5192,7 @@ pub(crate) fn eval_unary_i(opcode: OpCode, value: i64) -> i64 {
 }
 
 /// Evaluate a float binary operation. Values are stored as i64 (bit-cast).
-pub(crate) fn eval_binop_f(opcode: OpCode, lhs: i64, rhs: i64) -> i64 {
+pub fn eval_binop_f(opcode: OpCode, lhs: i64, rhs: i64) -> i64 {
     let a = f64::from_bits(lhs as u64);
     let b = f64::from_bits(rhs as u64);
     let result = match opcode {
@@ -5181,8 +5207,24 @@ pub(crate) fn eval_binop_f(opcode: OpCode, lhs: i64, rhs: i64) -> i64 {
     f64::to_bits(result) as i64
 }
 
+/// Evaluate a float comparison. Operands are stored as i64 (bit-cast f64).
+/// Result is bool encoded as i64 (0 or 1).
+pub fn eval_float_cmp(opcode: OpCode, lhs: i64, rhs: i64) -> i64 {
+    let a = f64::from_bits(lhs as u64);
+    let b = f64::from_bits(rhs as u64);
+    match opcode {
+        OpCode::FloatLt => i64::from(a < b),
+        OpCode::FloatLe => i64::from(a <= b),
+        OpCode::FloatEq => i64::from(a == b),
+        OpCode::FloatNe => i64::from(a != b),
+        OpCode::FloatGt => i64::from(a > b),
+        OpCode::FloatGe => i64::from(a >= b),
+        other => panic!("unsupported jitcode float compare {other:?}"),
+    }
+}
+
 /// Evaluate a float unary operation.
-pub(crate) fn eval_unary_f(opcode: OpCode, value: i64) -> i64 {
+pub fn eval_unary_f(opcode: OpCode, value: i64) -> i64 {
     let a = f64::from_bits(value as u64);
     let result = match opcode {
         OpCode::FloatNeg => -a,

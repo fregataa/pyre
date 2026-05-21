@@ -1141,8 +1141,8 @@ impl<'a> Transformer<'a> {
                 rhs,
                 result_ty,
             } if matches!(binop_name.as_str(), "mod" | "floordiv" | "div")
-                && self.get_value_kind_var(graph, lhs) == 'i'
-                && self.get_value_kind_var(graph, rhs) == 'i'
+                && matches!(self.get_value_kind_var(graph, lhs), 'i' | 'r')
+                && matches!(self.get_value_kind_var(graph, rhs), 'i' | 'r')
                 && self.binop_result_is_int(graph, op.result.as_ref(), result_ty) =>
             {
                 // **Rust low-level → RPython low-level.**  Pyre's
@@ -1190,19 +1190,35 @@ impl<'a> Transformer<'a> {
                 } else {
                     "floordiv"
                 };
+                // RPython parity (`rint.py:246-262 rtype_mod` /
+                // `rtype_floordiv`): the rtyper calls `hop.inputargs(
+                // Signed, Signed)` which inserts `cast_ptr_to_int` for
+                // any Ref-typed operand before lowering to the residual.
+                // Pyre makes the coercion explicit here for the same
+                // shape: a `r`-typed LHS or RHS (e.g. raw `code_ptr as
+                // usize` whose cast survived the front-end but was
+                // folded out of the SSA chain by an upstream pass) is
+                // routed through `cast_ptr_to_int` first so the residual
+                // call sees Signed operands like upstream does.
+                let (lhs_var, lhs_pre_ops) = self.coerce_operand_to_int(graph, lhs);
+                let (rhs_var, rhs_pre_ops) = self.coerce_operand_to_int(graph, rhs);
                 let lhs_vid = graph
-                    .value_id_of(lhs)
+                    .value_id_of(&lhs_var)
                     .expect("BinOp lhs has backing ValueId");
                 let rhs_vid = graph
-                    .value_id_of(rhs)
+                    .value_id_of(&rhs_var)
                     .expect("BinOp rhs has backing ValueId");
-                RewriteResult::Replace(self.emit_int_mod_or_floordiv_residual(
+                let mut ops = Vec::with_capacity(lhs_pre_ops.len() + rhs_pre_ops.len() + 2);
+                ops.extend(lhs_pre_ops);
+                ops.extend(rhs_pre_ops);
+                ops.extend(self.emit_int_mod_or_floordiv_residual(
                     graph,
                     helper_key,
                     lhs_vid,
                     rhs_vid,
                     op.result.clone(),
-                ))
+                ));
+                RewriteResult::Replace(ops)
             }
             // RPython `Transformer.rewrite_op_float_is_true(self, op)`
             // (`jtransform.py:1627-1631`):
@@ -1733,6 +1749,40 @@ impl<'a> Transformer<'a> {
                     op: "cast_int_to_float".into(),
                     operand: value.clone(),
                     result_ty: ValueType::Float,
+                },
+            }],
+        )
+    }
+
+    /// RPython's int rtyper calls `hop.inputargs(Signed, Signed)`, which
+    /// inserts `cast_ptr_to_int` for any Ref-typed operand before lowering
+    /// to the Signed-domain primitive.  Pyre makes the coercion explicit
+    /// at jtransform when a `r`-typed operand reaches an arithmetic site
+    /// that requires int operands (e.g. `int_mod` / `int_floordiv`
+    /// residual emission): synthesize a fresh Int SSA value and emit a
+    /// `cast_ptr_to_int` unary op materializing it.  Non-Ref operands are
+    /// returned unchanged.
+    fn coerce_operand_to_int(
+        &mut self,
+        graph: &mut FunctionGraph,
+        value: &crate::flowspace::model::Variable,
+    ) -> (crate::flowspace::model::Variable, Vec<SpaceOperation>) {
+        if self.get_value_kind_var(graph, value) != 'r' {
+            return (value.clone(), Vec::new());
+        }
+        let coerced_vid = self.fresh_synthetic_value_typed(
+            graph,
+            crate::jit_codewriter::type_state::ConcreteType::Signed,
+        );
+        let coerced = graph.must_variable(coerced_vid);
+        (
+            coerced.clone(),
+            vec![SpaceOperation {
+                result: Some(coerced),
+                kind: OpKind::UnaryOp {
+                    op: "cast_ptr_to_int".into(),
+                    operand: value.clone(),
+                    result_ty: ValueType::Int,
                 },
             }],
         )

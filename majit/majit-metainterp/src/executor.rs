@@ -1080,6 +1080,40 @@ pub fn do_getfield_gc_f(
     cpu.bh_getfield_gc_f(struct_, fielddescr)
 }
 
+// executor.py:206-212 do_getarrayitem_gc_{i,r,f}: project box → gcref +
+// concrete index, dispatch to `cpu.bh_getarrayitem_gc_*`.  Pyre's flat
+// box analog passes `(array, index)` as plain `i64` values projected
+// from the symbolic OpRefs by the caller.
+pub fn do_getarrayitem_gc_i(
+    cpu: &dyn majit_backend::Backend,
+    _metainterp: (),
+    arraybox: i64,
+    indexbox: i64,
+    arraydescr: &majit_translate::jitcode::BhDescr,
+) -> i64 {
+    cpu.bh_getarrayitem_gc_i(arraybox, indexbox, arraydescr)
+}
+
+pub fn do_getarrayitem_gc_r(
+    cpu: &dyn majit_backend::Backend,
+    _metainterp: (),
+    arraybox: i64,
+    indexbox: i64,
+    arraydescr: &majit_translate::jitcode::BhDescr,
+) -> majit_ir::GcRef {
+    cpu.bh_getarrayitem_gc_r(arraybox, indexbox, arraydescr)
+}
+
+pub fn do_getarrayitem_gc_f(
+    cpu: &dyn majit_backend::Backend,
+    _metainterp: (),
+    arraybox: i64,
+    indexbox: i64,
+    arraydescr: &majit_translate::jitcode::BhDescr,
+) -> f64 {
+    cpu.bh_getarrayitem_gc_f(arraybox, indexbox, arraydescr)
+}
+
 pub fn execute_varargs<M: Clone>(
     metainterp: &mut crate::pyjitpl::MetaInterp<M>,
     opnum: OpCode,

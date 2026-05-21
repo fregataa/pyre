@@ -21,7 +21,7 @@
 
 use crate::opencoder::Box as OcBox;
 use crate::recorder::Trace;
-use majit_ir::{DescrRef, GreenKey, OpCode, OpRef, Type, Value};
+use majit_ir::{DescrRef, GreenKey, HeapBox, OpCode, OpRef, Type, Value};
 use majit_trace::heapcache::HeapCache;
 
 use majit_backend::JitCellToken;
@@ -68,6 +68,32 @@ fn descr_to_bh_field_descr(descr: &DescrRef) -> Option<majit_translate::jitcode:
         parent: None,
         name: String::new(),
         owner: String::new(),
+    })
+}
+
+/// Project a tracer-side `DescrRef` to a backend `BhDescr::Array` for
+/// `executor::do_getarrayitem_gc_*` consumption — the array-side
+/// analogue of [`descr_to_bh_field_descr`].
+///
+/// `bh_getarrayitem_gc_*` consumes the descr through
+/// `unpack_arraydescr_size` (`base_size`, `itemsize`, `is_item_signed`)
+/// + the `array_base_size()` accessor for Ref/Float reads; the
+/// remaining `BhDescr::Array` fields are placeholder defaults the load
+/// path never reads.  Returns `None` for non-array descrs.
+fn descr_to_bh_array_descr(descr: &DescrRef) -> Option<majit_translate::jitcode::BhDescr> {
+    let a = descr.as_array_descr()?;
+    Some(majit_translate::jitcode::BhDescr::Array {
+        base_size: a.base_size(),
+        itemsize: a.item_size(),
+        len_offset: a.len_descr().map(|fd| fd.offset()),
+        type_id: a.cache_key(),
+        item_type: a.item_type(),
+        is_array_of_pointers: a.is_array_of_pointers(),
+        is_array_of_structs: false,
+        is_item_signed: a.is_item_signed(),
+        ei_index: u32::MAX,
+        array_type_id: None,
+        interior_fields: Vec::new(),
     })
 }
 
@@ -290,33 +316,6 @@ pub struct TraceCtx {
     /// 2834) to set the `FORCE_BRIDGE_SEGMENTING` bit on the loop
     /// token when bridge tracing aborts without an inlinable function.
     pub(crate) resumekey_original_loop_token: Option<std::sync::Arc<JitCellToken>>,
-    /// RPython `Box.value` analog — every recorded OpRef's concrete
-    /// runtime value, keyed by `OpRef.raw()`.  RPython's Box subclasses
-    /// carry `value: int / GcRef / longlong` as an intrinsic field
-    /// (`box.getint()` / `box.getref_base()` / `box.getfloat_storage()`);
-    /// pyre's `OpRef` is a flat ID so the concrete lives in a side
-    /// table.  Single-slot per opref matching the RPython single-field
-    /// shape — no fragmentation by op-kind (array vs field) because
-    /// `Box.value` is the same mechanism whether the Box originated from
-    /// `_do_getarrayitem_gc_any` or `_opimpl_getfield_gc_any_pureornot`.
-    ///
-    /// Populated at every recording site that has the runtime result
-    /// available (HEAP loads via `field_sanity_load`, dispatch arms that
-    /// already read the live concrete from registers, etc.).  Read by
-    /// [`Self::concrete_of_opref`] for the cache-hit sanity check + alias
-    /// canonicalization paths.
-    ///
-    /// Cache-hit usage shape:
-    /// - `pyjitpl.py:644-668 _do_getarrayitem_gc_any`:
-    ///   `if resvalue != tobox.getint(): assert 0`.
-    /// - `pyjitpl.py:929-947 _opimpl_getfield_gc_any_pureornot`:
-    ///   `assert resvalue == upd.currfieldbox.getint()/getref_base()/
-    ///   getfloat_storage()` (lines 937/939/943).
-    ///
-    /// Append-only: recorded oprefs are unique per trace and stale
-    /// entries are only reachable via cache-hit paths whose cache
-    /// entries are still live.
-    pub(crate) opref_concrete: std::collections::HashMap<u32, Value>,
     /// pyjitpl.py:929-947 `self.metainterp.cpu` analog.
     ///
     /// RPython's `_opimpl_getfield_gc_any_pureornot` runs
@@ -338,6 +337,24 @@ pub struct TraceCtx {
     /// which deref's the pointer to invoke `executor::do_getfield_gc_*`.
     /// The fat pointer is `*const dyn Backend` (16 bytes on 64-bit).
     pub(crate) cpu: Option<*const dyn majit_backend::Backend>,
+    /// `Box.value` analog side-table — runtime concrete keyed by OpRef.
+    ///
+    /// In RPython every `Box` subclass (`BoxInt` / `BoxRef` / `BoxFloat`)
+    /// carries its `.value` field intrinsically.  Any site that needs
+    /// the runtime concrete behind an op-result simply reads
+    /// `box.getint()` / `box.getref_base()` / `box.getfloatstorage()`.
+    ///
+    /// Pyre's `OpRef` is a flat identity; there is no per-box field to
+    /// hang `.value` on.  This map therefore holds the same fact under
+    /// the OpRef key.  It is populated at every record site that has
+    /// the live result in scope (HEAP load handlers, register reads,
+    /// resume-data materialization, etc.) and consulted by
+    /// [`Self::concrete_of_opref`] as step 3 in the Box.value
+    /// resolution chain.  Cache-write paths route the payload of
+    /// `HeapBox::new(opref, value)` through `concrete_of_opref(opref)`
+    /// so the cached `currfieldbox.value` parity is preserved even
+    /// when the carrier OpRef is non-Const.
+    pub(crate) opref_concrete: std::collections::HashMap<u32, Value>,
     /// `pyjitpl.py:3389-3390` `raise SwitchToBlackhole(ABORT_ESCAPE,
     /// raising_exception=True)` — RPython surfaces the abort reason and
     /// the `raising_exception` flag as a real Python exception that
@@ -506,6 +523,49 @@ impl TraceCtx {
         }
     }
 
+    /// Array-side analogue of [`field_sanity_load`].  `executor.execute`
+    /// dispatches GETARRAYITEM_GC_{I,R,F} through `do_getarrayitem_gc_*`
+    /// (executor.py:206-212); pyre's `kind` selects between the three
+    /// variants.  Returns `Some(value)` when `self.cpu` is wired and the
+    /// descr resolves to a `BhDescr::Array`; `None` otherwise.
+    pub fn array_sanity_load(
+        &self,
+        array_ptr: i64,
+        index: i64,
+        descr: &DescrRef,
+        kind: Type,
+    ) -> Option<Value> {
+        let cpu_ptr = self.cpu?;
+        // SAFETY: cpu pointer was installed via `set_cpu` against a
+        // backend that outlives this TraceCtx.
+        let cpu = unsafe { &*cpu_ptr };
+        let bh_descr = descr_to_bh_array_descr(descr)?;
+        match kind {
+            Type::Int => Some(Value::Int(crate::executor::do_getarrayitem_gc_i(
+                cpu,
+                (),
+                array_ptr,
+                index,
+                &bh_descr,
+            ))),
+            Type::Ref => Some(Value::Ref(crate::executor::do_getarrayitem_gc_r(
+                cpu,
+                (),
+                array_ptr,
+                index,
+                &bh_descr,
+            ))),
+            Type::Float => Some(Value::Float(crate::executor::do_getarrayitem_gc_f(
+                cpu,
+                (),
+                array_ptr,
+                index,
+                &bh_descr,
+            ))),
+            Type::Void => None,
+        }
+    }
+
     /// heapcache.py:542-553 `getarrayitem(box, indexbox, descr)` parity.
     /// Extracts the index ConstInt's `getint()` value (returns `None`
     /// on non-ConstInt operands, matching the upstream early-out at
@@ -520,7 +580,7 @@ impl TraceCtx {
         array: OpRef,
         index: OpRef,
         descr: u32,
-    ) -> Option<OpRef> {
+    ) -> Option<HeapBox> {
         let index_value = match self.constants.get_value(index)? {
             Value::Int(n) => n,
             _ => return None,
@@ -535,7 +595,13 @@ impl TraceCtx {
     /// (non-ConstInt operand) clears the entire `descr` submap;
     /// otherwise the write goes through the indexcache with `array`
     /// canonicalised by `_unique_const_heuristic`.
-    pub fn heapcache_setarrayitem(&mut self, array: OpRef, index: OpRef, descr: u32, value: OpRef) {
+    pub fn heapcache_setarrayitem(
+        &mut self,
+        array: OpRef,
+        index: OpRef,
+        descr: u32,
+        value: HeapBox,
+    ) {
         let index_value = match self.constants.get_value(index) {
             Some(Value::Int(n)) => Some(n),
             _ => None,
@@ -552,7 +618,7 @@ impl TraceCtx {
         array: OpRef,
         index: OpRef,
         descr: u32,
-        value: OpRef,
+        value: HeapBox,
     ) {
         let index_value = match self.constants.get_value(index) {
             Some(Value::Int(n)) => Some(n),
@@ -564,44 +630,14 @@ impl TraceCtx {
             .getarrayitem_now_known(array, index_value, descr, value, oracle)
     }
 
-    /// RPython `Box.__init__` analog — stamp an OpRef with its runtime
-    /// concrete value (the "Box.value" intrinsic field).  Called at
-    /// every recording site that has the live result in scope (HEAP
-    /// loads, register reads, etc.).
-    pub fn set_opref_concrete(&mut self, opref: OpRef, concrete: Value) {
-        self.opref_concrete.insert(opref.raw(), concrete);
-    }
-
-    /// RPython `box.value` read analog — the concrete value that was
-    /// stamped onto this opref at its record site.  `None` if never
-    /// stamped (analog of "the Box has no value field" — impossible in
-    /// RPython, expected in pyre for ops whose runtime result was not
-    /// computed at trace time, e.g. residual calls + guards).
-    pub fn lookup_opref_concrete(&self, opref: OpRef) -> Option<Value> {
-        self.opref_concrete.get(&opref.raw()).copied()
-    }
-
-    /// `pyjitpl.py:644-668 _do_getarrayitem_gc_any` sanity check —
-    /// dispatch-side typed accessor over [`Self::set_opref_concrete`]
-    /// for the Int-only `BC_GETARRAYITEM_GC_I` call site, which carries
-    /// the concrete as a raw `i64` register slot.
-    pub fn array_cache_track_concrete_int(&mut self, value: OpRef, concrete: i64) {
-        self.set_opref_concrete(value, Value::Int(concrete));
-    }
-
-    /// Typed accessor over [`Self::lookup_opref_concrete`] returning
-    /// `Option<i64>` for the dispatch sanity-check Int comparison.
-    pub fn array_cache_lookup_concrete_int(&self, value: OpRef) -> Option<i64> {
-        match self.lookup_opref_concrete(value) {
-            Some(Value::Int(n)) => Some(n),
-            _ => None,
-        }
-    }
-
     /// heapcache.py:518-522 `getfield` parity.  Routes `obj` through
     /// `_unique_const_heuristic` so two distinct ConstPtr OpRefs for
     /// the same gcref share the same `(obj, field_index)` cache slot.
-    pub fn heapcache_getfield_cached(&mut self, obj: OpRef, field_index: u32) -> Option<OpRef> {
+    ///
+    /// Returns the cached [`HeapBox`] (opref + concrete value) — RPython's
+    /// `upd.currfieldbox` carries both as a Box object.  Callers needing
+    /// only the opref read `.opref`; sanity-check callers read `.value`.
+    pub fn heapcache_getfield_cached(&mut self, obj: OpRef, field_index: u32) -> Option<HeapBox> {
         self.constants.refresh_from_gc();
         let oracle: &dyn majit_trace::heapcache::SameConstantOracle = &self.constants;
         self.heap_cache.getfield_cached(obj, field_index, oracle)
@@ -610,7 +646,12 @@ impl TraceCtx {
     /// heapcache.py:538-540 `setfield` parity.  Same canonicalisation
     /// as `heapcache_getfield_cached` plus alias-clearing semantics
     /// when `obj` is not known-unescaped.
-    pub fn heapcache_setfield_cached(&mut self, obj: OpRef, field_index: u32, value: OpRef) {
+    ///
+    /// `value: HeapBox` carries the (opref, runtime-payload) pair —
+    /// `pyjitpl.py:976 upd.currfieldbox is valuebox` parity uses
+    /// `cached.opref == value.opref` (Box identity); the payload is
+    /// preserved for subsequent cache-hit sanity checks.
+    pub fn heapcache_setfield_cached(&mut self, obj: OpRef, field_index: u32, value: HeapBox) {
         self.constants.refresh_from_gc();
         let oracle: &dyn majit_trace::heapcache::SameConstantOracle = &self.constants;
         self.heap_cache
@@ -618,7 +659,10 @@ impl TraceCtx {
     }
 
     /// heapcache.py:534-536 `getfield_now_known` parity (no aliasing).
-    pub fn heapcache_getfield_now_known(&mut self, obj: OpRef, field_index: u32, value: OpRef) {
+    /// `value: HeapBox` carries the loaded Box (opref + value) so the
+    /// cache entry holds the same payload `executor.execute(...)` would
+    /// have produced upstream.
+    pub fn heapcache_getfield_now_known(&mut self, obj: OpRef, field_index: u32, value: HeapBox) {
         self.constants.refresh_from_gc();
         let oracle: &dyn majit_trace::heapcache::SameConstantOracle = &self.constants;
         self.heap_cache
@@ -874,10 +918,10 @@ impl TraceCtx {
             trace_limit: DEFAULT_TRACE_LIMIT,
             snapshots: Vec::new(),
             resumekey_original_loop_token: None,
-            opref_concrete: std::collections::HashMap::new(),
             cpu: None,
             pending_switch_to_blackhole: None,
             virtualref_boxes: Vec::new(),
+            opref_concrete: std::collections::HashMap::new(),
         }
     }
 
@@ -937,10 +981,10 @@ impl TraceCtx {
             trace_limit: DEFAULT_TRACE_LIMIT,
             snapshots: Vec::new(),
             resumekey_original_loop_token: None,
-            opref_concrete: std::collections::HashMap::new(),
             cpu: None,
             pending_switch_to_blackhole: None,
             virtualref_boxes: Vec::new(),
+            opref_concrete: std::collections::HashMap::new(),
         }
     }
 
@@ -953,6 +997,46 @@ impl TraceCtx {
     /// executor.py:544 constant_from_op(op) parity: get typed Value for OpRef.
     pub fn constants_get_value(&self, opref: OpRef) -> Option<Value> {
         self.constants.get_value(opref)
+    }
+
+    /// `Box.__init__` analog — stamp an OpRef with its runtime concrete
+    /// value (the "Box.value" intrinsic field).  Called at every
+    /// recording site that has the live result in scope (HEAP loads,
+    /// register reads, resume-data materialization).
+    pub fn set_opref_concrete(&mut self, opref: OpRef, concrete: Value) {
+        self.opref_concrete.insert(opref.raw(), concrete);
+    }
+
+    /// `box.value` read analog — the concrete value stamped onto this
+    /// opref at its record site.  `None` if never stamped — analog of
+    /// "the Box has no value field" (impossible in RPython, expected
+    /// in pyre for ops whose runtime result was not computed at trace
+    /// time, e.g. residual calls + guards).
+    pub fn lookup_opref_concrete(&self, opref: OpRef) -> Option<Value> {
+        self.opref_concrete.get(&opref.raw()).copied()
+    }
+
+    /// `Box.value` read for cache-write sites — composes the
+    /// resolution chain that `concrete_of_opref` uses (Const pool +
+    /// standard-virtualizable shadow + `opref_concrete` stamp) but
+    /// returns `Option<Value>` instead of the `Ref(usize::MAX)`
+    /// sentinel.  Used at `heapcache.setfield(valuebox)` /
+    /// `heapcache.setarrayitem(valuebox)` cache-write sites to fill
+    /// the [`HeapBox`] payload: `None` collapses to `Value::Void`,
+    /// signalling "no Box.value known" so the downstream cache-hit
+    /// sanity check at `_opimpl_getfield_gc_any_pureornot` skips.
+    pub fn box_value(&self, opref: OpRef) -> Option<Value> {
+        if opref.is_constant() {
+            if let Some(value) = self.constants.get_value(opref) {
+                return Some(value);
+            }
+        }
+        if Some(opref) == self.standard_virtualizable_box() {
+            if let Some(v) = self.standard_virtualizable_concrete() {
+                return Some(v);
+            }
+        }
+        self.lookup_opref_concrete(opref)
     }
 
     /// RPython parity: Ref constants preserve their type so guard
@@ -1420,26 +1504,23 @@ impl TraceCtx {
     /// TraceCtx-local state.  Parallels upstream `box.getref_base()` /
     /// `box.getint()` / `box.getfloatstorage()` — in RPython each Box
     /// carries its own runtime concrete via the Box subclass; pyre's
-    /// `OpRef` is opaque, so concrete must be reconstructed.
+    /// `OpRef` is opaque, so concrete is reconstructed from the
+    /// available trace-time state.
     ///
     /// Resolution order, mirroring the subclass dispatch upstream performs
     /// implicitly:
     ///   1. Constant OpRefs — read from the `ConstantPool` (value + type).
+    ///      Mirrors `history.py:220/261/307 ConstInt/ConstFloat/ConstPtr`
+    ///      Box.value intrinsic field.
     ///   2. `standard_virtualizable_box()` — use the runtime shadow held in
-    ///      `virtualizable_values[-1]`.
-    ///   3. `opref_concrete` — RPython `Box.value` analog side-table
-    ///      populated at every record site that has the runtime result
-    ///      in scope (`set_opref_concrete`).  Covers HEAP loads
-    ///      (getfield_gc_*, getarrayitem_gc_*) + future record sites
-    ///      that opt into stamping.
+    ///      `virtualizable_values[-1]`.  Standard vable identity check.
+    ///   3. `opref_concrete` — Box.value stamp populated at every record
+    ///      site that has the runtime result in scope (HEAP loads,
+    ///      register reads, resume-data materialization).  Covers
+    ///      non-Const result OpRefs whose runtime concrete is known.
     ///   4. Fallback — a sentinel `Value::Ref(GcRef(usize::MAX))` that
     ///      never matches a real heap pointer, so PTR_EQ comparisons with
-    ///      the standard vable resolve to "different" at trace time.  The
-    ///      fallback is the conservative answer for OpRefs whose concrete
-    ///      lives only on the interpreter stack and must be threaded in
-    ///      by the external caller (Task #68): alias canonicalization for
-    ///      those paths remains off until dispatch.rs supplies the real
-    ///      concrete.
+    ///      the standard vable resolve to "different" at trace time.
     pub fn concrete_of_opref(&self, opref: OpRef) -> Value {
         if opref.is_constant() {
             // history.py:220/261/307 box.type parity: `ConstantPool`
@@ -2091,23 +2172,15 @@ impl TraceCtx {
             if let Some(cached) = self.heapcache_getfield_cached(vable_opref, field_index) {
                 // pyjitpl.py:934-945 sanity check: run the live field
                 // load (`executor.execute`) and assert equality against
-                // `upd.currfieldbox.getint()`.  Two paths recover the
-                // expected value:
-                //   1. Const cached opref → constant pool `Value::Int`.
-                //   2. Non-Const cached opref → `opref_concrete` Box.value
-                //      analog side-table populated at the MISS branch
-                //      below (or any other site that records a getfield
-                //      with `vable_struct_ptr` available).
-                let expected_int = if cached.is_constant() {
-                    match self.constants.get_value(cached) {
-                        Some(Value::Int(n)) => Some(n),
-                        _ => None,
-                    }
-                } else {
-                    match self.lookup_opref_concrete(cached) {
-                        Some(Value::Int(n)) => Some(n),
-                        _ => None,
-                    }
+                // `upd.currfieldbox.getint()`.  The cached HeapBox carries
+                // the runtime value directly (`upd.currfieldbox.getint()`
+                // analog) — no side-table needed.  `Value::Void` means
+                // the cache entry was seeded without a live concrete
+                // (e.g. from a setfield helper that lacked the runtime
+                // payload), so the sanity check skips.
+                let expected_int = match cached.value {
+                    Value::Int(n) => Some(n),
+                    _ => None,
                 };
                 if let Some(cached_int) = expected_int {
                     if vable_struct_ptr != 0 {
@@ -2130,24 +2203,35 @@ impl TraceCtx {
                     OpCode::GetfieldGcI,
                     crate::pyjitpl::counters::HEAPCACHED_OPS,
                 );
-                return (cached, Value::Void);
+                return (cached.opref, cached.value);
             }
             let op =
                 self.record_op_with_descr(OpCode::GetfieldGcI, &[vable_opref], fielddescr.clone());
-            // pyjitpl.py:949 upd.getfield_now_known(resbox).
-            self.heapcache_getfield_now_known(vable_opref, field_index, op);
-            // Stash the original live load's concrete value keyed by
-            // the recorded opref so subsequent cache hits on this opref
-            // (non-Const path) can run the sanity-check assert.  The
-            // RPython analog is `tobox.getint()` returning the live
-            // runtime int of the Box created at the original load.
-            if vable_struct_ptr != 0 {
-                if let Some(live) = self.field_sanity_load(vable_struct_ptr, &fielddescr, Type::Int)
-                {
-                    self.set_opref_concrete(op, live);
-                }
+            // pyjitpl.py:949 upd.getfield_now_known(resbox).  `resbox` in
+            // RPython carries the loaded value via `BoxInt.value`;
+            // here we read it through `field_sanity_load` and pair it
+            // with the recorded opref so the HeapBox stored in the
+            // cache mirrors RPython's executor-returned Box.
+            let live = if vable_struct_ptr != 0 {
+                self.field_sanity_load(vable_struct_ptr, &fielddescr, Type::Int)
+            } else {
+                None
+            };
+            let live_value = live.unwrap_or(Value::Void);
+            // RPython `Box(value)` constructor analog — stamp the
+            // recorded opref with the loaded runtime concrete so the
+            // Box.value chain (`opref_concrete` → cache hits +
+            // `concrete_of_opref` callers) sees the real value
+            // instead of the GcRef(usize::MAX) sentinel.
+            if !matches!(live_value, Value::Void) {
+                self.set_opref_concrete(op, live_value);
             }
-            return (op, Value::Void);
+            self.heapcache_getfield_now_known(
+                vable_opref,
+                field_index,
+                HeapBox::new(op, live_value),
+            );
+            return (op, live_value);
         }
         // self.metainterp.check_synchronized_virtualizable() — no-op in pyre.
         // index = self._get_virtualizable_field_index(fielddescr)
@@ -2305,18 +2389,22 @@ impl TraceCtx {
             // (pyjitpl.py:973-988).
             let field_index = fielddescr.index();
             if let Some(cached) = self.heapcache_getfield_cached(vable_opref, field_index) {
-                if cached == value {
+                if cached.opref == value {
                     // pyjitpl.py:977 profiler.count_ops(rop.SETFIELD_GC,
                     // Counters.HEAPCACHED_OPS) when the cache already
-                    // holds `valuebox` — `upd.currfieldbox is valuebox`.
+                    // holds `valuebox` — `upd.currfieldbox is valuebox`
+                    // (Box identity, not value equality).
                     self.profiler()
                         .count_ops(OpCode::SetfieldGc, crate::pyjitpl::counters::HEAPCACHED_OPS);
                     return;
                 }
             }
             self.record_op_with_descr(OpCode::SetfieldGc, &[vable_opref, value], fielddescr);
-            // pyjitpl.py:980 upd.setfield(valuebox).
-            self.heapcache_setfield_cached(vable_opref, field_index, value);
+            // pyjitpl.py:980 upd.setfield(valuebox).  The cache entry
+            // takes a HeapBox carrying (value, concrete) — `concrete`
+            // is the same payload `valuebox.getint()/getref_base()/
+            // getfloat_storage()` returns upstream.
+            self.heapcache_setfield_cached(vable_opref, field_index, HeapBox::new(value, concrete));
             return;
         }
         // index = self._get_virtualizable_field_index(fielddescr)
@@ -2364,18 +2452,11 @@ impl TraceCtx {
                 // pyjitpl.py:934-945 + :938-939 sanity check (ref arm):
                 //     resvalue = executor.execute(cpu, mi, opnum, fielddescr, box)
                 //     assert resvalue == upd.currfieldbox.getref_base()
-                // Const cached → constant pool; non-Const cached →
-                // `opref_concrete` Box.value analog side-table.
-                let expected_ref = if cached.is_constant() {
-                    match self.constants.get_value(cached) {
-                        Some(Value::Ref(r)) => Some(r),
-                        _ => None,
-                    }
-                } else {
-                    match self.lookup_opref_concrete(cached) {
-                        Some(Value::Ref(r)) => Some(r),
-                        _ => None,
-                    }
+                // `cached.value` is the upstream Box.getref_base() analog —
+                // attached to the cache entry at write time.
+                let expected_ref = match cached.value {
+                    Value::Ref(r) => Some(r),
+                    _ => None,
                 };
                 if let Some(cached_ref) = expected_ref {
                     if vable_struct_ptr != 0 {
@@ -2397,20 +2478,29 @@ impl TraceCtx {
                     OpCode::GetfieldGcI,
                     crate::pyjitpl::counters::HEAPCACHED_OPS,
                 );
-                return (cached, Value::Void);
+                return (cached.opref, cached.value);
             }
             let op =
                 self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], fielddescr.clone());
-            self.heapcache_getfield_now_known(vable_opref, field_index, op);
-            // Stash the live load's concrete ref so subsequent non-Const
-            // cache hits can run the sanity-check assert.
-            if vable_struct_ptr != 0 {
-                if let Some(live) = self.field_sanity_load(vable_struct_ptr, &fielddescr, Type::Ref)
-                {
-                    self.set_opref_concrete(op, live);
-                }
+            // pyjitpl.py:949 upd.getfield_now_known(resbox) — `resbox`
+            // carries `.getref_base()` payload; pair it with the
+            // recorded opref so the cache HeapBox mirrors RPython's
+            // executor-returned Box.
+            let live = if vable_struct_ptr != 0 {
+                self.field_sanity_load(vable_struct_ptr, &fielddescr, Type::Ref)
+            } else {
+                None
+            };
+            let live_value = live.unwrap_or(Value::Void);
+            if !matches!(live_value, Value::Void) {
+                self.set_opref_concrete(op, live_value);
             }
-            return (op, Value::Void);
+            self.heapcache_getfield_now_known(
+                vable_opref,
+                field_index,
+                HeapBox::new(op, live_value),
+            );
+            return (op, live_value);
         }
         let index = self
             .virtualizable_info
@@ -2460,18 +2550,11 @@ impl TraceCtx {
                 // ConstFloat.same_constant compares via
                 // longlong.extract_bits (history.py:283-294); pyre's
                 // Value::Eq for Float uses to_bits — bit-identical.
-                // Const cached → constant pool; non-Const cached →
-                // `opref_concrete` Box.value analog side-table.
-                let expected_float = if cached.is_constant() {
-                    match self.constants.get_value(cached) {
-                        Some(Value::Float(f)) => Some(f),
-                        _ => None,
-                    }
-                } else {
-                    match self.lookup_opref_concrete(cached) {
-                        Some(Value::Float(f)) => Some(f),
-                        _ => None,
-                    }
+                // `cached.value` is the upstream `currfieldbox.constbox()`
+                // analog payload.
+                let expected_float = match cached.value {
+                    Value::Float(f) => Some(f),
+                    _ => None,
                 };
                 if let Some(cached_float) = expected_float {
                     if vable_struct_ptr != 0 {
@@ -2493,21 +2576,28 @@ impl TraceCtx {
                     OpCode::GetfieldGcI,
                     crate::pyjitpl::counters::HEAPCACHED_OPS,
                 );
-                return (cached, Value::Void);
+                return (cached.opref, cached.value);
             }
             let op =
                 self.record_op_with_descr(OpCode::GetfieldGcF, &[vable_opref], fielddescr.clone());
-            self.heapcache_getfield_now_known(vable_opref, field_index, op);
-            // Stash the live load's concrete float so subsequent non-Const
-            // cache hits can run the sanity-check assert.
-            if vable_struct_ptr != 0 {
-                if let Some(live) =
-                    self.field_sanity_load(vable_struct_ptr, &fielddescr, Type::Float)
-                {
-                    self.set_opref_concrete(op, live);
-                }
+            // pyjitpl.py:949 upd.getfield_now_known(resbox) — pair the
+            // float payload with the recorded opref so the cache HeapBox
+            // mirrors RPython's executor-returned Box.
+            let live = if vable_struct_ptr != 0 {
+                self.field_sanity_load(vable_struct_ptr, &fielddescr, Type::Float)
+            } else {
+                None
+            };
+            let live_value = live.unwrap_or(Value::Void);
+            if !matches!(live_value, Value::Void) {
+                self.set_opref_concrete(op, live_value);
             }
-            return (op, Value::Void);
+            self.heapcache_getfield_now_known(
+                vable_opref,
+                field_index,
+                HeapBox::new(op, live_value),
+            );
+            return (op, live_value);
         }
         let index = self
             .virtualizable_info
@@ -2820,18 +2910,11 @@ impl TraceCtx {
                 // pyjitpl.py:934-945 + :938-939 sanity check (ref arm):
                 //     resvalue = executor.execute(cpu, mi, opnum, fielddescr, box)
                 //     assert resvalue == upd.currfieldbox.getref_base()
-                // Const cached → constant pool; non-Const cached →
-                // `opref_concrete` Box.value analog side-table.
-                let expected_ref = if cached.is_constant() {
-                    match self.constants.get_value(cached) {
-                        Some(Value::Ref(r)) => Some(r),
-                        _ => None,
-                    }
-                } else {
-                    match self.lookup_opref_concrete(cached) {
-                        Some(Value::Ref(r)) => Some(r),
-                        _ => None,
-                    }
+                // `cached.value` is the upstream `getref_base()` analog
+                // — populated when the cache entry was written.
+                let expected_ref = match cached.value {
+                    Value::Ref(r) => Some(r),
+                    _ => None,
                 };
                 if let Some(cached_ref) = expected_ref {
                     if vable_struct_ptr != 0 {
@@ -2853,17 +2936,24 @@ impl TraceCtx {
                     OpCode::GetfieldGcR,
                     crate::pyjitpl::counters::HEAPCACHED_OPS,
                 );
-                cached
+                cached.opref
             } else {
                 let op =
                     self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], fdescr.clone());
-                self.heapcache_getfield_now_known(vable_opref, f_index, op);
-                if vable_struct_ptr != 0 {
-                    if let Some(live) = self.field_sanity_load(vable_struct_ptr, &fdescr, Type::Ref)
-                    {
-                        self.set_opref_concrete(op, live);
-                    }
+                let live = if vable_struct_ptr != 0 {
+                    self.field_sanity_load(vable_struct_ptr, &fdescr, Type::Ref)
+                } else {
+                    None
+                };
+                let live_value = live.unwrap_or(Value::Void);
+                if !matches!(live_value, Value::Void) {
+                    self.set_opref_concrete(op, live_value);
                 }
+                self.heapcache_getfield_now_known(
+                    vable_opref,
+                    f_index,
+                    HeapBox::new(op, live_value),
+                );
                 op
             };
             // return self.opimpl_arraylen_gc(arraybox, adescr)
@@ -3148,7 +3238,11 @@ mod tests {
         let fd = majit_ir::make_field_descr(0, 8, Type::Int, majit_ir::ArrayFlag::Signed);
         let cached = ctx.constants.get_or_insert_typed(42, Type::Int);
         let field_index = fd.index();
-        ctx.heapcache_getfield_now_known(vable, field_index, cached);
+        ctx.heapcache_getfield_now_known(
+            vable,
+            field_index,
+            majit_ir::HeapBox::new(cached, Value::Int(42)),
+        );
         ctx.vable_getfield_int(0, vable, 0xCAFE_BABE, fd);
     }
 
@@ -3175,7 +3269,11 @@ mod tests {
             .constants
             .get_or_insert_typed(0xAAAA_BBBB as i64, Type::Ref);
         let field_index = fd.index();
-        ctx.heapcache_getfield_now_known(vable, field_index, cached);
+        ctx.heapcache_getfield_now_known(
+            vable,
+            field_index,
+            majit_ir::HeapBox::new(cached, Value::Ref(majit_ir::GcRef(0xAAAA_BBBB))),
+        );
         ctx.vable_getfield_ref(0, vable, 0xCAFE_BABE, fd);
     }
 
@@ -3202,7 +3300,11 @@ mod tests {
             .constants
             .get_or_insert_typed((1.5_f64).to_bits() as i64, Type::Float);
         let field_index = fd.index();
-        ctx.heapcache_getfield_now_known(vable, field_index, cached);
+        ctx.heapcache_getfield_now_known(
+            vable,
+            field_index,
+            majit_ir::HeapBox::new(cached, Value::Float(1.5)),
+        );
         ctx.vable_getfield_float(0, vable, 0xCAFE_BABE, fd);
     }
 
@@ -3228,14 +3330,22 @@ mod tests {
             .constants
             .get_or_insert_typed(0xAAAA_BBBB as i64, Type::Ref);
         let field_index_r = fd_r.index();
-        ctx.heapcache_getfield_now_known(vable, field_index_r, cached_r);
+        ctx.heapcache_getfield_now_known(
+            vable,
+            field_index_r,
+            majit_ir::HeapBox::new(cached_r, Value::Ref(majit_ir::GcRef(0xAAAA_BBBB))),
+        );
 
         let fd_f = majit_ir::make_field_descr_full(2, 8, 8, Type::Float, false);
         let cached_f = ctx
             .constants
             .get_or_insert_typed((3.14_f64).to_bits() as i64, Type::Float);
         let field_index_f = fd_f.index();
-        ctx.heapcache_getfield_now_known(vable, field_index_f, cached_f);
+        ctx.heapcache_getfield_now_known(
+            vable,
+            field_index_f,
+            majit_ir::HeapBox::new(cached_f, Value::Float(3.14)),
+        );
 
         let (r_result, _) = ctx.vable_getfield_ref(0, vable, 0xCAFE_BABE, fd_r);
         assert_eq!(r_result, cached_r);
@@ -3262,7 +3372,11 @@ mod tests {
         let fd = majit_ir::make_field_descr(0, 8, Type::Int, majit_ir::ArrayFlag::Signed);
         let cached = ctx.constants.get_or_insert_typed(7, Type::Int);
         let field_index = fd.index();
-        ctx.heapcache_getfield_now_known(vable, field_index, cached);
+        ctx.heapcache_getfield_now_known(
+            vable,
+            field_index,
+            majit_ir::HeapBox::new(cached, Value::Int(7)),
+        );
         let (result, _) = ctx.vable_getfield_int(0, vable, 0xCAFE_BABE, fd);
         assert_eq!(result, cached);
     }
