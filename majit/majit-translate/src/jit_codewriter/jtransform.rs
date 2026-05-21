@@ -1171,16 +1171,25 @@ impl<'a> Transformer<'a> {
                 } else {
                     "floordiv"
                 };
-                // RPython parity (`rint.py:246-262 rtype_mod` /
-                // `rtype_floordiv`): the rtyper calls `hop.inputargs(
-                // Signed, Signed)` which inserts `cast_ptr_to_int` for
-                // any Ref-typed operand before lowering to the residual.
-                // Pyre makes the coercion explicit here for the same
-                // shape: a `r`-typed LHS or RHS (e.g. raw `code_ptr as
-                // usize` whose cast survived the front-end but was
-                // folded out of the SSA chain by an upstream pass) is
-                // routed through `cast_ptr_to_int` first so the residual
-                // call sees Signed operands like upstream does.
+                // PRE-EXISTING-ADAPTATION (no direct RPython precedent):
+                // pyre-side recovery when an explicit
+                // `lltype.cast_ptr_to_int` (`rbuiltin.py:543-548
+                // genop('cast_ptr_to_int', vlist, resulttype=Signed)`)
+                // emitted by the front-end is elided from the SSA chain
+                // before reaching jtransform.  The gate accepts a
+                // Ref-typed LHS/RHS and rebuilds the missing cast here
+                // so the residual call sees Signed operands.  RPython
+                // `rint.py:246-262 rtype_mod` does NOT auto-cast
+                // arbitrary Ref operands; its `hop.inputargs(repr,
+                // repr)` assumes the rtyper has already inserted
+                // explicit casts at lltype / rbuiltin boundaries.  The
+                // wider tolerance here is therefore strictly broader
+                // than the RPython contract and exists only to keep the
+                // dispatch table closed while the upstream cast-
+                // elision is traced and fixed (the convergence path is
+                // to find which simplify / inline pass drops the cast
+                // and preserve it instead, then narrow this gate back
+                // to `'i' && 'i'`).
                 let (lhs_var, lhs_pre_ops) = self.coerce_operand_to_int(graph, lhs);
                 let (rhs_var, rhs_pre_ops) = self.coerce_operand_to_int(graph, rhs);
                 let mut ops = Vec::with_capacity(lhs_pre_ops.len() + rhs_pre_ops.len() + 2);
@@ -1686,14 +1695,18 @@ impl<'a> Transformer<'a> {
         )
     }
 
-    /// RPython's int rtyper calls `hop.inputargs(Signed, Signed)`, which
-    /// inserts `cast_ptr_to_int` for any Ref-typed operand before lowering
-    /// to the Signed-domain primitive.  Pyre makes the coercion explicit
-    /// at jtransform when a `r`-typed operand reaches an arithmetic site
-    /// that requires int operands (e.g. `int_mod` / `int_floordiv`
-    /// residual emission): synthesize a fresh Int SSA value and emit a
-    /// `cast_ptr_to_int` unary op materializing it.  Non-Ref operands are
-    /// returned unchanged.
+    /// PRE-EXISTING-ADAPTATION recovery helper — no direct RPython
+    /// precedent.  Inserts an explicit `cast_ptr_to_int` op for a
+    /// Ref-typed operand reaching an arithmetic site that requires
+    /// Int operands.  Upstream RPython does NOT auto-cast arbitrary
+    /// Ref to Signed at the rtyper boundary; ptr→int conversions come
+    /// from explicit `lltype.cast_ptr_to_int` builtins emitted at the
+    /// rbuiltin layer.  Pyre's analyzer/simplify chain may elide an
+    /// emitted cast before jtransform sees it, leaving a bare Ref at
+    /// the binop callsite; this helper rebuilds the missing cast so
+    /// the residual call sees Signed operands.  The convergence path
+    /// is to fix the cast elision upstream and retire this helper.
+    /// Non-Ref operands are returned unchanged.
     fn coerce_operand_to_int(
         &mut self,
         graph: &mut FunctionGraph,

@@ -1102,15 +1102,21 @@ pub fn generated_binary_int_value(
     // every sign combination — so no sign-only guard is emitted
     // here beyond the overflow corner.
     if matches!(op_code, OpCode::IntFloorDiv | OpCode::IntMod) {
+        let (lhs_val, rhs_val) = concrete.expect("concrete non-None enforced above");
         let zero_const = ctx.const_int(0);
         let rhs_zero = ctx.record_op(OpCode::IntEq, &[rhs_raw, zero_const]);
+        ctx.set_opref_concrete(rhs_zero, majit_ir::Value::Int((rhs_val == 0) as i64));
         frame.generate_guard(ctx, OpCode::GuardFalse, &[rhs_zero]);
         let int_min_const = ctx.const_int(i64::MIN);
         let neg_one_const = ctx.const_int(-1);
         let lhs_is_min = ctx.record_op(OpCode::IntEq, &[lhs_raw, int_min_const]);
+        ctx.set_opref_concrete(lhs_is_min, majit_ir::Value::Int((lhs_val == i64::MIN) as i64));
         let rhs_is_neg_one = ctx.record_op(OpCode::IntEq, &[rhs_raw, neg_one_const]);
+        ctx.set_opref_concrete(rhs_is_neg_one, majit_ir::Value::Int((rhs_val == -1) as i64));
         let ovf_both =
             ctx.record_op(OpCode::IntAnd, &[lhs_is_min, rhs_is_neg_one]);
+        let ovf_concrete = ((lhs_val == i64::MIN) as i64) & ((rhs_val == -1) as i64);
+        ctx.set_opref_concrete(ovf_both, majit_ir::Value::Int(ovf_concrete));
         frame.generate_guard(ctx, OpCode::GuardFalse, &[ovf_both]);
     }
 
@@ -1540,6 +1546,9 @@ pub fn generated_unary_int_value(
     if matches!(opcode, OpCode::IntNeg) {
         let min_val = ctx.const_int(i64::MIN);
         let is_min = ctx.record_op(OpCode::IntEq, &[payload, min_val]);
+        if let Some(majit_ir::Value::Int(n)) = ctx.box_value(payload) {
+            ctx.set_opref_concrete(is_min, majit_ir::Value::Int((n == i64::MIN) as i64));
+        }
         frame.generate_guard(ctx, OpCode::GuardFalse, &[is_min]);
     }
     let result = ctx.record_op(opcode, &[payload]);
@@ -1620,6 +1629,9 @@ fn list_heap_capacity_for_strategy(
             } else {
                 let zero = ctx.const_int(0);
                 let heap_storage = ctx.record_op(OpCode::IntGt, &[heap_cap, zero]);
+                if let Some(majit_ir::Value::Int(c)) = ctx.box_value(heap_cap) {
+                    ctx.set_opref_concrete(heap_storage, majit_ir::Value::Int((c > 0) as i64));
+                }
                 frame.generate_guard(ctx, OpCode::GuardTrue, &[heap_storage]);
                 heap_cap
             }
@@ -1645,6 +1657,13 @@ fn guard_append_without_resize(
     // interpreter/residual call perform the real resize.
     let capacity = list_heap_capacity_for_strategy(frame, ctx, list, strategy_id, is_inline);
     let has_room = ctx.record_op(OpCode::IntLt, &[len, capacity]);
+    // Box(value) parity: stamp guard predicate when both operand Box.value
+    // carriers resolve (BoxInt(0|1) — IntLt result).
+    if let (Some(majit_ir::Value::Int(l)), Some(majit_ir::Value::Int(c))) =
+        (ctx.box_value(len), ctx.box_value(capacity))
+    {
+        ctx.set_opref_concrete(has_room, majit_ir::Value::Int((l < c) as i64));
+    }
     frame.generate_guard(ctx, OpCode::GuardTrue, &[has_room]);
 }
 
@@ -1666,9 +1685,23 @@ fn guard_pop_without_resize_le(
     let capacity = list_heap_capacity_for_strategy(frame, ctx, list, strategy_id, is_inline);
     let one = ctx.const_int(1);
     let half = ctx.record_op(OpCode::IntRshift, &[capacity, one]);
+    let half_concrete = ctx.box_value(capacity).and_then(|v| match v {
+        majit_ir::Value::Int(c) => Some(c >> 1),
+        _ => None,
+    });
+    if let Some(h) = half_concrete {
+        ctx.set_opref_concrete(half, majit_ir::Value::Int(h));
+    }
     let five = ctx.const_int(5);
     let shrink_threshold = ctx.record_op(OpCode::IntSub, &[half, five]);
+    let shrink_concrete = half_concrete.map(|h| h.wrapping_sub(5));
+    if let Some(s) = shrink_concrete {
+        ctx.set_opref_concrete(shrink_threshold, majit_ir::Value::Int(s));
+    }
     let no_resize = ctx.record_op(OpCode::IntGe, &[new_len, shrink_threshold]);
+    if let (Some(majit_ir::Value::Int(n)), Some(s)) = (ctx.box_value(new_len), shrink_concrete) {
+        ctx.set_opref_concrete(no_resize, majit_ir::Value::Int((n >= s) as i64));
+    }
     frame.generate_guard(ctx, OpCode::GuardTrue, &[no_resize]);
 }
 
@@ -1784,6 +1817,12 @@ pub fn generated_list_setslice_same_len_by_strategy(
         let raw_stop_box = ctx.const_int(raw_stop);
         let lower_bound_ok =
             ctx.record_op(majit_ir::OpCode::IntGe, &[obj_len_box, raw_stop_box]);
+        if let Some(majit_ir::Value::Int(ol)) = ctx.box_value(obj_len_box) {
+            ctx.set_opref_concrete(
+                lower_bound_ok,
+                majit_ir::Value::Int((ol >= raw_stop) as i64),
+            );
+        }
         frame.generate_guard(ctx, majit_ir::OpCode::GuardTrue, &[lower_bound_ok]);
     } else {
         frame.implement_guard_value(ctx, obj_len_box, obj_len as i64);
@@ -1975,7 +2014,28 @@ pub fn generated_truth_value_direct(
         // strobject.py: str truth → guard_class + getfield_raw(len) → int_ne(0)
         if pyre_object::is_str(concrete_val) {
             frame.guard_class(ctx, value, &pyre_object::STR_TYPE as *const _ as *const pyre_object::PyType);
-            let len = ctx.record_op_with_descr(OpCode::GetfieldRawI, &[value], crate::descr::str_len_descr());
+            let len_descr = crate::descr::str_len_descr();
+            let len = ctx.record_op_with_descr(OpCode::GetfieldRawI, &[value], len_descr.clone());
+            // Box(value) parity: stamp len with the live int read so
+            // the IntNe truth below sees the BoxInt payload.
+            // executor.py:200 do_getfield_raw_i projects `structbox.
+            // getint()` for raw field reads.  Pyre's Python objects
+            // are carried as `Value::Ref` in box_value (the
+            // PyObjectRef pointer) but the recorded opcode here is
+            // GetfieldRawI, so the dispatch must go through the raw
+            // helper family — project the Ref to `i64` and call
+            // `raw_field_sanity_load` (NOT the GC variant which
+            // matches executor.py:188 do_getfield_gc_i).
+            if let Some(majit_ir::Value::Ref(struct_ref)) = ctx.box_value(value) {
+                let struct_ptr = struct_ref.0 as i64;
+                if struct_ptr != usize::MAX as i64 && struct_ptr != 0 {
+                    if let Some(live) =
+                        ctx.raw_field_sanity_load(struct_ptr, &len_descr, majit_ir::Type::Int)
+                    {
+                        ctx.set_opref_concrete(len, live);
+                    }
+                }
+            }
             let zero = ctx.const_int(0);
             let truth = ctx.record_op(OpCode::IntNe, &[len, zero]);
             if let Some(majit_ir::Value::Int(n)) = ctx.box_value(len) {
@@ -1986,7 +2046,26 @@ pub fn generated_truth_value_direct(
         // dictobject.py: dict truth → guard_class + getfield_raw(len) → int_ne(0)
         if pyre_object::is_dict(concrete_val) {
             frame.guard_class(ctx, value, &pyre_object::pyobject::DICT_TYPE as *const _ as *const pyre_object::PyType);
-            let len = ctx.record_op_with_descr(OpCode::GetfieldRawI, &[value], crate::descr::dict_len_descr());
+            let len_descr = crate::descr::dict_len_descr();
+            let len = ctx.record_op_with_descr(OpCode::GetfieldRawI, &[value], len_descr.clone());
+            // executor.py:200 do_getfield_raw_i projects `structbox.
+            // getint()` for raw field reads.  Pyre's Python objects
+            // are carried as `Value::Ref` in box_value (the
+            // PyObjectRef pointer) but the recorded opcode here is
+            // GetfieldRawI, so the dispatch must go through the raw
+            // helper family — project the Ref to `i64` and call
+            // `raw_field_sanity_load` (NOT the GC variant which
+            // matches executor.py:188 do_getfield_gc_i).
+            if let Some(majit_ir::Value::Ref(struct_ref)) = ctx.box_value(value) {
+                let struct_ptr = struct_ref.0 as i64;
+                if struct_ptr != usize::MAX as i64 && struct_ptr != 0 {
+                    if let Some(live) =
+                        ctx.raw_field_sanity_load(struct_ptr, &len_descr, majit_ir::Type::Int)
+                    {
+                        ctx.set_opref_concrete(len, live);
+                    }
+                }
+            }
             let zero = ctx.const_int(0);
             let truth = ctx.record_op(OpCode::IntNe, &[len, zero]);
             if let Some(majit_ir::Value::Int(n)) = ctx.box_value(len) {
@@ -2010,7 +2089,25 @@ pub fn generated_truth_value_direct(
             } else {
                 return None; // unknown strategy → residual
             };
-            let len = ctx.record_op_with_descr(OpCode::GetfieldRawI, &[value], len_descr);
+            let len = ctx.record_op_with_descr(OpCode::GetfieldRawI, &[value], len_descr.clone());
+            // executor.py:200 do_getfield_raw_i projects `structbox.
+            // getint()` for raw field reads.  Pyre's Python objects
+            // are carried as `Value::Ref` in box_value (the
+            // PyObjectRef pointer) but the recorded opcode here is
+            // GetfieldRawI, so the dispatch must go through the raw
+            // helper family — project the Ref to `i64` and call
+            // `raw_field_sanity_load` (NOT the GC variant which
+            // matches executor.py:188 do_getfield_gc_i).
+            if let Some(majit_ir::Value::Ref(struct_ref)) = ctx.box_value(value) {
+                let struct_ptr = struct_ref.0 as i64;
+                if struct_ptr != usize::MAX as i64 && struct_ptr != 0 {
+                    if let Some(live) =
+                        ctx.raw_field_sanity_load(struct_ptr, &len_descr, majit_ir::Type::Int)
+                    {
+                        ctx.set_opref_concrete(len, live);
+                    }
+                }
+            }
             let zero = ctx.const_int(0);
             let truth = ctx.record_op(OpCode::IntNe, &[len, zero]);
             if let Some(majit_ir::Value::Int(n)) = ctx.box_value(len) {
@@ -2030,7 +2127,11 @@ pub fn generated_truth_value_direct(
                 crate::state::pyobject_gcarray_descr(),
             );
             let zero = ctx.const_int(0);
-            return Some(ctx.record_op(OpCode::IntNe, &[len, zero]));
+            let truth = ctx.record_op(OpCode::IntNe, &[len, zero]);
+            if let Some(majit_ir::Value::Int(n)) = ctx.box_value(len) {
+                ctx.set_opref_concrete(truth, majit_ir::Value::Int((n != 0) as i64));
+            }
+            return Some(truth);
         }
     }
 
@@ -2176,6 +2277,9 @@ pub fn generated_list_pop_by_strategy(
     // invariant in the compiled trace independently.)
     let zero = ctx.const_int(0);
     let non_empty = ctx.record_op(OpCode::IntGt, &[len, zero]);
+    if let Some(majit_ir::Value::Int(n)) = ctx.box_value(len) {
+        ctx.set_opref_concrete(non_empty, majit_ir::Value::Int((n > 0) as i64));
+    }
     frame.generate_guard(ctx, OpCode::GuardTrue, &[non_empty]);
     let one = ctx.const_int(1);
     // `IntSub(cached_const, 1)` is constant-folded by the optimizer when
@@ -2364,12 +2468,20 @@ pub fn generated_direct_abs_value(
             let int_value = frame.trace_guarded_int_payload(ctx, value);
             let min_value = ctx.const_int(i64::MIN);
             let is_min = ctx.record_op(OpCode::IntEq, &[int_value, min_value]);
+            ctx.set_opref_concrete(is_min, majit_ir::Value::Int(0));
             frame.generate_guard(ctx, OpCode::GuardFalse, &[is_min]);
             // branchless abs: (x ^ sign) - sign
             let shift = ctx.const_int((i64::BITS - 1) as i64);
             let sign = ctx.record_op(OpCode::IntRshift, &[int_value, shift]);
+            let sign_concrete = concrete_int >> (i64::BITS - 1);
+            ctx.set_opref_concrete(sign, majit_ir::Value::Int(sign_concrete));
             let xor = ctx.record_op(OpCode::IntXor, &[int_value, sign]);
+            let xor_concrete = concrete_int ^ sign_concrete;
+            ctx.set_opref_concrete(xor, majit_ir::Value::Int(xor_concrete));
             let abs_value = ctx.record_op(OpCode::IntSub, &[xor, sign]);
+            let abs_concrete = xor_concrete.wrapping_sub(sign_concrete);
+            ctx.set_opref_concrete(abs_value, majit_ir::Value::Int(abs_concrete));
+            debug_assert_eq!(abs_concrete, concrete_int.wrapping_abs());
             return Some(crate::state::wrapint(ctx, abs_value));
         }
     }

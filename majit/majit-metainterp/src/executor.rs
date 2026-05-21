@@ -1114,6 +1114,80 @@ pub fn do_getarrayitem_gc_f(
     cpu.bh_getarrayitem_gc_f(arraybox, indexbox, arraydescr)
 }
 
+// blackhole.py:1370 bhimpl_arraylen_gc(cpu, array, arraydescr): direct
+// `cpu.bh_arraylen_gc(array, arraydescr)`.  RPython has no explicit
+// `do_arraylen_gc` in executor.py; the dispatch goes through the
+// blackhole fallback wrapper.  Pyre exposes it here in `executor.rs`
+// for `TraceCtx::arraylen_sanity_load` to consume directly without
+// importing the blackhole module.  Array is projected to `i64` from
+// the BoxRef (`arraybox.getref_base()` analog).
+pub fn do_arraylen_gc(
+    cpu: &dyn majit_backend::Backend,
+    _metainterp: (),
+    arraybox: i64,
+    arraydescr: &majit_translate::jitcode::BhDescr,
+) -> i64 {
+    cpu.bh_arraylen_gc(arraybox, arraydescr)
+}
+
+// executor.py:132 do_getarrayitem_raw_{i,f}: project arraybox → int
+// (raw pointer), dispatch to `cpu.bh_getarrayitem_raw_*`.  Distinct
+// from `do_getarrayitem_gc_*` (executor.py:117) which projects via
+// `arraybox.getref_base()` — raw arrays carry their pointer as a
+// plain integer.  Pyre passes the raw pointer as `i64`.
+pub fn do_getarrayitem_raw_i(
+    cpu: &dyn majit_backend::Backend,
+    _metainterp: (),
+    arraybox: i64,
+    indexbox: i64,
+    arraydescr: &majit_translate::jitcode::BhDescr,
+) -> i64 {
+    cpu.bh_getarrayitem_raw_i(arraybox, indexbox, arraydescr)
+}
+
+pub fn do_getarrayitem_raw_f(
+    cpu: &dyn majit_backend::Backend,
+    _metainterp: (),
+    arraybox: i64,
+    indexbox: i64,
+    arraydescr: &majit_translate::jitcode::BhDescr,
+) -> f64 {
+    cpu.bh_getarrayitem_raw_f(arraybox, indexbox, arraydescr)
+}
+
+// executor.py:200 do_getfield_raw_{i,r,f}: project structbox → int
+// (raw pointer via `structbox.getint()`), dispatch to
+// `cpu.bh_getfield_raw_*`.  Distinct from `do_getfield_gc_*`
+// (executor.py:188) which projects via `structbox.getref_base()` —
+// raw structs carry their pointer as a plain integer.  Pyre's caller
+// projects the symbolic OpRef carrier to `i64` directly.
+pub fn do_getfield_raw_i(
+    cpu: &dyn majit_backend::Backend,
+    _metainterp: (),
+    structbox: i64,
+    fielddescr: &majit_translate::jitcode::BhDescr,
+) -> i64 {
+    cpu.bh_getfield_raw_i(structbox, fielddescr)
+}
+
+pub fn do_getfield_raw_r(
+    cpu: &dyn majit_backend::Backend,
+    _metainterp: (),
+    structbox: i64,
+    fielddescr: &majit_translate::jitcode::BhDescr,
+) -> majit_ir::GcRef {
+    cpu.bh_getfield_raw_r(structbox, fielddescr)
+}
+
+pub fn do_getfield_raw_f(
+    cpu: &dyn majit_backend::Backend,
+    _metainterp: (),
+    structbox: i64,
+    fielddescr: &majit_translate::jitcode::BhDescr,
+) -> f64 {
+    cpu.bh_getfield_raw_f(structbox, fielddescr)
+}
+
 pub fn execute_varargs<M: Clone>(
     metainterp: &mut crate::pyjitpl::MetaInterp<M>,
     opnum: OpCode,

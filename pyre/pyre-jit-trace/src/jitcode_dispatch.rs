@@ -1214,9 +1214,23 @@ fn dispatch_switch_id(
     }
 
     if !valuebox.is_constant() {
+        // pyjitpl.py:611-617 opimpl_switch miss path — emit IntEq +
+        // GuardFalse for every key in switchdict (the trace bails out
+        // if any subsequent execution lands on a missed key).
+        // Box(value) parity: stamp each IntEq result with the
+        // (concrete_value == key) bool when valuebox's Box.value
+        // resolves an Int.
+        let valuebox_concrete = match ctx.trace_ctx.box_value(valuebox) {
+            Some(majit_ir::Value::Int(n)) => Some(n),
+            _ => None,
+        };
         for &key in switchdict.const_keys_in_order() {
             let keybox = ctx.trace_ctx.const_int(key);
             let eqbox = ctx.trace_ctx.record_op(OpCode::IntEq, &[valuebox, keybox]);
+            if let Some(v) = valuebox_concrete {
+                ctx.trace_ctx
+                    .set_opref_concrete(eqbox, majit_ir::Value::Int((v == key) as i64));
+            }
             ctx.trace_ctx.record_guard(OpCode::GuardFalse, &[eqbox], 0);
         }
     }

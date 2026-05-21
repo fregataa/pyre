@@ -523,6 +523,108 @@ impl TraceCtx {
         }
     }
 
+    /// `blackhole.py:1370 bhimpl_arraylen_gc(cpu, array, arraydescr)`
+    /// analog — read the GC array's length through
+    /// `cpu.bh_arraylen_gc(array_ptr, &arraydescr)`.  RPython has no
+    /// explicit `do_arraylen_gc` in `executor.py`; the dispatch path
+    /// goes through the blackhole fallback wrapper which the bhimpl
+    /// implements directly.  Returns `Some(Value::Int(len))` when
+    /// `self.cpu` is wired and the descr resolves to a `BhDescr::
+    /// Array`; `None` otherwise.  Used by `opimpl_arraylen_gc` to
+    /// stamp the recorded `ArraylenGc` OpRef with its runtime concrete
+    /// (RPython `BoxInt(length)` carrier).
+    pub fn arraylen_sanity_load(&self, array_ptr: i64, descr: &DescrRef) -> Option<Value> {
+        let cpu_ptr = self.cpu?;
+        // SAFETY: cpu pointer was installed via `set_cpu` against a
+        // backend that outlives this TraceCtx.
+        let cpu = unsafe { &*cpu_ptr };
+        let bh_descr = descr_to_bh_array_descr(descr)?;
+        Some(Value::Int(crate::executor::do_arraylen_gc(
+            cpu,
+            (),
+            array_ptr,
+            &bh_descr,
+        )))
+    }
+
+    /// `executor.py:200 do_getfield_raw_{i,r,f}` analog — read a raw
+    /// field at `struct_ptr + descr.offset` via `cpu.bh_getfield_raw_*`.
+    /// Distinct from [`field_sanity_load`] which dispatches the GC
+    /// variant (`executor.py:188 do_getfield_gc_*`).  Used when the
+    /// recorded opcode is `GetfieldRaw{I,R,F}` rather than
+    /// `GetfieldGc{I,R,F}`.
+    pub fn raw_field_sanity_load(
+        &self,
+        struct_ptr: i64,
+        descr: &DescrRef,
+        kind: Type,
+    ) -> Option<Value> {
+        let cpu_ptr = self.cpu?;
+        // SAFETY: cpu pointer was installed via `set_cpu` against a
+        // backend that outlives this TraceCtx.
+        let cpu = unsafe { &*cpu_ptr };
+        let bh_descr = descr_to_bh_field_descr(descr)?;
+        match kind {
+            Type::Int => Some(Value::Int(crate::executor::do_getfield_raw_i(
+                cpu,
+                (),
+                struct_ptr,
+                &bh_descr,
+            ))),
+            Type::Ref => Some(Value::Ref(crate::executor::do_getfield_raw_r(
+                cpu,
+                (),
+                struct_ptr,
+                &bh_descr,
+            ))),
+            Type::Float => Some(Value::Float(crate::executor::do_getfield_raw_f(
+                cpu,
+                (),
+                struct_ptr,
+                &bh_descr,
+            ))),
+            Type::Void => None,
+        }
+    }
+
+    /// `executor.py:132 do_getarrayitem_raw_{i,f}` analog — read a raw
+    /// array element via `cpu.bh_getarrayitem_raw_*`.  Distinct from
+    /// [`array_sanity_load`] which dispatches the GC variant
+    /// (`executor.py:117 do_getarrayitem_gc_*`).  Raw arrays carry the
+    /// array pointer as an `int` (`arraybox.getint()` upstream), not a
+    /// `getref_base()` projection — callers must pass the raw pointer
+    /// as `i64` directly without the `Value::Ref` carrier indirection.
+    pub fn raw_array_sanity_load(
+        &self,
+        array_ptr: i64,
+        index: i64,
+        descr: &DescrRef,
+        kind: Type,
+    ) -> Option<Value> {
+        let cpu_ptr = self.cpu?;
+        // SAFETY: cpu pointer was installed via `set_cpu` against a
+        // backend that outlives this TraceCtx.
+        let cpu = unsafe { &*cpu_ptr };
+        let bh_descr = descr_to_bh_array_descr(descr)?;
+        match kind {
+            Type::Int => Some(Value::Int(crate::executor::do_getarrayitem_raw_i(
+                cpu,
+                (),
+                array_ptr,
+                index,
+                &bh_descr,
+            ))),
+            Type::Float => Some(Value::Float(crate::executor::do_getarrayitem_raw_f(
+                cpu,
+                (),
+                array_ptr,
+                index,
+                &bh_descr,
+            ))),
+            Type::Ref | Type::Void => None,
+        }
+    }
+
     /// Array-side analogue of [`field_sanity_load`].  `executor.execute`
     /// dispatches GETARRAYITEM_GC_{I,R,F} through `do_getarrayitem_gc_*`
     /// (executor.py:206-212); pyre's `kind` selects between the three

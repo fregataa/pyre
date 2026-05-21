@@ -2005,7 +2005,19 @@ pub(crate) fn opimpl_arraylen_gc(ctx: &mut TraceCtx, array: OpRef, descr: DescrR
         );
         return cached;
     }
-    let result = ctx.record_op_with_descr(OpCode::ArraylenGc, &[array], descr);
+    let result = ctx.record_op_with_descr(OpCode::ArraylenGc, &[array], descr.clone());
+    // Box(value) parity: executor.py:188 do_arraylen_gc returns
+    // BoxInt(cpu.bh_arraylen_gc(array, arraydescr)). Stamp the result
+    // OpRef with the live length so downstream box_value(result) sees
+    // the same value (matches RPython BoxInt(length) carrier).
+    if let Some(majit_ir::Value::Ref(struct_ref)) = ctx.box_value(array) {
+        let struct_ptr = struct_ref.0 as i64;
+        if struct_ptr != usize::MAX as i64 && struct_ptr != 0 {
+            if let Some(live) = ctx.arraylen_sanity_load(struct_ptr, &descr) {
+                ctx.set_opref_concrete(result, live);
+            }
+        }
+    }
     ctx.heap_cache_mut().arraylen_now_known(array, result);
     result
 }
@@ -2539,7 +2551,24 @@ pub(crate) fn trace_raw_int_array_getitem_value(
     array: OpRef,
     index: OpRef,
 ) -> OpRef {
-    ctx.record_op_with_descr(OpCode::GetarrayitemRawI, &[array, index], int_array_descr())
+    let descr = int_array_descr();
+    let result = ctx.record_op_with_descr(OpCode::GetarrayitemRawI, &[array, index], descr.clone());
+    // Box(value) parity: executor.py:132 do_getarrayitem_raw_i projects
+    // `arraybox.getint()` (raw pointer carried as Int, not the
+    // `getref_base()` projection used by executor.py:117 do_get
+    // arrayitem_gc_i).  Route the sanity load through the raw helper
+    // family so the descriptor path matches `cpu.bh_getarrayitem_raw_i`.
+    if let (Some(majit_ir::Value::Int(arr_ptr)), Some(majit_ir::Value::Int(idx))) =
+        (ctx.box_value(array), ctx.box_value(index))
+    {
+        if arr_ptr != 0 {
+            if let Some(live) = ctx.raw_array_sanity_load(arr_ptr, idx, &descr, majit_ir::Type::Int)
+            {
+                ctx.set_opref_concrete(result, live);
+            }
+        }
+    }
+    result
 }
 
 pub(crate) fn trace_raw_float_array_getitem_value(
@@ -2547,11 +2576,22 @@ pub(crate) fn trace_raw_float_array_getitem_value(
     array: OpRef,
     index: OpRef,
 ) -> OpRef {
-    ctx.record_op_with_descr(
-        OpCode::GetarrayitemRawF,
-        &[array, index],
-        float_array_descr(),
-    )
+    let descr = float_array_descr();
+    let result = ctx.record_op_with_descr(OpCode::GetarrayitemRawF, &[array, index], descr.clone());
+    // executor.py:132 do_getarrayitem_raw_f — same Int-carried raw
+    // pointer projection as the int variant above.
+    if let (Some(majit_ir::Value::Int(arr_ptr)), Some(majit_ir::Value::Int(idx))) =
+        (ctx.box_value(array), ctx.box_value(index))
+    {
+        if arr_ptr != 0 {
+            if let Some(live) =
+                ctx.raw_array_sanity_load(arr_ptr, idx, &descr, majit_ir::Type::Float)
+            {
+                ctx.set_opref_concrete(result, live);
+            }
+        }
+    }
+    result
 }
 
 /// Write to frame's locals_cells_stack_w array.
