@@ -1589,6 +1589,88 @@ impl FrameState {
         }
         out
     }
+
+    /// `framestate.py:53-64 FrameState.matches` — "Two states match if
+    /// they only differ by using different Variables at the same place."
+    ///
+    /// ```python
+    /// def matches(self, other):
+    ///     assert self.blocklist == other.blocklist
+    ///     assert self.next_offset == other.next_offset
+    ///     for w1, w2 in zip(self.mergeable, other.mergeable):
+    ///         if not (w1 == w2 or (isinstance(w1, Variable) and
+    ///                              isinstance(w2, Variable))):
+    ///             return False
+    ///     return True
+    /// ```
+    ///
+    /// blocklist and next_offset must agree (asserted) — `matches` is a
+    /// post-`union` comparison invoked from `flowcontext.py:438` and the
+    /// candidate-list precondition is that all candidates share the
+    /// same join-point coordinates.
+    ///
+    /// The mergeable projection walks `locals + recursively_flatten(
+    /// stack) + [exc_type, exc_value]` (same shape as `getvariables` /
+    /// `getoutputargs`).  Two cells match iff they are equal or both
+    /// are `Variable` cells (regardless of identity — phi slot equality
+    /// is by structure, not vid).  `(None, None)` matches; any other
+    /// mix involving `None` does not.
+    pub fn matches(&self, other: &FrameState, graph: &FunctionGraph) -> bool {
+        use crate::flowspace::model::Hlvalue;
+        assert_eq!(
+            self.blocklist, other.blocklist,
+            "matches: blocklist mismatch"
+        );
+        assert_eq!(
+            self.next_offset, other.next_offset,
+            "matches: next_offset mismatch"
+        );
+        // (1) Locals — `framestate.mergeable` head.
+        let self_locals = self.locals_w_view(graph);
+        let other_locals = other.locals_w_view(graph);
+        if self_locals.len() != other_locals.len() {
+            return false;
+        }
+        let opt_cell_match = |w1: &Option<Hlvalue>, w2: &Option<Hlvalue>| match (w1, w2) {
+            (None, None) => true,
+            (Some(Hlvalue::Variable(_)), Some(Hlvalue::Variable(_))) => true,
+            (Some(x), Some(y)) => x == y,
+            _ => false,
+        };
+        if !self_locals
+            .iter()
+            .zip(other_locals.iter())
+            .all(|(w1, w2)| opt_cell_match(w1, w2))
+        {
+            return false;
+        }
+        drop(self_locals);
+        drop(other_locals);
+        // (2) Stack — `recursively_flatten(self.stack)` middle segment.
+        let self_stack = crate::flowspace::framestate::recursively_flatten(&self.stack);
+        let other_stack = crate::flowspace::framestate::recursively_flatten(&other.stack);
+        if self_stack.len() != other_stack.len() {
+            return false;
+        }
+        let cell_match = |w1: &Hlvalue, w2: &Hlvalue| match (w1, w2) {
+            (Hlvalue::Variable(_), Hlvalue::Variable(_)) => true,
+            (x, y) => x == y,
+        };
+        if !self_stack
+            .iter()
+            .zip(other_stack.iter())
+            .all(|(w1, w2)| cell_match(w1, w2))
+        {
+            return false;
+        }
+        // (3) Exception args — `[exc_type, exc_value]` tail.
+        let self_exc = exc_args(&self.last_exception);
+        let other_exc = exc_args(&other.last_exception);
+        self_exc
+            .iter()
+            .zip(other_exc.iter())
+            .all(|(w1, w2)| cell_match(w1, w2))
+    }
 }
 
 /// Hlvalue→LinkArg routing per cell, matching upstream

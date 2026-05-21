@@ -1822,6 +1822,22 @@ struct GraphBuildContext<'a> {
     /// table.
     #[allow(dead_code)]
     blockstack: Vec<crate::flowspace::flowcontext::FrameBlock>,
+    /// `flowcontext.py:293 self.joinpoints = {}` — candidate block list
+    /// keyed by `FrameState.next_offset`.  Each entry holds the
+    /// SpamBlocks already created for that join point in arrival order
+    /// (newest at index 0, matching upstream's `candidates.insert(0,
+    /// newblock)` convention at `flowcontext.py:435/462`).  Read by
+    /// `mergeblock`, which iterates candidates to find one whose
+    /// `framestate.union(currentstate)` returns non-None; written when
+    /// a new SpamBlock is created (`make_next_block` arm or the
+    /// generalization arm) or an existing candidate is generalized
+    /// out (`recloseblock` retire).
+    ///
+    /// Empty until callers route through `mergeblock`.  The tree-
+    /// recursive lowering today builds merge blocks directly without
+    /// consulting this map; downstream slices will migrate per-site.
+    #[allow(dead_code)]
+    joinpoints: HashMap<i64, Vec<BlockId>>,
 }
 
 #[derive(Debug, Clone)]
@@ -2365,6 +2381,7 @@ impl<'a> GraphBuildContext<'a> {
             value_stack: Vec::new(),
             last_exception: None,
             blockstack: Vec::new(),
+            joinpoints: HashMap::new(),
         }
     }
 
@@ -2727,6 +2744,208 @@ impl<'a> GraphBuildContext<'a> {
             self.local_first_bind_order.push(name.clone());
         }
         self.local_value_ids.insert(name, (vid, defining_block));
+    }
+
+    /// `flowspace/flowcontext.py:424-463 mergeblock` — line-by-line
+    /// port of the candidate-list-driven join-point handler.
+    ///
+    /// ```python
+    /// def mergeblock(self, currentblock, currentstate):
+    ///     next_offset = currentstate.next_offset
+    ///     candidates = self.joinpoints.setdefault(next_offset, [])
+    ///     for block in candidates:
+    ///         newstate = block.framestate.union(currentstate)
+    ///         if newstate is not None:
+    ///             break
+    ///     else:
+    ///         newblock = self.make_next_block(currentblock, currentstate)
+    ///         candidates.insert(0, newblock)
+    ///         return
+    ///
+    ///     if newstate.matches(block.framestate):
+    ///         outputargs = currentstate.getoutputargs(newstate)
+    ///         currentblock.closeblock(Link(outputargs, block))
+    ///         return
+    ///
+    ///     newblock = SpamBlock(newstate)
+    ///     ...
+    ///     outputargs = currentstate.getoutputargs(newstate)
+    ///     link = Link(outputargs, newblock)
+    ///     currentblock.closeblock(link)
+    ///
+    ///     block.dead = True
+    ///     block.operations = ()
+    ///     block.exitswitch = None
+    ///     outputargs = block.framestate.getoutputargs(newstate)
+    ///     block.recloseblock(Link(outputargs, newblock))
+    ///     candidates.remove(block)
+    ///
+    ///     candidates.insert(0, newblock)
+    ///     self.pendingblocks.append(newblock)
+    /// ```
+    ///
+    /// Three control-flow arms:
+    ///   - **No candidate accepts union** (`flowcontext.py:433-436`):
+    ///     fresh SpamBlock via `make_next_block`, `currentstate` is
+    ///     also the new block's framestate, candidate registered at
+    ///     head.
+    ///   - **First union-non-None candidate's merge equals it under
+    ///     `matches`** (`:438-441`): no generalization needed; close
+    ///     `currentblock` with a direct Link to the existing
+    ///     candidate.
+    ///   - **First union-non-None candidate's merge generalizes**
+    ///     (`:443-463`): create a new SpamBlock for the merged state,
+    ///     close `currentblock` to it, retire the old candidate by
+    ///     clearing its body and replacing its exits with a forward to
+    ///     the new block, then swap the candidate-list entry.
+    ///
+    /// Pyre adaptation: `pendingblocks.append(newblock)` is omitted —
+    /// the tree-recursive lowering visits every reachable block
+    /// synchronously; the new block becomes the merge target that the
+    /// caller lowers into directly.  Returns the BlockId of the merge
+    /// target so the caller can continue.
+    ///
+    /// Production migration blocker: pyre's existing AST merge sites
+    /// build "lean" merge blocks via `create_block_with_args(0)` /
+    /// `create_block_with_args(1)` with the locals threaded
+    /// per-slot through `lazy_install_local_at_current_block` only
+    /// when a fresh phi is actually needed.  This helper instead
+    /// follows `flowcontext.py:443 SpamBlock(newstate)` and emits a
+    /// merge block whose `inputargs` are ALL Variables in
+    /// `newstate.getvariables()` (locals + flattened stack + exc).
+    /// Switching a callsite over therefore changes the merge
+    /// block's inputarg arity in ways that downstream `set_goto`
+    /// callers (other merge sites that target this block) are not
+    /// prepared for, and exposes the latent gap where pyre's
+    /// `ctx.local_value_ids[name] = (vid, defining_block)` records
+    /// can carry a `defining_block` that isn't transitively reachable
+    /// from the predecessor (e.g. a local rebound in a sibling
+    /// arm).  `ensure_variable_at_block` in
+    /// `set_goto_from_framestate` then fails to backfill that
+    /// Variable through the predecessor chain.
+    ///
+    /// Closing the gap structurally requires either (a) making every
+    /// pyre AST merge block a SpamBlock with the full
+    /// `getvariables()` inputarg shape (so set_goto callers thread
+    /// the same N args uniformly) AND making `ctx.setstate` thread
+    /// the actual merge-block as the `defining_block` for the phi
+    /// locals it installs; or (b) a reachability-aware filter that
+    /// strips graph-unreachable Variables from the framestate before
+    /// `mergeblock`.  Multi-session.
+    #[allow(dead_code)]
+    fn mergeblock(
+        &mut self,
+        graph: &mut FunctionGraph,
+        currentblock: BlockId,
+        currentstate: FrameState,
+    ) -> BlockId {
+        let next_offset = currentstate.next_offset;
+        // `flowcontext.py:428` — `candidates = self.joinpoints.setdefault(
+        // next_offset, [])`.  Snapshot the candidate list so the framestate
+        // reads below can hold immutable graph borrows without conflicting
+        // with the mutable `self.joinpoints` borrow we'll need at the end.
+        let candidates_snapshot: Vec<BlockId> = self
+            .joinpoints
+            .get(&next_offset)
+            .cloned()
+            .unwrap_or_default();
+
+        // `flowcontext.py:429-432` — walk candidates looking for a union
+        // hit; on first non-None break out, preserving `block` (the
+        // candidate that succeeded) and `newstate` (the union result).
+        // Python's `for ... else` runs the else clause only when the
+        // loop completes without breaking, which we encode as
+        // `hit.is_none()`.
+        let mut hit: Option<(BlockId, FrameState)> = None;
+        for &cand in &candidates_snapshot {
+            let cand_fs = graph
+                .block(cand)
+                .framestate
+                .clone()
+                .expect("mergeblock: candidate must be a SpamBlock (framestate-bearing)");
+            if let Some(merged) = cand_fs.union(&currentstate, graph) {
+                hit = Some((cand, merged));
+                break;
+            }
+        }
+
+        match hit {
+            None => {
+                // `flowcontext.py:433-436` — `make_next_block(:465-473)`
+                // creates a fresh SpamBlock with `state.copy()` as its
+                // framestate and unconditionally links the current block
+                // to it.  Pyre's FrameState is Clone so `.clone()` plays
+                // the role of `state.copy()`.
+                let newstate = currentstate.clone();
+                let newblock = graph.create_block_from_framestate(&newstate);
+                graph.set_goto_from_framestate(currentblock, newblock, &currentstate, &newstate);
+                self.joinpoints
+                    .entry(next_offset)
+                    .or_default()
+                    .insert(0, newblock);
+                newblock
+            }
+            Some((cand, newstate)) => {
+                // `flowcontext.py:438` — `newstate.matches(block.framestate)`
+                // is true when the union produced no fresh Variables, so
+                // `block` already accepts `currentstate` shape-for-shape.
+                let cand_fs = graph
+                    .block(cand)
+                    .framestate
+                    .clone()
+                    .expect("mergeblock: candidate must be a SpamBlock (framestate-bearing)");
+                if newstate.matches(&cand_fs, graph) {
+                    // `flowcontext.py:439-441` — direct link from
+                    // current to the existing candidate.
+                    graph.set_goto_from_framestate(currentblock, cand, &currentstate, &cand_fs);
+                    cand
+                } else {
+                    // `flowcontext.py:443-463` — generalize: new
+                    // SpamBlock, link current→new, retire old candidate.
+                    let newblock = graph.create_block_from_framestate(&newstate);
+                    // `:449-451` — `outputargs = currentstate.
+                    // getoutputargs(newstate); currentblock.closeblock(
+                    // Link(outputargs, newblock))`.
+                    graph.set_goto_from_framestate(
+                        currentblock,
+                        newblock,
+                        &currentstate,
+                        &newstate,
+                    );
+                    // `:454-459` — dead-mark old candidate, clear body,
+                    // replace exits with a forward to the new block.
+                    // `outputargs = block.framestate.getoutputargs(
+                    // newstate)` projects the old block's entry shape
+                    // onto the new block's Variable slots.
+                    let old_outputargs = cand_fs.getoutputargs(&newstate, graph);
+                    {
+                        let blk = graph.block_mut(cand);
+                        blk.operations.clear();
+                        blk.exitswitch = None;
+                        blk.dead = true;
+                    }
+                    // Every `LinkArg::Value(var)` in `old_outputargs`
+                    // must be defined at `cand`; backfill the inputargs/
+                    // predecessor chain via `ensure_variable_at_block`
+                    // before installing the link.  Mirrors the same
+                    // backfill `set_goto_from_framestate` performs at
+                    // the caller-driven close sites.
+                    for arg in &old_outputargs {
+                        if let LinkArg::Value(var) = arg {
+                            graph.ensure_variable_at_block(cand, var);
+                        }
+                    }
+                    let link = Link::new_mixed(old_outputargs, newblock, None);
+                    graph.recloseblock(cand, vec![link]);
+                    // `:460-462` — `candidates.remove(block); candidates.
+                    // insert(0, newblock)`.
+                    let candidates = self.joinpoints.entry(next_offset).or_default();
+                    candidates.retain(|&c| c != cand);
+                    candidates.insert(0, newblock);
+                    newblock
+                }
+            }
+        }
     }
 }
 
@@ -14599,6 +14818,196 @@ mod tests {
         assert!(
             !ctx.local_value_ids.contains_key("y"),
             "None-killed slot must remove the binding from ctx"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // mergeblock helper (Slice 4.1 scaffold).
+    //
+    // Tests cover the three control-flow arms of
+    // `flowspace/flowcontext.py:424-463 mergeblock`:
+    //   1. No candidate at `next_offset` (or none accept union) — fresh
+    //      SpamBlock candidate is registered (`make_next_block`).
+    //   2. A candidate's union with current succeeds AND `matches` the
+    //      candidate's framestate — direct link, candidate list
+    //      unchanged.
+    //   3. A candidate's union with current succeeds but does NOT match
+    //      — fresh SpamBlock created with the merged state, old
+    //      candidate retired via `recloseblock`, candidate list swaps
+    //      the old block for the new.
+    //
+    // Tree-recursive lowering omits the `pendingblocks.append(newblock)`
+    // step from upstream; the merge target block is returned to the
+    // caller for synchronous continued lowering.
+
+    /// Build a single-slot FrameState whose only local is `vid`.
+    /// Variables backing the entries must already be registered with
+    /// `graph` so `create_block_from_framestate` / `getvariables` /
+    /// `set_goto_from_framestate` round-trip correctly.
+    fn mergeblock_test_state_single(vid: ValueId, next_offset: i64) -> FrameState {
+        FrameState {
+            entries: vec![Some(vid)],
+            locals_w: Vec::new(),
+            stack: Vec::new(),
+            last_exception: None,
+            blocklist: Vec::new(),
+            next_offset,
+        }
+    }
+
+    #[test]
+    fn mergeblock_first_arrival_creates_new_spam_block_candidate() {
+        // `flowcontext.py:433-436` — candidates empty, fall through to
+        // make_next_block: fresh SpamBlock with `currentstate.copy()` as
+        // its framestate, link current→new, insert at head.
+        let registry = StructFieldRegistry::default();
+        let fn_ret = HashMap::new();
+        let names = std::collections::HashSet::new();
+        let trait_names = std::collections::HashSet::new();
+        let mut ctx = z4a_test_ctx(&registry, &fn_ret, &names, &trait_names);
+        let mut graph = crate::model::FunctionGraph::new("test");
+        let v1 = graph.alloc_value();
+        let currentstate = mergeblock_test_state_single(v1, 10);
+        let current = graph.create_block_from_framestate(&currentstate);
+
+        let merge = ctx.mergeblock(&mut graph, current, currentstate.clone());
+
+        assert_eq!(
+            ctx.joinpoints.get(&10).cloned().unwrap_or_default(),
+            vec![merge],
+            "candidate list at next_offset=10 must contain only the new SpamBlock"
+        );
+        assert_ne!(merge, current, "mergeblock must create a NEW block");
+        assert!(
+            graph.block(merge).framestate.is_some(),
+            "make_next_block: merge target is a SpamBlock (framestate-bearing)"
+        );
+        let exits = &graph.block(current).exits;
+        assert_eq!(exits.len(), 1, "current closed with a single goto");
+        assert_eq!(exits[0].target, merge, "exit targets the new merge block");
+    }
+
+    #[test]
+    fn mergeblock_matching_candidate_takes_direct_link() {
+        // `flowcontext.py:438-441` — union succeeds, `matches` returns
+        // true (both predecessors carry Variables at the same slot
+        // positions modulo identity), so currentblock is linked
+        // directly to the existing candidate.  No new SpamBlock, no
+        // candidate-list mutation.
+        let registry = StructFieldRegistry::default();
+        let fn_ret = HashMap::new();
+        let names = std::collections::HashSet::new();
+        let trait_names = std::collections::HashSet::new();
+        let mut ctx = z4a_test_ctx(&registry, &fn_ret, &names, &trait_names);
+        let mut graph = crate::model::FunctionGraph::new("test");
+
+        // Predecessor #1.
+        let v1 = graph.alloc_value();
+        let state1 = mergeblock_test_state_single(v1, 20);
+        let current1 = graph.create_block_from_framestate(&state1);
+        let cand = ctx.mergeblock(&mut graph, current1, state1);
+
+        // Predecessor #2 — different Variable in the same slot, same
+        // next_offset.  Per `framestate.py:113-114`, the per-cell union
+        // mints a fresh Variable; `matches` accepts the pair as both-
+        // Variables, so we take the direct-link arm.
+        let v2 = graph.alloc_value();
+        let state2 = mergeblock_test_state_single(v2, 20);
+        let current2 = graph.create_block_from_framestate(&state2);
+        let merge = ctx.mergeblock(&mut graph, current2, state2);
+
+        assert_eq!(merge, cand, "matches arm returns the existing candidate");
+        assert_eq!(
+            ctx.joinpoints.get(&20).cloned().unwrap_or_default(),
+            vec![cand],
+            "candidate list unchanged on matches-direct-link arm"
+        );
+        assert_eq!(
+            graph.block(current1).exits[0].target,
+            cand,
+            "first predecessor still targets the original candidate"
+        );
+        assert_eq!(
+            graph.block(current2).exits[0].target,
+            cand,
+            "second predecessor takes the direct link to the same candidate"
+        );
+        assert!(
+            !graph.block(cand).dead,
+            "matches-direct-link arm does not retire the candidate"
+        );
+    }
+
+    #[test]
+    fn mergeblock_disagreeing_candidate_generalizes_and_retires_old() {
+        // `flowcontext.py:443-463` — second predecessor's union with
+        // the candidate produces a state that does NOT match the
+        // candidate (a slot present-as-Variable in the candidate
+        // collapses to None-kill when unioned with a one-sided
+        // arrival).  Build a fresh SpamBlock for the merged state,
+        // link current→new, retire the old candidate via
+        // `recloseblock` to forward to the new block, and swap the
+        // candidate-list entry.
+        let registry = StructFieldRegistry::default();
+        let fn_ret = HashMap::new();
+        let names = std::collections::HashSet::new();
+        let trait_names = std::collections::HashSet::new();
+        let mut ctx = z4a_test_ctx(&registry, &fn_ret, &names, &trait_names);
+        let mut graph = crate::model::FunctionGraph::new("test");
+
+        // Predecessor #1 binds slot 0 to v1.
+        let v1 = graph.alloc_value();
+        let state1 = mergeblock_test_state_single(v1, 30);
+        let current1 = graph.create_block_from_framestate(&state1);
+        let cand = ctx.mergeblock(&mut graph, current1, state1);
+
+        // Predecessor #2 leaves slot 0 unbound.  Per
+        // `framestate.py:110-111`, the per-cell union returns
+        // Ok(None) — the merged state has [None] at slot 0.
+        // `matches` rejects (Variable vs None) → take the generalize
+        // arm.
+        let state2 = FrameState {
+            entries: vec![None],
+            locals_w: Vec::new(),
+            stack: Vec::new(),
+            last_exception: None,
+            blocklist: Vec::new(),
+            next_offset: 30,
+        };
+        let current2 = graph.create_block_from_framestate(&state2);
+        let merge = ctx.mergeblock(&mut graph, current2, state2);
+
+        assert_ne!(merge, cand, "generalize arm allocates a fresh SpamBlock");
+        assert_eq!(
+            ctx.joinpoints.get(&30).cloned().unwrap_or_default(),
+            vec![merge],
+            "candidate list swaps the old block for the new (insert at head, remove old)"
+        );
+        // Old candidate retired: dead-marked, ops cleared, exits
+        // forwarded to the new block.
+        let cand_block = graph.block(cand);
+        assert!(cand_block.dead, "retired candidate must be dead-marked");
+        assert!(
+            cand_block.operations.is_empty(),
+            "retired candidate's operations must be cleared"
+        );
+        assert!(
+            cand_block.exitswitch.is_none(),
+            "retired candidate's exitswitch must be cleared"
+        );
+        assert_eq!(
+            cand_block.exits.len(),
+            1,
+            "retired candidate forwards via a single reclosed Link"
+        );
+        assert_eq!(
+            cand_block.exits[0].target, merge,
+            "retired candidate forwards to the new merged SpamBlock"
+        );
+        assert_eq!(
+            graph.block(current2).exits[0].target,
+            merge,
+            "current2 links directly to the new merge block"
         );
     }
 }
