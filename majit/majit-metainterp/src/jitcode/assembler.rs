@@ -1573,11 +1573,14 @@ impl JitCodeBuilder {
 
     /// RPython blackhole.py:976-985 `goto_if_exception_mismatch/iL`.
     ///
-    /// `vtable` is an int operand index, which may refer either to a real
-    /// Int register or to an assembler-routed Int constant pool slot.
-    /// Unlike `last_exception`, this operand is not necessarily a live
-    /// register, so we intentionally do not call `touch_reg()` here.
+    /// `vtable` is an int operand that may be either a real Int
+    /// register or a const-pool slot synthesized as `num_regs_i +
+    /// pool_idx` by `pyre-jit/src/jit/assembler.rs::expect_int_reg_or_pool`.
+    /// Validated via the union helper so the operand byte's
+    /// `[0, num_regs_i + num_consts_i)` range is enforced before the
+    /// `as u8` push.
     pub fn goto_if_exception_mismatch(&mut self, vtable: u16, label: u16) {
+        self.touch_int_reg_or_pool_slot(vtable);
         self.write_insn("goto_if_exception_mismatch/iL");
         self.push_u8(vtable as u8);
         self.push_label_ref(label);
@@ -1697,6 +1700,7 @@ impl JitCodeBuilder {
 
     /// blackhole.py bhimpl_raise(excvalue): raise exception from register.
     pub fn emit_raise(&mut self, src: u16) {
+        self.touch_ref_reg(src);
         self.write_insn("raise/r");
         self.push_u8(src as u8);
     }
@@ -1711,6 +1715,7 @@ impl JitCodeBuilder {
     /// Blackhole: no-op (value passes through).
     /// Tracing: emits GUARD_VALUE to specialize the trace on this value.
     pub fn int_guard_value(&mut self, src: u16) {
+        self.touch_reg(src);
         self.write_insn("int_guard_value/i");
         self.push_u8(src as u8);
     }
@@ -1746,12 +1751,14 @@ impl JitCodeBuilder {
 
     /// pyjitpl.py opimpl_ref_guard_value: promote ref register to constant.
     pub fn ref_guard_value(&mut self, src: u16) {
+        self.touch_ref_reg(src);
         self.write_insn("ref_guard_value/r");
         self.push_u8(src as u8);
     }
 
     /// pyjitpl.py opimpl_float_guard_value: promote float register to constant.
     pub fn float_guard_value(&mut self, src: u16) {
+        self.touch_float_reg(src);
         self.write_insn("float_guard_value/f");
         self.push_u8(src as u8);
     }
@@ -3877,27 +3884,19 @@ impl JitCodeBuilder {
         self.patches.push((label as usize, patch_offset));
     }
 
+    /// `assembler.py:72-74` `emit_reg(reg)` parity: real-register emit
+    /// path.  Asserts `reg.index < count_regs[kind]` when frozen so
+    /// out-of-band register indices fail-fast instead of silently
+    /// truncating via `as u8` at the matching push site.  Const-pool
+    /// slots route through `touch_int_reg_or_pool_slot` instead — they
+    /// live in `[num_regs_kind, num_regs_kind + num_consts_kind)`,
+    /// outside the real-register window.
     fn touch_reg(&mut self, reg: u16) {
-        // RPython `assembler.py:72-74` `emit_reg(reg)` asserts
-        // `reg.index < count_regs[kind]`.  The bytecode operand byte is
-        // 1 byte (`chr(reg.index)`), so any reg outside `[0, 256)` would
-        // silently truncate via `as u8` at the matching push site.
-        //
-        // Pyre callers route `Const*` operands through the constants
-        // pool as `num_regs_kind + pool_idx` (see
-        // `pyre/pyre-jit/src/jit/assembler.rs::expect_int_reg_or_pool`),
-        // so the legal upper bound at emit time is
-        // `num_regs_kind + num_consts_kind`. RPython keeps the two
-        // emit paths separate (`emit_reg` vs `emit_const`); pyre fuses
-        // them through `touch_reg`/`push_u8`, so the assert mirrors the
-        // union of both bounds.
-        let limit = self
-            .num_regs_i
-            .saturating_add(self.constants_i.len() as u16);
         if self.num_regs_frozen {
             assert!(
-                reg < limit && reg < 256,
-                "int reg {reg} out of bounds {limit} (assembler.py:72-74 emit_reg parity)"
+                reg < self.num_regs_i && reg < 256,
+                "int reg {reg} out of bounds {} (assembler.py:72-74 emit_reg parity)",
+                self.num_regs_i
             );
             return;
         }
@@ -3909,13 +3908,11 @@ impl JitCodeBuilder {
     }
 
     fn touch_ref_reg(&mut self, reg: u16) {
-        let limit = self
-            .num_regs_r
-            .saturating_add(self.constants_r.len() as u16);
         if self.num_regs_frozen {
             assert!(
-                reg < limit && reg < 256,
-                "ref reg {reg} out of bounds {limit} (assembler.py:72-74 emit_reg parity)"
+                reg < self.num_regs_r && reg < 256,
+                "ref reg {reg} out of bounds {} (assembler.py:72-74 emit_reg parity)",
+                self.num_regs_r
             );
             return;
         }
@@ -3927,13 +3924,77 @@ impl JitCodeBuilder {
     }
 
     fn touch_float_reg(&mut self, reg: u16) {
+        if self.num_regs_frozen {
+            assert!(
+                reg < self.num_regs_f && reg < 256,
+                "float reg {reg} out of bounds {} (assembler.py:72-74 emit_reg parity)",
+                self.num_regs_f
+            );
+            return;
+        }
+        assert!(
+            reg < 256,
+            "float reg {reg} out of u8 range (assembler.py:72 chr() parity)"
+        );
+        self.num_regs_f = max(self.num_regs_f, reg.saturating_add(1));
+    }
+
+    /// `assembler.py:126` `emit_const(...)` parity: the bytecode slot
+    /// for a constant operand is `count_regs[kind] + const_index`.
+    /// Real-register emit (`touch_reg`) and constant emit are two
+    /// distinct upstream paths; pyre fuses them at the call-arg
+    /// surface because the synthesized `[num_regs_kind, num_regs_kind +
+    /// num_consts_kind)` slot indices flow through `JitCallArg` from
+    /// `pyre-jit/src/jit/assembler.rs::expect_*_reg_or_pool`.  This
+    /// union helper validates against the combined range so const-pool
+    /// slots are accepted alongside real-register indices.
+    fn touch_int_reg_or_pool_slot(&mut self, reg: u16) {
+        let limit = self
+            .num_regs_i
+            .saturating_add(self.constants_i.len() as u16);
+        if self.num_regs_frozen {
+            assert!(
+                reg < limit && reg < 256,
+                "int reg-or-pool {reg} out of bounds {limit} \
+                 (assembler.py:72-74 emit_reg / assembler.py:126 emit_const parity)"
+            );
+            return;
+        }
+        assert!(
+            reg < 256,
+            "int reg {reg} out of u8 range (assembler.py:72 chr() parity)"
+        );
+        self.num_regs_i = max(self.num_regs_i, reg.saturating_add(1));
+    }
+
+    fn touch_ref_reg_or_pool_slot(&mut self, reg: u16) {
+        let limit = self
+            .num_regs_r
+            .saturating_add(self.constants_r.len() as u16);
+        if self.num_regs_frozen {
+            assert!(
+                reg < limit && reg < 256,
+                "ref reg-or-pool {reg} out of bounds {limit} \
+                 (assembler.py:72-74 emit_reg / assembler.py:126 emit_const parity)"
+            );
+            return;
+        }
+        assert!(
+            reg < 256,
+            "ref reg {reg} out of u8 range (assembler.py:72 chr() parity)"
+        );
+        self.num_regs_r = max(self.num_regs_r, reg.saturating_add(1));
+    }
+
+    fn touch_float_reg_or_pool_slot(&mut self, reg: u16) {
         let limit = self
             .num_regs_f
             .saturating_add(self.constants_f.len() as u16);
         if self.num_regs_frozen {
             assert!(
                 reg < limit && reg < 256,
-                "float reg {reg} out of bounds {limit} (assembler.py:72-74 emit_reg parity)"
+                "float reg-or-pool {reg} out of bounds {limit} \
+                 (assembler.py:72-74 emit_reg / assembler.py:126 emit_const parity)"
             );
             return;
         }
@@ -4043,10 +4104,15 @@ impl JitCodeBuilder {
     }
 
     fn touch_call_arg(&mut self, arg: JitCallArg) {
+        // Call-arg slot indices are produced by
+        // `pyre-jit/src/jit/assembler.rs::expect_*_reg_or_pool` which
+        // synthesizes `num_regs_kind + pool_idx` for constant operands,
+        // so the validated range is the kind+consts union (RPython
+        // `emit_const` slot range, `assembler.py:126`).
         match arg.kind {
-            JitArgKind::Int => self.touch_reg(arg.reg),
-            JitArgKind::Ref => self.touch_ref_reg(arg.reg),
-            JitArgKind::Float => self.touch_float_reg(arg.reg),
+            JitArgKind::Int => self.touch_int_reg_or_pool_slot(arg.reg),
+            JitArgKind::Ref => self.touch_ref_reg_or_pool_slot(arg.reg),
+            JitArgKind::Float => self.touch_float_reg_or_pool_slot(arg.reg),
         }
     }
 
