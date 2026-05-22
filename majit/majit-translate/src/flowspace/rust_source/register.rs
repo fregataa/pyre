@@ -78,6 +78,9 @@ use crate::flowspace::operation::{
     is_foldable_numeric, python_eq_const,
 };
 use crate::flowspace::pygraph::PyGraph;
+use crate::translator::rtyper::lltypesystem::lltype::{
+    GcKind, LowLevelType, OpaqueType, Ptr, StructType,
+};
 
 /// Walk `item_fn`, run the Rust-AST adapter, and return the
 /// `(HostObject, PyGraph)` pair that the upstream translator cache
@@ -861,6 +864,21 @@ fn register_items_into_namespace<'a>(
     source_filename: Option<&str>,
     source_text: Option<&str>,
 ) -> Result<(), AdapterError> {
+    // Pre-collect this inline mod's own `type T = U;` aliases. The
+    // guard replaces (not extends) the outer scope's alias map so
+    // outer-mod aliases are intentionally NOT visible inside —
+    // matching Rust's lexical-scope rule that an inner `mod` block
+    // shadows the outer module's `use` / `type` bindings unless they
+    // are re-imported. Outer-mod aliases reach the inner scope only
+    // through explicit `use super::T` (which the walker resolves
+    // through the deferred-uses pipeline, not the catalog).
+    let _walker_aliases_guard = WalkerTypeAliasGuard::enter(collect_type_aliases(items));
+    // Each scope owns its own `Item::Struct` → `Ptr(GcStruct(...))`
+    // map for by-value embedding lookup; inner-mod struct walks must
+    // not leak refs into the outer module's nested-embed lookup, so
+    // the guard enters with an empty map and reverts on drop.
+    let _walker_struct_ptrs_guard = WalkerStructPtrsGuard::enter();
+    preseed_struct_ptrs(items);
     // Inner-mod's own scoped const-eval partition (audit 1.4, 2026-05-08).
     let inner_const_scope = ModuleId::fresh();
     // Inner-mod's own module-globals registry partition (audit 1.3,
@@ -1467,6 +1485,18 @@ pub fn register_rust_module_at_with_source(
         Some(path) => ModuleId::for_path(path),
         None => ModuleId::fresh(),
     };
+    // Pre-collect `type T = U;` aliases so field-type resolution in
+    // `syn_primitive_to_lltype` can chase `PyObjectRef → *mut PyObject`
+    // through the catalog. The guard keeps the alias map active for
+    // the entire walker scope (pass 1 + pass 2 fixed-point loop +
+    // every recursive `register_items_into_namespace` call), and the
+    // guard's Drop revert keeps thread-local state clean across
+    // sibling walks.
+    let _walker_aliases_guard = WalkerTypeAliasGuard::enter(collect_type_aliases(&file.items));
+    // Per-file `Item::Struct` → `Ptr(GcStruct(...))` map for
+    // by-value embedding lookup; symmetric to the alias guard.
+    let _walker_struct_ptrs_guard = WalkerStructPtrsGuard::enter();
+    preseed_struct_ptrs(&file.items);
     // Source-order accumulator of `Item::Const` bindings produced
     // during this walk. Mirrors Python module-import semantics:
     // top-level statements run in order and each binding is visible
@@ -1919,7 +1949,14 @@ pub fn register_rust_module_at_with_source(
     // same class (`fn caller() { self.helper() }` ahead of `fn
     // helper(&self) { ... }`) need every sibling placeholder visible
     // through `class.class_get(name)` at body lowering time.
-    let mut pending_methods: Vec<(HostObject, GraphFunc, HostCode, syn::ItemFn)> = Vec::new();
+    // 5th tuple slot holds the impl-target class HostObject so the
+    // method body's `&self` typed-input lift
+    // (`build_flow::annotate_typed_ptr_inputs`) can resolve `Self`
+    // against it via `func_globals`. The impl class doubles as the
+    // method's class-side scope, matching the pyre convention
+    // established by the inner-mod path (line 1154).
+    let mut pending_methods: Vec<(HostObject, GraphFunc, HostCode, syn::ItemFn, HostObject)> =
+        Vec::new();
 
     // Strict-parity round-4 (2026-05-11): cross-trait method-name
     // collision check, keyed on the *resolved* target HostObject
@@ -2047,7 +2084,7 @@ pub fn register_rust_module_at_with_source(
             } = parts;
             seen_method_collisions.insert(collision_key, di.class_path.clone());
             class.class_set(&di.method_name, ConstValue::HostObject(host.clone()));
-            pending_methods.push((host, gf, host_code, di.item_fn));
+            pending_methods.push((host, gf, host_code, di.item_fn, class.clone()));
             made_progress = true;
         }
         deferred_impls = still_deferred_impls;
@@ -2055,11 +2092,11 @@ pub fn register_rust_module_at_with_source(
         // Phase B (impls): retry pending method bodies; host already
         // in class dict via the Phase A `class_set`.
         let mut still_pending_methods = Vec::with_capacity(pending_methods.len());
-        for (host, gf, host_code, item_fn) in pending_methods.drain(..) {
+        for (host, gf, host_code, item_fn, impl_class) in pending_methods.drain(..) {
             match lower_body_into_pygraph(
                 &item_fn,
                 module_id,
-                None,
+                Some(&impl_class),
                 gf.clone(),
                 &host_code,
                 source_text,
@@ -2071,7 +2108,7 @@ pub fn register_rust_module_at_with_source(
                 }
                 Err(err) => {
                     register_walker_error(host.clone(), err.to_string());
-                    still_pending_methods.push((host, gf, host_code, item_fn));
+                    still_pending_methods.push((host, gf, host_code, item_fn, impl_class));
                 }
             }
         }
@@ -3075,7 +3112,464 @@ fn eval_binop(
 /// matches that semantic exactly.
 fn build_host_class_from_struct(item_struct: &ItemStruct) -> HostObject {
     let name = item_struct.ident.to_string();
-    HostObject::new_class(&name, vec![])
+    let host = HostObject::new_class(&name, vec![]);
+    if let Some(ptr) = try_build_gc_struct_ptr(&name, &item_struct.fields) {
+        // Same-scope struct registry — later structs in the same scope
+        // can embed this one by-value via `syn_primitive_to_lltype` →
+        // `walker_struct_ptr_lookup`. Mirrors upstream
+        // `lltype.GcStruct("Outer", ("first", INNER_GCSTRUCT))` shape.
+        walker_struct_ptr_register(&name, ptr.clone());
+        // `set_lltype_ptr` rejects double-set; structurally equal
+        // re-walks are harmless because the previously-stored `Ptr`
+        // is structurally equal. Ignore the duplicate-set error to
+        // match `lltype.Ptr.__new__`'s "return the cached instance"
+        // behaviour (`rpython/rtyper/lltypesystem/lltype.py:721-739`).
+        let _ = host.set_lltype_ptr(ptr);
+    }
+    host
+}
+
+thread_local! {
+    /// Per-walker-scope `type T = U` map consulted by
+    /// [`syn_primitive_to_lltype`] when an unrecognized single-segment
+    /// identifier needs alias resolution. Set by the caller via
+    /// [`with_walker_type_aliases`] before invoking
+    /// [`build_host_class_from_struct`] / [`try_build_gc_struct_ptr`],
+    /// and restored to the prior value when the guard drops.  Mirrors
+    /// upstream Rust's compile-time `Item::Type` resolution at the
+    /// catalog layer: `type PyObjectRef = *mut PyObject;` lets a
+    /// struct field declared as `PyObjectRef` resolve through the
+    /// catalog the same way `*mut PyObject` already does.
+    static WALKER_TYPE_ALIASES: RefCell<StdHashMap<String, syn::Type>> =
+        RefCell::new(StdHashMap::new());
+}
+
+/// RAII guard that swaps the walker's thread-local type-alias map
+/// on construction and restores the prior contents on drop. The
+/// guard pattern keeps the alias scope correct across early `?`
+/// returns inside the walker body. Nested guards compose by saving
+/// the *prior* outer scope and reverting to it on drop (inline mods
+/// see their own alias scope; outer scope aliases are NOT visible
+/// inside).
+struct WalkerTypeAliasGuard {
+    prev: StdHashMap<String, syn::Type>,
+}
+
+impl WalkerTypeAliasGuard {
+    fn enter(aliases: StdHashMap<String, syn::Type>) -> Self {
+        let prev =
+            WALKER_TYPE_ALIASES.with(|cell| std::mem::replace(&mut *cell.borrow_mut(), aliases));
+        WalkerTypeAliasGuard { prev }
+    }
+}
+
+impl Drop for WalkerTypeAliasGuard {
+    fn drop(&mut self) {
+        WALKER_TYPE_ALIASES.with(|cell| {
+            *cell.borrow_mut() = std::mem::take(&mut self.prev);
+        });
+    }
+}
+
+/// Consult the walker scope's alias map for a single-segment ident.
+/// Returns `None` when no alias matches or the walker scope is empty
+/// (no `with_walker_type_aliases` guard active).
+fn walker_type_alias_lookup(name: &str) -> Option<syn::Type> {
+    WALKER_TYPE_ALIASES.with(|cell| cell.borrow().get(name).cloned())
+}
+
+thread_local! {
+    /// Per-walker-scope `Item::Struct` → `Ptr(GcStruct(...))` map
+    /// populated by [`build_host_class_from_struct`] after each
+    /// in-scope struct is minted. Consulted by
+    /// [`syn_primitive_to_lltype`] when an unrecognized single-segment
+    /// identifier names a struct that has already been walked in the
+    /// same scope, enabling by-value embedding of one cataloged struct
+    /// inside another — mirroring upstream
+    /// `lltype.GcStruct("Outer", ("first", INNER_GCSTRUCT))` (the
+    /// canonical "subclass marker" / `PyObject_HEAD` inheritance shape;
+    /// `lltype.py:296-303 Struct._first_struct`). Source-order
+    /// dependent: an embedding struct must follow its embedded struct
+    /// in the file; cross-file lookups are deferred to a later slice
+    /// (requires `use` import resolution).
+    static WALKER_STRUCT_PTRS: RefCell<StdHashMap<String, Ptr>> =
+        RefCell::new(StdHashMap::new());
+}
+
+/// RAII guard that clears the walker's thread-local struct-Ptr map
+/// on construction and restores the prior contents on drop. Mirrors
+/// [`WalkerTypeAliasGuard`]; nested guards compose by saving the
+/// prior outer scope and reverting to it on drop.
+struct WalkerStructPtrsGuard {
+    prev: StdHashMap<String, Ptr>,
+}
+
+impl WalkerStructPtrsGuard {
+    fn enter() -> Self {
+        let prev = WALKER_STRUCT_PTRS
+            .with(|cell| std::mem::replace(&mut *cell.borrow_mut(), StdHashMap::new()));
+        WalkerStructPtrsGuard { prev }
+    }
+}
+
+impl Drop for WalkerStructPtrsGuard {
+    fn drop(&mut self) {
+        WALKER_STRUCT_PTRS.with(|cell| {
+            *cell.borrow_mut() = std::mem::take(&mut self.prev);
+        });
+    }
+}
+
+/// Register a freshly-minted `Ptr(GcStruct(...))` into the walker's
+/// struct-Ptr map under its bare name so that subsequent same-scope
+/// struct walks can embed it by-value via [`syn_primitive_to_lltype`].
+/// Silently overwrites a previous entry under the same name — mirrors
+/// upstream `lltype.Ptr.__new__`'s structural cache (`lltype.py:721-739`)
+/// where structurally equal `Ptr`s share identity.  Mirrors the same
+/// `Ptr` into the process-wide [`PROCESS_WIDE_STRUCT_PTRS`] for
+/// cross-file lookup so e.g. `pyobject.rs`'s `PyObject` becomes
+/// visible when `typeobject.rs` later embeds it as a first field.
+fn walker_struct_ptr_register(name: &str, ptr: Ptr) {
+    WALKER_STRUCT_PTRS.with(|cell| {
+        cell.borrow_mut().insert(name.to_string(), ptr.clone());
+    });
+    if let Ok(mut map) = PROCESS_WIDE_STRUCT_PTRS.lock() {
+        map.insert(name.to_string(), ptr);
+    }
+}
+
+/// Consult the walker scope's struct-Ptr map for a single-segment
+/// ident.  Returns the inner `StructType` (`Ptr.TO` unwrapped) when
+/// the name matches a previously-minted `Ptr(GcStruct(...))`. Falls
+/// back to the process-wide registry [`PROCESS_WIDE_STRUCT_PTRS`] so
+/// cross-file embedding (e.g. `W_BytesObject { pub ob_header:
+/// PyObject }` in `bytesobject.rs` referencing the `PyObject`
+/// minted by `pyobject.rs`) resolves the same way same-file embedding
+/// does.
+fn walker_struct_ptr_lookup(name: &str) -> Option<StructType> {
+    let from_scope = WALKER_STRUCT_PTRS.with(|cell| cell.borrow().get(name).cloned());
+    let ptr = match from_scope {
+        Some(ptr) => ptr,
+        None => PROCESS_WIDE_STRUCT_PTRS.lock().ok()?.get(name).cloned()?,
+    };
+    match ptr.TO {
+        crate::translator::rtyper::lltypesystem::lltype::PtrTarget::Struct(s) => Some(s),
+        _ => None,
+    }
+}
+
+/// Process-wide name → `Ptr(GcStruct(...))` registry populated by
+/// [`walker_struct_ptr_register`] each time
+/// [`build_host_class_from_struct`] catalogues a struct. Mirrors
+/// upstream cross-module `LOAD_GLOBAL`'s identity invariant
+/// (`flowcontext.py:847`): two files that reference the same struct
+/// name share the same lltype `Ptr`. Lives for the duration of the
+/// process — once registered, the entry stays addressable until the
+/// program exits, matching `HOST_CLASS_MINTS`'s lifetime semantics.
+static PROCESS_WIDE_STRUCT_PTRS: std::sync::LazyLock<std::sync::Mutex<StdHashMap<String, Ptr>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(StdHashMap::new()));
+
+/// Pre-collect `Item::Type T = U;` definitions from a flat list of
+/// items into a `StdHashMap<String, syn::Type>`. Skips items with
+/// generic parameters (`type T<U> = Vec<U>;`) — those would require
+/// substitution semantics the catalog does not implement yet.
+fn collect_type_aliases<'a>(
+    items: impl IntoIterator<Item = &'a syn::Item>,
+) -> StdHashMap<String, syn::Type> {
+    let mut map = StdHashMap::new();
+    for item in items {
+        if let syn::Item::Type(item_type) = item
+            && item_type.generics.params.is_empty()
+        {
+            map.insert(item_type.ident.to_string(), (*item_type.ty).clone());
+        }
+    }
+    map
+}
+
+/// Populate the current walker scope's struct-Ptr catalog before the
+/// source-order item pass runs. This is a fixed-point pass over only
+/// the current scope's `Item::Struct`s: primitive-only structs register
+/// first, then structs whose first field embeds one of those registered
+/// GcStructs can register on a later iteration. That removes Rust
+/// forward-reference sensitivity without introducing a side table at
+/// use sites — the normal [`walker_struct_ptr_lookup`] path still reads
+/// the same per-scope catalog.
+fn preseed_struct_ptrs<'a>(items: impl IntoIterator<Item = &'a syn::Item>) {
+    let structs: Vec<&'a syn::ItemStruct> = items
+        .into_iter()
+        .filter_map(|item| match item {
+            syn::Item::Struct(item_struct) => Some(item_struct),
+            _ => None,
+        })
+        .collect();
+    let mut registered = std::collections::HashSet::new();
+    loop {
+        let mut progressed = false;
+        for item_struct in &structs {
+            let name = item_struct.ident.to_string();
+            if registered.contains(&name) {
+                continue;
+            }
+            if let Some(ptr) = try_build_gc_struct_ptr(&name, &item_struct.fields) {
+                walker_struct_ptr_register(&name, ptr);
+                registered.insert(name);
+                progressed = true;
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+}
+
+/// Attempt to synthesize a `Ptr(GcStruct(name, fields))` for an
+/// `Item::Struct` whose every field has a direct lltype shape. Returns
+/// `None` if any field's `syn::Type` falls outside the strict catalog
+/// covered by `syn_primitive_to_lltype` (Box/Rc/Arc/Vec/Atomic/dyn
+/// trait/generic — those require explicit RPython-shape modeling before
+/// they can be admitted).
+///
+/// Mirrors upstream `rpython/rtyper/lltypesystem/lltype.py:258-380
+/// class Struct.__init__` field-tuple constructor + `:721-739
+/// Ptr.__new__` validation. The resulting `Ptr` is what `_ptrEntry`
+/// (`lltype.py:1513-1518`) returns from `compute_annotation` when the
+/// `typeOf(self.instance)` of a typed-ref instance is evaluated.
+fn try_build_gc_struct_ptr(name: &str, fields: &syn::Fields) -> Option<Ptr> {
+    let field_iter: Box<dyn Iterator<Item = &syn::Field>> = match fields {
+        syn::Fields::Named(named) => Box::new(named.named.iter()),
+        syn::Fields::Unnamed(unnamed) => Box::new(unnamed.unnamed.iter()),
+        // `struct Foo;` — unit struct. Upstream `lltype.Struct(name)`
+        // with no fields is legal (`lltype.py:258` accepts `*fields`);
+        // produce an empty-field GcStruct so unit structs reach the
+        // catalog symmetrically with field-bearing ones.
+        syn::Fields::Unit => {
+            let struct_t = StructType::gc(name, vec![]);
+            return Ptr::from_container_type(LowLevelType::Struct(Box::new(struct_t))).ok();
+        }
+    };
+    let mut resolved: Vec<(String, LowLevelType)> = Vec::new();
+    for (idx, field) in field_iter.enumerate() {
+        let ll = syn_primitive_to_lltype(&field.ty)?;
+        // RPython `Struct._build` (`lltype.py:289-291`) rejects
+        // embedding a `GcStruct` as anything other than the first
+        // field of another `GcStruct` (the inheritance / subclass
+        // marker shape, e.g. `PyObject_HEAD`).  Pre-validate here so
+        // a non-first nested `GcStruct` rejects the parent gracefully
+        // instead of triggering the downstream `_note_inlined_into`
+        // panic.  Mirrors `StructType._note_inlined_into`'s
+        // `!first || !same_gc` arm.
+        if idx > 0
+            && let LowLevelType::Struct(inner) = &ll
+            && inner._gckind == GcKind::Gc
+        {
+            return None;
+        }
+        let field_name = field
+            .ident
+            .as_ref()
+            .map(|i| i.to_string())
+            .unwrap_or_else(|| idx.to_string());
+        resolved.push((field_name, ll));
+    }
+    let struct_t = StructType::gc(name, resolved);
+    Ptr::from_container_type(LowLevelType::Struct(Box::new(struct_t))).ok()
+}
+
+/// Map a `syn::Type` to a `LowLevelType` for the strict field-shape
+/// subset recognized by the struct catalog.
+/// Returns `None` for any shape that still needs catalog extension
+/// (`Vec<T>`, `Box<T>`, `Rc<T>`, `Arc<T>`, `Atomic*`, `dyn Trait`,
+/// generic type parameter, tuple, array, slice, fn type, …). Raw
+/// pointer fields and `&RegisteredStruct` are admitted because they
+/// have direct `Ptr(OpaqueType)` / `Ptr(GcStruct)` lltype counterparts.
+///
+/// The mapping preserves RPython `lltype.py` primitive identity
+/// (`Char`, `UniChar`, `SingleFloat`, `Float`, …) as it appears in
+/// `rpython/rtyper/lltypesystem/lltype.py:88-198`. This is the
+/// *lltype-level* identity — it lives one layer below the
+/// register-class collapse that `getkind` performs
+/// (`rpython/jit/codewriter/support.py:getkind`), where `Char` /
+/// `UniChar` / `SingleFloat` all fold to `'int'`. The
+/// register-class lift in `front/ast.rs::classify_fn_arg_ty` works
+/// at the `ValueType` (= register class) layer; that layer agrees
+/// with `getkind`, not with the lltype-primitive identity captured
+/// here. Mapping `char → Signed` or `f32 → Float` here would erase
+/// the lltype identity even though it would coincidentally pick the
+/// right register class.
+///
+/// Extract a single-segment leaf identifier from a raw pointer's
+/// target type for use as an `OpaqueType` tag. Returns `None` if
+/// the target is anything other than a single-segment path or a
+/// `()` unit-type — the caller falls back to the conventional
+/// `"?"` tag in that case.
+fn raw_pointer_target_tag(target: &syn::Type) -> Option<String> {
+    match target {
+        syn::Type::Path(p) if p.qself.is_none() && p.path.segments.len() == 1 => {
+            let seg = p.path.segments.first()?;
+            if !matches!(seg.arguments, syn::PathArguments::None) {
+                return None;
+            }
+            Some(seg.ident.to_string())
+        }
+        syn::Type::Tuple(t) if t.elems.is_empty() => Some("Void".to_string()),
+        _ => None,
+    }
+}
+
+fn syn_primitive_to_lltype(ty: &syn::Type) -> Option<LowLevelType> {
+    // `*const T` / `*mut T` — raw pointer to (typically opaque-to-the
+    // -catalog) target. Lift to `Ptr(OpaqueType(T, gckind=Raw))` so
+    // structs with raw-pointer fields register in the catalog
+    // without requiring the referent type to be known. Mirrors
+    // RPython `lltype.Ptr(OpaqueType("T"))` usage for externally
+    // declared opaque pointer targets (`lltype.py:564-572 class
+    // OpaqueType`). The opaque tag preserves the referent's leaf
+    // identifier so two distinct raw-pointer fields point to
+    // identity-distinct opaques (`*mut PyExecutionContext` is not
+    // equal to `*mut FrameDebugData`).
+    if let syn::Type::Ptr(ptr) = ty {
+        let tag = raw_pointer_target_tag(&ptr.elem).unwrap_or_else(|| "?".to_string());
+        let opaque = LowLevelType::Opaque(Box::new(OpaqueType::new(&tag)));
+        let raw_ptr = Ptr::from_container_type(opaque).ok()?;
+        return Some(LowLevelType::Ptr(Box::new(raw_ptr)));
+    }
+    // `&T` borrowed reference. RPython convention models gc-tracked
+    // references as `lltype.Ptr(GcStruct(T))` — the same shape used
+    // by `_ptrEntry.compute_annotation` (`lltype.py:1513-1518`) when
+    // a Python-level instance is annotated. The catalog admits `&T`
+    // only when `T` is a single-segment identifier resolving to a
+    // walker-registered struct (same-scope `WALKER_STRUCT_PTRS` or
+    // process-wide `PROCESS_WIDE_STRUCT_PTRS`).  `&str`, `&dyn
+    // Trait`, `&[T]` etc. reject — `rstr.STR` and trait-object
+    // dispatch are not yet ported.  The borrow lifetime annotation
+    // is dropped: lltype has no lifetime concept; the gc-pointer
+    // semantics carry over regardless of the source-level lifetime.
+    if let syn::Type::Reference(r) = ty {
+        let syn::Type::Path(p) = &*r.elem else {
+            return None;
+        };
+        if p.qself.is_some() || p.path.segments.len() != 1 {
+            return None;
+        }
+        let inner_seg = p.path.segments.first()?;
+        if !matches!(inner_seg.arguments, syn::PathArguments::None) {
+            return None;
+        }
+        let inner_name = inner_seg.ident.to_string();
+        let inner_struct = walker_struct_ptr_lookup(&inner_name)?;
+        if inner_struct._gckind != GcKind::Gc {
+            return None;
+        }
+        let ptr = Ptr::from_container_type(LowLevelType::Struct(Box::new(inner_struct))).ok()?;
+        return Some(LowLevelType::Ptr(Box::new(ptr)));
+    }
+    let syn::Type::Path(path) = ty else {
+        return None;
+    };
+    if path.qself.is_some() {
+        return None;
+    }
+    // Multi-segment paths reject here. Cross-module idents and Rust
+    // stdlib wrappers need explicit source-level modeling; collapsing
+    // them by leaf name would invent lltype shapes that RPython did not
+    // declare.
+    let seg = path.path.segments.last()?;
+    if path.path.segments.len() > 1 {
+        return None;
+    }
+    let name_outer = seg.ident.to_string();
+    // `Option<T>` — nullable pointer mirroring `lltype.nullptr(...)`
+    // semantics. Accept only when `T` itself resolves directly to
+    // `LowLevelType::Ptr(_)` without Rust wrapper/Vec collapse. This
+    // admits pointer-like Rust spellings such as `Option<*mut T>` and
+    // `Option<&RegisteredStruct>`, while rejecting `Option<Vec<T>>` and
+    // `Option<Box<T>>` whose storage shape is not a single lltype ptr.
+    if name_outer == "Option" {
+        if let syn::PathArguments::AngleBracketed(args) = &seg.arguments {
+            for arg in &args.args {
+                if let syn::GenericArgument::Type(inner) = arg {
+                    let inner_ll = syn_primitive_to_lltype(inner)?;
+                    if matches!(inner_ll, LowLevelType::Ptr(_)) {
+                        return Some(inner_ll);
+                    }
+                    return None;
+                }
+            }
+        }
+        return None;
+    }
+    if !matches!(seg.arguments, syn::PathArguments::None) {
+        return None;
+    }
+    let name = seg.ident.to_string();
+    // Walker-scope `type T = U` alias resolution.  Only consult the
+    // alias map when the leaf identifier does not collide with a
+    // primitive keyword below (`i32` etc. shouldn't shadow), and
+    // recurse on the aliased type so chains like
+    // `type Outer = Inner; type Inner = *mut Foo;` collapse.
+    if !matches!(
+        name.as_str(),
+        "i8" | "i16"
+            | "i32"
+            | "i64"
+            | "isize"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "usize"
+            | "bool"
+            | "char"
+            | "f32"
+            | "f64"
+    ) {
+        if let Some(alias_target) = walker_type_alias_lookup(&name) {
+            return syn_primitive_to_lltype(&alias_target);
+        }
+        // Same-scope `Item::Struct` previously minted as
+        // `Ptr(GcStruct(name, ...))` — return the unwrapped
+        // `StructType` so the parent embedding lifts as
+        // `lltype.GcStruct("Outer", ("first", INNER_GCSTRUCT))`
+        // (the canonical inheritance / `PyObject_HEAD` shape;
+        // `lltype.py:296-303 Struct._first_struct`).
+        // `try_build_gc_struct_ptr` enforces the upstream
+        // `_note_inlined_into` rule (gc field must be at index 0).
+        if let Some(inner_struct) = walker_struct_ptr_lookup(&name) {
+            return Some(LowLevelType::Struct(Box::new(inner_struct)));
+        }
+    }
+    let ll = match name.as_str() {
+        // `lltype.Signed` family — native int size on this platform.
+        "i8" | "i16" | "i32" | "i64" | "isize" => LowLevelType::Signed,
+        // `lltype.Unsigned` family — `getkind(Unsigned) == 'int'`
+        // collapses to the int register class at the producer side
+        // (`flatten.py:getkind`); the lltype primitive stays
+        // `Unsigned` so the annotator selects
+        // `SomeInteger(unsigned=True)`.
+        "u8" | "u16" | "u32" | "u64" | "usize" => LowLevelType::Unsigned,
+        "bool" => LowLevelType::Bool,
+        // `lltype.UniChar` — Rust `char` is a Unicode scalar value,
+        // matching RPython's `UniChar` primitive
+        // (`lltype.py:UniChar = Primitive("UniChar", "\x00")`).
+        // `getkind(UniChar) == 'int'` folds the register class to
+        // int downstream, but lltype identity must stay `UniChar`
+        // so the rtyper picks `UniCharRepr`
+        // (`rpython/rtyper/lltypesystem/rstr.py`).
+        "char" => LowLevelType::UniChar,
+        // `lltype.SingleFloat` — Rust `f32`. `getkind(SingleFloat)
+        // == 'int'` (the value is boxed through an int register
+        // word, see `rpython/jit/codewriter/support.py:getkind`);
+        // lltype identity stays distinct from `Float` so
+        // `cast_singlefloat_to_float` / `cast_float_to_singlefloat`
+        // dispatch correctly.
+        "f32" => LowLevelType::SingleFloat,
+        // `lltype.Float` — Rust `f64`, the canonical float register
+        // class (`getkind(Float) == 'float'`).
+        "f64" => LowLevelType::Float,
+        _ => return None,
+    };
+    Some(ll)
 }
 
 /// Test-only accessor for the per-`ModuleId` slice of the
@@ -7020,5 +7514,703 @@ pub const ParityProbe_O14_FGe: bool = 1.5 >= 1.5;
                 other => panic!("{name}: expected Bool, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn register_host_lltype_for_primitive_struct_roundtrips() {
+        // Walker pass for a struct whose every field is a recognized
+        // primitive must populate the `HostObject → Ptr(GcStruct)`
+        // registry. Mirrors upstream `_ptrEntry.compute_annotation`
+        // (`lltype.py:1513-1518`) — the class object carries the
+        // concrete `Ptr(GcStruct(...))` ready for `SomePtr` lift.
+        let src = "
+            pub struct ParityProbe_PrimStruct {
+                pub a: i64,
+                pub b: u64,
+                pub c: bool,
+                pub d: f64,
+            }
+        ";
+        let file = syn::parse_file(src).expect("primitive-struct fixture parses");
+        let module_id = register_rust_module(&file).expect("walk succeeds");
+
+        let host = lookup_host(module_id, "ParityProbe_PrimStruct")
+            .expect("ParityProbe_PrimStruct must register as HostObject");
+        let ptr = super::super::host_env::lookup_host_lltype(&host)
+            .expect("primitive-only struct must populate the lltype registry");
+        let target = match &ptr.TO {
+            crate::translator::rtyper::lltypesystem::lltype::PtrTarget::Struct(s) => s,
+            other => panic!("expected PtrTarget::Struct, got {other:?}"),
+        };
+        assert_eq!(target._name, "ParityProbe_PrimStruct");
+        let names: Vec<String> = target._names.clone();
+        assert_eq!(
+            names,
+            vec![
+                "a".to_string(),
+                "b".to_string(),
+                "c".to_string(),
+                "d".to_string(),
+            ],
+        );
+        assert_eq!(target._flds.get("a"), Some(&LowLevelType::Signed));
+        assert_eq!(target._flds.get("b"), Some(&LowLevelType::Unsigned));
+        assert_eq!(target._flds.get("c"), Some(&LowLevelType::Bool));
+        assert_eq!(target._flds.get("d"), Some(&LowLevelType::Float));
+    }
+
+    #[test]
+    fn register_host_lltype_lifts_raw_pointer_fields_to_ptr_opaque() {
+        // Raw-pointer fields (`*const T`, `*mut T`) lift to
+        // `Ptr(OpaqueType(T))` so structs like PyFrame whose layout
+        // is dense raw pointers reach the catalog without requiring
+        // every referent struct to be registered first. Distinct
+        // referent names produce identity-distinct opaque tags.
+        let src = "
+            pub struct ParityProbe_RawPtrFields {
+                pub a: *const ParityProbe_OtherA,
+                pub b: *mut ParityProbe_OtherB,
+                pub v: *mut (),
+            }
+        ";
+        let file = syn::parse_file(src).expect("raw-ptr fixture parses");
+        let module_id = register_rust_module(&file).expect("walk succeeds");
+        let host = lookup_host(module_id, "ParityProbe_RawPtrFields")
+            .expect("raw-ptr struct must register as HostObject");
+        let ptr = super::super::host_env::lookup_host_lltype(&host)
+            .expect("raw-ptr-field struct must populate the lltype registry");
+        let target = match &ptr.TO {
+            crate::translator::rtyper::lltypesystem::lltype::PtrTarget::Struct(s) => s,
+            other => panic!("expected PtrTarget::Struct, got {other:?}"),
+        };
+        let extract_opaque_tag = |fld_name: &str| -> String {
+            let fld = target._flds.get(fld_name).unwrap_or_else(|| {
+                panic!(
+                    "expected field `{fld_name}` in struct, got {:?}",
+                    target._flds
+                )
+            });
+            let inner_ptr = match fld {
+                LowLevelType::Ptr(p) => p,
+                other => panic!("`{fld_name}` must be Ptr(...), got {other:?}"),
+            };
+            match &inner_ptr.TO {
+                crate::translator::rtyper::lltypesystem::lltype::PtrTarget::Opaque(op) => {
+                    op.tag.clone()
+                }
+                other => panic!("`{fld_name}` Ptr target must be Opaque, got {other:?}"),
+            }
+        };
+        assert_eq!(extract_opaque_tag("a"), "ParityProbe_OtherA");
+        assert_eq!(extract_opaque_tag("b"), "ParityProbe_OtherB");
+        assert_eq!(extract_opaque_tag("v"), "Void");
+    }
+
+    #[test]
+    fn register_host_lltype_rejects_vec_fields_without_explicit_array_model() {
+        // Rust `Vec<T>` is not line-by-line equivalent to an upstream
+        // `lltype.Array(T)` declaration: the Rust field stores a vector
+        // header, not a direct lltype array pointer. Keep it out of the
+        // catalog until the caller supplies an explicit RPython-shape
+        // model for the field.
+        let src = "
+            pub struct ParityProbe_VecFields {
+                pub a: Vec<i64>,
+                pub b: Vec<u64>,
+                pub c: Vec<f64>,
+            }
+        ";
+        let file = syn::parse_file(src).expect("vec fixture parses");
+        let module_id = register_rust_module(&file).expect("walk succeeds");
+        let host = lookup_host(module_id, "ParityProbe_VecFields")
+            .expect("Vec-field struct must register as HostObject");
+        assert!(
+            super::super::host_env::lookup_host_lltype(&host).is_none(),
+            "Vec fields must not populate the lltype registry by implicit Ptr(Array) collapse",
+        );
+    }
+
+    #[test]
+    fn register_host_lltype_resolves_type_alias_in_field() {
+        // `type T = U;` declarations in the same module register an
+        // alias entry that `syn_primitive_to_lltype` chases when a
+        // field's leaf identifier matches. The classic pyre shape is
+        // `type PyObjectRef = *mut PyObject;` — a struct with a
+        // `PyObjectRef` field should lift the field to the same
+        // `Ptr(Opaque)` shape a literal `*mut PyObject` would.
+        let src = "
+            pub type ParityProbe_AliasRef = *mut ParityProbe_AliasTarget;
+            pub struct ParityProbe_AliasUser {
+                pub ptr: ParityProbe_AliasRef,
+            }
+        ";
+        let file = syn::parse_file(src).expect("alias fixture parses");
+        let module_id = register_rust_module(&file).expect("walk succeeds");
+        let host = lookup_host(module_id, "ParityProbe_AliasUser")
+            .expect("alias-user struct must register as HostObject");
+        let ptr = super::super::host_env::lookup_host_lltype(&host).expect(
+            "alias-user struct must populate the lltype registry \
+                     after alias resolution",
+        );
+        let target = match &ptr.TO {
+            crate::translator::rtyper::lltypesystem::lltype::PtrTarget::Struct(s) => s,
+            other => panic!("expected PtrTarget::Struct, got {other:?}"),
+        };
+        let ptr_field = target._flds.get("ptr").expect("`ptr` field present");
+        let inner_ptr = match ptr_field {
+            LowLevelType::Ptr(p) => p,
+            other => panic!("`ptr` must lift to Ptr(...), got {other:?}"),
+        };
+        match &inner_ptr.TO {
+            crate::translator::rtyper::lltypesystem::lltype::PtrTarget::Opaque(op) => {
+                assert_eq!(op.tag, "ParityProbe_AliasTarget");
+            }
+            other => panic!("inner Ptr target must be Opaque, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn register_host_lltype_skips_unsupported_field_shape_struct() {
+        // Catalog still rejects shapes that lack a recognized lltype
+        // mapping (`Result<T, E>`, `&T`, `dyn Trait`, tuple /
+        // fixed-array / slice / fn types, multi-segment paths,
+        // by-value nested struct). `Option<T>` is admitted only when
+        // the inner `T` directly resolves to a pointer-like lltype;
+        // non-pointer `Option<i64>` must leave the host's lltype slot
+        // empty so the `SomeInstance(classdef=None)` fallback path
+        // remains available.
+        let src = "
+            pub struct ParityProbe_UnsupportedFieldStruct {
+                pub inner: Option<i64>,
+            }
+        ";
+        let file = syn::parse_file(src).expect("unsupported-field fixture parses");
+        let module_id = register_rust_module(&file).expect("walk succeeds");
+
+        let host = lookup_host(module_id, "ParityProbe_UnsupportedFieldStruct")
+            .expect("ParityProbe_UnsupportedFieldStruct must register as HostObject");
+        assert!(
+            super::super::host_env::lookup_host_lltype(&host).is_none(),
+            "unsupported field shape must NOT populate the lltype \
+             registry until the matching Phase 5 slice lands",
+        );
+    }
+
+    #[test]
+    fn register_host_lltype_lifts_option_of_pointer_field_to_inner_ptr() {
+        // `Option<*mut T>` carries the same lltype shape as the inner
+        // raw pointer — the `None` arm maps to `lltype.nullptr(...)`
+        // and the `Some(p)` arm to the typed pointer of the same `Ptr`.
+        // Only directly pointer-like inner shapes are accepted.
+        let src = "
+            pub struct ParityProbe_OptionPtr {
+                pub raw: Option<*mut ParityProbe_OptionTarget>,
+            }
+        ";
+        let file = syn::parse_file(src).expect("option-of-pointer fixture parses");
+        let module_id = register_rust_module(&file).expect("walk succeeds");
+        let host = lookup_host(module_id, "ParityProbe_OptionPtr")
+            .expect("Option-of-pointer struct must register as HostObject");
+        let ptr = super::super::host_env::lookup_host_lltype(&host).expect(
+            "Option-of-pointer struct must populate the lltype registry \
+             via the nullable-ptr lift",
+        );
+        let target = match &ptr.TO {
+            crate::translator::rtyper::lltypesystem::lltype::PtrTarget::Struct(s) => s,
+            other => panic!("expected PtrTarget::Struct, got {other:?}"),
+        };
+        // `raw: Option<*mut T>` — inner is `Ptr(Opaque(T))`.
+        let raw_ll = target._flds.get("raw").expect("`raw` field present");
+        let raw_ptr = match raw_ll {
+            LowLevelType::Ptr(p) => p,
+            other => panic!("`raw` must lift to Ptr, got {other:?}"),
+        };
+        match &raw_ptr.TO {
+            crate::translator::rtyper::lltypesystem::lltype::PtrTarget::Opaque(op) => {
+                assert_eq!(op.tag, "ParityProbe_OptionTarget");
+            }
+            other => panic!("`raw` inner must be Opaque, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn register_host_lltype_rejects_option_of_vec_field() {
+        // `Option<Vec<T>>` is not a nullable lltype pointer. Rust stores
+        // the vector shape inside the option niche optimization, and
+        // the catalog must not erase that into `Ptr(Array(T))`.
+        let src = "
+            pub struct ParityProbe_OptionVec {
+                pub vec_inner: Option<Vec<i64>>,
+            }
+        ";
+        let file = syn::parse_file(src).expect("option-vec fixture parses");
+        let module_id = register_rust_module(&file).expect("walk succeeds");
+        let host = lookup_host(module_id, "ParityProbe_OptionVec")
+            .expect("Option<Vec>-field struct must register as HostObject");
+        assert!(
+            super::super::host_env::lookup_host_lltype(&host).is_none(),
+            "Option<Vec<T>> must not populate the lltype registry by nullable-array collapse",
+        );
+    }
+
+    #[test]
+    fn register_host_lltype_rejects_atomic_field_wrappers() {
+        // Atomic wrappers are synchronization primitives, not upstream
+        // lltype primitive declarations. Keep them out of the strict
+        // field catalog unless a caller provides an explicit RPython
+        // storage model.
+        let src = "
+            pub struct ParityProbe_Atomic {
+                pub a_i64: AtomicI64,
+                pub a_u8: AtomicU8,
+                pub a_bool: AtomicBool,
+                pub a_ptr: AtomicPtr<ParityProbe_AtomicTarget>,
+                pub a_qualified: std::sync::atomic::AtomicI64,
+            }
+        ";
+        let file = syn::parse_file(src).expect("atomic-field fixture parses");
+        let module_id = register_rust_module(&file).expect("walk succeeds");
+        let host = lookup_host(module_id, "ParityProbe_Atomic")
+            .expect("Atomic-field struct must register as HostObject");
+        assert!(
+            super::super::host_env::lookup_host_lltype(&host).is_none(),
+            "Atomic wrappers must not implicitly collapse to primitive lltypes",
+        );
+    }
+
+    #[test]
+    fn register_host_lltype_rejects_vec_of_by_value_registered_struct_without_panic() {
+        // All Rust `Vec<T>` fields reject in the strict catalog. This
+        // fixture keeps the old by-value registered-struct case covered
+        // and verifies that the parent rejects without disturbing the
+        // independently catalogable inner struct.
+        let src = "
+            pub struct ParityProbe_VecInner {
+                pub flag: i64,
+            }
+            pub struct ParityProbe_VecByValueParent {
+                pub items: Vec<ParityProbe_VecInner>,
+            }
+        ";
+        let file = syn::parse_file(src).expect("vec-by-value fixture parses");
+        let module_id = register_rust_module(&file).expect("walk succeeds");
+        let host = lookup_host(module_id, "ParityProbe_VecByValueParent")
+            .expect("ParityProbe_VecByValueParent must register as HostObject");
+        assert!(
+            super::super::host_env::lookup_host_lltype(&host).is_none(),
+            "Vec-of-by-value-GcStruct must NOT populate the lltype \
+             registry — gc-container elements are rejected upstream",
+        );
+        // Inner struct still catalogs (primitive fields only).
+        let inner_host = lookup_host(module_id, "ParityProbe_VecInner")
+            .expect("ParityProbe_VecInner must register as HostObject");
+        assert!(
+            super::super::host_env::lookup_host_lltype(&inner_host).is_some(),
+            "primitive-only inner struct should cataloge independently",
+        );
+    }
+
+    #[test]
+    fn register_host_lltype_rejects_non_whitelisted_multi_segment_path() {
+        // Multi-segment paths reject in the strict catalog. Leaf-name
+        // collapse for stdlib or imported wrappers would invent shapes
+        // that the corresponding RPython source did not declare.
+        let src = "
+            pub struct ParityProbe_MultiSegmentMiss {
+                pub items: std::collections::HashMap<i64, i64>,
+            }
+        ";
+        let file = syn::parse_file(src).expect("multi-segment fixture parses");
+        let module_id = register_rust_module(&file).expect("walk succeeds");
+        let host = lookup_host(module_id, "ParityProbe_MultiSegmentMiss")
+            .expect("ParityProbe_MultiSegmentMiss must register as HostObject");
+        assert!(
+            super::super::host_env::lookup_host_lltype(&host).is_none(),
+            "multi-segment field must NOT populate the lltype registry \
+             without explicit source-level modeling",
+        );
+    }
+
+    #[test]
+    fn register_host_lltype_rejects_fully_qualified_wrappers() {
+        // Qualified Rust wrappers do not become lltype fields by leaf
+        // name. They need an explicit RPython-shape model just like the
+        // bare wrapper spelling.
+        let src = "
+            pub struct ParityProbe_QualifiedWrappers {
+                pub r: std::rc::Rc<i64>,
+                pub c: std::cell::RefCell<u64>,
+                pub v: std::vec::Vec<i64>,
+            }
+        ";
+        let file = syn::parse_file(src).expect("qualified-wrapper fixture parses");
+        let module_id = register_rust_module(&file).expect("walk succeeds");
+        let host = lookup_host(module_id, "ParityProbe_QualifiedWrappers")
+            .expect("qualified-wrapper struct must register as HostObject");
+        assert!(
+            super::super::host_env::lookup_host_lltype(&host).is_none(),
+            "qualified Rust wrappers must not implicitly collapse to lltype fields",
+        );
+    }
+
+    #[test]
+    fn register_host_lltype_embeds_first_field_gc_struct_by_value() {
+        // `pub ob_header: PyObject` as the FIRST field of a subclass
+        // struct mirrors CPython's `PyObject_HEAD` inheritance marker.
+        // RPython's orthodox shape is
+        // `lltype.GcStruct("Outer", ("ob_header", PYOBJECT_GCSTRUCT))`
+        // where the embedded GcStruct sits at field index 0
+        // (`lltype.py:296-303 Struct._first_struct`). The catalog
+        // collapses the by-value embedding into a nested
+        // `LowLevelType::Struct(GcStruct)` field, NOT a `Ptr` —
+        // `_first_struct` requires the literal struct, not an
+        // indirection.
+        let src = "
+            pub struct ParityProbe_Base {
+                pub flag: i64,
+            }
+            pub struct ParityProbe_Sub {
+                pub ob_header: ParityProbe_Base,
+                pub extra: i64,
+            }
+        ";
+        let file = syn::parse_file(src).expect("first-field nested-struct fixture parses");
+        let module_id = register_rust_module(&file).expect("walk succeeds");
+        let sub_host = lookup_host(module_id, "ParityProbe_Sub")
+            .expect("ParityProbe_Sub must register as HostObject");
+        let sub_ptr = super::super::host_env::lookup_host_lltype(&sub_host).expect(
+            "subclass struct with first-field nested GcStruct must populate \
+             the lltype registry",
+        );
+        let sub_target = match &sub_ptr.TO {
+            crate::translator::rtyper::lltypesystem::lltype::PtrTarget::Struct(s) => s,
+            other => panic!("expected PtrTarget::Struct, got {other:?}"),
+        };
+        // `ob_header: ParityProbe_Base` — must be the first field, must
+        // be a `Struct(GcStruct(ParityProbe_Base))`, NOT a `Ptr`.
+        assert_eq!(
+            sub_target._names.first().map(String::as_str),
+            Some("ob_header"),
+            "ob_header must be the first field for inheritance shape parity",
+        );
+        let ob_header_ll = sub_target
+            ._flds
+            .get("ob_header")
+            .expect("`ob_header` field present");
+        let inner_struct = match ob_header_ll {
+            LowLevelType::Struct(s) => s,
+            other => panic!("`ob_header` must be Struct(GcStruct), got {other:?}"),
+        };
+        assert_eq!(
+            inner_struct._name, "ParityProbe_Base",
+            "embedded struct name must match the referenced ident",
+        );
+        assert_eq!(
+            inner_struct._gckind,
+            GcKind::Gc,
+            "embedded struct keeps its GcKind::Gc identity at the inheritance call site",
+        );
+        // `extra: i64` — non-first primitive field, lifts as Signed.
+        assert_eq!(sub_target._flds.get("extra"), Some(&LowLevelType::Signed));
+    }
+
+    #[test]
+    fn register_host_lltype_rejects_non_first_nested_gc_struct() {
+        // RPython `Struct._note_inlined_into` (`lltype.py:305-312`)
+        // rejects a `GcStruct` embedded at any field index other than
+        // 0. The pre-validation in `try_build_gc_struct_ptr` mirrors
+        // that — the parent struct should NOT register when a nested
+        // `GcStruct` field appears second or later, so downstream
+        // lookups fall back to the `SomeInstance(classdef=None)` path
+        // until the user rewrites the field as a pointer or moves it
+        // to position 0.
+        let src = "
+            pub struct ParityProbe_NestedBase {
+                pub flag: i64,
+            }
+            pub struct ParityProbe_BadOrder {
+                pub leading_int: i64,
+                pub trailing_base: ParityProbe_NestedBase,
+            }
+        ";
+        let file = syn::parse_file(src).expect("non-first nested-struct fixture parses");
+        let module_id = register_rust_module(&file).expect("walk succeeds");
+        let host = lookup_host(module_id, "ParityProbe_BadOrder")
+            .expect("ParityProbe_BadOrder must register as HostObject");
+        assert!(
+            super::super::host_env::lookup_host_lltype(&host).is_none(),
+            "non-first nested GcStruct field must NOT populate the lltype \
+             registry — RPython _note_inlined_into rejects this embedding",
+        );
+    }
+
+    #[test]
+    fn register_host_lltype_rejects_interior_mutability_wrappers() {
+        // Interior-mutability wrappers are Rust implementation details,
+        // but erasing them inside the field catalog would still invent a
+        // field shape that the RPython source did not declare.
+        let src = "
+            pub struct ParityProbe_InteriorMut {
+                pub c: Cell<i64>,
+                pub rc: RefCell<u64>,
+                pub oc: OnceCell<bool>,
+                pub uc: UnsafeCell<f64>,
+            }
+        ";
+        let file = syn::parse_file(src).expect("interior-mut fixture parses");
+        let module_id = register_rust_module(&file).expect("walk succeeds");
+        let host = lookup_host(module_id, "ParityProbe_InteriorMut")
+            .expect("interior-mut-field struct must register as HostObject");
+        assert!(
+            super::super::host_env::lookup_host_lltype(&host).is_none(),
+            "interior-mutability wrappers must not implicitly collapse to primitive lltypes",
+        );
+    }
+
+    #[test]
+    fn register_host_lltype_lifts_reference_to_registered_struct_as_ptr() {
+        // `&T` where `T` is a walker-registered struct lifts to
+        // `Ptr(GcStruct(T))` — RPython's gc-reference shape
+        // (`lltype.py:1513-1518 _ptrEntry.compute_annotation`).  Both
+        // same-scope and process-wide registrations resolve through
+        // [`walker_struct_ptr_lookup`].
+        let src = "
+            pub struct ParityProbe_RefTarget {
+                pub flag: i64,
+            }
+            pub struct ParityProbe_RefUser {
+                pub borrowed: &'static ParityProbe_RefTarget,
+            }
+        ";
+        let file = syn::parse_file(src).expect("&T fixture parses");
+        let module_id = register_rust_module(&file).expect("walk succeeds");
+        let host = lookup_host(module_id, "ParityProbe_RefUser")
+            .expect("ParityProbe_RefUser must register as HostObject");
+        let ptr = super::super::host_env::lookup_host_lltype(&host)
+            .expect("&T-field struct must populate the lltype registry");
+        let target = match &ptr.TO {
+            crate::translator::rtyper::lltypesystem::lltype::PtrTarget::Struct(s) => s,
+            other => panic!("expected PtrTarget::Struct, got {other:?}"),
+        };
+        let borrowed_ll = target
+            ._flds
+            .get("borrowed")
+            .expect("`borrowed` field present");
+        let borrowed_ptr = match borrowed_ll {
+            LowLevelType::Ptr(p) => p,
+            other => panic!("`borrowed` must lift to Ptr, got {other:?}"),
+        };
+        match &borrowed_ptr.TO {
+            crate::translator::rtyper::lltypesystem::lltype::PtrTarget::Struct(s) => {
+                assert_eq!(s._name, "ParityProbe_RefTarget");
+                assert_eq!(s._gckind, GcKind::Gc);
+            }
+            other => panic!("`borrowed` inner must be Struct(GcStruct), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn register_host_lltype_rejects_reference_to_non_struct_target() {
+        // `&str`, `&dyn Trait`, `&[T]`, `&i64`, `&UnregisteredStruct`
+        // all reject — the catalog only knows how to lift `&T` when
+        // `T` is a walker-registered struct.
+        let src = "
+            pub struct ParityProbe_RefMiss {
+                pub borrowed: &'static str,
+            }
+        ";
+        let file = syn::parse_file(src).expect("&str fixture parses");
+        let module_id = register_rust_module(&file).expect("walk succeeds");
+        let host = lookup_host(module_id, "ParityProbe_RefMiss")
+            .expect("ParityProbe_RefMiss must register as HostObject");
+        assert!(
+            super::super::host_env::lookup_host_lltype(&host).is_none(),
+            "`&str` (or any &T with non-struct target) must NOT populate \
+             the lltype registry until rstr / dyn-Trait support lands",
+        );
+    }
+
+    #[test]
+    fn register_host_lltype_embeds_cross_file_nested_gc_struct_via_process_registry() {
+        // Two separate walker invocations (mirroring two pyre source
+        // files, e.g. `pyobject.rs` + `bytesobject.rs`): the first
+        // registers a base struct, the second names it by bare ident
+        // in a `pub ob_header: BaseName` field.  The same-scope
+        // `WALKER_STRUCT_PTRS` is per-walker (cleared between calls);
+        // cross-file resolution falls through to the process-wide
+        // [`PROCESS_WIDE_STRUCT_PTRS`] registry seeded by the first
+        // walk.  Mirrors upstream `LOAD_GLOBAL`'s identity invariant
+        // across files (`flowcontext.py:847`).
+        let base_src = "
+            pub struct ParityProbe_CrossFileBase {
+                pub flag: i64,
+            }
+        ";
+        let base_file = syn::parse_file(base_src).expect("base fixture parses");
+        let _base_module = register_rust_module(&base_file).expect("base walk succeeds");
+        let sub_src = "
+            pub struct ParityProbe_CrossFileSub {
+                pub ob_header: ParityProbe_CrossFileBase,
+                pub tail: i64,
+            }
+        ";
+        let sub_file = syn::parse_file(sub_src).expect("sub fixture parses");
+        let sub_module = register_rust_module(&sub_file).expect("sub walk succeeds");
+        let sub_host = lookup_host(sub_module, "ParityProbe_CrossFileSub")
+            .expect("ParityProbe_CrossFileSub must register as HostObject");
+        let sub_ptr = super::super::host_env::lookup_host_lltype(&sub_host).expect(
+            "cross-file nested-struct embedding must populate the lltype \
+             registry via the process-wide struct ptr fallback",
+        );
+        let sub_target = match &sub_ptr.TO {
+            crate::translator::rtyper::lltypesystem::lltype::PtrTarget::Struct(s) => s,
+            other => panic!("expected PtrTarget::Struct, got {other:?}"),
+        };
+        let ob_header_ll = sub_target
+            ._flds
+            .get("ob_header")
+            .expect("`ob_header` field present");
+        let inner_struct = match ob_header_ll {
+            LowLevelType::Struct(s) => s,
+            other => panic!("`ob_header` must be Struct, got {other:?}"),
+        };
+        assert_eq!(inner_struct._name, "ParityProbe_CrossFileBase");
+        assert_eq!(inner_struct._gckind, GcKind::Gc);
+    }
+
+    #[test]
+    fn register_host_lltype_resolves_forward_reference_nested_struct() {
+        // The preseed fixed-point pass removes source-order sensitivity:
+        // a first-field embedded GcStruct can resolve even when the
+        // embedded struct appears later in the Rust module.
+        let src = "
+            pub struct ParityProbe_ForwardSub {
+                pub ob_header: ParityProbe_ForwardBase,
+            }
+            pub struct ParityProbe_ForwardBase {
+                pub flag: i64,
+            }
+        ";
+        let file = syn::parse_file(src).expect("forward-reference fixture parses");
+        let module_id = register_rust_module(&file).expect("walk succeeds");
+        let sub_host = lookup_host(module_id, "ParityProbe_ForwardSub")
+            .expect("ParityProbe_ForwardSub must register as HostObject");
+        let sub_ptr = super::super::host_env::lookup_host_lltype(&sub_host)
+            .expect("forward-reference nested struct lookup must populate the lltype registry");
+        let sub_target = match &sub_ptr.TO {
+            crate::translator::rtyper::lltypesystem::lltype::PtrTarget::Struct(s) => s,
+            other => panic!("expected PtrTarget::Struct, got {other:?}"),
+        };
+        let ob_header_ll = sub_target
+            ._flds
+            .get("ob_header")
+            .expect("`ob_header` field present");
+        let inner_struct = match ob_header_ll {
+            LowLevelType::Struct(s) => s,
+            other => panic!("`ob_header` must be Struct, got {other:?}"),
+        };
+        assert_eq!(inner_struct._name, "ParityProbe_ForwardBase");
+        // The base IS catalogued because it has only primitive fields.
+        let base_host = lookup_host(module_id, "ParityProbe_ForwardBase")
+            .expect("ParityProbe_ForwardBase must register as HostObject");
+        assert!(
+            super::super::host_env::lookup_host_lltype(&base_host).is_some(),
+            "primitive-only base struct should still cataloge",
+        );
+    }
+
+    #[test]
+    fn register_host_lltype_rejects_option_of_non_pointer_field() {
+        // `Option<Box<i64>>` is not a nullable lltype pointer. The
+        // catalog no longer unwraps `Box<T>` in fields, so this rejects
+        // before any `Some(0)`/`None` primitive ambiguity can arise.
+        let src = "
+            pub struct ParityProbe_OptionNonPtr {
+                pub boxed_int: Option<Box<i64>>,
+            }
+        ";
+        let file = syn::parse_file(src).expect("option-non-pointer fixture parses");
+        let module_id = register_rust_module(&file).expect("walk succeeds");
+        let host = lookup_host(module_id, "ParityProbe_OptionNonPtr")
+            .expect("ParityProbe_OptionNonPtr must register as HostObject");
+        assert!(
+            super::super::host_env::lookup_host_lltype(&host).is_none(),
+            "Option-of-non-pointer field must NOT populate the lltype \
+             registry — Some(0)/None ambiguity has no RPython equivalent",
+        );
+    }
+
+    #[test]
+    fn register_host_lltype_rejects_box_rc_arc_field_wrappers() {
+        // Function-argument register classification may unwrap these,
+        // but struct field storage parity may not. Reject Rust heap
+        // wrappers unless an explicit RPython pointer/container shape is
+        // modeled at the source level.
+        let src = "
+            pub struct ParityProbe_BoxRcArc {
+                pub b: Box<i64>,
+                pub r: Rc<u64>,
+                pub a: Arc<f64>,
+            }
+        ";
+        let file = syn::parse_file(src).expect("box/rc/arc fixture parses");
+        let module_id = register_rust_module(&file).expect("walk succeeds");
+        let host = lookup_host(module_id, "ParityProbe_BoxRcArc")
+            .expect("Box/Rc/Arc-field struct must register as HostObject");
+        assert!(
+            super::super::host_env::lookup_host_lltype(&host).is_none(),
+            "Box/Rc/Arc fields must not implicitly collapse to inner lltypes",
+        );
+    }
+
+    #[test]
+    fn register_host_lltype_preserves_char_and_singlefloat_identity() {
+        // `char` must land in `UniChar` and `f32` in `SingleFloat`,
+        // matching the upstream `lltype.py` primitive identities
+        // (`UniChar = Primitive("UniChar", "\x00")`,
+        // `SingleFloat = Primitive("SingleFloat", r_singlefloat(0.0))`).
+        // The fact that `getkind` collapses both to `'int'`
+        // downstream is a register-class fold, not a lltype-identity
+        // collapse — the rtyper still needs the distinct
+        // `UniChar` / `SingleFloat` primitives to dispatch
+        // `UniCharRepr` / `SingleFloatRepr`.
+        let src = "
+            pub struct ParityProbe_CharSingle {
+                pub ch: char,
+                pub sf: f32,
+            }
+        ";
+        let file = syn::parse_file(src).expect("char/singlefloat fixture parses");
+        let module_id = register_rust_module(&file).expect("walk succeeds");
+        let host = lookup_host(module_id, "ParityProbe_CharSingle")
+            .expect("ParityProbe_CharSingle must register as HostObject");
+        let ptr = super::super::host_env::lookup_host_lltype(&host)
+            .expect("char/f32 struct must populate the lltype registry");
+        let target = match &ptr.TO {
+            crate::translator::rtyper::lltypesystem::lltype::PtrTarget::Struct(s) => s,
+            other => panic!("expected PtrTarget::Struct, got {other:?}"),
+        };
+        assert_eq!(target._flds.get("ch"), Some(&LowLevelType::UniChar));
+        assert_eq!(target._flds.get("sf"), Some(&LowLevelType::SingleFloat));
+    }
+
+    #[test]
+    fn register_host_lltype_unit_struct_yields_empty_field_ptr() {
+        // Unit structs (`struct Foo;`) are valid upstream
+        // (`lltype.Struct(name)` with zero `*fields`).  Lift them
+        // through the catalog symmetrically.
+        let src = "pub struct ParityProbe_UnitStruct;";
+        let file = syn::parse_file(src).expect("unit-struct fixture parses");
+        let module_id = register_rust_module(&file).expect("walk succeeds");
+        let host = lookup_host(module_id, "ParityProbe_UnitStruct")
+            .expect("unit struct must register as HostObject");
+        let ptr = super::super::host_env::lookup_host_lltype(&host)
+            .expect("unit struct must populate the lltype registry");
+        let target = match &ptr.TO {
+            crate::translator::rtyper::lltypesystem::lltype::PtrTarget::Struct(s) => s,
+            other => panic!("expected PtrTarget::Struct, got {other:?}"),
+        };
+        assert_eq!(target._name, "ParityProbe_UnitStruct");
+        assert!(target._names.is_empty());
     }
 }

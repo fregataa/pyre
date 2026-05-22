@@ -4476,7 +4476,7 @@ fn lower_expr(
                             block: BlockId,
                             variant: UnsupportedExprKind|
      -> Result<Lowered, FlowingError> {
-        graph.push_op_var(
+        graph.push_op(
             block,
             OpKind::Abort {
                 kind: UnknownKind::UnsupportedExpr { variant },
@@ -4665,7 +4665,7 @@ fn lower_expr(
                             })
                             .map(type_string_to_value_type)
                             .unwrap_or(ValueType::Unknown);
-                        graph.push_op_var(
+                        graph.push_op(
                             *block,
                             OpKind::InteriorFieldWrite {
                                 base: base_var,
@@ -4685,7 +4685,7 @@ fn lower_expr(
                         let field_name = member_name(&field.member);
                         let ty = field_value_type_from_expr(&field.base, &field.member, ctx)
                             .unwrap_or(ValueType::Unknown);
-                        graph.push_op_var(
+                        graph.push_op(
                             *block,
                             OpKind::FieldWrite {
                                 base: base_var,
@@ -4711,7 +4711,7 @@ fn lower_expr(
                     let item_ty =
                         array_item_value_type_from_array_type_id(array_type_id.as_deref())
                             .unwrap_or(ValueType::Unknown);
-                    graph.push_op_var(
+                    graph.push_op(
                         *block,
                         OpKind::ArrayWrite {
                             base: base_var,
@@ -13237,7 +13237,7 @@ mod tests {
             )
             .expect("OpKind::Input must produce a Variable");
         let pre_y = graph
-            .push_op_var(
+            .push_op(
                 pre_loop_block,
                 OpKind::Input {
                     name: "y".into(),
@@ -13245,7 +13245,7 @@ mod tests {
                 },
                 true,
             )
-            .expect("OpKind::Input must produce a Variable");
+            .expect("OpKind::Input must produce a vid");
         // Close pre-loop block with the empty-args goto Slice 5c.1
         // installs before calling the allocator.
         graph.set_goto(pre_loop_block, header_entry, vec![]);
@@ -13264,7 +13264,7 @@ mod tests {
         );
         ctx.bind_local_id_var("x".into(), &pre_x, &graph, pre_loop_block);
         ctx.local_value_types.insert("x".into(), ValueType::Int);
-        ctx.bind_local_id_var("y".into(), &pre_y, &graph, pre_loop_block);
+        ctx.bind_local_id("y".into(), pre_y, pre_loop_block);
         ctx.local_value_types.insert("y".into(), ValueType::Int);
 
         // `pre_loop_snapshot` is produced by ctx in the real lowering;
@@ -13328,10 +13328,9 @@ mod tests {
         );
 
         // `y` was not referenced, so its ctx binding still points at
-        // the pre-loop slot; no header phi was allocated for it.
+        // the pre-loop vid; no header phi was allocated for it.
         let (current_y_vid, _) = ctx.local_value_ids["y"];
-        let pre_y_slot = graph.slot_of(&pre_y).expect("pre_y registered");
-        assert_eq!(current_y_vid.0, pre_y_slot);
+        assert_eq!(current_y_vid, pre_y);
     }
 
     /// Slice 5d nested-pattern coverage #1: nested while loops where

@@ -29,9 +29,10 @@ use syn::{
     Arm, BinOp, Block as SynBlock, Expr, ExprArray, ExprBinary, ExprBreak, ExprCall, ExprCast,
     ExprContinue, ExprField, ExprForLoop, ExprIf, ExprIndex, ExprLit, ExprLoop, ExprMatch,
     ExprMethodCall, ExprParen, ExprPath, ExprReturn, ExprTry, ExprTuple, ExprUnary, ExprWhile,
-    ItemFn, Lit, Local, LocalInit, Member, Pat, PatIdent, Stmt, UnOp,
+    FnArg, ItemFn, Lit, Local, LocalInit, Member, Pat, PatIdent, Stmt, UnOp,
 };
 
+use crate::annotator::model::{SomePtr, SomeValue};
 use crate::flowspace::model::{
     Block, BlockRef, BlockRefExt, ConstValue, Constant, FunctionGraph, HOST_ENV, Hlvalue,
     HostObject, Link, SpaceOperation, Variable, c_last_exception,
@@ -136,6 +137,12 @@ pub fn build_flow_from_rust_in_module_with_globals(
     validate_signature(func)?;
 
     let (inputargs, locals, local_unary_not_kinds) = collect_params(func)?;
+    annotate_typed_ptr_inputs(
+        &func.sig.inputs,
+        &inputargs,
+        module_id,
+        func_globals.as_ref(),
+    );
     let startblock = Block::shared(inputargs);
     let name = func.sig.ident.to_string();
     let graph = FunctionGraph::new(name, startblock.clone());
@@ -295,6 +302,122 @@ fn collect_params(
         inputargs.push(var);
     }
     Ok((inputargs, locals, local_unary_not_kinds))
+}
+
+/// For every `FnArg::Typed`/`FnArg::Receiver` whose declared type is a
+/// shared reference to a struct registered in the walker's
+/// lltype catalog, write `SomeValue::Ptr(SomePtr::new(ptr))` directly
+/// onto the corresponding inputarg's `Variable.annotation`. Variables
+/// whose declared type does NOT resolve through the catalog stay with
+/// the un-narrowed `SomeInstance(classdef=None)` lift supplied by
+/// `valuetype_to_someshell(Ref)`.
+///
+/// Mirrors upstream `rpython/rtyper/lltypesystem/lltype.py:1513-1518
+/// _ptrEntry.compute_annotation` — the parameter's lltype is read from
+/// the class object directly and surfaced on the Variable's annotation
+/// without going through any later relabel.
+fn annotate_typed_ptr_inputs(
+    inputs: &syn::punctuated::Punctuated<FnArg, syn::token::Comma>,
+    inputargs: &[Hlvalue],
+    module_id: ModuleId,
+    func_globals: Option<&HostObject>,
+) {
+    for (input, hlv) in inputs.iter().zip(inputargs.iter()) {
+        let ty = match input {
+            FnArg::Receiver(recv) => &*recv.ty,
+            FnArg::Typed(pt) => &*pt.ty,
+        };
+        let Some(target_ident) = referenced_struct_ident(ty) else {
+            continue;
+        };
+        let Some(ptr) = resolve_struct_lltype(&target_ident, module_id, func_globals) else {
+            continue;
+        };
+        if let Hlvalue::Variable(var) = hlv {
+            *var.annotation.borrow_mut() = Some(Rc::new(SomeValue::Ptr(SomePtr::new(ptr))));
+        }
+    }
+}
+
+/// Return the (single-segment) identifier of a `&Foo` typed reference
+/// whose inner type is a bare path.  Returns `None` for:
+///
+/// - `*const T` / `*mut T` raw pointers — these would lift to a
+///   `Ptr(Struct(..., GcKind::Raw))`; the walker catalog today builds
+///   only `GcStruct` entries, so admitting raw pointers here would
+///   silently promote raw → GC against `lltype.Ptr`'s `_gckind`
+///   invariant (`lltype.py:728-739`).  Phase 5 broadens the catalog
+///   to cover both kinds.
+/// - Multi-segment paths (`&pkg::Foo`) — the producer-side lookup
+///   below resolves a *single* name through the module-globals
+///   partition (mirrors upstream `func_globals[name]`); multi-segment
+///   resolution would require the full `getattr` cascade
+///   (`build_flow.rs::resolve_path_constant`-style chain) and is not
+///   wired here yet, so admitting `&a::Foo` could silently resolve to
+///   a same-named struct from a different namespace.
+/// - Anything carrying generic arguments (`&Vec<T>`, `&Box<Foo>`,
+///   …) — the inner container shape needs the Phase 5 catalog.
+/// - Trait objects, tuples, slices, fn types.
+fn referenced_struct_ident(ty: &syn::Type) -> Option<String> {
+    let inner = match ty {
+        syn::Type::Reference(r) => &*r.elem,
+        // `*const T` / `*mut T` deliberately excluded — see above.
+        _ => return None,
+    };
+    let path = match inner {
+        syn::Type::Path(p) => p,
+        _ => return None,
+    };
+    if path.qself.is_some() {
+        return None;
+    }
+    let segs = &path.path.segments;
+    if segs.len() != 1 {
+        return None;
+    }
+    let seg = &segs[0];
+    if !matches!(seg.arguments, syn::PathArguments::None) {
+        return None;
+    }
+    Some(seg.ident.to_string())
+}
+
+/// Look up `ident` in the walker registry slice for `module_id` (or
+/// the `func_globals` namespace's class dict if provided), then
+/// consult [`super::host_env::lookup_host_lltype`] for the
+/// `HostObject → Ptr(GcStruct(...))` association. Returns `None` if
+/// either step misses (the producer falls back to the un-narrowed
+/// `SomeInstance` lift).
+///
+/// `Self` is resolved against the impl-class threaded through
+/// `func_globals`: pyre's walker (`register.rs:1246-1252`) passes
+/// the impl target class as `func_globals` when lowering a method
+/// body, so `&self`'s syntactic `Self` resolves to that class
+/// directly. Mirrors upstream `flowcontext.py:847
+/// self.w_globals.value[name]` for module-level globals plus the
+/// implicit `Self` binding that Python lacks but Rust requires —
+/// without this short-circuit `&self` parameters never reach the
+/// `Ptr(GcStruct)` lift even when the impl target carries one.
+fn resolve_struct_lltype(
+    ident: &str,
+    module_id: ModuleId,
+    func_globals: Option<&HostObject>,
+) -> Option<crate::translator::rtyper::lltypesystem::lltype::Ptr> {
+    if ident == "Self"
+        && let Some(class) = func_globals
+        && class.is_class()
+    {
+        return class.lltype_ptr().cloned();
+    }
+    let const_value = func_globals
+        .and_then(|gl| gl.class_get(ident))
+        .or_else(|| module_globals_lookup(module_id, ident))
+        .or_else(|| pyre_stdlib_lookup(ident).map(ConstValue::HostObject))?;
+    let host = match const_value {
+        ConstValue::HostObject(h) => h,
+        _ => return None,
+    };
+    super::host_env::lookup_host_lltype(&host)
 }
 
 fn classify_type_for_unary_not(ty: &syn::Type) -> UnaryNotOperandKind {
@@ -9239,5 +9362,141 @@ mod tests {
         // arity mismatches.
         let g = lower("fn f(a: bool, b: bool, c: bool) -> bool { a && b || c }").unwrap();
         checkgraph(&g);
+    }
+
+    #[test]
+    fn entry_input_typed_ref_lifts_to_someptr() {
+        // Walker first registers the `Probe` struct so its `Ptr(GcStruct(Probe))`
+        // lands in the lltype catalog; then build_flow lowers a fn taking
+        // `&Probe`. The startblock's first inputarg must carry a
+        // `SomeValue::Ptr(SomePtr)` annotation pointing at the
+        // catalog-registered struct.
+        let src = "
+            pub struct ParityProbe_TypedRef {
+                pub a: i64,
+                pub b: u64,
+            }
+            pub fn ParityProbe_take(frame: &ParityProbe_TypedRef) -> i64 { 0 }
+        ";
+        let file = syn::parse_file(src).expect("typed-ref fixture parses");
+        let module_id = super::super::register::register_rust_module(&file)
+            .expect("walker registers struct + fn");
+        let item_fn = file
+            .items
+            .iter()
+            .find_map(|item| match item {
+                syn::Item::Fn(f) if f.sig.ident == "ParityProbe_take" => Some(f.clone()),
+                _ => None,
+            })
+            .expect("test fixture must contain ParityProbe_take");
+        let g =
+            build_flow_from_rust_in_module(&item_fn, module_id).expect("adapter lowers fn body");
+        let start = g.startblock.borrow();
+        let arg = start
+            .inputargs
+            .first()
+            .expect("entry block must have one inputarg");
+        let var = match arg {
+            Hlvalue::Variable(v) => v,
+            other => panic!("expected Variable inputarg, got {other:?}"),
+        };
+        let annotation_cell = var.annotation.borrow();
+        let ann = annotation_cell
+            .as_ref()
+            .expect("typed-ref inputarg must carry a producer-set annotation");
+        match ann.as_ref() {
+            SomeValue::Ptr(p) => {
+                use crate::translator::rtyper::lltypesystem::lltype::PtrTarget;
+                let target = match &p.ll_ptrtype.TO {
+                    PtrTarget::Struct(s) => s,
+                    other => panic!("expected PtrTarget::Struct, got {other:?}"),
+                };
+                assert_eq!(target._name, "ParityProbe_TypedRef");
+            }
+            other => panic!("typed-ref inputarg must lift to SomeValue::Ptr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn entry_input_self_receiver_lifts_to_impl_class_someptr() {
+        // `&self` inside an `impl Probe { ... }` method body carries a
+        // syntactic `&Self` type. The producer-side resolver must walk
+        // `Self` against the impl class threaded through `func_globals`
+        // (`register.rs:1246-1252` passes the class HostObject as
+        // `func_globals` for impl methods) and lift to the same
+        // `Ptr(GcStruct(Probe))` that `entry_input_typed_ref_lifts_to_someptr`
+        // covers for the named-type case.
+        let src = "
+            pub struct ParityProbe_SelfRecv {
+                pub a: i64,
+            }
+            impl ParityProbe_SelfRecv {
+                pub fn read(&self) -> i64 { 0 }
+            }
+        ";
+        let file = syn::parse_file(src).expect("self-receiver fixture parses");
+        let module_id = super::super::register::register_rust_module(&file)
+            .expect("walker registers struct + impl block");
+        let class_const =
+            super::super::register::module_globals_for_test(module_id, "ParityProbe_SelfRecv")
+                .expect("class registered as module global");
+        let class_host = match class_const {
+            ConstValue::HostObject(h) => h,
+            other => panic!("class module-global must hold HostObject, got {other:?}"),
+        };
+        let method_const = class_host
+            .class_get("read")
+            .expect("impl method `read` populates the class dict");
+        let method_host = match method_const {
+            ConstValue::HostObject(h) => h,
+            other => panic!("class_get(\"read\") must return HostObject, got {other:?}"),
+        };
+        let pygraph = super::super::host_env::lookup_walker_pygraph(&method_host)
+            .expect("walker pygraph for the impl method body must be registered");
+        let g = pygraph.graph.borrow();
+        let start = g.startblock.borrow();
+        let arg = start
+            .inputargs
+            .first()
+            .expect("`read(&self)` must produce one entry inputarg");
+        let var = match arg {
+            Hlvalue::Variable(v) => v,
+            other => panic!("expected Variable inputarg, got {other:?}"),
+        };
+        let annotation_cell = var.annotation.borrow();
+        let ann = annotation_cell
+            .as_ref()
+            .expect("&self inputarg must carry the producer-set Ptr annotation");
+        match ann.as_ref() {
+            SomeValue::Ptr(p) => {
+                use crate::translator::rtyper::lltypesystem::lltype::PtrTarget;
+                let target = match &p.ll_ptrtype.TO {
+                    PtrTarget::Struct(s) => s,
+                    other => panic!("expected PtrTarget::Struct, got {other:?}"),
+                };
+                assert_eq!(target._name, "ParityProbe_SelfRecv");
+            }
+            other => panic!("&self inputarg must lift to SomeValue::Ptr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn entry_input_typed_ref_unregistered_falls_back() {
+        // No walker call has registered `Unknown` for this module_id,
+        // so the lltype catalog misses; the inputarg's annotation stays
+        // empty (the downstream `valuetype_to_someshell(Ref)` fallback
+        // lift runs later in the annotator pass, not at producer time).
+        let g = lower("fn take(p: &UnregisteredStruct) -> i64 { 0 }").unwrap();
+        let start = g.startblock.borrow();
+        let arg = start.inputargs.first().expect("inputarg present");
+        let var = match arg {
+            Hlvalue::Variable(v) => v,
+            other => panic!("expected Variable inputarg, got {other:?}"),
+        };
+        assert!(
+            var.annotation.borrow().is_none(),
+            "unregistered typed ref must NOT pre-populate annotation \
+             (fallback path runs later in valuetype_to_someshell)",
+        );
     }
 }

@@ -756,7 +756,7 @@ pub(crate) mod tests {
                 true,
             )
             .unwrap();
-        graph.push_op_var(
+        graph.push_op(
             graph.startblock,
             OpKind::Call {
                 target: crate::model::CallTarget::indirect("Handler", "run"),
@@ -869,7 +869,7 @@ pub(crate) mod tests {
                 true,
             )
             .unwrap();
-        graph.push_op_var(
+        graph.push_op(
             graph.startblock,
             OpKind::Call {
                 target: CallTarget::method("bar", Some("Foo".to_string())),

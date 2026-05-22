@@ -919,8 +919,8 @@ mod stamp_classdef_hints_tests {
         let mut graph = FunctionGraph::new("producer_test");
         graph.ensure_variable_registered_void(&recv_var);
         let recv_slot = graph.slot_of(&recv_var).expect("just registered above");
-        let _result_var = graph
-            .push_op_var(
+        let _result_vid = graph
+            .push_op(
                 graph.startblock,
                 OpKind::Call {
                     target: CallTarget::method("push_value", Some("H".to_string())),
@@ -929,7 +929,7 @@ mod stamp_classdef_hints_tests {
                 },
                 true,
             )
-            .expect("push_op_var should succeed");
+            .expect("push_op should succeed");
         let mut value_to_var = std::collections::HashMap::new();
         value_to_var.insert(recv_slot, recv_var.clone());
 
@@ -963,7 +963,7 @@ mod stamp_classdef_hints_tests {
         graph.ensure_variable_registered_void(&recv_var);
         let recv_slot = graph.slot_of(&recv_var).expect("just registered above");
         graph
-            .push_op_var(
+            .push_op(
                 graph.startblock,
                 OpKind::Call {
                     target: CallTarget::method("push_value", Some("H".to_string())),
@@ -972,7 +972,7 @@ mod stamp_classdef_hints_tests {
                 },
                 true,
             )
-            .expect("push_op_var should succeed");
+            .expect("push_op should succeed");
         let mut value_to_var = std::collections::HashMap::new();
         value_to_var.insert(recv_slot, recv_var.clone());
 
@@ -1053,7 +1053,7 @@ mod stamp_classdef_hints_tests {
         graph.ensure_variable_registered_void(&recv_var);
         let recv_slot = graph.slot_of(&recv_var).expect("just registered above");
         graph
-            .push_op_var(
+            .push_op(
                 graph.startblock,
                 OpKind::Call {
                     target: CallTarget::method("push_value", Some("H".to_string())),
@@ -1062,7 +1062,7 @@ mod stamp_classdef_hints_tests {
                 },
                 true,
             )
-            .expect("push_op_var should succeed");
+            .expect("push_op should succeed");
         let mut value_to_var = std::collections::HashMap::new();
         value_to_var.insert(recv_slot, recv_var.clone());
 

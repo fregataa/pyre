@@ -6943,7 +6943,7 @@ mod tests {
         let mut graph = FunctionGraph::new("forcer");
         let frame_var = graph.alloc_value_var();
         graph.push_inputarg_var(graph.startblock, frame_var.clone());
-        graph.push_op_var(
+        graph.push_op(
             graph.startblock,
             OpKind::VableForce { base: frame_var },
             false,
@@ -7006,7 +7006,7 @@ mod tests {
 
         // caller: calls callee (no Abort itself)
         let mut caller = FunctionGraph::new("caller");
-        caller.push_op_var(
+        caller.push_op(
             caller.startblock,
             OpKind::Call {
                 target: CallTarget::function_path(["callee"]),
@@ -7063,7 +7063,7 @@ mod tests {
         let mut cc = CallControl::new();
         let mut graph = FunctionGraph::new("accessor");
         let base_var = graph.alloc_value_var();
-        graph.push_op_var(
+        graph.push_op(
             graph.startblock,
             OpKind::FieldRead {
                 base: base_var.clone(),
@@ -7073,7 +7073,7 @@ mod tests {
             },
             true,
         );
-        graph.push_op_var(
+        graph.push_op(
             graph.startblock,
             OpKind::FieldWrite {
                 base: base_var.clone(),
@@ -7151,7 +7151,7 @@ mod tests {
         let mut cc = CallControl::new();
         let mut graph = FunctionGraph::new("pure_writer");
         let base_var = graph.alloc_value_var();
-        graph.push_op_var(
+        graph.push_op(
             graph.startblock,
             OpKind::FieldWrite {
                 base: base_var.clone(),
@@ -7246,7 +7246,7 @@ mod tests {
         let base_var = graph.alloc_value_var();
         let field = crate::model::FieldDescriptor::new("x", Some("Point".into()));
         // Both read AND write the same field "x"
-        graph.push_op_var(
+        graph.push_op(
             graph.startblock,
             OpKind::FieldRead {
                 base: base_var.clone(),
@@ -7256,7 +7256,7 @@ mod tests {
             },
             true,
         );
-        graph.push_op_var(
+        graph.push_op(
             graph.startblock,
             OpKind::FieldWrite {
                 base: base_var.clone(),
@@ -7312,7 +7312,7 @@ mod tests {
         let mut graph = FunctionGraph::new("divider");
         let a_var = graph.alloc_value_var();
         let b_var = graph.alloc_value_var();
-        graph.push_op_var(
+        graph.push_op(
             graph.startblock,
             OpKind::BinOp {
                 op: "int_floordiv".to_string(),

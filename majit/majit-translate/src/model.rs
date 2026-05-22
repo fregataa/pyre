@@ -2588,9 +2588,9 @@ impl FunctionGraph {
         let entry = BlockId(0);
         let returnblock = BlockId(1);
         let exceptblock = BlockId(2);
-        let return_value: usize = 0;
-        let last_exception: usize = 1;
-        let last_exc_value: usize = 2;
+        let return_value = ValueId(0);
+        let last_exception = ValueId(1);
+        let last_exc_value = ValueId(2);
         // Canonical inputargs (returnvar / etype / evalue) get named
         // Variables matching `flowspace/model.py:21-25`
         // (`Variable("returnvar")`, `Variable("etype")`,
@@ -2604,9 +2604,9 @@ impl FunctionGraph {
         let var_etype = crate::flowspace::model::Variable::named("etype");
         let var_evalue = crate::flowspace::model::Variable::named("evalue");
         let mut variable_to_vid = std::collections::HashMap::new();
-        variable_to_vid.insert(var_returnvar.id(), return_value);
-        variable_to_vid.insert(var_etype.id(), last_exception);
-        variable_to_vid.insert(var_evalue.id(), last_exc_value);
+        variable_to_vid.insert(var_returnvar.id(), return_value.0);
+        variable_to_vid.insert(var_etype.id(), last_exception.0);
+        variable_to_vid.insert(var_evalue.id(), last_exc_value.0);
         Self {
             name: name.into(),
             startblock: entry,
@@ -3315,9 +3315,14 @@ impl FunctionGraph {
         self.next_value = next;
     }
 
-    /// Push an op whose fresh result `Variable` is minted in place
-    /// when `has_result` is true; callers receive that `Variable`
-    /// directly without round-tripping through
+    pub fn push_op(&mut self, block: BlockId, kind: OpKind, has_result: bool) -> Option<ValueId> {
+        self.push_op_var(block, kind, has_result)
+            .and_then(|var| self.value_id_of(&var))
+    }
+
+    /// Variable-returning sibling of [`Self::push_op`] — mints the
+    /// fresh result `Variable` (when `has_result` is true) and returns
+    /// it directly so callers no longer round-trip through
     /// `Option<ValueId>` + `must_variable`.
     pub fn push_op_var(
         &mut self,
@@ -4744,7 +4749,7 @@ mod tests {
     fn ensure_variable_at_block_idempotent_on_existing_op_result() {
         let mut graph = FunctionGraph::new("ensure_var_idempotent_op");
         let block = graph.create_block();
-        let _v = graph.push_op_var(
+        let _v = graph.push_op(
             block,
             OpKind::Input {
                 name: "x".to_string(),
@@ -4800,7 +4805,7 @@ mod tests {
         let v = Variable::new();
         graph.alloc_value_with_variable(v.clone());
         // Define v in pred via an Input op result.
-        let _ = graph.push_op_var(
+        let _ = graph.push_op(
             pred,
             OpKind::Input {
                 name: "p".to_string(),
@@ -4844,7 +4849,7 @@ mod tests {
         let leaf = graph.create_block();
         let v = Variable::new();
         graph.alloc_value_with_variable(v.clone());
-        let _ = graph.push_op_var(
+        let _ = graph.push_op(
             root,
             OpKind::Input {
                 name: "p".to_string(),
@@ -4890,7 +4895,7 @@ mod tests {
         let body_tail = graph.create_block();
         let v = Variable::new();
         graph.alloc_value_with_variable(v.clone());
-        let _ = graph.push_op_var(
+        let _ = graph.push_op(
             entry,
             OpKind::Input {
                 name: "p".to_string(),

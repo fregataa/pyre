@@ -120,7 +120,7 @@ pub mod register;
 
 pub use build_flow::{AdapterError, build_flow_from_rust, build_flow_from_rust_in_module};
 pub use host_env::{
-    ModuleId, drain_walker_errors, drain_walker_pygraphs, lookup_walker_error,
+    ModuleId, drain_walker_errors, drain_walker_pygraphs, lookup_host_lltype, lookup_walker_error,
     lookup_walker_pygraph,
 };
 pub use register::{

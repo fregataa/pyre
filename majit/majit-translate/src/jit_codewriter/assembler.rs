@@ -4061,7 +4061,7 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.push_op_var(
+        graph.push_op(
             graph.startblock,
             OpKind::FieldWrite {
                 base: base_var.clone(),
@@ -4071,7 +4071,7 @@ mod tests {
             },
             false,
         );
-        graph.push_op_var(
+        graph.push_op(
             graph.startblock,
             OpKind::ArrayWrite {
                 base: base_var.clone(),

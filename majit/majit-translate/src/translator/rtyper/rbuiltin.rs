@@ -40,7 +40,36 @@
 
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, OnceLock};
+
+/// Process-global counter for the legacy InstanceRepr→PtrRepr swap
+/// inside [`rtype_cast_ptr_to_int`].  Each fire is one
+/// `cast_ptr_to_int` call whose operand reached the typer without a
+/// producer-set `SomeValue::Ptr` annotation — i.e. the struct's
+/// `Ptr(GcStruct(...))` is not in the walker lltype catalog yet
+/// (Phase 1 / Phase 5 of the typed-ref-someptr-followup-epic).
+///
+/// Phase 4 progression gate (swap deletion): this counter must read 0
+/// across a representative production run.  Read it via
+/// [`swap_fallback_hits`]; reset between runs via
+/// [`reset_swap_fallback_hits`].
+pub(crate) static SWAP_FALLBACK_HITS: AtomicU64 = AtomicU64::new(0);
+
+/// Read the current value of the `cast_ptr_to_int` swap fallback hit
+/// counter.  Used by Phase 4 readiness checks + by unit tests.
+pub fn swap_fallback_hits() -> u64 {
+    SWAP_FALLBACK_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Reset the swap fallback hit counter to zero.  Test fixtures call
+/// this before exercising a `cast_ptr_to_int` lowering so the
+/// post-call observation is independent of any earlier-in-process
+/// fires (the registry is process-global so cross-test bleed is
+/// otherwise unavoidable).
+pub fn reset_swap_fallback_hits() {
+    SWAP_FALLBACK_HITS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
 
 use crate::annotator::model::{SomeBuiltin, SomeBuiltinMethod, SomeValue};
 use crate::flowspace::model::{ConstValue, Constant, HOST_ENV, HostObject};
@@ -2154,31 +2183,45 @@ pub fn rtype_cast_ptr_to_int(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>
     use crate::translator::rtyper::rmodel::PtrRepr;
     use crate::translator::rtyper::rtyper::{ConvertedTo, GenopResult};
 
-    // PRE-EXISTING-ADAPTATION (typed-ref-someptr-followup-epic
-    // `~/.claude/plans/typed-ref-someptr-followup-epic.md` —
-    // Phase 2 landed 2026-05-05, this block IS the Phase 2 swap):
-    // pyre's surface DSL has no `lltype.*` HostObject, so typed
-    // `&Foo` references lift to `SomeInstance(classdef=None)` instead
-    // of upstream's `SomePtr(ll_ptrtype)`.  That makes
-    // `hop.args_r[0]` arrive as `InstanceRepr` (lowleveltype
-    // `Ptr(GcStruct(OBJECT))`) rather than `PtrRepr`, so the upstream
-    // `assert isinstance(hop.args_r[0], rptr.PtrRepr)` cannot run
-    // directly.  The operand's concretetype is already a `Ptr(...)`
-    // (`InstanceRepr.lowleveltype`), so we relabel `args_r[0]` as
-    // `PtrRepr(operand_lltype)`; the relabel is a noop at LL because
-    // the underlying lowleveltype is unchanged.  Convergence path
-    // (epic Phase 3, blocked on M2.5g extern-Rust-helper registry
-    // walker): once M2.5g lands, the frontend gains a typed-`&Foo`
-    // catalog and lifts `&Foo` directly to
-    // `SomeValue::Ptr(SomePtr::new(t))` via
-    // `set_some(vid, ...)` at the lift site
-    // (`front/ast.rs::value_type_for_type`).  At that point this
-    // swap retires (`rptr.py:13-14 SomePtr.rtyper_makerepr` already
-    // produces `PtrRepr` upstream).
+    // PRE-EXISTING-ADAPTATION (typed-ref-someptr-followup-epic, Phase 3
+    // landed: this block IS the retirement-readiness diagnostic for
+    // the legacy late InstanceRepr→PtrRepr swap).  pyre's surface DSL
+    // has no `lltype.*` HostObject, so typed `&Foo` references whose
+    // owning struct is NOT in the walker lltype catalog lift to
+    // `SomeInstance(classdef=None)` instead of upstream's
+    // `SomePtr(ll_ptrtype)`.  Phase 2 lifted catalog-registered
+    // typed-refs to `SomeValue::Ptr` at producer time
+    // (`flowspace/rust_source/build_flow.rs::annotate_typed_ptr_inputs`)
+    // so the rtyper makerepr path
+    // (`rmodel.rs:2545 SomeValue::Ptr → PtrRepr`) lands them in
+    // `hop.args_r[0]` already as `PtrRepr` — the swap below is now
+    // load-bearing only for unregistered structs.
+    //
+    // Phase 4 progression gate: SWAP_FALLBACK_HITS reading 0 across a
+    // representative production run (currently `pyre/check.py`) is the
+    // sign every reachable struct has been added to the walker catalog
+    // (Phase 1 / Phase 5); once that holds the swap can be deleted in
+    // favour of the line-by-line `rbuiltin.py:541-549` port below.
+    let producer_set_someptr = matches!(
+        hop.args_v.borrow()[0].clone(),
+        Hlvalue::Variable(ref var) if matches!(
+            var.annotation.borrow().as_deref(),
+            Some(SomeValue::Ptr(_))
+        )
+    );
     let needs_swap = hop.args_r.borrow()[0]
         .as_ref()
         .map_or(false, |r| r.repr_class_id() != ReprClassId::PtrRepr);
+    if producer_set_someptr {
+        debug_assert!(
+            !needs_swap,
+            "rtype_cast_ptr_to_int: producer-set SomePtr operand reached the typer \
+             without args_r[0] resolving to PtrRepr (rtyper makerepr path broken; \
+             see rmodel.rs:2545 SomeValue::Ptr → PtrRepr wiring)",
+        );
+    }
     if needs_swap {
+        SWAP_FALLBACK_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let v = hop.args_v.borrow()[0].clone();
         let concrete = match &v {
             Hlvalue::Variable(var) => var.concretetype(),
@@ -2190,7 +2233,7 @@ pub fn rtype_cast_ptr_to_int(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>
                 return Err(TyperError::message(format!(
                     "rtype_cast_ptr_to_int: operand concretetype must be Ptr(...) for \
                      late InstanceRepr→PtrRepr swap (typed-ref-someptr-followup-epic \
-                     Phase 2), got {other:?}"
+                     Phase 3 fallback path), got {other:?}"
                 )));
             }
         };
@@ -3249,5 +3292,19 @@ mod tests {
         let sbm = SomeBuiltinMethod::new("foo", s_self, "foo");
         let r = dispatch_rtyper_makerepr(&SomeValue::BuiltinMethod(sbm), &rtyper).unwrap();
         assert_eq!(r.class_name(), "BuiltinMethodRepr");
+    }
+
+    #[test]
+    fn swap_fallback_hits_round_trip() {
+        // The `cast_ptr_to_int` retirement-readiness counter is
+        // process-global; reset before observing so cross-test bleed
+        // is excluded.  Subsequent increments through the public
+        // `SWAP_FALLBACK_HITS` atomic surface in the reader.
+        reset_swap_fallback_hits();
+        assert_eq!(swap_fallback_hits(), 0);
+        SWAP_FALLBACK_HITS.fetch_add(3, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(swap_fallback_hits(), 3);
+        reset_swap_fallback_hits();
+        assert_eq!(swap_fallback_hits(), 0);
     }
 }

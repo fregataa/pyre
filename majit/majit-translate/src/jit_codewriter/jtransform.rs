@@ -4430,7 +4430,7 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.push_op_var(
+        graph.push_op(
             graph.startblock,
             OpKind::GuardValue {
                 value: alias_var,
@@ -4484,7 +4484,7 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.push_op_var(
+        graph.push_op(
             graph.startblock,
             OpKind::VtableMethodPtr {
                 receiver: alias_var,
@@ -4758,7 +4758,7 @@ mod tests {
         let mut graph = FunctionGraph::new("test");
         let base_var = graph.alloc_value_var();
         let base = graph.slot_of(&base_var).expect("base registered");
-        graph.push_op_var(
+        graph.push_op(
             graph.startblock,
             OpKind::FieldRead {
                 base: base_var,
@@ -4815,7 +4815,7 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.push_op_var(
+        graph.push_op(
             graph.startblock,
             OpKind::ArrayRead {
                 base: array_var,
@@ -4860,7 +4860,7 @@ mod tests {
     fn rewrite_graph_requires_matching_field_owner_root() {
         let mut graph = FunctionGraph::new("test");
         let base_var = graph.alloc_value_var();
-        graph.push_op_var(
+        graph.push_op(
             graph.startblock,
             OpKind::FieldRead {
                 base: base_var,
@@ -4893,7 +4893,7 @@ mod tests {
         let mut graph = FunctionGraph::new("test");
         let base_var = graph.alloc_value_var();
         let value_var = graph.alloc_value_var();
-        graph.push_op_var(
+        graph.push_op(
             graph.startblock,
             OpKind::FieldWrite {
                 base: base_var,
@@ -4924,7 +4924,7 @@ mod tests {
         let base_var = graph.alloc_value_var();
         let index_var = graph.alloc_value_var();
         let value_var = graph.alloc_value_var();
-        graph.push_op_var(
+        graph.push_op(
             graph.startblock,
             OpKind::ArrayWrite {
                 base: base_var,
@@ -5018,7 +5018,7 @@ mod tests {
     #[test]
     fn rewrite_graph_classifies_calls() {
         let mut graph = FunctionGraph::new("test");
-        graph.push_op_var(
+        graph.push_op(
             graph.startblock,
             OpKind::Call {
                 target: CallTarget::method("call_callable", Some("PyFrame".into())),
@@ -5410,7 +5410,7 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.push_op_var(
+        graph.push_op(
             graph.startblock,
             OpKind::Call {
                 target: target.clone(),
@@ -5447,7 +5447,7 @@ mod tests {
         // RPython: residual calls always produce residual_call_*, regardless
         // of effect. The effect is only in the calldescr (descriptor).
         let mut graph = FunctionGraph::new("test");
-        graph.push_op_var(
+        graph.push_op(
             graph.startblock,
             OpKind::Call {
                 target: CallTarget::function_path(["custom_reader"]),
@@ -5487,7 +5487,7 @@ mod tests {
     #[test]
     fn rewrite_graph_reports_unknowns() {
         let mut graph = FunctionGraph::new("demo");
-        graph.push_op_var(
+        graph.push_op(
             graph.startblock,
             OpKind::Abort {
                 kind: crate::model::UnknownKind::UnsupportedExpr {
@@ -5507,7 +5507,7 @@ mod tests {
         let frame_var = graph.alloc_value_var();
         let hinted_var = graph.alloc_value_var();
         graph.push_inputarg_var(graph.startblock, frame_var.clone());
-        graph.push_op_var(
+        graph.push_op(
             graph.startblock,
             OpKind::Call {
                 target: CallTarget::function_path(["hint_access_directly"]),
@@ -5522,7 +5522,7 @@ mod tests {
             .last_mut()
             .unwrap()
             .result = Some(hinted_var.clone());
-        graph.push_op_var(
+        graph.push_op(
             graph.startblock,
             OpKind::FieldRead {
                 base: hinted_var,
@@ -5559,7 +5559,7 @@ mod tests {
         let frame_var = graph.alloc_value_var();
         let forced_var = graph.alloc_value_var();
         graph.push_inputarg_var(graph.startblock, frame_var.clone());
-        graph.push_op_var(
+        graph.push_op(
             graph.startblock,
             OpKind::Call {
                 target: CallTarget::function_path(["hint_force_virtualizable"]),
@@ -5574,7 +5574,7 @@ mod tests {
             .last_mut()
             .unwrap()
             .result = Some(forced_var.clone());
-        graph.push_op_var(
+        graph.push_op(
             graph.startblock,
             OpKind::FieldRead {
                 base: forced_var,
@@ -5625,7 +5625,7 @@ mod tests {
         graph.push_inputarg_var(graph.startblock, v_var.clone());
         // `hint_promote(v)` — mirrors `rlib/jit.py:101 promote(x)` after
         // lowering to the operator-level helper name.
-        graph.push_op_var(
+        graph.push_op(
             graph.startblock,
             OpKind::Call {
                 target: CallTarget::function_path(["hint_promote"]),
@@ -5642,7 +5642,7 @@ mod tests {
             .result = Some(promoted_var.clone());
         // A downstream op that names the promote result so we can
         // observe that `optimize_block` aliased it back to `v`.
-        graph.push_op_var(
+        graph.push_op(
             graph.startblock,
             OpKind::FieldRead {
                 base: promoted_var,
@@ -5692,7 +5692,7 @@ mod tests {
         let mut graph = FunctionGraph::new("demo");
         let v_var = graph.alloc_value_var();
         graph.push_inputarg_var(graph.startblock, v_var.clone());
-        graph.push_op_var(
+        graph.push_op(
             graph.startblock,
             OpKind::Call {
                 target: CallTarget::function_path(["hint_promote"]),
@@ -5752,7 +5752,7 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.push_op_var(
+        graph.push_op(
             graph.startblock,
             OpKind::FieldRead {
                 base: base_var,
@@ -5822,7 +5822,7 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.push_op_var(
+        graph.push_op(
             graph.startblock,
             OpKind::FieldRead {
                 base: base_var,
@@ -6266,7 +6266,7 @@ mod tests {
     fn build_handler_run_impl_graph(name: &str) -> FunctionGraph {
         let mut graph = FunctionGraph::new(name);
         graph
-            .push_op_var(
+            .push_op(
                 graph.startblock,
                 OpKind::Input {
                     name: "self".to_string(),
@@ -6319,7 +6319,7 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.push_op_var(
+        graph.push_op(
             graph.startblock,
             OpKind::Call {
                 target: CallTarget::indirect("Handler", "run"),
@@ -6412,7 +6412,7 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.push_op_var(
+        graph.push_op(
             graph.startblock,
             OpKind::Call {
                 target: CallTarget::indirect("Handler", "run"),
@@ -6488,7 +6488,7 @@ mod tests {
 
         let build_impl = |name: &str| {
             let mut g = FunctionGraph::new(name);
-            g.push_op_var(
+            g.push_op(
                 g.startblock,
                 OpKind::Input {
                     name: "self".into(),
@@ -6498,7 +6498,7 @@ mod tests {
             )
             .unwrap();
             for (i, ty) in extras.iter().enumerate() {
-                g.push_op_var(
+                g.push_op(
                     g.startblock,
                     OpKind::Input {
                         name: format!("a{i}"),
@@ -6567,7 +6567,7 @@ mod tests {
             );
         }
         let has_result = !matches!(result_ty, ValueType::Void);
-        graph.push_op_var(
+        graph.push_op(
             graph.startblock,
             OpKind::Call {
                 target: CallTarget::indirect("T", "m"),
@@ -6741,7 +6741,7 @@ mod tests {
 
         let build_impl = |name: &str| {
             let mut g = FunctionGraph::new(name);
-            g.push_op_var(
+            g.push_op(
                 g.startblock,
                 OpKind::Input {
                     name: "self".into(),
@@ -6751,7 +6751,7 @@ mod tests {
             )
             .unwrap();
             for (i, ty) in extras.iter().enumerate() {
-                g.push_op_var(
+                g.push_op(
                     g.startblock,
                     OpKind::Input {
                         name: format!("a{i}"),
@@ -6818,7 +6818,7 @@ mod tests {
             );
         }
         let has_result = !matches!(result_ty, ValueType::Void);
-        graph.push_op_var(
+        graph.push_op(
             graph.startblock,
             OpKind::Call {
                 target: CallTarget::indirect("T", "m"),
@@ -6965,7 +6965,7 @@ mod tests {
         let mut graph = FunctionGraph::new("demo");
         let v_var = graph.alloc_value_var();
         graph.push_inputarg_var(graph.startblock, v_var.clone());
-        graph.push_op_var(
+        graph.push_op(
             graph.startblock,
             OpKind::Call {
                 target: CallTarget::function_path(["hint_promote_or_string"]),
@@ -6996,7 +6996,7 @@ mod tests {
         let mut graph = FunctionGraph::new("demo");
         let v_var = graph.alloc_value_var();
         graph.push_inputarg_var(graph.startblock, v_var.clone());
-        graph.push_op_var(
+        graph.push_op(
             graph.startblock,
             OpKind::Call {
                 target: CallTarget::function_path(["hint_promote_or_string"]),

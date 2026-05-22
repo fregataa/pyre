@@ -608,6 +608,22 @@ pub fn drain_walker_errors() -> HashMap<HostObject, String> {
     HOST_RUST_WALKER_ERRORS.with(|map| std::mem::take(&mut *map.borrow_mut()))
 }
 
+// The walker→producer channel for `Ptr(GcStruct(...))` lives on
+// `HostObject::Class` directly via `HostObject::set_lltype_ptr` /
+// `HostObject::lltype_ptr`. Mirrors upstream `_ptrEntry.
+// compute_annotation` (`rpython/rtyper/lltypesystem/lltype.py:1513
+// -1518`): the lltype identity is attached to the class object the
+// pointer refers to, not stashed in a parallel registry.
+//
+// Re-export the read-side accessor under the historical name so
+// callers outside `rust_source/` don't need to know about the
+// inline storage.
+pub fn lookup_host_lltype(
+    host: &HostObject,
+) -> Option<crate::translator::rtyper::lltypesystem::lltype::Ptr> {
+    host.lltype_ptr().cloned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

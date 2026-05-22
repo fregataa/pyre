@@ -138,19 +138,19 @@ fn seed_variable(legacy_var: &Variable) -> Variable {
 ///    to carry a *fresh* prevblock-side `Variable` whose only "defining
 ///    site" is the link itself — the value flows into the target
 ///    block's inputarg via this synthetic Variable. The adapter must
-///    seed a `Variable` for each such slot so Slice 1c's link
+///    seed a `Variable` for each such `ValueId` so Slice 1c's link
 ///    translation can resolve the operand without tripping the
 ///    "undefined operand" invariant in `lookup_operand`.
 ///
 /// 3. **Exitswitch values** — `block.exitswitch = Some(ExitSwitch::Value(vid))`
-///    sometimes references a slot defined in a successor block's
+///    sometimes references a `ValueId` defined in a successor block's
 ///    inputarg context (rarely but legitimately in legacy graphs).
 ///    Seeded for the same reason.
 ///
-/// Each slot is seeded exactly once via `entry().or_insert_with`,
+/// Each `ValueId` is seeded exactly once via `entry().or_insert_with`,
 /// preserving operand identity across multiple readers — Slice 1b's op
 /// translator looks up the same Variable instance for every reader of a
-/// given slot, matching upstream Python's reference semantics where
+/// given `ValueId`, matching upstream Python's reference semantics where
 /// `op.args[i]` and `op2.args[j]` may be the same `Variable` object.
 ///
 /// **Restricted to the adapter / its tests.**  `function_graph_to_flowspace`
@@ -186,7 +186,7 @@ pub(crate) fn build_value_to_variable_map(legacy: &FunctionGraph) -> SlotToVaria
         // *leading* `Input{name, ty}` op for each named parameter whose
         // `op.result` matches a `block.inputargs` entry, and may emit
         // *additional* `Input{same name}` ops with fresh `op.result`
-        // slots for body-side rebinds. RPython's flowspace has no
+        // ValueIds for body-side rebinds. RPython's flowspace has no
         // such Input op machinery — the parameter Variable IS the
         // inputarg. Without aliasing the rebind result to the
         // canonical inputarg Variable, `setup_block_entry` writes
@@ -263,15 +263,15 @@ pub(crate) fn build_value_to_variable_map(legacy: &FunctionGraph) -> SlotToVaria
 /// in `op.args` (`flowspace/operation.py:152` `simple_call(target,
 /// *args)` — `target` and each `arg` is either a `Variable` or
 /// `Constant`). Pyre's legacy graph splits constants into define-ops
-/// (`OpKind::ConstInt(n)` produces a fresh slot consumed
-/// elsewhere). The adapter must recombine: every slot defined as a
-/// const becomes a `Hlvalue::Constant`; every other defined slot
+/// (`OpKind::ConstInt(n)` produces a fresh `ValueId` consumed
+/// elsewhere). The adapter must recombine: every `ValueId` defined as a
+/// const becomes a `Hlvalue::Constant`; every other defined `ValueId`
 /// remains a `Hlvalue::Variable` from the Slice 1a map.
 ///
 /// Constants are wrapped with their low-level concretetype attached,
 /// matching RPython's `Constant.concretetype` shape. The legacy graph
-/// used a separate slot for the define-op; after inlining, that
-/// slot is tracked separately for readback.
+/// used a separate `ValueId` for the define-op; after inlining, that
+/// `ValueId` is tracked separately for readback.
 pub fn build_value_to_hlvalue_map(
     legacy: &FunctionGraph,
     value_to_var: &SlotToVariable,
@@ -1262,7 +1262,7 @@ fn post_rtyper_jtransform_variant_name(kind: &OpKind) -> Option<&'static str> {
 /// Output of [`function_graph_to_flowspace`] — the assembled
 /// `flowspace::FunctionGraph` plus enough side tables for Slice 2's
 /// `specialize_legacy_graph` wrapper to drive `RPythonTyper::specialize`
-/// against pyre's annotator surface and read back per-slot
+/// against pyre's annotator surface and read back per-`ValueId`
 /// concretetypes.
 #[derive(Debug)]
 pub struct FlowspaceAdapterOutput {
@@ -1272,14 +1272,14 @@ pub struct FlowspaceAdapterOutput {
     /// `FunctionDesc.cache` ownership shape — Slice 2 hands this to
     /// `RPythonAnnotator` directly.
     pub graph: Rc<RefCell<FlowspaceGraph>>,
-    /// slot → flowspace::Variable (Slice 1a output) — Slice 2 reads
-    /// `Variable.concretetype` per slot after `specialize` returns.
+    /// `ValueId → flowspace::Variable` (Slice 1a output) — Slice 2 reads
+    /// `Variable.concretetype` per `ValueId` after `specialize` returns.
     pub value_to_var: SlotToVariable,
-    /// Legacy constant define slot -> `Constant.concretetype`.
+    /// Legacy constant define `ValueId` -> `Constant.concretetype`.
     /// Materialised at lift time from `OpKind::ConstInt` / `ConstFloat`
     /// via `Constant::with_concretetype` (`flowspace_adapter.rs:518-527`),
     /// matching RPython's `Constant.concretetype` ground truth.  Slice 2
-    /// reads the per-slot `LowLevelType` directly so the projector
+    /// reads the per-`ValueId` `LowLevelType` directly so the projector
     /// does not have to reconstruct the kind from the reduced legacy
     /// `ValueType` view.
     pub constant_concretetypes: HashMap<usize, LowLevelType>,
@@ -1398,7 +1398,7 @@ fn link_arg_to_hlvalue(
 /// RPython `flowspace/model.py:636-642` defines `link.last_exception`
 /// and `link.last_exc_value` in the link scope before checking
 /// `link.args`; those same Variables may then appear in `link.args`.
-/// Pyre's legacy graph represents them as fresh slots whose only
+/// Pyre's legacy graph represents them as fresh `ValueId`s whose only
 /// definition site is the link, so the adapter must materialise them in
 /// a per-link map instead of requiring a block-local definition.
 fn link_extravar_to_hlvalue(
@@ -1630,7 +1630,7 @@ pub fn function_graph_to_flowspace(
     })?;
 
     // Resolve the returnblock's inputarg as a fresh final-block
-    // Variable. Even when the legacy graph reuses the source slot
+    // Variable. Even when the legacy graph reuses the source ValueId
     // here, RPython's checkgraph treats target inputargs as definitions
     // in the target block, not as the predecessor's Variable object.
     //
@@ -1777,7 +1777,7 @@ pub fn function_graph_to_flowspace(
                         // gap: either the target block's inputargs were
                         // not extended to carry `name`, or the
                         // predecessor link's args do not include the
-                        // slot producer.  The dual-gate at
+                        // ValueId producer.  The dual-gate at
                         // `cutover.rs:439 is_known_unported` matches
                         // the substring `"adapter cross-block body
                         // Input"` and Skip-classifies the graph,
@@ -2173,8 +2173,8 @@ mod tests {
     #[test]
     fn build_value_to_variable_map_dedupes_by_value_id() {
         // Two ops both reading the same inputarg (legacy graphs are SSA
-        // — every slot has one definition, but multiple readers).
-        // Slice 1a must produce one Variable identity per slot.
+        // — every ValueId has one definition, but multiple readers).
+        // Slice 1a must produce one Variable identity per ValueId.
         let mut graph = LegacyGraph::new("dedup_test");
         // Slots 0..2 are canonical (returnvar / etype / evalue);
         // alloc one more so slot 3 has a backing Variable.
@@ -2221,7 +2221,7 @@ mod tests {
     fn build_value_to_variable_map_aliases_input_rebind_to_inputarg() {
         // Pyre's surface front emits a leading `Input{name}` op whose
         // result IS a block.inputarg, plus follow-up `Input{same name}`
-        // ops with FRESH result slots for body-side rebinds. The
+        // ops with FRESH result ValueIds for body-side rebinds. The
         // adapter must alias the rebind result to the canonical
         // inputarg Variable so `setup_block_entry`'s
         // `concretetype` write reaches both — otherwise the body's
@@ -2240,7 +2240,7 @@ mod tests {
                         ty: ValueType::Int,
                     },
                 },
-                // Rebind: result is fresh; same name → alias to slot 1's Variable.
+                // Rebind: result is fresh; same name → alias to ValueId(1)'s Variable.
                 SpaceOperation {
                     result: Some(graph.must_variable_at(2)),
                     kind: OpKind::Input {
@@ -3091,7 +3091,7 @@ mod tests {
         // RPython convention: returnblock canonically has one inputarg
         // (`flowspace/model.py:13-18`). True void returns use a
         // `SomeNone` / `Void`-typed argument; pyre's legacy graph
-        // mirrors that by always emitting a single slot in the
+        // mirrors that by always emitting a single ValueId in the
         // returnblock's inputargs.
         let mut graph = LegacyGraph::new("identity_return");
         let startblock = Block {
@@ -3163,7 +3163,7 @@ mod tests {
 
     #[test]
     fn function_graph_to_flowspace_returnvar_identity_preserved() {
-        // When the returnblock has an inputarg slot, the flowspace
+        // When the returnblock has an inputarg ValueId, the flowspace
         // graph's returnblock must use the SAME Variable identity (so
         // RPythonTyper.getreturnvar finds the right Variable —
         // rtyper.rs:1633-1638).
@@ -3195,7 +3195,7 @@ mod tests {
             .expect("graph must assemble");
 
         // The flowspace returnblock's single inputarg must be the
-        // Variable we seeded for slot 2.
+        // Variable we seeded for ValueId(2).
         let flowspace_graph = output.graph.borrow();
         let returnblock_ref = &flowspace_graph.returnblock;
         let returnblock = returnblock_ref.borrow();
@@ -3218,7 +3218,7 @@ mod tests {
 
     #[test]
     fn function_graph_to_flowspace_const_define_op_inlined_in_link_args() {
-        // ConstInt(7) defines slot 2. Slice 1b's
+        // ConstInt(7) defines ValueId(2). Slice 1b's
         // build_value_to_hlvalue_map inlines it into Link.args as
         // Hlvalue::Constant — Slice 1c's link translation must use that
         // mapping rather than wrapping the unused Variable.
@@ -3231,7 +3231,7 @@ mod tests {
                 kind: OpKind::ConstInt(7),
             }],
             exitswitch: None,
-            // Return slot 2, the ConstInt define.
+            // Return ValueId(2), the ConstInt define.
             exits: vec![link_to_returnblock(
                 vec![LinkArg::Value(graph.must_variable_at(2))],
                 graph.returnblock,
@@ -3276,9 +3276,9 @@ mod tests {
     fn function_graph_to_flowspace_exception_link_materialises_extravars_before_args() {
         // RPython checkgraph defines exception-link extravars before
         // validating link.args. Pyre's legacy graph represents those
-        // as fresh slots whose only definition site is the link.
+        // as fresh ValueIds whose only definition site is the link.
         let mut graph = LegacyGraph::new("canraise_with_extravars");
-        graph.set_next_value(12); // pre-allocate up to slot 11 for extravars
+        graph.set_next_value(12); // pre-allocate up to ValueId(11) for extravars
         let startblock = Block {
             id: graph.startblock,
             inputargs: block_inputargs(&mut graph, &[1, 2]),

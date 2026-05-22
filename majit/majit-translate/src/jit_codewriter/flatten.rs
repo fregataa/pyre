@@ -1895,7 +1895,7 @@ mod tests {
         let mut graph = FunctionGraph::new("canraise");
         let entry = graph.startblock;
         let call_result_var = graph.push_op_var(entry, OpKind::ConstInt(7), true).unwrap();
-        graph.push_op_var(entry, OpKind::Live, false);
+        graph.push_op(entry, OpKind::Live, false);
         let continuation = graph.create_block();
         let phi_var = graph.alloc_value_var();
         graph.push_inputarg_var(continuation, phi_var.clone());
@@ -1940,7 +1940,7 @@ mod tests {
         let mut graph = FunctionGraph::new("typed_canraise");
         let entry = graph.startblock;
         let call_result_var = graph.push_op_var(entry, OpKind::ConstInt(7), true).unwrap();
-        graph.push_op_var(entry, OpKind::Live, false);
+        graph.push_op(entry, OpKind::Live, false);
 
         let handler = graph.create_block();
         let handler_exc_type_var = graph.alloc_value_var();
@@ -1956,7 +1956,7 @@ mod tests {
         // Upstream invariant: typed catch handlers are not empty blocks.
         // Keep one op in the handler so the bare-reraise collapse remains
         // reserved for the empty exception block shape from flatten.py.
-        graph.push_op_var(handler, OpKind::Live, false);
+        graph.push_op(handler, OpKind::Live, false);
         graph.set_goto(handler, graph.returnblock, vec![handler_exc_value_var]);
 
         let (exc_block, last_exception_var, last_exc_value_var) = graph.exceptblock_arg_vars();
@@ -2104,7 +2104,7 @@ mod tests {
         let entry = graph.startblock;
         let lhs_var = graph.push_op_var(entry, OpKind::ConstInt(7), true).unwrap();
         let rhs_var = graph.push_op_var(entry, OpKind::ConstInt(2), true).unwrap();
-        graph.push_op_var(entry, OpKind::Live, false);
+        graph.push_op(entry, OpKind::Live, false);
         let lhs = graph.slot_of(&lhs_var).expect("lhs registered");
         let rhs = graph.slot_of(&rhs_var).expect("rhs registered");
         let sum_var = graph
@@ -2186,7 +2186,7 @@ mod tests {
         let entry = graph.startblock;
         let lhs_var = graph.push_op_var(entry, OpKind::ConstInt(7), true).unwrap();
         let rhs_var = graph.push_op_var(entry, OpKind::ConstInt(2), true).unwrap();
-        graph.push_op_var(entry, OpKind::Live, false);
+        graph.push_op(entry, OpKind::Live, false);
         let sum_var = graph
             .push_op_var(
                 entry,
@@ -2754,7 +2754,7 @@ mod tests {
         let mut graph = FunctionGraph::new("exc_chain");
         let entry = graph.startblock;
         let result_var = graph.push_op_var(entry, OpKind::ConstInt(7), true).unwrap();
-        graph.push_op_var(entry, OpKind::Live, false);
+        graph.push_op(entry, OpKind::Live, false);
 
         let make_handler = |graph: &mut FunctionGraph, marker_value: i64| {
             let block = graph.create_block();

@@ -30,7 +30,7 @@ use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
 use super::bytecode::HostCode;
 use crate::annotator::model::SomeValue;
-use crate::translator::rtyper::lltypesystem::lltype::_ptr;
+use crate::translator::rtyper::lltypesystem::lltype::{_ptr, Ptr};
 
 // RPython `Variable.annotation` holds a `SomeObject` subclass instance
 // (annotator/model.py:SomeObject). Rust stores `Option<Rc<SomeValue>>`
@@ -108,6 +108,31 @@ enum HostObjectKind {
         bases: Vec<HostObject>,
         members: Mutex<HashMap<String, ConstValue>>,
         reusable_prebuilt_instance: OnceLock<HostObject>,
+        /// lltype `Ptr(GcStruct(name, fields))` snapshot of the
+        /// underlying Rust `Item::Struct`, attached at walker time
+        /// from `flowspace/rust_source/register.rs::
+        /// build_host_class_from_struct`. The producer-side typed-
+        /// ref lift (`flowspace/rust_source/build_flow.rs::
+        /// annotate_typed_ptr_inputs`) reads this slot to materialize
+        /// `SomeValue::Ptr(SomePtr::new(ptr))` for `&Foo` entry inputs.
+        /// Raw-pointer entry inputs are deliberately not lifted through
+        /// this slot because the walker catalog only builds GC struct
+        /// pointers for typed references. Empty until the
+        /// walker successfully resolves every field via
+        /// `syn_primitive_to_lltype` — `OnceLock::get()` returning
+        /// `None` is the producer's signal to fall back to the
+        /// classdef-less `SomeInstance` shape.
+        ///
+        /// Mirrors the role of upstream `_ptrEntry.compute_annotation`
+        /// (`rpython/rtyper/lltypesystem/lltype.py:1513-1518`):
+        /// `typeOf(self.instance)` returns the cached `Ptr(T)` for
+        /// the instance's container type. Pyre's Rust adapter has
+        /// no Python instance to look at, so the producer-side
+        /// resolution path keys off the minted `HostObject` instead
+        /// — and the `Ptr` lives on the class object that the
+        /// HostObject represents, exactly as `Ptr.__new__`
+        /// (`lltype.py:721-739`) caches by container identity.
+        lltype_ptr: OnceLock<Ptr>,
     },
     /// Python module object. `members` 는 module dict — `getattr` 조회
     /// 대상. `LazyLock` singleton 의 Sync 요구를 만족하려고 `Mutex`.
@@ -497,6 +522,7 @@ impl HostObject {
                     bases,
                     members: Mutex::new(HashMap::new()),
                     reusable_prebuilt_instance: OnceLock::new(),
+                    lltype_ptr: OnceLock::new(),
                 },
             }),
         }
@@ -523,8 +549,42 @@ impl HostObject {
                     bases,
                     members: Mutex::new(members),
                     reusable_prebuilt_instance: OnceLock::new(),
+                    lltype_ptr: OnceLock::new(),
                 },
             }),
+        }
+    }
+
+    /// Walker-side write: attach the lltype `Ptr(GcStruct(...))`
+    /// derived from the underlying Rust `Item::Struct` to this
+    /// `HostObject::Class`. Idempotent for structurally equal
+    /// values; reports `Err(ptr)` on conflicting double-set (which
+    /// would indicate the walker fed two different field shapes for
+    /// the same class identity — a logic bug). Reads via
+    /// [`HostObject::lltype_ptr`].
+    ///
+    /// Returns `Err(ptr)` when the slot is already occupied —
+    /// callers may compare the existing value with their candidate
+    /// and treat structural equality as a no-op (mirrors how
+    /// `lltype.Ptr.__new__` returns the cached instance for an
+    /// already-seen container type).
+    pub fn set_lltype_ptr(&self, ptr: Ptr) -> Result<(), Ptr> {
+        match &self.inner.kind {
+            HostObjectKind::Class { lltype_ptr, .. } => lltype_ptr.set(ptr),
+            _ => Err(ptr),
+        }
+    }
+
+    /// Producer-side read: returns the lltype `Ptr` previously
+    /// attached to this `HostObject::Class` via
+    /// [`HostObject::set_lltype_ptr`]. `None` when the walker did
+    /// not synthesize one (struct's field shape outside the
+    /// primitive catalog — caller falls back to
+    /// `SomeInstance(classdef=None)`).
+    pub fn lltype_ptr(&self) -> Option<&Ptr> {
+        match &self.inner.kind {
+            HostObjectKind::Class { lltype_ptr, .. } => lltype_ptr.get(),
+            _ => None,
         }
     }
 
