@@ -631,6 +631,15 @@ struct SpamBlock {
     /// every `emit_*!` macro through `push_insn` the shadow becomes
     /// the authoritative source consumed by the post-walk flatten.
     per_block_ssarepr: Vec<super::flatten::Insn>,
+    /// Length of `per_block_ssarepr` at the moment the multi-pred
+    /// trampoline fallthrough fallback first appended `goto + ---`
+    /// (`emit_trampoline_for_multi_pred_link`).  Insns beyond this
+    /// index are trampoline-tail synthetic, not walker-emitted block
+    /// terminators.  Used by `rewrite_direct_terminator_tlabel` to
+    /// cap its reverse scan so a sibling link's explicit-jump rewrite
+    /// targets the original branch terminator instead of a previously
+    /// appended fallthrough `goto TLabel(target)`.
+    original_terminator_end: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -643,6 +652,7 @@ impl SpamBlockRef {
             framestate,
             dead: false,
             per_block_ssarepr: Vec::new(),
+            original_terminator_end: None,
         })))
     }
 
@@ -932,31 +942,23 @@ fn collect_cfg_coalesce_pairs(
 ///     source block's `per_block_ssarepr` BEFORE the terminator
 ///     (matches `flatten.py:154 self.insert_renamings(link)` which
 ///     runs BEFORE the recursive `make_bytecode_block(link.target)`).
-///   * Multi-exit blocks (POP_JUMP_IF_*, canraise switches): each
-///     exit's renamings are per-edge.  Walker's `goto_if_not` /
-///     `switch` ends the source block; we splice per-link renamings
-///     at the target's entry — but only when the target has a unique
-///     predecessor (otherwise multiple edges' renamings would collide
-///     at the same entry).
-///
-/// **Known incompleteness — multi-predecessor targets.**  Loop
-/// headers, merge blocks, and any other block with `in_degree > 1`
-/// SKIP renamings.  Upstream `flatten.py:306` runs
-/// `insert_renamings(link)` for EVERY link unconditionally, splicing
-/// each link's renamings between its own `Label(link)` and the
-/// recursive `make_bytecode_block(link.target)`.  Pyre's walker
-/// collapses every edge into the target block's entry label, so two
-/// incoming edges with different `(link.arg → target.inputarg)` color
-/// pairings would emit conflicting `<kind>_copy` ops at the same
-/// position.  Faithful upstream parity requires either per-link
-/// trampoline blocks or distinct per-link labels (T6 epic territory);
-/// until that lands, edges that need a copy through a
-/// multi-predecessor target are silently elided here.
+///   * Multi-exit blocks (POP_JUMP_IF_*, canraise switches) with a
+///     unique-predecessor target: splice renamings at the target's
+///     entry (`TargetAfterAnchor`).
+///   * Multi-exit blocks with a multi-predecessor target: emit a
+///     per-link trampoline via
+///     [`emit_trampoline_for_multi_pred_link`].  Mirrors upstream's
+///     `Label(link) + insert_renamings(link)` per-link emission by
+///     either rewriting the source terminator's TLabel onto a
+///     synthetic SpamBlock that runs the renamings then jumps to the
+///     original target (explicit-jump arm), or appending the
+///     renamings + explicit goto to the source's per-block
+///     accumulator (fall-through arm).
 fn walker_post_walk_insert_renamings(
-    graph: &super::flow::FunctionGraph,
+    graph: &mut super::flow::FunctionGraph,
     walker_slot_for_variable: &[Option<u16>],
     regallocs: &[super::regalloc::GraphAllocationResult; 3],
-    all_walker_blocks: &[SpamBlockRef],
+    all_walker_blocks: &mut Vec<SpamBlockRef>,
     walker_pc_live_marker_pos: &mut [Vec<(SpamBlockRef, usize)>],
 ) {
     // Variable → walker slot resolver: bridge first, then graph
@@ -1001,16 +1003,16 @@ fn walker_post_walk_insert_renamings(
         }
     }
 
-    // Pre-compute in-degree per reachable block (number of incoming
-    // links) to identify unique-predecessor targets for multi-exit
-    // insert_renamings.  Multi-predecessor targets (loop headers,
-    // merge points) need per-link trampoline blocks because canonical
-    // emits each link's renamings between `Label(link)` and
-    // `Label(target_block)`, but pyre's walker collapses link labels
-    // to the target's `pc{N}`, losing the per-edge distinction at
-    // the target's entry.  Splicing per-link renamings at a
-    // multi-predecessor target would mix the renamings of different
-    // edges, breaking semantics.
+    // Pre-compute in-degree per reachable block.  Multi-exit links
+    // dispatch on in_degree of the link's target:
+    //   * in_degree == 1: splice renamings into target's entry via
+    //     `TargetAfterAnchor` (safe since only this edge reaches the
+    //     target's entry label).
+    //   * in_degree > 1: synthesize a per-link trampoline via
+    //     `emit_trampoline_for_multi_pred_link` (mirroring
+    //     `flatten.py:175-205` per-link `Label + insert_renamings`
+    //     emission).  TargetAfterAnchor would otherwise mix
+    //     renamings from multiple incoming edges at the same entry.
     let mut in_degree: Vec<(super::flow::BlockRef, usize)> = Vec::new();
     for b in &reachable {
         for exit in &b.borrow().exits {
@@ -1052,14 +1054,20 @@ fn walker_post_walk_insert_renamings(
     }
 
     // Multi-exit blocks (POP_JUMP_IF_*, canraise switches): each
-    // exit's renamings are per-edge.  Walker's goto_if_not / switch
+    // exit's renamings are per-edge.  Walker's `goto_if_not` / switch
     // ends the source block; canonical emits each link's renamings
-    // between `Label(link)` and the target block's body.  For pyre,
-    // splice per-link renamings at the target's entry — but only
-    // when target has unique predecessor (otherwise multiple edges'
-    // renamings would collide at the same entry).  Multi-predecessor
-    // targets remain canonical_unmatched until walker grows distinct
-    // per-link labels (T6 epic) or per-link trampoline blocks.
+    // between `Label(link)` and the target block's body
+    // (`flatten.py:175-205 insert_exits`).  Pyre splice strategy:
+    //
+    //   * unique-predecessor target — splice renamings at target's
+    //     entry via `TargetAfterAnchor` (safe because only the link's
+    //     edge reaches the target's entry label);
+    //   * multi-predecessor target — synthesize a per-link trampoline
+    //     via [`emit_trampoline_for_multi_pred_link`].  Explicit-jump
+    //     arm rewrites the source terminator's TLabel + appends a
+    //     synthetic SpamBlock; fall-through arm appends renamings +
+    //     explicit `goto` to the source's per-block accumulator.
+    let mut trampoline_counter: usize = 0;
     for block_ref in &reachable {
         let exits = block_ref.borrow().exits.clone();
         if exits.len() < 2 {
@@ -1070,6 +1078,35 @@ fn walker_post_walk_insert_renamings(
                 continue;
             };
             if in_degree_of(&target_ref) > 1 {
+                let outcome = emit_trampoline_for_multi_pred_link(
+                    graph,
+                    block_ref,
+                    &link_ref,
+                    &get_color,
+                    all_walker_blocks,
+                    &mut trampoline_counter,
+                );
+                match outcome {
+                    TrampolineOutcome::Emitted { .. } | TrampolineOutcome::NoPairs => {}
+                    TrampolineOutcome::RewriteFailed => {
+                        let pairs = collect_distinct_renaming_pairs(&link_ref, &get_color);
+                        let target_label = super::flatten::block_label_name(&target_ref);
+                        let pair_strs: Vec<String> = pairs
+                            .iter()
+                            .map(|(src, dst, kind)| format!("{}:{}->{}", kind.as_str(), src, dst))
+                            .collect();
+                        panic!(
+                            "walker_post_walk_insert_renamings: trampoline rewrite \
+                             failed for graph={} target_label={} pairs=[{}] — \
+                             source terminator carries no TLabel matching the \
+                             target's block-identity name nor a SwitchDictDescr \
+                             entry pointing at it",
+                            graph.name,
+                            target_label,
+                            pair_strs.join(","),
+                        );
+                    }
+                }
                 continue;
             }
             if let Some(shift) = emit_link_renamings_into_block(
@@ -1083,6 +1120,417 @@ fn walker_post_walk_insert_renamings(
             }
         }
     }
+}
+
+/// Outcome of [`emit_trampoline_for_multi_pred_link`].  `Emitted`
+/// carries the new trampoline SpamBlock plus the byte length of its
+/// renaming body (excluding `Label` / trailing `goto`+`---`) so the
+/// caller can update its diagnostic counters.  `NoPairs` means the
+/// link's `link.args ↔ target.inputargs` mapping reduces to identity
+/// after `get_color` (nothing to copy).  `RewriteFailed` means
+/// [`rewrite_source_terminator_for_link`] could not locate a matching
+/// `TLabel` — neither a direct `Insn::Op` arg nor a
+/// `SwitchDictDescr._labels` entry pointed at the target's block
+/// label.  In the explicit-jump path this would mean the source
+/// terminator's TLabel was already rewritten by an earlier link
+/// (multi-fanout from the same source) or that the source's exit
+/// shape doesn't carry a TLabel for this link (fall-through arm —
+/// handled in the helper's append fallback below).
+enum TrampolineOutcome {
+    Emitted { spam: SpamBlockRef, body_len: usize },
+    NoPairs,
+    RewriteFailed,
+}
+
+/// `flatten.py:175-205` per-link `Label(link)` + `insert_renamings`
+/// emission ported as a synthetic trampoline SpamBlock for the
+/// multi-predecessor case.
+///
+/// Walker terminators (`goto_if_not`, `goto_if_not_int_is_zero`,
+/// `switch`) carry an `Operand::TLabel(block_label_name(target))`
+/// pointing directly at the target block's identity label.  When the
+/// target has multiple predecessors, upstream emits per-link renamings
+/// between `Label(link)` and the target block body; pyre's walker
+/// collapses link labels into the target's block label, so per-edge
+/// renamings have no place to land.  This helper restores upstream's
+/// per-link emission by:
+///
+/// 1. Collecting `(src_color, dst_color, kind)` pairs for the link
+///    (same logic as [`emit_link_renamings_into_block`]).
+/// 2. Allocating a unique trampoline label name.
+/// 3. Rewriting the source SpamBlock's terminator TLabel from the
+///    target's block-identity name to the trampoline name.
+/// 4. Building a new SpamBlock holding
+///    `Label(<trampoline>) ; <ref_copy/push/pop ops> ;
+///     goto TLabel(<original target>) ; ---` and appending it to
+///    `all_walker_blocks` (its position is after the DFS-matched
+///    prefix because the synthetic flow::Block is not reached by
+///    `graph.iterblocks()`).
+fn emit_trampoline_for_multi_pred_link<F>(
+    graph: &mut super::flow::FunctionGraph,
+    source_block: &super::flow::BlockRef,
+    link_ref: &super::flow::LinkRef,
+    get_color: &F,
+    all_walker_blocks: &mut Vec<SpamBlockRef>,
+    trampoline_counter: &mut usize,
+) -> TrampolineOutcome
+where
+    F: Fn(&super::flow::Variable) -> u16,
+{
+    let pairs = collect_distinct_renaming_pairs(link_ref, get_color);
+    let body = build_renaming_insns(pairs);
+    if body.is_empty() {
+        return TrampolineOutcome::NoPairs;
+    }
+    let target_block = match link_ref.borrow().target.clone() {
+        Some(t) => t,
+        None => return TrampolineOutcome::NoPairs,
+    };
+
+    // Locate the source SpamBlock for the in-place terminator rewrite.
+    let Some(source_spam) = all_walker_blocks
+        .iter()
+        .find(|s| !s.dead() && s.block() == *source_block)
+        .cloned()
+    else {
+        return TrampolineOutcome::RewriteFailed;
+    };
+    let target_label = super::flatten::block_label_name(&target_block);
+    let trampoline_name = format!("epsilon3_link_{}", *trampoline_counter);
+    match rewrite_source_terminator_for_link(
+        &source_spam,
+        link_ref,
+        &target_label,
+        &trampoline_name,
+    ) {
+        TerminatorRewrite::Rewritten => {
+            *trampoline_counter += 1;
+            // Explicit-jump arm: the source's terminator (`goto_if_not`,
+            // `goto_if_not_int_is_zero`, `switch`, ...) carried this
+            // link's branch target.  Synthesize a new SpamBlock for the
+            // trampoline so the rewritten terminator lands at
+            // `Label(<trampoline>)`, runs the ref_copies, then jumps to
+            // the original target.  The block has no graph reachability,
+            // so the post-walk DFS reorder leaves it in append-order at
+            // the tail of `all_walker_blocks`.
+            let synthetic_block = graph.new_block(Vec::new());
+            let trampoline_spam = SpamBlockRef::new(synthetic_block, None);
+            trampoline_spam.push_insn(super::flatten::Insn::Label(super::flatten::Label::new(
+                trampoline_name,
+            )));
+            let body_len = body.len();
+            for insn in body {
+                trampoline_spam.push_insn(insn);
+            }
+            trampoline_spam.push_insn(super::flatten::Insn::op(
+                "goto",
+                vec![super::flatten::Operand::TLabel(
+                    super::flatten::TLabel::new(target_label),
+                )],
+            ));
+            trampoline_spam.push_insn(super::flatten::Insn::Unreachable);
+            all_walker_blocks.push(trampoline_spam.clone());
+            return TrampolineOutcome::Emitted {
+                spam: trampoline_spam,
+                body_len,
+            };
+        }
+        TerminatorRewrite::FallthroughOrDefault => {}
+        TerminatorRewrite::Missing => return TrampolineOutcome::RewriteFailed,
+    }
+
+    // Fall-through arm fallback: when no terminator TLabel matched the
+    // target's block label, the link is the fall-through arm of a
+    // multi-exit source (`flatten.py:264 make_link(linktrue)` runs
+    // immediately after `goto_if_not` and inlines the renamings before
+    // the target block body).  Pyre's walker has no per-link `Label`
+    // for the fall-through arm — execution drops past the terminator
+    // straight into the next SpamBlock at byte-stream level.  Append
+    // the renamings AFTER the source's terminator together with an
+    // explicit `goto TLabel(<target>)` + `---` tail so the target is
+    // reached deterministically regardless of post-walk DFS reorder.
+    // `strip_walker_block_boundary_goto` elides the explicit goto when
+    // the immediate next non-empty block opens with the target label.
+    let body_len = body.len();
+    let mut spam_borrow = source_spam.0.borrow_mut();
+    // Codex P1 (PR #89): cap a future explicit-jump rewrite's reverse
+    // scan at the pre-append tail so a sibling link to the same target
+    // retargets the ORIGINAL branch terminator, not the goto we are
+    // about to append here.  Record only on the first append — later
+    // appends fall inside the already-tracked trampoline region.
+    if spam_borrow.original_terminator_end.is_none() {
+        spam_borrow.original_terminator_end = Some(spam_borrow.per_block_ssarepr.len());
+    }
+    let insns = &mut spam_borrow.per_block_ssarepr;
+    for insn in body {
+        insns.push(insn);
+    }
+    insns.push(super::flatten::Insn::op(
+        "goto",
+        vec![super::flatten::Operand::TLabel(
+            super::flatten::TLabel::new(target_label),
+        )],
+    ));
+    insns.push(super::flatten::Insn::Unreachable);
+    drop(spam_borrow);
+    TrampolineOutcome::Emitted {
+        spam: source_spam,
+        body_len,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminatorRewrite {
+    Rewritten,
+    FallthroughOrDefault,
+    Missing,
+}
+
+/// Rewrite the source SpamBlock's terminator for one concrete
+/// flowspace `Link`.  PyPy emits `TLabel(linkfalse)` for bool false
+/// branches and `SwitchDictDescr._labels.append((key, TLabel(switch)))`
+/// for switch cases (`flatten.py:240-304`); matching only the target
+/// block label is not link-specific enough when multiple exits from
+/// the same source converge on the same target block.
+fn rewrite_source_terminator_for_link(
+    source_spam: &SpamBlockRef,
+    link_ref: &super::flow::LinkRef,
+    target_label: &str,
+    to: &str,
+) -> TerminatorRewrite {
+    let link = link_ref.borrow();
+    if is_default_link_exitcase(&link.exitcase) {
+        return TerminatorRewrite::FallthroughOrDefault;
+    }
+    match &link.llexitcase {
+        Some(super::flow::FlowValue::Constant(super::flow::Constant {
+            value: super::flow::ConstantValue::Bool(false),
+            ..
+        })) => {
+            if rewrite_switch_dict_label_for_key(source_spam, 0, to) {
+                TerminatorRewrite::Rewritten
+            } else if rewrite_direct_terminator_tlabel(source_spam, target_label, to) {
+                TerminatorRewrite::Rewritten
+            } else {
+                TerminatorRewrite::Missing
+            }
+        }
+        Some(super::flow::FlowValue::Constant(super::flow::Constant {
+            value: super::flow::ConstantValue::Bool(true),
+            ..
+        })) => {
+            if rewrite_switch_dict_label_for_key(source_spam, 1, to) {
+                TerminatorRewrite::Rewritten
+            } else {
+                TerminatorRewrite::FallthroughOrDefault
+            }
+        }
+        Some(super::flow::FlowValue::Constant(super::flow::Constant {
+            value: super::flow::ConstantValue::Signed(key),
+            ..
+        })) => {
+            if rewrite_switch_dict_label_for_key(source_spam, *key, to) {
+                TerminatorRewrite::Rewritten
+            } else {
+                TerminatorRewrite::Missing
+            }
+        }
+        _ => {
+            if rewrite_direct_terminator_tlabel(source_spam, target_label, to) {
+                TerminatorRewrite::Rewritten
+            } else {
+                TerminatorRewrite::Missing
+            }
+        }
+    }
+}
+
+fn is_default_link_exitcase(exitcase: &Option<super::flow::FlowValue>) -> bool {
+    matches!(
+        exitcase,
+        Some(super::flow::FlowValue::Constant(super::flow::Constant {
+            value: super::flow::ConstantValue::Str(value),
+            ..
+        })) if value == "default"
+    )
+}
+
+/// Rewrite a direct branch target (`goto_if_not`, `goto`, exception
+/// mismatch branches) from the target block label to the trampoline.
+/// Reverse-scans so the terminator is considered before any earlier op.
+///
+/// Codex P1 (PR #89): when `original_terminator_end` is set, the
+/// reverse scan stops there.  The fallthrough fallback in
+/// [`emit_trampoline_for_multi_pred_link`] appends `body + goto
+/// TLabel(target) + Unreachable` past that anchor; without the cap a
+/// sibling link whose explicit-jump rewrite shares the same target
+/// would retarget the appended fallthrough goto instead of the
+/// original `goto_if_not`/`goto`/exception-mismatch branch terminator.
+fn rewrite_direct_terminator_tlabel(source_spam: &SpamBlockRef, from: &str, to: &str) -> bool {
+    let mut spam_borrow = source_spam.0.borrow_mut();
+    let upper = spam_borrow
+        .original_terminator_end
+        .unwrap_or(spam_borrow.per_block_ssarepr.len());
+    for insn in spam_borrow.per_block_ssarepr[..upper].iter_mut().rev() {
+        if let super::flatten::Insn::Op { args, .. } = insn {
+            for arg in args.iter_mut() {
+                if let super::flatten::Operand::TLabel(tl) = arg {
+                    if tl.name == from {
+                        tl.name = to.to_string();
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Rewrite a `SwitchDictDescr._labels` entry by its PyPy switch key,
+/// not by target label.  The key is the edge identity in
+/// `flatten.py:294-298`; using the target label would conflate two
+/// different switch cases that jump to the same block with different
+/// renamings.  `Rc::make_mut` keeps the mutation local if a descr is
+/// shared.
+fn rewrite_switch_dict_label_for_key(source_spam: &SpamBlockRef, key: i64, to: &str) -> bool {
+    let mut spam_borrow = source_spam.0.borrow_mut();
+    for insn in spam_borrow.per_block_ssarepr.iter_mut().rev() {
+        if let super::flatten::Insn::Op { args, .. } = insn {
+            for arg in args.iter_mut() {
+                if let super::flatten::Operand::Descr(descr_rc) = arg {
+                    if let super::flatten::DescrOperand::SwitchDict(_) = descr_rc.as_ref() {
+                        let descr_mut = std::rc::Rc::make_mut(descr_rc);
+                        if let super::flatten::DescrOperand::SwitchDict(sw) = descr_mut {
+                            for (label_key, tl) in sw.labels.iter_mut() {
+                                if *label_key == key {
+                                    tl.name = to.to_string();
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// `flatten.py:312-333 insert_renamings` per-kind emission.  Takes
+/// the distinct-color `(src, dst, kind)` pairs from
+/// [`collect_distinct_renaming_pairs`], groups them per kind in
+/// flatten.py:316-318 order, and lowers each kind via
+/// `reorder_renaming_list` (cycle-aware `<kind>_push` /
+/// `<kind>_pop`).  Returns an empty vec when `pairs` is empty (the
+/// caller treats this as "nothing to splice").
+fn build_renaming_insns(pairs: Vec<(u16, u16, Kind)>) -> Vec<super::flatten::Insn> {
+    if pairs.is_empty() {
+        return Vec::new();
+    }
+    let mut sorted = pairs;
+    // `flatten.py:312 lst.sort(key=lambda(v, w): w.index)`.
+    sorted.sort_by_key(|(_, dst, _)| *dst);
+    // `flatten.py:316-318` group by kind; `[T; 3]` indexed by
+    // `Kind::index()` per [[feedback-no-hashmap-ever]].
+    let mut renamings: [(Vec<u16>, Vec<u16>); 3] = [
+        (Vec::new(), Vec::new()),
+        (Vec::new(), Vec::new()),
+        (Vec::new(), Vec::new()),
+    ];
+    for (src, dst, kind) in sorted {
+        let bucket = &mut renamings[kind.index()];
+        bucket.0.push(src);
+        bucket.1.push(dst);
+    }
+    // `flatten.py:319-333` per-kind emit via `reorder_renaming_list`.
+    let mut emitted: Vec<super::flatten::Insn> = Vec::new();
+    for &kind in &Kind::ALL {
+        let (frm, to) = &renamings[kind.index()];
+        if frm.is_empty() {
+            continue;
+        }
+        for (src, dst) in majit_translate::jit_codewriter::flatten::reorder_renaming_list(frm, to) {
+            match (src, dst) {
+                (Some(src), Some(dst)) => {
+                    emitted.push(super::flatten::Insn::op_with_result(
+                        format!("{}_copy", kind.as_str()),
+                        vec![super::flatten::Operand::reg(kind, src)],
+                        super::flatten::Register::new(kind, dst),
+                    ));
+                }
+                (Some(src), None) => {
+                    emitted.push(super::flatten::Insn::op(
+                        format!("{}_push", kind.as_str()),
+                        vec![super::flatten::Operand::reg(kind, src)],
+                    ));
+                }
+                (None, Some(dst)) => {
+                    emitted.push(super::flatten::Insn::op_with_result(
+                        format!("{}_pop", kind.as_str()),
+                        Vec::new(),
+                        super::flatten::Register::new(kind, dst),
+                    ));
+                }
+                (None, None) => unreachable!(
+                    "reorder_renaming_list never yields (None, None) per majit/flatten.rs"
+                ),
+            }
+        }
+    }
+    emitted
+}
+
+/// `flatten.py:308-311 insert_renamings` pair extraction restricted
+/// to collecting distinct-color pairs that would actually emit a
+/// `<kind>_copy` / `<kind>_push` / `<kind>_pop`.  Skips
+/// `last_exception` / `last_exc_value` (routed through
+/// `generate_last_exc`, `flatten.py:336-347`) and pairs whose
+/// `src_color == dst_color` (no-op copies).  Skips `is_final &&
+/// exits.is_empty()` targets (returnblock/exceptblock) where the
+/// walker's RETURN_VALUE / RAISE handlers already emit `*_return` /
+/// `raise` referencing the source slot directly.
+fn collect_distinct_renaming_pairs<F>(
+    link_ref: &super::flow::LinkRef,
+    get_color: &F,
+) -> Vec<(u16, u16, Kind)>
+where
+    F: Fn(&super::flow::Variable) -> u16,
+{
+    let link_borrow = link_ref.borrow();
+    let Some(target_ref) = link_borrow.target.clone() else {
+        return Vec::new();
+    };
+    let target_borrow = target_ref.borrow();
+    if link_borrow.args.len() != target_borrow.inputargs.len() {
+        return Vec::new();
+    }
+    if target_borrow.is_final && target_borrow.exits.is_empty() {
+        return Vec::new();
+    }
+    let mut pairs = Vec::new();
+    for (i, arg) in link_borrow.args.iter().enumerate() {
+        let Some(src_value) = arg.as_ref() else {
+            continue;
+        };
+        let Some(src_variable) = src_value.as_variable() else {
+            continue;
+        };
+        let Some(dst_variable) = target_borrow.inputargs[i].as_variable() else {
+            continue;
+        };
+        if Some(src_variable) == link_borrow.last_exception
+            || Some(src_variable) == link_borrow.last_exc_value
+        {
+            continue;
+        }
+        let src_color = get_color(&src_variable);
+        let dst_color = get_color(&dst_variable);
+        if src_color != dst_color {
+            let kind = dst_variable.kind.unwrap_or(Kind::Ref);
+            pairs.push((src_color, dst_color, kind));
+        }
+    }
+    pairs
 }
 
 /// Apply a splice's offset shift to the walker-tracked PC anchor /
@@ -1139,111 +1587,9 @@ fn emit_link_renamings_into_block<F>(
 where
     F: Fn(&super::flow::Variable) -> u16,
 {
-    let link_borrow = link_ref.borrow();
-    let target_ref = link_borrow.target.clone()?;
-    let target_borrow = target_ref.borrow();
-    if link_borrow.args.len() != target_borrow.inputargs.len() {
-        return None;
-    }
-    // Skip blocks whose target is `returnblock`/`exceptblock`
-    // (`is_final && exits.is_empty()`).  Walker's RETURN_VALUE /
-    // RAISE handlers already emit `ref_return` / `raise` INLINE
-    // at the source block referencing the source stack-slot
-    // color (walker NEW-DEVIATION: upstream defers the return op
-    // to `make_return(target.inputargs)` AFTER insert_renamings
-    // copies link.args → target.inputargs).  Splicing a
-    // `ref_copy stack_color → target_inputarg_color` BEFORE
-    // walker's existing `ref_return stack_color` leaves walker's
-    // terminator reading the un-copied source slot and breaks
-    // SSA allocator coalescing on trivial return functions.
-    if target_borrow.is_final && target_borrow.exits.is_empty() {
-        return None;
-    }
-
-    // `flatten.py:308-311` pair extraction.  Skip pairs whose
-    // src is `last_exception` / `last_exc_value` (they route
-    // through `generate_last_exc` separately, flatten.py:336-347).
-    let mut pairs: Vec<(u16, u16, Kind)> = Vec::new();
-    for (i, arg) in link_borrow.args.iter().enumerate() {
-        let Some(src_value) = arg.as_ref() else {
-            continue;
-        };
-        let Some(src_variable) = src_value.as_variable() else {
-            continue;
-        };
-        let Some(dst_variable) = target_borrow.inputargs[i].as_variable() else {
-            continue;
-        };
-        if Some(src_variable) == link_borrow.last_exception
-            || Some(src_variable) == link_borrow.last_exc_value
-        {
-            continue;
-        }
-        let src_color = get_color(&src_variable);
-        let dst_color = get_color(&dst_variable);
-        let kind = dst_variable.kind.unwrap_or(Kind::Ref);
-        if src_color != dst_color {
-            pairs.push((src_color, dst_color, kind));
-        }
-    }
-    drop(target_borrow);
-    drop(link_borrow);
-
-    if pairs.is_empty() {
-        return None;
-    }
-    // `flatten.py:312 lst.sort(key=lambda(v, w): w.index)`.
-    pairs.sort_by_key(|(_, dst, _)| *dst);
-
-    // `flatten.py:316-318` group by kind; `[T; 3]` indexed by
-    // `Kind::index()` per [[feedback-no-hashmap-ever]].
-    let mut renamings: [(Vec<u16>, Vec<u16>); 3] = [
-        (Vec::new(), Vec::new()),
-        (Vec::new(), Vec::new()),
-        (Vec::new(), Vec::new()),
-    ];
-    for (src, dst, kind) in pairs {
-        let bucket = &mut renamings[kind.index()];
-        bucket.0.push(src);
-        bucket.1.push(dst);
-    }
-
-    // `flatten.py:319-333` per-kind emit via `reorder_renaming_list`.
-    let mut emitted: Vec<super::flatten::Insn> = Vec::new();
-    for &kind in &Kind::ALL {
-        let (frm, to) = &renamings[kind.index()];
-        if frm.is_empty() {
-            continue;
-        }
-        for (src, dst) in majit_translate::jit_codewriter::flatten::reorder_renaming_list(frm, to) {
-            match (src, dst) {
-                (Some(src), Some(dst)) => {
-                    emitted.push(super::flatten::Insn::op_with_result(
-                        format!("{}_copy", kind.as_str()),
-                        vec![super::flatten::Operand::reg(kind, src)],
-                        super::flatten::Register::new(kind, dst),
-                    ));
-                }
-                (Some(src), None) => {
-                    emitted.push(super::flatten::Insn::op(
-                        format!("{}_push", kind.as_str()),
-                        vec![super::flatten::Operand::reg(kind, src)],
-                    ));
-                }
-                (None, Some(dst)) => {
-                    emitted.push(super::flatten::Insn::op_with_result(
-                        format!("{}_pop", kind.as_str()),
-                        Vec::new(),
-                        super::flatten::Register::new(kind, dst),
-                    ));
-                }
-                (None, None) => unreachable!(
-                    "reorder_renaming_list never yields (None, None) per majit/flatten.rs"
-                ),
-            }
-        }
-    }
-
+    let target_ref = link_ref.borrow().target.clone()?;
+    let pairs = collect_distinct_renaming_pairs(link_ref, get_color);
+    let emitted = build_renaming_insns(pairs);
     if emitted.is_empty() {
         return None;
     }
@@ -8599,10 +8945,10 @@ impl CodeWriter {
             // injection between source-block terminator and each
             // target-block Label — separate future slice.
             walker_post_walk_insert_renamings(
-                &graph,
+                &mut graph,
                 &walker_slot_for_variable,
                 &graph_regallocs,
-                &all_walker_blocks,
+                &mut all_walker_blocks,
                 &mut walker_pc_live_marker_pos,
             );
             // Reorder all_walker_blocks per `graph.iterblocks()` DFS
@@ -9473,12 +9819,11 @@ mod tests {
     use crate::jit::assembler::ArcByPtr;
     use crate::jit::flatten::{Insn, Kind, Operand, Register, SSARepr};
     use crate::jit::flow::{
-        Block, Constant, ExitSwitch, FlowValue, FunctionGraph, Link, LinkRef, SpaceOperationArg,
-        Variable, VariableId, c_last_exception,
+        Block, Constant, ExitSwitch, FlowValue, FunctionGraph, Link, SpaceOperationArg, Variable,
+        VariableId, c_last_exception,
     };
     use pyre_interpreter::bytecode::{CodeObject, ConstantData};
     use pyre_interpreter::compile_exec;
-    use std::collections::HashMap;
     use std::sync::Arc;
 
     /// Tail-strip pass folds a `goto + Unreachable` tail into the
@@ -11157,5 +11502,139 @@ mod tests {
         );
         assert!(mainjitcode.is_populated());
         assert_eq!(mainjitcode.jitcode.jitdriver_sd(), Some(0));
+    }
+
+    /// Bool branches must be selected by their `llexitcase`, not by
+    /// target block label.  If true and false both target the same
+    /// block, only the false link owns the `goto_if_not` TLabel; the
+    /// true link is PyPy's fallthrough arm (`flatten.py:260-267`).
+    #[test]
+    fn rewrite_source_terminator_for_link_keeps_bool_true_fallthrough() {
+        use super::super::flatten::{Insn, Operand, TLabel};
+
+        let target_name = "block_target_42".to_string();
+        let goto_if_not = Insn::op(
+            "goto_if_not",
+            vec![
+                Operand::reg(Kind::Int, 5),
+                Operand::TLabel(TLabel::new(target_name.clone())),
+            ],
+        );
+        let source = super::SpamBlockRef::new(super::super::flow::Block::shared(Vec::new()), None);
+        source.push_insn(Insn::live(Vec::new()));
+        source.push_insn(goto_if_not);
+
+        let target = super::super::flow::Block::shared(Vec::new());
+        let true_link = super::super::flow::Link::new(
+            Vec::new(),
+            Some(target.clone()),
+            Some(super::super::flow::Constant::bool(true).into()),
+        )
+        .with_llexitcase(super::super::flow::Constant::bool(true).into())
+        .into_ref();
+        let false_link = super::super::flow::Link::new(
+            Vec::new(),
+            Some(target),
+            Some(super::super::flow::Constant::bool(false).into()),
+        )
+        .with_llexitcase(super::super::flow::Constant::bool(false).into())
+        .into_ref();
+
+        let true_result = super::rewrite_source_terminator_for_link(
+            &source,
+            &true_link,
+            &target_name,
+            "epsilon3_link_true",
+        );
+        assert_eq!(true_result, super::TerminatorRewrite::FallthroughOrDefault);
+        assert!(
+            matches!(&source.per_block_ssarepr()[1],
+                Insn::Op { args, .. }
+                    if args.iter().any(|a| matches!(a, Operand::TLabel(t) if t.name == target_name))),
+            "true-link fallthrough must not steal the false branch label",
+        );
+
+        let false_result = super::rewrite_source_terminator_for_link(
+            &source,
+            &false_link,
+            &target_name,
+            "epsilon3_link_false",
+        );
+        assert_eq!(false_result, super::TerminatorRewrite::Rewritten);
+        assert!(
+            matches!(&source.per_block_ssarepr()[1],
+                Insn::Op { args, .. }
+                    if args.iter().any(|a| matches!(a, Operand::TLabel(t) if t.name == "epsilon3_link_false"))),
+            "false link must rewrite the explicit goto_if_not label",
+        );
+    }
+
+    /// Switch branches must be selected by `(key, TLabel(link))`.
+    /// Two different switch cases may jump to the same target block
+    /// with different renamings, so target-label matching alone can
+    /// attach the trampoline to the wrong case.
+    #[test]
+    fn rewrite_source_terminator_for_link_rewrites_switch_by_key() {
+        use super::super::flatten::{DescrOperand, Insn, Operand, SwitchDictDescr, TLabel};
+        use std::rc::Rc;
+
+        let target_name = "block_switch_target_7".to_string();
+        let trampoline_name = "epsilon3_link_case3".to_string();
+
+        let mut sw = SwitchDictDescr::new();
+        sw.labels.push((1, TLabel::new(target_name.clone())));
+        sw.labels.push((3, TLabel::new(target_name.clone())));
+
+        let switch_op = Insn::op(
+            "switch",
+            vec![
+                Operand::reg(Kind::Int, 11),
+                Operand::Descr(Rc::new(DescrOperand::SwitchDict(sw))),
+            ],
+        );
+        let source = super::SpamBlockRef::new(super::super::flow::Block::shared(Vec::new()), None);
+        source.push_insn(switch_op);
+
+        let target = super::super::flow::Block::shared(Vec::new());
+        let link_case3 = super::super::flow::Link::new(
+            Vec::new(),
+            Some(target),
+            Some(super::super::flow::Constant::signed(3).into()),
+        )
+        .with_llexitcase(super::super::flow::Constant::signed(3).into())
+        .into_ref();
+
+        let rewrote = super::rewrite_source_terminator_for_link(
+            &source,
+            &link_case3,
+            &target_name,
+            &trampoline_name,
+        );
+        assert_eq!(rewrote, super::TerminatorRewrite::Rewritten);
+
+        let insns = source.per_block_ssarepr();
+        let Insn::Op { args, .. } = &insns[0] else {
+            panic!("expected single switch op");
+        };
+        let descr = args.iter().find_map(|a| match a {
+            Operand::Descr(d) => Some(d.clone()),
+            _ => None,
+        });
+        let descr = descr.expect("switch op must carry a Descr arg");
+        let DescrOperand::SwitchDict(sw) = descr.as_ref() else {
+            panic!("expected SwitchDict descr");
+        };
+        let rewritten = sw
+            .labels
+            .iter()
+            .find(|(k, _)| *k == 3)
+            .map(|(_, tl)| tl.name.clone());
+        assert_eq!(rewritten.as_deref(), Some(trampoline_name.as_str()));
+        let untouched_case1 = sw
+            .labels
+            .iter()
+            .find(|(k, _)| *k == 1)
+            .map(|(_, tl)| tl.name.clone());
+        assert_eq!(untouched_case1.as_deref(), Some(target_name.as_str()));
     }
 }

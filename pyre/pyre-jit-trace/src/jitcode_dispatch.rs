@@ -322,14 +322,39 @@ pub struct WalkContext<'frame, 'static_a: 'frame> {
     /// and enforces the lock-step contract so re-enabling walker-side
     /// GUARD_CLASS is sound.
     ///
-    /// Int / Float bank concrete shadow is deferred — those banks are
-    /// color-indexed rather than semantic-slot indexed, so they need a
-    /// codewriter-side color↔slot mapping that this Step doesn't
-    /// build. `goto_if_not/iL` and `switch/id` (which consume
-    /// concrete Int) wait on that follow-up slice.
+    /// **Companion bank** `concrete_registers_i` below now exists as a
+    /// skeleton field (Task #75.A) so handlers can plumb concrete int
+    /// shadow without changing the WalkContext signature again.  Seed
+    /// wiring (real concrete int values at trace entry + per-handler
+    /// writes for `int_*` arithmetic) is deferred to Task #75.B and
+    /// later slices.  Until then every callsite passes `&mut []`.
+    ///
+    /// `goto_if_not/iL` and `switch/id` (which consume concrete Int)
+    /// continue to fall back to the strict-mode fail-loud path until
+    /// `concrete_registers_i` is populated.
     ///
     /// Reference: [[project-tracer-m4-cutover-decision]] memory.
     pub concrete_registers_r: &'frame mut [ConcreteValue],
+    /// **Skeleton — Task #75.A.**  Concrete shadow mirror for
+    /// `registers_i`.  Color-indexed (not semantic-slot indexed like
+    /// `concrete_registers_r`) because pyre's Int bank has no
+    /// "semantic-slot" abstraction — Int registers are post-regalloc
+    /// colors directly.  Length equals `registers_i.len()` when
+    /// populated, or `0` when callsites pass `&mut []`.
+    ///
+    /// Future invariant (Task #75.B+): every walker handler that writes
+    /// `registers_i[dst]` MUST also write `concrete_registers_i[dst]`
+    /// in lock-step, mirroring the Ref-bank contract above.  A future
+    /// `write_int_reg` helper will enforce this once seeding lands.
+    ///
+    /// Consumers (`dispatch_goto_if_not/iL`, `switch/id`) currently
+    /// fall back to the strict-mode fail-loud path; they will switch
+    /// to reading `concrete_registers_i[src]` for the test-direction
+    /// fold once Task #75.B populates seeds.
+    ///
+    /// Reference: [[project-tracer-m4-cutover-decision]] memory,
+    /// "Architectural blocker for the Int-bank shadow" section.
+    pub concrete_registers_i: &'frame mut [ConcreteValue],
     /// Descr pool for `d`-coded operands. Each `d` argcode in the
     /// jitcode bytes resolves to `descr_refs[2-byte LE index]`.
     /// RPython `Assembler.descrs` (`assembler.py:23`) +
@@ -1038,10 +1063,123 @@ fn write_ref_reg(
     // a dst-in-bounds OpRef write implies in-bounds for the shadow.
     // `get_mut` defensively to tolerate sub-walk shadows that lag the
     // OpRef bank if a future caller mis-sizes them.
+    //
+    // Codex P1 (PR #89): collapse non-Ref ConcreteValue (Int / Float)
+    // to Null before storing into the Ref shadow.  `concrete_from_
+    // recorded_opref` returns whatever kind the per-OpRef concrete
+    // table holds; a kind mismatch (e.g. boxed Int returned through a
+    // Ref result slot) would otherwise leak Int/Float bits into
+    // `concrete_registers_r`, breaking ref-only downstream consumers
+    // (`getfield_gc_r` sanity loads, `raise/r` GUARD_CLASS) that
+    // expect `ConcreteValue::Ref(_)` or `Null`.
+    let sanitized = match concrete {
+        ConcreteValue::Ref(_) | ConcreteValue::Null => concrete,
+        ConcreteValue::Int(_) | ConcreteValue::Float(_) => ConcreteValue::Null,
+    };
     if let Some(c_slot) = ctx.concrete_registers_r.get_mut(dst) {
-        *c_slot = concrete;
+        *c_slot = sanitized;
     }
     Ok(())
+}
+
+/// Int-bank twin of [`read_ref_reg_concrete`] (Task #75.C).
+/// Reads the Int-bank slot at the operand index from
+/// `ctx.concrete_registers_i`.  Returns `ConcreteValue::Null` for
+/// out-of-range reads — the only legal time the slice is shorter than
+/// `registers_i` is at test fixtures that pass `&mut []`, and those
+/// don't trigger `goto_if_not/iL` / `switch/id` paths.
+fn read_int_reg_concrete(
+    code: &[u8],
+    op: &DecodedOp,
+    operand_offset: usize,
+    ctx: &WalkContext<'_, '_>,
+) -> ConcreteValue {
+    let byte_pc = op.pc + 1 + operand_offset;
+    let reg = code[byte_pc] as usize;
+    ctx.concrete_registers_i
+        .get(reg)
+        .copied()
+        .unwrap_or(ConcreteValue::Null)
+}
+
+/// Int-bank twin of [`write_ref_reg`] (Task #75.C).  Writes an Int
+/// register and its concrete shadow in lock-step.  Mirrors the
+/// Ref-bank contract: every walker handler that writes
+/// `registers_i[dst]` MUST also write `concrete_registers_i[dst]` so
+/// downstream `goto_if_not/iL` / `switch/id` can fold the branch.
+///
+/// `concrete` semantics:
+/// * `ConcreteValue::Int(v)` — the handler knows the concrete result
+///   (e.g. `int_copy/i>i` propagating from the source slot's shadow,
+///   an `int_<binop>` fold of two concrete inputs).
+/// * `ConcreteValue::Null` — the handler doesn't know (e.g. residual
+///   `Call*I`, `getfield_gc_i` cache miss).  Downstream consumers
+///   surface `GotoIfNotValueNotConcrete` for unknown branch inputs.
+fn write_int_reg(
+    ctx: &mut WalkContext<'_, '_>,
+    pc: usize,
+    dst: usize,
+    value: OpRef,
+    concrete: ConcreteValue,
+) -> Result<(), DispatchError> {
+    let len = ctx.registers_i.len();
+    let slot = ctx
+        .registers_i
+        .get_mut(dst)
+        .ok_or(DispatchError::RegisterOutOfRange {
+            pc,
+            reg: dst,
+            len,
+            bank: "i",
+        })?;
+    *slot = value;
+    // Mirror `write_ref_reg`'s defensive get_mut.  Test fixtures pass
+    // an empty `concrete_registers_i` slice; production callers
+    // (Task #75.B) size it to `registers_i.len()` at dispatch entry.
+    //
+    // Codex P1 (PR #89) symmetry with `write_ref_reg`: collapse
+    // non-Int ConcreteValue to Null before storing into the Int
+    // shadow so a kind-mismatched stamp can't leak Ref/Float bits
+    // into `concrete_registers_i`.
+    let sanitized = match concrete {
+        ConcreteValue::Int(_) | ConcreteValue::Null => concrete,
+        ConcreteValue::Ref(_) | ConcreteValue::Float(_) => ConcreteValue::Null,
+    };
+    if let Some(c_slot) = ctx.concrete_registers_i.get_mut(dst) {
+        *c_slot = sanitized;
+    }
+    Ok(())
+}
+
+/// Derive a `ConcreteValue` for shadow write-back from a freshly
+/// recorded `OpRef` via `concrete_of_opref` (Task #75.E).
+///
+/// RPython parity: `pyjitpl.py:execute_with_descr` /
+/// `rpython/jit/metainterp/executor.py` stamps `box.value` on every
+/// executed op result through the per-opcode LLOp executor — `Box.value`
+/// IS the load-bearing concrete channel.  Pyre's `concrete_of_opref`
+/// table-lookup is the orthodox shadow of that channel: constant pool
+/// (`history.py:220/261/307`), virtualizable boxes
+/// (`pyjitpl.py:3400-3430`), `set_opref_concrete` stamps from
+/// `binop_int_record` / `unop_int_record`, and standard virtualizable
+/// box hits all surface here.
+///
+/// Returns `ConcreteValue::Null` when the table has no entry — the
+/// caller's downstream `goto_if_not/iL` / GUARD_CLASS dispatch treats
+/// Null as "skip the fold / skip the guard".  The sentinel
+/// `Value::Ref(GcRef(usize::MAX))` (`trace_ctx.rs:1461`) is mapped to
+/// Null since it signals "no concrete known" rather than an actual
+/// pointer.
+#[inline]
+fn concrete_from_recorded_opref(ctx: &WalkContext<'_, '_>, opref: OpRef) -> ConcreteValue {
+    match ctx.trace_ctx.concrete_of_opref(opref) {
+        Value::Int(v) => ConcreteValue::Int(v),
+        Value::Float(v) => ConcreteValue::Float(v),
+        Value::Ref(r) if r != majit_ir::GcRef(usize::MAX) => {
+            ConcreteValue::Ref(r.as_usize() as pyre_object::PyObjectRef)
+        }
+        _ => ConcreteValue::Null,
+    }
 }
 
 /// Read concrete shadow values for a Ref-bank variadic operand list
@@ -1149,25 +1287,21 @@ fn binop_int_record(
     let result = ctx.trace_ctx.record_op(opcode, &[a, b]);
     // Box(value) parity: stamp the result from the operands' Box.value
     // carriers (BoxInt(value) — matches dispatch.rs trace_binop_i).
-    if let (Some(majit_ir::Value::Int(la)), Some(majit_ir::Value::Int(rb))) =
+    // The folded value also feeds the slot-keyed `concrete_registers_i`
+    // shadow via [`write_int_reg`] so handlers that read the slot
+    // (Ref-bank symmetry) see the same concrete as the OpRef channel.
+    let concrete = if let (Some(majit_ir::Value::Int(la)), Some(majit_ir::Value::Int(rb))) =
         (ctx.trace_ctx.box_value(a), ctx.trace_ctx.box_value(b))
     {
         let folded = majit_metainterp::eval_binop_i(opcode, la, rb);
         ctx.trace_ctx
             .set_opref_concrete(result, majit_ir::Value::Int(folded));
-    }
+        ConcreteValue::Int(folded)
+    } else {
+        ConcreteValue::Null
+    };
     let dst = code[op.pc + 3] as usize;
-    let len = ctx.registers_i.len();
-    let slot = ctx
-        .registers_i
-        .get_mut(dst)
-        .ok_or(DispatchError::RegisterOutOfRange {
-            pc: op.pc,
-            reg: dst,
-            len,
-            bank: "i",
-        })?;
-    *slot = result;
+    write_int_reg(ctx, op.pc, dst, result, concrete)?;
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
@@ -1253,11 +1387,16 @@ fn dispatch_switch_id(
 /// dispatch wholesale.
 ///
 /// Field plumbing:
-/// * `registers_r/i/f` — borrowed mutably from `miframe.sym`'s
-///   per-bank vectors. Walker handlers writing dst slots
-///   (`int_copy`, `binop_int_record`, etc.) mutate them in place,
-///   matching how `MIFrame::execute_opcode_step` mutates the same
-///   fields today.
+/// * `registers_r/i/f` — allocated fresh per call sized to
+///   `top_num_regs_* + top_constants_*.len()`, then populated by
+///   the inline `setup_call` from `argboxes_*` and constant slots.
+///   PyPy parity: `pyjitpl.py:171-176 MIFrame.__init__` allocates
+///   the bank vectors at frame construction; `:188 setup_call`
+///   populates slots `[0..argboxes.len())` from the caller's
+///   argboxes. Walker handlers writing dst slots (`int_copy`,
+///   `binop_int_record`, etc.) mutate them in place; the banks are
+///   dropped when this function returns (matching PyPy's per-frame
+///   lifetime).
 /// * `trace_ctx` — borrowed mutably from `miframe.ctx`'s
 ///   `TraceCtx`. Recording (`record_op`, `finish`, etc.) goes
 ///   through this.
@@ -1295,6 +1434,7 @@ fn dispatch_switch_id(
 /// **Production wiring**: `crate::shadow_walker::shadow_validate_pre`
 /// is the first caller; it passes `is_top_level: false` for per-opcode
 /// shadow validation.
+#[allow(clippy::too_many_arguments)]
 pub fn dispatch_via_miframe(
     miframe: &mut MIFrame,
     jitcode_code: &[u8],
@@ -1307,6 +1447,32 @@ pub fn dispatch_via_miframe(
     done_with_this_frame_descr_void: DescrRef,
     exit_frame_with_exception_descr_ref: DescrRef,
     is_top_level: bool,
+    // PyPy `pyjitpl.py:171-176 MIFrame.__init__` analog: the
+    // top-level jitcode's per-bank register count.  `dispatch_via_miframe`
+    // allocates fresh `Vec<OpRef>`s sized to `top_num_regs_* +
+    // top_constants_*.len()` — replacing the prior NEW-DEVIATION that
+    // reused `sym.registers_r` (a Python locals/stack mirror) as the
+    // MIFrame register file.  The codewriter-compiled arm jitcode
+    // expects `R[0]_r = handler = MIFrame self ptr`, which the
+    // `argboxes_*` parameters supply via the `setup_call` analog
+    // below.
+    top_num_regs_r: usize,
+    top_num_regs_i: usize,
+    top_num_regs_f: usize,
+    // Top-level jitcode's per-bank constant pool — seeded into
+    // register slots `[num_regs_*, num_regs_* + constants_*.len())`
+    // per `pyjitpl.py:98-119 copy_constants`.
+    top_constants_r: &[i64],
+    top_constants_i: &[i64],
+    top_constants_f: &[i64],
+    // PyPy `pyjitpl.py:188-200 setup_call(argboxes)` analog.
+    // `argboxes_*[i]` is written to `registers_*[i]` before walking.
+    // Production callers supply `argboxes_r = [const_ref(miframe_ptr)]`
+    // so the codewriter-compiled arm finds the MIFrame self ptr at
+    // `R[0]_r`.
+    argboxes_r: &[OpRef],
+    argboxes_i: &[OpRef],
+    argboxes_f: &[OpRef],
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     // Extract raw pointers before any borrow. `miframe.ctx` and
     // `miframe.sym` are `*mut`, distinct objects (the trace
@@ -1339,32 +1505,93 @@ pub fn dispatch_via_miframe(
         Some(sym.last_exc_box)
     };
 
-    // M4.Cutover Step 1: snapshot concrete shadow for `registers_r`.
-    // `sym.registers_r` is the semantic frame mirror (locals first,
-    // then stack); the parallel concrete shadow lives split across
-    // `sym.concrete_locals` (size = nlocals) + `sym.concrete_stack`
-    // (size = current stack depth). Concatenate into a single
-    // semantic-slot indexed Vec sized to `registers_r.len()` so
-    // walker handlers can read by the same byte-indexed reg number.
-    // Any tail slots beyond `concrete_locals + concrete_stack` get
-    // `ConcreteValue::Null` (matches `concrete_value_at`'s fallback
-    // at `state.rs:3225`).
-    let mut concrete_r_snapshot: Vec<ConcreteValue> = {
-        let total = sym.registers_r.len();
-        let nlocals = sym.concrete_locals.len();
-        (0..total)
-            .map(|i| {
-                if i < nlocals {
-                    sym.concrete_locals[i]
-                } else {
-                    sym.concrete_stack
-                        .get(i - nlocals)
-                        .copied()
-                        .unwrap_or(ConcreteValue::Null)
-                }
-            })
-            .collect()
-    };
+    // PyPy `pyjitpl.py:171-176 MIFrame.__init__` analog: allocate
+    // fresh per-bank register vectors sized to `top_num_regs_* +
+    // top_constants_*.len()`.  This replaces the prior NEW-DEVIATION
+    // that reused `sym.registers_r` (a Python locals/stack mirror,
+    // whose `[0]` slot is Python local 0) as the MIFrame register
+    // file.  The codewriter-compiled arm jitcode emits getfield
+    // chains rooted at `R[0] = handler = MIFrame self ptr`; the
+    // `argboxes_r` parameter supplies that handler ptr below via the
+    // `setup_call` analog.
+    let total_r = top_num_regs_r + top_constants_r.len();
+    let total_i = top_num_regs_i + top_constants_i.len();
+    let total_f = top_num_regs_f + top_constants_f.len();
+    let mut top_regs_r = vec![OpRef::NONE; total_r];
+    let mut top_regs_i = vec![OpRef::NONE; total_i];
+    let mut top_regs_f = vec![OpRef::NONE; total_f];
+    let mut top_concrete_r = vec![ConcreteValue::Null; total_r];
+    let mut top_concrete_i = vec![ConcreteValue::Null; total_i];
+
+    // PyPy `pyjitpl.py:98-119 copy_constants` analog: seed each
+    // constant into the upper slot range `[num_regs_*, total_*)`.
+    // `box_value` resolves these via `TraceCtx::constants` so
+    // downstream getfield chains see the constant's `Value::*`.
+    for (i, &v) in top_constants_i.iter().enumerate() {
+        top_regs_i[top_num_regs_i + i] = trace_ctx.const_int(v);
+        top_concrete_i[top_num_regs_i + i] = ConcreteValue::Int(v);
+    }
+    for (i, &v) in top_constants_r.iter().enumerate() {
+        top_regs_r[top_num_regs_r + i] = trace_ctx.const_ref(v);
+        if v != 0 {
+            top_concrete_r[top_num_regs_r + i] = ConcreteValue::Ref(v as pyre_object::PyObjectRef);
+        }
+    }
+    for (i, &v) in top_constants_f.iter().enumerate() {
+        top_regs_f[top_num_regs_f + i] = trace_ctx.const_float(v);
+    }
+
+    // PyPy `pyjitpl.py:188-200 setup_call(argboxes)` analog: write
+    // each argbox into the leading register slot.  The concrete
+    // shadow is derived from `box_value(box)` — for `ConstRef(ptr)`
+    // (the common case: argbox=miframe self ptr), this is
+    // `Some(Value::Ref(GcRef(ptr)))` resolved via the constant pool;
+    // for non-const argboxes it consults the `opref_concrete` stamp
+    // table.
+    //
+    // CodeRabbit Major (PR #89): reject oversized argbox lists up
+    // front instead of silently truncating with a per-loop `break`.
+    // The `_*_arity_mismatch` DispatchError shapes already exist for
+    // the inline-call paths (`InlineCall*ArityMismatch`); reuse them
+    // here so a caller/shape mismatch surfaces as a typed failure
+    // rather than a partially seeded frame.
+    if argboxes_r.len() > top_num_regs_r {
+        return Err(DispatchError::InlineCallArityMismatch {
+            pc: position,
+            provided: argboxes_r.len(),
+            callee_num_regs_r: top_num_regs_r,
+        });
+    }
+    if argboxes_i.len() > top_num_regs_i {
+        return Err(DispatchError::InlineCallIntArityMismatch {
+            pc: position,
+            provided: argboxes_i.len(),
+            callee_num_regs_i: top_num_regs_i,
+        });
+    }
+    if argboxes_f.len() > top_num_regs_f {
+        return Err(DispatchError::InlineCallFloatArityMismatch {
+            pc: position,
+            provided: argboxes_f.len(),
+            callee_num_regs_f: top_num_regs_f,
+        });
+    }
+    for (i, &box_ref) in argboxes_r.iter().enumerate() {
+        top_regs_r[i] = box_ref;
+        if let Some(majit_ir::Value::Ref(majit_ir::GcRef(ptr))) = trace_ctx.box_value(box_ref) {
+            top_concrete_r[i] = ConcreteValue::Ref(ptr as pyre_object::PyObjectRef);
+        }
+    }
+    for (i, &box_ref) in argboxes_i.iter().enumerate() {
+        top_regs_i[i] = box_ref;
+        if let Some(majit_ir::Value::Int(v)) = trace_ctx.box_value(box_ref) {
+            top_concrete_i[i] = ConcreteValue::Int(v);
+        }
+    }
+    for (i, &box_ref) in argboxes_f.iter().enumerate() {
+        top_regs_f[i] = box_ref;
+    }
+
     // M4.Cutover Step 2.2: seed last_exc_value_concrete from
     // sym.last_exc_value (the live PyObjectRef written by trait-side
     // `seed_raised_exception` at `trace_opcode.rs:6646`).  Null when
@@ -1377,10 +1604,11 @@ pub fn dispatch_via_miframe(
 
     let result = {
         let mut wc = WalkContext {
-            registers_r: &mut sym.registers_r,
-            registers_i: &mut sym.registers_i,
-            registers_f: &mut sym.registers_f,
-            concrete_registers_r: &mut concrete_r_snapshot,
+            registers_r: &mut top_regs_r,
+            registers_i: &mut top_regs_i,
+            registers_f: &mut top_regs_f,
+            concrete_registers_r: &mut top_concrete_r,
+            concrete_registers_i: &mut top_concrete_i,
             descr_refs,
             trace_ctx,
             done_with_this_frame_descr_ref,
@@ -1555,26 +1783,19 @@ fn getarrayitem_gc_via_heapcache_with_index_bank(
     };
 
     let dst = code[op.pc + 5] as usize;
+    // Task #75.E: derive shadow concrete from the recorded result's
+    // `concrete_of_opref` entry instead of inventing Null.  Constant
+    // arraybox + constant index hits land in `constants.get_value`;
+    // virtualizable hits surface via `standard_virtualizable_box`;
+    // `set_opref_concrete` stamps from upstream `binop_int_record`
+    // flow back here too.  Null fallback preserves the prior contract.
+    let concrete_for_shadow = concrete_from_recorded_opref(ctx, result);
     match dst_bank {
         'i' => {
-            let len = ctx.registers_i.len();
-            let slot = ctx
-                .registers_i
-                .get_mut(dst)
-                .ok_or(DispatchError::RegisterOutOfRange {
-                    pc: op.pc,
-                    reg: dst,
-                    len,
-                    bank: "i",
-                })?;
-            *slot = result;
+            write_int_reg(ctx, op.pc, dst, result, concrete_for_shadow)?;
         }
         'r' => {
-            // Recorded op result — walker doesn't compute the concrete
-            // (would need executing against the live heap), so pass
-            // Null.  Downstream raise/r GUARD_CLASS treats Null as
-            // "no info, skip the guard".
-            write_ref_reg(ctx, op.pc, dst, result, ConcreteValue::Null)?;
+            write_ref_reg(ctx, op.pc, dst, result, concrete_for_shadow)?;
         }
         'f' => {
             let len = ctx.registers_f.len();
@@ -1842,26 +2063,20 @@ fn getfield_gc_via_heapcache(
     };
 
     let dst = code[op.pc + 4] as usize;
+    // Task #75.E: derive shadow concrete via `concrete_of_opref` so a
+    // constant-folded predecessor (e.g. `binop_int_record` having
+    // stamped this OpRef in Task #75.D) propagates through.  RPython
+    // `Box.value` parity: `pyjitpl.py:executor.py` per-opcode LLOp
+    // stamps `box.value` post-exec; pyre's `concrete_of_opref` reads
+    // that channel.  Null fallback preserves the prior unknown-result
+    // behaviour for cache-miss recorded ops.
+    let concrete_for_shadow = concrete_from_recorded_opref(ctx, result);
     match dst_bank {
         'i' => {
-            let len = ctx.registers_i.len();
-            let slot = ctx
-                .registers_i
-                .get_mut(dst)
-                .ok_or(DispatchError::RegisterOutOfRange {
-                    pc: op.pc,
-                    reg: dst,
-                    len,
-                    bank: "i",
-                })?;
-            *slot = result;
+            write_int_reg(ctx, op.pc, dst, result, concrete_for_shadow)?;
         }
         'r' => {
-            // Recorded op result — walker doesn't compute the concrete
-            // (would need executing against the live heap), so pass
-            // Null.  Downstream raise/r GUARD_CLASS treats Null as
-            // "no info, skip the guard".
-            write_ref_reg(ctx, op.pc, dst, result, ConcreteValue::Null)?;
+            write_ref_reg(ctx, op.pc, dst, result, concrete_for_shadow)?;
         }
         'f' => {
             let len = ctx.registers_f.len();
@@ -1943,26 +2158,19 @@ fn getfield_vable_via_metainterp(
     };
 
     let dst = code[op.pc + 4] as usize;
+    // Task #75.E: derive shadow concrete via `concrete_of_opref`.  The
+    // `vable_getfield_*` helpers in `TraceCtx` already populate the
+    // concrete shadow for virtualizable-resident fields via the
+    // `standard_virtualizable_box()`/`virtualizable_boxes` channel,
+    // and feed `set_opref_concrete` on the GETFIELD_GC fallback for
+    // non-vable structs — both surface through this lookup.
+    let concrete_for_shadow = concrete_from_recorded_opref(ctx, result);
     match dst_bank {
         'i' => {
-            let len = ctx.registers_i.len();
-            let slot = ctx
-                .registers_i
-                .get_mut(dst)
-                .ok_or(DispatchError::RegisterOutOfRange {
-                    pc: op.pc,
-                    reg: dst,
-                    len,
-                    bank: "i",
-                })?;
-            *slot = result;
+            write_int_reg(ctx, op.pc, dst, result, concrete_for_shadow)?;
         }
         'r' => {
-            // Recorded op result — walker doesn't compute the concrete
-            // (would need executing against the live heap), so pass
-            // Null.  Downstream raise/r GUARD_CLASS treats Null as
-            // "no info, skip the guard".
-            write_ref_reg(ctx, op.pc, dst, result, ConcreteValue::Null)?;
+            write_ref_reg(ctx, op.pc, dst, result, concrete_for_shadow)?;
         }
         'f' => {
             let len = ctx.registers_f.len();
@@ -2046,24 +2254,19 @@ fn unop_int_record(
     let a = read_int_reg(code, op, 0, ctx)?;
     let result = ctx.trace_ctx.record_op(opcode, &[a]);
     // Box(value) parity: stamp the unary result from the operand's
-    // Box.value carrier (matches dispatch.rs trace_unary_i).
-    if let Some(majit_ir::Value::Int(n)) = ctx.trace_ctx.box_value(a) {
+    // Box.value carrier (matches dispatch.rs trace_unary_i).  The
+    // folded value also feeds the slot-keyed shadow via
+    // [`write_int_reg`].
+    let concrete = if let Some(majit_ir::Value::Int(n)) = ctx.trace_ctx.box_value(a) {
         let folded = majit_metainterp::eval_unary_i(opcode, n);
         ctx.trace_ctx
             .set_opref_concrete(result, majit_ir::Value::Int(folded));
-    }
+        ConcreteValue::Int(folded)
+    } else {
+        ConcreteValue::Null
+    };
     let dst = code[op.pc + 2] as usize;
-    let len = ctx.registers_i.len();
-    let slot = ctx
-        .registers_i
-        .get_mut(dst)
-        .ok_or(DispatchError::RegisterOutOfRange {
-            pc: op.pc,
-            reg: dst,
-            len,
-            bank: "i",
-        })?;
-    *slot = result;
+    write_int_reg(ctx, op.pc, dst, result, concrete)?;
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
@@ -2097,17 +2300,8 @@ fn binop_ref_to_int_record(
             .set_opref_concrete(result, majit_ir::Value::Int(folded));
     }
     let dst = code[op.pc + 3] as usize;
-    let len = ctx.registers_i.len();
-    let slot = ctx
-        .registers_i
-        .get_mut(dst)
-        .ok_or(DispatchError::RegisterOutOfRange {
-            pc: op.pc,
-            reg: dst,
-            len,
-            bank: "i",
-        })?;
-    *slot = result;
+    let concrete_for_shadow = concrete_from_recorded_opref(ctx, result);
+    write_int_reg(ctx, op.pc, dst, result, concrete_for_shadow)?;
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
@@ -2144,17 +2338,8 @@ fn ptr_nonzero_record(
             .set_opref_concrete(result, majit_ir::Value::Int((r.0 != 0) as i64));
     }
     let dst = code[op.pc + 2] as usize;
-    let len = ctx.registers_i.len();
-    let slot = ctx
-        .registers_i
-        .get_mut(dst)
-        .ok_or(DispatchError::RegisterOutOfRange {
-            pc: op.pc,
-            reg: dst,
-            len,
-            bank: "i",
-        })?;
-    *slot = result;
+    let concrete_for_shadow = concrete_from_recorded_opref(ctx, result);
+    write_int_reg(ctx, op.pc, dst, result, concrete_for_shadow)?;
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
@@ -2247,17 +2432,8 @@ fn binop_float_to_int_record(
             .set_opref_concrete(result, majit_ir::Value::Int(folded));
     }
     let dst = code[op.pc + 3] as usize;
-    let len = ctx.registers_i.len();
-    let slot = ctx
-        .registers_i
-        .get_mut(dst)
-        .ok_or(DispatchError::RegisterOutOfRange {
-            pc: op.pc,
-            reg: dst,
-            len,
-            bank: "i",
-        })?;
-    *slot = result;
+    let concrete_for_shadow = concrete_from_recorded_opref(ctx, result);
+    write_int_reg(ctx, op.pc, dst, result, concrete_for_shadow)?;
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
@@ -2679,6 +2855,117 @@ fn funcptr_concrete_int(ctx: &WalkContext<'_, '_>, funcptr: OpRef) -> Option<i64
     }
 }
 
+/// `pyjitpl.py:_record_helper_pure` (`pyjitpl.py:1346-1400`) parity for the
+/// walker layer: when a residual_call routes to `CallPure*` (elidable +
+/// cannot-raise EI per [`select_residual_call_opcode`]) AND every
+/// argument in `allboxes` has a known concrete value
+/// (`TraceCtx::box_value` returns `Some`), execute the helper at trace
+/// time via [`majit_metainterp::executor::execute_pure_call`] and stamp
+/// `recorded` with the result.
+///
+/// RPython upstream `_record_helper_pure` invokes
+/// `executor.execute_varargs(opnum, argboxes, descr, exc=False, pure=True)`
+/// which dispatches to `cpu.bh_call_*` and stores the result on
+/// `result_box.value` (`pyjitpl.py:1392`).  Pyre's walker observes the
+/// same effect through the `set_opref_concrete` stamp — downstream walker
+/// chain (sub-jitcode bodies that consume the call result via
+/// `concrete_of_opref`) folds end-to-end instead of stalling at
+/// `RefOp/IntOp(N)` unknown values.
+///
+/// **Caller contract**:
+/// * `call_opcode` must be one of `CallPureI`/`CallPureR`/`CallPureF`/
+///   `CallPureN` — the `select_residual_call_opcode` elidable arm
+///   (`pyjitpl.py:2126` proper, `dispatch.rs:2688-2690`).  Other call
+///   shapes (`CallMayForce*`, `CallLoopinvariant*`, `Call*`) carry
+///   `can_raise=true` or escape semantics that require the full
+///   `execute_varargs` MetaInterp seam — they MUST NOT route here.
+/// * `allboxes[0]` is the funcbox (per `build_allboxes` layout); the
+///   remaining slots are user args in `descr.arg_types()` ABI order.
+///
+/// Best-effort: returns silently when any operand lacks a concrete
+/// `box_value` (the walker has no way to read the runtime value), or
+/// when the arity exceeds `MAX_HOST_CALL_ARITY` (16) — the trace still
+/// has the recorded `CallPure*` op for the optimizer to consume later,
+/// just without the per-record fold.
+fn try_fold_pure_call_via_executor(
+    ctx: &mut WalkContext<'_, '_>,
+    call_opcode: OpCode,
+    allboxes: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    recorded: OpRef,
+) {
+    if !matches!(
+        call_opcode,
+        OpCode::CallPureI | OpCode::CallPureR | OpCode::CallPureF | OpCode::CallPureN
+    ) {
+        return;
+    }
+    // pyjitpl.py:1351-1352 — `_record_helper_pure` only fires for
+    // `EF_ELIDABLE_CANNOT_RAISE`. `select_residual_call_opcode` returns
+    // `CallPure*` whenever `check_is_elidable()` is true (including
+    // `EF_ELIDABLE_CAN_RAISE`), so re-check the can-raise predicate here
+    // before dispatching through the `execute_pure_call` no-metainterp
+    // carve-out.  A `EF_ELIDABLE_CAN_RAISE` callee would silently swallow
+    // the exception via `BH_LAST_EXC_VALUE` with no metainterp to
+    // transcribe it.
+    let ei = call_descr.get_extra_info();
+    if ei.check_can_raise(false) {
+        return;
+    }
+    if allboxes.is_empty() {
+        return;
+    }
+    // pyjitpl.py:1960-1993 `_build_allboxes`: slot 0 is funcbox, slots
+    // 1.. are user args in `descr.arg_types()` ABI order.  Walker's
+    // [`build_allboxes`] preserves the same layout.
+    let funcptr_val = ctx.trace_ctx.box_value(allboxes[0]);
+    let func_ptr = match funcptr_val {
+        Some(majit_ir::Value::Int(addr)) => addr,
+        _ => return,
+    };
+    // Cap at MAX_HOST_CALL_ARITY (`call_int_function` / `call_void_function`
+    // panic on excess arity).  `allboxes.len() - 1` is the arg count
+    // (funcbox doesn't pass through).
+    if allboxes.len() - 1 > majit_translate::jit_codewriter::insns::MAX_HOST_CALL_ARITY {
+        return;
+    }
+    let mut args = Vec::with_capacity(allboxes.len() - 1);
+    for &arg in &allboxes[1..] {
+        let v = match ctx.trace_ctx.box_value(arg) {
+            Some(majit_ir::Value::Int(n)) => n,
+            Some(majit_ir::Value::Ref(r)) => {
+                // `usize::MAX` sentinel from `concrete_of_opref` means
+                // "no concrete known" — never reach this path because
+                // `box_value` returns `None` for un-stamped OpRefs, but
+                // belt-and-suspenders against future plumbing.
+                if r == majit_ir::GcRef(usize::MAX) {
+                    return;
+                }
+                r.as_usize() as i64
+            }
+            Some(majit_ir::Value::Float(f)) => f.to_bits() as i64,
+            Some(majit_ir::Value::Void) => 0,
+            None => return,
+        };
+        args.push(v);
+    }
+    let result_i64 = majit_metainterp::executor::execute_pure_call(call_descr, func_ptr, &args);
+    // pyjitpl.py:1392 `result_box.value = result`: stamp the recorded
+    // OpRef with the executed concrete so downstream
+    // `concrete_of_opref` / `box_value` consumers see the folded value.
+    let result_value = match call_descr.result_type() {
+        majit_ir::Type::Int => majit_ir::Value::Int(result_i64),
+        majit_ir::Type::Ref => majit_ir::Value::Ref(majit_ir::GcRef(result_i64 as usize)),
+        majit_ir::Type::Float => majit_ir::Value::Float(f64::from_bits(result_i64 as u64)),
+        // void callees discard the result upstream too (`bh_call_v` has
+        // no return value); `CallPureN` is included in the matched set
+        // only to mirror PyPy's `_record_helper_pure` handling of all
+        // pure shapes — skip the stamp for void.
+        majit_ir::Type::Void => return,
+    };
+    ctx.trace_ctx.set_opref_concrete(recorded, result_value);
+}
+
 /// `pyjitpl.py:3671-3681 MetaInterp.direct_call_release_gil` port.
 /// Sub-case of the forces-virtual-or-virtualizable branch
 /// (`pyjitpl.py:2063` `if effectinfo.is_call_release_gil()`): when the
@@ -2933,25 +3220,19 @@ fn write_residual_call_result_to_dst(
     dst_bank: char,
     result: OpRef,
 ) -> Result<(), DispatchError> {
+    // Task #75.F: route the shadow write through `concrete_of_opref`
+    // so a CallPure* descr whose argboxes are all constant (do_residual_call
+    // path that lands a constant result via the executor.execute_varargs
+    // stamp) propagates concrete to the dst slot.  Falls back to Null when
+    // the result has no recorded concrete (matches the pre-#75.F shape for
+    // every non-elidable call).
+    let concrete_for_shadow = concrete_from_recorded_opref(ctx, result);
     match dst_bank {
         'r' => {
-            // Residual call result — walker doesn't execute the call,
-            // so the concrete return value is unknown.  Null in shadow
-            // means downstream GUARD_CLASS gates skip.
-            write_ref_reg(ctx, pc, dst, result, ConcreteValue::Null)?;
+            write_ref_reg(ctx, pc, dst, result, concrete_for_shadow)?;
         }
         'i' => {
-            let len = ctx.registers_i.len();
-            let slot = ctx
-                .registers_i
-                .get_mut(dst)
-                .ok_or(DispatchError::RegisterOutOfRange {
-                    pc,
-                    reg: dst,
-                    len,
-                    bank: "i",
-                })?;
-            *slot = result;
+            write_int_reg(ctx, pc, dst, result, concrete_for_shadow)?;
         }
         'f' => {
             let len = ctx.registers_f.len();
@@ -3290,6 +3571,15 @@ fn dispatch_residual_call_iRd_kind(
             .trace_ctx
             .record_op_with_descr(call_opcode, &allboxes, descr.clone());
 
+        // pyjitpl.py:1346-1400 `_record_helper_pure` parity: for
+        // `CallPure*` whose every argbox carries a known `box_value`,
+        // execute the helper now and stamp `recorded` with the result so
+        // downstream walker chain (sub-jitcode bodies that consume the
+        // result via `concrete_of_opref`) folds end-to-end.  No-op when
+        // any argbox is symbolic, when the EI can raise, or for non-pure
+        // call opcodes.
+        try_fold_pure_call_via_executor(ctx, call_opcode, &allboxes, call_descr, recorded);
+
         // pyjitpl.py:2659 `_record_helper_varargs` parity: every
         // recorded varargs op invalidates the heapcache via
         // `heapcache.invalidate_caches_varargs(opnum, descr,
@@ -3469,6 +3759,10 @@ fn dispatch_residual_call_iIRd_kind(
             .trace_ctx
             .record_op_with_descr(call_opcode, &allboxes, descr.clone());
 
+        // pyjitpl.py:1346-1400 `_record_helper_pure` parity — see
+        // `dispatch_residual_call_iRd_kind` for the upstream walk.
+        try_fold_pure_call_via_executor(ctx, call_opcode, &allboxes, call_descr, recorded);
+
         // pyjitpl.py:2659 `_record_helper_varargs` parity — see
         // `dispatch_residual_call_iRd_kind` for the upstream-citation
         // walkthrough.  Same invalidation semantics; only the
@@ -3593,6 +3887,10 @@ fn dispatch_residual_call_iIRFd_kind(
             .trace_ctx
             .record_op_with_descr(call_opcode, &allboxes, descr.clone());
 
+        // pyjitpl.py:1346-1400 `_record_helper_pure` parity — see
+        // `dispatch_residual_call_iRd_kind` for the upstream walk.
+        try_fold_pure_call_via_executor(ctx, call_opcode, &allboxes, call_descr, recorded);
+
         ctx.trace_ctx
             .heapcache_invalidate_caches_varargs(call_opcode, Some(ei), &allboxes);
         write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, recorded)?;
@@ -3620,14 +3918,24 @@ fn dispatch_residual_call_iIRFd_kind(
 /// `const_float`, matching RPython
 /// `pyjitpl.py:98-119 MIFrame.copy_constants`.
 ///
-/// Also returns a Ref-bank concrete shadow sized to match
-/// `registers_r` (constant slots seeded with `ConcreteValue::Null` —
-/// concrete propagation for the const pool would need a backing
-/// `PyObjectRef` materialisation that the sub-walk doesn't yet drive).
+/// Also returns Ref- and Int-bank concrete shadows sized to match
+/// `registers_r` / `registers_i`.  Ref-bank constant slots seed
+/// `ConcreteValue::Null` (concrete propagation for the const pool
+/// would need a backing `PyObjectRef` materialisation that the
+/// sub-walk doesn't yet drive); Int-bank constant slots seed
+/// `ConcreteValue::Int(v)` directly from `body.constants_i` so a
+/// future `goto_if_not/iL` reading a constant input finds a non-Null
+/// concrete and can fold the branch.
 fn allocate_callee_register_banks(
     body: &SubJitCodeBody,
     trace_ctx: &mut TraceCtx,
-) -> (Vec<OpRef>, Vec<OpRef>, Vec<OpRef>, Vec<ConcreteValue>) {
+) -> (
+    Vec<OpRef>,
+    Vec<OpRef>,
+    Vec<OpRef>,
+    Vec<ConcreteValue>,
+    Vec<ConcreteValue>,
+) {
     let total_r = body.num_regs_r + body.constants_r.len();
     let total_i = body.num_regs_i + body.constants_i.len();
     let total_f = body.num_regs_f + body.constants_f.len();
@@ -3635,8 +3943,10 @@ fn allocate_callee_register_banks(
     let mut regs_i = vec![OpRef::NONE; total_i];
     let mut regs_f = vec![OpRef::NONE; total_f];
     let concrete_r = vec![ConcreteValue::Null; total_r];
+    let mut concrete_i = vec![ConcreteValue::Null; total_i];
     for (i, &v) in body.constants_i.iter().enumerate() {
         regs_i[body.num_regs_i + i] = trace_ctx.const_int(v);
+        concrete_i[body.num_regs_i + i] = ConcreteValue::Int(v);
     }
     for (i, &v) in body.constants_r.iter().enumerate() {
         regs_r[body.num_regs_r + i] = trace_ctx.const_ref(v);
@@ -3644,7 +3954,7 @@ fn allocate_callee_register_banks(
     for (i, &v) in body.constants_f.iter().enumerate() {
         regs_f[body.num_regs_f + i] = trace_ctx.const_float(v);
     }
-    (regs_r, regs_i, regs_f, concrete_r)
+    (regs_r, regs_i, regs_f, concrete_r, concrete_i)
 }
 
 /// Operand layout `dR>X`:
@@ -3689,8 +3999,13 @@ fn dispatch_inline_call_dr_kind(
     let (args, arg_width) = read_ref_var_list(code, op, 2, ctx)?;
     let arg_concretes = read_ref_var_list_concrete(code, op, 2, ctx);
 
-    let (mut callee_regs_r, mut callee_regs_i, mut callee_regs_f, mut callee_concrete_r) =
-        allocate_callee_register_banks(&sub_body, ctx.trace_ctx);
+    let (
+        mut callee_regs_r,
+        mut callee_regs_i,
+        mut callee_regs_f,
+        mut callee_concrete_r,
+        mut callee_concrete_i,
+    ) = allocate_callee_register_banks(&sub_body, ctx.trace_ctx);
 
     if args.len() > sub_body.num_regs_r {
         return Err(DispatchError::InlineCallArityMismatch {
@@ -3712,6 +4027,7 @@ fn dispatch_inline_call_dr_kind(
             registers_i: &mut callee_regs_i,
             registers_f: &mut callee_regs_f,
             concrete_registers_r: &mut callee_concrete_r,
+            concrete_registers_i: &mut callee_concrete_i,
             descr_refs: ctx.descr_refs,
             trace_ctx: ctx.trace_ctx,
             done_with_this_frame_descr_ref: ctx.done_with_this_frame_descr_ref.clone(),
@@ -3739,28 +4055,20 @@ fn dispatch_inline_call_dr_kind(
                 return Err(DispatchError::UnexpectedNonVoidSubReturn { pc: op.pc });
             }
             let dst = code[op.pc + 1 + 2 + arg_width] as usize;
+            // inline_call_* dst writeback — `value` is the callee's
+            // SubReturn OpRef.  The callee's matching concrete shadow
+            // was dropped at sub-walk exit; `concrete_of_opref` still
+            // sees through to `constants.get_value` for callees that
+            // return a constant (e.g. `LoadConst` tail), so route via
+            // the unified shadow channel.  Non-constant returns surface
+            // as the sentinel `GcRef(usize::MAX)` → Null fallback.
+            let concrete_for_shadow = concrete_from_recorded_opref(ctx, value);
             match dst_bank {
                 'r' => {
-                    // inline_call_* dst writeback — `value` is the
-                    // callee's SubReturn OpRef.  The callee's matching
-                    // concrete lived in the sub-walk's concrete shadow
-                    // which has been dropped; future work could thread
-                    // the last concrete through SubReturn (M4.Cutover
-                    // Step 2.3).  Null is safe — downstream gates skip.
-                    write_ref_reg(ctx, op.pc, dst, value, ConcreteValue::Null)?;
+                    write_ref_reg(ctx, op.pc, dst, value, concrete_for_shadow)?;
                 }
                 'i' => {
-                    let len = ctx.registers_i.len();
-                    let slot =
-                        ctx.registers_i
-                            .get_mut(dst)
-                            .ok_or(DispatchError::RegisterOutOfRange {
-                                pc: op.pc,
-                                reg: dst,
-                                len,
-                                bank: "i",
-                            })?;
-                    *slot = value;
+                    write_int_reg(ctx, op.pc, dst, value, concrete_for_shadow)?;
                 }
                 _ => unreachable!(
                     "dispatch_inline_call_dr_kind dst_bank must be 'r', 'i' or 'v' (\
@@ -3859,8 +4167,13 @@ fn dispatch_inline_call_dir_kind(
     let (ref_args, ref_width) = read_ref_var_list(code, op, 2 + int_width, ctx)?;
     let ref_arg_concretes = read_ref_var_list_concrete(code, op, 2 + int_width, ctx);
 
-    let (mut callee_regs_r, mut callee_regs_i, mut callee_regs_f, mut callee_concrete_r) =
-        allocate_callee_register_banks(&sub_body, ctx.trace_ctx);
+    let (
+        mut callee_regs_r,
+        mut callee_regs_i,
+        mut callee_regs_f,
+        mut callee_concrete_r,
+        mut callee_concrete_i,
+    ) = allocate_callee_register_banks(&sub_body, ctx.trace_ctx);
 
     if int_args.len() > sub_body.num_regs_i {
         return Err(DispatchError::InlineCallIntArityMismatch {
@@ -3892,6 +4205,7 @@ fn dispatch_inline_call_dir_kind(
             registers_i: &mut callee_regs_i,
             registers_f: &mut callee_regs_f,
             concrete_registers_r: &mut callee_concrete_r,
+            concrete_registers_i: &mut callee_concrete_i,
             descr_refs: ctx.descr_refs,
             trace_ctx: ctx.trace_ctx,
             done_with_this_frame_descr_ref: ctx.done_with_this_frame_descr_ref.clone(),
@@ -3917,28 +4231,16 @@ fn dispatch_inline_call_dir_kind(
             // dst register byte sits after descr (2B) + I-list (int_width)
             // + R-list (ref_width) bytes.
             let dst = code[op.pc + 1 + 2 + int_width + ref_width] as usize;
+            // See dispatch_inline_call_dr_kind: route the SubReturn
+            // OpRef through the unified shadow channel so constant
+            // return values propagate.
+            let concrete_for_shadow = concrete_from_recorded_opref(ctx, value);
             match dst_bank {
                 'r' => {
-                    // inline_call_* dst writeback — `value` is the
-                    // callee's SubReturn OpRef.  The callee's matching
-                    // concrete lived in the sub-walk's concrete shadow
-                    // which has been dropped; future work could thread
-                    // the last concrete through SubReturn (M4.Cutover
-                    // Step 2.3).  Null is safe — downstream gates skip.
-                    write_ref_reg(ctx, op.pc, dst, value, ConcreteValue::Null)?;
+                    write_ref_reg(ctx, op.pc, dst, value, concrete_for_shadow)?;
                 }
                 'i' => {
-                    let len = ctx.registers_i.len();
-                    let slot =
-                        ctx.registers_i
-                            .get_mut(dst)
-                            .ok_or(DispatchError::RegisterOutOfRange {
-                                pc: op.pc,
-                                reg: dst,
-                                len,
-                                bank: "i",
-                            })?;
-                    *slot = value;
+                    write_int_reg(ctx, op.pc, dst, value, concrete_for_shadow)?;
                 }
                 _ => unreachable!("dispatch_inline_call_dir_kind dst_bank must be 'r', 'i' or 'v'"),
             }
@@ -4028,8 +4330,13 @@ fn dispatch_inline_call_dirf_kind(
     let ref_arg_concretes = read_ref_var_list_concrete(code, op, 2 + int_width, ctx);
     let (float_args, float_width) = read_float_var_list(code, op, 2 + int_width + ref_width, ctx)?;
 
-    let (mut callee_regs_r, mut callee_regs_i, mut callee_regs_f, mut callee_concrete_r) =
-        allocate_callee_register_banks(&sub_body, ctx.trace_ctx);
+    let (
+        mut callee_regs_r,
+        mut callee_regs_i,
+        mut callee_regs_f,
+        mut callee_concrete_r,
+        mut callee_concrete_i,
+    ) = allocate_callee_register_banks(&sub_body, ctx.trace_ctx);
 
     if int_args.len() > sub_body.num_regs_i {
         return Err(DispatchError::InlineCallIntArityMismatch {
@@ -4071,6 +4378,7 @@ fn dispatch_inline_call_dirf_kind(
             registers_i: &mut callee_regs_i,
             registers_f: &mut callee_regs_f,
             concrete_registers_r: &mut callee_concrete_r,
+            concrete_registers_i: &mut callee_concrete_i,
             descr_refs: ctx.descr_refs,
             trace_ctx: ctx.trace_ctx,
             done_with_this_frame_descr_ref: ctx.done_with_this_frame_descr_ref.clone(),
@@ -4094,28 +4402,16 @@ fn dispatch_inline_call_dirf_kind(
                 return Err(DispatchError::UnexpectedNonVoidSubReturn { pc: op.pc });
             }
             let dst = code[op.pc + 1 + 2 + int_width + ref_width + float_width] as usize;
+            // See dispatch_inline_call_dr_kind: route the SubReturn
+            // OpRef through the unified shadow channel so constant
+            // return values propagate.
+            let concrete_for_shadow = concrete_from_recorded_opref(ctx, value);
             match dst_bank {
                 'i' => {
-                    let len = ctx.registers_i.len();
-                    let slot =
-                        ctx.registers_i
-                            .get_mut(dst)
-                            .ok_or(DispatchError::RegisterOutOfRange {
-                                pc: op.pc,
-                                reg: dst,
-                                len,
-                                bank: "i",
-                            })?;
-                    *slot = value;
+                    write_int_reg(ctx, op.pc, dst, value, concrete_for_shadow)?;
                 }
                 'r' => {
-                    // inline_call_* dst writeback — `value` is the
-                    // callee's SubReturn OpRef.  The callee's matching
-                    // concrete lived in the sub-walk's concrete shadow
-                    // which has been dropped; future work could thread
-                    // the last concrete through SubReturn (M4.Cutover
-                    // Step 2.3).  Null is safe — downstream gates skip.
-                    write_ref_reg(ctx, op.pc, dst, value, ConcreteValue::Null)?;
+                    write_ref_reg(ctx, op.pc, dst, value, concrete_for_shadow)?;
                 }
                 'f' => {
                     let len = ctx.registers_f.len();
@@ -4485,17 +4781,8 @@ fn handle(
                     .set_opref_concrete(result, majit_ir::Value::Int(r.0 as i64));
             }
             let dst = code[op.pc + 2] as usize;
-            let len = ctx.registers_i.len();
-            let slot = ctx
-                .registers_i
-                .get_mut(dst)
-                .ok_or(DispatchError::RegisterOutOfRange {
-                    pc: op.pc,
-                    reg: dst,
-                    len,
-                    bank: "i",
-                })?;
-            *slot = result;
+            let concrete_for_shadow = concrete_from_recorded_opref(ctx, result);
+            write_int_reg(ctx, op.pc, dst, result, concrete_for_shadow)?;
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
         "ptr_eq/rr>i" => binop_ref_to_int_record(code, op, ctx, OpCode::PtrEq),
@@ -4627,19 +4914,18 @@ fn handle(
             // register, write the same OpRef into the dst slot. Pypy
             // records *no* IR op for a copy — pure SSA-level rename.
             // Operand layout `i>i`: 1B src + 1B dst.
+            //
+            // Task #75.C: propagate the source slot's Int-bank concrete
+            // shadow alongside the symbolic OpRef, mirroring the
+            // `ref_copy/r>r` Step 2.2 chain.  Without this, a
+            // `goto_if_not/iL` reading the dst slot wouldn't see the
+            // concrete and would surface `GotoIfNotValueNotConcrete`
+            // even when the source had a known concrete (e.g. a
+            // constant Int seeded by `allocate_callee_register_banks`).
             let src_val = read_int_reg(code, op, 0, ctx)?;
+            let src_concrete = read_int_reg_concrete(code, op, 0, ctx);
             let dst = code[op.pc + 2] as usize;
-            let len = ctx.registers_i.len();
-            let slot = ctx
-                .registers_i
-                .get_mut(dst)
-                .ok_or(DispatchError::RegisterOutOfRange {
-                    pc: op.pc,
-                    reg: dst,
-                    len,
-                    bank: "i",
-                })?;
-            *slot = src_val;
+            write_int_reg(ctx, op.pc, dst, src_val, src_concrete)?;
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
         "float_copy/f>f" => {
@@ -4702,6 +4988,23 @@ fn handle(
             //
             // Walker selects between the two via `ctx.is_top_level`.
             let result = read_ref_reg(code, op, 0, ctx)?;
+            // PyPy `box.value = result` parity at the frame boundary:
+            // the callee's slot-keyed concrete shadow (`concrete_registers_r`)
+            // carries the live PyObject pointer; mirror it onto the
+            // OpRef-keyed `opref_concrete` channel so the caller's
+            // `concrete_from_recorded_opref` (in `dispatch_inline_call_*_kind`)
+            // sees the stamped Box.value.  Skips constants — `TraceCtx::constants
+            // .get_value` is the authoritative shadow for those.
+            if !result.is_constant() {
+                if let ConcreteValue::Ref(ptr) = read_ref_reg_concrete(code, op, 0, ctx) {
+                    if !ptr.is_null() {
+                        ctx.trace_ctx.set_opref_concrete(
+                            result,
+                            majit_ir::Value::Ref(majit_ir::GcRef(ptr as usize)),
+                        );
+                    }
+                }
+            }
             if ctx.is_top_level {
                 ctx.trace_ctx
                     .finish(&[result], ctx.done_with_this_frame_descr_ref.clone());
@@ -4724,6 +5027,14 @@ fn handle(
             // `inline_call_*_i` would land the int OpRef in its `>i` slot.
             // Operand layout `i`: 1B int register at op.pc+1.
             let result = read_int_reg(code, op, 0, ctx)?;
+            // PyPy `box.value = result` parity at the frame boundary —
+            // see `ref_return/r` comment above for rationale.
+            if !result.is_constant() {
+                if let ConcreteValue::Int(v) = read_int_reg_concrete(code, op, 0, ctx) {
+                    ctx.trace_ctx
+                        .set_opref_concrete(result, majit_ir::Value::Int(v));
+                }
+            }
             if ctx.is_top_level {
                 ctx.trace_ctx
                     .finish(&[result], ctx.done_with_this_frame_descr_int.clone());
@@ -5043,6 +5354,7 @@ mod tests {
             registers_i: &mut [],
             registers_f: &mut [],
             concrete_registers_r: &mut concrete,
+            concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
@@ -5209,6 +5521,7 @@ mod tests {
             registers_i: &mut regs_i,
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -5249,6 +5562,7 @@ mod tests {
             registers_i: &mut regs_i,
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -5288,6 +5602,7 @@ mod tests {
             registers_i: &mut regs_i,
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -5336,6 +5651,7 @@ mod tests {
             registers_i: &mut regs_i,
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -5376,6 +5692,7 @@ mod tests {
             registers_i: &mut regs_i,
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -5415,6 +5732,7 @@ mod tests {
             registers_i: &mut regs_i,
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -5549,6 +5867,7 @@ mod tests {
             registers_i: &mut [],
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -5701,6 +6020,7 @@ mod tests {
             registers_i: &mut regs_i,
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -5801,6 +6121,7 @@ mod tests {
             registers_i: &mut regs_i,
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -5895,6 +6216,7 @@ mod tests {
             registers_i: &mut regs_i,
             registers_f: &mut regs_f,
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -5978,6 +6300,7 @@ mod tests {
             registers_i: &mut regs_i,
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -6058,6 +6381,7 @@ mod tests {
             registers_i: &mut [],
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
@@ -6116,6 +6440,7 @@ mod tests {
             registers_i: &mut [],
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
@@ -6156,6 +6481,7 @@ mod tests {
             registers_i: &mut [],
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
@@ -6192,6 +6518,7 @@ mod tests {
             registers_i: &mut [],
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -6236,6 +6563,7 @@ mod tests {
             registers_i: &mut [],
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -6286,6 +6614,7 @@ mod tests {
             registers_i: &mut [],
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -6331,6 +6660,7 @@ mod tests {
             registers_i: &mut regs_i,
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: make_fail_descr(1),
@@ -6381,6 +6711,7 @@ mod tests {
             registers_i: &mut regs_i,
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: make_fail_descr(1),
@@ -6430,6 +6761,7 @@ mod tests {
             registers_i: &mut [],
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: make_fail_descr(1),
@@ -6483,6 +6815,7 @@ mod tests {
             registers_i: &mut [],
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: make_fail_descr(1),
@@ -6522,6 +6855,7 @@ mod tests {
             registers_i: &mut [],
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -6564,6 +6898,7 @@ mod tests {
             registers_i: &mut [],
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -6606,6 +6941,7 @@ mod tests {
             registers_i: &mut [],
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -6696,6 +7032,7 @@ mod tests {
             registers_i: &mut [],
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -6734,6 +7071,7 @@ mod tests {
             registers_i: &mut [],
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -6784,6 +7122,7 @@ mod tests {
             registers_i: &mut [],
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr_done,
@@ -6864,6 +7203,7 @@ mod tests {
             registers_i: &mut [],
             registers_f: &mut [],
             concrete_registers_r: &mut concrete,
+            concrete_registers_i: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr_done,
@@ -6929,6 +7269,7 @@ mod tests {
             registers_i: &mut [],
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr_done,
@@ -6985,6 +7326,7 @@ mod tests {
             registers_i: &mut [],
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
@@ -7022,6 +7364,7 @@ mod tests {
             registers_i: &mut [],
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr_done,
@@ -7338,6 +7681,7 @@ mod tests {
             registers_i: &mut [],
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr_done.clone(),
@@ -7438,6 +7782,7 @@ mod tests {
             registers_i: &mut [],
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr_done,
@@ -7491,6 +7836,7 @@ mod tests {
             registers_i: &mut regs_i,
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -7540,6 +7886,7 @@ mod tests {
             registers_i: &mut regs_i,
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -7580,6 +7927,7 @@ mod tests {
             registers_i: &mut regs_i,
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -7619,6 +7967,7 @@ mod tests {
             registers_i: &mut [], // empty — index 7 must surface OOR
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -7679,6 +8028,7 @@ mod tests {
             registers_i: &mut [],
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -7727,6 +8077,7 @@ mod tests {
             registers_i: &mut [],
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -7766,6 +8117,7 @@ mod tests {
             registers_i: &mut [],
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -7804,6 +8156,7 @@ mod tests {
             registers_i: &mut [],
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -7852,6 +8205,7 @@ mod tests {
             registers_i: &mut regs_i,
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
@@ -7991,6 +8345,7 @@ mod tests {
             registers_i: &mut [],
             registers_f: &mut regs_f,
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
@@ -8057,6 +8412,7 @@ mod tests {
             registers_i: &mut [],
             registers_f: &mut regs_f,
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
@@ -8104,6 +8460,7 @@ mod tests {
             registers_i: &mut regs_i,
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
@@ -8173,6 +8530,7 @@ mod tests {
             registers_i: &mut regs_i,
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
@@ -8222,6 +8580,7 @@ mod tests {
             registers_i: &mut [],
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
@@ -8260,6 +8619,7 @@ mod tests {
             registers_i: &mut [],
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
@@ -8300,6 +8660,7 @@ mod tests {
             registers_i: &mut regs_i,
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
@@ -8348,6 +8709,7 @@ mod tests {
             registers_i: &mut [],
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -8388,6 +8750,7 @@ mod tests {
             registers_i: &mut regs_i,
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -8452,6 +8815,7 @@ mod tests {
             registers_i: &mut [],
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -8501,6 +8865,7 @@ mod tests {
             registers_i: &mut regs_i,
             registers_f: &mut [],
             concrete_registers_r: &mut concrete_r,
+            concrete_registers_i: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -8562,6 +8927,7 @@ mod tests {
             registers_i: &mut regs_i,
             registers_f: &mut [],
             concrete_registers_r: &mut concrete_r,
+            concrete_registers_i: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -8640,6 +9006,7 @@ mod tests {
             registers_i: &mut regs_i,
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
@@ -8785,6 +9152,7 @@ mod tests {
             registers_i: &mut regs_i,
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
@@ -8840,6 +9208,7 @@ mod tests {
             registers_i: &mut regs_i,
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
@@ -8886,6 +9255,7 @@ mod tests {
             registers_i: &mut regs_i,
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
@@ -8927,6 +9297,7 @@ mod tests {
             registers_i: &mut regs_i,
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
@@ -8977,6 +9348,7 @@ mod tests {
             registers_i: &mut regs_i,
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
@@ -9029,6 +9401,7 @@ mod tests {
             registers_i: &mut regs_i,
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
@@ -9101,6 +9474,7 @@ mod tests {
             registers_i: &mut regs_i,
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
@@ -9162,6 +9536,7 @@ mod tests {
             registers_i: &mut regs_i,
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
@@ -9222,6 +9597,7 @@ mod tests {
             registers_i: &mut regs_i,
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
@@ -9264,6 +9640,7 @@ mod tests {
             registers_i: &mut regs_i,
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
@@ -9344,6 +9721,7 @@ mod tests {
             registers_i: &mut regs_i,
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
@@ -9417,6 +9795,7 @@ mod tests {
             registers_i: &mut regs_i,
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
@@ -9504,6 +9883,7 @@ mod tests {
             registers_i: &mut regs_i,
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
@@ -9617,6 +9997,7 @@ mod tests {
             registers_i: &mut regs_i,
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
@@ -9666,6 +10047,7 @@ mod tests {
             registers_i: &mut regs_i,
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
@@ -9707,6 +10089,7 @@ mod tests {
             registers_i: &mut regs_i,
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
@@ -9772,6 +10155,7 @@ mod tests {
             registers_i: &mut regs_i,
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -9882,6 +10266,7 @@ mod tests {
             registers_i: &mut regs_i,
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
@@ -9968,6 +10353,7 @@ mod tests {
             registers_i: &mut [],
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
@@ -10053,6 +10439,7 @@ mod tests {
             registers_i: &mut [],
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -10117,6 +10504,7 @@ mod tests {
             registers_i: &mut [],
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -10184,6 +10572,7 @@ mod tests {
             registers_i: &mut regs_i,
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -10249,6 +10638,7 @@ mod tests {
             registers_i: &mut regs_i,
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -10320,6 +10710,7 @@ mod tests {
             registers_i: &mut regs_i,
             registers_f: &mut regs_f,
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -10389,6 +10780,7 @@ mod tests {
             registers_i: &mut regs_i,
             registers_f: &mut regs_f,
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -10446,6 +10838,7 @@ mod tests {
             registers_i: &mut regs_i,
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done,
@@ -10525,6 +10918,7 @@ mod tests {
             registers_i: &mut regs_i,
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done,
@@ -10581,6 +10975,7 @@ mod tests {
             registers_i: &mut [],
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done,
@@ -10619,6 +11014,7 @@ mod tests {
             registers_i: &mut [],
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done,
@@ -10675,6 +11071,7 @@ mod tests {
             registers_i: &mut regs_i,
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done,
@@ -10748,6 +11145,7 @@ mod tests {
             registers_i: &mut regs_i,
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done,
@@ -10814,6 +11212,7 @@ mod tests {
             registers_i: &mut regs_i,
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done,
@@ -10858,6 +11257,7 @@ mod tests {
             registers_i: &mut regs_i,
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done,
@@ -10925,6 +11325,7 @@ mod tests {
             registers_i: &mut [],
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done,
@@ -10972,6 +11373,7 @@ mod tests {
             registers_i: &mut regs_i,
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done,
@@ -11041,6 +11443,7 @@ mod tests {
             registers_i: &mut regs_i,
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done,
@@ -11096,6 +11499,7 @@ mod tests {
             registers_i: &mut regs_i,
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done,
@@ -11159,6 +11563,7 @@ mod tests {
             registers_i: &mut regs_i,
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done,
@@ -11238,6 +11643,11 @@ mod tests {
             .expect("`ref_return/r` must be in insns table");
         let code = [ret_byte, 0x02];
         let descr = make_fail_descr(1);
+        // PyPy `setup_call(argboxes)` analog: stamp `expected_arg` at
+        // `R[2]_r` so the `ref_return r2` walker handler picks it up
+        // from the fresh top-level register file.  Slots 0/1 stay
+        // `OpRef::NONE` since this fixture exercises only slot 2.
+        let argboxes_r = [OpRef::NONE, OpRef::NONE, expected_arg];
         let (outcome, end_pc) = dispatch_via_miframe(
             &mut miframe,
             &code,
@@ -11250,6 +11660,15 @@ mod tests {
             make_fail_descr(103),
             make_fail_descr(2),
             true,
+            8,
+            0,
+            0,
+            &[],
+            &[],
+            &[],
+            &argboxes_r,
+            &[],
+            &[],
         )
         .expect("dispatch_via_miframe must succeed for ref_return r2");
         assert_eq!(outcome, DispatchOutcome::Terminate);
@@ -11311,6 +11730,9 @@ mod tests {
         let code = [raise_byte, 0x03];
         let descr_done = make_fail_descr(1);
         let descr_exc = make_fail_descr(99);
+        // Setup_call argbox at R[3]_r: `raise/r` reads its exc operand
+        // from this slot in the fresh top-level register file.
+        let argboxes_r = [OpRef::NONE, OpRef::NONE, OpRef::NONE, exc_oprep];
         let (outcome, _) = dispatch_via_miframe(
             &mut miframe,
             &code,
@@ -11323,6 +11745,15 @@ mod tests {
             make_fail_descr(103),
             descr_exc,
             true,
+            8,
+            0,
+            0,
+            &[],
+            &[],
+            &[],
+            &argboxes_r,
+            &[],
+            &[],
         )
         .expect("dispatch_via_miframe must succeed for raise r3");
         assert_eq!(outcome, DispatchOutcome::Terminate);
@@ -11380,6 +11811,9 @@ mod tests {
             .get("ref_return/r")
             .expect("`ref_return/r` must be in insns table");
         let code = [ret_byte, 0x02];
+        // Setup_call argbox at R[2]_r — the `ref_return r2` walker
+        // handler picks it up from the fresh top-level register file.
+        let argboxes_r = [OpRef::NONE, OpRef::NONE, value];
         let _ = dispatch_via_miframe(
             &mut miframe,
             &code,
@@ -11392,6 +11826,15 @@ mod tests {
             make_fail_descr(103),
             make_fail_descr(2),
             true,
+            8,
+            0,
+            0,
+            &[],
+            &[],
+            &[],
+            &argboxes_r,
+            &[],
+            &[],
         )
         .expect("ref_return walk must succeed");
         drop(miframe);
@@ -11414,6 +11857,7 @@ mod tests {
             registers_i: &mut [],
             registers_f: &mut [],
             concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),

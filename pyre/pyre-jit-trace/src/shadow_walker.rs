@@ -113,11 +113,28 @@ pub fn opname_in_shadow_allow_list(instruction: &Instruction) -> bool {
             // M4.PoC.2: PopTop arm body is `inline_call_r_r/dR>r` into
             // the `pop_value` sub-jitcode, followed by the standard
             // `live/catch_exception/goto/reraise/ref_return/live/raise/
-            // ref_return` shoulder.  No `goto_if_not/iL` (which would
-            // need Int-bank concrete shadow), so the LoadFast blocker
-            // doesn't apply here.  See
+            // ref_return` shoulder.  See
             // `pop_top_jitcode_op_sequence_matches_expected_shape` test
-            // for the locked-in arm shape.
+            // for the locked-in OUTER arm shape.
+            //
+            // 2026-05-21 (Task #165): the outer arm is clean, but its
+            // `inline_call_r_r` recurses 4 levels deep into Rust helper
+            // bodies (`pop_value` → checked_sub → field access).  At
+            // depth 4, `getfield_gc_i` reads ref reg 0 (the Python
+            // local being popped); when the local is a small Python
+            // int the slot-keyed shadow holds `ConcreteValue::Int(n)`
+            // and `box_value(obj)` returns `Value::Int(n)` — not
+            // `Value::Ref(struct_ptr)`, so `field_sanity_load` skips
+            // and the result OpRef gets no `set_opref_concrete`
+            // stamp.  The downstream `int_le` + `goto_if_not/iL`
+            // (`pop_value`'s `checked_sub` bound check) then surfaces
+            // `GotoIfNotValueNotConcrete` on raise_catch_loop +
+            // synth/set_membership.  Other benches' PopTop sites
+            // happen to pop non-int Refs and survive.  Real fix
+            // requires the walker to translate small-int unboxed
+            // concretes into the heap-pointer view the codewriter
+            // expects (or to short-circuit `getfield_gc_i` on Int
+            // concretes via a different path).  Tracked as Task #165.
             | Instruction::PopTop
     )
     // M4.PoC.1 LoadFast attempt (2026-05-17) panicked on fib_loop with
@@ -293,6 +310,17 @@ pub fn shadow_validate_pre(
     // surfaces as `SubReturn` to the dispatcher (no FINISH). The trait
     // dispatch path doesn't emit a per-opcode FINISH either, so shadow
     // mode must run the walker as a sub-frame to match.
+    //
+    // PyPy `pyjitpl.py:188-200 setup_call(argboxes)` analog: the
+    // codewriter-compiled arm `opcode_<name><H>(handler: &mut H)`
+    // expects `R[0]_r = handler = MIFrame self ptr`.  Mint a fresh
+    // `ConstRef(miframe as i64)` so `box_value(arg)` resolves to
+    // `Value::Ref(GcRef(miframe_ptr))` via the const pool, then pass
+    // it as the sole ref-bank argbox.  Int/Float banks have no args
+    // for opcode arm bodies.
+    let miframe_self_ptr = miframe as *mut MIFrame as i64;
+    let miframe_box = miframe.ctx().const_ref(miframe_self_ptr);
+    let argboxes_r = [miframe_box];
     let walk_result = crate::jitcode_dispatch::dispatch_via_miframe(
         miframe,
         jitcode.code.as_slice(),
@@ -305,6 +333,15 @@ pub fn shadow_validate_pre(
         done_void,
         exit_exc_ref,
         false,
+        jitcode.num_regs_r() as usize,
+        jitcode.num_regs_i() as usize,
+        jitcode.num_regs_f() as usize,
+        jitcode.constants_r.as_slice(),
+        jitcode.constants_i.as_slice(),
+        jitcode.constants_f.as_slice(),
+        &argboxes_r,
+        &[],
+        &[],
     );
     if let Err(e) = walk_result {
         panic!(
