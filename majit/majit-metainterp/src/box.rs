@@ -24,7 +24,7 @@
 use std::cell::{Ref, RefCell};
 use std::rc::Rc;
 
-use majit_ir::{Type, Value};
+use majit_ir::{OpRef, Type, Value};
 
 use crate::optimizeopt::info::OpInfo;
 
@@ -65,9 +65,8 @@ pub enum BoxKind {
 
     /// `resoperation.py:699 AbstractInputArg`.
     /// `position` mirrors `AbstractInputArg.position`
-    /// (resoperation.py:699) — `Optional` because pyre constructs
-    /// inputargs without an assigned slot in some test fixtures.
-    InputArg { position: Option<u32> },
+    /// (resoperation.py:699).
+    InputArg { position: u32 },
 
     /// `history.py:220 ConstInt` / `:261 ConstFloat` / `:307 ConstPtr`.
     /// `const_index` is a pyre-only field carrying the
@@ -108,8 +107,8 @@ pub enum Forwarded {
 /// `is`-based default `__eq__` on `AbstractValue` (covers `ResOp` /
 /// `InputArg` / `Const`). PyPy's value-based comparison for constants is
 /// the explicit `same_box` / `same_constant` method (`history.py:204`),
-/// not `__eq__`. Callers that need value comparison on constants must use
-/// `BoxRef::same_constant`.
+/// not `__eq__`. Callers that need value comparison on constants compare
+/// `const_value()` outputs directly.
 pub struct BoxRef(Rc<Box>);
 
 impl BoxRef {
@@ -131,7 +130,7 @@ impl BoxRef {
     }
 
     /// New `AbstractInputArg` Box.
-    pub fn new_inputarg(type_: Type, position: Option<u32>) -> Self {
+    pub fn new_inputarg(type_: Type, position: u32) -> Self {
         Self(Rc::new(Box {
             forwarded: RefCell::new(Forwarded::None),
             type_,
@@ -205,7 +204,7 @@ impl BoxRef {
     pub fn position(&self) -> Option<u32> {
         match &self.0.kind {
             BoxKind::ResOp { position } => Some(position.get()),
-            BoxKind::InputArg { position } => *position,
+            BoxKind::InputArg { position } => Some(*position),
             BoxKind::Const { .. } => None,
         }
     }
@@ -229,14 +228,6 @@ impl BoxRef {
     pub fn const_value(&self) -> Option<Value> {
         match self.0.kind {
             BoxKind::Const { value, .. } => Some(value),
-            _ => None,
-        }
-    }
-
-    /// Extract `AbstractInputArg.position`.
-    pub fn inputarg_position(&self) -> Option<u32> {
-        match self.0.kind {
-            BoxKind::InputArg { position } => position,
             _ => None,
         }
     }
@@ -430,8 +421,7 @@ impl Clone for BoxRef {
 ///
 /// Carries an `Rc` clone of the live `Rc<RefCell<PtrInfo>>` together
 /// with a shared `RefCell` borrow into it.  `Deref<Target = PtrInfo>`
-/// gives ergonomic read-only access; callers needing identity can read
-/// `.handle()` to obtain the underlying `Rc` for `Rc::ptr_eq` checks.
+/// gives ergonomic read-only access.
 ///
 /// SAFETY: The inner `Ref<'static, PtrInfo>` is constructed by widening
 /// a `Ref` whose true lifetime is bounded by `_rc` (the `Rc` clone we
@@ -450,11 +440,6 @@ impl PtrInfoBorrow {
         let r: std::cell::Ref<'static, crate::optimizeopt::info::PtrInfo> =
             unsafe { std::mem::transmute(r) };
         Self { inner: r, _rc: rc }
-    }
-
-    /// Return the underlying handle for identity / sharing.
-    pub fn handle(&self) -> Rc<std::cell::RefCell<crate::optimizeopt::info::PtrInfo>> {
-        Rc::clone(&self._rc)
     }
 }
 
@@ -488,10 +473,6 @@ impl PtrInfoBorrowMut {
             unsafe { std::mem::transmute(r) };
         Self { inner: r, _rc: rc }
     }
-
-    pub fn handle(&self) -> Rc<std::cell::RefCell<crate::optimizeopt::info::PtrInfo>> {
-        Rc::clone(&self._rc)
-    }
 }
 
 impl std::ops::Deref for PtrInfoBorrowMut {
@@ -521,10 +502,6 @@ impl IntBoundBorrow {
             unsafe { std::mem::transmute(r) };
         Self { inner: r, _rc: rc }
     }
-
-    pub fn handle(&self) -> Rc<std::cell::RefCell<crate::optimizeopt::intutils::IntBound>> {
-        Rc::clone(&self._rc)
-    }
 }
 
 impl std::ops::Deref for IntBoundBorrow {
@@ -551,10 +528,6 @@ impl IntBoundBorrowMut {
         let r: std::cell::RefMut<'static, crate::optimizeopt::intutils::IntBound> =
             unsafe { std::mem::transmute(r) };
         Self { inner: r, _rc: rc }
-    }
-
-    pub fn handle(&self) -> Rc<std::cell::RefCell<crate::optimizeopt::intutils::IntBound>> {
-        Rc::clone(&self._rc)
     }
 }
 
@@ -622,8 +595,31 @@ pub struct BoxPool {
 }
 
 impl BoxPool {
+    /// Defensive bound on `idx`/`capacity` passed to `set`/`with_capacity`/
+    /// `from_slots`.  A leaked constant-namespace OpRef (raw `>= CONST_BIT
+    /// = 1 << 31`) or `TempVar` sentinel (`raw >= 0xFFFF_0000`) reaching
+    /// these entry points would otherwise resize the underlying
+    /// `Vec<Option<BoxRef>>` to multi-GiB.  Real traces top out at
+    /// `O(10^5)` ops; `10_000_000` is ~3 orders of magnitude of headroom
+    /// while still much smaller than `CONST_BIT`, so any namespace bleed
+    /// panics immediately instead of OOMing.
+    const SANE_IDX_BOUND: usize = 10_000_000;
+
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Preallocate the slot table with `capacity` entries reserved.
+    pub fn with_capacity(capacity: usize) -> Self {
+        assert!(
+            capacity < Self::SANE_IDX_BOUND,
+            "BoxPool::with_capacity({capacity}) exceeds SANE_IDX_BOUND ({}); \
+             caller likely passed a raw OpRef payload with CONST_BIT/sentinel set",
+            Self::SANE_IDX_BOUND
+        );
+        Self {
+            inner: Vec::with_capacity(capacity),
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -641,9 +637,39 @@ impl BoxPool {
         self.inner.get(idx)?.as_ref()
     }
 
-    /// `box_pool[idx] = Some(value)`; extends with `None` padding to
-    /// reach `idx`. Returns a clone of the installed BoxRef.
-    pub fn set(&mut self, idx: usize, value: BoxRef) -> BoxRef {
+    /// `box_pool[opref] = Some(value)`; extends with `None` padding to
+    /// reach the slot. Returns a clone of the installed BoxRef.
+    ///
+    /// Takes an `OpRef` rather than raw `usize` so the namespace
+    /// invariants are enforced at the type level: only body and
+    /// InputArg variants reach the underlying `Vec`. A constant or
+    /// `TempVar` reaching this entry point would otherwise resize the
+    /// Vec to multi-GiB (raw payload >= `CONST_BIT = 1 << 31` or
+    /// `SENTINEL_BASE = 0xFFFF_0000`).
+    pub fn set(&mut self, opref: OpRef, value: BoxRef) -> BoxRef {
+        let idx = match opref {
+            OpRef::IntOp(p)
+            | OpRef::FloatOp(p)
+            | OpRef::RefOp(p)
+            | OpRef::VoidOp(p)
+            | OpRef::InputArgInt(p)
+            | OpRef::InputArgFloat(p)
+            | OpRef::InputArgRef(p) => p as usize,
+            OpRef::ConstInt(_) | OpRef::ConstFloat(_) | OpRef::ConstPtr(_) => panic!(
+                "BoxPool::set rejects constant OpRefs ({opref:?}); \
+                 constants live in `const_pool`, not the box pool"
+            ),
+            OpRef::TempVar(_) => panic!(
+                "BoxPool::set rejects TempVar OpRefs ({opref:?}); \
+                 TempVars are regalloc-only and have no Box identity"
+            ),
+            OpRef::None => panic!("BoxPool::set rejects OpRef::None"),
+        };
+        assert!(
+            idx < Self::SANE_IDX_BOUND,
+            "BoxPool::set({opref:?}, idx={idx}) exceeds SANE_IDX_BOUND ({})",
+            Self::SANE_IDX_BOUND
+        );
         if idx >= self.inner.len() {
             self.inner.resize(idx + 1, None);
         }
@@ -679,41 +705,31 @@ impl BoxPool {
         self.inner.truncate(new_len);
     }
 
-    pub fn clear(&mut self) {
-        self.inner.clear();
+    /// Build from a `Vec<Option<BoxRef>>` snapshot table.
+    pub fn from_slots(slots: Vec<Option<BoxRef>>) -> Self {
+        assert!(
+            slots.len() < Self::SANE_IDX_BOUND,
+            "BoxPool::from_slots(len={}) exceeds SANE_IDX_BOUND ({}); \
+             slot table likely indexed by raw OpRef payload with CONST_BIT/sentinel set",
+            slots.len(),
+            Self::SANE_IDX_BOUND
+        );
+        Self { inner: slots }
     }
 
-    /// Index into the slot returning `&Option<BoxRef>` for callers that
-    /// need to distinguish out-of-bounds (`None` from `inner.get`) from
-    /// materialized vs tombstoned. Rarely needed.
-    pub fn slot(&self, idx: usize) -> Option<&Option<BoxRef>> {
-        self.inner.get(idx)
-    }
-
-    /// Borrow the raw `Vec<Option<BoxRef>>` slot table. Used by
-    /// snapshot/replay paths that need to preserve None tombstones
-    /// alongside materialized boxes.
-    pub fn as_slots(&self) -> &[Option<BoxRef>] {
-        &self.inner
-    }
-
-    /// Take ownership of the raw `Vec<Option<BoxRef>>` slot table.
+    /// Consume the pool and return its raw `Vec<Option<BoxRef>>` slot
+    /// table. Inverse of [`Self::from_slots`].
     pub fn into_slots(self) -> Vec<Option<BoxRef>> {
         self.inner
     }
-
-    /// Build from a `Vec<Option<BoxRef>>` snapshot — reverse of
-    /// `into_slots()`.
-    pub fn from_slots(slots: Vec<Option<BoxRef>>) -> Self {
-        Self { inner: slots }
-    }
 }
 
+#[cfg(test)]
 impl From<Vec<BoxRef>> for BoxPool {
     fn from(inner: Vec<BoxRef>) -> Self {
-        Self {
-            inner: inner.into_iter().map(Some).collect(),
-        }
+        let mut slots = Vec::with_capacity(inner.len());
+        slots.extend(inner.into_iter().map(Some));
+        Self { inner: slots }
     }
 }
 
@@ -823,9 +839,9 @@ mod tests {
 
     #[test]
     fn inputarg_position_preserved() {
-        let arg = BoxRef::new_inputarg(Type::Ref, Some(3));
+        let arg = BoxRef::new_inputarg(Type::Ref, 3);
         assert!(arg.is_inputarg());
-        assert_eq!(arg.inputarg_position(), Some(3));
+        assert_eq!(arg.position(), Some(3));
         assert_eq!(arg.type_(), Type::Ref);
     }
 
@@ -862,11 +878,9 @@ mod tests {
     }
 
     #[test]
-    fn position_returns_inputarg_position_when_set() {
-        let arg = BoxRef::new_inputarg(Type::Ref, Some(7));
+    fn position_returns_inputarg_position() {
+        let arg = BoxRef::new_inputarg(Type::Ref, 7);
         assert_eq!(arg.position(), Some(7));
-        let unset = BoxRef::new_inputarg(Type::Int, None);
-        assert_eq!(unset.position(), None);
     }
 
     #[test]

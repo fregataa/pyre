@@ -399,7 +399,6 @@ impl OptPure {
     /// typed-constant path first (`ConstPtr(NULL)` etc.) before falling back
     /// to opref_type metadata.
     fn matches_result_type(op: &Op, result: OpRef, ctx: &OptContext) -> bool {
-        let result = ctx.get_box_replacement(result);
         if let Some(result_box) = ctx.get_box_replacement_box(result) {
             if let Some((_raw, result_type)) = ctx.getconst(&result_box) {
                 return result_type == op.result_type();
@@ -645,8 +644,7 @@ impl OptPure {
                         }
                     }
                     crate::optimizeopt::ImportedShortPureArg::Const(expected_value, _source) => {
-                        let query = ctx.get_box_replacement(arg);
-                        match ctx.get_constant(query) {
+                        match ctx.get_constant(arg) {
                             Some(v) if v == *expected_value => {}
                             _ => {
                                 args_match = false;
@@ -807,7 +805,7 @@ impl Default for OptPure {
 impl OptPure {
     fn force_box(&mut self, opref: OpRef, ctx: &mut OptContext) -> OpRef {
         let resolved = ctx.get_box_replacement(opref);
-        let resolved_box = ctx.get_box_replacement_box(resolved);
+        let resolved_box = ctx.get_box_replacement_box(opref);
         if resolved_box.as_ref().map_or(false, |b| ctx.is_virtual(b)) {
             let resolved_box = resolved_box.expect("recorder-populated");
             let mut info = ctx.take_ptr_info(&resolved_box).unwrap();
@@ -950,8 +948,7 @@ impl Optimization for OptPure {
                 // ctx.emit() bypasses that optimizer path, so mirror the
                 // force_box step here before recording the postponed op.
                 for i in 0..postponed.num_args() {
-                    let arg = ctx.get_box_replacement(postponed.arg(i));
-                    postponed.setarg(i, self.force_box(arg, ctx));
+                    postponed.setarg(i, self.force_box(postponed.arg(i), ctx));
                 }
                 // Record and emit both the OVF op and the guard.
                 self.cache.insert(key, postponed.pos.get());
@@ -960,8 +957,7 @@ impl Optimization for OptPure {
             } else {
                 // Not a GUARD_NO_OVERFLOW: emit the postponed op now.
                 for i in 0..postponed.num_args() {
-                    let arg = ctx.get_box_replacement(postponed.arg(i));
-                    postponed.setarg(i, self.force_box(arg, ctx));
+                    postponed.setarg(i, self.force_box(postponed.arg(i), ctx));
                 }
                 ctx.emit(postponed);
             }
@@ -1348,8 +1344,12 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure::new()));
-        let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut majit_ir::VecAssoc::new(),
+            1024,
+            crate::r#box::BoxPool::new(),
+        );
 
         // Only the first IntAdd should remain.
         assert_eq!(result.len(), 1);
@@ -1368,8 +1368,12 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure::new()));
-        let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut majit_ir::VecAssoc::new(),
+            1024,
+            crate::r#box::BoxPool::new(),
+        );
 
         assert_eq!(result.len(), 2);
     }
@@ -1386,8 +1390,12 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure::new()));
-        let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut majit_ir::VecAssoc::new(),
+            1024,
+            crate::r#box::BoxPool::new(),
+        );
 
         assert_eq!(result.len(), 1);
     }
@@ -1404,8 +1412,12 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure::new()));
-        let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut majit_ir::VecAssoc::new(),
+            1024,
+            crate::r#box::BoxPool::new(),
+        );
 
         assert_eq!(result.len(), 2);
     }
@@ -1422,8 +1434,12 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure::new()));
-        let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut majit_ir::VecAssoc::new(),
+            1024,
+            crate::r#box::BoxPool::new(),
+        );
 
         assert_eq!(result.len(), 2);
     }
@@ -1443,8 +1459,12 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure::new()));
-        let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut majit_ir::VecAssoc::new(),
+            1024,
+            crate::r#box::BoxPool::new(),
+        );
 
         assert_eq!(result.len(), 1);
     }
@@ -1460,8 +1480,12 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure::new()));
-        let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut majit_ir::VecAssoc::new(),
+            1024,
+            crate::r#box::BoxPool::new(),
+        );
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::CallI);
@@ -1481,8 +1505,12 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure::new()));
-        let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut majit_ir::VecAssoc::new(),
+            1024,
+            crate::r#box::BoxPool::new(),
+        );
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::CallR);
@@ -1500,8 +1528,12 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure::new()));
-        let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut majit_ir::VecAssoc::new(),
+            1024,
+            crate::r#box::BoxPool::new(),
+        );
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::SetfieldGc);
@@ -1519,8 +1551,12 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure::new()));
-        let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut majit_ir::VecAssoc::new(),
+            1024,
+            crate::r#box::BoxPool::new(),
+        );
 
         assert_eq!(result.len(), 1);
     }
@@ -1537,8 +1573,12 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure::new()));
-        let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut majit_ir::VecAssoc::new(),
+            1024,
+            crate::r#box::BoxPool::new(),
+        );
 
         assert_eq!(result.len(), 1);
     }
@@ -1573,8 +1613,12 @@ mod tests {
             call_pure_results: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             preamble_pure_ops: Vec::new(),
         }));
-        let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut majit_ir::VecAssoc::new(),
+            1024,
+            crate::r#box::BoxPool::new(),
+        );
 
         // All 17 unique ops should be emitted, plus the re-inserted one
         // (since the first was evicted from the LRU cache of size 16).
@@ -1633,8 +1677,12 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure::new()));
-        let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut majit_ir::VecAssoc::new(),
+            1024,
+            crate::r#box::BoxPool::new(),
+        );
 
         assert_eq!(result.len(), 1);
     }
@@ -1649,8 +1697,12 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure::new()));
-        let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut majit_ir::VecAssoc::new(),
+            1024,
+            crate::r#box::BoxPool::new(),
+        );
 
         assert_eq!(result.len(), 1);
     }
@@ -1667,8 +1719,12 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure::new()));
-        let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut majit_ir::VecAssoc::new(),
+            1024,
+            crate::r#box::BoxPool::new(),
+        );
 
         assert_eq!(result.len(), 1);
     }
@@ -1688,8 +1744,12 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure::new()));
-        let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut majit_ir::VecAssoc::new(),
+            1024,
+            crate::r#box::BoxPool::new(),
+        );
 
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].opcode, OpCode::CallF);
@@ -1710,8 +1770,12 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure::new()));
-        let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut majit_ir::VecAssoc::new(),
+            1024,
+            crate::r#box::BoxPool::new(),
+        );
 
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].opcode, OpCode::IntAdd);
@@ -1738,7 +1802,12 @@ mod tests {
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(crate::optimizeopt::rewrite::OptRewrite::new()));
         opt.add_pass(Box::new(OptPure::new()));
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut constants,
+            1024,
+            crate::r#box::BoxPool::new(),
+        );
 
         // Only the first call should remain, demoted to CallI.
         assert_eq!(result.len(), 1);
@@ -1763,8 +1832,12 @@ mod tests {
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(crate::optimizeopt::rewrite::OptRewrite::new()));
         opt.add_pass(Box::new(OptPure::new()));
-        let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut majit_ir::VecAssoc::new(),
+            1024,
+            crate::r#box::BoxPool::new(),
+        );
 
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].opcode, OpCode::CallI);
@@ -1785,8 +1858,12 @@ mod tests {
             let mut opt = Optimizer::new();
             opt.add_pass(Box::new(crate::optimizeopt::rewrite::OptRewrite::new()));
             opt.add_pass(Box::new(OptPure::new()));
-            let result =
-                opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+            let result = opt.optimize_with_constants_and_inputs(
+                &ops,
+                &mut majit_ir::VecAssoc::new(),
+                1024,
+                crate::r#box::BoxPool::new(),
+            );
 
             assert_eq!(result.len(), 1);
             assert_eq!(result[0].opcode, expected_op);
@@ -1820,7 +1897,12 @@ mod tests {
         for i in 0..20u32 {}
         opt.add_pass(Box::new(crate::optimizeopt::rewrite::OptRewrite::new()));
         opt.add_pass(Box::new(OptPure::new()));
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut constants,
+            1024,
+            crate::r#box::BoxPool::new(),
+        );
 
         // 20 unique calls + the duplicate (#0) should be eliminated → 20 total
         assert_eq!(result.len(), 20);
@@ -1848,7 +1930,12 @@ mod tests {
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(crate::optimizeopt::rewrite::OptRewrite::new()));
         opt.add_pass(Box::new(OptPure::new()));
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut constants,
+            1024,
+            crate::r#box::BoxPool::new(),
+        );
 
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].opcode, OpCode::IntAdd);
@@ -1874,7 +1961,8 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure::new()));
-        let result = opt.optimize_with_constants(&ops, &mut constants);
+        let result =
+            opt.optimize_with_constants(&ops, &mut constants, crate::r#box::BoxPool::new());
 
         // IntAdd should be folded away (only Finish remains)
         assert_eq!(result.len(), 1, "IntAdd(3,4) should be constant-folded");
@@ -1899,7 +1987,8 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure::new()));
-        let result = opt.optimize_with_constants(&ops, &mut constants);
+        let result =
+            opt.optimize_with_constants(&ops, &mut constants, crate::r#box::BoxPool::new());
 
         assert_eq!(result.len(), 1, "IntLt(3,5) should be constant-folded");
     }
@@ -1921,8 +2010,12 @@ mod tests {
         opt.add_pass(Box::new(OptPure::new()));
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
-        let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut majit_ir::VecAssoc::new(),
+            1024,
+            crate::r#box::BoxPool::new(),
+        );
 
         // First pair stays, second pair CSE'd → 3 ops total
         let ovf_count = result
@@ -1951,7 +2044,8 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure::new()));
-        let result = opt.optimize_with_constants(&ops, &mut constants);
+        let result =
+            opt.optimize_with_constants(&ops, &mut constants, crate::r#box::BoxPool::new());
 
         // Both OVF and guard should be folded away
         let ovf_count = result
@@ -2089,8 +2183,12 @@ mod tests {
         opt.add_pass(Box::new(OptPure::new()));
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
-        let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut majit_ir::VecAssoc::new(),
+            1024,
+            crate::r#box::BoxPool::new(),
+        );
 
         // Second CALL_PURE → removed (CSE), its GUARD_NO_EXCEPTION → removed
         let gne_count = result
@@ -2552,8 +2650,12 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure::new()));
-        let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut majit_ir::VecAssoc::new(),
+            1024,
+            crate::r#box::BoxPool::new(),
+        );
 
         // First COND_CALL_VALUE emitted, second removed by CSE
         assert_eq!(result.len(), 1);
@@ -2575,7 +2677,12 @@ mod tests {
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         constants.insert(OpRef::const_int(0).raw(), majit_ir::Value::Int(0xCAFE));
         constants.insert(OpRef::const_int(1).raw(), majit_ir::Value::Int(7));
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1);
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut constants,
+            1,
+            crate::r#box::BoxPool::new(),
+        );
 
         assert!(result.is_empty());
         assert_eq!(
