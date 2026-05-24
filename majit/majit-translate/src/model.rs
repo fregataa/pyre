@@ -1412,7 +1412,10 @@ impl FrameState {
         // by `framestate.py:113-114 union`) from carry-through Variables
         // (`framestate.py:108 if w1 == w2: return w1`).  Mirrors the
         // pred-id gate in `register_phi_variables_in_stack_exc`.
-        let pred_local_ids: std::collections::HashSet<u64> = self_view
+        // `VecSet` per [[feedback-no-hashmap-ever]]: this set's live
+        // size is bounded by the locals_w width (one merge frame), so
+        // linear scan is the right shape.
+        let pred_local_ids: majit_ir::vec_set::VecSet<u64> = self_view
             .iter()
             .chain(other_view.iter())
             .filter_map(|c| c.as_ref())
