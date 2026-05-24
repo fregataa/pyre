@@ -7,18 +7,18 @@ repository.workspace = true
 description = "Rust port of RPython's translation pipeline (flowspace → annotator → rtyper → translator → jit/codewriter)"
 
 [dependencies]
-syn = { version = "2", features = ["full", "parsing", "visit"] }
-quote = "1"
+syn = { workspace = true, features = ["parsing"] }
+quote = { workspace = true }
 # `span-locations` exposes `Span::start()` / `Span::end()` for spans
 # created outside a proc-macro runtime, so `build_host_function_from_rust`
 # can read `syn::ItemFn`'s source line into the synthetic
 # `HostCode.co_firstlineno` (bytecode.py:46-60 parity). Without it
 # spans carry no line info and `co_firstlineno` falls back to 0.
-proc-macro2 = { version = "1", features = ["span-locations"] }
-serde = { version = "1", features = ["derive", "rc"] }
-serde_json = "1"
+proc-macro2 = { workspace = true, features = ["span-locations"] }
+serde = { workspace = true, features = ["rc"] }
+serde_json = { workspace = true }
 majit-ir = { workspace = true }
-libc = "0.2"
+libc = { workspace = true }
 # PRE-EXISTING-ADAPTATION, parity rule #1.
 #
 # RPython's `rpython/flowspace/bytecode.py` does `from opcode import
@@ -41,10 +41,10 @@ rustpython-compiler-core = { workspace = true }
 # graph's `co_code` when `print_statistics(save_per_graph_details=...)`
 # emits the per-graph file. Debug-only (gated by
 # `config.translation.backendopt.print_statistics`).
-md-5 = "0.10"
+md-5 = { workspace = true }
 vecset = { workspace = true }
 
 [dev-dependencies]
-tempfile = "3"
-walkdir = "2"
+tempfile = { workspace = true }
+walkdir = { workspace = true }
 rustpython-compiler = { workspace = true }

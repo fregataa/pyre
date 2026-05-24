@@ -11,12 +11,12 @@ majit-ir = { workspace = true }
 majit-backend = { workspace = true }
 majit-translate = { workspace = true }
 majit-gc = { workspace = true }
-cranelift-codegen = "0.130"
-cranelift-frontend = "0.130"
-cranelift-jit = "0.130"
-cranelift-module = "0.130"
-cranelift-native = "0.130"
-target-lexicon = "0.13"
+cranelift-codegen = { workspace = true }
+cranelift-frontend = { workspace = true }
+cranelift-jit = { workspace = true }
+cranelift-module = { workspace = true }
+cranelift-native = { workspace = true }
+target-lexicon = { workspace = true }
 
 [features]
 # Workspace-wide `cargo test --all --features dynasm` also selects this
@@ -27,4 +27,4 @@ dynasm = ["majit-metainterp/dynasm"]
 
 [dev-dependencies]
 majit-metainterp = { workspace = true }
-smallvec = "1"
+smallvec = { workspace = true }

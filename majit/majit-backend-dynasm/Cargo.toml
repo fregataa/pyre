@@ -11,9 +11,9 @@ majit-ir = { workspace = true }
 majit-backend = { workspace = true }
 majit-translate = { workspace = true }
 majit-gc = { workspace = true }
-dynasm = "5"
-dynasmrt = "5"
-libc = "0.2"
+dynasm = { workspace = true }
+dynasmrt = { workspace = true }
+libc = { workspace = true }
 
 [dev-dependencies]
 majit-trace = { workspace = true }

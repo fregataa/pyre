@@ -7,5 +7,5 @@ repository.workspace = true
 description = "Intermediate representation for majit JIT compiler"
 
 [dependencies]
-smallvec = "1.13"
-serde = { version = "1", features = ["derive"] }
+smallvec = { workspace = true }
+serde = { workspace = true }

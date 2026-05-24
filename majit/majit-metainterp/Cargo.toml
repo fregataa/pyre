@@ -18,7 +18,7 @@ majit-backend = { workspace = true }
 majit-gc = { workspace = true }
 majit-translate = { workspace = true }
 majit-backend-dynasm = { workspace = true, optional = true }
-smallvec = "1"
+smallvec = { workspace = true }
 vecset = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
@@ -30,4 +30,4 @@ majit-backend-wasm = { workspace = true }
 [dev-dependencies]
 majit-macros = { workspace = true }
 majit-gc = { workspace = true }
-smallvec = "1"
+smallvec = { workspace = true }

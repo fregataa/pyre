@@ -10,5 +10,5 @@ description = "Trace management and warm-up state for majit JIT compiler"
 majit-ir = { workspace = true }
 majit-backend = { workspace = true }
 majit-gc = { workspace = true }
-smallvec = "1"
+smallvec = { workspace = true }
 vecset = { workspace = true }
