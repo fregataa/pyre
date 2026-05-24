@@ -3340,6 +3340,67 @@ fn maybe_compile_and_run(
     None
 }
 
+/// Panic-safe RAII pairing for `FailDescr::start_compiling` /
+/// `done_compiling`.  `compile.py:704-709`:
+///
+/// ```python
+/// self.start_compiling()
+/// try:
+///     self._trace_and_compile_from_bridge(...)
+/// finally:
+///     self.done_compiling()
+/// ```
+///
+/// brackets bridge compilation with `start_compiling()` (set
+/// `ST_BUSY_FLAG`) and `done_compiling()` (clear it) in a try/finally —
+/// even when bridge compilation raises, `done_compiling` runs on the
+/// unwind path.  Pyre would otherwise leave the busy flag latched if
+/// the inner `trace_and_compile_from_bridge` panics, blocking every
+/// subsequent guard-fail retry on the same descriptor.  Holding an
+/// `Arc<dyn Descr>` clone keeps the descr alive across the scope and
+/// lets the drop call `as_fail_descr().done_compiling()` directly,
+/// matching `compile.py:786-795` instance-method dispatch.
+#[must_use = "drop the guard to clear ST_BUSY_FLAG"]
+pub(crate) struct GuardCompilingScope {
+    descr: std::sync::Arc<dyn majit_ir::Descr>,
+}
+
+impl GuardCompilingScope {
+    pub(crate) fn new(descr: &std::sync::Arc<dyn majit_ir::Descr>) -> Self {
+        // `compile.py:786-795 ResumeGuardDescr.start_compiling` is an
+        // instance method on `FailDescr` upstream — PyPy structurally
+        // cannot reach this code path with a non-fail descriptor (the
+        // `handle_fail` caller is itself a method on `FailDescr`).
+        // Pyre takes a `&Arc<dyn Descr>` to avoid an upfront downcast
+        // at the call site; PyPy raises `AttributeError` on a non-fail
+        // descr at the very first `start_compiling` lookup, so we
+        // panic in both debug and release builds via `expect` to match
+        // that fail-fast contract instead of silently skipping the
+        // start/done pair.
+        let fd = descr
+            .as_fail_descr()
+            .expect("GuardCompilingScope built on a non-fail descr; PyPy can only reach handle_fail through a FailDescr instance");
+        fd.start_compiling();
+        Self {
+            descr: std::sync::Arc::clone(descr),
+        }
+    }
+}
+
+impl Drop for GuardCompilingScope {
+    fn drop(&mut self) {
+        // The constructor's `expect` guarantees the underlying
+        // concrete type behind `dyn Descr` is a `FailDescr`; that
+        // type does not change for the lifetime of the Arc, so the
+        // downcast on the unwind path must also succeed.
+        let fd = self
+            .descr
+            .as_fail_descr()
+            .expect("GuardCompilingScope dropped with a descr that lost its FailDescr identity");
+        fd.done_compiling();
+    }
+}
+
 /// compile.py:701-717 handle_fail outcome.
 /// compile.py:701-717: handle_fail NEVER returns in RPython — it raises
 /// ContinueRunningNormally or DoneWithThisFrame. In pyre, we return the
@@ -3379,15 +3440,18 @@ fn handle_fail(
             driver.is_tracing()
         };
         if !is_tracing {
-            // `compile.py:704` `self.start_compiling()` — direct method
-            // call on the resume-guard descr instance.
-            if let Some(fd) = descr_arc.as_fail_descr() {
-                fd.start_compiling();
-            }
-            // compile.py:706-708: _trace_and_compile_from_bridge(deadframe)
-            // force_plain_eval prevents concrete calls during bridge
-            // tracing from re-entering compiled code.
+            // compile.py:704-709 try/finally: start_compiling() before
+            // bridge, done_compiling() on every unwind path.  The RAII
+            // guard packages both halves: ctor fires `start_compiling`
+            // via `descr.as_fail_descr()` (direct instance-method
+            // dispatch matching `compile.py:786-795`); drop fires
+            // `done_compiling` so a panic inside
+            // `trace_and_compile_from_bridge` cannot latch
+            // `ST_BUSY_FLAG`.
             let compiled = {
+                let _guard = GuardCompilingScope::new(descr_arc);
+                // force_plain_eval prevents concrete calls during bridge
+                // tracing from re-entering compiled code.
                 let _plain = pyre_interpreter::call::force_plain_eval();
                 crate::call_jit::trace_and_compile_from_bridge(
                     descr_arc,
@@ -3396,10 +3460,6 @@ fn handle_fail(
                     exit_layout,
                 )
             };
-            // `compile.py:709` `self.done_compiling()` — direct method call.
-            if let Some(fd) = descr_arc.as_fail_descr() {
-                fd.done_compiling();
-            }
             if compiled {
                 // compile.py:708: bridge compiled → ContinueRunningNormally.
                 // RPython: the bridge is attached to the guard descr;

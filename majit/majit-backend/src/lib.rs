@@ -5,9 +5,64 @@
 /// and the code generation backend (Cranelift, etc.).
 use std::cell::Cell;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use majit_ir::{Const, Descr, FailDescr, GcRef, InputArg, Op, OpRc, Type, Value};
+
+/// `rpython/jit/backend/model.py:8-12 CPUTotalTracker` — per-CPU totals
+/// bumped by `CompiledLoopToken.__init__` / `compiling_a_bridge` (loops
+/// and bridges created) and by the memory manager (loops and bridges
+/// freed).  PyPy attaches one tracker per `AbstractCPU` instance
+/// (`model.py:28-29 self.tracker = CPUTotalTracker()`).  Pyre matches
+/// that shape: each [`Backend`] impl owns an `Arc<CpuTotalTracker>`
+/// exposed via [`Backend::cpu_tracker`], and `MetaInterp::new` rebinds
+/// the paired profiler's tracker handle to the same Arc so reads
+/// through `Profiler.get_counter(TOTAL_*)` hit the same sink the
+/// backend's `compile_loop` / `compile_bridge` write to.  Multiple
+/// backend instances coexisting in one process (e.g. parallel
+/// translation tests) keep their totals isolated.
+///
+/// Each field is an [`AtomicUsize`] because PyPy's GIL-protected
+/// `+= 1` on a Python int becomes a cross-thread mutation in pyre — the
+/// backend may compile loops/bridges from worker threads while another
+/// reads totals.  `Relaxed` ordering matches PyPy: there is no causal
+/// relationship between bumps and snapshots.
+#[derive(Default, Debug)]
+pub struct CpuTotalTracker {
+    /// `model.py:9` `total_compiled_loops` — bumped once by
+    /// [`record_compiled_loop_token`] for each [`CompiledLoopToken`],
+    /// at backend `compile_loop` entry (PyPy `x86/assembler.py:514`
+    /// parity).  The bump used to live in [`CompiledLoopToken::new`]
+    /// but moved because pyre eagerly creates the CLT in
+    /// `JitCellToken::new`, which would over-count tokens that are
+    /// allocated but never assembled (the `register_pending_target`
+    /// path is one such caller).
+    pub total_compiled_loops: AtomicUsize,
+    /// `model.py:10` `total_compiled_bridges` — bumped by
+    /// [`CompiledLoopToken::compiling_a_bridge`] before bridge assembly.
+    pub total_compiled_bridges: AtomicUsize,
+    /// `model.py:11` `total_freed_loops` — bumped by the memory manager
+    /// (`memmgr.py:_kill_old_loops_now`) when an evicted token had no
+    /// attached bridges.
+    pub total_freed_loops: AtomicUsize,
+    /// `model.py:12` `total_freed_bridges` — bumped by the memory
+    /// manager for each bridge attached to an evicted token.
+    pub total_freed_bridges: AtomicUsize,
+}
+
+/// Process-wide fallback [`CpuTotalTracker`] for callers that have no
+/// backend handle in scope.  Should be reserved for legacy/test paths
+/// that pre-date the per-backend [`Backend::cpu_tracker`] hook; the
+/// production path threads each backend's own `Arc<CpuTotalTracker>`
+/// through [`record_compiled_loop_token`] and
+/// [`CompiledLoopToken::compiling_a_bridge`] so PyPy's per-CPU
+/// `cpu.tracker` semantics survive when multiple backends or
+/// `MetaInterpStaticData` instances coexist (e.g. tests that build
+/// fresh fixtures inside one process).
+pub fn fallback_cpu_tracker() -> &'static CpuTotalTracker {
+    static TRACKER: std::sync::OnceLock<CpuTotalTracker> = std::sync::OnceLock::new();
+    TRACKER.get_or_init(CpuTotalTracker::default)
+}
 
 pub mod call_stub;
 pub mod finish_descrs;
@@ -896,11 +951,60 @@ pub struct CompiledLoopToken {
     /// `CALL_ASSEMBLER` uses in `handle_call_assembler`
     /// (rewrite.py:673) to spill callee arguments.
     pub _ll_initial_locs: parking_lot::Mutex<Vec<i32>>,
+    /// Pyre-only one-shot latch for the side effects PyPy performs in
+    /// `CompiledLoopToken.__init__` (`model.py:296-307`): increment
+    /// `cpu.tracker.total_compiled_loops` and emit the
+    /// `jit-mem-looptoken-alloc` log section.
+    ///
+    /// PyPy creates the CLT inside backend `assemble_loop`, so the
+    /// constructor side effects are naturally tied to actual assembly.
+    /// Pyre creates `CompiledLoopToken` eagerly with `JitCellToken`;
+    /// this latch lets `record_compiled_loop_token` fire at backend
+    /// assembly time while preserving PyPy's strict "once per CLT"
+    /// semantics if a caller retries `compile_loop` with the same token.
+    loop_allocation_recorded: AtomicBool,
+}
+
+/// PyPy `model.py:296-307` `CompiledLoopToken.__init__` opens the
+/// `jit-mem-looptoken-alloc` debug section and bumps
+/// `cpu.tracker.total_compiled_loops` at the point where the CLT is
+/// created — `x86/assembler.py:514` and the per-backend equivalents do
+/// that *inside* `assemble_loop`.  Pyre's [`CompiledLoopToken::new`]
+/// runs eagerly from [`JitCellToken::new`] (line 1265 documents the
+/// eager-vs-lazy adaptation), so doing the bump there would
+/// over-count loops whose JitCellToken is allocated but never reaches
+/// `backend.compile_loop` (the `register_pending_target` path in
+/// `dynasm/runner.rs` is one such caller).
+///
+/// Each backend's `compile_loop` calls this helper as its first act.
+/// The helper records at most once per [`CompiledLoopToken`], matching
+/// PyPy's constructor side effect even if a Rust caller retries
+/// `compile_loop` with the same token.  The caller passes its own
+/// [`CpuTotalTracker`] (via
+/// [`Backend::cpu_tracker`]) so multiple backend instances in the
+/// same process keep separate totals — matching PyPy's per-CPU
+/// `cpu.tracker`.
+pub fn record_compiled_loop_token(tracker: &CpuTotalTracker, clt: &CompiledLoopToken) {
+    if clt.loop_allocation_recorded.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    tracker.total_compiled_loops.fetch_add(1, Ordering::Relaxed);
+    majit_ir::debug::log_one(
+        "jit-mem-looptoken-alloc",
+        &format!("allocating Loop # {}", clt.number),
+    );
 }
 
 impl CompiledLoopToken {
     /// `model.py:296-307` `__init__(self, cpu, number)`. The `cpu` is
     /// implicit in pyre — the owning `Backend` holds the token lifetime.
+    ///
+    /// **Counter / debug-section moved.**  PyPy bumps
+    /// `cpu.tracker.total_compiled_loops` and emits the
+    /// `jit-mem-looptoken-alloc` debug section here.  Pyre defers both
+    /// to [`record_compiled_loop_token`] called at the
+    /// [`Backend::compile_loop`] entry — see that helper's doc for the
+    /// eager-CLT rationale.
     pub fn new(number: u64) -> Self {
         CompiledLoopToken {
             number,
@@ -912,6 +1016,7 @@ impl CompiledLoopToken {
             asmmemmgr_gcreftracers: parking_lot::Mutex::new(Vec::new()),
             frame_info: parking_lot::Mutex::new(JitFrameInfo::default()),
             _ll_initial_locs: parking_lot::Mutex::new(Vec::new()),
+            loop_allocation_recorded: AtomicBool::new(false),
         }
     }
 
@@ -933,13 +1038,30 @@ impl CompiledLoopToken {
         self.loop_token_wref.lock().upgrade()
     }
 
-    /// `model.py:309-314` `compiling_a_bridge(self)`. The accompanying
-    /// `self.cpu.tracker.total_compiled_bridges += 1` and
-    /// `debug_start/debug_print/debug_stop` on the RPython side are
-    /// **PRE-EXISTING-ADAPTATION** (pyre has no global `cpu.tracker`
-    /// counter and uses `tracing` crate instead of `rpython.rlib.debug`).
-    pub fn compiling_a_bridge(&self) {
-        *self.bridges_count.lock() += 1;
+    /// `model.py:309-314` `compiling_a_bridge(self)` — bumps the
+    /// owning backend's `total_compiled_bridges` tracker, increments
+    /// this token's local `bridges_count`, and emits the
+    /// `jit-mem-looptoken-alloc` debug section line-for-line with
+    /// upstream.  The `tracker` parameter is the backend's own
+    /// [`CpuTotalTracker`] (via [`Backend::cpu_tracker`]) so multiple
+    /// backend instances stay isolated, matching PyPy's per-CPU
+    /// `cpu.tracker`.
+    pub fn compiling_a_bridge(&self, tracker: &CpuTotalTracker) {
+        tracker
+            .total_compiled_bridges
+            .fetch_add(1, Ordering::Relaxed);
+        let bridges_count = {
+            let mut count = self.bridges_count.lock();
+            *count += 1;
+            *count
+        };
+        majit_ir::debug::log_one(
+            "jit-mem-looptoken-alloc",
+            &format!(
+                "allocating Bridge # {} of Loop # {}",
+                bridges_count, self.number
+            ),
+        );
     }
 
     /// `rpython/jit/backend/model.py:316-329`
@@ -1480,6 +1602,30 @@ pub type CpuDescrHandle = Arc<std::sync::RwLock<CpuDescrAttachments>>;
 ///
 /// Mirrors rpython/jit/backend/model.py AbstractCPU.
 pub trait Backend: Send {
+    /// `rpython/jit/backend/model.py:28-29` `self.tracker =
+    /// CPUTotalTracker()` parity — each backend instance owns its
+    /// own [`CpuTotalTracker`].  [`record_compiled_loop_token`] and
+    /// [`CompiledLoopToken::compiling_a_bridge`] read this through
+    /// `&self` so multi-backend processes (e.g. test fixtures
+    /// creating fresh `MetaInterpStaticData` repeatedly) keep
+    /// counters isolated.
+    ///
+    /// Default returns a process-wide `Arc<CpuTotalTracker>` distinct
+    /// from [`fallback_cpu_tracker`]: the trait signature is
+    /// `&Arc<CpuTotalTracker>` (so callers can `Arc::clone` into
+    /// [`crate::JitProfiler::set_cpu_tracker`]) while
+    /// `fallback_cpu_tracker` returns a `&'static CpuTotalTracker`
+    /// reference for callers that already have direct access.  The
+    /// two statics therefore back independent counter stores;
+    /// synthetic/test backends that don't override this method
+    /// continue to behave like a process-global singleton among
+    /// themselves but won't observe writes through
+    /// `fallback_cpu_tracker`.
+    fn cpu_tracker(&self) -> &Arc<CpuTotalTracker> {
+        static FALLBACK_ARC: std::sync::OnceLock<Arc<CpuTotalTracker>> = std::sync::OnceLock::new();
+        FALLBACK_ARC.get_or_init(|| Arc::new(CpuTotalTracker::default()))
+    }
+
     /// Compile a loop trace into native code.
     fn compile_loop(
         &mut self,

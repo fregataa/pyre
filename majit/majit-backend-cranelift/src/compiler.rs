@@ -7007,6 +7007,12 @@ fn resolve_fail_arg_types(
 // ---------------------------------------------------------------------------
 
 pub struct CraneliftBackend {
+    /// `rpython/jit/backend/model.py:28-29 self.tracker =
+    /// CPUTotalTracker()` parity — per-instance `cpu.tracker`
+    /// exposed via [`Backend::cpu_tracker`].  See the DynasmBackend
+    /// counterpart for the shared-Arc pairing rationale with the
+    /// metainterp `JitProfiler`.
+    cpu_tracker: Arc<majit_backend::CpuTotalTracker>,
     module: JITModule,
     func_ctx: FunctionBuilderContext,
     constants: majit_ir::VecAssoc<u32, i64>,
@@ -7207,6 +7213,7 @@ impl CraneliftBackend {
         let func_ctx = FunctionBuilderContext::new();
 
         CraneliftBackend {
+            cpu_tracker: Arc::new(majit_backend::CpuTotalTracker::default()),
             module,
             func_ctx,
             constants: majit_ir::VecAssoc::new(),
@@ -14072,12 +14079,23 @@ impl majit_backend::Backend for CraneliftBackend {
         "cranelift"
     }
 
+    fn cpu_tracker(&self) -> &Arc<majit_backend::CpuTotalTracker> {
+        &self.cpu_tracker
+    }
+
     fn compile_loop(
         &mut self,
         inputargs: &[InputArg],
         ops: &[OpRc],
         token: &mut JitCellToken,
     ) -> Result<AsmInfo, BackendError> {
+        // `x86/assembler.py:514` parity — bump
+        // `cpu.tracker.total_compiled_loops` and open the
+        // `jit-mem-looptoken-alloc` debug section at the same point
+        // PyPy's `assemble_loop` creates the `CompiledLoopToken`.
+        if let Some(clt) = token.compiled_loop_token.as_ref() {
+            majit_backend::record_compiled_loop_token(&self.cpu_tracker, clt);
+        }
         // Deep-clone Op out of OpRc for the internal pipeline (post-optimizer
         // boundary; backend stages do not depend on `_forwarded` sharing).
         let ops_owned: Vec<Op> = ops.iter().map(|rc| (**rc).clone()).collect();
@@ -14224,6 +14242,11 @@ impl majit_backend::Backend for CraneliftBackend {
         previous_tokens: &[std::sync::Arc<JitCellToken>],
         caller_recovery_layout: Option<&majit_backend::ExitRecoveryLayout>,
     ) -> Result<AsmInfo, BackendError> {
+        // `x86/runner.py:100-101` parity — bump this backend's
+        // tracker and the per-loop bridges_count before assembling.
+        if let Some(clt) = original_token.compiled_loop_token.as_ref() {
+            clt.compiling_a_bridge(&self.cpu_tracker);
+        }
         let ops_owned: Vec<Op> = ops.iter().map(|rc| (**rc).clone()).collect();
         let ops: &[Op] = &ops_owned;
         let invalidated_arc = original_token.invalidated.clone();

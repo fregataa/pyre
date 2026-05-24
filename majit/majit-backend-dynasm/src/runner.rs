@@ -401,8 +401,31 @@ pub extern "C" fn dynasm_nursery_slowpath_jitframe(frame_size: u64) -> u64 {
     })
 }
 
-/// _build_malloc_slowpath(kind='var') parity: varsize nursery overflow.
-/// Called with (base_size, item_size, length). Returns payload pointer.
+/// `_build_malloc_slowpath(kind='var')` parity: varsize nursery
+/// overflow.  Called with `(base_size, item_size, length)`; returns the
+/// payload pointer.
+///
+/// **PRE-EXISTING-ADAPTATION (str/unicode/var slowpath collapse).**
+/// PyPy `x86/assembler.py:231-323 _build_malloc_slowpath(kind)` builds
+/// four distinct trampolines (`'fixed'`, `'str'`, `'unicode'`, `'var'`)
+/// stored as separate fields on the assembler
+/// (`malloc_slowpath`/`malloc_slowpath_varsize`/`malloc_slowpath_str`/
+/// `malloc_slowpath_unicode`).  Each callsite (`assembler.py:2592-2598`
+/// in `genop_call_malloc_nursery_varsize`) jumps to the trampoline
+/// matching the requested kind, which in turn calls the GC helper
+/// (`malloc_str`, `malloc_unicode`, `gc_ll_descr.malloc_slowpath_array`).
+///
+/// Pyre collapses the three varsize kinds into this single helper —
+/// `gc.alloc_varsize(base, item, length)` covers all three since pyre's
+/// `majit-gc` does not specialise on str/unicode object headers.  The
+/// fast path (`OpCode::CallMallocNurseryVarsize` in
+/// `x86/assembler.rs`) `CALL`s this directly instead of `JMP`-ing into
+/// a per-kind trampoline; OOM propagation flows through the same
+/// `propagate_exception_path` PyPy uses, just inlined per callsite
+/// rather than reached via the trampoline's tail `JMP`.  The behaviour
+/// is observationally identical (allocate-or-OOM-propagate); the
+/// missing per-kind trampolines are a code-shape divergence to revisit
+/// if pyre adopts the PyPy-style header-specialised GC allocators.
 pub extern "C" fn dynasm_nursery_slowpath_varsize(
     base_size: u64,
     item_size: u64,
@@ -664,6 +687,16 @@ pub unsafe extern "C" fn dynasm_realloc_frame(
 
 /// runner.py:23 AbstractX86CPU — concrete Backend implementation.
 pub struct DynasmBackend {
+    /// `rpython/jit/backend/model.py:28-29 self.tracker = CPUTotalTracker()`
+    /// parity — per-instance `cpu.tracker` exposed via
+    /// [`Backend::cpu_tracker`].  Held behind `Arc` so the same
+    /// counters are shared with the paired `JitProfiler` (which
+    /// borrows the same `Arc` during [`crate::pyjitpl::MetaInterp::new`]
+    /// setup in metainterp) — reads through `Profiler.get_counter`
+    /// and writes through [`majit_backend::record_compiled_loop_token`]
+    /// / [`CompiledLoopToken::compiling_a_bridge`] hit one shared
+    /// store.
+    cpu_tracker: Arc<majit_backend::CpuTotalTracker>,
     /// Next unique trace ID.
     next_trace_id: u64,
     /// Next header PC (green key).
@@ -769,6 +802,7 @@ impl DynasmBackend {
         // `compile.make_and_attach_done_descrs([self, cpu])` during
         // `MetaInterpStaticData.finish_setup` (pyjitpl.py:2222).
         DynasmBackend {
+            cpu_tracker: Arc::new(majit_backend::CpuTotalTracker::default()),
             next_trace_id: 1,
             next_header_pc: 0,
             constants: majit_ir::VecAssoc::new(),
@@ -1612,12 +1646,26 @@ impl DynasmBackend {
 }
 
 impl Backend for DynasmBackend {
+    fn cpu_tracker(&self) -> &Arc<majit_backend::CpuTotalTracker> {
+        &self.cpu_tracker
+    }
+
     fn compile_loop(
         &mut self,
         inputargs: &[InputArg],
         ops: &[OpRc],
         token: &mut JitCellToken,
     ) -> Result<AsmInfo, BackendError> {
+        // `x86/assembler.py:514` parity: PyPy creates the
+        // `CompiledLoopToken` inside `assemble_loop`, and that's where
+        // the `cpu.tracker.total_compiled_loops` bump and the
+        // `jit-mem-looptoken-alloc` debug section fire.  Pyre's eager
+        // CLT creation makes that point unreachable from
+        // `CompiledLoopToken::new`; defer both to here so the counter
+        // matches PyPy at the same structural moment.
+        if let Some(clt) = token.compiled_loop_token.as_ref() {
+            majit_backend::record_compiled_loop_token(&self.cpu_tracker, clt);
+        }
         // Deep-clone Op out of OpRc for the internal pipeline. Backend
         // stages do not depend on shared `_forwarded` identity with the
         // trace; the optimizer has already resolved forwarding by the
@@ -1839,6 +1887,15 @@ impl Backend for DynasmBackend {
         _previous_tokens: &[std::sync::Arc<JitCellToken>],
         _caller_recovery_layout: Option<&majit_backend::ExitRecoveryLayout>,
     ) -> Result<AsmInfo, BackendError> {
+        // `x86/runner.py:100-101` parity:
+        //   clt = original_loop_token.compiled_loop_token
+        //   clt.compiling_a_bridge()
+        // Bumps this backend's `cpu.tracker.total_compiled_bridges`,
+        // the per-loop `bridges_count`, and emits the
+        // `jit-mem-looptoken-alloc` debug section.
+        if let Some(clt) = original_token.compiled_loop_token.as_ref() {
+            clt.compiling_a_bridge(&self.cpu_tracker);
+        }
         // Deep-clone Op out of OpRc for the internal pipeline (see
         // compile_loop above for rationale).
         let ops_owned: Vec<Op> = ops.iter().map(|rc| (**rc).clone()).collect();

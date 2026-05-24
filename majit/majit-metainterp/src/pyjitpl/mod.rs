@@ -29,6 +29,47 @@ pub(crate) use majit_backend_wasm::WasmBackend as BackendImpl;
 #[cfg(not(any(feature = "cranelift", feature = "dynasm", target_arch = "wasm32")))]
 compile_error!("majit-metainterp requires a backend: enable feature \"cranelift\" or \"dynasm\"");
 
+/// Dismissable RAII guard around `crate::debug::debug_start(channel)`.
+/// On drop without [`dismiss`](Self::dismiss), fires
+/// `debug_stop(channel)` so the PYPYLOG category stack stays balanced
+/// when the surrounding code panics before the normal `debug_stop`
+/// site (e.g. an `assert!` inside `_setup_once`).  Used by
+/// [`MetaInterp::prepare_trace_start_runtime`] to bridge the gap
+/// between `debug_start("jit-tracing")` and
+/// [`MetaInterp::open_profiler_tracing_inner`], after which ownership
+/// of the close transfers to
+/// [`MetaInterp::leave_profiler_tracing`].
+#[must_use = "drop the rollback guard to fire debug_stop on the unwind path"]
+struct DebugSectionRollback {
+    channel: &'static str,
+    armed: bool,
+}
+
+impl DebugSectionRollback {
+    fn arm(channel: &'static str) -> Self {
+        crate::debug::debug_start(channel);
+        Self {
+            channel,
+            armed: true,
+        }
+    }
+
+    /// Cancel the rollback — the caller has reached a point where
+    /// some downstream code path is now responsible for issuing the
+    /// matching `debug_stop`.
+    fn dismiss(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for DebugSectionRollback {
+    fn drop(&mut self) {
+        if self.armed {
+            crate::debug::debug_stop(self.channel);
+        }
+    }
+}
+
 use crate::history::TreeLoop;
 use crate::warmstate::{HotResult, WarmEnterState};
 use majit_ir::descr::DescrRef;
@@ -1912,6 +1953,17 @@ impl<M: Clone> MetaInterp<M> {
             .expect("MetaInterpStaticData must be uniquely owned during MetaInterp::new")
             .jit_starting_line = format!("JIT starting ({})", backend.backend_name());
         staticdata.attach_descrs_to_cpu(backend);
+        // jitprof.py:105-106 `self.cpu.tracker` — bind the profiler's
+        // tracker handle to the backend's `CpuTotalTracker` Arc so
+        // `TOTAL_COMPILED_*` / `TOTAL_FREED_*` reads route to the same
+        // per-CPU sink the backend writes via
+        // `record_compiled_loop_token` / `clt.compiling_a_bridge`.
+        // Without this rebind, the freshly-constructed profiler holds
+        // a private tracker disconnected from the backend's, so totals
+        // would silently zero out.
+        staticdata
+            .profiler
+            .set_cpu_tracker(std::sync::Arc::clone(backend.cpu_tracker()));
         this
     }
 
@@ -2136,29 +2188,74 @@ impl<M: Clone> MetaInterp<M> {
         self.bridge_info = None;
     }
 
-    /// `pyjitpl.py:2890 / 2916` `profiler.start_tracing()` parity —
-    /// open the tracing profiler event scope.  Idempotent re-entry is
-    /// not allowed (PyPy's compile_and_run_once / handle_guard_failure
-    /// are not re-entrant on the same MetaInterp).
+    /// `pyjitpl.py:2890 / 2916`
+    /// `debug_start("jit-tracing"); profiler.start_tracing()` parity —
+    /// open the tracing debug section and profiler event scope.
+    /// Idempotent re-entry is not allowed (PyPy's
+    /// `compile_and_run_once` / `handle_guard_failure` are not
+    /// re-entrant on the same MetaInterp).  The debug section and
+    /// profiler event are issued together here because the
+    /// matching close lives in [`leave_profiler_tracing`]; both halves
+    /// must move as a pair to keep the `debug_start`/`debug_stop`
+    /// nesting balanced (PyPy convention).
+    ///
+    /// Use [`open_profiler_tracing_inner`](Self::open_profiler_tracing_inner)
+    /// instead when the caller needs `_setup_once` to run *inside*
+    /// the debug section but *before* the profiler event (PyPy
+    /// `compile_and_run_once` order at `pyjitpl.py:2888-2892`).
     pub fn enter_profiler_tracing(&mut self) {
-        debug_assert!(
+        // `assert!` (not `debug_assert!`): in release, a second
+        // entry would open another profiler/debug scope that
+        // `leave_profiler_tracing` cannot close (the boolean flag
+        // only tracks one scope), leaving the stacks permanently
+        // unbalanced and corrupting later `debug_stop` mismatch
+        // detection.  Crash-on-misuse matches PyPy's intolerance for
+        // recursive `start_tracing()` (`jitprof.py:81` would push
+        // a second TRACING and `_print_stats` would observe it).
+        assert!(
             !self.profiler_tracing_active,
             "enter_profiler_tracing called while tracing profiler event is already open",
+        );
+        crate::debug::debug_start("jit-tracing");
+        self.staticdata.profiler.start_tracing();
+        self.profiler_tracing_active = true;
+    }
+
+    /// Open the profiler tracing event scope assuming the
+    /// `jit-tracing` debug section has *already* been opened upstream
+    /// by the caller.  Used by [`prepare_trace_start_runtime`] so the
+    /// debug section can wrap `_setup_once` while the profiler event
+    /// only opens after `_setup_once` completes — matching the
+    /// `debug_start; _setup_once; start_tracing` order at
+    /// `pyjitpl.py:2888-2892`.  The matching close still routes
+    /// through [`leave_profiler_tracing`].
+    pub fn open_profiler_tracing_inner(&mut self) {
+        // Same release-build assertion contract as
+        // [`enter_profiler_tracing`] — a second entry would leak a
+        // profiler scope past `leave_profiler_tracing`'s single-flag
+        // close.
+        assert!(
+            !self.profiler_tracing_active,
+            "open_profiler_tracing_inner called while tracing profiler event is already open",
         );
         self.staticdata.profiler.start_tracing();
         self.profiler_tracing_active = true;
     }
 
-    /// `pyjitpl.py:2897 / 2934` `profiler.end_tracing()` parity —
-    /// close the tracing profiler event scope opened by
-    /// [`enter_profiler_tracing`].  No-op if the scope was already
-    /// closed (mirrors PyPy's `finally` semantics: a path that never
-    /// reached `start_tracing` still passes through `finally` without
-    /// firing `end_tracing` because the implicit pairing depends on
-    /// whether the entry method ran past `start_tracing`).
+    /// `pyjitpl.py:2897 / 2934`
+    /// `profiler.end_tracing(); debug_stop("jit-tracing")` parity —
+    /// close the profiler event scope opened by
+    /// [`enter_profiler_tracing`], then the matching debug section
+    /// (LIFO unwind matching PyPy's nested `try/finally`).  No-op if
+    /// the scope was already closed (mirrors PyPy's `finally`
+    /// semantics: a path that never reached `start_tracing` still
+    /// passes through `finally` without firing `end_tracing` because
+    /// the implicit pairing depends on whether the entry method ran
+    /// past `start_tracing`).
     pub fn leave_profiler_tracing(&mut self) {
         if self.profiler_tracing_active {
             self.staticdata.profiler.end_tracing();
+            crate::debug::debug_stop("jit-tracing");
             self.profiler_tracing_active = false;
         }
     }
@@ -2919,16 +3016,49 @@ impl<M: Clone> MetaInterp<M> {
 
     fn prepare_trace_start_runtime(&mut self) {
         // pyjitpl.py:2884-2892 `compile_and_run_once` body, line-by-line:
-        //   debug_start('jit-tracing')
+        //   debug_start('jit-tracing')                  # OUTER open
         //   self.staticdata._setup_once()
-        //   self.staticdata.profiler.start_tracing()
+        //   self.staticdata.profiler.start_tracing()    # INNER open
         //   self.staticdata.try_to_free_some_loops()
         // `ensure_jitlog_initialised` is pyre's pre-`_setup_once` jitlog
         // bootstrap; it has no PyPy analog (jitlog wiring runs inside
         // `_setup_once` upstream) and stays idempotent.
+        //
+        // The debug section wraps `_setup_once` upstream so any
+        // `debug_print` inside the one-shot bootstrap (vector-ext
+        // setup, jitlog handshake, etc.) lands inside the
+        // `jit-tracing` PYPYLOG section.  Pyre matches that by opening
+        // the debug section *before* `_setup_once` and the profiler
+        // event *after*, splitting the work that
+        // [`enter_profiler_tracing`] would normally combine.
         self.warm_state.ensure_jitlog_initialised();
+        // `_setup_once` contains unconditional asserts (vector_ext
+        // setup, jitdriver registration sanity, etc.) — a failure
+        // panics out of this function.  Use a dismissable RAII
+        // guard so the debug section closes on the unwind path
+        // instead of leaving `MAJIT_LOG`'s category stack
+        // unbalanced (which would trigger later `debug_stop`
+        // mismatch panics).
+        let rollback = DebugSectionRollback::arm("jit-tracing");
         self.staticdata._setup_once(&mut self.backend);
-        self.enter_profiler_tracing();
+        // Profiler event opens after `_setup_once`, matching PyPy
+        // line 2890.  `open_profiler_tracing_inner` is the
+        // debug_start-skipping variant of `enter_profiler_tracing`
+        // since the section is already open above.
+        //
+        // The rollback stays armed across `open_profiler_tracing_inner`:
+        // that call's `start_tracing()` can panic on a poisoned
+        // timing mutex, and the active flag is only set *after*
+        // `start_tracing()` returns.  If we dismissed earlier and
+        // `start_tracing()` then panicked, `profiler_tracing_active`
+        // would stay `false` so `leave_profiler_tracing` would skip
+        // the close — leaking the debug section.  Dismissing only
+        // after `open_profiler_tracing_inner` returns hands the
+        // close off cleanly: success → `leave_profiler_tracing`
+        // owns it via the now-`true` flag; panic → the rollback
+        // fires `debug_stop` on the unwind path.
+        self.open_profiler_tracing_inner();
+        rollback.dismiss();
         self.try_to_free_some_loops();
     }
 
@@ -4823,18 +4953,22 @@ impl<M: Clone> MetaInterp<M> {
             .iter()
             .map(|op| std::rc::Rc::new(op.clone()))
             .collect();
-        // compile.py:532-546 `profiler.start_backend() ... try: do_compile_loop
-        // ... finally: ... profiler.end_backend()`.
-        self.staticdata.profiler.start_backend();
-        let compile_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.backend.compile_loop(
-                &inputargs,
-                &compiled_ops_rc,
-                Arc::get_mut(&mut token)
-                    .expect("JitCellToken must stay uniquely owned until backend compile"),
-            )
-        }));
-        self.staticdata.profiler.end_backend();
+        // compile.py:532-546 `debug_start("jit-backend") +
+        // profiler.start_backend() ... try: do_compile_loop ... finally:
+        // ... profiler.end_backend() + debug_stop("jit-backend")`.
+        // `enter_backend` RAII guard pairs the debug section + profiler
+        // event; drop fires end_backend then debug_stop in LIFO order.
+        let compile_result = {
+            let _backend_scope = self.staticdata.profiler.enter_backend();
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.backend.compile_loop(
+                    &inputargs,
+                    &compiled_ops_rc,
+                    Arc::get_mut(&mut token)
+                        .expect("JitCellToken must stay uniquely owned until backend compile"),
+                )
+            }))
+        };
         let compile_result = match compile_result {
             Ok(r) => r,
             Err(e) => {
@@ -4999,11 +5133,9 @@ impl<M: Clone> MetaInterp<M> {
                 self.attach_procedure_with_redirect(green_key, Arc::clone(&token));
 
                 self.stats.loops_compiled += 1;
-                // jitprof.py:106 `self.cpu.tracker.total_compiled_loops`
-                // parity — bump the per-process profiler tracker so
-                // `Profiler.get_counter(TOTAL_COMPILED_LOOPS)` returns
-                // the post-`record_loop_or_bridge` total.
-                self.staticdata.profiler.inc_compiled_loop();
+                // `cpu.tracker.total_compiled_loops` is bumped inside
+                // `CompiledLoopToken::new` (model.py:297 parity); no
+                // explicit metainterp-side bump needed here.
 
                 if let Some(ref hook) = self.hooks.on_compile_loop {
                     hook(green_key, num_ops_before, num_ops_after);
@@ -5658,23 +5790,25 @@ impl<M: Clone> MetaInterp<M> {
         self.backend.set_next_trace_id(trace_id);
         self.backend.set_next_header_pc(green_key);
 
-        // compile.py:532-546 `profiler.start_backend() ... try: do_compile_loop
-        // ... finally: ... profiler.end_backend()`.
-        self.staticdata.profiler.start_backend();
-        let compile_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            // Wrap to `Vec<OpRc>` for the backend's trait boundary.
-            let combined_ops_rc: Vec<majit_ir::OpRc> = combined_ops
-                .iter()
-                .map(|op| std::rc::Rc::new(op.clone()))
-                .collect();
-            self.backend.compile_loop(
-                &inputargs,
-                &combined_ops_rc,
-                Arc::get_mut(&mut token)
-                    .expect("JitCellToken must stay uniquely owned until backend compile"),
-            )
-        }));
-        self.staticdata.profiler.end_backend();
+        // compile.py:532-546 `debug_start("jit-backend") +
+        // profiler.start_backend() ... try: do_compile_loop ... finally:
+        // ... profiler.end_backend() + debug_stop("jit-backend")`.
+        let compile_result = {
+            let _backend_scope = self.staticdata.profiler.enter_backend();
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // Wrap to `Vec<OpRc>` for the backend's trait boundary.
+                let combined_ops_rc: Vec<majit_ir::OpRc> = combined_ops
+                    .iter()
+                    .map(|op| std::rc::Rc::new(op.clone()))
+                    .collect();
+                self.backend.compile_loop(
+                    &inputargs,
+                    &combined_ops_rc,
+                    Arc::get_mut(&mut token)
+                        .expect("JitCellToken must stay uniquely owned until backend compile"),
+                )
+            }))
+        };
         let compile_result = match compile_result {
             Ok(r) => r,
             Err(_) => {
@@ -5822,11 +5956,8 @@ impl<M: Clone> MetaInterp<M> {
                 );
                 self.attach_procedure_with_redirect(green_key, Arc::clone(&token));
                 self.stats.loops_compiled += 1;
-                // jitprof.py:106 `self.cpu.tracker.total_compiled_loops`
-                // parity — bump the per-process profiler tracker so
-                // `Profiler.get_counter(TOTAL_COMPILED_LOOPS)` returns
-                // the post-`record_loop_or_bridge` total.
-                self.staticdata.profiler.inc_compiled_loop();
+                // `cpu.tracker.total_compiled_loops` is bumped inside
+                // `CompiledLoopToken::new` (model.py:297 parity).
 
                 if let Some(ref hook) = self.hooks.on_compile_loop {
                     hook(green_key, 0, num_combined_ops);
@@ -6201,8 +6332,9 @@ impl<M: Clone> MetaInterp<M> {
             .iter()
             .map(|op| std::rc::Rc::new(op.clone()))
             .collect();
-        // compile.py:532-546 `profiler.start_backend() ... try: do_compile_loop
-        // ... finally: ... profiler.end_backend()`.
+        // compile.py:532-546 `debug_start("jit-backend") +
+        // profiler.start_backend() ... try: do_compile_loop ... finally:
+        // ... profiler.end_backend() + debug_stop("jit-backend")`.
         let compile_loop_result = {
             let _backend_guard = self.staticdata.profiler.enter_backend();
             self.backend.compile_loop(
@@ -6327,11 +6459,8 @@ impl<M: Clone> MetaInterp<M> {
                 }
                 self.attach_procedure_with_redirect(green_key, Arc::clone(&token));
                 self.stats.loops_compiled += 1;
-                // jitprof.py:106 `self.cpu.tracker.total_compiled_loops`
-                // parity — bump the per-process profiler tracker so
-                // `Profiler.get_counter(TOTAL_COMPILED_LOOPS)` returns
-                // the post-`record_loop_or_bridge` total.
-                self.staticdata.profiler.inc_compiled_loop();
+                // `cpu.tracker.total_compiled_loops` is bumped inside
+                // `CompiledLoopToken::new` (model.py:297 parity).
                 if crate::debug::have_debug_prints() {
                     crate::debug::log_one(
                         "jit-summary",
@@ -6560,8 +6689,9 @@ impl<M: Clone> MetaInterp<M> {
             .iter()
             .map(|op| std::rc::Rc::new(op.clone()))
             .collect();
-        // compile.py:532-546 `profiler.start_backend() ... try: do_compile_loop
-        // ... finally: ... profiler.end_backend()`.
+        // compile.py:532-546 `debug_start("jit-backend") +
+        // profiler.start_backend() ... try: do_compile_loop ... finally:
+        // ... profiler.end_backend() + debug_stop("jit-backend")`.
         let compile_loop_result = {
             let _backend_guard = self.staticdata.profiler.enter_backend();
             self.backend.compile_loop(
@@ -6650,11 +6780,8 @@ impl<M: Clone> MetaInterp<M> {
                     },
                 );
                 self.stats.loops_compiled += 1;
-                // jitprof.py:106 `self.cpu.tracker.total_compiled_loops`
-                // parity — bump the per-process profiler tracker so
-                // `Profiler.get_counter(TOTAL_COMPILED_LOOPS)` returns
-                // the post-`record_loop_or_bridge` total.
-                self.staticdata.profiler.inc_compiled_loop();
+                // `cpu.tracker.total_compiled_loops` is bumped inside
+                // `CompiledLoopToken::new` (model.py:297 parity).
                 if crate::majit_log_enabled() {
                     eprintln!(
                         "[jit] compile_simple_loop: compiled segmented trace key={}, trace_id={}",
@@ -7345,10 +7472,23 @@ impl<M: Clone> MetaInterp<M> {
             // counter side: PyPy's `LoopToken.__del__` runs that
             // routine, which on its way out bumps
             // `cpu.tracker.total_freed_loops += 1` plus
-            // `total_freed_bridges += loop.bridges_count`.  Pyre's
-            // backend has no global `cpu.tracker`; we keep the same
-            // four counters on the per-process `JitProfiler` and
-            // increment them here, where the eviction is observed.
+            // `total_freed_bridges += loop.bridges_count`.  Pyre routes
+            // both bumps through the backend's `CpuTotalTracker` Arc
+            // via `JitProfiler::inc_freed_loop` / `add_freed_bridges`
+            // (the profiler is rebound onto that Arc in
+            // `MetaInterp::new`).
+            //
+            // **TIMING DIVERGENCE.**  RPython fires `__del__` exactly
+            // when the GC collects the LoopToken — Rust's `Arc`
+            // cannot match that timing because the last strong ref
+            // may be held by a guard-failure path that hasn't dropped
+            // yet.  Pyre instead bumps the counters at memmgr
+            // eviction (memmgr.py:73 `_kill_old_loops_now`), which is
+            // strictly upstream of `__del__` in PyPy: every evicted
+            // token will eventually `__del__`, but the counter is
+            // bumped at observe-time, not at the (later, unpredictable)
+            // Arc-drop time.  The observable difference is a small
+            // lead in the counter relative to actual memory release.
             // `compiled_loop_token` is None before backend compile
             // completes — never reachable on an evicted token, but
             // guarded for safety.
@@ -8536,22 +8676,24 @@ impl<M: Clone> MetaInterp<M> {
             token_mut.num_scalar_inputargs = self.num_scalar_inputargs;
         }
 
-        // compile.py:532-546 `profiler.start_backend() ... try: do_compile_loop
-        // ... finally: ... profiler.end_backend()`.
-        self.staticdata.profiler.start_backend();
-        let compile_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let optimized_ops_rc: Vec<majit_ir::OpRc> = optimized_ops
-                .iter()
-                .map(|op| std::rc::Rc::new(op.clone()))
-                .collect();
-            self.backend.compile_loop(
-                bridge_inputargs,
-                &optimized_ops_rc,
-                Arc::get_mut(&mut token)
-                    .expect("JitCellToken must stay uniquely owned until backend compile"),
-            )
-        }));
-        self.staticdata.profiler.end_backend();
+        // compile.py:532-546 `debug_start("jit-backend") +
+        // profiler.start_backend() ... try: do_compile_loop ... finally:
+        // ... profiler.end_backend() + debug_stop("jit-backend")`.
+        let compile_result = {
+            let _backend_scope = self.staticdata.profiler.enter_backend();
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let optimized_ops_rc: Vec<majit_ir::OpRc> = optimized_ops
+                    .iter()
+                    .map(|op| std::rc::Rc::new(op.clone()))
+                    .collect();
+                self.backend.compile_loop(
+                    bridge_inputargs,
+                    &optimized_ops_rc,
+                    Arc::get_mut(&mut token)
+                        .expect("JitCellToken must stay uniquely owned until backend compile"),
+                )
+            }))
+        };
         let compile_result = match compile_result {
             Ok(r) => r,
             Err(_) => return false,
@@ -8671,11 +8813,8 @@ impl<M: Clone> MetaInterp<M> {
                 );
                 self.attach_procedure_with_redirect(original_green_key, Arc::clone(&token));
                 self.stats.loops_compiled += 1;
-                // jitprof.py:106 `self.cpu.tracker.total_compiled_loops`
-                // parity — bump the per-process profiler tracker so
-                // `Profiler.get_counter(TOTAL_COMPILED_LOOPS)` returns
-                // the post-`record_loop_or_bridge` total.
-                self.staticdata.profiler.inc_compiled_loop();
+                // `cpu.tracker.total_compiled_loops` is bumped inside
+                // `CompiledLoopToken::new` (model.py:297 parity).
                 if let Some(ref hook) = self.hooks.on_compile_loop {
                     hook(original_green_key, bridge_ops.len(), num_optimized_ops);
                 }
@@ -9119,20 +9258,23 @@ impl<M: Clone> MetaInterp<M> {
                 .iter()
                 .map(|op| std::rc::Rc::new(op.clone()))
                 .collect();
-            // compile.py:589-599 `profiler.start_backend() ... try:
-            // do_compile_bridge ... finally: ... profiler.end_backend()`.
-            self.staticdata.profiler.start_backend();
-            let bridge_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                self.backend.compile_bridge(
-                    fail_descr,
-                    bridge_inputargs,
-                    &optimized_ops_rc_for_bridge,
-                    &source_jct,
-                    previous_tokens,
-                    caller_recovery_layout.as_ref(),
-                )
-            }));
-            self.staticdata.profiler.end_backend();
+            // compile.py:589-599 `debug_start("jit-backend") +
+            // profiler.start_backend() ... try: do_compile_bridge ...
+            // finally: ... profiler.end_backend() +
+            // debug_stop("jit-backend")`.
+            let bridge_result = {
+                let _backend_scope = self.staticdata.profiler.enter_backend();
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    self.backend.compile_bridge(
+                        fail_descr,
+                        bridge_inputargs,
+                        &optimized_ops_rc_for_bridge,
+                        &source_jct,
+                        previous_tokens,
+                        caller_recovery_layout.as_ref(),
+                    )
+                }))
+            };
             match bridge_result {
                 Ok(r) => r,
                 Err(e) => {
@@ -9255,9 +9397,9 @@ impl<M: Clone> MetaInterp<M> {
                 self.take_back_all_descrs(std::mem::take(&mut optimizer.all_descrs));
                 self.warm_state.log_bridge_compile(fail_index);
                 self.stats.bridges_compiled += 1;
-                // jitprof.py:108 `self.cpu.tracker.total_compiled_bridges`
-                // parity — bump the per-process profiler tracker.
-                self.staticdata.profiler.inc_compiled_bridge();
+                // `cpu.tracker.total_compiled_bridges` is bumped inside
+                // `Backend::compile_bridge` via `clt.compiling_a_bridge()`
+                // (x86/runner.py:100-101, model.py:309-314 parity).
 
                 if let Some(ref hook) = self.hooks.on_compile_bridge {
                     hook(green_key, fail_index, num_optimized_ops);
