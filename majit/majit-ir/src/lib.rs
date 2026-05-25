@@ -1,10 +1,17 @@
 pub mod bitstring;
+pub mod box_ref;
 pub mod debug;
 pub mod descr;
 pub mod descr_registry;
 pub mod effectinfo;
+pub mod field_entry;
+pub mod intbound;
 pub mod op_descr;
+pub mod op_info;
 pub mod op_type_index;
+pub mod optimize;
+pub mod ptr_info;
+pub mod rawbuffer;
 pub mod resoperation;
 pub mod resumecode;
 pub mod resumedata;
@@ -37,9 +44,9 @@ pub use resoperation::{
     Op, OpCode, OpRc, OpRef, RdVirtualInfo, VectorizationInfo, VirtualFieldsInfo, format_trace,
 };
 pub use value::{
-    Const, FAILARGS_LIMIT, GcRef, GreenAsI64, GreenKey, GreenType, InputArg, JitDriverVar, StrEqFn,
-    StrHashFn, Type, Value, VarKind, green_type_to_ir, make_str_slot, set_str_resolver,
-    set_unicode_resolver,
+    Const, FAILARGS_LIMIT, GcRef, GreenAsI64, GreenKey, GreenType, InputArg, InputArgRc,
+    JitDriverVar, StrEqFn, StrHashFn, Type, Value, VarKind, green_type_to_ir, make_str_slot,
+    set_str_resolver, set_unicode_resolver,
 };
 pub use vec_assoc::VecAssoc;
 pub use vec_set::VecSet;

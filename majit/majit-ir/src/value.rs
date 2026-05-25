@@ -241,18 +241,47 @@ impl Const {
 /// The `_forwarded` slot (`resoperation.py:235`) lives on `BoxRef`
 /// (`majit-metainterp/src/box.rs`), which is pyre's mirror of RPython's
 /// `AbstractValue` object identity.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct InputArg {
     pub tp: Type,
     /// Index in the inputargs list.
     pub index: u32,
+    /// `resoperation.py:700 AbstractInputArg._forwarded` parity slot.
+    /// Empty (`Forwarded::None`) until Slice 8.C dual-writes wire
+    /// `BoxRef::set_forwarded_*` to this field.
+    pub forwarded: std::cell::RefCell<crate::box_ref::Forwarded>,
+}
+
+impl InputArg {
+    /// Produce a fresh-identity `InputArg` from this one. The
+    /// `_forwarded` slot (`resoperation.py:700
+    /// AbstractInputArg._forwarded`) is per-instance mutable state tied
+    /// to that identity and resets to `Forwarded::None` for the new
+    /// object, mirroring RPython where every `InputArgInt(pos) /
+    /// InputArgFloat(pos) / InputArgRef(pos)` instantiation yields a
+    /// fresh Python object with `_forwarded = None`.
+    ///
+    /// `InputArg` deliberately is **not** `Clone`. Identity-shared
+    /// cloning (preserving the `_forwarded` slot) must go through
+    /// [`InputArgRc`](crate::value::InputArgRc) (`Rc::clone`); call this
+    /// helper only at boundaries where a value-typed `InputArg` is
+    /// intentionally being detached from its origin (e.g. backend input
+    /// list materialization).
+    pub fn fresh_value_copy(&self) -> Self {
+        InputArg {
+            tp: self.tp,
+            index: self.index,
+            forwarded: std::cell::RefCell::new(crate::box_ref::Forwarded::None),
+        }
+    }
 }
 
 impl PartialEq for InputArg {
     /// PyPy compares `AbstractInputArg`s by Python object identity
     /// (`AbstractValue.same_box` at `resoperation.py:38`). Pyre's
     /// value-typed `InputArg` stands in for that identity via
-    /// `(tp, index)` tuple equality.
+    /// `(tp, index)` tuple equality. `_forwarded` is mutable per-op
+    /// state and excluded from identity comparison.
     fn eq(&self, other: &Self) -> bool {
         self.tp == other.tp && self.index == other.index
     }
@@ -263,6 +292,7 @@ impl InputArg {
         InputArg {
             tp: Type::Int,
             index,
+            forwarded: std::cell::RefCell::new(crate::box_ref::Forwarded::None),
         }
     }
 
@@ -270,6 +300,7 @@ impl InputArg {
         InputArg {
             tp: Type::Ref,
             index,
+            forwarded: std::cell::RefCell::new(crate::box_ref::Forwarded::None),
         }
     }
 
@@ -277,11 +308,23 @@ impl InputArg {
         InputArg {
             tp: Type::Float,
             index,
+            forwarded: std::cell::RefCell::new(crate::box_ref::Forwarded::None),
         }
     }
 
     pub fn from_type(tp: Type, index: u32) -> Self {
-        InputArg { tp, index }
+        // `InputArg*` has no Void encoding (resoperation.py:719/727/739
+        // — only `InputArgInt`/`InputArgFloat`/`InputArgRef`); fail at
+        // construction so `opref()` can't be reached with a Void slot.
+        assert!(
+            tp != Type::Void,
+            "InputArg::from_type: Type::Void is not a valid input-arg type",
+        );
+        InputArg {
+            tp,
+            index,
+            forwarded: std::cell::RefCell::new(crate::box_ref::Forwarded::None),
+        }
     }
 
     /// Returns the OpRef referencing this input arg's slot.
@@ -295,6 +338,16 @@ impl InputArg {
         crate::resoperation::OpRef::input_arg_typed(self.index, self.tp)
     }
 }
+
+/// Shared `InputArg` identity (resoperation.py:700 `AbstractInputArg`).
+///
+/// PyPy's `inputargs` list holds Python objects that are reachable
+/// unchanged from `TreeLoop.inputargs`, the optimizer's exported state,
+/// the short preamble, resume metadata, and the backend's regalloc
+/// surface. Pyre matches that shape by wrapping every `InputArg` in
+/// `Rc` so all consumers traffic in the same identity and observe the
+/// same `_forwarded` slot via `inputarg.forwarded`.
+pub type InputArgRc = std::rc::Rc<InputArg>;
 
 /// Limit on the number of fail arguments per guard.
 ///

@@ -2210,12 +2210,13 @@ impl OptIntBounds {
         // First try direct index (when OpRef matches new_operations index)
         let idx = cond_ref.raw() as usize;
         if idx < ctx.new_operations.len() && ctx.new_operations[idx].pos.get() == cond_ref {
-            return Some(&ctx.new_operations[idx]);
+            return Some(ctx.new_operations[idx].as_ref());
         }
         // Otherwise search by pos field
         ctx.new_operations
             .iter()
             .rfind(|op| op.pos.get() == cond_ref)
+            .map(|rc| rc.as_ref())
     }
 
     // ── Bound narrowing helpers ──
@@ -3234,12 +3235,7 @@ impl Optimization for OptIntBounds {
             if !matches!(ctx.opref_type(resolved), Some(majit_ir::Type::Int)) {
                 continue;
             }
-            // BoxRef shim — peek_intbound_box takes &BoxRef.
-            let bound = ctx
-                .get_box_replacement_box(resolved)
-                .as_ref()
-                .and_then(|b| ctx.peek_intbound_box(b));
-            if let Some(bound) = bound {
+            if let Some(bound) = ctx.get_int_bound(arg) {
                 if bound.is_unbounded() {
                     continue;
                 }
@@ -3393,7 +3389,7 @@ mod tests {
             }
         }
 
-        let result = ctx.new_operations.clone();
+        let result: Vec<Op> = ctx.new_operations.iter().map(|rc| (**rc).clone()).collect();
         let _ = pass;
         (result, ctx)
     }
@@ -4436,7 +4432,12 @@ mod tests {
         constants.insert(200u32, majit_ir::Value::Int(1));
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut constants,
+            1024,
+            crate::r#box::BoxPool::new(),
+        );
 
         let opcodes: Vec<_> = result.iter().map(|op| op.opcode).collect();
         assert!(

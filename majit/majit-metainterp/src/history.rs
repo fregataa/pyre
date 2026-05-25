@@ -38,7 +38,14 @@ impl TreeLoopCutPosition {
 #[derive(Clone, Debug)]
 pub struct TreeLoop {
     /// Input arguments to the trace (loop header variables).
-    pub inputargs: Vec<InputArg>,
+    ///
+    /// `history.py:528` `# self.inputargs = list of InputArg` —
+    /// PyPy's `TreeLoop.inputargs` holds Python references shared by
+    /// identity with the recorder, optimizer exported state, short
+    /// preamble, resume metadata, and backend regalloc. Pyre wraps
+    /// each `InputArg` in `Rc` so every consumer observes the same
+    /// `_forwarded` slot.
+    pub inputargs: Vec<majit_ir::InputArgRc>,
     /// The recorded operations, in execution order.
     ///
     /// `history.py:528` `# self.operations = list of ResOperations` —
@@ -64,13 +71,20 @@ pub struct TreeLoop {
     /// (same Python objects, same `_forwarded` slot). The Rust pool
     /// preserves that identity by carrying the same `Rc<Box>` allocations
     /// from the recorder through to the optimizer.
-    pub box_pool: crate::r#box::BoxPool,
+    pub(crate) box_pool: crate::r#box::BoxPool,
 }
 
 impl TreeLoop {
     #[inline]
     fn is_runtime_opref(opref: OpRef) -> bool {
         !opref.is_none() && !opref.is_constant()
+    }
+
+    pub fn inputargs_cloned(&self) -> Vec<InputArg> {
+        self.inputargs
+            .iter()
+            .map(|rc| (**rc).fresh_value_copy())
+            .collect()
     }
 
     /// Create a new trace from input arguments and operations.
@@ -80,7 +94,7 @@ impl TreeLoop {
     /// `TreeLoop.operations` semantic).
     pub fn new(inputargs: Vec<InputArg>, ops: Vec<Op>) -> Self {
         TreeLoop {
-            inputargs,
+            inputargs: inputargs.into_iter().map(std::rc::Rc::new).collect(),
             ops: ops.into_iter().map(std::rc::Rc::new).collect(),
             snapshots: Vec::new(),
             box_pool: crate::r#box::BoxPool::new(),
@@ -94,7 +108,7 @@ impl TreeLoop {
         snapshots: Vec<crate::recorder::Snapshot>,
     ) -> Self {
         TreeLoop {
-            inputargs,
+            inputargs: inputargs.into_iter().map(std::rc::Rc::new).collect(),
             ops: ops.into_iter().map(std::rc::Rc::new).collect(),
             snapshots,
             box_pool: crate::r#box::BoxPool::new(),
@@ -109,13 +123,18 @@ impl TreeLoop {
         inputargs: Vec<InputArg>,
         ops: Vec<Op>,
         snapshots: Vec<crate::recorder::Snapshot>,
-        box_pool: impl Into<crate::r#box::BoxPool>,
+        box_pool: crate::r#box::BoxPool,
     ) -> Self {
+        let inputargs: Vec<majit_ir::InputArgRc> =
+            inputargs.into_iter().map(std::rc::Rc::new).collect();
+        let ops: Vec<OpRc> = ops.into_iter().map(std::rc::Rc::new).collect();
+        box_pool.bind_inputargs(&inputargs);
+        box_pool.bind_ops(inputargs.len(), &ops);
         TreeLoop {
             inputargs,
-            ops: ops.into_iter().map(std::rc::Rc::new).collect(),
+            ops,
             snapshots,
-            box_pool: box_pool.into(),
+            box_pool,
         }
     }
 
@@ -129,13 +148,17 @@ impl TreeLoop {
         inputargs: Vec<InputArg>,
         ops: Vec<OpRc>,
         snapshots: Vec<crate::recorder::Snapshot>,
-        box_pool: impl Into<crate::r#box::BoxPool>,
+        box_pool: crate::r#box::BoxPool,
     ) -> Self {
+        let inputargs: Vec<majit_ir::InputArgRc> =
+            inputargs.into_iter().map(std::rc::Rc::new).collect();
+        box_pool.bind_inputargs(&inputargs);
+        box_pool.bind_ops(inputargs.len(), &ops);
         TreeLoop {
             inputargs,
             ops,
             snapshots,
-            box_pool: box_pool.into(),
+            box_pool,
         }
     }
 
@@ -487,8 +510,9 @@ impl TreeLoop {
         // PtrInfo / IntBound / Const exclusively through these BoxRefs,
         // so retrace baselines must arrive with the pool seeded. Total
         // length: `new_ia_boxes.len() + op_escaped.len() + cut_ops.len()`.
-        let mut box_pool: crate::r#box::BoxPool =
-            Vec::with_capacity(new_ia_boxes.len() + op_escaped.len() + cut_ops.len()).into();
+        let mut box_pool = crate::r#box::BoxPool::with_capacity(
+            new_ia_boxes.len() + op_escaped.len() + cut_ops.len(),
+        );
         for (i, &tp) in new_ia_types.iter().enumerate() {
             box_pool.push(BoxRef::new_inputarg(tp, i as u32));
         }
@@ -804,7 +828,7 @@ mod tests {
         let inputargs = vec![InputArg::new_int(0)];
 
         let loop_trace = TreeLoop::new(
-            inputargs.clone(),
+            inputargs.iter().map(InputArg::fresh_value_copy).collect(),
             vec![
                 Op::new(
                     OpCode::IntAdd,

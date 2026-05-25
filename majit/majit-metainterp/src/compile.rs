@@ -251,7 +251,7 @@ impl<'a> CompileData<'a> {
         Self { trace }
     }
 
-    pub fn inputargs(&self) -> &'a [InputArg] {
+    pub fn inputargs(&self) -> &'a [majit_ir::InputArgRc] {
         &self.trace.inputargs
     }
 
@@ -1908,7 +1908,8 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
         return;
     }
 
-    let expanded_inputargs = inputargs.clone();
+    let expanded_inputargs: Vec<InputArg> =
+        inputargs.iter().map(|ia| ia.fresh_value_copy()).collect();
 
     // compile.py:429-430 — vable_box = inputargs[index_of_virtualizable].
     let vable_box = OpRef::input_arg_typed(

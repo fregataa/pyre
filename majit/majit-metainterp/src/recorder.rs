@@ -110,7 +110,6 @@ pub enum SnapshotTagged {
     Const(i64, majit_ir::Type),
 }
 
-#[derive(Clone)]
 pub struct Trace {
     /// Recorded operations.
     ops: Vec<Op>,
@@ -147,7 +146,7 @@ impl Trace {
             inputargs: Vec::new(),
             op_count: 0,
             box_count: 0,
-            box_pool: Vec::with_capacity(256).into(),
+            box_pool: crate::r#box::BoxPool::with_capacity(256),
         }
     }
 
@@ -483,13 +482,14 @@ impl Trace {
     /// replaces the retired `opref_concrete` side-table (RPython
     /// `history.py:803-807 *FrontendOp(pos, value)` parity).
     pub(crate) fn box_for_position(&self, position: u32) -> Option<&BoxRef> {
-        self.box_pool.get(position as usize)
+        self.box_pool.get_at_position(position as usize)
     }
 
-    /// H-2.1: full BoxRef pool snapshot — borrows the sparse slot
-    /// table (`None` for skipped positions).
-    pub fn box_pool(&self) -> &[Option<BoxRef>] {
-        self.box_pool.as_slots()
+    /// Full BoxRef pool snapshot — borrows the sparse slot table
+    /// (`None` for skipped positions). Test-only.
+    #[cfg(test)]
+    pub fn box_pool(&self) -> &crate::r#box::BoxPool {
+        &self.box_pool
     }
 }
 
@@ -568,7 +568,7 @@ mod tests {
             let b = rec.box_for_position(raw).expect("inputarg slot");
             assert!(b.is_inputarg());
             assert_eq!(b.type_(), expect_tp);
-            assert_eq!(b.inputarg_position(), Some(raw));
+            assert_eq!(b.position(), Some(raw));
         }
 
         // record_op typed (Int result)
@@ -622,9 +622,9 @@ mod tests {
         let pre_box_at_1 = rec.box_for_position(1).unwrap().clone();
         let trace = rec.get_trace();
         assert_eq!(trace.box_pool.len(), 2);
-        assert_eq!(trace.box_pool.get(1).unwrap(), &pre_box_at_1);
-        assert!(trace.box_pool.get(0).unwrap().is_inputarg());
-        assert!(trace.box_pool.get(1).unwrap().is_resop());
+        assert_eq!(trace.box_pool.get_at_position(1).unwrap(), &pre_box_at_1);
+        assert!(trace.box_pool.get_at_position(0).unwrap().is_inputarg());
+        assert!(trace.box_pool.get_at_position(1).unwrap().is_resop());
     }
 
     /// H-2.1 invariant: BoxRef identity is per-allocation. Two record calls
