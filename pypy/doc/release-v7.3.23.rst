@@ -22,13 +22,14 @@ This version includes a change to the bytecode interpreter to use `exception tab
 instead of dedicated opcodes. Now the PyPy disassembly will be closer to
 CPython format. So far it does not impact performance.
 
-We also include changes to code generation to use `computed
-gotos`_ and to more aggressively inline the stack checks when entering a
-``PyFrame``. These do not yet show up as improvements in speed.pypy.org
-benchmarks, Our venerable benchmarker machine is using gcc5.4.1 (it was set up
-10 years ago when that was standard, like our manylinux 2014 buildbot machines)
-so we are hopeful an update to infrastructure will show the same improvements
-that we see when running benchmarks on more modern compilers.
+.. reverted
+    We also include changes to code generation to use `computed
+    gotos`_ and to more aggressively inline the stack checks when entering a
+    ``PyFrame``. These do not yet show up as improvements in speed.pypy.org
+    benchmarks, Our venerable benchmarker machine is using gcc5.4.1 (it was set up
+    10 years ago when that was standard, like our manylinux 2014 buildbot machines)
+    so we are hopeful an update to infrastructure will show the same improvements
+    that we see when running benchmarks on more modern compilers.
 
 The release includes two different interpreters:
 
@@ -121,8 +122,10 @@ Speedups and enhancements
 - Speed up ``int << int -> long`` shifts and leave the exponent of ``long **
   int`` as an int
 - Detect performance-cluster L2 cache size instead of efficiency on Apple Silicon
-- Use computed-goto on GCC/Clang instead of a big switch statement
-- Explicitly inline stack checks at the beginning of each ``PyFrame``
+
+.. reverted
+    - Use computed-goto on GCC/Clang instead of a big switch statement
+    - Explicitly inline stack checks at the beginning of each ``PyFrame``
 
 Python 2.7
 ----------
