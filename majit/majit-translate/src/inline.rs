@@ -1358,7 +1358,7 @@ mod tests {
                 entry,
                 OpKind::Input {
                     name: "base".into(),
-                    ty: ValueType::Ref,
+                    ty: ValueType::Ref(None),
                 },
                 true,
             )
@@ -1369,7 +1369,7 @@ mod tests {
             OpKind::ArrayRead {
                 base: base_var,
                 index: idx_var,
-                item_ty: ValueType::Ref,
+                item_ty: ValueType::Ref(None),
                 array_type_id: None,
                 nolength: false,
             },
@@ -1389,7 +1389,7 @@ mod tests {
                 entry,
                 OpKind::Input {
                     name: "base".into(),
-                    ty: ValueType::Ref,
+                    ty: ValueType::Ref(None),
                 },
                 true,
             )
@@ -1399,7 +1399,7 @@ mod tests {
             OpKind::Call {
                 target: CallTarget::function_path(["callee"]),
                 args: vec![base_var],
-                result_ty: ValueType::Ref,
+                result_ty: ValueType::Ref(None),
             },
             true,
         );
@@ -1443,7 +1443,7 @@ mod tests {
             OpKind::Call {
                 target: CallTarget::function_path(["unknown_fn"]),
                 args: vec![],
-                result_ty: ValueType::Ref,
+                result_ty: ValueType::Ref(None),
             },
             true,
         );
@@ -1475,7 +1475,7 @@ mod tests {
                 entry,
                 OpKind::Input {
                     name: "base".into(),
-                    ty: ValueType::Ref,
+                    ty: ValueType::Ref(None),
                 },
                 true,
             )
@@ -1485,7 +1485,7 @@ mod tests {
             OpKind::Call {
                 target: CallTarget::function_path(["callee"]),
                 args: vec![base_var],
-                result_ty: ValueType::Ref,
+                result_ty: ValueType::Ref(None),
             },
             true,
         );
@@ -1499,7 +1499,7 @@ mod tests {
                 centry,
                 OpKind::Input {
                     name: "x".into(),
-                    ty: ValueType::Ref,
+                    ty: ValueType::Ref(None),
                 },
                 true,
             )
@@ -1509,7 +1509,7 @@ mod tests {
             OpKind::Call {
                 target: CallTarget::function_path(["outer"]),
                 args: vec![x_var],
-                result_ty: ValueType::Ref,
+                result_ty: ValueType::Ref(None),
             },
             true,
         );
@@ -1553,7 +1553,7 @@ mod tests {
                 entry,
                 OpKind::Input {
                     name: "base".into(),
-                    ty: ValueType::Ref,
+                    ty: ValueType::Ref(None),
                 },
                 true,
             )
@@ -1563,7 +1563,7 @@ mod tests {
             OpKind::Call {
                 target: CallTarget::function_path(["callee"]),
                 args: vec![base_var],
-                result_ty: ValueType::Ref,
+                result_ty: ValueType::Ref(None),
             },
             true,
         );

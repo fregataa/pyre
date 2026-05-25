@@ -3,9 +3,7 @@
 //! Data carriers consumed by codegen + downstream tooling. The
 //! production producer is `lib::analyze_pipeline_from_parsed` (which
 //! drives `build_canonical_opcode_dispatch` to fill `opcode_dispatch`,
-//! `jitcodes`, `insns`, `descrs`); `translator/rtyper/legacy_pipeline.rs`
-//! retains a parallel `analyze_program` chain only under
-//! `#[cfg(test)]` to anchor dual-gate fixture tests.
+//! `jitcodes`, `insns`, `descrs`).
 
 use serde::{Deserialize, Serialize};
 
@@ -119,4 +117,59 @@ pub struct ProgramPipelineResult {
     pub total_blocks: usize,
     pub total_ops: usize,
     pub total_vable_rewrites: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use crate::OpcodeDispatchSelector;
+    use crate::flatten::{FlatOp, SSARepr};
+    use crate::flowspace::model::ConstValue;
+    use crate::jitcode::JitCode;
+    use crate::opcode_dispatch::PipelineOpcodeArm;
+
+    #[test]
+    fn serialized_program_pipeline_skips_flattened_ssa_consts() {
+        let flattened = SSARepr {
+            name: "consts".into(),
+            insns: vec![FlatOp::RefReturn(crate::flatten::RegOrConst::Const(
+                crate::flowspace::model::Constant::new(ConstValue::byte_str("hello")),
+            ))],
+            num_blocks: 1,
+            insns_pos: None,
+        };
+        let program = ProgramPipelineResult {
+            functions: vec![PipelineResult {
+                name: "consts".into(),
+                original_blocks: 1,
+                annotations_count: 0,
+                vable_rewrites: 0,
+                transform_notes: Vec::new(),
+                flattened: flattened.clone(),
+            }],
+            opcode_dispatch: vec![PipelineOpcodeArm {
+                arm_id: 7,
+                selector: OpcodeDispatchSelector::Unsupported,
+                entry_jitcode_index: Some(0),
+                flattened: Some(flattened),
+            }],
+            jitcodes: vec![Arc::new(JitCode::new("consts"))],
+            jitcodes_by_path: std::collections::HashMap::new(),
+            insns: majit_ir::vec_assoc::VecAssoc::new(),
+            descrs: Vec::new(),
+            total_blocks: 1,
+            total_ops: 1,
+            total_vable_rewrites: 0,
+        };
+
+        let json = serde_json::to_string(&program).expect("program pipeline should serialize");
+        assert!(
+            !json.contains("flattened"),
+            "serialized artifact should not persist debug SSA payloads"
+        );
+        serde_json::to_string(&program.opcode_dispatch)
+            .expect("opcode dispatch artifact should serialize without SSARepr");
+    }
 }

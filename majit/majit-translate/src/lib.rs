@@ -75,8 +75,6 @@ use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use crate::translator::rtyper::legacy_annotator as annotate;
 #[cfg(test)]
-use crate::translator::rtyper::legacy_pipeline;
-#[cfg(test)]
 use crate::translator::rtyper::legacy_resolve as rtype;
 
 /// Configuration for the canonical graph/pipeline analyzer.
@@ -353,6 +351,59 @@ fn register_function_graph_alias(
     graphs.insert(path, graph.clone());
 }
 
+/// Compute the full alias spelling set for a free function lifted
+/// from a Rust source.  Mirrors the graph-alias loop in
+/// [`analyze_pipeline_from_parsed`] so call-site lookups that key on
+/// these spellings (function_graphs, function_hints,
+/// elidable/loopinvariant/cannot_collect/oopspec targets) all see
+/// the same FunctionPath set.  Without this, a module-qualified call
+/// site finds the graph alias but misses the elidable/loopinvariant
+/// hint registered only under the bare name.
+///
+/// `name` is the `SemanticFunction.name` (already module-prefixed
+/// when the function lives inside a `mod foo { fn bar() }` block);
+/// `source_module` is the file's crate-stripped path (populated by
+/// `front::ast::build_semantic_program_with_options` from
+/// `parsed.module_path`).
+fn free_function_alias_paths(name: &str, source_module: &str) -> Vec<crate::parse::CallPath> {
+    let segments: Vec<&str> = name.split("::").collect();
+    let mut paths = Vec::new();
+    paths.push(crate::parse::CallPath::from_segments(
+        segments.iter().copied(),
+    ));
+    let mut crate_segs = vec!["crate"];
+    crate_segs.extend(segments.iter().copied());
+    paths.push(crate::parse::CallPath::from_segments(crate_segs));
+    for crate_alias in &["pyre_interpreter", "pyre_object", "pyre_jit"] {
+        let mut alias_segs = vec![*crate_alias];
+        alias_segs.extend(segments.iter().copied());
+        paths.push(crate::parse::CallPath::from_segments(alias_segs));
+    }
+    let name_segs_prefix: Vec<&str> = name.split("::").collect();
+    let mod_segs_prefix: Vec<&str> = source_module.split("::").collect();
+    if !source_module.is_empty() && !name_segs_prefix.starts_with(&mod_segs_prefix) {
+        let module_segs: Vec<&str> = source_module.split("::").collect();
+        let mut module_qualified_segs: Vec<&str> = module_segs.clone();
+        module_qualified_segs.extend(segments.iter().copied());
+        paths.push(crate::parse::CallPath::from_segments(
+            module_qualified_segs.iter().copied(),
+        ));
+        let mut crate_module_segs = vec!["crate"];
+        crate_module_segs.extend(module_qualified_segs.iter().copied());
+        paths.push(crate::parse::CallPath::from_segments(
+            crate_module_segs.iter().copied(),
+        ));
+        for crate_alias in &["pyre_interpreter", "pyre_object", "pyre_jit"] {
+            let mut alias_segs = vec![*crate_alias];
+            alias_segs.extend(module_qualified_segs.iter().copied());
+            paths.push(crate::parse::CallPath::from_segments(
+                alias_segs.iter().copied(),
+            ));
+        }
+    }
+    paths
+}
+
 fn analyze_pipeline_from_parsed(
     parsed_files: &[parse::ParsedInterpreter],
     config: &AnalyzeConfig,
@@ -445,44 +496,19 @@ fn analyze_pipeline_from_parsed(
                 Some(rt) => func.graph.clone().with_return_type(rt),
                 None => func.graph.clone(),
             };
-            // Free function: register under qualified segments.
-            // func.name may be "a::helper" for module-internal functions.
-            let segments: Vec<&str> = func.name.split("::").collect();
-            let path = parse::CallPath::from_segments(segments.iter().copied());
-            register_function_graph_alias(
-                &mut canonical_function_graphs,
-                &mut canonical_function_alias_source,
-                path,
-                &func.name,
-                &graph,
-            );
-            // Also register under ["crate", ...segments].
-            let mut crate_segs = vec!["crate"];
-            crate_segs.extend(segments.iter().copied());
-            let crate_path = parse::CallPath::from_segments(crate_segs);
-            register_function_graph_alias(
-                &mut canonical_function_graphs,
-                &mut canonical_function_alias_source,
-                crate_path,
-                &func.name,
-                &graph,
-            );
-            // Cross-crate callsites prefix the call path with the
-            // crate name (`pyre_interpreter::pyframe_get_pycode`).
-            // `canonical_call_target` does not rewrite that prefix,
-            // so the same graph needs to be reachable under every
-            // well-known pyre crate-name alias.  Each pyre crate's
-            // source set is included in `PYRE_JIT_GRAPH_SOURCES` so
-            // the alias resolves to exactly the same FunctionGraph
-            // regardless of which crate the callee lived in.
-            for crate_alias in &["pyre_interpreter", "pyre_object", "pyre_jit"] {
-                let mut alias_segs = vec![*crate_alias];
-                alias_segs.extend(segments.iter().copied());
-                let alias_path = parse::CallPath::from_segments(alias_segs);
+            // Free function: register under every canonical alias
+            // spelling computed by `free_function_alias_paths` — bare
+            // segments, `crate::` prefix, three pyre-crate prefixes,
+            // and the same set re-prefixed with `func.module_path`
+            // (the file's crate-stripped module path).  The hint
+            // registration loop below uses the same helper so call
+            // sites that hit a module-qualified spelling find both the
+            // graph and its elidable/loopinvariant/oopspec hints.
+            for path in free_function_alias_paths(&func.name, &func.module_path) {
                 register_function_graph_alias(
                     &mut canonical_function_graphs,
                     &mut canonical_function_alias_source,
-                    alias_path,
+                    path,
                     &func.name,
                     &graph,
                 );
@@ -564,12 +590,13 @@ fn analyze_pipeline_from_parsed(
     // RPython parity: hints live on `graph.func` and survive alias
     // routing because the call path resolves to a single function
     // object identity (`policy.py:48` / `call.py:126`).  Pyre keys
-    // hints on `CallPath` segments, so cross-crate callsites under
-    // `pyre_interpreter::` / `pyre_object::` / `pyre_jit::` prefixes
-    // (registered alongside bare + `crate::` in
-    // `register_function_graph_alias`) must see the same hints —
-    // missing them silently disables `_jit_look_inside_` etc. for
-    // alias callers.
+    // hints on `CallPath` segments, so every spelling the graph alias
+    // loop registered above (`free_function_alias_paths`: bare +
+    // `crate::` + `pyre_interpreter|pyre_object|pyre_jit::` + the
+    // `source_module`-prefixed variants thereof) must carry the same
+    // hint set.  Missing the source-module-qualified aliases silently
+    // disables `_jit_look_inside_` etc. for module-qualified callers,
+    // which `CallControl::find_all_graphs` looks up by callee path.
     for func in &program.functions {
         if !func.self_ty_root.is_none() || func.hints.is_empty() {
             continue;
@@ -578,23 +605,9 @@ fn analyze_pipeline_from_parsed(
             Some(rt) => func.graph.clone().with_return_type(rt),
             None => func.graph.clone(),
         };
-        let segments: Vec<&str> = func.name.split("::").collect();
-        let path = parse::CallPath::from_segments(segments.iter().copied());
-        call_control.register_function_graph_with_hints(path, graph.clone(), func.hints.clone());
-        let mut crate_segs = vec!["crate"];
-        crate_segs.extend(segments.iter().copied());
-        let crate_path = parse::CallPath::from_segments(crate_segs);
-        call_control.register_function_graph_with_hints(
-            crate_path,
-            graph.clone(),
-            func.hints.clone(),
-        );
-        for crate_alias in &["pyre_interpreter", "pyre_object", "pyre_jit"] {
-            let mut alias_segs = vec![*crate_alias];
-            alias_segs.extend(segments.iter().copied());
-            let alias_path = parse::CallPath::from_segments(alias_segs);
+        for path in free_function_alias_paths(&func.name, &func.module_path) {
             call_control.register_function_graph_with_hints(
-                alias_path,
+                path,
                 graph.clone(),
                 func.hints.clone(),
             );
@@ -615,33 +628,19 @@ fn analyze_pipeline_from_parsed(
                     crate::parse::CallPath::from_segments([owner.as_str(), func.name.as_str()]);
                 call_control.return_types.insert(path, ret_type.clone());
             } else {
-                // free function: register under qualified segments.
+                // free function: register under every spelling the
+                // graph alias loop produced (`free_function_alias_paths`:
+                // bare + `crate::` + `pyre_interpreter|pyre_object|
+                // pyre_jit::` + the `source_module`-prefixed variants).
                 //
                 // RPython parity: return type lives on graph identity and
                 // surfaces uniformly to every callsite (`call.py:223-230`).
-                // Pyre keys `return_types` on `CallPath`; cross-crate
-                // callers reach the graph through `pyre_interpreter::` /
-                // `pyre_object::` / `pyre_jit::` aliases registered by
-                // `register_function_graph_alias`, so the same prefix set
-                // must carry the return type — without it,
-                // `signature validate` falls back to Ref and the direct-
+                // Pyre keys `return_types` on `CallPath`; alias spellings
+                // that lack the return type silently make
+                // `signature validate` fall back to Ref and the direct-
                 // call type tail goes silent.
-                let segments: Vec<&str> = func.name.split("::").collect();
-                let path = crate::parse::CallPath::from_segments(segments.iter().copied());
-                call_control.return_types.insert(path, ret_type.clone());
-                let mut crate_segs = vec!["crate"];
-                crate_segs.extend(segments.iter().copied());
-                let crate_path = crate::parse::CallPath::from_segments(crate_segs);
-                call_control
-                    .return_types
-                    .insert(crate_path, ret_type.clone());
-                for crate_alias in &["pyre_interpreter", "pyre_object", "pyre_jit"] {
-                    let mut alias_segs = vec![*crate_alias];
-                    alias_segs.extend(segments.iter().copied());
-                    let alias_path = crate::parse::CallPath::from_segments(alias_segs);
-                    call_control
-                        .return_types
-                        .insert(alias_path, ret_type.clone());
+                for path in free_function_alias_paths(&func.name, &func.module_path) {
+                    call_control.return_types.insert(path, ret_type.clone());
                 }
             }
         }
@@ -839,40 +838,23 @@ fn analyze_pipeline_from_parsed(
         if func.hints.is_empty() {
             continue;
         }
-        // Build all canonical paths for this function.
-        let mut paths = Vec::new();
-        if let Some(ref owner) = func.self_ty_root {
+        // Build all canonical paths for this function.  Free functions
+        // must use the same alias spelling set as the graph-alias loop
+        // above so a module-qualified call site finds both the graph
+        // AND the hints (elidable/loopinvariant/cannot_collect/oopspec).
+        let paths = if let Some(ref owner) = func.self_ty_root {
             // impl method: ["owner", "method"]
-            paths.push(crate::parse::CallPath::from_segments([
+            vec![crate::parse::CallPath::from_segments([
                 owner.as_str(),
                 func.name.as_str(),
-            ]));
+            ])]
         } else {
-            // free function: register under qualified segments + crate:: alias
-            let segments: Vec<&str> = func.name.split("::").collect();
-            paths.push(crate::parse::CallPath::from_segments(
-                segments.iter().copied(),
-            ));
-            let mut crate_segs = vec!["crate"];
-            crate_segs.extend(segments.iter().copied());
-            paths.push(crate::parse::CallPath::from_segments(crate_segs));
-            // Module-qualified alias for in-module bare calls qualified
-            // by `canonical_call_target:7494-7502`.  Without this every
-            // `#[majit_macros::elidable*]` (and `#[oopspec]` /
-            // `#[loop_invariant]` / etc.) hint on a free fn would be
-            // silently dropped by every same-module call site that
-            // spells the callee as a single identifier.
-            if !func.module_path.is_empty() && segments.len() == 1 {
-                let mut mod_segs: Vec<&str> = func.module_path.split("::").collect();
-                mod_segs.extend(segments.iter().copied());
-                paths.push(crate::parse::CallPath::from_segments(
-                    mod_segs.iter().copied(),
-                ));
-                let mut crate_mod_segs = vec!["crate"];
-                crate_mod_segs.extend(mod_segs.iter().copied());
-                paths.push(crate::parse::CallPath::from_segments(crate_mod_segs));
-            }
-        }
+            // Same alias-spelling set as the graph-registration loop
+            // above so every spelling the call-site might canonicalise
+            // to also finds the `#[oopspec]` / `#[loop_invariant]` /
+            // `#[cannot_collect]` / elidable hint.
+            free_function_alias_paths(&func.name, &func.module_path)
+        };
         for hint in &func.hints {
             for p in &paths {
                 // rlib/jit.py:250 — `@oopspec(spec)` registers func.oopspec = spec.
@@ -1657,44 +1639,6 @@ mod tests {
         assert!(
             flattened.insns.len() > 0,
             "load_fast should produce flat ops"
-        );
-    }
-
-    #[test]
-    fn test_graph_pipeline_on_pyre_source() {
-        // Run the full graph pipeline on actual pyre interpreter source.
-        // This validates that the pipeline handles real-world Rust code.
-        let source = read_pyre_file("pyre-interpreter/src/pyopcode.rs");
-        let parsed = parse::parse_source(&source);
-        let program = front::build_semantic_program(&parsed).expect("pyopcode.rs must lower");
-
-        let config = PipelineConfig::default();
-        let result = legacy_pipeline::analyze_program(&program, &config);
-
-        eprintln!("=== Graph Pipeline on pyre-interpreter ===");
-        eprintln!("Functions analyzed: {}", result.functions.len());
-        eprintln!("Total blocks: {}", result.total_blocks);
-        eprintln!("Total flat ops: {}", result.total_ops);
-
-        // Should analyze many functions from the real source
-        assert!(
-            result.functions.len() >= 5,
-            "expected >=5 functions from pyopcode.rs, got {}",
-            result.functions.len()
-        );
-
-        // Should produce multi-block CFGs for functions with control flow
-        let multi_block = result
-            .functions
-            .iter()
-            .filter(|f| f.original_blocks > 1)
-            .count();
-        eprintln!("Functions with multi-block CFG: {multi_block}");
-
-        // Should produce flat ops
-        assert!(
-            result.total_ops > 0,
-            "should produce flat ops from real source"
         );
     }
 

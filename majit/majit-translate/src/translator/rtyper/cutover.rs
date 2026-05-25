@@ -310,14 +310,15 @@ pub(crate) fn dual_gate_check(legacy_graph: &LegacyGraph) -> Result<(), String> 
 /// production callers consume it directly.  Slice 10A inverted the
 /// dependency direction: real path is the authoritative producer;
 /// legacy is the fallback for Skip-classified graphs.  Slice 12.2
-/// retired the per-graph divergence comparison against legacy
-/// (`cutover.rs:312`); test-time anchor invariants still run
-/// [`dual_gate_check`] for legacy-baseline regression checks against
-/// hand-built fixtures, but production no longer compares per
-/// slot — `Match` means the real path succeeded, full stop.
-/// PyPy `codewriter.py:33` consumes the rtyper-produced graph
-/// directly, with no dual-gate equivalent; pyre's `Skip` arm is the
-/// transitional scaffolding that retires once every owning epic in
+/// retired the per-graph divergence comparison against legacy in
+/// production; the legacy-baseline diff inside
+/// `dual_gate_check_with_registry` itself was retired afterwards —
+/// `Match` now means the real path succeeded, full stop.  Test-time
+/// anchor invariants still run [`dual_gate_check`] for legacy-baseline
+/// regression checks against hand-built fixtures.  PyPy
+/// `codewriter.py:33` consumes the rtyper-produced graph directly,
+/// with no dual-gate equivalent; pyre's `Skip` arm is the transitional
+/// scaffolding that retires once every owning epic in
 /// `is_known_unported`'s table converges.
 #[derive(Debug)]
 pub(crate) enum DualGateOutcome {
@@ -393,9 +394,8 @@ pub(crate) enum DualGateOutcome {
 /// Defensive per-`Variable` diff against the legacy walker baseline
 /// runs whenever both paths succeed.  Divergence is reported as
 /// `Skip("dual-gate divergence: ...")` so the codewriter falls back
-/// to the legacy walker output, matching main's pre-Slice-12.2
-/// contract.  Anchor tests use [`dual_gate_check`] directly for
-/// hand-built fixtures.
+/// to the legacy walker output.  Anchor tests use [`dual_gate_check`]
+/// directly for hand-built fixtures.
 pub(crate) fn dual_gate_check_with_registry(
     legacy_graph: &LegacyGraph,
     call_registry: &PyreCallRegistry,
@@ -431,26 +431,6 @@ pub(crate) fn dual_gate_check_with_registry(
             return Err(format!("real path panicked: {msg}"));
         }
     };
-    // Defensive baseline diff against the legacy walker.  Mirror of
-    // main's pre-Slice-12.2 contract: every definite slot is
-    // compared, and the first divergence becomes a `Skip` so the
-    // production caller falls back to the legacy walker for that
-    // function rather than silently shipping a real-path result that
-    // disagrees with the legacy/PyPy projection.
-    //
-    // A legacy panic disables the comparison entirely — that hole is
-    // closed by surfacing the panic as a fail-loud `Err`, so the
-    // codewriter caller cannot silently accept a real-path result
-    // whose parity has not been validated against the legacy baseline.
-    // resolve_types writes its baseline through
-    // `FunctionGraph::set_concretetype_of_inline`; the comparison reads
-    // legacy-side kinds back from those graph cells (resolve_types
-    // returns `()`).
-    //
-    // The annotation guard isolates this comparison-only pass from
-    // the rest of the program: see `dual_gate_check`'s doc for the
-    // failure mode (residue from baseline's `legacy_annotator::
-    // annotate` poisoning a subsequent `seed_variable` read).
     let _annotation_guard = LegacyAnnotationGuard::snapshot(legacy_graph);
     let baseline = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         super::legacy_annotator::annotate(legacy_graph);
@@ -480,27 +460,18 @@ pub(crate) fn dual_gate_check_with_registry(
     Ok(DualGateOutcome::Match { real_value_to_var })
 }
 
-/// Per-slot diff between the real path's `Variable.concretetype`
-/// snapshot (via `value_to_var`) and the legacy walker's baseline.
-/// Returns `Some(message)` if the real path differs from a definite
-/// legacy kind on any slot, or assigns a definite kind to a slot the
-/// legacy walker did not resolve.  Mirror of the loop
-/// body in [`dual_gate_check`] but surfaces the first divergence as a
-/// single string for `Skip`.
-///
-/// The transient `real_state` is built locally from each
-/// `Variable.concretetype` via [`lowleveltype_to_concrete`] so the
-/// comparison's lifetime owns the projection — the side-table no
-/// longer needs to live on [`DualGateOutcome::Match`].
 /// Local projection of `value_to_var` Variables' concretetype cells
-/// into a `BTreeMap<usize, ConcreteType>` shape keyed by the dense
-/// slot index.  Errors from unsupported lltypes are silently treated
-/// as missing entries — `specialize_legacy_graph` already propagates
-/// the failure to its caller before reaching the dual-gate, so
-/// reaching here implies every Variable's lltype is projectable.
-/// BTreeMap iteration is ascending-slot-index so
-/// `compare_real_against_legacy`'s "first divergence" message stays
-/// deterministic across runs.
+/// into a `BTreeMap<usize, ConcreteType>` keyed by the dense slot
+/// index.  Errors from unsupported lltypes are silently treated as
+/// missing entries — `specialize_legacy_graph` already propagates the
+/// failure to its caller before reaching the dual-gate, so reaching
+/// here implies every Variable's lltype is projectable.  BTreeMap
+/// iteration is ascending-slot-index so anchor-test "first
+/// divergence" messages stay deterministic across runs.
+///
+/// Survives as a [`dual_gate_check`] test helper after the production
+/// `dual_gate_check_with_registry` baseline strip — anchor tests still
+/// diff the real path against the legacy walker for hand-built
 fn project_value_to_var_to_map(
     value_to_var: &SlotToVariable,
     constant_concretetypes: &HashMap<usize, LowLevelType>,
@@ -530,9 +501,6 @@ fn compare_real_against_legacy(
     legacy_graph: &LegacyGraph,
 ) -> Option<String> {
     let real_state = project_value_to_var_to_map(value_to_var, constants);
-    // Legacy walker writes through `FunctionGraph::set_concretetype_of_inline`
-    // during `resolve_types`, so `legacy_graph.concretetype` carries
-    // the legacy-side populated-slot view.
     let legacy_snapshot = legacy_graph.concretetype_snapshot();
     for (idx, legacy_kind) in legacy_snapshot.iter().enumerate() {
         if *legacy_kind == ConcreteType::Unknown {
@@ -1611,7 +1579,7 @@ mod tests {
         };
         graph.blocks = vec![startblock, returnblock];
 
-        setbinding(&v1_var, ValueType::Ref);
+        setbinding(&v1_var, ValueType::Ref(None));
         let (value_to_var, _constants) = specialize_legacy_graph(&graph)
             .expect("Ref-typed inputarg must specialize via SomeInstance(classdef=None)");
         assert_eq!(

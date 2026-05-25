@@ -37,30 +37,19 @@ use crate::model::{FunctionGraph, Link, LinkArg, OpKind, ValueType};
 /// `somevalue_to_valuetype(&graph.variable_at(slot).annotation.borrow())`
 /// (production).
 pub fn annotate(graph: &FunctionGraph) {
-    // RPython parity gap: `annrpython.py:RPythonAnnotator.complete()`
-    // never seeds exceptblock inputargs — they receive `SomeInstance`
-    // annotations only through `follow_raise_link` (`annrpython.py:
-    // 614-618 typeof([v_last_exc_value])`) when an actual raise reaches
-    // the block, and stay `None` for unreachable exceptblocks.  Pyre's
-    // legacy walker pre-seeds `etype: Int, evalue: Ref` because the
-    // dual-gate baseline must match the real rtyper's exceptblock
-    // resolution (`Signed` / `GcRef`) regardless of whether the graph
-    // actually raises — without the pre-seed, `dual_gate_check` diverges
-    // on every trivial identity function (`anchor_int_identity_dual_
-    // gate_agrees` etc.).  `rpython/jit/codewriter/flatten.py:169-172`
-    // assumes `etype: Int, evalue: Ref` unconditionally; pyre mirrors
-    // that by seeding the annotator state up front.  This pre-seed
-    // retires only when the real rtyper's exceptblock-handling path
-    // itself aligns with upstream (i.e. `None`-annotation → exclude
-    // from build_value_kinds, not backfill to `Signed`/`GcRef`).
-    if let Some(exceptblock) = graph.blocks.get(graph.exceptblock.0) {
-        if let Some(etype) = exceptblock.inputargs.first() {
-            setbinding(etype, ValueType::Int);
-        }
-        if let Some(evalue) = exceptblock.inputargs.get(1) {
-            setbinding(evalue, ValueType::Ref);
-        }
-    }
+    // RPython parity: `annrpython.py:RPythonAnnotator.complete()`
+    // (`annrpython.py:603-618 typeof([v_last_exc_value])`) writes
+    // exceptblock annotations only when a `follow_raise_link` actually
+    // reaches the block — they stay `None` for unreachable exceptblocks.
+    // No annotator-stage pre-seed runs here; the rtyper-equivalent
+    // exception type/value concretetype seed is handled in
+    // `legacy_resolve::resolve_types` (`rtyper.setup_block_entry` writes
+    // `Signed` for `etype`, `GcRef` for `evalue` unconditionally at
+    // rtyper time, not annotation time — `rpython/rtyper/rtyper.py:
+    // setup_block_entry`).  Doing the seed at the annotation layer
+    // here would clash with `setbinding`'s monotonicity assert when
+    // partial real-rtyper `SomeInstance(...)` annotations are already
+    // attached from a panicked walk.
     // `returnblock.inputargs[0]` deliberately stays unseeded here.
     // `set_return(_, None)` wires a `LinkArg::Const(Constant(None,
     // concretetype=Some(VOID)))` (model.rs:set_return) and the
@@ -186,7 +175,7 @@ fn follow_link(graph: &FunctionGraph, link: &Link) -> bool {
 fn follow_raise_link(graph: &FunctionGraph, link: &Link) -> bool {
     let mut changed = false;
     if let Some(value) = link.last_exc_value.as_ref().and_then(|a| a.as_variable()) {
-        changed |= merge_value_type(value, ValueType::Ref);
+        changed |= merge_value_type(value, ValueType::Ref(None));
     }
     if let Some(value) = link.last_exception.as_ref().and_then(|a| a.as_variable()) {
         changed |= merge_value_type(value, ValueType::Int);
@@ -197,7 +186,7 @@ fn follow_raise_link(graph: &FunctionGraph, link: &Link) -> bool {
         let src_ty = if Some(src) == link.last_exception.as_ref() {
             ValueType::Int
         } else if Some(src) == link.last_exc_value.as_ref() {
-            ValueType::Ref
+            ValueType::Ref(None)
         } else {
             link_arg_type(src)
         };
@@ -260,7 +249,7 @@ fn const_value_type(value: &ConstValue) -> ValueType {
         | ConstValue::Code(_)
         | ConstValue::LLPtr(_)
         | ConstValue::Function(_)
-        | ConstValue::HostObject(_) => ValueType::Ref,
+        | ConstValue::HostObject(_) => ValueType::Ref(None),
     }
 }
 
@@ -373,7 +362,7 @@ fn infer_op_type(kind: &OpKind) -> ValueType {
 fn kind_char_to_value_type(kind: char) -> ValueType {
     match kind {
         'i' => ValueType::Int,
-        'r' => ValueType::Ref,
+        'r' => ValueType::Ref(None),
         'f' => ValueType::Float,
         'v' => ValueType::Void,
         _ => ValueType::Unknown,
@@ -405,7 +394,8 @@ fn union_type(a: &ValueType, b: &ValueType) -> ValueType {
                 other.clone()
             }
         }
-        _ => ValueType::Unknown, // Conflicting types → Unknown
+        (ValueType::Ref(_), ValueType::Ref(_)) => ValueType::Ref(None),
+        _ => ValueType::Unknown,
     }
 }
 
@@ -558,9 +548,9 @@ mod tests {
 
         annotate(&graph);
         assert_eq!(read_binding(&last_exception_var), ValueType::Int);
-        assert_eq!(read_binding(&last_exc_value_var), ValueType::Ref);
+        assert_eq!(read_binding(&last_exc_value_var), ValueType::Ref(None));
         assert_eq!(read_binding(&etype_var), ValueType::Int);
-        assert_eq!(read_binding(&evalue_var), ValueType::Ref);
+        assert_eq!(read_binding(&evalue_var), ValueType::Ref(None));
     }
 
     #[test]
@@ -609,7 +599,7 @@ mod tests {
         let ret_var = graph.block(graph.returnblock).inputargs[0].clone();
         assert_eq!(
             read_binding(&ret_var),
-            ValueType::Ref,
+            ValueType::Ref(None),
             "annotation-layer projection of Constant(None) follows SomeNone → Ref",
         );
 

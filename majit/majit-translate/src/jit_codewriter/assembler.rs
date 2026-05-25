@@ -2314,7 +2314,7 @@ fn value_type_to_kind(ty: &crate::model::ValueType) -> char {
         // shares register class with Signed/Unsigned — all `'i'` for
         // the codewriter.
         ValueType::Int | ValueType::Unsigned | ValueType::Bool => 'i',
-        ValueType::Ref => 'r',
+        ValueType::Ref(_) => 'r',
         ValueType::Float => 'f',
         ValueType::Void | ValueType::State | ValueType::Unknown => 'v',
     }
@@ -2340,7 +2340,7 @@ fn value_type_to_itemsize(ty: &crate::model::ValueType) -> usize {
     use crate::model::ValueType;
     match ty {
         ValueType::Int => 8,
-        ValueType::Ref => 8,
+        ValueType::Ref(_) => 8,
         ValueType::Float => 8,
         _ => 8,
     }
@@ -2908,7 +2908,7 @@ fn arraydescrof(
                 majit_ir::value::Type::Float,
                 8,
             ),
-            crate::model::ValueType::Ref => (
+            crate::model::ValueType::Ref(_) => (
                 majit_ir::descr::ArrayFlag::Pointer,
                 majit_ir::value::Type::Ref,
                 8,
@@ -3897,7 +3897,7 @@ mod tests {
                 entry,
                 OpKind::Input {
                     name: "r".into(),
-                    ty: ValueType::Ref,
+                    ty: ValueType::Ref(None),
                 },
                 true,
             )
@@ -3949,7 +3949,7 @@ mod tests {
                 graph.startblock,
                 OpKind::Input {
                     name: "cell".to_string(),
-                    ty: ValueType::Ref,
+                    ty: ValueType::Ref(None),
                 },
                 true,
             )
@@ -4036,7 +4036,7 @@ mod tests {
                 graph.startblock,
                 OpKind::Input {
                     name: "obj".into(),
-                    ty: ValueType::Ref,
+                    ty: ValueType::Ref(None),
                 },
                 true,
             )
@@ -4159,7 +4159,7 @@ mod tests {
                 graph.startblock,
                 OpKind::Input {
                     name: "obj".into(),
-                    ty: ValueType::Ref,
+                    ty: ValueType::Ref(None),
                 },
                 true,
             )

@@ -3275,10 +3275,7 @@ mod tests {
         // generate_from_graph reads only `name` / `original_blocks` /
         // `flattened.insns.len()` per function and the four `total_*`
         // counters. Hand-rolling a ProgramPipelineResult covers the same
-        // surface without routing through `analyze_program`; the
-        // `analyze_program → ProgramPipelineResult` plumbing itself is
-        // covered by `pipeline_e2e_simple_function` in
-        // `translator/rtyper/legacy_pipeline.rs`.
+        // surface without routing through the canonical pipeline.
         let mut pipeline = crate::pipeline::ProgramPipelineResult {
             functions: Vec::new(),
             opcode_dispatch: Vec::new(),

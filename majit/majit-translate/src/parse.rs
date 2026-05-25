@@ -143,6 +143,65 @@ pub struct InherentMethodInfo {
     pub hints: Vec<String>,
 }
 
+/// `pub const NAME: TY = ...;` vs `pub static NAME: TY = ...;`.
+/// `Const` values are compile-time inlined; `Static` values have a
+/// stable memory location and are addressable as `&NAME` / `&mut NAME`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModuleStaticKind {
+    Const,
+    Static,
+}
+
+/// Statically-known literal value attached to a `pub const` /
+/// `pub static` declaration whose initialiser is a single
+/// `syn::Lit::{Bool, Int, Float}` expression.  Mirrors PyPy
+/// `flowspace`'s `Constant(value)` shape — the value is known at
+/// compile time and lowers to a typed `OpKind::Const*` node
+/// directly, sidestepping the body-`Input` mis-classification path.
+///
+/// `Float` stores `f64::to_bits()` matching the `OpKind::ConstFloat`
+/// payload format used by the `syn::Lit::Float` arm at
+/// `front/ast.rs:5030`.
+#[derive(Debug, Clone, Copy)]
+pub enum ModuleStaticLiteral {
+    Bool(bool),
+    Int(i64),
+    Float(u64),
+}
+
+/// Module-level `const` / `static` declaration collected at parse time.
+///
+/// Records enough information for the front-end `Expr::Path` arm and
+/// the annotator to resolve a bare/qualified reference to a known
+/// global without falling through to a body-`Input` mis-classification.
+///
+/// PyPy parity: mirrors `flowspace/flowcontext.py:858 LOAD_GLOBAL`
+/// resolving a statically known module attribute to a
+/// `Constant(value)` node.  The Python flowspace reaches the value
+/// via attribute access on the function's `__globals__` dict; the
+/// Rust port collects the same data at parse time so the
+/// `Expr::Path` arm does not have to re-walk the source tree.
+#[derive(Debug, Clone)]
+pub struct ModuleStaticDecl {
+    /// `const` or `static`.
+    pub kind: ModuleStaticKind,
+    /// Type root identifier (last segment of a `syn::Type::Path`),
+    /// e.g. `"PyType"` for `pub static INT_TYPE: PyType = ...`.
+    /// `None` for non-path types (tuple / function pointer / array
+    /// / etc.) — the diagnostic [`Self::type_str`] still records the
+    /// full type text in that case.
+    pub type_root: Option<String>,
+    /// Full type text rendered via `quote::ToTokens`.  Diagnostic
+    /// only; the front-end resolver should key off `type_root`.
+    pub type_str: String,
+    /// Compile-time literal value, when the initialiser expression
+    /// is a single `syn::Lit::{Bool, Int, Float}` literal.  `None`
+    /// for non-literal initialisers (e.g. `new_pytype("int")`,
+    /// `std::ptr::null_mut()`, composite struct literal) — those
+    /// need addressable-host-value annotator wiring instead.
+    pub literal: Option<ModuleStaticLiteral>,
+}
+
 /// Parsed representation of an interpreter source file.
 pub struct ParsedInterpreter {
     pub file: File,
@@ -160,15 +219,30 @@ pub struct ParsedInterpreter {
     /// here so `qualify_to_canonical_struct` can resolve cross-module
     /// type identity without re-walking the source tree.
     pub use_imports: std::collections::HashMap<String, String>,
+    /// `pub const` / `pub static` declarations, keyed by
+    /// `(nested_mod_chain, bare_name)`.  File-root decls use an empty
+    /// `nested_mod_chain`; decls inside `mod foo { ... }` use
+    /// `"foo"`, and `mod foo { mod bar { ... } }` uses `"foo::bar"`.
+    /// Populated by [`collect_module_statics`].
+    ///
+    /// Inline-module recursion mirrors the front-end's
+    /// `GraphBuildContext.module_prefix` namespacing
+    /// (`front/ast.rs:1453-1471 build_graphs_from_items` Item::Mod arm)
+    /// so a `pub const FOO` declared inside `mod foo { ... }` is
+    /// addressable from a path expression inside the same `mod foo`
+    /// scope as bare `FOO`, and from outside as `foo::FOO`.
+    pub module_statics: std::collections::HashMap<(String, String), ModuleStaticDecl>,
 }
 
 pub fn parse_source(source: &str) -> ParsedInterpreter {
     let file = syn::parse_file(source).expect("failed to parse bundled source");
     let use_imports = collect_use_imports(&file.items);
+    let module_statics = collect_module_statics(&file.items);
     ParsedInterpreter {
         file,
         module_path: String::new(),
         use_imports,
+        module_statics,
     }
 }
 
@@ -182,10 +256,12 @@ pub fn parse_source(source: &str) -> ParsedInterpreter {
 pub fn parse_source_with_module(source: &str, module_path: &str) -> ParsedInterpreter {
     let file = syn::parse_file(source).expect("failed to parse bundled source");
     let use_imports = collect_use_imports(&file.items);
+    let module_statics = collect_module_statics(&file.items);
     ParsedInterpreter {
         file,
         module_path: module_path.to_string(),
         use_imports,
+        module_statics,
     }
 }
 
@@ -209,6 +285,179 @@ pub(crate) fn collect_use_imports(items: &[Item]) -> std::collections::HashMap<S
         }
     }
     imports
+}
+
+/// Walk every `Item::Const` and `Item::Static` and collect
+/// their declared name + type into a `{(nested_mod_chain, name) →
+/// ModuleStaticDecl}` table.  Recurses into `Item::Mod` blocks so
+/// inline-module decls are addressable under their nested chain —
+/// matching the front-end's `module_prefix` namespacing
+/// (`front/ast.rs:1453-1471 build_graphs_from_items` Item::Mod arm),
+/// which is the read side that consumes this table.  Decls inside
+/// functions or impl blocks remain out of scope (they are not
+/// addressable as bare path-expressions from a sibling lowering
+/// site).
+///
+/// `pub` is not required.  Pyre's downstream resolver does not enforce
+/// visibility; the per-file `use_imports` table is the authoritative
+/// gate for cross-file lookups.
+pub(crate) fn collect_module_statics(
+    items: &[Item],
+) -> std::collections::HashMap<(String, String), ModuleStaticDecl> {
+    let mut statics = std::collections::HashMap::new();
+    collect_module_statics_into(items, "", &mut statics);
+    statics
+}
+
+fn collect_module_statics_into(
+    items: &[Item],
+    prefix: &str,
+    statics: &mut std::collections::HashMap<(String, String), ModuleStaticDecl>,
+) {
+    use quote::ToTokens;
+    for item in items {
+        match item {
+            Item::Const(c) => {
+                let type_str = c.ty.to_token_stream().to_string();
+                let type_root = type_root_ident(&c.ty);
+                let literal = literal_value_from_expr(&c.expr);
+                statics.insert(
+                    (prefix.to_string(), c.ident.to_string()),
+                    ModuleStaticDecl {
+                        kind: ModuleStaticKind::Const,
+                        type_root,
+                        type_str,
+                        literal,
+                    },
+                );
+            }
+            // `static mut FOO` is runtime-mutable storage; constfolding
+            // its initial value is unsound because LOAD_GLOBAL must read
+            // the current `module.__dict__` value (PyPy
+            // `flowspace/flowcontext.py:845`).  The rust_source walker
+            // already excludes mutable statics (`register.rs:935-936`
+            // documented at `:488-494`); the parse-side snapshot must
+            // apply the same gate so the front-end `Expr::Path` arm at
+            // `front/ast.rs::lookup_module_static_literal` does not
+            // const-fold a `static mut` initialiser.
+            Item::Static(s) if matches!(s.mutability, syn::StaticMutability::None) => {
+                let type_str = s.ty.to_token_stream().to_string();
+                let type_root = type_root_ident(&s.ty);
+                let literal = literal_value_from_expr(&s.expr);
+                statics.insert(
+                    (prefix.to_string(), s.ident.to_string()),
+                    ModuleStaticDecl {
+                        kind: ModuleStaticKind::Static,
+                        type_root,
+                        type_str,
+                        literal,
+                    },
+                );
+            }
+            Item::Mod(m) => {
+                if let Some((_, ref nested_items)) = m.content {
+                    let nested_prefix = if prefix.is_empty() {
+                        m.ident.to_string()
+                    } else {
+                        format!("{}::{}", prefix, m.ident)
+                    };
+                    collect_module_statics_into(nested_items, &nested_prefix, statics);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Decode a const / static initialiser expression into a
+/// [`ModuleStaticLiteral`] when it is a single primitive literal.
+/// Returns `None` for any non-literal expression — calls, struct
+/// literals, casts, references, etc.  Negative integer / float
+/// literals (`-1`, `-3.14`) are recognised as a `syn::UnOp::Neg`
+/// wrapping a positive `Lit`; nothing more elaborate is supported.
+fn literal_value_from_expr(expr: &syn::Expr) -> Option<ModuleStaticLiteral> {
+    match expr {
+        syn::Expr::Lit(lit) => literal_value_from_lit(&lit.lit, false),
+        syn::Expr::Unary(syn::ExprUnary {
+            op: syn::UnOp::Neg(_),
+            expr,
+            ..
+        }) => {
+            if let syn::Expr::Lit(inner) = &**expr {
+                literal_value_from_lit(&inner.lit, true)
+            } else {
+                match literal_value_from_expr(expr)? {
+                    ModuleStaticLiteral::Int(n) => Some(ModuleStaticLiteral::Int(-n)),
+                    ModuleStaticLiteral::Float(bits) => Some(ModuleStaticLiteral::Float(
+                        (-f64::from_bits(bits)).to_bits(),
+                    )),
+                    _ => None,
+                }
+            }
+        }
+        syn::Expr::Unary(syn::ExprUnary {
+            op: syn::UnOp::Not(_),
+            expr,
+            ..
+        }) => match literal_value_from_expr(expr)? {
+            ModuleStaticLiteral::Bool(b) => Some(ModuleStaticLiteral::Bool(!b)),
+            ModuleStaticLiteral::Int(n) => Some(ModuleStaticLiteral::Int(!n)),
+            _ => None,
+        },
+        syn::Expr::Binary(syn::ExprBinary {
+            left, op, right, ..
+        }) => {
+            let lhs = literal_value_from_expr(left)?;
+            let rhs = literal_value_from_expr(right)?;
+            match (lhs, rhs) {
+                (ModuleStaticLiteral::Int(a), ModuleStaticLiteral::Int(b)) => {
+                    let result = match op {
+                        syn::BinOp::BitOr(_) => a | b,
+                        syn::BinOp::BitAnd(_) => a & b,
+                        syn::BinOp::BitXor(_) => a ^ b,
+                        syn::BinOp::Shl(_) => a.checked_shl(b as u32)?,
+                        syn::BinOp::Shr(_) => a.checked_shr(b as u32)?,
+                        syn::BinOp::Add(_) => a.checked_add(b)?,
+                        syn::BinOp::Sub(_) => a.checked_sub(b)?,
+                        syn::BinOp::Mul(_) => a.checked_mul(b)?,
+                        syn::BinOp::Div(_) => a.checked_div(b)?,
+                        syn::BinOp::Rem(_) => a.checked_rem(b)?,
+                        _ => return None,
+                    };
+                    Some(ModuleStaticLiteral::Int(result))
+                }
+                _ => None,
+            }
+        }
+        syn::Expr::Cast(syn::ExprCast { expr, .. }) => literal_value_from_expr(expr),
+        syn::Expr::Group(g) => literal_value_from_expr(&g.expr),
+        syn::Expr::Paren(p) => literal_value_from_expr(&p.expr),
+        _ => None,
+    }
+}
+
+fn literal_value_from_lit(lit: &syn::Lit, negative: bool) -> Option<ModuleStaticLiteral> {
+    match lit {
+        syn::Lit::Bool(b) => {
+            // `!false = true` is not the same as `-false`; the negation
+            // path only applies to numeric literals.  Bool reaches here
+            // only when `negative=false` because there is no `-bool`.
+            if negative {
+                return None;
+            }
+            Some(ModuleStaticLiteral::Bool(b.value))
+        }
+        syn::Lit::Int(i) => {
+            let v: i64 = i.base10_parse().ok()?;
+            Some(ModuleStaticLiteral::Int(if negative { -v } else { v }))
+        }
+        syn::Lit::Float(f) => {
+            let v: f64 = f.base10_parse().ok()?;
+            let bits = (if negative { -v } else { v }).to_bits();
+            Some(ModuleStaticLiteral::Float(bits))
+        }
+        _ => None,
+    }
 }
 
 fn walk_use_tree(
@@ -1122,6 +1371,182 @@ fn canonical_type_name(ty: &syn::Type) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn collect_module_statics_records_const_and_static_decls_at_file_root() {
+        let parsed = parse_source(
+            r#"
+            pub const PY_NULL: *mut PyObject = std::ptr::null_mut();
+            pub static INT_TYPE: PyType = new_pytype("int");
+            pub const WITHPREBUILTINT: bool = false;
+            // function-local + nested-module decls must not appear:
+            fn helper() {
+                const LOCAL: i32 = 7;
+            }
+            mod nested {
+                pub const NESTED: u8 = 1;
+            }
+        "#,
+        );
+
+        let py_null = parsed
+            .module_statics
+            .get(&(String::new(), "PY_NULL".to_string()))
+            .expect("PY_NULL collected");
+        assert_eq!(py_null.kind, ModuleStaticKind::Const);
+        // `*mut PyObject` is a `syn::Type::Ptr`; `type_root_ident`
+        // intentionally returns `None` for non-`Path`/`Reference`
+        // types (consistent with the existing call sites at
+        // `parse.rs:1004` parameter-type extraction).  The full type
+        // text remains available via `type_str` for diagnostics.
+        assert!(py_null.type_root.is_none());
+        assert!(py_null.type_str.contains("PyObject"));
+
+        let int_type = parsed
+            .module_statics
+            .get(&(String::new(), "INT_TYPE".to_string()))
+            .expect("INT_TYPE collected");
+        assert_eq!(int_type.kind, ModuleStaticKind::Static);
+        assert_eq!(int_type.type_root.as_deref(), Some("PyType"));
+
+        let prebuiltint = parsed
+            .module_statics
+            .get(&(String::new(), "WITHPREBUILTINT".to_string()))
+            .expect("WITHPREBUILTINT collected");
+        assert_eq!(prebuiltint.kind, ModuleStaticKind::Const);
+        assert_eq!(prebuiltint.type_root.as_deref(), Some("bool"));
+        assert!(matches!(
+            prebuiltint.literal,
+            Some(ModuleStaticLiteral::Bool(false))
+        ));
+
+        // `INT_TYPE = new_pytype("int")` is a call, not a literal —
+        // no `literal` payload.
+        assert!(int_type.literal.is_none());
+        // `PY_NULL = std::ptr::null_mut()` likewise.
+        assert!(py_null.literal.is_none());
+
+        // Function-local decls remain excluded — the walker only
+        // descends into `Item::Mod` blocks, not function bodies.
+        assert!(
+            parsed
+                .module_statics
+                .get(&(String::new(), "LOCAL".to_string()))
+                .is_none()
+        );
+        // Nested-module decl is recorded under its inline-mod prefix
+        // (`"nested"` here), matching the front-end's `module_prefix`
+        // namespacing.
+        let nested = parsed
+            .module_statics
+            .get(&("nested".to_string(), "NESTED".to_string()))
+            .expect("NESTED collected under nested mod prefix");
+        assert_eq!(nested.kind, ModuleStaticKind::Const);
+        assert_eq!(nested.type_root.as_deref(), Some("u8"));
+        assert!(
+            parsed
+                .module_statics
+                .get(&(String::new(), "NESTED".to_string()))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn collect_module_statics_records_primitive_literal_values() {
+        let parsed = parse_source(
+            r#"
+            pub const TRUE_FLAG: bool = true;
+            pub const FALSE_FLAG: bool = false;
+            pub const POS_INT: i64 = 42;
+            pub const NEG_INT: i32 = -7;
+            pub const POS_FLOAT: f64 = 3.14;
+            pub const NEG_FLOAT: f64 = -2.5;
+            // Non-literal initialisers must NOT carry a literal payload:
+            pub const FROM_FN: u32 = compute();
+            pub const CAST_EXPR: u64 = 1u64 << 32;
+        "#,
+        );
+
+        let get = |name: &str| {
+            parsed
+                .module_statics
+                .get(&(String::new(), name.to_string()))
+                .unwrap_or_else(|| panic!("{name} collected"))
+        };
+        assert!(matches!(
+            get("TRUE_FLAG").literal,
+            Some(ModuleStaticLiteral::Bool(true))
+        ));
+        assert!(matches!(
+            get("FALSE_FLAG").literal,
+            Some(ModuleStaticLiteral::Bool(false))
+        ));
+        assert!(matches!(
+            get("POS_INT").literal,
+            Some(ModuleStaticLiteral::Int(42))
+        ));
+        assert!(matches!(
+            get("NEG_INT").literal,
+            Some(ModuleStaticLiteral::Int(-7))
+        ));
+        match get("POS_FLOAT").literal {
+            Some(ModuleStaticLiteral::Float(bits)) => {
+                assert_eq!(f64::from_bits(bits), 3.14);
+            }
+            other => panic!("expected POS_FLOAT to carry Float literal, got {other:?}"),
+        }
+        match get("NEG_FLOAT").literal {
+            Some(ModuleStaticLiteral::Float(bits)) => {
+                assert_eq!(f64::from_bits(bits), -2.5);
+            }
+            other => panic!("expected NEG_FLOAT to carry Float literal, got {other:?}"),
+        }
+        assert!(get("FROM_FN").literal.is_none());
+        assert!(
+            matches!(get("CAST_EXPR").literal, Some(ModuleStaticLiteral::Int(v)) if v == 1i64 << 32)
+        );
+    }
+
+    /// PyPy parity regression guard: `static mut` storage carries a
+    /// runtime-mutable slot, and `LOAD_GLOBAL` reads the current
+    /// `module.__dict__` value (PyPy `flowspace/flowcontext.py:845`).
+    /// Snapshotting the initial-value literal would let the frontend
+    /// const-fold reads of a name whose live value has drifted, which
+    /// is unsound.  The rust_source walker already excludes mutable
+    /// statics (`register.rs:935-936` documented at `:488-494`); the
+    /// parse-side snapshot must apply the same gate.
+    #[test]
+    fn collect_module_statics_skips_static_mut_initial_values() {
+        let parsed = parse_source(
+            r#"
+            pub static IMMUTABLE_FLAG: bool = true;
+            pub static mut RUNTIME_COUNTER: i64 = 0;
+            pub static mut LIVE_BUFFER_LEN: usize = 16;
+        "#,
+        );
+        assert!(
+            parsed
+                .module_statics
+                .get(&(String::new(), "IMMUTABLE_FLAG".to_string()))
+                .is_some(),
+            "immutable `static` must still snapshot",
+        );
+        assert!(
+            parsed
+                .module_statics
+                .get(&(String::new(), "RUNTIME_COUNTER".to_string()))
+                .is_none(),
+            "`static mut RUNTIME_COUNTER` must not snapshot — runtime mutation \
+             breaks const-fold soundness (PyPy flowcontext.py:845 LOAD_GLOBAL)",
+        );
+        assert!(
+            parsed
+                .module_statics
+                .get(&(String::new(), "LIVE_BUFFER_LEN".to_string()))
+                .is_none(),
+            "`static mut LIVE_BUFFER_LEN` must not snapshot",
+        );
+    }
 
     #[test]
     fn extract_function_call_identity_preserves_path_segments() {

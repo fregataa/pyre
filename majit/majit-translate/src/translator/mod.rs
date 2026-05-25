@@ -5,10 +5,9 @@
 //! names, function names, control flow). The legacy `translate_legacy/`
 //! subtree it once paired with was deleted at Slice 10; the residual
 //! adapter walker that still drives the dual-gate Skip arm now lives
-//! in [`rtyper::legacy_annotator`] / [`rtyper::legacy_resolve`] /
-//! [`rtyper::legacy_pipeline`] inside this same tree.  Both
-//! `majit-annotator` and `majit-rtyper` standalone crates remain on
-//! the roadmap.
+//! in [`rtyper::legacy_annotator`] / [`rtyper::legacy_resolve`]
+//! inside this same tree.  Both `majit-annotator` and `majit-rtyper`
+//! standalone crates remain on the roadmap.
 
 pub mod backendopt;
 pub mod c;

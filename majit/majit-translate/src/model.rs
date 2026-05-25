@@ -62,7 +62,25 @@ pub enum ValueType {
     /// = Bool` is integer-compatible at the LL level (everything
     /// except logical-vs-bitwise distinguishes).
     Bool,
-    Ref,
+    /// `lltype.Ptr(<inner>)` — pointer / GC reference family.  The
+    /// optional `String` carries the Rust type-root identifier
+    /// (mirrors `front/ast.rs::type_root_ident`) for the pointee when
+    /// the producer knows it; `None` is the un-narrowed / opaque case
+    /// (mirrors `lltype.Ptr(<unspecified>)` upstream where the rtyper
+    /// resolves through `getinstancerepr(rtyper, None, Gc)` to the
+    /// abstract `object`-root `InstanceRepr`).
+    ///
+    /// `valuetype_to_someshell::Ref` arm
+    /// (`annotation_state.rs:58-88`) currently projects every
+    /// `Ref(_)` to `SomeInstance(classdef=None)`; the typed-ref-
+    /// someptr-followup epic (`memory/long_term_resolve_plan_2026_05_24.md`
+    /// + task #88) flips the producer-side `classify_fn_arg_ty` to
+    /// emit `Ref(Some(<type_root>))` and the consumer to lift the
+    /// known cases to `SomeInstance(classdef=Some(..))` or
+    /// `SomeValue::Ptr(SomePtr::new(<ll_ptrtype>))` via the
+    /// host-registry lookup before falling through to the
+    /// classdef-less projection.
+    Ref(Option<String>),
     Float,
     Void,
     State,
@@ -237,8 +255,20 @@ pub enum CallTarget {
     /// Rust frontend adaptation for constructors that RPython's rtyper erases
     /// before jtransform. This variant must only be produced after frontend
     /// resolution proves the call is not a user-defined function.
+    ///
+    /// `name` is the variant/ctor leaf (`"Continue"` for
+    /// `StepResult::Continue`).  `owner_path` is the qualifying segments
+    /// preceding the leaf (`["StepResult"]`), empty for ctors that have
+    /// no owner (`Ok`/`Err`/`Some`).  Owner path matters for downstream
+    /// identity: `HostObject::new_class(qualname)` keys on the joined
+    /// path, so `StepResult::Continue` and `JitAction::Continue` produce
+    /// distinct ClassDescs and don't collide on the bare leaf — matching
+    /// RPython `bookkeeper.py:353 getdesc(pyobj)` which dedupes by
+    /// object identity, not leaf string.
     SyntheticTransparentCtor {
         name: String,
+        #[serde(default)]
+        owner_path: Vec<String>,
     },
     /// RPython: `indirect_call` opname. Receiver's static type is a
     /// `dyn Trait` (Rust fat pointer); at JIT time the actual callee
@@ -308,7 +338,24 @@ impl CallTarget {
     }
 
     pub fn synthetic_transparent_ctor(name: impl Into<String>) -> Self {
-        Self::SyntheticTransparentCtor { name: name.into() }
+        Self::SyntheticTransparentCtor {
+            name: name.into(),
+            owner_path: Vec::new(),
+        }
+    }
+
+    /// Owner-qualified variant — preserves the full `Owner::Variant`
+    /// path so downstream `HostObject` identity does not collide on
+    /// the bare leaf (e.g. `StepResult::Continue` vs
+    /// `JitAction::Continue`).
+    pub fn synthetic_transparent_ctor_with_owner(
+        owner_path: Vec<String>,
+        name: impl Into<String>,
+    ) -> Self {
+        Self::SyntheticTransparentCtor {
+            name: name.into(),
+            owner_path,
+        }
     }
 
     pub fn receiver_root(&self) -> Option<&str> {
@@ -324,7 +371,7 @@ impl CallTarget {
             CallTarget::FunctionPath { segments } => {
                 Some(segments.iter().map(String::as_str).collect())
             }
-            CallTarget::SyntheticTransparentCtor { name } => Some(vec![name.as_str()]),
+            CallTarget::SyntheticTransparentCtor { name, .. } => Some(vec![name.as_str()]),
             CallTarget::Indirect { method_name, .. } => Some(vec![method_name.as_str()]),
             CallTarget::UnsupportedExpr => None,
         }
@@ -345,8 +392,16 @@ impl fmt::Display for CallTarget {
                 ..
             } => f.write_str(name),
             CallTarget::FunctionPath { segments } => f.write_str(&segments.join("::")),
-            CallTarget::SyntheticTransparentCtor { name } => {
-                write!(f, "<synthetic-transparent-ctor {name}>")
+            CallTarget::SyntheticTransparentCtor { name, owner_path } => {
+                if owner_path.is_empty() {
+                    write!(f, "<synthetic-transparent-ctor {name}>")
+                } else {
+                    write!(
+                        f,
+                        "<synthetic-transparent-ctor {}::{name}>",
+                        owner_path.join("::")
+                    )
+                }
             }
             CallTarget::Indirect {
                 trait_root,
@@ -4464,7 +4519,7 @@ mod tests {
                 orphan_entry,
                 OpKind::Input {
                     name: "captured".into(),
-                    ty: ValueType::Ref,
+                    ty: ValueType::Ref(None),
                 },
                 true,
             )

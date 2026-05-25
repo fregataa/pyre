@@ -55,7 +55,7 @@ pub fn valuetype_to_someshell(vt: &ValueType) -> Option<SomeValue> {
         // as `SomeBool::default` matching `SomeBool()` upstream.
         ValueType::Bool => Some(SomeValue::Bool(crate::annotator::model::SomeBool::default())),
         ValueType::Float => Some(SomeValue::Float(SomeFloat::default())),
-        ValueType::Ref => {
+        ValueType::Ref(_) => {
             // RPython `SomeInstance(classdef=None, can_be_None=False,
             // flags={})` (model.py:438).  Upstream-orthodox abstract
             // instance for cases where the bookkeeper has not yet
@@ -134,7 +134,7 @@ pub fn somevalue_to_valuetype(s: &SomeValue) -> ValueType {
         SomeValue::Float(_) | SomeValue::SingleFloat(_) | SomeValue::LongFloat(_) => {
             ValueType::Float
         }
-        SomeValue::Instance(_) | SomeValue::Ptr(_) | SomeValue::PBC(_) => ValueType::Ref,
+        SomeValue::Instance(_) | SomeValue::Ptr(_) | SomeValue::PBC(_) => ValueType::Ref(None),
         // `SomeImpossibleValue` represents unreachable code (`model.py:627`),
         // which projects to `ValueType::Void` in pyre's flat enum just
         // like upstream `lltype.Void`.
@@ -147,6 +147,6 @@ pub fn somevalue_to_valuetype(s: &SomeValue) -> ValueType {
         // precise lattice node should read the `Variable.annotation`
         // shell directly; this reduced projection falls back to `Ref`
         // so GC-pointer lowering applies.
-        _ => ValueType::Ref,
+        _ => ValueType::Ref(None),
     }
 }

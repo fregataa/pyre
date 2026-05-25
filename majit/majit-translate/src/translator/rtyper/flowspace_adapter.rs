@@ -1001,13 +1001,13 @@ pub fn translate_op(
                     call_args.extend(arg_hls);
                     Ok(vec![FlowspaceOp::new("simple_call", call_args, result)])
                 }
-                CallTarget::SyntheticTransparentCtor { name } => {
+                CallTarget::SyntheticTransparentCtor { name, owner_path } => {
                     // RPython parity: tagged-union ctor `Foo(x)` annotates as
                     // `SomePBC([ClassDesc(Foo)])` then `pair_simple_call`
                     // constructs `SomeInstance(classdef)` (`bookkeeper.py:
                     // 315-316`).  Wrapping the ctor name as
-                    // `HostObject::new_class(name, [])` routes through the
-                    // existing `is_class()` arm in
+                    // `HostObject::new_class(qualname, [])` routes through
+                    // the existing `is_class()` arm in
                     // [`crate::annotator::bookkeeper::Bookkeeper::immutablevalue_hostobject`]
                     // (`bookkeeper.rs:1984`) → `getdesc` → `ClassDesc::new`
                     // (`classdesc.rs:708`) → `SomePBC([ClassDesc])`, instead
@@ -1019,8 +1019,19 @@ pub fn translate_op(
                     // [`crate::jit_codewriter::jtransform`] still unwraps
                     // the simple_call to its inner value (the transparent
                     // semantics survive at the codewriter layer).
+                    //
+                    // `owner_path` qualifies the ctor identity so two
+                    // distinct enums sharing a leaf (e.g.
+                    // `StepResult::Continue` vs `JitAction::Continue`)
+                    // produce different ClassDescs.  Falls back to the
+                    // bare leaf when no owner was recorded (Ok/Err/Some).
+                    let qualname = if owner_path.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{}.{}", owner_path.join("."), name)
+                    };
                     let callable = Hlvalue::Constant(Constant::new(ConstValue::HostObject(
-                        HostObject::new_class(name.clone(), Vec::new()),
+                        HostObject::new_class(qualname, Vec::new()),
                     )));
                     let mut call_args = Vec::with_capacity(arg_hls.len() + 1);
                     call_args.push(callable);
@@ -1999,7 +2010,7 @@ mod tests {
 
     #[test]
     fn valuetype_ref_lifts_to_someinstance_classdef_none() {
-        let s = valuetype_to_someshell(&ValueType::Ref).expect("Ref must project");
+        let s = valuetype_to_someshell(&ValueType::Ref(None)).expect("Ref must project");
         match s {
             SomeValue::Instance(inst) => {
                 assert!(
@@ -2139,7 +2150,7 @@ mod tests {
         let graph = legacy_graph_with_inputarg_and_result(1, 2);
 
         setbinding(&graph.must_variable_at(1), ValueType::Int);
-        setbinding(&graph.must_variable_at(2), ValueType::Ref);
+        setbinding(&graph.must_variable_at(2), ValueType::Ref(None));
         let map = build_value_to_variable_map(&graph);
 
         assert_eq!(
@@ -2376,7 +2387,7 @@ mod tests {
                 entry,
                 OpKind::Input {
                     name: "z".to_string(),
-                    ty: ValueType::Ref,
+                    ty: ValueType::Ref(None),
                 },
                 true,
             )
@@ -2719,9 +2730,10 @@ mod tests {
             kind: OpKind::Call {
                 target: crate::model::CallTarget::SyntheticTransparentCtor {
                     name: "Point".into(),
+                    owner_path: Vec::new(),
                 },
                 args: vec![graph.must_variable_at(1)],
-                result_ty: ValueType::Ref,
+                result_ty: ValueType::Ref(None),
             },
         };
         let translated = translate_op(&op, &value_map, &empty_call_registry(), &graph)

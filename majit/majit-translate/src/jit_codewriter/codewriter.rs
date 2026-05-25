@@ -461,10 +461,7 @@ impl CodeWriter {
         // writes resolved kinds straight to each backing
         // `Variable.concretetype` (see `Transformer::transform` →
         // `apply_to_graph`), so the legacy `resolve_rewritten_types`
-        // walk is structurally dead in the production path.  The
-        // parameter is kept on the API because legacy_pipeline.rs still
-        // funnels its `resolve_rewritten_types` output through this
-        // function for the dual-gate baseline comparison.
+        // walk is structurally dead in the production path.
         // Commit jtransform-induced op-result kinds (`result_ty` /
         // `result_kind` declarations) to each backing
         // `Variable.concretetype` cell.  Pre-jtransform kinds are

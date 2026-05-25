@@ -194,9 +194,7 @@ pub struct GraphTransformResult {
 /// `codewriter::transform_graph_to_jitcode` instead, which threads
 /// `&CallControl` and runs the lowering pass before jtransform.
 /// This debug-assertion catches missed lowering sites at the
-/// remaining entries (test fixtures + the cfg(test)-gated
-/// `translator/rtyper/legacy_pipeline.rs::analyze_function`) —
-/// plan Rev 2 §Phase B3.
+/// remaining entries (test fixtures) — plan Rev 2 §Phase B3.
 pub fn rewrite_graph(graph: &FunctionGraph, config: &GraphTransformConfig) -> GraphTransformResult {
     #[cfg(debug_assertions)]
     crate::translator::rtyper::rpbc::assert_no_indirect_call_targets(graph);
@@ -208,9 +206,7 @@ pub fn rewrite_graph(graph: &FunctionGraph, config: &GraphTransformConfig) -> Gr
 /// `Transformer`. Required when the graph contains `OpKind::IndirectCall`
 /// (emitted by `translator/rtyper/rpbc.rs::lower_indirect_calls`), since
 /// `lower_indirect_call_op` needs `CallControl::getcalldescr` +
-/// `guess_call_kind` + `graphs_from`. Used by the cfg(test)-gated
-/// `translator::rtyper::legacy_pipeline::analyze_function` after it
-/// calls `lower_indirect_calls` upstream.
+/// `guess_call_kind` + `graphs_from`.
 pub fn rewrite_graph_with_callcontrol(
     graph: &FunctionGraph,
     config: &GraphTransformConfig,
@@ -569,7 +565,7 @@ impl<'a> Transformer<'a> {
             ValueType::Int | ValueType::Unsigned | ValueType::Bool | ValueType::State => {
                 crate::jit_codewriter::type_state::ConcreteType::Signed
             }
-            ValueType::Ref => crate::jit_codewriter::type_state::ConcreteType::GcRef,
+            ValueType::Ref(_) => crate::jit_codewriter::type_state::ConcreteType::GcRef,
             ValueType::Float => crate::jit_codewriter::type_state::ConcreteType::Float,
             ValueType::Void => crate::jit_codewriter::type_state::ConcreteType::Void,
             ValueType::Unknown => return,
@@ -1586,7 +1582,7 @@ impl<'a> Transformer<'a> {
         // — read kind off the Variable.concretetype slot directly.
         match FunctionGraph::concretetype_of(var) {
             crate::jit_codewriter::type_state::ConcreteType::Signed => Some(ValueType::Int),
-            crate::jit_codewriter::type_state::ConcreteType::GcRef => Some(ValueType::Ref),
+            crate::jit_codewriter::type_state::ConcreteType::GcRef => Some(ValueType::Ref(None)),
             crate::jit_codewriter::type_state::ConcreteType::Float => Some(ValueType::Float),
             crate::jit_codewriter::type_state::ConcreteType::Void => Some(ValueType::Void),
             crate::jit_codewriter::type_state::ConcreteType::Unknown => None,
@@ -3637,9 +3633,26 @@ impl<'a> Transformer<'a> {
         if args.len() != 1 {
             return false;
         }
-        let CallTarget::SyntheticTransparentCtor { name } = target else {
+        let CallTarget::SyntheticTransparentCtor {
+            name,
+            owner_path: _,
+        } = target
+        else {
             return false;
         };
+        // Discriminator is the leaf name: `Ok`/`Err`/`Some` are the
+        // single-arg transparent wrappers PyPy treats as identity
+        // value-level (constructed by `rpython/rtyper/lltypesystem/
+        // rtagged.py` / `rtyper/llinterp.py` PBC paths, never
+        // materialised at runtime).  The producer
+        // (`front/ast.rs::is_synthetic_result_option_wrapper_path`)
+        // accepts both bare (`Ok`) and qualified (`Result::Ok`,
+        // `std::option::Option::Some`) spellings; both must elide
+        // identically because PyPy doesn't distinguish call-site
+        // spelling at the SSA layer.  Unit variants like
+        // `StepResult::Continue` route through the same
+        // `SyntheticTransparentCtor` variant but have a different
+        // `name` and therefore skip this arm.
         if !matches!(name.as_str(), "Ok" | "Err" | "Some") {
             return false;
         }
@@ -3698,7 +3711,7 @@ fn value_type_to_kind(ty: &ValueType) -> char {
         // return `'int'` (ll Bool / Unsigned share register class
         // with Signed at the codewriter register-kind layer).
         ValueType::Int | ValueType::Unsigned | ValueType::Bool | ValueType::State => 'i',
-        ValueType::Ref | ValueType::Unknown => 'r',
+        ValueType::Ref(_) | ValueType::Unknown => 'r',
         ValueType::Float => 'f',
         ValueType::Void => 'v',
     }
@@ -3755,7 +3768,7 @@ fn value_type_to_ir_type(ty: &ValueType) -> majit_ir::value::Type {
         ValueType::Int | ValueType::Unsigned | ValueType::Bool | ValueType::State => {
             majit_ir::value::Type::Int
         }
-        ValueType::Ref | ValueType::Unknown => majit_ir::value::Type::Ref,
+        ValueType::Ref(_) | ValueType::Unknown => majit_ir::value::Type::Ref,
         ValueType::Float => majit_ir::value::Type::Float,
         ValueType::Void => majit_ir::value::Type::Void,
     }
@@ -3768,8 +3781,10 @@ fn target_to_call_path(target: &CallTarget) -> crate::parse::CallPath {
             crate::parse::CallPath::from_segments(segments.iter().map(String::as_str))
         }
         CallTarget::Method { name, .. } => crate::parse::CallPath::from_segments([name.as_str()]),
-        CallTarget::SyntheticTransparentCtor { name } => {
-            crate::parse::CallPath::from_segments([name.as_str()])
+        CallTarget::SyntheticTransparentCtor { name, owner_path } => {
+            let mut segs: Vec<&str> = owner_path.iter().map(String::as_str).collect();
+            segs.push(name.as_str());
+            crate::parse::CallPath::from_segments(segs)
         }
         // RPython: an indirect_call has no single jitcode-lookup path —
         // the family is handled via the op-based `graphs_from(op)` +
@@ -4264,7 +4279,7 @@ fn classify_vable_hint(target: &CallTarget) -> Option<crate::hints::Virtualizabl
 /// `is_generic_receiver` wildcard branch is retired; there is no
 /// production path that produces `callcontrol=None` at this site
 /// (`Transformer::with_callcontrol` is set by every production
-/// entry — `codewriter.rs:382` + `legacy_pipeline.rs:92`).
+/// entry — `codewriter.rs:382`).
 ///
 /// PRE-EXISTING-ADAPTATION: the override table itself is pyre-only
 /// (no upstream basis). The producer (`codewriter.rs::
@@ -4523,7 +4538,7 @@ mod tests {
                 graph.startblock,
                 OpKind::Input {
                     name: "receiver".into(),
-                    ty: ValueType::Ref,
+                    ty: ValueType::Ref(None),
                 },
                 true,
             )
@@ -4534,7 +4549,7 @@ mod tests {
                 OpKind::UnaryOp {
                     op: "same_as".into(),
                     operand: receiver_var.clone(),
-                    result_ty: ValueType::Ref,
+                    result_ty: ValueType::Ref(None),
                 },
                 true,
             )
@@ -4864,7 +4879,7 @@ mod tests {
                         "locals_stack_w",
                         Some("Frame".into()),
                     ),
-                    ty: ValueType::Ref,
+                    ty: ValueType::Ref(None),
                     pure: false,
                 },
                 true,
@@ -5078,7 +5093,7 @@ mod tests {
             OpKind::Call {
                 target: CallTarget::method("call_callable", Some("PyFrame".into())),
                 args: vec![],
-                result_ty: ValueType::Ref,
+                result_ty: ValueType::Ref(None),
             },
             false,
         );
@@ -5460,7 +5475,7 @@ mod tests {
                 graph.startblock,
                 OpKind::Input {
                     name: "arg".into(),
-                    ty: ValueType::Ref,
+                    ty: ValueType::Ref(None),
                 },
                 true,
             )
@@ -5470,7 +5485,7 @@ mod tests {
             OpKind::Call {
                 target: target.clone(),
                 args: vec![arg_var],
-                result_ty: ValueType::Ref,
+                result_ty: ValueType::Ref(None),
             },
             true,
         );
@@ -5507,7 +5522,7 @@ mod tests {
             OpKind::Call {
                 target: CallTarget::function_path(["custom_reader"]),
                 args: vec![],
-                result_ty: ValueType::Ref,
+                result_ty: ValueType::Ref(None),
             },
             true,
         );
@@ -5567,7 +5582,7 @@ mod tests {
             OpKind::Call {
                 target: CallTarget::function_path(["hint_access_directly"]),
                 args: vec![frame_var],
-                result_ty: ValueType::Ref,
+                result_ty: ValueType::Ref(None),
             },
             false,
         );
@@ -5619,7 +5634,7 @@ mod tests {
             OpKind::Call {
                 target: CallTarget::function_path(["hint_force_virtualizable"]),
                 args: vec![frame_var.clone()],
-                result_ty: ValueType::Ref,
+                result_ty: ValueType::Ref(None),
             },
             false,
         );
@@ -5685,7 +5700,7 @@ mod tests {
             OpKind::Call {
                 target: CallTarget::function_path(["hint_promote"]),
                 args: vec![v_var.clone()],
-                result_ty: ValueType::Ref,
+                result_ty: ValueType::Ref(None),
             },
             false,
         );
@@ -5802,7 +5817,7 @@ mod tests {
                 graph.startblock,
                 OpKind::Input {
                     name: "cell".to_string(),
-                    ty: ValueType::Ref,
+                    ty: ValueType::Ref(None),
                 },
                 true,
             )
@@ -5872,7 +5887,7 @@ mod tests {
                 graph.startblock,
                 OpKind::Input {
                     name: "p".to_string(),
-                    ty: ValueType::Ref,
+                    ty: ValueType::Ref(None),
                 },
                 true,
             )
@@ -6201,7 +6216,7 @@ mod tests {
         assert!(transformer.is_synthetic_result_option_ctor(
             &CallTarget::synthetic_transparent_ctor("Ok"),
             &[arg],
-            &ValueType::Ref,
+            &ValueType::Ref(None),
         ));
     }
 
@@ -6217,7 +6232,7 @@ mod tests {
         assert!(!transformer.is_synthetic_result_option_ctor(
             &CallTarget::function_path(["Ok"]),
             &[arg],
-            &ValueType::Ref,
+            &ValueType::Ref(None),
         ));
     }
 
@@ -6232,7 +6247,7 @@ mod tests {
         assert!(!transformer.is_synthetic_result_option_ctor(
             &CallTarget::function_path(["Ok"]),
             &[arg],
-            &ValueType::Ref,
+            &ValueType::Ref(None),
         ));
     }
 
@@ -6247,7 +6262,69 @@ mod tests {
         assert!(!transformer.is_synthetic_result_option_ctor(
             &CallTarget::synthetic_transparent_ctor("Ok"),
             &[arg],
-            &ValueType::Ref,
+            &ValueType::Ref(None),
+        ));
+    }
+
+    /// PyPy parity regression guard: the qualified spellings
+    /// `Result::Ok`, `Option::Some`, `std::result::Result::Err` etc.
+    /// must elide identically to the bare `Ok` / `Some` / `Err`
+    /// forms.  The frontend whitelist at
+    /// `front/ast.rs::is_synthetic_result_option_wrapper_path`
+    /// already admits these multi-segment paths and records the
+    /// leading segments as `owner_path`; jtransform must not reject
+    /// the call based on `owner_path` being non-empty because PyPy's
+    /// `rtyper`/`codewriter` collapse Ok(x) / Result::Ok(x) /
+    /// std::result::Result::Ok(x) to identity at the value layer
+    /// regardless of call-site spelling.
+    #[test]
+    fn synthetic_result_ctor_identity_accepts_qualified_spellings() {
+        let config = GraphTransformConfig::default();
+        let mut graph = FunctionGraph::new("synth_ctor_qualified");
+        let arg = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let transformer = Transformer::new(&config);
+        for (owner, name) in [
+            (vec!["Result"], "Ok"),
+            (vec!["Result"], "Err"),
+            (vec!["Option"], "Some"),
+            (vec!["result", "Result"], "Ok"),
+            (vec!["option", "Option"], "Some"),
+            (vec!["std", "result", "Result"], "Err"),
+            (vec!["core", "option", "Option"], "Some"),
+        ] {
+            let owner_path: Vec<String> = owner.iter().map(|s| s.to_string()).collect();
+            let target = CallTarget::synthetic_transparent_ctor_with_owner(owner_path, name);
+            assert!(
+                transformer.is_synthetic_result_option_ctor(
+                    &target,
+                    &[arg.clone()],
+                    &ValueType::Ref(None),
+                ),
+                "{owner:?}::{name} must elide identically to the bare form",
+            );
+        }
+    }
+
+    /// `SyntheticTransparentCtor` is also used for pyre-side unit
+    /// variants like `StepResult::Continue` (Reviewer #5).  Those
+    /// share the variant but must NOT elide because they are real
+    /// values, not transparent wrappers.  The discriminator is the
+    /// leaf name (`Ok`/`Err`/`Some` only); a non-matching name with
+    /// any owner_path must still return false.
+    #[test]
+    fn synthetic_result_ctor_identity_rejects_unit_variant_with_owner() {
+        let config = GraphTransformConfig::default();
+        let mut graph = FunctionGraph::new("synth_ctor_unit_variant");
+        let arg = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let transformer = Transformer::new(&config);
+        let target = CallTarget::synthetic_transparent_ctor_with_owner(
+            vec!["StepResult".to_string()],
+            "Continue",
+        );
+        assert!(!transformer.is_synthetic_result_option_ctor(
+            &target,
+            &[arg],
+            &ValueType::Ref(None),
         ));
     }
 
@@ -6263,22 +6340,22 @@ mod tests {
         assert!(!transformer.is_synthetic_result_option_ctor(
             &CallTarget::function_path(["Result", "Ok"]),
             &[arg.clone()],
-            &ValueType::Ref,
+            &ValueType::Ref(None),
         ));
         assert!(!transformer.is_synthetic_result_option_ctor(
             &CallTarget::synthetic_transparent_ctor("Foo"),
             &[arg.clone()],
-            &ValueType::Ref,
+            &ValueType::Ref(None),
         ));
         assert!(transformer.is_synthetic_result_option_ctor(
             &CallTarget::synthetic_transparent_ctor("Err"),
             &[arg.clone()],
-            &ValueType::Ref,
+            &ValueType::Ref(None),
         ));
         assert!(transformer.is_synthetic_result_option_ctor(
             &CallTarget::synthetic_transparent_ctor("Some"),
             &[arg],
-            &ValueType::Ref,
+            &ValueType::Ref(None),
         ));
     }
 
@@ -6325,7 +6402,7 @@ mod tests {
                 graph.startblock,
                 OpKind::Input {
                     name: "self".to_string(),
-                    ty: ValueType::Ref,
+                    ty: ValueType::Ref(None),
                 },
                 true,
             )
@@ -6547,7 +6624,7 @@ mod tests {
                 g.startblock,
                 OpKind::Input {
                     name: "self".into(),
-                    ty: ValueType::Ref,
+                    ty: ValueType::Ref(None),
                 },
                 true,
             )
@@ -6578,7 +6655,7 @@ mod tests {
         let return_str = match result_ty {
             ValueType::Int | ValueType::State => "i64",
             ValueType::Unsigned => "u64",
-            ValueType::Ref | ValueType::Unknown => "String",
+            ValueType::Ref(_) | ValueType::Unknown => "String",
             ValueType::Float => "f64",
             ValueType::Void => "",
             ValueType::Bool => "bool",
@@ -6601,7 +6678,7 @@ mod tests {
                 graph.startblock,
                 OpKind::Input {
                     name: "self".into(),
-                    ty: ValueType::Ref,
+                    ty: ValueType::Ref(None),
                 },
                 true,
             )
@@ -6698,7 +6775,7 @@ mod tests {
     }
     #[test]
     fn indirect_regular_call_r_r() {
-        check_indirect_regular_call_kind(&[], ValueType::Ref, (0, 1, 0), 'r');
+        check_indirect_regular_call_kind(&[], ValueType::Ref(None), (0, 1, 0), 'r');
     }
     #[test]
     fn indirect_regular_call_r_f() {
@@ -6715,7 +6792,7 @@ mod tests {
     }
     #[test]
     fn indirect_regular_call_ir_r() {
-        check_indirect_regular_call_kind(&[ValueType::Int], ValueType::Ref, (1, 1, 0), 'r');
+        check_indirect_regular_call_kind(&[ValueType::Int], ValueType::Ref(None), (1, 1, 0), 'r');
     }
     #[test]
     fn indirect_regular_call_ir_f() {
@@ -6739,7 +6816,7 @@ mod tests {
     fn indirect_regular_call_irf_r() {
         check_indirect_regular_call_kind(
             &[ValueType::Int, ValueType::Float],
-            ValueType::Ref,
+            ValueType::Ref(None),
             (1, 1, 1),
             'r',
         );
@@ -6800,7 +6877,7 @@ mod tests {
                 g.startblock,
                 OpKind::Input {
                     name: "self".into(),
-                    ty: ValueType::Ref,
+                    ty: ValueType::Ref(None),
                 },
                 true,
             )
@@ -6826,7 +6903,7 @@ mod tests {
         let return_str = match result_ty {
             ValueType::Int | ValueType::State => "i64",
             ValueType::Unsigned => "u64",
-            ValueType::Ref | ValueType::Unknown => "String",
+            ValueType::Ref(_) | ValueType::Unknown => "String",
             ValueType::Float => "f64",
             ValueType::Void => "",
             ValueType::Bool => "bool",
@@ -6852,7 +6929,7 @@ mod tests {
                 graph.startblock,
                 OpKind::Input {
                     name: "self".into(),
-                    ty: ValueType::Ref,
+                    ty: ValueType::Ref(None),
                 },
                 true,
             )
@@ -6940,7 +7017,7 @@ mod tests {
     }
     #[test]
     fn indirect_residual_call_r_r() {
-        check_indirect_residual_call_kind(&[], ValueType::Ref, (0, 1, 0), 'r');
+        check_indirect_residual_call_kind(&[], ValueType::Ref(None), (0, 1, 0), 'r');
     }
     #[test]
     fn indirect_residual_call_r_f() {
@@ -6957,7 +7034,7 @@ mod tests {
     }
     #[test]
     fn indirect_residual_call_ir_r() {
-        check_indirect_residual_call_kind(&[ValueType::Int], ValueType::Ref, (1, 1, 0), 'r');
+        check_indirect_residual_call_kind(&[ValueType::Int], ValueType::Ref(None), (1, 1, 0), 'r');
     }
     #[test]
     fn indirect_residual_call_ir_f() {
@@ -6981,7 +7058,7 @@ mod tests {
     fn indirect_residual_call_irf_r() {
         check_indirect_residual_call_kind(
             &[ValueType::Int, ValueType::Float],
-            ValueType::Ref,
+            ValueType::Ref(None),
             (1, 1, 1),
             'r',
         );
@@ -7025,7 +7102,7 @@ mod tests {
             OpKind::Call {
                 target: CallTarget::function_path(["hint_promote_or_string"]),
                 args: vec![v_var],
-                result_ty: ValueType::Ref,
+                result_ty: ValueType::Ref(None),
             },
             false,
         );

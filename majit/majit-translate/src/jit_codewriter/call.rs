@@ -2763,7 +2763,7 @@ fn graph_non_void_arg_types(graph: &FunctionGraph) -> Vec<Type> {
         // same `'i'` register kind as `Signed`.  Bool aliases to Int
         // so the wildcard does not silently re-classify it as Ref.
         crate::model::ValueType::Int | crate::model::ValueType::Bool => Some(Type::Int),
-        crate::model::ValueType::Ref => Some(Type::Ref),
+        crate::model::ValueType::Ref(_) => Some(Type::Ref),
         crate::model::ValueType::Float => Some(Type::Float),
         crate::model::ValueType::Void => None,
         // Unknown / State — default to Ref.
@@ -5367,7 +5367,7 @@ fn collect_readwrite_effects(
                             | crate::model::ValueType::Unsigned
                             | crate::model::ValueType::Bool
                             | crate::model::ValueType::State => majit_ir::value::Type::Int,
-                            crate::model::ValueType::Ref | crate::model::ValueType::Unknown => {
+                            crate::model::ValueType::Ref(_) | crate::model::ValueType::Unknown => {
                                 majit_ir::value::Type::Ref
                             }
                             crate::model::ValueType::Float => majit_ir::value::Type::Float,
@@ -5413,7 +5413,7 @@ fn collect_readwrite_effects(
                             | crate::model::ValueType::Unsigned
                             | crate::model::ValueType::Bool
                             | crate::model::ValueType::State => majit_ir::value::Type::Int,
-                            crate::model::ValueType::Ref | crate::model::ValueType::Unknown => {
+                            crate::model::ValueType::Ref(_) | crate::model::ValueType::Unknown => {
                                 majit_ir::value::Type::Ref
                             }
                             crate::model::ValueType::Float => majit_ir::value::Type::Float,
@@ -5486,7 +5486,7 @@ fn collect_readwrite_effects(
                             Some(0)
                         };
                     let arr_idx = descr_indices.array_index(
-                        value_type_discriminant(&crate::model::ValueType::Ref),
+                        value_type_discriminant(&crate::model::ValueType::Ref(None)),
                         &resolved_id,
                         len_offset,
                     );
@@ -5556,7 +5556,7 @@ fn collect_readwrite_effects(
                             Some(0)
                         };
                     let arr_idx = descr_indices.array_index(
-                        value_type_discriminant(&crate::model::ValueType::Ref),
+                        value_type_discriminant(&crate::model::ValueType::Ref(None)),
                         &resolved_id,
                         len_offset,
                     );
@@ -6181,7 +6181,7 @@ fn value_type_discriminant(ty: &crate::model::ValueType) -> u8 {
         // and `INT_TYPE` under the same `'int'` kind for descriptor
         // indexing (`lltypesystem/lloperation.py:108 getkind`).
         ValueType::Int | ValueType::Unsigned | ValueType::Bool => 0,
-        ValueType::Ref => 1,
+        ValueType::Ref(_) => 1,
         ValueType::Float => 2,
         ValueType::Void => 3,
         ValueType::State => 4,

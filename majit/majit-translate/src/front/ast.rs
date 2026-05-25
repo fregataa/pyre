@@ -296,6 +296,17 @@ pub struct SemanticProgram {
     /// the same lookup logic works across module-prefix variants.  Rank
     /// encoding follows `rpython/rtyper/rclass.py:644-678 _parse_field_list`.
     pub immutable_fields: HashMap<String, Vec<(String, ImmutableRank)>>,
+    /// Whole-program `pub const` / `pub static` declarations gathered
+    /// across every parsed file.  Keyed by `(module_path, name)` so
+    /// the same bare name (`INT_TYPE`) can disambiguate between
+    /// different defining modules.  Mirrors PyPy's
+    /// `bookkeeper.getdesc(TYPE)` whole-program registry — pyre
+    /// carries the data per-`(module, name)` because Rust has no
+    /// `lltype` object identity to key off.
+    ///
+    /// Populated by [`collect_program_metadata_pub`] / the per-file
+    /// build entries from each [`ParsedInterpreter::module_statics`].
+    pub module_statics: HashMap<(String, String), crate::parse::ModuleStaticDecl>,
 }
 
 pub fn build_semantic_program(parsed: &ParsedInterpreter) -> Result<SemanticProgram, FlowingError> {
@@ -336,6 +347,13 @@ pub struct ProgramMetadata {
     /// different paths in different files (`use other_a::Foo` in one
     /// vs `use other_b::Foo` in another).
     pub use_imports: HashMap<(String, String), String>,
+    /// Merged module-static table across all parsed files: each entry
+    /// `(file_module_path, static_name) → ModuleStaticDecl` mirrors the
+    /// per-file `ParsedInterpreter.module_statics` populated by
+    /// `parse::collect_module_statics`.  Keyed by `(module, name)` —
+    /// the same bare static name (e.g. `LOCAL`) can appear in multiple
+    /// files; the per-file key disambiguates.
+    pub module_statics: HashMap<(String, String), crate::parse::ModuleStaticDecl>,
 }
 
 /// RPython `annrpython.py:103-150 build_types` whole-program walk —
@@ -359,6 +377,8 @@ pub fn collect_program_metadata_pub(parsed_files: &[ParsedInterpreter]) -> Progr
     let mut immutable_fields: HashMap<String, Vec<(String, ImmutableRank)>> = HashMap::new();
     let mut struct_origins: HashMap<String, String> = HashMap::new();
     let mut use_imports: HashMap<(String, String), String> = HashMap::new();
+    let mut module_statics: HashMap<(String, String), crate::parse::ModuleStaticDecl> =
+        HashMap::new();
     for parsed in parsed_files {
         collect_struct_names(&parsed.file.items, "", &mut known_struct_names);
         collect_trait_names(&parsed.file.items, "", &mut known_trait_names);
@@ -378,6 +398,10 @@ pub fn collect_program_metadata_pub(parsed_files: &[ParsedInterpreter]) -> Progr
         // files; the per-file key disambiguates.
         for (alias, full) in &parsed.use_imports {
             use_imports.insert((parsed.module_path.clone(), alias.clone()), full.clone());
+        }
+        for ((nested, name), decl) in &parsed.module_statics {
+            let module = qualify_module_path(&parsed.module_path, nested);
+            module_statics.insert((module, name.clone()), decl.clone());
         }
     }
     for parsed in parsed_files {
@@ -399,6 +423,7 @@ pub fn collect_program_metadata_pub(parsed_files: &[ParsedInterpreter]) -> Progr
         fn_return_types,
         struct_origins,
         use_imports,
+        module_statics,
     }
 }
 
@@ -464,6 +489,20 @@ pub(crate) fn collect_struct_origins(
 /// `&HashMap::new()` when the call site has no per-source scope
 /// (parse-time registration, test fixtures, `lower_expr_into_graph`);
 /// resolution then reduces to `STRUCT_ORIGIN_REGISTRY` + `prefix::bare`.
+/// Concatenate a file's `module_path` with an inline-`mod` chain
+/// (the `nested` half of a `parsed.module_statics` key) into the
+/// program-wide module-static lookup key used by `lookup_module_
+/// static_literal` (the `(module, leaf)` form at
+/// `front/ast.rs:8932-8956`).  Either component may be empty.
+pub(crate) fn qualify_module_path(module_path: &str, nested: &str) -> String {
+    match (module_path.is_empty(), nested.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => module_path.to_string(),
+        (true, false) => nested.to_string(),
+        (false, false) => format!("{}::{}", module_path, nested),
+    }
+}
+
 pub(crate) fn qualify_type_name_with_imports(
     bare: &str,
     prefix: &str,
@@ -1341,10 +1380,17 @@ fn collect_nested_fn_returns(
 fn build_graphs_from_items(
     items: &[Item],
     prefix: &str,
+    source_module: &str,
     options: &AstGraphOptions,
     struct_fields: &StructFieldRegistry,
     fn_return_types: &HashMap<String, String>,
     use_imports: &HashMap<String, String>,
+    // Program-wide `pub const` / `pub static` table aggregated by the
+    // caller (`build_semantic_program_*_with_options`).  Empty for
+    // legacy test entry points; populated for the production pipeline.
+    // Threaded straight through to `build_function_graph` →
+    // `GraphBuildContext::with_module_statics`.
+    module_statics: &HashMap<(String, String), crate::parse::ModuleStaticDecl>,
     known_struct_names: &std::collections::HashSet<String>,
     known_trait_names: &std::collections::HashSet<String>,
     functions: &mut Vec<SemanticFunction>,
@@ -1367,7 +1413,9 @@ fn build_graphs_from_items(
                         struct_fields,
                         fn_return_types,
                         prefix,
+                        source_module,
                         use_imports,
+                        module_statics,
                         known_struct_names,
                         known_trait_names,
                     )?;
@@ -1409,7 +1457,9 @@ fn build_graphs_from_items(
                                 struct_fields,
                                 fn_return_types,
                                 prefix,
+                                source_module,
                                 use_imports,
+                                module_statics,
                                 known_struct_names,
                                 known_trait_names,
                             )?;
@@ -1428,10 +1478,12 @@ fn build_graphs_from_items(
                     build_graphs_from_items(
                         items,
                         &mod_prefix,
+                        source_module,
                         options,
                         struct_fields,
                         fn_return_types,
                         use_imports,
+                        module_statics,
                         known_struct_names,
                         known_trait_names,
                         functions,
@@ -1473,17 +1525,45 @@ pub fn build_semantic_program_with_options(
     // Pass 2: build function graphs with struct_fields + fn_return_types.
     // Field types are already module-qualified at the source (via
     // qualified_full_type_string), matching RPython's lltype identity.
+    // Aggregate the single-file `module_statics` ahead of the graph
+    // build so the `GraphBuildContext` attached at
+    // `build_function_graph` carries the same `(module_path, name) →
+    // ModuleStaticDecl` shape that the multi-file pipeline produces.
+    let mut module_statics: HashMap<(String, String), crate::parse::ModuleStaticDecl> =
+        HashMap::new();
+    for ((nested, name), decl) in &parsed.module_statics {
+        let module = qualify_module_path(&parsed.module_path, nested);
+        module_statics.insert((module, name.clone()), decl.clone());
+    }
+    let start_len = functions.len();
     build_graphs_from_items(
         &parsed.file.items,
         "",
+        &parsed.module_path,
         options,
         &struct_fields,
         &fn_return_types,
         &parsed.use_imports,
+        &module_statics,
         &known_struct_names,
         &known_trait_names,
         &mut functions,
     )?;
+    // Stamp the parsed file's `module_path` onto each new
+    // SemanticFunction so the call-registry alias loop in `lib.rs`
+    // can register the function under additional module-qualified
+    if !parsed.module_path.is_empty() {
+        for sf in &mut functions[start_len..] {
+            if sf.module_path.is_empty() {
+                sf.module_path = parsed.module_path.clone();
+            }
+            sf.graph.source_module = Some(parsed.module_path.clone());
+        }
+    }
+
+    // `module_statics` was aggregated upstream of `build_graphs_from_items`
+    // so the per-graph `GraphBuildContext` carries it; reuse the same
+    // table for the `SemanticProgram` payload here.
 
     Ok(SemanticProgram {
         functions,
@@ -1492,6 +1572,7 @@ pub fn build_semantic_program_with_options(
         struct_fields,
         fn_return_types,
         immutable_fields,
+        module_statics,
     })
 }
 
@@ -1527,6 +1608,19 @@ pub fn build_semantic_program_from_parsed_files_with_options(
             &mut immutable_fields,
         );
     }
+    // Aggregate per-file `module_statics` ahead of Pass 2 so the
+    // `GraphBuildContext` attached at `build_function_graph` carries
+    // the program-wide `(module_path, name) → ModuleStaticDecl`
+    // table.  Mirrors the `use_imports` aggregation pattern at
+    // `collect_program_metadata_pub`.
+    let mut module_statics: HashMap<(String, String), crate::parse::ModuleStaticDecl> =
+        HashMap::new();
+    for parsed in parsed_files {
+        for ((nested, name), decl) in &parsed.module_statics {
+            let module = qualify_module_path(&parsed.module_path, nested);
+            module_statics.insert((module, name.clone()), decl.clone());
+        }
+    }
     // Pass 2: build function graphs with merged struct_fields + fn_return_types visible.
     // Field types already module-qualified at source (qualified_full_type_string).
     let mut functions = Vec::new();
@@ -1535,28 +1629,26 @@ pub fn build_semantic_program_from_parsed_files_with_options(
         build_graphs_from_items(
             &parsed.file.items,
             "",
+            &parsed.module_path,
             options,
             &struct_fields,
             &fn_return_types,
             &parsed.use_imports,
+            &module_statics,
             &known_struct_names,
             &known_trait_names,
             &mut functions,
         )?;
-        // Stamp the parsed file's module_path onto each new
+        // Stamp the parsed file's `module_path` onto each new
         // SemanticFunction so the free-function hint registry in
         // `lib.rs` can add the `[module_path, name]` path alongside
-        // the bare-name and `crate::` alias paths.  This pairs with
-        // the single-segment qualification at
-        // `canonical_call_target:7494-7502`: a bare call inside
-        // `mod pyframe` resolves to `["pyframe", helper]` and must
-        // find the same `#[majit_macros::elidable*]` hint that the
-        // bare-name registration carries.
+        // the bare-name and `crate::` alias paths (PyPy
         if !parsed.module_path.is_empty() {
             for sf in &mut functions[functions_before..] {
                 if sf.module_path.is_empty() {
                     sf.module_path = parsed.module_path.clone();
                 }
+                sf.graph.source_module = Some(parsed.module_path.clone());
             }
         }
     }
@@ -1567,6 +1659,7 @@ pub fn build_semantic_program_from_parsed_files_with_options(
         struct_fields,
         fn_return_types,
         immutable_fields,
+        module_statics,
     })
 }
 
@@ -1690,6 +1783,7 @@ pub fn build_function_graph_pub(func: &ItemFn) -> Result<SemanticFunction, Flowi
     let empty_names = std::collections::HashSet::new();
     let empty_trait_names = std::collections::HashSet::new();
     let empty_use_imports = HashMap::new();
+    let empty_module_statics = HashMap::new();
     build_function_graph(
         func,
         &AstGraphOptions::default(),
@@ -1697,7 +1791,9 @@ pub fn build_function_graph_pub(func: &ItemFn) -> Result<SemanticFunction, Flowi
         &empty_registry,
         &empty_fn_ret,
         "",
+        "",
         &empty_use_imports,
+        &empty_module_statics,
         &empty_names,
         &empty_trait_names,
     )
@@ -1713,6 +1809,7 @@ pub fn build_function_graph_with_self_ty_pub(
     known_struct_names: &std::collections::HashSet<String>,
     known_trait_names: &std::collections::HashSet<String>,
 ) -> Result<SemanticFunction, FlowingError> {
+    let empty_module_statics = HashMap::new();
     build_function_graph(
         func,
         &AstGraphOptions::default(),
@@ -1720,7 +1817,9 @@ pub fn build_function_graph_with_self_ty_pub(
         struct_fields,
         fn_return_types,
         module_prefix,
+        "",
         use_imports,
+        &empty_module_statics,
         known_struct_names,
         known_trait_names,
     )
@@ -1795,6 +1894,17 @@ struct GraphBuildContext<'a> {
     /// RPython: lltype identity is globally unique — bare "Foo" in mod "a"
     /// must resolve to "a::Foo" in struct_fields lookups.
     module_prefix: String,
+    /// The file's source-module path — `parsed.module_path` for the file
+    /// that owns this graph, constant through nested `mod` recursion.
+    /// Distinct from `module_prefix`, which tracks the *nested-mod*
+    /// segment chain (top-level functions get `module_prefix = ""` so
+    /// that bare type qualification doesn't accidentally prepend the
+    /// file's path).  `source_module` is the key used to scope module-
+    /// static lookups so a `pub const FOO: i64 = 1;` declared in
+    /// `file_a` resolves only for graphs built from `file_a` — matching
+    /// PyPy's per-frame `globals` (`flowcontext.py:845`) which only sees
+    /// the defining file's module globals.
+    source_module: String,
     /// Per-source `use <path> as alias` table — `(alias → fully_qualified_path)`
     /// resolved from this source file's top-level `Item::Use` declarations.
     /// PyPy peer: `bookkeeper.getdesc(value)` walks the host Python lexical
@@ -1804,6 +1914,15 @@ struct GraphBuildContext<'a> {
     /// Empty when the file has no use-aliases or the build entry bypassed
     /// the parsed-file plumbing (`parse::collect_function_graphs` tests).
     use_imports: HashMap<String, String>,
+    /// Program-wide `pub const` / `pub static` declarations keyed by
+    /// `(module_path, name)`.  Aggregated by
+    /// [`build_semantic_program_from_parsed_files_with_options`] from
+    /// every parsed file's
+    /// [`crate::parse::ParsedInterpreter::module_statics`].
+    /// Populated via [`Self::with_module_statics`] at the function-graph
+    /// build site; defaults to empty when callers (tests, legacy entry
+    /// points) construct a context without program-wide aggregation.
+    module_statics: HashMap<(String, String), crate::parse::ModuleStaticDecl>,
     known_struct_names: &'a std::collections::HashSet<String>,
     known_trait_names: &'a std::collections::HashSet<String>,
     /// Loop targets active at the current lowering point.  Pushed on
@@ -2423,7 +2542,9 @@ impl<'a> GraphBuildContext<'a> {
             struct_fields,
             fn_return_types,
             module_prefix: module_prefix.to_string(),
+            source_module: String::new(),
             use_imports,
+            module_statics: HashMap::new(),
             known_struct_names,
             known_trait_names,
             loop_stack: Vec::new(),
@@ -2434,6 +2555,32 @@ impl<'a> GraphBuildContext<'a> {
             blockstack: Vec::new(),
             joinpoints: HashMap::new(),
         }
+    }
+
+    /// Builder that attaches the program-wide module-static table to
+    /// this graph build context.  Mirrors the additive `with_*`
+    /// builder pattern already used by `bind_local_id_*` helpers — the
+    /// `new()` constructor stays signature-stable so existing call
+    /// sites (5 production + several test fixtures) keep compiling
+    /// without per-site edits, and the build sites that have access
+    /// to a program-wide `module_statics` table (the multi-file
+    /// pipeline entry in `build_semantic_program_from_parsed_files_
+    /// with_options`) opt in via this setter.
+    fn with_module_statics(
+        mut self,
+        module_statics: HashMap<(String, String), crate::parse::ModuleStaticDecl>,
+    ) -> Self {
+        self.module_statics = module_statics;
+        self
+    }
+
+    /// Stamp the file-level source-module path used to scope module-
+    /// static lookups.  Empty string means "no per-file scope known"
+    /// (test fixtures and legacy public entry points); the production
+    /// pipeline calls this with `parsed.module_path`.
+    fn with_source_module(mut self, source_module: &str) -> Self {
+        self.source_module = source_module.to_string();
+        self
     }
 
     // ------------------------------------------------------------------
@@ -3411,6 +3558,9 @@ fn lazy_install_local_at_current_block_var(
             (Some(prior), new) if prior == new => {}
             (Some(ValueType::Unknown), _) => shared_value_type = Some(observed_type.clone()),
             (Some(_), ValueType::Unknown) => {}
+            (Some(ValueType::Ref(_)), ValueType::Ref(_)) => {
+                shared_value_type = Some(ValueType::Ref(None))
+            }
             (Some(_), _) => shared_value_type = Some(ValueType::Unknown),
         }
         pred_snaps.push(PredSnap {
@@ -3624,7 +3774,14 @@ fn build_function_graph(
     struct_fields: &StructFieldRegistry,
     fn_return_types: &HashMap<String, String>,
     module_prefix: &str,
+    source_module: &str,
     use_imports: &HashMap<String, String>,
+    // Program-wide `pub const` / `pub static` table — attached to
+    // `GraphBuildContext` via `with_module_statics` for the
+    // (future) `Expr::Path` arm consumer.  Empty for the legacy
+    // public wrappers (`build_function_graph_pub` / `_with_self_ty_pub`)
+    // that don't have access to the aggregated program-wide table.
+    module_statics: &HashMap<(String, String), crate::parse::ModuleStaticDecl>,
     known_struct_names: &std::collections::HashSet<String>,
     known_trait_names: &std::collections::HashSet<String>,
 ) -> Result<SemanticFunction, FlowingError> {
@@ -3640,7 +3797,9 @@ fn build_function_graph(
         use_imports.clone(),
         known_struct_names,
         known_trait_names,
-    );
+    )
+    .with_module_statics(module_statics.clone())
+    .with_source_module(source_module);
     ctx.generic_trait_roots =
         collect_generic_trait_roots(&func.sig.generics, module_prefix, known_trait_names);
 
@@ -4689,6 +4848,7 @@ fn lower_if_expr(
                     (a, b) if a == b => a,
                     (ValueType::Unknown, b) => b,
                     (a, ValueType::Unknown) => a,
+                    (ValueType::Ref(_), ValueType::Ref(_)) => ValueType::Ref(None),
                     _ => ValueType::Unknown,
                 };
                 info.push((i, merged_var.clone(), merged_ty));
@@ -5417,6 +5577,92 @@ fn lower_expr(
             {
                 return Ok(Lowered::from_value_var(graph, &threaded_var));
             }
+            // Path-as-value unit-variant ctor route — `StepResult::
+            // Continue` / `JitAction::Return` etc. reach the Expr::Path
+            // arm without going through `canonical_call_target`'s
+            // Call-site routing.  Without this branch they fall through
+            // to the naked `OpKind::Input` emit below and the rtyper
+            // adapter rejects them as "adapter cross-block body Input"
+            // because the qualified-path string is never a real local.
+            // Route only the unit-variant subset of `is_synthetic_
+            // ctor_path` (the Pyre-side `Class::Variant` group) so the
+            // 0-arg `HostObject::new_class` lands as a
+            // `SomeInstance(classdef)`.  Result/Option wrappers
+            // (`Ok`/`Err`/`Some`) are deliberately excluded — they are
+            // only valid as one-argument calls, and jtransform's
+            // transparent elision (`is_synthetic_result_option_ctor`)
+            // handles `args.len() == 1` only.
+            let segments_vec: Vec<String> = path
+                .path
+                .segments
+                .iter()
+                .map(|seg| seg.ident.to_string())
+                .collect();
+            // Path-as-value numeric constants — `flowspace/flowcontext.py:858
+            // LOAD_GLOBAL` parity: when a path resolves to a statically
+            // known module-level numeric attribute, emit a `Constant` node
+            // (`flowmodel.py:Constant(value)`) instead of a body-`Input` that
+            // would mis-classify as a cross-block local read.
+            //
+            // Match Rust's `f64::{INFINITY,NEG_INFINITY,NAN}` (and the
+            // `std::f64::*` / `core::f64::*` long forms) directly to the
+            // existing `OpKind::ConstFloat(bits)` lowering used at the
+            // `syn::Lit::Float` arm above.
+            if let Some(bits) = path_as_value_float_constant(&segments_vec) {
+                let var = graph
+                    .push_op_var(*block, OpKind::ConstFloat(bits), true)
+                    .expect("ConstFloat has has_result=true");
+                return Ok(Lowered::from_value_var(graph, &var));
+            }
+            // Parse-side `pub const NAME: <primitive> = <literal>`
+            // resolution.  `ctx.module_statics` (populated at
+            // `build_semantic_program_*_with_options` from each
+            // `ParsedInterpreter::module_statics`) carries every
+            // file-root const/static whose initialiser was a single
+            // primitive `syn::Lit::{Bool, Int, Float}` literal.  When
+            // the Expr::Path resolves to such a decl, emit the matching
+            // typed `OpKind::Const*` directly — mirroring how the
+            // `syn::Lit::*` arm above lowers an in-place literal.
+            //
+            // Same RPython parity argument as `path_as_value_float_constant`
+            // above: `flowspace/flowcontext.py:858 LOAD_GLOBAL` produces
+            // `Constant(value)` when the resolved module attribute is
+            // statically known.
+            if let Some(literal) = lookup_module_static_literal(&segments_vec, ctx) {
+                let const_op = match literal {
+                    crate::parse::ModuleStaticLiteral::Bool(b) => OpKind::ConstBool(b),
+                    crate::parse::ModuleStaticLiteral::Int(v) => OpKind::ConstInt(v),
+                    crate::parse::ModuleStaticLiteral::Float(bits) => OpKind::ConstFloat(bits),
+                };
+                let var = graph
+                    .push_op_var(*block, const_op, true)
+                    .expect("Const{Bool,Int,Float} has has_result=true");
+                return Ok(Lowered::from_value_var(graph, &var));
+            }
+            if is_synthetic_unit_variant_path(&segments_vec)
+                && !registered_function_path(&segments_vec, ctx)
+            {
+                let (last_idx, last) = segments_vec
+                    .iter()
+                    .enumerate()
+                    .last()
+                    .map(|(i, s)| (i, s.clone()))
+                    .expect("synthetic ctor path is non-empty");
+                let owner_path = segments_vec[..last_idx].to_vec();
+                let target = CallTarget::synthetic_transparent_ctor_with_owner(owner_path, last);
+                let result_var = graph.push_op_var(
+                    *block,
+                    OpKind::Call {
+                        target,
+                        args: Vec::new(),
+                        result_ty: ValueType::Unknown,
+                    },
+                    true,
+                );
+                return Ok(result_var
+                    .map(|var| Lowered::from_value_var(graph, &var))
+                    .unwrap_or_else(Lowered::no_value));
+            }
             let ty = ctx
                 .local_value_types
                 .get(&name)
@@ -5591,7 +5837,7 @@ fn lower_expr(
                         // (`bigint_invert(a: BigInt) -> BigInt` →
                         // `Ref`).
                         let result_ty = graph_value_type_var(graph, &operand_var)
-                            .filter(|ty| matches!(ty, ValueType::Int | ValueType::Ref))
+                            .filter(|ty| matches!(ty, ValueType::Int | ValueType::Ref(_)))
                             .unwrap_or(ValueType::Int);
                         let var = graph
                             .push_op_var(
@@ -5986,7 +6232,9 @@ fn lower_expr(
             // `int_mod/ri>i` opname when the result is later used as
             // an integer operand (Task #141 / Task #85 lock-in at
             // `pyre-jit-trace/src/jitcode_runtime.rs:1340`).
-            if source_ty.as_ref() == Some(&ValueType::Ref) && result_ty == ValueType::Unsigned {
+            if matches!(source_ty.as_ref(), Some(ValueType::Ref(_)))
+                && result_ty == ValueType::Unsigned
+            {
                 let intermediate_var = graph
                     .push_op_var(
                         *block,
@@ -8591,12 +8839,12 @@ fn canonical_call_target(expr: &syn::Expr, ctx: &GraphBuildContext) -> CallTarge
                 .map(|seg| seg.ident.to_string())
                 .collect();
             if is_synthetic_ctor_path(&segments) && !registered_function_path(&segments, ctx) {
-                return CallTarget::synthetic_transparent_ctor(
-                    segments
-                        .last()
-                        .expect("transparent ctor path is non-empty")
-                        .clone(),
-                );
+                let last = segments
+                    .last()
+                    .expect("transparent ctor path is non-empty")
+                    .clone();
+                let owner_path = segments[..segments.len() - 1].to_vec();
+                return CallTarget::synthetic_transparent_ctor_with_owner(owner_path, last);
             }
             if segments.len() == 1 && !ctx.module_prefix.is_empty() {
                 let mut qualified = ctx
@@ -8644,10 +8892,19 @@ fn canonical_call_target(expr: &syn::Expr, ctx: &GraphBuildContext) -> CallTarge
 /// caller's check at `canonical_call_target` that
 /// `registered_function_path` returns false.
 fn is_synthetic_ctor_path(segments: &[String]) -> bool {
+    is_synthetic_result_option_wrapper_path(segments) || is_synthetic_unit_variant_path(segments)
+}
+
+/// `Ok`/`Err`/`Some` and their qualified spellings.  These are
+/// always one-argument transparent wrappers that
+/// `jtransform::is_synthetic_result_option_ctor` elides at the
+/// `args.len() == 1` site.  Valid only as call targets — using the
+/// bare ctor name as a value would lower to a 0-arg synthetic call
+/// the elision pass does not handle.
+fn is_synthetic_result_option_wrapper_path(segments: &[String]) -> bool {
     let path: Vec<&str> = segments.iter().map(String::as_str).collect();
     matches!(
         path.as_slice(),
-        // Result/Option transparent wrappers — elided at jtransform.
         ["Ok"]
             | ["Err"]
             | ["Some"]
@@ -8663,13 +8920,151 @@ fn is_synthetic_ctor_path(segments: &[String]) -> bool {
             | ["core", "result", "Result", "Ok"]
             | ["core", "result", "Result", "Err"]
             | ["core", "option", "Option", "Some"]
-            // Pyre-side `Class::Variant` ctors — classdesc-routed,
-            // not elided.
-            | ["LoopResult", "Done"]
+    )
+}
+
+/// Path-as-value numeric constants — Rust counterpart of PyPy
+/// `flowspace.LOAD_GLOBAL` resolving a statically-known module
+/// attribute to a `Constant(value)` node.  Returns the `f64` bit
+/// pattern matching the `syn::Lit::Float` arm's
+/// `OpKind::ConstFloat(v.to_bits())` form.
+///
+/// Only `f64::{INFINITY, NEG_INFINITY, NAN}` and their long forms
+/// `{std,core}::f64::*` are recognised here; other numeric path
+/// constants would each need their own typed `Const*` op (the
+/// `OpKind::ConstFloat` variant is float-specific).
+fn path_as_value_float_constant(segments: &[String]) -> Option<u64> {
+    let path: Vec<&str> = segments.iter().map(String::as_str).collect();
+    let leaf = match path.as_slice() {
+        ["f64", leaf] => leaf,
+        ["std", "f64", leaf] => leaf,
+        ["core", "f64", leaf] => leaf,
+        _ => return None,
+    };
+    match *leaf {
+        "INFINITY" => Some(f64::INFINITY.to_bits()),
+        "NEG_INFINITY" => Some(f64::NEG_INFINITY.to_bits()),
+        "NAN" => Some(f64::NAN.to_bits()),
+        _ => None,
+    }
+}
+
+/// Resolve a path expression against the program-wide
+/// `pub const` / `pub static` table on `ctx.module_statics` and
+/// return its compile-time literal value when known.  Mirrors how
+/// `qualify_type_name_with_imports` resolves a bare type name —
+/// the same three-step ladder: explicit `::`-qualified path,
+/// `use`-alias lookup, same-file `(source_module, name)` lookup.
+///
+/// PyPy parity: `flowcontext.py:845-866` LOAD_GLOBAL only consults
+/// the defining function's `frame.globals` (the file's module
+/// globals) before falling through to builtins.  The bare-name
+/// fallback is therefore scoped to the file's `source_module`; no
+/// program-wide "unique leaf name" rule (which would let one file's
+/// `pub const FOO` resolve in an unrelated file by accident).
+///
+/// Returns `None` when the path does not resolve to a known
+/// file-root decl, or when it resolves to one whose initialiser
+/// is not a primitive literal (e.g. `INT_TYPE = new_pytype("int")`).
+fn lookup_module_static_literal(
+    segments: &[String],
+    ctx: &GraphBuildContext,
+) -> Option<crate::parse::ModuleStaticLiteral> {
+    if segments.is_empty() {
+        return None;
+    }
+    let leaf = segments.last().unwrap().clone();
+    if segments.len() >= 2 {
+        // RPython LOAD_GLOBAL + LOAD_ATTR: resolve the root segment
+        // through use-imports first, then try direct / stripped / relative.
+        let resolved_segments: Vec<String> = if let Some(full) = ctx.use_imports.get(&segments[0]) {
+            let mut resolved: Vec<String> = full.split("::").map(String::from).collect();
+            resolved.extend_from_slice(&segments[1..]);
+            resolved
+        } else {
+            segments.to_vec()
+        };
+        let module = resolved_segments[..resolved_segments.len() - 1].join("::");
+        let resolved_leaf = resolved_segments.last().unwrap().clone();
+        if let Some(decl) = ctx
+            .module_statics
+            .get(&(module.clone(), resolved_leaf.clone()))
+        {
+            return decl.literal;
+        }
+        if resolved_segments[0] == "crate"
+            || crate::parse::PYRE_INTERNAL_CRATES.contains(&resolved_segments[0].as_str())
+        {
+            let stripped_module = resolved_segments[1..resolved_segments.len() - 1].join("::");
+            if let Some(decl) = ctx
+                .module_statics
+                .get(&(stripped_module, resolved_leaf.clone()))
+            {
+                return decl.literal;
+            }
+        }
+        let current_module = qualify_module_path(&ctx.source_module, &ctx.module_prefix);
+        if !current_module.is_empty() {
+            let qualified = qualify_module_path(&current_module, &module);
+            if let Some(decl) = ctx.module_statics.get(&(qualified, resolved_leaf.clone())) {
+                return decl.literal;
+            }
+        }
+        return None;
+    }
+    // Single-segment: try `use`-alias first (RPython parity with
+    // `qualify_type_name_with_imports`).
+    if let Some(full) = ctx.use_imports.get(&leaf) {
+        if let Some(idx) = full.rfind("::") {
+            let module = full[..idx].to_string();
+            let name = full[idx + 2..].to_string();
+            if let Some(decl) = ctx.module_statics.get(&(module, name)) {
+                return decl.literal;
+            }
+        }
+    }
+    if !ctx.module_prefix.is_empty() {
+        let qualified = qualify_module_path(&ctx.source_module, &ctx.module_prefix);
+        if let Some(decl) = ctx.module_statics.get(&(qualified, leaf.clone())) {
+            return decl.literal;
+        }
+    }
+    // File-level same-module fallback: bare name resolves against
+    // the *file's* `source_module` (PyPy `frame.globals` parity).
+    // The production pipeline always populates this via
+    // `with_source_module`; test helpers pass `""` and therefore
+    // skip this fallback.
+    if !ctx.source_module.is_empty() {
+        if let Some(decl) = ctx
+            .module_statics
+            .get(&(ctx.source_module.clone(), leaf.clone()))
+        {
+            return decl.literal;
+        }
+    }
+    None
+}
+
+/// Pyre-side `Class::Variant` unit-variant ctors.  These are valid
+/// as bare path-expression values; `flowspace_adapter` builds a
+/// 0-arg `HostObject::new_class(name, [])` for them and the result
+/// lands as a `SomeInstance(classdef)`.  jtransform does not elide
+/// them.
+fn is_synthetic_unit_variant_path(segments: &[String]) -> bool {
+    let path: Vec<&str> = segments.iter().map(String::as_str).collect();
+    matches!(
+        path.as_slice(),
+        ["LoopResult", "Done"]
             | ["LoopResult", "ContinueRunningNormally"]
             | ["JitAction", "Return"]
             | ["JitAction", "Continue"]
             | ["StepResult", "Continue"]
+            | ["CompareOp", "Lt"]
+            | ["CompareOp", "Le"]
+            | ["CompareOp", "Gt"]
+            | ["CompareOp", "Ge"]
+            | ["CompareOp", "Eq"]
+            | ["CompareOp", "Ne"]
     )
 }
 
@@ -8912,7 +9307,7 @@ fn const_value_value_type(c: &ConstValue) -> Option<ValueType> {
         | ConstValue::Graphs(_)
         | ConstValue::Atom(_)
         | ConstValue::LLPtr(_)
-        | ConstValue::HostObject(_) => Some(ValueType::Ref),
+        | ConstValue::HostObject(_) => Some(ValueType::Ref(None)),
         // `LowLevelType` constants are `lltype.Void` carriers (the
         // value IS a TYPE object); RPython flow `Constant(TYPE,
         // lltype.Void)` — Void register class.
@@ -9076,7 +9471,7 @@ fn intrinsic_call_result_type(segments: &[String]) -> Option<ValueType> {
 fn kind_char_to_value_type(kind: char) -> Option<ValueType> {
     match kind {
         'i' => Some(ValueType::Int),
-        'r' => Some(ValueType::Ref),
+        'r' => Some(ValueType::Ref(None)),
         'f' => Some(ValueType::Float),
         'v' => Some(ValueType::Void),
         _ => None,
@@ -9188,14 +9583,14 @@ fn cast_builtin_name(
         // rtyper-side annotation back to the frontend (or a deferred
         // 2-arg rewrite in jtransform / annotator after the Ptr is
         // known).
-        (Some(ValueType::Ref), ValueType::Int) => Some(&[
+        (Some(ValueType::Ref(_)), ValueType::Int) => Some(&[
             "rpython",
             "rtyper",
             "lltypesystem",
             "lltype",
             "cast_ptr_to_int",
         ]),
-        (Some(ValueType::Int), ValueType::Ref) => Some(&[
+        (Some(ValueType::Int), ValueType::Ref(_)) => Some(&[
             "rpython",
             "rtyper",
             "lltypesystem",
@@ -9750,7 +10145,7 @@ pub(crate) fn classify_fn_arg_ty(ty: &syn::Type) -> crate::model::ValueType {
         syn::Type::Path(path) => {
             let last = match path.path.segments.last() {
                 Some(s) => s,
-                None => return ValueType::Ref,
+                None => return ValueType::Ref(None),
             };
             if path.path.segments.len() == 2
                 && path.path.segments[0].ident == "Self"
@@ -9772,7 +10167,7 @@ pub(crate) fn classify_fn_arg_ty(ty: &syn::Type) -> crate::model::ValueType {
                         }
                     }
                 }
-                return ValueType::Ref;
+                return ValueType::Ref(type_root_ident(ty));
             }
             match name.as_str() {
                 // `lltype.Signed` family.
@@ -9796,28 +10191,38 @@ pub(crate) fn classify_fn_arg_ty(ty: &syn::Type) -> crate::model::ValueType {
                 // level but stays in the Float class either way.
                 "f32" | "f64" => ValueType::Float,
                 // Anything else is a user type / GC ref / opaque struct.
-                _ => ValueType::Ref,
+                // Carry the joined path segments so downstream consumers
+                // (`valuetype_to_someshell` host-registry lookup) can
+                // narrow `SomeInstance(classdef=None)` to a registered
+                // `ClassDef` / `SomePtr(<ll_ptrtype>)` per the
+                // typed-ref-someptr-followup epic.
+                _ => ValueType::Ref(type_root_ident(ty)),
             }
         }
         // `&T` / `&mut T` — pointer → Ref (lltype.Ptr in RPython).
-        syn::Type::Reference(_) => ValueType::Ref,
+        // `type_root_ident` recursively unwraps the reference and
+        // returns the inner Path's joined segments when present.
+        syn::Type::Reference(_) => ValueType::Ref(type_root_ident(ty)),
         // `*const T` / `*mut T` — raw pointer, same class as Ref.  pyre
         // often stores GC objects as `*mut PyObject`; classify as Ref
         // so field/array bases reach the canonical `/rd>X` encoding
         // rather than the pyre-only `*_intbase` aliases.
-        syn::Type::Ptr(_) => ValueType::Ref,
+        syn::Type::Ptr(_) => ValueType::Ref(type_root_ident(ty)),
         syn::Type::Paren(paren) => classify_fn_arg_ty(&paren.elem),
         syn::Type::Group(group) => classify_fn_arg_ty(&group.elem),
         // `dyn Trait` — GC pointer to a trait object.
-        syn::Type::TraitObject(_) => ValueType::Ref,
+        // `type_root_ident` returns `dyn <Trait>` so consumers can
+        // distinguish concrete structs from trait objects.
+        syn::Type::TraitObject(_) => ValueType::Ref(type_root_ident(ty)),
         // Tuple/array/slice: treat as Ref (bulk data, not a register
         // primitive).  RPython `lltype.Array` + `lltype.Struct` both
-        // flatten to `lltype.Ptr` at the call-site boundary.
-        syn::Type::Tuple(_) | syn::Type::Array(_) | syn::Type::Slice(_) => ValueType::Ref,
+        // flatten to `lltype.Ptr` at the call-site boundary.  No single
+        // ident makes sense as the type-root, so leave `None`.
+        syn::Type::Tuple(_) | syn::Type::Array(_) | syn::Type::Slice(_) => ValueType::Ref(None),
         // `fn(T) -> T`, `impl Trait`, never — no runtime
         // representation reaches the SSA level; default to Ref for
         // safe-by-default classification.
-        _ => ValueType::Ref,
+        _ => ValueType::Ref(None),
     }
 }
 
@@ -10336,7 +10741,7 @@ fn type_string_to_value_type(type_str: &str) -> ValueType {
         "bool" => ValueType::Bool,
         "f32" | "f64" => ValueType::Float,
         "()" => ValueType::Void,
-        _ => ValueType::Ref,
+        _ => ValueType::Ref(None),
     }
 }
 
@@ -13168,7 +13573,7 @@ mod tests {
             entries: vec![
                 frame_entry("c", 3, ValueType::Int, &mut graph),
                 frame_entry("a", 1, ValueType::Int, &mut graph),
-                frame_entry("b", 2, ValueType::Ref, &mut graph),
+                frame_entry("b", 2, ValueType::Ref(None), &mut graph),
             ],
             ..Default::default()
         };
@@ -13193,7 +13598,7 @@ mod tests {
         let mut graph = FunctionGraph::new("iter_slots_demo");
         let frame = FrameState {
             entries: vec![
-                frame_entry("b", 2, ValueType::Ref, &mut graph),
+                frame_entry("b", 2, ValueType::Ref(None), &mut graph),
                 frame_entry("a", 1, ValueType::Int, &mut graph),
             ],
             ..Default::default()

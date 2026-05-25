@@ -17,8 +17,6 @@ pub mod error;
 pub mod extregistry;
 pub mod flowspace_adapter;
 pub mod legacy_annotator;
-#[cfg(test)]
-pub mod legacy_pipeline;
 pub mod legacy_resolve;
 pub mod llannotation;
 pub mod llinterp;

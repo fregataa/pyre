@@ -42,6 +42,26 @@ use crate::model::{FunctionGraph, Link, LinkArg, OpKind};
 /// read kinds via `FunctionGraph::concretetype_of(&v)`
 /// (`getkind(v.concretetype)`).
 pub fn resolve_types(graph: &FunctionGraph) {
+    // RPython `rtyper.setup_block_entry` writes `Signed` for `etype`
+    // and `GcRef` for `evalue` on every graph's exceptblock unconditionally
+    // at rtyper time (`rpython/rtyper/rtyper.py:setup_block_entry`
+    // exceptblock arm).  Run the seed before the annotation projection
+    // loop, then exclude exceptblock inputargs from that loop so a stale
+    // `SomeInstance(...)` annotation (left behind by a panicked real
+    // rtyper run) cannot project back to `GcRef` and overwrite the
+    // orthodox `Signed` on `etype`.
+    let mut exceptblock_inputargs: Vec<Variable> = Vec::new();
+    if let Some(exceptblock) = graph.blocks.get(graph.exceptblock.0) {
+        if let Some(etype) = exceptblock.inputargs.first() {
+            FunctionGraph::set_concretetype_of_inline(etype, ConcreteType::Signed);
+            exceptblock_inputargs.push(etype.clone());
+        }
+        if let Some(evalue) = exceptblock.inputargs.get(1) {
+            FunctionGraph::set_concretetype_of_inline(evalue, ConcreteType::GcRef);
+            exceptblock_inputargs.push(evalue.clone());
+        }
+    }
+
     // Walk the orthodox `Variable.annotation` slot on every registered
     // graph variable (RPython `Variable.annotation`).  `Unknown`-projected
     // entries never appear because `legacy_annotator::setbinding` clears
@@ -50,6 +70,9 @@ pub fn resolve_types(graph: &FunctionGraph) {
     // commits a real
     // `FunctionGraph::set_concretetype_of_inline` write.
     for (_, var) in graph.iter_variable_slots() {
+        if exceptblock_inputargs.iter().any(|e| e == var) {
+            continue;
+        }
         let ann = var.annotation.borrow();
         if let Some(rc_some) = ann.as_ref() {
             let vtype = somevalue_to_valuetype(rc_some);
@@ -668,7 +691,7 @@ mod tests {
                 OpKind::FieldRead {
                     base: base_var,
                     field: crate::model::FieldDescriptor::new("obj", None),
-                    ty: ValueType::Ref,
+                    ty: ValueType::Ref(None),
                     pure: false,
                 },
                 true,
@@ -816,7 +839,7 @@ mod tests {
                 entry,
                 OpKind::Input {
                     name: "obj".to_string(),
-                    ty: ValueType::Ref,
+                    ty: ValueType::Ref(None),
                 },
                 true,
             )

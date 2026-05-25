@@ -3539,6 +3539,36 @@ mod tests {
         assert_eq!(repr.class_name(), "InstanceRepr");
     }
 
+    /// Dependency anchor for the typed-ref-someptr-followup epic
+    /// (`annotation_state.rs:58-88` `valuetype_to_someshell::Ref` arm).
+    ///
+    /// `SomeInstance(classdef=None)` is the projection currently used by
+    /// `valuetype_to_someshell` for every `ValueType::Ref` operand;
+    /// `rclass.py:445-447` routes `classdef=None` through
+    /// `getinstancerepr(rtyper, None, Gc)` -> `buildinstancerepr` with
+    /// `unboxed=[]` / `virtualizable=false` and produces a regular
+    /// `InstanceRepr` for the abstract `object`-root.  This test locks
+    /// that the rtyper side handles the classdef-less projection
+    /// cleanly, so subsequent slices that flip producer-side
+    /// projections to `SomeValue::Ptr(SomePtr::new(..))` or
+    /// `SomeInstance(classdef=Some(..))` have a known-good fallback
+    /// they are replacing rather than removing.
+    #[test]
+    fn rtyper_makerepr_someinstance_classdef_none_returns_instance_repr() {
+        use crate::annotator::model::SomeInstance;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper.initialize_exceptiondata().expect("init");
+
+        let sv = SomeValue::Instance(SomeInstance::new(
+            None,
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        let repr = rtyper_makerepr(&sv, &rtyper).expect("rtyper_makerepr");
+        assert_eq!(repr.class_name(), "InstanceRepr");
+    }
+
     #[test]
     fn rtyper_makerepr_sometype_returns_rootclass_repr_when_initialized() {
         use crate::annotator::model::SomeType;

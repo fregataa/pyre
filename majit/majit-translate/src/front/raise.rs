@@ -171,7 +171,7 @@ pub fn lower_exc_from_raise(
             OpKind::Call {
                 target: simple_call_target,
                 args: message_args,
-                result_ty: ValueType::Ref,
+                result_ty: ValueType::Ref(None),
             },
             true,
         )
@@ -185,7 +185,7 @@ pub fn lower_exc_from_raise(
             OpKind::Call {
                 target: type_target,
                 args: vec![evalue_var.clone()],
-                result_ty: ValueType::Ref,
+                result_ty: ValueType::Ref(None),
             },
             true,
         )
