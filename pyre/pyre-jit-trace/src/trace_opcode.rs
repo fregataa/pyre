@@ -3414,6 +3414,120 @@ impl MIFrame {
             self.live_args_shape_at(ctx),
             "live_args_shape_at must predict close_loop_args_at output length",
         );
+        // virtualstate.py:39-67 — populate the `Box.value` stamp
+        // so the optimizer can route `cpu.cls_of_box(runtime_box)` /
+        // `runtime_box.getref_base()` through the materialised BoxRef's
+        // per-type mixin slot. Writes go into `ctx.opref_concrete`; the
+        // optimizer stamps them onto BoxRefs before virtualstate matching.
+        //
+        // virtualstate.py:646-648 requires `runtime_boxes` to be fully
+        // parallel with `boxes`. Pyre attempts to populate every slot
+        // but skips type-mismatched and Null (untracked) entries:
+        //   args[0]                                ↔ frame (raw ptr)
+        //   args[1..1+extra_reds]                  ↔ ec (raw ptr)
+        //   args[1+extra_reds..num_scalars]        ↔ vable scalars (shadow)
+        //   args[num_scalars + i]                  ↔ locals slot i
+        //   args[num_scalars + nlocals + j]        ↔ stack slot nlocals+j
+        // `num_scalars` already counts `extra_reds` (per dedup loop above).
+        {
+            let header_off = num_scalars;
+            // Mirror args' stack range (line 2891): portal-bridge keeps
+            // `s.valuestackdepth` at the initial seed (residual-call
+            // paths bypass `push_typed_value`), so the args layout uses
+            // `portal_vsd` metadata when present.  The runtime-value
+            // walk must use the same range or the locals/stack slot
+            // indices misalign relative to `args[header_off + ..]`.
+            let stack_only = portal_vsd
+                .unwrap_or(self.sym().valuestackdepth)
+                .saturating_sub(self.sym().nlocals);
+            let collect_kind =
+                |opref: OpRef, cv: crate::state::ConcreteValue| -> Option<majit_ir::Value> {
+                    let tp = opref.ty()?;
+                    match (tp, cv) {
+                        (Type::Int, crate::state::ConcreteValue::Int(v)) => {
+                            Some(majit_ir::Value::Int(v))
+                        }
+                        (Type::Float, crate::state::ConcreteValue::Float(v)) => {
+                            Some(majit_ir::Value::Float(v))
+                        }
+                        (Type::Ref, crate::state::ConcreteValue::Ref(obj)) => {
+                            Some(majit_ir::Value::Ref(majit_ir::GcRef(obj as usize)))
+                        }
+                        // ConcreteValue::Null is the "untracked" sentinel
+                        // (state.rs:1286); real frame nulls are preserved as
+                        // ConcreteValue::Ref(PY_NULL). Do not stamp Null as
+                        // a typed null ref — it means "no runtime value
+                        // recorded for this slot".
+                        (_, crate::state::ConcreteValue::Null) => None,
+                        // Type mismatch: pyre's locals/stack OpRefs are
+                        // Type::Ref (Python values are PyObject*), but
+                        // ConcreteValue auto-decodes unboxed int/float from
+                        // the live pyobj header. RPython's typed
+                        // InputArgInt/Ref/Float boxes prevent this
+                        // structurally. Skip stamp to preserve main's
+                        // "no value" baseline rather than injecting a
+                        // cross-typed value.
+                        _ => None,
+                    }
+                };
+            let record = |ctx: &mut TraceCtx, opref: OpRef, value: majit_ir::Value| {
+                if opref != OpRef::NONE && !opref.is_constant() {
+                    ctx.set_opref_concrete(opref, value);
+                }
+            };
+            // args[0] frame
+            let frame_addr = self.concrete_frame_addr;
+            if frame_addr != 0 {
+                if let Some(&opref) = args.first() {
+                    record(
+                        ctx,
+                        opref,
+                        majit_ir::Value::Ref(majit_ir::GcRef(frame_addr)),
+                    );
+                }
+            }
+            // args[1..1+extra_reds] ec — NUM_EXTRA_REDS == 1.
+            let ec_ptr = self.sym().concrete_execution_context as usize;
+            if ec_ptr != 0 {
+                if let Some(&opref) = args.get(1) {
+                    record(ctx, opref, majit_ir::Value::Ref(majit_ir::GcRef(ec_ptr)));
+                }
+            }
+            // args[1+extra_reds..num_scalars] vable static fields — the
+            // shadow `ctx.virtualizable_entry_at(i)` tracks the JIT's
+            // current belief about each vable scalar, kept in sync with
+            // `s.vable_*` OpRefs across setfield_vable updates.
+            let vable_start = 1 + extra_reds;
+            let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
+            for i in 0..nvs {
+                let slot_idx = vable_start + i;
+                let Some(&opref) = args.get(slot_idx) else {
+                    break;
+                };
+                if let Some((shadow_opref, value)) = ctx.virtualizable_entry_at(i) {
+                    if shadow_opref == opref {
+                        record(ctx, opref, value);
+                    }
+                }
+            }
+            for i in 0..nlocals {
+                let slot_idx = header_off + i;
+                if let Some(&opref) = args.get(slot_idx) {
+                    if let Some(v) = collect_kind(opref, self.sym().concrete_value_at(i)) {
+                        record(ctx, opref, v);
+                    }
+                }
+            }
+            for j in 0..stack_only {
+                let slot_idx = header_off + nlocals + j;
+                if let Some(&opref) = args.get(slot_idx) {
+                    if let Some(v) = collect_kind(opref, self.sym().concrete_value_at(nlocals + j))
+                    {
+                        record(ctx, opref, v);
+                    }
+                }
+            }
+        }
         args
     }
 

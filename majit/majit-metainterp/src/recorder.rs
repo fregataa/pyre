@@ -485,6 +485,15 @@ impl Trace {
         self.box_pool.get_at_position(position as usize)
     }
 
+    /// Iterate `(slot_index, &BoxRef)` over every materialised pool
+    /// entry, skipping `None` holes. Used at loop-compile handoff to
+    /// drain stamped values into the optimizer's pending map.
+    pub fn box_pool_iter_indexed(
+        &self,
+    ) -> impl Iterator<Item = (usize, &majit_ir::box_ref::BoxRef)> {
+        self.box_pool.iter_indexed()
+    }
+
     /// Full BoxRef pool snapshot — borrows the sparse slot table
     /// (`None` for skipped positions). Test-only.
     #[cfg(test)]

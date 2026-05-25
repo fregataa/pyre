@@ -2642,7 +2642,7 @@ mod tests {
         for &idx in int_slots {
             types[idx as usize] = Type::Int;
         }
-        opt.trace_inputargs = OpRef::inputarg_refs(&types);
+        opt.trace_inputargs = majit_ir::OpRef::inputarg_refs(&types);
         let (ops, snapshots) = seed_virtualize_guard_snapshots(ops);
         opt.snapshot_boxes = snapshots;
         opt.optimize_with_constants_and_inputs(
@@ -2655,7 +2655,7 @@ mod tests {
 
     fn run_default_pipeline(ops: &[Op]) -> Vec<Op> {
         let mut opt = Optimizer::default_pipeline();
-        opt.trace_inputargs = OpRef::inputarg_refs(&vec![Type::Ref; 1024]);
+        opt.trace_inputargs = majit_ir::OpRef::inputarg_refs(&vec![Type::Ref; 1024]);
         let (ops, snapshots) = seed_virtualize_guard_snapshots(ops);
         opt.snapshot_boxes = snapshots;
         opt.optimize_with_constants_and_inputs(
@@ -2675,7 +2675,7 @@ mod tests {
         for &idx in float_slots {
             types[idx as usize] = Type::Float;
         }
-        opt.trace_inputargs = OpRef::inputarg_refs(&types);
+        opt.trace_inputargs = majit_ir::OpRef::inputarg_refs(&types);
         let (ops, snapshots) = seed_virtualize_guard_snapshots(ops);
         opt.snapshot_boxes = snapshots;
         opt.optimize_with_constants_and_inputs(
@@ -3090,20 +3090,12 @@ mod tests {
         let mut ops = vec![
             Op::new(
                 OpCode::Label,
-                &[
-                    OpRef::input_arg_ref(0),
-                    OpRef::input_arg_int(1),
-                    OpRef::input_arg_int(2),
-                ],
+                &[OpRef::input_arg_ref(0), OpRef::int_op(1), OpRef::int_op(2)],
             ),
-            Op::new(OpCode::GuardTrue, &[OpRef::input_arg_int(1)]),
+            Op::new(OpCode::GuardTrue, &[OpRef::int_op(1)]),
             Op::new(
                 OpCode::Jump,
-                &[
-                    OpRef::input_arg_ref(0),
-                    OpRef::input_arg_int(1),
-                    OpRef::input_arg_int(2),
-                ],
+                &[OpRef::input_arg_ref(0), OpRef::int_op(1), OpRef::int_op(2)],
             ),
         ];
         ops[1].setfailargs(Default::default());

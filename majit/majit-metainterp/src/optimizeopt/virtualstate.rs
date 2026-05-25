@@ -65,9 +65,10 @@ impl VirtualStatesCantMatch {
 ///
 /// Pyre packs the per-`generate_guards` state into one struct instead
 /// of threading 4-5 separate parameters through the recursion. The
-/// `optimizer` + `cpu` slot is realised as `ctx: &mut OptContext`
-/// (the `cls_of_box_fn` hook + `get_runtime_field/item/interiorfield`
-/// helpers live on `OptContext`). `extra_guards` is the output buffer
+/// `optimizer` + `cpu` slot is realised as `ctx: &mut OptContext`;
+/// `ctx.cpu` is the `crate::cpu::Cpu` trait object that mirrors
+/// `optimizer.cpu`, and `get_runtime_field/item/interiorfield` helpers
+/// live on `OptContext`. `extra_guards` is the output buffer
 /// owned by the caller. `renum` tracks position aliasing per
 /// virtualstate.py:84-94. `bad` tracks the per-node "did this node
 /// fail to match" set per virtualstate.py:86/:98 (Python object
@@ -1315,10 +1316,10 @@ impl VirtualState {
     /// concrete runtime value as an "educated guess" (virtualstate.py:551-555).
     ///
     /// For nested struct/array recursion (virtualstate.py:148-176/241-261/292-326)
-    /// pyre threads the inner `fieldbox`/`fieldbox_runtime` through:
-    /// `get_known_class(opref)` (mod.rs:5174) reads optimizer-tracked
-    /// PtrInfo, so the parent's `info.fields[descr_idx]` / `info.items[i]`
-    /// OpRef serves as both `box` and `runtime_box`.
+    /// pyre threads the inner `fieldbox`/`fieldbox_runtime` through, and
+    /// the runtime class read for KnownClass branches is performed by
+    /// `cpu.cls_of_box(runtime_box)` (virtualstate.py:601/:608/:620),
+    /// not by the optimizer-tracked PtrInfo.
     ///
     /// Nested struct/array recursion: RPython's
     /// `GenerateGuardState.get_runtime_field` / `get_runtime_item` /
@@ -1483,12 +1484,11 @@ impl VirtualState {
             (VirtualStateInfo::Constant(val), _) => {
                 // virtualstate.py:400-405: emit GUARD_VALUE only when the
                 // concrete runtime box already equals the target constant.
-                // Merely having a runtime box is not enough; RPython checks
-                // `self.constbox.same_constant(runtime_box.constbox())`.
-                // virtualstate.py:400: runtime_box.constbox() — read the
-                // runtime box's own constant value, no chain walk.
+                // virtualstate.py:400: `runtime_box.constbox()` reads `.value`
+                // directly on `InputArg*`, so live InputArgs participate —
+                // route through `runtime_value_of`.
                 if runtime_box
-                    .and_then(|rb| state.ctx.isinstance_const(rb))
+                    .and_then(|runtime_box| state.ctx.runtime_value_of(runtime_box))
                     .is_some_and(|runtime_value| runtime_value == *val)
                 {
                     state.extra_guards.push(GuardRequirement::GuardValue {
@@ -1510,21 +1510,14 @@ impl VirtualState {
             // - LEVEL_KNOWNCLASS (:614-617) → no guard, identity check
             // - LEVEL_CONSTANT (:618-624) → no guard, static cls_of_box check
             //
-            // Every "with runtime guard" branch additionally requires
-            // `self.known_class.same_constant(cpu.cls_of_box(runtime_box))`
-            // (:601-602, :608-609, :620-621). The pyre port reads the
-            // runtime class via `ctx.cls_of_box(runtime_box)`
-            // (mod.rs `cls_of_box` method — walks the OpRef to a
-            // `Value::Ref(gcref)` and invokes the plumbed
-            // `default_cls_of_box` hook on `gcref.raw()`). The
-            // optimizer-tracked `get_known_class` is consulted first
-            // to honour `_known_class` slots set by earlier ops
-            // (info.py:763-772 `_known_class` accessor parity),
-            // then we fall back to the runtime concrete read so the
-            // bridge case where the runtime box is a concrete Ref
-            // without any optimizer-tracked PtrInfo still gets a
-            // class verdict. Without any match, RPython raises
-            // VirtualStatesCantMatch — pyre maps that to Err(()).
+            // Every "with runtime guard" branch reads the runtime class
+            // via `cpu.cls_of_box(runtime_box)` (:601-602, :608-609,
+            // :620-621). Pyre mirrors this with `ctx.cls_of_box`, which
+            // walks the OpRef to its `Value::Ref(gcref)` and invokes
+            // the plumbed `default_cls_of_box` hook on `gcref.raw()`.
+            // The optimizer-tracked PtrInfo is NOT consulted here —
+            // RPython explicitly uses the cpu hook on the concrete
+            // runtime box, not `getptrinfo`.
             (
                 VirtualStateInfo::KnownClass { class_ptr: c1 },
                 VirtualStateInfo::KnownClass { class_ptr: c2 },
@@ -1535,21 +1528,11 @@ impl VirtualState {
                     return Err(());
                 };
                 // virtualstate.py:601 `cpu.cls_of_box(runtime_box)` —
-                // optimizer-tracked `get_known_class` first (info.py:763-772
-                // `_known_class` accessor), falling back to the runtime
-                // concrete read so the bridge case where the runtime box
-                // is a concrete Ref without optimizer-tracked PtrInfo
-                // still gets a class verdict.  `get_known_class` takes
-                // `&BoxRef`; the OpRef-to-BoxRef hoist mirrors the
-                // guard.rs / rewrite.rs caller pattern.
+                // no optimizer-tracked precedence, direct runtime read.
                 let Some(rb_box) = state.ctx.get_box_replacement_box(rb) else {
                     return Err(());
                 };
-                let Some(runtime_cls) = state
-                    .ctx
-                    .get_known_class(&rb_box)
-                    .or_else(|| state.ctx.cls_of_box(&rb_box))
-                else {
+                let Some(runtime_cls) = state.ctx.cls_of_box(&rb_box) else {
                     return Err(());
                 };
                 if &runtime_cls != class_ptr {
@@ -1570,15 +1553,11 @@ impl VirtualState {
                     return Err(());
                 };
                 // virtualstate.py:608 `cpu.cls_of_box(runtime_box)` —
-                // optimizer-tracked first, runtime concrete fallback.
+                // no optimizer-tracked precedence.
                 let Some(rb_box) = state.ctx.get_box_replacement_box(rb) else {
                     return Err(());
                 };
-                let Some(runtime_cls) = state
-                    .ctx
-                    .get_known_class(&rb_box)
-                    .or_else(|| state.ctx.cls_of_box(&rb_box))
-                else {
+                let Some(runtime_cls) = state.ctx.cls_of_box(&rb_box) else {
                     return Err(());
                 };
                 if &runtime_cls != class_ptr {
@@ -2706,7 +2685,7 @@ fn export_single_value_inner(
     // virtualstate.py:360 not_virtual(cpu, box.type, info): the subclass
     // is picked by `box.type` which is ALWAYS set on RPython Boxes.
     // pyre's OptContext::opref_type reconstructs it from value_types
-    // (seeded from trace_inputarg_types) / producing-op result_type.
+    // (seeded from trace_inputargs) / producing-op result_type.
     // Verified: 0 hits across all 10 benchmarks. Production panics;
     // test builds keep a fallback because some unit tests construct
     // minimal OptContext without seeding value_types for every OpRef
@@ -2909,9 +2888,11 @@ mod tests {
         //
         // virtualstate.py:600-606 LEVEL_UNKNOWN branch additionally
         // requires `self.known_class.same_constant(cpu.cls_of_box(runtime_box))`.
-        // The KnownClass slot here gates on a runtime_box whose
-        // constant-pool entry has a matching class via PtrInfo::Constant
-        // (info.rs:824-851 get_known_class → cls_of_box).
+        // RPython reads the class directly from the runtime box's
+        // `value` attribute via `cpu.cls_of_box(runtime_box)` — no
+        // `get_known_class` (optimizer ptrinfo) fallback. Pyre mirrors
+        // this by routing the const-pool gcref through the `Cpu` hook
+        // installed below.
         let s1 = VirtualState::new(vec![
             VirtualStateInfo::KnownClass {
                 class_ptr: GcRef(0x100),
@@ -2924,11 +2905,15 @@ mod tests {
         ]);
 
         let mut ctx = OptContext::new(128);
-        // Install a known_class Instance ptrinfo on boxes[0] so
-        // get_known_class returns GcRef(0x100), satisfying the
-        // virtualstate.py:601-602 runtime-class match. The box must be
-        // seeded with Type::Ref so getptrinfo's `op.type == 'r'`
-        // assertion (info.py:885) holds.
+        // virtualstate.py:601 `cpu.cls_of_box(runtime_box)`. Seed a
+        // const-pool runtime_box for slot 0 whose raw payload is the
+        // sentinel `0x200`, install a `Cpu::cls_of_box` hook that maps
+        // `0x200 -> 0x100`, so the runtime read matches `known_class`.
+        // Slot 1 (NonNull) only requires runtime_box.is_some(); reuse
+        // the same const-pool ref.
+        ctx.cpu = crate::cpu::cpu_from_cls_of_box_fn(|raw| if raw == 0x200 { 0x100 } else { 0 });
+        let rb0 = ctx.make_constant_ref(GcRef(0x200));
+        let rb1 = ctx.make_constant_ref(GcRef(0x300));
         let boxes = vec![OpRef::ref_op(100), OpRef::ref_op(101)];
         let b0 = ctx
             .ensure_box(boxes[0])
@@ -2937,8 +2922,9 @@ mod tests {
             &b0,
             crate::optimizeopt::info::PtrInfo::known_class(GcRef(0x100), false),
         );
+        let runtime_boxes = vec![rb0, rb1];
         let guards = s1
-            .generate_guards(&s2, &boxes, Some(&boxes), &mut ctx, false)
+            .generate_guards(&s2, &boxes, Some(&runtime_boxes), &mut ctx, false)
             .unwrap();
         assert_eq!(guards.len(), 2);
         // Unknown incoming → GUARD_NONNULL_CLASS (:603).

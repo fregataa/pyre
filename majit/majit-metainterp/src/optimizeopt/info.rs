@@ -446,17 +446,18 @@ impl PtrInfoExt for PtrInfo {
                 //       else:
                 //           AbstractStructPtrInfo.make_guards(...)
                 //
-                // `ctx.remove_gctypeptr` is the `optimizer.cpu.remove_gctypeptr`
-                // analogue (llmodel.py:55 — translator config
-                // `gcremovetypeptr`). Pyre defaults to True because its
-                // PyObject layout has static singletons (INSTANCE_TYPE,
-                // INT_TYPE, …) with no GC header, and the False-branch
-                // GUARD_IS_OBJECT reads `obj - GcHeader::SIZE`
-                // (codegen.rs:797-802) which SIGBUSes on those statics.
-                // The False branch is still emitted line-by-line so a
-                // backend that flips `remove_gctypeptr=false` (e.g. a
-                // future heap-only PyObject layout) gets the upstream
-                // guard sequence without further changes.
+                // `ctx.remove_gctypeptr` is the
+                // `optimizer.cpu.remove_gctypeptr` analogue (llmodel.py:55
+                // — translator config `gcremovetypeptr`). Pyre defaults
+                // to True because its PyObject layout has static
+                // singletons (INSTANCE_TYPE, INT_TYPE, …) with no GC
+                // header, and the False-branch GUARD_IS_OBJECT reads
+                // `obj - GcHeader::SIZE` (codegen.rs:797-802) which
+                // SIGBUSes on those statics. The False branch is still
+                // emitted line-by-line so a backend that flips
+                // `remove_gctypeptr=false` (e.g. a future heap-only
+                // PyObject layout) gets the upstream guard sequence
+                // without further changes.
                 if let Some(cls) = &info.known_class {
                     let class_ref = alloc_const(ctx, Value::Ref(*cls));
                     if !ctx.remove_gctypeptr {

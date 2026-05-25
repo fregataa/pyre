@@ -286,19 +286,12 @@ impl OpRef {
 
     /// Build the `[InputArg*(0), InputArg*(1), ...]` vector for a trace
     /// whose inputarg types are `types`.  Position is the slot index.
-    /// Used by test fixtures so inputarg slots get the `InputArg*`
-    /// variant tag PyPy's `isinstance(x, InputArgInt)` dispatch reads —
-    /// `IntOp` / `VoidOp` masquerading at inputarg positions matches
-    /// the type test by coincidence but trips any identity-based
-    /// dispatch (resoperation.py:699 `AbstractInputArg` vs :250
-    /// `AbstractResOp`).
+    /// resoperation.py:719/727/739 InputArg{Int,Ref,Float}: RPython has
+    /// no InputArgVoid class.
     ///
     /// # Panics
     ///
-    /// Panics if `types` contains `Type::Void`. RPython has no
-    /// `InputArgVoid` class — only `InputArgInt`/`InputArgFloat`/`InputArgRef`
-    /// exist (resoperation.py:719/727/739) — so a Void slot here is a
-    /// structural bookkeeping error in the caller.
+    /// Panics if `types` contains `Type::Void`.
     pub fn inputarg_refs(types: &[Type]) -> Vec<OpRef> {
         debug_assert!(
             types.iter().all(|t| *t != Type::Void),

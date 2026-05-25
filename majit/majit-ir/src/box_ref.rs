@@ -30,7 +30,21 @@ use crate::op_info::OpInfo;
 use crate::ptr_info::PtrInfo;
 use crate::resoperation::{Op, VectorizationInfo};
 use crate::value::{Const, InputArg};
-use crate::{OpRef, Type, Value};
+use crate::{GcRef, OpRef, Type, Value};
+
+/// Per-type mixin class-attribute default — `IntOp._resint = 0`
+/// (resoperation.py:566), `RefOp._resref = nullptr` (resoperation.py:613),
+/// `FloatOp._resfloat = 0.0` (resoperation.py:582).  `Type::Void` has no
+/// mixin (void ops carry no result) so we use `Value::Void` as the inert
+/// placeholder.
+fn default_value_for(type_: Type) -> Value {
+    match type_ {
+        Type::Int => Value::Int(0),
+        Type::Ref => Value::Ref(GcRef::NULL),
+        Type::Float => Value::Float(0.0),
+        Type::Void => Value::Void,
+    }
+}
 
 /// `AbstractValue` mirror — unified representation of RPython's
 /// op/inputarg/const objects.
@@ -97,11 +111,17 @@ pub enum BoxKind {
     /// const-pool compaction via `BoxRef::set_position`. RPython has no
     /// equivalent on `AbstractResOp` itself — it threads
     /// `position_and_flags` through `FrontendOp` (resoperation.py:233).
+    /// The per-type mixin slot (`resoperation.py:566 IntOp._resint`,
+    /// `resoperation.py:612 RefOp._resref`,
+    /// `resoperation.py:582 FloatOp._resfloat`) lives on the outer
+    /// `Box.value: Cell<Option<Value>>` field — single storage
+    /// matching RPython's single `_resint`/`_resref`/`_resfloat`.
     ResOp { position: std::cell::Cell<u32> },
 
     /// `resoperation.py:699 AbstractInputArg`.
     /// `position` mirrors `AbstractInputArg.position`
     /// (resoperation.py:699).
+    /// Mixin value slot lives on outer `Box.value`.
     InputArg { position: u32 },
 
     /// `history.py:220 ConstInt` / `:261 ConstFloat` / `:307 ConstPtr`.
@@ -408,8 +428,8 @@ impl BoxRef {
     /// `_pos`). `Const` has no canonical position and returns `None`.
     pub fn position(&self) -> Option<u32> {
         match &self.0.kind {
-            BoxKind::ResOp { position } => Some(position.get()),
-            BoxKind::InputArg { position } => Some(*position),
+            BoxKind::ResOp { position, .. } => Some(position.get()),
+            BoxKind::InputArg { position, .. } => Some(*position),
             BoxKind::Const { .. } => None,
         }
     }
@@ -423,7 +443,7 @@ impl BoxRef {
     /// No-op for `InputArg` / `Const` (their positions are not subject
     /// to compaction).
     pub fn set_position(&self, new_pos: u32) {
-        if let BoxKind::ResOp { position } = &self.0.kind {
+        if let BoxKind::ResOp { position, .. } = &self.0.kind {
             position.set(new_pos);
         }
     }
@@ -596,9 +616,30 @@ impl BoxRef {
         }
     }
 
-    /// `history.py:803-807 IntFrontendOp(pos, intval).intval` parity —
-    /// read the per-Box intrinsic value carrier.  Const boxes return
-    /// their fixed `BoxKind::Const::value`.
+    /// Per-type mixin slot read — `_resint` / `_resref` / `_resfloat`
+    /// (resoperation.py:566/612/582).  Returns the cached runtime value
+    /// for `ResOp` / `InputArg` boxes; the variant default for `Const`
+    /// (which is what `Const.getvalue()` returns upstream).
+    /// For ResOp/InputArg, reads the stamped mixin slot; falls back
+    /// to the type-default when unstamped (RPython mixin class-attr
+    /// defaults: `_resint = 0`, `_resref = nullptr`, `_resfloat = 0.0`).
+    pub fn value(&self) -> Value {
+        match &self.0.kind {
+            BoxKind::Const { value, .. } => *value,
+            _ => self
+                .0
+                .value
+                .get()
+                .unwrap_or_else(|| default_value_for(self.type_())),
+        }
+    }
+
+    /// `history.py:803 IntFrontendOp(pos, intval)` parity — read the
+    /// per-Box intrinsic value carrier.  `None` when the mixin slot
+    /// has not been stamped (Pyre allocates BoxRefs before the tracer
+    /// computes the concrete value; RPython constructs each
+    /// `*FrontendOp(pos, value)` with the value already in hand).
+    /// Const boxes always return `Some`.
     pub fn get_value(&self) -> Option<Value> {
         match &self.0.kind {
             BoxKind::Const { value, .. } => Some(*value),
@@ -606,14 +647,52 @@ impl BoxRef {
         }
     }
 
-    /// `history.py:803-807` construction-time field assignment analog.
-    /// Const boxes are immutable and panic.
-    pub fn set_value(&self, value: Value) {
+    /// `IntOp.setint` (resoperation.py:576) — typed mixin slot write.
+    /// Rust adaptation of RPython's class-level typing: `setint` only
+    /// exists on `IntOp` subclasses, so calling it on a non-Int box is
+    /// structurally impossible in RPython. The assert mirrors that.
+    pub fn setint(&self, v: i64) {
+        assert_eq!(self.type_(), Type::Int, "setint on non-Int box");
+        self.0.value.set(Some(Value::Int(v)));
+    }
+
+    /// `RefOp.setref_base` (resoperation.py:630) — typed mixin slot write.
+    pub fn setref_base(&self, v: GcRef) {
+        assert_eq!(self.type_(), Type::Ref, "setref_base on non-Ref box");
+        self.0.value.set(Some(Value::Ref(v)));
+    }
+
+    /// `FloatOp.setfloatstorage` (resoperation.py:601) — typed mixin slot write.
+    pub fn setfloatstorage(&self, v: f64) {
+        assert_eq!(
+            self.type_(),
+            Type::Float,
+            "setfloatstorage on non-Float box"
+        );
+        self.0.value.set(Some(Value::Float(v)));
+    }
+
+    /// Generic mixin slot write.  Asserts type consistency as the Rust
+    /// equivalent of RPython's class-hierarchy guarantee (`setint` only
+    /// on `IntOp`, etc.).  All producer sites must type-gate before
+    /// calling: `close_loop_args_at` via `collect_kind(opref, cv)`,
+    /// bridge-entry via `heap_value_for(tp, raw)`, optimizer
+    /// `setup_optimizations` via Phase 2 remap type filter.
+    pub fn set_value(&self, v: Value) {
         match &self.0.kind {
             BoxKind::Const { .. } => {
-                panic!("BoxRef::set_value: Const value is immutable (BoxKind::Const)");
+                panic!("Const boxes do not inherit IntOp/RefOp/FloatOp value slots")
             }
-            _ => self.0.value.set(Some(value)),
+            _ => {
+                assert_eq!(
+                    self.type_(),
+                    v.get_type(),
+                    "BoxRef::set_value type mismatch: box {:?}, value {:?}",
+                    self.type_(),
+                    v.get_type()
+                );
+                self.0.value.set(Some(v));
+            }
         }
     }
 

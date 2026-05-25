@@ -739,14 +739,8 @@ pub struct OptContext {
     pub snapshot_vref_boxes: SnapshotBoxes,
     /// Per-guard per-frame (jitcode_index, pc) from tracing-time snapshots.
     pub snapshot_frame_pcs: SnapshotFramePcs,
-    /// Inputarg list as typed `OpRef::InputArg{Int,Ref,Float}` variants
-    /// (recorder side `InputArg{Int,Ref,Float}` objects). Slot `i` of
-    /// this Vec corresponds to the `OpRef` at position `inputarg_base + i`
-    /// in the current trace's namespace. `box.type` (history.py:220) is
-    /// derived from each entry's variant tag via `OpRef::ty()`, mirroring
-    /// PyPy's `self.inputargs = inputargs` pattern (optimizer.py:34) where
-    /// the optimizer carries the Box list and reads `.type` per Box.
-    /// Populated by `setup_optimizations`; emptied initially.
+    /// optimizer.py:34 `self.inputargs = inputargs` parity.
+    /// Typed InputArg OpRefs; slot `i` is `OpRef::input_arg_typed(i, tp)`.
     pub inputargs: Vec<majit_ir::OpRef>,
     /// Strong `InputArgRc` ownership for the BoxRefs seeded by
     /// `with_inputarg_types`. Production traces own their `InputArgRc`s
@@ -833,8 +827,7 @@ pub struct OptContext {
     /// header — `GUARD_IS_OBJECT` reads `obj - GcHeader::SIZE` and
     /// SIGBUSes on them. The pyre default matches the `True` branch
     /// (skip GUARD_IS_OBJECT, emit GUARD_NONNULL_CLASS as a single
-    /// op). Consumed by `info.py:338/:348 InstancePtrInfo.make_guards`
-    /// (info.rs port at `InstancePtrInfo::make_guards`).
+    /// op). Consumed by `info.py:338/:348 InstancePtrInfo.make_guards`.
     pub remove_gctypeptr: bool,
     /// optimizer.py:84-92 `Optimization.last_emitted_operation` — set
     /// to the just-emitted op (or `REMOVED` sentinel) by the base
@@ -4872,6 +4865,26 @@ impl OptContext {
             .and_then(|b| b.const_value())
     }
 
+    /// Register a concrete runtime value for an OpRef by writing it to
+    /// the corresponding `BoxRef`'s per-type mixin slot (RPython
+    /// `IntOp._resint` / `RefOp._resref` / `FloatOp._resfloat`).
+    pub fn register_runtime_value(&mut self, opref: OpRef, value: Value) {
+        if let Some(box_ref) = self.box_pool.get_at_position(opref.raw() as usize) {
+            box_ref.set_value(value);
+        }
+    }
+
+    /// resoperation.py:691-720 `InputArg*.getint/getref_base/getfloatstorage`
+    /// — extract the concrete runtime value carried by an OpRef.
+    pub fn runtime_value_of(&self, opref: OpRef) -> Option<Value> {
+        if let Some(v) = self.get_constant(opref) {
+            return Some(v);
+        }
+        let box_ref = self.get_box_replacement_box(opref)?;
+        box_ref.get_value()
+    }
+
+    /// Whether `opref` has a known constant value.
     pub fn is_constant(&self, opref: OpRef) -> bool {
         self.get_constant(opref).is_some()
     }
@@ -6041,9 +6054,9 @@ impl OptContext {
         } else if self.inputarg_base > 0 && raw < self.num_inputs {
             // Phase 1 inputarg slot accessed from a non-Phase-1 context
             // (Phase 2 / bridge).  RPython resolves these through Box
-            // identity; flat-OpRef pyre uses the shared `inputargs` list
-            // — no materialization, just the recorder-seeded Box list
-            // (optimizer.py:34 self.inputargs).
+            // identity; flat-OpRef pyre uses the shared `inputarg_types`
+            // Vec — no materialization, just the recorder-seeded type
+            // table.
             raw as usize
         } else {
             return None;
@@ -6051,41 +6064,41 @@ impl OptContext {
         if idx >= ni {
             return None;
         }
-        self.inputarg_type_at(idx)
+        let opref = *self.inputargs.get(idx)?;
+        let tp = opref.ty()?;
+        if tp == majit_ir::Type::Void {
+            None
+        } else {
+            Some(tp)
+        }
     }
 
-    /// Look up the declared type of inputarg slot `idx` (zero-based) by
-    /// reading the variant tag of `self.inputargs[idx]`. Returns `None`
-    /// if the slot is out of range, the variant tag yields `Void`, or
-    /// the Vec has not been populated. Mirrors the per-Box `box.type`
-    /// lookup (history.py:220) that `init_virtualizable` and other
-    /// consumers use to mint typed `OpRef::input_arg_*` matching the
-    /// producer side.
+    /// Look up the declared type of inputarg slot `idx` (zero-based) from
+    /// the `inputargs` Vec seeded by `setup_optimizations`. Returns
+    /// `None` if the slot is out of range, the type is `Void`, or the Vec
+    /// has not been populated. Reads `inputargs[idx].ty()` — each entry
+    /// is a typed `OpRef::input_arg_*` (optimizer.py:34 parity).
     pub fn inputarg_type_at(&self, idx: usize) -> Option<majit_ir::Type> {
-        match self.inputargs.get(idx)?.ty()? {
-            majit_ir::Type::Void => None,
-            tp => Some(tp),
+        let opref = *self.inputargs.get(idx)?;
+        let tp = opref.ty()?;
+        if tp == majit_ir::Type::Void {
+            None
+        } else {
+            Some(tp)
         }
     }
 
     /// Strict counterpart to `inputarg_type_at`. Panics when the slot is
-    /// out of range, the variant tag yields `Void`, or `inputargs` was
-    /// not populated by `setup_optimizations`. Mirrors RPython's
-    /// `box.type` invariant (history.py:220) — every InputArg always
-    /// carries a `.type`, so a miss here is a structural bookkeeping
-    /// bug.
-    ///
-    /// Used by Slice P5 sites that mint `OpRef::input_arg_typed(...)`
-    /// for Phase 2 inputargs and have no legitimate untyped fallback.
+    /// out of range, the variant yields `Void`, or `inputargs` was not
+    /// populated by `setup_optimizations`. Mirrors RPython's
+    /// `box.type` invariant (history.py:220).
     pub fn inputarg_type_at_strict(&self, idx: usize) -> majit_ir::Type {
-        match self.inputargs.get(idx).copied() {
-            Some(op) => match op.ty() {
-                Some(majit_ir::Type::Void) | None => panic!(
-                    "inputarg_type_at_strict: slot {idx} ({op:?}) is Void / untyped; \
-                     RPython invariant violated (history.py:220 box.type)"
-                ),
-                Some(tp) => tp,
-            },
+        match self.inputargs.get(idx).and_then(|o| o.ty()) {
+            Some(majit_ir::Type::Void) => panic!(
+                "inputarg_type_at_strict: slot {idx} is Void; \
+                 RPython invariant violated (history.py:220 box.type)"
+            ),
+            Some(tp) => tp,
             None => panic!(
                 "inputarg_type_at_strict: slot {idx} out of range \
                  (inputargs.len() = {}); setup_optimizations did not \
@@ -6100,6 +6113,21 @@ impl OptContext {
     /// Mirrors PyPy `self.inputargs[idx]` (optimizer.py:34).
     pub fn inputarg_at(&self, idx: usize) -> Option<majit_ir::OpRef> {
         self.inputargs.get(idx).copied()
+    }
+
+    /// `Box.type` strict accessor. Panics when no source carries a type for
+    /// `opref` — history.py:802 parity.
+    #[track_caller]
+    pub fn op_type_strict(&self, opref: OpRef) -> majit_ir::Type {
+        self.opref_type(opref).unwrap_or_else(|| {
+            panic!(
+                "op_type_strict: no Box.type for {:?} (resolved={:?}); \
+                 every OpRef must have a type via variant tag / constant / \
+                 producer op.type_ / inputarg slot. history.py:802 parity.",
+                opref,
+                self.get_box_replacement(opref),
+            )
+        })
     }
 
     /// info.py:865-878 `getrawptrinfo(op)` parity (line-by-line port).
@@ -6318,17 +6346,23 @@ impl OptContext {
     /// `FieldDescr.field_size()` / `is_field_signed()` (the same
     /// (offset, size, sign) triple `Cpu::bh_getfield_gc_i` consumes on
     /// the backend — compiler.rs:14570). Wraps the read in a freshly
-    /// allocated const OpRef matching `InputArg*` parity. Returns
-    /// `None` when the OpRef does not resolve to a concrete Ref, when
-    /// the descr is not a FieldDescr, or when the runtime pointer is
-    /// null (matching the backend's `if addr == 0 { return 0 }` guard
-    /// at compiler.rs:6371).
+    /// allocated const OpRef matching `InputArg*` parity.
+    ///
+    /// Concrete-Ref extractor is `runtime_value_of` (mod.rs) which
+    /// cascades box-forwarding chain → const_pool → stamped BoxRef
+    /// runtime value (the RPython `InputArg*.value` analog).
+    /// Returns `None` when the OpRef does not resolve to a concrete
+    /// non-null Ref, when the descr is not a FieldDescr, or when the
+    /// runtime pointer is null.
     pub fn get_runtime_field(
         &mut self,
         runtime_box: OpRef,
         descr: &majit_ir::descr::DescrRef,
     ) -> Option<OpRef> {
-        let raw = match self.get_constant(runtime_box)? {
+        // virtualstate.py:39 `box.getref_base()` — concrete Ref read.
+        // `runtime_value_of` cascades const_pool → stamped BoxRef value
+        // (RPython `InputArg*.value` analog).
+        let raw = match self.runtime_value_of(runtime_box)? {
             Value::Ref(gcref) if !gcref.is_null() => gcref.0 as i64,
             _ => return None,
         };
@@ -6385,13 +6419,20 @@ impl OptContext {
     /// `ArrayDescr.base_size()` / `ArrayDescr.itemsize()` matching the
     /// backend `Cpu::bh_getarrayitem_gc_*` (compiler.rs:14611). Wraps
     /// the read in a freshly allocated const OpRef.
+    ///
+    /// Concrete-Ref extractor routes through `runtime_value_of`; see
+    /// the matching note on `get_runtime_field` for the cascade and
+    /// the #217 Slice 2/3 population path.
     pub fn get_runtime_item(
         &mut self,
         runtime_box: OpRef,
         descr: &majit_ir::descr::DescrRef,
         i: usize,
     ) -> Option<OpRef> {
-        let raw = match self.get_constant(runtime_box)? {
+        // virtualstate.py:39 `box.getref_base()` — concrete Ref read.
+        // `runtime_value_of` cascades const_pool → stamped BoxRef value
+        // (RPython `InputArg*.value` analog).
+        let raw = match self.runtime_value_of(runtime_box)? {
             Value::Ref(gcref) if !gcref.is_null() => gcref.0 as i64,
             _ => return None,
         };
@@ -6447,13 +6488,19 @@ impl OptContext {
     /// + field.offset()` per `InteriorFieldDescr.array_descr()` +
     /// `field_descr()`. Matches the backend Cpu::bh_getinteriorfield_gc_*
     /// shape (struct + element_index + interior-field).
+    ///
+    /// Concrete-Ref extractor routes through `runtime_value_of`; see
+    /// `get_runtime_field` docstring.
     pub fn get_runtime_interiorfield(
         &mut self,
         runtime_box: OpRef,
         descr: &majit_ir::descr::DescrRef,
         i: usize,
     ) -> Option<OpRef> {
-        let raw = match self.get_constant(runtime_box)? {
+        // virtualstate.py:39 `box.getref_base()` — concrete Ref read.
+        // `runtime_value_of` cascades const_pool → stamped BoxRef value
+        // (RPython `InputArg*.value` analog).
+        let raw = match self.runtime_value_of(runtime_box)? {
             Value::Ref(gcref) if !gcref.is_null() => gcref.0 as i64,
             _ => return None,
         };
@@ -6502,9 +6549,14 @@ impl OptContext {
     ///
     /// Walks the BoxRef chain to its constant `Value::Ref(gcref)` payload
     /// (`box.getref_base()` parity) and dispatches `cpu.cls_of_box(raw)`
-    /// through the `Cpu` trait object stored at `self.cpu`.  Returns
-    /// `None` when the box does not resolve to a concrete `Value::Ref` or
-    /// the gcref is null (`DefaultCpu::cls_of_box` reports both as 0).
+    /// through the `Cpu` trait object stored at `self.cpu`.  Falls back
+    /// to the resolved box's per-type mixin slot (`RefOp._resref`,
+    /// resoperation.py:612) when the BoxRef chain has no terminal Const
+    /// — live `InputArgRef` boxes with a tracer-recorded concrete value
+    /// reach the typeptr deref through a synthetic Const wrapper.
+    /// Returns `None` when neither path produces a non-null gcref
+    /// (`DefaultCpu::cls_of_box` reports both "no Ref" and "null gcref"
+    /// as 0).
     ///
     /// Caller shape mirrors `optimizer.cpu.cls_of_box(box)` — every
     /// invocation (`info.rs`, `virtualstate.rs`, `rewrite.rs`,
@@ -6516,6 +6568,27 @@ impl OptContext {
         // BoxRef to its Const terminal and dereferences the GcRef
         // typeptr-at-offset-0. Returns 0 for non-Ref / null boxes.
         let typeptr = self.cpu.cls_of_box(op);
+        if typeptr != 0 {
+            return Some(majit_ir::GcRef(typeptr as usize));
+        }
+        // resoperation.py:612-642 `RefOp._resref` fallback — when the
+        // BoxRef chain has no Const terminal, read the mixin slot
+        // directly off the resolved box.  Wrap as a synthetic Const so
+        // the typeptr deref goes through the same `cpu.cls_of_box`
+        // path (preserves gcremovetypeptr overrides).
+        let resolved = op.get_box_replacement(false);
+        if resolved.const_value().is_some() {
+            // Already had a Const terminal; cpu reported 0 because
+            // non-Ref or null.  No mixin-slot fallback applies.
+            return None;
+        }
+        let value = resolved.get_value()?;
+        match value {
+            Value::Ref(gcref) if !gcref.is_null() => {}
+            _ => return None,
+        }
+        let synth = crate::r#box::BoxRef::new_const(value);
+        let typeptr = self.cpu.cls_of_box(&synth);
         if typeptr == 0 {
             None
         } else {

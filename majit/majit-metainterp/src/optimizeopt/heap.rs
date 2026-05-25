@@ -1037,14 +1037,26 @@ impl OptHeap {
     /// `allow_force`: true for call-triggered force, false for JUMP/flush.
     /// heap.py: cf.force_lazy_set(optheap, descr)
     ///
-    /// Emit a lazy SetfieldGc. If the value is virtual, return false (the
-    /// caller should handle it via pendingfields / rd_pendingfields).
-    fn emit_lazy_setfield(op: &mut Op, ctx: &mut OptContext, _allow_force: bool) -> bool {
+    /// `get_rhs`: polymorphic RHS extractor matching
+    /// `AbstractCachedEntry._get_rhs_from_set_op` (heap.py:169-170 /
+    /// :300). `Self::field_get_rhs` → `op.arg(1)` for SETFIELD_GC;
+    /// `Self::array_get_rhs` → `op.arg(2)` for SETARRAYITEM_GC.
+    ///
+    /// Emit a lazy SETFIELD_GC / SETARRAYITEM_GC. If the value is
+    /// virtual, return false (the caller should handle it via
+    /// pendingfields / rd_pendingfields).
+    fn emit_lazy_setfield(
+        op: &mut Op,
+        ctx: &mut OptContext,
+        _allow_force: bool,
+        get_rhs: fn(&Op) -> OpRef,
+    ) -> bool {
+        let rhs = get_rhs(op);
         // heap.py:136: emit_extra(op, emit=False) re-processes through passes.
         // Virtual values are skipped — handled by rd_pendingfields at guard
         // time or dropped at JUMP.
         let orig_is_virtual = ctx
-            .get_box_replacement_box(op.arg(1))
+            .get_box_replacement_box(rhs)
             .as_ref()
             .map_or(false, |b| ctx.is_virtual(b));
         if orig_is_virtual {
@@ -1933,7 +1945,7 @@ impl OptHeap {
                         }
                     }
                 }
-                Self::emit_lazy_setfield(&mut lazy_op, ctx, true);
+                Self::emit_lazy_setfield(&mut lazy_op, ctx, true, Self::field_get_rhs);
                 // can_cache=True: put_field_back_to_info
                 let final_value = lazy_op.arg(1);
                 let lazy_descr = lazy_op.getdescr().unwrap().clone();
@@ -2223,7 +2235,7 @@ impl OptHeap {
                 }
                 // heap.py:135 optheap.emit_extra(op, emit=False)
                 let put_back_op = lazy_op.clone();
-                Self::emit_lazy_setfield(&mut lazy_op, ctx, true);
+                Self::emit_lazy_setfield(&mut lazy_op, ctx, true, Self::array_get_rhs);
                 // heap.py:136-137 if not can_cache: return
                 if !can_cache {
                     return;
@@ -2366,7 +2378,7 @@ impl OptHeap {
                 }
                 // heap.py:135 optheap.emit_extra(op, emit=False)
                 let put_back_op = lazy_op.clone();
-                Self::emit_lazy_setfield(&mut lazy_op, ctx, true);
+                Self::emit_lazy_setfield(&mut lazy_op, ctx, true, Self::field_get_rhs);
                 // heap.py:136-137 if not can_cache: return
                 if !can_cache {
                     return;
@@ -2497,7 +2509,7 @@ impl OptHeap {
                             }
                         }
                     }
-                    Self::emit_lazy_setfield(&mut lazy_op, ctx, true);
+                    Self::emit_lazy_setfield(&mut lazy_op, ctx, true, Self::array_get_rhs);
                     // can_cache=True: put_field_back_to_info
                     let final_value = lazy_op.arg(2);
                     let descr = lazy_op.getdescr();
@@ -3839,7 +3851,7 @@ mod tests {
     /// as valid defined positions by the optimizer's undefined-ref filter.
     ///
     /// In production every recorded Box carries its intrinsic type via
-    /// `trace_inputarg_types`, so the preamble exporter can recover a
+    /// `trace_inputargs`, so the preamble exporter can recover a
     /// renamed inputarg's type without guessing. Unit-test inputs are
     /// anonymous stand-ins, so we seed Ref for every slot — the only
     /// use of the type in these tests is to populate
@@ -3852,7 +3864,7 @@ mod tests {
     /// Like `run_heap_opt`, but declares specific OpRef slots as Int-typed.
     /// Use for tests whose anonymous high-numbered Boxes are bound to
     /// int-typed fields (setfield_gc value, int_ args, etc.). Without this
-    /// the `trace_inputarg_types = vec![Ref; 1024]` default types every
+    /// the `trace_inputargs = vec![Ref; 1024]` default types every
     /// anonymous slot as Ref and the heap cache's MUST_ALIAS replacement
     /// `make_equal_to(getfield_gc_i.pos:Int, cached_value:Ref)` trips the
     /// `make_equal_to` cross-type assertion introduced for the Box.type

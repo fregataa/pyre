@@ -4501,6 +4501,24 @@ impl<M: Clone> MetaInterp<M> {
         // compile.py:221: call_pure_results = metainterp.call_pure_results
         let call_pure_results = ctx.take_call_pure_results();
 
+        // Drain the recorder's BoxRef pool values into the HashMap that
+        // bridges to the optimizer.  The recorder's BoxRefs carry values
+        // stamped by `set_opref_concrete` → `box.set_value()` during
+        // tracing; TraceIterator creates FRESH BoxRefs for Phase 1 that
+        // do not share identity with the recorder's.  This HashMap is
+        // the transient carrier until TraceIterator learns to copy
+        // values onto its fresh BoxRefs directly (RPython parity:
+        // compile.py:275 PreambleCompileData passes the same Box
+        // objects that already carry their `_res*` values).
+        let close_loop_runtime_values: std::collections::HashMap<u32, majit_ir::Value> = ctx
+            .recorder
+            .box_pool_iter_indexed()
+            .filter_map(|(idx, boxref)| {
+                let value = boxref.get_value()?;
+                Some((idx as u32, value))
+            })
+            .collect();
+
         let mut recorder = ctx.recorder;
         // RPython heapcache.py:176: every trace gets at least one
         // GUARD_NOT_INVALIDATED. This allows external invalidation
@@ -4601,11 +4619,10 @@ impl<M: Clone> MetaInterp<M> {
         unroll_opt.max_retrace_guards = self.warm_state.max_retrace_guards();
         unroll_opt.callinfocollection = self.callinfocollection.clone();
         unroll_opt.cpu = self.cpu.clone();
+        unroll_opt.runtime_values_pending = close_loop_runtime_values;
         unroll_opt.call_pure_results = preamble_data.call_pure_results.clone();
         // RPython Box type parity: each InputArg carries its type from
-        // tracing. Mint typed `OpRef::input_arg_{int,float,ref}` per
-        // recorder Box so the optimizer's `trace_inputargs` IS the Box
-        // list (optimizer.py:34 `self.inputargs = inputargs`).
+        // tracing. Propagate to optimizer so value_types covers inputargs.
         unroll_opt.trace_inputargs = preamble_data
             .base
             .inputargs()
@@ -4676,12 +4693,10 @@ impl<M: Clone> MetaInterp<M> {
                         // `InputArg.type` are intrinsic on the box;
                         // no raw-u32 type side-table propagation is
                         // needed (callers read via `OpRef::ty()`).
-                        simple_opt.trace_inputargs = trace
-                            .inputargs
-                            .iter()
-                            .enumerate()
-                            .map(|(i, ia)| majit_ir::OpRef::input_arg_typed(i as u32, ia.tp))
-                            .collect();
+                        let inputarg_types: Vec<majit_ir::Type> =
+                            trace.inputargs.iter().map(|ia| ia.tp).collect();
+                        simple_opt.trace_inputargs =
+                            majit_ir::OpRef::inputarg_refs(&inputarg_types);
                         simple_opt.snapshot_boxes = snapshot_map.clone();
                         simple_opt.snapshot_frame_sizes = snapshot_frame_size_map.clone();
                         simple_opt.snapshot_vable_boxes = snapshot_vable_map.clone();
@@ -5555,6 +5570,7 @@ impl<M: Clone> MetaInterp<M> {
             mut constants,
             trace,
             call_pure_results,
+            close_loop_runtime_values,
         ) = {
             let green_key = ctx.green_key;
             let header_pc = ctx.header_pc;
@@ -5576,6 +5592,14 @@ impl<M: Clone> MetaInterp<M> {
             let constants: majit_ir::VecAssoc<u32, majit_ir::Value> = ctx.constants.snapshot();
             let initial_inputarg_consts = ctx.initial_inputarg_consts.clone();
             let call_pure_results = ctx.take_call_pure_results();
+            let close_loop_runtime_values: std::collections::HashMap<u32, majit_ir::Value> = ctx
+                .recorder
+                .box_pool_iter_indexed()
+                .filter_map(|(idx, boxref)| {
+                    let value = boxref.get_value()?;
+                    Some((idx as u32, value))
+                })
+                .collect();
 
             // compile.py:358-362 records the closing JUMP on the same history
             // that `cut_trace_from` views. Rust materializes TreeLoop eagerly,
@@ -5604,6 +5628,7 @@ impl<M: Clone> MetaInterp<M> {
                 constants,
                 trace,
                 call_pure_results,
+                close_loop_runtime_values,
             )
         };
 
@@ -5648,6 +5673,7 @@ impl<M: Clone> MetaInterp<M> {
         unroll_opt.max_retrace_guards = self.warm_state.max_retrace_guards();
         unroll_opt.callinfocollection = self.callinfocollection.clone();
         unroll_opt.cpu = self.cpu.clone();
+        unroll_opt.runtime_values_pending = close_loop_runtime_values;
         unroll_opt.call_pure_results = call_pure_results.clone();
         let (
             retrace_snapshot_boxes,
@@ -6156,12 +6182,8 @@ impl<M: Clone> MetaInterp<M> {
         // history.py:_make_op parity: every InputArg carries its type
         // from the recorder. Propagate those raw recorder types to the
         // optimizer without further reconciliation.
-        optimizer.trace_inputargs = trace
-            .inputargs
-            .iter()
-            .enumerate()
-            .map(|(i, ia)| majit_ir::OpRef::input_arg_typed(i as u32, ia.tp))
-            .collect();
+        let inputarg_types: Vec<majit_ir::Type> = trace.inputargs.iter().map(|ia| ia.tp).collect();
+        optimizer.trace_inputargs = majit_ir::OpRef::inputarg_refs(&inputarg_types);
         // history.py:220/261/307 — `Const.type` / `InputArg.type` are
         // intrinsic on the box itself; no raw-u32 type side-table
         // propagation is needed.
@@ -8579,6 +8601,38 @@ impl<M: Clone> MetaInterp<M> {
             .enumerate()
             .map(|(i, ia)| majit_ir::OpRef::input_arg_typed(i as u32, ia.tp))
             .collect();
+        // #217 Slice 4 — bridge inputarg `InputArg*.value` stamp.
+        //
+        // bridgeopt.py:124 `deserialize_optimizer_knowledge` receives
+        // `frontend_boxes` (the source guard's live boxes) alongside
+        // `liveboxes` (the bridge inputargs). It reads class knowledge
+        // via `optimizer.cpu.cls_of_box(frontend_boxes[i])` at :145
+        // and heap knowledge through `decode_box` at :153-157.
+        //
+        // Pyre stamps the `frontend_boxes` concrete values onto the
+        // bridge inputarg BoxRefs here, so `runtime_value_of` and
+        // `cls_of_box` consumers in the optimizer can read them.
+        if let Some(frontend_boxes) = self.pending_frontend_boxes.as_deref() {
+            // bridgeopt.py:126 `assert len(frontend_boxes) == len(liveboxes)` —
+            // failed source-guard `fail_args` must be paired 1:1 with
+            // the bridge's `liveboxes` (== `bridge_inputargs` here).  A
+            // length mismatch is a fail_args-vs-liveboxes plumbing bug,
+            // not a "partial fill" mode RPython tolerates.
+            assert_eq!(
+                frontend_boxes.len(),
+                bridge_inputargs.len(),
+                "bridge frontend_boxes ({}) ≠ bridge_inputargs ({}); \
+                 fail_args plumbing diverged from liveboxes (bridgeopt.py:126)",
+                frontend_boxes.len(),
+                bridge_inputargs.len(),
+            );
+            for (ia, &raw) in bridge_inputargs.iter().zip(frontend_boxes.iter()) {
+                let value = heap_value_for(ia.tp, raw);
+                optimizer
+                    .runtime_values_pending
+                    .insert(ia.opref().raw(), value);
+            }
+        }
 
         // RPython-orthodox: bridgeopt.py / unroll.py have no source→bridge
         // constant pool merge. Const objects flow via rd_consts + fresh
@@ -9082,6 +9136,12 @@ impl<M: Clone> MetaInterp<M> {
             pending_bridge_rd,
             bridge_inputarg_base,
         );
+        let bridge_inputarg_types: Vec<majit_ir::OpRef> = prepared
+            .inputargs
+            .iter()
+            .enumerate()
+            .map(|(i, ia)| majit_ir::OpRef::input_arg_typed(i as u32, ia.tp))
+            .collect();
         let bridge_inputargs = prepared.inputargs.as_slice();
         let bridge_ops = prepared.ops.as_slice();
         let pending_bridge_rd = prepared.pending_bridge_rd;
@@ -9108,14 +9168,9 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.snapshot_vable_boxes = prepared.snapshot_vable_boxes;
         optimizer.snapshot_vref_boxes = prepared.snapshot_vref_boxes;
         optimizer.snapshot_frame_pcs = prepared.snapshot_frame_pcs;
-        // Store bridge inputargs as typed `OpRef::input_arg_*` Boxes so
-        // export_state can propagate them to
-        // `ExportedState.renamed_inputarg_types` (history.py:220 box.type).
-        optimizer.trace_inputargs = bridge_inputargs
-            .iter()
-            .enumerate()
-            .map(|(i, ia)| majit_ir::OpRef::input_arg_typed(i as u32, ia.tp))
-            .collect();
+        // Store bridge inputarg types so export_state can propagate them
+        // to ExportedState.renamed_inputarg_types (RPython Box type parity).
+        optimizer.trace_inputargs = bridge_inputarg_types;
 
         // RPython-orthodox: no source→bridge constant_types merge.
         // bridgeopt.py / unroll.py do not copy the source loop's constant
@@ -9203,7 +9258,7 @@ impl<M: Clone> MetaInterp<M> {
             if let Some(es) = exported {
                 // compile.py:1075-1084: new_trace.inputargs = info.renamed_inputargs.
                 // Types come from ExportedState.renamed_inputarg_types, populated
-                // by Optimizer from trace_inputarg_types (RPython Box type parity).
+                // by Optimizer from trace_inputargs (RPython Box type parity).
                 let renamed_inputargs: Vec<InputArg> =
                     es.renamed_inputargs
                         .iter()

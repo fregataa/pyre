@@ -1129,9 +1129,6 @@ impl TraceCtx {
     /// mismatches.  Panic instead.
     pub fn set_opref_concrete(&mut self, opref: OpRef, concrete: Value) {
         if opref.is_constant() {
-            // BoxKind::Const carries the value in its own field —
-            // stamping is a no-op (and would panic via BoxRef::
-            // set_value, which forbids Const writes).
             return;
         }
         let boxref = self

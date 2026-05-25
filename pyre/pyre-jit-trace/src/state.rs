@@ -3445,19 +3445,20 @@ impl PyreSym {
 
     /// Read a concrete value from the Box arrays using an absolute
     /// unified-array index (0..nlocals = locals, nlocals.. = stack).
-    pub(crate) fn concrete_value_at(&self, abs_idx: usize) -> ConcreteValue {
+    pub(crate) fn concrete_value_at_opt(&self, abs_idx: usize) -> Option<ConcreteValue> {
         if abs_idx < self.nlocals {
-            self.concrete_locals
-                .get(abs_idx)
-                .copied()
-                .unwrap_or(ConcreteValue::Null)
+            self.concrete_locals.get(abs_idx).copied()
         } else {
             let stack_idx = abs_idx - self.nlocals;
-            self.concrete_stack
-                .get(stack_idx)
-                .copied()
-                .unwrap_or(ConcreteValue::Null)
+            self.concrete_stack.get(stack_idx).copied()
         }
+    }
+
+    /// Read a concrete value from the Box arrays using an absolute
+    /// unified-array index (0..nlocals = locals, nlocals.. = stack).
+    pub(crate) fn concrete_value_at(&self, abs_idx: usize) -> ConcreteValue {
+        self.concrete_value_at_opt(abs_idx)
+            .unwrap_or(ConcreteValue::Null)
     }
 }
 
