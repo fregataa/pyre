@@ -1099,6 +1099,14 @@ impl<'a> IntegralForwardModification<'a> {
         }
     }
 
+    fn set_index_var(&mut self, key: OpRef, idx: IndexVar) {
+        self.index_vars.insert(key, idx);
+    }
+
+    fn set_memory_ref(&mut self, node_idx: usize, mref: MemoryRef) {
+        self.memory_refs.insert(node_idx, mref);
+    }
+
     fn is_const(opref: OpRef) -> bool {
         opref.is_constant()
     }
@@ -1128,7 +1136,7 @@ impl<'a> IntegralForwardModification<'a> {
             let v0 = self.const_val(a0).unwrap_or(0);
             let v1 = self.const_val(a1).unwrap_or(0);
             idx.constant = if is_sub { v0 - v1 } else { v0 + v1 };
-            self.index_vars.insert(result, idx);
+            self.set_index_var(result, idx);
         } else if Self::is_const(a0) {
             let mut idx = self.get_or_create(a1);
             idx = idx.clone_var();
@@ -1139,7 +1147,7 @@ impl<'a> IntegralForwardModification<'a> {
                     idx.constant += v;
                 }
             }
-            self.index_vars.insert(result, idx);
+            self.set_index_var(result, idx);
         } else if Self::is_const(a1) {
             let mut idx = self.get_or_create(a0);
             idx = idx.clone_var();
@@ -1150,11 +1158,11 @@ impl<'a> IntegralForwardModification<'a> {
                     idx.constant += v;
                 }
             }
-            self.index_vars.insert(result, idx);
+            self.set_index_var(result, idx);
         } else {
             // Both non-const: track the variable.
             let idx = self.get_or_create(a0);
-            self.index_vars.insert(result, idx);
+            self.set_index_var(result, idx);
         }
     }
 
@@ -1168,7 +1176,7 @@ impl<'a> IntegralForwardModification<'a> {
             let v0 = self.const_val(a0).unwrap_or(0);
             let v1 = self.const_val(a1).unwrap_or(0);
             idx.constant = v0 * v1;
-            self.index_vars.insert(result, idx);
+            self.set_index_var(result, idx);
         } else if Self::is_const(a0) {
             let mut idx = self.get_or_create(a1);
             idx = idx.clone_var();
@@ -1176,7 +1184,7 @@ impl<'a> IntegralForwardModification<'a> {
                 idx.coefficient_mul *= v;
                 idx.constant *= v;
             }
-            self.index_vars.insert(result, idx);
+            self.set_index_var(result, idx);
         } else if Self::is_const(a1) {
             let mut idx = self.get_or_create(a0);
             idx = idx.clone_var();
@@ -1184,7 +1192,7 @@ impl<'a> IntegralForwardModification<'a> {
                 idx.coefficient_mul *= v;
                 idx.constant *= v;
             }
-            self.index_vars.insert(result, idx);
+            self.set_index_var(result, idx);
         }
     }
 
@@ -1212,7 +1220,7 @@ impl<'a> IntegralForwardModification<'a> {
                 index_var: idx_var,
                 raw_access,
             };
-            self.memory_refs.insert(node_idx, mref);
+            self.set_memory_ref(node_idx, mref);
         }
     }
 

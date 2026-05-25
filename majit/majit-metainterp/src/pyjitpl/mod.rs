@@ -854,7 +854,6 @@ pub struct PartialTrace {
 ///   return ConstInt(ptr2int(obj.typeptr))
 /// Reads the first word of the object (typeptr/vtable pointer).
 fn default_cls_of_box(raw_ref: i64) -> i64 {
-    debug_assert!(raw_ref != 0, "cls_of_box: null ref");
     unsafe { *(raw_ref as *const usize) as i64 }
 }
 
@@ -1001,7 +1000,9 @@ pub struct MetaInterp<M: Clone> {
     /// Checked by compile_bridge_trace to return RetraceNeeded.
     pub(crate) retrace_after_bridge: bool,
     /// compile.py:288-290 parity: preamble target tokens saved from Phase 1
-    /// even when Phase 2 raises InvalidLoop.
+    /// even when Phase 2 raises InvalidLoop. Indexed by `green_key`; entries
+    /// are added on InvalidLoop and removed when the next retrace succeeds,
+    /// so the active set is bounded by the count of in-flight retraces.
     pending_preamble_tokens:
         crate::optimizeopt::vec_assoc::VecAssoc<u64, Vec<crate::optimizeopt::unroll::TargetToken>>,
     // pyjitpl.py:2289 `self.staticdata.all_descrs = self.cpu.setup_descrs()` now
@@ -2599,14 +2600,14 @@ impl<M: Clone> MetaInterp<M> {
 
     /// compile.py:269-270: return cross-loop cut info if the current trace
     /// closes at a different loop header than where it started.
-    pub fn cross_loop_cut_info(&self) -> Option<(usize, Vec<Type>)> {
+    pub fn cross_loop_cut_info(&self) -> Option<(usize, Vec<crate::trace_ctx::GreenBox>)> {
         let ctx = self.tracing.as_ref()?;
         let inner_key = ctx.cut_inner_green_key?;
         // compile.py:269: cross-loop cut uses the inner loop's merge point.
         // Lookup by inner_key (not ctx.green_key which is the outer loop).
         ctx.get_merge_point_at(inner_key, ctx.header_pc)
             .filter(|mp| mp.position._pos > 0)
-            .map(|mp| (mp.header_pc, mp.original_box_types.clone()))
+            .map(|mp| (mp.header_pc, mp.green_boxes.clone()))
     }
 
     /// Compat alias: delegates to set_trace_eagerness.
@@ -4489,8 +4490,7 @@ impl<M: Clone> MetaInterp<M> {
                 .filter(|mp| mp.position._pos > 0)
                 .map(|mp| {
                     (
-                        mp.original_boxes.clone(),
-                        mp.original_box_types.clone(),
+                        mp.green_boxes.clone(),
                         crate::history::TreeLoopCutPosition::new(mp.position._pos),
                     )
                 })
@@ -4532,9 +4532,7 @@ impl<M: Clone> MetaInterp<M> {
         // When the trace was retargeted to a different loop header,
         // cut_trace_from removes ops before the merge point and
         // replaces inputargs with original_boxes at the cut position.
-        let trace = if let Some((ref original_boxes, ref original_box_types, start)) =
-            cross_loop_cut
-        {
+        let trace = if let Some((ref original_boxes, start)) = cross_loop_cut {
             if crate::majit_log_enabled() {
                 eprintln!(
                     "[jit] cut_trace_from: start.op_index={} original_boxes={} trace_ops={} header_pc={}",
@@ -4544,12 +4542,7 @@ impl<M: Clone> MetaInterp<M> {
                     ctx.header_pc,
                 );
             }
-            trace.cut_trace_from_with_consts(
-                start,
-                original_boxes,
-                original_box_types,
-                &ctx.initial_inputarg_consts,
-            )
+            trace.cut_trace_from_with_consts(start, original_boxes, &ctx.initial_inputarg_consts)
         } else {
             trace
         };
@@ -5005,7 +4998,11 @@ impl<M: Clone> MetaInterp<M> {
                         if compiled.front_target_tokens.is_empty() {
                             compiled.front_target_tokens = unroll_opt.target_tokens.clone();
                         }
-                    } else {
+                    } else if !self
+                        .pending_preamble_tokens
+                        .iter()
+                        .any(|(k, _)| *k == green_key)
+                    {
                         self.pending_preamble_tokens
                             .entry_or_insert_with(green_key, || unroll_opt.target_tokens.clone());
                     }
@@ -5561,8 +5558,7 @@ impl<M: Clone> MetaInterp<M> {
                     .filter(|mp| mp.position == retrace_pos && mp.position._pos > 0)
                     .map(|mp| {
                         (
-                            mp.original_boxes.clone(),
-                            mp.original_box_types.clone(),
+                            mp.green_boxes.clone(),
                             crate::history::TreeLoopCutPosition::new(mp.position._pos),
                         )
                     })
@@ -5580,9 +5576,7 @@ impl<M: Clone> MetaInterp<M> {
             // so close once, then cut the completed trace.
             ctx.close_loop(jump_args);
             let trace = ctx.into_tree_loop();
-            let trace = if let Some((ref original_boxes, ref original_box_types, start)) =
-                retrace_cut
-            {
+            let trace = if let Some((ref original_boxes, start)) = retrace_cut {
                 if crate::majit_log_enabled() {
                     eprintln!(
                         "[jit] cut_retrace_from: start.op_index={} original_boxes={} trace_ops={} header_pc={}",
@@ -5592,12 +5586,7 @@ impl<M: Clone> MetaInterp<M> {
                         header_pc,
                     );
                 }
-                trace.cut_trace_from_with_consts(
-                    start,
-                    original_boxes,
-                    original_box_types,
-                    &initial_inputarg_consts,
-                )
+                trace.cut_trace_from_with_consts(start, original_boxes, &initial_inputarg_consts)
             } else {
                 trace
             };

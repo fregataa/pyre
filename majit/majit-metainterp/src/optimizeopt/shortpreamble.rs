@@ -203,8 +203,10 @@ impl ShortPreamble {
 pub struct CollectedShortPreambleBuilder {
     /// Raw ops collected during the preamble phase (before Label).
     raw_ops: Vec<Op>,
-    /// Label args carried across the Label (set when Label is found).
-    /// The index into this Vec is the label arg index.
+    /// shortpreamble.py:414 `ShortPreambleBuilder.label_args` — the
+    /// OpRefs that the Label carries. Index in this list IS the label
+    /// arg index. Lookup uses linear scan (label_args is small —
+    /// bounded by loop-carried value count).
     label_args: Vec<OpRef>,
     /// Whether the builder is still collecting (before Label).
     active: bool,
@@ -224,7 +226,8 @@ impl CollectedShortPreambleBuilder {
     /// Called when the Label is encountered. `label_args` are the OpRefs
     /// that the Label carries (= the loop-carried values from the preamble).
     pub fn set_label_args(&mut self, label_args: &[OpRef]) {
-        self.label_args = label_args.to_vec();
+        self.label_args.clear();
+        self.label_args.extend_from_slice(label_args);
         self.active = false; // Switch from preamble to body phase
     }
 
@@ -454,7 +457,9 @@ pub struct ShortBoxes {
     known_constants: VecSet<OpRef>,
     /// shortpreamble.py: short_inputargs
     short_inputargs: Vec<OpRef>,
-    /// shortpreamble.py: boxes_in_production
+    /// shortpreamble.py: boxes_in_production — cycle-detection set
+    /// for `materialize_one` recursion. Active set is bounded by
+    /// recursion depth (linear scan suffices).
     boxes_in_production: VecSet<OpRef>,
     /// The number of label args.
     pub num_label_args: usize,
@@ -543,7 +548,7 @@ impl ShortBoxes {
     pub fn is_reachable(&self, opref: OpRef) -> bool {
         self.short_inputargs.contains(&opref)
             || self.known_constants.contains(&opref)
-            || self.potential_ops.contains_key(&opref)
+            || self.potential_ops.iter().any(|(k, _)| *k == opref)
     }
 
     pub fn note_known_constant(&mut self, opref: OpRef) {
@@ -651,13 +656,13 @@ impl ShortBoxes {
         if let Some(existing) = self.produced_short_boxes.get(&opref) {
             return Some(existing.preamble_op.pos.get());
         }
-        if self.boxes_in_production.contains(&opref) {
+        if self.boxes_in_production.iter().any(|x| *x == opref) {
             return None;
         }
         if self.known_constants.contains(&opref) {
             return Some(opref);
         }
-        if self.potential_ops.contains_key(&opref) {
+        if self.potential_ops.iter().any(|(k, _)| *k == opref) {
             return self
                 .materialize_one(ctx, opref)
                 .map(|produced| produced.preamble_op.pos.get());
@@ -701,7 +706,7 @@ impl ShortBoxes {
         if let Some(existing) = self.produced_short_boxes.get(&result) {
             return Some(existing.clone());
         }
-        if self.boxes_in_production.contains(&result) {
+        if self.boxes_in_production.iter().any(|x| *x == result) {
             return None;
         }
         let candidate = self.potential_ops.get(&result)?.clone();
@@ -877,8 +882,9 @@ pub struct CollectedExtendedShortPreambleBuilder {
     pure_ops: Vec<PreambleOp>,
     /// Loop-invariant calls from the preamble.
     loopinvariant_ops: Vec<PreambleOp>,
-    /// Label args carried across the Label. Index into this Vec is the label
-    /// arg index.
+    /// shortpreamble.py:414 `ShortPreambleBuilder.label_args` — the
+    /// OpRefs that the Label carries. Index in this list IS the label
+    /// arg index. Lookup uses linear scan (label_args is small).
     label_args: Vec<OpRef>,
 }
 
@@ -895,7 +901,8 @@ impl CollectedExtendedShortPreambleBuilder {
 
     /// Set the label args mapping.
     pub fn set_label_args(&mut self, label_args: &[OpRef]) {
-        self.label_args = label_args.to_vec();
+        self.label_args.clear();
+        self.label_args.extend_from_slice(label_args);
     }
 
     fn lookup_label_arg(&self, opref: OpRef) -> Option<usize> {
@@ -1980,7 +1987,7 @@ impl ShortPreambleBuilder {
             if self.state.known_constants.contains(&arg) {
                 continue;
             }
-            if self.produced_short_boxes.contains_key(&arg) {
+            if self.produced_short_boxes.iter().any(|(k, _)| *k == arg) {
                 let _ = self.use_box_recursive(arg, visiting);
             }
         }
@@ -2344,7 +2351,7 @@ impl ExtendedShortPreambleBuilder {
             if self.known_constants.contains(&arg) {
                 continue;
             }
-            if self.produced_short_boxes.contains_key(&arg) {
+            if self.produced_short_boxes.iter().any(|(k, _)| *k == arg) {
                 let _ = self.use_box_recursive(arg, visiting);
             }
         }
@@ -2378,7 +2385,11 @@ impl ExtendedShortPreambleBuilder {
         preamble_op: &crate::optimizeopt::info::PreambleOp,
         resolved_op: OpRef,
     ) {
-        let lookup_key = if self.produced_short_boxes.contains_key(&resolved_op) {
+        let lookup_key = if self
+            .produced_short_boxes
+            .iter()
+            .any(|(k, _)| *k == resolved_op)
+        {
             resolved_op
         } else {
             preamble_op.op

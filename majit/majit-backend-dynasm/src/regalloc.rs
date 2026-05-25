@@ -12,7 +12,7 @@
 ///   compute_vars_longevity — regalloc.py:1173
 ///   valid_addressing_size  — regalloc.py:1236
 ///   get_scale              — regalloc.py:1239
-use std::collections::HashMap;
+use majit_ir::VecAssoc;
 
 use crate::arch::*;
 use crate::gcmap::{allocate_gcmap, gcmap_set_bit};
@@ -251,16 +251,16 @@ impl FixedRegisterPositions {
 
 /// regalloc.py:1054 LifetimeManager — manages Lifetime info for all variables.
 pub struct LifetimeManager {
-    lifetimes: HashMap<OpRef, Lifetime>,
+    lifetimes: VecAssoc<OpRef, Lifetime>,
     /// regalloc.py:1064 maps register → FixedRegisterPositions
-    pub fixed_register_use: HashMap<RegLoc, FixedRegisterPositions>,
+    pub fixed_register_use: VecAssoc<RegLoc, FixedRegisterPositions>,
 }
 
 impl LifetimeManager {
     pub fn new() -> Self {
         LifetimeManager {
-            lifetimes: HashMap::new(),
-            fixed_register_use: HashMap::new(),
+            lifetimes: VecAssoc::new(),
+            fixed_register_use: VecAssoc::new(),
         }
     }
 
@@ -295,8 +295,7 @@ impl LifetimeManager {
             }
         };
         self.fixed_register_use
-            .entry(register)
-            .or_insert_with(|| FixedRegisterPositions::new(register))
+            .entry_or_insert_with(register, || FixedRegisterPositions::new(register))
             .fixed_register(opindex, definition_pos);
     }
 
@@ -1592,7 +1591,7 @@ pub struct RegAlloc<'a> {
     inputargs: &'a [InputArg],
     /// Trace operations — borrowed for `opref_type` lookups (reads
     /// `op.type_` directly, RPython `box.type` parity).
-    operations: &'a [Op],
+    pub(crate) operations: &'a [Op],
     /// `inputarg_pos[arg.index] = idx in inputargs`, sentinel
     /// [`OpTypeIndex::NO_POS`] for unset slots. Mirrors
     /// `OpTypeIndex::inputarg_pos`.
@@ -1885,7 +1884,7 @@ impl<'a> RegAlloc<'a> {
 
     /// x86/regalloc.py:291 _update_bindings — bind bridge inputargs to their locations.
     fn _update_bindings(&mut self, locs: &[Loc], inputargs: &[InputArg]) {
-        let mut used: HashMap<RegLoc, ()> = HashMap::new();
+        let mut used: VecAssoc<RegLoc, ()> = VecAssoc::new();
 
         // x86/regalloc.py:295-312
         for (iarg, loc) in inputargs.iter().zip(locs.iter()) {
@@ -3629,7 +3628,7 @@ impl<'a> RegAlloc<'a> {
     /// and has no `flush_cc` equivalent, so receiving `frame_reg` as
     /// the result there would clobber x29 (the frame pointer). On
     /// non-x86 architectures, fall through to a plain force-allocate.
-    fn force_allocate_reg_or_cc(&mut self, result: OpRef, ops: &[Op], i: usize) -> Loc {
+    pub(crate) fn force_allocate_reg_or_cc(&mut self, result: OpRef, ops: &[Op], i: usize) -> Loc {
         #[cfg(target_arch = "x86_64")]
         if self.next_op_can_accept_cc(ops, i, result) {
             self.rm.force_allocate_frame_reg(result);
@@ -5910,8 +5909,8 @@ fn loc_eq(a: &Loc, b: &Loc) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use majit_ir::VecAssoc;
     use majit_ir::{InputArg, Op, OpCode, OpRc, OpRef, Type};
-    use std::collections::HashMap;
 
     fn make_op(opcode: OpCode, pos: u32, args: &[OpRef]) -> Op {
         let mut op = Op::new(opcode, args);

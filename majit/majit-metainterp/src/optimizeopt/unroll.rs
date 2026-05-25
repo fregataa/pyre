@@ -1052,9 +1052,10 @@ impl UnrollOptimizer {
                             if !is_trace_runtime_ref(arg, &consts_p2) {
                                 continue;
                             }
-                            if !visited_force.insert(arg) {
+                            if visited_force.contains(&arg) {
                                 continue;
                             }
+                            visited_force.insert(arg);
                             let resolved = final_ctx.get_box_replacement(arg);
                             let needs_force = final_ctx
                                 .potential_extra_ops
@@ -1174,7 +1175,8 @@ impl UnrollOptimizer {
             // when two virtuals share the same OpRef. Allocate fresh
             // OpRefs for duplicates so the LABEL carries independent slots.
             {
-                let mut seen_used = majit_ir::vec_set::VecSet::new();
+                let mut seen_used: majit_ir::vec_set::VecSet<OpRef> =
+                    majit_ir::vec_set::VecSet::new();
                 let mut next_fresh = current_label_args
                     .iter()
                     .chain(initial_sp.used_boxes.iter())
@@ -1184,7 +1186,8 @@ impl UnrollOptimizer {
                     .saturating_add(1)
                     .max(body_num_inputs as u32 + 100);
                 for &ub in &initial_sp.used_boxes {
-                    if seen_used.insert(ub) {
+                    if !seen_used.contains(&ub) {
+                        seen_used.insert(ub);
                         current_label_args.push(ub);
                     } else {
                         // shortpreamble.py:343-350 inputarg_from_tp parity:
@@ -3389,7 +3392,12 @@ impl OptUnroll {
                     // only (ConstInt/ConstPtr/ConstFloat). make_constant'd values
                     // are NOT Const objects — they are regular boxes with forwarded
                     // set to a Const, so they must go through the mapping.
-                    if arg.is_constant() || short_preamble.constants.contains_key(&arg.raw()) {
+                    if arg.is_constant()
+                        || short_preamble
+                            .constants
+                            .iter()
+                            .any(|(k, _)| *k == arg.raw())
+                    {
                         continue;
                     }
                     // unroll.py:404: _map_args — non-Const must be in mapping.
@@ -3468,7 +3476,10 @@ impl OptUnroll {
                 let mapped_jump_args: Vec<OpRef> = short_jump_args
                     .iter()
                     .map(|jump_arg| {
-                        let mapped = if short_preamble.constants.contains_key(&jump_arg.raw())
+                        let mapped = if short_preamble
+                            .constants
+                            .iter()
+                            .any(|(k, _)| *k == jump_arg.raw())
                             || jump_arg.is_constant()
                         {
                             *jump_arg
@@ -3498,7 +3509,7 @@ impl OptUnroll {
         current_short_jump_args(short_preamble, ctx)
             .iter()
             .map(|&jump_arg| {
-                let mapped = *mapping.get(&jump_arg).unwrap_or(&jump_arg);
+                let mapped = mapping.get(&jump_arg).copied().unwrap_or(jump_arg);
                 ctx.get_box_replacement(mapped)
             })
             .collect()
