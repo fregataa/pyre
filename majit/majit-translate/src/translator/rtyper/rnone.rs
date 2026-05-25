@@ -283,14 +283,35 @@ pub fn rtype_is_none(
             GenopResult::LLType(LowLevelType::Bool),
         ));
     }
-    // upstream: `elif robj1.lowleveltype == Address`. `Address` is
-    // defined in `rpython/rtyper/lltypesystem/llmemory.py`, which has
-    // no Rust counterpart yet; the dispatch point is retained as a
-    // structured parity marker so the llmemory port can flip this arm
-    // without retrofitting the surface.
-    //
-    // TODO (cascading port): when lltypesystem/llmemory.rs lands,
-    // match `LowLevelType::Address` and emit `adr_eq(v1, nullptr)`.
+    // upstream: `elif robj1.lowleveltype == Address`
+    // (`rnone.py:65-67`). `Address` is the lltype primitive defined
+    // by `llmemory.py:649 NULL = fakeaddress(None)`; pyre carries it
+    // via `LowLevelType::Address` and its `_defl()` yields the
+    // `_address::Null` default. Construct the NULL Address constant
+    // through the same `_defl()` path that
+    // `rpbc::null_address_constant` uses, then emit `adr_eq(v1, c_null)`.
+    if matches!(robj1.lowleveltype(), LowLevelType::Address) {
+        let v1 = hop.inputarg(robj1, pos)?;
+        let null_value = match LowLevelType::Address._defl() {
+            crate::translator::rtyper::lltypesystem::lltype::LowLevelValue::Address(addr) => {
+                ConstValue::LLAddress(addr)
+            }
+            other => {
+                return Err(TyperError::message(format!(
+                    "rtype_is_none: Address._defl() must yield LowLevelValue::Address, got {other:?}",
+                )));
+            }
+        };
+        let c_null = Hlvalue::Constant(Constant::with_concretetype(
+            null_value,
+            LowLevelType::Address,
+        ));
+        return Ok(hop.genop(
+            "adr_eq",
+            vec![v1, c_null],
+            GenopResult::LLType(LowLevelType::Bool),
+        ));
+    }
 
     // upstream: `elif robj1 == none_repr: return inputconst(Bool, True)`.
     // Upstream relies on `is`-based comparison (`r is none_repr`,

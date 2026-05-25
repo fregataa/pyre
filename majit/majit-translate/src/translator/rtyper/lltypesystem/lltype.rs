@@ -1065,8 +1065,8 @@ pub struct _ptr {
     pub _obj0: Result<Option<_ptr_obj>, DelayedPointer>,
     /// RPython `self._set_weak(False)` from `_ptr.__init__`
     /// (lltype.py:1410-1413). `_become` asserts `not self._weak`
-    /// (lltype.py:1416-1418); reserved for the weak-ptr variants
-    /// (`weakref_create` family) when those land.
+    /// (lltype.py:1416-1418). Used by `weakref_create` family
+    /// (llmemory.py:809-824, rbuiltin.py:744-782).
     pub _weak: bool,
 }
 
@@ -2432,6 +2432,17 @@ impl OpaqueType {
 /// `rtti` slot) consume this as the well-known opaque type.
 pub static RUNTIME_TYPE_INFO: LazyLock<LowLevelType> =
     LazyLock::new(|| LowLevelType::Opaque(Box::new(OpaqueType::new("RuntimeTypeInfo"))));
+
+/// `_WeakRefType(_gckind='gc')` (llmemory.py:809-811).
+pub static WEAKREF: LazyLock<LowLevelType> =
+    LazyLock::new(|| LowLevelType::Opaque(Box::new(OpaqueType::gc("WeakRef"))));
+
+/// `WeakRefPtr = Ptr(WeakRef)` (llmemory.py:816).
+pub static WEAKREF_PTR: LazyLock<LowLevelType> = LazyLock::new(|| {
+    LowLevelType::Ptr(Box::new(Ptr {
+        TO: PtrTarget::Opaque(OpaqueType::gc("WeakRef")),
+    }))
+});
 
 fn new_opaque_container(TYPE: OpaqueType, name: &str, about: Option<LowLevelType>) -> _opaque {
     _opaque {

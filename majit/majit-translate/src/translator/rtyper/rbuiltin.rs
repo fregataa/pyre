@@ -72,7 +72,7 @@ pub fn reset_swap_fallback_hits() {
 }
 
 use crate::annotator::model::{SomeBuiltin, SomeBuiltinMethod, SomeValue};
-use crate::flowspace::model::{ConstValue, Constant, HOST_ENV, HostObject};
+use crate::flowspace::model::{ConstValue, Constant, HOST_ENV, Hlvalue, HostObject};
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::extregistry::{self, ExtRegistryEntry};
 use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
@@ -184,9 +184,10 @@ fn builtin_typer_map() -> &'static Mutex<HashMap<HostObject, BuiltinTyperFn>> {
 ///   * rbuiltin.py:717-742 — `OrderedDict` / `objectmodel.r_dict` /
 ///     `objectmodel.r_ordereddict` (need `DictRepr::DICT` /
 ///     `ll_newdict` / `custom_eq_hash` interface)
-///   * rbuiltin.py:744-782 — weakref family (`weakref.ref`,
-///     `llmemory.weakref_create/deref`, `cast_ptr_to_weakrefptr`,
-///     `cast_weakrefptr_to_ptr` — need `WeakrefRepr` port)
+///   * rbuiltin.py:744-782 — weakref family low-level path
+///     (`weakref_create/deref`, `cast_ptr_to_weakrefptr`,
+///     `cast_weakrefptr_to_ptr` — ported; high-level `BaseWeakRefRepr`
+///     path + `weakref.ref` alias deferred)
 ///
 /// Each batch is a natural stand-alone commit once its dependent
 /// infra (HOST_ENV entry, helper-graph registration hook, `Repr`
@@ -324,6 +325,12 @@ fn install_default_typers(map: &mut HashMap<HostObject, BuiltinTyperFn>) {
             "cast_pointer",
             rtype_cast_pointer_typer,
         ),
+        // rbuiltin.py:471-477
+        (
+            "rpython.rtyper.lltypesystem.lltype",
+            "cast_primitive",
+            rtype_cast_primitive,
+        ),
         // rbuiltin.py:543-548
         (
             "rpython.rtyper.lltypesystem.lltype",
@@ -357,6 +364,72 @@ fn install_default_typers(map: &mut HashMap<HostObject, BuiltinTyperFn>) {
             "rpython.rtyper.lltypesystem.llmemory",
             "cast_int_to_adr",
             rtype_cast_int_to_adr,
+        ),
+        // rbuiltin.py:659-665
+        (
+            "rpython.rtyper.lltypesystem.llmemory",
+            "cast_adr_to_ptr",
+            rtype_cast_adr_to_ptr,
+        ),
+        // rbuiltin.py:667-678
+        (
+            "rpython.rtyper.lltypesystem.llmemory",
+            "cast_adr_to_int",
+            rtype_cast_adr_to_int,
+        ),
+        // rbuiltin.py:577-585
+        (
+            "rpython.rtyper.lltypesystem.llmemory",
+            "raw_malloc",
+            rtype_raw_malloc,
+        ),
+        // rbuiltin.py:587-591
+        (
+            "rpython.rtyper.lltypesystem.llmemory",
+            "raw_malloc_usage",
+            rtype_raw_malloc_usage,
+        ),
+        // rbuiltin.py:593-600
+        (
+            "rpython.rtyper.lltypesystem.llmemory",
+            "raw_free",
+            rtype_raw_free,
+        ),
+        // rbuiltin.py:602-609
+        (
+            "rpython.rtyper.lltypesystem.llmemory",
+            "raw_memcopy",
+            rtype_raw_memcopy,
+        ),
+        // rbuiltin.py:611-618
+        (
+            "rpython.rtyper.lltypesystem.llmemory",
+            "raw_memclear",
+            rtype_raw_memclear,
+        ),
+        // rbuiltin.py:744-758
+        (
+            "rpython.rtyper.lltypesystem.llmemory",
+            "weakref_create",
+            rtype_weakref_create,
+        ),
+        // rbuiltin.py:760-766
+        (
+            "rpython.rtyper.lltypesystem.llmemory",
+            "weakref_deref",
+            rtype_weakref_deref,
+        ),
+        // rbuiltin.py:768-774
+        (
+            "rpython.rtyper.lltypesystem.llmemory",
+            "cast_ptr_to_weakrefptr",
+            rtype_cast_ptr_to_weakrefptr,
+        ),
+        // rbuiltin.py:776-782
+        (
+            "rpython.rtyper.lltypesystem.llmemory",
+            "cast_weakrefptr_to_ptr",
+            rtype_cast_weakrefptr_to_ptr,
         ),
     ];
     for (module_name, attr_name, typer) in module_entries {
@@ -1384,6 +1457,276 @@ fn rtype_cast_pointer_typer(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>)
     Ok(hop.genop("cast_pointer", vec![v_input], GenopResult::LLType(lltype)))
 }
 
+/// RPython `_cast_to_Signed` table (rbuiltin.py:479-487) — opname that
+/// converts a primitive `t` value to lltype.Signed. `None` means
+/// "already Signed, no-op". Returns `None` outright for primitives
+/// that have no Signed counterpart.
+fn cast_to_signed_opname(t: &LowLevelType) -> Option<Option<&'static str>> {
+    match t {
+        LowLevelType::Signed => Some(None),
+        LowLevelType::Bool => Some(Some("cast_bool_to_int")),
+        LowLevelType::Char => Some(Some("cast_char_to_int")),
+        LowLevelType::UniChar => Some(Some("cast_unichar_to_int")),
+        LowLevelType::Float => Some(Some("cast_float_to_int")),
+        LowLevelType::Unsigned => Some(Some("cast_uint_to_int")),
+        LowLevelType::SignedLongLong => Some(Some("truncate_longlong_to_int")),
+        _ => None,
+    }
+}
+
+/// RPython `_cast_from_Signed` table (rbuiltin.py:488-495) — opname
+/// that converts an lltype.Signed value to primitive `t`. `None` means
+/// "already Signed, no-op". Returns `None` outright for primitives
+/// without a Signed source path.
+fn cast_from_signed_opname(t: &LowLevelType) -> Option<Option<&'static str>> {
+    match t {
+        LowLevelType::Signed => Some(None),
+        LowLevelType::Char => Some(Some("cast_int_to_char")),
+        LowLevelType::UniChar => Some(Some("cast_int_to_unichar")),
+        LowLevelType::Float => Some(Some("cast_int_to_float")),
+        LowLevelType::Unsigned => Some(Some("cast_int_to_uint")),
+        LowLevelType::SignedLongLong => Some(Some("cast_int_to_longlong")),
+        _ => None,
+    }
+}
+
+/// RPython `gen_cast(llops, TGT, v_value)` (rbuiltin.py:497-541).
+/// Primitive → primitive arm routes through `Signed` using the
+/// `_cast_to_Signed` + `_cast_from_Signed` tables. The Ptr↔Ptr,
+/// Ptr↔Address, and Address↔Primitive arms upstream require lltype
+/// machinery (`isinstance(TGT.TO, lltype.OpaqueType)`,
+/// `cast_adr_to_int`) whose Rust ports are not yet on every call path;
+/// each falls through to a fail-loud `TyperError` carrying the type
+/// pair so a future port can flip the arm without retrofitting the
+/// surface.
+pub(crate) fn gen_cast(
+    llops: &mut crate::translator::rtyper::rtyper::LowLevelOpList,
+    tgt: &LowLevelType,
+    v_value: Hlvalue,
+) -> Result<Hlvalue, TyperError> {
+    use crate::translator::rtyper::rtyper::GenopResult;
+    let orig = hlvalue_concretetype_for_gen_cast(&v_value)?;
+    // upstream `if ORIG == TGT: return v_value`
+    if &orig == tgt {
+        return Ok(v_value);
+    }
+    // upstream `if isinstance(TGT, Primitive) and isinstance(ORIG,
+    // Primitive)` — primitive→primitive routes via Signed.
+    if let (Some(to_signed), Some(from_signed)) =
+        (cast_to_signed_opname(&orig), cast_from_signed_opname(tgt))
+    {
+        let mut current = v_value;
+        if let Some(op) = to_signed {
+            current = llops
+                .genop(op, vec![current], GenopResult::LLType(LowLevelType::Signed))
+                .map(Hlvalue::Variable)
+                .ok_or_else(|| {
+                    TyperError::message(format!("gen_cast: {op} unexpectedly returned void"))
+                })?;
+        }
+        if let Some(op) = from_signed {
+            current = llops
+                .genop(op, vec![current], GenopResult::LLType(tgt.clone()))
+                .map(Hlvalue::Variable)
+                .ok_or_else(|| {
+                    TyperError::message(format!("gen_cast: {op} unexpectedly returned void"))
+                })?;
+        }
+        return Ok(current);
+    }
+    // rbuiltin.py:512 `elif ORIG is Signed and TGT is Bool`
+    if matches!(&orig, LowLevelType::Signed) && matches!(tgt, LowLevelType::Bool) {
+        return llops
+            .genop(
+                "int_is_true",
+                vec![v_value],
+                GenopResult::LLType(LowLevelType::Bool),
+            )
+            .map(Hlvalue::Variable)
+            .ok_or_else(|| TyperError::message("gen_cast: int_is_true returned void".to_string()));
+    }
+    // rbuiltin.py:515 `else: return llops.genop('cast_primitive', ...)`
+    // Both ORIG and TGT are primitives but not in the tables above.
+    if orig.is_primitive() && tgt.is_primitive() {
+        return llops
+            .genop(
+                "cast_primitive",
+                vec![v_value],
+                GenopResult::LLType(tgt.clone()),
+            )
+            .map(Hlvalue::Variable)
+            .ok_or_else(|| {
+                TyperError::message("gen_cast: cast_primitive returned void".to_string())
+            });
+    }
+    // upstream `elif isinstance(TGT, lltype.Ptr): ...`
+    if let LowLevelType::Ptr(tgt_ptr) = tgt {
+        use crate::translator::rtyper::lltypesystem::lltype::PtrTarget;
+        // Ptr->Ptr: cast_opaque_ptr when either side targets OpaqueType,
+        // otherwise cast_pointer.
+        if let LowLevelType::Ptr(orig_ptr) = &orig {
+            let opname = if matches!(tgt_ptr.TO, PtrTarget::Opaque(_))
+                || matches!(orig_ptr.TO, PtrTarget::Opaque(_))
+            {
+                "cast_opaque_ptr"
+            } else {
+                "cast_pointer"
+            };
+            return llops
+                .genop(opname, vec![v_value], GenopResult::LLType(tgt.clone()))
+                .map(Hlvalue::Variable)
+                .ok_or_else(|| TyperError::message(format!("gen_cast: {opname} returned void")));
+        }
+        // Address->Ptr (`elif ORIG == llmemory.Address`).
+        if matches!(&orig, LowLevelType::Address) {
+            return llops
+                .genop(
+                    "cast_adr_to_ptr",
+                    vec![v_value],
+                    GenopResult::LLType(tgt.clone()),
+                )
+                .map(Hlvalue::Variable)
+                .ok_or_else(|| {
+                    TyperError::message("gen_cast: cast_adr_to_ptr returned void".to_string())
+                });
+        }
+        // rbuiltin.py:524-527 Primitive->Ptr: cast through Signed, then cast_int_to_ptr.
+        if orig.is_primitive() {
+            let v_signed = gen_cast(llops, &LowLevelType::Signed, v_value)?;
+            return llops
+                .genop(
+                    "cast_int_to_ptr",
+                    vec![v_signed],
+                    GenopResult::LLType(tgt.clone()),
+                )
+                .map(Hlvalue::Variable)
+                .ok_or_else(|| {
+                    TyperError::message("gen_cast: cast_int_to_ptr returned void".to_string())
+                });
+        }
+    }
+    // upstream `elif TGT == llmemory.Address and isinstance(ORIG, lltype.Ptr)`
+    if matches!(tgt, LowLevelType::Address) && matches!(&orig, LowLevelType::Ptr(_)) {
+        return llops
+            .genop(
+                "cast_ptr_to_adr",
+                vec![v_value],
+                GenopResult::LLType(tgt.clone()),
+            )
+            .map(Hlvalue::Variable)
+            .ok_or_else(|| {
+                TyperError::message("gen_cast: cast_ptr_to_adr returned void".to_string())
+            });
+    }
+    // rbuiltin.py:528-539 `elif isinstance(TGT, Primitive):`
+    // Ptr->Primitive and Address->Primitive route through Signed.
+    if tgt.is_primitive() {
+        if matches!(&orig, LowLevelType::Ptr(_)) {
+            let v_signed = llops
+                .genop(
+                    "cast_ptr_to_int",
+                    vec![v_value],
+                    GenopResult::LLType(LowLevelType::Signed),
+                )
+                .map(Hlvalue::Variable)
+                .ok_or_else(|| {
+                    TyperError::message("gen_cast: cast_ptr_to_int returned void".to_string())
+                })?;
+            return gen_cast(llops, tgt, v_signed);
+        }
+        if matches!(&orig, LowLevelType::Address) {
+            let v_signed = llops
+                .genop(
+                    "cast_adr_to_int",
+                    vec![v_value],
+                    GenopResult::LLType(LowLevelType::Signed),
+                )
+                .map(Hlvalue::Variable)
+                .ok_or_else(|| {
+                    TyperError::message("gen_cast: cast_adr_to_int returned void".to_string())
+                })?;
+            return gen_cast(llops, tgt, v_signed);
+        }
+    }
+    Err(TyperError::message(format!(
+        "gen_cast: don't know how to cast from {orig:?} to {tgt:?}"
+    )))
+}
+
+/// `Hlvalue` concretetype extractor for [`gen_cast`]. Fails loud if
+/// either Variable or Constant lacks a concretetype, matching
+/// upstream's `v_value.concretetype` direct access semantics
+/// (`rbuiltin.py:498`).
+fn hlvalue_concretetype_for_gen_cast(value: &Hlvalue) -> Result<LowLevelType, TyperError> {
+    match value {
+        Hlvalue::Variable(v) => v.concretetype().ok_or_else(|| {
+            TyperError::message("gen_cast: source Variable missing concretetype".to_string())
+        }),
+        Hlvalue::Constant(c) => c.concretetype.clone().ok_or_else(|| {
+            TyperError::message("gen_cast: source Constant missing concretetype".to_string())
+        }),
+    }
+}
+
+/// RPython `@typer_for(lltype.cast_primitive) def rtype_cast_primitive(hop)`
+/// (rbuiltin.py:471-477).
+///
+/// ```python
+/// @typer_for(lltype.cast_primitive)
+/// def rtype_cast_primitive(hop):
+///     assert hop.args_s[0].is_constant()
+///     TGT = hop.args_s[0].const
+///     v_type, v_value = hop.inputargs(lltype.Void, hop.args_r[1])
+///     hop.exception_cannot_occur()
+///     return gen_cast(hop.llops, TGT, v_value)
+/// ```
+fn rtype_cast_primitive(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    use crate::annotator::model::SomeObjectTrait;
+
+    {
+        let args_s = hop.args_s.borrow();
+        let s0 = args_s.first().ok_or_else(|| {
+            TyperError::message("rtype_cast_primitive: hop.args_s[0] missing".to_string())
+        })?;
+        if !s0.is_constant() {
+            return Err(TyperError::message(
+                "rtype_cast_primitive: hop.args_s[0] must be a constant".to_string(),
+            ));
+        }
+    }
+    let r_arg1 = arg_repr(hop, 1)?;
+    let vlist = hop.inputargs(vec![
+        ConvertedTo::LowLevelType(&LowLevelType::Void),
+        ConvertedTo::Repr(r_arg1.as_ref()),
+    ])?;
+    hop.exception_cannot_occur()?;
+    let v_value = vlist
+        .into_iter()
+        .nth(1)
+        .ok_or_else(|| TyperError::message("rtype_cast_primitive: missing v_value".to_string()))?;
+    // rbuiltin.py:473 `TGT = hop.args_s[0].const`
+    let tgt = {
+        let args_s = hop.args_s.borrow();
+        let s0 = args_s.first().ok_or_else(|| {
+            TyperError::message("rtype_cast_primitive: hop.args_s[0] missing".to_string())
+        })?;
+        let cv = s0.const_().ok_or_else(|| {
+            TyperError::message("rtype_cast_primitive: hop.args_s[0] not constant".to_string())
+        })?;
+        match cv {
+            ConstValue::LowLevelType(t) => Ok((**t).clone()),
+            _ => Err(TyperError::message(
+                "rtype_cast_primitive: TGT not a LowLevelType constant".to_string(),
+            )),
+        }?
+    };
+    let result = {
+        let mut llops = hop.llops.borrow_mut();
+        gen_cast(&mut llops, &tgt, v_value)?
+    };
+    Ok(Some(result))
+}
+
 /// RPython `@typer_for(llmemory.cast_ptr_to_adr) def rtype_cast_ptr_to_adr(hop)`
 /// (rbuiltin.py:651-657).
 ///
@@ -1465,6 +1808,347 @@ fn rtype_cast_int_to_adr(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) ->
         "cast_int_to_adr",
         vlist,
         GenopResult::LLType(LowLevelType::Address),
+    ))
+}
+
+/// rbuiltin.py:659-665
+fn rtype_cast_adr_to_ptr(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    use crate::translator::rtyper::pairtype::ReprClassId;
+    use crate::translator::rtyper::rtyper::GenopResult;
+
+    let r0 = arg_repr(hop, 0)?;
+    // rbuiltin.py:660 `assert isinstance(hop.args_r[0], AddressRepr)`
+    if r0.repr_class_id() != ReprClassId::AddressRepr {
+        return Err(TyperError::message(
+            "cast_adr_to_ptr: args_r[0] must be AddressRepr",
+        ));
+    }
+    let vlist = hop.inputargs(vec![
+        ConvertedTo::Repr(r0.as_ref()),
+        ConvertedTo::LowLevelType(&LowLevelType::Void),
+    ])?;
+
+    let target_type = {
+        let args_s = hop.args_s.borrow();
+        let s1 = args_s
+            .get(1)
+            .ok_or_else(|| TyperError::message("cast_adr_to_ptr: missing TYPE arg".to_string()))?;
+        let cv = s1.const_().ok_or_else(|| {
+            TyperError::message("cast_adr_to_ptr: TYPE arg not constant".to_string())
+        })?;
+        match cv {
+            ConstValue::LowLevelType(t) => Ok((**t).clone()),
+            _ => Err(TyperError::message(
+                "cast_adr_to_ptr: TYPE arg not a LowLevelType constant".to_string(),
+            )),
+        }?
+    };
+
+    hop.exception_cannot_occur()?;
+    Ok(hop.genop(
+        "cast_adr_to_ptr",
+        vec![vlist[0].clone()],
+        GenopResult::LLType(target_type),
+    ))
+}
+
+/// rbuiltin.py:667-678
+fn rtype_cast_adr_to_int(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    use crate::translator::rtyper::pairtype::ReprClassId;
+    use crate::translator::rtyper::rtyper::GenopResult;
+
+    let r0 = arg_repr(hop, 0)?;
+    // rbuiltin.py:668 `assert isinstance(hop.args_r[0], AddressRepr)`
+    if r0.repr_class_id() != ReprClassId::AddressRepr {
+        return Err(TyperError::message(
+            "cast_adr_to_int: args_r[0] must be AddressRepr",
+        ));
+    }
+    let adr = hop.inputarg(ConvertedTo::Repr(r0.as_ref()), 0)?;
+
+    // rbuiltin.py:670-673 `mode = hop.args_s[1].const`
+    let mode = {
+        let args_s = hop.args_s.borrow();
+        if args_s.len() == 1 {
+            "emulated".to_string()
+        } else {
+            let s1 = args_s
+                .get(1)
+                .ok_or_else(|| TyperError::message("cast_adr_to_int: missing mode arg"))?;
+            let cv = s1
+                .const_()
+                .ok_or_else(|| TyperError::message("cast_adr_to_int: mode arg must be constant"))?;
+            match cv {
+                ConstValue::ByteStr(b) => String::from_utf8(b.clone())
+                    .map_err(|_| TyperError::message("cast_adr_to_int: mode not valid UTF-8"))?,
+                ConstValue::UniStr(s) => s.clone(),
+                _ => {
+                    return Err(TyperError::message(
+                        "cast_adr_to_int: mode must be a string constant",
+                    ));
+                }
+            }
+        }
+    };
+
+    let c_mode = Hlvalue::Constant(Constant::with_concretetype(
+        ConstValue::ByteStr(mode.into_bytes()),
+        LowLevelType::Void,
+    ));
+    hop.exception_cannot_occur()?;
+    Ok(hop.genop(
+        "cast_adr_to_int",
+        vec![adr, c_mode],
+        GenopResult::LLType(LowLevelType::Signed),
+    ))
+}
+
+/// RPython `@typer_for(llmemory.raw_malloc) def rtype_raw_malloc(hop, i_zero=None)`
+/// (rbuiltin.py:577-585).
+///
+/// ```python
+/// @typer_for(llmemory.raw_malloc)
+/// def rtype_raw_malloc(hop, i_zero=None):
+///     v_size = hop.inputarg(lltype.Signed, arg=0)
+///     v_zero, = parse_kwds(hop, (i_zero, None))
+///     if v_zero is None:
+///         v_zero = hop.inputconst(lltype.Bool, False)
+///     hop.exception_cannot_occur()
+///     return hop.genop('raw_malloc', [v_size, v_zero],
+///                      resulttype=llmemory.Address)
+/// ```
+fn rtype_raw_malloc(hop: &HighLevelOp, kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    use crate::flowspace::model::Hlvalue;
+    use crate::translator::rtyper::rtyper::GenopResult;
+
+    let i_zero = kwds_i.get("i_zero").copied();
+    // upstream `v_size = hop.inputarg(lltype.Signed, arg=0)` — fetch the
+    // positional size argument as Signed before parse_kwds truncates the
+    // hop's args_v tail.
+    let v_size = hop.inputarg(ConvertedTo::LowLevelType(&LowLevelType::Signed), 0)?;
+    let kw = parse_kwds(hop, &[(i_zero, None)])?;
+    let v_zero = match kw.into_iter().next().flatten() {
+        Some(v) => v,
+        None => Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::Bool(false),
+            LowLevelType::Bool,
+        )),
+    };
+    hop.exception_cannot_occur()?;
+    Ok(hop.genop(
+        "raw_malloc",
+        vec![v_size, v_zero],
+        GenopResult::LLType(LowLevelType::Address),
+    ))
+}
+
+/// RPython `@typer_for(llmemory.raw_malloc_usage) def rtype_raw_malloc_usage(hop)`
+/// (rbuiltin.py:587-591).
+///
+/// ```python
+/// @typer_for(llmemory.raw_malloc_usage)
+/// def rtype_raw_malloc_usage(hop):
+///     v_size, = hop.inputargs(lltype.Signed)
+///     hop.exception_cannot_occur()
+///     return hop.genop('raw_malloc_usage', [v_size], resulttype=lltype.Signed)
+/// ```
+fn rtype_raw_malloc_usage(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    use crate::translator::rtyper::rtyper::GenopResult;
+
+    let vlist = hop.inputargs(vec![ConvertedTo::LowLevelType(&LowLevelType::Signed)])?;
+    hop.exception_cannot_occur()?;
+    Ok(hop.genop(
+        "raw_malloc_usage",
+        vlist,
+        GenopResult::LLType(LowLevelType::Signed),
+    ))
+}
+
+/// rbuiltin.py:593-600
+fn rtype_raw_free(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    use crate::annotator::model::SomeValue;
+    use crate::translator::rtyper::rtyper::GenopResult;
+
+    let args_s = hop.args_s.borrow();
+    if let Some(SomeValue::Address(s_addr)) = args_s.first() {
+        if s_addr.is_null_address() {
+            return Err(TyperError::message(
+                "raw_free(x) where x is the constant NULL",
+            ));
+        }
+    }
+    drop(args_s);
+
+    let vlist = hop.inputargs(vec![ConvertedTo::LowLevelType(&LowLevelType::Address)])?;
+    hop.exception_cannot_occur()?;
+    Ok(hop.genop("raw_free", vlist, GenopResult::Void))
+}
+
+/// rbuiltin.py:602-609
+fn rtype_raw_memcopy(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    use crate::annotator::model::SomeValue;
+    use crate::translator::rtyper::rtyper::GenopResult;
+
+    let args_s = hop.args_s.borrow();
+    for s_addr in args_s.iter().take(2) {
+        if let SomeValue::Address(s) = s_addr {
+            if s.is_null_address() {
+                return Err(TyperError::message("raw_memcopy() with a constant NULL"));
+            }
+        }
+    }
+    drop(args_s);
+
+    let vlist = hop.inputargs(vec![
+        ConvertedTo::LowLevelType(&LowLevelType::Address),
+        ConvertedTo::LowLevelType(&LowLevelType::Address),
+        ConvertedTo::LowLevelType(&LowLevelType::Signed),
+    ])?;
+    hop.exception_cannot_occur()?;
+    Ok(hop.genop("raw_memcopy", vlist, GenopResult::Void))
+}
+
+/// rbuiltin.py:611-618
+fn rtype_raw_memclear(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    use crate::annotator::model::SomeValue;
+    use crate::translator::rtyper::rtyper::GenopResult;
+
+    let args_s = hop.args_s.borrow();
+    if let Some(SomeValue::Address(s_addr)) = args_s.first() {
+        if s_addr.is_null_address() {
+            return Err(TyperError::message(
+                "raw_memclear(x, n) where x is the constant NULL",
+            ));
+        }
+    }
+    drop(args_s);
+
+    let vlist = hop.inputargs(vec![
+        ConvertedTo::LowLevelType(&LowLevelType::Address),
+        ConvertedTo::LowLevelType(&LowLevelType::Signed),
+    ])?;
+    hop.exception_cannot_occur()?;
+    Ok(hop.genop("raw_memclear", vlist, GenopResult::Void))
+}
+
+/// rbuiltin.py:744-758 — low-level weakref_create path.
+///
+/// The `BaseWeakRefRepr` high-level path is not ported; only the else
+/// branch (low-level `PtrRepr * WeakRef`) is implemented.
+fn rtype_weakref_create(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    use crate::translator::rtyper::lltypesystem::lltype::WEAKREF_PTR;
+    use crate::translator::rtyper::rtyper::GenopResult;
+
+    let r0 = arg_repr(hop, 0)?;
+    let vlist = hop.inputargs(vec![ConvertedTo::Repr(r0.as_ref())])?;
+    hop.exception_cannot_occur()?;
+    Ok(hop.genop(
+        "weakref_create",
+        vlist,
+        GenopResult::LLType(WEAKREF_PTR.clone()),
+    ))
+}
+
+/// rbuiltin.py:760-766
+fn rtype_weakref_deref(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    use crate::translator::rtyper::lltypesystem::lltype::WEAKREF_PTR;
+    use crate::translator::rtyper::rtyper::GenopResult;
+
+    let r1 = arg_repr(hop, 1)?;
+    // rbuiltin.py:762 `assert v_wref.concretetype == llmemory.WeakRefPtr`
+    if r1.lowleveltype() != &*WEAKREF_PTR {
+        return Err(TyperError::message(
+            "weakref_deref: args_r[1] concretetype must be WeakRefPtr",
+        ));
+    }
+    let vlist = hop.inputargs(vec![
+        ConvertedTo::LowLevelType(&LowLevelType::Void),
+        ConvertedTo::Repr(r1.as_ref()),
+    ])?;
+
+    let target_type = {
+        let args_s = hop.args_s.borrow();
+        let s0 = args_s
+            .first()
+            .ok_or_else(|| TyperError::message("weakref_deref: missing PTRTYPE arg"))?;
+        let cv = s0
+            .const_()
+            .ok_or_else(|| TyperError::message("weakref_deref: PTRTYPE arg not constant"))?;
+        match cv {
+            ConstValue::LowLevelType(t) => Ok((**t).clone()),
+            _ => Err(TyperError::message(
+                "weakref_deref: PTRTYPE arg not a LowLevelType constant",
+            )),
+        }?
+    };
+
+    hop.exception_cannot_occur()?;
+    Ok(hop.genop(
+        "weakref_deref",
+        vec![vlist[1].clone()],
+        GenopResult::LLType(target_type),
+    ))
+}
+
+/// rbuiltin.py:768-774
+fn rtype_cast_ptr_to_weakrefptr(
+    hop: &HighLevelOp,
+    _kwds_i: &HashMap<String, usize>,
+) -> RTypeResult {
+    use crate::translator::rtyper::lltypesystem::lltype::WEAKREF_PTR;
+    use crate::translator::rtyper::rtyper::GenopResult;
+
+    let r0 = arg_repr(hop, 0)?;
+    let vlist = hop.inputargs(vec![ConvertedTo::Repr(r0.as_ref())])?;
+    hop.exception_cannot_occur()?;
+    Ok(hop.genop(
+        "cast_ptr_to_weakrefptr",
+        vlist,
+        GenopResult::LLType(WEAKREF_PTR.clone()),
+    ))
+}
+
+/// rbuiltin.py:776-782
+fn rtype_cast_weakrefptr_to_ptr(
+    hop: &HighLevelOp,
+    _kwds_i: &HashMap<String, usize>,
+) -> RTypeResult {
+    use crate::translator::rtyper::lltypesystem::lltype::WEAKREF_PTR;
+    use crate::translator::rtyper::rtyper::GenopResult;
+
+    let r1 = arg_repr(hop, 1)?;
+    // rbuiltin.py:780 `assert v_wref.concretetype == llmemory.WeakRefPtr`
+    if r1.lowleveltype() != &*WEAKREF_PTR {
+        return Err(TyperError::message(
+            "cast_weakrefptr_to_ptr: args_r[1] concretetype must be WeakRefPtr",
+        ));
+    }
+    let vlist = hop.inputargs(vec![
+        ConvertedTo::LowLevelType(&LowLevelType::Void),
+        ConvertedTo::Repr(r1.as_ref()),
+    ])?;
+
+    let target_type = {
+        let args_s = hop.args_s.borrow();
+        let s0 = args_s
+            .first()
+            .ok_or_else(|| TyperError::message("cast_weakrefptr_to_ptr: missing PTRTYPE arg"))?;
+        let cv = s0.const_().ok_or_else(|| {
+            TyperError::message("cast_weakrefptr_to_ptr: PTRTYPE arg not constant")
+        })?;
+        match cv {
+            ConstValue::LowLevelType(t) => Ok((**t).clone()),
+            _ => Err(TyperError::message(
+                "cast_weakrefptr_to_ptr: PTRTYPE arg not a LowLevelType constant",
+            )),
+        }?
+    };
+
+    hop.exception_cannot_occur()?;
+    Ok(hop.genop(
+        "cast_weakrefptr_to_ptr",
+        vec![vlist[1].clone()],
+        GenopResult::LLType(target_type),
     ))
 }
 
@@ -3077,6 +3761,45 @@ mod tests {
         assert!(
             lookup_typer(&host).is_some(),
             "BUILTIN_TYPER missing entry for `lltype.render_immortal`"
+        );
+    }
+
+    #[test]
+    fn install_default_typers_registers_cast_primitive_from_lltype_module() {
+        // rbuiltin.py:471-477 — `@typer_for(lltype.cast_primitive)`.
+        let host = HOST_ENV
+            .import_module("rpython.rtyper.lltypesystem.lltype")
+            .and_then(|m| m.module_get("cast_primitive"))
+            .expect("HOST_ENV missing lltype.cast_primitive");
+        assert!(
+            lookup_typer(&host).is_some(),
+            "BUILTIN_TYPER missing entry for `lltype.cast_primitive`"
+        );
+    }
+
+    #[test]
+    fn install_default_typers_registers_raw_malloc_from_llmemory_module() {
+        // rbuiltin.py:577-585 — `@typer_for(llmemory.raw_malloc)`.
+        let host = HOST_ENV
+            .import_module("rpython.rtyper.lltypesystem.llmemory")
+            .and_then(|m| m.module_get("raw_malloc"))
+            .expect("HOST_ENV missing llmemory.raw_malloc");
+        assert!(
+            lookup_typer(&host).is_some(),
+            "BUILTIN_TYPER missing entry for `llmemory.raw_malloc`"
+        );
+    }
+
+    #[test]
+    fn install_default_typers_registers_raw_malloc_usage_from_llmemory_module() {
+        // rbuiltin.py:587-591 — `@typer_for(llmemory.raw_malloc_usage)`.
+        let host = HOST_ENV
+            .import_module("rpython.rtyper.lltypesystem.llmemory")
+            .and_then(|m| m.module_get("raw_malloc_usage"))
+            .expect("HOST_ENV missing llmemory.raw_malloc_usage");
+        assert!(
+            lookup_typer(&host).is_some(),
+            "BUILTIN_TYPER missing entry for `llmemory.raw_malloc_usage`"
         );
     }
 

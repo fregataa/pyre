@@ -656,16 +656,28 @@ pub fn pair_integer_integer_convert_from_to(
     v: &Hlvalue,
     llops: &mut LowLevelOpList,
 ) -> Result<Option<Hlvalue>, TyperError> {
+    // rint.py:204-213: four fast paths, then generic cast_primitive.
     let opname = match (r_from.lowleveltype(), r_to.lowleveltype()) {
-        (LowLevelType::Signed, LowLevelType::Unsigned) => "cast_int_to_uint",
-        (LowLevelType::Unsigned, LowLevelType::Signed) => "cast_uint_to_int",
-        (LowLevelType::Signed, LowLevelType::SignedLongLong) => "cast_int_to_longlong",
-        (LowLevelType::SignedLongLong, LowLevelType::Signed) => "truncate_longlong_to_int",
-        _ => "cast_primitive",
+        (LowLevelType::Signed, LowLevelType::Unsigned) => Some("cast_int_to_uint"),
+        (LowLevelType::Unsigned, LowLevelType::Signed) => Some("cast_uint_to_int"),
+        (LowLevelType::Signed, LowLevelType::SignedLongLong) => Some("cast_int_to_longlong"),
+        (LowLevelType::SignedLongLong, LowLevelType::Signed) => Some("truncate_longlong_to_int"),
+        _ => None,
     };
+    if let Some(opname) = opname {
+        return Ok(llops
+            .genop(
+                opname,
+                vec![v.clone()],
+                GenopResult::LLType(r_to.lowleveltype().clone()),
+            )
+            .map(Hlvalue::Variable));
+    }
+    // rint.py:214: anything not in the fast-path table emits
+    // cast_primitive with the target lowleveltype as resulttype.
     Ok(llops
         .genop(
-            opname,
+            "cast_primitive",
             vec![v.clone()],
             GenopResult::LLType(r_to.lowleveltype().clone()),
         )

@@ -157,9 +157,10 @@ pub enum KnownType {
     WeakrefReference,
     /// `lltype._ptr` — the RPython `SomePtr.knowntype = _ptr`.
     LlPtr,
+    /// `llmemory.Address` — the RPython `SomeAddress.knowntype`.
+    Address,
     /// Not a type this commit carries; future commits add `List`,
-    /// `Tuple`, `Dict`, `Instance`, `Pbc`, `Iterator`, `Ptr`,
-    /// `Address`.
+    /// `Tuple`, `Dict`, `Instance`, `Pbc`, `Iterator`, `Ptr`.
     Other,
 }
 
@@ -186,6 +187,7 @@ impl fmt::Display for KnownType {
             KnownType::PropertyType => "property",
             KnownType::WeakrefReference => "ReferenceType",
             KnownType::LlPtr => "_ptr",
+            KnownType::Address => "Address",
             KnownType::Other => "<other>",
         };
         f.write_str(name)
@@ -1559,6 +1561,10 @@ impl SomeObjectTrait for SomeProperty {
 /// referring to it through the annotator-model module path.
 pub use crate::translator::rtyper::lltypesystem::lltype::SomePtr;
 
+/// Re-export of [`SomeAddress`], which RPython declares at
+/// `rpython/rtyper/lltypesystem/llmemory.py:573` (`class SomeAddress(SomeObject)`).
+pub use crate::translator::rtyper::lltypesystem::llmemory::SomeAddress;
+
 /// RPython `SomeObject.needs_sandboxing` side-attribute payload
 /// (attached by `rtyper/extfunc.py:ExtFuncEntry.compute_annotation`
 /// when `config.translation.sandbox` is on). Upstream uses ad-hoc
@@ -1855,6 +1861,7 @@ pub enum SomeValue {
     Property(SomeProperty),
     Ptr(SomePtr),
     InteriorPtr(SomeInteriorPtr),
+    Address(SomeAddress),
     LLADTMeth(SomeLLADTMeth),
     Builtin(SomeBuiltin),
     BuiltinMethod(SomeBuiltinMethod),
@@ -1895,6 +1902,7 @@ pub enum SomeValueTag {
     Property,
     Ptr,
     InteriorPtr,
+    Address,
     LLADTMeth,
     Builtin,
     BuiltinMethod,
@@ -1938,6 +1946,7 @@ impl SomeValueTag {
             T::Property => &[T::Property, T::Object],
             T::Ptr => &[T::Ptr, T::Object],
             T::InteriorPtr => &[T::InteriorPtr, T::Ptr, T::Object],
+            T::Address => &[T::Address, T::Object],
             T::LLADTMeth => &[T::LLADTMeth, T::Object],
             T::Builtin => &[T::Builtin, T::Object],
             T::BuiltinMethod => &[T::BuiltinMethod, T::Object],
@@ -1981,6 +1990,7 @@ impl SomeValue {
             SomeValue::Property(_) => T::Property,
             SomeValue::Ptr(_) => T::Ptr,
             SomeValue::InteriorPtr(_) => T::InteriorPtr,
+            SomeValue::Address(_) => T::Address,
             SomeValue::LLADTMeth(_) => T::LLADTMeth,
             SomeValue::Builtin(_) => T::Builtin,
             SomeValue::BuiltinMethod(_) => T::BuiltinMethod,
@@ -2111,6 +2121,7 @@ impl SomeValue {
             SomeValue::Property(s) => s.base.const_box.as_ref(),
             SomeValue::Ptr(s) => s.base.const_box.as_ref(),
             SomeValue::InteriorPtr(s) => s.base.const_box.as_ref(),
+            SomeValue::Address(s) => s.base.const_box.as_ref(),
             SomeValue::LLADTMeth(s) => s.base.const_box.as_ref(),
             SomeValue::Builtin(s) => s.base.const_box.as_ref(),
             SomeValue::BuiltinMethod(s) => s.base.const_box.as_ref(),
@@ -2155,6 +2166,7 @@ impl SomeValue {
             SomeValue::Property(s) => s.base.const_box = Some(c),
             SomeValue::Ptr(s) => s.base.const_box = Some(c),
             SomeValue::InteriorPtr(s) => s.base.const_box = Some(c),
+            SomeValue::Address(s) => s.base.const_box = Some(c),
             SomeValue::LLADTMeth(s) => s.base.const_box = Some(c),
             SomeValue::Builtin(s) => s.base.const_box = Some(c),
             SomeValue::BuiltinMethod(s) => s.base.const_box = Some(c),
@@ -2283,6 +2295,7 @@ impl SomeObjectTrait for SomeValue {
             SomeValue::Property(s) => s.knowntype(),
             SomeValue::Ptr(s) => s.knowntype(),
             SomeValue::InteriorPtr(s) => s.knowntype(),
+            SomeValue::Address(s) => s.knowntype(),
             SomeValue::LLADTMeth(s) => s.knowntype(),
             SomeValue::Builtin(s) => s.knowntype(),
             SomeValue::BuiltinMethod(s) => s.knowntype(),
@@ -2317,6 +2330,7 @@ impl SomeObjectTrait for SomeValue {
             SomeValue::Property(s) => s.immutable(),
             SomeValue::Ptr(s) => s.immutable(),
             SomeValue::InteriorPtr(s) => s.immutable(),
+            SomeValue::Address(s) => s.immutable(),
             SomeValue::LLADTMeth(s) => s.immutable(),
             SomeValue::Builtin(s) => s.immutable(),
             SomeValue::BuiltinMethod(s) => s.immutable(),
@@ -2351,6 +2365,7 @@ impl SomeObjectTrait for SomeValue {
             SomeValue::Property(s) => s.is_constant(),
             SomeValue::Ptr(s) => s.is_constant(),
             SomeValue::InteriorPtr(s) => s.is_constant(),
+            SomeValue::Address(s) => s.is_constant(),
             SomeValue::LLADTMeth(s) => s.is_constant(),
             SomeValue::Builtin(s) => s.is_constant(),
             SomeValue::BuiltinMethod(s) => s.is_constant(),
@@ -2390,6 +2405,7 @@ impl SomeObjectTrait for SomeValue {
             SomeValue::Property(s) => s.can_be_none(),
             SomeValue::Ptr(s) => s.can_be_none(),
             SomeValue::InteriorPtr(s) => s.can_be_none(),
+            SomeValue::Address(s) => s.can_be_none(),
             SomeValue::LLADTMeth(s) => s.can_be_none(),
             SomeValue::Builtin(s) => s.can_be_none(),
             SomeValue::BuiltinMethod(s) => s.can_be_none(),
@@ -2914,6 +2930,11 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
             )))
         }
 
+        // llannotation.py:15-17 — `pair(SomeAddress, SomeAddress).union()`
+        (SomeValue::Address(_), SomeValue::Address(_)) => {
+            Ok(SomeValue::Address(SomeAddress::new()))
+        }
+
         // `pair(SomeBuiltinMethod, SomeBuiltinMethod).union()` in
         // binaryop.py: analyser/methodname must match; `s_self`
         // widens by union.
@@ -3056,6 +3077,7 @@ pub fn not_const(s: &SomeValue) -> SomeValue {
         SomeValue::Property(v) => v.base.const_box = None,
         SomeValue::Ptr(v) => v.base.const_box = None,
         SomeValue::InteriorPtr(v) => v.base.const_box = None,
+        SomeValue::Address(v) => v.base.const_box = None,
         SomeValue::LLADTMeth(v) => v.base.const_box = None,
         SomeValue::Builtin(v) => v.base.const_box = None,
         SomeValue::BuiltinMethod(v) => v.base.const_box = None,

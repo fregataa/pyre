@@ -990,6 +990,7 @@ impl FunctionDesc {
                 SomeValueTag::Property => "SomeProperty",
                 SomeValueTag::Ptr => "SomePtr",
                 SomeValueTag::InteriorPtr => "SomeInteriorPtr",
+                SomeValueTag::Address => "SomeAddress",
                 SomeValueTag::LLADTMeth => "SomeLLADTMeth",
                 SomeValueTag::Builtin => "SomeBuiltin",
                 SomeValueTag::BuiltinMethod => "SomeBuiltinMethod",

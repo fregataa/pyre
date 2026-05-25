@@ -115,6 +115,7 @@ fn some_value_class_name(s: &SomeValue) -> String {
         SomeValue::Property(_) => "SomeProperty",
         SomeValue::Ptr(_) => "SomePtr",
         SomeValue::InteriorPtr(_) => "SomeInteriorPtr",
+        SomeValue::Address(_) => "SomeAddress",
         SomeValue::LLADTMeth(_) => "SomeLLADTMeth",
         SomeValue::Builtin(_) => "SomeBuiltin",
         SomeValue::BuiltinMethod(_) => "SomeBuiltinMethod",

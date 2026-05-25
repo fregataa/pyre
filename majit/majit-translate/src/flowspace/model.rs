@@ -581,6 +581,14 @@ impl HostObject {
     /// not synthesize one (struct's field shape outside the
     /// primitive catalog — caller falls back to
     /// `SomeInstance(classdef=None)`).
+    ///
+    /// Consumers in this crate:
+    /// `flowspace/rust_source/build_flow.rs::annotate_typed_ptr_inputs`
+    /// (for `&Foo` entry-input lift only — raw pointer entry inputs
+    /// do not consult this slot, and Rust wrapper / container shapes
+    /// such as `Box<T>` / `Vec<T>` / `Cell<T>` never populate it),
+    /// and `flowspace/rust_source/host_env.rs::lookup_host_lltype`
+    /// (which simply delegates).
     pub fn lltype_ptr(&self) -> Option<&Ptr> {
         match &self.inner.kind {
             HostObjectKind::Class { lltype_ptr, .. } => lltype_ptr.get(),
@@ -1855,6 +1863,14 @@ impl HostEnv {
             "cast_pointer",
             HostObject::new_builtin_callable("lltype.cast_pointer"),
         );
+        // `lltype.cast_primitive` — rbuiltin.py:471-477 typer paired with
+        // `gen_cast` at rbuiltin.py:497-541. The Rust port registers
+        // `rtype_cast_primitive` against this HostObject in
+        // `install_default_typers`.
+        lltype.module_set(
+            "cast_primitive",
+            HostObject::new_builtin_callable("lltype.cast_primitive"),
+        );
         // `lltype.cast_ptr_to_int` / `cast_int_to_ptr` — registered upstream
         // at `rpython/rtyper/lltypesystem/lltype.py:2367-2382` via the
         // `ann_cast_ptr_to_int` / `ann_cast_int_to_ptr` annotator hooks plus
@@ -1885,8 +1901,58 @@ impl HostEnv {
             HostObject::new_builtin_callable("llmemory.cast_ptr_to_adr"),
         );
         llmemory.module_set(
+            "cast_adr_to_ptr",
+            HostObject::new_builtin_callable("llmemory.cast_adr_to_ptr"),
+        );
+        llmemory.module_set(
+            "cast_adr_to_int",
+            HostObject::new_builtin_callable("llmemory.cast_adr_to_int"),
+        );
+        llmemory.module_set(
             "cast_int_to_adr",
             HostObject::new_builtin_callable("llmemory.cast_int_to_adr"),
+        );
+        // `llmemory.raw_malloc` / `raw_malloc_usage` — rbuiltin.py:577-591
+        // typer entries paired with `install_default_typers` in rbuiltin.rs.
+        // Both return / accept Signed; raw_malloc itself returns Address
+        // via the `raw_malloc` opname (lloperation.rs line 1103).
+        llmemory.module_set(
+            "raw_malloc",
+            HostObject::new_builtin_callable("llmemory.raw_malloc"),
+        );
+        llmemory.module_set(
+            "raw_malloc_usage",
+            HostObject::new_builtin_callable("llmemory.raw_malloc_usage"),
+        );
+        // rbuiltin.py:593-618
+        llmemory.module_set(
+            "raw_free",
+            HostObject::new_builtin_callable("llmemory.raw_free"),
+        );
+        llmemory.module_set(
+            "raw_memcopy",
+            HostObject::new_builtin_callable("llmemory.raw_memcopy"),
+        );
+        llmemory.module_set(
+            "raw_memclear",
+            HostObject::new_builtin_callable("llmemory.raw_memclear"),
+        );
+        // rbuiltin.py:744-782
+        llmemory.module_set(
+            "weakref_create",
+            HostObject::new_builtin_callable("llmemory.weakref_create"),
+        );
+        llmemory.module_set(
+            "weakref_deref",
+            HostObject::new_builtin_callable("llmemory.weakref_deref"),
+        );
+        llmemory.module_set(
+            "cast_ptr_to_weakrefptr",
+            HostObject::new_builtin_callable("llmemory.cast_ptr_to_weakrefptr"),
+        );
+        llmemory.module_set(
+            "cast_weakrefptr_to_ptr",
+            HostObject::new_builtin_callable("llmemory.cast_weakrefptr_to_ptr"),
         );
 
         let mut mods = self.modules.lock().unwrap();
@@ -2640,6 +2706,15 @@ impl ConstValue {
     /// Construct a Python 2 unicode constant.
     pub fn uni_str(value: impl AsRef<str>) -> Self {
         ConstValue::UniStr(value.as_ref().to_string())
+    }
+
+    /// llmemory.py:579 `not self.const` — true when the value is a
+    /// NULL address (`_address::Null` / `fakeaddress(None)`).
+    pub fn is_null_address(&self) -> bool {
+        matches!(
+            self,
+            ConstValue::LLAddress(crate::translator::rtyper::lltypesystem::lltype::_address::Null)
+        )
     }
 
     /// Return the raw bytes for a Python 2 byte string constant.

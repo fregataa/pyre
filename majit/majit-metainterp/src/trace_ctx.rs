@@ -1165,19 +1165,21 @@ impl TraceCtx {
             .and_then(|b| b.get_value())
     }
 
-    /// `Box.value` read — composes the resolution chain that
-    /// `concrete_of_opref` uses (Const pool + standard-virtualizable
-    /// shadow + BoxPool `Box::value` field) but returns
-    /// `Option<Value>` instead of the `Ref(usize::MAX)` sentinel.
-    /// PyPy `history.py:680 AbstractValue.getint()/getref_base()/
-    /// getfloat_storage()` analog: when a Box is consulted at the
-    /// cache-hit sanity check site (`_opimpl_getfield_gc_any_pureornot`
-    /// pyjitpl.py:934-945), RPython reads `currfieldbox.getXXX()` —
-    /// which dispatches through `Const.getint()` for constants and
-    /// `*FrontendOp.getint()` for the `Cell<Option<Value>>` payload.
-    /// The standard-virtualizable shadow restores the value of the
-    /// portal's red-virtualizable inputarg whose Box identity is
-    /// recycled across loop iterations.
+    /// `Box.value` read for cache-write sites — composes the
+    /// resolution chain that `concrete_of_opref` uses (Const pool +
+    /// standard-virtualizable shadow + `opref_concrete` stamp) but
+    /// returns `Option<Value>` instead of the `Ref(usize::MAX)`
+    /// sentinel.  Used at `heapcache.setfield(valuebox)` /
+    /// `heapcache.setarrayitem(valuebox)` cache-write sites to fill
+    /// the [`HeapBox`] payload: `None` collapses to `Value::Void`,
+    /// signalling "no Box.value known" so the downstream cache-hit
+    /// sanity check at `_opimpl_getfield_gc_any_pureornot` skips.
+    ///
+    /// `Option<Value>` return shape mirrors PyPy
+    /// `BoxInt(value=None)` / `BoxRef(value=None)` /
+    /// `BoxFloat(value=None)` — upstream uses `None` as the "no
+    /// value known yet" sentinel (history.py:803-807
+    /// `*FrontendOp(pos, value)`).
     pub fn box_value(&self, opref: OpRef) -> Option<Value> {
         if opref.is_constant() {
             if let Some(value) = self.constants.get_value(opref) {

@@ -8120,6 +8120,106 @@ pub const ParityProbe_O14_FGe: bool = 1.5 >= 1.5;
     }
 
     #[test]
+    fn register_host_lltype_resolves_multi_level_forward_reference_chain() {
+        // Three-level forward chain in reverse source order — preseed
+        // fixed-point must converge across multiple iterations:
+        // pass 1: C (primitive-only) registers;
+        // pass 2: B's first-field C resolves, B registers;
+        // pass 3: A's first-field B resolves, A registers.
+        let src = "
+            pub struct ParityProbe_ChainA {
+                pub head: ParityProbe_ChainB,
+            }
+            pub struct ParityProbe_ChainB {
+                pub head: ParityProbe_ChainC,
+            }
+            pub struct ParityProbe_ChainC {
+                pub flag: i64,
+            }
+        ";
+        let file = syn::parse_file(src).expect("multi-level forward chain parses");
+        let module_id = register_rust_module(&file).expect("walk succeeds");
+        for name in [
+            "ParityProbe_ChainA",
+            "ParityProbe_ChainB",
+            "ParityProbe_ChainC",
+        ] {
+            let host =
+                lookup_host(module_id, name).unwrap_or_else(|| panic!("{name} must register"));
+            assert!(
+                super::super::host_env::lookup_host_lltype(&host).is_some(),
+                "{name} must populate the lltype registry through preseed",
+            );
+        }
+    }
+
+    #[test]
+    fn register_host_lltype_resolves_forward_reference_through_type_alias() {
+        // Alias-mediated forward reference: `type Alias = LateStruct;`
+        // followed by a struct embedding `Alias` as first field, with
+        // `LateStruct` defined last. `collect_type_aliases` runs before
+        // the preseed fixed-point pass, so the alias map is fully
+        // populated when preseed walks structs; alias recursion in
+        // `syn_primitive_to_lltype` reaches `LateStruct` once it
+        // registers in a later preseed iteration.
+        let src = "
+            pub struct ParityProbe_AliasEmbed {
+                pub head: ParityProbe_AliasName,
+            }
+            pub type ParityProbe_AliasName = ParityProbe_AliasTarget;
+            pub struct ParityProbe_AliasTarget {
+                pub flag: i64,
+            }
+        ";
+        let file = syn::parse_file(src).expect("alias-mediated forward ref parses");
+        let module_id = register_rust_module(&file).expect("walk succeeds");
+        let embed_host = lookup_host(module_id, "ParityProbe_AliasEmbed")
+            .expect("ParityProbe_AliasEmbed must register");
+        let embed_ptr = super::super::host_env::lookup_host_lltype(&embed_host)
+            .expect("alias-mediated forward ref must lift to lltype");
+        let embed_target = match &embed_ptr.TO {
+            crate::translator::rtyper::lltypesystem::lltype::PtrTarget::Struct(s) => s,
+            other => panic!("expected PtrTarget::Struct, got {other:?}"),
+        };
+        let head_ll = embed_target
+            ._flds
+            .get("head")
+            .expect("`head` field present");
+        let inner_struct = match head_ll {
+            LowLevelType::Struct(s) => s,
+            other => panic!("`head` must be Struct, got {other:?}"),
+        };
+        assert_eq!(inner_struct._name, "ParityProbe_AliasTarget");
+    }
+
+    #[test]
+    fn register_host_lltype_rejects_mutual_by_value_struct_cycle() {
+        // Mutual by-value GcStruct embedding has no RPython equivalent
+        // (the layout would be infinite size). The preseed fixed-point
+        // pass makes no progress for either side, so neither struct
+        // registers — matching upstream `lltype.GcStruct` which has no
+        // representable cyclic by-value shape.
+        let src = "
+            pub struct ParityProbe_CycleA {
+                pub head: ParityProbe_CycleB,
+            }
+            pub struct ParityProbe_CycleB {
+                pub head: ParityProbe_CycleA,
+            }
+        ";
+        let file = syn::parse_file(src).expect("mutual cycle parses");
+        let module_id = register_rust_module(&file).expect("walk succeeds");
+        for name in ["ParityProbe_CycleA", "ParityProbe_CycleB"] {
+            let host = lookup_host(module_id, name)
+                .unwrap_or_else(|| panic!("{name} must register as HostObject"));
+            assert!(
+                super::super::host_env::lookup_host_lltype(&host).is_none(),
+                "{name} must NOT populate the lltype registry — mutual by-value cycle is unrepresentable",
+            );
+        }
+    }
+
+    #[test]
     fn register_host_lltype_rejects_option_of_non_pointer_field() {
         // `Option<Box<i64>>` is not a nullable lltype pointer. The
         // catalog no longer unwraps `Box<T>` in fields, so this rejects

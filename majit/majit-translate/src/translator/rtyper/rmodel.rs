@@ -1367,6 +1367,67 @@ impl Repr for SimplePointerRepr {
     }
 }
 
+/// RPython `raddress.py:27-62` — `class AddressRepr(Repr)`.
+/// Singleton repr for `SomeAddress`, lowleveltype = Address.
+#[derive(Debug)]
+pub struct AddressRepr {
+    state: ReprState,
+}
+
+impl AddressRepr {
+    fn new() -> Self {
+        AddressRepr {
+            state: ReprState::new(),
+        }
+    }
+}
+
+impl Repr for AddressRepr {
+    fn lowleveltype(&self) -> &LowLevelType {
+        &LowLevelType::Address
+    }
+
+    fn state(&self) -> &ReprState {
+        &self.state
+    }
+
+    fn class_name(&self) -> &'static str {
+        "AddressRepr"
+    }
+
+    fn repr_class_id(&self) -> super::pairtype::ReprClassId {
+        super::pairtype::ReprClassId::AddressRepr
+    }
+
+    /// raddress.py:50-53 `adr_ne(addr, NULL)` → Bool
+    fn rtype_bool(&self, hop: &HighLevelOp) -> RTypeResult {
+        use crate::translator::rtyper::rtyper::GenopResult;
+        let v_addr = hop.inputarg(ConvertedTo::Repr(self), 0)?;
+        let c_null = Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::LLAddress(crate::translator::rtyper::lltypesystem::lltype::_address::Null),
+            LowLevelType::Address,
+        ));
+        Ok(hop.genop(
+            "adr_ne",
+            vec![v_addr, c_null],
+            GenopResult::LLType(LowLevelType::Bool),
+        ))
+    }
+}
+
+impl fmt::Display for AddressRepr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.repr_string())
+    }
+}
+
+/// raddress.py:62 — module-global singleton `address_repr = AddressRepr()`.
+pub fn address_repr() -> Arc<AddressRepr> {
+    use std::sync::OnceLock;
+    static REPR: OnceLock<Arc<AddressRepr>> = OnceLock::new();
+    REPR.get_or_init(|| Arc::new(AddressRepr::new())).clone()
+}
+
 /// RPython `rptr.py:27-118` — `class PtrRepr(Repr)`.
 #[derive(Debug)]
 pub struct PtrRepr {
@@ -2549,6 +2610,7 @@ pub fn rtyper_makerepr(
         SomeValue::InteriorPtr(ptr) => Ok(std::sync::Arc::new(InteriorPtrRepr::new(
             ptr.ll_ptrtype.clone(),
         )) as std::sync::Arc<dyn Repr>),
+        SomeValue::Address(_) => Ok(address_repr() as std::sync::Arc<dyn Repr>),
         SomeValue::LLADTMeth(adtmeth) => {
             Ok(std::sync::Arc::new(LLADTMethRepr::new(adtmeth)) as std::sync::Arc<dyn Repr>)
         }

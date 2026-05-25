@@ -84,6 +84,8 @@ pub enum ReprClassId {
     SingleFloatRepr,
     /// `rfloat.py:166 LongFloatRepr`.
     LongFloatRepr,
+    /// `raddress.py:27 AddressRepr`.
+    AddressRepr,
     /// `rptr.py:27 PtrRepr`.
     PtrRepr,
     /// `rptr.py:220 InteriorPtrRepr`.
@@ -155,6 +157,7 @@ impl ReprClassId {
             FloatRepr => &[FloatRepr, Repr],
             SingleFloatRepr => &[SingleFloatRepr, Repr],
             LongFloatRepr => &[LongFloatRepr, Repr],
+            AddressRepr => &[AddressRepr, Repr],
             PtrRepr => &[PtrRepr, Repr],
             InteriorPtrRepr => &[InteriorPtrRepr, Repr],
             LLADTMethRepr => &[LLADTMethRepr, Repr],
