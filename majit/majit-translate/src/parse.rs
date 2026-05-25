@@ -55,12 +55,10 @@ impl CallPath {
     /// string-free and does not distinguish the two shapes
     /// `rpython/jit/codewriter/call.py:174-187`).
     ///
-    /// Both `::` (Rust path) and `.` (upstream `module.Class`) separators
-    /// are accepted — `ClassDef.name` mirrors upstream `classdesc.py:500-502`
-    /// (`cls.__module__ + '.' + cls.__name__`), while Rust impl
-    /// extraction emits `module::Type`.  Splitting on both keeps the
-    /// fast path keyed off `classdef_impl_types` reaching the same
-    /// `CallPath` registered by `register_trait_method`.
+    // Structural adaptation: Rust `::` ↔ PyPy `.` path separator.
+    // Both are accepted because ClassDef.name mirrors classdesc.py
+    // `cls.__module__ + '.' + cls.__name__` while Rust extraction
+    // emits `module::Type`.
     pub fn for_impl_method(impl_type_joined: &str, method: &str) -> Self {
         let mut segments: Vec<String> = impl_type_joined
             .split("::")

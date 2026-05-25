@@ -1207,56 +1207,24 @@ impl Bookkeeper {
         rc
     }
 
-    /// Pyre-side adapter for the codewriter-time bound-method discovery
-    /// pattern that mirrors `bookkeeper.py:383-397` (the regular-method
-    /// branch of `getdesc(pyobj)`): given a receiver classdef and a
-    /// method name, walk the MRO read-only for a `SomePBC` attribute
-    /// whose `descriptions` contain a `MethodDesc`, then route through
-    /// `getmethoddesc` so the upstream `methoddescs` cache is primed.
+    /// Codewriter-time method-desc discovery.
     ///
-    /// `None` when no MRO entry exposes a Method PBC for `name` — the
-    /// receiver is either unannotated for this method or carries a
-    /// non-method attribute (e.g. data attribute).
+    /// Walks `receiver_classdef`'s MRO for the first `SomePBC` attr
+    /// under `name`, then applies `classdesc.py:344-365` filtering
+    /// rules inline to collect all qualifying MethodDescs.
     ///
-    /// The walk is intentionally non-mutating (no `find_attribute` /
-    /// `generalize_attr_internal` / `update_attr`) so callers can run
-    /// it at codewriter time without triggering an annotator reflow.
-    /// This is the structural difference from `bookkeeper.py:392`'s
-    /// `classdef.find_attribute(name)` call: upstream tolerates the
-    /// reflow because the call lives inside `getdesc` during
-    /// annotation; pyre's producer runs post-annotator and must stay
-    /// pure-read.
+    /// Classdef-attrs read-only: uses `get_owner` / `attrs.get`
+    /// instead of `find_attribute` (which calls `locate_attribute`
+    /// → `generalize_attr_internal` mutating classdef attrs — a
+    /// phase violation at codewriter time). Does prime the
+    /// `Bookkeeper.methoddescs` cache via `getmethoddesc` calls.
     pub fn getmethoddesc_for_attribute(
         self: &Rc<Self>,
         receiver_classdef: &Rc<RefCell<super::classdesc::ClassDef>>,
         name: &str,
-    ) -> Option<Rc<RefCell<super::description::MethodDesc>>> {
+    ) -> Vec<Rc<RefCell<super::description::MethodDesc>>> {
         use super::description::DescEntry;
         use super::model::SomeValue;
-        // Walks `receiver_classdef`'s MRO, then applies upstream
-        // `classdesc.py:336-374 ClassDef.lookup_filter` to the first
-        // SomePBC found.  Returns a single MethodDesc rather than a
-        // filtered PBC because the only caller
-        // (codewriter.rs stamp_classdef_hints_on_graph) consumes a
-        // single dispatch target.
-        //
-        // lookup_filter rules per `classdesc.py:344-365`:
-        //   * `desc.selfclassdef is None` (unbound carrier): inspect
-        //     `methclassdef = desc.originclassdef` —
-        //       - `methclassdef is not self and
-        //          methclassdef.issubclass(self)` → subclass-origin
-        //          method, keep + `bind_self(methclassdef, flags)`
-        //       - `self.issubclass(methclassdef)` → upward candidate;
-        //          track the best (most specific) match via
-        //          `methclassdef.issubclass(uplookup)` and skip the
-        //          immediate append
-        //       - otherwise → not matching, skip
-        //   * already bound (`selfclassdef is not None`): kept verbatim
-        //     (instance-attribute origin).
-        // After the loop, the tracked upward best match is bound to
-        // `self` and appended last.  This adapter returns the first
-        // direct-match entry it finds, falling back to the upward
-        // best-match if no direct entry exists.
         let receiver_key = super::description::ClassDefKey::from_classdef(receiver_classdef);
         let mro = super::classdesc::ClassDef::getmro(receiver_classdef);
         for cdef in mro {
@@ -1264,6 +1232,11 @@ impl Bookkeeper {
             let Some(SomeValue::PBC(pbc)) = s_value else {
                 continue;
             };
+            // classdesc.py:344-365 filtering rules applied inline.
+            // Does not call ClassDef::lookup_filter (which calls
+            // bind_self); instead calls getmethoddesc directly to
+            // prime the methoddescs cache.
+            let mut d: Vec<Rc<RefCell<super::description::MethodDesc>>> = Vec::new();
             let mut uplookup: Option<Rc<RefCell<super::classdesc::ClassDef>>> = None;
             let mut up_md: Option<Rc<RefCell<super::description::MethodDesc>>> = None;
             for entry in pbc.descriptions.values() {
@@ -1281,13 +1254,15 @@ impl Bookkeeper {
                     )
                 };
                 if existing_self.is_some() {
-                    return Some(self.getmethoddesc(
+                    // Already-bound: kept verbatim (classdesc.py:347).
+                    d.push(self.getmethoddesc(
                         &funcdesc,
                         originclassdef,
                         existing_self,
                         &name_owned,
                         flags,
                     ));
+                    continue;
                 }
                 let Some(methclassdef) = self.lookup_classdef(originclassdef) else {
                     continue;
@@ -1296,9 +1271,11 @@ impl Bookkeeper {
                 let meth_issub_receiver = methclassdef.borrow().issubclass(receiver_classdef);
                 let receiver_issub_meth = receiver_classdef.borrow().issubclass(&methclassdef);
                 if !methclassdef_is_receiver && meth_issub_receiver {
+                    // Subclass-origin: bind to methclassdef
+                    // (classdesc.py:349-364).
                     let methclassdef_key =
                         super::description::ClassDefKey::from_classdef(&methclassdef);
-                    return Some(self.getmethoddesc(
+                    d.push(self.getmethoddesc(
                         &funcdesc,
                         originclassdef,
                         Some(methclassdef_key),
@@ -1306,6 +1283,7 @@ impl Bookkeeper {
                         flags,
                     ));
                 } else if receiver_issub_meth {
+                    // Upward: track best (classdesc.py:351-356).
                     let promote = match &uplookup {
                         None => true,
                         Some(cur) => methclassdef.borrow().issubclass(cur),
@@ -1316,6 +1294,8 @@ impl Bookkeeper {
                     }
                 }
             }
+            // Upward best-match bound to receiver
+            // (classdesc.py:366-367).
             if let Some(up_md_rc) = up_md {
                 let (funcdesc, originclassdef, name_owned, flags) = {
                     let b = up_md_rc.borrow();
@@ -1326,7 +1306,7 @@ impl Bookkeeper {
                         b.flags.clone(),
                     )
                 };
-                return Some(self.getmethoddesc(
+                d.push(self.getmethoddesc(
                     &funcdesc,
                     originclassdef,
                     Some(receiver_key),
@@ -1334,8 +1314,12 @@ impl Bookkeeper {
                     flags,
                 ));
             }
+            // classdesc.py:369-374 — once the owner's PBC is found,
+            // return the filtered result even if empty. Does not
+            // continue to parent attrs.
+            return d;
         }
-        None
+        Vec::new()
     }
 
     /// RPython `Bookkeeper.get_classpbc_attr_families(attrname)`
@@ -3861,15 +3845,14 @@ mod tests {
         classdef.borrow_mut().attrs.insert("push".into(), attr);
 
         // Idempotent on cache hit: returns the cached MethodDesc rc.
-        let returned = bk
-            .getmethoddesc_for_attribute(&classdef, "push")
-            .expect("expected Method PBC under push");
-        assert!(Rc::ptr_eq(&returned, &md));
+        let results = bk.getmethoddesc_for_attribute(&classdef, "push");
+        assert_eq!(results.len(), 1, "expected single Method PBC under push");
+        assert!(Rc::ptr_eq(&results[0], &md));
 
-        // Missing attribute → None.
+        // Missing attribute → empty Vec.
         assert!(
             bk.getmethoddesc_for_attribute(&classdef, "absent")
-                .is_none()
+                .is_empty()
         );
     }
 
@@ -3924,14 +3907,14 @@ mod tests {
         // Walking from Derived must return a MethodDesc bound to
         // Derived (upward best-match branch — Derived.issubclass(Base))
         // with originclassdef preserved as Base.
-        let bound = bk
-            .getmethoddesc_for_attribute(&derived_classdef, "m")
-            .expect("expected to find Base.m via Derived MRO");
+        let results = bk.getmethoddesc_for_attribute(&derived_classdef, "m");
+        assert_eq!(results.len(), 1, "expected single filtered MD");
+        let bound = &results[0];
         assert_eq!(bound.borrow().originclassdef, base_key);
         assert_eq!(bound.borrow().selfclassdef, Some(derived_key));
         // The unbound carrier is untouched; the bound result is a
         // distinct MethodDesc rc (cache key differs by selfclassdef).
-        assert!(!Rc::ptr_eq(&bound, &unbound));
+        assert!(!Rc::ptr_eq(bound, &unbound));
     }
 
     /// `classdesc.py:344-365 lookup_filter` only rebinds MDs whose
@@ -3985,9 +3968,9 @@ mod tests {
 
         // Walking from Derived must preserve the existing selfclassdef =
         // Some(base_key) — NOT rebind to Derived.
-        let resolved = bk
-            .getmethoddesc_for_attribute(&derived_classdef, "m")
-            .expect("expected to find Base.m via Derived MRO");
+        let results = bk.getmethoddesc_for_attribute(&derived_classdef, "m");
+        assert_eq!(results.len(), 1, "expected single filtered MD");
+        let resolved = &results[0];
         assert_eq!(resolved.borrow().originclassdef, base_key);
         assert_eq!(
             resolved.borrow().selfclassdef,
@@ -4051,9 +4034,9 @@ mod tests {
 
         // Walking from Base sees originclassdef = Derived as a strict
         // subclass — bind to Derived (methclassdef), not Base.
-        let bound = bk
-            .getmethoddesc_for_attribute(&base_classdef, "m")
-            .expect("expected to find subclass-origin MD on Base attrs");
+        let results = bk.getmethoddesc_for_attribute(&base_classdef, "m");
+        assert_eq!(results.len(), 1, "expected single filtered MD");
+        let bound = &results[0];
         assert_eq!(bound.borrow().originclassdef, derived_key);
         assert_eq!(
             bound.borrow().selfclassdef,
@@ -4061,6 +4044,82 @@ mod tests {
             "subclass-origin branch binds to methclassdef (Derived), not receiver (Base)",
         );
         assert_ne!(base_key, derived_key, "fixture sanity");
+    }
+
+    /// classdesc.py:341-367 lookup_filter collects ALL matching descs
+    /// into `d`, not just the first.  A PBC with both an already-bound
+    /// MD and an unbound upward-match MD must return both entries.
+    #[test]
+    fn getmethoddesc_for_attribute_collects_multi_desc_pbc() {
+        use crate::annotator::classdesc::Attribute;
+        use crate::annotator::description::DescEntry;
+        use crate::annotator::model::{SomePBC, SomeValue};
+
+        let bk = bk();
+
+        let base_pyobj = HostObject::new_class("Base", vec![]);
+        let base_desc = Rc::new(RefCell::new(
+            crate::annotator::classdesc::ClassDesc::new_shell(&bk, base_pyobj, "Base".into()),
+        ));
+        let base_classdef = crate::annotator::classdesc::ClassDef::new(&bk, &base_desc);
+        let base_key = crate::annotator::description::ClassDefKey::from_classdef(&base_classdef);
+        bk.register_classdef(base_classdef.clone());
+
+        let derived_pyobj =
+            HostObject::new_class("Derived", vec![base_desc.borrow().pyobj.clone()]);
+        let derived_desc = Rc::new(RefCell::new(
+            crate::annotator::classdesc::ClassDesc::new_shell(&bk, derived_pyobj, "Derived".into()),
+        ));
+        derived_desc.borrow_mut().basedesc = Some(base_desc.clone());
+        let derived_classdef = crate::annotator::classdesc::ClassDef::new(&bk, &derived_desc);
+        let derived_key =
+            crate::annotator::description::ClassDefKey::from_classdef(&derived_classdef);
+        bk.register_classdef(derived_classdef.clone());
+
+        // Two FunctionDescs so the MDs have distinct cache keys.
+        let gf1 = GraphFunc::new("m", Constant::new(ConstValue::Dict(Default::default())));
+        let host1 = HostObject::new_user_function(gf1);
+        let fd1 = bk.getdesc(&host1).unwrap().as_function().unwrap();
+        let gf2 = GraphFunc::new("m2", Constant::new(ConstValue::Dict(Default::default())));
+        let host2 = HostObject::new_user_function(gf2);
+        let fd2 = bk.getdesc(&host2).unwrap().as_function().unwrap();
+
+        // MD1: already-bound to Base (selfclassdef = Some(base_key)).
+        let already_bound = bk.getmethoddesc(
+            &fd1,
+            base_key,
+            Some(base_key),
+            "m",
+            std::collections::BTreeMap::new(),
+        );
+        // MD2: unbound, originclassdef = Base.
+        // Walking from Derived → upward match → bound to Derived.
+        let unbound =
+            bk.getmethoddesc(&fd2, base_key, None, "m", std::collections::BTreeMap::new());
+
+        let pbc = SomePBC::new(
+            [
+                DescEntry::Method(already_bound.clone()),
+                DescEntry::Method(unbound.clone()),
+            ],
+            false,
+        );
+        let mut attr = Attribute::new("m");
+        attr.s_value = SomeValue::PBC(pbc);
+        base_classdef.borrow_mut().attrs.insert("m".into(), attr);
+
+        // Walking from Derived: already-bound MD preserved +
+        // unbound MD bound to Derived as upward best-match = 2 entries.
+        let results = bk.getmethoddesc_for_attribute(&derived_classdef, "m");
+        assert_eq!(
+            results.len(),
+            2,
+            "multi-desc PBC must collect all matching MDs, not just the first",
+        );
+        // First entry: already-bound, selfclassdef preserved.
+        assert_eq!(results[0].borrow().selfclassdef, Some(base_key));
+        // Second entry: upward best-match, bound to receiver (Derived).
+        assert_eq!(results[1].borrow().selfclassdef, Some(derived_key));
     }
 
     #[test]

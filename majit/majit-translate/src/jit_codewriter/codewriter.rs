@@ -820,25 +820,22 @@ fn stamp_classdef_hints_on_graph(
             // dispatch namespace string follows from that binding's
             // classdef.name.
             //
-            // Fallback to the receiver classdef.name when the bind
-            // path is unreachable.  Three reachable fallback paths:
-            //   1. Bookkeeper weak-ref upgrade fails (classdef was
-            //      constructed standalone — typically a fixture).
-            //   2. `getmethoddesc_for_attribute` finds no Method PBC
-            //      under `name` in the receiver MRO.  Upstream
-            //      `bookkeeper.py:391 classdef.find_attribute(name)`
-            //      runs eagerly at annotation time, materialising the
-            //      attribute on the classdef; our pure-read adapter
-            //      operates post-annotator and tolerates the
-            //      materialisation gap by falling back to receiver
-            //      identity.  In the unbound-rebind case this is
-            //      parity-equivalent to the upstream answer
-            //      (`selfclassdef = receiver` ⇒
-            //      `bound_classdef.name = receiver.name`).
-            //   3. `lookup_classdef` cannot resolve the bound selfclassdef
-            //      key (Bookkeeper.classdefs was not seeded — fixture).
+            // Fallback to receiver classdef.name when:
+            //   1. Bookkeeper weak-ref upgrade fails (fixture).
+            //   2. getmethoddesc_for_attribute returns empty Vec
+            //      (no PBC for `name` in MRO attrs).
+            //   3. lookup_classdef cannot resolve the selfclassdef
+            //      key (Bookkeeper.classdefs unseeded — fixture).
+            // Takes the first MethodDesc from the filtered Vec.
+            // Multi-desc PBCs are compressed to a single impl_type
+            // for classdef_impl_types — inherent to the side-table
+            // architecture (see TODO(parity) on classdef_impl_types).
             let impl_type = if let Some(bk) = classdef_rc.borrow().bookkeeper.upgrade() {
-                match bk.getmethoddesc_for_attribute(classdef_rc, method_name) {
+                match bk
+                    .getmethoddesc_for_attribute(classdef_rc, method_name)
+                    .into_iter()
+                    .next()
+                {
                     Some(md) => {
                         let selfclassdef = md.borrow().selfclassdef;
                         match selfclassdef.and_then(|sc| bk.lookup_classdef(sc)) {

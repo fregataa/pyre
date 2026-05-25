@@ -658,17 +658,17 @@ pub struct CallControl {
     /// Equivalent to `op.args[0].concretetype.TO` in RPython's rtyped graph.
     struct_fields: crate::front::StructFieldRegistry,
 
-    /// `ClassDefKey → impl_type` side-table populated by the codewriter
-    /// producer (`stamp_classdef_hints_on_graph`) once per concrete
-    /// receiver classdef observed through the dual-gate
-    /// `real_value_to_var` map. Consumed by [`Self::resolve_method`] /
-    /// [`Self::resolve_method_impl_type`] when
-    /// `CallTarget::Method.classdef_hint` is `Some` — the
-    /// classdef-keyed fast path corresponds to upstream
-    /// `bookkeeper.py:431-442 getmethoddesc` keying on the concrete
-    /// `ClassDef` reference rather than a source-syntax string. When
-    /// the entry is absent, resolution falls through to the receiver-
-    /// root / default-method chain in [`Self::resolve_method`].
+    // TODO(parity): retire this side-table when resolve_method uses
+    // graph identity instead of string matching (plan §M3).
+    /// PRE-EXISTING-ADAPTATION: `ClassDefKey → impl_type` side-table.
+    /// No direct counterpart in call.py — upstream uses
+    /// `getfunctionptr(graph)` (call.py:181) which keys on graph
+    /// identity, not on a classdef→string mapping. This side-table
+    /// exists because pyre's codewriter resolves method targets from
+    /// source-syntax strings (Rust paths) rather than annotator-
+    /// derived graph identity.  Populated by `stamp_classdef_hints_on_
+    /// graph` once per concrete receiver classdef observed through
+    /// `real_value_to_var`.
     classdef_impl_types: HashMap<crate::annotator::description::ClassDefKey, String>,
 
     /// RPython: `op.result.concretetype` — function return type strings.
@@ -1961,11 +1961,10 @@ impl CallControl {
                 .or_default()
                 .push(impl_type.to_string());
         }
-        // `function_graphs` is the canonical `getfunctionptr(graph)`
-        // identity (RPython `call.py:175-187`).  Each impl gets a
-        // distinct CallPath built from `for_impl_method` so PyFrame's
-        // `push_value` and MIFrame's `push_value` stay separate
-        // (`["PyFrame", "push_value"]` vs `["MIFrame", "push_value"]`).
+        // call.py:175-187 getfunctionptr(graph) — graph identity is
+        // the key. Each impl gets a distinct CallPath via
+        // `for_impl_method` so PyFrame's `push_value` and MIFrame's
+        // `push_value` stay separate.
         let qualified_path = CallPath::for_impl_method(impl_type, method_name);
         self.function_graphs.entry(qualified_path).or_insert(graph);
     }
@@ -3386,6 +3385,8 @@ impl CallControl {
             }
         }
 
+        // TODO(parity): retire when §M3 annotator wiring publishes
+        // classdef hints before BFS runs.
         // PRE-EXISTING-ADAPTATION: receiver-agnostic "unique concrete
         // impl" fallback.  Upstream `call.py:175-187
         // getfunctionptr(graph)` keys on graph identity, never on
