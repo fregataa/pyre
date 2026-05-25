@@ -397,7 +397,7 @@ impl CodeWriter {
         // classdef-keyed dispatch). Ops whose receiver carries no
         // SomeInstance annotation are left untouched.
         if let Some(value_to_var) = real_value_to_var.as_ref() {
-            stamp_classdef_hints_on_graph(&mut graph_owned, value_to_var, callcontrol);
+            stamp_classdef_hints_on_graph(&mut graph_owned, value_to_var);
         }
         let graph = &graph_owned;
 
@@ -752,43 +752,28 @@ impl Default for CodeWriter {
     }
 }
 
-/// Codewriter-time producer for `CallTarget::Method.classdef_hint`.
+/// Codewriter-time producer for `CallTarget::Method.resolved_path`.
 ///
-/// Walks every `OpKind::Call { target: CallTarget::Method { .. }, .. }`
-/// in `graph`, looks up the receiver's annotated flowspace `Variable`
-/// via the dual-gate `value_to_var` map, extracts
-/// `SomeInstance.classdef` (`model.py:1054`) when present, and stamps
-/// the resulting `ClassDefKey` onto the op's `classdef_hint` field.
-/// The corresponding `(ClassDefKey → classdef.name)` pair is
-/// registered on `callcontrol`; `register_classdef_impl_type`
-/// canonicalises the value to `::` separators so the lookup against
-/// `function_graphs` via `CallPath::for_impl_method` (parse.rs:65)
-/// matches verbatim.  [`crate::call::CallControl::resolve_method`] /
-/// [`crate::call::CallControl::resolve_method_impl_type`] then take
-/// the classdef-keyed fast path — mirroring upstream's
-/// `bookkeeper.py:431-442 getmethoddesc` keying on the concrete
-/// `ClassDef` reference rather than a source-syntax string.
-///
-/// Receivers whose annotation is `None` (annotator did not bind them)
-/// or whose `SomeInstance` carries `classdef = None` (`object`-only
-/// instances per `model.py:1056`) leave the hint untouched; the
-/// existing receiver-root heuristic still runs for those sites until
-/// slices C4-C6 retire it.
+/// Walks every unstamped Method op in `graph`, looks up the receiver's
+/// annotated Variable via `value_to_var`, extracts
+/// `SomeInstance.classdef` when present, resolves the impl_type name
+/// from the MethodDesc's selfclassdef, builds
+/// `CallPath::for_impl_method` and stamps it as `resolved_path`.
+/// call.py:181 `getfunctionptr(graph)` — consumer does
+/// `function_graphs.get(&path)` directly.
 fn stamp_classdef_hints_on_graph(
     graph: &mut FunctionGraph,
     value_to_var: &crate::translator::rtyper::flowspace_adapter::SlotToVariable,
-    callcontrol: &mut CallControl,
 ) {
-    use crate::annotator::description::ClassDefKey;
     use crate::annotator::model::SomeValue;
     use crate::model::{CallTarget, OpKind};
-    let mut stamps: Vec<(usize, usize, ClassDefKey, String)> = Vec::new();
+    let mut stamps: Vec<(usize, usize, String, String)> = Vec::new();
     for (b_idx, block) in graph.blocks.iter().enumerate() {
         for (o_idx, op) in block.operations.iter().enumerate() {
             let OpKind::Call {
                 target:
                     CallTarget::Method {
-                        classdef_hint: None,
+                        resolved_path: None,
                         name: method_name,
                         ..
                     },
@@ -817,25 +802,11 @@ fn stamp_classdef_hints_on_graph(
             let Some(classdef_rc) = &inst.classdef else {
                 continue;
             };
-            let key = ClassDefKey::from_classdef(classdef_rc);
-            // Source of truth for `impl_type` is the bound MethodDesc's
-            // selfclassdef per `bookkeeper.py:384 getdesc` regular-
-            // method branch and `description.py:451 MethodDesc.bind_self`:
-            // the MethodDesc rebound by `getmethoddesc_for_attribute`
-            // carries `selfclassdef = receiver_classdef_key` and the
-            // dispatch namespace string follows from that binding's
-            // classdef.name.
-            //
+            // Resolve impl_type from MethodDesc selfclassdef.
             // Fallback to receiver classdef.name when:
             //   1. Bookkeeper weak-ref upgrade fails (fixture).
-            //   2. getmethoddesc_for_attribute returns empty Vec
-            //      (no PBC for `name` in MRO attrs).
-            //   3. lookup_classdef cannot resolve the selfclassdef
-            //      key (Bookkeeper.classdefs unseeded — fixture).
-            // Takes the first MethodDesc from the filtered Vec.
-            // Multi-desc PBCs are compressed to a single impl_type
-            // for classdef_impl_types — inherent to the side-table
-            // architecture (see TODO(parity) on classdef_impl_types).
+            //   2. getmethoddesc_for_attribute returns empty Vec.
+            //   3. lookup_classdef cannot resolve selfclassdef key.
             let impl_type = if let Some(bk) = classdef_rc.borrow().bookkeeper.upgrade() {
                 match bk
                     .getmethoddesc_for_attribute(classdef_rc, method_name)
@@ -854,18 +825,19 @@ fn stamp_classdef_hints_on_graph(
             } else {
                 classdef_rc.borrow().name.clone()
             };
-            stamps.push((b_idx, o_idx, key, impl_type));
+            stamps.push((b_idx, o_idx, method_name.clone(), impl_type));
         }
     }
-    for (b_idx, o_idx, key, impl_type) in stamps {
-        callcontrol.register_classdef_impl_type(key, impl_type);
+    for (b_idx, o_idx, method_name, impl_type) in stamps {
+        let normalized = impl_type.replace('.', "::");
+        let path = crate::parse::CallPath::for_impl_method(&normalized, &method_name);
         let op = &mut graph.blocks[b_idx].operations[o_idx];
         if let OpKind::Call {
-            target: CallTarget::Method { classdef_hint, .. },
+            target: CallTarget::Method { resolved_path, .. },
             ..
         } = &mut op.kind
         {
-            *classdef_hint = Some(key);
+            *resolved_path = Some(path);
         }
     }
 }
@@ -916,15 +888,10 @@ mod stamp_classdef_hints_tests {
 
     /// End-to-end producer test: a Call(Method) op whose receiver
     /// carries an annotated `SomeInstance(classdef=PyFrame)` gets a
-    /// `classdef_hint` stamped, and the `(key → "PyFrame")` binding is
-    /// registered into `CallControl.classdef_impl_types` so the
-    /// resolver can take the classdef-keyed fast path. Mirrors
-    /// `bookkeeper.py:431-442 getmethoddesc` keying on concrete
-    /// classdef rather than receiver source-syntax string.
+    /// Producer stamps `resolved_path` on the Method op.
     #[test]
-    fn stamp_classdef_hints_on_graph_stamps_hint_and_registers_impl_type() {
+    fn stamp_classdef_hints_on_graph_stamps_resolved_path() {
         let classdef = make_classdef("PyFrame");
-        let expected_key = ClassDefKey::from_classdef(&classdef);
 
         // Synthetic flowspace Variable annotated SomeInstance(PyFrame).
         let recv_var = Variable::new();
@@ -951,22 +918,14 @@ mod stamp_classdef_hints_tests {
         let mut value_to_var = std::collections::HashMap::new();
         value_to_var.insert(recv_slot, recv_var.clone());
 
-        let mut callcontrol = CallControl::new();
-        stamp_classdef_hints_on_graph(&mut graph, &value_to_var, &mut callcontrol);
+        stamp_classdef_hints_on_graph(&mut graph, &value_to_var);
 
-        // Op's classdef_hint must be Some(expected_key).
         let op = &graph.blocks[graph.startblock.0].operations[0];
         let OpKind::Call { target, .. } = &op.kind else {
             panic!("expected Call op");
         };
-        assert_eq!(target.classdef_hint(), Some(expected_key));
-
-        // Side-table must have the (key → "PyFrame") binding so the
-        // resolver fast path resolves to the registered impl.
-        assert_eq!(
-            callcontrol.classdef_impl_type_for_test(expected_key),
-            Some("PyFrame"),
-        );
+        let expected_path = crate::parse::CallPath::for_impl_method("PyFrame", "push_value");
+        assert_eq!(target.resolved_path(), Some(&expected_path));
     }
 
     /// Receivers whose annotation is `None` (annotator did not bind
@@ -994,19 +953,13 @@ mod stamp_classdef_hints_tests {
         let mut value_to_var = std::collections::HashMap::new();
         value_to_var.insert(recv_slot, recv_var.clone());
 
-        let mut callcontrol = CallControl::new();
-        stamp_classdef_hints_on_graph(&mut graph, &value_to_var, &mut callcontrol);
+        stamp_classdef_hints_on_graph(&mut graph, &value_to_var);
 
         let op = &graph.blocks[graph.startblock.0].operations[0];
         let OpKind::Call { target, .. } = &op.kind else {
             panic!("expected Call op");
         };
-        assert_eq!(target.classdef_hint(), None);
-        // No registration must have happened either.
-        assert_eq!(
-            callcontrol.classdef_impl_type_for_test(ClassDefKey::from_raw(0)),
-            None,
-        );
+        assert_eq!(target.resolved_path(), None);
     }
 
     /// When the receiver classdef's `attrs[method_name].s_value` carries
@@ -1094,8 +1047,7 @@ mod stamp_classdef_hints_tests {
         let mut value_to_var = std::collections::HashMap::new();
         value_to_var.insert(recv_slot, recv_var.clone());
 
-        let mut callcontrol = CallControl::new();
-        stamp_classdef_hints_on_graph(&mut graph, &value_to_var, &mut callcontrol);
+        stamp_classdef_hints_on_graph(&mut graph, &value_to_var);
 
         // Producer routed the receiver classdef + method name through
         // `getmethoddesc_for_attribute`, which executed the upstream
@@ -1125,15 +1077,12 @@ mod stamp_classdef_hints_tests {
             "bound entry is a distinct MethodDesc rc from the seeded unbound carrier",
         );
 
-        // `classdef_impl_types` carries the canonicalised qualified
-        // `classdef.name` (`::`-joined per `register_classdef_impl_type`)
-        // so the resolve_method classdef-keyed fast path builds the
-        // matching `CallPath::for_impl_method` directly against
-        // `function_graphs` — the same `getfunctionptr(graph)`
-        // identity surface upstream uses at call.py:175-187.
-        assert_eq!(
-            callcontrol.classdef_impl_type_for_test(classdef_key),
-            Some("PyFrame"),
-        );
+        // impl_type_hint stamped directly on the op.
+        let op = &graph.blocks[graph.startblock.0].operations[0];
+        let OpKind::Call { target, .. } = &op.kind else {
+            panic!("expected Call op");
+        };
+        let expected_path = crate::parse::CallPath::for_impl_method("PyFrame", "push_value");
+        assert_eq!(target.resolved_path(), Some(&expected_path));
     }
 }

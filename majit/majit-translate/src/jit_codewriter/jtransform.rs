@@ -2366,9 +2366,8 @@ impl<'a> Transformer<'a> {
                         .resolve_call_result(op.result.as_ref(), result_ty)
                         .ir_type;
                     let cc_ref: &crate::call::CallControl = self.callcontrol.as_deref().unwrap();
-                    let extraeffect =
-                        classify_call(target, &self.config.call_effects, Some(cc_ref))
-                            .map(|(d, _)| d.extra_info.extraeffect);
+                    let extraeffect = classify_call(target, &self.config.call_effects)
+                        .map(|(d, _)| d.extra_info.extraeffect);
                     let descriptor = cc_ref.getcalldescr(
                         op,
                         non_void_args,
@@ -2393,11 +2392,7 @@ impl<'a> Transformer<'a> {
 
         // Fallback when no CallControl: effect-only classification (legacy path).
         // RPython: always residual_call_*, effect only in calldescr.
-        if let Some((descriptor, _effect)) = classify_call(
-            target,
-            &self.config.call_effects,
-            self.callcontrol.as_deref(),
-        ) {
+        if let Some((descriptor, _effect)) = classify_call(target, &self.config.call_effects) {
             let non_void_args = resolve_non_void_arg_types_from_vars(args);
             let descriptor = descriptor.with_signature(
                 &non_void_args,
@@ -2512,29 +2507,26 @@ impl<'a> Transformer<'a> {
             // The jitcode_lower proc-macro intercepts the macros directly and
             // emits BC_COND_CALL_* / BC_RECORD_KNOWN_RESULT_* bytecodes.
         }
-        let (oopspecindex, extraeffect_override) = if let Some((descriptor, _)) = classify_call(
-            target,
-            &self.config.call_effects,
-            self.callcontrol.as_deref(),
-        ) {
-            (
-                descriptor.extra_info.oopspecindex,
-                Some(descriptor.extra_info.extraeffect),
-            )
-        } else if let Some(descriptor) = crate::call::describe_call(target) {
-            (
-                descriptor.extra_info.oopspecindex,
-                Some(descriptor.extra_info.extraeffect),
-            )
-        } else if let Some(spec) = user_oopspec.as_deref() {
-            // rlib/jit.py:250 — map user oopspec string to OopSpecIndex.
-            // jtransform.py:1731-1755 — jit.* oopspecs.
-            let idx = map_user_oopspec_to_index(spec);
-            (idx, None)
-        } else {
-            // Unknown builtin — keep as unclassified Call.
-            return RewriteResult::Keep;
-        };
+        let (oopspecindex, extraeffect_override) =
+            if let Some((descriptor, _)) = classify_call(target, &self.config.call_effects) {
+                (
+                    descriptor.extra_info.oopspecindex,
+                    Some(descriptor.extra_info.extraeffect),
+                )
+            } else if let Some(descriptor) = crate::call::describe_call(target) {
+                (
+                    descriptor.extra_info.oopspecindex,
+                    Some(descriptor.extra_info.extraeffect),
+                )
+            } else if let Some(spec) = user_oopspec.as_deref() {
+                // rlib/jit.py:250 — map user oopspec string to OopSpecIndex.
+                // jtransform.py:1731-1755 — jit.* oopspecs.
+                let idx = map_user_oopspec_to_index(spec);
+                (idx, None)
+            } else {
+                // Unknown builtin — keep as unclassified Call.
+                return RewriteResult::Keep;
+            };
 
         // RPython jtransform.py:1990-2002:
         //   calldescr = self.callcontrol.getcalldescr(op, oopspecindex, extraeffect)
@@ -4283,31 +4275,11 @@ fn classify_vable_hint(target: &CallTarget) -> Option<crate::hints::Virtualizabl
 /// The match is loose only in the asymmetric receiver-root direction:
 /// when the pattern leaves `receiver_root` as `None`, any target
 /// receiver matches; otherwise both sides must agree, either by
-/// exact source-syntax equality or — when the target carries a
-/// `classdef_hint` and `callcontrol` is available — through the
-/// classdef-keyed side-table that resolves the concrete receiver
-/// per `bookkeeper.py:431-442 getmethoddesc`. The pre-C6
-/// `is_generic_receiver` wildcard branch is retired; there is no
-/// production path that produces `callcontrol=None` at this site
-/// (`Transformer::with_callcontrol` is set by every production
-/// entry — `codewriter.rs:382`).
-///
-/// TODO: the override table itself is pyre-only
-/// (no upstream basis). The producer (`codewriter.rs::
-/// stamp_classdef_hints_on_graph`) stores the receiver's `ClassDef.name`
-/// (RPython `classdef.py:36 self.name`, fully qualified `module.Class`)
-/// canonicalised through `register_classdef_impl_type` to `::`
-/// separators so distinct classdefs sharing a leaf identifier don't
-/// collide. Override patterns such as `PYFRAME_CALL_OWNER_ROOT =
-/// "PyFrame"` are written bare in `pyre-jit-trace/src/call_spec.rs`, so
-/// the classdef-keyed branch also accepts a leaf-suffix match
-/// (`crate::parse::canonical_leaf`) against the qualified side-table
-/// value — accepting both `module.Class` and `module::Class` forms.
-fn call_target_matches_loose(
-    pattern: &CallTarget,
-    target: &CallTarget,
-    callcontrol: Option<&crate::call::CallControl>,
-) -> bool {
+/// exact source-syntax equality or — when the target carries an
+/// `impl_type_hint` — by direct string comparison or leaf-suffix
+/// match via `canonical_leaf` (accepts both `module.Class` and
+/// `module::Class` forms).
+fn call_target_matches_loose(pattern: &CallTarget, target: &CallTarget) -> bool {
     match (pattern, target) {
         (
             CallTarget::Method {
@@ -4318,7 +4290,7 @@ fn call_target_matches_loose(
             CallTarget::Method {
                 name: tn,
                 receiver_root: tr,
-                classdef_hint,
+                resolved_path,
             },
         ) => {
             if pn != tn {
@@ -4329,24 +4301,13 @@ fn call_target_matches_loose(
                     if p == t {
                         return true;
                     }
-                    if let (Some(key), Some(cc)) = (classdef_hint, callcontrol) {
-                        if let Some(side) = cc.classdef_impl_type_for_pattern_match(*key) {
-                            if side == p {
-                                return true;
-                            }
-                            // Side-table value is the canonicalised
-                            // qualified `ClassDef.name` (`::`-joined per
-                            // `register_classdef_impl_type`); pattern
-                            // receivers in pyre-jit-trace's
-                            // PYFRAME_CALL_EFFECTS are bare leaf
-                            // spellings. Compare on the leaf after the
-                            // final separator (`canonical_leaf` accepts
-                            // both `::` and `.`) so the override matcher
-                            // fires for bare patterns regardless of how
-                            // the producer's classdef was named.
-                            if crate::parse::canonical_leaf(side) == p {
-                                return true;
-                            }
+                    if let Some(path) = resolved_path {
+                        let prefix = path.impl_type_prefix();
+                        if prefix == p {
+                            return true;
+                        }
+                        if crate::parse::canonical_leaf(&prefix) == p {
+                            return true;
                         }
                     }
                     false
@@ -4388,7 +4349,6 @@ fn map_user_oopspec_to_index(spec: &str) -> majit_ir::descr::OopSpecIndex {
 fn classify_call(
     target: &CallTarget,
     overrides: &[CallEffectOverride],
-    callcontrol: Option<&crate::call::CallControl>,
 ) -> Option<(CallDescriptor, CallEffectKind)> {
     fn classify_effect_info(info: &majit_ir::descr::EffectInfo) -> CallEffectKind {
         if info.check_forces_virtual_or_virtualizable() {
@@ -4402,7 +4362,7 @@ fn classify_call(
 
     if let Some(descriptor) = overrides
         .iter()
-        .find(|override_| call_target_matches_loose(&override_.target, target, callcontrol))
+        .find(|override_| call_target_matches_loose(&override_.target, target))
         .map(|override_| override_.descriptor.clone())
     {
         let effect = classify_effect_info(&descriptor.get_extra_info());

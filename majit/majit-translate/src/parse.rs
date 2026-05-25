@@ -77,6 +77,16 @@ impl CallPath {
     pub fn canonical_key(&self) -> String {
         self.segments.join("::")
     }
+
+    /// For a path built by `for_impl_method`, extract the impl type
+    /// portion (all segments except the trailing method name).
+    pub fn impl_type_prefix(&self) -> String {
+        if self.segments.len() >= 2 {
+            self.segments[..self.segments.len() - 1].join("::")
+        } else {
+            self.segments.join("::")
+        }
+    }
 }
 
 /// Strip every `::` and `.` prefix and return the trailing segment.

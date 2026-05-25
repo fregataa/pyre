@@ -234,19 +234,11 @@ pub enum CallTarget {
     Method {
         name: String,
         receiver_root: Option<String>,
-        /// Transient transport for the concrete receiver `ClassDefKey`
-        /// the annotator's `lookup_filter` / `MethodDesc.selfclassdef`
-        /// (`bookkeeper.py:431-442 getmethoddesc`) picks per call site.
-        /// **Never source of truth**: authority is
-        /// `MethodDesc(originclassdef/selfclassdef)` +
-        /// `SomeInstance.classdef`. This field is `None` at construction
-        /// time; the codewriter's post-`dual_gate_type_state` producer
-        /// (`jit_codewriter/codewriter.rs::stamp_classdef_hints_on_graph`)
-        /// fills it from the receiver's `Variable.annotation`. Serde
-        /// surfaces never observe `Some(_)` — the hint is stripped on
-        /// serialize and re-derived on the consumer side.
+        /// Graph identity key resolved at stamp time by the codewriter
+        /// producer. call.py:181 `getfunctionptr(graph)` — consumer
+        /// does `function_graphs.get(&path)` directly. Transient.
         #[serde(skip, default)]
-        classdef_hint: Option<crate::annotator::description::ClassDefKey>,
+        resolved_path: Option<crate::parse::CallPath>,
     },
     FunctionPath {
         segments: Vec<String>,
@@ -285,36 +277,13 @@ impl CallTarget {
         Self::Method {
             name: name.into(),
             receiver_root,
-            classdef_hint: None,
+            resolved_path: None,
         }
     }
 
-    /// Constructor that attaches the annotator's concrete-receiver
-    /// classdef decision to an already-built `CallTarget::Method`.
-    /// Used by the codewriter producer that consumes the dual-gate
-    /// `real_value_to_var` map; every other caller should go through
-    /// [`Self::method`] to keep `classdef_hint` at `None` until the
-    /// producer runs.
-    pub fn method_with_classdef_hint(
-        name: impl Into<String>,
-        receiver_root: Option<String>,
-        classdef_hint: crate::annotator::description::ClassDefKey,
-    ) -> Self {
-        Self::Method {
-            name: name.into(),
-            receiver_root,
-            classdef_hint: Some(classdef_hint),
-        }
-    }
-
-    /// Read the classdef hint if present. Callers must treat `None` as
-    /// "annotator did not supply a decision"; falling back to
-    /// `receiver_root` string is the pre-monomorphization
-    /// TODO: still living in
-    /// [`crate::call::CallControl::resolve_method`].
-    pub fn classdef_hint(&self) -> Option<crate::annotator::description::ClassDefKey> {
+    pub fn resolved_path(&self) -> Option<&crate::parse::CallPath> {
         match self {
-            CallTarget::Method { classdef_hint, .. } => *classdef_hint,
+            CallTarget::Method { resolved_path, .. } => resolved_path.as_ref(),
             _ => None,
         }
     }
@@ -5272,62 +5241,26 @@ mod tests {
     // transient ClassDefKey transport invariants.
 
     #[test]
-    fn call_target_method_default_classdef_hint_is_none() {
-        // Outside the codewriter producer pass, `classdef_hint` must be
-        // `None`. The public constructor is the stable entry point;
-        // callers using `CallTarget::method(...)` never observe a
-        // `Some(_)` hint until `stamp_classdef_hints_on_graph` runs.
+    fn call_target_method_default_resolved_path_is_none() {
         let t = CallTarget::method("foo", Some("Bar".to_string()));
-        assert_eq!(t.classdef_hint(), None);
+        assert_eq!(t.resolved_path(), None);
     }
 
     #[test]
-    fn call_target_method_with_classdef_hint_holds_and_exposes_hint() {
-        use crate::annotator::description::ClassDefKey;
-        let hint = ClassDefKey::from_raw(0x1234);
-        let t = CallTarget::method_with_classdef_hint("foo", Some("Bar".to_string()), hint);
-        assert_eq!(t.classdef_hint(), Some(hint));
-        match &t {
-            CallTarget::Method {
-                name,
-                receiver_root,
-                classdef_hint,
-            } => {
-                assert_eq!(name, "foo");
-                assert_eq!(receiver_root.as_deref(), Some("Bar"));
-                assert_eq!(*classdef_hint, Some(hint));
-            }
-            other => panic!("expected CallTarget::Method, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn call_target_method_classdef_hint_is_skipped_by_serde() {
-        // The hint must never reach serde surfaces. Serializing a
-        // `Some`-hint target and deserializing back must drop the hint
-        // to `None`; the producer rederives it post-rebuild from the
-        // annotator output.
-        use crate::annotator::description::ClassDefKey;
-        let hint = ClassDefKey::from_raw(0xDEAD);
-        let t = CallTarget::method_with_classdef_hint("foo", Some("Bar".to_string()), hint);
+    fn call_target_method_resolved_path_is_skipped_by_serde() {
+        use crate::parse::CallPath;
+        let path = CallPath::for_impl_method("PyFrame", "foo");
+        let t = CallTarget::Method {
+            name: "foo".into(),
+            receiver_root: Some("Bar".into()),
+            resolved_path: Some(path),
+        };
         let json = serde_json::to_string(&t).expect("encode");
         assert!(
-            !json.contains("classdef_hint"),
-            "serialized form leaks classdef_hint: {json}"
+            !json.contains("resolved_path"),
+            "serialized form leaks resolved_path: {json}"
         );
         let round_trip: CallTarget = serde_json::from_str(&json).expect("decode");
-        assert_eq!(round_trip.classdef_hint(), None);
-        match round_trip {
-            CallTarget::Method {
-                name,
-                receiver_root,
-                classdef_hint,
-            } => {
-                assert_eq!(name, "foo");
-                assert_eq!(receiver_root.as_deref(), Some("Bar"));
-                assert_eq!(classdef_hint, None);
-            }
-            other => panic!("expected CallTarget::Method, got {other:?}"),
-        }
+        assert_eq!(round_trip.resolved_path(), None);
     }
 }
