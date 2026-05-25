@@ -168,38 +168,67 @@ pub trait Cpu: Send + Sync {
     ///     self.protect_speculative_array(gcptr, self.gc_ll_descr.str_descr)
     /// ```
     ///
-    /// PyPy delegates to `protect_speculative_array` with the
-    /// `gc_ll_descr.str_descr` cached at backend init.  Pyre does not
-    /// carry a typed `str_descr` on the default backend, so under
-    /// `supports_guard_gc_type == true` this fails closed — backends
-    /// that wire a typed str layout (e.g. a future pyre-object STR
-    /// shim) must override to route through their own
-    /// `protect_speculative_array(gcptr, str_descr)`.  Under
-    /// `supports_guard_gc_type == false` the upstream
+    /// PyPy delegates to `protect_speculative_array` with
+    /// `gc_ll_descr.str_descr` cached at backend init.  Pyre routes
+    /// through the same delegate when a backend has registered its
+    /// string layout via `str_descr()`.  Backends without a typed
+    /// string descr (the trait default) fail closed under
+    /// `supports_guard_gc_type == true` — the upstream
     /// `protect_speculative_operation` gate already skips the
-    /// string/unicode branch (`mod.rs:5430` "we don't unroll in that
-    /// case" port), so only the null check is reachable here.
+    /// string/unicode branch when `supports_guard_gc_type == false`
+    /// (`mod.rs:5430` "we don't unroll in that case" port), so only
+    /// the null check is reachable in that mode.
     fn protect_speculative_string(&self, gcptr: GcRef) -> Result<(), ()> {
         if gcptr.is_null() {
             return Err(());
         }
-        if majit_gc::supports_guard_gc_type() {
-            return Err(());
+        if !majit_gc::supports_guard_gc_type() {
+            return Ok(());
         }
-        Ok(())
+        match self.str_descr() {
+            Some(d) => self.protect_speculative_array(gcptr, d),
+            None => Err(()),
+        }
     }
 
     /// `llmodel.py:580-581 protect_speculative_unicode`.  Mirror of
-    /// `protect_speculative_string` for unicode storage; same
-    /// fail-closed disposition.
+    /// `protect_speculative_string` for unicode storage; routes
+    /// through `unicode_descr()` when registered.
     fn protect_speculative_unicode(&self, gcptr: GcRef) -> Result<(), ()> {
         if gcptr.is_null() {
             return Err(());
         }
-        if majit_gc::supports_guard_gc_type() {
-            return Err(());
+        if !majit_gc::supports_guard_gc_type() {
+            return Ok(());
         }
-        Ok(())
+        match self.unicode_descr() {
+            Some(d) => self.protect_speculative_array(gcptr, d),
+            None => Err(()),
+        }
+    }
+
+    /// `llmodel.py:557 gc_ll_descr.str_descr` — the typed `ArrayDescr`
+    /// for the runtime string layout (basesize + length offset + char
+    /// item size + `STR` type id).  Cached on the gc_ll_descr at
+    /// backend init upstream; pyre exposes it on the `Cpu` trait so
+    /// pyre-side bootstrap can register the concrete string layout
+    /// (e.g. `W_StrObject` / `W_BytesObject`) once and route
+    /// `protect_speculative_string` through the same typed descr. The
+    /// default `bh_strlen` / `bh_strgetitem` also use this descr; backends
+    /// whose physical string storage is not inline can override those
+    /// helpers while still reusing the same speculative type check.
+    ///
+    /// Default returns `None` — backends without a typed string
+    /// layout opt out, and the four downstream helpers fall back to
+    /// their fail-closed / `None` shape.
+    fn str_descr(&self) -> Option<&dyn ArrayDescr> {
+        None
+    }
+
+    /// `llmodel.py:557 gc_ll_descr.unicode_descr` — mirror of
+    /// `str_descr()` for the unicode layout.  Default `None`.
+    fn unicode_descr(&self) -> Option<&dyn ArrayDescr> {
+        None
     }
 
     /// `model.py:209+ cpu.bh_arraylen_gc` /
@@ -218,48 +247,44 @@ pub trait Cpu: Send + Sync {
         Some(unsafe { *(addr as *const i64) })
     }
 
-    /// `model.py:209+ cpu.bh_strlen` / `llmodel.py:594-595` and the
-    /// rest of the str/unicode read family below.
-    ///
-    /// **Structural disposition** (not a PRE-EXISTING-ADAPTATION):
-    /// pyre's tracer does not emit STRLEN / STRGETITEM / UNICODELEN /
-    /// UNICODEGETITEM against concrete Python strings.  Python's `str`
-    /// runs as `W_StringObject` and the trace accesses its fields
-    /// through `GETFIELD_GC_*` on the wrapper struct.  The
-    /// STRLEN/STRGETITEM opcodes are reachable only through the
-    /// vstring virtual-string optimizer (`optimizeopt/vstring.rs`),
-    /// which folds them inside `VString` info before they ever reach
-    /// `execute_nonspec_const`.  The emit helpers at
-    /// `history.rs:4296-4307` exist for parity but have no production
-    /// caller in pyre (`rg history\.strlen pyre/` returns no matches
-    /// as of this commit).
-    ///
-    /// Returning `None` from the defaults is therefore the
-    /// structurally complete answer: any concrete-string fold attempt
-    /// would require a typed PyPy `STR` layout (basesize + chars
-    /// offset) that pyre does not carry.  Should pyre later expose a
-    /// typed string descr, a backend override can implement these
-    /// without changing the trait surface.
-    fn bh_strlen(&self, _string: GcRef) -> Option<i64> {
-        None
+    /// `model.py:209+ cpu.bh_strlen` /
+    /// `llmodel.py:594-595 read_int_at_mem(string, str_descr.lendescr.offset, WORD, 1)`.
+    /// Routes through `str_descr()` → `bh_arraylen_gc` so any backend
+    /// that registered a typed string layout reaches the same length
+    /// read as the rest of the array family.  Backends without a
+    /// registered `str_descr()` return `None`, declining the fold.
+    fn bh_strlen(&self, string: GcRef) -> Option<i64> {
+        let descr = self.str_descr()?;
+        self.bh_arraylen_gc(string, descr)
     }
 
-    /// See `bh_strlen` for the disposition note.
-    fn bh_unicodelen(&self, _unicode: GcRef) -> Option<i64> {
-        None
+    /// `llmodel.py:594-595` mirror for unicode.  Routes through
+    /// `unicode_descr()` → `bh_arraylen_gc`.
+    fn bh_unicodelen(&self, unicode: GcRef) -> Option<i64> {
+        let descr = self.unicode_descr()?;
+        self.bh_arraylen_gc(unicode, descr)
     }
 
     /// `model.py:209+ cpu.bh_strgetitem` /
     /// `llmodel.py:609-612 read_int_at_mem(string, basesize + index, 1, 0)`.
-    /// See `bh_strlen` for the disposition note.
-    fn bh_strgetitem(&self, _string: GcRef, _index: i64) -> Option<i64> {
-        None
+    /// Routes through `str_descr()` → `bh_getarrayitem_gc_i` so any
+    /// backend that registered a typed string layout reaches the same
+    /// per-character read as the rest of the array family.  Backends
+    /// whose physical char data is not in-line at `base + index *
+    /// item_size` (e.g. pyre's `W_StrObject`, whose chars sit behind a
+    /// `*mut String` indirection) must override.
+    fn bh_strgetitem(&self, string: GcRef, index: i64) -> Option<i64> {
+        let descr = self.str_descr()?;
+        self.bh_getarrayitem_gc_i(string, index, descr)
     }
 
-    /// `model.py:209+ cpu.bh_unicodegetitem`.  See `bh_strlen` for the
-    /// disposition note.
-    fn bh_unicodegetitem(&self, _unicode: GcRef, _index: i64) -> Option<i64> {
-        None
+    /// `llmodel.py:609-612` mirror for unicode.  Routes through
+    /// `unicode_descr()` → `bh_getarrayitem_gc_i`.  Same override
+    /// requirement as `bh_strgetitem` for indirected char-data
+    /// layouts.
+    fn bh_unicodegetitem(&self, unicode: GcRef, index: i64) -> Option<i64> {
+        let descr = self.unicode_descr()?;
+        self.bh_getarrayitem_gc_i(unicode, index, descr)
     }
 
     /// `model.py:209+ cpu.bh_getarrayitem_gc_i` /

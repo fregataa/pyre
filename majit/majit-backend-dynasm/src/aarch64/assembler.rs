@@ -2151,13 +2151,22 @@ impl<'a> AssemblerARM64<'a> {
             OpCode::SameAsI
             | OpCode::SameAsR
             | OpCode::SameAsF
-            | OpCode::CastPtrToInt
-            | OpCode::CastIntToPtr
             | OpCode::CastOpaquePtr
             | OpCode::LoadFromGcTable
             | OpCode::VirtualRefR
             | OpCode::ConvertFloatBytesToLonglong
             | OpCode::ConvertLonglongBytesToFloat => {
+                if let (Some(src), Some(dst)) = (arglocs.first(), result_loc) {
+                    self.regalloc_mov(src, dst);
+                }
+            }
+            // `opassembler.py:269-270 emit_op_cast_ptr_to_int =
+            // _genop_same_as` / `emit_op_cast_int_to_ptr = _genop_same_as`.
+            // PyPy's aarch64 backend treats both casts as plain `mov` —
+            // the AddressAsInt low-bit tag is a `blackhole.py:603-610`
+            // interpreter-side invariant, not a backend codegen step.
+            // See x86 sibling for the full rationale.
+            OpCode::CastPtrToInt | OpCode::CastIntToPtr => {
                 if let (Some(src), Some(dst)) = (arglocs.first(), result_loc) {
                     self.regalloc_mov(src, dst);
                 }

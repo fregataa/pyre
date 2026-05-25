@@ -854,14 +854,25 @@ impl Optimization for OptPure {
         // Handle the postponed OVF op when we see GUARD_NO_OVERFLOW.
         if let Some(mut postponed) = self.postponed_op.take() {
             if op.opcode == OpCode::GuardNoOverflow {
-                // pure.py:122-128 — same constant_fold(op) call as the
-                // non-OVF branch. `execute_binary_int_const` skips the
-                // fold via checked_* when the OVF op would overflow, so
-                // the guard is preserved naturally in that case.
-                if let Some(Value::Int(folded)) = ctx.constant_fold(&postponed) {
-                    ctx.find_or_record_constant_int(postponed.pos.get(), folded);
-                    self.last_emitted_was_removed = true;
-                    return OptimizationResult::Remove; // guard also removed
+                // pure.py:126-136 — only call `constant_fold` when every
+                // arg has resolved to a `Const*` via `get_constant_box`
+                // (the `for...else:` gate).  Without this pre-check,
+                // `constant_fold` would panic on the now-strict
+                // `expect("arg must be Const")` since postponed OVF
+                // ops can have non-const args (e.g. `IntMulOvf(p, 1)`
+                // where p is an inputarg).
+                let all_args_const = (0..postponed.num_args()).all(|i| {
+                    ctx.get_box_replacement_box(postponed.arg(i))
+                        .as_ref()
+                        .and_then(|b| ctx.get_constant_box(b))
+                        .is_some()
+                });
+                if all_args_const {
+                    if let Some(Value::Int(folded)) = ctx.constant_fold(&postponed) {
+                        ctx.find_or_record_constant_int(postponed.pos.get(), folded);
+                        self.last_emitted_was_removed = true;
+                        return OptimizationResult::Remove; // guard also removed
+                    }
                 }
 
                 // pure.py:50-55: force_preamble_op replaces the OVF op
@@ -965,11 +976,12 @@ impl Optimization for OptPure {
         }
 
         if op.opcode.is_always_pure() {
-            // pure.py:121-128:
+            // pure.py:121-136:
             //     for i in range(op.numargs()):
             //         if self.get_constant_box(op.getarg(i)) is None:
             //             break
             //     else:
+            //         # all constant arguments: constant-fold away
             //         resbox = self.optimizer.constant_fold(op)
             //         self.optimizer.make_constant(op, resbox)
             //         return
@@ -980,6 +992,38 @@ impl Optimization for OptPure {
                     .is_some()
             });
             if all_args_const {
+                // Upstream `pure.py:130-136 for...else:` calls
+                // `optimizer.constant_fold(op)` unconditionally and
+                // feeds the result straight into `make_constant`.
+                // Pyre's `constant_fold` now narrows to two
+                // documented `None` paths only:
+                //   1. `protect_speculative_operation`'s
+                //      `supports_guard_gc_type == false` gate on
+                //      memory-reading folds (mod.rs).  Upstream's
+                //      comment at `optimizer.py:822-825` skips
+                //      unrolling in that mode; pyre's
+                //      `constant_fold` runs outside unroll too, so
+                //      the fold itself must decline.
+                //   2. Helper-internal narrow skips on `IntAddOvf` /
+                //      `IntSubOvf` / `IntMulOvf` overflow, shift
+                //      count outside `0..64`, `IntFloorDiv` /
+                //      `IntMod` divide-by-zero, and CAST_FLOAT_TO_INT
+                //      non-finite (`execute_binary_int_const` /
+                //      `execute_cast_const` return `Ok(None)`).
+                //      Upstream `do_int_add_ovf` would `assert
+                //      metainterp is not None` on overflow with
+                //      `metainterp=None` (executor.py:287); pyre
+                //      prefers the softer skip so the op stays in
+                //      the trace and the runtime guard fires.
+                // Every caller-invariant violation (missing box,
+                // descr, wrong Value variant) now panics inside
+                // `constant_fold` / `protect_speculative_operation`,
+                // matching upstream's `AttributeError`.  Genuine
+                // SpeculativeError paths panic via
+                // `panic_any(SpeculativeError)` and are caught at
+                // `optimize_peeled_loop` /
+                // `optimize_with_constants_and_inputs_at` per
+                // `unroll.py:119-123`.
                 if let Some(folded_value) = ctx.constant_fold(op) {
                     ctx.make_constant(op.pos.get(), folded_value);
                     self.last_emitted_was_removed = true;
@@ -2129,20 +2173,22 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "must be a gcref")]
     fn test_constant_fold_getfield_gc_pure_does_not_treat_int_constant_as_gc_pointer() {
+        // Upstream `optimizer.py:829-832 protect_speculative_operation`
+        // derefs `op.getarg(0)` via `getref_base()` — only `ConstPtr`
+        // supports that.  RPython's type system makes a `GETFIELD_GC_
+        // PURE_I` with `ConstInt` arg0 unconstructible.  Pyre's
+        // strict-orthodoxy port panics on the variant mismatch instead
+        // of returning `None`; this test pins that behavior.
         let descr = make_field_descr_full(4, 0, 8, Type::Int, true);
         let mut op = Op::with_descr(OpCode::GetfieldGcPureI, &[OpRef::int_op(10)], descr);
         op.pos.set(OpRef::int_op(0));
 
-        let mut pass = OptPure::new();
         let mut ctx = OptContext::with_num_inputs(4, 0);
         ctx.make_constant(OpRef::int_op(10), Value::Int(2));
-        pass.setup();
 
-        assert_eq!(ctx.constant_fold(&op), None);
-        let result = pass.propagate_forward(&op, &mut ctx);
-        assert!(matches!(result, OptimizationResult::PassOn));
-        assert_eq!(ctx.get_constant(OpRef::int_op(0)), None);
+        let _ = ctx.constant_fold(&op);
     }
 
     #[test]

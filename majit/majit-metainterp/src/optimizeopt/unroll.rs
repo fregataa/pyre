@@ -27,6 +27,39 @@ use crate::optimizeopt::{
 };
 use crate::resume::SnapshotBox;
 
+/// `unroll.py:119-123`:
+///
+/// ```python
+/// try:
+///     info, _ = self.propagate_all_forward(trace, call_pure_results, flush=False)
+/// except SpeculativeError:
+///     raise InvalidLoop("Speculative heap access would be ill-typed")
+/// ```
+///
+/// Catch a `SpeculativeError` panic raised by
+/// `OptContext::protect_speculative_operation` and rethrow it as an
+/// `InvalidLoop` — the existing catch_unwind sites at the pyjitpl
+/// layer already convert that into a "skip retrace" outcome.
+fn with_speculative_to_invalid_loop<R, F>(f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(value) => value,
+        Err(payload) => {
+            if payload
+                .downcast_ref::<crate::optimize::SpeculativeError>()
+                .is_some()
+            {
+                std::panic::panic_any(crate::optimize::InvalidLoop(
+                    "Speculative heap access would be ill-typed",
+                ));
+            }
+            std::panic::resume_unwind(payload);
+        }
+    }
+}
+
 fn is_trace_constant_ref(
     opref: OpRef,
     constants: &majit_ir::VecAssoc<u32, majit_ir::Value>,
@@ -195,22 +228,32 @@ impl UnrollOptimizer {
         }
     }
 
-    /// unroll.py: optimize_preamble(trace, runtime_boxes)
     /// Optimize the preamble (first iteration) of a loop trace.
     /// Returns the optimized preamble ops + the peeled loop ops.
+    ///
+    /// Upstream `unroll.py:100-110 optimize_preamble` has no
+    /// SpeculativeError catch — by construction the preamble's
+    /// gcrefs are concrete runtime values from the recorded
+    /// interpreter, so `cpu.protect_speculative_*` always passes.
+    /// A SpeculativeError here indicates a genuine bug (concrete
+    /// gcref failed type validation) and should propagate.
     pub fn optimize_preamble(&mut self, ops: &[Op]) -> Vec<Op> {
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::default_pipeline();
         optimizer.add_pass(Box::new(OptUnroll::new()));
         optimizer.propagate_all_forward(ops)
     }
 
-    /// unroll.py: optimize_peeled_loop(trace)
-    /// Optimize the loop body AFTER preamble peeling.
-    /// The peeled preamble has already established the type/class/bounds
-    /// information; this method optimizes the repeating body.
+    /// unroll.py:112-123 `optimize_peeled_loop(trace)`
+    /// Optimize the loop body AFTER preamble peeling.  The peeled
+    /// preamble has already established the type/class/bounds
+    /// information; this method optimizes the repeating body, with
+    /// speculative imports that may fail type validation —
+    /// `unroll.py:119-123 except SpeculativeError: raise InvalidLoop`.
     pub fn optimize_peeled_loop(&mut self, ops: &[Op]) -> Vec<Op> {
-        let mut optimizer = crate::optimizeopt::optimizer::Optimizer::default_pipeline();
-        optimizer.propagate_all_forward(ops)
+        with_speculative_to_invalid_loop(|| {
+            let mut optimizer = crate::optimizeopt::optimizer::Optimizer::default_pipeline();
+            optimizer.propagate_all_forward(ops)
+        })
     }
 
     /// unroll.py:238-242: jump_to_preamble(cell_token, jump_op).
@@ -442,6 +485,12 @@ impl UnrollOptimizer {
                 // (`history.py:220` ConstInt(value) per-call-site parity).
                 // opt_p1's entry path seeds `const_pool` from the shared
                 // `constants` map (`optimizer.rs:1944`).
+                // unroll.py:100-110 `optimize_preamble` has no
+                // SpeculativeError catch — Phase 1 corresponds to the
+                // preamble, whose gcrefs are concrete runtime values
+                // from the recorded interpreter and never raise
+                // SpeculativeError under correct construction.  A raise
+                // here is a real bug and must propagate.
                 let p1_ops = opt_p1.optimize_with_constants_and_inputs(
                     &p1_ops_in,
                     &mut consts_p1,
@@ -822,14 +871,19 @@ impl UnrollOptimizer {
         //
         // Const BoxRefs: see opt_p1 plumb above — fresh per-call from
         // `const_pool` via `BoxRef::new_const(value)`, no dedup.
-        let p2_ops = opt_p2.optimize_with_constants_and_inputs_at(
-            &p2_ops_in,
-            &mut consts_p2,
-            body_num_inputs,
-            phase2_inputarg_base, // inputarg_base — Phase 2 inputargs at [phase2_inputarg_base..)
-            p2_high_water,
-            iter.box_pool.clone(),
-        );
+        // unroll.py:119-123 — Phase 2 (peeled loop) raises
+        // SpeculativeError on speculative-fold paths; convert
+        // to InvalidLoop so the caller's catch handles it.
+        let p2_ops = with_speculative_to_invalid_loop(|| {
+            opt_p2.optimize_with_constants_and_inputs_at(
+                &p2_ops_in,
+                &mut consts_p2,
+                body_num_inputs,
+                phase2_inputarg_base, // inputarg_base — Phase 2 inputargs at [phase2_inputarg_base..)
+                p2_high_water,
+                iter.box_pool.clone(),
+            )
+        });
         // RPython optimizer.py:614-625 freezes op arguments during
         // `_emit_operation`; optimizer.py:598-612 may then install a Const
         // forwarding on the result, but it never retroactively rewrites the

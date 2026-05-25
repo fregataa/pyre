@@ -299,15 +299,18 @@ pub(crate) fn execute_one(
             OpResult::Value(f64::to_bits(a * b) as i64)
         }
         OpCode::FloatTrueDiv => {
-            // blackhole.py:714-718 `bhimpl_float_truediv = a / b` raises
-            // Python `ZeroDivisionError` when `b == 0.0`.  Rust IEEE
-            // division returns `inf` / `nan` instead.  Without a
-            // ZeroDivisionError class-pointer slot on `ExceptionState`
-            // the runtime cannot signal the exception, so the IEEE
-            // result is the structural adaptation (matching the same
-            // policy as runtime CastFloatToInt at executor.rs:313+).
-            // The constant-fold guard at `execute_binary_float_const`
-            // declines fold on `b == 0.0` so the trace emits the op.
+            // `blackhole.py:714-718 bhimpl_float_truediv = a / b`: after
+            // RPython translation `a / b` is plain C IEEE-754 division,
+            // returning `inf` / `nan` on `b == 0.0` with no exception
+            // raised at the JIT layer.  Python-level `ZeroDivisionError`
+            // is raised by `floatobject.py descr_truediv` *above* the
+            // JIT.  Rust's `/` on `f64` matches the same IEEE semantics,
+            // so this is structural parity, not an adaptation.
+            //
+            // `execute_binary_float_const` still declines to fold on
+            // `b == 0.0` so the trace emits the op for runtime handling
+            // (preserving the IEEE result path through the recorded
+            // operation rather than freezing a constant).
             let (a, b) = float_binop(values, op);
             OpResult::Value(f64::to_bits(a / b) as i64)
         }
@@ -320,20 +323,17 @@ pub(crate) fn execute_one(
             OpResult::Value(f64::to_bits(a.abs()) as i64)
         }
         OpCode::CastFloatToInt => {
-            // blackhole.py:800-808 `bhimpl_cast_float_to_int = int(int(a))`
-            // raises Python `OverflowError` on ±Inf / out-of-range and
-            // `ValueError` on NaN.  Rust's `as i64` saturates to the
-            // i64 bound for non-finite inputs.  The constant-fold gate
-            // at `execute_cast_const` (executor.rs:1634-1649) skips
-            // fold for those values so the trace still emits the op;
-            // here at runtime, with no `OverflowError`/`ValueError`
-            // class-pointer infrastructure on `ExceptionState`, the
-            // saturating cast is the structural adaptation matching
-            // the rest of the runtime's lenient-IEEE policy
-            // (FLOAT_TRUEDIV by zero yields `inf`/`nan` rather than
-            // `ZeroDivisionError`).  Documented as PRE-EXISTING-
-            // ADAPTATION pending an OverflowError class-pointer slot
-            // on `ExceptionState`.
+            // `blackhole.py:800-808 bhimpl_cast_float_to_int = int(int(a))`
+            // post-translation lowers to `lltype.cast_float_to_int` which
+            // is a plain C `(long)f` — implementation-defined / UB on
+            // non-finite, no Python exception raised at the JIT layer.
+            // Python-level `OverflowError` / `ValueError` come from
+            // `floatobject.py descr_int` *above* the JIT.  Rust's
+            // `as i64` saturates on non-finite, matching the lenient
+            // IEEE-cast policy already in `FloatTrueDiv` above.
+            //
+            // `execute_cast_const` declines to fold on non-finite so the
+            // trace emits the op for runtime handling.
             let a = float_unop(values, op);
             OpResult::Value(a as i64)
         }
@@ -783,49 +783,20 @@ pub(crate) fn execute_one(
             let (a, b) = binop(values, op);
             OpResult::Value((a != b) as i64)
         }
-        OpCode::CastPtrToInt => {
-            // blackhole.py:603-606 `bhimpl_cast_ptr_to_int`:
-            //     i = lltype.cast_ptr_to_int(a)
-            //     ll_assert((i & 1) == 1, "...not an odd int")
-            //
-            // **Structural divergence**, *not* a missed adaptation.
-            // PyPy enforces the AddressAsInt low-bit tag at THREE
-            // layers simultaneously — `lltype.cast_ptr_to_int` tags
-            // the int, JIT backend codegen emits machine code that
-            // tags during PTR→INT moves, and `lltype.cast_int_to_ptr`
-            // untags + asserts.  The optimizer also relies on
-            // `CastPtrToInt(p) ↔ CastIntToPtr(i)` being a free
-            // inverse pair (`rewrite.py:807-813`, mirrored at
-            // `optimizeopt/rewrite.rs:3078-3083`).
-            //
-            // Pyre's `GcRef(usize)` is a raw aligned pointer with no
-            // tag.  Applying `i | 1` here in the blackhole replay
-            // would diverge from the JIT-emitted machine code (which
-            // currently does a raw register copy for this opcode),
-            // and would break the optimizer's `CastPtrToInt ↔
-            // CastIntToPtr` inverse-pair registration because re-
-            // application of `| 1` is no longer idempotent.
-            //
-            // Bringing the assert in is therefore a multi-session
-            // epic: `GcRef` encoding rework (tag-on-construct), every
-            // backend's PTR↔INT codegen (`majit-backend-dynasm`,
-            // `majit-backend-cranelift`), blackhole handler_*
-            // (`blackhole.rs:8279-8294`), and the inverse-pair
-            // optimizer's tag-aware comparison.  Until those land
-            // together the trio (runtime + fold + blackhole) is
-            // intentionally raw-aligned, matching pyre's internal
-            // invariant rather than PyPy's.
+        // `assembler.py:1528-1529 genop_cast_ptr_to_int =
+        // _genop_same_as` / `genop_cast_int_to_ptr = _genop_same_as`.
+        // PyPy backends, executor, and test_lltype.py:693-701 /
+        // runner_test.py:1957-1966 all treat the casts as raw identity.
+        // The blackhole.py:603-610 `ll_assert` is a diagnostic check,
+        // not a transformation — the value passes through unchanged.
+        OpCode::CastPtrToInt | OpCode::CastIntToPtr => {
             let a = unop(values, op);
             OpResult::Value(a)
         }
-        OpCode::CastIntToPtr | OpCode::CastOpaquePtr => {
-            // blackhole.py:608-611 `bhimpl_cast_int_to_ptr` — same
-            // AddressAsInt invariant as cast_ptr_to_int above.  See
-            // the structural-divergence note on `CastPtrToInt`; the
-            // `(i & 1) == 1` assert cannot be added in isolation
-            // without breaking the optimizer's free-inverse pair
-            // (`optimizeopt/rewrite.rs:3082-3083`) and the JIT-emitted
-            // codegen for the opcode.
+        OpCode::CastOpaquePtr => {
+            // `bhimpl_cast_opaque_ptr` is an lltype-level ptr→ptr
+            // identity (no AddressAsInt encoding involved); pass
+            // through unchanged.
             let a = unop(values, op);
             OpResult::Value(a)
         }
@@ -1506,10 +1477,12 @@ pub fn execute_unary_float_const(opcode: OpCode, a: f64) -> Option<f64> {
 /// executor.py:495-498 binary-float row. Float arithmetic + comparisons
 /// (comparisons return bool wrapped as 0/1 in the caller). Mirrors
 /// blackhole.py bhimpl_float_add/_sub/_mul/_truediv (`:697-718`).
-/// FLOAT_TRUEDIV with `b == 0.0` is NOT folded — Python/RPython `a / b`
-/// raises ZeroDivisionError at runtime, and silently folding to ±inf/NaN
-/// would erase that exception path. The runtime executor still performs
-/// `a / b` per `blackhole.py:717`; only trace-time folding is suppressed.
+/// FLOAT_TRUEDIV with `b == 0.0` is NOT folded — see upstream
+/// `test_optimizebasic.test_float_division_by_multiplication` which
+/// preserves `float_truediv(f, 0.0)` in the optimized loop rather than
+/// freezing the IEEE inf/nan constant. The runtime executor still
+/// performs `a / b` per `blackhole.py:717` (translated C semantics);
+/// only trace-time folding is suppressed.
 pub fn execute_binary_float_const(opcode: OpCode, a: f64, b: f64) -> Option<f64> {
     let result = match opcode {
         OpCode::FloatAdd => a + b,
@@ -1536,6 +1509,21 @@ pub fn execute_float_compare_const(opcode: OpCode, a: f64, b: f64) -> Option<i64
     Some(result as i64)
 }
 
+/// `executor.py:555 execute_nonspec_const` delegates to `_execute_arglist`,
+/// which raises `NotImplementedError` at `:610` when no helper is registered
+/// for the opnum. RPython's `optimizer.py:810 constant_fold` does not catch
+/// that exception; it propagates to the caller. Pyre encodes the same
+/// dispatch distinction at the type level:
+///   * `Err(NotImplemented)` — no helper claimed the opnum (terminal
+///     fall-through below), mirroring the upstream raise.
+///   * `Ok(None)` — a helper claimed the opnum but declined to fold
+///     (null gcref, unsupported field size, etc.); pyre keeps these
+///     as `Ok(None)` so the caller can still see "helper ran, fold
+///     skipped" distinctly from "no helper".
+///   * `Ok(Some(value))` — successful fold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NotImplemented;
+
 /// executor.py:555 `execute_nonspec_const` free function — the
 /// generic opnum dispatch invoked by `optimizer.py:810 constant_fold`
 /// once every arg has been resolved to a `Const*` via
@@ -1554,15 +1542,9 @@ pub fn execute_float_compare_const(opcode: OpCode, a: f64, b: f64) -> Option<i64
 /// `_execute_arglist` (executor.py:563-610) selects
 /// `EXECUTE_BY_NUM_ARGS[arity, withdescr][opnum]` and raises
 /// `NotImplementedError` (`:610`) only when no function is registered
-/// for the opnum. *Helper-level* failures — wrapping vs OVF
-/// mismatches, divide-by-zero, NaN-cast, invalid shift counts — are
-/// not panics in PyPy: they either compute the wrapping result
-/// (`bhimpl_int_add`'s `intmask(a + b)`), follow the exception path
-/// (FLOAT_TRUEDIV `b == 0.0`, CAST_FLOAT_TO_INT NaN), or
-/// AssertionError under `metainterp=None` (OVF). Pyre keeps the
-/// softer skip — return `None` so `pure.rs` re-emits the op — which
-/// stays line-by-line aligned with the runtime path RPython would
-/// take when the constant-fold prediction is unsafe.
+/// for the opnum. Pyre returns [`Err(NotImplemented)`](NotImplemented)
+/// for that case and `Ok(None)` for helper-internal "decline to fold"
+/// outcomes (e.g. null gcref, unsupported field size).
 ///
 /// `_type` is accepted for signature parity with RPython's `type`
 /// parameter; it is not consulted because the Value variant in
@@ -1574,7 +1556,7 @@ pub fn execute_nonspec_const(
     argboxes: &[majit_ir::Value],
     descr: Option<&majit_ir::descr::DescrRef>,
     _type: majit_ir::Type,
-) -> Option<majit_ir::Value> {
+) -> Result<Option<majit_ir::Value>, NotImplemented> {
     use majit_ir::Value;
     let arity = argboxes.len();
 
@@ -1584,69 +1566,82 @@ pub fn execute_nonspec_const(
         // executor.py:314-321 `do_same_as_i/r/f` — identity fold for
         // SAME_AS_I/R/F (`bhimpl_int_same_as` etc., `blackhole.py:455`).
         match opnum {
-            OpCode::SameAsI | OpCode::SameAsR | OpCode::SameAsF => return Some(a),
+            OpCode::SameAsI | OpCode::SameAsR | OpCode::SameAsF => return Ok(Some(a)),
             _ => {}
         }
         if let Value::Int(i) = a {
             if let Some(folded) = execute_unary_int_const(opnum, i) {
-                return Some(Value::Int(folded));
+                return Ok(Some(Value::Int(folded)));
             }
         }
         if let Value::Float(f) = a {
             if let Some(folded) = execute_unary_float_const(opnum, f) {
-                return Some(Value::Float(folded));
+                return Ok(Some(Value::Float(folded)));
             }
         }
         if let Some(folded) = execute_cast_const(opnum, a) {
-            return Some(folded);
+            return Ok(Some(folded));
         }
         // GETFIELD_GC_PURE_I/R/F — withdescr arity-1.
+        // `optimizer.py:829-832 protect_speculative_operation` has
+        // validated the gcref is non-null and of a valid type for
+        // `fielddescr.parent_descr` (`llmodel.py:555-567`); the
+        // dereference below cannot fault.  Unsupported field_size is
+        // `llmodel.py:478 read_int_at_mem`'s NotImplementedError and
+        // would propagate to crash upstream — pyre matches via
+        // fail-loud `unreachable!()`.
         if let (Value::Ref(struct_ref), Some(d)) = (a, descr) {
             if let Some(fd) = d.as_field_descr() {
-                if struct_ref.is_null() {
-                    return None;
-                }
-                return match opnum {
-                    OpCode::GetfieldGcPureI => {
-                        // llmodel.py:467-478 read_int_at_mem only handles
-                        // sizes in `unroll_basic_sizes`; unknown sizes
-                        // raise NotImplementedError. Pre-filter so the
-                        // fold skips instead of relying on the trait impl
-                        // to recover a sentinel.
-                        match fd.field_size() {
-                            1 | 2 | 4 | 8 => {
-                                Some(Value::Int(cpu.bh_getfield_gc_i(struct_ref.0, fd)))
-                            }
-                            _ => None,
-                        }
-                    }
-                    OpCode::GetfieldGcPureR => {
-                        Some(Value::Ref(cpu.bh_getfield_gc_r(struct_ref.0, fd)))
-                    }
-                    OpCode::GetfieldGcPureF => {
-                        Some(Value::Float(cpu.bh_getfield_gc_f(struct_ref.0, fd)))
-                    }
-                    _ => None,
-                };
+                return Ok(Some(match opnum {
+                    OpCode::GetfieldGcPureI => match fd.field_size() {
+                        1 | 2 | 4 | 8 => Value::Int(cpu.bh_getfield_gc_i(struct_ref.0, fd)),
+                        sz => unreachable!(
+                            "GETFIELD_GC_PURE_I: unsupported field_size {} \
+                             (llmodel.py:478 raises NotImplementedError)",
+                            sz
+                        ),
+                    },
+                    OpCode::GetfieldGcPureR => Value::Ref(cpu.bh_getfield_gc_r(struct_ref.0, fd)),
+                    OpCode::GetfieldGcPureF => Value::Float(cpu.bh_getfield_gc_f(struct_ref.0, fd)),
+                    _ => return Err(NotImplemented),
+                }));
             }
         }
         // ARRAYLEN_GC — withdescr arity-1.
         // `executor.py:do_arraylen_gc` → `cpu.bh_arraylen_gc(array, ad)`.
+        // `protect_speculative_array` validated the gcref + tid; the
+        // arraydescr is expected to carry a `len_descr` (registered
+        // by the backend's array metadata), so a missing one is a
+        // bug — fail-loud per `llmodel.py:585 assert isinstance(...)`.
         if let (Value::Ref(array), Some(d)) = (a, descr) {
             if let Some(ad) = d.as_array_descr() {
                 if opnum == OpCode::ArraylenGc {
-                    return cpu.bh_arraylen_gc(array, ad).map(Value::Int);
+                    let len = cpu.bh_arraylen_gc(array, ad).expect(
+                        "ARRAYLEN_GC: arraydescr missing len_descr (llmodel.py:585 asserts)",
+                    );
+                    return Ok(Some(Value::Int(len)));
                 }
             }
         }
-        // STRLEN / UNICODELEN — pyre's default Cpu has no fold-time
-        // str/unicode layout, so `bh_strlen / bh_unicodelen` return
-        // `None` and the fold declines.  Backends that wire a typed
-        // string layout can override the trait methods to enable fold.
+        // STRLEN / UNICODELEN — by the time the fold is entered,
+        // `protect_speculative_string / _unicode` has already validated
+        // `str_descr / unicode_descr` is registered (under
+        // `supports_guard_gc_type == true`; the false case is gated
+        // out at `OptContext::protect_speculative_operation`).
         if let Value::Ref(s) = a {
             match opnum {
-                OpCode::Strlen => return cpu.bh_strlen(s).map(Value::Int),
-                OpCode::Unicodelen => return cpu.bh_unicodelen(s).map(Value::Int),
+                OpCode::Strlen => {
+                    let len = cpu
+                        .bh_strlen(s)
+                        .expect("STRLEN: str_descr unregistered after protect_speculative_string");
+                    return Ok(Some(Value::Int(len)));
+                }
+                OpCode::Unicodelen => {
+                    let len = cpu.bh_unicodelen(s).expect(
+                        "UNICODELEN: unicode_descr unregistered after protect_speculative_unicode",
+                    );
+                    return Ok(Some(Value::Int(len)));
+                }
                 _ => {}
             }
         }
@@ -1656,50 +1651,66 @@ pub fn execute_nonspec_const(
     if arity == 2 {
         if let (Value::Int(a), Value::Int(b)) = (argboxes[0], argboxes[1]) {
             if let Some(folded) = execute_binary_int_const(opnum, a, b) {
-                return Some(Value::Int(folded));
+                return Ok(Some(Value::Int(folded)));
             }
         }
         if let (Value::Float(a), Value::Float(b)) = (argboxes[0], argboxes[1]) {
             if let Some(folded) = execute_binary_float_const(opnum, a, b) {
-                return Some(Value::Float(folded));
+                return Ok(Some(Value::Float(folded)));
             }
             if let Some(folded) = execute_float_compare_const(opnum, a, b) {
-                return Some(Value::Int(folded));
+                return Ok(Some(Value::Int(folded)));
             }
         }
         if let (Value::Ref(a), Value::Ref(b)) = (argboxes[0], argboxes[1]) {
             if let Some(folded) = execute_ptr_compare_const(opnum, a.0, b.0) {
-                return Some(Value::Int(folded));
+                return Ok(Some(Value::Int(folded)));
             }
         }
         // GETARRAYITEM_GC_PURE_I/R/F — withdescr arity-2 (array, index).
         // `executor.py:do_getarrayitem_gc_pure_*` →
         //   `cpu.bh_getarrayitem_gc_*(array, index, ad)`.
+        // `protect_speculative_array` + the array-bounds check at
+        // `optimizer.py:865-867` validated the gcref/index pre-fold;
+        // unsupported `item_size` matches `llmodel.py:478`'s
+        // NotImplementedError, fail-loud via `unreachable!()`.
         if let (Value::Ref(array), Value::Int(index), Some(d)) = (argboxes[0], argboxes[1], descr) {
             if let Some(ad) = d.as_array_descr() {
-                return match opnum {
+                return Ok(Some(match opnum {
                     OpCode::GetarrayitemGcPureI => {
-                        cpu.bh_getarrayitem_gc_i(array, index, ad).map(Value::Int)
+                        let v = cpu.bh_getarrayitem_gc_i(array, index, ad).expect(
+                            "GETARRAYITEM_GC_PURE_I: unsupported item_size \
+                             (llmodel.py:478 raises NotImplementedError)",
+                        );
+                        Value::Int(v)
                     }
-                    OpCode::GetarrayitemGcPureR => Some(majit_ir::Value::Ref(
-                        cpu.bh_getarrayitem_gc_r(array, index, ad),
-                    )),
-                    OpCode::GetarrayitemGcPureF => Some(majit_ir::Value::Float(
-                        cpu.bh_getarrayitem_gc_f(array, index, ad),
-                    )),
-                    _ => None,
-                };
+                    OpCode::GetarrayitemGcPureR => {
+                        Value::Ref(cpu.bh_getarrayitem_gc_r(array, index, ad))
+                    }
+                    OpCode::GetarrayitemGcPureF => {
+                        Value::Float(cpu.bh_getarrayitem_gc_f(array, index, ad))
+                    }
+                    _ => return Err(NotImplemented),
+                }));
             }
         }
-        // STRGETITEM / UNICODEGETITEM — pyre's default Cpu has no
-        // fold-time str/unicode layout, so `bh_strgetitem /
-        // bh_unicodegetitem` return `None` and the fold declines.
-        // Backends that wire a typed string layout can override the
-        // trait methods to enable fold here.
+        // STRGETITEM / UNICODEGETITEM — protect_speculative_string /
+        // _unicode has validated str_descr / unicode_descr is
+        // registered (under `supports_guard_gc_type == true`).
         if let (Value::Ref(s), Value::Int(index)) = (argboxes[0], argboxes[1]) {
             match opnum {
-                OpCode::Strgetitem => return cpu.bh_strgetitem(s, index).map(Value::Int),
-                OpCode::Unicodegetitem => return cpu.bh_unicodegetitem(s, index).map(Value::Int),
+                OpCode::Strgetitem => {
+                    let v = cpu.bh_strgetitem(s, index).expect(
+                        "STRGETITEM: str_descr unregistered after protect_speculative_string",
+                    );
+                    return Ok(Some(Value::Int(v)));
+                }
+                OpCode::Unicodegetitem => {
+                    let v = cpu.bh_unicodegetitem(s, index).expect(
+                        "UNICODEGETITEM: unicode_descr unregistered after protect_speculative_unicode",
+                    );
+                    return Ok(Some(Value::Int(v)));
+                }
                 _ => {}
             }
         }
@@ -1713,25 +1724,16 @@ pub fn execute_nonspec_const(
             (argboxes[0], argboxes[1], argboxes[2])
         {
             if opnum == OpCode::IntBetween {
-                return Some(Value::Int((a <= b && b < c) as i64));
+                return Ok(Some(Value::Int((a <= b && b < c) as i64)));
             }
         }
     }
 
-    // executor.py:610 `raise NotImplementedError` only fires for opnums
-    // with no EXECUTE_BY_NUM_ARGS entry.  Every always-pure op in PyPy
-    // has an entry; pyre's helpers fan out into the dedicated
-    // execute_*_const helpers above plus the `cpu.bh_*` reads for
-    // GETFIELD_GC_PURE_*, GETARRAYITEM_GC_PURE_*, ARRAYLEN_GC.  The
-    // remaining always-pure opcodes (STRGETITEM, UNICODEGETITEM,
-    // LOAD_FROM_GC_TABLE, LOAD_EFFECTIVE_ADDRESS) require runtime layout
-    // infrastructure pyre does not yet expose — they fall through
-    // unfolded.  Helpers also return `None` on safety-guard skips
-    // (OVF overflow, FLOAT_TRUEDIV by zero, CAST_FLOAT_TO_INT
-    // non-finite, invalid shift counts, out-of-range array index).
-    // The caller (`OptContext::constant_fold` → `pure.rs:1002`) treats
-    // `None` as "do not fold" and emits the op verbatim.
-    None
+    // `executor.py:610 _execute_arglist` raises `NotImplementedError`
+    // when `EXECUTE_BY_NUM_ARGS[arity, withdescr][opnum]` is None.
+    // RPython's `optimizer.py:810 constant_fold` lets that propagate; Pyre
+    // encodes the same missing-helper signal via [`NotImplemented`].
+    Err(NotImplemented)
 }
 
 /// executor.py cross-type cast fold:
@@ -1746,13 +1748,16 @@ pub fn execute_cast_const(opcode: OpCode, arg: majit_ir::Value) -> Option<majit_
     use majit_ir::{GcRef, Value};
     match (opcode, arg) {
         (OpCode::CastFloatToInt, Value::Float(f)) => {
-            // blackhole.py:800-808 `bhimpl_cast_float_to_int = int(int(a))`.
-            // Python `int(f)` raises OverflowError on ±Inf, ValueError on
-            // NaN, and OverflowError on values outside the C long range
-            // (untranslated). Skip fold in those cases — emit the cast op
-            // so runtime takes the exception/long-cast path. The safe
-            // i64 window is `i64::MIN ..= i64::MAX`; `i64::MAX + 1` rounds
-            // to the same f64 as `i64::MAX` (precision loss), so use the
+            // blackhole.py:800-808 `bhimpl_cast_float_to_int = int(int(a))`
+            // lowers to `lltype.cast_float_to_int` (C `(long)f`) post-
+            // translation. Skip fold on non-finite or out-of-range
+            // floats: the runtime path's `as i64` saturates (lenient
+            // IEEE policy, see runtime arm at executor.rs:329) but
+            // trace-time fold would freeze that saturation as a
+            // constant — emit the cast op instead so the runtime
+            // computes consistently. The safe i64 window is
+            // `i64::MIN ..= i64::MAX`; `i64::MAX + 1` rounds to the
+            // same f64 as `i64::MAX` (precision loss), so use the
             // strictly-less-than upper bound `9.223372036854776e18`.
             if !f.is_finite() {
                 return None;
@@ -1775,15 +1780,12 @@ pub fn execute_cast_const(opcode: OpCode, arg: majit_ir::Value) -> Option<majit_
         (OpCode::ConvertLonglongBytesToFloat, Value::Int(i)) => {
             Some(Value::Float(f64::from_bits(i as u64)))
         }
-        // blackhole.py:603-611 — see the runtime `CastPtrToInt` /
-        // `CastIntToPtr` structural-divergence note at
-        // executor.rs:786 for why the AddressAsInt low-bit tag is
-        // not applied here (PyPy enforces it across lltype + JIT
-        // codegen + blackhole; pyre's raw-aligned `GcRef` cannot
-        // host it without a multi-session encoding rework).  The
-        // fold preserves the roundtrip identity
-        // `cast_int_to_ptr(cast_ptr_to_int(p)) == p` and stays in
-        // lockstep with the runtime + blackhole behavior.
+        // `assembler.py:1528-1529 genop_cast_ptr_to_int =
+        // _genop_same_as` / `genop_cast_int_to_ptr = _genop_same_as`.
+        // PyPy treats both casts as raw identity at every level:
+        // backend, executor, and test_lltype.py:693-701 /
+        // runner_test.py:1957-1966 expect
+        // `cast_int_to_ptr(21) → cast_ptr_to_int == 21`.
         (OpCode::CastPtrToInt, Value::Ref(r)) => Some(Value::Int(r.0 as i64)),
         (OpCode::CastIntToPtr, Value::Int(i)) => Some(Value::Ref(GcRef(i as usize))),
         _ => None,

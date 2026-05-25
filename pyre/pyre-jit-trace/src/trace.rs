@@ -24,6 +24,12 @@ pub fn trace_bytecode(
     start_pc: usize,
     mut concrete_frame: Box<pyre_interpreter::pyframe::PyFrame>,
 ) -> (TraceAction, Box<pyre_interpreter::pyframe::PyFrame>) {
+    // `llmodel.py:557` parity — install pyre's `Cpu` impl so the
+    // optimizer's `protect_speculative_string` / `bh_strlen` /
+    // `bh_strgetitem` family routes through `W_StrObject`-shaped
+    // `str_descr` / `unicode_descr` (`pyre_cpu` module).
+    meta.set_cpu(crate::pyre_cpu::shared());
+
     let ctx = meta
         .trace_ctx()
         .expect("trace_bytecode invariant: meta.tracing must be Some during merge_point closure");

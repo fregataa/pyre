@@ -4066,11 +4066,19 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "must be a gcref")]
     fn test_getfield_does_not_deref_arbitrary_int_constant_base() {
+        // `optimizer.py:818-867 protect_speculative_operation` derefs
+        // `op.getarg(0)` via `getref_base()` — upstream `ConstInt`
+        // does not expose that method and would `AttributeError`.
+        // RPython's type-typed `AbstractValue` makes this state
+        // unrepresentable at construction time: a `GETFIELD_GC_I`
+        // whose first arg is an `Int` cannot exist.  Pyre's flat
+        // `Value` enum allows the misuse syntactically, but per
+        // strict-orthodoxy parity the optimizer panics instead of
+        // emitting a defensive fallback.
         let d = immutable_descr(77);
         let mut heap = OptHeap::new();
-        // base is promoted to an Int constant via make_constant — Int input
-        // tag matches the constant value type.
         let mut ctx = OptContext::with_inputarg_types(4, &[Type::Int]);
         let p0 = OpRef::input_arg_typed(0, Type::Int);
         ctx.make_constant(p0, majit_ir::Value::Int(1));
@@ -4079,9 +4087,7 @@ mod tests {
         let mut op = Op::with_descr(OpCode::GetfieldGcI, &[p0], d);
         op.pos.set(pos1);
 
-        let result = heap.optimize_getfield(&op, &mut ctx);
-        assert!(matches!(result, OptimizationResult::Emit(_)));
-        assert_eq!(ctx.get_box_replacement(pos1), pos1);
+        let _ = heap.optimize_getfield(&op, &mut ctx);
     }
 
     // ── Test 2: Two GETFIELDs on same object/field → second eliminated ──

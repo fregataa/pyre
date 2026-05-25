@@ -396,13 +396,22 @@ unsafe fn int_lshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 }
 
 unsafe fn int_rshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    // intobject.py:393-403 `_rshift(space, a, b)`:
+    //   if r_uint(b) >= LONG_BIT:
+    //       if b < 0: raise ValueError("negative shift count")
+    //       # b >= LONG_BIT
+    //       if a == 0: return wrapint(space, a)
+    //       a = -1 if a < 0 else 0
+    //   else: a = a >> b
     let va = int_value(a);
     let vb = int_value(b);
     if vb < 0 {
         return Err(PyError::value_error("negative shift count"));
     }
-    let vb = vb as u32;
-    Ok(w_int_new(va >> vb.min(63)))
+    if vb >= 64 {
+        return Ok(w_int_new(if va < 0 { -1 } else { 0 }));
+    }
+    Ok(w_int_new(va >> vb))
 }
 
 unsafe fn long_lshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
@@ -435,7 +444,6 @@ unsafe fn long_rshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let shift = match vb.to_usize() {
         Some(v) => v,
         None => {
-            let va = as_bigint(a);
             let va = as_bigint(a);
             return Ok(w_int_new(if va.sign() == malachite_bigint::Sign::Minus {
                 -1

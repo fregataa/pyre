@@ -406,8 +406,12 @@ thread_local! {
                     return None;
                 }
                 match mode {
-                    // vstring.mode_string — UTF-8 byte length.
-                    0 => Some(unsafe { pyre_object::strobject::w_str_len(obj) } as i64),
+                    // vstring.mode_string — UTF-8 byte length per
+                    // `rstr.py:1226 Array(Char)` / `llmodel.py:667 bh_strlen`.
+                    0 => {
+                        let s = unsafe { pyre_object::strobject::w_str_get_value(obj) };
+                        Some(s.len() as i64)
+                    }
                     // vstring.mode_unicode — codepoint count.
                     1 => {
                         let s = unsafe { pyre_object::strobject::w_str_get_value(obj) };
@@ -3355,6 +3359,15 @@ fn maybe_compile_and_run(
         return None;
     }
     // warmstate.py:496-511: counter.tick → threshold reached → bound_reached
+    // TODO(parity): warmstate.py:473-496 funnels every back-edge through
+    // `maybe_compile_and_run`, which checks JC_TRACING, compiled-loop
+    // presence, DONT_TRACE_HERE, has_seen_a_procedure_token, and
+    // counter.tick in one linear sequence.  Pyre splits the checks
+    // across this function and `counter_tick_checked` (warmstate.rs:559).
+    // The flag-based DONT_TRACE_HERE path above duplicates part of the
+    // warmstate logic; verify that `counter_tick_checked` still covers
+    // the `has_seen_a_procedure_token` guard and the full `bound_reached`
+    // flow identically to warmstate.py:496-511.
     if driver
         .meta_interp_mut()
         .warm_state_mut()

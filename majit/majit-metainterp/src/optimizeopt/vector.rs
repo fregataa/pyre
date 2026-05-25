@@ -46,6 +46,12 @@ fn copy_resop(op: &Op) -> Op {
 }
 
 // ── vector.py:42-120: VectorLoop ───────────────────────────────────────
+//
+// TODO(parity): VectorLoop is missing `finaloplist` and the top-level
+// `optimize_vector` entry.  RPython `vector.py:331` renews jump args via
+// a Renamer; pyre's `finalise` does not yet perform this renewal.  The
+// current loop is not wired into the default pipeline, so the gap has no
+// runtime effect; this comment documents an existing source-parity gap.
 
 /// vector.py:42-120: VectorLoop — wraps a loop body (Label..operations..Jump)
 /// for vectorization analysis and transformation.

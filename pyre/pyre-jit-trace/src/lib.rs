@@ -17,6 +17,7 @@ pub mod jitcode_runtime;
 pub mod liveness;
 pub mod metainterp;
 pub mod pyjitcode;
+pub mod pyre_cpu;
 pub mod runtime_fnaddr_patch;
 pub mod shadow_walker;
 pub mod state;

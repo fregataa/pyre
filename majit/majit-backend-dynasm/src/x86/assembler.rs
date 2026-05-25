@@ -3085,13 +3085,26 @@ impl<'a> Assembler386<'a> {
             OpCode::SameAsI
             | OpCode::SameAsR
             | OpCode::SameAsF
-            | OpCode::CastPtrToInt
-            | OpCode::CastIntToPtr
             | OpCode::CastOpaquePtr
             | OpCode::LoadFromGcTable
             | OpCode::VirtualRefR
             | OpCode::ConvertFloatBytesToLonglong
             | OpCode::ConvertLonglongBytesToFloat => {
+                if let (Some(src), Some(dst)) = (arglocs.first(), result_loc) {
+                    self.regalloc_mov(src, dst);
+                }
+            }
+            // `assembler.py:1528 genop_cast_ptr_to_int = _genop_same_as`
+            // / `:1529 genop_cast_int_to_ptr = _genop_same_as`.  PyPy's
+            // x86 backend treats both casts as plain `mov` — the
+            // AddressAsInt low-bit tag is a `blackhole.py:603-610`
+            // interpreter-side software invariant, not a backend
+            // codegen step.  Tagging at codegen would fold a fake odd
+            // pointer back into the raw aligned-pointer space and
+            // could collide with a real GC pointer.  `runner_test.py:
+            // 1957 cast_int_to_ptr(-17) -> cast_ptr_to_int == -17`
+            // expects strict identity through the compiled trace.
+            OpCode::CastPtrToInt | OpCode::CastIntToPtr => {
                 if let (Some(src), Some(dst)) = (arglocs.first(), result_loc) {
                     self.regalloc_mov(src, dst);
                 }

@@ -1007,6 +1007,17 @@ extern "C" fn jit_reacquire_gil_shim() {
 // `rpython/jit/backend/llsupport/symbolic.py:7,29`). See the matching
 // comment in `majit-backend-dynasm/src/runner.rs` for full layout
 // rationale — both backends mirror the upstream rstr layout.
+//
+// TODO(parity): These constants assume PyPy's inline `rstr.STR`
+// layout `[hash | len | chars...]`.  Pyre's actual `W_StrObject`
+// (`pyre-object/strobject.rs:14`) is `[ob_type | value:*mut String |
+// len]` with chars behind a pointer indirection.  The constant-fold
+// paths (`PyreCpu::bh_strlen` / `bh_strgetitem`) override correctly,
+// but the non-constant compiled STRGETITEM/STRLEN path still uses
+// `base + basesize + index` addressing against the inline layout.
+// A full fix requires either (a) making the backend read through the
+// `*mut String` indirection, or (b) changing `W_StrObject` to inline
+// its chars like `rstr.STR`.
 
 /// `symbolic.get_field_token(rstr.STR/UNICODE, 'hash', ...).offset`.
 const BUILTIN_STRING_HASH_OFFSET: usize = 0;
@@ -8689,12 +8700,7 @@ impl CraneliftBackend {
                 ),
 
                 // ── Identity / cast ──
-                OpCode::SameAsI
-                | OpCode::SameAsR
-                | OpCode::SameAsF
-                | OpCode::CastPtrToInt
-                | OpCode::CastIntToPtr
-                | OpCode::CastOpaquePtr => {
+                OpCode::SameAsI | OpCode::SameAsR | OpCode::SameAsF | OpCode::CastOpaquePtr => {
                     let a = if op.num_args() > 0 {
                         resolve_opref(&mut builder, &constants, op.arg(0))
                     } else if let Some(&c) = constants.get(&vi) {
@@ -8715,6 +8721,22 @@ impl CraneliftBackend {
                             &mut synced_ref_vars,
                         );
                     }
+                }
+
+                // PyPy `assembler.py:1528-1529` (x86) /
+                // `opassembler.py:269-270` (aarch64): both casts are
+                // wired to `_genop_same_as` — the compiled trace just
+                // moves the value through.  The AddressAsInt low-bit
+                // tag is a `blackhole.py:603-610` interpreter-side
+                // invariant, not a backend codegen step.  OR-tagging
+                // here would fold a fake odd pointer back into the
+                // raw aligned-pointer space and could collide with a
+                // real GC pointer.  `runner_test.py:1957 cast_int_to_
+                // ptr(-17) -> cast_ptr_to_int == -17` expects strict
+                // identity through the compiled trace.
+                OpCode::CastPtrToInt | OpCode::CastIntToPtr => {
+                    let a = resolve_opref(&mut builder, &constants, op.arg(0));
+                    builder.def_var(var(vi), a);
                 }
 
                 // ── Guards ──

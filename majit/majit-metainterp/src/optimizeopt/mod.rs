@@ -527,6 +527,14 @@ pub use crate::optimizeopt::info::{StringConstantAllocator, StringContentResolve
 
 use crate::optimizeopt::info::PtrInfoExt;
 
+/// `optimizer.py:867 raise SpeculativeError`.  Panic-based propagation
+/// reaches `unroll.py:122 except SpeculativeError: raise InvalidLoop`
+/// which the unroll-pass entry catches via `catch_unwind` to convert
+/// to an `InvalidLoop`.
+fn raise_speculative_error(reason: &'static str) -> ! {
+    std::panic::panic_any(crate::optimize::SpeculativeError(reason));
+}
+
 /// Context provided to optimization passes.
 ///
 /// Holds the shared state that passes read from and write to.
@@ -5373,35 +5381,82 @@ impl OptContext {
     ///                                    op.getdescr(), op.type)
     /// ```
     ///
-    /// Returns `None` when `protect_speculative_operation` rejects the
-    /// op (RPython raises SpeculativeError) or when any arg fails to
-    /// resolve to a `ConstInt`/`ConstPtr`/`ConstFloat` via
-    /// `get_constant_box`. The pre-check at pure.rs:993-1006 normally
-    /// ensures every arg is constant before this is called, so the
-    /// `?` short-circuits would only fire after a structural change to
-    /// the caller.
+    /// Returns `None` only for the `supports_guard_gc_type == false`
+    /// gate on memory-reading folds (see `protect_speculative_operation`
+    /// for details).  Every other upstream-divergent path now panics:
+    ///  - `argboxes` build asserts every arg is constant (pure.rs:993-
+    ///    1006 pre-checks the same condition; a mismatch is a caller
+    ///    bug, equivalent to RPython's `AttributeError` from
+    ///    `get_constant_box(...).getint()`).
+    ///  - `Err(NotImplemented)` panics — upstream `executor.py:610`
+    ///    raises `NotImplementedError` when no helper is registered.
+    ///    This includes "never executed by pyjitpl" opnums such as
+    ///    LOAD_FROM_GC_TABLE / LOAD_EFFECTIVE_ADDRESS, which RPython's
+    ///    `_make_execute_list` deliberately leaves without a helper.
+    /// Helper-internal `Ok(None)` for OVF/shift/divide-by-zero/non-
+    /// finite cast still surfaces as `None` here; see `pure.rs:993`.
     pub fn constant_fold(&self, op: &Op) -> Option<Value> {
         self.protect_speculative_operation(op)?;
         let mut argboxes: Vec<Value> = Vec::with_capacity(op.num_args());
         for i in 0..op.num_args() {
-            let b = self.get_box_replacement_box(op.arg(i))?;
-            argboxes.push(self.get_constant_box(&b)?);
+            let b = self.get_box_replacement_box(op.arg(i)).expect(
+                "constant_fold: arg BoxRef must be registered (pure.rs:993-1006 pre-check)",
+            );
+            argboxes.push(
+                self.get_constant_box(&b)
+                    .expect("constant_fold: arg must be Const (pure.rs:993-1006 pre-check)"),
+            );
         }
-        crate::executor::execute_nonspec_const(
+        match crate::executor::execute_nonspec_const(
             self.cpu.as_ref(),
             op.opcode,
             &argboxes,
             op.getdescr().as_ref(),
             op.result_type(),
-        )
+        ) {
+            Ok(folded) => folded,
+            Err(crate::executor::NotImplemented) => panic!(
+                "execute_nonspec_const: no helper registered for opcode {:?} \
+                 (executor.py:610 NotImplementedError)",
+                op.opcode
+            ),
+        }
     }
 
     /// optimizer.py:818-867 `protect_speculative_operation(op)` — when
     /// constant-folding a pure operation that reads memory from a
     /// gcref, validate the gcref is non-null and of a valid type;
-    /// raise `SpeculativeError` otherwise.  Pyre signals that with
-    /// `None`, which `constant_fold` short-circuits on so `pure.rs`
-    /// re-emits the op verbatim.
+    /// raise `SpeculativeError` otherwise.
+    ///
+    /// Pyre raises the upstream `SpeculativeError` via
+    /// `raise_speculative_error` (panic with
+    /// `crate::optimize::SpeculativeError`) on every line that
+    /// upstream raises:
+    ///  - `cpu.protect_speculative_field/_array/_string/_unicode`
+    ///    returning `Err` → `:832 / :841 / :849 / :857`
+    ///  - shared bounds check `0 <= index < arraylength` failing
+    ///    → `:867`
+    /// `unroll.py:119-123` catches it at the unroll-phase boundary
+    /// (`with_speculative_to_invalid_loop` in `unroll.rs`) and
+    /// rethrows as `InvalidLoop`.
+    ///
+    /// The remaining `Option<()>` return path encodes ONE legitimate
+    /// case: the `supports_guard_gc_type == false` gate on memory-
+    /// reading folds.  Upstream's quote at `optimizer.py:822-825`:
+    /// *"if cpu.supports_guard_gc_type is false, we can't really do
+    /// this check at all, but then we don't unroll in that case"* —
+    /// upstream gates the entire `protect_speculative_operation`
+    /// entry on the unroll pass.  Pyre's `constant_fold` is also
+    /// called outside unrolling, so the fold itself must decline
+    /// when speculative type validation is impossible (otherwise a
+    /// wrong-type non-null const gcref would be deref'd at fold time
+    /// via `cpu.bh_arraylen_gc / bh_getarrayitem_gc_*`).
+    ///
+    /// Every other path that upstream encodes as `AttributeError` /
+    /// `assert` now panics: missing box registration, missing descr,
+    /// wrong `Value` variant.  This matches the upstream contract —
+    /// the caller (`pure.py:121-128` `for...else`) guarantees every
+    /// arg is a `Const*` before invoking this routine.
     ///
     /// Branches mirror the upstream `if / elif / elif / elif / else`
     /// chain line-for-line:
@@ -5426,13 +5481,26 @@ impl OptContext {
         let descr = op.getdescr();
         if opnum.is_getfield() {
             // optimizer.py:829-832 pure-getfield branch.
-            let arg0 = self.get_box_replacement_box(op.arg(0))?;
-            let gcref = match self.get_constant_box(&arg0)? {
+            let arg0 = self
+                .get_box_replacement_box(op.arg(0))
+                .expect("protect_speculative_operation: arg0 BoxRef must be registered");
+            let gcref = match self
+                .get_constant_box(&arg0)
+                .expect("protect_speculative_operation: arg0 must be Const")
+            {
                 Value::Ref(r) => r,
-                _ => return None,
+                v => unreachable!(
+                    "GETFIELD_GC_PURE_* arg0 must be a gcref (Value::Ref); got {:?}",
+                    v
+                ),
             };
-            let fd = descr.as_ref().and_then(|d| d.as_field_descr())?;
-            self.cpu.protect_speculative_field(gcref, fd).ok()?;
+            let fd = descr
+                .as_ref()
+                .and_then(|d| d.as_field_descr())
+                .expect("GETFIELD_GC_PURE_* descr must be a FieldDescr");
+            if self.cpu.protect_speculative_field(gcref, fd).is_err() {
+                raise_speculative_error("protect_speculative_field");
+            }
             return Some(());
         } else if matches!(
             opnum,
@@ -5472,41 +5540,80 @@ impl OptContext {
                 | OpCode::ArraylenGc
         ) {
             // optimizer.py:834-841 array branch.
-            let arg0 = self.get_box_replacement_box(op.arg(0))?;
-            let array = match self.get_constant_box(&arg0)? {
+            let arg0 = self
+                .get_box_replacement_box(op.arg(0))
+                .expect("protect_speculative_operation: array arg0 BoxRef must be registered");
+            let array = match self
+                .get_constant_box(&arg0)
+                .expect("protect_speculative_operation: array arg0 must be Const")
+            {
                 Value::Ref(r) => r,
-                _ => return None,
+                v => unreachable!(
+                    "GETARRAYITEM_GC_PURE_* / ARRAYLEN_GC arg0 must be a gcref; got {:?}",
+                    v
+                ),
             };
-            let ad = descr.as_ref().and_then(|d| d.as_array_descr())?;
-            self.cpu.protect_speculative_array(array, ad).ok()?;
+            let ad = descr
+                .as_ref()
+                .and_then(|d| d.as_array_descr())
+                .expect("array op descr must be an ArrayDescr");
+            if self.cpu.protect_speculative_array(array, ad).is_err() {
+                raise_speculative_error("protect_speculative_array");
+            }
             if opnum == OpCode::ArraylenGc {
                 return Some(());
             }
-            arraylength = self.cpu.bh_arraylen_gc(array, ad)?;
+            arraylength = self
+                .cpu
+                .bh_arraylen_gc(array, ad)
+                .expect("bh_arraylen_gc must succeed after protect_speculative_array");
         } else if matches!(opnum, OpCode::Strgetitem | OpCode::Strlen) {
             // optimizer.py:843-848 string branch.
-            let arg0 = self.get_box_replacement_box(op.arg(0))?;
-            let string = match self.get_constant_box(&arg0)? {
+            let arg0 = self
+                .get_box_replacement_box(op.arg(0))
+                .expect("protect_speculative_operation: string arg0 BoxRef must be registered");
+            let string = match self
+                .get_constant_box(&arg0)
+                .expect("protect_speculative_operation: string arg0 must be Const")
+            {
                 Value::Ref(r) => r,
-                _ => return None,
+                v => unreachable!("STRGETITEM / STRLEN arg0 must be a gcref; got {:?}", v),
             };
-            self.cpu.protect_speculative_string(string).ok()?;
+            if self.cpu.protect_speculative_string(string).is_err() {
+                raise_speculative_error("protect_speculative_string");
+            }
             if opnum == OpCode::Strlen {
                 return Some(());
             }
-            arraylength = self.cpu.bh_strlen(string)?;
+            arraylength = self
+                .cpu
+                .bh_strlen(string)
+                .expect("bh_strlen must succeed after protect_speculative_string");
         } else if matches!(opnum, OpCode::Unicodegetitem | OpCode::Unicodelen) {
             // optimizer.py:850-855 unicode branch.
-            let arg0 = self.get_box_replacement_box(op.arg(0))?;
-            let unicode = match self.get_constant_box(&arg0)? {
+            let arg0 = self
+                .get_box_replacement_box(op.arg(0))
+                .expect("protect_speculative_operation: unicode arg0 BoxRef must be registered");
+            let unicode = match self
+                .get_constant_box(&arg0)
+                .expect("protect_speculative_operation: unicode arg0 must be Const")
+            {
                 Value::Ref(r) => r,
-                _ => return None,
+                v => unreachable!(
+                    "UNICODEGETITEM / UNICODELEN arg0 must be a gcref; got {:?}",
+                    v
+                ),
             };
-            self.cpu.protect_speculative_unicode(unicode).ok()?;
+            if self.cpu.protect_speculative_unicode(unicode).is_err() {
+                raise_speculative_error("protect_speculative_unicode");
+            }
             if opnum == OpCode::Unicodelen {
                 return Some(());
             }
-            arraylength = self.cpu.bh_unicodelen(unicode)?;
+            arraylength = self
+                .cpu
+                .bh_unicodelen(unicode)
+                .expect("bh_unicodelen must succeed after protect_speculative_unicode");
         } else {
             // optimizer.py:857-858 else: return — nothing to validate.
             return Some(());
@@ -5515,13 +5622,21 @@ impl OptContext {
         // optimizer.py:860-862 shared bounds check:
         //   index = self.get_constant_box(op.getarg(1)).getint()
         //   if not (0 <= index < arraylength): raise SpeculativeError
-        let arg1 = self.get_box_replacement_box(op.arg(1))?;
-        let index = match self.get_constant_box(&arg1)? {
+        let arg1 = self
+            .get_box_replacement_box(op.arg(1))
+            .expect("protect_speculative_operation: arg1 BoxRef must be registered");
+        let index = match self
+            .get_constant_box(&arg1)
+            .expect("protect_speculative_operation: arg1 must be Const")
+        {
             Value::Int(i) => i,
-            _ => return None,
+            v => unreachable!(
+                "GETARRAYITEM / STRGETITEM / UNICODEGETITEM arg1 must be an int index; got {:?}",
+                v
+            ),
         };
         if !(0 <= index && index < arraylength) {
-            return None;
+            raise_speculative_error("index out of bounds for constant-fold");
         }
         Some(())
     }
