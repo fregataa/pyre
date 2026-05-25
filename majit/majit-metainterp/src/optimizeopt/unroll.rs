@@ -41,25 +41,27 @@ fn is_trace_runtime_ref(
     !opref.is_none() && !is_trace_constant_ref(opref, constants)
 }
 
-/// Reconstruct Phase 1's `box_pool` prefix from the exported snapshot
-/// so a Phase 2 retrace observes the same `_forwarded` chain Phase 1
-/// produced. The `BoxPool::clone` here is intentionally shallow:
-/// `BoxRef` is `Rc<Box>`, so cloning shares the same `Box` cells —
-/// matching `unroll.py` Phase 2's behaviour of seeing Phase 1's
-/// `_forwarded` mutations through Python object identity
-/// (resoperation.py:233-240).
+/// Reconstruct Phase 1's `box_pool` prefix for a Phase 2 retrace.
 ///
+/// The `BoxPool::clone` here is intentionally shallow: `BoxRef` is
+/// `Rc<Box>`, so cloning shares the same `Box` cells — matching
+/// `unroll.py` Phase 2's behaviour of seeing Phase 1's `_forwarded`
+/// mutations through Python object identity (resoperation.py:233-240).
 /// A "deep" snapshot (cloning each `Box` so Phase 2 cannot reach into
 /// `phase1_out`) would diverge from upstream: PyPy explicitly relies on
 /// shared identity to read Phase 1 forwarding from Phase 2 — see
-/// `unroll.py:55-64` `setinfo_from_preamble`. The defensive copy is the
-/// wrong direction for parity. The GcRef-rooting bookkeeping that
-/// `ExportedState::root_all_gcrefs` does is the canonical safety net,
-/// not snapshot copying.
-fn p1_full_prefix_from_box_pool_snapshot(
-    snapshot: Option<&crate::r#box::BoxPool>,
-) -> Option<crate::r#box::BoxPool> {
-    snapshot.cloned()
+/// `unroll.py:55-64` `setinfo_from_preamble`.
+///
+/// Returns `None` for an empty pool so callers feed the iterator the
+/// same `None`/`Some` distinction the `p1_full_prefix` argument
+/// expects.  GcRef rooting via `ExportedState::root_all_gcrefs` is the
+/// canonical safety net, not snapshot copying.
+fn p1_full_prefix_from_box_pool(pool: &crate::r#box::BoxPool) -> Option<crate::r#box::BoxPool> {
+    if pool.is_empty() {
+        None
+    } else {
+        Some(pool.clone())
+    }
 }
 
 /// unroll.py: UnrollOptimizer — high-level loop optimization controller.
@@ -116,11 +118,13 @@ pub struct UnrollOptimizer {
     /// pyjitpl.py:2289 all_descrs: dense list indexed by descr_index.
     /// Threaded through inner Optimizer instances for inline registration.
     pub all_descrs: Vec<majit_ir::descr::DescrRef>,
-    /// RPython Box type parity: trace inputarg types from recorder.
-    /// Each RPython Box carries its type; in majit OpRef is untyped u32.
-    /// Propagated to Phase 1 and Phase 2 Optimizer.trace_inputarg_types
-    /// so value_types covers inputarg OpRefs.
-    pub trace_inputarg_types: Vec<majit_ir::Type>,
+    /// Recorder-side trace inputargs as typed `OpRef::InputArg{Int,Ref,Float}`
+    /// variants. `box.type` (history.py:220) is the variant tag —
+    /// resoperation.py:719/727/739 `InputArg{Int,Ref,Float}.type`.
+    /// Propagated to the inner Phase 1 / Phase 2 `Optimizer.trace_inputargs`
+    /// so each phase carries the same Box list (optimizer.py:34
+    /// `self.inputargs = inputargs`).
+    pub trace_inputargs: Vec<majit_ir::OpRef>,
     /// Phase 1 emit ops (filtered to non-NONE pos, non-Void type) carried
     /// into Phase 2 so that `OptContext::op_at` resolves Phase 1 OpRefs
     /// directly via `op.type_` (history.py:220 box.type parity).
@@ -181,7 +185,7 @@ impl UnrollOptimizer {
             snapshot_vref_boxes: Vec::new(),
             snapshot_frame_pcs: Vec::new(),
             all_descrs: Vec::new(),
-            trace_inputarg_types: Vec::new(),
+            trace_inputargs: Vec::new(),
             phase1_emit_ops: Vec::new(),
             phase1_patchguardop: None,
             next_global_opref: 0,
@@ -336,8 +340,8 @@ impl UnrollOptimizer {
                 }
                 // compile_retrace has no `opt_p1.final_ctx` (Phase 1 was
                 // skipped), but the failed attempt's Phase 1 captured its full
-                // `box_pool` into `ExportedState.box_pool_snapshot` at export
-                // time (`export_state_with_bounds`). TraceIterator's
+                // `box_pool` into `ExportedState.box_pool` at export time
+                // (`export_state_with_bounds`). TraceIterator's
                 // `p1_full_prefix` contract: deliver the full Phase 1 box_pool
                 // including inputarg BoxRefs at `[0..num_inputs)`, so
                 // `import_state` setting `Forwarded::Box(target)` for
@@ -346,8 +350,7 @@ impl UnrollOptimizer {
                 // `_forwarded` through shared Box identity; preserving the full
                 // raw position alignment (inputargs + emit ops) reproduces
                 // that identity here.
-                let prefix =
-                    p1_full_prefix_from_box_pool_snapshot(pre_imported.box_pool_snapshot.as_ref());
+                let prefix = p1_full_prefix_from_box_pool(&pre_imported.box_pool);
                 (pre_imported, constants.clone(), Vec::new(), prefix)
             } else {
                 // ── Phase 1: PreambleCompileData.optimize() ──
@@ -364,7 +367,7 @@ impl UnrollOptimizer {
                 opt_p1.all_descrs = std::mem::take(&mut self.all_descrs);
                 opt_p1.callinfocollection = self.callinfocollection.clone();
                 opt_p1.cpu = self.cpu.clone();
-                opt_p1.trace_inputarg_types = self.trace_inputarg_types.clone();
+                opt_p1.trace_inputargs = self.trace_inputargs.clone();
                 opt_p1.snapshot_boxes = self.snapshot_boxes.clone();
                 opt_p1.snapshot_frame_sizes = self.snapshot_frame_sizes.clone();
                 opt_p1.snapshot_vable_boxes = self.snapshot_vable_boxes.clone();
@@ -393,10 +396,16 @@ impl UnrollOptimizer {
                 // structural alignment with RPython's `trace.get_iter()`
                 // call site, not a functional change.
                 // opencoder.py:264 `inputarg_from_tp(arg.type)` — fresh inputargs
-                // are typed via `self.trace_inputarg_types`, the recorder-supplied
-                // per-arg type list (length must equal `num_inputs`).
-                let p1_inputarg_types: &[majit_ir::Type] = &self.trace_inputarg_types;
-                debug_assert_eq!(p1_inputarg_types.len(), num_inputs);
+                // are typed via `self.trace_inputargs`, the recorder-supplied
+                // Box list (length must equal `num_inputs`). Derive the &[Type]
+                // surface TraceIterator expects from each Box's variant tag
+                // (resoperation.py:719/727/739).
+                debug_assert_eq!(self.trace_inputargs.len(), num_inputs);
+                let p1_inputarg_types: Vec<majit_ir::Type> = self
+                    .trace_inputargs
+                    .iter()
+                    .map(|op| op.ty().expect("inputarg OpRef must carry box.type"))
+                    .collect();
                 // Wrap input ops as `Vec<OpRc>` so TraceIterator's `&[OpRc]`
                 // surface receives shared identity (history.py:528). The
                 // deep-clone here corresponds to PyPy's `cls()` per-op fresh
@@ -408,7 +417,7 @@ impl UnrollOptimizer {
                     0,
                     ops_oprc.len(),
                     None,
-                    p1_inputarg_types,
+                    &p1_inputarg_types,
                     0,    // start_fresh = 0 — inputargs at [0..num_inputs)
                     None, // p1_full_prefix — Phase 1 has no prior phase
                 );
@@ -513,7 +522,14 @@ impl UnrollOptimizer {
                         // so the backend can see the reduced LABEL's declared
                         // types. Clone only the field we need to avoid keeping
                         // Phase 1 short preamble data alive longer than before.
-                        self.final_exported_state = Some(ExportedState {
+                        // GC parity (gcreftracer.py): `virtual_state` and
+                        // `box_pool` both carry GcRefs that the shadow stack
+                        // must pin between this store and any later read.
+                        // Match the rooting pattern at
+                        // `imported_loop_state = ...` / `phase1_out = ...`
+                        // (this file, ~line 666) — root after construction,
+                        // before placing into long-lived storage.
+                        let mut final_exported_state = ExportedState {
                             end_args: Vec::new(),
                             next_iteration_args: Vec::new(),
                             end_arg_types: Vec::new(),
@@ -528,11 +544,13 @@ impl UnrollOptimizer {
                             short_inputargs: Vec::new(),
                             runtime_boxes: Vec::new(),
                             patchguardop: None,
-                            phase1_emit_high_water: state.phase1_emit_high_water,
-                            box_pool_snapshot: None,
+                            box_pool: state.box_pool.clone(),
+                            phase1_emit_high_water: self.next_global_opref,
                             rooted_refs: Vec::new(),
                             shadow_stack_base: 0,
-                        });
+                        };
+                        final_exported_state.root_all_gcrefs();
+                        self.final_exported_state = Some(final_exported_state);
                         // Codex plan step 3: snapshot Phase 1 emit-op slice as
                         // Rc::clone vector. Phase 2's TraceIterator embeds these
                         // BoxRefs at its placeholder prefix `[num_inputs..end)`
@@ -628,7 +646,7 @@ impl UnrollOptimizer {
         opt_p2.all_descrs = std::mem::take(&mut self.all_descrs);
         opt_p2.callinfocollection = self.callinfocollection.clone();
         opt_p2.cpu = self.cpu.clone();
-        opt_p2.trace_inputarg_types = self.trace_inputarg_types.clone();
+        opt_p2.trace_inputargs = self.trace_inputargs.clone();
         opt_p2.phase1_emit_ops = self.phase1_emit_ops.clone();
         opt_p2.snapshot_boxes = self.snapshot_boxes.clone();
         opt_p2.snapshot_frame_sizes = self.snapshot_frame_sizes.clone();
@@ -722,8 +740,12 @@ impl UnrollOptimizer {
         let phase2_inputarg_base = self.next_global_opref.max(body_num_inputs as u32);
         // opencoder.py:264 `inputarg_from_tp(arg.type)` — same per-arg types
         // as Phase 1 (Phase 2 walks the body half of the same trace).
-        let p2_inputarg_types: &[majit_ir::Type] = &self.trace_inputarg_types;
-        debug_assert_eq!(p2_inputarg_types.len(), body_num_inputs);
+        debug_assert_eq!(self.trace_inputargs.len(), body_num_inputs);
+        let p2_inputarg_types: Vec<majit_ir::Type> = self
+            .trace_inputargs
+            .iter()
+            .map(|op| op.ty().expect("inputarg OpRef must carry box.type"))
+            .collect();
         // Wrap into `Vec<OpRc>` for TraceIterator's `&[OpRc]` surface.
         let ops_oprc: Vec<majit_ir::OpRc> =
             ops.iter().map(|op| std::rc::Rc::new(op.clone())).collect();
@@ -732,7 +754,7 @@ impl UnrollOptimizer {
             0,
             ops_oprc.len(),
             None,
-            p2_inputarg_types,
+            &p2_inputarg_types,
             phase2_inputarg_base, // fresh inputargs at [phase2_inputarg_base..)
             p1_full_prefix, // Codex plan step 3 slice B: full Phase 1 box_pool (inputargs + emit ops)
         );
@@ -1202,7 +1224,7 @@ impl UnrollOptimizer {
                         // equivalent (resoperation.py:29
                         // `AbstractValue.type`); legacy untyped paths fall
                         // through to Phase 2's `final_ctx.opref_type` and
-                        // the recorder's `trace_inputarg_types`.
+                        // the recorder's `trace_inputargs` Box list.
                         let tp = ub
                             .ty()
                             .or_else(|| {
@@ -1210,7 +1232,7 @@ impl UnrollOptimizer {
                             })
                             .or_else(|| {
                                 let raw = ub.raw() as usize;
-                                opt_p2.trace_inputarg_types.get(raw).copied()
+                                opt_p2.trace_inputargs.get(raw).and_then(|op| op.ty())
                             })
                             .unwrap_or_else(|| {
                                 panic!(
@@ -1241,9 +1263,13 @@ impl UnrollOptimizer {
                 // carry the same producer-side types as Phase 1's; fall back
                 // to Ref when types are unavailable.
                 let types: Vec<majit_ir::Type> = opt_p2
-                    .trace_inputarg_types
+                    .trace_inputargs
                     .get(..body_num_inputs)
-                    .map(|s| s.to_vec())
+                    .map(|s| {
+                        s.iter()
+                            .map(|op| op.ty().unwrap_or(majit_ir::Type::Ref))
+                            .collect()
+                    })
                     .unwrap_or_else(|| vec![majit_ir::Type::Ref; body_num_inputs]);
                 crate::optimizeopt::OptContext::with_inputarg_types(32, &types)
             });
@@ -1714,25 +1740,33 @@ pub struct ExportedState {
     /// Phase 2's extra_guards (from virtualstate) need rd_resume_position
     /// from this patchguardop (unroll.py:333-336).
     pub patchguardop: Option<majit_ir::Op>,
-    /// Smallest fresh OpRef strictly above every Phase 1 emit position
-    /// (i.e. `max(op.pos.raw()) + 1` over `phase1_emit_ops`). Used by
-    /// `opref_high_water` so retrace's Phase 2 namespace stays disjoint
-    /// from intermediate Phase 1 emit OpRefs that were forwarded /
-    /// folded and never survive as an end_arg / short_op source.
-    /// `0` when there are no Phase 1 emit positions to track.
-    pub phase1_emit_high_water: u32,
-    /// Snapshot of Phase 1's `OptContext::box_pool` taken at export time.
-    /// Used by `compile_retrace`'s Phase 2 TraceIterator as the
-    /// `p1_full_prefix` (inputarg + emit BoxRefs) so chain walks via
-    /// `Forwarded::Box(rc)` observe the failed attempt's accumulated
-    /// `_forwarded` info on every Phase 1 position — `unroll.py` Phase 2
-    /// reading Phase 1 box.\_forwarded through Python identity parity.
+    /// Phase 1's `OptContext::box_pool` slot table at export time — the
+    /// raw OpRef position → `Rc<Box>` lookup table Phase 2 consults when
+    /// chain-walking a Phase 1 OpRef.  Carries `Rc::clone`d handles, so
+    /// `Forwarded::Box(rc)` walks land on the same cells Phase 1 mutated
+    /// during its run — `unroll.py` Phase 2 reading Phase 1
+    /// `box._forwarded` through Python object identity parity.
     ///
-    /// `None` for ExportedStates produced by paths that do not feed into a
-    /// retrace attempt (test fixtures, in-flight construction). Populated
-    /// only by `export_state_with_bounds` at the canonical Phase 1 export
-    /// site.
-    pub(crate) box_pool_snapshot: Option<crate::r#box::BoxPool>,
+    /// Empty when no Phase 1 ran (test fixtures, fresh constructor) or
+    /// when Phase 1 forced-returned without producing a chain.  Always
+    /// populated by `export_state_with_bounds` at the canonical Phase 1
+    /// export site.  PyPy has no analog because Box references pass by
+    /// Python identity end-to-end; pyre's numeric `OpRef` indirection
+    /// makes this table the explicit lookup.
+    pub(crate) box_pool: crate::r#box::BoxPool,
+    /// `OptContext::next_pos` at end of Phase 1 — strict upper bound of
+    /// every OpRef Phase 1 allocated, including intermediates folded /
+    /// forwarded away before any structure-stored field could observe
+    /// them.  `box_pool.len()` is *almost* the same value, but
+    /// `reserve_pos_typed` skips `ensure_box` when `box_pool` is empty
+    /// (zero-inputarg / retrace baselines, `optimizeopt/mod.rs:2026`),
+    /// so the pool length under-reports the emit allocations in that
+    /// case.  Phase 2 / retrace seed their TraceIterator namespace
+    /// strictly above this watermark via `opref_high_water()` to keep
+    /// the OpRef set disjoint — RPython's object-identity Boxes get
+    /// disjointness from Python identity for free; pyre's numeric
+    /// OpRefs need an explicit position floor.
+    pub phase1_emit_high_water: u32,
     /// Shadow stack rooting for GcRef values in exported_infos.
     /// (OpRef key, field kind, shadow stack index).
     rooted_refs: Vec<(OpRef, ExportedGcRefField, usize)>,
@@ -1765,11 +1799,11 @@ enum ExportedGcRefField {
     VirtualStateConstantRef(usize),
     /// short_box_const_values[OpRef] = Value::Ref(...)
     ShortBoxConstValue(OpRef),
-    /// box_pool_snapshot[index].forwarded = Info(OpInfo::Ptr(PtrInfo::Constant(_)))
+    /// box_pool[index].forwarded = Info(OpInfo::Ptr(PtrInfo::Constant(_)))
     BoxPoolInfoPtrInfoConstant(usize),
-    /// box_pool_snapshot[index].forwarded = Info(OpInfo::Ptr(PtrInfo::Instance{known_class: Some(_)}))
+    /// box_pool[index].forwarded = Info(OpInfo::Ptr(PtrInfo::Instance{known_class: Some(_)}))
     BoxPoolInfoPtrInfoKnownClass(usize),
-    /// box_pool_snapshot[index].forwarded = Box(target) where target is
+    /// box_pool[index].forwarded = Box(target) where target is
     /// `BoxKind::Const(Value::Ref(_))` — `make_constant` /
     /// `make_equal_to(... const ...)` writer mirror shape.
     BoxPoolBoxConstRef(usize),
@@ -1777,6 +1811,13 @@ enum ExportedGcRefField {
 
 impl ExportedState {
     /// unroll.py: ExportedState.__init__
+    ///
+    /// `box_pool` must be supplied at construction so the synthetic vs
+    /// canonical-export distinction is explicit at every callsite — PyPy
+    /// passes the same Box objects by identity end-to-end, so the
+    /// "no pool" / "fresh pool" case has to be a conscious choice (test
+    /// fixture, retrace base) rather than a silent default that misses
+    /// `_forwarded` chain coverage.
     pub fn new(
         end_args: Vec<OpRef>,
         next_iteration_args: Vec<OpRef>,
@@ -1789,6 +1830,7 @@ impl ExportedState {
         renamed_inputargs: Vec<OpRef>,
         renamed_inputarg_types: Vec<Type>,
         short_inputargs: Vec<OpRef>,
+        box_pool: crate::r#box::BoxPool,
     ) -> Self {
         // unroll.py:466-477 `sb.create_short_boxes(...)` parity: pyre
         // pre-derives the per-OpRef ProducedShortOp view (with label-arg
@@ -1815,8 +1857,8 @@ impl ExportedState {
             short_inputargs,
             runtime_boxes: Vec::new(),
             patchguardop: None,
+            box_pool,
             phase1_emit_high_water: 0,
-            box_pool_snapshot: None,
             rooted_refs: Vec::new(),
             shadow_stack_base: majit_gc::shadow_stack::depth(),
         }
@@ -1910,23 +1952,26 @@ impl ExportedState {
             }
         }
 
-        // `phase1_emit_high_water` covers Phase 1 emit positions that are
-        // not reachable via any of the structure-stored OpRef fields above
-        // (e.g. intermediate ops that were forwarded and never survive as
-        // an end_arg / short_op source). Retrace must keep its Phase 2
-        // namespace disjoint from every one of those.
+        // `box_pool.len()` covers every Phase 1 BoxRef the failed
+        // attempt materialized — inputargs and emit ops the recorder /
+        // optimizer extended the pool for.  When retrace's Phase 2
+        // `start_fresh` is below that ceiling, the
+        // `TraceIterator::new` `p1_prefix.len().min(start_fresh)`
+        // truncation would drop the tail of the pool and re-issue the
+        // same raw positions for Phase 2 input/result OpRefs — a numeric
+        // collision PyPy's object-identity Boxes structurally cannot
+        // have.
+        high = high.max(self.box_pool.len() as u32);
+
+        // `phase1_emit_high_water` covers Phase 1 emit positions when
+        // `box_pool` was not extended (zero-inputarg / retrace baselines
+        // where `reserve_pos_typed` skips `ensure_box` — see
+        // `optimizeopt/mod.rs:2026`).  Intermediate OpRefs that were
+        // allocated then forwarded/folded never make it into any
+        // structure-stored field above, so the explicit watermark from
+        // Phase 1's `OptContext::next_pos` is the only signal that keeps
+        // Phase 2's namespace disjoint from those positions.
         high = high.max(self.phase1_emit_high_water);
-        // `box_pool_snapshot.len()` covers every Phase 1 BoxRef the failed
-        // attempt allocated, including positions whose only carrier is the
-        // pool itself (no end_arg / short_op / phase1_emit_op trace). When
-        // retrace's Phase 2 `start_fresh` is below that ceiling, the
-        // `TraceIterator::new` `p1_prefix.len().min(start_fresh)` truncation
-        // would drop the tail of the snapshot and re-issue the same raw
-        // positions for Phase 2 input/result OpRefs — a numeric collision
-        // PyPy's object-identity Boxes structurally cannot have.
-        if let Some(snapshot) = &self.box_pool_snapshot {
-            high = high.max(snapshot.len() as u32);
-        }
 
         high
     }
@@ -2035,49 +2080,47 @@ impl ExportedState {
                     .push((key, ExportedGcRefField::ShortBoxConstValue(key), ss_idx));
             }
         }
-        // ── box_pool_snapshot Forwarded::Info GcRef fields ──
+        // ── box_pool Forwarded::Info GcRef fields ──
         // Phase 2 chain walks land on these BoxRef cells and read their
         // _forwarded info; if GC moves a Ref between Phase 1 export and
         // retrace those reads see a stale handle.
-        if let Some(snapshot) = &self.box_pool_snapshot {
-            for (i, b) in snapshot.iter_indexed() {
-                let forwarded = b.get_forwarded();
-                if let crate::r#box::Forwarded::Info(OpInfo::Ptr(rc)) = &forwarded {
-                    let info = rc.borrow();
-                    match &*info {
-                        PtrInfo::Constant(gcref) if !gcref.is_null() => {
-                            let ss_idx = majit_gc::shadow_stack::push(*gcref);
-                            self.rooted_refs.push((
-                                dummy_key,
-                                ExportedGcRefField::BoxPoolInfoPtrInfoConstant(i),
-                                ss_idx,
-                            ));
-                        }
-                        PtrInfo::Instance(iinfo) => {
-                            if let Some(gcref) = iinfo.known_class {
-                                if !gcref.is_null() {
-                                    let ss_idx = majit_gc::shadow_stack::push(gcref);
-                                    self.rooted_refs.push((
-                                        dummy_key,
-                                        ExportedGcRefField::BoxPoolInfoPtrInfoKnownClass(i),
-                                        ss_idx,
-                                    ));
-                                }
-                            }
-                        }
-                        _ => {}
+        for (i, b) in self.box_pool.iter_indexed() {
+            let forwarded = b.get_forwarded();
+            if let crate::r#box::Forwarded::Info(OpInfo::Ptr(rc)) = &forwarded {
+                let info = rc.borrow();
+                match &*info {
+                    PtrInfo::Constant(gcref) if !gcref.is_null() => {
+                        let ss_idx = majit_gc::shadow_stack::push(*gcref);
+                        self.rooted_refs.push((
+                            dummy_key,
+                            ExportedGcRefField::BoxPoolInfoPtrInfoConstant(i),
+                            ss_idx,
+                        ));
                     }
-                } else if let crate::r#box::Forwarded::Box(target) = &forwarded {
-                    if target.is_constant() {
-                        if let Some(Value::Ref(gcref)) = target.const_value() {
+                    PtrInfo::Instance(iinfo) => {
+                        if let Some(gcref) = iinfo.known_class {
                             if !gcref.is_null() {
                                 let ss_idx = majit_gc::shadow_stack::push(gcref);
                                 self.rooted_refs.push((
                                     dummy_key,
-                                    ExportedGcRefField::BoxPoolBoxConstRef(i),
+                                    ExportedGcRefField::BoxPoolInfoPtrInfoKnownClass(i),
                                     ss_idx,
                                 ));
                             }
+                        }
+                    }
+                    _ => {}
+                }
+            } else if let crate::r#box::Forwarded::Box(target) = &forwarded {
+                if target.is_constant() {
+                    if let Some(Value::Ref(gcref)) = target.const_value() {
+                        if !gcref.is_null() {
+                            let ss_idx = majit_gc::shadow_stack::push(gcref);
+                            self.rooted_refs.push((
+                                dummy_key,
+                                ExportedGcRefField::BoxPoolBoxConstRef(i),
+                                ss_idx,
+                            ));
                         }
                     }
                 }
@@ -2178,9 +2221,7 @@ impl ExportedState {
                     }
                 }
                 ExportedGcRefField::BoxPoolInfoPtrInfoConstant(i) => {
-                    if let Some(snapshot) = self.box_pool_snapshot.as_ref()
-                        && let Some(b) = snapshot.get_at_position(*i)
-                    {
+                    if let Some(b) = self.box_pool.get_at_position(*i) {
                         // RPython object identity: mutate the live Rc<RefCell<PtrInfo>>
                         // in place so any other handle sharing it sees the post-GC
                         // address. Matches PyPy's `_forwarded` Python object reference
@@ -2199,9 +2240,7 @@ impl ExportedState {
                     }
                 }
                 ExportedGcRefField::BoxPoolInfoPtrInfoKnownClass(i) => {
-                    if let Some(snapshot) = self.box_pool_snapshot.as_ref()
-                        && let Some(b) = snapshot.get_at_position(*i)
-                    {
+                    if let Some(b) = self.box_pool.get_at_position(*i) {
                         let rc = match &b.get_forwarded() {
                             crate::r#box::Forwarded::Info(OpInfo::Ptr(rc))
                                 if matches!(&*rc.borrow(), PtrInfo::Instance(_)) =>
@@ -2218,9 +2257,7 @@ impl ExportedState {
                     }
                 }
                 ExportedGcRefField::BoxPoolBoxConstRef(i) => {
-                    if let Some(snapshot) = self.box_pool_snapshot.as_ref()
-                        && let Some(b) = snapshot.get_at_position(*i)
-                    {
+                    if let Some(b) = self.box_pool.get_at_position(*i) {
                         // BoxKind::Const is immutable, so swap in a fresh
                         // ConstRef BoxRef carrying the updated handle.
                         // `set_forwarded_box` enforces the AbstractValue
@@ -2317,8 +2354,8 @@ impl Clone for ExportedState {
             short_inputargs: self.short_inputargs.clone(),
             runtime_boxes: self.runtime_boxes.clone(),
             patchguardop: self.patchguardop.clone(),
+            box_pool: self.box_pool.clone(),
             phase1_emit_high_water: self.phase1_emit_high_water,
-            box_pool_snapshot: self.box_pool_snapshot.clone(),
             rooted_refs: Vec::new(),
             shadow_stack_base: majit_gc::shadow_stack::depth(),
         }
@@ -2715,6 +2752,19 @@ impl OptUnroll {
         // via `produced_short_boxes_from_exported_boxes`
         // (`shortpreamble.rs:2100`). Storing both shapes on
         // `ExportedState` would risk drift across mutations.
+        // Capture the full Phase 1 BoxRef pool so a subsequent
+        // `compile_retrace` attempt can hand it back to Phase 2 as
+        // `p1_full_prefix` (`unroll.rs:282-303`).  Doubles as the
+        // `opref_high_water` ceiling — `reserve_pos` extends `box_pool`
+        // for every Phase 1 emit position, including intermediates that
+        // were forwarded/folded and never survive as an end_arg /
+        // short_op source, so retrace's Phase 2 namespace must clear
+        // `box_pool.len()` to stay disjoint.  PyPy `unroll.py` Phase 2
+        // observes Phase 1's `_forwarded` mutations through Python
+        // identity on the same Box objects; pyre needs the Rc::cloned
+        // BoxRef vector to recreate that observation across the
+        // in-memory ExportedState hand-off.  Each entry is `Rc::clone`
+        // cheap; vec retention is bounded by `ExportedState` lifetime.
         let mut state = ExportedState::new(
             label_args.clone(),
             resolved_next_iteration_args,
@@ -2724,27 +2774,14 @@ impl OptUnroll {
             renamed_inputargs.to_vec(),
             renamed_inputarg_types,
             short_args,
+            ctx.box_pool.clone(),
         );
-        // Smallest fresh OpRef strictly above every Phase 1 emit position.
-        // Retrace's `opref_high_water` consults this so Phase 2's namespace
-        // stays disjoint from intermediate Phase 1 ops that were forwarded
-        // and never survive as an end_arg / short_op source. `op.pos.0`
-        // is already non-NONE / non-Void by the rebuild filter.
-        state.phase1_emit_high_water = optimizer
-            .phase1_emit_ops
-            .iter()
-            .map(|op| op.pos.get().raw().saturating_add(1))
-            .max()
-            .unwrap_or(0);
-        // Capture the full Phase 1 BoxRef pool so a subsequent
-        // `compile_retrace` attempt can hand it back to Phase 2 as
-        // `p1_full_prefix` (`unroll.rs:282-303`). PyPy `unroll.py` Phase 2
-        // observes Phase 1's `_forwarded` mutations through Python identity
-        // on the same Box objects; pyre needs the Rc::cloned BoxRef vector
-        // to recreate that observation across the in-memory ExportedState
-        // hand-off. Each entry is `Rc::clone` cheap; vec retention is
-        // bounded by `ExportedState` lifetime.
-        state.box_pool_snapshot = Some(ctx.box_pool.clone());
+        // `OptContext::next_pos` is the strict upper bound on raw OpRefs
+        // Phase 1 allocated.  Captured here so `opref_high_water()` can
+        // floor Phase 2 / retrace's `start_fresh` above every Phase 1
+        // emit position even when `box_pool` was not extended (zero-
+        // inputarg / retrace baselines — `optimizeopt/mod.rs:2026`).
+        state.phase1_emit_high_water = ctx.next_pos;
         // PRE-EXISTING-ADAPTATION: snapshot producer-side const values for
         // any const-namespace OpRef referenced by `short_boxes` op args.
         // Phase B.2 `ProducedShortOp::produce_op` reads raw OpRefs (not the
@@ -5026,7 +5063,7 @@ mod tests {
     }
 
     #[test]
-    fn test_retrace_box_pool_snapshot_preserves_inputargs_for_p1_full_prefix() {
+    fn test_retrace_box_pool_preserves_inputargs_for_p1_full_prefix() {
         let input0 = crate::r#box::BoxRef::new_inputarg(Type::Ref, 0);
         let input1 = crate::r#box::BoxRef::new_inputarg(Type::Int, 1);
         let emit2 = crate::r#box::BoxRef::new_resop(Type::Ref, 2);
@@ -5038,8 +5075,7 @@ mod tests {
             Some(emit3.clone()),
         ]);
 
-        let prefix =
-            p1_full_prefix_from_box_pool_snapshot(Some(&snapshot)).expect("snapshot exists");
+        let prefix = p1_full_prefix_from_box_pool(&snapshot).expect("non-empty pool");
 
         let prefix_slots: Vec<Option<crate::r#box::BoxRef>> = (0..prefix.len())
             .map(|i| prefix.get_at_position(i).cloned())
@@ -5047,6 +5083,11 @@ mod tests {
         assert_eq!(
             prefix_slots,
             vec![Some(input0), Some(input1), Some(emit2), Some(emit3)]
+        );
+
+        assert!(
+            p1_full_prefix_from_box_pool(&crate::r#box::BoxPool::default()).is_none(),
+            "empty pool maps to None for TraceIterator p1_full_prefix"
         );
     }
 
@@ -5061,6 +5102,7 @@ mod tests {
             vec![OpRef::int_op(14)],
             Vec::new(),
             vec![OpRef::int_op(23)],
+            crate::r#box::BoxPool::default(),
         );
 
         assert_eq!(exported.opref_high_water(), 110);
@@ -5073,7 +5115,7 @@ mod tests {
         // rationale — the preamble exporter needs an intrinsic type
         // for every renamed inputarg, which production derives from
         // the recorder's trace_inputarg_types.
-        opt.trace_inputarg_types = vec![majit_ir::Type::Ref; 1024];
+        opt.trace_inputargs = majit_ir::OpRef::inputarg_refs(&vec![majit_ir::Type::Ref; 1024]);
         // Production trace iteration gets rd_resume_position from
         // opencoder.py:399-401.  Direct unit-test guards must seed the
         // corresponding snapshot explicitly before store_final_boxes_in_guard.
@@ -5529,7 +5571,7 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptUnroll::new()));
-        opt.trace_inputarg_types = vec![majit_ir::Type::Ref; 1024];
+        opt.trace_inputargs = majit_ir::OpRef::inputarg_refs(&vec![majit_ir::Type::Ref; 1024]);
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
         let result = opt.optimize_with_constants_and_inputs(
@@ -5641,21 +5683,19 @@ mod tests {
     #[test]
     fn test_unroll_optimizer_optimize_trace() {
         let mut unroll_opt = UnrollOptimizer::new();
-        // IntAdd operates on Int-typed inputs — seed the inner phase1/2
-        // optimizers' trace_inputarg_types via UnrollOptimizer so the
-        // intbounds pass sees Int on the two inputargs.
-        unroll_opt.trace_inputarg_types = vec![majit_ir::Type::Int; 2];
-        // Use optimize_trace_with_constants_and_inputs to properly set
-        // num_inputs so input args don't collide with op positions. Args
-        // address inputarg slots via `InputArg*` OpRef variants so the
-        // BoxRef shape (`with_inputarg_types` plants `BoxRef::new_inputarg`)
-        // and the orthodox `_forwarded` mirror agree on the namespace.
+        // Two Int inputargs.  Use `InputArgInt` variants via
+        // `OpRef::inputarg_refs` to match resoperation.py:719
+        // `AbstractInputArg` class identity — the prior fixture used
+        // `OpRef::int_op` (`AbstractResOp` mixin) at inputarg slots, so
+        // the type check passed but the variant tag PyPy's
+        // `isinstance(x, InputArgInt)` reads diverged.  Seeding
+        // `trace_inputargs` mirrors the same intent for the
+        // intbounds pass / `with_inputarg_types` BoxRef planter.
+        let inputargs = OpRef::inputarg_refs(&[majit_ir::Type::Int, majit_ir::Type::Int]);
+        unroll_opt.trace_inputargs = inputargs.clone();
         let mut ops = vec![
-            Op::new(
-                OpCode::IntAdd,
-                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
-            ),
-            Op::new(OpCode::Jump, &[OpRef::input_arg_int(0)]),
+            Op::new(OpCode::IntAdd, &[inputargs[0], inputargs[1]]),
+            Op::new(OpCode::Jump, &[inputargs[0]]),
         ];
         assign_positions(&mut ops, 2);
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
@@ -5936,6 +5976,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             vec![source],
+            crate::r#box::BoxPool::default(),
         );
         let mut ctx = crate::optimizeopt::OptContext::with_inputarg_types(
             8,
