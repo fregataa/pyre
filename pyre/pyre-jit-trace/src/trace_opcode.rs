@@ -797,8 +797,6 @@ impl MIFrame {
             orgpc,
             pre_opcode_registers_r: None,
             pre_opcode_semantic_depth: None,
-            suppress_guard_no_exception_for_opcode: false,
-            pre_opcode_op_count: None,
             parent_frames: Vec::new(),
             pending_result_stack_idx: None,
             pending_result_type: None,
@@ -4984,7 +4982,6 @@ impl MIFrame {
                     );
                     Ok::<_, PyError>(())
                 })?;
-                self.suppress_guard_no_exception_for_opcode = true;
                 return Ok(());
             }
         }
@@ -5002,12 +4999,6 @@ impl MIFrame {
             ))
         })?;
         if handled {
-            // RPython parity: once STORE_SUBSCR is lowered through
-            // jtransform's list strategy primitive path, the emitted ops are
-            // guard_class/check_index/setarrayitem, not an exc=True residual
-            // call.  The generic bytecode-level may-raise classification must
-            // not append GUARD_NO_EXCEPTION to this primitive lowering.
-            self.suppress_guard_no_exception_for_opcode = true;
             return Ok(());
         }
         self.trace_store_subscr(obj, key, value)
@@ -5126,7 +5117,7 @@ impl MIFrame {
         if concrete_list.is_null() || unsafe { !is_list(concrete_list) } {
             return self.trace_call_callable(callable, &[]);
         }
-        self.with_ctx(|this, ctx| {
+        let result = self.with_ctx(|this, ctx| {
             this.guard_class(ctx, list, &LIST_TYPE as *const PyType);
             crate::helpers::emit_trace_call_void_typed(
                 ctx,
@@ -5134,8 +5125,10 @@ impl MIFrame {
                 &[list],
                 &[Type::Ref],
             );
-            Ok(ctx.const_ref(pyre_object::w_none() as i64))
-        })
+            ctx.const_ref(pyre_object::w_none() as i64)
+        });
+        self.trace_record_no_exception_guard();
+        Ok(result)
     }
 
     pub(crate) fn concrete_iter_continues(
@@ -5150,10 +5143,12 @@ impl MIFrame {
         callable: OpRef,
         args: &[OpRef],
     ) -> Result<OpRef, PyError> {
-        self.with_ctx(|this, ctx| {
+        let result = self.with_ctx(|this, ctx| {
             let boxed_args = box_args_for_python_helper(this, ctx, args);
             crate::helpers::emit_trace_call_known_builtin(ctx, callable, &boxed_args)
-        })
+        })?;
+        self.trace_record_no_exception_guard();
+        Ok(result)
     }
 
     pub(crate) fn direct_len_value(
@@ -5483,11 +5478,13 @@ impl MIFrame {
                     return self
                         .direct_minmax_value(callable, args[0], args[1], true, c_arg0, c_arg1);
                 }
-                return self.with_ctx(|this, ctx| {
+                let result = self.with_ctx(|this, ctx| {
                     this.implement_guard_value(ctx, callable, concrete_callable as i64);
                     let boxed_args = box_args_for_python_helper(this, ctx, args);
                     crate::helpers::emit_trace_call_known_builtin(ctx, callable, &boxed_args)
-                });
+                })?;
+                self.trace_record_no_exception_guard();
+                return Ok(result);
             }
             if is_function(concrete_callable) {
                 let w_callee_code = pyre_interpreter::getcode(concrete_callable);
@@ -5731,6 +5728,7 @@ impl MIFrame {
                             // pyjitpl.py:2079
                             this.push_call_replay_stack(ctx, callable, args, call_pc);
                             this.generate_guard(ctx, OpCode::GuardNotForced, &[]);
+                            this.generate_guard(ctx, OpCode::GuardNoException, &[]);
                             ctx.heap_cache_mut().invalidate_caches_for_escaped();
                             this.pop_call_replay_stack(ctx, args.len())?;
                             let result = if inline_framestack_active {
@@ -5805,6 +5803,7 @@ impl MIFrame {
                                 )?;
                                 this.push_call_replay_stack(ctx, callable, args, call_pc);
                                 this.generate_guard(ctx, OpCode::GuardNotForced, &[]);
+                                this.generate_guard(ctx, OpCode::GuardNoException, &[]);
                                 ctx.heap_cache_mut().invalidate_caches_for_escaped();
                                 this.pop_call_replay_stack(ctx, args.len())?;
                                 Ok(result)
@@ -5866,6 +5865,7 @@ impl MIFrame {
                                 // pyjitpl.py:2079
                                 this.push_call_replay_stack(ctx, callable, args, call_pc);
                                 this.generate_guard(ctx, OpCode::GuardNotForced, &[]);
+                                this.generate_guard(ctx, OpCode::GuardNoException, &[]);
                                 ctx.heap_cache_mut().invalidate_caches_for_escaped();
                                 this.pop_call_replay_stack(ctx, args.len())?;
                                 let result = if inline_framestack_active {
@@ -5897,6 +5897,7 @@ impl MIFrame {
                     )?;
                     this.push_call_replay_stack(ctx, callable, args, call_pc);
                     this.generate_guard(ctx, OpCode::GuardNotForced, &[]);
+                    this.generate_guard(ctx, OpCode::GuardNoException, &[]);
                     ctx.heap_cache_mut().invalidate_caches_for_escaped();
                     this.pop_call_replay_stack(ctx, args.len())?;
                     Ok(result)
@@ -6079,6 +6080,9 @@ impl MIFrame {
                     panic!("no frame helper for {} args", frame_args.len());
                 }
             });
+            // PyPy `recursive_call_*` emits GUARD_NO_EXCEPTION right after
+            // the callee-frame build helper (pyjitpl.py:2106).
+            self.trace_record_no_exception_guard();
 
             let mut sym = PyreSym::new_uninit(callee_frame_opref);
             sym.nlocals = callee_nlocals;
@@ -6330,6 +6334,7 @@ impl MIFrame {
                     // residual-call path (CA and CALL_MAY_FORCE alike).
                     this.push_call_replay_stack(ctx, callable, args, call_pc);
                     this.generate_guard(ctx, OpCode::GuardNotForced, &[]);
+                    this.generate_guard(ctx, OpCode::GuardNoException, &[]);
                     ctx.heap_cache_mut().invalidate_caches_for_escaped();
                     this.pop_call_replay_stack(ctx, args.len())?;
                     // CA-path-only: unbox boxed result via guard_class + getfield_gc_i.
@@ -6354,6 +6359,7 @@ impl MIFrame {
                     this.vable_after_residual_call()?;
                     this.push_call_replay_stack(ctx, callable, args, call_pc);
                     this.generate_guard(ctx, OpCode::GuardNotForced, &[]);
+                    this.generate_guard(ctx, OpCode::GuardNoException, &[]);
                     ctx.heap_cache_mut().invalidate_caches_for_escaped();
                     this.pop_call_replay_stack(ctx, args.len())?;
                     result
@@ -6379,6 +6385,7 @@ impl MIFrame {
                 this.vable_after_residual_call()?;
                 this.push_call_replay_stack(ctx, callable, args, call_pc);
                 this.generate_guard(ctx, OpCode::GuardNotForced, &[]);
+                this.generate_guard(ctx, OpCode::GuardNoException, &[]);
                 ctx.heap_cache_mut().invalidate_caches_for_escaped();
                 this.pop_call_replay_stack(ctx, args.len())?;
                 ctx.call_void(
@@ -6717,15 +6724,6 @@ impl MIFrame {
 
         self.set_orgpc(pc);
         self.prepare_fallthrough();
-        self.suppress_guard_no_exception_for_opcode = false;
-        // Snapshot op count so handle_possible_exception can detect
-        // whether this bytecode emitted any CALL_* family op. PyPy
-        // records GUARD_NO_EXCEPTION only inside `do_residual_call`
-        // (pyjitpl.py:2082); pyre's end-of-bytecode emit must replicate
-        // that gating so inlined primitive bodies (int_*_ovf + boxing
-        // + guards) don't accrete orphan exception guards.
-        let pre_op_count = self.with_ctx(|_this, ctx| ctx.num_ops() as u32);
-        self.pre_opcode_op_count = Some(pre_op_count);
         // RPython pyjitpl.py captures resumedata at each guard site, not at
         // every opcode boundary. Pyre still needs an opcode-start snapshot
         // for stack-machine opcodes that can mutate stack/register state
@@ -6850,7 +6848,7 @@ impl MIFrame {
         // RPython pyjitpl.py:1956-1957 execute_varargs: exc=True ops
         // always call handle_possible_exception, which internally decides
         // GUARD_EXCEPTION vs GUARD_NO_EXCEPTION.
-        if instruction_may_raise(instruction) && !self.suppress_guard_no_exception_for_opcode {
+        if instruction_may_raise(instruction) {
             let action = self.handle_possible_exception(code, pc);
             if !matches!(action, TraceAction::Continue) {
                 return action;
@@ -6962,32 +6960,9 @@ impl MIFrame {
             // RERAISE-issuing site is the only producer of reraise_lasti.
             self.finishframe_exception(code, pc, -1)
         } else {
-            // pyjitpl.py:3397: GUARD_NO_EXCEPTION.
-            //
-            // PyPy emits `GUARD_NO_EXCEPTION` only inside `do_residual_call`
-            // (pyjitpl.py:2082), so the guard exists only when the bytecode
-            // actually recorded a CALL_* family op that could have set the
-            // exception flag. Pyre's `handle_possible_exception` runs at
-            // every may-raise bytecode end regardless of the inner
-            // dispatch's structure, which leaves orphan exception guards
-            // after bytecodes whose body inlined entirely to primitives
-            // (e.g., `int_mul_ovf` + boxing/guards from `mul(x, x)`). Skip
-            // the emit when the bytecode's recording window contains no
-            // CALL_* op — mirrors PyPy's structural invariant at recording
-            // time, avoiding the post-opt `optimize_GUARD_NO_EXCEPTION`
-            // dependency on the `last_emitted_operation is REMOVED`
-            // sentinel (optimizeopt/heap.py:692) which pyre's per-pass
-            // `last_emitted_was_removed` flag cannot preserve across
-            // intermediate is_always_pure ops.
-            let skip = match self.pre_opcode_op_count {
-                Some(start) => self.with_ctx(|_this, ctx| !ctx.any_call_recorded_since(start)),
-                None => false,
-            };
-            if !skip {
-                self.with_ctx(|this, ctx| {
-                    this.generate_guard(ctx, majit_ir::OpCode::GuardNoException, &[]);
-                });
-            }
+            // Per-caller GUARD_NO_EXCEPTION is emitted inline at each
+            // can-raise CALL_* site (pyjitpl.py:2082 do_residual_call), so
+            // no fallback emit is needed when no exception was observed.
             TraceAction::Continue
         }
     }
@@ -7256,15 +7231,6 @@ impl MIFrame {
 
         self.set_orgpc(pc);
         self.prepare_fallthrough();
-        self.suppress_guard_no_exception_for_opcode = false;
-        // Snapshot op count so handle_possible_exception can detect
-        // whether this bytecode emitted any CALL_* family op. PyPy
-        // records GUARD_NO_EXCEPTION only inside `do_residual_call`
-        // (pyjitpl.py:2082); pyre's end-of-bytecode emit must replicate
-        // that gating so inlined primitive bodies (int_*_ovf + boxing
-        // + guards) don't accrete orphan exception guards.
-        let pre_op_count = self.with_ctx(|_this, ctx| ctx.num_ops() as u32);
-        self.pre_opcode_op_count = Some(pre_op_count);
         // Keep inline-frame guard capture aligned with the root-frame path:
         // only opcodes that can actually reach a guard carry an opcode-start
         // snapshot, and specific guard paths may still suppress it.
@@ -7396,7 +7362,7 @@ impl MIFrame {
                 return InlineTraceStepAction::Trace(self.handle_possible_exception(code, pc));
             }
         }
-        if instruction_may_raise(instruction) && !self.suppress_guard_no_exception_for_opcode {
+        if instruction_may_raise(instruction) {
             let exc_action = self.handle_possible_exception(code, pc);
             if !matches!(exc_action, TraceAction::Continue) {
                 return InlineTraceStepAction::Trace(exc_action);
@@ -7733,13 +7699,22 @@ impl TraceHelperAccess for MIFrame {
         });
     }
 
+    fn trace_record_no_exception_guard(&mut self) {
+        self.with_ctx(|this, ctx| {
+            this.generate_guard(ctx, OpCode::GuardNoException, &[]);
+        });
+    }
+
     fn trace_call_callable(&mut self, callable: OpRef, args: &[OpRef]) -> Result<OpRef, PyError> {
         let frame = self.trace_frame();
         let result = self.with_ctx(|this, ctx| {
             let boxed_args = box_args_for_python_helper(this, ctx, args);
             crate::helpers::emit_trace_call_callable(ctx, frame, callable, &boxed_args)
         })?;
+        // may-force CanRaise: GuardNotForced + GuardNoException, matching
+        // PyPy `execute_varargs` ordering.
         self.trace_record_not_forced_guard();
+        self.trace_record_no_exception_guard();
         Ok(result)
     }
 
@@ -7749,11 +7724,13 @@ impl TraceHelperAccess for MIFrame {
         b: OpRef,
         op: pyre_interpreter::bytecode::BinaryOperator,
     ) -> Result<OpRef, PyError> {
-        self.with_ctx(|this, ctx| {
+        let result = self.with_ctx(|this, ctx| {
             let lhs = box_value_for_python_helper(this, ctx, a);
             let rhs = box_value_for_python_helper(this, ctx, b);
             crate::helpers::emit_trace_binary_value(ctx, lhs, rhs, op)
-        })
+        })?;
+        self.trace_record_no_exception_guard();
+        Ok(result)
     }
 }
 
@@ -8726,8 +8703,6 @@ mod tests {
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
             pre_opcode_semantic_depth: None,
-            suppress_guard_no_exception_for_opcode: false,
-            pre_opcode_op_count: None,
         };
 
         let active = frame.get_list_of_active_boxes(&mut ctx, false, false);
@@ -8803,8 +8778,6 @@ mod tests {
             concrete_frame_addr: 0,
             pre_opcode_registers_r: Some(vec![local0, local1, stack0]),
             pre_opcode_semantic_depth: Some(3),
-            suppress_guard_no_exception_for_opcode: false,
-            pre_opcode_op_count: None,
         };
 
         let active = frame.get_list_of_active_boxes(&mut ctx, false, false);

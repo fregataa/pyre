@@ -1373,21 +1373,6 @@ impl TraceCtx {
         self.recorder.num_ops()
     }
 
-    /// Whether the recorder contains any `Call*` family op at or after
-    /// position `start`. Used by `handle_possible_exception` to decide
-    /// if the current bytecode actually performed a residual call that
-    /// could have set the exception flag; absent any such call no
-    /// `GUARD_NO_EXCEPTION` need be recorded (PyPy parity: `do_residual_call`
-    /// pyjitpl.py:2082 is the only emit site).
-    pub fn any_call_recorded_since(&self, start: u32) -> bool {
-        let start = start as usize;
-        let ops = self.recorder.ops();
-        if start >= ops.len() {
-            return false;
-        }
-        ops[start..].iter().any(|op| op.opcode.is_call())
-    }
-
     /// The structured green key values, if provided.
     pub fn green_key_values(&self) -> Option<&GreenKey> {
         self.green_key_values.as_ref()
@@ -5027,78 +5012,5 @@ mod tests {
                 Some(info.array_item_descr(0).index())
             );
         }
-    }
-
-    /// `any_call_recorded_since` is the gate consulted by
-    /// `handle_possible_exception` to decide whether GUARD_NO_EXCEPTION
-    /// should fire. PyPy `pyjitpl.py:2082` only emits this guard inside
-    /// `do_residual_call`, so the gate returns false when no Call* op
-    /// has been recorded within the current opcode window.
-    #[test]
-    fn any_call_recorded_since_empty_recorder_is_false() {
-        let recorder = Trace::new();
-        let ctx = TraceCtx::new(
-            recorder,
-            0,
-            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
-        );
-        assert!(!ctx.any_call_recorded_since(0));
-    }
-
-    #[test]
-    fn any_call_recorded_since_non_call_op_is_false() {
-        let mut recorder = Trace::new();
-        let a = recorder.record_input_arg(Type::Int);
-        let b = recorder.record_input_arg(Type::Int);
-        let mut ctx = TraceCtx::new(
-            recorder,
-            0,
-            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
-        );
-        let start = ctx.num_ops() as u32;
-        ctx.record_op(OpCode::IntAdd, &[a, b]);
-        // A pure arithmetic op cannot raise, so the gate stays false.
-        assert!(!ctx.any_call_recorded_since(start));
-    }
-
-    #[test]
-    fn any_call_recorded_since_call_op_is_true() {
-        let mut recorder = Trace::new();
-        let a = recorder.record_input_arg(Type::Int);
-        let mut ctx = TraceCtx::new(
-            recorder,
-            0,
-            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
-        );
-        let start = ctx.num_ops() as u32;
-        let descr = majit_ir::descr::make_call_descr(
-            vec![Type::Int],
-            Type::Int,
-            majit_ir::EffectInfo::default(),
-        );
-        ctx.record_op_with_descr(OpCode::CallI, &[a], descr);
-        // A CALL_* op was recorded after the snapshot — gate fires.
-        assert!(ctx.any_call_recorded_since(start));
-    }
-
-    #[test]
-    fn any_call_recorded_since_pre_start_call_is_false() {
-        let mut recorder = Trace::new();
-        let a = recorder.record_input_arg(Type::Int);
-        let mut ctx = TraceCtx::new(
-            recorder,
-            0,
-            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
-        );
-        let descr = majit_ir::descr::make_call_descr(
-            vec![Type::Int],
-            Type::Int,
-            majit_ir::EffectInfo::default(),
-        );
-        ctx.record_op_with_descr(OpCode::CallI, &[a], descr);
-        let start = ctx.num_ops() as u32;
-        // start points past the recorded call; nothing has been recorded
-        // in the new window so the gate stays false.
-        assert!(!ctx.any_call_recorded_since(start));
     }
 }

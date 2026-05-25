@@ -1647,21 +1647,6 @@ pub struct MIFrame {
     /// bank may include post-regalloc color slots above the semantic
     /// locals+stack prefix.
     pub(crate) pre_opcode_semantic_depth: Option<usize>,
-    /// When a Python bytecode normally classified as may-raise is handled by
-    /// a generated jtransform-style primitive lowering, the opcode is no
-    /// longer an `exc=True` residual call and must not emit the trailing
-    /// GUARD_NO_EXCEPTION for this one step.
-    pub(crate) suppress_guard_no_exception_for_opcode: bool,
-    /// Recorder op count snapshot at the start of the current bytecode.
-    /// Used by `handle_possible_exception` to detect whether a
-    /// `GUARD_NO_EXCEPTION` is required — mirrors PyPy's invariant that
-    /// `GUARD_NO_EXCEPTION` is recorded only by `do_residual_call`
-    /// (pyjitpl.py:2082), i.e. only when the bytecode actually emitted a
-    /// `CALL_*` family op. Pyre's `handle_possible_exception` runs at
-    /// every may-raise bytecode end regardless of what the inner dispatch
-    /// emitted, so the recording-time skip checks the bytecode's
-    /// recording window for a `Call*` op.
-    pub(crate) pre_opcode_op_count: Option<u32>,
     /// PyPy capture_resumedata: parent frame chain for multi-frame guards.
     /// Each entry points at one parent frame plus the resumepc that
     /// should be used when that parent is snapshotted. This stays much
@@ -5531,27 +5516,19 @@ impl JitState for PyreJitState {
         _header_pc: usize,
         original_boxes: &[majit_metainterp::GreenBox],
     ) -> PyreMeta {
-        let original_box_types: Vec<Type> = original_boxes.iter().map(|gb| gb.ty).collect();
-        let original_box_types = &original_box_types[..];
+        let original_box_count = original_boxes.len();
         // `NUM_SCALAR_INPUTARGS` already counts `NUM_EXTRA_REDS` (frame +
         // extra_reds + vable scalars), so do NOT add `trace_extra_reds`.
         use crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
         let _ = provisional.trace_extra_reds; // staging copy only
         // RPython parity: Python locals/stack are always Ref.
-        let slot_types = if original_box_types.len() >= NUM_SCALAR_INPUTARGS {
-            vec![
-                Type::Ref;
-                original_box_types
-                    .len()
-                    .saturating_sub(NUM_SCALAR_INPUTARGS)
-            ]
+        let slot_types = if original_box_count >= NUM_SCALAR_INPUTARGS {
+            vec![Type::Ref; original_box_count.saturating_sub(NUM_SCALAR_INPUTARGS)]
         } else {
             Vec::new()
         };
-        let array_capacity = if original_box_types.len() >= NUM_SCALAR_INPUTARGS {
-            original_box_types
-                .len()
-                .saturating_sub(NUM_SCALAR_INPUTARGS)
+        let array_capacity = if original_box_count >= NUM_SCALAR_INPUTARGS {
+            original_box_count.saturating_sub(NUM_SCALAR_INPUTARGS)
         } else {
             provisional.array_capacity
         };
@@ -6442,14 +6419,29 @@ mod tests {
     /// `MetaInterpStaticData.jitcodes` list is now populated only by
     /// `CodeWriter.make_jitcodes()` (warmspot.py:281-282); tests that
     /// exercise tracer logic directly must still arrive at that
-    /// post-`make_jitcodes` state, so we install a minimal populated
-    /// stub here.
+    /// post-`make_jitcodes` state, so we install a minimal assembled
+    /// jitcode with a `live/` anchor at offset 0 — every can-raise
+    /// CALL_* in the tracer now emits an inline `GuardNoException`
+    /// (pyjitpl.py:2082) whose resumedata snapshot routes through
+    /// `get_list_of_active_boxes` → `JitCode::get_live_vars_info`
+    /// (jitcode.py:80-93), so the test fixture must satisfy that
+    /// liveness lookup.
     fn install_test_jitcode(code: &CodeObject, code_ref: *const ()) {
         let raw_code = unsafe {
             pyre_interpreter::w_code_get_ptr(code_ref as pyre_object::PyObjectRef)
                 as *const CodeObject
         };
+        let mut builder = majit_metainterp::JitCodeBuilder::default();
+        let live_patch = builder.live_placeholder();
+        builder.patch_live_offset(live_patch, 0);
+        let mut insns = majit_ir::VecAssoc::new();
+        insns.insert(
+            "live/".to_string(),
+            majit_metainterp::jitcode::insns::BC_LIVE,
+        );
+        crate::assembler::publish_state(&insns, &[0, 0, 0], 3, 1);
         let mut pyjit = crate::PyJitCode::skeleton(raw_code, code_ref, None);
+        pyjit.jitcode = std::sync::Arc::new(builder.finish());
         pyjit.metadata.pc_map.resize(code.instructions.len(), 0);
         METAINTERP_SD.with(|r| {
             r.borrow_mut()
@@ -6783,9 +6775,6 @@ mod tests {
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
             pre_opcode_semantic_depth: None,
-            suppress_guard_no_exception_for_opcode: false,
-
-            pre_opcode_op_count: None,
         };
 
         let err = OpcodeStepExecutor::reraise(&mut state, 0).expect_err("reraise should raise");
@@ -6835,9 +6824,6 @@ mod tests {
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
             pre_opcode_semantic_depth: None,
-            suppress_guard_no_exception_for_opcode: false,
-
-            pre_opcode_op_count: None,
         };
 
         let err = OpcodeStepExecutor::reraise(&mut state, 1).expect_err("reraise should raise");
@@ -6880,9 +6866,6 @@ mod tests {
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
             pre_opcode_semantic_depth: None,
-            suppress_guard_no_exception_for_opcode: false,
-
-            pre_opcode_op_count: None,
         };
 
         let err = OpcodeStepExecutor::reraise(&mut state, 1).expect_err("reraise should raise");
@@ -6915,9 +6898,6 @@ mod tests {
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
             pre_opcode_semantic_depth: None,
-            suppress_guard_no_exception_for_opcode: false,
-
-            pre_opcode_op_count: None,
         };
 
         let err =
@@ -6945,9 +6925,6 @@ mod tests {
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
             pre_opcode_semantic_depth: None,
-            suppress_guard_no_exception_for_opcode: false,
-
-            pre_opcode_op_count: None,
         };
 
         <MIFrame as SharedOpcodeHandler>::push_value(
@@ -6983,9 +6960,6 @@ mod tests {
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
             pre_opcode_semantic_depth: None,
-            suppress_guard_no_exception_for_opcode: false,
-
-            pre_opcode_op_count: None,
         };
 
         <MIFrame as SharedOpcodeHandler>::push_value(
@@ -7031,9 +7005,6 @@ mod tests {
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
             pre_opcode_semantic_depth: None,
-            suppress_guard_no_exception_for_opcode: false,
-
-            pre_opcode_op_count: None,
         };
 
         <MIFrame as SharedOpcodeHandler>::push_value(
@@ -7079,9 +7050,6 @@ mod tests {
             concrete_frame_addr: (&mut *frame) as *mut pyre_interpreter::PyFrame as usize,
             pre_opcode_registers_r: None,
             pre_opcode_semantic_depth: None,
-            suppress_guard_no_exception_for_opcode: false,
-
-            pre_opcode_op_count: None,
         };
 
         <MIFrame as SharedOpcodeHandler>::push_value(
@@ -7119,9 +7087,6 @@ mod tests {
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
             pre_opcode_semantic_depth: None,
-            suppress_guard_no_exception_for_opcode: false,
-
-            pre_opcode_op_count: None,
         };
 
         <MIFrame as SharedOpcodeHandler>::push_value(
@@ -7165,9 +7130,6 @@ mod tests {
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
             pre_opcode_semantic_depth: None,
-            suppress_guard_no_exception_for_opcode: false,
-
-            pre_opcode_op_count: None,
         };
 
         <MIFrame as SharedOpcodeHandler>::push_value(
@@ -7270,9 +7232,6 @@ mod tests {
             concrete_frame_addr: (&mut *frame) as *mut pyre_interpreter::PyFrame as usize,
             pre_opcode_registers_r: None,
             pre_opcode_semantic_depth: None,
-            suppress_guard_no_exception_for_opcode: false,
-
-            pre_opcode_op_count: None,
         };
 
         <MIFrame as SharedOpcodeHandler>::push_value(
@@ -7318,9 +7277,6 @@ mod tests {
             concrete_frame_addr: (&mut *frame) as *mut pyre_interpreter::PyFrame as usize,
             pre_opcode_registers_r: None,
             pre_opcode_semantic_depth: None,
-            suppress_guard_no_exception_for_opcode: false,
-
-            pre_opcode_op_count: None,
         };
 
         frame.push(caught_exc);
@@ -7593,9 +7549,6 @@ mod tests {
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
             pre_opcode_semantic_depth: None,
-            suppress_guard_no_exception_for_opcode: false,
-
-            pre_opcode_op_count: None,
         };
 
         state.with_ctx(|this, ctx| {
@@ -7635,9 +7588,6 @@ mod tests {
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
             pre_opcode_semantic_depth: None,
-            suppress_guard_no_exception_for_opcode: false,
-
-            pre_opcode_op_count: None,
         };
 
         let _ = state.with_ctx(|this, ctx| this.trace_guarded_int_payload(ctx, int_obj));
@@ -7685,9 +7635,6 @@ mod tests {
                 concrete_frame_addr: 0,
                 pre_opcode_registers_r: None,
                 pre_opcode_semantic_depth: None,
-                suppress_guard_no_exception_for_opcode: false,
-
-                pre_opcode_op_count: None,
             };
             trace_unbox_int_with_resume(
                 &mut state,
@@ -7718,7 +7665,7 @@ mod tests {
     fn test_load_method_accepts_plain_python_instance_method() {
         let code = compile_exec("class C:\n    def f(self):\n        return self\nc = C()\n")
             .expect("compile failed");
-        let mut frame = pyre_interpreter::PyFrame::new(code);
+        let mut frame = pyre_interpreter::PyFrame::new(code.clone());
         frame
             .execute_frame(None, None)
             .expect("class body should execute");
@@ -7729,8 +7676,10 @@ mod tests {
                 .expect("namespace should contain c")
         };
 
+        install_test_jitcode(&code, frame.pycode);
         let mut ctx = TraceCtx::for_test(1);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
+        sym.jitcode = jitcode_for(frame.pycode);
 
         let mut state = MIFrame {
             ctx: &mut ctx,
@@ -7744,9 +7693,6 @@ mod tests {
             concrete_frame_addr: (&mut *frame) as *mut pyre_interpreter::PyFrame as usize,
             pre_opcode_registers_r: None,
             pre_opcode_semantic_depth: None,
-            suppress_guard_no_exception_for_opcode: false,
-
-            pre_opcode_op_count: None,
         };
 
         let instance_ref = ctx.const_ref(instance as i64);
@@ -8121,9 +8067,6 @@ mod tests {
                 concrete_frame_addr: 0,
                 pre_opcode_registers_r: None,
                 pre_opcode_semantic_depth: None,
-                suppress_guard_no_exception_for_opcode: false,
-
-                pre_opcode_op_count: None,
             };
 
             let loaded =
@@ -8176,9 +8119,6 @@ mod tests {
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
             pre_opcode_semantic_depth: None,
-            suppress_guard_no_exception_for_opcode: false,
-
-            pre_opcode_op_count: None,
         };
 
         state
@@ -8194,10 +8134,16 @@ mod tests {
 
     #[test]
     fn test_trace_binary_value_boxes_typed_raw_operands_for_python_helper() {
+        let code = compile_exec("x = 1.0 ** 2").expect("test code should compile");
+        let code_ref =
+            pyre_interpreter::w_code_new(Box::into_raw(Box::new(code.clone())) as *const ())
+                as *const ();
+        install_test_jitcode(&code, code_ref);
         let mut ctx = TraceCtx::for_test(2);
         let lhs = OpRef::input_arg_float(0);
         let rhs = OpRef::input_arg_int(1);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
+        sym.jitcode = jitcode_for(code_ref);
         sym.registers_r = vec![lhs, rhs];
         sym.symbolic_local_types = vec![Type::Float, Type::Int];
         sym.nlocals = 2;
@@ -8214,9 +8160,6 @@ mod tests {
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
             pre_opcode_semantic_depth: None,
-            suppress_guard_no_exception_for_opcode: false,
-
-            pre_opcode_op_count: None,
         };
 
         let _ = <MIFrame as TraceHelperAccess>::trace_binary_value(
@@ -8228,21 +8171,35 @@ mod tests {
         .expect("generic helper call should box raw operands first");
 
         let recorder = ctx.into_recorder();
-        let call = recorder.ops().last().expect("call op should be present");
-        assert!(matches!(
-            call.opcode,
-            OpCode::CallI | OpCode::CallR | OpCode::CallF | OpCode::CallN
-        ));
+        // GuardNoException (pyjitpl.py:2082) follows the residual Call*, so
+        // look up the Call* op explicitly rather than via `ops().last()`.
+        let call = recorder
+            .ops()
+            .iter()
+            .rev()
+            .find(|op| {
+                matches!(
+                    op.opcode,
+                    OpCode::CallI | OpCode::CallR | OpCode::CallF | OpCode::CallN
+                )
+            })
+            .expect("call op should be present");
         assert_ne!(call.arg(0), lhs);
         assert_ne!(call.arg(1), rhs);
     }
 
     #[test]
     fn test_trace_known_builtin_call_boxes_typed_raw_args_for_python_helper_boundary() {
+        let code = compile_exec("x = abs(1)").expect("test code should compile");
+        let code_ref =
+            pyre_interpreter::w_code_new(Box::into_raw(Box::new(code.clone())) as *const ())
+                as *const ();
+        install_test_jitcode(&code, code_ref);
         let mut ctx = TraceCtx::for_test(2);
         let callable = OpRef::input_arg_ref(0);
         let arg = OpRef::input_arg_int(1);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
+        sym.jitcode = jitcode_for(code_ref);
         sym.registers_r = vec![callable, arg];
         sym.symbolic_local_types = vec![Type::Ref, Type::Int];
         sym.nlocals = 2;
@@ -8259,9 +8216,6 @@ mod tests {
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
             pre_opcode_semantic_depth: None,
-            suppress_guard_no_exception_for_opcode: false,
-
-            pre_opcode_op_count: None,
         };
 
         let _ = state
@@ -8269,11 +8223,19 @@ mod tests {
             .expect("known builtin helper boundary should box raw int args");
 
         let recorder = ctx.into_recorder();
-        let call = recorder.ops().last().expect("call op should be present");
-        assert!(matches!(
-            call.opcode,
-            OpCode::CallI | OpCode::CallR | OpCode::CallF | OpCode::CallN
-        ));
+        // GuardNoException (pyjitpl.py:2082) follows the residual Call*, so
+        // look up the Call* op explicitly rather than via `ops().last()`.
+        let call = recorder
+            .ops()
+            .iter()
+            .rev()
+            .find(|op| {
+                matches!(
+                    op.opcode,
+                    OpCode::CallI | OpCode::CallR | OpCode::CallF | OpCode::CallN
+                )
+            })
+            .expect("call op should be present");
         assert_ne!(call.getarglist().last().copied(), Some(arg));
     }
 
@@ -8329,9 +8291,6 @@ mod tests {
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
             pre_opcode_semantic_depth: None,
-            suppress_guard_no_exception_for_opcode: false,
-
-            pre_opcode_op_count: None,
         };
 
         let concrete_lhs = w_int_new(10);
@@ -8421,9 +8380,6 @@ mod tests {
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
             pre_opcode_semantic_depth: None,
-            suppress_guard_no_exception_for_opcode: false,
-
-            pre_opcode_op_count: None,
         };
 
         let concrete_lhs = w_int_new(10);
@@ -8519,9 +8475,6 @@ mod tests {
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
             pre_opcode_semantic_depth: None,
-            suppress_guard_no_exception_for_opcode: false,
-
-            pre_opcode_op_count: None,
         };
 
         assert!(
@@ -8901,9 +8854,6 @@ mod tests {
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
             pre_opcode_semantic_depth: None,
-            suppress_guard_no_exception_for_opcode: false,
-
-            pre_opcode_op_count: None,
         };
 
         let jump_args = state.with_ctx(|this, ctx| this.close_loop_args(ctx));
@@ -8987,9 +8937,6 @@ mod tests {
             concrete_frame_addr: frame_ptr,
             pre_opcode_registers_r: None,
             pre_opcode_semantic_depth: None,
-            suppress_guard_no_exception_for_opcode: false,
-
-            pre_opcode_op_count: None,
         };
 
         let jump_args = state.with_ctx(|this, ctx| this.close_loop_args(ctx));
