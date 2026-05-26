@@ -74,50 +74,36 @@ pub fn shadow_walker_enabled() -> bool {
 pub fn opname_in_shadow_allow_list(instruction: &Instruction) -> bool {
     // Phase D-3 status: Blocker #1 (descr_refs placeholder pool) closed
     // by [`crate::descr::make_descr_from_bh`] +
-    // `crate::jitcode_runtime::ALL_DESCR_REFS` rewiring. Blocker #2
-    // (synthetic Rust constructor wrapper) closed by jtransform's
-    // `Ok` / `Err` / `Some` identity rewrite
-    // (`majit/majit-translate/src/jit_codewriter/jtransform.rs
-    //  ::rewrite_op_direct_call`): the trailing `int_copy +
-    // residual_call_r_r/iRd>r` pair every opcode arm carried for the
-    // `Ok(StepResult::Continue)` return wrapper is gone, so the walker
-    // emits zero `CallR` ops for opcodes whose body has no real call.
+    // `crate::jitcode_runtime::ALL_DESCR_REFS` rewiring. The `Ok` /
+    // `Err` / `Some` transparent-wrapper identity rewrite also landed in
+    // jtransform, but Pyre-side unit variants such as
+    // `StepResult::Continue` are deliberately not elided there. Opcode
+    // arms that return `Ok(StepResult::Continue)` can therefore still
+    // carry the trailing `int_copy + residual_call_r_r/iRd>r` pair.
     //
-    // First production opcode allow-listed: `Instruction::Nop` (and the
-    // four arm-id-zero siblings `ExtendedArg`, `Resume`, `Cache`,
-    // `NotTaken`). The arm bytes after the elision land at:
+    // The Nop family of 5 zero-op opcodes is the intended first
+    // production-walker batch, but production dispatch is currently
+    // disabled in `production_walker_handles`: those generated arms
+    // still contain the synthetic `Ok(StepResult::Continue)` wrapper as
+    // a `residual_call_r_r/iRd>r` with a symbolic function address. Once
+    // that wrapper is actually gone, their success-path arm bytes should
+    // decode to `ref_return/r ; ref_return/r ; live/ ; raise/r`, with no
+    // trace ops recorded under `is_top_level=false`.
     //
-    //     ref_return/r ; ref_return/r ; live/ ; raise/r
+    // To extend either allow-list, decode the candidate arm via
+    // `cargo test -p pyre-jit-trace ... dump_<name>_arm_bytes` and
+    // confirm every opname routes to a recorder-side handler the trait
+    // path also reaches. Anything still carrying a `residual_call_*`
+    // wrapper without a matching trait-side record must stay disabled.
     //
-    // None of those record a trace op when the walker dispatches under
-    // `is_top_level=false`: `ref_return/r` exits as
-    // `DispatchOutcome::SubReturn` (no `Finish`) and the `raise/r`
-    // / `live/` tails are unreachable for the success path. Trait
-    // dispatch for the same opcodes runs `Ok(StepResult::Continue)`
-    // natively and also emits zero ops, so walker == trait by
-    // construction.
-    //
-    // To extend the allow-list beyond Nop family, decode the candidate
-    // arm via `cargo test -p pyre-jit-trace ... dump_<name>_arm_bytes`
-    // and confirm every opname routes to a recorder-side handler the
-    // trait path also reaches. Anything still carrying a
-    // `residual_call_*` wrapper without a matching trait-side record
-    // panics under `MAJIT_SHADOW_WALKER=1`.
-    // Phase 5.A (issue #73, 2026-05-20): the Nop family of 5 zero-op
-    // opcodes has been production-flipped to walker dispatch via
-    // `production_walker_handles` in trace_opcode.rs (currently:
-    // `Nop | ExtendedArg | Resume { .. } | Cache | NotTaken`).  A
-    // subsequent PopTop activation was reverted in Stage A.1 because
+    // A subsequent PopTop activation was reverted in Stage A.1 because
     // its sym-shadow effects cannot ride alongside the trait dispatch
     // for `raise_catch_loop` / `synth/set_membership`; see
     // `[[project_issue73_phase4_poptop_vable_getfield_blocker]]` for
     // the small-int unboxed concrete vs heap-pointer view residual gap
     // and `[[project-issue73-phase5-design]]` for the cutover sequencing.
-    // Shadow validation is moot for the production-flipped opcodes
-    // because there is no parallel trait dispatch to compare against —
-    // the walker IS production.
     //
-    // Net effect: this function returns `false` for every instruction —
+    // Net effect: this function returns `false` for every instruction;
     // the shadow allow-list is intentionally empty for this phase.
     // `MAJIT_SHADOW_WALKER=1` therefore does not enable any Nop-family
     // exceptions; the env flag remains plumbed for future expansion
@@ -488,22 +474,13 @@ mod tests {
 
     #[test]
     fn shadow_allow_list_is_empty_pending_structural_epic() {
-        // Phase 5.A production-flipped the Nop family — they no longer
-        // belong in the shadow allow-list.  PopTop and the rest of the
-        // Python opcodes are blocked by the per-jitcode register-bank
-        // structural mismatch documented in `opname_in_shadow_allow_list`;
-        // shadow validation cannot meaningfully run against arm-local
-        // r0=frame semantics until MIFrame restructuring lands.  Until
-        // then the allow-list stays empty.
-        // The Nop family of zero-op opcodes that Phase 5.A flipped to
-        // production walker dispatch must all be rejected here, not just
-        // Nop itself.  Covering every unit variant of the family
-        // prevents a partial reintroduction from slipping through
-        // (e.g. accidentally re-allowing Cache while keeping Nop
-        // disabled).  Resume and ExtendedArg are struct variants whose
-        // construction needs an `Arg<...>`; their rejection is exercised
-        // implicitly through the production code path covered by
-        // `production_walker_handles`.
+        // The Nop family does not belong in the shadow allow-list while
+        // production walker dispatch is disabled for the same family in
+        // `production_walker_handles`. Covering the unit variants here
+        // prevents a partial reintroduction from slipping through. Resume
+        // and ExtendedArg are struct variants whose construction needs
+        // an `Arg<...>`; their rejection is covered by the production
+        // path when that allow-list is re-enabled.
         assert!(!opname_in_shadow_allow_list(&Instruction::Nop));
         assert!(!opname_in_shadow_allow_list(&Instruction::Cache));
         assert!(!opname_in_shadow_allow_list(&Instruction::NotTaken));

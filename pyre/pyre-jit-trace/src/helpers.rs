@@ -4,7 +4,7 @@
 //! Each wraps a pyre-object or pyre-interpreter operation with the
 //! correct calling convention and integer-based parameter passing.
 
-use majit_ir::{EffectInfo, ExtraEffect, OopSpecIndex, OpCode, OpRef, Type, Value};
+use majit_ir::{EffectInfo, ExtraEffect, GcRef, OopSpecIndex, OpCode, OpRef, Type, Value};
 use majit_metainterp::{TraceCtx, default_effect_info};
 
 use pyre_interpreter::{
@@ -111,6 +111,51 @@ pub fn emit_trace_call_ref_typed(
 ) -> OpRef {
     // See emit_trace_call_int_typed for the plumbing-gap rationale.
     ctx.call_ref_typed_with_effect(helper, args, arg_types, default_effect_info())
+}
+
+pub fn emit_trace_call_ref_typed_elidable_cannot_raise(
+    ctx: &mut TraceCtx,
+    helper: *const (),
+    args: &[OpRef],
+    arg_types: &[Type],
+    concrete_arg_values: &[Value],
+    concrete_result: Value,
+) -> OpRef {
+    let effect = EffectInfo::new(ExtraEffect::ElidableCannotRaise, OopSpecIndex::None);
+    ctx.call_typed_with_effect_pure(
+        OpCode::CallR,
+        helper,
+        args,
+        arg_types,
+        Type::Ref,
+        effect,
+        concrete_arg_values,
+        concrete_result,
+    )
+}
+
+pub(crate) extern "C" fn jit_namespace_slot_lookup(namespace_ptr: i64, slot: i64) -> i64 {
+    let namespace_ptr = namespace_ptr as *mut pyre_interpreter::executioncontext::DictStorage;
+    if namespace_ptr.is_null() || slot < 0 {
+        return PY_NULL as i64;
+    }
+    unsafe { (&*namespace_ptr).get_slot(slot as usize).unwrap_or(PY_NULL) as i64 }
+}
+
+pub(crate) fn namespace_slot_lookup_values(
+    func_ptr: *const (),
+    namespace_ptr: *mut pyre_interpreter::executioncontext::DictStorage,
+    slot: usize,
+) -> [Value; 3] {
+    [
+        Value::Int(func_ptr as usize as i64),
+        Value::Ref(GcRef(namespace_ptr as usize)),
+        Value::Int(slot as i64),
+    ]
+}
+
+pub(crate) fn namespace_slot_lookup_result(result: PyObjectRef) -> Value {
+    Value::Ref(GcRef(result as usize))
 }
 
 pub fn emit_trace_call_void(ctx: &mut TraceCtx, helper: *const (), args: &[OpRef]) {

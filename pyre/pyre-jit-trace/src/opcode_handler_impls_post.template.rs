@@ -196,21 +196,40 @@ impl pyre_interpreter::NamespaceOpcodeHandler for crate::state::MIFrame {
                 // celldict.py @elidable_promote + quasiimmut.py parity:
                 // 1. QUASIIMMUT_FIELD(ns, slot) — collected as quasi_immutable_deps
                 //    + GUARD_NOT_INVALIDATED.
-                // 2. RECORD_KNOWN_RESULT(result, ns, slot) — cache trace-time
-                //    lookup result (call_pure_results).
-                // 3. CALL_PURE_R(ns, slot) — elidable lookup; record_result_of_call_pure
-                //    folds via OptPure lookup_known_result.
+                // 2. RECORD_KNOWN_RESULT(result, helper, ns, slot) — cache
+                //    trace-time lookup result (call_pure_results).
+                // 3. CALL_PURE_R(helper, ns, slot) — elidable lookup;
+                //    record_result_of_call_pure folds via OptPure lookup_known_result.
                 let opref = self.with_ctx(|_this, ctx| {
                     let ns_const = ctx.const_ref(ns as i64);
                     let slot_const = ctx.const_int(slot as i64);
                     ctx.record_op(majit_ir::OpCode::QuasiimmutField, &[ns_const, slot_const]);
-                    let result_const = ctx.const_ref(concrete_value as i64);
-                    ctx.record_op(
-                        majit_ir::OpCode::RecordKnownResult,
-                        &[result_const, ns_const, slot_const],
+                    let lookup_fn = crate::helpers::jit_namespace_slot_lookup as *const ();
+                    let lookup_args = [ns_const, slot_const];
+                    let lookup_arg_types = [majit_ir::Type::Ref, majit_ir::Type::Int];
+                    ctx.record_known_result_typed(
+                        concrete_value as i64,
+                        lookup_fn,
+                        &lookup_args,
+                        &lookup_arg_types,
+                        majit_ir::Type::Ref,
+                        majit_metainterp::EffectInfoSlot::ElidableCannotRaise,
                     );
-                    let call_result =
-                        ctx.record_op(majit_ir::OpCode::CallPureR, &[ns_const, slot_const]);
+                    let concrete_args = crate::helpers::namespace_slot_lookup_values(
+                        lookup_fn,
+                        ns,
+                        slot,
+                    );
+                    let concrete_result =
+                        crate::helpers::namespace_slot_lookup_result(concrete_value);
+                    let call_result = crate::helpers::emit_trace_call_ref_typed_elidable_cannot_raise(
+                        ctx,
+                        lookup_fn,
+                        &lookup_args,
+                        &lookup_arg_types,
+                        &concrete_args,
+                        concrete_result,
+                    );
                     Ok::<_, pyre_interpreter::PyError>(call_result)
                 })?;
                 return Ok(crate::state::FrontendOp::new(opref, result_concrete));

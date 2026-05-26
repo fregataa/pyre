@@ -7488,16 +7488,19 @@ unsafe fn trace_check_exc_match_against(
 /// parent-frame chain.  Phase 6 removes the trait impl once every opcode
 /// is in this set and the inline-frame snapshot gap is closed.
 ///
-/// Phase 5.A initial set: the Nop family of 5 zero-op opcodes
-/// (`Nop`, `ExtendedArg`, `Resume`, `Cache`, `NotTaken`).  All share
-/// arm bytes `ref_return/r r0` (decode via `dump_nop_arm_bytes`) —
-/// walker emits zero IR ops and `SubReturn`s with `r0`'s contents; the
-/// trait dispatch returns `Ok(StepResult::Continue)` with zero op
-/// emission.  Walker ≡ trait for this batch by construction.
+/// Current status: the allow-list is deliberately empty.  The Nop
+/// family (`Nop`, `ExtendedArg`, `Resume`, `Cache`, `NotTaken`) should
+/// be the first zero-op production batch, but the generated arms still
+/// carry the synthetic `Ok(StepResult::Continue)` return wrapper as a
+/// `residual_call_r_r/iRd>r` with a symbolic function address instead
+/// of a real callable.  Enabling those arms in production can therefore
+/// emit an invalid `CallR` before any optimizer/backend choice is
+/// involved.  Re-enable this set only after the arm bytes decode to the
+/// real no-op shape (`ref_return/r ...`) without residual-call wrapper
+/// ops.
 ///
-/// Subsequent Phase 5 batches (5.B PopTop + drop `check_is_elidable`
-/// gate, 5.C..N per-opcode batches) grow this set until it covers every
-/// Python opcode, at which point Phase 6 deletes the trait infra.
+/// Subsequent Phase 5 batches grow this set until it covers every Python
+/// opcode, at which point Phase 6 deletes the trait infra.
 ///
 /// PopTop is intentionally NOT in this set: 2026-05-21 diagnostic
 /// (synth/set_membership SIGBUS, exit 138) traced the failure to the
@@ -7529,14 +7532,8 @@ unsafe fn trace_check_exc_match_against(
 /// PopTop walker activation is structurally blocked.  Documented in
 /// project memory `project-issue73-phase4-poptop-vable-getfield-blocker`.
 pub fn production_walker_handles(instruction: &Instruction) -> bool {
-    matches!(
-        instruction,
-        Instruction::Nop
-            | Instruction::ExtendedArg
-            | Instruction::Resume { .. }
-            | Instruction::Cache
-            | Instruction::NotTaken
-    )
+    let _ = instruction;
+    false
 }
 
 /// Apply the symbolic-tracker side effects of a walker-handled opcode.
