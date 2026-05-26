@@ -397,36 +397,31 @@ fn callable_prefix(w_callable: PyObjectRef) -> String {
     String::new()
 }
 
-/// `pyopcode.py:1979-2026 _dict_merge` — merge `source` into `dict`
-/// for `**kwargs` unpacking.  Validates string keys and duplicates.
+/// pyopcode.py:1979-2026 `_dict_merge` — merge `source` into `dict`.
+/// Dict path checks duplicates; mapping path does keys/getitem/setitem
+/// without extra validation (string key check is CALL_FUNCTION_EX's job).
 fn dict_merge_from_mapping(
     dict: PyObjectRef,
     source: PyObjectRef,
     w_callable: PyObjectRef,
 ) -> Result<(), PyError> {
     let prefix = callable_prefix(w_callable);
-    let merge_pair = |k: PyObjectRef, v: PyObjectRef| -> Result<(), PyError> {
-        unsafe {
-            if !pyre_object::is_str(k) {
-                return Err(PyError::type_error(format!(
-                    "{prefix}keywords must be strings"
-                )));
-            }
-            if pyre_object::w_dict_lookup(dict, k).is_some() {
-                let key_str = pyre_object::w_str_get_value(k);
-                return Err(PyError::type_error(format!(
-                    "{prefix}got multiple values for keyword argument '{key_str}'"
-                )));
-            }
-            pyre_object::w_dict_store(dict, k, v);
-        }
-        Ok(())
-    };
 
     unsafe {
         if pyre_object::is_dict(source) {
             for (k, v) in pyre_object::w_dict_items(source) {
-                merge_pair(k, v)?;
+                if pyre_object::w_dict_lookup(dict, k).is_some() {
+                    // pyopcode.py:1987 — %S is str(key)
+                    let key_str = if pyre_object::is_str(k) {
+                        pyre_object::w_str_get_value(k).to_string()
+                    } else {
+                        crate::display::py_repr(k)
+                    };
+                    return Err(PyError::type_error(format!(
+                        "{prefix}got multiple values for keyword argument '{key_str}'"
+                    )));
+                }
+                pyre_object::w_dict_store(dict, k, v);
             }
             return Ok(());
         }
@@ -442,11 +437,24 @@ fn dict_merge_from_mapping(
         }
         Err(e) => return Err(e),
     };
+    // pyopcode.py:2021 _dict_merge_loop: keys/getitem/contains/setitem
     let keys_obj = crate::call::call_function_impl_result(keys_method, &[])?;
     let keys = crate::builtins::collect_iterable(keys_obj)?;
     for key in keys {
         let val = crate::baseobjspace::getitem(source, key)?;
-        merge_pair(key, val)?;
+        unsafe {
+            if pyre_object::w_dict_lookup(dict, key).is_some() {
+                let key_str = if pyre_object::is_str(key) {
+                    pyre_object::w_str_get_value(key).to_string()
+                } else {
+                    crate::display::py_repr(key)
+                };
+                return Err(PyError::type_error(format!(
+                    "{prefix}got multiple values for keyword argument '{key_str}'"
+                )));
+            }
+            pyre_object::w_dict_store(dict, key, val);
+        }
     }
     Ok(())
 }

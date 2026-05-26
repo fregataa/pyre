@@ -5982,34 +5982,149 @@ fn bytes_method_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     Ok(pyre_object::w_str_new(&out))
 }
 
-/// PyPy: bytesobject.py descr_decode
-/// Decodes bytes to str via the given codec (defaults to utf-8/strict).
+fn decode_utf8_with_errors(data: &[u8], err_mode: &str) -> Result<String, crate::PyError> {
+    let mut out = String::new();
+    let mut pos = 0;
+    while pos < data.len() {
+        match std::str::from_utf8(&data[pos..]) {
+            Ok(s) => {
+                out.push_str(s);
+                break;
+            }
+            Err(e) => {
+                let valid_end = pos + e.valid_up_to();
+                out.push_str(unsafe { std::str::from_utf8_unchecked(&data[pos..valid_end]) });
+                let bad_len = e.error_len().unwrap_or(data.len() - valid_end);
+                match err_mode {
+                    "strict" => {
+                        if e.error_len().is_none() {
+                            return Err(crate::PyError::new(
+                                crate::PyErrorKind::UnicodeDecodeError,
+                                format!(
+                                    "'utf-8' codec can't decode bytes in position {}--{}: unexpected end of data",
+                                    valid_end,
+                                    data.len() - 1
+                                ),
+                            ));
+                        }
+                        return Err(crate::PyError::new(
+                            crate::PyErrorKind::UnicodeDecodeError,
+                            format!(
+                                "'utf-8' codec can't decode byte 0x{:02x} in position {}: invalid start byte",
+                                data[valid_end], valid_end
+                            ),
+                        ));
+                    }
+                    "ignore" => {}
+                    "replace" => out.push('\u{FFFD}'),
+                    "surrogateescape" => {
+                        // PEP 383: map bytes 0x80..0xFF → U+DC80..U+DCFF
+                        for &b in &data[valid_end..valid_end + bad_len] {
+                            out.push(char::from_u32(0xDC00 + b as u32).unwrap_or('\u{FFFD}'));
+                        }
+                    }
+                    "backslashreplace" => {
+                        for &b in &data[valid_end..valid_end + bad_len] {
+                            out.push_str(&format!("\\x{:02x}", b));
+                        }
+                    }
+                    _ => {
+                        return Err(crate::PyError::new(
+                            crate::PyErrorKind::LookupError,
+                            format!("unknown error handler name '{err_mode}'"),
+                        ));
+                    }
+                }
+                pos = valid_end + bad_len;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// bytesobject.py descr_decode → stringmethods.py:196 decode_object
 fn bytes_method_decode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty());
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
-    let encoding: String = if args.len() >= 2 {
-        unsafe {
-            if pyre_object::is_str(args[1]) {
-                pyre_object::w_str_get_value(args[1]).to_string()
-            } else {
-                "utf-8".to_string()
-            }
-        }
+    // unicodeobject.py:1669 — encoding/errors must be str (space.text_w)
+    if args.len() >= 2
+        && !unsafe { pyre_object::is_str(args[1]) }
+        && !unsafe { pyre_object::is_none(args[1]) }
+    {
+        let tn = unsafe { (*(*args[1]).ob_type).name };
+        return Err(crate::PyError::type_error(format!(
+            "decode() argument 'encoding' must be str, not {tn}",
+        )));
+    }
+    if args.len() >= 3
+        && !unsafe { pyre_object::is_str(args[2]) }
+        && !unsafe { pyre_object::is_none(args[2]) }
+    {
+        let tn = unsafe { (*(*args[2]).ob_type).name };
+        return Err(crate::PyError::type_error(format!(
+            "decode() argument 'errors' must be str, not {tn}",
+        )));
+    }
+    let encoding = if args.len() >= 2 && unsafe { pyre_object::is_str(args[1]) } {
+        unsafe { pyre_object::w_str_get_value(args[1]).to_string() }
     } else {
         "utf-8".to_string()
     };
+    let errors = if args.len() >= 3 && unsafe { pyre_object::is_str(args[2]) } {
+        unsafe { pyre_object::w_str_get_value(args[2]).to_string() }
+    } else {
+        "strict".to_string()
+    };
+    let err_mode = errors.as_str();
     let enc_lower = encoding.to_ascii_lowercase().replace('_', "-");
     let s = match enc_lower.as_str() {
-        "utf-8" | "utf8" | "u8" | "ascii" | "us-ascii" | "646" => {
-            // Best-effort: surrogateescape on invalid UTF-8 produces
-            // lossy output; for our purposes just replace invalid with U+FFFD.
-            match std::str::from_utf8(data) {
-                Ok(s) => s.to_string(),
-                Err(_) => String::from_utf8_lossy(data).into_owned(),
+        "utf-8" | "utf8" | "u8" => decode_utf8_with_errors(data, err_mode)?,
+        "ascii" | "us-ascii" | "646" => {
+            let mut out = String::new();
+            for (i, &b) in data.iter().enumerate() {
+                if b >= 0x80 {
+                    match err_mode {
+                        "strict" => {
+                            return Err(crate::PyError::new(
+                                crate::PyErrorKind::UnicodeDecodeError,
+                                format!(
+                                    "'ascii' codec can't decode byte 0x{:02x} in position {i}",
+                                    b
+                                ),
+                            ));
+                        }
+                        "ignore" => continue,
+                        "replace" => {
+                            out.push('\u{FFFD}');
+                            continue;
+                        }
+                        "surrogateescape" => {
+                            out.push(char::from_u32(0xDC00 + b as u32).unwrap_or('\u{FFFD}'));
+                            continue;
+                        }
+                        "backslashreplace" => {
+                            out.push_str(&format!("\\x{:02x}", b));
+                            continue;
+                        }
+                        _ => {
+                            return Err(crate::PyError::new(
+                                crate::PyErrorKind::LookupError,
+                                format!("unknown error handler name '{err_mode}'"),
+                            ));
+                        }
+                    }
+                }
+                out.push(b as char);
             }
+            out
         }
         "latin-1" | "latin1" | "iso-8859-1" | "8859" => data.iter().map(|&b| b as char).collect(),
-        _ => String::from_utf8_lossy(data).into_owned(),
+        _ => {
+            return Err(crate::PyError::new(
+                crate::PyErrorKind::LookupError,
+                format!("unknown encoding: {encoding}"),
+            ));
+        }
     };
     Ok(pyre_object::w_str_new(&s))
 }

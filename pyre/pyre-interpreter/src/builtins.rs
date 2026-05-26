@@ -2183,22 +2183,29 @@ pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
         if let Some(method) = unsafe { crate::baseobjspace::lookup_in_type(tp, "__float__") } {
             let result = crate::call::call_function_impl_result(method, &[obj])?;
             unsafe {
+                // floatobject.py:228 — exact float check (no subclass support yet)
                 if is_float(result) {
                     return Ok(result);
                 }
-                if is_int(result) {
-                    return Ok(floatobject::w_float_new(w_int_get_value(result) as f64));
-                }
             }
+            // descroperation.py:891 — __float__ returned non-float (type '%T')
+            let result_type = unsafe { (*(*result).ob_type).name };
+            return Err(crate::PyError::type_error(format!(
+                "__float__ returned non-float (type '{result_type}')",
+            )));
         }
         if let Some(method) = unsafe { crate::baseobjspace::lookup_in_type(tp, "__index__") } {
-            if let Ok(r) = crate::call::call_function_impl_result(method, &[obj]) {
-                unsafe {
-                    if is_int(r) {
-                        return Ok(floatobject::w_float_new(w_int_get_value(r) as f64));
-                    }
+            let r = crate::call::call_function_impl_result(method, &[obj])?;
+            // descroperation.py:609 — exact int or bool (int subclass)
+            unsafe {
+                if is_int(r) || is_bool(r) {
+                    return Ok(floatobject::w_float_new(w_int_get_value(r) as f64));
                 }
             }
+            let result_type = unsafe { (*(*r).ob_type).name };
+            return Err(crate::PyError::type_error(format!(
+                "__index__ returned non-int (type '{result_type}')",
+            )));
         }
     }
     Err(crate::PyError::type_error(

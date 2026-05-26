@@ -819,9 +819,43 @@ pub(crate) fn resolve_kwargs(
                 if n_pos_params != 1 { "s" } else { "" }
             )
         };
-        let given_str = format!("{} {}", n_pos, if n_pos != 1 { "were" } else { "was" });
+        // argument.py:571 ArgErrTooMany.getmsg
+        let nkwonly_given = if nkw > 0 {
+            let nkwonly = code.kwonlyarg_count as usize;
+            (0..nkw)
+                .filter(|&ki| {
+                    let kw_name = unsafe { pyre_object::w_tuple_getitem(kwarg_names, ki as i64) };
+                    if let Some(kw_obj) = kw_name {
+                        if !unsafe { pyre_object::is_str(kw_obj) } {
+                            return false;
+                        }
+                        let kw_s = unsafe { pyre_object::w_str_get_value(kw_obj) };
+                        (0..nkwonly).any(|j| &*code.varnames[skip_cls + n_pos_params + j] == kw_s)
+                    } else {
+                        false
+                    }
+                })
+                .count()
+        } else {
+            0
+        };
+        let given_str = if nkwonly_given > 0 {
+            format!(
+                "{} positional argument{} (and {} keyword-only argument{}) were given",
+                n_pos,
+                if n_pos != 1 { "s" } else { "" },
+                nkwonly_given,
+                if nkwonly_given != 1 { "s" } else { "" },
+            )
+        } else {
+            format!(
+                "{} {} given",
+                n_pos,
+                if n_pos != 1 { "were" } else { "was" }
+            )
+        };
         return Err(crate::PyError::type_error(format!(
-            "{}() takes {} but {} given",
+            "{}() takes {} but {}",
             fname, takes_str, given_str
         )));
     }

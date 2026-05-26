@@ -2900,8 +2900,8 @@ impl<'a> GraphBuildContext<'a> {
     /// records carry the merge block itself as their `defining_block`
     /// — every `Variable` in `state.locals_w` is materialised in
     /// `owner_block.inputargs` by `create_block_from_framestate`, so
-    /// `(vid, owner_block)` is the structurally honest pairing of the
-    /// pyre `(ValueId, BlockId)` reuse-gate.
+    /// `(var, owner_block)` is the structurally honest pairing of the
+    /// pyre `(Variable, BlockId)` reuse-gate.
     ///
     /// Also names freshly-minted phi `Variable`s via
     /// `graph.name_value(vid, name)` so the cutover's
@@ -2957,7 +2957,7 @@ impl<'a> GraphBuildContext<'a> {
                                     graph_value_type_var(graph, v).unwrap_or(ValueType::Unknown),
                                 )),
                                 // Constant cells in locals: pyre keys
-                                // identity through ValueId, and Constants
+                                // identity through Variable, and Constants
                                 // are emitted on-demand by the reader
                                 // (Stmt::Local / Expr::Path lower constant
                                 // literals via push_op directly), so we
