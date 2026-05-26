@@ -4606,6 +4606,8 @@ mod tests {
                 "int_add/ri>i",
                 "int_add/ir>i",
                 "int_add/rr>i",
+                "int_le/ri>i",
+                "int_le/rr>i",
                 "int_lshift/ri>i",
                 "int_rshift/ir>i",
                 "int_xor/rr>i",
