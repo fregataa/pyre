@@ -297,11 +297,9 @@ pub(crate) fn merge_backend_constants_from_ctx(
         if b.is_inputarg() {
             continue;
         }
-        let crate::r#box::Forwarded::Box(target) = &b.get_forwarded() else {
-            continue;
-        };
-        let Some(value) = target.const_value() else {
-            continue;
+        let value = match b.get_forwarded() {
+            crate::r#box::Forwarded::Const(c, _) => c.to_value(),
+            _ => continue,
         };
         if idx < live_positions.len() && live_positions[idx] {
             continue;
@@ -354,10 +352,7 @@ impl Optimizer {
         let Some(b) = box_pool.get(op.pos.get()) else {
             return false;
         };
-        let crate::r#box::Forwarded::Box(target) = &b.get_forwarded() else {
-            return false;
-        };
-        if target.const_value().is_none() {
+        if !matches!(b.get_forwarded(), crate::r#box::Forwarded::Const(_, _)) {
             return false;
         }
         op.num_args() == 0 || op.getarglist().iter().all(|arg| arg.is_none())
@@ -1975,6 +1970,13 @@ impl Optimizer {
         //    Mirrors `PyPy Optimizer.__init__: self.inputargs = inputargs`
         //    (optimizer.py:34).
         ctx.inputargs = self.trace_inputargs.clone();
+        // Bind inputarg BoxRefs handed in via `box_pool` so
+        // `make_equal_to` routes InputArg-targeted chain steps through
+        // `Forwarded::InputArg(_)` rather than the deprecated
+        // `Forwarded::Box(_)` fallback. `TraceIterator::new` builds the
+        // per-iter pool with fresh unbound `BoxRef::new_inputarg(tp, _)`;
+        // the TreeLoop-owned strong `InputArgRc`s never reach it.
+        ctx.ensure_inputarg_bindings();
         // Phase 1 emit ops: single source of truth for cross-phase OpRef →
         // `op.type_` lookup (history.py:220 parity).
         ctx.phase1_emit_ops = std::mem::take(&mut self.phase1_emit_ops);
@@ -2397,6 +2399,61 @@ impl Optimizer {
             if !op.pos.get().is_none() && op.type_ != majit_ir::Type::Void {
                 self.phase1_emit_ops.push(op.clone());
             }
+        }
+        // PyPy parity: a folded `ResOperation` keeps its Python identity
+        // through `_forwarded` links (resoperation.py:233-242); the
+        // `optimize_peeled_loop` (compile.py:291) chain walk reaches it
+        // via `partial_trace.operations`.
+        //
+        // pyre's per-iter `TraceIterator::next()` (opencoder.rs:500)
+        // pushes a fresh `BoxRef::new_resop` slot for every visited op
+        // BEFORE the optimizer pipeline decides whether to emit. Two
+        // categories of slot escape the `new_operations` carry above
+        // and need explicit handling so `Forwarded::Op(Weak<Op>)`
+        // upgrades stay live after Phase 1 context drop:
+        //
+        //   - Unbound orphan: the pipeline folded/dropped the op so
+        //     `ctx.emit` never ran. Synthesize a `SameAs` stand-in
+        //     and bind the slot.
+        //   - Synthetic-bound: a forward reference reached `ensure_box`
+        //     first; `ensure_box` minted a `SameAs` stand-in into
+        //     `ctx.resop_refs[idx]` and `bind_op`'ed it. When `emit`
+        //     never arrived to upgrade the binding to a real producer,
+        //     the stand-in itself is the chain target carrier.
+        //
+        // In both cases the stand-in OpRc must travel into
+        // `phase1_emit_ops` (and from there into
+        // `ExportedState.partial_trace_operations`) so retrace's
+        // `Weak<Op>` upgrade succeeds.
+        for (idx, b) in ctx.box_pool.iter_indexed() {
+            if !b.is_resop() {
+                continue;
+            }
+            let synth_stand_in = ctx.resop_refs.get(idx).and_then(|slot| slot.as_ref());
+            let bound = b.bound_op();
+            let bound_is_synthetic = match (&bound, synth_stand_in) {
+                (Some(boxed), Some(synth)) => std::rc::Rc::ptr_eq(boxed, synth),
+                _ => false,
+            };
+            if let Some(bound_rc) = bound {
+                if bound_is_synthetic {
+                    self.phase1_emit_ops.push(bound_rc);
+                }
+                continue;
+            }
+            use majit_ir::resoperation::Op;
+            let opcode = match b.type_() {
+                majit_ir::Type::Int => OpCode::SameAsI,
+                majit_ir::Type::Float => OpCode::SameAsF,
+                majit_ir::Type::Ref => OpCode::SameAsR,
+                majit_ir::Type::Void => continue,
+            };
+            let stand_in = std::rc::Rc::new(Op::new(opcode, &[]));
+            stand_in
+                .pos
+                .set(majit_ir::OpRef::op_typed(idx as u32, b.type_()));
+            b.bind_op(&stand_in);
+            self.phase1_emit_ops.push(stand_in);
         }
         // Transfer exported virtual state from context to optimizer
         // RPython BasicLoopInfo: quasi_immutable_deps collected during optimization
@@ -2877,10 +2934,7 @@ impl Optimizer {
                 if old_idx < num_inputs as u32 {
                     continue;
                 }
-                let crate::r#box::Forwarded::Box(target) = &b.get_forwarded() else {
-                    continue;
-                };
-                if target.const_value().is_none() {
+                if !matches!(b.get_forwarded(), crate::r#box::Forwarded::Const(_, _)) {
                     continue;
                 }
                 remap.insert(old_idx, next_const_pos);

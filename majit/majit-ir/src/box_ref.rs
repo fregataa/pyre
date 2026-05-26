@@ -29,7 +29,7 @@ use crate::intbound::IntBound;
 use crate::op_info::OpInfo;
 use crate::ptr_info::PtrInfo;
 use crate::resoperation::{Op, VectorizationInfo};
-use crate::value::InputArg;
+use crate::value::{Const, InputArg};
 use crate::{OpRef, Type, Value};
 
 /// `AbstractValue` mirror — unified representation of RPython's
@@ -120,15 +120,52 @@ pub enum BoxKind {
 
 /// Variant of the `_forwarded` slot.
 ///
-/// RPython's `_forwarded` is `None | another AbstractResOpOrInputArg |
-/// AbstractInfo`. Const forwarding is one case of "another box", so we
-/// represent it as `Box(BoxRef)` carrying a `BoxKind::Const(...)`.
+/// `Const` is an `AbstractValue` subclass too (`history.py:220
+/// ConstInt`), so forwarding to a constant is its own shape: `Const`
+/// is a value-typed `Copy` payload with no `_forwarded` slot of its
+/// own, unlike `ResOp`/`InputArg`. Keeping it as a separate variant
+/// retires the dedicated `BoxKind::Const`-as-chain-target carrier.
 #[derive(Clone, Debug)]
 pub enum Forwarded {
     None,
 
-    /// Forwarding to another `AbstractResOpOrInputArg` or `Const`.
+    /// Forwarding to another `AbstractResOpOrInputArg`. Const targets
+    /// route through [`Forwarded::Const`] instead; `ResOp` targets route
+    /// through [`Forwarded::Op`] once C.5 retires this variant.
     Box(BoxRef),
+
+    /// `resoperation.py:250 AbstractResOp` forwarding — direct
+    /// `Weak<Op>` reference, no `BoxRef`/`BoxKind::ResOp` carrier.
+    /// Chain walker upgrades the `Weak`, wraps the `Op` in a transient
+    /// `BoxRef` (via `BoxRef::from_bound_op`), and continues from
+    /// there. A dropped `Weak` terminates the chain at the predecessor
+    /// (PyPy never observes a dropped target — RPython keeps the
+    /// underlying object alive through the trace `operations` list).
+    Op(Weak<Op>),
+
+    /// `resoperation.py:699 AbstractInputArg` forwarding — direct
+    /// `Weak<InputArg>` reference, no `BoxRef`/`BoxKind::InputArg`
+    /// carrier. Same chain-walk semantics as `Op` (transient BoxRef
+    /// materialization via `BoxRef::from_bound_inputarg`). RPython
+    /// uses this for inputarg→inputarg redirects in bridge import and
+    /// retrace remap (compile.py:478 / unroll.py:497).
+    InputArg(Weak<InputArg>),
+
+    /// `history.py:220 ConstInt` / `:261 ConstFloat` / `:307 ConstPtr`
+    /// — forwarding terminates here; the constant value is carried
+    /// inline. Chain walkers stop on this variant (`not_const=true`
+    /// returns the pre-Const box; `not_const=false` materializes a
+    /// terminal const-bearing `BoxRef` for legacy callers).
+    ///
+    /// The trailing `Option<u32>` is the pyre-only `const_pool`
+    /// constant-namespace index that lets `box_to_opref` reconstruct
+    /// an `OpRef::Const{Int,Float,Ptr}(idx)` from a chain-walked-to-
+    /// Const terminal. PyPy has no analog (callers hold the Python
+    /// `Const` object directly). Sidecar to be retired alongside the
+    /// broader OpRef-reverse-lookup machinery; tagged `None` for
+    /// indexless seed_constant plantings (`optimizer.py:432` body
+    /// arm) and test plantings.
+    Const(Const, Option<u32>),
 
     /// `optimizeopt/info.py:17 AbstractInfo (is_info_class = True)` family —
     /// `PtrInfo`, `IntBound`, `FloatConstInfo`, `EmptyInfo`, etc.
@@ -175,6 +212,49 @@ impl BoxRef {
             value: Cell::new(None),
             op_handle: RefCell::new(None),
             inputarg_handle: RefCell::new(None),
+        }))
+    }
+
+    /// Transient `AbstractResOp` Box wrapping an already-bound
+    /// `OpRc`. Used by the chain walker to materialize a `BoxRef`
+    /// terminal from a `Forwarded::Op(Weak<Op>)` payload without
+    /// going through the pool; the new box does not live in
+    /// `BoxPool`, but its `bound_op` immediately answers with the
+    /// same `Rc<Op>` and its `_forwarded` slot reads via the bound op
+    /// per `get_forwarded`. Type and position are mirrored from
+    /// `op.pos.get()`.
+    pub fn from_bound_op(op: &crate::resoperation::OpRc) -> Self {
+        let opref = op.pos.get();
+        let type_ = opref.ty().unwrap_or(Type::Void);
+        let position = opref.raw();
+        Self(Rc::new(Box {
+            // `Box.forwarded` is the legacy mirror — the bound op's
+            // own slot is canonical so this stays None; `get_forwarded`
+            // returns op.forwarded via the `bound_op()` fastpath.
+            forwarded: RefCell::new(Forwarded::None),
+            type_,
+            kind: BoxKind::ResOp {
+                position: std::cell::Cell::new(position),
+            },
+            value: Cell::new(None),
+            op_handle: RefCell::new(Some(Rc::downgrade(op))),
+            inputarg_handle: RefCell::new(None),
+        }))
+    }
+
+    /// Transient `AbstractInputArg` Box wrapping an already-bound
+    /// `InputArgRc`. Mirror of `from_bound_op` for the chain walker's
+    /// `Forwarded::InputArg` terminal materialization.
+    pub fn from_bound_inputarg(ia: &crate::value::InputArgRc) -> Self {
+        let type_ = ia.tp;
+        let position = ia.index;
+        Self(Rc::new(Box {
+            forwarded: RefCell::new(Forwarded::None),
+            type_,
+            kind: BoxKind::InputArg { position },
+            value: Cell::new(None),
+            op_handle: RefCell::new(None),
+            inputarg_handle: RefCell::new(Some(Rc::downgrade(ia))),
         }))
     }
 
@@ -378,7 +458,25 @@ impl BoxRef {
         // `assert forwarded_to is not self` (resoperation.py:241).
         // Always-on assert so a release build can't accept a one-node
         // forwarding cycle that would make `get_box_replacement()` spin.
+        // After `bind_op` / `bind_inputarg` two distinct `Rc<Box>`
+        // wrappers can share the same canonical bound `OpRc`/`InputArgRc`;
+        // the `Rc::ptr_eq` on `self.0` alone misses that case, so also
+        // compare the bound handles when both sides carry one.
         assert!(!Rc::ptr_eq(&self.0, &target.0));
+        if let (Some(self_op), Some(target_op)) = (self.bound_op(), target.bound_op()) {
+            assert!(
+                !Rc::ptr_eq(&self_op, &target_op),
+                "set_forwarded_box on a BoxRef that wraps the same bound \
+                 Op as the target creates a one-node chain cycle"
+            );
+        }
+        if let (Some(self_ia), Some(target_ia)) = (self.bound_inputarg(), target.bound_inputarg()) {
+            assert!(
+                !Rc::ptr_eq(&self_ia, &target_ia),
+                "set_forwarded_box on a BoxRef that wraps the same bound \
+                 InputArg as the target creates a one-node chain cycle"
+            );
+        }
         // RPython AbstractValue invariant: `Const` is not a subclass of
         // `AbstractResOpOrInputArg` (history.py:182), so `set_forwarded`
         // is undefined on Const objects (resoperation.py:50 default
@@ -392,6 +490,74 @@ impl BoxRef {
         );
         let next = Forwarded::Box(target);
         self.write_forwarded(next);
+    }
+
+    /// `optimizer.py:394 op.set_forwarded(newop)` — InputArg variant.
+    /// Targets an `AbstractInputArg` identity directly via
+    /// `Weak<InputArg>`. Mirror of `set_forwarded_op` for the InputArg
+    /// chain-step case (compile.py:478, unroll.py:497).
+    pub fn set_forwarded_inputarg(&self, target: &crate::value::InputArgRc) {
+        // `resoperation.py:241 assert forwarded_to is not self` —
+        // compare against this BoxRef's bound InputArg so a chain step
+        // targeting the box's own identity panics instead of spinning
+        // the walker.
+        if let Some(self_ia) = self.bound_inputarg() {
+            assert!(
+                !Rc::ptr_eq(&self_ia, target),
+                "set_forwarded_inputarg on the same InputArg creates a \
+                 one-node chain cycle"
+            );
+        }
+        assert!(
+            !matches!(self.0.kind, BoxKind::Const { .. }),
+            "set_forwarded_inputarg on Const violates RPython AbstractValue \
+             invariant (Const has no _forwarded slot)"
+        );
+        self.write_forwarded(Forwarded::InputArg(Rc::downgrade(target)));
+    }
+
+    /// `optimizer.py:394 op.set_forwarded(newop)` — Op variant.
+    /// Targets an `AbstractResOp` identity directly via `Weak<Op>`,
+    /// retiring the `BoxKind::ResOp`-as-chain-target carrier. The
+    /// caller passes the canonical `OpRc` (typically a `TreeLoop.ops`
+    /// entry) — chain walkers upgrade the `Weak` and continue from
+    /// there.
+    pub fn set_forwarded_op(&self, target: &crate::resoperation::OpRc) {
+        // `resoperation.py:241 assert forwarded_to is not self` —
+        // compare against this BoxRef's bound Op so a chain step
+        // targeting the box's own identity panics instead of spinning
+        // the walker.
+        if let Some(self_op) = self.bound_op() {
+            assert!(
+                !Rc::ptr_eq(&self_op, target),
+                "set_forwarded_op on the same Op creates a one-node chain \
+                 cycle"
+            );
+        }
+        assert!(
+            !matches!(self.0.kind, BoxKind::Const { .. }),
+            "set_forwarded_op on Const violates RPython AbstractValue \
+             invariant (Const has no _forwarded slot)"
+        );
+        self.write_forwarded(Forwarded::Op(Rc::downgrade(target)));
+    }
+
+    /// `optimizer.py:432 make_constant(box, constbox)` — Const variant.
+    /// `Const` is an `AbstractValue` subclass (`history.py:220`), so PyPy
+    /// `box.set_forwarded(constbox)` is well-typed; here it terminates
+    /// the chain in a value-typed payload rather than allocating a
+    /// `BoxKind::Const` carrier. `const_index` is the pyre-side sidecar
+    /// for `box_to_opref` OpRef reconstruction; pass `None` when the
+    /// const has no const-namespace OpRef (PyPy parity site).
+    pub fn set_forwarded_const(&self, value: Const, const_index: Option<u32>) {
+        // Same Const-as-source invariant as the other set_forwarded_*
+        // variants — Const has no `_forwarded` slot per PyPy.
+        assert!(
+            !matches!(self.0.kind, BoxKind::Const { .. }),
+            "set_forwarded_const on Const violates RPython AbstractValue \
+             invariant (Const has no _forwarded slot)"
+        );
+        self.write_forwarded(Forwarded::Const(value, const_index));
     }
 
     /// `resoperation.py:53 set_forwarded(forwarded_to)` — Info variant.
@@ -462,14 +628,15 @@ impl BoxRef {
         self.write_forwarded(Forwarded::None);
     }
 
-    /// Slice 8.D writer: dual-write to `op.forwarded` / `inputarg.forwarded`
-    /// AND `Box.forwarded`. Snapshot consumers (`ExportedState.box_pool_snapshot`,
-    /// retrace import) clone the `BoxRef` by value and may outlive the
-    /// originating `OpRc` / `InputArgRc`; once the `Weak` upgrade fails,
-    /// `get_forwarded` falls back to `Box.forwarded`, so that slot must
-    /// stay current. The cost is one extra `RefCell` write per
-    /// `set_forwarded_*` — `Forwarded` is `Clone`, payloads are `Rc`/`Copy`
-    /// handles.
+    /// Dual-write to `op.forwarded` / `inputarg.forwarded` (the canonical
+    /// `_forwarded` host, resoperation.py:233-242 / :700) AND
+    /// `Box.forwarded`. Snapshot consumers (`compile_retrace` partial
+    /// trace import, test fixtures) clone the `BoxRef` by value and may
+    /// outlive the originating `OpRc` / `InputArgRc`; once the `Weak`
+    /// upgrade fails, `get_forwarded` falls back to `Box.forwarded`, so
+    /// that slot must stay current. The cost is one extra `RefCell` write
+    /// per `set_forwarded_*` — `Forwarded` is `Clone`, payloads are
+    /// `Rc`/`Copy` handles.
     fn write_forwarded(&self, value: Forwarded) {
         if let Some(weak) = self.0.op_handle.borrow().as_ref() {
             if let Some(op) = weak.upgrade() {
@@ -498,6 +665,38 @@ impl BoxRef {
                         return cur;
                     }
                     cur = b;
+                }
+                Forwarded::Op(weak) => {
+                    let Some(op_rc) = weak.upgrade() else {
+                        // Dropped target: PyPy has no analog (Python
+                        // GC keeps targets alive through `operations`).
+                        // Terminate the chain at `cur` to avoid a
+                        // dangling read.
+                        return cur;
+                    };
+                    cur = BoxRef::from_bound_op(&op_rc);
+                }
+                Forwarded::InputArg(weak) => {
+                    let Some(ia_rc) = weak.upgrade() else {
+                        return cur;
+                    };
+                    cur = BoxRef::from_bound_inputarg(&ia_rc);
+                }
+                Forwarded::Const(c, idx) => {
+                    if not_const {
+                        return cur;
+                    }
+                    // Materialize a terminal Const-bearing BoxRef so
+                    // legacy callers that expect `.const_value()` /
+                    // `BoxKind::Const` on the walker output keep
+                    // working until the BoxRef return type itself is
+                    // retired. Index sidecar round-trips so
+                    // `box_to_opref` can rebuild
+                    // `OpRef::Const{Int,Float,Ptr}(idx)`.
+                    return match idx {
+                        Some(i) => BoxRef::new_const_with_index(c.to_value(), i),
+                        None => BoxRef::new_const(c.to_value()),
+                    };
                 }
             }
         }
@@ -1185,10 +1384,11 @@ mod tests {
         assert!(matches!(b.get_forwarded(), Forwarded::Info(_)));
     }
 
-    /// PR #93 review (Codex P1): `ExportedState.box_pool_snapshot` clones
-    /// `BoxRef`s by value and lives past the originating `OpRc`. Writes
-    /// done while the Op is alive must also land in `Box.forwarded` so the
-    /// snapshot keeps the latest forwarding once `Weak::upgrade` fails.
+    /// Cross-pass snapshots (e.g. test fixtures cloning a BoxRef whose
+    /// originating `OpRc` then drops) outlive the `Weak<Op>` referent.
+    /// Writes done while the Op is alive must also land in `Box.forwarded`
+    /// so the snapshot keeps the latest forwarding once `Weak::upgrade`
+    /// fails.
     #[test]
     fn write_forwarded_mirrors_to_box_so_snapshot_survives_op_drop() {
         use crate::resoperation::{Op, OpCode};
