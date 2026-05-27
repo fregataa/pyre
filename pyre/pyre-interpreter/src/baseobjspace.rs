@@ -15,7 +15,7 @@
 
 use malachite_bigint::BigInt;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 use crate::function::is_function;
@@ -26,6 +26,26 @@ use pyre_object::*;
 // ── Re-exports from split-out modules ────────────────────────────────
 pub use crate::objspace::descroperation::*;
 pub(crate) use crate::objspace::std::formatting::{format_g_like, normalise_exponent};
+
+// ── Hash-error slot for dict key gate ────────────────────────────────
+// The strict hash hook (`pyre_object_hash_w_trampoline` in pyre-jit)
+// stores the concrete PyError here when `try_hash_value` fails.
+// Dict entry gates call `take_pending_hash_error` after a checked
+// dict op returns `DictKeyError` to recover the exception.
+thread_local! {
+    static PENDING_HASH_ERROR: Cell<Option<PyError>> = const { Cell::new(None) };
+}
+
+pub fn set_pending_hash_error(e: PyError) {
+    PENDING_HASH_ERROR.with(|cell| cell.set(Some(e)));
+}
+
+pub fn take_pending_hash_error() -> PyError {
+    PENDING_HASH_ERROR.with(|cell| {
+        cell.take()
+            .unwrap_or_else(|| PyError::type_error("unhashable type"))
+    })
+}
 
 /// Compatibility alias for PyPy's base-object type.
 /// PyPy frequently models interpreter values as subclasses of `W_Root`.
@@ -775,9 +795,12 @@ pub fn getitem(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
                 )),
             }
         } else if is_dict(obj) {
-            match w_dict_lookup(obj, index) {
-                Some(val) => Ok(val),
-                None => Err(PyError::key_error_with_key(index)),
+            // `pypy/objspace/std/dictmultiobject.py:137-141 W_DictMultiObject
+            // .descr_getitem` → `space.getitem(self, w_key)` → strategy
+            match pyre_object::dictmultiobject::w_dict_lookup_checked(obj, index) {
+                Ok(Some(val)) => Ok(val),
+                Ok(None) => Err(PyError::key_error_with_key(index)),
+                Err(_) => Err(take_pending_hash_error()),
             }
         } else if is_str(obj) {
             let s = w_str_get_value(obj);
@@ -1082,15 +1105,10 @@ pub fn setitem(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef) -> PyRe
                 ))
             }
         } else if is_dict(obj) {
-            // `pypy/objspace/std/dictmultiobject.py:174 descr_setitem` →
-            // `self.setitem(...)` → strategy.setitem(...) → r_dict insert,
-            // which calls `space.hash_w(w_key)` first.  Unhashable keys
-            // raise `TypeError: unhashable type: '<typename>'`.  Pyre's
-            // strategy.setitem doesn't gate on hash_w (Vec linear scan
-            // never needs it), so enforce the raise at the entry point.
-            crate::builtins::builtin_hash(&[index])?;
-            w_dict_store(obj, index, value);
-            Ok(w_none())
+            match unsafe { pyre_object::dictmultiobject::w_dict_store_checked(obj, index, value) } {
+                Ok(()) => Ok(w_none()),
+                Err(_) => Err(take_pending_hash_error()),
+            }
         } else if pyre_object::bytearrayobject::is_bytearray(obj) {
             if is_int(index) {
                 let idx = w_int_get_value(index);
@@ -6322,7 +6340,12 @@ pub fn contains(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, PyEr
             }
             match kind {
                 pyre_object::dictviewobject::DictViewKind::Keys => {
-                    return Ok(pyre_object::w_dict_lookup(dict, needle).is_some());
+                    return match unsafe {
+                        pyre_object::dictmultiobject::w_dict_lookup_checked(dict, needle)
+                    } {
+                        Ok(v) => Ok(v.is_some()),
+                        Err(_) => Err(take_pending_hash_error()),
+                    };
                 }
                 pyre_object::dictviewobject::DictViewKind::Items => {
                     if !is_tuple(needle) || w_tuple_len(needle) != 2 {
@@ -6336,10 +6359,13 @@ pub fn contains(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, PyEr
                         Some(v) => v,
                         None => return Ok(false),
                     };
-                    return Ok(match pyre_object::w_dict_lookup(dict, k) {
-                        Some(have) => eq_w(have, want),
-                        None => false,
-                    });
+                    return match unsafe {
+                        pyre_object::dictmultiobject::w_dict_lookup_checked(dict, k)
+                    } {
+                        Ok(Some(have)) => Ok(eq_w(have, want)),
+                        Ok(None) => Ok(false),
+                        Err(_) => Err(take_pending_hash_error()),
+                    };
                 }
                 pyre_object::dictviewobject::DictViewKind::Values => {
                     // values view: PyPy uses iter-based scan.
@@ -6383,7 +6409,10 @@ pub fn contains(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, PyEr
         }
         // dict: key containment (dictobject.py __contains__)
         if is_dict(haystack) {
-            return Ok(w_dict_lookup(haystack, needle).is_some());
+            return match pyre_object::dictmultiobject::w_dict_lookup_checked(haystack, needle) {
+                Ok(v) => Ok(v.is_some()),
+                Err(_) => Err(take_pending_hash_error()),
+            };
         }
         // set / frozenset (setobject.py W_BaseSetObject.descr_contains)
         if pyre_object::is_set_or_frozenset(haystack) {
@@ -6430,6 +6459,42 @@ pub fn contains(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, PyEr
 /// dispatcher fall through).
 pub fn hash_w(obj: PyObjectRef) -> i64 {
     crate::builtins::hash_value(obj)
+}
+
+/// `pypy/objspace/descroperation.py:553-580 hash_w` — strict variant
+/// that raises `TypeError: unhashable type: '<typename>'` instead of
+/// silently returning a sentinel hash.  Built-in mutable containers
+/// (dict / list / set / bytearray / dict view) are explicit
+/// unhashables per `dictmultiobject.py:1431` + `listobject.py` +
+/// `setobject.py`; everything else routes through `hash_value`'s
+/// hashable type ladder.  Mirrors the entry-point gate already in
+/// `builtins::builtin_hash` so callers that need to surface PyPy's
+/// `TypeError` directly (EmptyDictStrategy `getitem` /
+/// ObjectDictStrategy lookups per `dictmultiobject.py:738-743`) can
+/// reuse the same dispatch without duplicating the type ladder.
+pub fn hash_w_strict(obj: PyObjectRef) -> Result<i64, PyError> {
+    if obj.is_null() {
+        return Err(PyError::type_error("hash() argument is null"));
+    }
+    unsafe {
+        let kind = if pyre_object::is_dict(obj) {
+            Some("dict")
+        } else if pyre_object::is_list(obj) {
+            Some("list")
+        } else if pyre_object::is_set(obj) {
+            Some("set")
+        } else if pyre_object::is_bytearray(obj) {
+            Some("bytearray")
+        } else if pyre_object::dictviewobject::is_dict_view(obj) {
+            Some("dict view")
+        } else {
+            None
+        };
+        if let Some(name) = kind {
+            return Err(PyError::type_error(format!("unhashable type: '{}'", name)));
+        }
+    }
+    Ok(crate::builtins::hash_value(obj))
 }
 
 /// Compare two objects for equality (returns bool, not PyObjectRef).
@@ -6539,12 +6604,11 @@ pub fn delitem(obj: PyObjectRef, index: PyObjectRef) -> Result<(), PyError> {
 /// honour the W_DictObject `dict_storage_proxy` back-mirror via
 /// `w_dict_delitem_object_strategy` / `w_module_dict_delitem_inner`.
 fn dict_delitem(obj: PyObjectRef, key: PyObjectRef) -> Result<(), PyError> {
-    use pyre_object::*;
     unsafe {
-        if dictmultiobject::w_dict_delitem(obj, key) {
-            Ok(())
-        } else {
-            Err(PyError::key_error_with_key(key))
+        match pyre_object::dictmultiobject::w_dict_delitem_checked(obj, key) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(PyError::key_error_with_key(key)),
+            Err(_) => Err(take_pending_hash_error()),
         }
     }
 }

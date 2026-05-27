@@ -159,10 +159,20 @@ unsafe fn pyre_object_eq_w_trampoline(
 /// space.hash_w)` hash bridge: ObjectDictStrategy uses both eq_w and
 /// hash_w; pyre's `dict_keys_equal` enforces the bucket invariant
 /// (same eq_w + same hash_w → same key, different hash_w → distinct).
-/// Routes through `pyre_interpreter::baseobjspace::hash_w` (line-by-
-/// line port of `baseobjspace.py:840-845 W_ObjectSpace.hash_w`).
+/// Routes through `try_hash_value` (the strict Result-bearing hash)
+/// so unhashable types, user `__hash__ = None`, and user `__hash__`
+/// exceptions are all caught.  On error, signals via
+/// `dict_eq_hook::signal_hash_error` and stores the `PyError` in
+/// `PENDING_HASH_ERROR` for the caller to retrieve.
 unsafe fn pyre_object_hash_w_trampoline(obj: pyre_object::PyObjectRef) -> i64 {
-    pyre_interpreter::baseobjspace::hash_w(obj)
+    match pyre_interpreter::builtins::try_hash_value(obj) {
+        Ok(h) => h,
+        Err(e) => {
+            pyre_interpreter::baseobjspace::set_pending_hash_error(e);
+            pyre_object::dict_eq_hook::signal_hash_error(obj);
+            0
+        }
+    }
 }
 
 /// `pypy/objspace/std/typeobject.py:353-371
@@ -7000,7 +7010,7 @@ mod tests {
             symbolic_stack_types: vec![],
             registers_r: vec![local],
             concrete_stack: vec![],
-            concrete_namespace: frame.w_globals,
+            concrete_namespace: frame.w_globals_obj,
             vable_last_instr: ctx.const_int(resume_pc as i64 - 1),
             vable_pycode: ctx.const_ref(frame.pycode as usize as i64),
             vable_valuestackdepth: ctx.const_int(1),
@@ -7201,7 +7211,7 @@ mod tests {
             symbolic_stack_types: vec![Type::Ref, Type::Int],
             registers_r: vec![OpRef::NONE; 4],
             concrete_stack: vec![],
-            concrete_namespace: frame.w_globals,
+            concrete_namespace: frame.w_globals_obj,
             vable_last_instr: ctx.const_int(999),
             vable_pycode: ctx.const_ref(0xdead),
             vable_valuestackdepth: ctx.const_int(111),
@@ -7304,7 +7314,7 @@ mod tests {
             symbolic_stack_types: vec![Type::Ref, Type::Int],
             registers_r: vec![OpRef::NONE, OpRef::NONE, stack0, stack1],
             concrete_stack: vec![],
-            concrete_namespace: frame.w_globals,
+            concrete_namespace: frame.w_globals_obj,
             vable_last_instr: ctx.const_int(0),
             vable_pycode: ctx.const_ref(0),
             vable_valuestackdepth: ctx.const_int(0),
@@ -7409,7 +7419,7 @@ mod tests {
                 symbolic_stack_types: vec![],
                 registers_r: vec![local],
                 concrete_stack: vec![],
-                concrete_namespace: frame.w_globals,
+                concrete_namespace: frame.w_globals_obj,
                 vable_last_instr: ctx.const_int(resume_pc as i64 - 1),
                 vable_pycode: ctx.const_ref(frame.pycode as usize as i64),
                 vable_valuestackdepth: ctx.const_int(1),
@@ -7489,7 +7499,7 @@ mod tests {
             symbolic_stack_types: vec![Type::Ref, Type::Int],
             registers_r: vec![OpRef::NONE; 4],
             concrete_stack: vec![],
-            concrete_namespace: frame.w_globals,
+            concrete_namespace: frame.w_globals_obj,
             vable_last_instr: ctx.const_int(0),
             vable_pycode: ctx.const_ref(0),
             vable_valuestackdepth: ctx.const_int(0),
@@ -7556,7 +7566,7 @@ mod tests {
             symbolic_stack_types: vec![Type::Ref, Type::Int],
             registers_r: vec![OpRef::NONE; 4],
             concrete_stack: vec![],
-            concrete_namespace: frame.w_globals,
+            concrete_namespace: frame.w_globals_obj,
             vable_last_instr: ctx.const_int(0),
             vable_pycode: ctx.const_ref(0),
             vable_valuestackdepth: ctx.const_int(0),
@@ -7647,7 +7657,7 @@ mod tests {
                 symbolic_stack_types: vec![Type::Ref, Type::Int],
                 registers_r: vec![OpRef::NONE, OpRef::NONE, lower_stack, truth],
                 concrete_stack: vec![],
-                concrete_namespace: frame.w_globals,
+                concrete_namespace: frame.w_globals_obj,
                 vable_last_instr: ctx.const_int(resume_pc as i64 - 1),
                 vable_pycode: ctx.const_ref(frame.pycode as usize as i64),
                 vable_valuestackdepth: ctx.const_int(4),
@@ -7791,7 +7801,7 @@ mod tests {
             symbolic_stack_types: vec![Type::Ref, Type::Int],
             registers_r: vec![OpRef::NONE, OpRef::NONE, lower_stack, truth],
             concrete_stack: vec![],
-            concrete_namespace: frame.w_globals,
+            concrete_namespace: frame.w_globals_obj,
             vable_last_instr: ctx.const_int(resume_pc as i64 - 1),
             vable_pycode: ctx.const_ref(frame.pycode as usize as i64),
             vable_valuestackdepth: ctx.const_int(4),
@@ -7915,7 +7925,7 @@ mod tests {
             symbolic_stack_types: vec![Type::Ref, Type::Ref],
             registers_r: vec![local0, stack0, stack1],
             concrete_stack: vec![],
-            concrete_namespace: frame.w_globals,
+            concrete_namespace: frame.w_globals_obj,
             vable_last_instr: ctx.const_int(target_pc as i64 - 1),
             vable_pycode: ctx.const_ref(frame.pycode as usize as i64),
             vable_valuestackdepth: ctx.const_int(3),

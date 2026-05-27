@@ -27,9 +27,10 @@ pub type EqWHookFn = unsafe fn(a: PyObjectRef, b: PyObjectRef) -> bool;
 
 /// `pypy/interpreter/baseobjspace.py:840-845 W_ObjectSpace.hash_w`
 /// signature: returns the `__hash__` digest as `i64` (matching
-/// CPython `Py_hash_t`).  Errors are swallowed; the trampoline returns
-/// `0` for non-hashable types — callers (`dict_keys_equal`) gate on
-/// `try_hash_w` returning `Some(_)` before relying on the value.
+/// CPython `Py_hash_t`).  On error (unhashable type, user `__hash__`
+/// raised, etc.) the hook calls [`signal_hash_error`] and returns 0;
+/// callers that need error propagation use [`take_hash_error`] after
+/// the hash call.
 pub type HashWHookFn = unsafe fn(obj: PyObjectRef) -> i64;
 
 /// `pypy/objspace/std/typeobject.py:353-371
@@ -44,6 +45,35 @@ thread_local! {
     static EQ_W_HOOK: Cell<Option<EqWHookFn>> = const { Cell::new(None) };
     static HASH_W_HOOK: Cell<Option<HashWHookFn>> = const { Cell::new(None) };
     static COMPARES_BY_IDENTITY_HOOK: Cell<Option<ComparesByIdentityHookFn>> = const { Cell::new(None) };
+    /// Error flag set by the hash hook when `space.hash_w` encounters
+    /// an unhashable type or a user `__hash__` raises.  The object
+    /// reference is stored so the caller can reconstruct the error
+    /// message.  Null means no error.
+    static HASH_W_ERROR: Cell<PyObjectRef> = const { Cell::new(std::ptr::null_mut()) };
+}
+
+/// Signal that the most recent `hash_w` call failed.  Called by the
+/// hash hook trampoline when `try_hash_value` returns `Err`.  The
+/// caller retrieves the error via [`take_hash_error`].
+#[inline]
+pub fn signal_hash_error(obj: PyObjectRef) {
+    HASH_W_ERROR.with(|cell| cell.set(obj));
+}
+
+/// Consume the pending hash error flag, returning the unhashable
+/// object if an error was signalled since the last `take`.  Returns
+/// `None` when no error is pending.
+#[inline]
+pub fn take_hash_error() -> Option<PyObjectRef> {
+    HASH_W_ERROR.with(|cell| {
+        let obj = cell.get();
+        if obj.is_null() {
+            None
+        } else {
+            cell.set(std::ptr::null_mut());
+            Some(obj)
+        }
+    })
 }
 
 /// Install the `eq_w` callback for this thread.  Called from
@@ -87,6 +117,11 @@ pub unsafe fn try_eq_w(a: PyObjectRef, b: PyObjectRef) -> Option<bool> {
 /// is installed; callers treat that as "hash unavailable" and fall
 /// back to eq-only comparison (which preserves pre-Item-1.2 behavior
 /// on snapshot tools / single-crate tests).
+///
+/// When the hook signals an error (unhashable type, user `__hash__`
+/// raised), it calls [`signal_hash_error`] before returning 0.
+/// Callers that need error propagation should call
+/// [`take_hash_error`] after this function returns `Some(0)`.
 ///
 /// # Safety
 /// `obj` must be a valid PyObjectRef (null tolerated).

@@ -782,13 +782,15 @@ pub fn emit_new_pyframe_inline_self_recursive(
     valuestackdepth: usize,
     pycode: OpRef,
     w_globals: OpRef,
+    w_globals_obj: OpRef,
     ec: OpRef,
 ) -> OpRef {
     use crate::descr::{
         int_intval_descr, pyframe_code_descr, pyframe_dict_storage_descr,
         pyframe_execution_context_descr, pyframe_f_backref_descr, pyframe_f_generator_nowref_descr,
         pyframe_locals_cells_stack_descr, pyframe_next_instr_descr, pyframe_size_descr,
-        pyframe_stack_depth_descr, pyframe_w_yielding_from_descr, w_int_size_descr,
+        pyframe_stack_depth_descr, pyframe_w_globals_obj_descr, pyframe_w_yielding_from_descr,
+        w_int_size_descr,
     };
     use crate::state::pyobject_gcarray_descr;
 
@@ -840,6 +842,22 @@ pub fn emit_new_pyframe_inline_self_recursive(
     let globals_idx = globals_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, w_globals], globals_descr);
     ctx.heapcache_setfield_cached(new_frame, globals_idx, w_globals);
+
+    // R3.3b prep: also populate the canonical W_DictObject sibling slot
+    // (`PyFrame.w_globals_obj`) from `function.w_func_globals_obj` so
+    // trace-time JIT consumers can chase via `dict_storage_proxy` to
+    // recover the underlying DictStorage* without going through the
+    // pyframe-side lazy `get_w_globals_obj()` resolver.  R3.3 cutover
+    // will retire the raw `w_globals` SetfieldGc above once the rest
+    // of the JIT IR migrates to reading through this slot.
+    let globals_obj_descr = pyframe_w_globals_obj_descr();
+    let globals_obj_idx = globals_obj_descr.index();
+    ctx.record_op_with_descr(
+        OpCode::SetfieldGc,
+        &[new_frame, w_globals_obj],
+        globals_obj_descr,
+    );
+    ctx.heapcache_setfield_cached(new_frame, globals_obj_idx, w_globals_obj);
 
     // `locals_array` is a fresh `NewArrayClear` op result.  PyPy's
     // executor-while-trace model would have `Box.value` carry the

@@ -1745,6 +1745,27 @@ pub fn resolve_dict_backing(obj: PyObjectRef) -> PyObjectRef {
     pyre_object::PY_NULL
 }
 
+fn dict_lookup_checked(
+    dict: PyObjectRef,
+    key: PyObjectRef,
+) -> Result<Option<PyObjectRef>, crate::PyError> {
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_lookup_checked(dict, key)
+            .map_err(|_| crate::baseobjspace::take_pending_hash_error())
+    }
+}
+
+pub(crate) fn dict_store_checked(
+    dict: PyObjectRef,
+    key: PyObjectRef,
+    value: PyObjectRef,
+) -> Result<(), crate::PyError> {
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_store_checked(dict, key, value)
+            .map_err(|_| crate::baseobjspace::take_pending_hash_error())
+    }
+}
+
 pub fn dict_method_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() >= 2);
     let dict = resolve_dict_backing(args[0]);
@@ -1753,7 +1774,7 @@ pub fn dict_method_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     if dict.is_null() {
         return Ok(default);
     }
-    unsafe { Ok(w_dict_lookup(dict, key).unwrap_or(default)) }
+    Ok(dict_lookup_checked(dict, key)?.unwrap_or(default))
 }
 
 /// `pypy/objspace/std/dictmultiobject.py:descr_keys` parity — returns
@@ -1927,7 +1948,7 @@ pub fn dict_method_update(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
                     // dicts route through the union-view item walk so
                     // entries living only in the proxy survive.
                     for (k, v) in pyre_object::w_dict_items(other_raw) {
-                        w_dict_store(dict, k, v);
+                        dict_store_checked(dict, k, v)?;
                     }
                 }
             } else {
@@ -1946,7 +1967,7 @@ pub fn dict_method_update(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
                     let keys = crate::builtins::collect_iterable(w_keys_view)?;
                     for k in keys {
                         let v = crate::baseobjspace::getitem(other, k)?;
-                        w_dict_store(dict, k, v);
+                        dict_store_checked(dict, k, v)?;
                     }
                 } else {
                     // `dictmultiobject.py:1410-1416 update1_pairs` —
@@ -1963,7 +1984,7 @@ pub fn dict_method_update(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
                                 entries.len()
                             )));
                         }
-                        w_dict_store(dict, entries[0], entries[1]);
+                        dict_store_checked(dict, entries[0], entries[1])?;
                     }
                 }
             }
@@ -1975,7 +1996,7 @@ pub fn dict_method_update(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
                 if pyre_object::is_str(k) && pyre_object::w_str_get_value(k) == "__pyre_kw__" {
                     continue;
                 }
-                w_dict_store(dict, k, v);
+                dict_store_checked(dict, k, v)?;
             }
         }
     }
@@ -2058,21 +2079,20 @@ pub fn dict_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     let key = args[1];
     let default = args.get(2).copied();
     if !dict.is_null() {
-        unsafe {
-            if let Some(val) = w_dict_lookup(dict, key) {
-                // `pypy/objspace/std/dictmultiobject.py
-                // W_DictMultiObject.descr_pop` calls
-                // `space.delitem(self, w_key)` after the lookup,
-                // which dispatches to the storage's `delitem`
-                // implementation — equality-based, key-type
-                // agnostic.  pyre routes through `w_dict_delitem`
-                // which walks entries with `dict_keys_equal`, so
-                // `d.pop(int_key)` actually removes the entry
-                // instead of the previous str-only branch silently
-                // leaving the dict mutated only by happenstance.
-                pyre_object::dictmultiobject::w_dict_delitem(dict, key);
-                return Ok(val);
-            }
+        // `dictmultiobject.py:246-255 descr_pop` delegates to
+        // `strategy.pop`.  EmptyDictStrategy.pop (`:783-787`) returns
+        // the provided default, or raises KeyError, without hashing the
+        // key.  Do that before the checked lookup path, whose
+        // EmptyDictStrategy getitem parity intentionally hashes.
+        if unsafe { pyre_object::dictmultiobject::w_dict_is_empty_strategy(dict) } {
+            return default.ok_or_else(|| crate::PyError::key_error_with_key(key));
+        }
+        if let Some(val) = dict_lookup_checked(dict, key)? {
+            // Non-empty fallback until the full strategy.pop hook is
+            // present in DictStrategy: remove via the strategy dispatch
+            // after the successful lookup.
+            unsafe { pyre_object::dictmultiobject::w_dict_delitem(dict, key) };
+            return Ok(val);
         }
     }
     if let Some(d) = default {
@@ -2122,14 +2142,102 @@ pub fn dict_method_setdefault(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
     let key = args[1];
     let default = args.get(2).copied().unwrap_or_else(w_none);
     if !dict.is_null() {
-        unsafe {
-            if let Some(existing) = w_dict_lookup(dict, key) {
-                return Ok(existing);
-            }
-            w_dict_store(dict, key, default);
+        if let Some(existing) = dict_lookup_checked(dict, key)? {
+            return Ok(existing);
         }
+        dict_store_checked(dict, key, default)?;
     }
     Ok(default)
+}
+
+#[cfg(test)]
+mod dict_method_tests {
+    use super::*;
+
+    fn assert_type_error(result: Result<PyObjectRef, crate::PyError>) {
+        let err = result.expect_err("operation should reject unhashable dict key");
+        assert_eq!(err.kind, crate::PyErrorKind::TypeError);
+    }
+
+    unsafe fn test_hash_w(obj: PyObjectRef) -> i64 {
+        match crate::builtins::try_hash_value(obj) {
+            Ok(h) => h,
+            Err(e) => {
+                crate::baseobjspace::set_pending_hash_error(e);
+                pyre_object::dict_eq_hook::signal_hash_error(obj);
+                0
+            }
+        }
+    }
+
+    fn install_hash_hook() {
+        pyre_object::dict_eq_hook::register_hash_w_hook(test_hash_w);
+    }
+
+    #[test]
+    fn dict_get_rejects_unhashable_key() {
+        install_hash_hook();
+        let dict = w_dict_new();
+        let key = w_list_new(vec![]);
+
+        assert_type_error(dict_method_get(&[dict, key]));
+        assert_eq!(unsafe { w_dict_len(dict) }, 0);
+    }
+
+    #[test]
+    fn dict_setitem_rejects_unhashable_key_without_inserting() {
+        install_hash_hook();
+        let dict = w_dict_new();
+        let key = w_list_new(vec![]);
+
+        assert_type_error(crate::baseobjspace::setitem(dict, key, w_int_new(1)));
+        assert_eq!(unsafe { w_dict_len(dict) }, 0);
+    }
+
+    #[test]
+    fn dict_setdefault_rejects_unhashable_key() {
+        install_hash_hook();
+        let dict = w_dict_new();
+        let key = w_list_new(vec![]);
+
+        assert_type_error(dict_method_setdefault(&[dict, key, w_int_new(1)]));
+        assert_eq!(unsafe { w_dict_len(dict) }, 0);
+    }
+
+    #[test]
+    fn dict_pop_empty_returns_default_without_hashing_key() {
+        install_hash_hook();
+        let dict = w_dict_new();
+        let key = w_list_new(vec![]);
+        let default = w_int_new(42);
+
+        let result = dict_method_pop(&[dict, key, default]).expect("default should be returned");
+        assert_eq!(result, default);
+        assert_eq!(unsafe { w_dict_len(dict) }, 0);
+    }
+
+    #[test]
+    fn dict_pop_empty_without_default_raises_keyerror_not_typeerror() {
+        install_hash_hook();
+        let dict = w_dict_new();
+        let key = w_list_new(vec![]);
+
+        let err = dict_method_pop(&[dict, key]).expect_err("missing key should raise KeyError");
+        assert_eq!(err.kind, crate::PyErrorKind::KeyError);
+        assert_eq!(unsafe { w_dict_len(dict) }, 0);
+    }
+
+    #[test]
+    fn dict_update_pairs_rejects_unhashable_key() {
+        install_hash_hook();
+        let dict = w_dict_new();
+        let key = w_list_new(vec![]);
+        let pair = w_tuple_new(vec![key, w_int_new(1)]);
+        let pairs = w_list_new(vec![pair]);
+
+        assert_type_error(dict_method_update(&[dict, pairs]));
+        assert_eq!(unsafe { w_dict_len(dict) }, 0);
+    }
 }
 
 // ── Tuple methods ────────────────────────────────────────────────────

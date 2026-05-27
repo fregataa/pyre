@@ -2111,6 +2111,19 @@ impl PyFrame {
             unsafe { crate::w_code_frame_stores_global(code as PyObjectRef, globals) };
 
         let w_builtin = crate::baseobjspace::pick_builtin(globals, execution_context);
+        // R3.3a prep: eagerly resolve the canonical W_DictObject sibling
+        // so the trace-time JIT seed (state.rs concrete_namespace +
+        // pending PYFRAME_W_GLOBALS_OBJ_OFFSET vable cutover) observes
+        // a non-null PyObjectRef without going through the &mut self
+        // `get_w_globals_obj` lazy resolver.  Matches the documented
+        // invariant on `PyFrame::w_globals_obj` (pyframe.rs:121-128) and
+        // the other constructors (`new_with_namespace`, `new_minimal`,
+        // `createframe` callsite) which already resolve eagerly.
+        let w_globals_obj = if globals.is_null() {
+            PY_NULL
+        } else {
+            crate::baseobjspace::dict_storage_to_dict(globals)
+        };
         let mut frame = PyFrame {
             execution_context,
             pycode: code,
@@ -2127,7 +2140,7 @@ impl PyFrame {
             w_yielding_from: PY_NULL,
             f_backref: std::ptr::null_mut(),
             w_builtin,
-            w_globals_obj: PY_NULL,
+            w_globals_obj,
         };
         frame.init_cells();
         if stores_global {

@@ -195,8 +195,8 @@ pub(crate) extern "C" fn trace_set_current_exception_jit(exc: i64) {
 use pyre_interpreter::eval::{attach_raise_cause, normalize_raise_cause};
 use pyre_interpreter::truth_value as objspace_truth_value;
 use pyre_interpreter::{
-    DictStorage, OpcodeStepExecutor, PyError, SharedOpcodeHandler, call_function,
-    decode_instruction_at, execute_opcode_step, function_get_defaults, function_get_globals,
+    OpcodeStepExecutor, PyError, SharedOpcodeHandler, call_function, decode_instruction_at,
+    execute_opcode_step, function_get_defaults, function_get_globals, function_get_globals_obj,
     is_builtin_code, is_function, range_iter_continues,
 };
 
@@ -370,6 +370,12 @@ fn emit_call_assembler_callee_frame(
             let ncells = pyre_interpreter::ncells(callee_code);
             let max_stack = callee_code.max_stackdepth as usize;
             let callee_globals = unsafe { function_get_globals(concrete_callable) };
+            // R3.3b: also resolve the canonical W_DictObject sibling so the
+            // inline new-PyFrame helper populates `PyFrame.w_globals_obj`
+            // in lockstep with the raw slot, matching what production
+            // Rust constructors do at heap allocation.
+            let callee_globals_obj =
+                unsafe { pyre_interpreter::function_get_globals_obj(concrete_callable) };
             let stores_global = unsafe {
                 pyre_interpreter::w_code_frame_stores_global(
                     w_callee_code as PyObjectRef,
@@ -379,6 +385,7 @@ fn emit_call_assembler_callee_frame(
             if ncells == 0 && !stores_global {
                 let pycode_const = ctx.const_ref(w_callee_code as i64);
                 let w_globals_const = ctx.const_ref(callee_globals as i64);
+                let w_globals_obj_const = ctx.const_ref(callee_globals_obj as i64);
                 let ec = this.ensure_execution_context(ctx);
                 let frame = crate::helpers::emit_new_pyframe_inline_self_recursive(
                     ctx,
@@ -387,6 +394,7 @@ fn emit_call_assembler_callee_frame(
                     nlocals + ncells,
                     pycode_const,
                     w_globals_const,
+                    w_globals_obj_const,
                     ec,
                 );
                 return Ok((frame, false));
@@ -2395,7 +2403,7 @@ impl MIFrame {
         } else {
             (0, 0, 0)
         };
-        let ns_ptr = self.sym().concrete_namespace as i64;
+        let ns_ptr = crate::state::concrete_dict_storage(self.sym().concrete_namespace) as i64;
         // G.4.3a: portal-bridge frames trace eval_loop_jit, so each user
         // opcode is a residual call to execute_opcode_step whose
         // valuestackdepth side-effects do NOT advance `sym.valuestackdepth`.
@@ -5968,9 +5976,9 @@ impl MIFrame {
         let callee_nlocals =
             callee_code.varnames.len() + pyre_interpreter::pyframe::ncells(callee_code);
         let caller_namespace = caller_namespace_ptr;
-        let callee_globals = unsafe { function_get_globals(concrete_callable) };
+        let callee_globals_obj = unsafe { function_get_globals_obj(concrete_callable) };
         let can_skip_traced_callee_frame = !is_self_recursive
-            && callee_globals == caller_namespace
+            && callee_globals_obj == caller_namespace
             && concrete_args.len() == args.len()
             && callee_nlocals == args.len();
 
@@ -5991,7 +5999,7 @@ impl MIFrame {
                 .resize(callee_nlocals, ConcreteValue::Null);
             sym.concrete_stack = Vec::new();
             sym.jitcode = jitcode_for(w_code);
-            sym.concrete_namespace = callee_globals as *mut DictStorage;
+            sym.concrete_namespace = callee_globals_obj;
             sym.concrete_execution_context = self.sym().concrete_execution_context;
             let (
                 vable_last_instr,
@@ -6011,7 +6019,7 @@ impl MIFrame {
                     ctx.const_int(callee_nlocals as i64),
                     null, // debugdata = None
                     null, // lastblock = None
-                    ctx.const_ref(callee_globals as i64),
+                    ctx.const_ref(globals as i64),
                 )
             });
             sym.vable_last_instr = vable_last_instr;
@@ -6142,7 +6150,7 @@ impl MIFrame {
                 sym.locals_cells_stack_array_ref =
                     frame_locals_cells_stack_array(ctx, callee_frame_opref);
             });
-            sym.concrete_namespace = callee_globals as *mut DictStorage;
+            sym.concrete_namespace = callee_globals_obj;
             sym.concrete_execution_context = self.sym().concrete_execution_context;
             (sym, Some(callee_frame_opref))
         };

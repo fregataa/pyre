@@ -155,12 +155,8 @@ impl DictStrategy for IdentityDictStrategy {
     /// on mismatch, promote to Object.
     unsafe fn setitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef, w_value: PyObjectRef) {
         if Self::is_correct_type(w_key) {
-            let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
             let entries = identity_storage_mut(w_dict);
-            let is_insert = entries.insert(IdentityKey(w_key), w_value).is_none();
-            if is_insert {
-                dict.len += 1;
-            }
+            entries.insert(IdentityKey(w_key), w_value);
             crate::gc_hook::try_gc_write_barrier(w_dict as *mut u8);
             return;
         }
@@ -180,13 +176,8 @@ impl DictStrategy for IdentityDictStrategy {
     /// on mismatch, promote to Object.
     unsafe fn delitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> bool {
         if Self::is_correct_type(w_key) {
-            let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
             let entries = identity_storage_mut(w_dict);
-            if entries.shift_remove(&IdentityKey(w_key)).is_some() {
-                dict.len = entries.len();
-                return true;
-            }
-            return false;
+            return entries.shift_remove(&IdentityKey(w_key)).is_some();
         }
         self.switch_to_object_strategy(w_dict);
         crate::dictmultiobject::w_dict_delitem(w_dict, w_key)
@@ -212,24 +203,17 @@ impl DictStrategy for IdentityDictStrategy {
     }
 
     unsafe fn clear(&self, w_dict: PyObjectRef) {
-        let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
         let entries = identity_storage_mut(w_dict);
         entries.clear();
-        dict.len = 0;
     }
 
     /// `dictmultiobject.py:1152 AbstractTypedStrategy.copy` — clone
     /// the typed `IndexMap<IdentityKey, _>` backing and wrap with the
     /// same IdentityDictStrategy.
     unsafe fn copy(&self, w_dict: PyObjectRef) -> PyObjectRef {
-        let dict = &*(w_dict as *const crate::dictmultiobject::W_DictObject);
         let storage = identity_storage(w_dict);
         let new_storage = Box::into_raw(Box::new(storage.clone()));
-        crate::dictmultiobject::w_dict_new_with(
-            &IDENTITY_DICT_STRATEGY,
-            new_storage as *mut u8,
-            dict.len,
-        )
+        crate::dictmultiobject::w_dict_new_with(&IDENTITY_DICT_STRATEGY, new_storage as *mut u8)
     }
 
     /// `pypy.objspace.std.identitydict.IdentityDictStrategy` stores
@@ -237,31 +221,43 @@ impl DictStrategy for IdentityDictStrategy {
     /// the pointer.  Trace `key.0` through an unsafe pointer cast so a
     /// minor collection keeps each identity key's referent alive.
     ///
-    /// SOUNDNESS HAZARD (pyre-only, not in RPython): pyre's young gen
-    /// is moving (`majit-gc/src/lib.rs:184` notes only **old gen** is
-    /// mark-sweep non-moving; `collector.rs:1652 pin_nursery_object`
-    /// confirms minor collection promotes / relocates young objects).
-    /// `IdentityKey`'s `Hash` impl is `(self.0 as usize).hash(state)`
-    /// so a key promoted from young to old gen invalidates its bucket
-    /// placement in the underlying `IndexMap` — subsequent lookups with
-    /// the new pointer probe a different bucket and miss.  PyPy avoids
-    /// this by routing `IdentityDictStrategy` through `space.id(obj)`
-    /// whose result is recorded in the GC header (`compute_identity_hash`)
-    /// and survives moves.  Pyre's equivalent (`pyre_id` / stable-id GC
-    /// header) does not exist yet — see the "stable identity-hash GC
-    /// header" epic in MEMORY for the long-term fix.  Until that lands,
-    /// IdentityDict is sound only when keys are old-gen at insertion or
-    /// have been pinned; the typical pattern (class instances created
-    /// at module init, then used as dict keys) puts keys in old gen
-    /// before the first minor cycle so the bug rarely fires in practice
-    /// but is observable when a fresh user-class instance is inserted
-    /// and a minor collection follows before lookup.
+    /// GC-move bucket rehash: `IdentityKey`'s `Hash` impl is
+    /// `(self.0 as usize).hash(state)`, so when a minor collection
+    /// promotes / relocates a key from young to old gen
+    /// (`majit-gc/src/collector.rs:1652 pin_nursery_object`), the
+    /// IndexMap's bucket placement (computed at insert from the old
+    /// pointer) no longer agrees with the post-trace pointer's hash.
+    /// Subsequent lookups with the new pointer would probe a different
+    /// bucket and miss.  PyPy's IdentityDictStrategy is backed by an
+    /// RPython dict whose object-default hash routes through
+    /// `compute_identity_hash` — that hash is cached in the GC header
+    /// and survives moves, so PyPy's bucket placement stays consistent
+    /// without any explicit rehash.  Pyre lacks the per-object cached
+    /// id slot (would require widening `PyObject` and threading the
+    /// allocator), so the soundness is enforced here at trace time:
+    /// detect any moved key and rebuild the IndexMap in place so every
+    /// bucket gets recomputed from the new pointer.  `IndexMap::drain`
+    /// preserves insertion order, and re-inserting reuses the cleared
+    /// allocation, so the rebuild is O(n) and only fires when at least
+    /// one key actually moved.
     unsafe fn walk_gc_refs(&self, w_dict: PyObjectRef, visitor: &mut dyn FnMut(*mut PyObjectRef)) {
         let entries = identity_storage_mut(w_dict);
+        let mut needs_rehash = false;
         for (k, v) in entries.iter_mut() {
             let key_ptr = k as *const IdentityKey as *mut IdentityKey;
+            let before = (*key_ptr).0;
             visitor(std::ptr::addr_of_mut!((*key_ptr).0));
+            let after = (*key_ptr).0;
+            if !std::ptr::eq(before, after) {
+                needs_rehash = true;
+            }
             visitor(v as *mut PyObjectRef);
+        }
+        if needs_rehash {
+            let drained: Vec<(IdentityKey, PyObjectRef)> = entries.drain(..).collect();
+            for (k, v) in drained {
+                entries.insert(k, v);
+            }
         }
     }
 }

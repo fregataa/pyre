@@ -341,7 +341,11 @@ impl EmptyDictStrategy {
     ///
     /// # Safety
     /// `w_dict` and `w_key` must be valid PyObjectRef.
-    unsafe fn switch_to_correct_strategy(&self, w_dict: PyObjectRef, w_key: PyObjectRef) {
+    pub(crate) unsafe fn switch_to_correct_strategy(
+        &self,
+        w_dict: PyObjectRef,
+        w_key: PyObjectRef,
+    ) {
         // `:693-695 type(w_key) is self.space.StringObjectCls`
         // (Python 2 str / Python 3 bytes).
         if crate::is_bytes(w_key) {
@@ -509,7 +513,11 @@ impl EmptyKwargsDictStrategy {
     ///
     /// # Safety
     /// `w_dict` and `w_key` must be valid PyObjectRef.
-    unsafe fn switch_to_correct_strategy(&self, w_dict: PyObjectRef, w_key: PyObjectRef) {
+    pub(crate) unsafe fn switch_to_correct_strategy(
+        &self,
+        w_dict: PyObjectRef,
+        w_key: PyObjectRef,
+    ) {
         if crate::is_bytes(w_key) {
             EMPTY_DICT_STRATEGY.switch_to_bytes_strategy(w_dict);
             return;
@@ -890,11 +898,7 @@ impl DictStrategy for ObjectDictStrategy {
         let storage = &*(dict.dstorage
             as *const indexmap::IndexMap<crate::dictmultiobject::ObjectKey, PyObjectRef>);
         let new_storage = Box::into_raw(Box::new(storage.clone()));
-        crate::dictmultiobject::w_dict_new_with(
-            &OBJECT_DICT_STRATEGY,
-            new_storage as *mut u8,
-            dict.len,
-        )
+        crate::dictmultiobject::w_dict_new_with(&OBJECT_DICT_STRATEGY, new_storage as *mut u8)
     }
 }
 
@@ -1059,11 +1063,7 @@ impl DictStrategy for BytesDictStrategy {
         let dict = &*(w_dict as *const crate::dictmultiobject::W_DictObject);
         let storage = &*(dict.dstorage as *const indexmap::IndexMap<Vec<u8>, PyObjectRef>);
         let new_storage = Box::into_raw(Box::new(storage.clone()));
-        crate::dictmultiobject::w_dict_new_with(
-            &BYTES_DICT_STRATEGY,
-            new_storage as *mut u8,
-            dict.len,
-        )
+        crate::dictmultiobject::w_dict_new_with(&BYTES_DICT_STRATEGY, new_storage as *mut u8)
     }
 }
 
@@ -1233,11 +1233,7 @@ impl DictStrategy for UnicodeDictStrategy {
         let storage = &*(dict.dstorage
             as *const indexmap::IndexMap<crate::dictmultiobject::ObjectKey, PyObjectRef>);
         let new_storage = Box::into_raw(Box::new(storage.clone()));
-        crate::dictmultiobject::w_dict_new_with(
-            &UNICODE_DICT_STRATEGY,
-            new_storage as *mut u8,
-            dict.len,
-        )
+        crate::dictmultiobject::w_dict_new_with(&UNICODE_DICT_STRATEGY, new_storage as *mut u8)
     }
 }
 
@@ -1409,10 +1405,6 @@ impl DictStrategy for IntDictStrategy {
         let dict = &*(w_dict as *const crate::dictmultiobject::W_DictObject);
         let storage = &*(dict.dstorage as *const indexmap::IndexMap<i64, PyObjectRef>);
         let new_storage = Box::into_raw(Box::new(storage.clone()));
-        crate::dictmultiobject::w_dict_new_with(
-            &INT_DICT_STRATEGY,
-            new_storage as *mut u8,
-            dict.len,
-        )
+        crate::dictmultiobject::w_dict_new_with(&INT_DICT_STRATEGY, new_storage as *mut u8)
     }
 }

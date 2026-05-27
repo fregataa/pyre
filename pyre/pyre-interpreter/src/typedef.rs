@@ -1891,11 +1891,11 @@ fn init_dict_type(ns: &mut DictStorage) {
                                 {
                                     continue;
                                 }
-                                pyre_object::w_dict_store(self_dict, k, v);
+                                crate::type_methods::dict_store_checked(self_dict, k, v)?;
                             }
                         } else {
                             for (k, v) in pyre_object::w_dict_items(src) {
-                                pyre_object::w_dict_store(self_dict, k, v);
+                                crate::type_methods::dict_store_checked(self_dict, k, v)?;
                             }
                         }
                     } else {
@@ -1904,7 +1904,9 @@ fn init_dict_type(ns: &mut DictStorage) {
                             if let Ok(keys) = crate::builtins::collect_iterable(keys_obj) {
                                 for key in keys {
                                     if let Ok(val) = crate::baseobjspace::getitem(src, key) {
-                                        pyre_object::w_dict_store(self_dict, key, val);
+                                        crate::type_methods::dict_store_checked(
+                                            self_dict, key, val,
+                                        )?;
                                     }
                                 }
                             }
@@ -1967,13 +1969,13 @@ fn init_dict_type(ns: &mut DictStorage) {
                 // For plain dict: direct store. For dict subclass instance: use backing dict.
                 unsafe {
                     if pyre_object::is_dict(args[0]) {
-                        pyre_object::w_dict_store(args[0], args[1], args[2]);
+                        crate::type_methods::dict_store_checked(args[0], args[1], args[2])?;
                     } else if pyre_object::is_instance(args[0]) {
                         // dict subclass — store in __dict_data__ backing dict
                         if let Ok(backing) = crate::baseobjspace::getattr(args[0], "__dict_data__")
                         {
                             if pyre_object::is_dict(backing) {
-                                pyre_object::w_dict_store(backing, args[1], args[2]);
+                                crate::type_methods::dict_store_checked(backing, args[1], args[2])?;
                             }
                         }
                     }
@@ -2021,10 +2023,12 @@ fn init_dict_type(ns: &mut DictStorage) {
                 }
                 let dict = crate::type_methods::resolve_dict_backing(args[0]);
                 if !dict.is_null() {
-                    // Dict or dict subclass — look up in backing dict
-                    return Ok(pyre_object::w_bool_from(
-                        unsafe { pyre_object::w_dict_lookup(dict, args[1]) }.is_some(),
-                    ));
+                    return match unsafe {
+                        pyre_object::dictmultiobject::w_dict_lookup_checked(dict, args[1])
+                    } {
+                        Ok(v) => Ok(pyre_object::w_bool_from(v.is_some())),
+                        Err(_) => Err(crate::baseobjspace::take_pending_hash_error()),
+                    };
                 }
                 Ok(pyre_object::w_bool_from(
                     crate::baseobjspace::contains(args[0], args[1]).unwrap_or(false),

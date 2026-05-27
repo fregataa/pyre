@@ -3403,12 +3403,16 @@ fn builtin_id(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// object's class lacks a non-None `__hash__` slot.  Built-in
 /// mutable containers (dict, list, set, bytearray) explicitly set
 /// `__hash__ = None` (`dictmultiobject.py:1431`, `listobject.py`,
-/// `setobject.py`).  Pyre's `hash_value` falls through to identity
-/// for un-typed objects, so this wrapper screens the known
-/// unhashables before calling.
+/// `setobject.py`).  `try_hash_value` is the Result-bearing variant
+/// used by both `hash()` and dict key gates: it rejects known
+/// unhashables, recurses through tuple/frozenset contents, and
+/// propagates user `__hash__` errors.
 pub(crate) fn builtin_hash(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty(), "hash() takes exactly one argument");
-    let obj = args[0];
+    Ok(w_int_new(try_hash_value(args[0])?))
+}
+
+pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
     if obj.is_null() {
         return Err(crate::PyError::type_error("hash() argument is null"));
     }
@@ -3435,8 +3439,58 @@ pub(crate) fn builtin_hash(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
                 name
             )));
         }
+        if is_tuple(obj) {
+            let n = w_tuple_len(obj);
+            let mut hashes = Vec::with_capacity(n);
+            for i in 0..(n as i64) {
+                if let Some(item) = w_tuple_getitem(obj, i) {
+                    hashes.push(try_hash_value(item)?);
+                }
+            }
+            return Ok(_hash_tuple_xx(&hashes));
+        }
+        if pyre_object::is_frozenset(obj) {
+            let hashes: Result<Vec<i64>, crate::PyError> = pyre_object::w_set_items(obj)
+                .into_iter()
+                .map(try_hash_value)
+                .collect();
+            return Ok(_hash_frozenset(&hashes?));
+        }
+        if pyre_object::is_instance(obj) {
+            let w_type = pyre_object::w_instance_get_type(obj);
+            if let Some(method) = crate::baseobjspace::lookup_in_type(w_type, "__hash__") {
+                if pyre_object::is_none(method) {
+                    return Err(unhashable_type_error(obj));
+                }
+                let r = call_and_check(method, &[obj])?;
+                // descroperation.py:576-579 — normalize -1 to -2
+                let h = if is_bool(r) {
+                    pyre_object::w_bool_get_value(r) as i64
+                } else if is_int(r) {
+                    w_int_get_value(r)
+                } else if is_long(r) {
+                    _hash_long(pyre_object::w_long_get_value(r))
+                } else {
+                    return Err(crate::PyError::type_error(
+                        "__hash__ method should return an integer",
+                    ));
+                };
+                return Ok(if h == -1 { -2 } else { h });
+            }
+        }
     }
-    Ok(w_int_new(hash_value(obj)))
+    Ok(hash_value(obj))
+}
+
+fn unhashable_type_error(obj: PyObjectRef) -> crate::PyError {
+    let name = unsafe {
+        match crate::typedef::r#type(obj) {
+            Some(tp) => pyre_object::w_type_get_name(tp).to_string(),
+            None if !obj.is_null() => (*(*obj).ob_type).name.to_string(),
+            None => "NULL".to_string(),
+        }
+    };
+    crate::PyError::type_error(format!("unhashable type: '{}'", name))
 }
 
 /// `pypy/objspace/std/intobject.py:36-37` — `HASH_BITS = 61` (64-bit
@@ -4906,6 +4960,14 @@ fn builtin_import_stub(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_hash_rejects_tuple_containing_unhashable_key() {
+        let value = w_tuple_new(vec![w_list_new(vec![])]);
+        let err = builtin_hash(&[value]).expect_err("tuple hash should reject list element");
+
+        assert_eq!(err.kind, crate::PyErrorKind::TypeError);
+    }
 
     #[test]
     fn test_builtin_divmod_delegates_through_proxy() {

@@ -2045,36 +2045,11 @@ pub fn generated_truth_value_direct(
             }
             return Some(truth);
         }
-        // dictobject.py: dict truth → guard_class + getfield_raw(len) → int_ne(0)
-        if pyre_object::is_dict(concrete_val) {
-            frame.guard_class(ctx, value, &pyre_object::pyobject::DICT_TYPE as *const _ as *const pyre_object::PyType);
-            let len_descr = crate::descr::dict_len_descr();
-            let len = ctx.record_op_with_descr(OpCode::GetfieldRawI, &[value], len_descr.clone());
-            // executor.py:200 do_getfield_raw_i projects `structbox.
-            // getint()` for raw field reads.  Pyre's Python objects
-            // are carried as `Value::Ref` in box_value (the
-            // PyObjectRef pointer) but the recorded opcode here is
-            // GetfieldRawI, so the dispatch must go through the raw
-            // helper family — project the Ref to `i64` and call
-            // `raw_field_sanity_load` (NOT the GC variant which
-            // matches executor.py:188 do_getfield_gc_i).
-            if let Some(majit_ir::Value::Ref(struct_ref)) = ctx.box_value(value) {
-                let struct_ptr = struct_ref.0 as i64;
-                if struct_ptr != usize::MAX as i64 && struct_ptr != 0 {
-                    if let Some(live) =
-                        ctx.raw_field_sanity_load(struct_ptr, &len_descr, majit_ir::Type::Int)
-                    {
-                        ctx.set_opref_concrete(len, live);
-                    }
-                }
-            }
-            let zero = ctx.const_int(0);
-            let truth = ctx.record_op(OpCode::IntNe, &[len, zero]);
-            if let Some(majit_ir::Value::Int(n)) = ctx.box_value(len) {
-                ctx.set_opref_concrete(truth, majit_ir::Value::Int((n != 0) as i64));
-            }
-            return Some(truth);
-        }
+        // dictobject.py:107-109 W_DictMultiObject.length → strategy
+        // .length(self) — pyre delegates the same way, so the JIT does
+        // not have a single-instruction lowering for `bool(dict)`.
+        // Fall through to the generic `bool` callee path which will
+        // dispatch through `w_dict_len`.
         // listobject.py:423 W_ListObject.length() → strategy.length()
         // All list strategies determine truth by length, same as len() fast path.
         if pyre_object::is_list(concrete_val) {
@@ -2405,11 +2380,11 @@ pub fn generated_direct_len_value(
             let len = crate::state::trace_arraylen_gc(ctx, value, crate::descr::str_len_descr());
             return Some(len);
         }
-        if pyre_object::is_dict(concrete_value) {
-            frame.guard_class(ctx, value, &pyre_object::pyobject::DICT_TYPE as *const _ as *const pyre_object::PyType);
-            let len = crate::state::trace_arraylen_gc(ctx, value, crate::descr::dict_len_descr());
-            return Some(len);
-        }
+        // dictobject.py:107-109 W_DictMultiObject.length → strategy
+        // .length(self) — pyre delegates the same way, so the JIT does
+        // not have a single-instruction lowering for `len(dict)`.
+        // Fall through to the generic `len` callee path which will
+        // dispatch through `w_dict_len`.
         if pyre_object::is_list(concrete_value) {
             frame.guard_class(ctx, value, &pyre_object::pyobject::LIST_TYPE as *const _ as *const pyre_object::PyType);
             let len_descr = if pyre_object::w_list_uses_object_storage(concrete_value) {

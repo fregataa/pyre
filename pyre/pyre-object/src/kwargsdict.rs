@@ -95,7 +95,6 @@ impl KwargsDictStrategy {
         let (keys_w, values_w) = *old;
         dict.dstorage = crate::dictstrategy::UNICODE_DICT_STRATEGY.get_empty_storage();
         dict.dstrategy = &crate::dictstrategy::UNICODE_DICT_STRATEGY;
-        dict.len = 0;
         for (k, v) in keys_w.into_iter().zip(values_w.into_iter()) {
             crate::dictmultiobject::w_dict_store(w_dict, k, v);
         }
@@ -162,7 +161,6 @@ impl DictStrategy for KwargsDictStrategy {
             }
             storage.0.push(w_key);
             storage.1.push(w_value);
-            dict.len = storage.0.len();
             crate::gc_hook::try_gc_write_barrier(w_dict as *mut u8);
             return;
         }
@@ -204,11 +202,9 @@ impl DictStrategy for KwargsDictStrategy {
 
     /// `kwargsdict.py:123-129 popitem` — pop from both arrays in lock-step.
     unsafe fn popitem(&self, w_dict: PyObjectRef) -> Option<(PyObjectRef, PyObjectRef)> {
-        let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
-        let storage = &mut *(dict.dstorage as *mut (Vec<PyObjectRef>, Vec<PyObjectRef>));
+        let storage = kwargs_storage_mut(w_dict);
         let w_key = storage.0.pop()?;
         let w_value = storage.1.pop()?;
-        dict.len = storage.0.len();
         Some((w_key, w_value))
     }
 
@@ -221,7 +217,6 @@ impl DictStrategy for KwargsDictStrategy {
             dict.dstorage as *mut (Vec<PyObjectRef>, Vec<PyObjectRef>),
         ));
         dict.dstorage = self.get_empty_storage();
-        dict.len = 0;
     }
 
     /// `kwargsdict.py:154-156 view_as_kwargs` — copy parallel arrays
@@ -250,13 +245,8 @@ impl DictStrategy for KwargsDictStrategy {
     /// the parallel `(keys_w, values_w)` arrays and wrap with the
     /// same KwargsDictStrategy.
     unsafe fn copy(&self, w_dict: PyObjectRef) -> PyObjectRef {
-        let dict = &*(w_dict as *const crate::dictmultiobject::W_DictObject);
-        let storage = &*(dict.dstorage as *const (Vec<PyObjectRef>, Vec<PyObjectRef>));
+        let storage = kwargs_storage(w_dict);
         let new_storage = Box::into_raw(Box::new(storage.clone()));
-        crate::dictmultiobject::w_dict_new_with(
-            &KWARGS_DICT_STRATEGY,
-            new_storage as *mut u8,
-            dict.len,
-        )
+        crate::dictmultiobject::w_dict_new_with(&KWARGS_DICT_STRATEGY, new_storage as *mut u8)
     }
 }

@@ -1540,8 +1540,8 @@ pub struct PyreSym {
     /// pyjitpl.py:74: frame.jitcode — JitCode reference.
     /// Provides both .code (CodeObject*) and .index (snapshot encoding).
     pub(crate) jitcode: *const JitCode,
-    /// Namespace for global lookups.
-    pub(crate) concrete_namespace: *mut pyre_interpreter::DictStorage,
+    /// Namespace for global lookups (W_DictObject / W_ModuleDictObject).
+    pub(crate) concrete_namespace: PyObjectRef,
     /// Execution context pointer (for creating callee frames).
     pub(crate) concrete_execution_context: *const pyre_interpreter::PyExecutionContext,
     /// Virtualizable object pointer (PyFrame).
@@ -1609,7 +1609,7 @@ pub struct TestSymState {
     pub symbolic_stack_types: Vec<Type>,
     pub registers_r: Vec<OpRef>,
     pub concrete_stack: Vec<ConcreteValue>,
-    pub concrete_namespace: *mut pyre_interpreter::DictStorage,
+    pub concrete_namespace: PyObjectRef,
     pub vable_last_instr: OpRef,
     pub vable_pycode: OpRef,
     pub vable_valuestackdepth: OpRef,
@@ -2702,6 +2702,23 @@ pub(crate) fn callee_layout_for_call_assembler(
     (nlocals, nlocals + stack_only)
 }
 
+/// Derive the legacy `*mut DictStorage` from a dict object (W_DictObject
+/// or W_ModuleDictObject) via the `dict_storage_proxy` back-pointer.
+pub(crate) fn concrete_dict_storage(obj: PyObjectRef) -> *mut DictStorage {
+    if obj.is_null() {
+        return std::ptr::null_mut();
+    }
+    unsafe {
+        if pyre_object::dictmultiobject::is_module_dict(obj) {
+            (*(obj as *const pyre_object::dictmultiobject::W_ModuleDictObject)).dict_storage_proxy
+                as *mut DictStorage
+        } else {
+            (*(obj as *const pyre_object::dictmultiobject::W_DictObject)).dict_storage_proxy
+                as *mut DictStorage
+        }
+    }
+}
+
 pub(crate) fn dict_storage_slot_direct(ns: *mut DictStorage, name: &str) -> Option<usize> {
     if ns.is_null() {
         return None;
@@ -3332,7 +3349,7 @@ impl PyreSym {
         if concrete_frame != 0 {
             let frame = unsafe { &*(concrete_frame as *const pyre_interpreter::pyframe::PyFrame) };
             self.jitcode = jitcode_for(frame.pycode);
-            self.concrete_namespace = frame.w_globals;
+            self.concrete_namespace = frame.w_globals_obj;
             self.concrete_execution_context = frame.execution_context;
             self.concrete_vable_ptr = concrete_frame as *mut u8;
             // pyjitpl.py:74-90 MIFrame.setup parity for the per-kind banks

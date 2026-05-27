@@ -153,7 +153,7 @@ impl pyre_interpreter::NamespaceOpcodeHandler for crate::state::MIFrame {
         _nameindex: usize,
     ) -> Result<Self::Value, pyre_interpreter::PyError> {
         use crate::helpers::TraceHelperAccess;
-        let ns = self.sym().concrete_namespace;
+        let ns = crate::state::concrete_dict_storage(self.sym().concrete_namespace);
         let Some(slot) = crate::state::dict_storage_slot_direct(ns, name) else {
             let frame = self.trace_frame();
             let globals = self.trace_globals_ptr();
@@ -247,7 +247,7 @@ impl pyre_interpreter::NamespaceOpcodeHandler for crate::state::MIFrame {
         value: Self::Value,
     ) -> Result<(), pyre_interpreter::PyError> {
         use crate::helpers::TraceHelperAccess;
-        let ns = self.sym().concrete_namespace;
+        let ns = crate::state::concrete_dict_storage(self.sym().concrete_namespace);
         let Some(slot) = crate::state::dict_storage_slot_direct(ns, name) else {
             let globals = self.trace_globals_ptr();
             return self.with_trace_ctx(|ctx| {

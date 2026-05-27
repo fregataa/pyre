@@ -1463,6 +1463,23 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
                 false,
             ),
+            // R3.3b prep: canonical W_DictObject sibling slot
+            // (`pyframe.py:49 self.w_globals` parity).  Used by the inline
+            // new-PyFrame helper to populate the slot from the
+            // function's `w_func_globals_obj` cache so trace-time
+            // chases through `w_dict_get_dict_storage_proxy` observe
+            // a non-null PyObjectRef.  R3.3 cutover will retire the
+            // adjacent raw `PyFrame.w_globals` entry above and rename
+            // this one to fully match PyPy's pyframe.py:49 shape.
+            (
+                "PyFrame.w_globals_obj",
+                crate::frame_layout::PYFRAME_W_GLOBALS_OBJ_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
         ],
         "PyFrame",
         "pyframe::PyFrame",
@@ -1674,7 +1691,7 @@ use pyre_object::rangeobject::{
 };
 use pyre_object::strobject::STR_LEN_OFFSET;
 use pyre_object::{
-    BOOL_BOOLVAL_OFFSET, DICT_LEN_OFFSET, FLOAT_ARRAY_HEAP_CAP_OFFSET, FLOAT_ARRAY_LEN_OFFSET,
+    BOOL_BOOLVAL_OFFSET, FLOAT_ARRAY_HEAP_CAP_OFFSET, FLOAT_ARRAY_LEN_OFFSET,
     FLOAT_ARRAY_PTR_OFFSET, INT_ARRAY_HEAP_CAP_OFFSET, INT_ARRAY_LEN_OFFSET, INT_ARRAY_PTR_OFFSET,
     INT_INTVAL_OFFSET, W_ListObject, W_TupleObject,
 };
@@ -1846,10 +1863,6 @@ pub fn str_len_descr() -> DescrRef {
     make_immutable_field_descr(STR_LEN_OFFSET, 8, Type::Int, false)
 }
 
-pub fn dict_len_descr() -> DescrRef {
-    make_field_descr(DICT_LEN_OFFSET, 8, Type::Int, false)
-}
-
 pub fn dict_storage_values_ptr_descr() -> DescrRef {
     field_descr_from_group(&DICT_STORAGE_DESCR_GROUP, 0)
 }
@@ -1954,6 +1967,16 @@ pub fn pyframe_code_descr() -> DescrRef {
 
 pub fn pyframe_dict_storage_descr() -> DescrRef {
     field_descr_from_group(&PYFRAME_DESCR_GROUP, 4)
+}
+
+/// R3.3b prep: canonical `PyFrame.w_globals_obj` slot
+/// (PYFRAME_W_GLOBALS_OBJ_OFFSET).  Used by
+/// `emit_new_pyframe_inline_self_recursive` to populate the
+/// W_DictObject sibling so trace-time chases observe a non-null
+/// PyObjectRef.  R3.3 cutover will fold `pyframe_dict_storage_descr`
+/// into this entry after retiring the adjacent raw slot.
+pub fn pyframe_w_globals_obj_descr() -> DescrRef {
+    field_descr_from_group(&PYFRAME_DESCR_GROUP, 12)
 }
 
 /// rewrite.py:665-695 handle_call_assembler scalar field read for the
