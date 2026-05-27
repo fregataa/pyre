@@ -550,6 +550,10 @@ pub struct OptContext {
     /// a follow-up slice; for now the single dense pool removes the
     /// HashMap divergence without forcing the index-namespace split.
     pub(crate) const_pool: crate::optimizeopt::dense_value_pool::DenseValuePool,
+    /// Persistent BoxRef cache for const-namespace OpRefs. Populated in
+    /// lockstep with const_pool writes; readers migrate from const_pool
+    /// to this map as D-3 progresses. Once all readers are switched,
+    /// const_pool can be deleted.
     /// RPython: mapping dict in inline_short_preamble — separate from _forwarded.
     /// Maps Phase 1 source OpRefs to Phase 2 short arg OpRefs.
     /// Number of input arguments, used to offset emitted op positions
@@ -3874,12 +3878,6 @@ impl OptContext {
             return None;
         }
         let start = if opref.is_constant() {
-            // RPython parity: ConstInt/Float/Ptr (`history.py:220, 261, 307`)
-            // are constructed fresh per call site without dedup; we mirror by
-            // building a fresh BoxRef from `const_pool`. The `const_index`
-            // is preserved so `BoxRef::const_index()` round-trips back to
-            // the input `opref` for OpRef reconstruction downstream
-            // (`box_to_opref` / `getptrinfo` opref-alias derivation).
             let ci = opref.const_index();
             let value = self.const_pool.get(&ci).copied()?;
             crate::r#box::BoxRef::new_const_with_index(value, ci)
@@ -4650,66 +4648,45 @@ impl OptContext {
     /// Mirrors PyPy optimizer.py:432: `box.set_forwarded(constbox)`.
     /// The constant Box carries the fresh Const identity.
     pub fn make_constant(&mut self, opref: OpRef, value: Value) {
-        // optimizer.py:412: box = get_box_replacement(box)
-        let replaced = self.get_box_replacement(opref);
-        // optimizer.py:415-426: safety check — if box.get_forwarded() is
-        // IntBound and the constant is Int, validate contains() + make_eq_const().
-        // RPython checks ONE authoritative source: box._forwarded.
+        let b = self
+            .get_box_replacement_box(opref)
+            .or_else(|| self.ensure_box(self.get_box_replacement(opref)));
+        if let Some(b) = b {
+            self.make_constant_box(&b, value);
+        }
+    }
+
+    /// optimizer.py:413-435 make_constant(box, constbox)
+    pub fn make_constant_box(&mut self, op: &crate::r#box::BoxRef, value: Value) {
+        // optimizer.py:415: box = get_box_replacement(box)
+        let op = op.get_box_replacement(false);
+        // optimizer.py:418-429: IntBound safety check
         if let Value::Int(intval) = value {
-            // BoxRef-authoritative read of IntBound for the contains() +
-            // make_eq_const() in-place mutation. IntBound writers populate
-            // the BoxRef via `ensure_box`.
-            if let Some(b) = self.box_pool.get(replaced) {
-                if let Some(mut bound) = b.int_bound_mut() {
-                    if !bound.contains(intval as i64) {
-                        std::panic::panic_any(crate::optimize::InvalidLoop(
-                            "constant int is outside the range allowed for that box",
-                        ));
-                    }
-                    // optimizer.py:424-426: info.make_eq_const(value)
-                    let _ = bound.make_eq_const(intval as i64);
+            if let Some(mut bound) = op.int_bound_mut() {
+                if !bound.contains(intval as i64) {
+                    std::panic::panic_any(crate::optimize::InvalidLoop(
+                        "constant int is outside the range allowed for that box",
+                    ));
                 }
+                let _ = bound.make_eq_const(intval as i64);
             }
         }
-        // optimizer.py:427: if box.is_constant(): return
-        // BoxRef-routing short-circuit (slice 63):
-        // `replaced` is already Vec chain-walked, so `box[replaced]`'s
-        // forwarded is the terminal slot. If it's `Box(const_box)` (the
-        // make_constant mirror), `const_value()` returns Some(value);
-        // otherwise None and we proceed to the make_constant body.
-        if replaced.is_constant()
-            || self
-                .get_box_replacement_box(opref)
-                .and_then(|b| b.const_value())
-                .is_some()
-        {
+        // optimizer.py:430: if box.is_constant(): return
+        if op.is_constant() || op.const_value().is_some() {
             return;
         }
-        // optimizer.py:429-431 — when promoting a virtual to a constant,
-        // call `copy_fields_to_const(constinfo, optheap)` so the cached
-        // field/item state survives via the const_infos pool.
+        // optimizer.py:432-434: copy_fields_to_const for Ref
         if let Value::Ref(gcref) = value {
-            self.copy_fields_to_const(replaced, gcref);
+            if let Some(pos) = op.position() {
+                let opref = majit_ir::OpRef::ref_op(pos);
+                self.copy_fields_to_const(opref, gcref);
+            }
         }
-        // `make_constant`'s knowledge of "this box is constant" now lives
-        // solely on `box._forwarded = Box(constbox)` (set below). Readers
-        // route through the BoxRef chain — every legacy `self.constants[]`
-        // consumer (get_constant, getconst, with_intbound_mut, short-preamble
-        // loop_constants, merge_backend_constants_from_ctx, post-compact
-        // renumber, is_constant_placeholder_op, allocate_next_pos_raw) was
-        // migrated to `box_pool[idx]._forwarded`'s `Forwarded::Box(target).
-        // const_value()` arm in Phase D-5. The InputArg exclusion that
-        // previously gated the `self.constants[]` write is preserved by the
-        // box_pool readers themselves (e.g. merge_backend_constants_from_ctx's
-        // `b.is_inputarg()` skip per optimizer.rs:296).
-        // optimizer.py:432: box.set_forwarded(constbox)
+        // optimizer.py:435: box.set_forwarded(constbox)
         let new_const_idx = self.next_const_idx;
         self.next_const_idx += 1;
         self.const_pool.insert(new_const_idx, value);
-        let b = self
-            .ensure_box(replaced)
-            .expect("body-namespace OpRef must have a BoxRef slot");
-        b.set_forwarded_const(majit_ir::Const::from_value(value), Some(new_const_idx));
+        op.set_forwarded_const(majit_ir::Const::from_value(value), Some(new_const_idx));
     }
 
     /// info.py:194-198 (AbstractStructPtrInfo) + info.py:533-538 (ArrayPtrInfo)
@@ -5614,6 +5591,26 @@ impl OptContext {
     pub fn get_constant_float_box(&self, op: &crate::r#box::BoxRef) -> Option<f64> {
         match self.get_constant_box(op)? {
             Value::Float(f) => Some(f),
+            _ => None,
+        }
+    }
+
+    /// `isinstance(opref, Const)` parity — True only when the OpRef itself
+    /// is in the constant namespace. Does NOT walk the forwarding chain;
+    /// a body-namespace OpRef forwarded to a Const via `make_constant` returns
+    /// None here. Use `get_constant_box` for `getrawconstoption` semantics
+    /// (includes IntBound synthesis and chain walk).
+    pub fn isinstance_const(&self, opref: OpRef) -> Option<Value> {
+        if !opref.is_constant() {
+            return None;
+        }
+        self.const_pool.get(&opref.const_index()).copied()
+    }
+
+    /// `isinstance(opref, ConstInt)` parity — narrow check without chain walk.
+    pub fn isinstance_const_int(&self, opref: OpRef) -> Option<i64> {
+        match self.isinstance_const(opref)? {
+            Value::Int(i) => Some(i),
             _ => None,
         }
     }

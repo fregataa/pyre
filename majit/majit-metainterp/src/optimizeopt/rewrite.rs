@@ -26,16 +26,6 @@ fn raise_invalid_loop(msg: &'static str) -> ! {
     std::panic::panic_any(crate::optimize::InvalidLoop(msg));
 }
 
-/// Check if a float is an exact power of 2 (±2^n).
-/// rewrite.py: uses frexp; mantissa==0.5 means exact power of 2.
-fn is_power_of_two_float(v: f64) -> bool {
-    let bits = v.to_bits();
-    let mantissa_bits = bits & 0x000F_FFFF_FFFF_FFFF;
-    let exponent = ((bits >> 52) & 0x7FF) as i32;
-    // Normal number with zero mantissa fraction = exact power of 2
-    mantissa_bits == 0 && exponent > 0 && exponent < 0x7FF
-}
-
 /// info.py:16-18: INFO_NULL / INFO_NONNULL / INFO_UNKNOWN
 /// optimizer.py:127-135: getnullness()
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2928,355 +2918,101 @@ impl OptRewrite {
     }
 
     // ── Float algebraic simplifications ──
+    // rewrite.py:103-161 — only FLOAT_MUL, FLOAT_TRUEDIV, FLOAT_NEG, FLOAT_ABS.
+    // Constant folding for all float ops is handled by execute_nonspec_const.
 
-    /// Constant fold a binary float operation.
-    fn try_fold_binary_float(&self, opcode: OpCode, lhs: f64, rhs: f64) -> Option<f64> {
-        match opcode {
-            OpCode::FloatAdd => Some(lhs + rhs),
-            OpCode::FloatSub => Some(lhs - rhs),
-            OpCode::FloatMul => Some(lhs * rhs),
-            OpCode::FloatTrueDiv => {
-                if rhs != 0.0 {
-                    Some(lhs / rhs)
-                } else {
-                    None
-                }
-            }
-            OpCode::FloatFloorDiv => {
-                if rhs != 0.0 {
-                    Some((lhs / rhs).floor())
-                } else {
-                    None
-                }
-            }
-            OpCode::FloatMod => {
-                if rhs != 0.0 {
-                    Some(lhs % rhs)
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        }
-    }
-
-    /// `FloatAdd(x, 0.0) -> x`, `FloatAdd(0.0, x) -> x`, constant fold.
-    fn optimize_float_add(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let arg0 = op.arg(0);
-        let arg1 = op.arg(1);
-
-        if let (Some(a), Some(b)) = (
-            ctx.get_box_replacement_box(arg0)
-                .and_then(|b| ctx.get_constant_box(&b))
-                .and_then(|v| match v {
-                    Value::Float(f) => Some(f),
-                    _ => None,
-                }),
-            ctx.get_box_replacement_box(arg1)
-                .and_then(|b| ctx.get_constant_box(&b))
-                .and_then(|v| match v {
-                    Value::Float(f) => Some(f),
-                    _ => None,
-                }),
-        ) {
-            if let Some(result) = self.try_fold_binary_float(OpCode::FloatAdd, a, b) {
-                ctx.make_constant(op.pos.get(), Value::Float(result));
-                return OptimizationResult::Remove;
-            }
-        }
-
-        // x + 0.0 -> x
-        if let Some(v) = ctx
-            .get_box_replacement_box(arg1)
-            .and_then(|b| ctx.get_constant_box(&b))
-            .and_then(|v| match v {
-                Value::Float(f) => Some(f),
-                _ => None,
-            })
-        {
-            if v == 0.0 {
-                let b_old = ctx
-                    .ensure_box(op.pos.get())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
-                let b_arg = ctx
-                    .ensure_box(arg0)
-                    .expect("body-namespace OpRef must have a BoxRef slot");
-                ctx.make_equal_to(&b_old, &b_arg);
-                return OptimizationResult::Remove;
-            }
-        }
-        // 0.0 + x -> x
-        if let Some(v) = ctx
-            .get_box_replacement_box(arg0)
-            .and_then(|b| ctx.get_constant_box(&b))
-            .and_then(|v| match v {
-                Value::Float(f) => Some(f),
-                _ => None,
-            })
-        {
-            if v == 0.0 {
-                let b_old = ctx
-                    .ensure_box(op.pos.get())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
-                let b_arg = ctx
-                    .ensure_box(arg1)
-                    .expect("body-namespace OpRef must have a BoxRef slot");
-                ctx.make_equal_to(&b_old, &b_arg);
-                return OptimizationResult::Remove;
-            }
-        }
-
-        OptimizationResult::PassOn
-    }
-
-    /// `FloatSub(x, 0.0) -> x`, constant fold.
-    fn optimize_float_sub(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let arg0 = op.arg(0);
-        let arg1 = op.arg(1);
-
-        if let (Some(a), Some(b)) = (
-            ctx.get_box_replacement_box(arg0)
-                .and_then(|b| ctx.get_constant_box(&b))
-                .and_then(|v| match v {
-                    Value::Float(f) => Some(f),
-                    _ => None,
-                }),
-            ctx.get_box_replacement_box(arg1)
-                .and_then(|b| ctx.get_constant_box(&b))
-                .and_then(|v| match v {
-                    Value::Float(f) => Some(f),
-                    _ => None,
-                }),
-        ) {
-            if let Some(result) = self.try_fold_binary_float(OpCode::FloatSub, a, b) {
-                ctx.make_constant(op.pos.get(), Value::Float(result));
-                return OptimizationResult::Remove;
-            }
-        }
-
-        // x - 0.0 -> x
-        if let Some(v) = ctx
-            .get_box_replacement_box(arg1)
-            .and_then(|b| ctx.get_constant_box(&b))
-            .and_then(|v| match v {
-                Value::Float(f) => Some(f),
-                _ => None,
-            })
-        {
-            if v == 0.0 {
-                let b_old = ctx
-                    .ensure_box(op.pos.get())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
-                let b_arg = ctx
-                    .ensure_box(arg0)
-                    .expect("body-namespace OpRef must have a BoxRef slot");
-                ctx.make_equal_to(&b_old, &b_arg);
-                return OptimizationResult::Remove;
-            }
-        }
-
-        OptimizationResult::PassOn
-    }
-
-    /// `FloatMul(x, 1.0) -> x`, `FloatMul(1.0, x) -> x`, constant fold.
+    /// rewrite.py:103-120 optimize_FLOAT_MUL
     fn optimize_float_mul(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = op.arg(0);
         let arg1 = op.arg(1);
-
-        if let (Some(a), Some(b)) = (
-            ctx.get_box_replacement_box(arg0)
-                .and_then(|b| ctx.get_constant_box(&b))
+        // rewrite.py:109: for lhs, rhs in [(arg1, arg2), (arg2, arg1)]:
+        for &(lhs, rhs) in &[(arg0, arg1), (arg1, arg0)] {
+            if let Some(v) = ctx
+                .get_box_replacement_box(lhs)
+                .and_then(|b| b.const_value())
                 .and_then(|v| match v {
                     Value::Float(f) => Some(f),
                     _ => None,
-                }),
-            ctx.get_box_replacement_box(arg1)
-                .and_then(|b| ctx.get_constant_box(&b))
-                .and_then(|v| match v {
-                    Value::Float(f) => Some(f),
-                    _ => None,
-                }),
-        ) {
-            if let Some(result) = self.try_fold_binary_float(OpCode::FloatMul, a, b) {
-                ctx.make_constant(op.pos.get(), Value::Float(result));
-                return OptimizationResult::Remove;
+                })
+            {
+                let v2 = ctx.get_box_replacement(rhs);
+                if v == 1.0 {
+                    let b_old = ctx
+                        .ensure_box(op.pos.get())
+                        .expect("body-namespace OpRef must have a BoxRef slot");
+                    let b_v2 = ctx
+                        .ensure_box(v2)
+                        .expect("body-namespace OpRef must have a BoxRef slot");
+                    ctx.make_equal_to(&b_old, &b_v2);
+                    return OptimizationResult::Remove;
+                }
+                if v == -1.0 {
+                    let mut neg = Op::new(OpCode::FloatNeg, &[rhs]);
+                    neg.pos.set(op.pos.get());
+                    return OptimizationResult::Replace(neg);
+                }
             }
         }
-
-        // x * 1.0 -> x
-        if let Some(v) = ctx
-            .get_box_replacement_box(arg1)
-            .and_then(|b| ctx.get_constant_box(&b))
-            .and_then(|v| match v {
-                Value::Float(f) => Some(f),
-                _ => None,
-            })
-        {
-            if v == 1.0 {
-                let b_old = ctx
-                    .ensure_box(op.pos.get())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
-                let b_arg = ctx
-                    .ensure_box(arg0)
-                    .expect("body-namespace OpRef must have a BoxRef slot");
-                ctx.make_equal_to(&b_old, &b_arg);
-                return OptimizationResult::Remove;
-            }
-            // rewrite.py: x * -1.0 -> FLOAT_NEG(x)
-            if v == -1.0 {
-                let mut neg = Op::new(OpCode::FloatNeg, &[arg0]);
-                neg.pos.set(op.pos.get());
-                return OptimizationResult::Replace(neg);
-            }
-        }
-        // 1.0 * x -> x
-        if let Some(v) = ctx
-            .get_box_replacement_box(arg0)
-            .and_then(|b| ctx.get_constant_box(&b))
-            .and_then(|v| match v {
-                Value::Float(f) => Some(f),
-                _ => None,
-            })
-        {
-            if v == 1.0 {
-                let b_old = ctx
-                    .ensure_box(op.pos.get())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
-                let b_arg = ctx
-                    .ensure_box(arg1)
-                    .expect("body-namespace OpRef must have a BoxRef slot");
-                ctx.make_equal_to(&b_old, &b_arg);
-                return OptimizationResult::Remove;
-            }
-            // -1.0 * x -> FLOAT_NEG(x)
-            if v == -1.0 {
-                let mut neg = Op::new(OpCode::FloatNeg, &[arg1]);
-                neg.pos.set(op.pos.get());
-                return OptimizationResult::Replace(neg);
-            }
-        }
-
         OptimizationResult::PassOn
     }
 
-    /// `FloatTrueDiv(x, 1.0) -> x`, constant fold.
+    /// rewrite.py:126-145 optimize_FLOAT_TRUEDIV
     fn optimize_float_truediv(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = op.arg(0);
         let arg1 = op.arg(1);
-
-        if let (Some(a), Some(b)) = (
-            ctx.get_box_replacement_box(arg0)
-                .and_then(|b| ctx.get_constant_box(&b))
-                .and_then(|v| match v {
-                    Value::Float(f) => Some(f),
-                    _ => None,
-                }),
-            ctx.get_box_replacement_box(arg1)
-                .and_then(|b| ctx.get_constant_box(&b))
-                .and_then(|v| match v {
-                    Value::Float(f) => Some(f),
-                    _ => None,
-                }),
-        ) {
-            if let Some(result) = self.try_fold_binary_float(OpCode::FloatTrueDiv, a, b) {
-                ctx.make_constant(op.pos.get(), Value::Float(result));
-                return OptimizationResult::Remove;
-            }
-        }
-
-        // x / 1.0 -> x
-        if let Some(v) = ctx
+        if let Some(divisor) = ctx
             .get_box_replacement_box(arg1)
-            .and_then(|b| ctx.get_constant_box(&b))
+            .and_then(|b| b.const_value())
             .and_then(|v| match v {
                 Value::Float(f) => Some(f),
                 _ => None,
             })
         {
-            if v == 1.0 {
-                let b_old = ctx
-                    .ensure_box(op.pos.get())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
-                let b_arg = ctx
-                    .ensure_box(arg0)
-                    .expect("body-namespace OpRef must have a BoxRef slot");
-                ctx.make_equal_to(&b_old, &b_arg);
-                return OptimizationResult::Remove;
-            }
-            // rewrite.py: x / -1.0 -> FLOAT_NEG(x)
-            if v == -1.0 {
-                let mut neg = Op::new(OpCode::FloatNeg, &[arg0]);
-                neg.pos.set(op.pos.get());
-                return OptimizationResult::Replace(neg);
-            }
-            // rewrite.py: x / const → x * (1/const) when const is an exact power of 2.
-            // An exact power of 2 has the form ±2^n, so its reciprocal is also
-            // exactly representable. Check: v.abs() is a power of 2 when
-            // converting to integer bits gives mantissa=1.0.
-            if v != 0.0 && v.is_finite() && is_power_of_two_float(v) {
-                let recip = 1.0 / v;
-                let recip_ref = self.emit_constant_float(ctx, recip);
-                let mut new_op = Op::new(OpCode::FloatMul, &[arg0, recip_ref]);
-                new_op.pos.set(op.pos.get());
-                return OptimizationResult::Emit(new_op);
+            // rewrite.py:135-141: frexp check that divisor AND reciprocal
+            // are both exact powers of 2. Bit-level equivalent: mantissa
+            // bits are all zero and exponent is normal (not zero/subnormal/inf/nan).
+            if Self::is_exact_power_of_two(divisor) {
+                let reciprocal = 1.0 / divisor;
+                if Self::is_exact_power_of_two(reciprocal) {
+                    let recip_ref = self.emit_constant_float(ctx, reciprocal);
+                    let mut new_op = Op::new(OpCode::FloatMul, &[arg0, recip_ref]);
+                    new_op.pos.set(op.pos.get());
+                    return OptimizationResult::Emit(new_op);
+                }
             }
         }
-
         OptimizationResult::PassOn
     }
 
-    /// `FloatNeg(FloatNeg(x)) -> x`, constant fold.
+    /// rewrite.py:135: `math.frexp(divisor)[0]` == ±0.5 iff exact power of 2.
+    fn is_exact_power_of_two(v: f64) -> bool {
+        let bits = v.to_bits();
+        let mantissa = bits & 0x000F_FFFF_FFFF_FFFF;
+        let exponent = ((bits >> 52) & 0x7FF) as u32;
+        mantissa == 0 && exponent > 0 && exponent < 0x7FF
+    }
+
+    /// rewrite.py:147-153 optimize_FLOAT_NEG
     fn optimize_float_neg(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let arg0 = op.arg(0);
-
-        if let Some(a) = ctx
-            .get_box_replacement_box(arg0)
-            .and_then(|b| ctx.get_constant_box(&b))
-            .and_then(|v| match v {
-                Value::Float(f) => Some(f),
-                _ => None,
-            })
-        {
-            ctx.make_constant(op.pos.get(), Value::Float(-a));
-            return OptimizationResult::Remove;
-        }
-
-        // FloatNeg(FloatNeg(x)) -> x (double negation elimination)
-        if let Some(inner_op) = ctx.new_operations.iter().find(|o| o.pos.get() == arg0) {
-            if inner_op.opcode == OpCode::FloatNeg {
-                let inner_arg = inner_op.arg(0);
+        let v = ctx.get_box_replacement(op.arg(0));
+        if let Some(arg_op) = ctx.get_producing_op(v) {
+            if arg_op.opcode == OpCode::FloatNeg {
                 let b_old = ctx
                     .ensure_box(op.pos.get())
                     .expect("body-namespace OpRef must have a BoxRef slot");
                 let b_inner = ctx
-                    .ensure_box(inner_arg)
+                    .ensure_box(arg_op.arg(0))
                     .expect("body-namespace OpRef must have a BoxRef slot");
                 ctx.make_equal_to(&b_old, &b_inner);
                 return OptimizationResult::Remove;
             }
         }
-
         OptimizationResult::PassOn
     }
 
-    /// rewrite.py:155-161 optimize_FLOAT_ABS — idempotent: ABS(ABS(x)) → ABS(x).
+    /// rewrite.py:155-161 optimize_FLOAT_ABS
     fn optimize_float_abs(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let arg0 = op.arg(0);
-
-        if let Some(a) = ctx
-            .get_box_replacement_box(arg0)
-            .and_then(|b| ctx.get_constant_box(&b))
-            .and_then(|v| match v {
-                Value::Float(f) => Some(f),
-                _ => None,
-            })
-        {
-            ctx.make_constant(op.pos.get(), Value::Float(a.abs()));
-            return OptimizationResult::Remove;
-        }
-
-        // rewrite.py:157-160: FLOAT_ABS(FLOAT_ABS(x)) → FLOAT_ABS(x)
-        let v = ctx.get_box_replacement(arg0);
+        let v = ctx.get_box_replacement(op.arg(0));
         if let Some(arg_op) = ctx.get_producing_op(v) {
             if arg_op.opcode == OpCode::FloatAbs {
                 let b_old = ctx
@@ -3289,63 +3025,6 @@ impl OptRewrite {
                 return OptimizationResult::Remove;
             }
         }
-
-        OptimizationResult::PassOn
-    }
-
-    /// Constant fold FloatFloorDiv.
-    fn optimize_float_floordiv(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let arg0 = op.arg(0);
-        let arg1 = op.arg(1);
-
-        if let (Some(a), Some(b)) = (
-            ctx.get_box_replacement_box(arg0)
-                .and_then(|b| ctx.get_constant_box(&b))
-                .and_then(|v| match v {
-                    Value::Float(f) => Some(f),
-                    _ => None,
-                }),
-            ctx.get_box_replacement_box(arg1)
-                .and_then(|b| ctx.get_constant_box(&b))
-                .and_then(|v| match v {
-                    Value::Float(f) => Some(f),
-                    _ => None,
-                }),
-        ) {
-            if let Some(result) = self.try_fold_binary_float(OpCode::FloatFloorDiv, a, b) {
-                ctx.make_constant(op.pos.get(), Value::Float(result));
-                return OptimizationResult::Remove;
-            }
-        }
-
-        OptimizationResult::PassOn
-    }
-
-    /// Constant fold FloatMod.
-    fn optimize_float_mod(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let arg0 = op.arg(0);
-        let arg1 = op.arg(1);
-
-        if let (Some(a), Some(b)) = (
-            ctx.get_box_replacement_box(arg0)
-                .and_then(|b| ctx.get_constant_box(&b))
-                .and_then(|v| match v {
-                    Value::Float(f) => Some(f),
-                    _ => None,
-                }),
-            ctx.get_box_replacement_box(arg1)
-                .and_then(|b| ctx.get_constant_box(&b))
-                .and_then(|v| match v {
-                    Value::Float(f) => Some(f),
-                    _ => None,
-                }),
-        ) {
-            if let Some(result) = self.try_fold_binary_float(OpCode::FloatMod, a, b) {
-                ctx.make_constant(op.pos.get(), Value::Float(result));
-                return OptimizationResult::Remove;
-            }
-        }
-
         OptimizationResult::PassOn
     }
 
@@ -3531,14 +3210,10 @@ impl Optimization for OptRewrite {
             }
 
             // ── Float arithmetic ──
-            OpCode::FloatAdd => self.optimize_float_add(op, ctx),
-            OpCode::FloatSub => self.optimize_float_sub(op, ctx),
             OpCode::FloatMul => self.optimize_float_mul(op, ctx),
             OpCode::FloatTrueDiv => self.optimize_float_truediv(op, ctx),
             OpCode::FloatNeg => self.optimize_float_neg(op, ctx),
             OpCode::FloatAbs => self.optimize_float_abs(op, ctx),
-            OpCode::FloatFloorDiv => self.optimize_float_floordiv(op, ctx),
-            OpCode::FloatMod => self.optimize_float_mod(op, ctx),
 
             // ── Identity ops ──
             OpCode::SameAsI | OpCode::SameAsR | OpCode::SameAsF => self.optimize_same_as(op, ctx),
@@ -4827,112 +4502,6 @@ mod tests {
     // ── Float optimization tests ──
 
     #[test]
-    fn test_float_add_zero_right() {
-        let mut ops = vec![
-            Op::new(OpCode::SameAsF, &[]), // op0: x
-            Op::new(OpCode::SameAsF, &[]), // op1: 0.0
-            Op::new(OpCode::FloatAdd, &[OpRef::float_op(0), OpRef::float_op(1)]),
-        ];
-        with_positions(&mut ops);
-        let mut ctx = OptContext::new(3);
-        ctx.emit(ops[0].clone());
-        ctx.emit(ops[1].clone());
-        ctx.make_constant(OpRef::float_op(1), Value::Float(0.0));
-
-        let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[2], &mut ctx);
-        assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(
-            ctx.get_box_replacement(OpRef::float_op(2)),
-            OpRef::float_op(0)
-        );
-    }
-
-    #[test]
-    fn test_float_add_zero_left() {
-        let mut ops = vec![
-            Op::new(OpCode::SameAsF, &[]), // op0: 0.0
-            Op::new(OpCode::SameAsF, &[]), // op1: x
-            Op::new(OpCode::FloatAdd, &[OpRef::float_op(0), OpRef::float_op(1)]),
-        ];
-        with_positions(&mut ops);
-        let mut ctx = OptContext::new(3);
-        ctx.emit(ops[0].clone());
-        ctx.emit(ops[1].clone());
-        ctx.make_constant(OpRef::float_op(0), Value::Float(0.0));
-
-        let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[2], &mut ctx);
-        assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(
-            ctx.get_box_replacement(OpRef::float_op(2)),
-            OpRef::float_op(1)
-        );
-    }
-
-    #[test]
-    fn test_float_add_constant_fold() {
-        let mut ops = vec![
-            Op::new(OpCode::SameAsF, &[]),
-            Op::new(OpCode::SameAsF, &[]),
-            Op::new(OpCode::FloatAdd, &[OpRef::float_op(0), OpRef::float_op(1)]),
-        ];
-        with_positions(&mut ops);
-        let mut ctx = OptContext::new(3);
-        ctx.emit(ops[0].clone());
-        ctx.emit(ops[1].clone());
-        ctx.make_constant(OpRef::float_op(0), Value::Float(1.5));
-        ctx.make_constant(OpRef::float_op(1), Value::Float(2.5));
-
-        let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[2], &mut ctx);
-        assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_constant_float(OpRef::float_op(2)), Some(4.0));
-    }
-
-    #[test]
-    fn test_float_sub_zero() {
-        let mut ops = vec![
-            Op::new(OpCode::SameAsF, &[]),
-            Op::new(OpCode::SameAsF, &[]),
-            Op::new(OpCode::FloatSub, &[OpRef::float_op(0), OpRef::float_op(1)]),
-        ];
-        with_positions(&mut ops);
-        let mut ctx = OptContext::new(3);
-        ctx.emit(ops[0].clone());
-        ctx.emit(ops[1].clone());
-        ctx.make_constant(OpRef::float_op(1), Value::Float(0.0));
-
-        let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[2], &mut ctx);
-        assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(
-            ctx.get_box_replacement(OpRef::float_op(2)),
-            OpRef::float_op(0)
-        );
-    }
-
-    #[test]
-    fn test_float_sub_constant_fold() {
-        let mut ops = vec![
-            Op::new(OpCode::SameAsF, &[]),
-            Op::new(OpCode::SameAsF, &[]),
-            Op::new(OpCode::FloatSub, &[OpRef::float_op(0), OpRef::float_op(1)]),
-        ];
-        with_positions(&mut ops);
-        let mut ctx = OptContext::new(3);
-        ctx.emit(ops[0].clone());
-        ctx.emit(ops[1].clone());
-        ctx.make_constant(OpRef::float_op(0), Value::Float(5.0));
-        ctx.make_constant(OpRef::float_op(1), Value::Float(3.0));
-
-        let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[2], &mut ctx);
-        assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_constant_float(OpRef::float_op(2)), Some(2.0));
-    }
-
-    #[test]
     fn test_float_mul_one_right() {
         let mut ops = vec![
             Op::new(OpCode::SameAsF, &[]),
@@ -4977,91 +4546,6 @@ mod tests {
     }
 
     #[test]
-    fn test_float_mul_constant_fold() {
-        let mut ops = vec![
-            Op::new(OpCode::SameAsF, &[]),
-            Op::new(OpCode::SameAsF, &[]),
-            Op::new(OpCode::FloatMul, &[OpRef::float_op(0), OpRef::float_op(1)]),
-        ];
-        with_positions(&mut ops);
-        let mut ctx = OptContext::new(3);
-        ctx.emit(ops[0].clone());
-        ctx.emit(ops[1].clone());
-        ctx.make_constant(OpRef::float_op(0), Value::Float(3.0));
-        ctx.make_constant(OpRef::float_op(1), Value::Float(4.0));
-
-        let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[2], &mut ctx);
-        assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_constant_float(OpRef::float_op(2)), Some(12.0));
-    }
-
-    #[test]
-    fn test_float_truediv_one() {
-        let mut ops = vec![
-            Op::new(OpCode::SameAsF, &[]),
-            Op::new(OpCode::SameAsF, &[]),
-            Op::new(
-                OpCode::FloatTrueDiv,
-                &[OpRef::float_op(0), OpRef::float_op(1)],
-            ),
-        ];
-        with_positions(&mut ops);
-        let mut ctx = OptContext::new(3);
-        ctx.emit(ops[0].clone());
-        ctx.emit(ops[1].clone());
-        ctx.make_constant(OpRef::float_op(1), Value::Float(1.0));
-
-        let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[2], &mut ctx);
-        assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(
-            ctx.get_box_replacement(OpRef::float_op(2)),
-            OpRef::float_op(0)
-        );
-    }
-
-    #[test]
-    fn test_float_truediv_constant_fold() {
-        let mut ops = vec![
-            Op::new(OpCode::SameAsF, &[]),
-            Op::new(OpCode::SameAsF, &[]),
-            Op::new(
-                OpCode::FloatTrueDiv,
-                &[OpRef::float_op(0), OpRef::float_op(1)],
-            ),
-        ];
-        with_positions(&mut ops);
-        let mut ctx = OptContext::new(3);
-        ctx.emit(ops[0].clone());
-        ctx.emit(ops[1].clone());
-        ctx.make_constant(OpRef::float_op(0), Value::Float(10.0));
-        ctx.make_constant(OpRef::float_op(1), Value::Float(2.0));
-
-        let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[2], &mut ctx);
-        assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_constant_float(OpRef::float_op(2)), Some(5.0));
-    }
-
-    #[test]
-    fn test_float_neg_constant_fold() {
-        let mut ops = vec![
-            Op::new(OpCode::SameAsF, &[]),
-            Op::new(OpCode::FloatNeg, &[OpRef::float_op(0)]),
-        ];
-        with_positions(&mut ops);
-        let mut ctx = OptContext::new(2);
-        ctx.emit(ops[0].clone());
-        ctx.make_constant(OpRef::float_op(0), Value::Float(3.14));
-
-        let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[1], &mut ctx);
-        assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_constant_float(OpRef::float_op(1)), Some(-3.14));
-    }
-
-    #[test]
     fn test_float_neg_double_negation() {
         // FloatNeg(FloatNeg(x)) -> x
         let mut ops = vec![
@@ -5089,12 +4573,13 @@ mod tests {
     }
 
     #[test]
-    fn test_float_floordiv_constant_fold() {
+    fn test_float_truediv_power_of_two() {
+        // x / 2.0 → x * 0.5
         let mut ops = vec![
             Op::new(OpCode::SameAsF, &[]),
             Op::new(OpCode::SameAsF, &[]),
             Op::new(
-                OpCode::FloatFloorDiv,
+                OpCode::FloatTrueDiv,
                 &[OpRef::float_op(0), OpRef::float_op(1)],
             ),
         ];
@@ -5102,37 +4587,16 @@ mod tests {
         let mut ctx = OptContext::new(3);
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
-        ctx.make_constant(OpRef::float_op(0), Value::Float(7.0));
         ctx.make_constant(OpRef::float_op(1), Value::Float(2.0));
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
-        assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_constant_float(OpRef::float_op(2)), Some(3.0));
+        assert!(matches!(result, OptimizationResult::Emit(_)));
     }
 
     #[test]
-    fn test_float_mod_constant_fold() {
-        let mut ops = vec![
-            Op::new(OpCode::SameAsF, &[]),
-            Op::new(OpCode::SameAsF, &[]),
-            Op::new(OpCode::FloatMod, &[OpRef::float_op(0), OpRef::float_op(1)]),
-        ];
-        with_positions(&mut ops);
-        let mut ctx = OptContext::new(3);
-        ctx.emit(ops[0].clone());
-        ctx.emit(ops[1].clone());
-        ctx.make_constant(OpRef::float_op(0), Value::Float(7.0));
-        ctx.make_constant(OpRef::float_op(1), Value::Float(3.0));
-
-        let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[2], &mut ctx);
-        assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_constant_float(OpRef::float_op(2)), Some(1.0));
-    }
-
-    #[test]
-    fn test_float_add_no_constants() {
+    fn test_float_no_opt_passthrough() {
+        // FloatAdd with no constants: no RPython rewrite → PassOn
         let mut ops = vec![
             Op::new(OpCode::SameAsF, &[]),
             Op::new(OpCode::SameAsF, &[]),

@@ -936,18 +936,8 @@ impl OptString {
         };
         // vstring.py:706-712: isinstance(ConstInt) + different values
         if let (Some(l1), Some(l2)) = (l1box, l2box) {
-            let l1c = ctx
-                .get_box_replacement_box(l1)
-                .and_then(|b_| match b_.const_value() {
-                    Some(Value::Int(i)) => Some(i),
-                    _ => None,
-                });
-            let l2c = ctx
-                .get_box_replacement_box(l2)
-                .and_then(|b_| match b_.const_value() {
-                    Some(Value::Int(i)) => Some(i),
-                    _ => None,
-                });
+            let l1c = ctx.isinstance_const_int(l1);
+            let l2c = ctx.isinstance_const_int(l2);
             if let (Some(v1), Some(v2)) = (l1c, l2c) {
                 if v1 != v2 {
                     ctx.make_constant(op.pos.get(), Value::Int(0));
@@ -1010,13 +1000,7 @@ impl OptString {
         } else {
             None
         };
-        let l2_const = l2box.and_then(|r| {
-            ctx.get_box_replacement_box(r)
-                .and_then(|b_| match b_.const_value() {
-                    Some(Value::Int(i)) => Some(i),
-                    _ => None,
-                })
-        });
+        let l2_const = l2box.and_then(|r| ctx.isinstance_const_int(r));
         // vstring.py:742-756: isinstance(l2box, ConstInt) checks
         if let Some(l2val) = l2_const {
             if l2val == 0 {
@@ -1047,13 +1031,7 @@ impl OptString {
                 } else {
                     None
                 };
-                let l1_const = l1box.and_then(|r| {
-                    ctx.get_box_replacement_box(r)
-                        .and_then(|b_| match b_.const_value() {
-                            Some(Value::Int(i)) => Some(i),
-                            _ => None,
-                        })
-                });
+                let l1_const = l1box.and_then(|r| ctx.isinstance_const_int(r));
                 if l1_const == Some(1) {
                     // vstring.py:761-768: both length 1 → compare chars
                     let c1 = self.strgetitem(arg1, 0, ctx);
@@ -1226,18 +1204,8 @@ impl OptString {
         let l1box = ctx.getstrlen_opref(op.arg(1), mode);
         let l2box = ctx.getstrlen_opref(op.arg(2), mode);
         // vstring.py:825-828: isinstance(ConstInt) and both == 1
-        let l1c = ctx
-            .get_box_replacement_box(l1box)
-            .and_then(|b_| match b_.const_value() {
-                Some(Value::Int(i)) => Some(i),
-                _ => None,
-            });
-        let l2c = ctx
-            .get_box_replacement_box(l2box)
-            .and_then(|b_| match b_.const_value() {
-                Some(Value::Int(i)) => Some(i),
-                _ => None,
-            });
+        let l1c = ctx.isinstance_const_int(l1box);
+        let l2c = ctx.isinstance_const_int(l2box);
         if l1c == Some(1) && l2c == Some(1) {
             // vstring.py:830-836: extract chars and INT_SUB
             if let (Some(char1), Some(char2)) = (

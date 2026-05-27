@@ -1485,13 +1485,10 @@ impl VirtualState {
                 // concrete runtime box already equals the target constant.
                 // Merely having a runtime box is not enough; RPython checks
                 // `self.constbox.same_constant(runtime_box.constbox())`.
+                // virtualstate.py:400: runtime_box.constbox() — read the
+                // runtime box's own constant value, no chain walk.
                 if runtime_box
-                    .and_then(|rb| {
-                        state
-                            .ctx
-                            .get_box_replacement_box(rb)
-                            .and_then(|b| state.ctx.get_constant_box(&b))
-                    })
+                    .and_then(|rb| state.ctx.isinstance_const(rb))
                     .is_some_and(|runtime_value| runtime_value == *val)
                 {
                     state.extra_guards.push(GuardRequirement::GuardValue {
