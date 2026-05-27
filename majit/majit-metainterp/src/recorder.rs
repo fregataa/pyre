@@ -486,12 +486,19 @@ impl Trace {
     }
 
     /// Iterate `(slot_index, &BoxRef)` over every materialised pool
-    /// entry, skipping `None` holes. Used at loop-compile handoff to
-    /// drain stamped values into the optimizer's pending map.
+    /// entry, skipping `None` holes.
     pub fn box_pool_iter_indexed(
         &self,
     ) -> impl Iterator<Item = (usize, &majit_ir::box_ref::BoxRef)> {
         self.box_pool.iter_indexed()
+    }
+
+    /// Snapshot the recorder's sparse BoxRef pool so `TraceIterator`
+    /// can copy intrinsic `_res*` runtime values onto the fresh boxes it
+    /// creates for optimizer iteration, matching RPython's box-carried
+    /// value model without a parallel map.
+    pub(crate) fn box_pool_snapshot(&self) -> crate::r#box::BoxPool {
+        self.box_pool.clone()
     }
 
     /// Full BoxRef pool snapshot — borrows the sparse slot table

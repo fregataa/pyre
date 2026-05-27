@@ -329,13 +329,10 @@ pub struct UnrollOptimizer {
     /// `cpu.cls_of_box(runtime_box)` reads (virtualstate.py:601/:608/:620)
     /// and any future `bh_*` calls resolve to the same backend services.
     pub cpu: std::sync::Arc<dyn crate::cpu::Cpu>,
-    /// resoperation.py:691-720 `InputArg*.value` analog (#217 Slice 3).
-    /// Caller seeds tracer-captured concrete runtime values here (raw
-    /// `OpRef.raw()` keys, identical encoding to `TraceCtx.opref_concrete`);
-    /// Phase 1 + Phase 2 inner `Optimizer.runtime_values_pending` slots
-    /// clone from this so materialised BoxRefs are stamped before
-    /// virtualstate match runs.
-    pub runtime_values_pending: std::collections::HashMap<u32, majit_ir::Value>,
+    /// Recorder BoxRef pool carrying tracer-stamped runtime values.
+    /// TraceIterator copies those values onto the fresh per-phase boxes it
+    /// mints, preserving RPython's box-carried `_res*` value shape.
+    pub source_box_pool: Option<crate::r#box::BoxPool>,
 }
 
 impl UnrollOptimizer {
@@ -371,7 +368,7 @@ impl UnrollOptimizer {
             callinfocollection: None,
             call_pure_results: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             cpu: crate::cpu::default_cpu(),
-            runtime_values_pending: std::collections::HashMap::new(),
+            source_box_pool: None,
         }
     }
 
@@ -557,8 +554,6 @@ impl UnrollOptimizer {
                 opt_p1.all_descrs = std::mem::take(&mut self.all_descrs);
                 opt_p1.callinfocollection = self.callinfocollection.clone();
                 opt_p1.cpu = self.cpu.clone();
-                // Phase 1 runtime_values_pending is remapped below after
-                // p1_iter builds its _cache (recorder pos → Phase 1 pos).
                 opt_p1.trace_inputargs = self.trace_inputargs.clone();
                 opt_p1.snapshot_boxes = self.snapshot_boxes.clone();
                 opt_p1.snapshot_frame_sizes = self.snapshot_frame_sizes.clone();
@@ -589,20 +584,22 @@ impl UnrollOptimizer {
                 // call site, not a functional change.
                 // opencoder.py:264 `inputarg_from_tp(arg.type)` — fresh inputargs
                 // are typed via `self.trace_inputargs`, the recorder-supplied
-                // per-arg type list (length must equal `num_inputs`).
+                // Box list (length must equal `num_inputs`). Derive the &[Type]
+                // surface TraceIterator expects from each Box's variant tag
+                // (resoperation.py:719/727/739).
+                debug_assert_eq!(self.trace_inputargs.len(), num_inputs);
                 let p1_inputarg_types: Vec<majit_ir::Type> = self
                     .trace_inputargs
                     .iter()
-                    .map(|o| o.ty().unwrap_or(majit_ir::Type::Ref))
+                    .map(|op| op.ty().expect("inputarg OpRef must carry box.type"))
                     .collect();
-                debug_assert_eq!(p1_inputarg_types.len(), num_inputs);
                 // Wrap input ops as `Vec<OpRc>` so TraceIterator's `&[OpRc]`
                 // surface receives shared identity (history.py:528). The
                 // deep-clone here corresponds to PyPy's `cls()` per-op fresh
                 // allocation inside `TraceIterator.next` (opencoder.py:399-401).
                 let ops_oprc: Vec<majit_ir::OpRc> =
                     ops.iter().map(|op| std::rc::Rc::new(op.clone())).collect();
-                let mut p1_iter = crate::opencoder::TraceIterator::new(
+                let mut p1_iter = crate::opencoder::TraceIterator::new_with_source_box_pool(
                     &ops_oprc,
                     0,
                     ops_oprc.len(),
@@ -610,29 +607,13 @@ impl UnrollOptimizer {
                     &p1_inputarg_types,
                     0,    // start_fresh = 0 — inputargs at [0..num_inputs)
                     None, // p1_full_prefix — Phase 1 has no prior phase
+                    self.source_box_pool.as_ref(),
                 );
                 let mut p1_ops_in: Vec<Op> = Vec::with_capacity(ops.len());
                 while let Some(op) = p1_iter.next() {
                     p1_ops_in.push(op);
                 }
                 let p1_iter_fresh_hw = p1_iter._fresh;
-                let p1_cache = &p1_iter._cache;
-                // Remap recorder-keyed runtime values through p1_iter's
-                // _cache so the keys match Phase 1's fresh BoxPool positions.
-                // Same pattern as Phase 2 remap below; entries whose recorder
-                // position has no Phase 1 counterpart (DCE'd / const-folded)
-                // or whose fresh OpRef type drifts are filtered out.
-                opt_p1.runtime_values_pending = self
-                    .runtime_values_pending
-                    .iter()
-                    .filter_map(|(&k, &v)| {
-                        let fresh = p1_cache.get(k as usize).copied().flatten()?;
-                        if fresh.ty() != Some(v.get_type()) {
-                            return None;
-                        }
-                        Some((fresh.raw(), v))
-                    })
-                    .collect();
                 opt_p1.runtime_boxes = ops
                     .iter()
                     .rfind(|op| op.opcode == OpCode::Jump)
@@ -735,7 +716,7 @@ impl UnrollOptimizer {
                         // so the backend can see the reduced LABEL's declared
                         // types. Clone only the field we need to avoid keeping
                         // Phase 1 short preamble data alive longer than before.
-                        self.final_exported_state = Some(ExportedState {
+                        let mut final_exported_state = ExportedState {
                             end_args: Vec::new(),
                             next_iteration_args: Vec::new(),
                             end_arg_types: Vec::new(),
@@ -755,7 +736,9 @@ impl UnrollOptimizer {
                             partial_trace_operations: Vec::new(),
                             rooted_refs: Vec::new(),
                             shadow_stack_base: 0,
-                        });
+                        };
+                        final_exported_state.root_all_gcrefs();
+                        self.final_exported_state = Some(final_exported_state);
                         // Codex plan step 3: snapshot Phase 1 emit-op slice as
                         // Rc::clone vector. Phase 2's TraceIterator embeds these
                         // BoxRefs at its placeholder prefix `[num_inputs..end)`
@@ -955,16 +938,16 @@ impl UnrollOptimizer {
         let phase2_inputarg_base = self.next_global_opref.max(body_num_inputs as u32);
         // opencoder.py:264 `inputarg_from_tp(arg.type)` — same per-arg types
         // as Phase 1 (Phase 2 walks the body half of the same trace).
+        debug_assert_eq!(self.trace_inputargs.len(), body_num_inputs);
         let p2_inputarg_types: Vec<majit_ir::Type> = self
             .trace_inputargs
             .iter()
-            .map(|o| o.ty().unwrap_or(majit_ir::Type::Ref))
+            .map(|op| op.ty().expect("inputarg OpRef must carry box.type"))
             .collect();
-        debug_assert_eq!(p2_inputarg_types.len(), body_num_inputs);
         // Wrap into `Vec<OpRc>` for TraceIterator's `&[OpRc]` surface.
         let ops_oprc: Vec<majit_ir::OpRc> =
             ops.iter().map(|op| std::rc::Rc::new(op.clone())).collect();
-        let mut iter = crate::opencoder::TraceIterator::new(
+        let mut iter = crate::opencoder::TraceIterator::new_with_source_box_pool(
             &ops_oprc,
             0,
             ops_oprc.len(),
@@ -972,6 +955,7 @@ impl UnrollOptimizer {
             &p2_inputarg_types,
             phase2_inputarg_base, // fresh inputargs at [phase2_inputarg_base..)
             p1_full_prefix, // Codex plan step 3 slice B: full Phase 1 box_pool (inputargs + emit ops)
+            self.source_box_pool.as_ref(),
         );
         let mut p2_ops_in: Vec<Op> = Vec::with_capacity(ops.len());
         while let Some(op) = iter.next() {
@@ -1024,30 +1008,6 @@ impl UnrollOptimizer {
                 *r = r.map_opref(translate_opref);
             }
         }
-        // #217 Slice 3 strict-parity remap (virtualstate.py:646-648 Box
-        // identity parallelism between `boxes` and `runtime_boxes`).
-        // Phase 1's `runtime_values_pending` is keyed by the recorder's
-        // raw OpRef positions; Phase 2's TraceIterator reminted those
-        // positions to fresh OpRefs both for inputargs
-        // (opencoder.py:259-267) and for body op results
-        // (opencoder.py:399-401). `p2_cache[k]` is the canonical
-        // mapping the iterator built via `_cache[orig] = fresh` — same
-        // table `translate_opref` above uses for snapshot_boxes. Slots
-        // Phase 2 does not materialize (Phase 1-DCE'd ops, dead-store
-        // recorder positions) stay `None` in the cache; we filter them
-        // out rather than leak Phase 1 keys into Phase 2's runtime-value
-        // stamp set.
-        opt_p2.runtime_values_pending = self
-            .runtime_values_pending
-            .iter()
-            .filter_map(|(&k, &v)| {
-                let fresh = p2_cache.get(k as usize).copied().flatten()?;
-                if fresh.ty() != Some(v.get_type()) {
-                    return None;
-                }
-                Some((fresh.raw(), v))
-            })
-            .collect();
         // Phase 1's emitted ops are already in Phase 1's emitted
         // namespace `[num_inputs..next_global_opref)`. Phase 2 body may
         // reference these via `imported_label_args`. They are NOT in the

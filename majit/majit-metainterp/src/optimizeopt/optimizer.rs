@@ -13,7 +13,6 @@ use crate::optimizeopt::{
     vstring::OptString,
 };
 use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Type};
-use std::collections::HashMap;
 
 use crate::optimizeopt::info::{PtrInfo, PtrInfoExt};
 use crate::optimizeopt::{SnapshotBoxes, SnapshotFramePcs, SnapshotFrameSizes};
@@ -217,22 +216,6 @@ pub struct Optimizer {
     /// reasoning about descriptor-shared guards or other emit-bound
     /// metadata.
     pub emitted_operations: majit_ir::vec_set::VecSet<OpRef>,
-    /// resoperation.py:566/612/582 per-type mixin slot
-    /// (`IntOp._resint` / `RefOp._resref` / `FloatOp._resfloat`) seed
-    /// — concrete runtime values captured by the tracer at JUMP closure
-    /// (loop close, via `TraceCtx.opref_concrete`) or by fail_args fill
-    /// (bridge entry).  Transient construction-time bridge: caller
-    /// populates this before `setup_optimizations` runs, which stamps
-    /// each entry onto the matching `BoxRef` in `ctx.box_pool` via
-    /// `BoxRef::set_value`.  After stamping, the values live on the
-    /// boxes themselves (no parallel side-table); virtualstate match
-    /// consumers (`get_runtime_field/item/interiorfield`,
-    /// `cls_of_box`) read via `box.get_value()`.
-    ///
-    /// Keyed by `OpRef.raw()` so it shares the encoding of
-    /// `TraceCtx.opref_concrete` (a `clone()` seed at handoff is the
-    /// canonical path, no Vec materialization).
-    pub runtime_values_pending: HashMap<u32, majit_ir::Value>,
 }
 
 /// Lower a typed-`Value` constants pool into the dense
@@ -1110,7 +1093,6 @@ impl Optimizer {
             opt_guards_shared_emitted: 0,
             cpu: crate::cpu::default_cpu(),
             emitted_operations: majit_ir::vec_set::VecSet::new(),
-            runtime_values_pending: HashMap::new(),
         }
     }
 
@@ -1907,14 +1889,35 @@ impl Optimizer {
         box_pool: crate::r#box::BoxPool,
     ) -> Vec<Op> {
         use majit_ir::OpRef;
-        // Test-only: auto-seed `trace_inputargs` when unit tests
-        // pass bare `num_inputs` without staging a recorder. Production
-        // callers always populate `trace_inputargs` from the
-        // recorder's InputArg{Int,Ref,Float} entries before calling —
-        // the guard never fires outside `#[cfg(test)]`.
+        // Test-only auto-seed of `trace_inputargs` from the variant
+        // tags of any InputArg*/IntOp/FloatOp/RefOp OpRef that references
+        // a slot index in `[0, num_inputs)`. Production callers populate
+        // the list from the recorder's InputArg{Int,Ref,Float} objects
+        // via `setup_optimizations` (optimizer.py:34 self.inputargs).
+        //
+        // Falls back to `Type::Ref` for slots that no arg references —
+        // RPython never sees that case (every InputArg flows through some
+        // op), but unit fixtures can omit references to unused slots.
         #[cfg(test)]
         if self.trace_inputargs.is_empty() && num_inputs > 0 {
-            self.trace_inputargs = OpRef::inputarg_refs(&vec![majit_ir::Type::Ref; num_inputs]);
+            // RPython InputArg variants are Int/Ref/Float only
+            // (resoperation.py:719/727/739) — Void inputargs do not exist.
+            // VoidOp args at inputarg slots leave the slot at the Ref
+            // fallback because the actual inputarg-side Box would have
+            // been Int/Ref/Float per producer-side typing.
+            let mut types = vec![majit_ir::Type::Ref; num_inputs];
+            for op in ops.iter() {
+                for arg in op.getarglist().iter() {
+                    let idx = arg.raw() as usize;
+                    if idx < num_inputs {
+                        match arg.ty() {
+                            Some(majit_ir::Type::Void) | None => {}
+                            Some(tp) => types[idx] = tp,
+                        }
+                    }
+                }
+            }
+            self.trace_inputargs = OpRef::inputarg_refs(&types);
         }
         self.imported_label_args = None;
         self.terminal_op = None;
@@ -1945,19 +1948,6 @@ impl Optimizer {
         // `cpu.cls_of_box(runtime_box)` when the optimizer-tracked
         // PtrInfo has no `known_class` recorded.
         ctx.cpu = self.cpu.clone();
-        // resoperation.py:566/612/582 per-type mixin slot
-        // (`IntOp._resint`, `RefOp._resref`, `FloatOp._resfloat`) — stamp
-        // tracer-captured concrete runtime values directly onto each
-        // `BoxRef` in the pool so virtualstate match consumers
-        // (`get_runtime_field/item/interiorfield`, `cls_of_box`) read
-        // them via `box.get_value()` without a parallel side-table.
-        // Entries whose raw position has no Phase-local BoxPool slot
-        // are skipped (DCE'd ops, const-folded results).
-        for (&raw, &value) in &self.runtime_values_pending {
-            if let Some(box_ref) = ctx.box_pool.get_at_position(raw as usize) {
-                box_ref.set_value(value);
-            }
-        }
         // RPython resume.py parity: Phase 2 optimizer needs imported_label_args
         // to resolve NONE positions in fail_args inherited from Phase 1.
         ctx.imported_virtuals = self.imported_virtuals.clone();

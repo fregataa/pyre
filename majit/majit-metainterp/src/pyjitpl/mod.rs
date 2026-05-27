@@ -4501,23 +4501,10 @@ impl<M: Clone> MetaInterp<M> {
         // compile.py:221: call_pure_results = metainterp.call_pure_results
         let call_pure_results = ctx.take_call_pure_results();
 
-        // Drain the recorder's BoxRef pool values into the HashMap that
-        // bridges to the optimizer.  The recorder's BoxRefs carry values
-        // stamped by `set_opref_concrete` → `box.set_value()` during
-        // tracing; TraceIterator creates FRESH BoxRefs for Phase 1 that
-        // do not share identity with the recorder's.  This HashMap is
-        // the transient carrier until TraceIterator learns to copy
-        // values onto its fresh BoxRefs directly (RPython parity:
-        // compile.py:275 PreambleCompileData passes the same Box
-        // objects that already carry their `_res*` values).
-        let close_loop_runtime_values: std::collections::HashMap<u32, majit_ir::Value> = ctx
-            .recorder
-            .box_pool_iter_indexed()
-            .filter_map(|(idx, boxref)| {
-                let value = boxref.get_value()?;
-                Some((idx as u32, value))
-            })
-            .collect();
+        // Recorder BoxRefs carry values stamped by `set_opref_concrete`
+        // during tracing. TraceIterator copies those intrinsic values to
+        // the fresh per-iteration boxes it mints for the optimizer.
+        let close_loop_box_pool = ctx.recorder.box_pool_snapshot();
 
         let mut recorder = ctx.recorder;
         // RPython heapcache.py:176: every trace gets at least one
@@ -4619,7 +4606,7 @@ impl<M: Clone> MetaInterp<M> {
         unroll_opt.max_retrace_guards = self.warm_state.max_retrace_guards();
         unroll_opt.callinfocollection = self.callinfocollection.clone();
         unroll_opt.cpu = self.cpu.clone();
-        unroll_opt.runtime_values_pending = close_loop_runtime_values;
+        unroll_opt.source_box_pool = Some(close_loop_box_pool);
         unroll_opt.call_pure_results = preamble_data.call_pure_results.clone();
         // RPython Box type parity: each InputArg carries its type from
         // tracing. Propagate to optimizer so value_types covers inputargs.
@@ -5570,7 +5557,7 @@ impl<M: Clone> MetaInterp<M> {
             mut constants,
             trace,
             call_pure_results,
-            close_loop_runtime_values,
+            close_loop_box_pool,
         ) = {
             let green_key = ctx.green_key;
             let header_pc = ctx.header_pc;
@@ -5592,14 +5579,7 @@ impl<M: Clone> MetaInterp<M> {
             let constants: majit_ir::VecAssoc<u32, majit_ir::Value> = ctx.constants.snapshot();
             let initial_inputarg_consts = ctx.initial_inputarg_consts.clone();
             let call_pure_results = ctx.take_call_pure_results();
-            let close_loop_runtime_values: std::collections::HashMap<u32, majit_ir::Value> = ctx
-                .recorder
-                .box_pool_iter_indexed()
-                .filter_map(|(idx, boxref)| {
-                    let value = boxref.get_value()?;
-                    Some((idx as u32, value))
-                })
-                .collect();
+            let close_loop_box_pool = ctx.recorder.box_pool_snapshot();
 
             // compile.py:358-362 records the closing JUMP on the same history
             // that `cut_trace_from` views. Rust materializes TreeLoop eagerly,
@@ -5628,7 +5608,7 @@ impl<M: Clone> MetaInterp<M> {
                 constants,
                 trace,
                 call_pure_results,
-                close_loop_runtime_values,
+                close_loop_box_pool,
             )
         };
 
@@ -5673,7 +5653,7 @@ impl<M: Clone> MetaInterp<M> {
         unroll_opt.max_retrace_guards = self.warm_state.max_retrace_guards();
         unroll_opt.callinfocollection = self.callinfocollection.clone();
         unroll_opt.cpu = self.cpu.clone();
-        unroll_opt.runtime_values_pending = close_loop_runtime_values;
+        unroll_opt.source_box_pool = Some(close_loop_box_pool);
         unroll_opt.call_pure_results = call_pure_results.clone();
         let (
             retrace_snapshot_boxes,
@@ -8628,9 +8608,10 @@ impl<M: Clone> MetaInterp<M> {
             );
             for (ia, &raw) in bridge_inputargs.iter().zip(frontend_boxes.iter()) {
                 let value = heap_value_for(ia.tp, raw);
-                optimizer
-                    .runtime_values_pending
-                    .insert(ia.opref().raw(), value);
+                let box_ref = bridge_box_pool
+                    .get(ia.opref())
+                    .expect("fresh bridge inputarg BoxRef must exist");
+                box_ref.set_value(value);
             }
         }
 
@@ -9152,6 +9133,25 @@ impl<M: Clone> MetaInterp<M> {
         // earlier for the rationale. Both bridge entries (descriptor=None and
         // descriptor=Some) need the plumb so BoxRef readers stay primary.
         let bridge_box_pool = prepared.box_pool;
+        if let Some(prd) = pending_bridge_rd.as_ref() {
+            // bridgeopt.py:126 `assert len(frontend_boxes) == len(liveboxes)`.
+            // The concrete values belong on the fresh bridge InputArg boxes
+            // themselves, mirroring `FrontendOp(pos, value)` rather than a
+            // side table keyed by OpRef.
+            assert_eq!(prd.frontend_boxes.len(), prd.liveboxes.len());
+            for (&livebox, &raw) in prd.liveboxes.iter().zip(prd.frontend_boxes.iter()) {
+                let tp = livebox
+                    .ty()
+                    .expect("bridge livebox OpRef must carry box.type");
+                if tp == Type::Void {
+                    continue;
+                }
+                let box_ref = bridge_box_pool
+                    .get(livebox)
+                    .expect("fresh descriptor bridge livebox BoxRef must exist");
+                box_ref.set_value(heap_value_for(tp, raw));
+            }
+        }
         // history.py:220 box.type parity: promote the legacy `i64` pool
         // to a typed `Value` map.
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = bridge_constants

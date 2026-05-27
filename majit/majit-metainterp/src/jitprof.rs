@@ -219,6 +219,7 @@ impl JitProfiler {
         let mut state = self.timing.lock().expect("JitProfiler timing poisoned");
         state.t1 = Some(Instant::now());
         state.current.clear();
+        state.owner_thread = None;
     }
 
     /// jitprof.py:95 `Profiler.start_tracing`.
@@ -523,6 +524,7 @@ impl JitProfiler {
             t0 = state.t1;
             state.t1 = Some(now);
             let Some(ev1) = state.current.pop() else {
+                state.owner_thread = None;
                 crate::debug::log_one("jit-profiler", "BROKEN PROFILER DATA!");
                 return;
             };
