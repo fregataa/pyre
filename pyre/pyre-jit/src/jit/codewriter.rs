@@ -1509,6 +1509,62 @@ fn walker_post_walk_insert_renamings(
             }
         }
     }
+
+    // Dead superseded blocks: materialize forwarding stubs.
+    //
+    // `mergeblock` supersede (`flowcontext.py:455-463`) marks a
+    // joinpoint candidate dead and `recloseblock(Link(outputargs,
+    // newblock))`s it onto its generalization.  The walker, however,
+    // already emitted `goto TLabel(block<dead>)` into every
+    // predecessor that branched to the candidate *before* the
+    // supersede happened (the goto carries the candidate's
+    // block-identity name).  Upstream never hits this: `flatten_graph`
+    // runs after the flow graph is final and `simplify`/`join_blocks`
+    // collapse the forwarding block, so predecessors already point at
+    // the generalization.  Pyre's walker emits SSARepr inline, so the
+    // dead block must stay a real forwarding stub — exactly what
+    // `mark_dead`'s comment describes ("dead blocks remain enumerable
+    // as forwarding stubs").  `mark_dead` clears the dead block's own
+    // accumulator because the per-PC `-live-` resolver
+    // (`resolve_walker_pc`) requires dead blocks to contribute zero
+    // bytes, so the stub is a *separate* synthetic SpamBlock that owns
+    // the dead block's identity `Label`, runs the forwarding link's
+    // renamings, then `goto TLabel(block<newblock>)`.  Chained
+    // supersedes (`block<dead1> -> block<dead2> -> block<live>`)
+    // resolve naturally: every dead block emits its own stub, so the
+    // gotos thread stub-to-stub until reaching a live Label.
+    let dead_forwarders: Vec<SpamBlockRef> = all_walker_blocks
+        .iter()
+        .filter(|s| s.dead())
+        .cloned()
+        .collect();
+    for dead in dead_forwarders {
+        let exits = dead.block().borrow().exits.clone();
+        let [link_ref] = exits.as_slice() else {
+            continue;
+        };
+        let Some(target_ref) = link_ref.borrow().target.clone() else {
+            continue;
+        };
+        let pairs = collect_distinct_renaming_pairs(link_ref, &get_color);
+        let body = build_renaming_insns(pairs);
+        let synthetic_block = graph.new_block(Vec::new());
+        let stub_spam = SpamBlockRef::new(synthetic_block, None);
+        stub_spam.push_insn(super::flatten::Insn::Label(super::flatten::Label::new(
+            super::flatten::block_label_name(&dead.block()),
+        )));
+        for insn in body {
+            stub_spam.push_insn(insn);
+        }
+        stub_spam.push_insn(super::flatten::Insn::op(
+            "goto",
+            vec![super::flatten::Operand::TLabel(
+                super::flatten::block_tlabel(&target_ref),
+            )],
+        ));
+        stub_spam.push_insn(super::flatten::Insn::Unreachable);
+        all_walker_blocks.push(stub_spam);
+    }
 }
 
 /// Outcome of [`emit_trampoline_for_multi_pred_link`].  `Emitted`
