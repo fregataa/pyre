@@ -3155,6 +3155,23 @@ fn try_fold_pure_call_via_executor(
         };
         args.push(v);
     }
+    // Refuse to invoke the helper when any Ref argument is NULL.  Pyre's
+    // getfield_gc_r walker handler propagates field reads (including
+    // pointer-valued fields like `PyFrame.f_back`) as concrete values
+    // when the parent struct is concrete-known; a top-level frame
+    // returns NULL for `f_back`, stamping `Value::Ref(GcRef(0))` into
+    // the constant pool.  Folding `helper(NULL)` would then dereference
+    // NULL and SEGV.  PyPy avoids this because its optimizer inserts
+    // `guard_nonnull` ahead of any pointer-deref residual call; pyre's
+    // walker folds before that guard exists, so guard the executor
+    // entry against NULL receivers and fall through to recording the
+    // IR op as-is.  The downstream optimizer then sees the call op and
+    // emits the necessary guards.
+    for (i, &arg) in args.iter().enumerate() {
+        if matches!(call_descr.arg_types().get(i), Some(majit_ir::Type::Ref)) && arg == 0 {
+            return;
+        }
+    }
     let result_i64 = majit_metainterp::executor::execute_pure_call(call_descr, func_ptr, &args);
     // pyjitpl.py:1392 `result_box.value = result`: stamp the recorded
     // OpRef with the executed concrete so downstream
@@ -3478,7 +3495,7 @@ fn write_residual_call_result_to_dst(
 /// the downstream optimizer surfaces the empty snapshot as a no-op.
 fn collect_outer_active_boxes(
     sym: &crate::state::PyreSym,
-    trace_ctx: &majit_metainterp::TraceCtx,
+    trace_ctx: &TraceCtx,
     outer_jitcode_index: u32,
     entry_py_pc: u32,
 ) -> Vec<OpRef> {
@@ -3487,41 +3504,77 @@ fn collect_outer_active_boxes(
         entry_py_pc as i32,
     );
     let mut active = Vec::with_capacity(banks.int.len() + banks.ref_.len() + banks.float.len());
-    // Portal-frame ref bank read parity: when the outer frame owns the
-    // virtualizable shadow (`pyjitpl.py:1242 _opimpl_setarrayitem_vable`),
-    // trait dispatch's `store_local_value` (trace_opcode.rs:2174-2177)
-    // and `write_stack_slot` (trace_opcode.rs:590-595) write the symbolic
-    // value into `virtualizable_boxes[NUM_VABLE_SCALARS + semantic_idx]`
-    // and SKIP writing `registers_r[semantic_idx]` because the latter
-    // would shadow the authoritative vable view.  Walker-emitted snapshot
-    // active boxes still index by register, so for portal frames read
-    // the ref bank through the vable shadow first and fall back to
-    // `registers_r[idx]` only if the vable lookup misses (e.g. for
-    // bridge-local or non-vable scratch slots).  Mirrors `read_stack_slot`
-    // / `load_local_value`'s vable-first read path.
-    //
-    // `reg_idx == semantic_idx` for ref bank registers because
-    // `stack_slot_reg_idx(sym, stack_idx) = nlocals + stack_idx`
-    // (trace_opcode.rs:543) and locals occupy `[0..nlocals)` directly.
-    let portal_vable_owner = sym.owns_virtualizable_shadow();
-    let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
     // RPython `pyjitpl.py:216-233 _get_list_of_active_boxes` reads
-    // `self.registers_X[index]` directly per liveness index — an
-    // out-of-bounds index is an IndexError, not a silent NONE.  Pyre's
-    // banks are sized to the jitcode's `num_regs_X`, which the codewriter
-    // co-publishes with the liveness side-table, so every liveness
-    // index is in range by construction.  A miss here is a tracer-side
-    // invariant violation (size mismatch) — panic loudly so the bug
-    // surfaces at the encode site instead of bleeding NONE values into
-    // `encode_snapshot_boxes` where `get_opref_type(NONE)` panics with
-    // no breadcrumb pointing at the source.
+    // `self.registers_X[index]` directly per liveness index.  Pyre
+    // diverges on the Ref bank for portal-owner frames: Path 3 (task
+    // #219) retired the `registers_r` semantic-mirror write in
+    // `write_stack_slot` (trace_opcode.rs:581/605) so stack-slot colors
+    // sit at `OpRef::NONE` in `sym.registers_r`; the authoritative
+    // shadow lives in `trace_ctx.virtualizable_boxes`.  Codewriter
+    // liveness also force-alives `portal_frame_reg` / `portal_ec_reg`
+    // (codewriter.rs:3419-3424 `filter_liveness_in_place`) — these are
+    // scratch colors past `nlocals + max_stackdepth` that have no
+    // semantic frame slot, sourced instead from `sym.frame` /
+    // `sym.execution_context` (`interp_jit.py:67 reds = ['frame', 'ec']`).
     //
-    // Per-bank NONE check: if the trait dispatcher (or any path that
-    // writes to `sym.registers_X`) leaves a liveness-active slot
-    // unfilled, the snapshot encoder downstream would panic with a
-    // generic "active OpRef missing Box.type" message that obscures
-    // which bank/index was bad.  Catch it here at the source so the
-    // diagnostic points at the actual register-fill gap.
+    // Mirror the trait-side snapshot materializer
+    // (trace_opcode.rs:1340-1395 `get_list_of_active_boxes`): map each
+    // live Ref color to its semantic index via
+    // `semantic_ref_slot_for_reg_color`, read the vable shadow for
+    // portal-owner frames, and route the two portal red regs through
+    // `sym.frame` / `sym.execution_context` directly.
+    let (
+        nlocals,
+        valid_stack_only,
+        owns_vable,
+        local_color_map,
+        stack_color_map,
+        live_locals,
+        portal_frame_reg,
+        portal_ec_reg,
+    ) = if sym.jitcode.is_null() {
+        (
+            0usize,
+            0usize,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            u16::MAX,
+            u16::MAX,
+        )
+    } else {
+        unsafe {
+            let jc = &*sym.jitcode;
+            let payload = &jc.payload;
+            let live_locals = if payload.code_ptr.is_null() {
+                Vec::new()
+            } else {
+                let live_vars = crate::liveness::liveness_for(payload.code_ptr);
+                (0..sym.nlocals)
+                    .filter(|&idx| live_vars.is_local_live(entry_py_pc as usize, idx))
+                    .collect::<Vec<usize>>()
+            };
+            (
+                sym.nlocals,
+                sym.valuestackdepth.saturating_sub(sym.nlocals),
+                sym.owns_virtualizable_shadow(),
+                payload.metadata.pyre_color_for_semantic_local.clone(),
+                payload.metadata.stack_slot_color_map.clone(),
+                live_locals,
+                payload.metadata.portal_frame_reg,
+                payload.metadata.portal_ec_reg,
+            )
+        }
+    };
+    // Int / Float bank diagnostic panic: pyre's banks are sized to the
+    // jitcode's `num_regs_X`, which the codewriter co-publishes with the
+    // liveness side-table, so every liveness index is in range by
+    // construction.  A miss here is a tracer-side invariant violation
+    // (size mismatch) — panic loudly so the bug surfaces at the encode
+    // site instead of bleeding NONE values into `encode_snapshot_boxes`
+    // where `get_opref_type(NONE)` panics with no breadcrumb pointing at
+    // the source.
     let live_i = banks.int.clone();
     let live_r = banks.ref_.clone();
     let live_f = banks.float.clone();
@@ -3530,7 +3583,6 @@ fn collect_outer_active_boxes(
         sym.registers_r.len(),
         sym.registers_f.len(),
     );
-    let nlocals = sym.nlocals;
     let vable_len = trace_ctx.virtualizable_boxes_len().unwrap_or(0);
     // Int / Float bank candidates: pyre's vable static fields decode as
     // Int (last_instr, valuestackdepth, etc.); if liveness expects an Int
@@ -3540,12 +3592,6 @@ fn collect_outer_active_boxes(
     let vable_vsd = sym.vable_valuestackdepth;
     let vable_last_instr = sym.vable_last_instr;
     let dump_ctx = |bank: &'static str, reg_idx: u32| -> String {
-        let vable_idx = nvs + reg_idx as usize;
-        let vable_val = if portal_vable_owner {
-            format!("{:?}", trace_ctx.virtualizable_box_at(vable_idx))
-        } else {
-            "n/a (non-portal)".to_string()
-        };
         let int_hint = if bank == "int" {
             format!(
                 ", sym.vable_valuestackdepth={vable_vsd:?}, sym.vable_last_instr={vable_last_instr:?}"
@@ -3557,8 +3603,8 @@ fn collect_outer_active_boxes(
             "collect_outer_active_boxes: liveness-active {bank} \
              register {reg_idx} holds OpRef::NONE \
              (outer_jitcode_index={outer_jitcode_index}, entry_py_pc={entry_py_pc}, \
-              nlocals={nlocals}, portal_vable_owner={portal_vable_owner}, \
-              vable_len={vable_len}, vable[{vable_idx}]={vable_val}, \
+              nlocals={nlocals}, owns_vable={owns_vable}, \
+              vable_len={vable_len}, \
               num_regs_i={ni}, num_regs_r={nr}, num_regs_f={nf}, \
               live_banks_i={live_i:?}, live_banks_r={live_r:?}, live_banks_f={live_f:?}\
               {int_hint})",
@@ -3576,33 +3622,42 @@ fn collect_outer_active_boxes(
         active.push(v);
     }
     for &idx in &banks.ref_ {
-        let reg_idx = idx as usize;
-        // Vable-first read for portal frames.  The trait dispatch path
-        // intentionally stops mutating `registers_r` once the portal owns
-        // the vable shadow, so a non-`NONE` slot there can be stale.
-        // Reading `virtualizable_box_at(nvs + reg_idx)` first keeps the
-        // outer snapshot in lockstep with the live shadow; fall back to
-        // `registers_r` only when the vable lookup misses (non-portal
-        // sub-frames, or out-of-range indices the vable info doesn't
-        // cover).
-        let registers_r_slot = || {
+        let color = idx as usize;
+        let fallback = || {
             sym.registers_r
-                .get(reg_idx)
+                .get(color)
                 .copied()
                 .unwrap_or_else(|| panic!("{}", dump_ctx("ref", idx)))
         };
-        let v = if portal_vable_owner {
-            match trace_ctx.virtualizable_box_at(nvs + reg_idx) {
-                Some(vable_box) if vable_box != OpRef::NONE => vable_box,
-                _ => registers_r_slot(),
+        let value = if color as u16 == portal_frame_reg && portal_frame_reg != u16::MAX {
+            sym.frame
+        } else if color as u16 == portal_ec_reg && portal_ec_reg != u16::MAX {
+            sym.execution_context
+        } else if owns_vable {
+            let semantic_idx = crate::state::semantic_ref_slot_for_reg_color(
+                nlocals,
+                valid_stack_only,
+                &local_color_map,
+                &stack_color_map,
+                &live_locals,
+                color,
+            );
+            match semantic_idx {
+                Some(s_idx) if s_idx < nlocals + valid_stack_only => {
+                    let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
+                    trace_ctx
+                        .virtualizable_box_at(nvs + s_idx)
+                        .unwrap_or_else(fallback)
+                }
+                _ => fallback(),
             }
         } else {
-            registers_r_slot()
+            fallback()
         };
-        if v == OpRef::NONE {
+        if value == OpRef::NONE {
             panic!("{}", dump_ctx("ref", idx));
         }
-        active.push(v);
+        active.push(value);
     }
     for &idx in &banks.float {
         let v = sym
@@ -7943,656 +7998,6 @@ mod tests {
             Some(exc),
             "raise/r must populate ctx.last_exc_value before terminating",
         );
-    }
-
-    #[test]
-    #[ignore]
-    fn dump_pop_value_sub_jitcode_bytes() {
-        let target_idx: usize = std::env::var("DUMP_JITCODE_IDX")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(358);
-        use crate::jitcode_runtime::{all_descrs, all_jitcodes, decoded_ops};
-        let all = all_jitcodes();
-        if target_idx >= all.len() {
-            eprintln!("no jitcode {target_idx} (len={})", all.len());
-            return;
-        }
-        let jc = &all[target_idx];
-        let code = jc.code.as_slice();
-        eprintln!(
-            "sub-jitcode (idx {target_idx}): name={} num_regs_r={} num_regs_i={} num_regs_f={} constants_r={} constants_i={} code_len={}",
-            jc.name,
-            jc.num_regs_r(),
-            jc.num_regs_i(),
-            jc.num_regs_f(),
-            jc.constants_r.len(),
-            jc.constants_i.len(),
-            code.len(),
-        );
-        eprintln!("constants_i = {:#x?}", jc.constants_i);
-        eprintln!("constants_r = {:#x?}", jc.constants_r);
-        eprintln!("Raw bytes: {:02x?}", code);
-        let descrs = all_descrs();
-        for op in decoded_ops(code) {
-            let operand_bytes = &code[op.pc + 1..op.next_pc];
-            eprintln!(
-                "  pc={:>3}..{:<3} key={:>30}  operands={:02x?}",
-                op.pc, op.next_pc, op.key, operand_bytes,
-            );
-            let mut cursor = 0usize;
-            let mut chars = op.argcodes.chars();
-            while let Some(c) = chars.next() {
-                match c {
-                    'i' | 'c' | 'r' | 'f' => cursor += 1,
-                    'L' => cursor += 2,
-                    'd' | 'j' => {
-                        if cursor + 1 < operand_bytes.len() {
-                            let idx = u16::from_le_bytes([
-                                operand_bytes[cursor],
-                                operand_bytes[cursor + 1],
-                            ]) as usize;
-                            let info = descrs
-                                .get(idx)
-                                .map(|d| format!("{:?}", d))
-                                .unwrap_or_else(|| "<oor>".to_string());
-                            eprintln!("      descr[{idx}] = {info}");
-                            cursor += 2;
-                        } else {
-                            break;
-                        }
-                    }
-                    'I' | 'R' | 'F' => {
-                        if cursor < operand_bytes.len() {
-                            let n = operand_bytes[cursor] as usize;
-                            cursor += 1 + n;
-                        } else {
-                            break;
-                        }
-                    }
-                    '>' => {
-                        chars.next();
-                        cursor += 1;
-                    }
-                    _ => break,
-                }
-            }
-        }
-    }
-
-    #[test]
-    #[ignore]
-    fn dump_portal_jitcode_summary() {
-        // Architecture diagnostic: confirm whether the
-        // portal jitcode (eval_loop_jit's compiled form) exists and
-        // what its body shape is.  If portal contains per-opcode
-        // arms inlined directly, then walking portal at JitCode PC
-        // is the orthodox path.  If portal contains inline_call to
-        // per-arm jitcodes, then pyre's structure is "1+N" (portal +
-        // arms) vs PyPy's "1" (just portal with everything inlined).
-        use crate::jitcode_runtime::{all_jitcodes, decoded_ops, portal_jitcode};
-        let jcs = all_jitcodes();
-        eprintln!("ALL_JITCODES: total={}", jcs.len());
-        let p = portal_jitcode();
-        match p {
-            None => eprintln!("portal_jitcode() = None"),
-            Some(j) => {
-                eprintln!(
-                    "portal_jitcode: name={} code_len={} num_regs_r={} num_regs_i={} num_regs_f={}",
-                    j.name,
-                    j.code.len(),
-                    j.num_regs_r(),
-                    j.num_regs_i(),
-                    j.num_regs_f()
-                );
-                // First 30 ops of the portal.
-                let ops: Vec<_> = decoded_ops(j.code.as_slice()).take(30).collect();
-                for op in &ops {
-                    eprintln!("  pc={:>5}..{:<5} key={:>30}", op.pc, op.next_pc, op.key);
-                }
-                eprintln!(
-                    "  ... ({} more ops)",
-                    decoded_ops(j.code.as_slice())
-                        .count()
-                        .saturating_sub(ops.len())
-                );
-            }
-        }
-    }
-
-    #[test]
-    #[ignore]
-    fn dump_pyframe_pop_jitcode_122() {
-        // dispatch_inline_call_dr_kind for jitcode 122 (PyFrame::pop)
-        // is the second-level recursion inside pop_value's body.
-        // Dump its shape so we can audit the inner residual_calls
-        // for EffectInfo elidability.
-        use crate::jitcode_runtime::{all_descrs, all_jitcodes, decoded_ops};
-        let descrs = all_descrs();
-        let jcs = all_jitcodes();
-        for (idx, jc) in jcs.iter().enumerate() {
-            if idx != 122 {
-                continue;
-            }
-            eprintln!(
-                "jitcode_index={} name={} code_len={} num_regs_r={} num_regs_i={}",
-                idx,
-                jc.name,
-                jc.code.len(),
-                jc.num_regs_r(),
-                jc.num_regs_i()
-            );
-            for op in decoded_ops(jc.code.as_slice()) {
-                let operand_bytes = &jc.code[op.pc + 1..op.next_pc];
-                eprintln!(
-                    "  pc={:>3}..{:<3} key={:>32} operands={:02x?}",
-                    op.pc, op.next_pc, op.key, operand_bytes
-                );
-                let mut cursor = 0usize;
-                let mut chars = op.argcodes.chars();
-                while let Some(c) = chars.next() {
-                    match c {
-                        'i' | 'c' | 'r' | 'f' => cursor += 1,
-                        'L' => cursor += 2,
-                        'd' | 'j' => {
-                            let didx = u16::from_le_bytes([
-                                operand_bytes[cursor],
-                                operand_bytes[cursor + 1],
-                            ]) as usize;
-                            let info = descrs
-                                .get(didx)
-                                .map(|d| format!("{:?}", d))
-                                .unwrap_or_else(|| "<oor>".to_string());
-                            eprintln!("      descr[{didx}] = {info}");
-                            cursor += 2;
-                        }
-                        'I' | 'R' | 'F' => {
-                            let n = operand_bytes[cursor] as usize;
-                            cursor += 1 + n;
-                        }
-                        '>' => {
-                            chars.next();
-                            cursor += 1;
-                        }
-                        _ => break,
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    #[ignore]
-    fn dump_pop_value_jitcode_356() {
-        // Diagnostic: dump PyFrame::pop_value's body so we
-        // can see whether `nlocals()` is now `residual_call_r_i` or
-        // still `inline_call_r_i` after impl-method-hints fix.
-        use crate::jitcode_runtime::{all_descrs, all_jitcodes, decoded_ops};
-        let descrs = all_descrs();
-        let jcs = all_jitcodes();
-        for (idx, jc) in jcs.iter().enumerate() {
-            if !jc.name.contains("pop_value") {
-                continue;
-            }
-            eprintln!(
-                "jitcode_index={} name={} code_len={} num_regs_r={} num_regs_i={}",
-                idx,
-                jc.name,
-                jc.code.len(),
-                jc.num_regs_r(),
-                jc.num_regs_i()
-            );
-            for op in decoded_ops(jc.code.as_slice()) {
-                let operand_bytes = &jc.code[op.pc + 1..op.next_pc];
-                eprintln!(
-                    "  pc={:>3}..{:<3} key={:>30} operands={:02x?}",
-                    op.pc, op.next_pc, op.key, operand_bytes
-                );
-                let mut cursor = 0usize;
-                let mut chars = op.argcodes.chars();
-                while let Some(c) = chars.next() {
-                    match c {
-                        'i' | 'c' | 'r' | 'f' => cursor += 1,
-                        'L' => cursor += 2,
-                        'd' | 'j' => {
-                            let didx = u16::from_le_bytes([
-                                operand_bytes[cursor],
-                                operand_bytes[cursor + 1],
-                            ]) as usize;
-                            let info = descrs
-                                .get(didx)
-                                .map(|d| format!("{:?}", d))
-                                .unwrap_or_else(|| "<oor>".to_string());
-                            eprintln!("      descr[{didx}] = {info}");
-                            cursor += 2;
-                        }
-                        'I' | 'R' | 'F' => {
-                            let n = operand_bytes[cursor] as usize;
-                            cursor += 1 + n;
-                        }
-                        '>' => {
-                            chars.next();
-                            cursor += 1;
-                        }
-                        _ => break,
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    #[ignore]
-    fn dump_pop_top_sub_jitcode_ops() {
-        // PopTop arm body's `inline_call_r_r/dR>r` recurses into a sub-jitcode.
-        // Walk the chain down to the actual leaf (no more inline_call) so we
-        // can audit every IR op the walker emits per PopTop call.
-        use crate::jitcode_runtime::{
-            all_descrs, all_jitcodes, decoded_ops, jitcode_for_instruction,
-        };
-        let arm_jc = jitcode_for_instruction(&Instruction::PopTop)
-            .expect("PopTop must resolve to an arm jitcode");
-        let descrs = all_descrs();
-        let jitcodes = all_jitcodes();
-
-        let extract_sub_index = |descr_dbg: &str| -> Option<usize> {
-            let pos = descr_dbg.find("jitcode_index: ")?;
-            let rest = &descr_dbg[pos + "jitcode_index: ".len()..];
-            let end = rest.find(|c: char| !c.is_ascii_digit())?;
-            rest[..end].parse().ok()
-        };
-
-        let mut queue: Vec<(String, &[u8], String)> = vec![(
-            "PopTop arm".to_string(),
-            arm_jc.code.as_slice(),
-            arm_jc.name.clone(),
-        )];
-        let mut seen_indices: Vec<usize> = Vec::new();
-
-        while let Some((label, code, name)) = queue.pop() {
-            eprintln!("=== {label}: name={} code_len={}", name, code.len());
-            for op in decoded_ops(code) {
-                let operand_bytes = &code[op.pc + 1..op.next_pc];
-                eprintln!(
-                    "  pc={:>3}..{:<3} key={:>32}  operands={:02x?}",
-                    op.pc, op.next_pc, op.key, operand_bytes,
-                );
-                if op.key.starts_with("inline_call_") {
-                    let didx = u16::from_le_bytes([code[op.pc + 1], code[op.pc + 2]]) as usize;
-                    if let Some(d) = descrs.get(didx) {
-                        let s = format!("{:?}", d);
-                        if let Some(sub_idx) = extract_sub_index(&s) {
-                            eprintln!("      → sub-jitcode index {sub_idx}");
-                            if !seen_indices.contains(&sub_idx) {
-                                seen_indices.push(sub_idx);
-                                if let Some(sub_jc) = jitcodes.get(sub_idx) {
-                                    queue.push((
-                                        format!("{label}→{sub_idx}"),
-                                        sub_jc.code.as_slice(),
-                                        sub_jc.name.clone(),
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                } else if op.key.starts_with("residual_call_") {
-                    let descr_byte_offset = op.next_pc - 3;
-                    let didx =
-                        u16::from_le_bytes([code[descr_byte_offset], code[descr_byte_offset + 1]])
-                            as usize;
-                    if let Some(d) = descrs.get(didx) {
-                        let cd = d.as_calldescr();
-                        let ei = &cd.extra_info;
-                        eprintln!(
-                            "      → descr#{didx} args={:?} result={} extraeffect={:?} oopspec={:?} elidable={} canraise={}",
-                            cd.arg_classes,
-                            cd.result_type,
-                            ei.extraeffect,
-                            ei.oopspecindex,
-                            ei.check_is_elidable(),
-                            ei.check_can_raise(false),
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    #[ignore]
-    fn dump_pop_top_arm_bytes() {
-        use crate::jitcode_runtime::{all_descrs, decoded_ops, jitcode_for_instruction};
-        let jc = jitcode_for_instruction(&Instruction::PopTop)
-            .expect("PopTop must resolve to an arm jitcode");
-        let code = jc.code.as_slice();
-        eprintln!("PopTop arm: code_len={}", code.len());
-        let descrs = all_descrs();
-        for op in decoded_ops(code) {
-            let operand_bytes = &code[op.pc + 1..op.next_pc];
-            eprintln!(
-                "  pc={:>3}..{:<3} key={:>30}  operands={:02x?}",
-                op.pc, op.next_pc, op.key, operand_bytes,
-            );
-            let mut cursor = 0usize;
-            let mut chars = op.argcodes.chars();
-            while let Some(c) = chars.next() {
-                match c {
-                    'i' | 'c' | 'r' | 'f' => cursor += 1,
-                    'L' => cursor += 2,
-                    'd' | 'j' => {
-                        let idx =
-                            u16::from_le_bytes([operand_bytes[cursor], operand_bytes[cursor + 1]])
-                                as usize;
-                        let info = descrs
-                            .get(idx)
-                            .map(|d| format!("{:?}", d))
-                            .unwrap_or_else(|| "<oor>".to_string());
-                        eprintln!("      descr[{idx}] = {info}");
-                        cursor += 2;
-                    }
-                    'I' | 'R' | 'F' => {
-                        let n = operand_bytes[cursor] as usize;
-                        cursor += 1 + n;
-                    }
-                    '>' => {
-                        chars.next();
-                        cursor += 1;
-                    }
-                    _ => break,
-                }
-            }
-        }
-    }
-
-    #[test]
-    #[ignore]
-    fn dump_load_fast_check_arm_bytes() {
-        // T4 allow-list extension diagnostic: LoadFastCheck's arm
-        // body was the first opcode beyond PopTop blocked on the Int-bank
-        // concrete shadow (`GotoIfNotValueNotConcrete { pc: 28, value:
-        // IntOp(35) }` on fib_loop, 2026-05-17). With Concrete shadow skeleton-G landed
-        // the concrete_registers_i pool exists, so this dumper is the
-        // first step before re-attempting the allow-list extension.
-        use crate::jitcode_runtime::{all_descrs, decoded_ops, jitcode_for_instruction};
-        use pyre_interpreter::bytecode::Arg;
-        let instr = Instruction::LoadFastCheck {
-            var_num: Arg::marker(),
-        };
-        let jc =
-            jitcode_for_instruction(&instr).expect("LoadFastCheck must resolve to an arm jitcode");
-        let code = jc.code.as_slice();
-        eprintln!(
-            "LoadFastCheck arm: name={} num_regs_r={} num_regs_i={} num_regs_f={} code_len={}",
-            jc.name,
-            jc.num_regs_r(),
-            jc.num_regs_i(),
-            jc.num_regs_f(),
-            code.len(),
-        );
-        let descrs = all_descrs();
-        for op in decoded_ops(code) {
-            let operand_bytes = &code[op.pc + 1..op.next_pc];
-            eprintln!(
-                "  pc={:>3}..{:<3} key={:>30}  operands={:02x?}",
-                op.pc, op.next_pc, op.key, operand_bytes,
-            );
-            let mut cursor = 0usize;
-            let mut chars = op.argcodes.chars();
-            while let Some(c) = chars.next() {
-                match c {
-                    'i' | 'c' | 'r' | 'f' => cursor += 1,
-                    'L' => cursor += 2,
-                    'd' | 'j' => {
-                        let idx =
-                            u16::from_le_bytes([operand_bytes[cursor], operand_bytes[cursor + 1]])
-                                as usize;
-                        let info = descrs
-                            .get(idx)
-                            .map(|d| format!("{:?}", d))
-                            .unwrap_or_else(|| "<oor>".to_string());
-                        eprintln!("      descr[{idx}] = {info}");
-                        cursor += 2;
-                    }
-                    'I' | 'R' | 'F' => {
-                        let n = operand_bytes[cursor] as usize;
-                        cursor += 1 + n;
-                    }
-                    '>' => {
-                        chars.next();
-                        cursor += 1;
-                    }
-                    _ => break,
-                }
-            }
-        }
-    }
-
-    #[test]
-    #[ignore]
-    fn dump_load_fast_family_arm_bytes() {
-        // B1 allow-list batch diagnostic — dump LoadFast and LoadFastBorrow
-        // arm bytes side-by-side with LoadFastCheck so we can decide which
-        // of the three lands first.  Same decoder loop as
-        // `dump_load_fast_check_arm_bytes` above.
-        use crate::jitcode_runtime::{all_descrs, decoded_ops, jitcode_for_instruction};
-        use pyre_interpreter::bytecode::Arg;
-        let descrs = all_descrs();
-        for instr in [
-            Instruction::LoadFast {
-                var_num: Arg::marker(),
-            },
-            Instruction::LoadFastBorrow {
-                var_num: Arg::marker(),
-            },
-        ] {
-            let jc = jitcode_for_instruction(&instr)
-                .expect("LoadFast family must resolve to an arm jitcode");
-            let code = jc.code.as_slice();
-            eprintln!(
-                "{} arm: num_regs_r={} num_regs_i={} num_regs_f={} code_len={}",
-                jc.name,
-                jc.num_regs_r(),
-                jc.num_regs_i(),
-                jc.num_regs_f(),
-                code.len(),
-            );
-            for op in decoded_ops(code) {
-                let operand_bytes = &code[op.pc + 1..op.next_pc];
-                eprintln!(
-                    "  pc={:>3}..{:<3} key={:>30}  operands={:02x?}",
-                    op.pc, op.next_pc, op.key, operand_bytes,
-                );
-                if op.key.starts_with("residual_call_") {
-                    let descr_byte_offset = op.next_pc - 3;
-                    let didx =
-                        u16::from_le_bytes([code[descr_byte_offset], code[descr_byte_offset + 1]])
-                            as usize;
-                    if let Some(d) = descrs.get(didx) {
-                        let cd = d.as_calldescr();
-                        let ei = &cd.extra_info;
-                        eprintln!(
-                            "      → descr#{didx} args={:?} result={} extraeffect={:?} oopspec={:?} elidable={} canraise={}",
-                            cd.arg_classes,
-                            cd.result_type,
-                            ei.extraeffect,
-                            ei.oopspecindex,
-                            ei.check_is_elidable(),
-                            ei.check_can_raise(false),
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    #[ignore]
-    fn dump_nop_arm_bytes() {
-        // Phase D-3 Blocker #2 diagnostic: decode `Instruction::Nop`'s
-        // arm jitcode by following per-opname argcode arity (NOT a
-        // byte-by-byte table lookup, which mistakes operand bytes for
-        // opcode bytes). Surfaces the exact op sequence so we can map
-        // each residual_call back to its source in the codewriter.
-        use crate::jitcode_runtime::{all_descrs, decoded_ops, jitcode_for_instruction};
-        let jc =
-            jitcode_for_instruction(&Instruction::Nop).expect("Nop must resolve to an arm jitcode");
-        let code = jc.code.as_slice();
-        eprintln!(
-            "Nop arm: name={} num_regs_r={} num_regs_i={} num_regs_f={} code_len={}",
-            jc.name,
-            jc.num_regs_r(),
-            jc.num_regs_i(),
-            jc.num_regs_f(),
-            code.len(),
-        );
-        eprintln!("Raw bytes: {:02x?}", code);
-        let descrs = all_descrs();
-        for op in decoded_ops(code) {
-            let operand_bytes = &code[op.pc + 1..op.next_pc];
-            // Decode descr operands inline so we can see *which* residual
-            // call this is (the descr carries arg_classes + result_type
-            // + funcptr identity).
-            if op.argcodes.contains('d') || op.argcodes.contains('j') {
-                // Find the descr 2-byte operand. argcode parser
-                // sequences `i` then `R` then `d` then `>r` in the
-                // residual_call_r_r case — so the descr is the
-                // 2 bytes immediately preceding `>r` if present.
-                eprintln!(
-                    "  pc={:>3}..{:<3} key={:>30}  operands={:02x?}",
-                    op.pc, op.next_pc, op.key, operand_bytes,
-                );
-                // Try to find a 'd' position. For residual_call_r_r/iRd>r:
-                //   operands = [funcptr_int(1), R-len(1), R[0..n](n), descr_lo(1), descr_hi(1), dst_r(1)]
-                // For getfield_gc_r/rd>r:
-                //   operands = [src_r(1), descr_lo(1), descr_hi(1), dst_r(1)]
-                // We re-walk the argcode to locate `d` precisely.
-                let mut cursor = 0usize;
-                let mut chars = op.argcodes.chars();
-                while let Some(c) = chars.next() {
-                    match c {
-                        'i' | 'c' | 'r' | 'f' => cursor += 1,
-                        'L' => cursor += 2,
-                        'd' | 'j' => {
-                            let idx = u16::from_le_bytes([
-                                operand_bytes[cursor],
-                                operand_bytes[cursor + 1],
-                            ]) as usize;
-                            let info = descrs
-                                .get(idx)
-                                .map(|d| format!("{:?}", d))
-                                .unwrap_or_else(|| "<out-of-range>".to_string());
-                            eprintln!("      descr[{idx}] = {info}");
-                            cursor += 2;
-                        }
-                        'I' | 'R' | 'F' => {
-                            let n = operand_bytes[cursor] as usize;
-                            cursor += 1 + n;
-                        }
-                        '>' => {
-                            chars.next();
-                            cursor += 1;
-                        }
-                        _ => break,
-                    }
-                }
-            } else {
-                eprintln!(
-                    "  pc={:>3}..{:<3} key={:>30}  operands={:02x?}",
-                    op.pc, op.next_pc, op.key, operand_bytes,
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn dump_rvmprof_code_presence() {
-        // Throw-away check: rvmprof_code/ii presence in pyre's insns
-        // table. Used to decide whether `try_catch_exception_at` needs
-        // a runtime rvmprof skip path or just forward-prep
-        // documentation.
-        let t = insns_opname_to_byte();
-        if let Some(b) = t.get("rvmprof_code/ii") {
-            eprintln!("rvmprof_code/ii IS in insns table: byte = {b}");
-        } else {
-            eprintln!("rvmprof_code/ii is NOT in pyre insns table (forward-prep)");
-        }
-    }
-
-    #[test]
-    fn dump_unsupported_opnames_in_insns_table() {
-        // Throw-away audit: list every opname pyre's codewriter
-        // currently emits that the walker has no handler arm for.
-        // Drives the slice-by-slice handler coverage plan — the
-        // remaining names are the work queue.
-        use std::collections::HashSet;
-        let t = insns_opname_to_byte();
-        let supported: HashSet<&'static str> = [
-            "live/",
-            "goto/L",
-            "catch_exception/L",
-            "ref_return/r",
-            "inline_call_r_r/dR>r",
-            "int_copy/i>i",
-            "int_add/ii>i",
-            "int_sub/ii>i",
-            "int_mul/ii>i",
-            "int_and/ii>i",
-            "int_or/ii>i",
-            "int_xor/ii>i",
-            "int_rshift/ii>i",
-            "int_eq/ii>i",
-            "int_ne/ii>i",
-            "int_lt/ii>i",
-            "int_le/ii>i",
-            "int_gt/ii>i",
-            "int_ge/ii>i",
-            "float_add/ff>f",
-            "float_sub/ff>f",
-            "float_truediv/ff>f",
-            "float_neg/f>f",
-            "int_neg/i>i",
-            "int_invert/i>i",
-            "int_same_as/i>i",
-            "cast_int_to_float/i>f",
-            "ptr_eq/rr>i",
-            "ptr_ne/rr>i",
-            "getfield_gc_i/rd>i",
-            "getfield_gc_r/rd>r",
-            "setfield_gc_i/rid",
-            "setfield_gc_r/rrd",
-            "getarrayitem_gc_r/rid>r",
-            "setarrayitem_gc_r/rird",
-            "residual_call_r_r/iRd>r",
-            "residual_call_r_i/iRd>i",
-            "residual_call_ir_r/iIRd>r",
-            "raise/r",
-            "reraise/",
-            "last_exc_value/>r",
-            "int_return/i",
-            "float_return/f",
-            "void_return/",
-            "inline_call_r_i/dR>i",
-            "inline_call_ir_r/dIR>r",
-            "inline_call_ir_i/dIR>i",
-            "inline_call_irf_r/dIRF>r",
-            "inline_call_irf_f/dIRF>f",
-        ]
-        .into_iter()
-        .collect();
-        let mut missing: Vec<&str> = t
-            .keys()
-            .map(|s| s.as_str())
-            .filter(|n| !supported.contains(n))
-            .collect();
-        missing.sort();
-        eprintln!(
-            "Pyre insns table: {} opnames total; {} unsupported by walker",
-            t.len(),
-            missing.len()
-        );
-        for n in &missing {
-            eprintln!("UNSUPPORTED: {n}");
-        }
     }
 
     #[test]

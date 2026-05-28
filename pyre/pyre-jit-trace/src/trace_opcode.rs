@@ -7540,8 +7540,114 @@ unsafe fn trace_check_exc_match_against(
 /// PopTop walker activation is structurally blocked.  Documented in
 /// project memory `project-issue73-phase4-poptop-vable-getfield-blocker`.
 pub fn production_walker_handles(instruction: &Instruction) -> bool {
-    let _ = instruction;
-    false
+    // Re-enabled 2026-05-27.  The pre-jtransform unit-variant fold
+    // (`translator/rtyper/unit_variant_fold.rs::fold_unit_variant_ctors`)
+    // rewrites zero-arg `SyntheticTransparentCtor` calls
+    // (`StepResult::Continue`, `LoopResult::Done`, …) to
+    // `OpKind::ConstRef(prebuilt_instance)` on `model::FunctionGraph`
+    // before `Transformer::transform` runs.  The assembler lowers
+    // `ConstRef` through the existing `ref_copy/r>r` path
+    // (`assembler.rs::emit_const_r`), so arm bytes decode to the real
+    // no-op shape and walker activation no longer encounters
+    // residual-call wrappers around unit variants.
+    matches!(
+        instruction,
+        Instruction::Nop
+            | Instruction::ExtendedArg
+            | Instruction::Resume { .. }
+            | Instruction::Cache
+            | Instruction::NotTaken
+            | Instruction::ExitInitCheck
+            | Instruction::EndFor
+            | Instruction::UnaryNot
+            | Instruction::UnaryInvert
+            | Instruction::GetIter
+            | Instruction::MatchMapping
+            | Instruction::MatchSequence
+            | Instruction::SetupAnnotations
+            | Instruction::FormatSimple
+            | Instruction::FormatWithSpec
+            | Instruction::MakeFunction
+            | Instruction::GetYieldFromIter
+            | Instruction::PopIter
+            | Instruction::EndSend
+            | Instruction::DeleteSubscr
+            | Instruction::LoadLocals
+            | Instruction::LoadBuildClass
+            | Instruction::BuildTemplate
+            | Instruction::Copy { .. }
+            | Instruction::BinarySlice
+            | Instruction::StoreSlice
+            | Instruction::ContainsOp { .. }
+            | Instruction::IsOp { .. }
+            | Instruction::Swap { .. }
+            | Instruction::BuildTuple { .. }
+            | Instruction::BuildList { .. }
+            | Instruction::BuildSet { .. }
+            | Instruction::BuildString { .. }
+            | Instruction::BuildMap { .. }
+            | Instruction::BuildSlice { .. }
+            | Instruction::LoadFastAndClear { .. }
+            | Instruction::ListAppend { .. }
+            | Instruction::ListExtend { .. }
+            | Instruction::SetAdd { .. }
+            | Instruction::SetUpdate { .. }
+            | Instruction::MapAdd { .. }
+            | Instruction::DictUpdate { .. }
+            | Instruction::DictMerge { .. }
+            | Instruction::SetFunctionAttribute { .. }
+            | Instruction::UnpackSequence { .. }
+            | Instruction::UnpackEx { .. }
+            | Instruction::LoadName { .. }
+            | Instruction::StoreName { .. }
+            | Instruction::StoreGlobal { .. }
+            | Instruction::DeleteAttr { .. }
+            | Instruction::ImportName { .. }
+            | Instruction::ImportFrom { .. }
+            | Instruction::LoadSuperAttr { .. }
+            | Instruction::BuildInterpolation { .. }
+            | Instruction::CallIntrinsic1 { .. }
+            | Instruction::CallIntrinsic2 { .. }
+            | Instruction::GetLen
+            | Instruction::LoadSpecial { .. }
+            | Instruction::LoadFromDictOrGlobals { .. }
+            | Instruction::LoadFromDictOrDeref { .. }
+            | Instruction::LoadDeref { .. }
+            | Instruction::LoadFastCheck { .. }
+            | Instruction::LoadCommonConstant { .. }
+            | Instruction::GetAiter
+            | Instruction::GetAwaitable { .. }
+            | Instruction::StoreDeref { .. }
+            | Instruction::YieldValue { .. }
+            | Instruction::ReturnGenerator
+            | Instruction::Send { .. }
+            | Instruction::GetAnext
+            | Instruction::EndAsyncFor
+            | Instruction::CleanupThrow
+            | Instruction::WithExceptStart
+            | Instruction::DeleteFast { .. }
+            | Instruction::DeleteDeref { .. }
+            | Instruction::DeleteGlobal { .. }
+            | Instruction::DeleteName { .. }
+            | Instruction::CopyFreeVars { .. }
+            | Instruction::MakeCell { .. }
+            | Instruction::ConvertValue { .. }
+            // Instruction::Reraise excluded: `trace_code_step` reads
+            // `reraise_lasti` only from `step_result.err()`
+            // (trace_opcode.rs:6839-6843).  A walker-handled Reraise
+            // returns `StepResult::Continue` (Ok), so reraise_lasti is
+            // always -1 and `Reraise { depth > 0 }` aborts the trace.
+            // Keep on trait dispatch until the walker can propagate the
+            // saved lasti.
+            | Instruction::PopJumpIfNone { .. }
+            | Instruction::PopJumpIfNotNone { .. }
+            | Instruction::ForIter { .. }
+            | Instruction::CallKw { .. }
+            | Instruction::CallFunctionEx
+            | Instruction::LoadAttr { .. }
+            | Instruction::StoreAttr { .. }
+            | Instruction::StoreFastStoreFast { .. }
+    )
 }
 
 /// Apply the symbolic-tracker side effects of a walker-handled opcode.
@@ -7568,6 +7674,53 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
 ///   walker arm's `setarrayitem_vable_r` IR op updates the runtime
 ///   heap, but the tracer's shadow needs the same update applied here.
 ///
+/// Resync `sym.valuestackdepth` from the live `PyFrame` after a walker
+/// arm with non-zero net stack effect has run.
+///
+/// The walker arm emits `setfield_vable_i(valuestackdepth, …)` for any
+/// push/pop; that op routes through `vable_setfield` →
+/// `synchronize_virtualizable()` (pyjitpl.py:3470-3474), which writes
+/// the new vsd into the heap `PyFrame` at trace time.  Pyre's tracer
+/// maintains a parallel `sym.valuestackdepth` shadow that the walker
+/// path does not touch (pyre-only adaptation; PyPy's MIFrame has no
+/// such counter — rpython/jit/metainterp/pyjitpl.py:65-93).  Read the
+/// live depth back so the tracer's symbolic counter stays consistent
+/// with subsequent trait-dispatched opcodes that consume
+/// `sym.valuestackdepth`.
+fn resync_sym_vsd_from_concrete_frame(state: &mut MIFrame) {
+    let new_vsd = match state.concrete_valuestackdepth() {
+        Some(v) => v,
+        // Inline-callee tracing has no live `PyFrame`; the walker path
+        // is not reachable for inlined opcodes today (production walker
+        // dispatch only fires on top-level opcode entries), so a None
+        // here indicates the seed contract was violated upstream.
+        None => return,
+    };
+    // Mirror `sym.concrete_stack` from the live `PyFrame` so trait-
+    // dispatched callers reading `concrete_stack[stack_idx]` after a
+    // walker push/pop see the post-opcode value instead of the
+    // pre-opcode placeholder.  Same pattern as `PyreSym::setup_call`
+    // (state.rs:3336-3347).
+    let frame_addr = state.concrete_frame_addr;
+    let nlocals = state.sym().nlocals;
+    let new_stack_len = new_vsd.saturating_sub(nlocals);
+    let s = state.sym_mut();
+    let old_stack_len = s.concrete_stack.len();
+    if new_stack_len < old_stack_len {
+        s.concrete_stack.truncate(new_stack_len);
+    } else if new_stack_len > old_stack_len {
+        s.concrete_stack
+            .resize(new_stack_len, crate::state::ConcreteValue::Null);
+        for stack_idx in old_stack_len..new_stack_len {
+            let abs_idx = nlocals + stack_idx;
+            let obj = crate::state::concrete_stack_value(frame_addr, abs_idx)
+                .unwrap_or(pyre_object::PY_NULL);
+            s.concrete_stack[stack_idx] = crate::state::concrete_value_from_slot(obj);
+        }
+    }
+    s.valuestackdepth = new_vsd;
+}
+
 /// Mirrors `liveness.rs:528..588 _opcode_stack_effect` (Python
 /// `dis.stack_effect` parity).  Walker-handled opcodes must remain a
 /// closed set listed here AND in `production_walker_handles`.
@@ -7578,8 +7731,110 @@ fn apply_walker_stack_effect(state: &mut MIFrame, instruction: &Instruction) {
         | Instruction::ExtendedArg
         | Instruction::Resume { .. }
         | Instruction::Cache
-        | Instruction::NotTaken => {
+        | Instruction::NotTaken
+        | Instruction::ExitInitCheck
+        | Instruction::EndFor => {
             // delta = 0, no shadow mutation.
+        }
+        Instruction::UnaryNot
+        | Instruction::UnaryInvert
+        | Instruction::GetIter
+        | Instruction::MatchMapping
+        | Instruction::MatchSequence
+        | Instruction::SetupAnnotations
+        | Instruction::FormatSimple
+        | Instruction::FormatWithSpec
+        | Instruction::MakeFunction
+        | Instruction::GetYieldFromIter => {
+            // 1-in-1-out at the TOS slot. The walker arm emits
+            // `inline_call_r_r/dR>r` whose dst writeback to
+            // `concrete_registers_r[dst]` replaces the TOS register
+            // operand in-place; `sym.valuestackdepth` is invariant.
+        }
+        Instruction::PopIter
+        | Instruction::EndSend
+        | Instruction::DeleteSubscr
+        | Instruction::LoadLocals
+        | Instruction::LoadBuildClass
+        | Instruction::BuildTemplate
+        | Instruction::Copy { .. }
+        | Instruction::BinarySlice
+        | Instruction::StoreSlice
+        | Instruction::ContainsOp { .. }
+        | Instruction::IsOp { .. }
+        | Instruction::Swap { .. }
+        | Instruction::BuildTuple { .. }
+        | Instruction::BuildList { .. }
+        | Instruction::BuildSet { .. }
+        | Instruction::BuildString { .. }
+        | Instruction::BuildMap { .. }
+        | Instruction::BuildSlice { .. }
+        | Instruction::LoadFastAndClear { .. }
+        | Instruction::ListAppend { .. }
+        | Instruction::ListExtend { .. }
+        | Instruction::SetAdd { .. }
+        | Instruction::SetUpdate { .. }
+        | Instruction::MapAdd { .. }
+        | Instruction::DictUpdate { .. }
+        | Instruction::DictMerge { .. }
+        | Instruction::SetFunctionAttribute { .. }
+        | Instruction::UnpackSequence { .. }
+        | Instruction::UnpackEx { .. }
+        | Instruction::LoadName { .. }
+        | Instruction::StoreName { .. }
+        | Instruction::StoreGlobal { .. }
+        | Instruction::DeleteAttr { .. }
+        | Instruction::ImportName { .. }
+        | Instruction::ImportFrom { .. }
+        | Instruction::LoadSuperAttr { .. }
+        | Instruction::BuildInterpolation { .. }
+        | Instruction::CallIntrinsic1 { .. }
+        | Instruction::CallIntrinsic2 { .. }
+        | Instruction::GetLen
+        | Instruction::LoadSpecial { .. }
+        | Instruction::LoadFromDictOrGlobals { .. }
+        | Instruction::LoadFromDictOrDeref { .. }
+        | Instruction::LoadDeref { .. }
+        | Instruction::LoadFastCheck { .. }
+        | Instruction::LoadCommonConstant { .. }
+        | Instruction::GetAiter
+        | Instruction::GetAwaitable { .. }
+        | Instruction::StoreDeref { .. }
+        | Instruction::YieldValue { .. }
+        | Instruction::ReturnGenerator
+        | Instruction::Send { .. }
+        | Instruction::GetAnext
+        | Instruction::EndAsyncFor
+        | Instruction::CleanupThrow
+        | Instruction::WithExceptStart
+        | Instruction::DeleteFast { .. }
+        | Instruction::DeleteDeref { .. }
+        | Instruction::DeleteGlobal { .. }
+        | Instruction::DeleteName { .. }
+        | Instruction::CopyFreeVars { .. }
+        | Instruction::MakeCell { .. }
+        | Instruction::ConvertValue { .. }
+        | Instruction::Reraise { .. }
+        | Instruction::PopJumpIfNone { .. }
+        | Instruction::PopJumpIfNotNone { .. }
+        | Instruction::ForIter { .. }
+        | Instruction::CallKw { .. }
+        | Instruction::CallFunctionEx
+        | Instruction::LoadAttr { .. }
+        | Instruction::StoreAttr { .. }
+        | Instruction::StoreFastStoreFast { .. } => {
+            // Non-zero stack delta. The walker arm's
+            // `setfield_vable_i(valuestackdepth)` emit routes through
+            // `vable_setfield` (trace_ctx.rs:2608-2655) which calls
+            // `synchronize_virtualizable()` (`pyjitpl.py:3470-3474
+            // synchronize_virtualizable` parity) — that writes the new
+            // vsd back into the live `PyFrame` at trace time.  Resync
+            // `sym.valuestackdepth` from the concrete `PyFrame` so the
+            // tracer's parallel counter follows the live frame, mirroring
+            // PyPy's tracer which has no `MIFrame.valuestackdepth` shadow
+            // (rpython/jit/metainterp/pyjitpl.py:65-93) and reads stack
+            // depth directly from `metainterp.virtualizable_boxes`.
+            resync_sym_vsd_from_concrete_frame(state);
         }
         other => panic!(
             "apply_walker_stack_effect: missing handler for {:?}; every entry \
