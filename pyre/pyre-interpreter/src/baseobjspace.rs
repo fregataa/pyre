@@ -720,6 +720,62 @@ pub(crate) unsafe fn normalize_slice(
     Ok((start, stop, step))
 }
 
+/// `descroperation.py:169 get_and_call_function`.
+///
+/// ```python
+/// def get_and_call_function(space, w_descr, w_obj, *args_w):
+///     typ = type(w_descr)
+///     if typ is Function or typ is FunctionWithFixedCode:
+///         return w_descr.funccall(w_obj, *args_w)
+///     else:
+///         args = Arguments(space, list(args_w))
+///         w_impl = space.get(w_descr, w_obj)
+///         return space.call_args(w_impl, args)
+/// ```
+///
+/// The `Function`/`FunctionWithFixedCode` fast path (both `FUNCTION_TYPE`
+/// here, exact match) calls `funccall(w_obj, *args_w)` — `w_obj` leads the
+/// positionals.  `BuiltinFunction` (`BUILTIN_FUNCTION_TYPE`) is excluded
+/// because it binds differently.  Every other descriptor is bound through
+/// `get` (`space.get`) first, then called with `args_w` alone, so
+/// `@staticmethod` / `@classmethod` / custom-descriptor dunders receive the
+/// arguments PyPy gives them.
+unsafe fn get_and_call_function(
+    w_descr: PyObjectRef,
+    w_obj: PyObjectRef,
+    w_type: PyObjectRef,
+    args_w: &[PyObjectRef],
+) -> PyResult {
+    if !w_descr.is_null()
+        && std::ptr::eq(
+            unsafe { (*w_descr).ob_type },
+            &crate::FUNCTION_TYPE as *const _,
+        )
+    {
+        let mut full = Vec::with_capacity(args_w.len() + 1);
+        full.push(w_obj);
+        full.extend_from_slice(args_w);
+        return crate::call::call_function_impl_result(w_descr, &full);
+    }
+    let w_impl = unsafe { get(w_descr, w_obj, w_type) }?.unwrap_or(w_descr);
+    crate::call::call_function_impl_result(w_impl, args_w)
+}
+
+#[majit_macros::dont_look_inside]
+fn dict_missing_or_key_error(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
+    if let Some(w_type_obj) = crate::typedef::r#type(obj) {
+        let dict_type = crate::typedef::gettypeobject(&pyre_object::DICT_TYPE);
+        if dict_type.is_null() == false && std::ptr::eq(w_type_obj, dict_type) == false {
+            if let Some(w_missing) = unsafe { lookup_in_type(w_type_obj, "__missing__") } {
+                // dictmultiobject.py:166 space.get_and_call_function(
+                //     w_missing, self, w_key)
+                return unsafe { get_and_call_function(w_missing, obj, w_type_obj, &[index]) };
+            }
+        }
+    }
+    Err(PyError::key_error_with_key(index))
+}
+
 /// Get item by index: `obj[index]`.
 ///
 /// Dispatches based on the type of `obj`.
@@ -795,11 +851,14 @@ pub fn getitem(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
                 )),
             }
         } else if is_dict(obj) {
-            // `pypy/objspace/std/dictmultiobject.py:137-141 W_DictMultiObject
-            // .descr_getitem` → `space.getitem(self, w_key)` → strategy
+            // `dictmultiobject.py:161-172 descr_getitem`
             match pyre_object::dictmultiobject::w_dict_lookup_checked(obj, index) {
                 Ok(Some(val)) => Ok(val),
-                Ok(None) => Err(PyError::key_error_with_key(index)),
+                Ok(None) => {
+                    // dictmultiobject.py:166-170 — dict subclass
+                    // __missing__ dispatch before KeyError
+                    dict_missing_or_key_error(obj, index)
+                }
                 Err(_) => Err(take_pending_hash_error()),
             }
         } else if is_str(obj) {
@@ -4748,6 +4807,56 @@ pub fn pick_builtin(
     // `None=w_None`.  This is reached when (a) `w_globals` is null,
     // (b) `__builtins__` is absent from globals, or (c) `__builtins__`
     // is not Module/dict.
+    build_default_pick_builtin_module()
+}
+
+/// Object-based `pick_builtin` for call frames whose globals came from
+/// `Function.w_func_globals` as a W_DictObject, matching PyPy's
+/// `pyframe.py:115 self.builtin = space.builtin.pick_builtin(w_globals)`.
+pub fn pick_builtin_obj(
+    w_globals: PyObjectRef,
+    exec_ctx: *const crate::PyExecutionContext,
+) -> PyObjectRef {
+    if !w_globals.is_null() {
+        match finditem_str(w_globals, "__builtins__") {
+            Ok(Some(w_builtin)) if !w_builtin.is_null() => {
+                if !exec_ctx.is_null() {
+                    let space_builtin = unsafe { (*exec_ctx).get_builtin() };
+                    if !space_builtin.is_null() && std::ptr::eq(w_builtin, space_builtin) {
+                        return w_builtin;
+                    }
+                }
+                if unsafe { pyre_object::is_module(w_builtin) } {
+                    return w_builtin;
+                }
+                let backing = crate::type_methods::resolve_dict_backing(w_builtin);
+                if !backing.is_null() {
+                    return pyre_object::w_module_new_aliasing_dict(
+                        "",
+                        std::ptr::null_mut(),
+                        w_builtin,
+                    );
+                }
+            }
+            // `__builtins__` absent — moduledef.py:106-108 default Module.
+            Ok(_) => {}
+            // moduledef.py:97-98 `if not e.match(space, space.w_KeyError): raise`
+            // — a non-KeyError from the `__builtins__` lookup (a dict-subclass
+            // globals whose `__getitem__` raises) should propagate.  It cannot
+            // here: `pick_builtin_obj` returns `PyObjectRef` because every
+            // caller is an infallible frame builder (`pyframe.rs
+            // new_for_call_*`, JIT `call_jit.rs new_for_call_with_globals_obj`,
+            // `trace_opcode.rs`).  Propagating requires making frame creation
+            // fallible — the R3.4 `PyFrame.w_globals` retirement, which
+            // cascades a `Result` return across ~28 frame-build sites including
+            // the JIT hot path.  Until then the non-KeyError is dropped; the
+            // case is unreachable for a real module-dict `__globals__` and
+            // only arises for a dict-subclass globals with a raising
+            // `__getitem__`.  CONVERGENCE: thread `Result` once frame builders
+            // become fallible (R3.4).
+            Err(_) => {}
+        }
+    }
     build_default_pick_builtin_module()
 }
 

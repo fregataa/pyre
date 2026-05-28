@@ -218,6 +218,15 @@ pub trait GcAllocator: Send {
     /// Trigger a full collection.
     fn collect_full(&mut self);
 
+    /// minimark.py:1900-1915 `id_or_identityhash(gcobj)`.
+    /// Return a stable address for the object that does not change
+    /// across GC moves.  For nursery objects, allocates a shadow in
+    /// old-gen and returns its address.  For old-gen objects, returns
+    /// the object's own address.
+    fn id_or_identityhash(&mut self, obj_addr: usize) -> usize {
+        obj_addr
+    }
+
     /// gc.py:268 write_barrier_descr: descriptor for the write barrier check.
     fn get_write_barrier_descr(&self) -> Option<WriteBarrierDescr> {
         None
@@ -842,6 +851,26 @@ thread_local! {
 /// Install the active backend's `is_managed_heap_object` trampoline.
 pub fn set_active_gc_owns_object(hook: Option<GcOwnsObjectFn>) {
     ACTIVE_GC_OWNS_OBJECT.with(|c| c.set(hook));
+}
+
+/// minimark.py:1900-1915 `id_or_identityhash` TLS hook.
+pub type GcIdOrIdentityHashFn = fn(addr: usize) -> usize;
+
+thread_local! {
+    static ACTIVE_GC_ID_OR_IDENTITYHASH: Cell<Option<GcIdOrIdentityHashFn>> = const { Cell::new(None) };
+}
+
+pub fn set_active_gc_id_or_identityhash(hook: Option<GcIdOrIdentityHashFn>) {
+    ACTIVE_GC_ID_OR_IDENTITYHASH.with(|c| c.set(hook));
+}
+
+/// Return a GC-move-stable address for identity hashing.
+/// Falls back to `addr` when no backend is installed.
+pub fn gc_id_or_identityhash(addr: usize) -> usize {
+    ACTIVE_GC_ID_OR_IDENTITYHASH.with(|c| match c.get() {
+        Some(f) => f(addr),
+        None => addr,
+    })
 }
 
 /// Whether `addr` lies inside the active backend's managed GC heap.

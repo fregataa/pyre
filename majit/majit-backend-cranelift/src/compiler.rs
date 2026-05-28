@@ -1408,6 +1408,19 @@ fn gc_write_barrier_via_active_runtime(obj: GcRef) {
 /// allocators (`pyre_object::dealloc_items_block`) discriminate
 /// `try_gc_alloc_stable`-allocated blocks from `std::alloc`-backed
 /// fallback blocks during the L1/L2 stepping-stone window.
+fn id_or_identityhash_via_active_runtime(addr: usize) -> usize {
+    CRANELIFT_ACTIVE_GC.with(|cell| {
+        let mut guard = match cell.try_borrow_mut() {
+            Ok(guard) => guard,
+            Err(_) => return addr,
+        };
+        match guard.as_deref_mut() {
+            Some(gc) => gc.id_or_identityhash(addr),
+            None => addr,
+        }
+    })
+}
+
 fn gc_owns_object_via_active_runtime(addr: usize) -> bool {
     CRANELIFT_ACTIVE_GC.with(|cell| {
         let mut guard = match cell.try_borrow_mut() {
@@ -7320,6 +7333,7 @@ impl CraneliftBackend {
             Some(gc_remove_root_via_active_runtime),
         );
         majit_gc::set_active_gc_owns_object(Some(gc_owns_object_via_active_runtime));
+        majit_gc::set_active_gc_id_or_identityhash(Some(id_or_identityhash_via_active_runtime));
         majit_gc::set_active_write_barrier(Some(gc_write_barrier_via_active_runtime));
     }
 

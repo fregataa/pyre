@@ -288,6 +288,19 @@ fn dynasm_gc_write_barrier(obj: GcRef) {
     });
 }
 
+fn dynasm_id_or_identityhash(addr: usize) -> usize {
+    DYNASM_ACTIVE_GC.with(|cell| {
+        let mut guard = match cell.try_borrow_mut() {
+            Ok(guard) => guard,
+            Err(_) => return addr,
+        };
+        match guard.as_deref_mut() {
+            Some(gc) => gc.id_or_identityhash(addr),
+            None => addr,
+        }
+    })
+}
+
 /// Host-side `is_managed_heap_object` trampoline. Lets host-side
 /// allocators (`pyre_object::dealloc_items_block`) discriminate
 /// `try_gc_alloc_stable`-allocated blocks from `std::alloc`-backed
@@ -1157,6 +1170,7 @@ impl DynasmBackend {
         majit_gc::set_active_collect_full(Some(dynasm_collect_full));
         majit_gc::set_active_root_hooks(Some(dynasm_gc_add_root), Some(dynasm_gc_remove_root));
         majit_gc::set_active_gc_owns_object(Some(dynasm_gc_owns_object));
+        majit_gc::set_active_gc_id_or_identityhash(Some(dynasm_id_or_identityhash));
         majit_gc::set_active_write_barrier(Some(dynasm_gc_write_barrier));
     }
 

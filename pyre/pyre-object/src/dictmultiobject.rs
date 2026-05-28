@@ -726,6 +726,10 @@ pub const W_MODULE_DICT_GC_TYPE_ID: u32 = 48;
 /// Fixed payload size used by `gct_fv_gc_malloc`.
 pub const W_MODULE_DICT_OBJECT_SIZE: usize = std::mem::size_of::<W_ModuleDictObject>();
 
+/// Byte offset of `dict_storage_proxy` within `W_ModuleDictObject`.
+pub const W_MODULE_DICT_STORAGE_PROXY_OFFSET: usize =
+    std::mem::offset_of!(W_ModuleDictObject, dict_storage_proxy);
+
 impl crate::lltype::GcType for W_ModuleDictObject {
     const TYPE_ID: u32 = W_MODULE_DICT_GC_TYPE_ID;
     const SIZE: usize = W_MODULE_DICT_OBJECT_SIZE;
@@ -1670,6 +1674,118 @@ pub unsafe fn w_dict_store_checked(
         return Err(DictKeyError);
     }
     Ok(())
+}
+
+/// `dictmultiobject.py:487-493 DictStrategy.setdefault` (base) +
+/// `:749-753 EmptyDictStrategy.setdefault` +
+/// `:1073-1079 AbstractTypedStrategy.setdefault` — strategy-dispatched
+/// setdefault.
+///
+/// PRE-EXISTING-ADAPTATION: PyPy's `AbstractTypedStrategy.setdefault`
+/// is a single `r_dict.setdefault` (one hash).  pyre's typed strategies
+/// keep a `dict_storage_proxy` back-mirror that must be looked up first
+/// (proxy holds str-key authority) and stored with a sync, so the typed
+/// path runs the base two-step (`getitem` + `setitem`) — two hashes on
+/// an insert-miss.  This converges to the single op once the proxy
+/// retires (R3.5).  The Empty case routes through the checked store
+/// (`EmptyDictStrategy.setdefault` → `w_dict.setitem`) so an unhashable
+/// key raises TypeError before insertion.
+///
+/// # Safety
+/// `obj`, `key`, `value` must be valid PyObjectRef.
+pub unsafe fn w_dict_setdefault_checked(
+    obj: PyObjectRef,
+    key: PyObjectRef,
+    value: PyObjectRef,
+) -> Result<PyObjectRef, DictKeyError> {
+    if is_module_dict(obj) {
+        // `celldict.py:92-105 ModuleDictStrategy.setdefault`: for a str
+        // key, grab the cell and return its value if set, else store the
+        // default through the cell; non-str keys switch to object
+        // strategy.  `w_module_dict_*_inner_checked` carry the
+        // str-vs-object dispatch + cell write; pyre fetches the cell in
+        // the lookup and again in the store rather than reusing one cell
+        // object (`_setitem_str_cell_known`) — a back-mirror artefact
+        // that retires with `dict_storage_proxy` (R3.5).
+        if let Some(existing) = w_module_dict_lookup_inner_checked(obj, key)? {
+            return Ok(existing);
+        }
+        w_module_dict_store_inner_checked(obj, key, value)?;
+        return Ok(value);
+    }
+    let strategy = (*(obj as *const W_DictObject)).dstrategy;
+    // `dictmultiobject.py:749-753 EmptyDictStrategy.setdefault`:
+    //   self.switch_to_correct_strategy(w_dict, w_key)
+    //   w_dict.setitem(w_key, w_default)
+    //   return w_default
+    // `w_dict.setitem` is the public CHECKED store, so an unhashable
+    // key raises TypeError *before* insertion (parity with the
+    // empty-dict setitem rejecting unhashable).  Route through
+    // `w_dict_store_checked` and propagate its `Result` directly:
+    // `object_key_for_checked` consumes the hook error slot, so a
+    // post-hoc `take_hash_error()` would observe `None`.
+    if strategy_is(strategy, &crate::dictstrategy::EMPTY_DICT_STRATEGY) {
+        crate::dictstrategy::EMPTY_DICT_STRATEGY.switch_to_correct_strategy(obj, key);
+        w_dict_store_checked(obj, key, value)?;
+        return Ok(value);
+    }
+    if strategy_is(strategy, &crate::dictstrategy::EMPTY_KWARGS_DICT_STRATEGY) {
+        crate::dictstrategy::EMPTY_KWARGS_DICT_STRATEGY.switch_to_correct_strategy(obj, key);
+        w_dict_store_checked(obj, key, value)?;
+        return Ok(value);
+    }
+    let result = strategy.setdefault(obj, key, value);
+    if crate::dict_eq_hook::take_hash_error().is_some() {
+        return Err(DictKeyError);
+    }
+    Ok(result)
+}
+
+/// `dictmultiobject.py:624-634 DictStrategy.pop` (base) +
+/// `:783-787 EmptyDictStrategy.pop` +
+/// `:1123-1138 AbstractTypedStrategy.pop` — strategy-dispatched pop.
+///
+/// PRE-EXISTING-ADAPTATION: PyPy's `AbstractTypedStrategy.pop` is a
+/// single `r_dict.pop` (one hash).  pyre's typed strategies run the
+/// base two-step (`getitem` + `delitem`) so the `dict_storage_proxy`
+/// back-mirror stays in sync; this converges to the single op once the
+/// proxy retires (R3.5).  `EmptyDictStrategy.pop` does NOT hash the key
+/// (`:783-787` returns default / raises KeyError directly).
+///
+/// Returns `Ok(Some(value))` on hit, `Ok(None)` on miss (caller
+/// handles default/KeyError), or `Err(DictKeyError)` on hash error.
+///
+/// # Safety
+/// `obj`, `key` must be valid PyObjectRef.
+pub unsafe fn w_dict_pop_checked(
+    obj: PyObjectRef,
+    key: PyObjectRef,
+) -> Result<Option<PyObjectRef>, DictKeyError> {
+    if is_module_dict(obj) {
+        match w_module_dict_lookup_inner_checked(obj, key)? {
+            Some(val) => {
+                w_dict_delitem(obj, key);
+                Ok(Some(val))
+            }
+            None => Ok(None),
+        }
+    } else {
+        let strategy = (*(obj as *const W_DictObject)).dstrategy;
+        match strategy.pop(obj, key, None) {
+            Ok(val) => {
+                if crate::dict_eq_hook::take_hash_error().is_some() {
+                    return Err(DictKeyError);
+                }
+                Ok(Some(val))
+            }
+            Err(()) => {
+                if crate::dict_eq_hook::take_hash_error().is_some() {
+                    return Err(DictKeyError);
+                }
+                Ok(None)
+            }
+        }
+    }
 }
 
 /// Internal helper: `ObjectDictStrategy::setitem` body for pyre's

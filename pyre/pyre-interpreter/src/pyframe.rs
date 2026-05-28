@@ -2059,11 +2059,55 @@ impl PyFrame {
         Self::new_for_call_with_closure(code, args, globals, execution_context, PY_NULL)
     }
 
+    pub fn new_for_call_with_globals_obj(
+        code: *const (),
+        args: &[PyObjectRef],
+        globals: *mut DictStorage,
+        w_globals_obj: PyObjectRef,
+        execution_context: *const PyExecutionContext,
+    ) -> Self {
+        Self::new_for_call_with_closure_and_globals_obj(
+            code,
+            args,
+            globals,
+            w_globals_obj,
+            execution_context,
+            PY_NULL,
+        )
+    }
+
     /// Create a new frame for a function call with a closure.
     pub fn new_for_call_with_closure(
         code: *const (),
         args: &[PyObjectRef],
         globals: *mut DictStorage,
+        execution_context: *const PyExecutionContext,
+        closure: PyObjectRef,
+    ) -> Self {
+        let w_globals_obj = if globals.is_null() {
+            PY_NULL
+        } else {
+            crate::baseobjspace::dict_storage_to_dict(globals)
+        };
+        Self::new_for_call_with_closure_and_globals_obj(
+            code,
+            args,
+            globals,
+            w_globals_obj,
+            execution_context,
+            closure,
+        )
+    }
+
+    /// PyPy `space.createframe(code, function.w_func_globals, function)`.
+    /// The semantic globals carrier is the dict object.  `globals` is kept
+    /// only as pyre's legacy raw-storage side channel for code paths that
+    /// have not yet migrated off `PyFrame.w_globals`.
+    pub fn new_for_call_with_closure_and_globals_obj(
+        code: *const (),
+        args: &[PyObjectRef],
+        globals: *mut DictStorage,
+        w_globals_obj: PyObjectRef,
         execution_context: *const PyExecutionContext,
         closure: PyObjectRef,
     ) -> Self {
@@ -2110,19 +2154,10 @@ impl PyFrame {
         let stores_global =
             unsafe { crate::w_code_frame_stores_global(code as PyObjectRef, globals) };
 
-        let w_builtin = crate::baseobjspace::pick_builtin(globals, execution_context);
-        // R3.3a prep: eagerly resolve the canonical W_DictObject sibling
-        // so the trace-time JIT seed (state.rs concrete_namespace +
-        // pending PYFRAME_W_GLOBALS_OBJ_OFFSET vable cutover) observes
-        // a non-null PyObjectRef without going through the &mut self
-        // `get_w_globals_obj` lazy resolver.  Matches the documented
-        // invariant on `PyFrame::w_globals_obj` (pyframe.rs:121-128) and
-        // the other constructors (`new_with_namespace`, `new_minimal`,
-        // `createframe` callsite) which already resolve eagerly.
-        let w_globals_obj = if globals.is_null() {
-            PY_NULL
+        let w_builtin = if w_globals_obj.is_null() {
+            crate::baseobjspace::pick_builtin(globals, execution_context)
         } else {
-            crate::baseobjspace::dict_storage_to_dict(globals)
+            crate::baseobjspace::pick_builtin_obj(w_globals_obj, execution_context)
         };
         let mut frame = PyFrame {
             execution_context,

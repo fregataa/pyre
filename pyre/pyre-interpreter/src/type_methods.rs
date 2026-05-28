@@ -1892,103 +1892,81 @@ pub fn dict_method_copy(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 /// CPython 3.x signature accepts a single optional positional that is
 /// either a mapping (uses keys()) or an iterable of (key, value) pairs,
 /// followed by arbitrary kwargs that are merged on top.  The trailing
+/// `dictmultiobject.py:1378-1398 update1` — merge `w_data` into
+/// `w_dict`.  Shared by `dict.__init__` and `dict.update`.
+pub(crate) fn dict_update1(w_dict: PyObjectRef, w_data: PyObjectRef) -> Result<(), crate::PyError> {
+    let dict = resolve_dict_backing(w_dict);
+    if dict.is_null() {
+        return Ok(());
+    }
+    let other_raw = resolve_dict_backing(w_data);
+    unsafe {
+        let fast_path_eligible = other_raw.is_null() == false
+            && pyre_object::is_dict(other_raw)
+            && dict_subclass_uses_default_iter(w_data);
+        if fast_path_eligible {
+            // `dictmultiobject.py:1401-1406 update1_dict_dict`
+            let dst_is_empty = pyre_object::dictmultiobject::w_dict_is_regular_empty_no_proxy(dict);
+            let src_proxy_free = pyre_object::w_dict_get_dict_storage_proxy(other_raw).is_null();
+            if dst_is_empty && src_proxy_free {
+                let w_copy = pyre_object::dictmultiobject::w_dict_copy(other_raw);
+                pyre_object::dictmultiobject::w_dict_adopt_regular_copy_for_empty_update(
+                    dict, w_copy,
+                );
+            } else {
+                for (k, v) in pyre_object::w_dict_items(other_raw) {
+                    dict_store_checked(dict, k, v)?;
+                }
+            }
+        } else {
+            // `dictmultiobject.py:1388-1398 update1`
+            let w_keys_method = match crate::baseobjspace::getattr(w_data, "keys") {
+                Ok(value) => Some(value),
+                Err(e) if e.kind == crate::PyErrorKind::AttributeError => None,
+                Err(e) => return Err(e),
+            };
+            if let Some(w_method) = w_keys_method {
+                // `dictmultiobject.py:1421-1424 update1_keys`
+                let w_keys_view = crate::call::call_function_impl_result(w_method, &[])?;
+                let keys = crate::builtins::collect_iterable(w_keys_view)?;
+                for k in keys {
+                    let v = crate::baseobjspace::getitem(w_data, k)?;
+                    dict_store_checked(dict, k, v)?;
+                }
+            } else {
+                // `dictmultiobject.py:1410-1418 update1_pairs`
+                let pairs = crate::builtins::collect_iterable(w_data)?;
+                for (idx, pair) in pairs.into_iter().enumerate() {
+                    let entries = crate::builtins::collect_iterable(pair)?;
+                    if entries.len() != 2 {
+                        return Err(crate::PyError::value_error(format!(
+                            "dictionary update sequence element #{idx} has length {}; 2 is required",
+                            entries.len()
+                        )));
+                    }
+                    dict_store_checked(dict, entries[0], entries[1])?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `__pyre_kw__`-marked dict is the kwargs vehicle pyre's CALL_KW
 /// emits for builtin callees (`call.rs:727-744`).
 pub fn dict_method_update(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty(), "dict.update() needs the receiver");
     let (positional, kwargs_dict) = crate::builtins::split_builtin_kwargs(args);
-    // `pypy/objspace/std/dictmultiobject.py:1428` —
-    // `descr_update(self, w_other=None, **kwargs)`.  The signature
-    // accepts at most one extra positional after `self`; PyPy's
-    // gateway raises TypeError on the second one.  Pyre's flat ABI
-    // would otherwise silently ignore positional args past index 1.
+    // `dictmultiobject.py:1430-1435 init_or_update`
     if positional.len() > 2 {
         return Err(crate::PyError::type_error(format!(
             "update expected at most 1 argument, got {}",
             positional.len() - 1
         )));
     }
-    let dict = resolve_dict_backing(positional[0]);
-    if dict.is_null() {
-        return Ok(w_none());
-    }
+    let dict = positional[0];
     if let Some(other) = positional.get(1).copied() {
-        let other_raw = resolve_dict_backing(other);
-        unsafe {
-            // `dictmultiobject.py:1380-1387 update1` — the
-            // `W_DictMultiObject` fast path runs only when (a) `w_data`
-            // is a real dict AND (b) its type's `__iter__` is still
-            // `dict.__iter__`.  A subclass that overrides `__iter__`
-            // must round-trip through the slower `keys()` branch so the
-            // override is observable.
-            let fast_path_eligible = !other_raw.is_null()
-                && pyre_object::is_dict(other_raw)
-                && dict_subclass_uses_default_iter(other);
-            if fast_path_eligible {
-                // `dictmultiobject.py:1401-1406 update1_dict_dict` —
-                // when the destination is on EmptyDictStrategy,
-                // transplant the source's strategy + dstorage instead
-                // of iterating items.  Skipped for module dicts and
-                // proxy-attached dicts (TODO: bring to parity) because their
-                // Rust layouts / storage mirrors are not self-contained.
-                // Falls through to the item-loop otherwise (matches
-                // `:1407 else: rev_update1_dict_dict`).
-                let dst_is_empty =
-                    pyre_object::dictmultiobject::w_dict_is_regular_empty_no_proxy(dict);
-                let src_proxy_free =
-                    pyre_object::w_dict_get_dict_storage_proxy(other_raw).is_null();
-                if dst_is_empty && src_proxy_free {
-                    let w_copy = pyre_object::dictmultiobject::w_dict_copy(other_raw);
-                    pyre_object::dictmultiobject::w_dict_adopt_regular_copy_for_empty_update(
-                        dict, w_copy,
-                    );
-                } else {
-                    // `dictmultiobject.py:1407 rev_update1_dict_dict` —
-                    // walk the source items.  Proxy-attached source
-                    // dicts route through the union-view item walk so
-                    // entries living only in the proxy survive.
-                    for (k, v) in pyre_object::w_dict_items(other_raw) {
-                        dict_store_checked(dict, k, v)?;
-                    }
-                }
-            } else {
-                // `dictmultiobject.py:1388-1398 update1` — when the
-                // source has a `keys()` method, iterate the keys and
-                // copy `o[k]` into the dict (the general
-                // mapping-protocol path).  Otherwise fall through to
-                // the iterable-of-pairs path.
-                let w_keys_method = match crate::baseobjspace::getattr(other, "keys") {
-                    Ok(value) => Some(value),
-                    Err(e) if e.kind == crate::PyErrorKind::AttributeError => None,
-                    Err(e) => return Err(e),
-                };
-                if let Some(w_method) = w_keys_method {
-                    let w_keys_view = crate::call::call_function_impl_result(w_method, &[])?;
-                    let keys = crate::builtins::collect_iterable(w_keys_view)?;
-                    for k in keys {
-                        let v = crate::baseobjspace::getitem(other, k)?;
-                        dict_store_checked(dict, k, v)?;
-                    }
-                } else {
-                    // `dictmultiobject.py:1410-1416 update1_pairs` —
-                    // unpack each item to exactly two elements.  Error
-                    // message includes the element index per
-                    // `:1414-1415 "dictionary update sequence element
-                    // #%d has length %d; 2 is required"`.
-                    let pairs = crate::builtins::collect_iterable(other)?;
-                    for (idx, pair) in pairs.into_iter().enumerate() {
-                        let entries = crate::builtins::collect_iterable(pair)?;
-                        if entries.len() != 2 {
-                            return Err(crate::PyError::value_error(format!(
-                                "dictionary update sequence element #{idx} has length {}; 2 is required",
-                                entries.len()
-                            )));
-                        }
-                        dict_store_checked(dict, entries[0], entries[1])?;
-                    }
-                }
-            }
-        }
+        dict_update1(dict, other)?;
     }
     if let Some(kwargs) = kwargs_dict {
         unsafe {
@@ -1996,11 +1974,11 @@ pub fn dict_method_update(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
                 if pyre_object::is_str(k) && pyre_object::w_str_get_value(k) == "__pyre_kw__" {
                     continue;
                 }
-                dict_store_checked(dict, k, v)?;
+                dict_store_checked(resolve_dict_backing(dict), k, v)?;
             }
         }
     }
-    dict_sync_dict_storage_proxy(dict);
+    dict_sync_dict_storage_proxy(resolve_dict_backing(dict));
     Ok(w_none())
 }
 
@@ -2072,34 +2050,24 @@ fn dict_sync_dict_storage_proxy(dict: PyObjectRef) {
     }
 }
 
-/// PyPy: dictobject.py descr_pop
+/// `dictmultiobject.py:246-255 descr_pop` →
+/// `strategy.pop(self, w_key, w_default)` — single-operation pop
+/// via strategy dispatch (one hash).
 pub fn dict_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() >= 2, "dict.pop() takes at least 1 argument");
     let dict = resolve_dict_backing(args[0]);
     let key = args[1];
     let default = args.get(2).copied();
     if !dict.is_null() {
-        // `dictmultiobject.py:246-255 descr_pop` delegates to
-        // `strategy.pop`.  EmptyDictStrategy.pop (`:783-787`) returns
-        // the provided default, or raises KeyError, without hashing the
-        // key.  Do that before the checked lookup path, whose
-        // EmptyDictStrategy getitem parity intentionally hashes.
-        if unsafe { pyre_object::dictmultiobject::w_dict_is_empty_strategy(dict) } {
-            return default.ok_or_else(|| crate::PyError::key_error_with_key(key));
-        }
-        if let Some(val) = dict_lookup_checked(dict, key)? {
-            // Non-empty fallback until the full strategy.pop hook is
-            // present in DictStrategy: remove via the strategy dispatch
-            // after the successful lookup.
-            unsafe { pyre_object::dictmultiobject::w_dict_delitem(dict, key) };
-            return Ok(val);
+        unsafe {
+            match pyre_object::dictmultiobject::w_dict_pop_checked(dict, key) {
+                Ok(Some(val)) => return Ok(val),
+                Ok(None) => {}
+                Err(_) => return Err(crate::baseobjspace::take_pending_hash_error()),
+            }
         }
     }
-    if let Some(d) = default {
-        Ok(d)
-    } else {
-        Err(crate::PyError::key_error_with_key(key))
-    }
+    default.ok_or_else(|| crate::PyError::key_error_with_key(key))
 }
 
 /// `pypy/objspace/std/dictmultiobject.py:1395 W_DictMultiObject.descr_popitem`:
@@ -2136,16 +2104,19 @@ pub fn dict_method_popitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
     }
 }
 
+/// `dictmultiobject.py:267-269 descr_setdefault` →
+/// `self.setdefault(w_key, w_default)` — delegates to
+/// `strategy.setdefault` as a single atomic operation (one hash).
 pub fn dict_method_setdefault(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() >= 2);
     let dict = resolve_dict_backing(args[0]);
     let key = args[1];
     let default = args.get(2).copied().unwrap_or_else(w_none);
     if !dict.is_null() {
-        if let Some(existing) = dict_lookup_checked(dict, key)? {
-            return Ok(existing);
+        unsafe {
+            return pyre_object::dictmultiobject::w_dict_setdefault_checked(dict, key, default)
+                .map_err(|_| crate::baseobjspace::take_pending_hash_error());
         }
-        dict_store_checked(dict, key, default)?;
     }
     Ok(default)
 }
@@ -2196,6 +2167,12 @@ mod dict_method_tests {
 
     #[test]
     fn dict_setdefault_rejects_unhashable_key() {
+        // `dictmultiobject.py:749-753 EmptyDictStrategy.setdefault`:
+        //   self.switch_to_correct_strategy(w_dict, w_key)
+        //   w_dict.setitem(w_key, w_default)
+        // `w_dict.setitem` hashes the key via the object strategy's
+        // `space.hash_w`, so an unhashable key raises TypeError before
+        // anything is stored — the dict stays empty.
         install_hash_hook();
         let dict = w_dict_new();
         let key = w_list_new(vec![]);

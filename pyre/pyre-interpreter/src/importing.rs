@@ -14147,8 +14147,7 @@ fn relative_import(
 ) -> Result<PyObjectRef, crate::PyError> {
     // Get the package name from the calling module's globals.
     // PyPy: pkgname = globals.get('__package__') or globals.get('__name__')
-    let package = resolve_package_name(w_globals);
-    let package = package.ok_or_else(|| crate::PyError {
+    let package = resolve_package_name(w_globals)?.ok_or_else(|| crate::PyError {
         kind: crate::PyErrorKind::ImportError,
         message: "attempted relative import with no known parent package".to_string(),
         exc_object: std::ptr::null_mut(),
@@ -14190,39 +14189,41 @@ fn relative_import(
 ///
 /// PyPy: importing.py — checks __package__ first, falls back to __name__,
 /// strips the last component if __name__ has dots (module in a package).
-fn resolve_package_name(w_globals: PyObjectRef) -> Option<String> {
+fn resolve_package_name(w_globals: PyObjectRef) -> Result<Option<String>, crate::PyError> {
     if w_globals.is_null() {
-        return None;
+        return Ok(None);
     }
-    let ns = w_globals as *const crate::DictStorage;
-    let ns = unsafe { &*ns };
 
+    // `space.finditem_str` (baseobjspace.py:870-878) maps only KeyError to a
+    // missing entry; any other `__getitem__` error (a dict-subclass globals
+    // raising) must propagate.  `?` re-raises it; `if let Some(..)` consumes
+    // the present case.
     // Try __package__ first (PyPy: space.finditem_str(w_globals, '__package__'))
-    if let Some(&pkg) = ns.get("__package__") {
+    if let Some(pkg) = crate::baseobjspace::finditem_str(w_globals, "__package__")? {
         if !pkg.is_null() && unsafe { pyre_object::is_str(pkg) } {
             let s = unsafe { pyre_object::w_str_get_value(pkg) };
             if !s.is_empty() {
-                return Some(s.to_string());
+                return Ok(Some(s.to_string()));
             }
         }
     }
 
     // Fallback: __name__ (for modules inside packages)
-    if let Some(&name_obj) = ns.get("__name__") {
+    if let Some(name_obj) = crate::baseobjspace::finditem_str(w_globals, "__name__")? {
         if !name_obj.is_null() && unsafe { pyre_object::is_str(name_obj) } {
             let name = unsafe { pyre_object::w_str_get_value(name_obj) };
             // If the module has a __path__, it's a package — use __name__ as-is
-            if ns.get("__path__").is_some() {
-                return Some(name.to_string());
+            if crate::baseobjspace::finditem_str(w_globals, "__path__")?.is_some() {
+                return Ok(Some(name.to_string()));
             }
             // Otherwise strip the last component (module name within package)
             if let Some(dot) = name.rfind('.') {
-                return Some(name[..dot].to_string());
+                return Ok(Some(name[..dot].to_string()));
             }
         }
     }
 
-    None
+    Ok(None)
 }
 
 // ── import_from ──────────────────────────────────────────────────────

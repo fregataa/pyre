@@ -229,6 +229,14 @@ pub struct MiniMarkGC {
     threshold_bytes_made_old: usize,
     /// Pinned nursery objects that must not be moved during minor collection.
     pinned_objects: VecSet<usize>,
+    /// minimark.py:338 `nursery_objects_shadows = AddressDict()`.
+    /// Maps nursery object payload address → pre-allocated old-gen
+    /// shadow payload address.  When `id()` or `identityhash()` is
+    /// called on a nursery object, a shadow is allocated in old-gen
+    /// and registered here.  `copy_nursery_object` copies to the
+    /// shadow instead of a fresh allocation.  Cleared after each
+    /// minor collection.
+    nursery_objects_shadows: std::collections::HashMap<usize, usize>,
     /// Registry of compiled code regions for GC root scanning.
     pub compiled_code_registry: CompiledCodeRegistry,
     /// llsupport/gc.py:563 vtable→typeid mapping. RPython derives this
@@ -284,6 +292,7 @@ impl MiniMarkGC {
             bytes_made_old_since_cycle: 0,
             threshold_bytes_made_old: 0,
             pinned_objects: VecSet::new(),
+            nursery_objects_shadows: std::collections::HashMap::new(),
             compiled_code_registry: CompiledCodeRegistry::new(),
             vtable_to_type_id: VecAssoc::new(),
             _infobits_offset: 0,
@@ -715,6 +724,41 @@ impl MiniMarkGC {
             self.invalidate_young_weakrefs();
         }
 
+        // incminimark.py:1871-1884: clear the shadow map now that all
+        // nursery objects have been forwarded (or died).  Without pinned
+        // objects every nursery object was dragged out (into its shadow
+        // if any), so the whole map is dropped.  But pinned objects stay
+        // in the nursery, so a shadow handed out by `id_or_identityhash`
+        // is their stable identity address and MUST survive the clear —
+        // otherwise the next `id_or_identityhash` re-allocates a fresh
+        // shadow and the identity hash changes across collections
+        // (`record_pinned_object_with_shadow`).
+        if !self.nursery_objects_shadows.is_empty() {
+            if self.pinned_objects.is_empty() {
+                self.nursery_objects_shadows.clear();
+            } else {
+                let pinned = &self.pinned_objects;
+                let marking = self.incr_state.marking_in_progress;
+                self.nursery_objects_shadows
+                    .retain(|obj_addr, shadow_addr| {
+                        let keep = pinned.contains(obj_addr);
+                        if keep && marking {
+                            // incminimark.py:1745-1752
+                            // record_pinned_object_with_shadow: during the
+                            // marking phase keep the retained shadow black so
+                            // the in-progress sweep does not reclaim the
+                            // pinned object's reserved identity address.  Safe
+                            // because pinned objects hold no gcptrs, so the
+                            // shadow needs no further tracing.
+                            unsafe {
+                                (*header_of(*shadow_addr)).set_flag(flags::VISITED);
+                            }
+                        }
+                        keep
+                    });
+            }
+        }
+
         // Reset nursery for new allocations, preserving pinned objects.
         if self.pinned_objects.is_empty() {
             self.nursery.reset();
@@ -792,6 +836,63 @@ impl MiniMarkGC {
         }
     }
 
+    /// minimark.py:1859-1881 `_allocate_shadow(obj)`.
+    /// Allocate a shadow copy in old-gen for a nursery object.  The
+    /// shadow's tid is copied from the nursery object; for varsize
+    /// objects the length field is also copied.  The nursery header
+    /// gets GCFLAG_HAS_SHADOW so `_find_shadow` knows to look it up.
+    fn allocate_shadow(&mut self, obj_addr: usize) -> usize {
+        let hdr_ptr = (obj_addr - GcHeader::SIZE) as *const GcHeader;
+        let type_id = unsafe { (*hdr_ptr).type_id() };
+        let type_info = self.types.get(type_id);
+        let payload_size = if type_info.item_size > 0 {
+            let length = unsafe { *((obj_addr + type_info.length_offset) as *const usize) };
+            type_info.total_instance_size(length)
+        } else {
+            type_info.size
+        };
+        let total_size = GcHeader::SIZE + payload_size;
+        let shadow_hdr_ptr = self.oldgen.alloc(total_size);
+        let shadow_obj = shadow_hdr_ptr as usize + GcHeader::SIZE;
+        unsafe {
+            (*(shadow_hdr_ptr as *mut GcHeader)).tid_and_flags = (*hdr_ptr).tid_and_flags;
+            if type_info.item_size > 0 {
+                let len_ofs = type_info.length_offset;
+                *((shadow_obj + len_ofs) as *mut usize) = *((obj_addr + len_ofs) as *const usize);
+            }
+            let nursery_hdr = (obj_addr - GcHeader::SIZE) as *mut GcHeader;
+            (*nursery_hdr).set_flag(flags::HAS_SHADOW);
+        }
+        self.nursery_objects_shadows.insert(obj_addr, shadow_obj);
+        shadow_obj
+    }
+
+    /// minimark.py:1883-1897 `_find_shadow(obj)`.
+    /// Return the shadow address for a nursery object, allocating one
+    /// if this is the first request.
+    fn find_shadow(&mut self, obj_addr: usize) -> usize {
+        let hdr = unsafe { *((obj_addr - GcHeader::SIZE) as *const GcHeader) };
+        if hdr.has_flag(flags::HAS_SHADOW) {
+            if let Some(&shadow) = self.nursery_objects_shadows.get(&obj_addr) {
+                return shadow;
+            }
+        }
+        self.allocate_shadow(obj_addr)
+    }
+
+    /// minimark.py:1900-1915 `id_or_identityhash(gcobj)`.
+    /// Return a stable address usable as identity hash.  For nursery
+    /// objects, returns the shadow's address (which is where the object
+    /// will be copied to at the next minor collection).  For old-gen
+    /// objects, returns the object's own address (old-gen objects don't
+    /// move in mark-sweep).
+    pub fn id_or_identityhash(&mut self, obj_addr: usize) -> usize {
+        if self.is_in_nursery(obj_addr) {
+            return self.find_shadow(obj_addr);
+        }
+        obj_addr
+    }
+
     /// Copy a single nursery object to old gen.
     /// If already forwarded, returns the forwarding address.
     /// Pinned objects are left in place and returned as-is.
@@ -838,12 +939,31 @@ impl MiniMarkGC {
         let total_size = GcHeader::SIZE + actual_payload_size;
         let has_gc_ptrs = type_info.has_gc_ptrs;
 
-        // Allocate in old gen and copy.
+        // minimark.py:1513-1519: if the object has a pre-allocated
+        // shadow (from id() or identityhash()), copy into it instead
+        // of a fresh allocation.
         let header_ptr = obj_addr - GcHeader::SIZE;
-        // Safety: header_ptr points to a valid nursery object of total_size bytes.
-        let new_header_ptr = unsafe {
-            self.oldgen
-                .alloc_and_copy(header_ptr as *const u8, total_size)
+        let new_header_ptr = if unsafe { (*hdr_ptr).has_flag(flags::HAS_SHADOW) } {
+            if let Some(&shadow_obj) = self.nursery_objects_shadows.get(&obj_addr) {
+                let shadow_hdr = (shadow_obj - GcHeader::SIZE) as *mut u8;
+                // minimark.py:1518-1520: clear HAS_SHADOW before copy so the
+                // flag does not propagate to the shadow object itself.
+                unsafe { (*hdr_ptr).clear_flag(flags::HAS_SHADOW) };
+                unsafe {
+                    std::ptr::copy_nonoverlapping(header_ptr as *const u8, shadow_hdr, total_size);
+                }
+                shadow_hdr
+            } else {
+                unsafe {
+                    self.oldgen
+                        .alloc_and_copy(header_ptr as *const u8, total_size)
+                }
+            }
+        } else {
+            unsafe {
+                self.oldgen
+                    .alloc_and_copy(header_ptr as *const u8, total_size)
+            }
         };
         let new_obj_addr = new_header_ptr as usize + GcHeader::SIZE;
         self.bytes_made_old_since_cycle =
@@ -1962,6 +2082,10 @@ impl GcAllocator for MiniMarkGC {
 
     fn collect_full(&mut self) {
         self.do_collect_full();
+    }
+
+    fn id_or_identityhash(&mut self, obj_addr: usize) -> usize {
+        self.id_or_identityhash(obj_addr)
     }
 
     unsafe fn add_root(&mut self, root: *mut GcRef) {

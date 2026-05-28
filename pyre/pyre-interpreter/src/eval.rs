@@ -1124,8 +1124,15 @@ impl NamespaceOpcodeHandler for PyFrame {
         _nameindex: usize,
         value: Self::Value,
     ) -> Result<(), PyError> {
-        let ns = unsafe { &mut *self.get_w_globals() };
-        dict_storage_store(ns, name, value);
+        let w_globals_obj = self.get_w_globals_obj();
+        if !w_globals_obj.is_null() {
+            unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str(w_globals_obj, name, value);
+            }
+        } else {
+            let ns = unsafe { &mut *self.get_w_globals() };
+            dict_storage_store(ns, name, value);
+        }
         Ok(())
     }
 
@@ -2087,7 +2094,7 @@ impl OpcodeStepExecutor for PyFrame {
 
         let module = crate::importing::importhook(
             name,
-            self.get_w_globals() as PyObjectRef, // for relative imports: __name__/__package__
+            self.get_w_globals_obj(), // for relative imports: __name__/__package__
             w_fromlist,
             level,
             self.execution_context,
@@ -2355,10 +2362,20 @@ impl OpcodeStepExecutor for PyFrame {
             return Ok(());
         }
         // Fall back to globals
-        unsafe {
-            if let Some(&val) = (*self.get_w_globals()).get(name) {
+        let w_globals_obj = self.get_w_globals_obj();
+        if !w_globals_obj.is_null() {
+            if let Some(val) =
+                unsafe { pyre_object::dictmultiobject::w_dict_getitem_str(w_globals_obj, name) }
+            {
                 self.push(val);
                 return Ok(());
+            }
+        } else {
+            unsafe {
+                if let Some(&val) = (*self.get_w_globals()).get(name) {
+                    self.push(val);
+                    return Ok(());
+                }
             }
         }
         Err(PyError::new(
@@ -3068,11 +3085,22 @@ impl OpcodeStepExecutor for PyFrame {
                         pyre_object::w_dict_store(dict, pyre_object::w_str_new(name), value);
                     }
                 }
-                let w_globals = self.get_w_globals();
-                if self.nlocals() == 0 && !w_globals.is_null() {
-                    for (key, &value) in (*w_globals).entries() {
+                let w_globals_obj = self.get_w_globals_obj();
+                if self.nlocals() == 0 && !w_globals_obj.is_null() {
+                    for (key, value) in
+                        unsafe { pyre_object::dictmultiobject::w_dict_items(w_globals_obj) }
+                    {
                         if !value.is_null() {
-                            pyre_object::w_dict_store(dict, pyre_object::w_str_new(key), value);
+                            pyre_object::w_dict_store(dict, key, value);
+                        }
+                    }
+                } else {
+                    let w_globals = self.get_w_globals();
+                    if self.nlocals() == 0 && !w_globals.is_null() {
+                        for (key, &value) in (*w_globals).entries() {
+                            if !value.is_null() {
+                                pyre_object::w_dict_store(dict, pyre_object::w_str_new(key), value);
+                            }
                         }
                     }
                 }

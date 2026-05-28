@@ -1865,8 +1865,8 @@ fn init_str_type(ns: &mut DictStorage) {
 
 fn init_dict_type(ns: &mut DictStorage) {
     dict_storage_store(ns, "__new__", make_new_descr(dict_descr_new));
-    // dict.__init__(self, mapping_or_iterable=None, **kwargs)
-    // PyPy: W_DictMultiObject.descr_init
+    // `dictmultiobject.py:137-138 descr_init` →
+    // `init_or_update(space, self, __args__, 'dict')`
     dict_storage_store(
         ns,
         "__init__",
@@ -1874,43 +1874,29 @@ fn init_dict_type(ns: &mut DictStorage) {
             if args.is_empty() {
                 return Ok(pyre_object::w_none());
             }
-            let self_dict = args[0];
-            // Process positional arg (mapping or iterable of pairs)
-            // Process each arg: may be positional mapping/iterable or kwargs dict
-            for arg_idx in 1..args.len() {
-                let src = args[arg_idx];
+            let (positional, kwargs_dict) = crate::builtins::split_builtin_kwargs(args);
+            // `dictmultiobject.py:1431-1435 init_or_update` —
+            // at most 1 positional arg after self
+            if positional.len() > 2 {
+                return Err(crate::PyError::type_error(format!(
+                    "dict expected at most 1 argument, got {}",
+                    positional.len() - 1,
+                )));
+            }
+            let self_dict = positional[0];
+            if let Some(src) = positional.get(1).copied() {
+                crate::type_methods::dict_update1(self_dict, src)?;
+            }
+            // `dictmultiobject.py:1442-1443` — merge kwargs
+            if let Some(kw) = kwargs_dict {
                 unsafe {
-                    if pyre_object::is_dict(src) {
-                        let marker =
-                            pyre_object::w_dict_lookup(src, pyre_object::w_str_new("__pyre_kw__"));
-                        if marker.is_some() {
-                            // kwargs dict — merge excluding marker
-                            for (k, v) in pyre_object::w_dict_items(src) {
-                                if pyre_object::is_str(k)
-                                    && pyre_object::w_str_get_value(k) == "__pyre_kw__"
-                                {
-                                    continue;
-                                }
-                                crate::type_methods::dict_store_checked(self_dict, k, v)?;
-                            }
-                        } else {
-                            for (k, v) in pyre_object::w_dict_items(src) {
-                                crate::type_methods::dict_store_checked(self_dict, k, v)?;
-                            }
+                    for (k, v) in pyre_object::w_dict_items(kw) {
+                        if pyre_object::is_str(k)
+                            && pyre_object::w_str_get_value(k) == "__pyre_kw__"
+                        {
+                            continue;
                         }
-                    } else {
-                        if let Ok(keys_method) = crate::baseobjspace::getattr(src, "keys") {
-                            let keys_obj = crate::call_function(keys_method, &[]);
-                            if let Ok(keys) = crate::builtins::collect_iterable(keys_obj) {
-                                for key in keys {
-                                    if let Ok(val) = crate::baseobjspace::getitem(src, key) {
-                                        crate::type_methods::dict_store_checked(
-                                            self_dict, key, val,
-                                        )?;
-                                    }
-                                }
-                            }
-                        }
+                        crate::type_methods::dict_store_checked(self_dict, k, v)?;
                     }
                 }
             }

@@ -2025,13 +2025,15 @@ fn _flat_pycall(
     // call.rs:423-424 parity — increment call depth for JIT depth tracking.
     let _depth_guard = crate::call::increment_call_depth();
     let globals = unsafe { function_get_globals(func) };
+    let w_globals_obj = unsafe { function_get_globals_obj(func) };
     let closure = unsafe { function_get_closure(func) };
 
     // function.py:208-209 — createframe(code, w_func_globals, self)
-    let mut new_frame = crate::pyframe::PyFrame::new_for_call_with_closure(
+    let mut new_frame = crate::pyframe::PyFrame::new_for_call_with_closure_and_globals_obj(
         code,
         &[], // locals filled below directly from stack
         globals,
+        w_globals_obj,
         frame.execution_context,
         closure,
     );
@@ -2086,12 +2088,14 @@ fn _flat_pycall_defaults(
 ) -> PyObjectRef {
     let _depth_guard = crate::call::increment_call_depth();
     let globals = unsafe { function_get_globals(func) };
+    let w_globals_obj = unsafe { function_get_globals_obj(func) };
     let closure = unsafe { function_get_closure(func) };
 
-    let mut new_frame = crate::pyframe::PyFrame::new_for_call_with_closure(
+    let mut new_frame = crate::pyframe::PyFrame::new_for_call_with_closure_and_globals_obj(
         code,
         &[], // locals filled below
         globals,
+        w_globals_obj,
         frame.execution_context,
         closure,
     );

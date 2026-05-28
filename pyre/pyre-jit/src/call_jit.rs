@@ -37,8 +37,8 @@ fn pyre_probe_bh_startup_enabled() -> bool {
 
 use pyre_interpreter::bytecode::{Instruction, OpArgState};
 use pyre_interpreter::{
-    PyResult, function_get_closure, function_get_defaults, function_get_globals, function_get_name,
-    is_function, register_jit_function_caller,
+    PyResult, function_get_closure, function_get_defaults, function_get_globals,
+    function_get_globals_obj, function_get_name, is_function, register_jit_function_caller,
 };
 use pyre_object::intobject::w_int_get_value;
 use pyre_object::intobject::w_int_new;
@@ -402,18 +402,29 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
     // warmspot.py:1021 assembler_call_helper parity: the callee frame
     // (deadframe) may be a nursery-allocated JitFrame-like block. We
     // reconstruct a proper interpreter frame from its raw fields.
-    let (code, namespace, exec_ctx) = unsafe {
+    let (code, namespace, w_globals_obj, exec_ctx) = unsafe {
         use pyre_interpreter::pyframe::*;
         let p = frame_ptr as *const u8;
         let code = *(p.add(PYFRAME_PYCODE_OFFSET) as *const *const ());
         let ns = *(p.add(std::mem::offset_of!(PyFrame, w_globals))
             as *const *mut pyre_interpreter::DictStorage);
+        let w_globals_obj =
+            *(p.add(PYFRAME_W_GLOBALS_OBJ_OFFSET) as *const pyre_object::PyObjectRef);
         let ec = *(p.add(std::mem::offset_of!(PyFrame, execution_context))
             as *const *const pyre_interpreter::PyExecutionContext);
-        (code, ns, ec)
+        (code, ns, w_globals_obj, ec)
+    };
+    let namespace = if namespace.is_null() && !w_globals_obj.is_null() {
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_get_dict_storage_proxy(w_globals_obj)
+                as *mut pyre_interpreter::DictStorage
+        }
+    } else {
+        namespace
     };
 
-    let mut func_frame = PyFrame::new_for_call(code, &[], namespace, exec_ctx);
+    let mut func_frame =
+        PyFrame::new_for_call_with_globals_obj(code, &[], namespace, w_globals_obj, exec_ctx);
     func_frame.fix_array_ptrs();
 
     // warmspot.py:1021-1028 assembler_call_helper:
@@ -484,7 +495,7 @@ fn resolve_field_offset(owner: &str, field_name: &str) -> usize {
         "locals_cells_stack_w" => std::mem::offset_of!(PyFrame, locals_cells_stack_w),
         "valuestackdepth" => std::mem::offset_of!(PyFrame, valuestackdepth),
         "next_instr" | "f_lasti" | "last_instr" => std::mem::offset_of!(PyFrame, last_instr),
-        "namespace" | "w_globals" => std::mem::offset_of!(PyFrame, w_globals),
+        "namespace" | "w_globals" => std::mem::offset_of!(PyFrame, w_globals_obj),
         "vable_token" => std::mem::offset_of!(PyFrame, vable_token),
         _ => {
             if majit_metainterp::majit_log_enabled() {
@@ -2767,6 +2778,7 @@ fn create_callee_frame_impl_1_boxed(
     let w_code = unsafe { pyre_interpreter::getcode(callable) };
     let caller = unsafe { &*(caller_frame as *const PyFrame) };
     let globals = unsafe { function_get_globals(callable) };
+    let w_globals_obj = unsafe { function_get_globals_obj(callable) };
     let one_arg = [boxed_arg];
     let args = fill_positional_defaults_for_jit_call(callable, w_code, &one_arg);
     let args = args.as_ref();
@@ -2777,6 +2789,7 @@ fn create_callee_frame_impl_1_boxed(
             let f = unsafe { &mut *ptr };
             if f.pycode == w_code
                 && f.w_globals == globals
+                && f.w_globals_obj == w_globals_obj
                 && f.execution_context == caller.execution_context
             {
                 reset_reused_call_frame(f, args);
@@ -2788,7 +2801,13 @@ fn create_callee_frame_impl_1_boxed(
                     std::ptr::drop_in_place(ptr);
                     std::ptr::write(
                         ptr,
-                        PyFrame::new_for_call(w_code, args, globals, caller.execution_context),
+                        PyFrame::new_for_call_with_globals_obj(
+                            w_code,
+                            args,
+                            globals,
+                            w_globals_obj,
+                            caller.execution_context,
+                        ),
                     );
                     (&mut *ptr).fix_array_ptrs();
                 }
@@ -2797,7 +2816,13 @@ fn create_callee_frame_impl_1_boxed(
             unsafe {
                 std::ptr::write(
                     ptr,
-                    PyFrame::new_for_call(w_code, args, globals, caller.execution_context),
+                    PyFrame::new_for_call_with_globals_obj(
+                        w_code,
+                        args,
+                        globals,
+                        w_globals_obj,
+                        caller.execution_context,
+                    ),
                 );
                 (&mut *ptr).fix_array_ptrs();
             }
@@ -2806,10 +2831,11 @@ fn create_callee_frame_impl_1_boxed(
         return ptr as i64;
     }
 
-    let frame_ptr = heap_alloc_frame(PyFrame::new_for_call(
+    let frame_ptr = heap_alloc_frame(PyFrame::new_for_call_with_globals_obj(
         w_code,
         args,
         globals,
+        w_globals_obj,
         caller.execution_context,
     ));
     unsafe { &mut *frame_ptr }.fix_array_ptrs();
@@ -2823,6 +2849,7 @@ fn create_self_recursive_callee_frame_impl_1_boxed(
     let caller = unsafe { &*(caller_frame as *const PyFrame) };
     let func_code = caller.pycode;
     let globals = caller.w_globals;
+    let w_globals_obj = caller.w_globals_obj;
     let execution_context = caller.execution_context;
 
     let arena = arena_ref();
@@ -2831,6 +2858,7 @@ fn create_self_recursive_callee_frame_impl_1_boxed(
             let f = unsafe { &mut *ptr };
             if f.pycode == func_code
                 && f.w_globals == globals
+                && f.w_globals_obj == w_globals_obj
                 && f.execution_context == execution_context
             {
                 // Reuse: same code/globals/ec — full reset matching
@@ -2842,7 +2870,13 @@ fn create_self_recursive_callee_frame_impl_1_boxed(
                     std::ptr::drop_in_place(ptr);
                     std::ptr::write(
                         ptr,
-                        PyFrame::new_for_call(func_code, &[boxed_arg], globals, execution_context),
+                        PyFrame::new_for_call_with_globals_obj(
+                            func_code,
+                            &[boxed_arg],
+                            globals,
+                            w_globals_obj,
+                            execution_context,
+                        ),
                     );
                     (&mut *ptr).fix_array_ptrs();
                 }
@@ -2851,7 +2885,13 @@ fn create_self_recursive_callee_frame_impl_1_boxed(
             unsafe {
                 std::ptr::write(
                     ptr,
-                    PyFrame::new_for_call(func_code, &[boxed_arg], globals, execution_context),
+                    PyFrame::new_for_call_with_globals_obj(
+                        func_code,
+                        &[boxed_arg],
+                        globals,
+                        w_globals_obj,
+                        execution_context,
+                    ),
                 );
                 (&mut *ptr).fix_array_ptrs();
             }
@@ -2867,10 +2907,11 @@ fn create_self_recursive_callee_frame_impl_1_boxed(
         return ptr as i64;
     }
 
-    let frame_ptr = heap_alloc_frame(PyFrame::new_for_call(
+    let frame_ptr = heap_alloc_frame(PyFrame::new_for_call_with_globals_obj(
         func_code,
         &[boxed_arg],
         globals,
+        w_globals_obj,
         execution_context,
     ));
     unsafe { &mut *frame_ptr }.fix_array_ptrs();
@@ -2889,6 +2930,7 @@ fn create_callee_frame_impl(caller_frame: i64, callable: i64, args: &[PyObjectRe
     let w_code = unsafe { pyre_interpreter::getcode(callable) };
     let caller = unsafe { &*(caller_frame as *const PyFrame) };
     let globals = unsafe { function_get_globals(callable) };
+    let w_globals_obj = unsafe { function_get_globals_obj(callable) };
     let args = fill_positional_defaults_for_jit_call(callable, w_code, args);
     let args = args.as_ref();
 
@@ -2901,6 +2943,7 @@ fn create_callee_frame_impl(caller_frame: i64, callable: i64, args: &[PyObjectRe
             let f = unsafe { &mut *ptr };
             if f.pycode == w_code
                 && f.w_globals == globals
+                && f.w_globals_obj == w_globals_obj
                 && f.execution_context == caller.execution_context
             {
                 reset_reused_call_frame(f, args);
@@ -2910,7 +2953,13 @@ fn create_callee_frame_impl(caller_frame: i64, callable: i64, args: &[PyObjectRe
                     std::ptr::drop_in_place(ptr);
                     std::ptr::write(
                         ptr,
-                        PyFrame::new_for_call(w_code, args, globals, caller.execution_context),
+                        PyFrame::new_for_call_with_globals_obj(
+                            w_code,
+                            args,
+                            globals,
+                            w_globals_obj,
+                            caller.execution_context,
+                        ),
                     );
                     (&mut *ptr).fix_array_ptrs();
                 }
@@ -2920,7 +2969,13 @@ fn create_callee_frame_impl(caller_frame: i64, callable: i64, args: &[PyObjectRe
             unsafe {
                 std::ptr::write(
                     ptr,
-                    PyFrame::new_for_call(w_code, args, globals, caller.execution_context),
+                    PyFrame::new_for_call_with_globals_obj(
+                        w_code,
+                        args,
+                        globals,
+                        w_globals_obj,
+                        caller.execution_context,
+                    ),
                 );
                 (&mut *ptr).fix_array_ptrs();
             }
@@ -2930,10 +2985,11 @@ fn create_callee_frame_impl(caller_frame: i64, callable: i64, args: &[PyObjectRe
     }
 
     // Arena full: heap fallback (should not happen for recursion < 64)
-    let frame_ptr = heap_alloc_frame(PyFrame::new_for_call(
+    let frame_ptr = heap_alloc_frame(PyFrame::new_for_call_with_globals_obj(
         w_code,
         args,
         globals,
+        w_globals_obj,
         caller.execution_context,
     ));
     unsafe { &mut *frame_ptr }.fix_array_ptrs();
@@ -2986,6 +3042,7 @@ pub extern "C" fn jit_create_self_recursive_callee_frame_1_raw_int(
     let caller = unsafe { &*(caller_frame as *const PyFrame) };
     let func_code = caller.pycode;
     let globals = caller.w_globals;
+    let w_globals_obj = caller.w_globals_obj;
     let execution_context = caller.execution_context;
 
     let boxed = pyre_object::intobject::w_int_new(raw_int_arg);
@@ -2996,6 +3053,7 @@ pub extern "C" fn jit_create_self_recursive_callee_frame_1_raw_int(
         if was_init
             && f.pycode == func_code
             && f.w_globals == globals
+            && f.w_globals_obj == w_globals_obj
             && f.execution_context == execution_context
         {
             // Reuse: full reset matching new_for_call semantics.
@@ -3007,7 +3065,13 @@ pub extern "C" fn jit_create_self_recursive_callee_frame_1_raw_int(
                 }
                 std::ptr::write(
                     ptr,
-                    PyFrame::new_for_call(func_code, &[boxed], globals, execution_context),
+                    PyFrame::new_for_call_with_globals_obj(
+                        func_code,
+                        &[boxed],
+                        globals,
+                        w_globals_obj,
+                        execution_context,
+                    ),
                 );
                 (&mut *ptr).fix_array_ptrs();
             }
@@ -3029,10 +3093,11 @@ pub extern "C" fn jit_create_self_recursive_callee_frame_1_raw_int(
         return ptr as i64;
     }
 
-    let frame_ptr = heap_alloc_frame(PyFrame::new_for_call(
+    let frame_ptr = heap_alloc_frame(PyFrame::new_for_call_with_globals_obj(
         func_code,
         &[boxed],
         globals,
+        w_globals_obj,
         execution_context,
     ));
     unsafe { &mut *frame_ptr }.fix_array_ptrs();
@@ -3507,15 +3572,24 @@ pub extern "C" fn bh_load_global_fn(
     }
 
     let varname = code.names[idx].as_ref();
-    let w_globals = unsafe { &*(namespace_ptr as *const pyre_interpreter::DictStorage) };
+    let w_globals_obj = namespace_ptr as pyre_object::PyObjectRef;
     // pypy/interpreter/pyopcode.py:958-969 `_load_global`:
     //   w_value = self.space.finditem_str(self.get_w_globals(), varname)
     //   if w_value is None:
     //       w_value = self.get_builtin().getdictvalue(self.space, varname)
     //       if w_value is None:
     //           self._load_global_failed(w_varname)
-    if let Some(&w_value) = pyre_interpreter::dict_storage_get(w_globals, varname).as_ref() {
-        return w_value as i64;
+    //
+    // Dispatch through the dict strategy on the globals object
+    // (`dictmultiobject.py:113-115 getitem_str`) so module dicts and
+    // plain dicts (exec/eval globals, no dict_storage_proxy) are both
+    // handled — matching the interpreter `load_global_value`.
+    if !w_globals_obj.is_null() {
+        if let Some(w_value) =
+            unsafe { pyre_object::dictmultiobject::w_dict_getitem_str(w_globals_obj, varname) }
+        {
+            return w_value as i64;
+        }
     }
 
     // Residual helper adaptation: `self` is the live portal frame passed as

@@ -8,7 +8,7 @@ use std::sync::OnceLock;
 
 use crate::{
     DictStorage, PyError, PyResult, builtin_code_get, dispatch_callable, function_get_closure,
-    function_get_globals,
+    function_get_globals, function_get_globals_obj,
 };
 
 struct FrameLocalsRoot {
@@ -416,6 +416,7 @@ fn call_user_function_with_eval(
 ) -> PyResult {
     let w_code = unsafe { crate::getcode(callable) };
     let globals = unsafe { function_get_globals(callable) };
+    let w_globals_obj = unsafe { function_get_globals_obj(callable) };
     let closure = unsafe { function_get_closure(callable) };
     let func_code = unsafe {
         crate::w_code_get_ptr(w_code as pyre_object::PyObjectRef) as *const crate::CodeObject
@@ -430,10 +431,11 @@ fn call_user_function_with_eval(
         .flags
         .intersects(crate::CodeFlags::GENERATOR | crate::CodeFlags::COROUTINE)
     {
-        let mut gen_frame = PyFrame::new_for_call_with_closure(
+        let mut gen_frame = PyFrame::new_for_call_with_closure_and_globals_obj(
             w_code,
             &final_args,
             globals,
+            w_globals_obj,
             frame.execution_context,
             closure,
         );
@@ -441,10 +443,11 @@ fn call_user_function_with_eval(
         return gen_frame.run();
     }
 
-    let mut func_frame = PyFrame::new_for_call_with_closure(
+    let mut func_frame = PyFrame::new_for_call_with_closure_and_globals_obj(
         w_code,
         &final_args,
         globals,
+        w_globals_obj,
         frame.execution_context,
         closure,
     );
@@ -467,6 +470,7 @@ pub fn call_user_function_resolved(
 
     let w_code = unsafe { crate::getcode(callable) };
     let globals = unsafe { function_get_globals(callable) };
+    let w_globals_obj = unsafe { function_get_globals_obj(callable) };
     let closure = unsafe { function_get_closure(callable) };
     let func_code = unsafe {
         crate::w_code_get_ptr(w_code as pyre_object::PyObjectRef) as *const crate::CodeObject
@@ -478,10 +482,11 @@ pub fn call_user_function_resolved(
         .flags
         .intersects(crate::CodeFlags::GENERATOR | crate::CodeFlags::COROUTINE)
     {
-        let mut gen_frame = PyFrame::new_for_call_with_closure(
+        let mut gen_frame = PyFrame::new_for_call_with_closure_and_globals_obj(
             w_code,
             args,
             globals,
+            w_globals_obj,
             frame.execution_context,
             closure,
         );
@@ -491,8 +496,14 @@ pub fn call_user_function_resolved(
 
     let eval_fn = get_eval_fn();
 
-    let mut func_frame =
-        PyFrame::new_for_call_with_closure(w_code, args, globals, frame.execution_context, closure);
+    let mut func_frame = PyFrame::new_for_call_with_closure_and_globals_obj(
+        w_code,
+        args,
+        globals,
+        w_globals_obj,
+        frame.execution_context,
+        closure,
+    );
     func_frame.fix_array_ptrs();
     let _caller_locals_root = FrameLocalsRoot::new(frame);
     let _callee_locals_root = FrameLocalsRoot::new_mut(&mut func_frame);
@@ -619,6 +630,7 @@ pub fn call_user_function_plain_with_ctx(
 ) -> PyResult {
     let w_code = unsafe { crate::getcode(callable) };
     let globals = unsafe { function_get_globals(callable) };
+    let w_globals_obj = unsafe { function_get_globals_obj(callable) };
     let closure = unsafe { function_get_closure(callable) };
     let func_code = unsafe {
         crate::w_code_get_ptr(w_code as pyre_object::PyObjectRef) as *const crate::CodeObject
@@ -630,10 +642,11 @@ pub fn call_user_function_plain_with_ctx(
         .flags
         .intersects(crate::CodeFlags::GENERATOR | crate::CodeFlags::COROUTINE)
     {
-        let mut gen_frame = PyFrame::new_for_call_with_closure(
+        let mut gen_frame = PyFrame::new_for_call_with_closure_and_globals_obj(
             w_code,
             &final_args,
             globals,
+            w_globals_obj,
             execution_context,
             closure,
         );
@@ -641,10 +654,11 @@ pub fn call_user_function_plain_with_ctx(
         return gen_frame.run();
     }
 
-    let mut func_frame = PyFrame::new_for_call_with_closure(
+    let mut func_frame = PyFrame::new_for_call_with_closure_and_globals_obj(
         w_code,
         &final_args,
         globals,
+        w_globals_obj,
         execution_context,
         closure,
     );
@@ -1327,11 +1341,13 @@ pub fn call_with_kwargs(
 
             // Create frame and execute
             let globals = unsafe { function_get_globals(callable) };
+            let w_globals_obj = unsafe { function_get_globals_obj(callable) };
             let closure = unsafe { function_get_closure(callable) };
-            let mut func_frame = crate::pyframe::PyFrame::new_for_call_with_closure(
+            let mut func_frame = crate::pyframe::PyFrame::new_for_call_with_closure_and_globals_obj(
                 w_code,
                 &final_args,
                 globals,
+                w_globals_obj,
                 frame.execution_context,
                 closure,
             );
@@ -1680,6 +1696,7 @@ fn issubtype_ptr(w_type: PyObjectRef, cls: PyObjectRef) -> bool {
 fn call_user_function_with_args(func: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRef {
     let w_code = unsafe { crate::getcode(func) };
     let globals = unsafe { function_get_globals(func) };
+    let w_globals_obj = unsafe { function_get_globals_obj(func) };
     let closure = unsafe { function_get_closure(func) };
     let func_code = unsafe {
         crate::w_code_get_ptr(w_code as pyre_object::PyObjectRef) as *const crate::CodeObject
@@ -1705,8 +1722,14 @@ fn call_user_function_with_args(func: PyObjectRef, args: &[PyObjectRef]) -> PyOb
         .flags
         .intersects(crate::CodeFlags::GENERATOR | crate::CodeFlags::COROUTINE)
     {
-        let mut gen_frame =
-            PyFrame::new_for_call_with_closure(w_code, &final_args, globals, exec_ctx, closure);
+        let mut gen_frame = PyFrame::new_for_call_with_closure_and_globals_obj(
+            w_code,
+            &final_args,
+            globals,
+            w_globals_obj,
+            exec_ctx,
+            closure,
+        );
         gen_frame.fix_array_ptrs();
         return match gen_frame.run() {
             Ok(v) => v,
@@ -1717,8 +1740,14 @@ fn call_user_function_with_args(func: PyObjectRef, args: &[PyObjectRef]) -> PyOb
         };
     }
 
-    let mut frame =
-        PyFrame::new_for_call_with_closure(w_code, &final_args, globals, exec_ctx, closure);
+    let mut frame = PyFrame::new_for_call_with_closure_and_globals_obj(
+        w_code,
+        &final_args,
+        globals,
+        w_globals_obj,
+        exec_ctx,
+        closure,
+    );
     frame.fix_array_ptrs();
     match frame.execute_frame(None, None) {
         Ok(v) => v,
@@ -1903,6 +1932,7 @@ fn build_class_inner(
 ) -> PyResult {
     let w_code = unsafe { crate::getcode(body_fn) };
     let globals = unsafe { function_get_globals(body_fn) };
+    let w_globals_obj = unsafe { function_get_globals_obj(body_fn) };
     let closure = unsafe { function_get_closure(body_fn) };
     let func_code = unsafe {
         crate::w_code_get_ptr(w_code as pyre_object::PyObjectRef) as *const crate::CodeObject
@@ -2004,7 +2034,14 @@ fn build_class_inner(
         }
     }
 
-    let mut frame = PyFrame::new_for_call_with_closure(w_code, &[], globals, exec_ctx, closure);
+    let mut frame = PyFrame::new_for_call_with_closure_and_globals_obj(
+        w_code,
+        &[],
+        globals,
+        w_globals_obj,
+        exec_ctx,
+        closure,
+    );
     frame.setdictscope(class_ns_ptr)?;
 
     frame.execute_frame(None, None)?;

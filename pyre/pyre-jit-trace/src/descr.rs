@@ -1389,7 +1389,7 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             ),
             (
                 "PyFrame.w_globals",
-                crate::frame_layout::PYFRAME_W_GLOBALS_OFFSET,
+                crate::frame_layout::PYFRAME_W_GLOBALS_OBJ_OFFSET,
                 8,
                 Type::Ref,
                 false,
@@ -1977,6 +1977,20 @@ pub fn pyframe_dict_storage_descr() -> DescrRef {
 /// into this entry after retiring the adjacent raw slot.
 pub fn pyframe_w_globals_obj_descr() -> DescrRef {
     field_descr_from_group(&PYFRAME_DESCR_GROUP, 12)
+}
+
+/// R3.3-b: `W_ModuleDictObject.dict_storage_proxy` field — a raw
+/// `*mut DictStorage` pointer set during module init and stable
+/// for the object's lifetime.  Used by `frame_get_namespace` to
+/// chase from `w_globals_obj` (a W_ModuleDictObject) to the
+/// DictStorage that `load/store_namespace_value` reads.
+pub fn module_dict_storage_proxy_descr() -> DescrRef {
+    make_immutable_field_descr(
+        pyre_object::dictmultiobject::W_MODULE_DICT_STORAGE_PROXY_OFFSET,
+        8,
+        Type::Ref,
+        false,
+    )
 }
 
 /// rewrite.py:665-695 handle_call_assembler scalar field read for the

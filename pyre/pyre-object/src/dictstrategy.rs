@@ -140,6 +140,33 @@ pub trait DictStrategy {
     /// `w_dict` must be a valid PyObjectRef.
     unsafe fn items(&self, w_dict: PyObjectRef) -> Vec<(PyObjectRef, PyObjectRef)>;
 
+    /// `dictmultiobject.py:624-634 DictStrategy.pop` — remove and
+    /// return the value for `w_key`.  Returns `Ok(value)` on hit,
+    /// `Ok(w_default)` on miss when a default is provided, or
+    /// `Err(())` on miss without default (caller raises KeyError).
+    ///
+    /// # Safety
+    /// `w_dict` and `w_key` must be valid PyObjectRef.
+    unsafe fn pop(
+        &self,
+        w_dict: PyObjectRef,
+        w_key: PyObjectRef,
+        w_default: Option<PyObjectRef>,
+    ) -> Result<PyObjectRef, ()> {
+        // dictmultiobject.py:624-634
+        let w_item = self.getitem(w_dict, w_key);
+        if let Some(val) = w_item {
+            if self.delitem(w_dict, w_key) == false {
+                return Err(());
+            }
+            Ok(val)
+        } else if let Some(d) = w_default {
+            Ok(d)
+        } else {
+            Err(())
+        }
+    }
+
     /// `dictmultiobject.py:536-546 popitem` — remove and return the
     /// most recently inserted (key, value) pair.  Python 3.7+ `popitem`
     /// is LIFO (`pypy/objspace/std/dictmultiobject.py:1395
@@ -706,6 +733,32 @@ impl DictStrategy for EmptyDictStrategy {
         // MEMORY as the "hash hook error propagation" epic.
         let _ = crate::dict_eq_hook::try_hash_w(w_key);
         None
+    }
+
+    // dictmultiobject.py:749-753
+    unsafe fn setdefault(
+        &self,
+        w_dict: PyObjectRef,
+        w_key: PyObjectRef,
+        w_value: PyObjectRef,
+    ) -> PyObjectRef {
+        self.switch_to_correct_strategy(w_dict, w_key);
+        crate::dictmultiobject::w_dict_store(w_dict, w_key, w_value);
+        w_value
+    }
+
+    // dictmultiobject.py:783-787
+    unsafe fn pop(
+        &self,
+        _w_dict: PyObjectRef,
+        _w_key: PyObjectRef,
+        w_default: Option<PyObjectRef>,
+    ) -> Result<PyObjectRef, ()> {
+        if let Some(d) = w_default {
+            Ok(d)
+        } else {
+            Err(())
+        }
     }
 
     unsafe fn setitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef, w_value: PyObjectRef) {

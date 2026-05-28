@@ -153,7 +153,14 @@ impl pyre_interpreter::NamespaceOpcodeHandler for crate::state::MIFrame {
         _nameindex: usize,
     ) -> Result<Self::Value, pyre_interpreter::PyError> {
         use crate::helpers::TraceHelperAccess;
-        let ns = crate::state::concrete_dict_storage(self.sym().concrete_namespace);
+        let w_globals_obj = self.sym().concrete_namespace;
+        // `celldict.py:287-322 _LOAD_GLOBAL_cached`: under the JIT the
+        // cell/slot fast path is gated on `isinstance(w_globals,
+        // W_ModuleDictObject)`; plain dict globals fall through to
+        // `_load_global` (`space.finditem_str`).  `module_dict_slot_storage`
+        // returns null for non-module dicts so they take the name-based
+        // path whose emitted IR is layout-agnostic.
+        let ns = crate::state::module_dict_slot_storage(w_globals_obj);
         let Some(slot) = crate::state::dict_storage_slot_direct(ns, name) else {
             let frame = self.trace_frame();
             let globals = self.trace_globals_ptr();
@@ -161,30 +168,21 @@ impl pyre_interpreter::NamespaceOpcodeHandler for crate::state::MIFrame {
                 crate::helpers::emit_trace_load_name_from_namespace(ctx, frame, globals, name)
             });
             // `pyopcode.py:958-967 _load_global`: concrete value at
-            // trace time must mirror the extern's full fallback chain
-            // — globals first, then frame.get_builtin().getdictvalue.
-            // Reading `dict_storage_get(ns, name)` alone produces a
-            // null concrete for any builtin hit, which would let
-            // downstream record_known_result mis-fold the result.
-            let result_concrete = if ns.is_null() {
-                crate::state::ConcreteValue::Null
-            } else {
-                unsafe {
-                    let mut obj = pyre_interpreter::dict_storage_get(&*ns, name)
-                        .unwrap_or(std::ptr::null_mut());
-                    if obj.is_null() {
-                        let frame_ptr = self.concrete_frame_addr as i64;
-                        let name_bytes = name.as_bytes();
-                        obj = crate::helpers::jit_load_name_from_namespace(
-                            frame_ptr,
-                            ns as i64,
-                            name_bytes.as_ptr() as i64,
-                            name_bytes.len() as i64,
-                        ) as pyre_object::PyObjectRef;
-                    }
-                    crate::state::ConcreteValue::from_pyobj(obj)
-                }
-            };
+            // trace time mirrors the extern's full fallback chain —
+            // globals strategy dispatch, then
+            // frame.get_builtin().getdictvalue.  `jit_load_name_from_namespace`
+            // performs exactly that chain (and null-checks globals), so
+            // it gives the correct concrete for module dicts, plain
+            // dict globals, and builtin hits alike.
+            let frame_ptr = self.concrete_frame_addr as i64;
+            let name_bytes = name.as_bytes();
+            let obj = crate::helpers::jit_load_name_from_namespace(
+                frame_ptr,
+                w_globals_obj as i64,
+                name_bytes.as_ptr() as i64,
+                name_bytes.len() as i64,
+            ) as pyre_object::PyObjectRef;
+            let result_concrete = crate::state::ConcreteValue::from_pyobj(obj);
             return Ok(crate::state::FrontendOp::new(opref, result_concrete));
         };
         let concrete_cv = crate::state::dict_storage_value_direct(ns, slot);
@@ -201,7 +199,7 @@ impl pyre_interpreter::NamespaceOpcodeHandler for crate::state::MIFrame {
                 // 3. CALL_PURE_R(helper, ns, slot) — elidable lookup;
                 //    record_result_of_call_pure folds via OptPure lookup_known_result.
                 let opref = self.with_ctx(|_this, ctx| {
-                    let ns_const = ctx.const_ref(ns as i64);
+                    let ns_const = ctx.const_ref(w_globals_obj as i64);
                     let slot_const = ctx.const_int(slot as i64);
                     ctx.record_op(majit_ir::OpCode::QuasiimmutField, &[ns_const, slot_const]);
                     let lookup_fn = crate::helpers::jit_namespace_slot_lookup as *const ();
@@ -217,7 +215,7 @@ impl pyre_interpreter::NamespaceOpcodeHandler for crate::state::MIFrame {
                     );
                     let concrete_args = crate::helpers::namespace_slot_lookup_values(
                         lookup_fn,
-                        ns,
+                        w_globals_obj,
                         slot,
                     );
                     let concrete_result =
@@ -247,7 +245,13 @@ impl pyre_interpreter::NamespaceOpcodeHandler for crate::state::MIFrame {
         value: Self::Value,
     ) -> Result<(), pyre_interpreter::PyError> {
         use crate::helpers::TraceHelperAccess;
-        let ns = crate::state::concrete_dict_storage(self.sym().concrete_namespace);
+        // `celldict.py:328-333 STORE_GLOBAL_cached`: under the JIT the
+        // cell/slot path is bypassed for plain dict globals;
+        // `module_dict_slot_storage` returns null for non-module dicts so
+        // they take the name-based store (`space.setitem_str`) whose IR
+        // is layout-agnostic.  The slot store IR (`store_namespace_value`)
+        // reads the W_ModuleDictObject proxy offset, valid only here.
+        let ns = crate::state::module_dict_slot_storage(self.sym().concrete_namespace);
         let Some(slot) = crate::state::dict_storage_slot_direct(ns, name) else {
             let globals = self.trace_globals_ptr();
             return self.with_trace_ctx(|ctx| {

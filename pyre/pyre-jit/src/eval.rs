@@ -135,6 +135,10 @@ fn pyre_object_gc_current_object_address_trampoline(addr: usize) -> usize {
     majit_gc::gc_current_object_address(addr)
 }
 
+fn pyre_object_gc_identity_hash_trampoline(addr: usize) -> usize {
+    majit_gc::gc_id_or_identityhash(addr)
+}
+
 fn pyre_object_gc_write_barrier_trampoline(obj: *mut u8) {
     majit_gc::gc_write_barrier(majit_ir::GcRef(obj as usize));
 }
@@ -1697,6 +1701,9 @@ thread_local! {
             pyre_object_gc_current_object_address_trampoline,
         );
         pyre_object::register_gc_write_barrier_hook(pyre_object_gc_write_barrier_trampoline);
+        pyre_object::gc_hook::register_gc_identity_hash_hook(
+            pyre_object_gc_identity_hash_trampoline,
+        );
         // Fix 9 — `dictmultiobject.py:1209 ObjectDictStrategy` key
         // dispatch: register the `space.eq_w` trampoline so
         // `dict_keys_equal` honours user-defined `__eq__`.
@@ -7016,7 +7023,7 @@ mod tests {
             vable_valuestackdepth: ctx.const_int(1),
             vable_debugdata: ctx.const_ref(frame.debugdata as usize as i64),
             vable_lastblock: ctx.const_ref(frame.lastblock as usize as i64),
-            vable_w_globals: ctx.const_ref(frame.w_globals as usize as i64),
+            vable_w_globals: ctx.const_ref(frame.w_globals_obj as usize as i64),
         }
     }
 
@@ -7114,14 +7121,14 @@ mod tests {
 
         let ec_value = unsafe { (*(frame_ptr as *const PyFrame)).execution_context as usize };
         let mut values = vec![
-            Value::Ref(GcRef(frame_ptr)),                // frame
-            Value::Ref(GcRef(ec_value)),                 // ec extra red
-            Value::Int(8),                               // last_instr
-            Value::Ref(GcRef(frame.pycode as usize)),    // pycode
-            Value::Int(4),                               // valuestackdepth
-            Value::Ref(GcRef(0)),                        // debugdata
-            Value::Ref(GcRef(0)),                        // lastblock
-            Value::Ref(GcRef(frame.w_globals as usize)), // w_globals
+            Value::Ref(GcRef(frame_ptr)),                    // frame
+            Value::Ref(GcRef(ec_value)),                     // ec extra red
+            Value::Int(8),                                   // last_instr
+            Value::Ref(GcRef(frame.pycode as usize)),        // pycode
+            Value::Int(4),                                   // valuestackdepth
+            Value::Ref(GcRef(0)),                            // debugdata
+            Value::Ref(GcRef(0)),                            // lastblock
+            Value::Ref(GcRef(frame.w_globals_obj as usize)), // w_globals
         ];
         for reg in live_regs.iter() {
             match *reg {
@@ -7425,7 +7432,7 @@ mod tests {
                 vable_valuestackdepth: ctx.const_int(1),
                 vable_debugdata: ctx.const_ref(frame.debugdata as usize as i64),
                 vable_lastblock: ctx.const_ref(frame.lastblock as usize as i64),
-                vable_w_globals: ctx.const_ref(frame.w_globals as usize as i64),
+                vable_w_globals: ctx.const_ref(frame.w_globals_obj as usize as i64),
             });
             let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, resume_pc, resume_pc);
 
@@ -7663,7 +7670,7 @@ mod tests {
                 vable_valuestackdepth: ctx.const_int(4),
                 vable_debugdata: ctx.const_ref(frame.debugdata as usize as i64),
                 vable_lastblock: ctx.const_ref(frame.lastblock as usize as i64),
-                vable_w_globals: ctx.const_ref(frame.w_globals as usize as i64),
+                vable_w_globals: ctx.const_ref(frame.w_globals_obj as usize as i64),
             });
             trace_state::seed_compiled_trace_jitcode_test_state(
                 &mut sym,
@@ -7807,7 +7814,7 @@ mod tests {
             vable_valuestackdepth: ctx.const_int(4),
             vable_debugdata: ctx.const_ref(frame.debugdata as usize as i64),
             vable_lastblock: ctx.const_ref(frame.lastblock as usize as i64),
-            vable_w_globals: ctx.const_ref(frame.w_globals as usize as i64),
+            vable_w_globals: ctx.const_ref(frame.w_globals_obj as usize as i64),
         });
         trace_state::seed_compiled_trace_jitcode_test_state(
             &mut sym,
@@ -7931,7 +7938,7 @@ mod tests {
             vable_valuestackdepth: ctx.const_int(3),
             vable_debugdata: ctx.const_ref(frame.debugdata as usize as i64),
             vable_lastblock: ctx.const_ref(frame.lastblock as usize as i64),
-            vable_w_globals: ctx.const_ref(frame.w_globals as usize as i64),
+            vable_w_globals: ctx.const_ref(frame.w_globals_obj as usize as i64),
         });
         let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, target_pc, target_pc);
 

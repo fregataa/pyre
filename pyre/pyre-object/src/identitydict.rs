@@ -27,7 +27,7 @@ pub struct IdentityKey(pub PyObjectRef);
 impl std::hash::Hash for IdentityKey {
     #[inline]
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        (self.0 as usize).hash(state);
+        crate::gc_hook::gc_identity_hash(self.0 as usize).hash(state);
     }
 }
 
@@ -225,43 +225,15 @@ impl DictStrategy for IdentityDictStrategy {
     /// the pointer.  Trace `key.0` through an unsafe pointer cast so a
     /// minor collection keeps each identity key's referent alive.
     ///
-    /// GC-move bucket rehash: `IdentityKey`'s `Hash` impl is
-    /// `(self.0 as usize).hash(state)`, so when a minor collection
-    /// promotes / relocates a key from young to old gen
-    /// (`majit-gc/src/collector.rs:1652 pin_nursery_object`), the
-    /// IndexMap's bucket placement (computed at insert from the old
-    /// pointer) no longer agrees with the post-trace pointer's hash.
-    /// Subsequent lookups with the new pointer would probe a different
-    /// bucket and miss.  PyPy's IdentityDictStrategy is backed by an
-    /// RPython dict whose object-default hash routes through
-    /// `compute_identity_hash` — that hash is cached in the GC header
-    /// and survives moves, so PyPy's bucket placement stays consistent
-    /// without any explicit rehash.  Pyre lacks the per-object cached
-    /// id slot (would require widening `PyObject` and threading the
-    /// allocator), so the soundness is enforced here at trace time:
-    /// detect any moved key and rebuild the IndexMap in place so every
-    /// bucket gets recomputed from the new pointer.  `IndexMap::drain`
-    /// preserves insertion order, and re-inserting reuses the cleared
-    /// allocation, so the rebuild is O(n) and only fires when at least
-    /// one key actually moved.
+    /// Hash is now stable across GC moves via `gc_identity_hash`
+    /// (shadow-based, minimark.py:1900-1915), so no rehash is needed.
+    /// Trace key and value pointers so the GC updates them in place.
     unsafe fn walk_gc_refs(&self, w_dict: PyObjectRef, visitor: &mut dyn FnMut(*mut PyObjectRef)) {
         let entries = identity_storage_mut(w_dict);
-        let mut needs_rehash = false;
         for (k, v) in entries.iter_mut() {
             let key_ptr = k as *const IdentityKey as *mut IdentityKey;
-            let before = (*key_ptr).0;
             visitor(std::ptr::addr_of_mut!((*key_ptr).0));
-            let after = (*key_ptr).0;
-            if !std::ptr::eq(before, after) {
-                needs_rehash = true;
-            }
             visitor(v as *mut PyObjectRef);
-        }
-        if needs_rehash {
-            let drained: Vec<(IdentityKey, PyObjectRef)> = entries.drain(..).collect();
-            for (k, v) in drained {
-                entries.insert(k, v);
-            }
         }
     }
 }

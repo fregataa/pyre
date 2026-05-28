@@ -231,6 +231,34 @@ pub fn try_gc_current_object_address(addr: *mut u8) -> *mut u8 {
     })
 }
 
+/// minimark.py:1900-1915 `identityhash` hook.
+/// Returns a GC-move-stable address for the given object.
+pub type GcIdentityHashHookFn = fn(obj_addr: usize) -> usize;
+
+thread_local! {
+    static GC_IDENTITY_HASH_HOOK: Cell<Option<GcIdentityHashHookFn>> = const { Cell::new(None) };
+}
+
+pub fn register_gc_identity_hash_hook(hook: GcIdentityHashHookFn) {
+    GC_IDENTITY_HASH_HOOK.with(|cell| cell.set(Some(hook)));
+}
+
+pub fn clear_gc_identity_hash_hook() {
+    GC_IDENTITY_HASH_HOOK.with(|cell| cell.set(None));
+}
+
+/// Return a stable identity hash for `obj_addr`.  When the hook is
+/// installed, nursery objects get a shadow-based stable address;
+/// old-gen objects return their own address.  When no hook is
+/// installed, returns `obj_addr` unchanged (pre-GC fallback).
+#[inline]
+pub fn gc_identity_hash(obj_addr: usize) -> usize {
+    GC_IDENTITY_HASH_HOOK.with(|cell| match cell.get() {
+        Some(f) => f(obj_addr),
+        None => obj_addr,
+    })
+}
+
 /// Signature of the host-side write barrier callback. `obj` is the
 /// GC-managed object whose field is being updated with a possible young
 /// pointer. The backend decides whether `obj` is old enough to require

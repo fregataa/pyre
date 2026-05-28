@@ -1387,7 +1387,7 @@ use crate::descr::{
 };
 use crate::frame_layout::{
     PYFRAME_DEBUGDATA_OFFSET, PYFRAME_LASTBLOCK_OFFSET, PYFRAME_LOCALS_CELLS_STACK_OFFSET,
-    PYFRAME_PYCODE_OFFSET, PYFRAME_VALUESTACKDEPTH_OFFSET, PYFRAME_W_GLOBALS_OFFSET,
+    PYFRAME_PYCODE_OFFSET, PYFRAME_VALUESTACKDEPTH_OFFSET, PYFRAME_W_GLOBALS_OBJ_OFFSET,
 };
 use crate::helpers::emit_box_float_inline;
 
@@ -1873,9 +1873,8 @@ pub(crate) fn frame_locals_cells_stack_descr() -> DescrRef {
     crate::descr::pyframe_locals_cells_stack_descr()
 }
 
-pub(crate) fn frame_dict_storage_descr() -> DescrRef {
-    crate::descr::pyframe_dict_storage_descr()
-}
+// R3.3: frame_dict_storage_descr retired — frame_get_namespace now
+// reads through w_globals_obj → dict_storage_proxy.
 
 pub(crate) fn wrapint(ctx: &mut TraceCtx, value: OpRef) -> OpRef {
     crate::helpers::emit_box_int_inline(ctx, value, w_int_size_descr(), int_intval_descr())
@@ -2625,8 +2624,28 @@ pub(crate) fn trace_raw_float_array_setitem_value(
     );
 }
 
+/// pyframe.py:49 `self.w_globals` — read the canonical dict object
+/// from the frame.  Returns a PyObjectRef (W_DictObject or
+/// W_ModuleDictObject).  FFI helpers that receive namespace_ptr
+/// chase dict_storage_proxy internally.
+pub(crate) fn frame_get_globals_obj(ctx: &mut TraceCtx, frame: OpRef) -> OpRef {
+    ctx.record_op_with_descr(
+        OpCode::GetfieldGcR,
+        &[frame],
+        crate::descr::pyframe_w_globals_obj_descr(),
+    )
+}
+
+/// Read through w_globals_obj → dict_storage_proxy to reach the raw
+/// DictStorage* for slot-based namespace reads (celldict quasiimmut
+/// path).  Only valid when globals is a W_ModuleDictObject.
 pub(crate) fn frame_get_namespace(ctx: &mut TraceCtx, frame: OpRef) -> OpRef {
-    ctx.record_op_with_descr(OpCode::GetfieldGcR, &[frame], frame_dict_storage_descr())
+    let globals_obj = frame_get_globals_obj(ctx, frame);
+    ctx.record_op_with_descr(
+        OpCode::GetfieldGcR,
+        &[globals_obj],
+        crate::descr::module_dict_storage_proxy_descr(),
+    )
 }
 
 /// Read a value from the unified `locals_cells_stack_w` at the given absolute index.
@@ -2717,6 +2736,20 @@ pub(crate) fn concrete_dict_storage(obj: PyObjectRef) -> *mut DictStorage {
                 as *mut DictStorage
         }
     }
+}
+
+/// `celldict.py:317` — the slot-based quasi-immutable global cache is
+/// only valid for `W_ModuleDictObject` globals.  The slot path emits IR
+/// (`frame_get_namespace`) that chases the `W_ModuleDictObject`
+/// `dict_storage_proxy` offset, so plain `W_DictObject` globals
+/// (`exec`/`eval` with a bare dict) must NOT take the slot path.
+/// Returns the module dict's DictStorage proxy when `obj` is a module
+/// dict, else null so callers fall back to the name-based path.
+pub(crate) fn module_dict_slot_storage(obj: PyObjectRef) -> *mut DictStorage {
+    if obj.is_null() || unsafe { pyre_object::dictmultiobject::is_module_dict(obj) } == false {
+        return std::ptr::null_mut();
+    }
+    concrete_dict_storage(obj)
 }
 
 pub(crate) fn dict_storage_slot_direct(ns: *mut DictStorage, name: &str) -> Option<usize> {
@@ -3796,9 +3829,14 @@ impl PyreJitState {
 
     fn namespace_ptr(&self) -> Option<*mut DictStorage> {
         let frame_ptr = self.frame_ptr()?;
-        let namespace_ptr =
-            unsafe { *(frame_ptr.add(PYFRAME_W_GLOBALS_OFFSET) as *const *mut DictStorage) };
-        (!namespace_ptr.is_null()).then_some(namespace_ptr)
+        let w_globals_obj = unsafe {
+            *(frame_ptr.add(PYFRAME_W_GLOBALS_OBJ_OFFSET) as *const pyre_object::PyObjectRef)
+        };
+        if w_globals_obj.is_null() {
+            return None;
+        }
+        let ds = concrete_dict_storage(w_globals_obj);
+        (!ds.is_null()).then_some(ds)
     }
 
     fn namespace_len(&self) -> usize {
@@ -3946,9 +3984,9 @@ impl PyreJitState {
             .expect("PyreJitState.frame must point to a valid PyFrame")
     }
 
-    /// Read the w_globals pointer from the heap frame.
+    /// Read the w_globals_obj pointer from the heap frame.
     pub fn w_globals_as_usize(&self) -> usize {
-        self.read_frame_usize(PYFRAME_W_GLOBALS_OFFSET)
+        self.read_frame_usize(PYFRAME_W_GLOBALS_OBJ_OFFSET)
             .expect("PyreJitState.frame must point to a valid PyFrame")
     }
 
@@ -3995,10 +4033,10 @@ impl PyreJitState {
         );
     }
 
-    /// Write the w_globals pointer to the heap frame.
+    /// Write the w_globals_obj pointer to the heap frame.
     pub fn set_w_globals(&mut self, value: usize) {
         assert!(
-            self.write_frame_usize(PYFRAME_W_GLOBALS_OFFSET, value),
+            self.write_frame_usize(PYFRAME_W_GLOBALS_OBJ_OFFSET, value),
             "PyreJitState.frame must point to a valid PyFrame"
         );
     }

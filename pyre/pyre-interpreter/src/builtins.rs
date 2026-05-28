@@ -2996,8 +2996,15 @@ fn exec_or_eval(
         unsafe { (*caller_frame).execution_context }
     };
 
-    let mut globals_binding = if !is_none_or_null(globals_arg) {
-        GlobalsBinding::from_user_dict(globals_arg)
+    let implicit_globals_arg = if !is_none_or_null(globals_arg) {
+        globals_arg
+    } else if !caller_frame.is_null() {
+        unsafe { (*caller_frame).get_w_globals_obj() }
+    } else {
+        pyre_object::PY_NULL
+    };
+    let mut globals_binding = if !is_none_or_null(implicit_globals_arg) {
+        GlobalsBinding::from_user_dict(implicit_globals_arg)
     } else {
         GlobalsBinding::empty()
     };
@@ -3031,21 +3038,20 @@ fn exec_or_eval(
         globals_binding.attach_forward_proxy();
     }
     if !globals_ptr.is_null() {
-        // Pass the ORIGINAL `globals_arg` (the user's PyObjectRef —
-        // possibly a dict subclass instance) so eval/exec dispatch
-        // through the same receiver PyPy uses.  When the caller omits
-        // globals, Pyre only has the caller frame's `*mut DictStorage`,
-        // so this falls back to storage-direct seeding.
-        let w_globals_obj = if !is_none_or_null(globals_arg) {
-            globals_arg
-        } else if !caller_frame.is_null() {
-            // Caller-frame globals are kept as `*mut DictStorage`;
-            // there is no PyObjectRef to dispatch through.  Anonymous
-            // path — direct storage write.
-            pyre_object::PY_NULL
-        } else {
-            pyre_object::PY_NULL
-        };
+        // pyopcode.py:807 `space.call_method(w_globals, 'setdefault', ...)`
+        // (exec) and compiling.py:109 `space.contains_w(w_globals, ...)` /
+        // `space.setitem_str(w_globals, ...)` (eval) dispatch on the
+        // ORIGINAL `w_globals` object that `ensure_ns` returned — the
+        // user-supplied dict (possibly a subclass) for the explicit case,
+        // or the caller frame's `get_w_globals()` object for the implicit
+        // case.  Use `implicit_globals_arg`, NOT `globals_binding.backing`:
+        // the latter is `resolve_dict_backing`'s stripped W_DictObject,
+        // which bypasses dict-subclass `setdefault` / `__contains__` /
+        // `__setitem__` overrides.  `globals_ptr` is only pyre's temporary
+        // storage carrier while `PyFrame.w_globals` is still raw, so writes
+        // through the original object propagate to it via the forward proxy
+        // attached above.
+        let w_globals_obj = implicit_globals_arg;
         if is_eval {
             ensure_eval_builtins(unsafe { &mut *globals_ptr }, w_globals_obj, exec_ctx)?;
         } else {
@@ -3132,9 +3138,9 @@ fn exec_or_eval(
         // resolved object is the caller's globals (module-level exec
         // collapses to locals=globals — same-dict shape kept by the
         // module-frame's initialize_frame_scopes binding).
-        let caller_globals = unsafe { (*caller_frame).get_w_globals() };
-        let same_as_globals =
-            !caller_globals.is_null() && std::ptr::eq(globals_ptr, caller_globals);
+        let caller_globals_obj = unsafe { (*caller_frame).get_w_globals_obj() };
+        let same_as_globals = !caller_globals_obj.is_null()
+            && std::ptr::eq(implicit_caller_locals, caller_globals_obj);
         if !same_as_globals {
             frame.setdictscope_object(implicit_caller_locals)?;
         }

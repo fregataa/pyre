@@ -2403,7 +2403,7 @@ impl MIFrame {
         } else {
             (0, 0, 0)
         };
-        let ns_ptr = crate::state::concrete_dict_storage(self.sym().concrete_namespace) as i64;
+        let ns_ptr = self.sym().concrete_namespace as i64;
         // G.4.3a: portal-bridge frames trace eval_loop_jit, so each user
         // opcode is a residual call to execute_opcode_step whose
         // valuestackdepth side-effects do NOT advance `sym.valuestackdepth`.
@@ -6064,6 +6064,7 @@ impl MIFrame {
         let caller_namespace_ptr = self.sym().concrete_namespace;
         let w_code = unsafe { pyre_interpreter::getcode(concrete_callable) };
         let globals = unsafe { function_get_globals(concrete_callable) };
+        let callee_globals_obj = unsafe { function_get_globals_obj(concrete_callable) };
         let closure = unsafe { pyre_interpreter::function_get_closure(concrete_callable) };
         // pyjitpl.py:1396-1401 element-wise greenkey — `(code_ptr, 0)`
         // tuple equality is lossless vs the derived u64 hash.
@@ -6076,10 +6077,11 @@ impl MIFrame {
             passed_concrete_args,
         );
         let concrete_args = concrete_args.as_ref();
-        let mut callee_frame = PyFrame::new_for_call_with_closure(
+        let mut callee_frame = PyFrame::new_for_call_with_closure_and_globals_obj(
             w_code,
             concrete_args,
             globals,
+            callee_globals_obj,
             caller_exec_ctx,
             closure,
         );
@@ -6090,7 +6092,6 @@ impl MIFrame {
         let callee_nlocals =
             callee_code.varnames.len() + pyre_interpreter::pyframe::ncells(callee_code);
         let caller_namespace = caller_namespace_ptr;
-        let callee_globals_obj = unsafe { function_get_globals_obj(concrete_callable) };
         let can_skip_traced_callee_frame = !is_self_recursive
             && callee_globals_obj == caller_namespace
             && concrete_args.len() == args.len()
@@ -6133,7 +6134,10 @@ impl MIFrame {
                     ctx.const_int(callee_nlocals as i64),
                     null, // debugdata = None
                     null, // lastblock = None
-                    ctx.const_ref(globals as i64),
+                    // pyframe.py:128 self.w_globals is the dict OBJECT; the
+                    // vable slot is PYFRAME_W_GLOBALS_OBJ_OFFSET, so seed the
+                    // W_DictObject sibling, not the raw DictStorage*.
+                    ctx.const_ref(callee_globals_obj as i64),
                 )
             });
             sym.vable_last_instr = vable_last_instr;
@@ -8097,7 +8101,7 @@ impl TraceHelperAccess for MIFrame {
     }
 
     fn trace_globals_ptr(&mut self) -> OpRef {
-        self.with_ctx(|this, ctx| frame_get_namespace(ctx, this.frame()))
+        self.with_ctx(|this, ctx| crate::state::frame_get_globals_obj(ctx, this.frame()))
     }
 
     fn trace_record_not_forced_guard(&mut self) {
