@@ -803,6 +803,16 @@ pub trait Repr: Debug + std::any::Any {
         )))
     }
 
+    /// RPython `Repr.get_ll_fasthash_function(self)` (`rmodel.py:142-148`).
+    /// Base returns `None` — hash should be cached in the dict entry.
+    /// Concrete Reprs that alias `get_ll_hash_function` override this.
+    fn get_ll_fasthash_function(
+        &self,
+        _rtyper: &super::rtyper::RPythonTyper,
+    ) -> Result<Option<super::rtyper::LowLevelFunction>, TyperError> {
+        Ok(None)
+    }
+
     /// RPython `make_missing_op(Repr, opname)` (`rmodel.py:330-340`).
     fn missing_rtype_operation(&self, opname: &str) -> TyperError {
         TyperError::missing_rtype_operation(format!(
@@ -1399,6 +1409,56 @@ impl Repr for AddressRepr {
         super::pairtype::ReprClassId::AddressRepr
     }
 
+    /// raddress.py:30-34 `assert type(value) is fakeaddress`
+    fn convert_const(&self, value: &ConstValue) -> Result<Constant, TyperError> {
+        if !matches!(value, ConstValue::LLAddress(_)) {
+            return Err(TyperError::message(format!(
+                "AddressRepr.convert_const: expected LLAddress, got {value:?}",
+            )));
+        }
+        Ok(Constant::with_concretetype(
+            value.clone(),
+            LowLevelType::Address,
+        ))
+    }
+
+    /// raddress.py:41-43
+    fn rtype_getattr(&self, hop: &HighLevelOp) -> RTypeResult {
+        let v_access = hop.inputarg(ConvertedTo::Repr(self), 0)?;
+        Ok(Some(v_access))
+    }
+
+    /// raddress.py:55-56 `return None` — use default pointer equality
+    fn get_ll_eq_function(
+        &self,
+        _rtyper: &super::rtyper::RPythonTyper,
+    ) -> Result<Option<super::rtyper::LowLevelFunction>, TyperError> {
+        Ok(None)
+    }
+
+    /// raddress.py:54-57
+    fn get_ll_hash_function(
+        &self,
+        rtyper: &super::rtyper::RPythonTyper,
+    ) -> Result<Option<super::rtyper::LowLevelFunction>, TyperError> {
+        rtyper
+            .lowlevel_helper_function_with_builder(
+                "ll_addrhash".to_string(),
+                vec![LowLevelType::Address],
+                LowLevelType::Signed,
+                |_rtyper, args, _result| build_ll_addrhash_helper_graph("ll_addrhash", &args[0]),
+            )
+            .map(Some)
+    }
+
+    /// raddress.py:57
+    fn get_ll_fasthash_function(
+        &self,
+        rtyper: &super::rtyper::RPythonTyper,
+    ) -> Result<Option<super::rtyper::LowLevelFunction>, TyperError> {
+        self.get_ll_hash_function(rtyper)
+    }
+
     /// raddress.py:50-53 `adr_ne(addr, NULL)` → Bool
     fn rtype_bool(&self, hop: &HighLevelOp) -> RTypeResult {
         use crate::translator::rtyper::rtyper::GenopResult;
@@ -1421,12 +1481,107 @@ impl fmt::Display for AddressRepr {
     }
 }
 
+/// raddress.py:64-65 `ll_addrhash(addr) = cast_adr_to_int(addr, "forced")`
+fn build_ll_addrhash_helper_graph(
+    name: &str,
+    _arg_type: &LowLevelType,
+) -> Result<crate::flowspace::pygraph::PyGraph, TyperError> {
+    use crate::flowspace::model::{Block, FunctionGraph, GraphFunc, Link, SpaceOperation};
+    use crate::translator::rtyper::rtyper::{helper_pygraph_from_graph, variable_with_lltype};
+
+    let arg = variable_with_lltype("addr1", LowLevelType::Address);
+    let startblock = Block::shared(vec![Hlvalue::Variable(arg.clone())]);
+    let return_var = variable_with_lltype("result", LowLevelType::Signed);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    let cast_var = variable_with_lltype("hashed", LowLevelType::Signed);
+    let c_mode = Hlvalue::Constant(Constant::with_concretetype(
+        ConstValue::ByteStr(b"forced".to_vec()),
+        LowLevelType::Void,
+    ));
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "cast_adr_to_int",
+        vec![Hlvalue::Variable(arg), c_mode],
+        Hlvalue::Variable(cast_var.clone()),
+    ));
+
+    use crate::flowspace::model::BlockRefExt;
+    startblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(cast_var)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["addr1".to_string()],
+        func,
+    ))
+}
+
 /// raddress.py:62 — module-global singleton `address_repr = AddressRepr()`.
 pub fn address_repr() -> Arc<AddressRepr> {
     use std::sync::OnceLock;
     static REPR: OnceLock<Arc<AddressRepr>> = OnceLock::new();
     REPR.get_or_init(|| Arc::new(AddressRepr::new())).clone()
 }
+
+/// RPython `raddress.py:65-69` — `class TypedAddressAccessRepr(Repr)`.
+/// Intermediate repr for `addr.signed[offset]` patterns.
+/// `lowleveltype = Address`, stores the access type (Signed/Unsigned/Char/Address/Float).
+#[derive(Debug)]
+pub struct TypedAddressAccessRepr {
+    state: ReprState,
+    pub access_type: LowLevelType,
+}
+
+impl TypedAddressAccessRepr {
+    pub fn new(access_type: LowLevelType) -> Self {
+        TypedAddressAccessRepr {
+            state: ReprState::new(),
+            access_type,
+        }
+    }
+}
+
+impl Repr for TypedAddressAccessRepr {
+    fn lowleveltype(&self) -> &LowLevelType {
+        &LowLevelType::Address
+    }
+
+    fn state(&self) -> &ReprState {
+        &self.state
+    }
+
+    fn class_name(&self) -> &'static str {
+        "TypedAddressAccessRepr"
+    }
+
+    fn repr_class_id(&self) -> super::pairtype::ReprClassId {
+        super::pairtype::ReprClassId::TypedAddressAccessRepr
+    }
+}
+
+impl fmt::Display for TypedAddressAccessRepr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.repr_string())
+    }
+}
+
+// WeakRefRepr and EmulatedWeakRefRepr live in rweakref.rs
+// (rweakref.py:51-64 / rweakref.py:67-96)
 
 /// RPython `rptr.py:27-118` — `class PtrRepr(Repr)`.
 #[derive(Debug)]
@@ -2301,6 +2456,12 @@ pub enum ReprKey {
         can_be_none: bool,
         subset_of: Option<Box<ReprKey>>,
     },
+    /// RPython `SomeAddress.rtyper_makekey = (self.__class__,)`
+    /// (raddress.py:17-18).
+    Address,
+    /// RPython `SomeTypedAddressAccess.rtyper_makekey = (self.__class__, self.type)`
+    /// (raddress.py:24-25).
+    TypedAddressAccess(LowLevelType),
     /// Pending variant — carries a textual discriminator from
     /// `rtyper_makekey` arm that hasn't been ported yet.
     Pending(String),
@@ -2440,6 +2601,10 @@ pub fn rtyper_makekey(s_obj: &crate::annotator::model::SomeValue) -> ReprKey {
                 subset_of,
             }
         }
+        // raddress.py:17-18: SomeAddress.rtyper_makekey = (self.__class__,).
+        SomeValue::Address(_) => ReprKey::Address,
+        // raddress.py:24-25: SomeTypedAddressAccess.rtyper_makekey = (self.__class__, self.type).
+        SomeValue::TypedAddressAccess(s) => ReprKey::TypedAddressAccess(s.access_type.clone()),
         // Remaining variants defer to their r*.rs ports. Emit a
         // deterministic `Pending` key so the reprs cache still
         // distinguishes entries by variant-shape — identical
@@ -2597,9 +2762,8 @@ pub fn rtyper_makerepr(
         SomeValue::Property(_) => Err(TyperError::missing_rtype_operation(
             "SomeProperty.rtyper_makerepr — port rpython/rtyper/rproperty.py",
         )),
-        SomeValue::WeakRef(_) => Err(TyperError::missing_rtype_operation(
-            "SomeWeakRef.rtyper_makerepr — port rpython/rtyper/rweakref.py",
-        )),
+        // rweakref.py:13-17
+        SomeValue::WeakRef(_) => super::rweakref::weakref_makerepr(rtyper),
         SomeValue::TypeOf(_) => Err(TyperError::missing_rtype_operation(
             "SomeTypeOf.rtyper_makerepr — no direct upstream counterpart; pyre adaptation",
         )),
@@ -2611,6 +2775,10 @@ pub fn rtyper_makerepr(
             ptr.ll_ptrtype.clone(),
         )) as std::sync::Arc<dyn Repr>),
         SomeValue::Address(_) => Ok(address_repr() as std::sync::Arc<dyn Repr>),
+        // raddress.py:21-22: SomeTypedAddressAccess.rtyper_makerepr = TypedAddressAccessRepr(self.type).
+        SomeValue::TypedAddressAccess(s) => Ok(std::sync::Arc::new(TypedAddressAccessRepr::new(
+            s.access_type.clone(),
+        )) as std::sync::Arc<dyn Repr>),
         SomeValue::LLADTMeth(adtmeth) => {
             Ok(std::sync::Arc::new(LLADTMethRepr::new(adtmeth)) as std::sync::Arc<dyn Repr>)
         }

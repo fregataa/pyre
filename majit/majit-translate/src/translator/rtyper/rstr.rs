@@ -53,11 +53,11 @@ use crate::translator::rtyper::lltypesystem::rstr::{
     build_ll_startswith_char_helper_graph, build_ll_startswith_helper_graph,
     build_ll_str_is_true_helper_graph, build_ll_str2unicode_helper_graph,
     build_ll_strcmp_helper_graph, build_ll_strconcat_helper_graph, build_ll_streq_helper_graph,
-    build_ll_strhash_helper_graph, build_ll_string_casefold_helper_graph,
-    build_ll_string_isxxx_helper_graph, build_ll_stritem_checked_helper_graph,
-    build_ll_stritem_helper_graph, build_ll_stritem_nonneg_checked_helper_graph,
-    build_ll_stritem_nonneg_helper_graph, build_ll_strlen_helper_graph,
-    build_ll_unichr2str_helper_graph,
+    build_ll_strfasthash_helper_graph, build_ll_strhash_helper_graph,
+    build_ll_string_casefold_helper_graph, build_ll_string_isxxx_helper_graph,
+    build_ll_stritem_checked_helper_graph, build_ll_stritem_helper_graph,
+    build_ll_stritem_nonneg_checked_helper_graph, build_ll_stritem_nonneg_helper_graph,
+    build_ll_strlen_helper_graph, build_ll_unichr2str_helper_graph,
 };
 use crate::translator::rtyper::rmodel::{RTypeResult, Repr, ReprState};
 use crate::translator::rtyper::rtyper::{
@@ -354,6 +354,24 @@ impl Repr for StringRepr {
             )
             .map(Some)
     }
+
+    /// rstr.py:116-117 `return self.ll.ll_strfasthash`
+    fn get_ll_fasthash_function(
+        &self,
+        rtyper: &RPythonTyper,
+    ) -> Result<Option<LowLevelFunction>, TyperError> {
+        let ptr_for_builder = STRPTR.clone();
+        rtyper
+            .lowlevel_helper_function_with_builder(
+                "ll_strfasthash".to_string(),
+                vec![STRPTR.clone()],
+                LowLevelType::Signed,
+                move |_rtyper, _args, _result| {
+                    build_ll_strfasthash_helper_graph("ll_strfasthash", ptr_for_builder)
+                },
+            )
+            .map(Some)
+    }
 }
 
 /// RPython `class UnicodeRepr(BaseLLStringRepr, AbstractUnicodeRepr)`
@@ -602,6 +620,24 @@ impl Repr for UnicodeRepr {
                         "_ll_unicode_strhash",
                         "_hash_unicode_string",
                     )
+                },
+            )
+            .map(Some)
+    }
+
+    /// rstr.py:116-117 `return self.ll.ll_strfasthash` (unicode variant)
+    fn get_ll_fasthash_function(
+        &self,
+        rtyper: &RPythonTyper,
+    ) -> Result<Option<LowLevelFunction>, TyperError> {
+        let ptr_for_builder = UNICODEPTR.clone();
+        rtyper
+            .lowlevel_helper_function_with_builder(
+                "ll_unicode_fasthash".to_string(),
+                vec![UNICODEPTR.clone()],
+                LowLevelType::Signed,
+                move |_rtyper, _args, _result| {
+                    build_ll_strfasthash_helper_graph("ll_unicode_fasthash", ptr_for_builder)
                 },
             )
             .map(Some)
@@ -1084,6 +1120,14 @@ impl Repr for CharRepr {
             .map(Some)
     }
 
+    /// rstr.py:502
+    fn get_ll_fasthash_function(
+        &self,
+        rtyper: &RPythonTyper,
+    ) -> Result<Option<LowLevelFunction>, TyperError> {
+        self.get_ll_hash_function(rtyper)
+    }
+
     /// RPython `BaseCharReprMixin.rtype_len(_, hop)` (`rstr.py:504-505`):
     /// `return hop.inputconst(Signed, 1)`. Single chars always carry
     /// length 1.
@@ -1318,6 +1362,14 @@ impl Repr for UniCharRepr {
                 move |_rtyper, _args, _result| build_ll_unichar_hash_helper_graph(&name),
             )
             .map(Some)
+    }
+
+    /// rstr.py:770
+    fn get_ll_fasthash_function(
+        &self,
+        rtyper: &RPythonTyper,
+    ) -> Result<Option<LowLevelFunction>, TyperError> {
+        self.get_ll_hash_function(rtyper)
     }
 
     /// `BaseCharReprMixin.rtype_len` (`rstr.py:504-505`).

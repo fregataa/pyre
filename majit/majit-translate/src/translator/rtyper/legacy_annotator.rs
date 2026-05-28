@@ -218,6 +218,7 @@ fn const_value_type(value: &ConstValue) -> ValueType {
         ConstValue::Int(_)
         | ConstValue::Bool(_)
         | ConstValue::SpecTag(_)
+        | ConstValue::AddressOffset { .. }
         | ConstValue::LLAddress(_) => ValueType::Int,
         ConstValue::Float(_) => ValueType::Float,
         ConstValue::Placeholder => ValueType::Unknown,

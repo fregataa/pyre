@@ -430,6 +430,8 @@ fn install_default_typers(map: &mut HashMap<HostObject, BuiltinTyperFn>) {
             "cast_weakrefptr_to_ptr",
             rtype_cast_weakrefptr_to_ptr,
         ),
+        // rbuiltin.py:744 — `@typer_for(weakref.ref)`
+        ("weakref", "ref", rtype_weakref_create),
     ];
     for (module_name, attr_name, typer) in module_entries {
         if let Some(host) = HOST_ENV
@@ -2030,22 +2032,46 @@ fn rtype_raw_memclear(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RT
     Ok(hop.genop("raw_memclear", vlist, GenopResult::Void))
 }
 
-/// rbuiltin.py:744-758 — low-level weakref_create path.
-///
-/// The `BaseWeakRefRepr` high-level path is not ported; only the else
-/// branch (low-level `PtrRepr * WeakRef`) is implemented.
+/// rbuiltin.py:753/759/769/777 `assert hop.rtyper.getconfig().translation.rweakref`
+fn assert_rweakref(hop: &HighLevelOp) -> Result<(), TyperError> {
+    let rweakref = hop
+        .rtyper
+        .getconfig()
+        .map(|c| c.translation.rweakref)
+        .unwrap_or(true);
+    if !rweakref {
+        return Err(TyperError::message(
+            "weakref operation requires translation.rweakref=True",
+        ));
+    }
+    Ok(())
+}
+
+/// rbuiltin.py:746-757
 fn rtype_weakref_create(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
     use crate::translator::rtyper::lltypesystem::lltype::WEAKREF_PTR;
     use crate::translator::rtyper::rtyper::GenopResult;
+    use crate::translator::rtyper::rweakref::as_base_weakref_repr;
 
     let r0 = arg_repr(hop, 0)?;
     let vlist = hop.inputargs(vec![ConvertedTo::Repr(r0.as_ref())])?;
     hop.exception_cannot_occur()?;
-    Ok(hop.genop(
-        "weakref_create",
-        vlist,
-        GenopResult::LLType(WEAKREF_PTR.clone()),
-    ))
+    let r_result = hop.r_result.borrow();
+    let base_weakref = r_result
+        .as_ref()
+        .and_then(|r| as_base_weakref_repr(r.as_ref()));
+    if let Some(bwr) = base_weakref {
+        // rbuiltin.py:751-752 high-level path via BaseWeakRefRepr._weakref_create
+        bwr.weakref_create(hop, vlist.into_iter().next().unwrap())
+    } else {
+        // rbuiltin.py:754-757 low-level path
+        assert_rweakref(hop)?;
+        Ok(hop.genop(
+            "weakref_create",
+            vlist,
+            GenopResult::LLType(WEAKREF_PTR.clone()),
+        ))
+    }
 }
 
 /// rbuiltin.py:760-766
@@ -2053,6 +2079,7 @@ fn rtype_weakref_deref(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> R
     use crate::translator::rtyper::lltypesystem::lltype::WEAKREF_PTR;
     use crate::translator::rtyper::rtyper::GenopResult;
 
+    assert_rweakref(hop)?;
     let r1 = arg_repr(hop, 1)?;
     // rbuiltin.py:762 `assert v_wref.concretetype == llmemory.WeakRefPtr`
     if r1.lowleveltype() != &*WEAKREF_PTR {
@@ -2097,6 +2124,7 @@ fn rtype_cast_ptr_to_weakrefptr(
     use crate::translator::rtyper::lltypesystem::lltype::WEAKREF_PTR;
     use crate::translator::rtyper::rtyper::GenopResult;
 
+    assert_rweakref(hop)?;
     let r0 = arg_repr(hop, 0)?;
     let vlist = hop.inputargs(vec![ConvertedTo::Repr(r0.as_ref())])?;
     hop.exception_cannot_occur()?;
@@ -2115,6 +2143,7 @@ fn rtype_cast_weakrefptr_to_ptr(
     use crate::translator::rtyper::lltypesystem::lltype::WEAKREF_PTR;
     use crate::translator::rtyper::rtyper::GenopResult;
 
+    assert_rweakref(hop)?;
     let r1 = arg_repr(hop, 1)?;
     // rbuiltin.py:780 `assert v_wref.concretetype == llmemory.WeakRefPtr`
     if r1.lowleveltype() != &*WEAKREF_PTR {

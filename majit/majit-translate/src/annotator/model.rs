@@ -1563,6 +1563,8 @@ pub use crate::translator::rtyper::lltypesystem::lltype::SomePtr;
 /// Re-export of [`SomeAddress`], which RPython declares at
 /// `rpython/rtyper/lltypesystem/llmemory.py:573` (`class SomeAddress(SomeObject)`).
 pub use crate::translator::rtyper::lltypesystem::llmemory::SomeAddress;
+/// `rpython/rtyper/lltypesystem/llmemory.py:592` (`class SomeTypedAddressAccess(SomeObject)`).
+pub use crate::translator::rtyper::lltypesystem::llmemory::SomeTypedAddressAccess;
 
 /// RPython `SomeObject.needs_sandboxing` side-attribute payload
 /// (attached by `rtyper/extfunc.py:ExtFuncEntry.compute_annotation`
@@ -1861,6 +1863,7 @@ pub enum SomeValue {
     Ptr(SomePtr),
     InteriorPtr(SomeInteriorPtr),
     Address(SomeAddress),
+    TypedAddressAccess(SomeTypedAddressAccess),
     LLADTMeth(SomeLLADTMeth),
     Builtin(SomeBuiltin),
     BuiltinMethod(SomeBuiltinMethod),
@@ -1902,6 +1905,7 @@ pub enum SomeValueTag {
     Ptr,
     InteriorPtr,
     Address,
+    TypedAddressAccess,
     LLADTMeth,
     Builtin,
     BuiltinMethod,
@@ -1946,6 +1950,7 @@ impl SomeValueTag {
             T::Ptr => &[T::Ptr, T::Object],
             T::InteriorPtr => &[T::InteriorPtr, T::Ptr, T::Object],
             T::Address => &[T::Address, T::Object],
+            T::TypedAddressAccess => &[T::TypedAddressAccess, T::Object],
             T::LLADTMeth => &[T::LLADTMeth, T::Object],
             T::Builtin => &[T::Builtin, T::Object],
             T::BuiltinMethod => &[T::BuiltinMethod, T::Object],
@@ -1990,6 +1995,7 @@ impl SomeValue {
             SomeValue::Ptr(_) => T::Ptr,
             SomeValue::InteriorPtr(_) => T::InteriorPtr,
             SomeValue::Address(_) => T::Address,
+            SomeValue::TypedAddressAccess(_) => T::TypedAddressAccess,
             SomeValue::LLADTMeth(_) => T::LLADTMeth,
             SomeValue::Builtin(_) => T::Builtin,
             SomeValue::BuiltinMethod(_) => T::BuiltinMethod,
@@ -2121,6 +2127,7 @@ impl SomeValue {
             SomeValue::Ptr(s) => s.base.const_box.as_ref(),
             SomeValue::InteriorPtr(s) => s.base.const_box.as_ref(),
             SomeValue::Address(s) => s.base.const_box.as_ref(),
+            SomeValue::TypedAddressAccess(s) => s.base.const_box.as_ref(),
             SomeValue::LLADTMeth(s) => s.base.const_box.as_ref(),
             SomeValue::Builtin(s) => s.base.const_box.as_ref(),
             SomeValue::BuiltinMethod(s) => s.base.const_box.as_ref(),
@@ -2166,6 +2173,7 @@ impl SomeValue {
             SomeValue::Ptr(s) => s.base.const_box = Some(c),
             SomeValue::InteriorPtr(s) => s.base.const_box = Some(c),
             SomeValue::Address(s) => s.base.const_box = Some(c),
+            SomeValue::TypedAddressAccess(s) => s.base.const_box = Some(c),
             SomeValue::LLADTMeth(s) => s.base.const_box = Some(c),
             SomeValue::Builtin(s) => s.base.const_box = Some(c),
             SomeValue::BuiltinMethod(s) => s.base.const_box = Some(c),
@@ -2295,6 +2303,7 @@ impl SomeObjectTrait for SomeValue {
             SomeValue::Ptr(s) => s.knowntype(),
             SomeValue::InteriorPtr(s) => s.knowntype(),
             SomeValue::Address(s) => s.knowntype(),
+            SomeValue::TypedAddressAccess(s) => s.knowntype(),
             SomeValue::LLADTMeth(s) => s.knowntype(),
             SomeValue::Builtin(s) => s.knowntype(),
             SomeValue::BuiltinMethod(s) => s.knowntype(),
@@ -2330,6 +2339,7 @@ impl SomeObjectTrait for SomeValue {
             SomeValue::Ptr(s) => s.immutable(),
             SomeValue::InteriorPtr(s) => s.immutable(),
             SomeValue::Address(s) => s.immutable(),
+            SomeValue::TypedAddressAccess(s) => s.immutable(),
             SomeValue::LLADTMeth(s) => s.immutable(),
             SomeValue::Builtin(s) => s.immutable(),
             SomeValue::BuiltinMethod(s) => s.immutable(),
@@ -2365,6 +2375,7 @@ impl SomeObjectTrait for SomeValue {
             SomeValue::Ptr(s) => s.is_constant(),
             SomeValue::InteriorPtr(s) => s.is_constant(),
             SomeValue::Address(s) => s.is_constant(),
+            SomeValue::TypedAddressAccess(s) => s.is_constant(),
             SomeValue::LLADTMeth(s) => s.is_constant(),
             SomeValue::Builtin(s) => s.is_constant(),
             SomeValue::BuiltinMethod(s) => s.is_constant(),
@@ -2405,6 +2416,7 @@ impl SomeObjectTrait for SomeValue {
             SomeValue::Ptr(s) => s.can_be_none(),
             SomeValue::InteriorPtr(s) => s.can_be_none(),
             SomeValue::Address(s) => s.can_be_none(),
+            SomeValue::TypedAddressAccess(s) => s.can_be_none(),
             SomeValue::LLADTMeth(s) => s.can_be_none(),
             SomeValue::Builtin(s) => s.can_be_none(),
             SomeValue::BuiltinMethod(s) => s.can_be_none(),
@@ -3077,6 +3089,7 @@ pub fn not_const(s: &SomeValue) -> SomeValue {
         SomeValue::Ptr(v) => v.base.const_box = None,
         SomeValue::InteriorPtr(v) => v.base.const_box = None,
         SomeValue::Address(v) => v.base.const_box = None,
+        SomeValue::TypedAddressAccess(v) => v.base.const_box = None,
         SomeValue::LLADTMeth(v) => v.base.const_box = None,
         SomeValue::Builtin(v) => v.base.const_box = None,
         SomeValue::BuiltinMethod(v) => v.base.const_box = None,

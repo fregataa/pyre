@@ -206,6 +206,14 @@ impl Repr for IntegerRepr {
             .map(Some)
     }
 
+    /// rint.py:198
+    fn get_ll_fasthash_function(
+        &self,
+        rtyper: &super::rtyper::RPythonTyper,
+    ) -> Result<Option<super::rtyper::LowLevelFunction>, TyperError> {
+        self.get_ll_hash_function(rtyper)
+    }
+
     /// RPython `IntegerRepr.convert_const(self, value)` (`rint.py:31-37`):
     ///
     /// ```python

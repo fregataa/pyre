@@ -3420,6 +3420,40 @@ fn init_someptr_overrides(
             can_only_throw: CanOnlyThrow::List(vec![]),
         },
     );
+    // llmemory.py:582-586 — SomeAddress.getattr(self, s_attr).
+    register(
+        reg,
+        OpKind::GetAttr,
+        SomeValueTag::Address,
+        Specialization {
+            apply: Box::new(|ann, hl| {
+                let s_attr = ann
+                    .annotation(&hl.args[1])
+                    .expect("address.getattr: attr unbound");
+                let attr = s_attr
+                    .const_()
+                    .and_then(ConstValue::as_pystr)
+                    .expect("getattr on address must be constant str");
+                SomeValue::TypedAddressAccess(
+                    crate::translator::rtyper::lltypesystem::llmemory::SomeAddress::annotation_getattr(attr)
+                        .unwrap_or_else(|| panic!("unsupported access type: {attr}")),
+                )
+            }),
+            can_only_throw: CanOnlyThrow::List(vec![]),
+        },
+    );
+    // llmemory.py:588-589 — SomeAddress.bool(self) → s_Bool.
+    register(
+        reg,
+        OpKind::Bool,
+        SomeValueTag::Address,
+        Specialization {
+            apply: Box::new(|_ann, _hl| {
+                crate::translator::rtyper::lltypesystem::llmemory::SomeAddress::annotation_bool()
+            }),
+            can_only_throw: CanOnlyThrow::List(vec![]),
+        },
+    );
     register(
         reg,
         OpKind::Len,

@@ -152,6 +152,14 @@ impl Repr for NoneRepr {
             .map(Some)
     }
 
+    /// rnone.py:28
+    fn get_ll_fasthash_function(
+        &self,
+        rtyper: &super::rtyper::RPythonTyper,
+    ) -> Result<Option<super::rtyper::LowLevelFunction>, TyperError> {
+        self.get_ll_hash_function(rtyper)
+    }
+
     /// RPython `NoneRepr.rtype_bool(self, hop)` (`rnone.py:13-14`):
     /// `return Constant(False, Bool)`.
     ///

@@ -57,6 +57,9 @@ pub struct TranslationOptions {
     /// `SmallFunctionSetPBCRepr` becomes a candidate instead of
     /// `FunctionsPBCRepr`.
     pub withsmallfuncsets: usize,
+    /// RPython `config.translation.rweakref` (upstream default `True`).
+    /// Gate for RPython-level weakref support in the backend.
+    pub rweakref: bool,
 }
 
 impl Default for TranslationOptions {
@@ -69,6 +72,7 @@ impl Default for TranslationOptions {
             check_str_without_nul: false,
             taggedpointers: false,
             withsmallfuncsets: 0,
+            rweakref: true,
         }
     }
 }
@@ -145,6 +149,7 @@ impl TranslationConfig {
                 check_str_without_nul: get_bool(config, "translation.check_str_without_nul")?,
                 taggedpointers: get_bool(config, "translation.taggedpointers")?,
                 withsmallfuncsets: get_int(config, "translation.withsmallfuncsets")? as usize,
+                rweakref: get_bool(config, "translation.rweakref")?,
             },
         })
     }

@@ -1955,6 +1955,11 @@ impl HostEnv {
             HostObject::new_builtin_callable("llmemory.cast_weakrefptr_to_ptr"),
         );
 
+        // rbuiltin.py:744 `@typer_for(weakref.ref)` — weakref.ref aliases
+        // llmemory.weakref_create at the rtyper level.
+        let weakref_mod = HostObject::new_module("weakref");
+        weakref_mod.module_set("ref", HostObject::new_builtin_callable("weakref.ref"));
+
         let mut mods = self.modules.lock().unwrap();
         mods.insert("__builtin__".into(), self.builtin_module.clone());
         mods.insert("os".into(), os);
@@ -1965,6 +1970,7 @@ impl HostEnv {
         mods.insert("rpython.rlib.objectmodel".into(), objectmodel);
         mods.insert("rpython.rtyper.lltypesystem.lltype".into(), lltype);
         mods.insert("rpython.rtyper.lltypesystem.llmemory".into(), llmemory);
+        mods.insert("weakref".into(), weakref_mod);
     }
 
     /// upstream `getattr(__builtin__, name)` — `flowcontext.py:851`.
@@ -2090,6 +2096,15 @@ pub enum ConstValue {
     /// process-unique `u64` so two separately constructed tags never
     /// compare equal even if wrapped in `Constant`.
     ///
+    /// `llmemory.ItemOffset(TYPE)` symbolic size value. `lltype()` is
+    /// `Signed`; downstream `inputconst(Signed, sizeof(TYPE))` accepts
+    /// this variant so that concrete byte sizes are resolved only at
+    /// code emission, not at rtyper time.
+    AddressOffset {
+        kind: String,
+        type_name: String,
+        byte_size: i64,
+    },
     /// Deviation from upstream (parity rule #1): RPython uses a Python
     /// class (`SpecTag`) whose identity is the instance's `id()`. Rust
     /// has no cross-session `id()`, so we materialise identity as an
@@ -2125,6 +2140,18 @@ impl PartialEq for ConstValue {
             (ConstValue::LLAddress(a), ConstValue::LLAddress(b)) => a == b,
             (ConstValue::HostObject(a), ConstValue::HostObject(b)) => a == b,
             (ConstValue::SpecTag(a), ConstValue::SpecTag(b)) => a == b,
+            (
+                ConstValue::AddressOffset {
+                    kind: ak,
+                    type_name: at,
+                    byte_size: ab,
+                },
+                ConstValue::AddressOffset {
+                    kind: bk,
+                    type_name: bt,
+                    byte_size: bb,
+                },
+            ) => ak == bk && at == bt && ab == bb,
             _ => false,
         }
     }
@@ -2157,6 +2184,13 @@ impl std::fmt::Display for ConstValue {
             | ConstValue::LLPtr(_)
             | ConstValue::LLAddress(_)
             | ConstValue::Function(_) => write!(f, "{self:?}"),
+            ConstValue::AddressOffset {
+                kind,
+                type_name,
+                byte_size,
+            } => {
+                write!(f, "AddressOffset({kind}, {type_name}, {byte_size})")
+            }
         }
     }
 }
@@ -2207,6 +2241,15 @@ impl Hash for ConstValue {
             },
             ConstValue::HostObject(obj) => obj.hash(state),
             ConstValue::SpecTag(id) => id.hash(state),
+            ConstValue::AddressOffset {
+                kind,
+                type_name,
+                byte_size,
+            } => {
+                kind.hash(state);
+                type_name.hash(state);
+                byte_size.hash(state);
+            }
         }
     }
 }
@@ -2806,6 +2849,7 @@ impl ConstValue {
             ConstValue::HostObject(_) => Some(true),
             ConstValue::Atom(_) => Some(true),
             ConstValue::SpecTag(_) => Some(true),
+            ConstValue::AddressOffset { .. } => Some(true),
         }
     }
 
@@ -2891,6 +2935,7 @@ impl ConstValue {
             | ConstValue::LowLevelType(_)
             | ConstValue::LLPtr(_)
             | ConstValue::LLAddress(_)
+            | ConstValue::AddressOffset { .. }
             | ConstValue::SpecTag(_) => None,
         }
     }

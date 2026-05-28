@@ -4768,6 +4768,69 @@ pub(crate) fn build_ll_strhash_helper_graph(
     ))
 }
 
+/// lltypesystem/rstr.py:421-423 `ll_strfasthash(s)`:
+/// `ll_assert(s.hash != 0); return s.hash`.
+/// Assumes hash is already computed — a single getfield.
+pub(crate) fn build_ll_strfasthash_helper_graph(
+    name: &str,
+    ptr_lltype: LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    let hash_field_const =
+        || constant_with_lltype(ConstValue::byte_str("hash"), LowLevelType::Void);
+
+    let s = variable_with_lltype("s", ptr_lltype);
+    let startblock = Block::shared(vec![Hlvalue::Variable(s.clone())]);
+    let return_var = variable_with_lltype("result", LowLevelType::Signed);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    let v_hash = variable_with_lltype("hash", LowLevelType::Signed);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "getfield".to_string(),
+        vec![Hlvalue::Variable(s.clone()), hash_field_const()],
+        Hlvalue::Variable(v_hash.clone()),
+    ));
+    // ll_assert(s.hash != 0, "ll_strfasthash: hash==0")
+    let v_nz = variable_with_lltype("nz", LowLevelType::Bool);
+    let c_zero = constant_with_lltype(ConstValue::Int(0), LowLevelType::Signed);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "int_ne".to_string(),
+        vec![Hlvalue::Variable(v_hash.clone()), c_zero],
+        Hlvalue::Variable(v_nz.clone()),
+    ));
+    let c_msg = constant_with_lltype(
+        ConstValue::byte_str("ll_strfasthash: hash==0"),
+        LowLevelType::Void,
+    );
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "debug_assert".to_string(),
+        vec![Hlvalue::Variable(v_nz), c_msg],
+        constant_with_lltype(ConstValue::None, LowLevelType::Void),
+    ));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(v_hash)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["s".to_string()],
+        func,
+    ))
+}
+
 /// Synthesise the helper graph for `LLHelpers.ll_find_char`
 /// (`rtyper/lltypesystem/rstr.py:670-680`):
 ///

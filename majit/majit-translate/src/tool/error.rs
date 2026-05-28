@@ -188,6 +188,7 @@ fn render_somevalue(value: &crate::annotator::model::SomeValue) -> String {
         SomeValue::Ptr(_) => "SomePtr(...)".into(),
         SomeValue::InteriorPtr(_) => "SomeInteriorPtr(...)".into(),
         SomeValue::Address(_) => "SomeAddress()".into(),
+        SomeValue::TypedAddressAccess(s) => format!("SomeTypedAddressAccess({:?})", s.access_type),
         SomeValue::LLADTMeth(_) => "SomeLLADTMeth(...)".into(),
         SomeValue::Builtin(_) => "SomeBuiltin()".into(),
         SomeValue::BuiltinMethod(_) => "SomeBuiltinMethod()".into(),

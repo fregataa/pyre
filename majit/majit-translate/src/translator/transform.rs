@@ -873,7 +873,8 @@ fn is_valid_contains_key(cv: &ConstValue) -> bool {
         | ConstValue::UniStr(_)
         | ConstValue::None
         | ConstValue::HostObject(_)
-        | ConstValue::Function(_) => true,
+        | ConstValue::Function(_)
+        | ConstValue::AddressOffset { .. } => true,
         ConstValue::Tuple(items) => items.iter().all(is_valid_contains_key),
         ConstValue::List(_)
         | ConstValue::Dict(_)

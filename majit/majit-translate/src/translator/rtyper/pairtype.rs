@@ -86,6 +86,8 @@ pub enum ReprClassId {
     LongFloatRepr,
     /// `raddress.py:27 AddressRepr`.
     AddressRepr,
+    /// `raddress.py:65 TypedAddressAccessRepr`.
+    TypedAddressAccessRepr,
     /// `rptr.py:27 PtrRepr`.
     PtrRepr,
     /// `rptr.py:220 InteriorPtrRepr`.
@@ -130,6 +132,10 @@ pub enum ReprClassId {
     UnicodeRepr,
     /// Abstract base shared by `StringRepr` and `UnicodeRepr`.
     AbstractStringRepr,
+    /// `rweakref.py:51 WeakRefRepr(BaseWeakRefRepr)`.
+    WeakRefRepr,
+    /// `rweakref.py:67 EmulatedWeakRefRepr(BaseWeakRefRepr)`.
+    EmulatedWeakRefRepr,
 }
 
 impl ReprClassId {
@@ -158,6 +164,7 @@ impl ReprClassId {
             SingleFloatRepr => &[SingleFloatRepr, Repr],
             LongFloatRepr => &[LongFloatRepr, Repr],
             AddressRepr => &[AddressRepr, Repr],
+            TypedAddressAccessRepr => &[TypedAddressAccessRepr, Repr],
             PtrRepr => &[PtrRepr, Repr],
             InteriorPtrRepr => &[InteriorPtrRepr, Repr],
             LLADTMethRepr => &[LLADTMethRepr, Repr],
@@ -178,6 +185,8 @@ impl ReprClassId {
             StringRepr => &[StringRepr, AbstractStringRepr, Repr],
             UnicodeRepr => &[UnicodeRepr, AbstractStringRepr, Repr],
             AbstractStringRepr => &[AbstractStringRepr, Repr],
+            WeakRefRepr => &[WeakRefRepr, Repr],
+            EmulatedWeakRefRepr => &[EmulatedWeakRefRepr, Repr],
         }
     }
 }
@@ -394,6 +403,15 @@ fn dispatch_convert_from_to(
         // rnone.py:56-59 — `pairtype(NoneRepr, Repr).convert_from_to`
         // returns `inputconst(r_to, None)`.
         (NoneRepr, Repr) => super::rnone::pair_none_any_convert_from_to(r_from, r_to, v, llops),
+        // raddress.py:143-144 — `pairtype(PtrRepr, AddressRepr).convert_from_to`.
+        (PtrRepr, AddressRepr) => {
+            let result = llops.genop(
+                "cast_ptr_to_adr",
+                vec![v.clone()],
+                GenopResult::LLType(LowLevelType::Address),
+            );
+            Ok(result.map(Hlvalue::Variable))
+        }
         _ => Ok(None),
     }
 }
@@ -722,8 +740,156 @@ fn dispatch_rtype_op(
             committed(super::rstr::pair_unicode_unicode_rtype_compare(hop, "ge"))
         }
 
+        // raddress.py:74-80 — `pairtype(TypedAddressAccessRepr, IntegerRepr).rtype_getitem`.
+        (TypedAddressAccessRepr, IntegerRepr, "getitem") => {
+            committed(pair_typed_address_access_int_rtype_getitem(r1, hop))
+        }
+        // raddress.py:82-87 — `pairtype(TypedAddressAccessRepr, IntegerRepr).rtype_setitem`.
+        (TypedAddressAccessRepr, IntegerRepr, "setitem") => {
+            committed(pair_typed_address_access_int_rtype_setitem(r1, hop))
+        }
+
+        // raddress.py:92-98 — `pairtype(AddressRepr, IntegerRepr).rtype_add/inplace_add`.
+        (AddressRepr, IntegerRepr, "add") | (AddressRepr, IntegerRepr, "inplace_add") => {
+            if *r2.lowleveltype() == LowLevelType::Signed {
+                let v_args = hop.inputargs(vec![
+                    ConvertedTo::LowLevelType(&LowLevelType::Address),
+                    ConvertedTo::LowLevelType(&LowLevelType::Signed),
+                ])?;
+                Ok(Some(hop.genop(
+                    "adr_add",
+                    v_args,
+                    GenopResult::LLType(LowLevelType::Address),
+                )))
+            } else {
+                Ok(None)
+            }
+        }
+        // raddress.py:100-106 — `pairtype(AddressRepr, IntegerRepr).rtype_sub/inplace_sub`.
+        (AddressRepr, IntegerRepr, "sub") | (AddressRepr, IntegerRepr, "inplace_sub") => {
+            if *r2.lowleveltype() == LowLevelType::Signed {
+                let v_args = hop.inputargs(vec![
+                    ConvertedTo::LowLevelType(&LowLevelType::Address),
+                    ConvertedTo::LowLevelType(&LowLevelType::Signed),
+                ])?;
+                Ok(Some(hop.genop(
+                    "adr_sub",
+                    v_args,
+                    GenopResult::LLType(LowLevelType::Address),
+                )))
+            } else {
+                Ok(None)
+            }
+        }
+        // raddress.py:111-113 — `pairtype(AddressRepr, AddressRepr).rtype_sub`.
+        (AddressRepr, AddressRepr, "sub") => {
+            let v_args = hop.inputargs(vec![
+                ConvertedTo::LowLevelType(&LowLevelType::Address),
+                ConvertedTo::LowLevelType(&LowLevelType::Address),
+            ])?;
+            Ok(Some(hop.genop(
+                "adr_delta",
+                v_args,
+                GenopResult::LLType(LowLevelType::Signed),
+            )))
+        }
+        // raddress.py:115-137 — `pairtype(AddressRepr, AddressRepr)` comparisons.
+        (AddressRepr, AddressRepr, "eq")
+        | (AddressRepr, AddressRepr, "ne")
+        | (AddressRepr, AddressRepr, "lt")
+        | (AddressRepr, AddressRepr, "le")
+        | (AddressRepr, AddressRepr, "gt")
+        | (AddressRepr, AddressRepr, "ge") => {
+            let v_args = hop.inputargs(vec![
+                ConvertedTo::LowLevelType(&LowLevelType::Address),
+                ConvertedTo::LowLevelType(&LowLevelType::Address),
+            ])?;
+            let op = format!("adr_{opname}");
+            Ok(Some(hop.genop(
+                &op,
+                v_args,
+                GenopResult::LLType(LowLevelType::Bool),
+            )))
+        }
+
         _ => Ok(None),
     }
+}
+
+/// raddress.py:74-80
+fn pair_typed_address_access_int_rtype_getitem(r_acc: &dyn Repr, hop: &HighLevelOp) -> RTypeResult {
+    use super::rmodel::TypedAddressAccessRepr;
+    use crate::translator::rtyper::lltypesystem::llmemory::sizeof;
+
+    let any_r: &dyn std::any::Any = r_acc;
+    let r_acc = any_r
+        .downcast_ref::<TypedAddressAccessRepr>()
+        .ok_or_else(|| TyperError::message("expected TypedAddressAccessRepr"))?;
+    let args_r = hop.args_r.borrow();
+    let r0 = args_r[0]
+        .as_ref()
+        .ok_or_else(|| TyperError::message("missing repr for arg 0"))?;
+    let v_args = hop.inputargs(vec![
+        ConvertedTo::Repr(r0.as_ref()),
+        ConvertedTo::LowLevelType(&LowLevelType::Signed),
+    ])?;
+    let v_addr = v_args[0].clone();
+    let v_offs = v_args[1].clone();
+    let size = sizeof(&r_acc.access_type).ok_or_else(|| {
+        TyperError::message(format!("sizeof not supported for {:?}", r_acc.access_type))
+    })?;
+    let c_size = HighLevelOp::inputconst(&LowLevelType::Signed, &size)?;
+    let v_offs_mult = hop
+        .genop(
+            "int_mul",
+            vec![v_offs, Hlvalue::Constant(c_size)],
+            GenopResult::LLType(LowLevelType::Signed),
+        )
+        .ok_or_else(|| TyperError::message("int_mul genop returned None"))?;
+    Ok(hop.genop(
+        "raw_load",
+        vec![v_addr, v_offs_mult],
+        GenopResult::LLType(r_acc.access_type.clone()),
+    ))
+}
+
+/// raddress.py:82-87
+fn pair_typed_address_access_int_rtype_setitem(r_acc: &dyn Repr, hop: &HighLevelOp) -> RTypeResult {
+    use super::rmodel::TypedAddressAccessRepr;
+    use crate::translator::rtyper::lltypesystem::llmemory::sizeof;
+
+    let any_r: &dyn std::any::Any = r_acc;
+    let r_acc = any_r
+        .downcast_ref::<TypedAddressAccessRepr>()
+        .ok_or_else(|| TyperError::message("expected TypedAddressAccessRepr"))?;
+    let args_r = hop.args_r.borrow();
+    let r0 = args_r[0]
+        .as_ref()
+        .ok_or_else(|| TyperError::message("missing repr for arg 0"))?;
+    let v_args = hop.inputargs(vec![
+        ConvertedTo::Repr(r0.as_ref()),
+        ConvertedTo::LowLevelType(&LowLevelType::Signed),
+        ConvertedTo::LowLevelType(&r_acc.access_type),
+    ])?;
+    let v_addr = v_args[0].clone();
+    let v_offs = v_args[1].clone();
+    let v_value = v_args[2].clone();
+    let size = sizeof(&r_acc.access_type).ok_or_else(|| {
+        TyperError::message(format!("sizeof not supported for {:?}", r_acc.access_type))
+    })?;
+    let c_size = HighLevelOp::inputconst(&LowLevelType::Signed, &size)?;
+    let v_offs_mult = hop
+        .genop(
+            "int_mul",
+            vec![v_offs, Hlvalue::Constant(c_size)],
+            GenopResult::LLType(LowLevelType::Signed),
+        )
+        .ok_or_else(|| TyperError::message("int_mul genop returned None"))?;
+    Ok(hop.genop(
+        "raw_store",
+        vec![v_addr, v_offs_mult, v_value],
+        GenopResult::Void,
+    ))
 }
 
 pub fn pair_rtype_getitem(r1: &dyn Repr, r2: &dyn Repr, hop: &HighLevelOp) -> RTypeResult {

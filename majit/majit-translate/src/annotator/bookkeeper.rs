@@ -2241,6 +2241,12 @@ impl Bookkeeper {
                 }
                 Ok(result)
             }
+            ConstValue::AddressOffset { .. } => {
+                // AddressOffset.annotation() returns SomeInteger()
+                let mut s = SomeInteger::new(false, false);
+                s.base.const_box = Some(Constant::new(x.clone()));
+                Ok(SomeValue::Integer(s))
+            }
             ConstValue::Code(_)
             | ConstValue::Graphs(_)
             | ConstValue::LowLevelType(_)

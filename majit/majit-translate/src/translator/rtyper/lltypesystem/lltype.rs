@@ -205,13 +205,16 @@ impl LowLevelType {
             LowLevelType::Void => true,
             // upstream `Bool = Primitive("Bool", False)`.
             LowLevelType::Bool => matches!(value, ConstValue::Bool(_)),
-            // upstream `Signed` / `Unsigned` / `SignedLongLong` /
-            // `SignedLongLongLong` / `UnsignedLongLong` /
-            // `UnsignedLongLongLong` all accept Python `int` (with range
-            // checking upstream; pyre's `ConstValue::Int` is already i64
-            // so the only check left is category match).
-            LowLevelType::Signed
-            | LowLevelType::Unsigned
+            // upstream `Signed` also accepts Symbolic values whose
+            // `lltype()` is Signed; `llmemory.sizeof(TYPE)` returns an
+            // `ItemOffset(TYPE)` symbolic on the typed-address path.
+            LowLevelType::Signed => {
+                matches!(value, ConstValue::Int(_) | ConstValue::AddressOffset { .. })
+            }
+            // upstream `Unsigned` / long-long primitives accept Python
+            // `int` (range checking upstream; pyre's `ConstValue::Int` is
+            // already i64, so the only check left is category match).
+            LowLevelType::Unsigned
             | LowLevelType::SignedLongLong
             | LowLevelType::SignedLongLongLong
             | LowLevelType::UnsignedLongLong
@@ -3639,6 +3642,17 @@ mod tests {
             err.contains("opaqueptr() for OpaqueTypes only"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn signed_contains_address_offset_symbolic() {
+        let offset = ConstValue::AddressOffset {
+            kind: "ItemOffset".into(),
+            type_name: "Signed".into(),
+            byte_size: 8,
+        };
+        assert!(LowLevelType::Signed.contains_value(&offset));
+        assert!(!LowLevelType::Unsigned.contains_value(&offset));
     }
 
     #[test]

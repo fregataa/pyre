@@ -6285,20 +6285,16 @@ mod tests {
         // `MissingRTypeOperation` so cascading callers can anchor on
         // the upstream module name in the error message.
         //
-        // `SomeWeakRef` is the still-unported witness variant
-        // (rweakref.py port not landed). Earlier this test exercised
-        // `SomeString`; `string_repr` / `unicode_repr` are now ported,
-        // so rotated onto another unported variant
-        // (robject.py / rproperty.py / rweakref.py — pick whichever
-        // remains unported next).
-        use crate::annotator::model::SomeWeakRef;
+        // `SomeByteArray` is the still-unported witness variant
+        // (rbytearray.py port not landed).
+        use crate::annotator::model::SomeByteArray;
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = RPythonTyper::new(&ann);
         let err = rtyper
-            .getrepr(&SomeValue::WeakRef(SomeWeakRef::new(None)))
+            .getrepr(&SomeValue::ByteArray(SomeByteArray::new(false)))
             .unwrap_err();
         assert!(err.is_missing_rtype_operation());
-        assert!(err.to_string().contains("rweakref.py"));
+        assert!(err.to_string().contains("rbytearray.py"));
     }
 
     #[test]
@@ -6477,17 +6473,17 @@ mod tests {
         // silently fail, the setup path returns the structured
         // TyperError so callers know which upstream module to land.
         //
-        // `SomeWeakRef` is the still-unported witness variant
-        // (rweakref.py). Earlier this test used `SomeString`; that
-        // is now ported, so rotated to
-        // `SomeWeakRef`.
-        use crate::annotator::model::SomeWeakRef;
+        // `SomeByteArray` is the still-unported witness variant
+        // (rbytearray.py).
+        use crate::annotator::model::SomeByteArray;
         let ann_rc = RPythonAnnotator::new(None, None, None, false);
         let rtyper = Rc::new(RPythonTyper::new(&ann_rc));
         let arg_var = Variable::new();
         arg_var
             .annotation
-            .replace(Some(Rc::new(SomeValue::WeakRef(SomeWeakRef::new(None)))));
+            .replace(Some(Rc::new(SomeValue::ByteArray(SomeByteArray::new(
+                false,
+            )))));
         let result_var = Variable::new();
         result_var
             .annotation
