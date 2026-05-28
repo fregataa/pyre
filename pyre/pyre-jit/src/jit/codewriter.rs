@@ -1509,61 +1509,233 @@ fn walker_post_walk_insert_renamings(
             }
         }
     }
+}
 
-    // Dead superseded blocks: materialize forwarding stubs.
-    //
-    // `mergeblock` supersede (`flowcontext.py:455-463`) marks a
-    // joinpoint candidate dead and `recloseblock(Link(outputargs,
-    // newblock))`s it onto its generalization.  The walker, however,
-    // already emitted `goto TLabel(block<dead>)` into every
-    // predecessor that branched to the candidate *before* the
-    // supersede happened (the goto carries the candidate's
-    // block-identity name).  Upstream never hits this: `flatten_graph`
-    // runs after the flow graph is final and `simplify`/`join_blocks`
-    // collapse the forwarding block, so predecessors already point at
-    // the generalization.  Pyre's walker emits SSARepr inline, so the
-    // dead block must stay a real forwarding stub — exactly what
-    // `mark_dead`'s comment describes ("dead blocks remain enumerable
-    // as forwarding stubs").  `mark_dead` clears the dead block's own
-    // accumulator because the per-PC `-live-` resolver
-    // (`resolve_walker_pc`) requires dead blocks to contribute zero
-    // bytes, so the stub is a *separate* synthetic SpamBlock that owns
-    // the dead block's identity `Label`, runs the forwarding link's
-    // renamings, then `goto TLabel(block<newblock>)`.  Chained
-    // supersedes (`block<dead1> -> block<dead2> -> block<live>`)
-    // resolve naturally: every dead block emits its own stub, so the
-    // gotos thread stub-to-stub until reaching a live Label.
-    let dead_forwarders: Vec<SpamBlockRef> = all_walker_blocks
-        .iter()
-        .filter(|s| s.dead())
-        .cloned()
-        .collect();
-    for dead in dead_forwarders {
-        let exits = dead.block().borrow().exits.clone();
-        let [link_ref] = exits.as_slice() else {
-            continue;
-        };
-        let Some(target_ref) = link_ref.borrow().target.clone() else {
-            continue;
-        };
-        let pairs = collect_distinct_renaming_pairs(link_ref, &get_color);
-        let body = build_renaming_insns(pairs);
-        let synthetic_block = graph.new_block(Vec::new());
-        let stub_spam = SpamBlockRef::new(synthetic_block, None);
-        stub_spam.push_insn(super::flatten::Insn::Label(super::flatten::Label::new(
-            super::flatten::block_label_name(&dead.block()),
-        )));
-        for insn in body {
-            stub_spam.push_insn(insn);
+/// Port of `rpython/translator/simplify.py` `eliminate_empty_blocks`.
+///
+/// `simplify_graph` (`translator.py:55-56`) runs this right after
+/// `build_flow`, so the empty forwarding blocks that `mergeblock`
+/// supersede leaves behind (`flowcontext.py:455-463`:
+/// `block.dead = True; block.operations = (); block.exitswitch = None;
+/// recloseblock(Link(outputargs, newblock))`) are collapsed before any
+/// later phase sees them.  Upstream redirects every predecessor link
+/// THROUGH the forwarder: it rewrites the predecessor's `link.target`
+/// to the forwarder's single successor and substitutes the args so the
+/// values compose (`link.args = [v.replace(subst) for v in exit.args]`).
+/// The inner `while` collapses chained forwarders.
+///
+/// ```py
+/// def eliminate_empty_blocks(graph):
+///     for link in list(graph.iterlinks()):
+///         while not link.target.operations:
+///             block1 = link.target
+///             if block1.exitswitch is not None:
+///                 break
+///             if not block1.exits:
+///                 break
+///             exit = block1.exits[0]
+///             assert block1 is not exit.target
+///             subst = dict(zip(block1.inputargs, link.args))
+///             link.args = [v.replace(subst) for v in exit.args]
+///             link.target = exit.target
+/// ```
+///
+/// Pyre's walker fuses graph-build and flatten and never calls
+/// `simplify_graph`, so these forwarders survive and predecessors keep
+/// emitting `goto TLabel(block<dead>)`; this pass restores the orthodox
+/// collapse so predecessors point straight at the generalization (the
+/// byte-stream `TLabel`s are caught by
+/// [`rewrite_dead_forwarder_gotos`]).
+///
+/// Predicate parity: upstream tests `not link.target.operations`.  The
+/// walker emits SSARepr into `per_block_ssarepr`, NOT `block.operations`
+/// (which stays empty for every walker block), so `operations` cannot be
+/// the predicate.  `mark_dead` (the supersede `operations=()` +
+/// `recloseblock` step) sets `block.dead`, and supersede is the only
+/// producer of the empty-forwarding shape, so `dead` is the faithful
+/// pyre predicate.  The `exitswitch.is_none()` / `!exits.is_empty()`
+/// guards still mirror upstream exactly.
+fn eliminate_empty_blocks(graph: &super::flow::FunctionGraph) {
+    for link_ref in graph.iterlinks() {
+        loop {
+            let Some(block1) = link_ref.borrow().target.clone() else {
+                break;
+            };
+            let exit_link = {
+                let b1 = block1.borrow();
+                // RPython's predicate is `while not link.target.operations`
+                // (stop when the target carries real ops).  `dead` is the
+                // pyre proxy (see fn doc); a non-dead target stops the
+                // collapse exactly like a non-empty one upstream.
+                if !b1.dead {
+                    break;
+                }
+                // A `dead` block is only ever a `mergeblock` supersede
+                // forwarder (`flowcontext.py:455-463`): `operations=()`,
+                // `exitswitch=None`, recloseblock'd to a single Link.
+                // RPython reaches the same shape via `not operations` +
+                // `exitswitch is None` (single exit by graph invariant)
+                // + the `if not exits: break` returnblock guard.  Assert
+                // it so a future change to the supersede shape fails here
+                // loudly instead of silently leaving a dangling forwarder
+                // goto for the assembler to trip over.
+                assert!(
+                    b1.exitswitch.is_none() && b1.exits.len() == 1,
+                    "eliminate_empty_blocks: dead block {} is not a \
+                     single-exit forwarder (exitswitch={:?}, exits={})",
+                    super::flatten::block_label_name(&block1),
+                    b1.exitswitch,
+                    b1.exits.len(),
+                );
+                b1.exits[0].clone()
+            };
+            let (exit_args, exit_target) = {
+                let exit = exit_link.borrow();
+                match exit.target.clone() {
+                    Some(target) => (exit.args.clone(), target),
+                    None => break,
+                }
+            };
+            assert!(
+                block1 != exit_target,
+                "eliminate_empty_blocks: the graph contains an empty infinite loop"
+            );
+            // `subst = dict(zip(block1.inputargs, link.args))`.  RPython
+            // builds a dict here (`dict(zip(...))`) and the project's
+            // other port of this pass (`majit-translate
+            // translator/simplify.rs eliminate_empty_blocks`) uses the
+            // same `HashMap<Variable, _>`, so this is a direct port of an
+            // RPython dict — not a HashMap added for convenience.  Keep
+            // the full `LinkArg` (`Option<FlowValue>`) value so the
+            // substitution below can distinguish "inputarg with a
+            // concrete actual" from "inputarg with a `None` actual".
+            let inputargs = block1.borrow().inputargs.clone();
+            let link_args = link_ref.borrow().args.clone();
+            let mut subst: HashMap<super::flow::Variable, super::flow::LinkArg> = HashMap::new();
+            for (inputarg, arg) in inputargs.iter().zip(link_args.iter()) {
+                if let super::flow::FlowValue::Variable(v) = inputarg {
+                    subst.insert(*v, arg.clone());
+                }
+            }
+            // `link.args = [v.replace(subst) for v in exit.args]`.
+            // RPython's `getoutputargs` yields a concrete value list, so
+            // every inputarg has a concrete actual.  Every link feeding a
+            // dead forwarder is built by `output_link` -> `Link::new`
+            // (all `Some`), so a `None` actual for a substituted inputarg
+            // would be a non-orthodox link shape — fail loudly rather
+            // than silently emit a reference to the eliminated block's
+            // inputarg (a dangling Variable).
+            let new_args: Vec<super::flow::LinkArg> = exit_args
+                .iter()
+                .map(|arg| match arg {
+                    Some(super::flow::FlowValue::Variable(v)) => match subst.get(v) {
+                        Some(Some(value)) => Some(value.clone()),
+                        Some(None) => panic!(
+                            "eliminate_empty_blocks: dead forwarder inputarg \
+                             {v:?} has no concrete predecessor actual"
+                        ),
+                        // Not a `block1` inputarg: a free var — leave it
+                        // unchanged, matching RPython `replace` which
+                        // keeps vars absent from `subst`.
+                        None => arg.clone(),
+                    },
+                    _ => arg.clone(),
+                })
+                .collect();
+            // `link.target = exit.target`; the outer `loop` continues to
+            // collapse the new target if it is itself a forwarder.
+            let mut link = link_ref.borrow_mut();
+            link.args = new_args;
+            link.target = Some(exit_target);
         }
-        stub_spam.push_insn(super::flatten::Insn::op(
-            "goto",
-            vec![super::flatten::Operand::TLabel(
-                super::flatten::block_tlabel(&target_ref),
-            )],
-        ));
-        stub_spam.push_insn(super::flatten::Insn::Unreachable);
-        all_walker_blocks.push(stub_spam);
+    }
+}
+
+/// Companion to [`eliminate_empty_blocks`] for pyre's inline-emit
+/// walker: rewrite the already-emitted terminator `TLabel`s that name a
+/// collapsed dead forwarder so they target the surviving generalization.
+///
+/// The walker emits `goto` / `goto_if_not_*` / `switch` `TLabel`s by
+/// block identity (`block<addr>`) inline DURING the walk — before the
+/// `mergeblock` supersede that turns the target into a dead forwarder.
+/// `eliminate_empty_blocks` only rewrites graph links, so the byte
+/// stream still names the now-empty dead block.  This brings the emitted
+/// SSARepr in line with the collapsed graph: each `TLabel(block<dead>)`
+/// is retargeted to `block<live>` by following the same forwarder chain
+/// `eliminate_empty_blocks` walked, so the renamings the post-walk pass
+/// splices for the (collapsed) `predecessor -> generalization` link and
+/// the emitted goto agree.
+fn rewrite_dead_forwarder_gotos(all_walker_blocks: &[SpamBlockRef]) {
+    // Follow a dead forwarder's single-exit chain to its surviving
+    // (non-dead) target — mirrors the inner `while` of
+    // `eliminate_empty_blocks`.
+    fn resolve_forward(start: &super::flow::BlockRef) -> super::flow::BlockRef {
+        let mut cur = start.clone();
+        loop {
+            let next = {
+                let b = cur.borrow();
+                if !b.dead || b.exitswitch.is_some() || b.exits.is_empty() {
+                    None
+                } else {
+                    b.exits[0].borrow().target.clone()
+                }
+            };
+            match next {
+                Some(target) if target != cur => cur = target,
+                _ => break,
+            }
+        }
+        cur
+    }
+
+    // Dead forwarders number a handful per graph, so a flat
+    // `Vec<(from, to)>` with linear lookup is the right shape — no
+    // RPython dict stands behind this pyre-only byte-rewrite bridge, so
+    // [[feedback-no-hashmap-ever]] applies.
+    let mut remap: Vec<(String, String)> = Vec::new();
+    for spam in all_walker_blocks {
+        let block = spam.block();
+        if !block.borrow().dead {
+            continue;
+        }
+        let from = super::flatten::block_label_name(&block);
+        let to = super::flatten::block_label_name(&resolve_forward(&block));
+        if from != to {
+            remap.push((from, to));
+        }
+    }
+    if remap.is_empty() {
+        return;
+    }
+
+    let retarget = |tl: &mut super::flatten::TLabel| {
+        if let Some((_, to)) = remap.iter().find(|(from, _)| *from == tl.name) {
+            tl.name = to.clone();
+        }
+    };
+    for spam in all_walker_blocks {
+        let mut borrow = spam.0.borrow_mut();
+        for insn in borrow.per_block_ssarepr.iter_mut() {
+            let super::flatten::Insn::Op { args, .. } = insn else {
+                continue;
+            };
+            for arg in args.iter_mut() {
+                match arg {
+                    super::flatten::Operand::TLabel(tl) => retarget(tl),
+                    super::flatten::Operand::Descr(descr_rc) => {
+                        if let super::flatten::DescrOperand::SwitchDict(_) = descr_rc.as_ref() {
+                            let descr_mut = std::rc::Rc::make_mut(descr_rc);
+                            if let super::flatten::DescrOperand::SwitchDict(sw) = descr_mut {
+                                for (_key, tl) in sw.labels.iter_mut() {
+                                    retarget(tl);
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
 }
 
@@ -9193,6 +9365,36 @@ impl CodeWriter {
         // — both of which the assembler/blackhole already handle without
         // a front-end gate.
         let has_abort = assembler.has_abort_flag();
+
+        // `simplify_graph` (`translator.py:55-56`) parity: collapse the
+        // empty forwarding blocks `mergeblock` supersede left behind
+        // (`flowcontext.py:455-463`) before regalloc coalescing and the
+        // drain read the graph.  Runs BEFORE `collect_cfg_coalesce_pairs`
+        // so the coalesce pairs (and therefore the colors the renamings
+        // use) reflect the collapsed `predecessor -> generalization`
+        // links; `rewrite_dead_forwarder_gotos` then retargets the
+        // walker's inline-emitted `TLabel`s to match.
+        eliminate_empty_blocks(&graph);
+        // Port-boundary guard: after the collapse, no link reachable from
+        // the startblock may still target a dead forwarder.  RPython has
+        // no equivalent check (its graph is simplified before flatten),
+        // but pyre's `walker_post_walk_insert_renamings` reachability DFS
+        // skips dead targets, so a surviving reachable link -> dead edge
+        // would silently drop that edge's renamings while
+        // `rewrite_dead_forwarder_gotos` still retargets the byte goto —
+        // the exact renaming/goto divergence this epic fixes.  Fail loud
+        // instead.
+        for link_ref in graph.iterlinks() {
+            if let Some(target) = link_ref.borrow().target.clone() {
+                assert!(
+                    !target.borrow().dead,
+                    "eliminate_empty_blocks: reachable link still targets \
+                     dead forwarder {}; collapse is incomplete",
+                    super::flatten::block_label_name(&target),
+                );
+            }
+        }
+        rewrite_dead_forwarder_gotos(&all_walker_blocks);
 
         // Drain per-block accumulators into ssarepr.insns in
         // walker-block-creation order.  Mirrors `codewriter.py:53
