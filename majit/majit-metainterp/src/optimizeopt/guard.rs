@@ -846,7 +846,10 @@ impl OptGuard {
             }
             OpCode::GuardValue => {
                 let val_arg = op.arg(0);
-                if let Some(c) = ctx.get_constant_int(op.arg(1)) {
+                if let Some(c) = ctx
+                    .get_box_replacement_box(op.arg(1))
+                    .and_then(|cb| cb.const_int())
+                {
                     // guard.py: record known constant value.
                     self.known_constants.insert(val_arg, c);
                     if c != 0 {
@@ -859,7 +862,10 @@ impl OptGuard {
                 self.truthy_values.insert(op.arg(0));
                 // guard.py: record the known class for subsumption checks.
                 if op.num_args() >= 2 {
-                    if let Some(class_val) = ctx.get_constant_int(op.arg(1)) {
+                    if let Some(class_val) = ctx
+                        .get_box_replacement_box(op.arg(1))
+                        .and_then(|cb| cb.const_int())
+                    {
                         let val = majit_ir::GcRef(class_val as usize);
                         let key = op.arg(0);
                         self.known_classes.insert(key, val);
@@ -902,13 +908,19 @@ impl OptGuard {
             // known for this value, and it matches, remove the guard.
             OpCode::GuardClass if op.num_args() >= 2 => {
                 if let Some(known_class) = self.known_classes.get(&op.arg(0)).copied() {
-                    if let Some(expected) = ctx.get_constant_int(op.arg(1)) {
+                    if let Some(expected) = ctx
+                        .get_box_replacement_box(op.arg(1))
+                        .and_then(|cb| cb.const_int())
+                    {
                         return known_class.0 as i64 == expected;
                     }
                 }
                 // RPython: setinfo_from_preamble sets PtrInfo.KnownClass or
                 // Instance with known_class. Check ctx for imported info.
-                if let Some(expected) = ctx.get_constant_int(op.arg(1)) {
+                if let Some(expected) = ctx
+                    .get_box_replacement_box(op.arg(1))
+                    .and_then(|cb| cb.const_int())
+                {
                     if let Some(b) = ctx.get_box_replacement_box(op.arg(0)) {
                         if let Some(class_ptr) = ctx.get_known_class(&b) {
                             return class_ptr.0 as i64 == expected;
@@ -921,7 +933,10 @@ impl OptGuard {
             // that exact constant from a previous GuardValue.
             OpCode::GuardValue if op.num_args() >= 2 => {
                 if let Some(known) = self.known_constants.get(&op.arg(0)).copied() {
-                    if let Some(expected) = ctx.get_constant_int(op.arg(1)) {
+                    if let Some(expected) = ctx
+                        .get_box_replacement_box(op.arg(1))
+                        .and_then(|cb| cb.const_int())
+                    {
                         return known == expected;
                     }
                 }
@@ -940,12 +955,18 @@ impl OptGuard {
                 }
                 // Check class via guard pass state
                 if let Some(known_class) = self.known_classes.get(&op.arg(0)).copied() {
-                    if let Some(expected) = ctx.get_constant_int(op.arg(1)) {
+                    if let Some(expected) = ctx
+                        .get_box_replacement_box(op.arg(1))
+                        .and_then(|cb| cb.const_int())
+                    {
                         return known_class.0 as i64 == expected;
                     }
                 }
                 // Check class via imported PtrInfo
-                if let Some(expected) = ctx.get_constant_int(op.arg(1)) {
+                if let Some(expected) = ctx
+                    .get_box_replacement_box(op.arg(1))
+                    .and_then(|cb| cb.const_int())
+                {
                     if let Some(b) = ctx.get_box_replacement_box(op.arg(0)) {
                         if let Some(class_ptr) = ctx.get_known_class(&b) {
                             return class_ptr.0 as i64 == expected;
@@ -1023,7 +1044,10 @@ impl Optimization for OptGuard {
         // RPython: GuardValue makes the value a known constant in the
         // optimizer context, enabling export to Phase 2.
         if op.opcode == OpCode::GuardValue {
-            if let Some(c) = ctx.get_constant_int(op.arg(1)) {
+            if let Some(c) = ctx
+                .get_box_replacement_box(op.arg(1))
+                .and_then(|cb| cb.const_int())
+            {
                 ctx.make_constant(op.arg(0), majit_ir::Value::Int(c));
             }
         }

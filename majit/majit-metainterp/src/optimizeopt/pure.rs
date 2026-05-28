@@ -2115,7 +2115,11 @@ mod tests {
         assert_eq!(ctx.constant_fold(&op), Some(Value::Int(123)));
         let result = pass.propagate_forward(&op, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_constant_int(OpRef::int_op(0)), Some(123));
+        assert_eq!(
+            ctx.get_box_replacement_box(OpRef::int_op(0))
+                .and_then(|cb| cb.const_int()),
+            Some(123)
+        );
 
         unsafe {
             drop(Box::from_raw(ptr as *mut TestIntFieldObject));
@@ -2139,7 +2143,11 @@ mod tests {
         assert_eq!(ctx.constant_fold(&op), Some(Value::Float(3.5)));
         let result = pass.propagate_forward(&op, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_constant_float(OpRef::float_op(0)), Some(3.5));
+        assert_eq!(
+            ctx.get_box_replacement_box(OpRef::float_op(0))
+                .and_then(|b| ctx.get_constant_float_box(&b)),
+            Some(3.5)
+        );
 
         unsafe {
             drop(Box::from_raw(ptr as *mut TestFloatFieldObject));
@@ -2169,7 +2177,8 @@ mod tests {
         let result = pass.propagate_forward(&op, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(
-            ctx.get_constant(OpRef::ref_op(0)),
+            ctx.get_box_replacement_box(OpRef::ref_op(0))
+                .and_then(|cb| cb.const_value()),
             Some(Value::Ref(GcRef(0x1234_5678usize)))
         );
 
@@ -2245,7 +2254,12 @@ mod tests {
         let c5_a = ctx.make_constant_int(5);
         let c5_b = ctx.make_constant_int(5);
         assert_ne!(c5_a, c5_b, "make_constant_int must mint fresh slots");
-        assert_eq!(ctx.get_constant(c5_a), ctx.get_constant(c5_b));
+        assert_eq!(
+            ctx.get_box_replacement_box(c5_a)
+                .and_then(|cb| cb.const_value()),
+            ctx.get_box_replacement_box(c5_b)
+                .and_then(|cb| cb.const_value())
+        );
 
         // Cache `IntAdd(c5_a, x)` and look up `IntAdd(c5_b, x)`.
         let x = OpRef::int_op(7);

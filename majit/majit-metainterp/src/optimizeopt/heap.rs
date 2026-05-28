@@ -82,7 +82,9 @@ enum DictArgKey {
 impl DictArgKey {
     fn from_arg(arg: OpRef, ctx: &OptContext) -> Self {
         let resolved = ctx.get_box_replacement(arg);
-        let cval = ctx.get_constant(resolved);
+        let cval = ctx
+            .get_box_replacement_box(resolved)
+            .and_then(|cb| cb.const_value());
         match cval {
             Some(value) => DictArgKey::Const(value),
             None => DictArgKey::Op(resolved),
@@ -151,9 +153,15 @@ impl CachedField {
     }
 
     /// heap.py:59-65 AbstractCachedEntry.possible_aliasing
-    fn possible_aliasing(&self, struct_opref: OpRef) -> bool {
+    ///
+    /// `not info.getptrinfo(self._lazy_set.getarg(0)).same_info(opinfo)`.
+    /// For Ref operands `same_info` is box identity (two distinct Live
+    /// structs hold distinct PtrInfo objects, so `is` ⟺ same terminal box)
+    /// plus ConstPtrInfo value comparison (info.py:774-777) — exactly
+    /// `same_box` on the struct boxes.
+    fn possible_aliasing(&self, struct_opref: OpRef, ctx: &OptContext) -> bool {
         match &self.lazy_set {
-            Some((lazy_obj, _)) => *lazy_obj != struct_opref,
+            Some((lazy_obj, _)) => !ctx.same_box(*lazy_obj, struct_opref),
             None => false,
         }
     }
@@ -306,8 +314,12 @@ impl CachedField {
                 if let (Some(v1), Some(v2)) = (e1.as_opref(), e2.as_opref()) {
                     let v1r = ctx.get_box_replacement(v1);
                     let v2r = ctx.get_box_replacement(v2);
-                    let c1 = ctx.get_constant(v1r);
-                    let c2 = ctx.get_constant(v2r);
+                    let c1 = ctx
+                        .get_box_replacement_box(v1r)
+                        .and_then(|cb| cb.const_value());
+                    let c2 = ctx
+                        .get_box_replacement_box(v2r)
+                        .and_then(|cb| cb.const_value());
                     if matches!((c1, c2), (Some(a), Some(b)) if a != b) {
                         return true;
                     }
@@ -416,9 +428,12 @@ impl ArrayCachedItem {
     }
 
     /// heap.py:59-65 AbstractCachedEntry.possible_aliasing
-    fn possible_aliasing(&self, array_opref: OpRef) -> bool {
+    ///
+    /// `not info.getptrinfo(self._lazy_set.getarg(0)).same_info(opinfo)`;
+    /// for Ref operands `same_info` ⟺ `same_box` on the array boxes.
+    fn possible_aliasing(&self, array_opref: OpRef, ctx: &OptContext) -> bool {
         match &self.lazy_set {
-            Some((lazy_obj, _)) => *lazy_obj != array_opref,
+            Some((lazy_obj, _)) => !ctx.same_box(*lazy_obj, array_opref),
             None => false,
         }
     }
@@ -480,8 +495,12 @@ impl ArrayCachedItem {
                 continue;
             }
             // heap.py:293-294: if not value.is_constant(): continue
-            let c1 = ctx.get_constant(v1);
-            let c2 = ctx.get_constant(v2);
+            let c1 = ctx
+                .get_box_replacement_box(v1)
+                .and_then(|cb| cb.const_value());
+            let c2 = ctx
+                .get_box_replacement_box(v2)
+                .and_then(|cb| cb.const_value());
             let (Some(c1), Some(c2)) = (c1, c2) else {
                 continue;
             };
@@ -680,9 +699,9 @@ impl ArrayCacheSubMap {
     ) -> Option<OpRef> {
         if let Some(triples) = &self.cached_varindex_triples {
             for &(cached_arrayinfo, cached_index, cached_result) in triples {
-                if cached_arrayinfo == arrayinfo
-                    && ctx.get_box_replacement(cached_index) == indexbox
-                {
+                // heap.py:322: cached_arrayinfo is arrayinfo
+                //   and get_box_replacement(cached_index) is indexbox
+                if cached_arrayinfo == arrayinfo && ctx.box_is(cached_index, indexbox) {
                     return Some(ctx.get_box_replacement(cached_result));
                 }
             }
@@ -1502,18 +1521,36 @@ impl OptHeap {
         if oopspec == OopSpecIndex::Arraycopy
             && has_single_write_descr
             && op.num_args() >= 6
-            && ctx.get_constant_int(op.arg(3)).is_some()
-            && ctx.get_constant_int(op.arg(4)).is_some()
-            && ctx.get_constant_int(op.arg(5)).is_some()
+            && ctx
+                .get_box_replacement_box(op.arg(3))
+                .and_then(|cb| cb.const_int())
+                .is_some()
+            && ctx
+                .get_box_replacement_box(op.arg(4))
+                .and_then(|cb| cb.const_int())
+                .is_some()
+            && ctx
+                .get_box_replacement_box(op.arg(5))
+                .and_then(|cb| cb.const_int())
+                .is_some()
         {
             return;
         }
         if oopspec == OopSpecIndex::Arraymove
             && has_single_write_descr
             && op.num_args() >= 5
-            && ctx.get_constant_int(op.arg(2)).is_some()
-            && ctx.get_constant_int(op.arg(3)).is_some()
-            && ctx.get_constant_int(op.arg(4)).is_some()
+            && ctx
+                .get_box_replacement_box(op.arg(2))
+                .and_then(|cb| cb.const_int())
+                .is_some()
+            && ctx
+                .get_box_replacement_box(op.arg(3))
+                .and_then(|cb| cb.const_int())
+                .is_some()
+            && ctx
+                .get_box_replacement_box(op.arg(4))
+                .and_then(|cb| cb.const_int())
+                .is_some()
         {
             return;
         }
@@ -1853,7 +1890,9 @@ impl OptHeap {
         let mut force_lazy = false;
         if let Some(cf) = self.get_cached_field(&descr) {
             if let Some((lazy_obj, lazy_op)) = &cf.lazy_set {
-                if *lazy_obj == obj {
+                // heap.py:69 possible_aliasing_two_infos: opinfo1.same_info(opinfo2)
+                //   → MUST_ALIAS. For Ref operands same_info ⟺ same_box.
+                if ctx.same_box(*lazy_obj, obj) {
                     // MUST_ALIAS: lazy_set targets the same struct → return rhs
                     let cached = lazy_op.arg(1);
                     let b_old = ctx
@@ -2138,7 +2177,7 @@ impl OptHeap {
         //                  self.force_lazy_set(optheap, op.getdescr())
         let needs_force = self
             .get_cached_field(&descr)
-            .map_or(false, |cf| cf.possible_aliasing(obj));
+            .map_or(false, |cf| cf.possible_aliasing(obj, ctx));
         if needs_force {
             // heap.py:122-145 force_lazy_set(self, optheap, descr)
             // [can_cache=True]. Lifted into `force_lazy_set_field` per
@@ -2158,7 +2197,8 @@ impl OptHeap {
             match entry {
                 crate::optimizeopt::info::FieldEntry::Preamble(pop) => {
                     let cached_seen = ctx.get_box_replacement(pop.op);
-                    if cached_seen == arg1 {
+                    // heap.py:88 not cached_field.same_box(arg1)
+                    if ctx.same_box(cached_seen, arg1) {
                         let cached = ctx.force_op_from_preamble_op(&pop);
                         ctx.structinfo_setfield(op, field_idx, cached);
                         self.field_cache(descr).register_info(obj);
@@ -2169,7 +2209,8 @@ impl OptHeap {
                 }
                 crate::optimizeopt::info::FieldEntry::Value(cached) => {
                     let cached_resolved = ctx.get_box_replacement(cached);
-                    if cached_resolved == arg1 {
+                    // heap.py:88 not cached_field.same_box(arg1)
+                    if ctx.same_box(cached_resolved, arg1) {
                         // heap.py:100 self._lazy_set = None
                         self.field_cache(descr).lazy_set = None;
                         return OptimizationResult::Remove;
@@ -2280,7 +2321,7 @@ impl OptHeap {
         let needs_force = self
             .get_cached_array_submap(descr_idx)
             .and_then(|s| s.const_get(const_index))
-            .map_or(false, |cai| cai.possible_aliasing(array));
+            .map_or(false, |cai| cai.possible_aliasing(array, ctx));
         if needs_force {
             // heap.py:122-145 force_lazy_set(self, optheap, descr) [can_cache=True]
             // extracted as force_lazy_set_array per AbstractCachedEntry parity.
@@ -2297,7 +2338,8 @@ impl OptHeap {
             match entry {
                 crate::optimizeopt::info::FieldEntry::Preamble(pop) => {
                     let cached_seen = ctx.get_box_replacement(pop.op);
-                    if cached_seen == arg1 {
+                    // heap.py:88 not cached_field.same_box(arg1)
+                    if ctx.same_box(cached_seen, arg1) {
                         let cached = ctx.force_op_from_preamble_op(&pop);
                         self.arrayitem_cache(descr, const_index)
                             .register_info(array);
@@ -2309,7 +2351,8 @@ impl OptHeap {
                 }
                 crate::optimizeopt::info::FieldEntry::Value(cached) => {
                     let cached_resolved = ctx.get_box_replacement(cached);
-                    if cached_resolved == arg1 {
+                    // heap.py:88 not cached_field.same_box(arg1)
+                    if ctx.same_box(cached_resolved, arg1) {
                         // heap.py:100 self._lazy_set = None
                         self.arrayitem_cache(descr, const_index).lazy_set = None;
                         return OptimizationResult::Remove;
@@ -2424,7 +2467,9 @@ impl OptHeap {
                 .and_then(|s| s.const_get(const_index))
             {
                 if let Some((lazy_obj, lazy_op)) = &cai.lazy_set {
-                    if *lazy_obj == array {
+                    // heap.py:69 possible_aliasing_two_infos: same_info → MUST_ALIAS.
+                    // For Ref operands same_info ⟺ same_box.
+                    if ctx.same_box(*lazy_obj, array) {
                         // MUST_ALIAS: lazy_set targets the same array → return rhs
                         let cached = lazy_op.arg(2);
                         let b_old = ctx
@@ -2630,7 +2675,10 @@ impl OptHeap {
         //   cached_result = submap.lookup_cached(arrayinfo, indexop)
         if let Some(descr) = op.getdescr() {
             // heap.py:692-693: force lazy stores for this descr within the index bound
-            let indexb = ctx.getintbound_via_box(op.arg(1));
+            let indexb = ctx
+                .ensure_box(op.arg(1))
+                .map(|b| ctx.getintbound_handle(&b).borrow().clone())
+                .expect("getintbound: operand must resolve to a BoxRef");
             self.force_lazy_setarrayitem(&descr, Some(&indexb), true, ctx);
 
             let descr_idx = descr.index();
@@ -2671,7 +2719,10 @@ impl OptHeap {
                 //   submap.cache_varindex_write(arrayinfo, ...)
                 //   return self.emit(op)
                 if let Some(descr) = op.getdescr() {
-                    let indexb = ctx.getintbound_via_box(op.arg(1));
+                    let indexb = ctx
+                        .ensure_box(op.arg(1))
+                        .map(|b| ctx.getintbound_handle(&b).borrow().clone())
+                        .expect("getintbound: operand must resolve to a BoxRef");
                     self.force_lazy_setarrayitem(&descr, Some(&indexb), false, ctx);
                     let arrayinfo = ctx.get_box_replacement(op.arg(0));
                     let indexbox = ctx.get_box_replacement(op.arg(1));
@@ -3293,7 +3344,12 @@ impl Optimization for OptHeap {
                     continue;
                 }
                 let val_ok = available_boxes.map_or(true, |ab| {
-                    val.is_constant() || ctx.is_constant(val) || ab.contains(&val)
+                    val.is_constant()
+                        || ctx
+                            .get_box_replacement_box(val)
+                            .and_then(|cb| cb.const_value())
+                            .is_some()
+                        || ab.contains(&val)
                 });
                 if val_ok {
                     result.push((obj, descr.clone(), val));
@@ -3335,7 +3391,11 @@ impl Optimization for OptHeap {
                 .get_box_replacement_box(*box1)
                 .as_ref()
                 .map_or(false, |b| ctx.is_virtual(b));
-            let needs_install = !ctx.is_constant(resolved) && !resolved_is_virtual;
+            let needs_install = !ctx
+                .get_box_replacement_box(resolved)
+                .and_then(|cb| cb.const_value())
+                .is_some()
+                && !resolved_is_virtual;
             if needs_install {
                 // info.py:175-188 InstancePtrInfo + init_fields
                 if let Some(b) = ctx.ensure_box(resolved) {
@@ -3345,7 +3405,11 @@ impl Optimization for OptHeap {
             // heap.py:882-883: cf = self.field_cache(&descr)
             //                  structinfo.setfield(descr, box1, box2, optheap, cf=cf)
             self.cache_field(*box1, descr);
-            if ctx.is_constant(resolved) {
+            if ctx
+                .get_box_replacement_box(resolved)
+                .and_then(|cb| cb.const_value())
+                .is_some()
+            {
                 if let Some(info) = ctx.get_const_info_mut(resolved, parent_descr.clone()) {
                     info.setfield(field_idx, *box2);
                 }
@@ -3411,7 +3475,12 @@ impl Optimization for OptHeap {
                         continue;
                     }
                     let val_ok = available_boxes.map_or(true, |ab| {
-                        val.is_constant() || ctx.is_constant(val) || ab.contains(&val)
+                        val.is_constant()
+                            || ctx
+                                .get_box_replacement_box(val)
+                                .and_then(|cb| cb.const_value())
+                                .is_some()
+                            || ab.contains(&val)
                     });
                     if val_ok {
                         result.push((obj, index, descr.clone(), val));
@@ -3445,7 +3514,11 @@ impl Optimization for OptHeap {
                 .get_box_replacement_box(*box1)
                 .as_ref()
                 .map_or(false, |b| ctx.is_virtual(b));
-            let needs_install = !ctx.is_constant(resolved) && !resolved_is_virtual;
+            let needs_install = !ctx
+                .get_box_replacement_box(resolved)
+                .and_then(|cb| cb.const_value())
+                .is_some()
+                && !resolved_is_virtual;
             if needs_install {
                 if let Some(b) = ctx.ensure_box(resolved) {
                     ctx.set_ptr_info(
@@ -3461,7 +3534,11 @@ impl Optimization for OptHeap {
             //                  arrayinfo.setitem(descr, index, box1, box2, optheap, cf=cf)
             let cai = self.arrayitem_cache(descr, *index);
             cai.register_info(*box1);
-            if ctx.is_constant(resolved) {
+            if ctx
+                .get_box_replacement_box(resolved)
+                .and_then(|cb| cb.const_value())
+                .is_some()
+            {
                 // info.py:746-748 ConstPtrInfo.setitem → _get_array_info
                 if let Some(info) = ctx.get_const_info_array_mut(resolved, descr.clone()) {
                     info.setitem(*index as usize, *box2);

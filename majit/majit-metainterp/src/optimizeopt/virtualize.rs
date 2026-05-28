@@ -227,7 +227,8 @@ impl VirtualizableTracker {
     }
 
     fn is_standard_ref(&self, opref: OpRef, ctx: &OptContext) -> bool {
-        if opref != ctx.get_box_replacement(OpRef::input_arg_ref(0)) {
+        // pyjitpl.py:1131 `standard_box is box` — box identity.
+        if !ctx.box_is(opref, OpRef::input_arg_ref(0)) {
             return false;
         }
         ctx.get_box_replacement_box(opref)
@@ -243,8 +244,10 @@ impl VirtualizableTracker {
             .map(|idx| idx as u32)
     }
 
-    fn resolve_array_source(&self, array_ref: OpRef, ctx: &OptContext) -> Option<(OpRef, u32)> {
-        let producer = ctx.get_producing_op(array_ref)?;
+    fn resolve_array_source(&self, array_ref: OpRef, ctx: &mut OptContext) -> Option<(OpRef, u32)> {
+        let producer = ctx
+            .ensure_box(array_ref)
+            .and_then(|pb| ctx.get_producing_op(&pb))?;
         if !matches!(
             producer.opcode,
             OpCode::GetfieldRawI | OpCode::GetfieldRawR | OpCode::GetfieldRawF
@@ -1968,9 +1971,12 @@ impl Optimization for OptVirtualize {
                                     .and_then(|b| ctx.get_constant_int_box(&b))
                                 {
                                     // virtualize.py:53 func = source_op.getarg(0).getint()
-                                    let func = ctx.get_constant_int(op.arg(0)).expect(
-                                        "virtualize.py:53 source_op.getarg(0) must be ConstInt",
-                                    );
+                                    let func = ctx
+                                        .get_box_replacement_box(op.arg(0))
+                                        .and_then(|cb| cb.const_int())
+                                        .expect(
+                                            "virtualize.py:53 source_op.getarg(0) must be ConstInt",
+                                        );
                                     self.make_virtual_raw_memory(size as usize, func, op, ctx);
                                     self.last_emitted_was_removed = true;
                                     return OptimizationResult::Remove;

@@ -71,15 +71,13 @@ impl OptIntBounds {
         }
     }
 
-    #[cfg(test)]
-    fn getintbound(&self, opref: OpRef, ctx: &mut OptContext) -> IntBound {
-        ctx.getintbound(opref)
-    }
-
     fn getintbound_box(&self, opref: OpRef, ctx: &mut OptContext) -> IntBound {
         match ctx.get_box_replacement_box(opref) {
             Some(b) => ctx.getintbound_handle(&b).borrow().clone(),
-            None => ctx.getintbound_via_box(opref),
+            None => ctx
+                .ensure_box(opref)
+                .map(|b| ctx.getintbound_handle(&b).borrow().clone())
+                .expect("getintbound: operand must resolve to a BoxRef"),
         }
     }
 
@@ -1719,8 +1717,10 @@ impl OptIntBounds {
     /// autogenintrules.py helper used for pattern matching:
     /// `as_operation(box, opnum)` returns the producing op iff its opcode
     /// matches, else None.
-    fn as_operation(&self, opref: OpRef, opcode: OpCode, ctx: &OptContext) -> Option<Op> {
-        let op = ctx.get_producing_op(opref)?;
+    fn as_operation(&self, opref: OpRef, opcode: OpCode, ctx: &mut OptContext) -> Option<Op> {
+        let op = ctx
+            .ensure_box(opref)
+            .and_then(|pb| ctx.get_producing_op(&pb))?;
         if op.opcode == opcode { Some(op) } else { None }
     }
 
@@ -1746,12 +1746,21 @@ impl OptIntBounds {
         ctx.register_pure_from_args2(OpCode::IntSub, arg1, op.pos.get(), arg0);
         // intbounds.py:128-142: pick the constant arg, fall back to commutative
         // swap so `arg1` ends up holding the non-const operand.
-        let (inv_const, other) = if let Some(c) = ctx.get_constant_int(arg0) {
+        // intbounds.py:128/134 `isinstance(argN, ConstInt)` — raw Const
+        // check, no IntBound synthesis, so read const_value() not the
+        // synthesizing get_constant_int_box.
+        let (inv_const, other) = if let Some(Value::Int(c)) = ctx
+            .get_box_replacement_box(arg0)
+            .and_then(|b| b.const_value())
+        {
             if c == i64::MIN {
                 return;
             }
             (c, arg1)
-        } else if let Some(c) = ctx.get_constant_int(arg1) {
+        } else if let Some(Value::Int(c)) = ctx
+            .get_box_replacement_box(arg1)
+            .and_then(|b| b.const_value())
+        {
             if c == i64::MIN {
                 return;
             }
@@ -1782,8 +1791,12 @@ impl OptIntBounds {
         // Synthesis: INT_SUB(a,b)=res → INT_ADD(res,b)=a, INT_SUB(a,res)=b
         ctx.register_pure_from_args2(OpCode::IntAdd, arg0, op.pos.get(), arg1);
         ctx.register_pure_from_args2(OpCode::IntSub, arg1, arg0, op.pos.get());
-        // intbounds.py: constant inversion for INT_SUB
-        if let Some(c1) = ctx.get_constant_int(arg1) {
+        // intbounds.py: constant inversion for INT_SUB — `isinstance(arg1,
+        // ConstInt)` raw Const check (no IntBound synthesis).
+        if let Some(Value::Int(c1)) = ctx
+            .get_box_replacement_box(arg1)
+            .and_then(|b| b.const_value())
+        {
             if c1 != i64::MIN {
                 let neg_ref = self.get_or_make_const(-c1, ctx);
                 ctx.register_pure_from_args2(OpCode::IntAdd, op.pos.get(), arg0, neg_ref);
@@ -2042,13 +2055,14 @@ impl OptIntBounds {
     fn optimize_int_sub_ovf(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = ctx.get_box_replacement(op.arg(0));
         let arg1 = ctx.get_box_replacement(op.arg(1));
-        if arg0 == arg1 {
-            // arg0.same_box(arg1) → x - x = 0
+        // intbounds.py:278-279: b0/b1 are computed before the same_box check.
+        let b0 = self.getintbound_box(arg0, ctx);
+        let b1 = self.getintbound_box(arg1, ctx);
+        if ctx.same_box(arg0, arg1) {
+            // intbounds.py:280: arg0.same_box(arg1) → x - x = 0
             self.make_constant_int(op, 0, ctx);
             return OptimizationResult::Remove;
         }
-        let b0 = self.getintbound_box(arg0, ctx);
-        let b1 = self.getintbound_box(arg1, ctx);
         if b0.sub_bound_cannot_overflow(&b1) {
             // replace_op_with(op, INT_SUB) + send_extra_operation
             let new_op = op.copy_and_change(OpCode::IntSub, None, None);
@@ -3449,7 +3463,10 @@ mod tests {
         assert_eq!(result[0].opcode, OpCode::IntAdd);
 
         // The result should have bounds [5, 30]
-        let b = ctx.getintbound(OpRef::int_op(2));
+        let b = ctx
+            .ensure_box(OpRef::int_op(2))
+            .map(|b| ctx.getintbound_handle(&b).borrow().clone())
+            .expect("getintbound: operand must resolve to a BoxRef");
         assert_eq!(b.lower, 5);
         assert_eq!(b.upper, 30);
     }
@@ -3532,7 +3549,10 @@ mod tests {
         let (_result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
 
         // After the guard, i0 should be < 10, meaning upper <= 9
-        let b0 = ctx.getintbound(OpRef::int_op(0));
+        let b0 = ctx
+            .ensure_box(OpRef::int_op(0))
+            .map(|b| ctx.getintbound_handle(&b).borrow().clone())
+            .expect("getintbound: operand must resolve to a BoxRef");
         assert!(
             b0.upper <= 9,
             "After GUARD_TRUE(INT_LT(i0, 10)), i0.upper should be <= 9, got {}",
@@ -3555,7 +3575,10 @@ mod tests {
 
         let (_result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
 
-        let b0 = ctx.getintbound(OpRef::int_op(0));
+        let b0 = ctx
+            .ensure_box(OpRef::int_op(0))
+            .map(|b| ctx.getintbound_handle(&b).borrow().clone())
+            .expect("getintbound: operand must resolve to a BoxRef");
         assert!(
             b0.lower >= 5,
             "After GUARD_TRUE(INT_GE(i0, 5)), i0.lower should be >= 5, got {}",
@@ -3719,7 +3742,10 @@ mod tests {
             "INT_LT should be removed when known true"
         );
         // The constant should be set
-        let b = ctx.getintbound(OpRef::int_op(2));
+        let b = ctx
+            .ensure_box(OpRef::int_op(2))
+            .map(|b| ctx.getintbound_handle(&b).borrow().clone())
+            .expect("getintbound: operand must resolve to a BoxRef");
         assert!(b.is_constant() && b.get_constant_int() == 1);
     }
 
@@ -3740,7 +3766,10 @@ mod tests {
             result.is_empty(),
             "INT_LT should be removed when known false"
         );
-        let b = ctx.getintbound(OpRef::int_op(2));
+        let b = ctx
+            .ensure_box(OpRef::int_op(2))
+            .map(|b| ctx.getintbound_handle(&b).borrow().clone())
+            .expect("getintbound: operand must resolve to a BoxRef");
         assert!(b.is_constant() && b.get_constant_int() == 0);
     }
 
@@ -3757,7 +3786,10 @@ mod tests {
             result.is_empty(),
             "INT_EQ(x, x) should be removed (always 1)"
         );
-        let b = ctx.getintbound(OpRef::int_op(1));
+        let b = ctx
+            .ensure_box(OpRef::int_op(1))
+            .map(|b| ctx.getintbound_handle(&b).borrow().clone())
+            .expect("getintbound: operand must resolve to a BoxRef");
         assert!(b.is_constant() && b.get_constant_int() == 1);
     }
 
@@ -3774,7 +3806,10 @@ mod tests {
             result.is_empty(),
             "INT_NE(x, x) should be removed (always 0)"
         );
-        let b = ctx.getintbound(OpRef::int_op(1));
+        let b = ctx
+            .ensure_box(OpRef::int_op(1))
+            .map(|b| ctx.getintbound_handle(&b).borrow().clone())
+            .expect("getintbound: operand must resolve to a BoxRef");
         assert!(b.is_constant() && b.get_constant_int() == 0);
     }
 
@@ -3832,7 +3867,10 @@ mod tests {
 
         let (result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
         assert_eq!(result.len(), 1);
-        let b = ctx.getintbound(OpRef::int_op(2));
+        let b = ctx
+            .ensure_box(OpRef::int_op(2))
+            .map(|b| ctx.getintbound_handle(&b).borrow().clone())
+            .expect("getintbound: operand must resolve to a BoxRef");
         // [10, 20] - [0, 5] = [5, 20]
         assert_eq!(b.lower, 5);
         assert_eq!(b.upper, 20);
@@ -3852,7 +3890,10 @@ mod tests {
 
         let (result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
         assert_eq!(result.len(), 1);
-        let b = ctx.getintbound(OpRef::int_op(2));
+        let b = ctx
+            .ensure_box(OpRef::int_op(2))
+            .map(|b| ctx.getintbound_handle(&b).borrow().clone())
+            .expect("getintbound: operand must resolve to a BoxRef");
         // [2, 5] * [3, 7] = [6, 35]
         assert_eq!(b.lower, 6);
         assert_eq!(b.upper, 35);
@@ -3872,7 +3913,10 @@ mod tests {
 
         let (result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
         assert_eq!(result.len(), 1);
-        let b = ctx.getintbound(OpRef::int_op(2));
+        let b = ctx
+            .ensure_box(OpRef::int_op(2))
+            .map(|b| ctx.getintbound_handle(&b).borrow().clone())
+            .expect("getintbound: operand must resolve to a BoxRef");
         // AND of [0, 255] and [0, 15] -> [0, 15]
         assert!(b.lower >= 0);
         assert!(b.upper <= 15);
@@ -3897,7 +3941,10 @@ mod tests {
             "INT_AND of constants should be folded out, got {:?}",
             result.iter().map(|o| o.opcode).collect::<Vec<_>>()
         );
-        let b = ctx.getintbound(OpRef::int_op(2));
+        let b = ctx
+            .ensure_box(OpRef::int_op(2))
+            .map(|b| ctx.getintbound_handle(&b).borrow().clone())
+            .expect("getintbound: operand must resolve to a BoxRef");
         assert!(b.is_constant(), "result should be constant");
         assert_eq!(b.get_constant_int(), 0x0f);
     }
@@ -3960,7 +4007,10 @@ mod tests {
             "INT_OR of constants should be folded out, got {:?}",
             result.iter().map(|o| o.opcode).collect::<Vec<_>>()
         );
-        let b = ctx.getintbound(OpRef::int_op(2));
+        let b = ctx
+            .ensure_box(OpRef::int_op(2))
+            .map(|b| ctx.getintbound_handle(&b).borrow().clone())
+            .expect("getintbound: operand must resolve to a BoxRef");
         assert!(b.is_constant(), "result should be constant");
         assert_eq!(b.get_constant_int(), 0xff);
     }
@@ -4014,7 +4064,10 @@ mod tests {
         let ops = vec![make_op(OpCode::IntForceGeZero, &[OpRef::int_op(0)], 1)];
 
         let (_result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
-        let b = ctx.getintbound(OpRef::int_op(1));
+        let b = ctx
+            .ensure_box(OpRef::int_op(1))
+            .map(|b| ctx.getintbound_handle(&b).borrow().clone())
+            .expect("getintbound: operand must resolve to a BoxRef");
         assert!(
             b.lower >= 0,
             "INT_FORCE_GE_ZERO result should be >= 0, got {}",
@@ -4034,7 +4087,10 @@ mod tests {
         let ops = vec![op];
 
         let (_result, mut ctx) = run_pass_with_bounds(&ops, &[]);
-        let b = ctx.getintbound(OpRef::int_op(1));
+        let b = ctx
+            .ensure_box(OpRef::int_op(1))
+            .map(|b| ctx.getintbound_handle(&b).borrow().clone())
+            .expect("getintbound: operand must resolve to a BoxRef");
         assert!(b.lower >= 0, "ARRAYLEN_GC result should be non-negative");
     }
 
@@ -4043,7 +4099,10 @@ mod tests {
         let ops = vec![make_op(OpCode::Strlen, &[OpRef::int_op(0)], 1)];
 
         let (_result, mut ctx) = run_pass_with_bounds(&ops, &[]);
-        let b = ctx.getintbound(OpRef::int_op(1));
+        let b = ctx
+            .ensure_box(OpRef::int_op(1))
+            .map(|b| ctx.getintbound_handle(&b).borrow().clone())
+            .expect("getintbound: operand must resolve to a BoxRef");
         assert!(b.lower >= 0, "STRLEN result should be non-negative");
     }
 
@@ -4053,7 +4112,10 @@ mod tests {
         let ops = vec![make_op(OpCode::IntNeg, &[OpRef::int_op(0)], 1)];
 
         let (_result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
-        let b = ctx.getintbound(OpRef::int_op(1));
+        let b = ctx
+            .ensure_box(OpRef::int_op(1))
+            .map(|b| ctx.getintbound_handle(&b).borrow().clone())
+            .expect("getintbound: operand must resolve to a BoxRef");
         // neg([3, 10]) = [-10, -3]
         assert_eq!(b.lower, -10);
         assert_eq!(b.upper, -3);
@@ -4065,7 +4127,10 @@ mod tests {
         let ops = vec![make_op(OpCode::IntInvert, &[OpRef::int_op(0)], 1)];
 
         let (_result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
-        let b = ctx.getintbound(OpRef::int_op(1));
+        let b = ctx
+            .ensure_box(OpRef::int_op(1))
+            .map(|b| ctx.getintbound_handle(&b).borrow().clone())
+            .expect("getintbound: operand must resolve to a BoxRef");
         // invert([3, 10]) = [!10, !3] = [-11, -4]
         assert_eq!(b.lower, -11);
         assert_eq!(b.upper, -4);
@@ -4083,7 +4148,10 @@ mod tests {
 
         let (result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
         assert!(result.is_empty(), "INT_SUB_OVF(x, x) should be removed");
-        let b = ctx.getintbound(OpRef::int_op(1));
+        let b = ctx
+            .ensure_box(OpRef::int_op(1))
+            .map(|b| ctx.getintbound_handle(&b).borrow().clone())
+            .expect("getintbound: operand must resolve to a BoxRef");
         assert!(b.is_constant() && b.get_constant_int() == 0);
     }
 
@@ -4123,7 +4191,10 @@ mod tests {
         )];
 
         let (_result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
-        let b = ctx.getintbound(OpRef::int_op(2));
+        let b = ctx
+            .ensure_box(OpRef::int_op(2))
+            .map(|b| ctx.getintbound_handle(&b).borrow().clone())
+            .expect("getintbound: operand must resolve to a BoxRef");
         // [1, 4] << 2 = [4, 16]
         assert_eq!(b.lower, 4);
         assert_eq!(b.upper, 16);
@@ -4144,7 +4215,10 @@ mod tests {
         )];
 
         let (_result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
-        let b = ctx.getintbound(OpRef::int_op(2));
+        let b = ctx
+            .ensure_box(OpRef::int_op(2))
+            .map(|b| ctx.getintbound_handle(&b).borrow().clone())
+            .expect("getintbound: operand must resolve to a BoxRef");
         // [8, 20] >> 2 = [2, 5]
         assert_eq!(b.lower, 2);
         assert_eq!(b.upper, 5);
@@ -4232,7 +4306,10 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::IntSignext);
         // Result should have bounds [-128, 127]
-        let b = ctx.getintbound(OpRef::int_op(2));
+        let b = ctx
+            .ensure_box(OpRef::int_op(2))
+            .map(|b| ctx.getintbound_handle(&b).borrow().clone())
+            .expect("getintbound: operand must resolve to a BoxRef");
         assert!(b.lower >= -128);
         assert!(b.upper <= 127);
     }
@@ -4258,7 +4335,11 @@ mod tests {
         // INT_ADD should remain, INT_LT should be eliminated as constant true
         assert_eq!(result.len(), 1, "only INT_ADD should remain");
         assert_eq!(result[0].opcode, OpCode::IntAdd);
-        assert_eq!(ctx.get_constant_int(OpRef::int_op(4)), Some(1));
+        assert_eq!(
+            ctx.get_box_replacement_box(OpRef::int_op(4))
+                .and_then(|b| b.const_value()),
+            Some(Value::Int(1))
+        );
     }
 
     // ── Test: Guard narrowing with INT_IS_TRUE ──
@@ -4276,7 +4357,10 @@ mod tests {
         ];
 
         let (_result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
-        let b0 = ctx.getintbound(OpRef::int_op(0));
+        let b0 = ctx
+            .ensure_box(OpRef::int_op(0))
+            .map(|b| ctx.getintbound_handle(&b).borrow().clone())
+            .expect("getintbound: operand must resolve to a BoxRef");
         assert!(
             b0.lower >= 1,
             "After GUARD_TRUE(INT_IS_TRUE(i0)), i0.lower should be >= 1, got {}",
@@ -4297,7 +4381,10 @@ mod tests {
         ];
 
         let (_result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
-        let b0 = ctx.getintbound(OpRef::int_op(0));
+        let b0 = ctx
+            .ensure_box(OpRef::int_op(0))
+            .map(|b| ctx.getintbound_handle(&b).borrow().clone())
+            .expect("getintbound: operand must resolve to a BoxRef");
         assert!(
             b0.is_constant() && b0.get_constant_int() == 0,
             "After GUARD_FALSE(INT_IS_TRUE(i0)), i0 should be 0, got [{}, {}]",
@@ -4319,7 +4406,10 @@ mod tests {
         )];
 
         let (_result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
-        let b = ctx.getintbound(OpRef::int_op(1));
+        let b = ctx
+            .ensure_box(OpRef::int_op(1))
+            .map(|b| ctx.getintbound_handle(&b).borrow().clone())
+            .expect("getintbound: operand must resolve to a BoxRef");
         assert!(b.lower >= 6, "lower should be >= 6, got {}", b.lower);
         assert!(b.upper <= 10, "upper should be <= 10, got {}", b.upper);
     }
@@ -4346,7 +4436,10 @@ mod tests {
             .expect("body-namespace OpRef must have a BoxRef slot");
         ctx.setintbound(&i1_box, &IntBound::bounded(-5, -1));
         pass.propagate_bounds_backward(OpRef::int_op(1), &mut ctx);
-        let b0 = ctx.getintbound(OpRef::int_op(0));
+        let b0 = ctx
+            .ensure_box(OpRef::int_op(0))
+            .map(|b| ctx.getintbound_handle(&b).borrow().clone())
+            .expect("getintbound: operand must resolve to a BoxRef");
         assert!(
             b0.lower >= 1,
             "backward neg: lower should be >= 1, got {}",
@@ -4368,7 +4461,10 @@ mod tests {
             2,
         )];
         let (_result, mut ctx) = run_pass_with_bounds(&ops, &[]);
-        let b = ctx.getintbound(OpRef::int_op(2));
+        let b = ctx
+            .ensure_box(OpRef::int_op(2))
+            .map(|b| ctx.getintbound_handle(&b).borrow().clone())
+            .expect("getintbound: operand must resolve to a BoxRef");
         assert!(b.lower >= 0, "STRGETITEM lower should be >= 0");
         assert!(b.upper <= 255, "STRGETITEM upper should be <= 255");
     }
@@ -4390,7 +4486,10 @@ mod tests {
         ];
 
         let (_result, mut ctx) = run_pass_with_bounds(&[call], &initial_bounds);
-        let b = ctx.getintbound(OpRef::int_op(2));
+        let b = ctx
+            .ensure_box(OpRef::int_op(2))
+            .map(|b| ctx.getintbound_handle(&b).borrow().clone())
+            .expect("getintbound: operand must resolve to a BoxRef");
         assert_eq!(b.lower, -50);
         assert_eq!(b.upper, -3);
     }
@@ -4411,7 +4510,10 @@ mod tests {
         ];
 
         let (_result, mut ctx) = run_pass_with_bounds(&[call], &initial_bounds);
-        let b = ctx.getintbound(OpRef::int_op(2));
+        let b = ctx
+            .ensure_box(OpRef::int_op(2))
+            .map(|b| ctx.getintbound_handle(&b).borrow().clone())
+            .expect("getintbound: operand must resolve to a BoxRef");
         assert_eq!(b.lower, -3);
         assert_eq!(b.upper, 0);
     }

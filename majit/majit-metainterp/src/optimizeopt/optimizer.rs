@@ -690,9 +690,15 @@ impl Optimizer {
                         .map_or(false, |b| ctx.is_virtual(b));
                     if ctx.skip_flush_mode
                         && !field_ref.is_none()
-                        && !ctx.is_constant(field_ref)
+                        && !ctx
+                            .get_box_replacement_box(field_ref)
+                            .and_then(|cb| cb.const_value())
+                            .is_some()
                         && !field_is_virtual
-                        && ctx.get_constant(field_ref).is_none()
+                        && ctx
+                            .get_box_replacement_box(field_ref)
+                            .and_then(|cb| cb.const_value())
+                            .is_none()
                     {
                         same_as_targets.push((field_ref, entries.len(), field_idx));
                     }
@@ -727,7 +733,12 @@ impl Optimizer {
         // reserve_pos from returning a position that's already used
         // as a virtual head (allocated during import_state).
         for entry in &entries {
-            if !entry.head.is_none() && !ctx.is_constant(entry.head) {
+            if !entry.head.is_none()
+                && !ctx
+                    .get_box_replacement_box(entry.head)
+                    .and_then(|cb| cb.const_value())
+                    .is_some()
+            {
                 ctx.next_pos = ctx.next_pos.max(entry.head.raw() + 1);
             }
         }
@@ -2152,7 +2163,7 @@ impl Optimizer {
                     let source = typed_inputargs[i];
                     let target = nia[i];
                     // Constants don't participate in forwarding.
-                    if ctx.is_constant(target) {
+                    if ctx.get_box_replacement_box(target).and_then(|cb| cb.const_value()).is_some() {
                         return source;
                     }
                     // Cross-slot collision: target is another slot's source.
@@ -2333,7 +2344,13 @@ impl Optimizer {
                     .map_or(false, |b| ctx.has_ptr_info(b));
                 let resolved_is_ref =
                     ctx.opref_type(resolved) == Some(majit_ir::Type::Ref) || resolved_has_ptr_info;
-                if expected_ref && !resolved_is_ref && !ctx.is_constant(resolved) {
+                if expected_ref
+                    && !resolved_is_ref
+                    && !ctx
+                        .get_box_replacement_box(resolved)
+                        .and_then(|cb| cb.const_value())
+                        .is_some()
+                {
                     let arg_is_virtual = ctx
                         .get_box_replacement_box(arg)
                         .as_ref()
@@ -2521,7 +2538,7 @@ impl Optimizer {
                     .collect();
                 let original_args = resolved_args.clone();
                 for (slot_idx, arg) in resolved_args.iter_mut().enumerate() {
-                    if ctx.is_constant(*arg) || *arg == OpRef::NONE {
+                    if ctx.get_box_replacement_box(*arg).and_then(|cb| cb.const_value()).is_some() || *arg == OpRef::NONE {
                         continue;
                     }
                     let is_dup = !seen.insert(*arg);
@@ -4039,7 +4056,10 @@ impl Optimizer {
                             // either invariant violation rather
                             // than silently coercing to 0.
                             let boxindex = ctx.get_box_replacement(pf_op.arg(1));
-                            let idx = match ctx.get_constant_int(boxindex) {
+                            let idx = match ctx
+                                .get_box_replacement_box(boxindex)
+                                .and_then(|cb| cb.const_int())
+                            {
                                 Some(v) if (0..=i32::MAX as i64).contains(&v) => v,
                                 _ => std::panic::panic_any(crate::optimize::InvalidLoop(
                                     "_add_pending_fields: SETARRAYITEM_GC index \
@@ -4353,12 +4373,18 @@ impl Optimizer {
             return op;
         }
         // optimizer.py:756-757: b = self.getintbound(op.getarg(0)); if b.is_bool()
-        let b = ctx.getintbound_via_box(arg0);
+        let b = ctx
+            .ensure_box(arg0)
+            .map(|b| ctx.getintbound_handle(&b).borrow().clone())
+            .expect("getintbound: operand must resolve to a BoxRef");
         if !b.is_bool() {
             return op;
         }
         // optimizer.py:762: constvalue = op.getarg(1).getint()
-        let Some(constvalue) = ctx.get_constant_int(op.arg(1)) else {
+        let Some(constvalue) = ctx
+            .get_box_replacement_box(op.arg(1))
+            .and_then(|cb| cb.const_int())
+        else {
             return op;
         };
         // optimizer.py:763-775: 0 → GUARD_FALSE, 1 → GUARD_TRUE, else give up.

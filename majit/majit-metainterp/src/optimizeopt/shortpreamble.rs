@@ -1164,11 +1164,10 @@ pub(crate) fn classify_short_arg(
     // Const lookup priority: producer snapshot first (handles bridges and
     // unit-test consumer ctxs without pre-seeded const pool), then consumer
     // ctx (production: pre-seeded at optimizer.rs:1927).
-    if let Some(value) = short_box_const_values
-        .get(&arg)
-        .cloned()
-        .or_else(|| ctx.get_constant(arg))
-    {
+    if let Some(value) = short_box_const_values.get(&arg).cloned().or_else(|| {
+        ctx.get_box_replacement_box(arg)
+            .and_then(|cb| cb.const_value())
+    }) {
         let const_opref = imported_const_opref(ctx, imported_constants, arg, &value);
         return Some(crate::optimizeopt::ImportedShortPureArg::Const(
             value,

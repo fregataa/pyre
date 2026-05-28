@@ -230,7 +230,10 @@ impl StrPtrInfoExt for StrPtrInfo {
                     // vstring.py:179: `c.is_constant()` for Plain strings
                     // accepts only an actual ConstInt, not a synthesized
                     // ConstInt from a constant IntBound.
-                    chars.push(ctx.get_constant_int(ch_opref)?);
+                    chars.push(
+                        ctx.get_box_replacement_box(ch_opref)
+                            .and_then(|cb| cb.const_int())?,
+                    );
                 }
                 Some(chars)
             }
@@ -754,7 +757,11 @@ impl PtrInfoExt for PtrInfo {
             return false;
         }
         for &(_, val) in fields {
-            if !ctx.is_constant(val) {
+            if !ctx
+                .get_box_replacement_box(val)
+                .and_then(|cb| cb.const_value())
+                .is_some()
+            {
                 // Check if it's a virtual that is also immutable+constant
                 let resolved_box = ctx.get_box_replacement_box(val);
                 if let Some(info) = resolved_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
@@ -826,7 +833,10 @@ fn force_box_impl(
                     // info.py:144: _force_elements_immutable
                     // Write constant field values directly to the allocated memory.
                     for &(field_idx, val_ref) in fields.iter() {
-                        if let Some(value) = ctx.get_constant(val_ref) {
+                        if let Some(value) = ctx
+                            .get_box_replacement_box(val_ref)
+                            .and_then(|cb| cb.const_value())
+                        {
                             if let Some(fd) = lookup_field_descr(field_descrs, field_idx) {
                                 if let Some(field_d) = fd.as_field_descr() {
                                     let offset = field_d.offset();

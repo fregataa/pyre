@@ -881,7 +881,12 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
     }
 
     fn is_const(&self, opref: OpRef) -> bool {
-        if self.ctx.get_constant(opref).is_some() {
+        if self
+            .ctx
+            .get_box_replacement_box(opref)
+            .and_then(|cb| cb.const_value())
+            .is_some()
+        {
             return true;
         }
         matches!(
@@ -894,7 +899,11 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
     }
 
     fn get_const(&self, opref: OpRef) -> (i64, majit_ir::Type) {
-        match self.ctx.get_constant(opref) {
+        match self
+            .ctx
+            .get_box_replacement_box(opref)
+            .and_then(|cb| cb.const_value())
+        {
             Some(Value::Int(v)) => (v, majit_ir::Type::Int),
             Some(Value::Float(f)) => (f.to_bits() as i64, majit_ir::Type::Float),
             Some(Value::Ref(r)) => (r.0 as i64, majit_ir::Type::Ref),
@@ -940,7 +949,11 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
                 return tp;
             }
         }
-        if let Some(val) = self.ctx.get_constant(resolved) {
+        if let Some(val) = self
+            .ctx
+            .get_box_replacement_box(resolved)
+            .and_then(|cb| cb.const_value())
+        {
             return val.get_type();
         }
         // Producing op intrinsic type (resoperation.py:1693
@@ -2693,7 +2706,11 @@ impl OptContext {
                     ) else {
                         return false;
                     };
-                    if self.get_constant_int(func_opref).is_none() {
+                    if self
+                        .get_box_replacement_box(func_opref)
+                        .and_then(|cb| cb.const_int())
+                        .is_none()
+                    {
                         return false;
                     }
                     let mut op = Op::new(loop_invariant_opcode(result_type), &[func_opref]);
@@ -2744,7 +2761,10 @@ impl OptContext {
         // source directly (RPython parity for non-invented `op = self.res`).
         let result = self.get_box_replacement(preamble_op.op);
         let result_type = preamble_op.preamble_op.result_type();
-        let is_constant = self.is_constant(preamble_source);
+        let is_constant = self
+            .get_box_replacement_box(preamble_source)
+            .and_then(|cb| cb.const_value())
+            .is_some();
         let first_use = !self.imported_short_preamble_used.contains(&preamble_source);
         if first_use {
             self.imported_short_preamble_used.push(preamble_source);
@@ -3131,7 +3151,11 @@ impl OptContext {
             }
         }
         // unroll.py:57: if op.is_constant(): return
-        if self.is_constant(op) {
+        if self
+            .get_box_replacement_box(op)
+            .and_then(|cb| cb.const_value())
+            .is_some()
+        {
             return;
         }
         // BoxRef shim for `set_ptr_info` / `make_nonnull` calls below.
@@ -3330,7 +3354,11 @@ impl OptContext {
             }
         }
         // unroll.py:57-58 `if op.is_constant(): return`
-        if self.is_constant(target) {
+        if self
+            .get_box_replacement_box(target)
+            .and_then(|cb| cb.const_value())
+            .is_some()
+        {
             return;
         }
         match preamble_info {
@@ -3387,7 +3415,11 @@ impl OptContext {
     ) {
         use crate::optimizeopt::info::OpInfo;
         let target = self.get_box_replacement(op);
-        if self.is_constant(target) {
+        if self
+            .get_box_replacement_box(target)
+            .and_then(|cb| cb.const_value())
+            .is_some()
+        {
             return;
         }
         if let Some(b) = self.get_box_replacement_box(op) {
@@ -4363,7 +4395,10 @@ impl OptContext {
             self.opref_type(opref)
         );
         let replaced = self.get_box_replacement(opref);
-        if let Some(Value::Int(v)) = self.get_constant(replaced) {
+        if let Some(Value::Int(v)) = self
+            .get_box_replacement_box(replaced)
+            .and_then(|cb| cb.const_value())
+        {
             return Some(crate::optimizeopt::intutils::IntBound::from_constant(
                 v as i64,
             ));
@@ -4382,64 +4417,6 @@ impl OptContext {
         // BoxRef via `ensure_box`.
         let b = self.get_box_replacement_box(replaced)?;
         b.int_bound().map(|ib| ib.clone())
-    }
-
-    /// optimizer.py:99-113: getintbound(op) — get or create IntBound for
-    /// an int-typed box. Lazy: creates unbounded on first access and stores
-    /// it on the BoxRef's `_forwarded` slot.
-    pub(crate) fn getintbound_via_box(
-        &mut self,
-        opref: OpRef,
-    ) -> crate::optimizeopt::intutils::IntBound {
-        match self.get_box_replacement_box(opref) {
-            Some(b) => self.getintbound_handle(&b).borrow().clone(),
-            None => {
-                let b = self
-                    .ensure_box(opref)
-                    .expect("getintbound_via_box: OpRef must resolve to a BoxRef");
-                self.getintbound_handle(&b).borrow().clone()
-            }
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn getintbound(&mut self, opref: OpRef) -> crate::optimizeopt::intutils::IntBound {
-        use crate::optimizeopt::info::OpInfo;
-        // optimizer.py:100: assert op.type == 'i'
-        assert!(
-            matches!(self.opref_type(opref), Some(majit_ir::Type::Int) | None),
-            "getintbound: expected 'i'-typed OpRef, got {:?}",
-            self.opref_type(opref)
-        );
-        let replaced = self.get_box_replacement(opref);
-        if let Some(Value::Int(v)) = self.get_constant(replaced) {
-            return crate::optimizeopt::intutils::IntBound::from_constant(v as i64);
-        }
-        // optimizer.py:110 second `assert op.type == 'i'` — Box.type is
-        // immutable, so the replaced op must still be int-typed.
-        assert!(
-            matches!(self.opref_type(replaced), Some(majit_ir::Type::Int) | None),
-            "getintbound: replaced OpRef must be int-typed, got {:?}",
-            self.opref_type(replaced)
-        );
-        if replaced.is_constant() {
-            return crate::optimizeopt::intutils::IntBound::unbounded();
-        }
-        // BoxRef-authoritative read. IntBound writers populate the BoxRef via
-        // `ensure_box`; non-IntBound states match PyPy's rare-case branch
-        // and return unbounded without overwriting the slot.
-        let b = self
-            .ensure_box(replaced)
-            .expect("body-namespace OpRef must have a BoxRef slot");
-        match &b.get_forwarded() {
-            crate::r#box::Forwarded::Info(OpInfo::IntBound(rc)) => return rc.borrow().clone(),
-            crate::r#box::Forwarded::None => {}
-            _ => return crate::optimizeopt::intutils::IntBound::unbounded(),
-        }
-        // optimizer.py:110-112: fw is None → create unbounded and store
-        let intbound = crate::optimizeopt::intutils::IntBound::unbounded();
-        b.set_forwarded_info(OpInfo::int_bound(intbound.clone()));
-        intbound
     }
 
     /// `optimizer.py:99-113 getintbound(op)` orthodox identity variant.
@@ -4854,17 +4831,6 @@ impl OptContext {
         None
     }
 
-    /// Actual-Const reader: `box = box.get_box_replacement(); isinstance(box, Const)`.
-    ///
-    /// This intentionally does not use `get_constant_box`, because PyPy's
-    /// `optimizer.get_constant_box` also synthesizes `ConstInt` from constant
-    /// `IntBound`. Call this only for source sites that literally test
-    /// `isinstance(..., Const)` / `box.is_constant()` / direct `ConstInt`.
-    pub fn get_constant(&self, opref: OpRef) -> Option<Value> {
-        self.get_box_replacement_box(opref)
-            .and_then(|b| b.const_value())
-    }
-
     /// Register a concrete runtime value for an OpRef by writing it to
     /// the corresponding `BoxRef`'s per-type mixin slot (RPython
     /// `IntOp._resint` / `RefOp._resref` / `FloatOp._resfloat`).
@@ -4877,51 +4843,67 @@ impl OptContext {
     /// resoperation.py:691-720 `InputArg*.getint/getref_base/getfloatstorage`
     /// — extract the concrete runtime value carried by an OpRef.
     pub fn runtime_value_of(&self, opref: OpRef) -> Option<Value> {
-        if let Some(v) = self.get_constant(opref) {
+        if let Some(v) = self
+            .get_box_replacement_box(opref)
+            .and_then(|b| b.const_value())
+        {
             return Some(v);
         }
         let box_ref = self.get_box_replacement_box(opref)?;
         box_ref.get_value()
     }
 
-    /// Whether `opref` has a known constant value.
-    pub fn is_constant(&self, opref: OpRef) -> bool {
-        self.get_constant(opref).is_some()
-    }
-
-    /// `history.py:204-205 Const.same_box → same_constant` — value-aware
-    /// `same_box(query, stored)`. Walks both operands through
-    /// `get_box_replacement` first (`resoperation.py:58`), then compares:
-    ///   1. Identity (`OpRef ==`) — matches PyPy `AbstractValue.same_box`
-    ///      for the non-Const fast path.
-    ///   2. Value equality via `get_constant` for both sides — matches
-    ///      PyPy `Const.same_box` overload which delegates to
-    ///      `same_constant`. Two distinct ConstInt slots holding the same
-    ///      `Value::Int(42)` are `same_box == true`.
+    /// resoperation.py:38 `AbstractResOpOrInputArg.same_box`: `self is other`
+    /// — Python object identity, NOT the value-aware `Const.same_box`.
     ///
-    /// Extracted from the previous `lookup_pure` closure + the inline body
-    /// of `_same_args` in `optimizeopt/pure.rs`. Future Phase A.3 inline-
-    /// storage work for `OpRef` will let this method shed the `&self`
-    /// parameter for Const-Const cases; until then callers route through
-    /// `OptContext` to reach the constant pool.
-    pub fn same_box(&self, query: OpRef, stored: OpRef) -> bool {
-        let query = self.get_box_replacement(query);
-        let stored = self.get_box_replacement(stored);
-        if query == stored {
-            return true;
-        }
-        match (self.get_constant(query), self.get_constant(stored)) {
-            (Some(a), Some(b)) => a == b,
-            _ => false,
-        }
+    /// Walks both operands through `get_box_replacement` (resoperation.py:58)
+    /// then compares the resolved `OpRef`s. The `OpRef` variant tag encodes
+    /// (kind, type, position); each `make_constant_*` mints a fresh
+    /// `const_pool` slot, so two distinct ConstInt slots holding the same
+    /// value resolve to distinct `OpRef`s and are NOT `box_is` — matching
+    /// PyPy's `is` (two `ConstInt(5)` instances are distinct objects).
+    /// Resolved-`OpRef` equality is a faithful 1:1 encoding of upstream
+    /// object identity: the chain walk lands on one terminal `OpRef` per
+    /// box, so `==` holds iff the operands are the same box.
+    /// Use this where RPython writes `arg0 is arg1`; use `same_box` where
+    /// RPython writes `arg0.same_box(arg1)`.
+    /// Convergence path: once Goal D retires `box_pool` / OpRef indexing and
+    /// the trace yields a shared `BoxRef` per box, this collapses to
+    /// `Rc::ptr_eq(&get_box_replacement(a), &get_box_replacement(b))`.
+    pub fn box_is(&self, a: OpRef, b: OpRef) -> bool {
+        self.get_box_replacement(a) == self.get_box_replacement(b)
     }
 
-    /// Get constant integer value, if known.
-    pub fn get_constant_int(&self, opref: OpRef) -> Option<i64> {
-        self.get_constant(opref).and_then(|v| match v {
-            Value::Int(i) => Some(i),
-            _ => None,
-        })
+    /// resoperation.py:38 `same_box` (non-Const: `self is other`) +
+    /// history.py:211 `Const.same_box` (value comparison via
+    /// `same_constant`). Resolves both operands through
+    /// `get_box_replacement` then delegates to `BoxRef::same_box`. Falls
+    /// back to resolved-`OpRef` identity plus constant-value comparison
+    /// when either box is absent (test fixtures without a populated
+    /// `box_pool`).
+    pub fn same_box(&self, query: OpRef, stored: OpRef) -> bool {
+        match (
+            self.get_box_replacement_box(query),
+            self.get_box_replacement_box(stored),
+        ) {
+            (Some(ref a), Some(ref b)) => a.same_box(b),
+            _ => {
+                let query = self.get_box_replacement(query);
+                let stored = self.get_box_replacement(stored);
+                if query == stored {
+                    return true;
+                }
+                match (
+                    self.get_box_replacement_box(query)
+                        .and_then(|cb| cb.const_value()),
+                    self.get_box_replacement_box(stored)
+                        .and_then(|cb| cb.const_value()),
+                ) {
+                    (Some(a), Some(b)) => a == b,
+                    _ => false,
+                }
+            }
+        }
     }
 
     /// vstring.py:237 `optstring.getintbound(box).is_constant()` pattern.
@@ -5079,7 +5061,11 @@ impl OptContext {
                         // Constant OpRefs may collide with virtual positions;
                         // forcing would corrupt the virtual's PtrInfo.
                         let resolved = self.get_box_replacement(farg);
-                        if !self.is_constant(resolved) {
+                        if !self
+                            .get_box_replacement_box(resolved)
+                            .and_then(|cb| cb.const_value())
+                            .is_some()
+                        {
                             self.force_box_inline(farg);
                         }
                     }
@@ -5117,7 +5103,10 @@ impl OptContext {
             return;
         }
         let arg1 = op.arg(1);
-        let Some(constvalue) = self.get_constant_int(arg1) else {
+        let Some(constvalue) = self
+            .get_box_replacement_box(arg1)
+            .and_then(|cb| cb.const_int())
+        else {
             return;
         };
         let new_opcode = match constvalue {
@@ -5488,18 +5477,6 @@ impl OptContext {
         let _ = frame_sizes;
     }
 
-    /// Get the IntBound for an OpRef, if known from forwarded info or constants.
-    /// Returns `None` for boxes that have no IntBound in `box._forwarded`.
-    /// OpRef-taking wrapper around [`Self::peek_intbound`]; preserved for
-    /// legacy callers in rewrite.rs that gate optimizations on "is a
-    /// bound known?". Retires when those callers migrate to BoxRef.
-    #[cfg(test)]
-    pub fn get_int_bound(&self, opref: OpRef) -> Option<crate::optimizeopt::intutils::IntBound> {
-        self.get_box_replacement_box(opref)
-            .as_ref()
-            .and_then(|b| self.peek_intbound_box(b))
-    }
-
     /// Allocate a fresh constant OpRef and store the value.
     ///
     /// RPython equivalent: `ConstInt(value)` — constants in RPython are
@@ -5530,28 +5507,17 @@ impl OptContext {
         pos
     }
 
-    /// Record a constant-folded value and return its OpRef.
-    ///
-    /// If `opref` is not already a known constant, records the value.
-    /// Returns `opref` (which is now known to be this constant).
-    /// Get constant float value, if known.
-    pub fn get_constant_float(&self, opref: OpRef) -> Option<f64> {
-        self.get_constant(opref).and_then(|v| match v {
-            Value::Float(f) => Some(f),
-            _ => None,
-        })
-    }
-
-    /// Look up the operation that produces a given OpRef.
-    /// Searches emitted operations and input ops.
+    /// Look up the operation that produces a given box.
     /// Used for pattern matching nested operations (e.g., int_add(int_add(x, C1), C2)).
     /// Returns a clone to avoid borrow conflicts with mutable ctx methods.
-    pub fn get_producing_op(&self, opref: OpRef) -> Option<Op> {
-        let opref = self.get_box_replacement(opref);
-        self.new_operations
-            .iter()
-            .find(|op| op.pos.get() == opref)
-            .map(|rc| (**rc).clone())
+    pub fn get_producing_op(&self, op: &crate::r#box::BoxRef) -> Option<Op> {
+        // resoperation.py:233 `_forwarded` host: a box's producing op is its
+        // bound op (set at emit, mod.rs bind_op before new_operations.push).
+        // Walk the forwarding chain first (resoperation.py:58) so the
+        // replacement box's producer is read.
+        op.get_box_replacement(false)
+            .bound_op()
+            .map(|rc| (*rc).clone())
     }
 
     /// Number of emitted operations so far.
@@ -5969,7 +5935,10 @@ impl OptContext {
         }
         // 2. Seeded constant — read the intrinsic Rust shape (history.py:220
         //    `ConstInt.type = INT` parity).
-        if let Some(val) = self.get_constant(resolved) {
+        if let Some(val) = self
+            .get_box_replacement_box(resolved)
+            .and_then(|cb| cb.const_value())
+        {
             return Some(val.get_type());
         }
         // 3. Producing op's intrinsic `type_` (resoperation.py:1693
@@ -6954,7 +6923,12 @@ impl OptContext {
     /// runs `ensure_ptr_info_arg0(op).as_mut().setfield(...)`.
     pub fn structinfo_setfield(&mut self, op: &Op, field_idx: u32, value: OpRef) {
         let arg0 = self.get_box_replacement(op.arg(0));
-        if arg0.is_constant() || self.is_constant(arg0) {
+        if arg0.is_constant()
+            || self
+                .get_box_replacement_box(arg0)
+                .and_then(|cb| cb.const_value())
+                .is_some()
+        {
             let parent_descr = op.with_field_descr(|fd| fd.get_parent_descr()).flatten();
             if let Some(info) = self.get_const_info_mut(arg0, parent_descr) {
                 info.setfield(field_idx, value);
@@ -6978,7 +6952,12 @@ impl OptContext {
     /// `PtrInfo::Array` rather than `PtrInfo::Instance`.
     pub fn arrayinfo_setitem(&mut self, op: &Op, index: usize, value: OpRef) {
         let arg0 = self.get_box_replacement(op.arg(0));
-        if arg0.is_constant() || self.is_constant(arg0) {
+        if arg0.is_constant()
+            || self
+                .get_box_replacement_box(arg0)
+                .and_then(|cb| cb.const_value())
+                .is_some()
+        {
             if let Some(descr) = op.getdescr() {
                 if let Some(info) = self.get_const_info_array_mut(arg0, descr) {
                     info.setitem(index, value);
@@ -7099,7 +7078,9 @@ impl OptContext {
         // contract: extract whatever GcRef we can (Ref → the gcref, raw
         // pointer Int → cast, anything else → null sentinel) and let the
         // downstream user decide whether to act on it.
-        let arg0_const = self.get_constant(arg0);
+        let arg0_const = self
+            .get_box_replacement_box(arg0)
+            .and_then(|cb| cb.const_value());
         if arg0.is_constant() || arg0_const.is_some() {
             let gcref = match arg0_const {
                 Some(Value::Ref(g)) => g,
@@ -9366,7 +9347,10 @@ mod intbound_invariant_tests {
         let mut ctx = OptContext::new(0);
         let opref = OpRef::ref_op(20_000);
         ctx.seed_constant(opref, Value::Ref(GcRef(0xdead_beef)));
-        let _ = ctx.getintbound(opref);
+        let _ = ctx
+            .ensure_box(opref)
+            .map(|b| ctx.getintbound_handle(&b).borrow().clone())
+            .expect("getintbound: operand must resolve to a BoxRef");
     }
 
     #[test]

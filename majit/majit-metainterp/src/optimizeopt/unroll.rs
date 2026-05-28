@@ -1924,7 +1924,7 @@ pub struct ExportedState {
     /// guaranteed to have producer constants pre-seeded (production
     /// already does this at `optimizer.rs:1927`; bridges and unit tests
     /// remain the open cases). At that point `classify_short_arg` can
-    /// read from `ctx.get_constant(arg)` exclusively.
+    /// read the box's `const_value()` exclusively.
     pub short_box_const_values: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, majit_ir::Value>,
     /// Short preamble builder for bridge entry.
     pub short_preamble: Option<crate::optimizeopt::shortpreamble::ShortPreamble>,
@@ -2974,7 +2974,10 @@ impl OptUnroll {
                 if state.short_box_const_values.contains_key(&arg) {
                     continue;
                 }
-                if let Some(value) = ctx.get_constant(arg) {
+                if let Some(value) = ctx
+                    .get_box_replacement_box(arg)
+                    .and_then(|cb| cb.const_value())
+                {
                     state.short_box_const_values.insert(arg, value);
                 }
             }
@@ -3260,7 +3263,13 @@ impl OptUnroll {
                         let arg_values: Vec<_> = guard_op
                             .getarglist()
                             .iter()
-                            .map(|&arg| (arg, ctx.get_constant(arg)))
+                            .map(|&arg| {
+                                (
+                                    arg,
+                                    ctx.get_box_replacement_box(arg)
+                                        .and_then(|cb| cb.const_value()),
+                                )
+                            })
                             .collect();
                         eprintln!(
                             "[jit][jte] target_token #{tt_idx} emit guard {:?} from {:?} args={:?}",
@@ -4009,7 +4018,10 @@ impl OptUnroll {
             }
         };
         if resolved.is_constant() {
-            if let Some(value) = ctx.get_constant(resolved) {
+            if let Some(value) = ctx
+                .get_box_replacement_box(resolved)
+                .and_then(|cb| cb.const_value())
+            {
                 return synthesize_const_info(value);
             }
         }
@@ -5935,7 +5947,10 @@ mod tests {
         // directly on the box's _forwarded slot via setintbound.
         // widen() relaxes bounds: lower < MININT/2 → MININT, upper > MAXINT/2 → MAXINT.
         // For [10, 20], both are within MININT/2..MAXINT/2 so widen() preserves them.
-        let imported_bound = ctx2.getintbound(OpRef::int_op(21));
+        let imported_bound = ctx2
+            .ensure_box(OpRef::int_op(21))
+            .map(|b| ctx2.getintbound_handle(&b).borrow().clone())
+            .expect("getintbound: operand must resolve to a BoxRef");
         assert_eq!((imported_bound.lower, imported_bound.upper), (10, 20));
     }
 
@@ -6062,8 +6077,16 @@ mod tests {
         // a Python identity. The fresh slot is the first one allocated
         // by `reserve_const_ref` in ctx2.
         let fresh_const = OpRef::const_ptr(0);
-        assert_eq!(ctx2.get_constant(fresh_const), Some(Value::Ref(ptr)));
-        assert_eq!(ctx2.get_constant(OpRef::const_ptr(23)), None);
+        assert_eq!(
+            ctx2.get_box_replacement_box(fresh_const)
+                .and_then(|cb| cb.const_value()),
+            Some(Value::Ref(ptr))
+        );
+        assert_eq!(
+            ctx2.get_box_replacement_box(OpRef::const_ptr(23))
+                .and_then(|cb| cb.const_value()),
+            None
+        );
         assert_eq!(
             ctx2.imported_short_pure_ops,
             vec![crate::optimizeopt::ImportedShortPureOp::new(
@@ -6122,9 +6145,14 @@ mod tests {
                 .map(|(_, v)| *v),
             Some(OpRef::int_op(11))
         );
-        assert_eq!(ctx2.get_constant(func), None);
         assert_eq!(
-            ctx2.get_constant(OpRef::const_int(0)),
+            ctx2.get_box_replacement_box(func)
+                .and_then(|cb| cb.const_value()),
+            None
+        );
+        assert_eq!(
+            ctx2.get_box_replacement_box(OpRef::const_int(0))
+                .and_then(|cb| cb.const_value()),
             Some(Value::Int(func_ptr))
         );
     }

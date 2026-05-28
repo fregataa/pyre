@@ -2985,7 +2985,11 @@ mod tests {
         let guard = &emitted[0];
 
         assert_eq!(guard.opcode, OpCode::GuardValue);
-        assert_eq!(ctx.get_constant(guard.arg(1)), Some(Value::Ref(expected)));
+        assert_eq!(
+            ctx.get_box_replacement_box(guard.arg(1))
+                .and_then(|cb| cb.const_value()),
+            Some(Value::Ref(expected))
+        );
     }
 
     // ── Export/Import tests ──

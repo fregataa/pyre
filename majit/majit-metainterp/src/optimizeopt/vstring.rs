@@ -39,14 +39,24 @@ pub fn get_const_ptr_for_unicode(chars: &[i64], ctx: &OptContext) -> Option<maji
 /// Constant-folding INT_ADD: folds add-0 and const+const at the optimizer
 /// level. Non-constant adds emit an INT_ADD operation.
 pub fn _int_add(box1: OpRef, box2: OpRef, ctx: &mut OptContext) -> OpRef {
-    if let Some(v1) = ctx.get_constant_int(box1) {
+    if let Some(v1) = ctx
+        .get_box_replacement_box(box1)
+        .and_then(|cb| cb.const_int())
+    {
         if v1 == 0 {
             return box2;
         }
-        if let Some(v2) = ctx.get_constant_int(box2) {
+        if let Some(v2) = ctx
+            .get_box_replacement_box(box2)
+            .and_then(|cb| cb.const_int())
+        {
             return ctx.emit_constant_int(v1 + v2);
         }
-    } else if ctx.get_constant_int(box2) == Some(0) {
+    } else if ctx
+        .get_box_replacement_box(box2)
+        .and_then(|cb| cb.const_int())
+        == Some(0)
+    {
         return box1;
     }
     let op = Op::new(OpCode::IntAdd, &[box1, box2]);
@@ -84,8 +94,14 @@ pub fn copy_str_content(
     };
 
     // vstring.py:341-347: determine inline threshold M using intbound
-    let srcoffset_bound = ctx.getintbound_via_box(srcoffsetbox);
-    let lgt_bound = ctx.getintbound_via_box(lengthbox);
+    let srcoffset_bound = ctx
+        .ensure_box(srcoffsetbox)
+        .map(|b| ctx.getintbound_handle(&b).borrow().clone())
+        .expect("getintbound: operand must resolve to a BoxRef");
+    let lgt_bound = ctx
+        .ensure_box(lengthbox)
+        .map(|b| ctx.getintbound_handle(&b).borrow().clone())
+        .expect("getintbound: operand must resolve to a BoxRef");
     // vstring.py:343: isinstance(srcbox, ConstPtr)
     let src_is_const = ctx
         .get_box_replacement_box(srcbox)
@@ -114,7 +130,10 @@ pub fn copy_str_content(
                     // vstring.py:350-351: charbox = optstring.strgetitem(
                     //     None, srcbox, srcoffsetbox, mode)
                     // vstring.py:495: vindex = self.getintbound(index)
-                    let vindex = ctx.getintbound_via_box(src_offset);
+                    let vindex = ctx
+                        .ensure_box(src_offset)
+                        .map(|b| ctx.getintbound_handle(&b).borrow().clone())
+                        .expect("getintbound: operand must resolve to a BoxRef");
                     let resolved_idx = if vindex.is_constant() {
                         Some(vindex.get_constant_int())
                     } else {
@@ -740,11 +759,11 @@ impl OptString {
     /// vstring.py:383-391 _int_sub — constant-fold if both args are constant,
     /// otherwise emit INT_SUB.
     fn int_sub(&self, a: OpRef, b: OpRef, ctx: &mut OptContext) -> OpRef {
-        if let Some(vb) = ctx.get_constant_int(b) {
+        if let Some(vb) = ctx.get_box_replacement_box(b).and_then(|cb| cb.const_int()) {
             if vb == 0 {
                 return a;
             }
-            if let Some(va) = ctx.get_constant_int(a) {
+            if let Some(va) = ctx.get_box_replacement_box(a).and_then(|cb| cb.const_int()) {
                 return self.emit_constant_int(va - vb, ctx);
             }
         }
@@ -1101,7 +1120,10 @@ impl OptString {
         };
         // vstring.py:795-805: l2info = self.getintbound(l2box)
         if let Some(l2ref) = l2box {
-            let l2info = ctx.getintbound_via_box(l2ref);
+            let l2info = ctx
+                .ensure_box(l2ref)
+                .map(|b| ctx.getintbound_handle(&b).borrow().clone())
+                .expect("getintbound: operand must resolve to a BoxRef");
             if l2info.is_constant() && l2info.get_constant_int() == 1 {
                 // vstring.py:799: vchar = self.strgetitem(None, arg2, CONST_0, mode)
                 if let Some(vchar) = self.strgetitem(arg2, 0, ctx) {
@@ -2156,7 +2178,11 @@ mod tests {
             first, second
         );
         // The cached value must equal the Plain length (3).
-        assert_eq!(ctx.get_constant_int(first), Some(3));
+        assert_eq!(
+            ctx.get_box_replacement_box(first)
+                .and_then(|cb| cb.const_int()),
+            Some(3)
+        );
     }
 
     /// vstring.py:117: StrPtrInfo.getstrlen caches STRLEN result in lgtop.
@@ -2234,8 +2260,16 @@ mod tests {
         assert_eq!(l2, l2_again, "lgtop identity: p1 must return same OpRef");
 
         // Both have value 3, and RPython's same_box checks constant equality.
-        assert_eq!(ctx.get_constant_int(l1.unwrap()), Some(3));
-        assert_eq!(ctx.get_constant_int(l2.unwrap()), Some(3));
+        assert_eq!(
+            ctx.get_box_replacement_box(l1.unwrap())
+                .and_then(|cb| cb.const_int()),
+            Some(3)
+        );
+        assert_eq!(
+            ctx.get_box_replacement_box(l2.unwrap())
+                .and_then(|cb| cb.const_int()),
+            Some(3)
+        );
     }
 
     /// vstring.py:341-347: copy_str_content uses getintbound().is_constant()
@@ -2414,7 +2448,11 @@ mod tests {
 
         // getstrlen_opref should cache lgtop = ConstInt(3).
         let len1 = ctx.getstrlen_opref(p0, 0);
-        assert_eq!(ctx.get_constant_int(len1), Some(3));
+        assert_eq!(
+            ctx.get_box_replacement_box(len1)
+                .and_then(|cb| cb.const_int()),
+            Some(3)
+        );
 
         // Query again — must return the same cached OpRef.
         let len2 = ctx.getstrlen_opref(p0, 0);

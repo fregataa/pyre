@@ -457,6 +457,48 @@ impl BoxRef {
         }
     }
 
+    /// `isinstance(box, ConstInt)` + `box.getint()` (history.py:233) — the
+    /// raw Const-int accessor with NO IntBound synthesis. Distinct from the
+    /// optimizer's `get_constant_int_box`, which also synthesizes ConstInt
+    /// from a constant IntBound (optimizer.py:383-386).
+    pub fn const_int(&self) -> Option<i64> {
+        match self.const_value() {
+            Some(Value::Int(i)) => Some(i),
+            _ => None,
+        }
+    }
+
+    /// resoperation.py:38 `AbstractResOpOrInputArg.same_box`: `self is other`
+    /// history.py:211 `Const.same_box`: delegates to `same_constant` (value comparison)
+    ///
+    /// The (kind, type, position) triple is a faithful 1:1 encoding of
+    /// upstream object identity: every box has exactly one such triple, so
+    /// triple-equality holds iff the two terminals are the same box —
+    /// matching `self is other` for non-Const and `same_constant` for Const
+    /// (history.py:251/292/338). `Rc::ptr_eq` cannot be used directly
+    /// because `get_box_replacement`'s chain walk reconstructs a fresh
+    /// `Rc<Box>` at each step from the OpRef variant tag, so independently
+    /// walked terminals never share an `Rc` even when they are the same box.
+    /// Convergence path: once Goal D retires `box_pool` / OpRef indexing and
+    /// the trace yields a single shared `BoxRef` per box (optimizer.py's
+    /// `trace.next() -> Box`), the reconstruction disappears and this body
+    /// collapses to `Rc::ptr_eq` for non-Const + `same_constant` for Const.
+    pub fn same_box(&self, other: &BoxRef) -> bool {
+        if self == other {
+            return true;
+        }
+        match (self.position(), other.position()) {
+            (Some(a), Some(b)) => {
+                a == b && self.is_inputarg() == other.is_inputarg() && self.type_() == other.type_()
+            }
+            (None, None) => match (self.const_value(), other.const_value()) {
+                (Some(a), Some(b)) => a == b,
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
     /// `resoperation.py:50 get_forwarded`. Returns a clone of the
     /// current slot. For bound ResOp boxes the read is routed
     /// through `op.forwarded`; extends this to InputArg via

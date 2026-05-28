@@ -986,7 +986,10 @@ impl VectorizingOptimizer {
             return None;
         }
 
-        let constant_of = |opref: OpRef| -> Option<i64> { ctx.get_constant_int(opref) };
+        let constant_of = |opref: OpRef| -> Option<i64> {
+            ctx.get_box_replacement_box(opref)
+                .and_then(|cb| cb.const_int())
+        };
 
         let start_pos = ctx.new_operations.len() as u32 + self.body_ops.len() as u32;
         let mut sched_state = VecScheduleState::new(start_pos);

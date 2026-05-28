@@ -197,7 +197,10 @@ impl OptRewrite {
             .get_box_replacement_box(arg1)
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
-            if let Some(inner) = ctx.get_producing_op(arg0) {
+            if let Some(inner) = ctx
+                .ensure_box(arg0)
+                .and_then(|pb| ctx.get_producing_op(&pb))
+            {
                 if inner.opcode == OpCode::IntAdd {
                     if let Some(c1) = ctx
                         .get_box_replacement_box(inner.arg(1))
@@ -218,7 +221,10 @@ impl OptRewrite {
             .get_box_replacement_box(arg1)
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
-            if let Some(inner) = ctx.get_producing_op(arg0) {
+            if let Some(inner) = ctx
+                .ensure_box(arg0)
+                .and_then(|pb| ctx.get_producing_op(&pb))
+            {
                 if inner.opcode == OpCode::IntSub {
                     if let Some(c1) = ctx
                         .get_box_replacement_box(inner.arg(1))
@@ -239,7 +245,10 @@ impl OptRewrite {
             .get_box_replacement_box(arg1)
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
-            if let Some(inner) = ctx.get_producing_op(arg0) {
+            if let Some(inner) = ctx
+                .ensure_box(arg0)
+                .and_then(|pb| ctx.get_producing_op(&pb))
+            {
                 if inner.opcode == OpCode::IntSub {
                     if let Some(c1) = ctx
                         .get_box_replacement_box(inner.arg(0))
@@ -256,7 +265,7 @@ impl OptRewrite {
         }
 
         // x + x -> x << 1
-        if arg0 == arg1 {
+        if ctx.same_box(arg0, arg1) {
             let one = self.emit_constant_int(ctx, 1);
             let mut new_op = Op::new(OpCode::IntLshift, &[arg0, one]);
             new_op.pos.set(op.pos.get());
@@ -309,7 +318,7 @@ impl OptRewrite {
             return OptimizationResult::Emit(new_op);
         }
         // sub_x_x: int_sub(x, x) => 0
-        if arg0 == arg1 {
+        if ctx.same_box(arg0, arg1) {
             ctx.make_constant(op.pos.get(), Value::Int(0));
             return OptimizationResult::Remove;
         }
@@ -319,7 +328,10 @@ impl OptRewrite {
             .get_box_replacement_box(arg1)
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
-            if let Some(inner) = ctx.get_producing_op(arg0) {
+            if let Some(inner) = ctx
+                .ensure_box(arg0)
+                .and_then(|pb| ctx.get_producing_op(&pb))
+            {
                 if inner.opcode == OpCode::IntAdd {
                     if let Some(c1) = ctx
                         .get_box_replacement_box(inner.arg(1))
@@ -336,7 +348,10 @@ impl OptRewrite {
         }
 
         // sub_add: int_sub(int_add(x, y), y) => x
-        if let Some(inner) = ctx.get_producing_op(arg0) {
+        if let Some(inner) = ctx
+            .ensure_box(arg0)
+            .and_then(|pb| ctx.get_producing_op(&pb))
+        {
             if inner.opcode == OpCode::IntAdd && inner.arg(1) == arg1 {
                 let b_old = ctx
                     .ensure_box(op.pos.get())
@@ -350,7 +365,10 @@ impl OptRewrite {
         }
 
         // sub_add_neg: int_sub(y, int_add(x, y)) => int_neg(x)
-        if let Some(inner) = ctx.get_producing_op(arg1) {
+        if let Some(inner) = ctx
+            .ensure_box(arg1)
+            .and_then(|pb| ctx.get_producing_op(&pb))
+        {
             if inner.opcode == OpCode::IntAdd && inner.arg(1) == arg0 {
                 let mut new_op = Op::new(OpCode::IntNeg, &[inner.arg(0)]);
                 new_op.pos.set(op.pos.get());
@@ -363,7 +381,10 @@ impl OptRewrite {
             .get_box_replacement_box(arg1)
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
-            if let Some(inner) = ctx.get_producing_op(arg0) {
+            if let Some(inner) = ctx
+                .ensure_box(arg0)
+                .and_then(|pb| ctx.get_producing_op(&pb))
+            {
                 if inner.opcode == OpCode::IntSub {
                     if let Some(c1) = ctx
                         .get_box_replacement_box(inner.arg(1))
@@ -395,7 +416,10 @@ impl OptRewrite {
             .get_box_replacement_box(arg1)
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
-            if let Some(inner) = ctx.get_producing_op(arg0) {
+            if let Some(inner) = ctx
+                .ensure_box(arg0)
+                .and_then(|pb| ctx.get_producing_op(&pb))
+            {
                 if inner.opcode == OpCode::IntInvert {
                     let mut new_op = Op::new(OpCode::IntNeg, &[inner.arg(0)]);
                     new_op.pos.set(op.pos.get());
@@ -405,7 +429,10 @@ impl OptRewrite {
         }
 
         // sub_xor_x_y_y: int_sub(int_xor(x, y), y) => x (if x & y == 0)
-        if let Some(inner) = ctx.get_producing_op(arg0) {
+        if let Some(inner) = ctx
+            .ensure_box(arg0)
+            .and_then(|pb| ctx.get_producing_op(&pb))
+        {
             if inner.opcode == OpCode::IntXor && inner.arg(1) == arg1 {
                 if let (Some(bx), Some(by)) = (
                     ctx.get_box_replacement_box(inner.arg(0))
@@ -564,7 +591,10 @@ impl OptRewrite {
         }
 
         // mul_lshift: int_mul(x, int_lshift(1, y)) => int_lshift(x, y)
-        if let Some(inner) = ctx.get_producing_op(arg1) {
+        if let Some(inner) = ctx
+            .ensure_box(arg1)
+            .and_then(|pb| ctx.get_producing_op(&pb))
+        {
             if inner.opcode == OpCode::IntLshift {
                 if let Some(1) = ctx
                     .get_box_replacement_box(inner.arg(0))
@@ -634,7 +664,7 @@ impl OptRewrite {
         }
 
         // x // x -> 1 (self-division, x != 0 guaranteed by semantics)
-        if arg0 == arg1 {
+        if ctx.same_box(arg0, arg1) {
             ctx.make_constant(op.pos.get(), Value::Int(1));
             return OptimizationResult::Remove;
         }
@@ -726,7 +756,7 @@ impl OptRewrite {
         }
 
         // x % x -> 0 (self-modulo)
-        if arg0 == arg1 {
+        if ctx.same_box(arg0, arg1) {
             ctx.make_constant(op.pos.get(), Value::Int(0));
             return OptimizationResult::Remove;
         }
@@ -815,7 +845,7 @@ impl OptRewrite {
             return OptimizationResult::Remove;
         }
         // and_x_x: int_and(a, a) => a
-        if arg0 == arg1 {
+        if ctx.same_box(arg0, arg1) {
             let b_old = ctx
                 .ensure_box(op.pos.get())
                 .expect("body-namespace OpRef must have a BoxRef slot");
@@ -831,7 +861,10 @@ impl OptRewrite {
             .get_box_replacement_box(arg1)
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
-            if let Some(inner) = ctx.get_producing_op(arg0) {
+            if let Some(inner) = ctx
+                .ensure_box(arg0)
+                .and_then(|pb| ctx.get_producing_op(&pb))
+            {
                 if inner.opcode == OpCode::IntAnd {
                     if let Some(c1) = ctx
                         .get_box_replacement_box(inner.arg(1))
@@ -848,7 +881,10 @@ impl OptRewrite {
         }
 
         // and_absorb: int_and(a, int_and(a, b)) => int_and(a, b)
-        if let Some(inner) = ctx.get_producing_op(arg1) {
+        if let Some(inner) = ctx
+            .ensure_box(arg1)
+            .and_then(|pb| ctx.get_producing_op(&pb))
+        {
             if inner.opcode == OpCode::IntAnd && inner.arg(0) == arg0 {
                 let b_old = ctx
                     .ensure_box(op.pos.get())
@@ -909,7 +945,10 @@ impl OptRewrite {
         }
 
         // and_or: int_and(int_or(x, y), z) => int_and(x, z) (if y & z known 0)
-        if let Some(inner) = ctx.get_producing_op(arg0) {
+        if let Some(inner) = ctx
+            .ensure_box(arg0)
+            .and_then(|pb| ctx.get_producing_op(&pb))
+        {
             if inner.opcode == OpCode::IntOr {
                 if let (Some(by), Some(bz)) = (
                     ctx.get_box_replacement_box(inner.arg(1))
@@ -991,7 +1030,7 @@ impl OptRewrite {
             return OptimizationResult::Remove;
         }
         // or_x_x: int_or(a, a) => a
-        if arg0 == arg1 {
+        if ctx.same_box(arg0, arg1) {
             let b_old = ctx
                 .ensure_box(op.pos.get())
                 .expect("body-namespace OpRef must have a BoxRef slot");
@@ -1007,7 +1046,10 @@ impl OptRewrite {
             .get_box_replacement_box(arg1)
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
-            if let Some(inner) = ctx.get_producing_op(arg0) {
+            if let Some(inner) = ctx
+                .ensure_box(arg0)
+                .and_then(|pb| ctx.get_producing_op(&pb))
+            {
                 if inner.opcode == OpCode::IntOr {
                     if let Some(c1) = ctx
                         .get_box_replacement_box(inner.arg(1))
@@ -1024,7 +1066,10 @@ impl OptRewrite {
         }
 
         // or_absorb: int_or(a, int_or(a, b)) => int_or(a, b)
-        if let Some(inner) = ctx.get_producing_op(arg1) {
+        if let Some(inner) = ctx
+            .ensure_box(arg1)
+            .and_then(|pb| ctx.get_producing_op(&pb))
+        {
             if inner.opcode == OpCode::IntOr && inner.arg(0) == arg0 {
                 let b_old = ctx
                     .ensure_box(op.pos.get())
@@ -1038,9 +1083,12 @@ impl OptRewrite {
         }
 
         // or_and_two_parts: int_or(int_and(x, C1), int_and(x, C2)) => int_and(x, C1|C2)
-        if let (Some(inner0), Some(inner1)) =
-            (ctx.get_producing_op(arg0), ctx.get_producing_op(arg1))
-        {
+        if let (Some(inner0), Some(inner1)) = (
+            ctx.ensure_box(arg0)
+                .and_then(|pb| ctx.get_producing_op(&pb)),
+            ctx.ensure_box(arg1)
+                .and_then(|pb| ctx.get_producing_op(&pb)),
+        ) {
             if inner0.opcode == OpCode::IntAnd
                 && inner1.opcode == OpCode::IntAnd
                 && inner0.arg(0) == inner1.arg(0)
@@ -1135,7 +1183,7 @@ impl OptRewrite {
             return OptimizationResult::Remove;
         }
         // x ^ x -> 0
-        if arg0 == arg1 {
+        if ctx.same_box(arg0, arg1) {
             ctx.make_constant(op.pos.get(), Value::Int(0));
             return OptimizationResult::Remove;
         }
@@ -1162,7 +1210,10 @@ impl OptRewrite {
             .get_box_replacement_box(arg1)
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
-            if let Some(inner) = ctx.get_producing_op(arg0) {
+            if let Some(inner) = ctx
+                .ensure_box(arg0)
+                .and_then(|pb| ctx.get_producing_op(&pb))
+            {
                 if inner.opcode == OpCode::IntXor {
                     if let Some(c1) = ctx
                         .get_box_replacement_box(inner.arg(1))
@@ -1179,7 +1230,10 @@ impl OptRewrite {
         }
 
         // xor_absorb: int_xor(int_xor(a, b), b) => a
-        if let Some(inner) = ctx.get_producing_op(arg0) {
+        if let Some(inner) = ctx
+            .ensure_box(arg0)
+            .and_then(|pb| ctx.get_producing_op(&pb))
+        {
             if inner.opcode == OpCode::IntXor && inner.arg(1) == arg1 {
                 let b_old = ctx
                     .ensure_box(op.pos.get())
@@ -1260,7 +1314,10 @@ impl OptRewrite {
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
             if (0..64).contains(&c1) {
-                if let Some(inner) = ctx.get_producing_op(arg0) {
+                if let Some(inner) = ctx
+                    .ensure_box(arg0)
+                    .and_then(|pb| ctx.get_producing_op(&pb))
+                {
                     if inner.opcode == OpCode::IntRshift {
                         if ctx
                             .get_box_replacement_box(inner.arg(1))
@@ -1292,7 +1349,10 @@ impl OptRewrite {
                             .get_box_replacement_box(inner.arg(1))
                             .and_then(|b| ctx.get_constant_int_box(&b))
                         {
-                            if let Some(inner2) = ctx.get_producing_op(inner.arg(0)) {
+                            if let Some(inner2) = ctx
+                                .ensure_box(inner.arg(0))
+                                .and_then(|pb| ctx.get_producing_op(&pb))
+                            {
                                 if inner2.opcode == OpCode::IntRshift
                                     && ctx
                                         .get_box_replacement_box(inner2.arg(1))
@@ -1332,7 +1392,10 @@ impl OptRewrite {
             .get_box_replacement_box(arg1)
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
-            if let Some(inner) = ctx.get_producing_op(arg0) {
+            if let Some(inner) = ctx
+                .ensure_box(arg0)
+                .and_then(|pb| ctx.get_producing_op(&pb))
+            {
                 if inner.opcode == OpCode::IntLshift {
                     if let Some(c1) = ctx
                         .get_box_replacement_box(inner.arg(1))
@@ -1412,7 +1475,10 @@ impl OptRewrite {
         }
 
         // rshift_lshift: int_rshift(int_lshift(x, y), y) => x (if no overflow)
-        if let Some(inner) = ctx.get_producing_op(arg0) {
+        if let Some(inner) = ctx
+            .ensure_box(arg0)
+            .and_then(|pb| ctx.get_producing_op(&pb))
+        {
             if inner.opcode == OpCode::IntLshift && inner.arg(1) == arg1 {
                 if let (Some(bx), Some(by)) = (
                     ctx.get_box_replacement_box(inner.arg(0))
@@ -1439,7 +1505,10 @@ impl OptRewrite {
             .get_box_replacement_box(arg1)
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
-            if let Some(inner) = ctx.get_producing_op(arg0) {
+            if let Some(inner) = ctx
+                .ensure_box(arg0)
+                .and_then(|pb| ctx.get_producing_op(&pb))
+            {
                 if inner.opcode == OpCode::IntRshift {
                     if let Some(c1) = ctx
                         .get_box_replacement_box(inner.arg(1))
@@ -1522,7 +1591,10 @@ impl OptRewrite {
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
             if (0..64).contains(&c) {
-                if let Some(inner) = ctx.get_producing_op(arg0) {
+                if let Some(inner) = ctx
+                    .ensure_box(arg0)
+                    .and_then(|pb| ctx.get_producing_op(&pb))
+                {
                     if inner.opcode == OpCode::IntLshift
                         && ctx
                             .get_box_replacement_box(inner.arg(1))
@@ -1559,7 +1631,10 @@ impl OptRewrite {
         }
 
         // neg_neg: int_neg(int_neg(x)) => x
-        if let Some(inner) = ctx.get_producing_op(arg0) {
+        if let Some(inner) = ctx
+            .ensure_box(arg0)
+            .and_then(|pb| ctx.get_producing_op(&pb))
+        {
             if inner.opcode == OpCode::IntNeg {
                 let b_old = ctx
                     .ensure_box(op.pos.get())
@@ -1590,7 +1665,10 @@ impl OptRewrite {
         }
 
         // invert_invert: int_invert(int_invert(x)) => x
-        if let Some(inner) = ctx.get_producing_op(arg0) {
+        if let Some(inner) = ctx
+            .ensure_box(arg0)
+            .and_then(|pb| ctx.get_producing_op(&pb))
+        {
             if inner.opcode == OpCode::IntInvert {
                 let b_old = ctx
                     .ensure_box(op.pos.get())
@@ -1658,7 +1736,10 @@ impl OptRewrite {
         }
 
         // is_true_and_minint: int_is_true(int_and(x, MININT)) => int_lt(x, 0)
-        if let Some(inner) = ctx.get_producing_op(arg0) {
+        if let Some(inner) = ctx
+            .ensure_box(arg0)
+            .and_then(|pb| ctx.get_producing_op(&pb))
+        {
             if inner.opcode == OpCode::IntAnd {
                 if ctx
                     .get_box_replacement_box(inner.arg(1))
@@ -1691,27 +1772,6 @@ impl OptRewrite {
         //     arg1 = get_box_replacement(op.getarg(1))
         //     info0 = getptrinfo(arg0)
         //     info1 = getptrinfo(arg1)
-        // `getptrinfo` synthesizes `ConstPtrInfo` for constant Refs so
-        // null/known-class checks fire on constants too.
-        let arg0 = ctx.get_box_replacement(op.arg(0));
-        let arg1 = ctx.get_box_replacement(op.arg(1));
-        // rewrite.py:532 `elif arg0 is arg1:` relies on ConstPtr Box
-        // sharing in RPython — two ConstPtr boxes with the same value
-        // *are* the same Box. majit's constant pool does not share
-        // boxes, so same-value Ref constants still live at different
-        // OpRefs. Fold ConstPtr/ConstPtr pairs up front by comparing
-        // the stored Ref values so we match RPython's equality
-        // semantics without depending on Box interning.
-        if let (Some(Value::Ref(left)), Some(Value::Ref(right))) = (
-            ctx.get_box_replacement_box(arg0)
-                .and_then(|b| ctx.get_constant_box(&b)),
-            ctx.get_box_replacement_box(arg1)
-                .and_then(|b| ctx.get_constant_box(&b)),
-        ) {
-            let same = left == right;
-            ctx.make_constant(op.pos.get(), Value::Int((same ^ expect_isnot) as i64));
-            return OptimizationResult::Remove;
-        }
         let arg0_box = ctx.get_box_replacement_box(op.arg(0));
         let arg1_box = ctx.get_box_replacement_box(op.arg(1));
         let info0 = arg0_box.as_ref().and_then(|b| ctx.getptrinfo(b));
@@ -1720,12 +1780,21 @@ impl OptRewrite {
         let is_virtual0 = info0.as_ref().is_some_and(|i| i.is_virtual());
         let is_virtual1 = info1.as_ref().is_some_and(|i| i.is_virtual());
 
-        // rewrite.py:520-527: virtual objects
+        // rewrite.py:530-535: virtual objects
         if is_virtual0 {
             let intres = if is_virtual1 {
-                // Both virtual: same object only if same info instance.
-                // In Rust, check arg identity (same OpRef after forwarding).
-                (arg0 == arg1) ^ expect_isnot
+                // rewrite.py:532: `intres = (info0 is info1) ^ expect_isnot`
+                // — PtrInfo identity (info.py:71-72 `same_info` is `self is
+                // other` for non-Const infos), via getptrinfo_handle which
+                // preserves the `_forwarded` cell identity.
+                let same = match (
+                    arg0_box.as_ref().and_then(|b| ctx.getptrinfo_handle(b)),
+                    arg1_box.as_ref().and_then(|b| ctx.getptrinfo_handle(b)),
+                ) {
+                    (Some(h0), Some(h1)) => h0.same_info(&h1),
+                    _ => false,
+                };
+                same ^ expect_isnot
             } else {
                 expect_isnot
             };
@@ -1737,7 +1806,9 @@ impl OptRewrite {
             return OptimizationResult::Remove;
         }
 
-        // rewrite.py:528-531: null checks
+        // rewrite.py:528-531: null checks — fall back to OpRef for downstream
+        let arg0 = ctx.get_box_replacement(op.arg(0));
+        let arg1 = ctx.get_box_replacement(op.arg(1));
         if info1.as_ref().is_some_and(|i| i.is_null()) {
             return self.optimize_nullness(op, arg0, expect_isnot, ctx);
         }
@@ -1745,8 +1816,9 @@ impl OptRewrite {
             return self.optimize_nullness(op, arg1, expect_isnot, ctx);
         }
 
-        // rewrite.py:532-533: same object
-        if arg0 == arg1 {
+        // rewrite.py:542-543: `elif arg0 is arg1:` — box identity
+        // (resoperation.py:38 `same_box` base = `self is other`).
+        if ctx.box_is(arg0, arg1) {
             ctx.make_constant(op.pos.get(), Value::Int(!expect_isnot as i64));
             return OptimizationResult::Remove;
         }
@@ -1914,12 +1986,12 @@ impl OptRewrite {
             }
         }
         // eq_same: int_eq(x, x) => 1
-        if op.opcode == OpCode::IntEq && arg0 == arg1 {
+        if op.opcode == OpCode::IntEq && ctx.same_box(arg0, arg1) {
             ctx.make_constant(op.pos.get(), Value::Int(1));
             return OptimizationResult::Remove;
         }
         // ne_same: int_ne(x, x) => 0
-        if op.opcode == OpCode::IntNe && arg0 == arg1 {
+        if op.opcode == OpCode::IntNe && ctx.same_box(arg0, arg1) {
             ctx.make_constant(op.pos.get(), Value::Int(0));
             return OptimizationResult::Remove;
         }
@@ -1971,9 +2043,15 @@ impl OptRewrite {
 
         // eq_sub_eq: int_eq(int_sub(x, int_eq(x, a)), a) => 0
         if op.opcode == OpCode::IntEq {
-            if let Some(inner_sub) = ctx.get_producing_op(arg0) {
+            if let Some(inner_sub) = ctx
+                .ensure_box(arg0)
+                .and_then(|pb| ctx.get_producing_op(&pb))
+            {
                 if inner_sub.opcode == OpCode::IntSub && inner_sub.arg(0) != OpRef::NONE {
-                    if let Some(inner_eq) = ctx.get_producing_op(inner_sub.arg(1)) {
+                    if let Some(inner_eq) = ctx
+                        .ensure_box(inner_sub.arg(1))
+                        .and_then(|pb| ctx.get_producing_op(&pb))
+                    {
                         if inner_eq.opcode == OpCode::IntEq
                             && inner_eq.arg(0) == inner_sub.arg(0)
                             && inner_eq.arg(1) == arg1
@@ -2059,7 +2137,8 @@ impl OptRewrite {
         if let (Some(actual), Some(expected)) = (
             ctx.get_box_replacement_box(arg0)
                 .and_then(|b| ctx.get_constant_box(&b)),
-            ctx.get_constant(arg1),
+            ctx.get_box_replacement_box(arg1)
+                .and_then(|cb| cb.const_value()),
         ) {
             if actual == expected {
                 return OptimizationResult::Remove;
@@ -2433,8 +2512,14 @@ impl OptRewrite {
         }
         let arg1 = op.arg(1);
         let arg2 = op.arg(2);
-        let b1 = ctx.getintbound_via_box(arg1);
-        let b2 = ctx.getintbound_via_box(arg2);
+        let b1 = ctx
+            .ensure_box(arg1)
+            .map(|b| ctx.getintbound_handle(&b).borrow().clone())
+            .expect("getintbound: operand must resolve to a BoxRef");
+        let b2 = ctx
+            .ensure_box(arg2)
+            .map(|b| ctx.getintbound_handle(&b).borrow().clone())
+            .expect("getintbound: operand must resolve to a BoxRef");
 
         // rewrite.py:774-777: b1.known_eq_const(0) → 0
         if b1.known_eq_const(0) {
@@ -2499,8 +2584,14 @@ impl OptRewrite {
         }
         let arg1 = op.arg(1);
         let arg2 = op.arg(2);
-        let b1 = ctx.getintbound_via_box(arg1);
-        let b2 = ctx.getintbound_via_box(arg2);
+        let b1 = ctx
+            .ensure_box(arg1)
+            .map(|b| ctx.getintbound_handle(&b).borrow().clone())
+            .expect("getintbound: operand must resolve to a BoxRef");
+        let b2 = ctx
+            .ensure_box(arg2)
+            .map(|b| ctx.getintbound_handle(&b).borrow().clone())
+            .expect("getintbound: operand must resolve to a BoxRef");
 
         // rewrite.py:726-729: b1.known_eq_const(0) → 0
         if b1.known_eq_const(0) {
@@ -2512,13 +2603,22 @@ impl OptRewrite {
         if !b2.is_constant() {
             // rewrite.py:731-740: x // (1 << y) → x >> y
             // when 0 <= y < LONG_BIT - 1
-            if let Some(shift_op) = ctx.get_producing_op(arg2) {
+            if let Some(shift_op) = ctx
+                .ensure_box(arg2)
+                .and_then(|pb| ctx.get_producing_op(&pb))
+            {
                 if shift_op.opcode == OpCode::IntLshift
                     && shift_op.num_args() >= 2
-                    && ctx.get_constant_int(shift_op.arg(0)) == Some(1)
+                    && ctx
+                        .get_box_replacement_box(shift_op.arg(0))
+                        .and_then(|cb| cb.const_int())
+                        == Some(1)
                 {
                     let shiftvar = ctx.get_box_replacement(shift_op.arg(1));
-                    let shiftbound = ctx.getintbound_via_box(shiftvar);
+                    let shiftbound = ctx
+                        .ensure_box(shiftvar)
+                        .map(|b| ctx.getintbound_handle(&b).borrow().clone())
+                        .expect("getintbound: operand must resolve to a BoxRef");
                     if shiftbound.known_nonnegative() && shiftbound.known_lt_const(63) {
                         let mut rshift_op = Op::new(OpCode::IntRshift, &[arg1, shiftvar]);
                         rshift_op.pos.set(op.pos.get());
@@ -2995,7 +3095,7 @@ impl OptRewrite {
     /// rewrite.py:147-153 optimize_FLOAT_NEG
     fn optimize_float_neg(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let v = ctx.get_box_replacement(op.arg(0));
-        if let Some(arg_op) = ctx.get_producing_op(v) {
+        if let Some(arg_op) = ctx.ensure_box(v).and_then(|pb| ctx.get_producing_op(&pb)) {
             if arg_op.opcode == OpCode::FloatNeg {
                 let b_old = ctx
                     .ensure_box(op.pos.get())
@@ -3013,7 +3113,7 @@ impl OptRewrite {
     /// rewrite.py:155-161 optimize_FLOAT_ABS
     fn optimize_float_abs(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let v = ctx.get_box_replacement(op.arg(0));
-        if let Some(arg_op) = ctx.get_producing_op(v) {
+        if let Some(arg_op) = ctx.ensure_box(v).and_then(|pb| ctx.get_producing_op(&pb)) {
             if arg_op.opcode == OpCode::FloatAbs {
                 let b_old = ctx
                     .ensure_box(op.pos.get())
@@ -3421,7 +3521,10 @@ impl Optimization for OptRewrite {
             | OpCode::CallLoopinvariantR
             | OpCode::CallLoopinvariantF
             | OpCode::CallLoopinvariantN => {
-                if let Some(func_val) = ctx.get_constant_int(op.arg(0)) {
+                if let Some(func_val) = ctx
+                    .get_box_replacement_box(op.arg(0))
+                    .and_then(|cb| cb.const_int())
+                {
                     // RPython: LoopInvariantOp.produce_op stores PreambleOp
                     // in loop_invariant_results during import. Transfer from
                     // ctx.imported_loop_invariant_results on first access.
@@ -3526,8 +3629,10 @@ impl Optimization for OptRewrite {
                 let obj = ctx.get_box_replacement(op.arg(0));
                 if op.num_args() >= 2 {
                     // ConstClass is Value::Ref in majit (not Value::Int).
-                    let expected_class: Option<i64> =
-                        ctx.get_constant(op.arg(1)).and_then(|v| match v {
+                    let expected_class: Option<i64> = ctx
+                        .get_box_replacement_box(op.arg(1))
+                        .and_then(|cb| cb.const_value())
+                        .and_then(|v| match v {
                             Value::Ref(r) => Some(r.0 as i64),
                             Value::Int(i) => Some(i),
                             _ => None,
@@ -3568,10 +3673,13 @@ impl Optimization for OptRewrite {
             // upstream passes `op.getarg(0)` raw without a prior
             // `get_box_replacement` resolution. Pyre matches.
             OpCode::RecordExactValueI | OpCode::RecordExactValueR => {
-                let val = ctx.get_constant(op.arg(1)).expect(
-                    "rewrite.py:400 — RECORD_EXACT_VALUE expectedconstbox \
+                let val = ctx
+                    .get_box_replacement_box(op.arg(1))
+                    .and_then(|cb| cb.const_value())
+                    .expect(
+                        "rewrite.py:400 — RECORD_EXACT_VALUE expectedconstbox \
                      must be a Const",
-                );
+                    );
                 ctx.make_constant(op.arg(0), val);
                 OptimizationResult::Remove
             }
@@ -3676,7 +3784,10 @@ impl Optimization for OptRewrite {
             }
             OpCode::GuardValue => {
                 if op.num_args() >= 2 {
-                    if let Some(val) = ctx.get_constant(op.arg(1)) {
+                    if let Some(val) = ctx
+                        .get_box_replacement_box(op.arg(1))
+                        .and_then(|cb| cb.const_value())
+                    {
                         ctx.make_constant(op.arg(0), val);
                     }
                 }
@@ -3829,7 +3940,8 @@ mod tests {
             "{opcode:?}({a}, {b}) should constant-fold"
         );
         assert_eq!(
-            ctx.get_constant_int(OpRef::int_op(2)),
+            ctx.get_box_replacement_box(OpRef::int_op(2))
+                .and_then(|cb| cb.const_int()),
             Some(expected),
             "{opcode:?}({a}, {b}) = {expected}"
         );
@@ -3852,7 +3964,8 @@ mod tests {
         );
         if let Some(val) = expected_const {
             assert_eq!(
-                ctx.get_constant_int(OpRef::int_op(1)),
+                ctx.get_box_replacement_box(OpRef::int_op(1))
+                    .and_then(|cb| cb.const_int()),
                 Some(val),
                 "{opcode:?}(x, x) = {val}"
             );
@@ -3915,7 +4028,11 @@ mod tests {
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_constant_int(OpRef::int_op(2)), Some(0));
+        assert_eq!(
+            ctx.get_box_replacement_box(OpRef::int_op(2))
+                .and_then(|cb| cb.const_int()),
+            Some(0)
+        );
 
         // x * 1 = x
         assert_binop_identity(OpCode::IntMul, 1, 1, 0);
@@ -3964,7 +4081,11 @@ mod tests {
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_constant_int(OpRef::int_op(2)), Some(0));
+        assert_eq!(
+            ctx.get_box_replacement_box(OpRef::int_op(2))
+                .and_then(|cb| cb.const_int()),
+            Some(0)
+        );
         // x / x = 1
         assert_binop_self(OpCode::IntFloorDiv, Some(1));
         // x / -1 = neg(x)
@@ -3988,7 +4109,11 @@ mod tests {
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_constant_int(OpRef::int_op(2)), Some(0));
+        assert_eq!(
+            ctx.get_box_replacement_box(OpRef::int_op(2))
+                .and_then(|cb| cb.const_int()),
+            Some(0)
+        );
         // x % x = 0
         assert_binop_self(OpCode::IntMod, Some(0));
     }
@@ -4033,7 +4158,11 @@ mod tests {
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[1], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_constant_int(OpRef::int_op(1)), Some(-42));
+        assert_eq!(
+            ctx.get_box_replacement_box(OpRef::int_op(1))
+                .and_then(|cb| cb.const_int()),
+            Some(-42)
+        );
 
         // invert constant
         let mut ops2 = vec![
@@ -4046,7 +4175,11 @@ mod tests {
         ctx2.make_constant(OpRef::int_op(0), Value::Int(0xFF));
         let result2 = pass.propagate_forward(&ops2[1], &mut ctx2);
         assert!(matches!(result2, OptimizationResult::Remove));
-        assert_eq!(ctx2.get_constant_int(OpRef::int_op(1)), Some(!0xFF));
+        assert_eq!(
+            ctx2.get_box_replacement_box(OpRef::int_op(1))
+                .and_then(|cb| cb.const_int()),
+            Some(!0xFF)
+        );
     }
 
     #[test]
@@ -4063,7 +4196,11 @@ mod tests {
         ctx.make_constant(OpRef::int_op(0), Value::Int(0));
         let result = pass.propagate_forward(&ops[1], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_constant_int(OpRef::int_op(1)), Some(1));
+        assert_eq!(
+            ctx.get_box_replacement_box(OpRef::int_op(1))
+                .and_then(|cb| cb.const_int()),
+            Some(1)
+        );
 
         // is_zero(5) = 0
         let mut ops2 = vec![
@@ -4076,7 +4213,11 @@ mod tests {
         ctx2.make_constant(OpRef::int_op(0), Value::Int(5));
         let result2 = pass.propagate_forward(&ops2[1], &mut ctx2);
         assert!(matches!(result2, OptimizationResult::Remove));
-        assert_eq!(ctx2.get_constant_int(OpRef::int_op(1)), Some(0));
+        assert_eq!(
+            ctx2.get_box_replacement_box(OpRef::int_op(1))
+                .and_then(|cb| cb.const_int()),
+            Some(0)
+        );
     }
 
     #[test]
@@ -4337,7 +4478,11 @@ mod tests {
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_constant_int(OpRef::int_op(2)), Some(i64::MIN)); // wrapping
+        assert_eq!(
+            ctx.get_box_replacement_box(OpRef::int_op(2))
+                .and_then(|cb| cb.const_int()),
+            Some(i64::MIN)
+        ); // wrapping
     }
 
     // ── Shift of zero constant tests ──
@@ -4358,7 +4503,11 @@ mod tests {
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_constant_int(OpRef::int_op(2)), Some(0));
+        assert_eq!(
+            ctx.get_box_replacement_box(OpRef::int_op(2))
+                .and_then(|cb| cb.const_int()),
+            Some(0)
+        );
     }
 
     #[test]
@@ -4377,7 +4526,11 @@ mod tests {
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_constant_int(OpRef::int_op(2)), Some(0));
+        assert_eq!(
+            ctx.get_box_replacement_box(OpRef::int_op(2))
+                .and_then(|cb| cb.const_int()),
+            Some(0)
+        );
     }
 
     // ── Non-optimizable cases (should PassOn) ──
@@ -4432,7 +4585,11 @@ mod tests {
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_constant_int(OpRef::int_op(2)), Some(0x0F));
+        assert_eq!(
+            ctx.get_box_replacement_box(OpRef::int_op(2))
+                .and_then(|cb| cb.const_int()),
+            Some(0x0F)
+        );
     }
 
     // ── INT_OR constant fold ──
@@ -4454,7 +4611,11 @@ mod tests {
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_constant_int(OpRef::int_op(2)), Some(0xFF));
+        assert_eq!(
+            ctx.get_box_replacement_box(OpRef::int_op(2))
+                .and_then(|cb| cb.const_int()),
+            Some(0xFF)
+        );
     }
 
     // ── UINT_RSHIFT tests ──
@@ -4496,7 +4657,11 @@ mod tests {
         let result = pass.propagate_forward(&ops[2], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         // u64::MAX >> 1 = i64::MAX
-        assert_eq!(ctx.get_constant_int(OpRef::int_op(2)), Some(i64::MAX));
+        assert_eq!(
+            ctx.get_box_replacement_box(OpRef::int_op(2))
+                .and_then(|cb| cb.const_int()),
+            Some(i64::MAX)
+        );
     }
 
     // ── Float optimization tests ──
@@ -4754,7 +4919,11 @@ mod tests {
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[1], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_constant_int(OpRef::int_op(1)), Some(1));
+        assert_eq!(
+            ctx.get_box_replacement_box(OpRef::int_op(1))
+                .and_then(|cb| cb.const_int()),
+            Some(1)
+        );
     }
 
     #[test]
@@ -4771,7 +4940,11 @@ mod tests {
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[1], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_constant_int(OpRef::int_op(1)), Some(0));
+        assert_eq!(
+            ctx.get_box_replacement_box(OpRef::int_op(1))
+                .and_then(|cb| cb.const_int()),
+            Some(0)
+        );
     }
 
     #[test]
@@ -4788,7 +4961,11 @@ mod tests {
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[1], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_constant_int(OpRef::int_op(1)), Some(1));
+        assert_eq!(
+            ctx.get_box_replacement_box(OpRef::int_op(1))
+                .and_then(|cb| cb.const_int()),
+            Some(1)
+        );
     }
 
     #[test]
@@ -4805,12 +4982,21 @@ mod tests {
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[1], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_constant_int(OpRef::int_op(1)), Some(0));
+        assert_eq!(
+            ctx.get_box_replacement_box(OpRef::int_op(1))
+                .and_then(|cb| cb.const_int()),
+            Some(0)
+        );
     }
 
     #[test]
-    fn test_ptr_eq_constant_fold() {
-        // PtrEq(const 100, const 200) -> 0
+    fn test_ptr_eq_distinct_constants_not_folded_in_rewrite() {
+        // PtrEq(const 100, const 200): two distinct non-null ConstPtr.
+        // rewrite.py:525-564 _optimize_oois_ooisnot has no value-compare
+        // branch — `arg0 is arg1` (line 542) is object identity, which is
+        // False for distinct ConstPtr, so it falls through to `emit(op)`
+        // (line 564). The actual constant fold lives in the pure pass
+        // (pure.py:126-136 → execute_ptr_compare_const), not rewrite.
         let mut ops = vec![
             Op::new(OpCode::SameAsR, &[]), // op0: const 100
             Op::new(OpCode::SameAsR, &[]), // op1: const 200
@@ -4828,8 +5014,14 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
-        assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_constant_int(OpRef::int_op(2)), Some(0));
+        // rewrite.py:564 `return self.emit(op)` — rewrite passes the op on
+        // unchanged; it does not fold distinct constants.
+        assert!(matches!(result, OptimizationResult::PassOn));
+        assert_eq!(
+            ctx.get_box_replacement_box(OpRef::int_op(2))
+                .and_then(|cb| cb.const_int()),
+            None
+        );
     }
 
     // ── CAST round-trip tests ──
