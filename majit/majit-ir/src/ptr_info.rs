@@ -470,6 +470,120 @@ fn str_child_count(s: &StrPtrInfo) -> usize {
 }
 
 impl PtrInfo {
+    /// Visit every inline `ConstPtr.value` slot reachable from this PtrInfo.
+    ///
+    /// RPython stores these references in normal object fields below
+    /// `PtrInfo`/virtual info objects, so the translated GC updates the fields
+    /// in place. Pyre keeps the same structural data in Rust containers and
+    /// must walk the actual `OpRef` / `GcRef` slots explicitly.
+    pub fn walk_const_ptr_refs_mut(&mut self, visitor: &mut dyn FnMut(&mut GcRef)) {
+        fn visit_opref(opref: &mut OpRef, visitor: &mut dyn FnMut(&mut GcRef)) {
+            if let Some(slot) = opref.as_const_ptr_inline_mut() {
+                visitor(slot);
+            }
+        }
+
+        fn visit_field(entry: &mut FieldEntry, visitor: &mut dyn FnMut(&mut GcRef)) {
+            match entry {
+                FieldEntry::Value(opref) => visit_opref(opref, visitor),
+                FieldEntry::Preamble(pop) => {
+                    visit_opref(&mut pop.op, visitor);
+                    pop.preamble_op.walk_const_ptr_refs_mut(visitor);
+                }
+            }
+        }
+
+        fn visit_optional_gcref(slot: &mut Option<GcRef>, visitor: &mut dyn FnMut(&mut GcRef)) {
+            if let Some(gcref) = slot.as_mut() {
+                visitor(gcref);
+            }
+        }
+
+        match self {
+            PtrInfo::Constant(gcref) => visitor(gcref),
+            PtrInfo::Instance(info) => {
+                visit_optional_gcref(&mut info.known_class, visitor);
+                for (_, entry) in &mut info.fields {
+                    visit_field(entry, visitor);
+                }
+            }
+            PtrInfo::Struct(info) => {
+                for (_, entry) in &mut info.fields {
+                    visit_field(entry, visitor);
+                }
+            }
+            PtrInfo::Array(info) => {
+                for entry in &mut info.items {
+                    visit_field(entry, visitor);
+                }
+            }
+            PtrInfo::Virtual(info) => {
+                visit_optional_gcref(&mut info.known_class, visitor);
+                for (_, opref) in &mut info.fields {
+                    visit_opref(opref, visitor);
+                }
+            }
+            PtrInfo::VirtualArray(info) => {
+                for opref in &mut info.items {
+                    visit_opref(opref, visitor);
+                }
+            }
+            PtrInfo::VirtualStruct(info) => {
+                for (_, opref) in &mut info.fields {
+                    visit_opref(opref, visitor);
+                }
+            }
+            PtrInfo::VirtualArrayStruct(info) => {
+                for fields in &mut info.element_fields {
+                    for (_, opref) in fields {
+                        visit_opref(opref, visitor);
+                    }
+                }
+            }
+            PtrInfo::VirtualRawBuffer(info) => {
+                for opref in info.buffer.values_mut() {
+                    visit_opref(opref, visitor);
+                }
+            }
+            PtrInfo::VirtualRawSlice(info) => visit_opref(&mut info.parent, visitor),
+            PtrInfo::Virtualizable(info) => {
+                for (_, opref) in &mut info.fields {
+                    visit_opref(opref, visitor);
+                }
+                for (_, items) in &mut info.arrays {
+                    for opref in items {
+                        visit_opref(opref, visitor);
+                    }
+                }
+            }
+            PtrInfo::Str(info) => {
+                if let Some(opref) = info.lgtop.as_mut() {
+                    visit_opref(opref, visitor);
+                }
+                match &mut info.variant {
+                    VStringVariant::Ptr => {}
+                    VStringVariant::Plain(plain) => {
+                        for slot in &mut plain._chars {
+                            if let Some(opref) = slot.as_mut() {
+                                visit_opref(opref, visitor);
+                            }
+                        }
+                    }
+                    VStringVariant::Slice(slice) => {
+                        visit_opref(&mut slice.s, visitor);
+                        visit_opref(&mut slice.start, visitor);
+                        visit_opref(&mut slice.lgtop, visitor);
+                    }
+                    VStringVariant::Concat(concat) => {
+                        visit_opref(&mut concat.vleft, visitor);
+                        visit_opref(&mut concat.vright, visitor);
+                    }
+                }
+            }
+            PtrInfo::NonNull { .. } => {}
+        }
+    }
+
     // ── Constructors (info.py: factory methods) ──
 
     /// Create a NonNull PtrInfo.

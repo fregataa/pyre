@@ -209,12 +209,14 @@ impl Guard {
         if var.is_identity() {
             return var.var;
         }
-        // RPython: ConstInt(value) creates inline constant boxes.
-        // In majit we allocate constant OpRefs and record the value.
+        // history.py:227 ConstInt.value carried inline on the Box. The
+        // const_values side-table is preserved for legacy callers that
+        // still walk `OpRef → raw u32 → i64`; inline-Const variants make
+        // it redundant for new consumers.
         let ncp = next_const_pos;
         let cv = const_values;
         let ops = var.get_operations(|value| {
-            let cref = OpRef::const_int(*ncp);
+            let cref = OpRef::const_int_inline(value);
             *ncp += 1;
             cv.insert(cref, value);
             cref
@@ -590,7 +592,7 @@ impl GuardStrengthenOpt {
                         let ncp = &mut self.next_const_pos;
                         let cv = &mut self.const_values;
                         let result = index_var.emit_operations(&mut self._newoperations, |value| {
-                            let cref = OpRef::const_int(*ncp);
+                            let cref = OpRef::const_int_inline(value);
                             *ncp += 1;
                             cv.insert(cref, value);
                             cref

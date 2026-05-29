@@ -8,7 +8,7 @@ use smallvec::SmallVec;
 
 use crate::box_ref::Forwarded;
 use crate::descr::DescrRef;
-use crate::value::{GcRef, Type};
+use crate::value::{GcRef, Type, Value};
 
 /// Index into an operation list, used as a reference to an operation's
 /// result. Variant-tagged enum mirroring RPython's `AbstractValue` class
@@ -23,19 +23,47 @@ use crate::value::{GcRef, Type};
 /// `PartialEq` / `Eq` / `Hash` include the enum variant, not just `.raw()`.
 /// This keeps the disjoint RPython Box classes disjoint even when Pyre's
 /// flat encoding reuses the same raw position across InputArg / ResOp /
-/// Const namespaces.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+/// Const namespaces. `ConstFloatInline` uses `f64::to_bits()` for
+/// equality, hashing, and ordering to mirror RPython `ConstFloat._get_hash_`
+/// / `same_constant` (history.py:283/292), where `0.0 != -0.0` and
+/// `NaN == NaN` when their bit patterns agree. The `Ord`/`PartialOrd` impls
+/// (kept for `vecset::VecMap<OpRef, _>` sorted-Vec storage) lift the same
+/// bit-level total order over inline-f64 payloads.
+#[derive(Clone, Copy, Debug)]
 pub enum OpRef {
     /// Sentinel for missing/absent reference; `OpRef::NONE` aliases this.
     /// RPython has no equivalent — missing values are Python `None`.
     None,
     /// history.py:220 `ConstInt` — `type = 'i'`. Payload: raw u32 with
     /// `CONST_BIT` set; low bits are the constant pool index.
+    ///
+    /// Legacy pool-indexed variant. The
+    /// [OpRef inline-Const epic](`.claude/plans/piped-sleeping-brooks.md`)
+    /// migrates producers to `ConstIntInline(i64)` and retires this
+    /// variant in Slice 6.
     ConstInt(u32),
-    /// history.py:261 `ConstFloat` — `type = 'f'`.
+    /// history.py:261 `ConstFloat` — `type = 'f'`. Legacy pool-indexed
+    /// (see `ConstInt`).
     ConstFloat(u32),
-    /// history.py:307 `ConstPtr` — `type = 'r'`.
+    /// history.py:307 `ConstPtr` — `type = 'r'`. Legacy pool-indexed
+    /// (see `ConstInt`).
     ConstPtr(u32),
+    /// history.py:227 `ConstInt.value` carried inline as `i64` instead
+    /// of indexing through `ConstantPool`. Strict RPython parity:
+    /// `Const{Int,Float,Ptr}.value` are inline value attributes on the
+    /// Box class itself (history.py:227/268/314), no side-table lookup.
+    /// Introduced in Slice 1 of the OpRef inline-Const epic; producers
+    /// migrate in Slice 2, readers in Slice 3.
+    ConstIntInline(i64),
+    /// history.py:268 `ConstFloat.value` carried inline as `f64`. See
+    /// `ConstIntInline`. Equality / Hash bitwise via `f64::to_bits()`
+    /// per RPython `_get_hash_` / `same_constant` (history.py:283/292).
+    ConstFloatInline(f64),
+    /// history.py:314 `ConstPtr.value` carried inline as `GcRef`. See
+    /// `ConstIntInline`. The inline `GcRef` lives directly in the
+    /// `OpRef` and must be visited by the GC walker that traces the
+    /// op-graph (see `.claude/plans/piped-sleeping-brooks.md` Slice 7).
+    ConstPtrInline(GcRef),
     /// resoperation.py:719 `InputArgInt` — `type = 'i'`. Payload: input
     /// arg slot position.
     InputArgInt(u32),
@@ -65,6 +93,95 @@ pub enum OpRef {
     /// is single-instruction: `force_allocate_reg` then
     /// `possibly_free_var` within one `consider_*` body.
     TempVar(u32),
+}
+
+impl PartialEq for OpRef {
+    fn eq(&self, other: &Self) -> bool {
+        use OpRef::*;
+        match (self, other) {
+            (None, None) => true,
+            (ConstInt(a), ConstInt(b))
+            | (ConstFloat(a), ConstFloat(b))
+            | (ConstPtr(a), ConstPtr(b))
+            | (InputArgInt(a), InputArgInt(b))
+            | (InputArgFloat(a), InputArgFloat(b))
+            | (InputArgRef(a), InputArgRef(b))
+            | (IntOp(a), IntOp(b))
+            | (FloatOp(a), FloatOp(b))
+            | (RefOp(a), RefOp(b))
+            | (VoidOp(a), VoidOp(b))
+            | (TempVar(a), TempVar(b)) => a == b,
+            (ConstIntInline(a), ConstIntInline(b)) => a == b,
+            // history.py:292 ConstFloat.same_constant: bitwise compare
+            (ConstFloatInline(a), ConstFloatInline(b)) => a.to_bits() == b.to_bits(),
+            (ConstPtrInline(a), ConstPtrInline(b)) => a.0 == b.0,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for OpRef {}
+
+impl std::hash::Hash for OpRef {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            OpRef::None => {}
+            OpRef::ConstInt(x)
+            | OpRef::ConstFloat(x)
+            | OpRef::ConstPtr(x)
+            | OpRef::InputArgInt(x)
+            | OpRef::InputArgFloat(x)
+            | OpRef::InputArgRef(x)
+            | OpRef::IntOp(x)
+            | OpRef::FloatOp(x)
+            | OpRef::RefOp(x)
+            | OpRef::VoidOp(x)
+            | OpRef::TempVar(x) => x.hash(state),
+            OpRef::ConstIntInline(v) => v.hash(state),
+            // history.py:283 ConstFloat._get_hash_: bitwise
+            OpRef::ConstFloatInline(v) => v.to_bits().hash(state),
+            OpRef::ConstPtrInline(v) => v.0.hash(state),
+        }
+    }
+}
+
+impl OpRef {
+    /// Lift to a total-order key `(discriminant_index, payload_bits)`.
+    /// Inline-f64 uses `to_bits()` (same bitwise total order as `Eq`/`Hash`)
+    /// so the impl can compose into `vecset::VecMap<OpRef, _>` sorted-Vec
+    /// storage without a partial-order escape hatch.
+    fn ord_key(&self) -> (u8, u64) {
+        match *self {
+            OpRef::None => (0, 0),
+            OpRef::ConstInt(x) => (1, x as u64),
+            OpRef::ConstFloat(x) => (2, x as u64),
+            OpRef::ConstPtr(x) => (3, x as u64),
+            OpRef::ConstIntInline(v) => (4, v as u64),
+            OpRef::ConstFloatInline(v) => (5, v.to_bits()),
+            OpRef::ConstPtrInline(v) => (6, v.0 as u64),
+            OpRef::InputArgInt(x) => (7, x as u64),
+            OpRef::InputArgFloat(x) => (8, x as u64),
+            OpRef::InputArgRef(x) => (9, x as u64),
+            OpRef::IntOp(x) => (10, x as u64),
+            OpRef::FloatOp(x) => (11, x as u64),
+            OpRef::RefOp(x) => (12, x as u64),
+            OpRef::VoidOp(x) => (13, x as u64),
+            OpRef::TempVar(x) => (14, x as u64),
+        }
+    }
+}
+
+impl PartialOrd for OpRef {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for OpRef {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.ord_key().cmp(&other.ord_key())
+    }
 }
 
 impl OpRef {
@@ -98,8 +215,17 @@ impl OpRef {
 
     /// Extract the raw u32 payload. For `None` returns `u32::MAX` to
     /// preserve pre-Phase-3 round-trip semantics.
+    ///
+    /// `Const{Int,Float,Ptr}Inline` variants carry an inline value
+    /// (`i64`/`f64`/`GcRef`) and have no u32 raw encoding. Calling
+    /// `raw()` on them is a bug — the OpRef inline-Const epic
+    /// (`.claude/plans/piped-sleeping-brooks.md`) retires `raw()` for
+    /// `Const*` variants in Slice 6; until then, panic loud rather than
+    /// silently truncate. Use `as_const_int_inline` / `as_const_float_inline`
+    /// / `as_const_ptr_inline` to read inline payloads.
     #[inline]
-    pub const fn raw(self) -> u32 {
+    #[track_caller]
+    pub fn raw(self) -> u32 {
         match self {
             Self::None => u32::MAX,
             Self::ConstInt(x)
@@ -113,6 +239,13 @@ impl OpRef {
             | Self::RefOp(x)
             | Self::VoidOp(x)
             | Self::TempVar(x) => x,
+            Self::ConstIntInline(_) | Self::ConstFloatInline(_) | Self::ConstPtrInline(_) => {
+                panic!(
+                    "OpRef::raw() called on inline-Const variant {:?}; \
+                     use as_const_*_inline accessor instead",
+                    self
+                )
+            }
         }
     }
 
@@ -131,9 +264,16 @@ impl OpRef {
     pub fn ty(self) -> Option<Type> {
         match self {
             Self::None | Self::TempVar(_) => None,
-            Self::ConstInt(_) | Self::InputArgInt(_) | Self::IntOp(_) => Some(Type::Int),
-            Self::ConstFloat(_) | Self::InputArgFloat(_) | Self::FloatOp(_) => Some(Type::Float),
-            Self::ConstPtr(_) | Self::InputArgRef(_) | Self::RefOp(_) => Some(Type::Ref),
+            Self::ConstInt(_) | Self::ConstIntInline(_) | Self::InputArgInt(_) | Self::IntOp(_) => {
+                Some(Type::Int)
+            }
+            Self::ConstFloat(_)
+            | Self::ConstFloatInline(_)
+            | Self::InputArgFloat(_)
+            | Self::FloatOp(_) => Some(Type::Float),
+            Self::ConstPtr(_) | Self::ConstPtrInline(_) | Self::InputArgRef(_) | Self::RefOp(_) => {
+                Some(Type::Ref)
+            }
             Self::VoidOp(_) => Some(Type::Void),
         }
     }
@@ -157,7 +297,12 @@ impl OpRef {
     /// rather than silently classifying as a constant.
     pub fn is_constant(self) -> bool {
         match self {
-            Self::ConstInt(_) | Self::ConstFloat(_) | Self::ConstPtr(_) => true,
+            Self::ConstInt(_)
+            | Self::ConstFloat(_)
+            | Self::ConstPtr(_)
+            | Self::ConstIntInline(_)
+            | Self::ConstFloatInline(_)
+            | Self::ConstPtrInline(_) => true,
             // `TempVar` lives in the reserved `[SENTINEL_BASE, u32::MAX - 1]`
             // sentinel range. The raw payload DOES carry `CONST_BIT`
             // (`SENTINEL_BASE = 0xFFFF_0000 = CONST_BIT | 0x7FFF_0000`), but
@@ -211,16 +356,28 @@ impl OpRef {
 
     /// history.py:220 `ConstInt` — `type = 'i'`. Index points into the
     /// integer constant pool.
+    ///
+    /// **DEPRECATED (Slice 6 closure path)**: production paths use
+    /// `const_int_inline(value)` per history.py:227 `ConstInt.value` inline.
+    /// This factory remains for test fixtures that pair an `OpRef`
+    /// declaration with a separate `constants.insert(opref.raw(), value)`.
+    /// New code MUST use `const_int_inline` directly.
     pub const fn const_int(idx: u32) -> OpRef {
         OpRef::ConstInt(idx | Self::CONST_BIT)
     }
 
     /// history.py:261 `ConstFloat` — `type = 'f'`.
+    ///
+    /// **DEPRECATED (Slice 6 closure path)**: use `const_float_inline(value)`
+    /// per history.py:268 `ConstFloat.value` inline.
     pub const fn const_float(idx: u32) -> OpRef {
         OpRef::ConstFloat(idx | Self::CONST_BIT)
     }
 
     /// history.py:307 `ConstPtr` — `type = 'r'`.
+    ///
+    /// **DEPRECATED (Slice 6 closure path)**: use `const_ptr_inline(gcref)`
+    /// per history.py:314 `ConstPtr.value` inline.
     pub const fn const_ptr(idx: u32) -> OpRef {
         OpRef::ConstPtr(idx | Self::CONST_BIT)
     }
@@ -260,9 +417,61 @@ impl OpRef {
         OpRef::VoidOp(pos)
     }
 
+    /// Lower an inline-Const OpRef variant to its raw `i64` payload,
+    /// matching the wire shape of the legacy `set_constants(HashMap<u32,
+    /// i64>)` backend boundary. Returns `None` for non-Const OpRefs and
+    /// for legacy pool-indexed Const variants (caller must fall back to
+    /// pool lookup for those).
+    ///
+    /// Backends use this as an inline-first guard before any `.raw()`
+    /// call on a constant: inline-Const variants carry the value
+    /// directly (history.py:227/268/314) and have no pool key.
+    pub const fn inline_const_bits(self) -> Option<i64> {
+        match self {
+            Self::ConstIntInline(v) => Some(v),
+            Self::ConstFloatInline(v) => Some(v.to_bits() as i64),
+            Self::ConstPtrInline(v) => Some(v.0 as i64),
+            _ => None,
+        }
+    }
+
+    /// Integer value of an Int-typed inline constant — `ConstInt.getint()`
+    /// (history.py:240). Returns `None` for every non-Int operand:
+    /// `ConstFloat` / `ConstPtr` have no `getint` (history.py:268/314),
+    /// and the legacy pool-indexed `ConstInt(idx)` payload is an index,
+    /// not a value, so the caller must resolve that through its pool.
+    ///
+    /// Unlike `inline_const_bits`, this rejects `ConstFloatInline` and
+    /// `ConstPtrInline`. Use it where the operand is statically an
+    /// Int-typed constant — e.g. GuardClass / GuardNonnullClass /
+    /// GuardSubclass class operands, which are read with `getint()` by
+    /// RPython backends and carry vtable addresses as raw integers so the
+    /// GC never traces them.
+    pub const fn const_int_value(self) -> Option<i64> {
+        match self {
+            Self::ConstIntInline(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// Reverse of `const_inline_from_value`: extract the typed `Value`
+    /// from an inline-Const OpRef. Returns `None` for non-inline variants.
+    pub fn inline_const_to_value(self) -> Option<Value> {
+        match self {
+            Self::ConstIntInline(v) => Some(Value::Int(v)),
+            Self::ConstFloatInline(v) => Some(Value::Float(v)),
+            Self::ConstPtrInline(v) => Some(Value::Ref(v)),
+            _ => None,
+        }
+    }
+
     /// Allocate a typed `Const*` OpRef from a zero-based pool index. The
     /// type tag picks the matching variant (history.py:220/261/307).
     /// `Type::Void` is rejected — RPython has no Const-Void class.
+    ///
+    /// legacy-const-ok: mints a legacy idx-Const variant — inline-Const
+    /// callers use `const_int_inline` / `const_float_inline` /
+    /// `const_ptr_inline` directly.
     pub fn const_typed(idx: u32, tp: Type) -> OpRef {
         match tp {
             Type::Int => OpRef::const_int(idx),
@@ -391,6 +600,93 @@ impl OpRef {
             Self::RefOp(_) => Self::RefOp(new_raw),
             Self::VoidOp(_) => Self::VoidOp(new_raw),
             Self::TempVar(_) => Self::TempVar(new_raw),
+            Self::ConstIntInline(_) | Self::ConstFloatInline(_) | Self::ConstPtrInline(_) => {
+                panic!(
+                    "OpRef::with_raw() called on inline-Const variant; \
+                     inline payload has no u32 raw encoding"
+                )
+            }
+        }
+    }
+
+    // ── Inline-Const factories + accessors (Slice 1) ──
+    //
+    // Strict RPython parity: `Const{Int,Float,Ptr}.value` are inline
+    // attributes on the Box class (history.py:227/268/314). These
+    // factories mint an OpRef variant carrying the value directly,
+    // bypassing `ConstantPool`. Producers cut over in Slice 2; readers
+    // in Slice 3; the legacy idx variants retire and `*Inline` is
+    // renamed back to `Const*` in Slice 6.
+
+    /// history.py:227 `ConstInt.value: int` carried inline.
+    pub const fn const_int_inline(v: i64) -> OpRef {
+        OpRef::ConstIntInline(v)
+    }
+
+    /// history.py:268 `ConstFloat.value: float` carried inline.
+    pub const fn const_float_inline(v: f64) -> OpRef {
+        OpRef::ConstFloatInline(v)
+    }
+
+    /// history.py:314 `ConstPtr.value: gcref` carried inline.
+    pub const fn const_ptr_inline(v: GcRef) -> OpRef {
+        OpRef::ConstPtrInline(v)
+    }
+
+    /// Mint an inline-Const OpRef from a `Value` per RPython
+    /// `history.py:227/268/314` Const{Int,Float,Ptr}.value (the value
+    /// lives inline on the Box). `Value::Void` panics — RPython has no
+    /// `ConstVoid` (resoperation.py defines Const subclasses only for
+    /// Int/Float/Ref).
+    pub fn const_inline_from_value(value: &Value) -> OpRef {
+        match value {
+            Value::Int(i) => OpRef::ConstIntInline(*i),
+            Value::Float(f) => OpRef::ConstFloatInline(*f),
+            Value::Ref(r) => OpRef::ConstPtrInline(*r),
+            Value::Void => {
+                panic!("Value::Void has no Const subclass per resoperation.py / history.py")
+            }
+        }
+    }
+
+    /// Extract the inline `i64` from `ConstIntInline`; `None` for any
+    /// other variant (including legacy pool-indexed `ConstInt`).
+    pub const fn as_const_int_inline(self) -> Option<i64> {
+        match self {
+            Self::ConstIntInline(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// Extract the inline `f64` from `ConstFloatInline`; `None` for any
+    /// other variant.
+    pub const fn as_const_float_inline(self) -> Option<f64> {
+        match self {
+            Self::ConstFloatInline(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// Extract the inline `GcRef` from `ConstPtrInline`; `None` for any
+    /// other variant.
+    pub const fn as_const_ptr_inline(self) -> Option<GcRef> {
+        match self {
+            Self::ConstPtrInline(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// Mutable view of the inline `GcRef` carried by `ConstPtrInline`;
+    /// `None` for any other variant. Used by minor-collection root
+    /// walkers (framework.py `root_walker.walk_roots`) to forward
+    /// nursery-resident Ref constants in-place. `ConstInt` ≡ `ConstPtr`
+    /// at the AbstractValue level (history.py:227/268/314) — only the
+    /// `ConstPtr.value` slot needs GC tracing because `ConstInt.value`
+    /// is a plain integer.
+    pub fn as_const_ptr_inline_mut(&mut self) -> Option<&mut GcRef> {
+        match self {
+            Self::ConstPtrInline(v) => Some(v),
+            _ => None,
         }
     }
 }
@@ -1228,6 +1524,27 @@ impl AsRef<Op> for Op {
 }
 
 impl Op {
+    /// Visit every inline `ConstPtr.value` slot carried by this operation.
+    ///
+    /// RPython's GC traces `ResOperation.args` / `fail_args` object fields
+    /// directly. Pyre stores `ConstPtr.value` in `OpRef::ConstPtrInline`, so
+    /// long-lived op graphs must expose the actual mutable slots to the GC
+    /// walker instead of copying the pointer values aside.
+    pub fn walk_const_ptr_refs_mut(&self, visitor: &mut dyn FnMut(&mut GcRef)) {
+        for arg in self.args.borrow_mut().iter_mut() {
+            if let Some(slot) = arg.as_const_ptr_inline_mut() {
+                visitor(slot);
+            }
+        }
+        if let Some(fail_args) = self.fail_args.borrow_mut().as_mut() {
+            for arg in fail_args.iter_mut() {
+                if let Some(slot) = arg.as_const_ptr_inline_mut() {
+                    visitor(slot);
+                }
+            }
+        }
+    }
+
     pub fn new(opcode: OpCode, args: &[OpRef]) -> Self {
         Op {
             opcode,
@@ -1353,13 +1670,19 @@ impl Op {
     ///   guard_op.setfailargs(boxes)
     /// compile.py:874-876 store_final_boxes
     pub fn store_final_boxes(&self, boxes: Vec<OpRef>) {
-        // optimizer.py:745-749: check no duplicates (debug only)
+        // optimizer.py:745-749: check no duplicates (debug only).
+        // history.py:213/251 — `Const.same_constant` defines Const equality
+        // by value (e.g. `ConstInt(7) == ConstInt(7)`), not identity, so the
+        // duplicate detector keys on the `OpRef` variant itself (which
+        // derives `PartialEq+Hash` with the same value-based semantics for
+        // inline-Const variants) instead of `.raw()` (which panics on
+        // inline-Const).
         #[cfg(debug_assertions)]
         {
             let mut seen = std::collections::HashSet::new();
             for &b in &boxes {
                 if !b.is_none() {
-                    debug_assert!(seen.insert(b.raw()), "duplicate box in fail_args: {:?}", b);
+                    debug_assert!(seen.insert(b), "duplicate box in fail_args: {:?}", b);
                 }
             }
         }
@@ -1369,13 +1692,24 @@ impl Op {
 
 impl std::fmt::Display for Op {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // history.py:227/268/314 — inline-Const variants carry value on the
+        // OpRef and panic on `.raw()`. Render via accessor for those; body
+        // OpRefs continue to render as `v<pos>` from `.raw()`.
+        fn write_arg(f: &mut std::fmt::Formatter<'_>, arg: OpRef) -> std::fmt::Result {
+            match arg {
+                OpRef::ConstIntInline(v) => write!(f, "{v}"),
+                OpRef::ConstFloatInline(v) => write!(f, "{v}"),
+                OpRef::ConstPtrInline(v) => write!(f, "ptr({:#x})", v.0),
+                _ => write!(f, "v{}", arg.raw()),
+            }
+        }
         if self.opcode.is_guard() {
             write!(f, "{:?}(", self.opcode)?;
             for (i, arg) in self.getarglist().iter().enumerate() {
                 if i > 0 {
                     write!(f, ", ")?;
                 }
-                write!(f, "v{}", arg.raw())?;
+                write_arg(f, *arg)?;
             }
             write!(f, ")")?;
             if let Some(fa) = self.getfailargs() {
@@ -1384,7 +1718,7 @@ impl std::fmt::Display for Op {
                     if i > 0 {
                         write!(f, ", ")?;
                     }
-                    write!(f, "v{}", arg.raw())?;
+                    write_arg(f, *arg)?;
                 }
                 write!(f, "]")?;
             }
@@ -1395,7 +1729,7 @@ impl std::fmt::Display for Op {
                 if i > 0 {
                     write!(f, ", ")?;
                 }
-                write!(f, "v{}", arg.raw())?;
+                write_arg(f, *arg)?;
             }
             write!(f, ")")
         } else {
@@ -1404,7 +1738,7 @@ impl std::fmt::Display for Op {
                 if i > 0 {
                     write!(f, ", ")?;
                 }
-                write!(f, "v{}", arg.raw())?;
+                write_arg(f, *arg)?;
             }
             write!(f, ")")
         }
@@ -1434,6 +1768,29 @@ pub fn format_trace<V: std::fmt::Debug, T: AsRef<Op>, C: ConstLookup<V>>(
     constants: &C,
 ) -> String {
     use std::fmt::Write;
+    // history.py:227/268/314 — inline-Const variants carry their value
+    // directly; render via accessors instead of `.raw()` (which panics
+    // on inline-Const). Body-namespace OpRefs continue to render via
+    // raw position with constants-map lookup.
+    fn render_arg<V: std::fmt::Debug, C: ConstLookup<V>>(
+        out: &mut String,
+        arg: OpRef,
+        constants: &C,
+    ) {
+        use std::fmt::Write;
+        match arg {
+            OpRef::ConstIntInline(v) => write!(out, "{v}").unwrap(),
+            OpRef::ConstFloatInline(v) => write!(out, "{v}").unwrap(),
+            OpRef::ConstPtrInline(v) => write!(out, "ptr({:#x})", v.0).unwrap(),
+            _ => {
+                if let Some(val) = constants.lookup(arg.raw()) {
+                    write!(out, "{val:?}").unwrap();
+                } else {
+                    write!(out, "v{}", arg.raw()).unwrap();
+                }
+            }
+        }
+    }
     let mut out = String::new();
     for op in ops {
         let op: &Op = op.as_ref();
@@ -1450,11 +1807,7 @@ pub fn format_trace<V: std::fmt::Debug, T: AsRef<Op>, C: ConstLookup<V>>(
             if i > 0 {
                 write!(out, ", ").unwrap();
             }
-            if let Some(val) = constants.lookup(arg.raw()) {
-                write!(out, "{val:?}").unwrap();
-            } else {
-                write!(out, "v{}", arg.raw()).unwrap();
-            }
+            render_arg(&mut out, *arg, constants);
         }
         write!(out, ")").unwrap();
         // Render descriptor if present (parity with RPython's logger repr_of_descr)
@@ -1470,11 +1823,7 @@ pub fn format_trace<V: std::fmt::Debug, T: AsRef<Op>, C: ConstLookup<V>>(
                 if i > 0 {
                     write!(out, ", ").unwrap();
                 }
-                if let Some(val) = constants.lookup(arg.raw()) {
-                    write!(out, "{val:?}").unwrap();
-                } else {
-                    write!(out, "v{}", arg.raw()).unwrap();
-                }
+                render_arg(&mut out, *arg, constants);
             }
             write!(out, "]").unwrap();
         }
@@ -5034,6 +5383,8 @@ mod tests {
 
     // ── Typed OpRef constructors (Phase 2A) ──
 
+    // legacy-const-ok: pins variant-aware Eq across the legacy idx-Const
+    // factories; inline-Const variants have their own distinctness tests.
     #[test]
     fn typed_const_constructors_keep_variant_distinct() {
         // history.py:244 `ConstInt.same_constant` rejects `ConstFloat` /
@@ -5072,6 +5423,9 @@ mod tests {
         }
     }
 
+    // legacy-const-ok: exercises is_constant() classification on legacy
+    // idx-Const factories. Inline-Const variants are covered by parallel
+    // tests below.
     #[test]
     fn test_typed_constructors_classification() {
         // is_constant() distinguishes Const family from the rest.
@@ -5086,6 +5440,8 @@ mod tests {
         assert!(!OpRef::ref_op(0).is_constant());
     }
 
+    // legacy-const-ok: pins the legacy idx-Const factory ↔ const_index
+    // round-trip. Inline-Const variants store the value, not an idx.
     #[test]
     fn test_typed_const_round_trip_via_const_index() {
         for idx in [0u32, 1, 7, 100, 0x0FFF_FFFF] {
@@ -5098,6 +5454,9 @@ mod tests {
     /// Locks in the bit-helper byte-equivalence with the OpRef-construction
     /// path so callers in index-keyed pools can use `raw_is_constant` /
     /// `raw_const_index` without semantic drift.
+    ///
+    /// legacy-const-ok: raw_is_constant / raw_const_index are legacy
+    /// idx-Const helpers; inline variants panic on raw().
     #[test]
     fn test_raw_is_constant_matches_opref_path() {
         for idx in [0u32, 1, 7, 100, 0x0FFF_FFFF] {

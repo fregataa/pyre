@@ -1242,7 +1242,7 @@ mod tests {
     fn test_check_consistency_const_arg_ok() {
         // history.py:580: constants are always valid args
         let inputargs = vec![InputArg::new_int(0)];
-        let const_ref = OpRef::const_int(0);
+        let const_ref = OpRef::const_int_inline(0);
         let mut op0 = Op::new(OpCode::IntAdd, &[iarg(0), const_ref]);
         op0.pos.set(iop(1));
         let ops = vec![op0, Op::new(OpCode::Finish, &[iop(1)])];
@@ -1294,7 +1294,7 @@ mod tests {
         // history.py:590: fail_args must not contain constants
         let inputargs = vec![InputArg::new_int(0)];
         let mut guard = Op::new(OpCode::GuardTrue, &[iarg(0)]);
-        guard.setfailargs(smallvec::smallvec![OpRef::const_int(0)]);
+        guard.setfailargs(smallvec::smallvec![OpRef::const_int_inline(0)]);
         guard.setdescr(std::sync::Arc::new(DummyGuardDescr));
         let ops = vec![guard, Op::new(OpCode::Finish, &[])];
         let trace = TreeLoop::new(inputargs, ops);
@@ -1511,7 +1511,7 @@ mod tests {
         op0.pos.set(iop(1));
         ops.push(op0);
         // post-cut: uses a constant
-        let const_ref = OpRef::const_int(0);
+        let const_ref = OpRef::const_int_inline(0);
         let mut op1 = Op::new(OpCode::IntAdd, &[iarg(0), const_ref]);
         op1.pos.set(iop(2));
         ops.push(op1);
@@ -2610,7 +2610,7 @@ impl TraceCtx {
         arg_types: &[Type],
         ret_type: Type,
     ) -> OpRef {
-        let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
+        let func_ref = OpRef::const_int_inline(func_ptr as usize as i64);
         let descr = crate::call_descr::make_call_descr_for_opcode(opcode, arg_types, ret_type);
         let mut call_args = vec![func_ref];
         call_args.extend_from_slice(args);
@@ -2663,7 +2663,7 @@ impl TraceCtx {
         ret_type: Type,
         effect_info: majit_ir::EffectInfo,
     ) -> OpRef {
-        let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
+        let func_ref = OpRef::const_int_inline(func_ptr as usize as i64);
         let descr =
             crate::call_descr::make_call_descr_with_effect(arg_types, ret_type, effect_info);
         let mut call_args = vec![func_ref];
@@ -2747,7 +2747,7 @@ impl TraceCtx {
             effect_info.check_is_elidable() && !effect_info.check_can_raise(false),
             "call_typed_with_effect_pure requires EF_ELIDABLE_CANNOT_RAISE"
         );
-        let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
+        let func_ref = OpRef::const_int_inline(func_ptr as usize as i64);
         let descr =
             crate::call_descr::make_call_descr_with_effect(arg_types, ret_type, effect_info);
         let mut call_args = Vec::with_capacity(args.len() + 1);
@@ -2826,15 +2826,12 @@ impl TraceCtx {
         if all_const {
             // pyjitpl.py:3566-3569: all-constants → cut the CALL
             self.recorder.cut(patch_pos);
+            // history.py:227/268/314 — Const{Int,Float,Ptr}.value inline.
             let const_opref = match resbox_as_const {
-                Value::Int(v) => self.constants.get_or_insert(v),
-                Value::Float(v) => self
-                    .constants
-                    .get_or_insert_typed(v.to_bits() as i64, Type::Float),
-                Value::Ref(r) => self
-                    .constants
-                    .get_or_insert_typed(r.as_usize() as i64, Type::Ref),
-                Value::Void => self.constants.get_or_insert(0),
+                Value::Int(v) => OpRef::const_int_inline(v),
+                Value::Float(v) => OpRef::const_float_inline(v),
+                Value::Ref(r) => OpRef::const_ptr_inline(r),
+                Value::Void => OpRef::const_int_inline(0),
             };
             return const_opref;
         }
@@ -2882,8 +2879,8 @@ impl TraceCtx {
         arg_types: &[Type],
         slot: EffectInfoSlot,
     ) {
-        let cond_ref = self.constants.get_or_insert(condition);
-        let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
+        let cond_ref = OpRef::const_int_inline(condition);
+        let func_ref = OpRef::const_int_inline(func_ptr as usize as i64);
         let descr = make_call_descr_from_target_slot(arg_types, Type::Void, slot);
         let mut call_args = vec![cond_ref, func_ref];
         call_args.extend_from_slice(args);
@@ -2900,8 +2897,8 @@ impl TraceCtx {
         arg_types: &[Type],
         slot: EffectInfoSlot,
     ) -> OpRef {
-        let value_ref = self.constants.get_or_insert(value);
-        let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
+        let value_ref = OpRef::const_int_inline(value);
+        let func_ref = OpRef::const_int_inline(func_ptr as usize as i64);
         let descr = make_call_descr_from_target_slot(arg_types, Type::Int, slot);
         let mut call_args = vec![value_ref, func_ref];
         call_args.extend_from_slice(args);
@@ -2927,8 +2924,10 @@ impl TraceCtx {
         arg_types: &[Type],
         slot: EffectInfoSlot,
     ) -> OpRef {
-        let value_ref = self.constants.get_or_insert_typed(value, Type::Ref);
-        let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
+        // history.py:314 ConstPtr.value inline (Slice 7b op-graph walker
+        // forwards `OpRef::ConstPtrInline(GcRef)` slots in `op.args`).
+        let value_ref = OpRef::const_ptr_inline(majit_ir::GcRef(value as usize));
+        let func_ref = OpRef::const_int_inline(func_ptr as usize as i64);
         let descr = make_call_descr_from_target_slot(arg_types, Type::Ref, slot);
         let mut call_args = vec![value_ref, func_ref];
         call_args.extend_from_slice(args);
@@ -2983,10 +2982,15 @@ impl TraceCtx {
         // recorded constant lands as `ConstPtr` for Ref results,
         // matching `history.py:307 ConstPtr` and preventing alias with
         // `ConstInt` slots of the same raw value.
-        let result_ref = self
-            .constants
-            .get_or_insert_typed(result_value, result_type);
-        let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
+        // history.py:227/268/314 Const{Int,Float,Ptr}.value inline.
+        // Slice 7b op-graph walker forwards Ref slots.
+        let result_ref = match result_type {
+            Type::Int => OpRef::const_int_inline(result_value),
+            Type::Float => OpRef::const_float_inline(f64::from_bits(result_value as u64)),
+            Type::Ref => OpRef::const_ptr_inline(majit_ir::GcRef(result_value as usize)),
+            Type::Void => OpRef::const_int_inline(0),
+        };
+        let func_ref = OpRef::const_int_inline(func_ptr as usize as i64);
         let descr = make_call_descr_from_target_slot(arg_types, result_type, slot);
         let mut call_args = vec![result_ref, func_ref];
         call_args.extend_from_slice(args);
@@ -3158,7 +3162,7 @@ impl TraceCtx {
         arg_types: &[Type],
         ret_type: Type,
     ) -> OpRef {
-        let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
+        let func_ref = OpRef::const_int_inline(func_ptr as usize as i64);
         let descr = make_call_may_force_descr(arg_types, ret_type);
         let mut call_args = vec![func_ref];
         call_args.extend_from_slice(args);
@@ -3224,7 +3228,7 @@ impl TraceCtx {
         ret_type: Type,
         effect_info: majit_ir::EffectInfo,
     ) -> OpRef {
-        let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
+        let func_ref = OpRef::const_int_inline(func_ptr as usize as i64);
         let descr =
             crate::call_descr::make_call_descr_with_effect(arg_types, ret_type, effect_info);
         let mut call_args = vec![func_ref];
@@ -3377,8 +3381,10 @@ impl TraceCtx {
             "release_gil call_release_gil_target unset — emit-side resolve_call_release_gil_target should have populated realfuncaddr",
         );
         let _ = func_ptr;
-        let savebox = self.constants.get_or_insert(saveerr as i64);
-        let funcbox = self.constants.get_or_insert(realfuncaddr as i64);
+        // history.py:227 ConstInt.value inline for saveerr flags + static
+        // function pointer.
+        let savebox = OpRef::const_int_inline(saveerr as i64);
+        let funcbox = OpRef::const_int_inline(realfuncaddr as i64);
 
         let descr =
             crate::call_descr::make_call_descr_with_effect(arg_types, ret_type, effect_info);
@@ -3437,7 +3443,7 @@ impl TraceCtx {
         arg_types: &[Type],
         effect_info: majit_ir::EffectInfo,
     ) {
-        let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
+        let func_ref = OpRef::const_int_inline(func_ptr as usize as i64);
         let opcode = OpCode::call_loopinvariant_for_type(Type::Void);
         let descr =
             crate::call_descr::make_call_descr_with_effect(arg_types, Type::Void, effect_info);
@@ -3674,7 +3680,7 @@ impl TraceCtx {
         arg_types: &[Type],
         ret_type: Type,
     ) -> OpRef {
-        let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
+        let func_ref = OpRef::const_int_inline(func_ptr as usize as i64);
         let opcode = OpCode::call_loopinvariant_for_type(ret_type);
         let descr = crate::call_descr::make_call_descr_for_opcode(opcode, arg_types, ret_type);
         // RPython `heapcache.py:629-639` keys by descriptor identity
@@ -3924,7 +3930,7 @@ impl TraceCtx {
         effect_info: majit_ir::EffectInfo,
         concrete_resvalue: i64,
     ) -> OpRef {
-        let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
+        let func_ref = OpRef::const_int_inline(func_ptr as usize as i64);
         let opcode = OpCode::call_loopinvariant_for_type(ret_type);
         let descr =
             crate::call_descr::make_call_descr_with_effect(arg_types, ret_type, effect_info);

@@ -468,24 +468,39 @@ impl RewriteState {
         s
     }
 
-    /// Resolve a constant value from the constant pool.
-    fn resolve_constant(&self, key: u32) -> Option<i64> {
-        self.constants.get(&key).copied()
+    /// Resolve a constant value from the box (RPython parity: caller
+    /// passes the Box; `isinstance(box, ConstInt) and box.getint()`).
+    /// history.py:227/268/314 — inline-Const variants carry their value
+    /// directly; legacy pool-indexed variants look up via the snapshot.
+    fn resolve_constant(&self, opref: majit_ir::OpRef) -> Option<i64> {
+        // rewrite.py:548/590/1013 gate these reads on `isinstance(arg,
+        // ConstInt)` → `getint()`. ConstFloat/ConstPtr have no `getint`
+        // (history.py:268/314), so every Float/Ptr constant — inline or
+        // legacy pool-indexed — is rejected outright. ConstIntInline
+        // carries its value; the legacy pool-indexed `ConstInt(idx)` and
+        // the test harness's non-constant placeholder OpRefs (paired with
+        // a `constants[opref.raw()]` entry) resolve by raw key. Production
+        // pools are keyed in the constant namespace (CONST_BIT set), so a
+        // genuine box position never collides and stays unresolved.
+        match opref {
+            OpRef::ConstIntInline(v) => Some(v),
+            OpRef::ConstFloatInline(_)
+            | OpRef::ConstPtrInline(_)
+            | OpRef::ConstFloat(_)
+            | OpRef::ConstPtr(_) => None,
+            _ => self.constants.get(&opref.raw()).copied(),
+        }
     }
 
     /// Emit a fresh constant OpRef for `value`.
     ///
     /// rewrite.py:149/671/682 parity: RPython constructs a new
-    /// `ConstInt(value)` at each call site without caching. Mirrors that
-    /// — every call grows the constant pool by one entry in the shared
-    /// high-bit constant namespace (same as the tracer's ConstantPool).
-    /// Mints `OpRef::ConstInt` (history.py:220 `ConstInt.type = 'i'`).
+    /// `ConstInt(value)` at each call site. history.py:227
+    /// `ConstInt.value` is inline on the Box; pyre mints
+    /// `OpRef::ConstIntInline(value)` with the value carried inline
+    /// per history.py:220 `ConstInt.type = 'i'`.
     fn const_int(&mut self, value: i64) -> OpRef {
-        let opref = OpRef::const_int(self.next_const_idx);
-        self.next_const_idx += 1;
-        self.constants.insert(opref.raw(), value);
-        self.new_constant_types.insert(opref.raw(), Type::Int);
-        opref
+        OpRef::const_int_inline(value)
     }
 
     /// Emit an op. Void ops do not consume a result id.
@@ -564,12 +579,12 @@ impl RewriteState {
     fn record_int_add_or_sub(&mut self, op: &Op, is_subtraction: bool) {
         let v_arg0 = op.arg(0);
         let v_arg1 = op.arg(1);
-        let (box_arg, mut constant) = if let Some(c) = self.resolve_constant(v_arg1.raw()) {
+        let (box_arg, mut constant) = if let Some(c) = self.resolve_constant(v_arg1) {
             let signed = if is_subtraction { -c } else { c };
             (v_arg0, signed)
         } else if !is_subtraction {
             // rewrite.py:1019-1024: int_add only — try arg0 as constant.
-            let Some(c) = self.resolve_constant(v_arg0.raw()) else {
+            let Some(c) = self.resolve_constant(v_arg0) else {
                 return;
             };
             (v_arg1, c)
@@ -621,12 +636,22 @@ impl RewriteState {
 
     /// rewrite.py:930 parity: `v.type` — get the type of an OpRef.
     fn result_type_of(&self, r: OpRef) -> Option<Type> {
+        // history.py:220/261/307 typed Const variants carry the type tag
+        // intrinsically — `.raw()` panics on inline-Const, so consult `ty()`
+        // first.
+        if let Some(tp) = r.ty() {
+            return Some(tp);
+        }
         self.result_types.get(&r.raw()).copied()
     }
 
     /// rewrite.py:930 parity: `isinstance(v, ConstPtr) and not needs_write_barrier(v.value)`.
     /// A null ConstPtr never needs a write barrier.
     fn is_null_constant(&self, r: OpRef) -> bool {
+        // history.py:314 ConstPtr.value inline — null sentinel directly readable.
+        if let Some(bits) = r.inline_const_bits() {
+            return bits == 0;
+        }
         if let Some(&val) = self.constants.get(&r.raw()) {
             val == 0
         } else {
@@ -1001,7 +1026,7 @@ impl GcRewriterImpl {
 
         let item_size = descr.item_size();
         let v_length = st.resolve(op.arg(0)); // the length operand
-        let length_const = st.resolve_constant(v_length.raw());
+        let length_const = st.resolve_constant(v_length);
 
         // rewrite.py:548-558 — total_size for the constant-size /
         // zero-itemsize fast path.  Stays at -1 when v_length is a
@@ -1185,7 +1210,7 @@ impl GcRewriterImpl {
             return;
         }
         // rewrite.py:590-591 constant zero-length short-circuit.
-        let length_const = st.resolve_constant(v_length.raw());
+        let length_const = st.resolve_constant(v_length);
         if matches!(length_const, Some(0)) {
             return;
         }
@@ -1513,7 +1538,7 @@ impl GcRewriterImpl {
             st.resolve(op.arg(4))
         } else {
             let v_length = st.resolve(op.arg(4));
-            if let Some(c) = st.resolve_constant(v_length.raw()) {
+            if let Some(c) = st.resolve_constant(v_length) {
                 // rewrite.py:1073-1074 — constant-fold the shift.
                 st.const_int(c << itemscale)
             } else {
@@ -1668,10 +1693,10 @@ impl GcRewriterImpl {
     fn consider_setarrayitem_gc(&self, op: &Op, st: &mut RewriteState) {
         let array_ref = st.resolve(op.arg(0));
         let index_ref = op.arg(1);
-        if st.resolve_constant(array_ref.raw()).is_some() {
+        if st.resolve_constant(array_ref).is_some() {
             return;
         }
-        let Some(idx_val) = st.resolve_constant(index_ref.raw()) else {
+        let Some(idx_val) = st.resolve_constant(index_ref) else {
             return;
         };
         st.record_setarrayitem_index(array_ref, idx_val as usize);
@@ -1830,7 +1855,7 @@ impl GcRewriterImpl {
         st: &mut RewriteState,
     ) -> (i64, i64, ScaledIndex) {
         // rewrite.py:1118-1122 — ConstInt path.
-        if let Some(index_val) = st.resolve_constant(index_box.raw()) {
+        if let Some(index_val) = st.resolve_constant(index_box) {
             return (1, index_val * factor + offset, ScaledIndex::Const);
         }
         // rewrite.py:1124-1133 — non-constant path.
@@ -2262,13 +2287,13 @@ impl GcRewriterImpl {
             OpCode::GcLoadIndexedI | OpCode::GcLoadIndexedR | OpCode::GcLoadIndexedF
         ) {
             let scale = st
-                .resolve_constant(op.arg(2).raw())
+                .resolve_constant(op.arg(2))
                 .expect("GC_LOAD_INDEXED scale must be ConstInt");
             let offset = st
-                .resolve_constant(op.arg(3).raw())
+                .resolve_constant(op.arg(3))
                 .expect("GC_LOAD_INDEXED offset must be ConstInt");
             let size = st
-                .resolve_constant(op.arg(4).raw())
+                .resolve_constant(op.arg(4))
                 .expect("GC_LOAD_INDEXED size must be ConstInt");
             let ptr = st.resolve(op.arg(0));
             let index = st.resolve(op.arg(1));
@@ -2277,13 +2302,13 @@ impl GcRewriterImpl {
         }
         if matches!(opnum, OpCode::GcStoreIndexed) {
             let scale = st
-                .resolve_constant(op.arg(3).raw())
+                .resolve_constant(op.arg(3))
                 .expect("GC_STORE_INDEXED scale must be ConstInt");
             let offset = st
-                .resolve_constant(op.arg(4).raw())
+                .resolve_constant(op.arg(4))
                 .expect("GC_STORE_INDEXED offset must be ConstInt");
             let size = st
-                .resolve_constant(op.arg(5).raw())
+                .resolve_constant(op.arg(5))
                 .expect("GC_STORE_INDEXED size must be ConstInt");
             let ptr = st.resolve(op.arg(0));
             let index = st.resolve(op.arg(1));
@@ -3165,17 +3190,26 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].opcode, OpCode::CallMallocNursery);
         // rewrite.py:474-484 parity: size arg is ConstInt(descr.size + GcHeader::SIZE).
-        let size_val = constants[&result[0].arg(0).raw()];
+        let size_val = result[0]
+            .arg(0)
+            .inline_const_bits()
+            .expect("inline ConstInt");
         assert_eq!(size_val, (32 + crate::header::GcHeader::SIZE) as i64);
         assert_eq!(result[1].opcode, OpCode::GcStore); // tid init
-        let tid_val = constants[&result[1].arg(2).raw()];
+        let tid_val = result[1]
+            .arg(2)
+            .inline_const_bits()
+            .expect("inline ConstInt");
         assert_eq!(tid_val, 7); // type_id = 7
         // GcHeader packs type id (lower 32 bits) and gc flags (upper 32
         // bits) into a single u64.  gen_initialize_tid must emit a
         // 4-byte store so that the runtime-set flags
         // (collector.rs:449 alloc_in_oldgen ORs in TRACK_YOUNG_PTRS for
         // oldgen-promoted allocs) survive the type id stamp.
-        let store_size = constants[&result[1].arg(3).raw()];
+        let store_size = result[1]
+            .arg(3)
+            .inline_const_bits()
+            .expect("inline ConstInt");
         assert_eq!(
             store_size, 4,
             "gen_initialize_tid must emit a 4-byte store (type id half) so \
@@ -3252,9 +3286,12 @@ mod tests {
             .position(|o| o.opcode == OpCode::CallR)
             .expect("constant-length oversize must emit CALL_R slow helper");
         let call = &result[call_idx];
-        assert_eq!(consts[&call.arg(0).raw()], TEST_MALLOC_ARRAY_FN);
-        assert_eq!(consts[&call.arg(1).raw()], 8);
-        assert_eq!(consts[&call.arg(2).raw()], 5);
+        assert_eq!(
+            call.arg(0).inline_const_bits().expect("inline ConstInt"),
+            TEST_MALLOC_ARRAY_FN
+        );
+        assert_eq!(call.arg(1).inline_const_bits().expect("inline ConstInt"), 8);
+        assert_eq!(call.arg(2).inline_const_bits().expect("inline ConstInt"), 5);
         assert_eq!(call.arg(3), len_ref);
         assert!(
             result
@@ -3440,8 +3477,8 @@ mod tests {
             .iter()
             .filter(|o| o.opcode == OpCode::GcStore)
             // skip the tid header store (ofs=0, value=type_id, itemsize=4).
-            .filter(|o| consts.get(&o.arg(2).raw()).copied() == Some(0))
-            .map(|o| consts[&o.arg(1).raw()])
+            .filter(|o| o.arg(2).inline_const_bits() == Some(0))
+            .map(|o| o.arg(1).inline_const_bits().expect("inline ConstInt"))
             .collect();
         seen_offsets.sort();
         assert_eq!(
@@ -3460,9 +3497,7 @@ mod tests {
         rw.malloc_zero_filled = false;
         let gc_fields = vec![ref_field_descr_at(24), ref_field_descr_at(32)];
         let descr = size_descr_with_gc_fields(48, 42, gc_fields);
-        let val = OpRef::const_ptr(100);
-        let mut constants: VecAssoc<u32, i64> = VecAssoc::new();
-        constants.insert(val.raw(), 0x1234);
+        let val = OpRef::const_ptr_inline(majit_ir::GcRef(0x1234));
         let ops = vec![
             Op::with_descr(OpCode::New, &[], descr),
             Op::with_descr(
@@ -3473,13 +3508,13 @@ mod tests {
             Op::new(OpCode::Jump, &[]),
         ];
 
-        let (result, consts, _) = rw.rewrite_for_gc_with_constants(&ops, &constants);
+        let (result, _consts, _) = rw.rewrite_for_gc_with_constants(&ops, &VecAssoc::new());
 
         let null_offsets: Vec<i64> = result
             .iter()
             .filter(|o| o.opcode == OpCode::GcStore)
-            .filter(|o| consts.get(&o.arg(2).raw()).copied() == Some(0))
-            .map(|o| consts[&o.arg(1).raw()])
+            .filter(|o| o.arg(2).inline_const_bits() == Some(0))
+            .map(|o| o.arg(1).inline_const_bits().expect("inline ConstInt"))
             .collect();
         assert_eq!(
             null_offsets,
@@ -3533,14 +3568,20 @@ mod tests {
         // rewrite.py:893-895: combined size = round_up(24+8) + round_up(32+8) = 32 + 40 = 72
         let header = crate::header::GcHeader::SIZE as usize;
         let expected_size = round_up(24 + header) as i64 + round_up(32 + header) as i64;
-        assert_eq!(constants[&malloc.arg(0).raw()], expected_size);
+        assert_eq!(
+            malloc.arg(0).inline_const_bits().expect("inline ConstInt"),
+            expected_size
+        );
 
         let incr = result
             .iter()
             .find(|o| o.opcode == OpCode::NurseryPtrIncrement)
             .unwrap();
         // rewrite.py:898: ConstInt(previous_size) = round_up(24 + GcHeader::SIZE) = 32
-        assert_eq!(constants[&incr.arg(1).raw()], round_up(24 + header) as i64);
+        assert_eq!(
+            incr.arg(1).inline_const_bits().expect("inline ConstInt"),
+            round_up(24 + header) as i64
+        );
 
         // Both should have tid initialisation.
         let tid_stores: Vec<_> = result
@@ -3548,8 +3589,20 @@ mod tests {
             .filter(|o| o.opcode == OpCode::GcStore)
             .collect();
         assert_eq!(tid_stores.len(), 2);
-        assert_eq!(constants[&tid_stores[0].arg(2).raw()], 1); // first type_id
-        assert_eq!(constants[&tid_stores[1].arg(2).raw()], 2); // second type_id
+        assert_eq!(
+            tid_stores[0]
+                .arg(2)
+                .inline_const_bits()
+                .expect("inline ConstInt"),
+            1
+        ); // first type_id
+        assert_eq!(
+            tid_stores[1]
+                .arg(2)
+                .inline_const_bits()
+                .expect("inline ConstInt"),
+            2
+        ); // second type_id
     }
 
     // ── Test 7: A collecting operation between two NEWs prevents batching ──
@@ -3658,10 +3711,13 @@ mod tests {
         assert_eq!(result[0].opcode, OpCode::CallMallocNursery);
         assert_eq!(result[1].opcode, OpCode::GcStore);
         let tid_ref = result[1].arg(2);
-        assert_eq!(constants[&tid_ref.raw()], 3);
+        assert_eq!(tid_ref.inline_const_bits().expect("inline ConstInt"), 3);
         assert_eq!(result[2].opcode, OpCode::GcStore);
         let vtable_ref = result[2].arg(2);
-        assert_eq!(constants[&vtable_ref.raw()], 0xDEAD_i64);
+        assert_eq!(
+            vtable_ref.inline_const_bits().expect("inline ConstInt"),
+            0xDEAD_i64
+        );
     }
 
     // ── Test 11: SETARRAYITEM_GC with Ref — no card marking → regular WB ──
@@ -3880,7 +3936,7 @@ mod tests {
             .expect("SAME_AS_I must be emitted for GUARD_FALSE merge");
         let const_ref = same.arg(0);
         assert_eq!(
-            consts[&const_ref.raw()],
+            const_ref.inline_const_bits().expect("inline ConstInt"),
             1,
             "GUARD_FALSE hoists SAME_AS_I(1) per rewrite.py:463",
         );
@@ -3912,12 +3968,12 @@ mod tests {
             .expect("GuardValue replaces GuardAlwaysFails");
         assert_eq!(gv.arg(0), same.pos.get());
         assert_eq!(
-            consts[&gv.arg(1).raw()],
+            gv.arg(1).inline_const_bits().expect("inline ConstInt"),
             1,
             "GuardValue checks against ConstInt(1)",
         );
         assert_eq!(
-            consts[&same.arg(0).raw()],
+            same.arg(0).inline_const_bits().expect("inline ConstInt"),
             0,
             "SAME_AS_I uses ConstInt(0) per rewrite.py:421",
         );
@@ -4004,7 +4060,10 @@ mod tests {
             .collect();
         assert_eq!(zeros.len(), 1, "ZERO_ARRAY stays in place per parity");
         assert_eq!(
-            out_consts[&zeros[0].arg(2).raw()],
+            zeros[0]
+                .arg(2)
+                .inline_const_bits()
+                .expect("inline ConstInt"),
             0,
             "byte length must be 0"
         );
@@ -4049,10 +4108,38 @@ mod tests {
         assert_eq!(zeros.len(), 1, "should emit exactly one ZERO_ARRAY");
         // item_size = 4 (array_descr_int), so start_items=2 → 8 bytes,
         // length_items=2 → 8 bytes.
-        assert_eq!(out_consts[&zeros[0].arg(1).raw()], 8, "byte start");
-        assert_eq!(out_consts[&zeros[0].arg(2).raw()], 8, "byte length");
-        assert_eq!(out_consts[&zeros[0].arg(3).raw()], 1, "scale arg(3) is 1");
-        assert_eq!(out_consts[&zeros[0].arg(4).raw()], 1, "scale arg(4) is 1");
+        assert_eq!(
+            zeros[0]
+                .arg(1)
+                .inline_const_bits()
+                .expect("inline ConstInt"),
+            8,
+            "byte start"
+        );
+        assert_eq!(
+            zeros[0]
+                .arg(2)
+                .inline_const_bits()
+                .expect("inline ConstInt"),
+            8,
+            "byte length"
+        );
+        assert_eq!(
+            zeros[0]
+                .arg(3)
+                .inline_const_bits()
+                .expect("inline ConstInt"),
+            1,
+            "scale arg(3) is 1"
+        );
+        assert_eq!(
+            zeros[0]
+                .arg(4)
+                .inline_const_bits()
+                .expect("inline ConstInt"),
+            1,
+            "scale arg(4) is 1"
+        );
     }
 
     #[test]
@@ -4091,8 +4178,16 @@ mod tests {
             .find(|o| o.opcode == OpCode::ZeroArray)
             .unwrap();
         // No SETs, length=3 items × 4 bytes/item = 12 bytes.
-        assert_eq!(out_consts[&zero.arg(1).raw()], 0, "byte start");
-        assert_eq!(out_consts[&zero.arg(2).raw()], 12, "byte length");
+        assert_eq!(
+            zero.arg(1).inline_const_bits().expect("inline ConstInt"),
+            0,
+            "byte start"
+        );
+        assert_eq!(
+            zero.arg(2).inline_const_bits().expect("inline ConstInt"),
+            12,
+            "byte length"
+        );
     }
 
     #[test]
@@ -4140,8 +4235,22 @@ mod tests {
             .collect();
         assert_eq!(zeros.len(), 1, "rewrite.py:719 emits one ZERO_ARRAY");
         // start_items=1 → 4 bytes, length_items=3 → 12 bytes.
-        assert_eq!(out_consts[&zeros[0].arg(1).raw()], 4, "byte start");
-        assert_eq!(out_consts[&zeros[0].arg(2).raw()], 12, "byte length");
+        assert_eq!(
+            zeros[0]
+                .arg(1)
+                .inline_const_bits()
+                .expect("inline ConstInt"),
+            4,
+            "byte start"
+        );
+        assert_eq!(
+            zeros[0]
+                .arg(2)
+                .inline_const_bits()
+                .expect("inline ConstInt"),
+            12,
+            "byte length"
+        );
     }
 
     #[test]
@@ -4287,11 +4396,14 @@ mod tests {
     #[test]
     fn test_setarrayitem_gc_int_value_no_wb() {
         // rewrite.py:940: v.type != 'r' → no write barrier at all.
+        // The stored value is an int-typed box; resoperation.py:567
+        // pins `IntOp.type = 'i'`, so the write-barrier check sees
+        // `val_is_ref = false`.
         let rw = make_rewriter_with_cards();
         let ops = vec![
             Op::with_descr(
                 OpCode::SetarrayitemGc,
-                &[OpRef::ref_op(0), OpRef::int_op(1), OpRef::ref_op(2)],
+                &[OpRef::ref_op(0), OpRef::int_op(1), OpRef::int_op(2)],
                 array_descr_int(),
             ),
             Op::new(OpCode::Finish, &[]),
@@ -4377,14 +4489,38 @@ mod tests {
         assert_eq!(result[0].opcode, OpCode::LoadEffectiveAddress);
         assert_eq!(result[0].arg(0), p0);
         assert_eq!(result[0].arg(1), i0);
-        assert_eq!(constants[&result[0].arg(2).raw()], 16);
-        assert_eq!(constants[&result[0].arg(3).raw()], 0);
+        assert_eq!(
+            result[0]
+                .arg(2)
+                .inline_const_bits()
+                .expect("inline ConstInt"),
+            16
+        );
+        assert_eq!(
+            result[0]
+                .arg(3)
+                .inline_const_bits()
+                .expect("inline ConstInt"),
+            0
+        );
         // i_dst = load_effective_address(p1, i1, 16, 0)
         assert_eq!(result[1].opcode, OpCode::LoadEffectiveAddress);
         assert_eq!(result[1].arg(0), p1);
         assert_eq!(result[1].arg(1), i1);
-        assert_eq!(constants[&result[1].arg(2).raw()], 16);
-        assert_eq!(constants[&result[1].arg(3).raw()], 0);
+        assert_eq!(
+            result[1]
+                .arg(2)
+                .inline_const_bits()
+                .expect("inline ConstInt"),
+            16
+        );
+        assert_eq!(
+            result[1]
+                .arg(3)
+                .inline_const_bits()
+                .expect("inline ConstInt"),
+            0
+        );
         // call_n(memcpy_fn, i_dst, i_src, i_len)
         assert_eq!(result[2].opcode, OpCode::CallN);
         assert_eq!(result[2].arg(1), result[1].pos.get()); // dst
@@ -4414,12 +4550,30 @@ mod tests {
         assert_eq!(result.len(), 4);
         assert_eq!(result[0].opcode, OpCode::LoadEffectiveAddress);
         // basesize=16, shift=2 (itemsize=4 → itemscale=2)
-        assert_eq!(constants[&result[0].arg(2).raw()], 16);
-        assert_eq!(constants[&result[0].arg(3).raw()], 2);
+        assert_eq!(
+            result[0]
+                .arg(2)
+                .inline_const_bits()
+                .expect("inline ConstInt"),
+            16
+        );
+        assert_eq!(
+            result[0]
+                .arg(3)
+                .inline_const_bits()
+                .expect("inline ConstInt"),
+            2
+        );
         assert_eq!(result[1].opcode, OpCode::LoadEffectiveAddress);
         assert_eq!(result[2].opcode, OpCode::IntLshift);
         assert_eq!(result[2].arg(0), i_len);
-        assert_eq!(constants[&result[2].arg(1).raw()], 2);
+        assert_eq!(
+            result[2]
+                .arg(1)
+                .inline_const_bits()
+                .expect("inline ConstInt"),
+            2
+        );
         assert_eq!(result[3].opcode, OpCode::CallN);
         assert_eq!(result[3].arg(3), result[2].pos.get());
     }
@@ -4457,13 +4611,25 @@ mod tests {
         assert_eq!(result[0].arg(1), i0);
         assert_eq!(result[1].opcode, OpCode::IntAdd);
         assert_eq!(result[1].arg(0), result[0].pos.get());
-        assert_eq!(constants[&result[1].arg(1).raw()], 16); // str_basesize - 1
+        assert_eq!(
+            result[1]
+                .arg(1)
+                .inline_const_bits()
+                .expect("inline ConstInt"),
+            16
+        ); // str_basesize - 1
         assert_eq!(result[2].opcode, OpCode::IntAdd);
         assert_eq!(result[2].arg(0), p1);
         assert_eq!(result[2].arg(1), i1);
         assert_eq!(result[3].opcode, OpCode::IntAdd);
         assert_eq!(result[3].arg(0), result[2].pos.get());
-        assert_eq!(constants[&result[3].arg(1).raw()], 16);
+        assert_eq!(
+            result[3]
+                .arg(1)
+                .inline_const_bits()
+                .expect("inline ConstInt"),
+            16
+        );
         assert_eq!(result[4].opcode, OpCode::CallN);
         assert_eq!(result[4].arg(1), result[3].pos.get()); // dst
         assert_eq!(result[4].arg(2), result[1].pos.get()); // src
@@ -4504,25 +4670,55 @@ mod tests {
         assert_eq!(result.len(), 8);
         assert_eq!(result[0].opcode, OpCode::IntLshift);
         assert_eq!(result[0].arg(0), i0);
-        assert_eq!(constants[&result[0].arg(1).raw()], 2);
+        assert_eq!(
+            result[0]
+                .arg(1)
+                .inline_const_bits()
+                .expect("inline ConstInt"),
+            2
+        );
         assert_eq!(result[1].opcode, OpCode::IntAdd);
         assert_eq!(result[1].arg(0), p0);
         assert_eq!(result[1].arg(1), result[0].pos.get());
         assert_eq!(result[2].opcode, OpCode::IntAdd);
         assert_eq!(result[2].arg(0), result[1].pos.get());
-        assert_eq!(constants[&result[2].arg(1).raw()], 16);
+        assert_eq!(
+            result[2]
+                .arg(1)
+                .inline_const_bits()
+                .expect("inline ConstInt"),
+            16
+        );
         assert_eq!(result[3].opcode, OpCode::IntLshift);
         assert_eq!(result[3].arg(0), i1);
-        assert_eq!(constants[&result[3].arg(1).raw()], 2);
+        assert_eq!(
+            result[3]
+                .arg(1)
+                .inline_const_bits()
+                .expect("inline ConstInt"),
+            2
+        );
         assert_eq!(result[4].opcode, OpCode::IntAdd);
         assert_eq!(result[4].arg(0), p1);
         assert_eq!(result[4].arg(1), result[3].pos.get());
         assert_eq!(result[5].opcode, OpCode::IntAdd);
         assert_eq!(result[5].arg(0), result[4].pos.get());
-        assert_eq!(constants[&result[5].arg(1).raw()], 16);
+        assert_eq!(
+            result[5]
+                .arg(1)
+                .inline_const_bits()
+                .expect("inline ConstInt"),
+            16
+        );
         assert_eq!(result[6].opcode, OpCode::IntLshift);
         assert_eq!(result[6].arg(0), i_len);
-        assert_eq!(constants[&result[6].arg(1).raw()], 2);
+        assert_eq!(
+            result[6]
+                .arg(1)
+                .inline_const_bits()
+                .expect("inline ConstInt"),
+            2
+        );
         assert_eq!(result[7].opcode, OpCode::CallN);
         assert_eq!(result[7].arg(1), result[5].pos.get()); // dst
         assert_eq!(result[7].arg(2), result[2].pos.get()); // src

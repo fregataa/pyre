@@ -1584,6 +1584,28 @@ thread_local! {
         // dereference freed memory. See
         // `majit_metainterp::MetaInterp::walk_rd_consts_refs`.
         majit_gc::shadow_stack::register_extra_root_walker(rd_consts_root_walker);
+        // framework.py `root_walker.walk_roots` parity for the stashed
+        // retrace state: `MetaInterp.partial_trace.ops` carries the
+        // recorded `Op`s between a failed bridge compile and the
+        // subsequent `compile_retrace`. Any `OpRef::ConstPtrInline(GcRef)`
+        // in `op.args[j]` / `op.fail_args[j]` (history.py:314
+        // `ConstPtr.value`) holds a nursery-resident Ref that must
+        // survive minor collection in that window. RPython traces these
+        // through the `TreeLoop.operations` Python object graph; pyre's
+        // `Vec<Op>` storage needs the explicit walker. See
+        // `majit_metainterp::MetaInterp::walk_partial_trace_refs`.
+        majit_gc::shadow_stack::register_extra_root_walker(partial_trace_root_walker);
+        // framework.py `root_walker.walk_roots` parity for the active
+        // recorder's op-graph: any `OpRef::ConstPtrInline(GcRef)` stored
+        // in `op.args[j]` or `op.fail_args[j]` (history.py:314
+        // `ConstPtr.value`) holds a nursery-resident Ref that must
+        // survive minor collection during tracing. RPython traces these
+        // through the `MetaInterp.history` Python object graph
+        // automatically; pyre's recorder is in Rust storage so the
+        // embedder registers the walker. See
+        // `majit_metainterp::MetaInterp::walk_active_trace_refs`.
+        majit_gc::shadow_stack::register_extra_root_walker(active_trace_root_walker);
+        majit_gc::shadow_stack::register_extra_root_walker(compile_snapshot_root_walker);
         // pyre's temporary mapdict side table mirrors PyPy fields that are
         // normally traced by the translated GC. Walk its value slots
         // explicitly until the table is folded into the object layout.
@@ -1677,6 +1699,42 @@ fn rd_consts_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     // fine because the thread-local `UnsafeCell` is single-owner.
     let pair = driver_pair();
     pair.0.walk_rd_consts_refs(visitor);
+}
+
+/// framework.py `root_walker.walk_roots` hook for the inline-Const
+/// `ConstPtrInline` slots inside `MetaInterp.partial_trace.ops` —
+/// history.py:314 `ConstPtr.value` lives on the OpRef itself, so the
+/// walker iterates `partial.ops` and visits each `OpRef::ConstPtrInline`
+/// arg / fail-arg directly. Routes into
+/// `JitDriver::walk_partial_trace_refs`, which forwards to
+/// `MetaInterp::walk_partial_trace_refs`.
+fn partial_trace_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    // SAFETY: see `rd_consts_root_walker` above — same single-owner
+    // thread-local invariant.
+    let pair = driver_pair();
+    pair.0.walk_partial_trace_refs(visitor);
+}
+
+/// framework.py `root_walker.walk_roots` hook for the active recorder's
+/// op-graph. Visits every inline `OpRef::ConstPtrInline(GcRef)` slot in
+/// `op.args` / `op.fail_args` (history.py:314 `ConstPtr.value`).
+/// No-op when no trace is in progress. Routes into
+/// `JitDriver::walk_active_trace_refs`, which forwards to
+/// `MetaInterp::walk_active_trace_refs`.
+fn active_trace_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    // SAFETY: see `rd_consts_root_walker` above — same single-owner
+    // thread-local invariant.
+    let pair = driver_pair();
+    pair.0.walk_active_trace_refs(visitor);
+}
+
+/// GC walker for ConstPtrInline GcRefs extracted from snapshot maps
+/// during compilation. history.py:314 ConstPtr.value is traced through
+/// the Python object graph; pyre's SnapshotBox.opref slots in Rust Vecs
+/// need explicit walking. See `MetaInterp::walk_compile_snapshot_refs`.
+fn compile_snapshot_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    let pair = driver_pair();
+    pair.0.walk_compile_snapshot_refs(visitor);
 }
 
 /// `framework.shadowstack walk_stack_root` adapter — walk every

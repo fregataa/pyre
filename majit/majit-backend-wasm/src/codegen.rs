@@ -335,12 +335,21 @@ fn build_function(
                 } else {
                     // gcremovetypeptr fallback (assembler.py:1893-1901):
                     //   on x86_64 the typeid is a 32-bit value at offset 0.
-                    let classptr = constants.get(&op.arg(1).raw()).copied().expect(
-                        "_cmp_guard_class: gcremovetypeptr requires \
-                         loc_classptr to be an immediate (assert \
-                         isinstance(loc_classptr, ImmedLoc) in \
-                         x86/assembler.py:1887)",
-                    );
+                    let class_arg = op.arg(1);
+                    let classptr = class_arg
+                        .const_int_value()
+                        .or_else(|| {
+                            if matches!(class_arg, OpRef::ConstInt(_)) {
+                                constants.get(&class_arg.raw()).copied()
+                            } else {
+                                None
+                            }
+                        })
+                        .expect(
+                            "_cmp_guard_class: gcremovetypeptr requires \
+                             loc_classptr to be a ConstInt immediate \
+                             (aarch64/regalloc.py:829 op.getarg(1).getint())",
+                        );
                     let expected_typeid =
                         lookup_typeid_from_classptr(classptr_to_typeid, classptr as usize).expect(
                             "GuardClass: vtable_offset is None but the wasm \
@@ -475,7 +484,10 @@ fn build_function(
                     emit_resolve(&mut sink, constants, op.arg(0));
                     // num_bytes is arg(1), typically a constant
                     let num_bytes = if op.arg(1).is_constant() {
-                        constants.get(&op.arg(1).raw()).copied().unwrap_or(8)
+                        op.arg(1)
+                            .inline_const_bits()
+                            .or_else(|| constants.get(&op.arg(1).raw()).copied())
+                            .unwrap_or(8)
                     } else {
                         8 // default to no-op
                     };
@@ -919,13 +931,22 @@ fn build_function(
                 // assembler.py:1971 vtable_ptr = loc_check_against_class
                 //   .getint(): the bounds are resolved at codegen time,
                 //   so arg1 must be an immediate class pointer.
-                let loc_check_against_class =
-                    constants.get(&op.arg(1).raw()).copied().unwrap_or_else(|| {
+                let class_arg = op.arg(1);
+                let loc_check_against_class = class_arg
+                    .const_int_value()
+                    .or_else(|| {
+                        if matches!(class_arg, OpRef::ConstInt(_)) {
+                            constants.get(&class_arg.raw()).copied()
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_else(|| {
                         panic!(
                             "x86/assembler.py:1971 vtable_ptr = \
                              loc_check_against_class.getint(): \
-                             GUARD_SUBCLASS requires arg1 to be an \
-                             immediate class pointer"
+                             GUARD_SUBCLASS requires arg1 to be a \
+                             ConstInt immediate class pointer"
                         )
                     });
                 // assembler.py:1973-1974: vtable_ptr.subclassrange_{min,max}
@@ -1244,7 +1265,10 @@ fn emit_resolve(
     opref: OpRef,
 ) {
     if opref.is_constant() {
-        let val = constants.get(&opref.raw()).copied().unwrap_or(0);
+        // history.py:227/268/314 — inline-Const variants carry value inline.
+        let val = opref
+            .inline_const_bits()
+            .unwrap_or_else(|| constants.get(&opref.raw()).copied().unwrap_or(0));
         sink.i64_const(val);
     } else {
         sink.local_get(1 + opref.raw());

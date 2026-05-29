@@ -300,6 +300,12 @@ pub(crate) fn merge_backend_constants_from_ctx(
         let key = OptContext::op_ref_for_value(idx as u32, &value).raw();
         constants.entry_or_insert_with(key, || value);
     }
+    // legacy-const-ok: transitional fallback for idx-Const operands that
+    // enter the optimizer through legacy constants snapshots. RPython's
+    // Const boxes carry `.value` directly (history.py:227/268/314); the
+    // long-term shape is inline Const OpRefs only. Until every ingress is
+    // normalized to inline Const, preserve these pool-backed constants at
+    // the backend boundary instead of dropping them.
     for (const_idx, value) in ctx.const_pool.iter() {
         let key = OptContext::const_ref_for_value(const_idx, value).raw();
         constants.insert(key, value.clone());
@@ -1919,6 +1925,11 @@ impl Optimizer {
             let mut types = vec![majit_ir::Type::Ref; num_inputs];
             for op in ops.iter() {
                 for arg in op.getarglist().iter() {
+                    // Const args (inline-value or legacy idx) never reference an
+                    // inputarg slot; only InputArg*/IntOp/FloatOp/RefOp do.
+                    if arg.is_constant() {
+                        continue;
+                    }
                     let idx = arg.raw() as usize;
                     if idx < num_inputs {
                         match arg.ty() {
@@ -2044,11 +2055,11 @@ impl Optimizer {
         // RPython resume.py parity: pass snapshot_boxes to OptContext so
         // emit() can call store_final_boxes_in_guard inline at each guard
         // emission (not post-assembly).
-        ctx.snapshot_boxes = self.snapshot_boxes.clone();
-        ctx.snapshot_frame_sizes = self.snapshot_frame_sizes.clone();
-        ctx.snapshot_vable_boxes = self.snapshot_vable_boxes.clone();
-        ctx.snapshot_vref_boxes = self.snapshot_vref_boxes.clone();
-        ctx.snapshot_frame_pcs = self.snapshot_frame_pcs.clone();
+        ctx.snapshot_boxes = std::mem::take(&mut self.snapshot_boxes);
+        ctx.snapshot_frame_sizes = std::mem::take(&mut self.snapshot_frame_sizes);
+        ctx.snapshot_vable_boxes = std::mem::take(&mut self.snapshot_vable_boxes);
+        ctx.snapshot_vref_boxes = std::mem::take(&mut self.snapshot_vref_boxes);
+        ctx.snapshot_frame_pcs = std::mem::take(&mut self.snapshot_frame_pcs);
 
         sanitize_backend_constants_for_ops(ops, constants);
         // Pre-populate known constants so passes can see them.
@@ -3051,10 +3062,15 @@ impl Optimizer {
                 ctx.box_pool = crate::r#box::BoxPool::from_slots(new_pool);
             }
 
-            // Apply remap to all args and fail_args
+            // Apply remap to all args and fail_args. Const operands carry
+            // their value inline (history.py:227/268/314); position-remap
+            // applies only to body-namespace OpRefs (InputArg* / *Op).
             for op in &ctx.new_operations {
                 for i in 0..op.num_args() {
                     let arg = op.arg(i);
+                    if arg.is_constant() {
+                        continue;
+                    }
                     if let Some(&new_pos) = remap.get(&arg.raw()) {
                         op.setarg(i, arg.with_raw(new_pos));
                     }
@@ -3062,9 +3078,11 @@ impl Optimizer {
                 if let Some(mut fail_args) = op.getfailargs() {
                     let mut changed = false;
                     for arg in fail_args.iter_mut() {
-                        if let Some(&new_pos) = remap.get(&arg.raw()) {
-                            *arg = arg.with_raw(new_pos);
-                            changed = true;
+                        if !arg.is_constant() {
+                            if let Some(&new_pos) = remap.get(&arg.raw()) {
+                                *arg = arg.with_raw(new_pos);
+                                changed = true;
+                            }
                         }
                     }
                     if changed {
@@ -3086,7 +3104,12 @@ impl Optimizer {
             // positions. Without this, Phase 2's import_boxes maps to
             // pre-remap positions that no longer exist in the box pool.
             if let Some(ref mut state) = self.exported_loop_state {
+                // unroll.py:463 — end_args/infos may contain Const; Const
+                // is not a body position so it must not be remapped.
                 let remap_opref = |opref: &mut OpRef| {
+                    if opref.is_constant() {
+                        return;
+                    }
                     if let Some(&new_pos) = remap.get(&opref.raw()) {
                         *opref = opref.with_raw(new_pos);
                     }
@@ -3103,13 +3126,17 @@ impl Optimizer {
                 for arg in &mut state.short_inputargs {
                     remap_opref(arg);
                 }
-                // Remap exported_infos keys
+                // Remap exported_infos keys (Const keys pass through)
                 let old_infos = std::mem::take(&mut state.exported_infos);
                 for (key, value) in old_infos {
-                    let new_key = remap
-                        .get(&key.raw())
-                        .map(|&p| key.with_raw(p))
-                        .unwrap_or(key);
+                    let new_key = if key.is_constant() {
+                        key
+                    } else {
+                        remap
+                            .get(&key.raw())
+                            .map(|&p| key.with_raw(p))
+                            .unwrap_or(key)
+                    };
                     state.exported_infos.insert(new_key, value);
                 }
                 // Remap exported short boxes

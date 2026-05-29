@@ -60,11 +60,9 @@ fn test_int_add_loop() {
         InputArg::from_type(Type::Int, 1), // sum
     ];
 
-    let const_1 = OpRef::const_int(0);
-    let const_100 = OpRef::const_int(1);
-    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
-    constants.insert(OpRef::const_int(0).raw(), 1i64);
-    constants.insert(OpRef::const_int(1).raw(), 100i64);
+    let const_1 = OpRef::const_int_inline(1);
+    let const_100 = OpRef::const_int_inline(100);
+    let constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
 
     let ops = vec![
         Op::new(
@@ -168,9 +166,8 @@ fn test_float_ops() {
 fn test_call_generates_import() {
     let inputargs = vec![InputArg::from_type(Type::Int, 0)];
 
-    let func_ptr = OpRef::const_int(0);
-    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
-    constants.insert(OpRef::const_int(0).raw(), 42i64); // fake func_ptr
+    let func_ptr = OpRef::const_int_inline(42); // fake func_ptr
+    let constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
 
     let ops = vec![
         make_op(
@@ -298,15 +295,14 @@ fn test_guard_types() {
 fn test_guard_gc_type_uses_immediate_typeid() {
     let inputargs = vec![InputArg::from_type(Type::Int, 0)];
 
-    // OpRef::const_int(0) holds the immediate typeid 0x42
-    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
-    constants.insert(OpRef::const_int(0).raw(), 0x42_i64);
+    // Inline-Const carrying the immediate typeid 0x42
+    let constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
 
     let ops = vec![
         Op::new(OpCode::Label, &[OpRef::input_arg_int(0)]),
         make_guard(
             OpCode::GuardGcType,
-            &[OpRef::input_arg_int(0), OpRef::const_int(0)],
+            &[OpRef::input_arg_int(0), OpRef::const_int_inline(0x42)],
             &[OpRef::input_arg_int(0)],
         ),
         Op::new(OpCode::Jump, &[OpRef::input_arg_int(0)]),
@@ -393,14 +389,12 @@ fn test_guard_is_object_lowers_to_typeinfo_test() {
 fn test_guard_subclass_lowers_to_subclassrange_check() {
     let inputargs = vec![InputArg::from_type(Type::Int, 0)];
 
-    // history.py:307 `ConstPtr.type = 'r'` — vtable pointers are
-    // ref-typed Const boxes. Use the typed `OpRef::const_ptr` factory
-    // (raw = idx | CONST_BIT) so the variant tag matches the Box class
-    // identity, mirroring the `OpRef::const_int` pattern used in
-    // `test_guard_gc_type_lowers_to_typeid_check` above.
-    let class_constant = OpRef::const_ptr(0);
-    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
-    constants.insert(class_constant.raw(), 0xCAFEi64);
+    // model.py:199-201 `cls_of_box()` returns `ConstInt(ptr2int(typeptr))` —
+    // the emitted guard-class operand is the vtable address carried as a raw
+    // integer (read with `op.getarg(1).getint()`, rewrite.py:247). Use the
+    // inline ConstInt factory so the variant tag matches the backend reader.
+    let class_constant = OpRef::const_int_inline(0xCAFE);
+    let constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
 
     let ops = vec![
         Op::new(OpCode::Label, &[OpRef::input_arg_int(0)]),

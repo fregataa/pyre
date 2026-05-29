@@ -77,6 +77,9 @@ impl BoxPool {
             OpRef::ConstInt(_)
             | OpRef::ConstFloat(_)
             | OpRef::ConstPtr(_)
+            | OpRef::ConstIntInline(_)
+            | OpRef::ConstFloatInline(_)
+            | OpRef::ConstPtrInline(_)
             | OpRef::TempVar(_)
             | OpRef::None => return None,
         };
@@ -111,7 +114,12 @@ impl BoxPool {
             | OpRef::InputArgInt(p)
             | OpRef::InputArgFloat(p)
             | OpRef::InputArgRef(p) => p as usize,
-            OpRef::ConstInt(_) | OpRef::ConstFloat(_) | OpRef::ConstPtr(_) => panic!(
+            OpRef::ConstInt(_)
+            | OpRef::ConstFloat(_)
+            | OpRef::ConstPtr(_)
+            | OpRef::ConstIntInline(_)
+            | OpRef::ConstFloatInline(_)
+            | OpRef::ConstPtrInline(_) => panic!(
                 "BoxPool::set rejects constant OpRefs ({opref:?}); \
                  constants live in `const_pool`, not the box pool"
             ),

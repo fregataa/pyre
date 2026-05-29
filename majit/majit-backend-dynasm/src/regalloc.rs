@@ -1192,7 +1192,12 @@ impl RegisterManager {
         constants: &majit_ir::VecAssoc<u32, i64>,
     ) -> Loc {
         if v.is_constant() {
-            let val = constants.get(&v.raw()).copied().unwrap_or(0);
+            // history.py:227/268/314 — inline-Const variants carry the
+            // value directly; legacy pool-indexed variants fall through
+            // to the constants snapshot.
+            let val = v
+                .inline_const_bits()
+                .unwrap_or_else(|| constants.get(&v.raw()).copied().unwrap_or(0));
             if tp == Type::Float || self.is_float_constant(v) {
                 return Loc::Immed(ImmedLoc::new_float(val));
             }
@@ -1211,7 +1216,10 @@ impl RegisterManager {
         // Fallback: check constants map. The optimizer may leave constants
         // as plain OpRefs (without CONST_BIT) when they originate from
         // short preamble or constant folding.
-        if let Some(&val) = constants.get(&v.raw()) {
+        if let Some(val) = v
+            .inline_const_bits()
+            .or_else(|| constants.get(&v.raw()).copied())
+        {
             if tp == Type::Float || self.is_float_constant(v) {
                 return Loc::Immed(ImmedLoc::new_float(val));
             }
@@ -1509,8 +1517,12 @@ impl RegisterManager {
     /// x86/regalloc.py:55 convert_to_imm
     pub fn convert_to_imm(&self, v: OpRef, constants: &majit_ir::VecAssoc<u32, i64>) -> Loc {
         debug_assert!(v.is_constant());
-        // constants map key is opref.raw() (raw value WITH CONST_BIT), not const_index
-        let val = constants.get(&v.raw()).copied().unwrap_or(0);
+        // history.py:227/268/314 — inline-Const variants carry the value
+        // directly; legacy pool-indexed Const variants look up the i64
+        // raw bits via the constants snapshot.
+        let val = v
+            .inline_const_bits()
+            .unwrap_or_else(|| constants.get(&v.raw()).copied().unwrap_or(0));
         if self.is_float_constant(v) {
             Loc::Immed(ImmedLoc::new_float(val))
         } else {
@@ -2333,7 +2345,8 @@ impl<'a> RegAlloc<'a> {
     /// line 1475 and the fail-args handling at line 2079. This helper
     /// must use the same key convention.
     pub(crate) fn const_value(&self, v: OpRef) -> i64 {
-        self.constants.get(&v.raw()).copied().unwrap_or(0)
+        v.inline_const_bits()
+            .unwrap_or_else(|| self.constants.get(&v.raw()).copied().unwrap_or(0))
     }
 
     // ── walk_operations + consider_* ──
@@ -3590,7 +3603,13 @@ impl<'a> RegAlloc<'a> {
         ) {
             return false;
         }
-        if next_op.num_args() == 0 || next_op.arg(0).raw() != result.raw() {
+        // history.py:213 `Const.is_constant()` — Const operands are not
+        // op-result identities; comparison via raw position is invalid.
+        if next_op.num_args() == 0
+            || next_op.arg(0).is_constant()
+            || result.is_constant()
+            || next_op.arg(0).raw() != result.raw()
+        {
             return false;
         }
         if let Some(lt) = self.longevity.get(result) {
@@ -3598,18 +3617,20 @@ impl<'a> RegAlloc<'a> {
                 return false;
             }
         }
+        // history.py:251 `Const.same_constant` — variant-aware equality
+        // (`OpRef`'s derived `PartialEq`) handles inline-Const fail args /
+        // cond_call tail args without calling `.raw()`, which panics on
+        // inline-Const variants. Identity comparison against a non-Const
+        // `result` always yields `false` for any Const operand, which is
+        // the correct semantics: a constant fail-arg can never alias a
+        // body op result.
         if opnum != OpCode::CondCallN {
             if let Some(fail_args) = next_op.getfailargs() {
-                if fail_args.iter().any(|a| a.raw() == result.raw()) {
+                if fail_args.iter().any(|a| *a == result) {
                     return false;
                 }
             }
-        } else if next_op
-            .getarglist()
-            .iter()
-            .skip(1)
-            .any(|a| a.raw() == result.raw())
-        {
+        } else if next_op.getarglist().iter().skip(1).any(|a| *a == result) {
             return false;
         }
         true
@@ -6073,7 +6094,7 @@ mod tests {
         let i0 = OpRef::input_arg_int(0);
         let i1 = OpRef::int_op(1);
         let i2 = OpRef::int_op(2);
-        let c1 = OpRef::const_int(0);
+        let c1 = OpRef::const_int_inline(1);
 
         let inputargs = vec![InputArg::from_type(Type::Int, i0.raw())];
 
@@ -6089,8 +6110,7 @@ mod tests {
         finish.setfailargs(vec![].into());
         finish.set_fail_arg_types(vec![]);
 
-        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
-        constants.insert(c1.raw(), 1);
+        let constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
 
         let ops = vec![add, is_true, guard, finish];
         let mut ra = RegAlloc::new(constants, majit_ir::VecAssoc::new(), &inputargs, &ops);
@@ -6124,7 +6144,7 @@ mod tests {
         // i0 is the typed Ref inputarg slot 0; the regalloc keys boxes
         // by typed `OpRef::input_arg_ref` (variant-aware Eq).
         let i0 = OpRef::input_arg_ref(0);
-        let c0 = OpRef::const_int(0);
+        let c0 = OpRef::const_int_inline(0);
         let inputargs = vec![InputArg::from_type(Type::Ref, i0.raw())];
 
         let store = Op::new(OpCode::GcStore, &[i0, c0, i0]);
@@ -6260,8 +6280,8 @@ mod tests {
         let i0 = OpRef::int_op(0);
         let i1 = OpRef::int_op(1);
         let i2 = OpRef::int_op(2);
-        let c0 = OpRef::const_int(0);
-        let c8 = OpRef::const_int(8);
+        let c0 = OpRef::const_int_inline(0);
+        let c8 = OpRef::const_int_inline(8);
 
         let inputargs = vec![
             InputArg::from_type(Type::Ref, i0.raw()),
@@ -6274,11 +6294,12 @@ mod tests {
         finish.pos.set(OpRef::int_op(3));
         let ops = vec![raw, finish];
 
-        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
-        constants.insert(c0.raw(), 0);
-        constants.insert(c8.raw(), 8);
-
-        let mut ra = RegAlloc::new(constants, majit_ir::VecAssoc::new(), &inputargs, &ops);
+        let mut ra = RegAlloc::new(
+            majit_ir::VecAssoc::new(),
+            majit_ir::VecAssoc::new(),
+            &inputargs,
+            &ops,
+        );
         ra.prepare_loop();
         let expected_argloc = ra.loc(i1, Type::Ref);
         ra.j2_ops[0] = crate::j2plan::LirOp::Load {
@@ -6307,8 +6328,8 @@ mod tests {
         let i0 = OpRef::input_arg_ref(0);
         let i1 = OpRef::input_arg_ref(1);
         let i2 = OpRef::input_arg_int(2);
-        let c0 = OpRef::const_int(0);
-        let c8 = OpRef::const_int(8);
+        let c0 = OpRef::const_int_inline(0);
+        let c8 = OpRef::const_int_inline(8);
 
         let inputargs = vec![
             InputArg::from_type(Type::Ref, i0.raw()),
@@ -6321,11 +6342,12 @@ mod tests {
         finish.pos.set(OpRef::int_op(3));
         let ops = vec![raw, finish];
 
-        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
-        constants.insert(c0.raw(), 0);
-        constants.insert(c8.raw(), 8);
-
-        let mut ra = RegAlloc::new(constants, majit_ir::VecAssoc::new(), &inputargs, &ops);
+        let mut ra = RegAlloc::new(
+            majit_ir::VecAssoc::new(),
+            majit_ir::VecAssoc::new(),
+            &inputargs,
+            &ops,
+        );
         ra.prepare_loop();
         let expected_argloc = ra.loc(i1, Type::Ref);
         ra.j2_ops[0] = crate::j2plan::LirOp::Store {

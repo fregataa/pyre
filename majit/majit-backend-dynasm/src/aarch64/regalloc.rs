@@ -17,22 +17,30 @@ use majit_ir::{OpRef, Type};
 /// aarch64/regalloc.py:159 `DEFAULT_IMM_SIZE = 4096`.
 const DEFAULT_IMM_SIZE: i64 = 4096;
 
-/// aarch64/regalloc.py:169 `check_imm_box`. Accepts only `ConstInt`
-/// values in the AArch64 immediate range; non-Int constants
-/// (ConstFloat/ConstPtr) and box references fall through to the
-/// register form. `ConstInt(slot)` is a structural promise that the
-/// constant-pool entry exists (parity with `ConstInt.value` being
-/// set during `__init__`); a missing entry would be a corrupted IR
-/// and panics here, matching the assumption baked into
-/// `arg.getint()` upstream.
-fn check_imm_box(arg: OpRef, constants: &majit_ir::VecAssoc<u32, i64>) -> bool {
-    if !matches!(arg, OpRef::ConstInt(_)) {
-        return false;
+/// aarch64/regalloc.py:169 `check_imm_box`. PyPy accepts only
+/// `ConstInt` values in the AArch64 immediate range; non-Int
+/// constants (ConstFloat/ConstPtr) and box references fall through
+/// to the register form. PyPy reads `arg.getint()` directly because
+/// the int is inlined on `ConstInt` (history.py:227 `ConstInt.value`);
+/// pyre's inline-Const variant `OpRef::ConstIntInline` carries the i64
+/// on the OpRef itself, while the legacy `OpRef::ConstInt(idx)` form
+/// must look the value up through `val`. `ConstInt` always exposes a
+/// value (`arg.getint()` never fails), so a legacy pool-indexed
+/// `ConstInt` with no `val` is an invariant break, not a non-immediate.
+fn check_imm_box(arg: OpRef, val: Option<i64>) -> bool {
+    match arg {
+        OpRef::ConstIntInline(v) => v >= 0 && v < DEFAULT_IMM_SIZE,
+        OpRef::ConstInt(_) => {
+            let v = val.unwrap_or_else(|| {
+                panic!(
+                    "check_imm_box: legacy ConstInt {arg:?} missing from constants pool — \
+                     ConstInt always carries a value (regalloc.py:169 arg.getint())"
+                )
+            });
+            v >= 0 && v < DEFAULT_IMM_SIZE
+        }
+        _ => false,
     }
-    let val = *constants
-        .get(&arg.raw())
-        .expect("ConstInt slot must have a constant-pool entry (parity with ConstInt.getint())");
-    val >= 0 && val < DEFAULT_IMM_SIZE
 }
 
 /// aarch64/registers.py:14
@@ -188,7 +196,14 @@ impl<'a> RegAlloc<'a> {
         output: &mut Vec<RegAllocOp>,
     ) {
         let boxes = [lhs, rhs];
-        let imm_rhs = check_imm_box(rhs, &self.constants);
+        // history.py:227 — inline-Const carries its value; only consult the
+        // legacy pool for `OpRef::ConstInt(_)` to avoid `.raw()` panic.
+        let rhs_val = if matches!(rhs, OpRef::ConstInt(_)) {
+            self.constants.get(&rhs.raw()).copied()
+        } else {
+            None
+        };
+        let imm_rhs = check_imm_box(rhs, rhs_val);
         let lhs_loc = self.make_sure_var_in_reg(lhs, Type::Int, &boxes, None, false);
         let rhs_loc = if imm_rhs {
             self.loc(rhs, Type::Int)
@@ -306,8 +321,23 @@ impl<'a> RegAlloc<'a> {
         output: &mut Vec<RegAllocOp>,
     ) {
         let boxes = [lhs, rhs];
-        let imm_lhs = check_imm_box(lhs, &self.constants);
-        let imm_rhs = check_imm_box(rhs, &self.constants);
+        // history.py:227 — inline-Const variants carry the value on the
+        // OpRef. `check_imm_box` short-circuits on inline-Const so `val`
+        // is only consulted for the legacy idx form; gate the
+        // `constants.get(&arg.raw())` lookup behind that to avoid
+        // `.raw()` panicking on inline-Const variants.
+        let lhs_val = if matches!(lhs, OpRef::ConstInt(_)) {
+            self.constants.get(&lhs.raw()).copied()
+        } else {
+            None
+        };
+        let rhs_val = if matches!(rhs, OpRef::ConstInt(_)) {
+            self.constants.get(&rhs.raw()).copied()
+        } else {
+            None
+        };
+        let imm_lhs = check_imm_box(lhs, lhs_val);
+        let imm_rhs = check_imm_box(rhs, rhs_val);
         let (l0, l1) = if !imm_lhs && imm_rhs {
             let r0 = self.make_sure_var_in_reg(lhs, Type::Int, &boxes, None, false);
             let r1 = self.loc(rhs, Type::Int);

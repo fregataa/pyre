@@ -197,6 +197,26 @@ impl WasmBackend {
         with_wasm_active_gc(|gc| gc.get_typeid_from_classptr_if_gcremovetypeptr(classptr)).flatten()
     }
 
+    /// Resolve the vtable integer carried by GuardClass /
+    /// GuardNonnullClass / GuardSubclass `arg(1)`.
+    ///
+    /// RPython represents these class operands as `ConstInt` vtable
+    /// addresses: `model.py:199-201 cls_of_box()` returns
+    /// `ConstInt(ptr2int(obj.typeptr))`, `virtualstate.py:748` builds
+    /// `ConstInt(descr.get_vtable())`, and backends read
+    /// `op.getarg(1).getint()` (aarch64/regalloc.py:829). Inline ConstInt
+    /// carries the value directly; legacy pool-indexed ConstInt falls back
+    /// to the `constants` table.
+    fn const_class_vtable(&self, arg: majit_ir::OpRef) -> Option<i64> {
+        if let Some(v) = arg.const_int_value() {
+            return Some(v);
+        }
+        if matches!(arg, majit_ir::OpRef::ConstInt(_)) {
+            return self.constants.get(&arg.raw()).copied();
+        }
+        None
+    }
+
     /// Pre-compute classptr → expected_typeid pairs for every GuardClass /
     /// GuardNonnullClass operand seen in `ops`. wasm codegen runs without a
     /// borrow of `self`, so we materialize the resolver as a HashMap.
@@ -217,7 +237,7 @@ impl WasmBackend {
                 majit_ir::OpCode::GuardClass | majit_ir::OpCode::GuardNonnullClass
             ) && op.num_args() >= 2
             {
-                if let Some(&classptr) = self.constants.get(&op.arg(1).raw()) {
+                if let Some(classptr) = self.const_class_vtable(op.arg(1)) {
                     if let Some(tid) = self.lookup_typeid_from_classptr(classptr as usize) {
                         table.insert(classptr, tid);
                     }
@@ -261,7 +281,7 @@ impl WasmBackend {
             // for every constant GuardSubclass arg1.
             for op in ops {
                 if op.opcode == majit_ir::OpCode::GuardSubclass && op.num_args() >= 2 {
-                    if let Some(&classptr) = self.constants.get(&op.arg(1).raw()) {
+                    if let Some(classptr) = self.const_class_vtable(op.arg(1)) {
                         if let Some(range) = gc.subclass_range(classptr as usize) {
                             info.subclass_ranges.insert(classptr, range);
                         }
@@ -274,17 +294,28 @@ impl WasmBackend {
     }
 
     /// Collect constants from ops (constant OpRefs that appear as args).
+    ///
+    /// Inline-Const variants (`ConstIntInline`/`ConstFloatInline`/
+    /// `ConstPtrInline`) carry `.value` on the OpRef itself (history.py:
+    /// 227/268/314) so they need no `self.constants` side-table entry and
+    /// would `panic!` from `raw()`. Only legacy idx-keyed `ConstInt(u32)`
+    /// / `ConstFloat(u32)` / `ConstPtr(u32)` are registered here.
     fn collect_constants_from_ops(&mut self, ops: &[Op]) {
         for op in ops {
             for &arg in op.getarglist().iter() {
-                if arg.is_constant() && !self.constants.contains_key(&arg.raw()) {
-                    // Default to 0 if not already registered
+                if arg.is_constant()
+                    && arg.inline_const_bits().is_none()
+                    && !self.constants.contains_key(&arg.raw())
+                {
                     self.constants.insert(arg.raw(), 0);
                 }
             }
             if let Some(fail_args) = op.getfailargs() {
                 for &arg in fail_args.iter() {
-                    if arg.is_constant() && !self.constants.contains_key(&arg.raw()) {
+                    if arg.is_constant()
+                        && arg.inline_const_bits().is_none()
+                        && !self.constants.contains_key(&arg.raw())
+                    {
                         self.constants.insert(arg.raw(), 0);
                     }
                 }

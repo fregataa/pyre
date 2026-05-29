@@ -48,7 +48,9 @@ impl RegisterHints {
         if !arg.is_constant() {
             return None;
         }
-        self.constants.get(&arg.raw()).copied()
+        // history.py:227/268/314 — inline-Const variants carry value inline.
+        arg.inline_const_bits()
+            .or_else(|| self.constants.get(&arg.raw()).copied())
     }
 
     /// reghint.py:30 `add_hints` — main entry called from

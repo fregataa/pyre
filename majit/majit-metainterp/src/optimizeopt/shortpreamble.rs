@@ -32,7 +32,7 @@
 /// the body depends on, it records them. At the Label, the builder finalizes
 /// into a `ShortPreamble` that is stored alongside the compiled loop.
 use majit_ir::vec_set::VecSet;
-use majit_ir::{Op, OpCode, OpRef};
+use majit_ir::{GcRef, Op, OpCode, OpRef};
 
 use crate::optimizeopt::vec_assoc::VecAssoc;
 use crate::optimizeopt::virtualstate::VirtualState;
@@ -80,12 +80,11 @@ pub struct ShortPreamble {
     /// The exported virtual state at the loop header (from the preamble's exit).
     /// Used to check bridge compatibility and generate additional guards.
     pub exported_state: Option<VirtualState>,
-    /// RPython parity: constant values referenced by short preamble ops.
-    /// In RPython, short preamble ops embed Const objects (GC-tracked) that
-    /// survive across compilations. In pyre, OpRef indices reference the
-    /// loop's constant pool. This map captures the `Const` (type + value
-    /// in one box per history.py:220/261/307) for each constant OpRef so
-    /// bridges can re-register them in their own pool.
+    /// Legacy constant snapshot for pre-inline idx-Const short preambles.
+    /// Production short preamble ops now embed inline `Const*` OpRefs
+    /// directly, matching RPython where `_map_args` passes Const boxes
+    /// through unchanged. This map is therefore empty on production paths
+    /// and remains only as a compatibility field for legacy fixtures.
     pub constants: crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Const>,
     /// RPython parity: PtrInfo for each inputarg, from Phase 1 export.
     /// shortpreamble.py:414-425: preamble_op.set_forwarded(info)
@@ -125,6 +124,42 @@ impl ShortPreamble {
     /// Number of operations in the short preamble.
     pub fn len(&self) -> usize {
         self.ops.len()
+    }
+
+    pub fn walk_const_ptr_refs_mut(&mut self, visitor: &mut dyn FnMut(&mut GcRef)) {
+        fn visit_opref(opref: &mut OpRef, visitor: &mut dyn FnMut(&mut GcRef)) {
+            if let Some(slot) = opref.as_const_ptr_inline_mut() {
+                visitor(slot);
+            }
+        }
+
+        fn visit_oprefs(oprefs: &mut [OpRef], visitor: &mut dyn FnMut(&mut GcRef)) {
+            for opref in oprefs {
+                visit_opref(opref, visitor);
+            }
+        }
+
+        for entry in &mut self.ops {
+            entry.op.walk_const_ptr_refs_mut(visitor);
+        }
+        visit_oprefs(&mut self.inputargs, visitor);
+        visit_oprefs(&mut self.used_boxes, visitor);
+        visit_oprefs(&mut self.jump_args, visitor);
+        if let Some(phase1_inputargs) = self.phase1_inputargs.as_mut() {
+            visit_oprefs(phase1_inputargs, visitor);
+        }
+        if let Some(exported_state) = self.exported_state.as_mut() {
+            exported_state.walk_const_ptr_refs_mut(visitor);
+        }
+        for (_, konst) in self.constants.iter_mut() {
+            match konst {
+                majit_ir::Const::Ref(gcref) => visitor(gcref),
+                _ => {}
+            }
+        }
+        for info in self.inputarg_infos.iter_mut().flatten() {
+            info.walk_const_ptr_refs_mut(visitor);
+        }
     }
 
     /// Generate the operations to prepend when a bridge enters the loop.
@@ -547,7 +582,7 @@ impl ShortBoxes {
     /// RPython parity: check if opref is reachable in the short preamble.
     pub fn is_reachable(&self, opref: OpRef) -> bool {
         self.short_inputargs.contains(&opref)
-            || self.known_constants.contains(&opref)
+            || opref.is_constant()
             || self.potential_ops.iter().any(|(k, _)| *k == opref)
     }
 
@@ -659,7 +694,11 @@ impl ShortBoxes {
         if self.boxes_in_production.iter().any(|x| *x == opref) {
             return None;
         }
-        if self.known_constants.contains(&opref) {
+        // shortpreamble.py:288 isinstance(op, Const) → return op.
+        // pyre tracks iteration-known constants (body-typed OpRefs proven
+        // constant for this pass) in `known_constants`; those are this
+        // stage's `Const` boxes, mirroring `use_box`/`insert_dep_recursive`.
+        if opref.is_constant() || self.known_constants.contains(&opref) {
             return Some(opref);
         }
         if self.potential_ops.iter().any(|(k, _)| *k == opref) {
@@ -1129,7 +1168,16 @@ fn imported_const_opref(
     if let Some(&opref) = imported_constants.get(&source) {
         return opref;
     }
-    let opref = ctx.reserve_const_ref(value.get_type());
+    // history.py:227/268/314 Const{Int,Float,Ptr}.value inline — fresh
+    // imported short-preamble constant lands inline in `op.args` rather
+    // than indexing the legacy pool. Slice 7b op-graph walker covers
+    // ConstPtrInline slots across minor collection.
+    let opref = match value {
+        majit_ir::Value::Int(v) => OpRef::const_int_inline(*v),
+        majit_ir::Value::Float(v) => OpRef::const_float_inline(*v),
+        majit_ir::Value::Ref(v) => OpRef::const_ptr_inline(*v),
+        majit_ir::Value::Void => panic!("imported_const_opref: ConstVoid is not a value type"),
+    };
     ctx.seed_constant(opref, value.clone());
     imported_constants.insert(source, opref);
     opref
@@ -1830,20 +1878,9 @@ fn build_short_preamble_struct_from_ops(
     ops: &[Op],
     used_boxes: &[OpRef],
     jump_args: &[OpRef],
-    loop_constants: &crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Const>,
 ) -> ShortPreamble {
     let inputarg_idx =
         |arg: &OpRef| -> Option<usize> { short_inputargs.iter().position(|a| a == arg) };
-    // Collect all OpRefs defined by the short preamble ops (as results).
-    let mut defined_by_ops: VecSet<OpRef> = VecSet::new();
-    for ia in short_inputargs {
-        defined_by_ops.insert(*ia);
-    }
-    for op in ops {
-        if !op.pos.get().is_none() {
-            defined_by_ops.insert(op.pos.get());
-        }
-    }
     let entries = ops
         .iter()
         .cloned()
@@ -1875,44 +1912,19 @@ fn build_short_preamble_struct_from_ops(
             }
         })
         .collect();
-    // RPython parity: capture constant values referenced by short preamble ops.
-    // In RPython, Const objects are stored in op args and are GC-tracked. Here,
-    // we snapshot the loop's constant pool entries for any OpRef referenced by
-    // short preamble ops that isn't defined by the ops themselves.
-    let mut constants: crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Const> =
+    // history.py:227/268/314 — `Const{Int,Float,Ptr}.value` rides inline on
+    // the OpRef, so short-preamble ops embed the constant value directly in
+    // `op.args` and need no parallel side table. The captured `constants`
+    // map is empty along every production path; readers (`is_constant()`
+    // short-circuits at every callsite) treat it as a guaranteed-empty
+    // fallback for the legacy idx-Const shape that no production producer
+    // mints today.
+    //
+    // RPython parity: `shortpreamble.py` keeps no `loop_constants` side
+    // table — `arg` IS the `Const` box, so `_map_args(mapping, args)`
+    // (`unroll.py:364`) passes it through unchanged.
+    let constants: crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Const> =
         crate::optimizeopt::vec_assoc::VecAssoc::new();
-    // history.py:220/261/307 `ConstInt/ConstFloat/ConstPtr.type` invariant:
-    // every Const box carries its type intrinsically as an instance
-    // attribute. Pyre's `majit_ir::Const` enum captures the same shape
-    // (`Const::Int/Float/Ref` carries both type and value), so the
-    // captured snapshot stores `Const` directly rather than the legacy
-    // `(i64, Type)` pair.
-    for op in ops {
-        for &arg in op.getarglist().iter() {
-            if !defined_by_ops.contains(&arg) {
-                if let Some(c) = loop_constants.get(&arg.raw()) {
-                    constants.insert(arg.raw(), *c);
-                }
-            }
-        }
-        if let Some(fa) = op.getfailargs() {
-            for arg in fa {
-                if !defined_by_ops.contains(&arg) {
-                    if let Some(c) = loop_constants.get(&arg.raw()) {
-                        constants.insert(arg.raw(), *c);
-                    }
-                }
-            }
-        }
-    }
-    // Also check jump_args for constants
-    for &arg in jump_args {
-        if !defined_by_ops.contains(&arg) {
-            if let Some(c) = loop_constants.get(&arg.raw()) {
-                constants.insert(arg.raw(), *c);
-            }
-        }
-    }
     ShortPreamble {
         ops: entries,
         inputargs: short_inputargs.to_vec(),
@@ -1987,8 +1999,8 @@ impl ShortPreambleBuilder {
             return None;
         }
         for &arg in produced.preamble_op.getarglist().iter() {
-            // RPython: isinstance(arg, Const) → skip
-            if self.state.known_constants.contains(&arg) {
+            // shortpreamble.py:288 isinstance(arg, Const) → skip
+            if arg.is_constant() {
                 continue;
             }
             if self.produced_short_boxes.iter().any(|(k, _)| *k == arg) {
@@ -2100,10 +2112,7 @@ impl ShortPreambleBuilder {
         result
     }
 
-    pub fn build_short_preamble_struct(
-        &self,
-        loop_constants: &crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Const>,
-    ) -> ShortPreamble {
+    pub fn build_short_preamble_struct(&self) -> ShortPreamble {
         let jump_args: Vec<OpRef> = self
             .state
             .short_preamble_jump
@@ -2115,7 +2124,6 @@ impl ShortPreambleBuilder {
             &self.state.short,
             &self.state.used_boxes,
             &jump_args,
-            loop_constants,
         )
     }
 
@@ -2169,6 +2177,62 @@ pub struct ExtendedShortPreambleBuilder {
 }
 
 impl ExtendedShortPreambleBuilder {
+    pub fn walk_const_ptr_refs_mut(&mut self, visitor: &mut dyn FnMut(&mut GcRef)) {
+        fn visit_opref(opref: &mut OpRef, visitor: &mut dyn FnMut(&mut GcRef)) {
+            if let Some(slot) = opref.as_const_ptr_inline_mut() {
+                visitor(slot);
+            }
+        }
+
+        fn visit_oprefs(oprefs: &mut [OpRef], visitor: &mut dyn FnMut(&mut GcRef)) {
+            for opref in oprefs {
+                visit_opref(opref, visitor);
+            }
+        }
+
+        fn visit_produced(produced: &mut ProducedShortOp, visitor: &mut dyn FnMut(&mut GcRef)) {
+            produced.preamble_op.walk_const_ptr_refs_mut(visitor);
+            if let Some(source) = produced.same_as_source.as_mut() {
+                visit_opref(source, visitor);
+            }
+        }
+
+        for (_, produced) in self.produced_short_boxes.iter_mut() {
+            visit_produced(produced, visitor);
+        }
+        visit_oprefs(&mut self.short_inputargs, visitor);
+        for op in &mut self.short {
+            op.walk_const_ptr_refs_mut(visitor);
+        }
+        let known_constants = std::mem::take(&mut self.known_constants);
+        for mut opref in known_constants {
+            visit_opref(&mut opref, visitor);
+            self.known_constants.insert(opref);
+        }
+        for op in &mut self.extra_same_as {
+            op.walk_const_ptr_refs_mut(visitor);
+        }
+        for op in &mut self.short_preamble_jump {
+            op.walk_const_ptr_refs_mut(visitor);
+        }
+        for op in &mut self.base_extra_same_as {
+            op.walk_const_ptr_refs_mut(visitor);
+        }
+        visit_oprefs(&mut self.label_args, visitor);
+        visit_oprefs(&mut self.used_boxes, visitor);
+        visit_oprefs(&mut self.short_jump_args, visitor);
+        for (source, target) in self.phase1_to_inputarg.iter_mut() {
+            let mut source_copy = *source;
+            visit_opref(&mut source_copy, visitor);
+            visit_opref(target, visitor);
+        }
+        let recorded_canonical_results = std::mem::take(&mut self.recorded_canonical_results);
+        for mut opref in recorded_canonical_results {
+            visit_opref(&mut opref, visitor);
+            self.recorded_canonical_results.insert(opref);
+        }
+    }
+
     pub fn new(target_token: u64, sb: &ShortPreambleBuilder) -> Self {
         ExtendedShortPreambleBuilder {
             produced_short_boxes: sb.produced_short_boxes.clone(),
@@ -2292,12 +2356,16 @@ impl ExtendedShortPreambleBuilder {
         constants_set: &VecSet<u32>,
         pos_to_key: &VecAssoc<OpRef, OpRef>,
     ) -> bool {
+        // history.py:227/268/314 inline-Const variants short-circuit
+        // before `arg.raw()` (which panics on inline) — covered by
+        // `arg.is_constant()` below.
+        if arg.is_constant() || arg.is_none() {
+            return true;
+        }
         if self.short_results.contains(&arg)
             || inputargs_set.contains(&arg)
             || self.known_constants.contains(&arg)
             || constants_set.contains(&arg.raw())
-            || arg.is_constant()
-            || arg.is_none()
         {
             return true;
         }
@@ -2352,7 +2420,8 @@ impl ExtendedShortPreambleBuilder {
             return None;
         }
         for &arg in produced.preamble_op.getarglist().iter() {
-            if self.known_constants.contains(&arg) {
+            // shortpreamble.py:288 isinstance(arg, Const) → skip
+            if arg.is_constant() {
                 continue;
             }
             if self.produced_short_boxes.iter().any(|(k, _)| *k == arg) {
@@ -2547,10 +2616,7 @@ impl ExtendedShortPreambleBuilder {
         &self.short_inputargs
     }
 
-    pub fn build_short_preamble_struct(
-        &self,
-        loop_constants: &crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Const>,
-    ) -> ShortPreamble {
+    pub fn build_short_preamble_struct(&self) -> ShortPreamble {
         // short[..len-1] excludes the JUMP sentinel
         let ops: Vec<Op> = self.short[..self.short_ops_len()].to_vec();
         let inputargs = if self.label_args.is_empty() {
@@ -2563,7 +2629,6 @@ impl ExtendedShortPreambleBuilder {
             &ops,
             &self.used_boxes,
             &self.short_jump_args,
-            loop_constants,
         );
         if inputargs != &self.short_inputargs {
             sp.phase1_inputargs = Some(self.short_inputargs.clone());
@@ -2798,60 +2863,30 @@ pub fn build_short_preamble_from_produced_boxes(
     label_args: &[OpRef],
     short_inputargs: &[OpRef],
     produced: &[(OpRef, ProducedShortOp)],
-    loop_constants: &crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Const>,
 ) -> ShortPreamble {
     let mut builder = ShortPreambleBuilder::new(label_args, produced, short_inputargs);
-    // shortpreamble.py:288 `produce_arg` parity: known_constants holds
-    // the actual `Const`/inline-constant box objects so produce_arg can
-    // return them by identity. `loop_constants` (mod.rs:2940-2962) is
-    // two-source:
-    //   - const_pool entries — key is `OpRef::const_*(idx).raw()`, i.e.
-    //     `idx | CONST_BIT`. Reconstruct the typed `Const*` OpRef.
-    //   - self.constants entries (mod.rs:2956-2962, body-namespace ops
-    //     promoted to constant via `make_constant`) — key is
-    //     `replaced.raw() as u32`, i.e. the body OpRef position with
-    //     no CONST_BIT. Reconstruct the typed body `*Op` OpRef so
-    //     downstream `produce_arg` lookups (which key on the
-    //     operation's typed variant — `IntOp/FloatOp/RefOp`) hit.
-    //     Wrapping these as `Const*` (via `const_typed`) would
-    //     OR `CONST_BIT` and break variant-aware identity
-    //     (history.py:182 box class identity).
-    for (idx, c) in loop_constants.iter() {
-        // history.py:220/261/307 `Const{Int,Float,Ptr}.type` invariant:
-        // every Const box carries its `.type` intrinsically. Pyre's
-        // `majit_ir::Const` enum captures the same shape; `c.get_type()`
-        // returns the typed `Const` arm so we no longer need the
-        // parallel `loop_constant_types` side-table to recover the
-        // type for a `loop_constants` key.
-        let tp = c.get_type();
-        // `const_typed` takes a pool index (history.py:220 `ConstInt(idx)`
-        // construction shape); the CONST_BIT live in `loop_constants` keys
-        // is a raw-namespace artifact and must be stripped before handing
-        // the index to the factory. `raw_const_index` is the canonical
-        // un-OR helper (resoperation.rs:191).
-        let opref = if OpRef::raw_is_constant(*idx) {
-            OpRef::const_typed(OpRef::raw_const_index(*idx), tp)
-        } else {
-            OpRef::op_typed(*idx, tp)
-        };
-        builder.note_known_constant(opref);
-    }
+    // history.py:227/268/314 — inline-Const variants carry the value on
+    // the OpRef; `is_constant()` returns true intrinsically and the
+    // `is_reachable` / `add_heap_op` checks short-circuit before
+    // consulting `known_constants`. Production no longer mints legacy
+    // idx-Const variants (Slice 6 retirement), so there are no entries
+    // to seed into `known_constants` and the legacy `loop_constants`
+    // parameter has been retired.
     for (result, _) in produced {
         let _ = builder.add_op_to_short(*result);
         let _ = builder.add_preamble_op(*result);
     }
-    builder.build_short_preamble_struct(loop_constants)
+    builder.build_short_preamble_struct()
 }
 
 pub fn build_short_preamble_from_exported_boxes(
     label_args: &[OpRef],
     short_inputargs: &[OpRef],
     exported_short_boxes: &[PreambleOp],
-    loop_constants: &crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Const>,
 ) -> ShortPreamble {
     let produced =
         produced_short_boxes_from_exported_boxes(label_args, short_inputargs, exported_short_boxes);
-    build_short_preamble_from_produced_boxes(label_args, short_inputargs, &produced, loop_constants)
+    build_short_preamble_from_produced_boxes(label_args, short_inputargs, &produced)
 }
 
 #[cfg(test)]
@@ -3125,7 +3160,6 @@ mod tests {
             &[OpRef::int_op(0), OpRef::int_op(1)],
             &[OpRef::int_op(10), OpRef::int_op(11)],
             &exported,
-            &crate::optimizeopt::vec_assoc::VecAssoc::new(),
         );
         assert_eq!(sp.ops.len(), 2);
         assert_eq!(sp.ops[0].op.opcode, OpCode::IntAdd);
@@ -3160,12 +3194,7 @@ mod tests {
             },
         ];
 
-        let sp = build_short_preamble_from_exported_boxes(
-            &label_args,
-            &short_inputargs,
-            &exported,
-            &crate::optimizeopt::vec_assoc::VecAssoc::new(),
-        );
+        let sp = build_short_preamble_from_exported_boxes(&label_args, &short_inputargs, &exported);
         let opcodes: Vec<OpCode> = sp.ops.iter().map(|entry| entry.op.opcode).collect();
         assert_eq!(opcodes, vec![OpCode::IntAddOvf, OpCode::GuardNoOverflow]);
     }

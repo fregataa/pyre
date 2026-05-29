@@ -1182,7 +1182,7 @@ fn resolve_opref_vec_int(
     vec_float_oprefs: &VecSet<u32>,
     opref: OpRef,
 ) -> CValue {
-    if let Some(&c) = constants.get(&opref.raw()) {
+    if let Some(c) = lookup_const_i64(constants, opref) {
         let scalar = builder.ins().iconst(cl_types::I64, c);
         return builder.ins().splat(cl_types::I64X2, scalar);
     }
@@ -1209,7 +1209,7 @@ fn resolve_opref_vec_float(
     vec_float_oprefs: &VecSet<u32>,
     opref: OpRef,
 ) -> CValue {
-    if let Some(&c) = constants.get(&opref.raw()) {
+    if let Some(c) = lookup_const_i64(constants, opref) {
         let scalar_i = builder.ins().iconst(cl_types::I64, c);
         let scalar_f = builder
             .ins()
@@ -3821,11 +3821,37 @@ thread_local! {
 }
 
 fn opref_is_op_result_var(opref: OpRef) -> bool {
+    // history.py:213 `Const.is_constant()` returns True; inline-Const
+    // variants are constants, never op results — short-circuit before
+    // `.raw()` (which panics on inline variants).
+    if opref.inline_const_bits().is_some() {
+        return false;
+    }
     OP_RESULT_VARS.with(|cell| {
         cell.borrow()
             .as_ref()
             .is_some_and(|rv| rv.contains(&opref.raw()))
     })
+}
+
+/// Inline-first immediate lookup. Replaces `constants.get(&opref.raw()).copied()`
+/// at backend reader sites for arguments that may be inline-Const variants
+/// (history.py:227/268/314). For non-Const or legacy pool-indexed Const
+/// OpRefs, falls through to the pool snapshot.
+#[inline]
+fn lookup_const_i64(constants: &majit_ir::VecAssoc<u32, i64>, opref: OpRef) -> Option<i64> {
+    if let Some(v) = opref.inline_const_bits() {
+        return Some(v);
+    }
+    constants.get(&opref.raw()).copied()
+}
+
+fn missing_legacy_constant(opref: OpRef, where_: &str) -> ! {
+    panic!(
+        "{where_}: legacy constant {:?} has no constants-pool entry; \
+         OpRef::const_index() is a pool index, not the constant value",
+        opref
+    )
 }
 
 fn resolve_opref(
@@ -3853,8 +3879,11 @@ fn resolve_opref(
     if is_op_result {
         return builder.use_var(var(opref.raw()));
     }
-    if let Some(&c) = constants.get(&opref.raw()) {
+    if let Some(c) = lookup_const_i64(constants, opref) {
         return builder.ins().iconst(cl_types::I64, c);
+    }
+    if opref.is_constant() {
+        missing_legacy_constant(opref, "resolve_opref");
     }
     // RPython parity guard: every Box reaching codegen MUST be bound —
     // an inputarg, a label arg, a constant, or a previous op result
@@ -4099,8 +4128,10 @@ fn validate_oprefs_for_compile(
     for (op_idx, op) in ops.iter().enumerate() {
         if op.opcode == majit_ir::OpCode::Label {
             // LABEL params are introduced at the label block.
+            // Const operands (history.py:189-220) are not body-namespace
+            // OpRefs and are never label-bound.
             for &arg in op.getarglist().iter() {
-                if !arg.is_none() {
+                if !arg.is_none() && !arg.is_constant() {
                     seen.insert(arg.raw());
                 }
             }
@@ -4109,7 +4140,11 @@ fn validate_oprefs_for_compile(
         }
         if op_dereferences_first_arg(op.opcode) {
             let arg = op.arg(0);
+            // history.py:213 `Const.is_constant()` — Const operands are
+            // always "bound" by the value carried inline.
             let bound = arg.is_none()
+                || arg.is_constant()
+                || arg.inline_const_bits().is_some()
                 || constants.contains_key(&arg.raw())
                 || is_rewriter_immediate_arg(op.opcode, 0)
                 || seen.contains(&arg.raw());
@@ -4493,6 +4528,12 @@ fn build_type_overrides(
     }
     let lookup =
         |opref: OpRef, at_op_index: usize, fallback: Type, ovrs: &VecAssoc<u32, Type>| -> Type {
+            // Inline-Const variants carry `.value` on the OpRef and have no
+            // pool key — `raw()` panics on them (history.py:227/268/314).
+            // Return the variant-embedded type directly.
+            if opref.inline_const_bits().is_some() {
+                return opref.ty().unwrap_or(fallback);
+            }
             if let Some(&tp) = ovrs.get(&opref.raw()) {
                 return tp;
             }
@@ -4516,6 +4557,11 @@ fn build_type_overrides(
             if jump_arg.is_none() {
                 continue;
             }
+            // Const label args carry their type in the variant tag —
+            // there's no body-namespace `overrides` slot for them.
+            if label_arg.is_constant() {
+                continue;
+            }
             let jump_type = lookup(jump_arg, *jump_idx, Type::Int, &overrides);
             let label_type = lookup(label_arg, label_idx, Type::Ref, &overrides);
             if jump_type != label_type {
@@ -4535,6 +4581,10 @@ fn lookup_type_at(
     opref: OpRef,
     op_index: usize,
 ) -> Option<Type> {
+    // history.py:220/261/307 — Const variant tag carries the type directly.
+    if opref.is_constant() {
+        return opref.ty();
+    }
     if let Some(&tp) = overrides.get(&opref.raw()) {
         return Some(tp);
     }
@@ -4589,9 +4639,11 @@ fn build_ref_root_slots(
             // InputArg.index whose .tp is Ref. Phase E.2b shifted bridge
             // inputargs into `[bridge_inputarg_base..)`, so a dense lookup
             // by position no longer maps to the right InputArg.
-            if inputargs
-                .iter()
-                .any(|ia| ia.index == arg.raw() && ia.tp == Type::Ref)
+            // Const operands (history.py:189-220) are never InputArgs.
+            if !arg.is_constant()
+                && inputargs
+                    .iter()
+                    .any(|ia| ia.index == arg.raw() && ia.tp == Type::Ref)
             {
                 continue; // inputarg reference — always safe
             }
@@ -4626,7 +4678,9 @@ fn build_ref_root_slots(
                 .collect::<Vec<_>>()
                 .iter(),
         ) {
-            if inputarg_oprefs.contains(&arg.raw()) {
+            // Const operands (history.py:189-220) are not InputArgs; skip
+            // the body-namespace `.raw()` membership check.
+            if !arg.is_constant() && inputarg_oprefs.contains(&arg.raw()) {
                 used_inputargs.insert(arg.raw());
             }
         }
@@ -4733,18 +4787,19 @@ fn resolve_opref_or_imm(
     if opref.is_none() {
         return builder.ins().iconst(cl_types::I64, 0);
     }
+    // Inline-Const fast path: history.py:227/268/314 — value lives on
+    // the Box, not in a side pool.
+    if let Some(c) = opref.inline_const_bits() {
+        return builder.ins().iconst(cl_types::I64, c);
+    }
     if known_values.contains(&opref.raw()) || opref_is_op_result_var(opref) {
         return builder.use_var(var(opref.raw()));
     }
     if let Some(&c) = constants.get(&opref.raw()) {
         return builder.ins().iconst(cl_types::I64, c);
     }
-    // Constant-namespace OpRef: the const_index IS the value
-    // (RPython ConstInt(n).getint() == n).
     if opref.is_constant() {
-        return builder
-            .ins()
-            .iconst(cl_types::I64, opref.const_index() as i64);
+        missing_legacy_constant(opref, "resolve_opref_or_imm");
     }
     builder.ins().iconst(cl_types::I64, opref.raw() as i64)
 }
@@ -4758,6 +4813,12 @@ fn resolve_failarg_opref(
     ref_root_base_ofs: i32,
     opref: OpRef,
 ) -> CValue {
+    // Inline-Const fast path: history.py:227/268/314 — Const Box value
+    // is inline. Stale-ref reload only applies to op-result variables
+    // (regalloc-assigned slots), never to constants.
+    if let Some(c) = opref.inline_const_bits() {
+        return builder.ins().iconst(cl_types::I64, c);
+    }
     if let Some((_, root_slot)) = ref_root_slots
         .iter()
         .find(|(var_idx, _)| *var_idx == opref.raw() && stale_ref_vars.contains(var_idx))
@@ -4777,6 +4838,10 @@ fn resolve_constant_i64(
     opref: OpRef,
     what: &str,
 ) -> Result<i64, BackendError> {
+    // Inline-Const fast path: history.py:227/268/314.
+    if let Some(c) = opref.inline_const_bits() {
+        return Ok(c);
+    }
     if known_values.contains(&opref.raw()) || opref_is_op_result_var(opref) {
         return Err(unsupported_semantics(
             opcode,
@@ -4787,19 +4852,41 @@ fn resolve_constant_i64(
         return Ok(c);
     }
     if opref.is_constant() {
-        return Ok(opref.const_index() as i64);
+        return Err(unsupported_semantics(
+            opcode,
+            &format!(
+                "{what}: legacy constant {:?} has no constants-pool entry; \
+                 OpRef::const_index() is a pool index, not the constant value",
+                opref
+            ),
+        ));
     }
     Ok(opref.raw() as i64)
 }
 
-fn resolve_rewriter_immediate_i64(constants: &majit_ir::VecAssoc<u32, i64>, opref: OpRef) -> i64 {
-    constants.get(&opref.raw()).copied().unwrap_or_else(|| {
-        if opref.is_constant() {
-            opref.const_index() as i64
-        } else {
-            opref.raw() as i64
-        }
-    })
+fn resolve_rewriter_immediate_i64(
+    constants: &majit_ir::VecAssoc<u32, i64>,
+    opcode: OpCode,
+    opref: OpRef,
+    what: &str,
+) -> Result<i64, BackendError> {
+    if let Some(c) = opref.inline_const_bits() {
+        return Ok(c);
+    }
+    if let Some(&c) = constants.get(&opref.raw()) {
+        return Ok(c);
+    }
+    if opref.is_constant() {
+        return Err(unsupported_semantics(
+            opcode,
+            &format!(
+                "{what}: legacy constant {:?} has no constants-pool entry; \
+                 OpRef::const_index() is a pool index, not the constant value",
+                opref
+            ),
+        ));
+    }
+    Ok(opref.raw() as i64)
 }
 
 fn type_for_opref(
@@ -4811,6 +4898,13 @@ fn type_for_opref(
     op_index: usize,
     what: &str,
 ) -> Result<Type, BackendError> {
+    // history.py:220/261/307 — Const OpRef variant tag carries the type;
+    // `opref.ty()` returns it without touching `.raw()`.
+    if let Some(tp) = opref.ty() {
+        if opref.is_constant() {
+            return Ok(tp);
+        }
+    }
     if let Some(tp) = lookup_type_at(type_index, overrides, opref, op_index) {
         return Ok(tp);
     }
@@ -5215,7 +5309,9 @@ fn ref_root_slots_with_future_regular_uses(
                             .into_iter()
                             .chain(op.getfailargs().into_iter().flatten())
                     })
-                    .any(|arg| arg.raw() == *var_idx)
+                    // Const operands carry value inline (history.py:227/268/314)
+                    // — not a body-namespace var_idx match.
+                    .any(|arg| !arg.is_constant() && arg.raw() == *var_idx)
         })
         .copied()
         .collect()
@@ -7841,6 +7937,13 @@ impl CraneliftBackend {
                         .collect::<Vec<_>>()
                         .iter(),
                 ) {
+                    // Const operands carry value inline (history.py:227/268/314)
+                    // — they're not ref-root slot keys, which live in the
+                    // body-namespace (`ref_root_slots` entries from
+                    // `var(opref.raw())` slot allocations).
+                    if arg.is_constant() {
+                        continue;
+                    }
                     let idx = arg.raw();
                     if ref_root_slots.iter().any(|(vi, _)| *vi == idx) {
                         // iteration order is monotonic in `i`, so a later
@@ -8094,6 +8197,11 @@ impl CraneliftBackend {
                     .collect::<Vec<_>>()
                     .iter(),
             ) {
+                // Const operands carry value inline (history.py:227/268/314)
+                // — no Cranelift variable to declare for them.
+                if arg.is_constant() {
+                    continue;
+                }
                 if !arg.is_none()
                     && !declared_vars.contains(&arg.raw())
                     && !constants.contains_key(&arg.raw())
@@ -8119,7 +8227,9 @@ impl CraneliftBackend {
                 continue;
             }
             for &arg in op.getarglist().iter() {
-                if arg.is_none() || declared_vars.contains(&arg.raw()) {
+                // Const label args carry value inline (history.py:227/268/314)
+                // — no Cranelift variable to declare.
+                if arg.is_none() || arg.is_constant() || declared_vars.contains(&arg.raw()) {
                     continue;
                 }
                 declared_vars.insert(arg.raw());
@@ -8442,7 +8552,13 @@ impl CraneliftBackend {
                     builder.switch_to_block(*label_block);
                     for (i, &arg_ref) in ops[op_idx].getarglist().iter().enumerate() {
                         let param = builder.block_params(*label_block)[i];
-                        if !arg_ref.is_none() && !constants.contains_key(&arg_ref.raw()) {
+                        // Inline-Const (history.py:227/268/314) and legacy
+                        // idx-Const args carry value, not a body-namespace
+                        // slot — skip def_var/sync.
+                        if !arg_ref.is_none()
+                            && !arg_ref.is_constant()
+                            && !constants.contains_key(&arg_ref.raw())
+                        {
                             builder.def_var(var(arg_ref.raw()), param);
                             let cur_jf = builder.use_var(jf_ptr_var);
                             sync_ref_root_var(
@@ -8837,7 +8953,7 @@ impl CraneliftBackend {
                     let (obj, expected_class) = resolve_binop(&mut builder, &constants, op);
                     // x86/assembler.py:1887 assert isinstance(loc_classptr, ImmedLoc)
                     // — pre-fetch the classptr immediate from the constant pool.
-                    let expected_classptr_imm = constants.get(&op.arg(1).raw()).copied();
+                    let expected_classptr_imm = lookup_const_i64(&constants, op.arg(1));
                     let exit_block = builder.create_block();
                     builder.set_cold_block(exit_block);
                     let cont_block = builder.create_block();
@@ -8880,7 +8996,7 @@ impl CraneliftBackend {
                     guard_idx += 1;
 
                     let (obj, expected_class) = resolve_binop(&mut builder, &constants, op);
-                    let expected_classptr_imm = constants.get(&op.arg(1).raw()).copied();
+                    let expected_classptr_imm = lookup_const_i64(&constants, op.arg(1));
                     let zero = builder.ins().iconst(ptr_type, 0);
                     let exit_block = builder.create_block();
                     builder.set_cold_block(exit_block);
@@ -9529,9 +9645,11 @@ impl CraneliftBackend {
                     let loc_object = resolve_opref(&mut builder, &constants, op.arg(0));
                     // assembler.py:1971 vtable_ptr = loc_check_against_class
                     //   .getint(): the bounds are resolved at codegen time,
-                    //   so arg1 must be an immediate class pointer.
-                    let loc_check_against_class =
-                        constants.get(&op.arg(1).raw()).copied().unwrap_or_else(|| {
+                    //   so arg1 must be an immediate class pointer. Inline-Const
+                    //   carries the value on the OpRef (history.py:227); fall
+                    //   through to the legacy pool snapshot for idx-Const.
+                    let loc_check_against_class = lookup_const_i64(&constants, op.arg(1))
+                        .unwrap_or_else(|| {
                             panic!(
                                 "x86/assembler.py:1971 vtable_ptr = \
                                  loc_check_against_class.getint(): \
@@ -10377,7 +10495,13 @@ impl CraneliftBackend {
                     // values if the callee forces the frame.
                     for (index, &arg_ref) in info.fail_arg_refs.iter().enumerate() {
                         // The call result (vi) is not yet available — write 0.
-                        let raw = if arg_ref.raw() == vi && !constants.contains_key(&arg_ref.raw())
+                        // history.py:227/268/314: Const fail_args carry value
+                        // inline and never alias the call-result body var
+                        // `vi`. Only body-namespace refs participate in the
+                        // `raw == vi` not-yet-bound check.
+                        let raw = if !arg_ref.is_constant()
+                            && arg_ref.raw() == vi
+                            && !constants.contains_key(&arg_ref.raw())
                         {
                             builder.ins().iconst(cl_types::I64, 0)
                         } else {
@@ -10445,7 +10569,13 @@ impl CraneliftBackend {
                     // jf_frame so force_token_to_dead_frame() reads correct
                     // values if the callee forces the frame.
                     for (index, &arg_ref) in info.fail_arg_refs.iter().enumerate() {
-                        let raw = if arg_ref.raw() == vi && !constants.contains_key(&arg_ref.raw())
+                        // history.py:227/268/314: Const fail_args carry value
+                        // inline and never alias the call-result body var
+                        // `vi`. Only body-namespace refs participate in the
+                        // `raw == vi` not-yet-bound check.
+                        let raw = if !arg_ref.is_constant()
+                            && arg_ref.raw() == vi
+                            && !constants.contains_key(&arg_ref.raw())
                         {
                             builder.ins().iconst(cl_types::I64, 0)
                         } else {
@@ -10729,10 +10859,15 @@ impl CraneliftBackend {
                         let (nf_addr, nt_addr) =
                             gc_nursery_addrs.ok_or_else(|| missing_gc_runtime(op.opcode))?;
                         let flags = MemFlags::trusted();
-                        let size_val = constants
-                            .get(&op.arg(0).raw())
-                            .copied()
-                            .unwrap_or(op.arg(0).raw() as i64);
+                        // history.py:227 ConstInt.value inline — read directly
+                        // from `OpRef::ConstIntInline(v)`, fall through to the
+                        // legacy pool for `OpRef::ConstInt(idx)` arms.
+                        let size_val = op.arg(0).inline_const_bits().unwrap_or_else(|| {
+                            constants
+                                .get(&op.arg(0).raw())
+                                .copied()
+                                .unwrap_or(op.arg(0).raw() as i64)
+                        });
                         let size_total = builder.ins().iconst(cl_types::I64, size_val);
                         let nf_ptr = builder.ins().iconst(ptr_type, nf_addr as i64);
                         let nt_ptr = builder.ins().iconst(ptr_type, nt_addr as i64);
@@ -11285,12 +11420,7 @@ impl CraneliftBackend {
                             "GC_STORE itemsize",
                         )?;
                         if std::env::var_os("MAJIT_CL_GCSTORE_LOG").is_some() {
-                            let offset_dbg =
-                                constants.get(&op.arg(1).raw()).copied().or_else(|| {
-                                    op.arg(1)
-                                        .is_constant()
-                                        .then(|| op.arg(1).const_index() as i64)
-                                });
+                            let offset_dbg = lookup_const_i64(&constants, op.arg(1));
                             eprintln!(
                                 "[cl-gcstore] op_idx={} base={:?} offset_arg={:?} offset={:?} value_arg={:?} size={}",
                                 op_idx,
@@ -11812,16 +11942,36 @@ impl CraneliftBackend {
                     let ad = descr
                         .as_array_descr()
                         .expect("zero_array descriptor must be an ArrayDescr");
-                    let scale_start = resolve_rewriter_immediate_i64(&constants, op.arg(3));
-                    let scale_size = resolve_rewriter_immediate_i64(&constants, op.arg(4));
+                    let scale_start = resolve_rewriter_immediate_i64(
+                        &constants,
+                        op.opcode,
+                        op.arg(3),
+                        "ZERO_ARRAY scale_start",
+                    )?;
+                    let scale_size = resolve_rewriter_immediate_i64(
+                        &constants,
+                        op.opcode,
+                        op.arg(4),
+                        "ZERO_ARRAY scale_size",
+                    )?;
                     let base = resolve_opref(&mut builder, &constants, op.arg(0));
                     let start = builder.ins().iconst(
                         cl_types::I64,
-                        resolve_rewriter_immediate_i64(&constants, op.arg(1)),
+                        resolve_rewriter_immediate_i64(
+                            &constants,
+                            op.opcode,
+                            op.arg(1),
+                            "ZERO_ARRAY start",
+                        )?,
                     );
                     let size = builder.ins().iconst(
                         cl_types::I64,
-                        resolve_rewriter_immediate_i64(&constants, op.arg(2)),
+                        resolve_rewriter_immediate_i64(
+                            &constants,
+                            op.opcode,
+                            op.arg(2),
+                            "ZERO_ARRAY size",
+                        )?,
                     );
 
                     let start_bytes = match scale_start {
@@ -12425,7 +12575,7 @@ impl CraneliftBackend {
                             op.arg(0),
                         );
                         let scalar = resolve_opref(&mut builder, &constants, op.arg(1));
-                        let lane = constants.get(&op.arg(2).raw()).copied().unwrap_or(0) as u8;
+                        let lane = lookup_const_i64(&constants, op.arg(2)).unwrap_or(0) as u8;
                         let result = builder.ins().insertlane(vec_val, scalar, lane);
                         builder.def_var(var(vi), result);
                     } else {
@@ -12450,7 +12600,7 @@ impl CraneliftBackend {
                             builder
                                 .ins()
                                 .bitcast(cl_types::F64, MemFlags::new(), scalar_i);
-                        let lane = constants.get(&op.arg(2).raw()).copied().unwrap_or(0) as u8;
+                        let lane = lookup_const_i64(&constants, op.arg(2)).unwrap_or(0) as u8;
                         let result = builder.ins().insertlane(vec_val, scalar_f, lane);
                         builder.def_var(var(vi), result);
                     } else {
@@ -12469,7 +12619,7 @@ impl CraneliftBackend {
                             &vec_float_oprefs,
                             op.arg(0),
                         );
-                        let lane = constants.get(&op.arg(1).raw()).copied().unwrap_or(0) as u8;
+                        let lane = lookup_const_i64(&constants, op.arg(1)).unwrap_or(0) as u8;
                         let result = builder.ins().extractlane(vec_val, lane);
                         builder.def_var(var(vi), result);
                     } else {
@@ -12488,7 +12638,7 @@ impl CraneliftBackend {
                             &vec_float_oprefs,
                             op.arg(0),
                         );
-                        let lane = constants.get(&op.arg(1).raw()).copied().unwrap_or(0) as u8;
+                        let lane = lookup_const_i64(&constants, op.arg(1)).unwrap_or(0) as u8;
                         let scalar_f = builder.ins().extractlane(vec_val, lane);
                         let result =
                             builder
@@ -13339,7 +13489,15 @@ fn collect_guards(
         let force_token_slots: Vec<usize> = fail_arg_refs
             .iter()
             .enumerate()
-            .filter_map(|(slot, opref)| force_tokens.contains(&opref.raw()).then_some(slot))
+            // Const operands carry value inline (history.py:227/268/314)
+            // — never force-token slots which live in the body namespace.
+            .filter_map(|(slot, opref)| {
+                if opref.is_constant() {
+                    None
+                } else {
+                    force_tokens.contains(&opref.raw()).then_some(slot)
+                }
+            })
             .collect();
 
         // RPython resume.py:396: on guard failure the resume PC is taken
@@ -13688,11 +13846,14 @@ fn collect_guards(
             let mut bits: u64 = 0;
             for (i, tp) in fail_arg_types.iter().enumerate() {
                 if *tp == Type::Ref {
-                    let opref_id = fail_arg_refs.get(i).map(|r| r.raw()).unwrap_or(u32::MAX);
+                    let arg_ref = fail_arg_refs.get(i).copied().unwrap_or(OpRef::NONE);
                     // regalloc.py:1206 — guard fail_args must never be Const.
+                    // history.py:227/268/314 inline-Const carries the value on
+                    // the OpRef itself; legacy idx-Const lives in `constants`.
+                    // Both are reported by `is_constant()`.
                     debug_assert!(
-                        is_finish || is_external_jump || !constants.contains_key(&opref_id),
-                        "regalloc.py:1206: guard fail_args must not contain Const (slot={i}, opref={opref_id})"
+                        is_finish || is_external_jump || !arg_ref.is_constant(),
+                        "regalloc.py:1206: guard fail_args must not contain Const (slot={i}, opref={arg_ref:?})"
                     );
                     if (i as u32) < 64 {
                         bits |= 1u64 << i;
@@ -13996,7 +14157,13 @@ fn collect_terminal_exit_layouts(
                 .getarglist()
                 .iter()
                 .enumerate()
-                .filter_map(|(slot, opref)| force_tokens.contains(&opref.raw()).then_some(slot))
+                .filter_map(|(slot, opref)| {
+                    if opref.is_constant() {
+                        None
+                    } else {
+                        force_tokens.contains(&opref.raw()).then_some(slot)
+                    }
+                })
                 .collect();
             let gc_ref_slots = exit_types
                 .iter()

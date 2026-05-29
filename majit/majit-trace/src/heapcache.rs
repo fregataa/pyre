@@ -560,9 +560,6 @@ impl HeapCache {
                 if i >= self.known_class.len() {
                     self.known_class.resize(i + 1, None);
                 }
-                if self.known_class[i].is_none() {
-                    self.known_class[i] = Some(GcRef(0));
-                }
             }
             HF_KNOWN_NULLITY => {
                 let i = opref.raw() as usize;
@@ -1016,10 +1013,11 @@ impl HeapCache {
     ///      self._set_flag(box, HF_KNOWN_CLASS | HF_KNOWN_NULLITY)
     /// ```
     ///
-    /// pyre additionally remembers the concrete class pointer in the
-    /// `known_class` Vec because OpRef carries no static type token —
-    /// RPython retrieves the class via box.getref_base().
-    pub fn class_now_known(&mut self, opref: OpRef, class: GcRef) {
+    /// pyre additionally remembers the concrete class pointer when this
+    /// layer can decode it. The HF_KNOWN_CLASS flag itself must still be set
+    /// for legacy pool-indexed ConstInt guards whose value is not available
+    /// inside heapcache.py's notify path.
+    pub fn class_now_known_maybe(&mut self, opref: OpRef, class: Option<GcRef>) {
         if opref.is_constant() {
             return;
         }
@@ -1027,13 +1025,19 @@ impl HeapCache {
         if i >= self.known_class.len() {
             self.known_class.resize(i + 1, None);
         }
-        self.known_class[i] = Some(class);
+        if let Some(class) = class {
+            self.known_class[i] = Some(class);
+        }
         // RPython _set_flag(box, HF_KNOWN_CLASS | HF_KNOWN_NULLITY).
         self._set_flag(opref, HF_KNOWN_CLASS);
         // RPython also writes HF_KNOWN_NULLITY in the same _set_flag call;
         // route through nullity_now_known so the Vec<u8> value mirror also
         // captures non-null.
         self.nullity_now_known(opref, true);
+    }
+
+    pub fn class_now_known(&mut self, opref: OpRef, class: GcRef) {
+        self.class_now_known_maybe(opref, Some(class));
     }
 
     /// heapcache.py:467-468 is_class_known.
@@ -1087,51 +1091,38 @@ impl HeapCache {
             self.new_object(result);
             return;
         }
-        // heapcache.py: SETFIELD_GC tracking.
-        // The written value becomes reachable from the container.
-        // If the container later escapes, the value also escapes.
-        // heapcache.py: _escape_from_write — only record dependency if
-        // BOTH container and value are unescaped. If container is unescaped
-        // but value is not, escape the value immediately.
+        // heapcache.py:234-241 `mark_escaped` routes SETFIELD_GC /
+        // SETARRAYITEM_GC through the single `_escape_from_write(box,
+        // fieldbox)` body. SETFIELD_GC: box=args[0], fieldbox=args[1];
+        // SETARRAYITEM_GC: box=args[0], fieldbox=args[2]. The dependency
+        // is recorded only when both are unescaped; in every other case
+        // — including container unescaped but value already escaped —
+        // the value escapes (heapcache.py:224-229 `elif fieldbox is not
+        // None: self._escape_box(fieldbox)`).
         if opcode == OpCode::SetfieldGc && args.len() >= 2 {
-            let container = args[0];
-            let value = args[1];
-            // heapcache.py:493 is_unescaped — version-gated.
-            let container_unescaped = self.is_unescaped(container);
-            let value_unescaped = self.is_unescaped(value);
-            if container_unescaped && value_unescaped {
-                self._get_deps(container).push(Some(value));
-            } else if container_unescaped {
-                // Container unescaped, value already escaped — no-op
-            } else {
-                self._escape_box(value);
-            }
+            self._escape_from_write(args[0], args[1]);
         }
         if opcode == OpCode::SetarrayitemGc && args.len() >= 3 {
-            let container = args[0];
-            let value = args[2];
-            let container_unescaped = self.is_unescaped(container);
-            let value_unescaped = self.is_unescaped(value);
-            if container_unescaped && value_unescaped {
-                self._get_deps(container).push(Some(value));
-            } else if container_unescaped {
-                // Container unescaped, value already escaped — no-op
-            } else {
-                self._escape_box(value);
-            }
+            self._escape_from_write(args[0], args[2]);
         }
         // heapcache.py: GUARD_VALUE → known constant + nonnull.
         if opcode == OpCode::GuardValue && args.len() >= 2 {
             self.nullity_now_known(args[0], true);
         }
-        // heapcache.py: GUARD_CLASS/GUARD_NONNULL_CLASS → known class.
+        // heapcache.py:470-472 `class_now_known(box)` sets HF_KNOWN_CLASS
+        // on args[0]. RPython stores only the flag; pyre additionally keeps
+        // the concrete class pointer when it can decode the class operand.
+        // Guard class operands are ConstInt vtable addresses upstream:
+        // model.py:199-201 `cls_of_box()` returns ConstInt(ptr2int(typeptr))
+        // and aarch64/regalloc.py:829 reads `op.getarg(1).getint()`.
+        // Legacy pool-indexed class args still mark the class as known
+        // without a concrete side value because this layer has no pool.
         if opcode == OpCode::GuardClass || opcode == OpCode::GuardNonnullClass {
-            if args.len() >= 2 {
-                if let Some(class_val) = args.get(1) {
-                    self.class_now_known(args[0], GcRef(class_val.raw() as usize));
-                }
-            }
-            self.nullity_now_known(args[0], true);
+            let class = args
+                .get(1)
+                .and_then(|class_val| class_val.const_int_value())
+                .map(|class_val| GcRef(class_val as usize));
+            self.class_now_known_maybe(args[0], class);
         }
         // heapcache.py: GUARD_NONNULL → known non-null.
         if opcode == OpCode::GuardNonnull && !args.is_empty() {
@@ -2133,8 +2124,8 @@ mod tests {
     #[test]
     fn unique_const_heuristic_canonicalises_to_last_via_same_constant() {
         let mut entry = CacheEntry::new();
-        let a = OpRef::const_ptr(0);
-        let b = OpRef::const_ptr(1);
+        let a = OpRef::const_ptr_inline(majit_ir::GcRef(0xA000));
+        let b = OpRef::const_ptr_inline(majit_ir::GcRef(0xB000));
         let oracle = FixedSameConstantOracle {
             same_pairs: vec![(a, b)],
         };
@@ -2159,7 +2150,7 @@ mod tests {
     fn unique_const_heuristic_skips_non_ref_constants() {
         let mut entry = CacheEntry::new();
         let oracle = FixedSameConstantOracle { same_pairs: vec![] };
-        let ci = OpRef::const_int(0);
+        let ci = OpRef::const_int_inline(42);
         assert_eq!(entry._unique_const_heuristic(ci, &oracle), ci);
         assert!(entry.last_const_box.is_none());
     }
@@ -2352,6 +2343,31 @@ mod tests {
     }
 
     #[test]
+    fn test_notify_guard_class_marks_known_for_legacy_constint() {
+        let mut cache = HeapCache::new();
+        let obj = OpRef::ref_op(3);
+        let cls = OpRef::const_int(7);
+
+        cache.notify_op(OpCode::GuardClass, &[obj, cls], OpRef::NONE);
+
+        assert!(cache.is_class_known(obj));
+        assert_eq!(cache.get_known_class(obj), None);
+    }
+
+    #[test]
+    fn test_notify_guard_class_preserves_inline_class_value() {
+        let mut cache = HeapCache::new();
+        let obj = OpRef::ref_op(3);
+        let cls_ref = GcRef(0xCAFE);
+        let cls = OpRef::const_int_inline(cls_ref.0 as i64);
+
+        cache.notify_op(OpCode::GuardClass, &[obj, cls], OpRef::NONE);
+
+        assert!(cache.is_class_known(obj));
+        assert_eq!(cache.get_known_class(obj), Some(cls_ref));
+    }
+
+    #[test]
     fn test_notify_op_malloc() {
         let mut cache = HeapCache::new();
         let result = OpRef::ref_op(3);
@@ -2464,7 +2480,7 @@ mod tests {
     fn test_replace_box_marks_old_as_const() {
         let mut cache = HeapCache::new();
         let old = OpRef::ref_op(5);
-        let new = OpRef::const_ptr(0);
+        let new = OpRef::const_ptr_inline(majit_ir::GcRef(0xDEAD));
 
         cache.arraylen_now_known(old, old);
         cache.replace_box(old, new);

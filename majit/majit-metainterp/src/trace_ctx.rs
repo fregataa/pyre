@@ -290,11 +290,11 @@ pub struct TraceCtx {
     /// Used by force_finish_trace segmenting to record the guard-point pc.
     pub last_traced_pc: usize,
     /// GC-safe constant OpRefs for each initial inputarg at trace start.
-    /// Each entry is a ConstantPool-allocated OpRef whose value is kept
-    /// up-to-date by the shadow stack (Ref constants survive GC moves).
+    /// Each entry is an inline `Const*` OpRef mirroring
+    /// history.py:227/268/314 (`Const*.value` lives on the box). Ref
+    /// entries are forwarded by `MetaInterp::walk_active_trace_refs`.
     /// Used by cut_trace_from to remap escaped original inputargs to
-    /// existing pool constants, avoiding both stale pointers and
-    /// entry-contract mismatches.
+    /// stable Const boxes without re-entering the legacy ConstantPool.
     pub initial_inputarg_consts: Vec<majit_ir::OpRef>,
     /// pyjitpl.py:1087 parity: quasi-immutable field read needs a
     /// GUARD_NOT_INVALIDATED with full snapshot at the field read's orgpc.
@@ -1096,13 +1096,19 @@ impl TraceCtx {
     }
 
     /// Get or create a constant OpRef for a given i64 value.
+    ///
+    /// history.py:227 `ConstInt(value).value` is inline on the Box;
+    /// pyre mirrors this with `OpRef::ConstIntInline` — no pool allocation.
     pub fn const_int(&mut self, value: i64) -> OpRef {
-        self.constants.get_or_insert(value)
+        OpRef::const_int_inline(value)
     }
 
-    /// Get or create a Ref-typed constant OpRef.
     /// executor.py:544 constant_from_op(op) parity: get typed Value for OpRef.
+    /// history.py:227/268/314 — inline-Const carries the value directly.
     pub fn constants_get_value(&self, opref: OpRef) -> Option<Value> {
+        if let Some(v) = opref.inline_const_to_value() {
+            return Some(v);
+        }
         self.constants.get_value(opref)
     }
 
@@ -1173,6 +1179,9 @@ impl TraceCtx {
     /// restores the value of the portal's red-virtualizable inputarg
     /// whose Box identity is recycled across loop iterations.
     pub fn box_value(&self, opref: OpRef) -> Option<Value> {
+        if let Some(v) = opref.inline_const_to_value() {
+            return Some(v);
+        }
         if opref.is_constant() {
             if let Some(value) = self.constants.get_value(opref) {
                 return Some(value);
@@ -1188,9 +1197,11 @@ impl TraceCtx {
 
     /// RPython parity: Ref constants preserve their type so guard
     /// fail_args are correctly typed during guard failure recovery.
+    /// history.py:314 `ConstPtr.value` is inline on the Box; pyre
+    /// mirrors with `OpRef::ConstPtrInline(GcRef)`. The Slice 7b
+    /// op-graph walker forwards these slots across minor collection.
     pub fn const_ref(&mut self, value: i64) -> OpRef {
-        self.constants
-            .get_or_insert_typed(value, majit_ir::Type::Ref)
+        OpRef::const_ptr_inline(majit_ir::GcRef(value as usize))
     }
 
     /// history.py:361 CONST_NULL = ConstPtr(ConstPtr.value).
@@ -1200,18 +1211,31 @@ impl TraceCtx {
     }
 
     /// Get or create a Float-typed constant OpRef.
+    ///
+    /// history.py:268 `ConstFloat(valuestorage).value` is inline on the
+    /// Box; pyre mirrors with `OpRef::ConstFloatInline`. The incoming
+    /// `value: i64` is the longlong float-storage form (raw bits) per
+    /// RPython `longlong.FLOATSTORAGE`; convert to `f64` for the inline
+    /// payload so equality/hash use bitwise compare (history.py:283/292).
     pub fn const_float(&mut self, value: i64) -> OpRef {
-        self.constants
-            .get_or_insert_typed(value, majit_ir::Type::Float)
+        OpRef::const_float_inline(f64::from_bits(value as u64))
     }
 
     /// Return the type of a constant OpRef, if recorded.
+    /// history.py:227/268/314 — inline-Const carries type intrinsically.
     pub fn const_type(&self, opref: OpRef) -> Option<majit_ir::Type> {
+        if opref.inline_const_to_value().is_some() {
+            return opref.ty();
+        }
         self.constants.constant_type(opref)
     }
 
-    /// Return the concrete value for a constant OpRef, if it is a pooled constant.
+    /// Return the concrete value for a constant OpRef as raw i64 bits.
+    /// history.py:227/268/314 — inline-Const carries the value directly.
     pub fn const_value(&self, opref: OpRef) -> Option<i64> {
+        if let Some(bits) = opref.inline_const_bits() {
+            return Some(bits);
+        }
         self.constants.raw_bits(opref)
     }
 
@@ -1222,6 +1246,9 @@ impl TraceCtx {
     /// constants should migrate to this reader so the raw-i64 API can
     /// retire once the backend `set_constants` signature flips.
     pub fn const_typed_value(&self, opref: OpRef) -> Option<majit_ir::Value> {
+        if let Some(v) = opref.inline_const_to_value() {
+            return Some(v);
+        }
         self.constants.get_value(opref)
     }
 
@@ -1258,8 +1285,10 @@ impl TraceCtx {
     /// M1 bridge: translate a pyre `OpRef` into the `opencoder::Box` that
     /// `TraceRecordBuffer::record_op(&[Box], descr)` expects.
     ///
-    /// Pyre's OpRef uses the high bit (`>= 10_000` via `OpRef::from_const`)
-    /// to mark constants and keeps their values in a side `ConstantPool`;
+    /// Pyre's legacy pool-indexed Const OpRefs use the high bit
+    /// (`>= 10_000` via `OpRef::from_const`) and keep their values in a side
+    /// `ConstantPool`; inline Const OpRefs carry their value directly and
+    /// are resolved by `ConstantPool::get_value()` without a pool entry.
     /// RPython's opencoder takes concrete `Const{Int,Float,Ptr}` /
     /// `AbstractResOp` boxes and encodes them inline through the
     /// `_bigints` / `_floats` / `_refs` pools in `_encode`.
@@ -1268,9 +1297,9 @@ impl TraceCtx {
     /// unblocks M2 (routing `TraceCtx::record_*` through TraceRecordBuffer's
     /// Box-taking API) without touching any call site yet.
     ///
-    /// Panics when a constant OpRef has no pool entry — that is a genuine
-    /// invariant break (every `is_constant()` OpRef must have been minted
-    /// via `ConstantPool::get_or_insert_typed` or friends).
+    /// Panics when a legacy pool-indexed constant OpRef has no pool entry —
+    /// that is a genuine invariant break. Inline constants are valid without
+    /// one.
     pub fn opref_to_box(&self, opref: OpRef) -> OcBox {
         if opref.is_constant() {
             let value = self
@@ -1298,12 +1327,19 @@ impl TraceCtx {
     pub fn initial_inputarg_argbox(&self, index: usize) -> Option<(JitArgKind, OpRef, i64)> {
         let tp = self.recorder.inputarg_types().get(index).copied()?;
         let const_ref = self.initial_inputarg_consts.get(index).copied()?;
-        let value = self.constants.get_value(const_ref)?;
-        let bits = match value {
-            Value::Int(v) => v,
-            Value::Ref(r) => r.as_usize() as i64,
-            Value::Float(v) => v.to_bits() as i64,
-            Value::Void => 0,
+        // history.py:227/268/314 — Const{Int,Float,Ptr}.value lives inline
+        // on the Box (Slice 7 inline-Const cutover). Try inline first; fall
+        // back to the legacy pool lookup for any legacy idx-Const survivor.
+        let bits = if let Some(bits) = const_ref.inline_const_bits() {
+            bits
+        } else {
+            let value = self.constants.get_value(const_ref)?;
+            match value {
+                Value::Int(v) => v,
+                Value::Ref(r) => r.as_usize() as i64,
+                Value::Float(v) => v.to_bits() as i64,
+                Value::Void => 0,
+            }
         };
         let kind = match tp {
             Type::Int => JitArgKind::Int,
@@ -2623,14 +2659,13 @@ impl TraceCtx {
     /// ```
     ///
     /// Mirrors RPython's `jit::record_exact_class` hint (rlib/jit.rs:1181).
-    /// `cls_const` is the class-vtable Ref OpRef (must already be a
-    /// constant ref; the dispatcher reboxes the `record_exact_class/ri`
-    /// int-bank class pointer as ConstPtr before calling here). Cache hit
-    /// short-circuits and bumps
+    /// `cls_const` is the class-vtable ConstInt OpRef, matching
+    /// backend/model.py:199-201 `cls_of_box()` and the `/ri` bytecode
+    /// shape. Cache hit short-circuits and bumps
     /// `HEAPCACHED_OPS`; miss records `RecordExactClass` and stamps
     /// both `class_now_known` and `nullity_now_known(true)` per
-    /// pyjitpl.py:401-402.  Panics if `cls_const` resolves to a non-Ref
-    /// constant — the dispatcher invariant guarantees ref-kind here.
+    /// pyjitpl.py:401-402.  Panics if `cls_const` resolves to a non-Int
+    /// constant — the dispatcher invariant guarantees int-kind here.
     pub fn trace_record_exact_class(&mut self, opref: OpRef, cls_const: OpRef) {
         if self.heap_cache.is_class_known(opref) {
             self.profiler().count_ops(
@@ -2645,12 +2680,11 @@ impl TraceCtx {
             return;
         }
         self.record_op(OpCode::RecordExactClass, &[opref, cls_const]);
-        let cls_value = match self.constants.get_value(cls_const) {
-            Some(Value::Ref(gc)) => gc,
+        let cls_value = match self.constants_get_value(cls_const) {
+            Some(Value::Int(vtable)) => majit_ir::GcRef(vtable as usize),
             other => panic!(
                 "trace_record_exact_class: cls_const {:?} must resolve to a \
-                 ConstPtr (Value::Ref); got {:?} — bytecode argcodes are /ri \
-                 so dispatcher reboxes a constant int class pointer as ConstPtr",
+                 ConstInt vtable address; got {:?} — bytecode argcodes are /ri",
                 cls_const, other
             ),
         };
@@ -3659,14 +3693,21 @@ mod tests {
         assert_eq!(ctx.opref_to_box(c), OcBox::ConstPtr(addr));
     }
 
-    /// M1: constant OpRef that was not registered in the pool is a
-    /// genuine invariant break — the helper must panic rather than
+    /// M1: legacy idx-Const OpRef that was not registered in the pool
+    /// is a genuine invariant break — the helper must panic rather than
     /// silently substitute a Box::ResOp.
+    ///
+    /// legacy-const-ok: pins the legacy idx-Const + missing-pool-entry
+    /// failure mode. Inline variants carry the value on the OpRef and
+    /// never go through the pool.
+    ///
+    /// legacy-const-ok: pins the legacy idx-Const + missing-pool-entry
+    /// panic. Inline-Const variants never enter `opref_to_box`'s pool
+    /// lookup path.
     #[test]
     #[should_panic(expected = "not in pool")]
     fn test_opref_to_box_orphan_constant_panics_m1() {
         let ctx = TraceCtx::for_test(0);
-        // Forge a constant-namespace OpRef without touching the pool.
         let orphan = OpRef::const_int(7);
         ctx.opref_to_box(orphan);
     }

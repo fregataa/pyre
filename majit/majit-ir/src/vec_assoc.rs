@@ -144,6 +144,12 @@ impl<K: Eq, V> VecAssoc<K, V> {
         self.entries.iter_mut().map(|(k, v)| (&*k, v))
     }
 
+    /// Mutable access to both key and value. Use only when the key payload is
+    /// itself part of a GC-traced object graph and must be updated in place.
+    pub fn iter_entries_mut(&mut self) -> impl Iterator<Item = (&mut K, &mut V)> {
+        self.entries.iter_mut().map(|(k, v)| (k, v))
+    }
+
     pub fn keys(&self) -> impl Iterator<Item = &K> {
         self.entries.iter().map(|(k, _)| k)
     }

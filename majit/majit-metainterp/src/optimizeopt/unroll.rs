@@ -19,7 +19,7 @@
 /// don't collide with the original ops.
 use std::sync::{Arc, Mutex};
 
-use majit_ir::{DescrRef, Op, OpCode, OpRef, Type, Value};
+use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Type, Value};
 
 use crate::optimizeopt::{
     OptContext, Optimization, OptimizationResult, SnapshotBoxes, SnapshotFramePcs,
@@ -64,7 +64,16 @@ fn is_trace_constant_ref(
     opref: OpRef,
     constants: &majit_ir::VecAssoc<u32, majit_ir::Value>,
 ) -> bool {
-    !opref.is_none() && constants.contains_key(&opref.raw())
+    if opref.is_none() {
+        return false;
+    }
+    // history.py:189-220 — Const variants are constants by Box class.
+    // Inline-Const carries the value directly; legacy idx-Const may still
+    // appear at transitional boundaries and must also be treated as Const.
+    if opref.is_constant() {
+        return true;
+    }
+    constants.contains_key(&opref.raw())
 }
 
 fn is_trace_runtime_ref(
@@ -333,6 +342,10 @@ pub struct UnrollOptimizer {
     /// TraceIterator copies those values onto the fresh per-phase boxes it
     /// mints, preserving RPython's box-carried `_res*` value shape.
     pub source_box_pool: Option<crate::r#box::BoxPool>,
+    /// MetaInterp-owned compile snapshot root slot list. Stored as an address
+    /// because the unroll optimizer owns the inner phase optimizers while the
+    /// registered GC walker enters through MetaInterp.
+    pub compile_snapshot_root_slots: Option<usize>,
 }
 
 impl UnrollOptimizer {
@@ -369,7 +382,42 @@ impl UnrollOptimizer {
             call_pure_results: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             cpu: crate::cpu::default_cpu(),
             source_box_pool: None,
+            compile_snapshot_root_slots: None,
         }
+    }
+
+    fn collect_snapshot_const_ptr_slots(maps: &mut [&mut SnapshotBoxes]) -> Vec<usize> {
+        let mut slots = Vec::new();
+        for map in maps {
+            for slot in map.iter_mut() {
+                if let Some(boxes) = slot {
+                    for sb in boxes {
+                        if let majit_ir::OpRef::ConstPtrInline(gcref) = sb.opref {
+                            if !gcref.is_null() {
+                                slots.push((&mut sb.opref as *mut majit_ir::OpRef) as usize);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        slots
+    }
+
+    fn replace_compile_snapshot_roots(&self, slots: Vec<usize>) {
+        if let Some(addr) = self.compile_snapshot_root_slots {
+            // SAFETY: pyjitpl installs this address from
+            // `MetaInterp.compile_snapshot_refs` for the duration of one
+            // compile. Unroll phases run on the same thread as the registered
+            // root walker.
+            unsafe {
+                *(addr as *mut Vec<usize>) = slots;
+            }
+        }
+    }
+
+    fn clear_compile_snapshot_roots(&self) {
+        self.replace_compile_snapshot_roots(Vec::new());
     }
 
     /// Optimize the preamble (first iteration) of a loop trace.
@@ -560,6 +608,11 @@ impl UnrollOptimizer {
                 opt_p1.snapshot_vable_boxes = self.snapshot_vable_boxes.clone();
                 opt_p1.snapshot_vref_boxes = self.snapshot_vref_boxes.clone();
                 opt_p1.snapshot_frame_pcs = self.snapshot_frame_pcs.clone();
+                self.replace_compile_snapshot_roots(Self::collect_snapshot_const_ptr_slots(&mut [
+                    &mut opt_p1.snapshot_boxes,
+                    &mut opt_p1.snapshot_vable_boxes,
+                    &mut opt_p1.snapshot_vref_boxes,
+                ]));
                 opt_p1.call_pure_results = self.call_pure_results.clone();
                 // RPython optimize_preamble (unroll.py:101-103): flush=False.
                 // JUMP/FINISH is NOT sent through the pass pipeline; it's
@@ -735,6 +788,7 @@ impl UnrollOptimizer {
                             partial_trace_inputargs: Vec::new(),
                             partial_trace_operations: Vec::new(),
                             rooted_refs: Vec::new(),
+                            rooted_const_ptr_slots: Vec::new(),
                             shadow_stack_base: 0,
                         };
                         final_exported_state.root_all_gcrefs();
@@ -785,10 +839,12 @@ impl UnrollOptimizer {
                         // `has_compiled_targets` (`pyjitpl.py:3898`) read site.
                         self.ensure_preamble_target_token();
                         let loop_arity = closing_loop_contract_arity(&ops, p1_ni);
+                        self.clear_compile_snapshot_roots();
                         return (ops, loop_arity);
                     }
                 }
             };
+        self.clear_compile_snapshot_roots();
         // unroll.py:454 end_args carry type via Box; export_state already
         // populated `exported_state.end_arg_types` from ctx.
         // RPython parity: Phase 2 needs patchguardop from Phase 1's
@@ -1008,6 +1064,11 @@ impl UnrollOptimizer {
                 *r = r.map_opref(translate_opref);
             }
         }
+        self.replace_compile_snapshot_roots(Self::collect_snapshot_const_ptr_slots(&mut [
+            &mut opt_p2.snapshot_boxes,
+            &mut opt_p2.snapshot_vable_boxes,
+            &mut opt_p2.snapshot_vref_boxes,
+        ]));
         // Phase 1's emitted ops are already in Phase 1's emitted
         // namespace `[num_inputs..next_global_opref)`. Phase 2 body may
         // reference these via `imported_label_args`. They are NOT in the
@@ -1034,6 +1095,7 @@ impl UnrollOptimizer {
                 iter.box_pool.clone(),
             )
         });
+        self.clear_compile_snapshot_roots();
         // RPython optimizer.py:614-625 freezes op arguments during
         // `_emit_operation`; optimizer.py:598-612 may then install a Const
         // forwarding on the result, but it never retroactively rewrites the
@@ -1307,23 +1369,10 @@ impl UnrollOptimizer {
             // RPython unroll.py:497-504 `for produced_op in
             // exported_state.short_boxes` parity: consume the eagerly-derived
             // ProducedShortOp list stored on ExportedState at export time.
-            //
-            // history.py:220/261/307 `Const` carries both type and value
-            // intrinsically. Pyre's typed `majit_ir::Const` unifies the
-            // legacy `(i64, Type)` parallel maps into a single
-            // `VecAssoc<u32, Const>`; the conversion from typed `Value`
-            // happens directly at the call boundary, with no parallel
-            // `loop_constant_types` side-table.
-            let mut loop_constants: crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Const> =
-                crate::optimizeopt::vec_assoc::VecAssoc::new();
-            for (&k, v) in consts_p1.iter() {
-                loop_constants.insert(k, v.to_const());
-            }
             crate::optimizeopt::shortpreamble::build_short_preamble_from_produced_boxes(
                 &exported_end_args,
                 &exported_short_inputargs,
                 &exported_short_boxes_produced,
-                &loop_constants,
             )
         });
         // shortpreamble.py:414-425 parity: store PtrInfo for each inputarg.
@@ -1973,6 +2022,11 @@ pub struct ExportedState {
     /// Shadow stack rooting for GcRef values in exported_infos.
     /// (OpRef key, field kind, shadow stack index).
     rooted_refs: Vec<(OpRef, ExportedGcRefField, usize)>,
+    /// Shadow stack slots for every inline `ConstPtr.value` reachable from
+    /// this ExportedState's Rust object graph. RPython traces these fields as
+    /// normal Const object attributes; pyre records the walk order and copies
+    /// the forwarded values back in `refresh_from_gc`.
+    rooted_const_ptr_slots: Vec<usize>,
     /// Shadow stack depth at creation. release_roots pops to here.
     shadow_stack_base: usize,
 }
@@ -2062,6 +2116,7 @@ impl ExportedState {
             partial_trace_inputargs: Vec::new(),
             partial_trace_operations: Vec::new(),
             rooted_refs: Vec::new(),
+            rooted_const_ptr_slots: Vec::new(),
             shadow_stack_base: majit_gc::shadow_stack::depth(),
         }
         // gcreftracer.py parity: RPython ExportedState is a Python object
@@ -2070,6 +2125,118 @@ impl ExportedState {
         // order (longer-lived copy rooted first → lower shadow stack depth).
         // new() does NOT auto-root because the LIFO ordering depends on
         // the caller's storage pattern.
+    }
+
+    /// Visit every GC reference slot reachable from this exported optimizer
+    /// state. This is the Rust equivalent of PyPy keeping `ExportedState`
+    /// inside the GC-traced Python object graph: ConstPtr boxes, op args,
+    /// short preamble state, virtual state, and `_forwarded` payloads all
+    /// expose their actual mutable storage.
+    pub fn walk_const_ptr_refs_mut(&mut self, visitor: &mut dyn FnMut(&mut GcRef)) {
+        fn visit_opref(opref: &mut OpRef, visitor: &mut dyn FnMut(&mut GcRef)) {
+            if let Some(slot) = opref.as_const_ptr_inline_mut() {
+                visitor(slot);
+            }
+        }
+
+        fn visit_oprefs(oprefs: &mut [OpRef], visitor: &mut dyn FnMut(&mut GcRef)) {
+            for opref in oprefs {
+                visit_opref(opref, visitor);
+            }
+        }
+
+        fn visit_value(value: &mut Value, visitor: &mut dyn FnMut(&mut GcRef)) {
+            if let Value::Ref(gcref) = value {
+                visitor(gcref);
+            }
+        }
+
+        fn visit_op(op: &Op, visitor: &mut dyn FnMut(&mut GcRef)) {
+            let mut pos = op.pos.get();
+            visit_opref(&mut pos, visitor);
+            op.pos.set(pos);
+            op.walk_const_ptr_refs_mut(visitor);
+        }
+
+        fn visit_op_info(
+            info: &mut crate::optimizeopt::info::OpInfo,
+            visitor: &mut dyn FnMut(&mut GcRef),
+        ) {
+            if let crate::optimizeopt::info::OpInfo::Ptr(rc) = info {
+                rc.borrow_mut().walk_const_ptr_refs_mut(visitor);
+            }
+        }
+
+        fn visit_forwarded(
+            forwarded: &std::cell::RefCell<crate::r#box::Forwarded>,
+            visitor: &mut dyn FnMut(&mut GcRef),
+        ) {
+            let mut forwarded = forwarded.borrow_mut();
+            match &mut *forwarded {
+                crate::r#box::Forwarded::Info(info) => visit_op_info(info, visitor),
+                crate::r#box::Forwarded::Const(majit_ir::Const::Ref(gcref), _) => visitor(gcref),
+                _ => {}
+            }
+        }
+
+        fn visit_preamble_op(
+            entry: &mut crate::optimizeopt::shortpreamble::PreambleOp,
+            visitor: &mut dyn FnMut(&mut GcRef),
+        ) {
+            visit_op(&entry.op, visitor);
+            if let Some(source) = entry.same_as_source.as_mut() {
+                visit_opref(source, visitor);
+            }
+        }
+
+        fn visit_produced_short_op(
+            produced: &mut crate::optimizeopt::shortpreamble::ProducedShortOp,
+            visitor: &mut dyn FnMut(&mut GcRef),
+        ) {
+            visit_op(&produced.preamble_op, visitor);
+            if let Some(source) = produced.same_as_source.as_mut() {
+                visit_opref(source, visitor);
+            }
+        }
+
+        visit_oprefs(&mut self.end_args, visitor);
+        visit_oprefs(&mut self.next_iteration_args, visitor);
+        self.virtual_state.walk_const_ptr_refs_mut(visitor);
+        for (key, info) in self.exported_infos.iter_entries_mut() {
+            visit_opref(key, visitor);
+            visit_op_info(info, visitor);
+        }
+        for entry in &mut self.exported_short_boxes {
+            visit_preamble_op(entry, visitor);
+        }
+        for (key, produced) in &mut self.short_boxes {
+            visit_opref(key, visitor);
+            visit_produced_short_op(produced, visitor);
+        }
+        for (key, value) in self.short_box_const_values.iter_entries_mut() {
+            visit_opref(key, visitor);
+            visit_value(value, visitor);
+        }
+        if let Some(short_preamble) = self.short_preamble.as_mut() {
+            short_preamble.walk_const_ptr_refs_mut(visitor);
+        }
+        visit_oprefs(&mut self.renamed_inputargs, visitor);
+        visit_oprefs(&mut self.short_inputargs, visitor);
+        visit_oprefs(&mut self.runtime_boxes, visitor);
+        if let Some(patchguardop) = self.patchguardop.as_ref() {
+            visit_op(patchguardop, visitor);
+        }
+        for ia in &self.partial_trace_inputargs {
+            visit_forwarded(&ia.forwarded, visitor);
+        }
+        for op in &self.partial_trace_operations {
+            visit_op(op, visitor);
+            visit_forwarded(&op.forwarded, visitor);
+        }
+    }
+
+    pub fn has_shadow_roots(&self) -> bool {
+        !self.rooted_refs.is_empty() || !self.rooted_const_ptr_slots.is_empty()
     }
 
     /// Smallest fresh OpRef that is guaranteed not to collide with any Box
@@ -2198,7 +2365,15 @@ impl ExportedState {
         self.shadow_stack_base = majit_gc::shadow_stack::depth();
         // ── exported_infos GcRef fields ──
         let mut keys: Vec<OpRef> = self.exported_infos.keys().copied().collect();
-        keys.sort_by_key(|k| k.raw());
+        // Sort for determinism. Const variants (history.py:189-220) sort
+        // separately via the inline `i64` payload — `.raw()` would panic
+        // on inline-Const OpRefs.
+        keys.sort_by_key(|k| match k {
+            OpRef::ConstIntInline(v) => (1u8, *v as u64),
+            OpRef::ConstFloatInline(v) => (1u8, v.to_bits()),
+            OpRef::ConstPtrInline(v) => (1u8, v.0 as u64),
+            _ => (0u8, k.raw() as u64),
+        });
         for key in keys {
             if let Some(OpInfo::Ptr(rc)) = self.exported_infos.get(&key) {
                 let info = rc.borrow();
@@ -2273,7 +2448,12 @@ impl ExportedState {
         // RPython Const boxes are GC-traced objects. The Rust producer-side
         // const snapshot must therefore root any Ref payload it carries.
         let mut const_keys: Vec<OpRef> = self.short_box_const_values.keys().copied().collect();
-        const_keys.sort_by_key(|k| k.raw());
+        const_keys.sort_by_key(|k| match k {
+            OpRef::ConstIntInline(v) => (1u8, *v as u64),
+            OpRef::ConstFloatInline(v) => (2u8, v.to_bits()),
+            OpRef::ConstPtrInline(v) => (3u8, v.0 as u64),
+            _ => (0u8, k.raw() as u64),
+        });
         for key in const_keys {
             if let Some(Value::Ref(gcref)) = self.short_box_const_values.get(&key)
                 && !gcref.is_null()
@@ -2312,6 +2492,13 @@ impl ExportedState {
                 &mut self.rooted_refs,
             );
         }
+
+        let mut rooted_const_ptr_slots = Vec::new();
+        self.walk_const_ptr_refs_mut(&mut |slot| {
+            let ss_idx = majit_gc::shadow_stack::push(*slot);
+            rooted_const_ptr_slots.push(ss_idx);
+        });
+        self.rooted_const_ptr_slots = rooted_const_ptr_slots;
     }
 
     /// Update GcRef values from shadow stack — GC may have moved objects.
@@ -2333,7 +2520,7 @@ impl ExportedState {
     /// single canonical `Rc` into every slot of each group so the
     /// post-refresh tree preserves the pre-GC aliasing.
     pub fn refresh_from_gc(&mut self) {
-        use crate::optimizeopt::info::{OpInfo, PtrInfo};
+        use crate::optimizeopt::info::PtrInfo;
         use crate::optimizeopt::virtualstate::{VirtualStateInfo, VirtualStateInfoNode};
         use std::rc::Rc;
         // virtualstate.py:712 cache parity: snapshot original Rc identities
@@ -2458,13 +2645,27 @@ impl ExportedState {
             // re-derived against the canonical state graph.
             self.virtual_state.enum_top_level();
         }
+        let rooted_const_ptr_slots = self.rooted_const_ptr_slots.clone();
+        let mut root_idx = 0usize;
+        self.walk_const_ptr_refs_mut(&mut |slot| {
+            if let Some(&ss_idx) = rooted_const_ptr_slots.get(root_idx) {
+                *slot = majit_gc::shadow_stack::get(ss_idx);
+            }
+            root_idx = root_idx.saturating_add(1);
+        });
+        debug_assert_eq!(
+            root_idx,
+            rooted_const_ptr_slots.len(),
+            "ExportedState ConstPtr root walk changed between root_all_gcrefs and refresh_from_gc"
+        );
     }
 
     /// Release shadow stack roots.
     fn release_roots(&mut self) {
-        if !self.rooted_refs.is_empty() {
+        if !self.rooted_refs.is_empty() || !self.rooted_const_ptr_slots.is_empty() {
             majit_gc::shadow_stack::pop_to(self.shadow_stack_base);
             self.rooted_refs.clear();
+            self.rooted_const_ptr_slots.clear();
         }
     }
 
@@ -2500,6 +2701,7 @@ impl Clone for ExportedState {
             partial_trace_inputargs: self.partial_trace_inputargs.clone(),
             partial_trace_operations: self.partial_trace_operations.clone(),
             rooted_refs: Vec::new(),
+            rooted_const_ptr_slots: Vec::new(),
             shadow_stack_base: majit_gc::shadow_stack::depth(),
         }
     }
@@ -3379,34 +3581,18 @@ impl OptUnroll {
                             ctx,
                         );
                         if let Some(builder) = ctx.take_active_short_preamble_producer() {
-                            // history.py:220/261/307: `Const` carries both
-                            // type and value intrinsically. Pyre's typed
-                            // `majit_ir::Const` enum unifies the legacy
-                            // `(loop_constants, loop_constant_types)`
-                            // parallel maps into a single
-                            // `VecAssoc<u32, Const>`; the type tag rides on
-                            // the `Const` arm so no companion `Type` map is
-                            // needed.
-                            let mut loop_constants: crate::optimizeopt::vec_assoc::VecAssoc<
-                                u32,
-                                majit_ir::Const,
-                            > = crate::optimizeopt::vec_assoc::VecAssoc::new();
-                            for (const_idx, val) in ctx.const_pool.iter() {
-                                let c = val.to_const();
-                                let opref = OpRef::const_typed(const_idx, c.get_type());
-                                loop_constants.insert(opref.raw(), c);
-                            }
-                            // RPython's Const objects survive across compilations
-                            // via GC tracing. In majit, we must carry forward
-                            // constants from the previous build that may not
-                            // exist in the current Phase 2 context.
-                            for (&k, &c) in &sp.constants {
-                                if !loop_constants.contains_key(&k) {
-                                    loop_constants.insert(k, c);
-                                }
-                            }
+                            // history.py:227/268/314 — `Const{Int,Float,Ptr}.value`
+                            // rides inline on the OpRef. Production no longer
+                            // seeds `ctx.const_pool` (Slice 6 retirement;
+                            // `merge_backend_constants_from_ctx` asserts the
+                            // pool is empty at export), so the cross-compile
+                            // `loop_constants` snapshot is no longer built:
+                            // short-preamble ops embed the Const value
+                            // directly in `op.args`, mirroring RPython's
+                            // `shortpreamble.py` which has no parallel side
+                            // table.
                             target_token.short_preamble =
-                                Some(builder.build_short_preamble_struct(&loop_constants));
+                                Some(builder.build_short_preamble_struct());
                             target_token.short_preamble_producer = Some(builder);
                         }
                     } else {
@@ -3460,47 +3646,24 @@ impl OptUnroll {
         optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
         ctx: &mut OptContext,
     ) -> Vec<OpRef> {
-        // RPython parity: in RPython, short preamble ops embed Const objects
-        // (ConstPtr/ConstInt) that carry their own value and are GC-tracked.
-        // _map_args skips Const args — they're always valid because the GC
-        // keeps referenced objects alive via JitCellToken → TargetToken →
-        // short_preamble → ResOperation → ConstPtr chain.
-        //
-        // In pyre, short preamble ops use OpRef indices from the loop's
-        // constant pool. These OpRefs aren't in the bridge's context.
-        // Register them as constants in the bridge's OptContext so the ops
-        // can reference them correctly.
-        for (&idx, &c) in &short_preamble.constants {
-            let tp = c.get_type();
-            let value = c.to_value();
-            // history.py:220/261/307: ConstInt/ConstFloat/ConstPtr are
-            // disjoint Box subclasses pinned to `box.type` at construction.
-            // Mint the typed `OpRef::const_*` variant so the imported
-            // preamble const slot collides with the bridge's intra-pool
-            // dedup (`get_or_insert_typed` returns the same typed OpRef
-            // when value+type match) under variant-aware OpRef Eq
-            // (resoperation.rs:290).
-            let typed_opref = match tp {
-                majit_ir::Type::Int | majit_ir::Type::Void => majit_ir::OpRef::const_int(idx),
-                majit_ir::Type::Ref => majit_ir::OpRef::const_ptr(idx),
-                majit_ir::Type::Float => majit_ir::OpRef::const_float(idx),
-            };
-            ctx.make_constant(typed_opref, value);
-            // `make_constant` early-returns on const-namespace OpRefs
-            // (history.py:208 — Const.is_constant() == True), so
-            // const_pool registration is the explicit seed below.
-            // history.py:220/261/307 — `Const.type` is intrinsic on the
-            // Box itself, so no parallel raw-u32 type side-table is
-            // needed (callers recover the type via `OpRef::ty()` or
-            // `Const::get_type()`).
-            //
-            // `short_preamble.constants` is keyed by `arg.raw()` (CONST_BIT
-            // set); `OptContext.const_pool` is Vec-backed dense-indexed by
-            // `OpRef::const_index()` (CONST_BIT masked). Use the masked
-            // index to avoid resizing the Vec to ~2 GiB slots.
-            ctx.const_pool
-                .entry_or_insert_with(typed_opref.const_index(), || value);
-        }
+        // history.py:227/268/314 — `Const{Int,Float,Ptr}.value` is inline on
+        // the OpRef. All production short-preamble capture sites early-return
+        // on inline-Const (shortpreamble.rs:1897 `capture_const`), so
+        // `short_preamble.constants` is empty along every production export
+        // and the bridge has no legacy idx-Const to replay through
+        // `ctx.const_pool`. The export-side invariant at
+        // `optimizer::merge_backend_constants_from_ctx` asserts the same
+        // pool-empty contract; mirror it at the producer entry so any
+        // re-introduction of legacy idx-Const seeding fails loudly here
+        // rather than silently leaking into a backend that no longer
+        // consumes `ctx.const_pool`.
+        debug_assert!(
+            short_preamble.constants.is_empty(),
+            "inline_short_preamble: short_preamble.constants must be empty in production — \
+             history.py:227/268/314 inline-Const is the single source of truth; \
+             a non-empty entry indicates a stale legacy producer that would never reach \
+             the backend (merge_backend_constants_from_ctx no longer exports ctx.const_pool)"
+        );
 
         let mut mapping: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef> =
             crate::optimizeopt::vec_assoc::VecAssoc::new();
@@ -3669,12 +3832,10 @@ impl OptUnroll {
                             .rd_resume_position
                             .set(patch.rd_resume_position.get());
                     }
-                    // Re-register guard constant args from preamble's constant pool.
-                    for &arg in new_op.getarglist().iter() {
-                        if let Some(&c) = short_preamble.constants.get(&arg.raw()) {
-                            ctx.make_constant(arg, c.to_value());
-                        }
-                    }
+                    // history.py:227/268/314 — Const values ride inline
+                    // on the OpRef (ConstIntInline/ConstFloatInline/
+                    // ConstPtrInline). No pool replay needed.
+                    debug_assert!(short_preamble.constants.is_empty());
                 } else if let Some(fail_args) = new_op.fail_args_mut() {
                     for arg in fail_args.iter_mut() {
                         if let Some(&mapped) = mapping.get(arg) {
@@ -3695,17 +3856,12 @@ impl OptUnroll {
             loop {
                 let short_jump_args = current_short_jump_args(short_preamble, ctx);
                 let num_short_jump_args = short_jump_args.len();
-                // unroll.py:420: _map_args(mapping, short_jump_args)
-                // Const passes through, non-Const requires mapping.
+                // unroll.py:364 `_map_args(mapping, args)`: Const passes
+                // through unchanged, non-Const requires mapping.
                 let mapped_jump_args: Vec<OpRef> = short_jump_args
                     .iter()
                     .map(|jump_arg| {
-                        let mapped = if short_preamble
-                            .constants
-                            .iter()
-                            .any(|(k, _)| *k == jump_arg.raw())
-                            || jump_arg.is_constant()
-                        {
+                        let mapped = if jump_arg.is_constant() {
                             *jump_arg
                         } else {
                             *mapping.get(jump_arg).expect("mapping missing jump_arg")
@@ -4748,7 +4904,13 @@ fn assemble_peeled_trace_with_jump_args(
                     .copied()
                     .chain(later_op.getfailargs().into_iter().flatten())
                 {
+                    // unroll.py:364 `_map_args` passes Const through unchanged
+                    // — inline-Const args (history.py:227/268/314) carry their
+                    // value on the OpRef itself, so they are never label-args.
+                    // `arg.is_constant()` short-circuits before `.raw()` (which
+                    // panics on inline-Const variants).
                     if arg.is_none()
+                        || arg.is_constant()
                         || constants.contains_key(&arg.raw())
                         || label_arg_set.contains(&arg)
                         || extra_inner_set.contains(&arg)
@@ -4819,6 +4981,13 @@ fn assemble_peeled_trace_with_jump_args(
                 .iter()
                 .map(|&arg| {
                     if jump_to_self {
+                        return arg;
+                    }
+                    // unroll.py:364 `_map_args` passes Const through unchanged.
+                    // Inline-Const variants (history.py:227/268/314) panic on
+                    // `.raw()`; the inline payload IS the value and has no
+                    // positional remap target.
+                    if arg.is_constant() {
                         return arg;
                     }
                     let i = arg.raw() as usize;
@@ -4894,7 +5063,12 @@ fn assemble_peeled_trace_with_jump_args(
                 .copied()
                 .chain(new_op.getfailargs().into_iter().flatten())
             {
+                // unroll.py:364 `_map_args` passes Const through; inline-Const
+                // (history.py:227/268/314) carries its value on the OpRef and
+                // is never an inner-label-extension candidate. Short-circuit
+                // before `.raw()` (panics on inline-Const variants).
                 if arg.is_none()
+                    || arg.is_constant()
                     || constants.contains_key(&arg.raw())
                     || defs_since_inner_label.contains(&arg)
                     || label_args.contains(&arg)
@@ -5286,7 +5460,7 @@ mod tests {
     fn test_exported_state_high_water_covers_retrace_namespace() {
         let exported = ExportedState::new(
             vec![OpRef::int_op(52)],
-            vec![OpRef::int_op(109), OpRef::const_int(3)],
+            vec![OpRef::int_op(109), OpRef::const_int_inline(3)],
             crate::optimizeopt::virtualstate::VirtualState::new(Vec::new()),
             crate::optimizeopt::vec_assoc::VecAssoc::new(),
             Vec::new(),
@@ -5468,6 +5642,112 @@ mod tests {
         ];
 
         assert_eq!(pick_virtual_state(&my_vs, &target_states), Some(0));
+    }
+
+    #[test]
+    fn test_exported_state_walks_inline_const_ptr_slots() {
+        use crate::optimizeopt::info::{OpInfo, PtrInfo};
+        use crate::optimizeopt::shortpreamble::{
+            PreambleOp, PreambleOpKind, ProducedShortOp, ShortPreamble, ShortPreambleOp,
+        };
+        use crate::optimizeopt::virtualstate::{VirtualState, VirtualStateInfo};
+
+        let old = GcRef(0x1111_0000);
+        let new = GcRef(0x2222_0000);
+        let old_ref = OpRef::const_ptr_inline(old);
+        let new_ref = OpRef::const_ptr_inline(new);
+        let mut exported_infos = crate::optimizeopt::vec_assoc::VecAssoc::new();
+        exported_infos.insert(old_ref, OpInfo::ptr(PtrInfo::Constant(old)));
+        let mut short_box_const_values = crate::optimizeopt::vec_assoc::VecAssoc::new();
+        short_box_const_values.insert(old_ref, Value::Ref(old));
+        let mut constants = crate::optimizeopt::vec_assoc::VecAssoc::new();
+        constants.insert(0, majit_ir::Const::Ref(old));
+
+        let mut state = ExportedState::new(
+            vec![old_ref],
+            vec![old_ref],
+            VirtualState::new(vec![VirtualStateInfo::Constant(Value::Ref(old))]),
+            exported_infos,
+            vec![PreambleOp {
+                op: Op::new(OpCode::SameAsR, &[old_ref]),
+                kind: PreambleOpKind::Pure,
+                label_arg_idx: None,
+                invented_name: false,
+                same_as_source: Some(old_ref),
+            }],
+            vec![old_ref],
+            vec![Type::Ref],
+            vec![old_ref],
+        );
+        state.short_boxes.push((
+            old_ref,
+            ProducedShortOp {
+                kind: PreambleOpKind::Pure,
+                preamble_op: Op::new(OpCode::SameAsR, &[old_ref]),
+                invented_name: false,
+                same_as_source: Some(old_ref),
+            },
+        ));
+        state.short_box_const_values = short_box_const_values;
+        state.short_preamble = Some(ShortPreamble {
+            ops: vec![ShortPreambleOp {
+                op: Op::new(OpCode::GuardNonnull, &[old_ref]),
+                arg_mapping: Vec::new(),
+                fail_arg_mapping: Vec::new(),
+            }],
+            inputargs: vec![old_ref],
+            used_boxes: vec![old_ref],
+            jump_args: vec![old_ref],
+            exported_state: Some(VirtualState::new(vec![VirtualStateInfo::KnownClass {
+                class_ptr: old,
+            }])),
+            constants,
+            inputarg_infos: vec![Some(PtrInfo::Constant(old))],
+            phase1_inputargs: Some(vec![old_ref]),
+        });
+        state.runtime_boxes.push(old_ref);
+        state.patchguardop = Some(Op::new(OpCode::GuardNonnull, &[old_ref]));
+
+        state.walk_const_ptr_refs_mut(&mut |slot| {
+            if *slot == old {
+                *slot = new;
+            }
+        });
+
+        assert_eq!(state.end_args[0], new_ref);
+        assert_eq!(state.next_iteration_args[0], new_ref);
+        assert_eq!(state.renamed_inputargs[0], new_ref);
+        assert_eq!(state.short_inputargs[0], new_ref);
+        assert_eq!(state.runtime_boxes[0], new_ref);
+        assert!(state.exported_infos.get(&new_ref).is_some());
+        assert_eq!(state.exported_short_boxes[0].op.arg(0), new_ref);
+        assert_eq!(state.exported_short_boxes[0].same_as_source, Some(new_ref));
+        let produced = state
+            .short_boxes
+            .iter()
+            .find_map(|(key, produced)| (*key == new_ref).then_some(produced))
+            .expect("short_boxes key must be forwarded");
+        assert_eq!(produced.preamble_op.arg(0), new_ref);
+        assert_eq!(produced.same_as_source, Some(new_ref));
+        assert_eq!(
+            state.short_box_const_values.get(&new_ref),
+            Some(&Value::Ref(new))
+        );
+        assert_eq!(
+            state.patchguardop.as_ref().map(|op| op.arg(0)),
+            Some(new_ref)
+        );
+        match &state.virtual_state.state[0].info {
+            VirtualStateInfo::Constant(Value::Ref(gcref)) => assert_eq!(*gcref, new),
+            other => panic!("unexpected virtual state after walk: {other:?}"),
+        }
+        let short = state.short_preamble.as_ref().unwrap();
+        assert_eq!(short.ops[0].op.arg(0), new_ref);
+        assert_eq!(short.inputargs[0], new_ref);
+        assert_eq!(short.used_boxes[0], new_ref);
+        assert_eq!(short.jump_args[0], new_ref);
+        assert_eq!(short.phase1_inputargs.as_ref().unwrap()[0], new_ref);
+        assert_eq!(short.constants.get(&0), Some(&majit_ir::Const::Ref(new)));
     }
 
     #[test]
@@ -6038,10 +6318,10 @@ mod tests {
         let mut ctx = crate::optimizeopt::OptContext::with_num_inputs(8, 0);
         let ptr = GcRef(0x1234_5678);
         let field_descr = majit_ir::descr::make_field_descr_full(88, 0, 8, Type::Int, false);
-        // history.py:307 ConstPtr `type = 'r'`: a Ref-typed constant
-        // must use the const_ptr factory; const_int aliases ConstInt and
-        // breaks the Box class identity invariant under variant-aware
-        // OpRef Eq/Hash.
+        // legacy-const-ok: exercises the legacy idx-Const → inline-Const
+        // conversion at the import boundary. Producer-side `const_ptr(23)`
+        // is the legacy ConstantPool key; consumer-side reads the inline
+        // variant that carries the value directly (history.py:314).
         ctx.seed_constant(OpRef::const_ptr(23), Value::Ref(ptr));
         ctx.exported_short_boxes
             .push(crate::optimizeopt::shortpreamble::PreambleOp {
@@ -6074,22 +6354,14 @@ mod tests {
         let label_args = import_state(&targetargs, &exported, &mut optimizer, &mut ctx2);
         import_short_preamble_state(&targetargs, &label_args, &exported, &mut ctx2);
         assert_eq!(label_args, vec![OpRef::int_op(12), OpRef::int_op(11)]);
-        // unroll.py:454: the imported constant must land in a fresh
-        // const-pool slot in the consumer trace, not reuse the producer
-        // trace's slot index — majit OpRef is a trace-local index, not
-        // a Python identity. The fresh slot is the first one allocated
-        // by `reserve_const_ref` in ctx2.
-        let fresh_const = OpRef::const_ptr(0);
-        assert_eq!(
-            ctx2.get_box_replacement_box(fresh_const)
-                .and_then(|cb| cb.const_value()),
-            Some(Value::Ref(ptr))
-        );
-        assert_eq!(
-            ctx2.get_box_replacement_box(OpRef::const_ptr(23))
-                .and_then(|cb| cb.const_value()),
-            None
-        );
+        // history.py:314 ConstPtr.value inline: the imported constant
+        // lands at `OpRef::ConstPtrInline(ptr)` directly. The legacy
+        // producer-side `OpRef::const_ptr(23)` is the import source key,
+        // not a consumer-side slot; ctx2 was never seeded with idx 23 so
+        // `get_constant(legacy idx 23)` remains None.
+        let fresh_const = OpRef::const_ptr_inline(ptr);
+        assert_eq!(ctx2.get_constant(fresh_const), Some(Value::Ref(ptr)));
+        assert_eq!(ctx2.get_constant(OpRef::const_ptr(23)), None);
         assert_eq!(
             ctx2.imported_short_pure_ops,
             vec![crate::optimizeopt::ImportedShortPureOp::new(
@@ -6110,6 +6382,10 @@ mod tests {
     fn test_import_short_loopinvariant_uses_producer_const_snapshot() {
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
         let mut ctx = crate::optimizeopt::OptContext::with_num_inputs(8, 0);
+        // legacy-const-ok: exercises legacy idx-Const → inline-Const
+        // conversion at the import boundary. Producer-side `const_int(7)`
+        // is the legacy ConstantPool key; consumer reads the inline
+        // variant (history.py:227).
         let func = OpRef::const_int(7);
         let func_ptr = 0xCAFE;
         ctx.seed_constant(func, Value::Int(func_ptr));
@@ -6148,20 +6424,24 @@ mod tests {
                 .map(|(_, v)| *v),
             Some(OpRef::int_op(11))
         );
+        // The producer-side `func` was a legacy `OpRef::const_int(7)`;
+        // ctx2 was never seeded with idx 7, so it remains None.
+        assert_eq!(ctx2.get_constant(func), None);
+        // history.py:227 ConstInt.value inline — the imported func
+        // address lands at `OpRef::ConstIntInline(func_ptr)`, which
+        // carries the value directly.
         assert_eq!(
-            ctx2.get_box_replacement_box(func)
-                .and_then(|cb| cb.const_value()),
-            None
-        );
-        assert_eq!(
-            ctx2.get_box_replacement_box(OpRef::const_int(0))
-                .and_then(|cb| cb.const_value()),
+            ctx2.get_constant(OpRef::const_int_inline(func_ptr)),
             Some(Value::Int(func_ptr))
         );
     }
 
     #[test]
     fn test_import_short_loopinvariant_result_uses_short_inputarg_slot() {
+        // legacy-const-ok: exercises legacy idx-Const seeded into producer
+        // ctx (the import path reads the inline variant on the consumer
+        // side; this test asserts the source-side mapping survives the
+        // round-trip).
         let func = OpRef::const_int(7);
         let func_ptr = 0xBEEF;
         let source = OpRef::int_op(11);
@@ -6484,21 +6764,25 @@ mod tests {
         }];
         let p2_ops = vec![
             {
-                let mut op = Op::new(OpCode::IntGe, &[OpRef::int_op(11), OpRef::const_int(0)]);
+                let mut op = Op::new(
+                    OpCode::IntGe,
+                    &[OpRef::int_op(11), OpRef::const_int_inline(2)],
+                );
                 op.pos.set(OpRef::int_op(4));
                 op
             },
             {
-                let mut op = Op::new(OpCode::IntAdd, &[OpRef::int_op(11), OpRef::const_int(1)]);
+                let mut op = Op::new(
+                    OpCode::IntAdd,
+                    &[OpRef::int_op(11), OpRef::const_int_inline(1)],
+                );
                 op.pos.set(OpRef::int_op(11));
                 op
             },
             Op::new(OpCode::Jump, &[OpRef::int_op(11)]),
         ];
 
-        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
-        constants.insert(OpRef::const_int(0).raw(), majit_ir::Value::Int(2));
-        constants.insert(OpRef::const_int(1).raw(), majit_ir::Value::Int(1));
+        let constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
 
         let combined = assemble_peeled_trace(
             &p1_ops,
@@ -6552,15 +6836,17 @@ mod tests {
                 op
             },
             {
-                let mut op = Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::const_int(1)]);
+                let mut op = Op::new(
+                    OpCode::IntAdd,
+                    &[OpRef::int_op(0), OpRef::const_int_inline(1)],
+                );
                 op.pos.set(OpRef::int_op(19));
                 op
             },
             Op::new(OpCode::Jump, &[OpRef::int_op(19)]),
         ];
 
-        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
-        constants.insert(OpRef::const_int(1).raw(), majit_ir::Value::Int(1));
+        let constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
 
         let combined = assemble_peeled_trace(
             &p1_ops,
@@ -6637,7 +6923,11 @@ mod tests {
     }
 
     #[test]
-    fn test_assemble_peeled_trace_keeps_used_box_with_stale_constant_entry() {
+    fn test_assemble_peeled_trace_keeps_used_box_with_inline_constant_operand() {
+        // assemble_peeled_trace must preserve an inline-Const operand
+        // (history.py:227 `ConstInt.value`) untouched as the GuardValue
+        // immediate, and the box-namespace entries in the constants
+        // snapshot must round-trip unchanged.
         let p1_ops = vec![{
             let mut op = Op::new(OpCode::SameAsI, &[OpRef::int_op(37)]);
             op.pos.set(OpRef::void_op(857));
@@ -6647,7 +6937,7 @@ mod tests {
             {
                 let mut op = Op::new(
                     OpCode::GuardValue,
-                    &[OpRef::void_op(857), OpRef::const_int(0)],
+                    &[OpRef::void_op(857), OpRef::const_int_inline(2)],
                 );
                 op.setfailargs(vec![OpRef::void_op(857)].into());
                 op
@@ -6662,10 +6952,8 @@ mod tests {
                 ],
             ),
         ];
-        let constants = majit_ir::VecAssoc::from([
-            (OpRef::void_op(857).raw(), majit_ir::Value::Int(2)),
-            (OpRef::const_int(0).raw(), majit_ir::Value::Int(2)),
-        ]);
+        let constants =
+            majit_ir::VecAssoc::from([(OpRef::void_op(857).raw(), majit_ir::Value::Int(2))]);
 
         let mut ctx = assemble_test_context(&p1_ops, &p2_ops, 1);
         let combined = assemble_peeled_trace_with_jump_args(
@@ -6699,7 +6987,7 @@ mod tests {
         assert_eq!(combined[2].opcode, OpCode::GuardValue);
         assert_eq!(
             &*combined[2].getarglist(),
-            &[OpRef::void_op(857), OpRef::const_int(0)]
+            &[OpRef::void_op(857), OpRef::const_int_inline(2)]
         );
         assert_eq!(combined[3].opcode, OpCode::Jump);
         assert_eq!(
@@ -6777,14 +7065,16 @@ mod tests {
                 op
             },
             {
-                let mut op = Op::new(OpCode::IntAdd, &[OpRef::int_op(10), OpRef::const_int(0)]);
+                let mut op = Op::new(
+                    OpCode::IntAdd,
+                    &[OpRef::int_op(10), OpRef::const_int_inline(1)],
+                );
                 op.pos.set(OpRef::int_op(64));
                 op
             },
             Op::new(OpCode::Jump, &[OpRef::int_op(64)]),
         ];
-        let constants =
-            majit_ir::VecAssoc::from([(OpRef::const_int(0).raw(), majit_ir::Value::Int(1))]);
+        let constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
 
         let combined = assemble_peeled_trace(
             &[],
@@ -6920,7 +7210,10 @@ mod tests {
         let loop_descr = TargetToken::new_loop(1).as_jump_target_descr();
         let p2_ops = vec![
             {
-                let mut op = Op::new(OpCode::IntAdd, &[OpRef::int_op(10), OpRef::const_int(0)]);
+                let mut op = Op::new(
+                    OpCode::IntAdd,
+                    &[OpRef::int_op(10), OpRef::const_int_inline(1)],
+                );
                 op.pos.set(OpRef::int_op(20));
                 op
             },
@@ -6933,8 +7226,7 @@ mod tests {
                 jump
             },
         ];
-        let constants =
-            majit_ir::VecAssoc::from([(OpRef::const_int(0).raw(), majit_ir::Value::Int(1))]);
+        let constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
 
         let combined = assemble_peeled_trace(
             &[],
@@ -7017,9 +7309,9 @@ mod tests {
         // literal Const entries (their value is emitted inline at use
         // sites). Mirrors `assemble_peeled_trace_with_jump_args`'s
         // `label_arg.is_constant()` predicate.
-        let const_extra = OpRef::const_int(7);
+        let const_extra = OpRef::const_int_inline(606);
         let p2_ops = vec![Op::new(OpCode::Jump, &[OpRef::int_op(10)])];
-        let constants = majit_ir::VecAssoc::from([(const_extra.raw(), majit_ir::Value::Int(606))]);
+        let constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
 
         let combined = assemble_peeled_trace(
             &[],
@@ -7050,11 +7342,13 @@ mod tests {
         // The assembler is therefore a passthrough for inputarg references
         // — no source_slot input_remap needed. This test verifies that
         // pre-resolved body args survive intact.
-        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
-        constants.insert(OpRef::const_int(0).raw(), majit_ir::Value::Int(1));
+        let constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         let p2_ops = vec![
             {
-                let mut op = Op::new(OpCode::IntAdd, &[OpRef::int_op(200), OpRef::const_int(0)]);
+                let mut op = Op::new(
+                    OpCode::IntAdd,
+                    &[OpRef::int_op(200), OpRef::const_int_inline(1)],
+                );
                 op.pos.set(OpRef::int_op(20));
                 op
             },

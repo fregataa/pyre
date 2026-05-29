@@ -2,7 +2,6 @@
 //!
 //! These tests exercise the full majit pipeline from end to end.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use majit_backend::{
@@ -10,8 +9,7 @@ use majit_backend::{
 };
 use majit_backend_cranelift::{CraneliftBackend, force_token_to_dead_frame, jit_exc_raise};
 use majit_ir::{
-    ArrayDescr, Descr, DescrRef, FailDescr, FieldDescr, GcRef, InputArg, Op, OpCode, OpRc, OpRef,
-    Type, Value,
+    ArrayDescr, Descr, DescrRef, FieldDescr, GcRef, InputArg, Op, OpCode, OpRef, Type, Value,
 };
 use majit_metainterp::history::TreeLoop;
 use majit_metainterp::recorder::Trace;
@@ -84,16 +82,13 @@ fn test_simple_arithmetic() {
     let mut rec = Trace::new();
     let i0 = rec.record_input_arg(Type::Int);
 
-    let const_one = OpRef::const_int(0);
+    let const_one = OpRef::const_int_inline(1);
     let result = rec.record_op(OpCode::IntAdd, &[i0, const_one]);
     rec.finish(&[result], make_descr(0));
     let trace = rec.get_trace();
 
     // Compile directly without optimizer (RPython test_compile_linear_loop parity)
     let mut backend = CraneliftBackend::new();
-    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
-    constants.insert(OpRef::const_int(0).raw(), 1i64);
-    backend.set_constants(constants);
 
     let mut token = JitCellToken::new(0);
     backend
@@ -119,8 +114,8 @@ fn test_sum_loop() {
     let i = rec.record_input_arg(Type::Int);
     let sum = rec.record_input_arg(Type::Int);
 
-    let const_one = OpRef::const_int(0);
-    let const_zero = OpRef::const_int(1);
+    let const_one = OpRef::const_int_inline(1);
+    let const_zero = OpRef::const_int_inline(0);
 
     let sum2 = rec.record_op(OpCode::IntAdd, &[sum, i]);
     let i2 = rec.record_op(OpCode::IntSub, &[i, const_one]);
@@ -133,10 +128,6 @@ fn test_sum_loop() {
 
     // Compile
     let mut backend = CraneliftBackend::new();
-    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
-    constants.insert(OpRef::const_int(0).raw(), 1i64);
-    constants.insert(OpRef::const_int(1).raw(), 0i64);
-    backend.set_constants(constants);
 
     let mut token = JitCellToken::new(1);
     backend
@@ -198,8 +189,8 @@ fn test_guard_failure_path() {
     let mut rec = Trace::new();
     let x = rec.record_input_arg(Type::Int);
 
-    let const_zero = OpRef::const_int(0);
-    let const_two = OpRef::const_int(1);
+    let const_zero = OpRef::const_int_inline(0);
+    let const_two = OpRef::const_int_inline(2);
 
     let cmp = rec.record_op(OpCode::IntGt, &[x, const_zero]);
     rec.record_guard(OpCode::GuardTrue, &[cmp], Some(make_descr(0)));
@@ -211,10 +202,6 @@ fn test_guard_failure_path() {
 
     // Compile
     let mut backend = CraneliftBackend::new();
-    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
-    constants.insert(OpRef::const_int(0).raw(), 0i64);
-    constants.insert(OpRef::const_int(1).raw(), 2i64);
-    backend.set_constants(constants);
 
     let mut token = JitCellToken::new(3);
     backend
@@ -261,8 +248,8 @@ fn test_bridge_end_to_end() {
     let i = rec.record_input_arg(Type::Int);
     let sum = rec.record_input_arg(Type::Int);
 
-    let const_one = OpRef::const_int(0);
-    let const_zero = OpRef::const_int(1);
+    let const_one = OpRef::const_int_inline(1);
+    let const_zero = OpRef::const_int_inline(0);
 
     let sum2 = rec.record_op(OpCode::IntAdd, &[sum, i]);
     let i2 = rec.record_op(OpCode::IntSub, &[i, const_one]);
@@ -275,10 +262,6 @@ fn test_bridge_end_to_end() {
 
     // Compile main loop
     let mut backend = CraneliftBackend::new();
-    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
-    constants.insert(OpRef::const_int(0).raw(), 1i64);
-    constants.insert(OpRef::const_int(1).raw(), 0i64);
-    backend.set_constants(constants);
 
     // Pin the loop trace id to match the test's TestFailDescr defaults
     // (`trace_id() == 0`).  In production, metainterp's
@@ -307,12 +290,13 @@ fn test_bridge_end_to_end() {
     //   iter5: i=1,sum=14 -> sum2=15, i2=0, fail
     // Guard saves input args (i=1, sum=14)
     let frame = backend.execute_token(&token, &[Value::Int(5), Value::Int(0)]);
-    let descr = backend.get_latest_descr(&frame);
-    assert_eq!(descr.fail_index(), 0);
+    let (source_trace_id, source_fail_index_per_trace) = {
+        let descr = backend.get_latest_descr(&frame);
+        assert_eq!(descr.fail_index(), 0);
+        (descr.trace_id(), descr.fail_index_per_trace())
+    };
     assert_eq!(backend.get_int_value(&frame, 0), 1); // i
     assert_eq!(backend.get_int_value(&frame, 1), 14); // sum
-    let source_trace_id = descr.trace_id();
-    let source_fail_index_per_trace = descr.fail_index_per_trace();
 
     // Now compile a bridge for the guard failure.
     // Bridge takes (i, sum) and returns sum * 2.
@@ -321,39 +305,28 @@ fn test_bridge_end_to_end() {
     let bsum = bridge_rec.record_input_arg(Type::Int);
     let _ = bi; // bridge ignores i
 
-    let bridge_const_two = OpRef::const_int(0);
+    let bridge_const_two = OpRef::const_int_inline(2);
     let result = bridge_rec.record_op(OpCode::IntMul, &[bsum, bridge_const_two]);
     bridge_rec.finish(&[result], make_descr(1));
     let bridge_trace = bridge_rec.get_trace();
 
-    let mut bridge_constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
-    bridge_constants.insert(OpRef::const_int(0).raw(), 2i64);
-    backend.set_constants(bridge_constants);
-
-    // Build a metainterp `ResumeGuardDescr` that mirrors the source
-    // guard's identity for the bridge-compile lookup.
-    // No per-emission backend wrapper exists anymore; `compile_bridge`
-    // takes a `&dyn FailDescr` and `ResumeGuardDescr` is the
-    // metainterp class that implements it (`compile.py:840-843`).
-    let bridge_fail_descr_arc: DescrRef =
+    // Mint a `ResumeGuardDescr` that mirrors the source guard's identity
+    // (`CraneliftFailDescr` was retired in Slice 7-Tβ14f; bridge-compile
+    // lookup now uses `FailDescr::{trace_id, fail_index_per_trace}`
+    // directly off the descr the metainterp passes in —
+    // `pyjitpl/mod.rs:9040`).
+    let bridge_fail_descr =
         majit_backend::make_resume_guard_descr_typed(vec![Type::Int, Type::Int]);
     {
-        let fd = bridge_fail_descr_arc
-            .as_fail_descr()
-            .expect("ResumeGuardDescr implements FailDescr");
+        let fd = bridge_fail_descr.as_fail_descr().unwrap();
         fd.set_trace_id(source_trace_id);
-        // `compile.rs:449` parity: the bridge descr's per-trace fail
-        // index identifies which source guard inside the trace this
-        // bridge attaches to.  Without stamping it here a multi-guard
-        // trace bridge lookup that accidentally matches on trace_id
-        // alone would still pass the test.
         fd.set_fail_index_per_trace(source_fail_index_per_trace);
     }
-    let bridge_fail_descr = bridge_fail_descr_arc.as_fail_descr().unwrap();
+    let bridge_fail_descr_ref = bridge_fail_descr.as_fail_descr().unwrap();
 
     let bridge_info = backend
         .compile_bridge(
-            bridge_fail_descr,
+            bridge_fail_descr_ref,
             &inputargs_view(&bridge_trace),
             &bridge_trace.ops,
             &token,
@@ -412,9 +385,9 @@ fn build_magic_div_trace(m: i64, token_id: u64) -> (CraneliftBackend, JitCellTok
     let mut rec = Trace::new();
     let x = rec.record_input_arg(Type::Int);
 
-    let const_k = OpRef::const_int(0);
-    let const_i = OpRef::const_int(1);
-    let const_63 = OpRef::const_int(2);
+    let const_k = OpRef::const_int_inline(k as i64);
+    let const_i = OpRef::const_int_inline(i as i64);
+    let const_63 = OpRef::const_int_inline(63);
 
     // t = x >> 63
     let t = rec.record_op(OpCode::IntRshift, &[x, const_63]);
@@ -429,13 +402,7 @@ fn build_magic_div_trace(m: i64, token_id: u64) -> (CraneliftBackend, JitCellTok
     rec.finish(&[result], make_descr(0));
     let trace = rec.get_trace();
 
-    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
-    constants.insert(OpRef::const_int(0).raw(), k as i64);
-    constants.insert(OpRef::const_int(1).raw(), i as i64);
-    constants.insert(OpRef::const_int(2).raw(), 63i64);
-
     let mut backend = CraneliftBackend::new();
-    backend.set_constants(constants);
 
     let mut token = JitCellToken::new(token_id);
     backend
@@ -452,10 +419,10 @@ fn build_magic_mod_trace(m: i64, token_id: u64) -> (CraneliftBackend, JitCellTok
     let mut rec = Trace::new();
     let x = rec.record_input_arg(Type::Int);
 
-    let const_k = OpRef::const_int(0);
-    let const_i = OpRef::const_int(1);
-    let const_63 = OpRef::const_int(2);
-    let const_m = OpRef::const_int(3);
+    let const_k = OpRef::const_int_inline(k as i64);
+    let const_i = OpRef::const_int_inline(i as i64);
+    let const_63 = OpRef::const_int_inline(63);
+    let const_m = OpRef::const_int_inline(m);
 
     // Division: floor_div(x, m)
     let t = rec.record_op(OpCode::IntRshift, &[x, const_63]);
@@ -469,14 +436,7 @@ fn build_magic_mod_trace(m: i64, token_id: u64) -> (CraneliftBackend, JitCellTok
     rec.finish(&[remainder], make_descr(0));
     let trace = rec.get_trace();
 
-    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
-    constants.insert(OpRef::const_int(0).raw(), k as i64);
-    constants.insert(OpRef::const_int(1).raw(), i as i64);
-    constants.insert(OpRef::const_int(2).raw(), 63i64);
-    constants.insert(OpRef::const_int(3).raw(), m);
-
     let mut backend = CraneliftBackend::new();
-    backend.set_constants(constants);
 
     let mut token = JitCellToken::new(token_id);
     backend
@@ -499,9 +459,9 @@ fn build_power_of_two_div_trace(divisor: i64, token_id: u64) -> (CraneliftBacken
     let mut rec = Trace::new();
     let x = rec.record_input_arg(Type::Int);
 
-    let const_63 = OpRef::const_int(0);
-    let const_mask = OpRef::const_int(1);
-    let const_shift = OpRef::const_int(2);
+    let const_63 = OpRef::const_int_inline(63);
+    let const_mask = OpRef::const_int_inline(divisor - 1);
+    let const_shift = OpRef::const_int_inline(shift as i64);
 
     let sign = rec.record_op(OpCode::IntRshift, &[x, const_63]);
     let correction = rec.record_op(OpCode::IntAnd, &[sign, const_mask]);
@@ -510,13 +470,7 @@ fn build_power_of_two_div_trace(divisor: i64, token_id: u64) -> (CraneliftBacken
     rec.finish(&[result], make_descr(0));
     let trace = rec.get_trace();
 
-    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
-    constants.insert(OpRef::const_int(0).raw(), 63i64);
-    constants.insert(OpRef::const_int(1).raw(), divisor - 1);
-    constants.insert(OpRef::const_int(2).raw(), shift as i64);
-
     let mut backend = CraneliftBackend::new();
-    backend.set_constants(constants);
 
     let mut token = JitCellToken::new(token_id);
     backend
@@ -690,9 +644,9 @@ fn test_vec_int_add_simd() {
     let c = rec.record_input_arg(Type::Int);
     let d = rec.record_input_arg(Type::Int);
 
-    let const_0 = OpRef::const_int(0);
-    let const_1 = OpRef::const_int(1);
-    let const_2 = OpRef::const_int(2);
+    let const_0 = OpRef::const_int_inline(0);
+    let const_1 = OpRef::const_int_inline(1);
+    let const_2 = OpRef::const_int_inline(2);
 
     let vec0 = rec.record_op(OpCode::VecI, &[]);
     let vec1 = rec.record_op(OpCode::VecPackI, &[vec0, a, const_0, const_2]);
@@ -707,11 +661,6 @@ fn test_vec_int_add_simd() {
     let trace = rec.get_trace();
 
     let mut backend = CraneliftBackend::new();
-    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
-    constants.insert(OpRef::const_int(0).raw(), 0i64);
-    constants.insert(OpRef::const_int(1).raw(), 1i64);
-    constants.insert(OpRef::const_int(2).raw(), 2i64);
-    backend.set_constants(constants);
 
     let mut token = JitCellToken::new(300);
     backend
@@ -752,9 +701,9 @@ fn test_vec_int_sub_simd() {
     let c = rec.record_input_arg(Type::Int);
     let d = rec.record_input_arg(Type::Int);
 
-    let const_0 = OpRef::const_int(0);
-    let const_1 = OpRef::const_int(1);
-    let const_2 = OpRef::const_int(2);
+    let const_0 = OpRef::const_int_inline(0);
+    let const_1 = OpRef::const_int_inline(1);
+    let const_2 = OpRef::const_int_inline(2);
 
     let vec0 = rec.record_op(OpCode::VecI, &[]);
     let vec1 = rec.record_op(OpCode::VecPackI, &[vec0, a, const_0, const_2]);
@@ -769,11 +718,6 @@ fn test_vec_int_sub_simd() {
     let trace = rec.get_trace();
 
     let mut backend = CraneliftBackend::new();
-    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
-    constants.insert(OpRef::const_int(0).raw(), 0i64);
-    constants.insert(OpRef::const_int(1).raw(), 1i64);
-    constants.insert(OpRef::const_int(2).raw(), 2i64);
-    backend.set_constants(constants);
 
     let mut token = JitCellToken::new(301);
     backend
@@ -801,9 +745,9 @@ fn test_vec_int_mul_simd() {
     let c = rec.record_input_arg(Type::Int);
     let d = rec.record_input_arg(Type::Int);
 
-    let const_0 = OpRef::const_int(0);
-    let const_1 = OpRef::const_int(1);
-    let const_2 = OpRef::const_int(2);
+    let const_0 = OpRef::const_int_inline(0);
+    let const_1 = OpRef::const_int_inline(1);
+    let const_2 = OpRef::const_int_inline(2);
 
     let vec0 = rec.record_op(OpCode::VecI, &[]);
     let vec1 = rec.record_op(OpCode::VecPackI, &[vec0, a, const_0, const_2]);
@@ -818,11 +762,6 @@ fn test_vec_int_mul_simd() {
     let trace = rec.get_trace();
 
     let mut backend = CraneliftBackend::new();
-    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
-    constants.insert(OpRef::const_int(0).raw(), 0i64);
-    constants.insert(OpRef::const_int(1).raw(), 1i64);
-    constants.insert(OpRef::const_int(2).raw(), 2i64);
-    backend.set_constants(constants);
 
     let mut token = JitCellToken::new(302);
     backend
@@ -856,9 +795,9 @@ fn test_vec_expand_add_simd() {
     let b = rec.record_input_arg(Type::Int);
     let s = rec.record_input_arg(Type::Int);
 
-    let const_0 = OpRef::const_int(0);
-    let const_1 = OpRef::const_int(1);
-    let const_2 = OpRef::const_int(2);
+    let const_0 = OpRef::const_int_inline(0);
+    let const_1 = OpRef::const_int_inline(1);
+    let const_2 = OpRef::const_int_inline(2);
 
     let vec0 = rec.record_op(OpCode::VecI, &[]);
     let vec1 = rec.record_op(OpCode::VecPackI, &[vec0, a, const_0, const_2]);
@@ -871,11 +810,6 @@ fn test_vec_expand_add_simd() {
     let trace = rec.get_trace();
 
     let mut backend = CraneliftBackend::new();
-    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
-    constants.insert(OpRef::const_int(0).raw(), 0i64);
-    constants.insert(OpRef::const_int(1).raw(), 1i64);
-    constants.insert(OpRef::const_int(2).raw(), 2i64);
-    backend.set_constants(constants);
 
     let mut token = JitCellToken::new(303);
     backend
@@ -912,9 +846,9 @@ fn test_vec_float_add_simd() {
     let c = rec.record_input_arg(Type::Int);
     let d = rec.record_input_arg(Type::Int);
 
-    let const_0 = OpRef::const_int(0);
-    let const_1 = OpRef::const_int(1);
-    let const_2 = OpRef::const_int(2);
+    let const_0 = OpRef::const_int_inline(0);
+    let const_1 = OpRef::const_int_inline(1);
+    let const_2 = OpRef::const_int_inline(2);
 
     // Pack f64 bit patterns into I64X2 vectors
     let vec0 = rec.record_op(OpCode::VecI, &[]);
@@ -932,11 +866,6 @@ fn test_vec_float_add_simd() {
     let trace = rec.get_trace();
 
     let mut backend = CraneliftBackend::new();
-    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
-    constants.insert(OpRef::const_int(0).raw(), 0i64);
-    constants.insert(OpRef::const_int(1).raw(), 1i64);
-    constants.insert(OpRef::const_int(2).raw(), 2i64);
-    backend.set_constants(constants);
 
     let mut token = JitCellToken::new(304);
     backend
@@ -987,9 +916,9 @@ fn test_vec_chained_add_mul_simd() {
     let e = rec.record_input_arg(Type::Int);
     let f = rec.record_input_arg(Type::Int);
 
-    let const_0 = OpRef::const_int(0);
-    let const_1 = OpRef::const_int(1);
-    let const_2 = OpRef::const_int(2);
+    let const_0 = OpRef::const_int_inline(0);
+    let const_1 = OpRef::const_int_inline(1);
+    let const_2 = OpRef::const_int_inline(2);
 
     let vec0 = rec.record_op(OpCode::VecI, &[]);
     let vec_a = rec.record_op(OpCode::VecPackI, &[vec0, a, const_0, const_2]);
@@ -1011,11 +940,6 @@ fn test_vec_chained_add_mul_simd() {
     let trace = rec.get_trace();
 
     let mut backend = CraneliftBackend::new();
-    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
-    constants.insert(OpRef::const_int(0).raw(), 0i64);
-    constants.insert(OpRef::const_int(1).raw(), 1i64);
-    constants.insert(OpRef::const_int(2).raw(), 2i64);
-    backend.set_constants(constants);
 
     let mut token = JitCellToken::new(305);
     backend
@@ -1123,7 +1047,7 @@ fn call_descr_can_raise(idx: u32) -> DescrRef {
 }
 
 /// Assign sequential positions to ops starting at `base`.
-fn assign_positions(ops: &mut [OpRc], base: u32) {
+fn assign_positions(ops: &mut [Op], base: u32) {
     for (i, op) in ops.iter_mut().enumerate() {
         let pos = base + i as u32;
         op.pos.set(OpRef::op_typed(pos, op.result_type()));
@@ -1306,15 +1230,12 @@ fn test_threadlocalref_get_basic() {
     let mut rec = Trace::new();
     let _dummy = rec.record_input_arg(Type::Int); // need at least one input
 
-    let const_offset = OpRef::const_int(0); // offset = 0 bytes
+    let const_offset = OpRef::const_int_inline(0); // offset = 0 bytes
     let result = rec.record_op(OpCode::ThreadlocalrefGet, &[const_offset]);
     rec.finish(&[result], make_descr(0));
     let trace = rec.get_trace();
 
     let mut backend = CraneliftBackend::new();
-    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
-    constants.insert(OpRef::const_int(0).raw(), 0i64); // offset 0
-    backend.set_constants(constants);
 
     let mut token = JitCellToken::new(500);
     backend
@@ -1354,8 +1275,8 @@ fn test_threadlocalref_get_multiple_slots() {
     let mut rec = Trace::new();
     let _dummy = rec.record_input_arg(Type::Int);
 
-    let const_off0 = OpRef::const_int(0);
-    let const_off8 = OpRef::const_int(1);
+    let const_off0 = OpRef::const_int_inline(0);
+    let const_off8 = OpRef::const_int_inline(8);
 
     let r0 = rec.record_op(OpCode::ThreadlocalrefGet, &[const_off0]);
     let r1 = rec.record_op(OpCode::ThreadlocalrefGet, &[const_off8]);
@@ -1364,10 +1285,6 @@ fn test_threadlocalref_get_multiple_slots() {
     let trace = rec.get_trace();
 
     let mut backend = CraneliftBackend::new();
-    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
-    constants.insert(OpRef::const_int(0).raw(), 0i64);
-    constants.insert(OpRef::const_int(1).raw(), 8i64);
-    backend.set_constants(constants);
 
     let mut token = JitCellToken::new(501);
     backend
@@ -1398,15 +1315,12 @@ fn test_threadlocalref_set_and_read_roundtrip() {
     let mut rec = Trace::new();
     let _dummy = rec.record_input_arg(Type::Int);
 
-    let const_offset = OpRef::const_int(0);
+    let const_offset = OpRef::const_int_inline(16); // offset 16 -> slot index 2
     let result = rec.record_op(OpCode::ThreadlocalrefGet, &[const_offset]);
     rec.finish(&[result], make_descr(0));
     let trace = rec.get_trace();
 
     let mut backend = CraneliftBackend::new();
-    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
-    constants.insert(OpRef::const_int(0).raw(), 16i64); // offset 16 -> slot index 2
-    backend.set_constants(constants);
 
     let mut token = JitCellToken::new(502);
     backend
@@ -1526,8 +1440,8 @@ fn test_call_release_gil_i_compiles_and_executes() {
     let a = rec.record_input_arg(Type::Int);
     let b = rec.record_input_arg(Type::Int);
 
-    let saveerr = OpRef::const_int(0);
-    let fn_ptr = OpRef::const_int(1);
+    let saveerr = OpRef::const_int_inline(0);
+    let fn_ptr = OpRef::const_int_inline(ffi_add as *const () as usize as i64);
 
     let result = rec.record_op_with_descr(OpCode::CallReleaseGilI, &[saveerr, fn_ptr, a, b], cd);
     rec.record_guard_with_fail_args(
@@ -1540,13 +1454,6 @@ fn test_call_release_gil_i_compiles_and_executes() {
     let trace = rec.get_trace();
 
     let mut backend = CraneliftBackend::new();
-    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
-    constants.insert(OpRef::const_int(0).raw(), 0i64);
-    constants.insert(
-        OpRef::const_int(1).raw(),
-        ffi_add as *const () as usize as i64,
-    );
-    backend.set_constants(constants);
 
     let mut token = JitCellToken::new(600);
     backend
@@ -1578,8 +1485,8 @@ fn test_call_release_gil_i_no_args() {
 
     let mut rec = Trace::new();
     let dummy = rec.record_input_arg(Type::Int); // need at least one input
-    let saveerr = OpRef::const_int(0);
-    let fn_ptr = OpRef::const_int(1);
+    let saveerr = OpRef::const_int_inline(0);
+    let fn_ptr = OpRef::const_int_inline(ffi_constant as *const () as usize as i64);
 
     let result = rec.record_op_with_descr(OpCode::CallReleaseGilI, &[saveerr, fn_ptr], cd);
     rec.record_guard_with_fail_args(
@@ -1592,13 +1499,6 @@ fn test_call_release_gil_i_no_args() {
     let trace = rec.get_trace();
 
     let mut backend = CraneliftBackend::new();
-    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
-    constants.insert(OpRef::const_int(0).raw(), 0i64);
-    constants.insert(
-        OpRef::const_int(1).raw(),
-        ffi_constant as *const () as usize as i64,
-    );
-    backend.set_constants(constants);
 
     let mut token = JitCellToken::new(601);
     backend
@@ -1628,8 +1528,8 @@ fn test_call_release_gil_n_void_return() {
 
     let mut rec = Trace::new();
     let input = rec.record_input_arg(Type::Int);
-    let saveerr = OpRef::const_int(0);
-    let fn_ptr = OpRef::const_int(1);
+    let saveerr = OpRef::const_int_inline(0);
+    let fn_ptr = OpRef::const_int_inline(ffi_sink as *const () as usize as i64);
 
     rec.record_op_with_descr(OpCode::CallReleaseGilN, &[saveerr, fn_ptr, input], cd);
     rec.record_guard_with_fail_args(OpCode::GuardNotForced, &[], Some(make_descr(0)), &[input]);
@@ -1637,13 +1537,6 @@ fn test_call_release_gil_n_void_return() {
     let trace = rec.get_trace();
 
     let mut backend = CraneliftBackend::new();
-    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
-    constants.insert(OpRef::const_int(0).raw(), 0i64);
-    constants.insert(
-        OpRef::const_int(1).raw(),
-        ffi_sink as *const () as usize as i64,
-    );
-    backend.set_constants(constants);
 
     let mut token = JitCellToken::new(602);
     backend
@@ -1669,10 +1562,10 @@ fn test_call_release_gil_result_flows_through_trace() {
 
     let mut rec = Trace::new();
     let x = rec.record_input_arg(Type::Int);
-    let saveerr = OpRef::const_int(0);
-    let fn_ptr = OpRef::const_int(1);
-    let const_10 = OpRef::const_int(2);
-    let const_5 = OpRef::const_int(3);
+    let saveerr = OpRef::const_int_inline(0);
+    let fn_ptr = OpRef::const_int_inline(ffi_add as *const () as usize as i64);
+    let const_10 = OpRef::const_int_inline(10);
+    let const_5 = OpRef::const_int_inline(5);
 
     let tmp =
         rec.record_op_with_descr(OpCode::CallReleaseGilI, &[saveerr, fn_ptr, x, const_10], cd);
@@ -1682,15 +1575,6 @@ fn test_call_release_gil_result_flows_through_trace() {
     let trace = rec.get_trace();
 
     let mut backend = CraneliftBackend::new();
-    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
-    constants.insert(OpRef::const_int(0).raw(), 0i64);
-    constants.insert(
-        OpRef::const_int(1).raw(),
-        ffi_add as *const () as usize as i64,
-    );
-    constants.insert(OpRef::const_int(2).raw(), 10i64);
-    constants.insert(OpRef::const_int(3).raw(), 5i64);
-    backend.set_constants(constants);
 
     let mut token = JitCellToken::new(603);
     backend
@@ -1789,7 +1673,7 @@ fn raw_descr_float() -> DescrRef {
 #[test]
 fn test_raw_store_load_int_roundtrip() {
     let ad = raw_descr_int(8);
-    let const_offset = OpRef::const_int(0);
+    let const_offset = OpRef::const_int_inline(0); // offset 0
 
     let mut rec = Trace::new();
     let r0 = rec.record_input_arg(Type::Ref);
@@ -1801,9 +1685,6 @@ fn test_raw_store_load_int_roundtrip() {
     let trace = rec.get_trace();
 
     let mut backend = CraneliftBackend::new();
-    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
-    constants.insert(OpRef::const_int(0).raw(), 0i64); // offset 0
-    backend.set_constants(constants);
 
     let mut token = JitCellToken::new(600);
     backend
@@ -1831,7 +1712,7 @@ fn test_raw_store_load_int_roundtrip() {
 #[test]
 fn test_raw_store_load_float_roundtrip() {
     let ad = raw_descr_float();
-    let const_offset = OpRef::const_int(0);
+    let const_offset = OpRef::const_int_inline(0);
 
     let mut rec = Trace::new();
     let r0 = rec.record_input_arg(Type::Ref);
@@ -1843,9 +1724,6 @@ fn test_raw_store_load_float_roundtrip() {
     let trace = rec.get_trace();
 
     let mut backend = CraneliftBackend::new();
-    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
-    constants.insert(OpRef::const_int(0).raw(), 0i64);
-    backend.set_constants(constants);
 
     let mut token = JitCellToken::new(601);
     backend
@@ -1872,8 +1750,8 @@ fn test_raw_store_load_float_roundtrip() {
 #[test]
 fn test_raw_ops_different_offsets_no_interference() {
     let ad = raw_descr_int(8);
-    let off0 = OpRef::const_int(0);
-    let off8 = OpRef::const_int(1);
+    let off0 = OpRef::const_int_inline(0);
+    let off8 = OpRef::const_int_inline(8);
 
     let mut rec = Trace::new();
     let r0 = rec.record_input_arg(Type::Ref);
@@ -1892,10 +1770,6 @@ fn test_raw_ops_different_offsets_no_interference() {
     let trace = rec.get_trace();
 
     let mut backend = CraneliftBackend::new();
-    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
-    constants.insert(OpRef::const_int(0).raw(), 0i64);
-    constants.insert(OpRef::const_int(1).raw(), 8i64);
-    backend.set_constants(constants);
 
     let mut token = JitCellToken::new(602);
     backend
@@ -1930,7 +1804,7 @@ fn test_raw_load_unsigned_byte() {
         item_type: Type::Int,
         signed: false,
     });
-    let const_offset = OpRef::const_int(0);
+    let const_offset = OpRef::const_int_inline(0);
 
     let mut rec = Trace::new();
     let r0 = rec.record_input_arg(Type::Ref);
@@ -1940,9 +1814,6 @@ fn test_raw_load_unsigned_byte() {
     let trace = rec.get_trace();
 
     let mut backend = CraneliftBackend::new();
-    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
-    constants.insert(OpRef::const_int(0).raw(), 0i64);
-    backend.set_constants(constants);
 
     let mut token = JitCellToken::new(603);
     backend
@@ -2031,7 +1902,7 @@ fn test_call_release_gil_with_guard_not_forced() {
     let token_ref = rec.record_op(OpCode::ForceToken, &[]);
 
     // fn_ptr is stored as a constant
-    let fn_ptr = OpRef::const_int(0);
+    let fn_ptr = OpRef::const_int_inline(ffi_add_no_force as *const () as usize as i64);
 
     // CallMayForceI: arg(0)=fn_ptr, rest=[force_token, x]
     let result = rec.record_op_with_descr(OpCode::CallMayForceI, &[fn_ptr, token_ref, x], cd);
@@ -2048,12 +1919,6 @@ fn test_call_release_gil_with_guard_not_forced() {
     let trace = rec.get_trace();
 
     let mut backend = CraneliftBackend::new();
-    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
-    constants.insert(
-        OpRef::const_int(0).raw(),
-        ffi_add_no_force as *const () as usize as i64,
-    );
-    backend.set_constants(constants);
 
     let mut token = JitCellToken::new(700);
     backend
@@ -2097,7 +1962,7 @@ fn test_call_may_force_with_forcing_semantics() {
     let flag = rec.record_input_arg(Type::Int);
 
     let token_ref = rec.record_op(OpCode::ForceToken, &[]);
-    let fn_ptr = OpRef::const_int(0);
+    let fn_ptr = OpRef::const_int_inline(ffi_maybe_force as *const () as usize as i64);
 
     let result = rec.record_op_with_descr(OpCode::CallMayForceI, &[fn_ptr, token_ref, flag], cd);
 
@@ -2112,12 +1977,6 @@ fn test_call_may_force_with_forcing_semantics() {
     let trace = rec.get_trace();
 
     let mut backend = CraneliftBackend::new();
-    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
-    constants.insert(
-        OpRef::const_int(0).raw(),
-        ffi_maybe_force as *const () as usize as i64,
-    );
-    backend.set_constants(constants);
 
     let mut token = JitCellToken::new(701);
     backend
@@ -2168,8 +2027,8 @@ fn test_ffi_call_exception_propagation() {
     let mut rec = Trace::new();
     let val = rec.record_input_arg(Type::Int);
 
-    let saveerr = OpRef::const_int(0);
-    let fn_ptr = OpRef::const_int(1);
+    let saveerr = OpRef::const_int_inline(0);
+    let fn_ptr = OpRef::const_int_inline(ffi_raise_exception as *const () as usize as i64);
     let result = rec.record_op_with_descr(OpCode::CallReleaseGilI, &[saveerr, fn_ptr, val], cd);
 
     // GuardNotForced: required immediately after CallReleaseGil
@@ -2191,13 +2050,6 @@ fn test_ffi_call_exception_propagation() {
     let trace = rec.get_trace();
 
     let mut backend = CraneliftBackend::new();
-    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
-    constants.insert(OpRef::const_int(0).raw(), 0i64);
-    constants.insert(
-        OpRef::const_int(1).raw(),
-        ffi_raise_exception as *const () as usize as i64,
-    );
-    backend.set_constants(constants);
 
     let mut token = JitCellToken::new(702);
     backend
@@ -2245,8 +2097,8 @@ fn test_compiled_guard_failure_preserves_frame_stack_metadata() {
     let mut rec = Trace::new();
     let x = rec.record_input_arg(Type::Int);
 
-    let const_5 = OpRef::const_int(0);
-    let const_100 = OpRef::const_int(1);
+    let const_5 = OpRef::const_int_inline(5);
+    let const_100 = OpRef::const_int_inline(100);
 
     let result = rec.record_op(OpCode::IntAdd, &[x, const_5]);
     let cmp = rec.record_op(OpCode::IntLt, &[result, const_100]);
@@ -2255,10 +2107,6 @@ fn test_compiled_guard_failure_preserves_frame_stack_metadata() {
     let trace = rec.get_trace();
 
     let mut backend = CraneliftBackend::new();
-    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
-    constants.insert(OpRef::const_int(0).raw(), 5i64);
-    constants.insert(OpRef::const_int(1).raw(), 100i64);
-    backend.set_constants(constants);
 
     let mut token = JitCellToken::new(900);
     backend
@@ -2307,8 +2155,8 @@ fn test_compiled_bridge_guard_failure_has_frame_stack() {
     let i = rec.record_input_arg(Type::Int);
     let sum = rec.record_input_arg(Type::Int);
 
-    let const_one = OpRef::const_int(0);
-    let const_zero = OpRef::const_int(1);
+    let const_one = OpRef::const_int_inline(1);
+    let const_zero = OpRef::const_int_inline(0);
 
     let sum2 = rec.record_op(OpCode::IntAdd, &[sum, i]);
     let i2 = rec.record_op(OpCode::IntSub, &[i, const_one]);
@@ -2318,10 +2166,6 @@ fn test_compiled_bridge_guard_failure_has_frame_stack() {
     let trace = rec.get_trace();
 
     let mut backend = CraneliftBackend::new();
-    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
-    constants.insert(OpRef::const_int(0).raw(), 1i64);
-    constants.insert(OpRef::const_int(1).raw(), 0i64);
-    backend.set_constants(constants);
 
     backend.set_next_trace_id(910);
     backend.set_next_header_pc(1000);
@@ -2372,8 +2216,8 @@ fn test_compiled_bridge_guard_failure_has_frame_stack() {
     let _bi = bridge_rec.record_input_arg(Type::Int);
     let bsum = bridge_rec.record_input_arg(Type::Int);
 
-    let bridge_const_zero = OpRef::const_int(0);
-    let bridge_const_two = OpRef::const_int(1);
+    let bridge_const_zero = OpRef::const_int_inline(0);
+    let bridge_const_two = OpRef::const_int_inline(2);
 
     let bcmp = bridge_rec.record_op(OpCode::IntGt, &[bsum, bridge_const_zero]);
     bridge_rec.record_guard(OpCode::GuardTrue, &[bcmp], Some(make_descr(10)));
@@ -2381,34 +2225,25 @@ fn test_compiled_bridge_guard_failure_has_frame_stack() {
     bridge_rec.finish(&[bresult], make_descr(11));
     let bridge_trace = bridge_rec.get_trace();
 
-    let mut bridge_constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
-    bridge_constants.insert(OpRef::const_int(0).raw(), 0i64);
-    bridge_constants.insert(OpRef::const_int(1).raw(), 2i64);
-    backend.set_constants(bridge_constants);
-
-    let bridge_fail_descr_arc: DescrRef =
+    // Mint a `ResumeGuardDescr` that mirrors the source guard's identity
+    // (per-trace fail_index = 0, trace_id = 910).  `CraneliftFailDescr`
+    // was retired in Slice 7-Tβ14f; bridge-compile lookup now uses
+    // `FailDescr::{trace_id, fail_index_per_trace}` directly off the
+    // descr the metainterp passes in (`pyjitpl/mod.rs:9040`).
+    let bridge_fail_descr =
         majit_backend::make_resume_guard_descr_typed(vec![Type::Int, Type::Int]);
     {
-        let fd = bridge_fail_descr_arc
-            .as_fail_descr()
-            .expect("ResumeGuardDescr implements FailDescr");
+        let fd = bridge_fail_descr.as_fail_descr().unwrap();
         fd.set_trace_id(910);
-        // Mirror the source guard's per-trace fail index (the loop guard
-        // at line 2302 is the first guard of trace 910, so index 0
-        // matches the `source_guard: Some((909, 0))` recovery layout
-        // above).  Without this, a bridge lookup that only matches
-        // trace_id would still pass — see
-        // `compile.rs:449 set_fail_index_per_trace` for the production
-        // path's identity contract.
         fd.set_fail_index_per_trace(0);
     }
-    let bridge_fail_descr = bridge_fail_descr_arc.as_fail_descr().unwrap();
+    let bridge_fail_descr_ref = bridge_fail_descr.as_fail_descr().unwrap();
 
     backend.set_next_trace_id(911);
     backend.set_next_header_pc(2000);
     let _bridge_info = backend
         .compile_bridge(
-            bridge_fail_descr,
+            bridge_fail_descr_ref,
             &inputargs_view(&bridge_trace),
             &bridge_trace.ops,
             &token,
@@ -2451,30 +2286,26 @@ fn test_call_assembler_callee_guard_failure_frame_stack() {
     // Compile a callee trace with a guard that fails:
     //   input(x) -> cmp = x > 10 -> guard_true(cmp) -> finish(x)
     let callee_inputargs = vec![InputArg::new_int(0)];
-    let op = |oc, args: &[OpRef]| std::rc::Rc::new(Op::new(oc, args));
-    let op_d = |oc, args: &[OpRef], d| std::rc::Rc::new(Op::with_descr(oc, args, d));
     let mut callee_ops = vec![
-        op(OpCode::Label, &[OpRef::input_arg_int(0)]),
-        op(
+        Op::new(OpCode::Label, &[OpRef::input_arg_int(0)]),
+        Op::new(
             OpCode::IntGt,
-            &[OpRef::input_arg_int(0), OpRef::const_int(0)],
+            &[OpRef::input_arg_int(0), OpRef::const_int_inline(10)],
         ),
-        op_d(OpCode::GuardTrue, &[OpRef::int_op(1)], make_descr(0)),
-        op_d(OpCode::Finish, &[OpRef::input_arg_int(0)], make_descr(1)),
+        Op::with_descr(OpCode::GuardTrue, &[OpRef::int_op(1)], make_descr(0)),
+        Op::with_descr(OpCode::Finish, &[OpRef::input_arg_int(0)], make_descr(1)),
     ];
     assign_positions(&mut callee_ops, 0);
+    let callee_ops_rc: Vec<std::rc::Rc<Op>> =
+        callee_ops.into_iter().map(std::rc::Rc::new).collect();
 
     let mut backend = CraneliftBackend::new();
-    backend.set_constants(majit_ir::VecAssoc::from([(
-        OpRef::const_int(0).raw(),
-        10i64,
-    )]));
 
     backend.set_next_trace_id(920);
     backend.set_next_header_pc(3000);
     let mut callee_token = JitCellToken::new(903);
     backend
-        .compile_loop(&callee_inputargs, &callee_ops, &mut callee_token)
+        .compile_loop(&callee_inputargs, &callee_ops_rc, &mut callee_token)
         .expect("callee compilation should succeed");
 
     // x=20: guard passes, finish
@@ -2511,7 +2342,7 @@ fn test_frame_stack_slot_types_match_fail_arg_types() {
     let x_int = rec.record_input_arg(Type::Int);
     let x_float = rec.record_input_arg(Type::Float);
 
-    let const_0 = OpRef::const_int(0);
+    let const_0 = OpRef::const_int_inline(0);
 
     let cmp = rec.record_op(OpCode::IntGt, &[x_int, const_0]);
     rec.record_guard_with_fail_args(
@@ -2524,9 +2355,6 @@ fn test_frame_stack_slot_types_match_fail_arg_types() {
     let trace = rec.get_trace();
 
     let mut backend = CraneliftBackend::new();
-    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
-    constants.insert(OpRef::const_int(0).raw(), 0i64);
-    backend.set_constants(constants);
 
     backend.set_next_trace_id(930);
     backend.set_next_header_pc(5000);
@@ -2606,10 +2434,10 @@ fn test_ffi_exchange_buffer_pattern() {
     let cd = call_descr_release_gil_i(80, vec![Type::Ref]);
 
     // Constants: offset_16 = 16 (exchange_args[0]), offset_32 = 32 (exchange_result)
-    let off_arg = OpRef::const_int(0); // offset 16
-    let off_result = OpRef::const_int(1); // offset 32
-    let saveerr = OpRef::const_int(2); // CALL_RELEASE_GIL saveerr flag
-    let fn_ptr = OpRef::const_int(3); // ffi_exchange_buffer_fn
+    let off_arg = OpRef::const_int_inline(16); // offset 16
+    let off_result = OpRef::const_int_inline(32); // offset 32
+    let saveerr = OpRef::const_int_inline(0); // CALL_RELEASE_GIL saveerr flag
+    let fn_ptr = OpRef::const_int_inline(ffi_exchange_buffer_fn as *const () as usize as i64);
 
     let mut rec = Trace::new();
     // Inputs: r0 = exchange buffer pointer, i0 = argument value
@@ -2632,15 +2460,6 @@ fn test_ffi_exchange_buffer_pattern() {
     let trace = rec.get_trace();
 
     let mut backend = CraneliftBackend::new();
-    let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
-    constants.insert(OpRef::const_int(0).raw(), 16i64);
-    constants.insert(OpRef::const_int(1).raw(), 32i64);
-    constants.insert(OpRef::const_int(2).raw(), 0i64);
-    constants.insert(
-        OpRef::const_int(3).raw(),
-        ffi_exchange_buffer_fn as *const () as usize as i64,
-    );
-    backend.set_constants(constants);
 
     let mut token = JitCellToken::new(950);
     backend

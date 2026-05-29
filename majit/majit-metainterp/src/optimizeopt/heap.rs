@@ -882,7 +882,12 @@ impl OptHeap {
 
     /// heapcache.py:295-309 `_escape_box`: escape a box and transitively
     /// escape all its dependencies stored in `box._heapc_deps`.
+    /// Const boxes (history.py:189-220) are globally-scoped values, never
+    /// tracked in `unescaped` bitset.
     fn escape_box(&mut self, opref: OpRef) {
+        if opref.is_constant() {
+            return;
+        }
         vb_unset(&mut self.unescaped, opref.raw());
         if let Some(deps) = self.heapc_deps.remove(&opref) {
             for dep in deps {
@@ -891,11 +896,26 @@ impl OptHeap {
         }
     }
 
+    /// heapcache.py:493-494 `is_unescaped(box)` — `_check_flag(box,
+    /// HF_IS_UNESCAPED)`. Const boxes are never `RefFrontendOp` so the
+    /// flag is never set (history.py:213); `None` sentinels likewise.
+    fn is_unescaped(&self, opref: OpRef) -> bool {
+        if opref.is_none() || opref.is_constant() {
+            return false;
+        }
+        vb_get(&self.unescaped, opref.raw())
+    }
+
     /// heapcache.py:224-230 `_escape_from_write`: when storing a value
     /// into a container, append to `_get_deps(box)` if both are
     /// unescaped; otherwise escape the value immediately.
     fn escape_from_write(&mut self, container: OpRef, value: OpRef) {
-        if vb_get(&self.unescaped, container.raw()) && vb_get(&self.unescaped, value.raw()) {
+        // heapcache.py:224-229: if both box and fieldbox are unescaped,
+        // record the dependency; otherwise escape the fieldbox (the value).
+        // `is_unescaped`/`escape_box` are no-ops for Const operands, so a
+        // constant value never escapes the container and a constant
+        // container still escapes a non-constant value.
+        if self.is_unescaped(container) && self.is_unescaped(value) {
             self.heapc_deps
                 .entry_or_insert_with(container, Vec::new)
                 .push(value);
@@ -2766,9 +2786,6 @@ impl OptHeap {
         // calls emit_postponed_op() before every op, but the postpone→emit
         // cycle is specifically CallMayForce→GuardNotForced. Don't emit here.
 
-        // Guards: force lazy sets but keep caches (guards don't mutate the heap).
-        // RPython heap.py does NOT handle GuardNonnull — that is handled
-        // exclusively by rewrite.py. Only track nullity for cache purposes.
         if opcode.is_guard() {
             // force_lazy_sets_for_guard is now called via emitting_operation
             // callback (which runs for ALL guards regardless of which pass emits
@@ -6278,12 +6295,19 @@ mod tests {
         let hash = ctx.make_constant_int(42);
         let flag = ctx.make_constant_int(0);
 
-        // Two distinct ConstInt slots, same value. RPython's args_dict()
-        // hashes them via _get_hash_() (value-based for Const), so they
-        // collide as the same key.
+        // history.py:251 `ConstInt.same_constant` — Const equality is
+        // value-based (not identity), so `ConstInt(7) == ConstInt(7)`
+        // regardless of which call produced the box. Two
+        // `make_constant_int(7)` calls return inline-Const OpRefs whose
+        // variant payloads compare equal; `args_dict()` hashes them via
+        // `_get_hash_()` (value-based for Const, history.py:283), so
+        // they collide as the same key.
         let key_a = ctx.make_constant_int(7);
         let key_b = ctx.make_constant_int(7);
-        assert_ne!(key_a, key_b, "make_constant_int must mint fresh slots");
+        assert_eq!(
+            key_a, key_b,
+            "ConstInt(7) compares equal to ConstInt(7) by value (history.py:251 same_constant)"
+        );
 
         let pos1 = ctx.reserve_pos_typed(Type::Int);
         let mut op1 = Op::new(OpCode::CallI, &[func_addr, dict, key_a, hash, flag]);

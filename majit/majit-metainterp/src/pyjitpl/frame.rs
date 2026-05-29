@@ -588,19 +588,19 @@ impl MIFrame {
                 // pyjitpl.py:184-192 register clearing via ConstantPool.
                 match argcode {
                     b'i' => {
-                        let opref = pool.get_or_insert(0);
+                        let opref = OpRef::const_int_inline(0);
                         self.int_regs[index] = Some(opref);
                         self.int_values[index] = Some(0);
                         (None, None, None)
                     }
                     b'r' => {
-                        let opref = pool.get_or_insert_typed(0, Type::Ref);
+                        let opref = OpRef::const_ptr_inline(majit_ir::GcRef::NULL);
                         self.ref_regs[index] = Some(opref);
                         self.ref_values[index] = Some(0);
                         (None, None, None)
                     }
                     b'f' => {
-                        let opref = pool.get_or_insert_typed(0, Type::Float);
+                        let opref = OpRef::const_float_inline(0.0);
                         self.float_regs[index] = Some(opref);
                         self.float_values[index] = Some(0);
                         (None, None, None)
@@ -760,20 +760,20 @@ impl MIFrame {
                 .take()
                 .unwrap_or_else(|| self.jitcode.code[self.pc - 1] as usize);
             self._result_argcode = b'?';
-            if let Some(pool) = pool {
+            if pool.is_some() {
                 match argcode {
                     b'i' => {
-                        let opref = pool.get_or_insert(0);
+                        let opref = OpRef::const_int_inline(0);
                         self.int_regs[index] = Some(opref);
                         self.int_values[index] = Some(0);
                     }
                     b'r' => {
-                        let opref = pool.get_or_insert_typed(0, Type::Ref);
+                        let opref = OpRef::const_ptr_inline(majit_ir::GcRef::NULL);
                         self.ref_regs[index] = Some(opref);
                         self.ref_values[index] = Some(0);
                     }
                     b'f' => {
-                        let opref = pool.get_or_insert_typed(0, Type::Float);
+                        let opref = OpRef::const_float_inline(0.0);
                         self.float_regs[index] = Some(opref);
                         self.float_values[index] = Some(0);
                     }
@@ -1094,7 +1094,7 @@ mod tests {
         frame.int_regs[0] = Some(OpRef::int_op(5));
         frame.int_values[0] = Some(0);
         // ref_regs[0] constant pointer addr=0xdead_beef → Box::ConstPtr.
-        frame.ref_regs[0] = Some(OpRef::const_ptr(7));
+        frame.ref_regs[0] = Some(OpRef::const_ptr_inline(majit_ir::GcRef(0xdead_beef)));
         frame.ref_values[0] = Some(0xdead_beef);
 
         let sd = Arc::new(crate::MetaInterpStaticData::new());
@@ -1580,7 +1580,7 @@ mod tests {
             vec![("g0", Type::Int), ("g1", Type::Int)],
             vec![("r0", Type::Int)],
         );
-        let greens = vec![OpRef::const_int(0), OpRef::const_int(1)];
+        let greens = vec![OpRef::const_int_inline(0), OpRef::const_int_inline(1)];
         // Must not panic — both opref are Const-tagged and length matches.
         MIFrame::verify_green_args(&jd, &greens);
     }
@@ -1594,7 +1594,7 @@ mod tests {
             vec![],
         );
         // Only one green provided — must fail count check.
-        MIFrame::verify_green_args(&jd, &[OpRef::const_int(0)]);
+        MIFrame::verify_green_args(&jd, &[OpRef::const_int_inline(0)]);
     }
 
     #[test]

@@ -1046,46 +1046,6 @@ impl<S: JitState> JitDriver<S> {
         self.meta.front_target_inputarg_types(green_key)
     }
 
-    /// RPython resume_in_blackhole parity: resume execution from the guard
-    /// failure point using the blackhole interpreter.
-    pub fn blackhole_guard_failure(
-        &self,
-        green_key: u64,
-        trace_id: u64,
-        fail_index: u32,
-        fail_values: &[i64],
-        exception: crate::blackhole::ExceptionState,
-    ) -> Option<(
-        crate::blackhole::BlackholeResult,
-        crate::blackhole::ExceptionState,
-    )> {
-        self.meta
-            .blackhole_guard_failure(green_key, trace_id, fail_index, fail_values, exception)
-    }
-
-    /// Like `blackhole_guard_failure` but with a CallAssembler callback.
-    pub fn blackhole_guard_failure_ca(
-        &self,
-        green_key: u64,
-        trace_id: u64,
-        fail_index: u32,
-        fail_values: &[i64],
-        exception: crate::blackhole::ExceptionState,
-        call_assembler_fn: Option<&crate::blackhole::CallAssemblerFn>,
-    ) -> Option<(
-        crate::blackhole::BlackholeResult,
-        crate::blackhole::ExceptionState,
-    )> {
-        self.meta.blackhole_guard_failure_ca(
-            green_key,
-            trace_id,
-            fail_index,
-            fail_values,
-            exception,
-            call_assembler_fn,
-        )
-    }
-
     /// resume.py:1312 blackhole_from_resumedata parity: get the
     /// recovery slot types for building typed Value array from raw fail_values.
     pub fn get_recovery_slot_types(
@@ -2731,168 +2691,25 @@ impl<S: JitState> JitDriver<S> {
         self.meta.walk_rd_consts_refs(visitor);
     }
 
-    pub fn run_compiled_with_blackhole_fallback_keyed(
-        &mut self,
-        green_key: u64,
-        state: &mut S,
-        pre_run: impl FnOnce(),
-    ) -> crate::pyjitpl::DriverRunOutcome {
-        let Some(meta) = self.meta.get_compiled_meta(green_key).cloned() else {
-            return crate::pyjitpl::DriverRunOutcome::Abort {
-                restored: false,
-                via_blackhole: false,
-            };
-        };
-        let descriptor = self.driver_descriptor_for(state, &meta);
-        if !state.is_compatible(&meta) || !self.sync_before(state, &meta, descriptor.as_ref()) {
-            return crate::pyjitpl::DriverRunOutcome::Abort {
-                restored: false,
-                via_blackhole: false,
-            };
-        }
-        let live_values = state.extract_live_values(&meta);
-        if !Self::live_values_match_descriptor(descriptor.as_ref(), &live_values) {
-            return crate::pyjitpl::DriverRunOutcome::Abort {
-                restored: false,
-                via_blackhole: false,
-            };
-        }
-        let Some(live_values) = self.extend_compiled_live_values(
-            green_key,
-            state,
-            &meta,
-            descriptor.as_ref(),
-            live_values,
-        ) else {
-            return crate::pyjitpl::DriverRunOutcome::Abort {
-                restored: false,
-                via_blackhole: false,
-            };
-        };
-        pre_run();
-        let Some(result) = self
-            .meta
-            .run_with_blackhole_fallback_with_values(green_key, &live_values)
-        else {
-            return crate::pyjitpl::DriverRunOutcome::Abort {
-                restored: false,
-                via_blackhole: false,
-            };
-        };
-
-        match result {
-            crate::pyjitpl::BlackholeRunResult::Finished {
-                values,
-                typed_values,
-                meta,
-                via_blackhole,
-                ..
-            } => {
-                if let Some(values) = typed_values.as_ref() {
-                    state.restore_values(&meta, values);
-                } else {
-                    state.restore(&meta, &values);
-                }
-                self.sync_after(state, &meta, descriptor.as_ref());
-                crate::pyjitpl::DriverRunOutcome::Finished { via_blackhole }
-            }
-            crate::pyjitpl::BlackholeRunResult::Jump {
-                values,
-                typed_values,
-                exit_layout,
-                meta,
-                via_blackhole,
-                ..
-            } => {
-                if let Some(values) = typed_values.as_ref() {
-                    state.restore_values(&meta, values);
-                } else if let Some(layout) = exit_layout.as_ref() {
-                    state.restore_values(&meta, &Self::decode_exit_layout_values(&values, layout));
-                } else if let Some(values) =
-                    Self::decode_descriptor_values(descriptor.as_ref(), &values)
-                {
-                    state.restore_values(&meta, &values);
-                } else {
-                    state.restore(&meta, &values);
-                }
-                self.sync_after(state, &meta, descriptor.as_ref());
-                crate::pyjitpl::DriverRunOutcome::Jump { via_blackhole }
-            }
-            crate::pyjitpl::BlackholeRunResult::GuardFailure {
-                fail_values,
-                typed_fail_values,
-                exit_layout,
-                meta,
-                recovery,
-                via_blackhole,
-                ..
-            } => {
-                let patched_resume_layout = recovery.as_ref().and_then(|recovery| {
-                    recovery.resume_layout.as_ref().and_then(|layout| {
-                        Self::resume_layout_with_descriptor_slot_types(descriptor.as_ref(), layout)
-                    })
-                });
-                let restored = if let Some(recovery) = recovery.as_ref() {
-                    state.restore_guard_failure_with_resume_layout(
-                        &meta,
-                        &fail_values,
-                        recovery.reconstructed_state.as_ref(),
-                        patched_resume_layout
-                            .as_ref()
-                            .or(recovery.resume_layout.as_ref())
-                            .map(|layout| layout.frame_layouts.as_slice()),
-                        &recovery.materialized_virtuals,
-                        &recovery.pending_field_writes,
-                        &recovery.exception,
-                    )
-                } else if let Some(values) = typed_fail_values.as_ref() {
-                    state.restore_guard_failure_values(&meta, values, &ExceptionState::default())
-                } else if let Some(layout) = exit_layout.as_ref() {
-                    state.restore_guard_failure_values(
-                        &meta,
-                        &Self::decode_exit_layout_values(&fail_values, layout),
-                        &ExceptionState::default(),
-                    )
-                } else if let Some(values) =
-                    Self::decode_descriptor_values(descriptor.as_ref(), &fail_values)
-                {
-                    state.restore_guard_failure_values(&meta, &values, &ExceptionState::default())
-                } else {
-                    state.restore_guard_failure_with_resume_layout(
-                        &meta,
-                        &fail_values,
-                        None,
-                        None,
-                        &[],
-                        &[],
-                        &ExceptionState::default(),
-                    )
-                };
-                if restored {
-                    self.sync_after(state, &meta, descriptor.as_ref());
-                }
-                crate::pyjitpl::DriverRunOutcome::GuardFailure {
-                    restored,
-                    via_blackhole,
-                }
-            }
-            crate::pyjitpl::BlackholeRunResult::Abort { .. } => {
-                crate::pyjitpl::DriverRunOutcome::Abort {
-                    restored: false,
-                    via_blackhole: true,
-                }
-            }
-        }
+    /// framework.py `root_walker.walk_roots` parity: visit every
+    /// inline `OpRef::ConstPtrInline(GcRef)` slot in the stashed
+    /// `partial_trace.ops` op-graph (history.py:314 `ConstPtr.value`).
+    /// See `MetaInterp::walk_partial_trace_refs`.
+    pub fn walk_partial_trace_refs(&mut self, visitor: impl FnMut(&mut majit_ir::GcRef)) {
+        self.meta.walk_partial_trace_refs(visitor);
     }
 
-    pub fn run_compiled_with_blackhole_fallback_declarative<D: DeclarativeJitDriver>(
-        &mut self,
-        green_values: &[i64],
-        state: &mut S,
-        pre_run: impl FnOnce(),
-    ) -> Result<crate::pyjitpl::DriverRunOutcome, &'static str> {
-        let green_key = D::green_key(green_values)?;
-        Ok(self.run_compiled_with_blackhole_fallback_keyed(green_key.hash_u64(), state, pre_run))
+    /// framework.py `root_walker.walk_roots` parity: visit every
+    /// inline `ConstPtr.value` slot in the active recorder's op-graph
+    /// (history.py:314). See `MetaInterp::walk_active_trace_refs`.
+    pub fn walk_active_trace_refs(&mut self, visitor: impl FnMut(&mut majit_ir::GcRef)) {
+        self.meta.walk_active_trace_refs(visitor);
+    }
+
+    /// GC walker for ConstPtrInline GcRefs in snapshot maps that are
+    /// live during compilation. See `MetaInterp::walk_compile_snapshot_refs`.
+    pub fn walk_compile_snapshot_refs(&mut self, visitor: impl FnMut(&mut majit_ir::GcRef)) {
+        self.meta.walk_compile_snapshot_refs(visitor);
     }
 
     pub fn run_compiled_detailed_keyed(
@@ -4408,51 +4225,6 @@ mod tests {
     }
 
     #[test]
-    fn blackhole_jump_reports_via_blackhole_even_with_typed_restore_values() {
-        let mut driver = JitDriver::<TypedRestoreState>::new(2);
-        driver.meta.finish_setup_descrs_for_jitdrivers();
-        let key = 9u64;
-
-        assert!(matches!(
-            driver.meta.on_back_edge(key, &[1]),
-            BackEdgeAction::Interpret
-        ));
-        assert!(matches!(
-            driver.meta.on_back_edge(key, &[1]),
-            BackEdgeAction::StartedTracing
-        ));
-
-        // Use input arg as guard condition so optimizer cannot constant-fold.
-        {
-            let ctx = driver.meta.trace_ctx().expect("trace ctx should exist");
-            let i0 = OpRef::input_arg_int(0); // input arg
-            let g = ctx.record_guard(OpCode::GuardFalse, &[i0], 0);
-            ctx.capture_snapshot_for_last_guard(&[i0], 0, 0);
-            ctx.set_fail_args(g, &[i0]);
-        };
-        driver.meta.compile_loop(&[OpRef::input_arg_int(0)], ());
-        assert!(driver.has_compiled_loop(key));
-
-        let mut state = TypedRestoreState {
-            live_values: vec![1],
-            ..Default::default()
-        };
-        match driver.run_compiled_with_blackhole_fallback_keyed(key, &mut state, || {}) {
-            crate::pyjitpl::DriverRunOutcome::Jump { via_blackhole } => {
-                assert!(via_blackhole);
-            }
-            crate::pyjitpl::DriverRunOutcome::GuardFailure {
-                restored,
-                via_blackhole,
-            } => {
-                assert!(restored);
-                assert!(via_blackhole);
-            }
-            other => panic!("expected Jump or GuardFailure outcome, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn run_compiled_detailed_keyed_uses_typed_live_inputs() {
         let mut driver = JitDriver::<TypedInputState>::new(2);
         driver.meta.finish_setup_descrs_for_jitdrivers();
@@ -4511,72 +4283,6 @@ mod tests {
         assert_eq!(state.restored_values, typed_live_values);
         assert_eq!(state.raw_restore_calls, 0);
         assert_eq!(state.typed_restore_calls, 1);
-    }
-
-    #[test]
-    fn blackhole_fallback_uses_typed_live_inputs() {
-        let mut driver = JitDriver::<TypedInputState>::new(2);
-        driver.meta.finish_setup_descrs_for_jitdrivers();
-        let key = 12u64;
-        // Input 0 is Int (used as GuardFalse condition); inputs 1/2 are
-        // Ref/Float so the typed restore path still exercises mixed types.
-        // GUARD_TRUE/FALSE in RPython are typed 'i' (resoperation.py
-        // arglist_types) — the guard condition must be Int.
-        let typed_live_values = vec![Value::Int(1), Value::Ref(GcRef(0x5678)), Value::Float(6.25)];
-
-        assert!(matches!(
-            driver
-                .meta
-                .on_back_edge_typed(key, (0, 0), None, None, &typed_live_values),
-            BackEdgeAction::Interpret
-        ));
-        assert!(matches!(
-            driver
-                .meta
-                .on_back_edge_typed(key, (0, 0), None, None, &typed_live_values),
-            BackEdgeAction::StartedTracing
-        ));
-
-        // Input 0 is Int(1) — nonzero so GuardFalse fails at runtime.
-        {
-            let ctx = driver.meta.trace_ctx().expect("trace ctx should exist");
-            let i0 = OpRef::input_arg_int(0);
-            let r1 = OpRef::input_arg_ref(1);
-            let f2 = OpRef::input_arg_float(2);
-            let g = ctx.record_guard(OpCode::GuardFalse, &[i0], 0);
-            ctx.capture_snapshot_for_last_guard(&[i0, r1, f2], 0, 0);
-            ctx.set_fail_args(g, &[i0, r1, f2]);
-        };
-        driver.meta.compile_loop(
-            &[
-                OpRef::input_arg_int(0),
-                OpRef::input_arg_ref(1),
-                OpRef::input_arg_float(2),
-            ],
-            (),
-        );
-        assert!(driver.has_compiled_loop(key));
-
-        let mut state = TypedInputState {
-            raw_live_values: vec![1, 0, 0],
-            typed_live_values: typed_live_values.clone(),
-            ..Default::default()
-        };
-        match driver.run_compiled_with_blackhole_fallback_keyed(key, &mut state, || {}) {
-            crate::pyjitpl::DriverRunOutcome::Jump { via_blackhole } => {
-                assert!(via_blackhole);
-            }
-            crate::pyjitpl::DriverRunOutcome::GuardFailure {
-                restored,
-                via_blackhole,
-            } => {
-                // Guard failure is restored via blackhole — acceptable.
-                assert!(restored);
-                assert!(via_blackhole);
-            }
-            other => panic!("expected Jump or GuardFailure outcome, got {other:?}"),
-        }
-        assert_eq!(state.restored_values, typed_live_values);
     }
 
     #[test]

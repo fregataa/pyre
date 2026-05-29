@@ -1094,8 +1094,9 @@ impl VectorizingOptimizer {
             let zeroed_vec = xor_op.pos.get();
             sched_state.invariant_oplist.push(xor_op);
 
-            let zero_const = OpRef::const_int(0);
-            let one_const = OpRef::const_int(1);
+            // vector.py:866-869: pack the seed scalar into position 0
+            let zero_const = OpRef::const_int_inline(0);
+            let one_const = OpRef::const_int_inline(1);
             let pack_op = sched_state.create_vec_op(
                 OpCode::VecPackI,
                 &[zeroed_vec, seed, zero_const, one_const],

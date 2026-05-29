@@ -124,8 +124,8 @@ impl OptIntBounds {
     /// (resoperation.rs:290) `IntOp(idx) == InputArgInt(idx)` is false,
     /// so cache keys silently key-mismatch.
     ///
-    /// Mint via `make_constant_int` (constant namespace, CONST_BIT set,
-    /// typed `OpRef::const_int(idx)` per history.py:220 ConstInt.type).
+    /// Mint via `make_constant_int` (constant namespace, inline-Const
+    /// variant `OpRef::ConstIntInline(value)` per history.py:227).
     /// Constants minted at this site land in a namespace disjoint from
     /// any op/inputarg Box family, so no aliasing hazard remains.
     fn get_or_make_const(&self, value: i64, ctx: &mut OptContext) -> OpRef {

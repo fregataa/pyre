@@ -115,6 +115,10 @@ impl ConstantPool {
     /// Per-value dedup belongs to the resume tagging memo
     /// (`resume.py:148-172 ResumeDataLoopMemo.large_ints`), which lives
     /// in `resume.rs` and is unaffected by this method.
+    // legacy-const-ok: ConstantPool's own get_or_insert mints a legacy
+    // idx-Const that keys into self.constants. Inline-Const variants
+    // bypass the pool entirely; this entry exists for callers that
+    // need the legacy pool's raw-key contract.
     pub fn get_or_insert(&mut self, value: i64) -> OpRef {
         let opref = OpRef::const_int(self.next_const_idx);
         self.next_const_idx += 1;
@@ -135,6 +139,11 @@ impl ConstantPool {
     /// `rooted_refs` (alongside `refresh_from_gc`) is the single source
     /// of truth for which slots track a Ref constant; the post-GC
     /// address is written back to `constants[opref_key]` on each refresh.
+    // legacy-const-ok: ConstantPool's own get_or_insert_typed mints a
+    // typed legacy idx-Const that keys into self.constants. Inline-Const
+    // variants travel on the OpRef and never enter this pool; callers
+    // that need the raw-key/pool-index contract continue to come through
+    // here.
     pub fn get_or_insert_typed(&mut self, value: i64, tp: Type) -> OpRef {
         match tp {
             Type::Void => panic!("Void constants are not supported"),
@@ -225,6 +234,15 @@ impl ConstantPool {
     /// caller bug) and would otherwise return a Value carrying the wrong
     /// type for the OpRef's class.
     pub fn get_value(&self, opref: OpRef) -> Option<Value> {
+        // history.py:227/268/314 — ConstInt/ConstFloat/ConstPtr `.value`
+        // is inline on the Box. Inline-variant OpRefs carry the value
+        // directly; resolve without pool lookup.
+        match opref {
+            OpRef::ConstIntInline(v) => return Some(Value::Int(v)),
+            OpRef::ConstFloatInline(v) => return Some(Value::Float(v)),
+            OpRef::ConstPtrInline(v) => return Some(Value::Ref(v)),
+            _ => {}
+        }
         let stored = self.constants.get(&opref.raw()).cloned()?;
         debug_assert!(
             opref.ty().map(|t| t == stored.get_type()).unwrap_or(true),
@@ -269,9 +287,10 @@ impl ConstantPool {
         if a.ty() != b.ty() {
             return false;
         }
-        let av = self.constants.get(&a.raw());
-        let bv = self.constants.get(&b.raw());
-        match (av, bv) {
+        // Resolve each operand via get_value so inline-Const variants
+        // (history.py:227/268/314 `.value` inline) are handled uniformly
+        // with pooled variants.
+        match (self.get_value(a), self.get_value(b)) {
             (Some(x), Some(y)) => x == y,
             _ => false,
         }
@@ -361,6 +380,16 @@ impl ConstantPool {
     /// Look up a constant's raw `i64` bits (legacy backend boundary).
     /// Returns `None` if `opref` is not in the pool.
     pub fn raw_bits(&self, opref: OpRef) -> Option<i64> {
+        // Inline-Const variants carry value directly (history.py:227/268/314).
+        if let Some(v) = opref.as_const_int_inline() {
+            return Some(v);
+        }
+        if let Some(v) = opref.as_const_float_inline() {
+            return Some(v.to_bits() as i64);
+        }
+        if let Some(v) = opref.as_const_ptr_inline() {
+            return Some(v.0 as i64);
+        }
         self.constants.get(&opref.raw()).map(value_to_raw_bits)
     }
 
@@ -407,6 +436,9 @@ mod tests {
         assert!(pool.same_constant(a, b));
     }
 
+    // legacy-const-ok: pins ConstantPool's cross-index value-aware
+    // same_constant for two legacy idx-Const slots holding the same
+    // value.
     #[test]
     fn same_constant_value_aware_across_independent_inserts() {
         // history.py:244 ConstInt.same_constant: two ConstInt instances
@@ -450,6 +482,8 @@ mod tests {
         assert!(!pool.same_constant(inputarg, inputarg.with_raw(99)));
     }
 
+    // legacy-const-ok: pins same_constant rejection of NONE vs a legacy
+    // idx-Const operand.
     #[test]
     fn same_constant_handles_none() {
         // history.py:204-208 — `Const.same_constant` is defined only on

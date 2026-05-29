@@ -4609,17 +4609,13 @@ where
             // `TraceCtx::trace_record_exact_class` which gates on
             // `heap_cache.is_class_known` + bumps `HEAPCACHED_OPS` on
             // cache hit per pyjitpl.py:396-397.  The class operand follows
-            // blackhole.py:616 `@arguments("r", "i")`.
+            // blackhole.py:616 `@arguments("r", "i")` and remains the
+            // ConstInt vtable address that RPython passes as `clsbox`.
             jitcode::insns::BC_RECORD_EXACT_CLASS => {
                 let src = self.frames.current_mut().next_u8() as usize;
                 let cls = self.frames.current_mut().next_u8() as usize;
                 let (box_opref, _) = self.read_ref_reg(src);
-                let (cls_opref, cls_concrete) = self.read_int_reg(cls);
-                let cls_opref = if cls_opref.is_constant() {
-                    ctx.const_ref(cls_concrete)
-                } else {
-                    cls_opref
-                };
+                let (cls_opref, _) = self.read_int_reg(cls);
                 ctx.trace_record_exact_class(box_opref, cls_opref);
             }
             // pyjitpl.py opimpl_ref_guard_value → implement_guard_value

@@ -1,16 +1,13 @@
-//! Blackhole interpreter: evaluates IR operations with concrete values.
+//! Blackhole interpreter: executes jitcode bytecodes with concrete values.
 //!
-//! When a guard fails in compiled code, the blackhole interpreter can replay
-//! the remaining operations from the guard point to the end of the trace,
-//! using concrete values from the DeadFrame.
+//! When a guard fails in compiled code, `resume_in_blackhole` reconstructs
+//! execution frames from resume data and runs jitcode bytecodes with
+//! concrete values, following all code paths (not just the traced one).
 //!
 //! This is the RPython equivalent of `rpython/jit/metainterp/blackhole.py`.
 
 use crate::jitexc::JitException;
-use crate::resume::{
-    MaterializedVirtual, ResolvedPendingFieldWrite, ResumeData, ResumeDataExt, ResumeLayoutSummary,
-};
-use majit_ir::{GcRef, Op, OpCode, VecAssoc};
+use majit_ir::{GcRef, OpCode};
 
 /// blackhole.py:1068 parity: typed payload decoded from merge-point
 /// bytecode operands. Corresponds to the 6 lists in
@@ -27,85 +24,6 @@ pub struct MergePointArgs {
     pub red_ref: Vec<i64>,
     pub red_float: Vec<i64>,
 }
-
-use crate::executor::{OpResult, TraceValues, ValueStore, execute_one};
-
-/// Trait for IR-based blackhole memory access.
-///
-/// **Deprecated**: Part of the IR-based blackhole path.
-/// The jitcode-based `BlackholeInterpreter` delegates memory access
-/// through concrete function pointers in `JitCode.fn_ptrs` instead.
-pub trait BlackholeMemory {
-    /// Load a GC-managed field from `base + offset`.
-    fn gc_load_i(&self, base: i64, offset: i64) -> i64 {
-        let _ = (base, offset);
-        0
-    }
-    /// Load a GC ref field.
-    fn gc_load_r(&self, base: i64, offset: i64) -> i64 {
-        let _ = (base, offset);
-        0
-    }
-    /// Load a float field (returned as bits).
-    fn gc_load_f(&self, base: i64, offset: i64) -> i64 {
-        let _ = (base, offset);
-        0
-    }
-    /// Store an int value into a GC object field.
-    fn gc_store(&self, base: i64, offset: i64, value: i64) {
-        let _ = (base, offset, value);
-    }
-    /// Load from array at `base + index * scale + offset`.
-    fn gc_load_indexed_i(&self, base: i64, index: i64, scale: i64, offset: i64) -> i64 {
-        let _ = (base, index, scale, offset);
-        0
-    }
-    fn gc_load_indexed_r(&self, base: i64, index: i64, scale: i64, offset: i64) -> i64 {
-        let _ = (base, index, scale, offset);
-        0
-    }
-    fn gc_load_indexed_f(&self, base: i64, index: i64, scale: i64, offset: i64) -> i64 {
-        let _ = (base, index, scale, offset);
-        0
-    }
-    /// Store into array at `base + index * scale + offset`.
-    fn gc_store_indexed(&self, base: i64, index: i64, scale: i64, offset: i64, value: i64) {
-        let _ = (base, index, scale, offset, value);
-    }
-    /// Get array length.
-    fn arraylen(&self, base: i64) -> i64 {
-        let _ = base;
-        0
-    }
-    /// Get string length.
-    fn strlen(&self, base: i64) -> i64 {
-        let _ = base;
-        0
-    }
-    /// Call a function pointer with integer args, returning an integer.
-    fn call_i(&self, func: i64, args: &[i64]) -> i64 {
-        let _ = (func, args);
-        0
-    }
-    /// Call a function pointer returning a ref (as i64 pointer bits).
-    fn call_r(&self, func: i64, args: &[i64]) -> i64 {
-        let _ = (func, args);
-        0
-    }
-    /// Call a function pointer returning a float (as i64 bit-cast).
-    fn call_f(&self, func: i64, args: &[i64]) -> i64 {
-        let _ = (func, args);
-        0
-    }
-    /// Call a function pointer returning void.
-    fn call_n(&self, func: i64, args: &[i64]) {
-        let _ = (func, args);
-    }
-}
-
-/// Default no-op memory implementation (returns 0 for all loads).
-pub struct DefaultBlackholeMemory;
-impl BlackholeMemory for DefaultBlackholeMemory {}
 
 /// Exception state tracked during blackhole execution.
 ///
@@ -142,692 +60,6 @@ impl ExceptionState {
         self.exc_value = 0;
         (cls, val)
     }
-}
-
-/// Result of IR-based blackhole execution.
-///
-/// **Deprecated**: Part of the IR-based blackhole path.
-pub enum BlackholeResult {
-    /// Reached a Finish operation with output values and their types.
-    /// compile.py:636 DoneWithThisFrameDescr*.handle_fail:
-    /// the descr type determines how to interpret the value.
-    Finish {
-        op_index: usize,
-        values: Vec<i64>,
-        /// Types from the FINISH op's descr (e.g. [Type::Int] or [Type::Ref]).
-        value_types: Vec<majit_ir::Type>,
-    },
-    /// Reached a Jump — loop back to header with these values.
-    Jump { op_index: usize, values: Vec<i64> },
-    /// A guard failed during blackhole execution.
-    GuardFailed {
-        guard_index: usize,
-        fail_values: Vec<i64>,
-    },
-    /// A guard failed and resume-data virtuals were materialized for recovery.
-    GuardFailedWithVirtuals {
-        guard_index: usize,
-        fail_values: Vec<i64>,
-        materialized_virtuals: Vec<MaterializedVirtual>,
-        pending_field_writes: Vec<ResolvedPendingFieldWrite>,
-    },
-    /// Abort: encountered an unhandled operation.
-    Abort(String),
-}
-
-/// Evaluate IR operations sequentially with concrete i64 values.
-///
-/// **Deprecated**: RPython's blackhole.py executes jitcode bytecodes, not IR ops.
-/// Use `BlackholeInterpreter` + `resume_in_blackhole()` instead.
-/// This function will be removed once pyre generates jitcode and
-/// `pyjitpl.rs` guard failure recovery switches to jitcode-based blackhole.
-#[deprecated(note = "use BlackholeInterpreter for RPython-parity jitcode execution")]
-#[allow(deprecated)]
-pub fn blackhole_execute(
-    ops: &[Op],
-    constants: &VecAssoc<u32, i64>,
-    initial_values: &VecAssoc<u32, i64>,
-    start_index: usize,
-) -> BlackholeResult {
-    blackhole_execute_with_exception(
-        ops,
-        constants,
-        initial_values,
-        start_index,
-        ExceptionState::default(),
-    )
-}
-
-/// Evaluate with a concrete memory backend for load/store operations.
-///
-/// **Deprecated**: see `blackhole_execute`.
-#[deprecated(note = "use BlackholeInterpreter for RPython-parity jitcode execution")]
-pub fn blackhole_execute_with_memory(
-    ops: &[Op],
-    constants: &VecAssoc<u32, i64>,
-    initial_values: &VecAssoc<u32, i64>,
-    start_index: usize,
-    memory: &dyn BlackholeMemory,
-) -> BlackholeResult {
-    blackhole_execute_full(
-        ops,
-        constants,
-        initial_values,
-        start_index,
-        ExceptionState::default(),
-        memory,
-    )
-    .0
-}
-
-/// blackhole_execute_with_state + BlackholeMemory support.
-/// RPython _run_forever parity: Jump loops back to Label.
-pub fn blackhole_execute_full(
-    ops: &[Op],
-    constants: &VecAssoc<u32, i64>,
-    initial_values: &VecAssoc<u32, i64>,
-    start_index: usize,
-    initial_exception: ExceptionState,
-    memory: &dyn BlackholeMemory,
-) -> (BlackholeResult, ExceptionState) {
-    let mut merged = initial_values.clone();
-    for (&k, &v) in constants {
-        merged.entry_or_insert_with(k, || v);
-    }
-    let mut tv = TraceValues::from_vec_assoc(&merged);
-    drop(merged);
-    let mut exc_state = initial_exception;
-
-    // RPython _run_forever parity: find the Label op (loop header) so
-    // that Jump can loop back. The trace is [Label, ..., Jump(→Label)].
-    let label_index = ops
-        .iter()
-        .position(|op| op.opcode == OpCode::Label)
-        .unwrap_or(0);
-    let label_inputarg_positions: Vec<u32> = ops
-        .get(label_index)
-        .map(|op| op.getarglist().iter().map(|a| a.raw()).collect())
-        .unwrap_or_default();
-
-    let mut op_idx = start_index;
-
-    while op_idx < ops.len() {
-        let op = &ops[op_idx];
-        let result = execute_one_with_memory(op, &tv, &mut exc_state, memory);
-
-        match result {
-            OpResult::Value(v) => {
-                if !op.pos.get().is_none() {
-                    tv.set(op.pos.get().raw(), v);
-                }
-            }
-            OpResult::Void => {}
-            OpResult::Finish(args) => {
-                let vals: Vec<i64> = args.iter().map(|&r| tv.resolve(r)).collect();
-                let vtypes = op
-                    .with_fail_descr(|fd| fd.fail_arg_types().to_vec())
-                    .unwrap_or_default();
-                return (
-                    BlackholeResult::Finish {
-                        op_index: op_idx,
-                        values: vals,
-                        value_types: vtypes,
-                    },
-                    exc_state,
-                );
-            }
-            OpResult::Jump(args) => {
-                // RPython _run_forever parity: Jump loops back to Label.
-                let vals: Vec<i64> = args.iter().map(|&r| tv.resolve(r)).collect();
-                for (pos, val) in label_inputarg_positions.iter().zip(vals.iter()) {
-                    tv.set(*pos, *val);
-                }
-                op_idx = label_index + 1;
-                continue;
-            }
-            OpResult::GuardFailed => {
-                let fail_values = if let Some(fail_args) = op.getfailargs() {
-                    fail_args.iter().map(|&r| tv.resolve(r)).collect()
-                } else {
-                    vec![]
-                };
-                return (
-                    BlackholeResult::GuardFailed {
-                        guard_index: op_idx,
-                        fail_values,
-                    },
-                    exc_state,
-                );
-            }
-            OpResult::Unsupported(msg) => {
-                return (BlackholeResult::Abort(msg), exc_state);
-            }
-        }
-        op_idx += 1;
-    }
-
-    (
-        BlackholeResult::Abort("reached end of ops without finish/jump".to_string()),
-        exc_state,
-    )
-}
-
-/// Dispatch an op using real memory access when a BlackholeMemory backend is available.
-fn execute_one_with_memory(
-    op: &Op,
-    values: &(impl ValueStore + ?Sized),
-    exc: &mut ExceptionState,
-    memory: &dyn BlackholeMemory,
-) -> OpResult {
-    match op.opcode {
-        // Memory access ops with real backend
-        OpCode::GcLoadI => {
-            let base = values.resolve(op.arg(0));
-            let offset = values.resolve(op.arg(1));
-            OpResult::Value(memory.gc_load_i(base, offset))
-        }
-        OpCode::GcLoadR => {
-            let base = values.resolve(op.arg(0));
-            let offset = values.resolve(op.arg(1));
-            OpResult::Value(memory.gc_load_r(base, offset))
-        }
-        OpCode::GcLoadF => {
-            let base = values.resolve(op.arg(0));
-            let offset = values.resolve(op.arg(1));
-            OpResult::Value(memory.gc_load_f(base, offset))
-        }
-        OpCode::GcStore => {
-            let base = values.resolve(op.arg(0));
-            let offset = values.resolve(op.arg(1));
-            let value = values.resolve(op.arg(2));
-            memory.gc_store(base, offset, value);
-            OpResult::Void
-        }
-        OpCode::GcLoadIndexedI => {
-            let base = values.resolve(op.arg(0));
-            let index = values.resolve(op.arg(1));
-            let scale = values.resolve(op.arg(2));
-            let offset = values.resolve(op.arg(3));
-            OpResult::Value(memory.gc_load_indexed_i(base, index, scale, offset))
-        }
-        OpCode::GcLoadIndexedR => {
-            let base = values.resolve(op.arg(0));
-            let index = values.resolve(op.arg(1));
-            let scale = values.resolve(op.arg(2));
-            let offset = values.resolve(op.arg(3));
-            OpResult::Value(memory.gc_load_indexed_r(base, index, scale, offset))
-        }
-        OpCode::GcLoadIndexedF => {
-            let base = values.resolve(op.arg(0));
-            let index = values.resolve(op.arg(1));
-            let scale = values.resolve(op.arg(2));
-            let offset = values.resolve(op.arg(3));
-            OpResult::Value(memory.gc_load_indexed_f(base, index, scale, offset))
-        }
-        OpCode::GcStoreIndexed => {
-            let base = values.resolve(op.arg(0));
-            let index = values.resolve(op.arg(1));
-            let value = values.resolve(op.arg(2));
-            let scale = values.resolve(op.arg(3));
-            let offset = values.resolve(op.arg(4));
-            memory.gc_store_indexed(base, index, scale, offset, value);
-            OpResult::Void
-        }
-        OpCode::ArraylenGc => {
-            let base = values.resolve(op.arg(0));
-            OpResult::Value(memory.arraylen(base))
-        }
-        OpCode::Strlen | OpCode::Unicodelen => {
-            let base = values.resolve(op.arg(0));
-            OpResult::Value(memory.strlen(base))
-        }
-        // ── Field access via descr offset ──
-        OpCode::GetfieldGcI | OpCode::GetfieldRawI | OpCode::GetfieldGcPureI => {
-            let base = values.resolve(op.arg(0));
-            let offset = op.with_field_descr(|f| f.offset() as i64).unwrap_or(0);
-            OpResult::Value(memory.gc_load_i(base, offset))
-        }
-        OpCode::GetfieldGcR | OpCode::GetfieldRawR | OpCode::GetfieldGcPureR => {
-            let base = values.resolve(op.arg(0));
-            let offset = op.with_field_descr(|f| f.offset() as i64).unwrap_or(0);
-            OpResult::Value(memory.gc_load_r(base, offset))
-        }
-        OpCode::GetfieldGcF | OpCode::GetfieldRawF | OpCode::GetfieldGcPureF => {
-            let base = values.resolve(op.arg(0));
-            let offset = op.with_field_descr(|f| f.offset() as i64).unwrap_or(0);
-            OpResult::Value(memory.gc_load_f(base, offset))
-        }
-        OpCode::SetfieldGc | OpCode::SetfieldRaw => {
-            let base = values.resolve(op.arg(0));
-            let value = values.resolve(op.arg(1));
-            let offset = op.with_field_descr(|f| f.offset() as i64).unwrap_or(0);
-            memory.gc_store(base, offset, value);
-            OpResult::Void
-        }
-        // ── Array access via descr ──
-        OpCode::GetarrayitemGcI | OpCode::GetarrayitemRawI | OpCode::GetarrayitemGcPureI => {
-            let base = values.resolve(op.arg(0));
-            let index = values.resolve(op.arg(1));
-            let (item_size, base_ofs) = op
-                .with_array_descr(|a| (a.item_size() as i64, a.base_size() as i64))
-                .unwrap_or((1, 0));
-            OpResult::Value(memory.gc_load_indexed_i(base, index, item_size, base_ofs))
-        }
-        OpCode::GetarrayitemGcR | OpCode::GetarrayitemRawR | OpCode::GetarrayitemGcPureR => {
-            let base = values.resolve(op.arg(0));
-            let index = values.resolve(op.arg(1));
-            let (item_size, base_ofs) = op
-                .with_array_descr(|a| (a.item_size() as i64, a.base_size() as i64))
-                .unwrap_or((1, 0));
-            OpResult::Value(memory.gc_load_indexed_r(base, index, item_size, base_ofs))
-        }
-        OpCode::GetarrayitemGcF | OpCode::GetarrayitemRawF | OpCode::GetarrayitemGcPureF => {
-            let base = values.resolve(op.arg(0));
-            let index = values.resolve(op.arg(1));
-            let (item_size, base_ofs) = op
-                .with_array_descr(|a| (a.item_size() as i64, a.base_size() as i64))
-                .unwrap_or((1, 0));
-            OpResult::Value(memory.gc_load_indexed_f(base, index, item_size, base_ofs))
-        }
-        OpCode::SetarrayitemGc | OpCode::SetarrayitemRaw => {
-            let base = values.resolve(op.arg(0));
-            let index = values.resolve(op.arg(1));
-            let value = values.resolve(op.arg(2));
-            let (item_size, base_ofs) = op
-                .with_array_descr(|a| (a.item_size() as i64, a.base_size() as i64))
-                .unwrap_or((1, 0));
-            memory.gc_store_indexed(base, index, item_size, base_ofs, value);
-            OpResult::Void
-        }
-        // Call with real dispatch (all call variants)
-        OpCode::CallI
-        | OpCode::CallPureI
-        | OpCode::CallMayForceI
-        | OpCode::CallReleaseGilI
-        | OpCode::CallLoopinvariantI => {
-            let func = values.resolve(op.arg(0));
-            let args: Vec<i64> = op.getarglist()[1..]
-                .iter()
-                .map(|&r| values.resolve(r))
-                .collect();
-            OpResult::Value(memory.call_i(func, &args))
-        }
-        OpCode::CallR | OpCode::CallPureR | OpCode::CallMayForceR | OpCode::CallLoopinvariantR => {
-            let func = values.resolve(op.arg(0));
-            let args: Vec<i64> = op.getarglist()[1..]
-                .iter()
-                .map(|&r| values.resolve(r))
-                .collect();
-            OpResult::Value(memory.call_r(func, &args))
-        }
-        OpCode::CallF
-        | OpCode::CallPureF
-        | OpCode::CallMayForceF
-        | OpCode::CallReleaseGilF
-        | OpCode::CallLoopinvariantF => {
-            let func = values.resolve(op.arg(0));
-            let args: Vec<i64> = op.getarglist()[1..]
-                .iter()
-                .map(|&r| values.resolve(r))
-                .collect();
-            OpResult::Value(memory.call_f(func, &args))
-        }
-        OpCode::CallN
-        | OpCode::CallPureN
-        | OpCode::CallMayForceN
-        | OpCode::CallReleaseGilN
-        | OpCode::CallLoopinvariantN => {
-            let func = values.resolve(op.arg(0));
-            let args: Vec<i64> = op.getarglist()[1..]
-                .iter()
-                .map(|&r| values.resolve(r))
-                .collect();
-            memory.call_n(func, &args);
-            OpResult::Void
-        }
-        // CallAssembler — delegate to call dispatch
-        OpCode::CallAssemblerI => {
-            let func = values.resolve(op.arg(0));
-            let args: Vec<i64> = op.getarglist()[1..]
-                .iter()
-                .map(|&r| values.resolve(r))
-                .collect();
-            OpResult::Value(memory.call_i(func, &args))
-        }
-        OpCode::CallAssemblerR => {
-            let func = values.resolve(op.arg(0));
-            let args: Vec<i64> = op.getarglist()[1..]
-                .iter()
-                .map(|&r| values.resolve(r))
-                .collect();
-            OpResult::Value(memory.call_r(func, &args))
-        }
-        OpCode::CallAssemblerF => {
-            let func = values.resolve(op.arg(0));
-            let args: Vec<i64> = op.getarglist()[1..]
-                .iter()
-                .map(|&r| values.resolve(r))
-                .collect();
-            OpResult::Value(memory.call_f(func, &args))
-        }
-        OpCode::CallAssemblerN => {
-            let func = values.resolve(op.arg(0));
-            let args: Vec<i64> = op.getarglist()[1..]
-                .iter()
-                .map(|&r| values.resolve(r))
-                .collect();
-            memory.call_n(func, &args);
-            OpResult::Void
-        }
-        // CondCallValue — delegate to call dispatch
-        OpCode::CondCallValueI => {
-            let func = values.resolve(op.arg(0));
-            let args: Vec<i64> = op.getarglist()[1..]
-                .iter()
-                .map(|&r| values.resolve(r))
-                .collect();
-            OpResult::Value(memory.call_i(func, &args))
-        }
-        OpCode::CondCallValueR => {
-            let func = values.resolve(op.arg(0));
-            let args: Vec<i64> = op.getarglist()[1..]
-                .iter()
-                .map(|&r| values.resolve(r))
-                .collect();
-            OpResult::Value(memory.call_r(func, &args))
-        }
-        OpCode::CondCallN => {
-            let func = values.resolve(op.arg(0));
-            let args: Vec<i64> = op.getarglist()[1..]
-                .iter()
-                .map(|&r| values.resolve(r))
-                .collect();
-            memory.call_n(func, &args);
-            OpResult::Void
-        }
-        // Fall through to the default execute_one for everything else
-        _ => execute_one(op, values, exc),
-    }
-}
-
-/// **Deprecated**: IR-based blackhole. Will be replaced by jitcode-based
-/// `resume_in_blackhole()` once pyre generates jitcode.
-/// blackhole.py:1095 bhimpl_recursive_call parity:
-/// Callback to execute a CallAssembler op during IR blackhole.
-/// Receives the callee frame pointer (args[0]) and returns the result.
-/// In RPython this is `portal_runner` via `cpu.bh_call_i`.
-pub type CallAssemblerFn = dyn Fn(i64) -> i64;
-
-pub(crate) fn blackhole_execute_with_state(
-    ops: &[Op],
-    constants: &VecAssoc<u32, i64>,
-    initial_values: &VecAssoc<u32, i64>,
-    start_index: usize,
-    initial_exception: ExceptionState,
-) -> (BlackholeResult, ExceptionState) {
-    blackhole_execute_with_state_ca(
-        ops,
-        constants,
-        initial_values,
-        start_index,
-        initial_exception,
-        None,
-    )
-}
-
-pub(crate) fn blackhole_execute_with_state_ca(
-    ops: &[Op],
-    constants: &VecAssoc<u32, i64>,
-    initial_values: &VecAssoc<u32, i64>,
-    start_index: usize,
-    initial_exception: ExceptionState,
-    call_assembler_fn: Option<&CallAssemblerFn>,
-) -> (BlackholeResult, ExceptionState) {
-    let mut merged = initial_values.clone();
-    for (&k, &v) in constants {
-        merged.entry_or_insert_with(k, || v);
-    }
-    let mut tv = TraceValues::from_vec_assoc(&merged);
-    drop(merged);
-    let mut exc_state = initial_exception;
-
-    // Defensive trivial-loop short-circuit (mirrors
-    // pyjitpl/mod.rs:9188-9199): `_run_forever` parity here is a
-    // TODO (PyPy interprets jitcode bytecodes, not IR ops). When
-    // ops[start_index..] contains a Jump but no real work, the Jump-loops-
-    // to-Label parity (line 644-653 below) re-enters the body indefinitely
-    // without making progress. Return GuardFailed early using the preceding
-    // guard op's fail_args layout so the caller's exit_layout decode keys
-    // against a stable position.
-    let mut trivial_has_jump = false;
-    let mut trivial_has_work = false;
-    for op in &ops[start_index..] {
-        match op.opcode {
-            OpCode::Label => {}
-            OpCode::Jump => trivial_has_jump = true,
-            _ => {
-                trivial_has_work = true;
-                break;
-            }
-        }
-    }
-    if trivial_has_jump && !trivial_has_work {
-        let guard_idx = start_index.saturating_sub(1);
-        let fail_values = ops
-            .get(guard_idx)
-            .and_then(|op| op.getfailargs())
-            .map(|args| {
-                args.iter()
-                    .map(|a| {
-                        initial_values
-                            .get(&a.raw())
-                            .or_else(|| constants.get(&a.raw()))
-                            .copied()
-                            .unwrap_or(0)
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        return (
-            BlackholeResult::GuardFailed {
-                guard_index: guard_idx,
-                fail_values,
-            },
-            exc_state,
-        );
-    }
-
-    // RPython _run_forever parity: find the Label op (loop header) so
-    // that Jump can loop back. The trace is [Label, ..., Jump(→Label)].
-    let label_index = ops
-        .iter()
-        .position(|op| op.opcode == OpCode::Label)
-        .unwrap_or(0);
-    // Label's args define the loop's inputargs (their OpRef positions).
-    let label_inputarg_positions: Vec<u32> = ops
-        .get(label_index)
-        .map(|op| op.getarglist().iter().map(|a| a.raw()).collect())
-        .unwrap_or_default();
-
-    let mut op_idx = start_index;
-
-    // blackhole.py:1752 _run_forever: no iteration cap.
-    while op_idx < ops.len() {
-        let op = &ops[op_idx];
-        let result = execute_one(op, &tv, &mut exc_state);
-
-        match result {
-            OpResult::Value(v) => {
-                if !op.pos.get().is_none() {
-                    tv.set(op.pos.get().raw(), v);
-                }
-            }
-            OpResult::Void => {}
-            // blackhole.py:1095 bhimpl_recursive_call parity:
-            // CallAssembler ops invoke portal_runner via call_assembler_fn.
-            OpResult::Unsupported(_)
-                if call_assembler_fn.is_some() && op.opcode.is_call_assembler() =>
-            {
-                let ca_fn = call_assembler_fn.unwrap();
-                let frame_ptr = tv.resolve(op.arg(0));
-                let result = ca_fn(frame_ptr);
-                if !op.pos.get().is_none() {
-                    tv.set(op.pos.get().raw(), result);
-                }
-            }
-            OpResult::Finish(args) => {
-                let vals: Vec<i64> = args.iter().map(|&r| tv.resolve(r)).collect();
-                let vtypes = op
-                    .with_fail_descr(|fd| fd.fail_arg_types().to_vec())
-                    .unwrap_or_default();
-                return (
-                    BlackholeResult::Finish {
-                        op_index: op_idx,
-                        values: vals,
-                        value_types: vtypes,
-                    },
-                    exc_state,
-                );
-            }
-            OpResult::Jump(args) => {
-                // RPython _run_forever parity: Jump loops back to Label.
-                // Map jump args → label inputargs and restart from label+1.
-                let vals: Vec<i64> = args.iter().map(|&r| tv.resolve(r)).collect();
-                for (pos, val) in label_inputarg_positions.iter().zip(vals.iter()) {
-                    tv.set(*pos, *val);
-                }
-                op_idx = label_index + 1;
-                continue;
-            }
-            OpResult::GuardFailed => {
-                let fail_values = if let Some(fail_args) = op.getfailargs() {
-                    fail_args.iter().map(|&r| tv.resolve(r)).collect()
-                } else {
-                    vec![]
-                };
-                return (
-                    BlackholeResult::GuardFailed {
-                        guard_index: op_idx,
-                        fail_values,
-                    },
-                    exc_state,
-                );
-            }
-            OpResult::Unsupported(msg) => {
-                return (BlackholeResult::Abort(msg), exc_state);
-            }
-        }
-        op_idx += 1;
-    }
-
-    (
-        BlackholeResult::Abort("reached end of ops without finish/jump".to_string()),
-        exc_state,
-    )
-}
-
-/// Evaluate IR operations sequentially with concrete i64 values and an
-/// already-pending exception state.
-///
-/// **Deprecated**: see `blackhole_execute`.
-#[deprecated(note = "use BlackholeInterpreter for RPython-parity jitcode execution")]
-pub fn blackhole_execute_with_exception(
-    ops: &[Op],
-    constants: &VecAssoc<u32, i64>,
-    initial_values: &VecAssoc<u32, i64>,
-    start_index: usize,
-    initial_exception: ExceptionState,
-) -> BlackholeResult {
-    blackhole_execute_with_state(
-        ops,
-        constants,
-        initial_values,
-        start_index,
-        initial_exception,
-    )
-    .0
-}
-
-/// Blackhole execution with virtual object materialization.
-#[deprecated(note = "use BlackholeInterpreter for RPython-parity jitcode execution")]
-pub fn blackhole_with_virtuals(
-    ops: &[Op],
-    constants: &VecAssoc<u32, i64>,
-    initial_values: &VecAssoc<u32, i64>,
-    start_index: usize,
-    resume_data: Option<&ResumeData>,
-) -> BlackholeResult {
-    blackhole_with_recovery_layout(
-        ops,
-        constants,
-        initial_values,
-        start_index,
-        resume_data,
-        None,
-    )
-}
-
-/// Blackhole execution with semantic-free resume-layout materialization.
-#[deprecated(note = "use BlackholeInterpreter for RPython-parity jitcode execution")]
-pub fn blackhole_with_resume_layout(
-    ops: &[Op],
-    constants: &VecAssoc<u32, i64>,
-    initial_values: &VecAssoc<u32, i64>,
-    start_index: usize,
-    resume_layout: Option<&ResumeLayoutSummary>,
-) -> BlackholeResult {
-    blackhole_with_recovery_layout(
-        ops,
-        constants,
-        initial_values,
-        start_index,
-        None,
-        resume_layout,
-    )
-}
-
-fn blackhole_with_recovery_layout(
-    ops: &[Op],
-    constants: &VecAssoc<u32, i64>,
-    initial_values: &VecAssoc<u32, i64>,
-    start_index: usize,
-    resume_data: Option<&ResumeData>,
-    resume_layout: Option<&ResumeLayoutSummary>,
-) -> BlackholeResult {
-    #[allow(deprecated)]
-    let result = blackhole_execute(ops, constants, initial_values, start_index);
-
-    // If guard failed and we have resume data with virtuals, materialize them
-    if let BlackholeResult::GuardFailed {
-        guard_index,
-        ref fail_values,
-    } = result
-    {
-        if let Some(rd) = resume_data {
-            if !rd.virtuals.is_empty() || !rd.pending_fields.is_empty() {
-                let materialized = rd.materialize_virtuals(fail_values);
-                let pending_field_writes =
-                    ResumeData::resolve_pending_field_writes(&rd.pending_fields, fail_values);
-                return BlackholeResult::GuardFailedWithVirtuals {
-                    guard_index,
-                    fail_values: fail_values.clone(),
-                    materialized_virtuals: materialized,
-                    pending_field_writes,
-                };
-            }
-        } else if let Some(layout) = resume_layout {
-            if layout.num_virtuals > 0 || layout.pending_field_count > 0 {
-                return BlackholeResult::GuardFailedWithVirtuals {
-                    guard_index,
-                    fail_values: fail_values.clone(),
-                    materialized_virtuals: layout.materialize_virtuals(fail_values),
-                    pending_field_writes: layout.resolve_pending_field_writes(fail_values),
-                };
-            }
-        }
-    }
-
-    result
 }
 
 // ============================================================================
@@ -3088,296 +2320,96 @@ mod tests {
     //! for interpreter pooling, exception-state handling, and blackhole control
     //! flow.
     //!
-    //! The opcode-by-opcode `execute_one` coverage below is mostly original
-    //! Rust unit coverage. PyPy does not keep a dedicated `test_executor.py` in
-    //! this tree, so these tests exist to pin down the local Rust dispatcher
-    //! and arithmetic edge cases directly.
+    //! The opcode-by-opcode coverage below drives the orthodox runtime
+    //! helpers (`bhimpl_*`, `eval_*`) directly. PyPy keeps no dedicated
+    //! `test_executor.py` in this tree, so these tests pin down the local
+    //! helpers and arithmetic edge cases directly.
 
     use super::*;
-    use majit_ir::OpRef;
 
-    fn mk_op(opcode: OpCode, args: &[OpRef], pos: u32) -> Op {
-        let mut op = Op::new(opcode, args);
-        op.pos.set(OpRef::int_op(pos));
-        op
-    }
-
-    #[test]
-    fn test_blackhole_simple_arithmetic() {
-        let ops = vec![
-            mk_op(
-                OpCode::Label,
-                &[OpRef::int_op(0), OpRef::int_op(1)],
-                OpRef::NONE.raw(),
-            ),
-            mk_op(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)], 2),
-            mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
-        ];
-        let mut initial: VecAssoc<u32, i64> = VecAssoc::new();
-        initial.insert(0, 10i64);
-        initial.insert(1, 20i64);
-
-        match blackhole_execute(&ops, &VecAssoc::new(), &initial, 0) {
-            BlackholeResult::Finish { values: vals, .. } => assert_eq!(vals, vec![30]),
-            other => panic!(
-                "expected Finish, got {:?}",
-                match other {
-                    BlackholeResult::Abort(s) => s,
-                    _ => "other".to_string(),
-                }
-            ),
-        }
-    }
-
-    #[test]
-    fn test_blackhole_guard_passes() {
-        let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::int_op(0)], OpRef::NONE.raw()),
-            mk_op(OpCode::GuardTrue, &[OpRef::int_op(0)], OpRef::NONE.raw()),
-            mk_op(OpCode::Finish, &[OpRef::int_op(0)], OpRef::NONE.raw()),
-        ];
-        let mut initial: VecAssoc<u32, i64> = VecAssoc::new();
-        initial.insert(0, 1i64);
-
-        match blackhole_execute(&ops, &VecAssoc::new(), &initial, 0) {
-            BlackholeResult::Finish { values: vals, .. } => assert_eq!(vals, vec![1]),
-            _ => panic!("expected Finish"),
-        }
-    }
-
-    #[test]
-    fn test_blackhole_exception_guard_no_exception_passes() {
-        let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::int_op(0)], OpRef::NONE.raw()),
-            mk_op(OpCode::GuardNoException, &[], OpRef::NONE.raw()),
-            mk_op(OpCode::Finish, &[OpRef::int_op(0)], OpRef::NONE.raw()),
-        ];
-        let mut initial: VecAssoc<u32, i64> = VecAssoc::new();
-        initial.insert(0, 42i64);
-
-        match blackhole_execute(&ops, &VecAssoc::new(), &initial, 0) {
-            BlackholeResult::Finish { values: vals, .. } => assert_eq!(vals, vec![42]),
-            _ => panic!("expected Finish when no exception is pending"),
-        }
-    }
-
-    #[test]
-    fn test_blackhole_initial_exception_fails_guard_no_exception_without_restore() {
-        let mut guard_op = mk_op(OpCode::GuardNoException, &[], OpRef::NONE.raw());
-        guard_op.setfailargs(smallvec::smallvec![OpRef::int_op(0)]);
-        let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::int_op(0)], OpRef::NONE.raw()),
-            guard_op,
-            mk_op(OpCode::Finish, &[OpRef::int_op(0)], OpRef::NONE.raw()),
-        ];
-        let mut initial: VecAssoc<u32, i64> = VecAssoc::new();
-        initial.insert(0, 42i64);
-
-        match blackhole_execute_with_exception(
-            &ops,
-            &VecAssoc::new(),
-            &initial,
-            0,
-            ExceptionState {
-                exc_class: 100,
-                exc_value: 200,
-                ovf_flag: false,
-            },
-        ) {
-            BlackholeResult::GuardFailed { .. } => {}
-            _ => panic!("expected GuardFailed when initial exception is pending"),
-        }
-    }
-
-    #[test]
-    fn test_blackhole_initial_exception_satisfies_guard_exception_without_restore() {
-        let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::int_op(0)], OpRef::NONE.raw()),
-            mk_op(OpCode::GuardException, &[OpRef::int_op(0)], 1),
-            mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
-        ];
-        let mut initial: VecAssoc<u32, i64> = VecAssoc::new();
-        initial.insert(0, 100i64);
-
-        match blackhole_execute_with_exception(
-            &ops,
-            &VecAssoc::new(),
-            &initial,
-            0,
-            ExceptionState {
-                exc_class: 100,
-                exc_value: 200,
-                ovf_flag: false,
-            },
-        ) {
-            BlackholeResult::Finish { values: vals, .. } => assert_eq!(vals, vec![200]),
-            _ => panic!("expected Finish when initial exception class matches"),
-        }
-    }
-
-    #[test]
-    fn test_blackhole_exception_save_exc_class() {
-        // RestoreException sets exception state, then SaveExcClass reads it.
-        let ops = vec![
-            mk_op(
-                OpCode::Label,
-                &[OpRef::int_op(0), OpRef::int_op(1)],
-                OpRef::NONE.raw(),
-            ),
-            mk_op(
-                OpCode::RestoreException,
-                &[OpRef::int_op(0), OpRef::int_op(1)],
-                OpRef::NONE.raw(),
-            ),
-            mk_op(OpCode::SaveExcClass, &[], 2),
-            mk_op(OpCode::SaveException, &[], 3),
-            mk_op(
-                OpCode::Finish,
-                &[OpRef::int_op(2), OpRef::int_op(3)],
-                OpRef::NONE.raw(),
-            ),
-        ];
-        let mut initial: VecAssoc<u32, i64> = VecAssoc::new();
-        initial.insert(0, 100i64); // exc_class
-        initial.insert(1, 200i64); // exc_value
-
-        match blackhole_execute(&ops, &VecAssoc::new(), &initial, 0) {
-            BlackholeResult::Finish { values: vals, .. } => assert_eq!(vals, vec![100, 200]),
-            _ => panic!("expected Finish"),
-        }
-    }
-
-    #[test]
-    fn test_blackhole_guard_no_exception_fails_with_exception() {
-        // RestoreException then GuardNoException should fail.
-        let mut guard_op = mk_op(OpCode::GuardNoException, &[], OpRef::NONE.raw());
-        guard_op.setfailargs(smallvec::smallvec![OpRef::int_op(0)]);
-        let ops = vec![
-            mk_op(
-                OpCode::Label,
-                &[OpRef::int_op(0), OpRef::int_op(1)],
-                OpRef::NONE.raw(),
-            ),
-            mk_op(
-                OpCode::RestoreException,
-                &[OpRef::int_op(0), OpRef::int_op(1)],
-                OpRef::NONE.raw(),
-            ),
-            guard_op,
-            mk_op(OpCode::Finish, &[OpRef::int_op(0)], OpRef::NONE.raw()),
-        ];
-        let mut initial: VecAssoc<u32, i64> = VecAssoc::new();
-        initial.insert(0, 100i64);
-        initial.insert(1, 200i64);
-
-        match blackhole_execute(&ops, &VecAssoc::new(), &initial, 0) {
-            BlackholeResult::GuardFailed { .. } => {} // expected
-            _ => panic!("expected GuardFailed when exception is pending"),
-        }
-    }
-
-    #[test]
-    fn test_blackhole_guard_exception_matches() {
-        // Set exception, then GuardException with matching class should pass.
-        let ops = vec![
-            mk_op(
-                OpCode::Label,
-                &[OpRef::int_op(0), OpRef::int_op(1)],
-                OpRef::NONE.raw(),
-            ),
-            mk_op(
-                OpCode::RestoreException,
-                &[OpRef::int_op(0), OpRef::int_op(1)],
-                OpRef::NONE.raw(),
-            ),
-            // GuardException expects class in arg(0)
-            mk_op(OpCode::GuardException, &[OpRef::int_op(0)], 2),
-            mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
-        ];
-        let mut initial: VecAssoc<u32, i64> = VecAssoc::new();
-        initial.insert(0, 100i64); // exc_class
-        initial.insert(1, 200i64); // exc_value
-
-        match blackhole_execute(&ops, &VecAssoc::new(), &initial, 0) {
-            BlackholeResult::Finish { values: vals, .. } => {
-                // GuardException should return the exc_value
-                assert_eq!(vals, vec![200]);
-            }
-            _ => panic!("expected Finish when exception class matches"),
-        }
-    }
-
-    #[test]
-    fn test_blackhole_guard_fails() {
-        let mut guard_op = mk_op(OpCode::GuardTrue, &[OpRef::int_op(0)], OpRef::NONE.raw());
-        guard_op.setfailargs(smallvec::smallvec![OpRef::int_op(0)]);
-        let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::int_op(0)], OpRef::NONE.raw()),
-            guard_op,
-            mk_op(OpCode::Finish, &[OpRef::int_op(0)], OpRef::NONE.raw()),
-        ];
-        let mut initial: VecAssoc<u32, i64> = VecAssoc::new();
-        initial.insert(0, 0i64);
-
-        match blackhole_execute(&ops, &VecAssoc::new(), &initial, 0) {
-            BlackholeResult::GuardFailed { fail_values, .. } => {
-                assert_eq!(fail_values, vec![0]);
-            }
-            _ => panic!("expected GuardFailed"),
-        }
-    }
-
-    // ── Executor opcode tests (Rust-original dispatcher coverage) ──
+    // ── Executor opcode tests (bhimpl_* runtime coverage) ──
     //
-    // Systematic correctness tests for each opcode category handled by the
-    // local Rust blackhole dispatcher.
+    // Systematic correctness tests for each opcode category, driven directly
+    // against the orthodox runtime helpers that the jitcode
+    // `BlackholeInterpreter` dispatches to: `blackhole.py` `bhimpl_*` for the
+    // ops that have one, `pyjitpl/dispatch.rs` `eval_*` for float
+    // compares + float floordiv/mod, and `support.py` `_ll_2_int_{floordiv,mod}`
+    // for integer division (`jtransform.py:576 _do_builtin_call` residual).
 
-    /// Helper: build and execute a single binop, returning the i64 result.
+    /// Dispatch a single binary opcode to its orthodox runtime helper and
+    /// return the i64 result (float results are returned as `f64::to_bits`).
     fn exec_binop(opcode: OpCode, a: i64, b: i64) -> i64 {
-        let ops = vec![
-            mk_op(
-                OpCode::Label,
-                &[OpRef::int_op(0), OpRef::int_op(1)],
-                OpRef::NONE.raw(),
-            ),
-            mk_op(opcode, &[OpRef::int_op(0), OpRef::int_op(1)], 2),
-            mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
-        ];
-        let mut initial: VecAssoc<u32, i64> = VecAssoc::new();
-        initial.insert(0, a);
-        initial.insert(1, b);
-        match blackhole_execute(&ops, &VecAssoc::new(), &initial, 0) {
-            BlackholeResult::Finish { values, .. } => values[0],
-            other => panic!(
-                "expected Finish for {:?}, got {:?}",
-                opcode,
-                match other {
-                    BlackholeResult::Abort(s) => s,
-                    _ => "other".to_string(),
-                }
-            ),
+        match opcode {
+            // intmask(a OP b) — blackhole.py:458-468. INT_*_OVF run the same
+            // wrapping body in the blackhole; overflow detection is the
+            // separate `int_*_jump_if_ovf` bytecode (blackhole.py:478-497).
+            OpCode::IntAdd | OpCode::IntAddOvf => bhimpl_int_add(a, b),
+            OpCode::IntSub | OpCode::IntSubOvf => bhimpl_int_sub(a, b),
+            OpCode::IntMul | OpCode::IntMulOvf => bhimpl_int_mul(a, b),
+            // INT_FLOORDIV / INT_MOD are residual calls to the C-truncating
+            // helpers (support.py:255-271). The zero-divisor and INT_MIN/-1
+            // corners are guarded out of the trace before the call.
+            OpCode::IntFloorDiv => _ll_2_int_floordiv(a, b),
+            OpCode::IntMod => _ll_2_int_mod(a, b),
+            OpCode::IntAnd => bhimpl_int_and(a, b),
+            OpCode::IntOr => bhimpl_int_or(a, b),
+            OpCode::IntXor => bhimpl_int_xor(a, b),
+            OpCode::IntLshift => bhimpl_int_lshift(a, b),
+            OpCode::IntRshift => bhimpl_int_rshift(a, b),
+            OpCode::UintRshift => bhimpl_uint_rshift(a, b),
+            OpCode::IntLt => bhimpl_int_lt(a, b),
+            OpCode::IntLe => bhimpl_int_le(a, b),
+            OpCode::IntGt => bhimpl_int_gt(a, b),
+            OpCode::IntGe => bhimpl_int_ge(a, b),
+            OpCode::IntEq => bhimpl_int_eq(a, b),
+            OpCode::IntNe => bhimpl_int_ne(a, b),
+            OpCode::UintLt => bhimpl_uint_lt(a, b),
+            OpCode::UintLe => bhimpl_uint_le(a, b),
+            OpCode::UintGt => bhimpl_uint_gt(a, b),
+            OpCode::UintGe => bhimpl_uint_ge(a, b),
+            OpCode::IntSignext => bhimpl_int_signext(a, b),
+            OpCode::UintMulHigh => bhimpl_uint_mul_high(a, b),
+            OpCode::PtrEq => bhimpl_ptr_eq(a, b),
+            OpCode::PtrNe => bhimpl_ptr_ne(a, b),
+            OpCode::FloatAdd
+            | OpCode::FloatSub
+            | OpCode::FloatMul
+            | OpCode::FloatTrueDiv
+            | OpCode::FloatFloorDiv
+            | OpCode::FloatMod => crate::pyjitpl::dispatch::eval_binop_f(opcode, a, b),
+            OpCode::FloatLt
+            | OpCode::FloatLe
+            | OpCode::FloatEq
+            | OpCode::FloatNe
+            | OpCode::FloatGt
+            | OpCode::FloatGe => crate::pyjitpl::dispatch::eval_float_cmp(opcode, a, b),
+            other => panic!("exec_binop: unsupported opcode {other:?}"),
         }
     }
 
-    /// Helper: build and execute a single unary op, returning the i64 result.
+    /// Dispatch a single unary opcode to its orthodox runtime helper and
+    /// return the i64 result. Float-typed operands/results are carried as
+    /// `f64::to_bits` (the jitcode register convention).
     fn exec_unop(opcode: OpCode, a: i64) -> i64 {
-        let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::int_op(0)], OpRef::NONE.raw()),
-            mk_op(opcode, &[OpRef::int_op(0)], 1),
-            mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
-        ];
-        let mut initial: VecAssoc<u32, i64> = VecAssoc::new();
-        initial.insert(0, a);
-        match blackhole_execute(&ops, &VecAssoc::new(), &initial, 0) {
-            BlackholeResult::Finish { values, .. } => values[0],
-            other => panic!(
-                "expected Finish for {:?}, got {:?}",
-                opcode,
-                match other {
-                    BlackholeResult::Abort(s) => s,
-                    _ => "other".to_string(),
-                }
-            ),
+        match opcode {
+            OpCode::IntNeg => bhimpl_int_neg(a),
+            OpCode::IntInvert => bhimpl_int_invert(a),
+            OpCode::IntIsZero => bhimpl_int_is_zero(a),
+            OpCode::IntIsTrue => bhimpl_int_is_true(a),
+            OpCode::IntForceGeZero => bhimpl_int_force_ge_zero(a),
+            OpCode::SameAsI | OpCode::SameAsR => bhimpl_int_same_as(a),
+            OpCode::CastIntToFloat => bhimpl_cast_int_to_float(a).to_bits() as i64,
+            OpCode::CastFloatToInt => bhimpl_cast_float_to_int(f64::from_bits(a as u64)),
+            OpCode::ConvertFloatBytesToLonglong => {
+                bhimpl_convert_float_bytes_to_longlong(f64::from_bits(a as u64))
+            }
+            OpCode::ConvertLonglongBytesToFloat => {
+                bhimpl_convert_longlong_bytes_to_float(a).to_bits() as i64
+            }
+            OpCode::FloatNeg | OpCode::FloatAbs => {
+                crate::pyjitpl::dispatch::eval_unary_f(opcode, a)
+            }
+            other => panic!("exec_unop: unsupported opcode {other:?}"),
         }
     }
 
@@ -3593,18 +2625,6 @@ mod tests {
         assert_eq!(exec_unop(OpCode::SameAsR, 0xDEAD), 0xDEAD);
     }
 
-    #[test]
-    fn test_executor_same_as_zero_arg_constant_placeholder() {
-        let op = mk_op(OpCode::SameAsI, &[], 8);
-        let mut values: VecAssoc<u32, i64> = VecAssoc::new();
-        values.insert(8, 123);
-        let mut exc = ExceptionState::default();
-        match execute_one(&op, &values, &mut exc) {
-            OpResult::Value(v) => assert_eq!(v, 123),
-            _ => panic!("zero-arg SameAsI should resolve through its constant slot"),
-        }
-    }
-
     // ── UintMulHigh ──
 
     #[test]
@@ -3634,19 +2654,6 @@ mod tests {
     // Executor edge-case parity tests
     // Ported from rpython/jit/metainterp/test/test_executor.py
     // ══════════════════════════════════════════════════════════════════
-
-    // ── Division by zero ──
-
-    #[test]
-    fn test_executor_int_divmod_by_zero_returns_blackhole_default() {
-        // Division by zero returns 0 (blackhole convention: no panic).
-        assert_eq!(exec_binop(OpCode::IntFloorDiv, 42, 0), 0);
-        assert_eq!(exec_binop(OpCode::IntFloorDiv, -1, 0), 0);
-        assert_eq!(exec_binop(OpCode::IntFloorDiv, 0, 0), 0);
-        assert_eq!(exec_binop(OpCode::IntMod, 42, 0), 0);
-        assert_eq!(exec_binop(OpCode::IntMod, -1, 0), 0);
-        assert_eq!(exec_binop(OpCode::IntMod, 0, 0), 0);
-    }
 
     // ── Integer overflow boundaries ──
 
@@ -3804,57 +2811,6 @@ mod tests {
             assert_eq!(ll, bits);
             let back = exec_unop(OpCode::ConvertLonglongBytesToFloat, ll);
             assert_eq!(back, bits);
-        }
-    }
-
-    /// Verify every OpCode variant has an explicit handler in execute_one
-    /// (i.e., none falls through to the Unsupported catch-all).
-    #[test]
-    fn test_all_opcodes_have_blackhole_handler() {
-        let dummy_args = &[
-            OpRef::int_op(10_000),
-            OpRef::int_op(10_001),
-            OpRef::int_op(10_002),
-        ];
-        let mut constants: VecAssoc<u32, i64> = VecAssoc::new();
-        constants.insert(10_000, 1i64);
-        constants.insert(10_001, 2i64);
-        constants.insert(10_002, 3i64);
-
-        let mut values: VecAssoc<u32, i64> = constants.clone();
-        let mut exc = ExceptionState::default();
-
-        for opcode in OpCode::all() {
-            // Build a minimal op with enough args for any opcode
-            let arity = opcode.arity().unwrap_or(3) as usize;
-            let args = &dummy_args[..arity.min(3)];
-            let mut op = Op::new(opcode, args);
-            op.pos.set(OpRef::int_op(opcode.as_u16() as u32 + 20_000));
-
-            let result = execute_one(&op, &values, &mut exc);
-            // Store the result so subsequent ops can reference it
-            if let OpResult::Value(v) = &result {
-                values.insert(op.pos.get().raw(), *v);
-            }
-
-            match result {
-                OpResult::Unsupported(msg) => {
-                    // CallAssembler ops intentionally return Unsupported —
-                    // they require force_fn fallback, not blackhole execution.
-                    let is_call_assembler = matches!(
-                        opcode,
-                        OpCode::CallAssemblerI
-                            | OpCode::CallAssemblerR
-                            | OpCode::CallAssemblerF
-                            | OpCode::CallAssemblerN
-                    );
-                    if !is_call_assembler {
-                        panic!("OpCode {:?} returned Unsupported: {}", opcode, msg);
-                    }
-                }
-                // Any other result (Value, Void, Finish, Jump, GuardFailed) is acceptable
-                _ => {}
-            }
         }
     }
 

@@ -2241,25 +2241,23 @@ mod tests {
     }
 
     /// pure.py:62 / :72-74 same_box semantics for constant args.
-    /// Two distinct ConstInt slots holding the same value must match
-    /// in pure cache lookup. RPython's history.py:204-205 / :244 say
-    /// `same_box(a, b) == same_constant(a, b)` for Const subclasses,
-    /// so cache hits are value-equality not OpRef identity.
+    /// history.py:204-205 / :244 — `same_box(a, b) == same_constant(a, b)`
+    /// for Const subclasses, so cache hits are value-equality. With
+    /// inline `ConstInt.value`, two `make_constant_int(5)` calls return
+    /// the same `OpRef::ConstIntInline(5)` and the cache hit is by
+    /// OpRef equality (which is now value equality).
     #[test]
     fn lookup_pure_matches_same_value_constants_across_slots() {
         let mut pass = OptPure::new();
         let mut ctx = OptContext::new(0);
 
-        // Two distinct ConstInt slots, same value (5).
         let c5_a = ctx.make_constant_int(5);
         let c5_b = ctx.make_constant_int(5);
-        assert_ne!(c5_a, c5_b, "make_constant_int must mint fresh slots");
         assert_eq!(
-            ctx.get_box_replacement_box(c5_a)
-                .and_then(|cb| cb.const_value()),
-            ctx.get_box_replacement_box(c5_b)
-                .and_then(|cb| cb.const_value())
+            c5_a, c5_b,
+            "two ConstInt(5) boxes are same_constant-equal (history.py:251)"
         );
+        assert_eq!(ctx.get_constant(c5_a), ctx.get_constant(c5_b));
 
         // Cache `IntAdd(c5_a, x)` and look up `IntAdd(c5_b, x)`.
         let x = OpRef::int_op(7);
@@ -2402,7 +2400,10 @@ mod tests {
         // re-exported to ShortBoxes via short_preamble_pure_ops.
         let mut pass = OptPure::new();
         let mut ctx = OptContext::with_num_inputs(6, 0);
-        // Use constant-namespace OpRef (as the actual import process does).
+        // legacy-const-ok: this test exercises the legacy idx-Const ->
+        // ctx.const_pool seeding path that note_known_constants_from_ctx
+        // (shortpreamble.rs:570) iterates. Inline-Const variants skip the
+        // pool entirely and would not surface here.
         let const_opref = OpRef::const_int(10);
         ctx.seed_constant(const_opref, majit_ir::Value::Int(7));
         ctx.imported_short_pure_ops
@@ -2445,7 +2446,7 @@ mod tests {
     fn test_imported_short_call_pure_result_replays_into_pure_cache() {
         let mut pass = OptPure::new();
         let mut ctx = OptContext::with_num_inputs(8, 0);
-        let const_opref = OpRef::const_int(10);
+        let const_opref = OpRef::const_int_inline(0x1234);
         ctx.seed_constant(const_opref, majit_ir::Value::Int(0x1234));
         let call_descr = majit_ir::descr::make_call_descr_full(
             77,
@@ -2710,7 +2711,11 @@ mod tests {
     fn test_cond_call_value_uses_call_pure_results_starting_at_arg1() {
         let mut ops = vec![Op::new(
             OpCode::CondCallValueI,
-            &[OpRef::int_op(100), OpRef::const_int(0), OpRef::const_int(1)],
+            &[
+                OpRef::int_op(100),
+                OpRef::const_int_inline(0xCAFE),
+                OpRef::const_int_inline(7),
+            ],
         )];
         assign_positions(&mut ops);
 
@@ -2719,8 +2724,6 @@ mod tests {
         opt.add_pass(Box::new(OptPure::new()));
 
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
-        constants.insert(OpRef::const_int(0).raw(), majit_ir::Value::Int(0xCAFE));
-        constants.insert(OpRef::const_int(1).raw(), majit_ir::Value::Int(7));
         let result = opt.optimize_with_constants_and_inputs(
             &ops,
             &mut constants,

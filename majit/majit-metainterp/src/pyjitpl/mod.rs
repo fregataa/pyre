@@ -1,4 +1,4 @@
-mod dispatch;
+pub(crate) mod dispatch;
 mod frame;
 
 pub use dispatch::build_state_field_snapshot;
@@ -75,7 +75,7 @@ use crate::warmstate::{HotResult, WarmEnterState};
 use majit_ir::descr::DescrRef;
 use majit_ir::{Const, FailDescr, GcRef, InputArg, Op, OpCode, OpRc, OpRef, Type, Value};
 
-use crate::blackhole::{BlackholeResult, ExceptionState, blackhole_execute_with_state_ca};
+use crate::blackhole::ExceptionState;
 use crate::compile;
 use crate::compile::make_jitcell_token;
 pub use crate::compile::{
@@ -380,6 +380,24 @@ pub(crate) fn heap_value_for_pub(ty: Type, bits: i64) -> Value {
     }
 }
 
+fn collect_snapshot_const_ptr_slots(maps: &mut [&mut SnapshotBoxes]) -> Vec<usize> {
+    let mut slots = Vec::new();
+    for map in maps {
+        for slot in map.iter_mut() {
+            if let Some(boxes) = slot {
+                for sb in boxes {
+                    if let majit_ir::OpRef::ConstPtrInline(gcref) = sb.opref {
+                        if !gcref.is_null() {
+                            slots.push((&mut sb.opref as *mut majit_ir::OpRef) as usize);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    slots
+}
+
 fn snapshot_map_from_trace_snapshots(
     trace_snapshots: &[crate::recorder::Snapshot],
     constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
@@ -390,18 +408,12 @@ fn snapshot_map_from_trace_snapshots(
     SnapshotBoxes,
     SnapshotFramePcs,
 ) {
+    let _ = constants; // legacy idx-Const pool no longer populated here; see SnapshotTagged::Const arm
     let mut box_map = Vec::new();
     let mut size_map = Vec::new();
     let mut vable_map = Vec::new();
     let mut vref_map = Vec::new();
     let mut pc_map = Vec::new();
-    let mut next_const_idx = constants
-        .keys()
-        .filter(|&&k| majit_ir::OpRef::raw_is_constant(k))
-        .map(|&k| majit_ir::OpRef::raw_const_index(k))
-        .max()
-        .map(|m| m + 1)
-        .unwrap_or(0);
     // opencoder.py:603 _encode: trace snapshot recorder only emits Box
     // (live deadframe slot) and Const (compile-time pool) payloads.
     // TAGVIRTUAL belongs to resume numbering (resume.py:_number_boxes)
@@ -409,7 +421,7 @@ fn snapshot_map_from_trace_snapshots(
     // Box's OpRef. SnapshotTagged carries no `Virtual` variant (see
     // recorder.rs:73 docstring) so this match is exhaustive over the
     // two recorder-side cases.
-    let mut tagged_to_box = |t: &crate::recorder::SnapshotTagged| -> SnapshotBox {
+    let tagged_to_box = |t: &crate::recorder::SnapshotTagged| -> SnapshotBox {
         match t {
             crate::recorder::SnapshotTagged::Box(opref, fallback_tp) => {
                 // history.py:182/220/261/307 + resoperation.py:719/727/739/
@@ -422,41 +434,19 @@ fn snapshot_map_from_trace_snapshots(
                 SnapshotBox::typed(*opref, tp)
             }
             crate::recorder::SnapshotTagged::Const(val, tp) => {
-                // resume.py:173-176: null Ref → NULLREF via getconst.
-                // Register in pool so is_const → true, get_const → (0, Ref),
-                // getconst → NULLREF. Do NOT short-circuit to OpRef::NONE.
-                // resume.py:157 getconst: find or allocate pool entry.
-                //
-                // history.py:220 box.type parity: `Value` carries the box
-                // class intrinsically, so the lockstep check between the
-                // raw bits and the type is reduced to a single
-                // `Value`-equality comparison.
-                let needle = heap_value_for(*tp, *val);
-                let existing = constants
-                    .iter()
-                    .find(|(_, v)| **v == needle)
-                    .map(|(k, _)| *k);
-                let opref = match existing {
-                    // Re-mint via the typed factory rather than poking the
-                    // cached `raw` straight into a variant: a CONST_BIT-less
-                    // key (would only arise from a producer bypassing the
-                    // `OpRef::const_typed` factory) must not manufacture a
-                    // malformed `OpRef::ConstInt(raw)`.
-                    Some(raw) => {
-                        debug_assert!(
-                            majit_ir::OpRef::raw_is_constant(raw),
-                            "constants map key {} missing CONST_BIT",
-                            raw
-                        );
-                        majit_ir::OpRef::const_typed(majit_ir::OpRef::raw_const_index(raw), *tp)
-                    }
-                    None => {
-                        let opref = majit_ir::OpRef::const_typed(next_const_idx, *tp);
-                        next_const_idx += 1;
-                        constants.insert(opref.raw(), needle);
-                        opref
-                    }
-                };
+                // history.py:227/268/314 `Const{Int,Float,Ptr}.value` is
+                // inline on the Box itself; mint the inline-Const OpRef
+                // directly so the value travels on the OpRef into resume
+                // numbering. The legacy pool-indexed Const path required
+                // `OptContext::const_pool` seeding from `constants`, which
+                // Slice 6 retired (see
+                // `merge_backend_constants_from_ctx`'s `const_pool.is_empty()`
+                // assert) — without seeding, the encoder's
+                // `OptBoxEnv::get_const` fallthrough resolved a Ref-typed
+                // null slot as `(0, Type::Int)`, encoding a vable_array
+                // NULL pointer as TAGINT(0) instead of NULLREF.
+                let value = heap_value_for(*tp, *val);
+                let opref = majit_ir::OpRef::const_inline_from_value(&value);
                 SnapshotBox::typed(opref, *tp)
             }
         }
@@ -466,15 +456,14 @@ fn snapshot_map_from_trace_snapshots(
             .frames
             .iter()
             .flat_map(|f| f.boxes.iter())
-            .map(&mut tagged_to_box)
+            .map(&tagged_to_box)
             .collect();
         let frame_sizes: Vec<usize> = snap.frames.iter().map(|f| f.boxes.len()).collect();
-        let vable_boxes: Vec<SnapshotBox> =
-            snap.vable_boxes.iter().map(&mut tagged_to_box).collect();
+        let vable_boxes: Vec<SnapshotBox> = snap.vable_boxes.iter().map(&tagged_to_box).collect();
         // opencoder.py:767 create_top_snapshot writes BOTH vable_array
         // AND vref_array. resume.py:243-247 _number_boxes consumes
         // vref_array as a separate section after vable_array.
-        let vref_boxes: Vec<SnapshotBox> = snap.vref_boxes.iter().map(&mut tagged_to_box).collect();
+        let vref_boxes: Vec<SnapshotBox> = snap.vref_boxes.iter().map(&tagged_to_box).collect();
         let frame_pcs: Vec<(i32, i32)> = snap
             .frames
             .iter()
@@ -831,13 +820,14 @@ pub enum BridgeCompileResult {
 /// so that `compile_retrace` can append new body ops to it.
 pub struct PartialTrace {
     /// Optimized ops from the first (incomplete) compilation attempt.
+    /// history.py:220/261/307 `ConstInt/ConstFloat/ConstPtr` carry the
+    /// box class intrinsically; `op.args[j]` `OpRef::ConstXInline`
+    /// variants store the value inline (history.py:227/268/314), so
+    /// `compile_retrace` reuses `partial.ops` verbatim without any
+    /// separate constants side table.
     pub(crate) ops: Vec<Op>,
     /// Inputargs from the partial trace.
     pub(crate) inputargs: Vec<InputArg>,
-    /// Typed constants from the partial trace.  `Const` (history.py:220/261/307)
-    /// carries both value and type, so the merge in `compile_retrace`
-    /// no longer needs a parallel `constant_types` lookup.
-    pub(crate) constants: crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Const>,
 }
 
 /// The meta-tracing JIT engine.
@@ -996,6 +986,12 @@ pub struct MetaInterp<M: Clone> {
     /// loop depends on. After compilation, the caller registers the loop's
     /// invalidation flag on each dep. Cleared on each compile attempt.
     pub last_quasi_immutable_deps: Vec<(u64, u32)>,
+    /// Addresses of live `SnapshotBox.opref` slots containing
+    /// `OpRef::ConstPtrInline` during compilation. RPython traces the
+    /// `ConstPtr.value` field in place; pyre's root walker follows these
+    /// slots directly so a moving GC updates the snapshot boxes the optimizer
+    /// will read.
+    pub(crate) compile_snapshot_refs: Vec<usize>,
     /// Set by compile_bridge when optimizer returns retrace_requested=true.
     /// Checked by compile_bridge_trace to return RetraceNeeded.
     pub(crate) retrace_after_bridge: bool,
@@ -1272,6 +1268,27 @@ pub struct JitHooks {
     pub on_compile_error: Option<Box<dyn Fn(u64, &str) + Send>>,
 }
 
+/// framework.py `root_walker.walk_roots` per-op helper: visit every
+/// inline `ConstPtr.value` slot stored in `op.args` and `op.fail_args`.
+/// history.py:314 `ConstPtr.value` is inline on the Box object; pyre
+/// stores it inline on `OpRef::ConstPtrInline(GcRef)` so each `&mut
+/// OpRef` slot in `Op::args` / `Op::fail_args` is the canonical
+/// forwardable Ref site.
+fn walk_op_const_ptr_refs(op: &mut Op, visitor: &mut dyn FnMut(&mut GcRef)) {
+    for arg in op.args.borrow_mut().iter_mut() {
+        if let Some(slot) = arg.as_const_ptr_inline_mut() {
+            visitor(slot);
+        }
+    }
+    if let Some(fail_args) = op.fail_args.borrow_mut().as_mut() {
+        for arg in fail_args.iter_mut() {
+            if let Some(slot) = arg.as_const_ptr_inline_mut() {
+                visitor(slot);
+            }
+        }
+    }
+}
+
 impl<M: Clone> MetaInterp<M> {
     /// resume.py:1314 parity: `metainterp_sd.virtualref_info` shared
     /// `VirtualRefInfo` handed to `blackhole_from_resumedata` /
@@ -1322,6 +1339,108 @@ impl<M: Clone> MetaInterp<M> {
                 for layout in trace.terminal_exit_layouts.values_mut() {
                     visit_storage(layout.storage.as_ref(), &mut visitor);
                 }
+            }
+            for tt in entry.front_target_tokens.iter_mut() {
+                if let Some(virtual_state) = tt.virtual_state.as_mut() {
+                    virtual_state.walk_const_ptr_refs_mut(&mut visitor);
+                }
+                if let Some(sp) = tt.short_preamble.as_mut() {
+                    sp.walk_const_ptr_refs_mut(&mut visitor);
+                }
+                if let Some(builder) = tt.short_preamble_producer.as_mut() {
+                    builder.walk_const_ptr_refs_mut(&mut visitor);
+                }
+            }
+        }
+    }
+
+    /// framework.py `root_walker.walk_roots` hook for the stashed
+    /// retrace state. Every `OpRef::ConstPtrInline(GcRef)` appearing
+    /// in `partial.ops[i].args[j]` (or `fail_args[j]`) carries an
+    /// inline Ref per history.py:314 `ConstPtr.value`. RPython's
+    /// `TreeLoop.operations` (`history.py:508`) is walked through the
+    /// Python object graph automatically; pyre's `Vec<Op>` lives in
+    /// Rust storage so the embedder registers this walker.
+    pub fn walk_partial_trace_refs(&mut self, mut visitor: impl FnMut(&mut GcRef)) {
+        if let Some(partial) = self.partial_trace.as_mut() {
+            for op in partial.ops.iter_mut() {
+                walk_op_const_ptr_refs(op, &mut visitor);
+            }
+        }
+        if let Some(exported_state) = self.exported_state.as_mut() {
+            exported_state.walk_const_ptr_refs_mut(&mut visitor);
+        }
+    }
+
+    /// framework.py `root_walker.walk_roots` hook for the active
+    /// (in-progress) trace recorder. RPython's `MetaInterp.history`
+    /// (`pyjitpl.py:1607 self.history = History()`) holds the in-progress
+    /// `TreeLoop.operations` and is traced through the Python object
+    /// graph automatically.  pyre's recorder stores ops as
+    /// `Vec<Op>` in Rust memory, so any `OpRef::ConstPtrInline(GcRef)`
+    /// stored in `op.args[j]` or `op.fail_args[j]` (history.py:314
+    /// `ConstPtr.value`) needs explicit walking to survive minor
+    /// collection.
+    ///
+    /// When tracing is not active (`self.tracing.is_none()`) this is
+    /// a no-op. Bridge / retrace paths reuse the same `TraceCtx`, so a
+    /// single walker covers all in-progress trace states.
+    pub fn walk_active_trace_refs(&mut self, mut visitor: impl FnMut(&mut GcRef)) {
+        // pyjitpl.py:2451 `self.framestack` — `MIFrame.copy_constants()`
+        // (frame.rs:404-407) stores `jitcode.constants_r` entries as
+        // `OpRef::ConstPtrInline(GcRef)` in `ref_regs`. history.py:314
+        // `ConstPtr.value` is an inline gcref field traced through the
+        // Python object graph automatically; pyre's `Vec<Option<OpRef>>`
+        // storage needs an explicit walker. Independent of `self.tracing`:
+        // frames are pushed for both recording and recursive-portal calls.
+        for frame in self.framestack.frames.iter_mut() {
+            for slot in frame.ref_regs.iter_mut() {
+                if let Some(opref) = slot.as_mut() {
+                    if let Some(gcref) = opref.as_const_ptr_inline_mut() {
+                        visitor(gcref);
+                    }
+                }
+            }
+        }
+        let Some(trace_ctx) = self.tracing.as_mut() else {
+            return;
+        };
+        for op in trace_ctx.recorder.ops_mut() {
+            walk_op_const_ptr_refs(op, &mut visitor);
+        }
+        // pyjitpl.py:3290-3306 — `initialize_virtualizable` /
+        // `force_start_tracing` / `setup_tracing` snapshot inputarg
+        // constants into `initial_inputarg_consts`. Inline
+        // `ConstPtrInline(GcRef)` entries here live outside the op-graph
+        // and must be forwarded by the same GC walker — history.py:314
+        // `ConstPtr.value` is a gcref attribute of the Box.
+        for opref in trace_ctx.initial_inputarg_consts.iter_mut() {
+            if let Some(slot) = opref.as_const_ptr_inline_mut() {
+                visitor(slot);
+            }
+        }
+        // NOTE: `trace_ctx.call_pure_results: VecAssoc<Vec<Value>, Value>`
+        // (pyjitpl.py:3572-3573) also stores Ref slots. RPython's
+        // args_dict stores Const boxes and the GC traces their gcrefs
+        // through the Python object graph. Pyre stores concrete
+        // `Value::Ref(GcRef)` entries in a linear VecAssoc; this active
+        // trace walker does not rewrite that cache yet. Stale entries
+        // miss after a moving collection and are repopulated by the next
+        // CALL_PURE recording.
+    }
+
+    /// GC walker for ConstPtrInline GcRefs from snapshot maps during
+    /// compilation. Cleared after compilation completes.
+    pub fn walk_compile_snapshot_refs(&mut self, mut visitor: impl FnMut(&mut GcRef)) {
+        for &slot_addr in &self.compile_snapshot_refs {
+            // SAFETY: entries are collected from `SnapshotBox.opref` slots
+            // owned by the in-flight optimizer/OptContext and cleared at every
+            // compile exit. The extra-root walker runs on the same thread while
+            // compilation is paused for GC, mirroring RPython's in-place field
+            // update of `ConstPtr.value`.
+            let opref = unsafe { &mut *(slot_addr as *mut majit_ir::OpRef) };
+            if let Some(gcref) = opref.as_const_ptr_inline_mut() {
+                visitor(gcref);
             }
         }
     }
@@ -1394,27 +1513,6 @@ impl<M: Clone> MetaInterp<M> {
             values,
             meta,
             savedata,
-        })
-    }
-
-    #[inline]
-    fn blackhole_result_for_jump_exit(
-        fail_index: u32,
-        values: Vec<i64>,
-        typed_values: Vec<Value>,
-        exit_layout: CompiledExitLayout,
-        meta: M,
-        savedata: Option<GcRef>,
-        exception: ExceptionState,
-    ) -> Option<BlackholeRunResult<M>> {
-        (fail_index == u32::MAX).then_some(BlackholeRunResult::Jump {
-            values,
-            typed_values: Some(typed_values),
-            exit_layout: Some(exit_layout),
-            meta,
-            via_blackhole: false,
-            savedata,
-            exception,
         })
     }
 
@@ -1921,6 +2019,7 @@ impl<M: Clone> MetaInterp<M> {
             num_scalar_inputargs: 0,
             potential_retrace_position: None,
             last_quasi_immutable_deps: Vec::new(),
+            compile_snapshot_refs: Vec::new(),
             retrace_after_bridge: false,
             pending_preamble_tokens: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             pending_frontend_boxes: None,
@@ -2549,14 +2648,11 @@ impl<M: Clone> MetaInterp<M> {
                 .iter()
                 .map(|value| {
                     let opref = ctx.recorder.record_input_arg(value.get_type());
-                    let (bits, tp) = match value {
-                        Value::Int(i) => (*i, Type::Int),
-                        Value::Float(f) => (f.to_bits() as i64, Type::Float),
-                        Value::Ref(r) => (r.as_usize() as i64, Type::Ref),
-                        Value::Void => (0, Type::Void),
-                    };
+                    // history.py:227/268/314 — Const{Int,Float,Ptr}.value
+                    // is inline on the Box itself; mint inline-Const
+                    // directly rather than allocating a pool index.
                     ctx.initial_inputarg_consts
-                        .push(ctx.constants.get_or_insert_typed(bits, tp));
+                        .push(OpRef::const_inline_from_value(value));
                     opref
                 })
                 .collect()
@@ -3107,17 +3203,11 @@ impl<M: Clone> MetaInterp<M> {
                 // pyjitpl.py:2789 warmrunnerstate.trace_limit snapshot.
                 ctx.set_trace_limit(self.warm_state.trace_limit() as usize);
                 ctx.callinfocollection = self.callinfocollection.clone();
+                // history.py:227/268/314 — Const{Int,Float,Ptr}.value
+                // is inline on the Box; mint inline-Const directly.
                 ctx.initial_inputarg_consts = live_values
                     .iter()
-                    .map(|v| {
-                        let (bits, tp) = match v {
-                            Value::Int(i) => (*i, Type::Int),
-                            Value::Float(f) => (f.to_bits() as i64, Type::Float),
-                            Value::Ref(r) => (r.as_usize() as i64, Type::Ref),
-                            Value::Void => (0, Type::Void),
-                        };
-                        ctx.constants.get_or_insert_typed(bits, tp)
-                    })
+                    .map(OpRef::const_inline_from_value)
                     .collect();
                 if let Some(ref descriptor) = driver_descriptor {
                     ctx.set_driver_descriptor(descriptor.clone());
@@ -3327,17 +3417,11 @@ impl<M: Clone> MetaInterp<M> {
         // a warmstate borrow at every check site.
         ctx.set_trace_limit(self.warm_state.trace_limit() as usize);
         ctx.callinfocollection = self.callinfocollection.clone();
+        // history.py:227/268/314 — Const{Int,Float,Ptr}.value is inline
+        // on the Box; mint inline-Const directly.
         ctx.initial_inputarg_consts = live_values
             .iter()
-            .map(|v| {
-                let (bits, tp) = match v {
-                    Value::Int(i) => (*i, Type::Int),
-                    Value::Float(f) => (f.to_bits() as i64, Type::Float),
-                    Value::Ref(r) => (r.as_usize() as i64, Type::Ref),
-                    Value::Void => (0, Type::Void),
-                };
-                ctx.constants.get_or_insert_typed(bits, tp)
-            })
+            .map(OpRef::const_inline_from_value)
             .collect();
         if let Some(ref descriptor) = driver_descriptor {
             ctx.set_driver_descriptor(descriptor.clone());
@@ -4256,12 +4340,21 @@ impl<M: Clone> MetaInterp<M> {
         ctx: &TraceCtx,
         driver_descriptor: Option<&crate::jitdriver::JitDriverStaticData>,
     ) -> *const u8 {
+        // history.py:314 ConstPtr.value lives inline on the OpRef
+        // (Slice 7 inline-Const cutover). The legacy
+        // `ctx.constants.get_value` pool lookup never sees these entries
+        // so it must be tried as a fallback only for legacy callers.
         driver_descriptor
             .and_then(|driver| driver.virtualizable_arg_index())
             .and_then(|idx| ctx.initial_inputarg_consts.get(idx).copied())
-            .and_then(|const_ref| match ctx.constants.get_value(const_ref) {
-                Some(majit_ir::Value::Ref(gcref)) => Some(gcref.0 as *const u8),
-                _ => None,
+            .and_then(|const_ref| {
+                if let Some(gcref) = const_ref.as_const_ptr_inline() {
+                    return Some(gcref.0 as *const u8);
+                }
+                match ctx.constants.get_value(const_ref) {
+                    Some(majit_ir::Value::Ref(gcref)) => Some(gcref.0 as *const u8),
+                    _ => None,
+                }
             })
             .unwrap_or(std::ptr::null())
     }
@@ -4309,6 +4402,7 @@ impl<M: Clone> MetaInterp<M> {
     /// halves stay live for continued tracing.
     pub fn compile_loop(&mut self, jump_args: &[OpRef], meta: M) -> CompileOutcome {
         let outcome = self.compile_loop_body(jump_args, meta);
+        self.compile_snapshot_refs.clear();
         // pyjitpl.py:3015-3032 parity: once the body has taken the trace
         // ctx (tracing=None), drop the matching frontend session so the
         // next `begin_trace_session` sees a clean slate, and fire the
@@ -4599,6 +4693,8 @@ impl<M: Clone> MetaInterp<M> {
             .or_else(|| self.pending_preamble_tokens.remove(&green_key))
             .unwrap_or_default();
         let mut unroll_opt = crate::optimizeopt::unroll::UnrollOptimizer::new();
+        unroll_opt.compile_snapshot_root_slots =
+            Some((&mut self.compile_snapshot_refs as *mut Vec<usize>) as usize);
         unroll_opt.all_descrs = std::mem::take(&mut *self.staticdata.all_descrs.lock().unwrap());
         unroll_opt.target_tokens = prior_front_target_tokens.clone();
         unroll_opt.retraced_count = prior_retraced_count_early;
@@ -4636,6 +4732,11 @@ impl<M: Clone> MetaInterp<M> {
         unroll_opt.snapshot_vable_boxes = snapshot_vable_map.clone();
         unroll_opt.snapshot_vref_boxes = snapshot_vref_map.clone();
         unroll_opt.snapshot_frame_pcs = snapshot_pc_map.clone();
+        self.compile_snapshot_refs = collect_snapshot_const_ptr_slots(&mut [
+            &mut unroll_opt.snapshot_boxes,
+            &mut unroll_opt.snapshot_vable_boxes,
+            &mut unroll_opt.snapshot_vref_boxes,
+        ]);
 
         // RPython compile.py:278-294 parity: Phase 1 results must survive
         // Phase 2 InvalidLoop. Phase 1 writes to phase1_out on the caller's
@@ -5251,7 +5352,9 @@ impl<M: Clone> MetaInterp<M> {
         finish_args: &[OpRef],
         bridge_origin: Option<(u64, u32)>,
     ) -> CompileOutcome {
-        self.compile_trace_inner(green_key, finish_args, bridge_origin, None, None)
+        let outcome = self.compile_trace_inner(green_key, finish_args, bridge_origin, None, None);
+        self.compile_snapshot_refs.clear();
+        outcome
     }
 
     /// compile.py:1002-1021 ResumeFromInterpDescr parity.
@@ -5343,12 +5446,17 @@ impl<M: Clone> MetaInterp<M> {
         let call_pure_results = ctx.call_pure_results.clone();
         let trace_snapshots = ctx.snapshots().to_vec();
         let (
-            snapshot_boxes,
+            mut snapshot_boxes,
             snapshot_frame_sizes,
-            snapshot_vable_boxes,
-            snapshot_vref_boxes,
+            mut snapshot_vable_boxes,
+            mut snapshot_vref_boxes,
             snapshot_frame_pcs,
         ) = snapshot_map_from_trace_snapshots(&trace_snapshots, &mut constants);
+        self.compile_snapshot_refs = collect_snapshot_const_ptr_slots(&mut [
+            &mut snapshot_boxes,
+            &mut snapshot_vable_boxes,
+            &mut snapshot_vref_boxes,
+        ]);
         // Lower the typed `Value` pool to the dense `VecAssoc<u32, Const>`
         // shape the bridge compilation helpers consume.
         let bridge_constants =
@@ -5480,8 +5588,7 @@ impl<M: Clone> MetaInterp<M> {
         green_key: u64,
         ops: Vec<Op>,
         inputargs: Vec<InputArg>,
-        constants: crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Const>,
-        exported_state: crate::optimizeopt::unroll::ExportedState,
+        mut exported_state: crate::optimizeopt::unroll::ExportedState,
     ) {
         if crate::majit_log_enabled() {
             eprintln!(
@@ -5490,13 +5597,12 @@ impl<M: Clone> MetaInterp<M> {
                 ops.len()
             );
         }
-        self.partial_trace = Some(PartialTrace {
-            ops,
-            inputargs,
-            constants,
-        });
+        self.partial_trace = Some(PartialTrace { ops, inputargs });
         // pyjitpl.py:2410: self.retracing_from = self.potential_retrace_position
         self.retracing_from = self.potential_retrace_position;
+        if !exported_state.has_shadow_roots() {
+            exported_state.root_all_gcrefs();
+        }
         self.exported_state = Some(exported_state);
         // pyjitpl.py:2418: self.heapcache.reset()
         if let Some(ctx) = self.tracing.as_mut() {
@@ -5641,6 +5747,8 @@ impl<M: Clone> MetaInterp<M> {
             .or_else(|| self.pending_preamble_tokens.remove(&green_key))
             .unwrap_or_default();
         let mut unroll_opt = crate::optimizeopt::unroll::UnrollOptimizer::new();
+        unroll_opt.compile_snapshot_root_slots =
+            Some((&mut self.compile_snapshot_refs as *mut Vec<usize>) as usize);
         unroll_opt.all_descrs = std::mem::take(&mut *self.staticdata.all_descrs.lock().unwrap());
         unroll_opt.target_tokens = prior_front_target_tokens.clone();
         unroll_opt.retraced_count = self
@@ -5656,12 +5764,17 @@ impl<M: Clone> MetaInterp<M> {
         unroll_opt.source_box_pool = Some(close_loop_box_pool);
         unroll_opt.call_pure_results = call_pure_results.clone();
         let (
-            retrace_snapshot_boxes,
+            mut retrace_snapshot_boxes,
             retrace_snapshot_frame_sizes,
-            retrace_snapshot_vable_boxes,
-            retrace_snapshot_vref_boxes,
+            mut retrace_snapshot_vable_boxes,
+            mut retrace_snapshot_vref_boxes,
             retrace_snapshot_frame_pcs,
         ) = snapshot_map_from_trace_snapshots(&trace.snapshots, &mut constants);
+        self.compile_snapshot_refs = collect_snapshot_const_ptr_slots(&mut [
+            &mut retrace_snapshot_boxes,
+            &mut retrace_snapshot_vable_boxes,
+            &mut retrace_snapshot_vref_boxes,
+        ]);
         // history.py:220/261/307 — `Const.type` is intrinsic on the
         // box; no raw-u32 type side-table propagation is needed.
         unroll_opt.snapshot_boxes = retrace_snapshot_boxes;
@@ -5711,13 +5824,9 @@ impl<M: Clone> MetaInterp<M> {
         // ops (JUMP excluded), matching RPython's partial_trace.operations.
         let mut combined_ops = partial.ops;
         combined_ops.extend(body_ops);
-        // Merge constants from partial trace with new constants.  Partial
-        // trace stores `Const` (history.py:220/261/307) intrinsically, so
-        // `Const::to_value()` recovers the typed `Value` without a
-        // parallel type lookup.
-        for (k, c) in partial.constants {
-            constants.entry_or_insert_with(k, || c.to_value());
-        }
+        // history.py:227/268/314 parity: `op.args[j]` carries inline
+        // `ConstX.value` directly; the retrace boundary no longer needs
+        // a separate `constants` side-table merge (Slice 7a).
 
         // compile.py:1075-1085 + 379-393 parity: the partial trace saved by
         // compile_trace already owns the bridge inputarg contract
@@ -6171,12 +6280,17 @@ impl<M: Clone> MetaInterp<M> {
         // vectors so the optimizer can rebuild fail_args from snapshot in
         // store_final_boxes_in_guard (RPython ResumeDataVirtualAdder.finish).
         let (
-            snapshot_map,
+            mut snapshot_map,
             snapshot_frame_size_map,
-            snapshot_vable_map,
-            snapshot_vref_map,
+            mut snapshot_vable_map,
+            mut snapshot_vref_map,
             snapshot_pc_map,
         ) = snapshot_map_from_trace_snapshots(&trace_snapshots, &mut constants);
+        self.compile_snapshot_refs = collect_snapshot_const_ptr_slots(&mut [
+            &mut snapshot_map,
+            &mut snapshot_vable_map,
+            &mut snapshot_vref_map,
+        ]);
         // compile.py:92-96 SimpleCompileData.optimize → optimize_loop parity.
         // Wire snapshot data through to the optimizer so guard
         // store_final_boxes_in_guard (mod.rs:2261) can properly populate
@@ -6591,12 +6705,17 @@ impl<M: Clone> MetaInterp<M> {
         // inputargs.
 
         let (
-            snapshot_map,
+            mut snapshot_map,
             snapshot_frame_size_map,
-            snapshot_vable_map,
-            snapshot_vref_map,
+            mut snapshot_vable_map,
+            mut snapshot_vref_map,
             snapshot_pc_map,
         ) = snapshot_map_from_trace_snapshots(&trace_snapshots, &mut constants);
+        self.compile_snapshot_refs = collect_snapshot_const_ptr_slots(&mut [
+            &mut snapshot_map,
+            &mut snapshot_vable_map,
+            &mut snapshot_vref_map,
+        ]);
         optimizer.snapshot_boxes = snapshot_map;
         optimizer.snapshot_frame_sizes = snapshot_frame_size_map;
         optimizer.snapshot_vable_boxes = snapshot_vable_map;
@@ -6630,6 +6749,7 @@ impl<M: Clone> MetaInterp<M> {
                 }
                 // compile.py:228-230: trace.cut_at(cut_at); return None
                 self.warm_state.abort_tracing(green_key, false);
+                self.compile_snapshot_refs.clear();
                 return None;
             }
         };
@@ -6824,6 +6944,7 @@ impl<M: Clone> MetaInterp<M> {
                     hook(green_key, num_ops_before, num_ops_after);
                 }
                 // compile.py:249: return target_token
+                self.compile_snapshot_refs.clear();
                 return Some(green_key);
             }
             Err(e) => {
@@ -6835,6 +6956,7 @@ impl<M: Clone> MetaInterp<M> {
                     );
                 }
                 self.warm_state.abort_tracing(green_key, false);
+                self.compile_snapshot_refs.clear();
                 return None;
             }
         }
@@ -8340,17 +8462,6 @@ impl<M: Clone> MetaInterp<M> {
     ) -> BridgeCompileResult {
         self.close_bridge(green_key, trace_id, fail_index, finish_args)
     }
-
-    /// Record a constant Ref value in the active trace context.
-    /// Returns the OpRef for the constant.
-    pub fn record_bridge_const_ref(&mut self, value: i64) -> majit_ir::OpRef {
-        let ctx = self
-            .tracing
-            .as_mut()
-            .expect("record_bridge_const_ref requires active trace");
-        ctx.constants
-            .get_or_insert_typed(value, majit_ir::Type::Ref)
-    }
 }
 
 impl<M: Clone> MetaInterp<M> {
@@ -8687,18 +8798,10 @@ impl<M: Clone> MetaInterp<M> {
                         InputArg::from_type(tp, opref.raw())
                     })
                     .collect();
-                // PartialTrace now stores the typed `Const` pool directly;
-                // `compile_retrace`'s merge reads `Const::to_value()` without
-                // a parallel type lookup.
-                let retrace_constants =
-                    crate::optimizeopt::optimizer::lower_typed_constants_to_const_pool(&constants);
-                self.retrace_needed(
-                    green_key,
-                    optimized_ops.clone(),
-                    renamed_inputargs,
-                    retrace_constants,
-                    es,
-                );
+                // history.py:220/261/307 parity: `partial_trace.operations`
+                // carry inline `ConstX.value` per history.py:227/268/314;
+                // no separate constants side table at the retrace boundary.
+                self.retrace_needed(green_key, optimized_ops.clone(), renamed_inputargs, es);
             }
             self.retrace_after_bridge = true;
             return false;
@@ -9275,18 +9378,10 @@ impl<M: Clone> MetaInterp<M> {
                             InputArg::from_type(tp, opref.raw())
                         })
                         .collect();
-                // PartialTrace now stores the typed `Const` pool directly;
-                // `compile_retrace`'s merge reads `Const::to_value()` without
-                // a parallel type lookup.
-                let retrace_constants =
-                    crate::optimizeopt::optimizer::lower_typed_constants_to_const_pool(&constants);
-                self.retrace_needed(
-                    green_key,
-                    optimized_ops.clone(),
-                    renamed_inputargs,
-                    retrace_constants,
-                    es,
-                );
+                // history.py:220/261/307 parity: `partial_trace.operations`
+                // carry inline `ConstX.value` per history.py:227/268/314;
+                // no separate constants side table at the retrace boundary.
+                self.retrace_needed(green_key, optimized_ops.clone(), renamed_inputargs, es);
             }
             self.retrace_after_bridge = true;
             return false;
@@ -9642,10 +9737,11 @@ impl<M: Clone> MetaInterp<M> {
 
         // RPython uses global ConstInt/ConstPtr boxes, so a bridge that
         // references a parent-loop constant and a bridge that allocates
-        // a fresh one never land on the same "slot". majit instead uses
-        // per-trace, zero-based constant indices (ConstantPool), so a
-        // bridge's first `const_int` returns `OpRef::const_int(0)` — the
-        // same index the parent loop used. `compile_entry_bridge` later
+        // a fresh one never land on the same "slot". majit's legacy
+        // idx-Const path uses per-trace, zero-based constant indices
+        // (ConstantPool), so a bridge's first legacy const_int returns
+        // idx 0 — the same index the parent loop used.
+        // `compile_entry_bridge` later
         // copies the parent's `constant_types` into the bridge
         // optimizer's type map (so shared parent-constant references
         // type-check); that copy overwrites the bridge's own fresh type
@@ -10044,699 +10140,6 @@ impl<M: Clone> MetaInterp<M> {
             savedata,
             recovery,
         })
-    }
-
-    /// RPython resume_in_blackhole parity: resume execution from the guard
-    /// failure point using the IR-based blackhole interpreter.
-    /// RPython bh_call_i parity: `memory` provides call_i/call_r for
-    pub fn blackhole_guard_failure(
-        &self,
-        green_key: u64,
-        trace_id: u64,
-        fail_index: u32,
-        fail_values: &[i64],
-        exception: ExceptionState,
-    ) -> Option<(BlackholeResult, ExceptionState)> {
-        self.blackhole_guard_failure_ca(
-            green_key,
-            trace_id,
-            fail_index,
-            fail_values,
-            exception,
-            None,
-        )
-    }
-
-    /// blackhole.py:1095 bhimpl_recursive_call parity:
-    /// Like `blackhole_guard_failure` but with a CallAssembler callback
-    /// so the IR blackhole can execute CallAssembler ops via portal_runner.
-    pub fn blackhole_guard_failure_ca(
-        &self,
-        green_key: u64,
-        trace_id: u64,
-        fail_index: u32,
-        fail_values: &[i64],
-        exception: ExceptionState,
-        call_assembler_fn: Option<&crate::blackhole::CallAssemblerFn>,
-    ) -> Option<(BlackholeResult, ExceptionState)> {
-        let compiled = self.compiled_loops.get(&green_key)?;
-        let (_, trace) = Self::trace_for_exit(compiled, trace_id)?;
-        // F.5-orthodox.1 site #5: walk `trace.ops` via descr-side
-        // identity instead of the `guard_op_indices` HashMap shortcut.
-        // The blackhole replay needs the op-position (`guard_op_index +
-        // 1` is the replay start at line below), which is inherently
-        // a positional concept — match by `descr.fail_index_per_trace()`
-        // (the per-trace counter the producer stamps at
-        // `compile.rs:301`), like RPython's `compile.py:184
-        // op.getdescr()` predicate.
-        let guard_op_index = trace.ops.iter().position(|op| {
-            op.with_fail_descr(|descr| descr.fail_index_per_trace() == fail_index)
-                .unwrap_or(false)
-        })?;
-        let guard_op = trace.ops.get(guard_op_index)?;
-        let fail_args = guard_op.getfailargs()?;
-
-        let mut initial_values: crate::optimizeopt::vec_assoc::VecAssoc<u32, i64> =
-            crate::optimizeopt::vec_assoc::VecAssoc::with_capacity(fail_args.len());
-        for (arg, value) in fail_args.iter().zip(fail_values.iter().copied()) {
-            initial_values.insert(arg.raw(), value);
-        }
-
-        // PyPy parity: `_run_forever` interprets Python bytecode after guard
-        // failure, NOT the JIT trace's IR. pyre's `blackhole_execute_with_state_ca`
-        // IR-replay is TODO (pyre-specific). When post-guard ops are only Label/Jump
-        // structural markers, the replay's `_run_forever` parity Jump-loop
-        // (blackhole.rs:283-291) loops back to label_index+1, potentially
-        // re-executing preamble+body indefinitely without making progress.
-        // Short-circuit: if no actual work follows the guard, return
-        // GuardFailed with the input fail_values directly — semantically
-        // equivalent to "the trace immediately re-fails the same guard".
-        let post_guard_has_work = trace.ops[guard_op_index + 1..]
-            .iter()
-            .any(|op| !matches!(op.opcode, OpCode::Label | OpCode::Jump));
-        if !post_guard_has_work {
-            return Some((
-                crate::blackhole::BlackholeResult::GuardFailed {
-                    guard_index: guard_op_index,
-                    fail_values: fail_values.to_vec(),
-                },
-                exception,
-            ));
-        }
-
-        // Lower typed `Const` pool to the legacy `(u32 → i64)` shape the
-        // blackhole interpreter consumes; `Const::as_raw_i64()` projects
-        // each variant to its encoded `rd_consts[idx].0` bits.
-        let mut constants_va: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
-        for (&k, c) in trace.constants.iter() {
-            constants_va.insert(k, c.as_raw_i64());
-        }
-        Some(blackhole_execute_with_state_ca(
-            &trace.ops,
-            &constants_va,
-            &initial_values,
-            guard_op_index + 1,
-            exception,
-            call_assembler_fn,
-        ))
-    }
-
-    /// Run compiled code and, on guard failure, immediately continue through the
-    /// blackhole interpreter for the subset where majit can replay the remaining
-    /// optimized ops directly.
-    pub fn run_with_blackhole_fallback(
-        &mut self,
-        green_key: u64,
-        live_values: &[i64],
-    ) -> Option<BlackholeRunResult<M>> {
-        let result = self.run_compiled_detailed(green_key, live_values)?;
-        let fail_index = result.fail_index;
-        let trace_id = result.trace_id;
-        let is_finish = result.is_finish;
-        let values = result.values.clone();
-        let typed_values = result.typed_values.clone();
-        let compiled_exit_layout = result.exit_layout.clone();
-        let savedata = result.savedata;
-        let exception = result.exception.clone();
-        let meta = result.meta.clone();
-
-        if is_finish {
-            return Some(BlackholeRunResult::Finished {
-                values,
-                typed_values: Some(typed_values),
-                exit_layout: Some(compiled_exit_layout),
-                meta,
-                via_blackhole: false,
-                savedata,
-                exception,
-            });
-        }
-
-        if let Some(jump) = Self::blackhole_result_for_jump_exit(
-            fail_index,
-            values.clone(),
-            typed_values.clone(),
-            compiled_exit_layout.clone(),
-            meta.clone(),
-            savedata,
-            exception.clone(),
-        ) {
-            return Some(jump);
-        }
-
-        let initial_recovery = self.handle_guard_failure_in_trace_with_savedata(
-            green_key,
-            trace_id,
-            fail_index,
-            &values,
-            Some(&typed_values),
-            savedata,
-            exception.clone(),
-        );
-
-        let Some((blackhole_result, blackhole_exception)) = self.blackhole_guard_failure(
-            green_key,
-            trace_id,
-            fail_index,
-            &values,
-            exception.clone(),
-        ) else {
-            return Some(BlackholeRunResult::GuardFailure {
-                trace_id,
-                fail_index,
-                fail_values: values,
-                typed_fail_values: Some(typed_values),
-                exit_layout: Some(compiled_exit_layout),
-                meta,
-                recovery: initial_recovery,
-                materialized_virtuals: Vec::new(),
-                pending_field_writes: Vec::new(),
-                via_blackhole: false,
-                savedata,
-                exception,
-            });
-        };
-
-        match blackhole_result {
-            BlackholeResult::Finish {
-                op_index, values, ..
-            } => {
-                let exit_layout = {
-                    let compiled = self.compiled_loops.get(&green_key)?;
-                    let (terminal_trace_id, trace) = Self::trace_for_exit(compiled, trace_id)?;
-                    compile::terminal_exit_layout_for_trace(
-                        trace,
-                        green_key,
-                        terminal_trace_id,
-                        op_index,
-                    )
-                };
-                let typed_values = exit_layout
-                    .as_ref()
-                    .map(|layout| compile::decode_values_with_layout(&values, layout));
-                Some(BlackholeRunResult::Finished {
-                    values,
-                    typed_values,
-                    exit_layout,
-                    meta,
-                    via_blackhole: true,
-                    savedata,
-                    exception: blackhole_exception,
-                })
-            }
-            BlackholeResult::Jump { op_index, values } => {
-                let exit_layout = {
-                    let compiled = self.compiled_loops.get(&green_key)?;
-                    let (terminal_trace_id, trace) = Self::trace_for_exit(compiled, trace_id)?;
-                    compile::terminal_exit_layout_for_trace(
-                        trace,
-                        green_key,
-                        terminal_trace_id,
-                        op_index,
-                    )
-                };
-                let typed_values = exit_layout
-                    .as_ref()
-                    .map(|layout| compile::decode_values_with_layout(&values, layout));
-                Some(BlackholeRunResult::Jump {
-                    values,
-                    typed_values,
-                    exit_layout,
-                    meta,
-                    via_blackhole: true,
-                    savedata,
-                    exception: blackhole_exception,
-                })
-            }
-            BlackholeResult::GuardFailed {
-                guard_index,
-                fail_values,
-            } => {
-                let (
-                    fallback_trace_id,
-                    fallback_fail_index,
-                    exit_layout,
-                    typed_fail_values,
-                    materialized_virtuals,
-                    pending_field_writes,
-                ) = {
-                    let compiled = self.compiled_loops.get(&green_key)?;
-                    let (trace_id, trace) = Self::trace_for_exit(compiled, trace_id)?;
-                    // F.5-orthodox.1 reverse reader: route through
-                    // descr-side identity instead of iterating the
-                    // `guard_op_indices` HashMap looking for a value
-                    // match. The op at `guard_index` carries its
-                    // FailDescr Arc; `descr.fail_index_per_trace()`
-                    // returns the producer's per-trace counter directly
-                    // (set at `compile.rs:301 build_guard_metadata` time
-                    // via `set_fail_index_per_trace`, same value the
-                    // HashMap was returning). Mirrors RPython
-                    // `compile.py:184 op.getdescr()` where the descr
-                    // identity lookup replaces the side table entirely.
-                    //
-                    // Note: `descr.fail_index()` is the global
-                    // `alloc_fail_index()` id (descr.rs:1065), distinct
-                    // from the per-trace counter; reading the wrong slot
-                    // would mismatch the HashMap semantics being
-                    // replaced.
-                    let fallback_fail_index = trace
-                        .ops
-                        .get(guard_index)
-                        .and_then(|op| op.with_fail_descr(|fd| fd.fail_index_per_trace()))
-                        .unwrap_or(fail_index);
-                    let exit_layout = Self::compiled_exit_layout_from_trace(
-                        trace,
-                        green_key,
-                        trace_id,
-                        fallback_fail_index,
-                    );
-                    let resume_layout = exit_layout
-                        .as_ref()
-                        .and_then(|layout| layout.resume_layout.as_ref());
-                    let materialized_virtuals = resume_layout
-                        .map(|layout| layout.materialize_virtuals(&fail_values))
-                        .unwrap_or_default();
-                    let pending_field_writes = resume_layout
-                        .map(|layout| layout.resolve_pending_field_writes(&fail_values))
-                        .unwrap_or_default();
-                    let typed_fail_values = exit_layout
-                        .as_ref()
-                        .map(|layout| compile::decode_values_with_layout(&fail_values, layout));
-                    (
-                        trace_id,
-                        fallback_fail_index,
-                        exit_layout,
-                        typed_fail_values,
-                        materialized_virtuals,
-                        pending_field_writes,
-                    )
-                };
-                let recovery = self.handle_guard_failure_in_trace_with_savedata(
-                    green_key,
-                    fallback_trace_id,
-                    fallback_fail_index,
-                    &fail_values,
-                    typed_fail_values.as_deref(),
-                    savedata,
-                    blackhole_exception.clone(),
-                );
-                Some(BlackholeRunResult::GuardFailure {
-                    trace_id: fallback_trace_id,
-                    fail_index: fallback_fail_index,
-                    fail_values,
-                    typed_fail_values,
-                    exit_layout,
-                    meta,
-                    recovery,
-                    materialized_virtuals,
-                    pending_field_writes,
-                    via_blackhole: true,
-                    savedata,
-                    exception: blackhole_exception,
-                })
-            }
-            BlackholeResult::GuardFailedWithVirtuals {
-                guard_index,
-                fail_values,
-                materialized_virtuals,
-                pending_field_writes,
-            } => {
-                let (fallback_trace_id, fallback_fail_index, exit_layout, typed_fail_values) = {
-                    let compiled = self.compiled_loops.get(&green_key)?;
-                    let (trace_id, trace) = Self::trace_for_exit(compiled, trace_id)?;
-                    // F.5-orthodox.1 reverse reader: route through
-                    // descr-side identity instead of iterating the
-                    // `guard_op_indices` HashMap looking for a value
-                    // match. The op at `guard_index` carries its
-                    // FailDescr Arc; `descr.fail_index_per_trace()`
-                    // returns the producer's per-trace counter directly
-                    // (set at `compile.rs:301 build_guard_metadata` time
-                    // via `set_fail_index_per_trace`, same value the
-                    // HashMap was returning). Mirrors RPython
-                    // `compile.py:184 op.getdescr()` where the descr
-                    // identity lookup replaces the side table entirely.
-                    //
-                    // Note: `descr.fail_index()` is the global
-                    // `alloc_fail_index()` id (descr.rs:1065), distinct
-                    // from the per-trace counter; reading the wrong slot
-                    // would mismatch the HashMap semantics being
-                    // replaced.
-                    let fallback_fail_index = trace
-                        .ops
-                        .get(guard_index)
-                        .and_then(|op| op.with_fail_descr(|fd| fd.fail_index_per_trace()))
-                        .unwrap_or(fail_index);
-                    let exit_layout = Self::compiled_exit_layout_from_trace(
-                        trace,
-                        green_key,
-                        trace_id,
-                        fallback_fail_index,
-                    );
-                    let typed_fail_values = exit_layout
-                        .as_ref()
-                        .map(|layout| compile::decode_values_with_layout(&fail_values, layout));
-                    (
-                        trace_id,
-                        fallback_fail_index,
-                        exit_layout,
-                        typed_fail_values,
-                    )
-                };
-                let recovery = self.handle_guard_failure_in_trace_with_savedata(
-                    green_key,
-                    fallback_trace_id,
-                    fallback_fail_index,
-                    &fail_values,
-                    typed_fail_values.as_deref(),
-                    savedata,
-                    blackhole_exception.clone(),
-                );
-                Some(BlackholeRunResult::GuardFailure {
-                    trace_id: fallback_trace_id,
-                    fail_index: fallback_fail_index,
-                    fail_values,
-                    typed_fail_values,
-                    exit_layout,
-                    meta,
-                    recovery,
-                    materialized_virtuals,
-                    pending_field_writes,
-                    via_blackhole: true,
-                    savedata,
-                    exception: blackhole_exception,
-                })
-            }
-            BlackholeResult::Abort(message) => Some(BlackholeRunResult::Abort {
-                trace_id,
-                fail_index,
-                fail_values: values,
-                typed_fail_values: Some(typed_values),
-                exit_layout: Some(compiled_exit_layout),
-                meta,
-                recovery: initial_recovery,
-                message,
-                savedata,
-                exception: blackhole_exception,
-            }),
-        }
-    }
-
-    /// Typed-input counterpart to [`run_with_blackhole_fallback`].
-    pub fn run_with_blackhole_fallback_with_values(
-        &mut self,
-        green_key: u64,
-        live_values: &[Value],
-    ) -> Option<BlackholeRunResult<M>> {
-        let result = self.run_compiled_detailed_with_values(green_key, live_values)?;
-        let fail_index = result.fail_index;
-        let trace_id = result.trace_id;
-        let is_finish = result.is_finish;
-        let values = result.values.clone();
-        let typed_values = result.typed_values.clone();
-        let compiled_exit_layout = result.exit_layout.clone();
-        let savedata = result.savedata;
-        let exception = result.exception.clone();
-        let meta = result.meta.clone();
-
-        if is_finish {
-            return Some(BlackholeRunResult::Finished {
-                values,
-                typed_values: Some(typed_values),
-                exit_layout: Some(compiled_exit_layout),
-                meta,
-                via_blackhole: false,
-                savedata,
-                exception,
-            });
-        }
-
-        if let Some(jump) = Self::blackhole_result_for_jump_exit(
-            fail_index,
-            values.clone(),
-            typed_values.clone(),
-            compiled_exit_layout.clone(),
-            meta.clone(),
-            savedata,
-            exception.clone(),
-        ) {
-            return Some(jump);
-        }
-
-        let initial_recovery = self.handle_guard_failure_in_trace_with_savedata(
-            green_key,
-            trace_id,
-            fail_index,
-            &values,
-            Some(&typed_values),
-            savedata,
-            exception.clone(),
-        );
-
-        let Some((blackhole_result, blackhole_exception)) = self.blackhole_guard_failure(
-            green_key,
-            trace_id,
-            fail_index,
-            &values,
-            exception.clone(),
-        ) else {
-            return Some(BlackholeRunResult::GuardFailure {
-                trace_id,
-                fail_index,
-                fail_values: values,
-                typed_fail_values: Some(typed_values),
-                exit_layout: Some(compiled_exit_layout),
-                meta,
-                recovery: initial_recovery,
-                materialized_virtuals: Vec::new(),
-                pending_field_writes: Vec::new(),
-                via_blackhole: false,
-                savedata,
-                exception,
-            });
-        };
-
-        match blackhole_result {
-            BlackholeResult::Finish {
-                op_index, values, ..
-            } => {
-                let exit_layout = {
-                    let compiled = self.compiled_loops.get(&green_key)?;
-                    let (terminal_trace_id, trace) = Self::trace_for_exit(compiled, trace_id)?;
-                    compile::terminal_exit_layout_for_trace(
-                        trace,
-                        green_key,
-                        terminal_trace_id,
-                        op_index,
-                    )
-                };
-                let typed_values = exit_layout
-                    .as_ref()
-                    .map(|layout| compile::decode_values_with_layout(&values, layout));
-                Some(BlackholeRunResult::Finished {
-                    values,
-                    typed_values,
-                    exit_layout,
-                    meta,
-                    via_blackhole: true,
-                    savedata,
-                    exception: blackhole_exception,
-                })
-            }
-            BlackholeResult::Jump { op_index, values } => {
-                let exit_layout = {
-                    let compiled = self.compiled_loops.get(&green_key)?;
-                    let (terminal_trace_id, trace) = Self::trace_for_exit(compiled, trace_id)?;
-                    compile::terminal_exit_layout_for_trace(
-                        trace,
-                        green_key,
-                        terminal_trace_id,
-                        op_index,
-                    )
-                };
-                let typed_values = exit_layout
-                    .as_ref()
-                    .map(|layout| compile::decode_values_with_layout(&values, layout));
-                Some(BlackholeRunResult::Jump {
-                    values,
-                    typed_values,
-                    exit_layout,
-                    meta,
-                    via_blackhole: true,
-                    savedata,
-                    exception: blackhole_exception,
-                })
-            }
-            BlackholeResult::GuardFailed {
-                guard_index,
-                fail_values,
-            } => {
-                let (
-                    fallback_trace_id,
-                    fallback_fail_index,
-                    exit_layout,
-                    typed_fail_values,
-                    materialized_virtuals,
-                    pending_field_writes,
-                ) = {
-                    let compiled = self.compiled_loops.get(&green_key)?;
-                    let (trace_id, trace) = Self::trace_for_exit(compiled, trace_id)?;
-                    // F.5-orthodox.1 reverse reader: route through
-                    // descr-side identity instead of iterating the
-                    // `guard_op_indices` HashMap looking for a value
-                    // match. The op at `guard_index` carries its
-                    // FailDescr Arc; `descr.fail_index_per_trace()`
-                    // returns the producer's per-trace counter directly
-                    // (set at `compile.rs:301 build_guard_metadata` time
-                    // via `set_fail_index_per_trace`, same value the
-                    // HashMap was returning). Mirrors RPython
-                    // `compile.py:184 op.getdescr()` where the descr
-                    // identity lookup replaces the side table entirely.
-                    //
-                    // Note: `descr.fail_index()` is the global
-                    // `alloc_fail_index()` id (descr.rs:1065), distinct
-                    // from the per-trace counter; reading the wrong slot
-                    // would mismatch the HashMap semantics being
-                    // replaced.
-                    let fallback_fail_index = trace
-                        .ops
-                        .get(guard_index)
-                        .and_then(|op| op.with_fail_descr(|fd| fd.fail_index_per_trace()))
-                        .unwrap_or(fail_index);
-                    let exit_layout = Self::compiled_exit_layout_from_trace(
-                        trace,
-                        green_key,
-                        trace_id,
-                        fallback_fail_index,
-                    );
-                    let resume_layout = exit_layout
-                        .as_ref()
-                        .and_then(|layout| layout.resume_layout.as_ref());
-                    let materialized_virtuals = resume_layout
-                        .map(|layout| layout.materialize_virtuals(&fail_values))
-                        .unwrap_or_default();
-                    let pending_field_writes = resume_layout
-                        .map(|layout| layout.resolve_pending_field_writes(&fail_values))
-                        .unwrap_or_default();
-                    let typed_fail_values = exit_layout
-                        .as_ref()
-                        .map(|layout| compile::decode_values_with_layout(&fail_values, layout));
-                    (
-                        trace_id,
-                        fallback_fail_index,
-                        exit_layout,
-                        typed_fail_values,
-                        materialized_virtuals,
-                        pending_field_writes,
-                    )
-                };
-                let recovery = self.handle_guard_failure_in_trace_with_savedata(
-                    green_key,
-                    fallback_trace_id,
-                    fallback_fail_index,
-                    &fail_values,
-                    typed_fail_values.as_deref(),
-                    savedata,
-                    blackhole_exception.clone(),
-                );
-                Some(BlackholeRunResult::GuardFailure {
-                    trace_id: fallback_trace_id,
-                    fail_index: fallback_fail_index,
-                    fail_values,
-                    typed_fail_values,
-                    exit_layout,
-                    meta,
-                    recovery,
-                    materialized_virtuals,
-                    pending_field_writes,
-                    via_blackhole: true,
-                    savedata,
-                    exception: blackhole_exception,
-                })
-            }
-            BlackholeResult::GuardFailedWithVirtuals {
-                guard_index,
-                fail_values,
-                materialized_virtuals,
-                pending_field_writes,
-            } => {
-                let (fallback_trace_id, fallback_fail_index, exit_layout, typed_fail_values) = {
-                    let compiled = self.compiled_loops.get(&green_key)?;
-                    let (trace_id, trace) = Self::trace_for_exit(compiled, trace_id)?;
-                    // F.5-orthodox.1 reverse reader: route through
-                    // descr-side identity instead of iterating the
-                    // `guard_op_indices` HashMap looking for a value
-                    // match. The op at `guard_index` carries its
-                    // FailDescr Arc; `descr.fail_index_per_trace()`
-                    // returns the producer's per-trace counter directly
-                    // (set at `compile.rs:301 build_guard_metadata` time
-                    // via `set_fail_index_per_trace`, same value the
-                    // HashMap was returning). Mirrors RPython
-                    // `compile.py:184 op.getdescr()` where the descr
-                    // identity lookup replaces the side table entirely.
-                    //
-                    // Note: `descr.fail_index()` is the global
-                    // `alloc_fail_index()` id (descr.rs:1065), distinct
-                    // from the per-trace counter; reading the wrong slot
-                    // would mismatch the HashMap semantics being
-                    // replaced.
-                    let fallback_fail_index = trace
-                        .ops
-                        .get(guard_index)
-                        .and_then(|op| op.with_fail_descr(|fd| fd.fail_index_per_trace()))
-                        .unwrap_or(fail_index);
-                    let exit_layout = Self::compiled_exit_layout_from_trace(
-                        trace,
-                        green_key,
-                        trace_id,
-                        fallback_fail_index,
-                    );
-                    let typed_fail_values = exit_layout
-                        .as_ref()
-                        .map(|layout| compile::decode_values_with_layout(&fail_values, layout));
-                    (
-                        trace_id,
-                        fallback_fail_index,
-                        exit_layout,
-                        typed_fail_values,
-                    )
-                };
-                let recovery = self.handle_guard_failure_in_trace_with_savedata(
-                    green_key,
-                    fallback_trace_id,
-                    fallback_fail_index,
-                    &fail_values,
-                    typed_fail_values.as_deref(),
-                    savedata,
-                    blackhole_exception.clone(),
-                );
-                Some(BlackholeRunResult::GuardFailure {
-                    trace_id: fallback_trace_id,
-                    fail_index: fallback_fail_index,
-                    fail_values,
-                    typed_fail_values,
-                    exit_layout,
-                    meta,
-                    recovery,
-                    materialized_virtuals,
-                    pending_field_writes,
-                    via_blackhole: true,
-                    savedata,
-                    exception: blackhole_exception,
-                })
-            }
-            BlackholeResult::Abort(message) => Some(BlackholeRunResult::Abort {
-                trace_id,
-                fail_index,
-                fail_values: values,
-                typed_fail_values: Some(typed_values),
-                exit_layout: Some(compiled_exit_layout),
-                meta,
-                recovery: initial_recovery,
-                message,
-                savedata,
-                exception: blackhole_exception,
-            }),
-        }
     }
 
     // ── Retrace Support ──────────────────────────────────────
@@ -13669,67 +13072,6 @@ pub enum RunResult<M> {
         savedata: Option<GcRef>,
         recovery: Option<GuardRecovery>,
     },
-}
-
-/// Result of running compiled code with automatic blackhole fallback.
-#[derive(Debug, Clone)]
-pub enum BlackholeRunResult<M> {
-    /// The trace produced final values, either directly or via blackhole replay.
-    Finished {
-        values: Vec<i64>,
-        typed_values: Option<Vec<Value>>,
-        exit_layout: Option<CompiledExitLayout>,
-        meta: M,
-        via_blackhole: bool,
-        savedata: Option<GcRef>,
-        exception: ExceptionState,
-    },
-    /// The blackhole replay reached a jump back-edge.
-    Jump {
-        values: Vec<i64>,
-        typed_values: Option<Vec<Value>>,
-        exit_layout: Option<CompiledExitLayout>,
-        meta: M,
-        via_blackhole: bool,
-        savedata: Option<GcRef>,
-        exception: ExceptionState,
-    },
-    /// Execution still ended in a guard failure.
-    GuardFailure {
-        trace_id: u64,
-        fail_index: u32,
-        fail_values: Vec<i64>,
-        typed_fail_values: Option<Vec<Value>>,
-        exit_layout: Option<CompiledExitLayout>,
-        meta: M,
-        recovery: Option<GuardRecovery>,
-        materialized_virtuals: Vec<MaterializedVirtual>,
-        pending_field_writes: Vec<ResolvedPendingFieldWrite>,
-        via_blackhole: bool,
-        savedata: Option<GcRef>,
-        exception: ExceptionState,
-    },
-    /// Blackhole replay could not continue the trace.
-    Abort {
-        trace_id: u64,
-        fail_index: u32,
-        fail_values: Vec<i64>,
-        typed_fail_values: Option<Vec<Value>>,
-        exit_layout: Option<CompiledExitLayout>,
-        meta: M,
-        recovery: Option<GuardRecovery>,
-        message: String,
-        savedata: Option<GcRef>,
-        exception: ExceptionState,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DriverRunOutcome {
-    Finished { via_blackhole: bool },
-    Jump { via_blackhole: bool },
-    GuardFailure { restored: bool, via_blackhole: bool },
-    Abort { restored: bool, via_blackhole: bool },
 }
 
 #[derive(Debug, Clone)]
@@ -16665,7 +16007,7 @@ mod metainterp_static_data_tests {
         // ConstPtr / ConstFloat at this slot.
         let allboxes = [
             (JitArgKind::Int, OpRef::int_op(0), 0),
-            (JitArgKind::Int, OpRef::const_int(1), 0xfeed),
+            (JitArgKind::Int, OpRef::const_int_inline(0xfeed), 0xfeed),
         ];
         let _ = meta.do_recursive_call(&jd, &allboxes, descr_ref, &descr_view, 0, 0, false);
     }
@@ -18119,6 +17461,107 @@ mod tests {
         assert!(!default_issubclass(0x1000, 0x1100));
         assert!(!default_issubclass(0x2000, 0x1000));
         assert!(default_issubclass(0xdead, 0xdead));
+    }
+
+    #[test]
+    fn walk_partial_trace_refs_forwards_inline_const_ptr_in_op_args() {
+        // history.py:314 `ConstPtr.value` parity: an inline-Const Ref
+        // stored in `op.args[j]` is the canonical forwardable Ref site
+        // after Slice 2 producer cutover. A minor collection between
+        // a failed bridge compile and `compile_retrace` must forward
+        // it through the op-graph walker.
+        let mut meta = MetaInterp::<()>::new(0);
+        let op = mk_op(
+            OpCode::PtrEq,
+            &[
+                OpRef::const_ptr_inline(GcRef(0x4000)),
+                OpRef::const_ptr_inline(GcRef::NULL),
+            ],
+            10,
+        );
+        meta.partial_trace = Some(PartialTrace {
+            ops: vec![op],
+            inputargs: Vec::new(),
+        });
+
+        meta.walk_partial_trace_refs(|slot| match slot.0 {
+            0x4000 => slot.0 = 0x5000,
+            0 => slot.0 = 0x6000,
+            _ => {}
+        });
+
+        let ops = &meta.partial_trace.as_ref().unwrap().ops;
+        assert_eq!(ops[0].arg(0).as_const_ptr_inline(), Some(GcRef(0x5000)));
+        assert_eq!(ops[0].arg(1).as_const_ptr_inline(), Some(GcRef(0x6000)));
+    }
+
+    #[test]
+    fn walk_partial_trace_refs_forwards_inline_const_ptr_in_fail_args() {
+        // history.py:314 + resoperation.py guard fail_args parity:
+        // guard ops carry `fail_args` (the resume-side live values).
+        // After Slice 2 cutover, an inline ConstPtr in fail_args must
+        // also forward across minor collection.
+        let mut meta = MetaInterp::<()>::new(0);
+        let guard = mk_op(OpCode::GuardTrue, &[OpRef::input_arg_int(0)], 11);
+        guard.setfailargs(smallvec::smallvec![
+            OpRef::const_ptr_inline(GcRef(0x7000)),
+            OpRef::const_int_inline(123),
+        ]);
+        meta.partial_trace = Some(PartialTrace {
+            ops: vec![guard],
+            inputargs: Vec::new(),
+        });
+
+        meta.walk_partial_trace_refs(|slot| {
+            if slot.0 == 0x7000 {
+                slot.0 = 0x8000;
+            }
+        });
+
+        let ops = &meta.partial_trace.as_ref().unwrap().ops;
+        let fail_args = ops[0].getfailargs().expect("guard has fail_args");
+        assert_eq!(fail_args[0].as_const_ptr_inline(), Some(GcRef(0x8000)));
+        // Non-Ref inline-Const slots untouched.
+        assert_eq!(fail_args[1], OpRef::const_int_inline(123));
+    }
+
+    #[test]
+    fn walk_active_trace_refs_forwards_inline_const_ptr() {
+        // history.py:314 parity for the in-progress recorder: a
+        // minor collection during tracing must forward inline
+        // `OpRef::ConstPtrInline(GcRef)` slots stored in the active
+        // `Trace::ops` Vec.
+        let mut meta = MetaInterp::<()>::new(0);
+        let mut trace_ctx = crate::trace_ctx::TraceCtx::for_test(1);
+        trace_ctx.recorder.push_op_for_test(mk_op(
+            OpCode::PtrEq,
+            &[
+                OpRef::const_ptr_inline(GcRef(0xA000)),
+                OpRef::input_arg_int(0),
+            ],
+            5,
+        ));
+        meta.tracing = Some(trace_ctx);
+
+        meta.walk_active_trace_refs(|slot| {
+            if slot.0 == 0xA000 {
+                slot.0 = 0xB000;
+            }
+        });
+
+        let ops = meta.tracing.as_ref().unwrap().recorder.ops();
+        assert_eq!(ops[0].arg(0).as_const_ptr_inline(), Some(GcRef(0xB000)));
+    }
+
+    #[test]
+    fn walk_active_trace_refs_noop_when_not_tracing() {
+        // When `MetaInterp.tracing` is `None`, the walker is a no-op;
+        // pyjitpl.py:1607 only creates `History()` while tracing is
+        // active.
+        let mut meta = MetaInterp::<()>::new(0);
+        let mut visited = 0u32;
+        meta.walk_active_trace_refs(|_| visited += 1);
+        assert_eq!(visited, 0);
     }
 
     #[test]
@@ -20338,67 +19781,6 @@ mod tests {
         assert!(
             MetaInterp::<()>::run_result_for_jump_exit(3, vec![42], (), None).is_none(),
             "guard failure exits must keep using recovery paths"
-        );
-    }
-
-    #[test]
-    fn test_blackhole_result_for_jump_exit_returns_jump() {
-        let exit_layout = CompiledExitLayout {
-            rd_loop_token: 91,
-            trace_id: 12,
-            fail_index: u32::MAX,
-            source_op_index: Some(3),
-            exit_types: vec![Type::Int],
-            is_finish: false,
-            is_exception_exit: false,
-            gc_ref_slots: Vec::new(),
-            force_token_slots: Vec::new(),
-            recovery_layout: None,
-            resume_layout: None,
-            storage: None,
-        };
-        let exception = ExceptionState::default();
-
-        let result = MetaInterp::<()>::blackhole_result_for_jump_exit(
-            u32::MAX,
-            vec![42],
-            vec![Value::Int(42)],
-            exit_layout.clone(),
-            (),
-            None,
-            exception.clone(),
-        )
-        .expect("jump exit should bypass blackhole recovery");
-        match result {
-            BlackholeRunResult::Jump {
-                values,
-                typed_values,
-                exit_layout,
-                via_blackhole,
-                exception,
-                ..
-            } => {
-                assert_eq!(values, vec![42]);
-                assert_eq!(typed_values, Some(vec![Value::Int(42)]));
-                assert_eq!(exit_layout.unwrap().trace_id, 12);
-                assert!(!via_blackhole);
-                assert_eq!(exception, ExceptionState::default());
-            }
-            other => panic!("expected Jump result, got {other:?}"),
-        }
-
-        assert!(
-            MetaInterp::<()>::blackhole_result_for_jump_exit(
-                5,
-                vec![42],
-                vec![Value::Int(42)],
-                exit_layout,
-                (),
-                None,
-                exception,
-            )
-            .is_none(),
-            "guard failure exits must keep using guard recovery / blackhole fallback"
         );
     }
 

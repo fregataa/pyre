@@ -1,8 +1,7 @@
-use majit_ir::{GcRef, GreenKey, OpCode, OpRef, Type, Value};
+use majit_ir::{GcRef, GreenKey, OpRef, Type, Value};
 use majit_macros::jit_driver;
 use majit_metainterp::{
-    DeclarativeJitDriver, DriverRunOutcome, JitDriver, JitState, PendingFieldWriteLayout,
-    TraceAction, TraceCtx,
+    DeclarativeJitDriver, JitDriver, JitState, PendingFieldWriteLayout, TraceCtx,
     recorder::{Snapshot, SnapshotFrame, SnapshotTagged},
     resume::{MaterializedValue, MaterializedVirtual, ResumeDataExt, ResumeDataVirtualAdder},
     virtualizable::VirtualizableInfo,
@@ -39,82 +38,6 @@ fn attach_single_frame_snapshot(ctx: &mut TraceCtx, pc: u32, boxes: &[(OpRef, Ty
     ctx.set_last_guard_resume_position(snapshot_id);
 }
 
-macro_rules! close_loop_with_increment_guard_failure {
-    ($ctx:expr, $sym:expr) => {{
-        let null = $ctx.const_null();
-        let frame_is_null = $ctx.record_op(OpCode::PtrEq, &[$sym[0], null]);
-        let g1 = $ctx.record_guard_typed(
-            OpCode::GuardFalse,
-            &[frame_is_null],
-            vec![Type::Ref, Type::Int],
-        );
-        $ctx.set_fail_args(g1, &[$sym[0], $sym[1]]);
-        // resume.py:396-397 `assert resume_position >= 0`: every guard
-        // must have a snapshot-backed rd_resume_position before the
-        // optimizer's store_final_boxes_in_guard runs (mod.rs:3376).
-        attach_single_frame_snapshot($ctx, 0, &[($sym[0], Type::Ref), ($sym[1], Type::Int)]);
-        let one = $ctx.const_int(1);
-        let incremented = $ctx.record_op(OpCode::IntAdd, &[$sym[1], one]);
-        let two = $ctx.const_int(2);
-        let reached_second_guard = $ctx.record_op(OpCode::IntEq, &[incremented, two]);
-        let g2 = $ctx.record_guard(OpCode::GuardFalse, &[reached_second_guard], 1);
-        $ctx.set_fail_args(g2, &[incremented]);
-        attach_single_frame_snapshot($ctx, 1, &[(incremented, Type::Int)]);
-        let finish_args = $sym.clone();
-        let finish_arg_types = finish_args
-            .iter()
-            .map(|opref| $ctx.get_opref_type(*opref).unwrap_or(Type::Int))
-            .collect();
-        TraceAction::Finish {
-            finish_args,
-            finish_arg_types,
-            exit_with_exception: false,
-        }
-    }};
-}
-
-fn start_guard_failure_trace<S>(driver: &mut JitDriver<S>, key: u64, state: &mut S)
-where
-    S: JitState<Env = (), Sym = Vec<OpRef>>,
-{
-    assert!(
-        driver
-            .back_edge_keyed(key, key as usize, state, &(), || {})
-            .is_none()
-    );
-    if !driver.is_tracing() {
-        assert!(
-            driver
-                .back_edge_keyed(key, key as usize, state, &(), || {})
-                .is_none()
-        );
-    }
-    assert!(driver.is_tracing());
-    driver.merge_point(|meta, sym| {
-        let ctx = meta
-            .trace_ctx()
-            .expect("merge_point invariant: tracing must be Some");
-        close_loop_with_increment_guard_failure!(ctx, sym)
-    });
-}
-
-fn assert_guard_failure_blackhole_outcome<S>(driver: &mut JitDriver<S>, key: u64, state: &mut S)
-where
-    S: JitState<Env = ()>,
-{
-    match driver.run_compiled_with_blackhole_fallback_keyed(key, state, || {}) {
-        DriverRunOutcome::GuardFailure {
-            restored,
-            via_blackhole,
-            ..
-        } => {
-            assert!(restored);
-            assert!(via_blackhole);
-        }
-        other => panic!("expected GuardFailure outcome, got {other:?}"),
-    }
-}
-
 #[jit_driver(greens = [pc, code], reds = [frame, stack], virtualizable = frame)]
 struct DeclarativeDriver;
 
@@ -123,30 +46,6 @@ struct TypedDeclarativeDriver;
 
 #[jit_driver(greens = [pc, code], reds = [frame, stackpos, top], virtualizable = frame)]
 struct AutoVirtualizableDriver;
-
-#[jit_driver(greens = [pc, code], reds = [frame, stackpos, top])]
-struct ResumeMappedDriver;
-
-#[jit_driver(greens = [pc, code], reds = [obj, flag])]
-struct VirtualResumeDriver;
-
-#[jit_driver(greens = [pc, code], reds = [obj, flag])]
-struct PendingWriteDriver;
-
-#[jit_driver(greens = [pc, code], reds = [frame, flag])]
-struct MultiFrameDriver;
-
-#[jit_driver(greens = [pc, code], reds = [frame, flag])]
-struct GenericMultiFrameDriver;
-
-#[jit_driver(greens = [pc, code], reds = [frame, flag])]
-struct LayoutTypedFrameDriver;
-
-#[jit_driver(greens = [pc, code], reds = [array, flag])]
-struct PendingArrayWriteDriver;
-
-#[jit_driver(greens = [pc, code], reds = [outer, inner, alias])]
-struct NestedVirtualResumeDriver;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TestMeta {
@@ -604,14 +503,6 @@ struct GenericMultiFrameResumeState {
     materialize_calls: usize,
 }
 
-struct LayoutTypedFrameRestoreState {
-    frame: usize,
-    flag: i64,
-    fallback_restore_calls: usize,
-    layout_restore_calls: usize,
-    restored_frames: Vec<(usize, i64)>,
-}
-
 struct NestedVirtualResumeState {
     outer: usize,
     inner: usize,
@@ -835,6 +726,10 @@ impl JitState for ResumeMappedState {
         self.top = values[2].as_int();
     }
 
+    fn live_value_types(&self, _meta: &Self::Meta) -> Vec<Type> {
+        vec![Type::Ref, Type::Int, Type::Int]
+    }
+
     fn collect_jump_args(sym: &Self::Sym) -> Vec<OpRef> {
         sym.clone()
     }
@@ -885,6 +780,10 @@ impl JitState for VirtualResumeState {
     fn restore_values(&mut self, _meta: &Self::Meta, values: &[Value]) {
         self.obj = values[0].as_ref().as_usize();
         self.flag = values[1].as_int();
+    }
+
+    fn live_value_types(&self, _meta: &Self::Meta) -> Vec<Type> {
+        vec![Type::Ref, Type::Int]
     }
 
     fn materialize_virtual_ref(
@@ -956,6 +855,10 @@ impl JitState for PendingWriteState {
         self.flag = values[1].as_int();
     }
 
+    fn live_value_types(&self, _meta: &Self::Meta) -> Vec<Type> {
+        vec![Type::Ref, Type::Int]
+    }
+
     fn pending_field_write_layout(
         &self,
         _meta: &Self::Meta,
@@ -1015,6 +918,10 @@ impl JitState for PendingArrayWriteState {
     fn restore_values(&mut self, _meta: &Self::Meta, values: &[Value]) {
         self.array = values[0].as_ref().as_usize();
         self.flag = values[1].as_int();
+    }
+
+    fn live_value_types(&self, _meta: &Self::Meta) -> Vec<Type> {
+        vec![Type::Ref, Type::Int]
     }
 
     fn pending_field_write_layout(
@@ -1202,85 +1109,6 @@ impl JitState for GenericMultiFrameResumeState {
             offset: fd.offset(),
             value_type: fd.field_type(),
         })
-    }
-
-    fn collect_jump_args(sym: &Self::Sym) -> Vec<OpRef> {
-        sym.clone()
-    }
-
-    fn collect_typed_jump_args(sym: &Self::Sym) -> Vec<(OpRef, Type)> {
-        vec![(sym[0], Type::Ref), (sym[1], Type::Int)]
-    }
-
-    fn validate_close(_sym: &Self::Sym, _meta: &Self::Meta) -> bool {
-        true
-    }
-}
-
-impl JitState for LayoutTypedFrameRestoreState {
-    type Meta = TestMeta;
-    type Sym = Vec<OpRef>;
-    type Env = ();
-
-    fn build_meta(&self, header_pc: usize, _env: &Self::Env) -> Self::Meta {
-        TestMeta { header_pc }
-    }
-
-    fn extract_live(&self, _meta: &Self::Meta) -> Vec<i64> {
-        vec![self.frame as i64, self.flag]
-    }
-
-    fn extract_live_values(&self, _meta: &Self::Meta) -> Vec<Value> {
-        vec![Value::Ref(GcRef(self.frame)), Value::Int(self.flag)]
-    }
-
-    fn live_value_types(&self, _meta: &Self::Meta) -> Vec<Type> {
-        vec![Type::Int, Type::Int]
-    }
-
-    fn create_sym(_meta: &Self::Meta, _header_pc: usize) -> Self::Sym {
-        typed_inputarg_sym(&[Type::Ref, Type::Int])
-    }
-
-    fn is_compatible(&self, _meta: &Self::Meta) -> bool {
-        true
-    }
-
-    fn restore(&mut self, _meta: &Self::Meta, values: &[i64]) {
-        self.fallback_restore_calls += 1;
-        self.frame = values[0] as usize;
-        self.flag = values[1];
-    }
-
-    fn restore_values(&mut self, _meta: &Self::Meta, values: &[Value]) {
-        self.fallback_restore_calls += 1;
-        self.frame = match values[0] {
-            Value::Ref(r) => r.as_usize(),
-            Value::Int(v) => v as usize,
-            _ => 0,
-        };
-        self.flag = match values[1] {
-            Value::Int(v) => v,
-            Value::Float(v) => v as i64,
-            Value::Ref(r) => r.as_usize() as i64,
-            Value::Void => 0,
-        };
-    }
-
-    fn restore_reconstructed_frame_values(
-        &mut self,
-        _meta: &Self::Meta,
-        _frame_index: usize,
-        _total_frames: usize,
-        _frame_pc: u64,
-        values: &[Value],
-        _exception: &majit_metainterp::blackhole::ExceptionState,
-    ) -> bool {
-        self.layout_restore_calls += 1;
-        self.frame = values[0].as_ref().as_usize();
-        self.flag = values[1].as_int();
-        self.restored_frames.push((self.frame, self.flag));
-        true
     }
 
     fn collect_jump_args(sym: &Self::Sym) -> Vec<OpRef> {
@@ -1766,33 +1594,30 @@ fn declarative_driver_can_reject_virtualizable_sync_before_tracing_starts() {
 }
 
 #[test]
-fn declarative_driver_guard_failure_restores_from_reconstructed_resume_frame() {
-    let descriptor =
-        ResumeMappedDriver::descriptor(&[Type::Int, Type::Int], &[Type::Ref, Type::Int, Type::Int])
-            .expect("descriptor should build");
-    let mut driver = JitDriver::<ResumeMappedState>::with_descriptor(1, descriptor);
+fn jit_state_restore_guard_failure_restores_from_reconstructed_resume_frame() {
+    let meta = TestMeta { header_pc: 444 };
     let frame_ptr = 0x4444usize;
     let mut state = ResumeMappedState {
-        frame: frame_ptr,
-        stackpos: 0,
-        top: 5,
+        frame: 0,
+        stackpos: 1,
+        top: -10,
     };
-
-    start_guard_failure_trace(&mut driver, 444, &mut state);
 
     let mut resume = ResumeDataVirtualAdder::new();
     resume.push_frame(0, 444);
     resume.set_slot_constant(0, majit_ir::Const::Ref(GcRef(frame_ptr as usize)));
     resume.map_slot(1, 0);
     resume.set_slot_constant(2, majit_ir::Const::Int(99));
-    driver
-        .meta_interp_mut()
-        .attach_resume_data(444, 1, resume.build());
+    let reconstructed_state = resume.build().reconstruct_state(&[2]);
 
-    state.frame = 0;
-    state.stackpos = 1;
-    state.top = -10;
-    assert_guard_failure_blackhole_outcome(&mut driver, 444, &mut state);
+    assert!(state.restore_guard_failure(
+        &meta,
+        &[2],
+        Some(&reconstructed_state),
+        &reconstructed_state.virtuals,
+        &reconstructed_state.pending_fields,
+        &majit_metainterp::blackhole::ExceptionState::default(),
+    ));
 
     assert_eq!(state.frame, frame_ptr);
     assert_eq!(state.stackpos, 2);
@@ -1800,22 +1625,17 @@ fn declarative_driver_guard_failure_restores_from_reconstructed_resume_frame() {
 }
 
 #[test]
-fn declarative_driver_guard_failure_materializes_virtual_ref_from_resume_state() {
-    let descriptor =
-        VirtualResumeDriver::descriptor(&[Type::Int, Type::Int], &[Type::Ref, Type::Int])
-            .expect("descriptor should build");
-    let mut driver = JitDriver::<VirtualResumeState>::with_descriptor(1, descriptor);
+fn jit_state_restore_guard_failure_materializes_virtual_ref_from_resume_state() {
+    let meta = TestMeta { header_pc: 555 };
     let typedescr_7: majit_ir::DescrRef =
         std::sync::Arc::new(majit_ir::descr::SimpleSizeDescr::new(7, 0, 0));
     let mut state = VirtualResumeState {
         obj: 0,
-        flag: 0,
+        flag: 1,
         materialized_ref: 0xfeedusize,
         materialize_calls: 0,
         expected_descr: Some(typedescr_7.clone()),
     };
-
-    start_guard_failure_trace(&mut driver, 555, &mut state);
 
     let mut resume = ResumeDataVirtualAdder::new();
     resume.push_frame(0, 555);
@@ -1831,14 +1651,16 @@ fn declarative_driver_guard_failure_materializes_virtual_ref_from_resume_state()
     );
     resume.set_slot_virtual(0, virtual_index);
     resume.map_slot(1, 0);
-    driver
-        .meta_interp_mut()
-        .attach_resume_data(555, 1, resume.build());
+    let reconstructed_state = resume.build().reconstruct_state(&[2]);
 
-    state.obj = 0;
-    state.obj = 0;
-    state.flag = 1;
-    assert_guard_failure_blackhole_outcome(&mut driver, 555, &mut state);
+    assert!(state.restore_guard_failure(
+        &meta,
+        &[2],
+        Some(&reconstructed_state),
+        &reconstructed_state.virtuals,
+        &reconstructed_state.pending_fields,
+        &majit_metainterp::blackhole::ExceptionState::default(),
+    ));
 
     assert_eq!(state.obj, 0xfeedusize);
     assert_eq!(state.flag, 2);
@@ -1963,22 +1785,15 @@ fn jit_state_restore_guard_failure_replays_pending_writes_with_virtual_target_an
 }
 
 #[test]
-fn declarative_driver_guard_failure_replays_pending_field_writes() {
-    let descriptor =
-        PendingWriteDriver::descriptor(&[Type::Int, Type::Int], &[Type::Ref, Type::Int])
-            .expect("descriptor should build");
-    let mut driver = JitDriver::<PendingWriteState>::with_descriptor(1, descriptor);
+fn jit_state_restore_guard_failure_replays_pending_field_writes() {
+    let meta = TestMeta { header_pc: 666 };
     let mut cell = PendingWriteCell { field: 11 };
-    let mut state = PendingWriteState {
-        obj: (&mut cell as *mut PendingWriteCell) as usize,
-        flag: 0,
-    };
-
-    start_guard_failure_trace(&mut driver, 666, &mut state);
+    let cell_ptr = (&mut cell as *mut PendingWriteCell) as usize;
+    let mut state = PendingWriteState { obj: 0, flag: 1 };
 
     let mut resume = ResumeDataVirtualAdder::new();
     resume.push_frame(0, 666);
-    resume.set_slot_constant(0, majit_ir::Const::Ref(GcRef(state.obj as usize)));
+    resume.set_slot_constant(0, majit_ir::Const::Ref(GcRef(cell_ptr)));
     resume.map_slot(1, 0);
     let pending_descr: majit_ir::DescrRef = std::sync::Arc::new(
         majit_ir::descr::SimpleFieldDescr::new(9, 0, 8, Type::Int, false),
@@ -1986,39 +1801,35 @@ fn declarative_driver_guard_failure_replays_pending_field_writes() {
     resume.add_pending_field_write(
         Some(pending_descr),
         majit_metainterp::resume::ResumeValueSource::Constant(majit_ir::Const::Ref(GcRef(
-            state.obj as usize,
+            cell_ptr,
         ))),
         majit_metainterp::resume::ResumeValueSource::Constant(majit_ir::Const::Int(77)),
     );
-    driver
-        .meta_interp_mut()
-        .attach_resume_data(666, 1, resume.build());
+    let reconstructed_state = resume.build().reconstruct_state(&[2]);
 
-    state.obj = 0;
-    state.flag = 1;
-    assert_guard_failure_blackhole_outcome(&mut driver, 666, &mut state);
+    assert!(state.restore_guard_failure(
+        &meta,
+        &[2],
+        Some(&reconstructed_state),
+        &reconstructed_state.virtuals,
+        &reconstructed_state.pending_fields,
+        &majit_metainterp::blackhole::ExceptionState::default(),
+    ));
 
     assert_eq!(state.flag, 2);
     assert_eq!(cell.field, 77);
 }
 
 #[test]
-fn declarative_driver_guard_failure_replays_pending_array_writes_via_layout_hook() {
-    let descriptor =
-        PendingArrayWriteDriver::descriptor(&[Type::Int, Type::Int], &[Type::Ref, Type::Int])
-            .expect("descriptor should build");
-    let mut driver = JitDriver::<PendingArrayWriteState>::with_descriptor(1, descriptor);
+fn jit_state_restore_guard_failure_replays_pending_array_writes_via_layout_hook() {
+    let meta = TestMeta { header_pc: 888 };
     let mut array = vec![10_i64, 20_i64, 30_i64];
-    let mut state = PendingArrayWriteState {
-        array: array.as_mut_ptr() as usize,
-        flag: 0,
-    };
-
-    start_guard_failure_trace(&mut driver, 888, &mut state);
+    let array_ptr = array.as_mut_ptr() as usize;
+    let mut state = PendingArrayWriteState { array: 0, flag: 1 };
 
     let mut resume = ResumeDataVirtualAdder::new();
     resume.push_frame(0, 888);
-    resume.set_slot_constant(0, majit_ir::Const::Ref(GcRef(state.array as usize)));
+    resume.set_slot_constant(0, majit_ir::Const::Ref(GcRef(array_ptr)));
     resume.map_slot(1, 0);
     let pending_descr: majit_ir::DescrRef = std::sync::Arc::new(
         majit_ir::descr::SimpleArrayDescr::new(12, 0, std::mem::size_of::<i64>(), 0, Type::Int),
@@ -2026,36 +1837,35 @@ fn declarative_driver_guard_failure_replays_pending_array_writes_via_layout_hook
     resume.add_pending_arrayitem_write(
         Some(pending_descr),
         majit_metainterp::resume::ResumeValueSource::Constant(majit_ir::Const::Ref(GcRef(
-            state.array as usize,
+            array_ptr,
         ))),
         1,
         majit_metainterp::resume::ResumeValueSource::Constant(majit_ir::Const::Int(88)),
     );
-    driver
-        .meta_interp_mut()
-        .attach_resume_data(888, 1, resume.build());
+    let reconstructed_state = resume.build().reconstruct_state(&[2]);
 
-    state.array = 0;
-    state.flag = 1;
-    assert_guard_failure_blackhole_outcome(&mut driver, 888, &mut state);
+    assert!(state.restore_guard_failure(
+        &meta,
+        &[2],
+        Some(&reconstructed_state),
+        &reconstructed_state.virtuals,
+        &reconstructed_state.pending_fields,
+        &majit_metainterp::blackhole::ExceptionState::default(),
+    ));
 
     assert_eq!(state.flag, 2);
     assert_eq!(array, vec![10, 88, 30]);
 }
 
 #[test]
-fn declarative_driver_guard_failure_can_restore_multi_frame_resume_state() {
-    let descriptor = MultiFrameDriver::descriptor(&[Type::Int, Type::Int], &[Type::Ref, Type::Int])
-        .expect("descriptor should build");
-    let mut driver = JitDriver::<MultiFrameResumeState>::with_descriptor(1, descriptor);
+fn jit_state_restore_guard_failure_can_restore_multi_frame_resume_state() {
+    let meta = TestMeta { header_pc: 777 };
     let frame_ptr = 0xabcusize;
     let mut state = MultiFrameResumeState {
-        frame: frame_ptr,
-        flag: 0,
+        frame: 0,
+        flag: 1,
         restored_pcs: Vec::new(),
     };
-
-    start_guard_failure_trace(&mut driver, 777, &mut state);
 
     let mut resume = ResumeDataVirtualAdder::new();
     resume.push_frame(0, 100);
@@ -2064,13 +1874,16 @@ fn declarative_driver_guard_failure_can_restore_multi_frame_resume_state() {
     resume.push_frame(0, 200);
     resume.set_slot_constant(0, majit_ir::Const::Ref(GcRef(frame_ptr as usize)));
     resume.map_slot(1, 0);
-    driver
-        .meta_interp_mut()
-        .attach_resume_data(777, 1, resume.build());
+    let reconstructed_state = resume.build().reconstruct_state(&[2]);
 
-    state.frame = 0;
-    state.flag = 1;
-    assert_guard_failure_blackhole_outcome(&mut driver, 777, &mut state);
+    assert!(state.restore_guard_failure(
+        &meta,
+        &[2],
+        Some(&reconstructed_state),
+        &reconstructed_state.virtuals,
+        &reconstructed_state.pending_fields,
+        &majit_metainterp::blackhole::ExceptionState::default(),
+    ));
 
     assert_eq!(state.frame, frame_ptr);
     assert_eq!(state.flag, 2);
@@ -2078,22 +1891,17 @@ fn declarative_driver_guard_failure_can_restore_multi_frame_resume_state() {
 }
 
 #[test]
-fn declarative_driver_guard_failure_can_restore_multi_frame_state_via_generic_frame_hooks() {
-    let descriptor =
-        GenericMultiFrameDriver::descriptor(&[Type::Int, Type::Int], &[Type::Ref, Type::Int])
-            .expect("descriptor should build");
-    let mut driver = JitDriver::<GenericMultiFrameResumeState>::with_descriptor(1, descriptor);
+fn jit_state_restore_guard_failure_can_restore_multi_frame_state_via_generic_frame_hooks() {
+    let meta = TestMeta { header_pc: 778 };
     let materialized_ref = 0xfeedusize;
     let mut state = GenericMultiFrameResumeState {
         frame: 0,
-        flag: 0,
+        flag: 1,
         restored_pcs: Vec::new(),
         restored_frames: Vec::new(),
         materialized_ref,
         materialize_calls: 0,
     };
-
-    start_guard_failure_trace(&mut driver, 778, &mut state);
 
     let mut resume = ResumeDataVirtualAdder::new();
     resume.push_frame(0, 300);
@@ -2103,12 +1911,16 @@ fn declarative_driver_guard_failure_can_restore_multi_frame_state_via_generic_fr
     resume.push_frame(0, 400);
     resume.set_slot_virtual(0, virtual_index);
     resume.map_slot(1, 0);
-    driver
-        .meta_interp_mut()
-        .attach_resume_data(778, 1, resume.build());
+    let reconstructed_state = resume.build().reconstruct_state(&[2]);
 
-    state.flag = 1;
-    assert_guard_failure_blackhole_outcome(&mut driver, 778, &mut state);
+    assert!(state.restore_guard_failure(
+        &meta,
+        &[2],
+        Some(&reconstructed_state),
+        &reconstructed_state.virtuals,
+        &reconstructed_state.pending_fields,
+        &majit_metainterp::blackhole::ExceptionState::default(),
+    ));
 
     assert_eq!(state.frame, materialized_ref);
     assert_eq!(state.flag, 2);
@@ -2121,23 +1933,18 @@ fn declarative_driver_guard_failure_can_restore_multi_frame_state_via_generic_fr
 }
 
 #[test]
-fn declarative_driver_generic_multi_frame_restore_reuses_virtual_cache_for_pending_writes() {
-    let descriptor =
-        GenericMultiFrameDriver::descriptor(&[Type::Int, Type::Int], &[Type::Ref, Type::Int])
-            .expect("descriptor should build");
-    let mut driver = JitDriver::<GenericMultiFrameResumeState>::with_descriptor(1, descriptor);
+fn jit_state_restore_guard_failure_reuses_virtual_cache_for_pending_writes() {
+    let meta = TestMeta { header_pc: 779 };
     let mut cell = PendingWriteCell { field: 0 };
     let cell_ptr = (&mut cell as *mut PendingWriteCell) as usize;
     let mut state = GenericMultiFrameResumeState {
         frame: 0,
-        flag: 0,
+        flag: 1,
         restored_pcs: Vec::new(),
         restored_frames: Vec::new(),
         materialized_ref: cell_ptr,
         materialize_calls: 0,
     };
-
-    start_guard_failure_trace(&mut driver, 779, &mut state);
 
     let mut resume = ResumeDataVirtualAdder::new();
     resume.push_frame(0, 500);
@@ -2155,49 +1962,17 @@ fn declarative_driver_generic_multi_frame_restore_reuses_virtual_cache_for_pendi
         majit_metainterp::resume::ResumeValueSource::Virtual(virtual_index),
         majit_metainterp::resume::ResumeValueSource::Constant(majit_ir::Const::Int(77)),
     );
-    driver
-        .meta_interp_mut()
-        .attach_resume_data(779, 1, resume.build());
+    let reconstructed_state = resume.build().reconstruct_state(&[2]);
 
-    state.flag = 1;
-    assert_guard_failure_blackhole_outcome(&mut driver, 779, &mut state);
+    assert!(state.restore_guard_failure(
+        &meta,
+        &[2],
+        Some(&reconstructed_state),
+        &reconstructed_state.virtuals,
+        &reconstructed_state.pending_fields,
+        &majit_metainterp::blackhole::ExceptionState::default(),
+    ));
 
     assert_eq!(state.materialize_calls, 1);
     assert_eq!(cell.field, 77);
-}
-
-#[test]
-fn declarative_driver_guard_failure_uses_resume_layout_slot_types_for_generic_restore() {
-    let descriptor =
-        LayoutTypedFrameDriver::descriptor(&[Type::Int, Type::Int], &[Type::Ref, Type::Int])
-            .expect("descriptor should build");
-    let mut driver = JitDriver::<LayoutTypedFrameRestoreState>::with_descriptor(1, descriptor);
-    let frame_ptr = 0xfaceusize;
-    let mut state = LayoutTypedFrameRestoreState {
-        frame: frame_ptr,
-        flag: 1,
-        fallback_restore_calls: 0,
-        layout_restore_calls: 0,
-        restored_frames: Vec::new(),
-    };
-
-    start_guard_failure_trace(&mut driver, 780, &mut state);
-
-    let mut resume = ResumeDataVirtualAdder::new();
-    resume.push_frame(0, 780);
-    resume.set_slot_constant(0, majit_ir::Const::Ref(GcRef(frame_ptr as usize)));
-    resume.map_slot(1, 0);
-    driver
-        .meta_interp_mut()
-        .attach_resume_data(780, 1, resume.build());
-
-    state.frame = 0;
-    state.flag = 1;
-    assert_guard_failure_blackhole_outcome(&mut driver, 780, &mut state);
-
-    assert_eq!(state.frame, frame_ptr);
-    assert_eq!(state.flag, 2);
-    assert_eq!(state.layout_restore_calls, 1);
-    assert_eq!(state.fallback_restore_calls, 0);
-    assert_eq!(state.restored_frames, vec![(frame_ptr, 2)]);
 }

@@ -457,6 +457,23 @@ impl Trace {
         &self.ops
     }
 
+    /// Mutable view of the recorded operations. Used by minor-collection
+    /// root walkers (framework.py `root_walker.walk_roots`) to forward
+    /// nursery-resident `ConstPtr.value` slots stored inline in
+    /// `op.args` / `op.fail_args` per history.py:314.
+    pub fn ops_mut(&mut self) -> &mut [Op] {
+        &mut self.ops
+    }
+
+    /// Test-only direct append. Production callers go through
+    /// `record_op` so `op_count` / `box_count` / `box_pool` stay
+    /// in sync; this helper is for GC walker unit tests that exercise
+    /// the op-graph storage without driving the full record path.
+    #[cfg(test)]
+    pub fn push_op_for_test(&mut self, op: Op) {
+        self.ops.push(op);
+    }
+
     /// Access the recorded input arguments.
     pub fn inputargs(&self) -> &[InputArg] {
         &self.inputargs
@@ -1143,7 +1160,7 @@ mod tests {
         let i0 = rec.record_input_arg(Type::Int);
 
         // Simulate a pooled constant reference.
-        let const_ref = OpRef::const_int(0);
+        let const_ref = OpRef::const_int_inline(0);
         let add = rec.record_op(OpCode::IntAdd, &[i0, const_ref]);
 
         rec.close_loop(&[add]);
@@ -1159,7 +1176,7 @@ mod tests {
         let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Int);
 
-        let const_ref = OpRef::const_int(1);
+        let const_ref = OpRef::const_int_inline(1);
         let add1 = rec.record_op(OpCode::IntAdd, &[i0, const_ref]);
         let add2 = rec.record_op(OpCode::IntAdd, &[add1, const_ref]);
 

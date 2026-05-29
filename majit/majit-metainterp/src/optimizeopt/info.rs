@@ -420,7 +420,13 @@ impl PtrInfoExt for PtrInfo {
         ctx: &mut crate::optimizeopt::OptContext,
     ) {
         let mut alloc_const = |ctx: &mut crate::optimizeopt::OptContext, value: Value| {
-            let pos = ctx.reserve_const_ref(value.get_type());
+            // history.py:227/268/314 Const{Int,Float,Ptr}.value inline.
+            let pos = match value {
+                Value::Int(v) => OpRef::const_int_inline(v),
+                Value::Float(v) => OpRef::const_float_inline(v),
+                Value::Ref(v) => OpRef::const_ptr_inline(v),
+                Value::Void => panic!("alloc_const: ConstVoid not allowed"),
+            };
             ctx.seed_constant(pos, value);
             pos
         };
@@ -462,7 +468,11 @@ impl PtrInfoExt for PtrInfo {
                 // PyObject layout) gets the upstream guard sequence
                 // without further changes.
                 if let Some(cls) = &info.known_class {
-                    let class_ref = alloc_const(ctx, Value::Ref(*cls));
+                    // info.py:341-345 stores `_known_class` on PtrInfo, but
+                    // the emitted guard operand is the same ConstInt vtable
+                    // address produced by backend/model.py:199-201
+                    // `cls_of_box()`.
+                    let class_ref = alloc_const(ctx, Value::Int(cls.0 as i64));
                     if !ctx.remove_gctypeptr {
                         short.push(Op::new(OpCode::GuardNonnull, &[op]));
                         short.push(Op::new(OpCode::GuardIsObject, &[op]));
@@ -1700,7 +1710,7 @@ mod tests {
 
         let mut replay = Op::new(
             OpCode::GetarrayitemGcI,
-            &[OpRef::int_op(10), OpRef::const_int(0)],
+            &[OpRef::int_op(10), OpRef::const_int_inline(0)],
         );
         replay.pos.set(OpRef::int_op(88));
         let pop = PreambleOp {

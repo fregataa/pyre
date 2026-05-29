@@ -1233,7 +1233,15 @@ impl DynasmBackend {
                 majit_ir::OpCode::GuardClass | majit_ir::OpCode::GuardNonnullClass
             ) && op.num_args() >= 2
             {
-                if let Some(&classptr) = constants.get(&op.arg(1).raw()) {
+                let class_arg = op.arg(1);
+                let classptr = class_arg.const_int_value().or_else(|| {
+                    if matches!(class_arg, majit_ir::OpRef::ConstInt(_)) {
+                        constants.get(&class_arg.raw()).copied()
+                    } else {
+                        None
+                    }
+                });
+                if let Some(classptr) = classptr {
                     if let Some(tid) = self.lookup_typeid_from_classptr(classptr as usize) {
                         table.insert(classptr, tid);
                     }
@@ -1261,7 +1269,15 @@ impl DynasmBackend {
         }
         for op in ops {
             if op.opcode == majit_ir::OpCode::GuardSubclass && op.num_args() >= 2 {
-                if let Some(&classptr) = constants.get(&op.arg(1).raw()) {
+                let class_arg = op.arg(1);
+                let classptr = class_arg.const_int_value().or_else(|| {
+                    if matches!(class_arg, majit_ir::OpRef::ConstInt(_)) {
+                        constants.get(&class_arg.raw()).copied()
+                    } else {
+                        None
+                    }
+                });
+                if let Some(classptr) = classptr {
                     if let Some(range) =
                         with_dynasm_active_gc(|gc| gc.subclass_range(classptr as usize)).flatten()
                     {

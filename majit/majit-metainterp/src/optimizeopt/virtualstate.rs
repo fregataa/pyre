@@ -608,6 +608,88 @@ pub struct VirtualState {
 }
 
 impl VirtualState {
+    /// Visit every inline `ConstPtr.value` / known-class Ref stored below this
+    /// virtual state.
+    ///
+    /// RPython keeps `TargetToken.virtual_state` in the GC-traced object graph.
+    /// The Rust port stores the same graph in `Rc<VirtualStateInfoNode>`; during
+    /// a stop-the-world GC walk we mutate the node payloads in place so all
+    /// shared references observe the forwarded address.
+    pub fn walk_const_ptr_refs_mut(&mut self, visitor: &mut dyn FnMut(&mut GcRef)) {
+        use std::collections::HashSet;
+
+        fn visit_value(value: &mut Value, visitor: &mut dyn FnMut(&mut GcRef)) {
+            if let Value::Ref(gcref) = value {
+                visitor(gcref);
+            }
+        }
+
+        fn visit_node(
+            node: &Rc<VirtualStateInfoNode>,
+            visitor: &mut dyn FnMut(&mut GcRef),
+            seen: &mut HashSet<*const VirtualStateInfoNode>,
+        ) {
+            let ptr = Rc::as_ptr(node);
+            if !seen.insert(ptr) {
+                return;
+            }
+            // SAFETY: GC root walking is stop-the-world in pyre. RPython mutates
+            // the same object-graph fields in place; this mirrors that by
+            // updating the shared Rc node payload so every alias sees the
+            // forwarded GcRef.
+            let node_mut = unsafe { &mut *(ptr as *mut VirtualStateInfoNode) };
+            visit_info(&mut node_mut.info, visitor, seen);
+        }
+
+        fn visit_info(
+            info: &mut VirtualStateInfo,
+            visitor: &mut dyn FnMut(&mut GcRef),
+            seen: &mut HashSet<*const VirtualStateInfoNode>,
+        ) {
+            match info {
+                VirtualStateInfo::Constant(value) => visit_value(value, visitor),
+                VirtualStateInfo::Virtual {
+                    known_class,
+                    fields,
+                    ..
+                } => {
+                    if let Some(gcref) = known_class.as_mut() {
+                        visitor(gcref);
+                    }
+                    for (_, child) in fields {
+                        visit_node(child, visitor, seen);
+                    }
+                }
+                VirtualStateInfo::VArray { items, .. } => {
+                    for child in items {
+                        visit_node(child, visitor, seen);
+                    }
+                }
+                VirtualStateInfo::VStruct { fields, .. } => {
+                    for (_, child) in fields {
+                        visit_node(child, visitor, seen);
+                    }
+                }
+                VirtualStateInfo::VArrayStruct { element_fields, .. } => {
+                    for fields in element_fields {
+                        for (_, child) in fields {
+                            visit_node(child, visitor, seen);
+                        }
+                    }
+                }
+                VirtualStateInfo::KnownClass { class_ptr } => visitor(class_ptr),
+                VirtualStateInfo::NonNull
+                | VirtualStateInfo::IntBounded(_)
+                | VirtualStateInfo::Unknown(_) => {}
+            }
+        }
+
+        let mut seen = HashSet::new();
+        for node in &self.state {
+            visit_node(node, visitor, &mut seen);
+        }
+    }
+
     pub fn new(state: Vec<VirtualStateInfo>) -> Self {
         let state: Vec<Rc<VirtualStateInfoNode>> = state
             .into_iter()
@@ -2315,9 +2397,12 @@ impl GuardRequirement {
                         None => return Vec::new(),
                     }
                 };
-                // virtualstate.py:610 GUARD_CLASS [box, self.known_class]
-                // — known_class is a ConstPtr to the class.
-                let class_const = ctx.make_constant_ref(*expected_class);
+                // virtualstate.py:610 GUARD_CLASS [box, self.known_class].
+                // The class operand is a ConstInt vtable address:
+                // backend/model.py:199-201 `cls_of_box()` returns
+                // `ConstInt(ptr2int(obj.typeptr))`, and backend regalloc
+                // reads `op.getarg(1).getint()`.
+                let class_const = ctx.make_constant_int(expected_class.0 as i64);
                 let mut op = Op::new(OpCode::GuardClass, &[arg, class_const]);
                 op.setfailargs(Default::default());
                 vec![op]
@@ -2335,9 +2420,10 @@ impl GuardRequirement {
                         None => return Vec::new(),
                     }
                 };
-                // virtualstate.py:603 GUARD_NONNULL_CLASS [box, self.known_class]
-                // — known_class is a ConstPtr to the class.
-                let class_const = ctx.make_constant_ref(*expected_class);
+                // virtualstate.py:603 GUARD_NONNULL_CLASS [box, self.known_class].
+                // The class operand is the same ConstInt vtable address used
+                // by GUARD_CLASS.
+                let class_const = ctx.make_constant_int(expected_class.0 as i64);
                 let mut op = Op::new(OpCode::GuardNonnullClass, &[arg, class_const]);
                 op.setfailargs(Default::default());
                 vec![op]

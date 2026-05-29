@@ -692,13 +692,13 @@ pub struct ByteTraceIter<'a> {
     /// Majit-specific fresh OpRef counter (same role as
     /// `TraceIterator::_fresh` on the legacy walker).
     pub _fresh: u32,
-    /// Optional ConstantPool for materializing TAGINT / TAGCONSTPTR /
-    /// TAGCONSTOTHER constants into caller-owned OpRefs.  When `None`,
-    /// any constant-tagged arg panics (M4 step 1 back-compat).  When
-    /// `Some`, constants are de-duplicated via
-    /// `ConstantPool::get_or_insert_typed` — the returned OpRef is
-    /// owned by the caller's pool so downstream consumers can resolve
-    /// values through the same pool.
+    /// Legacy ConstantPool slot, retained for callers that still pass one.
+    /// `_untag` (opencoder.rs:823) materialises TAGINT / TAGCONSTPTR /
+    /// TAGCONSTOTHER directly into inline-Const OpRef variants per
+    /// history.py:227/268/314 (`Const{Int,Float,Ptr}.value` inline), so
+    /// this field is no longer consulted on the constant-decode path.
+    /// Kept on the struct to preserve the cut-trace constructor signature
+    /// in test fixtures pending the wider ConstantPool retirement audit.
     pub const_pool: Option<&'a mut crate::constant_pool::ConstantPool>,
 }
 
@@ -713,11 +713,12 @@ impl<'a> ByteTraceIter<'a> {
         Self::new_with_pool(trace, start, end, start_fresh, None)
     }
 
-    /// M4 step 2: constructor that attaches a ConstantPool for
-    /// constant-arg decode.  When `const_pool` is `Some`, TAGINT /
-    /// TAGCONSTPTR / TAGCONSTOTHER args are resolved through the pool
-    /// (`get_or_insert_typed`); when `None`, they panic (the M4 step 1
-    /// behaviour that keeps TAGBOX-only tests honest).
+    /// Slice 6 retired the `ConstantPool` indirection: every TAG* arm
+    /// in `_untag` now mints inline-Const directly (history.py:227/268/314
+    /// `Const*.value` inline). The `const_pool` parameter is no longer
+    /// consulted on the decode path; it is retained for callers that
+    /// still pass `Some(&mut pool)` until the legacy idx-Const path is
+    /// fully retired.
     pub fn new_with_pool(
         trace: &'a TraceRecordBuffer,
         start: usize,
@@ -854,13 +855,14 @@ impl<'a> ByteTraceIter<'a> {
 
     /// opencoder.py:321-335 `_untag` — full dispatch.
     ///
-    /// TAGBOX → `_cache` lookup.  TAGINT → small int pool entry.
-    /// TAGCONSTPTR → `trace._refs[v]` → pool entry.  TAGCONSTOTHER →
-    /// either `trace._floats[v >> 1]` (bit 0 == 1) or
-    /// `trace._bigints[v >> 1]` (bit 0 == 0), routed through the pool.
-    ///
-    /// When `const_pool` is `None`, non-TAGBOX tags panic (back-compat
-    /// with M4 step 1 TAGBOX-only usage).
+    /// TAGBOX → `_cache` lookup.  TAGINT → inline `ConstInt(v)`
+    /// (history.py:227 `ConstInt.value` inline).  TAGCONSTPTR → inline
+    /// `ConstPtr(trace._refs[v])` (history.py:314 `ConstPtr.value` inline).
+    /// TAGCONSTOTHER → inline `ConstFloat`/`ConstInt` from
+    /// `trace._floats`/`trace._bigints` (history.py:268/227 inline). The
+    /// `const_pool` field on the iterator is no longer consulted on this
+    /// path — Slice 6 retired the ConstantPool indirection so every TAG*
+    /// arm mints inline-Const directly.
     ///
     /// `pub` because `SnapshotIterator::get` / `unpack_array`
     /// (opencoder.py:222-231) dispatch through `main_iter._untag`.
@@ -877,42 +879,28 @@ impl<'a> ByteTraceIter<'a> {
             }
             TAGINT => {
                 // opencoder.py:326-327 ConstInt(v) — signed small int.
-                match self.const_pool.as_deref_mut() {
-                    Some(pool) => pool.get_or_insert_typed(v, Type::Int),
-                    None => panic!(
-                        "ByteTraceIter: TAGINT arg with value {} but no ConstantPool \
-                         attached — construct via `new_with_pool(..., Some(&mut pool))`",
-                        v
-                    ),
-                }
+                // history.py:227 ConstInt.value inline.
+                OpRef::const_int_inline(v)
             }
             TAGCONSTPTR => {
-                // opencoder.py:328-329 ConstPtr(self.trace._refs[v]).
+                // opencoder.py:328-329 ConstPtr(self.trace._refs[v]) —
+                // history.py:314 `ConstPtr.value` inline. Slice 7b
+                // op-graph walker forwards `OpRef::ConstPtrInline(GcRef)`
+                // slots across minor collection.
                 let addr = self.trace._refs[v as usize];
-                match self.const_pool.as_deref_mut() {
-                    Some(pool) => pool.get_or_insert_typed(addr as i64, Type::Ref),
-                    None => panic!("ByteTraceIter: TAGCONSTPTR arg but no ConstantPool attached"),
-                }
+                OpRef::const_ptr_inline(majit_ir::GcRef(addr as usize))
             }
             TAGCONSTOTHER => {
                 // opencoder.py:330-334 bigint vs float split on bit 0.
                 let pool_idx = (v >> 1) as usize;
                 if v & 1 != 0 {
+                    // history.py:268 ConstFloat.value inline.
                     let bits = self.trace._floats[pool_idx];
-                    match self.const_pool.as_deref_mut() {
-                        Some(pool) => pool.get_or_insert_typed(bits as i64, Type::Float),
-                        None => panic!(
-                            "ByteTraceIter: TAGCONSTOTHER (float) but no ConstantPool attached"
-                        ),
-                    }
+                    OpRef::const_float_inline(f64::from_bits(bits as u64))
                 } else {
+                    // history.py:227 ConstInt.value inline.
                     let val = self.trace._bigints[pool_idx];
-                    match self.const_pool.as_deref_mut() {
-                        Some(pool) => pool.get_or_insert_typed(val, Type::Int),
-                        None => panic!(
-                            "ByteTraceIter: TAGCONSTOTHER (bigint) but no ConstantPool attached"
-                        ),
-                    }
+                    OpRef::const_int_inline(val)
                 }
             }
             other => unreachable!("ByteTraceIter: unknown tag {}", other),
@@ -3122,9 +3110,9 @@ mod tests {
     #[test]
     fn test_trace_iterator_constants_passthrough() {
         // opencoder.py:321-335 _untag(): TAGINT/TAGCONSTPTR/TAGCONSTOTHER
-        // pass through unchanged. In majit, constant OpRefs (is_constant
-        // high-bit marker) must NOT be remapped through `_cache`.
-        let const_ref = OpRef::const_int(5);
+        // pass through unchanged. In majit, constant OpRefs (inline-Const
+        // variants) must NOT be remapped through `_cache`.
+        let const_ref = OpRef::const_int_inline(5);
         let ops = vec![op_at(1, majit_ir::OpCode::IntAdd, &[iarg(0), const_ref])];
         let inputarg_types = vec![majit_ir::Type::Int; 1];
         let ops: Vec<majit_ir::OpRc> = ops.into_iter().map(std::rc::Rc::new).collect();
@@ -3462,20 +3450,25 @@ mod tests {
         assert!(it.done());
     }
 
-    /// M4 step 1: constant args panic when the iterator was built
-    /// without a ConstantPool (the default `get_byte_iter()` /
-    /// `new()` path).  M4 step 2 introduced `new_with_pool` for the
-    /// with-pool path; this test keeps the back-compat panic surface
-    /// honest.
+    /// M4 (post-Slice-7b): all `TAG{INT,CONSTPTR,CONSTOTHER}` args mint
+    /// inline-Const OpRefs (`history.py:227/268/314 Const{Int,Float,Ptr}.value`
+    /// are inline) so the byte iterator no longer requires a
+    /// ConstantPool to decode constant arguments. The op-graph GC walker
+    /// (`MetaInterp::walk_active_trace_refs` /
+    /// `walk_partial_trace_refs`) forwards `ConstPtrInline(GcRef)`
+    /// slots across minor collection.
     #[test]
-    #[should_panic(expected = "no ConstantPool attached")]
-    fn test_byte_trace_iter_const_arg_panics_without_pool_m4() {
+    fn test_byte_trace_iter_decodes_tagconstptr_inline_m4() {
         let mut buf = TraceRecordBuffer::new(1, empty_sd());
-        buf.record_input_arg(Type::Int);
-        // `Box::ConstInt(0)` routes through `_encode_smallint` → TAGINT.
-        let _ = buf.record_op2(OpCode::IntAdd, Box::ResOp(0), Box::ConstInt(0), None);
+        buf.record_input_arg(Type::Ref);
+        let _ = buf.record_op1(OpCode::SameAsR, Box::ConstPtr(0xdead_beef), None);
         let mut it = buf.get_byte_iter();
-        let _ = it.next(); // should panic inside `_untag` on the TAGINT arg
+        let op = it.next().expect("SameAsR");
+        assert_eq!(op.opcode, OpCode::SameAsR);
+        assert_eq!(
+            op.arg(0).as_const_ptr_inline(),
+            Some(majit_ir::GcRef(0xdead_beef))
+        );
     }
 
     /// M4 step 2: TAGINT arg with a ConstantPool attached resolves into
@@ -4095,8 +4088,12 @@ mod tests {
         assert_eq!(expected._refs, actual._refs);
     }
 
-    /// Step 2b: an orphan constant OpRef (CONST_BIT set but no pool
+    /// Step 2b: an orphan constant OpRef (legacy idx-Const with no pool
     /// entry) is a genuine invariant break — the adapter must panic.
+    ///
+    /// legacy-const-ok: pins the legacy idx-Const + missing-pool-entry
+    /// failure mode. Inline-Const variants carry the value on the OpRef
+    /// and never go through the pool, so this path is unreachable for them.
     #[test]
     #[should_panic(expected = "not in pool")]
     fn test_record_op_oprefs_orphan_constant_panics_2b() {

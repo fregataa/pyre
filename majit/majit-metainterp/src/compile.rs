@@ -95,11 +95,15 @@ fn fail_arg_type(opref: &OpRef, value_types: &vecset::VecMap<u32, Type>) -> Type
     if *opref == OpRef::NONE {
         return Type::Ref;
     }
+    // history.py:220/261/307 — `Const{Int,Float,Ptr}.type` is intrinsic on
+    // the Box itself. Variant tag dispatch is the single source of truth
+    // for Const operands; the side `value_types` map is only consulted for
+    // body OpRefs whose type was captured at guard-emission time.
+    // Inline-Const variants panic on `.raw()`, so dispatch via `ty()` first.
     if opref.is_constant() {
-        value_types.get(&opref.raw()).copied().unwrap_or(Type::Int)
-    } else {
-        value_types.get(&opref.raw()).copied().unwrap_or(Type::Ref)
+        return opref.ty().unwrap_or(Type::Int);
     }
+    value_types.get(&opref.raw()).copied().unwrap_or(Type::Ref)
 }
 
 /// Derive slot_types from ExitValueSourceLayout + exit_types.
@@ -488,6 +492,17 @@ pub(crate) fn build_guard_metadata(
             // typing — it matches RPython where `handle_fail` reads
             // `cpu.get_*_value(deadframe, 0)` keyed by the descr
             // class, not by per-arg inference.
+            // history.py:220/261/307 — Const operands carry `.type`
+            // intrinsically; route via `opref.ty()` before consulting the
+            // body-OpRef-keyed `value_types` side table (which uses
+            // `.raw()` that panics on inline-Const variants).
+            let finish_arg_type = |opref: &OpRef| -> Type {
+                if opref.is_constant() {
+                    opref.ty().unwrap_or(Type::Int)
+                } else {
+                    value_types.get(&opref.raw()).copied().unwrap_or(Type::Int)
+                }
+            };
             if let Some(types) = descr_types {
                 if types.len() == op.num_args() {
                     types.to_vec()
@@ -496,17 +511,11 @@ pub(crate) fn build_guard_metadata(
                     // type-shaped descr): reconstruct per-arg from the
                     // incremental `value_types`. Production FINISH always
                     // matches the descr arity.
-                    op.getarglist()
-                        .iter()
-                        .map(|opref| value_types.get(&opref.raw()).copied().unwrap_or(Type::Int))
-                        .collect()
+                    op.getarglist().iter().map(finish_arg_type).collect()
                 }
             } else {
                 // No descr — synthetic test FINISH only.
-                op.getarglist()
-                    .iter()
-                    .map(|opref| value_types.get(&opref.raw()).copied().unwrap_or(Type::Int))
-                    .collect()
+                op.getarglist().iter().map(finish_arg_type).collect()
             }
         } else if let Some(fail_args) = op.getfailargs() {
             // `store_final_boxes_in_guard` (resume.py:397) writes the
@@ -521,6 +530,11 @@ pub(crate) fn build_guard_metadata(
                 if types.len() == fail_args.len() {
                     types.to_vec()
                 } else {
+                    // history.py:220/261/307 — `fail_arg_type` routes Const
+                    // operands via `opref.ty()` (intrinsic on Const Boxes)
+                    // and only consults the `value_types` side table for
+                    // body OpRefs. Inline-Const operands panic on `.raw()`,
+                    // so the redundant inline lookup is collapsed away.
                     fail_args
                         .iter()
                         .enumerate()
@@ -532,9 +546,6 @@ pub(crate) fn build_guard_metadata(
                                 if let Some(&tp) = fa.get(i) {
                                     return tp;
                                 }
-                            }
-                            if let Some(&tp) = value_types.get(&opref.raw()) {
-                                return tp;
                             }
                             fail_arg_type(opref, &value_types)
                         })
@@ -551,9 +562,6 @@ pub(crate) fn build_guard_metadata(
                             if let Some(&tp) = types.get(i) {
                                 return tp;
                             }
-                            if let Some(&tp) = value_types.get(&opref.raw()) {
-                                return tp;
-                            }
                             fail_arg_type(opref, &value_types)
                         })
                         .collect()
@@ -561,12 +569,7 @@ pub(crate) fn build_guard_metadata(
             } else {
                 fail_args
                     .iter()
-                    .map(|opref| {
-                        if let Some(&tp) = value_types.get(&opref.raw()) {
-                            return tp;
-                        }
-                        fail_arg_type(opref, &value_types)
-                    })
+                    .map(|opref| fail_arg_type(opref, &value_types))
                     .collect()
             }
         } else if let Some(dt) = descr_types {
@@ -1726,6 +1729,11 @@ pub(crate) fn normalize_closing_jump_args(
             break;
         }
         let arg = jump.arg(idx);
+        // history.py:189-220 Const* are values, not body-namespace OpRefs
+        // — they never need closing-jump normalization.
+        if arg.is_constant() {
+            continue;
+        }
         if constants.contains_key(&arg.raw()) {
             continue;
         }
@@ -2060,9 +2068,8 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
         };
         for index in 0..array_len {
             // compile.py:453 — ConstInt(index) for the array subscript.
-            let const_opref = OpRef::const_int(next_const_idx);
-            next_const_idx += 1;
-            constants.insert(const_opref.raw(), majit_ir::Value::Int(index as i64));
+            // history.py:227 ConstInt.value inline.
+            let const_opref = OpRef::const_int_inline(index as i64);
 
             let old_opref =
                 OpRef::input_arg_typed(expanded_inputargs[i].index, expanded_inputargs[i].tp);
@@ -2434,29 +2441,22 @@ pub fn compile_tmp_callback(
     // InputArgs occupy `0..num_inputs` and are minted via
     // `InputArg::opref()` so they carry RPython-parity InputArg{Int,
     // Float,Ref} variants (resoperation.py:719/727/739). Constants
-    // (funcbox + greens) live in the dedicated CONST_BIT namespace and
-    // are minted via `OpRef::const_typed` so each one is a Const{Int,
-    // Float,Ptr} (history.py:220/261/307).
-    const CONST_BASE: u32 = 10_000;
-    let mut constants: majit_ir::VecAssoc<u32, majit_ir::Const> = majit_ir::VecAssoc::new();
-    // `compile.py:1126` funcbox = ConstInt(adr2int(k)).
-    let funcbox_ref = OpRef::const_int(CONST_BASE);
-    constants.insert(
-        funcbox_ref.raw(),
-        majit_ir::Const::Int(jitdriver_sd.portal_runner_adr),
-    );
+    // (funcbox + greens) carry their value inline on the OpRef
+    // variant (history.py:227/268/314 `Const{Int,Float,Ptr}.value`).
+    // `compile.py:1126` funcbox = ConstInt(adr2int(k)) — `ConstInt.value`
+    // inline, carried directly on the OpRef variant.
+    let funcbox_ref = OpRef::const_int_inline(jitdriver_sd.portal_runner_adr);
     // Green boxes follow in declaration order.
     let mut callargs: Vec<OpRef> = Vec::with_capacity(1 + greenboxes.len() + inputargs.len());
     callargs.push(funcbox_ref);
-    for (i, gb) in greenboxes.iter().enumerate() {
-        let (c, tp) = match *gb {
-            Value::Int(v) => (majit_ir::Const::Int(v), Type::Int),
-            Value::Ref(r) => (majit_ir::Const::Ref(r), Type::Ref),
-            Value::Float(f) => (majit_ir::Const::Float(f), Type::Float),
+    for gb in greenboxes.iter() {
+        // history.py:227/268/314 Const{Int,Float,Ptr}.value inline.
+        let g_ref = match *gb {
+            Value::Int(v) => OpRef::const_int_inline(v),
+            Value::Ref(r) => OpRef::const_ptr_inline(r),
+            Value::Float(f) => OpRef::const_float_inline(f),
             Value::Void => panic!("compile_tmp_callback: void greenbox"),
         };
-        let g_ref = OpRef::const_typed(CONST_BASE + 1 + i as u32, tp);
-        constants.insert(g_ref.raw(), c);
         callargs.push(g_ref);
     }
     // Red args — inputargs occupy contiguous low OpRefs. Use
@@ -2524,7 +2524,10 @@ pub fn compile_tmp_callback(
     //
     // `compile.py:1146` `cpu.compile_loop(inputargs, operations, jitcell_token,
     // log=False)`.
-    backend.set_constants_pool(constants);
+    // Inline-Const carries each Const value directly on its OpRef
+    // variant (history.py:227/268/314), so the backend pool is left
+    // empty for `compile_tmp_callback`.
+    backend.set_constants_pool(majit_ir::VecAssoc::new());
     backend.compile_loop(
         &inputargs,
         &operations,
@@ -2559,6 +2562,8 @@ mod tests {
     use crate::resume::{ResumeDataLoopMemo, SimpleBoxEnv, Snapshot, SnapshotFrame};
     use majit_ir::{ArrayFlag, Op, OpCode, OpRef};
 
+    // history.py:227 ConstInt.value inline — SimpleBoxEnv.get_const
+    // reads inline-Const directly without the legacy raw-u32 side table.
     #[test]
     fn test_build_guard_metadata_keeps_vable_array_out_of_frame_slots() {
         use majit_backend::ExitValueSourceLayout;
@@ -2567,22 +2572,14 @@ mod tests {
         let mut env = SimpleBoxEnv::new();
         env.types.insert(0, Type::Ref);
         env.types.insert(1, Type::Int);
-        env.constants
-            .insert(OpRef::const_int(1).raw(), (8, Type::Int));
-        env.constants
-            .insert(OpRef::const_int(2).raw(), (777, Type::Int)); // code object payload
-        env.constants
-            .insert(OpRef::const_int(3).raw(), (2, Type::Int));
-        env.constants
-            .insert(OpRef::const_int(4).raw(), (999, Type::Int)); // namespace payload
 
         let snapshot = Snapshot {
             vable_array: vec![
                 OpRef::input_arg_ref(0).into(),
-                OpRef::const_int(1).into(),
-                OpRef::const_int(2).into(),
-                OpRef::const_int(3).into(),
-                OpRef::const_int(4).into(),
+                OpRef::const_int_inline(8).into(),
+                OpRef::const_int_inline(777).into(), // code object payload
+                OpRef::const_int_inline(2).into(),
+                OpRef::const_int_inline(999).into(), // namespace payload
             ],
             vref_array: vec![],
             framestack: vec![SnapshotFrame {

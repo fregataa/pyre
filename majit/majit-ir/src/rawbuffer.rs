@@ -79,6 +79,10 @@ impl RawBuffer {
         &self.values
     }
 
+    pub fn values_mut(&mut self) -> &mut [OpRef] {
+        &mut self.values
+    }
+
     pub fn iter_entries(&self) -> impl Iterator<Item = (i64, usize, &DescrRef, OpRef)> + '_ {
         self.offsets
             .iter()

@@ -368,6 +368,12 @@ impl BoxEnv for SimpleBoxEnv {
     // op -> op._forwarded -> ... until None / AbstractInfo, returning the
     // last item before that. Iterate the replacement map the same way.
     fn get_box_replacement(&self, opref: majit_ir::OpRef) -> majit_ir::OpRef {
+        // history.py:227/268/314 inline-Const is its own forwarding root
+        // (Const objects never participate in `_forwarded` per
+        // resoperation.py:57 default `_forwarded = None`).
+        if opref.inline_const_bits().is_some() {
+            return opref;
+        }
         let mut opref = opref;
         while let Some(next) = self.replacements.get(&opref.raw()).copied() {
             if next == opref {
@@ -381,12 +387,19 @@ impl BoxEnv for SimpleBoxEnv {
     // resoperation.py:64-65 not_const arm: stop one hop before reaching
     // a Const target, returning the predecessor.
     fn get_box_replacement_not_const(&self, opref: majit_ir::OpRef) -> majit_ir::OpRef {
+        if opref.inline_const_bits().is_some() {
+            return opref;
+        }
         let mut opref = opref;
         while let Some(next) = self.replacements.get(&opref.raw()).copied() {
             if next == opref {
                 return opref;
             }
-            if next.is_constant() || self.constants.contains_key(&next.raw()) {
+            if next.is_constant() {
+                return opref;
+            }
+            // Legacy idx Const sentinel in side table.
+            if next.inline_const_bits().is_none() && self.constants.contains_key(&next.raw()) {
                 return opref;
             }
             opref = next;
@@ -395,27 +408,50 @@ impl BoxEnv for SimpleBoxEnv {
     }
 
     fn is_const(&self, opref: majit_ir::OpRef) -> bool {
+        // history.py:227/268/314 inline-Const variants are constants by tag.
+        if opref.is_constant() {
+            return true;
+        }
         self.constants.contains_key(&opref.raw())
     }
     fn get_const(&self, opref: majit_ir::OpRef) -> (i64, majit_ir::Type) {
+        // history.py:227 ConstInt.value / :268 ConstFloat.value / :314 ConstPtr.value
+        // inline on the Box; read directly without side-table.
+        if let (Some(bits), Some(tp)) = (opref.inline_const_bits(), opref.ty()) {
+            return (bits, tp);
+        }
         self.constants
             .get(&opref.raw())
             .copied()
             .unwrap_or((0, majit_ir::Type::Int))
     }
     fn get_type(&self, opref: majit_ir::OpRef) -> majit_ir::Type {
+        // resoperation.py:1693 opclasses[opnum].type — every typed OpRef
+        // variant pins `.type` (history.py:220/261/307 + resoperation.py:567/589/615).
+        if let Some(tp) = opref.ty() {
+            return tp;
+        }
         self.types
             .get(&opref.raw())
             .copied()
             .unwrap_or(majit_ir::Type::Int)
     }
     fn is_virtual_ref(&self, opref: majit_ir::OpRef) -> bool {
+        if opref.inline_const_bits().is_some() {
+            return false;
+        }
         self.virtuals.contains(&opref.raw())
     }
     fn is_virtual_raw(&self, opref: majit_ir::OpRef) -> bool {
+        if opref.inline_const_bits().is_some() {
+            return false;
+        }
         self.virtuals.contains(&opref.raw())
     }
     fn get_virtual_fields(&self, opref: majit_ir::OpRef) -> Option<majit_ir::VirtualFieldsInfo> {
+        if opref.inline_const_bits().is_some() {
+            return None;
+        }
         self.virtual_fields.get(&opref.raw()).cloned()
     }
 }
@@ -4507,12 +4543,14 @@ mod tests {
         use majit_ir::OpRef;
         let mut memo = ResumeDataLoopMemo::new();
         let mut env = SimpleBoxEnv::new();
-        env.constants
-            .insert(OpRef::const_int(1).raw(), (42i64, majit_ir::Type::Int));
         let snapshot = Snapshot::single_frame(
             0,
             8,
-            vec![OpRef::const_int(1), OpRef::int_op(1), OpRef::int_op(2)],
+            vec![
+                OpRef::const_int_inline(42),
+                OpRef::int_op(1),
+                OpRef::int_op(2),
+            ],
         );
         let numb_state = memo.number(&snapshot, &env, -1).unwrap();
         // Should have: [size, num_failargs, 0(vable), 0(vref), 0(jitcode), 8(pc), tagged...]
@@ -4530,7 +4568,7 @@ mod tests {
         assert_eq!(items[4], 0);
         // items[5] = pc = 8
         assert_eq!(items[5], 8);
-        // items[6] = OpRef::const_int(1) tagged as TAGINT(42) since 42 fits in 13 bits
+        // items[6] = inline-Const(42) tagged as TAGINT(42) since 42 fits in 13 bits
         let (val, tagbits) = untag(items[6] as i16);
         assert_eq!(tagbits, TAGINT);
         assert_eq!(val, 42);
@@ -4549,12 +4587,14 @@ mod tests {
         use majit_ir::OpRef;
         let mut memo = ResumeDataLoopMemo::new();
         let mut env = SimpleBoxEnv::new();
-        env.constants
-            .insert(OpRef::const_int(1).raw(), (42i64, majit_ir::Type::Int));
         let snapshot = Snapshot::single_frame(
             0,
             8,
-            vec![OpRef::const_int(1), OpRef::int_op(1), OpRef::int_op(2)],
+            vec![
+                OpRef::const_int_inline(42),
+                OpRef::int_op(1),
+                OpRef::int_op(2),
+            ],
         );
         let mut numb_state = memo.number(&snapshot, &env, -1).unwrap();
         // RPython: ResumeDataVirtualAdder.finish() patches slot 1 with num_boxes.
@@ -4747,9 +4787,7 @@ mod tests {
     fn test_multi_frame_snapshot() {
         use majit_ir::OpRef;
         let mut memo = ResumeDataLoopMemo::new();
-        let mut env = SimpleBoxEnv::new();
-        env.constants
-            .insert(OpRef::const_int(0).raw(), (99i64, majit_ir::Type::Int));
+        let env = SimpleBoxEnv::new();
 
         let snapshot = Snapshot {
             vable_array: vec![],
@@ -4758,7 +4796,7 @@ mod tests {
                 SnapshotFrame {
                     jitcode_index: 0,
                     pc: 10,
-                    boxes: vec![OpRef::int_op(1).into(), OpRef::const_int(0).into()],
+                    boxes: vec![OpRef::int_op(1).into(), OpRef::const_int_inline(99).into()],
                 },
                 SnapshotFrame {
                     jitcode_index: 1,
@@ -4813,8 +4851,6 @@ mod tests {
         use majit_ir::OpRef;
         let mut memo = ResumeDataLoopMemo::new();
         let mut env = SimpleBoxEnv::new();
-        env.constants
-            .insert(OpRef::const_int(1).raw(), (42i64, majit_ir::Type::Int));
         env.virtuals.insert(2);
         env.types.insert(2, majit_ir::Type::Ref);
 
@@ -4822,7 +4858,7 @@ mod tests {
             0,
             8,
             vec![
-                OpRef::const_int(1),
+                OpRef::const_int_inline(42),
                 OpRef::int_op(1),
                 OpRef::ref_op(2),
                 OpRef::int_op(3),

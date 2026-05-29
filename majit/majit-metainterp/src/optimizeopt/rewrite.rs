@@ -2306,21 +2306,9 @@ impl OptRewrite {
             obj_info_for_class.and_then(|i| i.get_known_class(ctx.cpu.as_ref()))
         {
             if op.num_args() >= 2 {
-                // Class pointer may be Value::Int or Value::Ref.
-                let expected = ctx
-                    .get_box_replacement_box(op.arg(1))
-                    .and_then(|b| match b.const_value() {
-                        Some(Value::Int(i)) => Some(i),
-                        _ => None,
-                    })
-                    .or_else(|| {
-                        ctx.get_box_replacement_box(op.arg(1))
-                            .and_then(|b| b.const_value())
-                            .and_then(|v| match v {
-                                majit_ir::Value::Ref(r) => Some(r.0 as i64),
-                                _ => None,
-                            })
-                    });
+                // RPython GuardClass / GuardNonnullClass class operands are
+                // ConstInt vtable addresses (`expectedclassbox.getint()`).
+                let expected = ctx.get_constant_int(op.arg(1));
                 if let Some(expected) = expected {
                     if known_class.0 as i64 == expected {
                         return OptimizationResult::Remove;
@@ -2387,21 +2375,7 @@ impl OptRewrite {
                     // guard's position in last_guard_pos (optimizer.py:137
                     // parity) rather than snapping it to the tail of
                     // new_operations.
-                    if let Some(class_val) = ctx
-                        .get_box_replacement_box(op.arg(1))
-                        .and_then(|b| match b.const_value() {
-                            Some(Value::Int(i)) => Some(i),
-                            _ => None,
-                        })
-                        .or_else(|| {
-                            ctx.get_box_replacement_box(op.arg(1))
-                                .and_then(|b| b.const_value())
-                                .and_then(|v| match v {
-                                    majit_ir::Value::Ref(r) => Some(r.0 as i64),
-                                    _ => None,
-                                })
-                        })
-                    {
+                    if let Some(class_val) = ctx.get_constant_int(op.arg(1)) {
                         if let Some(b) = ctx.ensure_box(obj) {
                             crate::optimizeopt::optimizer::Optimizer::make_constant_class(
                                 ctx, &b, class_val, /* update_last_guard = */ false,
@@ -2422,21 +2396,7 @@ impl OptRewrite {
         // `is_virtual` guard and lets `Optimizer::make_constant_class`
         // dispatch on the live `Instance` / `Virtual` arm.
         if op.num_args() >= 2 {
-            if let Some(class_val) = ctx
-                .get_box_replacement_box(op.arg(1))
-                .and_then(|b| match b.const_value() {
-                    Some(Value::Int(i)) => Some(i),
-                    _ => None,
-                })
-                .or_else(|| {
-                    ctx.get_box_replacement_box(op.arg(1))
-                        .and_then(|b| b.const_value())
-                        .and_then(|v| match v {
-                            majit_ir::Value::Ref(r) => Some(r.0 as i64),
-                            _ => None,
-                        })
-                })
-            {
+            if let Some(class_val) = ctx.get_constant_int(op.arg(1)) {
                 ctx.pending_guard_class_postprocess =
                     Some(crate::optimizeopt::PendingGuardClassPostprocess { obj, class_val });
             }
@@ -3646,15 +3606,9 @@ impl Optimization for OptRewrite {
             OpCode::RecordExactClass => {
                 let obj = ctx.get_box_replacement(op.arg(0));
                 if op.num_args() >= 2 {
-                    // ConstClass is Value::Ref in majit (not Value::Int).
-                    let expected_class: Option<i64> = ctx
-                        .get_box_replacement_box(op.arg(1))
-                        .and_then(|cb| cb.const_value())
-                        .and_then(|v| match v {
-                            Value::Ref(r) => Some(r.0 as i64),
-                            Value::Int(i) => Some(i),
-                            _ => None,
-                        });
+                    // RPython `RECORD_EXACT_CLASS` carries the same ConstInt
+                    // vtable address shape as GUARD_CLASS.
+                    let expected_class = ctx.get_constant_int(op.arg(1));
                     if let Some(expected_class) = expected_class {
                         // getptrinfo synthesizes ConstPtrInfo for constant
                         // Refs so `get_known_class` reads cls_of_box for them.

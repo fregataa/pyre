@@ -982,8 +982,21 @@ impl<'a> Assembler386<'a> {
         if let Some(&slot) = self.opref_to_slot.get(&opref) {
             return ResolvedArg::Slot(Self::slot_offset(slot));
         }
-        if let Some(&val) = self.constants.get(&opref.raw()) {
+        // history.py:227/268/314 — inline-Const variants carry value inline.
+        if let Some(val) = opref
+            .inline_const_bits()
+            .or_else(|| self.constants.get(&opref.raw()).copied())
+        {
             return ResolvedArg::Const(val);
+        }
+        // history.py:227/268/314 — Const always carries a value, so a
+        // constant OpRef with no resolvable value is an invariant break,
+        // not a `#0`.
+        if opref.is_constant() {
+            panic!(
+                "resolve_opref: legacy constant {opref:?} missing from constants pool — \
+                 Const always carries a value (history.py:227/268/314)"
+            );
         }
         // Unmapped OpRef — treat as 0.
         ResolvedArg::Const(0)
@@ -5658,7 +5671,9 @@ impl<'a> Assembler386<'a> {
                 let dst = Self::slot_offset(i);
                 dynasm!(self.mc ; .arch x64 ; push QWORD [rbp + dst]);
             } else if arg_ref.is_constant() {
-                let val = self.constants.get(&arg_ref.raw()).copied().unwrap_or(0);
+                let val = arg_ref
+                    .inline_const_bits()
+                    .unwrap_or_else(|| self.constants.get(&arg_ref.raw()).copied().unwrap_or(0));
                 dynasm!(self.mc ; .arch x64 ; mov rax, QWORD val as i64 ; push rax);
             } else if let Some(&old_slot) = self.opref_to_slot.get(&arg_ref) {
                 let src = Self::slot_offset(old_slot);
@@ -7270,6 +7285,15 @@ impl<'a> Assembler386<'a> {
         if matches!(value_loc, Loc::Reg(val) if val.is_xmm) {
             return false;
         }
+        // history.py:227/268/314 — inline-Const variants carry value
+        // inline; the variant tag IS the box type, subsuming the
+        // legacy constant_types side table.
+        if let Some(val) = value.inline_const_bits() {
+            if !matches!(value, OpRef::ConstPtrInline(_)) {
+                return false;
+            }
+            return val != 0;
+        }
         if let Some(tp) = self.constant_types.get(&value.raw()) {
             if *tp != Type::Ref {
                 return false;
@@ -7486,11 +7510,14 @@ impl<'a> Assembler386<'a> {
     /// x86/assembler.py:2556 malloc_cond parity.
     fn genop_call_malloc_nursery(&mut self, op: &Op, result_loc: Option<&Loc>) {
         let size_ref = op.arg(0);
-        let total_size = self
-            .constants
-            .get(&size_ref.raw())
-            .copied()
-            .unwrap_or(size_ref.raw() as i64);
+        // history.py:227 ConstInt.value carried inline — prefer the inline
+        // payload before falling through to the legacy pool / raw u32.
+        let total_size = size_ref.inline_const_bits().unwrap_or_else(|| {
+            self.constants
+                .get(&size_ref.raw())
+                .copied()
+                .unwrap_or(size_ref.raw() as i64)
+        });
         let gc_header_size = majit_gc::header::GcHeader::SIZE as i64;
         // gc.py:525-531 — read nursery slot addresses from the active GC
         // descriptor (cpu.gc_ll_descr.get_nursery_free_addr() parity), not

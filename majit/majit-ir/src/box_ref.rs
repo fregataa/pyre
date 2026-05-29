@@ -388,6 +388,43 @@ impl BoxRef {
         }
     }
 
+    /// New `Const*` Box carrying an explicit `source_opref`. Used when
+    /// the caller already holds the constant's OpRef (inline-Const
+    /// variant or legacy pool-indexed). Adapts to the `const_index`
+    /// field internally.
+    pub fn new_const_from_opref(value: Value, source_opref: OpRef) -> Self {
+        debug_assert!(
+            source_opref.is_constant(),
+            "BoxRef::new_const_from_opref: source_opref must be a Const variant, got {source_opref:?}"
+        );
+        match source_opref {
+            OpRef::ConstInt(_) | OpRef::ConstFloat(_) | OpRef::ConstPtr(_) => {
+                Self::new_const_with_index(value, source_opref.const_index())
+            }
+            _ => Self::new_const(value),
+        }
+    }
+
+    /// Return the source OpRef the Const Box was constructed from.
+    /// Returns `None` for non-Const boxes.
+    pub fn source_opref(&self) -> Option<OpRef> {
+        match &self.0.kind {
+            BoxKind::Const { value, const_index } => {
+                let opref = match const_index {
+                    Some(idx) => OpRef::const_typed(*idx, value.get_type()),
+                    None => match value {
+                        Value::Int(v) => OpRef::const_int_inline(*v),
+                        Value::Float(v) => OpRef::const_float_inline(*v),
+                        Value::Ref(v) => OpRef::const_ptr_inline(*v),
+                        Value::Void => OpRef::None,
+                    },
+                };
+                Some(opref)
+            }
+            _ => None,
+        }
+    }
+
     pub fn type_(&self) -> Type {
         self.0.type_
     }

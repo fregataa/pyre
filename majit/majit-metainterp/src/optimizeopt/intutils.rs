@@ -77,7 +77,15 @@ impl IntBoundMakeGuards for IntBound {
         use majit_ir::{OpCode, Type, Value};
 
         let mut alloc_const = |ctx: &mut crate::optimizeopt::OptContext, value: Value| {
-            let pos = ctx.reserve_const_ref(value.get_type());
+            // history.py:227/268/314 Const{Int,Float,Ptr}.value inline.
+            // IntBound guards mint Int values only, so the match is total
+            // on the variant tag.
+            let pos = match value {
+                Value::Int(v) => majit_ir::OpRef::const_int_inline(v),
+                Value::Float(v) => majit_ir::OpRef::const_float_inline(v),
+                Value::Ref(v) => majit_ir::OpRef::const_ptr_inline(v),
+                Value::Void => panic!("alloc_const: ConstVoid not allowed"),
+            };
             ctx.seed_constant(pos, value);
             pos
         };
