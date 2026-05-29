@@ -469,10 +469,28 @@ pub struct JitDriverStaticData {
 /// Instead, callee graphs are collected from parsed Rust source files
 /// (free functions via `collect_function_graphs` and trait impl methods
 /// via `extract_trait_impls`).
+/// Resolution of a `(receiver, method)` last-two-segment suffix against the
+/// registered `function_graphs` keys: either a single unique key or an
+/// ambiguous suffix shared by more than one key.
+enum SuffixMatch {
+    Unique(CallPath),
+    Ambiguous,
+}
+
 pub struct CallControl {
     /// Free function graphs: CallPath → FunctionGraph.
     /// RPython: `funcptr._obj.graph` linkage.
     function_graphs: HashMap<CallPath, FunctionGraph>,
+
+    /// O(1) index over `function_graphs` keyed by their last two segments
+    /// `(receiver, method)`, mirroring the suffix-match in `target_to_path`'s
+    /// `self.method()` fallback. Maintained incrementally on registration so
+    /// the fallback is a single lookup instead of a linear scan over every
+    /// registered graph (the analysis runs that fallback tens of thousands of
+    /// times during effect inference). pyre-only resolution aid — RPython
+    /// carries the callee graph pointer on the call op, so there is no
+    /// suffix-scan upstream.
+    method_suffix_index: HashMap<(String, String), SuffixMatch>,
 
     /// Per-graph hint set, mirroring RPython `func._jit_*_` / `_elidable_function_`.
     /// Populated by `register_function_graph_with_hints` and
@@ -489,6 +507,18 @@ pub struct CallControl {
     /// method-name global).  Inherent impls do not populate this map;
     /// they use `function_graphs` directly via `[impl_type, method_name]`.
     trait_method_impls: HashMap<(String, String), Vec<String>>,
+
+    /// O(1) index over `trait_method_impls` keyed by method name alone:
+    /// `method_name → [impl_type, …]` across every declaring trait.
+    /// Maintained incrementally in `register_trait_method` so
+    /// `impls_for_method_name` is a single lookup instead of a linear scan
+    /// over every `(trait_root, method_name)` entry (the effect analysis
+    /// runs that scan tens of thousands of times via `target_to_path`'s
+    /// trait-resolution fallback). Each entry mirrors the exact push order
+    /// into `trait_method_impls`, so the resolved multiset is identical.
+    /// pyre-only resolution aid — RPython keys candidate lookup on the
+    /// call op's exact candidate-graph list, not on a method-name global.
+    method_to_impl_types: HashMap<String, Vec<String>>,
 
     /// Candidate targets — graphs we will inline.
     /// RPython: `CallControl.candidate_graphs`.
@@ -1030,8 +1060,10 @@ impl CallControl {
     pub fn new() -> Self {
         Self {
             function_graphs: HashMap::new(),
+            method_suffix_index: HashMap::new(),
             function_hints: HashMap::new(),
             trait_method_impls: HashMap::new(),
+            method_to_impl_types: HashMap::new(),
             candidate_graphs: HashSet::new(),
             portal_targets: HashSet::new(),
             jitdrivers_sd: Vec::new(),
@@ -1797,9 +1829,34 @@ impl CallControl {
         Some(descr as majit_ir::descr::DescrRef)
     }
 
+    /// Maintain [`Self::method_suffix_index`] for a newly registered key.
+    /// Records the last two segments `(receiver, method)`; a second distinct
+    /// key with the same suffix marks the suffix `Ambiguous` (so the
+    /// `target_to_path` fallback declines to guess, matching the old scan).
+    fn index_method_suffix(&mut self, path: &CallPath) {
+        let segs = &path.segments;
+        if segs.len() < 2 {
+            return;
+        }
+        let key = (segs[segs.len() - 2].clone(), segs[segs.len() - 1].clone());
+        match self.method_suffix_index.entry(key) {
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert(SuffixMatch::Unique(path.clone()));
+            }
+            std::collections::hash_map::Entry::Occupied(mut o) => {
+                if let SuffixMatch::Unique(existing) = o.get() {
+                    if existing != path {
+                        o.insert(SuffixMatch::Ambiguous);
+                    }
+                }
+            }
+        }
+    }
+
     /// Register a free function graph.
     /// RPython: graphs are discovered via funcptr linkage.
     pub fn register_function_graph(&mut self, path: CallPath, graph: FunctionGraph) {
+        self.index_method_suffix(&path);
         self.function_graphs.insert(path, graph);
     }
 
@@ -1813,6 +1870,7 @@ impl CallControl {
         graph: FunctionGraph,
         hints: Vec<String>,
     ) {
+        self.index_method_suffix(&path);
         self.function_graphs.insert(path.clone(), graph);
         if !hints.is_empty() {
             self.function_hints.insert(path, hints);
@@ -1946,13 +2004,20 @@ impl CallControl {
                 .entry((trait_root.to_string(), method_name.to_string()))
                 .or_default()
                 .push(impl_type.to_string());
+            self.method_to_impl_types
+                .entry(method_name.to_string())
+                .or_default()
+                .push(impl_type.to_string());
         }
         // call.py:175-187 getfunctionptr(graph) — graph identity is
         // the key. Each impl gets a distinct CallPath via
         // `for_impl_method` so PyFrame's `push_value` and MIFrame's
         // `push_value` stay separate.
         let qualified_path = CallPath::for_impl_method(impl_type, method_name);
-        self.function_graphs.entry(qualified_path).or_insert(graph);
+        if !self.function_graphs.contains_key(&qualified_path) {
+            self.index_method_suffix(&qualified_path);
+            self.function_graphs.insert(qualified_path, graph);
+        }
     }
 
     /// Mark a target as the portal entry point.
@@ -3052,32 +3117,19 @@ impl CallControl {
                     // emission whenever the BFS would have inlined the
                     // method body otherwise.
                     //
-                    // Scan `function_graphs` for keys whose last 2 segments
-                    // match `[receiver, name]`.  Accept the match only if it
-                    // is unique: an ambiguous suffix (e.g. two crates both
-                    // exposing a `PyFrame::pop`) falls through to the trait
-                    // resolution path, which mirrors Rust's name-resolution
-                    // ambiguity error rather than silently picking one.
-                    let needle = (receiver, name.as_str());
-                    let mut matched: Option<&CallPath> = None;
-                    let mut multi = false;
-                    for key in self.function_graphs.keys() {
-                        let segs = &key.segments;
-                        if segs.len() >= 2
-                            && segs[segs.len() - 2] == needle.0
-                            && segs[segs.len() - 1] == needle.1
-                        {
-                            if matched.is_some() {
-                                multi = true;
-                                break;
-                            }
-                            matched = Some(key);
-                        }
-                    }
-                    if !multi {
-                        if let Some(path) = matched {
-                            return Some(path.clone());
-                        }
+                    // Look up `function_graphs` keys whose last 2 segments
+                    // match `[receiver, name]` via `method_suffix_index`.
+                    // Accept the match only if it is unique: an ambiguous
+                    // suffix (e.g. two crates both exposing a `PyFrame::pop`)
+                    // falls through to the trait resolution path, which mirrors
+                    // Rust's name-resolution ambiguity error rather than
+                    // silently picking one.
+                    match self
+                        .method_suffix_index
+                        .get(&(receiver.to_string(), name.to_string()))
+                    {
+                        Some(SuffixMatch::Unique(path)) => return Some(path.clone()),
+                        Some(SuffixMatch::Ambiguous) | None => {}
                     }
                 }
                 // Fall back to trait method resolution for polymorphic calls.
@@ -3361,10 +3413,10 @@ impl CallControl {
     /// lookup uses the exact `(trait_root, method_name)` key via
     /// `all_impls_for_indirect` instead.
     fn impls_for_method_name<'b>(&'b self, method_name: &str) -> Vec<&'b String> {
-        self.trait_method_impls
-            .iter()
-            .filter(|((_, m), _)| m == method_name)
-            .flat_map(|(_, impls)| impls.iter())
+        self.method_to_impl_types
+            .get(method_name)
+            .into_iter()
+            .flatten()
             .collect()
     }
 
