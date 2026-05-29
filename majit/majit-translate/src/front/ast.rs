@@ -9369,7 +9369,7 @@ fn graph_link_input_value_type_var(
 /// and never appears in production link args.
 fn const_value_value_type(c: &ConstValue) -> Option<ValueType> {
     match c {
-        ConstValue::Int(_) | ConstValue::AddressOffset { .. } => Some(ValueType::Int),
+        ConstValue::Int(_) | ConstValue::AddressOffset(_) => Some(ValueType::Int),
         // RPython annotates `Constant(True)`/`Constant(False)` with
         // `SomeBool(SomeInteger)` (`annotator/model.py:185-227`); the
         // rtyper picks `BoolRepr` and `getkind(lltype.Bool) == 'int'`

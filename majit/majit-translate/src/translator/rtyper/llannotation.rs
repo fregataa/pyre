@@ -28,9 +28,9 @@ use super::lltypesystem::lltype;
 use crate::annotator::argument::ArgumentsForTranslation;
 use crate::annotator::bookkeeper;
 use crate::annotator::model::{
-    AnnotatorError, KnownType, SomeBool, SomeChar, SomeFloat, SomeInteger, SomeLongFloat,
-    SomeObjectBase, SomeObjectTrait, SomePtr, SomeSingleFloat, SomeUnicodeCodePoint, SomeValue,
-    SomeValueTag, s_bool, s_none,
+    AnnotatorError, KnownType, SomeAddress, SomeBool, SomeChar, SomeFloat, SomeInteger,
+    SomeLongFloat, SomeObjectBase, SomeObjectTrait, SomePtr, SomeSingleFloat, SomeUnicodeCodePoint,
+    SomeValue, SomeValueTag, s_bool, s_none,
 };
 use crate::flowspace::model::{ConstValue, Constant};
 use crate::flowspace::operation::{CanOnlyThrow, HLOperation, OpKind, Specialization};
@@ -495,6 +495,7 @@ pub fn init_pairtypes(
 ) {
     init_ptr_integer_pairtype(reg);
     init_ptr_object_pairtype(reg);
+    init_address_pairtypes(reg);
 }
 
 fn register(
@@ -642,10 +643,190 @@ fn init_ptr_object_pairtype(
     );
 }
 
+// =====================================================================
+// llannotation.py:15-48 — address-family pair dispatch.
+// =====================================================================
+
+/// Register the `SomeTypedAddressAccess`/`SomeInteger` getitem/setitem,
+/// `SomeAddress`/`SomeInteger` add/sub, and `SomeAddress`/`SomeAddress`
+/// sub dispatch tables (llannotation.py:15-48).
+fn init_address_pairtypes(
+    reg: &mut HashMap<OpKind, DoubleDispatchRegistry<SomeValueTag, SomeValueTag, Specialization>>,
+) {
+    // llannotation.py:34-36 `getitem.can_only_throw = []`.
+    register(
+        reg,
+        OpKind::GetItem,
+        SomeValueTag::TypedAddressAccess,
+        SomeValueTag::Integer,
+        Specialization {
+            apply: Box::new(typed_address_access_integer_getitem),
+            can_only_throw: CanOnlyThrow::List(vec![]),
+        },
+    );
+    // llannotation.py:38-40 `setitem.can_only_throw = []`.
+    register(
+        reg,
+        OpKind::SetItem,
+        SomeValueTag::TypedAddressAccess,
+        SomeValueTag::Integer,
+        Specialization {
+            apply: Box::new(typed_address_access_integer_setitem),
+            can_only_throw: CanOnlyThrow::List(vec![]),
+        },
+    );
+    // llannotation.py:44-45 `def add((s_addr, s_int)): return SomeAddress()`.
+    register(
+        reg,
+        OpKind::Add,
+        SomeValueTag::Address,
+        SomeValueTag::Integer,
+        Specialization {
+            apply: Box::new(|_ann, _hl| SomeValue::Address(SomeAddress::new())),
+            can_only_throw: CanOnlyThrow::Absent,
+        },
+    );
+    // llannotation.py:47-48 `def sub((s_addr, s_int)): return SomeAddress()`.
+    register(
+        reg,
+        OpKind::Sub,
+        SomeValueTag::Address,
+        SomeValueTag::Integer,
+        Specialization {
+            apply: Box::new(|_ann, _hl| SomeValue::Address(SomeAddress::new())),
+            can_only_throw: CanOnlyThrow::Absent,
+        },
+    );
+    // llannotation.py:19-23 `def sub((s_addr1, s_addr2))`.
+    register(
+        reg,
+        OpKind::Sub,
+        SomeValueTag::Address,
+        SomeValueTag::Address,
+        Specialization {
+            apply: Box::new(address_address_sub),
+            can_only_throw: CanOnlyThrow::Absent,
+        },
+    );
+    // llannotation.py:25-26 `def is_((s_addr1, s_addr2)): assert False,
+    // "comparisons with is not supported by addresses"`. A more specific
+    // (Address, Address) entry shadows the (Object, Object) `is__default`.
+    register(
+        reg,
+        OpKind::Is,
+        SomeValueTag::Address,
+        SomeValueTag::Address,
+        Specialization {
+            apply: Box::new(|_ann, _hl| panic!("comparisons with is not supported by addresses")),
+            can_only_throw: CanOnlyThrow::List(vec![]),
+        },
+    );
+}
+
+/// llannotation.py:34-35 `def getitem((s_taa, s_int)): return
+/// lltype_to_annotation(s_taa.type)`.
+fn typed_address_access_integer_getitem(
+    ann: &crate::annotator::annrpython::RPythonAnnotator,
+    hl: &HLOperation,
+) -> SomeValue {
+    match ann.annotation(&hl.args[0]).unwrap_or(SomeValue::Impossible) {
+        SomeValue::TypedAddressAccess(taa) => lltype_to_annotation(taa.access_type),
+        _ => panic!("typed_address_access_integer_getitem: arg 0 not TypedAddressAccess"),
+    }
+}
+
+/// llannotation.py:38-39 `def setitem((s_taa, s_int), s_value): assert
+/// annotation_to_lltype(s_value) is s_taa.type`.
+fn typed_address_access_integer_setitem(
+    ann: &crate::annotator::annrpython::RPythonAnnotator,
+    hl: &HLOperation,
+) -> SomeValue {
+    let s_value = ann
+        .annotation(&hl.args[2])
+        .expect("typed_address_access_integer_setitem: missing value arg");
+    match ann.annotation(&hl.args[0]).unwrap_or(SomeValue::Impossible) {
+        SomeValue::TypedAddressAccess(taa) => {
+            let v_lltype = annotation_to_lltype(&s_value, None)
+                .expect("typed_address_access_integer_setitem: annotation_to_lltype failed");
+            assert_eq!(
+                v_lltype, taa.access_type,
+                "setitem value lltype must match the address access type",
+            );
+        }
+        _ => panic!("typed_address_access_integer_setitem: arg 0 not TypedAddressAccess"),
+    }
+    SomeValue::Impossible
+}
+
+/// llannotation.py:19-23 — `addr - addr`. Both null-address constants
+/// fold to the constant `0`; otherwise a plain `SomeInteger`.
+fn address_address_sub(
+    ann: &crate::annotator::annrpython::RPythonAnnotator,
+    hl: &HLOperation,
+) -> SomeValue {
+    let s0 = ann.annotation(&hl.args[0]).unwrap_or(SomeValue::Impossible);
+    let s1 = ann.annotation(&hl.args[1]).unwrap_or(SomeValue::Impossible);
+    if let (SomeValue::Address(a0), SomeValue::Address(a1)) = (&s0, &s1) {
+        if a0.is_null_address() && a1.is_null_address() {
+            return bookkeeper::immutablevalue(&ConstValue::Int(0))
+                .expect("immutablevalue(0) must succeed");
+        }
+    }
+    SomeValue::Integer(SomeInteger::new(false, false))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::annotator::model::{KnownType, SomeBool};
+
+    #[test]
+    fn init_address_pairtypes_registers_getitem_setitem_add_sub() {
+        use crate::flowspace::operation::OpKind;
+        let mut reg: HashMap<
+            OpKind,
+            DoubleDispatchRegistry<SomeValueTag, SomeValueTag, Specialization>,
+        > = HashMap::new();
+        init_address_pairtypes(&mut reg);
+
+        let taa = SomeValueTag::TypedAddressAccess;
+        let int = SomeValueTag::Integer;
+        let addr = SomeValueTag::Address;
+
+        assert!(
+            reg[&OpKind::GetItem]
+                .get((taa, int), taa.mro(), int.mro())
+                .is_some()
+        );
+        assert!(
+            reg[&OpKind::SetItem]
+                .get((taa, int), taa.mro(), int.mro())
+                .is_some()
+        );
+        assert!(
+            reg[&OpKind::Add]
+                .get((addr, int), addr.mro(), int.mro())
+                .is_some()
+        );
+        assert!(
+            reg[&OpKind::Sub]
+                .get((addr, int), addr.mro(), int.mro())
+                .is_some()
+        );
+        assert!(
+            reg[&OpKind::Sub]
+                .get((addr, addr), addr.mro(), addr.mro())
+                .is_some()
+        );
+        // llannotation.py:25-26 — (Address, Address) `is_` is registered
+        // (and shadows the (Object, Object) `is__default`), so that
+        // comparing two addresses with `is` reaches the asserting arm.
+        assert!(
+            reg[&OpKind::Is]
+                .get((addr, addr), addr.mro(), addr.mro())
+                .is_some()
+        );
+    }
 
     #[test]
     fn annotation_to_lltype_maps_scalar_and_pointer_annotations() {

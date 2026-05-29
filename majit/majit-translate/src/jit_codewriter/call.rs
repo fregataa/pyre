@@ -793,6 +793,25 @@ pub struct CallControl {
 /// from Rust type strings via `from_type_strings()`. Offsets and sizes may diverge
 /// from actual `#[repr(C)]` layout. The runtime SHOULD override via
 /// `set_struct_layout()` with values from `std::mem::offset_of!()` /
+/// `rpython/jit/backend/llsupport/symbolic.py` parity: `CallControl`'s
+/// struct layouts resolve the layout-dependent `llmemory` symbolic
+/// offsets (`FieldOffset` → `get_field_token`, struct `ItemOffset` →
+/// `get_size`) when they reach constant emission.
+impl crate::translator::rtyper::lltypesystem::llmemory::OffsetLayout for CallControl {
+    fn field_offset(&self, struct_name: &str, fldname: &str) -> Option<i64> {
+        let layout = self.struct_layouts.get(struct_name)?;
+        layout
+            .fields
+            .iter()
+            .find(|f| f.name == fldname)
+            .map(|f| f.offset as i64)
+    }
+
+    fn struct_size(&self, struct_name: &str) -> Option<i64> {
+        self.struct_layouts.get(struct_name).map(|l| l.size as i64)
+    }
+}
+
 /// `std::mem::size_of::<T>()` for production use.
 #[derive(Debug, Clone)]
 pub struct StructLayout {

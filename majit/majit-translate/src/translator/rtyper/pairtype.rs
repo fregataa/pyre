@@ -835,9 +835,7 @@ fn pair_typed_address_access_int_rtype_getitem(r_acc: &dyn Repr, hop: &HighLevel
     ])?;
     let v_addr = v_args[0].clone();
     let v_offs = v_args[1].clone();
-    let size = sizeof(&r_acc.access_type).ok_or_else(|| {
-        TyperError::message(format!("sizeof not supported for {:?}", r_acc.access_type))
-    })?;
+    let size = sizeof(&r_acc.access_type, None).map_err(TyperError::message)?;
     let c_size = HighLevelOp::inputconst(&LowLevelType::Signed, &size)?;
     let v_offs_mult = hop
         .genop(
@@ -874,9 +872,7 @@ fn pair_typed_address_access_int_rtype_setitem(r_acc: &dyn Repr, hop: &HighLevel
     let v_addr = v_args[0].clone();
     let v_offs = v_args[1].clone();
     let v_value = v_args[2].clone();
-    let size = sizeof(&r_acc.access_type).ok_or_else(|| {
-        TyperError::message(format!("sizeof not supported for {:?}", r_acc.access_type))
-    })?;
+    let size = sizeof(&r_acc.access_type, None).map_err(TyperError::message)?;
     let c_size = HighLevelOp::inputconst(&LowLevelType::Signed, &size)?;
     let v_offs_mult = hop
         .genop(

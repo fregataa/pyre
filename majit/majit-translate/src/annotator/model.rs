@@ -2946,6 +2946,20 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
             Ok(SomeValue::Address(SomeAddress::new()))
         }
 
+        // llannotation.py:28-31 — `pair(SomeTypedAddressAccess,
+        // SomeTypedAddressAccess).union()`:
+        //   `assert s_taa1.type == s_taa2.type; return s_taa1`.
+        (SomeValue::TypedAddressAccess(a), SomeValue::TypedAddressAccess(b)) => {
+            if a.access_type != b.access_type {
+                return Err(UnionError {
+                    lhs: s1.clone(),
+                    rhs: s2.clone(),
+                    msg: "cannot unify typed address accesses of distinct types".into(),
+                });
+            }
+            Ok(SomeValue::TypedAddressAccess(a.clone()))
+        }
+
         // `pair(SomeBuiltinMethod, SomeBuiltinMethod).union()` in
         // binaryop.py: analyser/methodname must match; `s_self`
         // widens by union.
@@ -4609,6 +4623,21 @@ mod tests {
             union(&signed, &unsigned).is_err(),
             "unprovable signedness should error"
         );
+    }
+
+    #[test]
+    fn union_typed_address_access_requires_matching_type() {
+        use crate::translator::rtyper::lltypesystem::llmemory::SomeTypedAddressAccess;
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        // llannotation.py:28-31 — same access type unions to s_taa1.
+        let signed =
+            SomeValue::TypedAddressAccess(SomeTypedAddressAccess::new(LowLevelType::Signed));
+        let signed2 =
+            SomeValue::TypedAddressAccess(SomeTypedAddressAccess::new(LowLevelType::Signed));
+        assert!(union(&signed, &signed2).is_ok());
+        // Distinct access types fail (upstream `assert s_taa1.type == s_taa2.type`).
+        let charr = SomeValue::TypedAddressAccess(SomeTypedAddressAccess::new(LowLevelType::Char));
+        assert!(union(&signed, &charr).is_err());
     }
 
     #[test]

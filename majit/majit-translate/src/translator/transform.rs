@@ -874,7 +874,7 @@ fn is_valid_contains_key(cv: &ConstValue) -> bool {
         | ConstValue::None
         | ConstValue::HostObject(_)
         | ConstValue::Function(_)
-        | ConstValue::AddressOffset { .. } => true,
+        | ConstValue::AddressOffset(_) => true,
         ConstValue::Tuple(items) => items.iter().all(is_valid_contains_key),
         ConstValue::List(_)
         | ConstValue::Dict(_)

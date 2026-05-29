@@ -2096,15 +2096,11 @@ pub enum ConstValue {
     /// process-unique `u64` so two separately constructed tags never
     /// compare equal even if wrapped in `Constant`.
     ///
-    /// `llmemory.ItemOffset(TYPE)` symbolic size value. `lltype()` is
-    /// `Signed`; downstream `inputconst(Signed, sizeof(TYPE))` accepts
-    /// this variant so that concrete byte sizes are resolved only at
-    /// code emission, not at rtyper time.
-    AddressOffset {
-        kind: String,
-        type_name: String,
-        byte_size: i64,
-    },
+    /// `llmemory` symbolic address offset (`AddressOffset` and its
+    /// subclasses). `lltype()` is `Signed`; downstream `inputconst(Signed,
+    /// sizeof(TYPE))` accepts this so concrete byte sizes are resolved
+    /// only at code emission, not at rtyper time.
+    AddressOffset(crate::translator::rtyper::lltypesystem::llmemory::AddressOffset),
     /// Deviation from upstream (parity rule #1): RPython uses a Python
     /// class (`SpecTag`) whose identity is the instance's `id()`. Rust
     /// has no cross-session `id()`, so we materialise identity as an
@@ -2140,18 +2136,7 @@ impl PartialEq for ConstValue {
             (ConstValue::LLAddress(a), ConstValue::LLAddress(b)) => a == b,
             (ConstValue::HostObject(a), ConstValue::HostObject(b)) => a == b,
             (ConstValue::SpecTag(a), ConstValue::SpecTag(b)) => a == b,
-            (
-                ConstValue::AddressOffset {
-                    kind: ak,
-                    type_name: at,
-                    byte_size: ab,
-                },
-                ConstValue::AddressOffset {
-                    kind: bk,
-                    type_name: bt,
-                    byte_size: bb,
-                },
-            ) => ak == bk && at == bt && ab == bb,
+            (ConstValue::AddressOffset(a), ConstValue::AddressOffset(b)) => a == b,
             _ => false,
         }
     }
@@ -2184,13 +2169,7 @@ impl std::fmt::Display for ConstValue {
             | ConstValue::LLPtr(_)
             | ConstValue::LLAddress(_)
             | ConstValue::Function(_) => write!(f, "{self:?}"),
-            ConstValue::AddressOffset {
-                kind,
-                type_name,
-                byte_size,
-            } => {
-                write!(f, "AddressOffset({kind}, {type_name}, {byte_size})")
-            }
+            ConstValue::AddressOffset(offset) => write!(f, "{offset:?}"),
         }
     }
 }
@@ -2241,15 +2220,7 @@ impl Hash for ConstValue {
             },
             ConstValue::HostObject(obj) => obj.hash(state),
             ConstValue::SpecTag(id) => id.hash(state),
-            ConstValue::AddressOffset {
-                kind,
-                type_name,
-                byte_size,
-            } => {
-                kind.hash(state);
-                type_name.hash(state);
-                byte_size.hash(state);
-            }
+            ConstValue::AddressOffset(offset) => offset.hash(state),
         }
     }
 }
@@ -2849,7 +2820,7 @@ impl ConstValue {
             ConstValue::HostObject(_) => Some(true),
             ConstValue::Atom(_) => Some(true),
             ConstValue::SpecTag(_) => Some(true),
-            ConstValue::AddressOffset { .. } => Some(true),
+            ConstValue::AddressOffset(_) => Some(true),
         }
     }
 
@@ -2935,7 +2906,7 @@ impl ConstValue {
             | ConstValue::LowLevelType(_)
             | ConstValue::LLPtr(_)
             | ConstValue::LLAddress(_)
-            | ConstValue::AddressOffset { .. }
+            | ConstValue::AddressOffset(_)
             | ConstValue::SpecTag(_) => None,
         }
     }

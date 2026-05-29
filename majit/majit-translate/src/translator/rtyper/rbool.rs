@@ -138,6 +138,19 @@ impl Repr for BoolRepr {
             .map(Some)
     }
 
+    /// RPython `BoolRepr` inherits `IntegerRepr.get_ll_fasthash_function
+    /// = get_ll_hash_function` (`rint.py:50`). Rust trait dispatch does
+    /// not inherit from the concrete `IntegerRepr`, so the alias is
+    /// re-stated here; without it the base default (`None`) would fire
+    /// and `gen_hash_function` would lose the fast path for Bool dict
+    /// keys.
+    fn get_ll_fasthash_function(
+        &self,
+        rtyper: &super::rtyper::RPythonTyper,
+    ) -> Result<Option<super::rtyper::LowLevelFunction>, TyperError> {
+        self.get_ll_hash_function(rtyper)
+    }
+
     /// RPython `BoolRepr.convert_const(self, value)` (`rbool.py:17-20`):
     ///
     /// ```python

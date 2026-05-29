@@ -349,7 +349,7 @@ fn const_truthy(value: &ConstValue) -> bool {
         | ConstValue::LowLevelType(_)
         | ConstValue::LLPtr(_)
         | ConstValue::LLAddress(_)
-        | ConstValue::AddressOffset { .. }
+        | ConstValue::AddressOffset(_)
         | ConstValue::SpecTag(_)
         | ConstValue::HostObject(_) => true,
     }

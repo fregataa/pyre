@@ -45,7 +45,7 @@ use std::sync::LazyLock;
 
 use crate::flowspace::model::{
     Block, BlockRefExt, ConstValue, Constant, FunctionGraph, GraphFunc, Hlvalue, Link,
-    SpaceOperation,
+    SpaceOperation, Variable,
 };
 use crate::flowspace::pygraph::PyGraph;
 use crate::translator::rtyper::error::TyperError;
@@ -893,6 +893,925 @@ pub(crate) fn build_ll_unichr2str_helper_graph(name: &str) -> Result<PyGraph, Ty
     Ok(helper_pygraph_from_graph(
         graph,
         vec!["ch".to_string()],
+        func,
+    ))
+}
+
+/// Build a standalone `Ptr(GcArray(Char))` lltype — the `CHAR_ARRAY =
+/// GcArray(Char)` scratch buffer and the `hex_chars` digit table both
+/// have this shape (`lltypesystem/ll_str.py:5,42`).
+fn char_gcarray_ptr_lltype() -> LowLevelType {
+    LowLevelType::Ptr(Box::new(Ptr {
+        TO: PtrTarget::Array(ArrayType::new(LowLevelType::Char)),
+    }))
+}
+
+/// Materialise the immortal `hex_chars = malloc(Array(Char), 16,
+/// immortal=True)` table whose entries are `"%x" % i`
+/// (`lltypesystem/ll_str.py:42-45`).
+fn hex_chars_constant() -> Result<Hlvalue, TyperError> {
+    let array_lltype = LowLevelType::Array(Box::new(ArrayType::new(LowLevelType::Char)));
+    let ptr = malloc(array_lltype, Some(16), MallocFlavor::Gc, true)
+        .map_err(|e| TyperError::message(format!("hex_chars malloc: {e}")))?;
+    let Ok(Some(_ptr_obj::Array(arr))) = &ptr._obj0 else {
+        return Err(TyperError::message(
+            "hex_chars malloc did not produce an Array container".to_string(),
+        ));
+    };
+    for i in 0..16u32 {
+        let digit = std::char::from_digit(i, 16).expect("from_digit(0..16, 16) is always Some");
+        arr.setitem(i as usize, LowLevelValue::Char(digit));
+    }
+    Ok(constant_with_lltype(
+        ConstValue::LLPtr(Box::new(ptr)),
+        char_gcarray_ptr_lltype(),
+    ))
+}
+
+/// Synthesise `ll_int2hex` (`lltypesystem/ll_str.py:47-82`):
+///
+/// ```python
+/// @jit.elidable
+/// def ll_int2hex(i, addPrefix):
+///     temp = malloc(CHAR_ARRAY, 20)
+///     len = 0
+///     sign = 0
+///     if i < 0:
+///         sign = 1
+///         i = ll_unsigned(-i)
+///     else:
+///         i = ll_unsigned(i)
+///     if i == 0:
+///         len = 1
+///         temp[0] = '0'
+///     else:
+///         while i:
+///             temp[len] = hex_chars[i & 0xf]
+///             i >>= 4
+///             len += 1
+///     len += sign
+///     if addPrefix:
+///         len += 2
+///     result = mallocstr(len)
+///     result.hash = 0
+///     j = 0
+///     if sign:
+///         result.chars[0] = '-'
+///         j = 1
+///     if addPrefix:
+///         result.chars[j] = '0'
+///         result.chars[j+1] = 'x'
+///         j += 2
+///     while j < len:
+///         result.chars[j] = temp[len-j-1]
+///         j += 1
+///     return result
+/// ```
+///
+/// `i` is reduced to `r_uint` so `i & 0xf` / `i >>= 4` are the unsigned
+/// `uint_and` / `uint_rshift`; literal digit/prefix/sign chars are produced
+/// with `cast_int_to_char` of their ASCII codes. `signed_input` selects the
+/// specialisation: `true` materialises the Signed one (full `if i < 0` sign
+/// branch, ll_str.py:52-55); `false` the Unsigned one (`r_uint` input, sign
+/// branch pruned) used by the `raddress.py:39` address path.
+pub(crate) fn build_ll_int2hex_helper_graph(
+    name: &str,
+    signed_input: bool,
+) -> Result<PyGraph, TyperError> {
+    use crate::translator::rtyper::rmodel::{gc_flavor_const, lowlevel_type_const};
+
+    let str_struct_lltype = struct_lltype_from_strptr(&STRPTR)?;
+    let result_chars_ptr_lltype = chars_array_ptr_lltype_from_strptr(&STRPTR)?;
+    let temp_ptr_lltype = char_gcarray_ptr_lltype();
+    let char_array_lltype = LowLevelType::Array(Box::new(ArrayType::new(LowLevelType::Char)));
+    let c_hex_chars = hex_chars_constant()?;
+
+    let bool_true = || constant_with_lltype(ConstValue::Bool(true), LowLevelType::Bool);
+    let bool_false = || constant_with_lltype(ConstValue::Bool(false), LowLevelType::Bool);
+    let signed_const = |n: i64| constant_with_lltype(ConstValue::Int(n), LowLevelType::Signed);
+    let unsigned_const = |n: i64| constant_with_lltype(ConstValue::Int(n), LowLevelType::Unsigned);
+    let chars_field_const =
+        || constant_with_lltype(ConstValue::byte_str("chars"), LowLevelType::Void);
+    let hash_field_const =
+        || constant_with_lltype(ConstValue::byte_str("hash"), LowLevelType::Void);
+    let char_for = |code: i64, block: &crate::flowspace::model::BlockRef| -> Hlvalue {
+        let ch = variable_with_lltype("ch", LowLevelType::Char);
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            "cast_int_to_char",
+            vec![signed_const(code)],
+            Hlvalue::Variable(ch.clone()),
+        ));
+        Hlvalue::Variable(ch)
+    };
+
+    // ll_str.py:48 `ll_int2hex(i, addPrefix)` is specialised by the type
+    // of `i`. `raddress.py:39` calls `ll_int2hex(r_uint(id), True)`, so the
+    // address path needs the `r_uint` (Unsigned) specialisation, in which
+    // `if i < 0` is provably false and the whole sign branch is pruned.
+    // `signed_input=true` materialises the Signed specialisation (full sign
+    // branch, ll_str.py:52-55); `false` materialises the Unsigned one.
+    let i_lltype = if signed_input {
+        LowLevelType::Signed
+    } else {
+        LowLevelType::Unsigned
+    };
+    let i_arg = variable_with_lltype("i", i_lltype.clone());
+    let add_prefix_arg = variable_with_lltype("addPrefix", LowLevelType::Bool);
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(i_arg.clone()),
+        Hlvalue::Variable(add_prefix_arg.clone()),
+    ]);
+    let return_var = variable_with_lltype("result", STRPTR.clone());
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    let mk_block = |spec: Vec<(&str, LowLevelType)>| {
+        Block::shared(
+            spec.into_iter()
+                .map(|(n, lltype)| Hlvalue::Variable(variable_with_lltype(n, lltype)))
+                .collect(),
+        )
+    };
+    // The sign branch (b_sign / b_pos) exists only in the Signed
+    // specialisation; the Unsigned specialisation links startblock
+    // straight to b_zero with sign=0.
+    let b_sign = signed_input.then(|| {
+        mk_block(vec![
+            ("i", LowLevelType::Signed),
+            ("addPrefix", LowLevelType::Bool),
+            ("temp", temp_ptr_lltype.clone()),
+        ])
+    });
+    let b_pos = signed_input.then(|| {
+        mk_block(vec![
+            ("i", LowLevelType::Signed),
+            ("addPrefix", LowLevelType::Bool),
+            ("temp", temp_ptr_lltype.clone()),
+        ])
+    });
+    let b_zero = mk_block(vec![
+        ("addPrefix", LowLevelType::Bool),
+        ("temp", temp_ptr_lltype.clone()),
+        ("i_u", LowLevelType::Unsigned),
+        ("sign", LowLevelType::Signed),
+    ]);
+    let b_iszero = mk_block(vec![
+        ("addPrefix", LowLevelType::Bool),
+        ("temp", temp_ptr_lltype.clone()),
+        ("sign", LowLevelType::Signed),
+    ]);
+    let b_loop_cond = mk_block(vec![
+        ("addPrefix", LowLevelType::Bool),
+        ("temp", temp_ptr_lltype.clone()),
+        ("i_u", LowLevelType::Unsigned),
+        ("sign", LowLevelType::Signed),
+        ("len", LowLevelType::Signed),
+    ]);
+    let b_loop_body = mk_block(vec![
+        ("addPrefix", LowLevelType::Bool),
+        ("temp", temp_ptr_lltype.clone()),
+        ("i_u", LowLevelType::Unsigned),
+        ("sign", LowLevelType::Signed),
+        ("len", LowLevelType::Signed),
+    ]);
+    let b_after_digits = mk_block(vec![
+        ("addPrefix", LowLevelType::Bool),
+        ("temp", temp_ptr_lltype.clone()),
+        ("sign", LowLevelType::Signed),
+        ("len", LowLevelType::Signed),
+    ]);
+    let b_addprefix_len = mk_block(vec![
+        ("addPrefix", LowLevelType::Bool),
+        ("temp", temp_ptr_lltype.clone()),
+        ("sign", LowLevelType::Signed),
+        ("len", LowLevelType::Signed),
+    ]);
+    let b_alloc = mk_block(vec![
+        ("addPrefix", LowLevelType::Bool),
+        ("temp", temp_ptr_lltype.clone()),
+        ("sign", LowLevelType::Signed),
+        ("len", LowLevelType::Signed),
+    ]);
+    let b_write_sign = mk_block(vec![
+        ("addPrefix", LowLevelType::Bool),
+        ("temp", temp_ptr_lltype.clone()),
+        ("result", STRPTR.clone()),
+        ("result_chars", result_chars_ptr_lltype.clone()),
+        ("len", LowLevelType::Signed),
+    ]);
+    let b_check_prefix = mk_block(vec![
+        ("addPrefix", LowLevelType::Bool),
+        ("temp", temp_ptr_lltype.clone()),
+        ("result", STRPTR.clone()),
+        ("result_chars", result_chars_ptr_lltype.clone()),
+        ("len", LowLevelType::Signed),
+        ("j", LowLevelType::Signed),
+    ]);
+    let b_write_prefix = mk_block(vec![
+        ("temp", temp_ptr_lltype.clone()),
+        ("result", STRPTR.clone()),
+        ("result_chars", result_chars_ptr_lltype.clone()),
+        ("len", LowLevelType::Signed),
+        ("j", LowLevelType::Signed),
+    ]);
+    let b_copy_cond = mk_block(vec![
+        ("temp", temp_ptr_lltype.clone()),
+        ("result", STRPTR.clone()),
+        ("result_chars", result_chars_ptr_lltype.clone()),
+        ("len", LowLevelType::Signed),
+        ("j", LowLevelType::Signed),
+    ]);
+    let b_copy_body = mk_block(vec![
+        ("temp", temp_ptr_lltype.clone()),
+        ("result", STRPTR.clone()),
+        ("result_chars", result_chars_ptr_lltype.clone()),
+        ("len", LowLevelType::Signed),
+        ("j", LowLevelType::Signed),
+    ]);
+
+    // Snapshot each block's input Variables up front, so reading them
+    // back at op-emission sites does not re-borrow a block that is
+    // already mutably borrowed by the enclosing `operations.push`.
+    let mut input_snapshots: std::collections::HashMap<
+        *const std::cell::RefCell<crate::flowspace::model::Block>,
+        Vec<Variable>,
+    > = std::collections::HashMap::new();
+    let mut snapshot_blocks: Vec<&crate::flowspace::model::BlockRef> = Vec::new();
+    if let Some(b) = &b_sign {
+        snapshot_blocks.push(b);
+    }
+    if let Some(b) = &b_pos {
+        snapshot_blocks.push(b);
+    }
+    snapshot_blocks.extend([
+        &b_zero,
+        &b_iszero,
+        &b_loop_cond,
+        &b_loop_body,
+        &b_after_digits,
+        &b_addprefix_len,
+        &b_alloc,
+        &b_write_sign,
+        &b_check_prefix,
+        &b_write_prefix,
+        &b_copy_cond,
+        &b_copy_body,
+    ]);
+    for block in snapshot_blocks {
+        let vars = block
+            .borrow()
+            .inputargs
+            .iter()
+            .map(|h| match h {
+                Hlvalue::Variable(v) => v.clone(),
+                other => panic!("ll_int2hex block input must be Variable, got {other:?}"),
+            })
+            .collect();
+        input_snapshots.insert(std::rc::Rc::as_ptr(block), vars);
+    }
+    let var_of = |block: &crate::flowspace::model::BlockRef, idx: usize| -> Variable {
+        input_snapshots[&std::rc::Rc::as_ptr(block)][idx].clone()
+    };
+
+    // ---- start: temp = malloc(CHAR_ARRAY, 20); branch on i < 0.
+    let temp = variable_with_lltype("temp", temp_ptr_lltype.clone());
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "malloc_varsize",
+        vec![
+            lowlevel_type_const(char_array_lltype),
+            gc_flavor_const()?,
+            signed_const(20),
+        ],
+        Hlvalue::Variable(temp.clone()),
+    ));
+    if signed_input {
+        let b_sign = b_sign.as_ref().expect("b_sign exists in signed build");
+        let b_pos = b_pos.as_ref().expect("b_pos exists in signed build");
+        let neg = variable_with_lltype("neg", LowLevelType::Bool);
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "int_lt",
+            vec![Hlvalue::Variable(i_arg.clone()), signed_const(0)],
+            Hlvalue::Variable(neg.clone()),
+        ));
+        startblock.borrow_mut().exitswitch = Some(Hlvalue::Variable(neg));
+        startblock.closeblock(vec![
+            Link::new(
+                vec![
+                    Hlvalue::Variable(i_arg.clone()),
+                    Hlvalue::Variable(add_prefix_arg.clone()),
+                    Hlvalue::Variable(temp.clone()),
+                ],
+                Some(b_sign.clone()),
+                Some(bool_true()),
+            )
+            .into_ref(),
+            Link::new(
+                vec![
+                    Hlvalue::Variable(i_arg.clone()),
+                    Hlvalue::Variable(add_prefix_arg.clone()),
+                    Hlvalue::Variable(temp.clone()),
+                ],
+                Some(b_pos.clone()),
+                Some(bool_false()),
+            )
+            .into_ref(),
+        ]);
+
+        // ---- b_sign: i < 0 → sign = 1; i = r_uint(-i).
+        let ni = variable_with_lltype("ni", LowLevelType::Signed);
+        b_sign.borrow_mut().operations.push(SpaceOperation::new(
+            "int_neg",
+            vec![Hlvalue::Variable(var_of(b_sign, 0))],
+            Hlvalue::Variable(ni.clone()),
+        ));
+        let i_u_sign = variable_with_lltype("i_u", LowLevelType::Unsigned);
+        b_sign.borrow_mut().operations.push(SpaceOperation::new(
+            "cast_primitive",
+            vec![Hlvalue::Variable(ni)],
+            Hlvalue::Variable(i_u_sign.clone()),
+        ));
+        b_sign.closeblock(vec![
+            Link::new(
+                vec![
+                    Hlvalue::Variable(var_of(b_sign, 1)),
+                    Hlvalue::Variable(var_of(b_sign, 2)),
+                    Hlvalue::Variable(i_u_sign),
+                    signed_const(1),
+                ],
+                Some(b_zero.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+
+        // ---- b_pos: i >= 0 → sign = 0; i = r_uint(i).
+        let i_u_pos = variable_with_lltype("i_u", LowLevelType::Unsigned);
+        b_pos.borrow_mut().operations.push(SpaceOperation::new(
+            "cast_primitive",
+            vec![Hlvalue::Variable(var_of(b_pos, 0))],
+            Hlvalue::Variable(i_u_pos.clone()),
+        ));
+        b_pos.closeblock(vec![
+            Link::new(
+                vec![
+                    Hlvalue::Variable(var_of(b_pos, 1)),
+                    Hlvalue::Variable(var_of(b_pos, 2)),
+                    Hlvalue::Variable(i_u_pos),
+                    signed_const(0),
+                ],
+                Some(b_zero.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+    } else {
+        // Unsigned specialisation (`r_uint` input): `if i < 0` is provably
+        // false, so the sign branch is pruned — go straight to b_zero with
+        // the already-unsigned i and sign=0.
+        startblock.closeblock(vec![
+            Link::new(
+                vec![
+                    Hlvalue::Variable(add_prefix_arg.clone()),
+                    Hlvalue::Variable(temp.clone()),
+                    Hlvalue::Variable(i_arg.clone()),
+                    signed_const(0),
+                ],
+                Some(b_zero.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+    }
+
+    // ---- b_zero: branch on i == 0 (i.e. not uint_is_true(i)).
+    let nz = variable_with_lltype("nz", LowLevelType::Bool);
+    b_zero.borrow_mut().operations.push(SpaceOperation::new(
+        "uint_is_true",
+        vec![Hlvalue::Variable(var_of(&b_zero, 2))],
+        Hlvalue::Variable(nz.clone()),
+    ));
+    b_zero.borrow_mut().exitswitch = Some(Hlvalue::Variable(nz));
+    b_zero.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(var_of(&b_zero, 0)),
+                Hlvalue::Variable(var_of(&b_zero, 1)),
+                Hlvalue::Variable(var_of(&b_zero, 2)),
+                Hlvalue::Variable(var_of(&b_zero, 3)),
+                signed_const(0),
+            ],
+            Some(b_loop_cond.clone()),
+            Some(bool_true()),
+        )
+        .into_ref(),
+        Link::new(
+            vec![
+                Hlvalue::Variable(var_of(&b_zero, 0)),
+                Hlvalue::Variable(var_of(&b_zero, 1)),
+                Hlvalue::Variable(var_of(&b_zero, 3)),
+            ],
+            Some(b_iszero.clone()),
+            Some(bool_false()),
+        )
+        .into_ref(),
+    ]);
+
+    // ---- b_iszero: len = 1; temp[0] = '0'.
+    let zero_ch = char_for(48, &b_iszero);
+    let set_void = variable_with_lltype("set", LowLevelType::Void);
+    b_iszero.borrow_mut().operations.push(SpaceOperation::new(
+        "setarrayitem",
+        vec![
+            Hlvalue::Variable(var_of(&b_iszero, 1)),
+            signed_const(0),
+            zero_ch,
+        ],
+        Hlvalue::Variable(set_void),
+    ));
+    b_iszero.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(var_of(&b_iszero, 0)),
+                Hlvalue::Variable(var_of(&b_iszero, 1)),
+                Hlvalue::Variable(var_of(&b_iszero, 2)),
+                signed_const(1),
+            ],
+            Some(b_after_digits.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    // ---- b_loop_cond: while i: ...
+    let keep = variable_with_lltype("keep", LowLevelType::Bool);
+    b_loop_cond
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "uint_is_true",
+            vec![Hlvalue::Variable(var_of(&b_loop_cond, 2))],
+            Hlvalue::Variable(keep.clone()),
+        ));
+    b_loop_cond.borrow_mut().exitswitch = Some(Hlvalue::Variable(keep));
+    b_loop_cond.closeblock(vec![
+        Link::new(
+            (0..5)
+                .map(|k| Hlvalue::Variable(var_of(&b_loop_cond, k)))
+                .collect(),
+            Some(b_loop_body.clone()),
+            Some(bool_true()),
+        )
+        .into_ref(),
+        Link::new(
+            vec![
+                Hlvalue::Variable(var_of(&b_loop_cond, 0)),
+                Hlvalue::Variable(var_of(&b_loop_cond, 1)),
+                Hlvalue::Variable(var_of(&b_loop_cond, 3)),
+                Hlvalue::Variable(var_of(&b_loop_cond, 4)),
+            ],
+            Some(b_after_digits.clone()),
+            Some(bool_false()),
+        )
+        .into_ref(),
+    ]);
+
+    // ---- b_loop_body: temp[len] = hex_chars[i & 0xf]; i >>= 4; len += 1.
+    let nib = variable_with_lltype("nib", LowLevelType::Unsigned);
+    b_loop_body
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "uint_and",
+            vec![
+                Hlvalue::Variable(var_of(&b_loop_body, 2)),
+                unsigned_const(15),
+            ],
+            Hlvalue::Variable(nib.clone()),
+        ));
+    let digit = variable_with_lltype("digit", LowLevelType::Char);
+    b_loop_body
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "getarrayitem",
+            vec![c_hex_chars, Hlvalue::Variable(nib)],
+            Hlvalue::Variable(digit.clone()),
+        ));
+    let set_void = variable_with_lltype("set", LowLevelType::Void);
+    b_loop_body
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "setarrayitem",
+            vec![
+                Hlvalue::Variable(var_of(&b_loop_body, 1)),
+                Hlvalue::Variable(var_of(&b_loop_body, 4)),
+                Hlvalue::Variable(digit),
+            ],
+            Hlvalue::Variable(set_void),
+        ));
+    let i_next = variable_with_lltype("i_next", LowLevelType::Unsigned);
+    b_loop_body
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "uint_rshift",
+            vec![Hlvalue::Variable(var_of(&b_loop_body, 2)), signed_const(4)],
+            Hlvalue::Variable(i_next.clone()),
+        ));
+    let len_next = variable_with_lltype("len_next", LowLevelType::Signed);
+    b_loop_body
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "int_add",
+            vec![Hlvalue::Variable(var_of(&b_loop_body, 4)), signed_const(1)],
+            Hlvalue::Variable(len_next.clone()),
+        ));
+    b_loop_body.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(var_of(&b_loop_body, 0)),
+                Hlvalue::Variable(var_of(&b_loop_body, 1)),
+                Hlvalue::Variable(i_next),
+                Hlvalue::Variable(var_of(&b_loop_body, 3)),
+                Hlvalue::Variable(len_next),
+            ],
+            Some(b_loop_cond.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    // ---- b_after_digits: len += sign; branch on addPrefix.
+    let len_signed = variable_with_lltype("len1", LowLevelType::Signed);
+    b_after_digits
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "int_add",
+            vec![
+                Hlvalue::Variable(var_of(&b_after_digits, 3)),
+                Hlvalue::Variable(var_of(&b_after_digits, 2)),
+            ],
+            Hlvalue::Variable(len_signed.clone()),
+        ));
+    b_after_digits.borrow_mut().exitswitch = Some(Hlvalue::Variable(var_of(&b_after_digits, 0)));
+    b_after_digits.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(var_of(&b_after_digits, 0)),
+                Hlvalue::Variable(var_of(&b_after_digits, 1)),
+                Hlvalue::Variable(var_of(&b_after_digits, 2)),
+                Hlvalue::Variable(len_signed.clone()),
+            ],
+            Some(b_addprefix_len.clone()),
+            Some(bool_true()),
+        )
+        .into_ref(),
+        Link::new(
+            vec![
+                Hlvalue::Variable(var_of(&b_after_digits, 0)),
+                Hlvalue::Variable(var_of(&b_after_digits, 1)),
+                Hlvalue::Variable(var_of(&b_after_digits, 2)),
+                Hlvalue::Variable(len_signed),
+            ],
+            Some(b_alloc.clone()),
+            Some(bool_false()),
+        )
+        .into_ref(),
+    ]);
+
+    // ---- b_addprefix_len: len += 2.
+    let len_prefixed = variable_with_lltype("len2", LowLevelType::Signed);
+    b_addprefix_len
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "int_add",
+            vec![
+                Hlvalue::Variable(var_of(&b_addprefix_len, 3)),
+                signed_const(2),
+            ],
+            Hlvalue::Variable(len_prefixed.clone()),
+        ));
+    b_addprefix_len.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(var_of(&b_addprefix_len, 0)),
+                Hlvalue::Variable(var_of(&b_addprefix_len, 1)),
+                Hlvalue::Variable(var_of(&b_addprefix_len, 2)),
+                Hlvalue::Variable(len_prefixed),
+            ],
+            Some(b_alloc.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    // ---- b_alloc: result = mallocstr(len); result.hash = 0; branch on sign.
+    let result = variable_with_lltype("result", STRPTR.clone());
+    b_alloc.borrow_mut().operations.push(SpaceOperation::new(
+        "malloc_varsize",
+        vec![
+            lowlevel_type_const(str_struct_lltype),
+            gc_flavor_const()?,
+            Hlvalue::Variable(var_of(&b_alloc, 3)),
+        ],
+        Hlvalue::Variable(result.clone()),
+    ));
+    let set_hash = variable_with_lltype("set", LowLevelType::Void);
+    b_alloc.borrow_mut().operations.push(SpaceOperation::new(
+        "setfield",
+        vec![
+            Hlvalue::Variable(result.clone()),
+            hash_field_const(),
+            signed_const(0),
+        ],
+        Hlvalue::Variable(set_hash),
+    ));
+    let result_chars = variable_with_lltype("result_chars", result_chars_ptr_lltype.clone());
+    b_alloc.borrow_mut().operations.push(SpaceOperation::new(
+        "getsubstruct",
+        vec![Hlvalue::Variable(result.clone()), chars_field_const()],
+        Hlvalue::Variable(result_chars.clone()),
+    ));
+    let sign_b = variable_with_lltype("sign_b", LowLevelType::Bool);
+    b_alloc.borrow_mut().operations.push(SpaceOperation::new(
+        "int_is_true",
+        vec![Hlvalue::Variable(var_of(&b_alloc, 2))],
+        Hlvalue::Variable(sign_b.clone()),
+    ));
+    b_alloc.borrow_mut().exitswitch = Some(Hlvalue::Variable(sign_b));
+    b_alloc.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(var_of(&b_alloc, 0)),
+                Hlvalue::Variable(var_of(&b_alloc, 1)),
+                Hlvalue::Variable(result.clone()),
+                Hlvalue::Variable(result_chars.clone()),
+                Hlvalue::Variable(var_of(&b_alloc, 3)),
+            ],
+            Some(b_write_sign.clone()),
+            Some(bool_true()),
+        )
+        .into_ref(),
+        Link::new(
+            vec![
+                Hlvalue::Variable(var_of(&b_alloc, 0)),
+                Hlvalue::Variable(var_of(&b_alloc, 1)),
+                Hlvalue::Variable(result),
+                Hlvalue::Variable(result_chars),
+                Hlvalue::Variable(var_of(&b_alloc, 3)),
+                signed_const(0),
+            ],
+            Some(b_check_prefix.clone()),
+            Some(bool_false()),
+        )
+        .into_ref(),
+    ]);
+
+    // ---- b_write_sign: result.chars[0] = '-'; j = 1.
+    let minus = char_for(45, &b_write_sign);
+    let set_void = variable_with_lltype("set", LowLevelType::Void);
+    b_write_sign
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "setarrayitem",
+            vec![
+                Hlvalue::Variable(var_of(&b_write_sign, 3)),
+                signed_const(0),
+                minus,
+            ],
+            Hlvalue::Variable(set_void),
+        ));
+    b_write_sign.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(var_of(&b_write_sign, 0)),
+                Hlvalue::Variable(var_of(&b_write_sign, 1)),
+                Hlvalue::Variable(var_of(&b_write_sign, 2)),
+                Hlvalue::Variable(var_of(&b_write_sign, 3)),
+                Hlvalue::Variable(var_of(&b_write_sign, 4)),
+                signed_const(1),
+            ],
+            Some(b_check_prefix.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    // ---- b_check_prefix: branch on addPrefix.
+    b_check_prefix.borrow_mut().exitswitch = Some(Hlvalue::Variable(var_of(&b_check_prefix, 0)));
+    b_check_prefix.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(var_of(&b_check_prefix, 1)),
+                Hlvalue::Variable(var_of(&b_check_prefix, 2)),
+                Hlvalue::Variable(var_of(&b_check_prefix, 3)),
+                Hlvalue::Variable(var_of(&b_check_prefix, 4)),
+                Hlvalue::Variable(var_of(&b_check_prefix, 5)),
+            ],
+            Some(b_write_prefix.clone()),
+            Some(bool_true()),
+        )
+        .into_ref(),
+        Link::new(
+            vec![
+                Hlvalue::Variable(var_of(&b_check_prefix, 1)),
+                Hlvalue::Variable(var_of(&b_check_prefix, 2)),
+                Hlvalue::Variable(var_of(&b_check_prefix, 3)),
+                Hlvalue::Variable(var_of(&b_check_prefix, 4)),
+                Hlvalue::Variable(var_of(&b_check_prefix, 5)),
+            ],
+            Some(b_copy_cond.clone()),
+            Some(bool_false()),
+        )
+        .into_ref(),
+    ]);
+
+    // ---- b_write_prefix: result.chars[j] = '0'; result.chars[j+1] = 'x'; j += 2.
+    let prefix_zero = char_for(48, &b_write_prefix);
+    let set_void = variable_with_lltype("set", LowLevelType::Void);
+    b_write_prefix
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "setarrayitem",
+            vec![
+                Hlvalue::Variable(var_of(&b_write_prefix, 2)),
+                Hlvalue::Variable(var_of(&b_write_prefix, 4)),
+                prefix_zero,
+            ],
+            Hlvalue::Variable(set_void),
+        ));
+    let j_plus1 = variable_with_lltype("j1", LowLevelType::Signed);
+    b_write_prefix
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "int_add",
+            vec![
+                Hlvalue::Variable(var_of(&b_write_prefix, 4)),
+                signed_const(1),
+            ],
+            Hlvalue::Variable(j_plus1.clone()),
+        ));
+    let prefix_x = char_for(120, &b_write_prefix);
+    let set_void = variable_with_lltype("set", LowLevelType::Void);
+    b_write_prefix
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "setarrayitem",
+            vec![
+                Hlvalue::Variable(var_of(&b_write_prefix, 2)),
+                Hlvalue::Variable(j_plus1),
+                prefix_x,
+            ],
+            Hlvalue::Variable(set_void),
+        ));
+    let j_plus2 = variable_with_lltype("j2", LowLevelType::Signed);
+    b_write_prefix
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "int_add",
+            vec![
+                Hlvalue::Variable(var_of(&b_write_prefix, 4)),
+                signed_const(2),
+            ],
+            Hlvalue::Variable(j_plus2.clone()),
+        ));
+    b_write_prefix.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(var_of(&b_write_prefix, 0)),
+                Hlvalue::Variable(var_of(&b_write_prefix, 1)),
+                Hlvalue::Variable(var_of(&b_write_prefix, 2)),
+                Hlvalue::Variable(var_of(&b_write_prefix, 3)),
+                Hlvalue::Variable(j_plus2),
+            ],
+            Some(b_copy_cond.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    // ---- b_copy_cond: while j < len.
+    let copy_go = variable_with_lltype("copy_go", LowLevelType::Bool);
+    b_copy_cond
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "int_lt",
+            vec![
+                Hlvalue::Variable(var_of(&b_copy_cond, 4)),
+                Hlvalue::Variable(var_of(&b_copy_cond, 3)),
+            ],
+            Hlvalue::Variable(copy_go.clone()),
+        ));
+    b_copy_cond.borrow_mut().exitswitch = Some(Hlvalue::Variable(copy_go));
+    b_copy_cond.closeblock(vec![
+        Link::new(
+            (0..5)
+                .map(|k| Hlvalue::Variable(var_of(&b_copy_cond, k)))
+                .collect(),
+            Some(b_copy_body.clone()),
+            Some(bool_true()),
+        )
+        .into_ref(),
+        Link::new(
+            vec![Hlvalue::Variable(var_of(&b_copy_cond, 1))],
+            Some(graph.returnblock.clone()),
+            Some(bool_false()),
+        )
+        .into_ref(),
+    ]);
+
+    // ---- b_copy_body: result.chars[j] = temp[len-j-1]; j += 1.
+    let len_minus_j = variable_with_lltype("lmj", LowLevelType::Signed);
+    b_copy_body
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "int_sub",
+            vec![
+                Hlvalue::Variable(var_of(&b_copy_body, 3)),
+                Hlvalue::Variable(var_of(&b_copy_body, 4)),
+            ],
+            Hlvalue::Variable(len_minus_j.clone()),
+        ));
+    let src_idx = variable_with_lltype("src_idx", LowLevelType::Signed);
+    b_copy_body
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "int_sub",
+            vec![Hlvalue::Variable(len_minus_j), signed_const(1)],
+            Hlvalue::Variable(src_idx.clone()),
+        ));
+    let src_ch = variable_with_lltype("src_ch", LowLevelType::Char);
+    b_copy_body
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "getarrayitem",
+            vec![
+                Hlvalue::Variable(var_of(&b_copy_body, 0)),
+                Hlvalue::Variable(src_idx),
+            ],
+            Hlvalue::Variable(src_ch.clone()),
+        ));
+    let set_void = variable_with_lltype("set", LowLevelType::Void);
+    b_copy_body
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "setarrayitem",
+            vec![
+                Hlvalue::Variable(var_of(&b_copy_body, 2)),
+                Hlvalue::Variable(var_of(&b_copy_body, 4)),
+                Hlvalue::Variable(src_ch),
+            ],
+            Hlvalue::Variable(set_void),
+        ));
+    let j_inc = variable_with_lltype("j_inc", LowLevelType::Signed);
+    b_copy_body
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "int_add",
+            vec![Hlvalue::Variable(var_of(&b_copy_body, 4)), signed_const(1)],
+            Hlvalue::Variable(j_inc.clone()),
+        ));
+    b_copy_body.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(var_of(&b_copy_body, 0)),
+                Hlvalue::Variable(var_of(&b_copy_body, 1)),
+                Hlvalue::Variable(var_of(&b_copy_body, 2)),
+                Hlvalue::Variable(var_of(&b_copy_body, 3)),
+                Hlvalue::Variable(j_inc),
+            ],
+            Some(b_copy_cond.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["i".to_string(), "addPrefix".to_string()],
         func,
     ))
 }
@@ -7536,7 +8455,7 @@ pub(crate) fn build_ll_strconcat_helper_graph(
 /// [`crate::translator::rtyper::rtyper::LowLevelOpList::gendirectcall`]
 /// but exposed for builder closures that emit `direct_call` ops
 /// directly into a synthesised `PyGraph`.
-fn sub_helper_funcptr_constant(
+pub(crate) fn sub_helper_funcptr_constant(
     rtyper: &crate::translator::rtyper::rtyper::RPythonTyper,
     sub_helper: &crate::translator::rtyper::rtyper::LowLevelFunction,
 ) -> Result<Constant, TyperError> {
@@ -10485,5 +11404,69 @@ mod tests {
         };
         let body_borrow = loop_body.borrow();
         assert_eq!(body_borrow.operations[1].opname, "unichar_eq");
+    }
+
+    #[test]
+    fn build_ll_int2hex_chains_uint_ops_through_hex_chars_table() {
+        let helper = build_ll_int2hex_helper_graph("ll_int2hex", true).expect("build ll_int2hex");
+        let graph = helper.graph.borrow();
+
+        // BFS over reachable blocks, collecting every opname and the
+        // prebuilt hex_chars constant referenced by the digit lookup.
+        let mut seen: Vec<*const std::cell::RefCell<crate::flowspace::model::Block>> = Vec::new();
+        let mut queue = vec![graph.startblock.clone()];
+        let mut opnames: Vec<String> = Vec::new();
+        let mut hex_chars: Option<ConstValue> = None;
+        while let Some(block) = queue.pop() {
+            let key = std::rc::Rc::as_ptr(&block);
+            if seen.contains(&key) {
+                continue;
+            }
+            seen.push(key);
+            let b = block.borrow();
+            for op in &b.operations {
+                opnames.push(op.opname.clone());
+                if op.opname == "getarrayitem" {
+                    if let Hlvalue::Constant(c) = &op.args[0] {
+                        hex_chars = Some(c.value.clone());
+                    }
+                }
+            }
+            for link in &b.exits {
+                if let Some(target) = link.borrow().target.as_ref() {
+                    queue.push(target.clone());
+                }
+            }
+        }
+
+        for expected in [
+            "malloc_varsize",
+            "int_neg",
+            "cast_primitive",
+            "uint_is_true",
+            "uint_and",
+            "uint_rshift",
+            "cast_int_to_char",
+            "setfield",
+            "getsubstruct",
+        ] {
+            assert!(
+                opnames.iter().any(|n| n == expected),
+                "ll_int2hex graph missing op {expected}; saw {opnames:?}"
+            );
+        }
+
+        // hex_chars is an immortal Array(Char) holding "0123456789abcdef".
+        let Some(ConstValue::LLPtr(ptr)) = hex_chars else {
+            panic!("digit lookup must read from an LLPtr hex_chars table");
+        };
+        let Ok(Some(_ptr_obj::Array(arr))) = &ptr._obj0 else {
+            panic!("hex_chars LLPtr must target an Array container");
+        };
+        let items = arr.items.lock().unwrap();
+        assert_eq!(items.len(), 16);
+        assert_eq!(items[0], LowLevelValue::Char('0'));
+        assert_eq!(items[10], LowLevelValue::Char('a'));
+        assert_eq!(items[15], LowLevelValue::Char('f'));
     }
 }

@@ -209,7 +209,7 @@ impl LowLevelType {
             // `lltype()` is Signed; `llmemory.sizeof(TYPE)` returns an
             // `ItemOffset(TYPE)` symbolic on the typed-address path.
             LowLevelType::Signed => {
-                matches!(value, ConstValue::Int(_) | ConstValue::AddressOffset { .. })
+                matches!(value, ConstValue::Int(_) | ConstValue::AddressOffset(_))
             }
             // upstream `Unsigned` / long-long primitives accept Python
             // `int` (range checking upstream; pyre's `ConstValue::Int` is
@@ -764,6 +764,7 @@ pub enum _ptr_obj {
     Struct(_struct),
     Array(_array),
     Opaque(_opaque),
+    Wref(_wref),
 }
 
 #[derive(Clone, Debug)]
@@ -925,6 +926,64 @@ impl Eq for _opaque {}
 impl Hash for _opaque {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self._identity.hash(state);
+    }
+}
+
+/// llmemory.py:861-885 — `class _wref(lltype._container)`. A gc-managed
+/// container holding a weak reference to another gc container;
+/// `_TYPE = WeakRef`, `_gckind = 'gc'`.
+///
+/// Upstream stores `weakref.ref(normalizeptr(ptarget)._obj)` (or
+/// `lambda: None` for a dead wref) and `_dereference` returns
+/// `obj._as_ptr()` while the referent is alive. This port holds the
+/// referent pointer directly: the translation model never frees objects
+/// (`obj._was_freed()` is always false), so a live `_wref` keeps the
+/// target `_ptr` and `_dereference` clones it; `None` is the dead wref.
+#[derive(Clone, Debug)]
+pub struct _wref {
+    pub _identity: usize,
+    pub _obref: Option<Box<_ptr>>,
+}
+
+impl PartialEq for _wref {
+    fn eq(&self, other: &Self) -> bool {
+        self._identity == other._identity
+    }
+}
+
+impl Eq for _wref {}
+
+impl Hash for _wref {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self._identity.hash(state);
+    }
+}
+
+impl _wref {
+    /// llmemory.py:865-870 `_wref.__init__(self, ptarget)`.
+    pub fn new(ptarget: Option<&_ptr>) -> Self {
+        _wref {
+            _identity: fresh_low_level_container_identity(),
+            _obref: ptarget.map(|p| Box::new(p.clone())),
+        }
+    }
+
+    /// llmemory.py:872-879 `_wref._dereference(self)`. Returns the referent
+    /// (always alive in the translation model) or `None` for a dead wref.
+    pub fn _dereference(&self) -> Option<_ptr> {
+        self._obref.as_ref().map(|p| (**p).clone())
+    }
+
+    /// `_container._as_ptr(self)` — `_ptr(Ptr(self._TYPE), self, solid=True)`
+    /// with `self._TYPE == WeakRef`.
+    pub fn _as_ptr(self) -> _ptr {
+        _ptr::new_with_solid(
+            Ptr {
+                TO: PtrTarget::Opaque(OpaqueType::gc("WeakRef")),
+            },
+            Ok(Some(_ptr_obj::Wref(self))),
+            true,
+        )
     }
 }
 
@@ -1296,6 +1355,7 @@ impl _ptr {
             _ptr_obj::Struct(_) => panic!("{:?} instance is not callable", self._TYPE),
             _ptr_obj::Array(_) => panic!("{:?} instance is not callable", self._TYPE),
             _ptr_obj::Opaque(_) => panic!("{:?} instance is not callable", self._TYPE),
+            _ptr_obj::Wref(_) => panic!("{:?} instance is not callable", self._TYPE),
         }
     }
 
@@ -1330,6 +1390,7 @@ impl _ptr {
             _ptr_obj::Struct(obj) => LowLevelValue::Struct(Box::new(obj.clone())),
             _ptr_obj::Array(obj) => LowLevelValue::Array(Box::new(obj.clone())),
             _ptr_obj::Opaque(obj) => LowLevelValue::Opaque(Box::new(obj.clone())),
+            _ptr_obj::Wref(_) => panic!("weakref has no container parent"),
         }
     }
 
@@ -3850,11 +3911,12 @@ mod tests {
 
     #[test]
     fn signed_contains_address_offset_symbolic() {
-        let offset = ConstValue::AddressOffset {
-            kind: "ItemOffset".into(),
-            type_name: "Signed".into(),
-            byte_size: 8,
-        };
+        let offset = ConstValue::AddressOffset(
+            crate::translator::rtyper::lltypesystem::llmemory::AddressOffset::ItemOffset {
+                TYPE: LowLevelType::Signed,
+                repeat: 1,
+            },
+        );
         assert!(LowLevelType::Signed.contains_value(&offset));
         assert!(!LowLevelType::Unsigned.contains_value(&offset));
     }

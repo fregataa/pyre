@@ -674,7 +674,7 @@ pub fn builtin_bool(
             | ConstValue::Code(_)
             | ConstValue::Atom(_)
             | ConstValue::SpecTag(_) => true,
-            ConstValue::AddressOffset { .. } => true,
+            ConstValue::AddressOffset(_) => true,
             ConstValue::LLAddress(addr) => matches!(
                 addr,
                 crate::translator::rtyper::lltypesystem::lltype::_address::Fake(_)

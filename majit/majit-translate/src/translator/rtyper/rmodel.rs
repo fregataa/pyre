@@ -1290,6 +1290,77 @@ impl Repr for VoidRepr {
     fn repr_class_id(&self) -> super::pairtype::ReprClassId {
         super::pairtype::ReprClassId::VoidRepr
     }
+
+    /// rmodel.py:355 `def get_ll_eq_function(self): return None`.
+    fn get_ll_eq_function(
+        &self,
+        _rtyper: &super::rtyper::RPythonTyper,
+    ) -> Result<Option<super::rtyper::LowLevelFunction>, TyperError> {
+        Ok(None)
+    }
+
+    /// rmodel.py:356 `def get_ll_hash_function(self): return ll_hash_void`
+    /// where `ll_hash_void(v): return 0` (rmodel.py:247-248).
+    fn get_ll_hash_function(
+        &self,
+        rtyper: &super::rtyper::RPythonTyper,
+    ) -> Result<Option<super::rtyper::LowLevelFunction>, TyperError> {
+        rtyper
+            .lowlevel_helper_function_with_builder(
+                "ll_hash_void".to_string(),
+                vec![LowLevelType::Void],
+                LowLevelType::Signed,
+                |_rtyper, args, _result| build_ll_hash_void_helper_graph("ll_hash_void", &args[0]),
+            )
+            .map(Some)
+    }
+
+    /// rmodel.py:357 `get_ll_fasthash_function = get_ll_hash_function`.
+    fn get_ll_fasthash_function(
+        &self,
+        rtyper: &super::rtyper::RPythonTyper,
+    ) -> Result<Option<super::rtyper::LowLevelFunction>, TyperError> {
+        self.get_ll_hash_function(rtyper)
+    }
+}
+
+/// rmodel.py:247-248 `def ll_hash_void(v): return 0` — single-block
+/// helper graph taking one `Void` arg and returning the `Signed`
+/// constant `0`.
+fn build_ll_hash_void_helper_graph(
+    name: &str,
+    _arg_type: &LowLevelType,
+) -> Result<crate::flowspace::pygraph::PyGraph, TyperError> {
+    use crate::flowspace::model::{Block, BlockRefExt, FunctionGraph, GraphFunc, Link};
+    use crate::translator::rtyper::rtyper::{helper_pygraph_from_graph, variable_with_lltype};
+
+    let arg = variable_with_lltype("v", LowLevelType::Void);
+    let startblock = Block::shared(vec![Hlvalue::Variable(arg)]);
+    let return_var = variable_with_lltype("result", LowLevelType::Signed);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    let c_zero = Hlvalue::Constant(Constant::with_concretetype(
+        ConstValue::Int(0),
+        LowLevelType::Signed,
+    ));
+    startblock.closeblock(vec![
+        Link::new(vec![c_zero], Some(graph.returnblock.clone()), None).into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["v".to_string()],
+        func,
+    ))
 }
 
 /// RPython `impossible_repr = VoidRepr()` (`rmodel.py:359`) — the
@@ -1473,6 +1544,21 @@ impl Repr for AddressRepr {
             GenopResult::LLType(LowLevelType::Bool),
         ))
     }
+
+    /// raddress.py:36-39 `ll_str(a) = ll_int2hex(r_uint(ll_addrhash(a)),
+    /// True)`. The default `Repr.rtype_str` (rmodel.py:195-197) calls
+    /// `hop.gendirectcall(self.ll_str, v_self)`; the `ll_str` body is
+    /// itself a helper graph that chains `ll_addrhash` into `ll_int2hex`.
+    fn rtype_str(&self, hop: &HighLevelOp) -> RTypeResult {
+        let vlist = hop.inputargs(vec![ConvertedTo::Repr(self)])?;
+        let helper = hop.rtyper.lowlevel_helper_function_with_builder(
+            "ll_addr_str".to_string(),
+            vec![LowLevelType::Address],
+            crate::translator::rtyper::lltypesystem::rstr::STRPTR.clone(),
+            |rtyper, _args, _result| build_ll_address_str_helper_graph(rtyper, "ll_addr_str"),
+        )?;
+        hop.gendirectcall(&helper, vlist)
+    }
 }
 
 impl fmt::Display for AddressRepr {
@@ -1527,6 +1613,97 @@ fn build_ll_addrhash_helper_graph(
     Ok(helper_pygraph_from_graph(
         graph,
         vec!["addr1".to_string()],
+        func,
+    ))
+}
+
+/// raddress.py:36-39 `ll_str(a)`: chain `ll_addrhash(a)` into
+/// `ll_int2hex(r_uint(id), True)`. The `r_uint(id)` wrap is emitted as a
+/// `cast_primitive` of the Signed hash to `Unsigned`, feeding the Unsigned
+/// specialisation of `ll_int2hex` (`signed_input=false`, sign branch
+/// pruned) so a negative address hashes to its full-width unsigned hex.
+fn build_ll_address_str_helper_graph(
+    rtyper: &super::rtyper::RPythonTyper,
+    name: &str,
+) -> Result<crate::flowspace::pygraph::PyGraph, TyperError> {
+    use crate::flowspace::model::{Block, FunctionGraph, GraphFunc, Link, SpaceOperation};
+    use crate::translator::rtyper::lltypesystem::rstr::{
+        STRPTR, build_ll_int2hex_helper_graph, sub_helper_funcptr_constant,
+    };
+    use crate::translator::rtyper::rtyper::{
+        constant_with_lltype, helper_pygraph_from_graph, variable_with_lltype,
+    };
+
+    let addrhash = rtyper.lowlevel_helper_function_with_builder(
+        "ll_addrhash".to_string(),
+        vec![LowLevelType::Address],
+        LowLevelType::Signed,
+        |_rtyper, _args, _result| {
+            build_ll_addrhash_helper_graph("ll_addrhash", &LowLevelType::Address)
+        },
+    )?;
+    let c_addrhash = sub_helper_funcptr_constant(rtyper, &addrhash)?;
+    let int2hex = rtyper.lowlevel_helper_function_with_builder(
+        "ll_int2hex".to_string(),
+        vec![LowLevelType::Unsigned, LowLevelType::Bool],
+        STRPTR.clone(),
+        |_rtyper, _args, _result| build_ll_int2hex_helper_graph("ll_int2hex", false),
+    )?;
+    let c_int2hex = sub_helper_funcptr_constant(rtyper, &int2hex)?;
+
+    let addr = variable_with_lltype("a", LowLevelType::Address);
+    let startblock = Block::shared(vec![Hlvalue::Variable(addr.clone())]);
+    let return_var = variable_with_lltype("result", STRPTR.clone());
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    let v_id = variable_with_lltype("id", LowLevelType::Signed);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![Hlvalue::Constant(c_addrhash), Hlvalue::Variable(addr)],
+        Hlvalue::Variable(v_id.clone()),
+    ));
+    // r_uint(id): reinterpret the Signed hash as Unsigned for the unsigned
+    // ll_int2hex specialisation.
+    let v_uid = variable_with_lltype("id", LowLevelType::Unsigned);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "cast_primitive",
+        vec![Hlvalue::Variable(v_id)],
+        Hlvalue::Variable(v_uid.clone()),
+    ));
+    let c_true = constant_with_lltype(ConstValue::Bool(true), LowLevelType::Bool);
+    let v_result = variable_with_lltype("result", STRPTR.clone());
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![
+            Hlvalue::Constant(c_int2hex),
+            Hlvalue::Variable(v_uid),
+            c_true,
+        ],
+        Hlvalue::Variable(v_result.clone()),
+    ));
+
+    use crate::flowspace::model::BlockRefExt;
+    startblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(v_result)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["a".to_string()],
         func,
     ))
 }
@@ -2984,10 +3161,13 @@ mod tests {
     /// for unsupported Reprs instead of silently using a wrong path.
     #[test]
     fn base_repr_get_ll_eq_and_hash_function_defaults_raise_typererror() {
+        use crate::translator::rtyper::lltypesystem::lltype::{OpaqueType, Ptr, PtrTarget};
         let rtyper = rtyper_for_tests();
-        // VoidRepr has no get_ll_eq_function override → falls back to
-        // base default which raises.
-        let r = VoidRepr::new();
+        // SimplePointerRepr has no get_ll_eq_function / get_ll_hash_function
+        // override → falls back to the base default which raises.
+        let r = SimplePointerRepr::new(LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Opaque(OpaqueType::gc("GCREF")),
+        })));
         let eq_err = r.get_ll_eq_function(&rtyper).unwrap_err();
         assert!(
             eq_err.to_string().contains("no equality function"),
@@ -2998,6 +3178,31 @@ mod tests {
             hash_err.to_string().contains("no hashing function"),
             "got {hash_err:?}"
         );
+    }
+
+    /// rmodel.py:355-357 — `VoidRepr` overrides `get_ll_eq_function`
+    /// (returns None), `get_ll_hash_function` (returns `ll_hash_void`),
+    /// and aliases `get_ll_fasthash_function = get_ll_hash_function`.
+    #[test]
+    fn voidrepr_eq_none_hash_and_fasthash_resolve_ll_hash_void() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
+        let r = VoidRepr::new();
+        assert!(r.get_ll_eq_function(&rtyper).unwrap().is_none());
+
+        let hashfn = r
+            .get_ll_hash_function(&rtyper)
+            .unwrap()
+            .expect("ll_hash_void helper");
+        assert_eq!(hashfn.name, "ll_hash_void");
+        assert_eq!(hashfn.args, vec![LowLevelType::Void]);
+        assert_eq!(hashfn.result, LowLevelType::Signed);
+
+        let fastfn = r
+            .get_ll_fasthash_function(&rtyper)
+            .unwrap()
+            .expect("ll_hash_void helper (fasthash alias)");
+        assert_eq!(fastfn.name, "ll_hash_void");
     }
 
     #[test]

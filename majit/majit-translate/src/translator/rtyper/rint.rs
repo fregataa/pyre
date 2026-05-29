@@ -228,10 +228,12 @@ impl Repr for IntegerRepr {
     ///
     /// Pyre maps `Bool` through the same primitive cast: `True` becomes
     /// integer `1`, `False` becomes integer `0`. The `Symbolic` branch
-    /// (rlib/objectmodel.py) has no ConstValue counterpart; the
-    /// rlib/symbolic port will extend this arm when it lands.
+    /// (rint.py:26-27 `if isinstance(value, objectmodel.Symbolic): return
+    /// value`) carries `llmemory` address offsets through unchanged; the
+    /// concrete byte size is resolved only at code emission.
     fn convert_const(&self, value: &ConstValue) -> Result<Constant, TyperError> {
         let converted = match value {
+            ConstValue::AddressOffset(_) => value.clone(),
             ConstValue::Int(_) => value.clone(),
             ConstValue::Bool(value) => ConstValue::Int(i64::from(*value)),
             _ => return Err(TyperError::message(format!("not an integer: {value:?}"))),
@@ -1056,6 +1058,22 @@ mod tests {
         assert_eq!(c.concretetype, Some(LowLevelType::Signed));
         let c = r.convert_const(&ConstValue::Bool(true)).unwrap();
         assert_eq!(c.concretetype, Some(LowLevelType::Signed));
+    }
+
+    #[test]
+    fn integer_repr_convert_const_passes_address_offset_through() {
+        // rint.py:26-27 — `if isinstance(value, objectmodel.Symbolic):
+        // return value`. llmemory address offsets carry through unchanged.
+        let r = signed_repr();
+        let offset = ConstValue::AddressOffset(
+            crate::translator::rtyper::lltypesystem::llmemory::AddressOffset::ItemOffset {
+                TYPE: LowLevelType::Signed,
+                repeat: 1,
+            },
+        );
+        let c = r.convert_const(&offset).unwrap();
+        assert_eq!(c.concretetype, Some(LowLevelType::Signed));
+        assert_eq!(c.value, offset);
     }
 
     #[test]

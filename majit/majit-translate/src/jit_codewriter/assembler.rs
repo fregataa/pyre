@@ -679,7 +679,7 @@ impl Assembler {
                 // `encode_op` and the per-arm emitters had each gotten
                 // their own `startpoints.insert` call except this one.
                 state.startpoints.insert(state.code.len());
-                let src_reg = self.encode_regorconst_source(src, dst.kind, state);
+                let src_reg = self.encode_regorconst_source(src, dst.kind, state, callcontrol);
                 let kind_char = kind_char_of(dst.kind);
                 let kind_name = kind_long_name(dst.kind);
                 let key = format!("{kind_name}_copy/{kind_char}>{kind_char}");
@@ -746,21 +746,21 @@ impl Assembler {
             // single-byte argcode `i`/`r`/`f` suffices for both register
             // and constant sources (upstream `assembler.py:164-174`).
             FlatOp::IntReturn(v) => {
-                let reg = self.encode_regorconst_source(v, RegKind::Int, state);
+                let reg = self.encode_regorconst_source(v, RegKind::Int, state, callcontrol);
                 let opnum = self.get_opnum("int_return/i");
                 state.startpoints.insert(state.code.len());
                 state.code.push(opnum);
                 state.code.push(reg);
             }
             FlatOp::RefReturn(v) => {
-                let reg = self.encode_regorconst_source(v, RegKind::Ref, state);
+                let reg = self.encode_regorconst_source(v, RegKind::Ref, state, callcontrol);
                 let opnum = self.get_opnum("ref_return/r");
                 state.startpoints.insert(state.code.len());
                 state.code.push(opnum);
                 state.code.push(reg);
             }
             FlatOp::FloatReturn(v) => {
-                let reg = self.encode_regorconst_source(v, RegKind::Float, state);
+                let reg = self.encode_regorconst_source(v, RegKind::Float, state, callcontrol);
                 let opnum = self.get_opnum("float_return/f");
                 state.startpoints.insert(state.code.len());
                 state.code.push(opnum);
@@ -778,7 +778,7 @@ impl Assembler {
             // standard OverflowError instance.  Blackhole:
             // `blackhole.py:1000 bhimpl_raise(excvalue)`.
             FlatOp::Raise(v) => {
-                let reg = self.encode_regorconst_source(v, RegKind::Ref, state);
+                let reg = self.encode_regorconst_source(v, RegKind::Ref, state, callcontrol);
                 let opnum = self.get_opnum("raise/r");
                 state.startpoints.insert(state.code.len());
                 state.code.push(opnum);
@@ -896,6 +896,7 @@ impl Assembler {
         arg: &crate::flatten::RegOrConst,
         expected_kind: RegKind,
         state: &mut AssemblyState,
+        callcontrol: Option<&CallControl>,
     ) -> u8 {
         match arg {
             // RPython `assembler.py:164-174`: the single-byte argcode
@@ -940,7 +941,7 @@ impl Assembler {
                          with the surrounding op's kind)",
                     );
                 }
-                self.emit_const(&c.value, kind_char, state)
+                self.emit_const(&c.value, kind_char, state, callcontrol)
             }
         }
     }
@@ -2237,20 +2238,43 @@ impl Assembler {
 
     /// RPython assembler.py:80-138: emit_const for integer constants.
     /// Adds to constant pool and returns the index byte.
-    fn emit_const(&mut self, value: &ConstValue, kind: char, state: &mut AssemblyState) -> u8 {
+    fn emit_const(
+        &mut self,
+        value: &ConstValue,
+        kind: char,
+        state: &mut AssemblyState,
+        callcontrol: Option<&CallControl>,
+    ) -> u8 {
         match kind {
-            'i' => self.emit_const_i_from_const(value, state),
+            'i' => self.emit_const_i_from_const(value, state, callcontrol),
             'r' => self.emit_const_r(value, state),
             'f' => self.emit_const_f(value, state),
             other => panic!("unknown constant kind {other:?} for {value:?}"),
         }
     }
 
-    fn emit_const_i_from_const(&mut self, value: &ConstValue, state: &mut AssemblyState) -> u8 {
+    fn emit_const_i_from_const(
+        &mut self,
+        value: &ConstValue,
+        state: &mut AssemblyState,
+        callcontrol: Option<&CallControl>,
+    ) -> u8 {
         let value = match value {
             ConstValue::Int(n) => *n,
             ConstValue::Bool(b) => *b as i64,
             ConstValue::SpecTag(tag) => *tag as i64,
+            // `llmemory` address offsets are symbolic; resolve to the
+            // concrete byte size at code emission. Struct field offsets /
+            // sizes come from the `CallControl`'s struct layouts (it
+            // implements `OffsetLayout`); the layout-free offsets resolve
+            // even without a `callcontrol`.
+            ConstValue::AddressOffset(offset) => {
+                let resolved = match callcontrol {
+                    Some(cc) => offset.byte_size(cc),
+                    None => offset.byte_size(&NoStructLayout),
+                };
+                resolved.unwrap_or_else(|err| panic!("emit_const_i: {err}"))
+            }
             other => panic!("integer-kind constant not supported by emit_const_i: {other:?}"),
         };
         self.emit_const_i(value, state)
@@ -2463,6 +2487,20 @@ fn bh_field_spec_from_parts(
         is_immutable,
         is_quasi_immutable,
         index_in_parent,
+    }
+}
+
+/// Empty layout source used when no `CallControl` is threaded into
+/// constant emission. The layout-free symbolic offsets (primitive
+/// `ItemOffset`, `CompositeOffset`, and the standard array tokens) still
+/// resolve; struct field offsets / sizes report as missing.
+struct NoStructLayout;
+impl crate::translator::rtyper::lltypesystem::llmemory::OffsetLayout for NoStructLayout {
+    fn field_offset(&self, _struct_name: &str, _fldname: &str) -> Option<i64> {
+        None
+    }
+    fn struct_size(&self, _struct_name: &str) -> Option<i64> {
+        None
     }
 }
 
