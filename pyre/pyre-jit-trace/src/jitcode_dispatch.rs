@@ -708,6 +708,20 @@ pub enum DispatchError {
     /// benchmarks don't trigger; this guard is fail-loud against future
     /// silent TODOs.
     JitForceVirtualRequiresConcreteResolver { pc: usize },
+    /// `{get,set}field_vable_{i,r,f}` read its box operand from a Ref
+    /// register holding `OpRef::None`. RPython parity: `pyjitpl.py:1167-1199
+    /// opimpl_getfield_vable_{i,r,f}` / `_opimpl_setfield_vable(box, ...,
+    /// pc)` always receive a live `box` from the register file — the
+    /// virtualizable frame box. Pyre's walker initializes Ref register
+    /// slots to `OpRef::None`; an inlined callee frame may leave the vable
+    /// register unseeded (documented walker arg-seeding gap). Both vable
+    /// accessors route through `is_nonstandard_virtualizable` →
+    /// `heapcache.nonstandard_virtualizables_now_known(box)`, which would
+    /// feed `OpRef::None` (`raw() == u32::MAX`) into the dense heapcache
+    /// flag `Vec<u32>`, resizing it to `u32::MAX + 1` (16 GiB). Surface as
+    /// a trace abort so production falls back to trait dispatch rather
+    /// than allocating.
+    VableBoxNotSeeded { pc: usize },
 }
 
 /// Walk one opcode at `pc` and return the dispatch outcome plus the
@@ -2303,6 +2317,13 @@ fn getfield_vable_via_metainterp(
     dst_bank: char,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let obj = read_ref_reg(code, op, 0, ctx)?;
+    // RPython's `box` is always a live virtualizable-frame box. An
+    // unseeded walker Ref register holds `OpRef::None` (`raw() ==
+    // u32::MAX`); feeding it into the metainterp vable path would resize
+    // the heapcache flag vector to 16 GiB. Bail to a trace abort instead.
+    if obj.is_none() {
+        return Err(DispatchError::VableBoxNotSeeded { pc: op.pc });
+    }
     let descr = read_descr(code, op, 1, ctx)?;
 
     // R7 parity: RPython `opimpl_getfield_vable_{i,r,f}(box, fielddescr,
@@ -2416,6 +2437,11 @@ fn setfield_vable_via_metainterp(
     value_bank: char,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let obj = read_ref_reg(code, op, 0, ctx)?;
+    // Same unseeded-register guard as `getfield_vable_via_metainterp`:
+    // a `None` box would resize the heapcache flag vector to 16 GiB.
+    if obj.is_none() {
+        return Err(DispatchError::VableBoxNotSeeded { pc: op.pc });
+    }
     let value = match value_bank {
         'i' => read_int_reg(code, op, 1, ctx)?,
         'r' => read_ref_reg(code, op, 1, ctx)?,
@@ -5910,6 +5936,94 @@ mod tests {
                 reg_idx,
             );
         }
+    }
+
+    /// `getfield_vable_*` must abort to `VableBoxNotSeeded` when the
+    /// box register is unseeded (`OpRef::NONE`) rather than feed
+    /// `u32::MAX` into the heapcache flag vector (a 16 GiB resize).
+    #[test]
+    fn getfield_vable_with_none_obj_surfaces_vable_box_not_seeded() {
+        let descr_pool: Vec<DescrRef> = Vec::new();
+        let mut tc = fresh_trace_ctx();
+        let mut regs_r = vec![OpRef::NONE];
+        let mut regs_i = vec![OpRef::NONE];
+        let mut wc = WalkContext {
+            registers_r: &mut regs_r,
+            registers_i: &mut regs_i,
+            registers_f: &mut [],
+            concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
+            descr_refs: &descr_pool,
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: make_fail_descr(1),
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
+            entry_py_pc: 0,
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
+        };
+        // `getfield_vable_i/rd>i`: operand 0 (the box) sits at code[pc+1].
+        let code = [0u8, 0x00, 0x00, 0x00, 0x00];
+        let op = DecodedOp {
+            key: "getfield_vable_i/rd>i",
+            opname: "getfield_vable_i",
+            argcodes: "rd>i",
+            pc: 0,
+            next_pc: 5,
+        };
+        assert_eq!(
+            getfield_vable_via_metainterp(&code, &op, &mut wc, 'i'),
+            Err(DispatchError::VableBoxNotSeeded { pc: 0 })
+        );
+    }
+
+    /// `setfield_vable_*` carries the same unseeded-box guard.
+    #[test]
+    fn setfield_vable_with_none_obj_surfaces_vable_box_not_seeded() {
+        let descr_pool: Vec<DescrRef> = Vec::new();
+        let mut tc = fresh_trace_ctx();
+        let mut regs_r = vec![OpRef::NONE];
+        let mut regs_i = vec![OpRef::NONE];
+        let mut wc = WalkContext {
+            registers_r: &mut regs_r,
+            registers_i: &mut regs_i,
+            registers_f: &mut [],
+            concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
+            descr_refs: &descr_pool,
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: make_fail_descr(1),
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
+            entry_py_pc: 0,
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
+        };
+        // `setfield_vable_i/rid`: operand 0 (the box) sits at code[pc+1].
+        let code = [0u8, 0x00, 0x00, 0x00, 0x00];
+        let op = DecodedOp {
+            key: "setfield_vable_i/rid",
+            opname: "setfield_vable_i",
+            argcodes: "rid",
+            pc: 0,
+            next_pc: 5,
+        };
+        assert_eq!(
+            setfield_vable_via_metainterp(&code, &op, &mut wc, 'i'),
+            Err(DispatchError::VableBoxNotSeeded { pc: 0 })
+        );
     }
 
     #[test]

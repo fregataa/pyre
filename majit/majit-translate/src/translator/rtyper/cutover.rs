@@ -55,7 +55,9 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::flowspace::argument::Signature;
-use crate::flowspace::model::{ConstValue, Constant, GraphFunc};
+use crate::flowspace::model::{
+    Block, BlockRefExt, ConstValue, Constant, GraphFunc, Hlvalue, Link, Variable,
+};
 use crate::flowspace::pygraph::PyGraph;
 #[cfg(test)]
 use crate::front;
@@ -964,6 +966,180 @@ pub(crate) fn lift_callee_to_pygraph(
     Ok(pygraph)
 }
 
+/// Z2.5 Path C slice 2 — synthesize a minimal flowed `PyGraph` for a
+/// callee whose real body cannot be lowered through the adapter
+/// (`unsafe fn` in `pyre-object` / `pyre-interpreter`).  The stub has
+/// a single Link from `startblock` to `returnblock` carrying a
+/// pre-annotated `Variable` so the annotator's `flowin` projects the
+/// callsite result to the declared return type without touching the
+/// (non-modellable) body.
+///
+/// `name` becomes the synthetic graph's `FunctionGraph.name`.
+/// `signature.argnames` are turned into named `Variable`s on the
+/// startblock; `return_lltype` is projected through
+/// [`crate::translator::rtyper::llannotation::lltype_to_annotation`]
+/// to a `SomeValue` shell (no `const_box`) attached to a fresh
+/// `Variable` carried on the Link to the returnblock.  Returns
+/// `None` when the return type is a container
+/// (`Func` / `Struct` / `Array` / `Opaque` / `ForwardReference` /
+/// `FixedSizeArray`) or `Address` (no `SomeAddress` port yet) —
+/// the caller skips registration for that fn and the original
+/// "not registered in PyreCallRegistry" Skip path covers it.
+///
+/// **Why pre-annotated Variable rather than `Constant`.** A
+/// `Constant(default_value)` in the return Link routes through
+/// `Bookkeeper::immutableconstant`, which lifts e.g.
+/// `ConstValue::Bool(false)` to `SomeBool { const_box = Some(...) }`.
+/// That constant slot leaks into the rtyper as a fold-eligible
+/// "known false" annotation and can mis-specialise downstream code
+/// that observes the callsite result.  Upstream `ExtRegistryEntry.
+/// compute_result_annotation` (`extregistry.py:33`) returns a
+/// `SomeXXX()` shell with no `const`; the pre-annotated Variable
+/// here carries exactly that shape via `binding(arg)` reading
+/// `v.annotation` directly (`annrpython.py:282-287`).
+///
+/// Mirrors how `description.py:193-203` test fixtures build a
+/// `FunctionDesc` with a minimal `PyGraph` body — the upstream
+/// equivalent is `Translator._prebuilt_graphs[entry_point] = pygraph`
+/// where `pygraph` is hand-constructed without going through
+/// `build_flow`.  Pure constructor — no annotator / rtyper side
+/// effects.
+pub(crate) fn build_stub_pygraph_for_unsafe_fn(
+    name: String,
+    signature: Signature,
+    return_lltype: LowLevelType,
+) -> Option<Rc<PyGraph>> {
+    let return_someval = default_someshell_for_lltype(&return_lltype)?;
+    let inputargs: Vec<Hlvalue> = signature
+        .argnames
+        .iter()
+        .map(|n| Hlvalue::Variable(Variable::named(n)))
+        .collect();
+    let startblock = Block::shared(inputargs);
+    let func = GraphFunc::new(
+        name.clone(),
+        Constant::new(ConstValue::Dict(HashMap::new())),
+    );
+    let mut graph_inner = crate::flowspace::model::FunctionGraph::new(name, startblock.clone());
+    graph_inner.func = Some(func.clone());
+    let return_var = Variable::named("__unsafe_stub_result");
+    *return_var.annotation.borrow_mut() = Some(Rc::new(return_someval));
+    let return_hlvalue = Hlvalue::Variable(return_var);
+    let link = Rc::new(RefCell::new(Link::new(
+        vec![return_hlvalue],
+        Some(graph_inner.returnblock.clone()),
+        None,
+    )));
+    startblock.closeblock(vec![link]);
+    Some(Rc::new(PyGraph {
+        graph: Rc::new(RefCell::new(graph_inner)),
+        func,
+        signature: RefCell::new(signature),
+        defaults: RefCell::new(Some(Vec::new())),
+        access_directly: Cell::new(false),
+    }))
+}
+
+/// Project a `LowLevelType` to a `SomeValue` shell suitable for
+/// pre-annotating the stub-graph return Variable
+/// ([`build_stub_pygraph_for_unsafe_fn`]).
+///
+/// Delegates to
+/// [`crate::translator::rtyper::llannotation::lltype_to_annotation`]
+/// for every primitive lltype `lltype_to_annotation` itself handles
+/// (Void / Bool / Float family / Char / UniChar / integer family /
+/// `Ptr(_)` / `InteriorPtr(_)`), so this helper inherits the
+/// upstream `lltype_to_annotation` (`llannotation.py:172-185`) shape
+/// — every returned `SomeXXX` has no `const_box` set, matching
+/// `ExtRegistryEntry.compute_result_annotation` semantics.
+///
+/// Returns `None` for container types
+/// (`Func` / `Struct` / `Array` / `FixedSizeArray` / `Opaque` /
+/// `ForwardReference`) that `lltype_to_annotation` rejects, and for
+/// `Address` (upstream `SomeAddress`; not yet ported to the pyre
+/// `SomeValue` enum — see `model.rs:21` TODO).  The slice 3c caller
+/// treats `None` as "skip this fn"; the unported path then surfaces
+/// the original "not registered" Skip.
+pub(crate) fn default_someshell_for_lltype(
+    lltype: &LowLevelType,
+) -> Option<crate::annotator::model::SomeValue> {
+    if lltype.is_container_type() {
+        return None;
+    }
+    match lltype {
+        // SomeAddress is not yet present in the SomeValue enum
+        // (model.rs:21 TODO); skip until ported.
+        LowLevelType::Address => None,
+        _ => Some(crate::translator::rtyper::llannotation::lltype_to_annotation(lltype.clone())),
+    }
+}
+
+/// Z2.5 Path C slice 3c — register a batch of unsafe-fn stub
+/// `(segments, signature, return_lltype)` specs into `registry`.
+/// Each entry is wrapped through [`build_stub_pygraph_for_unsafe_fn`]
+/// + [`PyreCallRegistry::register_callee`], so subsequent
+/// `flowspace_adapter::translate_op` lookups via
+/// `call_registry.lookup_with_leaf_match` find a registered entry and
+/// the dual gate no longer Skips with "not registered in
+/// PyreCallRegistry" for these paths.
+///
+/// `specs` is typically the output of
+/// `register::extract_unsafe_fn_stubs(file, prefix)` run over every
+/// parsed source file.  Per-fn failures (stub-pygraph builder returns
+/// `None` for compound lltypes, or registry already has the same key
+/// at a conflicting signature) propagate as silent skips — the
+/// upstream "not registered" Skip path then absorbs that specific fn
+/// while the rest of the batch lands.
+///
+/// Mirrors `populate_call_registry_from_call_graphs`'s
+/// "register and prefill" contract (`cutover.rs:856-875`) but feeds
+/// from the syn-AST stub-spec list instead of pyre's
+/// `function_graphs: HashMap<CallPath, LegacyGraph>` (which excludes
+/// unsafe fns by validate_signature rejection).
+///
+/// **Annotator-only carrier — never reaches the codewriter.**
+/// The stub graph carries a single default-Constant return link
+/// suitable for `RPythonAnnotator` return-type inference via
+/// `cachedgraph` (see `pyre_call_registry::prefill_default_cache`).
+/// Because `CallControl::function_graphs` is populated exclusively
+/// by safe-fn `build_flow` output (unsafe fns are rejected at
+/// `flowspace/rust_source/build_flow.rs:215`), the unsafe stub key
+/// is never present in `function_graphs`.  `CallControl::
+/// find_all_graphs` walks `function_graphs.keys()` only and resolves
+/// each call target via `target_to_path_and_graph`
+/// (`jit_codewriter/call.rs:2601`) which returns `None` for any
+/// path absent from `function_graphs` — so an unsafe-stub target
+/// triggers `continue` and is never added to `candidate_graphs`,
+/// never reaches `transform_graph_to_jitcode`, and never compiles
+/// into executable JITCode.  The actual unsafe-fn body executes
+/// through the residual-call / direct-call fnaddr lowering that
+/// the codewriter emits for the call op whose target resolves
+/// to the host-evaluator entry point.  Reviewer 2026-05-24 round
+/// item #5 audited this layering; the default-Constant return is
+/// safe by virtue of the `function_graphs` gate, not by any
+/// `look_inside_graph` policy on the stub itself.
+pub(crate) fn register_unsafe_fn_stubs(
+    registry: &PyreCallRegistry,
+    specs: &[(Vec<String>, Signature, LowLevelType)],
+) {
+    for (segments, signature, return_lltype) in specs {
+        let Some(stub_pygraph) = build_stub_pygraph_for_unsafe_fn(
+            segments.last().cloned().unwrap_or_default(),
+            signature.clone(),
+            return_lltype.clone(),
+        ) else {
+            continue;
+        };
+        let key = FunctionPathKey::from_segments(segments.iter().cloned());
+        if registry.lookup(&key).is_some() {
+            // Already registered via the function_graphs pass (e.g. a
+            // safe fn with the same path).  Don't overwrite.
+            continue;
+        }
+        registry.register_callee(key, signature.clone(), stub_pygraph);
+    }
+}
+
 /// Derive the canonical `FunctionPathKey` for a `SemanticFunction`.
 ///
 /// Mirrors the front-end's `canonical_call_target`
@@ -1179,7 +1355,10 @@ pub fn specialize_legacy_graph_with_registry_returning_value_to_var(
     // themselves into `all_blocks`/`annotated` through the same
     // bindinputargs path on first arrival.
     let subject_inputcells =
-        crate::translator::rtyper::flowspace_adapter::derive_subject_inputcells(legacy)?;
+        crate::translator::rtyper::flowspace_adapter::derive_subject_inputcells(
+            legacy,
+            Some(call_registry.bookkeeper()),
+        )?;
     let (startblock, exceptblock) = {
         let g = graph.borrow();
         (g.startblock.clone(), g.exceptblock.clone())
@@ -2923,4 +3102,270 @@ fn cross_block(x: i64, cond: bool) -> i64 {
     // annotator.  Per-session annotator construction inside
     // `specialize_legacy_graph_with_registry_returning_value_to_var`
     // is the only remaining production lifecycle.
+
+    // ─── Z2.5 Path C slice 2 helpers ───
+    #[test]
+    fn default_someshell_for_lltype_integer_family_yields_someinteger_no_const() {
+        use crate::annotator::model::SomeValue;
+        for ll in [
+            LowLevelType::Signed,
+            LowLevelType::Unsigned,
+            LowLevelType::SignedLongLong,
+            LowLevelType::UnsignedLongLong,
+        ] {
+            let s = default_someshell_for_lltype(&ll)
+                .unwrap_or_else(|| panic!("{ll:?} must project to a SomeValue"));
+            match s {
+                SomeValue::Integer(ref si) => assert!(
+                    si.base.const_box.is_none(),
+                    "{ll:?}: SomeInteger must carry no const_box"
+                ),
+                other => panic!("{ll:?}: expected SomeInteger, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn default_someshell_for_lltype_bool_yields_somebool_no_const() {
+        use crate::annotator::model::SomeValue;
+        let s = default_someshell_for_lltype(&LowLevelType::Bool)
+            .expect("Bool must project to SomeBool");
+        match s {
+            SomeValue::Bool(b) => assert!(
+                b.base.const_box.is_none(),
+                "SomeBool must carry no const_box (ExtRegistryEntry parity)"
+            ),
+            other => panic!("expected SomeBool, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn default_someshell_for_lltype_void_yields_somenone() {
+        use crate::annotator::model::SomeValue;
+        let s = default_someshell_for_lltype(&LowLevelType::Void)
+            .expect("Void must project to SomeNone");
+        assert!(matches!(s, SomeValue::None_(_)), "got {s:?}");
+    }
+
+    #[test]
+    fn default_someshell_for_lltype_float_family_yields_somefloat_no_const() {
+        use crate::annotator::model::SomeValue;
+        for ll in [
+            LowLevelType::Float,
+            LowLevelType::SingleFloat,
+            LowLevelType::LongFloat,
+        ] {
+            let s = default_someshell_for_lltype(&ll)
+                .unwrap_or_else(|| panic!("{ll:?} must project to a SomeValue"));
+            let const_present = match &s {
+                SomeValue::Float(f) => f.base.const_box.is_some(),
+                SomeValue::SingleFloat(f) => f.base.const_box.is_some(),
+                SomeValue::LongFloat(f) => f.base.const_box.is_some(),
+                other => panic!("{ll:?}: expected float family, got {other:?}"),
+            };
+            assert!(!const_present, "{ll:?}: float shell must have no const_box");
+        }
+    }
+
+    #[test]
+    fn default_someshell_for_lltype_address_yields_none() {
+        // SomeAddress not yet ported (model.rs:21 TODO).
+        assert!(default_someshell_for_lltype(&LowLevelType::Address).is_none());
+    }
+
+    #[test]
+    fn build_stub_pygraph_carries_signature_and_links_to_returnblock() {
+        use crate::annotator::model::SomeValue;
+        let sig = Signature::new(vec!["obj".to_string()], None, None);
+        let pygraph = build_stub_pygraph_for_unsafe_fn(
+            "is_none".to_string(),
+            sig.clone(),
+            LowLevelType::Bool,
+        )
+        .expect("Bool return must produce a stub pygraph");
+        assert_eq!(*pygraph.signature.borrow(), sig);
+        let graph = pygraph.graph.borrow();
+        assert_eq!(graph.name, "is_none");
+        let start = graph.startblock.borrow();
+        assert_eq!(
+            start.inputargs.len(),
+            1,
+            "argname must map to a single inputarg"
+        );
+        assert_eq!(
+            start.exits.len(),
+            1,
+            "stub must Link directly to returnblock"
+        );
+        let link = start.exits[0].borrow();
+        assert_eq!(
+            link.args.len(),
+            1,
+            "stub Link carries exactly the pre-annotated return Variable"
+        );
+        // The link's target must be the graph's returnblock.
+        let link_target = link.target.as_ref().expect("Link must target a block");
+        assert!(
+            std::rc::Rc::ptr_eq(link_target, &graph.returnblock),
+            "stub Link must target the graph's returnblock"
+        );
+        // The return arg must be a Variable carrying a const-free
+        // SomeBool annotation (ExtRegistryEntry parity).
+        let ret_arg = link.args[0]
+            .as_ref()
+            .expect("stub return arg must be Some(Hlvalue::Variable)");
+        match ret_arg {
+            Hlvalue::Variable(v) => {
+                let ann = v.annotation.borrow();
+                let s = ann.as_ref().expect("return Variable must be pre-annotated");
+                match &**s {
+                    SomeValue::Bool(b) => assert!(
+                        b.base.const_box.is_none(),
+                        "stub return SomeBool must not leak a const_box"
+                    ),
+                    other => panic!("expected SomeBool annotation, got {other:?}"),
+                }
+            }
+            other => panic!("stub return must be Hlvalue::Variable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn register_unsafe_fn_stubs_registers_each_spec_and_skips_compound_returns() {
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::translator::rtyper::pyre_call_registry::PyreCallRegistry;
+        let bk = std::rc::Rc::new(Bookkeeper::new());
+        let registry = PyreCallRegistry::new(bk);
+        let specs = vec![
+            (
+                vec!["pyobject".to_string(), "is_none".to_string()],
+                Signature::new(vec!["obj".to_string()], None, None),
+                LowLevelType::Bool,
+            ),
+            (
+                vec!["pyobject".to_string(), "is_int".to_string()],
+                Signature::new(vec!["obj".to_string()], None, None),
+                LowLevelType::Bool,
+            ),
+            // Compound lltype — slice 2's default_constvalue_for_lltype
+            // returns None and register_unsafe_fn_stubs must skip.
+            (
+                vec!["pyobject".to_string(), "unsupported".to_string()],
+                Signature::new(vec!["x".to_string()], None, None),
+                LowLevelType::Struct(Box::new(
+                    crate::translator::rtyper::lltypesystem::lltype::StructType::new("S", vec![]),
+                )),
+            ),
+        ];
+        register_unsafe_fn_stubs(&registry, &specs);
+        assert_eq!(
+            registry.len(),
+            2,
+            "compound-return spec must be skipped, others registered"
+        );
+        assert!(
+            registry
+                .lookup(&FunctionPathKey::from_segments([
+                    "pyobject".to_string(),
+                    "is_none".to_string()
+                ]))
+                .is_some()
+        );
+        assert!(
+            registry
+                .lookup(&FunctionPathKey::from_segments([
+                    "pyobject".to_string(),
+                    "is_int".to_string()
+                ]))
+                .is_some()
+        );
+    }
+
+    /// Reviewer round 2026-05-24 item #5 — pin the layering invariant
+    /// that the synthetic stub-pygraph is annotator-only.  The
+    /// `register_unsafe_fn_stubs` helper writes the stub into the
+    /// `PyreCallRegistry` cache but does NOT mutate any
+    /// `CallControl::function_graphs` map; the codewriter's BFS walks
+    /// `function_graphs.keys()` and resolves each call op's target via
+    /// `target_to_path_and_graph` which requires the target to be
+    /// present in `function_graphs`.  This test mirrors the
+    /// `codewriter.rs:192-195` production call shape (registry +
+    /// `callcontrol.unsafe_fn_stubs`) and asserts the path is reachable
+    /// via the registry but not via `CallControl::function_graphs`.
+    #[test]
+    fn register_unsafe_fn_stubs_does_not_populate_callcontrol_function_graphs() {
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::jit_codewriter::call::CallControl;
+        use crate::translator::rtyper::pyre_call_registry::PyreCallRegistry;
+        let mut callcontrol = CallControl::new();
+        callcontrol.unsafe_fn_stubs = vec![(
+            vec!["pyobject".to_string(), "is_none".to_string()],
+            Signature::new(vec!["obj".to_string()], None, None),
+            LowLevelType::Bool,
+        )];
+        let bk = std::rc::Rc::new(Bookkeeper::new());
+        let registry = PyreCallRegistry::new(bk);
+        register_unsafe_fn_stubs(&registry, &callcontrol.unsafe_fn_stubs);
+        // Registry side: the stub is present for `cachedgraph` lookups.
+        let key = FunctionPathKey::from_segments(["pyobject".to_string(), "is_none".to_string()]);
+        assert!(
+            registry.lookup(&key).is_some(),
+            "registry must carry the unsafe stub for annotator lookup"
+        );
+        // CallControl side: function_graphs is untouched, so
+        // `find_all_graphs_for_tests` (which BFS-walks
+        // `function_graphs.keys()`) cannot route to the stub.
+        let cp = crate::parse::CallPath::from_segments(["pyobject", "is_none"]);
+        assert!(
+            !callcontrol.function_graphs().contains_key(&cp),
+            "CallControl::function_graphs must NOT carry the unsafe stub path",
+        );
+        callcontrol.find_all_graphs_for_tests();
+        assert!(
+            !callcontrol.is_candidate(&cp),
+            "find_all_graphs must not pick up an unsafe-stub-only path",
+        );
+    }
+
+    #[test]
+    fn register_unsafe_fn_stubs_does_not_overwrite_existing_entries() {
+        // A path already registered via function_graphs (e.g. a safe fn
+        // wearing the same segments) must NOT be overwritten by a stub.
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::translator::rtyper::pyre_call_registry::PyreCallRegistry;
+        let bk = std::rc::Rc::new(Bookkeeper::new());
+        let registry = PyreCallRegistry::new(bk);
+        let key = FunctionPathKey::from_segments(["pyobject".to_string(), "shared".to_string()]);
+        let signature = Signature::new(vec!["x".to_string()], None, None);
+        let existing = registry.get_or_register(key.clone(), signature.clone());
+        let existing_host_id = existing.host_object.identity_id();
+        let specs = vec![(
+            vec!["pyobject".to_string(), "shared".to_string()],
+            signature,
+            LowLevelType::Bool,
+        )];
+        register_unsafe_fn_stubs(&registry, &specs);
+        assert_eq!(registry.len(), 1, "no new entry expected");
+        let after = registry.lookup(&key).expect("entry still present");
+        assert_eq!(
+            after.host_object.identity_id(),
+            existing_host_id,
+            "register_unsafe_fn_stubs must not replace an existing entry"
+        );
+    }
+
+    #[test]
+    fn build_stub_pygraph_returns_none_for_compound_lltype() {
+        // Compound lltypes have no representable default; the helper
+        // must return `None` so slice 3's caller skips registration.
+        let sig = Signature::new(vec!["x".to_string()], None, None);
+        let func_ll = LowLevelType::Func(Box::new(
+            crate::translator::rtyper::lltypesystem::lltype::FuncType {
+                args: vec![],
+                result: LowLevelType::Void,
+            },
+        ));
+        let result = build_stub_pygraph_for_unsafe_fn("synth".to_string(), sig, func_ll);
+        assert!(result.is_none(), "Func lltype must surface as None");
+    }
 }

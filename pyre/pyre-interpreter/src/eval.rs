@@ -909,6 +909,13 @@ fn eval_loop(frame: &mut PyFrame) -> PyResult {
         }
         let (opcode_pc, instruction, op_arg) = decode_instruction_for_dispatch(code, pc)?;
         let fallthrough = opcode_pc + 1;
+        // `decode_instruction_for_dispatch` absorbs any EXTENDED_ARG prefix
+        // units, so the real opcode may sit past `pc`.  Re-point `last_instr`
+        // at the opcode unit (`opcode_pc`) so a falling-through handler's
+        // `next_instr()` (= last_instr + 1) lands at `fallthrough` rather than
+        // re-dispatching the opcode unit that trailed an EXTENDED_ARG.
+        // Mirrors interp_jit.py dispatch (`set_last_instr_from_next_instr`).
+        frame.set_last_instr_from_next_instr(fallthrough);
         match execute_opcode_step(frame, code, instruction, op_arg, fallthrough) {
             Ok(StepResult::Continue)
             | Ok(StepResult::CloseLoop {
@@ -1385,6 +1392,16 @@ impl IterOpcodeHandler for PyFrame {
     /// PyPy: space.iter(w_iterable) → calls __iter__ or wraps in seq_iter.
     fn ensure_iter_value(&mut self, iter: Self::Value) -> Result<(), PyError> {
         unsafe {
+            // mappingproxy iterates over its backing dict's keys.
+            // dictproxyobject.py:41 descr_iter → space.iter(self.w_mapping).
+            let iter = if pyre_object::is_dict_proxy(iter) {
+                let mapping = pyre_object::w_dict_proxy_get_mapping(iter);
+                let tos = self.valuestackdepth - 1;
+                self.locals_w_mut()[tos] = mapping;
+                mapping
+            } else {
+                iter
+            };
             // Already an iterator
             if pyre_object::is_range_iter(iter)
                 || pyre_object::is_seq_iter(iter)
@@ -2172,7 +2189,9 @@ impl OpcodeStepExecutor for PyFrame {
     // ── FormatSimple (str(TOS)) ──
     fn format_simple(&mut self) -> Result<(), PyError> {
         let val = self.pop();
-        let s = unsafe { crate::py_str(val) };
+        // `f'{x}'` → `PyObject_Format(x, NULL)`; a user `__format__` is
+        // invoked with an empty spec, otherwise this is `str(value)`.
+        let s = crate::type_methods::format_value_dispatch(val, "")?;
         self.push(pyre_object::w_str_new(&s));
         Ok(())
     }
@@ -2181,20 +2200,18 @@ impl OpcodeStepExecutor for PyFrame {
     fn format_with_spec(&mut self) -> Result<(), PyError> {
         let spec = self.pop();
         let val = self.pop();
-        // `pypy/objspace/std/newformat.py format(value, spec)` — empty
-        // spec falls through to `space.str_w(space.str(value))`; a
-        // non-empty spec routes through the type's `__format__`.  Pyre
-        // shares the str.format spec parser at
-        // `type_methods::format_with_spec` so f-string `{n:08.3f}` and
-        // `"{:08.3f}".format(n)` produce identical output.
-        let s = unsafe {
-            if pyre_object::is_str(spec) && !pyre_object::w_str_get_value(spec).is_empty() {
-                let spec_str = pyre_object::w_str_get_value(spec).to_string();
-                crate::type_methods::format_with_spec_public(val, &spec_str)
+        // `PyObject_Format(value, spec)` — dispatch to a user-defined
+        // `__format__` when present, else apply the shared spec parser
+        // (empty spec → `str(value)`).  `type_methods::format_value_dispatch`
+        // keeps f-string `{n:08.3f}` and `"{:08.3f}".format(n)` identical.
+        let spec_str = unsafe {
+            if pyre_object::is_str(spec) {
+                pyre_object::w_str_get_value(spec).to_string()
             } else {
-                crate::py_str(val)
+                String::new()
             }
         };
+        let s = crate::type_methods::format_value_dispatch(val, &spec_str)?;
         self.push(pyre_object::w_str_new(&s));
         Ok(())
     }
@@ -2774,10 +2791,18 @@ impl OpcodeStepExecutor for PyFrame {
                         obj
                     }
                 }
-            } else if crate::typedef::r#type(obj).is_some() && !pyre_object::is_module(obj) {
+            } else if let Some(w_type) =
+                crate::typedef::r#type(obj).filter(|_| !pyre_object::is_module(obj))
+            {
                 // Builtin type method (list.append, etc.) found via TypeDef.
-                // PyPy: LOOKUP_METHOD binds self for builtin type methods.
-                obj
+                // PyPy: LOOKUP_METHOD binds self for builtin type methods,
+                // except staticmethods (str.maketrans) and classmethods
+                // (dict.fromkeys), which getattr already unwrapped above.
+                match crate::baseobjspace::lookup_in_type(w_type, name) {
+                    Some(d) if pyre_object::is_staticmethod(d) => PY_NULL,
+                    Some(d) if pyre_object::is_classmethod(d) => w_type,
+                    _ => obj,
+                }
             } else {
                 PY_NULL
             }
@@ -3124,7 +3149,9 @@ impl OpcodeStepExecutor for PyFrame {
             } else if pyre_object::is_list(value) {
                 pyre_object::w_list_items_copy_as_vec(value)
             } else {
-                return Err(PyError::type_error("cannot unpack non-sequence"));
+                // Any other iterable is materialised via the iteration
+                // protocol, matching `unpack_sequence_exact`'s fallback.
+                crate::builtins::collect_iterable(value)?
             }
         };
 

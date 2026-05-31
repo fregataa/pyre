@@ -409,9 +409,14 @@ fn remap_op_kind(
     remap_var: &impl Fn(&crate::flowspace::model::Variable) -> crate::flowspace::model::Variable,
 ) -> OpKind {
     match kind {
-        OpKind::Input { name, ty } => OpKind::Input {
+        OpKind::Input {
+            name,
+            ty,
+            class_root,
+        } => OpKind::Input {
             name: name.clone(),
             ty: ty.clone(),
+            class_root: class_root.clone(),
         },
         OpKind::ConstInt(v) => OpKind::ConstInt(*v),
         OpKind::ConstBool(v) => OpKind::ConstBool(*v),
@@ -784,6 +789,18 @@ fn remap_op_kind(
             result_kind: *result_kind,
         },
         OpKind::Abort { kind } => OpKind::Abort { kind: kind.clone() },
+        OpKind::NewTuple { args } => OpKind::NewTuple {
+            args: args.iter().map(&remap_var).collect(),
+        },
+        OpKind::LoadStatic {
+            segments,
+            ty,
+            value,
+        } => OpKind::LoadStatic {
+            segments: segments.clone(),
+            ty: ty.clone(),
+            value: value.clone(),
+        },
     }
 }
 
@@ -806,9 +823,11 @@ pub fn op_variable_refs(kind: &OpKind) -> Vec<crate::flowspace::model::Variable>
         | OpKind::CurrentTraceLength
         | OpKind::Live
         | OpKind::LoopHeader { .. }
-        | OpKind::Abort { .. } => {
+        | OpKind::Abort { .. }
+        | OpKind::LoadStatic { .. } => {
             vec![]
         }
+        OpKind::NewTuple { args } => args.iter().map(clone_var).collect(),
         OpKind::VableForce { base } => vec![clone_var(base)],
         OpKind::JitMergePoint {
             greens_i,
@@ -1042,7 +1061,13 @@ pub fn is_pure_op(kind: &OpKind) -> bool {
         | OpKind::VableArrayRead { .. }
         // Pure vtable slot read — `cast_pointer + getfield` chain
         // collapsed into one op (see `OpKind::VtableMethodPtr` doc).
-        | OpKind::VtableMethodPtr { .. } => true,
+        | OpKind::VtableMethodPtr { .. }
+        // `newtuple` is `PureOperation` (`operation.py:542-548`).
+        | OpKind::NewTuple { .. }
+        // `LoadStatic` reads a `static` declaration's compile-time
+        // address — equivalent to `LOAD_GLOBAL` → Constant lookup,
+        // pure.
+        | OpKind::LoadStatic { .. } => true,
         // Per-opname classification for `OpKind::BinOp` mirrors
         // `simplify.CanRemove` (`simplify.py:405-417`) +
         // `enum_ops_without_sideeffects()` for binary ops.  Pyre's
@@ -1362,6 +1387,7 @@ mod tests {
                 OpKind::Input {
                     name: "base".into(),
                     ty: ValueType::Ref(None),
+                    class_root: None,
                 },
                 true,
             )
@@ -1393,6 +1419,7 @@ mod tests {
                 OpKind::Input {
                     name: "base".into(),
                     ty: ValueType::Ref(None),
+                    class_root: None,
                 },
                 true,
             )
@@ -1479,6 +1506,7 @@ mod tests {
                 OpKind::Input {
                     name: "base".into(),
                     ty: ValueType::Ref(None),
+                    class_root: None,
                 },
                 true,
             )
@@ -1503,6 +1531,7 @@ mod tests {
                 OpKind::Input {
                     name: "x".into(),
                     ty: ValueType::Ref(None),
+                    class_root: None,
                 },
                 true,
             )
@@ -1557,6 +1586,7 @@ mod tests {
                 OpKind::Input {
                     name: "base".into(),
                     ty: ValueType::Ref(None),
+                    class_root: None,
                 },
                 true,
             )

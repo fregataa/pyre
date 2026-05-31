@@ -41,7 +41,7 @@ fn try_call_dunder(obj: PyObjectRef, name: &str) -> Option<String> {
 ///   - integral floats in the positional band → `"<n>.0"`
 ///   - magnitude < 1e-4 or >= 1e16 → `"{:e}"` with explicit sign
 ///   - otherwise → Rust's `Display` (`{}`)
-fn format_float_repr(val: f64) -> String {
+pub(crate) fn format_float_repr(val: f64) -> String {
     if val.is_nan() {
         return "nan".to_string();
     }
@@ -122,6 +122,46 @@ fn format_str_repr(s: &str) -> String {
     out
 }
 
+thread_local! {
+    /// Object pointers currently mid-`py_repr` on this thread.  Guards the
+    /// recursive container branches against unbounded recursion on a
+    /// reference cycle (a list holding itself, a dict valued by itself).
+    /// Mirrors the per-thread reprlist behind `Py_ReprEnter`/`Py_ReprLeave`.
+    static REPR_ACTIVE: std::cell::RefCell<Vec<usize>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// RAII cycle guard.  `enter` returns `None` when `obj` is already being
+/// repr'd on this thread — the caller emits the `...` placeholder — and
+/// otherwise records `obj`, removing it again when the guard drops.
+struct ReprGuard(usize);
+
+impl ReprGuard {
+    fn enter(obj: PyObjectRef) -> Option<ReprGuard> {
+        let key = obj as usize;
+        REPR_ACTIVE.with(|active| {
+            let mut active = active.borrow_mut();
+            if active.contains(&key) {
+                None
+            } else {
+                active.push(key);
+                Some(ReprGuard(key))
+            }
+        })
+    }
+}
+
+impl Drop for ReprGuard {
+    fn drop(&mut self) {
+        REPR_ACTIVE.with(|active| {
+            let mut active = active.borrow_mut();
+            if let Some(pos) = active.iter().rposition(|&k| k == self.0) {
+                active.remove(pos);
+            }
+        });
+    }
+}
+
 /// Format a PyObjectRef for debug display.
 ///
 /// # Safety
@@ -151,6 +191,9 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> String {
                 "False".to_string()
             }
         } else if std::ptr::eq(tp, &pyre_object::pyobject::LIST_TYPE as *const PyType) {
+            let Some(_guard) = ReprGuard::enter(obj) else {
+                return "[...]".to_string();
+            };
             let n = pyre_object::w_list_len(obj);
             let mut parts = Vec::with_capacity(n);
             for i in 0..n {
@@ -193,6 +236,9 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> String {
                     }
                 }
             }
+            let Some(_guard) = ReprGuard::enter(obj) else {
+                return "(...)".to_string();
+            };
             let n = pyre_object::w_tuple_len(obj);
             let mut parts = Vec::with_capacity(n);
             for i in 0..n {
@@ -212,12 +258,24 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> String {
             // `w_dict_items` already routes through `is_module_dict`,
             // so reach for the unified surface instead of casting
             // through the W_DictObject layout.
+            let Some(_guard) = ReprGuard::enter(obj) else {
+                return "{...}".to_string();
+            };
             let entries = pyre_object::w_dict_items(obj);
             let mut parts = Vec::with_capacity(entries.len());
             for (k, v) in entries {
                 parts.push(format!("{}: {}", py_repr(k), py_repr(v)));
             }
             format!("{{{}}}", parts.join(", "))
+        } else if pyre_object::sliceobject::is_slice(obj) {
+            // `pypy/objspace/std/sliceobject.py descr_repr` —
+            // `slice(%r, %r, %r)`.
+            format!(
+                "slice({}, {}, {})",
+                py_repr(pyre_object::sliceobject::w_slice_get_start(obj)),
+                py_repr(pyre_object::sliceobject::w_slice_get_stop(obj)),
+                py_repr(pyre_object::sliceobject::w_slice_get_step(obj)),
+            )
         } else if pyre_object::is_bytes_like(obj) {
             // `pypy/objspace/std/bytesobject.py W_BytesObject.descr_repr`
             // and `bytearrayobject.py W_BytearrayObject.descr_repr` —
@@ -251,9 +309,16 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> String {
             // → `'%s({%s})' % (typename, items_repr_joined)` for
             // frozenset and `'{%s}' % items_repr_joined` for set.  Empty
             // set keeps the `set()` constructor form.
+            let is_frozen = pyre_object::is_frozenset(obj);
+            let Some(_guard) = ReprGuard::enter(obj) else {
+                return if is_frozen {
+                    "frozenset(...)".to_string()
+                } else {
+                    "set(...)".to_string()
+                };
+            };
             let items = pyre_object::w_set_items(obj);
             let parts: Vec<String> = items.iter().map(|&v| py_repr(v)).collect();
-            let is_frozen = pyre_object::is_frozenset(obj);
             if items.is_empty() {
                 if is_frozen {
                     "frozenset()".to_string()
@@ -475,6 +540,20 @@ pub unsafe fn py_str(obj: PyObjectRef) -> String {
                 }
                 pyre_object::excobject::ExcKind::UnicodeEncodeError => {
                     return unicode_encode_error_str(obj);
+                }
+                // `interp_exceptions.py:540-548 W_KeyError.descr_str` —
+                // a single-argument KeyError stringifies as `repr(args[0])`
+                // so `str(KeyError('k'))` is `"'k'"`; with any other arg
+                // count it falls back to `W_BaseException.descr_str` below.
+                pyre_object::excobject::ExcKind::KeyError => {
+                    let args = pyre_object::excobject::w_exception_get_args(obj);
+                    if !args.is_null()
+                        && pyre_object::is_tuple(args)
+                        && pyre_object::w_tuple_len(args) == 1
+                    {
+                        let first = pyre_object::w_tuple_getitem(args, 0).unwrap_or(args);
+                        return py_repr(first);
+                    }
                 }
                 _ => {}
             }

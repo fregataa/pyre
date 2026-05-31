@@ -1959,6 +1959,163 @@ impl HostEnv {
         // llmemory.weakref_create at the rtyper level.
         let weakref_mod = HostObject::new_module("weakref");
         weakref_mod.module_set("ref", HostObject::new_builtin_callable("weakref.ref"));
+        // Z2.5 Path C tail — Rust std lib module-qualified entry points
+        // referenced by pyre-object / pyre-interpreter callsites
+        // (`std::ptr::null_mut`, `std::ptr::copy_nonoverlapping`,
+        // `std::mem::align_of`, `std::alloc::dealloc`).  Branch 3b of
+        // `flowspace_adapter::translate_op` resolves
+        // `["std", "ptr", "null_mut"]` by joining `segments[..-1]` with
+        // `.` (→ `"std.ptr"`) and calling
+        // `HOST_ENV.import_module("std.ptr").module_get("null_mut")`,
+        // so the module key matches the join shape.  No analyzer hook
+        // attached — the callable surface is sufficient to close the
+        // registry-Skip path; downstream type lowering for these
+        // intrinsics still routes through the M2.5g extern-Rust-helper
+        // walker when it lands.
+        let std_ptr = HostObject::new_module("std.ptr");
+        std_ptr.module_set(
+            "null_mut",
+            HostObject::new_builtin_callable("std.ptr.null_mut"),
+        );
+        std_ptr.module_set("eq", HostObject::new_builtin_callable("std.ptr.eq"));
+        std_ptr.module_set(
+            "copy_nonoverlapping",
+            HostObject::new_builtin_callable("std.ptr.copy_nonoverlapping"),
+        );
+        let std_mem = HostObject::new_module("std.mem");
+        std_mem.module_set(
+            "align_of",
+            HostObject::new_builtin_callable("std.mem.align_of"),
+        );
+        std_mem.module_set(
+            "size_of",
+            HostObject::new_builtin_callable("std.mem.size_of"),
+        );
+        let std_alloc = HostObject::new_module("std.alloc");
+        std_alloc.module_set(
+            "dealloc",
+            HostObject::new_builtin_callable("std.alloc.dealloc"),
+        );
+        // `std::slice::from_raw_parts(p, len)` and `_mut` — raw-pointer
+        // -> slice constructors called from pyre-object string / bytes
+        // helpers when packing a `*const u8` + `usize` into a `&[u8]`
+        // (`pyre_object::strobject::w_str_new_from_bytes`, etc.).  No
+        // analyzer needed today: the registry surface is enough to
+        // retire the Skip; the rtyper-side lowering still routes
+        // through the M2.5g extern-Rust-helper walker once that lands.
+        let std_slice = HostObject::new_module("std.slice");
+        std_slice.module_set(
+            "from_raw_parts",
+            HostObject::new_builtin_callable("std.slice.from_raw_parts"),
+        );
+        std_slice.module_set(
+            "from_raw_parts_mut",
+            HostObject::new_builtin_callable("std.slice.from_raw_parts_mut"),
+        );
+
+        // `BigInt::from(v)` callsites in `pyre-object` (longobject /
+        // tupleobject etc.) emit `["BigInt", "from"]` as the canonical
+        // call target.  Surface this as a module-shaped entry so
+        // Branch 3b in `flowspace_adapter::translate_op` resolves the
+        // 2-segment callsite verbatim; the analyzer doesn't model
+        // arbitrary-precision arithmetic, but the registry surface is
+        // enough to retire the Skip path.
+        let bigint = HostObject::new_module("BigInt");
+        bigint.module_set("from", HostObject::new_builtin_callable("BigInt.from"));
+
+        // Rust primitive type conversion impls (`u32::from`,
+        // `i64::from`, `i64::try_from`, `usize::try_from`) — callsites
+        // emit `[primitive, method]` 2-segment paths.  Each impl
+        // returns an integer; a shared `SomeInteger` analyzer covers
+        // all conversion variants.
+        let primitive_u32 = HostObject::new_module("u32");
+        primitive_u32.module_set("from", HostObject::new_builtin_callable("u32.from"));
+        let primitive_i64 = HostObject::new_module("i64");
+        primitive_i64.module_set("from", HostObject::new_builtin_callable("i64.from"));
+        primitive_i64.module_set("try_from", HostObject::new_builtin_callable("i64.try_from"));
+        let primitive_usize = HostObject::new_module("usize");
+        primitive_usize.module_set(
+            "try_from",
+            HostObject::new_builtin_callable("usize.try_from"),
+        );
+
+        // External crate `majit_metainterp` helpers called from pyre
+        // source via `use majit_metainterp::{majit_log_enabled, ...}`.
+        // The two-segment callsites `["majit_metainterp",
+        // "majit_log_enabled"]` and the three-segment
+        // `["majit_metainterp", "jit", "we_are_jitted"]` both lower to
+        // `pub fn -> bool` flag checks that are compile-time constant
+        // outside the JIT context.  Register HOST_ENV stubs +
+        // analyzers (`builtin.rs`) so the registry resolution +
+        // `SomeBuiltin.call` dispatch both succeed.
+        let majit_metainterp = HostObject::new_module("majit_metainterp");
+        majit_metainterp.module_set(
+            "majit_log_enabled",
+            HostObject::new_builtin_callable("majit_metainterp.majit_log_enabled"),
+        );
+        let majit_metainterp_jit = HostObject::new_module("majit_metainterp.jit");
+        majit_metainterp_jit.module_set(
+            "we_are_jitted",
+            HostObject::new_builtin_callable("majit_metainterp.jit.we_are_jitted"),
+        );
+
+        // Container constructors emitted as `[Type, "new"]` 2-segment
+        // FunctionPath callsites by pyre-source helpers.  Same shape
+        // as the `std.slice`/`BigInt` stubs above: surface a module
+        // named after the type with a builtin-callable for each
+        // associated function so Branch 3b in
+        // `flowspace_adapter::translate_op` resolves the path.  No
+        // analyzer is wired today; the rtyper-side lowering still
+        // routes through the M2.5g extern-Rust-helper walker once
+        // that lands.
+        let box_ty = HostObject::new_module("Box");
+        box_ty.module_set("new", HostObject::new_builtin_callable("Box.new"));
+        box_ty.module_set("into_raw", HostObject::new_builtin_callable("Box.into_raw"));
+        let vec_ty = HostObject::new_module("Vec");
+        vec_ty.module_set("new", HostObject::new_builtin_callable("Vec.new"));
+        let string_ty = HostObject::new_module("String");
+        string_ty.module_set("new", HostObject::new_builtin_callable("String.new"));
+        string_ty.module_set(
+            "with_capacity",
+            HostObject::new_builtin_callable("String.with_capacity"),
+        );
+
+        // 3- and 4-segment paths: `indexmap::IndexMap::new` and
+        // `std::collections::HashMap::new`.  Branch 3b joins
+        // `segments[..len-1]` with `.` and queries
+        // `HOST_ENV.import_module(...)`, so register the module under
+        // the dotted prefix (`indexmap.IndexMap`,
+        // `std.collections.HashMap`).
+        let indexmap_indexmap = HostObject::new_module("indexmap.IndexMap");
+        indexmap_indexmap.module_set(
+            "new",
+            HostObject::new_builtin_callable("indexmap.IndexMap.new"),
+        );
+        let std_collections_hashmap = HostObject::new_module("std.collections.HashMap");
+        std_collections_hashmap.module_set(
+            "new",
+            HostObject::new_builtin_callable("std.collections.HashMap.new"),
+        );
+
+        // Pyre-internal type ctors emitted as 2-segment paths.
+        // `FrameDebugData::new` from `pyframe::PyFrame::getorcreate_debug_data`;
+        // `RootScope::new` from `gc_roots::push_roots`.
+        let frame_debug_data = HostObject::new_module("FrameDebugData");
+        frame_debug_data.module_set(
+            "new",
+            HostObject::new_builtin_callable("FrameDebugData.new"),
+        );
+        let root_scope = HostObject::new_module("RootScope");
+        root_scope.module_set("new", HostObject::new_builtin_callable("RootScope.new"));
+
+        // `pyre_object::int_array::IntArray::from_vec(Vec<i64>)` packs
+        // a `Vec` into an `IntArray` and is called from
+        // `pyre_object::listobject` list-strategy paths.
+        let int_array = HostObject::new_module("IntArray");
+        int_array.module_set(
+            "from_vec",
+            HostObject::new_builtin_callable("IntArray.from_vec"),
+        );
 
         let mut mods = self.modules.lock().unwrap();
         mods.insert("__builtin__".into(), self.builtin_module.clone());
@@ -1971,6 +2128,24 @@ impl HostEnv {
         mods.insert("rpython.rtyper.lltypesystem.lltype".into(), lltype);
         mods.insert("rpython.rtyper.lltypesystem.llmemory".into(), llmemory);
         mods.insert("weakref".into(), weakref_mod);
+        mods.insert("std.ptr".into(), std_ptr);
+        mods.insert("std.mem".into(), std_mem);
+        mods.insert("std.alloc".into(), std_alloc);
+        mods.insert("std.slice".into(), std_slice);
+        mods.insert("BigInt".into(), bigint);
+        mods.insert("majit_metainterp".into(), majit_metainterp);
+        mods.insert("majit_metainterp.jit".into(), majit_metainterp_jit);
+        mods.insert("u32".into(), primitive_u32);
+        mods.insert("i64".into(), primitive_i64);
+        mods.insert("usize".into(), primitive_usize);
+        mods.insert("Box".into(), box_ty);
+        mods.insert("Vec".into(), vec_ty);
+        mods.insert("String".into(), string_ty);
+        mods.insert("indexmap.IndexMap".into(), indexmap_indexmap);
+        mods.insert("std.collections.HashMap".into(), std_collections_hashmap);
+        mods.insert("FrameDebugData".into(), frame_debug_data);
+        mods.insert("RootScope".into(), root_scope);
+        mods.insert("IntArray".into(), int_array);
     }
 
     /// upstream `getattr(__builtin__, name)` — `flowcontext.py:851`.

@@ -431,6 +431,18 @@ pub enum OpKind {
     Input {
         name: String,
         ty: ValueType,
+        /// Optional class identity for `Ref`-typed parameters carried
+        /// from the front-end's `syn::Type` projection.  Mirrors how
+        /// PyPy's annotator routes typed `&Foo` through
+        /// `bookkeeper.getuniqueclassdef` (`description.py:283-305
+        /// FunctionDesc.pycall`) so the rtyper's `find_attribute`
+        /// (`rclass.py:556`) lands on the actual `ClassDef`.  Populated
+        /// from the leaf segment of `type_root_ident` at
+        /// `build_function_graph` (front/ast.rs:2107-2184) when the
+        /// param's `ValueType` is `Ref(_)` and the leaf matches a known
+        /// struct in `program.struct_fields`; otherwise `None`.  Non-
+        /// `Ref` params (Int, Float, Bool, Void) always have `None`.
+        class_root: Option<String>,
     },
     ConstInt(i64),
     /// RPython `flowmodel.py:Constant(bool_value)` — a bool constant
@@ -887,6 +899,61 @@ pub enum OpKind {
     /// by `FlowingError::Unsupported` (`front/ast.rs:53`).
     Abort {
         kind: UnknownKind,
+    },
+
+    /// RPython `BUILD_TUPLE` (`flowspace/flowcontext.py:1163`) /
+    /// `newtuple` operation (`operation.py:542-548`).  Constructs a
+    /// new tuple from N element values; the result is a fresh tuple
+    /// object distinct from any individual element.  Emitted by
+    /// `front/ast.rs::lower_expr` for `syn::Expr::Tuple` in place of
+    /// the prior `Abort { UnsupportedExpr::Tuple }` marker.
+    NewTuple {
+        args: Vec<crate::flowspace::model::Variable>,
+    },
+
+    /// Single-segment `Expr::Path` resolving to a crate-local `static`
+    /// declaration (typically a SHOUTY_CASE constant like
+    /// `GC_WEAKREF_TYPE`, `INT_TYPE`, `MODULE_DICT_TYPE`).  Emitted by
+    /// `front/ast.rs::lower_expr` for `syn::Expr::Path` whose joined
+    /// `name` is present in `ctx.known_statics` (populated from
+    /// `CallControl.static_decls`).
+    ///
+    /// RPython parity: `flowspace/flowcontext.py:LOAD_GLOBAL` lifts a
+    /// module-scope name lookup to a `Constant(value)` whose payload
+    /// is the resolved object (`flowspace/flowcontext.py:1098`); the
+    /// annotator binds the result via `unionof(s_Constant)` without
+    /// emitting a SpaceOperation (the bound `Variable` *is* the
+    /// graph-level definition).  Pyre's adapter emits a placeholder
+    /// `same_as` SpaceOperation whose first arg is the static's
+    /// declared `Hlvalue::Constant` so checkgraph's defining-var
+    /// set includes the producer (this differs from PyPy where
+    /// `LOAD_GLOBAL` returns a Constant Hlvalue directly and no
+    /// SpaceOperation is needed — pyre's frontend always emits an
+    /// op so cross-block reads have a defined producer).
+    ///
+    /// PRE-EXISTING-ADAPTATION: RPython has no concept of a
+    /// "static at a crate path" — it has module-global Python names
+    /// looked up by `LOAD_GLOBAL`.  The `segments` field carries the
+    /// fully-qualified path (`["module_path", "STATIC_NAME"]`)
+    /// matching the upstream lookup key shape.
+    ///
+    /// Slice C — `value` carries the literal-evaluated initializer
+    /// when `extract_static_decls` could fold the RHS to a
+    /// `ConstValue` (bool/int/float/string literals, including the
+    /// `-LIT` unary-neg shape and the `thread_local!` `const { LIT }`
+    /// wrapper).  `Some(v)` reaches the flowspace adapter as the
+    /// concrete `Constant(v)` operand of the synthetic `same_as` op,
+    /// matching PyPy `LOAD_GLOBAL` (`flowcontext.py:856`) pushing the
+    /// resolved object.  `None` retains the legacy `UniStr(joined)`
+    /// sentinel for non-literal RHS (host calls, struct ctors,
+    /// `LazyLock::new(...)`, `std::ptr::null_mut()`, etc.); those
+    /// still surface as the `same_as/>i` / `same_as/>r` unwired
+    /// snapshot entry in `default_bh_builder_unwired_set_matches_
+    /// task_85_snapshot` pending host-evaluator infrastructure.
+    LoadStatic {
+        segments: Vec<String>,
+        ty: ValueType,
+        value: Option<crate::flowspace::model::ConstValue>,
     },
 }
 
@@ -2590,6 +2657,17 @@ fn ptr_gckind(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FunctionGraph {
     pub name: String,
+    /// Impl-block self-type root for graphs produced from `impl <T> { fn m(&self, ...) }`.
+    /// Mirrors PyPy's `graph.func.im_class` access (the bound-method's class
+    /// reference): RPython lifts `self` as `SomeInstance(getuniqueclassdef(im_class))`
+    /// at `description.py:283-305 FunctionDesc.pycall`, then the rtyper resolves
+    /// `self.<field>` against that ClassDef.  Pyre's per-graph
+    /// `derive_subject_inputcells` (`flowspace_adapter.rs:1388`) uses this field
+    /// to project the receiver inputarg as `SomeInstance(Some(classdef))` instead
+    /// of the abstract `SomeInstance(None)` shell that `valuetype_to_someshell(Ref)`
+    /// yields when no class hint is available.  `None` for free functions and
+    /// synthetic test-fixture graphs.
+    pub owner_root: Option<String>,
     pub startblock: BlockId,
     /// RPython `flowspace/model.py:17-18 FunctionGraph.returnblock` —
     /// `Block([return_var])` with `operations=()` and `exits=()`.
@@ -2742,6 +2820,7 @@ impl FunctionGraph {
             variable_to_vid,
             return_type: None,
             source_module: None,
+            owner_root: None,
         }
     }
 
@@ -2764,6 +2843,17 @@ impl FunctionGraph {
     /// resolution (`flowspace_adapter.rs::translate_op` Layer 3).
     pub fn with_source_module(mut self, mp: impl Into<String>) -> Self {
         self.source_module = Some(mp.into());
+        self
+    }
+
+    /// Builder-style setter for `owner_root` — the impl-block self-type
+    /// root for graphs produced from `impl <T> { fn m(&self, ...) }`.
+    /// Front-end production paths set this from `impl_block.self_ty`
+    /// (`front/ast.rs::build_function_graph` callers pass `self_ty_root`);
+    /// `derive_subject_inputcells` consults it to project the receiver
+    /// inputarg as `SomeInstance(Some(getuniqueclassdef(im_class)))`.
+    pub fn with_owner_root(mut self, owner: impl Into<String>) -> Self {
+        self.owner_root = Some(owner.into());
         self
     }
 
@@ -2974,17 +3064,21 @@ impl FunctionGraph {
     /// missing colors.
     pub(crate) fn bind_variable_at(&mut self, idx: usize, var: crate::flowspace::model::Variable) {
         if idx >= self.value_variables.len() {
+            let old_len = self.value_variables.len();
             self.value_variables.resize_with(idx + 1, || {
                 let placeholder = crate::flowspace::model::Variable::new();
                 Some(placeholder)
             });
-            // Re-register the placeholders that just got minted so
-            // `slot_of` lookups against them still succeed.
-            for (slot_idx, slot) in self.value_variables.iter().enumerate() {
-                if let Some(placeholder) = slot {
-                    self.variable_to_vid
-                        .entry(placeholder.id())
-                        .or_insert(slot_idx);
+            // Register only the placeholders that were just minted —
+            // pre-existing slots already have their `variable_to_vid`
+            // entry from the original allocation site, so the prior
+            // full-vec walk repeated O(n) work per resize call without
+            // changing any pre-existing mapping (the `entry().or_insert`
+            // shape made the rescan a no-op for older slots but still
+            // touched every slot every time).
+            for slot_idx in old_len..self.value_variables.len() {
+                if let Some(placeholder) = &self.value_variables[slot_idx] {
+                    self.variable_to_vid.insert(placeholder.id(), slot_idx);
                 }
             }
             // Keep the allocator cursor past any slot reserved here so
@@ -3619,6 +3713,7 @@ impl FunctionGraph {
                 OpKind::Input {
                     name,
                     ty: ValueType::Unknown,
+                    class_root: None,
                 },
                 var.clone(),
             );
@@ -4031,6 +4126,7 @@ mod tests {
                 OpKind::Input {
                     name: "x".into(),
                     ty: ValueType::Int,
+                    class_root: None,
                 },
                 true,
             )
@@ -4071,6 +4167,7 @@ mod tests {
                 OpKind::Input {
                     name: "x".into(),
                     ty: ValueType::Int,
+                    class_root: None,
                 },
                 true,
             )
@@ -4097,6 +4194,7 @@ mod tests {
                 OpKind::Input {
                     name: "cond".into(),
                     ty: ValueType::Int,
+                    class_root: None,
                 },
                 true,
             )
@@ -4194,6 +4292,7 @@ mod tests {
                 OpKind::Input {
                     name: name.to_string(),
                     ty: ValueType::Int,
+                    class_root: None,
                 },
                 true,
             )
@@ -4384,6 +4483,7 @@ mod tests {
                 OpKind::Input {
                     name: "param".into(),
                     ty: ValueType::Int,
+                    class_root: None,
                 },
                 true,
             )
@@ -4498,6 +4598,7 @@ mod tests {
                 OpKind::Input {
                     name: "captured".into(),
                     ty: ValueType::Ref(None),
+                    class_root: None,
                 },
                 true,
             )
@@ -4896,6 +4997,7 @@ mod tests {
             OpKind::Input {
                 name: "x".to_string(),
                 ty: ValueType::Unknown,
+                class_root: None,
             },
             true,
         );
@@ -4952,6 +5054,7 @@ mod tests {
             OpKind::Input {
                 name: "p".to_string(),
                 ty: ValueType::Unknown,
+                class_root: None,
             },
             true,
         );
@@ -4996,6 +5099,7 @@ mod tests {
             OpKind::Input {
                 name: "p".to_string(),
                 ty: ValueType::Unknown,
+                class_root: None,
             },
             true,
         );
@@ -5042,6 +5146,7 @@ mod tests {
             OpKind::Input {
                 name: "p".to_string(),
                 ty: ValueType::Unknown,
+                class_root: None,
             },
             true,
         );

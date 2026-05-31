@@ -381,7 +381,23 @@ fn free_function_alias_paths(name: &str, source_module: &str) -> Vec<crate::pars
     }
     let name_segs_prefix: Vec<&str> = name.split("::").collect();
     let mod_segs_prefix: Vec<&str> = source_module.split("::").collect();
-    if !source_module.is_empty() && !name_segs_prefix.starts_with(&mod_segs_prefix) {
+    // The starts_with check is meant to skip the module-qualified loop
+    // when `name` already carries the module prefix (e.g. a nested
+    // `mod foo { fn bar() }` whose `sf.name` is set to "foo::bar"
+    // before the module stamp at `front/ast.rs:1669-1676`).  Without
+    // the length-strict guard, a function whose bare leaf happens to
+    // equal its containing module's name (`pyre-interpreter/src/
+    // stack_check.rs` `pub fn stack_check`) collides — its single-
+    // segment name "stack_check" `starts_with` ["stack_check"] is
+    // true, so the loop is skipped and the
+    // `["module", "name"]` / `["crate", "module", "name"]` / aliased
+    // spellings never get registered, leaving every call site that
+    // writes `crate::stack_check::stack_check` looking for an
+    // unregistered path.  Require `name` to be STRICTLY LONGER than
+    // `module` to count as already-prefixed.
+    let name_already_prefixed = name_segs_prefix.len() > mod_segs_prefix.len()
+        && name_segs_prefix.starts_with(&mod_segs_prefix);
+    if !source_module.is_empty() && !name_already_prefixed {
         let module_segs: Vec<&str> = source_module.split("::").collect();
         let mut module_qualified_segs: Vec<&str> = module_segs.clone();
         module_qualified_segs.extend(segments.iter().copied());
@@ -412,6 +428,38 @@ fn analyze_pipeline_from_parsed(
     fnaddr_bindings: &FnAddrBindings<'_>,
     impl_fnaddr_bindings: &ImplFnAddrBindings<'_>,
 ) -> pipeline::ProgramPipelineResult {
+    let profile = std::env::var_os("PYRE_PROFILE_PIPELINE").is_some();
+    let phase_start = std::time::Instant::now();
+    let mut last = phase_start;
+    macro_rules! mark_phase {
+        ($name:literal) => {{
+            #[allow(unused_assignments)]
+            if profile {
+                let now = std::time::Instant::now();
+                eprintln!(
+                    "[PYRE_PROFILE_PIPELINE] {:>9.3}s  {:>9.3}s  {}",
+                    (now - phase_start).as_secs_f64(),
+                    (now - last).as_secs_f64(),
+                    $name,
+                );
+                last = now;
+            }
+        }};
+    }
+    mark_phase!("entry");
+    // Install the cross-file type-alias floor before any walker pass
+    // runs.  The floor is the union of every parsed file's top-level
+    // `type T = U;` declarations; it stays visible across the per-file
+    // walker calls that happen later in the pipeline (lazy
+    // `Translation::from_rust_*` creation).  Mirrors PyPy
+    // `Bookkeeper`'s whole-program import-resolution map — a struct
+    // field declared as `field: PyObjectRef` in `pyframe.rs` resolves
+    // through the alias declared in `pyobject.rs` regardless of
+    // walker iteration order.
+    let _walker_alias_floor =
+        crate::flowspace::rust_source::register::WalkerAliasFloorGuard::install(
+            parsed_files.iter().map(|p| &p.file),
+        );
     // Use-import resolver: harvest `(bare_name → defining_module_path)`
     // from every `ParsedInterpreter.module_path` non-empty entry, then
     // publish into the `majit_ir::descr::STRUCT_ORIGIN_REGISTRY` global
@@ -432,6 +480,51 @@ fn analyze_pipeline_from_parsed(
         }
     }
     majit_ir::descr::register_struct_origins(struct_origins);
+    // Codewriter-side static catalogue.  Collected here so it can be
+    // installed on `CallControl.static_decls` further down for the
+    // adapter consumer.  The front-end `Expr::Path` arm receives the
+    // same data through `KnownStaticsCatalogue` constructed inside
+    // `build_semantic_program_from_parsed_files_with_options`.
+    let early_static_decls: Vec<(
+        Vec<String>,
+        crate::model::ValueType,
+        Option<crate::flowspace::model::ConstValue>,
+    )> = parsed_files
+        .iter()
+        .flat_map(|parsed| {
+            crate::flowspace::rust_source::register::extract_static_decls(
+                &parsed.file,
+                &parsed.module_path,
+            )
+        })
+        .collect();
+    // `use <path>::*` glob roots are expanded into explicit
+    // `use_imports` entries inside
+    // `build_semantic_program_*_with_options` so the front-end
+    // `Expr::Path` arm resolves glob-imported bare names through the
+    // primary `use_imports` lookup without a separate fallback.
+    // Diagnostic pre-pass — populate
+    // `FORCE_ATTRIBUTES_INTO_CLASSES` (classdesc.py:957-961) from each
+    // `parsed_files` entry's top-level structs so
+    // `ClassDesc::_init_classdef` can pre-fill `ClassDef.attrs` *before*
+    // the annotator's narrowing gate at
+    // `flowspace_adapter.rs::derive_subject_inputcells` checks
+    // `attrs_populated`.  Production never drives the walker (only
+    // `extract_static_decls` and `extract_unsafe_fn_stubs` are called
+    // from `register`), which left the dict empty for parsed-only
+    // structs and forced every impl-method `self` to carry
+    // `SomeInstance(classdef=None)`.  Empty `module_path` files (test
+    // fixtures) skip; their structs are registered through the bare-
+    // leaf walker path when the fixture explicitly calls
+    // `register_rust_module_at_with_source`.
+    for parsed in parsed_files {
+        if !parsed.module_path.is_empty() {
+            crate::flowspace::rust_source::register::pre_register_struct_fields_from_file(
+                &parsed.file,
+                "",
+            );
+        }
+    }
     // RPython `translator/translator.py:55 buildflowgraph` — FlowingError
     // propagates out and translation halts.  Pyre's top-level analyzer
     // requires a complete program; a FlowingError here means a user-
@@ -439,8 +532,10 @@ fn analyze_pipeline_from_parsed(
     // the correct response is to abort loudly so the coverage audit
     // surfaces the unsupported expression rather than silently dropping
     // a graph.
+    mark_phase!("known_statics + struct_origins + struct_field_attrs populated");
     let program = front::build_semantic_program_from_parsed_files(parsed_files)
         .expect("pyre-interpreter source must lower without FlowingError");
+    mark_phase!("build_semantic_program_from_parsed_files");
     let mut canonical_trait_impls = Vec::new();
     let mut canonical_inherent_methods = Vec::new();
     let mut canonical_function_graphs = std::collections::HashMap::new();
@@ -486,6 +581,31 @@ fn analyze_pipeline_from_parsed(
     // RPython: use the rtyped graphs (with concretetype info) for all analysis.
     // Use program.functions' graphs which were built with full struct_fields
     // context, NOT re-parsed graphs (which lose array_type_id etc.).
+    // Build the `pub use <src>::*` re-export index:
+    // `globbed_source_path -> [importing_module_path, ...]`.  For each
+    // file that does `pub use crate::M::*;`, M (as `::`-joined string)
+    // maps to that file's `module_path`, so a function defined in M
+    // also becomes callable under the importing module's namespace
+    // (and through the full set of crate-alias spellings the alias
+    // generator emits).  Mirrors Rust's resolution of `crate::
+    // ImportingMod::name` through the re-export; without this fan-out
+    // the registry would only carry the original `M::name` aliases
+    // and `crate::ImportingMod::name` would fail to resolve.
+    let mut glob_reexports: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for parsed in parsed_files {
+        if parsed.module_path.is_empty() || parsed.pub_use_globs.is_empty() {
+            continue;
+        }
+        for source_segments in &parsed.pub_use_globs {
+            let source_key = source_segments.join("::");
+            glob_reexports
+                .entry(source_key)
+                .or_default()
+                .push(parsed.module_path.clone());
+        }
+    }
+
     for func in &program.functions {
         if func.self_ty_root.is_none() {
             // Stamp the source return type onto the graph so the JIT
@@ -512,6 +632,40 @@ fn analyze_pipeline_from_parsed(
                     &func.name,
                     &graph,
                 );
+            }
+            // Additional alias spellings for `pub use crate::<func
+            // module>::*;` re-exports — without this, a caller that
+            // writes `crate::ImportingMod::func` (resolved through the
+            // Rust-side glob re-export) finds no registered graph
+            // because `free_function_alias_paths` only fans out under
+            // the function's own module.
+            if let Some(importing_modules) = glob_reexports.get(&func.module_path) {
+                // Use just the function's leaf name (without module
+                // prefix) so the re-export aliases mirror what the
+                // alias generator would emit for a function natively
+                // defined in `importing_module`.
+                let leaf = func
+                    .name
+                    .rsplit("::")
+                    .next()
+                    .unwrap_or(&func.name)
+                    .to_string();
+                for importing_module in importing_modules {
+                    let synthetic_name = if importing_module.is_empty() {
+                        leaf.clone()
+                    } else {
+                        format!("{importing_module}::{leaf}")
+                    };
+                    for path in free_function_alias_paths(&synthetic_name, importing_module) {
+                        register_function_graph_alias(
+                            &mut canonical_function_graphs,
+                            &mut canonical_function_alias_source,
+                            path,
+                            &func.name,
+                            &graph,
+                        );
+                    }
+                }
             }
         }
     }
@@ -571,6 +725,37 @@ fn analyze_pipeline_from_parsed(
         }
     }
     call_control.use_imports = use_imports_agg;
+    // Z2.5 Path C — populate the metadata-only `unsafe_fn_stubs`
+    // carrier so the codewriter's `dual_gate_registry` can register
+    // every `unsafe fn` / unsafe impl-method as a stub-pygraph entry
+    // in PyreCallRegistry.  Walks each parsed source file under its
+    // crate-stripped `module_path` prefix, dropping unsafe fns whose
+    // return type the slice 3a projection cannot represent (see
+    // `flowspace::rust_source::register::simple_return_type_to_lltype`).
+    // Closes the bulk of the "not registered in PyreCallRegistry"
+    // Skip cluster (218 events at 2026-05-22 measurement) dominated
+    // by `pyre_object::is_*` predicates whose body lowering is
+    // intentionally rejected at `build_flow.rs:215`.
+    let mut unsafe_stubs: Vec<(
+        Vec<String>,
+        crate::flowspace::argument::Signature,
+        crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+    )> = Vec::new();
+    for parsed in parsed_files {
+        unsafe_stubs.extend(
+            crate::flowspace::rust_source::register::extract_unsafe_fn_stubs(
+                &parsed.file,
+                &parsed.module_path,
+            ),
+        );
+    }
+    call_control.unsafe_fn_stubs = unsafe_stubs;
+    // Codewriter-side mirror of the static catalogue.  Same
+    // `(segments, ty)` shape that
+    // [`KnownStaticsCatalogue::from_parsed_files`] feeds to the
+    // front-end's `Expr::Path` lookup; reusing the
+    // `early_static_decls` walk avoids a second pass.
+    call_control.static_decls = early_static_decls;
     // Populate CallControl with layouts from the provider.
     for struct_name in program.struct_fields.fields.keys() {
         if let Some(layout) = provider.get_struct_layout(struct_name) {
@@ -923,11 +1108,17 @@ fn analyze_pipeline_from_parsed(
     // tests feed the full Phase D0 source set the fallback is never
     // exercised and the eval_loop_jit-only identity locks in.
     let default_portal_name = {
-        let eval_loop_jit_path = parse::CallPath::from_segments(["eval_loop_jit"]);
-        if call_control
-            .function_graphs()
-            .contains_key(&eval_loop_jit_path)
-        {
+        // Tolerate module-qualified registrations: `eval_loop_jit` may
+        // land under `["eval", "eval_loop_jit"]` when its file
+        // (`pyre-jit/src/eval.rs`) was parsed with `module_path =
+        // "eval"`.  Suffix-match on the leaf segment covers both shapes.
+        let has_leaf = |leaf: &str| {
+            call_control
+                .function_graphs()
+                .keys()
+                .any(|k| k.segments.last().map(|s| s == leaf).unwrap_or(false))
+        };
+        if has_leaf("eval_loop_jit") {
             "eval_loop_jit"
         } else {
             "execute_opcode_step"
@@ -960,7 +1151,85 @@ fn analyze_pipeline_from_parsed(
                 vec!["PyFrame".to_string(), "ExecutionContext".to_string()],
             ),
         };
-    let portal = parse::CallPath::from_segments([portal_name.as_str()]);
+    // Resolve the portal `CallPath` tolerantly so the lookup hits
+    // regardless of how `build_graphs_from_items` qualifies the
+    // function's name.  Free functions registered with a non-empty
+    // `parsed.module_path` land under `["module", "name"]` (e.g.
+    // `["pyopcode", "execute_opcode_step"]`); a bare-leaf alias
+    // (`["execute_opcode_step"]`) is also published for cross-module
+    // bare callsites (`lib.rs:432-448`).  Prefer the module-qualified
+    // canonical key over the bare alias so production parity with
+    // `module_path!()` semantics — and downstream tests asserting
+    // `by_path.contains_key(&["module", "name"])` — match the JitCode
+    // registration shape.  Selection order:
+    //  1. module-qualified key whose leaf matches the portal name and
+    //     is NOT `crate`-prefixed (multi-segment, source-of-truth);
+    //  2. bare leaf (legacy empty-`module_path` fixtures);
+    //  3. any remaining suffix-match (last-resort fallback).
+    let portal = {
+        let bare = parse::CallPath::from_segments([portal_name.as_str()]);
+        let leaf_matches = |k: &&parse::CallPath| {
+            k.segments
+                .last()
+                .map(|s| s == portal_name.as_str())
+                .unwrap_or(false)
+        };
+        // Prefer the shortest qualified path among aliases — the
+        // canonical `[module, name]` shape (length 2) over the
+        // `[crate_alias, module, name]` shape (length 3+).  HashMap
+        // iteration order is non-deterministic, so `find()` without
+        // tie-breaking would silently flip between aliases across
+        // builds, making downstream tests (e.g.
+        // `generated::tests::eval_loop_jit_portal_*`) flake on the
+        // by_path key shape.  Choosing the shortest path mirrors
+        // `lib.rs:465-471 register_function_graph_alias` order: the
+        // `[module, name]` form is registered FIRST and is the
+        // source-of-truth canonical name for the graph; the longer
+        // forms are crate-prefixed aliases for cross-crate callsites.
+        //
+        // Tie-break among same-length candidates by deprioritising
+        // keys whose first segment is a crate alias
+        // (`pyre_interpreter`, `pyre_object`, `pyre_jit`), then by
+        // lexicographic order.  Without this, two length-2 keys like
+        // `["eval", "eval_loop_jit"]` (the module-qualified form) and
+        // `["pyre_object", "eval_loop_jit"]` (a crate-alias form
+        // emitted by `free_function_alias_paths`) tie on length, and
+        // the winner depends on HashMap iteration order — the source
+        // of the eval_loop_jit_portal_* flake.
+        let is_crate_alias =
+            |seg: &str| matches!(seg, "pyre_interpreter" | "pyre_object" | "pyre_jit");
+        let qualified = call_control
+            .function_graphs()
+            .keys()
+            .filter(|k| {
+                leaf_matches(k)
+                    && k.segments.len() > 1
+                    && k.segments.first().map(|s| s != "crate").unwrap_or(false)
+            })
+            .min_by_key(|k| {
+                (
+                    k.segments.len(),
+                    k.segments
+                        .first()
+                        .map(|s| is_crate_alias(s.as_str()))
+                        .unwrap_or(false),
+                    k.segments.clone(),
+                )
+            })
+            .cloned();
+        if let Some(qualified) = qualified {
+            qualified
+        } else if call_control.function_graphs().contains_key(&bare) {
+            bare
+        } else {
+            call_control
+                .function_graphs()
+                .keys()
+                .find(leaf_matches)
+                .cloned()
+                .unwrap_or(bare)
+        }
+    };
     if call_control.function_graphs().contains_key(&portal) {
         call_control.setup_jitdriver(
             portal,
@@ -1041,8 +1310,14 @@ fn analyze_pipeline_from_parsed(
         total_vable_rewrites: 0,
     };
 
-    let (opcode_dispatch, jitcodes, insns, descrs) =
-        build_canonical_opcode_dispatch(parsed_files, &config.pipeline, &mut call_control);
+    mark_phase!("call_control + canonical_trait_impls + register graphs");
+    let (opcode_dispatch, jitcodes, insns, descrs) = build_canonical_opcode_dispatch(
+        parsed_files,
+        &program.fn_return_types,
+        &config.pipeline,
+        &mut call_control,
+    );
+    mark_phase!("build_canonical_opcode_dispatch");
     pipeline.opcode_dispatch = opcode_dispatch;
     pipeline.jitcodes = jitcodes;
     // Mirror of `CallControl::jitcodes` (RPython `call.py:87 self.jitcodes`)
@@ -1080,6 +1355,7 @@ fn analyze_pipeline_from_parsed(
 /// it picks up callee graphs discovered during jtransform.
 fn build_canonical_opcode_dispatch(
     parsed_files: &[parse::ParsedInterpreter],
+    fn_return_types: &std::collections::HashMap<String, String>,
     pipeline_config: &pipeline::PipelineConfig,
     call_control: &mut call::CallControl,
 ) -> (
@@ -1091,7 +1367,7 @@ fn build_canonical_opcode_dispatch(
     let mut opcode_arms = Vec::new();
 
     for parsed in parsed_files {
-        let file_opcodes = parse::extract_opcode_dispatch_arms(parsed);
+        let file_opcodes = parse::extract_opcode_dispatch_arms(parsed, fn_return_types);
         if !file_opcodes.is_empty() {
             opcode_arms = file_opcodes;
             break;
@@ -1286,16 +1562,62 @@ mod tests {
         }
     }
 
+    /// Collect `(source, crate-stripped module_path)` per file under `dir`.
+    /// The module_path matches what `module_path!()` would emit at runtime
+    /// minus the leading crate-name segment — `lib.rs` → `""`,
+    /// `baseobjspace.rs` → `"baseobjspace"`, `module/inner.rs` → `"module::inner"`.
+    /// Feeds `parse::parse_source_with_module` so call-site segments
+    /// emitted by `canonical_call_target` for `crate::module::name` paths
+    /// hit the same `module::name` keys the registry collects.
+    fn collect_rs_files_with_modules(
+        dir: &Path,
+        sources: &mut Vec<String>,
+        module_paths: &mut Vec<String>,
+    ) {
+        for entry in WalkDir::new(dir) {
+            let entry = entry.unwrap_or_else(|_| panic!("failed to walk dir {}", dir.display()));
+            let path = entry.path();
+            if entry.file_type().is_file() && path.extension().is_some_and(|ext| ext == "rs") {
+                let source = std::fs::read_to_string(path)
+                    .unwrap_or_else(|_| panic!("failed to read {}", path.display()));
+                let relative = path.strip_prefix(dir).unwrap_or(path).with_extension("");
+                let mut segments: Vec<String> = relative
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy().to_string())
+                    .collect();
+                // lib.rs / main.rs / mod.rs occupy the parent module path
+                // (no leaf segment), so strip them and let the remaining
+                // ancestor chain stand as the module path.  Empty path
+                // (`lib.rs` at the crate root) registers under the empty
+                // prefix, matching today's behaviour.
+                if matches!(
+                    segments.last().map(String::as_str),
+                    Some("lib" | "main" | "mod")
+                ) {
+                    segments.pop();
+                }
+                sources.push(source);
+                module_paths.push(segments.join("::"));
+            }
+        }
+    }
+
     fn read_all_pyre_sources() -> Vec<String> {
+        let (sources, _module_paths) = read_all_pyre_sources_with_modules();
+        sources
+    }
+
+    fn read_all_pyre_sources_with_modules() -> (Vec<String>, Vec<String>) {
         let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../pyre");
         let mut sources = Vec::new();
+        let mut module_paths = Vec::new();
         for dir in [
             base.join("pyre-object/src"),
             base.join("pyre-interpreter/src"),
         ] {
-            collect_rs_files(&dir, &mut sources);
+            collect_rs_files_with_modules(&dir, &mut sources, &mut module_paths);
         }
-        sources
+        (sources, module_paths)
     }
 
     #[test]
@@ -1661,6 +1983,50 @@ mod tests {
         );
     }
 
+    /// Parity tripwire: the `Instruction::LoadFast` dispatch arm must
+    /// inline `load_fast` and the inlined body must have rewritten the
+    /// virtualizable `self.next_instr` field read and `self.locals_w[idx]`
+    /// array read to `getfield_vable` / `getarrayitem_vable`
+    /// ([`OpKind::VableFieldRead`] / [`OpKind::VableArrayRead`]).  A plain
+    /// `getfield` / `getarrayitem` (vable rewrite silently skipped) leaves
+    /// these kinds absent and must fail the test, not pass it — guarding
+    /// against the tripwire degrading to a mere "non-empty flattening"
+    /// check.
+    fn assert_load_fast_rewrites_vable_accesses(arm: &opcode_dispatch::PipelineOpcodeArm) {
+        use crate::jit_codewriter::flatten::FlatOp;
+        use crate::model::OpKind;
+
+        let flattened = arm
+            .flattened
+            .as_ref()
+            .expect("LoadFast arm should be flattened");
+        let inlined = flattened
+            .insns
+            .iter()
+            .find_map(|insn| match insn {
+                FlatOp::Op(op) => match &op.kind {
+                    OpKind::InlineCall { jitcode, .. } => jitcode.body()._ssarepr.as_ref(),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("LoadFast dispatch should inline the load_fast method body");
+        let body_has = |pred: &dyn Fn(&OpKind) -> bool| {
+            inlined
+                .insns
+                .iter()
+                .any(|insn| matches!(insn, FlatOp::Op(op) if pred(&op.kind)))
+        };
+        assert!(
+            body_has(&|k| matches!(k, OpKind::VableFieldRead { .. })),
+            "self.next_instr should rewrite to a vable field read"
+        );
+        assert!(
+            body_has(&|k| matches!(k, OpKind::VableArrayRead { .. })),
+            "self.locals_w[idx] should rewrite to a vable array read"
+        );
+    }
+
     #[test]
     fn test_analyze_multiple_with_config_rewrites_virtualizable_graphs() {
         let source = r#"
@@ -1722,6 +2088,7 @@ mod tests {
             load_fast.flattened.as_ref().unwrap().insns.len() > 0,
             "LoadFast flattened should have ops"
         );
+        assert_load_fast_rewrites_vable_accesses(load_fast);
     }
 
     #[test]
@@ -1784,6 +2151,7 @@ mod tests {
             canonical_load_fast.flattened.as_ref().unwrap().insns.len() > 0,
             "canonical LoadFast flattened should have ops"
         );
+        assert_load_fast_rewrites_vable_accesses(canonical_load_fast);
     }
 
     #[test]

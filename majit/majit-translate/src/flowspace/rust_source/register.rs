@@ -863,6 +863,7 @@ fn register_items_into_namespace<'a>(
     module_id: ModuleId,
     source_filename: Option<&str>,
     source_text: Option<&str>,
+    module_prefix: &str,
 ) -> Result<(), AdapterError> {
     // Pre-collect this inline mod's own `type T = U;` aliases. The
     // guard replaces (not extends) the outer scope's alias map so
@@ -950,7 +951,7 @@ fn register_items_into_namespace<'a>(
             }
             Item::Struct(item_struct) => {
                 let name = item_struct.ident.to_string();
-                let host = build_host_class_from_struct(item_struct);
+                let host = build_host_class_from_struct(item_struct, module_prefix);
                 mirror_set(&name, ConstValue::HostObject(host));
             }
             Item::Fn(item_fn) => {
@@ -962,12 +963,22 @@ fn register_items_into_namespace<'a>(
                 };
                 let nested_name = nested_item_mod.ident.to_string();
                 let nested_namespace = HostObject::new_class(&nested_name, vec![]);
+                // Push the nested mod ident onto the module-prefix path
+                // so `build_host_class_from_struct` keys inner structs
+                // under the qualified path, mirroring PyPy nested
+                // module scoping (`classdesc.py:672` per-class identity).
+                let nested_prefix = if module_prefix.is_empty() {
+                    nested_name.clone()
+                } else {
+                    format!("{module_prefix}::{nested_name}")
+                };
                 register_items_into_namespace(
                     &nested_namespace,
                     nested_inner_items,
                     module_id,
                     source_filename,
                     source_text,
+                    &nested_prefix,
                 )?;
                 mirror_set(&nested_name, ConstValue::HostObject(nested_namespace));
             }
@@ -1556,7 +1567,7 @@ pub fn register_rust_module_at_with_source(
             }
             Item::Struct(item_struct) => {
                 let name = item_struct.ident.to_string();
-                let host = build_host_class_from_struct(item_struct);
+                let host = build_host_class_from_struct(item_struct, "");
                 register_module_global(module_id, &name, ConstValue::HostObject(host));
             }
             Item::Const(item_const) => {
@@ -1692,6 +1703,7 @@ pub fn register_rust_module_at_with_source(
                     module_id,
                     source_filename,
                     source_text,
+                    &mod_name,
                 )?;
                 register_module_global(module_id, &mod_name, ConstValue::HostObject(namespace));
             }
@@ -3110,8 +3122,44 @@ fn eval_binop(
 /// fork; named-field bindings then emit `getattr(scrutinee, "x")` on
 /// the *instance* (not the class object) — the empty class dict
 /// matches that semantic exactly.
-fn build_host_class_from_struct(item_struct: &ItemStruct) -> HostObject {
+///
+/// Side effect: each `syn::Fields::Named` entry is also written into
+/// [`crate::annotator::classdesc::FORCE_ATTRIBUTES_INTO_CLASSES`] via
+/// [`crate::annotator::classdesc::register_struct_fields`] so
+/// `ClassDesc::_init_classdef` can pre-populate `ClassDef.attrs` with
+/// the field's typed `Attribute` shell.  Same dict as the hand-coded
+/// EnvironmentError entry (classdesc.py:957-961); the walker is just
+/// an additional writer to the same store.
+fn build_host_class_from_struct(item_struct: &ItemStruct, module_prefix: &str) -> HostObject {
     let name = item_struct.ident.to_string();
+    let qualified_key = if module_prefix.is_empty() {
+        name.clone()
+    } else {
+        format!("{module_prefix}::{name}")
+    };
+    // Project the declared named fields into the
+    // `FORCE_ATTRIBUTES_INTO_CLASSES` dict.  Same store consumed by
+    // `ClassDesc::_init_classdef` for the hand-coded EnvironmentError
+    // override.
+    //
+    // Keyed under the caller-supplied module prefix so two structs
+    // with the same bare ident declared in different inline mods
+    // occupy distinct registry slots, mirroring PyPy `ClassDesc`
+    // per-class identity (`classdesc.py:672`).
+    if let syn::Fields::Named(named) = &item_struct.fields {
+        let mut stubs: Vec<(String, crate::model::ValueType)> = Vec::new();
+        for field in &named.named {
+            let Some(ident) = field.ident.as_ref() else {
+                continue;
+            };
+            let field_name = ident.to_string();
+            let ty = crate::front::ast::classify_fn_arg_ty(&field.ty);
+            stubs.push((field_name, ty));
+        }
+        if !stubs.is_empty() {
+            crate::annotator::classdesc::register_struct_fields(&qualified_key, &stubs);
+        }
+    }
     let host = HostObject::new_class(&name, vec![]);
     if let Some(ptr) = try_build_gc_struct_ptr(&name, &item_struct.fields) {
         // Same-scope struct registry — later structs in the same scope
@@ -3140,25 +3188,39 @@ thread_local! {
     /// catalog layer: `type PyObjectRef = *mut PyObject;` lets a
     /// struct field declared as `PyObjectRef` resolve through the
     /// catalog the same way `*mut PyObject` already does.
-    static WALKER_TYPE_ALIASES: RefCell<StdHashMap<String, syn::Type>> =
-        RefCell::new(StdHashMap::new());
+    static WALKER_TYPE_ALIASES: RefCell<indexmap::IndexMap<String, syn::Type>> =
+        RefCell::new(indexmap::IndexMap::new());
 }
 
-/// RAII guard that swaps the walker's thread-local type-alias map
-/// on construction and restores the prior contents on drop. The
-/// guard pattern keeps the alias scope correct across early `?`
-/// returns inside the walker body. Nested guards compose by saving
-/// the *prior* outer scope and reverting to it on drop (inline mods
-/// see their own alias scope; outer scope aliases are NOT visible
-/// inside).
+/// RAII guard that extends the walker's per-thread type-alias map
+/// with the entering scope's aliases and restores the prior contents
+/// on drop.  Nested scopes compose by merging into the parent's
+/// alias map: inline-mod entries either shadow a same-name parent
+/// alias (`IndexMap::insert` overwrites) or add new entries, and
+/// drop restores the parent scope verbatim — outer-scope aliases
+/// remain visible inside the inline mod, matching RPython's whole-
+/// program alias visibility (`flowcontext.py:847` resolves names
+/// through `func_globals` which spans the imported namespace).
+///
+/// Cross-file aliases are seeded by the top-level pipeline entry
+/// (`analyze_pipeline_from_parsed`) which constructs the union of
+/// every parsed file's top-level `type T = U;` declarations and
+/// installs them via [`Self::enter`] before any per-file walker
+/// runs.
 struct WalkerTypeAliasGuard {
-    prev: StdHashMap<String, syn::Type>,
+    prev: indexmap::IndexMap<String, syn::Type>,
 }
 
 impl WalkerTypeAliasGuard {
-    fn enter(aliases: StdHashMap<String, syn::Type>) -> Self {
-        let prev =
-            WALKER_TYPE_ALIASES.with(|cell| std::mem::replace(&mut *cell.borrow_mut(), aliases));
+    fn enter(aliases: indexmap::IndexMap<String, syn::Type>) -> Self {
+        let prev = WALKER_TYPE_ALIASES.with(|cell| {
+            let prev = cell.borrow().clone();
+            let mut current = cell.borrow_mut();
+            for (name, ty) in aliases {
+                current.insert(name, ty);
+            }
+            prev
+        });
         WalkerTypeAliasGuard { prev }
     }
 }
@@ -3172,10 +3234,44 @@ impl Drop for WalkerTypeAliasGuard {
 }
 
 /// Consult the walker scope's alias map for a single-segment ident.
-/// Returns `None` when no alias matches or the walker scope is empty
-/// (no `with_walker_type_aliases` guard active).
+/// Returns `None` when no alias matches.  Outer-scope aliases stay
+/// addressable inside inline-mod entries because
+/// [`WalkerTypeAliasGuard::enter`] merges (rather than replaces) the
+/// parent scope.
 fn walker_type_alias_lookup(name: &str) -> Option<syn::Type> {
     WALKER_TYPE_ALIASES.with(|cell| cell.borrow().get(name).cloned())
+}
+
+/// Cross-file alias floor — RAII handle that seeds the walker's
+/// alias map with every parsed file's top-level `type T = U;`
+/// declarations before per-file walks run.  Mirrors PyPy
+/// `Bookkeeper`'s whole-program import-resolution map: each module's
+/// type aliases stay visible to every other module's walker pass,
+/// regardless of source-file iteration order.
+///
+/// Construct one at the top of `analyze_pipeline_from_parsed` (or
+/// any caller that walks multiple parsed files in sequence) and bind
+/// it as `let _floor = ...;` so it lives across the per-file calls;
+/// drop restores the prior thread-local content.
+pub struct WalkerAliasFloorGuard {
+    _inner: WalkerTypeAliasGuard,
+}
+
+impl WalkerAliasFloorGuard {
+    /// Build the floor from every parsed file's top-level
+    /// `Item::Type` declarations and install it on the per-thread
+    /// walker alias map.
+    pub fn install<'a>(files: impl IntoIterator<Item = &'a syn::File>) -> Self {
+        let mut floor: indexmap::IndexMap<String, syn::Type> = indexmap::IndexMap::new();
+        for file in files {
+            for (name, ty) in collect_type_aliases(&file.items) {
+                floor.entry(name).or_insert(ty);
+            }
+        }
+        Self {
+            _inner: WalkerTypeAliasGuard::enter(floor),
+        }
+    }
 }
 
 thread_local! {
@@ -3188,26 +3284,30 @@ thread_local! {
     /// inside another — mirroring upstream
     /// `lltype.GcStruct("Outer", ("first", INNER_GCSTRUCT))` (the
     /// canonical "subclass marker" / `PyObject_HEAD` inheritance shape;
-    /// `lltype.py:296-303 Struct._first_struct`). Source-order
-    /// dependent: an embedding struct must follow its embedded struct
-    /// in the file; cross-file lookups are deferred to a later slice
-    /// (requires `use` import resolution).
+    /// `lltype.py:296-303 Struct._first_struct`).
+    ///
+    /// Cross-file struct ptrs are seeded by
+    /// [`WalkerStructPtrsFloorGuard::install`] at the top of
+    /// `analyze_pipeline_from_parsed`, so a struct declared in one
+    /// file resolves through this map when a sibling file embeds it
+    /// by bare ident.  Per-file / per-mod walker guards merge into
+    /// the same map (clone-on-enter, restore-on-drop) so the floor
+    /// stays visible across the whole walker pass.
     static WALKER_STRUCT_PTRS: RefCell<StdHashMap<String, Ptr>> =
         RefCell::new(StdHashMap::new());
 }
 
-/// RAII guard that clears the walker's thread-local struct-Ptr map
-/// on construction and restores the prior contents on drop. Mirrors
-/// [`WalkerTypeAliasGuard`]; nested guards compose by saving the
-/// prior outer scope and reverting to it on drop.
+/// RAII guard that snapshots the walker's thread-local struct-Ptr map
+/// on construction and restores the snapshot on drop. Mirrors
+/// [`WalkerTypeAliasGuard`]; nested guards compose by merging into
+/// the parent scope's map (clone-on-enter) and reverting on drop.
 struct WalkerStructPtrsGuard {
     prev: StdHashMap<String, Ptr>,
 }
 
 impl WalkerStructPtrsGuard {
     fn enter() -> Self {
-        let prev = WALKER_STRUCT_PTRS
-            .with(|cell| std::mem::replace(&mut *cell.borrow_mut(), StdHashMap::new()));
+        let prev = WALKER_STRUCT_PTRS.with(|cell| cell.borrow().clone());
         WalkerStructPtrsGuard { prev }
     }
 }
@@ -3220,63 +3320,109 @@ impl Drop for WalkerStructPtrsGuard {
     }
 }
 
+/// Install-only RAII guard that pre-mints `Ptr(GcStruct(...))` entries
+/// for every top-level `Item::Struct` across the supplied parsed files,
+/// then keeps them visible on the per-thread walker map for the
+/// duration of the analyze pipeline.
+///
+/// Mirrors upstream `Bookkeeper`'s whole-program type cache (per-
+/// translation single dictionary in `pypy/annotation/bookkeeper.py:67
+/// self.descs = {}`) — a struct field declared as `pub ob_header:
+/// PyObject` in `bytesobject.rs` resolves through the `PyObject`
+/// minted from `pyobject.rs` regardless of walker iteration order.
+///
+/// Construct one at the top of `analyze_pipeline_from_parsed` (or
+/// any caller that walks multiple parsed files in sequence) and bind
+/// it as `let _floor = ...;` so it lives across the per-file calls.
+pub struct WalkerStructPtrsFloorGuard {
+    _inner: WalkerStructPtrsGuard,
+}
+
+impl WalkerStructPtrsFloorGuard {
+    /// Build the floor by running the same fixed-point minting
+    /// [`preseed_struct_ptrs`] uses, but over the union of every
+    /// parsed file's top-level `Item::Struct`s. Cross-file dependencies
+    /// (struct B in file 2 embeds struct A from file 1) resolve through
+    /// the same iteration: A mints on iteration 1, B mints on
+    /// iteration 2 once A is registered.
+    pub fn install<'a>(files: impl IntoIterator<Item = &'a syn::File>) -> Self {
+        let inner = WalkerStructPtrsGuard::enter();
+        let structs: Vec<&'a syn::ItemStruct> = files
+            .into_iter()
+            .flat_map(|file| file.items.iter())
+            .filter_map(|item| match item {
+                syn::Item::Struct(s) => Some(s),
+                _ => None,
+            })
+            .collect();
+        let mut registered = std::collections::HashSet::new();
+        loop {
+            let mut progressed = false;
+            for item_struct in &structs {
+                let name = item_struct.ident.to_string();
+                if registered.contains(&name) {
+                    continue;
+                }
+                if let Some(ptr) = try_build_gc_struct_ptr(&name, &item_struct.fields) {
+                    walker_struct_ptr_register(&name, ptr);
+                    registered.insert(name);
+                    progressed = true;
+                }
+            }
+            if !progressed {
+                break;
+            }
+        }
+        Self { _inner: inner }
+    }
+}
+
 /// Register a freshly-minted `Ptr(GcStruct(...))` into the walker's
-/// struct-Ptr map under its bare name so that subsequent same-scope
-/// struct walks can embed it by-value via [`syn_primitive_to_lltype`].
-/// Silently overwrites a previous entry under the same name — mirrors
-/// upstream `lltype.Ptr.__new__`'s structural cache (`lltype.py:721-739`)
-/// where structurally equal `Ptr`s share identity.  Mirrors the same
-/// `Ptr` into the process-wide [`PROCESS_WIDE_STRUCT_PTRS`] for
-/// cross-file lookup so e.g. `pyobject.rs`'s `PyObject` becomes
-/// visible when `typeobject.rs` later embeds it as a first field.
+/// struct-Ptr map under its bare name so that subsequent struct walks
+/// can embed it by-value via [`syn_primitive_to_lltype`]. Silently
+/// overwrites a previous entry under the same name — mirrors upstream
+/// `lltype.Ptr.__new__`'s structural cache (`lltype.py:721-739`)
+/// where structurally equal `Ptr`s share identity.
 fn walker_struct_ptr_register(name: &str, ptr: Ptr) {
     WALKER_STRUCT_PTRS.with(|cell| {
-        cell.borrow_mut().insert(name.to_string(), ptr.clone());
+        cell.borrow_mut().insert(name.to_string(), ptr);
     });
-    if let Ok(mut map) = PROCESS_WIDE_STRUCT_PTRS.lock() {
-        map.insert(name.to_string(), ptr);
-    }
 }
 
 /// Consult the walker scope's struct-Ptr map for a single-segment
 /// ident.  Returns the inner `StructType` (`Ptr.TO` unwrapped) when
-/// the name matches a previously-minted `Ptr(GcStruct(...))`. Falls
-/// back to the process-wide registry [`PROCESS_WIDE_STRUCT_PTRS`] so
-/// cross-file embedding (e.g. `W_BytesObject { pub ob_header:
-/// PyObject }` in `bytesobject.rs` referencing the `PyObject`
-/// minted by `pyobject.rs`) resolves the same way same-file embedding
-/// does.
+/// the name matches a previously-minted `Ptr(GcStruct(...))`.
+///
+/// Cross-file embedding (e.g. `W_BytesObject { pub ob_header:
+/// PyObject }` in `bytesobject.rs` referencing the `PyObject` minted
+/// by `pyobject.rs`) resolves through the floor pre-mint installed
+/// by [`WalkerStructPtrsFloorGuard::install`] at the top of the
+/// analyze pipeline.
 fn walker_struct_ptr_lookup(name: &str) -> Option<StructType> {
-    let from_scope = WALKER_STRUCT_PTRS.with(|cell| cell.borrow().get(name).cloned());
-    let ptr = match from_scope {
-        Some(ptr) => ptr,
-        None => PROCESS_WIDE_STRUCT_PTRS.lock().ok()?.get(name).cloned()?,
-    };
+    let ptr = WALKER_STRUCT_PTRS.with(|cell| cell.borrow().get(name).cloned())?;
     match ptr.TO {
         crate::translator::rtyper::lltypesystem::lltype::PtrTarget::Struct(s) => Some(s),
         _ => None,
     }
 }
 
-/// Process-wide name → `Ptr(GcStruct(...))` registry populated by
-/// [`walker_struct_ptr_register`] each time
-/// [`build_host_class_from_struct`] catalogues a struct. Mirrors
-/// upstream cross-module `LOAD_GLOBAL`'s identity invariant
-/// (`flowcontext.py:847`): two files that reference the same struct
-/// name share the same lltype `Ptr`. Lives for the duration of the
-/// process — once registered, the entry stays addressable until the
-/// program exits, matching `HOST_CLASS_MINTS`'s lifetime semantics.
-static PROCESS_WIDE_STRUCT_PTRS: std::sync::LazyLock<std::sync::Mutex<StdHashMap<String, Ptr>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(StdHashMap::new()));
-
 /// Pre-collect `Item::Type T = U;` definitions from a flat list of
-/// items into a `StdHashMap<String, syn::Type>`. Skips items with
-/// generic parameters (`type T<U> = Vec<U>;`) — those would require
+/// items into an [`indexmap::IndexMap`]. Skips items with generic
+/// parameters (`type T<U> = Vec<U>;`) — those would require
 /// substitution semantics the catalog does not implement yet.
+///
+/// Insertion-order preservation is load-bearing: downstream
+/// [`WalkerTypeAliasGuard::enter`] mirrors each alias into the
+/// process-wide registry via `first-writer-wins` semantics.  A
+/// non-deterministic hash-table iteration order would make the first
+/// writer platform-dependent (random hasher seeds on Linux vs macOS
+/// vs Windows), turning what looks like a stable registry into
+/// platform-divergent analyzer state.  Source-order keeps the floor
+/// reproducible across hosts and across cargo-test runs.
 fn collect_type_aliases<'a>(
     items: impl IntoIterator<Item = &'a syn::Item>,
-) -> StdHashMap<String, syn::Type> {
-    let mut map = StdHashMap::new();
+) -> indexmap::IndexMap<String, syn::Type> {
+    let mut map = indexmap::IndexMap::new();
     for item in items {
         if let syn::Item::Type(item_type) = item
             && item_type.generics.params.is_empty()
@@ -3439,8 +3585,9 @@ fn syn_primitive_to_lltype(ty: &syn::Type) -> Option<LowLevelType> {
     // by `_ptrEntry.compute_annotation` (`lltype.py:1513-1518`) when
     // a Python-level instance is annotated. The catalog admits `&T`
     // only when `T` is a single-segment identifier resolving to a
-    // walker-registered struct (same-scope `WALKER_STRUCT_PTRS` or
-    // process-wide `PROCESS_WIDE_STRUCT_PTRS`).  `&str`, `&dyn
+    // walker-registered struct (visible through `WALKER_STRUCT_PTRS`
+    // either from the current walker scope or the cross-file floor
+    // installed at pipeline entry).  `&str`, `&dyn
     // Trait`, `&[T]` etc. reject — `rstr.STR` and trait-object
     // dispatch are not yet ported.  The borrow lifetime annotation
     // is dropped: lltype has no lifetime concept; the gc-pointer
@@ -3570,6 +3717,72 @@ fn syn_primitive_to_lltype(ty: &syn::Type) -> Option<LowLevelType> {
         _ => return None,
     };
     Some(ll)
+}
+
+// ---------------------------------------------------------------------------
+// Rust struct field projection — writes into
+// `crate::annotator::classdesc::FORCE_ATTRIBUTES_INTO_CLASSES`.
+// ---------------------------------------------------------------------------
+
+/// Pre-pass that mirrors [`build_host_class_from_struct`]'s field
+/// projection but runs on a parsed `syn::File` without driving the
+/// full walker.  The production pipeline (`analyze_pipeline_from_parsed`)
+/// does not call [`register_rust_module_at_with_source`], which means
+/// [`build_host_class_from_struct`] never fires there and the
+/// `FORCE_ATTRIBUTES_INTO_CLASSES` dict stays unpopulated for parsed-
+/// only structs.  Without these entries `ClassDesc::_init_classdef`
+/// cannot pre-fill `ClassDef.attrs`, so the receiver-narrowing gate
+/// at `flowspace_adapter.rs::derive_subject_inputcells` skips and
+/// every `impl`-method `self` carries `SomeInstance(classdef=None)`.
+///
+/// `prefix` matches the walker-module-prefix shape: empty for
+/// top-level structs (registered under the bare ident), non-empty
+/// for structs declared inside an inline `mod` block (registered
+/// under `{prefix}::{ident}`).
+pub fn pre_register_struct_fields_from_file(file: &syn::File, prefix: &str) {
+    pre_register_struct_fields_from_items(&file.items, prefix);
+}
+
+fn pre_register_struct_fields_from_items(items: &[syn::Item], prefix: &str) {
+    for item in items {
+        match item {
+            Item::Struct(item_struct) => {
+                if let syn::Fields::Named(named) = &item_struct.fields {
+                    let mut stubs: Vec<(String, crate::model::ValueType)> = Vec::new();
+                    for field in &named.named {
+                        let Some(ident) = field.ident.as_ref() else {
+                            continue;
+                        };
+                        let field_name = ident.to_string();
+                        let ty = crate::front::ast::classify_fn_arg_ty(&field.ty);
+                        stubs.push((field_name, ty));
+                    }
+                    if !stubs.is_empty() {
+                        let bare_name = item_struct.ident.to_string();
+                        let qualified_key = if prefix.is_empty() {
+                            bare_name
+                        } else {
+                            format!("{prefix}::{bare_name}")
+                        };
+                        crate::annotator::classdesc::register_struct_fields(&qualified_key, &stubs);
+                    }
+                }
+            }
+            Item::Mod(item_mod) => {
+                let Some((_, inner)) = &item_mod.content else {
+                    continue;
+                };
+                let inner_name = item_mod.ident.to_string();
+                let inner_prefix = if prefix.is_empty() {
+                    inner_name
+                } else {
+                    format!("{prefix}::{inner_name}")
+                };
+                pre_register_struct_fields_from_items(inner, &inner_prefix);
+            }
+            _ => continue,
+        }
+    }
 }
 
 /// Test-only accessor for the per-`ModuleId` slice of the
@@ -3800,8 +4013,12 @@ fn collect_local_names(item_fn: &ItemFn, argnames_in_order: &[String]) -> Vec<St
 /// adapter needs `Hlvalue`s for the startblock, while this helper needs
 /// the plain `String` names for `HostCode::co_varnames`.
 fn extract_argnames(item_fn: &ItemFn) -> Result<Vec<String>, AdapterError> {
+    extract_argnames_from_sig(&item_fn.sig)
+}
+
+fn extract_argnames_from_sig(sig: &syn::Signature) -> Result<Vec<String>, AdapterError> {
     let mut out = Vec::new();
-    for input in &item_fn.sig.inputs {
+    for input in &sig.inputs {
         let ident = match input {
             FnArg::Receiver(_) => "self".to_string(),
             FnArg::Typed(pat_type) => match &*pat_type.pat {
@@ -3823,12 +4040,769 @@ fn extract_argnames(item_fn: &ItemFn) -> Result<Vec<String>, AdapterError> {
     Ok(out)
 }
 
+/// Z2.5 Path C slice 1 — walk a parsed `syn::File` to collect
+/// `(path-segments, Signature)` pairs for every top-level `unsafe fn`
+/// and unsafe impl-method.  These callees cannot lower their bodies via
+/// the adapter (`build_flow.rs:215` rejects `sig.unsafety.is_some()`
+/// because the bodies access raw pointers that the flowspace adapter
+/// does not model), but downstream `OpKind::Call::FunctionPath` sites
+/// still need their signature registered in `PyreCallRegistry` —
+/// otherwise the dual gate Skips with "not registered in
+/// PyreCallRegistry" at `flowspace_adapter.rs:1059`.
+///
+/// `prefix` is the module-path stem the caller derived from the source
+/// filename (`pyobject` for `pyre/pyre-object/src/pyobject.rs`); each
+/// free-fn key becomes `[prefix, ident]` (or `[ident]` when prefix is
+/// empty, matching the bare-name registration path in
+/// `front/ast.rs::collect_fn_returns`).  Impl-methods key as
+/// `[prefix-segments..., ImplTy-segments..., method]` — the file's
+/// module prefix is prepended only when the impl target was written as
+/// a bare ident (`impl PyFrame { ... }` in `pyframe.rs` → `["pyframe",
+/// "PyFrame", method]`).  When the impl target carries its own
+/// qualifier (`impl pyframe::PyFrame { ... }` from a different file)
+/// the syntactic spelling is used verbatim.  This matches the
+/// module-qualified `CallPath::for_impl_method(impl_type_root, name)`
+/// shape that `lib.rs::register_function_graph` registers (`impl_type`
+/// is derived from `method_info.self_ty_root`, the qualified path).
+///
+/// Pure-extract — no registration, no side effects.  The slice 3
+/// consumer (`cutover.rs::populate_call_registry_from_call_graphs`)
+/// drives the registration once the slice 2 stub PyGraph builder is in
+/// place; until then, calling this helper is a no-op observable only
+/// through the return Vec.  Returns an empty Vec when `file` contains
+/// no unsafe fns / methods.
+pub fn extract_unsafe_fn_signatures(
+    file: &File,
+    prefix: &str,
+) -> Vec<(Vec<String>, crate::flowspace::argument::Signature)> {
+    use crate::flowspace::argument::Signature;
+    let mut out = Vec::new();
+    for item in &file.items {
+        match item {
+            Item::Fn(func) if func.sig.unsafety.is_some() => {
+                let Ok(argnames) = extract_argnames(func) else {
+                    continue;
+                };
+                let mut segments = Vec::with_capacity(2);
+                if !prefix.is_empty() {
+                    segments.push(prefix.to_string());
+                }
+                segments.push(func.sig.ident.to_string());
+                out.push((segments, Signature::new(argnames, None, None)));
+            }
+            Item::Impl(impl_block) => {
+                let Some(target_path) = extract_impl_target_path(&impl_block.self_ty) else {
+                    continue;
+                };
+                // Module-qualify the impl-method key so it matches the
+                // runtime `register_function_graph` shape
+                // (`["pyframe", "PyFrame", method]`) rather than the
+                // 2-segment leaf-only shape (`["PyFrame", method]`).
+                // When the impl target was written bare (`impl PyFrame
+                // {...}`), prepend the file's module prefix; when the
+                // impl target was written with its own qualifier (`impl
+                // pyframe::PyFrame {...}`), use that path verbatim —
+                // the syntactic spelling already disambiguates.
+                let impl_ty_segments: Vec<String> = if target_path.len() > 1 {
+                    target_path.clone()
+                } else if prefix.is_empty() {
+                    target_path.clone()
+                } else {
+                    let mut segs: Vec<String> = prefix.split("::").map(String::from).collect();
+                    segs.extend(target_path.iter().cloned());
+                    segs
+                };
+                for sub in &impl_block.items {
+                    let syn::ImplItem::Fn(method) = sub else {
+                        continue;
+                    };
+                    if method.sig.unsafety.is_none() {
+                        continue;
+                    }
+                    let Ok(argnames) = extract_argnames_from_sig(&method.sig) else {
+                        continue;
+                    };
+                    let mut path = impl_ty_segments.clone();
+                    path.push(method.sig.ident.to_string());
+                    out.push((path, Signature::new(argnames, None, None)));
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Walk a parsed `syn::File` for `pub static X: T = ...` items and
+/// project each to `[prefix?, ident]` segments + `ValueType` from `T`.
+///
+/// Cat 2.1 Slice 1 (Z2.5 SHOUTY_CASE cluster): the lazy install
+/// fallback at `front/ast.rs::Expr::Path` emits a body-`OpKind::Input`
+/// for any single-segment name not bound in `ctx.local_value_ids` —
+/// crate-local statics (e.g. `INT_TYPE`, `BYTES_TYPE`, `TRUE_SINGLETON`)
+/// fall into that hole and surface as "adapter cross-block body Input"
+/// Skip events when the same static is read across blocks (predecessor
+/// link.args carries no matching entry because the name is not a
+/// local).  The orthodox fix is to recognise the name as a known
+/// crate-level static at lowering time and emit a `Constant`-style
+/// load instead of a body-`Input`, but the immediate prerequisite is a
+/// catalogue of every `pub static` in the pyre source tree paired with
+/// its declared type so the lowering site can decide.
+///
+/// This helper produces that catalogue.  Pure-extract — no
+/// registration, no side effects; the slice 2 consumer will plumb the
+/// result through `lib.rs::analyze_pipeline_from_parsed` into the
+/// front-end ctx alongside `unsafe_fn_stubs`.  `prefix` mirrors the
+/// other Slice-1 helpers: passed at the file's module path so segments
+/// resolve to `[module, name]` (`module_path::name` form).  An empty
+/// prefix yields `[name]` single-segment entries (test fixtures /
+/// crate-root statics).
+///
+/// Type projection: routes the static's `syn::Type` through
+/// `front/ast.rs::classify_fn_arg_ty` which already handles
+/// `i8..i64` / `u8..u64` / `bool` / `f32`/`f64` / `Box<T>`/`Rc<T>`/`Arc<T>`
+/// unwrapping + the `Self::Truth` self-ty special case.  Compound
+/// types (`PyType`, `LazyLock<...>`, custom structs) surface as
+/// `ValueType::Ref` since the address `&STATIC` is the lowering shape
+/// upstream `LOAD_GLOBAL` produces for module-level constants
+/// (`flowcontext.py:841` pushes the literal value; for compound
+/// values pyre emits the address).  `static` (non-`pub`) items are
+/// included too — they're still in-scope inside the defining crate
+/// and same-crate cross-block reads trip the same Skip family.
+pub fn extract_static_decls(
+    file: &File,
+    prefix: &str,
+) -> Vec<(
+    Vec<String>,
+    crate::model::ValueType,
+    Option<crate::flowspace::model::ConstValue>,
+)> {
+    let mut out = Vec::new();
+    let mut push_entry = |ident: &syn::Ident, ty: &syn::Type, init: Option<&syn::Expr>| {
+        let mut segments = Vec::with_capacity(2);
+        if !prefix.is_empty() {
+            segments.push(prefix.to_string());
+        }
+        segments.push(ident.to_string());
+        let value_type = crate::front::ast::classify_fn_arg_ty(ty);
+        let const_value = init.and_then(eval_literal_init_to_const_value);
+        out.push((segments, value_type, const_value));
+    };
+    for item in &file.items {
+        // `Item::Const` covers crate-level `const X: T = ...` declarations
+        // (e.g. `pub const PY_NULL: PyObjectRef = std::ptr::null_mut();`,
+        // `pub const WITHPREBUILTINT: bool = false;`). Same Skip family
+        // as `static` — single-segment reads cross block boundaries via
+        // body-`OpKind::Input`, surface as "adapter cross-block body
+        // Input" without a defining link.arg.
+        match item {
+            Item::Static(s) => push_entry(&s.ident, &s.ty, Some(&s.expr)),
+            Item::Const(c) => push_entry(&c.ident, &c.ty, Some(&c.expr)),
+            // `thread_local! { static X: T = ...; ... }` expands to a
+            // set of TLS-keyed statics; the inner names are
+            // single-segment crate-local references that
+            // `front/ast.rs::Expr::Path` reads exactly like a normal
+            // `static`.  `syn::Item::Macro` carries the body as opaque
+            // tokens — parse them as a sequence of `ItemStatic`s and
+            // re-use the same emit path.  Other macros are ignored.
+            Item::Macro(m) if m.mac.path.is_ident("thread_local") => {
+                if let Ok(body) = syn::parse2::<ThreadLocalBody>(m.mac.tokens.clone()) {
+                    for s in &body.statics {
+                        push_entry(&s.ident, &s.ty, Some(&s.expr));
+                    }
+                }
+            }
+            _ => continue,
+        }
+    }
+    out
+}
+
+/// Z2.5 Cat 2.1 Slice C — project a `static`/`const` initializer
+/// expression to a `ConstValue` when the RHS is a trivial literal.
+///
+/// PyPy `LOAD_GLOBAL` (`flowspace/flowcontext.py:856`) resolves the
+/// name to the actual host object at flowspace time and pushes a
+/// `Constant(value)`.  The pyre extraction runs at compile time and
+/// has no host-runtime evaluator; the safe subset is literal RHS:
+/// `bool` / integer / float / string literals plus the `const { LIT }`
+/// block wrapper used inside `thread_local!`.  Returns `None` for any
+/// non-literal initializer (function calls, struct constructors,
+/// references, offset_of!, etc.) — the caller falls back to the
+/// `UniStr(joined_path)` sentinel for those, preserving the
+/// pre-Slice-C lowering shape.
+///
+/// Unary `-LIT` is accepted for signed integer / float literals to
+/// match Rust's parse tree (`syn::Expr::Unary { op: Neg, expr: Lit }`).
+fn eval_literal_init_to_const_value(
+    expr: &syn::Expr,
+) -> Option<crate::flowspace::model::ConstValue> {
+    use crate::flowspace::model::ConstValue;
+    match expr {
+        syn::Expr::Lit(syn::ExprLit { lit, .. }) => match lit {
+            syn::Lit::Bool(b) => Some(ConstValue::Bool(b.value)),
+            syn::Lit::Int(i) => i.base10_parse::<i64>().ok().map(ConstValue::Int),
+            syn::Lit::Float(f) => f.base10_parse::<f64>().ok().map(ConstValue::float),
+            syn::Lit::Str(s) => Some(ConstValue::UniStr(s.value())),
+            syn::Lit::ByteStr(b) => Some(ConstValue::ByteStr(b.value())),
+            _ => None,
+        },
+        syn::Expr::Unary(syn::ExprUnary {
+            op: syn::UnOp::Neg(_),
+            expr: inner,
+            ..
+        }) => match inner.as_ref() {
+            syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Int(i),
+                ..
+            }) => i.base10_parse::<i64>().ok().map(|v| ConstValue::Int(-v)),
+            syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Float(f),
+                ..
+            }) => f.base10_parse::<f64>().ok().map(|v| ConstValue::float(-v)),
+            _ => None,
+        },
+        // `std::ptr::null()` / `std::ptr::null_mut()` — a NULL raw
+        // pointer constant (e.g. `pub const PY_NULL: PyObjectRef =
+        // std::ptr::null_mut();`). RPython models the same value as
+        // `llmemory.NULL = fakeaddress(None)`; project the call to the
+        // `_address::Null` carrier so the `LoadStatic` lowers to a
+        // proper null-ref `Constant` instead of the `UniStr(path)`
+        // sentinel. The argument-less call with a callee path whose
+        // final segment is `null` / `null_mut` is the only shape that
+        // resolves; anything with arguments stays unrecognised.
+        syn::Expr::Call(syn::ExprCall { func, args, .. }) if args.is_empty() => {
+            if let syn::Expr::Path(syn::ExprPath { path, .. }) = func.as_ref() {
+                match path.segments.last().map(|s| s.ident.to_string()).as_deref() {
+                    Some("null") | Some("null_mut") => Some(ConstValue::LLAddress(
+                        crate::translator::rtyper::lltypesystem::lltype::_address::Null,
+                    )),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        }
+        // `thread_local! { static X: T = const { LIT }; }` — the
+        // initializer wraps a literal in a `syn::Expr::Const` block.
+        // Plain `syn::Expr::Block` is also accepted for static
+        // initializers that compute the value inside a non-const
+        // block (rare; `unsafe { LIT }` and `{ LIT }` shapes).
+        syn::Expr::Const(syn::ExprConst { block, .. })
+        | syn::Expr::Block(syn::ExprBlock { block, .. })
+            if block.stmts.len() == 1 =>
+        {
+            if let syn::Stmt::Expr(e, None) = &block.stmts[0] {
+                eval_literal_init_to_const_value(e)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// `thread_local! { ... }` body parser — accepts a sequence of
+/// `static NAME: TYPE = EXPR;` entries.  Matches the grammar
+/// documented at the std `thread_local!` macro
+/// (`rustc_src/library/std/src/thread/local.rs`).
+struct ThreadLocalBody {
+    statics: Vec<syn::ItemStatic>,
+}
+
+impl syn::parse::Parse for ThreadLocalBody {
+    fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
+        let mut statics = Vec::new();
+        while !input.is_empty() {
+            statics.push(input.parse()?);
+        }
+        Ok(Self { statics })
+    }
+}
+
+/// Z2.5 Path C slice 3a — project a `syn::ReturnType` to a
+/// `LowLevelType` representable by the slice 2 stub-pygraph builder.
+/// Coverage is intentionally narrow at this slice (Bool / Void only) —
+/// it lands the wiring shape early so the dominant `pyre_object::is_*`
+/// predicate family (every `unsafe fn is_X(obj) -> bool`) can hit the
+/// stub-pygraph path immediately.  Other return types surface `None`
+/// and the slice 3c caller skips registration, preserving the original
+/// "not registered" Skip behavior for those fns until a follow-on
+/// widens the projection.
+///
+/// `Default` return (`fn foo()`) projects to `LowLevelType::Void`.
+/// Explicit `() -> ()` does too (single-segment path "()" rejected at
+/// the syn level — `syn::Type::Tuple` with no elements is the parse).
+/// `bool` matches the literal `bool` identifier at the type-path leaf.
+///
+/// Returns `None` when the type is unsupported (any non-`bool` type
+/// path, references, generics, tuples with elements, function
+/// pointers, etc.) — caller treats `None` as "skip this fn".
+pub fn simple_return_type_to_lltype(
+    ret: &syn::ReturnType,
+) -> Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType> {
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    match ret {
+        syn::ReturnType::Default => Some(LowLevelType::Void),
+        syn::ReturnType::Type(_, ty) => match ty.as_ref() {
+            syn::Type::Tuple(tup) if tup.elems.is_empty() => Some(LowLevelType::Void),
+            syn::Type::Path(tp)
+                if tp.qself.is_none()
+                    && tp.path.leading_colon.is_none()
+                    && tp.path.segments.len() == 1 =>
+            {
+                let leaf = &tp.path.segments[0];
+                if !matches!(leaf.arguments, syn::PathArguments::None) {
+                    return None;
+                }
+                match leaf.ident.to_string().as_str() {
+                    "bool" => Some(LowLevelType::Bool),
+                    _ => None,
+                }
+            }
+            _ => None,
+        },
+    }
+}
+
+/// Z2.5 Path C slice 3b — combine slice 1's argname-extraction with
+/// slice 3a's return-type projection.  Each entry of the returned Vec
+/// is a fully-qualified spec tuple ready for slice 3c's
+/// `register_unsafe_fn_stubs` (cutover.rs): `(path-segments, Signature,
+/// return_lltype)`.
+///
+/// Filters out unsafe fns whose return type slice 3a cannot project —
+/// the caller treats those as "skip" and the original Skip path covers
+/// them.  Mirrors the per-fn discard contract documented on
+/// [`simple_return_type_to_lltype`].
+pub fn extract_unsafe_fn_stubs(
+    file: &File,
+    prefix: &str,
+) -> Vec<(
+    Vec<String>,
+    crate::flowspace::argument::Signature,
+    crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+)> {
+    let pairs = extract_unsafe_fn_signatures(file, prefix);
+    let mut out = Vec::with_capacity(pairs.len());
+    for (segments, signature) in pairs {
+        let Some(ret_ty) = lookup_return_type_for_signature(file, prefix, &segments) else {
+            continue;
+        };
+        let Some(lltype) = simple_return_type_to_lltype(&ret_ty) else {
+            continue;
+        };
+        out.push((segments, signature, lltype));
+    }
+    out
+}
+
+/// Find the `syn::ReturnType` for a registered `(segments, signature)`
+/// pair by re-walking the file.  Each `extract_unsafe_fn_signatures`
+/// entry corresponds to exactly one `Item::Fn` (free-fn shape
+/// `[prefix?, ident]`) or one `Item::Impl::ImplItem::Fn` (impl-method
+/// shape `[prefix-segments?..., ImplTy-segments..., method]`).
+fn lookup_return_type_for_signature(
+    file: &File,
+    prefix: &str,
+    segments: &[String],
+) -> Option<syn::ReturnType> {
+    if segments.is_empty() {
+        return None;
+    }
+    let method_or_fn_ident = segments.last()?.as_str();
+    let is_free_fn_segments = if prefix.is_empty() {
+        segments.len() == 1
+    } else {
+        segments.len() == 2 && segments[0] == prefix
+    };
+    for item in &file.items {
+        match item {
+            Item::Fn(func) if is_free_fn_segments => {
+                if func.sig.unsafety.is_some() && func.sig.ident == method_or_fn_ident {
+                    return Some(func.sig.output.clone());
+                }
+            }
+            Item::Impl(impl_block) if !is_free_fn_segments => {
+                let Some(target_path) = extract_impl_target_path(&impl_block.self_ty) else {
+                    continue;
+                };
+                // Reproduce the prefix-prepend logic of
+                // `extract_unsafe_fn_signatures` so the lookup key
+                // matches when the impl was written bare under a
+                // non-empty prefix.
+                let expected_impl_ty: Vec<String> = if target_path.len() > 1 {
+                    target_path.clone()
+                } else if prefix.is_empty() {
+                    target_path.clone()
+                } else {
+                    let mut segs: Vec<String> = prefix.split("::").map(String::from).collect();
+                    segs.extend(target_path.iter().cloned());
+                    segs
+                };
+                let segs_lead = &segments[..segments.len() - 1];
+                if segs_lead != expected_impl_ty.as_slice() {
+                    continue;
+                }
+                for sub in &impl_block.items {
+                    if let syn::ImplItem::Fn(method) = sub {
+                        if method.sig.unsafety.is_some() && method.sig.ident == method_or_fn_ident {
+                            return Some(method.sig.output.clone());
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn parse(src: &str) -> ItemFn {
         syn::parse_str::<ItemFn>(src).expect("test fixture must parse")
+    }
+
+    fn parse_file(src: &str) -> File {
+        syn::parse_str::<File>(src).expect("test fixture must parse as syn::File")
+    }
+
+    #[test]
+    fn extract_unsafe_fn_signatures_empty_file_returns_empty() {
+        let file = parse_file("");
+        assert!(extract_unsafe_fn_signatures(&file, "anyprefix").is_empty());
+    }
+
+    #[test]
+    fn extract_unsafe_fn_signatures_safe_fn_skipped() {
+        let file = parse_file("pub fn safe_helper(x: i64) -> i64 { x + 1 }");
+        assert!(extract_unsafe_fn_signatures(&file, "modprefix").is_empty());
+    }
+
+    #[test]
+    fn extract_unsafe_fn_signatures_free_unsafe_fn_prefixed() {
+        let file = parse_file("pub unsafe fn is_none(obj: *const u8) -> bool { obj.is_null() }");
+        let pairs = extract_unsafe_fn_signatures(&file, "pyobject");
+        assert_eq!(pairs.len(), 1);
+        let (segments, sig) = &pairs[0];
+        assert_eq!(
+            segments,
+            &vec!["pyobject".to_string(), "is_none".to_string()]
+        );
+        assert_eq!(sig.argnames, vec!["obj".to_string()]);
+    }
+
+    #[test]
+    fn extract_unsafe_fn_signatures_empty_prefix_emits_bare_name() {
+        let file = parse_file("pub unsafe fn bare_unsafe(x: i64) {}");
+        let pairs = extract_unsafe_fn_signatures(&file, "");
+        assert_eq!(pairs.len(), 1);
+        let (segments, _) = &pairs[0];
+        assert_eq!(segments, &vec!["bare_unsafe".to_string()]);
+    }
+
+    #[test]
+    fn extract_unsafe_fn_signatures_impl_unsafe_method_keys_by_impl_type() {
+        let file = parse_file(
+            "impl Foo { pub unsafe fn method_a(&self, x: i64) -> bool { true } pub fn safe(&self) {} }",
+        );
+        let pairs = extract_unsafe_fn_signatures(&file, "pyobject");
+        assert_eq!(pairs.len(), 1, "safe method must be filtered out");
+        let (segments, sig) = &pairs[0];
+        // Module-qualified: bare `impl Foo {...}` in prefix `pyobject`
+        // → `["pyobject", "Foo", "method_a"]`.
+        assert_eq!(
+            segments,
+            &vec![
+                "pyobject".to_string(),
+                "Foo".to_string(),
+                "method_a".to_string()
+            ],
+        );
+        assert_eq!(sig.argnames, vec!["self".to_string(), "x".to_string()]);
+    }
+
+    #[test]
+    fn extract_unsafe_fn_signatures_impl_unsafe_method_keeps_qualifier_when_written() {
+        let file = parse_file("impl other_mod::Foo { pub unsafe fn method_q(&self) {} }");
+        let pairs = extract_unsafe_fn_signatures(&file, "pyobject");
+        assert_eq!(pairs.len(), 1);
+        let (segments, _) = &pairs[0];
+        // Qualified `impl other_mod::Foo {...}` keeps its syntactic
+        // path verbatim regardless of the file's prefix.
+        assert_eq!(
+            segments,
+            &vec![
+                "other_mod".to_string(),
+                "Foo".to_string(),
+                "method_q".to_string()
+            ],
+        );
+    }
+
+    #[test]
+    fn extract_unsafe_fn_signatures_trait_impl_unsafe_method_keys_by_self_type() {
+        let file = parse_file("impl SomeTrait for Bar { unsafe fn op(&self) -> i64 { 0 } }");
+        // Empty prefix: bare `impl ... for Bar` stays at `["Bar", "op"]`
+        // because there is no module-stem to prepend.
+        let pairs = extract_unsafe_fn_signatures(&file, "");
+        assert_eq!(pairs.len(), 1);
+        let (segments, _) = &pairs[0];
+        assert_eq!(segments, &vec!["Bar".to_string(), "op".to_string()]);
+    }
+
+    #[test]
+    fn extract_unsafe_fn_signatures_mixed_file_returns_all_unsafe_entries() {
+        let file = parse_file(
+            "pub fn safe_a() {} pub unsafe fn unsafe_a(p: i64) {} impl Cls { pub unsafe fn m(&self) -> bool { true } pub fn safe_m(&self) {} }",
+        );
+        let pairs = extract_unsafe_fn_signatures(&file, "modx");
+        assert_eq!(pairs.len(), 2);
+        let segments_set: std::collections::HashSet<Vec<String>> =
+            pairs.iter().map(|(s, _)| s.clone()).collect();
+        assert!(segments_set.contains(&vec!["modx".to_string(), "unsafe_a".to_string()]));
+        // Impl method picks up the file prefix (`modx`) on top of the
+        // bare impl target ident.
+        assert!(segments_set.contains(&vec![
+            "modx".to_string(),
+            "Cls".to_string(),
+            "m".to_string()
+        ]));
+    }
+
+    // ─── Z2.5 Path C slice 3a/3b ───
+
+    fn parse_return_ty(src: &str) -> syn::ReturnType {
+        let item: ItemFn = syn::parse_str(src).expect("test fixture must parse");
+        item.sig.output
+    }
+
+    #[test]
+    fn simple_return_type_default_yields_void() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        let ret = parse_return_ty("fn f() {}");
+        assert!(matches!(
+            simple_return_type_to_lltype(&ret),
+            Some(LowLevelType::Void)
+        ));
+    }
+
+    #[test]
+    fn simple_return_type_unit_tuple_yields_void() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        let ret = parse_return_ty("fn f() -> () {}");
+        assert!(matches!(
+            simple_return_type_to_lltype(&ret),
+            Some(LowLevelType::Void)
+        ));
+    }
+
+    #[test]
+    fn simple_return_type_bool_yields_bool() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        let ret = parse_return_ty("fn f() -> bool { true }");
+        assert!(matches!(
+            simple_return_type_to_lltype(&ret),
+            Some(LowLevelType::Bool)
+        ));
+    }
+
+    #[test]
+    fn simple_return_type_unsupported_yields_none() {
+        // Coverage intentionally narrow at this slice — `i64`, `*const u8`,
+        // generic types, references all surface None so the caller skips.
+        for src in [
+            "fn f() -> i64 { 0 }",
+            "fn f() -> u32 { 0 }",
+            "fn f() -> *const u8 { std::ptr::null() }",
+            "fn f() -> Vec<u8> { Vec::new() }",
+            "fn f() -> &'static str { \"\" }",
+        ] {
+            assert!(
+                simple_return_type_to_lltype(&parse_return_ty(src)).is_none(),
+                "unsupported return must surface None: {src}"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_unsafe_fn_stubs_keeps_only_supported_return_types() {
+        let file = parse_file(
+            "pub unsafe fn pred(p: *const u8) -> bool { true } \
+             pub unsafe fn malloc(n: usize) -> *mut u8 { std::ptr::null_mut() } \
+             pub unsafe fn unit_helper(p: i64) {}",
+        );
+        let stubs = extract_unsafe_fn_stubs(&file, "mem");
+        let segments_set: std::collections::HashSet<Vec<String>> =
+            stubs.iter().map(|(s, _, _)| s.clone()).collect();
+        assert!(
+            segments_set.contains(&vec!["mem".to_string(), "pred".to_string()]),
+            "bool-returning unsafe fn must produce a stub"
+        );
+        assert!(
+            segments_set.contains(&vec!["mem".to_string(), "unit_helper".to_string()]),
+            "()-returning unsafe fn must produce a stub"
+        );
+        assert!(
+            !segments_set.contains(&vec!["mem".to_string(), "malloc".to_string()]),
+            "*mut u8 return is unsupported at slice 3a, must skip"
+        );
+    }
+
+    #[test]
+    fn extract_unsafe_fn_stubs_resolves_impl_method_return_types() {
+        let file =
+            parse_file("impl Foo { pub unsafe fn method_b(&self, x: i64) -> bool { true } }");
+        let stubs = extract_unsafe_fn_stubs(&file, "pyobject");
+        assert_eq!(stubs.len(), 1);
+        let (segments, _, lltype) = &stubs[0];
+        // Module-qualified key matches `register_function_graph`'s
+        // `["pyobject", "Foo", "method_b"]` shape.
+        assert_eq!(
+            segments,
+            &vec![
+                "pyobject".to_string(),
+                "Foo".to_string(),
+                "method_b".to_string()
+            ],
+        );
+        assert!(matches!(
+            lltype,
+            crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Bool
+        ));
+    }
+
+    /// Verify that `build_host_class_from_struct` writes one entry per
+    /// named field into `FORCE_ATTRIBUTES_INTO_CLASSES`, shelled to
+    /// the matching `SomeValue` variant.  Skips other test cases'
+    /// state by using a uniquely-named struct.
+    #[test]
+    fn struct_field_attrs_snapshot_carries_named_field_value_types() {
+        let item: ItemStruct =
+            syn::parse_str("struct PyreFieldStubProbe { count: i64, name: String, flag: bool }")
+                .expect("test fixture must parse");
+        let _ = build_host_class_from_struct(&item, "");
+        let snap = crate::annotator::classdesc::forced_attributes_for("PyreFieldStubProbe")
+            .expect("registration must publish under the struct's local name");
+        assert_eq!(snap.len(), 3, "every named field must round-trip");
+        assert!(matches!(
+            snap.get("count"),
+            Some(crate::annotator::model::SomeValue::Integer(_))
+        ));
+        assert!(matches!(
+            snap.get("name"),
+            Some(crate::annotator::model::SomeValue::Instance(_))
+        ));
+        assert!(matches!(
+            snap.get("flag"),
+            Some(crate::annotator::model::SomeValue::Bool(_))
+        ));
+    }
+
+    /// Verify that re-registering the same struct name overwrites
+    /// the prior field set (last-writer-wins on the outer key).
+    #[test]
+    fn struct_field_attrs_snapshot_re_registration_overwrites() {
+        let first: ItemStruct = syn::parse_str("struct PyreFieldStubOverwriteProbe { a: i64 }")
+            .expect("fixture parses");
+        let second: ItemStruct =
+            syn::parse_str("struct PyreFieldStubOverwriteProbe { b: bool, c: f64 }")
+                .expect("fixture parses");
+        let _ = build_host_class_from_struct(&first, "");
+        let _ = build_host_class_from_struct(&second, "");
+        let snap =
+            crate::annotator::classdesc::forced_attributes_for("PyreFieldStubOverwriteProbe")
+                .unwrap();
+        assert_eq!(snap.len(), 2, "second registration replaces first");
+        assert!(snap.contains_key("b"));
+        assert!(snap.contains_key("c"));
+        assert!(!snap.contains_key("a"), "first walk's `a` must be evicted");
+    }
+
+    /// Qualified-key contract: a struct walked under a non-empty
+    /// `module_prefix` keys its field-attr stub under
+    /// `"{prefix}::{ident}"`.  Bare lookup misses (no fallback);
+    /// only the exact qualified key resolves.  Mirrors PyPy
+    /// `ClassDesc` per-class identity (`classdesc.py:672`).
+    #[test]
+    fn struct_field_attrs_snapshot_qualified_key_no_bare_fallback() {
+        let item: ItemStruct =
+            syn::parse_str("struct PyreFieldStubQualifiedProbe { count: i64, name: String }")
+                .expect("fixture parses");
+        let _ = build_host_class_from_struct(&item, "mymod");
+        // Bare lookup must miss — fallback was removed.
+        assert!(
+            crate::annotator::classdesc::forced_attributes_for("PyreFieldStubQualifiedProbe")
+                .is_none(),
+            "bare lookup must not resolve a qualified registration"
+        );
+        // Exact qualified lookup hits.
+        let snap = crate::annotator::classdesc::forced_attributes_for(
+            "mymod::PyreFieldStubQualifiedProbe",
+        )
+        .expect("qualified lookup matches the registered key");
+        assert_eq!(snap.len(), 2);
+        assert!(matches!(
+            snap.get("count"),
+            Some(crate::annotator::model::SomeValue::Integer(_))
+        ));
+        assert!(matches!(
+            snap.get("name"),
+            Some(crate::annotator::model::SomeValue::Instance(_))
+        ));
+    }
+
+    /// Nested-mod prefix composition: a struct inside `mod outer { mod
+    /// inner { struct Foo { ... } } }` keys under
+    /// `"outer::inner::Foo"`.  Verifies that
+    /// `register_items_into_namespace`'s nested-mod arm composes the
+    /// `module_prefix` argument from the outer and inner mod idents.
+    #[test]
+    fn struct_field_attrs_snapshot_nested_mod_qualified_key() {
+        let item: ItemStruct = syn::parse_str("struct PyreFieldStubNestedProbe { value: bool }")
+            .expect("fixture parses");
+        let _ = build_host_class_from_struct(&item, "outer::inner");
+        assert!(
+            crate::annotator::classdesc::forced_attributes_for("PyreFieldStubNestedProbe")
+                .is_none(),
+            "bare lookup must miss"
+        );
+        assert!(
+            crate::annotator::classdesc::forced_attributes_for("outer::PyreFieldStubNestedProbe")
+                .is_none(),
+            "single-segment lookup must miss when registered with two segments"
+        );
+        let snap = crate::annotator::classdesc::forced_attributes_for(
+            "outer::inner::PyreFieldStubNestedProbe",
+        )
+        .expect("nested-mod prefix must compose into the registry key");
+        assert!(matches!(
+            snap.get("value"),
+            Some(crate::annotator::model::SomeValue::Bool(_))
+        ));
+    }
+
+    /// Tuple structs and unit structs have no named fields, so the
+    /// dict must not be populated for them.
+    #[test]
+    fn struct_field_attrs_snapshot_skips_unnamed_field_structs() {
+        let tuple: ItemStruct =
+            syn::parse_str("struct PyreFieldStubTupleProbe(i64, bool);").expect("fixture parses");
+        let unit: ItemStruct =
+            syn::parse_str("struct PyreFieldStubUnitProbe;").expect("fixture parses");
+        let _ = build_host_class_from_struct(&tuple, "");
+        let _ = build_host_class_from_struct(&unit, "");
+        assert!(
+            crate::annotator::classdesc::forced_attributes_for("PyreFieldStubTupleProbe").is_none(),
+            "tuple structs do not publish field stubs"
+        );
+        assert!(
+            crate::annotator::classdesc::forced_attributes_for("PyreFieldStubUnitProbe").is_none(),
+            "unit structs do not publish field stubs"
+        );
     }
 
     /// Test helper: lookup `name` in `module_id`'s slice of the
@@ -7670,6 +8644,58 @@ pub const ParityProbe_O14_FGe: bool = 1.5 >= 1.5;
     }
 
     #[test]
+    fn register_host_lltype_resolves_type_alias_declared_in_prior_file() {
+        // Cross-file alias visibility — pyre source files are walked
+        // sequentially and each `WalkerTypeAliasGuard::drop` restores
+        // the parent scope.  The pipeline entry installs a
+        // `WalkerAliasFloorGuard` carrying the union of every parsed
+        // file's `type T = U;` declarations so the second file's
+        // struct field declared as `field: ProbeXFileRef` resolves
+        // through the seeded floor.  Mirrors RPython's whole-program
+        // alias visibility — `flowcontext.py:847` resolves names
+        // through `func_globals` which spans the imported namespace.
+        let src_decl = "
+            pub type ProbeXFileRef = *mut ProbeXFileTarget;
+        ";
+        let src_user = "
+            pub struct ProbeXFileUser {
+                pub ptr: ProbeXFileRef,
+            }
+        ";
+        let file_decl = syn::parse_file(src_decl).expect("decl fixture parses");
+        let file_user = syn::parse_file(src_user).expect("user fixture parses");
+        // Install the cross-file alias floor before either walk runs,
+        // matching the production pipeline's
+        // `WalkerAliasFloorGuard::install` step.
+        let _floor = WalkerAliasFloorGuard::install([&file_decl, &file_user]);
+        let _ = register_rust_module(&file_decl).expect("decl walk succeeds");
+        let module_user_id = register_rust_module(&file_user).expect("user walk succeeds");
+
+        let host = lookup_host(module_user_id, "ProbeXFileUser")
+            .expect("ProbeXFileUser struct must register as HostObject");
+        let ptr = super::super::host_env::lookup_host_lltype(&host).expect(
+            "user struct must populate the lltype registry — the \
+             cross-file alias for `ProbeXFileRef` should resolve via \
+             the seeded WalkerAliasFloorGuard",
+        );
+        let target = match &ptr.TO {
+            crate::translator::rtyper::lltypesystem::lltype::PtrTarget::Struct(s) => s,
+            other => panic!("expected PtrTarget::Struct, got {other:?}"),
+        };
+        let ptr_field = target._flds.get("ptr").expect("`ptr` field present");
+        let inner_ptr = match ptr_field {
+            LowLevelType::Ptr(p) => p,
+            other => panic!("`ptr` must lift to Ptr(...), got {other:?}"),
+        };
+        match &inner_ptr.TO {
+            crate::translator::rtyper::lltypesystem::lltype::PtrTarget::Opaque(op) => {
+                assert_eq!(op.tag, "ProbeXFileTarget");
+            }
+            other => panic!("inner Ptr target must be Opaque, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn register_host_lltype_skips_unsupported_field_shape_struct() {
         // Catalog still rejects shapes that lack a recognized lltype
         // mapping (`Result<T, E>`, `&T`, `dyn Trait`, tuple /
@@ -8031,23 +9057,22 @@ pub const ParityProbe_O14_FGe: bool = 1.5 >= 1.5;
     }
 
     #[test]
-    fn register_host_lltype_embeds_cross_file_nested_gc_struct_via_process_registry() {
+    fn register_host_lltype_embeds_cross_file_nested_gc_struct_via_floor_guard() {
         // Two separate walker invocations (mirroring two pyre source
         // files, e.g. `pyobject.rs` + `bytesobject.rs`): the first
         // registers a base struct, the second names it by bare ident
-        // in a `pub ob_header: BaseName` field.  The same-scope
-        // `WALKER_STRUCT_PTRS` is per-walker (cleared between calls);
-        // cross-file resolution falls through to the process-wide
-        // [`PROCESS_WIDE_STRUCT_PTRS`] registry seeded by the first
-        // walk.  Mirrors upstream `LOAD_GLOBAL`'s identity invariant
-        // across files (`flowcontext.py:847`).
+        // in a `pub ob_header: BaseName` field.  Cross-file resolution
+        // works because [`WalkerStructPtrsFloorGuard::install`] mints
+        // every parsed file's top-level structs into the walker
+        // thread-local before any per-file walk runs.  Mirrors
+        // upstream `Bookkeeper`'s whole-program type cache
+        // (`bookkeeper.py:67 self.descs = {}`).
         let base_src = "
             pub struct ParityProbe_CrossFileBase {
                 pub flag: i64,
             }
         ";
         let base_file = syn::parse_file(base_src).expect("base fixture parses");
-        let _base_module = register_rust_module(&base_file).expect("base walk succeeds");
         let sub_src = "
             pub struct ParityProbe_CrossFileSub {
                 pub ob_header: ParityProbe_CrossFileBase,
@@ -8055,12 +9080,14 @@ pub const ParityProbe_O14_FGe: bool = 1.5 >= 1.5;
             }
         ";
         let sub_file = syn::parse_file(sub_src).expect("sub fixture parses");
+        let _floor = WalkerStructPtrsFloorGuard::install([&base_file, &sub_file]);
+        let _base_module = register_rust_module(&base_file).expect("base walk succeeds");
         let sub_module = register_rust_module(&sub_file).expect("sub walk succeeds");
         let sub_host = lookup_host(sub_module, "ParityProbe_CrossFileSub")
             .expect("ParityProbe_CrossFileSub must register as HostObject");
         let sub_ptr = super::super::host_env::lookup_host_lltype(&sub_host).expect(
             "cross-file nested-struct embedding must populate the lltype \
-             registry via the process-wide struct ptr fallback",
+             registry via the floor pre-mint",
         );
         let sub_target = match &sub_ptr.TO {
             crate::translator::rtyper::lltypesystem::lltype::PtrTarget::Struct(s) => s,
@@ -8312,5 +9339,195 @@ pub const ParityProbe_O14_FGe: bool = 1.5 >= 1.5;
         };
         assert_eq!(target._name, "ParityProbe_UnitStruct");
         assert!(target._names.is_empty());
+    }
+
+    #[test]
+    fn extract_static_decls_empty_file_returns_empty() {
+        let file = parse_file("");
+        assert!(extract_static_decls(&file, "anyprefix").is_empty());
+    }
+
+    #[test]
+    fn extract_static_decls_const_emitted_alongside_static() {
+        use crate::model::ValueType;
+        let file = parse_file("pub const FOO: i64 = 42;");
+        let decls = extract_static_decls(&file, "modprefix");
+        assert_eq!(decls.len(), 1, "Item::Const must be catalogued");
+        assert_eq!(decls[0].0, vec!["modprefix".to_string(), "FOO".to_string()]);
+        assert_eq!(decls[0].1, ValueType::Int);
+    }
+
+    #[test]
+    fn extract_static_decls_pub_static_int_unsigned_bool_float() {
+        use crate::model::ValueType;
+        let file = parse_file(
+            "pub static A: i64 = 0;
+             pub static B: usize = 0;
+             pub static C: bool = false;
+             pub static D: f64 = 0.0;",
+        );
+        let decls = extract_static_decls(&file, "pyobject");
+        assert_eq!(decls.len(), 4);
+        assert_eq!(decls[0].0, vec!["pyobject".to_string(), "A".to_string()]);
+        assert_eq!(decls[0].1, ValueType::Int);
+        assert_eq!(decls[1].1, ValueType::Unsigned);
+        assert_eq!(decls[2].1, ValueType::Bool);
+        assert_eq!(decls[3].1, ValueType::Float);
+    }
+
+    #[test]
+    fn extract_static_decls_empty_prefix_emits_bare_name() {
+        let file = parse_file("pub static BARE: bool = true;");
+        let decls = extract_static_decls(&file, "");
+        assert_eq!(decls.len(), 1);
+        assert_eq!(decls[0].0, vec!["BARE".to_string()]);
+    }
+
+    #[test]
+    fn extract_static_decls_compound_type_classifies_as_ref() {
+        use crate::model::ValueType;
+        let file = parse_file(
+            "pub static INT_TYPE: PyType = new_pytype(\"int\");
+             pub static SMALL_INTS: LazyLock<Vec<W_IntObject>> = LazyLock::new(|| vec![]);",
+        );
+        let decls = extract_static_decls(&file, "pyobject");
+        assert_eq!(decls.len(), 2);
+        // `PyType` is a bare path leaf; `classify_fn_arg_ty` falls through
+        // to the compound-type `Ref` branch.
+        assert_eq!(decls[0].1, ValueType::Ref(Some("PyType".to_string())));
+        // `LazyLock<...>` is not in the `Box | Rc | Arc` unwrap list;
+        // also falls through to Ref carrying the wrapper's leaf ident.
+        assert_eq!(decls[1].1, ValueType::Ref(Some("LazyLock".to_string())));
+        // Non-literal RHS: `ConstValue` resolution falls back to `None`,
+        // adapter retains the `UniStr(joined)` sentinel.
+        assert!(decls[0].2.is_none());
+        assert!(decls[1].2.is_none());
+    }
+
+    #[test]
+    fn extract_static_decls_literal_rhs_resolves_const_value() {
+        use crate::flowspace::model::ConstValue;
+        let file = parse_file(
+            "pub const I: i64 = 42;
+             pub const NEG: i32 = -7;
+             pub const B: bool = false;
+             pub const F: f64 = 1.5;
+             pub const S: &str = \"hi\";",
+        );
+        let decls = extract_static_decls(&file, "");
+        assert_eq!(decls.len(), 5);
+        assert_eq!(decls[0].2, Some(ConstValue::Int(42)));
+        assert_eq!(decls[1].2, Some(ConstValue::Int(-7)));
+        assert_eq!(decls[2].2, Some(ConstValue::Bool(false)));
+        assert_eq!(decls[3].2, Some(ConstValue::float(1.5)));
+        assert_eq!(decls[4].2, Some(ConstValue::UniStr("hi".to_string())));
+    }
+
+    #[test]
+    fn extract_static_decls_null_pointer_rhs_resolves_to_null_address() {
+        use crate::flowspace::model::ConstValue;
+        use crate::translator::rtyper::lltypesystem::lltype::_address;
+        // `std::ptr::null_mut()` / `null()` resolve to the `_address::Null`
+        // carrier so the `LoadStatic` lowers to a null-ref `Constant`
+        // instead of the `UniStr(path)` sentinel.
+        let file = parse_file(
+            "pub const PY_NULL: PyObjectRef = std::ptr::null_mut();
+             pub const CONST_NULL: *const u8 = std::ptr::null();
+             pub const BARE_NULL: *mut u8 = null_mut();",
+        );
+        let decls = extract_static_decls(&file, "");
+        assert_eq!(decls.len(), 3);
+        let null = Some(ConstValue::LLAddress(_address::Null));
+        assert_eq!(decls[0].2, null);
+        assert_eq!(decls[1].2, null);
+        assert_eq!(decls[2].2, null);
+    }
+
+    #[test]
+    fn extract_static_decls_thread_local_const_literal_resolves() {
+        use crate::flowspace::model::ConstValue;
+        // `thread_local! { static X: T = const { LIT }; }` — the
+        // `const { ... }` block wrapper unwraps to the inner literal.
+        let file = parse_file(
+            "thread_local! {\n\
+                 static FLAG: bool = const { true };\n\
+             }",
+        );
+        let decls = extract_static_decls(&file, "");
+        assert_eq!(decls.len(), 1);
+        assert_eq!(decls[0].2, Some(ConstValue::Bool(true)));
+    }
+
+    #[test]
+    fn extract_static_decls_non_pub_static_included() {
+        let file = parse_file("static PRIVATE: bool = false;");
+        let decls = extract_static_decls(&file, "mod");
+        assert_eq!(decls.len(), 1, "non-pub static must still be catalogued");
+        assert_eq!(decls[0].0, vec!["mod".to_string(), "PRIVATE".to_string()]);
+    }
+
+    #[test]
+    fn extract_static_decls_thread_local_macro_inner_statics_catalogued() {
+        use crate::model::ValueType;
+        let file = parse_file(
+            "thread_local! {\n\
+                 static CALL_DEPTH: Cell<u32> = const { Cell::new(0) };\n\
+                 pub static SHADOW_STACK: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };\n\
+             }",
+        );
+        let decls = extract_static_decls(&file, "modprefix");
+        assert_eq!(
+            decls.len(),
+            2,
+            "both thread_local statics must be catalogued"
+        );
+        let names: Vec<String> = decls
+            .iter()
+            .map(|(seg, _, _)| seg.last().cloned().unwrap())
+            .collect();
+        assert!(names.contains(&"CALL_DEPTH".to_string()));
+        assert!(names.contains(&"SHADOW_STACK".to_string()));
+        // Compound types fall through to `ValueType::Ref` per the
+        // `compound_type_classifies_as_ref` invariant.
+        assert!(
+            decls
+                .iter()
+                .all(|(_, ty, _)| matches!(ty, ValueType::Ref(_)))
+        );
+    }
+
+    #[test]
+    fn extract_static_decls_non_thread_local_macros_ignored() {
+        let file = parse_file(
+            "println!(\"hello\");\n\
+             lazy_static::lazy_static! {\n\
+                 static ref OTHER: Vec<u8> = vec![];\n\
+             }",
+        );
+        let decls = extract_static_decls(&file, "");
+        assert!(
+            decls.is_empty(),
+            "only `thread_local!` is recognised; other macros stay opaque"
+        );
+    }
+
+    #[test]
+    fn extract_static_decls_other_items_ignored() {
+        let file = parse_file(
+            "pub fn foo() {}
+             pub const C: i64 = 0;
+             pub static S: bool = true;
+             pub struct St;
+             pub enum E { A }",
+        );
+        let decls = extract_static_decls(&file, "");
+        assert_eq!(
+            decls.len(),
+            2,
+            "Item::Static and Item::Const contribute; fn/struct/enum ignored",
+        );
+        let names: Vec<String> = decls.iter().map(|(seg, _, _)| seg[0].clone()).collect();
+        assert!(names.contains(&"C".to_string()));
+        assert!(names.contains(&"S".to_string()));
     }
 }

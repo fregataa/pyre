@@ -306,6 +306,43 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
     // semantics.
     analyzer_for(&mut reg, "rarithmetic.intmask", rarith_intmask);
     analyzer_for(&mut reg, "rarithmetic.longlongmask", rarith_longlongmask);
+    // Rust `std::ptr::eq(p, q) -> bool` — registered under the dotted
+    // qualname that `HostEnv::bootstrap` assigns to the HOST_ENV stub
+    // (`flowspace/model.rs:1910`).  Lowers identity checks in
+    // `baseobjspace::is_w` / `baseobjspace::is_`.
+    analyzer_for(&mut reg, "std.ptr.eq", std_ptr_eq);
+    // Rust `std::mem::size_of::<T>() -> usize` — compile-time type-size
+    // constant called by `lltype::malloc_typed` /
+    // `object_array::items_block_layout`.  Returns `SomeInteger`.
+    analyzer_for(&mut reg, "std.mem.size_of", std_mem_size_of);
+    // Rust `std::mem::align_of::<T>() -> usize` — same compile-time
+    // `usize` lattice as `size_of`; called by `object_array.rs` /
+    // `pyframe.rs`.
+    analyzer_for(&mut reg, "std.mem.align_of", std_mem_align_of);
+    // Rust `String::new()` / `String::with_capacity(n)` construct an empty
+    // owned UTF-8 buffer; both annotate as a mutable `SomeString` so the
+    // `String.new` / `String.with_capacity` HOST_ENV stubs do not reach the
+    // "no analyser registered" error (the formatting helpers in
+    // `type_methods.rs` call them).
+    analyzer_for(&mut reg, "String.new", string_constructor);
+    analyzer_for(&mut reg, "String.with_capacity", string_constructor);
+    // External crate `majit_metainterp` bool flag helpers — both
+    // qualnames share the same analyzer (returns `SomeBool`).
+    analyzer_for(
+        &mut reg,
+        "majit_metainterp.majit_log_enabled",
+        majit_metainterp_bool_flag,
+    );
+    analyzer_for(
+        &mut reg,
+        "majit_metainterp.jit.we_are_jitted",
+        majit_metainterp_bool_flag,
+    );
+    // Rust primitive type conversion impls — all return `SomeInteger`.
+    analyzer_for(&mut reg, "u32.from", primitive_integer_conversion);
+    analyzer_for(&mut reg, "i64.from", primitive_integer_conversion);
+    analyzer_for(&mut reg, "i64.try_from", primitive_integer_conversion);
+    analyzer_for(&mut reg, "usize.try_from", primitive_integer_conversion);
     // `rarithmetic.r_uint` is routed via
     // `ExtRegistryEntry::ForType` (rarithmetic.py:572-582 `ForTypeEntry`):
     // bookkeeper's BUILTIN_ANALYZERS miss falls through to
@@ -1164,6 +1201,94 @@ pub fn rarith_longlongmask(
         false,
         crate::annotator::model::KnownType::LongLong,
     )))
+}
+
+/// Analyzer for `std::ptr::eq(p1, p2) -> bool` — Rust pointer identity
+/// check.  Registered against the `HostObject::new_builtin_callable
+/// ("std.ptr.eq")` stub published by [`HostEnv::bootstrap`]
+/// (`flowspace/model.rs:1910`) so `baseobjspace::is_w` /
+/// `baseobjspace::is_` (which lower the Python identity check to
+/// `std::ptr::eq(w_one, w_two)`) annotate cleanly.  Mirrors PyPy's
+/// `ptr_eq(p, q)` annotator: pure identity comparison returning
+/// `SomeBool` regardless of operand types.
+pub fn std_ptr_eq(
+    _bk: &Rc<Bookkeeper>,
+    _args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    Ok(SomeValue::Bool(super::model::SomeBool::new()))
+}
+
+/// Analyzer for `std::mem::size_of::<T>() -> usize` — compile-time
+/// type-size constant.  Registered against the
+/// `HostObject::new_builtin_callable("std.mem.size_of")` stub.
+/// Callers in pyre source: `lltype::malloc_typed`,
+/// `object_array::items_block_layout`.  Returns `SomeInteger` since
+/// the actual value is a compile-time `usize`; the rtyper folds the
+/// const at lowering time, but the annotator just needs the lattice
+/// position.  The value is a `usize` byte size, so it is non-negative —
+/// modeled as `SomeInteger(nonneg=True)` (the `rffi.sizeof` / `len`
+/// lattice), strictly more precise than the default and safe under join.
+pub fn std_mem_size_of(
+    _bk: &Rc<Bookkeeper>,
+    _args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    Ok(SomeValue::Integer(SomeInteger::new(true, false)))
+}
+
+/// Analyzer for `std::mem::align_of::<T>() -> usize`.  Identical
+/// lattice to [`std_mem_size_of`] (a compile-time non-negative
+/// `usize`); registered against the `std.mem.align_of` stub so those
+/// callsites do not reach the "no analyser registered" error.
+pub fn std_mem_align_of(
+    bk: &Rc<Bookkeeper>,
+    args_s: &[Option<SomeValue>],
+    kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    std_mem_size_of(bk, args_s, kwds)
+}
+
+/// Analyzer for `String::new()` / `String::with_capacity(n)`.  Both
+/// build an empty owned UTF-8 buffer, so the annotation surface is a
+/// mutable `SomeString` (not `None`; a `String` may hold interior nul
+/// bytes, hence `no_nul = false`).  Registered against the `String.new`
+/// / `String.with_capacity` HOST_ENV stubs so those callsites resolve to
+/// a real lattice value instead of erroring with "no analyser registered".
+pub fn string_constructor(
+    _bk: &Rc<Bookkeeper>,
+    _args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    Ok(SomeValue::String(SomeString::new(false, false)))
+}
+
+/// Analyzer for the `majit_metainterp` crate's `pub fn -> bool` flag
+/// helpers.  Single implementation covers both `majit_log_enabled()`
+/// (logging gate) and `jit::we_are_jitted()` (JIT-context probe);
+/// both return `bool` so the annotation is `SomeBool` regardless of
+/// which qualname the dispatcher routed to.
+pub fn majit_metainterp_bool_flag(
+    _bk: &Rc<Bookkeeper>,
+    _args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    Ok(SomeValue::Bool(super::model::SomeBool::new()))
+}
+
+/// Analyzer for Rust primitive type `From` / `TryFrom` impls
+/// (`u32::from`, `i64::from`, `i64::try_from`, `usize::try_from`).
+/// All return integer values (the target primitive); `TryFrom` returns
+/// `Result<T, ...>` but pyre lowers the unwrap inline so the
+/// annotation surface is `SomeInteger`.  Per-primitive precision
+/// (knowntype) is left as default since the rtyper folds the
+/// conversion at lowering time.
+pub fn primitive_integer_conversion(
+    _bk: &Rc<Bookkeeper>,
+    _args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    Ok(SomeValue::Integer(SomeInteger::default()))
 }
 
 /// Upstream `ann_cast_ptr_to_int(s_ptr)`

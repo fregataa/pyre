@@ -2127,6 +2127,8 @@ impl Assembler {
                 OpKind::JitMergePoint { .. } => "JitMergePoint",
                 OpKind::LoopHeader { .. } => "LoopHeader",
                 OpKind::Abort { .. } => "Abort",
+                OpKind::NewTuple { .. } => "NewTuple",
+                OpKind::LoadStatic { .. } => "LoadStatic",
             }
         }
         let mut sites: std::collections::HashMap<crate::flowspace::model::Variable, ValueSites> =
@@ -3276,6 +3278,13 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         // jtransform.py:901-903 — `record_quasiimmut_field(v_inst, descr, descr1)`.
         OpKind::RecordQuasiImmutField { .. } => "record_quasiimmut_field".into(),
         OpKind::Abort { .. } => "abort".into(),
+        OpKind::NewTuple { .. } => "newtuple".into(),
+        // `LoadStatic` lowers to a `same_as` SpaceOperation whose arg
+        // is the static's resolved `Hlvalue::Constant` (see model.rs
+        // `LoadStatic` doc).  The opname matches RPython's
+        // `same_as` (`flowspace/operation.py:540`) which the rtyper
+        // already handles as identity.
+        OpKind::LoadStatic { .. } => "same_as".into(),
     }
 }
 
@@ -3955,6 +3964,7 @@ mod tests {
                 OpKind::Input {
                     name: "a".into(),
                     ty: ValueType::Int,
+                    class_root: None,
                 },
                 true,
             )
@@ -3977,6 +3987,7 @@ mod tests {
                 OpKind::Input {
                     name: "r".into(),
                     ty: ValueType::Ref(None),
+                    class_root: None,
                 },
                 true,
             )
@@ -4029,6 +4040,7 @@ mod tests {
                 OpKind::Input {
                     name: "cell".to_string(),
                     ty: ValueType::Ref(None),
+                    class_root: None,
                 },
                 true,
             )
@@ -4116,6 +4128,7 @@ mod tests {
                 OpKind::Input {
                     name: "obj".into(),
                     ty: ValueType::Ref(None),
+                    class_root: None,
                 },
                 true,
             )
@@ -4126,6 +4139,7 @@ mod tests {
                 OpKind::Input {
                     name: "i".into(),
                     ty: ValueType::Int,
+                    class_root: None,
                 },
                 true,
             )
@@ -4136,6 +4150,7 @@ mod tests {
                 OpKind::Input {
                     name: "v".into(),
                     ty: ValueType::Int,
+                    class_root: None,
                 },
                 true,
             )
@@ -4239,6 +4254,7 @@ mod tests {
                 OpKind::Input {
                     name: "obj".into(),
                     ty: ValueType::Ref(None),
+                    class_root: None,
                 },
                 true,
             )
@@ -4249,6 +4265,7 @@ mod tests {
                 OpKind::Input {
                     name: "i".into(),
                     ty: ValueType::Int,
+                    class_root: None,
                 },
                 true,
             )
@@ -4358,6 +4375,7 @@ mod tests {
                 OpKind::Input {
                     name: "lhs".into(),
                     ty: ValueType::Int,
+                    class_root: None,
                 },
                 true,
             )
@@ -4368,6 +4386,7 @@ mod tests {
                 OpKind::Input {
                     name: "rhs".into(),
                     ty: ValueType::Int,
+                    class_root: None,
                 },
                 true,
             )
@@ -4427,6 +4446,7 @@ mod tests {
                 kind: crate::model::OpKind::Input {
                     name: "x".into(),
                     ty: crate::model::ValueType::Int,
+                    class_root: None,
                 },
             })],
             num_blocks: 1,

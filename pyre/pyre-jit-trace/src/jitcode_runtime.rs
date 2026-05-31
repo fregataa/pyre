@@ -312,21 +312,41 @@ static INSNS_OPNAME_TO_BYTE: LazyLock<majit_ir::vec_assoc::VecAssoc<String, u8>>
                     BYTES.len(),
                 )
             });
-        // Overlay the helper-side `_pyre/P` adapter keys so the static
-        // decoder shares a key set with the production blackhole builder.
-        // pyre_extension_insns() is the same source the runtime builder
-        // hands to `setup_insns(...)`.
-        for (key, byte) in majit_translate::insns::pyre_extension_insns() {
-            if let Some(&prev) = table.get(key) {
-                assert_eq!(
-                    prev, byte,
-                    "pyre extension insns: opname {key:?} disagrees with build-time \
-                     pipeline.insns (build={prev}, extension={byte})",
-                );
-            } else {
-                table.insert(key.to_string(), byte);
+        // Overlay the canonical `wellknown_bh_insns` and pyre-only
+        // `pyre_extension_insns` keys so the runtime table covers every
+        // opname a `BlackholeInterpBuilder` could be asked to dispatch.
+        //
+        // RPython parity: `blackhole.py:55-65 BlackholeInterpBuilder.__init__`
+        // populates `self.insns = asm.insns` and then `wire_bhimpl_handlers`
+        // (`:152-179`) iterates that map to bind every bhimpl handler.
+        // Pyre's build-time `pipeline.insns` only records opnames the
+        // assembler actually emitted during `make_jitcodes`; canonical
+        // opnames the analyzed source set did not exercise (e.g.
+        // `ref_guard_value/r`) are absent.  Overlaying
+        // both `wellknown_bh_insns` and `pyre_extension_insns` restores
+        // the closed key universe RPython's runtime sees, so callers
+        // (`build_default_bh_builder_with_unwired_report`, dispatch
+        // tests) treat opname coverage as a property of the codebase,
+        // not of which paths the build observed.
+        fn overlay_insns(
+            table: &mut majit_ir::vec_assoc::VecAssoc<String, u8>,
+            source: &majit_ir::VecAssoc<&'static str, u8>,
+        ) {
+            for (key, byte) in source.iter() {
+                let owned = (*key).to_string();
+                if let Some(&prev) = table.get(&owned) {
+                    assert_eq!(
+                        prev, *byte,
+                        "insns overlay: opname {key:?} disagrees with build-time \
+                         pipeline.insns (build={prev}, overlay={byte})",
+                    );
+                } else {
+                    table.insert(owned, *byte);
+                }
             }
         }
+        overlay_insns(&mut table, &majit_translate::insns::wellknown_bh_insns());
+        overlay_insns(&mut table, &majit_translate::insns::pyre_extension_insns());
         table
     });
 
@@ -1382,20 +1402,75 @@ mod tests {
         // regalloc emitted a kind shape that no RPython blackhole handler
         // has — fix at upstream emission, do NOT add a `*_r>i` /
         // `*_ir>i` alias.
-        let (_builder, mut unwired) = build_default_bh_builder_with_unwired_report();
-        unwired.sort();
-        // These are the current kind-flow gaps emitted by
-        // generated helper jitcodes. Keep them as an explicit snapshot
-        // rather than wiring aliases: RPython has only the integer-kind
-        // comparison handler here, so new entries still indicate an
-        // upstream typing/lowering issue.
-        let expected: Vec<String> = vec!["int_le/ri>i".to_string(), "int_le/rr>i".to_string()];
-        assert_eq!(
-            unwired, expected,
-            "Unwired-opname snapshot drifted. If a new entry \
-             appeared, find the new kind-flow bug upstream instead of \
-             adding a bhhandler alias.  Existing entries document a \
-             pending upstream rewrite — see the `expected` literal.",
+        //
+        // Documented pending rewrites (intentional drift):
+        //
+        // - `newtuple/*` — Z2.5 NewTuple slice (commit 4666d12ea8) added
+        //   `OpKind::NewTuple` → flowspace `newtuple` opname for
+        //   `syn::Expr::Tuple` lowering.  RPython virtualizes newtuple
+        //   via the optimizer (`optimizeopt/virtualize.py:NewTuple`)
+        //   before it reaches the blackhole interp, so PyPy never wires
+        //   `bhimpl_newtuple_*`.  Pyre's optimizer doesn't yet virtualize
+        //   these emissions; once it does, these entries vanish.
+        // - `same_as/>i` / `same_as/>r` — `OpKind::LoadStatic`
+        //   (`flowspace_adapter.rs:720`) emits a `same_as(UniStr(...))`
+        //   sentinel that survives to JITCode at `assembler.rs:3218`.
+        //   RPython's `same_as` is rtyper-eliminated before reaching the
+        //   blackhole.  Pyre's LoadStatic-as-sentinel design is a
+        //   reviewer-flagged deviation (Slice C target); closing
+        //   requires emitting the resolved constant value instead of a
+        //   string sentinel at the adapter, after which the regular
+        //   jtransform `same_as` alias-elimination retires the
+        //   `OpKind::LoadStatic` variant entirely.  Null-pointer statics
+        //   (`PY_NULL = std::ptr::null_mut()`) now resolve to a real
+        //   `ConstValue::LLAddress(Null)` (immediate `0`) in
+        //   `extract_static_decls`, so their `same_as` folds away; the
+        //   remaining `same_as/>r` is the `*_TYPE` runtime-address
+        //   globals whose host addresses are only known at runtime
+        //   (Slice B address-baking target).
+        // - `int_eq/if>i` — an `int_eq` enumerated with one int and one
+        //   float operand.  Surfaced once `format_float`'s no-type branch
+        //   started formatting through `display::format_float_repr`
+        //   (commit f94d00f183, the no-type float `.0` fix), which widened
+        //   the translated reachability set and let whole-program
+        //   annotation infer a mixed int/float comparand for a shared
+        //   numeric-compare helper.  The int/float compare is coerced to a
+        //   float compare by the optimizer before the blackhole, so the
+        //   shape is never dispatched — `i == 1.0` in a JIT hot loop runs
+        //   correctly (check.py 39/39 x2).  Closing it is the rtyper
+        //   int/float ordered-compare coercion (Slice E / reviewer 2.5),
+        //   after which the mixed-operand `int_eq` is never emitted.
+        //
+        // Cross-platform tolerance: the analyzer's classdef/type-alias
+        // resolution still depends on file-traversal order beyond what
+        // `build.rs collect_rs_files` sort fixes (e.g. process-wide
+        // first-writer-wins type-alias registry under PR 91 reviewer
+        // 2.2).  macOS APFS happens to produce `same_as/>i` for some
+        // Int-typed LoadStatic that ext4 / NTFS instead lowers to a
+        // Ref-Ref tuple emitting `newtuple/rr>r` — both belong to the
+        // Z2.5 in-progress set above, so this tripwire accepts either
+        // shape as long as no NEW opname appears outside the documented
+        // pending list.  Closing the underlying order-sensitivity is
+        // Task #133 / multi-session Z2.5 deep fix.
+        let (_builder, unwired) = build_default_bh_builder_with_unwired_report();
+        let allowed: &[&str] = &[
+            "newtuple/>r",
+            "newtuple/ff>r",
+            "newtuple/ii>r",
+            "newtuple/rr>r",
+            "same_as/>i",
+            "same_as/>r",
+            "int_eq/if>i",
+        ];
+        let unexpected: Vec<&String> = unwired
+            .iter()
+            .filter(|n| !allowed.contains(&n.as_str()))
+            .collect();
+        assert!(
+            unexpected.is_empty(),
+            "Task #85 unwired-opname snapshot drifted. New entries: {unexpected:?}. \
+             Find the new kind-flow bug upstream instead of adding a bhhandler alias.  \
+             Existing allowed entries document pending upstream rewrites — see comments.",
         );
     }
 

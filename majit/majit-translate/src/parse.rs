@@ -241,17 +241,50 @@ pub struct ParsedInterpreter {
     /// addressable from a path expression inside the same `mod foo`
     /// scope as bare `FOO`, and from outside as `foo::FOO`.
     pub module_statics: std::collections::HashMap<(String, String), ModuleStaticDecl>,
+    /// `pub use <path>::*` glob re-exports at the file root.  Each
+    /// entry is the source-path segments (after `crate::` /
+    /// `self::` / `super::` are stripped), without the trailing
+    /// glob.  Example: `pub use crate::objspace::descroperation::*;`
+    /// in `baseobjspace.rs` (module path `"baseobjspace"`) records
+    /// `["objspace", "descroperation"]`.  Consumed at
+    /// `lib.rs::analyze_pipeline_from_parsed` to emit extra alias
+    /// paths so callers writing `crate::baseobjspace::pos(...)`
+    /// (Rust-resolved through the re-export) resolve to the same
+    /// function graph the walker registered under
+    /// `crate::objspace::descroperation::pos`.  Non-pub `use` globs
+    /// AND pub uses of non-`crate::` paths (external crates, stdlib)
+    /// are skipped.
+    pub pub_use_globs: Vec<Vec<String>>,
+    /// Non-`pub` `use <path>::*` glob imports at the file root.  Each
+    /// entry is the source-path segments after `crate::` / `self::` /
+    /// pyre-internal-crate-alias roots are stripped, without the
+    /// trailing glob.  Example: `use crate::pyobject::*;` in
+    /// `excobject.rs` records `["pyobject"]`.  Consumed at semantic
+    /// build time by
+    /// [`crate::front::ast::build_semantic_program_from_parsed_files_with_options`]
+    /// which expands each glob into explicit `(alias → full_path)`
+    /// entries on the per-file `use_imports` map — mirroring Python's
+    /// import-resolution step that binds glob-imported names into the
+    /// importing module's namespace at module-load time.  The
+    /// front-end `Expr::Path` arm then resolves bare names through
+    /// the primary `use_imports` lookup without a separate glob
+    /// fallback.
+    pub use_globs: Vec<Vec<String>>,
 }
 
 pub fn parse_source(source: &str) -> ParsedInterpreter {
     let file = syn::parse_file(source).expect("failed to parse bundled source");
     let use_imports = collect_use_imports(&file.items);
     let module_statics = collect_module_statics(&file.items);
+    let pub_use_globs = collect_pub_use_globs(&file.items);
+    let use_globs = collect_use_globs(&file.items);
     ParsedInterpreter {
         file,
         module_path: String::new(),
         use_imports,
         module_statics,
+        pub_use_globs,
+        use_globs,
     }
 }
 
@@ -266,11 +299,15 @@ pub fn parse_source_with_module(source: &str, module_path: &str) -> ParsedInterp
     let file = syn::parse_file(source).expect("failed to parse bundled source");
     let use_imports = collect_use_imports(&file.items);
     let module_statics = collect_module_statics(&file.items);
+    let pub_use_globs = collect_pub_use_globs(&file.items);
+    let use_globs = collect_use_globs(&file.items);
     ParsedInterpreter {
         file,
         module_path: module_path.to_string(),
         use_imports,
         module_statics,
+        pub_use_globs,
+        use_globs,
     }
 }
 
@@ -294,6 +331,105 @@ pub(crate) fn collect_use_imports(items: &[Item]) -> std::collections::HashMap<S
         }
     }
     imports
+}
+
+/// Walk every file-root `pub use <path>::*;` and collect the source
+/// path segments (after `crate::` / `self::` are stripped, with
+/// internal pyre-crate roots also stripped to mirror the rest of the
+/// analyzer's namespace normalisation).  Non-`pub` use globs are
+/// excluded — those are private imports only the file itself can
+/// resolve through, never visible to external callers.
+///
+/// `pub use foo::*` (no `crate::`) and globs rooted in external
+/// crates (`std`, `core`, `alloc`, well-known external workspace
+/// crates) are also skipped: pyre cannot synthesise sensible aliases
+/// for them without re-walking the target module, and the function-
+/// registry only carries pyre-source paths in the first place.
+pub(crate) fn collect_pub_use_globs(items: &[Item]) -> Vec<Vec<String>> {
+    let mut out = Vec::new();
+    for item in items {
+        let Item::Use(u) = item else {
+            continue;
+        };
+        if !matches!(u.vis, syn::Visibility::Public(_)) {
+            continue;
+        }
+        walk_pub_use_for_globs(&u.tree, &mut Vec::new(), &mut out);
+    }
+    out
+}
+
+/// Walk every file-root `use <path>::*` (non-`pub`) statement and
+/// collect the source-path segments (after `crate::` / `self::` /
+/// pyre-internal-crate-alias roots are stripped).  Mirrors
+/// [`collect_pub_use_globs`] but for plain `use` instead of `pub use`.
+/// The result is stored on [`ParsedInterpreter::use_globs`] and
+/// consumed by `front::ast::build_semantic_program_*_with_options`,
+/// which expands each glob root into explicit `use_imports` entries
+/// at semantic build time.
+pub(crate) fn collect_use_globs(items: &[Item]) -> Vec<Vec<String>> {
+    let mut out = Vec::new();
+    for item in items {
+        let Item::Use(u) = item else {
+            continue;
+        };
+        if matches!(u.vis, syn::Visibility::Public(_)) {
+            continue;
+        }
+        walk_pub_use_for_globs(&u.tree, &mut Vec::new(), &mut out);
+    }
+    out
+}
+
+fn walk_pub_use_for_globs(
+    tree: &syn::UseTree,
+    prefix: &mut Vec<String>,
+    out: &mut Vec<Vec<String>>,
+) {
+    match tree {
+        syn::UseTree::Path(p) => {
+            prefix.push(p.ident.to_string());
+            walk_pub_use_for_globs(&p.tree, prefix, out);
+            prefix.pop();
+        }
+        syn::UseTree::Glob(_) => {
+            let stripped = strip_glob_root(prefix);
+            if !stripped.is_empty() {
+                out.push(stripped);
+            }
+        }
+        syn::UseTree::Group(g) => {
+            for sub in &g.items {
+                walk_pub_use_for_globs(sub, prefix, out);
+            }
+        }
+        syn::UseTree::Name(_) | syn::UseTree::Rename(_) => {
+            // Named re-exports (`pub use crate::M::name`) are handled
+            // by the regular `walk_use_tree` namespace machinery via
+            // `use_imports` — only Glob entries need the per-source
+            // alias-fan-out at registration time.
+        }
+    }
+}
+
+/// Strip the leading namespace-root token (`crate`, `self`, or a
+/// well-known pyre crate alias) so the stored segments match the
+/// `func.module_path` shape used downstream (`pyre-interpreter/src/
+/// foo.rs` → module path `"foo"`, segments `["foo"]`).
+fn strip_glob_root(prefix: &[String]) -> Vec<String> {
+    if prefix.is_empty() {
+        return Vec::new();
+    }
+    let first = prefix[0].as_str();
+    let is_local_root = matches!(first, "crate" | "self");
+    let is_pyre_alias = PYRE_INTERNAL_CRATES.contains(&first);
+    if is_local_root || is_pyre_alias {
+        prefix[1..].iter().cloned().collect()
+    } else {
+        // External crates / stdlib — skip.  Returning empty signals
+        // the caller to drop this entry.
+        Vec::new()
+    }
 }
 
 /// Walk every `Item::Const` and `Item::Static` and collect
@@ -1249,14 +1385,17 @@ fn collect_inherent_methods_from_items(
 ///
 /// Duplicate opcode selectors are rejected. Silently keeping the first arm
 /// would hide dispatch drift in the interpreter source.
-pub fn extract_opcode_dispatch_arms(parsed: &ParsedInterpreter) -> Vec<ExtractedOpcodeArm> {
+pub fn extract_opcode_dispatch_arms(
+    parsed: &ParsedInterpreter,
+    fn_return_types: &std::collections::HashMap<String, String>,
+) -> Vec<ExtractedOpcodeArm> {
     let Some(func) = find_function(parsed, "execute_opcode_step") else {
         return Vec::new();
     };
     let Some(opcode_match) = find_opcode_match(func) else {
         return Vec::new();
     };
-    reject_duplicate_opcode_selectors(extract_match_arms(opcode_match, &func.sig))
+    reject_duplicate_opcode_selectors(extract_match_arms(opcode_match, &func.sig, fn_return_types))
 }
 
 /// Extract receiver -> trait bounds for `execute_opcode_step`.
@@ -1324,7 +1463,11 @@ pub fn collect_function_graphs(
 /// a panic rather than silently dropping the arm's graph.  Silently
 /// dropping would let a `PipelineOpcodeArm` reach the codewriter
 /// without the semantic graph the downstream jitcode path depends on.
-fn extract_match_arms(expr: &ExprMatch, sig: &syn::Signature) -> Vec<ExtractedOpcodeArm> {
+fn extract_match_arms(
+    expr: &ExprMatch,
+    sig: &syn::Signature,
+    fn_return_types: &std::collections::HashMap<String, String>,
+) -> Vec<ExtractedOpcodeArm> {
     expr.arms
         .iter()
         .map(|arm| {
@@ -1347,6 +1490,7 @@ fn extract_match_arms(expr: &ExprMatch, sig: &syn::Signature) -> Vec<ExtractedOp
                 &mut graph,
                 &arm.body,
                 Some(sig),
+                fn_return_types,
             )
             .unwrap_or_else(|e| {
                 panic!("opcode dispatch arm `{name}` must lower without FlowingError: {e:?}")
@@ -2206,7 +2350,7 @@ mod tests {
             }
         "#,
         );
-        let arms = extract_opcode_dispatch_arms(&parsed);
+        let arms = extract_opcode_dispatch_arms(&parsed, &std::collections::HashMap::new());
         let selectors: Vec<String> = arms
             .iter()
             .map(|arm| arm.selector.canonical_key())
@@ -2235,6 +2379,6 @@ mod tests {
             }
         "#,
         );
-        let _ = extract_opcode_dispatch_arms(&parsed);
+        let _ = extract_opcode_dispatch_arms(&parsed, &std::collections::HashMap::new());
     }
 }

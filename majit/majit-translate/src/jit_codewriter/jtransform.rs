@@ -991,6 +991,116 @@ impl<'a> Transformer<'a> {
                 });
                 RewriteResult::Replace(ops)
             }
+            // PRE-EXISTING-ADAPTATION (no direct RPython precedent): pyre-
+            // side recovery when integer comparisons reach jtransform with
+            // a Ref-typed operand because the rtyper-equivalent did not
+            // stamp the operand's `concretetype` (or an `lltype.
+            // cast_ptr_to_int` was elided from the SSA chain).  RPython's
+            // rtyper inserts the cast at the rtyper layer
+            // (`rpython/rtyper/rint.py`), so by the time `jtransform.py`
+            // observes the comparison the operands are uniformly `Signed`;
+            // pyre's lighter rtyper leaves the generic `BinOp` in place
+            // with one or both operands defaulting to `'r'` kind, so the
+            // unconditional `int_<op>` prefix at
+            // `assembler.rs:3160` would emit `int_eq/ir>i` /
+            // `int_le/ri>i` opnames that no RPython blackhole handler
+            // registers (see
+            // `default_bh_builder_unwired_set_matches_task_85_snapshot`).
+            //
+            // Reviewer 2026-05-24 round — coverage covers all six
+            // comparison ops (`eq`/`ne`/`lt`/`le`/`gt`/`ge`).  The
+            // earlier "eq/ne only" restriction surfaced `int_le/r*`
+            // as unwired blackhole opnames, breaking the Task #85
+            // expected-empty snapshot.  RPython has no `ptr_lt` family,
+            // but `cast_ptr_to_int` followed by `int_lt`/`int_le`
+            // matches what `rpython/rtyper/rint.py` emits for any
+            // comparison whose operands cross the ptr/int boundary —
+            // the cast is rtyper-orthodox, the resulting `int_<cmp>/ii>i`
+            // opname is wired by the blackhole.  Producer-side fix
+            // for the missing rtyper cast remains the canonical
+            // convergence path; this jtransform recovery is the
+            // bridge until that lands.
+            // eq/ne with BOTH operands ref-kind → emit ptr_eq / ptr_ne
+            // directly.  PyPy `rpython/rtyper/rptr.py:167-184
+            // pairtype(PtrRepr, Repr).rtype_eq/ne` calls
+            // `hop.inputargs(r_ptr, r_ptr)` (both already ptr-typed in
+            // this branch — no cast) and emits `ptr_eq` / `ptr_ne`.
+            // Pyre's blackhole has `bhimpl_ptr_eq` / `bhimpl_ptr_ne`
+            // wired at `bh_binop_r_to_i`, so the resulting
+            // `ptr_eq/rr>i` opname dispatches without going through
+            // `cast_ptr_to_int`.
+            OpKind::BinOp {
+                op: binop_name,
+                lhs,
+                rhs,
+                result_ty,
+            } if matches!(binop_name.as_str(), "eq" | "ne")
+                && self.get_value_kind_var(lhs) == 'r'
+                && self.get_value_kind_var(rhs) == 'r' =>
+            {
+                self.stamp_value_kind(
+                    graph,
+                    op.result.clone(),
+                    crate::jit_codewriter::type_state::ConcreteType::Signed,
+                );
+                let ptr_op = if binop_name == "eq" {
+                    "ptr_eq"
+                } else {
+                    "ptr_ne"
+                };
+                RewriteResult::Replace(vec![SpaceOperation {
+                    result: op.result.clone(),
+                    kind: OpKind::BinOp {
+                        op: ptr_op.into(),
+                        lhs: lhs.clone(),
+                        rhs: rhs.clone(),
+                        result_ty: result_ty.clone(),
+                    },
+                }])
+            }
+            // Mixed-kind eq/ne (one ref + one int) or any ordered
+            // ref-cmp (lt/le/gt/ge with a ref operand) — PRE-EXISTING
+            // ADAPTATION: pyre's frontend admits source patterns
+            // RPython does not (PyPy `rptr.py` only registers eq/ne for
+            // PtrRepr pairtype, never `<`/`<=`/`>`/`>=`; mixed
+            // ref+int eq/ne would surface as a TyperError at PyPy's
+            // `inputargs(r_ptr, r_ptr)` convertfromrepr step).  Pyre
+            // bridges by coercing every ref operand through
+            // `cast_ptr_to_int` and emitting `int_<op>`.  The canonical
+            // PyPy-orthodox close is fixing the source patterns
+            // upstream (use `is_null()` / explicit `as` cast) or
+            // moving the cast emission into pyre's rtyper rint
+            // compare-template — Task #146 deferred multi-session.
+            OpKind::BinOp {
+                op: binop_name,
+                lhs,
+                rhs,
+                result_ty,
+            } if matches!(binop_name.as_str(), "eq" | "ne" | "lt" | "le" | "gt" | "ge")
+                && matches!(self.get_value_kind_var(lhs), 'i' | 'r')
+                && matches!(self.get_value_kind_var(rhs), 'i' | 'r')
+                && (self.get_value_kind_var(lhs) == 'r' || self.get_value_kind_var(rhs) == 'r') =>
+            {
+                self.stamp_value_kind(
+                    graph,
+                    op.result.clone(),
+                    crate::jit_codewriter::type_state::ConcreteType::Signed,
+                );
+                let (lhs_var, lhs_pre_ops) = self.coerce_operand_to_int(graph, lhs);
+                let (rhs_var, rhs_pre_ops) = self.coerce_operand_to_int(graph, rhs);
+                let mut ops = lhs_pre_ops;
+                ops.extend(rhs_pre_ops);
+                ops.push(SpaceOperation {
+                    result: op.result.clone(),
+                    kind: OpKind::BinOp {
+                        op: binop_name.clone(),
+                        lhs: lhs_var,
+                        rhs: rhs_var,
+                        result_ty: result_ty.clone(),
+                    },
+                });
+                RewriteResult::Replace(ops)
+            }
             OpKind::BinOp {
                 op: binop_name,
                 lhs,
@@ -3862,7 +3972,11 @@ fn remap_op(
         | OpKind::CurrentTraceLength
         | OpKind::Live
         | OpKind::LoopHeader { .. }
-        | OpKind::Abort { .. } => op.kind.clone(),
+        | OpKind::Abort { .. }
+        | OpKind::LoadStatic { .. } => op.kind.clone(),
+        OpKind::NewTuple { args } => OpKind::NewTuple {
+            args: args.iter().map(|a| remap_value(a, aliases)).collect(),
+        },
         OpKind::GuardValue { value, kind_char } => OpKind::GuardValue {
             value: remap_value(value, aliases),
             kind_char: *kind_char,
@@ -4414,6 +4528,7 @@ mod tests {
                 OpKind::Input {
                     name: "x".into(),
                     ty: ValueType::Int,
+                    class_root: None,
                 },
                 true,
             )
@@ -4456,6 +4571,7 @@ mod tests {
                 OpKind::Input {
                     name: "x".into(),
                     ty: ValueType::Int,
+                    class_root: None,
                 },
                 true,
             )
@@ -4510,6 +4626,7 @@ mod tests {
                 OpKind::Input {
                     name: "receiver".into(),
                     ty: ValueType::Ref(None),
+                    class_root: None,
                 },
                 true,
             )
@@ -4567,6 +4684,7 @@ mod tests {
                 OpKind::Input {
                     name: "lhs".into(),
                     ty: ValueType::Int,
+                    class_root: None,
                 },
                 true,
             )
@@ -4577,6 +4695,7 @@ mod tests {
                 OpKind::Input {
                     name: "rhs".into(),
                     ty: ValueType::Float,
+                    class_root: None,
                 },
                 true,
             )
@@ -4641,6 +4760,7 @@ mod tests {
                 OpKind::Input {
                     name: "lhs".into(),
                     ty: ValueType::Float,
+                    class_root: None,
                 },
                 true,
             )
@@ -4651,6 +4771,7 @@ mod tests {
                 OpKind::Input {
                     name: "rhs".into(),
                     ty: ValueType::Int,
+                    class_root: None,
                 },
                 true,
             )
@@ -4715,6 +4836,7 @@ mod tests {
                 OpKind::Input {
                     name: "lhs".into(),
                     ty: ValueType::Int,
+                    class_root: None,
                 },
                 true,
             )
@@ -4725,6 +4847,7 @@ mod tests {
                 OpKind::Input {
                     name: "rhs".into(),
                     ty: ValueType::Float,
+                    class_root: None,
                 },
                 true,
             )
@@ -5137,6 +5260,7 @@ mod tests {
                 OpKind::Input {
                     name: "lhs".into(),
                     ty: ValueType::Unknown,
+                    class_root: None,
                 },
                 true,
             )
@@ -5147,6 +5271,7 @@ mod tests {
                 OpKind::Input {
                     name: "rhs".into(),
                     ty: ValueType::Unknown,
+                    class_root: None,
                 },
                 true,
             )
@@ -5217,6 +5342,7 @@ mod tests {
                 OpKind::Input {
                     name: "lhs".into(),
                     ty: ValueType::Int,
+                    class_root: None,
                 },
                 true,
             )
@@ -5227,6 +5353,7 @@ mod tests {
                 OpKind::Input {
                     name: "rhs".into(),
                     ty: ValueType::Int,
+                    class_root: None,
                 },
                 true,
             )
@@ -5297,6 +5424,7 @@ mod tests {
                 OpKind::Input {
                     name: "lhs".into(),
                     ty: ValueType::Int,
+                    class_root: None,
                 },
                 true,
             )
@@ -5307,6 +5435,7 @@ mod tests {
                 OpKind::Input {
                     name: "rhs".into(),
                     ty: ValueType::Int,
+                    class_root: None,
                 },
                 true,
             )
@@ -5374,6 +5503,7 @@ mod tests {
                 OpKind::Input {
                     name: "lhs".into(),
                     ty: ValueType::Int,
+                    class_root: None,
                 },
                 true,
             )
@@ -5384,6 +5514,7 @@ mod tests {
                 OpKind::Input {
                     name: "rhs".into(),
                     ty: ValueType::Int,
+                    class_root: None,
                 },
                 true,
             )
@@ -5447,6 +5578,7 @@ mod tests {
                 OpKind::Input {
                     name: "arg".into(),
                     ty: ValueType::Ref(None),
+                    class_root: None,
                 },
                 true,
             )
@@ -5789,6 +5921,7 @@ mod tests {
                 OpKind::Input {
                     name: "cell".to_string(),
                     ty: ValueType::Ref(None),
+                    class_root: None,
                 },
                 true,
             )
@@ -5859,6 +5992,7 @@ mod tests {
                 OpKind::Input {
                     name: "p".to_string(),
                     ty: ValueType::Ref(None),
+                    class_root: None,
                 },
                 true,
             )
@@ -6374,6 +6508,7 @@ mod tests {
                 OpKind::Input {
                     name: "self".to_string(),
                     ty: ValueType::Ref(None),
+                    class_root: None,
                 },
                 true,
             )
@@ -6418,6 +6553,7 @@ mod tests {
                 OpKind::Input {
                     name: "handler".to_string(),
                     ty: ValueType::Unknown,
+                    class_root: None,
                 },
                 true,
             )
@@ -6511,6 +6647,7 @@ mod tests {
                 OpKind::Input {
                     name: "handler".to_string(),
                     ty: ValueType::Unknown,
+                    class_root: None,
                 },
                 true,
             )
@@ -6596,6 +6733,7 @@ mod tests {
                 OpKind::Input {
                     name: "self".into(),
                     ty: ValueType::Ref(None),
+                    class_root: None,
                 },
                 true,
             )
@@ -6606,6 +6744,7 @@ mod tests {
                     OpKind::Input {
                         name: format!("a{i}"),
                         ty: ty.clone(),
+                        class_root: None,
                     },
                     true,
                 )
@@ -6650,6 +6789,7 @@ mod tests {
                 OpKind::Input {
                     name: "self".into(),
                     ty: ValueType::Ref(None),
+                    class_root: None,
                 },
                 true,
             )
@@ -6663,6 +6803,7 @@ mod tests {
                         OpKind::Input {
                             name: format!("a{i}"),
                             ty: ty.clone(),
+                            class_root: None,
                         },
                         true,
                     )
@@ -6849,6 +6990,7 @@ mod tests {
                 OpKind::Input {
                     name: "self".into(),
                     ty: ValueType::Ref(None),
+                    class_root: None,
                 },
                 true,
             )
@@ -6859,6 +7001,7 @@ mod tests {
                     OpKind::Input {
                         name: format!("a{i}"),
                         ty: ty.clone(),
+                        class_root: None,
                     },
                     true,
                 )
@@ -6901,6 +7044,7 @@ mod tests {
                 OpKind::Input {
                     name: "self".into(),
                     ty: ValueType::Ref(None),
+                    class_root: None,
                 },
                 true,
             )
@@ -6914,6 +7058,7 @@ mod tests {
                         OpKind::Input {
                             name: format!("a{i}"),
                             ty: ty.clone(),
+                            class_root: None,
                         },
                         true,
                     )

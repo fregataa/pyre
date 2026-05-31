@@ -208,10 +208,29 @@ pub(crate) fn build_value_to_variable_map(legacy: &FunctionGraph) -> SlotToVaria
         }
 
         // Class 1b — op-result definitions, with Input rebind aliasing.
+        //
+        // `OpKind::Abort` (pyre-only front-end marker for unsupported
+        // expression forms — `front/ast.rs::continue_with_unknown` /
+        // `stop_unsupported`) is intentionally NOT seeded into
+        // `value_to_var`.  `translate_op`'s Abort arm emits no
+        // flowspace op (`flowspace_adapter.rs:648 OpKind::Abort { .. }
+        // => Ok(Vec::new())`), so seeding the result_var here would
+        // hand consumer ops a `Hlvalue::Variable` that never gets
+        // *defined* by any emitted flowspace op — `checkgraph`
+        // (`flowspace/model.rs::checkgraph`) then panics with
+        // "variable used before definition" at the consumer's arg
+        // slot, NOT at the missing-operand site.  Skipping the seed
+        // here forces the first consumer's `lookup_operand` to fail
+        // with "undefined operand ValueId" instead (`is_known_unported`
+        // already matches that substring; the dual gate Skip-classifies
+        // the graph cleanly at the producer-adjacent site).
         for op in &block.operations {
             let Some(result_var) = op.result.as_ref() else {
                 continue;
             };
+            if matches!(op.kind, OpKind::Abort { .. }) {
+                continue;
+            }
             let Some(result) = legacy.slot_of(result_var) else {
                 continue;
             };
@@ -617,6 +636,7 @@ pub(crate) fn translate_op_is_skipped(kind: &OpKind) -> bool {
             | OpKind::GuardFalse { .. }
             | OpKind::GuardValue { .. }
             | OpKind::VableForce { .. }
+            | OpKind::Abort { .. }
     )
 }
 
@@ -676,6 +696,103 @@ pub fn translate_op(
         | OpKind::GuardFalse { .. }
         | OpKind::GuardValue { .. }
         | OpKind::VableForce { .. } => Ok(Vec::new()),
+
+        // ─── pyre-only `OpKind::Abort` marker ───
+        // Front-end `lower_expr::stop_unsupported` / `continue_with_unknown`
+        // emit this when the surface Rust DSL hits an unsupported
+        // expression form (unsupported lit, ForLoop, Closure, Macro,
+        // …).  RPython upstream raises `FlowingError`
+        // (`flowspace/flowcontext.py:258,417`) and drops the function
+        // before annotator/rtyper see it, so there is no upstream
+        // analogue.  The Slice 10C `SomeInstance(None) -> Ptr -> GcRef`
+        // synthesis was reverted because the `classdef=None` result
+        // tripped downstream `find_attribute` lookups.
+        //
+        // Post-`FORCE_ATTRIBUTES_INTO_CLASSES` pre-population (struct
+        // field projection by `register_struct_fields`) impl-method
+        // `self` narrows to a populated
+        // ClassDef, so the original classdef:None cascade is no longer
+        // triggered by the receiver projection.  Abort's own
+        // result_var is still un-narrowed, but every front-end
+        // emit-site falls into one of two shapes:
+        //
+        //   (a) `stop_unsupported` — pushes Abort and returns
+        //       `Err(FlowingError::Unsupported)`; the parent `?`
+        //       ladder aborts the body before any operand reads the
+        //       result_var.  No downstream consumer ⇒ skipping is
+        //       safe.
+        //
+        //   (b) `continue_with_unknown` — pushes Abort and returns
+        //       the result_var as a `Lowered.value`.  Callers may
+        //       consume it; for those, the absent translate output
+        //       leaves the result_var unmapped in `value_to_var`,
+        //       and the first consumer surfaces a fail-loud
+        //       "undefined operand ValueId" message that
+        //       `is_known_unported` classifies as Skip — same
+        //       outcome as the prior "post-rtyper jtransform
+        //       variant" Skip, just at a more localised site.
+        //
+        // Convergence: each emit-site is retired by lowering the
+        // specific expression form properly (per-variant epic —
+        // `ConstStr`, `Range`, `Closure`, etc.).  Until then this
+        // arm absorbs the placeholder silently so the dual-gate
+        // doesn't have to round-trip through a TyperError just to
+        // re-classify as Skip.
+        OpKind::Abort { .. } => Ok(Vec::new()),
+
+        // ─── `newtuple` — RPython `BUILD_TUPLE` / `space.newtuple` ───
+        // `PureOperation` (`operation.py:542-548`).  Each `args[i]`
+        // Variable is routed through `value_map` so the legacy
+        // flowspace SpaceOperation references the same Hlvalue
+        // identities the graph validator (`checkgraph`) tracks; using
+        // raw model-side Variables here would trip
+        // "variable used before definition" when an earlier op
+        // remapped its result to a different legacy Variable.
+        OpKind::NewTuple { args } => {
+            let mut hl_args: Vec<Hlvalue> = Vec::with_capacity(args.len());
+            for (i, var) in args.iter().enumerate() {
+                let vid = operand_value_id(graph, var, op, "arg")?;
+                let role = format!("arg{i}");
+                hl_args.push(lookup_operand(value_map, vid, op, &role)?);
+            }
+            let result = resolve_result_hlvalue(op, value_map, graph)?;
+            Ok(vec![FlowspaceOp::new("newtuple", hl_args, result)])
+        }
+
+        // ─── `LoadStatic` — Z2.5 Cat 2.1 single-segment static lookup ─
+        // Pyre-only marker emitted by `front/ast.rs::lower_expr` when
+        // `Expr::Path` resolves to a crate-level `static` declaration
+        // (SHOUTY_CASE constant like `GC_WEAKREF_TYPE`).  RPython
+        // peer: `LOAD_GLOBAL` (`flowspace/flowcontext.py:1098`)
+        // resolves the name lookup to a `Constant(value)` directly
+        // — no SpaceOperation is emitted, and the bound `Variable`
+        // *is* the graph-level definition.  Pyre always emits an op
+        // here so cross-block reads have a defined producer (the
+        // `checkgraph` defining-var set requires every operand to
+        // trace to an op result or `Block.inputargs`).
+        //
+        // Slice C: when `extract_static_decls` could fold the static's
+        // RHS to a `ConstValue` (`bool` / integer / float / string
+        // literals + `const { LIT }` block wrapper), the adapter
+        // emits `same_as(Constant(value))` — the concrete `Constant`
+        // shape PyPy `LOAD_GLOBAL` pushes.  For unresolved RHS
+        // (host calls, `LazyLock::new(...)`, `std::ptr::null_mut()`,
+        // struct ctors, etc.) the adapter falls back to a
+        // `UniStr(joined_path)` sentinel — the rtyper's `same_as`
+        // arm (`rtyper.rs::translate_op "same_as"`) still treats
+        // both shapes as identity, but only the resolved-value
+        // arm matches the upstream `Constant(value)` payload
+        // contract.
+        OpKind::LoadStatic {
+            segments, value, ..
+        } => {
+            let constant = match value {
+                Some(v) => Hlvalue::Constant(Constant::new(v.clone())),
+                None => Hlvalue::Constant(Constant::new(ConstValue::UniStr(segments.join("::")))),
+            };
+            let result = resolve_result_hlvalue(op, value_map, graph)?;
+            Ok(vec![FlowspaceOp::new("same_as", vec![constant], result)])
+        }
 
         // ─── Pre-rtyper opname normalization ───
         // `binary_op_name` (`front/ast.rs:3227-3258`) emits Rust-side
@@ -924,6 +1041,34 @@ pub fn translate_op(
                 // by the registry) and routes through
                 // `FunctionRepr::call(hop)` (`rpbc.py:199`).
                 CallTarget::FunctionPath { segments } => {
+                    // `hint_promote_or_string` is a synthesised marker
+                    // emitted by `front/ast.rs::synthesize_or_passthrough`
+                    // (~`ast.rs:1246-1248`) when the elidable_promote
+                    // decorator wraps a function — it inserts
+                    // `let __self_promoted = hint_promote_or_string(self);`
+                    // for each promoted arg.  Upstream RPython
+                    // `rlib/jit.py:191-194` lifts this through a host
+                    // function that, in non-JIT contexts, is an identity
+                    // (`hint(x, promote_string=True)` returns `x`).  The
+                    // marker has no source-level implementation in pyre,
+                    // so the registry can never resolve it; lower it here
+                    // as `same_as(arg)` — the RPython internal renaming
+                    // op (`rtyper.py:478-481`) the rtyper already
+                    // handles via `rbuiltin::rtype_same_as`.  Tracing-
+                    // time JIT promotion semantics still get applied via
+                    // the wrapper's outer call structure and the rtyper-
+                    // side `hint` op recognition (`rtyper.rs:2033 "hint"`
+                    // arm); the inner identity is all the marker
+                    // contributes outside the JIT lift.
+                    if segments.len() == 1 && segments[0] == "hint_promote_or_string" {
+                        let mut iter = arg_hls.into_iter();
+                        let arg = iter.next().ok_or_else(|| {
+                            TyperError::message(
+                                "hint_promote_or_string requires at least one arg".to_string(),
+                            )
+                        })?;
+                        return Ok(vec![FlowspaceOp::new("same_as", vec![arg], result)]);
+                    }
                     let key =
                         crate::translator::rtyper::pyre_call_registry::FunctionPathKey::from_segments(
                             segments.iter().cloned(),
@@ -1021,52 +1166,94 @@ pub fn translate_op(
                             )?;
                             module.module_get(&full_segments[full_segments.len() - 1])
                         };
-                    let callable_host = if let Some(entry) = call_registry.lookup(&key) {
-                        entry.host_object.clone()
-                    } else if segments.len() == 1
-                        && let Some(builtin) = HOST_ENV.lookup_builtin(&segments[0])
-                    {
-                        builtin
-                    } else if let Some(attr) = resolve_via_use_imports() {
-                        // Branch 3a — caller imported `segments[0]`;
-                        // upstream-orthodox `frame.globals[<alias>]`
-                        // resolution path.
-                        attr
-                    } else if segments.len() >= 2
-                        && let Some(module) =
-                            HOST_ENV.import_module(&segments[..segments.len() - 1].join("."))
-                        && let Some(attr) = module.module_get(&segments[segments.len() - 1])
-                    {
-                        // Branch 3b — fully-qualified inline path,
-                        // TODO as documented above.
-                        attr
-                    } else if segments.len() == 2
-                        && let Some(entry) = call_registry.lookup_by_method_suffix(segments)
-                    {
-                        // Branch 4 — associated-function call
-                        // `Type::method(self, ...)` whose impl method is
-                        // registered under a module-qualified key
-                        // `[...module..., Type, method]`.  The exact
-                        // lookup at layer 1 missed because the call site
-                        // spells only `[Type, method]`; recover the
-                        // canonical entry by its `[Type, method]` tail,
-                        // mirroring the bound method-call suffix match
-                        // (`call.rs:3155 target_to_path`).  Upstream
-                        // resolves both spellings to one `FunctionDesc`.
-                        entry.host_object.clone()
-                    } else {
-                        return Err(TyperError::message(format!(
-                            "translate_op: OpKind::Call::FunctionPath {{ segments: {:?} }} \
+                    let callable_host =
+                        if let Some(entry) = call_registry.lookup_with_leaf_match(&key) {
+                            // `lookup_with_leaf_match` tries the verbatim key +
+                            // alias indirection (`Self::lookup`), then a cross-
+                            // module leaf-match against free-function entries —
+                            // the registry-build analog of the codewriter-side
+                            // `target_to_path` leaf-match (`call.rs:3043-3104`),
+                            // closing the glob-import gap (`use pyre_object::*;`
+                            // in caller `baseobjspace` referencing a bare name
+                            // with no `use_imports` entry).
+                            entry.host_object.clone()
+                        } else if segments.len() == 1
+                            && let Some(builtin) = HOST_ENV.lookup_builtin(&segments[0])
+                        {
+                            builtin
+                        } else if let Some(attr) = resolve_via_use_imports() {
+                            // Branch 3a — caller imported `segments[0]`;
+                            // upstream-orthodox `frame.globals[<alias>]`
+                            // resolution path.
+                            attr
+                        } else if segments.len() >= 2
+                            && let Some(module) =
+                                HOST_ENV.import_module(&segments[..segments.len() - 1].join("."))
+                            && let Some(attr) = module.module_get(&segments[segments.len() - 1])
+                        {
+                            // Branch 3b — fully-qualified inline path,
+                            // PRE-EXISTING-ADAPTATION as documented above.
+                            attr
+                        } else if segments.len() == 2
+                            && let Some(entry) = call_registry.lookup_by_method_suffix(segments)
+                        {
+                            // Branch 4 — associated-function call
+                            // `Type::method(self, ...)` whose impl method is
+                            // registered under a module-qualified key
+                            // `[...module..., Type, method]`.  The exact
+                            // lookup at layer 1 missed because the call site
+                            // spells only `[Type, method]`; recover the
+                            // canonical entry by its `[Type, method]` tail,
+                            // mirroring the bound method-call suffix match
+                            // (`call.rs:3155 target_to_path`).  Upstream
+                            // resolves both spellings to one `FunctionDesc`.
+                            entry.host_object.clone()
+                        } else if segments.len() == 2
+                            && segments[0] == "simple_call"
+                            && let Some(exc_class) = HOST_ENV.lookup_builtin(&segments[1])
+                        {
+                            // Branch 3c — PRE-EXISTING-ADAPTATION closure
+                            // for `front/raise.rs::lower_exc_from_raise`
+                            // (~`raise.rs:153`).  Upstream RPython
+                            // `flowcontext.py:614/623` emits
+                            // `op.simple_call(const(exc_class), *args)`
+                            // with the class as `args[0]`; pyre stashes
+                            // the class name in `path[1]` of the
+                            // `FunctionPath` because its `Vec<Variable>`
+                            // arg carrier cannot yet hold a
+                            // `Constant(HostObject(class))` alongside
+                            // `Variable`s — that conversion is the
+                            // multi-session `Vec<Variable>` →
+                            // `Vec<LinkArg>` migration (see the
+                            // module-level "PRE-EXISTING-ADAPTATION"
+                            // block in `front/raise.rs:120-126` for the
+                            // detailed rationale).  The downstream
+                            // reconstruction is documented at
+                            // `raise.rs:122-123`:
+                            // > any downstream reader can reconstruct
+                            // > `(op, const_class, args…)` from
+                            // > `(path[0], path[1], op.args)`
+                            // This branch is exactly that
+                            // reconstruction: resolve `path[1]`
+                            // (the exception class name) as a builtin
+                            // HostObject and use it as the simple_call
+                            // callable, leaving `op.args` as the
+                            // trailing message arguments.  TODO retire
+                            // when the LinkArg migration lands.
+                            exc_class
+                        } else {
+                            return Err(TyperError::message(format!(
+                                "translate_op: OpKind::Call::FunctionPath {{ segments: {:?} }} \
                              not registered in PyreCallRegistry, not in HOST_ENV \
                              `__builtin__`, and not a known module-qualified host attribute — \
                              the production builder (a SemanticProgram walker, or a test \
                              fixture building the registry directly) must register the path \
                              with its parameter Signature before specialize_legacy_graph \
                              consults the rtyper. Result slot = {}",
-                            segments,
-                            fmt_op_result_slot(graph, op),
-                        )));
-                    };
+                                segments,
+                                fmt_op_result_slot(graph, op),
+                            )));
+                        };
                     let callable =
                         Hlvalue::Constant(Constant::new(ConstValue::HostObject(callable_host)));
                     let mut call_args = Vec::with_capacity(arg_hls.len() + 1);
@@ -1330,14 +1517,13 @@ fn post_rtyper_jtransform_variant_name(kind: &OpKind) -> Option<&'static str> {
         OpKind::LoopHeader { .. } => "LoopHeader (jtransform.py:1690-1718)",
         // `OpKind::Abort` is pyre-only — RPython raises `FlowingError`
         // (`flowspace/flowcontext.py:258,417`) and drops the function
-        // before reaching the rtyper.  No real-path lowering exists;
-        // the dual-gate Skip-classifies the graph and the legacy path
-        // covers it.  The ratchet that synthesised a
-        // `SomeInstance(None) -> Ptr -> GcRef` projection was a
-        // deviation (no upstream peer) and has been reverted —
-        // closing this entry requires retiring every Abort emit-site
-        // in the front-end (Expr::ForLoop placeholder, etc.) and
-        // replacing them with proper RPython-orthodox lowerings.
+        // before reaching the rtyper.  Now handled by an explicit
+        // `Ok(Vec::new())` arm in `translate_op`, but the diagnostic
+        // name is retained here so the post-rtyper variant table can
+        // still surface the marker if a leak ever reaches it.
+        // Convergence path remains per-variant retirement of the
+        // front-end's `stop_unsupported` / `continue_with_unknown`
+        // emit-sites (`ConstStr`, `Range`, `Closure`, etc.).
         OpKind::Abort { .. } => "Abort (pyre-only abort marker)",
         _ => return None,
     })
@@ -1613,15 +1799,16 @@ fn link_extravar_to_hlvalue(
 ///   `seed_variable` does (`flowspace_adapter.rs:99-115`).
 pub(crate) fn derive_subject_inputcells(
     legacy: &FunctionGraph,
+    // Retained for call-site symmetry with the rtyper entry points; the
+    // receiver's ClassDef is resolved by annotation, not seeded here.
+    _bookkeeper: Option<&Rc<crate::annotator::bookkeeper::Bookkeeper>>,
 ) -> Result<Vec<crate::annotator::model::SomeValue>, TyperError> {
     let startblock = &legacy.blocks[legacy.startblock.0];
-    let mut input_ty_by_result: HashMap<
-        crate::flowspace::model::Variable,
-        &crate::model::ValueType,
-    > = HashMap::new();
+    let mut input_by_result: HashMap<crate::flowspace::model::Variable, &crate::model::ValueType> =
+        HashMap::new();
     for op in &startblock.operations {
         if let (Some(result), OpKind::Input { ty, .. }) = (op.result.as_ref(), &op.kind) {
-            input_ty_by_result.insert(result.clone(), ty);
+            input_by_result.insert(result.clone(), ty);
         }
     }
     let mut cells = Vec::with_capacity(startblock.inputargs.len());
@@ -1635,7 +1822,7 @@ pub(crate) fn derive_subject_inputcells(
             continue;
         }
         // 2. Front-end Input op at the startblock.
-        if let Some(ty) = input_ty_by_result.get(var) {
+        if let Some(&ty) = input_by_result.get(var) {
             let shell = valuetype_to_someshell(ty).ok_or_else(|| {
                 TyperError::message(format!(
                     "derive_subject_inputcells: startblock.inputargs[{idx}] \
@@ -1644,6 +1831,18 @@ pub(crate) fn derive_subject_inputcells(
                      only `ValueType::Unknown` lacks a SomeValue shell)"
                 ))
             })?;
+            // A `Ref` inputarg projects to the abstract `SomeInstance(None)`
+            // that `valuetype_to_someshell` yields; its concrete ClassDef is
+            // resolved by call-propagation during annotation, the way RPython
+            // binds a method to the class observed at its call site
+            // (`description.py:283-305 FunctionDesc.pycall`).  An earlier
+            // pass eager-seeded the receiver here from `OpKind::Input
+            // .class_root` via `getuniqueclassdef_for_struct_root`; that
+            // minted a struct-root ClassDef whose identity differed from the
+            // call-propagated one, leaving the annotation fixpoint dependent
+            // on graph-processing (HashMap) order — non-deterministic
+            // classdef-less-`self` getattr.  Receiver narrowing is left to
+            // annotation.
             cells.push(shell);
             continue;
         }
@@ -1872,7 +2071,14 @@ pub fn function_graph_to_flowspace(
             }
         }
         for legacy_op in &legacy_block.operations {
-            if let (Some(result), OpKind::Input { name, ty: _ }) = (
+            if let (
+                Some(result),
+                OpKind::Input {
+                    name,
+                    ty: _,
+                    class_root: _,
+                },
+            ) = (
                 legacy_op.result.as_ref().and_then(|v| legacy.slot_of(v)),
                 &legacy_op.kind,
             ) {
@@ -1897,7 +2103,14 @@ pub fn function_graph_to_flowspace(
                 continue;
             }
 
-            if let (Some(result), OpKind::Input { name, ty: _ }) = (
+            if let (
+                Some(result),
+                OpKind::Input {
+                    name,
+                    ty: _,
+                    class_root: _,
+                },
+            ) = (
                 legacy_op.result.as_ref().and_then(|v| legacy.slot_of(v)),
                 &legacy_op.kind,
             ) {
@@ -1954,9 +2167,19 @@ pub fn function_graph_to_flowspace(
                 continue;
             }
 
+            // Skip Abort here for the same reason
+            // `build_value_to_variable_map` skips it — `translate_op`
+            // emits no flowspace op for Abort, so seeding its result
+            // would leave the consumer's flowspace arg referencing a
+            // never-defined Variable.  Letting `lookup_operand` fail
+            // at the first consumer surfaces the orthodox
+            // "undefined operand ValueId" message that
+            // `is_known_unported` classifies as Skip at the
+            // producer-adjacent site.
             if let Some(result_var) = legacy_op.result.as_ref()
                 && let Some(result) = legacy.slot_of(result_var)
                 && !value_map.contains_key(&result)
+                && !matches!(legacy_op.kind, OpKind::Abort { .. })
             {
                 let var = seed_variable(result_var);
                 value_to_var.entry(result).or_insert_with(|| var.clone());
@@ -2389,6 +2612,7 @@ mod tests {
                     kind: OpKind::Input {
                         name: "x".to_string(),
                         ty: ValueType::Int,
+                        class_root: None,
                     },
                 },
                 // Rebind: result is fresh; same name → alias to slot 1's Variable.
@@ -2397,6 +2621,7 @@ mod tests {
                     kind: OpKind::Input {
                         name: "x".to_string(),
                         ty: ValueType::Int,
+                        class_root: None,
                     },
                 },
             ],
@@ -2486,6 +2711,7 @@ mod tests {
             kind: OpKind::Input {
                 name: "x".to_string(),
                 ty: ValueType::Int,
+                class_root: None,
             },
         };
         let result = translate_op(&op, &value_map, &empty_call_registry(), &graph)
@@ -2507,6 +2733,7 @@ mod tests {
                 OpKind::Input {
                     name: "x".to_string(),
                     ty: ValueType::Int,
+                    class_root: None,
                 },
                 true,
             )
@@ -2517,6 +2744,7 @@ mod tests {
                 OpKind::Input {
                     name: "y".to_string(),
                     ty: ValueType::Float,
+                    class_root: None,
                 },
                 true,
             )
@@ -2527,6 +2755,7 @@ mod tests {
                 OpKind::Input {
                     name: "z".to_string(),
                     ty: ValueType::Ref(None),
+                    class_root: None,
                 },
                 true,
             )
@@ -2535,7 +2764,7 @@ mod tests {
         graph.push_inputarg_var(entry, y_var);
         graph.push_inputarg_var(entry, z_var);
 
-        let cells = derive_subject_inputcells(&graph)
+        let cells = derive_subject_inputcells(&graph, None)
             .expect("typed Input ops must project to definite SomeValue cells");
         assert_eq!(cells.len(), 3);
         assert!(
@@ -2561,7 +2790,7 @@ mod tests {
         let entry = graph.startblock;
         let orphan = graph.alloc_value_var();
         graph.push_inputarg_var(entry, orphan);
-        let err = derive_subject_inputcells(&graph)
+        let err = derive_subject_inputcells(&graph, None)
             .expect_err("inputarg without matching Input op must surface as TyperError");
         let msg = format!("{err}");
         assert!(
@@ -2580,12 +2809,13 @@ mod tests {
                 OpKind::Input {
                     name: "u".to_string(),
                     ty: ValueType::Unknown,
+                    class_root: None,
                 },
                 true,
             )
             .unwrap();
         graph.push_inputarg_var(entry, var);
-        let err = derive_subject_inputcells(&graph)
+        let err = derive_subject_inputcells(&graph, None)
             .expect_err("ValueType::Unknown has no SomeValue projection");
         let msg = format!("{err}");
         assert!(
@@ -3567,7 +3797,8 @@ mod tests {
         assert_eq!(
             opkind_variant_name(&OpKind::Input {
                 name: "x".into(),
-                ty: ValueType::Int
+                ty: ValueType::Int,
+                class_root: None,
             }),
             "Input"
         );

@@ -389,6 +389,148 @@ impl PyreCallRegistry {
         found
     }
 
+    /// Same as [`Self::lookup`] with an additional caller-scoped
+    /// `use_imports` consultation, then a narrowly-scoped cross-module
+    /// leaf-match fallback for callsites whose verbatim path missed.
+    ///
+    /// Resolution order, in priority:
+    ///
+    /// 1. Verbatim literal lookup ([`Self::lookup`]) — the registered
+    ///    `FunctionPathKey` hits this whenever the caller spelled the
+    ///    callee under one of its registered aliases.
+    /// 2. Caller-relative globals via [`Self::lookup_use_import`] —
+    ///    when the query is `[caller_module, leaf]`, ask the
+    ///    `use_imports` table whether `leaf` was imported into
+    ///    `caller_module`'s lexical scope.  Mirrors
+    ///    `flowcontext.py:845-866 LOAD_GLOBAL` consulting
+    ///    `frame.globals[name]` before the builtins fallback.
+    /// 3. Cross-module leaf-match safety net — scan the registry for
+    ///    free-function entries whose last segment equals the query
+    ///    leaf.  A single match resolves; multiple matches resolve only
+    ///    when they all point at the same `host_object` (alias cluster
+    ///    of one source function).  PyPy has no equivalent of this
+    ///    global scan — it is a PRE-EXISTING-ADAPTATION covering the
+    ///    code paths where the caller's `use_imports` aggregation has
+    ///    not yet captured the import that bound the alias (e.g.
+    ///    crate-level re-exports threaded through `pub use`).  The
+    ///    convergence check keeps the resolution unambiguous; the
+    ///    `query_is_free_fn` filter keeps it from picking up
+    ///    impl-method candidates that share the leaf.
+    ///
+    /// Restrictions match the codewriter-side leaf-match:
+    ///
+    /// - Only single-segment (`["bare"]`) or two-segment
+    ///   (`["caller_module", "bare"]`) keys participate.  Three-plus-
+    ///   segment paths are explicit qualifications and must NOT
+    ///   fuzzy-match — they either resolve verbatim or surface as a
+    ///   real registry miss.
+    /// - Free-function entries only: the `HostObject` must satisfy
+    ///   `is_user_function()`.  Method-shaped hosts (registered via
+    ///   `[impl_type, method_name]` aliases) keep their identity
+    ///   distinct from a same-leaf free function.
+    /// - Multi-match aliases of the same source (identical
+    ///   `host_object` Arc identity) converge on a single resolution.
+    ///
+    /// `PYRE_STRICT_TARGET_TO_PATH=1` (audit-only) disables the
+    /// `use_imports` consultation and the cross-module safety net,
+    /// keeping the strict-mode envelope consistent across
+    /// registry-build and codewriter call resolution.
+    pub fn lookup_with_leaf_match(&self, key: &FunctionPathKey) -> Option<Rc<PyreFunctionEntry>> {
+        if let Some(entry) = self.lookup(key) {
+            return Some(entry);
+        }
+        if std::env::var_os("PYRE_STRICT_TARGET_TO_PATH").is_some() {
+            return None;
+        }
+        let segments = key.segments();
+        if segments.is_empty() || segments.len() > 2 {
+            return None;
+        }
+        let leaf = segments.last()?;
+        // PyPy `flowcontext.py:845-866 LOAD_GLOBAL`-orthodox priority:
+        // when the query is a two-segment `[caller_module, leaf]` path,
+        // consult the caller's `use_imports` (lexical globals) FIRST.
+        // The caller-relative resolution captures `use foo::bar` aliases
+        // and the typical `use ...::*` glob-import path, mirroring
+        // upstream's `frame.globals[name]` consultation before the
+        // cross-module fallback below.
+        if segments.len() == 2 {
+            let caller_module = &segments[0];
+            if let Some(resolved) = self.lookup_use_import(caller_module, leaf) {
+                let resolved_segs: Vec<String> = resolved.split("::").map(str::to_string).collect();
+                let resolved_key = FunctionPathKey::from_segments(resolved_segs.iter().cloned());
+                if let Some(entry) = self.lookup(&resolved_key) {
+                    return Some(entry);
+                }
+            }
+        }
+        // Free-fn vs impl-method shape disambiguator.  A free-fn query
+        // path spells `[module_or_crate, fn_name]` where every pre-leaf
+        // segment is snake_case (module conv); an impl-method path
+        // spells `[..., ImplType, method_name]` where the segment
+        // immediately preceding the leaf is the impl target type
+        // (PascalCase by Rust naming conv).  When the query is a
+        // free-fn shape but the registry has an unrelated impl-method
+        // candidate sharing the leaf identifier (e.g. `OpRef::is_none`
+        // colliding with free-fn `pyre_object::is_none`), the impl
+        // candidate should be rejected — the callsite was already typed
+        // by the caller as a non-method call.  Mirrors PyPy's bookkeeper
+        // never confusing `is_none(obj)` with `obj.is_none()` because
+        // `Constant.value` identity differs (free fn object vs bound
+        // method object); pyre's segment-key carrier reproduces that
+        // distinction structurally.
+        let query_is_free_fn = segments
+            .iter()
+            .rev()
+            .skip(1)
+            .all(|s| !starts_with_uppercase(s));
+        let entries_borrow = self.entries.borrow();
+        let matches: Vec<&Rc<PyreFunctionEntry>> = entries_borrow
+            .iter()
+            .filter(|(k, e)| {
+                if !e.host_object.is_user_function() {
+                    return false;
+                }
+                let cand_segs = k.segments();
+                if cand_segs.last().map(|s| s != leaf).unwrap_or(true) {
+                    return false;
+                }
+                if query_is_free_fn {
+                    // Reject impl-method candidates: the segment
+                    // immediately preceding the leaf is PascalCase
+                    // (impl target type) while every earlier segment is
+                    // snake_case (module path).
+                    if cand_segs.len() >= 2
+                        && let Some(impl_ty) = cand_segs.iter().rev().nth(1)
+                        && starts_with_uppercase(impl_ty)
+                    {
+                        return false;
+                    }
+                }
+                true
+            })
+            .map(|(_, e)| e)
+            .collect();
+        if matches.len() == 1 {
+            return Some(matches[0].clone());
+        }
+        if !matches.is_empty() {
+            // Multi-alias convergence: free-function registration
+            // dual-publishes each graph under several segment-key
+            // shapes (canonical + crate-stripped + alias).  When all
+            // matches point at the same `host_object` identity
+            // (`HostObject`'s `PartialEq` is Arc-pointer equality at
+            // `flowspace/model.rs:208`), the alias cluster is
+            // unambiguous.
+            let first_host = matches[0].host_object.clone();
+            let all_same = matches.iter().all(|e| e.host_object == first_host);
+            if all_same {
+                return Some(matches[0].clone());
+            }
+        }
+        None
+    }
+
     /// Look up or insert. The first caller for a given path:
     ///
     /// 1. constructs a synthetic `GraphFunc` (`name` = `key.name()`,
@@ -584,6 +726,16 @@ impl PyreCallRegistry {
     // readers must consult `Variable.concretetype` directly through
     // the `PyGraph.graph` already cached on the `PyreFunctionEntry.
     // function_desc.cache`.
+}
+
+/// Rust naming convention shape check: PascalCase / leading-uppercase
+/// idents are type / struct / enum names (impl method receivers); all-
+/// snake_case idents are modules / functions / primitives.  Used by
+/// [`PyreCallRegistry::lookup_with_leaf_match`] to distinguish
+/// `Type::method` candidates from `module::fn` candidates when the
+/// query path's shape disagrees.
+fn starts_with_uppercase(s: &str) -> bool {
+    s.chars().next().is_some_and(|c| c.is_ascii_uppercase())
 }
 
 #[cfg(test)]
@@ -848,4 +1000,90 @@ mod tests {
     // which builds a real lifted leaf PyGraph via
     // `lift_callee_to_pygraph` and verifies the cache pre-fill lets
     // the rtyper resolve the call to `Signed`.
+
+    #[test]
+    fn lookup_with_leaf_match_prefers_free_fn_over_impl_method_collision() {
+        // Free-fn `pyre_object::is_none` colliding with impl-method
+        // `OpRef::is_none` (unrelated `Option::is_none`-style helper on
+        // a primitive enum).  A bare-call query `["pyre_object",
+        // "is_none"]` (free-fn shape — every pre-leaf segment
+        // snake_case) must resolve to the free fn, not the impl method
+        // — `Bookkeeper.getdesc(Constant(is_none))` would key on the
+        // free-fn Python callable identity, never colliding with the
+        // bound-method object.
+        let bk = Rc::new(Bookkeeper::new());
+        let registry = PyreCallRegistry::new(bk);
+        let free_fn = registry.get_or_register(
+            FunctionPathKey::from_segments(["pyobject", "is_none"]),
+            signature(&["obj"]),
+        );
+        let _impl_method = registry.get_or_register(
+            FunctionPathKey::from_segments(["resoperation", "OpRef", "is_none"]),
+            signature(&["self"]),
+        );
+        let resolved = registry
+            .lookup_with_leaf_match(&FunctionPathKey::from_segments(["pyre_object", "is_none"]))
+            .expect("free-fn-shape query must resolve via leaf-match");
+        assert!(
+            Rc::ptr_eq(&resolved, &free_fn),
+            "leaf-match must pick the free-fn registration when the query is free-fn shape, \
+             not the colliding impl-method one"
+        );
+    }
+
+    #[test]
+    fn lookup_with_leaf_match_still_resolves_impl_method_when_no_free_fn() {
+        // No free-fn `is_none` registered, only the impl method.  The
+        // free-fn-shape query should fall through and return None
+        // rather than incorrectly latching onto the impl method —
+        // upstream would surface the same "no such free fn" gap as a
+        // bookkeeper lookup miss.
+        let bk = Rc::new(Bookkeeper::new());
+        let registry = PyreCallRegistry::new(bk);
+        let _impl_method = registry.get_or_register(
+            FunctionPathKey::from_segments(["resoperation", "OpRef", "is_none"]),
+            signature(&["self"]),
+        );
+        let resolved = registry
+            .lookup_with_leaf_match(&FunctionPathKey::from_segments(["pyre_object", "is_none"]));
+        assert!(
+            resolved.is_none(),
+            "free-fn-shape query must NOT silently latch onto an impl-method \
+             candidate sharing the leaf identifier"
+        );
+    }
+
+    #[test]
+    fn lookup_with_leaf_match_uses_caller_use_imports_before_global_scan() {
+        // PyPy `flowcontext.py:845-866 LOAD_GLOBAL` parity — given two
+        // free functions named `helper` (one in `mod_a`, one in
+        // `mod_b`), a `[caller, helper]` query must resolve to whatever
+        // `caller`'s `use_imports` declares the alias to, not whichever
+        // global-leaf-scan match the registry iteration order yields.
+        let bk = Rc::new(Bookkeeper::new());
+        let registry = PyreCallRegistry::new(bk);
+        let _a = registry.get_or_register(
+            FunctionPathKey::from_segments(["mod_a", "helper"]),
+            signature(&["x"]),
+        );
+        let b = registry.get_or_register(
+            FunctionPathKey::from_segments(["mod_b", "helper"]),
+            signature(&["x"]),
+        );
+        let mut imports = std::collections::HashMap::new();
+        imports.insert(
+            ("caller".to_string(), "helper".to_string()),
+            "mod_b::helper".to_string(),
+        );
+        registry.set_use_imports(imports);
+        let resolved = registry
+            .lookup_with_leaf_match(&FunctionPathKey::from_segments(["caller", "helper"]))
+            .expect("caller's use_imports must steer the leaf-match resolution");
+        assert!(
+            Rc::ptr_eq(&resolved, &b),
+            "use_imports[caller, helper] = mod_b::helper must select the mod_b entry, \
+             not whichever same-leaf global-scan match the iteration happens to produce \
+             first"
+        );
+    }
 }
