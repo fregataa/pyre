@@ -575,7 +575,10 @@ pub fn weakref_deref(PTRTYPE: &LowLevelType, pwref: &_ptr) -> Result<_ptr, Strin
     else {
         return Err("weakref_deref: arg 2 must be a WeakRefPtr".to_string());
     };
-    match wref._dereference() {
+    let deref = wref
+        ._dereference()
+        .map_err(|_| "weakref_deref: weakref referent is a delayed pointer".to_string())?;
+    match deref {
         None => nullptr(LowLevelType::from((**ptr_t).TO.clone())),
         Some(p) => cast_any_ptr(ptr_t, &p),
     }

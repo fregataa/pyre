@@ -1243,12 +1243,14 @@ impl _wref {
     ///
     /// `None` for a dead wref; otherwise the referent unless its container
     /// reports `_was_freed()` (always false until a `_free` caller lands —
-    /// Epic G slice 4 / llinterp).
-    pub fn _dereference(&self) -> Option<_ptr> {
+    /// Epic G slice 4 / llinterp). A delayed referent propagates
+    /// `DelayedPointer` out of `_was_freed`, exactly as upstream lets it
+    /// escape `_dereference`.
+    pub fn _dereference(&self) -> Result<Option<_ptr>, DelayedPointer> {
         match &self._obref {
-            None => None,
-            Some(p) if p._was_freed() => None,
-            Some(p) => Some((**p).clone()),
+            None => Ok(None),
+            Some(p) if p._was_freed()? => Ok(None),
+            Some(p) => Ok(Some((**p).clone())),
         }
     }
 
@@ -1359,10 +1361,30 @@ impl _array {
     pub fn setitem(&self, index: usize, value: LowLevelValue) -> bool {
         let mut items = self.items.lock().unwrap();
         let Some(slot) = items.get_mut(index) else {
+            // `_array.setitem` special case (lltype.py:1946-1950): writing
+            // `'\x00'` to the one slot past the end of an
+            // `extra_item_after_alloc` array (the trailing NUL of a STR)
+            // is a no-op, not an out-of-bounds error.
+            if index == items.len()
+                && matches!(value, LowLevelValue::Char('\0'))
+                && self.extra_item_after_alloc()
+            {
+                return true;
+            }
             return false;
         };
         *slot = value;
         true
+    }
+
+    /// `self._TYPE._hints.get('extra_item_after_alloc')` — only a
+    /// variable-length `Array` (e.g. `STR.chars`) carries it; a
+    /// `FixedSizeArray` never does.
+    fn extra_item_after_alloc(&self) -> bool {
+        match &self.TYPE {
+            ArrayContainer::Array(t) => t._hints.get("extra_item_after_alloc").is_some(),
+            ArrayContainer::FixedSizeArray(_) => false,
+        }
     }
 }
 
@@ -1568,12 +1590,14 @@ impl _ptr {
     ///
     /// A null pointer (`_obj0 == None`) and a tagged int are never freed;
     /// a real container delegates to its own `_was_freed`. A delayed
-    /// pointer cannot be inspected, so it reports not-freed. Uses
+    /// pointer surfaces as `Err(DelayedPointer)` because `_getobj`
+    /// (lltype.py:1237) raises on it — this propagates to the caller
+    /// (`_wref._dereference`) rather than masquerading as not-freed. Uses
     /// `check=False` to avoid recursing into `_check`.
-    pub fn _was_freed(&self) -> bool {
-        match self._getobj(false) {
-            Ok(Some(obj)) => obj._was_freed(),
-            _ => false,
+    pub fn _was_freed(&self) -> Result<bool, DelayedPointer> {
+        match self._getobj(false)? {
+            Some(obj) => Ok(obj._was_freed()),
+            None => Ok(false),
         }
     }
 
@@ -3484,10 +3508,15 @@ impl _ptr_obj {
 /// cast mints a `'hidden'` opaque that stows the original container so the
 /// inverse cast can rebuild the real pointer.
 ///
-/// The `_cast_to_ptr` / `_cast_to_opaque` container hooks and the
-/// tagged-int container case that upstream guards with `hasattr` are not
-/// modelled: no pyre container defines those hooks, so those branches are
-/// dead exactly as the `hasattr` checks make them dead upstream.
+/// Two upstream branches are not modelled:
+/// - the `_cast_to_ptr` (lltype.py:989) / `_cast_to_opaque` (lltype.py:998)
+///   container hooks are `hasattr`-guarded and no pyre container defines
+///   them, so those branches are dead exactly as the `hasattr` checks make
+///   them dead upstream;
+/// - the tagged-int container case (`isinstance(container, int)`,
+///   lltype.py:1004) is gated on the tagged-int `_ptr` payload, which pyre
+///   does not carry yet — no `cast_opaque_ptr` input can hold one, so the
+///   branch is unreachable until that payload lands.
 pub fn cast_opaque_ptr(PTRTYPE: &Ptr, ptr: &_ptr) -> Result<_ptr, String> {
     let curtype = ptr._TYPE.clone();
     if curtype == *PTRTYPE {
@@ -5867,16 +5896,16 @@ mod tests {
         .unwrap();
         let wref = _wref::new(Some(&target));
 
-        assert!(!target._was_freed());
-        assert!(wref._dereference().is_some());
+        assert!(!target._was_freed().unwrap());
+        assert!(wref._dereference().unwrap().is_some());
 
         let _ptr_obj::Struct(container) = target._obj().unwrap() else {
             panic!("gc struct ptr must hold a Struct container");
         };
         container._free();
 
-        assert!(target._was_freed());
-        assert!(wref._dereference().is_none());
+        assert!(target._was_freed().unwrap());
+        assert!(wref._dereference().unwrap().is_none());
     }
 
     #[test]
@@ -5954,6 +5983,34 @@ mod tests {
         };
         container._free();
         let _ = p.nonzero();
+    }
+
+    #[test]
+    fn array_setitem_trailing_nul_special_case() {
+        use crate::flowspace::model::ConstValue;
+        // `Array(Char, hints={'extra_item_after_alloc': 1})` like STR.chars:
+        // writing '\x00' to the one slot past the end is a no-op success;
+        // any other out-of-bounds write fails (lltype.py:1946-1950).
+        let with_extra = ArrayType::with_hints(
+            LowLevelType::Char,
+            vec![("extra_item_after_alloc".into(), ConstValue::Int(1))],
+        );
+        let arr = build_array(
+            ArrayContainer::Array(with_extra),
+            vec![LowLevelValue::Char('a'), LowLevelValue::Char('b')],
+        );
+        assert!(arr.setitem(2, LowLevelValue::Char('\0')));
+        assert!(!arr.setitem(2, LowLevelValue::Char('z')));
+        assert!(!arr.setitem(3, LowLevelValue::Char('\0')));
+        assert!(arr.setitem(1, LowLevelValue::Char('c')));
+
+        // Without the hint, the trailing NUL write is a plain out-of-bounds
+        // failure.
+        let plain = build_array(
+            ArrayContainer::Array(ArrayType::new(LowLevelType::Char)),
+            vec![LowLevelValue::Char('a')],
+        );
+        assert!(!plain.setitem(1, LowLevelValue::Char('\0')));
     }
 
     #[test]
