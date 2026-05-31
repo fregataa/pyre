@@ -726,6 +726,18 @@ impl SpamBlockRef {
     fn per_block_ssarepr_len(&self) -> usize {
         self.0.borrow().per_block_ssarepr.len()
     }
+
+    /// Move `other`'s per-block accumulator onto the end of `self`'s and clear
+    /// `other` (issue #73 `remove_trivial_links` merge bridge).  Returns the
+    /// index in `self` where `other`'s insns now begin so callers can re-point
+    /// any `-live-` marker offsets recorded against `other`.  `self` and
+    /// `other` must be distinct blocks.
+    fn absorb_per_block_ssarepr(&self, other: &SpamBlockRef) -> usize {
+        let base = self.0.borrow().per_block_ssarepr.len();
+        let moved = std::mem::take(&mut other.0.borrow_mut().per_block_ssarepr);
+        self.0.borrow_mut().per_block_ssarepr.extend(moved);
+        base
+    }
 }
 
 impl PartialEq for SpamBlockRef {
@@ -1555,7 +1567,7 @@ fn walker_post_walk_insert_renamings(
 /// producer of the empty-forwarding shape, so `dead` is the faithful
 /// pyre predicate.  The `exitswitch.is_none()` / `!exits.is_empty()`
 /// guards still mirror upstream exactly.
-fn eliminate_empty_blocks(graph: &super::flow::FunctionGraph) {
+pub(crate) fn eliminate_empty_blocks(graph: &super::flow::FunctionGraph) {
     for link_ref in graph.iterlinks() {
         loop {
             let Some(block1) = link_ref.borrow().target.clone() else {
@@ -1733,6 +1745,54 @@ fn rewrite_dead_forwarder_gotos(all_walker_blocks: &[SpamBlockRef]) {
                         }
                     }
                     _ => {}
+                }
+            }
+        }
+    }
+}
+
+/// Issue #73 `remove_trivial_links` merge bridge.
+///
+/// When `remove_trivial_links` merges `target` into `source`
+/// (`source.recloseblock(*target.exits)`), `target` becomes unreachable in
+/// `graph.iterblocks()`, but the walker has already emitted `target`'s Python
+/// opcodes inline into its `per_block_ssarepr`.  The drain appends unreachable
+/// blocks AFTER the DFS-ordered prefix, so without this bridge `target`'s insns
+/// would emit at the wrong position behind `source`'s now-dangling
+/// `goto TLabel(target)`.
+///
+/// Relocate each merged `target`'s accumulator to the end of its `source`'s, in
+/// the merge (absorption) order, and re-point any per-PC `-live-` markers
+/// recorded against `target` to their new `source` offset.  The surviving
+/// stream keeps `source`'s block-boundary `goto TLabel(target) + ---`
+/// immediately followed by `target`'s `Label` — a runtime-correct (redundant)
+/// fall-through branch that the assembler patches normally (`target`'s label is
+/// single-entry, so it is marked exactly once and never left unmarked).
+fn rewrite_trivial_link_merges(
+    merges: &[(super::flow::BlockRef, super::flow::BlockRef)],
+    all_walker_blocks: &[SpamBlockRef],
+    walker_pc_live_marker_pos: &mut [Vec<(SpamBlockRef, usize)>],
+) {
+    let find = |b: &super::flow::BlockRef| -> Option<SpamBlockRef> {
+        all_walker_blocks
+            .iter()
+            .find(|spam| &spam.block() == b)
+            .cloned()
+    };
+    for (source, target) in merges {
+        let (Some(src_spam), Some(tgt_spam)) = (find(source), find(target)) else {
+            continue;
+        };
+        if src_spam == tgt_spam {
+            continue;
+        }
+        let base = src_spam.absorb_per_block_ssarepr(&tgt_spam);
+        // Re-point `-live-` markers: (tgt_spam, off) -> (src_spam, base + off).
+        for pc_entries in walker_pc_live_marker_pos.iter_mut() {
+            for entry in pc_entries.iter_mut() {
+                if entry.0 == tgt_spam {
+                    entry.0 = src_spam.clone();
+                    entry.1 += base;
                 }
             }
         }
@@ -9374,7 +9434,62 @@ impl CodeWriter {
         // use) reflect the collapsed `predecessor -> generalization`
         // links; `rewrite_dead_forwarder_gotos` then retargets the
         // walker's inline-emitted `TLabel`s to match.
+        //
+        // The full orthodox pass list lives in
+        // [`super::simplify::simplify_graph`] / `all_passes` (issue #112).
+        // Here we run the **walker-safe subset** of the orthodox pass list,
+        // each either keeping every SpamBlock's `per_block_ssarepr` in the
+        // block-by-block drain, or reconciling the inline byte stream with a
+        // bridge, in the upstream `all_passes` relative order:
+        //
+        //   eliminate_empty_blocks   (+ rewrite_dead_forwarder_gotos bridge;
+        //                             dead blocks have cleared per_block_ssarepr)
+        //   constfold_exitswitch     (no-op today — the walker folds constant
+        //                             branch conditions before emitting an
+        //                             exitswitch — but kept for all_passes
+        //                             parity and to fold any that do appear)
+        //   remove_trivial_links     (merges single-entry/exit chains; the
+        //                             merge bridge below relocates each merged
+        //                             target's per_block_ssarepr into source)
+        //
+        // EMPIRICALLY VALIDATED (#73): this subset passes the full check.py
+        // gate (dynasm 39/39, correctness + 8-benchmark performance).
+        //
+        // The remaining active `all_passes` entries are deliberately NOT wired
+        // here (all pay off only once codegen is driven from the graph, #73):
+        //
+        //   - `transform_dead_op_vars` and `remove_identical_vars_SSA` both
+        //     drop a graph inputarg + its predecessor link arg (one PRUNES dead
+        //     ones, the other DEDUPS a duplicate phi and renames it to its
+        //     twin).  But the walker's real bytecode uses live in each
+        //     SpamBlock's `per_block_ssarepr` and read the dropped variable's
+        //     walker SLOT, which the graph rename does not touch.  Since
+        //     `walker_post_walk_insert_renamings` only sees the pruned graph it
+        //     emits no copy into that slot, so the inline insns can read a
+        //     stale slot — a lost / wrong edge value (codex review P1 x2,
+        //     PR #127).  They need a walker-side liveness/renaming bridge, or
+        //     the graph-driven drain, before they can be wired.
+        //   - `ssa_to_ssi` runs CORRECTLY on walker graphs (the
+        //     `backendopt_ssa.rs` stop-at-startblock adaptation), but is
+        //     overhead-only: it threads values the walker already routes
+        //     through its register/slot model, adding redundant coalesce pairs
+        //     / `ref_copy` that measurably regress exception-heavy code
+        //     (raise_catch ~4.2x -> ~10.9x).
+        //
+        // The other `all_passes` entries are structural no-ops on today's
+        // empty-`operations` walker blocks (see their classification in
+        // `simplify.rs`).
         eliminate_empty_blocks(&graph);
+        super::simplify::constfold_exitswitch(&graph);
+        // remove_trivial_links merges single-entry/single-exit chains; the
+        // merge bridge relocates each merged target's inline per_block_ssarepr
+        // into its surviving source so the drain keeps the opcodes (issue #73).
+        let trivial_link_merges = super::simplify::remove_trivial_links_recording(&graph);
+        rewrite_trivial_link_merges(
+            &trivial_link_merges,
+            &all_walker_blocks,
+            &mut walker_pc_live_marker_pos,
+        );
         // Port-boundary guard: after the collapse, no link reachable from
         // the startblock may still target a dead forwarder.  RPython has
         // no equivalent check (its graph is simplified before flatten),
