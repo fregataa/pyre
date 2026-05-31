@@ -346,8 +346,8 @@ class PythonCodeGenerator(assemble.PythonCodeMaker):
             self.emit_op(ops.POP_TOP)
             self.no_position_info()
         elif kind == F_HANDLER_CLEANUP:
-            if fblock.datum:
-                self.emit_op(_POP_BLOCK)  # end inner cleanup scope (SETUP_CLEANUP cleanup_end)
+            self.emit_op(_POP_BLOCK)  # end inner cleanup scope (SETUP_CLEANUP cleanup_end)
+            self.emit_op(_POP_BLOCK)  # end outer cleanup scope (SETUP_CLEANUP outer_cleanup)
             # new-mode: prev_exc is on value stack below tos (if preserve_tos)
             if preserve_tos:
                 self.emit_op(ops.ROT_TWO)  # bring prev_exc to TOS

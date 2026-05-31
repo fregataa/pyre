@@ -690,3 +690,38 @@ def test_reraise_with_replaced_traceback():
             raise
     except ValueError as err:
         assert err.__traceback__ is othr
+
+def test_bare_except_return_finally_no_context():
+    # return from bare except clears the exception; finally's raise must not
+    # report "During handling of the above exception, another exception occurred"
+    def foo():
+        try:
+            raise Exception("original")
+        except:
+            return
+        finally:
+            raise Exception("in finally")
+
+    try:
+        foo()
+    except Exception as e:
+        assert e.args[0] == "in finally"
+        assert e.__context__ is None, "expected no context, got: %r" % (e.__context__,)
+
+def test_bare_except_return_finally_runs_once():
+    # finally block must execute exactly once when return exits a bare except
+    log = []
+    def foo():
+        try:
+            raise Exception
+        except:
+            return
+        finally:
+            log.append(1)
+            raise Exception("in finally")
+
+    try:
+        foo()
+    except Exception:
+        pass
+    assert log == [1], "finally ran %d times, expected 1" % len(log)
