@@ -303,6 +303,18 @@ impl AddressOffset {
 /// Word size (length-field width / pointer width).
 const WORD: i64 = std::mem::size_of::<usize>() as i64;
 
+/// `ctypes.sizeof(ctypes.c_longdouble)` (ll2ctypes.py:151) — the
+/// `long double` width is target-C-ABI-derived, not fixed: 16 on the
+/// x86-64 SysV (80-bit extended) and AArch64 AAPCS64 (128-bit quad)
+/// ABIs, but 8 where `long double == double` (Apple AArch64). Resolved
+/// from the build target — for the in-process JIT the build target is
+/// the execution target, the same coupling RPython gets from `ctypes`.
+const SIZEOF_LONGFLOAT: i64 = if cfg!(all(target_arch = "aarch64", target_os = "macos")) {
+    8
+} else {
+    16
+};
+
 /// Resolver for the layout-dependent symbolic offsets, mirroring
 /// `rpython/jit/backend/llsupport/symbolic.py`. The codewriter owns the
 /// real struct layouts, so it implements this; defining the trait here
@@ -316,14 +328,26 @@ pub trait OffsetLayout {
     fn struct_size(&self, struct_name: &str) -> Option<i64>;
 }
 
-/// Byte size of a primitive `LowLevelType` (word = 8 bytes).
+/// Byte size of a primitive `LowLevelType`. Mirrors
+/// `symbolic.get_size(TYPE)` (symbolic.py:24), which resolves to
+/// `ctypes.sizeof(ll2ctypes.get_ctypes_type(TYPE))`; the widths below are
+/// the C-model sizes for the LP64 targets pyre emits for (x86-64 /
+/// AArch64). `UniChar` is the 4-byte UCS-4 codepoint; `LongFloat` is the
+/// target-derived `long double` width ([`SIZEOF_LONGFLOAT`]).
 fn primitive_byte_size(ty: &LowLevelType) -> Result<i64, String> {
     match ty {
         LowLevelType::Signed
         | LowLevelType::Unsigned
         | LowLevelType::Address
-        | LowLevelType::Float => Ok(8),
-        LowLevelType::Char => Ok(1),
+        | LowLevelType::SignedLongLong
+        | LowLevelType::UnsignedLongLong
+        | LowLevelType::Float => Ok(WORD),
+        // `r_longlonglong` / `r_ulonglonglong` are 128-bit on every target
+        // that defines them, so 16 is stable; `long double` is not.
+        LowLevelType::SignedLongLongLong | LowLevelType::UnsignedLongLongLong => Ok(16),
+        LowLevelType::LongFloat => Ok(SIZEOF_LONGFLOAT),
+        LowLevelType::SingleFloat | LowLevelType::UniChar => Ok(4),
+        LowLevelType::Bool | LowLevelType::Char => Ok(1),
         other => Err(format!("no primitive byte size for {other:?}")),
     }
 }

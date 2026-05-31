@@ -47,9 +47,9 @@ mod tests {
     /// rpython/rlib/rstack.py:42 stack_check / assembler.py:1080
     /// _call_header_with_stack_check parity contract: backend slowpath
     /// wrappers MUST construct a fresh `RecursionError` and place it
-    /// into `JIT_PENDING_EXCEPTION`; the JIT glue drains that slot at
-    /// every backend boundary and raises the exception in the
-    /// interpreter — matches RPython
+    /// into the current thread's pending JIT exception slot; the JIT
+    /// glue drains that slot at every backend boundary and raises the
+    /// exception in the interpreter — matches RPython
     /// `stack_check_slowpath → _StackOverflow → pos_exception() →
     /// propagate_exception_path`.
     ///
@@ -88,7 +88,7 @@ mod tests {
         );
         assert!(
             stack_check::is_jit_overflow_pending(),
-            "slowpath must raise into JIT_PENDING_EXCEPTION",
+            "slowpath must raise into the current thread's pending slot",
         );
         let err = stack_check::drain_jit_pending_exception()
             .expect_err("pending exception must surface as RecursionError");

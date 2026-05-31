@@ -129,7 +129,15 @@ pub static STRPTR: LazyLock<LowLevelType> = LazyLock::new(|| {
 /// elides both today (see [`STR`] docstring); structural shape is
 /// what the eventual `UnicodeRepr` port consumes.
 pub static UNICODE: LazyLock<LowLevelType> = LazyLock::new(|| {
-    let chars = ArrayType::new(LowLevelType::UniChar);
+    // `Array(UniChar, hints={'immutable': True})` (rstr.py:1239) —
+    // marks the unichar array read-only; no trailing-NUL reservation.
+    let chars = ArrayType::with_hints(
+        LowLevelType::UniChar,
+        vec![(
+            "immutable".into(),
+            crate::flowspace::model::ConstValue::Bool(true),
+        )],
+    );
     let body = StructType::gc_with_hints(
         "rpy_unicode",
         vec![

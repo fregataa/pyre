@@ -1608,9 +1608,12 @@ impl _ptr {
     ///
     /// Pyre-port scope: down-casts and identity casts are supported.
     /// Null casts return `Ptr(target)._defl()`. Up-casts surface a
-    /// structured error pending a `_parent_link` port — exception
-    /// classes only ever down-cast for `ll_cast_to_object`, which is
-    /// the immediate consumer.
+    /// structured error: the `_parentable` liveness chain exists, but
+    /// `_parentstructure()` must hand back the *parent container object*
+    /// to re-point at, which the value model cannot do yet (no
+    /// `_identity`→container map — see [`ParentLink::parent`]). Exception
+    /// classes only ever down-cast for `ll_cast_to_object`, the immediate
+    /// consumer, so the up-cast arm is unreached today.
     pub fn _cast_to(&self, ptrtype: &Ptr) -> Result<_ptr, String> {
         let down_or_up = castable(ptrtype, &self._TYPE)?;
         if down_or_up == 0 {
@@ -2876,10 +2879,14 @@ fn opaqueptr_hidden(
         _parentable: Parentable::new(),
     };
     let ptr_t = Ptr::from_container_type(LowLevelType::Opaque(Box::new(TYPE)))?;
+    // `opaqueptr` always returns `_ptr(Ptr(TYPE), o, solid=True)`
+    // (lltype.py:2360) — the pointer to a hidden opaque is itself always
+    // solid, independent of the `solid` attr recorded on the `_opaque`
+    // (which carries the original cast pointer's solidity).
     Ok(_ptr::new_with_solid(
         ptr_t,
         Ok(Some(_ptr_obj::Opaque(obj))),
-        solid,
+        true,
     ))
 }
 
@@ -3454,10 +3461,15 @@ impl _ptr_obj {
     /// `_container._normalizedcontainer()` — only `_opaque` rewrites itself
     /// (lltype.py:2178). `_parentable._normalizedcontainer`
     /// (lltype.py:1721-1735) walks `_struct`/`_array` up to the enclosing
-    /// struct when this is its first inlined field; that walk needs the
-    /// deferred object-returning `_parentstructure()`. A hidden opaque's
-    /// container is a top-level allocation (no parent), so it is already in
-    /// normal form here.
+    /// struct while this container is the parent's first inlined field;
+    /// that walk returns the *parent container object*, so it needs the
+    /// deferred object-returning `_parentstructure()` (blocked: the value
+    /// model has no `_identity`→container map — see [`ParentLink::parent`]).
+    /// KNOWN GAP: if a first-inlined substruct/array is hidden behind an
+    /// opaque, our eq/hash keys on the substruct where upstream would key on
+    /// the promoted parent. The reachable pyre path (cast_opaque_ptr off a
+    /// top-level GC allocation) has no parent, so it is already normal here;
+    /// the gap closes when `_parentstructure()` lands.
     fn _normalizedcontainer(&self) -> _ptr_obj {
         match self {
             _ptr_obj::Opaque(o) => o._normalizedcontainer(),
