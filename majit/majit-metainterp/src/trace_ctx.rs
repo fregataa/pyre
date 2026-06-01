@@ -1,4 +1,4 @@
-//! Tracing context: wraps Trace + ConstantPool with convenience API.
+//! Tracing context: wraps the recorder Trace with a convenience API.
 //!
 //! `TraceCtx` owns the struct definition, constructors, accessors,
 //! constant management, and virtualizable machinery.  The recording
@@ -164,11 +164,11 @@ pub struct MergePoint {
     pub header_pc: usize,
 }
 
-/// Tracing context: wraps Trace + ConstantPool with convenience API.
+/// Tracing context: wraps the recorder Trace with a convenience API.
 ///
 /// The interpreter uses this during trace recording to:
 /// - Record IR operations
-/// - Manage constants (with deduplication)
+/// - Carry inline constant operands on the OpRef variants
 /// - Record guards (with auto-generated FailDescr)
 /// - Record function calls (with auto-generated CallDescr)
 pub struct TraceCtx {
@@ -292,7 +292,7 @@ pub struct TraceCtx {
     /// history.py:227/268/314 (`Const*.value` lives on the box). Ref
     /// entries are forwarded by `MetaInterp::walk_active_trace_refs`.
     /// Used by cut_trace_from to remap escaped original inputargs to
-    /// stable Const boxes without re-entering the legacy ConstantPool.
+    /// stable inline Const OpRefs.
     pub initial_inputarg_consts: Vec<majit_ir::OpRef>,
     /// pyjitpl.py:1087 parity: quasi-immutable field read needs a
     /// GUARD_NOT_INVALIDATED with full snapshot at the field read's orgpc.
@@ -775,8 +775,12 @@ impl TraceCtx {
     /// `_clear_caches_arraymove` → `_clear_caches_arrayop_with_consts`
     /// where ConstPtr source/dest boxes are canonicalised by
     /// `_unique_const_heuristic` (heapcache.py:96-104) via the
-    /// `SameConstantOracle` plumbed from `ConstantPool`.  `refresh_from_gc`
-    /// runs first so post-GC GCREF addresses are current.
+    /// `SameConstantOracle` (`history::ConstOprefOracle`, value-compares
+    /// inline Const OpRefs).  ConstPtr values are carried inline on the
+    /// OpRef (history.py:314), and the active-trace GC walker
+    /// (`walk_active_trace_refs`) forwards those inline GCREFs across minor
+    /// collections, so reading one here yields the current address with no
+    /// separate constant-pool re-read.
     ///
     /// The `const_value` closure resolves `srcstart` / `dststart` /
     /// `length` boxes to their `ConstInt.getint()` values
@@ -1800,9 +1804,9 @@ impl TraceCtx {
     ///
     /// Resolution order, mirroring the subclass dispatch upstream performs
     /// implicitly:
-    ///   1. Constant OpRefs — read from the `ConstantPool` (value + type).
-    ///      Mirrors `history.py:220/261/307 ConstInt/ConstFloat/ConstPtr`
-    ///      Box.value intrinsic field.
+    ///   1. Constant OpRefs — read inline off the OpRef variant (value +
+    ///      type).  Mirrors `history.py:220/261/307 ConstInt/ConstFloat/
+    ///      ConstPtr` Box.value intrinsic field.
     ///   2. `standard_virtualizable_box()` — use the runtime shadow held in
     ///      `virtualizable_values[-1]`.  Standard vable identity check.
     ///   3. `opref_concrete` — Box.value stamp populated at every record
@@ -1814,8 +1818,8 @@ impl TraceCtx {
     ///      the standard vable resolve to "different" at trace time.
     pub fn concrete_of_opref(&self, opref: OpRef) -> Value {
         if opref.is_constant() {
-            // history.py:220/261/307 box.type parity: `ConstantPool`
-            // stores typed `Value` directly — the variant tag carries
+            // history.py:220/261/307 box.type parity: the OpRef variant
+            // carries the typed `Value` inline — the variant tag carries
             // the `Box.type` intrinsically, so no separate type lookup
             // is required.
             if let Some(value) = opref.inline_const_to_value() {

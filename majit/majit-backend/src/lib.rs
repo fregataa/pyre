@@ -78,6 +78,7 @@ pub use finish_descrs::{
     DoneWithThisFrameDescrRef, DoneWithThisFrameDescrVoid, ExitFrameWithExceptionDescrRef,
     PropagateExceptionDescr, get_or_attach_done_with_this_frame_descr_multi,
 };
+pub use jitframe::JitFrameInfo;
 pub use rd_payload::RdPayload;
 pub use resume_guard_descr::{
     ResumeGuardDescr, STATUS_BUSY_FLAG, STATUS_SHIFT, STATUS_SHIFT_MASK, STATUS_TY_FLOAT,
@@ -861,43 +862,10 @@ impl std::fmt::Debug for LoopVersionInfo {
     }
 }
 
-/// `rpython/jit/backend/llsupport/jitframe.py:30-40` `JITFRAMEINFO` parity.
-///
-/// Runtime frame depth/size carried on each `CompiledLoopToken`. Mutated
-/// in-place via `update_frame_depth` when bridges extend the frame layout.
-///
-/// `#[repr(C)]` pins the `[jfi_frame_depth, jfi_frame_size]` field order so
-/// the rewriter's `CallAssemblerCalleeLocs.frame_info_ptr` can pass the
-/// struct's raw address to generated code that loads `jfi_frame_depth` /
-/// `jfi_frame_size` at fixed offsets — matching RPython `jitframe.py:30-40`
-/// (lltype-allocated, stable-layout struct).
-#[derive(Debug, Default)]
-#[repr(C)]
-pub struct JitFrameInfo {
-    /// `jitframe.py:33` `('jfi_frame_depth', lltype.Signed)`.
-    pub jfi_frame_depth: i64,
-    /// `jitframe.py:35` `('jfi_frame_size', lltype.Signed)`.
-    pub jfi_frame_size: i64,
-}
-
-impl JitFrameInfo {
-    /// `rpython/jit/backend/llsupport/jitframe.py:18-22`
-    /// `jitframeinfo_update_depth(jfi, base_ofs, new_depth)`.
-    pub fn update_frame_depth(&mut self, base_ofs: i64, new_depth: i64) {
-        // jitframe.py:8 `SIZEOFSIGNED = rffi.sizeof(lltype.Signed)`; 64-bit target.
-        const SIZEOFSIGNED: i64 = 8;
-        if new_depth > self.jfi_frame_depth {
-            self.jfi_frame_depth = new_depth;
-            self.jfi_frame_size = base_ofs + new_depth * SIZEOFSIGNED;
-        }
-    }
-
-    /// `rpython/jit/backend/llsupport/jitframe.py:24-26` `jitframeinfo_clear`.
-    pub fn clear(&mut self) {
-        self.jfi_frame_size = 0;
-        self.jfi_frame_depth = 0;
-    }
-}
+// JITFRAMEINFO is the single `JitFrameInfo` defined in `jitframe.rs`
+// (re-exported at the crate root above). `CompiledLoopToken.frame_info`
+// holds one — the same struct `JitFrame.jf_frame_info` points to, matching
+// RPython's single `JITFRAMEINFO` (jitframe.py:30-40).
 
 /// `rpython/jit/backend/model.py:292-338` `CompiledLoopToken` parity.
 ///
@@ -1082,7 +1050,7 @@ impl CompiledLoopToken {
     ) {
         // `model.py:317` `new_fi = self.frame_info`
         // `model.py:318` `new_loop_tokens = []`
-        let new_fi_depth = self.frame_info.lock().jfi_frame_depth;
+        let new_fi_depth = self.frame_info.lock().jfi_frame_depth as i64;
         let mut new_loop_tokens: Vec<std::sync::Weak<CompiledLoopToken>> = Vec::new();
         // `model.py:319-324` propagate depth through the old token's
         // existing redirect chain, dropping dead weak refs (`ref()` →

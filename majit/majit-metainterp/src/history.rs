@@ -16,14 +16,17 @@ use majit_ir::{DescrRef, InputArg, Op, OpCode, OpRc, OpRef, Type, Value};
 pub type History = crate::trace_ctx::TraceCtx;
 
 /// Stateless `SameConstantOracle` resolving operands purely from the
-/// inline-Const OpRef variants (`history.py:227/268/314` `.value`), with
-/// no constant pool. Line-for-line mirror of `ConstantPool::same_constant`
-/// (history.py:251 ConstInt / :292 ConstFloat / :338 ConstPtr): reject
-/// non-constants, `is`-equal short-circuit, disjoint-subclass type check
-/// (history.py:220/261/307), then value compare. The value resolution
-/// reads `inline_const_to_value` instead of the pool, so it is identical
-/// to the pool method for inline operands — the only operands the recorder
-/// produces.
+/// inline-Const OpRef variants (`history.py:227/268/314` `.value`),
+/// without a constant-pool lookup. This is `Const.same_constant`
+/// (history.py:251 ConstInt / :292 ConstFloat / :338 ConstPtr), which
+/// compares each Const's own `.value`; the byte-stream `_refs`/`_bigints`/
+/// `_floats` pools of `opencoder.Trace` (opencoder.py:482-486) are a
+/// separate encoding concern. Resolution: reject non-constants, then perform
+/// the same subclass-specific value compare as the RPython methods. The
+/// Rust implementation can fast-path equal OpRef payloads because inline
+/// Const equality is already variant + value equality, not Python object
+/// identity. The value read uses `inline_const_to_value` — the only operand
+/// form the recorder produces.
 pub struct ConstOprefOracle;
 
 impl majit_trace::heapcache::SameConstantOracle for ConstOprefOracle {
@@ -2047,15 +2050,11 @@ impl TraceCtx {
 
     // ── Step 2e.2a: split-borrow helpers ──────────────────────────────
     //
-    // Private `do_*` helpers take `(&mut Trace, &ConstantPool, ...)` so the
-    // caller performs an explicit two-field borrow of `self.recorder` and
-    // `self.constants`. The `_constants` parameter is currently unused —
-    // `recorder::Trace` carries raw `OpRef` values and needs no constant
-    // resolution at record time — but the signature shape matches
-    // `TraceRecordBuffer::record_op_oprefs` / `record_guard_oprefs` /
-    // `close_loop_oprefs` / `finish_oprefs` (opencoder.rs:2420-2551), all
-    // of which consume `&ConstantPool` to resolve tagged-constant `OpRef`
-    // into wire bytes.
+    // Private `do_*` helpers take `(&mut Trace, ...)` so the caller
+    // performs an explicit field borrow of `self.recorder`.
+    // `recorder::Trace` carries raw `OpRef` values whose `Const` variants
+    // hold their value inline (history.py:227/268/314), so no constant
+    // resolution is needed at record time.
     //
     // Step 2e.2b swaps the `recorder` field type from `Trace` to
     // `TraceRecordBuffer`. Contrary to an earlier note here, this is NOT

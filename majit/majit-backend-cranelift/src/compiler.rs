@@ -7679,8 +7679,8 @@ impl CraneliftBackend {
                 lookup_call_assembler_target(token_number).map(|t| {
                     let clt = &t.compiled_loop_token;
                     // JitFrameInfo is #[repr(C)] so `&JitFrameInfo as *const _`
-                    // points at [jfi_frame_depth: i64, jfi_frame_size: i64];
-                    // the generated CALL_ASSEMBLER code loads those words
+                    // points at [jfi_frame_depth, jfi_frame_size] (Signed
+                    // words); the generated CALL_ASSEMBLER code loads those
                     // without taking the Mutex. Keeping the Arc alive via
                     // `RegisteredLoopTarget.compiled_loop_token` pins the
                     // allocation, matching RPython where the lltype-malloced

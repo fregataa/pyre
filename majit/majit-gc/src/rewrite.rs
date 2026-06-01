@@ -392,10 +392,11 @@ struct RewriteState {
     /// presence matches upstream and the consumer can be wired without
     /// re-introducing the field.
     _constant_additions: VecAssoc<OpRef, (OpRef, i64)>,
-    /// Next constant index for `OpRef::from_const`. Shares the
-    /// constant-namespace with the tracer's ConstantPool; initialized in
-    /// `with_constants` from the passed-in map so newly emitted constants
-    /// do not collide with tracer entries.
+    /// Reserved next constant index in the passed-in constant namespace.
+    /// Current GC-rewrite parity emits fresh `ConstInt` values inline
+    /// (`history.py:227`) instead of allocating pool entries, so this is
+    /// initialized in `with_constants` but has no writer until a backend
+    /// egress path needs pooled constants again.
     next_const_idx: u32,
 
     /// rewrite.py:470-471 `_changed_op` / `_changed_op_to` parity.

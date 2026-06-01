@@ -484,7 +484,7 @@ impl<'a> TraceIterator<'a> {
 // args only.  Constants (TAGINT/TAGCONSTPTR/TAGCONSTOTHER), variable-
 // arity ops (arity == None), and descr-bearing ops panic with a
 // dedicated message — those decode branches land in M4 step 2 alongside
-// ConstantPool + descr-table wiring.
+// inline-constant decode + descr-table wiring.
 
 /// opencoder.py:249-406 `TraceIterator`.  Byte-stream walker over
 /// `TraceRecordBuffer._ops`.
@@ -571,7 +571,8 @@ impl<'a> ByteTraceIter<'a> {
     ///
     /// `_untag` mints inline-Const OpRef variants directly
     /// (history.py:227/268/314 `Const*.value` inline), so the decode path
-    /// needs no constant pool.
+    /// needs no external/legacy ConstantPool. It still reads the
+    /// opencoder-local `_refs` / `_bigints` / `_floats` pools.
     pub fn new(trace: &'a TraceRecordBuffer, start: usize, end: usize, start_fresh: u32) -> Self {
         let cache_size = (trace._index as usize).max(trace.max_num_inputargs as usize);
         let mut _cache: Vec<Option<OpRef>> = vec![None; cache_size];
@@ -705,7 +706,7 @@ impl<'a> ByteTraceIter<'a> {
     /// TAGCONSTOTHER → inline `ConstFloat`/`ConstInt` from
     /// `trace._floats`/`trace._bigints` (history.py:268/227 inline). Every
     /// TAG* arm mints inline-Const directly, so the decode needs no
-    /// constant pool.
+    /// external/legacy ConstantPool beyond these opencoder-local pools.
     ///
     /// `pub` because `SnapshotIterator::get` / `unpack_array`
     /// (opencoder.py:222-231) dispatch through `main_iter._untag`.
@@ -1136,7 +1137,8 @@ impl<'a> SnapshotIterator<'a> {
     /// does not own a `main_iter` because the legacy
     /// `TraceIterator<'a>` (pre-byte-stream) cannot be constructed
     /// without the `&[OpRc]` slice it walks, and the byte-stream
-    /// `ByteTraceIter` carries its own `ConstantPool` lifetime.
+    /// `ByteTraceIter` carries its own borrow lifetime over the
+    /// recorder buffer it walks.
     /// Callers pass the iterator explicitly instead so this helper
     /// stays structurally equivalent to `main_iter._untag(index)`.
     pub fn get(&self, tagged: i64, main_iter: &mut ByteTraceIter<'_>) -> OpRef {
@@ -2689,8 +2691,10 @@ impl TraceRecordBuffer {
     /// into `_refs`. The shadow stack holds the authoritative post-move
     /// pointer for each entry pushed by `_encode_ptr`; copy those
     /// values into `_refs` so TAGCONSTPTR decodes land on the current
-    /// address. Called at the same boundaries as
-    /// `ConstantPool::refresh_from_gc`.
+    /// address. This helper is the required write-back point for the
+    /// `_refs` shadow-stack adaptation; callers must wire it at the same
+    /// GC boundaries as the op-graph Ref-walker
+    /// (`MetaInterp::walk_active_trace_refs`).
     pub fn refresh_from_gc(&mut self) {
         for &(ref_idx, ss_idx) in &self.rooted_ref_indices {
             self._refs[ref_idx] = majit_gc::shadow_stack::get(ss_idx).0 as u64;
@@ -3290,9 +3294,8 @@ mod tests {
         assert_eq!(op.arg(0).as_const_ptr(), Some(majit_ir::GcRef(0xdead_beef)));
     }
 
-    /// M4 step 2: TAGINT arg with a ConstantPool attached resolves into
-    /// a pool-allocated OpRef whose value matches the recorded
-    /// `Box::ConstInt(v)`.
+    /// M4: a TAGINT arg round-trips to an inline-Const OpRef whose value
+    /// matches the recorded `Box::ConstInt(v)`.
     #[test]
     fn test_byte_trace_iter_tagint_with_pool_m4() {
         let mut buf = TraceRecordBuffer::new(1, empty_sd());
@@ -3312,8 +3315,8 @@ mod tests {
         );
     }
 
-    /// M4 step 2: same-value TAGINT args round-trip to the same Value
-    /// through the pool. `history.py:220 ConstInt.__init__` is
+    /// M4: same-value TAGINT args round-trip to the same Value
+    /// inline. `history.py:220 ConstInt.__init__` is
     /// fresh-alloc per call so the two OpRefs may differ; the
     /// upstream value-equality predicate is `Const.same_constant`
     /// (history.py:204).

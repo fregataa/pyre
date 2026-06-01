@@ -464,19 +464,20 @@ impl OpRef {
         matches!(self, Self::TempVar(_))
     }
 
-    /// `resoperation.py:38 AbstractValue.same_box(other)` — the base
-    /// identity comparison (`self is other`). A flat `OpRef` is an index
-    /// with no carried value, so identity reduces to variant + raw
-    /// payload equality (`derive(PartialEq)`); this is the explicit API
-    /// name so callers don't reach for `==`.
+    /// `resoperation.py:38 AbstractValue.same_box(other)` plus the
+    /// `Const.same_box` override (history.py:211 → `same_constant`). A flat
+    /// `OpRef` is a tagged handle and `==` compares variant + payload, so a
+    /// single `==` already covers both: for non-Const variants it is
+    /// position equality (the base `self is other`), and for
+    /// `Const{Int,Float,Ptr}` it is inline value equality
+    /// (`Const.same_constant`, including history.py:292 bitwise float so
+    /// `0.0 != -0.0`). This is the explicit API name so callers don't reach
+    /// for `==`.
     ///
-    /// This implements the `AbstractValue` base only. The `Const.same_box`
-    /// override (history.py:211 → `same_constant`, value equality) needs
-    /// the constant's value, which lives in the `Box` / `ConstantPool`,
-    /// not the `OpRef`. Const-aware dispatch therefore lives on
-    /// `BoxRef::same_box` (identity for ResOp/InputArg, value for Const)
-    /// reached via `OptContext::same_box`; callers comparing Const values
-    /// use that or `ConstantPool::same_constant` directly.
+    /// The same split is mirrored on `BoxRef::same_box` (identity for
+    /// ResOp/InputArg, value for Const) reached via `OptContext::same_box`,
+    /// for callers holding a stable `Rc<Box>` handle; callers comparing
+    /// Const values may use that or `ConstOprefOracle` directly.
     #[inline]
     pub fn same_box(self, other: OpRef) -> bool {
         self == other
@@ -628,8 +629,7 @@ impl OpRef {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum AbstractValue {
     None,
-    /// history.py:220 `ConstInt` — `type = 'i'`. Payload: index into
-    /// the integer constant pool.
+    /// history.py:220 `ConstInt` — `type = 'i'`.
     ConstInt(u32),
     /// history.py:261 `ConstFloat` — `type = 'f'`.
     ConstFloat(u32),
@@ -690,8 +690,9 @@ impl AbstractValue {
         )
     }
 
-    /// Returns the variant payload (constant index, input arg position,
-    /// or op result position). `None` variant returns `None`.
+    /// Returns the variant's raw u32 payload (input arg / op-result
+    /// position; the `Const*` variants carry an opaque discriminant).
+    /// `None` variant returns `None`.
     pub fn raw(self) -> Option<u32> {
         match self {
             Self::None => None,

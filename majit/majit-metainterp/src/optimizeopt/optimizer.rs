@@ -2834,23 +2834,6 @@ impl Optimizer {
                 Some(&exported_int_bounds),
             )
         });
-        // Populate renamed_inputarg_types from the exported input boxes'
-        // actual optimizer-visible types. In RPython each renamed inputarg
-        // is a Box whose `.type` is already fixed; falling back to a pyre-only
-        // default like Int can silently corrupt retrace input typing.
-        if let Some(ref mut es) = self.exported_loop_state {
-            if es.renamed_inputarg_types.is_empty() {
-                es.renamed_inputarg_types = es
-                    .renamed_inputargs
-                    .iter()
-                    .map(|&opref| {
-                        ctx.opref_type(opref).unwrap_or_else(|| {
-                            panic!("missing type for exported renamed inputarg {:?}", opref)
-                        })
-                    })
-                    .collect();
-            }
-        }
         // RPython parity: propagate patchguardop to ExportedState so Phase 2
         // can use it for extra_guards from virtualstate (unroll.py:333-336).
         if let Some(ref mut es) = self.exported_loop_state {
@@ -3629,8 +3612,7 @@ impl Optimizer {
         // 5: Box.type lives intrinsically on `OpRef.ty()` (variant
         // tag, history.py:220 + resoperation.py:1693 parity) and on
         // `Op.type_` once the op lands in `new_operations`, so the
-        // side-table refresh that `register_value_type` used to perform
-        // is fully redundant.
+        // pre-Slice-0.5 type side-table refresh is fully redundant.
 
         // Resolve forwarded arguments. PyPy `_emit_operation`
         // (optimizer.py:614-625) walks args via force_box at the entry to

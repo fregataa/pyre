@@ -4674,10 +4674,10 @@ impl<M: Clone> MetaInterp<M> {
             compile::PreambleCompileData::new(&trace, jump_args, &call_pure_results, enable_opts);
         let trace_snapshots = preamble_data.base.snapshots().to_vec();
 
-        // The ConstantPool value map is empty in production (every
-        // `get_or_insert{,_typed}` writer is test-only; S0 inline-Const
-        // carries constants in OpRef variants), so the typed egress is
-        // always empty.  Start the typed-constant map fresh.
+        // The recorder carries Const values inline on the OpRef variants
+        // (history.py:227/268/314), so there is no legacy TraceCtx
+        // ConstantPool to drain — this backend typed-constant egress map
+        // starts fresh.
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
 
         // Materialize Vec<Op> from the trace's `Vec<OpRc>` so the
@@ -4880,13 +4880,12 @@ impl<M: Clone> MetaInterp<M> {
         // `trace.inputargs[i]`. Using a prefix of `trace.inputargs` declares
         // every reduced slot with the wrong type (e.g. the vable layout's
         // `frame, next_instr, code, …` instead of the optimizer's actual
-        // `frame, s_value, i_value`). The optimizer already records the
-        // per-reduced-slot type in `ExportedState.renamed_inputarg_types`
-        // (derived from `opref_type` of each renamed inputarg). Consume it
+        // `frame, s_value, i_value`). Each `ExportedState.renamed_inputargs`
+        // OpRef carries its `.type` intrinsically (history.py:220); read it
         // here so the backend sees declared types that match the reduced
         // LABEL's args.
         // compile.py:341 parity: the optimizer's reduced LABEL contract
-        // (ExportedState.renamed_inputarg_types) is the only valid source of
+        // (ExportedState.renamed_inputargs) is the only valid source of
         // root inputarg types. RPython has no synthetic recovery when this
         // is absent; abort compilation so the caller falls back to the
         // interpreter instead of synthesizing Int-padded InputArgs.
@@ -4899,13 +4898,22 @@ impl<M: Clone> MetaInterp<M> {
             match unroll_opt
                 .final_exported_state
                 .as_ref()
-                .map(|es| es.renamed_inputarg_types.as_slice())
-                .filter(|types| types.len() == final_num_inputs)
+                .map(|es| es.renamed_inputargs.as_slice())
+                .filter(|args| args.len() == final_num_inputs)
             {
-                Some(types) => types
+                Some(args) => args
                     .iter()
                     .enumerate()
-                    .map(|(i, &tp)| InputArg::from_type(tp, i as u32))
+                    .map(|(i, &opref)| {
+                        let tp = opref.ty().unwrap_or_else(|| {
+                            panic!(
+                                "renamed inputarg {:?} has no intrinsic type \
+                                 (history.py:220 Box.type invariant)",
+                                opref
+                            )
+                        });
+                        InputArg::from_type(tp, i as u32)
+                    })
                     .collect::<Vec<_>>(),
                 None => {
                     if crate::majit_log_enabled() {
@@ -5482,8 +5490,9 @@ impl<M: Clone> MetaInterp<M> {
             .enumerate()
             .map(|(i, &tp)| majit_ir::InputArg::from_type(tp, i as u32))
             .collect();
-        // The ConstantPool value map is empty in production, so the
-        // snapshot is always empty.  Start the typed-constant map fresh.
+        // The recorder carries Const values inline on the OpRef variants
+        // (history.py:227/268/314), so there is no legacy TraceCtx
+        // ConstantPool to snapshot — this typed-constant map starts fresh.
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         let call_pure_results = ctx.call_pure_results.clone();
         let trace_snapshots = ctx.snapshots().to_vec();
@@ -5723,8 +5732,9 @@ impl<M: Clone> MetaInterp<M> {
             });
             let orig_vable_ptr_retrace =
                 self.orig_vable_ptr_from_trace_ctx(&ctx, driver_descriptor.as_ref());
-            // The ConstantPool value map is empty in production, so the
-            // snapshot is always empty.  Start the typed-constant map fresh.
+            // The recorder carries Const values inline on the OpRef variants
+            // (history.py:227/268/314), so there is no legacy TraceCtx
+            // ConstantPool to snapshot — this typed-constant map starts fresh.
             let constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
             let initial_inputarg_consts = ctx.initial_inputarg_consts.clone();
             let call_pure_results = ctx.take_call_pure_results();
@@ -6308,10 +6318,10 @@ impl<M: Clone> MetaInterp<M> {
             self.warm_state.get_enable_opts(),
         );
 
-        // The ConstantPool value map is empty in production (every
-        // `get_or_insert{,_typed}` writer is test-only; S0 inline-Const
-        // carries constants in OpRef variants), so the typed egress is
-        // always empty.  Start the typed-constant map fresh.
+        // The recorder carries Const values inline on the OpRef variants
+        // (history.py:227/268/314), so there is no legacy TraceCtx
+        // ConstantPool to drain — this backend typed-constant egress map
+        // starts fresh.
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
 
         let num_ops_before = trace_ops.len();
@@ -6728,10 +6738,10 @@ impl<M: Clone> MetaInterp<M> {
             self.warm_state.get_enable_opts(),
         );
 
-        // The ConstantPool value map is empty in production (every
-        // `get_or_insert{,_typed}` writer is test-only; S0 inline-Const
-        // carries constants in OpRef variants), so the typed egress is
-        // always empty.  Start the typed-constant map fresh.
+        // The recorder carries Const values inline on the OpRef variants
+        // (history.py:227/268/314), so there is no legacy TraceCtx
+        // ConstantPool to drain — this backend typed-constant egress map
+        // starts fresh.
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
 
         if crate::majit_log_enabled() {
@@ -8824,16 +8834,15 @@ impl<M: Clone> MetaInterp<M> {
                 let renamed_inputargs: Vec<InputArg> = es
                     .renamed_inputargs
                     .iter()
-                    .enumerate()
-                    .map(|(i, &opref)| {
+                    .map(|&opref| {
                         // RPython retrace passes the original typed Box list
-                        // directly; pyre's renamed_inputarg_types side table
-                        // must be parallel to renamed_inputargs.
-                        let tp = es.renamed_inputarg_types.get(i).copied().unwrap_or_else(|| {
+                        // directly; each renamed inputarg OpRef carries its
+                        // `.type` intrinsically (history.py:220).
+                        let tp = opref.ty().unwrap_or_else(|| {
                             panic!(
-                                "missing renamed_inputarg_types[{}] (renamed_inputargs.len()={}): \
-                                 export_state populates the parallel type list in lockstep",
-                                i, es.renamed_inputargs.len()
+                                "renamed inputarg {:?} has no intrinsic type \
+                                 (history.py:220 Box.type invariant)",
+                                opref
                             )
                         });
                         InputArg::from_type(tp, opref.raw())
@@ -9307,8 +9316,9 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.snapshot_vable_boxes = prepared.snapshot_vable_boxes;
         optimizer.snapshot_vref_boxes = prepared.snapshot_vref_boxes;
         optimizer.snapshot_frame_pcs = prepared.snapshot_frame_pcs;
-        // Store bridge inputarg types so export_state can propagate them
-        // to ExportedState.renamed_inputarg_types (RPython Box type parity).
+        // Store bridge inputarg types so export_state can mint typed
+        // `renamed_inputargs` OpRefs that carry their type intrinsically
+        // (history.py:220 InputArg{Int,Ref,Float}.type Box parity).
         optimizer.trace_inputargs = bridge_inputarg_types;
 
         // RPython-orthodox: no source→bridge constant_types merge.
@@ -9395,24 +9405,22 @@ impl<M: Clone> MetaInterp<M> {
             }
             if let Some(es) = exported {
                 // compile.py:1075-1084: new_trace.inputargs = info.renamed_inputargs.
-                // Types come from ExportedState.renamed_inputarg_types, populated
-                // by Optimizer from trace_inputargs (RPython Box type parity).
-                let renamed_inputargs: Vec<InputArg> =
-                    es.renamed_inputargs
-                        .iter()
-                        .enumerate()
-                        .map(|(i, &opref)| {
-                            let tp = es.renamed_inputarg_types.get(i).copied().unwrap_or_else(
-                                || {
-                                    panic!(
-                                        "missing renamed_inputarg_types entry for retrace input {}",
-                                        i
-                                    )
-                                },
-                            );
-                            InputArg::from_type(tp, opref.raw())
-                        })
-                        .collect();
+                // Each renamed OpRef is a typed InputArg{Int,Ref,Float} variant
+                // carrying its type intrinsically (history.py:220 Box.type parity).
+                let renamed_inputargs: Vec<InputArg> = es
+                    .renamed_inputargs
+                    .iter()
+                    .map(|&opref| {
+                        let tp = opref.ty().unwrap_or_else(|| {
+                            panic!(
+                                "renamed inputarg {:?} has no intrinsic type \
+                                     (history.py:220 Box.type invariant)",
+                                opref
+                            )
+                        });
+                        InputArg::from_type(tp, opref.raw())
+                    })
+                    .collect();
                 // history.py:220/261/307 parity: `partial_trace.operations`
                 // carry inline `ConstX.value` per history.py:227/268/314;
                 // no separate constants side table at the retrace boundary.

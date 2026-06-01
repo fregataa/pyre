@@ -38,6 +38,7 @@ pub const NULLGCMAP: *const u8 = std::ptr::null();
 ///     ('jfi_frame_size', lltype.Signed),
 /// )
 /// ```
+#[derive(Debug, Default)]
 #[repr(C)]
 pub struct JitFrameInfo {
     /// jfi_frame_depth: Signed — number of word-sized slots in jf_frame.
@@ -54,8 +55,15 @@ const _: () = assert!(std::mem::size_of::<JitFrameInfo>() == JITFRAMEINFO_SIZE);
 // jitframe.py:18-22 — jitframeinfo_update_depth
 // jitframe.py:24-26 — jitframeinfo_clear
 impl JitFrameInfo {
-    /// jitframe.py:18-22
-    pub fn update_depth(&mut self, base_ofs: isize, new_depth: isize) {
+    /// jitframe.py:18-22 `jitframeinfo_update_depth(jfi, base_ofs, new_depth)`.
+    ///
+    /// The fields are `isize` (lltype.Signed = machine word); the frame-depth
+    /// call sites (CompiledLoopToken / backend assemblers) thread `base_ofs`
+    /// and `new_depth` as `i64`, so the word-width conversion is localized
+    /// here.
+    pub fn update_frame_depth(&mut self, base_ofs: i64, new_depth: i64) {
+        let base_ofs = base_ofs as isize;
+        let new_depth = new_depth as isize;
         if new_depth > self.jfi_frame_depth {
             self.jfi_frame_depth = new_depth;
             self.jfi_frame_size = base_ofs + new_depth * SIZEOFSIGNED as isize;
@@ -404,7 +412,7 @@ where
         // llmodel.py:132-139 — widen frame_info when we need more depth.
         let fi = (*old_jf).jf_frame_info as *mut JitFrameInfo;
         if expected_depth > (*fi).jfi_frame_depth {
-            (*fi).update_depth(base_ofs, expected_depth);
+            (*fi).update_frame_depth(base_ofs as i64, expected_depth as i64);
         }
         let size_bytes = (*fi).jfi_frame_size;
 

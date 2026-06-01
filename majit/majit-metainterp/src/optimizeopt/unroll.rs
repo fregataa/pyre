@@ -667,10 +667,11 @@ impl UnrollOptimizer {
                     }
                     state.patchguardop = opt_p1.patchguardop.clone();
                     self.all_descrs = std::mem::take(&mut opt_p1.all_descrs);
-                    // Box.type parity: retain Phase 1's renamed_inputarg_types
-                    // so the backend can see the reduced LABEL's declared
-                    // types. Clone only the field we need to avoid keeping
-                    // Phase 1 short preamble data alive longer than before.
+                    // Box.type parity: retain Phase 1's renamed_inputargs so
+                    // the backend can read the reduced LABEL's declared types
+                    // off each typed InputArg OpRef. Clone only the field we
+                    // need to avoid keeping Phase 1 short preamble data alive
+                    // longer than before.
                     let mut final_exported_state = ExportedState {
                         end_args: Vec::new(),
                         next_iteration_args: Vec::new(),
@@ -682,7 +683,6 @@ impl UnrollOptimizer {
                         short_box_const_values: crate::optimizeopt::vec_assoc::VecAssoc::new(),
                         short_preamble: None,
                         renamed_inputargs: state.renamed_inputargs.clone(),
-                        renamed_inputarg_types: state.renamed_inputarg_types.clone(),
                         short_inputargs: Vec::new(),
                         runtime_boxes: Vec::new(),
                         patchguardop: None,
@@ -1873,11 +1873,11 @@ pub struct ExportedState {
     pub short_box_const_values: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, majit_ir::Value>,
     /// Short preamble builder for bridge entry.
     pub short_preamble: Option<crate::optimizeopt::shortpreamble::ShortPreamble>,
-    /// Renamed inputargs from the preamble.
+    /// Renamed inputargs from the preamble. Each OpRef is a typed
+    /// `InputArg{Int,Float,Ref}` variant carrying its `.type` intrinsically
+    /// (history.py:220), so consumers read the type via `OpRef::ty()` —
+    /// RPython `info.renamed_inputargs` Box parity, no parallel type array.
     pub renamed_inputargs: Vec<OpRef>,
-    /// Types of renamed_inputargs. RPython Box objects carry type
-    /// intrinsically; majit stores it separately.
-    pub renamed_inputarg_types: Vec<Type>,
     /// Short inputargs for the short preamble.
     pub short_inputargs: Vec<OpRef>,
     /// unroll.py: runtime_boxes — live values at the original jump point.
@@ -1968,7 +1968,6 @@ impl ExportedState {
         >,
         exported_short_boxes: Vec<crate::optimizeopt::shortpreamble::PreambleOp>,
         renamed_inputargs: Vec<OpRef>,
-        renamed_inputarg_types: Vec<Type>,
         short_inputargs: Vec<OpRef>,
     ) -> Self {
         // unroll.py:466-477 `sb.create_short_boxes(...)` parity: pyre
@@ -1992,7 +1991,6 @@ impl ExportedState {
             short_box_const_values: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             short_preamble: None,
             renamed_inputargs,
-            renamed_inputarg_types,
             short_inputargs,
             runtime_boxes: Vec::new(),
             patchguardop: None,
@@ -2497,7 +2495,6 @@ impl Clone for ExportedState {
             short_box_const_values: self.short_box_const_values.clone(),
             short_preamble: self.short_preamble.clone(),
             renamed_inputargs: self.renamed_inputargs.clone(),
-            renamed_inputarg_types: self.renamed_inputarg_types.clone(),
             short_inputargs: self.short_inputargs.clone(),
             runtime_boxes: self.runtime_boxes.clone(),
             patchguardop: self.patchguardop.clone(),
@@ -2851,51 +2848,6 @@ impl OptUnroll {
         // RPython unroll.py:467: next_iteration_args = end_args (post-force).
         // Aliased boxes (same resolved OpRef) are handled by export_state's
         // create_state cache + make_inputargs' position_in_notvirtuals dedup.
-        // unroll.py:454 `end_args` are typed Boxes — port reads each arg's
-        // authoritative type from `ctx` at export time so downstream consumers
-        // never have to reconstruct types from op result shape.
-        // RPython Box type parity: `renamed_inputargs` are the fresh per-iteration
-        // InputArg Boxes (unroll.py `trace.get_iter()` inputargs). Their types
-        // are intrinsic on RPython Boxes; pyre reconstructs them via
-        // `ctx.opref_type` for each renamed OpRef directly. Using
-        // `end_arg_types` (computed over `end_args`) here would be wrong:
-        // `end_args` are the post-force JUMP operands, which may be distinct
-        // OpRefs from the renamed inputargs (and can have different types
-        // when forcing virtuals replaces an InputArg slot with a fresh
-        // NewWithVtable / SameAs alias).
-        // RPython unroll.py:452 `export_state()` reads each `info.inputargs`
-        // Box's `.type` (history.py:220 InputArg{Int,Ref,Float}) directly —
-        // the inputarg Box's intrinsic type, not the post-forwarding
-        // target's. Pyre's `renamed_inputargs` are the canonical inputarg
-        // slot OpRefs; reading `inputarg_type` *before* `opref_type`
-        // forwarding mirrors RPython's Box-identity lookup. If the slot
-        // was forwarded onto something that itself lacks a recorded type
-        // (e.g. a virtual-head SameAs alias whose `value_types` entry
-        // was Void-filtered upstream), the fall-through `opref_type` path
-        // still resolves it, and finally the strict panic surfaces the
-        // genuine missing-Box.type case RPython would never reach.
-        let renamed_inputarg_types: Vec<Type> = renamed_inputargs
-            .iter()
-            .map(|&opref| {
-                // history.py:220 `box.type` intrinsic
-                // (resoperation.py:719/727/739 InputArg{Int,Ref,Float}.type
-                // carries the inputarg's declared type on the Box itself).
-                // `inputarg_type` is a *read-only* lookup against the
-                // graph-level `inputarg_types` Vec — never materialize a
-                // fresh Box here, since the OpRef variant tag of a Phase 1
-                // low slot referenced from Phase 2 may mismatch the
-                // canonical `inputarg_types[idx]`.
-                ctx.inputarg_type(opref)
-                    .or_else(|| ctx.opref_type(opref))
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "missing type for renamed inputarg {:?} in export_state \
-                             (history.py:220 Box.type invariant)",
-                            opref
-                        )
-                    })
-            })
-            .collect();
         // RPython parity: store next_iteration_args in their post-forwarding
         // form so the cache key invariant established by `export_single_value`
         // (which uses `get_box_replacement` as the cache key, virtualstate.rs:2213)
@@ -2927,7 +2879,6 @@ impl OptUnroll {
             infos,
             exported_short_boxes,
             renamed_inputargs.to_vec(),
-            renamed_inputarg_types,
             short_args,
         );
         // `OptContext::next_pos` is the strict upper bound on raw OpRefs
@@ -3868,7 +3819,7 @@ impl OptUnroll {
         // assigns a Box of the correct kind from `produced_op.short_op.res`
         // before `produce_op` runs; majit must allocate the result OpRef
         // with the typed allocator so `opref_type` resolution doesn't
-        // depend on a downstream `register_value_type` patch.
+        // depend on a downstream type-registration patch.
         let mut result_map: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef> =
             crate::optimizeopt::vec_assoc::VecAssoc::new();
         for (source, produced) in &exported_state.short_boxes {
@@ -5268,7 +5219,6 @@ mod tests {
             crate::optimizeopt::vec_assoc::VecAssoc::new(),
             Vec::new(),
             vec![OpRef::int_op(14)],
-            Vec::new(),
             vec![OpRef::int_op(23)],
         );
 
@@ -5474,7 +5424,6 @@ mod tests {
                 same_as_source: Some(old_ref),
             }],
             vec![old_ref],
-            vec![Type::Ref],
             vec![old_ref],
         );
         state.short_boxes.push((
@@ -6247,7 +6196,6 @@ mod tests {
                 invented_name: false,
                 same_as_source: None,
             }],
-            Vec::new(),
             Vec::new(),
             vec![source],
         );

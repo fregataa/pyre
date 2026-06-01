@@ -46,8 +46,8 @@ use majit_ir::{EffectInfo, ExtraEffect, GcRef, OpCode, OpRef, Type};
 /// is the lowest crate that needs the predicate (for the
 /// `_unique_const_heuristic` ConstPtr canonicalisation,
 /// heapcache.py:96-104) and the implementation lives in `majit-metainterp`
-/// where the `ConstantPool` storage sits.  `&dyn SameConstantOracle`
-/// keeps the heapcache layer agnostic of the pool's representation.
+/// (`history::ConstOprefOracle`).  `&dyn SameConstantOracle`
+/// keeps the heapcache layer agnostic of the oracle's representation.
 pub trait SameConstantOracle {
     fn same_constant(&self, a: OpRef, b: OpRef) -> bool;
 }
@@ -1665,8 +1665,8 @@ impl HeapCache {
     /// `_unique_const_heuristic` ConstPtr canonicalisation and the
     /// `maybe_replace_with_const` forwarding internally.  Need an
     /// `oracle` parameter because pyre's `same_constant` lives on the
-    /// `ConstantPool` rather than on the box itself (no
-    /// `Const.same_constant` method).
+    /// `ConstOprefOracle` (inline Const OpRef value compare) rather than
+    /// on the OpRef itself.
     pub fn get_field_updater(
         &mut self,
         obj: OpRef,

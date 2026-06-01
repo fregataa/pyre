@@ -3951,9 +3951,9 @@ mod tests {
     /// `trace_inputargs`, so the preamble exporter can recover a
     /// renamed inputarg's type without guessing. Unit-test inputs are
     /// anonymous stand-ins, so we seed Ref for every slot — the only
-    /// use of the type in these tests is to populate
-    /// `renamed_inputarg_types`, and Ref keeps heap/aliasing tests on
-    /// the same path RPython exercises for pointer Boxes.
+    /// use of the type in these tests is to mint typed renamed inputarg
+    /// OpRefs, and Ref keeps heap/aliasing tests on the same path
+    /// RPython exercises for pointer Boxes.
     fn run_heap_opt(ops: &mut [Op]) -> Vec<Op> {
         run_heap_opt_typed(ops, &[])
     }

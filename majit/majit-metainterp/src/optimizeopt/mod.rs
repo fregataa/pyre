@@ -1488,51 +1488,6 @@ impl OptContext {
         }
     }
 
-    /// RPython Box.type invariant: each OpRef's type is fixed at creation
-    /// (IntFrontendOp / RefFrontendOp / FloatFrontendOp are separate classes
-    /// and `box.type` is a class property, immutable for the box's lifetime).
-    /// The typed OpRef enum variant (`ConstInt`/`InputArgInt`/`IntOp`/…)
-    /// encodes `box.type` directly per resoperation.py:29
-    /// `AbstractValue.type` parity, so this function exists only as a
-    /// debug guardrail: it verifies the registered `tp` agrees with the
-    /// variant tag the producer minted (and with `Op.type_` on the
-    /// producing op) and otherwise short-circuits — there is no
-    /// side-table to populate.
-    ///
-    /// Void (no result) is rejected because there is no Box value.
-    pub fn register_value_type(&mut self, opref: majit_ir::OpRef, tp: majit_ir::Type) {
-        debug_assert_ne!(
-            tp,
-            majit_ir::Type::Void,
-            "register_value_type: Void has no box value (opref={:?})",
-            opref,
-        );
-        if let Some(variant_tp) = opref.ty() {
-            debug_assert_eq!(
-                variant_tp, tp,
-                "register_value_type: OpRef variant tag ({:?}) disagrees \
-                 with registered tp ({:?}) at {:?} — fix the producer \
-                 (typed factory mismatch with op.result_type())",
-                variant_tp, tp, opref,
-            );
-        }
-        #[cfg(debug_assertions)]
-        if let Some(producer) = self
-            .new_operations
-            .iter()
-            .rev()
-            .find(|o| o.pos.get() == opref)
-        {
-            debug_assert_eq!(
-                producer.type_, tp,
-                "register_value_type: Op.type_ ({:?}) disagrees with \
-                 registered tp ({:?}) at {:?} (opcode={:?}) — Box.type \
-                 parity violation",
-                producer.type_, tp, opref, producer.opcode,
-            );
-        }
-    }
-
     pub fn new(estimated_ops: usize) -> Self {
         OptContext {
             new_operations: Vec::with_capacity(estimated_ops),
@@ -2074,8 +2029,8 @@ impl OptContext {
     /// Allocate a fresh OpRef position with the producer's result type
     /// stamped on the variant tag. Callers always know `box.type` —
     /// the resulting OpRef is recognized at priority 0 by `opref_type` /
-    /// `OptBoxEnv::get_type`, and `register_value_type` no longer needs
-    /// to grow the side-table for these positions.
+    /// `OptBoxEnv::get_type`, and there is no type side-table to grow
+    /// for these positions.
     pub fn alloc_op_position_typed(&mut self, tp: majit_ir::Type) -> OpRef {
         self.reserve_pos_typed(tp)
     }
@@ -2378,9 +2333,8 @@ impl OptContext {
     /// `opclasses[opnum].type`): every emitted op's intrinsic
     /// `Op.type_` must agree with both the producer's
     /// `OpCode::result_type()` and the `OpRef.pos` variant tag.
-    /// Replaces the pre-Slice-0.5 `register_value_type`
-    /// debug-assertion site at the surviving emit/emit_extra
-    /// producer surfaces.
+    /// Replaces the pre-Slice-0.5 type-registration debug-assertion
+    /// site at the surviving emit/emit_extra producer surfaces.
     fn debug_assert_box_type_invariant(op: &Op) {
         let pos = op.pos.get();
         debug_assert_eq!(
@@ -2525,7 +2479,7 @@ impl OptContext {
         // the op is about to be pushed into `new_operations`,
         // after which `op_at` resolves its intrinsic `op.type_`
         // (resoperation.py:1693 parity) and `opref_type` returns it via
-        // the primary fast path. The pre-Slice-0.5 `register_value_type`
+        // the primary fast path. The pre-Slice-0.5 type-registration
         // side-table entry is gone; its Box.type invariant survives as
         // `debug_assert_box_type_invariant` below.
         Self::debug_assert_box_type_invariant(&op);
@@ -6027,7 +5981,7 @@ impl OptContext {
         // safe to read for `.type_` and other intrinsic attributes; arg
         // / descr fields refer to Phase 1's namespace and should not be
         // dereferenced through this path (Phase 2 callers only consume
-        // `op.type_` via `get_op_result_type` / `opref_type`).
+        // `op.type_` via `opref_type`).
         self.phase1_emit_ops
             .iter()
             .rev()
@@ -6035,9 +5989,6 @@ impl OptContext {
             .map(|rc| rc.as_ref())
     }
 
-    /// RPython box.type parity: find the result type of the operation
-    /// that produces this OpRef. Returns None if the OpRef is an
-    /// inputarg or was not produced by any emitted operation.
     /// optimizer.py: clear_newoperations()
     /// Clear the output operation list (used when restarting optimization).
     pub fn clear_newoperations(&mut self) {
@@ -6059,11 +6010,10 @@ impl OptContext {
     /// encodes `box.type` (`AbstractValue.type` ∈ {`'i'`, `'r'`, `'f'`,
     /// `'v'`}) directly in the variant tag, so reading the tag is the
     /// line-by-line equivalent of upstream `box.type`. The fall-through
-    /// arms cover residual cases — seeded constants without a typed
-    /// variant, ops that have not yet been emitted, inputarg slots, and
-    /// PtrInfo-derived Ref typing. Raw-pointer `ConstInt` Boxes keep
-    /// `op.type == 'i'` and become `ConstPtrInfo` through
-    /// `getrawptrinfo` per `info.py:870-871`.
+    /// arms cover residual cases — ops that have not yet been emitted,
+    /// inputarg slots, and PtrInfo-derived Ref typing. Raw-pointer
+    /// `ConstInt` Boxes keep `op.type == 'i'` and become `ConstPtrInfo`
+    /// through `getrawptrinfo` per `info.py:870-871`.
     ///
     /// Returns `None` only when none of the above sources have type
     /// information for the OpRef. Callers must treat `None` like
@@ -6091,23 +6041,20 @@ impl OptContext {
         if let Some(tp) = resolved.ty() {
             return Some(tp);
         }
-        // 2. Seeded constant — read the intrinsic Rust shape (history.py:220
-        //    `ConstInt.type = INT` parity).
-        if let Some(val) = self
-            .get_box_replacement_box(resolved)
-            .and_then(|cb| cb.const_value())
-        {
-            return Some(val.get_type());
-        }
-        // 3. Producing op's intrinsic `type_` (resoperation.py:1693
-        //    `opclasses[opnum].type` parity). populates this
-        //    at construction; this is the primary fast path post-Slice-0.5.
+        // 2. Producing op's intrinsic `type_` (resoperation.py:1693
+        //    `res.type = result_type` in `create_class_for_op`, i.e.
+        //    `opclasses[opnum].type`). `Op::new` populates this at
+        //    construction; this is the primary fast path post-Slice-0.5.
+        //    Reached only when `resolved` is `None`/`TempVar` (every other
+        //    variant is typed by step 1); inline-Const collapsed the old
+        //    pool-indexed "seeded constant without a typed variant" case
+        //    into step 1, so no separate const-value fall-through remains.
         if let Some(op) = self.op_at(resolved) {
             if op.type_ != majit_ir::Type::Void {
                 return Some(op.type_);
             }
         }
-        // 5. PtrInfo-derived type (history.py:220 box.type parity for
+        // 3. PtrInfo-derived type (box.type parity for
         //    virtual heads across phase boundaries). Phase 1 virtualizes
         //    NewWithVtable / New / NewArray etc. by returning
         //    `OptimizationResult::Remove` from the relevant `optimize_*`
@@ -6153,7 +6100,7 @@ impl OptContext {
     /// the box.  Pyre's flat `OpRef(u32)` namespace separates Phase 1
     /// inputargs (at `[0, num_inputs)`) from Phase 2 inputargs (at
     /// `[phase2_inputarg_base, phase2_inputarg_base + num_inputs)`), but
-    /// `Optimizer.trace_inputarg_types` is identical between phases
+    /// `Optimizer.trace_inputargs` is identical between phases
     /// (single recorder source).  Indexing the same `inputarg_types`
     /// Vec by raw position recovers Phase 1 slot types from Phase 2
     /// without a separate side-table (history.py:220 parity).
@@ -6240,21 +6187,6 @@ impl OptContext {
     /// Mirrors PyPy `self.inputargs[idx]` (optimizer.py:34).
     pub fn inputarg_at(&self, idx: usize) -> Option<majit_ir::OpRef> {
         self.inputargs.get(idx).copied()
-    }
-
-    /// `Box.type` strict accessor. Panics when no source carries a type for
-    /// `opref` — history.py:802 parity.
-    #[track_caller]
-    pub fn op_type_strict(&self, opref: OpRef) -> majit_ir::Type {
-        self.opref_type(opref).unwrap_or_else(|| {
-            panic!(
-                "op_type_strict: no Box.type for {:?} (resolved={:?}); \
-                 every OpRef must have a type via variant tag / constant / \
-                 producer op.type_ / inputarg slot. history.py:802 parity.",
-                opref,
-                self.get_box_replacement(opref),
-            )
-        })
     }
 
     /// info.py:865-878 `getrawptrinfo(op)` parity (line-by-line port).
@@ -8749,6 +8681,50 @@ mod boxref_forwarding_tests {
             &old_box.get_forwarded(),
             crate::r#box::Forwarded::None,
         ));
+    }
+
+    /// Slice 0.8 capstone: for an emitted ResOp the producing `Op.type_`,
+    /// the minted OpRef variant tag, and `opref_type` all derive from the
+    /// single source `opcode.result_type()` (resoperation.py:1693
+    /// `res.type = result_type` in `create_class_for_op`). This regresses
+    /// if a producer mints a variant tag disagreeing with `op.type_`, or if
+    /// `opref_type` stops reading the variant tag / producing op — i.e. if
+    /// any retired type side-table (`value_types` / `prev_phase_value_types`
+    /// / `renamed_inputarg_types`) were reintroduced as a competing source.
+    #[test]
+    fn slice_0_8_emitted_op_type_is_single_source_of_truth() {
+        use majit_ir::{Op, OpCode};
+        let mut ctx = OptContext::with_num_inputs(8, 0);
+        let cases: &[(OpCode, Type)] = &[
+            (OpCode::SameAsI, Type::Int),
+            (OpCode::SameAsR, Type::Ref),
+            (OpCode::SameAsF, Type::Float),
+        ];
+        for &(opcode, ty) in cases {
+            let op = Op::new(opcode, &[]);
+            // `Op::new` seeds `type_` from `opcode.result_type()`.
+            assert_eq!(op.type_, ty, "Op.type_ must equal opcode.result_type()");
+            let pos: OpRef = ctx.emit(op);
+            // `emit` reserves a typed pos, so the variant tag encodes the type.
+            assert_eq!(
+                pos.ty(),
+                Some(ty),
+                "minted OpRef variant tag must encode the op result type"
+            );
+            // The unified reader agrees, proving it reads the variant tag /
+            // producing op.type_ and not any retired side-table.
+            assert_eq!(
+                ctx.opref_type(pos),
+                Some(ty),
+                "opref_type must agree with the variant tag / op.type_"
+            );
+            // The producing op recovered by position carries the same type_.
+            let producer = ctx.op_at(pos).expect("emitted op must be findable by pos");
+            assert_eq!(
+                producer.type_, ty,
+                "producing op.type_ must match the variant tag / opref_type"
+            );
+        }
     }
 }
 

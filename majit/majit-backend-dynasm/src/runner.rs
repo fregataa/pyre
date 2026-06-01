@@ -1287,6 +1287,32 @@ impl DynasmBackend {
         arch::JITFRAME_FIXED_SIZE + position
     }
 
+    /// Free a libc-allocated jitframe and every frame it forwards to.
+    ///
+    /// jitframe.py:139-145 — when `_check_frame_depth`'s realloc slowpath
+    /// fires, the outgrown frame's `jf_forward` is linked to its
+    /// replacement (`dynasm_realloc_frame`), and every node in that chain
+    /// was `register_libc_jitframe`'d (the head in `execute_token`, each
+    /// replacement in `dynasm_realloc_frame`).  Walk the chain, reading
+    /// `jf_forward` before freeing each node, so every frame is
+    /// unregistered + freed exactly once.  In the common no-realloc case
+    /// the chain is a single node (`jf_forward == null`).
+    ///
+    /// # Safety
+    /// `head` must be a live, `register_libc_jitframe`-tracked
+    /// `*mut JitFrame`, and the compiled epilogue must have popped every
+    /// chain frame off the shadow stack (gen_footer_shadowstack) before
+    /// this runs, so no freed frame is still a GC root.
+    unsafe fn free_jitframe_chain(head: *mut JitFrame) {
+        let mut cur = head;
+        while !cur.is_null() {
+            let next = unsafe { (*cur).jf_forward };
+            majit_gc::shadow_stack::unregister_libc_jitframe(cur as usize);
+            unsafe { libc::free(cur as *mut std::ffi::c_void) };
+            cur = next;
+        }
+    }
+
     /// llsupport/regalloc.py:861-871 `_set_initial_bindings` parity:
     /// `_ll_initial_locs` stores `loc.value - base_ofs`, measured in bytes
     /// from `FIRST_ITEM_OFFSET`, not input-order slot numbers.
@@ -2079,14 +2105,45 @@ impl Backend for DynasmBackend {
         let compiled = Self::get_compiled(token);
         let entry = codebuf::buffer_ptr(&compiled.buffer);
 
-        let num_slots = args
-            .len()
-            .max(compiled.fail_descrs.len() * 4)
-            .max(compiled.frame_depth.load(Ordering::Acquire))
-            .max(64);
+        // jitframe.py:51 — every JITFRAME carries a non-null JITFRAMEINFO
+        // so the bridge-entry `_check_frame_depth` realloc slowpath
+        // (`_frame_realloc_slowpath` → `dynasm_realloc_frame`) can read
+        // `jfi_frame_depth` / `jfi_frame_size` to size a grown frame.
+        // Mirror the CALL_ASSEMBLER callee template
+        // (`lookup_call_assembler_callee_locs` above): the Arc-pinned
+        // `frame_info` pointer is stable, and `jfi_frame_depth` alone sizes
+        // the frame — the same sizing the JIT uses for the callee frames it
+        // allocates itself, so the former `.max(args/fail*4/64)` cushion was
+        // a runner-only over-allocation with no upstream basis.
+        let clt = token
+            .compiled_loop_token
+            .as_ref()
+            .expect("JitCellToken missing compiled_loop_token");
+        let (fi_ptr, num_slots) = {
+            let info = clt.frame_info.lock();
+            // The Arc-pinned `JitFrameInfo` address stays valid past the
+            // guard drop; pass it as the frame's `jf_frame_info` so the
+            // bridge realloc slowpath can read `jfi_frame_depth` /
+            // `jfi_frame_size` (jitframe.py:51).  Mirrors the CALL_ASSEMBLER
+            // callee path (`lookup_call_assembler_callee_locs`).
+            (
+                &*info as *const majit_backend::JitFrameInfo,
+                info.jfi_frame_depth as usize,
+            )
+        };
+        // `jfi_frame_depth` is floored at `JITFRAME_FIXED_SIZE + inputargs`
+        // by construction, so every input slot fits.  Assert it (release):
+        // dropping the `.max(64)` cushion removes the silent-OOB mask, so a
+        // depth/arg mismatch must surface loudly instead of corrupting.
+        assert!(
+            num_slots >= Self::input_slot(args.len()),
+            "execute_token: frame depth {num_slots} < input top {} for {} args",
+            Self::input_slot(args.len()),
+            args.len()
+        );
         let jf_ptr = unsafe { libc::calloc(1, JitFrame::alloc_size(num_slots)) as *mut JitFrame };
         assert!(!jf_ptr.is_null(), "execute_token: calloc failed");
-        unsafe { JitFrame::init(jf_ptr, std::ptr::null(), num_slots) };
+        unsafe { JitFrame::init(jf_ptr, fi_ptr, num_slots) };
         // Register this libc-allocated jitframe with the GC so its
         // interior Ref slots (pinned by gcmap bits) remain visible to
         // the collector during CallMallocNursery slow-path collections.
@@ -2221,8 +2278,10 @@ impl Backend for DynasmBackend {
             }
         }
 
-        majit_gc::shadow_stack::unregister_libc_jitframe(jf_ptr as usize);
-        unsafe { libc::free(jf_ptr as *mut std::ffi::c_void) };
+        // The deadframe `result_jf` is the tip of `jf_ptr`'s `jf_forward`
+        // chain whenever `_check_frame_depth` realloc'd; free every frame in
+        // the chain (jitframe.py:139-145), not just the original head.
+        unsafe { Self::free_jitframe_chain(jf_ptr) };
 
         DeadFrame {
             data: Box::new(FrameData::new(raw_values, descr, None)),
@@ -2244,14 +2303,32 @@ impl Backend for DynasmBackend {
         let compiled = Self::get_compiled(token);
         let entry = codebuf::buffer_ptr(&compiled.buffer);
 
-        let num_slots = args
-            .len()
-            .max(compiled.fail_descrs.len() * 4)
-            .max(compiled.frame_depth.load(Ordering::Acquire))
-            .max(64);
+        // Same non-null JITFRAMEINFO + `jfi_frame_depth` sizing as
+        // `execute_token` (jitframe.py:51) — the bridge realloc slowpath
+        // needs the frame_info, and the depth matches cranelift's
+        // `max_output_slots`-sized raw outputs (compiler.rs:14994).
+        let clt = token
+            .compiled_loop_token
+            .as_ref()
+            .expect("JitCellToken missing compiled_loop_token");
+        let (fi_ptr, num_slots) = {
+            let info = clt.frame_info.lock();
+            // Same non-null frame_info + `jfi_frame_depth` sizing as
+            // `execute_token`.
+            (
+                &*info as *const majit_backend::JitFrameInfo,
+                info.jfi_frame_depth as usize,
+            )
+        };
+        assert!(
+            num_slots >= Self::input_slot(args.len()),
+            "execute_token_ints_raw: frame depth {num_slots} < input top {} for {} args",
+            Self::input_slot(args.len()),
+            args.len()
+        );
         let jf_ptr = unsafe { libc::calloc(1, JitFrame::alloc_size(num_slots)) as *mut JitFrame };
         assert!(!jf_ptr.is_null(), "execute_token_ints_raw: calloc failed");
-        unsafe { JitFrame::init(jf_ptr, std::ptr::null(), num_slots) };
+        unsafe { JitFrame::init(jf_ptr, fi_ptr, num_slots) };
         // Same registration as `execute_token` above: the libc-allocated
         // jitframe must be visible to the minor-collection walker so its
         // `jf_gcmap`-marked Ref slots get traced during
@@ -2314,8 +2391,8 @@ impl Backend for DynasmBackend {
             descr_fd.trace_id(),
         ));
 
-        majit_gc::shadow_stack::unregister_libc_jitframe(jf_ptr as usize);
-        unsafe { libc::free(jf_ptr as *mut std::ffi::c_void) };
+        // Free the whole `jf_forward` realloc chain (jitframe.py:139-145).
+        unsafe { Self::free_jitframe_chain(jf_ptr) };
 
         let descr_arc: majit_ir::DescrRef = descr.clone();
         majit_backend::RawExecResult {
