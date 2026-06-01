@@ -1359,6 +1359,17 @@ impl _array {
     }
 
     pub fn setitem(&self, index: usize, value: LowLevelValue) -> bool {
+        // `assert typeOf(value) == self._TYPE.OF` (lltype.py:1942) — the
+        // element-type invariant guards every `_array.setitem`, not just the
+        // `_ptr.__setitem__` path.
+        assert_eq!(
+            typeOf_value(&value),
+            self.OF(),
+            "{:?} items: expect {:?} got {:?}",
+            self.TYPE,
+            self.OF(),
+            typeOf_value(&value)
+        );
         let mut items = self.items.lock().unwrap();
         let Some(slot) = items.get_mut(index) else {
             // `_array.setitem` special case (lltype.py:1946-1950): writing
@@ -1377,12 +1388,26 @@ impl _array {
         true
     }
 
-    /// `self._TYPE._hints.get('extra_item_after_alloc')` — only a
-    /// variable-length `Array` (e.g. `STR.chars`) carries it; a
-    /// `FixedSizeArray` never does.
+    /// `self._TYPE.OF` — the array element type, shared by both the
+    /// variable-length `Array` and the `FixedSizeArray` carriers.
+    fn OF(&self) -> ConcretetypePlaceholder {
+        match &self.TYPE {
+            ArrayContainer::Array(t) => t.OF.clone(),
+            ArrayContainer::FixedSizeArray(t) => t.OF.clone(),
+        }
+    }
+
+    /// `self._TYPE._hints.get('extra_item_after_alloc')` — checked for
+    /// truthiness, not mere presence (a `0`/`False` hint is falsy in
+    /// upstream). Only a variable-length `Array` (e.g. `STR.chars`) carries
+    /// it; a `FixedSizeArray` never does.
     fn extra_item_after_alloc(&self) -> bool {
         match &self.TYPE {
-            ArrayContainer::Array(t) => t._hints.get("extra_item_after_alloc").is_some(),
+            ArrayContainer::Array(t) => match t._hints.get("extra_item_after_alloc") {
+                Some(ConstValue::Int(n)) => *n != 0,
+                Some(ConstValue::Bool(b)) => *b,
+                _ => false,
+            },
             ArrayContainer::FixedSizeArray(_) => false,
         }
     }
@@ -6011,6 +6036,37 @@ mod tests {
             vec![LowLevelValue::Char('a')],
         );
         assert!(!plain.setitem(1, LowLevelValue::Char('\0')));
+
+        // A falsy `extra_item_after_alloc` hint (`0`) does not enable the
+        // special case — `.get(...)` truthiness, not key presence.
+        let falsy_hint = ArrayType::with_hints(
+            LowLevelType::Char,
+            vec![("extra_item_after_alloc".into(), ConstValue::Int(0))],
+        );
+        let falsy = build_array(
+            ArrayContainer::Array(falsy_hint),
+            vec![LowLevelValue::Char('a')],
+        );
+        assert!(!falsy.setitem(1, LowLevelValue::Char('\0')));
+    }
+
+    #[test]
+    #[should_panic(expected = "items: expect")]
+    fn array_setitem_rejects_mismatched_item_type() {
+        // `assert typeOf(value) == self._TYPE.OF` (lltype.py:1942) — a
+        // `Char` write to a `Signed`/`extra_item_after_alloc` array fails the
+        // element-type invariant rather than slipping through the trailing-NUL
+        // special case.
+        use crate::flowspace::model::ConstValue;
+        let signed_extra = ArrayType::with_hints(
+            LowLevelType::Signed,
+            vec![("extra_item_after_alloc".into(), ConstValue::Int(1))],
+        );
+        let arr = build_array(
+            ArrayContainer::Array(signed_extra),
+            vec![LowLevelValue::Signed(1)],
+        );
+        arr.setitem(1, LowLevelValue::Char('\0'));
     }
 
     #[test]
