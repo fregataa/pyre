@@ -1,0 +1,9 @@
+[env]
+# The full `eval_loop_jit` pipeline analysis (a ~100-arm `match
+# instruction` dispatch) recurses deep enough to overflow the default
+# 2 MiB thread stack used by the libtest harness.  `pyre-jit-trace/
+# build.rs` already runs the identical analysis on an explicit 64 MiB
+# worker for this reason; this raises every cargo-spawned test/binary
+# thread's minimum stack so `cargo test` works without a manual
+# `RUST_MIN_STACK=…` prefix.
+RUST_MIN_STACK = "16777216"

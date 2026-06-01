@@ -1729,6 +1729,110 @@ impl FrameState {
         out
     }
 
+    /// `framestate.py:42-48 FrameState.copy` — "Make a copy of this
+    /// state in which all Variables are fresh."
+    ///
+    /// ```python
+    /// def copy(self):
+    ///     exc = self.last_exception
+    ///     if exc is not None:
+    ///         exc = FSException(_copy(exc.w_type), _copy(exc.w_value))
+    ///     return FrameState(map(_copy, self.locals_w),
+    ///                       map(_copy, self.stack),
+    ///                       exc, self.blocklist, self.next_offset)
+    /// ```
+    ///
+    /// `_copy(v)` (framestate.py:4-12) independently creates a fresh
+    /// `Variable(v)` per occurrence — NO shared mapping across cells.
+    /// Constants and None slots pass through unchanged.
+    pub fn copy(&self, graph: &mut FunctionGraph) -> FrameState {
+        use crate::flowspace::model::{Hlvalue, Variable};
+        // `_copy(v)` — each call independently mints a fresh Variable.
+        // `Variable(v)` (model.py:300-311) copies the source's name
+        // prefix via `rename(v)`, which reads `v._name`; carry the
+        // source slot's name onto the fresh Variable so the freshened
+        // state's phi inputs keep their human-readable names.
+        let copy_hlvalue = |h: &Hlvalue, graph: &mut FunctionGraph| -> Hlvalue {
+            match h {
+                Hlvalue::Variable(src) => {
+                    // `_copy(v) -> Variable(v)` (framestate.py:4): fresh
+                    // Variable carrying the source's `_name` prefix
+                    // (annotation stays None). Identity-shared `_name`
+                    // makes the rename visible through the registry clone.
+                    let mut nv = graph.alloc_value_var();
+                    nv.rename_from(src);
+                    graph.ensure_variable_registered_void(&nv);
+                    Hlvalue::Variable(nv)
+                }
+                other => other.clone(),
+            }
+        };
+        let copy_var = |v: &Variable, graph: &mut FunctionGraph| -> Variable {
+            let mut nv = graph.alloc_value_var();
+            nv.rename_from(v);
+            graph.ensure_variable_registered_void(&nv);
+            nv
+        };
+        // `locals_w` is the authoritative carrier (framestate.py:19).
+        // When `locals_w` is empty (pre-Z4.A.6 fixtures), fall back
+        // to `entries` as the seed.
+        let locals_w: Vec<Option<Hlvalue>> = if self.locals_w.len() == self.entries.len() {
+            self.locals_w
+                .iter()
+                .map(|slot| slot.as_ref().map(|h| copy_hlvalue(h, graph)))
+                .collect()
+        } else {
+            self.entries
+                .iter()
+                .map(|e| e.as_ref().map(|v| Hlvalue::Variable(copy_var(v, graph))))
+                .collect()
+        };
+        let entries: Vec<Option<Variable>> = locals_w
+            .iter()
+            .map(|slot| {
+                slot.as_ref().and_then(|hv| match hv {
+                    Hlvalue::Variable(v) => Some(v.clone()),
+                    Hlvalue::Constant(_) => None,
+                })
+            })
+            .collect();
+        // `map(_copy, self.stack)` — each stack element independently copied.
+        // framestate.py:8-10: FlowSignal → rebuild with recursively
+        // copied args.
+        let stack: Vec<crate::flowspace::framestate::StackElem> =
+            self.stack
+                .iter()
+                .map(|elem| match elem {
+                    crate::flowspace::framestate::StackElem::Value(h) => {
+                        crate::flowspace::framestate::StackElem::Value(copy_hlvalue(h, graph))
+                    }
+                    crate::flowspace::framestate::StackElem::Signal(sig) => {
+                        use crate::flowspace::flowcontext::FlowSignal;
+                        let copied_args: Vec<Hlvalue> =
+                            sig.args().iter().map(|a| copy_hlvalue(a, graph)).collect();
+                        crate::flowspace::framestate::StackElem::Signal(
+                            FlowSignal::rebuild_with_args(sig.tag(), copied_args),
+                        )
+                    }
+                })
+                .collect();
+        // `exc = FSException(_copy(exc.w_type), _copy(exc.w_value))`
+        let last_exception = self.last_exception.as_ref().map(|exc| {
+            crate::flowspace::model::FSException::new(
+                copy_hlvalue(&exc.w_type, graph),
+                copy_hlvalue(&exc.w_value, graph),
+            )
+        });
+        FrameState {
+            entries,
+            locals_w,
+            stack,
+            last_exception,
+            blocklist: self.blocklist.clone(),
+            next_offset: self.next_offset,
+        }
+    }
+
     /// `framestate.py:53-64 FrameState.matches` — "Two states match if
     /// they only differ by using different Variables at the same place."
     ///
@@ -2694,20 +2798,18 @@ pub struct FunctionGraph {
     /// vec is the single source of truth — no parallel kind
     /// side-table backs it.  Indexed by slot index.
     pub value_variables: Vec<Option<crate::flowspace::model::Variable>>,
-    /// Variable names for debugging (RPython Variable._name).
-    pub value_names: std::collections::HashMap<usize, String>,
     /// `flowspace::model::Variable.id` → graph-slot reverse index.
     /// Populated by `ensure_variable_registered_void` / `bind_variable_at`
     /// at Variable definition sites; consumed by `slot_of` /
     /// `bridge_variable` lookup paths so a `Variable` carried through
     /// `Hlvalue` / `LinkArg::Value` can be projected back to its
-    /// allocation slot for `value_variables` / `value_names` indexing.
+    /// allocation slot for `value_variables` indexing.
     ///
     /// RPython has no counterpart — `framestate.py:92-99 getoutputargs`
     /// pushes the polymorphic `Hlvalue` cell directly into `Link.args`,
     /// no bridge needed because the link domain IS `Hlvalue`.  This map
     /// is the documented TODO for pyre's slot-indexed
-    /// `value_variables` / `value_names` side tables: it lets
+    /// `value_variables` side table: it lets
     /// Variable-keyed lookups resolve in `O(1)` without scanning
     /// `value_variables` linearly.
     pub(crate) variable_to_vid: std::collections::HashMap<u64, usize>,
@@ -2816,7 +2918,6 @@ impl FunctionGraph {
             notes: Vec::new(),
             next_value: 3,
             value_variables: vec![Some(var_returnvar), Some(var_etype), Some(var_evalue)],
-            value_names: std::collections::HashMap::new(),
             variable_to_vid,
             return_type: None,
             source_module: None,
@@ -3114,7 +3215,7 @@ impl FunctionGraph {
 
     /// Slot-indexed primitive — indexes `variable_to_vid` directly.
     /// Canonical accessor: callers hand the index straight to
-    /// `value_variables` / `value_names` / `Block.inputargs`.
+    /// `value_variables` / `Block.inputargs`.
     pub fn slot_of(&self, var: &crate::flowspace::model::Variable) -> Option<usize> {
         self.variable_to_vid.get(&var.id()).copied()
     }
@@ -3639,6 +3740,102 @@ impl FunctionGraph {
         self.set_control_flow_metadata(block, None, vec![link]);
     }
 
+    /// `flowcontext.py:440 currentblock.closeblock(Link(outputargs, block))`
+    /// — compute link args via `getoutputargs` and install the Link
+    /// WITHOUT calling [`Self::ensure_variable_at_block`].
+    ///
+    /// RPython's `closeblock` (`model.py:246`) asserts the block is open
+    /// (exits empty) before installing exits.  Use [`Self::recloseblock`]
+    /// or [`Self::recloseblock_link`] when re-closing an already-closed
+    /// block.
+    pub fn closeblock_link(
+        &mut self,
+        block: BlockId,
+        target_block: BlockId,
+        pred_state: &FrameState,
+        target_state: &FrameState,
+    ) {
+        let outputargs = pred_state.getoutputargs(target_state, self);
+        let target_inputarg_count = self.block(target_block).inputargs.len();
+        assert_eq!(
+            outputargs.len(),
+            target_inputarg_count,
+            "closeblock_link: outputargs.len() ({}) != target.inputargs.len() ({}) — \
+             block {:?} → target {:?} on graph {:?}",
+            outputargs.len(),
+            target_inputarg_count,
+            block,
+            target_block,
+            self.name,
+        );
+        let link = Link::new_mixed(outputargs, target_block, None);
+        self.closeblock(block, vec![link]);
+    }
+
+    /// Lenient predecessor backfill for a framestate-driven loop link.
+    /// `getoutputargs` (`framestate.py:92`) reads `pred_state`'s cell for
+    /// each `target_state` `Variable` slot; a loop-carried slot the body
+    /// never read on this path is a header phi defined at the loop header,
+    /// not at `block` (the closing predecessor / pre-loop block).  A
+    /// fixed-size `locals_w` frame would have carried the slot through
+    /// every block so the cell is always live at the link source; pyre's
+    /// flat `local_value_ids` does not, so the predecessor chain is
+    /// backfilled via [`Self::ensure_variable_at_block`] — but only for
+    /// args genuinely reachable from `block` without growing a `forbidden`
+    /// fixed-arity loop header ([`Self::can_thread_variable_to_block`]).
+    /// Stale carry-through bindings that dead-end before a definition site
+    /// are left unthreaded, matching the upstream name-based path's
+    /// `lazy_install ... unwrap_or(var)`.  A no-op for slots already
+    /// defined at `block`.
+    pub fn thread_loop_link_args(
+        &mut self,
+        block: BlockId,
+        pred_state: &FrameState,
+        target_state: &FrameState,
+        forbidden: &std::collections::HashSet<BlockId>,
+    ) {
+        let args = pred_state.getoutputargs(target_state, self);
+        let to_thread: Vec<crate::flowspace::model::Variable> = args
+            .iter()
+            .filter_map(|arg| match arg {
+                LinkArg::Value(v) if self.can_thread_variable_to_block(block, v, forbidden) => {
+                    Some(v.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        for v in &to_thread {
+            self.ensure_variable_at_block(block, v);
+        }
+    }
+
+    /// Like [`Self::closeblock_link`] but for blocks that may already be
+    /// closed — delegates to [`Self::recloseblock`] instead of
+    /// [`Self::closeblock`].  `model.py:250 recloseblock`.
+    pub fn recloseblock_link(
+        &mut self,
+        block: BlockId,
+        target_block: BlockId,
+        pred_state: &FrameState,
+        target_state: &FrameState,
+    ) {
+        let outputargs = pred_state.getoutputargs(target_state, self);
+        let target_inputarg_count = self.block(target_block).inputargs.len();
+        assert_eq!(
+            outputargs.len(),
+            target_inputarg_count,
+            "recloseblock_link: outputargs.len() ({}) != target.inputargs.len() ({}) — \
+             block {:?} → target {:?} on graph {:?}",
+            outputargs.len(),
+            target_inputarg_count,
+            block,
+            target_block,
+            self.name,
+        );
+        let link = Link::new_mixed(outputargs, target_block, None);
+        self.recloseblock(block, vec![link]);
+    }
+
     /// Backfill `var` as a definition reachable at `block`.
     ///
     /// Cycle-safe top-down: adds `var` to `block.inputargs` BEFORE
@@ -3688,14 +3885,11 @@ impl FunctionGraph {
         if pred_edges.is_empty() {
             return false;
         }
-        // If `block` is a phi-block (has any `OpKind::Input` op), the
-        // back-edge close machinery (front/ast.rs `header_phi_name_list`)
-        // pairs every inputarg with an `OpKind::Input { name, .. }` op to
-        // produce the per-name link-arg list at close time.  When this
-        // helper adds a fresh inputarg via the recursive backfill we
-        // must also emit the paired op so the invariant holds; otherwise
-        // header_phi_name_list silently drops the new inputarg and the
-        // back-edge `set_goto` panics on `args.len() != inputargs.len()`.
+        // If `block` is a phi-block (has any `OpKind::Input` op), every
+        // inputarg must be paired with an `OpKind::Input { name, .. }` op.
+        // When this helper adds a fresh inputarg via the recursive backfill
+        // we must also emit the paired op so the invariant holds; otherwise
+        // `closeblock_link` / `getoutputargs` panics on arity mismatch.
         let is_phi_block = self
             .block(block)
             .operations
@@ -3706,7 +3900,6 @@ impl FunctionGraph {
             let name = self
                 .slot_of(var)
                 .and_then(|slot| self.value_name_at(slot))
-                .map(String::from)
                 .unwrap_or_default();
             self.push_op_with_result_var(
                 block,
@@ -3722,18 +3915,52 @@ impl FunctionGraph {
             let ok = self.ensure_variable_at_block(pred_block, var);
             if !ok {
                 let slot = self.slot_of(var);
-                let name = slot.and_then(|s| self.value_name_at(s)).map(String::from);
+                let name = slot.and_then(|s| self.value_name_at(s));
+                // Dump the blocks whose framestate references `var` and the
+                // blocks that actually define it.  Surfaces stale carry-
+                // through bindings (e.g. a sibling control-flow path's
+                // local leaking into a slot whose backing Variable is no
+                // longer reachable via the predecessor chain) without
+                // forcing the engineer to rebuild a custom dump.
+                let mut framestate_blocks: Vec<BlockId> = Vec::new();
+                for b in &self.blocks {
+                    let Some(fs) = b.framestate.as_ref() else {
+                        continue;
+                    };
+                    let in_locals = fs.entries.iter().any(|e| e.as_ref() == Some(var));
+                    let in_stack = crate::flowspace::framestate::recursively_flatten(&fs.stack)
+                        .iter()
+                        .any(|h| {
+                            matches!(h, crate::flowspace::model::Hlvalue::Variable(v) if v == var)
+                        });
+                    if in_locals || in_stack {
+                        framestate_blocks.push(b.id);
+                    }
+                }
+                let mut def_blocks: Vec<BlockId> = Vec::new();
+                for b in &self.blocks {
+                    if b.inputargs.contains(var)
+                        || b.operations
+                            .iter()
+                            .any(|op| op.result.as_ref() == Some(var))
+                    {
+                        def_blocks.push(b.id);
+                    }
+                }
                 panic!(
                     "ensure_variable_at_block: predecessor {:?} cannot define \
                      Variable id={} (slot={:?}, name={:?}) when threading to block {:?} on graph {:?} \
                      — graph corruption: no transitive predecessor chain leads \
-                     to a definition site",
+                     to a definition site. \
+                     Variable appears in framestate of blocks {:?} and in inputargs/operations of blocks {:?}.",
                     pred_block,
                     var.id(),
                     slot,
                     name,
                     block,
                     self.name,
+                    framestate_blocks,
+                    def_blocks,
                 );
             }
             self.block_mut(pred_block).exits[exit_idx]
@@ -3774,10 +4001,10 @@ impl FunctionGraph {
     ///    pre-existing >2-arm `Expr::Match` fallback at
     ///    `ast.rs:6045-6052` which wires only arms[0..2]).
     /// 2. Need to grow `inputargs` on a block whose arity is
-    ///    externally constrained (loop headers; see
-    ///    `header_phi_name_list` at `ast.rs:2334-2344` for the
-    ///    named-only enumeration that breaks when an unnamed inputarg
-    ///    is later added to a header by ensure_variable_at_block).
+    ///    externally constrained (loop headers created by
+    ///    `build_loop_header_state` + `create_block_from_framestate`;
+    ///    `closeblock_link` computes link args via `getoutputargs`
+    ///    and would produce an arity mismatch if the header grew).
     ///
     /// `forbidden` lists every block whose `inputargs` must NOT grow.
     /// `Expr::While` / `Expr::Loop` / `Expr::ForLoop` close their
@@ -3977,22 +4204,76 @@ impl FunctionGraph {
         &self.blocks[block.0]
     }
 
-    /// Name a value (RPython Variable._name).  Projects the backing
-    /// slot from `var` and forwards to the `value_names`
-    /// side-table.
+    /// `Variable.rename(name)` (model.py:311-326) — name the Variable
+    /// object's `_name`. Identity-shared `_name` (`Rc<RefCell<..>>`)
+    /// makes the rename visible through every clone, including the
+    /// `Block.inputargs` entry and the registry clone, so the cleaned
+    /// name reaches `backendopt/ssa`. `rename` is first-wins ("don't
+    /// rename several times"), so re-naming an already-named Variable
+    /// is a no-op.
     pub fn name_value_var(
         &mut self,
         var: &crate::flowspace::model::Variable,
         name: impl Into<String>,
     ) {
-        if let Some(slot) = self.slot_of(var) {
-            self.value_names.insert(slot, name.into());
-        }
+        let mut v = var.clone();
+        v.rename(&name.into());
     }
 
-    /// Get the name of a value at the given dense slot, if any.
-    pub fn value_name_at(&self, idx: usize) -> Option<&str> {
-        self.value_names.get(&idx).map(|s| s.as_str())
+    /// Source name of the value at the given dense slot, if it enters
+    /// SSA through an `OpKind::Input` op. This is the raw, uncleaned
+    /// name (the equivalent of `co_varnames`, read by `signature_for`
+    /// and the flowspace adapter's same-name dedup); it is distinct
+    /// from the cleaned `Variable._name` carried on the object via
+    /// `rename` (read by `backendopt/ssa`). Values that do not enter
+    /// through an `Input` op (e.g. a `let` binding to an arithmetic
+    /// result) have no source name here.
+    ///
+    /// The `Input` op is the *only* carrier of the raw name: `rename`
+    /// stores `clean_name(name)` on `Variable._name` (which appends a
+    /// trailing `_` and maps non-identifier chars to `_`), so the
+    /// object name cannot reconstruct `co_varnames`. For startblock
+    /// formal parameters the recovery is exact 1:1 — the param-binding
+    /// loop (`lower_expr_into_graph_with_signature` / `build_function_
+    /// graph`) emits a named `Input` op for every inputarg — so the
+    /// `arg{N}` fallback in `signature_for_graph` is unreachable for
+    /// well-formed graphs. `pygraph.py:16` instead names the initial-
+    /// block locals straight from `code.co_varnames` and stores
+    /// `code.signature` on the `PyGraph` wrapper; pyre's lifted callee
+    /// graphs carry no such wrapper, so the raw name is recovered from
+    /// the `Input` op until a `PyGraph`-equivalent signature store
+    /// lands.
+    pub fn value_name_at(&self, idx: usize) -> Option<String> {
+        let var = self.variable_at(idx)?;
+        // Unnamed values (arithmetic temporaries, constants) carry no
+        // source name; `Variable.renamed` is the O(1) gate that keeps
+        // the `Input`-op lookup off the hot path for the common case.
+        if !var.renamed() {
+            return None;
+        }
+        let var_id = var.id();
+        for block in &self.blocks {
+            for op in &block.operations {
+                if let OpKind::Input { name, .. } = &op.kind {
+                    if op.result.as_ref().map(|r| r.id()) == Some(var_id) {
+                        return Some(name.clone());
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// `Variable.rename(name)` — alias of [`Self::name_value_var`].
+    /// Both honour the first-wins idempotency of `rename`; used by
+    /// `FrameState::copy` (name-prefix carry-over) and the `mergeblock`
+    /// generalize arm (`flowcontext.py:444-447`).
+    pub fn rename_value_var(
+        &mut self,
+        var: &crate::flowspace::model::Variable,
+        name: impl Into<String>,
+    ) {
+        self.name_value_var(var, name);
     }
 
     pub fn block_mut(&mut self, block: BlockId) -> &mut Block {

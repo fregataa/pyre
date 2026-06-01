@@ -2442,6 +2442,36 @@ static NAMESDICT: LazyLock<Mutex<HashMap<String, (String, u32)>>> = LazyLock::ne
     Mutex::new(m)
 });
 
+/// `Variable.rename`'s string-cleaning step (model.py:319-324).
+///
+/// Removes strange characters: keep `[A-Za-z0-9_]`, swap the rest to
+/// `_`; always trail with a `_`; prefix numeric first-chars with `_`
+/// to ensure a valid Python identifier. `namesdict.setdefault(name,
+/// (name, 0))[0]` interns the cleaned prefix.
+pub fn clean_name(name: &str) -> String {
+    let mut cleaned: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    cleaned.push('_');
+    if let Some(first) = cleaned.chars().next() {
+        if !first.is_ascii_alphabetic() && first != '_' {
+            cleaned.insert(0, '_');
+        }
+    }
+    let mut nd = NAMESDICT.lock().unwrap();
+    let entry = nd
+        .entry(cleaned.clone())
+        .or_insert_with(|| (cleaned.clone(), 0));
+    entry.0.clone()
+}
+
 /// Per-process id counter for Variable identity (RPython identity
 /// parity). Rust has no Python-style `id(obj)`, so each Variable
 /// gets a unique `u64` at construction; `clone()` preserves it
@@ -2480,7 +2510,13 @@ pub struct Variable {
     /// Identity key. See `NEXT_VAR_ID` — RPython uses object
     /// identity; Rust approximates with a process-wide increment.
     id: u64,
-    _name: String,
+    /// Prefix name (upstream `Variable._name`). Wrapped in
+    /// `Rc<RefCell<…>>` so that `rename`/`set_name` on one clone is
+    /// observable through every clone with the same identity — upstream
+    /// Python is a single object, so a post-clone rename (e.g. the
+    /// `mergeblock` generalize loop renaming a block's inputargs) must
+    /// propagate to all references. `copy()` mints a fresh cell.
+    _name: Rc<std::cell::RefCell<String>>,
     /// Lazy numbering counter (upstream `Variable._nr`). Shared
     /// across clones so `name()` is stable per identity.
     _nr: Rc<std::cell::Cell<i64>>,
@@ -2523,7 +2559,7 @@ impl Clone for Variable {
     fn clone(&self) -> Self {
         Variable {
             id: self.id,
-            _name: self._name.clone(),
+            _name: Rc::clone(&self._name),
             _nr: Rc::clone(&self._nr),
             annotation: Rc::clone(&self.annotation),
             concretetype: Rc::clone(&self.concretetype),
@@ -2553,7 +2589,7 @@ impl Variable {
         // `_name = self.dummyname; _nr = -1; annotation = None`.
         Variable {
             id: alloc_var_id(),
-            _name: DUMMYNAME.to_owned(),
+            _name: Rc::new(std::cell::RefCell::new(DUMMYNAME.to_owned())),
             _nr: Rc::new(std::cell::Cell::new(-1)),
             annotation: Rc::new(std::cell::RefCell::new(None)),
             concretetype: Rc::new(std::cell::RefCell::new(None)),
@@ -2571,27 +2607,28 @@ impl Variable {
     /// number for this Variable's prefix from the shared namesdict.
     pub fn name(&self) -> String {
         let mut nr = self._nr.get();
+        let prefix = self._name.borrow().clone();
         if nr == -1 {
             let mut nd = NAMESDICT.lock().unwrap();
             let entry = nd
-                .entry(self._name.clone())
-                .or_insert_with(|| (self._name.clone(), 0));
+                .entry(prefix.clone())
+                .or_insert_with(|| (prefix.clone(), 0));
             nr = entry.1 as i64;
             entry.1 += 1;
             self._nr.set(nr);
         }
-        format!("{}{}", self._name, nr)
+        format!("{}{}", prefix, nr)
     }
 
     /// RPython `Variable.renamed` (property).
     pub fn renamed(&self) -> bool {
-        self._name != DUMMYNAME
+        *self._name.borrow() != DUMMYNAME
     }
 
     /// Generator flowspace needs the pre-numbered name prefix that
     /// upstream reads as `v._name`.
-    pub fn name_prefix(&self) -> &str {
-        &self._name
+    pub fn name_prefix(&self) -> String {
+        self._name.borrow().clone()
     }
 
     /// RPython `Variable.rename(name)`.
@@ -2602,36 +2639,30 @@ impl Variable {
     /// handles the string case, `rename_from(&Variable)` handles the
     /// Variable case — see `set_name_from`).
     pub fn rename(&mut self, name: &str) {
-        if self._name != DUMMYNAME {
+        if *self._name.borrow() != DUMMYNAME {
             return;
         }
-        // Remove strange characters; upstream uses a translation
-        // table exported as `PY_IDENTIFIER`. Port the same
-        // observable behaviour: keep `[A-Za-z0-9_]`, swap the rest
-        // to `_`. Always trail with a `_`. Prefix numeric first-chars
-        // with `_` to ensure a valid Python identifier.
-        let mut cleaned: String = name
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '_' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        cleaned.push('_');
-        if let Some(first) = cleaned.chars().next() {
-            if !first.is_ascii_alphabetic() && first != '_' {
-                cleaned.insert(0, '_');
-            }
+        *self._name.borrow_mut() = clean_name(name);
+        self._nr.set(-1);
+    }
+
+    /// RPython `Variable.rename(name)` where `name` is another
+    /// `Variable` (the `_copy(v) -> Variable(v)` path, framestate.py:4 /
+    /// model.py:311-326). Copies the source's prefix and resets `_nr`
+    /// for lazy renumbering; honours the "don't rename twice" guard and
+    /// the "source wasn't renamed either" early-out. Unlike the `&str`
+    /// overload it does *not* clean the name (the source prefix is
+    /// already cleaned). Does NOT copy annotation/concretetype —
+    /// `Variable(v).__init__` leaves `annotation = None`.
+    pub fn rename_from(&mut self, other: &Variable) {
+        if *self._name.borrow() != DUMMYNAME {
+            return;
         }
-        // `namesdict.setdefault(name, (name, 0))[0]`.
-        let mut nd = NAMESDICT.lock().unwrap();
-        let entry = nd
-            .entry(cleaned.clone())
-            .or_insert_with(|| (cleaned.clone(), 0));
-        self._name = entry.0.clone();
+        let other_name = other._name.borrow().clone();
+        if other_name == DUMMYNAME {
+            return;
+        }
+        *self._name.borrow_mut() = other_name;
         self._nr.set(-1);
     }
 
@@ -2639,13 +2670,14 @@ impl Variable {
     pub fn set_name_from(&mut self, other: &Variable) {
         // `v.name` forces finalisation on the RHS.
         let _ = other.name();
-        self._name = other._name.clone();
+        let other_name = other._name.borrow().clone();
+        *self._name.borrow_mut() = other_name;
         self._nr.set(other._nr.get());
     }
 
     /// RPython `Variable.set_name(name, nr)` (for wrapper.py).
     pub fn set_name(&mut self, name: String, nr: i64) {
-        self._name = name;
+        *self._name.borrow_mut() = name;
         self._nr.set(nr);
     }
 
@@ -2681,8 +2713,10 @@ impl Variable {
         // `rename`. Annotation and concretetype are copied by VALUE
         // into the new cells — sharing the source's Rcs would alias
         // mutable state across independent identities.
-        let mut newvar = Variable::new();
-        newvar._name = self._name.clone();
+        let newvar = Variable::new();
+        // `copy()` is a *new* identity, so it gets a fresh `_name` cell
+        // holding the source's prefix value (not a shared Rc).
+        *newvar._name.borrow_mut() = self._name.borrow().clone();
         newvar._nr.set(-1);
         *newvar.annotation.borrow_mut() = self.annotation.borrow().clone();
         *newvar.concretetype.borrow_mut() = self.concretetype.borrow().clone();
