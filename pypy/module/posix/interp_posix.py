@@ -2651,6 +2651,7 @@ if _WIN32:
                                space.newint(info[2])])
 
     def _getfinalpathname(space, w_path):
+        is_bytes = space.isinstance_w(w_path, space.w_bytes)
         path = space.fsdecode_w(w_path)
         if '\x00' in path:
             raise oefmt(space.w_ValueError, "embedded null character")
@@ -2661,7 +2662,20 @@ if _WIN32:
                                  space.newtext(e.msg))
         except OSError as e:
             raise wrap_oserror2(space, e, w_path, eintr_retry=False)
-        return space.newtext(s, lgt)
+        w_result = space.newtext(s, lgt)
+        if is_bytes:
+            return space.fsencode(w_result)
+        return w_result
+
+    def _getdiskusage(space, w_path):
+        path = space.fsdecode_w(w_path)
+        if '\x00' in path:
+            raise oefmt(space.w_ValueError, "embedded null character")
+        try:
+            total, free = nt.win32_getdiskusage(path)
+        except OSError as e:
+            raise wrap_oserror2(space, e, w_path, eintr_retry=False)
+        return space.newtuple([space.newint(total), space.newint(free)])
 
     @unwrap_spec(fd=c_int)
     def get_handle_inheritable(space, fd):
