@@ -64,8 +64,10 @@ use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
 
 #[inline]
 fn make_nonnull_opref(ctx: &mut OptContext, opref: OpRef) {
-    let resolved = ctx.get_box_replacement(opref);
-    if let Some(box_ref) = ctx.ensure_box(resolved) {
+    if let Some(box_ref) = ctx
+        .get_box_replacement_box(opref)
+        .or_else(|| ctx.ensure_box(opref))
+    {
         ctx.make_nonnull(&box_ref);
     }
 }

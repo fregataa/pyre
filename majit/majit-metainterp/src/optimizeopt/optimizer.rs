@@ -789,13 +789,21 @@ impl Optimizer {
         // unroll.py:55: if op.get_forwarded() is not None: return
         // Skip heads that already have PtrInfo (duplicate entries from
         // aliased JUMP args sharing the same VirtualState position).
-        let mut installed_heads: majit_ir::vec_set::VecSet<OpRef> =
+        // Keyed by the virtual head's Box identity. `ensure_box` is
+        // position-stable (a head position resolves to one canonical Box),
+        // so two entries sharing a head dedupe by `Rc::ptr_eq`. The head is
+        // always a NEW (virtual-alloc) ResOp, so `ensure_box` returns
+        // `Some`; a `None` head is left un-deduped, which only costs a
+        // redundant idempotent `set_ptr_info`.
+        let mut installed_heads: majit_ir::vec_set::VecSet<crate::r#box::BoxRef> =
             majit_ir::vec_set::VecSet::new();
         for entry in entries {
-            if installed_heads.contains(&entry.head) {
-                continue;
+            if let Some(head_key) = ctx.ensure_box(entry.head) {
+                if installed_heads.contains(&head_key) {
+                    continue;
+                }
+                installed_heads.insert(head_key);
             }
-            installed_heads.insert(entry.head);
             if std::env::var_os("MAJIT_LOG").is_some() {
                 eprintln!(
                     "[jit] install_imported_virtual head={:?} fields={:?}",

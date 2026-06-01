@@ -81,6 +81,21 @@ impl OptIntBounds {
         }
     }
 
+    /// Resolve an operand to its forwarded terminal `BoxRef`, the `op =
+    /// get_box_replacement(op)` step shared by every `optimize_INT_*` body
+    /// (intbounds.py / optimizer.py:343). Walks the `_forwarded` chain via
+    /// `get_box_replacement_box`, falling back to `ensure_box` for the
+    /// retrace/test baseline that carries no upstream binding (the same
+    /// fallback `getintbound_box` uses). The returned box is the operand the
+    /// bound and the `arg0 is arg1` identity check both read, so a single
+    /// resolve replaces the prior resolve-for-`==` plus resolve-inside-
+    /// `getintbound_box` pair.
+    fn resolve_box(&self, opref: OpRef, ctx: &mut OptContext) -> crate::r#box::BoxRef {
+        ctx.get_box_replacement_box(opref)
+            .or_else(|| ctx.ensure_box(opref))
+            .expect("intbounds operand must resolve to a BoxRef")
+    }
+
     /// Intersect a bound into the stored bound for opref. RPython:
     /// `self.getintbound(op).intersect(bound)` (mutates the IntBound stored
     /// on `op._forwarded` in place).
@@ -135,14 +150,14 @@ impl OptIntBounds {
     // ── Comparison optimizations ──
 
     fn optimize_int_lt(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let arg0 = ctx.get_box_replacement(op.arg(0));
-        let arg1 = ctx.get_box_replacement(op.arg(1));
-        let b0 = self.getintbound_box(arg0, ctx);
-        let b1 = self.getintbound_box(arg1, ctx);
+        let arg0 = self.resolve_box(op.arg(0), ctx);
+        let arg1 = self.resolve_box(op.arg(1), ctx);
+        let b0 = ctx.getintbound_handle(&arg0).borrow().clone();
+        let b1 = ctx.getintbound_handle(&arg1).borrow().clone();
         if b0.known_lt(&b1) {
             self.make_constant_int(op, 1, ctx);
             OptimizationResult::Remove
-        } else if b0.known_ge(&b1) || arg0 == arg1 {
+        } else if b0.known_ge(&b1) || arg0.same_box(&arg1) {
             self.make_constant_int(op, 0, ctx);
             OptimizationResult::Remove
         } else {
@@ -151,14 +166,14 @@ impl OptIntBounds {
     }
 
     fn optimize_int_gt(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let arg0 = ctx.get_box_replacement(op.arg(0));
-        let arg1 = ctx.get_box_replacement(op.arg(1));
-        let b0 = self.getintbound_box(arg0, ctx);
-        let b1 = self.getintbound_box(arg1, ctx);
+        let arg0 = self.resolve_box(op.arg(0), ctx);
+        let arg1 = self.resolve_box(op.arg(1), ctx);
+        let b0 = ctx.getintbound_handle(&arg0).borrow().clone();
+        let b1 = ctx.getintbound_handle(&arg1).borrow().clone();
         if b0.known_gt(&b1) {
             self.make_constant_int(op, 1, ctx);
             OptimizationResult::Remove
-        } else if b0.known_le(&b1) || arg0 == arg1 {
+        } else if b0.known_le(&b1) || arg0.same_box(&arg1) {
             self.make_constant_int(op, 0, ctx);
             OptimizationResult::Remove
         } else {
@@ -167,11 +182,11 @@ impl OptIntBounds {
     }
 
     fn optimize_int_le(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let arg0 = ctx.get_box_replacement(op.arg(0));
-        let arg1 = ctx.get_box_replacement(op.arg(1));
-        let b0 = self.getintbound_box(arg0, ctx);
-        let b1 = self.getintbound_box(arg1, ctx);
-        if b0.known_le(&b1) || arg0 == arg1 {
+        let arg0 = self.resolve_box(op.arg(0), ctx);
+        let arg1 = self.resolve_box(op.arg(1), ctx);
+        let b0 = ctx.getintbound_handle(&arg0).borrow().clone();
+        let b1 = ctx.getintbound_handle(&arg1).borrow().clone();
+        if b0.known_le(&b1) || arg0.same_box(&arg1) {
             self.make_constant_int(op, 1, ctx);
             OptimizationResult::Remove
         } else if b0.known_gt(&b1) {
@@ -183,11 +198,11 @@ impl OptIntBounds {
     }
 
     fn optimize_int_ge(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let arg0 = ctx.get_box_replacement(op.arg(0));
-        let arg1 = ctx.get_box_replacement(op.arg(1));
-        let b0 = self.getintbound_box(arg0, ctx);
-        let b1 = self.getintbound_box(arg1, ctx);
-        if b0.known_ge(&b1) || arg0 == arg1 {
+        let arg0 = self.resolve_box(op.arg(0), ctx);
+        let arg1 = self.resolve_box(op.arg(1), ctx);
+        let b0 = ctx.getintbound_handle(&arg0).borrow().clone();
+        let b1 = ctx.getintbound_handle(&arg1).borrow().clone();
+        if b0.known_ge(&b1) || arg0.same_box(&arg1) {
             self.make_constant_int(op, 1, ctx);
             OptimizationResult::Remove
         } else if b0.known_lt(&b1) {
@@ -340,14 +355,14 @@ impl OptIntBounds {
     // ── Unsigned comparison optimizations ──
 
     fn optimize_uint_lt(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let arg0 = ctx.get_box_replacement(op.arg(0));
-        let arg1 = ctx.get_box_replacement(op.arg(1));
-        let b0 = self.getintbound_box(arg0, ctx);
-        let b1 = self.getintbound_box(arg1, ctx);
+        let arg0 = self.resolve_box(op.arg(0), ctx);
+        let arg1 = self.resolve_box(op.arg(1), ctx);
+        let b0 = ctx.getintbound_handle(&arg0).borrow().clone();
+        let b1 = ctx.getintbound_handle(&arg1).borrow().clone();
         if b0.known_unsigned_lt(&b1) {
             self.make_constant_int(op, 1, ctx);
             OptimizationResult::Remove
-        } else if b0.known_unsigned_ge(&b1) || arg0 == arg1 {
+        } else if b0.known_unsigned_ge(&b1) || arg0.same_box(&arg1) {
             self.make_constant_int(op, 0, ctx);
             OptimizationResult::Remove
         } else {
@@ -356,14 +371,14 @@ impl OptIntBounds {
     }
 
     fn optimize_uint_gt(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let arg0 = ctx.get_box_replacement(op.arg(0));
-        let arg1 = ctx.get_box_replacement(op.arg(1));
-        let b0 = self.getintbound_box(arg0, ctx);
-        let b1 = self.getintbound_box(arg1, ctx);
+        let arg0 = self.resolve_box(op.arg(0), ctx);
+        let arg1 = self.resolve_box(op.arg(1), ctx);
+        let b0 = ctx.getintbound_handle(&arg0).borrow().clone();
+        let b1 = ctx.getintbound_handle(&arg1).borrow().clone();
         if b0.known_unsigned_gt(&b1) {
             self.make_constant_int(op, 1, ctx);
             OptimizationResult::Remove
-        } else if b0.known_unsigned_le(&b1) || arg0 == arg1 {
+        } else if b0.known_unsigned_le(&b1) || arg0.same_box(&arg1) {
             self.make_constant_int(op, 0, ctx);
             OptimizationResult::Remove
         } else {
@@ -372,11 +387,11 @@ impl OptIntBounds {
     }
 
     fn optimize_uint_le(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let arg0 = ctx.get_box_replacement(op.arg(0));
-        let arg1 = ctx.get_box_replacement(op.arg(1));
-        let b0 = self.getintbound_box(arg0, ctx);
-        let b1 = self.getintbound_box(arg1, ctx);
-        if b0.known_unsigned_le(&b1) || arg0 == arg1 {
+        let arg0 = self.resolve_box(op.arg(0), ctx);
+        let arg1 = self.resolve_box(op.arg(1), ctx);
+        let b0 = ctx.getintbound_handle(&arg0).borrow().clone();
+        let b1 = ctx.getintbound_handle(&arg1).borrow().clone();
+        if b0.known_unsigned_le(&b1) || arg0.same_box(&arg1) {
             self.make_constant_int(op, 1, ctx);
             OptimizationResult::Remove
         } else if b0.known_unsigned_gt(&b1) {
@@ -388,11 +403,11 @@ impl OptIntBounds {
     }
 
     fn optimize_uint_ge(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let arg0 = ctx.get_box_replacement(op.arg(0));
-        let arg1 = ctx.get_box_replacement(op.arg(1));
-        let b0 = self.getintbound_box(arg0, ctx);
-        let b1 = self.getintbound_box(arg1, ctx);
-        if b0.known_unsigned_ge(&b1) || arg0 == arg1 {
+        let arg0 = self.resolve_box(op.arg(0), ctx);
+        let arg1 = self.resolve_box(op.arg(1), ctx);
+        let b0 = ctx.getintbound_handle(&arg0).borrow().clone();
+        let b1 = ctx.getintbound_handle(&arg1).borrow().clone();
+        if b0.known_unsigned_ge(&b1) || arg0.same_box(&arg1) {
             self.make_constant_int(op, 1, ctx);
             OptimizationResult::Remove
         } else if b0.known_unsigned_lt(&b1) {
@@ -1630,8 +1645,8 @@ impl OptIntBounds {
 
     /// autogenintrules.py:1403-1411 optimize_INT_IS_ZERO — rules: is_zero_true.
     fn optimize_int_is_zero(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let arg0 = ctx.get_box_replacement(op.arg(0));
-        let b0 = self.getintbound_box(arg0, ctx);
+        let arg0 = self.resolve_box(op.arg(0), ctx);
+        let b0 = ctx.getintbound_handle(&arg0).borrow().clone();
         // is_zero_true: int_is_zero(x) => 0
         // when bound excludes 0: lower > 0, or upper < 0, or any tvalue bit set.
         if b0.lower > 0 || b0.upper < 0 || b0.tvalue != 0 {
@@ -1644,8 +1659,8 @@ impl OptIntBounds {
     /// autogenintrules.py:1415-1428 optimize_INT_FORCE_GE_ZERO — rules:
     /// force_ge_zero_pos / force_ge_zero_neg.
     fn optimize_int_force_ge_zero(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let arg0 = ctx.get_box_replacement(op.arg(0));
-        let b0 = self.getintbound_box(arg0, ctx);
+        let arg0 = self.resolve_box(op.arg(0), ctx);
+        let b0 = ctx.getintbound_handle(&arg0).borrow().clone();
         // force_ge_zero_neg: int_force_ge_zero(x) => 0  (when x < 0)
         if b0.known_lt_const(0) {
             self.make_constant_int(op, 0, ctx);
@@ -1656,10 +1671,7 @@ impl OptIntBounds {
             let b_old = ctx
                 .ensure_box(op.pos.get())
                 .expect("body-namespace OpRef must have a BoxRef slot");
-            let b_arg = ctx
-                .ensure_box(arg0)
-                .expect("body-namespace OpRef must have a BoxRef slot");
-            ctx.make_equal_to(&b_old, &b_arg);
+            ctx.make_equal_to(&b_old, &arg0);
             return OptimizationResult::Remove;
         }
         OptimizationResult::PassOn

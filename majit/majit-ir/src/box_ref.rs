@@ -33,7 +33,7 @@ use crate::op_info::OpInfo;
 use crate::ptr_info::PtrInfo;
 use crate::resoperation::Op;
 use crate::value::{Const, InputArg};
-use crate::{OpRef, Type, Value};
+use crate::{GcRef, OpRef, Type, Value};
 
 /// `AbstractValue` mirror — unified representation of RPython's
 /// op/inputarg/const objects.
@@ -110,7 +110,18 @@ pub enum BoxKind {
     /// `history.py:220 ConstInt` / `:261 ConstFloat` / `:307 ConstPtr`.
     /// The Const carries its `value` directly (history.py:227/268/314); the
     /// chain walker reconstructs the inline-Const OpRef from it.
-    Const { value: Value },
+    ///
+    /// `Cell` so the GC root walker can forward an inline `Value::Ref`
+    /// `GcRef` in place via a get/set cycle (`walk_const_ptr_refs`) without
+    /// a `&mut Box`. The wrapped `Value` is otherwise immutable.
+    Const { value: Cell<Value> },
+
+    /// Absent-reference sentinel — the `BoxRef` mirror of `OpRef::None`.
+    /// Fills a `fail_args` hole in-place (failargs hold `None` entries for
+    /// slots that were never written), preserving arity. Carries no value,
+    /// position, or meaningful `type_` (`Type::Void`); every accessor
+    /// treats it as empty.
+    None,
 }
 
 /// Variant of the `_forwarded` slot.
@@ -280,7 +291,23 @@ impl BoxRef {
         let type_ = value.get_type();
         Self(Rc::new(Box {
             type_,
-            kind: BoxKind::Const { value },
+            kind: BoxKind::Const {
+                value: Cell::new(value),
+            },
+            value: Cell::new(None),
+            op_handle: RefCell::new(None),
+            inputarg_handle: RefCell::new(None),
+        }))
+    }
+
+    /// Absent-reference sentinel — the `BoxRef` mirror of `OpRef::None`.
+    /// Fills a `fail_args` hole in-place (failargs hold `None` entries for
+    /// slots that were never written), preserving arity. `type_` is
+    /// `Void`; carries no value, position, or forwarding.
+    pub fn none() -> Self {
+        Self(Rc::new(Box {
+            type_: Type::Void,
+            kind: BoxKind::None,
             value: Cell::new(None),
             op_handle: RefCell::new(None),
             inputarg_handle: RefCell::new(None),
@@ -366,10 +393,10 @@ impl BoxRef {
     pub fn source_opref(&self) -> Option<OpRef> {
         match &self.0.kind {
             BoxKind::Const { value } => {
-                let opref = match value {
-                    Value::Int(v) => OpRef::const_int(*v),
-                    Value::Float(v) => OpRef::const_float(*v),
-                    Value::Ref(v) => OpRef::const_ptr(*v),
+                let opref = match value.get() {
+                    Value::Int(v) => OpRef::const_int(v),
+                    Value::Float(v) => OpRef::const_float(v),
+                    Value::Ref(v) => OpRef::const_ptr(v),
                     Value::Void => OpRef::None,
                 };
                 Some(opref)
@@ -395,6 +422,12 @@ impl BoxRef {
         matches!(self.0.kind, BoxKind::ResOp { .. })
     }
 
+    /// True for the `none()` sentinel — the `BoxRef` mirror of
+    /// `OpRef::is_none` (an absent `fail_args` slot).
+    pub fn is_none(&self) -> bool {
+        matches!(self.0.kind, BoxKind::None)
+    }
+
     /// `resoperation.py:233 AbstractResOpOrInputArg._pos` accessor.
     ///
     /// Returns the index where this box resides in the pool for
@@ -404,7 +437,7 @@ impl BoxRef {
         match &self.0.kind {
             BoxKind::ResOp { position, .. } => Some(position.get()),
             BoxKind::InputArg { position, .. } => Some(*position),
-            BoxKind::Const { .. } => None,
+            BoxKind::Const { .. } | BoxKind::None => None,
         }
     }
 
@@ -425,8 +458,8 @@ impl BoxRef {
     /// Extract the constant value. Mirrors `history.py:233 ConstInt.getint`
     /// and the equivalent accessors on the other Const subclasses.
     pub fn const_value(&self) -> Option<Value> {
-        match self.0.kind {
-            BoxKind::Const { value, .. } => Some(value),
+        match &self.0.kind {
+            BoxKind::Const { value, .. } => Some(value.get()),
             _ => None,
         }
     }
@@ -439,6 +472,22 @@ impl BoxRef {
         match self.const_value() {
             Some(Value::Int(i)) => Some(i),
             _ => None,
+        }
+    }
+
+    /// GC root walk over an inline `Value::Ref` carried by a `Const` box —
+    /// the `BoxRef` mirror of the per-arg `OpRef::ConstPtr` forwarding in
+    /// `Op::walk_const_ptr_refs_mut`. The collector forwards in place; the
+    /// `Cell` get/set cycle writes the moved address back so the box no
+    /// longer holds the stale (pre-move) pointer. No-op for non-`Const`
+    /// boxes and for non-`Ref` constants.
+    pub fn walk_const_ptr_refs(&self, visitor: &mut dyn FnMut(&mut GcRef)) {
+        if let BoxKind::Const { value } = &self.0.kind {
+            let mut v = value.get();
+            if let Value::Ref(gcref) = &mut v {
+                visitor(gcref);
+                value.set(v);
+            }
         }
     }
 
@@ -455,6 +504,11 @@ impl BoxRef {
     pub fn same_box(&self, other: &BoxRef) -> bool {
         if self == other {
             return true;
+        }
+        // Two `none()` sentinels denote the same absent reference
+        // (`OpRef::None`; `None is None`).
+        if self.is_none() || other.is_none() {
+            return self.is_none() && other.is_none();
         }
         match (self.const_value(), other.const_value()) {
             (Some(a), Some(b)) => a == b,
@@ -609,7 +663,7 @@ impl BoxRef {
     /// Const boxes always return `Some`.
     pub fn get_value(&self) -> Option<Value> {
         match &self.0.kind {
-            BoxKind::Const { value, .. } => Some(*value),
+            BoxKind::Const { value, .. } => Some(value.get()),
             _ => {
                 // The concrete value's canonical host is the bound
                 // `Op`/`InputArg` (`resoperation.py:566 IntOp._resint`).
@@ -986,6 +1040,7 @@ impl std::fmt::Debug for BoxRef {
             BoxKind::ResOp { .. } => "ResOp",
             BoxKind::InputArg { .. } => "InputArg",
             BoxKind::Const { .. } => "Const",
+            BoxKind::None => "None",
         };
         write!(
             f,

@@ -624,7 +624,6 @@ impl OptPure {
                         // still matches, mirroring `_same_args` and
                         // `preamble_pure_ops` upstream paths
                         // (optimizer.py:343 get_box_replacement).
-                        let arg = ctx.get_box_replacement(arg);
                         match ctx
                             .get_box_replacement_box(arg)
                             .and_then(|b| b.const_value())
@@ -902,12 +901,12 @@ impl Optimization for OptPure {
                 let key = PureOpKey::from_op(&postponed);
                 if let Some(cached_ref) = self.lookup_pure(&key, ctx) {
                     if Self::_can_reuse_oldop(postponed.opcode, postponed.opcode, true) {
-                        let cached_ref = ctx.get_box_replacement(cached_ref);
                         let b_old = ctx
                             .ensure_box(postponed.pos.get())
                             .expect("body-namespace OpRef must have a BoxRef slot");
                         let b_cached = ctx
-                            .ensure_box(cached_ref)
+                            .get_box_replacement_box(cached_ref)
+                            .or_else(|| ctx.ensure_box(cached_ref))
                             .expect("body-namespace OpRef must have a BoxRef slot");
                         ctx.make_equal_to(&b_old, &b_cached);
                         self.last_emitted_was_removed = true;
@@ -1053,12 +1052,12 @@ impl Optimization for OptPure {
 
             // CSE: exact same operation already computed?
             if let Some(cached_ref) = self.lookup_pure(&key, ctx) {
-                let cached_ref = ctx.get_box_replacement(cached_ref);
                 let b_old = ctx
                     .ensure_box(op.pos.get())
                     .expect("body-namespace OpRef must have a BoxRef slot");
                 let b_cached = ctx
-                    .ensure_box(cached_ref)
+                    .get_box_replacement_box(cached_ref)
+                    .or_else(|| ctx.ensure_box(cached_ref))
                     .expect("body-namespace OpRef must have a BoxRef slot");
                 ctx.make_equal_to(&b_old, &b_cached);
                 self.last_emitted_was_removed = true;
@@ -1101,12 +1100,13 @@ impl Optimization for OptPure {
                         start_index,
                         ctx,
                     ) {
-                        let cached_ref = ctx.get_box_replacement(old_op.pos.get());
+                        let cached_src = old_op.pos.get();
                         let b_old = ctx
                             .ensure_box(op.pos.get())
                             .expect("body-namespace OpRef must have a BoxRef slot");
                         let b_cached = ctx
-                            .ensure_box(cached_ref)
+                            .get_box_replacement_box(cached_src)
+                            .or_else(|| ctx.ensure_box(cached_src))
                             .expect("body-namespace OpRef must have a BoxRef slot");
                         ctx.make_equal_to(&b_old, &b_cached);
                         self.last_emitted_was_removed = true;
@@ -1163,12 +1163,12 @@ impl Optimization for OptPure {
                         _ => unreachable!("non-preamble matched index must be Direct"),
                     }
                 };
-                let cached_ref = ctx.get_box_replacement(entry_result);
                 let b_old = ctx
                     .ensure_box(op.pos.get())
                     .expect("body-namespace OpRef must have a BoxRef slot");
                 let b_cached = ctx
-                    .ensure_box(cached_ref)
+                    .get_box_replacement_box(entry_result)
+                    .or_else(|| ctx.ensure_box(entry_result))
                     .expect("body-namespace OpRef must have a BoxRef slot");
                 ctx.make_equal_to(&b_old, &b_cached);
                 self.last_emitted_was_removed = true;
@@ -1176,12 +1176,12 @@ impl Optimization for OptPure {
             }
             // pure.py:211-220: known_result_call_pure.
             if let Some(result_ref) = self.lookup_known_result(op, start_index, ctx) {
-                let result_ref = ctx.get_box_replacement(result_ref);
                 let b_old = ctx
                     .ensure_box(op.pos.get())
                     .expect("body-namespace OpRef must have a BoxRef slot");
                 let b_result = ctx
-                    .ensure_box(result_ref)
+                    .get_box_replacement_box(result_ref)
+                    .or_else(|| ctx.ensure_box(result_ref))
                     .expect("body-namespace OpRef must have a BoxRef slot");
                 ctx.make_equal_to(&b_old, &b_result);
                 self.last_emitted_was_removed = true;

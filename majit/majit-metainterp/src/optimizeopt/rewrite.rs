@@ -145,6 +145,30 @@ impl OptRewrite {
 
     // ── Algebraic simplifications ──
 
+    /// `_eq(box1, bound1, box2, bound2)` (autogenintrules.py:15-18): two
+    /// integer operands count as equal when they are the same box OR both
+    /// IntBounds are the same constant. The constant arm catches operands
+    /// proven equal by bounds analysis even when neither is a `Const` box.
+    /// Used by the `x op x` self-operation rules (sub_x_x, and_x_x, or_x_x,
+    /// xor_x_x, eq_same, ne_same).
+    fn boxes_equal_via_intbound(&self, arg0: OpRef, arg1: OpRef, ctx: &OptContext) -> bool {
+        if ctx.same_box(arg0, arg1) {
+            return true;
+        }
+        if let (Some(b0), Some(b1)) = (
+            ctx.get_box_replacement_box(arg0),
+            ctx.get_box_replacement_box(arg1),
+        ) {
+            if let (Some(ib0), Some(ib1)) = (ctx.peek_intbound_box(&b0), ctx.peek_intbound_box(&b1))
+            {
+                if ib0.is_constant() && ib1.is_constant() && ib0.lower == ib1.lower {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Try algebraic simplification for INT_ADD.
     /// `x + 0 -> x`, `0 + x -> x`, `x + x -> x << 1`
     fn optimize_int_add(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
@@ -318,7 +342,7 @@ impl OptRewrite {
             return OptimizationResult::Emit(new_op);
         }
         // sub_x_x: int_sub(x, x) => 0
-        if ctx.same_box(arg0, arg1) {
+        if self.boxes_equal_via_intbound(arg0, arg1, ctx) {
             ctx.make_constant(op.pos.get(), Value::Int(0));
             return OptimizationResult::Remove;
         }
@@ -845,7 +869,7 @@ impl OptRewrite {
             return OptimizationResult::Remove;
         }
         // and_x_x: int_and(a, a) => a
-        if ctx.same_box(arg0, arg1) {
+        if self.boxes_equal_via_intbound(arg0, arg1, ctx) {
             let b_old = ctx
                 .ensure_box(op.pos.get())
                 .expect("body-namespace OpRef must have a BoxRef slot");
@@ -1030,7 +1054,7 @@ impl OptRewrite {
             return OptimizationResult::Remove;
         }
         // or_x_x: int_or(a, a) => a
-        if ctx.same_box(arg0, arg1) {
+        if self.boxes_equal_via_intbound(arg0, arg1, ctx) {
             let b_old = ctx
                 .ensure_box(op.pos.get())
                 .expect("body-namespace OpRef must have a BoxRef slot");
@@ -1183,7 +1207,7 @@ impl OptRewrite {
             return OptimizationResult::Remove;
         }
         // x ^ x -> 0
-        if ctx.same_box(arg0, arg1) {
+        if self.boxes_equal_via_intbound(arg0, arg1, ctx) {
             ctx.make_constant(op.pos.get(), Value::Int(0));
             return OptimizationResult::Remove;
         }
@@ -1986,12 +2010,12 @@ impl OptRewrite {
             }
         }
         // eq_same: int_eq(x, x) => 1
-        if op.opcode == OpCode::IntEq && ctx.same_box(arg0, arg1) {
+        if op.opcode == OpCode::IntEq && self.boxes_equal_via_intbound(arg0, arg1, ctx) {
             ctx.make_constant(op.pos.get(), Value::Int(1));
             return OptimizationResult::Remove;
         }
         // ne_same: int_ne(x, x) => 0
-        if op.opcode == OpCode::IntNe && ctx.same_box(arg0, arg1) {
+        if op.opcode == OpCode::IntNe && self.boxes_equal_via_intbound(arg0, arg1, ctx) {
             ctx.make_constant(op.pos.get(), Value::Int(0));
             return OptimizationResult::Remove;
         }
@@ -2177,7 +2201,6 @@ impl OptRewrite {
         // rewrite.py:284-301: optimize_GUARD_VALUE for Ref args.
         // getptrinfo synthesizes ConstPtrInfo for constant Refs, matching
         // `if info:` in RPython (which is True for ConstPtrInfo too).
-        let obj = ctx.get_box_replacement(arg0);
         let obj_box = ctx.get_box_replacement_box(arg0);
         let obj_info = obj_box.as_ref().and_then(|b| ctx.getptrinfo(b));
         if let Some(info) = obj_info {
@@ -2255,8 +2278,8 @@ impl OptRewrite {
                         // rewrite.py:343: self.optimizer.replace_guard(op, info)
                         ctx.new_operations[old_idx] = std::rc::Rc::new(replacement);
                         // rewrite.py:345-346: info.reset_last_guard_pos()
-                        if let Some(b) = ctx.ensure_box(obj) {
-                            ctx.with_ptr_info_mut(&b, |info_mut| info_mut.reset_last_guard_pos());
+                        if let Some(b) = obj_box.as_ref() {
+                            ctx.with_ptr_info_mut(b, |info_mut| info_mut.reset_last_guard_pos());
                         }
                         // postprocess_GUARD_VALUE (rewrite.py:303-305): make_constant
                         // with the actual c_value (preserving Int vs Ref typing).
@@ -3013,13 +3036,13 @@ impl OptRewrite {
                     _ => None,
                 })
             {
-                let v2 = ctx.get_box_replacement(rhs);
                 if v == 1.0 {
                     let b_old = ctx
                         .ensure_box(op.pos.get())
                         .expect("body-namespace OpRef must have a BoxRef slot");
                     let b_v2 = ctx
-                        .ensure_box(v2)
+                        .get_box_replacement_box(rhs)
+                        .or_else(|| ctx.ensure_box(rhs))
                         .expect("body-namespace OpRef must have a BoxRef slot");
                     ctx.make_equal_to(&b_old, &b_v2);
                     return OptimizationResult::Remove;
@@ -3072,8 +3095,10 @@ impl OptRewrite {
 
     /// rewrite.py:147-153 optimize_FLOAT_NEG
     fn optimize_float_neg(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let v = ctx.get_box_replacement(op.arg(0));
-        if let Some(arg_op) = ctx.ensure_box(v).and_then(|pb| ctx.get_producing_op(&pb)) {
+        let v = ctx
+            .get_box_replacement_box(op.arg(0))
+            .or_else(|| ctx.ensure_box(op.arg(0)));
+        if let Some(arg_op) = v.and_then(|pb| ctx.get_producing_op(&pb)) {
             if arg_op.opcode == OpCode::FloatNeg {
                 let b_old = ctx
                     .ensure_box(op.pos.get())
@@ -3090,17 +3115,18 @@ impl OptRewrite {
 
     /// rewrite.py:155-161 optimize_FLOAT_ABS
     fn optimize_float_abs(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let v = ctx.get_box_replacement(op.arg(0));
-        if let Some(arg_op) = ctx.ensure_box(v).and_then(|pb| ctx.get_producing_op(&pb)) {
-            if arg_op.opcode == OpCode::FloatAbs {
-                let b_old = ctx
-                    .ensure_box(op.pos.get())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
-                let b_v = ctx
-                    .ensure_box(v)
-                    .expect("body-namespace OpRef must have a BoxRef slot");
-                ctx.make_equal_to(&b_old, &b_v);
-                return OptimizationResult::Remove;
+        let v = ctx
+            .get_box_replacement_box(op.arg(0))
+            .or_else(|| ctx.ensure_box(op.arg(0)));
+        if let Some(v) = v {
+            if let Some(arg_op) = ctx.get_producing_op(&v) {
+                if arg_op.opcode == OpCode::FloatAbs {
+                    let b_old = ctx
+                        .ensure_box(op.pos.get())
+                        .expect("body-namespace OpRef must have a BoxRef slot");
+                    ctx.make_equal_to(&b_old, &v);
+                    return OptimizationResult::Remove;
+                }
             }
         }
         OptimizationResult::PassOn
@@ -3582,12 +3608,13 @@ impl Optimization for OptRewrite {
             // ── rewrite.py:373-374: optimize_ASSERT_NOT_NONE ──
             OpCode::AssertNotNone => {
                 // RPython: self.make_nonnull(op.getarg(0))
-                let obj = ctx.get_box_replacement(op.arg(0));
-                let obj_box = ctx.get_box_replacement_box(op.arg(0));
+                let obj_box = ctx
+                    .get_box_replacement_box(op.arg(0))
+                    .or_else(|| ctx.ensure_box(op.arg(0)));
                 let has_info = obj_box.as_ref().map_or(false, |b| ctx.has_ptr_info(b));
                 if !has_info {
-                    if let Some(b) = ctx.ensure_box(obj) {
-                        ctx.set_ptr_info(&b, crate::optimizeopt::info::PtrInfo::nonnull());
+                    if let Some(b) = obj_box.as_ref() {
+                        ctx.set_ptr_info(b, crate::optimizeopt::info::PtrInfo::nonnull());
                     }
                 }
                 OptimizationResult::Remove
@@ -3604,7 +3631,6 @@ impl Optimization for OptRewrite {
             //     self.make_constant_class(op.getarg(0), expectedclassbox,
             //                              update_last_guard=False)
             OpCode::RecordExactClass => {
-                let obj = ctx.get_box_replacement(op.arg(0));
                 if op.num_args() >= 2 {
                     // RPython `RECORD_EXACT_CLASS` carries the same ConstInt
                     // vtable address shape as GUARD_CLASS.
@@ -3612,7 +3638,9 @@ impl Optimization for OptRewrite {
                     if let Some(expected_class) = expected_class {
                         // getptrinfo synthesizes ConstPtrInfo for constant
                         // Refs so `get_known_class` reads cls_of_box for them.
-                        let obj_box = ctx.get_box_replacement_box(op.arg(0));
+                        let obj_box = ctx
+                            .get_box_replacement_box(op.arg(0))
+                            .or_else(|| ctx.ensure_box(op.arg(0)));
                         if let Some(known) = obj_box
                             .as_ref()
                             .and_then(|b| ctx.getptrinfo(b))
@@ -3621,10 +3649,10 @@ impl Optimization for OptRewrite {
                             debug_assert_eq!(known, expected_class);
                             return OptimizationResult::Remove;
                         }
-                        if let Some(b) = ctx.ensure_box(obj) {
+                        if let Some(b) = obj_box.as_ref() {
                             crate::optimizeopt::optimizer::Optimizer::make_constant_class(
                                 ctx,
-                                &b,
+                                b,
                                 expected_class,
                                 false, // update_last_guard=False
                             );

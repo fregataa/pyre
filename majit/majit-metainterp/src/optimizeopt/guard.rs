@@ -4,6 +4,15 @@
 /// on the same value appears later, and fuses consecutive guards that can
 /// share fail descriptors.
 ///
+/// Two distinct upstream sources meet in this file. `OptGuard` and its
+/// dedup/strengthening logic port the `optimize_GUARD_*` / `postprocess_*`
+/// methods of `rewrite.py` (`optimize_GUARD_VALUE`:294,
+/// `optimize_GUARD_CLASS`:407 / `postprocess_GUARD_CLASS`:440,
+/// `optimize_GUARD_NONNULL_CLASS`:448, `optimize_GUARD_TRUE`:359 /
+/// `optimize_GUARD_FALSE`:371). The separate `Guard` / `transitive_imply` /
+/// `emit_varops` machinery below ports `guard.py`'s `GuardStrengthenOpt`, the
+/// integer-comparison guard strengthening used only by the vector optimizer.
+///
 /// ## Redundant Guard Removal
 ///
 /// If the same foldable guard condition (opcode + arguments) has already been
@@ -807,12 +816,13 @@ pub struct OptGuard {
     /// `guard_nonnull`).
     truthy_values: VecSet<OpRef>,
 
-    /// guard.py: values with known class (from GuardClass/GuardNonnullClass).
+    /// Values with known class (`optimize_GUARD_CLASS`:407 /
+    /// `postprocess_GUARD_CLASS`:440 / `optimize_GUARD_NONNULL_CLASS`:448).
     /// The class operand is `expectedclassbox.getint()` — a `ConstInt` vtable
     /// address (model.py:199-201), never a traced ref.
     known_classes: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, i64>,
 
-    /// guard.py: values known to be specific constants (from GuardValue).
+    /// Values known to be specific constants (`optimize_GUARD_VALUE`:294).
     known_constants: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, i64>,
 
     /// Descriptor of the last emitted guard, used for consecutive-guard
