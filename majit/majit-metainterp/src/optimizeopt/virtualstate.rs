@@ -1318,6 +1318,32 @@ impl VirtualState {
         if self.state.len() != other.state.len() {
             return Err(());
         }
+        // virtualstate.py:646-648 `assert (len(self.state) == len(other.state)
+        // == len(boxes) == len(runtime_boxes))`. The state-length pair is
+        // handled above (Err, not assert — an arity-mismatched target is
+        // skipped rather than crashing). The remaining two equalities are a
+        // hard invariant: `boxes` (the jump args, get_box_replacement'd) and
+        // `runtime_boxes` (the concrete jump-close values) are built from the
+        // same jump arglist as `other` (export_state mints one state entry per
+        // arg), so both align positionally with `self.state`. Release-active
+        // `assert` mirrors the upstream `assert`, and the strict `boxes[i]` /
+        // `runtime_boxes[i]` indexing below relies on it (no silent
+        // NONE/None masking of a misaligned list). `runtime_boxes` is `Option`
+        // because the generalization-of path supplies no runtime guidance; when
+        // present it must be the same length as the state.
+        assert_eq!(
+            boxes.len(),
+            self.state.len(),
+            "generate_guards: boxes ({}) not aligned with state ({})",
+            boxes.len(),
+            self.state.len(),
+        );
+        assert!(
+            runtime_boxes.map_or(true, |rb| rb.len() == self.state.len()),
+            "generate_guards: runtime_boxes (len {:?}) not aligned with state ({})",
+            runtime_boxes.map(<[OpRef]>::len),
+            self.state.len(),
+        );
         // virtualstate.py:24-37 `GenerateGuardState.__init__` constructs
         // the per-call state container: `optimizer`, `cpu`,
         // `extra_guards`, `renum`, `bad`, `force_boxes`. pyre packs
@@ -1355,8 +1381,10 @@ impl VirtualState {
         // `state.renum` (GenerateGuardState struct field).
 
         for (i, (expected, incoming)) in self.state.iter().zip(other.state.iter()).enumerate() {
-            let box_opref = boxes.get(i).copied().unwrap_or(OpRef::NONE);
-            let runtime_box = runtime_boxes.and_then(|rb| rb.get(i).copied());
+            // virtualstate.py:649-652 indexes `boxes[i]` / `runtime_boxes[i]`
+            // directly; the asserts above guarantee i is in range.
+            let box_opref = boxes[i];
+            let runtime_box = runtime_boxes.map(|rb| rb[i]);
             if let Err(()) = Self::generate_guards_for_entry_recursive(
                 i,
                 expected,
@@ -1608,15 +1636,12 @@ impl VirtualState {
                 let Some(rb) = runtime_box else {
                     return Err(());
                 };
-                // virtualstate.py:601 `cpu.cls_of_box(runtime_box)` —
-                // no optimizer-tracked precedence, direct runtime read.
-                let Some(rb_box) = state.ctx.get_box_replacement_box(rb) else {
+                // virtualstate.py:601 `cpu.cls_of_box(runtime_box)` reads the
+                // runtime box's own ref (getref_base), no _forwarded walk.
+                let Some(runtime_cls) = state.ctx.runtime_cls_of(rb) else {
                     return Err(());
                 };
-                let Some(runtime_cls) = state.ctx.cls_of_box(&rb_box) else {
-                    return Err(());
-                };
-                if &runtime_cls != class_ptr {
+                if runtime_cls != *class_ptr {
                     return Err(());
                 }
                 state
@@ -1633,15 +1658,12 @@ impl VirtualState {
                 let Some(rb) = runtime_box else {
                     return Err(());
                 };
-                // virtualstate.py:608 `cpu.cls_of_box(runtime_box)` —
-                // no optimizer-tracked precedence.
-                let Some(rb_box) = state.ctx.get_box_replacement_box(rb) else {
+                // virtualstate.py:608 `cpu.cls_of_box(runtime_box)` reads the
+                // runtime box's own ref (getref_base), no _forwarded walk.
+                let Some(runtime_cls) = state.ctx.runtime_cls_of(rb) else {
                     return Err(());
                 };
-                let Some(runtime_cls) = state.ctx.cls_of_box(&rb_box) else {
-                    return Err(());
-                };
-                if &runtime_cls != class_ptr {
+                if runtime_cls != *class_ptr {
                     return Err(());
                 }
                 state.extra_guards.push(GuardRequirement::GuardClass {
@@ -1675,8 +1697,16 @@ impl VirtualState {
                 if !r.is_null() { Ok(()) } else { Err(()) }
             }
             (VirtualStateInfo::NonNull, VirtualStateInfo::Unknown(_)) => {
-                // virtualstate.py:578-584: runtime_box gate
-                if runtime_box.is_some() {
+                // virtualstate.py:578-584 _generate_guards_nonnull, LEVEL_UNKNOWN:
+                //   if runtime_box is not None and runtime_box.nonnull():
+                //       extra_guards.append(ResOperation(rop.GUARD_NONNULL, [box]))
+                //   else:
+                //       raise VirtualStatesCantMatch("other not known to be nonnull")
+                // `runtime_box.nonnull()` reads the box's own ref
+                // (getref_base()), so gate on the runtime value being a
+                // non-null ref — not on mere OpRef presence. A null field
+                // read wrapped as ConstRef(NULL) must NOT emit GUARD_NONNULL.
+                if runtime_box.is_some_and(|rb| state.ctx.runtime_nonnull(rb)) {
                     state.extra_guards.push(GuardRequirement::GuardNonnull {
                         arg_index: arg_idx,
                         box_opref,
@@ -1701,8 +1731,33 @@ impl VirtualState {
                 Ok(())
             }
             (VirtualStateInfo::IntBounded(bounds), VirtualStateInfo::Unknown(_)) => {
-                // virtualstate.py:493-498: runtime_box gate
-                if runtime_box.is_some() {
+                // virtualstate.py:493-499 _generate_guards_unkown:
+                //   if (runtime_box is not None and
+                //       self.intbound.contains(runtime_box.getint())):
+                //       self.intbound.make_guards(box, extra_guards, state.optimizer)
+                //   else: raise VirtualStatesCantMatch("intbounds don't match")
+                // `runtime_box.getint()` reads the box's own _resint (no
+                // _forwarded walk); gate on the runtime int actually falling
+                // within bounds — not on mere OpRef presence. The emitted op
+                // stream is identical to upstream: `GuardBounds.to_ops` calls
+                // `IntBound::make_guards` (intutils.py:1264-1289) verbatim, so
+                // the same INT_GE/INT_LE/INT_AND + GUARD_TRUE/GUARD_VALUE
+                // sequence is produced. Only materialization is deferred:
+                // `generate_guards` may reject a later position and discard the
+                // whole `extra_guards` list (loop at :1388), and pyre's const
+                // creation / OpRef-position allocation are non-rollbackable
+                // global side-effects (unlike RPython's throwaway ResOperation
+                // objects). Recording a `GuardRequirement` intent here and
+                // materializing it in `to_ops` only after a successful match
+                // keeps the const pool untouched on a rejected match.
+                let within = runtime_box
+                    .and_then(|rb| state.ctx.runtime_value_of(rb))
+                    .and_then(|v| match v {
+                        Value::Int(i) => Some(i),
+                        _ => None,
+                    })
+                    .is_some_and(|i| bounds.contains(i));
+                if within {
                     state.extra_guards.push(GuardRequirement::GuardBounds {
                         arg_index: arg_idx,
                         box_opref,

@@ -565,7 +565,16 @@ impl UnrollOptimizer {
                 p1_ops_in.push(op);
             }
             let p1_iter_fresh_hw = p1_iter._fresh;
-            opt_p1.runtime_boxes = ops
+            // compile.py:275 `PreambleCompileData(trace, jumpargs, ...)` —
+            // the recorded JUMP arglist is the preamble's `runtime_boxes`
+            // (live_arg_boxes captured at the merge point). Capture it into a
+            // local here; `opt_p1.runtime_boxes` cannot carry it because
+            // `setup()` clears that field at the start of every optimize run
+            // (optimizer.rs `self.runtime_boxes.clear()`). Threaded into the
+            // exported state below so the peeled-loop close reads it as
+            // `state.runtime_boxes` (unroll.py:105 → :153/166) rather than the
+            // peeled body's own jump args.
+            let recorded_jump_args: Vec<OpRef> = ops
                 .iter()
                 .rfind(|op| op.opcode == OpCode::Jump)
                 .map(|op| op.getarglist().to_vec())
@@ -618,6 +627,11 @@ impl UnrollOptimizer {
 
             match opt_p1.exported_loop_state.take() {
                 Some(mut state) => {
+                    // unroll.py:105 `export_state(..., runtime_boxes, ...)` —
+                    // carry the recorded JUMP args into ExportedState so the
+                    // peeled-loop close passes them to generate_guards as
+                    // `state.runtime_boxes` (unroll.py:153/166).
+                    state.runtime_boxes = recorded_jump_args.clone();
                     // end_arg_types is already populated by
                     // `Optimizer::optimize_with_constants_and_inputs_at`
                     // using the optimizer-visible `ctx.opref_type()` (see
@@ -1106,6 +1120,7 @@ impl UnrollOptimizer {
             exported_short_inputargs,
             exported_short_boxes_produced,
             exported_renamed_inputargs,
+            exported_runtime_boxes,
         ) = {
             let es = opt_p2
                 .imported_loop_state
@@ -1117,6 +1132,7 @@ impl UnrollOptimizer {
                 es.short_inputargs.clone(),
                 es.short_boxes.clone(),
                 es.renamed_inputargs.clone(),
+                es.runtime_boxes.clone(),
             )
         };
         // RPython unroll.py:124-141 performs an extra end-of-preamble forcing
@@ -1427,7 +1443,27 @@ impl UnrollOptimizer {
             // RPython: except InvalidLoop → jump_to_preamble immediately,
             // NO retry. The big comment at unroll.py:305-316 explains why
             // continuing after partial inlining is unsafe.
-            let runtime_boxes = body_jump_args.clone();
+            // unroll.py:153/166 passes `state.runtime_boxes` (the preamble's
+            // recorded JUMP args, exported at unroll.py:105) to
+            // jump_to_existing_trace, NOT the peeled body's own jump arglist.
+            // `runtime_boxes[i]` is read un-forwarded via `getint`/`getref_base`
+            // (the box's own observed value), while `boxes[i]` (= forwarded body
+            // jump args) drives the virtual-state match (virtualstate.py:646
+            // reads them as parallel-but-distinct lists).
+            //
+            // `exported_runtime_boxes` is the recorded JUMP arglist threaded
+            // through ExportedState.runtime_boxes (set in the Phase-1 export
+            // above, carried across a retrace import). Those Phase-1 OpRefs
+            // resolve in Phase-2's jump_ctx via cross-phase find_producer_op
+            // (phase1_emit_ops / input_ops) and carry the boxes' own observed
+            // runtime values. Fall back to the body jump args only when the
+            // channel is empty (a trace with no recorded JUMP), where the
+            // generate_guards length assert would otherwise fail.
+            let runtime_boxes = if exported_runtime_boxes.len() == body_jump_args.len() {
+                exported_runtime_boxes.clone()
+            } else {
+                body_jump_args.clone()
+            };
             let mut invalid_loop = false;
             let mut jumped = if skip_jump_to_existing {
                 false

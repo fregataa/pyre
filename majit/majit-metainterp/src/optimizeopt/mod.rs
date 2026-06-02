@@ -4919,16 +4919,70 @@ impl OptContext {
     }
 
     /// resoperation.py:691-720 `InputArg*.getint/getref_base/getfloatstorage`
-    /// — extract the concrete runtime value carried by an OpRef.
+    /// — extract the concrete runtime value carried by an OpRef's OWN box.
+    ///
+    /// virtualstate.py:400 `runtime_box.constbox()`, :494 `.getint()`, :579
+    /// `.nonnull()`, :601/:608 `cpu.cls_of_box(runtime_box)` read the runtime
+    /// box object itself: `getint`/`getref_base` (resoperation.py:691) return
+    /// `_resint`/`_resref` — the box's own value slot, set when the box was
+    /// created — and never walk `_forwarded`. This resolves the box at
+    /// `opref`'s own position (`resolve_to_boxref`, the canonical host WITHOUT
+    /// the `get_box_replacement` chain walk) and reads its value directly; an
+    /// optimizer forwarding (`make_equal_to` / `make_constant`) never takes
+    /// precedence over the box's own observed value.
+    ///
+    /// `None` for an own slot that carries no value: pyre's value slots are
+    /// `Option<Value>` (resoperation.rs / box_ref.rs) where RPython's are
+    /// `_resint=0` / `_resref=NULL` defaults, so an unobserved box reads as
+    /// `None` here. Callers (`runtime_nonnull`, IntBounded, `runtime_cls_of`,
+    /// `get_runtime_field`) treat `None` as "no runtime guidance" and refuse
+    /// the guard — the conservative direction. The runtime boxes threaded into
+    /// generate_guards are the recorded JUMP args (unroll.py:105), whose
+    /// producing ops carry their own observed values, so this reads the real
+    /// runtime value without consulting `_forwarded`.
     pub fn runtime_value_of(&self, opref: OpRef) -> Option<Value> {
-        if let Some(v) = self
-            .get_box_replacement_box(opref)
-            .and_then(|b| b.const_value())
-        {
-            return Some(v);
+        let own = self.resolve_to_boxref(opref)?;
+        own.const_value().or_else(|| own.get_value())
+    }
+
+    /// `runtime_box.nonnull()` — resoperation.py:583 `IntOp.nonnull`
+    /// (`self._resint != 0`), :609 `FloatOp.nonnull`
+    /// (`bool(extract_bits(self._resfloat))`), `RefOp.nonnull`
+    /// (`bool(self.getref_base())`). Reads the runtime box's carried value
+    /// (`runtime_value_of`) and applies the per-type rule. Returns `false`
+    /// when no runtime value is plumbed: a box with no observed value must
+    /// not be claimed nonnull (virtualstate.py:579 gates GUARD_NONNULL on
+    /// `runtime_box.nonnull()`, so a null/absent value refuses the guard).
+    pub fn runtime_nonnull(&self, opref: OpRef) -> bool {
+        match self.runtime_value_of(opref) {
+            Some(Value::Int(i)) => i != 0,
+            Some(Value::Float(f)) => f.to_bits() != 0,
+            Some(Value::Ref(r)) => !r.is_null(),
+            Some(Value::Void) | None => false,
         }
-        let box_ref = self.get_box_replacement_box(opref)?;
-        box_ref.get_value()
+    }
+
+    /// `cpu.cls_of_box(runtime_box)` — virtualstate.py:601/608/620,
+    /// model.py:199-201. Reads the runtime box's OWN ref value
+    /// (`getref_base`, resoperation.py:691 — the box's own `_resref` slot,
+    /// never the `_forwarded` chain) via `runtime_value_of`, then returns
+    /// `ptr2int(typeptr)`, the immortal vtable address as a plain integer.
+    ///
+    /// Unlike `cls_of_box(&BoxRef)` (which walks `get_box_replacement` to
+    /// reach a Const terminal), this resolves through the no-forward
+    /// `runtime_value_of`: virtualstate's KnownClass arms read the runtime
+    /// box itself, with no optimizer-tracked / forwarded precedence. Returns
+    /// `None` for non-Ref / null / unobserved values, so a KnownClass guard
+    /// refuses rather than reading a forwarded class.
+    pub fn runtime_cls_of(&self, opref: OpRef) -> Option<i64> {
+        match self.runtime_value_of(opref)? {
+            Value::Ref(gcref) if !gcref.is_null() => {
+                let synth = crate::r#box::BoxRef::new_const(Value::Ref(gcref));
+                let typeptr = self.cpu.cls_of_box(&synth);
+                if typeptr == 0 { None } else { Some(typeptr) }
+            }
+            _ => None,
+        }
     }
 
     /// resoperation.py:38 `AbstractResOpOrInputArg.same_box`: `self is other`
