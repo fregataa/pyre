@@ -277,3 +277,9 @@ os_createdirectory_impl(wchar_t *path, int mode){
     return 0;
 }
 
+int
+os_removedirectory_impl(wchar_t *path)
+{
+    return (int)RemoveDirectoryW(path);
+}
+
