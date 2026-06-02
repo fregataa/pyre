@@ -185,54 +185,7 @@ pub trait GraphAnalyzer<R: AnalyzerResult, I: GraphInfo>: Sized {
         op: &SpaceOperation,
         seen: Option<&mut DependencyTracker<R>>,
     ) -> R {
-        // `result = self.bottom_result()`.
-        let mut result = R::bottom_result();
-        // `funcobj` upstream is `op.args[0].value._obj`.
-        let Some(Hlvalue::Constant(c)) = op.args.first() else {
-            return result;
-        };
-        let ConstValue::LLPtr(f) = &c.value else {
-            return result;
-        };
-        let Ok(lltype::_ptr_obj::Func(funcobj)) = f._obj() else {
-            return result;
-        };
-        // `if hasattr(funcobj, '_callbacks'):` — the callback graph keys.
-        let Some(ConstValue::Graphs(keys)) = funcobj.attrs.get("_callbacks") else {
-            return result;
-        };
-        // Resolve all callback graphs up front so the `translator()`
-        // borrow is dropped before the recursive `analyze_direct_call`
-        // (which re-borrows `self`). Upstream obtains every callback
-        // graph from `bk.getdesc(function).getgraphs()`, so resolution
-        // never drops a callback; an unresolved key here is a
-        // registration bug, surfaced as `top_result()` exactly like the
-        // `indirect_call` arm's unknown-graph path (`:117-126`).
-        let graphs: Vec<GraphRef> = {
-            let trans_graphs = self.translator().graphs.borrow();
-            let mut graphs = Vec::with_capacity(keys.len());
-            for key in keys {
-                let Some(graph) = trans_graphs
-                    .iter()
-                    .find(|g| GraphKey::of(g).as_usize() == *key)
-                    .cloned()
-                else {
-                    return R::top_result();
-                };
-                graphs.push(graph);
-            }
-            graphs
-        };
-        // `seen` is threaded into each callee walk; default an owned
-        // tracker when the caller passed `None`, as the framework does.
-        let mut owned_tracker = DependencyTracker::new();
-        let seen = seen.unwrap_or(&mut owned_tracker);
-        // `for ... for graph in desc.getgraphs(): result =
-        //  self.join_two_results(result, self.analyze_direct_call(...))`.
-        for graph in &graphs {
-            result = R::join_two_results(result, self.analyze_direct_call(graph, Some(seen)));
-        }
-        result
+        framework_analyze_external_call(self, op, seen)
     }
 
     /// `analyze_exceptblock(block, seen)`
@@ -572,6 +525,100 @@ where
         }
     }
     R::finalize_builder(result)
+}
+
+/// Framework body of `analyze_external_call` (`graphanalyze.py:60-69`).
+///
+/// ```python
+/// def analyze_external_call(self, funcobj, seen=None):
+///     result = self.bottom_result()
+///     if hasattr(funcobj, '_callbacks'):
+///         bk = self.translator.annotator.bookkeeper
+///         for function in funcobj._callbacks.callbacks:
+///             desc = bk.getdesc(function)
+///             for graph in desc.getgraphs():
+///                 result = self.join_two_results(
+///                     result, self.analyze_direct_call(graph, seen))
+///     return result
+/// ```
+///
+/// Pyre surfaces every `**attrs`-set funcobj member through `_func.attrs`
+/// (the same mirror that carries `external` / `canraise` /
+/// `random_effects_on_gcobjs`). `_callbacks` is normalised there to a
+/// `ConstValue::Graphs` graph-key list — upstream's
+/// `function -> bk.getdesc(function).getgraphs()` indirection collapses to
+/// the resolved callback graphs, resolved through `TranslationContext.graphs`
+/// exactly like the `indirect_call` arm. A subclass override
+/// (e.g. [`super::collectanalyze`]) delegates here for the no-special-case
+/// path, matching upstream's `BoolGraphAnalyzer.analyze_external_call` super-call.
+pub fn framework_analyze_external_call<A, R, I>(
+    analyzer: &mut A,
+    op: &SpaceOperation,
+    seen: Option<&mut DependencyTracker<R>>,
+) -> R
+where
+    A: GraphAnalyzer<R, I>,
+    R: AnalyzerResult,
+    I: GraphInfo,
+{
+    // `result = self.bottom_result()`.
+    let result = R::bottom_result();
+    // `funcobj` upstream is `op.args[0].value._obj`.
+    let Some(Hlvalue::Constant(c)) = op.args.first() else {
+        return result;
+    };
+    let ConstValue::LLPtr(f) = &c.value else {
+        return result;
+    };
+    let Ok(lltype::_ptr_obj::Func(funcobj)) = f._obj() else {
+        return result;
+    };
+    // `if hasattr(funcobj, '_callbacks'):` — absent attr keeps the
+    // `bottom_result()` (`hasattr == False` path).
+    let Some(callbacks) = funcobj.attrs.get("_callbacks") else {
+        return result;
+    };
+    // The attr is present, so pyre's normalisation invariant requires a
+    // graph-key list; any other shape is a malformed `_callbacks` and
+    // fails loud rather than silently degrading to bottom/top.
+    let ConstValue::Graphs(keys) = callbacks else {
+        panic!(
+            "_callbacks funcobj attr is not a ConstValue::Graphs key list ({callbacks:?}) \
+             — pyre normalises callbacks to graph keys (graphanalyze.py:60-69)"
+        );
+    };
+    // Resolve all callback graphs up front so the `translator()` borrow is
+    // dropped before the recursive `analyze_direct_call` (which re-borrows
+    // `self`). Upstream obtains every callback graph from
+    // `bk.getdesc(function).getgraphs()`, so resolution never drops a
+    // callback; an unresolved key here is a registration bug, surfaced as
+    // `top_result()` exactly like the `indirect_call` unknown-graph path.
+    let graphs: Vec<GraphRef> = {
+        let trans_graphs = analyzer.translator().graphs.borrow();
+        let mut graphs = Vec::with_capacity(keys.len());
+        for key in keys {
+            let Some(graph) = trans_graphs
+                .iter()
+                .find(|g| GraphKey::of(g).as_usize() == *key)
+                .cloned()
+            else {
+                return R::top_result();
+            };
+            graphs.push(graph);
+        }
+        graphs
+    };
+    // `seen` is threaded into each callee walk; default an owned tracker
+    // when the caller passed `None`, as the framework does.
+    let mut owned_tracker = DependencyTracker::new();
+    let seen = seen.unwrap_or(&mut owned_tracker);
+    // `for ... for graph in desc.getgraphs(): result =
+    //  self.join_two_results(result, self.analyze_direct_call(...))`.
+    let mut result = result;
+    for graph in &graphs {
+        result = R::join_two_results(result, analyzer.analyze_direct_call(graph, Some(seen)));
+    }
+    result
 }
 
 /// `DependencyTracker` (`graphanalyze.py:210-258`). Tracks the

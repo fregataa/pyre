@@ -17,9 +17,10 @@
 //!   (`graphanalyze.BoolGraphAnalyzer.analyze_direct_call`).
 //! * `analyze_external_call(self, funcobj, seen=None)` returns
 //!   `top_result()` when `funcobj.random_effects_on_gcobjs` is set;
-//!   otherwise delegates to the inherited handler — which in
-//!   `BoolGraphAnalyzer` returns `top_result()` (same conservative
-//!   default as `RaiseAnalyzer`'s `getattr(fnobj, 'canraise', True)`).
+//!   otherwise delegates to the inherited
+//!   `BoolGraphAnalyzer.analyze_external_call` — which is the base
+//!   `GraphAnalyzer.analyze_external_call` (`bottom_result()` plus the
+//!   `_callbacks` graph walk), NOT a conservative `top_result()` default.
 //! * `analyze_simple_operation(self, op, graphinfo)` returns `True`
 //!   for `malloc` / `malloc_varsize` with `flavor='gc'`, and
 //!   otherwise reads `LL_OPERATIONS[opname].canmallocgc`.
@@ -28,6 +29,7 @@ use crate::flowspace::model::{ConstValue, FunctionGraph, GraphRef, Hlvalue, Spac
 use crate::tool::algo::unionfind::UnionFind;
 use crate::translator::backendopt::graphanalyze::{
     Dependency, DependencyTracker, GraphAnalyzer, framework_analyze_direct_call,
+    framework_analyze_external_call,
 };
 use crate::translator::rtyper::lltypesystem::lloperation::ll_operations;
 use crate::translator::rtyper::lltypesystem::lltype::_ptr_obj;
@@ -119,31 +121,32 @@ impl<'t> GraphAnalyzer<bool, ()> for CollectAnalyzer<'t> {
     fn analyze_external_call(
         &mut self,
         op: &SpaceOperation,
-        _seen: Option<&mut DependencyTracker<bool>>,
+        seen: Option<&mut DependencyTracker<bool>>,
     ) -> bool {
-        // Inline the LLPtr → _func unwrap; on miss, fall back to the
-        // upstream `BoolGraphAnalyzer.analyze_external_call` default,
-        // which is `top_result() == True`.
-        let Some(arg0) = op.args.first() else {
-            return true;
-        };
-        let Hlvalue::Constant(c) = arg0 else {
-            return true;
-        };
-        let ConstValue::LLPtr(f) = &c.value else {
-            return true;
-        };
-        let Ok(_ptr_obj::Func(funcobj)) = f._obj() else {
-            return true;
-        };
-        match funcobj.attrs.get("random_effects_on_gcobjs") {
-            Some(ConstValue::Bool(true)) => return true,
-            _ => {}
+        // `if funcobj.random_effects_on_gcobjs: return True`. `funcobj`
+        // upstream is `op.args[0].value._obj`; pyre reads the flag off
+        // the `_func.attrs` mirror that carries `canraise` / `external`.
+        if let Some(Hlvalue::Constant(c)) = op.args.first() {
+            if let ConstValue::LLPtr(f) = &c.value {
+                if let Ok(_ptr_obj::Func(funcobj)) = f._obj() {
+                    let Some(value) = funcobj.attrs.get("random_effects_on_gcobjs") else {
+                        panic!("collectanalyze.py:22 funcobj.random_effects_on_gcobjs missing");
+                    };
+                    if value.truthy().unwrap_or_else(|| {
+                        panic!(
+                            "collectanalyze.py:22 random_effects_on_gcobjs has unknown truthiness: \
+                             {value:?}"
+                        )
+                    }) {
+                        return true;
+                    }
+                }
+            }
         }
-        // Upstream's super-call defaults to True for an external
-        // funcobj — `BoolGraphAnalyzer` inherits the no-info path
-        // which never proves bottom.
-        true
+        // `return graphanalyze.BoolGraphAnalyzer.analyze_external_call(
+        //      self, funcobj, seen)` — the base walk: `bottom_result()`
+        // (`False`) unless a `_callbacks` graph proves collection.
+        framework_analyze_external_call(self, op, seen)
     }
 
     /// Upstream `:27-33`:
@@ -260,6 +263,38 @@ mod tests {
         )
     }
 
+    fn external_direct_call_with_attrs(attrs: HashMap<String, ConstValue>) -> SpaceOperation {
+        let functype = lltype::FuncType {
+            args: vec![],
+            result: lltype::LowLevelType::Void,
+        };
+        let ptr = crate::translator::rtyper::lltypesystem::lltype::_ptr::new(
+            crate::translator::rtyper::lltypesystem::lltype::Ptr {
+                TO: crate::translator::rtyper::lltypesystem::lltype::PtrTarget::Func(
+                    functype.clone(),
+                ),
+            },
+            Ok(Some(
+                crate::translator::rtyper::lltypesystem::lltype::_ptr_obj::Func(
+                    crate::translator::rtyper::lltypesystem::lltype::_func::new(
+                        functype,
+                        "ext".to_string(),
+                        None,
+                        None,
+                        attrs,
+                    ),
+                ),
+            )),
+        );
+        SpaceOperation::new(
+            "direct_call",
+            vec![Hlvalue::Constant(Constant::new(ConstValue::LLPtr(
+                Box::new(ptr),
+            )))],
+            Hlvalue::Variable(Variable::named("r")),
+        )
+    }
+
     #[test]
     fn cannot_collect_hint_short_circuits_to_false() {
         let translator = TranslationContext::new();
@@ -322,58 +357,43 @@ mod tests {
 
     #[test]
     fn external_call_with_random_effects_on_gcobjs_returns_true() {
-        use std::collections::HashMap as StdHashMap;
         let translator = TranslationContext::new();
         let mut analyzer = CollectAnalyzer::new(&translator);
 
         // Build a direct_call op with attrs = {"random_effects_on_gcobjs": True}.
-        let mut attrs: StdHashMap<String, ConstValue> = StdHashMap::new();
+        let mut attrs = HashMap::new();
         attrs.insert(
             "random_effects_on_gcobjs".to_string(),
             ConstValue::Bool(true),
         );
-        let ptr = crate::translator::rtyper::lltypesystem::lltype::_ptr::new(
-            crate::translator::rtyper::lltypesystem::lltype::Ptr {
-                TO: crate::translator::rtyper::lltypesystem::lltype::PtrTarget::Func(
-                    lltype::FuncType {
-                        args: vec![],
-                        result: lltype::LowLevelType::Void,
-                    },
-                ),
-            },
-            Ok(Some(
-                crate::translator::rtyper::lltypesystem::lltype::_ptr_obj::Func(
-                    crate::translator::rtyper::lltypesystem::lltype::_func::new(
-                        lltype::FuncType {
-                            args: vec![],
-                            result: lltype::LowLevelType::Void,
-                        },
-                        "ext".to_string(),
-                        None,
-                        None,
-                        attrs,
-                    ),
-                ),
-            )),
-        );
-        let op = SpaceOperation::new(
-            "direct_call",
-            vec![Hlvalue::Constant(Constant::new(ConstValue::LLPtr(
-                Box::new(ptr),
-            )))],
-            Hlvalue::Variable(Variable::named("r")),
-        );
+        let op = external_direct_call_with_attrs(attrs);
         assert!(analyzer.analyze_external_call(&op, None));
     }
 
     #[test]
-    fn external_direct_call_to_unknown_returns_true_by_default() {
+    fn external_call_with_random_effects_false_and_no_callbacks_returns_false() {
         let translator = TranslationContext::new();
         let mut analyzer = CollectAnalyzer::new(&translator);
-        // direct_call_to(None) builds an LLPtr whose `_func.attrs` has
-        // no `random_effects_on_gcobjs` key — upstream's default in
-        // BoolGraphAnalyzer is `top_result() == True`.
+        // `random_effects_on_gcobjs = False` reaches the upstream
+        // super-call. With no `_callbacks`, base `GraphAnalyzer`
+        // returns `bottom_result() == False` (graphanalyze.py:60-69).
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "random_effects_on_gcobjs".to_string(),
+            ConstValue::Bool(false),
+        );
+        let op = external_direct_call_with_attrs(attrs);
+        assert!(!analyzer.analyze_external_call(&op, None));
+    }
+
+    #[test]
+    #[should_panic(expected = "funcobj.random_effects_on_gcobjs missing")]
+    fn external_call_missing_random_effects_fails_loud() {
+        let translator = TranslationContext::new();
+        let mut analyzer = CollectAnalyzer::new(&translator);
+        // Upstream reads `funcobj.random_effects_on_gcobjs` directly,
+        // so a missing attr is not the same as a false attr.
         let op = direct_call_to(None);
-        assert!(analyzer.analyze_external_call(&op, None));
+        let _ = analyzer.analyze_external_call(&op, None);
     }
 }

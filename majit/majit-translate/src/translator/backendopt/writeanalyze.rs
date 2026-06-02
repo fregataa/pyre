@@ -49,33 +49,35 @@ use std::collections::HashSet;
 /// port lifts that string into the enum discriminant.
 ///
 /// The `TYPE` slot carries `op.args[0].concretetype` (or `lltype.Ptr(T)`
-/// for the `gc_{load,store}_indexed` offset path). It is `Option` because
-/// `Hlvalue::concretetype` is `Option`-typed; in a post-rtype graph it is
-/// always `Some`, mirroring upstream's unconditional `.concretetype` read.
+/// for the `gc_{load,store}_indexed` offset path). Upstream reads
+/// `.concretetype` unconditionally and builds `lltype.Ptr(T)`
+/// unconditionally — neither yields `None` on a valid rtyped graph — so
+/// the slot is a plain `LowLevelType`; the producers fail loud rather
+/// than synthesising a `None`-typed effect.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Effect {
     /// `("struct", op.args[0].concretetype, op.args[1].value)`.
     Struct {
-        TYPE: Option<LowLevelType>,
+        TYPE: LowLevelType,
         fieldname: ConstValue,
     },
     /// `("array", TYPE)`.
-    Array { TYPE: Option<LowLevelType> },
+    Array { TYPE: LowLevelType },
     /// `("interiorfield", TYPE, fieldname)`.
     InteriorField {
-        TYPE: Option<LowLevelType>,
+        TYPE: LowLevelType,
         fieldname: ConstValue,
     },
     /// `("readstruct", op.args[0].concretetype, op.args[1].value)`.
     ReadStruct {
-        TYPE: Option<LowLevelType>,
+        TYPE: LowLevelType,
         fieldname: ConstValue,
     },
     /// `("readarray", op.args[0].concretetype)`.
-    ReadArray { TYPE: Option<LowLevelType> },
+    ReadArray { TYPE: LowLevelType },
     /// `("readinteriorfield", op.args[0].concretetype, fieldname)`.
     ReadInteriorField {
-        TYPE: Option<LowLevelType>,
+        TYPE: LowLevelType,
         fieldname: ConstValue,
     },
 }
@@ -312,13 +314,17 @@ fn as_variable(hv: Hlvalue) -> Option<Variable> {
 }
 
 /// `op.args[i].concretetype` for an `Hlvalue` arg
-/// (`finalizer.py:159-160` pattern).
-fn arg_concretetype(op: &SpaceOperation, i: usize) -> Option<LowLevelType> {
-    match op.args.get(i) {
+/// (`finalizer.py:159-160` pattern). Upstream reaches `.concretetype`
+/// directly; a missing arg slot or an absent `concretetype` is a
+/// malformed/un-rtyped graph, so the port fails loud (IndexError /
+/// AttributeError parity) rather than synthesising a `None`-typed effect.
+fn arg_concretetype(op: &SpaceOperation, i: usize) -> LowLevelType {
+    let ct = match op.args.get(i) {
         Some(Hlvalue::Variable(v)) => v.concretetype(),
         Some(Hlvalue::Constant(c)) => c.concretetype.clone(),
-        None => None,
-    }
+        None => panic!("op.args[{i}] missing"),
+    };
+    ct.unwrap_or_else(|| panic!("op.args[{i}].concretetype is None (un-rtyped graph)"))
 }
 
 /// The `AddressOffset` carried by an offset constant's value. Upstream's
@@ -350,7 +356,11 @@ trait WriteAnalyzerMethods {
     /// ```
     fn getinteriorname(&self, op: &SpaceOperation) -> ConstValue {
         if let Some(Hlvalue::Constant(c)) = op.args.get(1) {
-            if matches!(c.value, ConstValue::ByteStr(_) | ConstValue::UniStr(_)) {
+            // `isinstance(op.args[1].value, str)` — Python 2 `str` is
+            // bytes-only, so `ConstValue::as_pystr` matches `ByteStr`
+            // and rejects `UniStr` (Python 2 `unicode`), per the
+            // `flowspace/model.rs` `as_pystr` rule.
+            if c.value.as_pystr().is_some() {
                 return c.value.clone();
             }
         }
@@ -361,17 +371,13 @@ trait WriteAnalyzerMethods {
 
     /// `_array_result(self, TYPE)` (`writeanalyze.py:75-76`):
     /// `frozenset([("array", TYPE)])`.
-    fn array_result(&self, TYPE: Option<LowLevelType>) -> WriteEffects {
+    fn array_result(&self, TYPE: LowLevelType) -> WriteEffects {
         WriteEffects::Set(HashSet::from([Effect::Array { TYPE }]))
     }
 
     /// `_interiorfield_result(self, TYPE, fieldname)` (`writeanalyze.py:78-79`):
     /// `frozenset([("interiorfield", TYPE, fieldname)])`.
-    fn interiorfield_result(
-        &self,
-        TYPE: Option<LowLevelType>,
-        fieldname: ConstValue,
-    ) -> WriteEffects {
+    fn interiorfield_result(&self, TYPE: LowLevelType, fieldname: ConstValue) -> WriteEffects {
         WriteEffects::Set(HashSet::from([Effect::InteriorField { TYPE, fieldname }]))
     }
 
@@ -502,12 +508,10 @@ trait WriteAnalyzerMethods {
 
 /// `lltype.Ptr(T)` for an effect-offset container type. Raises upstream
 /// (`TypeError: cannot make a pointer to ...`) on a non-container `T`;
-/// the port matches that fail-loud contract. The result is wrapped in
-/// `Some` to fit [`Effect`]'s `Option`-typed `TYPE` slot, which is only
-/// `None` for the `setfield`/`setarrayitem` `concretetype` path.
-fn ptr_to(TYPE: &LowLevelType) -> Option<LowLevelType> {
+/// the port matches that fail-loud contract.
+fn ptr_to(TYPE: &LowLevelType) -> LowLevelType {
     match Ptr::from_container_type(TYPE.clone()) {
-        Ok(ptr) => Some(LowLevelType::from(ptr)),
+        Ok(ptr) => LowLevelType::from(ptr),
         Err(e) => panic!("lltype.Ptr({TYPE:?}): {e}"),
     }
 }
@@ -691,7 +695,7 @@ mod tests {
         assert_eq!(
             r,
             WriteEffects::Set(HashSet::from([Effect::Struct {
-                TYPE: Some(LowLevelType::Signed),
+                TYPE: LowLevelType::Signed,
                 fieldname: ConstValue::byte_str("x"),
             }]))
         );
@@ -715,7 +719,7 @@ mod tests {
         assert_eq!(
             r,
             WriteEffects::Set(HashSet::from([Effect::Array {
-                TYPE: Some(LowLevelType::Signed),
+                TYPE: LowLevelType::Signed,
             }]))
         );
     }
@@ -760,9 +764,7 @@ mod tests {
         let expected_ptr = LowLevelType::from(Ptr::from_container_type(array_ty).unwrap());
         assert_eq!(
             r,
-            WriteEffects::Set(HashSet::from([Effect::ReadArray {
-                TYPE: Some(expected_ptr),
-            }]))
+            WriteEffects::Set(HashSet::from([Effect::ReadArray { TYPE: expected_ptr }]))
         );
     }
 
@@ -815,7 +817,7 @@ mod tests {
         assert_eq!(
             r,
             WriteEffects::Set(HashSet::from([Effect::ReadStruct {
-                TYPE: Some(LowLevelType::Signed),
+                TYPE: LowLevelType::Signed,
                 fieldname: ConstValue::byte_str("x"),
             }]))
         );
@@ -909,7 +911,7 @@ mod tests {
         assert_eq!(
             r,
             WriteEffects::Set(HashSet::from([Effect::Struct {
-                TYPE: Some(LowLevelType::Signed),
+                TYPE: LowLevelType::Signed,
                 fieldname: ConstValue::byte_str("cb"),
             }]))
         );
