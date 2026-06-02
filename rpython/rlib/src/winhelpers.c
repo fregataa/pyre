@@ -238,7 +238,7 @@ os_unlink_impl(wchar_t *lpFileName)
     return (int)DeleteFileW(lpFileName);
 }
 
-int
+RPY_EXPORTED int
 os_createdirectory_impl(wchar_t *path, int mode){
     int result = 0;
     int error = 0;
@@ -277,7 +277,7 @@ os_createdirectory_impl(wchar_t *path, int mode){
     return 0;
 }
 
-int
+RPY_EXPORTED int
 os_removedirectory_impl(wchar_t *path)
 {
     return (int)RemoveDirectoryW(path);
