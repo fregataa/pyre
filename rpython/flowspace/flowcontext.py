@@ -154,18 +154,12 @@ class Replayer(Recorder):
 
     def __init__(self, block, booloutcome, nextreplayer):
         self.crnt_block = block
-        # We don't care about comments when replaying; they
-        # are likely to be emitted at different times:
-        self.listtoreplay = [op for op in block.operations
-                             if op.opname != 'comment']
+        self.listtoreplay = block.operations
         self.booloutcome = booloutcome
         self.nextreplayer = nextreplayer
         self.index = 0
 
     def append(self, operation):
-        # Ignore comments when verifying the replay:
-        if operation.opname == 'comment':
-            return
         operation.result = self.listtoreplay[self.index].result
         assert operation == self.listtoreplay[self.index], (
             '\n'.join(["Not generating the same operation sequence:"] +

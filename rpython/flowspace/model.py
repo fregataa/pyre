@@ -180,6 +180,19 @@ class Block(object):
                                           #  Constant(last_exception), see below
         self.exits = []                   # list of Link(s)
 
+    def copy_source_attribution(self, other):
+        """Copy source_func/source_line from other to self.
+
+        Used when creating a new block from an existing one (e.g. during
+        inlining or block splitting) so the C backend can still emit RPython
+        source comments for the new block's code.
+        """
+        if hasattr(other, 'source_func'):
+            self.source_func = other.source_func
+            self.source_line = other.source_line
+        elif hasattr(other, 'source_line'):
+            self.source_line = other.source_line
+
     def is_final_block(self):
         return self.operations == ()      # return or except block
 
@@ -276,27 +289,6 @@ class Block(object):
 
     view = show
 
-    def get_base_label(self, blocknum):
-        # Generate a more friendly C label for this block
-        if self.operations:
-            txt = "block"
-        elif (not self.exits) and len(self.inputargs) == 1:
-            txt = "return_block"
-        elif (not self.exits) and len(self.inputargs) == 2:
-            txt = "raise_block"
-        else:
-            txt = "block"
-        return '%s%d' % (txt, blocknum)
-    
-    def firstop(self):
-        """
-        Get the first (non-comment) operation
-        """
-        for op in self.operations:
-            if op.opname != 'comment':
-                return op
-                
- 
 class Variable(object):
     __slots__ = ["_name", "_nr", "annotation", "concretetype"]
 

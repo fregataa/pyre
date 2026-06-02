@@ -1,4 +1,3 @@
-import inspect
 import sys
 from rpython.translator.c.support import cdecl
 from rpython.translator.c.support import llvalue_from_constant, gen_assignments
@@ -14,6 +13,7 @@ from rpython.translator.backendopt.ssa import SSI_to_SSA
 from rpython.translator.backendopt.innerloop import find_inner_loops
 from rpython.tool.identity_dict import identity_dict
 from rpython.rlib.objectmodel import CDefinedIntSymbolic
+from rpython.tool.sourcetools import getsourcelines
 
 
 LOCALVAR = 'l_%s'
@@ -64,10 +64,9 @@ def make_funcgen(graph, db, exception_policy, functionname):
 _source_lines_cache = {}
 
 def escape_c_comments(py_src):
-    # Escape C comments within RPython source, to avoid generating bogus
-    # comments in our generated C source:
-    py_src = py_src.replace('/*', '')
-    py_src = py_src.replace('*/', '')
+    # Escape C comment delimiters within RPython source.
+    py_src = py_src.replace('/*', '/ *')
+    py_src = py_src.replace('*/', '* /')
     return py_src
 
 class FunctionCodeGenerator(object):
@@ -257,17 +256,12 @@ class FunctionCodeGenerator(object):
         if hasattr(graph, 'func'):
             func = graph.func
             if func not in _source_lines_cache:
-                try:
-                    _source_lines_cache[func] = inspect.getsourcelines(func)
-                except (IOError, TypeError):
-                    _source_lines_cache[func] = None
+                _source_lines_cache[func] = getsourcelines(func)
             cached = _source_lines_cache[func]
             if cached is not None:
                 src, startline = cached
-                try:
-                    filename = inspect.getfile(func)
-                except TypeError:
-                    filename = '<unknown>'
+                filename = getattr(getattr(func, '__code__', None),
+                                   'co_filename', '<unknown>')
                 yield '/* RPython source %r' % filename
                 for i, line in enumerate(src):
                     line = line.rstrip()
@@ -320,10 +314,7 @@ class FunctionCodeGenerator(object):
     def _source_comment(self, func, linenum):
         """Yield a C comment with the RPython source line, or nothing on error."""
         if func not in _source_lines_cache:
-            try:
-                _source_lines_cache[func] = inspect.getsourcelines(func)
-            except (IOError, TypeError):
-                _source_lines_cache[func] = None
+            _source_lines_cache[func] = getsourcelines(func)
         cached = _source_lines_cache[func]
         if cached is None:
             return

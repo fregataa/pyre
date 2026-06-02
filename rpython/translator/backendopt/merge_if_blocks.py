@@ -5,13 +5,12 @@ log = AnsiLogger("backendopt")
 
 
 def is_chain_block(block, first=False):
-    noncommentops = [op for op in block.operations
-                     if op.opname != 'comment']
-    if len(noncommentops) == 0:
+    ops = block.operations
+    if len(ops) == 0:
         return False
-    if len(noncommentops) > 1 and not first:
+    if len(ops) > 1 and not first:
         return False
-    op = noncommentops[-1]
+    op = ops[-1]
     if (op.opname not in ('int_eq', 'uint_eq', 'char_eq', 'unichar_eq')
         # note: 'llong_eq', 'ullong_eq' have been removed, as it's not
         # strictly C-compliant to do a switch() on a long long.  It also
@@ -109,7 +108,7 @@ def merge_if_blocks_once(graph):
             newcheckvar = targetblock.inputargs[falseexit.args.index(checkvar)]
             if not is_chain_block(targetblock):
                 break
-            if newcheckvar not in targetblock.firstop().args:
+            if newcheckvar not in targetblock.operations[0].args:
                 break
             for i, var in enumerate(trueexit.args):
                 add_to_varmap(var, trueexit.target.inputargs[i])

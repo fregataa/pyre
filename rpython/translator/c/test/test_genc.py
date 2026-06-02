@@ -806,6 +806,34 @@ def test_inlining_c_source():
     assert 'return h(c + 1, d - 1)' in c_fn_src # inlined body of g
     assert 'return p * q' in c_fn_src # inlined body of h
     
+def test_escape_c_comments_unit():
+    from rpython.translator.c.funcgen import escape_c_comments
+
+    # Basic cases: delimiters are split with a space, not deleted.
+    assert escape_c_comments('/* hello */') == '/ * hello * /'
+    assert escape_c_comments('*/') == '* /'
+    assert escape_c_comments('/*') == '/ *'
+
+    # The original bug: "**//".replace('/*','') is "**//", then
+    # "**//".replace('*/','') yields "*/" -- a C comment terminator.
+    # With the fixed implementation the result must contain no "*/".
+    result = escape_c_comments('**// floor-division after power')
+    assert '*/' not in result
+    assert '/*' not in result
+
+    # Pathological overlap: removing "/*" then "*/", in the old code,
+    # could turn "*/**" into "**" and leave "*/"-free output by luck, but
+    # "**//"-style inputs reliably exposed the bug.
+    for src in ['**//x', 'a**//b', '**// comment']:
+        r = escape_c_comments(src)
+        assert '*/' not in r, 'escape_c_comments(%r) -> %r still contains */' % (src, r)
+        assert '/*' not in r, 'escape_c_comments(%r) -> %r still contains /*' % (src, r)
+
+    # Content that contains neither delimiter is left unchanged.
+    assert escape_c_comments('plain text') == 'plain text'
+    assert escape_c_comments('x // y') == 'x // y'
+
+
 def test_escaping_c_comments():
     # Ensure that c comments within RPython code get escaped when we generate
     # our .c code (to avoid generating bogus C)

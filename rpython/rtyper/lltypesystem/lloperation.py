@@ -587,7 +587,6 @@ LL_OPERATIONS = {
     'threadlocalref_enum':  LLOp(sideeffects=False),  # enum all threadlocalrefs
 
     # __________ debugging __________
-    'comment':                 LLOp(),
     'debug_view':              LLOp(),
     'debug_print':             LLOp(canrun=True),
     'debug_start':             LLOp(canrun=True),
