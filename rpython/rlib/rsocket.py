@@ -1470,9 +1470,14 @@ if _c.WIN32:
         with lltype.scoped_alloc(_c.WSAPROTOCOL_INFO, zero=True) as info:
             if _c.WSADuplicateSocket(fd, rwin32.GetCurrentProcessId(), info):
                 raise last_error()
+            if inheritable:
+                flags = rffi.cast(rwin32.DWORD, 0)
+            else:
+                flags = rffi.cast(rwin32.DWORD,
+                                  _c.WSA_FLAG_NO_HANDLE_INHERIT)
             result = _c.WSASocket(
                 _c.FROM_PROTOCOL_INFO, _c.FROM_PROTOCOL_INFO,
-                _c.FROM_PROTOCOL_INFO, info, 0, 0)
+                _c.FROM_PROTOCOL_INFO, info, 0, flags)
             result = rffi.cast(lltype.Signed, result)
             if result == INVALID_SOCKET:
                 raise last_error()
