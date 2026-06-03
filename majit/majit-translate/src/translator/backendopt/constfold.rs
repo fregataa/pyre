@@ -71,9 +71,16 @@ fn fold_op_list(
         // Upstream `constfold.py:27-82`: `try: op = getattr(llop,
         // spaceop.opname)`. Missing-from-registry → AttributeError →
         // `pass` → fall through to the exit-early/append branch.
+        // Upstream `constfold.py:15`: `RESTYPE = spaceop.result.concretetype`,
+        // forwarded into `op(RESTYPE, *args)` (`:34`). Only `need_result_type`
+        // ops (`cast_adr_to_ptr`, …) consume it; the rest ignore it.
+        let restype = match &spaceop.result {
+            Hlvalue::Variable(v) => v.concretetype(),
+            Hlvalue::Constant(c) => c.concretetype.clone(),
+        };
         if let Some(op_desc) = ll_operations().get(spaceop.opname.as_str()) {
             if !op_desc.sideeffects && args.len() == vargs.len() {
-                if let Some(result) = eval_llop(&spaceop.opname, &args) {
+                if let Some(result) = eval_llop(&spaceop.opname, &args, restype.as_ref()) {
                     if let Hlvalue::Variable(result_var) = &spaceop.result {
                         // Upstream `constfold.py:46-47`: opnames in
                         // `fixup_op_result` post-process the folded
@@ -1215,8 +1222,20 @@ fn fixup_solid(_p: ConstValue) -> ConstValue {
 /// `_ovf` family lives in [`fold_ovf_op`] because the surrounding
 /// pattern (`c_last_exception` plus exit rewiring) is constfold-
 /// specific.
-fn eval_llop(opname: &str, args: &[ConstValue]) -> Option<ConstValue> {
-    crate::translator::rtyper::lltypesystem::opimpl::get_op_impl(opname).and_then(|f| f(args))
+fn eval_llop(
+    opname: &str,
+    args: &[ConstValue],
+    restype: Option<&LowLevelType>,
+) -> Option<ConstValue> {
+    use crate::translator::rtyper::lltypesystem::opimpl;
+    // Upstream `LLOp.__call__`: ops with `need_result_type = True` receive
+    // RESTYPE as the first argument (`op(RESTYPE, *args)`); the rest fold
+    // from `args` alone. `cast_adr_to_ptr` (`opimpl.py:485`) is the only
+    // ported `need_result_type` op so far.
+    if opname == "cast_adr_to_ptr" {
+        return restype.and_then(|rt| opimpl::op_cast_adr_to_ptr(rt, args));
+    }
+    opimpl::get_op_impl(opname).and_then(|f| f(args))
 }
 
 /// Port of upstream `fold_ovf_op(spaceop, args)` (`constfold.py:102-114`).
@@ -1560,14 +1579,22 @@ mod tests {
     /// `checked_add` which returned `None` and refused to fold.
     #[test]
     fn eval_llop_int_add_wraps_on_overflow() {
-        let r = eval_llop("int_add", &[ConstValue::Int(i64::MAX), ConstValue::Int(1)]);
+        let r = eval_llop(
+            "int_add",
+            &[ConstValue::Int(i64::MAX), ConstValue::Int(1)],
+            None,
+        );
         assert_eq!(r, Some(ConstValue::Int(i64::MIN)));
     }
 
     /// `int_sub(MIN, 1)` upstream wraps to `MAX`.
     #[test]
     fn eval_llop_int_sub_wraps_on_underflow() {
-        let r = eval_llop("int_sub", &[ConstValue::Int(i64::MIN), ConstValue::Int(1)]);
+        let r = eval_llop(
+            "int_sub",
+            &[ConstValue::Int(i64::MIN), ConstValue::Int(1)],
+            None,
+        );
         assert_eq!(r, Some(ConstValue::Int(i64::MAX)));
     }
 
@@ -1575,21 +1602,25 @@ mod tests {
     /// reinterpreted as signed).
     #[test]
     fn eval_llop_int_mul_wraps_on_overflow() {
-        let r = eval_llop("int_mul", &[ConstValue::Int(i64::MAX), ConstValue::Int(2)]);
+        let r = eval_llop(
+            "int_mul",
+            &[ConstValue::Int(i64::MAX), ConstValue::Int(2)],
+            None,
+        );
         assert_eq!(r, Some(ConstValue::Int(-2)));
     }
 
     /// `int_neg(MIN)` upstream wraps to `MIN` (intmask of `-MIN`).
     #[test]
     fn eval_llop_int_neg_wraps_on_min() {
-        let r = eval_llop("int_neg", &[ConstValue::Int(i64::MIN)]);
+        let r = eval_llop("int_neg", &[ConstValue::Int(i64::MIN)], None);
         assert_eq!(r, Some(ConstValue::Int(i64::MIN)));
     }
 
     /// `int_abs(MIN)` upstream wraps to `MIN`.
     #[test]
     fn eval_llop_int_abs_wraps_on_min() {
-        let r = eval_llop("int_abs", &[ConstValue::Int(i64::MIN)]);
+        let r = eval_llop("int_abs", &[ConstValue::Int(i64::MIN)], None);
         assert_eq!(r, Some(ConstValue::Int(i64::MIN)));
     }
 
@@ -1602,6 +1633,7 @@ mod tests {
         let r = eval_llop(
             "int_floordiv",
             &[ConstValue::Int(i64::MIN), ConstValue::Int(-1)],
+            None,
         );
         assert_eq!(r, None);
     }
@@ -1611,7 +1643,11 @@ mod tests {
     /// `i64::wrapping_rem` so the op is removed from the graph.
     #[test]
     fn eval_llop_int_mod_folds_min_mod_neg_one_to_zero() {
-        let r = eval_llop("int_mod", &[ConstValue::Int(i64::MIN), ConstValue::Int(-1)]);
+        let r = eval_llop(
+            "int_mod",
+            &[ConstValue::Int(i64::MIN), ConstValue::Int(-1)],
+            None,
+        );
         assert_eq!(r, Some(ConstValue::Int(0)));
     }
 

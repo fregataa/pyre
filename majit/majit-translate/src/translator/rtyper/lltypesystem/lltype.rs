@@ -36,6 +36,21 @@ thread_local! {
     /// records the post-`_become` target by pointer identity here and
     /// routes read-side operations through the redirect.
     static PTR_BECOME_TARGETS: RefCell<HashMap<u64, _ptr>> = RefCell::new(HashMap::new());
+
+    /// `_subarray._cache` (lltype.py:2015-2040) — keyed by the parent
+    /// container's identity and the `baseoffset_or_fieldname`, so two
+    /// derivations of the same interior pointer reuse one `_subarray` (and so
+    /// one container identity). Upstream uses a `WeakKeyDictionary` plus
+    /// `_cleanup_cache`; the translator never frees these containers (the
+    /// parent is held strongly — see [`ParentLink::parent_container`]), so a
+    /// plain strong map is the consistent adaptation.
+    static SUBARRAY_CACHE: RefCell<HashMap<(usize, ParentIndex), _subarray>> =
+        RefCell::new(HashMap::new());
+
+    /// `_arraylenref._cache` (lltype.py:2067, 2091-2098) — the array
+    /// container's identity → its single length pseudo-reference.
+    static ARRAYLENREF_CACHE: RefCell<HashMap<usize, _arraylenref>> =
+        RefCell::new(HashMap::new());
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -350,7 +365,115 @@ pub enum _address {
     /// the integer directly because the host-evaluator hands back a raw
     /// pointer value for a `Ref`-typed static without a live `_ptr` to
     /// wrap.
+    ///
+    /// INVARIANT: this carries only an **odd, non-zero** integer — the
+    /// tagged-integer pointer `cast_int_to_ptr` builds (lltype.py:2375). A
+    /// zero integer maps to [`_address::Null`] and an even non-zero integer
+    /// declines, both in [`cast_int_to_adr`]. So the wrapped tagged-int
+    /// `_ptr` is never `None` and the address is always non-NULL.
     IntCast(i64),
+}
+
+impl _address {
+    /// `fakeaddress.__eq__` (`llmemory.py:496-508`). Compares the two
+    /// addresses by their underlying container: `obj1 = self.ptr._obj`,
+    /// `obj2 = other.ptr._obj` (`None` for NULL), `return obj1 == obj2`.
+    ///
+    /// `_fixup()` (llmemory.py:540-547) is the identity here because the
+    /// `llarena` fake-arena rebind it performs for a freed referent is
+    /// unported; a freed `Fake` therefore reaches `_getobj(check=True)`
+    /// and panics exactly as upstream `._obj` would on a non-arena freed
+    /// pointer. Upstream catches only `DelayedPointer`, falling back to
+    /// pointer identity (`self.ptr is other.ptr`).
+    pub fn _eq(&self, other: &_address) -> bool {
+        // An int-cast address compares by its raw integer — the underlying
+        // `_obj` of a tagged-integer pointer (llmemory.py:788 builds it via
+        // `cast_int_to_ptr`; `_ptr._obj` of a tagged int is the int itself).
+        // It is therefore never equal to a NULL or container-backed address.
+        match (self, other) {
+            (_address::IntCast(a), _address::IntCast(b)) => return a == b,
+            (_address::IntCast(_), _) | (_, _address::IntCast(_)) => return false,
+            _ => {}
+        }
+        let obj = |a: &_address| -> Result<Option<_ptr_obj>, DelayedPointer> {
+            match a {
+                _address::Null => Ok(None),
+                _address::Fake(p) => p._getobj(true),
+                _address::IntCast(_) => unreachable!("int-cast handled above"),
+            }
+        };
+        match (obj(self), obj(other)) {
+            (Ok(o1), Ok(o2)) => o1 == o2,
+            // `except lltype.DelayedPointer: return self.ptr is other.ptr`
+            _ => match (self, other) {
+                (_address::Fake(p1), _address::Fake(p2)) => p1._identity == p2._identity,
+                _ => false,
+            },
+        }
+    }
+
+    /// `fakeaddress.__ne__` (`llmemory.py:509-513`): `not (self == other)`.
+    pub fn _ne(&self, other: &_address) -> bool {
+        !self._eq(other)
+    }
+
+    /// `fakeaddress.__nonzero__` (`llmemory.py:490-491`): `self.ptr is not
+    /// None`. `Fake` wraps a live pointer and `IntCast` an odd-non-zero
+    /// tagged-integer pointer (see the variant invariant), both with a
+    /// non-`None` `_obj0` and so non-NULL; only `Null` — the normalization
+    /// of `_obj0 is None` (llmemory.py:454-456) — is the NULL address.
+    pub fn nonzero(&self) -> bool {
+        matches!(self, _address::Fake(_) | _address::IntCast(_))
+    }
+
+    /// `fakeaddress.__lt__` (`llmemory.py:515-525`). For the convenience of
+    /// debugging the GCs, NULL is the smallest address; two non-NULL
+    /// fakeaddresses cannot be ordered (upstream `TypeError`, surfaced here
+    /// as `Err` so the fold declines).
+    pub fn _lt(&self, other: &_address) -> Result<bool, String> {
+        if !other.nonzero() {
+            return Ok(false); // self < NULL => False
+        }
+        if !self.nonzero() {
+            return Ok(true); // NULL < non-null-other => True
+        }
+        Err("cannot compare non-NULL fakeaddresses with '<'".to_string())
+    }
+
+    /// `fakeaddress.__le__` (`llmemory.py:526-527`): `self == other or self
+    /// < other`.
+    pub fn _le(&self, other: &_address) -> Result<bool, String> {
+        Ok(self._eq(other) || self._lt(other)?)
+    }
+
+    /// `fakeaddress.__gt__` (`llmemory.py:528-529`): `not (self == other or
+    /// self < other)`.
+    pub fn _gt(&self, other: &_address) -> Result<bool, String> {
+        Ok(!(self._eq(other) || self._lt(other)?))
+    }
+
+    /// `fakeaddress.__ge__` (`llmemory.py:530-531`): `not (self < other)`.
+    pub fn _ge(&self, other: &_address) -> Result<bool, String> {
+        Ok(!self._lt(other)?)
+    }
+
+    /// `fakeaddress.__sub__` (`llmemory.py:477-487`), the
+    /// `isinstance(other, fakeaddress)` arm: `addr1 - addr2` is `0` when the
+    /// two addresses are equal, otherwise `TypeError("cannot subtract
+    /// fakeaddresses in general")` (surfaced as `Err` so the fold declines).
+    ///
+    /// The other two arms of `__sub__` are not reachable through `op_adr_delta`
+    /// (`opimpl.py:551-553` passes two checked addresses): the
+    /// `isinstance(other, AddressOffset)` arm (`self + (-other)`) belongs to
+    /// `op_adr_sub` and stays blocked on the object-returning
+    /// `_parentstructure()` walk that `AddressOffset.ref` needs.
+    pub fn _delta(&self, other: &_address) -> Result<i64, String> {
+        if self._eq(other) {
+            Ok(0)
+        } else {
+            Err("cannot subtract fakeaddresses in general".to_string())
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -778,6 +901,15 @@ pub enum _ptr_obj {
     Array(_array),
     Opaque(_opaque),
     Wref(_wref),
+    /// `_subarray` interior view (lltype.py:1956), built by
+    /// `direct_fieldptr`/`direct_arrayitems`/`direct_ptradd`.
+    Subarray(_subarray),
+    /// `_arraylenref` array-length pseudo-reference (lltype.py:2062), built by
+    /// `ArrayLengthOffset.ref`.
+    ArrayLenRef(_arraylenref),
+    /// `_endmarker_struct` end-of-array sentinel (lltype.py:168), built by
+    /// `ItemOffset.ref` for a reference exactly to the array end.
+    EndMarker(_endmarker),
 }
 
 #[derive(Clone, Debug)]
@@ -927,50 +1059,61 @@ pub struct Parentable {
     storage_live: std::sync::atomic::AtomicBool,
     /// `_wrparent`/`_parent_type`/`_parent_index` (lltype.py:1693-1696),
     /// installed by `_setparentstructure`. Upstream `_wrparent` is a
-    /// `weakref.ref(parent)`; the translator never collects containers, so
-    /// a strong `Arc<Parentable>` to the parent's shared state is held
-    /// instead (the weak/strong distinction and `_keepparent` exist only to
-    /// cooperate with Python's GC).
+    /// `weakref.ref(parent)`; the translator never collects containers, so the
+    /// parent *container object* is held strongly in [`ParentLink`] instead
+    /// (the weak/strong distinction and `_keepparent` exist only to cooperate
+    /// with Python's GC).
     parent: Mutex<Option<ParentLink>>,
 }
 
 /// `_parentable._wrparent` + `_parent_type` + `_parent_index`
 /// (lltype.py:1693-1696).
-#[derive(Debug)]
 struct ParentLink {
-    /// `_wrparent()` — the parent container's shared `_parentable` state.
+    /// `_wrparent()` — the parent *container object* (`_struct`/`_array`/
+    /// `_opaque`), so `_parentstructure()` (lltype.py:1704-1714) can hand the
+    /// parent back and `parentlink` / `_normalizedcontainer` / `_cast_to`
+    /// up-casts can re-point at its inlined fields.
     ///
-    /// Upstream `_wrparent` weakly references the parent *container object*
-    /// (`_struct`/`_array`/`_opaque`), so `_parentstructure()`
-    /// (lltype.py:1704-1714) can hand the parent back and `_normalizedcontainer`
-    /// (lltype.py:1721-1735) / `_cast_to` up-casts can read its first inlined
-    /// field. Here only the parent's `Parentable` (liveness chain) is reachable,
-    /// not the owning container value, because the value-model has no
-    /// `_identity`→container map. This is exactly what blocks the
-    /// object-returning `_parentstructure()` walk; the liveness predicates
-    /// (`_was_freed`/`_check`) need only the chain and are fully ported.
-    parent: Arc<Parentable>,
-    /// `_parent_type` (lltype.py:1695) — `typeOf(parent)`. Stored to mirror
-    /// the upstream slot; read by the deferred object-returning
-    /// `_parentstructure()` / `_normalizedcontainer` / `_cast_to` up-cast,
-    /// which need an identity→container map pyre does not have yet.
-    #[allow(dead_code)]
+    /// Upstream `_wrparent` is a `weakref.ref(parent)`; the translator never
+    /// collects containers, so the parent is held strongly (consistent with
+    /// the strong-ref adaptation documented on [`Parentable::parent`]). The
+    /// parent shares its `_fields`/`items` `Arc` with the child's owner, so
+    /// this strong link closes a reference cycle — a leak that is harmless
+    /// because lltype containers are translation-time values that are never
+    /// freed. The cycle would also make the derived `Debug` recurse forever,
+    /// so `ParentLink` carries a hand-written non-recursive `Debug` below.
+    parent_container: _ptr_obj,
+    /// `_parent_type` (lltype.py:1695) — `typeOf(parent)`. Read by the
+    /// `_cast_to` up-cast walk (the widened-to type check) and the
+    /// error-message/normalizedcontainer hints.
     parent_type: LowLevelType,
     /// `_parent_index` (lltype.py:1696) — the field name or item index that
-    /// holds this sub-container inside the parent. Same deferred readers as
-    /// `parent_type`.
-    #[allow(dead_code)]
+    /// holds this sub-container inside the parent.
     parent_index: ParentIndex,
+}
+
+impl std::fmt::Debug for ParentLink {
+    /// Non-recursive: the parent container forms an `Arc` cycle back to this
+    /// link's owner, so printing it would loop forever. Show only the
+    /// type/index slots, like upstream's `_parent_type`/`_parent_index`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ParentLink")
+            .field("parent_type", &self.parent_type)
+            .field("parent_index", &self.parent_index)
+            .finish_non_exhaustive()
+    }
 }
 
 /// `_parent_index` (lltype.py:1696): a struct field name or an array item
 /// index. Inner values are read by the deferred `_parentstructure()` walk
-/// (see [`ParentLink::parent_index`]).
-#[derive(Clone, Debug)]
-#[allow(dead_code)]
-enum ParentIndex {
+/// (see [`ParentLink::parent_index`]). The item index is signed: a
+/// `direct_ptradd` backward shift produces a `_subarray` at `base + n < 0`
+/// (lltype.py:1114), which only fails when actually dereferenced out of
+/// bounds, not when the interior pointer is built.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum ParentIndex {
     Field(String),
-    Item(usize),
+    Item(i64),
 }
 
 impl Parentable {
@@ -994,7 +1137,9 @@ impl Parentable {
         }
         match &*self.parent.lock().unwrap() {
             None => false,
-            Some(link) => link.parent.was_freed(),
+            Some(link) => parentable_of_obj(&link.parent_container)
+                .expect("a parent container is always a `_parentable`")
+                .was_freed(),
         }
     }
 
@@ -1020,19 +1165,103 @@ impl Parentable {
     }
 
     /// `_parentable._setparentstructure(parent, parentindex)`
-    /// (lltype.py:1693-1696). `_keepparent` (lltype.py:1697-1702) is moot
-    /// without Python-GC cooperation and is omitted.
+    /// (lltype.py:1693-1696). `parent` is the parent container object;
+    /// `_parent_type = typeOf(parent)`. `_keepparent` (lltype.py:1697-1702)
+    /// is moot without Python-GC cooperation and is omitted (the parent is
+    /// always held strongly here — see [`ParentLink::parent_container`]).
     fn set_parent_structure(
         &self,
-        parent: Arc<Parentable>,
+        parent_container: _ptr_obj,
         parent_type: LowLevelType,
         parent_index: ParentIndex,
     ) {
         *self.parent.lock().unwrap() = Some(ParentLink {
-            parent,
+            parent_container,
             parent_type,
             parent_index,
         });
+    }
+
+    /// `_parentable._parentstructure(check=True)` (lltype.py:1704-1714): hand
+    /// back the parent container object, running its `_check()` first when
+    /// `check`. `None` for a container with no parent link.
+    fn parentstructure(&self, check: bool) -> Option<_ptr_obj> {
+        let guard = self.parent.lock().unwrap();
+        let link = guard.as_ref()?;
+        if check {
+            parentable_of_obj(&link.parent_container)
+                .expect("a parent container is always a `_parentable`")
+                .check();
+        }
+        Some(link.parent_container.clone())
+    }
+
+    /// `_parentable._parent_index` (lltype.py:1696) — `self`'s field name or
+    /// item index inside its parent, or `None` when unparented.
+    fn parent_index(&self) -> Option<ParentIndex> {
+        self.parent
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|l| l.parent_index.clone())
+    }
+
+    /// `_parentable._parent_type` (lltype.py:1695) — `typeOf(parent)`, or
+    /// `None` when unparented. Read by the `_cast_to` up-cast walk to check
+    /// the widened-to type against `PTRTYPE.TO`.
+    fn parent_type(&self) -> Option<LowLevelType> {
+        self.parent
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|l| l.parent_type.clone())
+    }
+}
+
+/// The shared `_parentable` state of a container *object* (`_struct`/
+/// `_array`/`_opaque`), or `None` for the non-parentable `_func`/`_wref`.
+/// Companion to [`parentable_of`] for the `_ptr_obj` (pointed-to container)
+/// representation that `_parentstructure` hands back.
+fn parentable_of_obj(obj: &_ptr_obj) -> Option<Arc<Parentable>> {
+    match obj {
+        _ptr_obj::Struct(s) => Some(s._parentable.clone()),
+        _ptr_obj::Array(a) => Some(a._parentable.clone()),
+        _ptr_obj::Opaque(o) => Some(o._parentable.clone()),
+        _ptr_obj::Subarray(s) => Some(s._parentable.clone()),
+        _ptr_obj::EndMarker(e) => Some(e._parentable.clone()),
+        // `_arraylenref` is a `_parentable` upstream but never sets a parent
+        // and is never itself a parent of inlined children, so it shares no
+        // `_parentable` state for the parent-chain walk.
+        _ptr_obj::Func(_) | _ptr_obj::Wref(_) | _ptr_obj::ArrayLenRef(_) => None,
+    }
+}
+
+/// `getattr(parent, name)` reinterpreted as the inlined sub-container object
+/// it holds — the first-field identity probe for the `_cast_to` up-cast
+/// (`getattr(parent, PARENTTYPE._names[0]) != struc`, lltype.py:1443). `None`
+/// when `parent` is not a `_struct` or the field is not an inlined container.
+fn first_field_container(parent: &_ptr_obj, name: &str) -> Option<_ptr_obj> {
+    let _ptr_obj::Struct(s) = parent else {
+        return None;
+    };
+    match s._getattr(name)? {
+        LowLevelValue::Struct(c) => Some(_ptr_obj::Struct(*c)),
+        LowLevelValue::Array(c) => Some(_ptr_obj::Array(*c)),
+        LowLevelValue::Opaque(c) => Some(_ptr_obj::Opaque(*c)),
+        _ => None,
+    }
+}
+
+/// `parentlink(container)` (lltype.py:1123-1128): the parent container object
+/// and the index of `container` within it, or `(None, None)` when `container`
+/// has no parent (top-level allocation) or is not a `_parentable`.
+pub(crate) fn parentlink(container: &_ptr_obj) -> (Option<_ptr_obj>, Option<ParentIndex>) {
+    let Some(p) = parentable_of_obj(container) else {
+        return (None, None);
+    };
+    match p.parentstructure(true) {
+        Some(parent) => (Some(parent), p.parent_index()),
+        None => (None, None),
     }
 }
 
@@ -1049,28 +1278,63 @@ fn parentable_of(value: &LowLevelValue) -> Option<Arc<Parentable>> {
     }
 }
 
+/// `_container._as_ptr(self)` (lltype.py:1640-1641): `_ptr(Ptr(self._TYPE),
+/// self, solid)` for an inlined container value (`_struct`/`_array`/
+/// `_opaque`). `None` for a non-container `LowLevelValue`. Used by
+/// `AddressOffset::ref` to hand back a pointer to a navigated sub-container.
+pub(crate) fn container_value_as_ptr(value: &LowLevelValue, solid: bool) -> Option<_ptr> {
+    let (obj, target) = match value {
+        LowLevelValue::Struct(s) => (
+            _ptr_obj::Struct((**s).clone()),
+            PtrTarget::Struct(s.TYPE.clone()),
+        ),
+        LowLevelValue::Array(a) => {
+            let target = match &a.TYPE {
+                ArrayContainer::Array(t) => PtrTarget::Array(t.clone()),
+                ArrayContainer::FixedSizeArray(t) => PtrTarget::FixedSizeArray(t.clone()),
+            };
+            (_ptr_obj::Array((**a).clone()), target)
+        }
+        LowLevelValue::Opaque(o) => (
+            _ptr_obj::Opaque((**o).clone()),
+            PtrTarget::Opaque(o.TYPE.clone()),
+        ),
+        _ => return None,
+    };
+    Some(_ptr::new_with_solid(
+        Ptr { TO: target },
+        Ok(Some(obj)),
+        solid,
+    ))
+}
+
 /// `_struct.__init__` (lltype.py:1767-1781) — build a `_struct` whose
 /// inlined sub-container fields link back to it as their `_wrparent`
 /// (`parent=self, parentindex=fld`). Single construction path so both
 /// `_container_example` and `malloc` wire parent links identically.
 fn build_struct(type_: StructType, fields: Vec<(String, LowLevelValue)>) -> _struct {
-    let _parentable = Parentable::new();
-    let parent_type = LowLevelType::Struct(Box::new(type_.clone()));
-    for (name, value) in &fields {
+    // Upstream `_setparentstructure(parent=self, ...)` passes the parent
+    // container object, which exists (has identity) before `__init__` runs.
+    // Build the `_struct` first, then link each inlined sub-container to it;
+    // the clone shares `_fields`/`_parentable` so it is an identity alias.
+    let s = _struct {
+        _identity: fresh_low_level_container_identity(),
+        TYPE: type_,
+        _fields: Arc::new(Mutex::new(fields)),
+        _parentable: Parentable::new(),
+    };
+    let parent_obj = _ptr_obj::Struct(s.clone());
+    let parent_type = LowLevelType::Struct(Box::new(s.TYPE.clone()));
+    for (name, value) in s._fields.lock().unwrap().iter() {
         if let Some(child) = parentable_of(value) {
             child.set_parent_structure(
-                _parentable.clone(),
+                parent_obj.clone(),
                 parent_type.clone(),
                 ParentIndex::Field(name.clone()),
             );
         }
     }
-    _struct {
-        _identity: fresh_low_level_container_identity(),
-        TYPE: type_,
-        _fields: Arc::new(Mutex::new(fields)),
-        _parentable,
-    }
+    s
 }
 
 /// `_array.__init__` (lltype.py:1864-1876) and `_fixedsizearray.__init__`
@@ -1080,28 +1344,437 @@ fn build_struct(type_: StructType, fields: Vec<(String, LowLevelValue)>) -> _str
 /// lltype.py:1872); a `_fixedsizearray` passes the synthesized field name
 /// `"item%d" % j` (`parentindex=fld`, lltype.py:1825).
 fn build_array(type_: ArrayContainer, items: Vec<LowLevelValue>) -> _array {
-    let _parentable = Parentable::new();
-    let parent_type = match &type_ {
-        ArrayContainer::Array(a) => LowLevelType::Array(Box::new(a.clone())),
-        ArrayContainer::FixedSizeArray(a) => LowLevelType::FixedSizeArray(Box::new(a.clone())),
+    // Same construction order as `build_struct`: materialize the `_array`,
+    // then link each inlined item to the (identity-aliased) parent object.
+    let a = _array {
+        _identity: fresh_low_level_container_identity(),
+        TYPE: type_,
+        items: Arc::new(Mutex::new(items)),
+        _parentable: Parentable::new(),
     };
-    let fixedsize = matches!(&type_, ArrayContainer::FixedSizeArray(_));
-    for (j, item) in items.iter().enumerate() {
+    let parent_obj = _ptr_obj::Array(a.clone());
+    let parent_type = match &a.TYPE {
+        ArrayContainer::Array(arr) => LowLevelType::Array(Box::new(arr.clone())),
+        ArrayContainer::FixedSizeArray(arr) => LowLevelType::FixedSizeArray(Box::new(arr.clone())),
+    };
+    let fixedsize = matches!(&a.TYPE, ArrayContainer::FixedSizeArray(_));
+    for (j, item) in a.items.lock().unwrap().iter().enumerate() {
         if let Some(child) = parentable_of(item) {
             let parent_index = if fixedsize {
                 ParentIndex::Field(format!("item{j}"))
             } else {
-                ParentIndex::Item(j)
+                ParentIndex::Item(j as i64)
             };
-            child.set_parent_structure(_parentable.clone(), parent_type.clone(), parent_index);
+            child.set_parent_structure(parent_obj.clone(), parent_type.clone(), parent_index);
         }
     }
-    _array {
-        _identity: fresh_low_level_container_identity(),
-        TYPE: type_,
-        items: Arc::new(Mutex::new(items)),
-        _parentable,
+    a
+}
+
+impl _subarray {
+    /// `_parentable._was_freed` (lltype.py:1681-1691) — delegates to the
+    /// shared `_parentable`, which walks the parent chain.
+    pub fn _was_freed(&self) -> bool {
+        self._parentable.was_freed()
     }
+
+    /// `_subarray.getlength` (lltype.py:1985-1987) — the `_TYPE` is always a
+    /// `FixedSizeArray`, so its declared `.length` (1).
+    pub fn getlength(&self) -> usize {
+        self.TYPE.length
+    }
+
+    /// `_subarray.getbounds` (lltype.py:1989-1994): a struct-field subarray
+    /// spans `(0, 1)`; an array subarray shifts the parent array's bounds by
+    /// `-baseoffset`, so a backward `direct_ptradd` base makes index 0 fall
+    /// below `start` (the `_ptr.__getitem__` bounds check then rejects it as an
+    /// out-of-bounds read instead of reaching a negative parent index).
+    pub fn getbounds(&self) -> (i64, i64) {
+        match self
+            ._parentable
+            .parent_index()
+            .expect("a _subarray always has a parent index")
+        {
+            ParentIndex::Field(_) => (0, 1),
+            ParentIndex::Item(base) => {
+                let parent = self
+                    ._parentable
+                    .parentstructure(true)
+                    .expect("a _subarray always has a parent");
+                let _ptr_obj::Array(a) = parent else {
+                    panic!("_subarray over an array item expects an Array parent");
+                };
+                let (start, stop) = a.getbounds();
+                (start as i64 - base, stop as i64 - base)
+            }
+        }
+    }
+
+    /// `_subarray.getitem` (lltype.py:1996-2004): redirect into the parent at
+    /// `base + index`. A struct-field subarray (`_parent_index` is a name)
+    /// reads the field (index must be 0); an array subarray (`_parent_index`
+    /// is the integer base) reads the parent item at `base + index`.
+    pub fn getitem(&self, index: usize) -> Option<LowLevelValue> {
+        let parent = self
+            ._parentable
+            .parentstructure(true)
+            .expect("a _subarray always has a parent");
+        match self
+            ._parentable
+            .parent_index()
+            .expect("a _subarray always has a parent index")
+        {
+            ParentIndex::Field(fieldname) => {
+                assert_eq!(index, 0);
+                let _ptr_obj::Struct(s) = parent else {
+                    panic!("_subarray over a struct field expects a Struct parent");
+                };
+                s._getattr(&fieldname)
+            }
+            ParentIndex::Item(base) => {
+                let _ptr_obj::Array(a) = parent else {
+                    panic!("_subarray over an array item expects an Array parent");
+                };
+                // `self._parentstructure().getitem(baseoffset + index)`
+                // (lltype.py:2003). A backward `base` makes the effective index
+                // negative; `_ptr.__getitem__` already rejects such an index via
+                // `getbounds()` (`_subarray.getbounds` shifts the parent bounds
+                // by `-base`), so the `try_from` is a defensive backstop for a
+                // direct container access that bypassed the pointer check.
+                let effective = base + index as i64;
+                let effective =
+                    usize::try_from(effective).expect("out-of-bounds read of a backward _subarray");
+                a.getitem(effective)
+            }
+        }
+    }
+
+    /// `_subarray.setitem` (lltype.py:2006-2013): write back into the parent
+    /// at `base + index`. A struct-field subarray (`_parent_index` a name)
+    /// sets the field (index must be 0); an array subarray (`_parent_index`
+    /// the integer base) sets the parent item at `base + index`.
+    pub fn setitem(&self, index: usize, value: LowLevelValue) -> bool {
+        let parent = self
+            ._parentable
+            .parentstructure(true)
+            .expect("a _subarray always has a parent");
+        match self
+            ._parentable
+            .parent_index()
+            .expect("a _subarray always has a parent index")
+        {
+            ParentIndex::Field(fieldname) => {
+                assert_eq!(index, 0);
+                let _ptr_obj::Struct(s) = parent else {
+                    panic!("_subarray over a struct field expects a Struct parent");
+                };
+                s._setattr(&fieldname, value)
+            }
+            ParentIndex::Item(base) => {
+                let _ptr_obj::Array(a) = parent else {
+                    panic!("_subarray over an array item expects an Array parent");
+                };
+                // As in `getitem`, `_ptr.__setitem__`'s `getbounds()` check
+                // rejects a negative effective index first; the `try_from` is a
+                // backstop for direct container access.
+                let effective = base + index as i64;
+                let effective = usize::try_from(effective)
+                    .expect("out-of-bounds write of a backward _subarray");
+                a.setitem(effective, value)
+            }
+        }
+    }
+
+    /// `_subarray._makeptr(parent, baseoffset_or_fieldname, solid)`
+    /// (lltype.py:2015-2040). `ITEMTYPE` is the parent struct field type
+    /// (`direct_fieldptr`, `_parent_index` a name) or the parent array `OF`
+    /// (`direct_arrayitems`/`direct_ptradd`, `_parent_index` an integer); the
+    /// subarray `_TYPE` is `FixedSizeArray(ITEMTYPE, 1)`. The `_subarray` is
+    /// memoized per `(parent, baseoffset_or_fieldname)` through [`SUBARRAY_CACHE`]
+    /// so re-deriving the same interior pointer reuses one container identity.
+    fn _makeptr(parent: &_ptr_obj, key: ParentIndex, solid: bool) -> Result<_ptr, String> {
+        let parent_id = match parent {
+            _ptr_obj::Struct(s) => s._identity,
+            _ptr_obj::Array(a) => a._identity,
+            _ => return Err("_subarray._makeptr: parent must be a struct or array".into()),
+        };
+        let cache_key = (parent_id, key.clone());
+        let cached = SUBARRAY_CACHE.with(|c| c.borrow().get(&cache_key).cloned());
+        let sub = match cached {
+            Some(sub) => sub,
+            None => {
+                let item_type = match (&key, parent) {
+                    (ParentIndex::Field(name), _ptr_obj::Struct(s)) => s
+                        .TYPE
+                        ._flds
+                        .get(name)
+                        .cloned()
+                        .ok_or_else(|| format!("{} has no field {name:?}", s.TYPE._name))?,
+                    (ParentIndex::Item(_), _ptr_obj::Array(a)) => match &a.TYPE {
+                        ArrayContainer::Array(t) => t.OF.clone(),
+                        ArrayContainer::FixedSizeArray(t) => t.OF.clone(),
+                    },
+                    _ => return Err("_subarray._makeptr: parent/index kind mismatch".into()),
+                };
+                let arraytype = FixedSizeArrayType::new(item_type, 1);
+                let sub = _subarray {
+                    _identity: fresh_low_level_container_identity(),
+                    TYPE: arraytype,
+                    _parentable: Parentable::new(),
+                };
+                sub._parentable
+                    .set_parent_structure(parent.clone(), parent._container_type(), key);
+                SUBARRAY_CACHE.with(|c| c.borrow_mut().insert(cache_key, sub.clone()));
+                sub
+            }
+        };
+        Ok(_ptr::new_with_solid(
+            Ptr {
+                TO: PtrTarget::FixedSizeArray(sub.TYPE.clone()),
+            },
+            Ok(Some(_ptr_obj::Subarray(sub))),
+            solid,
+        ))
+    }
+}
+
+/// `class _arraylenref(_parentable)` (lltype.py:2062-2101) — a pseudo-reference
+/// to the length field of an array, used only internally by `llmemory` to
+/// implement `ArrayLengthOffset`. Its `_TYPE` is always `FixedSizeArray(Signed,
+/// 1)` and `getitem(0)` reads the parent array's current length.
+///
+/// As with [`_subarray`] the weak `_cache` (array → `_arraylenref`) is
+/// modeled by the strong [`ARRAYLENREF_CACHE`] keyed on the parent array's
+/// container identity, so re-deriving a length pointer reuses one identity.
+/// `setitem` (in-place shrink, lltype.py:2084-2089) is ported in full.
+#[derive(Clone, Debug)]
+pub struct _arraylenref {
+    pub _identity: usize,
+    /// `self.array` (lltype.py:2072) — the parent array container whose length
+    /// this pseudo-reference projects.
+    pub array: Box<_array>,
+}
+
+impl PartialEq for _arraylenref {
+    fn eq(&self, other: &Self) -> bool {
+        self._identity == other._identity
+    }
+}
+
+impl Eq for _arraylenref {}
+
+impl Hash for _arraylenref {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self._identity.hash(state);
+    }
+}
+
+impl _arraylenref {
+    /// `_arraylenref.getlength` (lltype.py:2074-2075) — always 1.
+    pub fn getlength(&self) -> usize {
+        1
+    }
+
+    /// `_arraylenref.getbounds` (lltype.py:2077-2078) — always `(0, 1)`.
+    pub fn getbounds(&self) -> (i64, i64) {
+        (0, 1)
+    }
+
+    /// `_arraylenref.getitem` (lltype.py:2080-2082): `assert index == 0;
+    /// return self.array.getlength()`.
+    pub fn getitem(&self, index: usize) -> Option<LowLevelValue> {
+        assert_eq!(index, 0);
+        Some(LowLevelValue::Signed(self.array.getlength() as i64))
+    }
+
+    /// `_arraylenref.setitem` (lltype.py:2084-2089): `assert index == 0`;
+    /// writing a length smaller than the array's current length shrinks it in
+    /// place, an equal length is a no-op, and growing is rejected.
+    pub fn setitem(&self, index: usize, value: LowLevelValue) -> bool {
+        assert_eq!(index, 0);
+        let LowLevelValue::Signed(newlen) = value else {
+            panic!("_arraylenref.setitem expects a Signed length, got {value:?}");
+        };
+        let cur = self.array.getlength() as i64;
+        if newlen != cur {
+            if newlen > cur {
+                panic!("can't grow an array in-place");
+            }
+            self.array.shrinklength(newlen as usize);
+        }
+        true
+    }
+
+    /// `_arraylenref._makeptr(array, solid)` (lltype.py:2091-2098) —
+    /// `_ptr(Ptr(FixedSizeArray(Signed, 1)), lenref, solid)`. The `lenref` is
+    /// memoized per array container identity through [`ARRAYLENREF_CACHE`], so
+    /// re-deriving the length pointer of one array reuses its identity.
+    pub(crate) fn _makeptr(array: Box<_array>, solid: bool) -> _ptr {
+        let arraytype = FixedSizeArrayType::new(LowLevelType::Signed, 1);
+        let array_id = array._identity;
+        let cached = ARRAYLENREF_CACHE.with(|c| c.borrow().get(&array_id).cloned());
+        let lenref = cached.unwrap_or_else(|| {
+            let lenref = _arraylenref {
+                _identity: fresh_low_level_container_identity(),
+                array,
+            };
+            ARRAYLENREF_CACHE.with(|c| c.borrow_mut().insert(array_id, lenref.clone()));
+            lenref
+        });
+        _ptr::new_with_solid(
+            Ptr {
+                TO: PtrTarget::FixedSizeArray(arraytype),
+            },
+            Ok(Some(_ptr_obj::ArrayLenRef(lenref))),
+            solid,
+        )
+    }
+}
+
+/// `class _endmarker_struct(lltype._struct)` (lltype.py:168-183) — the sentinel
+/// `_struct` `ItemOffset.ref` returns for a reference *exactly* to the end of an
+/// array. Its `_TYPE` is the array item struct type `A`; it carries a parent
+/// link back to the array at the end index but exposes no fields — every field
+/// access raises (`__getattr__`, lltype.py:175-183).
+///
+/// The weak `_end_markers` memo (array → endmarker, llmemory.py:167) is not
+/// modeled (same value-model PRE-EXISTING-ADAPTATION as [`_subarray`] /
+/// [`_arraylenref`]); the address-fold consumer threads a single derived
+/// pointer and never re-derives, so the cache's `is`-identity stability is
+/// unexercised.
+#[derive(Clone, Debug)]
+pub struct _endmarker {
+    pub _identity: usize,
+    pub TYPE: StructType,
+    /// Shared `_parentable` state — `_endmarker_struct` is a `_struct`, hence a
+    /// `_parentable`, linked to the parent array at the end index.
+    _parentable: Arc<Parentable>,
+}
+
+impl PartialEq for _endmarker {
+    fn eq(&self, other: &Self) -> bool {
+        self._identity == other._identity
+    }
+}
+
+impl Eq for _endmarker {}
+
+impl Hash for _endmarker {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self._identity.hash(state);
+    }
+}
+
+impl _endmarker {
+    /// `_parentable._was_freed` — delegates to the shared `_parentable`.
+    pub fn _was_freed(&self) -> bool {
+        self._parentable.was_freed()
+    }
+
+    /// `_endmarker_struct(A, parent=array, parentindex=index)`
+    /// (llmemory.py:98-99) — the sentinel `_struct` linked to the parent array
+    /// at the end index. `A` is the array item struct type. Memoization per
+    /// array (`_end_markers`, llmemory.py:167) is the caller's responsibility,
+    /// matching upstream where the cache lives in `llmemory`.
+    pub(crate) fn new(item_type: &StructType, parent: &_ptr_obj, index: usize) -> _endmarker {
+        let endmarker = _endmarker {
+            _identity: fresh_low_level_container_identity(),
+            TYPE: item_type.clone(),
+            _parentable: Parentable::new(),
+        };
+        endmarker._parentable.set_parent_structure(
+            parent.clone(),
+            parent._container_type(),
+            ParentIndex::Item(index as i64),
+        );
+        endmarker
+    }
+
+    /// `_endmarker_struct(...)._as_ptr()` (llmemory.py:101) — a `Ptr(A)` to
+    /// this sentinel.
+    pub(crate) fn _as_ptr(&self, solid: bool) -> _ptr {
+        _ptr::new_with_solid(
+            Ptr {
+                TO: PtrTarget::Struct(self.TYPE.clone()),
+            },
+            Ok(Some(_ptr_obj::EndMarker(self.clone()))),
+            solid,
+        )
+    }
+}
+
+/// `direct_fieldptr(structptr, fieldname)` (lltype.py:1058-1071) — a
+/// `Ptr(FixedSizeArray(FIELD, 1))` interior pointer to `structptr.fieldname`,
+/// usable in `getarrayitem(0)`/`setarrayitem(0)`.
+pub fn direct_fieldptr(structptr: &_ptr, fieldname: &str) -> Result<_ptr, String> {
+    let curtype: LowLevelType = structptr._TYPE.TO.clone().into();
+    let LowLevelType::Struct(st) = &curtype else {
+        return Err("direct_fieldptr: not a struct".into());
+    };
+    if st._flds.get(fieldname).is_none() {
+        return Err(format!("{} has no field {fieldname:?}", st._name));
+    }
+    if !structptr.nonzero() {
+        return Err("direct_fieldptr: NULL argument".into());
+    }
+    let obj = structptr
+        ._obj()
+        .map_err(|_| "direct_fieldptr: delayed pointer".to_string())?;
+    _subarray::_makeptr(
+        &obj,
+        ParentIndex::Field(fieldname.to_string()),
+        structptr._solid,
+    )
+}
+
+/// `direct_arrayitems(arrayptr)` (lltype.py:1082-1093) — a
+/// `Ptr(FixedSizeArray(ITEM, 1))` interior pointer to the array's first item,
+/// usable in `getarrayitem(n)`/`direct_ptradd(n)`.
+pub fn direct_arrayitems(arrayptr: &_ptr) -> Result<_ptr, String> {
+    let curtype: LowLevelType = arrayptr._TYPE.TO.clone().into();
+    if !matches!(
+        curtype,
+        LowLevelType::Array(_) | LowLevelType::FixedSizeArray(_)
+    ) {
+        return Err("direct_arrayitems: not an array".into());
+    }
+    if !arrayptr.nonzero() {
+        return Err("direct_arrayitems: NULL argument".into());
+    }
+    let obj = arrayptr
+        ._obj()
+        .map_err(|_| "direct_arrayitems: delayed pointer".to_string())?;
+    _subarray::_makeptr(&obj, ParentIndex::Item(0), arrayptr._solid)
+}
+
+/// `direct_ptradd(ptr, n)` (lltype.py:1102-1114) — shift an interior pointer
+/// built by `direct_arrayitems()` forward/backward by `n` items, re-resolving
+/// it as `parent[base + n]`. The non-`_subarray` case (a bare nolength C-like
+/// array) delegates upstream to `rffi.ptradd`; pyre has no `rffi.ptradd`
+/// consumer for the address-fold path, so that case declines. A backward
+/// shift can make `base + n` negative — upstream builds the `_subarray`
+/// regardless and only errors on an out-of-bounds dereference, so the signed
+/// index is threaded straight through.
+pub fn direct_ptradd(ptr: &_ptr, n: i64) -> Result<_ptr, String> {
+    if !ptr.nonzero() {
+        return Err("direct_ptradd: NULL argument".into());
+    }
+    let obj = ptr
+        ._obj()
+        .map_err(|_| "direct_ptradd: delayed pointer".to_string())?;
+    if !matches!(&obj, _ptr_obj::Subarray(_)) {
+        return Err("direct_ptradd: non-_subarray needs rffi.ptradd — not ported".into());
+    }
+    let (parent, base) = parentlink(&obj);
+    let parent = parent.ok_or_else(|| "direct_ptradd: subarray has no parent".to_string())?;
+    let base = match base {
+        Some(ParentIndex::Item(j)) => j,
+        Some(ParentIndex::Field(_)) => {
+            return Err("direct_ptradd: cannot shift a struct-field subarray".into());
+        }
+        None => return Err("direct_ptradd: subarray has no parent index".into()),
+    };
+    _subarray::_makeptr(&parent, ParentIndex::Item(base + n), ptr._solid)
 }
 
 impl PartialEq for _struct {
@@ -1127,6 +1800,47 @@ impl PartialEq for _array {
 impl Eq for _array {}
 
 impl Hash for _array {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self._identity.hash(state);
+    }
+}
+
+/// `_subarray` (lltype.py:1956-2059) — a `_parentable` view over one slot of
+/// a parent array or struct field, built only by [`direct_fieldptr`] /
+/// [`direct_arrayitems`]. Its `_TYPE` is always `FixedSizeArray(ITEMTYPE, 1)`,
+/// and its `_parent_index` is the parent field name (`direct_fieldptr`) or the
+/// item base offset (`direct_arrayitems`); `getitem(i)` redirects into the
+/// parent at `base + i`.
+///
+/// Upstream's `_keepparent` slot and the `_subarray._cache` weak memo
+/// (lltype.py:1964-1969, 2015-2040) are not modelled. `_keepparent` only
+/// cooperates with Python's GC (the parent is held strongly here, the same
+/// value-model adaptation as [`ParentLink::parent_container`]). The cache
+/// gives `is`-identity stability to independently re-derived interior
+/// pointers; without it two `direct_fieldptr(p, "f")` calls yield subarrays
+/// with distinct `_identity`. The sole consumer here (`AddressOffset::ref` →
+/// the address-fold table) threads a single derived pointer and never
+/// re-derives, so the stability difference is unexercised. Convergence path:
+/// move containers behind an arena/`Rc` registry — the same epic that gates
+/// the [`_wref`] strong-ref adaptation — then a real weak-keyed cache can land.
+#[derive(Clone, Debug)]
+pub struct _subarray {
+    pub _identity: usize,
+    pub TYPE: FixedSizeArrayType,
+    /// Shared `_parentable` state (lltype.py:1654-1666); `_subarray` is a
+    /// `_parentable` (lltype.py:1956).
+    _parentable: Arc<Parentable>,
+}
+
+impl PartialEq for _subarray {
+    fn eq(&self, other: &Self) -> bool {
+        self._identity == other._identity
+    }
+}
+
+impl Eq for _subarray {}
+
+impl Hash for _subarray {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self._identity.hash(state);
     }
@@ -1359,6 +2073,11 @@ impl _array {
 
     pub fn getbounds(&self) -> (usize, usize) {
         (0, self.items.lock().unwrap().len())
+    }
+
+    /// `_array.shrinklength` (lltype.py:1920-1921): `del self.items[newlength:]`.
+    pub fn shrinklength(&self, newlength: usize) {
+        self.items.lock().unwrap().truncate(newlength);
     }
 
     /// Cloned out of the lock guard — same rationale as `_struct::_getattr`.
@@ -1665,12 +2384,14 @@ impl _ptr {
     ///
     /// Pyre-port scope: down-casts and identity casts are supported.
     /// Null casts return `Ptr(target)._defl()`. Up-casts surface a
-    /// structured error: the `_parentable` liveness chain exists, but
-    /// `_parentstructure()` must hand back the *parent container object*
-    /// to re-point at, which the value model cannot do yet (no
-    /// `_identity`→container map — see [`ParentLink::parent`]). Exception
-    /// classes only ever down-cast for `ll_cast_to_object`, the immediate
-    /// consumer, so the up-cast arm is unreached today.
+    /// structured error: the object-returning `_parentstructure()`
+    /// ([`Parentable::parentstructure`]) now lands, but the upstream up-cast
+    /// also reads the parent's first inlined field by name and identity-checks
+    /// it against `struc` (`getattr(parent, PARENTTYPE._names[0]) != struc`)
+    /// before re-pointing — a container-`getattr`/identity-compare walk that is
+    /// a later slice. Exception classes only ever down-cast for
+    /// `ll_cast_to_object`, the immediate consumer, so the up-cast arm is
+    /// unreached today.
     pub fn _cast_to(&self, ptrtype: &Ptr) -> Result<_ptr, String> {
         let down_or_up = castable(ptrtype, &self._TYPE)?;
         if down_or_up == 0 {
@@ -1681,9 +2402,55 @@ impl _ptr {
             return Ok(ptrtype._defl());
         }
         if down_or_up < 0 {
-            return Err(format!(
-                "_ptr._cast_to: up-cast (depth={down_or_up}) requires \
-                 _parentstructure() — not yet ported",
+            // upstream (lltype.py:1436-1451): walk *up* the parent chain
+            // `-down_or_up` times via `_parentstructure()`, checking at each
+            // step that `struc` is the parent's first inlined field, then
+            // verify the widened-to type equals `PTRTYPE.TO`.
+            let mut u = -down_or_up;
+            let mut struc = self
+                ._obj()
+                .map_err(|_| "_ptr._cast_to: delayed pointer".to_string())?;
+            let mut parent_type: Option<LowLevelType> = None;
+            while u > 0 {
+                let parentable = parentable_of_obj(&struc)
+                    .ok_or_else(|| format!("_ptr._cast_to: {struc:?} is not a _parentable"))?;
+                let parent = parentable
+                    .parentstructure(true)
+                    .ok_or_else(|| format!("widening to trash: {:?}", self._TYPE))?;
+                let ptype = parentable
+                    .parent_type()
+                    .expect("a parented container always records its parent type");
+                // `getattr(parent, PARENTTYPE._names[0]) != struc` → InvalidCast.
+                let LowLevelType::Struct(ps) = &ptype else {
+                    return Err(format!(
+                        "_ptr._cast_to: up-cast parent {ptype:?} is not a struct"
+                    ));
+                };
+                let first_name = ps._names.first().ok_or_else(|| {
+                    format!("_ptr._cast_to: parent struct {:?} has no fields", ps._name)
+                })?;
+                match first_field_container(&parent, first_name) {
+                    Some(fc) if fc == struc => {}
+                    _ => {
+                        return Err(format!("InvalidCast: {:?} to {:?}", self._TYPE, ptrtype));
+                    }
+                }
+                struc = parent;
+                parent_type = Some(ptype);
+                u -= 1;
+            }
+            let parent_type = parent_type.expect("an up-cast walks at least once");
+            let target_type: LowLevelType = ptrtype.TO.clone().into();
+            if parent_type != target_type {
+                return Err(format!(
+                    "widening {:?} inside {parent_type:?} instead of {target_type:?}",
+                    self._TYPE
+                ));
+            }
+            return Ok(_ptr::new_with_solid(
+                ptrtype.clone(),
+                Ok(Some(struc)),
+                self._solid,
             ));
         }
         // upstream: `while down_or_up: p = getattr(p, typeOf(p).TO._names[0])`.
@@ -1754,6 +2521,9 @@ impl _ptr {
             _ptr_obj::Array(_) => panic!("{:?} instance is not callable", self._TYPE),
             _ptr_obj::Opaque(_) => panic!("{:?} instance is not callable", self._TYPE),
             _ptr_obj::Wref(_) => panic!("{:?} instance is not callable", self._TYPE),
+            _ptr_obj::Subarray(_) => panic!("{:?} instance is not callable", self._TYPE),
+            _ptr_obj::ArrayLenRef(_) => panic!("{:?} instance is not callable", self._TYPE),
+            _ptr_obj::EndMarker(_) => panic!("{:?} instance is not callable", self._TYPE),
         }
     }
 
@@ -1789,6 +2559,9 @@ impl _ptr {
             _ptr_obj::Array(obj) => LowLevelValue::Array(Box::new(obj.clone())),
             _ptr_obj::Opaque(obj) => LowLevelValue::Opaque(Box::new(obj.clone())),
             _ptr_obj::Wref(_) => panic!("weakref has no container parent"),
+            _ptr_obj::Subarray(_) => panic!("subarray has no container parent"),
+            _ptr_obj::ArrayLenRef(_) => panic!("arraylenref has no container parent"),
+            _ptr_obj::EndMarker(_) => panic!("endmarker has no container parent"),
         }
     }
 
@@ -1903,14 +2676,27 @@ impl _ptr {
                     Some(LowLevelType::Array(_) | LowLevelType::FixedSizeArray(_))
                 )
         ) {
-            let _ptr_obj::Array(obj) = self
+            // `o = self._obj.getitem(i)` (lltype.py:1294) — dispatched to the
+            // container, so `_subarray`/`_arraylenref` interior pointers (from
+            // `direct_fieldptr`/`direct_arrayitems`/`ArrayLengthOffset`) read
+            // through too, not only `_array`.
+            let obj = self
                 ._obj()
-                .map_err(|_| format!("delayed pointer {:?} is not an array", self._TYPE))?
-            else {
-                panic!("array pointer must expose an array object");
-            };
-            if let Some(value) = obj.getitem(index) {
-                return Ok(self._expose(InteriorOffset::Index(index), value.clone()));
+                .map_err(|_| format!("delayed pointer {:?} is not an array", self._TYPE))?;
+            // `start, stop = self._obj.getbounds(); if not (start <= i < stop):
+            // raise IndexError("array index out of bounds")` (lltype.py:1289-
+            // 1293) — the bounds check happens at the pointer level, ahead of
+            // the container `getitem`, so an out-of-range index (a backward
+            // `_subarray`, a non-zero `_arraylenref`) is an array-index error
+            // rather than a container panic.
+            if let Some((start, stop)) = obj.container_getbounds() {
+                let i = index as i64;
+                if !(start <= i && i < stop) {
+                    return Err(format!("array index out of bounds: {index}"));
+                }
+            }
+            if let Some(value) = obj.container_getitem(index) {
+                return Ok(self._expose(InteriorOffset::Index(index), value));
             }
             return Err(format!("array index out of bounds: {index}"));
         }
@@ -2018,16 +2804,24 @@ impl _ptr {
                 self._TYPE, expected, got_t
             ));
         }
-        let _ptr_obj::Array(obj) = self
-            ._obj0
-            .as_mut()
-            .map_err(|_| format!("delayed pointer {:?} is not an array", self._TYPE))?
-            .as_mut()
-            .expect("non-null array pointer must expose an underlying object")
-        else {
-            panic!("array pointer must expose an array object");
-        };
-        if !obj.setitem(index, val) {
+        // `self._obj.setitem(i, val)` (lltype.py:1320) — dispatched to the
+        // container so `_subarray` interior pointers (from `direct_fieldptr`/
+        // `direct_arrayitems`) write back through their parent, not only
+        // `_array`. Element-type validity is checked above and re-asserted by
+        // the container's own `setitem`.
+        let obj = self
+            ._obj()
+            .map_err(|_| format!("delayed pointer {:?} is not an array", self._TYPE))?;
+        // `start, stop = self._obj.getbounds(); if not (start <= i < stop):
+        // raise IndexError` (lltype.py:1314-1318) — bounds-check at the pointer
+        // level before dispatching, mirroring `__getitem__`.
+        if let Some((start, stop)) = obj.container_getbounds() {
+            let i = index as i64;
+            if !(start <= i && i < stop) {
+                return Err(format!("array index out of bounds: {index}"));
+            }
+        }
+        if !obj.container_setitem(index, val) {
             return Err(format!("array index out of bounds: {index}"));
         }
         Ok(())
@@ -3473,6 +4267,47 @@ pub fn cast_pointer(ptrtype: &Ptr, ptr: &_ptr) -> Result<_ptr, String> {
 }
 
 impl _ptr_obj {
+    /// `self._obj.getitem(i)` for the array-like containers `_ptr.__getitem__`
+    /// reaches (lltype.py:1294): `_array`, plus the `_subarray` /
+    /// `_arraylenref` interior containers built by `direct_fieldptr` /
+    /// `direct_arrayitems` / `ArrayLengthOffset`. Non-array containers (and an
+    /// `_endmarker`, which exposes no items) yield `None`.
+    fn container_getitem(&self, index: usize) -> Option<LowLevelValue> {
+        match self {
+            _ptr_obj::Array(a) => a.getitem(index),
+            _ptr_obj::Subarray(s) => s.getitem(index),
+            _ptr_obj::ArrayLenRef(l) => l.getitem(index),
+            _ => None,
+        }
+    }
+
+    /// `self._obj.setitem(i, val)` (lltype.py:1320). `_arraylenref.setitem` is
+    /// the in-place length shrink (lltype.py:2084-2089); the field-less
+    /// `_endmarker` exposes no items, so it declines.
+    fn container_setitem(&self, index: usize, value: LowLevelValue) -> bool {
+        match self {
+            _ptr_obj::Array(a) => a.setitem(index, value),
+            _ptr_obj::Subarray(s) => s.setitem(index, value),
+            _ptr_obj::ArrayLenRef(l) => l.setitem(index, value),
+            _ => false,
+        }
+    }
+
+    /// `self._obj.getbounds()` (lltype.py:1289, :1314) — the `(start, stop)`
+    /// the `_ptr.__getitem__`/`__setitem__` bounds check consults before
+    /// dispatching to `getitem`/`setitem`. Non-array containers yield `None`.
+    fn container_getbounds(&self) -> Option<(i64, i64)> {
+        match self {
+            _ptr_obj::Array(a) => {
+                let (start, stop) = a.getbounds();
+                Some((start as i64, stop as i64))
+            }
+            _ptr_obj::Subarray(s) => Some(s.getbounds()),
+            _ptr_obj::ArrayLenRef(l) => Some(l.getbounds()),
+            _ => None,
+        }
+    }
+
     /// `lltype.typeOf(container)` — the container's `LowLevelType`.
     fn _container_type(&self) -> LowLevelType {
         match self {
@@ -3486,6 +4321,11 @@ impl _ptr_obj {
             },
             _ptr_obj::Opaque(o) => LowLevelType::Opaque(Box::new(o.TYPE.clone())),
             _ptr_obj::Wref(_) => WEAKREF.clone(),
+            _ptr_obj::Subarray(s) => LowLevelType::FixedSizeArray(Box::new(s.TYPE.clone())),
+            _ptr_obj::ArrayLenRef(_) => LowLevelType::FixedSizeArray(Box::new(
+                FixedSizeArrayType::new(LowLevelType::Signed, 1),
+            )),
+            _ptr_obj::EndMarker(e) => LowLevelType::Struct(Box::new(e.TYPE.clone())),
         }
     }
 
@@ -3498,7 +4338,9 @@ impl _ptr_obj {
             _ptr_obj::Struct(s) => s._was_freed(),
             _ptr_obj::Array(a) => a._was_freed(),
             _ptr_obj::Opaque(o) => o._was_freed(),
-            _ptr_obj::Func(_) | _ptr_obj::Wref(_) => false,
+            _ptr_obj::Subarray(s) => s._was_freed(),
+            _ptr_obj::EndMarker(e) => e._was_freed(),
+            _ptr_obj::Func(_) | _ptr_obj::Wref(_) | _ptr_obj::ArrayLenRef(_) => false,
         }
     }
 
@@ -3511,7 +4353,9 @@ impl _ptr_obj {
             _ptr_obj::Struct(s) => s._parentable.check(),
             _ptr_obj::Array(a) => a._parentable.check(),
             _ptr_obj::Opaque(o) => o._parentable.check(),
-            _ptr_obj::Func(_) | _ptr_obj::Wref(_) => {}
+            _ptr_obj::Subarray(s) => s._parentable.check(),
+            _ptr_obj::EndMarker(e) => e._parentable.check(),
+            _ptr_obj::Func(_) | _ptr_obj::Wref(_) | _ptr_obj::ArrayLenRef(_) => {}
         }
     }
 
@@ -3519,14 +4363,15 @@ impl _ptr_obj {
     /// (lltype.py:2178). `_parentable._normalizedcontainer`
     /// (lltype.py:1721-1735) walks `_struct`/`_array` up to the enclosing
     /// struct while this container is the parent's first inlined field;
-    /// that walk returns the *parent container object*, so it needs the
-    /// deferred object-returning `_parentstructure()` (blocked: the value
-    /// model has no `_identity`→container map — see [`ParentLink::parent`]).
+    /// that walk returns the *parent container object* via the object-returning
+    /// `_parentstructure()` ([`Parentable::parentstructure`]), which now lands;
+    /// wiring the `_parentable._normalizedcontainer` first-field promotion on
+    /// top of it is a later slice.
     /// KNOWN GAP: if a first-inlined substruct/array is hidden behind an
     /// opaque, our eq/hash keys on the substruct where upstream would key on
     /// the promoted parent. The reachable pyre path (cast_opaque_ptr off a
     /// top-level GC allocation) has no parent, so it is already normal here;
-    /// the gap closes when `_parentstructure()` lands.
+    /// the gap closes when the promotion walk is wired.
     fn _normalizedcontainer(&self) -> _ptr_obj {
         match self {
             _ptr_obj::Opaque(o) => o._normalizedcontainer(),
@@ -5978,6 +6823,251 @@ mod tests {
     }
 
     #[test]
+    fn parentlink_returns_parent_container_and_field_index() {
+        // `_parentstructure()` / `parentlink` (lltype.py:1704-1714, 1123-1128):
+        // an inlined sub-container hands back its enclosing container *object*
+        // and the field index it occupies; a top-level allocation has no
+        // parent.
+        let inner = StructType::new("inner", vec![("x".into(), LowLevelType::Signed)]);
+        let outer = StructType::_build(
+            "outer",
+            vec![("sub".into(), LowLevelType::Struct(Box::new(inner)))],
+            GcKind::Gc,
+            vec![],
+            vec![],
+        );
+        let parent = malloc(
+            LowLevelType::Struct(Box::new(outer)),
+            None,
+            MallocFlavor::Gc,
+            true,
+        )
+        .unwrap();
+        let parent_obj = parent._obj().unwrap();
+        let _ptr_obj::Struct(parent_container) = parent_obj.clone() else {
+            panic!("gc struct ptr must hold a Struct container");
+        };
+        let Some(LowLevelValue::Struct(sub)) = parent_container._getattr("sub") else {
+            panic!("inlined sub field must hold a Struct container");
+        };
+
+        // A top-level allocation is unparented.
+        assert!(matches!(parentlink(&parent_obj), (None, None)));
+
+        // The inlined sub-struct points back at `outer` via field "sub", and
+        // the returned parent is the same container object (by identity).
+        let (got_parent, got_index) = parentlink(&_ptr_obj::Struct(*sub));
+        assert_eq!(got_parent, Some(parent_obj));
+        match got_index {
+            Some(ParentIndex::Field(name)) => assert_eq!(name, "sub"),
+            other => panic!("expected Field(\"sub\"), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn direct_fieldptr_makes_subarray_over_struct_field() {
+        // `direct_fieldptr(structptr, "x")` (lltype.py:1058-1071) → a
+        // `Ptr(FixedSizeArray(Signed, 1))` interior pointer whose `getitem(0)`
+        // reads the named field; a missing field declines.
+        let s = StructType::gc(
+            "point",
+            vec![
+                ("x".into(), LowLevelType::Signed),
+                ("y".into(), LowLevelType::Signed),
+            ],
+        );
+        let p = malloc(
+            LowLevelType::Struct(Box::new(s)),
+            None,
+            MallocFlavor::Gc,
+            true,
+        )
+        .unwrap();
+        let _ptr_obj::Struct(container) = p._obj().unwrap() else {
+            panic!("gc struct ptr must hold a Struct container");
+        };
+        container._setattr("x", LowLevelValue::Signed(7));
+
+        let fieldptr = direct_fieldptr(&p, "x").unwrap();
+        let _ptr_obj::Subarray(sub) = fieldptr._obj().unwrap() else {
+            panic!("direct_fieldptr yields a _subarray interior pointer");
+        };
+        assert_eq!(sub.getitem(0), Some(LowLevelValue::Signed(7)));
+
+        assert!(direct_fieldptr(&p, "z").is_err());
+    }
+
+    #[test]
+    fn subarray_makeptr_memoizes_per_parent_and_offset() {
+        // `_subarray._cache` (lltype.py:2015-2040): re-deriving the same
+        // interior pointer reuses one `_subarray` (so the two fakeaddresses
+        // would compare equal); a different field is a distinct container.
+        let s = StructType::gc(
+            "point",
+            vec![
+                ("x".into(), LowLevelType::Signed),
+                ("y".into(), LowLevelType::Signed),
+            ],
+        );
+        let p = malloc(
+            LowLevelType::Struct(Box::new(s)),
+            None,
+            MallocFlavor::Gc,
+            true,
+        )
+        .unwrap();
+        let x1 = direct_fieldptr(&p, "x").unwrap();
+        let x2 = direct_fieldptr(&p, "x").unwrap();
+        let y1 = direct_fieldptr(&p, "y").unwrap();
+        assert_eq!(x1._obj().unwrap(), x2._obj().unwrap());
+        assert_ne!(x1._obj().unwrap(), y1._obj().unwrap());
+    }
+
+    #[test]
+    fn arraylenref_makeptr_memoizes_per_array() {
+        // `_arraylenref._cache` (lltype.py:2091-2098): the length pointer of
+        // one array is the same container on re-derivation.
+        let array_ty = LowLevelType::Array(Box::new(ArrayType::gc(LowLevelType::Signed)));
+        let arrayptr = malloc(array_ty, Some(3), MallocFlavor::Gc, true).unwrap();
+        let _ptr_obj::Array(arr) = arrayptr._obj().unwrap() else {
+            panic!("array ptr must hold an Array container");
+        };
+        let l1 = _arraylenref::_makeptr(Box::new(arr.clone()), true);
+        let l2 = _arraylenref::_makeptr(Box::new(arr), true);
+        assert_eq!(l1._obj().unwrap(), l2._obj().unwrap());
+    }
+
+    #[test]
+    fn ptr_getitem_setitem_through_subarray_interior_pointer() {
+        // `_ptr.__getitem__/__setitem__` delegate to `self._obj.getitem/
+        // setitem` (lltype.py:1294/1320), so a `direct_fieldptr` _subarray
+        // pointer both reads and writes the parent struct field.
+        let s = StructType::gc("point", vec![("x".into(), LowLevelType::Signed)]);
+        let p = malloc(
+            LowLevelType::Struct(Box::new(s)),
+            None,
+            MallocFlavor::Gc,
+            true,
+        )
+        .unwrap();
+        let _ptr_obj::Struct(container) = p._obj().unwrap() else {
+            panic!("gc struct ptr must hold a Struct container");
+        };
+        container._setattr("x", LowLevelValue::Signed(5));
+
+        let mut fieldptr = direct_fieldptr(&p, "x").unwrap();
+        assert_eq!(fieldptr.getitem(0).unwrap(), LowLevelValue::Signed(5));
+        fieldptr.setitem(0, LowLevelValue::Signed(9)).unwrap();
+        // The write lands in the parent struct field, visible both through
+        // the parent container and a re-read of the interior pointer.
+        assert_eq!(container._getattr("x"), Some(LowLevelValue::Signed(9)));
+        assert_eq!(fieldptr.getitem(0).unwrap(), LowLevelValue::Signed(9));
+    }
+
+    #[test]
+    fn direct_ptradd_shifts_backward_into_range() {
+        // `direct_ptradd(ptr, n)` (lltype.py:1102-1114) builds a `_subarray`
+        // at `base + n` for any sign of the shift; only an out-of-bounds
+        // dereference errors. Shift forward to base 2 then back to base 1.
+        let array_ty = LowLevelType::Array(Box::new(ArrayType::gc(LowLevelType::Signed)));
+        let arrayptr = malloc(array_ty, Some(3), MallocFlavor::Gc, true).unwrap();
+        let _ptr_obj::Array(arr) = arrayptr._obj().unwrap() else {
+            panic!("array ptr must hold an Array container");
+        };
+        assert!(arr.setitem(1, LowLevelValue::Signed(20)));
+
+        let items = direct_arrayitems(&arrayptr).unwrap();
+        let fwd = direct_ptradd(&items, 2).unwrap();
+        let back = direct_ptradd(&fwd, -1).unwrap();
+        let _ptr_obj::Subarray(sub) = back._obj().unwrap() else {
+            panic!("direct_ptradd yields a _subarray interior pointer");
+        };
+        assert_eq!(sub.getitem(0), Some(LowLevelValue::Signed(20)));
+    }
+
+    #[test]
+    fn arraylenref_setitem_shrinks_parent_array() {
+        // `_arraylenref.setitem(0, smaller)` (lltype.py:2084-2089) shrinks the
+        // parent array in place; the length pointer then reads the new length.
+        let array_ty = LowLevelType::Array(Box::new(ArrayType::gc(LowLevelType::Signed)));
+        let arrayptr = malloc(array_ty, Some(3), MallocFlavor::Gc, true).unwrap();
+        let _ptr_obj::Array(arr) = arrayptr._obj().unwrap() else {
+            panic!("array ptr must hold an Array container");
+        };
+        let mut lenptr = _arraylenref::_makeptr(Box::new(arr.clone()), true);
+        assert_eq!(lenptr.getitem(0).unwrap(), LowLevelValue::Signed(3));
+        lenptr.setitem(0, LowLevelValue::Signed(1)).unwrap();
+        assert_eq!(lenptr.getitem(0).unwrap(), LowLevelValue::Signed(1));
+        // The shrink is visible through the shared parent container.
+        assert_eq!(arr.getlength(), 1);
+    }
+
+    #[test]
+    fn ptr_getitem_arraylenref_out_of_bounds_errs_not_panics() {
+        // `_ptr.__getitem__` bounds-checks via `getbounds()` (lltype.py:1289-
+        // 1293) ahead of the container. An `_arraylenref` spans `(0, 1)`, so
+        // index 1 is an out-of-bounds error, not the `assert index == 0` panic.
+        let array_ty = LowLevelType::Array(Box::new(ArrayType::gc(LowLevelType::Signed)));
+        let arrayptr = malloc(array_ty, Some(3), MallocFlavor::Gc, true).unwrap();
+        let _ptr_obj::Array(arr) = arrayptr._obj().unwrap() else {
+            panic!("array ptr must hold an Array container");
+        };
+        let lenptr = _arraylenref::_makeptr(Box::new(arr), true);
+        assert!(lenptr.getitem(0).is_ok());
+        assert!(lenptr.getitem(1).is_err());
+    }
+
+    #[test]
+    fn ptr_getitem_backward_subarray_index_zero_errs_not_panics() {
+        // A backward `direct_ptradd` base shifts the `_subarray` bounds so that
+        // index 0 falls below `start` (lltype.py:1989-1994); `_ptr.__getitem__`
+        // reports an out-of-bounds error rather than reaching the negative
+        // parent index that would panic the container `getitem`.
+        let array_ty = LowLevelType::Array(Box::new(ArrayType::gc(LowLevelType::Signed)));
+        let arrayptr = malloc(array_ty, Some(3), MallocFlavor::Gc, true).unwrap();
+        let items = direct_arrayitems(&arrayptr).unwrap();
+        let back = direct_ptradd(&items, -1).unwrap();
+        // bounds = (0 - (-1), 3 - (-1)) = (1, 4): index 0 is below start.
+        assert!(back.getitem(0).is_err());
+        // index 1 reads the parent's item 0 (effective = -1 + 1 = 0).
+        assert!(back.getitem(1).is_ok());
+    }
+
+    #[test]
+    fn cast_pointer_up_cast_round_trips_through_first_field() {
+        // A `GcStruct` whose first inlined field is the base struct models the
+        // rclass inheritance layout. A pointer down-cast to the base field
+        // up-casts back to the original container (lltype.py:1436-1451).
+        let object_t = StructType::gc("object", vec![("typeptr".into(), LowLevelType::Signed)]);
+        let sub_t = StructType::gc(
+            "subclass",
+            vec![
+                (
+                    "super".into(),
+                    LowLevelType::Struct(Box::new(object_t.clone())),
+                ),
+                ("x".into(), LowLevelType::Signed),
+            ],
+        );
+        let subptr = malloc(
+            LowLevelType::Struct(Box::new(sub_t.clone())),
+            None,
+            MallocFlavor::Gc,
+            true,
+        )
+        .unwrap();
+
+        let object_ptrtype =
+            Ptr::from_container_type(LowLevelType::Struct(Box::new(object_t))).unwrap();
+        let sub_ptrtype = Ptr::from_container_type(LowLevelType::Struct(Box::new(sub_t))).unwrap();
+
+        // down-cast to the base field, then up-cast back to the subclass.
+        let objptr = cast_pointer(&object_ptrtype, &subptr).unwrap();
+        let back = cast_pointer(&sub_ptrtype, &objptr).unwrap();
+        assert_eq!(back, subptr);
+    }
+
+    #[test]
     #[should_panic(expected = "accessing freed container")]
     fn double_free_panics() {
         // Epic G slice 3: `_free` calls `_check` first, so a second `_free`
@@ -6075,6 +7165,87 @@ mod tests {
             vec![LowLevelValue::Signed(1)],
         );
         arr.setitem(1, LowLevelValue::Char('\0'));
+    }
+
+    #[test]
+    fn fakeaddress_eq_compares_underlying_container() {
+        // `fakeaddress.__eq__` (llmemory.py:496-508): NULL == NULL, NULL is
+        // unequal to a live address, and two `Fake` addresses are equal iff
+        // they wrap the same underlying container.
+        let ptr_t = Ptr {
+            TO: PtrTarget::Struct(StructType::gc(
+                "S",
+                vec![("x".into(), LowLevelType::Signed)],
+            )),
+        };
+        let p = ptr_t._example();
+        let same = p.clone(); // same container identity
+        let other = ptr_t._example(); // fresh _container_example → distinct identity
+
+        let null = _address::Null;
+        let fake = _address::Fake(Box::new(p));
+        let fake_same = _address::Fake(Box::new(same));
+        let fake_other = _address::Fake(Box::new(other));
+
+        assert!(null._eq(&_address::Null));
+        assert!(!null._eq(&fake));
+        assert!(!fake._eq(&null));
+        assert!(fake._eq(&fake_same));
+        assert!(!fake._eq(&fake_other));
+
+        // `__ne__` is the negation of `__eq__`.
+        assert!(null._ne(&fake));
+        assert!(!fake._ne(&fake_same));
+        assert!(fake._ne(&fake_other));
+    }
+
+    #[test]
+    fn fakeaddress_ordering_null_is_smallest() {
+        // `fakeaddress.__lt__`/`__le__`/`__gt__`/`__ge__` (llmemory.py:515-538):
+        // NULL is the smallest address; two non-NULL addresses cannot be
+        // ordered (TypeError → `Err`).
+        let ptr_t = Ptr {
+            TO: PtrTarget::Struct(StructType::gc(
+                "S",
+                vec![("x".into(), LowLevelType::Signed)],
+            )),
+        };
+        let null = _address::Null;
+        let fake = _address::Fake(Box::new(ptr_t._example()));
+        let fake2 = _address::Fake(Box::new(ptr_t._example()));
+
+        assert!(!null.nonzero());
+        assert!(fake.nonzero());
+
+        assert_eq!(null._lt(&fake), Ok(true)); // NULL < non-null
+        assert_eq!(fake._lt(&null), Ok(false)); // non-null < NULL
+        assert_eq!(null._lt(&null), Ok(false)); // NULL < NULL
+        assert!(fake._lt(&fake2).is_err()); // two non-NULL → TypeError
+
+        assert_eq!(fake._ge(&null), Ok(true)); // not (non-null < NULL)
+        assert_eq!(null._le(&fake), Ok(true)); // NULL <= non-null
+        assert_eq!(fake._gt(&null), Ok(true)); // non-null > NULL
+        assert!(fake._le(&fake2).is_err()); // composes the un-orderable `<`
+    }
+
+    #[test]
+    fn fakeaddress_delta_zero_when_equal_else_typeerror() {
+        // `fakeaddress.__sub__` (llmemory.py:477-487), fakeaddress arm: equal
+        // addresses subtract to 0; distinct addresses raise TypeError (`Err`).
+        let ptr_t = Ptr {
+            TO: PtrTarget::Struct(StructType::gc(
+                "S",
+                vec![("x".into(), LowLevelType::Signed)],
+            )),
+        };
+        let p = ptr_t._example();
+        let fake = _address::Fake(Box::new(p.clone()));
+        let fake_same = _address::Fake(Box::new(p));
+        let fake_other = _address::Fake(Box::new(ptr_t._example()));
+
+        assert_eq!(_address::Null._delta(&_address::Null), Ok(0));
+        assert_eq!(fake._delta(&fake_same), Ok(0));
+        assert!(fake._delta(&fake_other).is_err());
     }
 
     #[test]

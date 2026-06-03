@@ -3032,10 +3032,10 @@ impl ConstValue {
             ConstValue::Graphs(graphs) => Some(!graphs.is_empty()),
             ConstValue::LowLevelType(_) => Some(true),
             ConstValue::LLPtr(ptr) => Some(ptr.nonzero()),
-            ConstValue::LLAddress(addr) => Some(matches!(
-                addr,
-                crate::translator::rtyper::lltypesystem::lltype::_address::Fake(_)
-            )),
+            // `fakeaddress.__nonzero__` (llmemory.py:490-491) = `ptr is not
+            // None`: a `Fake` and an (odd, tagged-int) `IntCast` are both
+            // non-NULL, only `Null` is false. Single-sourced on `nonzero`.
+            ConstValue::LLAddress(addr) => Some(addr.nonzero()),
             ConstValue::Function(_) => Some(true),
             ConstValue::HostObject(_) => Some(true),
             ConstValue::Atom(_) => Some(true),
@@ -4730,6 +4730,29 @@ mod tests {
         assert_ne!(n1, n2);
         assert!(n1.starts_with('v'));
         assert!(n2.starts_with('v'));
+    }
+
+    #[test]
+    fn lladdress_truthy_mirrors_fakeaddress_nonzero() {
+        // `bool(fakeaddress)` = `__nonzero__` = `ptr is not None`
+        // (llmemory.py:490-491): a NULL address is false, a `Fake` and an
+        // odd tagged-int `IntCast` are both true.
+        use lltype::{_address, Ptr, PtrTarget, StructType};
+        let ptr_t = Ptr {
+            TO: PtrTarget::Struct(StructType::gc(
+                "S",
+                vec![("x".into(), lltype::LowLevelType::Signed)],
+            )),
+        };
+        assert_eq!(ConstValue::LLAddress(_address::Null).truthy(), Some(false));
+        assert_eq!(
+            ConstValue::LLAddress(_address::Fake(Box::new(ptr_t._example()))).truthy(),
+            Some(true)
+        );
+        assert_eq!(
+            ConstValue::LLAddress(_address::IntCast(0x41)).truthy(),
+            Some(true)
+        );
     }
 
     #[test]

@@ -44,6 +44,8 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use crate::flowspace::model::ConstValue;
+use crate::translator::rtyper::lltypesystem::llmemory::{cast_adr_to_ptr, cast_int_to_adr};
+use crate::translator::rtyper::lltypesystem::lltype::{_address, LowLevelType};
 
 /// Fold callable signature. `None` mirrors upstream's "exception →
 /// no fold" path (`constfold.py:34-46`).
@@ -753,6 +755,160 @@ pub fn op_ptr_iszero(args: &[ConstValue]) -> Option<ConstValue> {
     }
 }
 
+/// RPython `op_adr_eq` (`opimpl.py:520-523`): `checkadr; return addr1 ==
+/// addr2`. The `checkadr` discipline (operands must be `Address`) is the
+/// `LLAddress` carrier match; non-address operands refuse to fold. The
+/// `==` delegates to `fakeaddress.__eq__` ([`_address::_eq`]).
+pub fn op_adr_eq(args: &[ConstValue]) -> Option<ConstValue> {
+    match args {
+        [ConstValue::LLAddress(a), ConstValue::LLAddress(b)] => Some(ConstValue::Bool(a._eq(b))),
+        _ => None,
+    }
+}
+
+/// RPython `op_adr_ne` (`opimpl.py:525-528`): `checkadr; return addr1 !=
+/// addr2`, delegating to `fakeaddress.__ne__` ([`_address::_ne`]).
+pub fn op_adr_ne(args: &[ConstValue]) -> Option<ConstValue> {
+    match args {
+        [ConstValue::LLAddress(a), ConstValue::LLAddress(b)] => Some(ConstValue::Bool(a._ne(b))),
+        _ => None,
+    }
+}
+
+/// RPython `op_adr_lt` (`opimpl.py:510-513`): `checkadr; return addr1 <
+/// addr2`. `fakeaddress.__lt__` raises `TypeError` for two non-NULL
+/// addresses; `Err` there maps to "no fold" (the op stays runtime).
+pub fn op_adr_lt(args: &[ConstValue]) -> Option<ConstValue> {
+    match args {
+        [ConstValue::LLAddress(a), ConstValue::LLAddress(b)] => a._lt(b).ok().map(ConstValue::Bool),
+        _ => None,
+    }
+}
+
+/// RPython `op_adr_le` (`opimpl.py:515-518`): `checkadr; return addr1 <=
+/// addr2`, delegating to `fakeaddress.__le__` ([`_address::_le`]).
+pub fn op_adr_le(args: &[ConstValue]) -> Option<ConstValue> {
+    match args {
+        [ConstValue::LLAddress(a), ConstValue::LLAddress(b)] => a._le(b).ok().map(ConstValue::Bool),
+        _ => None,
+    }
+}
+
+/// RPython `op_adr_gt` (`opimpl.py:530-533`): `checkadr; return addr1 >
+/// addr2`, delegating to `fakeaddress.__gt__` ([`_address::_gt`]).
+pub fn op_adr_gt(args: &[ConstValue]) -> Option<ConstValue> {
+    match args {
+        [ConstValue::LLAddress(a), ConstValue::LLAddress(b)] => a._gt(b).ok().map(ConstValue::Bool),
+        _ => None,
+    }
+}
+
+/// RPython `op_adr_ge` (`opimpl.py:535-538`): `checkadr; return addr1 >=
+/// addr2`, delegating to `fakeaddress.__ge__` ([`_address::_ge`]).
+pub fn op_adr_ge(args: &[ConstValue]) -> Option<ConstValue> {
+    match args {
+        [ConstValue::LLAddress(a), ConstValue::LLAddress(b)] => a._ge(b).ok().map(ConstValue::Bool),
+        _ => None,
+    }
+}
+
+/// RPython `op_adr_delta` (`opimpl.py:551-553`): `checkadr(addr1);
+/// checkadr(addr2); return addr1 - addr2`. With two fakeaddresses the
+/// subtraction ([`_address::_delta`], `fakeaddress.__sub__` llmemory.py:481-484)
+/// yields `Signed 0` when the addresses are equal and raises `TypeError`
+/// otherwise; the `Err` maps to "no fold" so the op stays runtime.
+///
+pub fn op_adr_delta(args: &[ConstValue]) -> Option<ConstValue> {
+    match args {
+        [ConstValue::LLAddress(a), ConstValue::LLAddress(b)] => {
+            a._delta(b).ok().map(ConstValue::Int)
+        }
+        _ => None,
+    }
+}
+
+/// RPython `op_adr_add` (`opimpl.py:540-543`): `checkadr(addr); assert
+/// typeOf(offset) is Signed; return addr + offset`. `fakeaddress.__add__`
+/// (llmemory.py:469-474) raises `NullAddressError` on a NULL base and
+/// otherwise returns `fakeaddress(offset.ref(self.ptr))`. The offset is the
+/// `ConstValue::AddressOffset` carrier; [`AddressOffset::r#ref`] declines
+/// (→ no fold) for the bases / element kinds it cannot navigate yet.
+pub fn op_adr_add(args: &[ConstValue]) -> Option<ConstValue> {
+    match args {
+        [ConstValue::LLAddress(addr), ConstValue::AddressOffset(off)] => {
+            // Only a `Fake` base carries a `_ptr` to navigate; a NULL base is
+            // `NullAddressError` and an int-cast base has no container pointer
+            // — both decline to fold.
+            let _address::Fake(ptr) = addr else {
+                return None;
+            };
+            off.r#ref(ptr)
+                .ok()
+                .map(|p| ConstValue::LLAddress(_address::Fake(Box::new(p))))
+        }
+        // `fakeaddress.__add__`: a plain `0` offset returns the address
+        // unchanged (llmemory.py:474-475). The `offset` is typed `Signed`,
+        // which admits an `Int` carrier as well as `AddressOffset`
+        // (`Signed::contains_value`).
+        [ConstValue::LLAddress(addr), ConstValue::Int(0)] => {
+            Some(ConstValue::LLAddress(addr.clone()))
+        }
+        _ => None,
+    }
+}
+
+/// RPython `op_adr_sub` (`opimpl.py:545-549`): `addr - offset`. With an
+/// `AddressOffset` operand `fakeaddress.__sub__` is `self + (-offset)`
+/// (llmemory.py:476-477); a non-negatable offset (`AddressOffset::neg` →
+/// `None`) declines, as does the underlying `op_adr_add`.
+pub fn op_adr_sub(args: &[ConstValue]) -> Option<ConstValue> {
+    match args {
+        [ConstValue::LLAddress(addr), ConstValue::AddressOffset(off)] => {
+            let neg = off.clone().neg()?;
+            op_adr_add(&[
+                ConstValue::LLAddress(addr.clone()),
+                ConstValue::AddressOffset(neg),
+            ])
+        }
+        // `fakeaddress.__sub__`: a plain `0` offset returns self
+        // (llmemory.py:486-487).
+        [ConstValue::LLAddress(addr), ConstValue::Int(0)] => {
+            Some(ConstValue::LLAddress(addr.clone()))
+        }
+        _ => None,
+    }
+}
+
+/// RPython `op_cast_int_to_adr(int)` (`opimpl.py:487-489`):
+/// `llmemory.cast_int_to_adr(int)` (llmemory.py:788-796). Folds the
+/// `cast_int_to_ptr` + `cast_ptr_to_adr` composition: `0` → NULL address,
+/// an odd integer → the tagged-int [`_address::IntCast`] carrier, an even
+/// non-zero integer → declines (its upstream `ll2ctypes` resolution is
+/// runtime-only). See [`cast_int_to_adr`].
+pub fn op_cast_int_to_adr(args: &[ConstValue]) -> Option<ConstValue> {
+    match args {
+        [ConstValue::Int(n)] => cast_int_to_adr(*n).map(ConstValue::LLAddress),
+        _ => None,
+    }
+}
+
+/// RPython `op_cast_adr_to_ptr(TYPE, adr)` (`opimpl.py:482-485`,
+/// `need_result_type = True`): `llmemory.cast_adr_to_ptr(adr, TYPE)`. `TYPE`
+/// is the operation result's concretetype (`constfold.py:36` passes RESTYPE
+/// first); it must be a `Ptr`. An int-cast address declines (no tagged-int
+/// round-trip ported).
+pub fn op_cast_adr_to_ptr(restype: &LowLevelType, args: &[ConstValue]) -> Option<ConstValue> {
+    let [ConstValue::LLAddress(adr)] = args else {
+        return None;
+    };
+    let LowLevelType::Ptr(expected) = restype else {
+        return None;
+    };
+    cast_adr_to_ptr(adr, expected)
+        .ok()
+        .map(|p| ConstValue::LLPtr(Box::new(p)))
+}
+
 // ---- cast_*_to_* (primitive-only carriers) ------------------------
 
 /// RPython `op_cast_int_to_float` (`opimpl.py:388-391`).
@@ -1241,18 +1397,19 @@ pub fn op_unlikely(args: &[ConstValue]) -> Option<ConstValue> {
 //      op_direct_ptradd         :192-202
 //    Convergence: typed raw-pointer carrier with bounds metadata.
 //
-// 4. llmemory address carrier (12 ops):
-//      op_cast_adr_to_ptr       :482-485
-//      op_cast_int_to_adr       :487-489
-//      op_adr_lt/le/eq/ne/gt/ge :510-538
-//      op_adr_add/sub/delta     :540-553
-//    Convergence: `llmemory::Address` carrier port.
+// 4. llmemory address carrier — all landed (adr_lt/le/eq/ne/gt/ge/
+//    delta/add/sub + cast_int_to_adr + cast_adr_to_ptr). `cast_adr_to_ptr`
+//    (`opimpl.py:482-485`, `need_result_type`) folds through the
+//    RESTYPE threaded by `constfold.rs::eval_llop`.
 //
 // 5. lltype.cast_primitive / cast_pointer with TYPE arg (2 ops):
 //      op_cast_primitive        :383-386
 //      op_cast_pointer          :477-480
-//    Convergence: thread the LLOp's RESTYPE descriptor through the
-//    `FoldFn` signature (current shape is `&[ConstValue]` only).
+//    Both are `need_result_type`; `constfold.rs::eval_llop` already
+//    threads RESTYPE (see group 4). Convergence: add the RESTYPE-taking
+//    `op_cast_primitive` / `op_cast_pointer` bodies + their eval_llop
+//    arms (cast_pointer needs the `LLPtr` carrier walk, cast_primitive
+//    the primitive-reinterpret over RESTYPE).
 //
 // 6. r_longlonglong / r_ulonglonglong 128-bit integer carrier
 //    (6 ops):
@@ -1441,6 +1598,17 @@ pub fn get_op_impl(opname: &str) -> Option<FoldFn> {
         m.insert("ptr_ne", op_ptr_ne);
         m.insert("ptr_nonzero", op_ptr_nonzero);
         m.insert("ptr_iszero", op_ptr_iszero);
+
+        m.insert("adr_lt", op_adr_lt);
+        m.insert("adr_le", op_adr_le);
+        m.insert("adr_eq", op_adr_eq);
+        m.insert("adr_ne", op_adr_ne);
+        m.insert("adr_gt", op_adr_gt);
+        m.insert("adr_ge", op_adr_ge);
+        m.insert("adr_delta", op_adr_delta);
+        m.insert("adr_add", op_adr_add);
+        m.insert("adr_sub", op_adr_sub);
+        m.insert("cast_int_to_adr", op_cast_int_to_adr);
 
         m.insert("cast_int_to_float", op_cast_int_to_float);
         m.insert("cast_float_to_int", op_cast_float_to_int);
@@ -1846,5 +2014,205 @@ mod tests {
         let f = get_op_impl("int_add").expect("int_add must be in registry");
         assert_eq!(f(&[i(1), i(2)]), Some(i(3)));
         assert!(get_op_impl("definitely_not_an_op").is_none());
+    }
+
+    #[test]
+    fn adr_eq_ne_fold_over_address_carrier() {
+        use crate::translator::rtyper::lltypesystem::lltype::_address;
+        let null = || ConstValue::LLAddress(_address::Null);
+        let f_eq = get_op_impl("adr_eq").expect("adr_eq must be registered");
+        let f_ne = get_op_impl("adr_ne").expect("adr_ne must be registered");
+        // NULL == NULL folds to true; != folds to false.
+        assert_eq!(f_eq(&[null(), null()]), Some(ConstValue::Bool(true)));
+        assert_eq!(f_ne(&[null(), null()]), Some(ConstValue::Bool(false)));
+        // `checkadr`: non-address operands refuse to fold.
+        assert_eq!(f_eq(&[i(1), i(1)]), None);
+
+        // Ordering ops are registered; NULL < NULL folds to false, and a
+        // non-orderable pair (handled in lltype tests) declines to fold here.
+        for op in ["adr_lt", "adr_le", "adr_gt", "adr_ge"] {
+            assert!(get_op_impl(op).is_some(), "{op} must be registered");
+        }
+        let f_lt = get_op_impl("adr_lt").unwrap();
+        assert_eq!(f_lt(&[null(), null()]), Some(ConstValue::Bool(false)));
+
+        // adr_delta of two equal addresses folds to Signed 0; non-address
+        // operands refuse to fold (`checkadr`).
+        let f_delta = get_op_impl("adr_delta").expect("adr_delta must be registered");
+        assert_eq!(f_delta(&[null(), null()]), Some(ConstValue::Int(0)));
+        assert_eq!(f_delta(&[i(1), i(1)]), None);
+    }
+
+    #[test]
+    fn adr_add_folds_through_container_array_navigation() {
+        use crate::translator::rtyper::lltypesystem::llmemory::AddressOffset;
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            _address, _ptr_obj, ArrayType, LowLevelType, MallocFlavor, ParentIndex, StructType,
+            malloc, parentlink,
+        };
+
+        // `GcArray(Struct('item', ('x', Signed)))` of length 3.
+        let item = StructType::new("item", vec![("x".into(), LowLevelType::Signed)]);
+        let item_ty = LowLevelType::Struct(Box::new(item));
+        let array_ty = LowLevelType::Array(Box::new(ArrayType::gc(item_ty.clone())));
+        let arrayptr = malloc(array_ty.clone(), Some(3), MallocFlavor::Gc, true).unwrap();
+
+        let f_add = get_op_impl("adr_add").expect("adr_add must be registered");
+
+        // `arrayadr + ArrayItemsOffset(ARRAY)` → pointer to item 0.
+        let arrayadr = ConstValue::LLAddress(_address::Fake(Box::new(arrayptr.clone())));
+        let items_off = ConstValue::AddressOffset(AddressOffset::ArrayItemsOffset(array_ty));
+        let Some(ConstValue::LLAddress(_address::Fake(item0ptr))) = f_add(&[arrayadr, items_off])
+        else {
+            panic!("ArrayItemsOffset fold must yield a fake address");
+        };
+
+        // `firstitemadr + ItemOffset(ITEM, 1)` → pointer to item 1.
+        let item0adr = ConstValue::LLAddress(_address::Fake(item0ptr));
+        let item_off = ConstValue::AddressOffset(AddressOffset::ItemOffset {
+            TYPE: item_ty,
+            repeat: 1,
+        });
+        let Some(ConstValue::LLAddress(_address::Fake(item1ptr))) = f_add(&[item0adr, item_off])
+        else {
+            panic!("ItemOffset fold must yield a fake address");
+        };
+
+        // The navigated pointer is the array's element at index 1: its
+        // parentlink points back at the array container with item index 1.
+        let (parent, index) = parentlink(&item1ptr._obj().unwrap());
+        assert!(matches!(parent, Some(_ptr_obj::Array(_))));
+        match index {
+            Some(ParentIndex::Item(1)) => {}
+            Some(ParentIndex::Field(ref name)) if name == "item1" => {}
+            other => panic!("expected item index 1, got {other:?}"),
+        }
+
+        // A NULL base is `NullAddressError` and declines to fold.
+        assert_eq!(
+            op_adr_add(&[
+                ConstValue::LLAddress(_address::Null),
+                ConstValue::AddressOffset(AddressOffset::ArrayItemsOffset(LowLevelType::Signed)),
+            ]),
+            None
+        );
+    }
+
+    #[test]
+    fn adr_add_sub_zero_offset_returns_address_unchanged() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            _address, ArrayType, LowLevelType, MallocFlavor, malloc,
+        };
+
+        // `fakeaddress.__add__/__sub__`: a plain `0` offset returns the address
+        // unchanged (llmemory.py:474-475, 486-487). The `Int(0)` carrier is a
+        // valid `Signed` offset alongside `AddressOffset`.
+        let array_ty = LowLevelType::Array(Box::new(ArrayType::gc(LowLevelType::Signed)));
+        let arrayptr = malloc(array_ty, Some(1), MallocFlavor::Gc, true).unwrap();
+        let addr = ConstValue::LLAddress(_address::Fake(Box::new(arrayptr)));
+
+        assert_eq!(
+            op_adr_add(&[addr.clone(), ConstValue::Int(0)]),
+            Some(addr.clone())
+        );
+        assert_eq!(
+            op_adr_sub(&[addr.clone(), ConstValue::Int(0)]),
+            Some(addr.clone())
+        );
+        // A non-zero plain int is `NotImplemented` upstream → declines to fold.
+        assert_eq!(op_adr_add(&[addr.clone(), ConstValue::Int(8)]), None);
+        assert_eq!(op_adr_sub(&[addr, ConstValue::Int(8)]), None);
+    }
+
+    #[test]
+    fn adr_add_folds_through_primitive_array_navigation() {
+        use crate::translator::rtyper::lltypesystem::llmemory::AddressOffset;
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            _address, _ptr_obj, ArrayType, LowLevelType, LowLevelValue, MallocFlavor, malloc,
+        };
+
+        // `GcArray(Signed)` of length 3, item 1 set to 42.
+        let array_ty = LowLevelType::Array(Box::new(ArrayType::gc(LowLevelType::Signed)));
+        let arrayptr = malloc(array_ty.clone(), Some(3), MallocFlavor::Gc, true).unwrap();
+        let _ptr_obj::Array(arr) = arrayptr._obj().unwrap() else {
+            panic!("array ptr must hold an Array container");
+        };
+        assert!(arr.setitem(1, LowLevelValue::Signed(42)));
+
+        let f_add = get_op_impl("adr_add").expect("adr_add must be registered");
+
+        // `arrayadr + ArrayItemsOffset(ARRAY)` → `direct_arrayitems` interior
+        // pointer to item 0 (a `_subarray`).
+        let arrayadr = ConstValue::LLAddress(_address::Fake(Box::new(arrayptr)));
+        let items_off = ConstValue::AddressOffset(AddressOffset::ArrayItemsOffset(array_ty));
+        let Some(ConstValue::LLAddress(_address::Fake(item0ptr))) = f_add(&[arrayadr, items_off])
+        else {
+            panic!("ArrayItemsOffset fold must yield a fake address");
+        };
+
+        // `firstitemadr + ItemOffset(Signed, 1)` → `direct_ptradd` to item 1.
+        let item0adr = ConstValue::LLAddress(_address::Fake(item0ptr));
+        let item_off = ConstValue::AddressOffset(AddressOffset::ItemOffset {
+            TYPE: LowLevelType::Signed,
+            repeat: 1,
+        });
+        let Some(ConstValue::LLAddress(_address::Fake(item1ptr))) = f_add(&[item0adr, item_off])
+        else {
+            panic!("ItemOffset fold must yield a fake address");
+        };
+
+        // The item-1 subarray reads the parent array's element 1 (= 42).
+        let _ptr_obj::Subarray(sub) = item1ptr._obj().unwrap() else {
+            panic!("a primitive-array interior pointer holds a _subarray");
+        };
+        assert_eq!(sub.getitem(0), Some(LowLevelValue::Signed(42)));
+    }
+
+    #[test]
+    fn cast_int_to_adr_folds_per_cast_int_to_ptr_semantics() {
+        use crate::translator::rtyper::lltypesystem::lltype::_address;
+        let cast = get_op_impl("cast_int_to_adr").expect("cast_int_to_adr must be registered");
+        // 0 routes through `cast_int_to_ptr` → `nullptr` → the NULL address.
+        assert_eq!(cast(&[i(0)]), Some(ConstValue::LLAddress(_address::Null)));
+        // An odd integer becomes the tagged-int `IntCast` fakeaddress carrier.
+        assert_eq!(
+            cast(&[i(0x41)]),
+            Some(ConstValue::LLAddress(_address::IntCast(0x41)))
+        );
+        // An even non-zero integer raises `ValueError` upstream (its
+        // `ll2ctypes` resolution is runtime-only) → declines.
+        assert_eq!(cast(&[i(0x40)]), None);
+        // A non-integer operand declines.
+        assert_eq!(cast(&[f(1.0)]), None);
+    }
+
+    #[test]
+    fn cast_adr_to_ptr_folds_fake_and_null_addresses() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            _address, ArrayType, LowLevelType, MallocFlavor, malloc,
+        };
+
+        let array_ty = LowLevelType::Array(Box::new(ArrayType::gc(LowLevelType::Signed)));
+        let arrayptr = malloc(array_ty, Some(3), MallocFlavor::Gc, true).unwrap();
+        let restype = LowLevelType::Ptr(Box::new(arrayptr._TYPE.clone()));
+
+        // A fake address over a live ptr casts back to the same-typed ptr.
+        let fakeadr = ConstValue::LLAddress(_address::Fake(Box::new(arrayptr.clone())));
+        assert_eq!(
+            op_cast_adr_to_ptr(&restype, &[fakeadr]),
+            Some(ConstValue::LLPtr(Box::new(arrayptr)))
+        );
+
+        // A NULL address casts to the null ptr of the expected type.
+        let nulladr = ConstValue::LLAddress(_address::Null);
+        let Some(ConstValue::LLPtr(p)) = op_cast_adr_to_ptr(&restype, &[nulladr]) else {
+            panic!("a NULL address must cast to a null ptr");
+        };
+        assert!(p._obj0.as_ref().is_ok_and(|o| o.is_none()));
+
+        // An int-cast (odd, tagged-int) address declines — the inverse
+        // `cast_int_to_ptr` would need the unmodeled tagged-int `_ptr` payload.
+        let intadr = ConstValue::LLAddress(_address::IntCast(0x41));
+        assert_eq!(op_cast_adr_to_ptr(&restype, &[intadr]), None);
     }
 }

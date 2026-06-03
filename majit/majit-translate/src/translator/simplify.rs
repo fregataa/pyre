@@ -384,6 +384,9 @@ pub fn get_graph_for_call(arg: &Hlvalue, translator: &TranslationContext) -> Opt
         Ok(lltype::_ptr_obj::Array(_)) => return None,
         Ok(lltype::_ptr_obj::Opaque(_)) => return None,
         Ok(lltype::_ptr_obj::Wref(_)) => return None,
+        Ok(lltype::_ptr_obj::Subarray(_)) => return None,
+        Ok(lltype::_ptr_obj::ArrayLenRef(_)) => return None,
+        Ok(lltype::_ptr_obj::EndMarker(_)) => return None,
         Err(lltype::DelayedPointer) => return None,
     };
     // upstream: `try: return funcobj.graph except AttributeError: return None`.

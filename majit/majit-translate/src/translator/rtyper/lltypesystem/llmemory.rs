@@ -2,14 +2,27 @@
 //! low-level memory addresses.
 #![allow(non_snake_case)]
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::LazyLock;
 
 use crate::annotator::model::{KnownType, SomeObjectBase, SomeObjectTrait, SomeValue};
 use crate::flowspace::model::ConstValue;
 use crate::translator::rtyper::lltypesystem::lltype::{
-    _ptr, _ptr_obj, _wref, GcKind, LowLevelType, Ptr, PtrTarget, WEAKREF_PTR, cast_opaque_ptr,
-    cast_pointer, nullptr,
+    _address, _arraylenref, _endmarker, _ptr, _ptr_obj, _wref, GcKind, LowLevelType, ParentIndex,
+    Ptr, PtrTarget, WEAKREF_PTR, cast_opaque_ptr, cast_pointer, container_value_as_ptr,
+    direct_arrayitems, direct_fieldptr, direct_ptradd, nullptr, parentlink,
 };
+
+thread_local! {
+    /// `_end_markers` (llmemory.py:167) — `<array of STRUCT>` identity →
+    /// its `_endmarker`. `ItemOffset.ref` memoizes the sentinel per parent
+    /// array so two references to one array's end share an identity.
+    /// Upstream uses a `WeakKeyDictionary`; the translator never frees these
+    /// containers, so a strong map keyed by identity is the consistent
+    /// adaptation (as for `_subarray._cache` / `_arraylenref._cache`).
+    static END_MARKERS: RefCell<HashMap<usize, _endmarker>> = RefCell::new(HashMap::new());
+}
 
 /// `class SomeAddress(SomeObject)` (llmemory.py:573-590).
 /// Annotation for low-level Address values. `immutable = True`.
@@ -297,6 +310,201 @@ impl AddressOffset {
             }
             AddressOffset::ArrayLengthOffset(_) => Ok(0),
         }
+    }
+
+    /// `AddressOffset.ref(ptr)` (llmemory.py per variant: ItemOffset:79,
+    /// FieldOffset:198, CompositeOffset:261, ArrayItemsOffset:289) — navigate
+    /// `ptr` by this offset to the interior pointer it denotes.
+    ///
+    /// The container-element cases resolve via [`parentlink`] + container
+    /// `getitem`/`_getattr` and hand back a `_container._as_ptr()`. The
+    /// primitive/pointer-element cases (upstream `direct_ptradd`/
+    /// `direct_fieldptr`/`direct_arrayitems`) build `_subarray` interior
+    /// pointers, the array-end marker builds an `_endmarker_struct`, and
+    /// `ArrayLengthOffset` builds an `_arraylenref`. A case still returns `Err`
+    /// (so a constant fold over the offset declines) only when the base pointer
+    /// cannot be navigated — a delayed/NULL `ptr` or an element kind the
+    /// container does not model.
+    pub fn r#ref(&self, ptr: &_ptr) -> Result<_ptr, String> {
+        match self {
+            AddressOffset::ItemOffset { TYPE, repeat } => item_offset_ref(TYPE, *repeat, ptr),
+            AddressOffset::FieldOffset { TYPE, fldname } => field_offset_ref(TYPE, fldname, ptr),
+            AddressOffset::ArrayItemsOffset(TYPE) => array_items_offset_ref(TYPE, ptr),
+            // llmemory.py:261-264 `for item in self.offsets: ptr = item.ref(ptr)`.
+            AddressOffset::CompositeOffset(offsets) => {
+                let mut p = ptr.clone();
+                for o in offsets {
+                    p = o.r#ref(&p)?;
+                }
+                Ok(p)
+            }
+            AddressOffset::ArrayLengthOffset(_) => array_length_offset_ref(ptr),
+        }
+    }
+}
+
+/// `ItemOffset.ref(firstitemptr)` (llmemory.py:79-110), array-of-containers
+/// arm: `parent, index = parentlink(firstitemptr._obj); index += repeat;
+/// parent.getitem(index)._as_ptr()`.
+fn item_offset_ref(ty: &LowLevelType, repeat: i64, firstitemptr: &_ptr) -> Result<_ptr, String> {
+    let a: LowLevelType = firstitemptr._TYPE.TO.clone().into();
+    if &a != ty {
+        // `A` is a FixedSizeArray (or nolength Array) of primitives or pointers
+        // whose item type matches `self.TYPE` → `direct_ptradd(firstitemptr,
+        // repeat)` (llmemory.py:104-109). Any other `A` is a `TypeError`
+        // (llmemory.py:110-111) and declines to fold.
+        if primitive_array_matches_item(&a, ty) {
+            return direct_ptradd(firstitemptr, repeat);
+        }
+        return Err(format!("ItemOffset::ref: got {a:?}, expected {ty:?}"));
+    }
+    let obj = firstitemptr
+        ._obj()
+        .map_err(|_| "ItemOffset::ref: delayed pointer".to_string())?;
+    let (parent, index) = parentlink(&obj);
+    let parent = parent.ok_or_else(|| format!("{firstitemptr:?} is not within a container"))?;
+    let _ptr_obj::Array(arr) = &parent else {
+        return Err(format!("{firstitemptr:?} is not within an array"));
+    };
+    // `if isinstance(index, str): assert index.startswith('item'); index = int(index[4:])`.
+    let base: i64 = match index {
+        Some(ParentIndex::Item(j)) => j,
+        Some(ParentIndex::Field(name)) => name
+            .strip_prefix("item")
+            .and_then(|s| s.parse::<i64>().ok())
+            .ok_or_else(|| format!("unexpected array parentindex {name:?}"))?,
+        None => return Err("parent container has no index".into()),
+    };
+    let index = base + repeat;
+    if index < 0 {
+        return Err(format!("ItemOffset::ref index {index} out of range"));
+    }
+    if index as usize == arr.getlength() {
+        // `for references exactly to the end of the array` →
+        // `_end_markers[parent]` else `_endmarker_struct(A, parent, index)`,
+        // then `._as_ptr()` (llmemory.py:93-101). `A == self.TYPE` here, so
+        // `ty` is the array item struct type.
+        let LowLevelType::Struct(item_struct) = ty else {
+            return Err(format!(
+                "ItemOffset::ref end marker on non-struct item {ty:?}"
+            ));
+        };
+        let array_id = arr._identity;
+        let cached = END_MARKERS.with(|c| c.borrow().get(&array_id).cloned());
+        let endmarker = cached.unwrap_or_else(|| {
+            let e = _endmarker::new(item_struct, &parent, index as usize);
+            END_MARKERS.with(|c| c.borrow_mut().insert(array_id, e.clone()));
+            e
+        });
+        return Ok(endmarker._as_ptr(true));
+    }
+    let item = arr
+        .getitem(index as usize)
+        .ok_or_else(|| format!("ItemOffset::ref item {index} out of range"))?;
+    container_value_as_ptr(&item, true)
+        .ok_or_else(|| "ItemOffset::ref: item is not a container".into())
+}
+
+/// `FieldOffset.ref(struct)` (llmemory.py:198-209), container-field arm:
+/// `substruct = struct._obj._getattr(fldname); substruct._as_ptr()`.
+fn field_offset_ref(ty: &LowLevelType, fldname: &str, struct_ptr: &_ptr) -> Result<_ptr, String> {
+    // `if lltype.typeOf(struct).TO != self.TYPE: struct = cast_pointer(
+    //  Ptr(self.TYPE), struct)` (llmemory.py:199-200) — up-cast to the
+    // offset's struct type when the pointer is to an inner sub-struct.
+    let cur: LowLevelType = struct_ptr._TYPE.TO.clone().into();
+    let casted;
+    let struct_ptr: &_ptr = if &cur != ty {
+        casted = cast_pointer(&Ptr::from_container_type(ty.clone())?, struct_ptr)?;
+        &casted
+    } else {
+        struct_ptr
+    };
+    let LowLevelType::Struct(st) = ty else {
+        return Err(format!("FieldOffset::ref on non-struct {ty:?}"));
+    };
+    let field_ty = st
+        ._flds
+        .get(fldname)
+        .ok_or_else(|| format!("{} has no field {fldname:?}", st._name))?;
+    if !field_ty.is_container_type() {
+        // primitive field → `direct_fieldptr(struct, fldname)`
+        // (llmemory.py:205-206).
+        return direct_fieldptr(struct_ptr, fldname);
+    }
+    let obj = struct_ptr
+        ._obj()
+        .map_err(|_| "FieldOffset::ref: delayed pointer".to_string())?;
+    let _ptr_obj::Struct(s) = &obj else {
+        return Err(format!("FieldOffset::ref target is not a struct: {obj:?}"));
+    };
+    let sub = s
+        ._getattr(fldname)
+        .ok_or_else(|| format!("struct has no field {fldname:?}"))?;
+    container_value_as_ptr(&sub, true)
+        .ok_or_else(|| "FieldOffset::ref: field is not a container".into())
+}
+
+/// `ArrayItemsOffset.ref(arrayptr)` (llmemory.py:289-296), array-of-containers
+/// arm: `arrayptr._obj.getitem(0)._as_ptr()`.
+fn array_items_offset_ref(ty: &LowLevelType, arrayptr: &_ptr) -> Result<_ptr, String> {
+    let of = array_of_type(ty)?;
+    if !of.is_container_type() {
+        // primitive array → `direct_arrayitems(arrayptr)` (llmemory.py:297).
+        return direct_arrayitems(arrayptr);
+    }
+    let obj = arrayptr
+        ._obj()
+        .map_err(|_| "ArrayItemsOffset::ref: delayed pointer".to_string())?;
+    let _ptr_obj::Array(arr) = &obj else {
+        return Err(format!(
+            "ArrayItemsOffset::ref target is not an array: {obj:?}"
+        ));
+    };
+    let item0 = arr
+        .getitem(0)
+        .ok_or_else(|| "ArrayItemsOffset::ref: empty array".to_string())?;
+    container_value_as_ptr(&item0, true)
+        .ok_or_else(|| "ArrayItemsOffset::ref: item is not a container".into())
+}
+
+/// `ArrayLengthOffset.ref(arrayptr)` (llmemory.py:336-338):
+/// `_arraylenref._makeptr(arrayptr._obj, arrayptr._solid)` — a
+/// `Ptr(FixedSizeArray(Signed, 1))` whose `getitem(0)` reads the array length.
+fn array_length_offset_ref(arrayptr: &_ptr) -> Result<_ptr, String> {
+    let obj = arrayptr
+        ._obj()
+        .map_err(|_| "ArrayLengthOffset::ref: delayed pointer".to_string())?;
+    let _ptr_obj::Array(arr) = obj else {
+        return Err(format!(
+            "ArrayLengthOffset::ref target is not an array: {obj:?}"
+        ));
+    };
+    Ok(_arraylenref::_makeptr(Box::new(arr), arrayptr._solid))
+}
+
+/// `TYPE.OF` for an array lltype.
+fn array_of_type(ty: &LowLevelType) -> Result<LowLevelType, String> {
+    match ty {
+        LowLevelType::Array(t) => Ok(t.OF.clone()),
+        LowLevelType::FixedSizeArray(t) => Ok(t.OF.clone()),
+        _ => Err(format!("expected an array type, got {ty:?}")),
+    }
+}
+
+/// `(isinstance(A, FixedSizeArray) or (isinstance(A, Array) and
+/// A._hints.get('nolength', False))) and array_item_type_match(A.OF,
+/// self.TYPE)` (llmemory.py:104-107) — the predicate routing `ItemOffset.ref`
+/// to `direct_ptradd`. A `direct_arrayitems`-derived pointer is always a
+/// `FixedSizeArray(ITEM, 1)`, so that is the live arm; the nolength-`Array`
+/// arm covers bare C-like arrays. `array_item_type_match` is modelled by
+/// item-type equality.
+fn primitive_array_matches_item(a: &LowLevelType, ty: &LowLevelType) -> bool {
+    match a {
+        LowLevelType::FixedSizeArray(t) => &t.OF == ty,
+        LowLevelType::Array(t) => {
+            matches!(t._hints.get("nolength"), Some(ConstValue::Bool(true))) && &t.OF == ty
+        }
+        _ => false,
     }
 }
 
@@ -628,6 +836,49 @@ pub fn cast_any_ptr(expected: &Ptr, ptr: &_ptr) -> Result<_ptr, String> {
         return cast_opaque_ptr(expected, ptr);
     }
     cast_pointer(expected, ptr)
+}
+
+/// `cast_int_to_adr(int)` (llmemory.py:788-796) — `cast_ptr_to_adr` of
+/// `cast_int_to_ptr(_NONGCREF, int)` (lltype.py:2372-2377). The `AddressAsInt`
+/// branch (llmemory.py:789-790) is moot — pyre carries no `AddressAsInt`
+/// constant. Folding the composition three ways:
+/// - `int == 0`: `cast_int_to_ptr` returns `nullptr(_NONGCREF.TO)`, whose
+///   `_obj0` is `None`, so `cast_ptr_to_adr` (`fakeaddress.__init__`,
+///   llmemory.py:454-456) normalizes the null ptr to the NULL address.
+/// - odd `int`: `cast_int_to_ptr` builds a tagged-integer `_ptr`
+///   (`_obj0 = oddint`, never `None`), kept by `cast_ptr_to_adr` as the
+///   [`_address::IntCast`] carrier (pyre's tagged-int fakeaddress).
+/// - even non-zero `int`: `cast_int_to_ptr` raises `ValueError`
+///   (lltype.py:2375-2376); upstream then resolves it through the runtime
+///   `ll2ctypes._int2obj` table (llmemory.py:793-795), which has no
+///   translation-time value — the fold declines.
+pub fn cast_int_to_adr(int: i64) -> Option<_address> {
+    if int == 0 {
+        Some(_address::Null)
+    } else if int & 1 == 1 {
+        Some(_address::IntCast(int))
+    } else {
+        None
+    }
+}
+
+/// `cast_adr_to_ptr(adr, EXPECTED_TYPE)` (llmemory.py:757-758) =
+/// `adr._cast_to_ptr(EXPECTED_TYPE)` (llmemory.py:538-543). `_fixup()` is the
+/// identity here (the llarena fake-arena rebind is unported). A live address
+/// re-casts its pointer with [`cast_any_ptr`]; a NULL address yields
+/// `nullptr(EXPECTED_TYPE.TO)` — so the `cast_int_to_adr(0)` round-trip lands
+/// here through the `Null` arm. An int-cast (odd, tagged) address would need
+/// the inverse `cast_int_to_ptr` to rebuild a tagged-integer `_ptr`, whose
+/// payload pyre's `_ptr._obj0` cannot carry yet (same model gap noted on
+/// `cast_opaque_ptr`), so it declines.
+pub fn cast_adr_to_ptr(adr: &_address, expected: &Ptr) -> Result<_ptr, String> {
+    match adr {
+        _address::Fake(ptr) => cast_any_ptr(expected, ptr),
+        _address::Null => nullptr(expected.TO.clone().into()),
+        _address::IntCast(_) => {
+            Err("cast_adr_to_ptr on a tagged-int address needs the cast_int_to_ptr round-trip — the tagged-int _ptr payload is not modeled".into())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1048,5 +1299,91 @@ mod tests {
         let got = weakref_deref(&gcref, &wref).unwrap();
         assert!(got.nonzero());
         assert_eq!(LowLevelType::Ptr(Box::new(got._TYPE.clone())), gcref);
+    }
+
+    #[test]
+    fn array_length_offset_ref_reads_array_length() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            ArrayType, LowLevelValue, MallocFlavor, malloc,
+        };
+
+        // `GcArray(Signed)` of length 3.
+        let array_ty = LowLevelType::Array(Box::new(ArrayType::gc(LowLevelType::Signed)));
+        let arrayptr = malloc(array_ty.clone(), Some(3), MallocFlavor::Gc, true).unwrap();
+
+        // `ArrayLengthOffset(ARRAY).ref(arrayptr)` → a `_arraylenref` pointer
+        // whose only item is the array length.
+        let lenptr = AddressOffset::ArrayLengthOffset(array_ty)
+            .r#ref(&arrayptr)
+            .unwrap();
+        let _ptr_obj::ArrayLenRef(lenref) = lenptr._obj().unwrap() else {
+            panic!("ArrayLengthOffset::ref must yield an _arraylenref");
+        };
+        assert_eq!(lenref.getlength(), 1);
+        assert_eq!(lenref.getitem(0), Some(LowLevelValue::Signed(3)));
+    }
+
+    #[test]
+    fn item_offset_ref_to_array_end_yields_endmarker() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            ArrayType, MallocFlavor, StructType, malloc,
+        };
+
+        // `GcArray(Struct('Item', ('x', Signed)))` of length 1 — an inlined
+        // (non-gc) item struct, as required for an array of containers.
+        let item_ty = LowLevelType::Struct(Box::new(StructType::new(
+            "Item",
+            vec![("x".into(), LowLevelType::Signed)],
+        )));
+        let array_ty = LowLevelType::Array(Box::new(ArrayType::gc(item_ty.clone())));
+        let arrayptr = malloc(array_ty.clone(), Some(1), MallocFlavor::Gc, true).unwrap();
+
+        // `ArrayItemsOffset(ARRAY).ref` → item-0 struct pointer.
+        let item0 = AddressOffset::ArrayItemsOffset(array_ty)
+            .r#ref(&arrayptr)
+            .unwrap();
+        // `item0 + ItemOffset(Item, 1)` lands exactly at the array end (index
+        // 1 == length 1) → the `_endmarker_struct` sentinel, typed `Ptr(Item)`.
+        let endptr = AddressOffset::ItemOffset {
+            TYPE: item_ty.clone(),
+            repeat: 1,
+        }
+        .r#ref(&item0)
+        .unwrap();
+        let _ptr_obj::EndMarker(end) = endptr._obj().unwrap() else {
+            panic!("an end-of-array reference must yield an _endmarker");
+        };
+        assert!(!end._was_freed());
+        assert_eq!(LowLevelType::Struct(Box::new(end.TYPE.clone())), item_ty);
+    }
+
+    #[test]
+    fn item_offset_ref_memoizes_end_marker_per_array() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            ArrayType, MallocFlavor, StructType, malloc,
+        };
+
+        // `_end_markers[parent]` (llmemory.py:96-100): two references exactly
+        // to one array's end yield the same `_endmarker` container, so the two
+        // fakeaddresses would compare equal.
+        let item_ty = LowLevelType::Struct(Box::new(StructType::new(
+            "Item",
+            vec![("x".into(), LowLevelType::Signed)],
+        )));
+        let array_ty = LowLevelType::Array(Box::new(ArrayType::gc(item_ty.clone())));
+        let arrayptr = malloc(array_ty.clone(), Some(1), MallocFlavor::Gc, true).unwrap();
+
+        let end_ptr = || {
+            let item0 = AddressOffset::ArrayItemsOffset(array_ty.clone())
+                .r#ref(&arrayptr)
+                .unwrap();
+            AddressOffset::ItemOffset {
+                TYPE: item_ty.clone(),
+                repeat: 1,
+            }
+            .r#ref(&item0)
+            .unwrap()
+        };
+        assert_eq!(end_ptr()._obj().unwrap(), end_ptr()._obj().unwrap());
     }
 }
