@@ -7,6 +7,7 @@ use crate::flowspace::model::{
     LinkRef, SpaceOperation, Variable,
 };
 use crate::translator::rtyper::lltypesystem::lloperation::ll_operations;
+use crate::translator::rtyper::lltypesystem::lltype;
 use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType};
 use crate::translator::simplify;
 use crate::translator::unsimplify::{insert_empty_block, split_block};
@@ -1174,37 +1175,19 @@ fn fixup_op_result(opname: &str, result: ConstValue) -> ConstValue {
 ///     return container._as_ptr()
 /// ```
 ///
-/// TODO: `lltype._parentable` / `_keepparent` /
-/// `_parentstructure()` not yet ported — see
-/// `rtyper/lltypesystem/lltype.rs:1209` "structured error pending a
-/// `_parent_link` port"). Until the parent-link infra lands, the
-/// body of `fixup_solid` cannot be expressed faithfully.
-///
-/// The function is gated by [`fixup_op_result`], whose match arms
-/// fire only for `getsubstruct` / `getarraysubstruct` /
-/// `direct_fieldptr` / `direct_arrayitems`. None of those four
-/// opnames have an opimpl in
-/// `rtyper/lltypesystem/opimpl.rs` (verified empty by grep on the
-/// four literal opname strings), so [`eval_llop`] never returns
-/// `Some(...)` for them and `fixup_op_result` never invokes
-/// `fixup_solid` in production. The `unimplemented!` is therefore a
-/// loud-fail gate: it surfaces the day either (a) the
-/// `_parent_link` port lands (real implementation replaces the
-/// gate) or (b) `eval_llop` grows a `getsubstruct`-class arm
-/// without the keepalive (regression — fail loudly so the parity
-/// gap is visible at the first call).
-///
-/// **Convergence path**: port `lltype._parentable.{_keepparent,
-/// _parentstructure}` (mirroring upstream `lltype.py` ~`:550-700`),
-/// then replace this stub with the literal four-line body above.
-fn fixup_solid(_p: ConstValue) -> ConstValue {
-    unimplemented!(
-        "constfold.py:131-145 fixup_solid: needs lltype._parentable / \
-         _parentstructure() / _keepparent (rtyper/lltypesystem/lltype.rs:1209 \
-         marks _parent_link port pending). Reachable only if eval_llop \
-         grows a getsubstruct/getarraysubstruct/direct_fieldptr/\
-         direct_arrayitems arm before the parent-link infra lands.",
-    )
+/// Pins the parent of an inlined sub-pointer so it keeps the inlined part
+/// alive. The body lives in [`lltype::fixup_solid`]: pyre's
+/// `_setparentstructure` already holds the parent strongly (the `ParentLink`
+/// model), so the `_keepparent` keepalive is structurally satisfied and the
+/// pointer is returned unchanged after validating its container is a
+/// `_parentable`. A non-pointer fold result, or a pointer whose container is
+/// not a `_parentable`, is a producer bug and panics loudly.
+fn fixup_solid(p: ConstValue) -> ConstValue {
+    let ConstValue::LLPtr(ptr) = &p else {
+        panic!("fixup_solid: expected a low-level pointer fold result, got {p:?}");
+    };
+    lltype::fixup_solid(ptr).expect("fixup_solid: container must be a live _parentable");
+    p
 }
 
 /// Local subset of upstream `LLOp.__call__` (lloperation.py) at
@@ -1659,14 +1642,13 @@ mod tests {
         assert_eq!(fixup_op_result("int_add", v.clone()), v);
     }
 
-    /// `fixup_op_result` for `getsubstruct` would route to
-    /// `fixup_solid` — currently unimplemented (panics with the
-    /// upstream-citing message). The panic is unreachable from
-    /// production today since `eval_llop` does not match
-    /// `getsubstruct`, but the registry surface is in place.
+    /// `fixup_op_result` routes `getsubstruct` through `fixup_solid`, which
+    /// expects a low-level pointer fold result. A non-pointer is a producer
+    /// bug and panics loudly (the parentable-pointer success path is covered
+    /// by `lltype::tests::fixup_solid_keeps_parentable_pointer_unchanged`).
     #[test]
-    #[should_panic(expected = "fixup_solid")]
-    fn fixup_op_result_routes_getsubstruct_to_fixup_solid_stub() {
+    #[should_panic(expected = "expected a low-level pointer fold result")]
+    fn fixup_op_result_getsubstruct_rejects_non_pointer_result() {
         let _ = fixup_op_result("getsubstruct", ConstValue::Int(0));
     }
 }

@@ -9,9 +9,9 @@ use std::sync::LazyLock;
 use crate::annotator::model::{KnownType, SomeObjectBase, SomeObjectTrait, SomeValue};
 use crate::flowspace::model::ConstValue;
 use crate::translator::rtyper::lltypesystem::lltype::{
-    _address, _arraylenref, _endmarker, _ptr, _ptr_obj, _wref, GcKind, LowLevelType, ParentIndex,
-    Ptr, PtrTarget, WEAKREF_PTR, cast_opaque_ptr, cast_pointer, container_value_as_ptr,
-    direct_arrayitems, direct_fieldptr, direct_ptradd, nullptr, parentlink,
+    _address, _arraylenref, _endmarker, _ptr, _ptr_obj, _wref, GcKind, LowLevelType, NONGCREF,
+    ParentIndex, Ptr, PtrTarget, WEAKREF_PTR, cast_int_to_ptr, cast_opaque_ptr, cast_pointer,
+    container_value_as_ptr, direct_arrayitems, direct_fieldptr, direct_ptradd, nullptr, parentlink,
 };
 
 thread_local! {
@@ -338,7 +338,7 @@ impl AddressOffset {
                 }
                 Ok(p)
             }
-            AddressOffset::ArrayLengthOffset(_) => array_length_offset_ref(ptr),
+            AddressOffset::ArrayLengthOffset(TYPE) => array_length_offset_ref(TYPE, ptr),
         }
     }
 }
@@ -376,10 +376,8 @@ fn item_offset_ref(ty: &LowLevelType, repeat: i64, firstitemptr: &_ptr) -> Resul
         None => return Err("parent container has no index".into()),
     };
     let index = base + repeat;
-    if index < 0 {
-        return Err(format!("ItemOffset::ref index {index} out of range"));
-    }
-    if index as usize == arr.getlength() {
+    let len = arr.getlength() as i64;
+    if index == len {
         // `for references exactly to the end of the array` →
         // `_end_markers[parent]` else `_endmarker_struct(A, parent, index)`,
         // then `._as_ptr()` (llmemory.py:93-101). `A == self.TYPE` here, so
@@ -398,8 +396,14 @@ fn item_offset_ref(ty: &LowLevelType, repeat: i64, firstitemptr: &_ptr) -> Resul
         });
         return Ok(endmarker._as_ptr(true));
     }
+    // `parent.getitem(index)` (llmemory.py:103) is Python list indexing, so a
+    // negative index addresses from the end; out-of-range declines.
+    let actual = if index < 0 { len + index } else { index };
+    if actual < 0 || actual >= len {
+        return Err(format!("ItemOffset::ref item {index} out of range"));
+    }
     let item = arr
-        .getitem(index as usize)
+        .getitem(actual as usize)
         .ok_or_else(|| format!("ItemOffset::ref item {index} out of range"))?;
     container_value_as_ptr(&item, true)
         .ok_or_else(|| "ItemOffset::ref: item is not a container".into())
@@ -447,6 +451,15 @@ fn field_offset_ref(ty: &LowLevelType, fldname: &str, struct_ptr: &_ptr) -> Resu
 /// `ArrayItemsOffset.ref(arrayptr)` (llmemory.py:289-296), array-of-containers
 /// arm: `arrayptr._obj.getitem(0)._as_ptr()`.
 fn array_items_offset_ref(ty: &LowLevelType, arrayptr: &_ptr) -> Result<_ptr, String> {
+    // `assert array_type_match(lltype.typeOf(arrayptr).TO, self.TYPE)`
+    // (llmemory.py:290) — the pointer's array type must match the offset's,
+    // otherwise the navigation is invalid and the fold declines.
+    let a1: LowLevelType = arrayptr._TYPE.TO.clone().into();
+    if !array_type_match(&a1, ty) {
+        return Err(format!(
+            "ArrayItemsOffset::ref: array type mismatch: {a1:?} vs {ty:?}"
+        ));
+    }
     let of = array_of_type(ty)?;
     if !of.is_container_type() {
         // primitive array → `direct_arrayitems(arrayptr)` (llmemory.py:297).
@@ -470,7 +483,15 @@ fn array_items_offset_ref(ty: &LowLevelType, arrayptr: &_ptr) -> Result<_ptr, St
 /// `ArrayLengthOffset.ref(arrayptr)` (llmemory.py:336-338):
 /// `_arraylenref._makeptr(arrayptr._obj, arrayptr._solid)` — a
 /// `Ptr(FixedSizeArray(Signed, 1))` whose `getitem(0)` reads the array length.
-fn array_length_offset_ref(arrayptr: &_ptr) -> Result<_ptr, String> {
+fn array_length_offset_ref(ty: &LowLevelType, arrayptr: &_ptr) -> Result<_ptr, String> {
+    // `assert array_type_match(lltype.typeOf(arrayptr).TO, self.TYPE)`
+    // (llmemory.py:337).
+    let a1: LowLevelType = arrayptr._TYPE.TO.clone().into();
+    if !array_type_match(&a1, ty) {
+        return Err(format!(
+            "ArrayLengthOffset::ref: array type mismatch: {a1:?} vs {ty:?}"
+        ));
+    }
     let obj = arrayptr
         ._obj()
         .map_err(|_| "ArrayLengthOffset::ref: delayed pointer".to_string())?;
@@ -506,6 +527,37 @@ fn primitive_array_matches_item(a: &LowLevelType, ty: &LowLevelType) -> bool {
         }
         _ => false,
     }
+}
+
+/// `array_type_match(A1, A2)` (llmemory.py:662-666): the offset's stored array
+/// type `A2` must equal the pointer's actual array type `A1`, or `A2` is the
+/// `GCARRAY_OF_PTR` placeholder and `A1` is a length-prefixed `GcArray` of
+/// pointers. `GCARRAY_OF_PTR` (`GcArray(GCREF, hints={'placeholder': True})`)
+/// is minted only by the GC transformer, which pyre does not run, so the
+/// placeholder arm is unreachable here; it is modelled for completeness.
+fn array_type_match(a1: &LowLevelType, a2: &LowLevelType) -> bool {
+    if a1 == a2 {
+        return true;
+    }
+    let LowLevelType::Array(a2_arr) = a2 else {
+        return false;
+    };
+    let a2_is_gcarray_of_ptr = a2_arr._gckind == GcKind::Gc
+        && matches!(a2_arr.OF, LowLevelType::Ptr(_))
+        && matches!(
+            a2_arr._hints.get("placeholder"),
+            Some(ConstValue::Bool(true))
+        );
+    if !a2_is_gcarray_of_ptr {
+        return false;
+    }
+    matches!(
+        a1,
+        LowLevelType::Array(a1_arr)
+            if a1_arr._gckind == GcKind::Gc
+                && matches!(a1_arr.OF, LowLevelType::Ptr(_))
+                && !matches!(a1_arr._hints.get("nolength"), Some(ConstValue::Bool(true)))
+    )
 }
 
 /// Word size (length-field width / pointer width).
@@ -838,16 +890,27 @@ pub fn cast_any_ptr(expected: &Ptr, ptr: &_ptr) -> Result<_ptr, String> {
     cast_pointer(expected, ptr)
 }
 
-/// `cast_int_to_adr(int)` (llmemory.py:788-796) — `cast_ptr_to_adr` of
-/// `cast_int_to_ptr(_NONGCREF, int)` (lltype.py:2372-2377). The `AddressAsInt`
-/// branch (llmemory.py:789-790) is moot — pyre carries no `AddressAsInt`
+/// `cast_int_to_adr(int)` (llmemory.py:788-796):
+///
+/// ```python
+/// def cast_int_to_adr(int):
+///     if isinstance(int, AddressAsInt):
+///         return int.adr
+///     try:
+///         ptr = lltype.cast_int_to_ptr(_NONGCREF, int)
+///     except ValueError:
+///         from rpython.rtyper.lltypesystem import ll2ctypes
+///         ptr = ll2ctypes._int2obj[int]._as_ptr()
+///     return cast_ptr_to_adr(ptr)
+/// ```
+///
+/// The `AddressAsInt` branch is moot — pyre carries no `AddressAsInt`
 /// constant. Folding the composition three ways:
 /// - `int == 0`: `cast_int_to_ptr` returns `nullptr(_NONGCREF.TO)`, whose
 ///   `_obj0` is `None`, so `cast_ptr_to_adr` (`fakeaddress.__init__`,
 ///   llmemory.py:454-456) normalizes the null ptr to the NULL address.
-/// - odd `int`: `cast_int_to_ptr` builds a tagged-integer `_ptr`
-///   (`_obj0 = oddint`, never `None`), kept by `cast_ptr_to_adr` as the
-///   [`_address::IntCast`] carrier (pyre's tagged-int fakeaddress).
+/// - odd `int`: `cast_int_to_ptr` builds a tagged-integer `_NONGCREF` `_ptr`,
+///   wrapped as the `fakeaddress` (`_address::Fake`).
 /// - even non-zero `int`: `cast_int_to_ptr` raises `ValueError`
 ///   (lltype.py:2375-2376); upstream then resolves it through the runtime
 ///   `ll2ctypes._int2obj` table (llmemory.py:793-795), which has no
@@ -856,7 +919,8 @@ pub fn cast_int_to_adr(int: i64) -> Option<_address> {
     if int == 0 {
         Some(_address::Null)
     } else if int & 1 == 1 {
-        Some(_address::IntCast(int))
+        let ptr = cast_int_to_ptr(&NONGCREF, int).expect("odd int is a valid tagged pointer");
+        Some(_address::Fake(Box::new(ptr)))
     } else {
         None
     }
@@ -867,17 +931,23 @@ pub fn cast_int_to_adr(int: i64) -> Option<_address> {
 /// identity here (the llarena fake-arena rebind is unported). A live address
 /// re-casts its pointer with [`cast_any_ptr`]; a NULL address yields
 /// `nullptr(EXPECTED_TYPE.TO)` — so the `cast_int_to_adr(0)` round-trip lands
-/// here through the `Null` arm. An int-cast (odd, tagged) address would need
-/// the inverse `cast_int_to_ptr` to rebuild a tagged-integer `_ptr`, whose
-/// payload pyre's `_ptr._obj0` cannot carry yet (same model gap noted on
-/// `cast_opaque_ptr`), so it declines.
+/// here through the `Null` arm. A tagged-integer address re-casts its
+/// `_NONGCREF` pointer through [`cast_any_ptr`] like any other live address:
+/// `EXPECTED == _NONGCREF` returns the tagged pointer unchanged, and every
+/// other concrete/opaque `EXPECTED` fails through `cast_opaque_ptr` because the
+/// bare-integer container has no `_obj.container` (upstream `InvalidCast`).
 pub fn cast_adr_to_ptr(adr: &_address, expected: &Ptr) -> Result<_ptr, String> {
     match adr {
         _address::Fake(ptr) => cast_any_ptr(expected, ptr),
         _address::Null => nullptr(expected.TO.clone().into()),
-        _address::IntCast(_) => {
-            Err("cast_adr_to_ptr on a tagged-int address needs the cast_int_to_ptr round-trip — the tagged-int _ptr payload is not modeled".into())
-        }
+        // A `ConstRefAddr` raw host pointer has no live container to re-cast at
+        // fold time — upstream's rtyper would hold the prebuilt object's `_ptr`
+        // (via `convert_const`); pyre cannot rebuild it from the bare integer.
+        // It flows only as a `Ref` constant and never reaches here in practice.
+        _address::IntCast(_) => Err(
+            "cast_adr_to_ptr on a ConstRefAddr raw host pointer: no live container at fold time"
+                .into(),
+        ),
     }
 }
 
@@ -1321,6 +1391,28 @@ mod tests {
         };
         assert_eq!(lenref.getlength(), 1);
         assert_eq!(lenref.getitem(0), Some(LowLevelValue::Signed(3)));
+    }
+
+    #[test]
+    fn array_items_offset_ref_rejects_mismatched_array_type() {
+        use crate::translator::rtyper::lltypesystem::lltype::{ArrayType, MallocFlavor, malloc};
+        // `ArrayItemsOffset(A2).ref(arrayptr)` asserts `array_type_match(A1, A2)`
+        // (llmemory.py:286-290) where `A1 = typeOf(arrayptr).TO`. A matching
+        // element type folds; a mismatched one fails the assert (the over-fold
+        // guard), so the fold declines instead of producing a wrong pointer.
+        let signed_arr = LowLevelType::Array(Box::new(ArrayType::gc(LowLevelType::Signed)));
+        let arrayptr = malloc(signed_arr.clone(), Some(3), MallocFlavor::Gc, true).unwrap();
+        assert!(
+            AddressOffset::ArrayItemsOffset(signed_arr)
+                .r#ref(&arrayptr)
+                .is_ok()
+        );
+        let float_arr = LowLevelType::Array(Box::new(ArrayType::gc(LowLevelType::Float)));
+        assert!(
+            AddressOffset::ArrayItemsOffset(float_arr)
+                .r#ref(&arrayptr)
+                .is_err()
+        );
     }
 
     #[test]

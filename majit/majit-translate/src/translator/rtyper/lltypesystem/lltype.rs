@@ -358,19 +358,19 @@ pub enum _address {
     /// have a stable structural hash; the `Fake` arm carries a Box
     /// to keep the variant fixed-size.
     Fake(Box<_ptr>),
-    /// `cast_int_to_adr(int)` (`llmemory.py:788`) — the fakeaddress
-    /// produced by casting a raw integer pointer to an `Address`.
-    /// Upstream casts the integer to a `_NONGCREF` `_ptr` (or resolves
-    /// it through `ll2ctypes._int2obj`) and wraps that ptr; pyre carries
-    /// the integer directly because the host-evaluator hands back a raw
-    /// pointer value for a `Ref`-typed static without a live `_ptr` to
-    /// wrap.
+    /// Pyre's carrier for an `OpKind::ConstRefAddr` — a `Ref`-typed static
+    /// constant whose host-evaluator value is a raw pointer **integer**
+    /// (`front/ast.rs`, `(ValueType::Ref, ConstValue::Int)`), with no live
+    /// `_ptr`/container to wrap. Upstream's rtyper holds the prebuilt object's
+    /// real `_ptr` (via `convert_const`); pyre has only the integer until the
+    /// live-prebuilt `convert_const` path lands, so it carries it directly.
     ///
-    /// INVARIANT: this carries only an **odd, non-zero** integer — the
-    /// tagged-integer pointer `cast_int_to_ptr` builds (lltype.py:2375). A
-    /// zero integer maps to [`_address::Null`] and an even non-zero integer
-    /// declines, both in [`cast_int_to_adr`]. So the wrapped tagged-int
-    /// `_ptr` is never `None` and the address is always non-NULL.
+    /// This is **not** the `cast_int_to_adr` tagged-integer fakeaddress: that
+    /// path builds a proper `_NONGCREF` `_ptr` and wraps it as [`Fake`]
+    /// (llmemory.py:788, `cast_int_to_ptr`). A `ConstRefAddr` raw pointer is
+    /// typically aligned (even), which `cast_int_to_ptr` rejects, so it never
+    /// reaches `Fake`; it flows only as a `Ref` constant and is never re-cast
+    /// to a pointer through `cast_adr_to_ptr`.
     IntCast(i64),
 }
 
@@ -386,10 +386,9 @@ impl _address {
     /// pointer. Upstream catches only `DelayedPointer`, falling back to
     /// pointer identity (`self.ptr is other.ptr`).
     pub fn _eq(&self, other: &_address) -> bool {
-        // An int-cast address compares by its raw integer — the underlying
-        // `_obj` of a tagged-integer pointer (llmemory.py:788 builds it via
-        // `cast_int_to_ptr`; `_ptr._obj` of a tagged int is the int itself).
-        // It is therefore never equal to a NULL or container-backed address.
+        // A `ConstRefAddr` raw-pointer carrier compares by its raw integer —
+        // two `Ref` statics are the same iff their prebuilt addresses match.
+        // It is never equal to a NULL or container-backed address.
         match (self, other) {
             (_address::IntCast(a), _address::IntCast(b)) => return a == b,
             (_address::IntCast(_), _) | (_, _address::IntCast(_)) => return false,
@@ -418,10 +417,10 @@ impl _address {
     }
 
     /// `fakeaddress.__nonzero__` (`llmemory.py:490-491`): `self.ptr is not
-    /// None`. `Fake` wraps a live pointer and `IntCast` an odd-non-zero
-    /// tagged-integer pointer (see the variant invariant), both with a
-    /// non-`None` `_obj0` and so non-NULL; only `Null` — the normalization
-    /// of `_obj0 is None` (llmemory.py:454-456) — is the NULL address.
+    /// None`. `Fake` wraps a live pointer (a tagged-integer `_NONGCREF`
+    /// pointer included, whose `_obj0` is non-`None`) and `IntCast` a raw
+    /// `ConstRefAddr` pointer; only `Null` — the normalization of `_obj0 is
+    /// None` (llmemory.py:454-456) — is the NULL address.
     pub fn nonzero(&self) -> bool {
         matches!(self, _address::Fake(_) | _address::IntCast(_))
     }
@@ -910,6 +909,13 @@ pub enum _ptr_obj {
     /// `_endmarker_struct` end-of-array sentinel (lltype.py:168), built by
     /// `ItemOffset.ref` for a reference exactly to the array end.
     EndMarker(_endmarker),
+    /// Tagged-integer pointer payload — `_ptr(PTRTYPE, oddint, solid=True)`
+    /// stores the bare odd integer in `_obj0` (lltype.py:2372-2377,
+    /// `cast_int_to_ptr`). Upstream `_obj0` is a plain `int` here; modeled as
+    /// a dedicated variant since the int is not a container. Consumed by
+    /// `_cast_to_int` (lltype.py:1456-1457) and round-tripped through
+    /// `cast_adr_to_ptr` of a `cast_int_to_adr` tagged address.
+    IntCast(i64),
 }
 
 #[derive(Clone, Debug)]
@@ -1231,8 +1237,11 @@ fn parentable_of_obj(obj: &_ptr_obj) -> Option<Arc<Parentable>> {
         _ptr_obj::EndMarker(e) => Some(e._parentable.clone()),
         // `_arraylenref` is a `_parentable` upstream but never sets a parent
         // and is never itself a parent of inlined children, so it shares no
-        // `_parentable` state for the parent-chain walk.
-        _ptr_obj::Func(_) | _ptr_obj::Wref(_) | _ptr_obj::ArrayLenRef(_) => None,
+        // `_parentable` state for the parent-chain walk. A tagged-int payload
+        // (`cast_int_to_ptr`) is a bare integer, not a container.
+        _ptr_obj::Func(_) | _ptr_obj::Wref(_) | _ptr_obj::ArrayLenRef(_) | _ptr_obj::IntCast(_) => {
+            None
+        }
     }
 }
 
@@ -1750,11 +1759,15 @@ pub fn direct_arrayitems(arrayptr: &_ptr) -> Result<_ptr, String> {
 /// `direct_ptradd(ptr, n)` (lltype.py:1102-1114) — shift an interior pointer
 /// built by `direct_arrayitems()` forward/backward by `n` items, re-resolving
 /// it as `parent[base + n]`. The non-`_subarray` case (a bare nolength C-like
-/// array) delegates upstream to `rffi.ptradd`; pyre has no `rffi.ptradd`
-/// consumer for the address-fold path, so that case declines. A backward
-/// shift can make `base + n` negative — upstream builds the `_subarray`
-/// regardless and only errors on an out-of-bounds dereference, so the signed
-/// index is threaded straight through.
+/// array) delegates upstream to `rffi.ptradd`, which is
+/// `ll2ctypes.force_ptradd` (rffi.py:1220, ll2ctypes.py:1458) — runtime ctypes
+/// pointer arithmetic over a real `_rctypes` object. ll2ctypes is dead at fold
+/// time (no live ctypes object backs a fold constant), so there is no
+/// constant-fold value to produce and the fold declines, exactly as upstream
+/// would have nothing to compute without the runtime pointer. A backward shift
+/// can make `base + n` negative — upstream builds the `_subarray` regardless
+/// and only errors on an out-of-bounds dereference, so the signed index is
+/// threaded straight through.
 pub fn direct_ptradd(ptr: &_ptr, n: i64) -> Result<_ptr, String> {
     if !ptr.nonzero() {
         return Err("direct_ptradd: NULL argument".into());
@@ -1763,7 +1776,11 @@ pub fn direct_ptradd(ptr: &_ptr, n: i64) -> Result<_ptr, String> {
         ._obj()
         .map_err(|_| "direct_ptradd: delayed pointer".to_string())?;
     if !matches!(&obj, _ptr_obj::Subarray(_)) {
-        return Err("direct_ptradd: non-_subarray needs rffi.ptradd — not ported".into());
+        return Err(
+            "direct_ptradd: non-_subarray delegates to rffi.ptradd (ll2ctypes runtime), \
+             which has no constant-fold value"
+                .into(),
+        );
     }
     let (parent, base) = parentlink(&obj);
     let parent = parent.ok_or_else(|| "direct_ptradd: subarray has no parent".to_string())?;
@@ -1775,6 +1792,34 @@ pub fn direct_ptradd(ptr: &_ptr, n: i64) -> Result<_ptr, String> {
         None => return Err("direct_ptradd: subarray has no parent index".into()),
     };
     _subarray::_makeptr(&parent, ParentIndex::Item(base + n), ptr._solid)
+}
+
+/// RPython `fixup_solid(p)` (`constfold.py:131-145`):
+///
+/// ```python
+/// def fixup_solid(p):
+///     container = p._obj
+///     assert isinstance(container, lltype._parentable)
+///     container._keepparent = container._parentstructure()
+///     return container._as_ptr()
+/// ```
+///
+/// Pins the parent of an inlined sub-pointer so the parent keeps the inlined
+/// part alive. pyre's `_setparentstructure` already holds the parent strongly
+/// through [`ParentLink`] (the strong-ref model on [`Parentable::parent`]), so
+/// the `_keepparent` keepalive is structurally satisfied — there is nothing to
+/// pin that is not already pinned. The body therefore validates the container
+/// is a `_parentable` and returns the pointer unchanged: `container._as_ptr()`
+/// yields a pointer to the same container, and `_ptr` equality is by container
+/// identity, so it is the same pointer.
+pub fn fixup_solid(ptr: &_ptr) -> Result<_ptr, String> {
+    let container = ptr
+        ._obj()
+        .map_err(|_| "fixup_solid: delayed pointer".to_string())?;
+    if parentable_of_obj(&container).is_none() {
+        return Err(format!("fixup_solid: {container:?} is not a _parentable"));
+    }
+    Ok(ptr.clone())
 }
 
 impl PartialEq for _struct {
@@ -2524,6 +2569,7 @@ impl _ptr {
             _ptr_obj::Subarray(_) => panic!("{:?} instance is not callable", self._TYPE),
             _ptr_obj::ArrayLenRef(_) => panic!("{:?} instance is not callable", self._TYPE),
             _ptr_obj::EndMarker(_) => panic!("{:?} instance is not callable", self._TYPE),
+            _ptr_obj::IntCast(_) => panic!("{:?} instance is not callable", self._TYPE),
         }
     }
 
@@ -2562,6 +2608,7 @@ impl _ptr {
             _ptr_obj::Subarray(_) => panic!("subarray has no container parent"),
             _ptr_obj::ArrayLenRef(_) => panic!("arraylenref has no container parent"),
             _ptr_obj::EndMarker(_) => panic!("endmarker has no container parent"),
+            _ptr_obj::IntCast(_) => panic!("tagged-int pointer has no container parent"),
         }
     }
 
@@ -3692,6 +3739,13 @@ pub static WEAKREF_PTR: LazyLock<LowLevelType> = LazyLock::new(|| {
     }))
 });
 
+/// `_NONGCREF = lltype.Ptr(lltype.OpaqueType('NONGCREF'))` (llmemory.py:787).
+/// The raw opaque pointer type `cast_int_to_adr` casts a tagged integer
+/// through.
+pub static NONGCREF: LazyLock<Ptr> = LazyLock::new(|| Ptr {
+    TO: PtrTarget::Opaque(OpaqueType::new("NONGCREF")),
+});
+
 fn new_opaque_container(TYPE: OpaqueType, name: &str, about: Option<LowLevelType>) -> _opaque {
     _opaque {
         _identity: fresh_low_level_container_identity(),
@@ -4249,6 +4303,34 @@ pub fn nullptr(T: LowLevelType) -> Result<_ptr, String> {
     Ok(Ptr::from_container_type(T)?._defl())
 }
 
+/// RPython `cast_int_to_ptr(PTRTYPE, oddint)` (`lltype.py:2372-2377`):
+///
+/// ```python
+/// def cast_int_to_ptr(PTRTYPE, oddint):
+///     if oddint == 0:
+///         return nullptr(PTRTYPE.TO)
+///     if not (oddint & 1):
+///         raise ValueError("only odd integers can be cast back to ptr")
+///     return _ptr(PTRTYPE, oddint, solid=True)
+/// ```
+///
+/// Builds a tagged-integer pointer whose `_obj0` is the bare odd integer
+/// ([`_ptr_obj::IntCast`]). `cast_int_to_adr` casts a raw integer through
+/// `_NONGCREF` with this.
+pub fn cast_int_to_ptr(PTRTYPE: &Ptr, oddint: i64) -> Result<_ptr, String> {
+    if oddint == 0 {
+        return nullptr(PTRTYPE.TO.clone().into());
+    }
+    if oddint & 1 == 0 {
+        return Err("only odd integers can be cast back to ptr".into());
+    }
+    Ok(_ptr::new_with_solid(
+        PTRTYPE.clone(),
+        Ok(Some(_ptr_obj::IntCast(oddint))),
+        true,
+    ))
+}
+
 /// RPython `cast_pointer(PTRTYPE, ptr)` (`lltype.py:964-968`):
 ///
 /// ```python
@@ -4326,6 +4408,7 @@ impl _ptr_obj {
                 FixedSizeArrayType::new(LowLevelType::Signed, 1),
             )),
             _ptr_obj::EndMarker(e) => LowLevelType::Struct(Box::new(e.TYPE.clone())),
+            _ptr_obj::IntCast(_) => panic!("tagged-int pointer has no container type"),
         }
     }
 
@@ -4340,7 +4423,10 @@ impl _ptr_obj {
             _ptr_obj::Opaque(o) => o._was_freed(),
             _ptr_obj::Subarray(s) => s._was_freed(),
             _ptr_obj::EndMarker(e) => e._was_freed(),
-            _ptr_obj::Func(_) | _ptr_obj::Wref(_) | _ptr_obj::ArrayLenRef(_) => false,
+            _ptr_obj::Func(_)
+            | _ptr_obj::Wref(_)
+            | _ptr_obj::ArrayLenRef(_)
+            | _ptr_obj::IntCast(_) => false,
         }
     }
 
@@ -4355,28 +4441,48 @@ impl _ptr_obj {
             _ptr_obj::Opaque(o) => o._parentable.check(),
             _ptr_obj::Subarray(s) => s._parentable.check(),
             _ptr_obj::EndMarker(e) => e._parentable.check(),
-            _ptr_obj::Func(_) | _ptr_obj::Wref(_) | _ptr_obj::ArrayLenRef(_) => {}
+            _ptr_obj::Func(_)
+            | _ptr_obj::Wref(_)
+            | _ptr_obj::ArrayLenRef(_)
+            | _ptr_obj::IntCast(_) => {}
         }
     }
 
-    /// `_container._normalizedcontainer()` — only `_opaque` rewrites itself
-    /// (lltype.py:2178). `_parentable._normalizedcontainer`
+    /// `_container._normalizedcontainer()` — `_opaque` rewrites itself
+    /// (lltype.py:2178), otherwise `_parentable._normalizedcontainer`
     /// (lltype.py:1721-1735) walks `_struct`/`_array` up to the enclosing
-    /// struct while this container is the parent's first inlined field;
-    /// that walk returns the *parent container object* via the object-returning
-    /// `_parentstructure()` ([`Parentable::parentstructure`]), which now lands;
-    /// wiring the `_parentable._normalizedcontainer` first-field promotion on
-    /// top of it is a later slice.
-    /// KNOWN GAP: if a first-inlined substruct/array is hidden behind an
-    /// opaque, our eq/hash keys on the substruct where upstream would key on
-    /// the promoted parent. The reachable pyre path (cast_opaque_ptr off a
-    /// top-level GC allocation) has no parent, so it is already normal here;
-    /// the gap closes when the promotion walk is wired.
+    /// struct while this container is the parent's first inlined struct field,
+    /// returning the promoted parent container object.
     fn _normalizedcontainer(&self) -> _ptr_obj {
-        match self {
-            _ptr_obj::Opaque(o) => o._normalizedcontainer(),
-            _ => self.clone(),
+        if let _ptr_obj::Opaque(o) = self {
+            return o._normalizedcontainer();
         }
+        let mut container = self.clone();
+        loop {
+            // `parent = container._parentstructure(check); if parent is None:
+            //  break; index = container._parent_index; T = typeOf(parent)`.
+            let Some(parentable) = parentable_of_obj(&container) else {
+                break;
+            };
+            let Some(parent) = parentable.parentstructure(true) else {
+                break;
+            };
+            // `if not isinstance(T, Struct) or T._first_struct()[0] != index
+            //  or isinstance(T, FixedSizeArray): break`. A `FixedSizeArray`
+            // parent is a distinct lltype here, so the `Struct` match already
+            // excludes it.
+            let Some(LowLevelType::Struct(parent_struct)) = parentable.parent_type() else {
+                break;
+            };
+            let Some((first_name, _)) = parent_struct._first_struct() else {
+                break;
+            };
+            if parentable.parent_index() != Some(ParentIndex::Field(first_name)) {
+                break;
+            }
+            container = parent;
+        }
+        container
     }
 }
 
@@ -6983,6 +7089,21 @@ mod tests {
             panic!("direct_ptradd yields a _subarray interior pointer");
         };
         assert_eq!(sub.getitem(0), Some(LowLevelValue::Signed(20)));
+    }
+
+    #[test]
+    fn fixup_solid_keeps_parentable_pointer_unchanged() {
+        // `fixup_solid(p)` (constfold.py:131-145) pins the parent of an inlined
+        // sub-pointer. pyre's strong `ParentLink` already satisfies the
+        // `_keepparent` keepalive, so it validates the container is a
+        // `_parentable` and returns the same pointer (container identity
+        // preserved). Both a plain array container and a `direct_arrayitems`
+        // `_subarray` interior pointer are `_parentable`.
+        let array_ty = LowLevelType::Array(Box::new(ArrayType::gc(LowLevelType::Signed)));
+        let arrayptr = malloc(array_ty, Some(3), MallocFlavor::Gc, true).unwrap();
+        assert_eq!(fixup_solid(&arrayptr).unwrap(), arrayptr);
+        let items = direct_arrayitems(&arrayptr).unwrap();
+        assert_eq!(fixup_solid(&items).unwrap(), items);
     }
 
     #[test]

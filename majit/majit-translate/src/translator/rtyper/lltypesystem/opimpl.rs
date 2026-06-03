@@ -882,9 +882,9 @@ pub fn op_adr_sub(args: &[ConstValue]) -> Option<ConstValue> {
 /// RPython `op_cast_int_to_adr(int)` (`opimpl.py:487-489`):
 /// `llmemory.cast_int_to_adr(int)` (llmemory.py:788-796). Folds the
 /// `cast_int_to_ptr` + `cast_ptr_to_adr` composition: `0` → NULL address,
-/// an odd integer → the tagged-int [`_address::IntCast`] carrier, an even
-/// non-zero integer → declines (its upstream `ll2ctypes` resolution is
-/// runtime-only). See [`cast_int_to_adr`].
+/// an odd integer → a tagged-integer `_NONGCREF` `_ptr` wrapped as the
+/// fakeaddress (`_address::Fake`), an even non-zero integer → declines (its
+/// upstream `ll2ctypes` resolution is runtime-only). See [`cast_int_to_adr`].
 pub fn op_cast_int_to_adr(args: &[ConstValue]) -> Option<ConstValue> {
     match args {
         [ConstValue::Int(n)] => cast_int_to_adr(*n).map(ConstValue::LLAddress),
@@ -2170,15 +2170,16 @@ mod tests {
 
     #[test]
     fn cast_int_to_adr_folds_per_cast_int_to_ptr_semantics() {
-        use crate::translator::rtyper::lltypesystem::lltype::_address;
+        use crate::translator::rtyper::lltypesystem::lltype::{_address, _ptr_obj};
         let cast = get_op_impl("cast_int_to_adr").expect("cast_int_to_adr must be registered");
         // 0 routes through `cast_int_to_ptr` → `nullptr` → the NULL address.
         assert_eq!(cast(&[i(0)]), Some(ConstValue::LLAddress(_address::Null)));
-        // An odd integer becomes the tagged-int `IntCast` fakeaddress carrier.
-        assert_eq!(
-            cast(&[i(0x41)]),
-            Some(ConstValue::LLAddress(_address::IntCast(0x41)))
-        );
+        // An odd integer casts through `cast_int_to_ptr(_NONGCREF, odd)` to a
+        // tagged-integer `_ptr`, wrapped as the fakeaddress (`Fake`).
+        let Some(ConstValue::LLAddress(_address::Fake(p))) = cast(&[i(0x41)]) else {
+            panic!("an odd integer must build a tagged-int fakeaddress");
+        };
+        assert!(matches!(p._obj0, Ok(Some(_ptr_obj::IntCast(0x41)))));
         // An even non-zero integer raises `ValueError` upstream (its
         // `ll2ctypes` resolution is runtime-only) → declines.
         assert_eq!(cast(&[i(0x40)]), None);
@@ -2210,9 +2211,15 @@ mod tests {
         };
         assert!(p._obj0.as_ref().is_ok_and(|o| o.is_none()));
 
-        // An int-cast (odd, tagged-int) address declines — the inverse
-        // `cast_int_to_ptr` would need the unmodeled tagged-int `_ptr` payload.
-        let intadr = ConstValue::LLAddress(_address::IntCast(0x41));
+        // A tagged-int fakeaddress (`cast_int_to_adr` of an odd integer)
+        // re-casts its `_NONGCREF` opaque pointer through the real cast
+        // pipeline. Re-casting to a concrete array type fails — the bare-int
+        // container has no `_obj.container` (upstream `InvalidCast`) — so the
+        // fold declines.
+        let cast_int = get_op_impl("cast_int_to_adr").unwrap();
+        let Some(intadr) = cast_int(&[i(0x41)]) else {
+            panic!("an odd integer must build a tagged-int fakeaddress");
+        };
         assert_eq!(op_cast_adr_to_ptr(&restype, &[intadr]), None);
     }
 }
