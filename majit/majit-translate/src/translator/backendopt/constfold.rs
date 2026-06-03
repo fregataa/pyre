@@ -1176,18 +1176,19 @@ fn fixup_op_result(opname: &str, result: ConstValue) -> ConstValue {
 /// ```
 ///
 /// Pins the parent of an inlined sub-pointer so it keeps the inlined part
-/// alive. The body lives in [`lltype::fixup_solid`]: pyre's
-/// `_setparentstructure` already holds the parent strongly (the `ParentLink`
-/// model), so the `_keepparent` keepalive is structurally satisfied and the
-/// pointer is returned unchanged after validating its container is a
-/// `_parentable`. A non-pointer fold result, or a pointer whose container is
-/// not a `_parentable`, is a producer bug and panics loudly.
+/// alive, then returns `container._as_ptr()`. The body lives in
+/// [`lltype::fixup_solid`]: pyre's `_setparentstructure` already holds the
+/// parent strongly (the `ParentLink` model), so the `_keepparent` keepalive is
+/// structurally satisfied; it validates the container is a `_parentable` and
+/// rebuilds a solid pointer. A non-pointer fold result, or a pointer whose
+/// container is not a `_parentable`, is a producer bug and panics loudly.
 fn fixup_solid(p: ConstValue) -> ConstValue {
     let ConstValue::LLPtr(ptr) = &p else {
         panic!("fixup_solid: expected a low-level pointer fold result, got {p:?}");
     };
-    lltype::fixup_solid(ptr).expect("fixup_solid: container must be a live _parentable");
-    p
+    let fixed =
+        lltype::fixup_solid(ptr).expect("fixup_solid: container must be a live _parentable");
+    ConstValue::LLPtr(Box::new(fixed))
 }
 
 /// Local subset of upstream `LLOp.__call__` (lloperation.py) at

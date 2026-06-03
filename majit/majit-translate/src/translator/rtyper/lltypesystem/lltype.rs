@@ -1808,10 +1808,11 @@ pub fn direct_ptradd(ptr: &_ptr, n: i64) -> Result<_ptr, String> {
 /// part alive. pyre's `_setparentstructure` already holds the parent strongly
 /// through [`ParentLink`] (the strong-ref model on [`Parentable::parent`]), so
 /// the `_keepparent` keepalive is structurally satisfied — there is nothing to
-/// pin that is not already pinned. The body therefore validates the container
-/// is a `_parentable` and returns the pointer unchanged: `container._as_ptr()`
-/// yields a pointer to the same container, and `_ptr` equality is by container
-/// identity, so it is the same pointer.
+/// pin that is not already pinned. The body validates the container is a
+/// `_parentable` and returns `container._as_ptr()`: a fresh solid pointer to
+/// the container (`_ptr(Ptr(typeOf(container)), container, solid=True)`,
+/// `_container._as_ptr`, lltype.py:1640). `_ptr` equality is by container
+/// identity, so the result still equals the input pointer.
 pub fn fixup_solid(ptr: &_ptr) -> Result<_ptr, String> {
     let container = ptr
         ._obj()
@@ -1819,7 +1820,11 @@ pub fn fixup_solid(ptr: &_ptr) -> Result<_ptr, String> {
     if parentable_of_obj(&container).is_none() {
         return Err(format!("fixup_solid: {container:?} is not a _parentable"));
     }
-    Ok(ptr.clone())
+    Ok(_ptr::new_with_solid(
+        Ptr::from_container_type(container._container_type())?,
+        Ok(Some(container)),
+        true,
+    ))
 }
 
 impl PartialEq for _struct {
@@ -2445,6 +2450,16 @@ impl _ptr {
         // upstream: `if not self: return PTRTYPE._defl()`.
         if !self.nonzero() {
             return Ok(ptrtype._defl());
+        }
+        // upstream (lltype.py:1428): `if isinstance(self._obj, int): return
+        // _ptr(PTRTYPE, self._obj, solid=True)` — a tagged-integer pointer
+        // re-tags to the target type, keeping its integer payload.
+        if let Ok(Some(_ptr_obj::IntCast(n))) = &self._obj0 {
+            return Ok(_ptr::new_with_solid(
+                ptrtype.clone(),
+                Ok(Some(_ptr_obj::IntCast(*n))),
+                true,
+            ));
         }
         if down_or_up < 0 {
             // upstream (lltype.py:1436-1451): walk *up* the parent chain
@@ -3746,6 +3761,14 @@ pub static NONGCREF: LazyLock<Ptr> = LazyLock::new(|| Ptr {
     TO: PtrTarget::Opaque(OpaqueType::new("NONGCREF")),
 });
 
+/// `GCREF = lltype.Ptr(lltype.GcOpaqueType('GCREF'))` (llmemory.py:653) — the
+/// element type of the `GCARRAY_OF_PTR` placeholder array (`array_type_match`).
+pub static GCREF: LazyLock<LowLevelType> = LazyLock::new(|| {
+    LowLevelType::Ptr(Box::new(Ptr {
+        TO: PtrTarget::Opaque(OpaqueType::gc("GCREF")),
+    }))
+});
+
 fn new_opaque_container(TYPE: OpaqueType, name: &str, about: Option<LowLevelType>) -> _opaque {
     _opaque {
         _identity: fresh_low_level_container_identity(),
@@ -4528,6 +4551,16 @@ pub fn cast_opaque_ptr(PTRTYPE: &Ptr, ptr: &_ptr) -> Result<_ptr, String> {
         let container = opaque
             .container
             .ok_or_else(|| format!("{ptr:?} does not come from a container"))?;
+        // upstream (lltype.py:998): `if isinstance(container, int): return
+        // _ptr(PTRTYPE, container, solid=True)` — a hidden opaque holding a
+        // tagged-integer container re-tags it to the target type.
+        if let _ptr_obj::IntCast(n) = *container {
+            return Ok(_ptr::new_with_solid(
+                PTRTYPE.clone(),
+                Ok(Some(_ptr_obj::IntCast(n))),
+                true,
+            ));
+        }
         let p = _ptr::new_with_solid(
             Ptr::from_container_type(container._container_type())?,
             Ok(Some(*container)),
@@ -7092,18 +7125,23 @@ mod tests {
     }
 
     #[test]
-    fn fixup_solid_keeps_parentable_pointer_unchanged() {
+    fn fixup_solid_returns_solid_pointer_to_same_container() {
         // `fixup_solid(p)` (constfold.py:131-145) pins the parent of an inlined
-        // sub-pointer. pyre's strong `ParentLink` already satisfies the
-        // `_keepparent` keepalive, so it validates the container is a
-        // `_parentable` and returns the same pointer (container identity
-        // preserved). Both a plain array container and a `direct_arrayitems`
-        // `_subarray` interior pointer are `_parentable`.
+        // sub-pointer and returns `container._as_ptr()` — a solid pointer.
+        // pyre's strong `ParentLink` already satisfies the `_keepparent`
+        // keepalive, so it validates the container is a `_parentable` and
+        // rebuilds the pointer. `_ptr` equality is by container identity, so
+        // the result still equals the input. Both a plain array container and a
+        // `direct_arrayitems` `_subarray` interior pointer are `_parentable`.
         let array_ty = LowLevelType::Array(Box::new(ArrayType::gc(LowLevelType::Signed)));
         let arrayptr = malloc(array_ty, Some(3), MallocFlavor::Gc, true).unwrap();
-        assert_eq!(fixup_solid(&arrayptr).unwrap(), arrayptr);
+        let fixed = fixup_solid(&arrayptr).unwrap();
+        assert_eq!(fixed, arrayptr);
+        assert!(fixed._solid);
         let items = direct_arrayitems(&arrayptr).unwrap();
-        assert_eq!(fixup_solid(&items).unwrap(), items);
+        let fixed_items = fixup_solid(&items).unwrap();
+        assert_eq!(fixed_items, items);
+        assert!(fixed_items._solid);
     }
 
     #[test]

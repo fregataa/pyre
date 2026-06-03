@@ -9,9 +9,10 @@ use std::sync::LazyLock;
 use crate::annotator::model::{KnownType, SomeObjectBase, SomeObjectTrait, SomeValue};
 use crate::flowspace::model::ConstValue;
 use crate::translator::rtyper::lltypesystem::lltype::{
-    _address, _arraylenref, _endmarker, _ptr, _ptr_obj, _wref, GcKind, LowLevelType, NONGCREF,
-    ParentIndex, Ptr, PtrTarget, WEAKREF_PTR, cast_int_to_ptr, cast_opaque_ptr, cast_pointer,
-    container_value_as_ptr, direct_arrayitems, direct_fieldptr, direct_ptradd, nullptr, parentlink,
+    _address, _arraylenref, _endmarker, _ptr, _ptr_obj, _wref, ArrayContainer, GCREF, GcKind,
+    LowLevelType, NONGCREF, ParentIndex, Ptr, PtrTarget, WEAKREF_PTR, cast_int_to_ptr,
+    cast_opaque_ptr, cast_pointer, container_value_as_ptr, direct_arrayitems, direct_fieldptr,
+    direct_ptradd, nullptr, parentlink,
 };
 
 thread_local! {
@@ -396,9 +397,15 @@ fn item_offset_ref(ty: &LowLevelType, repeat: i64, firstitemptr: &_ptr) -> Resul
         });
         return Ok(endmarker._as_ptr(true));
     }
-    // `parent.getitem(index)` (llmemory.py:103) is Python list indexing, so a
-    // negative index addresses from the end; out-of-range declines.
-    let actual = if index < 0 { len + index } else { index };
+    // `parent.getitem(index)` (llmemory.py:103). A varsize `_array.getitem`
+    // (lltype.py:1927) is Python list indexing, so a negative index addresses
+    // from the end; a fixed-size array `_fixedsizearray.getitem`
+    // (lltype.py:1839) asserts `0 <= index < length`, so a negative index is
+    // rejected. Out-of-range declines either way.
+    let actual = match &arr.TYPE {
+        ArrayContainer::Array(_) if index < 0 => len + index,
+        _ => index,
+    };
     if actual < 0 || actual >= len {
         return Err(format!("ItemOffset::ref item {index} out of range"));
     }
@@ -530,11 +537,13 @@ fn primitive_array_matches_item(a: &LowLevelType, ty: &LowLevelType) -> bool {
 }
 
 /// `array_type_match(A1, A2)` (llmemory.py:662-666): the offset's stored array
-/// type `A2` must equal the pointer's actual array type `A1`, or `A2` is the
-/// `GCARRAY_OF_PTR` placeholder and `A1` is a length-prefixed `GcArray` of
-/// pointers. `GCARRAY_OF_PTR` (`GcArray(GCREF, hints={'placeholder': True})`)
+/// type `A2` must equal the pointer's actual array type `A1`, or `A2` is
+/// exactly the `GCARRAY_OF_PTR` token and `A1` is a length-prefixed `GcArray`
+/// of pointers. `GCARRAY_OF_PTR` (`GcArray(GCREF, hints={'placeholder': True})`)
 /// is minted only by the GC transformer, which pyre does not run, so the
-/// placeholder arm is unreachable here; it is modelled for completeness.
+/// placeholder arm is unreachable here; it is modelled for completeness. `A2`
+/// must match `GCARRAY_OF_PTR` exactly — a gc array of [`GCREF`] carrying the
+/// `placeholder` hint — not merely any placeholder gc array of pointers.
 fn array_type_match(a1: &LowLevelType, a2: &LowLevelType) -> bool {
     if a1 == a2 {
         return true;
@@ -543,7 +552,7 @@ fn array_type_match(a1: &LowLevelType, a2: &LowLevelType) -> bool {
         return false;
     };
     let a2_is_gcarray_of_ptr = a2_arr._gckind == GcKind::Gc
-        && matches!(a2_arr.OF, LowLevelType::Ptr(_))
+        && a2_arr.OF == *GCREF
         && matches!(
             a2_arr._hints.get("placeholder"),
             Some(ConstValue::Bool(true))
