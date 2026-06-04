@@ -289,9 +289,9 @@ impl pyre_interpreter::ConstantOpcodeHandler for crate::state::MIFrame {
         Ok(crate::state::FrontendOp::new(opref, concrete))
     }
 
-    fn str_constant(&mut self, value: &str) -> Result<Self::Value, pyre_interpreter::PyError> {
+    fn str_constant(&mut self, value: &rustpython_wtf8::Wtf8) -> Result<Self::Value, pyre_interpreter::PyError> {
         use crate::helpers::TraceHelperAccess;
-        let concrete = crate::state::ConcreteValue::Ref(pyre_object::w_str_new(value));
+        let concrete = crate::state::ConcreteValue::Ref(pyre_object::w_str_from_wtf8(value.to_owned()));
         let opref = self.trace_str_constant(value)?;
         Ok(crate::state::FrontendOp::new(opref, concrete))
     }
