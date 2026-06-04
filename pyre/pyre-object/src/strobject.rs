@@ -1,26 +1,36 @@
-//! W_StrObject -- Python `str` type backed by a heap-allocated String.
+//! W_StrObject -- Python `str` type backed by a heap-allocated WTF-8 buffer.
 //!
 //! Most string operations still go through residual helpers, but the object
 //! carries a stable length slot so truth/len paths can follow the same layout
 //! from both the interpreter and the tracer.
+//!
+//! The value buffer is a `Wtf8Buf` rather than a Rust `String`, mirroring
+//! PyPy's `W_UnicodeObject._utf8` (`pypy/objspace/std/unicodeobject.py`),
+//! which stores UTF-8 bytes that may carry encoded surrogates under
+//! `allow_surrogates=True`.  WTF-8 is the same model: a superset of UTF-8
+//! that can additionally represent lone surrogate code points.  Every
+//! Rust `&str` is valid WTF-8, so the common (surrogate-free) path is
+//! zero-cost via `Wtf8::as_str`.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+
+use rustpython_wtf8::{Wtf8, Wtf8Buf};
 
 use crate::pyobject::*;
 
 /// Python string object.
 ///
-/// Layout: `[ob_type | w_class | value:*mut String | byte_len | len]`
-/// `byte_len` is the UTF-8 byte count (RPython STR `rstr.py:1226
+/// Layout: `[ob_type | w_class | value:*mut Wtf8Buf | byte_len | len]`
+/// `byte_len` is the WTF-8 byte count (RPython STR `rstr.py:1226
 /// Array(Char)` parity — `llmodel.py:667 bh_strlen` reads this).
 /// `len` is the codepoint count (RPython UNICODE parity —
 /// `bh_unicodelen` reads this).  The `value` pointer owns a
-/// heap-allocated `String` (via `Box::into_raw`).
+/// heap-allocated `Wtf8Buf` (via `Box::into_raw`).
 #[repr(C)]
 pub struct W_StrObject {
     pub ob_header: PyObject,
-    pub value: *mut String,
+    pub value: *mut Wtf8Buf,
     pub byte_len: usize,
     pub len: usize,
 }
@@ -48,11 +58,32 @@ impl crate::lltype::GcType for W_StrObject {
 /// Allocate a new W_StrObject on the heap.
 ///
 /// Uses `Box::leak` for simplicity (objects are never freed).
-/// The inner `String` is also `Box::into_raw`'d so it can be recovered.
+/// The inner `Wtf8Buf` is also `Box::into_raw`'d so it can be recovered.
+/// `from_string` takes ownership of the bytes with no copy or
+/// re-validation (every `&str` is already valid WTF-8).
 pub fn w_str_new(s: &str) -> PyObjectRef {
-    let value = crate::lltype::malloc_raw(s.to_string());
+    let value = crate::lltype::malloc_raw(Wtf8Buf::from_string(s.to_string()));
     let byte_len = s.len();
     let char_len = s.chars().count();
+    crate::lltype::malloc_typed(W_StrObject {
+        ob_header: PyObject {
+            ob_type: &STR_TYPE as *const PyType,
+            w_class: get_instantiate(&STR_TYPE),
+        },
+        value,
+        byte_len,
+        len: char_len,
+    }) as PyObjectRef
+}
+
+/// Allocate a new W_StrObject from a WTF-8 buffer that may carry lone
+/// surrogate code points (produced by surrogateescape / surrogatepass
+/// decoding).  `byte_len` is the WTF-8 byte count, `len` the code point
+/// count (which counts each surrogate as one code point).
+pub fn w_str_from_wtf8(value: Wtf8Buf) -> PyObjectRef {
+    let byte_len = value.len();
+    let char_len = value.code_points().count();
+    let value = crate::lltype::malloc_raw(value);
     crate::lltype::malloc_typed(W_StrObject {
         ob_header: PyObject {
             ob_type: &STR_TYPE as *const PyType,
@@ -67,18 +98,19 @@ pub fn w_str_new(s: &str) -> PyObjectRef {
 thread_local! {
     /// String constant interning cache — single-threaded, no lock needed.
     /// RPython has no equivalent lock; string interning is handled by the
-    /// translator at compile time, not at runtime.
-    static STRING_CONSTANT_CACHE: RefCell<HashMap<String, usize>> =
+    /// translator at compile time, not at runtime.  Keyed by WTF-8 so a
+    /// surrogate-bearing constant (a `'\udcff'` literal) interns too.
+    static STRING_CONSTANT_CACHE: RefCell<HashMap<Wtf8Buf, usize>> =
         RefCell::new(HashMap::new());
 }
 
 /// Box a string constant into a heap Python str object.
-pub fn box_str_constant(value: &str) -> PyObjectRef {
+pub fn box_str_constant(value: &Wtf8) -> PyObjectRef {
     STRING_CONSTANT_CACHE.with(|cache| {
         if let Some(&cached) = cache.borrow().get(value) {
             return cached as PyObjectRef;
         }
-        let obj = w_str_new(value);
+        let obj = w_str_from_wtf8(value.to_owned());
         cache.borrow_mut().insert(value.to_owned(), obj as usize);
         obj
     })
@@ -88,11 +120,54 @@ pub fn box_str_constant(value: &str) -> PyObjectRef {
 ///
 /// # Safety
 /// `obj` must point to a valid `W_StrObject`.
+///
+/// # Panics
+/// The backing buffer is WTF-8.  Surrogateescape / surrogatepass decoding
+/// now produces surrogate-bearing strings, so a `&str` view is no longer
+/// guaranteed.  Consumers that must tolerate lone surrogates read through
+/// [`w_str_get_wtf8`]; the remaining (still-unmigrated) `&str` consumers
+/// reach this accessor and panic on a surrogate rather than silently
+/// corrupting, until each is migrated to the WTF-8 view.
 #[inline]
 pub unsafe fn w_str_get_value(obj: PyObjectRef) -> &'static str {
     unsafe {
         let str_obj = obj as *const W_StrObject;
+        (*(*str_obj).value)
+            .as_str()
+            .expect("w_str_get_value: backing Wtf8Buf is not valid UTF-8 (lone surrogate)")
+    }
+}
+
+/// Borrow the WTF-8 view of a known W_StrObject, surrogate-aware.
+///
+/// Unlike [`w_str_get_value`], this never panics on lone surrogates.
+/// Callers that must handle surrogate-bearing strings (codec encode,
+/// repr) read code points through this accessor.
+///
+/// # Safety
+/// `obj` must point to a valid `W_StrObject`.
+#[inline]
+pub unsafe fn w_str_get_wtf8(obj: PyObjectRef) -> &'static Wtf8 {
+    unsafe {
+        let str_obj = obj as *const W_StrObject;
         &*(*str_obj).value
+    }
+}
+
+/// Borrow a known W_StrObject as `&str`, or `None` when it carries a lone
+/// surrogate (so the backing is not valid UTF-8).
+///
+/// String-keyed fast paths that store keys in a `&str`-keyed map use this
+/// to skip surrogate keys and fall through to the generic object-keyed
+/// path instead of panicking in [`w_str_get_value`].
+///
+/// # Safety
+/// `obj` must point to a valid `W_StrObject`.
+#[inline]
+pub unsafe fn w_str_get_value_opt(obj: PyObjectRef) -> Option<&'static str> {
+    unsafe {
+        let str_obj = obj as *const W_StrObject;
+        (*(*str_obj).value).as_str().ok()
     }
 }
 
@@ -119,12 +194,12 @@ pub extern "C" fn jit_str_concat(a: i64, b: i64) -> i64 {
     let a = a as PyObjectRef;
     let b = b as PyObjectRef;
     unsafe {
-        let sa = w_str_get_value(a);
-        let sb = w_str_get_value(b);
-        let mut result = String::with_capacity(sa.len() + sb.len());
-        result.push_str(sa);
-        result.push_str(sb);
-        w_str_new(&result) as i64
+        let sa = w_str_get_wtf8(a);
+        let sb = w_str_get_wtf8(b);
+        let mut result = Wtf8Buf::with_capacity(sa.len() + sb.len());
+        result.push_wtf8(sa);
+        result.push_wtf8(sb);
+        w_str_from_wtf8(result) as i64
     }
 }
 
@@ -132,9 +207,13 @@ pub extern "C" fn jit_str_concat(a: i64, b: i64) -> i64 {
 pub extern "C" fn jit_str_repeat(s: i64, n: i64) -> i64 {
     let s = s as PyObjectRef;
     unsafe {
-        let sv = w_str_get_value(s);
+        let sv = w_str_get_wtf8(s);
         let count = if n < 0 { 0 } else { n as usize };
-        w_str_new(&sv.repeat(count)) as i64
+        let mut result = Wtf8Buf::with_capacity(sv.len() * count);
+        for _ in 0..count {
+            result.push_wtf8(sv);
+        }
+        w_str_from_wtf8(result) as i64
     }
 }
 
@@ -143,9 +222,11 @@ pub extern "C" fn jit_str_compare(a: i64, b: i64) -> i64 {
     let a = a as PyObjectRef;
     let b = b as PyObjectRef;
     unsafe {
-        let sa = w_str_get_value(a);
-        let sb = w_str_get_value(b);
-        match sa.cmp(sb) {
+        // WTF-8 byte order matches code point order, so the byte
+        // comparison yields the same result as comparing code points.
+        let sa = w_str_get_wtf8(a);
+        let sb = w_str_get_wtf8(b);
+        match sa.as_bytes().cmp(sb.as_bytes()) {
             std::cmp::Ordering::Less => -1,
             std::cmp::Ordering::Equal => 0,
             std::cmp::Ordering::Greater => 1,
@@ -210,8 +291,8 @@ mod tests {
 
     #[test]
     fn test_box_str_constant_reuses_same_object() {
-        let a = box_str_constant("pyre");
-        let b = box_str_constant("pyre");
+        let a = box_str_constant(Wtf8::new("pyre"));
+        let b = box_str_constant(Wtf8::new("pyre"));
         assert_eq!(a, b);
     }
 

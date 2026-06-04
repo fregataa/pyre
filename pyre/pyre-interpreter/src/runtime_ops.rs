@@ -5,9 +5,10 @@ use crate::bytecode::{BinaryOperator, ComparisonOperator};
 use pyre_object::{
     PY_NULL, PyObjectRef, W_SeqIterator, is_instance, is_list, is_range_iter, is_seq_iter, is_str,
     is_tuple, w_dict_new, w_dict_store, w_int_get_value, w_int_new, w_list_getitem, w_list_len,
-    w_list_new, w_range_iter_has_next, w_range_iter_next, w_str_get_value, w_str_new,
-    w_tuple_getitem, w_tuple_len, w_tuple_new,
+    w_list_new, w_range_iter_has_next, w_range_iter_next, w_str_from_wtf8, w_str_get_wtf8,
+    w_str_len, w_tuple_getitem, w_tuple_len, w_tuple_new,
 };
+use rustpython_wtf8::Wtf8Buf;
 
 use crate::{
     DictStorage, PyError, PyErrorKind, builtin_code_get, function_get_code, is_builtin_code,
@@ -753,7 +754,8 @@ pub fn sequence_len(seq: PyObjectRef) -> Result<usize, PyError> {
             return Ok(w_list_len(seq));
         }
         if is_str(seq) {
-            return Ok(w_str_get_value(seq).chars().count());
+            // Cached code point count — surrogate-safe (avoids w_str_get_value).
+            return Ok(w_str_len(seq));
         }
         // Try __len__ on instances
         if is_instance(seq) {
@@ -779,13 +781,15 @@ pub fn sequence_getitem(seq: PyObjectRef, index: usize) -> Result<PyObjectRef, P
                 .ok_or_else(|| PyError::type_error("list index out of range"));
         }
         if is_str(seq) {
-            let s = w_str_get_value(seq);
-            return s
-                .chars()
+            // Walk code points through the WTF-8 view so a surrogate-bearing
+            // string yields its lone surrogate instead of panicking.
+            return w_str_get_wtf8(seq)
+                .code_points()
                 .nth(index)
                 .map(|c| {
-                    let mut buf = [0u8; 4];
-                    w_str_new(c.encode_utf8(&mut buf))
+                    let mut one = Wtf8Buf::new();
+                    one.push(c);
+                    w_str_from_wtf8(one)
                 })
                 .ok_or_else(|| PyError::type_error("string index out of range"));
         }

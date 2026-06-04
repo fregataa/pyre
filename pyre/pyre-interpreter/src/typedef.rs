@@ -15,6 +15,7 @@ use std::sync::OnceLock;
 
 use pyre_object::pyobject::*;
 use pyre_object::*;
+use rustpython_wtf8::{CodePoint, Wtf8Buf};
 
 use crate::{
     DictStorage, dict_storage_store, make_builtin_function, make_builtin_function_with_arity,
@@ -1995,37 +1996,39 @@ fn init_str_type(ns: &mut DictStorage) {
             // maketrans(x[, y[, z]]) → translation dict
             let d = pyre_object::w_dict_new();
             if args.len() >= 3 {
-                // maketrans(x, y, z) — z is chars to delete (map to None)
-                let x = unsafe { pyre_object::w_str_get_value(args[0]) };
-                let y = unsafe { pyre_object::w_str_get_value(args[1]) };
-                let z = unsafe { pyre_object::w_str_get_value(args[2]) };
-                for (xc, yc) in x.chars().zip(y.chars()) {
+                // maketrans(x, y, z) — z is chars to delete (map to None).
+                // Keys/values are code-point ordinals, read through the
+                // WTF-8 view so a surrogate character does not panic.
+                let x = unsafe { pyre_object::w_str_get_wtf8(args[0]) };
+                let y = unsafe { pyre_object::w_str_get_wtf8(args[1]) };
+                let z = unsafe { pyre_object::w_str_get_wtf8(args[2]) };
+                for (xc, yc) in x.code_points().zip(y.code_points()) {
                     unsafe {
                         pyre_object::w_dict_store(
                             d,
-                            pyre_object::w_int_new(xc as i64),
-                            pyre_object::w_int_new(yc as i64),
+                            pyre_object::w_int_new(xc.to_u32() as i64),
+                            pyre_object::w_int_new(yc.to_u32() as i64),
                         );
                     }
                 }
-                for zc in z.chars() {
+                for zc in z.code_points() {
                     unsafe {
                         pyre_object::w_dict_store(
                             d,
-                            pyre_object::w_int_new(zc as i64),
+                            pyre_object::w_int_new(zc.to_u32() as i64),
                             pyre_object::w_none(),
                         );
                     }
                 }
             } else if args.len() >= 2 {
-                let x = unsafe { pyre_object::w_str_get_value(args[0]) };
-                let y = unsafe { pyre_object::w_str_get_value(args[1]) };
-                for (xc, yc) in x.chars().zip(y.chars()) {
+                let x = unsafe { pyre_object::w_str_get_wtf8(args[0]) };
+                let y = unsafe { pyre_object::w_str_get_wtf8(args[1]) };
+                for (xc, yc) in x.code_points().zip(y.code_points()) {
                     unsafe {
                         pyre_object::w_dict_store(
                             d,
-                            pyre_object::w_int_new(xc as i64),
-                            pyre_object::w_int_new(yc as i64),
+                            pyre_object::w_int_new(xc.to_u32() as i64),
+                            pyre_object::w_int_new(yc.to_u32() as i64),
                         );
                     }
                 }
@@ -2040,9 +2043,11 @@ fn init_str_type(ns: &mut DictStorage) {
                         let ord_key = if pyre_object::is_int(k) {
                             k
                         } else if pyre_object::is_str(k) {
-                            let s = pyre_object::w_str_get_value(k);
-                            let ch = s.chars().next().unwrap_or('\0');
-                            pyre_object::w_int_new(ch as i64)
+                            let s = pyre_object::w_str_get_wtf8(k);
+                            match s.code_points().next() {
+                                Some(cp) => pyre_object::w_int_new(cp.to_u32() as i64),
+                                None => pyre_object::w_int_new(0),
+                            }
                         } else {
                             k
                         };
@@ -7088,12 +7093,11 @@ fn bytearray_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
             }
             let encoding = pyre_object::w_str_get_value(rest[1]);
             let errors = if rest.len() >= 3 && pyre_object::is_str(rest[2]) {
-                Some(pyre_object::w_str_get_value(rest[2]))
+                pyre_object::w_str_get_value(rest[2])
             } else {
-                None
+                "strict"
             };
-            let s = pyre_object::w_str_get_value(arg);
-            let encoded = encode_str(s, Some(encoding), errors)?;
+            let encoded = crate::type_methods::encode_object(arg, encoding, errors)?;
             return Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(
                 &encoded,
             ));
@@ -8804,6 +8808,121 @@ fn unicode_decode_error_msg(
     }
 }
 
+/// unicodehelper.py:13-23 decode_error_handler — raises a structured
+/// UnicodeDecodeError, mirroring `OperationError(space.w_UnicodeDecodeError,
+/// space.newtuple([encoding, w_s, start, end, msg]))`.  Populates the
+/// `.encoding`/`.object`/`.start`/`.end`/`.reason` fields per
+/// `W_UnicodeDecodeError.descr_init` (interp_exceptions.py:1041-1059) so
+/// the caught exception carries the full attribute set, not just a message.
+/// `.object` holds the whole bytes buffer; `start`/`end` index into it.
+pub(crate) fn unicode_decode_error(
+    encoding: &str,
+    data: &[u8],
+    start: usize,
+    end: usize,
+    reason: &str,
+) -> crate::PyError {
+    let w_encoding = pyre_object::w_str_new(encoding);
+    let w_object = pyre_object::w_bytes_from_bytes(data);
+    let w_start = pyre_object::w_int_new(start as i64);
+    let w_end = pyre_object::w_int_new(end as i64);
+    let w_reason = pyre_object::w_str_new(reason);
+    // Eager message for PyError.message; descr_str recomputes the same
+    // text from the fields (display.rs unicode_decode_error_str).
+    let msg = unicode_decode_error_msg(encoding, data, start, end, reason);
+    let exc = pyre_object::excobject::w_exception_new(
+        pyre_object::excobject::ExcKind::UnicodeDecodeError,
+        &msg,
+    );
+    unsafe {
+        pyre_object::excobject::w_exception_set_encoding(exc, w_encoding);
+        pyre_object::excobject::w_exception_set_object(exc, w_object);
+        pyre_object::excobject::w_exception_set_start(exc, w_start);
+        pyre_object::excobject::w_exception_set_end(exc, w_end);
+        pyre_object::excobject::w_exception_set_reason(exc, w_reason);
+        // W_BaseException.descr_init: args_w = [encoding, object, start, end, reason]
+        let args_list =
+            pyre_object::w_list_new(vec![w_encoding, w_object, w_start, w_end, w_reason]);
+        pyre_object::excobject::w_exception_set_args(exc, args_list);
+        crate::PyError::from_exc_object(exc)
+    }
+}
+
+/// interp_exceptions.py:1175-1191 W_UnicodeEncodeError.descr_str format.
+/// `w_object` is the str being encoded; the bad code point is read at
+/// `start` through the surrogate-aware WTF-8 view.
+fn unicode_encode_error_msg(
+    codec: &str,
+    w_object: PyObjectRef,
+    start: usize,
+    end: usize,
+    reason: &str,
+) -> String {
+    if end == start + 1 {
+        let badchar = unsafe {
+            pyre_object::w_str_get_wtf8(w_object)
+                .code_points()
+                .nth(start)
+                .map(|c| c.to_u32())
+                .unwrap_or(0)
+        };
+        let badchar_repr = if badchar <= 0xff {
+            format!("'\\x{badchar:02x}'")
+        } else if badchar <= 0xffff {
+            format!("'\\u{badchar:04x}'")
+        } else {
+            format!("'\\U{badchar:08x}'")
+        };
+        format!(
+            "'{codec}' codec can't encode character {badchar_repr} in position {start}: {reason}"
+        )
+    } else {
+        format!(
+            "'{codec}' codec can't encode characters in position {start}-{}: {reason}",
+            end - 1
+        )
+    }
+}
+
+/// unicodehelper.py encode_error_handler — raises a structured
+/// UnicodeEncodeError, mirroring `OperationError(space.w_UnicodeEncodeError,
+/// space.newtuple([encoding, w_obj, start, end, msg]))`.  Populates the
+/// `.encoding`/`.object`/`.start`/`.end`/`.reason` fields per
+/// `W_UnicodeEncodeError.descr_init` (interp_exceptions.py:1153-1173) so the
+/// caught exception carries the full attribute set, not just a message.
+/// `.object` holds the whole str; `start`/`end` index code points into it.
+pub(crate) fn unicode_encode_error(
+    encoding: &str,
+    w_object: PyObjectRef,
+    start: usize,
+    end: usize,
+    reason: &str,
+) -> crate::PyError {
+    let w_encoding = pyre_object::w_str_new(encoding);
+    let w_start = pyre_object::w_int_new(start as i64);
+    let w_end = pyre_object::w_int_new(end as i64);
+    let w_reason = pyre_object::w_str_new(reason);
+    // Eager message for PyError.message; descr_str recomputes the same text
+    // from the fields (display.rs unicode_encode_error_str).
+    let msg = unicode_encode_error_msg(encoding, w_object, start, end, reason);
+    let exc = pyre_object::excobject::w_exception_new(
+        pyre_object::excobject::ExcKind::UnicodeEncodeError,
+        &msg,
+    );
+    unsafe {
+        pyre_object::excobject::w_exception_set_encoding(exc, w_encoding);
+        pyre_object::excobject::w_exception_set_object(exc, w_object);
+        pyre_object::excobject::w_exception_set_start(exc, w_start);
+        pyre_object::excobject::w_exception_set_end(exc, w_end);
+        pyre_object::excobject::w_exception_set_reason(exc, w_reason);
+        // W_BaseException.descr_init: args_w = [encoding, object, start, end, reason]
+        let args_list =
+            pyre_object::w_list_new(vec![w_encoding, w_object, w_start, w_end, w_reason]);
+        pyre_object::excobject::w_exception_set_args(exc, args_list);
+        crate::PyError::from_exc_object(exc)
+    }
+}
+
 /// unicodehelper.py:15-22 — strict errorhandler raises UnicodeDecodeError
 fn utf8_strict_handler(
     data: &[u8],
@@ -8811,10 +8930,7 @@ fn utf8_strict_handler(
     end: usize,
     reason: &str,
 ) -> Result<(), crate::PyError> {
-    Err(crate::PyError::new(
-        crate::PyErrorKind::UnicodeDecodeError,
-        unicode_decode_error_msg("utf-8", data, start, end, reason),
-    ))
+    Err(unicode_decode_error("utf-8", data, start, end, reason))
 }
 
 /// Handle a decode error for non-strict modes.
@@ -8826,7 +8942,7 @@ fn utf8_error_handler(
     start: usize,
     end: usize,
     reason: &str,
-    out: &mut String,
+    out: &mut Wtf8Buf,
 ) -> Result<usize, crate::PyError> {
     match err_mode {
         "strict" => {
@@ -8835,17 +8951,68 @@ fn utf8_error_handler(
         }
         "ignore" => Ok(end),
         "replace" => {
-            out.push('\u{FFFD}');
+            out.push_char('\u{FFFD}');
             Ok(end)
         }
-        // interp_codecs.py:515-555 surrogateescape / :431-513 surrogatepass
-        // PyPy stores surrogates via rutf8 allow_surrogates=True (WTF-8).
-        // pyre's W_StrObject backs onto Rust String (&str = valid UTF-8),
-        // so surrogate codepoints cannot be represented.  Re-raise.
-        "surrogateescape" | "surrogatepass" => Err(crate::PyError::new(
-            crate::PyErrorKind::UnicodeDecodeError,
-            unicode_decode_error_msg("utf-8", data, start, end, reason),
-        )),
+        // interp_codecs.py:536-555 surrogateescape_errors (decode branch).
+        // Escape up to four non-ASCII bytes as lone surrogates 0xdc00+c;
+        // refuse to escape ASCII bytes; if none consumed, re-raise.
+        "surrogateescape" => {
+            let mut consumed = 0;
+            while consumed < 4 && consumed < end - start {
+                let c = data[start + consumed];
+                if c < 128 {
+                    // Refuse to escape ASCII bytes.
+                    break;
+                }
+                out.push(CodePoint::from_u32(0xDC00 + c as u32).unwrap());
+                consumed += 1;
+            }
+            if consumed == 0 {
+                // codec complained about ASCII byte.
+                return Err(unicode_decode_error("utf-8", data, start, end, reason));
+            }
+            Ok(start + consumed)
+        }
+        // interp_codecs.py:476-510 surrogatepass_errors (decode branch).
+        // Decode a single three-byte UTF-8 surrogate (ED A0..BF 80..BF) at
+        // `start`; if it is not a surrogate, re-raise the original error.
+        "surrogatepass" => {
+            let ch0 = if data.len() > start {
+                data[start] as i32
+            } else {
+                -1
+            };
+            let ch1 = if data.len() > start + 1 {
+                data[start + 1] as i32
+            } else {
+                -1
+            };
+            let ch2 = if data.len() > start + 2 {
+                data[start + 2] as i32
+            } else {
+                -1
+            };
+            let mut ch = 0;
+            if ch1 != -1
+                && ch2 != -1
+                && ch0 & 0xf0 == 0xe0
+                && ch1 & 0xc0 == 0x80
+                && ch2 & 0xc0 == 0x80
+            {
+                // it's a three-byte code
+                ch = ((ch0 & 0x0f) << 12) + ((ch1 & 0x3f) << 6) + (ch2 & 0x3f);
+            }
+            if !(0xd800..=0xdfff).contains(&ch) {
+                // it's not a surrogate - fail
+                ch = 0;
+            }
+            if ch == 0 {
+                return Err(unicode_decode_error("utf-8", data, start, end, reason));
+            }
+            out.push(CodePoint::from_u32(ch as u32).unwrap());
+            Ok(start + 3)
+        }
         "backslashreplace" => {
             for &b in &data[start..end] {
                 out.push_str(&format!("\\x{:02x}", b));
@@ -8895,10 +9062,10 @@ fn invalid_byte_2_of_4(ch1: u8, ch2: u8) -> bool {
 /// PyPy appends raw UTF-8 bytes to a StringBuilder; Rust reconstructs
 /// Unicode scalar values via char::from_u32.  Surrogates are always
 /// rejected by invalid_byte_2_of_3 and routed to the error handler.
-fn decode_utf8_with_errors(data: &[u8], err_mode: &str) -> Result<String, crate::PyError> {
+fn decode_utf8_with_errors(data: &[u8], err_mode: &str) -> Result<Wtf8Buf, crate::PyError> {
     let s = data;
     let size = s.len();
-    let mut result = String::new();
+    let mut result = Wtf8Buf::new();
     let mut pos = 0;
     let final_ = true; // pyre always decodes complete buffers
 
@@ -8906,7 +9073,7 @@ fn decode_utf8_with_errors(data: &[u8], err_mode: &str) -> Result<String, crate:
         let ordch1 = s[pos];
         // unicodehelper.py:394 fast path for ASCII
         if ordch1 <= 0x7F {
-            result.push(ordch1 as char);
+            result.push_char(ordch1 as char);
             pos += 1;
             continue;
         }
@@ -9021,7 +9188,7 @@ fn decode_utf8_with_errors(data: &[u8], err_mode: &str) -> Result<String, crate:
             // 110yyyyy 10zzzzzz
             let cp = ((ordch1 as u32 & 0x1F) << 6) | (ordch2 as u32 & 0x3F);
             if let Some(c) = char::from_u32(cp) {
-                result.push(c);
+                result.push_char(c);
             }
             pos += 2;
         } else if n == 3 {
@@ -9055,7 +9222,7 @@ fn decode_utf8_with_errors(data: &[u8], err_mode: &str) -> Result<String, crate:
                 | ((ordch2 as u32 & 0x3F) << 6)
                 | (ordch3 as u32 & 0x3F);
             if let Some(c) = char::from_u32(cp) {
-                result.push(c);
+                result.push_char(c);
             }
             pos += 3;
         } else {
@@ -9102,7 +9269,7 @@ fn decode_utf8_with_errors(data: &[u8], err_mode: &str) -> Result<String, crate:
                 | ((ordch3 as u32 & 0x3F) << 6)
                 | (ordch4 as u32 & 0x3F);
             if let Some(c) = char::from_u32(cp) {
-                result.push(c);
+                result.push_char(c);
             }
             pos += 4;
         }
@@ -9148,31 +9315,40 @@ fn bytes_method_decode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     let s = match enc_lower.as_str() {
         "utf-8" | "utf8" | "u8" => decode_utf8_with_errors(data, err_mode)?,
         "ascii" | "us-ascii" | "646" => {
-            let mut out = String::new();
+            let mut out = Wtf8Buf::new();
             for (i, &b) in data.iter().enumerate() {
                 if b >= 0x80 {
                     match err_mode {
                         "strict" => {
-                            return Err(crate::PyError::new(
-                                crate::PyErrorKind::UnicodeDecodeError,
-                                format!(
-                                    "'ascii' codec can't decode byte 0x{:02x} in position {i}: ordinal not in range(128)",
-                                    b
-                                ),
+                            return Err(unicode_decode_error(
+                                "ascii",
+                                data,
+                                i,
+                                i + 1,
+                                "ordinal not in range(128)",
                             ));
                         }
                         "ignore" => continue,
                         "replace" => {
-                            out.push('\u{FFFD}');
+                            out.push_char('\u{FFFD}');
                             continue;
                         }
-                        "surrogateescape" | "surrogatepass" => {
-                            return Err(crate::PyError::new(
-                                crate::PyErrorKind::UnicodeDecodeError,
-                                format!(
-                                    "'ascii' codec can't decode byte 0x{:02x} in position {i}: ordinal not in range(128)",
-                                    b
-                                ),
+                        // surrogateescape escapes the non-ASCII byte as a lone
+                        // surrogate 0xdc00+b (interp_codecs.py:536-555).
+                        "surrogateescape" => {
+                            out.push(CodePoint::from_u32(0xDC00 + b as u32).unwrap());
+                            continue;
+                        }
+                        // surrogatepass only decodes three-byte UTF-8 surrogate
+                        // sequences; a single non-ASCII byte is not one, so it
+                        // re-raises (interp_codecs.py:476-510).
+                        "surrogatepass" => {
+                            return Err(unicode_decode_error(
+                                "ascii",
+                                data,
+                                i,
+                                i + 1,
+                                "ordinal not in range(128)",
                             ));
                         }
                         "backslashreplace" => {
@@ -9190,13 +9366,15 @@ fn bytes_method_decode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
                         }
                     }
                 }
-                out.push(b as char);
+                out.push_char(b as char);
             }
             out
         }
-        "latin-1" | "latin1" | "iso-8859-1" | "8859" => data.iter().map(|&b| b as char).collect(),
+        "latin-1" | "latin1" | "iso-8859-1" | "8859" => {
+            Wtf8Buf::from_string(data.iter().map(|&b| b as char).collect::<String>())
+        }
         _ => {
-            if let Some(result) = crate::type_methods::decode_utf16_32(data, &enc_lower) {
+            if let Some(result) = crate::type_methods::decode_utf16_32(data, &enc_lower, err_mode) {
                 result?
             } else {
                 return Err(crate::PyError::new(
@@ -9206,7 +9384,7 @@ fn bytes_method_decode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
             }
         }
     };
-    Ok(pyre_object::w_str_new(&s))
+    Ok(pyre_object::w_str_from_wtf8(s))
 }
 
 /// PyPy: bytesobject.py descr_repr — returns a quoted literal like `b'hello'`.
@@ -9239,63 +9417,6 @@ fn bytes_method_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     Ok(pyre_object::w_str_new(&out))
 }
 
-/// `bytes.__new__(cls, *args)` — PyPy: bytesobject.py descr__new__
-/// `unicodeobject.py W_UnicodeObject.descr_encode` parity for the
-/// common encodings.  ASCII / Latin-1 emit per-character bytes and
-/// reject out-of-range codepoints with UnicodeEncodeError; UTF-8 is
-/// the lossless default Rust string representation.  An unknown
-/// encoding surfaces LookupError("unknown encoding: <name>").
-fn encode_str(
-    s: &str,
-    encoding: Option<&str>,
-    _errors: Option<&str>,
-) -> Result<Vec<u8>, crate::PyError> {
-    let enc = encoding.unwrap_or("utf-8");
-    let lower = enc.to_ascii_lowercase().replace('_', "-");
-    match lower.as_str() {
-        "utf-8" | "utf8" | "u8" => Ok(s.as_bytes().to_vec()),
-        "ascii" | "us-ascii" | "646" => {
-            for (i, ch) in s.chars().enumerate() {
-                if (ch as u32) >= 0x80 {
-                    return Err(crate::PyError::new(
-                        crate::PyErrorKind::UnicodeEncodeError,
-                        format!(
-                            "'ascii' codec can't encode character '\\x{:x}' in position {}",
-                            ch as u32, i
-                        ),
-                    ));
-                }
-            }
-            Ok(s.as_bytes().to_vec())
-        }
-        "latin-1" | "latin1" | "iso-8859-1" | "8859" => {
-            let mut out = Vec::with_capacity(s.len());
-            for (i, ch) in s.chars().enumerate() {
-                if (ch as u32) > 0xff {
-                    return Err(crate::PyError::new(
-                        crate::PyErrorKind::UnicodeEncodeError,
-                        format!(
-                            "'latin-1' codec can't encode character '\\u{:04x}' in position {}",
-                            ch as u32, i
-                        ),
-                    ));
-                }
-                out.push(ch as u8);
-            }
-            Ok(out)
-        }
-        _ => {
-            if let Some(out) = crate::type_methods::encode_utf16_32(s, &lower) {
-                return Ok(out);
-            }
-            Err(crate::PyError::new(
-                crate::PyErrorKind::LookupError,
-                format!("unknown encoding: {enc}"),
-            ))
-        }
-    }
-}
-
 fn bytes_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // args[0] = cls (ignored for now)
     // bytes()           → empty
@@ -9318,12 +9439,11 @@ fn bytes_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
             }
             let encoding = pyre_object::w_str_get_value(args[2]);
             let errors = if args.len() >= 4 && pyre_object::is_str(args[3]) {
-                Some(pyre_object::w_str_get_value(args[3]))
+                pyre_object::w_str_get_value(args[3])
             } else {
-                None
+                "strict"
             };
-            let s = pyre_object::w_str_get_value(arg);
-            let encoded = encode_str(s, Some(encoding), errors)?;
+            let encoded = crate::type_methods::encode_object(arg, encoding, errors)?;
             return Ok(pyre_object::bytesobject::w_bytes_from_bytes(&encoded));
         }
         if has_encoding {

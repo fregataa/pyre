@@ -2383,9 +2383,7 @@ fn pyobject_from_constant(constant: &crate::bytecode::ConstantData) -> PyObjectR
         ConstantData::Boolean { value } => pyre_object::w_bool_from(*value),
         // `eval.rs:1317-1319 str_constant` — `box_str_constant` interns
         // matching `space.newtext` per `unicodeobject.py wrapunicode`.
-        ConstantData::Str { value } => pyre_object::strobject::box_str_constant(
-            value.as_str().expect("non-UTF-8 string constant"),
-        ),
+        ConstantData::Str { value } => pyre_object::strobject::box_str_constant(value),
         // `eval.rs:1321-1323 bytes_constant`.
         ConstantData::Bytes { value } => pyre_object::bytesobject::w_bytes_from_bytes(value),
         // `eval.rs:1325-1331 code_constant` — same pointer-cast helper.

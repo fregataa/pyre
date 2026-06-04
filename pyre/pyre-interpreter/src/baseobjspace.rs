@@ -22,6 +22,7 @@ use crate::function::is_function;
 pub use crate::{PyError, PyErrorKind, PyResult};
 use pyre_object::strobject::is_str;
 use pyre_object::*;
+use rustpython_wtf8::{CodePoint, Wtf8Buf};
 
 // ── Re-exports from split-out modules ────────────────────────────────
 pub use crate::objspace::descroperation::*;
@@ -917,35 +918,34 @@ unsafe fn getitem_tuple(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
 
 #[inline(never)]
 unsafe fn getitem_str(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
-    let s = w_str_get_value(obj);
+    // Index code points through the surrogate-aware WTF-8 view so a
+    // surrogateescape / surrogatepass-decoded string can be sliced and
+    // indexed without going through `w_str_get_value`.
+    let cps: Vec<CodePoint> = w_str_get_wtf8(obj).code_points().collect();
     if is_slice(index) {
         // `pypy/objspace/std/unicodeobject.py W_UnicodeObject._getitem_slice`
         // → `slice.indices(len)` (`pypy/objspace/std/sliceobject.py`).
         // Reuse the shared `normalize_slice` helper so negative-step
         // defaults (`s[::-1]`, `s[5::-1]`) match list/tuple semantics.
-        let chars: Vec<char> = s.chars().collect();
-        let len = chars.len() as i64;
+        let len = cps.len() as i64;
         let (start, stop, step) = normalize_slice(index, len)?;
-        let mut result = String::new();
+        let mut result = Wtf8Buf::new();
         let mut i = start;
         while (step > 0 && i < stop) || (step < 0 && i > stop) {
-            if i >= 0 && (i as usize) < chars.len() {
-                result.push(chars[i as usize]);
+            if i >= 0 && (i as usize) < cps.len() {
+                result.push(cps[i as usize]);
             }
             i += step;
         }
-        return Ok(w_str_new(&result));
+        return Ok(w_str_from_wtf8(result));
     }
     if is_int(index) {
         let idx = w_int_get_value(index);
-        let chars: Vec<char> = s.chars().collect();
-        let actual_idx = if idx < 0 {
-            chars.len() as i64 + idx
-        } else {
-            idx
-        } as usize;
-        if actual_idx < chars.len() {
-            return Ok(w_str_new(&chars[actual_idx].to_string()));
+        let actual_idx = if idx < 0 { cps.len() as i64 + idx } else { idx } as usize;
+        if actual_idx < cps.len() {
+            let mut one = Wtf8Buf::new();
+            one.push(cps[actual_idx]);
+            return Ok(w_str_from_wtf8(one));
         }
         return Err(PyError::new(
             PyErrorKind::IndexError,
@@ -5598,7 +5598,10 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
             return Ok(pyre_object::w_seq_iter_new(obj, w_tuple_len(obj)));
         }
         if is_str(obj) {
-            let len = w_str_get_value(obj).len();
+            // Code-point count (not byte count) seeds the sequence
+            // iterator, read straight from the cached length so a
+            // lone-surrogate backing does not panic.
+            let len = w_str_len(obj);
             return Ok(pyre_object::w_seq_iter_new(obj, len));
         }
         if pyre_object::bytesobject::is_bytes_like(obj) {
@@ -5773,11 +5776,22 @@ pub fn next(obj: PyObjectRef) -> PyResult {
             } else if is_tuple(seq) {
                 pyre_object::w_tuple_getitem(seq, idx)
             } else if is_str(seq) {
-                let s = w_str_get_value(seq);
-                s.chars().nth(idx as usize).map(|c| {
-                    let mut buf = [0u8; 4];
-                    w_str_new(c.encode_utf8(&mut buf))
-                })
+                // Box the idx-th code point as a one-character str,
+                // reading the WTF-8 view so a lone surrogate is yielded
+                // instead of panicking.
+                let s = w_str_get_wtf8(seq);
+                let mut found: Option<PyObjectRef> = None;
+                let mut n = 0i64;
+                for cp in s.code_points() {
+                    if n == idx {
+                        let mut one = Wtf8Buf::new();
+                        one.push(cp);
+                        found = Some(w_str_from_wtf8(one));
+                        break;
+                    }
+                    n += 1;
+                }
+                found
             } else {
                 None
             };
@@ -6770,9 +6784,12 @@ pub fn contains(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, PyEr
             return Ok(false);
         }
         if is_str(haystack) && is_str(needle) {
-            let h = w_str_get_value(haystack);
-            let n = w_str_get_value(needle);
-            return Ok(h.contains(n));
+            // Substring test over the WTF-8 bytes: the encoding is
+            // self-synchronizing, so a byte-level match coincides with a
+            // codepoint-level match and lone surrogates compare correctly.
+            let h = pyre_object::w_str_get_wtf8(haystack).as_bytes();
+            let n = pyre_object::w_str_get_wtf8(needle).as_bytes();
+            return Ok(n.is_empty() || h.windows(n.len()).any(|w| w == n));
         }
         // dict: key containment (dictobject.py __contains__)
         if is_dict(haystack) {
@@ -6888,7 +6905,10 @@ pub fn eq_w(a: PyObjectRef, b: PyObjectRef) -> bool {
             return av == bv;
         }
         if is_str(a) && is_str(b) {
-            return w_str_get_value(a) == w_str_get_value(b);
+            // Compare WTF-8 bytes so lone-surrogate strings compare by
+            // content instead of panicking in `w_str_get_value`.
+            return pyre_object::w_str_get_wtf8(a).as_bytes()
+                == pyre_object::w_str_get_wtf8(b).as_bytes();
         }
     }
     compare(a, b, CompareOp::Eq)

@@ -12,3 +12,4 @@ num-traits = { workspace = true }
 majit-macros = { workspace = true }
 pyre-macros = { workspace = true }
 indexmap = { workspace = true }
+rustpython-wtf8 = { workspace = true }

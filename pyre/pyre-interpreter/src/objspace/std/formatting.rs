@@ -4,11 +4,27 @@
 use crate::objspace::descroperation::{int_value, is_int_like};
 use crate::{PyError, PyErrorKind, PyResult};
 use pyre_object::*;
+use rustpython_wtf8::{CodePoint, Wtf8, Wtf8Buf};
+
+/// Take the first `n` code points of a WTF-8 string (the `%`-format
+/// precision truncation, surrogate-aware).
+fn take_code_points(body: &Wtf8, n: usize) -> Wtf8Buf {
+    let mut out = Wtf8Buf::new();
+    let mut k = 0usize;
+    for cp in body.code_points() {
+        if k >= n {
+            break;
+        }
+        out.push(cp);
+        k += 1;
+    }
+    out
+}
 
 /// `str % args` — printf-style string formatting.
 /// PyPy: unicodeobject.py mod__String_ANY → formatting.py
 pub(crate) unsafe fn str_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> PyResult {
-    let fmt_str = w_str_get_value(fmt);
+    let fmt_str = w_str_get_wtf8(fmt);
     // `formatting.py:39-46 StringFormatter.__init__` — when `args`
     // is a tuple, `values_w` is the unpacked positional list; for
     // any other shape (mapping, single value), `values_w` stays
@@ -28,7 +44,7 @@ pub(crate) unsafe fn str_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> 
         vec![args]
     };
 
-    let mut result = String::new();
+    let mut result = Wtf8Buf::new();
     let mut arg_idx = 0;
     let bytes = fmt_str.as_bytes();
     let mut i = 0;
@@ -165,7 +181,7 @@ pub(crate) unsafe fn str_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> 
             let spec = bytes[i] as char;
             i += 1;
             if spec == '%' {
-                result.push('%');
+                result.push_char('%');
                 continue;
             }
             let arg = if let Some(na) = named_arg {
@@ -195,6 +211,29 @@ pub(crate) unsafe fn str_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> 
                 }
                 s
             };
+            // WTF-8 counterpart of `pad` for the `%s` / `%c` bodies,
+            // which may carry a lone surrogate; pads to `width` code
+            // points with spaces.
+            let pad_wtf8 = |body: &Wtf8| -> Wtf8Buf {
+                let body_len = body.code_points().count();
+                if body_len >= width {
+                    return body.to_wtf8_buf();
+                }
+                let need = width - body_len;
+                let mut out = Wtf8Buf::with_capacity(body.len() + need);
+                if left_align {
+                    out.push_wtf8(body);
+                    for _ in 0..need {
+                        out.push_char(' ');
+                    }
+                } else {
+                    for _ in 0..need {
+                        out.push_char(' ');
+                    }
+                    out.push_wtf8(body);
+                }
+                out
+            };
             let sign_prefix = |val: i64| -> &'static str {
                 if val < 0 {
                     "-"
@@ -208,11 +247,15 @@ pub(crate) unsafe fn str_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> 
             };
             match spec {
                 's' => {
-                    let mut body = crate::py_str(arg);
-                    if let Some(p) = precision {
-                        body = body.chars().take(p).collect();
-                    }
-                    result.push_str(&pad(body));
+                    // `%s` is `str(self)`, preserved in WTF-8 so a lone
+                    // surrogate (a str, or an exception whose single
+                    // argument is a str) survives.
+                    let body = crate::py_str_wtf8(arg);
+                    let body = match precision {
+                        Some(p) => take_code_points(&body, p),
+                        None => body,
+                    };
+                    result.push_wtf8(&pad_wtf8(&body));
                 }
                 'r' => {
                     let mut body = crate::py_repr(arg);
@@ -408,19 +451,25 @@ pub(crate) unsafe fn str_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> 
                                 "%c arg not in range(0x110000)".to_string(),
                             ));
                         }
-                        let c = char::from_u32(v as u32).ok_or_else(|| {
+                        // A surrogate ordinal (0xD800..=0xDFFF) is a valid
+                        // single character, so build the body from a
+                        // CodePoint rather than a `char` (which rejects
+                        // surrogates).
+                        let cp = CodePoint::from_u32(v as u32).ok_or_else(|| {
                             PyError::new(
                                 PyErrorKind::OverflowError,
                                 "%c arg not in range(0x110000)".to_string(),
                             )
                         })?;
-                        result.push_str(&pad(c.to_string()));
+                        let mut one = Wtf8Buf::with_capacity(4);
+                        one.push(cp);
+                        result.push_wtf8(&pad_wtf8(&one));
                     } else if is_str(arg) {
-                        let s = w_str_get_value(arg);
-                        if s.chars().count() != 1 {
+                        let s = w_str_get_wtf8(arg);
+                        if s.code_points().count() != 1 {
                             return Err(PyError::type_error("%c requires int or single character"));
                         }
-                        result.push_str(&pad(s.to_string()));
+                        result.push_wtf8(&pad_wtf8(s));
                     } else {
                         return Err(PyError::type_error(format!(
                             "%c requires int or char, not {}",
@@ -438,11 +487,21 @@ pub(crate) unsafe fn str_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> 
                     )));
                 }
             }
+        } else if bytes[i] == b'%' {
+            // Trailing lone `%` (no following byte) — emit literally.
+            result.push_char('%');
+            i += 1;
         } else {
-            let rest = std::str::from_utf8(&bytes[i..]).unwrap_or("\u{FFFD}");
-            let ch = rest.chars().next().unwrap_or('\u{FFFD}');
-            result.push(ch);
-            i += ch.len_utf8();
+            // Literal run up to the next `%`; `%` is a single ASCII byte
+            // that never occurs inside a multi-byte sequence, so the run
+            // is itself valid WTF-8 and copies whole (preserving any
+            // surrogate in the template and avoiding byte-at-a-time
+            // decoding).
+            let start = i;
+            while i < bytes.len() && bytes[i] != b'%' {
+                i += 1;
+            }
+            result.push_wtf8(unsafe { Wtf8::from_bytes_unchecked(&bytes[start..i]) });
         }
     }
     // `formatting.py:572-580 checkconsumed` — surplus positional
@@ -455,7 +514,7 @@ pub(crate) unsafe fn str_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> 
             "not all arguments converted during string formatting",
         ));
     }
-    Ok(w_str_new(&result))
+    Ok(pyre_object::w_str_from_wtf8(result))
 }
 
 /// `formatting.py fmt_g / fmt_G` parity helper — emits the `%g` body

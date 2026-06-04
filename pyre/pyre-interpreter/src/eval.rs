@@ -1470,16 +1470,19 @@ impl IterOpcodeHandler for PyFrame {
             }
             // str → list of 1-char strings → seq_iter
             if pyre_object::is_str(iter) {
-                let s = pyre_object::w_str_get_value(iter);
-                let chars: Vec<pyre_object::PyObjectRef> = s
-                    .chars()
+                // Walk code points through the WTF-8 view so iterating a
+                // surrogateescape / surrogatepass-decoded string yields its
+                // lone surrogates instead of panicking in w_str_get_value.
+                let chars: Vec<pyre_object::PyObjectRef> = pyre_object::w_str_get_wtf8(iter)
+                    .code_points()
                     .map(|c| {
-                        let mut buf = [0u8; 4];
-                        pyre_object::w_str_new(c.encode_utf8(&mut buf))
+                        let mut one = rustpython_wtf8::Wtf8Buf::new();
+                        one.push(c);
+                        pyre_object::w_str_from_wtf8(one)
                     })
                     .collect();
+                let len = chars.len();
                 let char_list = pyre_object::w_list_new(chars);
-                let len = s.chars().count();
                 let seq_iter = pyre_object::w_seq_iter_new(char_list, len);
                 let tos = self.valuestackdepth - 1;
                 self.locals_w_mut()[tos] = seq_iter;
@@ -1786,7 +1789,7 @@ impl ConstantOpcodeHandler for PyFrame {
         Ok(w_bool_from(value))
     }
 
-    fn str_constant(&mut self, value: &str) -> Result<Self::Value, PyError> {
+    fn str_constant(&mut self, value: &rustpython_wtf8::Wtf8) -> Result<Self::Value, PyError> {
         Ok(box_str_constant(value))
     }
 
@@ -2218,7 +2221,7 @@ impl OpcodeStepExecutor for PyFrame {
         // `f'{x}'` → `PyObject_Format(x, NULL)`; a user `__format__` is
         // invoked with an empty spec, otherwise this is `str(value)`.
         let s = crate::type_methods::format_value_dispatch(val, "")?;
-        self.push(pyre_object::w_str_new(&s));
+        self.push(pyre_object::w_str_from_wtf8(s));
         Ok(())
     }
 
@@ -2230,21 +2233,41 @@ impl OpcodeStepExecutor for PyFrame {
         // `__format__` when present, else apply the shared spec parser
         // (empty spec → `str(value)`).  `type_methods::format_value_dispatch`
         // keeps f-string `{n:08.3f}` and `"{:08.3f}".format(n)` identical.
+        // A format spec is expected to be valid text (specs do not carry
+        // surrogates), so a non-UTF-8 spec reads as empty rather than
+        // panicking.
         let spec_str = unsafe {
             if pyre_object::is_str(spec) {
-                pyre_object::w_str_get_value(spec).to_string()
+                match pyre_object::w_str_get_wtf8(spec).as_str() {
+                    Ok(v) => v.to_string(),
+                    Err(_) => String::new(),
+                }
             } else {
                 String::new()
             }
         };
         let s = crate::type_methods::format_value_dispatch(val, &spec_str)?;
-        self.push(pyre_object::w_str_new(&s));
+        self.push(pyre_object::w_str_from_wtf8(s));
         Ok(())
     }
 
     // ── ConvertValue (repr/str/ascii conversion) ──
     fn convert_value(&mut self, conv: crate::bytecode::ConvertValueOparg) -> Result<(), PyError> {
         let val = self.pop();
+        // `str(val)` is computed in WTF-8 so a lone surrogate (a str, or
+        // an exception whose single argument is a str) survives instead
+        // of being forced through a Rust `String` via `py_str`.  This is
+        // the path the `'%s' % x` → CONVERT_VALUE/FORMAT_SIMPLE compile
+        // rewrite takes.
+        let is_str_conv = matches!(
+            conv,
+            crate::bytecode::ConvertValueOparg::Str | crate::bytecode::ConvertValueOparg::None
+        );
+        if is_str_conv {
+            let w = unsafe { crate::py_str_wtf8(val) };
+            self.push(pyre_object::w_str_from_wtf8(w));
+            return Ok(());
+        }
         let s = match conv {
             crate::bytecode::ConvertValueOparg::Str => unsafe { crate::py_str(val) },
             crate::bytecode::ConvertValueOparg::Repr => unsafe { crate::py_repr(val) },
@@ -3285,8 +3308,12 @@ impl OpcodeStepExecutor for PyFrame {
                 return Ok(());
             }
             if pyre_object::is_str(obj) {
-                let full = pyre_object::w_str_get_value(obj);
-                let len = full.len() as i64;
+                // Slice on code-point boundaries over the WTF-8 view, so a
+                // surrogate-bearing or multi-byte string slices correctly.
+                let full = pyre_object::w_str_get_wtf8(obj);
+                let mut offsets: Vec<usize> = full.code_point_indices().map(|(i, _)| i).collect();
+                offsets.push(full.as_bytes().len());
+                let len = (offsets.len() - 1) as i64;
                 let s = if pyre_object::is_none(start) {
                     0
                 } else {
@@ -3298,9 +3325,11 @@ impl OpcodeStepExecutor for PyFrame {
                     pyre_object::w_int_get_value(stop)
                 };
                 let s = if s < 0 { (len + s).max(0) } else { s.min(len) } as usize;
-                let e = if e < 0 { (len + e).max(0) } else { e.min(len) } as usize;
-                let slice = &full[s..e.min(full.len())];
-                self.push(pyre_object::w_str_new(slice));
+                let e = (if e < 0 { (len + e).max(0) } else { e.min(len) } as usize).max(s);
+                let part =
+                    rustpython_wtf8::Wtf8::from_bytes(&full.as_bytes()[offsets[s]..offsets[e]])
+                        .expect("code-point-aligned slice is WTF-8");
+                self.push(pyre_object::w_str_from_wtf8(part.to_wtf8_buf()));
                 return Ok(());
             }
             if pyre_object::is_tuple(obj) {
@@ -3350,11 +3379,11 @@ impl OpcodeStepExecutor for PyFrame {
             parts.push(self.pop());
         }
         parts.reverse();
-        let mut result = String::new();
+        let mut result = rustpython_wtf8::Wtf8Buf::new();
         for part in &parts {
             unsafe {
                 if pyre_object::is_str(*part) {
-                    result.push_str(pyre_object::w_str_get_value(*part));
+                    result.push_wtf8(pyre_object::w_str_get_wtf8(*part));
                 } else if pyre_object::is_int(*part) {
                     result.push_str(&pyre_object::w_int_get_value(*part).to_string());
                 } else if pyre_object::is_none(*part) {
@@ -3370,7 +3399,7 @@ impl OpcodeStepExecutor for PyFrame {
                 }
             }
         }
-        self.push(pyre_object::w_str_new(&result));
+        self.push(pyre_object::w_str_from_wtf8(result));
         Ok(())
     }
 

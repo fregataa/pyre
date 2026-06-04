@@ -533,79 +533,6 @@ impl PyError {
         }
     }
 
-    /// `interp_exceptions.py:1175-1191 W_UnicodeEncodeError.descr_str`
-    /// parity — builds a `UnicodeEncodeError` carrying the structured
-    /// `encoding` / `object` / `start` / `end` / `reason` slots (and the
-    /// `(encoding, object, start, end, reason)` args tuple) so that
-    /// `str(e)` and the traceback render the full codec message instead
-    /// of an empty string. `[start, end)` is the half-open run of
-    /// unencodable code points; `end == start + 1` yields the
-    /// single-character message, a wider run the `position {s}-{e-1}`
-    /// form.
-    pub fn unicode_encode_error(
-        encoding: &str,
-        w_object: PyObjectRef,
-        start: i64,
-        end: i64,
-        reason: &str,
-    ) -> Self {
-        let message = if end == start + 1 {
-            let badchar = unsafe {
-                if pyre_object::is_str(w_object) {
-                    let chars: Vec<char> = pyre_object::w_str_get_value(w_object).chars().collect();
-                    usize::try_from(start)
-                        .ok()
-                        .and_then(|i| chars.get(i).copied())
-                } else {
-                    None
-                }
-            };
-            let badchar_repr = badchar
-                .map(|ch| {
-                    let c = ch as u32;
-                    if c <= 0xff {
-                        format!("'\\x{c:02x}'")
-                    } else if c <= 0xffff {
-                        format!("'\\u{c:04x}'")
-                    } else {
-                        format!("'\\U{c:08x}'")
-                    }
-                })
-                .unwrap_or_else(|| "'?'".to_string());
-            format!(
-                "'{encoding}' codec can't encode character {badchar_repr} in position {start}: {reason}"
-            )
-        } else {
-            format!(
-                "'{encoding}' codec can't encode characters in position {start}-{}: {reason}",
-                end - 1
-            )
-        };
-        let exc = pyre_object::excobject::w_exception_new(ExcKind::UnicodeEncodeError, &message);
-        unsafe {
-            pyre_object::excobject::w_exception_set_encoding(exc, pyre_object::w_str_new(encoding));
-            pyre_object::excobject::w_exception_set_object(exc, w_object);
-            pyre_object::excobject::w_exception_set_start(exc, pyre_object::w_int_new(start));
-            pyre_object::excobject::w_exception_set_end(exc, pyre_object::w_int_new(end));
-            pyre_object::excobject::w_exception_set_reason(exc, pyre_object::w_str_new(reason));
-            let args_list = pyre_object::w_list_new(vec![
-                pyre_object::w_str_new(encoding),
-                w_object,
-                pyre_object::w_int_new(start),
-                pyre_object::w_int_new(end),
-                pyre_object::w_str_new(reason),
-            ]);
-            pyre_object::excobject::w_exception_set_args(exc, args_list);
-        }
-        PyError {
-            kind: PyErrorKind::UnicodeEncodeError,
-            message,
-            exc_object: exc,
-            attach_tb: true,
-            reraise_lasti: -1,
-        }
-    }
-
     pub fn index_error(msg: impl Into<String>) -> Self {
         PyError {
             kind: PyErrorKind::IndexError,
@@ -773,7 +700,20 @@ impl PyError {
     pub unsafe fn from_exc_object(obj: PyObjectRef) -> Self {
         unsafe {
             let kind = pyre_object::excobject::w_exception_get_kind(obj);
-            let message = pyre_object::excobject::w_exception_get_message(obj).to_string();
+            let msg = pyre_object::excobject::w_exception_get_message(obj);
+            let message = match msg.as_str() {
+                Ok(s) => s.to_string(),
+                Err(_) => {
+                    // Lone-surrogate message (rare) → lossy UTF-8 for
+                    // the Rust-side error string; `exc_object` keeps the
+                    // exact value for `str(e)` / `repr(e)`.
+                    let mut out = String::new();
+                    for cp in msg.code_points() {
+                        out.push(cp.to_char().unwrap_or('\u{FFFD}'));
+                    }
+                    out
+                }
+            };
             PyError {
                 kind: Self::kind_from_exc(kind),
                 message,

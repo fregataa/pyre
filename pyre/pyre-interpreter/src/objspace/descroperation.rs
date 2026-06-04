@@ -13,6 +13,7 @@ use num_traits::ToPrimitive;
 
 use pyre_object::strobject::is_str;
 use pyre_object::*;
+use rustpython_wtf8::Wtf8Buf;
 
 use crate::baseobjspace::{
     getattr, getitem, is_true, issubtype_w, lookup, lookup_in_type, lookup_in_type_where,
@@ -626,12 +627,15 @@ unsafe fn long_bitxor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 /// Concatenate two str objects.
 
 pub(crate) unsafe fn str_concat(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    let sa = w_str_get_value(a);
-    let sb = w_str_get_value(b);
-    let mut result = String::with_capacity(sa.len() + sb.len());
-    result.push_str(sa);
-    result.push_str(sb);
-    Ok(w_str_new(&result))
+    // Read the surrogate-aware WTF-8 view so concatenating a
+    // surrogateescape/surrogatepass-decoded string does not go through
+    // `w_str_get_value` (which rejects lone surrogates).
+    let sa = w_str_get_wtf8(a);
+    let sb = w_str_get_wtf8(b);
+    let mut result = Wtf8Buf::with_capacity(sa.len() + sb.len());
+    result.push_wtf8(sa);
+    result.push_wtf8(sb);
+    Ok(w_str_from_wtf8(result))
 }
 
 /// Extract a non-negative repeat count from an int or long, raising
@@ -652,19 +656,23 @@ unsafe fn repeat_count(n: PyObjectRef, msg: &str) -> Result<usize, PyError> {
 
 /// unicodeobject.py:619-621 descr_mul
 pub(crate) unsafe fn str_repeat(s: PyObjectRef, n: PyObjectRef) -> PyResult {
-    let sv = w_str_get_value(s);
+    // Repeat at the WTF-8 byte level — a repetition of valid WTF-8 is valid
+    // WTF-8 — so a surrogate-bearing string repeats without going through
+    // `w_str_get_value`.
+    let bytes = w_str_get_wtf8(s).as_bytes();
     let count = repeat_count(n, "new string is too long")?;
-    let total = sv
+    let total = bytes
         .len()
         .checked_mul(count)
         .ok_or_else(|| PyError::new(PyErrorKind::OverflowError, "new string is too long"))?;
-    let mut out = String::new();
+    let mut out: Vec<u8> = Vec::new();
     out.try_reserve_exact(total)
         .map_err(|_| PyError::new(PyErrorKind::MemoryError, ""))?;
     for _ in 0..count {
-        out.push_str(sv);
+        out.extend_from_slice(bytes);
     }
-    Ok(w_str_new(&out))
+    let buf = Wtf8Buf::from_bytes(out).expect("repetition of WTF-8 is WTF-8");
+    Ok(w_str_from_wtf8(buf))
 }
 
 pub(crate) unsafe fn list_concat(a: PyObjectRef, b: PyObjectRef) -> PyResult {
@@ -1918,8 +1926,13 @@ pub fn compare(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
             };
         }
         if is_str(a) && is_str(b) {
-            let sa = w_str_get_value(a);
-            let sb = w_str_get_value(b);
+            // Compare the WTF-8 bytes: for surrogate-free strings this is the
+            // UTF-8 byte order (= code point order), and WTF-8 keeps lone
+            // surrogates in code-point order too, so a surrogate-bearing
+            // string compares correctly without going through
+            // `w_str_get_value`.
+            let sa = w_str_get_wtf8(a).as_bytes();
+            let sb = w_str_get_wtf8(b).as_bytes();
             return Ok(w_bool_from(match op {
                 CompareOp::Lt => sa < sb,
                 CompareOp::Le => sa <= sb,
@@ -1929,33 +1942,22 @@ pub fn compare(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
                 CompareOp::Ne => sa != sb,
             }));
         }
-        // bytes / bytearray value comparison — bytesobject.py /
-        // bytearrayobject.py `descr_eq` / `descr_lt` / … compare the
-        // underlying byte sequence lexicographically; bytes and
-        // bytearray are mutually comparable by content.
+        // bytesobject.py W_BytesObject.descr_eq / _lt / ... and the
+        // bytearray counterparts — lexicographic comparison on the raw
+        // bytes.  bytes and bytearray compare by content
+        // (b"a" == bytearray(b"a")), so both operands route through
+        // bytes_like_data.
         if pyre_object::bytesobject::is_bytes_like(a) && pyre_object::bytesobject::is_bytes_like(b)
         {
-            let la = pyre_object::bytesobject::bytes_like_len(a);
-            let lb = pyre_object::bytesobject::bytes_like_len(b);
-            let mut ord = std::cmp::Ordering::Equal;
-            for i in 0..la.min(lb) {
-                let ba = pyre_object::bytesobject::bytes_like_getitem(a, i);
-                let bb = pyre_object::bytesobject::bytes_like_getitem(b, i);
-                if ba != bb {
-                    ord = ba.cmp(&bb);
-                    break;
-                }
-            }
-            if ord == std::cmp::Ordering::Equal {
-                ord = la.cmp(&lb);
-            }
+            let da = pyre_object::bytesobject::bytes_like_data(a);
+            let db = pyre_object::bytesobject::bytes_like_data(b);
             return Ok(w_bool_from(match op {
-                CompareOp::Lt => ord == std::cmp::Ordering::Less,
-                CompareOp::Le => ord != std::cmp::Ordering::Greater,
-                CompareOp::Gt => ord == std::cmp::Ordering::Greater,
-                CompareOp::Ge => ord != std::cmp::Ordering::Less,
-                CompareOp::Eq => ord == std::cmp::Ordering::Equal,
-                CompareOp::Ne => ord != std::cmp::Ordering::Equal,
+                CompareOp::Lt => da < db,
+                CompareOp::Le => da <= db,
+                CompareOp::Gt => da > db,
+                CompareOp::Ge => da >= db,
+                CompareOp::Eq => da == db,
+                CompareOp::Ne => da != db,
             }));
         }
         // Tuple lexicographic comparison — PyPy: tupleobject.py descr_lt / _eq / etc.

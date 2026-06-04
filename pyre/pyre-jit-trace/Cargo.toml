@@ -15,6 +15,7 @@ test-support = []
 [dependencies]
 pyre-object = { workspace = true }
 pyre-interpreter = { workspace = true }
+rustpython-wtf8 = { workspace = true }
 majit-ir = { workspace = true }
 majit-macros = { workspace = true }
 majit-metainterp = { workspace = true }

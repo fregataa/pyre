@@ -618,7 +618,7 @@ pub trait TraceHelperAccess {
         self.with_trace_ctx(|ctx| Ok(ctx.const_ref(w_bool_from(value) as i64)))
     }
 
-    fn trace_str_constant(&mut self, value: &str) -> Result<OpRef, PyError> {
+    fn trace_str_constant(&mut self, value: &rustpython_wtf8::Wtf8) -> Result<OpRef, PyError> {
         self.with_trace_ctx(|ctx| Ok(ctx.const_ref(box_str_constant(value) as i64)))
     }
 

@@ -351,7 +351,7 @@ pub trait ConstantOpcodeHandler: SharedOpcodeHandler {
     fn bigint_constant(&mut self, value: &PyBigInt) -> Result<Self::Value, PyError>;
     fn float_constant(&mut self, value: f64) -> Result<Self::Value, PyError>;
     fn bool_constant(&mut self, value: bool) -> Result<Self::Value, PyError>;
-    fn str_constant(&mut self, value: &str) -> Result<Self::Value, PyError>;
+    fn str_constant(&mut self, value: &rustpython_wtf8::Wtf8) -> Result<Self::Value, PyError>;
     /// Bytes literal — pyre stores immutable bytes values as bytearray.
     /// PyPy: Bytes literals create W_BytesObject, but pyre lacks a separate
     /// bytes type so we route through W_BytearrayObject (mutable) and rely
@@ -389,9 +389,7 @@ fn load_const_value<H: ConstantOpcodeHandler + ?Sized>(
         }
         ConstantData::Float { value } => handler.float_constant(*value),
         ConstantData::Boolean { value } => handler.bool_constant(*value),
-        ConstantData::Str { value } => {
-            handler.str_constant(value.as_str().expect("non-UTF-8 string constant"))
-        }
+        ConstantData::Str { value } => handler.str_constant(value),
         ConstantData::Tuple { elements } => {
             let mut items = Vec::with_capacity(elements.len());
             for element in elements {

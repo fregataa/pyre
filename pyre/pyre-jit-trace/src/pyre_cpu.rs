@@ -14,7 +14,7 @@
 //! `unicode_descr()` returns `PyreUnicodeDescr` (len_descr → codepoint len).
 //!
 //! `W_StrObject` (pyre-object) stores char data behind a
-//! `*mut String` pointer at `STR_VALUE_OFFSET`; the default
+//! `*mut Wtf8Buf` pointer at `STR_VALUE_OFFSET`; the default
 //! `bh_getarrayitem_gc_i(base + index)` path would read wrong memory,
 //! so `bh_strgetitem` is overridden to follow the indirection.
 
@@ -26,6 +26,7 @@ use majit_metainterp::cpu::{Cpu, DefaultCpu};
 use pyre_object::strobject::{
     STR_BYTE_LEN_OFFSET, STR_LEN_OFFSET, STR_VALUE_OFFSET, W_STR_GC_TYPE_ID, W_STR_OBJECT_SIZE,
 };
+use rustpython_wtf8::Wtf8Buf;
 
 /// FieldDescr for `W_StrObject.byte_len` — UTF-8 byte count.
 /// RPython STR is `Array(Char)` byte string (`rstr.py:1226`);
@@ -188,13 +189,13 @@ impl Cpu for PyreCpu {
         // RPython STR is `Array(Char)` byte string (`rstr.py:1226-1228`);
         // `llmodel.py:667 bh_strlen` returns the byte count.
         // `str_descr().len_descr()` reads `W_StrObject.byte_len` for the
-        // compiled path; this override follows the `*mut String` indirection
+        // compiled path; this override follows the `*mut Wtf8Buf` indirection
         // directly for the blackhole interpreter path.
         if string.is_null() {
             return None;
         }
         let value_addr = string.0 + STR_VALUE_OFFSET;
-        let value_ptr = unsafe { *(value_addr as *const *const String) };
+        let value_ptr = unsafe { *(value_addr as *const *const Wtf8Buf) };
         if value_ptr.is_null() {
             return None;
         }
@@ -207,8 +208,8 @@ impl Cpu for PyreCpu {
         // STRGETITEM returns `ord(char)` = byte value.
         // `intbounds.rs:3109` narrows the result to `[0, 255]`
         // (`vstring.py:393-400 IntBound.make_ge(0).make_lt(256)`).
-        // `W_StrObject.value: *mut String` at `STR_VALUE_OFFSET` —
-        // follow the indirection and read the UTF-8 byte at `index`.
+        // `W_StrObject.value: *mut Wtf8Buf` at `STR_VALUE_OFFSET` —
+        // follow the indirection and read the WTF-8 byte at `index`.
         // PyPy's STR stores chars in-line at `base + item_size * index`;
         // pyre diverges structurally so this override replaces the
         // default `bh_getarrayitem_gc_i` routing.
@@ -216,7 +217,7 @@ impl Cpu for PyreCpu {
             return None;
         }
         let value_addr = string.0 + STR_VALUE_OFFSET;
-        let value_ptr = unsafe { *(value_addr as *const *const String) };
+        let value_ptr = unsafe { *(value_addr as *const *const Wtf8Buf) };
         if value_ptr.is_null() {
             return None;
         }
@@ -231,19 +232,20 @@ impl Cpu for PyreCpu {
 
     fn bh_unicodegetitem(&self, unicode: GcRef, index: i64) -> Option<i64> {
         // RPython UNICODE is codepoint-indexed; UNICODEGETITEM returns
-        // the codepoint value.  Pyre's `W_StrObject` stores UTF-8, so
-        // walk codepoints via `chars().nth(index)`.
+        // the codepoint value.  Pyre's `W_StrObject` stores WTF-8, so
+        // walk codepoints via `code_points().nth(index)`; `to_u32`
+        // yields the ordinal (including lone surrogates D800-DFFF).
         if unicode.is_null() {
             return None;
         }
         let value_addr = unicode.0 + STR_VALUE_OFFSET;
-        let value_ptr = unsafe { *(value_addr as *const *const String) };
+        let value_ptr = unsafe { *(value_addr as *const *const Wtf8Buf) };
         if value_ptr.is_null() {
             return None;
         }
         let s = unsafe { &*value_ptr };
         let i = index as usize;
-        s.chars().nth(i).map(|c| c as i64)
+        s.code_points().nth(i).map(|c| c.to_u32() as i64)
     }
 }
 

@@ -7,6 +7,7 @@ use crate::{
     make_module_builtin_function, make_module_builtin_function_with_arity,
 };
 use pyre_object::*;
+use rustpython_wtf8::{CodePoint, Wtf8Buf};
 
 /// Install the default builtins into a namespace.
 /// Read a memoryview stub's `(data copy, itemsize, backing buffer)`.
@@ -1583,7 +1584,7 @@ fn type_descr_new_with_metaclass(
         ));
     }
     let name = unsafe { (*(*obj).ob_type).name };
-    Ok(box_str_constant(name))
+    Ok(box_str_constant(rustpython_wtf8::Wtf8::new(name)))
 }
 
 /// `isinstance(obj, cls)` — pypy/module/__builtin__/abstractinst.py
@@ -1640,18 +1641,26 @@ fn builtin_issubclass(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
 macro_rules! exc_constructor {
     ($fn_name:ident, $kind:expr) => {
         fn $fn_name(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-            let msg: String = if args.is_empty() {
-                String::new()
-            } else if args.len() == 1 {
-                unsafe { crate::display::py_str(args[0]) }
+            let exc = if args.len() == 1 && unsafe { pyre_object::is_str(args[0]) } {
+                // Single str argument: store the message in WTF-8 so a
+                // lone surrogate (e.g. `ValueError('\udcff')`) survives
+                // construction.
+                let w = unsafe { pyre_object::w_str_get_wtf8(args[0]) };
+                pyre_object::excobject::w_exception_new_wtf8($kind, w)
             } else {
-                let parts: Vec<String> = args
-                    .iter()
-                    .map(|&a| unsafe { crate::display::py_repr(a) })
-                    .collect();
-                format!("({})", parts.join(", "))
+                let msg: String = if args.is_empty() {
+                    String::new()
+                } else if args.len() == 1 {
+                    unsafe { crate::display::py_str(args[0]) }
+                } else {
+                    let parts: Vec<String> = args
+                        .iter()
+                        .map(|&a| unsafe { crate::display::py_repr(a) })
+                        .collect();
+                    format!("({})", parts.join(", "))
+                };
+                pyre_object::excobject::w_exception_new($kind, &msg)
             };
-            let exc = pyre_object::excobject::w_exception_new($kind, &msg);
             let args_list = pyre_object::w_list_new(args.to_vec());
             unsafe {
                 pyre_object::excobject::w_exception_set_args(exc, args_list);
@@ -2226,8 +2235,8 @@ pub(crate) fn builtin_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             return Ok(obj);
         }
     }
-    let s = unsafe { crate::py_str(obj) };
-    Ok(w_str_new(&s))
+    let w = unsafe { crate::py_str_wtf8(obj) };
+    Ok(pyre_object::w_str_from_wtf8(w))
 }
 
 /// `repr(obj)` → string representation
@@ -4185,7 +4194,10 @@ fn _hash_tuple_xx(items: &[i64]) -> i64 {
 /// (matching `PYTHONHASHSEED=0`).  Switching to a randomised seed
 /// is straight-forward (`OnceLock<[u8; 16]>` seeded from
 /// `getrandom` or the env var) once tests are robust to it.
-fn _hash_str(s: &str) -> i64 {
+/// Hash a string by its WTF-8 bytes — `unicodeobject.py descr_hash` hashes
+/// `self._utf8`, so a lone-surrogate string hashes by its byte sequence
+/// instead of panicking on the `&str` view.
+fn _hash_str(bytes: &[u8]) -> i64 {
     use core::hash::Hasher;
     // `rpython/rlib/rsiphash.py:60-62 _build_key_from_seed` — when
     // `PYTHONHASHSEED=0` the key is the 16-byte all-zero buffer.
@@ -4196,7 +4208,7 @@ fn _hash_str(s: &str) -> i64 {
     // robust to it.
     static SECRET: [u8; 16] = [0u8; 16];
     let mut hasher = siphasher::sip::SipHasher24::new_with_key(&SECRET);
-    hasher.write(s.as_bytes());
+    hasher.write(bytes);
     let raw = hasher.finish() as i64;
     raw - ((raw == -1) as i64)
 }
@@ -4271,7 +4283,7 @@ pub fn hash_value(obj: PyObjectRef) -> i64 {
             return _hash_float(pyre_object::w_float_get_value(obj));
         }
         if is_str(obj) {
-            return _hash_str(w_str_get_value(obj));
+            return _hash_str(pyre_object::w_str_get_wtf8(obj).as_bytes());
         }
         if pyre_object::is_none(obj) {
             return 0;
@@ -4317,14 +4329,16 @@ fn builtin_ord(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let obj = args[0];
     unsafe {
         if is_str(obj) {
-            let s = w_str_get_value(obj);
-            let count = s.chars().count();
+            // Read the code point through the WTF-8 view so a lone-surrogate
+            // single-character string yields its ordinal (0xD800-0xDFFF).
+            let count = w_str_len(obj);
             if count != 1 {
                 return Err(crate::PyError::type_error(format!(
                     "ord() expected a character, but string of length {count} found"
                 )));
             }
-            return Ok(w_int_new(s.chars().next().unwrap() as i64));
+            let cp = w_str_get_wtf8(obj).code_points().next().unwrap();
+            return Ok(w_int_new(cp.to_u32() as i64));
         }
         // bytesobject.py:464 — bytes of length 1
         if pyre_object::bytesobject::is_bytes_like(obj) {
@@ -4368,7 +4382,16 @@ fn builtin_chr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     }
     match char::from_u32(val as u32) {
         Some(c) => Ok(w_str_new(&c.to_string())),
-        None => Err(crate::PyError::value_error("chr() arg out of range")),
+        // Surrogate code points (0xD800-0xDFFF) are valid chr() arguments and
+        // produce a lone-surrogate string; char::from_u32 rejects them, so
+        // build the string through a WTF-8 code point instead.
+        None => {
+            let cp = CodePoint::from_u32(val as u32)
+                .expect("val is in 0..=0x10ffff per the range check above");
+            let mut one = Wtf8Buf::new();
+            one.push(cp);
+            Ok(w_str_from_wtf8(one))
+        }
     }
 }
 
@@ -5447,7 +5470,7 @@ fn builtin_format(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // `str(value)`) — the same path f-string `{v:spec}` and
     // `"{:spec}".format(v)` use, so all three produce identical output.
     let s = crate::type_methods::format_value_dispatch(value, &spec)?;
-    Ok(w_str_new(&s))
+    Ok(pyre_object::w_str_from_wtf8(s))
 }
 
 /// `__import__(name, globals=None, locals=None, fromlist=(), level=0)`

@@ -4,6 +4,7 @@ use pyre_object::pyobject::{
     BOOL_TYPE, ELLIPSIS_TYPE, FLOAT_TYPE, INSTANCE_TYPE, INT_TYPE, LONG_TYPE, MODULE_TYPE,
     NONE_TYPE, PyObjectRef, PyType, STR_TYPE, TYPE_TYPE,
 };
+use rustpython_wtf8::{Wtf8, Wtf8Buf};
 
 use crate::{
     BUILTIN_CODE_TYPE, BUILTIN_FUNCTION_TYPE, FUNCTION_TYPE, builtin_code_name, function_get_name,
@@ -92,31 +93,36 @@ pub(crate) fn format_float_repr(val: f64) -> String {
     format!("{val}")
 }
 
-/// `pypy/objspace/std/unicodeobject.py W_UnicodeObject._descr_repr`
-/// parity — pick the outer quote (prefer single, switch to double iff
-/// the string contains a single but no double), then escape backslash,
-/// the matching quote, common whitespace, and control characters.
-/// Non-control codepoints pass through verbatim.
-fn format_str_repr(s: &str) -> String {
-    let has_single = s.contains('\'');
-    let has_double = s.contains('"');
+/// `rutf8.py:660 make_utf8_escape_function` (`quotes=True`) parity —
+/// pick the outer quote (prefer single, switch to double iff the string
+/// contains a single but no double), then escape backslash, the matching
+/// quote, common whitespace, and control characters.  Lone surrogate code
+/// points are escaped via `char_escape_helper` (`rutf8.py:647`) as
+/// `\uXXXX`.  Non-control scalar values pass through verbatim.
+fn format_wtf8_repr(s: &Wtf8) -> String {
+    let bytes = s.as_bytes();
+    let has_single = bytes.contains(&b'\'');
+    let has_double = bytes.contains(&b'"');
     let quote = if has_single && !has_double { '"' } else { '\'' };
-    let mut out = String::with_capacity(s.len() + 2);
+    let mut out = String::with_capacity(bytes.len() + 2);
     out.push(quote);
-    for ch in s.chars() {
-        match ch {
-            '\\' => out.push_str("\\\\"),
-            '\t' => out.push_str("\\t"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            c if c == quote => {
+    for cp in s.code_points() {
+        match cp.to_char() {
+            Some('\\') => out.push_str("\\\\"),
+            Some('\t') => out.push_str("\\t"),
+            Some('\n') => out.push_str("\\n"),
+            Some('\r') => out.push_str("\\r"),
+            Some(c) if c == quote => {
                 out.push('\\');
                 out.push(c);
             }
-            c if (c as u32) < 0x20 || (c as u32) == 0x7f => {
+            Some(c) if (c as u32) < 0x20 || (c as u32) == 0x7f => {
                 out.push_str(&format!("\\x{:02x}", c as u32));
             }
-            c => out.push(c),
+            Some(c) => out.push(c),
+            // Lone surrogate (0xD800-0xDFFF) — char_escape_helper emits
+            // `\u` + four hex digits for codepoints in [0x100, 0x10000).
+            None => out.push_str(&format!("\\u{:04x}", cp.to_u32())),
         }
     }
     out.push(quote);
@@ -332,7 +338,7 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> String {
                 format!("{{{}}}", parts.join(", "))
             }
         } else if std::ptr::eq(tp, &STR_TYPE as *const PyType) {
-            format_str_repr(pyre_object::w_str_get_value(obj))
+            format_wtf8_repr(pyre_object::w_str_get_wtf8(obj))
         } else if std::ptr::eq(tp, &NONE_TYPE as *const PyType) {
             "None".to_string()
         } else if std::ptr::eq(
@@ -403,10 +409,15 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> String {
                 }
             } else {
                 let msg = pyre_object::excobject::w_exception_get_message(obj);
-                if msg.is_empty() {
-                    String::new()
-                } else {
-                    format!("'{msg}'")
+                match msg.as_str() {
+                    Ok(s) => {
+                        if s.is_empty() {
+                            String::new()
+                        } else {
+                            format!("'{s}'")
+                        }
+                    }
+                    Err(_) => String::new(),
                 }
             };
             format!("{class_name}({inner})")
@@ -589,6 +600,73 @@ pub unsafe fn py_str(obj: PyObjectRef) -> String {
     }
 }
 
+/// WTF-8 preserving variant of `py_str` for the `str(x)` path.
+///
+/// Mirrors `py_str` but returns a `Wtf8Buf`, preserving lone surrogates
+/// for the two shapes whose `str()` can carry them: a `str` (returned
+/// verbatim) and a `W_BaseException` whose single argument is a `str`
+/// (`descr_str` returns `space.str(self.args_w[0])`).  Every other
+/// object's `str()` is plain UTF-8, so it delegates to `py_str` and
+/// wraps the result.
+///
+/// # Safety
+/// `obj` must point to a valid `PyObject`.
+pub unsafe fn py_str_wtf8(obj: PyObjectRef) -> Wtf8Buf {
+    unsafe {
+        let obj = crate::baseobjspace::unwrap_cell(obj);
+        if !obj.is_null() {
+            let tp = (*obj).ob_type;
+            if std::ptr::eq(tp, &STR_TYPE as *const PyType) {
+                return pyre_object::w_str_get_wtf8(obj).to_wtf8_buf();
+            }
+            if pyre_object::is_exception(obj) {
+                if let Some(w) = exception_descr_str_wtf8(obj) {
+                    return w;
+                }
+            }
+        }
+        Wtf8Buf::from_string(py_str(obj))
+    }
+}
+
+/// The WTF-8 carrying subset of `W_BaseException.descr_str`: a base
+/// exception whose `args_w` is a single `str` stringifies to that str
+/// verbatim (`interp_exceptions.py:131 space.str(self.args_w[0])`).
+/// Returns `None` for every other shape — no args, multiple args, a
+/// non-`str` arg, or the Unicode/`KeyError` kinds whose `descr_str`
+/// overrides are ASCII-only — letting `py_str_wtf8` fall back to
+/// `py_str`.
+///
+/// # Safety
+/// `obj` must point to a valid `W_ExceptionObject`.
+unsafe fn exception_descr_str_wtf8(obj: PyObjectRef) -> Option<Wtf8Buf> {
+    unsafe {
+        let kind = pyre_object::w_exception_get_kind(obj);
+        if matches!(
+            kind,
+            pyre_object::excobject::ExcKind::UnicodeTranslateError
+                | pyre_object::excobject::ExcKind::UnicodeDecodeError
+                | pyre_object::excobject::ExcKind::UnicodeEncodeError
+                | pyre_object::excobject::ExcKind::KeyError
+        ) {
+            return None;
+        }
+        let args = pyre_object::excobject::w_exception_get_args(obj);
+        if args.is_null() || !pyre_object::is_tuple(args) {
+            return None;
+        }
+        if pyre_object::w_tuple_len(args) != 1 {
+            return None;
+        }
+        let first = pyre_object::w_tuple_getitem(args, 0).unwrap_or(args);
+        let first = crate::baseobjspace::unwrap_cell(first);
+        if first.is_null() || !std::ptr::eq((*first).ob_type, &STR_TYPE as *const PyType) {
+            return None;
+        }
+        Some(pyre_object::w_str_get_wtf8(first).to_wtf8_buf())
+    }
+}
+
 /// Format an `int` `%d` position slot from a `W_ExceptionObject`
 /// typed Unicode*Error position field.  `descr_init`'s typecheck
 /// admits `int` (including subclasses), so a successfully-initialised
@@ -712,13 +790,17 @@ unsafe fn unicode_translate_error_str(obj: PyObjectRef) -> String {
         if single_char {
             let start = *start_slot.as_ref().expect("single_char gated on Ok");
             let badchar_repr = if pyre_object::is_str(w_object) {
-                let text = pyre_object::w_str_get_value(w_object);
-                let chars: Vec<char> = text.chars().collect();
+                // Read the offending code point through the surrogate-aware
+                // WTF-8 view: the bad character is frequently a lone surrogate
+                // (utf-8 strict encode), which `w_str_get_value` cannot hold.
+                let code_points: Vec<u32> = pyre_object::w_str_get_wtf8(w_object)
+                    .code_points()
+                    .map(|c| c.to_u32())
+                    .collect();
                 usize::try_from(start)
                     .ok()
-                    .and_then(|i| chars.get(i).copied())
-                    .map(|ch| {
-                        let badchar = ch as u32;
+                    .and_then(|i| code_points.get(i).copied())
+                    .map(|badchar| {
                         if badchar <= 0xff {
                             format!("'\\x{:02x}'", badchar)
                         } else if badchar <= 0xffff {
@@ -826,13 +908,17 @@ unsafe fn unicode_encode_error_str(obj: PyObjectRef) -> String {
         if single_char {
             let start = *start_slot.as_ref().expect("single_char gated on Ok");
             let badchar_repr = if pyre_object::is_str(w_object) {
-                let text = pyre_object::w_str_get_value(w_object);
-                let chars: Vec<char> = text.chars().collect();
+                // Read the offending code point through the surrogate-aware
+                // WTF-8 view: the bad character is frequently a lone surrogate
+                // (utf-8 strict encode), which `w_str_get_value` cannot hold.
+                let code_points: Vec<u32> = pyre_object::w_str_get_wtf8(w_object)
+                    .code_points()
+                    .map(|c| c.to_u32())
+                    .collect();
                 usize::try_from(start)
                     .ok()
-                    .and_then(|i| chars.get(i).copied())
-                    .map(|ch| {
-                        let badchar = ch as u32;
+                    .and_then(|i| code_points.get(i).copied())
+                    .map(|badchar| {
                         if badchar <= 0xff {
                             format!("'\\x{:02x}'", badchar)
                         } else if badchar <= 0xffff {

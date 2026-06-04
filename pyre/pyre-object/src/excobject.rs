@@ -12,6 +12,7 @@
 //! it via the assigned `subclassrange_{min,max}`.
 
 use crate::pyobject::*;
+use rustpython_wtf8::{Wtf8, Wtf8Buf};
 
 pub static EXCEPTION_TYPE: PyType = crate::pyobject::new_pytype("BaseException");
 pub static EXC_EXCEPTION_TYPE: PyType = crate::pyobject::new_pytype("Exception");
@@ -207,7 +208,9 @@ pub enum ExcKind {
 pub struct W_ExceptionObject {
     pub ob_header: PyObject,
     pub kind: ExcKind,
-    pub message: *mut String,
+    /// `WTF-8` so a lone-surrogate message (e.g. `ValueError('\udcff')`)
+    /// survives construction; `&str` cannot represent surrogates.
+    pub message: *mut Wtf8Buf,
     pub args_w: PyObjectRef,
     /// `interp_exceptions.py:114 W_BaseException.w_cause = None` —
     /// `raise X from Y` cause set by `descr_setcause` (line 167-174).
@@ -314,7 +317,18 @@ impl crate::lltype::GcType for W_ExceptionObject {
 /// placeholder, matching the legacy "internal `w_exception_new`"
 /// path.
 pub fn w_exception_new(kind: ExcKind, message: &str) -> PyObjectRef {
-    let message = crate::lltype::malloc_raw(message.to_string());
+    let message = crate::lltype::malloc_raw(Wtf8Buf::from_string(message.to_string()));
+    w_exception_new_from_message_ptr(kind, message)
+}
+
+/// Like `w_exception_new` but stores an arbitrary WTF-8 message,
+/// preserving lone surrogates that a `&str` message cannot carry.
+pub fn w_exception_new_wtf8(kind: ExcKind, message: &Wtf8) -> PyObjectRef {
+    let message = crate::lltype::malloc_raw(message.to_wtf8_buf());
+    w_exception_new_from_message_ptr(kind, message)
+}
+
+fn w_exception_new_from_message_ptr(kind: ExcKind, message: *mut Wtf8Buf) -> PyObjectRef {
     let w_class = lookup_exc_class_for_kind(kind);
     let w_class = if w_class != PY_NULL {
         w_class
@@ -764,7 +778,7 @@ pub unsafe fn w_exception_get_kind(obj: PyObjectRef) -> ExcKind {
 /// # Safety
 /// `obj` must point to a valid `W_ExceptionObject`.
 #[inline]
-pub unsafe fn w_exception_get_message(obj: PyObjectRef) -> &'static str {
+pub unsafe fn w_exception_get_message(obj: PyObjectRef) -> &'static Wtf8 {
     unsafe { &*(*(obj as *const W_ExceptionObject)).message }
 }
 
@@ -922,7 +936,7 @@ mod tests {
         unsafe {
             assert!(is_exception(obj));
             assert_eq!(w_exception_get_kind(obj), ExcKind::ValueError);
-            assert_eq!(w_exception_get_message(obj), "bad value");
+            assert_eq!(w_exception_get_message(obj), Wtf8::new("bad value"));
         }
     }
 
@@ -1003,7 +1017,7 @@ mod tests {
         unsafe {
             assert!(is_exception(a));
             assert_eq!(w_exception_get_kind(a), ExcKind::MemoryError);
-            assert_eq!(w_exception_get_message(a), "");
+            assert_eq!(w_exception_get_message(a), Wtf8::new(""));
         }
     }
 

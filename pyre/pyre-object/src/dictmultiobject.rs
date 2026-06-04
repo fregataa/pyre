@@ -101,6 +101,18 @@ impl Eq for ObjectKey {}
 /// crate's unit tests exercise (str, int, bool, bytes, tuple, frozenset).
 /// Unknown types still pointer-hash — sufficient because their
 /// `dict_keys_equal` arm short-circuits on `std::ptr::eq` first.
+/// View a key as `&str` only when it is a str whose backing is valid UTF-8.
+/// A lone-surrogate str returns `None` so the `&str`-keyed proxy fast paths
+/// (which cannot represent it) fall through to the generic object-keyed path.
+#[inline]
+unsafe fn key_as_utf8(key: PyObjectRef) -> Option<&'static str> {
+    if crate::is_str(key) {
+        crate::w_str_get_value_opt(key)
+    } else {
+        None
+    }
+}
+
 #[inline]
 pub unsafe fn object_key_for(obj: PyObjectRef) -> ObjectKey {
     let hash = crate::dict_eq_hook::try_hash_w(obj).unwrap_or_else(|| builtin_structural_hash(obj));
@@ -182,7 +194,9 @@ unsafe fn builtin_structural_hash(obj: PyObjectRef) -> i64 {
     if crate::is_str(obj) {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        crate::w_str_get_value(obj).hash(&mut h);
+        // Hash the WTF-8 bytes so a lone-surrogate key does not panic in
+        // `w_str_get_value`; the byte sequence is the hashed identity.
+        crate::w_str_get_wtf8(obj).as_bytes().hash(&mut h);
         return h.finish() as i64;
     }
     if crate::bytesobject::is_bytes(obj) {
@@ -1395,9 +1409,10 @@ pub(crate) unsafe fn dict_keys_equal(a: PyObjectRef, b: PyObjectRef) -> bool {
         };
         return av == bv;
     }
-    // Str keys
+    // Str keys — compare the WTF-8 bytes so lone-surrogate keys compare by
+    // content instead of panicking in `w_str_get_value`.
     if crate::is_str(a) && crate::is_str(b) {
-        return crate::w_str_get_value(a) == crate::w_str_get_value(b);
+        return crate::w_str_get_wtf8(a).as_bytes() == crate::w_str_get_wtf8(b).as_bytes();
     }
     // Bytes keys — compare byte contents.
     if crate::bytesobject::is_bytes(a) && crate::bytesobject::is_bytes(b) {
@@ -1567,11 +1582,14 @@ pub unsafe fn w_dict_lookup_object_strategy(
     key: PyObjectRef,
 ) -> Option<PyObjectRef> {
     let dict = &*(obj as *const W_DictObject);
-    if !dict.dict_storage_proxy.is_null() && crate::is_str(key) {
-        if let Some(v) =
-            maybe_lookup_dict_storage(dict.dict_storage_proxy, crate::w_str_get_value(key))
-        {
-            return Some(v);
+    // The `&str`-keyed proxy storage cannot represent a lone surrogate, so a
+    // surrogate key skips the fast path and falls through to the generic
+    // object-keyed entries below (`w_str_get_value_opt` returns None).
+    if !dict.dict_storage_proxy.is_null() {
+        if let Some(ks) = key_as_utf8(key) {
+            if let Some(v) = maybe_lookup_dict_storage(dict.dict_storage_proxy, ks) {
+                return Some(v);
+            }
         }
     }
     let entries = &*(dict.dstorage as *const indexmap::IndexMap<ObjectKey, PyObjectRef>);
@@ -1583,11 +1601,11 @@ pub unsafe fn w_dict_lookup_object_strategy_checked(
     key: PyObjectRef,
 ) -> Result<Option<PyObjectRef>, DictKeyError> {
     let dict = &*(obj as *const W_DictObject);
-    if !dict.dict_storage_proxy.is_null() && crate::is_str(key) {
-        if let Some(v) =
-            maybe_lookup_dict_storage(dict.dict_storage_proxy, crate::w_str_get_value(key))
-        {
-            return Ok(Some(v));
+    if !dict.dict_storage_proxy.is_null() {
+        if let Some(ks) = key_as_utf8(key) {
+            if let Some(v) = maybe_lookup_dict_storage(dict.dict_storage_proxy, ks) {
+                return Ok(Some(v));
+            }
         }
     }
     let entries = &*(dict.dstorage as *const indexmap::IndexMap<ObjectKey, PyObjectRef>);
@@ -1623,15 +1641,17 @@ pub unsafe fn w_module_dict_lookup_inner(
         // sibling slot, so consult it from the generic lookup too —
         // mirrors the str-side fallback in `w_module_dict_getitem_str`
         // (`:947-951`).
-        if !proxy.is_null() && crate::is_str(key) {
-            if let Some(v) = maybe_lookup_dict_storage(proxy, crate::w_str_get_value(key)) {
-                return Some(v);
+        if !proxy.is_null() {
+            if let Some(ks) = key_as_utf8(key) {
+                if let Some(v) = maybe_lookup_dict_storage(proxy, ks) {
+                    return Some(v);
+                }
             }
         }
         return None;
     }
-    if crate::is_str(key) {
-        return w_module_dict_getitem_str(obj, crate::w_str_get_value(key));
+    if let Some(ks) = key_as_utf8(key) {
+        return w_module_dict_getitem_str(obj, ks);
     }
     if _never_equal_to_string(key) {
         return None;
@@ -1641,9 +1661,11 @@ pub unsafe fn w_module_dict_lookup_inner(
     if let Some(&v) = entries.get(&object_key_for(key)) {
         return Some(v);
     }
-    if !proxy.is_null() && crate::is_str(key) {
-        if let Some(v) = maybe_lookup_dict_storage(proxy, crate::w_str_get_value(key)) {
-            return Some(v);
+    if !proxy.is_null() {
+        if let Some(ks) = key_as_utf8(key) {
+            if let Some(v) = maybe_lookup_dict_storage(proxy, ks) {
+                return Some(v);
+            }
         }
     }
     None
@@ -1659,15 +1681,17 @@ pub unsafe fn w_module_dict_lookup_inner_checked(
         if let Some(&v) = entries.get(&object_key) {
             return Ok(Some(v));
         }
-        if !proxy.is_null() && crate::is_str(key) {
-            if let Some(v) = maybe_lookup_dict_storage(proxy, crate::w_str_get_value(key)) {
-                return Ok(Some(v));
+        if !proxy.is_null() {
+            if let Some(ks) = key_as_utf8(key) {
+                if let Some(v) = maybe_lookup_dict_storage(proxy, ks) {
+                    return Ok(Some(v));
+                }
             }
         }
         return Ok(None);
     }
-    if crate::is_str(key) {
-        return Ok(w_module_dict_getitem_str(obj, crate::w_str_get_value(key)));
+    if let Some(ks) = key_as_utf8(key) {
+        return Ok(w_module_dict_getitem_str(obj, ks));
     }
     if _never_equal_to_string(key) {
         return Ok(None);
@@ -1921,8 +1945,10 @@ pub unsafe fn w_dict_store_object_strategy_checked(
 /// # Safety
 /// `obj` must point to a valid `W_ModuleDictObject`.
 pub unsafe fn w_module_dict_store_inner(obj: PyObjectRef, key: PyObjectRef, value: PyObjectRef) {
-    if crate::is_str(key) && !w_module_dict_is_object_strategy(obj) {
-        return w_module_dict_setitem_str(obj, crate::w_str_get_value(key), value);
+    if !w_module_dict_is_object_strategy(obj) {
+        if let Some(ks) = key_as_utf8(key) {
+            return w_module_dict_setitem_str(obj, ks, value);
+        }
     }
     if !w_module_dict_is_object_strategy(obj) {
         w_module_dict_switch_to_object_strategy(obj);
@@ -1942,9 +1968,11 @@ pub unsafe fn w_module_dict_store_inner_checked(
     key: PyObjectRef,
     value: PyObjectRef,
 ) -> Result<(), DictKeyError> {
-    if crate::is_str(key) && !w_module_dict_is_object_strategy(obj) {
-        w_module_dict_setitem_str(obj, crate::w_str_get_value(key), value);
-        return Ok(());
+    if !w_module_dict_is_object_strategy(obj) {
+        if let Some(ks) = key_as_utf8(key) {
+            w_module_dict_setitem_str(obj, ks, value);
+            return Ok(());
+        }
     }
     if !w_module_dict_is_object_strategy(obj) {
         w_module_dict_switch_to_object_strategy(obj);
@@ -1965,14 +1993,18 @@ pub unsafe fn w_module_dict_store_inner_checked(
 /// if any. Declared in pyre-interpreter and re-exported via an `extern`
 /// hook registered at startup to avoid a circular dependency.
 unsafe fn maybe_sync_dict_storage_store(ns_ptr: *mut u8, key: PyObjectRef, value: PyObjectRef) {
-    if ns_ptr.is_null() || !crate::is_str(key) {
+    if ns_ptr.is_null() {
         return;
     }
+    // A lone-surrogate key cannot live in the `&str`-keyed proxy storage, so
+    // there is nothing to sync (the object-strategy entries hold it instead).
+    let Some(name) = key_as_utf8(key) else {
+        return;
+    };
     if let Some(hook) = DICT_STORAGE_STORE_HOOK
         .load(std::sync::atomic::Ordering::Acquire)
         .as_ref()
     {
-        let name = crate::w_str_get_value(key);
         hook(ns_ptr, name, value);
     }
 }
@@ -2506,12 +2538,13 @@ pub unsafe fn w_dict_delitem_object_strategy(obj: PyObjectRef, key: PyObjectRef)
     // String-key delete must also flow into the storage proxy so
     // `del module.__dict__[name]` and `globals().pop(name)` clear the
     // backing namespace too.
-    if crate::is_str(key) && !dict.dict_storage_proxy.is_null() {
-        let key_str = crate::w_str_get_value(key);
-        if !hit && maybe_lookup_dict_storage(dict.dict_storage_proxy, key_str).is_some() {
-            hit = true;
+    if !dict.dict_storage_proxy.is_null() {
+        if let Some(key_str) = key_as_utf8(key) {
+            if !hit && maybe_lookup_dict_storage(dict.dict_storage_proxy, key_str).is_some() {
+                hit = true;
+            }
+            maybe_sync_dict_storage_delete(dict.dict_storage_proxy, key_str);
         }
-        maybe_sync_dict_storage_delete(dict.dict_storage_proxy, key_str);
     }
     hit
 }
@@ -2527,12 +2560,13 @@ pub unsafe fn w_dict_delitem_object_strategy_checked(
     if entries.shift_remove(&object_key).is_some() {
         hit = true;
     }
-    if crate::is_str(key) && !dict.dict_storage_proxy.is_null() {
-        let key_str = crate::w_str_get_value(key);
-        if !hit && maybe_lookup_dict_storage(dict.dict_storage_proxy, key_str).is_some() {
-            hit = true;
+    if !dict.dict_storage_proxy.is_null() {
+        if let Some(key_str) = key_as_utf8(key) {
+            if !hit && maybe_lookup_dict_storage(dict.dict_storage_proxy, key_str).is_some() {
+                hit = true;
+            }
+            maybe_sync_dict_storage_delete(dict.dict_storage_proxy, key_str);
         }
-        maybe_sync_dict_storage_delete(dict.dict_storage_proxy, key_str);
     }
     Ok(hit)
 }
@@ -2557,8 +2591,8 @@ pub unsafe fn w_module_dict_delitem_inner(obj: PyObjectRef, key: PyObjectRef) ->
         if entries.shift_remove(&object_key_for(key)).is_some() {
             let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
             strategy.mutated();
-            if crate::is_str(key) {
-                maybe_sync_dict_storage_delete(proxy, crate::w_str_get_value(key));
+            if let Some(ks) = key_as_utf8(key) {
+                maybe_sync_dict_storage_delete(proxy, ks);
             }
             return true;
         }
@@ -2568,19 +2602,20 @@ pub unsafe fn w_module_dict_delitem_inner(obj: PyObjectRef, key: PyObjectRef) ->
         // cell version for any successful str delete; `mutated()` is
         // what triggers GlobalCache invalidation in pyre, so fire it
         // alongside the proxy-only removal.
-        if !proxy.is_null() && crate::is_str(key) {
-            let key_str = crate::w_str_get_value(key);
-            if maybe_lookup_dict_storage(proxy, key_str).is_some() {
-                maybe_sync_dict_storage_delete(proxy, key_str);
-                let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
-                strategy.mutated();
-                return true;
+        if !proxy.is_null() {
+            if let Some(key_str) = key_as_utf8(key) {
+                if maybe_lookup_dict_storage(proxy, key_str).is_some() {
+                    maybe_sync_dict_storage_delete(proxy, key_str);
+                    let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
+                    strategy.mutated();
+                    return true;
+                }
             }
         }
         return false;
     }
-    if crate::is_str(key) {
-        return w_module_dict_delitem_str(obj, crate::w_str_get_value(key)).is_some();
+    if let Some(ks) = key_as_utf8(key) {
+        return w_module_dict_delitem_str(obj, ks).is_some();
     }
     if _never_equal_to_string(key) {
         return false;
@@ -2591,8 +2626,8 @@ pub unsafe fn w_module_dict_delitem_inner(obj: PyObjectRef, key: PyObjectRef) ->
     if entries.shift_remove(&object_key_for(key)).is_some() {
         let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
         strategy.mutated();
-        if crate::is_str(key) {
-            maybe_sync_dict_storage_delete(proxy, crate::w_str_get_value(key));
+        if let Some(ks) = key_as_utf8(key) {
+            maybe_sync_dict_storage_delete(proxy, ks);
         }
         return true;
     }
@@ -2610,24 +2645,25 @@ pub unsafe fn w_module_dict_delitem_inner_checked(
         if entries.shift_remove(&object_key).is_some() {
             let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
             strategy.mutated();
-            if crate::is_str(key) {
-                maybe_sync_dict_storage_delete(proxy, crate::w_str_get_value(key));
+            if let Some(ks) = key_as_utf8(key) {
+                maybe_sync_dict_storage_delete(proxy, ks);
             }
             return Ok(true);
         }
-        if !proxy.is_null() && crate::is_str(key) {
-            let key_str = crate::w_str_get_value(key);
-            if maybe_lookup_dict_storage(proxy, key_str).is_some() {
-                maybe_sync_dict_storage_delete(proxy, key_str);
-                let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
-                strategy.mutated();
-                return Ok(true);
+        if !proxy.is_null() {
+            if let Some(key_str) = key_as_utf8(key) {
+                if maybe_lookup_dict_storage(proxy, key_str).is_some() {
+                    maybe_sync_dict_storage_delete(proxy, key_str);
+                    let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
+                    strategy.mutated();
+                    return Ok(true);
+                }
             }
         }
         return Ok(false);
     }
-    if crate::is_str(key) {
-        return Ok(w_module_dict_delitem_str(obj, crate::w_str_get_value(key)).is_some());
+    if let Some(ks) = key_as_utf8(key) {
+        return Ok(w_module_dict_delitem_str(obj, ks).is_some());
     }
     if _never_equal_to_string(key) {
         return Ok(false);
@@ -2639,8 +2675,8 @@ pub unsafe fn w_module_dict_delitem_inner_checked(
     if entries.shift_remove(&object_key).is_some() {
         let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
         strategy.mutated();
-        if crate::is_str(key) {
-            maybe_sync_dict_storage_delete(proxy, crate::w_str_get_value(key));
+        if let Some(ks) = key_as_utf8(key) {
+            maybe_sync_dict_storage_delete(proxy, ks);
         }
         return Ok(true);
     }
@@ -3030,12 +3066,19 @@ pub unsafe fn w_module_dict_items_inner(obj: PyObjectRef) -> Vec<(PyObjectRef, P
 /// the strategy slot via `w_dict_items`, so W_DictObject and
 /// W_ModuleDictObject both round-trip their dict_storage_proxy /
 /// celldict cell-cache walks uniformly.
+///
+/// Keys that carry a lone surrogate (not valid UTF-8) are skipped:
+/// every consumer of this helper feeds the key into a `&str`-keyed
+/// path (dict_storage_store, call_with_kwargs, module `__dir__`),
+/// none of which can yet represent a surrogate key.  Skipping them
+/// here avoids the [`w_str_get_value`] panic until those paths thread
+/// the WTF-8 key through.
 pub unsafe fn w_dict_str_entries(obj: PyObjectRef) -> Vec<(String, PyObjectRef)> {
     w_dict_items(obj)
         .into_iter()
         .filter_map(|(k, v)| {
             if crate::is_str(k) {
-                Some((crate::w_str_get_value(k).to_string(), v))
+                crate::w_str_get_value_opt(k).map(|s| (s.to_string(), v))
             } else {
                 None
             }

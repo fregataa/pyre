@@ -49,8 +49,8 @@ const CONSTANT_METHODS: &[ConstantMethod] = &[
     },
     ConstantMethod {
         name: "str_constant",
-        args_decl: "value: &str",
-        concrete_expr: "crate::state::ConcreteValue::Ref(pyre_object::w_str_new(value))",
+        args_decl: "value: &rustpython_wtf8::Wtf8",
+        concrete_expr: "crate::state::ConcreteValue::Ref(pyre_object::w_str_from_wtf8(value.to_owned()))",
         trace_call: "self.trace_str_constant(value)?",
     },
     ConstantMethod {

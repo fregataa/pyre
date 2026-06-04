@@ -10,6 +10,7 @@
 //! unit. Method functions are registered into TypeDef at startup.
 
 use pyre_object::*;
+use rustpython_wtf8::{CodePoint, Wtf8, Wtf8Buf};
 
 // ── List methods ─────────────────────────────────────────────────────
 // All take self (list) as first arg.
@@ -194,25 +195,8 @@ pub fn list_method_remove(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 
 pub fn str_method_join(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() == 2);
-    let sep = unsafe { w_str_get_value(args[0]) };
+    let sep = unsafe { pyre_object::w_str_get_wtf8(args[0]) };
     let iterable = args[1];
-    // pypy/objspace/std/unicodeobject.py:856-872 descr_join — each
-    // element must be a str; otherwise TypeError("sequence item N:
-    // expected str instance, <T> found"). Silently dropping non-str
-    // items lost the error and produced an empty join.
-    let collect_strict = |items: Vec<PyObjectRef>| -> Result<Vec<String>, crate::PyError> {
-        let mut parts = Vec::with_capacity(items.len());
-        for (i, item) in items.iter().enumerate() {
-            if unsafe { !is_str(*item) } {
-                return Err(crate::PyError::type_error(format!(
-                    "sequence item {i}: expected str instance, {} found",
-                    unsafe { (*(*(*item)).ob_type).name }
-                )));
-            }
-            parts.push(unsafe { w_str_get_value(*item) }.to_string());
-        }
-        Ok(parts)
-    };
     let items: Vec<PyObjectRef> = unsafe {
         if is_list(iterable) {
             let n = w_list_len(iterable);
@@ -228,8 +212,24 @@ pub fn str_method_join(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
             crate::builtins::collect_iterable(iterable)?
         }
     };
-    let parts = collect_strict(items)?;
-    Ok(w_str_new(&parts.join(sep)))
+    // pypy/objspace/std/unicodeobject.py:856-872 descr_join — each
+    // element must be a str; otherwise TypeError("sequence item N:
+    // expected str instance, <T> found"). Silently dropping non-str
+    // items lost the error and produced an empty join.
+    let mut out = rustpython_wtf8::Wtf8Buf::new();
+    for (i, item) in items.iter().enumerate() {
+        if unsafe { !is_str(*item) } {
+            return Err(crate::PyError::type_error(format!(
+                "sequence item {i}: expected str instance, {} found",
+                unsafe { (*(*(*item)).ob_type).name }
+            )));
+        }
+        if i > 0 {
+            out.push_wtf8(sep);
+        }
+        out.push_wtf8(unsafe { pyre_object::w_str_get_wtf8(*item) });
+    }
+    Ok(pyre_object::w_str_from_wtf8(out))
 }
 
 /// `str.split` / `str.rsplit` take `sep` and `maxsplit` positionally or by
@@ -257,54 +257,118 @@ fn resolve_split_args(
     Ok((sep, maxsplit))
 }
 
+/// Box a code-point slice into a str object.
+fn cps_to_str(cps: &[CodePoint]) -> PyObjectRef {
+    let mut buf = Wtf8Buf::with_capacity(cps.len());
+    for &cp in cps {
+        buf.push(cp);
+    }
+    w_str_from_wtf8(buf)
+}
+
+/// A lone surrogate is not whitespace.
+fn cp_is_whitespace(cp: CodePoint) -> bool {
+    match cp.to_char() {
+        Some(c) => c.is_whitespace(),
+        None => false,
+    }
+}
+
+/// `str.split()` with no separator: split on runs of whitespace,
+/// dropping leading/trailing runs.  When `maxsplit >= 0`, after that
+/// many splits the rest (leading whitespace stripped) is one tail token.
+fn wtf8_split_whitespace(s: &Wtf8, maxsplit: i64) -> Vec<PyObjectRef> {
+    let cps: Vec<CodePoint> = s.code_points().collect();
+    let mut out: Vec<PyObjectRef> = Vec::new();
+    let mut i = 0usize;
+    loop {
+        if maxsplit >= 0 && out.len() as i64 >= maxsplit {
+            break;
+        }
+        while i < cps.len() && cp_is_whitespace(cps[i]) {
+            i += 1;
+        }
+        if i == cps.len() {
+            break;
+        }
+        let start = i;
+        while i < cps.len() && !cp_is_whitespace(cps[i]) {
+            i += 1;
+        }
+        out.push(cps_to_str(&cps[start..i]));
+    }
+    while i < cps.len() && cp_is_whitespace(cps[i]) {
+        i += 1;
+    }
+    if i < cps.len() {
+        out.push(cps_to_str(&cps[i..]));
+    }
+    out
+}
+
+/// `str.rsplit()` with no separator: like `wtf8_split_whitespace` but
+/// scanning from the right, so the tail token is the leading remainder.
+fn wtf8_rsplit_whitespace(s: &Wtf8, maxsplit: i64) -> Vec<PyObjectRef> {
+    let cps: Vec<CodePoint> = s.code_points().collect();
+    let mut tokens: Vec<PyObjectRef> = Vec::new();
+    let mut i = cps.len();
+    loop {
+        if maxsplit >= 0 && tokens.len() as i64 >= maxsplit {
+            break;
+        }
+        while i > 0 && cp_is_whitespace(cps[i - 1]) {
+            i -= 1;
+        }
+        if i == 0 {
+            break;
+        }
+        let end = i;
+        while i > 0 && !cp_is_whitespace(cps[i - 1]) {
+            i -= 1;
+        }
+        tokens.push(cps_to_str(&cps[i..end]));
+    }
+    tokens.reverse();
+    let mut prefix_end = i;
+    while prefix_end > 0 && cp_is_whitespace(cps[prefix_end - 1]) {
+        prefix_end -= 1;
+    }
+    if prefix_end > 0 {
+        let mut out = vec![cps_to_str(&cps[..prefix_end])];
+        out.extend(tokens);
+        out
+    } else {
+        tokens
+    }
+}
+
 pub fn str_method_split(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty());
-    let s = unsafe { w_str_get_value(args[0]) };
+    let s = unsafe { w_str_get_wtf8(args[0]) };
     let (sep_arg, maxsplit_arg) = resolve_split_args(args, "split")?;
     let sep = parse_split_sep(sep_arg)?;
     // `unicodeobject.py:972 @unwrap_spec(maxsplit=int) descr_split` —
     // `space.int_w(w_maxsplit)` routes through `__index__`, so any
     // int-like object (subclass, numpy int, etc.) is accepted.
     let maxsplit = parse_split_maxsplit(maxsplit_arg)?;
-    let sep_view = sep.as_deref();
-    let parts: Vec<PyObjectRef> = match sep_view {
+    let parts: Vec<PyObjectRef> = match sep.as_deref() {
         Some(sep) => {
             // `unicodeobject.py:1028 _split_with_separator` raises
             // ValueError on empty separator before the slow path.
-            if sep.is_empty() {
+            if sep.as_bytes().is_empty() {
                 return Err(crate::PyError::value_error("empty separator"));
             }
             if maxsplit < 0 {
-                s.split(sep).map(|p| w_str_new(p)).collect()
+                s.split(sep)
+                    .map(|p| w_str_from_wtf8(p.to_wtf8_buf()))
+                    .collect()
             } else {
                 s.splitn((maxsplit as usize) + 1, sep)
-                    .map(|p| w_str_new(p))
+                    .map(|p| w_str_from_wtf8(p.to_wtf8_buf()))
                     .collect()
             }
         }
-        None => {
-            if maxsplit < 0 {
-                s.split_whitespace().map(|p| w_str_new(p)).collect()
-            } else {
-                let mut out: Vec<PyObjectRef> = Vec::new();
-                let mut remaining = s;
-                let max = maxsplit as usize;
-                while out.len() < max {
-                    let trimmed = remaining.trim_start();
-                    if trimmed.is_empty() {
-                        break;
-                    }
-                    let end = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
-                    out.push(w_str_new(&trimmed[..end]));
-                    remaining = &trimmed[end..];
-                }
-                let tail = remaining.trim_start();
-                if !tail.is_empty() {
-                    out.push(w_str_new(tail));
-                }
-                out
-            }
-        }
+        None => wtf8_split_whitespace(s, maxsplit),
     };
     Ok(w_list_new(parts))
 }
@@ -313,12 +377,12 @@ pub fn str_method_split(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 /// .convert_arg_to_w_unicode` parity — `sep` must be `None` or a
 /// `str`; anything else surfaces a TypeError at the same call site
 /// where PyPy's `space.unicode_w` would.
-fn parse_split_sep(value: PyObjectRef) -> Result<Option<String>, crate::PyError> {
+fn parse_split_sep(value: PyObjectRef) -> Result<Option<Wtf8Buf>, crate::PyError> {
     if value.is_null() || unsafe { is_none(value) } {
         return Ok(None);
     }
     if unsafe { is_str(value) } {
-        return Ok(Some(unsafe { w_str_get_value(value) }.to_string()));
+        return Ok(Some(unsafe { w_str_get_wtf8(value) }.to_wtf8_buf()));
     }
     let tp_name = unsafe {
         match crate::typedef::r#type(value) {
@@ -351,63 +415,29 @@ fn parse_split_maxsplit(value: PyObjectRef) -> Result<i64, crate::PyError> {
 /// as `descr_split`.
 pub fn str_method_rsplit(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty());
-    let s = unsafe { w_str_get_value(args[0]) };
+    let s = unsafe { w_str_get_wtf8(args[0]) };
     let (sep_arg, maxsplit_arg) = resolve_split_args(args, "rsplit")?;
     let sep = parse_split_sep(sep_arg)?;
     let maxsplit = parse_split_maxsplit(maxsplit_arg)?;
-    let sep_view = sep.as_deref();
-    let parts: Vec<PyObjectRef> = match sep_view {
+    let parts: Vec<PyObjectRef> = match sep.as_deref() {
         Some(sep) => {
             // `unicodeobject.py:1028 _split_with_separator` raises
             // ValueError on empty separator before the slow path —
             // mirrors the forward `split` rejection.
-            if sep.is_empty() {
+            if sep.as_bytes().is_empty() {
                 return Err(crate::PyError::value_error("empty separator"));
             }
-            let mut out: Vec<&str> = if maxsplit < 0 {
+            let mut out: Vec<&Wtf8> = if maxsplit < 0 {
                 s.rsplit(sep).collect()
             } else {
                 s.rsplitn((maxsplit as usize) + 1, sep).collect()
             };
             out.reverse();
-            out.into_iter().map(|p| w_str_new(p)).collect()
+            out.into_iter()
+                .map(|p| w_str_from_wtf8(p.to_wtf8_buf()))
+                .collect()
         }
-        None => {
-            // `s.rsplit(None, maxsplit)` collapses runs of whitespace
-            // and walks from the right.
-            let chars: Vec<char> = s.chars().collect();
-            let mut tokens: Vec<String> = Vec::new();
-            let mut i = chars.len();
-            let max = if maxsplit < 0 {
-                usize::MAX
-            } else {
-                maxsplit as usize
-            };
-            while i > 0 && tokens.len() < max {
-                while i > 0 && chars[i - 1].is_whitespace() {
-                    i -= 1;
-                }
-                if i == 0 {
-                    break;
-                }
-                let end = i;
-                while i > 0 && !chars[i - 1].is_whitespace() {
-                    i -= 1;
-                }
-                tokens.push(chars[i..end].iter().collect());
-            }
-            tokens.reverse();
-            // Remaining prefix becomes the leading element.
-            let prefix: String = chars[..i].iter().collect();
-            let prefix_trimmed = prefix.trim();
-            if !prefix_trimmed.is_empty() {
-                let mut out = vec![w_str_new(prefix_trimmed)];
-                out.extend(tokens.into_iter().map(|t| w_str_new(&t)));
-                out
-            } else {
-                tokens.into_iter().map(|t| w_str_new(&t)).collect()
-            }
-        }
+        None => wtf8_rsplit_whitespace(s, maxsplit),
     };
     Ok(w_list_new(parts))
 }
@@ -429,8 +459,17 @@ pub fn str_method_rsplit(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 /// surface matches `unicode_casefold` for every Unicode code point.
 pub fn str_method_casefold(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty());
-    let s = unsafe { w_str_get_value(args[0]) };
-    Ok(w_str_new(&caseless::default_case_fold_str(s)))
+    let s = unsafe { w_str_get_wtf8(args[0]) };
+    // Fast path: no lone surrogate, fold the whole &str at once.
+    if let Ok(valid) = s.as_str() {
+        return Ok(w_str_new(&caseless::default_case_fold_str(valid)));
+    }
+    // Surrogate path: fold each scalar code point, pass surrogates through.
+    let out = wtf8_map_chars(s, |c, out| {
+        let mut buf = [0u8; 4];
+        out.push_str(&caseless::default_case_fold_str(c.encode_utf8(&mut buf)));
+    });
+    Ok(w_str_from_wtf8(out))
 }
 
 #[allow(dead_code)]
@@ -490,35 +529,35 @@ pub fn str_method_format_map(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
 /// ASCII whitespace (the `str::trim` set).  When provided, removes
 /// any character contained in `chars` from each end (NOT a substring
 /// match — `'aabaa'.strip('a') == 'b'`).
-fn strip_chars(s: &str, chars: Option<&str>, left: bool, right: bool) -> String {
-    let chars_set: Option<Vec<char>> = chars.map(|c| c.chars().collect());
-    let mut current: &str = s;
+fn strip_chars(s: &Wtf8, chars: Option<&Wtf8>, left: bool, right: bool) -> Wtf8Buf {
+    let chars_set: Option<Vec<CodePoint>> = chars.map(|c| c.code_points().collect());
+    let mut current: &Wtf8 = s;
     if left {
         current = match chars_set.as_ref() {
-            Some(set) => current.trim_start_matches(|c: char| set.contains(&c)),
+            Some(set) => current.trim_start_matches(|cp: CodePoint| set.contains(&cp)),
             None => current.trim_start(),
         };
     }
     if right {
         current = match chars_set.as_ref() {
-            Some(set) => current.trim_end_matches(|c: char| set.contains(&c)),
+            Some(set) => current.trim_end_matches(|cp: CodePoint| set.contains(&cp)),
             None => current.trim_end(),
         };
     }
-    current.to_string()
+    current.to_wtf8_buf()
 }
 
 /// `pypy/objspace/std/unicodeobject.py:1464-1473 W_UnicodeObject
 /// ._strip` — extract the optional `chars` argument as a `&str`,
 /// raising TypeError on non-str non-None arguments rather than
 /// silently falling through to the whitespace default.
-fn extract_strip_chars(arg: PyObjectRef, fn_name: &str) -> Result<Option<String>, crate::PyError> {
+fn extract_strip_chars(arg: PyObjectRef, fn_name: &str) -> Result<Option<Wtf8Buf>, crate::PyError> {
     if arg.is_null() || unsafe { pyre_object::is_none(arg) } {
         return Ok(None);
     }
     if unsafe { pyre_object::is_str(arg) } {
         return Ok(Some(
-            unsafe { pyre_object::w_str_get_value(arg) }.to_string(),
+            unsafe { pyre_object::w_str_get_wtf8(arg) }.to_wtf8_buf(),
         ));
     }
     Err(crate::PyError::type_error(format!(
@@ -528,32 +567,47 @@ fn extract_strip_chars(arg: PyObjectRef, fn_name: &str) -> Result<Option<String>
 
 pub fn str_method_strip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty());
-    let s = unsafe { w_str_get_value(args[0]) };
+    let s = unsafe { w_str_get_wtf8(args[0]) };
     let chars = match args.get(1) {
         Some(&a) => extract_strip_chars(a, "strip")?,
         None => None,
     };
-    Ok(w_str_new(&strip_chars(s, chars.as_deref(), true, true)))
+    Ok(w_str_from_wtf8(strip_chars(
+        s,
+        chars.as_deref(),
+        true,
+        true,
+    )))
 }
 
 pub fn str_method_lstrip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty());
-    let s = unsafe { w_str_get_value(args[0]) };
+    let s = unsafe { w_str_get_wtf8(args[0]) };
     let chars = match args.get(1) {
         Some(&a) => extract_strip_chars(a, "lstrip")?,
         None => None,
     };
-    Ok(w_str_new(&strip_chars(s, chars.as_deref(), true, false)))
+    Ok(w_str_from_wtf8(strip_chars(
+        s,
+        chars.as_deref(),
+        true,
+        false,
+    )))
 }
 
 pub fn str_method_rstrip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty());
-    let s = unsafe { w_str_get_value(args[0]) };
+    let s = unsafe { w_str_get_wtf8(args[0]) };
     let chars = match args.get(1) {
         Some(&a) => extract_strip_chars(a, "rstrip")?,
         None => None,
     };
-    Ok(w_str_new(&strip_chars(s, chars.as_deref(), false, true)))
+    Ok(w_str_from_wtf8(strip_chars(
+        s,
+        chars.as_deref(),
+        false,
+        true,
+    )))
 }
 
 /// `unicodeobject.py descr_startswith` — accepts either a single str
@@ -561,20 +615,20 @@ pub fn str_method_rstrip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 /// unicodeobject.py:848 descr_startswith(self, prefix, start=0, end=sys.maxsize)
 pub fn str_method_startswith(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() >= 2);
-    let s = unsafe { w_str_get_value(args[0]) };
+    let s = unsafe { pyre_object::w_str_get_wtf8(args[0]) };
     let slice = str_slice_args(s, args);
     str_prefix_match(slice, args[1], "startswith", true).map(w_bool_from)
 }
 
 pub fn str_method_endswith(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() >= 2);
-    let s = unsafe { w_str_get_value(args[0]) };
+    let s = unsafe { pyre_object::w_str_get_wtf8(args[0]) };
     let slice = str_slice_args(s, args);
     str_prefix_match(slice, args[1], "endswith", false).map(w_bool_from)
 }
 
-fn str_slice_args<'a>(s: &'a str, args: &[pyre_object::PyObjectRef]) -> &'a str {
-    let char_len = s.chars().count() as i64;
+fn str_slice_args<'a>(s: &'a Wtf8, args: &[pyre_object::PyObjectRef]) -> &'a Wtf8 {
+    let char_len = s.code_points().count() as i64;
     let start = if args.len() >= 3 {
         let v = unsafe { pyre_object::w_int_get_value(args[2]) };
         if v < 0 {
@@ -595,29 +649,41 @@ fn str_slice_args<'a>(s: &'a str, args: &[pyre_object::PyObjectRef]) -> &'a str 
     } else {
         char_len as usize
     };
+    let empty = unsafe { Wtf8::from_bytes_unchecked(&[]) };
     if start > end {
-        return "";
+        return empty;
     }
-    let byte_start = s.char_indices().nth(start).map_or(s.len(), |(i, _)| i);
-    let byte_end = s.char_indices().nth(end).map_or(s.len(), |(i, _)| i);
-    &s[byte_start..byte_end]
+    let bytes = s.as_bytes();
+    let byte_start = s
+        .code_point_indices()
+        .nth(start)
+        .map_or(bytes.len(), |(i, _)| i);
+    let byte_end = s
+        .code_point_indices()
+        .nth(end)
+        .map_or(bytes.len(), |(i, _)| i);
+    unsafe { Wtf8::from_bytes_unchecked(&bytes[byte_start..byte_end]) }
 }
 
 fn str_prefix_match(
-    s: &str,
+    s: &Wtf8,
     needle: PyObjectRef,
     method: &str,
     start: bool,
 ) -> Result<bool, crate::PyError> {
-    let test = |p: &str| {
+    let h = s.as_bytes();
+    // WTF-8 is self-synchronizing, so a byte-level prefix/suffix match
+    // coincides with a code-point-level one.
+    let test = |p: &Wtf8| {
+        let p = p.as_bytes();
         if start {
-            s.starts_with(p)
+            h.starts_with(p)
         } else {
-            s.ends_with(p)
+            h.ends_with(p)
         }
     };
     if unsafe { pyre_object::is_str(needle) } {
-        let p = unsafe { w_str_get_value(needle) };
+        let p = unsafe { pyre_object::w_str_get_wtf8(needle) };
         return Ok(test(p));
     }
     if unsafe { pyre_object::is_tuple(needle) } {
@@ -631,7 +697,7 @@ fn str_prefix_match(
                     unsafe { (*(*item).ob_type).name }
                 )));
             }
-            let p = unsafe { w_str_get_value(item) };
+            let p = unsafe { pyre_object::w_str_get_wtf8(item) };
             if test(p) {
                 return Ok(true);
             }
@@ -646,7 +712,6 @@ fn str_prefix_match(
 
 pub fn str_method_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() >= 3);
-    let s = unsafe { w_str_get_value(args[0]) };
     // pypy/objspace/std/unicodeobject.py:1132-1148 descr_replace —
     // both `old` and `new` must be str / W_UnicodeObject; otherwise
     // TypeError("replace() argument N must be str, not ...").
@@ -662,94 +727,83 @@ pub fn str_method_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             unsafe { (*(*args[2]).ob_type).name }
         )));
     }
-    let old = unsafe { w_str_get_value(args[1]) };
-    let new = unsafe { w_str_get_value(args[2]) };
+    let s = unsafe { pyre_object::w_str_get_wtf8(args[0]) };
+    let old = unsafe { pyre_object::w_str_get_wtf8(args[1]) };
+    let new = unsafe { pyre_object::w_str_get_wtf8(args[2]) };
     // `unicodeobject.py descr_replace` — optional count argument; a
     // negative count means "no limit" (matches CPython); 0 leaves the
     // string untouched.
-    let result = match args.get(3) {
-        Some(&w_count) if unsafe { pyre_object::is_int(w_count) } => {
-            let count = unsafe { pyre_object::w_int_get_value(w_count) };
-            if count < 0 {
-                s.replace(old, new)
-            } else {
-                s.replacen(old, new, count as usize)
-            }
-        }
-        _ => s.replace(old, new),
+    let maxcount = match args.get(3) {
+        Some(&w_count) if unsafe { pyre_object::is_int(w_count) } => unsafe {
+            pyre_object::w_int_get_value(w_count)
+        },
+        _ => -1,
     };
-    Ok(w_str_new(&result))
+    Ok(w_str_from_wtf8(wtf8_replace(s, old, new, maxcount)))
 }
 
-/// `unicodeobject.py:1319 _unwrap_and_compute_idx_params` — resolve the
-/// optional `start` / `end` search args (PyPy slice semantics via
-/// `unwrap_start_stop`) into a byte-offset window `(byte_start,
-/// byte_end)` into `s`.  Returns `None` when the codepoint window is
-/// empty because `start` is past the end or past `end` (the search-miss
-/// case shared by find / index / count).
-fn str_idx_window(s: &str, args: &[PyObjectRef]) -> Result<Option<(usize, usize)>, crate::PyError> {
-    let char_len = s.chars().count() as i64;
+/// WTF-8 window for the optional `start` / `end` search args: resolve them
+/// (PyPy slice semantics via `unwrap_start_stop`) into a byte-offset window
+/// `(byte_start, byte_end)` into the WTF-8 backing, indexing by code point so
+/// a surrogate-bearing string does not panic in `w_str_get_value`.  Returns
+/// `None` when the codepoint window is empty because `start` is past the end
+/// or past `end` (the search-miss case shared by count).
+fn wtf8_idx_window(
+    s: &Wtf8,
+    args: &[PyObjectRef],
+) -> Result<Option<(usize, usize)>, crate::PyError> {
+    let cp_len = s.code_points().count() as i64;
     let w_start = if args.len() >= 3 { args[2] } else { w_none() };
     let w_end = if args.len() >= 4 { args[3] } else { w_none() };
-    let (start, end) = crate::sliceobject::unwrap_start_stop(char_len, w_start, w_end)?;
-    if start > char_len {
+    let (start, end) = crate::sliceobject::unwrap_start_stop(cp_len, w_start, w_end)?;
+    if start > cp_len {
         return Ok(None);
     }
-    let end = end.min(char_len);
+    let end = end.min(cp_len);
     if start > end {
         return Ok(None);
     }
     let byte_start = s
-        .char_indices()
+        .code_point_indices()
         .nth(start as usize)
         .map_or(s.len(), |(i, _)| i);
     let byte_end = s
-        .char_indices()
+        .code_point_indices()
         .nth(end as usize)
         .map_or(s.len(), |(i, _)| i);
     Ok(Some((byte_start, byte_end)))
 }
 
-/// `unicodeobject.py:1288 _unwrap_and_search` — substring search over
-/// the codepoint window `s[start:end]`.  `forward` chooses `find` vs
-/// `rfind`.  Indices are codepoint-based on both input and output.
-fn str_search(args: &[PyObjectRef], forward: bool) -> Result<Option<i64>, crate::PyError> {
-    let s = unsafe { w_str_get_value(args[0]) };
-    let sub = unsafe { w_str_get_value(args[1]) };
-    let Some((byte_start, byte_end)) = str_idx_window(s, args)? else {
-        return Ok(None);
-    };
-    let window = &s[byte_start..byte_end];
-    let found = if forward {
-        window.find(sub)
-    } else {
-        window.rfind(sub)
-    };
-    Ok(found.map(|byte_pos| s[..byte_start + byte_pos].chars().count() as i64))
-}
-
 pub fn str_method_find(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() >= 2);
-    Ok(w_int_new(str_search(args, true)?.unwrap_or(-1)))
+    Ok(w_int_new(str_unwrap_and_search(args, true)?.unwrap_or(-1)))
 }
 
 pub fn str_method_rfind(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() >= 2);
-    Ok(w_int_new(str_search(args, false)?.unwrap_or(-1)))
+    Ok(w_int_new(str_unwrap_and_search(args, false)?.unwrap_or(-1)))
 }
 
 pub fn str_method_upper(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty());
-    Ok(w_str_new(
-        &unsafe { w_str_get_value(args[0]) }.to_uppercase(),
-    ))
+    let s = unsafe { w_str_get_wtf8(args[0]) };
+    let out = wtf8_map_chars(s, |c, out| {
+        for u in c.to_uppercase() {
+            out.push_char(u);
+        }
+    });
+    Ok(w_str_from_wtf8(out))
 }
 
 pub fn str_method_lower(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty());
-    Ok(w_str_new(
-        &unsafe { w_str_get_value(args[0]) }.to_lowercase(),
-    ))
+    let s = unsafe { w_str_get_wtf8(args[0]) };
+    let out = wtf8_map_chars(s, |c, out| {
+        for l in c.to_lowercase() {
+            out.push_char(l);
+        }
+    });
+    Ok(w_str_from_wtf8(out))
 }
 
 /// PyPy: unicodeobject.py descr_format
@@ -792,7 +846,7 @@ fn str_method_format_core(
         &mut numbering,
         2,
     )?;
-    Ok(pyre_object::w_str_new(&rendered))
+    Ok(pyre_object::w_str_from_wtf8(rendered))
 }
 
 /// `newformat.py W_StringFormatter.format` rendering pass.  Renders the
@@ -808,7 +862,7 @@ fn format_render(
     auto_idx: &mut usize,
     numbering: &mut Option<bool>,
     depth: u32,
-) -> Result<String, crate::PyError> {
+) -> Result<Wtf8Buf, crate::PyError> {
     let lookup_kwarg = |name: &str| -> Result<Option<PyObjectRef>, crate::PyError> {
         if let Some(m) = mapping {
             // `newformat.format_method(... w_mapping, True)` resolves
@@ -825,13 +879,13 @@ fn format_render(
         Ok(None)
     };
 
-    let mut result = String::new();
+    let mut result = Wtf8Buf::new();
     let bytes = fmt.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'{' {
             if i + 1 < bytes.len() && bytes[i + 1] == b'{' {
-                result.push('{');
+                result.push_char('{');
                 i += 2;
                 continue;
             }
@@ -970,7 +1024,10 @@ fn format_render(
             // str / repr / ascii before the format spec.
             let converted = match conversion {
                 None => val,
-                Some('s') => pyre_object::w_str_new(&unsafe { crate::py_str(val) }),
+                // `!s` is `str(self)`, preserved in WTF-8 so a lone
+                // surrogate (a str, or an exception with a str argument)
+                // passes through unchanged.
+                Some('s') => pyre_object::w_str_from_wtf8(unsafe { crate::py_str_wtf8(val) }),
                 Some('r') => pyre_object::w_str_new(&unsafe { crate::py_repr(val) }),
                 Some('a') => pyre_object::w_str_new(&crate::builtins::py_ascii(val)),
                 Some(c) => {
@@ -981,15 +1038,17 @@ fn format_render(
                 }
             };
             // A spec containing `{` is itself a template: render it
-            // (sharing the numbering state) before applying it.
-            let resolved_spec = if spec.bytes().any(|b| b == b'{') {
+            // (sharing the numbering state) before applying it.  A
+            // rendered spec is expected to be valid text (format specs
+            // do not carry surrogates).
+            let resolved_spec: String = if spec.bytes().any(|b| b == b'{') {
                 if depth == 0 {
                     return Err(crate::PyError::new(
                         crate::PyErrorKind::ValueError,
                         "Max string recursion exceeded".to_string(),
                     ));
                 }
-                format_render(
+                let nested = format_render(
                     &spec,
                     positional,
                     kwargs_dict,
@@ -997,18 +1056,34 @@ fn format_render(
                     auto_idx,
                     numbering,
                     depth - 1,
-                )?
+                )?;
+                match nested.as_str() {
+                    Ok(v) => v.to_string(),
+                    Err(_) => String::new(),
+                }
             } else {
                 spec
             };
             let formatted = format_value_dispatch(converted, &resolved_spec)?;
-            result.push_str(&formatted);
+            result.push_wtf8(&formatted);
         } else if bytes[i] == b'}' && i + 1 < bytes.len() && bytes[i + 1] == b'}' {
-            result.push('}');
+            result.push_char('}');
             i += 2;
-        } else {
-            result.push(bytes[i] as char);
+        } else if bytes[i] == b'}' {
+            // A lone `}` (not `}}`) is emitted literally.
+            result.push_char('}');
             i += 1;
+        } else {
+            // Literal run up to the next brace; `{` / `}` are single
+            // ASCII bytes that never occur inside a multi-byte
+            // sequence, so the run is itself valid text and copies
+            // whole (a byte-at-a-time `as char` would mojibake
+            // non-ASCII literals).
+            let start = i;
+            while i < bytes.len() && bytes[i] != b'{' && bytes[i] != b'}' {
+                i += 1;
+            }
+            result.push_str(&fmt[start..i]);
         }
     }
     Ok(result)
@@ -1278,7 +1353,7 @@ fn pad_to_width(body: String, fill: char, align: char, width: usize) -> String {
 /// Public entry point for the f-string `FormatWithSpec` opcode in
 /// `eval.rs::format_with_spec`. Forwards to the same parser used by
 /// `str.format` so both surfaces share the spec semantics.
-pub fn format_with_spec_public(val: PyObjectRef, spec: &str) -> String {
+pub fn format_with_spec_public(val: PyObjectRef, spec: &str) -> Wtf8Buf {
     format_with_spec(val, spec)
 }
 
@@ -1287,7 +1362,7 @@ pub fn format_with_spec_public(val: PyObjectRef, spec: &str) -> String {
 /// apply the shared builtin spec parser, with an empty spec collapsing to
 /// `str(value)`.  Shared by `format()`, the `FormatSimple`/`FormatWithSpec`
 /// f-string opcodes, and `str.format` field formatting.
-pub fn format_value_dispatch(val: PyObjectRef, spec: &str) -> Result<String, crate::PyError> {
+pub fn format_value_dispatch(val: PyObjectRef, spec: &str) -> Result<Wtf8Buf, crate::PyError> {
     unsafe {
         if is_instance(val) && crate::baseobjspace::lookup(val, "__format__").is_some() {
             let spec_obj = pyre_object::w_str_new(spec);
@@ -1302,11 +1377,14 @@ pub fn format_value_dispatch(val: PyObjectRef, spec: &str) -> Result<String, cra
                     (*(*result).ob_type).name
                 )));
             }
-            return Ok(pyre_object::w_str_get_value(result).to_string());
+            return Ok(pyre_object::w_str_get_wtf8(result).to_wtf8_buf());
         }
     }
     if spec.is_empty() {
-        Ok(unsafe { crate::py_str(val) })
+        // Empty spec collapses to `str(value)`, preserved in WTF-8 so a
+        // str — or an exception whose single argument is a str — keeps
+        // its lone surrogates.
+        Ok(unsafe { crate::py_str_wtf8(val) })
     } else {
         Ok(format_with_spec_public(val, spec))
     }
@@ -1322,15 +1400,21 @@ pub fn builtin_value_format(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     } else {
         String::new()
     };
-    let s = if spec.is_empty() {
-        unsafe { crate::py_str(args[0]) }
-    } else {
-        format_with_spec_public(args[0], &spec)
-    };
-    Ok(pyre_object::w_str_new(&s))
+    if spec.is_empty() {
+        // `str(self)` — a str self passes through as WTF-8.
+        if unsafe { pyre_object::is_str(args[0]) } {
+            return Ok(pyre_object::w_str_from_wtf8(
+                unsafe { pyre_object::w_str_get_wtf8(args[0]) }.to_wtf8_buf(),
+            ));
+        }
+        return Ok(pyre_object::w_str_new(&unsafe { crate::py_str(args[0]) }));
+    }
+    Ok(pyre_object::w_str_from_wtf8(format_with_spec_public(
+        args[0], &spec,
+    )))
 }
 
-fn format_with_spec(val: PyObjectRef, spec: &str) -> String {
+fn format_with_spec(val: PyObjectRef, spec: &str) -> Wtf8Buf {
     let p = parse_spec(spec);
     unsafe {
         if pyre_object::is_int(val) || pyre_object::is_bool(val) {
@@ -1349,34 +1433,79 @@ fn format_with_spec(val: PyObjectRef, spec: &str) -> String {
                     .map_or_else(|| format!("{v}"), |c| c.to_string());
                 // `c` keeps the integer default alignment (right).
                 let align = p.align.unwrap_or('>');
-                return pad_to_width(body, p.fill, align, p.width);
+                return Wtf8Buf::from_string(pad_to_width(body, p.fill, align, p.width));
             }
             // Float-style spec on int: coerce to f64 (matches CPython
             // `int.__format__('.3f')` behaviour).  `%` is a float-only
             // presentation type, so route ints through it too.
             if matches!(p.ty, 'f' | 'F' | 'e' | 'E' | 'g' | 'G' | '%') {
-                return format_float(v as f64, &p);
+                return Wtf8Buf::from_string(format_float(v as f64, &p));
             }
-            return format_int(v, &p);
+            return Wtf8Buf::from_string(format_int(v, &p));
         }
         if pyre_object::is_float(val) {
             let v = pyre_object::floatobject::w_float_get_value(val);
-            return format_float(v, &p);
+            return Wtf8Buf::from_string(format_float(v, &p));
         }
         if pyre_object::is_str(val) {
-            let body = pyre_object::w_str_get_value(val).to_string();
+            // Read the WTF-8 view so a lone-surrogate body formats and
+            // pads by code point instead of panicking.
+            let full = pyre_object::w_str_get_wtf8(val);
             let body = if let Some(prec) = p.precision {
-                body.chars().take(prec).collect()
+                let mut t = Wtf8Buf::new();
+                let mut n = 0usize;
+                for cp in full.code_points() {
+                    if n >= prec {
+                        break;
+                    }
+                    t.push(cp);
+                    n += 1;
+                }
+                t
             } else {
-                body
+                full.to_wtf8_buf()
             };
             let align = p.align.unwrap_or('<');
-            return pad_to_width(body, p.fill, align, p.width);
+            return pad_wtf8(&body, p.fill, align, p.width);
         }
-        let body = crate::py_str(val);
-        let align = p.align.unwrap_or('<');
-        pad_to_width(body, p.fill, align, p.width)
+        Wtf8Buf::from_string(pad_to_width(
+            crate::py_str(val),
+            p.fill,
+            p.align.unwrap_or('<'),
+            p.width,
+        ))
     }
+}
+
+/// Pad a WTF-8 string body to `width` code points with `fill`,
+/// honouring `<` / `^` / `>` alignment.  String bodies never use the
+/// numeric `=` alignment, so any non-`<`/`^` alignment right-aligns.
+fn pad_wtf8(body: &Wtf8, fill: char, align: char, width: usize) -> Wtf8Buf {
+    let body_len = body.code_points().count();
+    if body_len >= width {
+        return body.to_wtf8_buf();
+    }
+    let need = width - body_len;
+    let fill_cp = CodePoint::from_char(fill);
+    let mut out = Wtf8Buf::with_capacity(body.len() + need * 4);
+    match align {
+        '<' => {
+            out.push_wtf8(body);
+            push_cp_repeated(&mut out, fill_cp, need);
+        }
+        '^' => {
+            let left = need / 2;
+            let right = need - left;
+            push_cp_repeated(&mut out, fill_cp, left);
+            out.push_wtf8(body);
+            push_cp_repeated(&mut out, fill_cp, right);
+        }
+        _ => {
+            push_cp_repeated(&mut out, fill_cp, need);
+            out.push_wtf8(body);
+        }
+    }
+    out
 }
 
 fn format_int(v: i64, p: &ParsedSpec) -> String {
@@ -1500,12 +1629,83 @@ fn format_float(v: f64, p: &ParsedSpec) -> String {
     pad_to_width(body, p.fill, align, p.width)
 }
 
+/// runicode.py:333 unicode_encode_utf_8 + interp_codecs.py
+/// surrogatepass / surrogateescape encode branches.  The WTF-8 backing
+/// already stores a lone surrogate as its three-byte sequence, so the
+/// surrogate-free common case is a direct byte copy; surrogate code points
+/// are routed to the named error handler.  `w_object` is the str being
+/// encoded, threaded through so a strict failure can build a structured
+/// UnicodeEncodeError carrying it.
+fn encode_utf8_with_errors(
+    w_object: PyObjectRef,
+    err_mode: &str,
+) -> Result<Vec<u8>, crate::PyError> {
+    let s: &Wtf8 = unsafe { w_str_get_wtf8(w_object) };
+    // utf8_encode_utf_8 fast path: no surrogates → already valid UTF-8.
+    if let Ok(valid) = s.as_str() {
+        return Ok(valid.as_bytes().to_vec());
+    }
+    let mut out = Vec::with_capacity(s.len());
+    let mut buf = [0u8; 4];
+    for (index, cp) in s.code_points().enumerate() {
+        if let Some(c) = cp.to_char() {
+            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+            continue;
+        }
+        let code = cp.to_u32();
+        match err_mode {
+            // surrogatepass_errors encode branch (interp_codecs.py:455-458):
+            // emit the three-byte sequence for the surrogate code point.
+            "surrogatepass" => {
+                out.push(0xE0 | (code >> 12) as u8);
+                out.push(0x80 | ((code >> 6) & 0x3f) as u8);
+                out.push(0x80 | (code & 0x3f) as u8);
+            }
+            // surrogateescape_errors encode branch (interp_codecs.py:528-534):
+            // a 0xDC80..0xDCFF surrogate maps back to the byte code-0xDC00;
+            // any other surrogate fails.
+            "surrogateescape" => {
+                if (0xDC80..=0xDCFF).contains(&code) {
+                    out.push((code - 0xDC00) as u8);
+                } else {
+                    return Err(crate::typedef::unicode_encode_error(
+                        "utf-8",
+                        w_object,
+                        index,
+                        index + 1,
+                        "surrogates not allowed",
+                    ));
+                }
+            }
+            "strict" => {
+                return Err(crate::typedef::unicode_encode_error(
+                    "utf-8",
+                    w_object,
+                    index,
+                    index + 1,
+                    "surrogates not allowed",
+                ));
+            }
+            "ignore" => {}
+            "replace" => out.push(b'?'),
+            "backslashreplace" => out.extend_from_slice(format!("\\u{code:04x}").as_bytes()),
+            "xmlcharrefreplace" => out.extend_from_slice(format!("&#{code};").as_bytes()),
+            _ => {
+                return Err(crate::PyError::new(
+                    crate::PyErrorKind::LookupError,
+                    format!("unknown error handler name '{err_mode}'"),
+                ));
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// PyPy: unicodeobject.py descr_encode → encode_object.
 /// For the common 'utf-8' / 'ascii' fast paths, returns the UTF-8 bytes
 /// of the string. Other codecs fall through to a best-effort UTF-8 encoding.
 pub fn str_method_encode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty());
-    let s = unsafe { w_str_get_value(args[0]) };
     // `encoding` and `errors` arrive positionally or by keyword; builtin
     // kwargs are packed in a trailing `__pyre_kw__` dict.
     let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
@@ -1543,82 +1743,105 @@ pub fn str_method_encode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
         };
     let encoding = str_arg(dual("encoding", pos.get(1).copied())?, "utf-8")?;
     let errors = str_arg(dual("errors", pos.get(2).copied())?, "strict")?;
+    Ok(pyre_object::w_bytes_from_bytes(&encode_object(
+        args[0], &encoding, &errors,
+    )?))
+}
+
+/// `unicodeobject.py W_UnicodeObject.descr_encode` → `encode_object`.
+/// Encodes a str (`w_object`) to bytes with the named codec and error
+/// handler.  Shared by `str.encode`, `bytes(str, …)` and
+/// `bytearray(str, …)` so all three honour the same codec set and error
+/// handlers.  The whole path reads the surrogate-aware WTF-8 view, so a
+/// lone surrogate is routed to the error handler rather than crashing.
+pub fn encode_object(
+    w_object: PyObjectRef,
+    encoding: &str,
+    errors: &str,
+) -> Result<Vec<u8>, crate::PyError> {
     let enc_lower = encoding.to_ascii_lowercase().replace('_', "-");
+    if matches!(enc_lower.as_str(), "utf-8" | "utf8" | "u8") {
+        return encode_utf8_with_errors(w_object, errors);
+    }
+    let s = unsafe { w_str_get_wtf8(w_object) };
     match enc_lower.as_str() {
-        "utf-8" | "utf8" | "u8" => Ok(pyre_object::w_bytes_from_bytes(s.as_bytes())),
         "ascii" | "us-ascii" | "646" => encode_narrow(
             s,
-            args[0],
+            w_object,
             "ascii",
             0x7f,
             "ordinal not in range(128)",
-            &errors,
+            errors,
         ),
         "latin-1" | "latin1" | "iso-8859-1" | "8859" => encode_narrow(
             s,
-            args[0],
+            w_object,
             "latin-1",
             0xff,
             "ordinal not in range(256)",
-            &errors,
+            errors,
         ),
-        _ => {
-            if let Some(out) = encode_utf16_32(s, &enc_lower) {
-                return Ok(pyre_object::w_bytes_from_bytes(&out));
-            }
-            Err(crate::PyError::new(
+        _ => match encode_utf16_32(s, &enc_lower, w_object, errors) {
+            Some(out) => out,
+            None => Err(crate::PyError::new(
                 crate::PyErrorKind::LookupError,
                 format!("unknown encoding: {encoding}"),
-            ))
-        }
+            )),
+        },
     }
 }
 
-/// Encode `s` with a single-byte codec (`ascii`, `latin-1`) where any code
-/// point `> max_cp` is unencodable, applying the `errors` handler.
-/// Supported handlers: `strict` (raise `UnicodeEncodeError` over the maximal
-/// run), `ignore`, `replace` (`?`), `backslashreplace`, `xmlcharrefreplace`.
-/// The handler is consulted lazily, so an all-encodable string never trips an
-/// unknown-handler `LookupError` — matching `PyUnicode_AsEncodedString`.
 fn encode_narrow(
-    s: &str,
+    s: &Wtf8,
     source: PyObjectRef,
     enc_name: &str,
     max_cp: u32,
     range_msg: &str,
     errors: &str,
-) -> Result<PyObjectRef, crate::PyError> {
-    let chars: Vec<char> = s.chars().collect();
-    let mut out: Vec<u8> = Vec::with_capacity(chars.len());
+) -> Result<Vec<u8>, crate::PyError> {
+    let cps: Vec<u32> = s.code_points().map(|c| c.to_u32()).collect();
+    let mut out: Vec<u8> = Vec::with_capacity(cps.len());
     let mut i = 0usize;
-    while i < chars.len() {
-        if (chars[i] as u32) <= max_cp {
-            out.push(chars[i] as u8);
+    while i < cps.len() {
+        if cps[i] <= max_cp {
+            out.push(cps[i] as u8);
+            i += 1;
+            continue;
+        }
+        // `surrogateescape` rescues only a 0xDC80..0xDCFF code point, mapping
+        // it back to the byte `code-0xDC00` (interp_codecs.py:528-534); any
+        // other unencodable code point still raises, so it is handled one at
+        // a time rather than over the maximal run.
+        if errors == "surrogateescape" && (0xDC80..=0xDCFF).contains(&cps[i]) {
+            out.push((cps[i] - 0xDC00) as u8);
             i += 1;
             continue;
         }
         // Maximal run of consecutive unencodable code points — `strict`
-        // reports the whole span as one error, like CPython.
+        // reports the whole span as one error, like CPython.  A
+        // `surrogateescape`-rescuable code point ends the run.
         let start = i;
         let mut end = i;
-        while end < chars.len() && (chars[end] as u32) > max_cp {
+        while end < cps.len()
+            && cps[end] > max_cp
+            && !(errors == "surrogateescape" && (0xDC80..=0xDCFF).contains(&cps[end]))
+        {
             end += 1;
         }
         match errors {
-            "strict" => {
-                return Err(crate::PyError::unicode_encode_error(
-                    enc_name,
-                    source,
-                    start as i64,
-                    end as i64,
-                    range_msg,
+            // `surrogateescape` reached here only for an unencodable code
+            // point outside the rescue range, so it raises like `strict`.
+            // `surrogatepass` only rescues surrogates for utf-8/16/32, so a
+            // narrow codec re-raises the original UnicodeEncodeError.
+            "strict" | "surrogateescape" | "surrogatepass" => {
+                return Err(crate::typedef::unicode_encode_error(
+                    enc_name, source, start, end, range_msg,
                 ));
             }
             "ignore" => {}
             "replace" => out.resize(out.len() + (end - start), b'?'),
             "backslashreplace" => {
-                for &c in &chars[start..end] {
-                    let cp = c as u32;
+                for &cp in &cps[start..end] {
                     let esc = if cp <= 0xff {
                         format!("\\x{cp:02x}")
                     } else if cp <= 0xffff {
@@ -1630,8 +1853,8 @@ fn encode_narrow(
                 }
             }
             "xmlcharrefreplace" => {
-                for &c in &chars[start..end] {
-                    out.extend_from_slice(format!("&#{};", c as u32).as_bytes());
+                for &cp in &cps[start..end] {
+                    out.extend_from_slice(format!("&#{cp};").as_bytes());
                 }
             }
             _ => {
@@ -1643,7 +1866,7 @@ fn encode_narrow(
         }
         i = end;
     }
-    Ok(pyre_object::w_bytes_from_bytes(&out))
+    Ok(out)
 }
 
 /// Collapse a normalized encoding name to its separator-free form so
@@ -1655,208 +1878,487 @@ fn compact_codec_name(lower: &str) -> String {
         .collect()
 }
 
+/// Append a 16-bit code unit in the requested byte order.
+fn push_unit16(out: &mut Vec<u8>, unit: u16, big_endian: bool) {
+    out.extend_from_slice(&if big_endian {
+        unit.to_be_bytes()
+    } else {
+        unit.to_le_bytes()
+    });
+}
+
+/// Append a 32-bit code unit in the requested byte order.
+fn push_unit32(out: &mut Vec<u8>, unit: u32, big_endian: bool) {
+    out.extend_from_slice(&if big_endian {
+        unit.to_be_bytes()
+    } else {
+        unit.to_le_bytes()
+    });
+}
+
+/// Emit a non-surrogate scalar value: utf-32 writes one 32-bit unit,
+/// utf-16 writes one BMP unit or a surrogate pair for astral planes.
+fn emit_scalar(out: &mut Vec<u8>, cp: u32, is32: bool, big_endian: bool) {
+    if is32 {
+        push_unit32(out, cp, big_endian);
+    } else if cp <= 0xFFFF {
+        push_unit16(out, cp as u16, big_endian);
+    } else {
+        let v = cp - 0x10000;
+        push_unit16(out, 0xD800 | (v >> 10) as u16, big_endian);
+        push_unit16(out, 0xDC00 | (v & 0x3FF) as u16, big_endian);
+    }
+}
+
 /// utf-16 / utf-32 encode for the `lower`-normalized codec name, or
 /// `None` if `lower` names neither.  The bare `utf-16` / `utf-32` forms
-/// emit a little-endian BOM; the `-le` / `-be` forms omit it.
-pub fn encode_utf16_32(s: &str, lower: &str) -> Option<Vec<u8>> {
-    let (is32, big_endian, bom) = match compact_codec_name(lower).as_str() {
-        "utf16" | "u16" => (false, false, true),
-        "utf16le" => (false, false, false),
-        "utf16be" => (false, true, false),
-        "utf32" | "u32" => (true, false, true),
-        "utf32le" => (true, false, false),
-        "utf32be" => (true, true, false),
+/// emit a little-endian BOM; the `-le` / `-be` forms omit it.  A lone
+/// surrogate is routed through `errors` (`surrogatepass` emits its raw
+/// code unit; `strict` raises) rather than crashing.
+pub fn encode_utf16_32(
+    s: &Wtf8,
+    lower: &str,
+    w_object: PyObjectRef,
+    errors: &str,
+) -> Option<Result<Vec<u8>, crate::PyError>> {
+    // `codec` is the canonical name reported in a UnicodeEncodeError, so
+    // a `-le` / `-be` spelling keeps its suffix while `utf16` normalizes
+    // to `utf-16`.
+    let (is32, big_endian, bom, codec) = match compact_codec_name(lower).as_str() {
+        "utf16" | "u16" => (false, false, true, "utf-16"),
+        "utf16le" => (false, false, false, "utf-16-le"),
+        "utf16be" => (false, true, false, "utf-16-be"),
+        "utf32" | "u32" => (true, false, true, "utf-32"),
+        "utf32le" => (true, false, false, "utf-32-le"),
+        "utf32be" => (true, true, false, "utf-32-be"),
         _ => return None,
     };
+    Some(encode_utf16_32_impl(
+        s, is32, big_endian, bom, codec, w_object, errors,
+    ))
+}
+
+fn encode_utf16_32_impl(
+    s: &Wtf8,
+    is32: bool,
+    big_endian: bool,
+    bom: bool,
+    codec: &str,
+    w_object: PyObjectRef,
+    errors: &str,
+) -> Result<Vec<u8>, crate::PyError> {
     let mut out = Vec::new();
     if bom {
-        let cp = 0xFEFFu32;
-        if is32 {
-            out.extend_from_slice(&if big_endian {
-                cp.to_be_bytes()
-            } else {
-                cp.to_le_bytes()
-            });
-        } else {
-            let unit = 0xFEFFu16;
-            out.extend_from_slice(&if big_endian {
-                unit.to_be_bytes()
-            } else {
-                unit.to_le_bytes()
-            });
-        }
+        emit_scalar(&mut out, 0xFEFF, is32, big_endian);
     }
-    if is32 {
-        for ch in s.chars() {
-            let cp = ch as u32;
-            out.extend_from_slice(&if big_endian {
-                cp.to_be_bytes()
-            } else {
-                cp.to_le_bytes()
-            });
+    for (index, cp) in s.code_points().enumerate() {
+        let code = cp.to_u32();
+        if !(0xD800..=0xDFFF).contains(&code) {
+            emit_scalar(&mut out, code, is32, big_endian);
+            continue;
         }
-    } else {
-        let mut buf = [0u16; 2];
-        for ch in s.chars() {
-            for &unit in ch.encode_utf16(&mut buf).iter() {
-                out.extend_from_slice(&if big_endian {
-                    unit.to_be_bytes()
+        // Lone surrogate — only the utf-8/16/32 surrogatepass branch may
+        // emit it, as a raw code unit (interp_codecs.py surrogatepass).
+        match errors {
+            "surrogatepass" => {
+                if is32 {
+                    push_unit32(&mut out, code, big_endian);
                 } else {
-                    unit.to_le_bytes()
-                });
+                    push_unit16(&mut out, code as u16, big_endian);
+                }
+            }
+            // surrogateescape rescues a 0xDC80..0xDCFF surrogate to the byte
+            // code-0xDC00; any other surrogate still raises.
+            "surrogateescape" if (0xDC80..=0xDCFF).contains(&code) => {
+                out.push((code - 0xDC00) as u8);
+            }
+            "ignore" => {}
+            "replace" => emit_scalar(&mut out, '?' as u32, is32, big_endian),
+            "backslashreplace" => {
+                for b in format!("\\u{code:04x}").bytes() {
+                    emit_scalar(&mut out, b as u32, is32, big_endian);
+                }
+            }
+            "xmlcharrefreplace" => {
+                for b in format!("&#{code};").bytes() {
+                    emit_scalar(&mut out, b as u32, is32, big_endian);
+                }
+            }
+            "strict" | "surrogateescape" => {
+                return Err(crate::typedef::unicode_encode_error(
+                    codec,
+                    w_object,
+                    index,
+                    index + 1,
+                    "surrogates not allowed",
+                ));
+            }
+            _ => {
+                return Err(crate::PyError::new(
+                    crate::PyErrorKind::LookupError,
+                    format!("unknown error handler name '{errors}'"),
+                ));
             }
         }
     }
-    Some(out)
+    Ok(out)
 }
 
 /// utf-16 / utf-32 decode for the `lower`-normalized codec name, or
 /// `None` if `lower` names neither.  The bare `utf-16` / `utf-32` forms
 /// consume a leading BOM to choose endianness (defaulting to
-/// little-endian); the `-le` / `-be` forms are fixed.
-pub fn decode_utf16_32(data: &[u8], lower: &str) -> Option<Result<String, crate::PyError>> {
-    let (is32, fixed_be) = match compact_codec_name(lower).as_str() {
-        "utf16" | "u16" => (false, None),
-        "utf16le" => (false, Some(false)),
-        "utf16be" => (false, Some(true)),
-        "utf32" | "u32" => (true, None),
-        "utf32le" => (true, Some(false)),
-        "utf32be" => (true, Some(true)),
+/// little-endian); the `-le` / `-be` forms are fixed.  A lone surrogate
+/// is routed through `err_mode` (`surrogatepass` keeps it as a code
+/// point; `strict` raises), so the result is a `Wtf8Buf`.
+pub fn decode_utf16_32(
+    data: &[u8],
+    lower: &str,
+    err_mode: &str,
+) -> Option<Result<Wtf8Buf, crate::PyError>> {
+    // `codec` is the canonical name reported in a UnicodeDecodeError.
+    let (is32, fixed_be, codec) = match compact_codec_name(lower).as_str() {
+        "utf16" | "u16" => (false, None, "utf-16"),
+        "utf16le" => (false, Some(false), "utf-16-le"),
+        "utf16be" => (false, Some(true), "utf-16-be"),
+        "utf32" | "u32" => (true, None, "utf-32"),
+        "utf32le" => (true, Some(false), "utf-32-le"),
+        "utf32be" => (true, Some(true), "utf-32-be"),
         _ => return None,
     };
-    Some(decode_utf16_32_impl(data, is32, fixed_be))
+    Some(if is32 {
+        decode_utf32_impl(data, fixed_be, codec, err_mode)
+    } else {
+        decode_utf16_impl(data, fixed_be, codec, err_mode)
+    })
 }
 
-fn decode_utf16_32_impl(
-    data: &[u8],
-    is32: bool,
-    fixed_be: Option<bool>,
-) -> Result<String, crate::PyError> {
-    let unit = if is32 { 4usize } else { 2usize };
-    // Resolve endianness: a fixed -le/-be codec ignores any BOM, while
-    // the bare form consumes a leading BOM and otherwise defaults to LE.
-    let (big_endian, start) = match fixed_be {
-        Some(be) => (be, 0usize),
-        None => {
-            if is32 && data.starts_with(&[0xFF, 0xFE, 0x00, 0x00]) {
-                (false, 4)
-            } else if is32 && data.starts_with(&[0x00, 0x00, 0xFE, 0xFF]) {
-                (true, 4)
-            } else if !is32 && data.starts_with(&[0xFF, 0xFE]) {
-                (false, 2)
-            } else if !is32 && data.starts_with(&[0xFE, 0xFF]) {
-                (true, 2)
-            } else {
-                (false, 0)
-            }
-        }
-    };
-    let body = &data[start..];
-    let codec = if is32 { "utf-32" } else { "utf-16" };
-    if body.len() % unit != 0 {
-        return Err(crate::PyError::new(
-            crate::PyErrorKind::UnicodeDecodeError,
-            format!(
-                "'{codec}' codec can't decode bytes in position {}: truncated data",
-                body.len() - (body.len() % unit)
-            ),
-        ));
+/// Resolve endianness and the body start offset: a fixed `-le`/`-be`
+/// codec ignores any BOM, while the bare form consumes a leading BOM and
+/// otherwise defaults to little-endian.
+fn resolve_bom(data: &[u8], is32: bool, fixed_be: Option<bool>) -> (bool, usize) {
+    match fixed_be {
+        Some(be) => (be, 0),
+        None if is32 && data.starts_with(&[0xFF, 0xFE, 0x00, 0x00]) => (false, 4),
+        None if is32 && data.starts_with(&[0x00, 0x00, 0xFE, 0xFF]) => (true, 4),
+        None if !is32 && data.starts_with(&[0xFF, 0xFE]) => (false, 2),
+        None if !is32 && data.starts_with(&[0xFE, 0xFF]) => (true, 2),
+        None => (false, 0),
     }
-    if is32 {
-        let mut s = String::new();
-        for (i, chunk) in body.chunks_exact(4).enumerate() {
-            let arr = [chunk[0], chunk[1], chunk[2], chunk[3]];
-            let cp = if big_endian {
-                u32::from_be_bytes(arr)
-            } else {
-                u32::from_le_bytes(arr)
-            };
-            match char::from_u32(cp) {
-                Some(c) => s.push(c),
-                None => {
-                    return Err(crate::PyError::new(
-                        crate::PyErrorKind::UnicodeDecodeError,
-                        format!(
-                            "'utf-32' codec can't decode bytes in position {}: code point not in range(0x110000)",
-                            i * 4
-                        ),
-                    ));
-                }
-            }
+}
+
+/// Read one `unit`-byte (2 or 4) code unit at `pos` in the given order.
+fn read_code_unit(data: &[u8], pos: usize, unit: usize, big_endian: bool) -> u32 {
+    if unit == 2 {
+        let arr = [data[pos], data[pos + 1]];
+        if big_endian {
+            u16::from_be_bytes(arr) as u32
+        } else {
+            u16::from_le_bytes(arr) as u32
         }
-        Ok(s)
     } else {
-        let units: Vec<u16> = body
-            .chunks_exact(2)
-            .map(|c| {
-                let arr = [c[0], c[1]];
-                if big_endian {
-                    u16::from_be_bytes(arr)
-                } else {
-                    u16::from_le_bytes(arr)
-                }
-            })
-            .collect();
-        let mut s = String::new();
-        for r in char::decode_utf16(units) {
-            match r {
-                Ok(c) => s.push(c),
-                Err(_) => {
-                    return Err(crate::PyError::new(
-                        crate::PyErrorKind::UnicodeDecodeError,
-                        "'utf-16' codec can't decode bytes: illegal UTF-16 surrogate",
-                    ));
+        let arr = [data[pos], data[pos + 1], data[pos + 2], data[pos + 3]];
+        if big_endian {
+            u32::from_be_bytes(arr)
+        } else {
+            u32::from_le_bytes(arr)
+        }
+    }
+}
+
+/// Decode error-handler dispatch for utf-16 / utf-32 (interp_codecs.py
+/// surrogatepass/surrogateescape branches plus the generic handlers).
+/// Appends the replacement to `out` and returns the byte position to
+/// resume decoding at.  `unit` is 2 for utf-16, 4 for utf-32.
+fn utf16_32_decode_error(
+    err_mode: &str,
+    codec: &str,
+    data: &[u8],
+    start: usize,
+    end: usize,
+    reason: &str,
+    big_endian: bool,
+    unit: usize,
+    out: &mut Wtf8Buf,
+) -> Result<usize, crate::PyError> {
+    match err_mode {
+        "strict" => Err(crate::typedef::unicode_decode_error(
+            codec, data, start, end, reason,
+        )),
+        "ignore" => Ok(end),
+        "replace" => {
+            out.push_char('\u{FFFD}');
+            Ok(end)
+        }
+        "backslashreplace" => {
+            for &b in &data[start..end.min(data.len())] {
+                out.push_str(&format!("\\x{b:02x}"));
+            }
+            Ok(end)
+        }
+        // surrogatepass: reconstruct one surrogate from the unit at
+        // `start` and keep it; a non-surrogate value re-raises
+        // (interp_codecs.py:476-510).
+        "surrogatepass" => {
+            if start + unit <= data.len() {
+                let ch = read_code_unit(data, start, unit, big_endian);
+                if (0xD800..=0xDFFF).contains(&ch) {
+                    out.push(CodePoint::from_u32(ch).unwrap());
+                    return Ok(start + unit);
                 }
             }
+            Err(crate::typedef::unicode_decode_error(
+                codec, data, start, end, reason,
+            ))
         }
-        Ok(s)
+        // surrogateescape: escape each >=128 byte as 0xdc00+byte, up to 4
+        // bytes or the first ASCII byte (interp_codecs.py:536-555).
+        "surrogateescape" => {
+            let mut consumed = 0usize;
+            while consumed < 4 && start + consumed < end {
+                let b = data[start + consumed];
+                if b < 128 {
+                    break;
+                }
+                out.push(CodePoint::from_u32(0xDC00 + b as u32).unwrap());
+                consumed += 1;
+            }
+            if consumed == 0 {
+                return Err(crate::typedef::unicode_decode_error(
+                    codec, data, start, end, reason,
+                ));
+            }
+            Ok(start + consumed)
+        }
+        _ => Err(crate::PyError::new(
+            crate::PyErrorKind::LookupError,
+            format!("unknown error handler name '{err_mode}'"),
+        )),
     }
+}
+
+/// `unicodehelper.py str_decode_utf_16_helper` (runicode.py:517).
+fn decode_utf16_impl(
+    data: &[u8],
+    fixed_be: Option<bool>,
+    codec: &str,
+    err_mode: &str,
+) -> Result<Wtf8Buf, crate::PyError> {
+    let (big_endian, mut pos) = resolve_bom(data, false, fixed_be);
+    let len = data.len();
+    let mut out = Wtf8Buf::with_capacity(len / 2);
+    while pos < len {
+        if len - pos < 2 {
+            pos = utf16_32_decode_error(
+                err_mode,
+                codec,
+                data,
+                pos,
+                len,
+                "truncated data",
+                big_endian,
+                2,
+                &mut out,
+            )?;
+            if len - pos < 2 {
+                break;
+            }
+            continue;
+        }
+        let ch = read_code_unit(data, pos, 2, big_endian);
+        pos += 2;
+        if !(0xD800..=0xDFFF).contains(&ch) {
+            out.push(CodePoint::from_u32(ch).unwrap());
+            continue;
+        } else if ch >= 0xDC00 {
+            // unexpected lone low surrogate
+            pos = utf16_32_decode_error(
+                err_mode,
+                codec,
+                data,
+                pos - 2,
+                pos,
+                "illegal encoding",
+                big_endian,
+                2,
+                &mut out,
+            )?;
+            continue;
+        }
+        // high surrogate: a low surrogate must follow
+        if len - pos < 2 {
+            pos -= 2;
+            pos = utf16_32_decode_error(
+                err_mode,
+                codec,
+                data,
+                pos,
+                len,
+                "unexpected end of data",
+                big_endian,
+                2,
+                &mut out,
+            )?;
+        } else {
+            let ch2 = read_code_unit(data, pos, 2, big_endian);
+            pos += 2;
+            if (0xDC00..=0xDFFF).contains(&ch2) {
+                let c = (((ch & 0x3FF) << 10) | (ch2 & 0x3FF)) + 0x10000;
+                out.push(CodePoint::from_u32(c).unwrap());
+            } else {
+                pos = utf16_32_decode_error(
+                    err_mode,
+                    codec,
+                    data,
+                    pos - 4,
+                    pos - 2,
+                    "illegal UTF-16 surrogate",
+                    big_endian,
+                    2,
+                    &mut out,
+                )?;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// `unicodehelper.py str_decode_utf_32_helper` (runicode.py:762).  The
+/// public codec rejects surrogates (`allow_surrogates=False`), so a
+/// surrogate code point is routed through the error handler.
+fn decode_utf32_impl(
+    data: &[u8],
+    fixed_be: Option<bool>,
+    codec: &str,
+    err_mode: &str,
+) -> Result<Wtf8Buf, crate::PyError> {
+    let (big_endian, mut pos) = resolve_bom(data, true, fixed_be);
+    let len = data.len();
+    let mut out = Wtf8Buf::with_capacity(len / 4);
+    while pos < len {
+        if len - pos < 4 {
+            pos = utf16_32_decode_error(
+                err_mode,
+                codec,
+                data,
+                pos,
+                len,
+                "truncated data",
+                big_endian,
+                4,
+                &mut out,
+            )?;
+            if len - pos < 4 {
+                break;
+            }
+            continue;
+        }
+        let ch = read_code_unit(data, pos, 4, big_endian);
+        if (0xD800..=0xDFFF).contains(&ch) {
+            pos = utf16_32_decode_error(
+                err_mode,
+                codec,
+                data,
+                pos,
+                pos + 4,
+                "code point in surrogate code point range(0xd800, 0xe000)",
+                big_endian,
+                4,
+                &mut out,
+            )?;
+            continue;
+        } else if ch >= 0x110000 {
+            pos = utf16_32_decode_error(
+                err_mode,
+                codec,
+                data,
+                pos,
+                len,
+                "code point not in range(0x110000)",
+                big_endian,
+                4,
+                &mut out,
+            )?;
+            continue;
+        }
+        out.push(CodePoint::from_u32(ch).unwrap());
+        pos += 4;
+    }
+    Ok(out)
+}
+
+/// Map each scalar code point of `s` through `f`, appending to a
+/// `Wtf8Buf`; a lone surrogate passes through unchanged.  Used by the
+/// case-mapping methods, which leave surrogates untouched.
+fn wtf8_map_chars(s: &Wtf8, f: impl Fn(char, &mut Wtf8Buf)) -> Wtf8Buf {
+    let mut out = Wtf8Buf::with_capacity(s.len());
+    for cp in s.code_points() {
+        match cp.to_char() {
+            Some(c) => f(c, &mut out),
+            None => out.push(cp),
+        }
+    }
+    out
 }
 
 pub fn str_method_isdigit(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty());
-    let s = unsafe { w_str_get_value(args[0]) };
-    Ok(w_bool_from(
-        !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()),
-    ))
+    // A lone surrogate satisfies no character class, so a non-UTF-8
+    // backing is never all-digit (and the empty string is false too).
+    let s = unsafe { w_str_get_wtf8(args[0]) };
+    let result = match s.as_str() {
+        Ok(v) => !v.is_empty() && v.chars().all(|c| c.is_ascii_digit()),
+        Err(_) => false,
+    };
+    Ok(w_bool_from(result))
 }
 
 pub fn str_method_isdecimal(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty());
-    let s = unsafe { w_str_get_value(args[0]) };
-    Ok(w_bool_from(
-        !s.is_empty() && s.chars().all(|c| c.is_ascii_digit() || c.is_numeric()),
-    ))
+    let s = unsafe { w_str_get_wtf8(args[0]) };
+    let result = match s.as_str() {
+        Ok(v) => !v.is_empty() && v.chars().all(|c| c.is_ascii_digit() || c.is_numeric()),
+        Err(_) => false,
+    };
+    Ok(w_bool_from(result))
 }
 
 pub fn str_method_isnumeric(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty());
-    let s = unsafe { w_str_get_value(args[0]) };
-    Ok(w_bool_from(
-        !s.is_empty() && s.chars().all(|c| c.is_numeric()),
-    ))
+    let s = unsafe { w_str_get_wtf8(args[0]) };
+    let result = match s.as_str() {
+        Ok(v) => !v.is_empty() && v.chars().all(|c| c.is_numeric()),
+        Err(_) => false,
+    };
+    Ok(w_bool_from(result))
 }
 
 pub fn str_method_istitle(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty());
-    let s = unsafe { w_str_get_value(args[0]) };
+    let s = unsafe { w_str_get_wtf8(args[0]) };
     let mut cased = false;
     let mut prev_cased = false;
-    for c in s.chars() {
-        if c.is_uppercase() {
-            if prev_cased {
-                return Ok(w_bool_from(false));
+    for cp in s.code_points() {
+        // A lone surrogate is uncased, so it resets `prev_cased` like
+        // any other non-cased code point (the `None` arm / `else`).
+        match cp.to_char() {
+            Some(c) => {
+                if c.is_uppercase() {
+                    if prev_cased {
+                        return Ok(w_bool_from(false));
+                    }
+                    prev_cased = true;
+                    cased = true;
+                } else if c.is_lowercase() {
+                    if !prev_cased {
+                        return Ok(w_bool_from(false));
+                    }
+                    prev_cased = true;
+                    cased = true;
+                } else {
+                    prev_cased = false;
+                }
             }
-            prev_cased = true;
-            cased = true;
-        } else if c.is_lowercase() {
-            if !prev_cased {
-                return Ok(w_bool_from(false));
-            }
-            prev_cased = true;
-            cased = true;
-        } else {
-            prev_cased = false;
+            None => prev_cased = false,
         }
     }
     Ok(w_bool_from(cased))
@@ -1864,17 +2366,25 @@ pub fn str_method_istitle(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 
 pub fn str_method_isalpha(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty());
-    let s = unsafe { w_str_get_value(args[0]) };
-    Ok(w_bool_from(
-        !s.is_empty() && s.chars().all(|c| c.is_alphabetic()),
-    ))
+    let s = unsafe { w_str_get_wtf8(args[0]) };
+    let result = match s.as_str() {
+        Ok(v) => !v.is_empty() && v.chars().all(|c| c.is_alphabetic()),
+        Err(_) => false,
+    };
+    Ok(w_bool_from(result))
 }
 
 /// PyPy: unicodeobject.py descr_isidentifier
 pub fn str_method_isidentifier(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty());
-    let s = unsafe { w_str_get_value(args[0]) };
-    Ok(w_bool_from(is_identifier(s)))
+    // An identifier cannot contain a lone surrogate, so a non-UTF-8
+    // backing is never an identifier.
+    let s = unsafe { w_str_get_wtf8(args[0]) };
+    let result = match s.as_str() {
+        Ok(v) => is_identifier(v),
+        Err(_) => false,
+    };
+    Ok(w_bool_from(result))
 }
 
 /// Check if a string is a valid Python identifier.
@@ -1898,40 +2408,147 @@ fn is_identifier(s: &str) -> bool {
 /// fill between it and the digits (`'-42'.zfill(5) == '-0042'`).
 pub fn str_method_zfill(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() >= 2);
-    let s = unsafe { w_str_get_value(args[0]) };
+    let s = unsafe { w_str_get_wtf8(args[0]) };
     let width = unsafe { w_int_get_value(args[1]) }.max(0) as usize;
-    let len = s.chars().count();
+    let len = s.code_points().count();
     if len >= width {
         return Ok(args[0]);
     }
     let need = width - len;
-    let mut chars = s.chars();
-    let mut out = String::with_capacity(width);
-    let first = chars.clone().next();
-    if let Some(c) = first {
-        if c == '+' || c == '-' {
-            out.push(c);
-            chars.next();
-        }
+    let mut cps = s.code_points();
+    let mut out = Wtf8Buf::with_capacity(width);
+    let first = cps.clone().next();
+    if first == Some(CodePoint::from_char('+')) || first == Some(CodePoint::from_char('-')) {
+        out.push(first.unwrap());
+        cps.next();
     }
     for _ in 0..need {
-        out.push('0');
+        out.push_char('0');
     }
-    out.extend(chars);
-    Ok(w_str_new(&out))
+    for cp in cps {
+        out.push(cp);
+    }
+    Ok(w_str_from_wtf8(out))
+}
+
+/// Number of non-overlapping occurrences of `needle` in `haystack`,
+/// scanning over the WTF-8 bytes. The encoding is self-synchronizing,
+/// so a byte-window match starts on a code-point boundary and the count
+/// equals the code-point-level count. An empty needle matches at every
+/// code-point boundary (len+1 positions), as in `str.count`.
+fn wtf8_count(haystack: &Wtf8, needle: &Wtf8) -> usize {
+    let h = haystack.as_bytes();
+    let n = needle.as_bytes();
+    if n.is_empty() {
+        return haystack.code_points().count() + 1;
+    }
+    let mut count = 0;
+    let mut i = 0;
+    while i + n.len() <= h.len() {
+        if &h[i..i + n.len()] == n {
+            count += 1;
+            i += n.len();
+        } else {
+            i += 1;
+        }
+    }
+    count
+}
+
+/// First byte offset of `needle` fully within `haystack[lo..hi]`, over
+/// WTF-8 bytes. An empty needle matches at `lo`.
+fn wtf8_find_bounded(haystack: &[u8], needle: &[u8], lo: usize, hi: usize) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(lo);
+    }
+    if needle.len() > hi {
+        return None;
+    }
+    (lo..=hi - needle.len()).find(|&i| &haystack[i..i + needle.len()] == needle)
+}
+
+/// Last byte offset of `needle` fully within `haystack[lo..hi]`, over
+/// WTF-8 bytes. An empty needle matches at `hi`.
+fn wtf8_rfind_bounded(haystack: &[u8], needle: &[u8], lo: usize, hi: usize) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(hi);
+    }
+    if needle.len() > hi {
+        return None;
+    }
+    (lo..=hi - needle.len())
+        .rev()
+        .find(|&i| &haystack[i..i + needle.len()] == needle)
+}
+
+/// PyPy `_unwrap_and_search` (unicodeobject.py:1288-1317) — the shared
+/// path for find/rfind/index/rindex. `start`/`end` (args[2]/args[3])
+/// are codepoint indices: `unwrap_start_stop` adds the length to a
+/// negative value and lower-clamps to 0. The search runs over the
+/// WTF-8 bytes inside that window and the byte offset is converted back
+/// to a codepoint index. Returns None when not found.
+/// `unicodeobject.py:1288 _unwrap_and_search` — the shared path for
+/// find/rfind/index/rindex. `start`/`end` (args[2]/args[3]) flow through
+/// `unwrap_start_stop`, so `None` / omitted arguments default, any
+/// `__index__`-bearing object is accepted, and a `TypeError` propagates.
+/// The search runs over the WTF-8 bytes inside the codepoint window and
+/// the matching byte offset is mapped back to a codepoint index. Returns
+/// `Ok(None)` when not found.
+fn str_unwrap_and_search(
+    args: &[PyObjectRef],
+    forward: bool,
+) -> Result<Option<i64>, crate::PyError> {
+    let s = unsafe { pyre_object::w_str_get_wtf8(args[0]) };
+    let sub = unsafe { pyre_object::w_str_get_wtf8(args[1]) }.as_bytes();
+    let h = s.as_bytes();
+    // Byte offset of each codepoint, with the trailing length appended,
+    // so `cp_offsets[i]` is `_index_to_byte(i)` and a byte offset maps
+    // back via its position.
+    let mut cp_offsets: Vec<usize> = s.code_point_indices().map(|(i, _)| i).collect();
+    cp_offsets.push(h.len());
+    let length = (cp_offsets.len() - 1) as i64;
+
+    let w_start = if args.len() >= 3 { args[2] } else { w_none() };
+    let w_end = if args.len() >= 4 { args[3] } else { w_none() };
+    let (start, end) = crate::sliceobject::unwrap_start_stop(length, w_start, w_end)?;
+
+    let start_index = if start == 0 {
+        0
+    } else if start > length {
+        return Ok(None);
+    } else {
+        cp_offsets[start as usize]
+    };
+    let end_index = if end >= length {
+        h.len()
+    } else {
+        cp_offsets[end as usize]
+    };
+    if start_index > end_index {
+        return Ok(None);
+    }
+
+    let res_index = if forward {
+        wtf8_find_bounded(h, sub, start_index, end_index)
+    } else {
+        wtf8_rfind_bounded(h, sub, start_index, end_index)
+    };
+    Ok(res_index.and_then(|ri| cp_offsets.iter().position(|&o| o == ri).map(|i| i as i64)))
 }
 
 /// PyPy: unicodeobject.py descr_count
 pub fn str_method_count(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() >= 2);
-    let s = unsafe { w_str_get_value(args[0]) };
-    let sub = unsafe { w_str_get_value(args[1]) };
-    let Some((byte_start, byte_end)) = str_idx_window(s, args)? else {
+    // Operands read as WTF-8 so lone surrogates do not panic; the optional
+    // start / end arguments bound the count window over the code points.
+    let s = unsafe { pyre_object::w_str_get_wtf8(args[0]) };
+    let sub = unsafe { pyre_object::w_str_get_wtf8(args[1]) };
+    let Some((byte_start, byte_end)) = wtf8_idx_window(s, args)? else {
         return Ok(w_int_new(0));
     };
-    Ok(w_int_new(
-        s[byte_start..byte_end].matches(sub).count() as i64
-    ))
+    let window = rustpython_wtf8::Wtf8::from_bytes(&s.as_bytes()[byte_start..byte_end])
+        .expect("code-point boundary slice is valid WTF-8");
+    Ok(w_int_new(wtf8_count(window, sub) as i64))
 }
 
 /// PyPy: unicodeobject.py descr_index
@@ -1939,7 +2556,7 @@ pub fn str_method_count(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 /// "substring not found" (ValueError).
 pub fn str_method_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() >= 2);
-    match str_search(args, true)? {
+    match str_unwrap_and_search(args, true)? {
         Some(i) => Ok(w_int_new(i)),
         None => Err(crate::PyError::value_error("substring not found")),
     }
@@ -1950,7 +2567,7 @@ pub fn str_method_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 /// unicodeobject.py:572 descr_rindex
 pub fn str_method_rindex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() >= 2);
-    match str_search(args, false)? {
+    match str_unwrap_and_search(args, false)? {
         Some(i) => Ok(w_int_new(i)),
         None => Err(crate::PyError::value_error("substring not found")),
     }
@@ -1959,55 +2576,78 @@ pub fn str_method_rindex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 /// PyPy: unicodeobject.py descr_title
 pub fn str_method_title(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty());
-    let s = unsafe { w_str_get_value(args[0]) };
-    let mut result = String::with_capacity(s.len());
+    let s = unsafe { w_str_get_wtf8(args[0]) };
+    let mut result = Wtf8Buf::with_capacity(s.len());
     let mut prev_is_sep = true;
-    for c in s.chars() {
-        if prev_is_sep {
-            for u in c.to_uppercase() {
-                result.push(u);
+    for cp in s.code_points() {
+        match cp.to_char() {
+            Some(c) => {
+                if prev_is_sep {
+                    for u in c.to_uppercase() {
+                        result.push_char(u);
+                    }
+                } else {
+                    for l in c.to_lowercase() {
+                        result.push_char(l);
+                    }
+                }
+                prev_is_sep = !c.is_alphanumeric();
             }
-        } else {
-            for l in c.to_lowercase() {
-                result.push(l);
+            // A lone surrogate is not alphanumeric — it starts a new word.
+            None => {
+                result.push(cp);
+                prev_is_sep = true;
             }
         }
-        prev_is_sep = !c.is_alphanumeric();
     }
-    Ok(w_str_new(&result))
+    Ok(w_str_from_wtf8(result))
 }
 
 /// PyPy: unicodeobject.py descr_capitalize
 pub fn str_method_capitalize(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty());
-    let s = unsafe { w_str_get_value(args[0]) };
-    let mut chars = s.chars();
-    let result = match chars.next() {
-        None => String::new(),
-        Some(first) => {
-            let upper: String = first.to_uppercase().collect();
-            let lower: String = chars.flat_map(|c| c.to_lowercase()).collect();
-            format!("{upper}{lower}")
+    let s = unsafe { w_str_get_wtf8(args[0]) };
+    let mut result = Wtf8Buf::with_capacity(s.len());
+    let mut cps = s.code_points();
+    if let Some(first) = cps.next() {
+        match first.to_char() {
+            Some(c) => {
+                for u in c.to_uppercase() {
+                    result.push_char(u);
+                }
+            }
+            None => result.push(first),
         }
-    };
-    Ok(w_str_new(&result))
+        for cp in cps {
+            match cp.to_char() {
+                Some(c) => {
+                    for l in c.to_lowercase() {
+                        result.push_char(l);
+                    }
+                }
+                None => result.push(cp),
+            }
+        }
+    }
+    Ok(w_str_from_wtf8(result))
 }
 
 /// PyPy: unicodeobject.py descr_swapcase
 pub fn str_method_swapcase(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty());
-    let s = unsafe { w_str_get_value(args[0]) };
-    let result: String = s
-        .chars()
-        .flat_map(|c| {
-            if c.is_uppercase() {
-                c.to_lowercase().collect::<Vec<_>>()
-            } else {
-                c.to_uppercase().collect::<Vec<_>>()
+    let s = unsafe { w_str_get_wtf8(args[0]) };
+    let out = wtf8_map_chars(s, |c, out| {
+        if c.is_uppercase() {
+            for l in c.to_lowercase() {
+                out.push_char(l);
             }
-        })
-        .collect();
-    Ok(w_str_new(&result))
+        } else {
+            for u in c.to_uppercase() {
+                out.push_char(u);
+            }
+        }
+    });
+    Ok(w_str_from_wtf8(out))
 }
 
 /// PyPy: unicodeobject.py descr_center
@@ -2015,17 +2655,17 @@ pub fn str_method_swapcase(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 /// `' '` when missing; PyPy raises TypeError when the fill string is
 /// not exactly one character long (unicodeobject.py:1191-1194
 /// _convert_fillchar parity).
-fn pad_fillchar(args: &[PyObjectRef], method: &str) -> Result<char, crate::PyError> {
+fn pad_fillchar(args: &[PyObjectRef], method: &str) -> Result<CodePoint, crate::PyError> {
     if args.len() <= 2 {
-        return Ok(' ');
+        return Ok(CodePoint::from_char(' '));
     }
     if !unsafe { pyre_object::is_str(args[2]) } {
         return Err(crate::PyError::type_error(format!(
             "{method}() argument 2 must be a single character"
         )));
     }
-    let raw = unsafe { w_str_get_value(args[2]) };
-    let mut iter = raw.chars();
+    let raw = unsafe { w_str_get_wtf8(args[2]) };
+    let mut iter = raw.code_points();
     let first = iter.next();
     if first.is_none() || iter.next().is_some() {
         return Err(crate::PyError::type_error(format!(
@@ -2035,12 +2675,19 @@ fn pad_fillchar(args: &[PyObjectRef], method: &str) -> Result<char, crate::PyErr
     Ok(first.unwrap())
 }
 
+/// Append `cp` to `out`, `n` times.
+fn push_cp_repeated(out: &mut Wtf8Buf, cp: CodePoint, n: usize) {
+    for _ in 0..n {
+        out.push(cp);
+    }
+}
+
 pub fn str_method_center(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() >= 2);
-    let s = unsafe { w_str_get_value(args[0]) };
+    let s = unsafe { w_str_get_wtf8(args[0]) };
     let width = unsafe { w_int_get_value(args[1]) }.max(0) as usize;
     let fillchar = pad_fillchar(args, "center")?;
-    let s_len = s.chars().count();
+    let s_len = s.code_points().count();
     if s_len >= width {
         return Ok(args[0]);
     }
@@ -2048,41 +2695,43 @@ pub fn str_method_center(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     let d = width - s_len;
     let left = d / 2 + (d & width & 1);
     let right = d - left;
-    let result = format!(
-        "{}{}{}",
-        fillchar.to_string().repeat(left),
-        s,
-        fillchar.to_string().repeat(right)
-    );
-    Ok(w_str_new(&result))
+    let mut out = Wtf8Buf::with_capacity(s.len() + (left + right) * 4);
+    push_cp_repeated(&mut out, fillchar, left);
+    out.push_wtf8(s);
+    push_cp_repeated(&mut out, fillchar, right);
+    Ok(w_str_from_wtf8(out))
 }
 
 /// PyPy: unicodeobject.py descr_ljust
 pub fn str_method_ljust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() >= 2);
-    let s = unsafe { w_str_get_value(args[0]) };
+    let s = unsafe { w_str_get_wtf8(args[0]) };
     let width = unsafe { w_int_get_value(args[1]) }.max(0) as usize;
     let fillchar = pad_fillchar(args, "ljust")?;
-    let s_len = s.chars().count();
+    let s_len = s.code_points().count();
     if s_len >= width {
         return Ok(args[0]);
     }
-    let pad = fillchar.to_string().repeat(width - s_len);
-    Ok(w_str_new(&format!("{s}{pad}")))
+    let mut out = Wtf8Buf::with_capacity(s.len() + (width - s_len) * 4);
+    out.push_wtf8(s);
+    push_cp_repeated(&mut out, fillchar, width - s_len);
+    Ok(w_str_from_wtf8(out))
 }
 
 /// PyPy: unicodeobject.py descr_rjust
 pub fn str_method_rjust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() >= 2);
-    let s = unsafe { w_str_get_value(args[0]) };
+    let s = unsafe { w_str_get_wtf8(args[0]) };
     let width = unsafe { w_int_get_value(args[1]) }.max(0) as usize;
     let fillchar = pad_fillchar(args, "rjust")?;
-    let s_len = s.chars().count();
+    let s_len = s.code_points().count();
     if s_len >= width {
         return Ok(args[0]);
     }
-    let pad = fillchar.to_string().repeat(width - s_len);
-    Ok(w_str_new(&format!("{pad}{s}")))
+    let mut out = Wtf8Buf::with_capacity(s.len() + (width - s_len) * 4);
+    push_cp_repeated(&mut out, fillchar, width - s_len);
+    out.push_wtf8(s);
+    Ok(w_str_from_wtf8(out))
 }
 
 /// `pypy/objspace/std/unicodeobject.py descr_isprintable` —
@@ -2105,86 +2754,157 @@ pub fn str_method_rjust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 /// which catches the common ASCII-only cases.
 pub fn str_method_isprintable(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty());
-    let s = unsafe { w_str_get_value(args[0]) };
-    if s.is_empty() {
-        return Ok(w_bool_from(true));
-    }
-    Ok(w_bool_from(s.chars().all(|c| {
-        // Cc (control) — Rust stdlib catches this.
-        // Zl / Zp — single chars U+2028 / U+2029 are non-printable.
-        // Zs other than space — narrow no-break U+202F, etc., are
-        // non-printable, but plain space ' ' is.
-        if c.is_control() {
-            return false;
-        }
-        if c == '\u{2028}' || c == '\u{2029}' {
-            return false;
-        }
-        true
-    })))
+    let s = unsafe { w_str_get_wtf8(args[0]) };
+    // Empty returns True (vacuous); a lone surrogate is not printable.
+    let result = match s.as_str() {
+        Ok(v) => v.chars().all(|c| {
+            // Cc (control) — Rust stdlib catches this.
+            // Zl / Zp — single chars U+2028 / U+2029 are non-printable.
+            // Zs other than space — narrow no-break U+202F, etc., are
+            // non-printable, but plain space ' ' is.
+            !c.is_control() && c != '\u{2028}' && c != '\u{2029}'
+        }),
+        Err(_) => false,
+    };
+    Ok(w_bool_from(result))
 }
 
 /// PyPy: unicodeobject.py descr_isspace
 pub fn str_method_isspace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty());
-    let s = unsafe { w_str_get_value(args[0]) };
-    Ok(w_bool_from(
-        !s.is_empty() && s.chars().all(|c| c.is_whitespace()),
-    ))
+    let s = unsafe { w_str_get_wtf8(args[0]) };
+    let result = match s.as_str() {
+        Ok(v) => !v.is_empty() && v.chars().all(|c| c.is_whitespace()),
+        Err(_) => false,
+    };
+    Ok(w_bool_from(result))
+}
+
+/// True iff `s` has at least one cased (alphabetic) code point and
+/// every cased code point matches the requested case.  Lone
+/// surrogates are uncased and ignored, so `'ABC\udcff'.isupper()` is
+/// still True — unlike the character-class predicates, a surrogate
+/// does not force a false result here.
+fn wtf8_cased_all(s: &Wtf8, want_upper: bool) -> bool {
+    let mut has_cased = false;
+    let mut all_match = true;
+    for cp in s.code_points() {
+        if let Some(c) = cp.to_char() {
+            if c.is_alphabetic() {
+                has_cased = true;
+                let ok = if want_upper {
+                    c.is_uppercase()
+                } else {
+                    c.is_lowercase()
+                };
+                if !ok {
+                    all_match = false;
+                }
+            }
+        }
+    }
+    has_cased && all_match
 }
 
 /// PyPy: unicodeobject.py descr_isupper
 pub fn str_method_isupper(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty());
-    let s = unsafe { w_str_get_value(args[0]) };
-    let has_cased = s.chars().any(|c| c.is_alphabetic());
-    Ok(w_bool_from(
-        has_cased
-            && s.chars()
-                .filter(|c| c.is_alphabetic())
-                .all(|c| c.is_uppercase()),
-    ))
+    let s = unsafe { w_str_get_wtf8(args[0]) };
+    Ok(w_bool_from(wtf8_cased_all(s, true)))
 }
 
 /// PyPy: unicodeobject.py descr_islower
 pub fn str_method_islower(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty());
-    let s = unsafe { w_str_get_value(args[0]) };
-    let has_cased = s.chars().any(|c| c.is_alphabetic());
-    Ok(w_bool_from(
-        has_cased
-            && s.chars()
-                .filter(|c| c.is_alphabetic())
-                .all(|c| c.is_lowercase()),
-    ))
+    let s = unsafe { w_str_get_wtf8(args[0]) };
+    Ok(w_bool_from(wtf8_cased_all(s, false)))
 }
 
 /// PyPy: unicodeobject.py descr_isalnum
 pub fn str_method_isalnum(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty());
-    let s = unsafe { w_str_get_value(args[0]) };
-    Ok(w_bool_from(
-        !s.is_empty() && s.chars().all(|c| c.is_alphanumeric()),
-    ))
+    let s = unsafe { w_str_get_wtf8(args[0]) };
+    let result = match s.as_str() {
+        Ok(v) => !v.is_empty() && v.chars().all(|c| c.is_alphanumeric()),
+        Err(_) => false,
+    };
+    Ok(w_bool_from(result))
 }
 
 /// PyPy: unicodeobject.py descr_isascii
 pub fn str_method_isascii(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty());
-    let s = unsafe { w_str_get_value(args[0]) };
-    Ok(w_bool_from(s.is_ascii()))
+    let s = unsafe { w_str_get_wtf8(args[0]) };
+    let result = match s.as_str() {
+        Ok(v) => v.is_ascii(),
+        Err(_) => false,
+    };
+    Ok(w_bool_from(result))
+}
+
+/// Builds an owned str from a byte sub-slice of a WTF-8 string. The
+/// slice must start and end on code-point boundaries, which holds for
+/// the partition cuts below (the separator aligns on boundaries).
+fn wtf8_slice_str(bytes: &[u8]) -> PyObjectRef {
+    let part = unsafe { Wtf8::from_bytes_unchecked(bytes) };
+    w_str_from_wtf8(part.to_wtf8_buf())
+}
+
+/// Replaces up to `maxcount` occurrences of `sub` with `by` over the
+/// WTF-8 bytes (rstring.py:220-309 `replace_count` isutf8 path). A
+/// negative `maxcount` means no limit; an empty `sub` inserts `by` at
+/// every code-point boundary, including the ends.
+fn wtf8_replace(input: &Wtf8, sub: &Wtf8, by: &Wtf8, maxcount: i64) -> Wtf8Buf {
+    if maxcount == 0 {
+        return input.to_wtf8_buf();
+    }
+    let inp = input.as_bytes();
+    let sub_b = sub.as_bytes();
+    let mut out = Wtf8Buf::new();
+    let mut start = 0usize;
+    let mut maxcount = maxcount;
+    if sub_b.is_empty() {
+        let mut indices = input.code_point_indices().map(|(i, _)| i);
+        // Skip the leading boundary at 0; it is handled by the first
+        // `by` insertion before each code point.
+        indices.next();
+        loop {
+            out.push_wtf8(by);
+            maxcount -= 1;
+            if start == inp.len() || maxcount == 0 {
+                break;
+            }
+            let next = indices.next().unwrap_or(inp.len());
+            out.push_wtf8(unsafe { Wtf8::from_bytes_unchecked(&inp[start..next]) });
+            start = next;
+        }
+    } else {
+        while maxcount != 0 {
+            match wtf8_find_bounded(inp, sub_b, start, inp.len()) {
+                Some(next) => {
+                    out.push_wtf8(unsafe { Wtf8::from_bytes_unchecked(&inp[start..next]) });
+                    out.push_wtf8(by);
+                    start = next + sub_b.len();
+                    maxcount -= 1;
+                }
+                None => break,
+            }
+        }
+    }
+    out.push_wtf8(unsafe { Wtf8::from_bytes_unchecked(&inp[start..]) });
+    out
 }
 
 /// PyPy: unicodeobject.py descr_partition
 pub fn str_method_partition(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() >= 2);
-    let s = unsafe { w_str_get_value(args[0]) };
-    let sep = unsafe { w_str_get_value(args[1]) };
-    match s.find(sep) {
+    let s = unsafe { pyre_object::w_str_get_wtf8(args[0]) }.as_bytes();
+    let sep = unsafe { pyre_object::w_str_get_wtf8(args[1]) }.as_bytes();
+    match wtf8_find_bounded(s, sep, 0, s.len()) {
         Some(i) => Ok(w_tuple_new(vec![
-            w_str_new(&s[..i]),
-            w_str_new(sep),
-            w_str_new(&s[i + sep.len()..]),
+            wtf8_slice_str(&s[..i]),
+            args[1],
+            wtf8_slice_str(&s[i + sep.len()..]),
         ])),
         None => Ok(w_tuple_new(vec![args[0], w_str_new(""), w_str_new("")])),
     }
@@ -2193,13 +2913,13 @@ pub fn str_method_partition(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
 /// PyPy: unicodeobject.py descr_rpartition
 pub fn str_method_rpartition(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() >= 2);
-    let s = unsafe { w_str_get_value(args[0]) };
-    let sep = unsafe { w_str_get_value(args[1]) };
-    match s.rfind(sep) {
+    let s = unsafe { pyre_object::w_str_get_wtf8(args[0]) }.as_bytes();
+    let sep = unsafe { pyre_object::w_str_get_wtf8(args[1]) }.as_bytes();
+    match wtf8_rfind_bounded(s, sep, 0, s.len()) {
         Some(i) => Ok(w_tuple_new(vec![
-            w_str_new(&s[..i]),
-            w_str_new(sep),
-            w_str_new(&s[i + sep.len()..]),
+            wtf8_slice_str(&s[..i]),
+            args[1],
+            wtf8_slice_str(&s[i + sep.len()..]),
         ])),
         None => Ok(w_tuple_new(vec![w_str_new(""), w_str_new(""), args[0]])),
     }
@@ -2213,13 +2933,15 @@ pub fn str_method_rpartition(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
 pub fn str_method_splitlines(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty());
     let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    let s = unsafe { w_str_get_value(pos[0]) };
+    // `\n` / `\r` are single bytes that cannot occur inside a multi-byte
+    // WTF-8 sequence, so the line boundaries are found by walking bytes;
+    // each emitted slice cuts on a code-point boundary.
+    let bytes = unsafe { w_str_get_wtf8(pos[0]) }.as_bytes();
     // keepends is positional-or-keyword.
     let keepends = crate::builtins::kwarg_get(kwargs, "keepends")
         .or_else(|| pos.get(1).copied())
         .map(crate::baseobjspace::is_true)
         .unwrap_or(false);
-    let bytes = s.as_bytes();
     let mut parts: Vec<PyObjectRef> = Vec::new();
     let mut start = 0usize;
     let mut i = 0usize;
@@ -2230,10 +2952,7 @@ pub fn str_method_splitlines(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
                 term_end += 1;
             }
             let end = if keepends { term_end } else { i };
-            let line = std::str::from_utf8(&bytes[start..end])
-                .unwrap_or("")
-                .to_string();
-            parts.push(w_str_new(&line));
+            parts.push(wtf8_slice_str(&bytes[start..end]));
             start = term_end;
             i = term_end;
         } else {
@@ -2241,10 +2960,7 @@ pub fn str_method_splitlines(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
         }
     }
     if start < bytes.len() {
-        let line = std::str::from_utf8(&bytes[start..])
-            .unwrap_or("")
-            .to_string();
-        parts.push(w_str_new(&line));
+        parts.push(wtf8_slice_str(&bytes[start..]));
     }
     Ok(w_list_new(parts))
 }
@@ -2258,12 +2974,11 @@ pub fn str_method_removeprefix(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
             pos.len().saturating_sub(1)
         )));
     }
-    let s = unsafe { w_str_get_value(pos[0]) };
-    let prefix = unsafe { w_str_get_value(pos[1]) };
-    if s.starts_with(prefix) {
-        Ok(w_str_new(&s[prefix.len()..]))
-    } else {
-        Ok(pos[0])
+    let s = unsafe { w_str_get_wtf8(pos[0]) };
+    let prefix = unsafe { w_str_get_wtf8(pos[1]) };
+    match s.strip_prefix(prefix) {
+        Some(rest) => Ok(w_str_from_wtf8(rest.to_wtf8_buf())),
+        None => Ok(pos[0]),
     }
 }
 
@@ -2276,19 +2991,18 @@ pub fn str_method_removesuffix(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
             pos.len().saturating_sub(1)
         )));
     }
-    let s = unsafe { w_str_get_value(pos[0]) };
-    let suffix = unsafe { w_str_get_value(pos[1]) };
-    if s.ends_with(suffix) {
-        Ok(w_str_new(&s[..s.len() - suffix.len()]))
-    } else {
-        Ok(pos[0])
+    let s = unsafe { w_str_get_wtf8(pos[0]) };
+    let suffix = unsafe { w_str_get_wtf8(pos[1]) };
+    match s.strip_suffix(suffix) {
+        Some(rest) => Ok(w_str_from_wtf8(rest.to_wtf8_buf())),
+        None => Ok(pos[0]),
     }
 }
 
 /// PyPy: unicodeobject.py descr_expandtabs
 pub fn str_method_expandtabs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty());
-    let s = unsafe { w_str_get_value(args[0]) };
+    let s = unsafe { w_str_get_wtf8(args[0]) };
     let tabsize = if args.len() > 1 {
         unsafe { w_int_get_value(args[1]) }
     } else {
@@ -2297,30 +3011,30 @@ pub fn str_method_expandtabs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     // Tabs advance to the next multiple of `tabsize` measured from the
     // start of the current line (the column resets on `\n` / `\r`); a
     // non-positive `tabsize` drops tabs entirely.
-    let mut result = String::with_capacity(s.len());
+    let mut result = Wtf8Buf::with_capacity(s.len());
     let mut col: i64 = 0;
-    for c in s.chars() {
-        match c {
-            '\t' => {
+    for cp in s.code_points() {
+        match cp.to_char() {
+            Some('\t') => {
                 if tabsize > 0 {
                     let incr = tabsize - (col % tabsize);
                     col += incr;
                     for _ in 0..incr {
-                        result.push(' ');
+                        result.push_char(' ');
                     }
                 }
             }
-            '\n' | '\r' => {
-                result.push(c);
+            Some('\n') | Some('\r') => {
+                result.push(cp);
                 col = 0;
             }
             _ => {
-                result.push(c);
+                result.push(cp);
                 col += 1;
             }
         }
     }
-    Ok(w_str_new(&result))
+    Ok(w_str_from_wtf8(result))
 }
 
 /// PyPy: unicodeobject.py descr_translate
@@ -2329,30 +3043,30 @@ pub fn str_method_expandtabs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
 /// ordinals (int), strings (str), or None (delete).
 pub fn str_method_translate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() >= 2, "translate() takes exactly one argument");
-    let s = unsafe { w_str_get_value(args[0]) };
+    let s = unsafe { w_str_get_wtf8(args[0]) };
     let table = args[1];
-    let mut result = String::with_capacity(s.len());
+    let mut result = Wtf8Buf::with_capacity(s.len());
     unsafe {
-        for ch in s.chars() {
-            let key = w_int_new(ch as i64);
+        for cp in s.code_points() {
+            let key = w_int_new(cp.to_u32() as i64);
             if let Some(val) = w_dict_lookup(table, key) {
                 if is_none(val) {
                     // None → delete character
                 } else if is_int(val) {
-                    if let Some(c) = char::from_u32(w_int_get_value(val) as u32) {
+                    if let Some(c) = CodePoint::from_u32(w_int_get_value(val) as u32) {
                         result.push(c);
                     }
                 } else if is_str(val) {
-                    result.push_str(w_str_get_value(val));
+                    result.push_wtf8(w_str_get_wtf8(val));
                 } else {
-                    result.push(ch);
+                    result.push(cp);
                 }
             } else {
-                result.push(ch);
+                result.push(cp);
             }
         }
     }
-    Ok(w_str_new(&result))
+    Ok(w_str_from_wtf8(result))
 }
 
 // ── Dict methods ─────────────────────────────────────────────────────

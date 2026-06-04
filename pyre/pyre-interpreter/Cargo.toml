@@ -15,6 +15,7 @@ dynasm = ["majit-metainterp/dynasm"]
 [dependencies]
 pyre-object = { workspace = true }
 pyre-macros = { workspace = true }
+rustpython-wtf8 = { workspace = true }
 majit-gc = { workspace = true }
 majit-ir = { workspace = true }
 majit-macros = { workspace = true }
