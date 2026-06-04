@@ -43,6 +43,8 @@ if _POSIX:
                     )
 
     cond_includes = [('AF_NETLINK', 'linux/netlink.h')]
+    cond_includes += [('AF_ALG', 'linux/if_alg.h')]
+    cond_includes += [('AF_QIPCRTR', 'linux/qrtr.h')]
 
     libraries = ()
     calling_conv = 'c'
@@ -150,7 +152,7 @@ AI_NUMERICSERV AI_PASSIVE AI_V4MAPPED AI_V4MAPPED_CFG
 BTPROTO_HCI BTPROTO_L2CAP BTPROTO_SCO BTPROTO_RFCOMM
 
 ALG_OP_DECRYPT ALG_OP_ENCRYPT ALG_OP_SIGN ALG_OP_VERIFY ALG_SET_AEAD_ASSOCLEN
-ALG_SET_AEAD_AUTHSIZE ALG_SET_IV ALG_SET_KEY ALG_SET_OP ALG_SET_PUBKEY
+ALG_SET_AEAD_AUTHSIZE ALG_SET_IV ALG_SET_KEY ALG_SET_OP ALG_SET_PUBKEY SOL_ALG
 
 HCI_DATA_DIR HCI_FILTER HCI_TIME_STAMP
 
@@ -384,6 +386,20 @@ CConfig.sockaddr_nl = platform.Struct('struct sockaddr_nl',
                                               ('nl_pid', rffi.INT),
                                               ('nl_groups', rffi.INT)],
                                              ifdef='AF_NETLINK')
+
+CConfig.sockaddr_alg = platform.Struct('struct sockaddr_alg',
+                                         [('salg_family', rffi.INT),
+                                          ('salg_type', rffi.CFixedArray(rffi.CHAR, 14)),
+                                          ('salg_feat', rffi.SHORT),
+                                          ('salg_mask', rffi.SHORT),
+                                          ('salg_name', rffi.CFixedArray(rffi.CHAR, 64)),
+                                         ], ifdef='AF_ALG')
+
+CConfig.sockaddr_qrtr = platform.Struct('struct sockaddr_qrtr',
+                                         [('sq_family', rffi.INT),
+                                          ('sq_node', rffi.INT),
+                                          ('sq_port', rffi.INT),
+                                         ], ifdef='AF_ALG')
 
 CConfig.addrinfo = platform.Struct('struct addrinfo',
                                      [('ai_flags', rffi.INT),
@@ -1280,6 +1296,10 @@ sockaddr_in6 = cConfig.sockaddr_in6
 sockaddr_un = cConfig.sockaddr_un
 if cConfig.sockaddr_nl is not None:
     sockaddr_nl = cConfig.sockaddr_nl
+if cConfig.sockaddr_alg is not None:
+    sockaddr_alg = cConfig.sockaddr_alg
+if cConfig.sockaddr_qrtr is not None:
+    sockaddr_qrtr = cConfig.sockaddr_qrtr
 in_addr = cConfig.in_addr
 #in_addr_size = sizeof(in_addr)
 in6_addr = cConfig.in6_addr

@@ -469,6 +469,49 @@ if HAS_AF_NETLINK:
 
 # ____________________________________________________________
 
+HAS_AF_ALG = 'AF_ALG' in constants
+if HAS_AF_ALG:
+    class AlgAddress(Address):
+        family = AF_ALG
+        struct = _c.sockaddr_alg
+        maxlen = minlen = sizeof(struct)
+
+        def __init__(self, algtype, algname, salg_feat=0, salg_mask=0):
+            addr = lltype.malloc(self.struct, flavor='raw', zero=True,
+                                 track_allocation=False)
+            self.setdata(addr, self.maxlen)
+            rffi.setintfield(addr, 'c_salg_family', AF_ALG)
+            rffi.str2chararray(algtype,
+                               rffi.cast(rffi.CCHARP, addr.c_salg_type), 14)
+            rffi.setintfield(addr, 'c_salg_feat', salg_feat)
+            rffi.setintfield(addr, 'c_salg_mask', salg_mask)
+            rffi.str2chararray(algname,
+                               rffi.cast(rffi.CCHARP, addr.c_salg_name), 64)
+
+HAS_AF_QIPCRTR = 'AF_QIPCRTR' in constants
+if HAS_AF_ALG:
+    class QrtrAddress(Address):
+        family = AF_QIPCRTR
+        struct = _c.sockaddr_qrtr
+        maxlen = minlen = sizeof(struct)
+
+        def __init__(self, node, port):
+            addr = lltype.malloc(self.struct, flavor='raw', zero=True,
+                                 track_allocation=False)
+            self.setdata(addr, self.maxlen)
+            rffi.setintfield(addr, 'c_sq_family', AF_QIPCRTR)
+            rffi.setintfield(addr, 'c_sq_node', node)
+            rffi.setintfield(addr, 'c_sq_port', port)
+
+        def get_data(self):
+            a = self.lock(_c.sockaddr_qrtr)
+            node = a.c_sq_node
+            port = a.c_sq_port
+            self.unlock()
+            return (node, port)
+
+# ____________________________________________________________
+
 HAVE_SOCK_NONBLOCK = "SOCK_NONBLOCK" in constants
 HAVE_SOCK_CLOEXEC = "SOCK_CLOEXEC" in constants
 
@@ -677,6 +720,19 @@ class RSocket(object):
         Return (new socket fd, client address)."""
         if self._select(False) == 1:
             raise SocketTimeout
+        if HAS_AF_ALG and self.family == AF_ALG:
+            # AF_ALG does not support accept() with address buffer; pass NULL
+            null_addr = lltype.nullptr(_c.sockaddr_ptr.TO)
+            null_addrlen = lltype.nullptr(_c.socklen_t_ptr.TO)
+            newfd = _c.socketaccept(self.fd, null_addr, null_addrlen)
+            if _c.invalid_socket(newfd):
+                raise self.error_handler()
+            if not inheritable:
+                sock_set_inheritable(newfd, False)
+            if _c._WIN32:
+                newfd = rffi.cast(lltype.Signed, newfd)
+            address, _ = make_null_address(self.family)
+            return (newfd, address)
         address, addr_p, addrlen_p = self._addrbuf()
         try:
             remove_inheritable = not inheritable
@@ -1822,4 +1878,4 @@ def if_nameindex():
             break
         out.append((v.c_if_index, rffi.charp2str(v.c_if_name)))
         i += 1
-    return out 
+    return out
