@@ -50,10 +50,7 @@ pub mod translator;
 
 pub use call::{CallDescriptor, StructFieldLayout, StructLayout};
 pub use flatten::{FlatOp, GraphFlattener, Label, RegKind, SSARepr, flatten, flatten_graph};
-pub use front::{
-    AstGraphOptions, SemanticFunction, SemanticProgram, build_semantic_program,
-    build_semantic_program_from_parsed_files,
-};
+pub use front::{AstGraphOptions, SemanticFunction, SemanticProgram};
 pub use jit_codewriter::type_state::ConcreteType;
 pub use jtransform::{
     CallEffectKind, CallEffectOverride, GraphTransformConfig, GraphTransformResult,
@@ -63,10 +60,7 @@ pub use layout::{HeuristicLayoutProvider, LayoutProvider};
 pub use model::{Block, BlockId, CallTarget, FunctionGraph, OpKind, SpaceOperation, ValueType};
 pub use opcode_dispatch::PipelineOpcodeArm;
 pub use parse::{
-    CallPath, ExtractedHandlerCall, ExtractedOpcodeArm, OpcodeDispatchSelector, ParsedInterpreter,
-    ReceiverTraitBindings, extract_inherent_impl_methods, extract_opcode_dispatch_arms,
-    extract_opcode_dispatch_receiver_traits, extract_trait_impls, find_opcode_dispatch_match,
-    parse_source,
+    CallPath, ExtractedOpcodeArm, OpcodeDispatchSelector, ParsedInterpreter, parse_source,
 };
 pub use pipeline::{PipelineConfig, PipelineResult, PortalSpec, ProgramPipelineResult};
 
@@ -113,6 +107,192 @@ pub struct MethodInfo {
 /// Canonical single-file analysis entry point.
 pub fn analyze_pipeline(source: &str) -> pipeline::ProgramPipelineResult {
     analyze_pipeline_with_config(source, &AnalyzeConfig::default())
+}
+
+/// Feature-gated SemanticProgram builder.
+///
+/// When the `mir-frontend` feature is enabled, route the build
+/// through [`front::mir::build_semantic_program_from_llbcs`] using
+/// LLBC artefacts discovered via, in priority order:
+///
+/// 1. `PYRE_MIR_FRONTEND_LLBC` env-var (OS path-list: `;`-separated on
+///    Windows, `:`-separated elsewhere). Explicit override for CI /
+///    test fixtures targeting a specific LLBC set.
+/// 2. Auto-discovery at `<workspace>/build/llbc/<expected>.ullbc`,
+///    where `scripts/extract-llbc.sh` writes. If every expected file
+///    exists, the MIR front-end engages automatically.
+///
+/// Panics when neither source resolves: the MIR front-end is the only
+/// graph builder, so a missing LLBC set (Charon not installed, or
+/// `scripts/extract-llbc.sh` not run) is a fatal misconfiguration
+/// rather than a fallback to another path.
+fn build_semantic_program_via_active_frontend(
+    parsed_files: &[parse::ParsedInterpreter],
+) -> front::SemanticProgram {
+    #[cfg(feature = "mir-frontend")]
+    {
+        // Accept an OS path-list so production can pass both
+        // `pyre-object.ullbc` and `pyre-interpreter.ullbc` (and any
+        // future per-crate ullbc) in one env-var.
+        // `std::env::split_paths` uses the platform separator (`;` on
+        // Windows, `:` elsewhere) so a Windows drive letter like `Z:`
+        // is not mistaken for a separator.  The single-path form also
+        // works.
+        //
+        // If the env-var is unset, auto-discover the canonical
+        // workspace LLBC artefacts before failing loud.
+        let resolved_paths: Option<Vec<String>> = std::env::var_os("PYRE_MIR_FRONTEND_LLBC")
+            .map(|v| {
+                std::env::split_paths(&v)
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect()
+            })
+            .or_else(|| auto_discover_workspace_llbc_paths(parsed_files));
+        if let Some(paths) = resolved_paths {
+            let llbcs: Vec<majit_charon_reader::Llbc> = paths
+                .iter()
+                .map(|p| {
+                    majit_charon_reader::Llbc::load(p)
+                        .unwrap_or_else(|e| panic!("Step 4.4 cutover: load {p}: {e}"))
+                })
+                .collect();
+            let mut program = front::mir::build_semantic_program_from_llbcs(&llbcs)
+                .unwrap_or_else(|e| panic!("Step 4.4 cutover: lower llbcs {paths:?}: {e}"));
+            // JIT-hint pass.  pyre's proc-macro attributes
+            // (`#[majit_macros::elidable*]` / `dont_look_inside` /
+            // `loop_invariant` / `unroll_safe`) are consumed by the
+            // proc-macro at expansion time and do not survive in
+            // Charon's `attr_info`, so the macros leave `#[doc(hidden)]`
+            // marker consts (`_elidable_function_<NAME>`, …) next to each
+            // annotated fn.  Charon extracts those into `global_decls`;
+            // `front::llbc_hints` reads them back and the hints merge into
+            // the MIR-driven SemanticProgram by leaf name — the analog of
+            // RPython's translator reading `func._elidable_function_` off
+            // the function object.
+            merge_hints_from_llbcs(&mut program, &llbcs);
+            // Whole-program type metadata (`known_struct_names`,
+            // `known_trait_names`, `struct_fields`) comes from the MIR
+            // builder's `derive_program_metadata` walk over Charon's
+            // `type_decls` / `trait_decls`; struct field-type strings are
+            // resolved by `tyref_to_ast_string` (Charon-resolved types,
+            // e.g. `*mut PyObject`, `Vec<u8>`, `i64`) rather than the syn
+            // re-parse.
+            return program;
+        }
+    }
+    let _ = parsed_files; // silence unused warning when the feature is off
+    // The MIR front-end is the only graph builder.  Reaching this
+    // point means neither `PYRE_MIR_FRONTEND_LLBC` nor the workspace
+    // auto-discover located an LLBC source — surface the
+    // misconfiguration immediately.
+    panic!(
+        "no LLBC source resolved.\n\
+         Run `scripts/extract-llbc.sh` to produce \
+         `build/llbc/{{pyre-object,pyre-interpreter}}.ullbc`, \
+         or set `PYRE_MIR_FRONTEND_LLBC` to an OS path-list \
+         (`;`-separated on Windows, `:` elsewhere) explicitly."
+    );
+}
+
+/// Locate the workspace's `build/llbc/` directory and return paths to
+/// the canonical pyre LLBC artefacts when every expected file is
+/// present *and* the caller looks like a production build (not a test
+/// fixture).
+///
+/// Returns `None` when:
+///   - no parsed_file carries a `module_path` (test fixtures use
+///     `parse::parse_source` which leaves `module_path` empty;
+///     production uses `parse::parse_source_with_module`),
+///   - the caller passed fewer than `PROD_PARSED_FILES_FLOOR`
+///     parsed_files (single-source diagnostic),
+///   - any expected artefact is missing (contributor without
+///     Charon installed), or
+///   - the workspace anchoring fails.
+///
+/// The two gates together match the production fingerprint:
+/// `pyre-jit-trace/build.rs:157` calls
+/// `analyze_multiple_pipeline_with_modules` with ≈100 files and a
+/// per-file `module_path`.  Tests via
+/// `analyze_multiple_pipeline_with_config` parse without module
+/// paths and stay below the floor, so auto-discovery does not
+/// silently swap their front-end.
+///
+/// The workspace root is anchored at compile time via
+/// `env!("CARGO_MANIFEST_DIR")` — `<workspace>/majit/majit-translate`
+/// resolves up to `<workspace>` via two `..` segments.  The
+/// `scripts/extract-llbc.sh` script writes to the same
+/// `<workspace>/build/llbc/` directory by convention, so the two
+/// halves stay in sync.
+#[cfg(feature = "mir-frontend")]
+fn auto_discover_workspace_llbc_paths(
+    parsed_files: &[parse::ParsedInterpreter],
+) -> Option<Vec<String>> {
+    const PROD_PARSED_FILES_FLOOR: usize = 50;
+    if parsed_files.len() < PROD_PARSED_FILES_FLOOR {
+        return None;
+    }
+    if !parsed_files.iter().any(|p| !p.module_path.is_empty()) {
+        return None;
+    }
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..");
+    let llbc_dir = workspace_root.join("build").join("llbc");
+    // Canonical production set.  `pyre-module.ullbc` is intentionally
+    // omitted — it is empty in current builds and adds nothing.
+    // `corpus.ullbc` is the Charon fixture, not production.
+    //
+    // The set is fixed at exactly this pair so the generated
+    // `all_jitcodes` table is environment-invariant: the build consumes
+    // the same `.ullbc` inputs regardless of which artefacts happen to
+    // sit in `build/llbc/`, so a local tree and CI produce byte-identical
+    // codegen.  `pyre-jit.ullbc` (which `extract-llbc.sh pyre-jit` can
+    // still produce for experimentation) is deliberately NOT discovered
+    // here — its `PyreBlackholeAllocator::bh_*` / `allocate_*` /
+    // `box_int` / `box_float` / `Drop::drop` entries are semantically
+    // residual runtime calls (the deopt-fallback allocator, not traced
+    // code), so the `extract_*` `graph: None` placeholder is their
+    // correct representation.  Their absence from the discovered set is
+    // therefore by-design, not a coverage gap.
+    const REQUIRED: &[&str] = &["pyre-object.ullbc", "pyre-interpreter.ullbc"];
+    let mut paths = Vec::with_capacity(REQUIRED.len());
+    for name in REQUIRED {
+        let p = llbc_dir.join(name);
+        if !p.exists() {
+            return None;
+        }
+        paths.push(p.to_string_lossy().into_owned());
+    }
+    Some(paths)
+}
+
+/// Merge JIT-hint markers harvested from the ullbc surrogate consts
+/// into a MIR-driven SemanticProgram.
+///
+/// `front::llbc_hints::harvest_hints_from_llbcs` reads the
+/// `#[doc(hidden)]` marker consts the `majit_macros` proc-macros emit
+/// (`_elidable_function_<NAME>`, `_jit_elidable_cannot_raise_<NAME>`,
+/// `_jit_look_inside_<NAME>`, …) out of Charon's `global_decls`,
+/// keyed by the fn leaf name.  Each `SemanticFunction` is matched by
+/// the trailing segment of its `name` (Charon's `name_path` form,
+/// e.g. `pyre_interpreter::frame::Frame::pop`) and the hints copied in.
+///
+/// Matches by leaf because the marker const and its user fn share the
+/// same leaf but sit in sibling module / impl paths that a full-path
+/// match would never align.
+#[cfg(feature = "mir-frontend")]
+fn merge_hints_from_llbcs(
+    program: &mut front::SemanticProgram,
+    llbcs: &[majit_charon_reader::Llbc],
+) {
+    let hints_by_leaf = front::llbc_hints::harvest_hints_from_llbcs(llbcs);
+    for f in &mut program.functions {
+        let leaf = f.name.rsplit("::").next().unwrap_or(&f.name);
+        if let Some(h) = hints_by_leaf.get(leaf) {
+            f.hints.clone_from(h);
+        }
+    }
 }
 
 /// Configurable canonical single-file analysis entry point.
@@ -509,7 +689,7 @@ fn analyze_pipeline_from_parsed(
         std::collections::HashMap::new();
     for parsed in parsed_files {
         if !parsed.module_path.is_empty() {
-            front::ast::collect_struct_origins(
+            front::syn_metadata::collect_struct_origins(
                 &parsed.file.items,
                 &parsed.module_path,
                 &mut struct_origins,
@@ -517,24 +697,6 @@ fn analyze_pipeline_from_parsed(
         }
     }
     majit_ir::descr::register_struct_origins(struct_origins);
-    // Codewriter-side static catalogue.  Collected here so it can be
-    // installed on `CallControl.static_decls` further down for the
-    // adapter consumer.  The front-end `Expr::Path` arm receives the
-    // same data through `KnownStaticsCatalogue` constructed inside
-    // `build_semantic_program_from_parsed_files_with_options`.
-    let early_static_decls: Vec<(
-        Vec<String>,
-        crate::model::ValueType,
-        Option<crate::flowspace::model::ConstValue>,
-    )> = parsed_files
-        .iter()
-        .flat_map(|parsed| {
-            crate::flowspace::rust_source::register::extract_static_decls(
-                &parsed.file,
-                &parsed.module_path,
-            )
-        })
-        .collect();
     // `use <path>::*` glob roots are expanded into explicit
     // `use_imports` entries inside
     // `build_semantic_program_*_with_options` so the front-end
@@ -547,9 +709,9 @@ fn analyze_pipeline_from_parsed(
     // the annotator's narrowing gate at
     // `flowspace_adapter.rs::derive_subject_inputcells` checks
     // `attrs_populated`.  Production never drives the walker (only
-    // `extract_static_decls` and `extract_unsafe_fn_stubs` are called
-    // from `register`), which left the dict empty for parsed-only
-    // structs and forced every impl-method `self` to carry
+    // `extract_unsafe_fn_stubs` is called from `register`), which left
+    // the dict empty for parsed-only structs and forced every
+    // impl-method `self` to carry
     // `SomeInstance(classdef=None)`.  Empty `module_path` files (test
     // fixtures) skip; their structs are registered through the bare-
     // leaf walker path when the fixture explicitly calls
@@ -569,10 +731,14 @@ fn analyze_pipeline_from_parsed(
     // the correct response is to abort loudly so the coverage audit
     // surfaces the unsupported expression rather than silently dropping
     // a graph.
+    // When the `mir-frontend` feature is enabled, route the production
+    // SemanticProgram build through the MIR-driven
+    // `front::mir::build_semantic_program_from_llbcs` path.  The LLBC
+    // source is a Charon-extracted .ullbc snapshot (produced by
+    // `scripts/extract-llbc.sh`), located via `PYRE_MIR_FRONTEND_LLBC`
+    // or workspace auto-discovery.
     mark_phase!("known_statics + struct_origins + struct_field_attrs populated");
-    let program =
-        front::build_semantic_program_from_parsed_files_with_statics(parsed_files, static_addrs)
-            .expect("pyre-interpreter source must lower without FlowingError");
+    let program = build_semantic_program_via_active_frontend(parsed_files);
     mark_phase!("build_semantic_program_from_parsed_files");
     let mut canonical_trait_impls = Vec::new();
     let mut canonical_inherent_methods = Vec::new();
@@ -596,25 +762,76 @@ fn analyze_pipeline_from_parsed(
         String,
     > = std::collections::HashMap::new();
 
-    for parsed in parsed_files {
-        canonical_trait_impls.extend(
-            parse::extract_trait_impls(
-                parsed,
-                &program.struct_fields,
-                &program.fn_return_types,
-                &program.known_struct_names,
-            )
-            .expect("trait impls must lower without FlowingError"),
-        );
-        canonical_inherent_methods.extend(
-            parse::extract_inherent_impl_methods(
-                parsed,
-                &program.struct_fields,
-                &program.fn_return_types,
-                &program.known_struct_names,
-            )
-            .expect("inherent methods must lower without FlowingError"),
-        );
+    // Source impl-method registration from the MIR-lowered
+    // `program.functions`.  Each `SemanticFunction` carries
+    // `self_ty_root` / `trait_root` populated to the exact registration
+    // keys the downstream loops below consume, so those loops are
+    // agnostic to where the `canonical_*` vectors come from.
+    //
+    // `program.functions` is a superset of every graph-carrying
+    // method the source surface defines.  Trait methods with no
+    // graph are intentional non-JIT targets — `#[cfg(test)]` impls,
+    // `into_py` on primitive receivers Charon cannot key to an ADT,
+    // residual `PyreBlackholeAllocator::*` allocator hooks, std-trait
+    // impls (`Drop`/`From`/`PartialEq`/…), and `BoxEnv` default bodies
+    // MIR does not lower.  They carry no graph (so the BFS never
+    // reaches them) and their `return_types` are redundant with the
+    // CFG-scan result kind (`graph_result_kind` = `getkind(FUNC.RESULT)`,
+    // `codewriter.rs:656`) — the calldescr builder reads the declared
+    // type only as an `i↔r` tiebreak and `debug_assert`s it against the
+    // CFG kind; no impl method diverges, so omitting the side-table
+    // entries is a no-op for call-descriptor typing.
+    //
+    // `mir_graph_lookup` is consulted by the registration loops below
+    // (trait-default vs concrete-impl graph fetch).
+    let mir_graph_lookup = front::semantic::MirGraphLookup::from_program(&program);
+    for func in &program.functions {
+        match (&func.self_ty_root, &func.trait_root) {
+            // Concrete trait-impl method: `impl Trait for Type { fn m }`.
+            (Some(owner), Some(trait_leaf)) => {
+                canonical_trait_impls.push(TraitImplInfo {
+                    trait_name: trait_leaf.clone(),
+                    for_type: owner.clone(),
+                    self_ty_root: Some(owner.clone()),
+                    methods: vec![MethodInfo {
+                        name: func.name.clone(),
+                        graph: Some(func.graph.clone()),
+                        return_type: func.return_type.clone(),
+                        hints: func.hints.clone(),
+                    }],
+                });
+            }
+            // Trait default-body: `trait T { fn m { … } }`.  The pseudo
+            // `for_type` matches the extractor's sentinel so the loop's
+            // `is_default` branch and the `call.rs` resolve-method
+            // filters keep distinguishing default from concrete impl.
+            (None, Some(trait_leaf)) => {
+                canonical_trait_impls.push(TraitImplInfo {
+                    trait_name: trait_leaf.clone(),
+                    for_type: format!("<default methods of {}>", trait_leaf),
+                    self_ty_root: None,
+                    methods: vec![MethodInfo {
+                        name: func.name.clone(),
+                        graph: Some(func.graph.clone()),
+                        return_type: func.return_type.clone(),
+                        hints: func.hints.clone(),
+                    }],
+                });
+            }
+            // Inherent method: `impl Type { fn m }`.
+            (Some(owner), None) => {
+                canonical_inherent_methods.push(parse::InherentMethodInfo {
+                    for_type: owner.clone(),
+                    self_ty_root: Some(owner.clone()),
+                    name: func.name.clone(),
+                    graph: func.graph.clone(),
+                    return_type: func.return_type.clone(),
+                    hints: func.hints.clone(),
+                });
+            }
+            // Free function — registered by the dedicated loop below.
+            (None, None) => {}
+        }
     }
     // RPython: use the rtyped graphs (with concretetype info) for all analysis.
     // Use program.functions' graphs which were built with full struct_fields
@@ -743,7 +960,7 @@ fn analyze_pipeline_from_parsed(
     // Thread per-source-file `parsed.module_path` + `use_imports`
     // into CallControl as data carriers (orthodox PyPy
     // `bookkeeper.position` + `frame.f_globals` lexical-resolution
-    // entry points, see [[orthodox-6item-2026-05-17]] item 2.3/2.4).
+    // entry points).
     // Today's consumers normalise at the runtime path_hash boundary
     // via `STRUCT_ORIGIN_REGISTRY` + `canonical_struct_name`; the
     // carriers here let a future per-graph lexical resolver land
@@ -763,17 +980,16 @@ fn analyze_pipeline_from_parsed(
         }
     }
     call_control.use_imports = use_imports_agg;
-    // Z2.5 Path C — populate the metadata-only `unsafe_fn_stubs`
-    // carrier so the codewriter's `dual_gate_registry` can register
-    // every `unsafe fn` / unsafe impl-method as a stub-pygraph entry
-    // in PyreCallRegistry.  Walks each parsed source file under its
-    // crate-stripped `module_path` prefix, dropping unsafe fns whose
-    // return type the slice 3a projection cannot represent (see
+    // Populate the metadata-only `unsafe_fn_stubs` carrier so the
+    // codewriter's `dual_gate_registry` can register every `unsafe fn`
+    // / unsafe impl-method as a stub-pygraph entry in PyreCallRegistry.
+    // Walks each parsed source file under its crate-stripped
+    // `module_path` prefix, dropping unsafe fns whose return type the
+    // projection cannot represent (see
     // `flowspace::rust_source::register::simple_return_type_to_lltype`).
-    // Closes the bulk of the "not registered in PyreCallRegistry"
-    // Skip cluster (218 events at 2026-05-22 measurement) dominated
-    // by `pyre_object::is_*` predicates whose body lowering is
-    // intentionally rejected at `build_flow.rs:215`.
+    // Covers the bulk of the "not registered in PyreCallRegistry" Skip
+    // cluster dominated by `pyre_object::is_*` predicates whose body
+    // lowering is intentionally rejected at `build_flow.rs:215`.
     let mut unsafe_stubs: Vec<(
         Vec<String>,
         crate::flowspace::argument::Signature,
@@ -788,12 +1004,6 @@ fn analyze_pipeline_from_parsed(
         );
     }
     call_control.unsafe_fn_stubs = unsafe_stubs;
-    // Codewriter-side mirror of the static catalogue.  Same
-    // `(segments, ty)` shape that
-    // [`KnownStaticsCatalogue::from_parsed_files`] feeds to the
-    // front-end's `Expr::Path` lookup; reusing the
-    // `early_static_decls` walk avoids a second pass.
-    call_control.static_decls = early_static_decls;
     // Populate CallControl with layouts from the provider.
     for struct_name in program.struct_fields.fields.keys() {
         if let Some(layout) = provider.get_struct_layout(struct_name) {
@@ -836,6 +1046,13 @@ fn analyze_pipeline_from_parsed(
             );
         }
     }
+    // The registration loop below prefers the graph from
+    // `mir_graph_lookup` over the one already carried in
+    // `canonical_trait_impls` / `canonical_inherent_methods`.  Both
+    // come from `program.functions`, so the lookup is a defensive
+    // re-fetch keyed on the registration path — cheap, and it keeps a
+    // single source of truth for the trait-default vs concrete-impl
+    // distinction.
     for impl_info in &canonical_trait_impls {
         let impl_type = impl_info
             .self_ty_root
@@ -850,15 +1067,28 @@ fn analyze_pipeline_from_parsed(
         } else {
             Some(impl_info.trait_name.as_str())
         };
+        let is_default = impl_info.for_type.starts_with("<default methods of ");
         for method in &impl_info.methods {
-            if let Some(graph) = &method.graph {
+            // Read the MIR-built graph from `program.functions`.
+            // `method.graph` (`Option`) remains as a residual fallback
+            // for the handful of MIR-uncovered entries, though every
+            // method registered above carries a graph so the fallback
+            // is effectively unreached.
+            let mir_graph: Option<&model::FunctionGraph> = if is_default {
+                mir_graph_lookup.lookup_trait_default(&impl_info.trait_name, &method.name)
+            } else {
+                mir_graph_lookup.lookup_impl_method(impl_type, &method.name)
+            };
+            let graph_source: Option<model::FunctionGraph> =
+                mir_graph.cloned().or_else(|| method.graph.clone());
+            if let Some(graph) = graph_source {
                 // Stamp the source return type onto the graph itself so
                 // the JIT codewriter signature validator reads
                 // `FUNC.RESULT` directly off the callee graph
                 // (RPython `funcptr._obj.TO.RESULT`).
                 let graph = match &method.return_type {
-                    Some(rt) => graph.clone().with_return_type(rt),
-                    None => graph.clone(),
+                    Some(rt) => graph.with_return_type(rt),
+                    None => graph,
                 };
                 call_control.register_trait_method(&method.name, trait_root, impl_type, graph);
                 // Parity with upstream `rpython/annotator/classdesc.py:749
@@ -875,20 +1105,23 @@ fn analyze_pipeline_from_parsed(
                 // at `call.rs:1921,1970 resolve_method*` and
                 // `lib.rs:935 push_matching_trait_methods` can continue
                 // to distinguish "trait default" from "concrete impl".
-                if impl_info.for_type.starts_with("<default methods of ") {
+                if is_default {
                     let direct_path = crate::parse::CallPath::from_segments([
                         impl_info.trait_name.as_str(),
                         method.name.as_str(),
                     ]);
-                    let direct_graph = match &method.return_type {
-                        Some(rt) => method
-                            .graph
-                            .clone()
-                            .expect("method.graph populated above")
-                            .with_return_type(rt),
-                        None => method.graph.clone().expect("method.graph populated above"),
-                    };
-                    call_control.register_function_graph(direct_path, direct_graph);
+                    // Prefer the MIR graph for the direct_path
+                    // registration too; fall back to `method.graph`
+                    // when the lookup has no entry.
+                    let direct_source: Option<model::FunctionGraph> =
+                        mir_graph.cloned().or_else(|| method.graph.clone());
+                    if let Some(g) = direct_source {
+                        let direct_graph = match &method.return_type {
+                            Some(rt) => g.with_return_type(rt),
+                            None => g,
+                        };
+                        call_control.register_function_graph(direct_path, direct_graph);
+                    }
                 }
             }
             let path = crate::parse::CallPath::for_impl_method(impl_type, method.name.as_str());
@@ -966,6 +1199,14 @@ fn analyze_pipeline_from_parsed(
             .as_deref()
             .unwrap_or(&method_info.for_type);
         let path = crate::parse::CallPath::for_impl_method(impl_type, method_info.name.as_str());
+        // Read the MIR-built graph; `method_info.graph` is the
+        // residual fallback for the handful of MIR-uncovered entries,
+        // effectively unreached because every inherent method
+        // registered above carries a graph.
+        let graph: model::FunctionGraph = mir_graph_lookup
+            .lookup_impl_method(impl_type, &method_info.name)
+            .map(|g| g.clone())
+            .unwrap_or_else(|| method_info.graph.clone());
         // Pair the graph with the method's hints so the BFS-driven
         // `look_inside_graph` synthesises a `SemanticFunction` whose
         // `_reject_function("elidable")` mirrors RPython's
@@ -977,8 +1218,8 @@ fn analyze_pipeline_from_parsed(
         // the callee graph (`funcptr._obj.TO.RESULT`), matching the
         // free-function and trait-method registration paths above.
         let graph = match &method_info.return_type {
-            Some(rt) => method_info.graph.clone().with_return_type(rt),
-            None => method_info.graph.clone(),
+            Some(rt) => graph.with_return_type(rt),
+            None => graph,
         };
         if method_info.hints.is_empty() {
             call_control.register_function_graph(path.clone(), graph);
@@ -1050,7 +1291,7 @@ fn analyze_pipeline_from_parsed(
                     continue;
                 }
                 // `support.py:705 argnames = ll_func.__code__.co_varnames[:nb_args]`
-                // — companion hint emitted by `front::ast::collect_jit_hints`
+                // — companion hint emitted by `front::syn_metadata::collect_jit_hints`
                 // when `#[oopspec(...)]` is paired with a function signature.
                 // Threads the declaration-order parameter names into
                 // `CallControl::oopspec_argnames` so `parse_oopspec`
@@ -1106,9 +1347,9 @@ fn analyze_pipeline_from_parsed(
     // target. `execute_opcode_step` itself is a handler reached from the
     // real portal's match arm, so seeding BFS from it treats a handler
     // as an entry point — tolerable only for the legacy test
-    // configurations that have no `eval_loop_jit` at all; once those
-    // tests feed the full Phase D0 source set the fallback is never
-    // exercised and the eval_loop_jit-only identity locks in.
+    // configurations that have no `eval_loop_jit` at all.  When the
+    // tests feed the full production source set the fallback is never
+    // exercised and the eval_loop_jit-only identity is used.
     let default_portal_name = {
         // Tolerate module-qualified registrations: `eval_loop_jit` may
         // land under `["eval", "eval_loop_jit"]` when its file
@@ -1299,12 +1540,8 @@ fn analyze_pipeline_from_parsed(
     };
 
     mark_phase!("call_control + canonical_trait_impls + register graphs");
-    let (opcode_dispatch, jitcodes, insns, descrs) = build_canonical_opcode_dispatch(
-        parsed_files,
-        &program.fn_return_types,
-        &config.pipeline,
-        &mut call_control,
-    );
+    let (opcode_dispatch, jitcodes, insns, descrs) =
+        build_canonical_opcode_dispatch(&program, &config.pipeline, &mut call_control);
     mark_phase!("build_canonical_opcode_dispatch");
     pipeline.opcode_dispatch = opcode_dispatch;
     pipeline.jitcodes = jitcodes;
@@ -1342,8 +1579,7 @@ fn analyze_pipeline_from_parsed(
 /// orthodox `drain_pending_graphs` loop picks them up exactly the same way
 /// it picks up callee graphs discovered during jtransform.
 fn build_canonical_opcode_dispatch(
-    parsed_files: &[parse::ParsedInterpreter],
-    fn_return_types: &std::collections::HashMap<String, String>,
+    program: &front::SemanticProgram,
     pipeline_config: &pipeline::PipelineConfig,
     call_control: &mut call::CallControl,
 ) -> (
@@ -1352,15 +1588,31 @@ fn build_canonical_opcode_dispatch(
     majit_ir::vec_assoc::VecAssoc<String, u8>,
     Vec<jitcode::BhDescr>,
 ) {
-    let mut opcode_arms = Vec::new();
+    // Reconstruct the opcode-dispatch arms from the lowered MIR
+    // `execute_opcode_step` graph (`front::mir_dispatch`).
+    // `reject_duplicate_opcode_selectors` keeps the parser-level
+    // uniqueness invariant.
+    let opcode_arms = parse::reject_duplicate_opcode_selectors(
+        front::mir_dispatch::extract_opcode_dispatch_arms_from_mir(program),
+    );
 
-    for parsed in parsed_files {
-        let file_opcodes = parse::extract_opcode_dispatch_arms(parsed, fn_return_types);
-        if !file_opcodes.is_empty() {
-            opcode_arms = file_opcodes;
-            break;
-        }
-    }
+    // Fail loud when the interpreter is present but the dispatch table is
+    // empty.  `extract_opcode_dispatch_arms_from_mir` returns an empty
+    // vector both for a legitimately interpreter-free LLBC set and for a
+    // present-but-unrecognised dispatcher (missing `execute_opcode_step`
+    // or a non-`Value`-switch start block).  The latter would silently
+    // ship an opcode-less, non-functional JIT, so gate the emptiness on
+    // the interpreter fingerprint: the `Instruction` enum is the same
+    // signal the extractor itself keys on (front::mir_dispatch).
+    assert!(
+        !opcode_arms.is_empty()
+            || !program
+                .enum_variant_by_discriminant
+                .contains_key("Instruction"),
+        "opcode dispatch is empty but the interpreter `Instruction` enum is \
+         present: `execute_opcode_step` or its discriminant switch is missing \
+         (front::mir_dispatch::extract_opcode_dispatch_arms_from_mir)"
+    );
 
     // RPython codewriter.py:74-89: make_jitcodes().
     //
@@ -1520,790 +1772,6 @@ pub fn recognition_report(result: &pipeline::ProgramPipelineResult) -> codegen::
 pub use codegen::{OpcodeRecognition, RecognitionReport};
 
 /// Generate code from graph pipeline results.
-#[cfg(test)]
-pub fn generate_graph_code(result: &pipeline::ProgramPipelineResult) -> String {
-    codegen::generate_from_graph(result)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::path::Path;
-    use walkdir::WalkDir;
-
-    fn read_pyre_file(name: &str) -> String {
-        let base = concat!(env!("CARGO_MANIFEST_DIR"), "/../../pyre/");
-        std::fs::read_to_string(format!("{base}{name}"))
-            .unwrap_or_else(|_| panic!("failed to read {name}"))
-    }
-
-    fn collect_rs_files(dir: &Path, sources: &mut Vec<String>) {
-        for entry in WalkDir::new(dir) {
-            let entry = entry.unwrap_or_else(|_| panic!("failed to walk dir {}", dir.display()));
-            let path = entry.path();
-            if entry.file_type().is_file() && path.extension().is_some_and(|ext| ext == "rs") {
-                sources.push(
-                    std::fs::read_to_string(path)
-                        .unwrap_or_else(|_| panic!("failed to read {}", path.display())),
-                );
-            }
-        }
-    }
-
-    /// Collect `(source, crate-stripped module_path)` per file under `dir`.
-    /// The module_path matches what `module_path!()` would emit at runtime
-    /// minus the leading crate-name segment — `lib.rs` → `""`,
-    /// `baseobjspace.rs` → `"baseobjspace"`, `module/inner.rs` → `"module::inner"`.
-    /// Feeds `parse::parse_source_with_module` so call-site segments
-    /// emitted by `canonical_call_target` for `crate::module::name` paths
-    /// hit the same `module::name` keys the registry collects.
-    fn collect_rs_files_with_modules(
-        dir: &Path,
-        sources: &mut Vec<String>,
-        module_paths: &mut Vec<String>,
-    ) {
-        for entry in WalkDir::new(dir) {
-            let entry = entry.unwrap_or_else(|_| panic!("failed to walk dir {}", dir.display()));
-            let path = entry.path();
-            if entry.file_type().is_file() && path.extension().is_some_and(|ext| ext == "rs") {
-                let source = std::fs::read_to_string(path)
-                    .unwrap_or_else(|_| panic!("failed to read {}", path.display()));
-                let relative = path.strip_prefix(dir).unwrap_or(path).with_extension("");
-                let mut segments: Vec<String> = relative
-                    .components()
-                    .map(|c| c.as_os_str().to_string_lossy().to_string())
-                    .collect();
-                // lib.rs / main.rs / mod.rs occupy the parent module path
-                // (no leaf segment), so strip them and let the remaining
-                // ancestor chain stand as the module path.  Empty path
-                // (`lib.rs` at the crate root) registers under the empty
-                // prefix, matching today's behaviour.
-                if matches!(
-                    segments.last().map(String::as_str),
-                    Some("lib" | "main" | "mod")
-                ) {
-                    segments.pop();
-                }
-                sources.push(source);
-                module_paths.push(segments.join("::"));
-            }
-        }
-    }
-
-    fn read_all_pyre_sources() -> Vec<String> {
-        let (sources, _module_paths) = read_all_pyre_sources_with_modules();
-        sources
-    }
-
-    fn read_all_pyre_sources_with_modules() -> (Vec<String>, Vec<String>) {
-        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../pyre");
-        let mut sources = Vec::new();
-        let mut module_paths = Vec::new();
-        for dir in [
-            base.join("pyre-object/src"),
-            base.join("pyre-interpreter/src"),
-        ] {
-            collect_rs_files_with_modules(&dir, &mut sources, &mut module_paths);
-        }
-        (sources, module_paths)
-    }
-
-    #[test]
-    fn test_analyze_pyopcode() {
-        let source = read_pyre_file("pyre-interpreter/src/pyopcode.rs");
-        let result = analyze_multiple_pipeline_with_config(
-            &[&source],
-            &crate::test_support::pyre_analyze_config(),
-        );
-
-        assert!(
-            result.opcode_dispatch.len() > 20,
-            "expected >20 opcode arms, got {}",
-            result.opcode_dispatch.len()
-        );
-
-        eprintln!("=== Single-file Analysis ===");
-        eprintln!("Opcodes: {}", result.opcode_dispatch.len());
-        for (i, arm) in result.opcode_dispatch.iter().enumerate() {
-            eprintln!(
-                "  [{i}] {} → {:?}",
-                arm.selector.canonical_key(),
-                arm.flattened.as_ref().map(|f| f.insns.len())
-            );
-        }
-    }
-
-    /// Whole-program pipeline fixture: parse + lower the entire pyre
-    /// interpreter exactly once, then run every whole-program assertion
-    /// block against the shared result. `ProgramPipelineResult` holds
-    /// `Rc`-based IR (`!Send`/`!Sync`), so it cannot be shared across
-    /// cargo's parallel test threads via a `static`/`LazyLock`; merging
-    /// the formerly-separate per-block tests into one is the only way to
-    /// pay the (interpreter-size-linear) lowering cost a single time.
-    #[test]
-    fn test_full_pipeline_analysis() {
-        let sources = read_all_pyre_sources();
-        let source_refs: Vec<&str> = sources.iter().map(String::as_str).collect();
-        let parsed_files: Vec<_> = source_refs
-            .iter()
-            .map(|source| parse::parse_source(source))
-            .collect();
-        let config = crate::test_support::pyre_analyze_config();
-        // Single whole-program lowering shared by every block below.
-        let result = analyze_pipeline_from_parsed(
-            &parsed_files,
-            &config,
-            None,
-            &|_, _| None,
-            &[],
-            &[],
-            HostStaticAddrs::default(),
-        );
-        // Walker-populated metadata mirrors the production
-        // `analyze_pipeline_from_parsed` path: `extract_trait_impls`
-        // lowers method bodies against this registry so the
-        // `expr_unary_not_operand_kind` classifier can resolve
-        // cross-module bool calls. Empty registries previously masked
-        // unsupported `!x` patterns through the UNARY_NOT bool-fork
-        // fall-through; with the fail-loud restoration, the test
-        // fixture must populate the registries the same way production
-        // does.
-        let metadata = crate::front::ast::collect_program_metadata_pub(&parsed_files);
-        let trait_impls: Vec<TraitImplInfo> = parsed_files
-            .iter()
-            .flat_map(|p| {
-                parse::extract_trait_impls(
-                    p,
-                    &metadata.struct_fields,
-                    &metadata.fn_return_types,
-                    &metadata.known_struct_names,
-                )
-                .expect("trait impls must lower")
-            })
-            .collect();
-
-        assert_multi_file_analysis(&result, &trait_impls);
-        assert_codegen_output(&result);
-        assert_recognition_report(&result);
-    }
-
-    fn assert_multi_file_analysis(
-        result: &pipeline::ProgramPipelineResult,
-        trait_impls: &[TraitImplInfo],
-    ) {
-        eprintln!("=== Multi-file Analysis ===");
-        eprintln!("Opcodes: {}", result.opcode_dispatch.len());
-        eprintln!("Functions: {}", result.functions.len());
-        eprintln!("Trait impls: {}", trait_impls.len());
-
-        // Should have trait impls from eval.rs (PyFrame impls)
-        let pyframe_impls: Vec<_> = trait_impls
-            .iter()
-            .filter(|i| i.for_type.contains("PyFrame"))
-            .collect();
-        eprintln!("\nPyFrame trait impls: {}", pyframe_impls.len());
-        for impl_info in &pyframe_impls {
-            eprintln!(
-                "  impl {} for PyFrame — {} methods",
-                impl_info.trait_name,
-                impl_info.methods.len()
-            );
-            for m in &impl_info.methods {
-                eprintln!("    {}", m.name);
-            }
-        }
-
-        // Should have resolved opcode patterns (flattened op counts)
-        eprintln!("\nOpcode patterns:");
-        for arm in &result.opcode_dispatch {
-            if let Some(ref flat) = arm.flattened {
-                eprintln!(
-                    "  {} → {} flat ops",
-                    arm.selector.canonical_key(),
-                    flat.insns.len()
-                );
-            }
-        }
-
-        // Report flattened (inline→jtransform→flatten) stats
-        let flattened_count = result
-            .opcode_dispatch
-            .iter()
-            .filter(|a| a.flattened.is_some())
-            .count();
-        eprintln!(
-            "\nFlattened (inline pipeline): {flattened_count}/{}",
-            result.opcode_dispatch.len()
-        );
-        for arm in &result.opcode_dispatch {
-            if let Some(ref flat) = arm.flattened {
-                eprintln!(
-                    "  {} → {} flat ops",
-                    arm.selector.canonical_key(),
-                    flat.insns.len()
-                );
-            }
-        }
-
-        // Verify canonical graph/pipeline dispatch flattens a useful subset.
-        let flattened_dispatch_count = result
-            .opcode_dispatch
-            .iter()
-            .filter(|a| a.flattened.is_some())
-            .count();
-        assert!(
-            flattened_dispatch_count >= 10,
-            "expected >=10 flattened opcode arms, got {}",
-            flattened_dispatch_count
-        );
-
-        // Verify flattened arms produce non-empty op sequences.
-        assert!(
-            result
-                .opcode_dispatch
-                .iter()
-                .filter_map(|arm| arm.flattened.as_ref())
-                .all(|f| f.insns.len() > 0),
-            "all flattened arms should have non-empty op sequences"
-        );
-
-        // RPython: CodeWriter.make_jitcodes() produces JitCode for each graph.
-        // Verify the full pipeline (regalloc + liveness + assemble) runs.
-        //
-        // `collect_jitcodes_in_alloc_order` preserves the dense invariant
-        // `all_jitcodes[i].index == i` (call.rs:1620-1633, matching RPython
-        // codewriter.py:80), and by construction every slot in the vec is
-        // a legitimate shell produced by `get_jitcode`. Shells whose body
-        // was never committed (e.g. graph registered by a caller but never
-        // drained because the test harness doesn't wire an fnaddr binding)
-        // round-trip as body-less entries — `try_body()` is the documented
-        // probe for distinguishing them.
-        eprintln!("\nJitCodes: {}", result.jitcodes.len());
-        let mut bodied = 0usize;
-        for (i, jitcode) in result.jitcodes.iter().enumerate() {
-            match jitcode.try_body() {
-                Some(body) => {
-                    eprintln!(
-                        "  [{}] {} → {} bytes, regs i={} r={} f={}",
-                        i,
-                        jitcode.name,
-                        body.code.len(),
-                        body.c_num_regs_i,
-                        body.c_num_regs_r,
-                        body.c_num_regs_f,
-                    );
-                    bodied += 1;
-                }
-                None => eprintln!("  [{}] {} → <shell: body not committed>", i, jitcode.name),
-            }
-        }
-        assert!(
-            !result.jitcodes.is_empty(),
-            "CodeWriter should produce JitCodes from opcode arms"
-        );
-        assert!(
-            bodied > 0,
-            "at least one JitCode should have a committed body"
-        );
-        assert!(
-            result
-                .jitcodes
-                .iter()
-                .filter_map(|jc| jc.try_body())
-                .all(|body| !body.code.is_empty()),
-            "every committed JitCode body must have non-empty bytecode"
-        );
-    }
-
-    fn assert_codegen_output(result: &pipeline::ProgramPipelineResult) {
-        let code = generate_trace_code_from_pipeline(result);
-        let flattened_arms: Vec<_> = result
-            .opcode_dispatch
-            .iter()
-            .filter(|arm| arm.flattened.is_some())
-            .collect();
-
-        // Should contain canonical dispatch table
-        assert!(
-            code.contains("CANONICAL_TRACE_PATTERNS"),
-            "missing CANONICAL_TRACE_PATTERNS"
-        );
-        assert!(
-            !code.contains("pub const TRACE_PATTERNS"),
-            "canonical output should not emit legacy TRACE_PATTERNS alias"
-        );
-        assert!(
-            code.contains("Canonical analysis summary:"),
-            "missing canonical summary"
-        );
-        assert!(!flattened_arms.is_empty(), "expected flattened opcode arms");
-
-        eprintln!("=== Generated Code ({} bytes) ===", code.len());
-        // Print first 50 lines
-        for (i, line) in code.lines().enumerate().take(50) {
-            eprintln!("{:3}: {}", i + 1, line);
-        }
-    }
-
-    fn assert_recognition_report(result: &pipeline::ProgramPipelineResult) {
-        let report = recognition_report(result);
-
-        eprintln!("=== Recognition Report ===");
-        eprintln!(
-            "Total opcodes: {}, Flattened: {} ({:.0}%)",
-            report.total_opcodes,
-            report.flattened,
-            if report.total_opcodes > 0 {
-                report.flattened as f64 / report.total_opcodes as f64 * 100.0
-            } else {
-                0.0
-            }
-        );
-        eprintln!(
-            "Total flat ops: {}, Unknown: {}, Unresolved calls: {}",
-            report.total_flat_ops, report.unknown_ops, report.unresolved_calls
-        );
-        eprintln!("\nPer-opcode:");
-        for opc in &report.per_opcode {
-            let status = if opc.flat_ops > 0 {
-                format!(
-                    "{} ops ({}U {}C)",
-                    opc.flat_ops, opc.unknowns, opc.unresolved
-                )
-            } else {
-                "unflattened".to_string()
-            };
-            eprintln!("  {:40} {}", opc.selector, status);
-        }
-
-        // Scoreboard assertions
-        assert!(
-            report.total_opcodes > 20,
-            "expected >20 opcodes, got {}",
-            report.total_opcodes
-        );
-        assert!(
-            report.flattened >= 10,
-            "expected >=10 flattened, got {}",
-            report.flattened
-        );
-    }
-
-    #[test]
-    fn test_graph_pipeline_e2e() {
-        // E2E test: source → AST front-end → semantic graph → graph transform → classify
-        let parsed = parse::parse_source(
-            r#"
-            struct Frame { next_instr: usize, locals_w: Vec<i64> }
-            impl Frame {
-                fn load_fast(&mut self) -> i64 {
-                    let idx = self.next_instr;
-                    self.locals_w[idx]
-                }
-                fn store_fast(&mut self, val: i64) {
-                    let idx = self.next_instr;
-                    self.locals_w[idx] = val;
-                }
-            }
-        "#,
-        );
-
-        // Step 1: AST → semantic graph
-        let program = front::build_semantic_program(&parsed).expect("source must lower");
-        assert_eq!(
-            program.functions.len(),
-            2,
-            "should have load_fast + store_fast"
-        );
-
-        // Step 2: graph transform (with virtualizable config)
-        let config = GraphTransformConfig {
-            vable_fields: vec![VirtualizableFieldDescriptor::new(
-                "next_instr",
-                Some("Frame".into()),
-                0,
-            )],
-            vable_arrays: vec![VirtualizableFieldDescriptor::new(
-                "locals_w",
-                Some("Frame".into()),
-                0,
-            )],
-            ..Default::default()
-        };
-
-        let load_fast_graph = &program.functions[0].graph;
-        let result = rewrite_graph(load_fast_graph, &config);
-        assert!(
-            result.vable_rewrites > 0,
-            "load_fast should have vable rewrites, got notes: {:?}",
-            result.notes
-        );
-
-        // Step 3: flatten the rewritten graph
-        // `resolve_types` commits per-value `concretetype` cells on
-        // each backing Variable as it builds, so downstream consumers
-        // can read kinds via `FunctionGraph::concretetype_of(&v)`
-        // without a separate publish step.
-        annotate::annotate(&result.graph);
-        rtype::resolve_types(&result.graph);
-        let mut result = result;
-        crate::regalloc::augment_canonical_exceptblock_on_graph(&mut result.graph);
-        let mut regallocs = crate::regalloc::perform_all_register_allocations(&result.graph);
-        let flattened = flatten::flatten_graph(&result.graph, &mut regallocs);
-        eprintln!(
-            "load_fast graph ops: {:?}",
-            load_fast_graph.block(load_fast_graph.startblock).operations
-        );
-        eprintln!("load_fast flattened: {} ops", flattened.insns.len());
-        assert!(
-            flattened.insns.len() > 0,
-            "load_fast should produce flat ops"
-        );
-    }
-
-    #[test]
-    fn test_analyze_pipeline_runs_canonical_graph_path() {
-        let source = read_pyre_file("pyre-interpreter/src/pyopcode.rs");
-        let graph_result = analyze_pipeline(&source);
-
-        // Canonical pipeline should produce per-opcode dispatch arms.
-        assert!(
-            graph_result.opcode_dispatch.len() >= 5,
-            "expected >=5 opcode dispatch arms, got {}",
-            graph_result.opcode_dispatch.len(),
-        );
-        assert!(
-            !graph_result.jitcodes.is_empty(),
-            "canonical pipeline should produce jitcodes"
-        );
-    }
-
-    /// Parity tripwire: the `Instruction::LoadFast` dispatch arm must
-    /// inline `load_fast` and the inlined body must have rewritten the
-    /// virtualizable `self.next_instr` field read and `self.locals_w[idx]`
-    /// array read to `getfield_vable` / `getarrayitem_vable`
-    /// ([`OpKind::VableFieldRead`] / [`OpKind::VableArrayRead`]).  A plain
-    /// `getfield` / `getarrayitem` (vable rewrite silently skipped) leaves
-    /// these kinds absent and must fail the test, not pass it — guarding
-    /// against the tripwire degrading to a mere "non-empty flattening"
-    /// check.
-    fn assert_load_fast_rewrites_vable_accesses(arm: &opcode_dispatch::PipelineOpcodeArm) {
-        use crate::jit_codewriter::flatten::FlatOp;
-        use crate::model::OpKind;
-
-        let flattened = arm
-            .flattened
-            .as_ref()
-            .expect("LoadFast arm should be flattened");
-        let inlined = flattened
-            .insns
-            .iter()
-            .find_map(|insn| match insn {
-                FlatOp::Op(op) => match &op.kind {
-                    OpKind::InlineCall { jitcode, .. } => jitcode.body()._ssarepr.as_ref(),
-                    _ => None,
-                },
-                _ => None,
-            })
-            .expect("LoadFast dispatch should inline the load_fast method body");
-        let body_has = |pred: &dyn Fn(&OpKind) -> bool| {
-            inlined
-                .insns
-                .iter()
-                .any(|insn| matches!(insn, FlatOp::Op(op) if pred(&op.kind)))
-        };
-        assert!(
-            body_has(&|k| matches!(k, OpKind::VableFieldRead { .. })),
-            "self.next_instr should rewrite to a vable field read"
-        );
-        assert!(
-            body_has(&|k| matches!(k, OpKind::VableArrayRead { .. })),
-            "self.locals_w[idx] should rewrite to a vable array read"
-        );
-    }
-
-    #[test]
-    fn test_analyze_multiple_with_config_rewrites_virtualizable_graphs() {
-        let source = r#"
-            enum Instruction { LoadFast }
-
-            struct Frame {
-                next_instr: usize,
-                locals_w: Vec<i64>,
-            }
-
-            impl Frame {
-                fn load_fast(&mut self) -> i64 {
-                    let idx = self.next_instr;
-                    self.locals_w[idx]
-                }
-            }
-
-            fn execute_opcode_step(frame: &mut Frame, instruction: Instruction) {
-                match instruction {
-                    Instruction::LoadFast => {
-                        let _ = frame.load_fast();
-                    }
-                }
-            }
-        "#;
-
-        let result = analyze_multiple_pipeline_with_config(
-            &[source],
-            &AnalyzeConfig {
-                pipeline: PipelineConfig {
-                    transform: GraphTransformConfig {
-                        vable_fields: vec![VirtualizableFieldDescriptor::new(
-                            "next_instr",
-                            Some("Frame".into()),
-                            0,
-                        )],
-                        vable_arrays: vec![VirtualizableFieldDescriptor::new(
-                            "locals_w",
-                            Some("Frame".into()),
-                            0,
-                        )],
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                },
-            },
-        );
-
-        let load_fast = result
-            .opcode_dispatch
-            .iter()
-            .find(|arm| arm.selector.canonical_key() == "Instruction::LoadFast")
-            .expect("LoadFast opcode arm");
-        assert!(
-            load_fast.flattened.is_some(),
-            "LoadFast should be flattened"
-        );
-        assert!(
-            load_fast.flattened.as_ref().unwrap().insns.len() > 0,
-            "LoadFast flattened should have ops"
-        );
-        assert_load_fast_rewrites_vable_accesses(load_fast);
-    }
-
-    #[test]
-    fn test_analyze_multiple_pipeline_with_config_produces_canonical_vable_dispatch() {
-        let source = r#"
-            enum Instruction { LoadFast }
-
-            struct Frame {
-                next_instr: usize,
-                locals_w: Vec<i64>,
-            }
-
-            impl Frame {
-                fn load_fast(&mut self) -> i64 {
-                    let idx = self.next_instr;
-                    self.locals_w[idx]
-                }
-            }
-
-            fn execute_opcode_step(frame: &mut Frame, instruction: Instruction) {
-                match instruction {
-                    Instruction::LoadFast => {
-                        let _ = frame.load_fast();
-                    }
-                }
-            }
-        "#;
-
-        let result = analyze_multiple_pipeline_with_config(
-            &[source],
-            &AnalyzeConfig {
-                pipeline: PipelineConfig {
-                    transform: GraphTransformConfig {
-                        vable_fields: vec![VirtualizableFieldDescriptor::new(
-                            "next_instr",
-                            Some("Frame".into()),
-                            0,
-                        )],
-                        vable_arrays: vec![VirtualizableFieldDescriptor::new(
-                            "locals_w",
-                            Some("Frame".into()),
-                            0,
-                        )],
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                },
-            },
-        );
-        let canonical_load_fast = result
-            .opcode_dispatch
-            .iter()
-            .find(|arm| arm.selector.canonical_key() == "Instruction::LoadFast")
-            .expect("canonical LoadFast opcode arm");
-        assert!(
-            canonical_load_fast.flattened.is_some(),
-            "canonical LoadFast should be flattened"
-        );
-        assert!(
-            canonical_load_fast.flattened.as_ref().unwrap().insns.len() > 0,
-            "canonical LoadFast flattened should have ops"
-        );
-        assert_load_fast_rewrites_vable_accesses(canonical_load_fast);
-    }
-
-    #[test]
-    fn test_analyze_multiple_pipeline_with_fnaddr_bindings_stamps_real_jitcode_fnaddr() {
-        let source = r#"
-            fn helper_opaque(a: i64, b: i64) -> i64 {
-                a + b
-            }
-
-            fn execute_opcode_step() -> i64 {
-                helper_opaque(2, 3)
-            }
-        "#;
-
-        let result = analyze_multiple_pipeline_with_fnaddr_bindings(
-            &[source],
-            &AnalyzeConfig::default(),
-            None,
-            &[("testcrate::helper_opaque", 0x1234_5678)],
-        );
-
-        let helper = result
-            .jitcodes
-            .iter()
-            .find(|jitcode| jitcode.name == "helper_opaque")
-            .expect("helper_opaque jitcode");
-        assert_eq!(helper.fnaddr, 0x1234_5678);
-    }
-
-    #[test]
-    fn test_opcode_dispatch_uses_trait_bound_default_method_graphs() {
-        let source = r#"
-            enum Instruction { LoadFast }
-
-            trait OpcodeStepExecutor {
-                fn load_fast_checked(&mut self, idx: usize) {
-                    let _ = idx;
-                }
-            }
-
-            fn execute_opcode_step<E: OpcodeStepExecutor>(executor: &mut E, instruction: Instruction) {
-                match instruction {
-                    Instruction::LoadFast => executor.load_fast_checked(0),
-                }
-            }
-        "#;
-
-        let result = analyze_multiple_pipeline(&[source]);
-        let arm = result
-            .opcode_dispatch
-            .iter()
-            .find(|arm| arm.selector.canonical_key() == "Instruction::LoadFast")
-            .expect("LoadFast opcode arm");
-        assert!(
-            arm.flattened.is_some(),
-            "trait-bound default method should produce a flattened result"
-        );
-    }
-
-    /// Integration test: CallControl + inline on real pyre sources.
-    ///
-    /// Verifies that the inline pass produces graphs with low-level ops
-    /// (FieldRead, ArrayRead) from inlined handler method bodies.
-    #[test]
-    fn test_inline_pipeline_integration() {
-        let sources = read_all_pyre_sources();
-        let source_refs: Vec<&str> = sources.iter().map(String::as_str).collect();
-        let parsed_files: Vec<_> = source_refs.iter().map(|s| parse::parse_source(s)).collect();
-
-        // Build CallControl from parsed sources
-        let mut call_control = call::CallControl::new();
-        let mut function_graphs = std::collections::HashMap::new();
-        let metadata = crate::front::ast::collect_program_metadata_pub(&parsed_files);
-        for parsed in &parsed_files {
-            parse::collect_function_graphs(parsed, &metadata, &mut function_graphs)
-                .expect("collect_function_graphs: FlowingError must propagate");
-        }
-        for (path, graph) in &function_graphs {
-            call_control.register_function_graph(path.clone(), graph.clone());
-        }
-        let trait_impls: Vec<TraitImplInfo> = parsed_files
-            .iter()
-            .flat_map(|p| {
-                parse::extract_trait_impls(
-                    p,
-                    &metadata.struct_fields,
-                    &metadata.fn_return_types,
-                    &metadata.known_struct_names,
-                )
-                .expect("trait impls must lower")
-            })
-            .collect();
-        for impl_info in &trait_impls {
-            let impl_type = impl_info
-                .self_ty_root
-                .as_deref()
-                .unwrap_or(&impl_info.for_type);
-            let trait_root = if impl_info.trait_name.is_empty() {
-                None
-            } else {
-                Some(impl_info.trait_name.as_str())
-            };
-            for method in &impl_info.methods {
-                if let Some(graph) = &method.graph {
-                    call_control.register_trait_method(
-                        &method.name,
-                        trait_root,
-                        impl_type,
-                        graph.clone(),
-                    );
-                }
-            }
-        }
-        call_control.find_all_graphs_for_tests();
-
-        // Get opcode_load_fast_checked graph and inline it
-        let path = parse::CallPath::from_segments(["opcode_load_fast_checked"]);
-        let graph = function_graphs.get(&path);
-        assert!(
-            graph.is_some(),
-            "opcode_load_fast_checked should exist in function_graphs"
-        );
-        let mut graph = graph.unwrap().clone();
-
-        let pre_inline_blocks = graph.blocks.len();
-        let inlined = inline::inline_graph(&mut graph, &call_control, 3);
-
-        eprintln!("=== Inline Integration Test ===");
-        eprintln!(
-            "  opcode_load_fast_checked: {pre_inline_blocks} blocks → {} blocks, {inlined} call sites inlined",
-            graph.blocks.len()
-        );
-        for block in &graph.blocks {
-            for op in &block.operations {
-                eprintln!("    {:?}", op.kind);
-            }
-        }
-
-        // inline.rs is a graph utility, NOT part of the RPython-orthodox
-        // pipeline. Method calls are now correctly Residual (not auto-Regular),
-        // so fewer call sites may be inlined. This is expected.
-        eprintln!("  inlined count: {inlined}");
-
-        // Check if any low-level ops emerged from inlining FunctionPath calls
-        let all_ops: Vec<_> = graph.blocks.iter().flat_map(|b| &b.operations).collect();
-        let has_low_level = all_ops.iter().any(|op| {
-            matches!(
-                &op.kind,
-                OpKind::FieldRead { .. }
-                    | OpKind::ArrayRead { .. }
-                    | OpKind::ArrayWrite { .. }
-                    | OpKind::FieldWrite { .. }
-            )
-        });
-        eprintln!("  has low-level ops after inline: {has_low_level}");
-    }
-}
 
 /// `rlib` — Rust port of `rpython/rlib/` helpers pulled in on demand.
 /// Currently only the pieces required by the annotator port are

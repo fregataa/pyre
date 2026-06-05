@@ -1,4 +1,4 @@
-//! Phase F: static registry of `Arc<JitCode>`s produced from
+//! Static registry of `Arc<JitCode>`s produced from
 //! pyre-interpreter handler graphs.
 //!
 //! ## Positioning (TODO)
@@ -39,11 +39,11 @@
 //!
 //! ## Audience: TEST FIXTURE (not production)
 //!
-//! As of 2026-04-25, `all_jitcodes()` is consumed **only** by
+//! `all_jitcodes()` is consumed **only** by
 //! majit-translate's own integration tests
 //! (`test_phase_f_all_jitcodes.rs`,
-//! `test_make_jitcodes_produces_graph_keyed_output.rs`,
-//! `tests` mod below). The pyre runtime never imports this function.
+//! `test_make_jitcodes_produces_graph_keyed_output.rs`). The pyre
+//! runtime never imports this function.
 //!
 //! Production builds run a parallel pipeline at `pyre-jit-trace/build.rs`
 //! that calls `analyze_multiple_pipeline_with_vinfo_and_fnaddr_bindings`
@@ -56,12 +56,10 @@
 //! is what the unit tests need to assert (graph discovery, alloc-order
 //! invariants, by-path keying).
 //!
-//! The historical description ("route generated::all_jitcodes
-//! through fnaddr_bindings instead of symbolic fallback") was written
-//! before the build-time bincode path landed in `pyre-jit-trace/build.rs`;
-//! production-side fnaddr resolution is therefore already done by that
-//! script, and `generated::all_jitcodes` keeps its symbolic-fallback
-//! contract as the deliberate test surface. **Do not rewire this module
+//! Production-side fnaddr resolution is done by
+//! `pyre-jit-trace/build.rs`, so `generated::all_jitcodes` keeps its
+//! symbolic-fallback contract as the deliberate test surface. It is not
+//! routed through `fnaddr_bindings`. **Do not rewire this module
 //! to thread `&fnaddr_bindings` — doing so would either (1) introduce a
 //! `majit-translate` ⇒ `pyre-interpreter` dependency that breaks the
 //! `majit/* ⊥ pyre/*` invariant, or (2) require parameterising the
@@ -72,7 +70,7 @@
 //!
 //! An earlier draft of this module ran its own narrow pipeline
 //! (opcode_* free functions + trait impl methods only, with empty
-//! `StructFieldRegistry` / `fn_return_types` / `known_struct_names`).
+//! `StructFieldRegistry` / `known_struct_names`).
 //! That shape is **narrower than `translator.graphs`** upstream assumes
 //! and drops structural context:
 //!
@@ -80,10 +78,10 @@
 //!   registered via `extract_inherent_impl_methods` in
 //!   `analyze_pipeline_from_parsed`; without them, direct_call targets
 //!   like `self.pop()` cannot resolve to a concrete graph.
-//! - `struct_fields` / `fn_return_types` / `known_struct_names` carry
-//!   array-type identity that `extract_trait_impls` consults; an empty
-//!   context silently collapses those identities and the rtyped graph
-//!   becomes syntax-only.
+//! - `struct_fields` / `known_struct_names` carry array-type identity
+//!   that `extract_trait_impls` consults; an empty context silently
+//!   collapses those identities and the rtyped graph becomes
+//!   syntax-only.
 //!
 //! Re-using `analyze_multiple_pipeline` eliminates both gaps: the same
 //! full-context registry the canonical analyzer consumes becomes this
@@ -94,8 +92,8 @@
 //! - NOT a new key schema. The canonical key is `CallPath` (matching
 //!   `CallControl.jitcodes`, which is `rpython/jit/codewriter/call.py:87
 //!   self.jitcodes` keyed by graph identity).
-//! - NOT a variant-keyed map. The plan's Phase E acceptance check
-//!   (`rg "HashMap<Instruction" majit/majit-translate/src/` = 0) holds.
+//! - NOT a variant-keyed map. No `HashMap<Instruction, …>` exists under
+//!   `majit/majit-translate/src/` (`rg "HashMap<Instruction"` = 0).
 //! - NOT a new opname family. Every handler is transformed through the
 //!   existing `CodeWriter::transform_graph_to_jitcode` without per-arm
 //!   special cases.
@@ -140,7 +138,7 @@ pub use crate::codewriter::AllJitCodes;
 ///   called directly from default trait methods (pyopcode.rs:821).
 ///   Before their inclusion, `analyze_multiple_pipeline` would report
 ///   them as unresolved `direct_call` targets.
-/// - `pyre-jit/src/eval.rs` — Phase D0 portal runner `eval_loop_jit`
+/// - `pyre-jit/src/eval.rs` — portal runner `eval_loop_jit`
 ///   (pyre analogue of upstream `warmspot.py::portal_runner`) and
 ///   its resume/allocation helpers (`allocate_struct`,
 ///   `allocate_with_vtable`). Seeding this root lets
@@ -260,96 +258,5 @@ fn build() -> AllJitCodes {
     AllJitCodes {
         by_path: result.jitcodes_by_path,
         in_order: result.jitcodes,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::with_all_jitcodes;
-    use crate::call::symbolic_fnaddr_for_path;
-    use crate::parse::CallPath;
-
-    #[test]
-    fn generic_handler_graphs_keep_symbolic_fnaddr_surface() {
-        with_all_jitcodes(|reg| {
-            // `execute_opcode_step` is consumed by
-            // `build_canonical_opcode_dispatch` (`lib.rs:965-1027`): each match
-            // arm body is registered as a synthetic graph keyed under
-            // `["__opcode_dispatch__", "<selector>#<arm_id>"]`. The wrapper
-            // function itself is not separately registered; the dispatch arms
-            // are the "generic handler graphs" whose fnaddr surface this test
-            // pins. Pick one arm per representative opcode family (load /
-            // build / pop) to lock the symbolic-fnaddr contract.
-            for path in [
-                CallPath::from_segments(["__opcode_dispatch__", "Instruction::LoadConst#1"]),
-                CallPath::from_segments(["__opcode_dispatch__", "Instruction::BuildList#30"]),
-                CallPath::from_segments(["__opcode_dispatch__", "Instruction::PopTop#14"]),
-            ] {
-                let jitcode = reg
-                    .by_path
-                    .get(&path)
-                    .unwrap_or_else(|| panic!("missing JitCode for path {:?}", path.segments));
-                assert_eq!(
-                    jitcode.fnaddr,
-                    symbolic_fnaddr_for_path(&path),
-                    "generated::with_all_jitcodes unexpectedly stopped using the symbolic fnaddr \
-                     fallback for {:?}; if this became a real fnaddr, update the contract \
-                     comment above with the chosen monomorphization strategy",
-                    path.segments
-                );
-            }
-        });
-    }
-
-    /// Phase D acceptance: `eval_loop_jit` is the portal (upstream
-    /// `warmspot.py::portal_runner` analogue, seeded into
-    /// `find_all_graphs(portal, policy)` at `call.py:57`). When the
-    /// portal runner lives in `PYRE_JIT_GRAPH_SOURCES`
-    /// (`pyre-jit/src/eval.rs`), the production pipeline must register a
-    /// JitCode for it *and* keep the match-arm callee
-    /// `execute_opcode_step` reachable as a BFS-discovered inlinee (not
-    /// as a separate entry point). A missing `eval_loop_jit` JitCode
-    /// here would indicate that `setup_jitdriver` silently fell back to
-    /// `execute_opcode_step`, reintroducing the "handler-as-portal"
-    /// shape Phase D eliminates.
-    #[test]
-    fn eval_loop_jit_portal_produces_jitcode_with_handler_closure() {
-        with_all_jitcodes(|reg| {
-            // Module-qualified paths — see comment on
-            // `generic_handler_graphs_keep_symbolic_fnaddr_surface`.
-            // `pyre-jit/src/eval.rs` is declared under `"eval"` in
-            // `PYRE_JIT_GRAPH_SOURCES`; `pyre-interpreter/src/pyopcode.rs`
-            // under `"pyopcode"`.
-            let portal = CallPath::from_segments(["eval", "eval_loop_jit"]);
-            assert!(
-                reg.by_path.contains_key(&portal),
-                "Phase D parity: eval_loop_jit must have a JitCode after \
-                 analyze_multiple_pipeline runs (production seeds portal via \
-                 setup_jitdriver, find_all_graphs BFSes from it). Missing the \
-                 entry means the portal fallback unexpectedly chose \
-                 execute_opcode_step."
-            );
-            // `execute_opcode_step` is decomposed by
-            // `build_canonical_opcode_dispatch` (`lib.rs:965-1027`) into
-            // synthetic per-arm graphs keyed under `__opcode_dispatch__`. The
-            // wrapper itself is not registered; the dispatch arms are what
-            // make the BFS surface from `eval_loop_jit` reach individual
-            // opcode handlers. A missing arm here means
-            // `extract_opcode_dispatch_arms` no longer sees the match body, or
-            // the synthetic registration step in
-            // `build_canonical_opcode_dispatch` regressed.
-            let has_arm = reg.by_path.keys().any(|k| {
-                k.segments
-                    .first()
-                    .map(|s| s == "__opcode_dispatch__")
-                    .unwrap_or(false)
-            });
-            assert!(
-                has_arm,
-                "Phase D parity: per-opcode dispatch arms must be registered \
-                 under [\"__opcode_dispatch__\", ...]; absence means the \
-                 eval_loop_jit → execute_opcode_step match arms never landed."
-            );
-        });
     }
 }

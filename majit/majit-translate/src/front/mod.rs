@@ -23,12 +23,56 @@
 //!
 //! Every non-trivial addition to this module must include a comment citing the RPython file:line it replaces or bridges. If no such line exists, the addition is further pyre-specific deviation and must be justified explicitly in the commit message.
 //!
+//! ## Source of graphs: Charon-extracted MIR
+//!
+//! The semantic graphs are built from Charon-extracted ULLBC, not from
+//! syn AST.  `front::mir::build_semantic_program_from_llbcs` consumes the
+//! extracted artefacts and produces the `SemanticProgram` whose
+//! `program.functions` carry the per-method graphs the rest of the
+//! pipeline consumes.  `auto_discover_workspace_llbc_paths` in `lib.rs`
+//! resolves `<workspace>/build/llbc/{pyre-object,pyre-interpreter}.ullbc`
+//! when `PYRE_MIR_FRONTEND_LLBC` is unset; the canonical pair
+//! `pyre-object.ullbc` / `pyre-interpreter.ullbc` is REQUIRED.  Setting
+//! `PYRE_REQUIRE_MIR_FRONTEND=1` makes
+//! `build_semantic_program_via_active_frontend` panic when no LLBC source
+//! resolves, so production builds (which set the flag in
+//! `pyre/check.py::build_backend`) assert that graphs come from MIR.
+//!
+//! Per-method graphs come straight from MIR.  `extract_trait_impls` /
+//! `extract_inherent_impl_methods` index `program.functions` via
+//! `front::semantic::MirGraphLookup` and substitute the MIR graph;
+//! `SemanticFunction.self_ty_root` and `SemanticFunction.trait_root`,
+//! populated on MIR-built impl methods (including trait-default bodies
+//! detected by `trait_default_owner_for_fundecl`), drive that
+//! registration.  `build_semantic_program_from_llbcs` dedups merged
+//! entries by the full qualified path (`{module_path}::{name}`) so that
+//! same-named impl methods across types are not collapsed.  The
+//! per-callsite return type is taken from the MIR-built
+//! `SemanticFunction` signature directly.  `tyref_to_value_type` maps
+//! `Literal::{Int,UInt}` / atom `"Bool"` / atom `"Char"` so that
+//! `usize` / `isize` arguments classify as integer rather than `Ref`,
+//! satisfying `flatten.rs:1155 "switch exitswitch must be int"` for
+//! graphs that switch on integer-typed arguments.
+//!
+//! ## dyn-Trait / impl-Trait classification
+//!
+//! Charon extracts every `dyn Trait` / `impl Trait` site in the
+//! JIT-consumed crates (`pyre-object`, `pyre-interpreter`,
+//! `pyre-module`) cleanly.  This driver targets the as-extracted ULLBC
+//! and treats `Dynamic` calls as first-class opaque indirect calls
+//! (type-flow devirtualization only if a hot path later demands it).
+//! Dict dispatch is statically-resolved `Trait`-kind, not virtual: none
+//! of the `Dynamic` fat-pointer calls in `pyre-interpreter.ullbc` are
+//! `DictStrategy::*`.  No RPITIT / GAT / trait alias appears in scope;
+//! the only extraction gap is std `thread_local!` accessor stubs,
+//! treated as opaque ops.
 
-pub mod ast;
+pub mod llbc_hints;
+pub mod mir;
+pub mod mir_dispatch;
+pub mod opcode_wrapper;
 pub mod raise;
+pub mod semantic;
+pub mod syn_metadata;
 
-pub use ast::{
-    AstGraphOptions, SemanticFunction, SemanticProgram, StructFieldRegistry,
-    build_semantic_program, build_semantic_program_from_parsed_files,
-    build_semantic_program_from_parsed_files_with_statics,
-};
+pub use semantic::{AstGraphOptions, SemanticFunction, SemanticProgram, StructFieldRegistry};

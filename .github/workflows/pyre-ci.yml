@@ -8,6 +8,8 @@ on:
       - "Cargo.lock"
       - "majit/**/*"
       - "pyre/**/*"
+      - "scripts/install-charon.sh"
+      - "scripts/extract-llbc.sh"
       - ".github/workflows/pyre-ci.yml"
   pull_request:
     branches: [ "main", "py3.[0-9]+" ]
@@ -16,6 +18,8 @@ on:
       - "Cargo.lock"
       - "majit/**/*"
       - "pyre/**/*"
+      - "scripts/install-charon.sh"
+      - "scripts/extract-llbc.sh"
       - ".github/workflows/pyre-ci.yml"
   workflow_dispatch:
 
@@ -44,6 +48,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # On windows-latest install-charon.sh builds Charon from source
+        # (no Windows release asset is published); see scripts/install-charon.sh.
         os: [ubuntu-24.04, macos-latest, windows-latest]
         backend: [dynasm, cranelift]
 
@@ -53,6 +59,12 @@ jobs:
     - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       with:
         cache-bin: false
+    - name: Install Charon
+      shell: bash
+      run: scripts/install-charon.sh
+    - name: Extract LLBC
+      shell: bash
+      run: scripts/extract-llbc.sh pyre-object pyre-interpreter
     - name: Run cargo test for ${{ matrix.backend }}
       run: cargo test --all --no-default-features --features ${{ matrix.backend }}
 
@@ -62,6 +74,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # On windows-latest install-charon.sh builds Charon from source
+        # (no Windows release asset is published); see scripts/install-charon.sh.
         os: [ubuntu-24.04, macos-latest, windows-latest]
 
     steps:
@@ -80,6 +94,12 @@ jobs:
     - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       with:
         cache-bin: false
+    - name: Install Charon
+      shell: bash
+      run: scripts/install-charon.sh
+    - name: Extract LLBC
+      shell: bash
+      run: scripts/extract-llbc.sh pyre-object pyre-interpreter
     - name: Run pyre/check.py
       env:
         PYRE_CHECK_PYTHON3: ${{ steps.cpython.outputs.python-path }}

@@ -39,7 +39,7 @@
 
 use std::collections::HashSet;
 
-use crate::front::ast::SemanticFunction;
+use crate::front::semantic::SemanticFunction;
 use crate::model::FunctionGraph;
 #[allow(unused_imports)]
 use majit_ir::value::Type;
@@ -266,9 +266,9 @@ impl JitPolicy for StopAtXPolicy {
 ///   - `@look_inside` (`rlib/jit.py:147`) sets
 ///     `func._jit_look_inside_ = True`
 ///
-/// `ast.rs::collect_jit_hints` lowers those decorators into the
-/// `"dont_look_inside"` and `"jit_look_inside"` hint strings; both forms
-/// route through this helper.
+/// `front::llbc_hints::harvest_hints_from_llbcs` lowers those decorators
+/// into the `"dont_look_inside"` and `"jit_look_inside"` hint strings;
+/// both forms route through this helper.
 fn jit_look_inside_hint(hints: &[String]) -> Option<bool> {
     for h in hints {
         match h.as_str() {
@@ -400,6 +400,7 @@ mod tests {
             hints: hints.into_iter().map(|h| h.to_string()).collect(),
             module_path: String::new(),
             access_directly: false,
+            trait_root: None,
         }
     }
 
@@ -448,6 +449,7 @@ mod tests {
             hints: vec![],
             module_path: String::new(),
             access_directly: false,
+            trait_root: None,
         };
         // Without `unroll_safe`, the loop disqualifies the graph.
         assert!(!policy.look_inside_graph(&loopy));
@@ -462,6 +464,7 @@ mod tests {
             hints: vec!["unroll_safe".into()],
             module_path: String::new(),
             access_directly: false,
+            trait_root: None,
         };
         assert!(policy.look_inside_graph(&unroll_safe));
     }

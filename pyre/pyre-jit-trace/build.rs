@@ -13,12 +13,26 @@ use walkdir::WalkDir;
 /// - pyre-object (Python object types: W_IntObject, W_FloatObject, etc.)
 /// - pyre-interpreter (object space, bytecode dispatch, eval loop)
 fn main() {
-    // Run on a worker thread with a large stack: on Windows the main
-    // thread's default stack is 1 MiB, which `syn`'s recursive parsing
-    // of the ~90 collected source files overflows
-    // (STATUS_STACK_OVERFLOW 0xc00000fd).
+    // The codegen worker (`real_main`) runs the RPythonTyper
+    // specialization (`specialize_legacy_graph_with_registry` → annotator
+    // `complete_pending_blocks` / rtyper `specialize_more_blocks`).  Its
+    // visit order is keyed off the annotator/rtyper worklist maps
+    // (`genpendingblocks`, `annotated`, `all_blocks`, …), which are
+    // insertion-ordered `IndexMap`s, so the order in which the callee
+    // specialization chain is walked is deterministic and independent of the
+    // per-process SipHash seed.  A single in-process run suffices, matching
+    // RPython's single-shot translator.  The 1 GiB thread stack is needed
+    // for syn's recursive parse of ~150 files plus the rtyper chain
+    // (on Windows the main thread's 1 MiB default would
+    // STATUS_STACK_OVERFLOW).
+    run_worker();
+}
+
+/// Run the codegen worker on a large-stack thread, propagating any panic so
+/// the build fails loudly instead of emitting partial output.
+fn run_worker() {
     std::thread::Builder::new()
-        .stack_size(64 * 1024 * 1024)
+        .stack_size(1024 * 1024 * 1024)
         .spawn(real_main)
         .expect("spawn build-script worker")
         .join()
@@ -43,7 +57,7 @@ fn real_main() {
         collect_rs_files(dir, &mut sources, &mut source_paths);
     }
 
-    // Phase G follow-up — include the portal canonical source so
+    // Include the portal canonical source so
     // `majit-translate` finds `eval_loop_jit` in `call_control
     // .function_graphs()` and the default-portal logic at
     // `majit-translate/src/lib.rs:621-644` flips from
@@ -188,7 +202,7 @@ fn real_main() {
     // `pub mod generated`). Trait impls would conflict (E0119) under double
     // inclusion, so they live in their own file included only once.
     //
-    // Assembled from THREE pieces (Phase B of the eval-loop automation plan):
+    // Assembled from THREE pieces:
     //   1. `opcode_handler_impls_pre.template.rs` — header + variant
     //      `SharedOpcodeHandler` impl (transcription).
     //   2. `majit_translate::handler_spec::emit_simple_trait_impls()` —
@@ -224,8 +238,8 @@ fn real_main() {
     let json = serde_json::to_string_pretty(&pipeline).unwrap();
     std::fs::write(format!("{out_dir}/jit_metadata.json"), &json).unwrap();
 
-    // Phase D-1 Step 1 (eval-loop automation plan): persist
-    // `pipeline.jitcodes` (RPython `all_jitcodes` from codewriter.py:89) as a
+    // Persist `pipeline.jitcodes` (RPython `all_jitcodes` from
+    // codewriter.py:89) as a
     // single bincode artifact. Runtime deserializes this once into the shared
     // MetaInterpStaticData jitcodes store — same single-store model as
     // RPython `warmspot.py:281-282` `self.metainterp_sd.jitcodes =
@@ -235,7 +249,7 @@ fn real_main() {
     let jitcodes_bin = bincode::serialize(&pipeline.jitcodes).unwrap();
     std::fs::write(format!("{out_dir}/opcode_jitcodes.bin"), &jitcodes_bin).unwrap();
 
-    // Phase D-1 Step 4: persist `pipeline.opcode_dispatch` (the arm table)
+    // Persist `pipeline.opcode_dispatch` (the arm table)
     // alongside the jitcodes so the runtime can map opcode → arm_id →
     // entry_jitcode_index → JitCode. This is the same `PipelineOpcodeArm`
     // shape already present in `jit_metadata.json`; bincode just avoids the
@@ -243,7 +257,7 @@ fn real_main() {
     let dispatch_bin = bincode::serialize(&pipeline.opcode_dispatch).unwrap();
     std::fs::write(format!("{out_dir}/opcode_dispatch.bin"), &dispatch_bin).unwrap();
 
-    // Phase D-2 prerequisite: persist the runtime opname → u8 table so
+    // Persist the runtime opname → u8 table so
     // `JitCode.code` (assembler-local mapping) decodes back to the
     // canonical `(opname, argcodes)` shape at runtime (shadow dispatch,
     // IR diffing).  RPython equivalent: the table handed to
@@ -338,6 +352,18 @@ fn real_main() {
     );
     println!("cargo::rerun-if-changed=src/virtualizable_spec.rs");
     println!("cargo::rerun-if-changed=src/call_spec.rs");
+    // The mir-frontend analysis derives `jit_trace_gen.rs` from
+    // the workspace LLBC artefacts — or the `PYRE_MIR_FRONTEND_LLBC`
+    // override — none of which are `.rs` sources covered above.  Track
+    // them so re-extracting the ullbc (scripts/extract-llbc.sh) or
+    // repointing the override invalidates the cached generated trace
+    // instead of silently reusing a stale one.  A `rerun-if-changed` on
+    // a not-yet-present path is harmless (Cargo reruns when it appears),
+    // so this is safe on a contributor tree without the artefacts.
+    println!("cargo::rerun-if-env-changed=PYRE_MIR_FRONTEND_LLBC");
+    for llbc in ["pyre-object.ullbc", "pyre-interpreter.ullbc"] {
+        println!("cargo::rerun-if-changed={repo_root}/build/llbc/{llbc}");
+    }
 }
 
 fn build_call_effect_overrides() -> Vec<majit_translate::CallEffectOverride> {
@@ -363,8 +389,8 @@ fn build_call_effect_overrides() -> Vec<majit_translate::CallEffectOverride> {
 }
 
 /// Collect a single `.rs` file by absolute path, mirroring
-/// `collect_rs_files`'s read-into-vecs convention.  Used by Phase G
-/// follow-up to thread `pyre-jit/src/eval.rs` (the portal canonical)
+/// `collect_rs_files`'s read-into-vecs convention.  Used to thread
+/// `pyre-jit/src/eval.rs` (the portal canonical)
 /// into the analysis without including the rest of pyre-jit's JIT
 /// infrastructure (codewriter, assembler, regalloc, ...).
 /// Crate-stripped module path for a source file at `path`.

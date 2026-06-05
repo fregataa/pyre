@@ -12,7 +12,7 @@ use majit_ir::descr::{DescrRef, EffectInfo, ExtraEffect, OopSpecIndex};
 use majit_ir::value::Type;
 use serde::{Deserialize, Serialize};
 
-use crate::front::ast::SemanticFunction;
+use crate::front::semantic::SemanticFunction;
 use crate::jitcode::{BhCallDescr, CallResultErasedKey};
 use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind, SpaceOperation};
 use crate::parse::CallPath;
@@ -738,7 +738,7 @@ pub struct CallControl {
     /// `Index(n)` placeholders.  Pyre cannot introspect a function
     /// pointer for argnames; populated by the walker through
     /// `mark_oopspec_argnames` whenever `#[oopspec(...)]` is paired
-    /// with a function signature (`front::ast::collect_jit_hints`
+    /// with a function signature (`front::syn_metadata::collect_jit_hints`
     /// emits a companion `"oopspec_argnames:..."` hint that
     /// `lib.rs:600` consumes alongside `"oopspec:..."`).
     ///
@@ -776,8 +776,7 @@ pub struct CallControl {
     /// the process-global `STRUCT_ORIGIN_REGISTRY` + `canonical_struct_name`
     /// (`majit-ir/src/descr.rs:148-225`); this carrier records the
     /// per-file module path so a future per-graph lexical resolver
-    /// (orthodox PyPy `getdesc` parity, see
-    /// [[orthodox-6item-2026-05-17]]) can consume it.
+    /// (orthodox PyPy `getdesc` parity) can consume it.
     pub parsed_module_paths: Vec<String>,
     /// Per-source-file `use` import map collected from
     /// `ParsedInterpreter.use_imports` (`parse.rs::collect_use_imports`).
@@ -785,11 +784,11 @@ pub struct CallControl {
     /// Mirrors PyPy bookkeeper's lexical/import-scope name resolution
     /// (`annrpython.Bookkeeper.getdesc` + `frame.f_globals` lookups);
     /// pyre's `qualify_type_name` does not yet consult this table,
-    /// awaiting the per-FunctionGraph use_imports carrier outlined in
-    /// [[orthodox-6item-2026-05-17]].  Populated here as the data
+    /// awaiting the per-FunctionGraph use_imports carrier.
+    /// Populated here as the data
     /// carrier so the future resolver lands without re-plumbing.
     pub use_imports: HashMap<(String, String), String>,
-    /// Z2.5 Path C metadata-only registration carrier — `(segments,
+    /// Metadata-only registration carrier — `(segments,
     /// Signature, return_lltype)` for every `unsafe fn` and unsafe
     /// impl-method discovered in the parsed source set.  These callees
     /// cannot lower their bodies (`build_flow.rs:215` rejects
@@ -805,24 +804,6 @@ pub struct CallControl {
         Vec<String>,
         crate::flowspace::argument::Signature,
         crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
-    )>,
-    /// Z2.5 Cat 2.1 metadata carrier — `(segments, ValueType,
-    /// Option<ConstValue>)` for every `pub static` / `static`
-    /// declaration discovered in the parsed source set.  Populated by
-    /// `lib.rs::analyze_pipeline_from_parsed` via
-    /// `flowspace::rust_source::register::extract_static_decls`.
-    /// Consumed by `front/ast.rs::Expr::Path` lowering (Slice 3)
-    /// to skip the body-`OpKind::Input` fallthrough for known
-    /// crate-level statics — the closure path for the SHOUTY_CASE
-    /// cross-block body Input Skip cluster.  Slice C: the `value`
-    /// component carries the literal-evaluated `ConstValue` when the
-    /// initializer is a Rust literal; `None` when the RHS is a host
-    /// call or otherwise unresolvable at extract time.  No consumer
-    /// yet on the codewriter side (Slice 2 plumbing only).
-    pub static_decls: Vec<(
-        Vec<String>,
-        crate::model::ValueType,
-        Option<crate::flowspace::model::ConstValue>,
     )>,
 }
 
@@ -1157,7 +1138,6 @@ impl CallControl {
             parsed_module_paths: Vec::new(),
             use_imports: HashMap::new(),
             unsafe_fn_stubs: Vec::new(),
-            static_decls: Vec::new(),
         }
     }
 
@@ -1390,8 +1370,8 @@ impl CallControl {
                 // init_array_descr` stamps `descr.tid` from
                 // `layoutbuilder.get_type_id(A)` — a dense sequential
                 // GC type id allocated by the GC layoutbuilder.  Pyre
-                // does not yet port the layoutbuilder analog (multi-
-                // session epic); analyzer-side `SimpleArrayDescr.type_id`
+                // does not yet port the layoutbuilder analog;
+                // analyzer-side `SimpleArrayDescr.type_id`
                 // stays at 0 (the `get_array_descr` cache-miss-mint
                 // default at `descr.rs:515`).  Runtime-registered
                 // `SimpleArrayDescr` carries a real GC tid stamped at
@@ -2688,8 +2668,8 @@ impl CallControl {
         // path: port the integer helpers as Rust-source bodies the
         // walker can lower into a graph, register the graph via
         // `register_function_graph(canonical_name)`, then the BFS
-        // seed arm below will push the impl path naturally.  Multi-
-        // session port: requires walker reach into majit-metainterp
+        // seed arm below will push the impl path naturally.  This
+        // requires walker reach into majit-metainterp
         // and a Rust analogue of `MixLevelHelperAnnotator.constfunc`.
         // `ll_math_sqrt` additionally needs a pyre-side raise
         // protocol (PyError emission from a residual C call) before
@@ -2807,6 +2787,7 @@ impl CallControl {
                         hints,
                         module_path: String::new(),
                         access_directly: false,
+                        trait_root: None,
                     };
                     if policy.look_inside_graph(&func) {
                         self.candidate_graphs.insert(callee_path.clone());
@@ -3637,7 +3618,7 @@ impl CallControl {
             }
         }
 
-        // TODO(parity): retire when §M3 annotator wiring publishes
+        // TODO(parity): retire when annotator wiring publishes
         // classdef hints before BFS runs.
         // TODO: receiver-agnostic "unique concrete impl" fallback.
         // Upstream `call.py:175-187
@@ -3652,8 +3633,8 @@ impl CallControl {
         // annotator-derived classdef hint and no receiver-name match,
         // collapsing to the unique concrete impl is the only way to
         // include the impl's body in `candidate_graphs`.  Retired once
-        // the annotator-monomorphization epic publishes classdef hints
-        // before BFS runs (plan §M3); the
+        // the annotator publishes classdef hints
+        // before BFS runs; the
         // `find_all_graphs_closure_reaches_handler_graphs_from_dispatch_portal`
         // and `all_jitcodes_registry_contains_inherent_impl_methods`
         // oracles pin the BFS coverage this branch enables.
@@ -3983,7 +3964,7 @@ impl CallControl {
     /// match the function's actual parameter declaration order.
     ///
     /// Populated by the walker (`lib.rs:600`) whenever
-    /// `front::ast::collect_jit_hints` emits the
+    /// `front::syn_metadata::collect_jit_hints` emits the
     /// `"oopspec_argnames:..."` companion hint — i.e. when a function
     /// carries `#[oopspec(...)]` AND its signature is available at
     /// hint-collection time.  Programmatic `mark_oopspec` callers
@@ -4004,20 +3985,18 @@ impl CallControl {
 
     // ── Graph-based analyzers (call.py:282-303) ─────────────────────
     //
-    // PRE-EXISTING-ADAPTATION. The five `analyze_*` methods below walk
+    // The five `analyze_*` methods below walk
     // `crate::model::FunctionGraph` (the flat codewriter graph), inlining
     // the generic `GraphAnalyzer.analyze_direct_call` traversal
     // (`graphanalyze.py:139-177`) into each per-analysis body with a
-    // bottom-on-cycle `seen` guard. The orthodox versions are already
+    // bottom-on-cycle `seen` guard. The orthodox versions are
     // ported over the flowspace graph model: `RaiseAnalyzer`
     // (`backendopt/canraise.rs`), `CollectAnalyzer`
     // (`backendopt/collectanalyze.rs`), and the shared `GraphAnalyzer`
     // framework (`backendopt/graphanalyze.rs`, with SCC-merge cycle
     // handling via `DependencyTracker`/`UnionFind`). These duplicates
     // exist only because `CallControl` operates on the flat graph, not on
-    // flowspace graphs. Convergence path: once `CallControl`'s graphs are
-    // flowspace graphs (the graph-model unification), delete these methods
-    // and consume the `backendopt/` analyzers directly. Do NOT extract a
+    // flowspace graphs. Do NOT extract a
     // shared skeleton here — that would add a third analysis framework
     // duplicating `graphanalyze.rs` over the wrong graph model.
 
@@ -4590,7 +4569,7 @@ impl CallControl {
         // single funcobj so the flags are always false — they are enforced
         // family-wide below.
         //
-        // Section-4 adaptation: call.py:252-257 also reads
+        // call.py:252-257 also reads
         // `_call_aroundstate_target_` here and packages it into the
         // EffectInfo's `call_release_gil_target`.  That direct-call
         // propagation is intentionally omitted from this translated-graph
@@ -4698,20 +4677,13 @@ impl CallControl {
                             // comparison happens in the rtyper-derived
                             // shape upstream uses (call.py:222 `FUNC.RESULT`).
                             let effective_declared =
-                                crate::front::ast::transparent_result_ok_type(declared)
+                                crate::front::syn_metadata::transparent_result_ok_type(declared)
                                     .map(|s| s.to_string())
                                     .unwrap_or_else(|| declared.clone());
                             let expected_result =
                                 return_type_string_to_value_type(Some(&effective_declared));
                             // RPython call.py:220 hard-fails when
-                            // `RESULT != FUNC.RESULT`.  The arm-graph
-                            // entry threads `ProgramMetadata.fn_return_types`
-                            // through to
-                            // `lower_expr_into_graph_with_signature`
-                            // (parse.rs:808), so every callsite's
-                            // expected result type is resolved from the
-                            // whole-program return-type map before it
-                            // reaches `getcalldescr`.
+                            // `RESULT != FUNC.RESULT`.
                             if result_type != expected_result {
                                 panic!(
                                     "in operation calling {target}: calling a \
@@ -4749,7 +4721,7 @@ impl CallControl {
                     // return_type (RPython `funcptr.TO.RESULT`).
                     let declared = witness_graph.return_type.as_ref();
                     let effective_declared = declared.map(|declared| {
-                        crate::front::ast::transparent_result_ok_type(declared)
+                        crate::front::syn_metadata::transparent_result_ok_type(declared)
                             .map(|s| s.to_string())
                             .unwrap_or_else(|| declared.clone())
                     });
@@ -5781,12 +5753,13 @@ fn collect_readwrite_effects(
                     // False)` (`descr.py:359`) so headerless array-of-structs
                     // shapes hash to a different bitstring slot than
                     // length-prefixed shapes of the same item type.
-                    let len_offset =
-                        if crate::front::ast::nolength_from_array_type_id(resolved_id.as_deref()) {
-                            None
-                        } else {
-                            Some(0)
-                        };
+                    let len_offset = if crate::front::syn_metadata::nolength_from_array_type_id(
+                        resolved_id.as_deref(),
+                    ) {
+                        None
+                    } else {
+                        Some(0)
+                    };
                     let arr_idx = descr_indices.array_index(
                         value_type_discriminant(&crate::model::ValueType::Ref(None)),
                         &resolved_id,
@@ -5851,12 +5824,13 @@ fn collect_readwrite_effects(
                     // (`descr.py:359`) so headerless array-of-structs shapes
                     // do not alias length-prefixed ones at the EffectInfo
                     // bitset.
-                    let len_offset =
-                        if crate::front::ast::nolength_from_array_type_id(resolved_id.as_deref()) {
-                            None
-                        } else {
-                            Some(0)
-                        };
+                    let len_offset = if crate::front::syn_metadata::nolength_from_array_type_id(
+                        resolved_id.as_deref(),
+                    ) {
+                        None
+                    } else {
+                        Some(0)
+                    };
                     let arr_idx = descr_indices.array_index(
                         value_type_discriminant(&crate::model::ValueType::Ref(None)),
                         &resolved_id,
@@ -7096,8 +7070,7 @@ mod tests {
         // TODO: receiver-agnostic unique-impl fallback in
         // `resolve_method` enables BFS to monomorphise
         // generic-receiver call sites at trait dispatch.  Retired
-        // when the annotator publishes classdef hints before BFS
-        // (plan §M3).
+        // when the annotator publishes classdef hints before BFS.
         assert!(
             cc.resolve_method("load_local_value", Some("handler"), None)
                 .is_some()
@@ -7334,149 +7307,6 @@ mod tests {
         assert_eq!(
             descriptor.extra_info.extraeffect,
             ExtraEffect::ElidableCanRaise
-        );
-    }
-
-    /// End-to-end consumer-side parity for `#[elidable_promote]`.
-    ///
-    /// `rlib/jit.py:184-201 elidable_promote.decorator(func)` installs
-    /// two callables on module import: the closure-captured original
-    /// `func` (which receives `_elidable_function_ = True` via
-    /// `elidable(func)` at jit.py:185) and the `exec`-built wrapper
-    /// `result` (which carries no flag, per jit.py:198-201).
-    /// `jit_codewriter/call.py:247 elidable = getattr(func,
-    /// "_elidable_function_", False)` therefore observes True for the
-    /// orig path and False for the wrapper path, and `getcalldescr`
-    /// classifies them with distinct `extraeffect` values.
-    ///
-    /// Pyre's pipeline:
-    ///
-    ///   1. `front/ast.rs::build_graphs_from_items` synthesizes
-    ///      (`_orig_<NAME>_unlikely_name`, wrapper) — Slice B.
-    ///   2. `collect_jit_hints` no longer maps `elidable_promote` to
-    ///      `"elidable"` — Slice C — so only the synthesized orig
-    ///      receives the binary flag.
-    ///   3. `lib.rs:573-622` walks `program.functions` and calls
-    ///      `mark_elidable` per `"elidable"` hint, stamping the
-    ///      `"elidable"` token onto the registered graph's `graph.hints`.
-    ///   4. `getcalldescr` reads `is_elidable(target)` and produces
-    ///      `ElidableCanRaise` / `ElidableCannotRaise` for the orig
-    ///      callsite; the wrapper callsite stays `CanRaise` /
-    ///      `CannotRaise` per the raise analyzer.
-    ///
-    /// This test exercises that full chain on a single
-    /// `#[elidable_promote(promote_args = "all")]` source: the orig's
-    /// direct_call resolves to `ElidableCannotRaise` (the
-    /// synthesizer-produced body cannot raise — its only op is
-    /// `x + y` over locals); the wrapper's direct_call resolves to
-    /// `CannotRaise` (no `_elidable_function_` flag, no raise).
-    #[test]
-    fn elidable_promote_endtoend_marks_orig_only() {
-        // jit.py:180-201 source — same shape as the synthesizer test
-        // at front/ast.rs.
-        let parsed = crate::parse::parse_source(
-            r#"
-            #[elidable_promote(promote_args = "all")]
-            pub fn foo(x: i64, y: i64) -> i64 {
-                x + y
-            }
-        "#,
-        );
-        let program =
-            crate::front::ast::build_semantic_program(&parsed).expect("source must lower");
-        assert_eq!(
-            program.functions.len(),
-            2,
-            "expected synthesized (orig, wrapper) pair, got names {:?}",
-            program
-                .functions
-                .iter()
-                .map(|sf| sf.name.as_str())
-                .collect::<Vec<_>>()
-        );
-
-        // Mirror `majit-translate::lib.rs:573-622`: walk the
-        // synthesized functions' hints onto CallControl exactly the
-        // way production wires them.
-        let mut cc = CallControl::new();
-        for func in &program.functions {
-            let segments: Vec<&str> = func.name.split("::").collect();
-            let path = CallPath::from_segments(segments.iter().copied());
-            cc.register_function_graph(path.clone(), func.graph.clone().with_return_type("i64"));
-            for hint in &func.hints {
-                if hint == "elidable" {
-                    cc.mark_elidable(path.clone());
-                }
-            }
-        }
-        cc.find_all_graphs_for_tests();
-
-        // jit.py:185 `elidable(func)` parity — the orig callable
-        // carries the binary flag.
-        let orig_target = CallTarget::function_path(["_orig_foo_unlikely_name"]);
-        assert!(
-            cc.is_elidable(&orig_target),
-            "_orig_foo_unlikely_name must be elidable (RPython \
-             jit.py:185 elidable(func) sets _elidable_function_)"
-        );
-
-        // jit.py:198-201 wrapper `result` — no `_elidable_function_`,
-        // so `is_elidable` must report False.
-        let wrapper_target = CallTarget::function_path(["foo"]);
-        assert!(
-            !cc.is_elidable(&wrapper_target),
-            "wrapper `foo` must NOT be elidable (RPython jit.py:198-201 \
-             returns `result` without _elidable_function_)"
-        );
-
-        // jit.py:292-299 `getcalldescr` over the orig direct-call:
-        // `elidable=True, _canraise(op)=False` → ElidableCannotRaise.
-        let mut cache = AnalysisCache::default();
-        let orig_descr = cc.getcalldescr(
-            &direct_call_op(orig_target.clone()),
-            vec![Type::Int, Type::Int],
-            Type::Int,
-            OopSpecIndex::None,
-            None,
-            &mut cache,
-            None,
-        );
-        assert_eq!(
-            orig_descr.extra_info.extraeffect,
-            ExtraEffect::ElidableCannotRaise,
-            "direct_call(_orig_foo_unlikely_name) must classify as \
-             ElidableCannotRaise (call.py:299 else branch)"
-        );
-
-        // jit.py:303 `getcalldescr` over the wrapper direct-call:
-        // `elidable=False` puts the result in the
-        // {CanRaise, CannotRaise} band, never the elidable band.
-        // The exact CanRaise/CannotRaise pick depends on the raise
-        // analyzer's view of the wrapper body, which still contains
-        // unresolved `hint_promote` Call ops at this stage (jtransform
-        // rewrites those to non-raising `GuardValue` only later — see
-        // Slice A).  Asserting the elidable-band exclusion is the
-        // narrow consumer-side parity claim that survives across the
-        // pre-/post-jtransform boundary.
-        let wrapper_descr = cc.getcalldescr(
-            &direct_call_op(wrapper_target.clone()),
-            vec![Type::Int, Type::Int],
-            Type::Int,
-            OopSpecIndex::None,
-            None,
-            &mut cache,
-            None,
-        );
-        assert!(
-            !matches!(
-                wrapper_descr.extra_info.extraeffect,
-                ExtraEffect::ElidableCanRaise
-                    | ExtraEffect::ElidableCannotRaise
-                    | ExtraEffect::ElidableOrMemoryError,
-            ),
-            "direct_call(foo) must NOT classify into the elidable \
-             band; got {:?}",
-            wrapper_descr.extra_info.extraeffect
         );
     }
 
@@ -7785,7 +7615,7 @@ mod tests {
         assert_eq!(r2, CanRaise::Yes);
     }
 
-    /// Characterization probe (graph-model unification, Slice 1.5):
+    /// Characterization probe:
     /// feed ONE flat graph to both effect-analysis paths and assert they
     /// agree — the flat `CallControl._canraise` vs the orthodox
     /// `backendopt::canraise::RaiseAnalyzer` over the adapter-produced
@@ -7821,7 +7651,7 @@ mod tests {
         // (model.py:668-688) would reject both: every Link.args value must
         // be defined in the predecessor block (only last_exception /
         // last_exc_value may be defined only_in_link). Real front-end
-        // graphs ARE well-formed and DO convert — production cutover runs
+        // graphs ARE well-formed and DO convert — production runs
         // function_graph_to_flowspace on every graph and check.py is green.
         // So these `.is_err()` assertions pin that the adapter correctly
         // enforces SSA-definedness, not an exception-edge limitation; the
@@ -7898,14 +7728,13 @@ mod tests {
         assert!(!cc.analyze_can_raise_impl(&path, &mut seen, true));
     }
 
-    /// Graph-model unification (Slice 1, test-only): prove the orthodox
+    /// Graph-model unification (test-only): prove the orthodox
     /// flowspace `RaiseAnalyzer` (backendopt/canraise.rs) reproduces the
     /// SAME tri-state verdict as the flat `CallControl::_canraise` on
     /// well-formed lltype-vocabulary graphs. This locks the equivalence
     /// contract that is the precondition for deleting
     /// `analyze_can_raise_impl` once the flowspace analyzers are wired
-    /// into `getcalldescr` (the whole-program flowspace-registration
-    /// keystone + consumer slice).
+    /// into `getcalldescr`.
     ///
     /// Tri-state coverage, parametrized by startblock op + CFG shape:
     /// - `int_add`, no exception edge → `No` (the op cannot raise and the
@@ -8483,7 +8312,7 @@ mod tests {
         assert_eq!(cc.jitdrivers_sd[0].index_of_virtualizable, 0);
     }
 
-    // ── RPython indirect_call family tests — plan §Tests ────────────
+    // ── RPython indirect_call family tests ──────────────────────────
 
     /// `guess_call_kind` for `OpKind::IndirectCall`:
     ///   ≥1 candidate impl is a regular candidate → `Regular`
