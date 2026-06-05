@@ -8,7 +8,8 @@ use majit_backend::Backend;
 use majit_ir::{DescrRef, OpCode, OpRef, Type, Value};
 use majit_metainterp::virtualizable::VirtualizableInfo;
 use majit_metainterp::{
-    JitDriverStaticData, JitState, ResidualVirtualizableSync, TraceAction, TraceCtx,
+    BridgeInlineCarrier, JitDriverStaticData, JitState, ReconstructRecipe,
+    ResidualVirtualizableSync, TraceAction, TraceCtx,
 };
 
 use pyre_interpreter::bytecode::{CodeObject, ComparisonOperator, Instruction};
@@ -1397,8 +1398,6 @@ impl ConcreteValue {
         }
     }
 }
-
-use pyre_interpreter::DictStorage;
 
 use crate::descr::{
     PY_OBJECT_ARRAY_GC_TYPE_ID, float_floatval_descr, int_intval_descr, make_array_descr_with_type,
@@ -4285,6 +4284,17 @@ fn reconstruct_inline_recipe(
     if !code_ref.freevars.is_empty() || pyre_interpreter::pyframe::ncells(code_ref) != 0 {
         return None;
     }
+    // pyframe.py:128-132 get_w_globals(): the reconstructed callee frame's
+    // globals come from its own pycode (`assemble_bridge_inline_pending`
+    // resolves them via `w_code_get_w_globals`). If the callee code never ran
+    // under known globals (`w_globals` null), there is no namespace to restore,
+    // so abort to the single-frame bridge — the forward inline path declines
+    // the same way.
+    if unsafe { pyre_interpreter::w_code_get_w_globals(w_code as pyre_object::PyObjectRef) }
+        .is_null()
+    {
+        return None;
+    }
     let nlocals = code_ref.varnames.len();
 
     let reg_indices = frame_liveness_reg_indices_by_bank_at(frame.jitcode_index, frame.pc);
@@ -6784,10 +6794,7 @@ impl JitState for PyreJitState {
                 }
             }
             if ok && !recipes.is_empty() {
-                crate::state::set_bridge_inline_carrier(crate::state::BridgeInlineCarrier {
-                    root_pc,
-                    recipes,
-                });
+                ctx.set_bridge_inline_carrier(BridgeInlineCarrier { root_pc, recipes });
             }
         }
     }
@@ -10400,87 +10407,6 @@ pub struct PendingInlineFrame {
     pub caller_result_type: Option<Type>,
 }
 
-/// A decoded-but-not-yet-built description of one inlined
-/// callee frame (`resume_data.frames[i]`, `i >= 1`) for a multi-frame
-/// bridge. `setup_bridge_sym` decodes the resume stream into this recipe
-/// while `resume_data` / the rd_virtuals cache are in scope; `trace_bytecode`
-/// then assembles each recipe into a `PyFrame` + `PyreSym` and pushes it via
-/// `push_inline_frame` — RIGHT before `interpret()`, with the root concrete
-/// frame's globals/EC available and immediate GC-rooting (`rebuild_from_
-/// resumedata` resume.py:1042-1057 rebuilds frames and immediately interprets;
-/// pyre defers the build to the drain so the reconstructed locals are never
-/// held unrooted across an arbitrary collection — the #1 SIGSEGV subsystem).
-///
-/// The bank vectors are indexed by pyre's semantic register index
-/// (`frame_liveness_reg_indices_by_bank_at`): pyre traces Python bytecode, so
-/// these are `locals_cells_stack_w` positions, NOT RPython regalloc colors,
-/// and align with `write_stack_slot`/LOAD_FAST's `nlocals + stack_idx`.
-/// `concrete_r` is parallel to `registers_r` and seeds the assembled frame's
-/// `locals_cells_stack_w` (Int/Float boxed at assembly time per
-/// `value_to_vable_array_item_bits` eval.rs:5829).
-pub struct ReconstructRecipe {
-    pub w_code: *const (),
-    pub jitcode_index: i32,
-    pub pc: usize,
-    pub nlocals: usize,
-    pub valuestackdepth: usize,
-    pub registers_i: Vec<OpRef>,
-    pub registers_r: Vec<OpRef>,
-    pub registers_f: Vec<OpRef>,
-    pub concrete_r: Vec<majit_ir::Value>,
-    pub nargs: usize,
-}
-
-/// The decoded inline-callee recipes for one multi-frame
-/// bridge, plus the outermost (`frames[0]`) resume pc. `trace_bytecode`
-/// builds the caller-visible root frame at `root_pc` and pushes each
-/// recipe on top (innermost last), so the framestack matches the inline
-/// depth the guard fired at (`rebuild_from_resumedata` resume.py:1049-1056).
-pub struct BridgeInlineCarrier {
-    /// `resume_data.frames[0].pc` — where the outermost (portal/root) frame
-    /// resumes once the reconstructed callees return. The bridge's returned
-    /// resume pc (`decode_and_restore_guard_failure`) is the INNERMOST frame's
-    /// pc; the root must instead resume at its own `frames[0].pc`, so this is
-    /// threaded separately rather than derived from the trace start pc.
-    pub root_pc: usize,
-    /// `resume_data.frames[1..]`, OUTERMOST-FIRST. The portal (`frames[0]`)
-    /// is NOT here — it is the caller-visible root `sym`.
-    pub recipes: Vec<ReconstructRecipe>,
-}
-
-thread_local! {
-    /// The multi-frame bridge carrier decoded by
-    /// `setup_bridge_sym` and drained once by `trace_bytecode`, which
-    /// assembles+pushes each recipe through `push_inline_frame`. `None` for
-    /// primary traces and single-frame bridges.
-    ///
-    /// pyre-only side channel with no upstream counterpart (RPython's
-    /// rebuild and `_interpret` are methods on one `MetaInterp`). Carrying
-    /// the lightweight `ReconstructRecipe` (no `PyreSym`/`PyFrame`)
-    /// thread-locally is safe against re-entrancy: each bridge attempt runs
-    /// `setup_bridge_sym` (`call_jit.rs` start_bridge_tracing) then
-    /// `trace_bytecode` sequentially on one thread before any tracing begins.
-    /// ORDER INVARIANT: recipes stay OUTERMOST-FIRST and carry per-frame
-    /// greenkey inputs, because `push_inline_frame` re-runs
-    /// `enter_inline_frame` + `push_inline_trace_position` +
-    /// `portal_call_depth += 1` per frame (metainterp.rs:421-475).
-    static BRIDGE_INLINE_CARRIER: RefCell<Option<BridgeInlineCarrier>> =
-        const { RefCell::new(None) };
-}
-
-/// Stash the decoded inline-callee carrier for the bridge currently being
-/// set up. Overwrites any prior unconsumed value.
-pub(crate) fn set_bridge_inline_carrier(carrier: BridgeInlineCarrier) {
-    BRIDGE_INLINE_CARRIER.with(|c| *c.borrow_mut() = Some(carrier));
-}
-
-/// Take the decoded inline-callee carrier for the bridge about to be
-/// traced, leaving the carrier empty. Returns `None` for single-frame
-/// bridges and primary traces.
-pub(crate) fn take_bridge_inline_carrier() -> Option<BridgeInlineCarrier> {
-    BRIDGE_INLINE_CARRIER.with(|c| c.borrow_mut().take())
-}
-
 /// Reify one Ref-bank recipe slot as the boxed `W_Root` pointer that
 /// `locals_cells_stack_w` (a W_Root array, virtualizable.py:86-98) must
 /// hold. `reconstruct_inline_recipe` gates int/float banks out of multi-
@@ -10508,13 +10434,12 @@ fn recipe_slot_to_pyobj(v: majit_ir::Value) -> PyObjectRef {
 /// callee-frame helper / GUARD_NO_EXCEPTION belong to a LIVE caller making a
 /// call; a reconstructed suspended frame is simply pushed.
 ///
-/// `globals` / `w_globals_obj` / `execution_context` come from the bridge's
-/// root concrete frame. The resume stream does not carry per-inline-frame
-/// globals (inline frames are not virtualizable owners, so `vable_w_globals`
-/// is only encoded for `frames[0]`), but every multi-frame bridge resume pc
-/// is a CALL return point, so the reconstructed callee never re-runs
-/// LOAD_GLOBAL before returning, and same-module callees (the common case,
-/// e.g. `function_calls` main/mix/add3) share the root's module dict.
+/// The callee frame's globals come from its OWN pycode (`recipe.w_code`),
+/// matching `pyframe.py:128-132 get_w_globals()` where a frame's globals
+/// derive from its promoted pycode rather than the caller; a cross-module
+/// inlined callee's LOAD_GLOBAL then resolves against the callee module's
+/// namespace. `execution_context` is the per-thread singleton and comes from
+/// the bridge's root concrete frame.
 ///
 /// `parent_frames` is the OUTER chain (immediate parent first) the drain
 /// builds from the framestack; `push_inline_frame` stamps
@@ -10522,8 +10447,6 @@ fn recipe_slot_to_pyobj(v: majit_ir::Value) -> PyObjectRef {
 pub(crate) fn assemble_bridge_inline_pending(
     ctx: &mut TraceCtx,
     recipe: &ReconstructRecipe,
-    globals: *mut pyre_interpreter::DictStorage,
-    w_globals_obj: PyObjectRef,
     execution_context: *const pyre_interpreter::PyExecutionContext,
     parent_frames: Vec<ResumeFrameState>,
 ) -> PendingInlineFrame {
@@ -10531,6 +10454,20 @@ pub(crate) fn assemble_bridge_inline_pending(
 
     let nlocals = recipe.nlocals;
     let valuestackdepth = recipe.valuestackdepth;
+
+    // pyframe.py:128-132 get_w_globals(): a frame's globals come from its OWN
+    // pycode (`jit.promote(self.pycode).w_globals`), not the caller. Resolve
+    // the callee's globals from `recipe.w_code` — the same `pycode.w_globals`
+    // the forward inline path reads via `function_get_globals` — so a
+    // cross-module inlined callee's LOAD_GLOBAL sees the callee module's
+    // namespace. `reconstruct_inline_recipe` aborts the multi-frame path when
+    // the callee code has no resolved globals, so `globals` is non-null here.
+    let globals = unsafe { pyre_interpreter::w_code_get_w_globals(recipe.w_code as PyObjectRef) };
+    let w_globals_obj = if globals.is_null() {
+        pyre_object::PY_NULL
+    } else {
+        pyre_interpreter::baseobjspace::dict_storage_to_dict(globals)
+    };
 
     // resume.py:1042-1057 newframe + reload: build a fresh concrete frame for
     // `recipe.w_code` and seed `locals_cells_stack_w[0..valuestackdepth]` from

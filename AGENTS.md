@@ -1,5 +1,46 @@
 # AGENTS.md
 
+## How pyre's JIT is built: meta-tracing by source translation
+
+pyre is structured like PyPy. `pyre-interpreter` is the Rust interpreter (the
+analog of PyPy's RPython interpreter). **The JIT is not hand-written** —
+`majit-translate` reads the interpreter's Rust source and *generates* it:
+`front/ast.rs` (parse) → `flowspace/` (flow-graph build, the
+`flowcontext.py`/`framestate.py` analog) → `annotator/` (`annrpython.py` type
+inference) → `rtyper/` (low-level lowering) → `jit_codewriter/`
+(`jtransform.py`/`codewriter.py`, emits JitCode). This is the same pipeline
+RPython's translator + `jtransform` run over PyPy's interpreter.
+
+**Consequence — "Rust can't be meta-traced" is never a valid excuse for a
+deviation.** Generating the JIT from the interpreter source *is* meta-tracing,
+by the same principle: whatever semantics the interpreter source expresses is
+what the generated JIT must preserve. A JIT that diverges from the
+interpreter's behavior has a *generation defect to fix*, not an inherent
+limitation of "the JIT is Rust, not Python." Do not justify a mismatch by
+appeal to the implementation language.
+
+### Frame identity must be preserved per frame
+
+PyPy keeps one frame object per inlined Python call — `MIFrame` while tracing,
+`BlackholeInterpreter` on resume — each carrying its own
+`jitcode → pycode → w_globals → locals`. `LOAD_GLOBAL` reads
+`self.get_w_globals()` off the *live* frame (`pyframe.py:128-132`:
+`jit.promote(self.pycode).w_globals`); guard-failure resume rebuilds one frame
+per encoded jitcode header (`resume.py:1042-1057`). Caller/callee namespace
+confusion is therefore *impossible* — there is no shared frame slot.
+
+The frame is the interpreter loop's single **red** input; `pycode` is the
+**green**. The generated per-code jitcode must thread that red frame for
+**every** frame, including inlined non-portal callees. Collapsing inlined
+callees onto a single shared anchor (one `portal_frame_reg`, or a single
+bridge-resume root frame) drops the callee's own pycode/globals/locals and
+makes a cross-module `LOAD_GLOBAL` resolve against the *caller's* globals.
+This whole class of bug (the pycode-`names` miscompile, the LOAD_GLOBAL
+namespace mismatch, bridge-resume inline-frame globals, vable-resident root
+locals) is one root cause — a *frame-identity collapse*. Fix it by restoring
+the per-frame red frame (converging on RPython's 1-red-arg frame shape), never
+by baking a single anchor's value as a constant.
+
 ## Data structure parity with RPython/PyPy
 
 **Do not casually introduce `HashMap` (or any Rust-native collection) when porting RPython/PyPy code.**

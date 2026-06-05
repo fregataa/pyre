@@ -95,8 +95,10 @@ pub use pyjitpl::{
     trace_jitcode_with_args, trace_jitcode_with_args_and_runtime,
 };
 pub use quasiimmut::QuasiImmut;
+pub use trace_ctx::BridgeInlineCarrier;
 pub use trace_ctx::GreenBox;
 pub use trace_ctx::MergePoint;
+pub use trace_ctx::ReconstructRecipe;
 pub use trace_ctx::TraceCtx;
 
 /// Compute green key from code pointer and PC.

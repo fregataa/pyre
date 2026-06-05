@@ -40,23 +40,14 @@ pub fn trace_bytecode(
     // callee — NOT the root. The callees are reconstructed + pushed below
     // (innermost last) so `interpret()` resumes at the deepest frame; the root
     // resumes at `root_pc` once they return (`rebuild_from_resumedata`
-    // resume.py:1049-1056). Snapshot the root frame's globals/EC now, before
-    // `concrete_frame` is moved into the root `MetaInterpFrame`.
-    let carrier = crate::state::take_bridge_inline_carrier();
-    let (start_pc, root_globals, root_w_globals_obj, root_ec) = if let Some(ref c) = carrier {
-        (
-            c.root_pc,
-            concrete_frame.get_w_globals(),
-            concrete_frame.w_globals_obj,
-            concrete_frame.execution_context,
-        )
+    // resume.py:1049-1056). Snapshot the root frame's EC now, before
+    // `concrete_frame` is moved into the root `MetaInterpFrame`; each callee's
+    // globals come from its OWN pycode (`assemble_bridge_inline_pending`).
+    let carrier = ctx.take_bridge_inline_carrier();
+    let (start_pc, root_ec) = if let Some(ref c) = carrier {
+        (c.root_pc, concrete_frame.execution_context)
     } else {
-        (
-            start_pc,
-            std::ptr::null_mut(),
-            pyre_object::PY_NULL,
-            std::ptr::null(),
-        )
+        (start_pc, std::ptr::null())
     };
     // RPython MetaInterp._interpret() parity: root frame owns a concrete
     // PyFrame snapshot. MetaInterp drives both symbolic tracing AND
@@ -150,14 +141,8 @@ pub fn trace_bytecode(
                 pending_result_type: None,
             }];
             parent_frames.extend(parent_parents);
-            let pending = crate::state::assemble_bridge_inline_pending(
-                ctx,
-                recipe,
-                root_globals,
-                root_w_globals_obj,
-                root_ec,
-                parent_frames,
-            );
+            let pending =
+                crate::state::assemble_bridge_inline_pending(ctx, recipe, root_ec, parent_frames);
             metainterp.push_inline_frame(ctx, pending, result_idx);
             // push_inline_frame hardcodes MetaInterpFrame.pc = 0; retarget to
             // the reconstructed resume pc. The concrete frame's last_instr was

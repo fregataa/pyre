@@ -3835,10 +3835,33 @@ mod tests {
             ctx.make_constant(opref, value);
         }
         let mut pass = OptRewrite::new();
-        let op_rc = std::rc::Rc::new(ops[target].clone());
+        let mut op = ops[target].clone();
+        resolve_op_args_in_ctx(&mut op, &mut ctx);
+        let op_rc = std::rc::Rc::new(op.clone());
         ctx.bind_input_resops(std::slice::from_ref(&op_rc));
-        let result = pass.propagate_forward(&ops[target], &op_rc, &mut ctx);
+        let result = pass.propagate_forward(&op, &op_rc, &mut ctx);
         (result, ctx)
+    }
+
+    fn resolve_op_args_in_ctx(op: &mut Op, ctx: &mut OptContext) {
+        // optimizer.py:651-652 setarg loop parity. Direct unit tests that
+        // bypass Optimizer::propagate_from_pass_range still need the same
+        // canonical BoxRef args that production passes receive.
+        for i in 0..op.num_args() {
+            let arg = op.arg(i);
+            let resolved = match ctx.get_box_replacement_box(arg.to_opref()) {
+                Some(b) => b,
+                None => {
+                    let argref = arg.to_opref();
+                    if argref.is_none() {
+                        arg.clone()
+                    } else {
+                        ctx.materialize_box_at(argref).get_box_replacement(false)
+                    }
+                }
+            };
+            op.setarg(i, resolved);
+        }
     }
 
     fn assert_remove(result: &OptimizationResult) {
@@ -3870,10 +3893,7 @@ mod tests {
         for op in ops.iter() {
             // Resolve forwarded arguments
             let mut resolved = op.clone();
-            // optimizer.py:651-652 setarg loop parity.
-            for i in 0..resolved.num_args() {
-                resolved.setarg(i, ctx.get_box_replacement(resolved.arg(i).to_opref()));
-            }
+            resolve_op_args_in_ctx(&mut resolved, &mut ctx);
 
             let __pf_rc = std::rc::Rc::new(resolved.clone());
             ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
@@ -4496,9 +4516,11 @@ mod tests {
         ctx.emit(ops[1].clone());
 
         // Process op2: should detect double negation
-        let __pf_rc = std::rc::Rc::new(ops[2].clone());
+        let mut resolved2 = ops[2].clone();
+        resolve_op_args_in_ctx(&mut resolved2, &mut ctx);
+        let __pf_rc = std::rc::Rc::new(resolved2.clone());
         ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
-        let result2 = pass.propagate_forward(&ops[2], &__pf_rc, &mut ctx);
+        let result2 = pass.propagate_forward(&resolved2, &__pf_rc, &mut ctx);
         assert!(matches!(result2, OptimizationResult::Remove));
         assert_eq!(
             ctx.get_box_replacement(OpRef::float_op(2)).to_opref(),
@@ -4761,9 +4783,11 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         // Process CondCallN -> removed
-        let __pf_rc = std::rc::Rc::new(ops[2].clone());
+        let mut resolved2 = ops[2].clone();
+        resolve_op_args_in_ctx(&mut resolved2, &mut ctx);
+        let __pf_rc = std::rc::Rc::new(resolved2.clone());
         ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
-        let result2 = pass.propagate_forward(&ops[2], &__pf_rc, &mut ctx);
+        let result2 = pass.propagate_forward(&resolved2, &__pf_rc, &mut ctx);
         assert!(matches!(result2, OptimizationResult::Remove));
 
         // Process GuardNoException -> should also be removed

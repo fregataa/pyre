@@ -416,6 +416,65 @@ pub struct TraceCtx {
     /// aliased OpRefs share `getref_base()` — the RPython shape, which
     /// reads `box.getref_base()` off the Box at every use.
     pub(crate) virtualref_boxes: Vec<(OpRef, usize)>,
+
+    /// Task #64 bug-2: the decoded inline-callee recipes for the bridge
+    /// currently being set up, stashed by `setup_bridge_sym` and drained
+    /// once by `trace_bytecode` right before `interpret()`. `None` for
+    /// primary traces and single-frame bridges.
+    ///
+    /// Lives on `TraceCtx` (the per-trace MetaInterp-analog) rather than a
+    /// thread-local: a fresh `TraceCtx` is built per bridge and dropped on
+    /// every abort path (`abort_trace_live`), so the carrier is reborn
+    /// `None` for each bridge exactly as RPython resets `self.framestack =
+    /// []` before `rebuild_from_resumedata` (pyjitpl.py:3427). This makes a
+    /// stale carrier leaking across bridges structurally impossible.
+    pub(crate) bridge_inline_carrier: Option<BridgeInlineCarrier>,
+}
+
+/// Task #64 bug-2: a decoded-but-not-yet-built description of one inlined
+/// callee frame (`resume_data.frames[i]`, `i >= 1`) for a multi-frame
+/// bridge. `setup_bridge_sym` decodes the resume stream into this recipe
+/// while the resume data / rd_virtuals cache are in scope; `trace_bytecode`
+/// then assembles each recipe into a `PyFrame` + `PyreSym` and pushes it via
+/// `push_inline_frame` — RIGHT before `interpret()`, with the root concrete
+/// frame's EC available and immediate GC-rooting (`rebuild_from_resumedata`
+/// resume.py:1042-1057 rebuilds frames and immediately interprets; pyre
+/// defers the build to the drain so the reconstructed locals are never held
+/// unrooted across an arbitrary collection — the #1 SIGSEGV subsystem).
+///
+/// The bank vectors are indexed by pyre's semantic register index: pyre
+/// traces Python bytecode, so these are `locals_cells_stack_w` positions,
+/// NOT RPython regalloc colors, and align with LOAD_FAST's `nlocals +
+/// stack_idx`. `concrete_r` is parallel to `registers_r` and seeds the
+/// assembled frame's `locals_cells_stack_w`.
+pub struct ReconstructRecipe {
+    pub w_code: *const (),
+    pub jitcode_index: i32,
+    pub pc: usize,
+    pub nlocals: usize,
+    pub valuestackdepth: usize,
+    pub registers_i: Vec<OpRef>,
+    pub registers_r: Vec<OpRef>,
+    pub registers_f: Vec<OpRef>,
+    pub concrete_r: Vec<majit_ir::Value>,
+    pub nargs: usize,
+}
+
+/// Task #64 bug-2: the decoded inline-callee recipes for one multi-frame
+/// bridge, plus the outermost (`frames[0]`) resume pc. `trace_bytecode`
+/// builds the caller-visible root frame at `root_pc` and pushes each
+/// recipe on top (innermost last), so the framestack matches the inline
+/// depth the guard fired at (`rebuild_from_resumedata` resume.py:1049-1056).
+pub struct BridgeInlineCarrier {
+    /// `resume_data.frames[0].pc` — where the outermost (portal/root) frame
+    /// resumes once the reconstructed callees return. The bridge's returned
+    /// resume pc (`decode_and_restore_guard_failure`) is the INNERMOST frame's
+    /// pc; the root must instead resume at its own `frames[0].pc`, so this is
+    /// threaded separately rather than derived from the trace start pc.
+    pub root_pc: usize,
+    /// `resume_data.frames[1..]`, OUTERMOST-FIRST. The portal (`frames[0]`)
+    /// is NOT here — it is the caller-visible root `sym`.
+    pub recipes: Vec<ReconstructRecipe>,
 }
 
 /// rlib/jit.py:592 default `trace_limit` — mirrored here so standalone
@@ -1022,6 +1081,7 @@ impl TraceCtx {
             cpu: None,
             pending_switch_to_blackhole: None,
             virtualref_boxes: Vec::new(),
+            bridge_inline_carrier: None,
         }
     }
 
@@ -1086,7 +1146,23 @@ impl TraceCtx {
             cpu: None,
             pending_switch_to_blackhole: None,
             virtualref_boxes: Vec::new(),
+            bridge_inline_carrier: None,
         }
+    }
+
+    /// Stash the decoded inline-callee carrier for the bridge currently
+    /// being set up. Overwrites any prior unconsumed value. `setup_bridge_sym`
+    /// calls this; `trace_bytecode` drains it once via
+    /// [`take_bridge_inline_carrier`](Self::take_bridge_inline_carrier).
+    pub fn set_bridge_inline_carrier(&mut self, carrier: BridgeInlineCarrier) {
+        self.bridge_inline_carrier = Some(carrier);
+    }
+
+    /// Take the decoded inline-callee carrier for the bridge about to be
+    /// traced, leaving the field empty. Returns `None` for primary traces
+    /// and single-frame bridges.
+    pub fn take_bridge_inline_carrier(&mut self) -> Option<BridgeInlineCarrier> {
+        self.bridge_inline_carrier.take()
     }
 
     /// Get or create a constant OpRef for a given i64 value.

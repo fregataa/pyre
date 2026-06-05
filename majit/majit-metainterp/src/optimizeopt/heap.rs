@@ -4086,6 +4086,11 @@ mod tests {
         let pos1 = ctx.reserve_pos_typed(Type::Int);
         let mut op = Op::with_descr(OpCode::GetfieldGcI, &[BoxRef::from_opref(p0)], d);
         op.pos.set(pos1);
+        op.setarg(
+            0,
+            ctx.get_box_replacement_box(op.arg(0).to_opref())
+                .expect("constant receiver resolves to a BoxRef"),
+        );
 
         let _ = heap.optimize_getfield(&op, &std::rc::Rc::new(op.clone()), &mut ctx);
     }
@@ -6029,8 +6034,7 @@ mod tests {
         // Bind the variable index input box before the pass: post-resolver
         // op.arg(1) must be bound for getintbound to install its IntBound on
         // `_forwarded` (the real recorder binds input args).
-        ctx.ensure_box(idx)
-            .expect("variable index input must bind to a BoxRef");
+        ctx.materialize_box_at(idx);
 
         for op in &ops {
             let mut resolved = op.clone();
@@ -6129,8 +6133,7 @@ mod tests {
         // Bind the variable index input box before the pass: post-resolver
         // op.arg(1) must be bound for getintbound to install its IntBound on
         // `_forwarded` (the real recorder binds input args).
-        ctx.ensure_box(idx)
-            .expect("variable index input must bind to a BoxRef");
+        ctx.materialize_box_at(idx);
 
         for op in &ops {
             let mut resolved = op.clone();

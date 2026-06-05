@@ -1954,6 +1954,21 @@ pub fn dispatch_via_miframe_at_opcode_entry<'a>(
     // the topmost frame's `registers_r[0]` carries the PyFrame argument.
     // Skeleton arms with `num_regs_r() == 0` (no Ref bank, e.g. trivial
     // pass-through opcodes) simply skip the seed.
+    //
+    // Epic #245 (per-frame frame-identity): this `regs_r[0] = sym.frame`
+    // write IS the runtime seed of the universal `self`(frame) red arg.
+    // `frame_opref` is the *per-callee* frame — `sym.frame` is set to the
+    // inlined callee's `callee_frame_opref` (`trace_opcode.rs`
+    // `sym.frame = callee_frame_opref`), so each frame's r0 already
+    // resolves to its own PyFrame.  Slice 1 appended a graph-level
+    // `frame_var` start-block inputarg to non-portal callee jitcode, but
+    // that Variable currently shares a color with the single
+    // `portal_frame_reg` (the unconditional `pin!(frame_var,
+    // portal_frame_reg)` in `codewriter.rs`), so there is no distinct
+    // slot to seed separately — the per-callee frame seed lives here.
+    // Un-aliasing `frame_var` (its own color) and flipping the non-portal
+    // namespace/pycode readers off the shared `portal_frame_reg` onto it
+    // is the coupled Slice 3a step (#240 LoadGlobal namespace cutover).
     if entry_jitcode.num_regs_r() > 0 {
         regs_r[0] = frame_opref;
         concrete_r[0] = if concrete_frame_addr != 0 {

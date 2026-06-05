@@ -90,11 +90,46 @@ fn portal_graph_inputvars(code: &CodeObject) -> (super::flow::Variable, super::f
     )
 }
 
-fn graph_entry_inputargs(code: &CodeObject, portal_inputs: bool) -> Vec<super::flow::FlowValue> {
+/// Which extra red inputargs a per-code jitcode's startblock carries
+/// beyond the Python function arguments.
+///
+/// Every per-code jitcode threads the universal `self` red frame: each
+/// opcode-handler graph takes `self` (the interpreter frame) as
+/// `inputargs[0]`, and pyre's one-jitcode-per-code-object model carries
+/// that as a single red frame inputarg (the "1-red-arg frame shape",
+/// `driver_descriptor`).  The portal graph additionally carries the
+/// JitDriver's `ec` red (`jitdriver_sd.reds = [frame, ec]`,
+/// interp_jit.py:64-69) — `ec` is portal-specific, `frame` is not.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FrameInputs {
+    /// No frame, no ec — test-only shadow graphs.
+    None,
+    /// Non-portal callee jitcode: the universal `self` red frame only.
+    Frame,
+    /// Portal graph: frame + ec.
+    Portal,
+}
+
+impl FrameInputs {
+    fn has_frame(self) -> bool {
+        matches!(self, FrameInputs::Frame | FrameInputs::Portal)
+    }
+
+    fn has_ec(self) -> bool {
+        matches!(self, FrameInputs::Portal)
+    }
+}
+
+fn graph_entry_inputargs(
+    code: &CodeObject,
+    frame_inputs: FrameInputs,
+) -> Vec<super::flow::FlowValue> {
     let mut inputargs = entry_inputargs(code);
-    if portal_inputs {
-        let (frame, ec) = portal_graph_inputvars(code);
+    let (frame, ec) = portal_graph_inputvars(code);
+    if frame_inputs.has_frame() {
         inputargs.push(frame.into());
+    }
+    if frame_inputs.has_ec() {
         inputargs.push(ec.into());
     }
     inputargs
@@ -227,21 +262,24 @@ struct FrameState {
     blocklist: Vec<FrameBlock>,
     /// `framestate.py:24` `next_offset`.
     next_offset: usize,
-    /// Graph-level portal red slots: the `(frame, ec)` Variables that
-    /// flow through every block of a portal graph.  Populated on the
-    /// entry FrameState (via `entry_frame_state(code, portal_inputs=
-    /// true)`) and propagated through block transitions unchanged —
-    /// portal Variables carry graph-level identity, not per-block SSA
-    /// names, so `copy()` passes them through without freshening and
-    /// `union()` requires both sides to agree.  Mirrors the red
-    /// carry-through in `rpython/jit/metainterp/warmspot.py` where the
-    /// jitdriver_sd.reds list names `(jitframe, ec)` that the portal
-    /// interpreter function threads through every iteration of the
-    /// loop.  Participates in `mergeable()` after the last-exception
-    /// pair so backedge `Link.args` produced by `getoutputargs()` stay
-    /// aligned with the portal `startblock.inputargs` appended by
-    /// `graph_entry_inputargs(code, portal_inputs=true)`.
-    portal_extras: Option<(super::flow::FlowValue, super::flow::FlowValue)>,
+    /// Graph-level red slots: the universal `self` frame Variable plus,
+    /// for portal graphs, the JitDriver `ec` Variable, that flow through
+    /// every block.  The first element (frame) is present on every
+    /// non-portal callee jitcode (`FrameInputs::Frame`) as well as the
+    /// portal (`FrameInputs::Portal`); the second element (`ec`) is
+    /// `Some` only on the portal.  Populated on the entry FrameState
+    /// (via `entry_frame_state(code, FrameInputs::Frame | Portal)`) and
+    /// propagated through block transitions unchanged — these Variables
+    /// carry graph-level identity, not per-block SSA names, so `copy()`
+    /// passes them through without freshening and `union()` requires
+    /// both sides to agree.  Mirrors the red carry-through in
+    /// `rpython/jit/metainterp/warmspot.py` where the jitdriver_sd.reds
+    /// list names `(jitframe, ec)` that the portal interpreter function
+    /// threads through every iteration of the loop.  Participates in
+    /// `mergeable()` after the last-exception pair so backedge
+    /// `Link.args` produced by `getoutputargs()` stay aligned with the
+    /// `startblock.inputargs` appended by `graph_entry_inputargs`.
+    portal_extras: Option<(super::flow::FlowValue, Option<super::flow::FlowValue>)>,
 }
 
 impl FrameState {
@@ -262,14 +300,14 @@ impl FrameState {
         }
     }
 
-    /// Seed the graph-level portal `(frame, ec)` pair on this state.
-    /// Called from `entry_frame_state(code, portal_inputs=true)` for
-    /// the startblock state of portal graphs; every state derived from
-    /// that entry state via `copy()` or `union()` preserves the same
-    /// pair.
+    /// Seed the graph-level `(frame, Option<ec>)` pair on this state.
+    /// Called from `entry_frame_state(code, FrameInputs::Frame | Portal)`
+    /// for the startblock state; every state derived from that entry
+    /// state via `copy()` or `union()` preserves the same pair.  `ec` is
+    /// `Some` only for portal graphs.
     fn with_portal_extras(
         mut self,
-        extras: (super::flow::FlowValue, super::flow::FlowValue),
+        extras: (super::flow::FlowValue, Option<super::flow::FlowValue>),
     ) -> Self {
         self.portal_extras = Some(extras);
         self
@@ -287,7 +325,9 @@ impl FrameState {
         }
         if let Some((frame, ec)) = &self.portal_extras {
             data.push(Some(frame.clone()));
-            data.push(Some(ec.clone()));
+            if let Some(ec) = ec {
+                data.push(Some(ec.clone()));
+            }
         }
         data
     }
@@ -487,9 +527,11 @@ impl FrameState {
             )),
         };
         // Portal extras carry graph-level identity; if the two sides
-        // are both portal-seeded they must reference the same Variables,
-        // otherwise the graph is malformed.  Non-portal graphs never
-        // populate them.
+        // are both seeded they must reference the same `(frame, ec)`
+        // Variables, otherwise the graph is malformed.  Both sides of a
+        // union belong to the same graph, so they are uniformly seeded
+        // (`FrameInputs::Frame`/`Portal`) or uniformly absent
+        // (`FrameInputs::None`, test-only graphs).
         let portal_extras = match (&self.portal_extras, &other.portal_extras) {
             (None, None) => None,
             (Some(left), Some(right)) => {
@@ -598,7 +640,7 @@ fn union_kind(left: Option<Kind>, right: Option<Kind>) -> Option<Kind> {
     if left == right { left } else { None }
 }
 
-fn entry_frame_state(code: &CodeObject, portal_inputs: bool) -> FrameState {
+fn entry_frame_state(code: &CodeObject, frame_inputs: FrameInputs) -> FrameState {
     let inputargs = entry_inputargs(code);
     let mut locals_w = vec![None; code.varnames.len()];
     for (index, value) in inputargs.into_iter().enumerate() {
@@ -613,11 +655,11 @@ fn entry_frame_state(code: &CodeObject, portal_inputs: bool) -> FrameState {
         frame_blocks_for_offset(code, 0),
         0,
     );
-    if portal_inputs {
-        let (frame, ec) = portal_graph_inputvars(code);
-        state.with_portal_extras((frame.into(), ec.into()))
-    } else {
-        state
+    let (frame, ec) = portal_graph_inputvars(code);
+    match frame_inputs {
+        FrameInputs::None => state,
+        FrameInputs::Frame => state.with_portal_extras((frame.into(), None)),
+        FrameInputs::Portal => state.with_portal_extras((frame.into(), Some(ec.into()))),
     }
 }
 
@@ -3348,9 +3390,9 @@ fn sync_stack_state(graph: &mut super::flow::FunctionGraph, state: &mut FrameSta
 
 fn new_shadow_graph_with_portal_inputs(
     code: &CodeObject,
-    portal_inputs: bool,
+    frame_inputs: FrameInputs,
 ) -> super::flow::FunctionGraph {
-    let start_inputargs = graph_entry_inputargs(code, portal_inputs);
+    let start_inputargs = graph_entry_inputargs(code, frame_inputs);
     let return_var = Some(super::flow::Variable::new(
         super::flow::VariableId(start_inputargs.len() as u32),
         Kind::Ref,
@@ -3363,7 +3405,7 @@ fn new_shadow_graph_with_portal_inputs(
 }
 
 fn new_shadow_graph(code: &CodeObject) -> super::flow::FunctionGraph {
-    new_shadow_graph_with_portal_inputs(code, false)
+    new_shadow_graph_with_portal_inputs(code, FrameInputs::None)
 }
 
 fn attach_catch_exception_edge(
@@ -4591,6 +4633,14 @@ impl CodeWriter {
             .callcontrol()
             .jitdriver_sd_from_portal_graph(code as *const CodeObject);
         let is_portal = portal_jd_index.is_some();
+        // Every per-code jitcode threads the universal `self` red frame;
+        // the portal additionally threads `ec` (`jitdriver_sd.reds =
+        // [frame, ec]`).  Non-portal callees carry frame only.
+        let frame_inputs = if is_portal {
+            FrameInputs::Portal
+        } else {
+            FrameInputs::Frame
+        };
 
         // Populate `cpu.lowering_ctx` with the four retired-family fn
         // indices so the canonical `flatten.rs::flatten_graph(graph,
@@ -4623,17 +4673,18 @@ impl CodeWriter {
                     call_fn_7_idx,
                     call_fn_8_idx,
                 ],
-                // Only portal graphs include `frame_var` in
-                // `graph_entry_inputargs(code, true)`. For non-portal
-                // graphs `frame_var.id` collides with the synthesised
-                // `return_var` slot (`new_shadow_graph_with_portal_inputs`
-                // assigns `return_var = Variable(VariableId(start_inputargs.len()))`,
-                // which equals `entry_arg_slots(code)` when
-                // `portal_inputs=false` — the same id `portal_graph_inputvars`
-                // returns for `frame_var`). Threading a non-portal
-                // `Some(frame_var)` through `get_register` would resolve
-                // the call-frame operand from `return_var`'s color instead
-                // of a real graph input.
+                // Both portal and non-portal graphs now include
+                // `frame_var` as a real startblock inputarg
+                // (`graph_entry_inputargs(code, FrameInputs::Frame |
+                // Portal)`), so `frame_var.id` (= `entry_arg_slots`) no
+                // longer collides with the synthesised `return_var.id`
+                // (= `start_inputargs.len()` = `entry_arg_slots + 1`).
+                // `portal_frame_var` nonetheless stays `None` for
+                // non-portal in this slice: it drives
+                // `lower_simple_call_hlop_to_insn` (flatten.rs), and the
+                // non-portal call/LOAD_GLOBAL readers still source the
+                // frame from the shared `portal_frame_reg` slot.  Routing
+                // them to the per-callee `frame_var` is a later slice.
                 portal_frame_var: if is_portal { Some(frame_var) } else { None },
             });
         }
@@ -4655,26 +4706,21 @@ impl CodeWriter {
         // shadow graph now carries the same per-block `FrameState`
         // object instead of a topology-only `BlockRef`.
         //
-        // Portal graphs (registered in `jitdrivers_sd`, per
-        // codewriter.py:37) carry two extra red inputs —
-        // `(frame, ec)` — appended to both `startblock.inputargs` via
-        // `graph_entry_inputargs(code, portal_inputs=true)` AND to
-        // `FrameState` via `entry_frame_state(code, portal_inputs=
-        // true)`.  `FrameState.portal_extras` carries those Variables
-        // through every block transition so `getoutputargs()` on any
-        // backedge produces link args aligned with the appended
-        // startblock slots.  Non-portal graphs populate neither side
-        // and behave exactly as before.
-        // `rpython/jit/codewriter/codewriter.py:37 portal_jd = self
-        // .callcontrol.jitdriver_sd_from_portal_graph(graph)` —
-        // upstream copies each source graph's actual `inputargs` and
-        // routes the portal-only extras through transformation, not
-        // by appending synthetic `(frame, ec)` to every non-portal
-        // graph.  Pyre matches by gating the portal-input append on
-        // `is_portal` (the prior unconditional shortcut introduced
-        // upstream non-orthodoxy by adding unused inputargs to non-
-        // portal graphs).
-        let mut graph = new_shadow_graph_with_portal_inputs(code, is_portal);
+        // Every per-code jitcode carries the universal `self` red frame
+        // as a startblock inputarg — upstream every opcode-handler graph
+        // takes `self` (the interpreter frame) as `inputargs[0]`, and
+        // pyre's one-jitcode-per-code-object model carries that single
+        // red frame for both portal and non-portal callees.  The portal
+        // additionally carries the JitDriver `ec` red (`jitdriver_sd
+        // .reds = [frame, ec]`, warmspot.py).  `frame_inputs` selects:
+        // `Portal` = frame + ec, `Frame` = frame only (non-portal
+        // callee).  Both are appended to `startblock.inputargs` via
+        // `graph_entry_inputargs(code, frame_inputs)` AND to `FrameState`
+        // via `entry_frame_state(code, frame_inputs)`;
+        // `FrameState.portal_extras` carries those Variables through
+        // every block transition so `getoutputargs()` on any backedge
+        // produces link args aligned with the appended startblock slots.
+        let mut graph = new_shadow_graph_with_portal_inputs(code, frame_inputs);
         let (catch_for_pc, catch_sites, handler_depth_at) =
             decode_exception_catch_sites(&mut assembler, &mut graph, code, num_instrs);
         // `flowcontext.py:293 self.joinpoints = {}` — sparse-by-PC dict
@@ -4683,7 +4729,7 @@ impl CodeWriter {
         // list semantics for supersede where multiple SpamBlocks at the
         // same PC are tracked head-of-list.
         let mut joinpoints: VecMap<usize, Vec<SpamBlockRef>> = VecMap::new();
-        let start_state = entry_frame_state(code, is_portal);
+        let start_state = entry_frame_state(code, frame_inputs);
         // Collect every walker-created block in walker-visit order so the
         // post-walk drain can iterate per-block accumulators in the same
         // order their pushes reached `ssarepr.insns`.  Each block's
@@ -5788,15 +5834,19 @@ impl CodeWriter {
                 // entry and encoded by the assembler as the canonical
                 // leading `r` operand.
                 emit_vable_getfield_ref_walker_only(&current_block, vable_reg, dst, field_idx);
-                // Graph dual-write threads `frame_var.into()` which is
-                // only a startblock inputarg when `is_portal` (per
-                // `graph_entry_inputargs(code, is_portal)`).  Non-portal
-                // graphs would record an op reading a Variable that has
-                // no producer, violating upstream's well-formedness; gate
-                // accordingly.  Returns `Option<Variable>` so callsites
-                // that need the graph identity for downstream
-                // dual-writes can thread the same Variable; non-portal
-                // callees skip the graph emit and return `None`.
+                // Graph dual-write threads `frame_var.into()`.  As of
+                // Epic #245 Slice 1 `frame_var` is a startblock inputarg
+                // for both portal and non-portal graphs
+                // (`graph_entry_inputargs(code, frame_inputs)`), so the
+                // Variable always has a producer.  The dual-write stays
+                // portal-gated here because the non-portal vable readers
+                // still source the frame from the shared
+                // `portal_frame_reg` slot rather than the per-callee
+                // `frame_var`; rewiring them is a later slice.  Returns
+                // `Option<Variable>` so callsites that need the graph
+                // identity for downstream dual-writes can thread the
+                // same Variable; non-portal callees skip the graph emit
+                // and return `None`.
                 if is_portal {
                     let result = emit_graph_op_with_result(
                         &mut graph,
@@ -6668,7 +6718,11 @@ impl CodeWriter {
                                 // `do_fixed_list_setitem` — STORE_FAST →
                                 // `setarrayitem_vable_r(locals_cells_stack_w,
                                 // local_slot, w_value)`.  `frame_var` is a
-                                // startblock inputarg only when `is_portal`.
+                                // startblock inputarg for both portal and
+                                // non-portal graphs (Epic #245 Slice 1);
+                                // the dual-write stays portal-gated until
+                                // the non-portal readers move off the
+                                // shared `portal_frame_reg` slot.
                                 let local_slot = local_to_vable_slot(reg as usize) as i64;
                                 let v_idx: super::flow::FlowValue =
                                     super::flow::Constant::signed(local_slot).into();
@@ -11623,7 +11677,7 @@ mod tests {
             "def f(a):\n    while a:\n        a = a - 1\n    return a\n",
         );
 
-        let inputargs = graph_entry_inputargs(&code, true);
+        let inputargs = graph_entry_inputargs(&code, FrameInputs::Portal);
         let arg_slots = entry_arg_slots(&code);
         assert_eq!(inputargs.len(), arg_slots + 2);
         match &inputargs[arg_slots] {
@@ -11648,16 +11702,19 @@ mod tests {
             "def f(a):\n    while a:\n        a = a - 1\n    return a\n",
         );
 
-        let graph = new_shadow_graph_with_portal_inputs(&code, true);
+        let graph = new_shadow_graph_with_portal_inputs(&code, FrameInputs::Portal);
         let startblock = graph.startblock.borrow();
         let returnblock = graph.returnblock.borrow();
 
-        assert_eq!(startblock.inputargs, graph_entry_inputargs(&code, true));
+        assert_eq!(
+            startblock.inputargs,
+            graph_entry_inputargs(&code, FrameInputs::Portal)
+        );
         match &returnblock.inputargs[0] {
             FlowValue::Variable(variable) => {
                 assert_eq!(
                     variable.id,
-                    VariableId(graph_entry_inputargs(&code, true).len() as u32)
+                    VariableId(graph_entry_inputargs(&code, FrameInputs::Portal).len() as u32)
                 );
                 assert_eq!(variable.kind, Some(Kind::Ref));
             }
@@ -11666,11 +11723,58 @@ mod tests {
     }
 
     #[test]
+    fn nonportal_shadow_graph_appends_frame_inputarg_only() {
+        // Epic #245 Slice 1 keystone: a non-portal callee jitcode carries
+        // the universal `self` red frame as a real startblock inputarg
+        // (`FrameInputs::Frame`) — one extra slot, NOT the portal's
+        // `(frame, ec)` pair — and `return_var` shifts past it so it no
+        // longer aliases `frame_var` (the prior collision that forced
+        // `LoweringContext::portal_frame_var = None`).
+        let code = first_nested_function_code(
+            "def f(a):\n    while a:\n        a = a - 1\n    return a\n",
+        );
+        let arg_slots = entry_arg_slots(&code);
+        let (frame_var, _ec_var) = portal_graph_inputvars(&code);
+
+        // graph_entry_inputargs appends frame only (no ec).
+        let inputargs = graph_entry_inputargs(&code, FrameInputs::Frame);
+        assert_eq!(inputargs.len(), arg_slots + 1);
+        match &inputargs[arg_slots] {
+            FlowValue::Variable(variable) => {
+                assert_eq!(*variable, frame_var);
+                assert_eq!(variable.kind, Some(Kind::Ref));
+            }
+            other => panic!("expected frame variable, got {other:?}"),
+        }
+
+        // return_var moves to `arg_slots + 1`; the `frame_var.id ==
+        // return_var.id` collision is dissolved.
+        let graph = new_shadow_graph_with_portal_inputs(&code, FrameInputs::Frame);
+        let startblock = graph.startblock.borrow();
+        let returnblock = graph.returnblock.borrow();
+        assert_eq!(startblock.inputargs, inputargs);
+        match &returnblock.inputargs[0] {
+            FlowValue::Variable(variable) => {
+                assert_eq!(variable.id, VariableId((arg_slots + 1) as u32));
+                assert_ne!(variable.id, frame_var.id);
+            }
+            other => panic!("expected variable return arg, got {other:?}"),
+        }
+
+        // entry_frame_state threads frame through portal_extras (ec
+        // absent), so getvariables() = entry locals + [frame].
+        let state = entry_frame_state(&code, FrameInputs::Frame);
+        let mut expected = entry_inputargs(&code);
+        expected.push(frame_var.into());
+        assert_eq!(state.getvariables(), expected);
+    }
+
+    #[test]
     fn portal_jit_merge_point_graph_args_match_upstream_shape() {
         let code = first_nested_function_code(
             "def f(a):\n    while a:\n        a = a - 1\n    return a\n",
         );
-        let graph = new_shadow_graph_with_portal_inputs(&code, true);
+        let graph = new_shadow_graph_with_portal_inputs(&code, FrameInputs::Portal);
         let pycode_var = Variable::new(VariableId(9999), Kind::Ref);
         let args = portal_jit_merge_point_graph_args(&graph, 17, pycode_var, 7);
 
@@ -11745,7 +11849,7 @@ mod tests {
     fn entry_frame_state_matches_pygraph_locals_shape() {
         let code =
             first_nested_function_code("def f(a, b, *args, c, d, **kw):\n    return a + b\n");
-        let state = entry_frame_state(&code, false);
+        let state = entry_frame_state(&code, FrameInputs::None);
 
         assert_eq!(state.locals_w.len(), code.varnames.len());
         assert_eq!(state.getvariables(), entry_inputargs(&code));
