@@ -13,6 +13,13 @@ use walkdir::WalkDir;
 /// - pyre-object (Python object types: W_IntObject, W_FloatObject, etc.)
 /// - pyre-interpreter (object space, bytecode dispatch, eval loop)
 fn main() {
+    // Fail fast with an actionable message when the Charon-extracted LLBC
+    // artefacts the codegen consumes are absent.  Without this, the missing
+    // set surfaces deep inside `real_main` as a worker-thread `panic!`
+    // (`build-script worker panicked: Any { .. }`) printed *below* the
+    // 150-line source-path dump, where it is easy to miss.
+    preflight_llbc_or_fail();
+
     // The codegen worker (`real_main`) runs the RPythonTyper
     // specialization (`specialize_legacy_graph_with_registry` → annotator
     // `complete_pending_blocks` / rtyper `specialize_more_blocks`).  Its
@@ -26,6 +33,96 @@ fn main() {
     // (on Windows the main thread's 1 MiB default would
     // STATUS_STACK_OVERFLOW).
     run_worker();
+}
+
+/// Pre-flight the LLBC prerequisite, mirroring the resolution order in
+/// `majit-translate` (`build_semantic_program_via_active_frontend`):
+/// honour the `PYRE_MIR_FRONTEND_LLBC` override, else require the
+/// canonical `build/llbc/{pyre-object,pyre-interpreter}.ullbc` pair.
+///
+/// When neither resolves, emit a clean, copy-pasteable bootstrap message
+/// and fail the build *before* the worker spawns — so the contributor
+/// sees the exact steps to run instead of a worker-thread panic buried
+/// under the source-file dump.  Auto-running the bootstrap from here is
+/// deliberately avoided: `scripts/extract-llbc.sh` shells out to a nested
+/// `cargo build`, which would block on the outer build's target-directory
+/// lock (deadlock), and a build script that downloads a toolchain breaks
+/// hermetic / offline / CI builds.
+fn preflight_llbc_or_fail() {
+    // Explicit override: trust it and let the translator validate the
+    // individual paths (its loader panics per-file with the bad path).
+    if std::env::var_os("PYRE_MIR_FRONTEND_LLBC")
+        .map(|v| std::env::split_paths(&v).any(|p| !p.as_os_str().is_empty()))
+        .unwrap_or(false)
+    {
+        return;
+    }
+
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..");
+    let llbc_dir = repo_root.join("build").join("llbc");
+    // Matches `auto_discover_workspace_llbc_paths`'s REQUIRED set.
+    const REQUIRED: &[&str] = &["pyre-object.ullbc", "pyre-interpreter.ullbc"];
+    let missing: Vec<&str> = REQUIRED
+        .iter()
+        .copied()
+        .filter(|name| !llbc_dir.join(name).exists())
+        .collect();
+    if missing.is_empty() {
+        return;
+    }
+
+    let charon_present = repo_root
+        .join("build")
+        .join("charon")
+        .join("charon")
+        .exists();
+
+    // `cargo::error=` lines (no embedded newlines) surface in Cargo's
+    // error summary on modern Cargo and fail the build on their own; the
+    // framed stderr block below stays readable on every toolchain, and the
+    // explicit non-zero exit is the belt-and-suspenders stop for a Cargo
+    // too old to recognise `cargo::error`.
+    println!(
+        "cargo::error=pyre-jit codegen needs the Charon-extracted LLBC artefacts, but build/llbc/ is missing: {}",
+        missing.join(", "),
+    );
+    if !charon_present {
+        println!("cargo::error=Install charon (one-time): scripts/install-charon.sh");
+    }
+    println!("cargo::error=Extract the LLBC: scripts/extract-llbc.sh pyre-object pyre-interpreter");
+
+    // The install step is only needed when the charon binary is absent;
+    // with it present the fix is the single extract command.
+    let install_line = if charon_present {
+        String::new()
+    } else {
+        "   scripts/install-charon.sh                            # one-time\n".to_string()
+    };
+    eprintln!(
+        "\n\
+========================================================================\n\
+ pyre-jit-trace: JIT codegen prerequisite missing\n\
+------------------------------------------------------------------------\n\
+ The Charon-extracted LLBC artefacts are required but were not found:\n\
+{}\n\
+ Bootstrap (run from the repo root):\n\
+{}\
+   scripts/extract-llbc.sh pyre-object pyre-interpreter\n\
+\n\
+ …or point the build at existing artefacts:\n\
+   export PYRE_MIR_FRONTEND_LLBC=/abs/pyre-object.ullbc:/abs/pyre-interpreter.ullbc\n\
+========================================================================\n",
+        missing
+            .iter()
+            .map(|name| format!("   build/llbc/{name}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        install_line,
+    );
+
+    std::process::exit(1);
 }
 
 /// Run the codegen worker on a large-stack thread, propagating any panic so
