@@ -815,50 +815,50 @@ class W_Socket(W_Root):
 
         return space.newint(count)
 
-    @unwrap_spec(op=int, flags=int,
-                 w_iv=WrappedDefault(None), w_assoclen=WrappedDefault(None))
-    def sendmsg_afalg_w(self, space, w_msg=None, __kwonly__=None, op=-1, w_iv=None, w_assoclen=None, flags=0):
-        """sendmsg_afalg([msg], *, op[, iv[, assoclen[, flags=MSG_MORE]]])
+    if rsocket.HAS_AF_ALG:
+        @unwrap_spec(op=int, flags=int,
+                     w_iv=WrappedDefault(None), w_assoclen=WrappedDefault(None))
+        def sendmsg_afalg_w(self, space, w_msg=None, __kwonly__=None, op=-1, w_iv=None, w_assoclen=None, flags=0):
+            """sendmsg_afalg([msg], *, op[, iv[, assoclen[, flags=MSG_MORE]]])
 
-        Set operation mode, IV and length of associated data for an AF_ALG
-        operation socket."""
-        from rpython.rlib import _rsocket_rffi as _c
-        if widen(self.sock.family) != rsocket.AF_ALG:
-            raise oefmt(space.w_OSError, "algset is only supported for AF_ALG")
-        if op < 0:
-            raise oefmt(space.w_TypeError, "Invalid or missing argument 'op'")
-        assoclen = -1
-        if not space.is_none(w_assoclen):
-            assoclen = space.int_w(w_assoclen)
-            if assoclen < 0:
-                raise oefmt(space.w_TypeError, "assoclen must be positive")
-        data = []
-        if w_msg is not None:
-            for w_buf in space.unpackiterable(w_msg):
-                data.append(space.readbuf_w(w_buf).as_str())
-        ancillary = [(_c.SOL_ALG, _c.ALG_SET_OP, _pack_uint32(op))]
-        if w_iv is not None:
-            iv = space.readbuf_w(w_iv).as_str()
-            ancillary.append((_c.SOL_ALG, _c.ALG_SET_IV,
-                              _pack_uint32(len(iv)) + iv))
-        if assoclen >= 0:
-            ancillary.append((_c.SOL_ALG, _c.ALG_SET_AEAD_ASSOCLEN,
-                              _pack_uint32(assoclen)))
-        while True:
-            try:
-                count = self.sock.sendmsg(data, ancillary, flags)
-                if count < 0:
-                    if count == -1000:
-                        raise oefmt(space.w_OSError,
-                                    "sending multiple control messages not supported")
-                    if count == -1001:
-                        raise oefmt(space.w_OSError, "ancillary data item too large")
-                    if count == -1002:
-                        raise oefmt(space.w_OSError, "too much ancillary data")
-                break
-            except SocketError as e:
-                converted_error(space, e, eintr_retry=True)
-        return space.newint(count)
+            Set operation mode, IV and length of associated data for an AF_ALG
+            operation socket."""
+            if widen(self.sock.family) != rsocket.AF_ALG:
+                raise oefmt(space.w_OSError, "algset is only supported for AF_ALG")
+            if op < 0:
+                raise oefmt(space.w_TypeError, "Invalid or missing argument 'op'")
+            assoclen = -1
+            if not space.is_none(w_assoclen):
+                assoclen = space.int_w(w_assoclen)
+                if assoclen < 0:
+                    raise oefmt(space.w_TypeError, "assoclen must be positive")
+            data = []
+            if w_msg is not None:
+                for w_buf in space.unpackiterable(w_msg):
+                    data.append(space.readbuf_w(w_buf).as_str())
+            ancillary = [(rsocket.SOL_ALG, rsocket.ALG_SET_OP, _pack_uint32(op))]
+            if w_iv is not None:
+                iv = space.readbuf_w(w_iv).as_str()
+                ancillary.append((rsocket.SOL_ALG, rsocket.ALG_SET_IV,
+                                  _pack_uint32(len(iv)) + iv))
+            if assoclen >= 0:
+                ancillary.append((rsocket.SOL_ALG, rsocket.ALG_SET_AEAD_ASSOCLEN,
+                                  _pack_uint32(assoclen)))
+            while True:
+                try:
+                    count = self.sock.sendmsg(data, ancillary, flags)
+                    if count < 0:
+                        if count == -1000:
+                            raise oefmt(space.w_OSError,
+                                        "sending multiple control messages not supported")
+                        if count == -1001:
+                            raise oefmt(space.w_OSError, "ancillary data item too large")
+                        if count == -1002:
+                            raise oefmt(space.w_OSError, "too much ancillary data")
+                    break
+                except SocketError as e:
+                    converted_error(space, e, eintr_retry=True)
+            return space.newint(count)
 
     @unwrap_spec(flag=int)
     def setblocking_w(self, space, flag):
