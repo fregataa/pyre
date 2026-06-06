@@ -31,6 +31,15 @@ def mallocbuf(buffersize):
 
 
 constants = _c.constants
+HAS_AF_ALG = 'AF_ALG' in constants
+
+# Copy CPython: needed for AF_ALG but sometimes not defined in headers
+for name, value in (("SOL_ALG", 279), ("ALG_SET_AEAD_ASSOCLEN", 4),
+        ("ALG_SET_AEAD_AUTHSIZE", 5), ("ALG_SET_PUB_KEY", 6), ("ALG_OP_SIGN", 2),
+        ("ALG_OP_VERIFY", 3)):
+    if name not in constants:
+        constants[name] = value
+
 locals().update(constants)  # Define constants from _c
 
 HAS_SO_PROTOCOL = hasattr(_c, 'SO_PROTOCOL')
@@ -469,7 +478,6 @@ if HAS_AF_NETLINK:
 
 # ____________________________________________________________
 
-HAS_AF_ALG = 'AF_ALG' in constants
 if HAS_AF_ALG:
     class AlgAddress(Address):
         family = AF_ALG
