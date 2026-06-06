@@ -345,7 +345,16 @@ impl CallTarget {
             CallTarget::FunctionPath { segments } => {
                 Some(segments.iter().map(String::as_str).collect())
             }
-            CallTarget::SyntheticTransparentCtor { name, .. } => Some(vec![name.as_str()]),
+            // `(owner_path, name)` is the lookup identity per the
+            // variant docs; collapsing onto the leaf alone would
+            // make `Instruction::LoadFast` and `OtherEnum::LoadFast`
+            // share segments and break any downstream caller that
+            // uses `path_segments()` for qualified identity.
+            CallTarget::SyntheticTransparentCtor { name, owner_path } => {
+                let mut segs: Vec<&str> = owner_path.iter().map(String::as_str).collect();
+                segs.push(name.as_str());
+                Some(segs)
+            }
             CallTarget::Indirect { method_name, .. } => Some(vec![method_name.as_str()]),
             CallTarget::UnsupportedExpr => None,
         }
@@ -807,6 +816,23 @@ pub enum OpKind {
     IsVirtual {
         value: crate::flowspace::model::Variable,
         kind_char: char,
+    },
+    /// RPython `flowspace` `isinstance(obj, cls)` (annotator/unaryop.py +
+    /// rtyper.rs:2035 dispatch — `Repr.rtype_isinstance`). The
+    /// front-end emits this op at `match` cascade sites where the
+    /// variant pattern carries a payload (`TupleStruct`) and a
+    /// ptr_eq-against-singleton check would be insufficient.
+    /// `class_carrier` is typically a `ConstRef`-wrapped vtable
+    /// Constant resolved by the rtyper to a CLASSTYPE pointer; the
+    /// rtyper then dispatches to
+    /// [`InstanceRepr::rtype_isinstance`](crate::translator::rtyper::rclass::InstanceRepr::rtype_isinstance)
+    /// which mints either `ll_isinstance_const_{,nonnull}_<min>_<max>`
+    /// (Constant `class_carrier`) or the generic `ll_isinstance`
+    /// (Variable `class_carrier`).
+    IsInstance {
+        obj: crate::flowspace::model::Variable,
+        class_carrier: crate::flowspace::model::Variable,
+        result_ty: ValueType,
     },
 
     // ── Conditional call ops (jtransform.py:1665-1688) ──────
@@ -4130,6 +4156,22 @@ impl FunctionGraph {
     ///  block.closeblock(Link(false_args, if_false, False),
     ///                   Link(true_args,  if_true,  True))`
     /// (`flowspace/model.py:175-180` + `:304`).
+    ///
+    /// RPython `flowcontext.py:744-779` unconditionally evaluates
+    /// `op.bool(w_value).eval(self)` before `guessbool`, so every
+    /// `block.exitswitch` Variable is the result of a `bool` HighLevelOp.
+    /// The rtyper then specialises `bool` per repr (`rmodel.py:251-260
+    /// CanBeNull → ptr_nonzero`; `rint.py IntegerRepr → identity`;
+    /// `rstr.py → str_nonzero`; etc.).  Pyre's flatten consumer asserts
+    /// `block.exitswitch.concretetype == lltype.Bool`
+    /// (`flatten.py:248`) — without the unconditional `bool` wrap, a
+    /// composite-pattern `match` / `if let` scrutinee of `Ref` kind
+    /// reaches `FlatOp::GotoIfNot` (`assembler.rs:559-578`), the
+    /// hard-coded `goto_if_not/iL` opname forces the walker into the
+    /// wrong register bank, and every LoadAttr/StoreAttr arm aborts with
+    /// `RegisterOutOfRange` (issue #115).  Routing the cond through a
+    /// `bool` hop here re-establishes the upstream invariant in one
+    /// place; the rtyper handles the per-repr specialisation downstream.
     pub fn set_branch(
         &mut self,
         block: BlockId,
@@ -4139,6 +4181,22 @@ impl FunctionGraph {
         if_false: BlockId,
         false_args: Vec<crate::flowspace::model::Variable>,
     ) {
+        // upstream: `op.bool(w_value).eval(self)` — append `bool` hop to
+        // `block.operations` before installing it as exitswitch.  The
+        // wrap is idempotent (a `bool(bool(_))` chain folds to identity
+        // through `IntegerRepr::rtype_bool` / `BoolRepr::rtype_bool`),
+        // mirroring upstream which also wraps unconditionally.
+        let cond = self
+            .push_op_var(
+                block,
+                OpKind::UnaryOp {
+                    op: "bool".into(),
+                    operand: cond,
+                    result_ty: ValueType::Bool,
+                },
+                true,
+            )
+            .expect("UnaryOp { op: \"bool\", .. } produces a value");
         // `flowspace/model.py:114 Link.__init__` arity assert per
         // arm — same rationale as `set_goto`.
         let true_inputarg_count = self.block(if_true).inputargs.len();
@@ -4442,6 +4500,31 @@ impl FunctionGraph {
 mod tests {
     use super::*;
 
+    /// `CallTarget::SyntheticTransparentCtor::path_segments()` must
+    /// return the full `(owner_path..., name)` join — `front/mir.rs`
+    /// `Aggregate` / `ShallowInitBox` lowerings rely on the qualified
+    /// identity to distinguish same-leaf ctors across owner enums
+    /// (`StepResult::Continue` vs `JitAction::Continue`).  Collapsing
+    /// to the bare leaf would collide their `HostObject` /
+    /// `getdesc(pyobj)` keys (`bookkeeper.py:353`).
+    #[test]
+    fn synthetic_transparent_ctor_path_segments_preserve_owner_path() {
+        let bare = CallTarget::synthetic_transparent_ctor("Continue");
+        assert_eq!(bare.path_segments(), Some(vec!["Continue"]));
+
+        let owned = CallTarget::synthetic_transparent_ctor_with_owner(
+            vec!["StepResult".to_string()],
+            "Continue",
+        );
+        assert_eq!(owned.path_segments(), Some(vec!["StepResult", "Continue"]));
+
+        let nested = CallTarget::synthetic_transparent_ctor_with_owner(
+            vec!["outer".to_string(), "Inner".to_string()],
+            "Leaf",
+        );
+        assert_eq!(nested.path_segments(), Some(vec!["outer", "Inner", "Leaf"]));
+    }
+
     #[test]
     fn graph_allocates_values_and_blocks() {
         let mut graph = FunctionGraph::new("demo");
@@ -4460,7 +4543,11 @@ mod tests {
         let next = graph.create_block();
         graph.set_branch(entry, cond_var, next, vec![], next, vec![]);
         assert_eq!(graph.blocks.len(), 4);
-        assert_eq!(graph.block(entry).operations.len(), 1);
+        // `set_branch` mirrors RPython `flowcontext.py:744-779`
+        // `op.bool(w_value).eval(self)` — every exitswitch is the result
+        // of an appended `bool` HighLevelOp, so a branching block carries
+        // the original Input op plus the bool wrap (2 ops total).
+        assert_eq!(graph.block(entry).operations.len(), 2);
         assert_eq!(graph.block(graph.returnblock).inputargs.len(), 1);
         assert_eq!(graph.block(graph.exceptblock).inputargs.len(), 2);
     }

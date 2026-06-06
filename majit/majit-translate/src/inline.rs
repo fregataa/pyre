@@ -658,6 +658,15 @@ fn remap_op_kind(
             value: remap_var(value),
             kind_char: *kind_char,
         },
+        OpKind::IsInstance {
+            obj,
+            class_carrier,
+            result_ty,
+        } => OpKind::IsInstance {
+            obj: remap_var(obj),
+            class_carrier: remap_var(class_carrier),
+            result_ty: result_ty.clone(),
+        },
         OpKind::Live => OpKind::Live,
         OpKind::JitMergePoint {
             jitdriver_index,
@@ -874,6 +883,11 @@ pub fn op_variable_refs(kind: &OpKind) -> Vec<crate::flowspace::model::Variable>
         OpKind::AssertGreen { value, .. }
         | OpKind::IsConstant { value, .. }
         | OpKind::IsVirtual { value, .. } => vec![clone_var(value)],
+        OpKind::IsInstance {
+            obj, class_carrier, ..
+        } => {
+            vec![clone_var(obj), clone_var(class_carrier)]
+        }
         OpKind::VtableMethodPtr { receiver, .. } => vec![clone_var(receiver)],
         OpKind::IndirectCall { funcptr, args, .. } => {
             let mut v = vec![clone_var(funcptr)];
@@ -1070,6 +1084,13 @@ pub fn is_pure_op(kind: &OpKind) -> bool {
         | OpKind::VtableMethodPtr { .. }
         // `newtuple` is `PureOperation` (`operation.py:542-548`).
         | OpKind::NewTuple { .. }
+        // `isinstance` lowers to `int_between` over `obj.typeptr`'s
+        // subclass-range fields plus an optional null branch — all
+        // pure reads, classified `canfold=True` upstream
+        // (`lloperation.py instance_isinstance`).  Keeping dead
+        // `IsInstance` results alive would block prune_dead_phis Step
+        // 5 even though the predicate is side-effect-free.
+        | OpKind::IsInstance { .. }
         // `LoadStatic` reads a `static` declaration's compile-time
         // address — equivalent to `LOAD_GLOBAL` → Constant lookup,
         // pure.

@@ -523,16 +523,24 @@ impl Assembler {
             // RPython flatten.py:247-267: goto_if_not(cond, TLabel(false_path))
             // Only goto_if_not exists — no goto_if_true in RPython.
             FlatOp::GotoIfNot { cond, target } => {
-                // RPython parity expectation: `cond.kind == RegKind::Int`
-                // because `block.exitswitch.concretetype == lltype.Bool`
-                // is the build-time gate at `flatten.py:248`.  Pyre's
-                // annotator/rtyper coverage gap (TODO #71/#74)
-                // occasionally lets a Ref cond reach this site (e.g.
-                // `eval_loop_jit`'s portal bool branches).  The
-                // `cond.index` byte still encodes the regalloc color
-                // correctly so emission proceeds; the parity gap is
-                // tracked above lookup_coloring_var rather than asserted
-                // here.
+                // RPython parity: `cond.kind == RegKind::Int` because
+                // `block.exitswitch.concretetype == lltype.Bool` is the
+                // build-time gate at `flatten.py:248`.  Pyre routes
+                // every Variable-cond exitswitch installation through
+                // `FunctionGraph::set_branch` (model.rs), which appends
+                // a `bool` UnaryOp (flowcontext.py:756
+                // `Variable.bool().eval(self)`) so the rtyper lowers
+                // the cond to a Bool register before flatten emits.
+                // Fail loud if a non-Int slips through — mirrors
+                // `FlatOp::Switch`'s assert below.
+                assert_eq!(
+                    cond.kind,
+                    RegKind::Int,
+                    "FlatOp::GotoIfNot.cond must be RegKind::Int \
+                     (flatten.py:248 `block.exitswitch.concretetype == lltype.Bool`); \
+                     got {:?}",
+                    cond.kind,
+                );
                 let opnum = self.get_opnum("goto_if_not/iL");
                 state.startpoints.insert(state.code.len());
                 state.code.push(opnum);
@@ -2118,6 +2126,7 @@ impl Assembler {
                 OpKind::CurrentTraceLength => "CurrentTraceLength",
                 OpKind::IsConstant { .. } => "IsConstant",
                 OpKind::IsVirtual { .. } => "IsVirtual",
+                OpKind::IsInstance { .. } => "IsInstance",
                 OpKind::ConditionalCall { .. } => "ConditionalCall",
                 OpKind::ConditionalCallValue { .. } => "ConditionalCallValue",
                 OpKind::RecordKnownResult { .. } => "RecordKnownResult",
@@ -3273,6 +3282,21 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         OpKind::IsVirtual { kind_char, .. } => {
             format!("{}_isvirtual", kind_char_to_name(*kind_char))
         }
+        // The rtyper at rtyper.rs:2035 dispatches the flowspace
+        // `"isinstance"` opname through `InstanceRepr::rtype_isinstance`,
+        // which lowers it into a direct_call to the per-class
+        // `ll_isinstance_const_*` or unspecialised `ll_isinstance`
+        // helper.  By the time the codewriter assembler runs every
+        // `OpKind::IsInstance` should already have been replaced with
+        // that direct_call, so reaching this arm signals an rtyper
+        // gap.  Fail loudly rather than emit an `"isinstance"` opname
+        // with no corresponding entry in `insns.rs::wellknown_bh_insns`.
+        OpKind::IsInstance { .. } => panic!(
+            "OpKind::IsInstance reached the JitCode assembler; the rtyper \
+             must lower isinstance to ll_isinstance* direct_call before \
+             codewriter emission (rtyper.rs:2035 / \
+             InstanceRepr::rtype_isinstance)"
+        ),
         OpKind::RecordKnownResult { result_kind, .. } => {
             format!("record_known_result_{result_kind}")
         }

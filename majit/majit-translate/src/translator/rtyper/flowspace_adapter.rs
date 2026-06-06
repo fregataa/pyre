@@ -592,11 +592,10 @@ fn fmt_op_result(op: &SpaceOperation) -> String {
 /// `true` iff `kind` is a 0-arg unit-variant transparent ctor
 /// (`StepResult::Continue`, `LoopResult::Done`, …) that [`translate_op`]
 /// pre-folds to a `Constant` and emits no `FlowspaceOp` (the unit-variant
-/// guard at the top of `translate_op`).  The `?` / Result / Option
-/// transparent-ctor handling has no RPython counterpart; this is the one
-/// shape that records nothing, so [`op_canraise`] and [`translate_op`]
-/// consult the SAME predicate — `op_canraise` is false exactly when
-/// `translate_op` emits no op.
+/// guard at the top of `translate_op`).
+///
+/// [`op_canraise`] and [`translate_op`] consult the SAME predicate —
+/// `op_canraise` is false exactly when `translate_op` emits no op.
 fn is_elided_unit_variant_ctor(kind: &OpKind) -> bool {
     if let OpKind::Call {
         target: crate::model::CallTarget::SyntheticTransparentCtor { name, owner_path },
@@ -893,6 +892,29 @@ pub fn translate_op(
             Ok(vec![FlowspaceOp::new(
                 normalize_unary_op_name(opname)?,
                 vec![v],
+                result,
+            )])
+        }
+
+        // ─── `isinstance` — RPython `space.isinstance(obj, cls)` ───
+        // `flowspace/operation.py:259 isinstance → OpKind::IsInstance`.
+        // Emitted pre-rtyper by `front/ast.rs` at `TupleStruct` /
+        // composite match-cascade payload sites where a unit-variant
+        // ptr_eq does not suffice. The rtyper dispatches `"isinstance"`
+        // at `rtyper.rs:2035 translate_unary_operation` →
+        // `InstanceRepr::rtype_isinstance`, which mints either a
+        // per-class `ll_isinstance_const_*` helper (Constant
+        // `class_carrier`) or the generic `ll_isinstance` helper
+        // (Variable `class_carrier`).
+        OpKind::IsInstance {
+            obj, class_carrier, ..
+        } => {
+            let obj_hl = lookup_operand(value_map, obj, op, "obj")?;
+            let cls_hl = lookup_operand(value_map, class_carrier, op, "class_carrier")?;
+            let result = resolve_result_hlvalue(op, value_map)?;
+            Ok(vec![FlowspaceOp::new(
+                "isinstance",
+                vec![obj_hl, cls_hl],
                 result,
             )])
         }
@@ -1486,6 +1508,7 @@ fn opkind_variant_name(kind: &OpKind) -> &'static str {
         OpKind::CurrentTraceLength => "CurrentTraceLength",
         OpKind::IsConstant { .. } => "IsConstant",
         OpKind::IsVirtual { .. } => "IsVirtual",
+        OpKind::IsInstance { .. } => "IsInstance",
         OpKind::ConditionalCall { .. } => "ConditionalCall",
         OpKind::ConditionalCallValue { .. } => "ConditionalCallValue",
         OpKind::RecordKnownResult { .. } => "RecordKnownResult",
@@ -3151,6 +3174,63 @@ mod tests {
             panic!("ctor callable must be ConstValue::HostObject");
         };
         assert_eq!(host.qualname(), "Point");
+    }
+
+    #[test]
+    fn translate_op_isinstance_lowers_to_flowspace_isinstance() {
+        // OpKind::IsInstance arrives from the tuple-struct match
+        // cascade (`front/ast.rs:7467`).  Emit a single
+        // `isinstance(obj, cls)` flowspace op so the rtyper dispatches
+        // to `InstanceRepr::rtype_isinstance`.
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let graph = translate_op_test_graph(10);
+        let obj_hl_var = Variable::new();
+        let cls_hl_var = Variable::new();
+        let result_hl_var = Variable::new();
+        value_map.insert(
+            graph.must_variable_at(1),
+            Hlvalue::Variable(obj_hl_var.clone()),
+        );
+        value_map.insert(
+            graph.must_variable_at(2),
+            Hlvalue::Variable(cls_hl_var.clone()),
+        );
+        value_map.insert(
+            graph.must_variable_at(3),
+            Hlvalue::Variable(result_hl_var.clone()),
+        );
+        let op = SpaceOperation {
+            result: Some(graph.must_variable_at(3)),
+            kind: OpKind::IsInstance {
+                obj: graph.must_variable_at(1),
+                class_carrier: graph.must_variable_at(2),
+                result_ty: ValueType::Bool,
+            },
+        };
+        let translated = translate_op(&op, &value_map, &empty_call_registry(), &graph)
+            .expect("OpKind::IsInstance must lower");
+        assert_eq!(translated.len(), 1);
+        assert_eq!(
+            translated[0].opname, "isinstance",
+            "IsInstance must emit the flowspace `isinstance` opname",
+        );
+        assert_eq!(translated[0].args.len(), 2, "isinstance args: [obj, cls]");
+        match &translated[0].args[0] {
+            Hlvalue::Variable(v) => assert_eq!(v, &obj_hl_var, "args[0] must be obj"),
+            other => panic!("args[0] must be Variable, got {other:?}"),
+        }
+        match &translated[0].args[1] {
+            Hlvalue::Variable(v) => {
+                assert_eq!(v, &cls_hl_var, "args[1] must be class_carrier")
+            }
+            other => panic!("args[1] must be Variable, got {other:?}"),
+        }
+        match &translated[0].result {
+            Hlvalue::Variable(v) => {
+                assert_eq!(v, &result_hl_var, "result must follow value_map mapping")
+            }
+            other => panic!("result must be Variable, got {other:?}"),
+        }
     }
 
     #[test]

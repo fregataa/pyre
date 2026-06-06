@@ -2084,6 +2084,25 @@ impl InstanceRepr {
         self.gcflavor
     }
 
+    /// RPython `InstanceRepr.common_repr(self)` (rclass.py:932-933):
+    ///
+    /// ```python
+    /// def common_repr(self):  # -> object or nongcobject reprs
+    ///     return getinstancerepr(self.rtyper, None, self.gcflavor)
+    /// ```
+    ///
+    /// Returns the root `InstanceRepr` for this instance's gcflavor —
+    /// the one whose `lowleveltype` is `OBJECTPTR` (or `NONGCOBJECTPTR`
+    /// for non-GC flavors). `rtype_isinstance` (rclass.py:1019-1021)
+    /// uses this to convert `v_obj` to the common base type before the
+    /// runtime check.
+    pub fn common_repr(&self) -> Result<Arc<InstanceRepr>, TyperError> {
+        let rtyper = self.rtyper.upgrade().ok_or_else(|| {
+            TyperError::message("InstanceRepr.common_repr: rtyper weak ref expired")
+        })?;
+        getinstancerepr(&rtyper, None, self.gcflavor)
+    }
+
     /// Read-only view of the instance-level `fields` dict populated by
     /// `_setup_repr`. RPython `self.fields` (rclass.py:557).
     pub fn fields(&self) -> std::cell::Ref<'_, HashMap<String, (String, Arc<dyn Repr>)>> {
@@ -2855,6 +2874,129 @@ impl Repr for InstanceRepr {
             ClassReprArc::Root(r) => r.getclsfield(Hlvalue::Variable(v_cls), &attr, &mut llops)?,
         };
         Ok(Some(Hlvalue::Variable(var)))
+    }
+
+    /// RPython `InstanceRepr.rtype_bool(self, hop)` (rclass.py:866-868):
+    ///
+    /// ```python
+    /// def rtype_bool(self, hop):
+    ///     vinst, = hop.inputargs(self)
+    ///     return hop.genop('ptr_nonzero', [vinst], resulttype=Bool)
+    /// ```
+    ///
+    /// `InstanceRepr` does not inherit from `CanBeNull` upstream, so the
+    /// constant fast-path in [`crate::translator::rtyper::rmodel::can_be_null_rtype_bool`]
+    /// is intentionally absent here — a non-null instance always evaluates
+    /// to true and the lowleveltype carrier is a `Ptr(GcStruct)` that
+    /// `ptr_nonzero` lowers directly to a null comparison.
+    fn rtype_bool(&self, hop: &HighLevelOp) -> RTypeResult {
+        use crate::translator::rtyper::rtyper::{ConvertedTo, GenopResult};
+        let vlist = hop.inputargs(vec![ConvertedTo::Repr(self)])?;
+        Ok(hop.genop(
+            "ptr_nonzero",
+            vlist,
+            GenopResult::LLType(LowLevelType::Bool),
+        ))
+    }
+
+    /// RPython `InstanceRepr.rtype_isinstance(self, hop)` (rclass.py:1019-1032):
+    ///
+    /// ```python
+    /// def rtype_isinstance(self, hop):
+    ///     class_repr = get_type_repr(hop.rtyper)
+    ///     instance_repr = self.common_repr()
+    ///
+    ///     v_obj, v_cls = hop.inputargs(instance_repr, class_repr)
+    ///     if isinstance(v_cls, Constant):
+    ///         cls = v_cls.value
+    ///         llf, llf_nonnull = make_ll_isinstance(self.rtyper, cls)
+    ///         if hop.args_s[0].can_be_None:
+    ///             return hop.gendirectcall(llf, v_obj)
+    ///         else:
+    ///             return hop.gendirectcall(llf_nonnull, v_obj)
+    ///     else:
+    ///         return hop.gendirectcall(ll_isinstance, v_obj, v_cls)
+    /// ```
+    ///
+    /// Constant `v_cls` is recognised here and routed through
+    /// [`make_ll_isinstance`] (rclass.py:1149-1168) to pick up the
+    /// per-class `int_between` / `ptr_eq` specialisation. The choice
+    /// between `ll_isinstance_const` (null-checking) and
+    /// `ll_isinstance_const_nonnull` (assumes nonnull) is driven by
+    /// `hop.args_s[0].can_be_None`. Variable `v_cls` falls through to
+    /// the unspecialised `ll_isinstance` helper minted by E.1.
+    fn rtype_isinstance(&self, hop: &HighLevelOp) -> RTypeResult {
+        use crate::translator::rtyper::rtyper::{ConvertedTo, make_ll_isinstance};
+
+        // upstream: `class_repr = get_type_repr(hop.rtyper)`.
+        let rtyper = self.rtyper.upgrade().ok_or_else(|| {
+            TyperError::message("InstanceRepr.rtype_isinstance: rtyper weak ref expired")
+        })?;
+        let class_repr = get_type_repr(&rtyper)?;
+        // upstream: `instance_repr = self.common_repr()`.
+        let instance_repr = self.common_repr()?;
+
+        // upstream: `v_obj, v_cls = hop.inputargs(instance_repr, class_repr)`.
+        let v_args = hop.inputargs(vec![
+            ConvertedTo::Repr(instance_repr.as_ref() as &dyn Repr),
+            ConvertedTo::Repr(class_repr.as_ref()),
+        ])?;
+        let v_obj = v_args[0].clone();
+        let v_cls = v_args[1].clone();
+
+        // upstream: `if isinstance(v_cls, Constant):`.
+        if let Hlvalue::Constant(c) = &v_cls {
+            // upstream: `cls = v_cls.value`. The constant carries an
+            // `_ptr` to the vtable; subclassrange_{min,max} are read
+            // off it by make_ll_isinstance.
+            let ConstValue::LLPtr(c_ptr) = &c.value else {
+                return Err(TyperError::message(format!(
+                    "InstanceRepr.rtype_isinstance: constant v_cls must \
+                     carry an _ptr, got {:?}",
+                    c.value
+                )));
+            };
+            // upstream: `llf, llf_nonnull = make_ll_isinstance(self.rtyper, cls)`.
+            // `v_obj` has been coerced through `instance_repr.lowleveltype()`
+            // (OBJECTPTR for gc flavor, NONGCOBJECTPTR for raw); pass it
+            // through so the minted helper's `obj` parameter type matches
+            // the actual `v_obj`'s lltype upstream's "obj should be cast
+            // to OBJECT or NONGCOBJECT" polymorphism (rclass.py:1143).
+            let (ll_const, ll_const_nonnull) =
+                make_ll_isinstance(&rtyper, c_ptr, instance_repr.lowleveltype())?;
+            // upstream: `if hop.args_s[0].can_be_None: ...`. The
+            // `can_be_None` flag rides on the annotator's
+            // SomeInstance / SomePBC carriers — None elsewhere means
+            // the obj is statically known non-null, so the nonnull
+            // variant skips the runtime branch.
+            let can_be_none = {
+                let args_s = hop.args_s.borrow();
+                match args_s.get(0) {
+                    Some(SomeValue::Instance(inst)) => inst.can_be_none,
+                    Some(SomeValue::PBC(pbc)) => pbc.can_be_none,
+                    _ => true,
+                }
+            };
+            let helper = if can_be_none {
+                ll_const
+            } else {
+                ll_const_nonnull
+            };
+            return hop.gendirectcall(&helper, vec![v_obj]);
+        }
+
+        // upstream variable case: `gendirectcall(ll_isinstance, v_obj, v_cls)`.
+        // `v_obj` was coerced through `instance_repr.lowleveltype()`,
+        // which is `OBJECTPTR` for the GC flavor and `NONGCOBJECTPTR`
+        // for raw-flavor instances — hard-coding `OBJECTPTR` would
+        // mint a helper signature that mismatches the actual argument
+        // type for non-GC paths.
+        let helper = rtyper.lowlevel_helper_function(
+            "ll_isinstance",
+            vec![instance_repr.lowleveltype().clone(), CLASSTYPE.clone()],
+            LowLevelType::Bool,
+        )?;
+        hop.gendirectcall(&helper, vec![v_obj, v_cls])
     }
 
     /// RPython `InstanceRepr.convert_const(self, value)` (rclass.py:772-792):
