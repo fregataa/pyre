@@ -873,28 +873,44 @@ class W_Socket(W_Root):
         except SocketError as e:
             raise converted_error(space, e)
 
-    @unwrap_spec(level=int, optname=int)
-    def setsockopt_w(self, space, level, optname, w_optval):
-        """setsockopt(level, option, value)
+    def setsockopt_w(self, space, __args__):
+        """setsockopt(level, option, value: int)
+        setsockopt(level, option, value: buffer)
+        setsockopt(level, option, None, optlen: int)
 
         Set a socket option.  See the Unix manual for level and option.
-        The value argument can either be an integer or a string.
+        The value argument can either be an integer, a string buffer, or
+        None, optlen.");
         """
-        try:
-            optval = space.c_int_w(w_optval)
-        except OperationError as e:
-            if e.async(space):
-                raise
-            optval = space.charbuf_w(w_optval)
+        args_w = __args__.arguments_w
+        n_args = len(args_w)
+        level = space.c_int_w(args_w[0])
+        optname = space.c_int_w(args_w[1])
+        if n_args == 3:
             try:
-                self.sock.setsockopt(level, optname, optval)
+                optval = space.c_int_w(args_w[2])
+            except OperationError as e:
+                if e.async(space):
+                    raise
+                optval = space.charbuf_w(args_w[2])
+                try:
+                    self.sock.setsockopt(level, optname, optval)
+                except SocketError as e:
+                    raise converted_error(space, e)
+                return
+            try:
+                self.sock.setsockopt_int(level, optname, optval)
             except SocketError as e:
                 raise converted_error(space, e)
-            return
-        try:
-            self.sock.setsockopt_int(level, optname, optval)
-        except SocketError as e:
-            raise converted_error(space, e)
+        elif n_args == 4:
+            if not space.is_none(args_w[2]):
+                raise oefmt(space.w_TypeError,
+                      "setsockopt() takse exactly 3 arguments (4 given)")
+            optlen = space.int_w(args_w[2])
+            try:
+                self.sock.setsockopt_None(level, optname, optlen)
+            except SocketError as e:
+                raise converted_error(space, e)
 
     def settimeout_w(self, space, w_timeout):
         """settimeout(timeout)

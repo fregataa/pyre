@@ -930,12 +930,12 @@ def test_sendmsg_afalg_aes_cbc():
     _alg_skip_if_unavailable()
     key = bytes.fromhex('06a9214036b8a15b512e03d534120006')
     iv = bytes.fromhex('3dafba429d9eb430b422da802c9fac41')
-    msg = b"Single block msg"
+    msg = b"single block msg"
     ciphertext = bytes.fromhex('e353779c1079aeb82708942dbe77181a')
     msglen = len(msg)
     algo = _alg_create('skcipher', 'cbc(aes)')
     try:
-        algo.setsockopt(_socket.SOL_ALG, _socket.ALG_SET_KEY, key)
+        algo.setsockopt(_socket.sol_alg, _socket.alg_set_key, key)
         fd, _ = algo._accept()
         op = _socket.socket(_socket.AF_ALG, _socket.SOCK_SEQPACKET, 0, fd)
         try:
@@ -954,3 +954,18 @@ def test_sendmsg_afalg_aes_cbc():
             op.close()
     finally:
         algo.close()
+
+def test_setsockopt_aead():
+    import _socket
+    _alg_skip_if_unavailable()
+    key = bytes.fromhex('06a9214036b8a15b512e03d534120006')
+    expected_tag = bytes.fromhex('0032a1dc85f1c9786925a2e71d8272dd')
+    taglen = len(expected_tag)
+    algo = _alg_create('aead', 'gcm(aes)')
+    try:
+        algo.setsockopt(socket.SOL_ALG, socket.ALG_SET_KEY, key)
+        algo.setsockopt(socket.SOL_ALG, socket.ALG_SET_AEAD_AUTHSIZE,
+                        None, taglen)
+    finally:
+        algo.close()
+ 
