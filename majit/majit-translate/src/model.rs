@@ -2789,6 +2789,84 @@ fn ptr_gckind(
     }
 }
 
+/// Per-function effect attributes — the metadata `call.py` /
+/// `collectanalyze.py` read off `graph.func` (or, for a graph-less
+/// external call, off `funcobj`). Carried directly on the
+/// [`FunctionGraph`] (`graph.func`) for functions that have a graph, and
+/// in `CallControl::external_funcobjs` keyed by `CallPath` for graph-less
+/// externals (the `jit.*` intrinsics, `Vec::len`, etc.).
+///
+/// The raw source-attribute tokens (`_elidable_function_`,
+/// `_jit_loop_invariant_`, the open `_jit_*_` policy hints like
+/// `look_inside` / `unroll_safe` / `aroundstate`) also live on
+/// [`FunctionGraph::hints`], the unbounded token bag that
+/// [`crate::jit_codewriter::policy`] matches against the synthesized
+/// `SemanticFunction`. This struct is the typed carrier the CallControl
+/// effect analyzers read instead of string-searching `hints` — matching
+/// RPython's `getattr(func, <attr>)` reads — and is also the home for
+/// the attributes that were previously kept in per-`CallControl`
+/// GraphId-keyed side tables.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FuncEffects {
+    /// `func.oopspec` (rlib/jit.py:250 `@oopspec(spec)`). Its presence is
+    /// the builtin signal (call.py:135 `if hasattr(targetgraph.func,
+    /// 'oopspec'): return 'builtin'`).
+    pub oopspec: Option<String>,
+    /// `argnames = ll_func.__code__.co_varnames[:nb_args]`
+    /// (support.py:705) — declaration-order parameter names used by
+    /// `parse_oopspec` to resolve identifier slots in the spec's `(...)`
+    /// pattern. Empty when no `(...)`-bearing spec was registered.
+    pub oopspec_argnames: Vec<String>,
+    /// `func._gctransformer_hint_cannot_collect_` (collectanalyze.py:15)
+    /// — `analyze_can_collect` returns False immediately.
+    pub cannot_collect: bool,
+    /// `funcobj.random_effects_on_gcobjs` (collectanalyze.py:21-25). Only
+    /// meaningful for an external (graph-less) funcobj; a graph-bearing
+    /// function derives can-collect by walking the graph instead.
+    pub random_effects_on_gcobjs: bool,
+    /// pyre `#[majit_macros::elidable_cannot_raise]` user assertion that
+    /// the callee never raises (honoured by `getcalldescr`'s elidable
+    /// branch before consulting `_canraise`).
+    pub cannot_raise_assertion: bool,
+    /// pyre `#[majit_macros::elidable_or_memerror]` user assertion that
+    /// the callee raises only MemoryError.
+    pub memerror_only_assertion: bool,
+    /// `func._elidable_function_` (call.py:239) — the typed carrier the
+    /// CallControl analyzers read (`is_elidable`, indirect-family check).
+    /// The same `"elidable"` token also stays in [`FunctionGraph::hints`]
+    /// for the policy `SemanticFunction` path.
+    pub elidable: bool,
+    /// `func._jit_loop_invariant_` (call.py:240).
+    pub loop_invariant: bool,
+    /// `func._gctransformer_hint_close_stack_` (call.py:129-134) — a
+    /// close_stack callee must never produce a JitCode and is classified
+    /// `Residual` by `guess_call_kind`.
+    pub close_stack: bool,
+}
+
+impl FuncEffects {
+    /// Fold `other`'s set attributes into `self`. Used when a graph is
+    /// registered *after* a `mark_*` already recorded effects on the
+    /// graph-less external funcobj record for the same path, so the typed
+    /// carrier ends up registration-order-insensitive (every present
+    /// value / set flag in `other` wins; cleared flags never unset `self`).
+    pub fn merge_from(&mut self, other: &FuncEffects) {
+        if other.oopspec.is_some() {
+            self.oopspec = other.oopspec.clone();
+        }
+        if !other.oopspec_argnames.is_empty() {
+            self.oopspec_argnames = other.oopspec_argnames.clone();
+        }
+        self.cannot_collect |= other.cannot_collect;
+        self.random_effects_on_gcobjs |= other.random_effects_on_gcobjs;
+        self.cannot_raise_assertion |= other.cannot_raise_assertion;
+        self.memerror_only_assertion |= other.memerror_only_assertion;
+        self.elidable |= other.elidable;
+        self.loop_invariant |= other.loop_invariant;
+        self.close_stack |= other.close_stack;
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FunctionGraph {
     pub name: String,
@@ -2866,6 +2944,11 @@ pub struct FunctionGraph {
     /// carrier directly. Empty for graphs with no hints (the common case
     /// and all `FunctionGraph::new` fixtures).
     pub hints: Vec<String>,
+    /// Per-function effect attributes RPython reads off `graph.func`
+    /// (`func.oopspec`, `_gctransformer_hint_cannot_collect_`, …). Default
+    /// (all unset) for `FunctionGraph::new` fixtures; production
+    /// registration stamps these through `CallControl::mark_*`.
+    pub func: FuncEffects,
 }
 
 impl FunctionGraph {
@@ -2939,6 +3022,7 @@ impl FunctionGraph {
             return_type: None,
             owner_root: None,
             hints: Vec::new(),
+            func: FuncEffects::default(),
         }
     }
 

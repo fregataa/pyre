@@ -463,6 +463,105 @@ pub struct JitDriverStaticData {
     pub greenfield_info: Option<std::sync::Arc<dyn GreenFieldInfoHandle>>,
 }
 
+/// Identity of a source funcobj: `(owner_root, name)`.
+///
+/// `name` is the graph's `name_path()` — Charon's fully-qualified path for
+/// a free function (unique per source), `owner_root` the impl type for a
+/// method (so two impls' same-named methods, e.g. `PyFrame::push_value` vs
+/// `MIFrame::push_value`, stay distinct).  Every alias spelling of one
+/// source funcobj resolves to the same `GraphKey`.
+type GraphKey = (Option<String>, String);
+
+/// Storage for registered graphs that mirrors RPython's
+/// `{name: funcobj}` indirection: many call-path spellings (aliases) name
+/// the **same** `FunctionGraph` object, reached through every name.
+///
+/// Pyre lifts each function once but a call site can reach it under
+/// several `CallPath` spellings (bare, `crate::`-prefixed, module-
+/// qualified, re-export aliases — see `lib.rs::free_function_alias_paths`).
+/// Keying graph storage by `CallPath` directly would clone a distinct
+/// graph per spelling, so `graph.func` (the funcobj effect attributes
+/// RPython reads via `getattr(targetgraph.func, …)`) would not be shared
+/// across aliases.  This indirection keeps one graph per source funcobj:
+/// `path_to_key` maps every alias spelling to the funcobj's `GraphKey`,
+/// and `graphs` holds the single shared graph — so a mark on any alias is
+/// observed through every sibling alias, matching `call.py:29 {graph:
+/// jitcode}` object identity.
+///
+/// This is graph-**storage** identity (one funcobj, many names), distinct
+/// from the retired per-effect `GraphId` surrogate: effects live on
+/// `graph.func` inside the shared graph, never in a side table keyed by a
+/// surrogate token.
+#[derive(Default)]
+pub(crate) struct GraphStore {
+    path_to_key: HashMap<CallPath, GraphKey>,
+    graphs: HashMap<GraphKey, FunctionGraph>,
+}
+
+impl GraphStore {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register `graph` under `path`.  When another alias of the same
+    /// source funcobj (same `GraphKey`) is already stored, keep the one
+    /// shared graph object and fold this registration's attributes onto it
+    /// monotonically — accumulate effects, adopt hints / return type if the
+    /// stored graph lacks them — so neither registration order nor a
+    /// hint-less first insert drops metadata a later alias carried.
+    pub(crate) fn insert(&mut self, path: CallPath, graph: FunctionGraph) {
+        let key = (graph.owner_root.clone(), graph.name.clone());
+        match self.graphs.get_mut(&key) {
+            Some(existing) => {
+                existing.func.merge_from(&graph.func);
+                if !graph.hints.is_empty() {
+                    existing.hints = graph.hints;
+                }
+                if existing.return_type.is_none() {
+                    existing.return_type = graph.return_type;
+                }
+            }
+            None => {
+                self.graphs.insert(key.clone(), graph);
+            }
+        }
+        self.path_to_key.insert(path, key);
+    }
+
+    pub(crate) fn get(&self, path: &CallPath) -> Option<&FunctionGraph> {
+        self.graphs.get(self.path_to_key.get(path)?)
+    }
+
+    pub(crate) fn get_mut(&mut self, path: &CallPath) -> Option<&mut FunctionGraph> {
+        let key = self.path_to_key.get(path)?.clone();
+        self.graphs.get_mut(&key)
+    }
+
+    pub(crate) fn contains_key(&self, path: &CallPath) -> bool {
+        self.path_to_key.contains_key(path)
+    }
+
+    /// Every registered alias spelling (one entry per `CallPath`, not per
+    /// shared graph) — matches the old `HashMap<CallPath, _>::keys()`.
+    pub(crate) fn keys(&self) -> impl Iterator<Item = &CallPath> {
+        self.path_to_key.keys()
+    }
+
+    /// `(alias path, shared graph)` for every registered spelling.  The
+    /// same graph appears once per alias, mirroring the old per-path map.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&CallPath, &FunctionGraph)> {
+        self.path_to_key
+            .iter()
+            .filter_map(move |(p, k)| self.graphs.get(k).map(|g| (p, g)))
+    }
+
+    /// Number of registered alias spellings (path count), matching the old
+    /// `HashMap<CallPath, _>::len()` so `iter()`-sized allocations stay correct.
+    pub(crate) fn len(&self) -> usize {
+        self.path_to_key.len()
+    }
+}
+
 /// Call control — decides inline vs residual for each call target.
 ///
 /// RPython: `call.py::CallControl`.
@@ -476,22 +575,12 @@ pub struct JitDriverStaticData {
 /// (free functions via `collect_function_graphs` and trait impl methods
 /// via `extract_trait_impls`).
 
-/// Process-local numeric graph identity — the faithful Rust analog of
-/// RPython keying its call graph on graph OBJECT identity
-/// (`rpython/jit/codewriter/call.py:30 self.jitcodes = {} # map {graph:
-/// jitcode}`). `crate::model::FunctionGraph` has no Python-style object
-/// identity, and it is NOT the flowspace graph that `GraphKey` /
-/// `lltype::Func.graph` wraps, so this is a fresh CallControl-owned token
-/// rather than a reuse of `GraphKey::as_usize`. Deliberately NOT
-/// `Serialize`: identity is process-local; the serde-stable graph
-/// reference stays `CallPath` (`CallTarget::Method.resolved_path`).
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct GraphId(u32);
-
 pub struct CallControl {
-    /// Free function graphs: CallPath → FunctionGraph.
-    /// RPython: `funcptr._obj.graph` linkage.
-    function_graphs: HashMap<CallPath, FunctionGraph>,
+    /// Registered graphs, keyed by call path through a funcobj-identity
+    /// indirection so alias spellings share one `FunctionGraph` (and thus
+    /// one `graph.func`).  RPython: `funcptr._obj.graph` linkage +
+    /// `{name: funcobj}` aliasing.
+    function_graphs: GraphStore,
 
     /// Leaf-name → free-function `CallPath`s with `owner_root.is_none()`.
     ///
@@ -518,25 +607,15 @@ pub struct CallControl {
     /// `[receiver_leaf, method_name]`.
     impl_method_leaf_index: HashMap<String, Vec<CallPath>>,
 
-    /// CallPath → [`GraphId`] mint map — established at
-    /// `register_function_graph` / `register_trait_method`. Many CallPaths
-    /// (the alias spellings of one source graph) may map to the SAME
-    /// GraphId; see [`Self::graph_id_by_identity`].
-    graph_ids: HashMap<CallPath, GraphId>,
-    /// Graph-object identity `(owner_root, name)` → [`GraphId`] — the
-    /// surrogate for RPython `call.py:29 {graph: jitcode}` (keyed on the
-    /// graph *object*). A free function registers clones of one source
-    /// graph under several alias spellings, all sharing
-    /// `(None, func.name)`; interning routes through this map so every
-    /// alias converges on a single GraphId and the GraphId-keyed effect
-    /// maps hold one entry per graph rather than one per alias. Impl
-    /// methods key on `(Some(impl_type), method_name)`, so two impls of
-    /// one trait (e.g. `PyFrame::push_value` vs `MIFrame::push_value`)
-    /// stay on distinct GraphIds — the bare name alone collides, the
-    /// owner_root disambiguates.
-    graph_id_by_identity: HashMap<(Option<String>, String), GraphId>,
-    /// Monotonic [`GraphId`] counter.
-    next_graph_id: u32,
+    /// `func` effect attributes for graph-less external functions — the
+    /// `jit.*` intrinsics (`jit.isconstant`, …) and externals like
+    /// `Vec::len` that carry `#[oopspec]` / `random_effects_on_gcobjs`
+    /// without a registered [`FunctionGraph`]. RPython reads these off the
+    /// external `funcobj` (`op.args[0].value._obj`); pyre has no funcobj
+    /// for a graph-less call, so the per-`CallPath` record is the funcobj
+    /// analog. Graph-bearing functions carry the same [`FuncEffects`] on
+    /// the graph itself (`graph.func`); see [`Self::func_effects`].
+    external_funcobjs: HashMap<CallPath, crate::model::FuncEffects>,
 
     /// Trait bindings: `(trait_root, method_name)` → `Vec<impl_type>`.
     ///
@@ -572,10 +651,6 @@ pub struct CallControl {
     /// RPython: `JitDriverStaticData` — metadata for each jitdriver.
     /// `jitdrivers_sd[i]` holds the green/red arg layout for driver i.
     jitdrivers_sd: Vec<JitDriverStaticData>,
-
-    /// Builtin targets (oopspec operations).
-    /// RPython: detected via `funcobj.graph.func.oopspec`.
-    builtin_targets: HashSet<GraphId>,
 
     /// RPython: `CallControl.jitcodes` — map {graph_key: JitCode}.
     /// Pyre stores `Arc<JitCode>` shells so callers (e.g.
@@ -682,25 +757,6 @@ pub struct CallControl {
     /// (`heap.py:540-560`, `heap.rs:839 array_effect_index`).
     pub descr_indices: DescrIndexRegistry,
 
-    /// Pyre extension: targets whose source carries
-    /// `#[majit_macros::elidable_cannot_raise]` — a user assertion that
-    /// the callee never raises.  Honoured by `getcalldescr`'s elidable
-    /// branch before consulting `_canraise`, because pyre's exception
-    /// analyser defaults to `analyze_external_call → True` for any
-    /// callee outside `function_graphs` (Vec::len, pyframe_get_pycode,
-    /// etc.) and cannot recover `EF_ELIDABLE_CANNOT_RAISE` on its own
-    /// the way RPython's analyser does upstream.  Without honouring the
-    /// assertion, every `#[elidable_cannot_raise]` callsite is downgraded
-    /// to `ElidableCanRaise` and pays an unnecessary GUARD_NO_EXCEPTION.
-    cannot_raise_assertion_targets: HashSet<GraphId>,
-
-    /// Pyre extension: targets whose source carries
-    /// `#[majit_macros::elidable_or_memerror]` — a user assertion that
-    /// the callee raises only MemoryError.  Mirrors
-    /// `cannot_raise_assertion_targets` for the `EF_ELIDABLE_OR_MEMORYERROR`
-    /// branch of RPython's `call.py:292-298` 3-way split.
-    memerror_only_assertion_targets: HashSet<GraphId>,
-
     /// RPython: known struct types for `get_type_flag(ARRAY.OF)` → FLAG_STRUCT.
     /// If an array's element type is in this set, the array descriptor gets
     /// `ArrayFlag::Struct` (like RPython's `isinstance(TYPE, lltype.Struct)`).
@@ -725,33 +781,6 @@ pub struct CallControl {
     /// bypassing the type-string heuristic. The runtime/proc-macro populates
     /// this via `set_struct_layout()`.
     pub struct_layouts: HashMap<String, StructLayout>,
-    /// RPython: collectanalyze.py:15 — _gctransformer_hint_cannot_collect_.
-    /// Functions known not to trigger GC collection. The collect_analyzer
-    /// returns False immediately for these.
-    pub cannot_collect_targets: HashSet<GraphId>,
-    /// RPython: collectanalyze.py:21-25 — funcobj.random_effects_on_gcobjs.
-    /// External functions whose calls may have random effects on GC objects.
-    /// analyze_can_collect returns True immediately for these.
-    pub external_gc_effects: HashSet<GraphId>,
-
-    /// RPython: rlib/jit.py:250 `@oopspec(spec)` — `getattr(func, 'oopspec', None)`.
-    /// Maps call target → oopspec string (e.g. "jit.isconstant(value)").
-    /// codewriter/jtransform reads this to route calls through OopSpecIndex.
-    pub oopspec_targets: HashMap<GraphId, String>,
-    /// `support.py:705 argnames = ll_func.__code__.co_varnames[:nb_args]` —
-    /// per-target positional parameter names, used by `parse_oopspec`
-    /// to resolve identifier slots in the spec's `(...)` pattern to
-    /// `Index(n)` placeholders.  Pyre cannot introspect a function
-    /// pointer for argnames; populated by the walker through
-    /// `mark_oopspec_argnames` whenever `#[oopspec(...)]` is paired
-    /// with a function signature (`front::llbc_hints::harvest_hints_from_llbcs`
-    /// emits a companion `"oopspec_argnames:..."` hint that
-    /// `lib.rs:600` consumes alongside `"oopspec:..."`).
-    ///
-    /// Keyed by [`GraphId`] (graph identity), resolved from the call
-    /// target via [`Self::graph_id_of`]; the writer interns the path.
-    pub oopspec_argnames: HashMap<GraphId, Vec<String>>,
-
     /// RPython: `_immutable_fields_` per class. Maps struct_name →
     /// `(field_name, rank)` pairs declared immutable / quasi-immutable.
     /// Consulted by the heuristic fallback in `all_interiorfielddescrs`
@@ -1080,17 +1109,14 @@ impl CallControl {
     /// RPython: `CallControl.__init__`.
     pub fn new() -> Self {
         Self {
-            function_graphs: HashMap::new(),
+            function_graphs: GraphStore::new(),
             free_fn_leaf_index: HashMap::new(),
             impl_method_leaf_index: HashMap::new(),
-            graph_ids: HashMap::new(),
-            graph_id_by_identity: HashMap::new(),
-            next_graph_id: 0,
+            external_funcobjs: HashMap::new(),
             trait_method_impls: HashMap::new(),
             method_to_impl_types: HashMap::new(),
             candidate_graphs: HashSet::new(),
             jitdrivers_sd: Vec::new(),
-            builtin_targets: HashSet::new(),
             jitcodes: indexmap::IndexMap::new(),
             function_fnaddrs: HashMap::new(),
             builtin_func_for_spec_cache: std::cell::RefCell::new(HashMap::new()),
@@ -1101,8 +1127,6 @@ impl CallControl {
             virtualref_info: None,
             callinfocollection: majit_ir::CallInfoCollection::new(),
             descr_indices: DescrIndexRegistry::default(),
-            cannot_raise_assertion_targets: HashSet::new(),
-            memerror_only_assertion_targets: HashSet::new(),
             known_struct_names: HashSet::new(),
             struct_fields: crate::front::StructFieldRegistry::default(),
             // RPython: symbolic.get_array_token(GcArray(T))[0] = carray.items.offset
@@ -1110,10 +1134,6 @@ impl CallControl {
             //
             array_header_size: std::mem::size_of::<usize>(),
             struct_layouts: HashMap::new(),
-            cannot_collect_targets: HashSet::new(),
-            external_gc_effects: HashSet::new(),
-            oopspec_targets: HashMap::new(),
-            oopspec_argnames: HashMap::new(),
             immutable_fields_by_struct: HashMap::new(),
             immutable_array_types: HashSet::new(),
             unsafe_fn_stubs: Vec::new(),
@@ -1861,7 +1881,16 @@ impl CallControl {
     /// `free_fn_leaf_index`.  The index is the only mutable side
     /// channel that mirrors `function_graphs`, so all writes go
     /// through this helper to keep them consistent.
-    fn insert_function_graph_indexed(&mut self, path: CallPath, graph: FunctionGraph) {
+    fn insert_function_graph_indexed(&mut self, path: CallPath, mut graph: FunctionGraph) {
+        // Fold any effect marks recorded before the graph existed: a
+        // `mark_*` called ahead of registration lands on the graph-less
+        // external funcobj record for `path`; carry it onto `graph.func`
+        // so the typed effect carrier is registration-order-insensitive
+        // (RPython attaches `func` attributes regardless of when the
+        // graph is discovered).
+        if let Some(pending) = self.external_funcobjs.remove(&path) {
+            graph.func.merge_from(&pending);
+        }
         if let Some(leaf) = path.segments.last() {
             let bucket = if graph.owner_root.is_none() {
                 self.free_fn_leaf_index.entry(leaf.clone()).or_default()
@@ -1875,70 +1904,42 @@ impl CallControl {
         self.function_graphs.insert(path, graph);
     }
 
-    /// Idempotent mint: return the existing [`GraphId`] for `path` or
-    /// allocate the next one. The single GraphId mint site, the surrogate
-    /// for RPython `call.py:29 {graph: jitcode}` (keyed on the graph
-    /// *object*).
+    /// Read the [`FuncEffects`](crate::model::FuncEffects) for `path`:
+    /// the graph's own `graph.func` when a graph is registered, otherwise
+    /// the graph-less external funcobj record. `None` when neither exists.
     ///
-    /// The port has no live graph objects, so identity is recovered from
-    /// the registered graph's `(owner_root, name)` pair: a free function
-    /// registers one source graph under several alias spellings (`lib.rs`
-    /// `free_function_alias_paths`), and every alias clone shares
-    /// `(None, func.name)` (`func.name` is unique per source — a duplicate
-    /// would collide on the bare alias path and panic at
-    /// `register_function_graph_alias`). Routing through
-    /// [`Self::graph_id_by_identity`] converges all aliases of one source
-    /// graph onto a single GraphId, so the GraphId-keyed effect maps
-    /// (`oopspec_targets`, `cannot_collect_targets`, the assertion sets…)
-    /// hold one entry per graph — matching graph-object identity rather
-    /// than the path. Impl methods carry `owner_root = Some(impl_type)`
-    /// and a bare method `name`, so `PyFrame::push_value` and
-    /// `MIFrame::push_value` key on distinct pairs and stay separate. The
-    /// caller must register the graph (via `register_function_graph` /
-    /// `register_trait_method`, which insert before interning) before its
-    /// first intern; a path with no registered graph (fnaddr-only) keeps
-    /// per-path identity, which is correct as it has no graph to converge.
-    fn intern_graph_id(&mut self, path: &CallPath) -> GraphId {
-        if let Some(&id) = self.graph_ids.get(path) {
-            return id;
-        }
-        let identity = self
-            .function_graphs
+    /// This is the `graph.func` / external-`funcobj` read RPython does
+    /// directly off the call op's target — every per-function effect is
+    /// carried here rather than in a separate per-effect side table.
+    fn func_effects(&self, path: &CallPath) -> Option<&crate::model::FuncEffects> {
+        self.function_graphs
             .get(path)
-            .map(|g| (g.owner_root.clone(), g.name.clone()));
-        let id = match identity
-            .as_ref()
-            .and_then(|key| self.graph_id_by_identity.get(key).copied())
-        {
-            Some(existing) => existing,
-            None => {
-                let fresh = GraphId(self.next_graph_id);
-                self.next_graph_id += 1;
-                if let Some(key) = identity {
-                    self.graph_id_by_identity.insert(key, fresh);
-                }
-                fresh
-            }
-        };
-        self.graph_ids.insert(path.clone(), id);
-        id
+            .map(|g| &g.func)
+            .or_else(|| self.external_funcobjs.get(path))
     }
 
-    /// Resolve a call target to its [`GraphId`], if registered. The
-    /// in-process identity primitive paired with [`Self::target_to_path`]
-    /// (which stays the CallPath-producing resolver for serde/display).
-    fn graph_id_of(&self, target: &CallTarget) -> Option<GraphId> {
+    /// Mutable [`FuncEffects`](crate::model::FuncEffects) for `path`,
+    /// targeting the registered graph's `graph.func` when present and the
+    /// graph-less external funcobj record (created on demand) otherwise.
+    /// The `mark_*` setters route every effect write through here.
+    fn func_effects_mut(&mut self, path: &CallPath) -> &mut crate::model::FuncEffects {
+        if let Some(graph) = self.function_graphs.get_mut(path) {
+            &mut graph.func
+        } else {
+            self.external_funcobjs.entry(path.clone()).or_default()
+        }
+    }
+
+    /// Resolve a call target to its [`FuncEffects`](crate::model::FuncEffects).
+    fn target_func_effects(&self, target: &CallTarget) -> Option<&crate::model::FuncEffects> {
         self.target_to_path(target)
-            .and_then(|p| self.graph_ids.get(&p).copied())
+            .and_then(|p| self.func_effects(&p))
     }
 
     /// Register a free function graph.
     /// RPython: graphs are discovered via funcptr linkage.
     pub fn register_function_graph(&mut self, path: CallPath, graph: FunctionGraph) {
-        // Insert before interning so `intern_graph_id` can read the graph's
-        // canonical name and converge alias spellings onto one GraphId.
-        self.insert_function_graph_indexed(path.clone(), graph);
-        self.intern_graph_id(&path);
+        self.insert_function_graph_indexed(path, graph);
     }
 
     /// Register a free function graph together with its hints.
@@ -2110,13 +2111,10 @@ impl CallControl {
         // Still route through it so a future `owner_root.is_none()` trait
         // path stays indexed automatically.
         if !self.function_graphs.contains_key(&qualified_path) {
-            // Insert before interning so `intern_graph_id` reads the graph's
-            // `(owner_root, name)` identity. Each impl method registers
-            // exactly once under a distinct qualified path, and its
-            // `owner_root = Some(impl_type)` keeps it on a GraphId separate
-            // from other impls' same-named methods.
-            self.insert_function_graph_indexed(qualified_path.clone(), graph);
-            self.intern_graph_id(&qualified_path);
+            // Each impl method registers exactly once under a distinct
+            // qualified path; its `owner_root = Some(impl_type)` keeps it
+            // separate from other impls' same-named methods.
+            self.insert_function_graph_indexed(qualified_path, graph);
         }
     }
 
@@ -2550,12 +2548,6 @@ impl CallControl {
         false
     }
 
-    /// Mark a target as a builtin (oopspec) operation.
-    pub fn mark_builtin(&mut self, path: CallPath) {
-        let id = self.intern_graph_id(&path);
-        self.builtin_targets.insert(id);
-    }
-
     /// Discover candidate graphs by BFS from portal targets.
     ///
     /// RPython: `CallControl.find_all_graphs(policy)` (call.py:49-92).
@@ -2765,10 +2757,11 @@ impl CallControl {
                     {
                         continue; // recursive — don't follow
                     }
+                    // call.py:135 — `hasattr(targetgraph.func, 'oopspec')`
+                    // ⇒ builtin; builtins are not followed during BFS.
                     if self
-                        .graph_ids
-                        .get(&callee_path)
-                        .is_some_and(|id| self.builtin_targets.contains(id))
+                        .func_effects(&callee_path)
+                        .is_some_and(|f| f.oopspec.is_some())
                     {
                         continue; // builtin — don't follow
                     }
@@ -2827,7 +2820,7 @@ impl CallControl {
         // RPython call.py:159-165: except KeyError:
         //   must never produce JitCode for close_stack.
         assert!(
-            !self.graph_has_hint(path, "close_stack"),
+            !self.func_effects(path).is_some_and(|f| f.close_stack),
             "{:?} has _gctransformer_hint_close_stack_",
             path
         );
@@ -3080,13 +3073,12 @@ impl CallControl {
                 if self.jitdrivers_sd.iter().any(|jd| &jd.portal_graph == p) {
                     return CallKind::Recursive;
                 }
-                let id = self.graph_ids.get(p);
                 // call.py:129-134 _gctransformer_hint_close_stack_ → 'residual'
-                if self.graph_has_hint(p, "close_stack") {
+                if self.func_effects(p).is_some_and(|f| f.close_stack) {
                     return CallKind::Residual;
                 }
-                // call.py:135-136 oopspec → 'builtin'
-                if id.is_some_and(|id| self.builtin_targets.contains(id)) {
+                // call.py:135-136 `hasattr(targetgraph.func, 'oopspec')` → 'builtin'
+                if self.func_effects(p).is_some_and(|f| f.oopspec.is_some()) {
                     return CallKind::Builtin;
                 }
             }
@@ -3299,11 +3291,12 @@ impl CallControl {
                     // register_function_graph_alias` chain), so a bare
                     // callsite (`use crate::X; X();`) producing
                     // `[caller_module, X]` will leaf-match every alias
-                    // simultaneously even though all aliases point at
-                    // copies of the same source graph.  Disambiguate by
+                    // simultaneously even though all aliases name the one
+                    // shared source graph (`GraphStore` keys them to a single
+                    // `FunctionGraph` by identity).  Disambiguate by
                     // FunctionGraph.name (the qualified source name set
                     // by `lib.rs:1342 sf.name = format!("{prefix}::{name}")`,
-                    // identical across alias clones).  PyPy parity:
+                    // identical across aliases).  PyPy parity:
                     // `bookkeeper.getdesc(callable)` keys on function-
                     // object identity, so multi-alias publications of
                     // the same desc converge on a single resolution.
@@ -3320,16 +3313,17 @@ impl CallControl {
                                     .unwrap_or(false)
                             });
                             if all_same {
-                                // Every match is an alias clone of one source
-                                // graph (`g.name` identical).  Return a
-                                // deterministic canonical alias — the
-                                // lexicographically smallest segments — rather
-                                // than the bucket's arbitrary first entry, so
-                                // the resolved `CallPath` is stable across runs
-                                // and consistently lines up with the
-                                // path-keyed registries (`function_fnaddrs`,
-                                // `return_types`, `builtin_targets`,
-                                // `portal_targets`).
+                                // Every match is an alias of one source graph
+                                // (`g.name` identical).  Return a deterministic
+                                // canonical alias — the lexicographically
+                                // smallest segments — rather than the bucket's
+                                // arbitrary first entry, so the resolved
+                                // `CallPath` is stable across runs and lines up
+                                // with the still-path-keyed registries
+                                // (`function_fnaddrs`, `external_funcobjs`);
+                                // `function_graphs` itself now shares one graph
+                                // across the aliases, so any of them would
+                                // resolve to the same effects.
                                 let canonical = matches
                                     .iter()
                                     .copied()
@@ -3743,9 +3737,10 @@ impl CallControl {
     /// formatted error message on the first mismatch.
     pub fn check_indirect_call_family(&self, candidates: &[CallPath]) -> Result<(), String> {
         for graph in candidates {
-            let err = if self.graph_has_hint(graph, "elidable") {
+            let effects = self.func_effects(graph);
+            let err = if effects.is_some_and(|f| f.elidable) {
                 Some("@jit.elidable")
-            } else if self.graph_has_hint(graph, "loopinvariant") {
+            } else if effects.is_some_and(|f| f.loop_invariant) {
                 Some("@jit.loop_invariant")
             } else if self.graph_has_hint(graph, "aroundstate") {
                 Some("_call_aroundstate_target_")
@@ -3763,8 +3758,9 @@ impl CallControl {
         Ok(())
     }
 
-    /// Access the function graphs map (for inline pass).
-    pub fn function_graphs(&self) -> &HashMap<CallPath, FunctionGraph> {
+    /// Access the registered graphs (for the inline pass and registry
+    /// population). Alias spellings share one graph via [`GraphStore`].
+    pub(crate) fn function_graphs(&self) -> &GraphStore {
         &self.function_graphs
     }
 
@@ -3794,15 +3790,21 @@ impl CallControl {
 
     // ── Per-graph JIT hint carrier ───────────────────────────────────
     //
-    // `graph.hints` is the single home for the source `#[jit_*]`
-    // attributes (`_elidable_function_`, `_jit_loop_invariant_`,
-    // `_gctransformer_hint_close_stack_`, …).  It is seeded at
-    // registration (`register_function_graph_with_hints` /
-    // `register_function_hints_for`) from the parsed attribute set and
-    // read back here, matching `getattr(funcobj, "_elidable_function_",
-    // False)` off the funcobj.
+    // `graph.hints` is the raw `#[jit_*]` source-attribute token bag
+    // (`elidable`, `loopinvariant`, `close_stack`, plus the open policy
+    // tokens `look_inside` / `unroll_safe` / `aroundstate`).  It is
+    // seeded at registration (`register_function_graph_with_hints` /
+    // `register_function_hints_for`) and matched by
+    // `jit_codewriter::policy` against the synthesized `SemanticFunction`.
+    // The effect analyzers below instead read the typed carrier
+    // [`crate::model::FuncEffects`] (`graph.func`) for the
+    // `_elidable_function_` / `_jit_loop_invariant_` /
+    // `_gctransformer_hint_close_stack_` attributes, matching RPython's
+    // `getattr(func, <attr>)` reads; `mark_*` populates both.
 
     /// Test whether the registered graph for `path` carries the hint `tok`.
+    /// Used for the open policy tokens still keyed in `graph.hints`
+    /// (e.g. `aroundstate`); the typed effects read [`Self::func_effects`].
     fn graph_has_hint(&self, path: &CallPath, tok: &str) -> bool {
         self.function_graphs
             .get(path)
@@ -3822,33 +3824,38 @@ impl CallControl {
     // ── Elidable / loop-invariant registration ──────────────────────
 
     /// RPython: `getattr(func, "_elidable_function_", False)` (call.py:239).
-    /// Mark a target as elidable (pure function).
+    /// Mark a target as elidable (pure function). Sets the typed
+    /// `func.elidable` (read by the analyzers, order-insensitive via the
+    /// external-funcobj merge) and stamps the `"elidable"` token onto
+    /// `graph.hints` for the policy `SemanticFunction` path.
     pub fn mark_elidable(&mut self, path: CallPath) {
+        self.func_effects_mut(&path).elidable = true;
         self.stamp_graph_hint(&path, "elidable");
     }
 
     /// RPython: `getattr(func, "_jit_loop_invariant_", False)` (call.py:240).
     /// Mark a target as loop-invariant.
     pub fn mark_loopinvariant(&mut self, path: CallPath) {
+        self.func_effects_mut(&path).loop_invariant = true;
         self.stamp_graph_hint(&path, "loopinvariant");
     }
 
     /// RPython: call.py:239 — check if target has `_elidable_function_`.
     pub fn is_elidable(&self, target: &CallTarget) -> bool {
-        self.target_to_path(target)
-            .is_some_and(|p| self.graph_has_hint(&p, "elidable"))
+        self.target_func_effects(target).is_some_and(|f| f.elidable)
     }
 
     /// Pyre extension: register a target as carrying the
     /// `#[elidable_cannot_raise]` user assertion.
     pub fn mark_cannot_raise_assertion(&mut self, path: CallPath) {
-        let id = self.intern_graph_id(&path);
         assert!(
-            !self.memerror_only_assertion_targets.contains(&id),
+            !self
+                .func_effects(&path)
+                .is_some_and(|f| f.memerror_only_assertion),
             "conflicting elidable exception assertions for {path:?}: \
              already marked memerror-only, cannot also mark cannot-raise"
         );
-        self.cannot_raise_assertion_targets.insert(id);
+        self.func_effects_mut(&path).cannot_raise_assertion = true;
     }
 
     /// Pyre extension: check if `target` carries the
@@ -3869,9 +3876,8 @@ impl CallControl {
     /// that `EF_ELIDABLE_CANNOT_RAISE` callees are always executable.
     pub fn has_cannot_raise_assertion(&self, target: &CallTarget) -> bool {
         self.target_to_path(target).is_some_and(|p| {
-            self.graph_ids
-                .get(&p)
-                .is_some_and(|id| self.cannot_raise_assertion_targets.contains(id))
+            self.func_effects(&p)
+                .is_some_and(|f| f.cannot_raise_assertion)
                 && self
                     .function_fnaddrs
                     .get(&p)
@@ -3882,13 +3888,14 @@ impl CallControl {
     /// Pyre extension: register a target as carrying the
     /// `#[elidable_or_memerror]` user assertion.
     pub fn mark_memerror_only_assertion(&mut self, path: CallPath) {
-        let id = self.intern_graph_id(&path);
         assert!(
-            !self.cannot_raise_assertion_targets.contains(&id),
+            !self
+                .func_effects(&path)
+                .is_some_and(|f| f.cannot_raise_assertion),
             "conflicting elidable exception assertions for {path:?}: \
              already marked cannot-raise, cannot also mark memerror-only"
         );
-        self.memerror_only_assertion_targets.insert(id);
+        self.func_effects_mut(&path).memerror_only_assertion = true;
     }
 
     /// Pyre extension: check if `target` carries the
@@ -3901,9 +3908,8 @@ impl CallControl {
     /// would crash there too.
     pub fn has_memerror_only_assertion(&self, target: &CallTarget) -> bool {
         self.target_to_path(target).is_some_and(|p| {
-            self.graph_ids
-                .get(&p)
-                .is_some_and(|id| self.memerror_only_assertion_targets.contains(id))
+            self.func_effects(&p)
+                .is_some_and(|f| f.memerror_only_assertion)
                 && self
                     .function_fnaddrs
                     .get(&p)
@@ -3913,49 +3919,46 @@ impl CallControl {
 
     /// RPython: call.py:240 — check if target has `_jit_loop_invariant_`.
     pub fn is_loopinvariant(&self, target: &CallTarget) -> bool {
-        self.target_to_path(target)
-            .is_some_and(|p| self.graph_has_hint(&p, "loopinvariant"))
+        self.target_func_effects(target)
+            .is_some_and(|f| f.loop_invariant)
     }
 
     /// RPython: call.py:129-134 — `_gctransformer_hint_close_stack_`.
-    /// Mark a target as close_stack (must never produce JitCode).
+    /// Mark a target as close_stack (must never produce JitCode). Sets the
+    /// typed `func.close_stack` and stamps the `"close_stack"` token onto
+    /// `graph.hints`.
     pub fn mark_close_stack(&mut self, path: CallPath) {
+        self.func_effects_mut(&path).close_stack = true;
         self.stamp_graph_hint(&path, "close_stack");
     }
 
     /// RPython: collectanalyze.py:21 — `funcobj.random_effects_on_gcobjs`.
     /// Mark an external target as having random GC effects.
     pub fn mark_external_gc_effects(&mut self, path: CallPath) {
-        let id = self.intern_graph_id(&path);
-        self.external_gc_effects.insert(id);
+        self.func_effects_mut(&path).random_effects_on_gcobjs = true;
     }
 
     /// RPython: collectanalyze.py:15 — `_gctransformer_hint_cannot_collect_`.
     /// Mark a target as known not to trigger GC collection.
     pub fn mark_cannot_collect(&mut self, path: CallPath) {
-        let id = self.intern_graph_id(&path);
-        self.cannot_collect_targets.insert(id);
+        self.func_effects_mut(&path).cannot_collect = true;
     }
 
     /// RPython: rlib/jit.py:250 `@oopspec(spec)` — store `func.oopspec = spec`.
     /// Mark a target as having an oopspec string for jtransform lowering.
+    ///
+    /// Presence of `func.oopspec` is also the builtin signal (call.py:135
+    /// `if hasattr(targetgraph.func, 'oopspec'): return 'builtin'`):
+    /// `guess_call_kind` classifies the call `Builtin` and the BFS does
+    /// not follow it, both derived directly from `oopspec.is_some()`.
     pub fn mark_oopspec(&mut self, path: CallPath, spec: String) {
-        let id = self.intern_graph_id(&path);
-        self.oopspec_targets.insert(id, spec);
-        // call.py:135-136 `if hasattr(targetgraph.func, 'oopspec'): return
-        // 'builtin'` — oopspec presence is the builtin signal. A builtin
-        // call is classified `Builtin` by `guess_call_kind` and is NOT
-        // followed during the candidate-graph BFS (only seeded explicitly
-        // via `INLINE_CALLS_TO`). Tie the two here so every production
-        // oopspec registration drives that classification, not just the
-        // explicit `mark_builtin` path.
-        self.builtin_targets.insert(id);
+        self.func_effects_mut(&path).oopspec = Some(spec);
     }
 
     /// RPython: `getattr(func, 'oopspec', None)` — look up oopspec for a target.
     pub fn get_oopspec(&self, target: &CallTarget) -> Option<&str> {
-        self.graph_id_of(target)
-            .and_then(|id| self.oopspec_targets.get(&id).map(|s| s.as_str()))
+        self.target_func_effects(target)
+            .and_then(|f| f.oopspec.as_deref())
     }
 
     /// `support.py:705 argnames = ll_func.__code__.co_varnames[:nb_args]` —
@@ -3972,16 +3975,16 @@ impl CallControl {
     /// (`lib.rs:707-741` jit.* bindings) leave this unset because
     /// their bare-name specs have no `(...)` pattern to resolve.
     pub fn mark_oopspec_argnames(&mut self, path: CallPath, argnames: Vec<String>) {
-        let id = self.intern_graph_id(&path);
-        self.oopspec_argnames.insert(id, argnames);
+        self.func_effects_mut(&path).oopspec_argnames = argnames;
     }
 
     /// Per-target argname lookup paired with `get_oopspec`.  Returns
     /// `None` when the target has no registered argname list
     /// (the dominant case today).
     pub fn get_oopspec_argnames(&self, target: &CallTarget) -> Option<&[String]> {
-        self.graph_id_of(target)
-            .and_then(|id| self.oopspec_argnames.get(&id).map(|v| v.as_slice()))
+        self.target_func_effects(target)
+            .map(|f| f.oopspec_argnames.as_slice())
+            .filter(|names| !names.is_empty())
     }
 
     // ── Graph-based analyzers (call.py:282-303) ─────────────────────
@@ -4139,7 +4142,8 @@ impl CallControl {
     /// (graphanalyze.py:60-69). "No graph" ≠ random effects in RPython.
     ///
     /// In majit: functions without graphs are external calls — returns
-    /// True if in `external_gc_effects`, False otherwise.
+    /// True if the external funcobj has `random_effects_on_gcobjs`, False
+    /// otherwise.
     fn analyze_random_effects(&self, path: &CallPath, seen: &mut HashSet<CallPath>) -> bool {
         if !seen.insert(path.clone()) {
             return false; // cycle → bottom_result
@@ -4150,9 +4154,9 @@ impl CallControl {
                 // RPython: analyze_external_call → bottom_result (False)
                 // unless funcobj.random_effects_on_gcobjs → True.
                 return self
-                    .graph_ids
+                    .external_funcobjs
                     .get(path)
-                    .is_some_and(|id| self.external_gc_effects.contains(id));
+                    .is_some_and(|f| f.random_effects_on_gcobjs);
             }
         };
         // RPython: analyze_simple_operation always returns False.
@@ -4246,19 +4250,18 @@ impl CallControl {
     /// - analyze_direct_call: recurse into callee graphs.
     /// - analyze_external_call (graphanalyze.py:60): bottom_result() (False).
     /// - _gctransformer_hint_cannot_collect_ (collectanalyze.py:15-16):
-    ///   functions in `cannot_collect_targets` are known not to collect.
+    ///   functions whose `func.cannot_collect` is set are known not to collect.
     fn analyze_can_collect(&self, path: &CallPath, seen: &mut HashSet<CallPath>) -> bool {
         if !seen.insert(path.clone()) {
             return false;
         }
-        let id = self.graph_ids.get(path);
         // collectanalyze.py:15: _gctransformer_hint_cannot_collect_ → False
-        if id.is_some_and(|id| self.cannot_collect_targets.contains(id)) {
+        if self.func_effects(path).is_some_and(|f| f.cannot_collect) {
             return false;
         }
         // collectanalyze.py:15: _gctransformer_hint_close_stack_ → True.
         // close_stack functions always can collect.
-        if self.graph_has_hint(path, "close_stack") {
+        if self.func_effects(path).is_some_and(|f| f.close_stack) {
             return true;
         }
         let graph = match self.function_graphs.get(path) {
@@ -4267,7 +4270,10 @@ impl CallControl {
                 // collectanalyze.py:21-25: analyze_external_call —
                 // if funcobj.random_effects_on_gcobjs → True,
                 // else → bottom_result() (False).
-                return id.is_some_and(|id| self.external_gc_effects.contains(id));
+                return self
+                    .external_funcobjs
+                    .get(path)
+                    .is_some_and(|f| f.random_effects_on_gcobjs);
             }
         };
         for block in &graph.blocks {
@@ -4951,7 +4957,7 @@ impl Default for CallControl {
 /// set of ("struct"/"array"/"interiorfield", T, fieldname) tuples.
 fn analyze_readwrite(
     target: &CallTarget,
-    function_graphs: &HashMap<CallPath, FunctionGraph>,
+    function_graphs: &GraphStore,
     cc: &CallControl,
     descr_indices: &DescrIndexRegistry,
 ) -> WriteAnalysis {
@@ -5005,7 +5011,7 @@ fn analyze_readwrite(
 /// union of every member graph's effects.
 fn analyze_readwrite_indirect_family(
     graphs: Option<&[CallPath]>,
-    function_graphs: &HashMap<CallPath, FunctionGraph>,
+    function_graphs: &GraphStore,
     cc: &CallControl,
     descr_indices: &DescrIndexRegistry,
 ) -> WriteAnalysis {
@@ -5476,7 +5482,7 @@ fn extract_element_type_from_str(type_str: &str) -> Option<String> {
 /// "readonly = reads & ~writes" (effectinfo.py:345-360).
 fn collect_readwrite_effects(
     path: &CallPath,
-    function_graphs: &HashMap<CallPath, FunctionGraph>,
+    function_graphs: &GraphStore,
     cc: &CallControl,
     descr_indices: &DescrIndexRegistry,
     seen: &mut HashSet<CallPath>,
@@ -6828,18 +6834,22 @@ mod tests {
         );
     }
 
-    /// GraphId converges on graph-object identity (`call.py:29`), not the
-    /// CallPath: two alias spellings of one source graph (same `graph.name`)
-    /// share a single GraphId, so a mark applied through one alias is
-    /// observed through the other; a distinct source graph stays separate.
+    /// Effect metadata lives on the funcobj (`graph.func`), and every alias
+    /// spelling of one source funcobj shares that single graph object via
+    /// [`GraphStore`]'s identity indirection — so a mark applied through one
+    /// alias is observed through every sibling alias, matching RPython's
+    /// `getattr(targetgraph.func, …)` object-identity reads (`call.py:29`
+    /// `{graph: jitcode}`). A genuinely distinct source graph stays
+    /// independent (separate `GraphKey`).
     #[test]
-    fn graph_id_converges_aliases_of_one_source_graph() {
+    fn oopspec_shared_across_aliases_of_one_source_graph() {
         let mut cc = CallControl::new();
-        // Two alias spellings of one source graph "canonical::source".
+        // Two alias spellings of one source graph "canonical::source": same
+        // `graph.name`, no `owner_root` → same `GraphKey` → one shared graph.
         let alias_a = CallPath::from_segments(["alias_a"]);
         let alias_b = CallPath::from_segments(["alias_b"]);
         cc.register_function_graph(alias_a.clone(), FunctionGraph::new("canonical::source"));
-        cc.register_function_graph(alias_b, FunctionGraph::new("canonical::source"));
+        cc.register_function_graph(alias_b.clone(), FunctionGraph::new("canonical::source"));
         // A third path is a genuinely different source graph.
         let other = CallPath::from_segments(["other_alias"]);
         cc.register_function_graph(other, FunctionGraph::new("other::source"));
@@ -6847,28 +6857,31 @@ mod tests {
         // Mark the oopspec through alias_a only.
         cc.mark_oopspec(alias_a, "list.append(l, v)".to_string());
 
-        // alias_b observes it — the two aliases share one GraphId.
+        // alias_a observes it.
+        assert_eq!(
+            cc.get_oopspec(&CallTarget::function_path(["alias_a"])),
+            Some("list.append(l, v)"),
+        );
+        // alias_b observes it too — both names reach the one shared funcobj
+        // graph, so the effect attribute is shared (RPython parity).
         assert_eq!(
             cc.get_oopspec(&CallTarget::function_path(["alias_b"])),
             Some("list.append(l, v)"),
-            "aliases of one source graph must share a GraphId",
+            "a mark on one alias is observed through every sibling alias of \
+             the same source funcobj",
         );
-        // The distinct source graph does not.
+        // The distinct source graph is unaffected.
         assert_eq!(
             cc.get_oopspec(&CallTarget::function_path(["other_alias"])),
             None,
-            "a distinct source graph must keep a separate GraphId",
         );
     }
 
-    /// Two impls of one trait carry the SAME bare `graph.name` (production
-    /// stamps the bare method name on impl-method graphs — `PyFrame` and
-    /// `MIFrame` both name their graph `push_value`). The GraphId identity
-    /// key is `(owner_root, name)`, so `owner_root` keeps them on distinct
-    /// GraphIds: a mark on one impl must NOT leak to the other. Guards
-    /// against keying identity on the bare name alone.
+    /// Two impls of one trait register under distinct qualified paths
+    /// (`PyFrame::push_value` vs `MIFrame::push_value`), each carrying its
+    /// own `graph.func`. A mark on one impl must NOT leak to the other.
     #[test]
-    fn graph_id_separates_same_named_methods_of_distinct_impls() {
+    fn oopspec_separates_same_named_methods_of_distinct_impls() {
         let mut cc = CallControl::new();
         // Both graphs share bare name "push_value"; only owner_root differs,
         // mirroring what `front::mir` stamps for impl methods.
@@ -6885,8 +6898,7 @@ mod tests {
             FunctionGraph::new("push_value").with_owner_root("MIFrame"),
         );
 
-        // Mark the oopspec on PyFrame's method only (probing GraphId
-        // identity — the spec string's semantics are immaterial here).
+        // Mark the oopspec on PyFrame's method only.
         cc.mark_oopspec(
             CallPath::from_segments(["PyFrame", "push_value"]),
             "stepper.push(f, v)".to_string(),
@@ -6899,7 +6911,7 @@ mod tests {
         assert_eq!(
             cc.get_oopspec(&CallTarget::function_path(["MIFrame", "push_value"])),
             None,
-            "same-named methods of distinct impls must keep separate GraphIds",
+            "same-named methods of distinct impls keep separate func metadata",
         );
     }
 
@@ -7051,7 +7063,10 @@ mod tests {
     fn guess_call_kind_builtin() {
         let mut cc = CallControl::new();
         let path = CallPath::from_segments(["w_int_add"]);
-        cc.mark_builtin(path);
+        // call.py:135 — `hasattr(targetgraph.func, 'oopspec')` is the
+        // builtin signal; an oopspec registration is what makes a call
+        // classify `Builtin`.
+        cc.mark_oopspec(path, "int_add(a, b)".to_string());
 
         let target = CallTarget::function_path(["w_int_add"]);
         assert_eq!(

@@ -743,7 +743,7 @@ pub(crate) fn is_known_unported(msg: &str) -> bool {
 ///    so `cachedgraph` (`description.rs:1037-1039`) hits at the
 ///    rtyper's `direct_call`.
 pub(crate) fn populate_call_registry_from_call_graphs(
-    function_graphs: &std::collections::HashMap<crate::parse::CallPath, LegacyGraph>,
+    function_graphs: &crate::jit_codewriter::call::GraphStore,
     registry: &PyreCallRegistry,
 ) -> Result<(), TyperError> {
     // Dedupe by canonical path — RPython `Bookkeeper.getdesc(pyobj)`
@@ -797,7 +797,7 @@ pub(crate) fn populate_call_registry_from_call_graphs(
     // gets exactly one row per distinct callable, with `aliases`
     // carrying the indirection.
     let mut by_canonical_path: HashMap<Vec<String>, FunctionPathKey> = HashMap::new();
-    for (path, graph) in function_graphs {
+    for (path, graph) in function_graphs.iter() {
         let key = FunctionPathKey::from_segments(path.segments.iter().cloned());
         let canonical_strip = canonical_dedup_key(path);
         let entry = if let Some(canonical_key) = by_canonical_path.get(&canonical_strip) {

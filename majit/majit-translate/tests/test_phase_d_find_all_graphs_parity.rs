@@ -97,10 +97,11 @@ fn find_all_graphs_does_not_follow_builtin_targets() {
         build_caller_graph("portal", &builtin_path),
     );
     // Register the builtin's graph so the edge has somewhere to land,
-    // but mark it as a builtin target so BFS must skip the regular
+    // but give it an oopspec so it classifies as a builtin (call.py:135
+    // `hasattr(targetgraph.func, 'oopspec')`) and BFS skips the regular
     // classification.
     cc.register_function_graph(builtin_path.clone(), FunctionGraph::new("ll_builtin"));
-    cc.mark_builtin(builtin_path.clone());
+    cc.mark_oopspec(builtin_path.clone(), "ll_builtin(x)".to_string());
     cc.mark_portal(portal_path.clone());
 
     let mut policy = DefaultJitPolicy::new();
