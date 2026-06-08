@@ -1189,12 +1189,13 @@ impl UnrollOptimizer {
                             .iter()
                             .filter_map(|token| token.virtual_state.clone())
                             .collect();
-                    let target_virtual_state =
-                        if let Some(idx) = pick_virtual_state(&current_vs, &target_states) {
-                            target_states.swap_remove(idx)
-                        } else {
-                            exported_vs.clone()
-                        };
+                    let target_virtual_state = if let Some(idx) =
+                        pick_virtual_state(&current_vs, &target_states, &mut final_ctx)
+                    {
+                        target_states.swap_remove(idx)
+                    } else {
+                        exported_vs.clone()
+                    };
                     if let Ok(args) = target_virtual_state.make_inputargs(
                         &forced_jump_args,
                         &mut opt_p2,
@@ -1478,7 +1479,7 @@ impl UnrollOptimizer {
                             &mut opt_p2,
                             &mut jump_ctx,
                             false,
-                            Some(&runtime_boxes),
+                            &runtime_boxes,
                         )
                         .is_none()
                 })) {
@@ -1536,7 +1537,7 @@ impl UnrollOptimizer {
                                 &mut opt_p2,
                                 &mut jump_ctx,
                                 true,
-                                Some(&runtime_boxes),
+                                &runtime_boxes,
                             )
                             .is_none()
                     })) {
@@ -1573,7 +1574,7 @@ impl UnrollOptimizer {
                                 &mut opt_p2,
                                 &mut jump_ctx,
                                 true,
-                                Some(&runtime_boxes),
+                                &runtime_boxes,
                             )
                             .is_none()
                     })) {
@@ -3136,9 +3137,11 @@ impl OptUnroll {
     /// Returns None if jumped successfully, Some(virtual_state) otherwise.
     /// unroll.py:304-362: jump_to_existing_trace
     ///
-    /// `runtime_boxes`: live values at the jump point, used by
-    /// generate_guards to emit GUARD_VALUE when the runtime value
-    /// matches a known constant. Pass None when unavailable (bridges).
+    /// `runtime_boxes`: the concrete runtime values at the jump point
+    /// (unroll.py:153/166/207/222), used by generate_guards to emit
+    /// GUARD_VALUE when the runtime value matches a known constant. Always a
+    /// position-aligned list — both the loop (`state.runtime_boxes`) and the
+    /// bridge (`optimize_bridge`'s `runtime_boxes`) paths supply it.
     pub fn jump_to_existing_trace(
         &self,
         jump_args: &[OpRef],
@@ -3147,7 +3150,7 @@ impl OptUnroll {
         optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
         ctx: &mut OptContext,
         force_boxes: bool,
-        runtime_boxes: Option<&[OpRef]>,
+        runtime_boxes: &[OpRef],
     ) -> Option<crate::optimizeopt::virtualstate::VirtualState> {
         self.jump_to_existing_trace_with_vs(
             jump_args,
@@ -3172,7 +3175,7 @@ impl OptUnroll {
         optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
         ctx: &mut OptContext,
         force_boxes: bool,
-        runtime_boxes: Option<&[OpRef]>,
+        runtime_boxes: &[OpRef],
         pre_vs: Option<crate::optimizeopt::virtualstate::VirtualState>,
     ) -> Option<crate::optimizeopt::virtualstate::VirtualState> {
         // optimizer.py:317 `with self.optimizer.cant_replace_guards():`
@@ -3207,7 +3210,7 @@ impl OptUnroll {
         optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
         ctx: &mut OptContext,
         force_boxes: bool,
-        runtime_boxes: Option<&[OpRef]>,
+        runtime_boxes: &[OpRef],
         pre_vs: Option<crate::optimizeopt::virtualstate::VirtualState>,
     ) -> Option<crate::optimizeopt::virtualstate::VirtualState> {
         let mut virtual_state = pre_vs
@@ -5010,9 +5013,10 @@ fn reshape_jump_args_for_preamble(jump_args: &mut Vec<OpRef>, preamble_args: &[O
 pub fn pick_virtual_state(
     my_vs: &crate::optimizeopt::virtualstate::VirtualState,
     target_states: &[crate::optimizeopt::virtualstate::VirtualState],
+    ctx: &mut OptContext,
 ) -> Option<usize> {
     for (i, target_vs) in target_states.iter().enumerate() {
-        if target_vs.generalization_of(my_vs) {
+        if target_vs.generalization_of(my_vs, ctx) {
             return Some(i);
         }
     }
@@ -5505,7 +5509,11 @@ mod tests {
             ]),
         ];
 
-        assert_eq!(pick_virtual_state(&my_vs, &target_states), Some(0));
+        let mut ctx = OptContext::new(128);
+        assert_eq!(
+            pick_virtual_state(&my_vs, &target_states, &mut ctx),
+            Some(0)
+        );
     }
 
     #[test]

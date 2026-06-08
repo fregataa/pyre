@@ -2585,46 +2585,23 @@ impl TraceCtx {
         self.force_finish = val;
     }
 
-    /// Get the result type of an OpRef from the recorded trace.
+    /// Get the result type of an OpRef.
     ///
-    /// resoperation.py:567 / history.py:220 Box.type parity: every typed
+    /// resoperation.py:567 / history.py:182 Box.type parity: every typed
     /// Box (`InputArg{Int,Ref,Float}`, `IntOp`/`RefOp`/`FloatOp`,
     /// `Const{Int,Ref,Float}`) carries `box.type` intrinsically on the
-    /// object itself. pyre encodes that on the typed `OpRef` variant via
-    /// `opref.ty()`, so the variant tag IS the authoritative answer when
-    /// it is present. Trust it first; the inputarg / constant_pool /
-    /// recorded-op fallbacks remain for the transitional `Untyped`
-    /// variant produced by legacy `OpRef::from_raw` / `OpRef::from_const`
-    /// callers (closing them is tracked under the typed-OpRef migration).
+    /// object itself. pyre encodes that on the typed `OpRef` variant, so
+    /// `opref.ty()` IS the authoritative answer — there is no side table
+    /// to consult. `opref.ty()` is `None` only for `OpRef::None` and
+    /// `TempVar`, neither of which is a Box, so both resolve to `None`.
     ///
     /// Box.type is always one of `'i'` / `'r'` / `'f'`. Void is NOT a
-    /// valid Box type — only value-producing ops have Boxes. pyre's
-    /// recorder assigns `pos` to every op (including void ops like
-    /// `SetfieldGc` and guards), so a stale lookup of a void op's pos
-    /// would otherwise return `Type::Void`; filter that out and return
-    /// `None` so callers fall back to a safe default rather than letting
-    /// Void leak into `livebox_types` / `fail_arg_types`.
+    /// valid Box type — only value-producing ops have Boxes — so a
+    /// void-result op (`SetfieldGc`, guards, …) also maps to `None`
+    /// rather than letting `Type::Void` leak into `livebox_types` /
+    /// `fail_arg_types`.
     pub fn get_opref_type(&self, opref: OpRef) -> Option<Type> {
-        // resoperation.py:29 / history.py:220: typed Box's `.type` is
-        // intrinsic. Trust the variant tag before consulting any side
-        // table.
-        if let Some(tp) = opref.ty() {
-            return (tp != Type::Void).then_some(tp);
-        }
-        if (opref.raw() as usize) < self.recorder.num_inputargs() {
-            return Some(self.recorder.inputarg_types()[opref.raw() as usize]);
-        }
-        // A constant carries its type on its variant tag, already consulted
-        // above via `opref.ty()`; no separate constant-type lookup is needed.
-        // Untyped-OpRef fallback: `opref.ty()` returned None above, so a
-        // variant-aware `get_op_by_pos` would never match a typed
-        // `op.pos`. Look the op up by raw position only — once the
-        // Untyped variant retirement (#171) completes, the entire
-        // fallback chain disappears together with this branch.
-        self.recorder
-            .get_op_by_raw_pos(opref.raw())
-            .map(|op| op.result_type())
-            .filter(|tp| *tp != Type::Void)
+        opref.ty().filter(|tp| *tp != Type::Void)
     }
 
     /// The green key hash (loop header PC) for this trace.

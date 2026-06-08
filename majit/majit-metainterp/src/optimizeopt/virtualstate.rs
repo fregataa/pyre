@@ -370,194 +370,6 @@ impl Clone for VirtualStateInfoNode {
 }
 
 impl VirtualStateInfo {
-    /// Check if `other` is compatible with `self`.
-    ///
-    /// "Compatible" means that if the loop body was optimized assuming `self`,
-    /// a value described by `other` can safely enter that loop body.
-    ///
-    /// In RPython this is `generate_guards()` which emits any needed bridge guards.
-    /// Here we just check compatibility; guard generation is separate.
-    pub fn is_compatible(&self, other: &VirtualStateInfo) -> bool {
-        match (self, other) {
-            // virtualstate.py:383-410 NotVirtualStateInfo._generate_guards
-            // LEVEL_UNKNOWN parity: RPython dispatches to
-            // `_generate_guards_unkown` on the subclass (Int/Ptr/Float).
-            // The subclass `isinstance(other, NotVirtualStateInfoInt)` check
-            // enforces type agreement; a cross-type mismatch raises
-            // VirtualStatesCantMatch.
-            (VirtualStateInfo::Unknown(tp), _) => info_type_matches(*tp, other),
-
-            // Constants must match exactly.
-            (VirtualStateInfo::Constant(a), VirtualStateInfo::Constant(b)) => a == b,
-            (VirtualStateInfo::Constant(_), _) => false,
-
-            // Virtual instance: other must also be a matching virtual with compatible fields
-            (
-                VirtualStateInfo::Virtual {
-                    descr: d1,
-                    known_class: kc1,
-                    fields: f1,
-                    ..
-                },
-                VirtualStateInfo::Virtual {
-                    descr: d2,
-                    known_class: kc2,
-                    fields: f2,
-                    ..
-                },
-            ) => {
-                if descr_identity(d1) != descr_identity(d2) {
-                    return false;
-                }
-                // Class must match (both None or same pointer)
-                match (kc1, kc2) {
-                    (Some(c1), Some(c2)) if c1 != c2 => return false,
-                    (Some(_), None) => return false,
-                    _ => {}
-                }
-                // All fields in self must have compatible counterparts in other
-                for (idx, info) in f1 {
-                    let other_info = f2.iter().find(|(i, _)| i == idx).map(|(_, v)| v.as_ref());
-                    match other_info {
-                        Some(oi) => {
-                            if !info.is_compatible(oi) {
-                                return false;
-                            }
-                        }
-                        None => return false, // field missing in other
-                    }
-                }
-                true
-            }
-
-            // Virtual array: must match length and each element
-            (
-                VirtualStateInfo::VArray {
-                    descr: d1,
-                    items: i1,
-                    ..
-                },
-                VirtualStateInfo::VArray {
-                    descr: d2,
-                    items: i2,
-                    ..
-                },
-            ) => {
-                if descr_identity(d1) != descr_identity(d2) || i1.len() != i2.len() {
-                    return false;
-                }
-                i1.iter().zip(i2.iter()).all(|(a, b)| a.is_compatible(b))
-            }
-
-            // Virtual struct: same as virtual instance
-            (
-                VirtualStateInfo::VStruct {
-                    descr: d1,
-                    fields: f1,
-                    ..
-                },
-                VirtualStateInfo::VStruct {
-                    descr: d2,
-                    fields: f2,
-                    ..
-                },
-            ) => {
-                if descr_identity(d1) != descr_identity(d2) {
-                    return false;
-                }
-                for (idx, info) in f1 {
-                    let other_info = f2.iter().find(|(i, _)| i == idx).map(|(_, v)| v.as_ref());
-                    match other_info {
-                        Some(oi) => {
-                            if !info.is_compatible(oi) {
-                                return false;
-                            }
-                        }
-                        None => return false,
-                    }
-                }
-                true
-            }
-
-            // Virtual array struct
-            // virtualstate.py:292-306: VArrayStructStateInfo._generate_guards
-            (
-                VirtualStateInfo::VArrayStruct {
-                    descr: d1,
-                    fielddescrs: fd1,
-                    element_fields: ef1,
-                },
-                VirtualStateInfo::VArrayStruct {
-                    descr: d2,
-                    fielddescrs: fd2,
-                    element_fields: ef2,
-                },
-            ) => {
-                // virtualstate.py:294-304: arraydescr identity + fielddescrs length + fielddescrs identity
-                if descr_identity(d1) != descr_identity(d2) || ef1.len() != ef2.len() {
-                    return false;
-                }
-                if fd1.len() != fd2.len() {
-                    return false;
-                }
-                for (a, b) in fd1.iter().zip(fd2.iter()) {
-                    if descr_identity(a) != descr_identity(b) {
-                        return false;
-                    }
-                }
-                ef1.iter().zip(ef2.iter()).all(|(fields1, fields2)| {
-                    for (idx, info) in fields1 {
-                        let other_info = fields2
-                            .iter()
-                            .find(|(i, _)| i == idx)
-                            .map(|(_, v)| v.as_ref());
-                        match other_info {
-                            Some(oi) if info.is_compatible(oi) => {}
-                            _ => return false,
-                        }
-                    }
-                    true
-                })
-            }
-
-            // KnownClass: other must have the same class (or be virtual with matching class).
-            // RPython: KnownClass does NOT accept Unknown/NonNull in pure
-            // compatibility check (raises VirtualStatesCantMatch). Guard
-            // generation with runtime_box is needed for that.
-            (VirtualStateInfo::KnownClass { class_ptr: c1 }, other_info) => match other_info {
-                VirtualStateInfo::KnownClass { class_ptr: c2 } => c1 == c2,
-                VirtualStateInfo::Virtual { known_class, .. } => known_class.as_ref() == Some(c1),
-                _ => false,
-            },
-
-            // NonNull: other must be nonnull (virtual is always nonnull).
-            // RPython: NonNull does NOT accept Unknown in pure compatibility
-            // check (raises VirtualStatesCantMatch).
-            (VirtualStateInfo::NonNull, other_info) => match other_info {
-                VirtualStateInfo::NonNull
-                | VirtualStateInfo::KnownClass { .. }
-                | VirtualStateInfo::Virtual { .. }
-                | VirtualStateInfo::VArray { .. }
-                | VirtualStateInfo::VStruct { .. }
-                | VirtualStateInfo::VArrayStruct { .. } => true,
-                VirtualStateInfo::Constant(Value::Ref(r)) => !r.is_null(),
-                _ => false,
-            },
-
-            // IntBounded: other must have tighter or equal bounds.
-            (VirtualStateInfo::IntBounded(b1), VirtualStateInfo::IntBounded(b2)) => {
-                b2.lower >= b1.lower && b2.upper <= b1.upper
-            }
-            (VirtualStateInfo::IntBounded(b), VirtualStateInfo::Constant(Value::Int(v))) => {
-                b.contains(*v)
-            }
-            (VirtualStateInfo::IntBounded(_), _) => false,
-
-            // Cross-type mismatches
-            _ => false,
-        }
-    }
-
     /// Whether this info represents a virtual (not yet allocated) value.
     pub fn is_virtual(&self) -> bool {
         matches!(
@@ -1259,60 +1071,89 @@ impl VirtualState {
         }
     }
 
-    /// Check if another VirtualState is compatible (can reuse the optimized loop body).
+    /// virtualstate.py:636 `generalization_of(self, other, optimizer)`.
     ///
-    /// Returns true if all entries are compatible.
-    pub fn is_compatible(&self, other: &VirtualState) -> bool {
+    /// `self` is the target loop state's requirement and `other` is the
+    /// incoming state. Returns true if `self` can accept `other` *without*
+    /// emitting any runtime guard — a pure structural generalization check.
+    ///
+    /// Mirrors the upstream exactly: build a `GenerateGuardState`, then for
+    /// every entry call the per-entry `generate_guards` with `op = None` and
+    /// `runtime_op = None`. Per the upstream docstring (virtualstate.py:79-82)
+    /// "if None is passed in for op, no guard is ever generated, and this
+    /// function degenerates to a generalization check"; with `runtime_box`
+    /// `None` every guard-emitting arm fails fast, so the walk reduces to
+    /// structure plus the renum alias-consistency check (virtualstate.py:84-94):
+    /// two positions mapping to the same virtual node in `self` must map
+    /// consistently in `other`. The previous `is_compatible` zip skipped that
+    /// renum check entirely.
+    ///
+    /// `ctx` corresponds to the upstream `optimizer`; it is threaded into
+    /// `GenerateGuardState` but never dereferenced, because no arm that reads
+    /// a runtime value is reachable when `runtime_box` is `None`.
+    pub fn generalization_of(&self, other: &VirtualState, ctx: &mut OptContext) -> bool {
+        // virtualstate.py:638 `assert len(self.state) == len(other.state)`.
+        // pyre returns false rather than asserting so an arity-mismatched
+        // target is skipped (the `pick_virtual_state` contract), matching the
+        // Err-not-assert choice in `generate_guards`.
         if self.state.len() != other.state.len() {
             return false;
         }
-        self.state
-            .iter()
-            .zip(other.state.iter())
-            .all(|(a, b)| a.is_compatible(b))
+        // virtualstate.py:637 `state = GenerateGuardState(optimizer)` —
+        // force_boxes defaults False. `extra_guards` is a throwaway buffer:
+        // with op / runtime_op None no guard is ever pushed, and the result
+        // is discarded regardless.
+        let mut guards: Vec<GuardRequirement> = Vec::new();
+        let mut state = GenerateGuardState {
+            ctx,
+            extra_guards: &mut guards,
+            renum: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            bad: VecSet::new(),
+            force_boxes: false,
+        };
+        // virtualstate.py:640-642 `for i in range(len(self.state)):
+        //     self.state[i].generate_guards(other.state[i], None, None, state)`
+        // catching VirtualStatesCantMatch → return False.
+        for (i, (expected, incoming)) in self.state.iter().zip(other.state.iter()).enumerate() {
+            if Self::generate_guards_for_entry_recursive(
+                i,
+                expected,
+                incoming,
+                OpRef::NONE,
+                None,
+                &mut state,
+            )
+            .is_err()
+            {
+                return false;
+            }
+        }
+        true
     }
 
-    /// virtualstate.py: generalization_of(other, optimizer)
-    ///
-    /// `self` is the target loop state's requirement and `other` is the
-    /// incoming state. Returns true if `self` can safely accept `other`.
-    pub fn generalization_of(&self, other: &VirtualState) -> bool {
-        self.is_compatible(other)
-    }
-
-    /// virtualstate.py: generate_guards(other, boxes, runtime_boxes, optimizer)
+    /// virtualstate.py:646 `generate_guards(self, other, boxes, runtime_boxes, optimizer)`.
     ///
     /// Generate guards to bridge from `other` state to `self` state.
-    /// Returns a list of guard operations that need to be emitted to ensure
-    /// the incoming values satisfy the requirements of the optimized loop.
+    /// Returns `Ok(guards)` if the incoming state can be accepted with
+    /// runtime guards, `Err(())` if fundamentally incompatible
+    /// (`VirtualStatesCantMatch`).
     ///
-    /// `runtime_boxes`: live OpRefs at the jump point. When provided,
-    /// per-entry guard generation can peek at the runtime value to decide
-    /// whether emitting a GUARD_VALUE is profitable (e.g. when the
-    /// runtime value already equals the expected constant).
-    /// virtualstate.py:646: generate_guards(self, other, boxes, runtime_boxes, optimizer)
+    /// `boxes`: the actual OpRefs at each position (the guard's first
+    /// argument in GUARD_VALUE etc.). `runtime_boxes`: the concrete runtime
+    /// values at the jump point, used as an educated guess to decide whether
+    /// emitting a guard is profitable (virtualstate.py:551-555). Both are
+    /// always concrete, position-aligned lists — virtualstate.py:646-648
+    /// asserts `len(self.state) == len(other.state) == len(boxes)
+    /// == len(runtime_boxes)`.
     ///
-    /// `boxes`: the actual OpRefs at each position (used as the guard's
-    /// first argument in GUARD_VALUE etc.).
-    /// virtualstate.py:646 generate_guards parity.
-    ///
-    /// Returns Ok(guards) if the incoming state can be accepted with
-    /// runtime guards, Err(()) if fundamentally incompatible
-    /// (VirtualStatesCantMatch).
-    ///
-    /// `runtime_boxes`: live OpRefs at the jump point. When Some,
-    /// non-permanent guard emission is enabled (matching RPython's
-    /// _jump_to_existing_trace path). When None, only structurally
-    /// compatible pairs are accepted (matching generalization_of).
-    ///
-    /// `force_boxes`: when true, Virtual incoming values can be
-    /// accepted by NonVirtual targets (the virtual will be forced
-    /// later by make_inputargs). Matches RPython's force_boxes.
+    /// `force_boxes`: when true, Virtual incoming values can be accepted by
+    /// NonVirtual targets (the virtual will be forced later by
+    /// make_inputargs). Matches RPython's force_boxes.
     pub fn generate_guards(
         &self,
         other: &VirtualState,
         boxes: &[OpRef],
-        runtime_boxes: Option<&[OpRef]>,
+        runtime_boxes: &[OpRef],
         ctx: &mut OptContext,
         force_boxes: bool,
     ) -> Result<Vec<GuardRequirement>, ()> {
@@ -1328,10 +1169,8 @@ impl VirtualState {
         // same jump arglist as `other` (export_state mints one state entry per
         // arg), so both align positionally with `self.state`. Release-active
         // `assert` mirrors the upstream `assert`, and the strict `boxes[i]` /
-        // `runtime_boxes[i]` indexing below relies on it (no silent
-        // NONE/None masking of a misaligned list). `runtime_boxes` is `Option`
-        // because the generalization-of path supplies no runtime guidance; when
-        // present it must be the same length as the state.
+        // `runtime_boxes[i]` indexing below relies on it (no silent NONE
+        // masking of a misaligned list).
         assert_eq!(
             boxes.len(),
             self.state.len(),
@@ -1339,10 +1178,11 @@ impl VirtualState {
             boxes.len(),
             self.state.len(),
         );
-        assert!(
-            runtime_boxes.map_or(true, |rb| rb.len() == self.state.len()),
-            "generate_guards: runtime_boxes (len {:?}) not aligned with state ({})",
-            runtime_boxes.map(<[OpRef]>::len),
+        assert_eq!(
+            runtime_boxes.len(),
+            self.state.len(),
+            "generate_guards: runtime_boxes ({}) not aligned with state ({})",
+            runtime_boxes.len(),
             self.state.len(),
         );
         // virtualstate.py:24-37 `GenerateGuardState.__init__` constructs
@@ -1383,9 +1223,12 @@ impl VirtualState {
 
         for (i, (expected, incoming)) in self.state.iter().zip(other.state.iter()).enumerate() {
             // virtualstate.py:649-652 indexes `boxes[i]` / `runtime_boxes[i]`
-            // directly; the asserts above guarantee i is in range.
+            // directly; the asserts above guarantee i is in range. The
+            // per-entry `runtime_box` is `Option` because nested struct/array
+            // recursion has no runtime value for sub-fields (passes `None`);
+            // at the top level it is always present.
             let box_opref = boxes[i];
-            let runtime_box = runtime_boxes.map(|rb| rb[i]);
+            let runtime_box = Some(runtime_boxes[i]);
             if let Err(()) = Self::generate_guards_for_entry_recursive(
                 i,
                 expected,
@@ -2886,97 +2729,134 @@ mod tests {
         Arc::new(TestDescr(idx))
     }
 
-    // ── Compatibility tests ──
+    // ── Per-entry structural checks ──
+    //
+    // virtualstate.py:636-643 generalization_of drives the per-entry
+    // generate_guards with op=None (virtualstate.py:79-82), which
+    // degenerates to a structural generalization check that emits no
+    // guard. Each pair below is wrapped as a one-entry VirtualState so
+    // the entry-level discrimination is exercised through that production
+    // path rather than a separate compatibility helper.
+
+    /// Wrap a single `VirtualStateInfo` as a one-entry `VirtualState`.
+    fn vs1(info: VirtualStateInfo) -> VirtualState {
+        VirtualState::new(vec![info])
+    }
 
     #[test]
     fn test_unknown_type_discrimination() {
         // virtualstate.py:383-410 NotVirtualStateInfoInt._generate_guards:
         // isinstance(other, NotVirtualStateInfoInt) check enforces type.
         // Unknown(Int) accepts Int-typed incoming only, not Ref-typed NonNull.
-        let unknown_int = VirtualStateInfo::Unknown(Type::Int);
-        assert!(unknown_int.is_compatible(&VirtualStateInfo::Unknown(Type::Int)));
-        assert!(unknown_int.is_compatible(&VirtualStateInfo::Constant(Value::Int(42))));
-        assert!(!unknown_int.is_compatible(&VirtualStateInfo::NonNull));
-        assert!(!unknown_int.is_compatible(&VirtualStateInfo::Unknown(Type::Ref)));
+        let mut ctx = OptContext::new(128);
+        let unknown_int = vs1(VirtualStateInfo::Unknown(Type::Int));
+        assert!(
+            unknown_int.generalization_of(&vs1(VirtualStateInfo::Unknown(Type::Int)), &mut ctx)
+        );
+        assert!(
+            unknown_int
+                .generalization_of(&vs1(VirtualStateInfo::Constant(Value::Int(42))), &mut ctx)
+        );
+        assert!(!unknown_int.generalization_of(&vs1(VirtualStateInfo::NonNull), &mut ctx));
+        assert!(
+            !unknown_int.generalization_of(&vs1(VirtualStateInfo::Unknown(Type::Ref)), &mut ctx)
+        );
 
         // Unknown(Ref) accepts Ref-typed incoming: NonNull, KnownClass, etc.
-        let unknown_ref = VirtualStateInfo::Unknown(Type::Ref);
-        assert!(unknown_ref.is_compatible(&VirtualStateInfo::NonNull));
-        assert!(unknown_ref.is_compatible(&VirtualStateInfo::Unknown(Type::Ref)));
-        assert!(!unknown_ref.is_compatible(&VirtualStateInfo::Unknown(Type::Int)));
+        let unknown_ref = vs1(VirtualStateInfo::Unknown(Type::Ref));
+        assert!(unknown_ref.generalization_of(&vs1(VirtualStateInfo::NonNull), &mut ctx));
+        assert!(
+            unknown_ref.generalization_of(&vs1(VirtualStateInfo::Unknown(Type::Ref)), &mut ctx)
+        );
+        assert!(
+            !unknown_ref.generalization_of(&vs1(VirtualStateInfo::Unknown(Type::Int)), &mut ctx)
+        );
     }
 
     #[test]
     fn test_constant_compatibility() {
-        let c1 = VirtualStateInfo::Constant(Value::Int(42));
-        let c2 = VirtualStateInfo::Constant(Value::Int(42));
-        let c3 = VirtualStateInfo::Constant(Value::Int(99));
-
-        assert!(c1.is_compatible(&c2));
-        assert!(!c1.is_compatible(&c3));
-        assert!(!c1.is_compatible(&VirtualStateInfo::Unknown(Type::Int)));
+        let mut ctx = OptContext::new(128);
+        let c1 = vs1(VirtualStateInfo::Constant(Value::Int(42)));
+        assert!(c1.generalization_of(&vs1(VirtualStateInfo::Constant(Value::Int(42))), &mut ctx));
+        assert!(!c1.generalization_of(&vs1(VirtualStateInfo::Constant(Value::Int(99))), &mut ctx));
+        assert!(!c1.generalization_of(&vs1(VirtualStateInfo::Unknown(Type::Int)), &mut ctx));
     }
 
     #[test]
     fn test_nonnull_compatibility() {
-        let nn = VirtualStateInfo::NonNull;
-        assert!(nn.is_compatible(&VirtualStateInfo::NonNull));
-        assert!(nn.is_compatible(&VirtualStateInfo::KnownClass { class_ptr: 0x100 }));
-        assert!(!nn.is_compatible(&VirtualStateInfo::Unknown(Type::Int)));
+        let mut ctx = OptContext::new(128);
+        let nn = vs1(VirtualStateInfo::NonNull);
+        assert!(nn.generalization_of(&vs1(VirtualStateInfo::NonNull), &mut ctx));
+        assert!(nn.generalization_of(
+            &vs1(VirtualStateInfo::KnownClass { class_ptr: 0x100 }),
+            &mut ctx
+        ));
+        assert!(!nn.generalization_of(&vs1(VirtualStateInfo::Unknown(Type::Int)), &mut ctx));
     }
 
     #[test]
     fn test_known_class_compatibility() {
-        let kc1 = VirtualStateInfo::KnownClass { class_ptr: 0x100 };
-        let kc2 = VirtualStateInfo::KnownClass { class_ptr: 0x100 };
-        let kc3 = VirtualStateInfo::KnownClass { class_ptr: 0x200 };
-
-        assert!(kc1.is_compatible(&kc2));
-        assert!(!kc1.is_compatible(&kc3));
-        assert!(!kc1.is_compatible(&VirtualStateInfo::Unknown(Type::Int)));
+        let mut ctx = OptContext::new(128);
+        let kc1 = vs1(VirtualStateInfo::KnownClass { class_ptr: 0x100 });
+        assert!(kc1.generalization_of(
+            &vs1(VirtualStateInfo::KnownClass { class_ptr: 0x100 }),
+            &mut ctx
+        ));
+        assert!(!kc1.generalization_of(
+            &vs1(VirtualStateInfo::KnownClass { class_ptr: 0x200 }),
+            &mut ctx
+        ));
+        assert!(!kc1.generalization_of(&vs1(VirtualStateInfo::Unknown(Type::Int)), &mut ctx));
     }
 
     #[test]
     fn test_virtual_array_compatibility() {
+        let mut ctx = OptContext::new(128);
         let descr = test_descr(1);
-        let a1 = VirtualStateInfo::VArray {
+        let a1 = vs1(VirtualStateInfo::VArray {
             descr: descr.clone(),
             items: vec![
                 VirtualStateInfoNode::new_rc(VirtualStateInfo::Constant(Value::Int(1))),
                 VirtualStateInfoNode::new_rc(VirtualStateInfo::Unknown(Type::Int)),
             ],
             lenbound: None,
-        };
-        let a2 = VirtualStateInfo::VArray {
+        });
+        let a2 = vs1(VirtualStateInfo::VArray {
             descr: descr.clone(),
             items: vec![
                 VirtualStateInfoNode::new_rc(VirtualStateInfo::Constant(Value::Int(1))),
                 VirtualStateInfoNode::new_rc(VirtualStateInfo::Constant(Value::Int(2))),
             ],
             lenbound: None,
-        };
-        let a3 = VirtualStateInfo::VArray {
+        });
+        let a3 = vs1(VirtualStateInfo::VArray {
             descr: descr.clone(),
             items: vec![VirtualStateInfoNode::new_rc(VirtualStateInfo::Constant(
                 Value::Int(1),
             ))],
             lenbound: None,
-        };
+        });
 
-        assert!(a1.is_compatible(&a2)); // same length, first matches, second is Unknown
-        assert!(!a1.is_compatible(&a3)); // different length
+        assert!(a1.generalization_of(&a2, &mut ctx)); // same length, first matches, second is Unknown
+        assert!(!a1.generalization_of(&a3, &mut ctx)); // different length
     }
 
     #[test]
     fn test_int_bounded_compatibility() {
-        let b1 = VirtualStateInfo::IntBounded(IntBound::bounded(0, 100));
-        let b2 = VirtualStateInfo::IntBounded(IntBound::bounded(10, 50));
-        let b3 = VirtualStateInfo::IntBounded(IntBound::bounded(-10, 200));
-        let c = VirtualStateInfo::Constant(Value::Int(42));
-
-        assert!(b1.is_compatible(&b2)); // b2 is within b1
-        assert!(!b1.is_compatible(&b3)); // b3 exceeds b1
-        assert!(b1.is_compatible(&c)); // 42 is within [0, 100]
+        let mut ctx = OptContext::new(128);
+        let b1 = vs1(VirtualStateInfo::IntBounded(IntBound::bounded(0, 100)));
+        // b2 is within b1
+        assert!(b1.generalization_of(
+            &vs1(VirtualStateInfo::IntBounded(IntBound::bounded(10, 50))),
+            &mut ctx
+        ));
+        // b3 exceeds b1
+        assert!(!b1.generalization_of(
+            &vs1(VirtualStateInfo::IntBounded(IntBound::bounded(-10, 200))),
+            &mut ctx
+        ));
+        // 42 is within [0, 100]
+        assert!(b1.generalization_of(&vs1(VirtualStateInfo::Constant(Value::Int(42))), &mut ctx));
     }
 
     // ── VirtualState tests ──
@@ -2992,7 +2872,8 @@ mod tests {
             VirtualStateInfo::KnownClass { class_ptr: 0x100 },
         ]);
 
-        assert!(s1.is_compatible(&s2));
+        let mut ctx = OptContext::new(128);
+        assert!(s1.generalization_of(&s2, &mut ctx));
     }
 
     #[test]
@@ -3003,12 +2884,13 @@ mod tests {
         let target = VirtualState::new(vec![VirtualStateInfo::Unknown(Type::Ref)]);
         let incoming = VirtualState::new(vec![VirtualStateInfo::NonNull]);
 
-        assert!(target.generalization_of(&incoming));
-        assert!(!incoming.generalization_of(&target));
+        let mut ctx = OptContext::new(128);
+        assert!(target.generalization_of(&incoming, &mut ctx));
+        assert!(!incoming.generalization_of(&target, &mut ctx));
 
         // Cross-type: Int target does NOT accept Ref incoming
         let int_target = VirtualState::new(vec![VirtualStateInfo::Unknown(Type::Int)]);
-        assert!(!int_target.generalization_of(&incoming));
+        assert!(!int_target.generalization_of(&incoming, &mut ctx));
     }
 
     #[test]
@@ -3019,7 +2901,8 @@ mod tests {
             VirtualStateInfo::Unknown(Type::Int),
         ]);
 
-        assert!(!s1.is_compatible(&s2));
+        let mut ctx = OptContext::new(128);
+        assert!(!s1.generalization_of(&s2, &mut ctx));
     }
 
     #[test]
@@ -3062,7 +2945,7 @@ mod tests {
         );
         let runtime_boxes = vec![rb0, rb1];
         let guards = s1
-            .generate_guards(&s2, &boxes, Some(&runtime_boxes), &mut ctx, false)
+            .generate_guards(&s2, &boxes, &runtime_boxes, &mut ctx, false)
             .unwrap();
         assert_eq!(guards.len(), 2);
         // Unknown incoming → GUARD_NONNULL_CLASS (:603).
@@ -3085,26 +2968,14 @@ mod tests {
         let mut ctx = OptContext::new(128);
         let matching_runtime = ctx.make_constant_int(7);
         let guards = expected
-            .generate_guards(
-                &incoming,
-                &boxes,
-                Some(&[matching_runtime]),
-                &mut ctx,
-                false,
-            )
+            .generate_guards(&incoming, &boxes, &[matching_runtime], &mut ctx, false)
             .unwrap();
         assert_eq!(guards.len(), 1);
 
         let mismatching_runtime = ctx.make_constant_int(8);
         assert!(
             expected
-                .generate_guards(
-                    &incoming,
-                    &boxes,
-                    Some(&[mismatching_runtime]),
-                    &mut ctx,
-                    false
-                )
+                .generate_guards(&incoming, &boxes, &[mismatching_runtime], &mut ctx, false)
                 .is_err()
         );
     }

@@ -137,70 +137,38 @@ impl<'a> OpTypeIndex<'a> {
         pos
     }
 
-    /// Lookup priority for a fully defined value: real constants
-    /// (`ConstInt.type`/`ConstPtr.type`/`ConstFloat.type`) first, then ops
-    /// (`opclasses[opnum].type` — resoperation.py:1693), then inputargs
-    /// (`InputArgInt/Ref/Float.type` — history.py:220). Returns `None`
-    /// for `OpRef::NONE`, unresolvable refs, or `Type::Void`.
-    ///
-    /// This is the post-definition view.  Callers that stand at a specific
-    /// trace position must use `opref_type_at`, which preserves the
-    /// RPython Box-identity rule for flat `OpRef(u32)` collisions by using
-    /// the inputarg type until the colliding op result has actually been
-    /// defined.
-    ///
+    /// `box.type` lookup. resoperation.py:29 / history.py:182: a typed
+    /// Box carries its `.type` on the object itself, and pyre encodes
+    /// that on the `OpRef` variant tag (`ConstInt`/`ConstPtr`/`ConstFloat`,
+    /// `InputArg{Int,Ref,Float}`, `{Int,Float,Ref,Void}Op`). The tag IS
+    /// the answer — no positional or side-table lookup is needed. Returns
+    /// `None` for `OpRef::NONE`, `TempVar` (neither is a Box), or a
+    /// `Void`-tagged op (`Void` is not a valid Box type).
     pub fn opref_type(&self, opref: OpRef) -> Option<Type> {
         self.opref_type_at_or_after(opref, None)
     }
 
-    /// Position-sensitive `box.type` lookup.
+    /// `box.type` lookup with a trace-position hint.
     ///
-    /// RPython never has to ask whether an integer id names an InputArg or a
-    /// later ResOperation: those are different Box objects.  pyre's flat
-    /// `OpRef(u32)` namespace can collide, so callers that are walking the
-    /// trace must pass their current operation index.  Before the producing
-    /// op is reached, the inputarg Box is the only live Box with that id; at
-    /// or after the producing op, the ResOperation's `.type` is the live
-    /// Box type.
+    /// The `op_index` hint is vestigial. It once disambiguated a flat
+    /// `OpRef(u32)` namespace in which an InputArg and a later
+    /// ResOperation could share an id, so the inputarg type was used
+    /// until the op's result was defined. Typed `OpRef` variants now
+    /// resolve that directly — `InputArgInt(0)` and `IntOp(0)` are
+    /// distinct values — so this is identical to `opref_type`; the
+    /// parameter is retained for call-site compatibility.
     pub fn opref_type_at(&self, opref: OpRef, op_index: usize) -> Option<Type> {
         self.opref_type_at_or_after(opref, Some(op_index))
     }
 
-    fn opref_type_at_or_after(&self, opref: OpRef, op_index: Option<usize>) -> Option<Type> {
-        if opref.is_none() {
-            return None;
-        }
+    fn opref_type_at_or_after(&self, opref: OpRef, _op_index: Option<usize>) -> Option<Type> {
         // history.py:182 / resoperation.py:29: `box.type` lives on the Box
-        // object itself; pyre's typed OpRef variants (`Const{Int,Float,Ptr}`
-        // / `InputArg{Int,Float,Ref}` / `{Int,Float,Ref,Void}Op`) carry the
-        // matching type tag intrinsically.
-        if let Some(tp) = opref.ty() {
-            return (tp != Type::Void).then_some(tp);
-        }
-        // raw uniqueness panic at build time means there is at most one
-        // ops[]/inputargs[] entry per raw u32, so there is no
-        // typed-vs-raw asymmetry to walk; a single positional lookup
-        // suffices.
-        let raw = opref.raw() as usize;
-        if let Some(idx) = op_pos_lookup(&self.op_pos, raw) {
-            let tp = self.ops[idx].type_;
-            if tp == Type::Void {
-                return None;
-            }
-            if op_index.map_or(true, |at| idx <= at) {
-                return Some(tp);
-            }
-        }
-        if let Some(idx) = op_pos_lookup(&self.inputarg_pos, raw) {
-            return Some(self.inputargs[idx].tp);
-        }
-        if let Some(idx) = op_pos_lookup(&self.op_pos, raw) {
-            let tp = self.ops[idx].type_;
-            if tp != Type::Void {
-                return Some(tp);
-            }
-        }
-        None
+        // object itself; pyre's typed OpRef variants carry the matching
+        // type tag intrinsically, so the tag IS the answer. The only
+        // tag-less oprefs are `OpRef::None` and `TempVar` — neither is a
+        // Box — and both resolve to `None`, as does a `Void`-tagged op
+        // (`Void` is not a valid Box type).
+        opref.ty().filter(|tp| *tp != Type::Void)
     }
 
     /// Direct `OpRef → &Op` lookup; returns `None` for constants,

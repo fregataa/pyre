@@ -3555,7 +3555,7 @@ impl Optimizer {
                 optimizer,
                 ctx,
                 force_boxes,
-                Some(pre_opt_jump_args),
+                pre_opt_jump_args,
                 pre_vs,
             )
         })) {
