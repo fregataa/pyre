@@ -963,8 +963,8 @@ def test_setsockopt_aead():
     taglen = len(expected_tag)
     algo = _alg_create('aead', 'gcm(aes)')
     try:
-        algo.setsockopt(socket.SOL_ALG, socket.ALG_SET_KEY, key)
-        algo.setsockopt(socket.SOL_ALG, socket.ALG_SET_AEAD_AUTHSIZE,
+        algo.setsockopt(_socket.SOL_ALG, _socket.ALG_SET_KEY, key)
+        algo.setsockopt(_socket.SOL_ALG, _socket.ALG_SET_AEAD_AUTHSIZE,
                         None, taglen)
     finally:
         algo.close()
