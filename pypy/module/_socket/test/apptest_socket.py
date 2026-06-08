@@ -935,7 +935,7 @@ def test_sendmsg_afalg_aes_cbc():
     msglen = len(msg)
     algo = _alg_create('skcipher', 'cbc(aes)')
     try:
-        algo.setsockopt(_socket.sol_alg, _socket.alg_set_key, key)
+        algo.setsockopt(_socket.SOL_ALG, _socket.ALG_SET_KEY, key)
         fd, _ = algo._accept()
         op = _socket.socket(_socket.AF_ALG, _socket.SOCK_SEQPACKET, 0, fd)
         try:
