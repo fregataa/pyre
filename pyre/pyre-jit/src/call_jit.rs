@@ -3276,6 +3276,27 @@ pub extern "C" fn bh_build_list_fn(argc: i64, item0: i64, item1: i64, item2: i64
     pyre_interpreter::runtime_ops::build_list_from_refs(&items) as i64
 }
 
+/// BUILD_TUPLE: `space.newtuple([w_items])`. Allocation-only; the items are
+/// pre-existing heap refs, no user code runs.
+pub extern "C" fn bh_build_tuple_fn(argc: i64, item0: i64, item1: i64, item2: i64) -> i64 {
+    let n = argc as usize;
+    let items: Vec<pyre_object::PyObjectRef> = match n {
+        0 => vec![],
+        1 => vec![item0 as pyre_object::PyObjectRef],
+        2 => vec![
+            item0 as pyre_object::PyObjectRef,
+            item1 as pyre_object::PyObjectRef,
+        ],
+        3 => vec![
+            item0 as pyre_object::PyObjectRef,
+            item1 as pyre_object::PyObjectRef,
+            item2 as pyre_object::PyObjectRef,
+        ],
+        _ => panic!("unsupported argc {} in bh_build_tuple_fn", argc),
+    };
+    pyre_interpreter::runtime_ops::build_tuple_from_refs(&items) as i64
+}
+
 /// BUILD_SLICE: `space.newslice(w_start, w_end, w_step)`.
 /// `argc` is 2 or 3; for argc=2 the CPython/PyPy opcode semantics use None
 /// for `w_step` (`pypy/interpreter/pyopcode.py:1463-1472`).
@@ -3290,6 +3311,37 @@ pub extern "C" fn bh_build_slice_fn(argc: i64, start: i64, stop: i64, step: i64)
         stop as pyre_object::PyObjectRef,
         step,
     ) as i64
+}
+
+/// UNPACK_SEQUENCE: validate that `seq` has exactly `count` elements and
+/// return a tuple of those items, raising ValueError/TypeError on a length
+/// mismatch or non-sequence the same way the interpreter does. The portal
+/// reads the items back out with `bh_unpack_item_fn`; producing the
+/// validated tuple once keeps the iteration-protocol fallback single-pass.
+pub extern "C" fn bh_unpack_sequence_fn(count: i64, seq: i64) -> i64 {
+    let seq = seq as pyre_object::PyObjectRef;
+    match pyre_interpreter::runtime_ops::unpack_sequence_exact(seq, count as usize) {
+        Ok(items) => pyre_interpreter::runtime_ops::build_tuple_from_refs(&items) as i64,
+        Err(err) => {
+            majit_metainterp::blackhole::BH_LAST_EXC_VALUE
+                .with(|c| c.set(err.to_exc_object() as i64));
+            0
+        }
+    }
+}
+
+/// Read item `index` out of the validated tuple produced by
+/// `bh_unpack_sequence_fn`.
+pub extern "C" fn bh_unpack_item_fn(index: i64, seq: i64) -> i64 {
+    let seq = seq as pyre_object::PyObjectRef;
+    match pyre_interpreter::runtime_ops::sequence_getitem(seq, index as usize) {
+        Ok(item) => item as i64,
+        Err(err) => {
+            majit_metainterp::blackhole::BH_LAST_EXC_VALUE
+                .with(|c| c.set(err.to_exc_object() as i64));
+            0
+        }
+    }
 }
 
 pub extern "C" fn bh_store_subscr_fn(obj: i64, key: i64, value: i64) -> i64 {

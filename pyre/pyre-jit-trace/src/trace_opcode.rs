@@ -204,9 +204,13 @@ use pyre_object::PyObjectRef;
 use pyre_object::listobject::w_list_getitem;
 use pyre_object::methodobject::{METHOD_TYPE, is_method, w_method_get_func, w_method_get_self};
 use pyre_object::pyobject::{
-    FLOAT_TYPE, INT_TYPE, LIST_TYPE, PyType, TUPLE_TYPE, is_float, is_int, is_list, is_tuple,
+    FLOAT_TYPE, INT_TYPE, LIST_TYPE, LONG_TYPE, PyType, TUPLE_TYPE, get_instantiate, is_float,
+    is_int, is_list, is_long, is_tuple,
 };
 use pyre_object::rangeobject::RANGE_ITER_TYPE;
+use pyre_object::specialisedtupleobject::{
+    SPECIALISED_TUPLE_FF_TYPE, SPECIALISED_TUPLE_II_TYPE, SPECIALISED_TUPLE_OO_TYPE,
+};
 use pyre_object::tupleobject::w_tuple_getitem;
 use pyre_object::{
     PY_NULL, w_list_can_append_without_realloc, w_list_is_inline_storage, w_list_len,
@@ -219,6 +223,76 @@ fn trace_abort_error(reason: &'static str) -> PyError {
 
 fn is_trace_abort_error(err: &PyError) -> bool {
     err.kind == pyre_interpreter::PyErrorKind::TraceAbort
+}
+
+fn trace_plain_int_payload(
+    frame: &mut MIFrame,
+    ctx: &mut TraceCtx,
+    item: OpRef,
+    concrete_item: PyObjectRef,
+) -> OpRef {
+    if frame.value_type(item) == Type::Int {
+        return item;
+    }
+    unsafe {
+        if is_long(concrete_item) {
+            return crate::state::trace_unbox_long_with_resume(
+                frame,
+                ctx,
+                item,
+                &LONG_TYPE as *const _ as i64,
+            );
+        }
+    }
+    frame.trace_guarded_int_payload(ctx, item)
+}
+
+fn trace_set_tuple_w_class(ctx: &mut TraceCtx, tuple: OpRef, descr: DescrRef) {
+    let w_class = get_instantiate(&TUPLE_TYPE);
+    if w_class.is_null() {
+        return;
+    }
+    // Pyre object-model adaptation: `ob_type` is the JIT-visible
+    // RPython vtable, but Python-level `type()` reads `w_class`.
+    // PyPy's specialised tuple variants all share the public tuple typedef.
+    let w_class = ctx.const_ref(w_class as i64);
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[tuple, w_class], descr.clone());
+    ctx.heapcache_setfield_cached(tuple, descr.index(), w_class);
+}
+
+/// Emit `GetfieldGcR(w_class) → PtrEq(expected) → GuardTrue` so the trace
+/// only stays specialised for instances whose Python-level `w_class`
+/// matches `expected_typeobj`. Mirrors the `type(w) is W_IntObject` /
+/// `type(w) is W_FloatObject` half of `listobject.py:2390 is_plain_int1`
+/// and `specialisedtupleobject.py:176`. Without this guard a later
+/// int/float subclass with the same payload layout would re-enter a
+/// trace specialised for the exact payload type and silently lose
+/// subclass identity when the trace rewraps via `wrapint` / `wrapfloat`.
+///
+/// Only `Type::Ref` items can carry a divergent `w_class`: a raw
+/// `Type::Int` / `Type::Float` trace value is an unboxed payload produced
+/// by arithmetic or a guarded unbox, and its concrete shadow can only be
+/// `Int` / `Float` (the `write_int_reg` / `write_ref_reg` sanitizers
+/// collapse a boxed subclass to `Null`), never a subclass pointer. Reading
+/// `w_class` off such a value would force the box that OptVirtualize is
+/// meant to remove, so skip the guard there.
+fn trace_guard_exact_w_class(
+    frame: &mut MIFrame,
+    ctx: &mut TraceCtx,
+    obj: OpRef,
+    expected_typeobj: PyObjectRef,
+) {
+    if expected_typeobj.is_null() || frame.value_type(obj) != Type::Ref {
+        return;
+    }
+    if ctx.heap_cache().is_unescaped(obj) {
+        return;
+    }
+    let descr = crate::descr::w_class_descr();
+    let actual = crate::state::opimpl_getfield_gc_r(ctx, obj, descr);
+    let expected = ctx.const_ref(expected_typeobj as i64);
+    let eq = ctx.record_op(OpCode::PtrEq, &[actual, expected]);
+    frame.generate_guard(ctx, OpCode::GuardTrue, &[eq]);
 }
 
 fn positional_defaults_to_load(
@@ -4729,20 +4803,294 @@ impl MIFrame {
         crate::generated_dynamic_list_index(self, ctx, key, len, concrete_key)
     }
 
-    /// Unpack a known-length tuple. `tupleobject.py:376-390`
-    /// `W_TupleObject` carries `wrappeditems` only; length is read
-    /// from the GcArray header via `arraylen_gc(items_block,
-    /// pyobject_gcarray_descr)`. Guard order matches pyjitpl.py:832-836:
-    /// `guard_class(tuple) → getfield_gc_pure_r(wrappeditems) →
-    /// arraylen_gc(items_block) → implement_guard_value(len, count) →
-    /// per-index getarrayitem_gc_pure_r`.
+    /// Trace-visible tuple construction, matching
+    /// `objspace/std/objspace.py:515 fixedview` consumers and
+    /// `tupleobject.py` / `specialisedtupleobject.py` producers. This
+    /// replaces the older opaque `jit_build_tuple_N` helper for concrete
+    /// tuple shapes so OptVirtualize can remove a tuple that is built only
+    /// to be immediately unpacked.
+    pub(crate) fn trace_build_tuple_value(
+        &mut self,
+        items: &[OpRef],
+        concrete_items: &[PyObjectRef],
+    ) -> Result<OpRef, PyError> {
+        // Build the trace-visible specialised tuple (NewWithVtable +
+        // inline `value0`/`value1` SetfieldGc) so OptVirtualize can
+        // virtualize the build→unpack pair and elide the allocation. The
+        // paired `w_class` guard on the int/float items is a header-field
+        // read that OptVirtualize resolves via `FieldDescr::is_w_class`
+        // (virtualize.rs), so the virtual loop-carried items no longer
+        // trip the `make_equal_to` Box.type invariant.
+        if concrete_items.iter().any(|item| item.is_null()) {
+            // STRUCTURAL ADAPTATION: PyPy's `space.newtuple()` always
+            // reaches `wraptuple()` with concrete W_Root instances, so
+            // `makespecialisedtuple2()` can choose `Cls_ii` / `Cls_ff` /
+            // `Cls_oo` for arity 2. Pyre's trace-side FrontendOp may
+            // lack that concrete side channel after earlier trace-only
+            // operations. In that case, keep the older helper path rather
+            // than guessing a canonical W_TupleObject and regressing
+            // specialised tuple parity on escaped two-tuples.
+            return self.trace_build_tuple(items);
+        }
+
+        self.with_ctx(|this, ctx| unsafe {
+            if items.len() == 2 && concrete_items.len() >= 2 {
+                let lhs = concrete_items[0];
+                let rhs = concrete_items[1];
+                if pyre_object::is_plain_int1(lhs) && pyre_object::is_plain_int1(rhs) {
+                    // `listobject.py:2390 is_plain_int1` rejects app-level
+                    // int subclasses via `type(w) is W_IntObject/W_LongObject`.
+                    // Pyre stores that subclass identity in `PyObject.w_class`
+                    // while `ob_type` stays at the payload layout, so the
+                    // unbox guard (which only checks `ob_type`) is not
+                    // enough — emit a paired `w_class` guard so a later
+                    // int subclass with the same payload layout side-exits
+                    // instead of replaying the Cls_ii fast path and
+                    // re-wrapping its payload as a plain int.
+                    let int_typeobj = get_instantiate(&INT_TYPE);
+                    trace_guard_exact_w_class(this, ctx, items[0], int_typeobj);
+                    trace_guard_exact_w_class(this, ctx, items[1], int_typeobj);
+                    let raw0 = trace_plain_int_payload(this, ctx, items[0], lhs);
+                    let raw1 = trace_plain_int_payload(this, ctx, items[1], rhs);
+                    let tuple = ctx.record_op_with_descr(
+                        OpCode::NewWithVtable,
+                        &[],
+                        crate::descr::specialised_tuple_ii_size_descr(),
+                    );
+                    ctx.heap_cache_mut().new_object(tuple);
+                    trace_set_tuple_w_class(
+                        ctx,
+                        tuple,
+                        crate::descr::specialised_tuple_ii_w_class_descr(),
+                    );
+                    ctx.record_op_with_descr(
+                        OpCode::SetfieldGc,
+                        &[tuple, raw0],
+                        crate::descr::specialised_tuple_ii_value0_descr(),
+                    );
+                    ctx.heapcache_setfield_cached(
+                        tuple,
+                        crate::descr::specialised_tuple_ii_value0_descr().index(),
+                        raw0,
+                    );
+                    ctx.record_op_with_descr(
+                        OpCode::SetfieldGc,
+                        &[tuple, raw1],
+                        crate::descr::specialised_tuple_ii_value1_descr(),
+                    );
+                    ctx.heapcache_setfield_cached(
+                        tuple,
+                        crate::descr::specialised_tuple_ii_value1_descr().index(),
+                        raw1,
+                    );
+                    return Ok(tuple);
+                }
+
+                if pyre_object::is_plain_float_strict(lhs)
+                    && pyre_object::is_plain_float_strict(rhs)
+                {
+                    // `specialisedtupleobject.py:176` requires
+                    // `type(w) is W_FloatObject` strict identity. The
+                    // unbox guard only checks `ob_type == FLOAT_TYPE`,
+                    // so emit a paired `w_class` guard against the
+                    // canonical float class — a later float subclass
+                    // with the same payload layout must side-exit
+                    // instead of replaying the Cls_ff fast path and
+                    // re-wrapping its payload as a plain float.
+                    let float_typeobj = get_instantiate(&FLOAT_TYPE);
+                    trace_guard_exact_w_class(this, ctx, items[0], float_typeobj);
+                    trace_guard_exact_w_class(this, ctx, items[1], float_typeobj);
+                    let raw0 = if this.value_type(items[0]) == Type::Float {
+                        items[0]
+                    } else {
+                        crate::state::trace_unbox_float_with_resume(
+                            this,
+                            ctx,
+                            items[0],
+                            &FLOAT_TYPE as *const _ as i64,
+                        )
+                    };
+                    let raw1 = if this.value_type(items[1]) == Type::Float {
+                        items[1]
+                    } else {
+                        crate::state::trace_unbox_float_with_resume(
+                            this,
+                            ctx,
+                            items[1],
+                            &FLOAT_TYPE as *const _ as i64,
+                        )
+                    };
+                    let tuple = ctx.record_op_with_descr(
+                        OpCode::NewWithVtable,
+                        &[],
+                        crate::descr::specialised_tuple_ff_size_descr(),
+                    );
+                    ctx.heap_cache_mut().new_object(tuple);
+                    trace_set_tuple_w_class(
+                        ctx,
+                        tuple,
+                        crate::descr::specialised_tuple_ff_w_class_descr(),
+                    );
+                    ctx.record_op_with_descr(
+                        OpCode::SetfieldGc,
+                        &[tuple, raw0],
+                        crate::descr::specialised_tuple_ff_value0_descr(),
+                    );
+                    ctx.heapcache_setfield_cached(
+                        tuple,
+                        crate::descr::specialised_tuple_ff_value0_descr().index(),
+                        raw0,
+                    );
+                    ctx.record_op_with_descr(
+                        OpCode::SetfieldGc,
+                        &[tuple, raw1],
+                        crate::descr::specialised_tuple_ff_value1_descr(),
+                    );
+                    ctx.heapcache_setfield_cached(
+                        tuple,
+                        crate::descr::specialised_tuple_ff_value1_descr().index(),
+                        raw1,
+                    );
+                    return Ok(tuple);
+                }
+
+                let tuple = ctx.record_op_with_descr(
+                    OpCode::NewWithVtable,
+                    &[],
+                    crate::descr::specialised_tuple_oo_size_descr(),
+                );
+                ctx.heap_cache_mut().new_object(tuple);
+                trace_set_tuple_w_class(
+                    ctx,
+                    tuple,
+                    crate::descr::specialised_tuple_oo_w_class_descr(),
+                );
+                ctx.record_op_with_descr(
+                    OpCode::SetfieldGc,
+                    &[tuple, items[0]],
+                    crate::descr::specialised_tuple_oo_value0_descr(),
+                );
+                ctx.heapcache_setfield_cached(
+                    tuple,
+                    crate::descr::specialised_tuple_oo_value0_descr().index(),
+                    items[0],
+                );
+                ctx.record_op_with_descr(
+                    OpCode::SetfieldGc,
+                    &[tuple, items[1]],
+                    crate::descr::specialised_tuple_oo_value1_descr(),
+                );
+                ctx.heapcache_setfield_cached(
+                    tuple,
+                    crate::descr::specialised_tuple_oo_value1_descr().index(),
+                    items[1],
+                );
+                return Ok(tuple);
+            }
+
+            let len = ctx.const_int(items.len() as i64);
+            let array_descr = crate::state::pyobject_gcarray_descr();
+            let items_block = ctx.record_op_with_descr(OpCode::NewArrayClear, &[len], array_descr);
+            ctx.heap_cache_mut().new_array(items_block, len, true);
+            for (idx, &item) in items.iter().enumerate() {
+                let idx = ctx.const_int(idx as i64);
+                crate::state::trace_items_block_setitem_value(ctx, items_block, idx, item);
+            }
+
+            let tuple = ctx.record_op_with_descr(
+                OpCode::NewWithVtable,
+                &[],
+                crate::descr::w_tuple_size_descr(),
+            );
+            ctx.heap_cache_mut().new_object(tuple);
+            trace_set_tuple_w_class(ctx, tuple, crate::descr::tuple_w_class_descr());
+            let wrappeditems_descr = crate::descr::tuple_wrappeditems_descr();
+            ctx.record_op_with_descr(
+                OpCode::SetfieldGc,
+                &[tuple, items_block],
+                wrappeditems_descr.clone(),
+            );
+            ctx.heapcache_setfield_cached(tuple, wrappeditems_descr.index(), items_block);
+            Ok(tuple)
+        })
+    }
+
+    /// Unpack a known-length tuple. `W_TupleObject` follows
+    /// `tupleobject.py:376-390`: `wrappeditems` is a GcArray and the
+    /// length is read via `arraylen_gc(items_block, pyobject_gcarray_descr)`.
+    ///
+    /// Arity-2 specialised tuple variants follow
+    /// `specialisedtupleobject.py`: after `guard_class` their immutable
+    /// inline `value0` / `value1` fields are loaded directly. This keeps
+    /// `UNPACK_SEQUENCE` structurally aligned with the tuple getitem path
+    /// and avoids tracing a canonical `W_TupleObject` guard for `Cls_ii`.
     fn trace_unpack_known_tuple(
         &mut self,
         ctx: &mut TraceCtx,
         seq: OpRef,
         count: usize,
+        concrete_seq: PyObjectRef,
         items_descr: DescrRef,
     ) -> Vec<OpRef> {
+        let ob_type = unsafe { (*concrete_seq).ob_type };
+        let spec_ii = &SPECIALISED_TUPLE_II_TYPE as *const PyType;
+        let spec_ff = &SPECIALISED_TUPLE_FF_TYPE as *const PyType;
+        let spec_oo = &SPECIALISED_TUPLE_OO_TYPE as *const PyType;
+
+        if std::ptr::eq(ob_type, spec_ii) {
+            debug_assert_eq!(count, 2);
+            self.guard_class(ctx, seq, spec_ii);
+            let value0 = ctx.record_op_with_descr(
+                OpCode::GetfieldGcPureI,
+                &[seq],
+                crate::descr::specialised_tuple_ii_value0_descr(),
+            );
+            let value1 = ctx.record_op_with_descr(
+                OpCode::GetfieldGcPureI,
+                &[seq],
+                crate::descr::specialised_tuple_ii_value1_descr(),
+            );
+            return vec![
+                crate::state::wrapint(ctx, value0),
+                crate::state::wrapint(ctx, value1),
+            ];
+        }
+
+        if std::ptr::eq(ob_type, spec_ff) {
+            debug_assert_eq!(count, 2);
+            self.guard_class(ctx, seq, spec_ff);
+            let value0 = ctx.record_op_with_descr(
+                OpCode::GetfieldGcPureF,
+                &[seq],
+                crate::descr::specialised_tuple_ff_value0_descr(),
+            );
+            let value1 = ctx.record_op_with_descr(
+                OpCode::GetfieldGcPureF,
+                &[seq],
+                crate::descr::specialised_tuple_ff_value1_descr(),
+            );
+            return vec![
+                crate::state::wrapfloat(ctx, value0),
+                crate::state::wrapfloat(ctx, value1),
+            ];
+        }
+
+        if std::ptr::eq(ob_type, spec_oo) {
+            debug_assert_eq!(count, 2);
+            self.guard_class(ctx, seq, spec_oo);
+            let value0 = ctx.record_op_with_descr(
+                OpCode::GetfieldGcPureR,
+                &[seq],
+                crate::descr::specialised_tuple_oo_value0_descr(),
+            );
+            let value1 = ctx.record_op_with_descr(
+                OpCode::GetfieldGcPureR,
+                &[seq],
+                crate::descr::specialised_tuple_oo_value1_descr(),
+            );
+            return vec![value0, value1];
+        }
+
         self.guard_class(ctx, seq, &TUPLE_TYPE as *const PyType);
 
         let items_block = crate::state::opimpl_getfield_gc_r(ctx, seq, items_descr);
@@ -4821,6 +5169,7 @@ impl MIFrame {
                     ctx,
                     seq,
                     count,
+                    concrete_seq,
                     crate::descr::tuple_wrappeditems_descr(),
                 ));
             }
@@ -7570,6 +7919,23 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
     // `ConstRef(prebuilt_instance)`; the assembler lowers `ConstRef`
     // through `ref_copy/r>r` (`assembler.rs::emit_const_r`), so arms
     // decode without residual-call wrappers around unit variants.
+    //
+    // BuildTuple / UnpackSequence are intentionally NOT in this set: the
+    // trait-dispatch handlers (`trace_build_tuple_value`,
+    // `unpack_sequence_value`) carry the specialised arity-2 tuple
+    // build/unpack fast paths, and the walker's jitcode dispatch cannot
+    // yet express them (it aborts with `InlineCallArityMismatch` when the
+    // tuple flows through an inlined call). Keep them on the trait path
+    // until the walker can encode the specialised tuple layout.
+    //
+    // StoreFastStoreFast is also excluded: its codewriter arm lowers to a
+    // chain of `residual_call` ops whose funcptr `constants_i` entries are
+    // unresolved placeholders (not patched by `patch_constants_i_fnaddrs`,
+    // which only rewrites build→runtime fnaddr pairs). The walker reads one
+    // of those placeholders as the call target and branches to it (`blr`),
+    // faulting on an unmapped address. Route it through the trait handler
+    // (`opcode_store_fast_store_fast`) until the arm's helper fnaddrs are
+    // resolved.
     matches!(
         instruction,
         Instruction::Nop
@@ -7601,7 +7967,6 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             | Instruction::ContainsOp { .. }
             | Instruction::IsOp { .. }
             | Instruction::Swap { .. }
-            | Instruction::BuildTuple { .. }
             | Instruction::BuildList { .. }
             | Instruction::BuildSet { .. }
             | Instruction::BuildString { .. }
@@ -7616,7 +7981,6 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             | Instruction::DictUpdate { .. }
             | Instruction::DictMerge { .. }
             | Instruction::SetFunctionAttribute { .. }
-            | Instruction::UnpackSequence { .. }
             | Instruction::UnpackEx { .. }
             | Instruction::LoadName { .. }
             | Instruction::StoreName { .. }
@@ -7666,36 +8030,39 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             | Instruction::CallFunctionEx
             | Instruction::LoadAttr { .. }
             | Instruction::StoreAttr { .. }
-            | Instruction::StoreFastStoreFast { .. } // Instruction::PopExcept excluded: same bridge-tracing
-                                                     // rationale as PushExcInfo below — its arm manages the
-                                                     // exception-info stack via impure helper jitcodes the walker
-                                                     // cannot execute concretely, so on the bridge leg the handler's
-                                                     // stack is left inflated and the loop-back `Jump` carries the
-                                                     // wrong arg count.  Trait dispatch executes it concretely.
-                                                     // Instruction::PushExcInfo excluded: its codewriter arm
-                                                     // `inline_call`s the exception-info-stack helper jitcodes,
-                                                     // which branch on the concrete result of an impure /
-                                                     // may-raise `residual_call`.  The production walker only folds
-                                                     // the concrete result of *pure* calls
-                                                     // (`try_fold_pure_call_via_executor`), so the helper's
-                                                     // post-call `goto_if_not` reads a `Null` concrete and mis-routes
-                                                     // into the helper's `raise/r` tail — surfacing a spurious
-                                                     // `SubRaise { exc_concrete: Null }` that aborts every bridge
-                                                     // trace of an exception handler.  The walker path was never
-                                                     // exercised before (the main loop only traces the no-exception
-                                                     // path; the bridge that reaches the handler never compiled
-                                                     // until the exc-value threading fix landed).  Keep PUSH_EXC_INFO
-                                                     // on trait dispatch — which executes the opcode concretely — the
-                                                     // same rationale that excludes `Reraise` above, until the walker
-                                                     // can execute impure residual calls during tracing.
-                                                     // Instruction::PopTop excluded: in the exception-handler
-                                                     // region it pops the matched exception value off the stack the
-                                                     // PUSH_EXC_INFO / POP_EXCEPT helpers manage.  Leaving it on the
-                                                     // walker while those are trait-dispatched desyncs the bridge's
-                                                     // handler-region stack, producing a loop-back `Jump` with the
-                                                     // wrong arg count (bridge fails to compile) and a backend
-                                                     // regalloc panic.  Keep the whole handler region on one concrete
-                                                     // (trait) leg so the bridge's framestate matches the loop entry.
+            // Instruction::StoreFastStoreFast excluded: routed off the
+            // walker JIT path (kept on trait dispatch) until the SFSF
+            // walker re-enable is unblocked.
+            // Instruction::PopExcept excluded: same bridge-tracing
+            // rationale as PushExcInfo below — its arm manages the
+            // exception-info stack via impure helper jitcodes the walker
+            // cannot execute concretely, so on the bridge leg the handler's
+            // stack is left inflated and the loop-back `Jump` carries the
+            // wrong arg count.  Trait dispatch executes it concretely.
+            // Instruction::PushExcInfo excluded: its codewriter arm
+            // `inline_call`s the exception-info-stack helper jitcodes,
+            // which branch on the concrete result of an impure /
+            // may-raise `residual_call`.  The production walker only folds
+            // the concrete result of *pure* calls
+            // (`try_fold_pure_call_via_executor`), so the helper's
+            // post-call `goto_if_not` reads a `Null` concrete and mis-routes
+            // into the helper's `raise/r` tail — surfacing a spurious
+            // `SubRaise { exc_concrete: Null }` that aborts every bridge
+            // trace of an exception handler.  The walker path was never
+            // exercised before (the main loop only traces the no-exception
+            // path; the bridge that reaches the handler never compiled
+            // until the exc-value threading fix landed).  Keep PUSH_EXC_INFO
+            // on trait dispatch — which executes the opcode concretely — the
+            // same rationale that excludes `Reraise` above, until the walker
+            // can execute impure residual calls during tracing.
+            // Instruction::PopTop excluded: in the exception-handler
+            // region it pops the matched exception value off the stack the
+            // PUSH_EXC_INFO / POP_EXCEPT helpers manage.  Leaving it on the
+            // walker while those are trait-dispatched desyncs the bridge's
+            // handler-region stack, producing a loop-back `Jump` with the
+            // wrong arg count (bridge fails to compile) and a backend
+            // regalloc panic.  Keep the whole handler region on one concrete
+            // (trait) leg so the bridge's framestate matches the loop entry.
             // PushNull is a bare stack push (delta +1) with no may-force
             // receiver and no `vsd <= nlocals` underflow guard, so it
             // routes through the non-zero stack-effect resync alongside
@@ -8951,6 +9318,22 @@ impl OpcodeStepExecutor for MIFrame {
 mod tests {
     use super::*;
 
+    fn test_miframe<'a>(ctx: &'a mut TraceCtx, sym: &'a mut PyreSym) -> MIFrame {
+        MIFrame {
+            ctx,
+            sym,
+            fallthrough_pc: 0,
+            parent_frames: Vec::new(),
+            pending_result_stack_idx: None,
+            pending_result_type: None,
+            pending_inline_frame: None,
+            orgpc: 0,
+            concrete_frame_addr: 0,
+            pre_opcode_registers_r: None,
+            pre_opcode_semantic_depth: None,
+        }
+    }
+
     #[cfg(feature = "cranelift")]
     fn clear_pending_jit_exception() {
         majit_backend_cranelift::jit_exc_raise(0);
@@ -8977,6 +9360,34 @@ mod tests {
     #[cfg(not(any(feature = "cranelift", feature = "dynasm")))]
     fn pending_jit_exception_raw() -> i64 {
         0
+    }
+
+    #[test]
+    fn exact_w_class_guard_skips_primitive_values() {
+        let mut ctx = TraceCtx::for_test_types(&[Type::Int, Type::Float]);
+        let mut sym = PyreSym::new_uninit(OpRef::NONE);
+        let mut frame = test_miframe(&mut ctx, &mut sym);
+
+        let fake_type = 0x1234usize as PyObjectRef;
+        let before = unsafe { &*frame.ctx }.num_ops();
+        let frame_ptr: *mut MIFrame = &mut frame;
+        let ctx_ptr = frame.ctx;
+        unsafe {
+            trace_guard_exact_w_class(
+                &mut *frame_ptr,
+                &mut *ctx_ptr,
+                OpRef::input_arg_int(0),
+                fake_type,
+            );
+            trace_guard_exact_w_class(
+                &mut *frame_ptr,
+                &mut *ctx_ptr,
+                OpRef::input_arg_float(1),
+                fake_type,
+            );
+        }
+
+        assert_eq!(unsafe { &*frame.ctx }.num_ops(), before);
     }
 
     #[test]

@@ -3084,6 +3084,25 @@ fn emit_frontend_newlist(
     )
 }
 
+fn emit_frontend_newtuple(
+    graph: &mut super::flow::FunctionGraph,
+    block: &super::flow::BlockRef,
+    items: Vec<super::flow::FlowValue>,
+    offset: i64,
+) -> super::flow::Variable {
+    // flowcontext.py BUILD_TUPLE -> `op.newtuple(*items).eval(self)`.
+    // Preserve the frontend semantic op in the graph; the build_tuple
+    // helper call remains a pyre backend adaptation only.
+    emit_graph_op_with_result(
+        graph,
+        block,
+        "newtuple",
+        items.into_iter().map(Into::into).collect(),
+        Kind::Ref,
+        offset,
+    )
+}
+
 fn emit_frontend_newslice(
     graph: &mut super::flow::FunctionGraph,
     block: &super::flow::BlockRef,
@@ -3633,6 +3652,9 @@ struct FnPtrIndices {
     load_const_fn: HelperHandle,
     store_subscr_fn: HelperHandle,
     build_list_fn: HelperHandle,
+    build_tuple_fn: HelperHandle,
+    unpack_sequence_fn: HelperHandle,
+    unpack_item_fn: HelperHandle,
     build_slice_fn: HelperHandle,
     normalize_raise_varargs_fn: HelperHandle,
     call_fn_0: HelperHandle,
@@ -3807,6 +3829,27 @@ fn register_helper_fn_pointers(
         cpu.set_current_exception_fn as *const (),
         CallFlavor::PlainCannotRaiseNoHeap,
     );
+    // `bh_build_tuple_fn` is allocation-only, same classification as
+    // `bh_build_list_fn` (allocation can `MemoryError`, no virtual-force).
+    // Bound after the existing fn_ptrs to preserve their indices.
+    let build_tuple_fn = bind(
+        assembler,
+        cpu.build_tuple_fn as *const (),
+        CallFlavor::Plain,
+    );
+    // `bh_unpack_sequence_fn` validates the length and allocates the item
+    // tuple (can raise ValueError/TypeError); `bh_unpack_item_fn` indexes
+    // that validated tuple. Both can raise → `CallFlavor::Plain`.
+    let unpack_sequence_fn = bind(
+        assembler,
+        cpu.unpack_sequence_fn as *const (),
+        CallFlavor::Plain,
+    );
+    let unpack_item_fn = bind(
+        assembler,
+        cpu.unpack_item_fn as *const (),
+        CallFlavor::Plain,
+    );
     FnPtrIndices {
         call_fn,
         load_global_fn,
@@ -3817,6 +3860,9 @@ fn register_helper_fn_pointers(
         load_const_fn,
         store_subscr_fn,
         build_list_fn,
+        build_tuple_fn,
+        unpack_sequence_fn,
+        unpack_item_fn,
         build_slice_fn,
         normalize_raise_varargs_fn,
         call_fn_0,
@@ -4556,6 +4602,21 @@ impl CodeWriter {
                 HelperHandle {
                     idx: build_list_fn_idx,
                     flavor: _build_list_fn_flavor,
+                },
+            build_tuple_fn:
+                HelperHandle {
+                    idx: build_tuple_fn_idx,
+                    flavor: _build_tuple_fn_flavor,
+                },
+            unpack_sequence_fn:
+                HelperHandle {
+                    idx: unpack_sequence_fn_idx,
+                    flavor: _unpack_sequence_fn_flavor,
+                },
+            unpack_item_fn:
+                HelperHandle {
+                    idx: unpack_item_fn_idx,
+                    flavor: _unpack_item_fn_flavor,
                 },
             build_slice_fn:
                 HelperHandle {
@@ -8471,14 +8532,44 @@ impl CodeWriter {
                         // underflow.
                         Instruction::UnpackSequence { count } => {
                             let n = count.get(op_arg) as usize;
-                            // Pop iterable, push n unpacked items.
-                            // pypy/interpreter/pyopcode.py:872.
-                            pop_and_decr_depth(&mut current_state, &mut current_depth);
-                            for _ in 0..n {
-                                push_fresh_ref(&mut current_state, &mut graph);
-                                current_depth += 1;
+                            // Pop the sequence; preserve it in a stable scratch reg
+                            // because the item pushes below reuse the stack slots.
+                            let seq_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let _seq_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let seq_scratch = ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
+                            emit_ref_copy(&current_block, seq_scratch, seq_reg);
+                            // unpack_sequence_fn(n, seq) → tuple of exactly n items;
+                            // raises ValueError/TypeError on length mismatch or a
+                            // non-sequence, matching opcode_unpack_sequence.
+                            let tuple_scratch = ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
+                            push_walker_emit(
+                                &current_block,
+                                super::flatten::build_one_int_one_ref_fn_residual_call_ir_r_insn(
+                                    unpack_sequence_fn_idx,
+                                    n as i64,
+                                    seq_scratch,
+                                    tuple_scratch,
+                                ),
+                            );
+                            // Push the items in reverse so the stack top is item[0]
+                            // (opcode_unpack_sequence pushes `items.into_iter().rev()`).
+                            for k in (0..n).rev() {
+                                let item_dst = stack_base + current_depth;
+                                push_walker_emit(
+                                    &current_block,
+                                    super::flatten::build_one_int_one_ref_fn_residual_call_ir_r_insn(
+                                        unpack_item_fn_idx,
+                                        k as i64,
+                                        tuple_scratch,
+                                        item_dst,
+                                    ),
+                                );
+                                let item_value = fresh_ref_value(&mut graph);
+                                if let super::flow::FlowValue::Variable(v) = &item_value {
+                                    pin!(Some(*v), item_dst);
+                                }
+                                push_and_bump!(item_value, py_pc);
                             }
-                            emit_abort_permanent!();
                         }
 
                         // CPython 3.13 iterator protocol — emit abort_permanent
@@ -8621,13 +8712,51 @@ impl CodeWriter {
 
                         // BuildTuple(count): pops count items, pushes 1 tuple. Net: -(count-1).
                         Instruction::BuildTuple { count } => {
-                            let n = count.get(op_arg) as usize;
-                            for _ in 0..n {
-                                pop_and_decr_depth(&mut current_state, &mut current_depth);
+                            let argc = count.get(op_arg) as usize;
+                            if argc > 3 {
+                                for _ in 0..argc {
+                                    let _ = emit_popvalue_ref!(current_depth, py_pc);
+                                    let _ = pop_ref_or_fresh(&mut current_state, &mut graph);
+                                }
+                                emit_abort_permanent!();
+                                push_fresh_ref(&mut current_state, &mut graph);
+                                current_depth += 1;
+                                emit_vsd!(current_depth, py_pc);
+                                continue;
                             }
-                            push_fresh_ref(&mut current_state, &mut graph);
-                            current_depth += 1;
-                            emit_abort_permanent!();
+                            let mut arg_regs_rev: Vec<u16> = Vec::with_capacity(argc);
+                            let mut item_values_rev = Vec::with_capacity(argc);
+                            for _ in 0..argc {
+                                let item_reg = emit_popvalue_ref!(current_depth, py_pc);
+                                let item_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                                if let super::flow::FlowValue::Variable(v) = &item_value {
+                                    pin!(Some(*v), item_reg);
+                                }
+                                arg_regs_rev.push(item_reg);
+                                item_values_rev.push(item_value);
+                            }
+                            let arg_regs: Vec<u16> = arg_regs_rev.iter().rev().copied().collect();
+                            // build_tuple_fn(argc, item0, item1, item2) → tuple. Same
+                            // residual_call_ir_r shape as build_list_fn (the IR builder
+                            // is fn-index agnostic); unused item slots padded with
+                            // ConstInt(0).
+                            let result_value = emit_frontend_newtuple(
+                                &mut graph,
+                                &current_block.block(),
+                                item_values_rev.into_iter().rev().collect(),
+                                py_pc as i64,
+                            );
+                            pin!(Some(result_value), stack_base + current_depth);
+                            push_walker_emit(
+                                &current_block,
+                                super::flatten::build_build_list_fn_residual_call_ir_r_insn(
+                                    build_tuple_fn_idx,
+                                    argc,
+                                    &arg_regs,
+                                    stack_base + current_depth,
+                                ),
+                            );
+                            push_and_bump!(result_value.into(), py_pc);
                         }
 
                         // BuildSet(count): pops count items, pushes 1 set. Net: -(count-1).

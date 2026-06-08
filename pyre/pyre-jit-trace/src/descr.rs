@@ -1077,6 +1077,15 @@ static W_TUPLE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 true,
                 false,
             ),
+            (
+                "PyObject.w_class",
+                pyre_object::pyobject::W_CLASS_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
         ],
         "W_TupleObject",
         "tupleobject::W_TupleObject",
@@ -1111,6 +1120,15 @@ static SPECIALISED_TUPLE_II_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLo
                 true,
                 false,
             ),
+            (
+                "PyObject.w_class",
+                pyre_object::pyobject::W_CLASS_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
         ],
         "W_SpecialisedTupleObject_ii",
         "specialisedtupleobject::W_SpecialisedTupleObject_ii",
@@ -1142,6 +1160,15 @@ static SPECIALISED_TUPLE_FF_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLo
                 true,
                 false,
             ),
+            (
+                "PyObject.w_class",
+                pyre_object::pyobject::W_CLASS_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
         ],
         "W_SpecialisedTupleObject_ff",
         "specialisedtupleobject::W_SpecialisedTupleObject_ff",
@@ -1171,6 +1198,15 @@ static SPECIALISED_TUPLE_OO_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLo
                 Type::Ref,
                 false,
                 true,
+                false,
+            ),
+            (
+                "PyObject.w_class",
+                pyre_object::pyobject::W_CLASS_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                false,
                 false,
             ),
         ],
@@ -1433,6 +1469,23 @@ impl SizeDescr for PyreSizeDescr {
         self.vtable
     }
 
+    /// The canonical `w_class` (Python class object) for instances of
+    /// this type — `get_instantiate(vtable_type)`. Read live (not cached
+    /// at construction) since the type objects are installed after the
+    /// descrs are built. `None` before `init_typeobjects()` runs.
+    fn w_class_obj(&self) -> Option<i64> {
+        if self.vtable == 0 {
+            return None;
+        }
+        let tp = self.vtable as *const pyre_object::pyobject::PyType;
+        let w_class = unsafe { pyre_object::pyobject::get_instantiate(&*tp) };
+        if w_class.is_null() {
+            None
+        } else {
+            Some(w_class as i64)
+        }
+    }
+
     fn is_immutable(&self) -> bool {
         false
     }
@@ -1619,7 +1672,23 @@ use pyre_object::{FLOAT_TYPE, INT_TYPE};
 ///
 /// Mutable because __class__ assignment can change it.
 pub fn w_class_descr() -> DescrRef {
-    make_field_descr(pyre_object::pyobject::W_CLASS_OFFSET, 8, Type::Ref, false)
+    // Named "w_class" so `FieldDescr::is_w_class()` recognises the
+    // header field; OptVirtualize must resolve it from the object's
+    // class identity rather than indexing it against a virtual's value
+    // fields (its `index_in_parent` of 0 would otherwise collide with
+    // the first value field, e.g. `W_IntObject.intval`).
+    Arc::new(PyreFieldDescr {
+        offset: pyre_object::pyobject::W_CLASS_OFFSET,
+        field_size: 8,
+        field_type: Type::Ref,
+        signed: false,
+        immutable: false,
+        quasi_immutable: false,
+        name: "w_class",
+        index_in_parent: 0,
+        parent_descr: None,
+        ei_index: AtomicU32::new(u32::MAX),
+    })
 }
 
 /// Alias for backward compatibility — same as w_class_descr().
@@ -1724,6 +1793,10 @@ pub fn tuple_wrappeditems_descr() -> DescrRef {
     field_descr_from_group(&W_TUPLE_DESCR_GROUP, 0)
 }
 
+pub fn tuple_w_class_descr() -> DescrRef {
+    field_descr_from_group(&W_TUPLE_DESCR_GROUP, 1)
+}
+
 /// `W_SpecialisedTupleObject_ii.value0` — inline `i64` per
 /// `specialisedtupleobject.py:34-44`. Immutable.
 pub fn specialised_tuple_ii_value0_descr() -> DescrRef {
@@ -1733,6 +1806,10 @@ pub fn specialised_tuple_ii_value0_descr() -> DescrRef {
 /// `W_SpecialisedTupleObject_ii.value1` — inline `i64`. Immutable.
 pub fn specialised_tuple_ii_value1_descr() -> DescrRef {
     field_descr_from_group(&SPECIALISED_TUPLE_II_DESCR_GROUP, 1)
+}
+
+pub fn specialised_tuple_ii_w_class_descr() -> DescrRef {
+    field_descr_from_group(&SPECIALISED_TUPLE_II_DESCR_GROUP, 2)
 }
 
 /// `W_SpecialisedTupleObject_ff.value0` — inline `f64`. Immutable.
@@ -1745,6 +1822,10 @@ pub fn specialised_tuple_ff_value1_descr() -> DescrRef {
     field_descr_from_group(&SPECIALISED_TUPLE_FF_DESCR_GROUP, 1)
 }
 
+pub fn specialised_tuple_ff_w_class_descr() -> DescrRef {
+    field_descr_from_group(&SPECIALISED_TUPLE_FF_DESCR_GROUP, 2)
+}
+
 /// `W_SpecialisedTupleObject_oo.value0` — inline `PyObjectRef`. Immutable.
 pub fn specialised_tuple_oo_value0_descr() -> DescrRef {
     field_descr_from_group(&SPECIALISED_TUPLE_OO_DESCR_GROUP, 0)
@@ -1753,6 +1834,10 @@ pub fn specialised_tuple_oo_value0_descr() -> DescrRef {
 /// `W_SpecialisedTupleObject_oo.value1` — inline `PyObjectRef`. Immutable.
 pub fn specialised_tuple_oo_value1_descr() -> DescrRef {
     field_descr_from_group(&SPECIALISED_TUPLE_OO_DESCR_GROUP, 1)
+}
+
+pub fn specialised_tuple_oo_w_class_descr() -> DescrRef {
+    field_descr_from_group(&SPECIALISED_TUPLE_OO_DESCR_GROUP, 2)
 }
 
 /// `ItemsBlock.capacity` — the GcArray length header at offset 0 of
@@ -1832,6 +1917,26 @@ pub fn w_range_iter_size_descr() -> DescrRef {
 /// vtable = &FLOAT_TYPE (ob_type for virtual materialization).
 pub fn w_float_size_descr() -> DescrRef {
     W_FLOAT_DESCR_GROUP.size_descr.clone()
+}
+
+/// Size descriptor for canonical `W_TupleObject`.
+pub fn w_tuple_size_descr() -> DescrRef {
+    W_TUPLE_DESCR_GROUP.size_descr.clone()
+}
+
+/// Size descriptor for `W_SpecialisedTupleObject_ii`.
+pub fn specialised_tuple_ii_size_descr() -> DescrRef {
+    SPECIALISED_TUPLE_II_DESCR_GROUP.size_descr.clone()
+}
+
+/// Size descriptor for `W_SpecialisedTupleObject_ff`.
+pub fn specialised_tuple_ff_size_descr() -> DescrRef {
+    SPECIALISED_TUPLE_FF_DESCR_GROUP.size_descr.clone()
+}
+
+/// Size descriptor for `W_SpecialisedTupleObject_oo`.
+pub fn specialised_tuple_oo_size_descr() -> DescrRef {
+    SPECIALISED_TUPLE_OO_DESCR_GROUP.size_descr.clone()
 }
 
 /// Size descriptor for W_SliceObject allocation via NewWithVtable.

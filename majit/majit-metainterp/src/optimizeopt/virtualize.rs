@@ -734,6 +734,52 @@ impl OptVirtualize {
                     }
                 }
             }
+            // Pyre object-model: `w_class` (PyObject offset 8) is a header
+            // field carrying Python-level class identity, not a value field.
+            // Its shared descr has `index_in_parent == 0`, which would
+            // collide with the first value field (e.g. `W_IntObject.intval`,
+            // an `Int`) and forward `Ref ← Int` in `make_equal_to`. Resolve
+            // it from the virtual's class identity: a stored `w_class` field
+            // when the layout tracks one (specialised tuples set it
+            // explicitly), otherwise the canonical class object for the size
+            // descr's type (builtins built by `new_with_vtable` inherit the
+            // type's `get_instantiate`).
+            if field_descr.is_w_class() {
+                if let PtrInfo::Virtual(ref vinfo) = info {
+                    let stored = vinfo
+                        .descr
+                        .as_size_descr()
+                        .and_then(|sd| {
+                            sd.all_fielddescrs()
+                                .iter()
+                                .find(|fd| fd.is_w_class())
+                                .map(|fd| fd.index_in_parent() as u32)
+                        })
+                        .and_then(|widx| get_field(&vinfo.fields, widx));
+                    if let Some(val_ref) = stored {
+                        let b_old = BoxRef::from_bound_op(op_rc);
+                        let b_val = ctx.get_box_replacement(val_ref);
+                        ctx.make_equal_to(&b_old, &b_val);
+                        return OptimizationResult::Remove;
+                    }
+                    if let Some(w_class) = vinfo
+                        .descr
+                        .as_size_descr()
+                        .and_then(|sd| sd.w_class_obj())
+                        .filter(|&w| w != 0)
+                    {
+                        ctx.make_constant(
+                            op.pos.get(),
+                            majit_ir::Value::Ref(majit_ir::GcRef(w_class as usize)),
+                        );
+                        return OptimizationResult::Remove;
+                    }
+                    // Class identity unresolved: leave the read in place so
+                    // the virtual is forced and the real `w_class` is read,
+                    // rather than mis-indexing a value field.
+                    return OptimizationResult::PassOn;
+                }
+            }
             let field_val = match &info {
                 PtrInfo::Virtual(vinfo) => get_field(&vinfo.fields, field_idx),
                 PtrInfo::VirtualStruct(vinfo) => get_field(&vinfo.fields, field_idx),
