@@ -120,7 +120,10 @@ def test_socket_connect():
         name = s.getpeername() # Will raise socket.error if not connected
         assert name[1] == 80
     finally:
-        s.close()
+        try:
+            s.close()
+        except Exception:
+            pass
 
 def test_socket_connect_ex():
     import _socket
