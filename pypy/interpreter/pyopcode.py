@@ -158,7 +158,9 @@ class __extend__(pyframe.PyFrame):
                 # next_instr is unchanged and the round-trip is skipped.
                 _d = self.debugdata
                 if ec.space.reverse_debugging or (
-                        _d is not None and _d.w_f_trace is not None):
+                        _d is not None and _d.w_f_trace is not None) or (
+                        not we_are_translated() and
+                        'bytecode_only_trace' in ec.__dict__):
                     ec.bytecode_only_trace(self)
                     next_instr = r_uint(self.last_instr)
                 actionflag = ec.space.actionflag
