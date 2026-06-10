@@ -4111,6 +4111,63 @@ impl OptContext {
             .unwrap_or_else(|| crate::r#box::BoxRef::from_opref(opref))
     }
 
+    /// `BoxRef`-addressed operand resolution seam. Callers holding the
+    /// operand Box (`op.arg(i)`) resolve it here instead of collapsing to
+    /// an `OpRef` and re-resolving.
+    ///
+    /// resoperation.py:57-68: a bound operand carries its producer op (or
+    /// is a Const) and walks its own `_forwarded` chain directly — the Box
+    /// object IS the reference. An unbound operand (no producer handle:
+    /// short-preamble replay / test baseline position-only box, or an
+    /// InputArg) has no producer chain to walk from the Box alone, so it
+    /// resolves through the `OpRef` position store as before.
+    pub fn resolve_box_box(&self, arg: &crate::r#box::BoxRef) -> crate::r#box::BoxRef {
+        if arg.bound_op().is_some() || arg.is_constant() {
+            let resolved = arg.get_box_replacement(false);
+            #[cfg(debug_assertions)]
+            {
+                let legacy = self.get_box_replacement(arg.to_opref());
+                debug_assert!(
+                    resolved.same_box(&legacy) || resolved.to_opref() == legacy.to_opref(),
+                    "resolve_box_box: box-native walk diverged from OpRef path for {:?}",
+                    arg.to_opref()
+                );
+            }
+            resolved
+        } else {
+            self.get_box_replacement(arg.to_opref())
+        }
+    }
+
+    /// `Option`-returning sibling of [`OptContext::resolve_box_box`], the
+    /// box-native form of `get_box_replacement_box`. resoperation.py:58
+    /// `get_box_replacement(op)` walks the box's `_forwarded` chain; a bound
+    /// operand (or Const) walks it directly here. The `None` arm is pyre's
+    /// unbound-operand adaptation (RPython has no unbound boxes): an unbound
+    /// operand resolves through the `OpRef` store and surfaces `None` when the
+    /// root does not resolve (sentinel / baseline) so callers can branch on it.
+    pub fn resolve_box_box_opt(&self, arg: &crate::r#box::BoxRef) -> Option<crate::r#box::BoxRef> {
+        if arg.bound_op().is_some() || arg.is_constant() {
+            let resolved = arg.get_box_replacement(false);
+            #[cfg(debug_assertions)]
+            {
+                let legacy = self.get_box_replacement_box(arg.to_opref());
+                let agrees = match &legacy {
+                    Some(l) => resolved.same_box(l) || resolved.to_opref() == l.to_opref(),
+                    None => false,
+                };
+                debug_assert!(
+                    agrees,
+                    "resolve_box_box_opt: box-native walk diverged from OpRef path for {:?}",
+                    arg.to_opref()
+                );
+            }
+            Some(resolved)
+        } else {
+            self.get_box_replacement_box(arg.to_opref())
+        }
+    }
+
     /// resoperation.py:58 get_box_replacement(not_const=True). This is used
     /// for guard fail args / backend liveboxes where RPython stops before a
     /// Const target, preserving the runtime box while resume numbering carries
@@ -4806,6 +4863,20 @@ impl OptContext {
         // `_forwarded` host so the constant forwarding lands. A sentinel
         // `opref` has no host to forward.
         let b = self.get_box_replacement_box(opref).or_else(|| {
+            (!opref.is_none() && !opref.is_constant()).then(|| self.materialize_box_at(opref))
+        });
+        if let Some(b) = b {
+            self.make_constant_box(&b, value);
+        }
+    }
+
+    /// `BoxRef`-operand form of [`OptContext::make_constant`]. optimizer.py:413
+    /// `make_constant(box, constbox)` does `box = get_box_replacement(box)` then
+    /// forwards the constant; this takes that first resolve box-native via
+    /// `resolve_box_box_opt` instead of collapsing the operand to an `OpRef`.
+    pub fn make_constant_arg(&mut self, arg: &crate::r#box::BoxRef, value: Value) {
+        let b = self.resolve_box_box_opt(arg).or_else(|| {
+            let opref = arg.to_opref();
             (!opref.is_none() && !opref.is_constant()).then(|| self.materialize_box_at(opref))
         });
         if let Some(b) = b {
