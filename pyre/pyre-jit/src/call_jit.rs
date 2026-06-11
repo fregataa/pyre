@@ -229,17 +229,17 @@ const ARENA_CAP: usize = 64;
 /// Single source of truth: [`majit_gc::header::GcHeader::SIZE`].
 const GC_HEADER_SIZE: usize = majit_gc::header::GcHeader::SIZE;
 
-/// Arena slot with prepended GcHeader (zeroed, layout parity only).
+/// Arena slot: leading GcHeader (tid 0, flags 0) then the frame payload.
 #[repr(C)]
 struct GcFrameSlot {
-    gc_header: u64,
+    gc_header: majit_gc::header::GcHeader,
     frame: MaybeUninit<PyFrame>,
 }
 
 impl GcFrameSlot {
     const fn zeroed() -> Self {
         GcFrameSlot {
-            gc_header: 0,
+            gc_header: majit_gc::header::GcHeader { tid_and_flags: 0 },
             frame: MaybeUninit::uninit(),
         }
     }
@@ -248,13 +248,13 @@ impl GcFrameSlot {
 /// Heap-allocated frame with prepended GcHeader.
 #[repr(C)]
 struct GcPyFrame {
-    gc_header: u64,
+    gc_header: majit_gc::header::GcHeader,
     frame: PyFrame,
 }
 
 fn heap_alloc_frame(frame: PyFrame) -> *mut PyFrame {
     let gc_frame = Box::into_raw(Box::new(GcPyFrame {
-        gc_header: 0,
+        gc_header: majit_gc::header::GcHeader { tid_and_flags: 0 },
         frame,
     }));
     unsafe { &mut (*gc_frame).frame as *mut PyFrame }
@@ -1366,9 +1366,10 @@ pub fn blackhole_resume_via_rd_numb(
     // for lazy materialization in getvirtual_ptr/getvirtual_int.
     let count = deadframe.len() as i32;
     let rd_virtuals_converted: Option<Vec<resume::VirtualInfo>> = rd_virtuals.map(|rd_virts| {
+        let num_virtuals = rd_virts.len();
         rd_virts
             .iter()
-            .map(|rd| resume::rd_virtual_to_virtual_info(rd, rd_consts, count))
+            .map(|rd| resume::rd_virtual_to_virtual_info(rd, rd_consts, count, num_virtuals))
             .collect()
     });
     let rd_virtuals_slice = rd_virtuals_converted.as_deref();
@@ -3451,8 +3452,9 @@ pub fn cranelift_resumedata_deopt(
     //    VirtualInfo so the decoder can materialise lazily.
     let count = outputs.len() as i32;
     let rd_virtuals_converted: Option<Vec<resume::VirtualInfo>> = rd_virtuals_rcs.map(|rcs| {
+        let num_virtuals = rcs.len();
         rcs.iter()
-            .map(|rd| resume::rd_virtual_to_virtual_info(rd, rd_consts, count))
+            .map(|rd| resume::rd_virtual_to_virtual_info(rd, rd_consts, count, num_virtuals))
             .collect()
     });
     let rd_virtuals_slice = rd_virtuals_converted.as_deref();

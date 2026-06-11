@@ -1624,6 +1624,15 @@ pub struct PyreSym {
     /// by handle_possible_exception after GUARD_EXCEPTION, then consumed
     /// by finishframe_exception for stack push.
     pub(crate) last_exc_box: OpRef,
+    /// E1: maps the OpRef of a trace-built (fresh `NewWithVtable`)
+    /// exception to its trace-time concrete instance.  `RAISE_VARARGS`
+    /// reuses the instance to take the instance fast path — skip the
+    /// residual `normalize_raise_varargs_jit` publish + `GUARD_EXCEPTION`
+    /// round-trip so the exception stays virtualizable — and to apply the
+    /// unconditional `__context__ = ec.sys_exc_value` chaining that is
+    /// valid only for a freshly constructed exception (w_context still
+    /// null, self-cycle impossible).
+    pub(crate) trace_built_exc: majit_ir::VecAssoc<OpRef, pyre_object::PyObjectRef>,
     /// Symbolic mirror of executioncontext.current_exception/sys_exc_info.
     /// Used by PUSH_EXC_INFO / POP_EXCEPT to preserve nested handler state.
     pub(crate) current_exc_value: pyre_object::PyObjectRef,
@@ -3048,6 +3057,7 @@ impl PyreSym {
             last_exc_value: std::ptr::null_mut(),
             class_of_last_exc_is_const: false,
             last_exc_box: OpRef::NONE,
+            trace_built_exc: majit_ir::VecAssoc::new(),
             current_exc_value: pyre_interpreter::eval::get_current_exception(),
             current_exc_box: OpRef::NONE,
             virtualref_boxes: Vec::new(),
@@ -8801,6 +8811,14 @@ mod tests {
         let prev_exc = pyre_interpreter::PyError::value_error("prev").to_exc_object();
         let caught_exc = pyre_interpreter::PyError::runtime_error("caught").to_exc_object();
 
+        // get/set_current_exception read/write `(*ec).sys_exc_value` on the
+        // thread's current EC; production establishes it via
+        // `set_last_exec_ctx(frame.execution_context)` (eval.rs:841). Mirror
+        // that here so the save/restore round-trips like a real frame, and
+        // restore the prior ctx at the end to avoid leaking into sibling tests.
+        let saved_ctx = pyre_interpreter::call::take_last_exec_ctx();
+        pyre_interpreter::call::set_last_exec_ctx(frame.execution_context);
+
         let mut ctx = TraceCtx::for_test(1);
         let prev_exc_ref = ctx.const_ref(prev_exc as i64);
         let caught_exc_ref = ctx.const_ref(caught_exc as i64);
@@ -8839,10 +8857,10 @@ mod tests {
         assert_eq!(pushed_exc.opref, caught_exc_ref);
         let restored_prev = <MIFrame as SharedOpcodeHandler>::pop_value(&mut state)
             .expect("previous exception should be underneath the caught exception");
-        // push_exc_info emits a residual `trace_get_current_exception_jit`
-        // call (pyopcode.py:786 runtime save-restore parity) so the
-        // previous-exception slot carries a fresh OpRef from that call.
-        // Only the concrete value survives across the save/restore.
+        // push_exc_info emits `GetfieldGcR(ec)` on `ec.sys_exc_value`
+        // (pyopcode.py:786 runtime save-restore parity), so the previous-
+        // exception slot carries that op's OpRef and its concrete value is
+        // read back from the EC field — `prev_exc`, which the test seeded.
         assert_ne!(restored_prev.opref, OpRef::NONE);
         assert_eq!(restored_prev.concrete.to_pyobj(), prev_exc);
 
@@ -8853,6 +8871,7 @@ mod tests {
         assert_eq!(state.sym().current_exc_box, restored_prev.opref);
         assert_eq!(pyre_interpreter::eval::get_current_exception(), prev_exc);
         pyre_interpreter::eval::set_current_exception(PY_NULL);
+        pyre_interpreter::call::set_last_exec_ctx(saved_ctx);
     }
 
     #[test]

@@ -134,30 +134,34 @@ pub unsafe fn header_of(obj_addr: usize) -> *mut GcHeader {
     (obj_addr - GcHeader::SIZE) as *mut GcHeader
 }
 
-/// Allocate a value of type `T` behind a leading zeroed [`GcHeader`] and
-/// return the payload pointer (`block + GcHeader::SIZE`).
+/// Allocate a value of type `T` behind a leading [`GcHeader`] and return the
+/// payload pointer (`block + SIZE`).
 ///
-/// Mirrors incminimark's `malloc_fixedsize`: reserve `size_gc_header + size`
-/// bytes, initialise the header at the block start
-/// (`init_gc_object(result, typeid, flags=0)`), and return
-/// `obj = result + size_gc_header`. The header is zeroed (`tid = 0`, all
-/// flags clear) so a write barrier reading `*(obj - SIZE)` sees
-/// `TRACK_YOUNG_PTRS = 0` and skips the object: it is immortal (leaked), not
-/// tracked by the nursery or old generation.
+/// `malloc_fixedsize` analog: reserve `size_gc_header + size` bytes,
+/// `init_gc_object(result, typeid, flags=0)` at the block start, and return
+/// `obj = result + size_gc_header`. A freshly allocated object carries no
+/// flags, so the header word is exactly `type_id` (`GcHeader::new`). Callers
+/// pass the object's GC type id (`malloc_typed` threads `GcType::type_id()`;
+/// the untyped bridge and frames pass the object-root id 0).
 ///
-/// The allocation is intentionally leaked — these objects outlive every
-/// collection until the managed allocator takes them over. Callers MUST NOT
-/// `Box::from_raw` the result: it points past the header, not at the
-/// allocation base.
+/// The header's flags are all clear, so a write barrier reading `*(obj - SIZE)`
+/// sees `TRACK_YOUNG_PTRS = 0` and skips the object. These objects are not yet
+/// routed through the managed nursery allocator; they are leaked host
+/// allocations, and the header is what lets the barrier read `*(obj - SIZE)`
+/// without dereferencing foreign memory.
 ///
-/// `T` must be word-aligned (`align_of::<T>() <= GcHeader::SIZE`), matching
-/// the fixed one-word header; a wider alignment would move the payload off
-/// the fixed `obj - SIZE` offset the barrier reads.
-pub fn alloc_with_gc_header<T>(value: T) -> *mut T {
-    debug_assert!(
-        std::mem::align_of::<T>() <= GcHeader::SIZE,
-        "object alignment exceeds GcHeader::SIZE; fixed header offset would break the write barrier",
-    );
+/// # Safety
+/// - The result points past the header; it MUST NOT be passed to
+///   `Box::from_raw` or freed at the payload pointer.
+/// - `align_of::<T>() <= GcHeader::SIZE`, enforced at monomorphisation: a
+///   wider alignment would move the payload off the fixed `obj - SIZE` offset.
+pub fn alloc_with_gc_header<T>(value: T, type_id: u32) -> *mut T {
+    const {
+        assert!(
+            std::mem::align_of::<T>() <= GcHeader::SIZE,
+            "alloc_with_gc_header: align_of::<T>() exceeds GcHeader::SIZE; the fixed obj - SIZE header offset would misalign the payload",
+        )
+    };
     let total = GcHeader::SIZE + std::mem::size_of::<T>();
     let align = std::mem::align_of::<T>().max(GcHeader::SIZE);
     let layout = std::alloc::Layout::from_size_align(total, align)
@@ -167,7 +171,7 @@ pub fn alloc_with_gc_header<T>(value: T) -> *mut T {
         if raw.is_null() {
             std::alloc::handle_alloc_error(layout);
         }
-        (raw as *mut GcHeader).write(GcHeader::new(0));
+        (raw as *mut GcHeader).write(GcHeader::new(type_id));
         let ptr = raw.add(GcHeader::SIZE) as *mut T;
         ptr.write(value);
         ptr
@@ -224,15 +228,16 @@ mod tests {
     }
 
     #[test]
-    fn alloc_with_gc_header_prepends_zeroed_header() {
-        // Leaked intentionally — the managed/immortal allocation contract
-        // forbids freeing the returned payload pointer.
-        let p = alloc_with_gc_header(0xABCD_u64);
+    fn alloc_with_gc_header_prepends_header() {
+        // Leaked: the payload pointer points past the header, so it must not
+        // be freed.
+        let p = alloc_with_gc_header(0xABCD_u64, 0x1357);
         unsafe {
             assert_eq!(*p, 0xABCD);
             let hdr = header_of(p as usize);
-            // Zeroed header => barrier reads TRACK_YOUNG_PTRS=0 and skips.
-            assert_eq!((*hdr).tid_and_flags, 0);
+            // type id recorded; flags clear (init_gc_object flags=0).
+            assert_eq!((*hdr).type_id(), 0x1357);
+            assert_eq!((*hdr).flags(), 0);
             assert!(!(*hdr).has_flag(flags::TRACK_YOUNG_PTRS));
         }
     }

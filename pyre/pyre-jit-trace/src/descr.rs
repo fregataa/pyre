@@ -1646,9 +1646,13 @@ pub fn make_array_descr_with_full_id(
 // ── Range iterator field descriptors ─────────────────────────────────
 
 use pyre_interpreter::{DICT_STORAGE_VALUES_LEN_OFFSET, DICT_STORAGE_VALUES_OFFSET};
+use pyre_object::excobject::{
+    EXC_ARGS_W_OFFSET, EXC_KIND_COUNT, EXC_KIND_OFFSET, EXC_W_CONTEXT_OFFSET, ExcKind,
+    W_EXCEPTION_OBJECT_SIZE, exc_kind_to_pytype,
+};
 use pyre_object::floatobject::{FLOAT_FLOATVAL_OFFSET, W_FloatObject};
 use pyre_object::intobject::W_IntObject;
-use pyre_object::pyobject::OB_TYPE_OFFSET;
+use pyre_object::pyobject::{OB_TYPE_OFFSET, W_CLASS_OFFSET};
 use pyre_object::rangeobject::{
     RANGE_ITER_CURRENT_OFFSET, RANGE_ITER_STEP_OFFSET, RANGE_ITER_STOP_OFFSET,
 };
@@ -1737,6 +1741,14 @@ pub fn method_w_self_descr() -> DescrRef {
 /// payload.
 pub fn object_mutable_cell_value_descr() -> DescrRef {
     field_descr_from_group(&W_OBJECT_MUTABLE_CELL_DESCR_GROUP, 0)
+}
+
+/// Size descriptor for `W_ListObject` allocation via NewWithVtable.
+/// vtable = &LIST_TYPE; the Object-strategy fields `length` / `items` /
+/// `strategy` are SetField'd after; `int_items` / `float_items` stay at the
+/// NewWithVtable memzero (== empty, never read under the Object strategy).
+pub fn w_list_size_descr() -> DescrRef {
+    W_LIST_DESCR_GROUP.size_descr.clone()
 }
 
 /// rlist.py:116 `l.length` — live length of a list under the Object
@@ -1937,6 +1949,150 @@ pub fn specialised_tuple_ff_size_descr() -> DescrRef {
 /// Size descriptor for `W_SpecialisedTupleObject_oo`.
 pub fn specialised_tuple_oo_size_descr() -> DescrRef {
     SPECIALISED_TUPLE_OO_DESCR_GROUP.size_descr.clone()
+}
+
+/// SizeDescr + field descrs for `W_ExceptionObject` allocation via
+/// NewWithVtable, one set per `ExcKind`.  The vtable (`ob_type`) differs
+/// per kind (`exc_kind_to_pytype`), so each kind owns its group; the
+/// three SetField'd fields — `kind`, `w_class`, `args_w` — share the
+/// same offsets across kinds.  `w_cause`/`w_context`/… stay zeroed by
+/// the `NewWithVtable` memzero (PY_NULL), matching
+/// `w_exception_new_empty`.
+fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
+    build_object_descr_group_with_def_path(
+        W_EXCEPTION_OBJECT_SIZE,
+        W_EXCEPTION_GC_TYPE_ID,
+        exc_kind_to_pytype(kind) as *const _ as usize,
+        &[
+            // `kind` is a `u8` tag (1 byte, unsigned).
+            (
+                "W_ExceptionObject.kind",
+                EXC_KIND_OFFSET,
+                1,
+                Type::Int,
+                false,
+                false,
+                false,
+            ),
+            (
+                "W_ExceptionObject.w_class",
+                W_CLASS_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "W_ExceptionObject.args_w",
+                EXC_ARGS_W_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            // `w_context` (`__context__`): a GC pointer slot.  Written by
+            // the RAISE_VARARGS `__context__` chaining lowering
+            // (`exc.w_context = ec.sys_exc_value`) so the optimizer can
+            // track it on the virtual exception; carried at field index 3.
+            (
+                "W_ExceptionObject.w_context",
+                EXC_W_CONTEXT_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+        ],
+        // Empty name: the per-kind vtable means a shared "W_ExceptionObject"
+        // name-registry slot would be first-write-wins and lose the other
+        // kinds' vtables.  NewWithVtable embeds the SizeDescr in the op, so
+        // the name-registry publish is not needed here.
+        "",
+        "",
+    )
+}
+
+static W_EXCEPTION_DESCR_CACHE: LazyLock<Mutex<Vec<Option<PyreObjectDescrGroup>>>> =
+    LazyLock::new(|| Mutex::new((0..EXC_KIND_COUNT).map(|_| None).collect()));
+
+/// Field descrs for the exception construction emit: `(size, kind,
+/// w_class, args_w)`.  Built and cached per `ExcKind` on first use.
+pub fn w_exception_descrs(kind: ExcKind) -> (DescrRef, DescrRef, DescrRef, DescrRef) {
+    let idx = kind as u8 as usize;
+    let mut cache = W_EXCEPTION_DESCR_CACHE.lock().unwrap();
+    if cache[idx].is_none() {
+        cache[idx] = Some(build_w_exception_group(kind));
+    }
+    let group = cache[idx].as_ref().unwrap();
+    (
+        group.size_descr.clone() as DescrRef,
+        field_descr_from_group(group, 0),
+        field_descr_from_group(group, 1),
+        field_descr_from_group(group, 2),
+    )
+}
+
+/// Field descr for `W_ExceptionObject.w_context` (the `__context__`
+/// slot), index 3 of the per-kind exception descr group.  Used by the
+/// RAISE_VARARGS `__context__` chaining lowering; shares the same parent
+/// `SizeDescr` as the `NewWithVtable` emit so the optimizer recognises
+/// the store as a field of the virtual exception.
+pub fn w_exception_context_descr(kind: ExcKind) -> DescrRef {
+    let idx = kind as u8 as usize;
+    let mut cache = W_EXCEPTION_DESCR_CACHE.lock().unwrap();
+    if cache[idx].is_none() {
+        cache[idx] = Some(build_w_exception_group(kind));
+    }
+    let group = cache[idx].as_ref().unwrap();
+    field_descr_from_group(group, 3)
+}
+
+/// Field descr for `ExecutionContext::sys_exc_value`, used by the JIT
+/// lowering of PUSH_EXC_INFO / POP_EXCEPT to GETFIELD_GC_R / SETFIELD_GC.
+///
+/// `field_type = Ref` so the optimizer tracks the value as a GC
+/// reference (virtual-defer + correct resume), but the `flag` is
+/// deliberately NON-pointer so `is_pointer_field()` is false and the GC
+/// rewrite emits NO write barrier (`rewrite.rs handle_write_barrier_setfield`
+/// gates the barrier on `is_pointer_field() && val_is_ref`).  That is
+/// correct here: the EC is a non-GC `Rc`-owned struct whose
+/// `sys_exc_value` slot is forwarded directly as a GC root every
+/// collection (`eval::walk_pyframe_roots`), so the generational
+/// remembered-set barrier is unnecessary.  A single cached Arc gives the
+/// PUSH and POP ops the same `descr_identity`, so the heap optimizer
+/// dead-store-eliminates a balanced save/restore (and the stored
+/// exception, if it never otherwise escapes, stays virtual and DCEs).
+pub fn ec_sys_exc_value_descr() -> DescrRef {
+    static EC_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLock::new(|| {
+        use majit_ir::descr::{ArrayFlag, SimpleFieldDescrSpec};
+        // type_id 0 + vtable 0 → SimpleSizeDescr::is_object() == false, so
+        // the optimizer builds a StructPtrInfo for the (non-GC) EC pointer.
+        // The single field is Ref-typed (ref value tracking) but
+        // Unsigned-flagged (is_pointer_field() == false → no write barrier;
+        // the slot is a forwarded GC root, see eval::walk_pyframe_roots).
+        majit_ir::descr::make_simple_descr_group(
+            u32::MAX,
+            pyre_interpreter::EC_SIZE,
+            0,
+            0,
+            &[SimpleFieldDescrSpec {
+                index: 0,
+                name: "ExecutionContext.sys_exc_value".to_string(),
+                offset: pyre_interpreter::EC_SYS_EXC_VALUE_OFFSET,
+                field_size: 8,
+                field_type: Type::Ref,
+                is_immutable: false,
+                is_quasi_immutable: false,
+                flag: ArrayFlag::Unsigned,
+                virtualizable: false,
+                index_in_parent: 0,
+            }],
+        )
+    });
+    EC_DESCR_GROUP.field_descrs[0].clone() as DescrRef
 }
 
 /// Size descriptor for W_SliceObject allocation via NewWithVtable.
