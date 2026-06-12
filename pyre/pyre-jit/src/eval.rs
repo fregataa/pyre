@@ -364,6 +364,27 @@ unsafe fn set_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_
     }
 }
 
+/// Custom trace for `W_TupleObject`. `wrappeditems` points at an off-GC
+/// `std::alloc`'d `ItemsBlock` (`tupleobject.rs:56`), so the element
+/// slots are unreachable through inline `gc_ptr_offsets` — the collector
+/// would see `wrappeditems` as a single non-managed pointer and stop.
+/// Forward each element slot in place, exactly as `set_object_custom_trace`
+/// walks the off-GC `Vec`, so a moving collector relocates young tuple
+/// elements and rewrites the block. The block is exact-size for tuples
+/// (`capacity == len`, every slot written by `alloc_tuple_items_block`).
+unsafe fn tuple_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+    let tuple = unsafe { &*(obj_addr as *const pyre_object::tupleobject::W_TupleObject) };
+    let block = tuple.wrappeditems;
+    if block.is_null() {
+        return;
+    }
+    let cap = unsafe { pyre_object::object_array::items_block_capacity(block) };
+    let base = unsafe { pyre_object::object_array::items_block_items_base(block) };
+    for i in 0..cap {
+        f(unsafe { base.add(i) } as *mut majit_ir::GcRef);
+    }
+}
+
 /// RPython jitexc.py:53 ContinueRunningNormally parity.
 pub(crate) enum LoopResult {
     Done(PyResult),
@@ -581,16 +602,17 @@ thread_local! {
         // tuple convergence additionally requires specialised arity-2
         // variants (per `pypy/objspace/std/specialisedtupleobject.py`),
         // which are not yet modeled here.
-        let mut w_tuple_ti = TypeInfo::object_subclass(
+        // `wrappeditems` points at an off-GC `std::alloc`'d ItemsBlock, so
+        // inline `gc_ptr_offsets` tracing stops at the non-managed block
+        // pointer and never reaches the elements. Trace through the block
+        // with a custom hook instead (mirrors `W_SetObject`); the tuple's
+        // explicit write barrier at creation (`tupleobject.rs`) keeps the
+        // old-gen tuple in the remembered set so this runs on minor GC.
+        let w_tuple_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
             std::mem::size_of::<pyre_object::tupleobject::W_TupleObject>(),
             object_tid,
-        );
-        w_tuple_ti.gc_ptr_offsets = vec![std::mem::offset_of!(
-            pyre_object::tupleobject::W_TupleObject,
-            wrappeditems
-        )];
-        w_tuple_ti.has_gc_ptrs = true;
-        let w_tuple_tid = gc.register_type(w_tuple_ti);
+            tuple_object_custom_trace,
+        ));
         debug_assert_eq!(w_tuple_tid, W_TUPLE_GC_TYPE_ID);
         // `rlist.py Ptr(GcArray(OBJECTPTR))` — the variable-length
         // backing block behind `PyObjectArray`. `base=8` single-slot
@@ -4836,8 +4858,16 @@ fn materialize_virtual_from_rd(
                 rd_consts[ci].to_value()
             }
             majit_ir::resumedata::TAGVIRTUAL => {
+                // resume.py:278-284 nested virtuals are numbered negatively;
+                // getvirtual_ptr resolves them via Python negative list
+                // indexing into rd_virtuals (resume.py:951-954).
+                let vidx = if val < 0 {
+                    (rd_virtuals.map_or(0, |v| v.len()) as i32 + val) as usize
+                } else {
+                    val as usize
+                };
                 return Some(materialize_virtual_from_rd(
-                    val as usize,
+                    vidx,
                     dead_frame,
                     num_failargs,
                     rd_consts,
@@ -5634,9 +5664,16 @@ fn decode_tagged_value(
             .unwrap_or(majit_ir::Const::Int(0))
             .to_value(),
         majit_metainterp::resume::TAGVIRTUAL => {
-            // resume.py:1572: decode_ref(TAGVIRTUAL) → getvirtual_ptr(num)
+            // resume.py:1572: decode_ref(TAGVIRTUAL) → getvirtual_ptr(num).
+            // resume.py:278-284 nested virtuals are numbered negatively;
+            // resolve via negative indexing into rd_virtuals (resume.py:951-954).
+            let vidx = if val < 0 {
+                (rd_virtuals.map_or(0, |v| v.len()) as i32 + val) as usize
+            } else {
+                val as usize
+            };
             materialize_virtual_from_rd(
-                val as usize,
+                vidx,
                 dead_frame,
                 num_failargs,
                 rd_consts,
@@ -5831,8 +5868,17 @@ fn rebuild_typed_from_rd_numb(
 ) -> (Vec<Value>, Option<usize>, HashMap<usize, Value>) {
     use majit_ir::resumedata::rebuild_from_numbering;
 
-    let (_num_failargs, vable_values, _vref_values, frames) =
-        rebuild_from_numbering(rd_numb, rd_consts, &exit_layout.exit_types, None);
+    let num_virtuals = exit_layout
+        .storage
+        .as_deref()
+        .map_or(0, |s| s.rd_virtuals.len());
+    let (_num_failargs, vable_values, _vref_values, frames) = rebuild_from_numbering(
+        rd_numb,
+        rd_consts,
+        &exit_layout.exit_types,
+        None,
+        num_virtuals,
+    );
 
     // resume.py:1045 consume_vref_and_vable_boxes parity.
     // vable_array format: [frame_ptr, ni, code, vsd, ns, locals..., stack...]
@@ -6092,8 +6138,17 @@ fn build_resumed_frames(
     // boxes each frame contributes. There is no out-of-band frame size — the
     // decoder reads jitcode liveness at the frame's resume pc.
     let cb = pyre_jit_trace::state::frame_value_count_at;
-    let (_num_failargs, vable_values, _vref_values, frames) =
-        rebuild_from_numbering(rd_numb, rd_consts, &exit_layout.exit_types, Some(&cb));
+    let num_virtuals = exit_layout
+        .storage
+        .as_deref()
+        .map_or(0, |s| s.rd_virtuals.len());
+    let (_num_failargs, vable_values, _vref_values, frames) = rebuild_from_numbering(
+        rd_numb,
+        rd_consts,
+        &exit_layout.exit_types,
+        Some(&cb),
+        num_virtuals,
+    );
 
     let dead_frame_typed = decode_exit_layout_values(raw_values, exit_layout);
     if majit_metainterp::majit_log_enabled() {

@@ -13849,11 +13849,13 @@ fn collect_guards(
                 let fvc = get_frame_value_count_fn();
                 let fvc_ref: Option<&dyn Fn(i32, i32) -> usize> =
                     fvc.as_ref().map(|f| f as &dyn Fn(i32, i32) -> usize);
+                let num_virtuals = op.resolved_rd_virtuals().map_or(0, |v| v.len());
                 let (_nfa, _vable, _vref, frames) = rebuild_from_numbering(
                     &rd_numb_bytes,
                     &rd_consts_data,
                     &fail_arg_types,
                     fvc_ref,
+                    num_virtuals,
                 );
                 // Strip the after-residual-call marker: this pre-computed
                 // pc is exit-layout metadata, not the resume target (the
@@ -13897,8 +13899,14 @@ fn collect_guards(
             let fvc = majit_ir::resumedata::get_frame_value_count_fn();
             let fvc_ref: Option<&dyn Fn(i32, i32) -> usize> =
                 fvc.as_ref().map(|f| f as &dyn Fn(i32, i32) -> usize);
-            let (_num_failargs, _vable_values, _vref_values, frames) =
-                rebuild_from_numbering(&rd_numb_bytes, &rd_consts_data, &fail_arg_types, fvc_ref);
+            let num_virtuals = rd_vi.as_ref().map_or(0, |v| v.len());
+            let (_num_failargs, _vable_values, _vref_values, frames) = rebuild_from_numbering(
+                &rd_numb_bytes,
+                &rd_consts_data,
+                &fail_arg_types,
+                fvc_ref,
+                num_virtuals,
+            );
 
             // Rebuild frame slots from rd_numb values.
             // Track Virtual(vidx) → slot_idx for target_slot in virtual_layouts.
@@ -13961,7 +13969,17 @@ fn collect_guards(
                         };
                         ExitValueSourceLayout::ExitValue(idx)
                     }
-                    resumedata::TAGVIRTUAL => ExitValueSourceLayout::Virtual(val as usize),
+                    resumedata::TAGVIRTUAL => {
+                        // resume.py:278-284 nested virtuals are numbered
+                        // negatively; resolve via negative indexing into
+                        // rd_virtuals (resume.py:951-954).
+                        let idx = if val >= 0 {
+                            val as usize
+                        } else {
+                            (num_virtuals as i32 + val) as usize
+                        };
+                        ExitValueSourceLayout::Virtual(idx)
+                    }
                     resumedata::TAGINT => ExitValueSourceLayout::Constant(val as i64),
                     resumedata::TAGCONST => {
                         let idx = (val - resumedata::TAG_CONST_OFFSET) as usize;

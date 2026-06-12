@@ -673,6 +673,23 @@ impl PyreMetaInterp {
 
     // ── Concrete execution helpers ───────────────────────────────
 
+    /// Concretely execute the inline frame's next opcode on its
+    /// `owned_concrete_frame` (the trace snapshot).
+    ///
+    /// KNOWN DIVERGENCE from RPython `execute_and_record` (live miscompile,
+    /// see memory `cf-executor-into-walker-epic-2026-06-08`): this runs ONLY
+    /// for inline frames (called from `step_inline_frame`); `step_root_frame`
+    /// never concrete-steps.  For a residual SHARED-heap STORE (STORE_GLOBAL /
+    /// STORE_SUBSCR / LIST_APPEND on a caller-shared object) `execute_opcode_step`
+    /// mutates the live heap during recording, because `snapshot_for_tracing`
+    /// shares `w_globals_obj` (pyframe.rs).  The compiled loop then re-runs the
+    /// traced iteration from the loop header (the real frame never advanced),
+    /// re-applying the store → one-time over-commit scaling with inline depth.
+    /// RPython advances the single real frame as it records (so the store
+    /// commits once and the compiled loop resumes AFTER the traced iterations),
+    /// and blackhole-FORWARDS on abort instead of re-running.  Fix = the
+    /// executor-into-walker cutover (Task #14); gate
+    /// `pyre/bench/synth/inlined_callee_globals.py`.
     fn concrete_execute_step(&mut self) {
         let top = self.framestack.last_mut().unwrap();
         let Some(cf) = top.owned_concrete_frame.as_mut() else {

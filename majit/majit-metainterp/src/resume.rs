@@ -1272,8 +1272,11 @@ pub use majit_backend::VirtualFieldSource;
 /// each field value comes from at resume time.
 ///
 /// `consts` is the rd_consts array. `count` is the number of fail_args
-/// (used for negative TAGBOX indices). Both come from the containing
-/// ResumeGuardDescr / EncodedResumeData.
+/// (used for negative TAGBOX indices). `num_virtuals` is the length of
+/// rd_virtuals (used for negative TAGVIRTUAL indices — nested virtuals
+/// are numbered negatively by `assign_number_to_virtual`,
+/// resume.py:278-284, and resolved via Python negative list indexing).
+/// All come from the containing ResumeGuardDescr / EncodedResumeData.
 pub fn tagged_to_source(
     tagged: i16,
     consts: &[majit_ir::Const],
@@ -1312,16 +1315,11 @@ pub fn tagged_to_source(
             ResumeValueSource::FailArg(idx as usize)
         }
         TAGVIRTUAL => {
-            // Negative nums (cached/nested virtuals from
-            // assign_number_to_virtual) index rd_virtuals from the end, as in
-            // RPython's Python list negative indexing. Mirror the serialization
-            // remap in _number_virtuals (rd_virtuals.len() + num).
-            let idx = if num >= 0 {
-                num as usize
-            } else {
-                (num_virtuals as i32 + num) as usize
-            };
-            ResumeValueSource::Virtual(idx)
+            let mut idx = num;
+            if idx < 0 {
+                idx += num_virtuals as i32;
+            }
+            ResumeValueSource::Virtual(idx as usize)
         }
         _ => ResumeValueSource::Unavailable,
     }
@@ -1330,8 +1328,8 @@ pub fn tagged_to_source(
 /// Convert an `RdVirtualInfo` (IR-level, from compile.rs/pyjitpl.rs)
 /// to a `VirtualInfo` (resume-level, used by ResumeDataDirectReader).
 ///
-/// `consts` and `count` are needed to decode tagged fieldnums; `num_virtuals`
-/// (the total rd_virtuals count) remaps negative TAGVIRTUAL field references.
+/// `consts`, `count` and `num_virtuals` are needed to decode tagged
+/// fieldnums (see [`tagged_to_source`]).
 pub fn rd_virtual_to_virtual_info(
     rd: &majit_ir::RdVirtualInfo,
     consts: &[majit_ir::Const],
@@ -4633,7 +4631,7 @@ mod tests {
 
         let fail_arg_types = vec![majit_ir::Type::Int, majit_ir::Type::Int];
         let (num_failargs, _vable_values, _vref_values, rebuilt_frames) =
-            rebuild_from_numbering(&rd_numb, memo.consts(), &fail_arg_types, None);
+            rebuild_from_numbering(&rd_numb, memo.consts(), &fail_arg_types, None, 0);
         assert_eq!(num_failargs, 2);
         assert_eq!(rebuilt_frames.len(), 1);
         assert_eq!(rebuilt_frames[0].pc, 8);
@@ -4672,7 +4670,7 @@ mod tests {
 
         let fail_arg_types = vec![majit_ir::Type::Int, majit_ir::Type::Int];
         let (num_failargs, _vable_values, _vref_values, rebuilt_frames) =
-            rebuild_from_numbering(&rd_numb, memo.consts(), &fail_arg_types, None);
+            rebuild_from_numbering(&rd_numb, memo.consts(), &fail_arg_types, None, 0);
         assert_eq!(num_failargs, 2); // OpRef::int_op(1) and OpRef::int_op(3) are boxes
         assert_eq!(rebuilt_frames[0].values.len(), 3);
         assert_eq!(
@@ -4865,7 +4863,7 @@ mod tests {
             majit_ir::Type::Int,
         ];
         let (num_failargs, _vable_values, _vref_values, rebuilt_frames) =
-            rebuild_from_numbering(&rd_numb, &rd_consts, &fail_arg_types, Some(&frame_count));
+            rebuild_from_numbering(&rd_numb, &rd_consts, &fail_arg_types, Some(&frame_count), 0);
         assert_eq!(num_failargs, 3);
         assert_eq!(rebuilt_frames.len(), 2);
         assert_eq!(rebuilt_frames[0].jitcode_index, 0);
@@ -4906,7 +4904,7 @@ mod tests {
         // rd_numb should be valid
         let fail_arg_types = vec![majit_ir::Type::Int, majit_ir::Type::Int];
         let (num_failargs, _vable_values, _vref_values, rebuilt_frames) =
-            rebuild_from_numbering(&rd_numb, &rd_consts, &fail_arg_types, None);
+            rebuild_from_numbering(&rd_numb, &rd_consts, &fail_arg_types, None, 0);
         assert_eq!(num_failargs, 2);
         assert_eq!(rebuilt_frames.len(), 1);
         assert_eq!(

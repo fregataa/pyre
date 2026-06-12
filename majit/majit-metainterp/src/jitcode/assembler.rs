@@ -1063,6 +1063,51 @@ impl JitCodeBuilder {
         })
     }
 
+    /// Allocate a zero-initialised GC array.
+    ///
+    /// blackhole.py `bhimpl_new_array_clear @arguments("cpu","i","d",
+    /// returns="r")`: reads `registers_i[length_reg]` (or a const-pool
+    /// slot) as the element count and `descrs[descr_idx]` as the array
+    /// descriptor; writes the new array into `registers_r[dst]`.
+    ///
+    /// Encoding: `[BC_NEW_ARRAY_CLEAR][length_reg u8][descr_idx lo u8]
+    ///             [descr_idx hi u8][dst u8]`.
+    pub fn new_array_clear(&mut self, dst: u16, length_reg: u16, descr_idx: u16) {
+        self.touch_int_reg_or_pool_slot(length_reg);
+        self.touch_ref_reg(dst);
+        self.write_insn("new_array_clear/id>r");
+        self.push_reg_u8(length_reg, "new_array_clear length");
+        self.push_u16(descr_idx);
+        self.push_reg_u8(dst, "new_array_clear dst");
+    }
+
+    /// Store a Ref element into a GC-managed array.
+    ///
+    /// blackhole.py `bhimpl_setarrayitem_gc_r @arguments("cpu","r","i",
+    /// "r","d")`: reads `registers_r[array_reg]` as the array pointer,
+    /// `registers_i[index_reg]` (or a const-pool slot) as the element
+    /// index, `registers_r[value_reg]` (or a const-pool slot) as the new
+    /// value, and `descrs[descr_idx]` as the array descriptor.
+    ///
+    /// Encoding: `[BC_SETARRAYITEM_GC_R][array_reg u8][index_reg u8]
+    ///             [value_reg u8][descr_idx lo u8][descr_idx hi u8]`.
+    pub fn setarrayitem_gc_r(
+        &mut self,
+        array_reg: u16,
+        index_reg: u16,
+        value_reg: u16,
+        descr_idx: u16,
+    ) {
+        self.touch_ref_reg(array_reg);
+        self.touch_int_reg_or_pool_slot(index_reg);
+        self.touch_ref_reg_or_pool_slot(value_reg);
+        self.write_insn("setarrayitem_gc_r/rird");
+        self.push_reg_u8(array_reg, "setarrayitem_gc_r array");
+        self.push_reg_u8(index_reg, "setarrayitem_gc_r index");
+        self.push_reg_u8(value_reg, "setarrayitem_gc_r value");
+        self.push_u16(descr_idx);
+    }
+
     /// RPython `blackhole.py:459-521` `bhimpl_int_*` per-opname handlers:
     /// each primitive has its own insn_id in `BlackholeInterpBuilder.insns`
     /// (`blackhole.py:52-81 setup_insns`). Emits via `write_insn` with
@@ -3661,6 +3706,20 @@ impl JitCodeBuilder {
         calldescr: majit_translate::jit_codewriter::jitcode::BhCallDescr,
     ) -> u16 {
         self.add_bh_descr(CanonicalBhDescr::Call { calldescr })
+    }
+
+    /// Append an array descriptor to the descrs pool and return its
+    /// index (deduped).  RPython `assembler.py:197-207 _encode_descr`
+    /// accepts any `AbstractDescr`; pyre keeps the pool entry points
+    /// typed per variant (`add_call_descr` for calls, this for arrays)
+    /// so a mis-shaped descr is rejected at emit time instead of at
+    /// blackhole decode time.
+    pub fn add_array_descr(&mut self, descr: CanonicalBhDescr) -> u16 {
+        assert!(
+            matches!(descr, CanonicalBhDescr::Array { .. }),
+            "add_array_descr expects CanonicalBhDescr::Array, got {descr:?}"
+        );
+        self.add_bh_descr(descr)
     }
 
     fn add_bh_descr(&mut self, descr: CanonicalBhDescr) -> u16 {

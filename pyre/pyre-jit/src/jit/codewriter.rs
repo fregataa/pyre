@@ -2460,25 +2460,6 @@ fn emit_frontend_newlist(
     )
 }
 
-fn emit_frontend_newtuple(
-    graph: &mut super::flow::FunctionGraph,
-    block: &super::flow::BlockRef,
-    items: Vec<super::flow::FlowValue>,
-    offset: i64,
-) -> super::flow::Variable {
-    // flowcontext.py BUILD_TUPLE -> `op.newtuple(*items).eval(self)`.
-    // Preserve the frontend semantic op in the graph; the build_tuple
-    // helper call remains a pyre backend adaptation only.
-    emit_graph_op_with_result(
-        graph,
-        block,
-        "newtuple",
-        items.into_iter().map(Into::into).collect(),
-        Kind::Ref,
-        offset,
-    )
-}
-
 fn emit_frontend_newslice(
     graph: &mut super::flow::FunctionGraph,
     block: &super::flow::BlockRef,
@@ -2833,8 +2814,23 @@ fn new_shadow_graph_with_portal_inputs(
     frame_inputs: FrameInputs,
 ) -> super::flow::FunctionGraph {
     let start_inputargs = graph_entry_inputargs(code, frame_inputs);
+    // `portal_graph_inputvars` reserves both `frame` (`entry_arg_slots`)
+    // and `ec` (`entry_arg_slots + 1`) unconditionally, but a frame-only
+    // graph (`FrameInputs::Frame`) omits the `ec` inputarg — so
+    // `start_inputargs.len()` lands on `entry_arg_slots + 1`, exactly
+    // `ec_var.id`.  Placing `return_var` there aliases the phantom
+    // `ec_var`, which coalesces the return value onto the `portal_ec_reg`
+    // sentinel via the `(retval, return_var)` CFG edge.  Reserve both red
+    // slots whenever the graph threads a frame so `return_var` always
+    // follows `[frame, ec]`; the portal already does this
+    // (`start_inputargs.len() == entry_arg_slots + 2`).
+    let return_id = if frame_inputs.has_frame() {
+        entry_arg_slots(code) as u32 + 2
+    } else {
+        start_inputargs.len() as u32
+    };
     let return_var = Some(super::flow::Variable::new(
-        super::flow::VariableId(start_inputargs.len() as u32),
+        super::flow::VariableId(return_id),
         Kind::Ref,
     ));
     super::flow::FunctionGraph::new(
@@ -3074,7 +3070,7 @@ struct FnPtrIndices {
     store_subscr_fn: HelperHandle,
     getattr_fn: HelperHandle,
     build_list_fn: HelperHandle,
-    build_tuple_fn: HelperHandle,
+    newtuple_from_array_fn: HelperHandle,
     unpack_sequence_fn: HelperHandle,
     unpack_item_fn: HelperHandle,
     build_slice_fn: HelperHandle,
@@ -3253,12 +3249,12 @@ fn register_helper_fn_pointers(
         cpu.set_current_exception_fn as *const (),
         CallFlavor::PlainCannotRaiseNoHeap,
     );
-    // `bh_build_tuple_fn` is allocation-only, same classification as
-    // `bh_build_list_fn` (allocation can `MemoryError`, no virtual-force).
-    // Bound after the existing fn_ptrs to preserve their indices.
-    let build_tuple_fn = bind(
+    // `bh_newtuple_from_array` is allocation-only, same classification as
+    // `bh_build_list_fn` (`newtuple(list_w)` consuming the forced popvalues
+    // array, objspace.py:332): can `MemoryError`, no virtual-force.
+    let newtuple_from_array_fn = bind(
         assembler,
-        cpu.build_tuple_fn as *const (),
+        cpu.newtuple_from_array_fn as *const (),
         CallFlavor::Plain,
     );
     // `bh_unpack_sequence_fn` validates the length and allocates the item
@@ -3309,7 +3305,7 @@ fn register_helper_fn_pointers(
         store_subscr_fn,
         getattr_fn,
         build_list_fn,
-        build_tuple_fn,
+        newtuple_from_array_fn,
         unpack_sequence_fn,
         unpack_item_fn,
         build_slice_fn,
@@ -4136,10 +4132,10 @@ impl CodeWriter {
                     idx: build_list_fn_idx,
                     flavor: _build_list_fn_flavor,
                 },
-            build_tuple_fn:
+            newtuple_from_array_fn:
                 HelperHandle {
-                    idx: build_tuple_fn_idx,
-                    flavor: _build_tuple_fn_flavor,
+                    idx: newtuple_from_array_fn_idx,
+                    flavor: _newtuple_from_array_fn_flavor,
                 },
             unpack_sequence_fn:
                 HelperHandle {
@@ -4263,7 +4259,7 @@ impl CodeWriter {
                 store_subscr_fn_idx,
                 getattr_fn_idx,
                 build_list_fn_idx,
-                build_tuple_fn_idx,
+                newtuple_from_array_fn_idx,
                 // `[u16; 9]` indexed by nargs (0..=8).  `call_fn_idx` (nargs=1)
                 // is the unsuffixed binding from line 3153; the suffixed
                 // 0/2..=8 fill the surrounding slots.
@@ -7520,20 +7516,18 @@ impl CodeWriter {
                         }
 
                         // BuildTuple(count): pops count items, pushes 1 tuple. Net: -(count-1).
+                        //
+                        // pyopcode.py:995-998 BUILD_TUPLE — `items =
+                        // self.popvalues(itemcount)` (`pyframe.py:408-419`,
+                        // `@jit.unroll_safe` — the fixed-size list build
+                        // unrolls to `new_array_clear` + itemcount ×
+                        // `setarrayitem_gc_r`) followed by `w_tuple =
+                        // self.space.newtuple(items_w)` (`objspace.py:332`,
+                        // NOT unroll_safe — a single residual call consuming
+                        // the forced list).  No arity cap: argc travels as
+                        // the `new_array_clear` length constant.
                         Instruction::BuildTuple { count } => {
                             let argc = count.get(op_arg) as usize;
-                            if argc > 3 {
-                                for _ in 0..argc {
-                                    let _ = emit_popvalue_ref!(current_depth, py_pc);
-                                    let _ = pop_ref_or_fresh(&mut current_state, &mut graph);
-                                }
-                                emit_abort_permanent!();
-                                push_fresh_ref(&mut current_state, &mut graph);
-                                current_depth += 1;
-                                emit_vsd!(current_depth, py_pc);
-                                continue;
-                            }
-                            let mut arg_regs_rev: Vec<u16> = Vec::with_capacity(argc);
                             let mut item_values_rev = Vec::with_capacity(argc);
                             for _ in 0..argc {
                                 let item_reg = emit_popvalue_ref!(current_depth, py_pc);
@@ -7541,14 +7535,50 @@ impl CodeWriter {
                                 if let super::flow::FlowValue::Variable(v) = &item_value {
                                     pin!(Some(*v), item_reg);
                                 }
-                                arg_regs_rev.push(item_reg);
                                 item_values_rev.push(item_value);
                             }
-                            let _: Vec<u16> = arg_regs_rev.iter().rev().copied().collect();
-                            let result_value = emit_frontend_newtuple(
+                            // popvalues pops top-first; values_w keeps
+                            // bottom-to-top order (`values_w[n-1] = top`),
+                            // so reverse the pop order for the stores.
+                            let items: Vec<super::flow::FlowValue> =
+                                item_values_rev.into_iter().rev().collect();
+                            let array_var = emit_graph_op_with_result(
                                 &mut graph,
                                 &current_block.block(),
-                                item_values_rev.into_iter().rev().collect(),
+                                "new_array_clear",
+                                vec![
+                                    super::flow::FlowValue::Constant(
+                                        super::flow::Constant::signed(argc as i64),
+                                    )
+                                    .into(),
+                                ],
+                                Kind::Ref,
+                                py_pc as i64,
+                            );
+                            for (i, item) in items.into_iter().enumerate() {
+                                emit_graph_op_void(
+                                    &current_block.block(),
+                                    "setarrayitem_gc_r",
+                                    vec![
+                                        super::flow::FlowValue::Variable(array_var).into(),
+                                        super::flow::FlowValue::Constant(
+                                            super::flow::Constant::signed(i as i64),
+                                        )
+                                        .into(),
+                                        item.into(),
+                                    ],
+                                    py_pc as i64,
+                                );
+                            }
+                            // objspace.py:332 `w_tuple = space.newtuple(items_w)`
+                            // — a single residual call consuming the forced
+                            // array.
+                            let result_value = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                "newtuple_from_array",
+                                vec![super::flow::FlowValue::Variable(array_var).into()],
+                                Kind::Ref,
                                 py_pc as i64,
                             );
                             pin!(Some(result_value), stack_base + current_depth);
@@ -10583,7 +10613,7 @@ mod tests {
             "def f(a):\n    while a:\n        a = a - 1\n    return a\n",
         );
         let arg_slots = entry_arg_slots(&code);
-        let (frame_var, _ec_var) = portal_graph_inputvars(&code);
+        let (frame_var, ec_var) = portal_graph_inputvars(&code);
 
         // graph_entry_inputargs appends frame only (no ec).
         let inputargs = graph_entry_inputargs(&code, FrameInputs::Frame);
@@ -10596,16 +10626,21 @@ mod tests {
             other => panic!("expected frame variable, got {other:?}"),
         }
 
-        // return_var moves to `arg_slots + 1`; the `frame_var.id ==
-        // return_var.id` collision is dissolved.
+        // `return_var` moves to `arg_slots + 2`, past the unconditionally
+        // reserved `[frame, ec]` red slots, so it aliases neither
+        // `frame_var.id` (= arg_slots) nor the phantom `ec_var.id`
+        // (= arg_slots + 1) — dissolving the off-portal
+        // `ec_var.id == return_var.id` collision that coalesced the
+        // return value onto `portal_ec_reg`.
         let graph = new_shadow_graph_with_portal_inputs(&code, FrameInputs::Frame);
         let startblock = graph.startblock.borrow();
         let returnblock = graph.returnblock.borrow();
         assert_eq!(startblock.inputargs, inputargs);
         match &returnblock.inputargs[0] {
             FlowValue::Variable(variable) => {
-                assert_eq!(variable.id, VariableId((arg_slots + 1) as u32));
+                assert_eq!(variable.id, VariableId((arg_slots + 2) as u32));
                 assert_ne!(variable.id, frame_var.id);
+                assert_ne!(variable.id, ec_var.id);
             }
             other => panic!("expected variable return arg, got {other:?}"),
         }

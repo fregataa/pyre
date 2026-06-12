@@ -1174,6 +1174,38 @@ fn dispatch_op(
                 .builder
                 .vable_arraylen_with_base(dst, vable_reg, array_idx);
         }
+        // Heap GC-array primitives, canonical shapes
+        // `new_array_clear/id>r` (blackhole.py `bhimpl_new_array_clear`)
+        // and `setarrayitem_gc_r/rird` (`bhimpl_setarrayitem_gc_r`).
+        // The descr operand arrives as an already-materialised
+        // `DescrOperand::Bh(BhDescr::Array { .. })` and registers onto
+        // the builder's shared descrs pool (`assembler.py:197-207
+        // _encode_descr`).
+        "new_array_clear" => {
+            assert_eq!(
+                args.len(),
+                2,
+                "new_array_clear expects [length, arraydescr]"
+            );
+            let dst = expect_result_reg(result, Kind::Ref, "new_array_clear needs result");
+            let length = expect_int_reg_or_pool(state, &args[0]);
+            let descr_idx = expect_array_bh_descr(state, &args[1], "new_array_clear");
+            state.builder.new_array_clear(dst, length, descr_idx);
+        }
+        "setarrayitem_gc_r" => {
+            assert_eq!(
+                args.len(),
+                4,
+                "setarrayitem_gc_r expects [array, index, value, arraydescr]"
+            );
+            let array = expect_reg(&args[0], Kind::Ref);
+            let index = expect_int_reg_or_pool(state, &args[1]);
+            let value = expect_ref_reg_or_pool(state, &args[2]);
+            let descr_idx = expect_array_bh_descr(state, &args[3], "setarrayitem_gc_r");
+            state
+                .builder
+                .setarrayitem_gc_r(array, index, value, descr_idx);
+        }
         "hint_force_virtualizable" => {
             assert_eq!(args.len(), 1, "hint_force_virtualizable expects [vable]");
             let vable_reg = expect_reg(&args[0], Kind::Ref);
@@ -1812,6 +1844,23 @@ fn expect_vable_arraylen_args(args: &[Operand]) -> (u16, u16) {
     let vable_reg = expect_reg(&args[0], Kind::Ref);
     let array_idx = expect_matching_vable_array_descrs(&args[1], &args[2], "arraylen_vable");
     (vable_reg, array_idx)
+}
+
+/// Resolve a `DescrOperand::Bh(BhDescr::Array { .. })` operand onto the
+/// builder's descrs pool and return the pool index.  RPython
+/// `assembler.py:197-207 _encode_descr` — the descr operand of a heap
+/// array op is appended to `Assembler.descrs` and encoded as a 2-byte
+/// index.
+fn expect_array_bh_descr(state: &mut AssemblyState, op: &Operand, ctx: &'static str) -> u16 {
+    match op {
+        Operand::Descr(d) => match &**d {
+            DescrOperand::Bh(bh @ majit_translate::jitcode::BhDescr::Array { .. }) => {
+                state.builder.add_array_descr(bh.clone())
+            }
+            other => panic!("{ctx} expects DescrOperand::Bh(BhDescr::Array), got {other:?}"),
+        },
+        other => panic!("{ctx} expects a descr operand, got {other:?}"),
+    }
 }
 
 fn expect_int_reg_or_pool(state: &mut AssemblyState, op: &Operand) -> u16 {

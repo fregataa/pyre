@@ -1251,6 +1251,14 @@ impl PyFrame {
     /// recording a trace to keep the real frame state unchanged until the
     /// interpreter actually executes the same path.
     pub fn snapshot_for_tracing(&self) -> FrameBox {
+        // Frame-LOCAL state (locals_cells_stack_w / valuestackdepth / last_instr)
+        // is COPIED, so snapshot mutations to locals/stack are discarded — that
+        // is the abort-safety the snapshot exists for.  But `w_globals_obj`
+        // (below) is the SAME dict ptr: SHARED-heap mutations during recording
+        // (inline-frame STORE_GLOBAL via `concrete_execute_step`) leak to the
+        // real heap and are re-applied by the compiled loop's re-run.  This is
+        // the live miscompile the executor-into-walker cutover removes (memory
+        // `cf-executor-into-walker-epic-2026-06-08`).
         let mut frame = FrameBox::new(PyFrame {
             execution_context: self.execution_context,
             pycode: self.pycode,

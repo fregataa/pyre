@@ -82,34 +82,53 @@ pub fn w_tuple_new(items: Vec<PyObjectRef>) -> PyObjectRef {
 /// arity-2 specialisation. Useful for tests and call sites that need
 /// the canonical layout.
 ///
-/// Carries `gc_ptr_offsets = [offset_of(wrappeditems)]`
-/// (`eval.rs:289`). `wrappeditems` still points at a `std::alloc`'d
-/// `ItemsBlock`; the mark walker's
-/// `is_managed_heap_object` guard (collector.rs:991/1008) keeps that
-/// stepping-stone correctness-safe.
+/// `wrappeditems` points at a `std::alloc`'d `ItemsBlock`, which is
+/// outside the GC heap, so the elements are NOT reachable through inline
+/// `gc_ptr_offsets` (the collector would stop at the non-managed block
+/// pointer). The type is registered with `tuple_object_custom_trace`
+/// (`eval.rs`) which walks the block, and this constructor write-barriers
+/// the old-gen tuple so a minor collection actually runs that hook on a
+/// tuple holding young elements.
 pub fn w_tuple_new_array_backed(items: Vec<PyObjectRef>) -> PyObjectRef {
-    // First caller of the `gct_fv_gc_malloc` bracket pattern
-    // (`framework.py:853-856`):
+    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`):
     //   livevars = self.push_roots(hop)
     //   v_alloc = hop.genop("direct_call", [malloc_fast_ptr, ...])
     //   self.pop_roots(hop, livevars)
-    // Each `items[i]` is a live GC pointer that must survive the
-    // potential collection triggered inside `try_gc_alloc_stable`
-    // below; the `RootScope` guard truncates the shadow stack on
-    // function return mirroring `pop_roots`.
+    // Each `items[i]` is a live GC pointer that must survive — and be
+    // relocated by — the collection that the GC mallocs below may
+    // trigger. `pin_root` records each in the shadow stack so the
+    // moving collector both keeps it alive and rewrites its slot to the
+    // post-relocation address. The `items_block` is filled only AFTER
+    // those mallocs, from the relocated shadow-stack slots, mirroring
+    // `pop_roots` reading the (possibly-moved) values back: the local
+    // `items` Vec still holds pre-collection addresses, and the
+    // `std::alloc`'d `items_block` is invisible to the collector until
+    // `wrappeditems` is set, so filling it before the tuple malloc would
+    // leave it pointing at evacuated nursery slots.
     let _roots = crate::gc_roots::push_roots();
+    let save_point = crate::gc_roots::shadow_stack_len();
+    let len = items.len();
     for &item in &items {
         crate::gc_roots::pin_root(item);
     }
 
-    let items_block = unsafe { alloc_tuple_items_block(&items) };
+    // The only allocations that may collect: the type's lazy instantiate
+    // map and the tuple header. Both run while every item is pinned.
     let header = PyObject {
         ob_type: &TUPLE_TYPE as *const PyType,
         w_class: get_instantiate(&TUPLE_TYPE),
     };
-    if let Some(raw) = crate::gc_hook::try_gc_alloc_stable(W_TUPLE_GC_TYPE_ID, W_TUPLE_OBJECT_SIZE)
-        .filter(|p| !p.is_null())
-    {
+    let raw = crate::gc_hook::try_gc_alloc_stable(W_TUPLE_GC_TYPE_ID, W_TUPLE_OBJECT_SIZE)
+        .filter(|p| !p.is_null());
+
+    // pop_roots: read the relocated item pointers back out of the shadow
+    // stack, then build the (std::alloc'd, non-collecting) items block.
+    let relocated: Vec<PyObjectRef> = (0..len)
+        .map(|i| crate::gc_roots::shadow_stack_get(save_point + i))
+        .collect();
+    let items_block = unsafe { alloc_tuple_items_block(&relocated) };
+
+    if let Some(raw) = raw {
         unsafe {
             std::ptr::write(
                 raw as *mut W_TupleObject,
@@ -119,6 +138,15 @@ pub fn w_tuple_new_array_backed(items: Vec<PyObjectRef>) -> PyObjectRef {
                 },
             );
         }
+        // The tuple lives in old-gen (`try_gc_alloc_stable`); its items
+        // may still be in the nursery. The element pointers are stored in
+        // the off-GC `items_block`, so the implicit write barrier on the
+        // tuple struct never fires — register the tuple explicitly so the
+        // next minor collection scans it (via the `wrappeditems`
+        // custom-trace hook) and relocates any young element. Mirrors the
+        // `write_barrier_from_array` an old list/tuple store would emit
+        // (incminimark.py:1495).
+        crate::gc_hook::try_gc_write_barrier(raw);
         return raw as PyObjectRef;
     }
     Box::into_raw(Box::new(W_TupleObject {

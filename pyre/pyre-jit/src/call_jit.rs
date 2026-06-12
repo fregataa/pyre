@@ -3484,25 +3484,48 @@ pub extern "C" fn bh_build_list_fn(argc: i64, item0: i64, item1: i64, item2: i64
     pyre_interpreter::runtime_ops::build_list_from_refs(&items) as i64
 }
 
-/// BUILD_TUPLE: `space.newtuple([w_items])`. Allocation-only; the items are
+/// BUILD_TUPLE: `space.newtuple(list_w)` (`objspace.py:332` →
+/// `tupleobject.py:477` wraptuple) consuming a length-prefixed
+/// `GcTypedArray` of refs — the forced `popvalues` list
+/// (`pyframe.py:408-419`).  Length travels inside the array (offset-0
+/// prefix), so there is no arity cap.  Allocation-only; the items are
 /// pre-existing heap refs, no user code runs.
-pub extern "C" fn bh_build_tuple_fn(argc: i64, item0: i64, item1: i64, item2: i64) -> i64 {
-    let n = argc as usize;
-    let items: Vec<pyre_object::PyObjectRef> = match n {
-        0 => vec![],
-        1 => vec![item0 as pyre_object::PyObjectRef],
-        2 => vec![
-            item0 as pyre_object::PyObjectRef,
-            item1 as pyre_object::PyObjectRef,
-        ],
-        3 => vec![
-            item0 as pyre_object::PyObjectRef,
-            item1 as pyre_object::PyObjectRef,
-            item2 as pyre_object::PyObjectRef,
-        ],
-        _ => panic!("unsupported argc {} in bh_build_tuple_fn", argc),
-    };
+pub extern "C" fn bh_newtuple_from_array(array: i64) -> i64 {
+    let arr = array as *const pyre_object::object_array::GcTypedArray;
+    let len = pyre_object::object_array::gcarray_len(arr);
+    let mut items: Vec<pyre_object::PyObjectRef> = Vec::with_capacity(len);
+    for i in 0..len {
+        items.push(pyre_object::object_array::getarrayitem_ref(arr, i));
+    }
     pyre_interpreter::runtime_ops::build_tuple_from_refs(&items) as i64
+}
+
+#[cfg(test)]
+mod tests_bh_newtuple_from_array {
+    use super::bh_newtuple_from_array;
+    use pyre_object::object_array::{ArrayKind, allocate_array, setarrayitem_ref};
+
+    #[test]
+    fn builds_tuple_of_any_arity_from_ref_array() {
+        // The length travels inside the length-prefixed array, so any
+        // arity fits without fixed argument slots.
+        let arr = allocate_array(5, ArrayKind::Ref, true);
+        let items: Vec<pyre_object::PyObjectRef> = (0..5)
+            .map(|i| pyre_object::w_int_new(i as i64 * 7))
+            .collect();
+        for (i, &w) in items.iter().enumerate() {
+            setarrayitem_ref(arr, i, w);
+        }
+        let tup = bh_newtuple_from_array(arr as i64) as pyre_object::PyObjectRef;
+        unsafe {
+            assert_eq!(pyre_object::w_tuple_len(tup), 5);
+            for (i, &w) in items.iter().enumerate() {
+                let got =
+                    pyre_object::w_tuple_getitem(tup, i as i64).expect("tuple item within range");
+                assert_eq!(got, w);
+            }
+        }
+    }
 }
 
 /// BUILD_SLICE: `space.newslice(w_start, w_end, w_step)`.

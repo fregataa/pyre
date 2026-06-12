@@ -10839,6 +10839,31 @@ fn handle(
         "setarrayitem_gc_i/riid" => setarrayitem_gc_via_heapcache(code, op, ctx, 'i'),
         "setarrayitem_gc_r/rird" => setarrayitem_gc_via_heapcache(code, op, ctx, 'r'),
         "setarrayitem_gc_f/rifd" => setarrayitem_gc_via_heapcache(code, op, ctx, 'f'),
+        // RPython `pyjitpl.py:746-755 opimpl_new_array_clear` —
+        // `_opimpl_new_array(rop.NEW_ARRAY_CLEAR, lengthbox,
+        // arraydescr)` records the op and seeds the heapcache via
+        // `heapcache.new_array(resbox, lengthbox)`.  Operand layout
+        // per `bhimpl_new_array_clear @arguments("cpu","i","d",
+        // returns="r")`: 1B i-reg(length) + 2B descr + 1B r-reg(dst).
+        "new_array_clear/id>r" => {
+            let length = read_int_reg(code, op, 0, ctx)?;
+            let descr = read_descr(code, op, 1, ctx)?;
+            let resbox =
+                ctx.trace_ctx
+                    .record_op_with_descr(OpCode::NewArrayClear, &[length], descr);
+            // heapcache.py `new_array(box, lengthbox)` — `clear=true`
+            // marks every slot as known-NULL until written
+            // (`trace_opcode.rs` newtuple items-block recording uses
+            // the same seed).
+            ctx.trace_ctx
+                .heap_cache_mut()
+                .new_array(resbox, length, true);
+            let dst = code[op.pc + 4] as usize;
+            // A freshly recorded allocation has no runtime concrete —
+            // same Null posture as other recorded producers.
+            write_ref_reg(ctx, op.pc, dst, resbox, ConcreteValue::Null)?;
+            Ok((DispatchOutcome::Continue, op.next_pc))
+        }
         "int_copy/i>i" => {
             // RPython `pyjitpl.py:471-477 _opimpl_any_copy(self, box) → box`
             // + `@arguments("box")` + `>i` result coding: read src

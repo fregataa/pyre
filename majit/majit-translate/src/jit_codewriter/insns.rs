@@ -403,6 +403,13 @@ pub const BC_GETARRAYITEM_GC_F_PURE: u8 = 212;
 // matching `rclass.py:1163-1167 ll_isinstance`'s range-check arm.
 pub const BC_INT_BETWEEN: u8 = 213;
 
+// `blackhole.py:1311-1313 bhimpl_new_array_clear` —
+// `@arguments("cpu", "i", "d", returns="r")` gives canonical key
+// `new_array_clear/id>r`.  Pyre emits this from the BUILD_TUPLE
+// `popvalues` unroll (`pyre-jit/src/jit/codewriter.rs` — the
+// `pyframe.py:408-419` fixed-size items-array allocation).
+pub const BC_NEW_ARRAY_CLEAR: u8 = 214;
+
 // pyre-only `abort/>r` — Ref-result variant of `abort/` (BC_ABORT = 13)
 // emitted by `Assembler::encode_op`'s default branch when an `OpKind::
 // Abort { result_kind: Ref }` reaches the assembler.  Lives in
@@ -833,6 +840,9 @@ pub fn wellknown_bh_insns() -> VecAssoc<&'static str, u8> {
     m.insert("setarrayitem_gc_i/riid", BC_SETARRAYITEM_GC_I);
     m.insert("setarrayitem_gc_r/rird", BC_SETARRAYITEM_GC_R);
     m.insert("setarrayitem_gc_f/rifd", BC_SETARRAYITEM_GC_F);
+    // GC array allocation — `blackhole.py:1311-1313
+    // bhimpl_new_array_clear @arguments("cpu","i","d",returns="r")`.
+    m.insert("new_array_clear/id>r", BC_NEW_ARRAY_CLEAR);
     m.insert("getarrayitem_gc_i/rid>i", BC_GETARRAYITEM_GC_I);
     m.insert("getarrayitem_gc_f/rid>f", BC_GETARRAYITEM_GC_F);
     // RPython `blackhole.py:1339-1341` aliases

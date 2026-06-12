@@ -369,6 +369,7 @@ fn decode_tagged(
     num_failargs: i32,
     rd_consts: &[Const],
     fail_arg_types: &[Type],
+    num_virtuals: usize,
 ) -> RebuiltValue {
     let (val, tagbits) = untag(tagged);
     match tagbits {
@@ -410,7 +411,17 @@ fn decode_tagged(
             });
             RebuiltValue::Box(index, kind)
         }
-        TAGVIRTUAL => RebuiltValue::Virtual(val as usize),
+        TAGVIRTUAL => {
+            // resume.py:278-284 assign_number_to_virtual numbers nested
+            // virtuals negatively; resume.py:951-954 getvirtual_ptr resolves
+            // them via Python negative list indexing into rd_virtuals.
+            let index = if val < 0 {
+                (num_virtuals as i32 + val) as usize
+            } else {
+                val as usize
+            };
+            RebuiltValue::Virtual(index)
+        }
         _ => RebuiltValue::Unassigned,
     }
 }
@@ -437,6 +448,7 @@ pub fn rebuild_from_numbering(
     rd_consts: &[Const],
     fail_arg_types: &[Type],
     frame_value_count: Option<&dyn Fn(i32, i32) -> usize>,
+    num_virtuals: usize,
 ) -> (i32, Vec<RebuiltValue>, Vec<RebuiltValue>, Vec<RebuiltFrame>) {
     let mut reader = resumecode::Reader::new(rd_numb);
 
@@ -456,6 +468,7 @@ pub fn rebuild_from_numbering(
             num_failargs,
             rd_consts,
             fail_arg_types,
+            num_virtuals,
         ));
     }
 
@@ -472,6 +485,7 @@ pub fn rebuild_from_numbering(
             num_failargs,
             rd_consts,
             fail_arg_types,
+            num_virtuals,
         ));
     }
 
@@ -503,6 +517,7 @@ pub fn rebuild_from_numbering(
                 num_failargs,
                 rd_consts,
                 fail_arg_types,
+                num_virtuals,
             ));
         }
         frames.push(RebuiltFrame {

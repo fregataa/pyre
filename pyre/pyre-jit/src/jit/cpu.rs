@@ -70,8 +70,10 @@ pub struct Cpu {
     pub getattr_fn: extern "C" fn(i64, i64) -> i64,
     /// `bhimpl_build_list` — (argc, item0, item1, item2) → new list.
     pub build_list_fn: extern "C" fn(i64, i64, i64, i64) -> i64,
-    /// `bhimpl_build_tuple` — (argc, item0, item1, item2) → new tuple.
-    pub build_tuple_fn: extern "C" fn(i64, i64, i64, i64) -> i64,
+    /// `newtuple(list_w)` (`objspace.py:332`) — (ref array) → new tuple.
+    /// The array is the forced `popvalues` list; length travels inside
+    /// the array, so any arity fits.
+    pub newtuple_from_array_fn: extern "C" fn(i64) -> i64,
     /// `bhimpl_unpack_sequence` — (count, seq) → validated tuple of items.
     pub unpack_sequence_fn: extern "C" fn(i64, i64) -> i64,
     /// Read item `index` out of the validated unpack tuple — (index, seq) → item.
@@ -173,7 +175,7 @@ impl Cpu {
             store_subscr_fn: pyre_interpreter::opcode_ops::bh_store_subscr_fn,
             getattr_fn: crate::call_jit::bh_getattr_fn,
             build_list_fn: crate::call_jit::bh_build_list_fn,
-            build_tuple_fn: crate::call_jit::bh_build_tuple_fn,
+            newtuple_from_array_fn: crate::call_jit::bh_newtuple_from_array,
             unpack_sequence_fn: crate::call_jit::bh_unpack_sequence_fn,
             unpack_item_fn: crate::call_jit::bh_unpack_item_fn,
             build_slice_fn: crate::call_jit::bh_build_slice_fn,

@@ -453,25 +453,43 @@ pub unsafe fn gc_typed_array_items_base(array: *mut GcTypedArray) -> *mut u8 {
     unsafe { (array as *mut u8).add(GC_TYPED_ARRAY_ITEMS_OFFSET) }
 }
 
+/// llmodel.py:596-619 bh_get/setarrayitem_gc_* access the raw byte
+/// offset with no bounds check — a null array or out-of-range index
+/// never occurs in correct jitcode. Panic loudly instead of reading
+/// or writing out of bounds.
 #[inline]
 unsafe fn gc_typed_array_item_ptr(
     array: *mut GcTypedArray,
     index: usize,
     item_size: usize,
-) -> Option<*mut u8> {
-    if array.is_null() || index >= unsafe { (*array).len } {
-        return None;
-    }
-    Some(unsafe { gc_typed_array_items_base(array).add(index * item_size) })
+) -> *mut u8 {
+    assert!(!array.is_null(), "gc_typed_array_item_ptr: null array");
+    let len = unsafe { (*array).len };
+    assert!(
+        index < len,
+        "gc_typed_array_item_ptr: index {index} out of range (len {len})"
+    );
+    unsafe { gc_typed_array_items_base(array).add(index * item_size) }
 }
 
 /// llmodel.py:607-609 bh_setarrayitem_gc_r parity.
 pub fn setarrayitem_ref(array: *mut GcTypedArray, index: usize, value: PyObjectRef) {
     unsafe {
-        if let Some(ptr) = gc_typed_array_item_ptr(array, index, std::mem::size_of::<PyObjectRef>())
-        {
-            (ptr as *mut PyObjectRef).write_unaligned(value);
-        }
+        let ptr = gc_typed_array_item_ptr(array, index, std::mem::size_of::<PyObjectRef>());
+        (ptr as *mut PyObjectRef).write_unaligned(value);
+    }
+}
+
+/// llmodel.py:596-598 bh_getarrayitem_gc_r parity.
+/// Read a `PyObjectRef` from a ref array slot.
+pub fn getarrayitem_ref(array: *const GcTypedArray, index: usize) -> PyObjectRef {
+    unsafe {
+        let ptr = gc_typed_array_item_ptr(
+            array as *mut GcTypedArray,
+            index,
+            std::mem::size_of::<PyObjectRef>(),
+        );
+        (ptr as *const PyObjectRef).read_unaligned()
     }
 }
 
@@ -479,9 +497,8 @@ pub fn setarrayitem_ref(array: *mut GcTypedArray, index: usize, value: PyObjectR
 /// Write a raw i64 to an int array slot.
 pub fn setarrayitem_int(array: *mut GcTypedArray, index: usize, value: i64) {
     unsafe {
-        if let Some(ptr) = gc_typed_array_item_ptr(array, index, std::mem::size_of::<i64>()) {
-            (ptr as *mut i64).write_unaligned(value);
-        }
+        let ptr = gc_typed_array_item_ptr(array, index, std::mem::size_of::<i64>());
+        (ptr as *mut i64).write_unaligned(value);
     }
 }
 
@@ -489,9 +506,8 @@ pub fn setarrayitem_int(array: *mut GcTypedArray, index: usize, value: i64) {
 /// Write a raw f64 to a float array slot.
 pub fn setarrayitem_float(array: *mut GcTypedArray, index: usize, value: f64) {
     unsafe {
-        if let Some(ptr) = gc_typed_array_item_ptr(array, index, std::mem::size_of::<f64>()) {
-            (ptr as *mut f64).write_unaligned(value);
-        }
+        let ptr = gc_typed_array_item_ptr(array, index, std::mem::size_of::<f64>());
+        (ptr as *mut f64).write_unaligned(value);
     }
 }
 
@@ -558,4 +574,40 @@ pub fn gcarray_len(array: *const GcTypedArray) -> usize {
         return 0;
     }
     unsafe { (*array).len }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gc_typed_array_ref_roundtrip() {
+        let arr = allocate_array(3, ArrayKind::Ref, true);
+        assert_eq!(gcarray_len(arr), 3);
+        // Zero-filled allocation: every slot reads back null.
+        for i in 0..3 {
+            assert!(getarrayitem_ref(arr, i).is_null());
+        }
+        let a = 0x1000usize as PyObjectRef;
+        let b = 0x2008usize as PyObjectRef;
+        setarrayitem_ref(arr, 0, a);
+        setarrayitem_ref(arr, 2, b);
+        assert_eq!(getarrayitem_ref(arr, 0), a);
+        assert!(getarrayitem_ref(arr, 1).is_null());
+        assert_eq!(getarrayitem_ref(arr, 2), b);
+    }
+
+    #[test]
+    #[should_panic(expected = "out of range")]
+    fn gc_typed_array_out_of_range_read_panics() {
+        let arr = allocate_array(3, ArrayKind::Ref, true);
+        getarrayitem_ref(arr, 3);
+    }
+
+    #[test]
+    #[should_panic(expected = "out of range")]
+    fn gc_typed_array_out_of_range_write_panics() {
+        let arr = allocate_array(3, ArrayKind::Ref, true);
+        setarrayitem_ref(arr, 3, std::ptr::null_mut());
+    }
 }

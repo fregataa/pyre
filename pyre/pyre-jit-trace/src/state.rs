@@ -321,47 +321,54 @@ impl MetaInterpStaticData {
             );
             let raw_key = Self::canonical_code_key_opt(payload.w_code)
                 .expect("make_jitcodes returned a non-canonical W_CodeObject");
-            let existing_pos = self
-                .jitcodes
-                .iter()
-                .position(|jitcode| unsafe { jitcode.raw_code() as usize } == raw_key);
-            if let Some(pos) = existing_pos {
-                // warmspot.py:281-282 stable-jitcodes invariant:
-                // `make_jitcodes()` populates each CodeObject's JitCode
-                // exactly once, so existing frame pointers and jitcode
-                // payloads never move. Pyre reaches this drain boundary
-                // lazily and can re-drain the same CodeObject (a later
-                // primary compile re-queues an inlined callee's graph),
-                // producing a payload whose `-live-`/pc_map layout differs
-                // from the first drain. Replacing an already-populated
-                // entry would shift the liveness offsets out from under
-                // resume data already captured against the first payload,
-                // desyncing the rd_numb per-section cursor at blackhole
-                // resume (`resume.py:1339-1341`). Only fill a not-yet-
-                // populated slot (skeleton or portal-bridge placeholder);
-                // once drained the entry is frozen.
-                if !self.jitcodes[pos].payload.is_populated() {
+            let existing_pos = self.installed_jitcode_pos_for_raw_key(raw_key);
+            match existing_pos {
+                Some(pos) if Self::slot_accepts_payload(&self.jitcodes[pos], &payload) => {
                     let index = self.jitcodes[pos].index;
                     Self::stamp_payload_index(index, &payload);
                     self.jitcodes[pos].code = payload.w_code;
                     self.jitcodes[pos].payload = payload;
                 }
-            } else {
-                let index = self.jitcodes.len() as i32;
-                Self::stamp_payload_index(index, &payload);
-                self.jitcodes.push(Box::new(JitCode {
-                    code: payload.w_code,
-                    index,
-                    payload,
-                }));
+                _ => {
+                    let index = self.jitcodes.len() as i32;
+                    Self::stamp_payload_index(index, &payload);
+                    self.jitcodes.push(Box::new(JitCode {
+                        code: payload.w_code,
+                        index,
+                        payload,
+                    }));
+                }
             }
         }
     }
 
+    /// May `slot`'s payload be replaced by `payload` in place (keeping
+    /// the slot's jitcode index)?
+    ///
+    /// RPython's `metainterp_sd.jitcodes[i]` entries are immutable after
+    /// `warmspot.py:282`: every `rd_numb` frame records `(jitcode_index,
+    /// pc)` and the blackhole decoder re-derives the per-frame value
+    /// count from that index's pc_map + liveness tables, so a populated
+    /// entry must never change shape under an index that live resume
+    /// data already references. Pyre's runtime codewriter can re-splice
+    /// a graph (e.g. on a `merge_point_pc` refinement, or when a later
+    /// primary compile re-queues an inlined callee's graph at the drain
+    /// boundary); such a rebuild must take a FRESH index, leaving the
+    /// old entry intact for old resume data. Only not-yet-populated placeholders (skeletons and
+    /// portal-bridge installs, both `pc_map`-empty — no liveness any
+    /// rd_numb could reference) are filled in place, matching RPython's
+    /// "same JitCode object is filled later" setup-time flow.
+    fn slot_accepts_payload(slot: &JitCode, payload: &std::sync::Arc<crate::PyJitCode>) -> bool {
+        !slot.payload.is_populated() || std::sync::Arc::ptr_eq(&slot.payload, payload)
+    }
+
     fn installed_jitcode_pos_for_raw_key(&self, raw_key: usize) -> Option<usize> {
+        // A re-spliced graph appends a fresh entry (see
+        // `slot_accepts_payload`); new frames must bind the newest build,
+        // while old indices keep resolving to their original entries.
         self.jitcodes
             .iter()
-            .position(|jitcode| unsafe { jitcode.raw_code() as usize } == raw_key)
+            .rposition(|jitcode| unsafe { jitcode.raw_code() as usize } == raw_key)
     }
 
     fn portal_bridge_payload_for(
@@ -418,20 +425,27 @@ impl MetaInterpStaticData {
     ) -> *const JitCode {
         let raw_key = Self::canonical_code_key_opt(code).unwrap_or(0);
         if let Some(pos) = self.installed_jitcode_pos_for_raw_key(raw_key) {
-            if let Some(payload) = supplied {
-                // Stable-jitcodes invariant (see
-                // `set_jitcodes_from_make_result`): only fill a not-yet-
-                // populated slot (skeleton or portal-bridge placeholder).
-                // Once a CodeObject's JitCode is populated it is frozen,
-                // so resume data captured against it stays consistent
-                // with the liveness/pc_map the blackhole reader resolves
-                // at resume time.
-                if !self.jitcodes[pos].payload.is_populated() {
+            match supplied {
+                Some(payload) if Self::slot_accepts_payload(&self.jitcodes[pos], &payload) => {
                     let index = self.jitcodes[pos].index;
                     Self::stamp_payload_index(index, &payload);
                     self.jitcodes[pos].code = payload.w_code;
                     self.jitcodes[pos].payload = payload;
                 }
+                Some(payload) => {
+                    // Re-spliced build of an already-populated entry:
+                    // append under a fresh index (see `slot_accepts_payload`).
+                    let index = self.jitcodes.len() as i32;
+                    Self::stamp_payload_index(index, &payload);
+                    self.jitcodes.push(Box::new(JitCode {
+                        code: payload.w_code,
+                        index,
+                        payload,
+                    }));
+                    let pos = self.jitcodes.len() - 1;
+                    return &*self.jitcodes[pos] as *const JitCode;
+                }
+                None => {}
             }
             return &*self.jitcodes[pos] as *const JitCode;
         }
@@ -527,6 +541,7 @@ impl MetaInterpStaticData {
         let key = Self::canonical_code_key_opt(code)?;
         self.jitcodes
             .iter()
+            .rev()
             .find(|jitcode| unsafe { jitcode.raw_code() as usize } == key)
             .filter(|jitcode| !jitcode.payload.is_skeleton())
             .map(|jitcode| &**jitcode as *const JitCode)
@@ -2220,7 +2235,7 @@ pub(crate) fn pyobject_array_descr() -> DescrRef {
 /// `virtualizable_gen.rs`). `base_size = FIXED_ARRAY_ITEMS_OFFSET`
 /// skips the length prefix so `GETARRAYITEM_GC_R(array_ptr, i)` lands
 /// on items[i] directly.
-pub(crate) fn pyobject_gcarray_descr() -> DescrRef {
+pub fn pyobject_gcarray_descr() -> DescrRef {
     // type_id = PY_OBJECT_ARRAY_GC_TYPE_ID so the GC tracer walks each
     // item slot as a Ref. Without this, gen_initialize_tid stamps
     // OBJECT_GC_TYPE_ID into the GC header, the tracer treats the
@@ -5148,9 +5163,17 @@ fn decode_tagged_concrete(
             storage.rd_consts()[ci].as_raw_i64()
         }
         TAGVIRTUAL => {
+            // resume.py:278-284 nested virtuals are numbered negatively;
+            // getvirtual resolves them via Python negative list indexing
+            // into rd_virtuals (resume.py:951-954).
+            let vidx = if val < 0 {
+                (rd_virtuals.map_or(0, |v| v.len()) as i32 + val) as usize
+            } else {
+                val as usize
+            };
             if expected_kind == Type::Int {
                 materialize_concrete_virtual_int(
-                    val as usize,
+                    vidx,
                     rd_virtuals,
                     fail_values,
                     num_failargs,
@@ -5161,7 +5184,7 @@ fn decode_tagged_concrete(
                 )
             } else {
                 let gcref = materialize_concrete_virtual_ptr(
-                    val as usize,
+                    vidx,
                     rd_virtuals,
                     fail_values,
                     num_failargs,
@@ -6136,7 +6159,15 @@ fn materialize_bridge_virtual(
                 }
             }
             TAGVIRTUAL => {
-                materialize_bridge_virtual(ctx, val as usize, rd_virtuals, resume_data, cache)
+                // resume.py:278-284 nested virtuals are numbered negatively;
+                // getvirtual resolves them via Python negative list indexing
+                // into rd_virtuals (resume.py:951-954).
+                let vidx = if val < 0 {
+                    (rd_virtuals.map_or(0, |v| v.len()) as i32 + val) as usize
+                } else {
+                    val as usize
+                };
+                materialize_bridge_virtual(ctx, vidx, rd_virtuals, resume_data, cache)
             }
             _ => OpRef::NONE,
         }
@@ -7445,8 +7476,13 @@ impl JitState for PyreJitState {
         // RPython uses jitcode liveness via get_current_position_info; majit
         // routes the same lookup through `frame_value_count_at`.
         let cb = crate::state::frame_value_count_at;
-        let (num_failargs, vable_values, vref_values, frames) =
-            rebuild_from_numbering(rd_numb, rd_consts, fail_arg_types, Some(&cb));
+        let (num_failargs, vable_values, vref_values, frames) = rebuild_from_numbering(
+            rd_numb,
+            rd_consts,
+            fail_arg_types,
+            Some(&cb),
+            storage.rd_virtuals.len(),
+        );
 
         if frames.is_empty() {
             return None;

@@ -544,8 +544,14 @@ pub(crate) fn build_guard_metadata(
                 let fvc = majit_ir::resumedata::get_frame_value_count_fn();
                 let fvc_ref: Option<&dyn Fn(i32, i32) -> usize> =
                     fvc.as_ref().map(|f| f as &dyn Fn(i32, i32) -> usize);
-                let (_num_failargs, vable_values, _vref_values, frames) =
-                    rebuild_from_numbering(&rd_numb_bytes, &rd_consts_data, &exit_types, fvc_ref);
+                let num_virtuals = op.resolved_rd_virtuals().map_or(0, |v| v.len());
+                let (_num_failargs, vable_values, _vref_values, frames) = rebuild_from_numbering(
+                    &rd_numb_bytes,
+                    &rd_consts_data,
+                    &exit_types,
+                    fvc_ref,
+                    num_virtuals,
+                );
                 let vable_array = vable_values
                     .iter()
                     .map(|val| match val {
@@ -655,11 +661,13 @@ pub(crate) fn build_guard_metadata(
                     let fvc = majit_ir::resumedata::get_frame_value_count_fn();
                     let fvc_ref: Option<&dyn Fn(i32, i32) -> usize> =
                         fvc.as_ref().map(|f| f as &dyn Fn(i32, i32) -> usize);
+                    let num_virtuals = op.resolved_rd_virtuals().map_or(0, |v| v.len());
                     let (num_failargs, vable_values, vref_values, frames) = rebuild_from_numbering(
                         &rd_numb_bytes,
                         &rd_consts_data,
                         &exit_types,
                         fvc_ref,
+                        num_virtuals,
                     );
                     debug_assert!(
                         vref_values.len() & 1 == 0,
@@ -709,6 +717,7 @@ pub(crate) fn build_guard_metadata(
             // const pool (compile.py:849 get_resumestorage).
             let rd_consts_arc = op.resolved_rd_consts();
             let rd_consts_ref: &[Const] = rd_consts_arc.as_deref().unwrap_or(&[]);
+            let num_virtuals = op.resolved_rd_virtuals().map_or(0, |v| v.len()) as i32;
             let resolve_tagged_source = |tagged: i16| -> ExitValueSourceLayout {
                 let (val, tagbits) = majit_ir::resumedata::untag(tagged);
                 match tagbits {
@@ -721,7 +730,15 @@ pub(crate) fn build_guard_metadata(
                         ExitValueSourceLayout::ExitValue(idx)
                     }
                     majit_ir::resumedata::TAGVIRTUAL => {
-                        ExitValueSourceLayout::Virtual(val as usize)
+                        // resume.py:278-284 nested virtuals are numbered
+                        // negatively; resolve via negative indexing into
+                        // rd_virtuals (resume.py:951-954).
+                        let idx = if val >= 0 {
+                            val as usize
+                        } else {
+                            (num_virtuals + val) as usize
+                        };
+                        ExitValueSourceLayout::Virtual(idx)
                     }
                     majit_ir::resumedata::TAGINT => ExitValueSourceLayout::Constant(val as i64),
                     majit_ir::resumedata::TAGCONST => {

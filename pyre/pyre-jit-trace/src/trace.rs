@@ -99,6 +99,14 @@ pub fn trace_bytecode(
     // RPython MetaInterp._interpret() parity: root frame owns a concrete
     // PyFrame snapshot. MetaInterp drives both symbolic tracing AND
     // concrete execution — the interpreter does not run during tracing.
+    //
+    // KNOWN DIVERGENCE (live miscompile, memory
+    // `cf-executor-into-walker-epic-2026-06-08`): tracing runs on a SNAPSHOT
+    // (`snapshot_for_tracing`), not the real frame, and the compiled loop
+    // re-runs the traced iteration from the loop header.  RPython's `_interpret`
+    // advances the SINGLE real frame so the compiled loop resumes AFTER the
+    // traced iterations.  For inline-frame SHARED-heap STOREs this re-run
+    // double-applies (see `metainterp::concrete_execute_step`).
     concrete_frame.set_last_instr_from_next_instr(start_pc);
     let w_code = concrete_frame.pycode;
     // Issue #73 walker-as-tracer foundation probe (read-only).
