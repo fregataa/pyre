@@ -40,9 +40,8 @@ thread_local! {
     /// container's identity and the `baseoffset_or_fieldname`, so two
     /// derivations of the same interior pointer reuse one `_subarray` (and so
     /// one container identity). Upstream uses a `WeakKeyDictionary` plus
-    /// `_cleanup_cache`; the translator never frees these containers (the
-    /// parent is held strongly — see [`ParentLink::parent_container`]), so a
-    /// plain strong map is the consistent adaptation.
+    /// `_cleanup_cache`; the cache holds each `_subarray` strongly, so a plain
+    /// strong map is the consistent adaptation.
     static SUBARRAY_CACHE: RefCell<HashMap<(usize, ParentIndex), _subarray>> =
         RefCell::new(HashMap::new());
 
@@ -863,26 +862,80 @@ impl _func {
 /// for the lock; pyre's lock acquisitions are uncontended in practice
 /// (the tracer/codewriter share the per-process repr cache without
 /// concurrent mutation of any single `_struct`).
-#[derive(Clone, Debug)]
-pub struct _struct {
-    pub _identity: usize,
+#[derive(Debug)]
+pub struct StructCore {
     pub TYPE: StructType,
-    pub _fields: Arc<Mutex<Vec<(String, LowLevelValue)>>>,
-    /// Shared `_parentable` state — `_storage`/`_wrparent`/… on the
-    /// container object (lltype.py:1654-1666).
-    _parentable: Arc<Parentable>,
+    pub _fields: Mutex<Vec<(String, LowLevelValue)>>,
+    /// `_parentable` state — `_storage`/`_wrparent`/… on the container
+    /// object (lltype.py:1654-1666). Owned inline by the Core.
+    pub(crate) _parentable: Parentable,
+}
+
+#[derive(Clone, Debug)]
+pub struct _struct(pub(crate) Arc<StructCore>);
+
+impl std::ops::Deref for _struct {
+    type Target = StructCore;
+    fn deref(&self) -> &StructCore {
+        &self.0
+    }
+}
+
+impl _struct {
+    /// `_struct.__init__` (lltype.py:1654-1666): fresh container, live storage.
+    pub(crate) fn from_parts(TYPE: StructType, fields: Vec<(String, LowLevelValue)>) -> Self {
+        _struct(Arc::new(StructCore {
+            TYPE,
+            _fields: Mutex::new(fields),
+            _parentable: Parentable::new_inline(),
+        }))
+    }
+
+    /// `id(self)` / `is` container identity (lltype.py:1387-1391) — the
+    /// `Arc` allocation address. Stable for the lifetime of the `Arc`;
+    /// every value-clone shares the same `Arc`, hence the same identity.
+    pub fn identity(&self) -> usize {
+        Arc::as_ptr(&self.0) as *const () as usize
+    }
 }
 
 /// `_array.items` is wrapped in `Arc<Mutex<...>>` for the same shared-
 /// storage discipline as `_struct._fields` — see the `_struct` doc
 /// above for the parity rationale (task #157).
-#[derive(Clone, Debug)]
-pub struct _array {
-    pub _identity: usize,
+#[derive(Debug)]
+pub struct ArrayCore {
     pub TYPE: ArrayContainer,
-    pub items: Arc<Mutex<Vec<LowLevelValue>>>,
-    /// Shared `_parentable` state (lltype.py:1654-1666).
-    _parentable: Arc<Parentable>,
+    pub items: Mutex<Vec<LowLevelValue>>,
+    /// `_parentable` state (lltype.py:1654-1666). Owned inline by the Core.
+    pub(crate) _parentable: Parentable,
+}
+
+#[derive(Clone, Debug)]
+pub struct _array(pub(crate) Arc<ArrayCore>);
+
+impl std::ops::Deref for _array {
+    type Target = ArrayCore;
+    fn deref(&self) -> &ArrayCore {
+        &self.0
+    }
+}
+
+impl _array {
+    /// `_array.__init__` (lltype.py:1654-1666): fresh container, live storage.
+    pub(crate) fn from_parts(TYPE: ArrayContainer, items: Vec<LowLevelValue>) -> Self {
+        _array(Arc::new(ArrayCore {
+            TYPE,
+            items: Mutex::new(items),
+            _parentable: Parentable::new_inline(),
+        }))
+    }
+
+    /// `id(self)` / `is` container identity (lltype.py:1387-1391) — the
+    /// `Arc` allocation address. Stable for the lifetime of the `Arc`;
+    /// every value-clone shares the same `Arc`, hence the same identity.
+    pub fn identity(&self) -> usize {
+        Arc::as_ptr(&self.0) as *const () as usize
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -916,9 +969,58 @@ pub enum _ptr_obj {
     IntCast(i64),
 }
 
+/// `_parentable._wrparent = weakref.ref(parent)` (lltype.py:1693). A weak
+/// handle to a parent container — one of the three `_parentable` subclasses
+/// (`_struct`/`_array`/`_opaque`). Held weak so the child→parent link does
+/// not keep the parent alive; `_parentstructure`/`_was_freed` upgrade it and
+/// raise "already garbage collected parent" when it is gone (lltype.py:1681-1714).
 #[derive(Clone, Debug)]
-pub struct _opaque {
-    pub _identity: usize,
+pub enum WeakContainer {
+    Struct(std::sync::Weak<StructCore>),
+    Array(std::sync::Weak<ArrayCore>),
+    Opaque(std::sync::Weak<OpaqueCore>),
+}
+
+impl WeakContainer {
+    /// `weakref.ref(parent)` — downgrade a strong container handle.
+    fn downgrade(obj: &_ptr_obj) -> Option<WeakContainer> {
+        match obj {
+            _ptr_obj::Struct(s) => Some(WeakContainer::Struct(Arc::downgrade(&s.0))),
+            _ptr_obj::Array(a) => Some(WeakContainer::Array(Arc::downgrade(&a.0))),
+            _ptr_obj::Opaque(o) => Some(WeakContainer::Opaque(Arc::downgrade(&o.0))),
+            _ => None,
+        }
+    }
+
+    /// Upgrade back to the strong container, or `None` if collected.
+    fn upgrade(&self) -> Option<_ptr_obj> {
+        match self {
+            WeakContainer::Struct(w) => w.upgrade().map(|c| _ptr_obj::Struct(_struct(c))),
+            WeakContainer::Array(w) => w.upgrade().map(|c| _ptr_obj::Array(_array(c))),
+            WeakContainer::Opaque(w) => w.upgrade().map(|c| _ptr_obj::Opaque(_opaque(c))),
+        }
+    }
+}
+
+/// `_ptr._obj0` slot (lltype.py:1196 `_obj0` attribute). `_setobj`
+/// (lltype.py:1214-1224) classifies the target into one of these forms when
+/// a pointer is set:
+/// * `Null` — `pointing_to is None`.
+/// * `Strong(obj)` — solid pointer, or `_T._gckind != 'raw'`, or a
+///   `FuncType` pointer; `_obj0 = pointing_to` keeps the container alive.
+/// * `Weak(wref)` — a raw, non-solid, non-func container; `_obj0 =
+///   weakref.ref(pointing_to)` so the pointer does not keep it alive.
+/// * `Delayed` — a forward `DelayedPointer` whose target is not yet known.
+#[derive(Clone, Debug)]
+pub enum PtrObj {
+    Null,
+    Strong(_ptr_obj),
+    Weak(WeakContainer),
+    Delayed(DelayedPointer),
+}
+
+#[derive(Debug)]
+pub struct OpaqueCore {
     pub TYPE: OpaqueType,
     /// Optional human-readable name — `_opaque(TYPE, _name=name, **attrs)`
     /// kwarg upstream (used by `opaqueptr` to mint named containers such
@@ -929,9 +1031,13 @@ pub struct _opaque {
     /// the opaque itself (`lltype.py:387-389`).
     pub about: Option<LowLevelType>,
     /// Upstream `_attach_runtime_type_info_funcptr()` stores validated
-    /// helper pointers directly on the RTTI opaque (`lltype.py:405-415`).
-    pub query_funcptr: Option<Box<_ptr>>,
-    pub destructor_funcptr: Option<Box<_ptr>>,
+    /// helper pointers directly on the RTTI opaque (`lltype.py:405-415`):
+    /// `self._runtime_type_info.query_funcptr = funcptr`. The store mutates
+    /// the existing opaque in place, so these are `Mutex` cells behind the
+    /// shared `Arc<OpaqueCore>` — the funcptr attach keeps the opaque's
+    /// `Arc::as_ptr` identity, matching `id(self._runtime_type_info)`.
+    pub query_funcptr: Mutex<Option<Box<_ptr>>>,
+    pub destructor_funcptr: Mutex<Option<Box<_ptr>>>,
     /// `cast_opaque_ptr(..., 'hidden', container=..., ORIGTYPE=...,
     /// solid=...)` stores the original container and its pointer type on
     /// the opaque so a later opaque→concrete cast can rebuild the real
@@ -939,9 +1045,46 @@ pub struct _opaque {
     pub container: Option<Box<_ptr_obj>>,
     pub ORIGTYPE: Option<LowLevelType>,
     pub solid: bool,
-    /// Shared `_parentable` state (lltype.py:1654-1666); `_opaque` is a
-    /// `_parentable` (lltype.py:2142).
-    _parentable: Arc<Parentable>,
+    /// `_parentable` state (lltype.py:1654-1666); `_opaque` is a
+    /// `_parentable` (lltype.py:2142). Owned inline by the Core.
+    pub(crate) _parentable: Parentable,
+}
+
+#[derive(Clone, Debug)]
+pub struct _opaque(pub(crate) Arc<OpaqueCore>);
+
+impl std::ops::Deref for _opaque {
+    type Target = OpaqueCore;
+    fn deref(&self) -> &OpaqueCore {
+        &self.0
+    }
+}
+
+impl _opaque {
+    /// `_opaque.__init__` (lltype.py:2142-2155): fresh container, live storage.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_parts(
+        TYPE: OpaqueType,
+        _name: Option<String>,
+        about: Option<LowLevelType>,
+        query_funcptr: Option<Box<_ptr>>,
+        destructor_funcptr: Option<Box<_ptr>>,
+        container: Option<Box<_ptr_obj>>,
+        ORIGTYPE: Option<LowLevelType>,
+        solid: bool,
+    ) -> Self {
+        _opaque(Arc::new(OpaqueCore {
+            TYPE,
+            _name,
+            about,
+            query_funcptr: Mutex::new(query_funcptr),
+            destructor_funcptr: Mutex::new(destructor_funcptr),
+            container,
+            ORIGTYPE,
+            solid,
+            _parentable: Parentable::new_inline(),
+        }))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1028,14 +1171,15 @@ impl _func {
 }
 
 /// Upstream `_container` inherits Python `object`'s identity-based
-/// `__eq__` / `__hash__` (`lltype.py:1634-1649`); two `_struct`
-/// instances compare equal iff they are the same Python object
-/// (`id(self) == id(other)`). Rust `#[derive(Clone)]` on `_ptr._obj0`
-/// duplicates container bodies at different addresses, so address-based
-/// identity cannot survive a clone. We assign each container a stable
-/// `_identity: usize` at `_container_example()` time and key `PartialEq`
-/// / `Hash` / `_identityhash` off it — preserving the `is`-comparison
-/// semantics `lltype.py:1387-1391` (`_ptr._identityhash`) relies on.
+/// `__eq__` / `__hash__` (`lltype.py:1634-1649`); two containers compare
+/// equal iff they are the same Python object (`id(self) == id(other)`).
+/// The `Arc`-backed containers (`_struct` / `_array` / `_opaque`) derive
+/// `is`-identity from `Arc::as_ptr` directly (see `_struct::identity`),
+/// matching `lltype.py:1387-1391`. This counter only serves the remaining
+/// `#[derive(Clone)]` value containers (`_subarray`, `_arraylenref`,
+/// `_endmarker`, `_wref`) that are not yet behind an `Arc`: cloning such a
+/// value must keep the same identity, which a stored counter (not the
+/// address of a freely-duplicated body) provides.
 fn fresh_low_level_container_identity() -> usize {
     static NEXT_LOW_LEVEL_CONTAINER_ID: AtomicUsize = AtomicUsize::new(1);
     NEXT_LOW_LEVEL_CONTAINER_ID.fetch_add(1, Ordering::Relaxed)
@@ -1061,32 +1205,20 @@ pub struct Parentable {
     /// variant is not modeled (ll2ctypes is dead in pyre). `AtomicBool`
     /// keeps the hot `_check`/`_was_freed` read off a mutex.
     storage_live: std::sync::atomic::AtomicBool,
-    /// `_wrparent`/`_parent_type`/`_parent_index` (lltype.py:1693-1696),
-    /// installed by `_setparentstructure`. Upstream `_wrparent` is a
-    /// `weakref.ref(parent)`; the translator never collects containers, so the
-    /// parent *container object* is held strongly in [`ParentLink`] instead
-    /// (the weak/strong distinction and `_keepparent` exist only to cooperate
-    /// with Python's GC).
+    /// `_wrparent`/`_parent_type`/`_parent_index`/`_keepparent`
+    /// (lltype.py:1693-1702), installed by `_setparentstructure`.
     parent: Mutex<Option<ParentLink>>,
 }
 
-/// `_parentable._wrparent` + `_parent_type` + `_parent_index`
-/// (lltype.py:1693-1696).
+/// `_parentable._wrparent` + `_parent_type` + `_parent_index` + `_keepparent`
+/// (lltype.py:1693-1702).
 struct ParentLink {
-    /// `_wrparent()` — the parent *container object* (`_struct`/`_array`/
-    /// `_opaque`), so `_parentstructure()` (lltype.py:1704-1714) can hand the
-    /// parent back and `parentlink` / `_normalizedcontainer` / `_cast_to`
-    /// up-casts can re-point at its inlined fields.
-    ///
-    /// Upstream `_wrparent` is a `weakref.ref(parent)`; the translator never
-    /// collects containers, so the parent is held strongly (consistent with
-    /// the strong-ref adaptation documented on [`Parentable::parent`]). The
-    /// parent shares its `_fields`/`items` `Arc` with the child's owner, so
-    /// this strong link closes a reference cycle — a leak that is harmless
-    /// because lltype containers are translation-time values that are never
-    /// freed. The cycle would also make the derived `Debug` recurse forever,
-    /// so `ParentLink` carries a hand-written non-recursive `Debug` below.
-    parent_container: _ptr_obj,
+    /// `_wrparent = weakref.ref(parent)` (lltype.py:1693) — a weak handle to
+    /// the parent *container object* (`_struct`/`_array`/`_opaque`), upgraded
+    /// by `_parentstructure()` (lltype.py:1704-1714) so `parentlink` /
+    /// `_normalizedcontainer` / `_cast_to` up-casts can re-point at its
+    /// inlined fields. `None` after the parent is collected.
+    wrparent: WeakContainer,
     /// `_parent_type` (lltype.py:1695) — `typeOf(parent)`. Read by the
     /// `_cast_to` up-cast walk (the widened-to type check) and the
     /// error-message/normalizedcontainer hints.
@@ -1094,12 +1226,20 @@ struct ParentLink {
     /// `_parent_index` (lltype.py:1696) — the field name or item index that
     /// holds this sub-container inside the parent.
     parent_index: ParentIndex,
+    /// `_keepparent` (lltype.py:1697-1702) — a strong ref to the parent kept
+    /// only when this child is the parent's first inlined field of matching
+    /// `_gckind`, so the shared allocation stays alive as long as the child.
+    /// `None` otherwise.
+    keepparent: Option<_ptr_obj>,
 }
 
 impl std::fmt::Debug for ParentLink {
-    /// Non-recursive: the parent container forms an `Arc` cycle back to this
-    /// link's owner, so printing it would loop forever. Show only the
-    /// type/index slots, like upstream's `_parent_type`/`_parent_index`.
+    /// Non-recursive: `wrparent` is a `Weak` so printing it does not recurse
+    /// into the target. `keepparent` (when `Some`) is a strong `_ptr_obj` to
+    /// the parent container; that container's own `ParentLink` could chain
+    /// further up, making the depth unbounded for deep struct hierarchies.
+    /// Show only the type/index slots, like upstream's `_parent_type`/
+    /// `_parent_index`; omit `wrparent`/`keepparent`.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ParentLink")
             .field("parent_type", &self.parent_type)
@@ -1130,20 +1270,33 @@ impl Parentable {
         })
     }
 
+    /// Inline (non-Arc) ctor — the Core now owns the `Parentable` directly.
+    fn new_inline() -> Self {
+        Parentable {
+            storage_live: std::sync::atomic::AtomicBool::new(true),
+            parent: Mutex::new(None),
+        }
+    }
+
     /// `_parentable._was_freed` (lltype.py:1681-1691): freed iff this
     /// container's own storage was freed, or — walking `_wrparent` — its
-    /// parent structure is freed. Upstream raises if a `_wrparent` weakref
-    /// was garbage collected; the translator holds the parent strongly, so
-    /// the walk simply recurses.
+    /// parent structure is freed. Raises if the `_wrparent` weakref was
+    /// garbage collected.
     fn was_freed(&self) -> bool {
         if !self.storage_live.load(Ordering::Relaxed) {
             return true;
         }
         match &*self.parent.lock().unwrap() {
             None => false,
-            Some(link) => parentable_of_obj(&link.parent_container)
-                .expect("a parent container is always a `_parentable`")
-                .was_freed(),
+            Some(link) => match link.wrparent.upgrade() {
+                None => panic!(
+                    "accessing sub-container, but already garbage collected parent {:?}",
+                    link.parent_type
+                ),
+                Some(parent) => parentable_of_obj(&parent)
+                    .expect("a parent container is always a `_parentable`")
+                    .was_freed(),
+            },
         }
     }
 
@@ -1169,20 +1322,51 @@ impl Parentable {
     }
 
     /// `_parentable._setparentstructure(parent, parentindex)`
-    /// (lltype.py:1693-1696). `parent` is the parent container object;
-    /// `_parent_type = typeOf(parent)`. `_keepparent` (lltype.py:1697-1702)
-    /// is moot without Python-GC cooperation and is omitted (the parent is
-    /// always held strongly here — see [`ParentLink::parent_container`]).
+    /// (lltype.py:1693-1702). `parent` is the parent container object;
+    /// `_wrparent = weakref.ref(parent)`, `_parent_type = typeOf(parent)`.
+    /// `_keepparent` keeps a strong ref to the parent only when this child
+    /// (`child_type` = `self._TYPE`) is the parent struct's first inlined
+    /// field of matching `_gckind`.
     fn set_parent_structure(
         &self,
+        child_type: &LowLevelType,
         parent_container: _ptr_obj,
         parent_type: LowLevelType,
         parent_index: ParentIndex,
     ) {
+        let wrparent = WeakContainer::downgrade(&parent_container)
+            .expect("a parent container is always Struct/Array/Opaque");
+        // `_keepparent` (lltype.py:1697-1702): keep a strong ref only when the
+        // parent is a Struct with names, this child is its first field
+        // (`parentindex in (names[0], 0)`), and child and parent share the
+        // same `_gckind`. `FixedSizeArray(Struct)` (lltype.py:491) is a Struct
+        // subclass with synthetic field names `item0, item1, …`, so a child
+        // inlined as `item0` (`_names[0]`) of a matching-`_gckind` fixedsize
+        // array parent also qualifies.
+        let same_gckind = child_type._gckind() == parent_type._gckind();
+        let is_first_field = match &parent_type {
+            // Plain Struct: first field is `_names[0]` (non-empty).
+            LowLevelType::Struct(st) => {
+                !st._names.is_empty() && parent_first_field_match(&st._names, &parent_index)
+            }
+            // FixedSizeArray: a real parent always has at least `item0`
+            // (`length > 0`); the first item is field `item0`, i.e. the
+            // integer-`0` disjunct of upstream `(names[0], 0)`.
+            LowLevelType::FixedSizeArray(arr) => {
+                arr.length > 0 && parent_index == ParentIndex::Field("item0".to_string())
+            }
+            _ => false,
+        };
+        let keepparent = if is_first_field && same_gckind {
+            Some(parent_container.clone())
+        } else {
+            None
+        };
         *self.parent.lock().unwrap() = Some(ParentLink {
-            parent_container,
+            wrparent,
             parent_type,
             parent_index,
+            keepparent,
         });
     }
 
@@ -1192,12 +1376,50 @@ impl Parentable {
     fn parentstructure(&self, check: bool) -> Option<_ptr_obj> {
         let guard = self.parent.lock().unwrap();
         let link = guard.as_ref()?;
+        let parent = match link.wrparent.upgrade() {
+            None => panic!(
+                "accessing sub-container, but already garbage collected parent {:?}",
+                link.parent_type
+            ),
+            Some(parent) => parent,
+        };
         if check {
-            parentable_of_obj(&link.parent_container)
+            parentable_of_obj(&parent)
                 .expect("a parent container is always a `_parentable`")
                 .check();
         }
-        Some(link.parent_container.clone())
+        Some(parent)
+    }
+
+    /// `container._keepparent = container._parentstructure()` (constfold.py:
+    /// 137, `fixup_solid`). Forces a strong ref to the (upgraded) parent
+    /// regardless of the first-field/`_gckind` rule `set_parent_structure`
+    /// applies, so a pointer to an inlined part keeps the whole parent alive.
+    /// No-op when the container has no parent link (`_parentstructure()` is
+    /// `None`), matching `_keepparent = None`.
+    fn force_keepparent(&self) {
+        let parent = self.parentstructure(false);
+        if let Some(link) = self.parent.lock().unwrap().as_mut() {
+            link.keepparent = parent;
+        }
+    }
+
+    /// True when this container's recorded weak parent still upgrades to
+    /// `candidate` (the same live container `Arc`). An interior container
+    /// memoized by the parent's `Arc::as_ptr` address fails this check once
+    /// the original parent is gone — the weak ref is dead (or, on a reused
+    /// address, points at a different `Arc`) — so the caller recomputes. This
+    /// emulates the `WeakKeyDictionary` eviction plus the `RuntimeError:
+    /// pointer comparison with a freed structure` retry that upstream
+    /// `_subarray._makeptr` performs (lltype.py:2024-2027).
+    fn parent_is(&self, candidate: &_ptr_obj) -> bool {
+        match self.parent.lock().unwrap().as_ref() {
+            None => false,
+            Some(link) => match link.wrparent.upgrade() {
+                Some(parent) => parent.same_arc(candidate),
+                None => false,
+            },
+        }
     }
 
     /// `_parentable._parent_index` (lltype.py:1696) — `self`'s field name or
@@ -1226,17 +1448,31 @@ impl Parentable {
 /// `_array`/`_opaque`), or `None` for the non-parentable `_func`/`_wref`.
 /// Companion to [`parentable_of`] for the `_ptr_obj` (pointed-to container)
 /// representation that `_parentstructure` hands back.
-fn parentable_of_obj(obj: &_ptr_obj) -> Option<Arc<Parentable>> {
+/// `parentindex in (self._parent_type._names[0], 0)` (lltype.py:1699): the
+/// child is the parent struct's first field — either its first named field,
+/// or item index 0. `names` is the parent struct's `_names` (non-empty).
+fn parent_first_field_match(names: &[String], parent_index: &ParentIndex) -> bool {
+    match parent_index {
+        ParentIndex::Field(name) => name == &names[0],
+        ParentIndex::Item(i) => *i == 0,
+    }
+}
+
+fn parentable_of_obj(obj: &_ptr_obj) -> Option<&Parentable> {
     match obj {
-        _ptr_obj::Struct(s) => Some(s._parentable.clone()),
-        _ptr_obj::Array(a) => Some(a._parentable.clone()),
-        _ptr_obj::Opaque(o) => Some(o._parentable.clone()),
-        _ptr_obj::Subarray(s) => Some(s._parentable.clone()),
-        _ptr_obj::EndMarker(e) => Some(e._parentable.clone()),
-        // `_arraylenref` is a `_parentable` upstream but never sets a parent
-        // and is never itself a parent of inlined children, so it shares no
-        // `_parentable` state for the parent-chain walk. A tagged-int payload
-        // (`cast_int_to_ptr`) is a bare integer, not a container.
+        _ptr_obj::Struct(s) => Some(&s._parentable),
+        _ptr_obj::Array(a) => Some(&a._parentable),
+        _ptr_obj::Opaque(o) => Some(&o._parentable),
+        _ptr_obj::Subarray(s) => Some(&*s._parentable),
+        _ptr_obj::EndMarker(e) => Some(&*e._parentable),
+        // `_arraylenref` is a `_parentable` upstream (lltype.py:2062) but is
+        // modeled here without one: it never sets a parent link and is never
+        // itself a parent of inlined children, so the parent-chain walk would
+        // see an empty link either way. STRUCTURAL DEVIATION (not functional):
+        // converging means adding an empty `_parentable` and reconciling the
+        // explicit `_ptr_obj::ArrayLenRef` arms that currently assume it is not
+        // a parentable (`arraylenref has no container parent`). A tagged-int
+        // payload (`cast_int_to_ptr`) is a bare integer, not a container.
         _ptr_obj::Func(_) | _ptr_obj::Wref(_) | _ptr_obj::ArrayLenRef(_) | _ptr_obj::IntCast(_) => {
             None
         }
@@ -1259,6 +1495,24 @@ fn first_field_container(parent: &_ptr_obj, name: &str) -> Option<_ptr_obj> {
     }
 }
 
+/// `top_container(container)` (lltype.py:1130-1137): walk the parent chain to
+/// the outermost container that owns the shared allocation. A container with
+/// no `_parentable` or no parent link is already the top. Uses `check=false`
+/// on the walk — the decision it feeds (`_subarray`'s raw keepalive) only
+/// reads the top container's `_gckind`, so a freed-storage check here would be
+/// spurious.
+fn top_container(container: &_ptr_obj) -> _ptr_obj {
+    let mut top = container.clone();
+    loop {
+        let parent = parentable_of_obj(&top).and_then(|p| p.parentstructure(false));
+        match parent {
+            Some(p) => top = p,
+            None => break,
+        }
+    }
+    top
+}
+
 /// `parentlink(container)` (lltype.py:1123-1128): the parent container object
 /// and the index of `container` within it, or `(None, None)` when `container`
 /// has no parent (top-level allocation) or is not a `_parentable`.
@@ -1276,11 +1530,27 @@ pub(crate) fn parentlink(container: &_ptr_obj) -> (Option<_ptr_obj>, Option<Pare
 /// inlined container (`_struct`/`_array`/`_opaque`), or `None` for a
 /// primitive / pointer field. Used to wire `_setparentstructure` at
 /// materialization (`_struct`/`_array.__init__` pass `parent=self`).
-fn parentable_of(value: &LowLevelValue) -> Option<Arc<Parentable>> {
+fn parentable_of(value: &LowLevelValue) -> Option<&Parentable> {
     match value {
-        LowLevelValue::Struct(s) => Some(s._parentable.clone()),
-        LowLevelValue::Array(a) => Some(a._parentable.clone()),
-        LowLevelValue::Opaque(o) => Some(o._parentable.clone()),
+        LowLevelValue::Struct(s) => Some(&s._parentable),
+        LowLevelValue::Array(a) => Some(&a._parentable),
+        LowLevelValue::Opaque(o) => Some(&o._parentable),
+        _ => None,
+    }
+}
+
+/// `typeOf(value)` for a `LowLevelValue` that is itself an inlined container
+/// (`_struct`/`_array`/`_opaque`) — the child's `_TYPE`, passed to
+/// `_setparentstructure` so the `_keepparent` `_gckind` comparison can run.
+/// `None` for a primitive / pointer field.
+fn child_container_type(value: &LowLevelValue) -> Option<LowLevelType> {
+    match value {
+        LowLevelValue::Struct(s) => Some(LowLevelType::Struct(Box::new(s.TYPE.clone()))),
+        LowLevelValue::Array(a) => Some(match &a.TYPE {
+            ArrayContainer::Array(t) => LowLevelType::Array(Box::new(t.clone())),
+            ArrayContainer::FixedSizeArray(t) => LowLevelType::FixedSizeArray(Box::new(t.clone())),
+        }),
+        LowLevelValue::Opaque(o) => Some(LowLevelType::Opaque(Box::new(o.TYPE.clone()))),
         _ => None,
     }
 }
@@ -1324,17 +1594,15 @@ fn build_struct(type_: StructType, fields: Vec<(String, LowLevelValue)>) -> _str
     // container object, which exists (has identity) before `__init__` runs.
     // Build the `_struct` first, then link each inlined sub-container to it;
     // the clone shares `_fields`/`_parentable` so it is an identity alias.
-    let s = _struct {
-        _identity: fresh_low_level_container_identity(),
-        TYPE: type_,
-        _fields: Arc::new(Mutex::new(fields)),
-        _parentable: Parentable::new(),
-    };
+    let s = _struct::from_parts(type_, fields);
     let parent_obj = _ptr_obj::Struct(s.clone());
     let parent_type = LowLevelType::Struct(Box::new(s.TYPE.clone()));
     for (name, value) in s._fields.lock().unwrap().iter() {
         if let Some(child) = parentable_of(value) {
+            let child_type = child_container_type(value)
+                .expect("a `_parentable` field is always a container value");
             child.set_parent_structure(
+                &child_type,
                 parent_obj.clone(),
                 parent_type.clone(),
                 ParentIndex::Field(name.clone()),
@@ -1353,12 +1621,7 @@ fn build_struct(type_: StructType, fields: Vec<(String, LowLevelValue)>) -> _str
 fn build_array(type_: ArrayContainer, items: Vec<LowLevelValue>) -> _array {
     // Same construction order as `build_struct`: materialize the `_array`,
     // then link each inlined item to the (identity-aliased) parent object.
-    let a = _array {
-        _identity: fresh_low_level_container_identity(),
-        TYPE: type_,
-        items: Arc::new(Mutex::new(items)),
-        _parentable: Parentable::new(),
-    };
+    let a = _array::from_parts(type_, items);
     let parent_obj = _ptr_obj::Array(a.clone());
     let parent_type = match &a.TYPE {
         ArrayContainer::Array(arr) => LowLevelType::Array(Box::new(arr.clone())),
@@ -1367,12 +1630,19 @@ fn build_array(type_: ArrayContainer, items: Vec<LowLevelValue>) -> _array {
     let fixedsize = matches!(&a.TYPE, ArrayContainer::FixedSizeArray(_));
     for (j, item) in a.items.lock().unwrap().iter().enumerate() {
         if let Some(child) = parentable_of(item) {
+            let child_type = child_container_type(item)
+                .expect("a `_parentable` item is always a container value");
             let parent_index = if fixedsize {
                 ParentIndex::Field(format!("item{j}"))
             } else {
                 ParentIndex::Item(j as i64)
             };
-            child.set_parent_structure(parent_obj.clone(), parent_type.clone(), parent_index);
+            child.set_parent_structure(
+                &child_type,
+                parent_obj.clone(),
+                parent_type.clone(),
+                parent_index,
+            );
         }
     }
     a
@@ -1500,13 +1770,22 @@ impl _subarray {
     /// memoized per `(parent, baseoffset_or_fieldname)` through [`SUBARRAY_CACHE`]
     /// so re-deriving the same interior pointer reuses one container identity.
     fn _makeptr(parent: &_ptr_obj, key: ParentIndex, solid: bool) -> Result<_ptr, String> {
+        // `_subarray._cache` is a `WeakKeyDictionary` keyed by the parent
+        // object (lltype.py:2011). The keyed `Arc::as_ptr` address can be
+        // reused after a parent is dropped, so a cache hit is accepted only
+        // when the stored entry's weak `_wrparent` still upgrades to *this*
+        // parent (`parent_is`); a stale hit on a reused address recomputes,
+        // mirroring upstream's `except RuntimeError: _cleanup_cache(); retry`
+        // (lltype.py:2024-2027).
         let parent_id = match parent {
-            _ptr_obj::Struct(s) => s._identity,
-            _ptr_obj::Array(a) => a._identity,
+            _ptr_obj::Struct(s) => s.identity(),
+            _ptr_obj::Array(a) => a.identity(),
             _ => return Err("_subarray._makeptr: parent must be a struct or array".into()),
         };
         let cache_key = (parent_id, key.clone());
-        let cached = SUBARRAY_CACHE.with(|c| c.borrow().get(&cache_key).cloned());
+        let cached = SUBARRAY_CACHE
+            .with(|c| c.borrow().get(&cache_key).cloned())
+            .filter(|sub| sub._parentable.parent_is(parent));
         let sub = match cached {
             Some(sub) => sub,
             None => {
@@ -1529,8 +1808,21 @@ impl _subarray {
                     TYPE: arraytype,
                     _parentable: Parentable::new(),
                 };
-                sub._parentable
-                    .set_parent_structure(parent.clone(), parent._container_type(), key);
+                let child_type = LowLevelType::FixedSizeArray(Box::new(sub.TYPE.clone()));
+                sub._parentable.set_parent_structure(
+                    &child_type,
+                    parent.clone(),
+                    parent._container_type(),
+                    key,
+                );
+                // `_subarray.__init__` (lltype.py:1958-1961): also keep the
+                // parent strongly when the top container is `raw` — the
+                // subarray shares its allocation, so it must keep it alive;
+                // inside a gc object it is someone else's job. The `ll2ctypes`
+                // `_storage.contents` disjunct is dead in pyre.
+                if top_container(parent)._container_type()._gckind() == GcKind::Raw {
+                    sub._parentable.force_keepparent();
+                }
                 SUBARRAY_CACHE.with(|c| c.borrow_mut().insert(cache_key, sub.clone()));
                 sub
             }
@@ -1618,7 +1910,11 @@ impl _arraylenref {
     /// re-deriving the length pointer of one array reuses its identity.
     pub(crate) fn _makeptr(array: Box<_array>, solid: bool) -> _ptr {
         let arraytype = FixedSizeArrayType::new(LowLevelType::Signed, 1);
-        let array_id = array._identity;
+        // The cache value (`_arraylenref`) holds the parent array strongly
+        // through its `array: Box<_array>` field, so the parent `Arc` stays
+        // alive as long as this key lives — its `Arc::as_ptr` address cannot
+        // be reused while it remains a key, making the stored identity safe.
+        let array_id = array.identity();
         let cached = ARRAYLENREF_CACHE.with(|c| c.borrow().get(&array_id).cloned());
         let lenref = cached.unwrap_or_else(|| {
             let lenref = _arraylenref {
@@ -1678,6 +1974,13 @@ impl _endmarker {
         self._parentable.was_freed()
     }
 
+    /// True when this end marker's weak `_wrparent` still upgrades to `parent`
+    /// — used to reject a stale `_end_markers` cache hit on a reused
+    /// `Arc::as_ptr` address (see [`Parentable::parent_is`]).
+    pub(crate) fn parent_is(&self, parent: &_ptr_obj) -> bool {
+        self._parentable.parent_is(parent)
+    }
+
     /// `_endmarker_struct(A, parent=array, parentindex=index)`
     /// (llmemory.py:98-99) — the sentinel `_struct` linked to the parent array
     /// at the end index. `A` is the array item struct type. Memoization per
@@ -1689,7 +1992,9 @@ impl _endmarker {
             TYPE: item_type.clone(),
             _parentable: Parentable::new(),
         };
+        let child_type = LowLevelType::Struct(Box::new(endmarker.TYPE.clone()));
         endmarker._parentable.set_parent_structure(
+            &child_type,
             parent.clone(),
             parent._container_type(),
             ParentIndex::Item(index as i64),
@@ -1803,10 +2108,14 @@ pub fn direct_ptradd(ptr: &_ptr, n: i64) -> Result<_ptr, String> {
 /// ```
 ///
 /// Pins the parent of an inlined sub-pointer so the parent keeps the inlined
-/// part alive. pyre's `_setparentstructure` already holds the parent strongly
-/// through [`ParentLink`] (the strong-ref model on [`Parentable::parent`]), so
-/// the `_keepparent` keepalive is structurally satisfied — there is nothing to
-/// pin that is not already pinned. The body validates the container is a
+/// part alive. `_setparentstructure` stores the parent as a `Weak`
+/// (`ParentLink::wrparent`, lltype.py:1693) and keeps it strong only when the
+/// `_gckind` / first-field rule applies (`ParentLink::keepparent`,
+/// lltype.py:1697-1702). `fixup_solid` forces `keepparent` to the parent
+/// regardless of that rule (`Parentable::force_keepparent`), so an interior
+/// part that is *not* the parent's first field — a non-first struct field, an
+/// array item, a subarray — still keeps its (otherwise weakly-held) parent
+/// alive. The body validates the container is a
 /// `_parentable` and returns `container._as_ptr()`: a fresh solid pointer to
 /// the container (`_ptr(Ptr(typeOf(container)), container, solid=True)`,
 /// `_container._as_ptr`, lltype.py:1640). `_ptr` equality is by container
@@ -1815,9 +2124,15 @@ pub fn fixup_solid(ptr: &_ptr) -> Result<_ptr, String> {
     let container = ptr
         ._obj()
         .map_err(|_| "fixup_solid: delayed pointer".to_string())?;
-    if parentable_of_obj(&container).is_none() {
+    let Some(parentable) = parentable_of_obj(&container) else {
         return Err(format!("fixup_solid: {container:?} is not a _parentable"));
-    }
+    };
+    // `container._keepparent = container._parentstructure()` (constfold.py:137):
+    // pin the parent strongly so the inlined part keeps the whole object alive,
+    // independent of the first-field/`_gckind` rule. With the weak `_wrparent`
+    // (lltype.py:1693) this is load-bearing — an interior part returned as a
+    // constant would otherwise let its parent drop.
+    parentable.force_keepparent();
     Ok(_ptr::new_with_solid(
         Ptr::from_container_type(container._container_type())?,
         Ok(Some(container)),
@@ -1827,7 +2142,7 @@ pub fn fixup_solid(ptr: &_ptr) -> Result<_ptr, String> {
 
 impl PartialEq for _struct {
     fn eq(&self, other: &Self) -> bool {
-        self._identity == other._identity
+        Arc::ptr_eq(&self.0, &other.0)
     }
 }
 
@@ -1835,13 +2150,13 @@ impl Eq for _struct {}
 
 impl Hash for _struct {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self._identity.hash(state);
+        self.identity().hash(state);
     }
 }
 
 impl PartialEq for _array {
     fn eq(&self, other: &Self) -> bool {
-        self._identity == other._identity
+        Arc::ptr_eq(&self.0, &other.0)
     }
 }
 
@@ -1849,7 +2164,7 @@ impl Eq for _array {}
 
 impl Hash for _array {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self._identity.hash(state);
+        self.identity().hash(state);
     }
 }
 
@@ -1860,17 +2175,17 @@ impl Hash for _array {
 /// item base offset (`direct_arrayitems`); `getitem(i)` redirects into the
 /// parent at `base + i`.
 ///
-/// Upstream's `_keepparent` slot and the `_subarray._cache` weak memo
-/// (lltype.py:1964-1969, 2015-2040) are not modelled. `_keepparent` only
-/// cooperates with Python's GC (the parent is held strongly here, the same
-/// value-model adaptation as [`ParentLink::parent_container`]). The cache
+/// Upstream's `_subarray._cache` weak memo (lltype.py:2015-2040) is not
+/// modelled as a weak map. The `_subarray`'s `_setparentstructure` ports
+/// `_keepparent` (lltype.py:1697-1702) via the shared `_parentable`. The cache
 /// gives `is`-identity stability to independently re-derived interior
 /// pointers; without it two `direct_fieldptr(p, "f")` calls yield subarrays
 /// with distinct `_identity`. The sole consumer here (`AddressOffset::ref` →
 /// the address-fold table) threads a single derived pointer and never
 /// re-derives, so the stability difference is unexercised. A faithful
-/// weak-keyed cache needs containers behind an arena/`Rc` registry — the same
-/// container model the [`_wref`] strong-ref adaptation needs.
+/// weak-keyed cache would key on `Arc::as_ptr` (as `parent_id` already does)
+/// but drop the entry when the parent is reclaimed — requiring a weak-map
+/// structure not yet implemented.
 #[derive(Clone, Debug)]
 pub struct _subarray {
     pub _identity: usize,
@@ -1903,7 +2218,7 @@ impl PartialEq for _opaque {
     fn eq(&self, other: &Self) -> bool {
         match (&self.container, &other.container) {
             (Some(_), Some(_)) => self._normalizedcontainer() == other._normalizedcontainer(),
-            _ => self._identity == other._identity,
+            _ => self.identity() == other.identity(),
         }
     }
 }
@@ -1917,12 +2232,19 @@ impl Hash for _opaque {
     fn hash<H: Hasher>(&self, state: &mut H) {
         match &self.container {
             Some(c) => c._normalizedcontainer().hash(state),
-            None => self._identity.hash(state),
+            None => self.identity().hash(state),
         }
     }
 }
 
 impl _opaque {
+    /// `id(self)` / `is` container identity (lltype.py:1387-1391) — the
+    /// `Arc` allocation address. Stable for the lifetime of the `Arc`;
+    /// every value-clone shares the same `Arc`, hence the same identity.
+    pub fn identity(&self) -> usize {
+        Arc::as_ptr(&self.0) as *const () as usize
+    }
+
     /// `_parentable._free` (lltype.py:1668) — `_opaque` is a `_parentable`;
     /// delegates to the shared `_parentable` state.
     pub fn _free(&self) {
@@ -1955,26 +2277,35 @@ impl _opaque {
 ///
 /// Upstream stores `weakref.ref(normalizeptr(ptarget)._obj)` (or
 /// `lambda: None` for a dead wref) and `_dereference` returns
-/// `obj._as_ptr()` unless `obj is None or obj._was_freed()`. This port
-/// holds the referent pointer strongly instead.
+/// `obj._as_ptr()` unless `obj is None or obj._was_freed()` (llmemory.py:
+/// 865-879). `_obref` reuses the same [`PtrObj`] classification as
+/// `_ptr._obj0`: `Weak` for an `Arc<XCore>` container (`_struct`/`_array`/
+/// `_opaque`, where `std::sync::Weak` is the direct analog of
+/// `weakref.ref`), `Null` for the `lambda: None` dead wref, and `Delayed`
+/// when the target was delayed at construction (upstream raises it out of
+/// `normalizeptr(ptarget)._obj`).
 ///
-/// PRE-EXISTING-ADAPTATION (blocker: value-based container model). A true
-/// `weakref.ref` needs the referent container to be a reference-counted
-/// object a `std::rc::Weak` can observe, and `_was_freed()` needs an arena
-/// that nulls `_storage` on free (`_parentable._was_freed`, lltype.py:1681).
-/// pyre's containers (`_struct`/`_array`/`_opaque`) are value types keyed
-/// by a `_identity` counter, cloned freely, with no arena and no `_free`
-/// path — so `_was_freed()` is always false and a weak ref would resolve
-/// alive exactly as the strong ref does. The behaviour is therefore
-/// identical; only the storage mechanism differs. A faithful weakref would
-/// move containers behind an `Rc`/arena registry across the whole lltype
-/// container layer, then store `rc::Weak` here and port `_free`/`_was_freed`;
-/// that is not yet implemented, and until then the strong ref is
-/// observationally exact.
+/// `weakref.ref` upstream accepts *any* container; the not-yet-`Arc`
+/// interior containers (`_subarray`/`_arraylenref`/`_endmarker`/`_wref`)
+/// have no weak form here, so they are held `Strong` instead of rejected —
+/// the same fallback `_ptr._setobj` uses, observationally identical under
+/// pyre's never-free model (a strongly-held referent never reports
+/// `_was_freed`, so `_dereference` returns it just like a live weakref).
+///
+/// The `Weak` referent stays alive only through its other strong holders,
+/// exactly like a Python weakref. Translation-time gc containers are held
+/// strongly by the database / prebuilt-constant tables for the whole
+/// translation, so the upgrade resolves alive in practice; should a referent
+/// ever be reclaimed, `_dereference` returns null — the faithful weakref
+/// result. `_was_freed()` (the second null path) only fires once `_free`
+/// has run on the container; pyre has no arena that nulls a central storage
+/// slot, so it stays false unless an `llinterp`-style `_free` caller runs.
 #[derive(Clone, Debug)]
 pub struct _wref {
     pub _identity: usize,
-    pub _obref: Option<Box<_ptr>>,
+    // `Box` breaks the `_wref` → `PtrObj::Strong(_ptr_obj)` →
+    // `_ptr_obj::Wref(_wref)` size cycle (a wref can name a wref).
+    pub _obref: Box<PtrObj>,
 }
 
 impl PartialEq for _wref {
@@ -1992,11 +2323,49 @@ impl Hash for _wref {
 }
 
 impl _wref {
-    /// llmemory.py:865-870 `_wref.__init__(self, ptarget)`.
+    /// llmemory.py:865-870 `_wref.__init__(self, ptarget)`:
+    ///
+    /// ```python
+    /// if ptarget is None:
+    ///     self._obref = lambda: None
+    /// else:
+    ///     obj = lltype.normalizeptr(ptarget)._obj
+    ///     self._obref = weakref.ref(obj)
+    /// ```
+    ///
+    /// `obj = normalizeptr(ptarget)._obj` resolves the referent container;
+    /// `weakref.ref(obj)` keeps a weak handle. A `None` target is the
+    /// `lambda: None` dead wref (`PtrObj::Null`); a delayed target carries
+    /// its `DelayedPointer` through (upstream raises it).
     pub fn new(ptarget: Option<&_ptr>) -> Self {
+        let obref = match ptarget {
+            None => PtrObj::Null,
+            Some(p) => match p._getobj(true) {
+                // A target delayed at construction propagates its
+                // `DelayedPointer` (upstream raises it out of `._obj`).
+                Err(delayed) => PtrObj::Delayed(delayed),
+                // A null target has no `_obj`; treat as the dead wref.
+                Ok(None) => PtrObj::Null,
+                Ok(Some(obj)) => {
+                    // `obj = normalizeptr(ptarget)._obj` (llmemory.py:864):
+                    // un-hide an opaque and promote to the normalized
+                    // container before `weakref.ref(obj)`. `weakref.ref`
+                    // accepts any container; an `Arc<XCore>` referent
+                    // downgrades to a real `Weak`, while a not-yet-`Arc`
+                    // interior container (`_subarray`/`_arraylenref`/
+                    // `_endmarker`/`_wref`) has no weak form and is held
+                    // `Strong` — the same fallback `_setobj` uses, never-free
+                    // so observationally a live weakref.
+                    let container = obj._normalizedcontainer();
+                    WeakContainer::downgrade(&container)
+                        .map(PtrObj::Weak)
+                        .unwrap_or(PtrObj::Strong(container))
+                }
+            },
+        };
         _wref {
             _identity: fresh_low_level_container_identity(),
-            _obref: ptarget.map(|p| Box::new(p.clone())),
+            _obref: Box::new(obref),
         }
     }
 
@@ -2011,16 +2380,24 @@ impl _wref {
     ///         return obj._as_ptr()
     /// ```
     ///
-    /// `None` for a dead wref; otherwise the referent unless its container
-    /// reports `_was_freed()` (false unless a `_free` caller has run on the
-    /// container, e.g. from `llinterp`). A delayed referent propagates
-    /// `DelayedPointer` out of `_was_freed`, exactly as upstream lets it
-    /// escape `_dereference`.
+    /// `obj = self._obref()` upgrades the weakref; a collected referent
+    /// (`None`) and the `lambda: None` dead wref both yield null, as does a
+    /// container reporting `_was_freed()` (false unless a `_free` caller has
+    /// run, e.g. from `llinterp`). A `Strong` fallback referent (a non-`Arc`
+    /// interior container) is never collected, so it dereferences unless it
+    /// reports `_was_freed()`. A target that was delayed at construction
+    /// propagates `DelayedPointer`, exactly as upstream lets it escape.
     pub fn _dereference(&self) -> Result<Option<_ptr>, DelayedPointer> {
-        match &self._obref {
-            None => Ok(None),
-            Some(p) if p._was_freed()? => Ok(None),
-            Some(p) => Ok(Some((**p).clone())),
+        match &*self._obref {
+            PtrObj::Delayed(_) => Err(DelayedPointer),
+            PtrObj::Null => Ok(None),
+            PtrObj::Weak(wref) => match wref.upgrade() {
+                None => Ok(None),
+                Some(obj) if obj._was_freed() => Ok(None),
+                Some(obj) => Ok(Some(obj._as_ptr(true))),
+            },
+            PtrObj::Strong(obj) if obj._was_freed() => Ok(None),
+            PtrObj::Strong(obj) => Ok(Some(obj._as_ptr(true))),
         }
     }
 
@@ -2248,12 +2625,12 @@ pub struct _ptr {
     pub _identity: u64,
     pub _TYPE: Ptr,
     pub _solid: bool,
-    pub _obj0: Result<Option<_ptr_obj>, DelayedPointer>,
-    /// RPython `self._set_weak(False)` from `_ptr.__init__`
-    /// (lltype.py:1410-1413). `_become` asserts `not self._weak`
-    /// (lltype.py:1416-1418). Used by `weakref_create` family
-    /// (llmemory.py:809-824, rbuiltin.py:744-782).
-    pub _weak: bool,
+    /// `_ptr._obj0` (lltype.py:1196). `_setobj` (lltype.py:1214-1224)
+    /// classifies the target as `Null`/`Strong`/`Weak`/`Delayed`; the
+    /// weak form is `weakref.ref(pointing_to)` for raw, non-solid,
+    /// non-func containers, so `_weak` state is `matches!(_obj0,
+    /// PtrObj::Weak(_))` (lltype.py:1218-1224 `_set_weak`).
+    pub _obj0: PtrObj,
 }
 
 /// RPython `_abstract_ptr.__eq__` (`lltype.py:1185-1195`). Order:
@@ -2273,7 +2650,11 @@ impl PartialEq for _ptr {
                 self_resolved._TYPE, other_resolved._TYPE
             );
         }
-        match (&self_resolved._obj0, &other_resolved._obj0) {
+        // `self._obj == other._obj` (lltype.py:1190): `_obj` is `_getobj(
+        // check=True)`, so the freed-storage `_check()` runs as part of the
+        // comparison. A `DelayedPointer` on either side falls back to `_ptr`
+        // identity (`return self is other`, lltype.py:1196-1197).
+        match (self_resolved._getobj(true), other_resolved._getobj(true)) {
             (Ok(a), Ok(b)) => a == b,
             _ => self._identity == other._identity,
         }
@@ -2292,13 +2673,63 @@ impl _ptr {
         _obj0: Result<Option<_ptr_obj>, DelayedPointer>,
         _solid: bool,
     ) -> Self {
-        _ptr {
+        // RPython `_ptr.__init__` (lltype.py:1408-1413): `_set_weak(False)`
+        // then `_setobj(pointing_to, solid)`. A `DelayedPointer` target is
+        // stored verbatim as the delayed `_obj0` form.
+        let mut p = _ptr {
             _identity: fresh_low_level_pointer_identity(),
             _TYPE,
-            _solid,
-            _obj0,
-            _weak: false,
+            _solid: false,
+            _obj0: PtrObj::Null,
+        };
+        match _obj0 {
+            Ok(pointing_to) => p._setobj(pointing_to, _solid),
+            Err(delayed) => {
+                p._obj0 = PtrObj::Delayed(delayed);
+                p._solid = _solid;
+            }
         }
+        p
+    }
+
+    /// RPython `_ptr._setobj(self, pointing_to, solid=False)`
+    /// (lltype.py:1214-1224). A `None` target is null; a solid pointer,
+    /// a non-raw `_gckind`, or a `FuncType` pointer keeps a `Strong`
+    /// reference (`_obj0 = pointing_to`); otherwise the raw, non-solid
+    /// container is held weakly (`_obj0 = weakref.ref(pointing_to)`).
+    /// Non-container raw targets (the tagged-int `IntCast` carrier, `Func`)
+    /// have no weak form and stay `Strong`.
+    ///
+    /// PRE-EXISTING-ADAPTATION (blocker: `_subarray`/`_arraylenref` not yet
+    /// `Arc`-backed). Upstream `weakref.ref(pointing_to)` weakens any
+    /// `_parentable`, including the interior `_subarray`/`_arraylenref`
+    /// containers; those are still `#[derive(Clone)]` value types keyed by a
+    /// `_identity` counter, so `WeakContainer::downgrade` (which needs an
+    /// `Arc<XCore>`) returns `None` and the `unwrap_or` keeps them `Strong`.
+    /// This matches the pre-`Arc` behaviour (all `_obj0` were strong), so it
+    /// is no regression, but a raw non-solid pointer to such an interior
+    /// container is strong where upstream is weak. Converging needs the
+    /// interior containers moved behind `Arc`, like `_struct`/`_array`/
+    /// `_opaque`.
+    pub fn _setobj(&mut self, pointing_to: Option<_ptr_obj>, solid: bool) {
+        self._obj0 = match pointing_to {
+            None => PtrObj::Null,
+            Some(obj) => {
+                let is_func = matches!(self._TYPE.TO, PtrTarget::Func(_));
+                if solid || self._TYPE._gckind() != GcKind::Raw || is_func {
+                    PtrObj::Strong(obj)
+                } else {
+                    // Struct/Array/Opaque downgrade to a real weak ref; the
+                    // not-yet-`Arc` interior containers (`_subarray`/
+                    // `_arraylenref`) and the non-container `IntCast`/`Func`
+                    // carriers have no weak form and stay `Strong`.
+                    WeakContainer::downgrade(&obj)
+                        .map(PtrObj::Weak)
+                        .unwrap_or(PtrObj::Strong(obj))
+                }
+            }
+        };
+        self._solid = solid;
     }
 
     pub fn _hashable_identity(&self) -> u64 {
@@ -2343,7 +2774,21 @@ impl _ptr {
             "_ptr._become: type mismatch (self={:?}, other={:?})",
             self._TYPE, other._TYPE,
         );
-        assert!(!self._weak, "_ptr._become: cannot reassign a weak pointer",);
+        // `assert not self._weak` (lltype.py:1417): `_setobj` updates `_weak`
+        // in place on each `_become`, so the guard must read self's *current*
+        // weak state. Pyre records becomes in a redirect table instead of
+        // mutating `_obj0`, so the live state is the resolved target's `_obj0`;
+        // a fresh `self` resolves to itself. This rejects a second `_become`
+        // after self has been pointed at a weak target.
+        assert!(
+            !matches!(self._resolved_ptr()._obj0, PtrObj::Weak(_)),
+            "_ptr._become: cannot reassign a weak pointer",
+        );
+        // `self._setobj(other._obj, ...)`: `other._obj` is `_getobj(check=True)`
+        // (lltype.py:1418), so a dead weak referent or freed storage raises
+        // here at `_become` time, not at a later dereference. A null or delayed
+        // `other` resolves without error and stays lazy through the redirect.
+        let _ = other._getobj(true);
         let resolved = other._resolved_ptr();
         PTR_BECOME_TARGETS.with(|targets| {
             targets.borrow_mut().insert(self._identity, resolved);
@@ -2358,15 +2803,34 @@ impl _ptr {
     fn _getobj(&self, check: bool) -> Result<Option<_ptr_obj>, DelayedPointer> {
         let resolved = self._resolved_ptr();
         match resolved._obj0 {
-            Ok(Some(obj)) => {
+            PtrObj::Null => Ok(None),
+            PtrObj::Delayed(_) => Err(DelayedPointer),
+            PtrObj::Strong(obj) => {
                 if check {
                     obj._check();
                 }
                 Ok(Some(obj))
             }
-            Ok(None) => Ok(None),
-            Err(_) => Err(DelayedPointer),
+            // `obj = obj()` upgrades the weakref; a `None` upgrade is
+            // `RuntimeError("accessing already garbage collected %r")`.
+            PtrObj::Weak(w) => match w.upgrade() {
+                None => panic!("accessing already garbage collected {:?}", resolved._TYPE),
+                Some(obj) => {
+                    if check {
+                        obj._check();
+                    }
+                    Ok(Some(obj))
+                }
+            },
         }
+    }
+
+    /// The resolved `_obj0` in the old `Result<Option<_ptr_obj>,
+    /// DelayedPointer>` shape (`_getobj(check=False)`): a weak slot is
+    /// upgraded to its strong container without running the freed-storage
+    /// check. Used by readers that previously matched `_obj0` directly.
+    pub fn _obj0_value(&self) -> Result<Option<_ptr_obj>, DelayedPointer> {
+        self._getobj(false)
     }
 
     /// The `_obj` property (`_getobj(check=True)`, lltype.py:1240). Returns
@@ -2448,10 +2912,10 @@ impl _ptr {
         // upstream (lltype.py:1428): `if isinstance(self._obj, int): return
         // _ptr(PTRTYPE, self._obj, solid=True)` — a tagged-integer pointer
         // re-tags to the target type, keeping its integer payload.
-        if let Ok(Some(_ptr_obj::IntCast(n))) = &self._obj0 {
+        if let Ok(Some(_ptr_obj::IntCast(n))) = self._obj0_value() {
             return Ok(_ptr::new_with_solid(
                 ptrtype.clone(),
-                Ok(Some(_ptr_obj::IntCast(*n))),
+                Ok(Some(_ptr_obj::IntCast(n))),
                 true,
             ));
         }
@@ -2551,7 +3015,7 @@ impl _ptr {
         // Re-wrap with the target Ptr type while preserving the
         // underlying object and solid bit. Upstream `_ptr(PTRTYPE,
         // p._obj, solid=self._solid)`.
-        let obj0 = current._obj0.clone();
+        let obj0 = current._obj0_value();
         Ok(_ptr::new_with_solid(ptrtype.clone(), obj0, self._solid))
     }
 
@@ -2779,15 +3243,13 @@ impl _ptr {
                 ));
             }
             let obj = self
-                ._obj0
-                .as_mut()
+                ._obj0_value()
                 .map_err(|_| {
                     format!(
                         "delayed pointer {:?} has no field {:?}",
                         self._TYPE, field_name
                     )
                 })?
-                .as_mut()
                 .expect("non-null struct pointer must expose an underlying object");
             let _ptr_obj::Struct(obj) = obj else {
                 panic!("struct pointer must expose a struct object");
@@ -2814,15 +3276,13 @@ impl _ptr {
         val: LowLevelValue,
     ) -> Result<(), String> {
         let obj = self
-            ._obj0
-            .as_mut()
+            ._obj0_value()
             .map_err(|_| {
                 format!(
                     "delayed pointer {:?} has no nested field {:?}",
                     self._TYPE, field
                 )
             })?
-            .as_mut()
             .expect("non-null struct pointer must expose an underlying object");
         let _ptr_obj::Struct(obj) = obj else {
             return Err(format!(
@@ -3287,7 +3747,7 @@ impl StructType {
             Some(LowLevelType::Struct(Box::new(result.clone()))),
         )
         .expect("opaqueptr(RuntimeTypeInfo, ...) must succeed for gc_rtti()");
-        let Ok(Some(_ptr_obj::Opaque(rtti_opaque))) = rtti_ptr._obj0 else {
+        let Ok(Some(_ptr_obj::Opaque(rtti_opaque))) = rtti_ptr._obj0_value() else {
             panic!("opaqueptr(RuntimeTypeInfo, ...) must yield an opaque container");
         };
         result._runtime_type_info = Some(Box::new(rtti_opaque));
@@ -3693,18 +4153,16 @@ impl OpaqueType {
     }
 
     pub fn _container_example(&self) -> _opaque {
-        _opaque {
-            _identity: fresh_low_level_container_identity(),
-            TYPE: self.clone(),
-            _name: Some("?".to_string()),
-            about: None,
-            query_funcptr: None,
-            destructor_funcptr: None,
-            container: None,
-            ORIGTYPE: None,
-            solid: false,
-            _parentable: Parentable::new(),
-        }
+        _opaque::from_parts(
+            self.clone(),
+            Some("?".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
     }
 
     /// RPython `OpaqueType._note_inlined_into` (`lltype.py:592-596`).
@@ -3764,18 +4222,16 @@ pub static GCREF: LazyLock<LowLevelType> = LazyLock::new(|| {
 });
 
 fn new_opaque_container(TYPE: OpaqueType, name: &str, about: Option<LowLevelType>) -> _opaque {
-    _opaque {
-        _identity: fresh_low_level_container_identity(),
+    _opaque::from_parts(
         TYPE,
-        _name: Some(name.to_string()),
+        Some(name.to_string()),
         about,
-        query_funcptr: None,
-        destructor_funcptr: None,
-        container: None,
-        ORIGTYPE: None,
-        solid: false,
-        _parentable: Parentable::new(),
-    }
+        None,
+        None,
+        None,
+        None,
+        false,
+    )
 }
 
 /// `opaqueptr(PTRTYPE.TO, 'hidden', container=container, ORIGTYPE=...,
@@ -3788,18 +4244,16 @@ fn opaqueptr_hidden(
     origtype: Option<LowLevelType>,
     solid: bool,
 ) -> Result<_ptr, String> {
-    let obj = _opaque {
-        _identity: fresh_low_level_container_identity(),
-        TYPE: TYPE.clone(),
-        _name: Some("hidden".to_string()),
-        about: None,
-        query_funcptr: None,
-        destructor_funcptr: None,
-        container: Some(Box::new(container)),
-        ORIGTYPE: origtype,
+    let obj = _opaque::from_parts(
+        TYPE.clone(),
+        Some("hidden".to_string()),
+        None,
+        None,
+        None,
+        Some(Box::new(container)),
+        origtype,
         solid,
-        _parentable: Parentable::new(),
-    };
+    );
     let ptr_t = Ptr::from_container_type(LowLevelType::Opaque(Box::new(TYPE)))?;
     // `opaqueptr` always returns `_ptr(Ptr(TYPE), o, solid=True)`
     // (lltype.py:2360) — the pointer to a hidden opaque is itself always
@@ -4429,6 +4883,53 @@ impl _ptr_obj {
         }
     }
 
+    /// `self is other` for two `Arc`-backed containers — same allocation,
+    /// compared by `Arc::as_ptr` identity. Only the `_struct`/`_array`/
+    /// `_opaque` parents an interior container memoizes against reach here;
+    /// other variants are never cache parents and compare unequal.
+    fn same_arc(&self, other: &_ptr_obj) -> bool {
+        match (self, other) {
+            (_ptr_obj::Struct(a), _ptr_obj::Struct(b)) => a.identity() == b.identity(),
+            (_ptr_obj::Array(a), _ptr_obj::Array(b)) => a.identity() == b.identity(),
+            (_ptr_obj::Opaque(a), _ptr_obj::Opaque(b)) => a.identity() == b.identity(),
+            _ => false,
+        }
+    }
+
+    /// `_container._as_ptr(self)` (lltype.py:1640-1641) — `_ptr(Ptr(typeOf
+    /// (self)), self, solid)`. The upstream base method works for *every*
+    /// `_container`, so this dispatches across all container variants: a
+    /// `_wref` strong-fallback referent dereferences through here
+    /// (`_wref._dereference`), and a weakref-to-weakref lands on the `Wref`
+    /// arm. The `PtrTarget` per variant matches each container's own
+    /// `_makeptr`/`_as_ptr`. Only the tagged-int `IntCast` carrier is not a
+    /// container.
+    fn _as_ptr(&self, solid: bool) -> _ptr {
+        let target = match self {
+            _ptr_obj::Struct(s) => PtrTarget::Struct(s.TYPE.clone()),
+            _ptr_obj::Array(a) => match &a.TYPE {
+                ArrayContainer::Array(t) => PtrTarget::Array(t.clone()),
+                ArrayContainer::FixedSizeArray(t) => PtrTarget::FixedSizeArray(t.clone()),
+            },
+            _ptr_obj::Opaque(o) => PtrTarget::Opaque(o.TYPE.clone()),
+            _ptr_obj::Func(f) => PtrTarget::Func(f.TYPE.clone()),
+            // `_subarray._makeptr`: `Ptr(FixedSizeArray(ITEMTYPE, 1))`.
+            _ptr_obj::Subarray(s) => PtrTarget::FixedSizeArray(s.TYPE.clone()),
+            // `_arraylenref._makeptr`: `Ptr(FixedSizeArray(Signed, 1))`.
+            _ptr_obj::ArrayLenRef(_) => {
+                PtrTarget::FixedSizeArray(FixedSizeArrayType::new(LowLevelType::Signed, 1))
+            }
+            // `_endmarker_struct._as_ptr`: `Ptr(A)` (the item struct type).
+            _ptr_obj::EndMarker(e) => PtrTarget::Struct(e.TYPE.clone()),
+            // `_wref._as_ptr`: `Ptr(WeakRef)`.
+            _ptr_obj::Wref(_) => PtrTarget::Opaque(OpaqueType::gc("WeakRef")),
+            _ptr_obj::IntCast(_) => {
+                panic!("tagged-int pointer has no container to take _as_ptr of")
+            }
+        };
+        _ptr::new_with_solid(Ptr { TO: target }, Ok(Some(self.clone())), solid)
+    }
+
     /// The container's `_was_freed()`. `_struct`/`_array`/`_opaque` are
     /// `_parentable` and consult their shared `_parentable` state;
     /// `_func`/`_wref` are plain `_container`s whose `_was_freed` is always
@@ -4543,6 +5044,7 @@ pub fn cast_opaque_ptr(PTRTYPE: &Ptr, ptr: &_ptr) -> Result<_ptr, String> {
         };
         let container = opaque
             .container
+            .clone()
             .ok_or_else(|| format!("{ptr:?} does not come from a container"))?;
         // upstream (lltype.py:998): `if isinstance(container, int): return
         // _ptr(PTRTYPE, container, solid=True)` — a hidden opaque holding a
@@ -4588,6 +5090,7 @@ pub fn cast_opaque_ptr(PTRTYPE: &Ptr, ptr: &_ptr) -> Result<_ptr, String> {
         };
         let container = opaque
             .container
+            .clone()
             .ok_or_else(|| format!("{ptr:?} does not come from a container"))?;
         opaqueptr_hidden(opaque_t.clone(), *container, None, opaque.solid)
     } else {
@@ -4693,12 +5196,17 @@ pub fn attachRuntimeTypeInfo_with_ptrs(
             "destructor",
         )?;
     }
-    let rtti_opaque = struct_t._runtime_type_info.as_mut().expect("checked above");
+    // `self._runtime_type_info.query_funcptr = funcptr` (lltype.py:405,415):
+    // mutate the existing RTTI opaque in place through its `Mutex` cells, so
+    // its `Arc::as_ptr` identity is unchanged across the attach. A `None`
+    // argument leaves the existing value, matching the `if ... is not None`
+    // guards upstream.
+    let rtti_opaque = struct_t._runtime_type_info.as_ref().expect("checked above");
     if let Some(funcptr) = funcptr {
-        rtti_opaque.query_funcptr = Some(Box::new(funcptr));
+        *rtti_opaque.query_funcptr.lock().unwrap() = Some(Box::new(funcptr));
     }
     if let Some(destrptr) = destrptr {
-        rtti_opaque.destructor_funcptr = Some(Box::new(destrptr));
+        *rtti_opaque.destructor_funcptr.lock().unwrap() = Some(Box::new(destrptr));
     }
     let ptr_t = Ptr::from_container_type(RUNTIME_TYPE_INFO.clone())?;
     Ok(_ptr::new(
@@ -5115,7 +5623,7 @@ mod tests {
     fn nullptr_of_runtime_type_info_is_null_ptr_to_opaque_target() {
         let p = nullptr(RUNTIME_TYPE_INFO.clone()).unwrap();
         assert!(matches!(p._TYPE.TO, PtrTarget::Opaque(_)));
-        assert!(matches!(&p._obj0, Ok(None)));
+        assert!(matches!(&p._obj0, PtrObj::Null));
     }
 
     #[test]
@@ -5193,7 +5701,7 @@ mod tests {
         );
         let T = LowLevelType::Struct(Box::new(s));
         let p = malloc(T, None, MallocFlavor::Gc, true).unwrap();
-        let Ok(Some(_ptr_obj::Struct(inner))) = &p._obj0 else {
+        let Ok(Some(_ptr_obj::Struct(inner))) = p._obj0_value() else {
             panic!("malloc(Struct, immortal=true) must produce Struct container");
         };
         assert_eq!(inner.TYPE._name, "vtable");
@@ -5204,7 +5712,7 @@ mod tests {
     fn malloc_immortal_gc_opaque_allocates_opaque_container() {
         let T = RUNTIME_TYPE_INFO.clone();
         let p = malloc(T, None, MallocFlavor::Gc, true).unwrap();
-        assert!(matches!(&p._obj0, Ok(Some(_ptr_obj::Opaque(_)))));
+        assert!(matches!(p._obj0_value(), Ok(Some(_ptr_obj::Opaque(_)))));
         assert!(p._solid);
     }
 
@@ -5236,7 +5744,7 @@ mod tests {
             true,
         )
         .unwrap();
-        let Some(_ptr_obj::Struct(s)) = p._obj0.as_ref().unwrap().as_ref() else {
+        let Ok(Some(_ptr_obj::Struct(s))) = p._obj0_value() else {
             panic!("malloc should return a live Struct pointer");
         };
         let items_value = s
@@ -5273,7 +5781,7 @@ mod tests {
     #[test]
     fn opaqueptr_mints_named_opaque_container_and_wraps_in_ptr() {
         let p = opaqueptr(RUNTIME_TYPE_INFO.clone(), "ExceptionFoo").unwrap();
-        let Ok(Some(_ptr_obj::Opaque(inner))) = &p._obj0 else {
+        let Ok(Some(_ptr_obj::Opaque(inner))) = p._obj0_value() else {
             panic!("opaqueptr must produce an Opaque container");
         };
         assert_eq!(inner._name.as_deref(), Some("ExceptionFoo"));
@@ -5331,7 +5839,7 @@ mod tests {
         let T = LowLevelType::Struct(Box::new(s));
         let p = getRuntimeTypeInfo(&T).unwrap();
         assert!(matches!(p._TYPE.TO, PtrTarget::Opaque(_)));
-        let Ok(Some(_ptr_obj::Opaque(inner))) = &p._obj0 else {
+        let Ok(Some(_ptr_obj::Opaque(inner))) = p._obj0_value() else {
             panic!("getRuntimeTypeInfo must produce an Opaque container");
         };
         assert_eq!(inner._name.as_deref(), Some("ExceptionBar"));
@@ -5373,11 +5881,11 @@ mod tests {
         let from_attach = attachRuntimeTypeInfo(&T).unwrap();
         let from_get = getRuntimeTypeInfo(&T).unwrap();
         let (Ok(Some(_ptr_obj::Opaque(a))), Ok(Some(_ptr_obj::Opaque(b)))) =
-            (&from_attach._obj0, &from_get._obj0)
+            (from_attach._obj0_value(), from_get._obj0_value())
         else {
             panic!("both helpers must produce Opaque containers");
         };
-        assert_eq!(a._identity, b._identity);
+        assert_eq!(a.identity(), b.identity());
         assert_eq!(a._name, b._name);
     }
 
@@ -5430,21 +5938,25 @@ mod tests {
             .expect("rtti opaque must still be present");
         assert_eq!(
             rtti.query_funcptr
+                .lock()
+                .unwrap()
                 .as_ref()
                 .map(|ptr| ptr._hashable_identity()),
             Some(query._hashable_identity())
         );
         assert_eq!(
             rtti.destructor_funcptr
+                .lock()
+                .unwrap()
                 .as_ref()
                 .map(|ptr| ptr._hashable_identity()),
             Some(destr._hashable_identity())
         );
-        let Ok(Some(_ptr_obj::Opaque(attached_rtti))) = &attached._obj0 else {
+        let Ok(Some(_ptr_obj::Opaque(attached_rtti))) = attached._obj0_value() else {
             panic!("attachRuntimeTypeInfo_with_ptrs must return the RTTI opaque pointer");
         };
-        assert!(attached_rtti.query_funcptr.is_some());
-        assert!(attached_rtti.destructor_funcptr.is_some());
+        assert!(attached_rtti.query_funcptr.lock().unwrap().is_some());
+        assert!(attached_rtti.destructor_funcptr.lock().unwrap().is_some());
     }
 
     #[test]
@@ -5794,7 +6306,6 @@ mod tests {
             _TYPE: ptr1._TYPE.clone(),
             _solid: ptr1._solid,
             _obj0: ptr1._obj0.clone(),
-            _weak: ptr1._weak,
         };
         let ptr3 = Ptr {
             TO: PtrTarget::Struct(StructType::gc(
@@ -6113,7 +6624,10 @@ mod tests {
             )),
         }
         ._example();
-        self_ptr._weak = true;
+        // Force `self_ptr` into the weak `_obj0` form. `_keep` retains a
+        // strong handle so the downgrade has a live referent.
+        let _keep = self_ptr._obj0_value().unwrap().unwrap();
+        self_ptr._obj0 = PtrObj::Weak(WeakContainer::downgrade(&_keep).unwrap());
         let other_ptr = Ptr {
             TO: PtrTarget::Struct(StructType::gc(
                 "S",
@@ -7121,11 +7635,12 @@ mod tests {
     fn fixup_solid_returns_solid_pointer_to_same_container() {
         // `fixup_solid(p)` (constfold.py:131-145) pins the parent of an inlined
         // sub-pointer and returns `container._as_ptr()` — a solid pointer.
-        // pyre's strong `ParentLink` already satisfies the `_keepparent`
-        // keepalive, so it validates the container is a `_parentable` and
-        // rebuilds the pointer. `_ptr` equality is by container identity, so
-        // the result still equals the input. Both a plain array container and a
-        // `direct_arrayitems` `_subarray` interior pointer are `_parentable`.
+        // `_setparentstructure` already applies the `_keepparent` rule
+        // (lltype.py:1697-1702) on construction, so the keepalive is already
+        // in place; `fixup_solid`'s observable effect here is the solid flag.
+        // `_ptr` equality is by container identity, so the result still equals
+        // the input. Both a plain array container and a `direct_arrayitems`
+        // `_subarray` interior pointer are `_parentable`.
         let array_ty = LowLevelType::Array(Box::new(ArrayType::gc(LowLevelType::Signed)));
         let arrayptr = malloc(array_ty, Some(3), MallocFlavor::Gc, true).unwrap();
         let fixed = fixup_solid(&arrayptr).unwrap();
@@ -7447,7 +7962,7 @@ mod tests {
             o
         };
         // Distinct opaque objects, same underlying allocation.
-        assert_ne!(o1._identity, o2._identity);
+        assert_ne!(o1.identity(), o2.identity());
         assert_eq!(o1, o2);
         assert_eq!(opaque_hash(&o1), opaque_hash(&o2));
 

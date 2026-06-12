@@ -245,7 +245,7 @@ impl LowLevelDatabase {
 }
 
 fn ptr_name(ptr: &_ptr) -> Option<String> {
-    match &ptr._obj0 {
+    match ptr._obj0_value() {
         Ok(Some(_ptr_obj::Func(func))) => Some(func._name.clone()),
         _ => None,
     }

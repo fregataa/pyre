@@ -10,7 +10,7 @@ use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::llmemory;
 use crate::translator::rtyper::lltypesystem::lltype::{
     _ptr, FrozenDict, GcKind, LowLevelType, LowLevelValue, MallocFlavor, OpaqueType, Ptr,
-    PtrTarget, StructType, WEAKREF_PTR, malloc, nullptr,
+    PtrTarget, StructType, WEAKREF_PTR, cast_opaque_ptr, malloc, nullptr,
 };
 use crate::translator::rtyper::pairtype::ReprClassId;
 use crate::translator::rtyper::rmodel::{
@@ -331,12 +331,13 @@ impl EmulatedWeakRefRepr {
     fn do_weakref_create(&self, llinstance: &_ptr) -> Result<Constant, TyperError> {
         let pointee = ptr_pointee_type(&self.lltype)?;
         let mut p = malloc(pointee, None, MallocFlavor::Gc, true).map_err(TyperError::message)?;
-        // `cast_opaque_ptr(GCREF, llinstance)` re-types the target pointer
-        // to GCREF, aliasing the same underlying container.
+        // `p.ref = cast_opaque_ptr(GCREF, llinstance)` (rweakref.py:77): wrap
+        // the instance in a hidden GCREF opaque so `weakref_deref` can reveal
+        // the original container, rather than just re-typing the pointer.
         let LowLevelType::Ptr(gcref_ptr) = gcref_type() else {
             unreachable!("gcref_type() is a Ptr");
         };
-        let gcref = _ptr::new(*gcref_ptr, llinstance._obj0.clone());
+        let gcref = cast_opaque_ptr(&gcref_ptr, llinstance).map_err(TyperError::message)?;
         p.setattr("ref", LowLevelValue::Ptr(Box::new(gcref)))
             .map_err(TyperError::message)?;
         Ok(Constant::with_concretetype(
@@ -546,8 +547,11 @@ mod tests {
     }
 
     fn gc_instance(name: &str) -> _ptr {
-        use crate::translator::rtyper::lltypesystem::lltype::opaqueptr;
-        opaqueptr(LowLevelType::Opaque(Box::new(OpaqueType::gc(name))), "inst").unwrap()
+        // An instance is a concrete `Ptr(GcStruct)` (an `InstanceRepr`'s
+        // lowleveltype), so `cast_opaque_ptr(GCREF, llinstance)` takes the
+        // concrete→opaque path and wraps it in a hidden GCREF opaque.
+        let struct_t = LowLevelType::Struct(Box::new(StructType::gc(name, vec![])));
+        malloc(struct_t, None, MallocFlavor::Gc, true).unwrap()
     }
 
     #[test]

@@ -134,10 +134,8 @@ pub fn llstr(s: &[u8]) -> Result<_ptr, String> {
         .ok_or_else(|| "STR forward reference unresolved".to_string())?;
     let p = malloc(str_struct, Some(s.len()), MallocFlavor::Gc, true)?;
     let obj = p
-        ._obj0
-        .as_ref()
+        ._obj0_value()
         .map_err(|_| "llstr: malloc returned a delayed pointer".to_string())?
-        .as_ref()
         .ok_or_else(|| "llstr: malloc returned a null pointer".to_string())?;
     let _ptr_obj::Struct(st) = obj else {
         return Err("llstr: malloc(STR) must produce a struct container".to_string());
@@ -314,7 +312,7 @@ pub fn alloc_array_unicode(value: &str) -> Result<_ptr, String> {
     let codepoint_count = value.chars().count();
     let mut ptr = malloc(unicode_body, Some(codepoint_count), MallocFlavor::Gc, true)?;
     ptr.setattr("hash", LowLevelValue::Signed(0))?;
-    let Some(obj) = ptr._obj0.as_mut().map_err(|_| {
+    let Some(obj) = ptr._obj0_value().map_err(|_| {
         "alloc_array_unicode: delayed UNICODE pointer cannot be initialised".to_string()
     })?
     else {
@@ -1014,7 +1012,7 @@ fn hex_chars_constant() -> Result<Hlvalue, TyperError> {
     let array_lltype = LowLevelType::Array(Box::new(ArrayType::new(LowLevelType::Char)));
     let ptr = malloc(array_lltype, Some(16), MallocFlavor::Gc, true)
         .map_err(|e| TyperError::message(format!("hex_chars malloc: {e}")))?;
-    let Ok(Some(_ptr_obj::Array(arr))) = &ptr._obj0 else {
+    let Ok(Some(_ptr_obj::Array(arr))) = ptr._obj0_value() else {
         return Err(TyperError::message(
             "hex_chars malloc did not produce an Array container".to_string(),
         ));
@@ -8627,7 +8625,7 @@ mod tests {
         };
         assert_eq!(h, ll_strhash_value(b"Foo"));
         assert_ne!(h, 0);
-        let Some(obj) = p._obj0.as_ref().unwrap().as_ref() else {
+        let Some(obj) = p._obj0_value().unwrap() else {
             panic!("STR pointer must be live");
         };
         let _ptr_obj::Struct(s) = obj else {
@@ -8651,7 +8649,7 @@ mod tests {
         let bytes: &[u8] = &[b'a', 0x00, 0xFF, b'z'];
         let p = llstr(bytes).expect("llstr");
         assert!(p.nonzero());
-        let Some(obj) = p._obj0.as_ref().unwrap().as_ref() else {
+        let Some(obj) = p._obj0_value().unwrap() else {
             panic!("llstr pointer must be live");
         };
         let _ptr_obj::Struct(s) = obj else {
@@ -8709,7 +8707,7 @@ mod tests {
     fn null_str_ptr_is_typed_null_strptr() {
         let p = null_str_ptr();
         assert!(!p.nonzero(), "null_str_ptr must be null");
-        assert!(matches!(&p._obj0, Ok(None)));
+        assert!(matches!(p._obj0_value(), Ok(None)));
         let LowLevelType::Ptr(expected) = STRPTR.clone() else {
             panic!("STRPTR must be Ptr");
         };
@@ -8769,7 +8767,7 @@ mod tests {
         let LowLevelValue::Signed(0) = p.getattr("hash").unwrap() else {
             panic!("hash field must be Signed(0)");
         };
-        let Some(obj) = p._obj0.as_ref().unwrap().as_ref() else {
+        let Some(obj) = p._obj0_value().unwrap() else {
             panic!("UNICODE pointer must be live");
         };
         let _ptr_obj::Struct(s) = obj else {
@@ -11637,7 +11635,7 @@ mod tests {
         let Some(ConstValue::LLPtr(ptr)) = hex_chars else {
             panic!("digit lookup must read from an LLPtr hex_chars table");
         };
-        let Ok(Some(_ptr_obj::Array(arr))) = &ptr._obj0 else {
+        let Ok(Some(_ptr_obj::Array(arr))) = ptr._obj0_value() else {
             panic!("hex_chars LLPtr must target an Array container");
         };
         let items = arr.items.lock().unwrap();

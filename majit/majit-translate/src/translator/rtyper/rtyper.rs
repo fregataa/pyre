@@ -3415,14 +3415,14 @@ pub(crate) fn make_ll_isinstance(
     // before assignment would observe the default `Signed(0)` for both
     // markers and collide every uninitialised class onto a single
     // helper.  Pin the underlying container's stable identity (the
-    // `_struct._identity` set at allocation, preserved across `_ptr`
+    // `_struct.identity()` allocation pointer, preserved across `_ptr`
     // clones) into the name so distinct classes never share a helper
     // even if their range markers do.  Upstream keys this cache by
     // `cls._obj` identity (`rclass.py:1149`); the container identity
     // is the analog.
-    let class_identity: u64 = match &cls_ptr._obj0 {
+    let class_identity: u64 = match cls_ptr._obj0_value() {
         Ok(Some(crate::translator::rtyper::lltypesystem::lltype::_ptr_obj::Struct(s))) => {
-            s._identity as u64
+            s.identity() as u64
         }
         _ => cls_ptr._hashable_identity(),
     };

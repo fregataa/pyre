@@ -2473,7 +2473,7 @@ impl InstanceRepr {
                     && p._gckind() == crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc
                     && matches!(
                         &converted.value,
-                        ConstValue::LLPtr(llp) if matches!(llp._obj0, Ok(None))
+                        ConstValue::LLPtr(llp) if matches!(llp._obj0_value(), Ok(None))
                     )
                 {
                     continue;

@@ -388,8 +388,16 @@ fn item_offset_ref(ty: &LowLevelType, repeat: i64, firstitemptr: &_ptr) -> Resul
                 "ItemOffset::ref end marker on non-struct item {ty:?}"
             ));
         };
-        let array_id = arr._identity;
-        let cached = END_MARKERS.with(|c| c.borrow().get(&array_id).cloned());
+        // `_end_markers` is a `WeakKeyDictionary` keyed by the parent array
+        // (llmemory.py:167). The keyed `Arc::as_ptr` address can be reused
+        // after the array is dropped, so a cache hit is accepted only when the
+        // stored end marker's weak `_wrparent` still upgrades to *this* array
+        // (`parent_is`); a stale hit on a reused address recomputes, emulating
+        // the auto-evicting dictionary.
+        let array_id = arr.identity();
+        let cached = END_MARKERS
+            .with(|c| c.borrow().get(&array_id).cloned())
+            .filter(|e| e.parent_is(&parent));
         let endmarker = cached.unwrap_or_else(|| {
             let e = _endmarker::new(item_struct, &parent, index as usize);
             END_MARKERS.with(|c| c.borrow_mut().insert(array_id, e.clone()));

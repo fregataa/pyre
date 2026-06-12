@@ -2179,7 +2179,7 @@ mod tests {
         let Some(ConstValue::LLAddress(_address::Fake(p))) = cast(&[i(0x41)]) else {
             panic!("an odd integer must build a tagged-int fakeaddress");
         };
-        assert!(matches!(p._obj0, Ok(Some(_ptr_obj::IntCast(0x41)))));
+        assert!(matches!(p._obj0_value(), Ok(Some(_ptr_obj::IntCast(0x41)))));
         // An even non-zero integer raises `ValueError` upstream (its
         // `ll2ctypes` resolution is runtime-only) → declines.
         assert_eq!(cast(&[i(0x40)]), None);
@@ -2209,7 +2209,7 @@ mod tests {
         let Some(ConstValue::LLPtr(p)) = op_cast_adr_to_ptr(&restype, &[nulladr]) else {
             panic!("a NULL address must cast to a null ptr");
         };
-        assert!(p._obj0.as_ref().is_ok_and(|o| o.is_none()));
+        assert!(p._obj0_value().is_ok_and(|o| o.is_none()));
 
         // A tagged-int fakeaddress (`cast_int_to_adr` of an odd integer)
         // re-casts its `_NONGCREF` opaque pointer through the real cast
