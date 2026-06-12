@@ -7,8 +7,10 @@
 //!
 //! | majit         | rpython/tool/algo/         |
 //! |---------------|----------------------------|
+//! | `graphlib`    | `graphlib.py`              |
 //! | `sparsemat`   | `sparsemat.py`             |
 //! | `unionfind`   | `unionfind.py`             |
 
+pub mod graphlib;
 pub mod sparsemat;
 pub mod unionfind;
