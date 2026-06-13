@@ -271,6 +271,15 @@ pub struct TraceCtx {
     /// the cross-component flow at dispatch time) can sample the
     /// metainterp's depth counter without holding a back-reference.
     pub portal_call_depth_fn: Option<Box<dyn Fn() -> i32>>,
+    /// pyjitpl.py:1527 `MetaInterp.seen_loop_header_for_jdindex` parity for
+    /// walkers that drive dispatch through `TraceCtx` (the pyre full-body
+    /// walker has no dispatcher struct of its own, so the per-trace flag
+    /// lives here; majit's own `pyjitpl::dispatch` keeps an equivalent
+    /// field on the dispatcher).  Stamped by a `loop_header` op
+    /// (pyjitpl.py:1527-1528, the lowered `can_enter_jit` at a backward
+    /// jump), consumed and reset by the following `jit_merge_point`
+    /// (pyjitpl.py:1559-1562).  `-1` = not seen.
+    pub seen_loop_header_for_jdindex: i32,
     /// pyjitpl.py: `metainterp.staticdata.callinfocollection`. Needed by
     /// `ResumeDataBoxReader.concat_strings` / `slice_string` / `concat_unicodes`
     /// / `slice_unicode` (resume.py:1143-1188) which look up the
@@ -1091,6 +1100,7 @@ impl TraceCtx {
             has_compiled_targets_fn: None,
             is_bridge_trace: false,
             portal_call_depth_fn: None,
+            seen_loop_header_for_jdindex: -1,
             callinfocollection: None,
             call_pure_results: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             trace_limit: DEFAULT_TRACE_LIMIT,
@@ -1156,6 +1166,7 @@ impl TraceCtx {
             has_compiled_targets_fn: None,
             is_bridge_trace: false,
             portal_call_depth_fn: None,
+            seen_loop_header_for_jdindex: -1,
             callinfocollection: None,
             call_pure_results: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             trace_limit: DEFAULT_TRACE_LIMIT,
@@ -1234,6 +1245,22 @@ impl TraceCtx {
                 opref.raw(),
             );
         }
+    }
+
+    /// Like [`Self::set_opref_concrete`] but returns `false` instead of
+    /// panicking when no frontend op/inputarg is recorded at `opref`'s
+    /// position.  The full-body walker's speculative residual-call
+    /// execution (`try_execute_residual_call_via_walker`) can compute a
+    /// concrete for an OpRef recorded in a context whose op was not
+    /// allocated in the active recorder (a deeper inlined / recursive
+    /// frame's result).  Leaving that result symbolic makes the downstream
+    /// branch abort the trace into the trait fallback rather than crash
+    /// the tracer.
+    pub fn try_set_opref_concrete(&mut self, opref: OpRef, concrete: Value) -> bool {
+        if opref.is_constant() {
+            return true;
+        }
+        self.recorder.set_concrete_at(opref.raw(), concrete)
     }
 
     /// `BoxRef::get_value` reader — the concrete value stamped onto
@@ -1454,6 +1481,21 @@ impl TraceCtx {
         self.recorder.num_ops()
     }
 
+    /// Number of guard operations recorded so far.  The walker compares
+    /// this across a `vable_getfield_*` / `vable_setfield` call to detect
+    /// the `_nonstandard_virtualizable` PTR_EQ promote guard those helpers
+    /// emit internally, so it can attach a resume snapshot to it.
+    pub fn num_guards(&self) -> usize {
+        self.recorder.num_guards()
+    }
+
+    /// Opcode of the most recently recorded guard, if any
+    /// (`pyjitpl.py:2599-2603` — snapshot capture keys
+    /// `after_residual_call` on the guard opcode).
+    pub fn last_guard_opcode(&self) -> Option<OpCode> {
+        self.recorder.last_guard_opcode()
+    }
+
     /// The structured green key values, if provided.
     pub fn green_key_values(&self) -> Option<&GreenKey> {
         self.green_key_values.as_ref()
@@ -1576,7 +1618,14 @@ impl TraceCtx {
         let Some(values) = self.virtualizable_values.as_mut() else {
             return;
         };
-        for i in 0..static_count.min(values.len()) {
+        // `virtualizable_values`'s last slot stores the standard-vable identity
+        // (`virtualizable_boxes[-1]` in RPython terms, see comment at
+        // `virtualizable_box_at`).  `synchronize_virtualizable` already stops
+        // at `static_count + sum(lengths)`; mirror that here so a
+        // short/misaligned shadow (only the identity slot present, or fewer
+        // data slots than expected) can never overwrite the identity.
+        let shadow_data_len = values.len().saturating_sub(1);
+        for i in 0..static_count.min(shadow_data_len) {
             let ty = info.static_fields[i].field_type;
             let bits = unsafe { info.read_field(heap_ptr, i) };
             values[i] = crate::pyjitpl::heap_value_for_pub(ty, bits);
@@ -1588,7 +1637,7 @@ impl TraceCtx {
             }
             let ty = info.array_fields[a_idx].item_type;
             for item_idx in 0..length {
-                if cursor >= values.len() {
+                if cursor >= shadow_data_len {
                     break;
                 }
                 let bits = unsafe { info.read_array_item(heap_ptr, a_idx, item_idx) };
@@ -1863,6 +1912,18 @@ impl TraceCtx {
     /// for vref.  Empty vectors when neither a virtualizable nor any
     /// virtualref is live (matches RPython's `_list_of_boxes_virtualizable`
     /// / `_list_of_boxes` returning a 0-length array).
+    /// Walker precondition for [`Self::build_snapshot_vable_vref_boxes`]:
+    /// every virtualizable box (including the identity at `[-1]`) must carry
+    /// `OpRef::ty()` — the invariant [`crate::pyjitpl::build_vable_snapshot_boxes`]
+    /// enforces by panicking.  A deeper inlined / recursive frame can leave
+    /// the identity box untyped, so the full-body walker calls this before
+    /// recording a guard snapshot and aborts the trace into the trait
+    /// fallback instead of tripping the panic.
+    pub fn vable_snapshot_buildable(&self) -> bool {
+        let vable_slice: &[OpRef] = self.virtualizable_boxes.as_deref().unwrap_or(&[]);
+        vable_slice.iter().all(|op| op.ty().is_some())
+    }
+
     pub fn build_snapshot_vable_vref_boxes(
         &self,
     ) -> (
@@ -1992,6 +2053,17 @@ impl TraceCtx {
     /// Cached array lengths for the active standard virtualizable.
     pub fn virtualizable_array_lengths(&self) -> Option<&[usize]> {
         self.virtualizable_array_lengths.as_deref()
+    }
+
+    /// Live virtualizable heap pointer (`MetaInterp::vable_ptr` mirror).
+    /// `vinfo.unwrap_virtualizable_box(virtualizable_box)` analogue for
+    /// callers that need the concrete object behind
+    /// `standard_virtualizable_box()` — e.g. the
+    /// `tracing_before_residual_call` / `tracing_after_residual_call`
+    /// token protocol around a concrete-executed residual call
+    /// (pyjitpl.py:3329-3330, 3349-3353).
+    pub fn virtualizable_heap_ptr(&self) -> Option<*const u8> {
+        self.virtualizable_heap_ptr
     }
 
     /// pyjitpl.py:2394 `forced_virtualizable` accessor.

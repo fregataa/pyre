@@ -219,9 +219,11 @@ pub fn install_portal_for(
         PyJitCodeMetadata {
             pc_map: Vec::new(),
             after_residual_call_resume_pc: Vec::new(),
+            first_jit_pc_by_py_pc: Vec::new(),
             depth_at_py_pc,
             portal_frame_reg,
             portal_ec_reg,
+            built_as_portal: true,
             stack_base,
             stack_slot_color_map,
             pyre_color_for_semantic_local,
@@ -410,9 +412,11 @@ def f(x, y):
             PyJitCodeMetadata {
                 pc_map: vec![0],
                 after_residual_call_resume_pc: vec![None],
+                first_jit_pc_by_py_pc: vec![0],
                 depth_at_py_pc: Vec::new(),
                 portal_frame_reg: 0,
                 portal_ec_reg: 0,
+                built_as_portal: true,
                 stack_base: 0,
                 stack_slot_color_map: Vec::new(),
                 pyre_color_for_semantic_local: Vec::new(),

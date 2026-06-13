@@ -198,6 +198,53 @@ fn make_simple_compile_views<'a>(
     }
 }
 
+/// Reject an unsound cross-loop-CUT self loop, giving up to the blackhole.
+///
+/// A cross-loop CUT synthesizes a self-loop LABEL whose inputargs are the
+/// inner merge-point boxes; valuestack temporaries that are NULL at the inner
+/// header are promoted into LABEL inputargs via the escaped-ref BFS. If the
+/// optimized body class-guards such a slot (`GuardClass`, `GuardNonnullClass`
+/// and `GuardNonnull` all assume a non-null object) while the closing `Jump`
+/// feeds back a `Const` NULL ref for that same slot, the LABEL/JUMP contract is
+/// self-inconsistent: the loop dereferences NULL on its own back edge.
+///
+/// `virtualstate.py:595-606 _generate_guards_knownclass` rejects a `KnownClass`
+/// slot fed an unknown/NULL box with `VirtualStatesCantMatch`, so a unrolled
+/// close never installs this. The no-unroll retry path
+/// (`pyjitpl.py:3044-3054`) synthesizes a LABEL with no virtual state, so the
+/// inconsistency must be detected directly and given up to the blackhole rather
+/// than installing an unsound loop.
+///
+/// Returns the offending slot index, or `None` when the contract is consistent.
+fn cross_loop_cut_label_jump_null_guard_slot(ops: &[Op]) -> Option<usize> {
+    let label = ops.first().filter(|op| op.opcode == OpCode::Label)?;
+    let jump = ops.last().filter(|op| op.opcode == OpCode::Jump)?;
+    let label_slots: Vec<OpRef> = (0..label.num_args())
+        .map(|i| label.arg(i).to_opref())
+        .collect();
+    for op in ops {
+        if !matches!(
+            op.opcode,
+            OpCode::GuardClass | OpCode::GuardNonnullClass | OpCode::GuardNonnull
+        ) {
+            continue;
+        }
+        let guarded = op.arg(0).to_opref();
+        let Some(slot) = label_slots.iter().position(|s| *s == guarded) else {
+            continue;
+        };
+        if slot >= jump.num_args() {
+            continue;
+        }
+        if let Some(Value::Ref(r)) = jump.arg(slot).const_value() {
+            if r.is_null() {
+                return Some(slot);
+            }
+        }
+    }
+    None
+}
+
 pub(crate) struct CompiledTrace {
     /// Inputargs for this trace, used to recover typed exit layouts during blackhole replay.
     pub(crate) inputargs: Vec<InputArg>,
@@ -4821,11 +4868,26 @@ impl<M: Clone> MetaInterp<M> {
             Err(payload) => {
                 // Phase 2 panicked — unroll_opt dropped. Phase 1 results
                 // survive in phase1_out (written before Phase 2 started).
-                if let Some(inv) = payload.downcast_ref::<crate::optimize::InvalidLoop>() {
+                //
+                // unroll.py:119-123 `except SpeculativeError: raise
+                // InvalidLoop`: a SpeculativeError escaping the optimize
+                // pass (constant_fold of an ill-typed speculative heap
+                // access) is equivalent to an InvalidLoop — abandon the
+                // optimized trace and fall back, rather than re-raising and
+                // crashing the interpreter.
+                let invalid_reason = payload
+                    .downcast_ref::<crate::optimize::InvalidLoop>()
+                    .map(|inv| inv.0)
+                    .or_else(|| {
+                        payload
+                            .downcast_ref::<crate::optimize::SpeculativeError>()
+                            .map(|err| err.0)
+                    });
+                if let Some(reason) = invalid_reason {
                     if crate::majit_log_enabled() {
                         eprintln!(
                             "[jit] abort trace at key={} (InvalidLoop: {})",
-                            green_key, inv.0,
+                            green_key, reason,
                         );
                     }
                     self.cancel_count += 1;
@@ -5028,6 +5090,35 @@ impl<M: Clone> MetaInterp<M> {
         // `vable_*` operations keep the hot path on boxes instead of
         // re-materializing `GetfieldRaw*`/`GetarrayitemRaw*` entry ops.
         let (mut inputargs, optimized_ops) = (inputargs, optimized_ops);
+
+        // Reject an unsound cross-loop-CUT self loop: it can class-guard a
+        // LABEL slot that the closing JUMP feeds back a `Const` NULL — an
+        // unsound contract the no-unroll retry path (pyjitpl.py:3044-3054)
+        // builds because it carries no virtual state to reject it. The loop
+        // would deref NULL on its back edge, so give up to the blackhole (the
+        // same `CompileOutcome::Aborted` the retry-failure path takes) rather
+        // than install it. Gated on the cross-loop-CUT marker so the FBW-off
+        // production path is byte-identical. Read before
+        // `normalize_closing_jump_args`, though that pass preserves `Const` args
+        // (`compile.rs:1682`) so the slot would survive it either way.
+        if cut_inner_green_key.is_some() {
+            if let Some(slot) = cross_loop_cut_label_jump_null_guard_slot(&optimized_ops) {
+                if crate::majit_log_enabled() {
+                    eprintln!(
+                        "[jit] abort compile: cross-loop-cut LABEL slot {} is \
+                         class-guarded but the closing JUMP feeds Const(NULL) at key={}",
+                        slot, green_key
+                    );
+                }
+                crate::debug::log_one(
+                    "jit-summary",
+                    &format!("giveup cross-loop-cut null-guard slot {slot} key={green_key}"),
+                );
+                self.warm_state.abort_tracing(green_key, false);
+                self.exported_state = None;
+                return CompileOutcome::Aborted;
+            }
+        }
         let mut compiled_ops =
             compile::normalize_closing_jump_args(optimized_ops, &constants, final_num_inputs);
 
@@ -6559,17 +6650,27 @@ impl<M: Clone> MetaInterp<M> {
         let mut inputargs: Vec<InputArg> = trace.inputargs_cloned();
         // Reconcile inputarg types with optimizer's post-unbox types.
         // Pyre starts tracing with Ref values (all Python objects), but
-        // the optimizer may unbox Int-typed locals. Read the first guard's
-        // fail_arg_types to discover the optimizer's type decisions, then
-        // update inputargs to match. This ensures gcmap and adapt-live
-        // agree on which slots are GC refs vs raw ints.
-        if let Some(first_guard_types) = optimized_ops
-            .iter()
-            .find(|op| op.opcode.is_guard())
-            .and_then(|op| op.with_fail_descr(|fd| fd.fail_arg_types().to_vec()))
-        {
-            for (i, ia) in inputargs.iter_mut().enumerate() {
-                if let Some(&tp) = first_guard_types.get(i) {
+        // the optimizer may unbox Int-typed locals. Guard fail_args carry
+        // the post-unbox box views; key the reconciliation on each box's
+        // own input-arg index. fail_args list snapshot live boxes, not
+        // inputargs, so slot i of fail_args generally names a different
+        // value than inputargs[i] — a positional zip corrupts the type of
+        // any inputarg whose fail_args slot happens to hold another box
+        // (and the backend then never binds the bank the snapshot
+        // references). This ensures gcmap and adapt-live agree on which
+        // slots are GC refs vs raw ints.
+        for op in optimized_ops.iter().filter(|op| op.opcode.is_guard()) {
+            let Some(fail_args) = op.getfailargs() else {
+                continue;
+            };
+            for fa in fail_args.iter() {
+                let (idx, tp) = match fa.to_opref() {
+                    OpRef::InputArgInt(i) => (i, Type::Int),
+                    OpRef::InputArgFloat(i) => (i, Type::Float),
+                    OpRef::InputArgRef(i) => (i, Type::Ref),
+                    _ => continue,
+                };
+                if let Some(ia) = inputargs.get_mut(idx as usize) {
                     ia.tp = tp;
                 }
             }
@@ -9554,6 +9655,46 @@ impl<M: Clone> MetaInterp<M> {
         if crate::majit_log_enabled() {
             eprintln!("--- bridge trace (after opt) ---");
             eprint!("{}", majit_ir::format_trace(&optimized_ops, &constants));
+        }
+
+        // compile.py:27-29 giveup() parity: a bridge whose terminal JUMP
+        // targets an already-compiled loop must supply exactly as many args
+        // as that loop's LABEL — the backend regalloc asserts
+        // `arglocs.len() == target_arglocs.len()`. The full-body walk can
+        // close a bridge against an outer-loop LABEL that an unroll short
+        // preamble grew beyond the virtualizable layout the bridge close
+        // reconstructs (its loop-invariant `extra` inputargs), so the counts
+        // disagree. Give up on this bridge gracefully (blackhole resume still
+        // produces the correct result) instead of letting the backend panic.
+        // target_arglocs is empty for a not-yet-compiled target (fresh
+        // retrace token); skip the check there, matching the backend's own
+        // `target_arglocs.is_empty()` no-assert branch.
+        if let Some(jump) = optimized_ops
+            .last()
+            .filter(|op| op.opcode == majit_ir::OpCode::Jump)
+        {
+            let target_len = jump.getdescr().and_then(|d| {
+                d.as_loop_target_descr()
+                    .map(|ltd| ltd.target_arglocs().len())
+            });
+            if let Some(target_len) = target_len {
+                let jump_len = jump.getarglist().len();
+                if target_len != 0 && jump_len != target_len {
+                    if crate::majit_log_enabled() {
+                        eprintln!(
+                            "[jit] compile_bridge giveup: JUMP args {jump_len} != \
+                             target LABEL args {target_len} (key={green_key} guard={fail_index})"
+                        );
+                    }
+                    crate::debug::log_one(
+                        "jit-summary",
+                        &format!(
+                            "bridge giveup: JUMP args {jump_len} != target LABEL args {target_len}"
+                        ),
+                    );
+                    return false;
+                }
+            }
         }
 
         self.backend

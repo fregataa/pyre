@@ -2245,6 +2245,34 @@ impl Optimizer {
             let inputarg_base = ctx.inputarg_base;
             let nia = &exported_state.next_iteration_args;
             let n = nia.len();
+            // `next_iteration_args` must not be longer than the trace's
+            // inputargs: every loop-back value needs a backing inputarg
+            // slot to forward to. RPython guarantees this by construction:
+            // `reached_loop_header` (pyjitpl.py:2934-2978) builds
+            // `live_arg_boxes = reds + virtualizable_boxes[:-1]` for BOTH
+            // the merge-point registration and the closing JUMP, so the
+            // two shapes always match. Pyre's full-body-walk
+            // `jit_merge_point` handler now mirrors that exactly
+            // (jitcode_dispatch.rs: reds rebound to `sym.frame` /
+            // `sym.execution_context`, then `append_virtualizable_boxes`
+            // + `remove_consts_and_duplicates`), and the historical
+            // reds-only `[frame, ec]` seeding that made a cross-loop cut
+            // declare 2 inputargs against a full-shape JUMP is gone —
+            // verified unreachable across the bench suite (fannkuch /
+            // nbody, which used to trip it, at default and raised
+            // trace_eagerness).
+            //
+            // The guard stays as a tripwire: a future shape regression
+            // must decline through `InvalidLoop` — the designed
+            // compile-failure channel `compile_loop_body` catches to fall
+            // back to the interpreter — instead of letting
+            // `inputarg_type_at_strict` hard-panic the worker thread.
+            if (0..n).any(|i| ctx.inputarg_type_at(i).is_none()) {
+                std::panic::panic_any(crate::optimize::InvalidLoop(
+                    "next_iteration_args longer than inputargs (full-body-walk \
+                     cross-loop cut over a forced heap virtual)",
+                ));
+            }
             // resoperation.py:719/727/739 InputArg{Int,Ref,Float}: mint typed
             // variants for each Phase 2 source slot from `inputarg_types`
             // (history.py:220 box.type). Variant-aware Eq requires the

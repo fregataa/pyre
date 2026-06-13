@@ -1689,6 +1689,14 @@ thread_local! {
         // `majit_metainterp::MetaInterp::walk_active_trace_refs`.
         majit_gc::shadow_stack::register_extra_root_walker(active_trace_root_walker);
         majit_gc::shadow_stack::register_extra_root_walker(compile_snapshot_root_walker);
+        // framework.py `root_walker.walk_roots` parity for the full-body
+        // walk's store-undo journal: the `(list, key, displaced)` triples
+        // hold nursery refs across the rest of the walk (residual calls
+        // allocate, and a minor collection moves nursery objects). See
+        // `pyre_jit_trace::jitcode_dispatch::fbw_store_journal_root_walker`.
+        majit_gc::shadow_stack::register_extra_root_walker(
+            pyre_jit_trace::jitcode_dispatch::fbw_store_journal_root_walker,
+        );
         // pyre's temporary mapdict side table mirrors PyPy fields that are
         // normally traced by the translated GC. Walk its value slots
         // explicitly until the table is folded into the object layout.
@@ -3314,8 +3322,10 @@ pub(crate) fn eval_loop_jit_bridge(frame: &mut PyFrame) -> LoopResult {
             // Mirror `eval_loop_jit`'s walker-dispatched bypass — the
             // walker arm already mutated the live PyFrame via
             // `vable_setfield` → `synchronize_virtualizable`, and the
-            // compiled trace owns the rest of the bytecode's heap
-            // effects on replay.  Running `execute_opcode_step` here
+            // walker executor concrete-executed the arm's non-elidable
+            // residual calls (the arm walk is the sole execution leg —
+            // no replay applies a declined effect).  Running
+            // `execute_opcode_step` here
             // would double-mutate `valuestackdepth` for the same opcode.
             // Drain any pending raise from `BH_LAST_EXC_VALUE` so the
             // exception handler runs against the bridge frame.
@@ -3456,7 +3466,18 @@ fn jit_merge_point_hook(
             crate::jit::codewriter::register_portal_jitdriver(code, frame.pycode, Some(pc));
             let snapshot = frame.snapshot_for_tracing();
             let _ = concrete_frame;
-            let (action, _executed_frame) = trace_bytecode(meta, sym, code, pc, snapshot);
+            let (action, executed_frame) = trace_bytecode(meta, sym, code, pc, snapshot);
+            // pyjitpl.py:3048-3091 raise_continue_running_normally: tracing
+            // IS execution — a walk that committed its end-of-walk state
+            // into the snapshot (CloseLoop / CompileTracePending flush)
+            // hands that state to the LIVE frame, so the
+            // ContinueRunningNormally re-entry continues from the walked
+            // iteration's end instead of replaying it (re-applying every
+            // concretely executed side effect).  An uncommitted flush
+            // leaves the snapshot at entry state — adopting it is a no-op.
+            if pyre_jit_trace::trace::take_walk_end_flush_committed() {
+                frame.restore_resume_state_from(&executed_frame);
+            }
             action
         },
     ) {
@@ -4127,8 +4148,13 @@ fn bound_reached(
                         Some(loop_header_pc),
                     );
                     let concrete_frame = frame.snapshot_for_tracing();
-                    let (action, _) =
+                    let (action, executed_frame) =
                         trace_bytecode(meta, sym, code, loop_header_pc, concrete_frame);
+                    // raise_continue_running_normally seam — see the
+                    // jit_merge_point_hook tracing site for the contract.
+                    if pyre_jit_trace::trace::take_walk_end_flush_committed() {
+                        frame.restore_resume_state_from(&executed_frame);
+                    }
                     action
                 },
             );
@@ -5671,7 +5697,7 @@ pub(crate) fn decode_and_restore_guard_failure(
     // `rd_numb` here indicates an unported guard-emission site — hard
     // assert so the gap surfaces rather than silently degrade via a
     // pyre-only single-frame synthesis.
-    {
+    let resumed_frames = {
         // compile.py:853 `ResumeGuardDescr` storage — borrow rd_numb /
         // rd_consts from the guard-owned shared Arc instead of a
         // per-guard Vec copy.
@@ -5684,18 +5710,19 @@ pub(crate) fn decode_and_restore_guard_failure(
             "rebuild_guard_fail_state: storage.rd_numb is empty (fail_index={})",
             exit_layout.fail_index
         );
-        // build_resumed_frames is driven only for its side effect: the
         // GuardFailureSync mode writes the captured vable boxes back onto
         // the physical frame (see comment above). The decoded frame chain
-        // itself is unused on the guard-failure path.
+        // is also consumed below to recover the innermost frame's section
+        // pc (its resume opcode), which the full-body walk does not track
+        // in the vable `last_instr` field.
         build_resumed_frames(
             raw_values,
             storage.rd_numb.as_slice(),
             storage.rd_consts(),
             exit_layout,
             ResumeVableMode::GuardFailureSync,
-        );
-    }
+        )
+    };
 
     // virtualizable.py:126: write fields from resumedata to frame.
     let restored = jit_state.restore_guard_failure_values(meta, &typed, &ExceptionState::default());
@@ -5708,7 +5735,23 @@ pub(crate) fn decode_and_restore_guard_failure(
     }
 
     if restored {
-        Some((typed, jit_state.next_instr()))
+        // `next_instr()` is derived from the vable `last_instr` field.  The
+        // full-body walk sets the concrete frame's `last_instr` once at the
+        // loop header and does not advance it per opcode, so for a mid-body
+        // guard that field — and hence `next_instr()` — carries the loop
+        // header pc instead of the guard's resume opcode.  The per-frame
+        // section pc (`ResumedFrame.py_pc`, the same coordinate
+        // `resume_in_blackhole` resumes at) is the correct resume point.
+        // Prefer it when the two disagree; for the trait tracer they always
+        // match (the frame's `last_instr` tracks the Python pc), so this is
+        // a no-op there.
+        let ni = jit_state.next_instr();
+        let resume_pc = resumed_frames
+            .last()
+            .map(|f| f.py_pc)
+            .filter(|&section_pc| section_pc != ni)
+            .unwrap_or(ni);
+        Some((typed, resume_pc))
     } else {
         None
     }
@@ -8741,7 +8784,20 @@ first = g(9)
 factor = 2
 second = g(9)";
         let code = pyre_interpreter::compile_exec(source).expect("compile failed");
-        let mut frame = PyFrame::new(code);
+        // Production shape (pyrex real_main): the frame carries an
+        // ExecutionContext and the TLS slot is seeded, so
+        // `getexecutioncontext().gettopframe()` is live when the
+        // self-recursive CALL_ASSEMBLER path concretely executes the
+        // recursive `g(n - 1)` during the walk (`bh_call_fn_impl`
+        // resolves the parent frame from it).  A bare `PyFrame::new`
+        // frame is never entered onto the EC and trips the fail-fast
+        // topframe assert — same fixture shape as
+        // `test_nested_direct_helper_calls_stay_correct`.
+        let execution_context = std::rc::Rc::new(pyre_interpreter::PyExecutionContext::default());
+        pyre_interpreter::call::set_last_exec_ctx(std::rc::Rc::as_ptr(&execution_context));
+        let mut frame =
+            pyre_interpreter::pyframe::PyFrame::new_with_context(code, execution_context)
+                .expect("frame construction failed");
         let _ = eval_with_jit(&mut frame);
         unsafe {
             let first = *(*frame_globals_storage(&frame)).get("first").unwrap();
@@ -8797,7 +8853,18 @@ while i < 40:
     s = add(s, compute(i))
     i = add(i, 1)";
         let code = pyre_interpreter::compile_exec(source).expect("compile failed");
-        let mut frame = PyFrame::new(code);
+        // Production shape (pyrex real_main): the frame carries an
+        // ExecutionContext and the TLS slot is seeded, so
+        // `getexecutioncontext().gettopframe()` is live during blackhole
+        // resume — `bh_call_fn_impl` resolves the parent frame from it
+        // when a guard deopt re-executes a `call_fn` residual.  A bare
+        // `PyFrame::new` frame is never entered onto the EC and trips
+        // the fail-fast topframe assert.
+        let execution_context = std::rc::Rc::new(pyre_interpreter::PyExecutionContext::default());
+        pyre_interpreter::call::set_last_exec_ctx(std::rc::Rc::as_ptr(&execution_context));
+        let mut frame =
+            pyre_interpreter::pyframe::PyFrame::new_with_context(code, execution_context)
+                .expect("frame construction failed");
         let _ = eval_with_jit(&mut frame);
         unsafe {
             let s = *(*frame_globals_storage(&frame)).get("s").unwrap();

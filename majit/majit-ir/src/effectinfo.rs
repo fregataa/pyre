@@ -220,6 +220,17 @@ pub fn consider_array(_array_name: &str) -> bool {
 pub struct EffectInfo {
     pub extraeffect: ExtraEffect,
     pub oopspecindex: OopSpecIndex,
+    /// pyre-only: identifies a pyre custom-bytecode helper `residual_call`
+    /// (`binary_op` / `compare` / `load_const` / `box_int` / `store_subscr`
+    /// / `load_global`) so the full-body walker can re-emit its speculative
+    /// specialization.  Held OFF `oopspecindex` on purpose: these helpers have
+    /// no upstream OS_* identity, so parking them on `oopspecindex` would make
+    /// `has_oopspec()` true and divert the production reghint / vstring passes
+    /// (both read `has_oopspec()` behaviorally) off the ordinary-call path, and
+    /// would break the `_OS_CANRAISE` invariant for the CanRaise members.
+    /// `None` for every ordinary call, so `has_oopspec()` and the OS_* universe
+    /// stay identical to upstream.
+    pub pyre_helper: PyreHelperKind,
     // ── effectinfo.py:128-145 raw descr sets ──
     //
     // PyPy stores `_readonly_descrs_fields: frozenset[Descr]` (and the
@@ -300,6 +311,7 @@ impl PartialEq for EffectInfo {
     fn eq(&self, other: &Self) -> bool {
         self.extraeffect == other.extraeffect
             && self.oopspecindex == other.oopspecindex
+            && self.pyre_helper == other.pyre_helper
             && descr_set_eq(
                 &self._readonly_descrs_fields,
                 &other._readonly_descrs_fields,
@@ -335,6 +347,7 @@ impl std::hash::Hash for EffectInfo {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.extraeffect.hash(state);
         self.oopspecindex.hash(state);
+        self.pyre_helper.hash(state);
         descr_set_hash(&self._readonly_descrs_fields, state);
         descr_set_hash(&self._write_descrs_fields, state);
         descr_set_hash(&self._readonly_descrs_arrays, state);
@@ -352,6 +365,7 @@ impl Default for EffectInfo {
         EffectInfo {
             extraeffect: ExtraEffect::CanRaise,
             oopspecindex: OopSpecIndex::None,
+            pyre_helper: PyreHelperKind::None,
             // effectinfo.py:128-145 frozenset_or_none: empty frozenset for
             // a non-random-effects EI with no field/array touches yet.
             _readonly_descrs_fields: Some(Vec::new()),
@@ -484,6 +498,45 @@ pub enum OopSpecIndex {
     JitForceVirtualizable = 121,
 }
 
+/// pyre-only recognition tag for custom-bytecode helper `residual_call`s.
+///
+/// The pyre codewriter lowers several Python bytecodes to a single runtime
+/// helper `residual_call`: `binary_op` / `compare` carry the operator as a
+/// compact int tag; `load_const` / `load_global` re-read an indexed code
+/// slot; `box_int` wraps a raw Int; `store_subscr` does `obj[key] = value`.
+/// The full-body walker re-emits each one's speculative specialization
+/// (e.g. `guard_class` + `getfield_gc` + `int/float_OP` + `new_with_vtable`
+/// for `binary_op`), but it cannot match the helper by fnaddr because
+/// pyre-jit-trace does not depend on pyre-jit — so the calldescr's
+/// [`EffectInfo`] carries this tag instead.
+///
+/// Deliberately separate from [`OopSpecIndex`]: these helpers have no
+/// upstream OS_* identity, [`EffectInfo::has_oopspec`] must stay false for
+/// them so the production reghint / vstring passes treat them as ordinary
+/// calls, and the CanRaise members (`load_const` / `load_global` / `box_int`)
+/// would otherwise violate the `_OS_CANRAISE` invariant (effectinfo.py:198).
+/// Discriminants are pyre-internal (no upstream meaning).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum PyreHelperKind {
+    #[default]
+    None,
+    BinaryOp,
+    CompareOp,
+    LoadConst,
+    BoxInt,
+    StoreSubscr,
+    LoadGlobal,
+    /// `bh_call_fn_N(callable, null_or_self, args...)` — the CALL-family
+    /// Python-call helper.  `null_or_self` (arg index 1) is a sentinel
+    /// the helper checks before use (a non-null receiver is prepended as
+    /// arg0; `PY_NULL` means "no receiver" and is never dereferenced), so
+    /// a concrete-NULL there is the NORMAL plain-call shape, not the
+    /// broken baked-NULL-globals shape the walker's may-force NULL-ref
+    /// gate rejects.
+    CallFn,
+}
+
 impl EffectInfo {
     pub fn check_is_elidable(&self) -> bool {
         self.extraeffect == ExtraEffect::ElidableCanRaise
@@ -549,6 +602,7 @@ impl EffectInfo {
         EffectInfo {
             extraeffect,
             oopspecindex,
+            pyre_helper: PyreHelperKind::None,
             _readonly_descrs_fields: Some(Vec::new()),
             _write_descrs_fields: Some(Vec::new()),
             _readonly_descrs_arrays: Some(Vec::new()),
@@ -610,6 +664,7 @@ impl EffectInfo {
     pub const MOST_GENERAL: EffectInfo = EffectInfo {
         extraeffect: ExtraEffect::RandomEffects,
         oopspecindex: OopSpecIndex::None,
+        pyre_helper: PyreHelperKind::None,
         _readonly_descrs_fields: None,
         _write_descrs_fields: None,
         _readonly_descrs_arrays: None,

@@ -434,6 +434,33 @@ impl PyFrame {
     pub fn locals_w_mut(&mut self) -> &mut FixedObjectArray {
         unsafe { &mut *self.locals_cells_stack_w }
     }
+
+    /// Restore the per-trace mutable frame state — instruction pointer, value
+    /// stack depth, and `locals_cells_stack_w` contents — from a snapshot
+    /// taken before a bridge trace.  `trace_and_compile_from_bridge` uses this
+    /// to undo any concrete-execution mutation the full-body walker applied to
+    /// the live frame during the walk, so a `BridgeCompiled` resume re-enters
+    /// at the exact guard state instead of mid-body / past a stepped loop
+    /// counter.  `src` is a `snapshot_for_tracing` of this same frame, so the
+    /// arrays share length; the `min` is defensive.
+    ///
+    /// These three are exactly the mutable virtualizable fields the walk can
+    /// touch (may-force residual calls advance `last_instr` and the value
+    /// stack).  The remaining `_virtualizable_` fields — `pycode`, `w_globals`,
+    /// `debugdata` — are deliberately NOT restored: `pycode`/`w_globals` are
+    /// frame-invariant and `debugdata` is debug-only; none are written on the
+    /// live frame during tracing (the walk writes only the symbolic `PyreSym`
+    /// shadow), so restoring them would be dead.
+    pub fn restore_resume_state_from(&mut self, src: &PyFrame) {
+        self.last_instr = src.last_instr;
+        self.valuestackdepth = src.valuestackdepth;
+        let src_vals = src.locals_w().as_slice().to_vec();
+        let dst = self.locals_w_mut();
+        let n = src_vals.len().min(dst.as_slice().len());
+        for (i, &v) in src_vals.iter().take(n).enumerate() {
+            dst[i] = v;
+        }
+    }
 }
 
 /// Extract raw CodeObject from frame's W_CodeObject.
@@ -2469,6 +2496,13 @@ pub fn load_const_from_code(code: &CodeObject, idx: usize) -> PyObjectRef {
         return pyre_object::w_none();
     }
     pyobject_from_constant(&constants[idx])
+}
+
+/// `co_names[idx]` — the global/attribute name at `idx`, used by the JIT
+/// full-body walker to resolve a `LOAD_GLOBAL` namei to the name string for
+/// the module-dict cell-cache lookup.  `None` when `idx` is out of range.
+pub fn load_name_from_code(code: &CodeObject, idx: usize) -> Option<&str> {
+    code.names.get(idx).map(|s| s.as_str())
 }
 
 fn code_constants(code: &CodeObject) -> &[crate::bytecode::ConstantData] {

@@ -224,6 +224,18 @@ impl<'frame, 'static_a: 'frame> WalkerFrameOps
         // narrow enough that `walker_capture_snapshot_for_last_guard`'s
         // `&mut WalkContext` arg sees a fresh exclusive borrow.
         self.trace_ctx.record_guard(opcode, args, 0);
-        crate::jitcode_dispatch::walker_capture_snapshot_for_last_guard(self, 0);
+        // `walker_capture_snapshot_for_last_guard` returns a typed abort
+        // (`GuardSnapshotVableUntyped`) for the multi-frame vable case the
+        // full-body walk routes through `DispatchError`.  The `()` trait
+        // signature (shared with the trait tracer's `MIFrame`) has no
+        // error channel, so latch the first failure on the context; the
+        // STORE_SUBSCR specialization's dispatcher call site drains it
+        // and aborts the walk — a guard without a resume snapshot must
+        // not reach the compile pipeline.
+        if let Err(e) = crate::jitcode_dispatch::walker_capture_snapshot_for_last_guard(self, 0) {
+            if self.pending_guard_snapshot_error.is_none() {
+                self.pending_guard_snapshot_error = Some(e);
+            }
+        }
     }
 }

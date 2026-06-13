@@ -90,6 +90,15 @@ pub struct PyJitCodeMetadata {
     /// the next opcode's start marker (`blackhole.py:396-410
     /// handle_exception_in_frame`).  Same length as `pc_map`.
     pub after_residual_call_resume_pc: Vec<Option<usize>>,
+    /// py_pc → jitcode byte offset of the FIRST instruction the opcode
+    /// emitted (`usize::MAX` for PCs that emit no jitcode of their own:
+    /// trivia, folded ops).  `pc_map` resolves each PC to its nearest
+    /// `-live-` marker at-or-before, so adjacent PCs share marker
+    /// positions and the map is not invertible; the full-body walk needs
+    /// the exact inverse (jitcode pc → containing Python opcode) for
+    /// guard resume coordinates, which this table provides.  Same length
+    /// as `pc_map`.
+    pub first_jit_pc_by_py_pc: Vec<usize>,
     /// Value-stack depth at each Python PC, in slots above stack_base.
     pub depth_at_py_pc: Vec<u16>,
     /// Post-regalloc Ref-bank color of the portal jitdriver's first red
@@ -108,6 +117,17 @@ pub struct PyJitCodeMetadata {
     /// argument (`ec`, `pypy/module/pypyjit/interp_jit.py:67`).
     /// Snapshot serializer maps this color to `sym.execution_context`.
     pub portal_ec_reg: u16,
+    /// Whether the body was compiled with the PORTAL entry shape
+    /// (`FrameInputs::Portal`: `[frame, ec]` red inputs + frame-vable
+    /// locals prologue) — `jitdriver_sd_from_portal_graph(code)` was
+    /// `Some` at compile time.  A body first compiled as a plain CALLEE
+    /// (`FrameInputs::Frame`, discovered through another function's
+    /// call) reads its params from caller-seeded registers and stays
+    /// frozen once installed trace-side (resume data captured against
+    /// it must stay consistent), so a later portal trace of the same
+    /// code must NOT walk it: `run_perfn_walk` declines on
+    /// `!built_as_portal` and the trait tracer compiles the function.
+    pub built_as_portal: bool,
     /// Absolute start index of the operand stack in PyFrame.locals_cells_stack_w.
     pub stack_base: usize,
     /// Post-regalloc
@@ -193,6 +213,14 @@ pub struct PyJitCodePayload {
     pub has_abort: bool,
     /// Python PC of the jit_merge_point opcode (trace entry header).
     pub merge_point_pc: Option<usize>,
+    /// Lazily-built per-fn walker descr pool
+    /// (`state::sub_jitcode_descr_pool_for_code`): adapted `descr_refs`,
+    /// raw `RuntimeBhDescr` slice, sub-jitcode lookup. Carried on the
+    /// payload — not in a side table keyed by object identity — so a
+    /// `replace_with` body refill drops the pool together with the
+    /// `exec.descrs` it borrows from. RPython has no equivalent table:
+    /// the active MIFrame's JitCode carries its descriptors directly.
+    pub(crate) sub_descr_pool: std::cell::OnceCell<crate::state::SubDescrPool>,
 }
 
 /// Shared `PyJitCode` identity whose payload is filled in place.
@@ -223,7 +251,10 @@ pub struct PyJitCode {
 // SAFETY: `PyJitCode` payload replacement is restricted to the codewriter
 // publication path, which runs under pyre's single-threaded JIT setup before
 // the populated object is handed to runtime readers. Runtime-visible index
-// stamping uses atomics on the inner `RuntimeJitCode`.
+// stamping uses atomics on the inner `RuntimeJitCode`. The lazily-built
+// `sub_descr_pool` `OnceCell` is initialized only from the trace-side walker
+// (`state::sub_jitcode_descr_pool_for_code`), which runs on the single
+// thread owning the thread-local `METAINTERP_SD` store.
 unsafe impl Sync for PyJitCode {}
 
 impl Deref for PyJitCode {
@@ -290,6 +321,7 @@ impl PyJitCode {
             w_code,
             has_abort,
             merge_point_pc,
+            sub_descr_pool: std::cell::OnceCell::new(),
         })
     }
 
@@ -327,6 +359,7 @@ impl PyJitCode {
             w_code,
             has_abort,
             merge_point_pc,
+            sub_descr_pool,
         } = next.payload.into_inner();
         let next_jitcode = std::sync::Arc::try_unwrap(next_jitcode)
             .expect("freshly assembled PyJitCode must uniquely own its runtime JitCode");
@@ -338,6 +371,11 @@ impl PyJitCode {
             // express "shared for setup identity, exclusively mutated before
             // runtime publication", so we write through the stable allocation
             // under the setup-phase precondition documented above.
+            // Drop any pool built against the body being replaced BEFORE
+            // overwriting the inner JitCode: the pool borrows that body's
+            // `exec.descrs`, and the new body starts with no pool (built
+            // lazily on first walker inline of the refilled callee).
+            current.sub_descr_pool = sub_descr_pool;
             let current_jitcode = std::sync::Arc::as_ptr(&current.jitcode) as *mut RuntimeJitCode;
             *current_jitcode = next_jitcode;
             current.metadata = metadata;
@@ -480,6 +518,7 @@ impl PyJitCode {
             PyJitCodeMetadata {
                 pc_map: Vec::new(),
                 after_residual_call_resume_pc: Vec::new(),
+                first_jit_pc_by_py_pc: Vec::new(),
                 depth_at_py_pc: Vec::new(),
                 // u16::MAX sentinel mirrors `canonical_bridge::install_portal_for`
                 // (canonical_bridge.rs:165-166). Encoder/decoder readers in
@@ -490,6 +529,7 @@ impl PyJitCode {
                 // unrelated locals/stack slots.
                 portal_frame_reg: u16::MAX,
                 portal_ec_reg: u16::MAX,
+                built_as_portal: false,
                 stack_base: 0,
                 stack_slot_color_map: Vec::new(),
                 pyre_color_for_semantic_local: Vec::new(),

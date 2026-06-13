@@ -1162,6 +1162,7 @@ fn jit_blackhole_resume_from_guard(
     num_fail_values: usize,
     raw_deadframe_ptr: *const i64,
     num_raw_deadframe: usize,
+    guard_exc: i64,
 ) -> Option<i64> {
     // rstack.stack_check_slowpath → _StackOverflow parity: drain the
     // pending JIT-prologue overflow exception when the backend probe
@@ -1274,14 +1275,14 @@ fn jit_blackhole_resume_from_guard(
         // resume.py:924 _prepare_pendingfields(storage.rd_pendingfields):
         // deferred field writes must be replayed before consume_vref_and_vable.
         // blackhole.py:1794 `current_exc = _prepare_resume_from_failure(
-        // guard_opnum, deadframe)`. The CALL_ASSEMBLER resume reaches here
-        // through the C-ABI with raw fail-value pointers, not a `DeadFrame`,
-        // so `cpu.grab_exc_value(deadframe)` (which reads the JITFRAME
-        // `jf_guard_exc` field set by `emit_guard_exit`) is not yet wired in
-        // on this path. Pass 0 (no pending exception) — unchanged from the
-        // prior behavior — until the JITFRAME exc field is threaded through
-        // the CALL_ASSEMBLER guard-exit ABI.
-        let guard_exc = 0;
+        // guard_opnum, deadframe)`. The backend trampoline grabbed
+        // `jf_guard_exc` off the jitframe (`cpu.grab_exc_value`,
+        // llmodel.py:240) and threaded it through the C-ABI `guard_exc`
+        // parameter, so a GUARD_NO_EXCEPTION / GUARD_EXCEPTION /
+        // GUARD_NOT_FORCED failure inside a CALL_ASSEMBLER-entered
+        // callee delivers its pending exception to the blackhole resume
+        // instead of resuming the no-exception continuation with a NULL
+        // result.
         let result = blackhole_resume_via_rd_numb(
             &storage.rd_numb,
             storage.rd_consts(),
@@ -1961,7 +1962,23 @@ pub fn trace_and_compile_from_bridge(
     // that whole-loop interpreter; calling it once preserves the concrete PC
     // updates across branches/back-edges. Re-invoking it in a synthetic
     // `pc + 1` loop diverges from RPython and corrupts nested-loop bridges.
+    // The bridge tracer must leave the real frame exactly at the guard
+    // resume state so that a `BridgeCompiled` outcome re-enters
+    // `eval_loop_jit` there — the `ContinueRunningNormally` arm does NOT
+    // reconstruct the frame, it runs the interpreter forward from the live
+    // frame's `last_instr` / value stack as-is.  The trait tracer interprets
+    // a private `snapshot_for_tracing` copy and never touches the real frame,
+    // so it naturally preserves the resume state.  The full-body walker,
+    // however, runs may-force residual calls concretely through the shared
+    // execution context during the walk, which advances the live frame's
+    // `last_instr` AND its locals (e.g. a loop counter) to the walked
+    // opcode's concrete state.  Snapshot the resume state here and restore it
+    // after the walk so the post-bridge interpreter resumes at the guard
+    // point rather than mid-body or past a dropped loop iteration (a
+    // value-stack underflow / off-by-one-iteration result otherwise).
+    let resume_state = frame.snapshot_for_tracing();
     let trace_frame = frame.snapshot_for_tracing();
+    let mut adopted_walk_end_state = false;
     let outcome = {
         let (driver, _) = crate::eval::driver_pair();
         driver.jit_merge_point_keyed(
@@ -1971,11 +1988,26 @@ pub fn trace_and_compile_from_bridge(
             &env,
             || {},
             |meta, sym| {
-                let (action, _executed) = trace_bytecode(meta, sym, code, resume_pc, trace_frame);
+                let (action, executed) = trace_bytecode(meta, sym, code, resume_pc, trace_frame);
+                // pyjitpl.py:3048-3091 raise_continue_running_normally:
+                // a bridge walk that closed at a merge point and committed
+                // its end-of-walk state into the trace snapshot
+                // (`flush_walk_end_state_to_frame`) hands the LIVE frame
+                // that end state — the walked region's residual calls
+                // executed concretely, so resuming at the guard would
+                // re-apply every side effect.  Uncommitted → fall through
+                // to the guard-state restore below (legacy replay).
+                if pyre_jit_trace::trace::take_walk_end_flush_committed() {
+                    frame.restore_resume_state_from(&executed);
+                    adopted_walk_end_state = true;
+                }
                 action
             },
         )
     };
+    if !adopted_walk_end_state {
+        frame.restore_resume_state_from(&resume_state);
+    }
 
     // merge_point handles Finish/CloseLoop via bridge_info.
     if outcome.is_some() {
@@ -2016,6 +2048,16 @@ pub fn trace_and_compile_from_bridge(
     // If the driver is no longer tracing, the bridge was compiled
     // (or aborted) inside merge_point. Check whether a bridge was
     // actually attached to distinguish success from abort.
+    //
+    // pyjitpl.py:3057 raise_continue_running_normally: a trace that
+    // reached a merge point exits with ContinueRunningNormally from the
+    // CURRENT state — never through the blackhole-from-guard path. A
+    // committed walk already executed the region and the live frame
+    // adopted its end state above, so the caller must continue running
+    // normally even when the trace closed as a new loop at an inner
+    // header instead of attaching a bridge to this guard; resuming in
+    // the blackhole would re-apply every walked side effect from the
+    // guard-time values.
     let tracing_active = {
         let (driver, _) = crate::eval::driver_pair();
         driver.is_tracing()
@@ -2023,11 +2065,11 @@ pub fn trace_and_compile_from_bridge(
     if !tracing_active {
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
-                "[jit][bridge-trace] trace ended at resume_pc={} key={} compiled={}",
-                resume_pc, green_key, compiled
+                "[jit][bridge-trace] trace ended at resume_pc={} key={} compiled={} adopted={}",
+                resume_pc, green_key, compiled, adopted_walk_end_state
             );
         }
-        return compiled;
+        return compiled || adopted_walk_end_state;
     }
 
     // Trace did not converge into a bridge. Abort like RPython's
@@ -2042,7 +2084,9 @@ pub fn trace_and_compile_from_bridge(
         let (driver, _) = crate::eval::driver_pair();
         driver.meta_interp_mut().abort_trace(false);
     }
-    false
+    // A committed walk has already executed the region into the live
+    // frame; the blackhole replay must not run even on this abort path.
+    adopted_walk_end_state
 }
 
 /// compile.py:701-717 handle_fail for call_assembler guard failures.

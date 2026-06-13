@@ -2272,6 +2272,7 @@ fn record_residual_call_graph_op(
     block: &super::flow::BlockRef,
     fn_idx: u16,
     flavor: CallFlavor,
+    pyre_helper: majit_ir::PyreHelperKind,
     args_i: Vec<super::flow::FlowValue>,
     args_r: Vec<super::flow::FlowValue>,
     args_f: Vec<super::flow::FlowValue>,
@@ -2308,7 +2309,12 @@ fn record_residual_call_graph_op(
             args_f,
         )));
     }
-    let effect_info = super::flatten::effect_info_for_call_flavor(flavor);
+    let mut effect_info = super::flatten::effect_info_for_call_flavor(flavor);
+    // Helper-recognition tag for the full-body walker's specialization
+    // folds (BoxInt / BinaryOp / CompareOp dispatch in
+    // `jitcode_dispatch.rs`); mirrors the tag the dedicated walker-emit
+    // builders (`flatten.rs build_*_insn`) attach to the same helpers.
+    effect_info.pyre_helper = pyre_helper;
     let can_raise = effect_info.check_can_raise(false);
     op_args.push(
         super::flatten::intern_call_descr_stub(effect_info, arg_kinds, reskind.to_kind()).into(),
@@ -2384,6 +2390,42 @@ fn emit_graph_op_with_result(
     let result = graph.fresh_variable(result_kind);
     record_graph_op(block, opname, args, Some(result.into()), offset);
     result
+}
+
+/// Record a `loop_header` graph op (jtransform.py:1714-1723, the lowered
+/// `can_enter_jit` at a backward-jump site) into `block` and serialize it
+/// into the SSARepr stream the assembler consumes.  The op carries a
+/// single `Constant(jdindex)` — no Variables — so the flattener needs no
+/// register coloring.  Same record-then-serialize idiom as the portal
+/// `jit_merge_point` emission.
+fn emit_loop_header(
+    graph: &super::flow::FunctionGraph,
+    block: &SpamBlockRef,
+    ssarepr: &mut SSARepr,
+    jdindex: usize,
+    py_pc: usize,
+) {
+    let graph_op = emit_graph_op_void(
+        &block.block(),
+        "loop_header",
+        vec![super::flow::Constant::signed(jdindex as i64).into()],
+        py_pc as i64,
+    );
+    let mut empty_regallocs = [
+        super::regalloc::GraphAllocationResult {
+            coloring: std::collections::HashMap::new(),
+            num_colors: 0,
+        },
+        super::regalloc::GraphAllocationResult {
+            coloring: std::collections::HashMap::new(),
+            num_colors: 0,
+        },
+        super::regalloc::GraphAllocationResult {
+            coloring: std::collections::HashMap::new(),
+            num_colors: 0,
+        },
+    ];
+    GraphFlattener::new(graph, &mut empty_regallocs, ssarepr).serialize_op(&graph_op);
 }
 
 fn emit_frontend_neg(
@@ -3272,7 +3314,7 @@ fn filter_liveness_in_place(
     walker_tracked_pc_live_indices: Option<&[usize]>,
     walker_after_call_pc_indices: Option<&[Option<usize>]>,
     clear_unboxed_banks: bool,
-) -> (Vec<usize>, Vec<Option<usize>>) {
+) -> (Vec<usize>, Vec<Option<usize>>, Vec<Option<usize>>) {
     use super::flatten::{Kind as SsaKind, Operand as SsaOperand};
     // Per-PC `-live-` positions are required: the post-merge
     // `live_markers` vector is built by translating each per-PC
@@ -3301,11 +3343,29 @@ fn filter_liveness_in_place(
     let after_call_anchors: Vec<Option<usize>> = walker_after_call_pc_indices
         .map(|s| s.to_vec())
         .unwrap_or_else(|| vec![None; walker_tracked.len()]);
-    let (live_markers, after_call_post_merge) = super::liveness::compute_liveness_with_pc_anchors(
-        ssarepr,
-        walker_tracked,
-        &after_call_anchors,
-    );
+    // Per-PC first-insn positions (pre-merge), captured before
+    // `compute_liveness` rewrites the stream; remapped through the same
+    // `remove_repeated_live` remap below.  This is the exact
+    // jitcode-pc → Python-opcode inverse the full-body walk consumes
+    // (`PyJitCodeMetadata::first_jit_pc_by_py_pc`) — `pc_map`'s
+    // nearest-marker carry-forward shares positions across PCs and is
+    // not invertible.
+    let mut first_insn_pre_merge: Vec<Option<usize>> = vec![None; walker_tracked.len()];
+    for &(py_pc, pos) in &ssarepr.pc_first_insn_pos {
+        if (0..walker_tracked.len() as i64).contains(&py_pc) {
+            first_insn_pre_merge[py_pc as usize] = Some(pos);
+        }
+    }
+    let (live_markers, after_call_post_merge, remap) =
+        super::liveness::compute_liveness_with_pc_anchors(
+            ssarepr,
+            walker_tracked,
+            &after_call_anchors,
+        );
+    let first_insn_post_merge: Vec<Option<usize>> = first_insn_pre_merge
+        .iter()
+        .map(|entry| entry.map(|old| remap[old]))
+        .collect();
     let live_vars = pyre_jit_trace::state::liveness_for(code as *const _);
     let nlocals = code.varnames.len();
     let live_markers_out = live_markers.clone();
@@ -3527,7 +3587,11 @@ fn filter_liveness_in_place(
         }
         existing.extend(non_register);
     }
-    (live_markers_out, after_call_post_merge)
+    (
+        live_markers_out,
+        after_call_post_merge,
+        first_insn_post_merge,
+    )
 }
 
 /// Decode `code.exceptiontable` into the structures the dispatch loop
@@ -4391,11 +4455,35 @@ impl CodeWriter {
                 $reskind:expr,
                 $offset:expr $(,)?
             ) => {
+                residual_call!(
+                    $fn_idx,
+                    $flavor,
+                    majit_ir::PyreHelperKind::None,
+                    $args_i,
+                    $args_r,
+                    $args_f,
+                    $arg_kinds,
+                    $reskind,
+                    $offset,
+                )
+            };
+            (
+                $fn_idx:expr,
+                $flavor:expr,
+                $pyre_helper:expr,
+                $args_i:expr,
+                $args_r:expr,
+                $args_f:expr,
+                $arg_kinds:expr,
+                $reskind:expr,
+                $offset:expr $(,)?
+            ) => {
                 record_residual_call_graph_op(
                     &mut graph,
                     &current_block.block(),
                     $fn_idx,
                     $flavor,
+                    $pyre_helper,
                     $args_i,
                     $args_r,
                     $args_f,
@@ -5704,6 +5792,7 @@ impl CodeWriter {
                             let boxed = residual_call!(
                                 box_int_fn_idx,
                                 CallFlavor::Plain,
+                                majit_ir::PyreHelperKind::BoxInt,
                                 vec![super::flow::Constant::signed(val).into()],
                                 vec![],
                                 vec![],
@@ -6145,6 +6234,23 @@ impl CodeWriter {
                                 backward_jump_target(code, py_pc, instr, op_arg)
                             {
                                 if target_py_pc < num_instrs {
+                                    // interp_jit.py:118 `can_enter_jit` at each
+                                    // backward jump → jtransform.py:1714-1723
+                                    // lowers it to a `loop_header` op in the
+                                    // jumping block, before the goto. The op
+                                    // stamps `seen_loop_header_for_jdindex` so
+                                    // the target's `jit_merge_point` treats
+                                    // this arrival as a loop crossing
+                                    // (pyjitpl.py:1527-1562).
+                                    if let Some(jdindex) = portal_jd_index {
+                                        emit_loop_header(
+                                            &graph,
+                                            &current_block,
+                                            &mut ssarepr,
+                                            jdindex,
+                                            py_pc,
+                                        );
+                                    }
                                     emit_goto!(target_py_pc);
                                 }
                             }
@@ -6238,6 +6344,49 @@ impl CodeWriter {
                             // into these registers, so the pop order here must
                             // mirror the interpreter exactly or a pre-call
                             // resume reads the null slot as the callable.
+                            //
+                            // When the abstract stack carries the LoadAttr/
+                            // LoadGlobal null sentinel as a graph Constant, the
+                            // slot value exists ONLY in the vable array
+                            // (`emit_pushvalue_ref_const!` writes no stack
+                            // register), and it must NOT const-fold to
+                            // ConstRef(0): a pre-call resume seeds the slot
+                            // from the tracer, which may hold a real receiver
+                            // (load_method_fast_path pushes `[w_descr, w_obj]`,
+                            // callmethod.py:60-68).  Materialize the slot value
+                            // with the upstream popvalue read
+                            // (`pyframe.py:411-417` reads
+                            // `locals_cells_stack_w[depth]` BEFORE clearing it,
+                            // `jtransform.py:1877 do_fixed_list_getitem`) so the
+                            // stack register has a producer on the straight-line
+                            // jitcode path; a producer-less pinned variable
+                            // leaves the register unbound for any execution that
+                            // is not rd_numb-seeded (walker full-body walk,
+                            // blackhole entry upstream of the push).
+                            let null_or_self_needs_read = is_portal
+                                && !matches!(
+                                    current_state.stack.last(),
+                                    Some(super::flow::FlowValue::Variable(_))
+                                );
+                            let null_or_self_read = if null_or_self_needs_read {
+                                let slot =
+                                    (stack_base_absolute + current_depth as usize - 1) as i64;
+                                let v_idx: super::flow::FlowValue =
+                                    super::flow::Constant::signed(slot).into();
+                                Some(emit_graph_op_with_result(
+                                    &mut graph,
+                                    &current_block.block(),
+                                    "getarrayitem_vable_r",
+                                    vable_getarrayitem_ref_graph_args(
+                                        frame_var.into(),
+                                        v_idx.into(),
+                                    ),
+                                    Kind::Ref,
+                                    py_pc as i64,
+                                ))
+                            } else {
+                                None
+                            };
                             let null_or_self_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let null_or_self_value =
                                 match pop_ref_or_fresh(&mut current_state, &mut graph) {
@@ -6245,21 +6394,38 @@ impl CodeWriter {
                                         pin!(Some(v), null_or_self_reg);
                                         v
                                     }
-                                    _ => {
-                                        // The LoadAttr/LoadGlobal arms push the
-                                        // null sentinel as a graph Constant, but it
-                                        // must NOT const-fold to ConstRef(0): a
-                                        // pre-call resume seeds this stack register
-                                        // from the tracer, which may hold a real
-                                        // receiver (load_method_fast_path pushes
-                                        // `[w_descr, w_obj]`, callmethod.py:60-68).
-                                        // Read the register instead — the pure
-                                        // blackhole path physically writes PY_NULL
-                                        // into it via emit_pushvalue_ref_const!.
-                                        let v = graph.fresh_variable(Kind::Ref);
-                                        pin!(Some(v), null_or_self_reg);
-                                        v
-                                    }
+                                    _ => match null_or_self_read {
+                                        Some(v) => {
+                                            pin!(Some(v), null_or_self_reg);
+                                            v
+                                        }
+                                        None => {
+                                            // Non-portal frames have no vable
+                                            // mirror to read the slot from;
+                                            // materialize the pure-path PY_NULL
+                                            // into the stack register with a
+                                            // `ref_copy(ConstRef(0))` producer —
+                                            // the same Insn shape
+                                            // `insert_renamings` (flatten.py:320)
+                                            // emits for a Constant link arg.  A
+                                            // producer-less pinned variable
+                                            // leaves the register unbound on the
+                                            // straight-line jitcode path; resume
+                                            // entries past this site still seed
+                                            // the register from rd_numb (which
+                                            // may carry a real receiver).
+                                            let v = emit_graph_op_with_result(
+                                                &mut graph,
+                                                &current_block.block(),
+                                                "ref_copy",
+                                                vec![super::flow::Constant::none().into()],
+                                                Kind::Ref,
+                                                py_pc as i64,
+                                            );
+                                            pin!(Some(v), null_or_self_reg);
+                                            v
+                                        }
+                                    },
                                 };
                             let callable_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let callable_value = pop_ref_or_fresh(&mut current_state, &mut graph);
@@ -6344,6 +6510,7 @@ impl CodeWriter {
                             let zero_graph_var = residual_call!(
                                 box_int_fn_idx,
                                 CallFlavor::Plain,
+                                majit_ir::PyreHelperKind::BoxInt,
                                 vec![super::flow::Constant::signed(0).into()],
                                 vec![],
                                 vec![],
@@ -6357,6 +6524,7 @@ impl CodeWriter {
                                 let binary_result = residual_call!(
                                     binary_op_fn_idx,
                                     CallFlavor::MayForce,
+                                    majit_ir::PyreHelperKind::BinaryOp,
                                     vec![super::flow::Constant::signed(subtract_tag as i64).into()],
                                     vec![zero_var.clone().into(), operand_value_for_dual.into()],
                                     vec![],
@@ -6379,6 +6547,18 @@ impl CodeWriter {
                                 backward_jump_target(code, py_pc, instr, op_arg)
                             {
                                 if target_py_pc < num_instrs {
+                                    // Same `can_enter_jit` → `loop_header`
+                                    // lowering as the JumpBackward arm above
+                                    // (jtransform.py:1714-1723).
+                                    if let Some(jdindex) = portal_jd_index {
+                                        emit_loop_header(
+                                            &graph,
+                                            &current_block,
+                                            &mut ssarepr,
+                                            jdindex,
+                                            py_pc,
+                                        );
+                                    }
                                     emit_goto!(target_py_pc);
                                 }
                             }
@@ -6792,6 +6972,7 @@ impl CodeWriter {
                             let cmp_result = residual_call!(
                                 compare_fn_idx,
                                 CallFlavor::MayForce,
+                                majit_ir::PyreHelperKind::CompareOp,
                                 vec![super::flow::Constant::signed(10).into()],
                                 vec![exc_value, match_type_value],
                                 vec![],
@@ -7830,6 +8011,7 @@ impl CodeWriter {
                         let boxed_lasti = residual_call!(
                             box_int_fn_idx,
                             CallFlavor::Plain,
+                            majit_ir::PyreHelperKind::BoxInt,
                             vec![super::flow::Constant::signed(site.lasti_py_pc as i64).into()],
                             vec![],
                             vec![],
@@ -8412,6 +8594,27 @@ impl CodeWriter {
                 super::regalloc::rename_lookup(&alloc_result.rename, Kind::Ref, slot_pre_color(i));
             pyre_color_for_semantic_local.push(post);
         }
+        // Function-arg locals: the body reads param `i` from the startblock
+        // inputarg's splice color, not from a walker-slot pairing — a param
+        // that is never STOREd has no surviving slot pairing ("most recent
+        // pairing wins" re-pins its Variable to the operand-stack slot it
+        // is pushed to), so `slot_pre_color` falls back to identity while
+        // `reserve_local_ref_colors_in_place` may have moved the inputarg
+        // off its `enforce_input_args` color.  Read the color straight off
+        // the inputarg Variable so the map matches the emitted body.
+        {
+            let startblock = graph.startblock.borrow();
+            let nargs = entry_arg_slots(code).min(nlocals as usize);
+            for (i, arg) in startblock.inputargs.iter().take(nargs).enumerate() {
+                let super::flow::FlowValue::Variable(v) = arg else {
+                    continue;
+                };
+                if let Some(&color) = splice_regallocs[Kind::Ref.index()].coloring.get(&v.id) {
+                    pyre_color_for_semantic_local[i] =
+                        super::regalloc::rename_lookup(&alloc_result.rename, Kind::Ref, color);
+                }
+            }
+        }
         // After step C the chordal coloring is free to coalesce
         // disjointly-live stack slots into the same color, so the full
         // map may legitimately repeat colors (e.g. `[1, 1, 2, 3, 4, 0,
@@ -8426,18 +8629,19 @@ impl CodeWriter {
         // pass writes into each `-live-` marker are already the
         // post-rename colors. `filter_liveness_in_place` then splits
         // them into live_i/live_r/live_f per assembler.py:150-152.
-        let (post_remove_live_indices, after_call_post_merge) = filter_liveness_in_place(
-            &mut ssarepr,
-            code,
-            &depth_at_pc,
-            &pyre_color_for_semantic_local,
-            &stack_slot_color_map,
-            portal_frame_reg,
-            portal_ec_reg,
-            walker_tracked_pc_live_indices_out.as_deref(),
-            walker_after_call_pc_indices_out.as_deref(),
-            true,
-        );
+        let (post_remove_live_indices, after_call_post_merge, first_insn_post_merge) =
+            filter_liveness_in_place(
+                &mut ssarepr,
+                code,
+                &depth_at_pc,
+                &pyre_color_for_semantic_local,
+                &stack_slot_color_map,
+                portal_frame_reg,
+                portal_ec_reg,
+                walker_tracked_pc_live_indices_out.as_deref(),
+                walker_after_call_pc_indices_out.as_deref(),
+                true,
+            );
         // Runtime entry/liveness lookups expect the byte offset of the
         // surviving `-live-` marker for each Python PC
         // (`jitcode.get_live_vars_info` first checks `code[pc] ==
@@ -8473,9 +8677,11 @@ impl CodeWriter {
             w_code,
             pc_map,
             after_call_post_merge,
+            first_insn_post_merge,
             depth_at_pc,
             portal_frame_reg,
             portal_ec_reg,
+            is_portal,
             has_abort,
             merge_point_pc,
             num_regs,
@@ -8512,9 +8718,11 @@ impl CodeWriter {
         w_code: *const (),
         pc_map: Vec<usize>,
         after_call_post_merge: Vec<Option<usize>>,
+        first_insn_post_merge: Vec<Option<usize>>,
         depth_at_pc: Vec<u16>,
         portal_frame_reg: u16,
         portal_ec_reg: u16,
+        is_portal: bool,
         has_abort: bool,
         merge_point_pc: Option<usize>,
         num_regs: super::assembler::NumRegs,
@@ -8554,8 +8762,14 @@ impl CodeWriter {
             .enumerate()
             .filter_map(|(py_pc, entry)| entry.map(|idx| (py_pc, idx)))
             .collect();
+        let first_insn_some: Vec<(usize, usize)> = first_insn_post_merge
+            .iter()
+            .enumerate()
+            .filter_map(|(py_pc, entry)| entry.map(|idx| (py_pc, idx)))
+            .collect();
         let mut combined_indices = pc_map.clone();
         combined_indices.extend(after_call_some.iter().map(|(_, idx)| *idx));
+        combined_indices.extend(first_insn_some.iter().map(|(_, idx)| *idx));
         let (jitcode, combined_bytes) = {
             let mut asm = self.assembler.borrow_mut();
             assembler.finish_with_positions_from(&mut *asm, ssarepr, &combined_indices, num_regs)
@@ -8564,6 +8778,13 @@ impl CodeWriter {
         let mut after_residual_call_resume_pc: Vec<Option<usize>> = vec![None; pc_map.len()];
         for (k, (py_pc, _)) in after_call_some.iter().enumerate() {
             after_residual_call_resume_pc[*py_pc] = Some(combined_bytes[pc_map.len() + k]);
+        }
+        // `usize::MAX` = the PC emitted no jitcode of its own (trivia /
+        // folded); see `PyJitCodeMetadata::first_jit_pc_by_py_pc`.
+        let mut first_jit_pc_by_py_pc: Vec<usize> = vec![usize::MAX; pc_map.len()];
+        let first_insn_base = pc_map.len() + after_call_some.len();
+        for (k, (py_pc, _)) in first_insn_some.iter().enumerate() {
+            first_jit_pc_by_py_pc[*py_pc] = combined_bytes[first_insn_base + k];
         }
 
         // call.py:148 `jd.mainjitcode.jitdriver_sd = jd`. RPython mutates
@@ -8590,9 +8811,11 @@ impl CodeWriter {
         let metadata = PyJitCodeMetadata {
             pc_map: pc_map_bytes,
             after_residual_call_resume_pc,
+            first_jit_pc_by_py_pc,
             depth_at_py_pc: depth_at_pc,
             portal_frame_reg,
             portal_ec_reg,
+            built_as_portal: is_portal,
             stack_base: frame_stack_base,
             stack_slot_color_map,
             pyre_color_for_semantic_local,
@@ -9895,18 +10118,19 @@ mod tests {
         let depth_at_pc: Vec<u16> = vec![0; code.instructions.len()];
         let local_color_map: Vec<u16> = (0..code.varnames.len() as u16).collect();
         let stack_slot_color_map: Vec<u16> = Vec::new();
-        let (post_remove_live_indices, _after_call_post_merge) = filter_liveness_in_place(
-            &mut ssarepr,
-            &code,
-            &depth_at_pc,
-            &local_color_map,
-            &stack_slot_color_map,
-            u16::MAX,
-            u16::MAX,
-            Some(&walker_tracked_pc_live_indices),
-            None,
-            false,
-        );
+        let (post_remove_live_indices, _after_call_post_merge, _first_insn_post_merge) =
+            filter_liveness_in_place(
+                &mut ssarepr,
+                &code,
+                &depth_at_pc,
+                &local_color_map,
+                &stack_slot_color_map,
+                u16::MAX,
+                u16::MAX,
+                Some(&walker_tracked_pc_live_indices),
+                None,
+                false,
+            );
 
         let live_idx = post_remove_live_indices[reachable_pc];
         let live_args = ssarepr.insns[live_idx]
@@ -9966,18 +10190,19 @@ mod tests {
         let depth_at_pc: Vec<u16> = vec![0; code.instructions.len()];
         let local_color_map: Vec<u16> = (0..code.varnames.len() as u16).collect();
         let stack_slot_color_map: Vec<u16> = Vec::new();
-        let (post_remove_live_indices, _after_call_post_merge) = filter_liveness_in_place(
-            &mut ssarepr,
-            &code,
-            &depth_at_pc,
-            &local_color_map,
-            &stack_slot_color_map,
-            u16::MAX,
-            u16::MAX,
-            Some(&walker_tracked_pc_live_indices),
-            None,
-            true,
-        );
+        let (post_remove_live_indices, _after_call_post_merge, _first_insn_post_merge) =
+            filter_liveness_in_place(
+                &mut ssarepr,
+                &code,
+                &depth_at_pc,
+                &local_color_map,
+                &stack_slot_color_map,
+                u16::MAX,
+                u16::MAX,
+                Some(&walker_tracked_pc_live_indices),
+                None,
+                true,
+            );
 
         let live_idx = post_remove_live_indices[reachable_pc];
         let live_args = ssarepr.insns[live_idx]

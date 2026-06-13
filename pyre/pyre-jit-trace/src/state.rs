@@ -795,6 +795,131 @@ pub fn pyjitcode_for_code(code: *const ()) -> Option<std::sync::Arc<crate::PyJit
     })
 }
 
+/// Build a `SubJitCodeBody` view over the callee per-fn JitCode for a
+/// W_CodeObject, building+installing it on demand (`jitcode_for`) when the
+/// lazy per-fn build has not run yet.  Used by full-body-walk call inlining
+/// to obtain a sub-walk body for a runtime callable's code.
+///
+/// The `Arc<PyJitCode>` is held for the program lifetime in the append-only
+/// `MetaInterpStaticData.jitcodes` store (warmspot.py:282) and its bytecode /
+/// constant pools are immutable after build, so extending those slices to
+/// `'static` is sound — the same justification as the per-fn arm-entry borrow
+/// extension at `trace.rs:363` / `trace_opcode.rs:6735`.  Returns `None` when
+/// the code is null or the on-demand build did not install a payload.
+pub(crate) fn sub_jitcode_body_for_code(
+    code: *const (),
+) -> Option<crate::jitcode_dispatch::SubJitCodeBody> {
+    if code.is_null() {
+        return None;
+    }
+    if jitcode_for(code).is_null() {
+        return None;
+    }
+    let pjc = pyjitcode_for_code(code)?;
+    let jc = &pjc.jitcode;
+    // SAFETY: the payload lives for the program in the append-only jitcodes
+    // store (a second Arc keeps the allocation alive after this local clone
+    // drops); the pools are immutable post-build.
+    Some(unsafe {
+        crate::jitcode_dispatch::SubJitCodeBody {
+            code: &*(jc.code.as_slice() as *const [u8]),
+            num_regs_r: jc.num_regs_r() as usize,
+            num_regs_i: jc.num_regs_i() as usize,
+            num_regs_f: jc.num_regs_f() as usize,
+            constants_i: &*(jc.constants_i.as_slice() as *const [i64]),
+            constants_r: &*(jc.constants_r.as_slice() as *const [i64]),
+            constants_f: &*(jc.constants_f.as_slice() as *const [i64]),
+        }
+    })
+}
+
+/// Post-regalloc Ref-bank colors of the callee's Python-semantic local
+/// slots (`metadata.pyre_color_for_semantic_local`).  Used by full-body-walk
+/// call inlining to seed positional args at the registers the callee body
+/// actually reads its params from — the canonical splice regalloc does not
+/// pin local-i inputargs to identity colors, so `r0..nparams` seeding reads
+/// the wrong bank slots.  `None` when no payload is installed for `code`.
+pub(crate) fn sub_jitcode_param_colors_for_code(code: *const ()) -> Option<Vec<u16>> {
+    if code.is_null() {
+        return None;
+    }
+    let pjc = pyjitcode_for_code(code)?;
+    Some(pjc.metadata.pyre_color_for_semantic_local.clone())
+}
+
+pub(crate) type SubDescrPool = (
+    &'static [DescrRef],
+    &'static [majit_metainterp::jitcode::RuntimeBhDescr],
+    &'static crate::jitcode_dispatch::SubJitCodeLookup,
+);
+
+/// Build (memoized on the payload itself) the per-fn descr pool a callee body
+/// needs when inlined by full-body-walk call inlining: its OWN adapted
+/// `descr_refs` + raw `RuntimeBhDescr` slice (for `RawDescrPool::PerFn`) +
+/// `sub_jitcode_lookup`.  Mirror of the top-level diagnostic walk's per-fn
+/// descr-pool construction (`trace.rs:363-400`, task #50): a callee body's
+/// `d`/`j` descr operands index its OWN `exec.descrs`, not the caller's pool.
+///
+/// The pool lives on `PyJitCodePayload.sub_descr_pool`, not in a side table
+/// keyed by object identity: RPython has no such table — the active MIFrame's
+/// JitCode carries its descriptors directly — and an identity-keyed cache
+/// would survive `PyJitCode::replace_with`, which refills the body in place
+/// under the same outer allocation (an in-place refill overwrites the inner
+/// `exec.descrs` the pool borrows). Carried on the payload, the pool is
+/// dropped by the same `replace_with` that invalidates its borrows.
+///
+/// The returned slices are `'static` because the payload lives for the
+/// program in the append-only `MetaInterpStaticData.jitcodes` store
+/// (warmspot.py:282) — the same justification as `sub_jitcode_body_for_code`
+/// below; the adapted `descr_refs` Vec and the lookup closure are leaked once
+/// per distinct callee body (bounded by the program's callable count ×
+/// refinements, not per trace attempt). `'static` coerces to the walker's
+/// `'static_a`.
+pub(crate) fn sub_jitcode_descr_pool_for_code(code: *const ()) -> Option<SubDescrPool> {
+    use majit_metainterp::jitcode::RuntimeBhDescr;
+    if code.is_null() || jitcode_for(code).is_null() {
+        return None;
+    }
+    let pjc = pyjitcode_for_code(code)?;
+    Some(*pjc.sub_descr_pool.get_or_init(|| {
+        // SAFETY: the borrow is valid for `'static` because the payload is
+        // retained for the program lifetime by the append-only
+        // `MetaInterpStaticData.jitcodes` store, and `exec.descrs` is
+        // immutable post-build. The one mutation path, `replace_with`,
+        // replaces this `OnceCell` together with the body, so the pool can
+        // never be returned for a body other than the one it was built from.
+        let perfn_descrs: &'static [RuntimeBhDescr] =
+            unsafe { &*(pjc.jitcode.exec.descrs.as_slice() as *const [RuntimeBhDescr]) };
+        let descr_refs: Vec<DescrRef> = perfn_descrs
+            .iter()
+            .enumerate()
+            .map(|(i, d)| match d {
+                RuntimeBhDescr::Descr(bh) => crate::descr::make_descr_from_bh(bh),
+                RuntimeBhDescr::JitCode(_)
+                | RuntimeBhDescr::Call(_)
+                | RuntimeBhDescr::AssemblerToken(_) => crate::descr::make_jitcode_descr(i),
+            })
+            .collect();
+        let descr_refs: &'static [DescrRef] = Box::leak(descr_refs.into_boxed_slice());
+        let lookup: Box<crate::jitcode_dispatch::SubJitCodeLookup> = Box::new(move |idx: usize| {
+            perfn_descrs
+                .get(idx)
+                .and_then(|d| d.as_jitcode())
+                .map(|jc| crate::jitcode_dispatch::SubJitCodeBody {
+                    code: jc.code.as_slice(),
+                    num_regs_r: jc.num_regs_r() as usize,
+                    num_regs_i: jc.num_regs_i() as usize,
+                    num_regs_f: jc.num_regs_f() as usize,
+                    constants_i: jc.constants_i.as_slice(),
+                    constants_r: jc.constants_r.as_slice(),
+                    constants_f: jc.constants_f.as_slice(),
+                })
+        });
+        let lookup: &'static crate::jitcode_dispatch::SubJitCodeLookup = Box::leak(lookup);
+        (descr_refs, perfn_descrs, lookup)
+    }))
+}
+
 /// `resume.py:1049` `consume_one_section` → `enumerate_vars` parity:
 /// return the number of tagged values encoded for a frame at
 /// (jitcode_index, pc).
@@ -2831,6 +2956,133 @@ pub(crate) fn module_dict_cell_value_direct(obj: PyObjectRef, slot: usize) -> Op
 /// virtualizable slot level.
 pub(crate) fn concrete_virtualizable_slot_type(_value: PyObjectRef) -> Type {
     Type::Ref
+}
+
+/// pyjitpl.py:3048-3091 `raise_continue_running_normally` parity for the
+/// authoritative full-body walk.  The walk concretely executed the traced
+/// region's residual calls, so a walk end that returns control to the
+/// interpreter must hand back the END-of-walk frame state — the same
+/// contract the guard-failure blackhole writeback satisfies
+/// (`handle_jitexception` re-enters `eval_loop_jit` from the frame's own
+/// `last_instr`).  Without this the interpreter (or a freshly entered
+/// compiled loop, whose preamble reloads vable fields from the heap)
+/// re-runs the walked region from its START state, re-applying every
+/// concretely executed side effect.
+///
+/// Writes every live `locals_cells_stack_w` slot from the virtualizable
+/// shadow's concrete half (`virtualizable_entry_at` — the value half of
+/// the Box pair the authoritative walk maintains), `valuestackdepth` =
+/// the `LiveVars` forward-stack-analysis depth at the merge point (the
+/// same `depth_at_py_pc` derivation the portal-bridge encoder/decoder
+/// pair consumes — the symbolic vsd mirror can go stale, see
+/// `portal_bridge_vable_vsd`), and `last_instr = resume_py_pc - 1` so
+/// `next_instr()` re-enters at the merge point.  A bridge walk enters at
+/// a guard pc whose stack depth differs from the merge point's, so the
+/// depth must come from the analysis, not from the frame's entry value.
+///
+/// All-or-nothing: returns false (frame untouched) when any live slot
+/// lacks a shadow entry, when the depth analysis has no entry for the
+/// merge pc, or when the walked region net-changed the frame's block
+/// chain (`lastblock` — the flush writes only locals/stack/vsd/
+/// last_instr, so a block push/pop inside the walked region would leave
+/// the adopted frame's chain inconsistent with its pc).  The caller then
+/// keeps the legacy replay-from-start behavior.
+pub(crate) fn flush_walk_end_state_to_frame(
+    ctx: &TraceCtx,
+    frame: usize,
+    resume_py_pc: usize,
+) -> bool {
+    if frame == 0 {
+        return false;
+    }
+    let Some(nlocals) = concrete_nlocals(frame) else {
+        return false;
+    };
+    let Some(info) = ctx.virtualizable_info() else {
+        return false;
+    };
+    // Stack depth at the merge point from the cached forward analysis
+    // (mirror of `canonical_bridge::install_portal_for`'s derivation:
+    // absolute vsd = stack_base + depth, stack_base = nlocals + ncells
+    // = `concrete_nlocals`).
+    let frame_ptr = frame as *const u8;
+    let w_code =
+        unsafe { *(frame_ptr.add(crate::frame_layout::PYFRAME_PYCODE_OFFSET) as *const *const ()) };
+    if w_code.is_null() {
+        return false;
+    }
+    let raw_code = unsafe {
+        pyre_interpreter::w_code_get_ptr(w_code as PyObjectRef)
+            as *const pyre_interpreter::CodeObject
+    };
+    let Some(depth) = crate::liveness::liveness_for(raw_code)
+        .depth_at_py_pc()
+        .get(resume_py_pc)
+        .copied()
+    else {
+        return false;
+    };
+    let end_vsd = nlocals + depth as usize;
+    let live = end_vsd.max(nlocals);
+    let base = info.num_static_extra_boxes;
+    // Block-chain net-change check: the shadow's `lastblock` static box
+    // still holds the entry chain head iff the walk pushed/popped no
+    // blocks (a balanced push+pop allocates a fresh head and also
+    // declines — conservative).
+    let lastblock_static = info
+        .static_fields
+        .iter()
+        .position(|f| f.name == "lastblock");
+    let Some(lastblock_idx) = lastblock_static else {
+        return false;
+    };
+    let Some((_opref, shadow_lastblock)) = ctx.virtualizable_entry_at(lastblock_idx) else {
+        return false;
+    };
+    let frame_lastblock = unsafe { *(frame_ptr.add(PYFRAME_LASTBLOCK_OFFSET) as *const usize) };
+    match shadow_lastblock {
+        Value::Ref(r) => {
+            if r.0 != frame_lastblock {
+                return false;
+            }
+        }
+        _ => return false,
+    }
+    // Validation pass first: it allocates nothing, so entry presence
+    // cannot change under it.  Commit only when every live slot resolves.
+    for abs in 0..live {
+        if ctx.virtualizable_entry_at(base + abs).is_none() {
+            return false;
+        }
+    }
+    let arr_ptr = unsafe {
+        *(frame_ptr.add(PYFRAME_LOCALS_CELLS_STACK_OFFSET)
+            as *const *mut pyre_object::FixedObjectArray)
+    };
+    if arr_ptr.is_null() || unsafe { &*arr_ptr }.as_slice().len() < live {
+        return false;
+    }
+    // Commit one slot at a time, re-reading the shadow entry per slot:
+    // boxing an Int/Float slot allocates and may trigger a minor
+    // collection, which moves nursery objects — the trace-ctx forwarding
+    // hook keeps the shadow entries current, and each already-written
+    // slot is reachable from the (rooted) frame, so neither side goes
+    // stale across the loop.
+    for abs in 0..live {
+        let Some((_opref, value)) = ctx.virtualizable_entry_at(base + abs) else {
+            return false;
+        };
+        let boxed = boxed_slot_value_for_type(Type::Ref, &value);
+        unsafe {
+            (*arr_ptr).as_mut_slice()[abs] = boxed;
+        }
+    }
+    unsafe {
+        let pf = &mut *(frame as *mut PyFrame);
+        pf.valuestackdepth = end_vsd;
+        pf.last_instr = resume_py_pc as isize - 1;
+    }
+    true
 }
 
 pub(crate) fn looks_like_heap_ref(value: PyObjectRef) -> bool {
@@ -10296,9 +10548,11 @@ mod tests {
             crate::PyJitCodeMetadata {
                 pc_map: vec![0],
                 after_residual_call_resume_pc: vec![None],
+                first_jit_pc_by_py_pc: vec![0],
                 depth_at_py_pc: vec![2],
                 portal_frame_reg: 0,
                 portal_ec_reg: 0,
+                built_as_portal: true,
                 stack_base: 1,
                 stack_slot_color_map: Vec::new(),
                 pyre_color_for_semantic_local: Vec::new(),

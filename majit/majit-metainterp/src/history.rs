@@ -469,6 +469,16 @@ impl TreeLoop {
             } else {
                 // No pool constant available: fall back to new inputarg.
                 let tp = self.inputargs[r.raw() as usize].tp;
+                if crate::majit_log_enabled() {
+                    eprintln!(
+                        "[jit][cut-escape] original inputarg {:?} (tp={:?}) not in \
+                         original_boxes and no pool constant — appended as extra \
+                         inputarg #{}",
+                        r,
+                        tp,
+                        new_ia_boxes.len(),
+                    );
+                }
                 remap.insert(r, OpRef::input_arg_typed(new_ia_boxes.len() as u32, tp));
                 new_ia_boxes.push(r);
                 new_ia_types.push(tp);
@@ -2132,6 +2142,13 @@ impl TraceCtx {
         self.recorder.set_last_op_resume_position(snapshot_id);
     }
 
+    /// Set rd_resume_position on the most-recently recorded *guard* op,
+    /// skipping any non-guard ops recorded after it (see
+    /// [`crate::recorder::Trace::set_last_guard_op_resume_position`]).
+    pub fn set_last_guard_op_resume_position(&mut self, snapshot_id: i32) {
+        self.recorder.set_last_guard_op_resume_position(snapshot_id);
+    }
+
     /// TODO: low-level / single-frame snapshot helper
     /// used by callers that record guards without a populated framestack
     /// to walk.
@@ -2220,6 +2237,32 @@ impl TraceCtx {
             vref_boxes: vref_boxes.to_vec(),
         });
         self.set_last_guard_resume_position(snapshot_id);
+    }
+
+    /// Like [`capture_snapshot_for_last_guard_with_vable_vref`] but stamps
+    /// the resume position on the most-recent *guard* op rather than the
+    /// last recorded op.  Used when a guard is emitted inside a helper
+    /// (the `_nonstandard_virtualizable` PTR_EQ promote) that records
+    /// further non-guard ops before the caller can capture.
+    pub fn capture_snapshot_for_last_guard_op_with_vable_vref(
+        &mut self,
+        active_boxes: &[OpRef],
+        jitcode_index: u32,
+        pc: u32,
+        vable_boxes: &[crate::recorder::SnapshotTagged],
+        vref_boxes: &[crate::recorder::SnapshotTagged],
+    ) {
+        let boxes = self.encode_snapshot_boxes(active_boxes);
+        let snapshot_id = self.capture_resumedata(crate::recorder::Snapshot {
+            frames: vec![crate::recorder::SnapshotFrame {
+                jitcode_index,
+                pc,
+                boxes,
+            }],
+            vable_boxes: vable_boxes.to_vec(),
+            vref_boxes: vref_boxes.to_vec(),
+        });
+        self.set_last_guard_op_resume_position(snapshot_id);
     }
 
     /// Multi-frame variant of [`capture_snapshot_for_last_guard`].
