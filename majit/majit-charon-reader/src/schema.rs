@@ -34,12 +34,19 @@ pub struct Translated {
     /// `SemanticProgram.known_trait_names`.
     #[serde(default)]
     pub trait_decls: Vec<Option<crate::ullbc::TraitDecl>>,
-    /// `trait_impls`, `ordered_decls`, `files`, `options`,
-    /// `target_information`, `item_names`, `assoc_item_names`,
-    /// `short_names` — kept opaque until a driver pass needs them.
-    /// Charon's release-to-release renames of these surfaces are the
-    /// most common source of schema drift; staying opaque here means
-    /// a Charon bump does not require recompiling this crate.
-    #[serde(flatten)]
-    pub rest: std::collections::BTreeMap<String, Value>,
+    /// `impl Trait for T` table, indexed by trait-impl id. Kept as raw
+    /// `Value` entries and projected on demand (see
+    /// [`crate::Llbc::trait_impls_raw`]).  Read by the front-end's
+    /// trait-associated-type resolution.
+    ///
+    /// Every other top-level surface Charon emits (`ordered_decls`,
+    /// `files`, `options`, `target_information`, `item_names`,
+    /// `assoc_item_names`, `short_names`, …) is intentionally not
+    /// modelled: serde skips unknown fields without allocating, which
+    /// both keeps the loader resilient to Charon's release-to-release
+    /// renames *and* avoids materialising the whole document as a
+    /// `serde(flatten)` catch-all (the latter forces serde to buffer
+    /// the entire `translated` object into an in-memory `Content` tree).
+    #[serde(default)]
+    pub trait_impls: Vec<Value>,
 }

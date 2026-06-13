@@ -839,6 +839,16 @@ pub fn getitem(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
         if is_range_iter(obj) {
             return getitem_range_iter(obj, index);
         }
+        // descroperation.py:356-381 DescrOperation.getitem — any object
+        // whose type defines `__getitem__` on its MRO is subscriptable
+        // (the arms above are fast paths for builtin sequence/mapping
+        // types).  Covers W_Root types like `re.Match` whose typedef
+        // registers `__getitem__`.
+        if let Some(w_type) = crate::typedef::r#type(obj) {
+            if let Some(method) = lookup_in_type_where(w_type, "__getitem__") {
+                return get_and_call_function(method, obj, w_type, &[index]);
+            }
+        }
         Err(PyError::type_error(format!(
             "'{}' object is not subscriptable",
             (*(*obj).ob_type).name,
@@ -1015,17 +1025,17 @@ unsafe fn getitem_type(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     // so an ordinary class still takes the `__class_getitem__` path below.
     if let Some(w_meta) = crate::typedef::r#type(obj) {
         if let Some(method) = lookup_in_type_where(w_meta, "__getitem__") {
-            return crate::call::call_function_impl_result(method, &[obj, index]);
+            return get_and_call_function(method, obj, w_meta, &[index]);
         }
     }
     // Python 3.9+ generic subscript: type[X] → __class_getitem__(X)
     // typeobject.py type.__class_getitem__
     if let Some(method) = lookup_in_type_where(obj, "__class_getitem__") {
-        let result = crate::call_function(method, &[obj, index]);
+        let result = get_and_call_function(method, obj, obj, &[index]);
         // Fallback if the user-defined __class_getitem__ raised
         // a stub error or returned NULL — return the type so
         // `class Foo(Generic[T]): pass` keeps working.
-        if !result.is_null() {
+        if let Ok(result) = result {
             return Ok(result);
         }
     }
@@ -1036,8 +1046,9 @@ unsafe fn getitem_type(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
 #[inline(never)]
 unsafe fn getitem_instance(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     // descroperation.py __getitem__
-    if let Some(method) = lookup_in_type_where(w_instance_get_type(obj), "__getitem__") {
-        return crate::call::call_function_impl_result(method, &[obj, index]);
+    let w_type = w_instance_get_type(obj);
+    if let Some(method) = lookup_in_type_where(w_type, "__getitem__") {
+        return get_and_call_function(method, obj, w_type, &[index]);
     }
     Err(PyError::type_error(format!(
         "'{}' object is not subscriptable",
@@ -1710,6 +1721,11 @@ thread_local! {
 /// it to call `_obj_getdict`. pyre dispatches at runtime via the type's
 /// hasdict flag because Rust has no per-class virtual table.
 pub fn getdict(obj: PyObjectRef) -> PyObjectRef {
+    // exceptions/interp_exceptions.py:222-225 W_BaseException.getdict
+    // override — lazily allocates the instance dict on the typed slot.
+    if unsafe { pyre_object::is_exception(obj) } {
+        return unsafe { pyre_object::excobject::w_exception_getdict(obj) };
+    }
     let w_type = match crate::typedef::r#type(obj) {
         Some(tp) => tp,
         None => return pyre_object::PY_NULL,
@@ -1734,6 +1750,19 @@ pub fn getdict(obj: PyObjectRef) -> PyObjectRef {
 /// objspace/std/mapdict.py:820-821 MapdictDictSupport.setdict overrides
 /// it to call `_obj_setdict`.
 pub fn setdict(obj: PyObjectRef, w_dict: PyObjectRef) -> Result<(), PyError> {
+    // exceptions/interp_exceptions.py:227-231 W_BaseException.setdict
+    // override — validates the value is a dict, then writes the slot.
+    // `space.isinstance_w(w_dict, space.w_dict)` accepts dict subclasses.
+    if unsafe { pyre_object::is_exception(obj) } {
+        let w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
+        if !unsafe { isinstance_w(w_dict, w_dict_type) } {
+            return Err(PyError::type_error(
+                "setting exceptions's dictionary to a non-dict".to_string(),
+            ));
+        }
+        unsafe { pyre_object::excobject::w_exception_setdict(obj, w_dict) };
+        return Ok(());
+    }
     let w_type = match crate::typedef::r#type(obj) {
         Some(tp) => tp,
         None => {
@@ -1751,6 +1780,23 @@ pub fn setdict(obj: PyObjectRef, w_dict: PyObjectRef) -> Result<(), PyError> {
             tp_name,
         )))
     }
+}
+
+/// `space.finditem_str`-shaped resolution for raw dict ops on a
+/// `getdict` result.  Upstream dict-subclass instances are dict-layout
+/// `W_DictMultiObject`, so `finditem_str`/`setitem_str` strategy
+/// dispatch works on them directly; pyre dict-subclass instances are
+/// `__dict_data__`-composed W_InstanceObject (typedef.rs
+/// dict_descr_new), so the `w_dict_*` layout accessors must target the
+/// backing dict.  Plain dicts, module dicts and mapdict views pass
+/// through unchanged.  The `__dict__` getter keeps returning the
+/// stored object itself (identity), so it reads `getdict` directly.
+fn getdict_backing(obj: PyObjectRef) -> PyObjectRef {
+    let w_dict = getdict(obj);
+    if w_dict.is_null() {
+        return w_dict;
+    }
+    crate::type_methods::resolve_dict_backing(w_dict)
 }
 
 /// interpreter/baseobjspace.py:142-143 W_Root.getweakref().
@@ -2183,14 +2229,11 @@ pub fn getattr_str(obj: PyObjectRef, name: &str) -> PyResult {
                 "fset" => return Ok(w_property_get_fset(obj)),
                 "fdel" => return Ok(w_property_get_fdel(obj)),
                 "__doc__" => {
-                    // Try INSTANCE_DICT first (set via property.__doc__ = "...")
-                    let w_dict = crate::objspace::std::mapdict::_obj_getdict(obj);
-                    if let Some(v) =
-                        pyre_object::w_dict_lookup(w_dict, pyre_object::w_str_new("__doc__"))
-                    {
-                        return Ok(v);
-                    }
-                    return Ok(w_none());
+                    // descriptor.py:316-318 `__doc__ = GetSetProperty(
+                    // W_Property.get_doc, W_Property.set_doc)` → :249-250
+                    // get_doc returns the `w_doc` slot.
+                    let stored = pyre_object::propertyobject::w_property_get_doc(obj);
+                    return Ok(if stored.is_null() { w_none() } else { stored });
                 }
                 _ => {}
             }
@@ -2316,7 +2359,7 @@ pub fn getattr_str(obj: PyObjectRef, name: &str) -> PyResult {
             // MapDictStrategy view whose getitem_str reads the map
             // (getdictvalue, mapdict.py:846-847; MapDictStrategy.getitem_str
             // delegates there, mapdict.py:1168-1175).
-            let w_dict = getdict(obj);
+            let w_dict = getdict_backing(obj);
             if !w_dict.is_null() {
                 if let Some(value) = pyre_object::w_dict_getitem_str(w_dict, name) {
                     return Ok(value);
@@ -2470,7 +2513,7 @@ pub(crate) unsafe fn object_getattribute_surrogate(
         // Instance: the instance `__dict__` first (a surrogate can never
         // be a data descriptor), then the class attribute via the type
         // MRO.
-        let w_dict = getdict(obj);
+        let w_dict = getdict_backing(obj);
         if !w_dict.is_null() {
             if let Some(v) = pyre_object::w_dict_lookup(w_dict, w_name) {
                 if !v.is_null() {
@@ -2640,7 +2683,7 @@ pub(crate) unsafe fn object_delattr_surrogate(
             }
             return Err(attr_error_wtf8(obj, name));
         }
-        let w_dict = getdict(obj);
+        let w_dict = getdict_backing(obj);
         if !w_dict.is_null() && pyre_object::w_dict_delitem(w_dict, w_name) {
             return Ok(w_none());
         }
@@ -2685,7 +2728,7 @@ pub fn object_getattribute(obj: PyObjectRef, name: &str) -> PyResult {
             // Instance dict is the sole authority for instance attributes
             // (mapdict map+storage via the MapDictStrategy view); no
             // ATTR_TABLE fallback (mapdict.py:846-847, 1168-1175).
-            let w_dict = getdict(obj);
+            let w_dict = getdict_backing(obj);
             if !w_dict.is_null() {
                 if let Some(value) = pyre_object::w_dict_getitem_str(w_dict, name) {
                     return Ok(value);
@@ -2935,7 +2978,7 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str) -> PyResult {
     // Check the live W_DictObject (functions are hasdict per typedef.py:735
     // __dict__ = getset_func_dict) before falling through to legacy ATTR_TABLE.
     if unsafe { crate::is_function(obj) } {
-        let w_dict = getdict(obj);
+        let w_dict = getdict_backing(obj);
         if !w_dict.is_null() {
             if let Some(v) = unsafe { pyre_object::w_dict_getitem_str(w_dict, name) } {
                 return Ok(v);
@@ -3041,38 +3084,24 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str) -> PyResult {
                     // Pyre stores the eager dict on the typed
                     // `Function.w_ann` slot via
                     // `function_set_annotations` at MAKE_FUNCTION
-                    // ANNOTATIONS time (eval.rs).  PEP 649 lazy
-                    // annotations (`MakeFunctionFlag::Annotate`,
-                    // default in the RustPython compiler) keep a
-                    // `__annotate_func__` callable in ATTR_TABLE that
-                    // we invoke with `format=1` to materialise the
-                    // dict; the result is stamped onto `w_ann` to
-                    // freeze identity for subsequent reads.
-                    let raw = unsafe { (*(obj as *mut crate::function::Function)).w_ann };
-                    if !raw.is_null() {
-                        return Ok(raw);
-                    }
-                    let annotate_fn = ATTR_TABLE.with(|table| {
-                        let table = table.borrow();
-                        let entry = table.get(&(obj as usize))?;
-                        entry
-                            .get("__annotate_func__")
-                            .copied()
-                            .or_else(|| entry.get("__annotate__").copied())
-                    });
-                    if let Some(annotate_fn) = annotate_fn {
-                        if !annotate_fn.is_null() && !is_none(annotate_fn) {
-                            let dict = crate::call_function(annotate_fn, &[w_int_new(1)]);
-                            unsafe {
-                                crate::function::function_set_annotations(obj, dict);
-                            }
-                            return Ok(dict);
-                        }
-                    }
-                    // Lazy-fill via the helper so the slot is stamped
-                    // and `f.__annotations__ is f.__annotations__`
+                    // ANNOTATIONS time (eval.rs); PEP 649 lazy
+                    // annotations keep the `__annotate__` callable on
+                    // the typed `Function.w_annotate` slot.  The
+                    // helper resolves both forms and stamps `w_ann`
+                    // so `f.__annotations__ is f.__annotations__`
                     // identity holds across reads.
                     return Ok(unsafe { crate::function::function_get_annotations(obj) });
+                }
+                "__annotate__" => {
+                    // PEP 649 `func_annotate` surface: the stored
+                    // callable, or None when annotations were eager or
+                    // absent.
+                    let annotate_fn =
+                        unsafe { (*(obj as *mut crate::function::Function)).w_annotate };
+                    if !annotate_fn.is_null() {
+                        return Ok(annotate_fn);
+                    }
+                    return Ok(w_none());
                 }
                 _ => {}
             }
@@ -3146,6 +3175,15 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str) -> PyResult {
         || name == "__wrapped__"
         || name == "__annotations__"
     {
+        // baseobjspace.py:46-50 W_Root.getdictvalue — consult the
+        // instance dict (exception `w_dict` slot, hasdict objects)
+        // before the legacy fallbacks.
+        let w_dict = getdict_backing(obj);
+        if !w_dict.is_null() {
+            if let Some(value) = unsafe { pyre_object::w_dict_getitem_str(w_dict, name) } {
+                return Ok(value);
+            }
+        }
         // Check ATTR_TABLE first, then return None as default
         let found = ATTR_TABLE.with(|table| {
             let table = table.borrow();
@@ -3455,7 +3493,7 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str) -> PyResult {
     // `descr__getattribute__` uses at descroperation.py:50). This is the
     // second half of the "hasdict instance dict" protocol and must fire
     // before the legacy `ATTR_TABLE` fallback.
-    let w_dict = getdict(obj);
+    let w_dict = getdict_backing(obj);
     if !w_dict.is_null() {
         if let Some(value) = unsafe { pyre_object::w_dict_getitem_str(w_dict, name) } {
             return Ok(value);
@@ -4067,16 +4105,15 @@ pub(crate) unsafe fn lookup_in_type_wtf8(w_type: PyObjectRef, name: &Wtf8) -> Op
 /// space; pyre is single-space, so a thread-local singleton stands in
 /// (the role the dict-strategy `space.fromcache` singletons already
 /// play).  `versions[h]` is the `version_tag()` the slot was filled
-/// under (`0` = empty), `names[h]` the looked-up name, `values[h]` the
-/// cached result.  PyPy caches the `lookup_where` tuple `(w_class,
-/// w_value)`; `lookup_in_type_where` is value-only (no caller consumes
-/// the `w_class` half), so only `w_value` is materialised — a null
-/// `values[h]` on a valid `(version, name)` entry is the cached negative
-/// result (`_lookup_where_all_typeobjects` returned not-found).
+/// under (`0` = empty), `names[h]` the looked-up name, `lookup_where[h]`
+/// the cached `(w_class, w_value)` pair from the MRO walk — a
+/// `(null, null)` pair on a valid `(version, name)` entry is the cached
+/// negative result (`_lookup_where_all_typeobjects` returned
+/// `(None, None)`).
 struct MethodCache {
     versions: Vec<u64>,
     names: Vec<Option<String>>,
-    values: Vec<PyObjectRef>,
+    lookup_where: Vec<(PyObjectRef, PyObjectRef)>,
 }
 
 /// `space.config.objspace.std.methodcachesizeexp` default.
@@ -4087,7 +4124,7 @@ thread_local! {
     static METHOD_CACHE: std::cell::RefCell<MethodCache> = std::cell::RefCell::new(MethodCache {
         versions: vec![0u64; METHOD_CACHE_SIZE],
         names: vec![None; METHOD_CACHE_SIZE],
-        values: vec![std::ptr::null_mut(); METHOD_CACHE_SIZE],
+        lookup_where: vec![(std::ptr::null_mut(), std::ptr::null_mut()); METHOD_CACHE_SIZE],
     });
 }
 
@@ -4169,28 +4206,47 @@ pub unsafe fn _pure_lookup_where_with_method_cache(
     version_tag: u64,
 ) -> PyObjectRef {
     let name = pyre_object::strobject::w_str_get_value(w_name);
+    // PyPy's elidable returns the cached `(w_class, w_value)` tuple
+    // object; the residual-call ABI here carries one raw register, so
+    // the elidable surface projects the `w_value` half.  Callers that
+    // need the defining class go through the interpreter front door
+    // `lookup_where_with_method_cache`, which reads the same cache
+    // entry.
+    _cached_lookup_where(w_type, name, version_tag).1
+}
+
+/// The `MethodCache` probe/fill shared by the `@elidable` JIT surface
+/// and the interpreter front door.  Probes the `(version_tag, name)`
+/// slot; on a miss runs the raw MRO walk (`typeobject.py:478-489
+/// _lookup_where_all_typeobjects`) and fills the slot with the
+/// `(w_class, w_value)` pair (`typeobject.py:545-549`).
+unsafe fn _cached_lookup_where(
+    w_type: PyObjectRef,
+    name: &str,
+    version_tag: u64,
+) -> (PyObjectRef, PyObjectRef) {
     let h = method_hash(version_tag, name);
     // Probe without holding the borrow across the MRO walk below.
     let hit = METHOD_CACHE.with(|c| {
         let cache = c.borrow();
         if cache.versions[h] == version_tag && cache.names[h].as_deref() == Some(name) {
-            // A valid entry with a null value is the cached negative result.
-            Some(cache.values[h])
+            // A valid entry with null pointers is the cached negative result.
+            Some(cache.lookup_where[h])
         } else {
             None
         }
     });
-    if let Some(v) = hit {
-        return v;
+    if let Some(tup) = hit {
+        return tup;
     }
-    let v = lookup_in_type_where_uncached(w_type, name).unwrap_or(std::ptr::null_mut());
+    let tup = lookup_where(w_type, name).unwrap_or((std::ptr::null_mut(), std::ptr::null_mut()));
     METHOD_CACHE.with(|c| {
         let mut cache = c.borrow_mut();
         cache.versions[h] = version_tag;
         cache.names[h] = Some(name.to_string());
-        cache.values[h] = v;
+        cache.lookup_where[h] = tup;
     });
-    v
+    tup
 }
 
 /// Forward every cached `values[h]` slot during collection — the
@@ -4209,11 +4265,13 @@ pub unsafe fn _pure_lookup_where_with_method_cache(
 pub(crate) unsafe fn walk_method_cache_gc(forward: &mut dyn FnMut(&mut PyObjectRef)) {
     METHOD_CACHE.with(|c| {
         let mut cache = c.borrow_mut();
-        for slot in cache.values.iter_mut() {
-            if slot.is_null() {
-                // Empty / negative-cache slot: nothing to forward.
-            } else {
-                forward(slot);
+        for (w_class, w_value) in cache.lookup_where.iter_mut() {
+            // Empty / negative-cache slots hold nulls: nothing to forward.
+            if !w_class.is_null() {
+                forward(w_class);
+            }
+            if !w_value.is_null() {
+                forward(w_value);
             }
         }
     });
@@ -4222,19 +4280,49 @@ pub(crate) unsafe fn walk_method_cache_gc(forward: &mut dyn FnMut(&mut PyObjectR
 /// `typeobject.py:503-514 lookup_where_with_method_cache` — the method
 /// cache front door.  One path for interpreter and JIT (PyPy branches
 /// only on `version_tag is None`, never on `we_are_jitted()`): promote
-/// the type and its `version_tag`, then route through the `@elidable`
-/// `_pure_lookup_where_with_method_cache` so the trace folds the
-/// `(version_tag, name)`-keyed lookup to a constant while the interpreter
-/// consults the `MethodCache`.
-pub(crate) unsafe fn lookup_in_type_where(w_type: PyObjectRef, name: &str) -> Option<PyObjectRef> {
+/// the type and its `version_tag`, then consult the
+/// `(version_tag, name)`-keyed `MethodCache` for the `(w_class,
+/// w_value)` pair.  pyre's type namespaces hold plain values (no
+/// `MutableCell` strategy yet), so the `typeobject.py:511-513
+/// unwrap_cell` boundary has nothing to unwrap.
+pub(crate) unsafe fn lookup_where_with_method_cache(
+    w_type: PyObjectRef,
+    name: &str,
+) -> Option<(PyObjectRef, PyObjectRef)> {
     if w_type.is_null() || !is_type(w_type) {
-        return lookup_in_type_where_uncached(w_type, name);
+        return lookup_where(w_type, name);
     }
     // typeobject.py:505 — `promote(self)`.
     let _ = majit_metainterp::jit::promote(w_type);
     // typeobject.py:506 — `version_tag = promote(self.version_tag())`;
     // `w_type_version_tag` routes a prebuilt type through the
     // `elidable_promote` `_pure_version_tag`, so the tag folds on the trace.
+    let version_tag = w_type_version_tag(w_type);
+    if version_tag == 0 {
+        // typeobject.py:507-509 — no version tag: uncacheable.
+        return lookup_where(w_type, name);
+    }
+    let (w_class, w_value) = _cached_lookup_where(w_type, name, version_tag);
+    if w_value.is_null() {
+        None
+    } else {
+        Some((w_class, w_value))
+    }
+}
+
+/// `lookup` value projection of [`lookup_where_with_method_cache`]
+/// (typeobject.py:476 `lookup` = `self.lookup_where(name)[1]`).  Under
+/// the JIT this routes through the `@elidable`
+/// `_pure_lookup_where_with_method_cache` so the trace records a
+/// `CALL_PURE_R` and folds the `(version_tag, name)`-keyed lookup to a
+/// constant.
+pub(crate) unsafe fn lookup_in_type_where(w_type: PyObjectRef, name: &str) -> Option<PyObjectRef> {
+    if w_type.is_null() || !is_type(w_type) {
+        return lookup_in_type_where_uncached(w_type, name);
+    }
+    // typeobject.py:505 — `promote(self)`.
+    let _ = majit_metainterp::jit::promote(w_type);
+    // typeobject.py:506 — `version_tag = promote(self.version_tag())`.
     let version_tag = w_type_version_tag(w_type);
     if version_tag == 0 {
         // typeobject.py:507-509 — no version tag: uncacheable.
@@ -4265,8 +4353,8 @@ pub(crate) unsafe fn lookup_in_type_where(w_type: PyObjectRef, name: &str) -> Op
 /// receiver / descriptor shape.  Mirror of `callmethod.py`:
 /// `has_object_getattribute()` (line 33), `version_tag()` (line 56),
 /// `_pure_lookup_where_with_method_cache` (line 59),
-/// `flag_method_descriptor` (line 65, here a plain `FUNCTION_TYPE`
-/// function), and the instance-dict shadowing check (line 66).
+/// `flag_method_descriptor` (line 66), and the instance-dict shadowing
+/// check (line 66).
 ///
 /// # Safety
 /// `w_obj` must be a valid object pointer (null tolerated).
@@ -4287,24 +4375,22 @@ pub unsafe fn load_method_fast_path(
     if version_tag == 0 {
         return None;
     }
-    // callmethod.py:33 `w_type.has_object_getattribute()` — only the default
+    // callmethod.py:46 `w_type.has_object_getattribute()` — only the default
     // `__getattribute__` is sound to bypass (typeobject.py:303-326).  The
-    // memo is primed by the interpreter `getattr` (baseobjspace.rs:2137).
-    if !pyre_object::typeobject::w_type_get_uses_object_getattribute(w_type) {
+    // computing form looks `__getattribute__` up and memoizes the default
+    // in `uses_object_getattribute`, so the first access takes the fast
+    // path too (not only after the interpreter `getattr` primed the flag).
+    if !has_object_getattribute(w_type) {
         return None;
     }
     // callmethod.py:59 `_pure_lookup_where_with_method_cache(name, vt)`.
     let w_descr = lookup_in_type(w_type, name)?;
-    // callmethod.py:65 `space.type(w_descr).flag_method_descriptor`: only a
-    // plain `FUNCTION_TYPE` function binds `self` here (builtin functions
-    // have no `__get__`; staticmethod / classmethod / property / member /
-    // type descriptors are not plain method descriptors).
-    if !crate::is_function(w_descr)
-        || !std::ptr::eq(
-            (*w_descr).ob_type,
-            &crate::FUNCTION_TYPE as *const pyre_object::PyType,
-        )
-    {
+    // callmethod.py:66 `space.type(w_descr).flag_method_descriptor`: only a
+    // method-descriptor type (the `function` typedef, typedef.py:807) binds
+    // `self` here; builtin functions, staticmethod / classmethod / property
+    // / member / type descriptors all carry the `False` default.
+    let w_descr_type = crate::typedef::r#type(w_descr)?;
+    if !pyre_object::typeobject::w_type_get_flag_method_descriptor(w_descr_type) {
         return None;
     }
     // callmethod.py:66-67 `w_value = w_obj.getdictvalue(space, name)`: a
@@ -4367,6 +4453,14 @@ pub(crate) unsafe fn getattribute_if_not_from_object(w_type: PyObjectRef) -> Opt
         return Some(w_descr);
     }
     None
+}
+
+/// typeobject.py:325-326 `has_object_getattribute` — true iff the type
+/// inherits `object.__getattribute__` unchanged.  Computing form: looks
+/// the descriptor up (memoizing the default in
+/// `uses_object_getattribute`) rather than reading the raw flag.
+pub(crate) unsafe fn has_object_getattribute(w_type: PyObjectRef) -> bool {
+    getattribute_if_not_from_object(w_type).is_none()
 }
 
 /// typeobject.py:328-348 `setattr_if_not_from_object` — the `__setattr__`
@@ -4644,7 +4738,7 @@ pub(crate) unsafe fn is_data_descr(descr: PyObjectRef) -> bool {
     if is_property(descr) {
         return true;
     }
-    // typedef.py:492-496 Member is a data descriptor (__get__, __set__, __delete__)
+    // typedef.py:533-540 Member is a data descriptor (__get__, __set__, __delete__)
     if pyre_object::is_member(descr) {
         return true;
     }
@@ -4752,18 +4846,18 @@ unsafe fn get(
         return Ok(Some(crate::call_function(fget, &[obj])));
     }
 
-    // typedef.py:464-475 Member.descr_member_get:
+    // typedef.py:504-516 Member.descr_member_get:
     //   if space.is_w(w_obj, space.w_None): return self
     //   self.typecheck(space, w_obj)
     //   w_result = w_obj.getslotvalue(self.index)
-    //   if w_result is None: raise AttributeError(self.name)
+    //   if w_result is None: raise AttributeError(...)
     //   return w_result
     if pyre_object::is_member(descr) {
-        // typedef.py:467
+        // typedef.py:507-508
         if obj.is_null() || is_none(obj) {
             return Ok(Some(descr));
         }
-        // typedef.py:470: self.typecheck(space, w_obj) → TypeError
+        // typedef.py:510: self.typecheck(space, w_obj) → TypeError
         let w_cls = pyre_object::w_member_get_cls(descr);
         if !w_cls.is_null() && is_type(w_cls) && !isinstance_w(obj, w_cls) {
             let slot_name = pyre_object::w_member_get_name(descr);
@@ -4774,19 +4868,14 @@ unsafe fn get(
                 (*(*obj).ob_type).name,
             )));
         }
-        let slot_name = pyre_object::w_member_get_name(descr);
-        let found = ATTR_TABLE.with(|table| {
-            let table = table.borrow();
-            table
-                .get(&(obj as usize))
-                .and_then(|d| d.get(slot_name).copied())
-        });
-        // typedef.py:472-474: if w_result is None: raise AttributeError(self.name)
+        // typedef.py:511: w_result = w_obj.getslotvalue(self.index)
+        let index = pyre_object::w_member_get_index(descr);
+        let found = crate::objspace::std::mapdict::getslotvalue(obj, index);
+        // typedef.py:512-516: if w_result is None: raise
+        // AttributeError("'%T' object has no attribute '%s'")
         if found.is_none() {
-            return Err(crate::PyError::new(
-                crate::PyErrorKind::AttributeError,
-                slot_name.to_string(),
-            ));
+            let slot_name = pyre_object::w_member_get_name(descr);
+            return Err(raiseattrerror(obj, slot_name));
         }
         return Ok(found);
     }
@@ -4842,11 +4931,11 @@ unsafe fn set(
         return Ok(true);
     }
 
-    // typedef.py:477-481 Member.descr_member_set:
+    // typedef.py:518-522 Member.descr_member_set:
     //   self.typecheck(space, w_obj)
     //   w_obj.setslotvalue(self.index, w_value)
     if pyre_object::is_member(descr) {
-        // typedef.py:480: self.typecheck(space, w_obj) → TypeError
+        // typedef.py:521: self.typecheck(space, w_obj) → TypeError
         let w_cls = pyre_object::w_member_get_cls(descr);
         if !w_cls.is_null() && is_type(w_cls) && !isinstance_w(obj, w_cls) {
             let slot_name = pyre_object::w_member_get_name(descr);
@@ -4857,14 +4946,9 @@ unsafe fn set(
                 (*(*obj).ob_type).name,
             )));
         }
-        let slot_name = pyre_object::w_member_get_name(descr);
-        ATTR_TABLE.with(|table| {
-            let mut table = table.borrow_mut();
-            table
-                .entry(obj as usize)
-                .or_default()
-                .insert(slot_name.to_string(), value);
-        });
+        // typedef.py:522: w_obj.setslotvalue(self.index, w_value)
+        let index = pyre_object::w_member_get_index(descr);
+        crate::objspace::std::mapdict::setslotvalue(obj, index, value);
         return Ok(true);
     }
 
@@ -4907,7 +4991,7 @@ unsafe fn delete(descr: PyObjectRef, obj: PyObjectRef) -> Result<(), crate::PyEr
         crate::call::call_function_impl_result(fdel, &[obj])?;
         return Ok(());
     }
-    // typedef.py:483-490 Member.descr_member_del
+    // typedef.py:524-531 Member.descr_member_del
     if pyre_object::is_member(descr) {
         let w_cls = pyre_object::w_member_get_cls(descr);
         if !w_cls.is_null() && is_type(w_cls) && !isinstance_w(obj, w_cls) {
@@ -4919,15 +5003,11 @@ unsafe fn delete(descr: PyObjectRef, obj: PyObjectRef) -> Result<(), crate::PyEr
                 (*(*obj).ob_type).name,
             )));
         }
-        let slot_name = pyre_object::w_member_get_name(descr);
-        let removed = ATTR_TABLE.with(|table| {
-            let mut table = table.borrow_mut();
-            table
-                .get_mut(&(obj as usize))
-                .and_then(|d| d.remove(slot_name))
-                .is_some()
-        });
+        // typedef.py:527-531: success = w_obj.delslotvalue(self.index)
+        let index = pyre_object::w_member_get_index(descr);
+        let removed = crate::objspace::std::mapdict::delslotvalue(obj, index);
         if !removed {
+            let slot_name = pyre_object::w_member_get_name(descr);
             return Err(crate::PyError::new(
                 crate::PyErrorKind::AttributeError,
                 slot_name.to_string(),
@@ -5131,7 +5211,10 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
     //         raiseattrerror(space, w_obj, name, w_descr)
     //
     // The descriptor + type short-circuits above already handle the
-    // first half of this. What remains is `setdictvalue` + raiseattrerror.
+    // first half of this. What remains is `setdictvalue` + raiseattrerror,
+    // both at the function tail — the exception arms below emulate the
+    // GetSetProperty descriptors of W_BaseException.typedef and so must
+    // run before `setdictvalue`, like a descriptor `__set__` would.
     //
     // Module objects: PyPy `module.py:Module` does not override
     // `descr__setattr__`, so the call reaches `setdictvalue` (`W_Root.
@@ -5143,7 +5226,9 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
     // be shadowed by the namespace store.  `setitem` is the generic
     // dispatch: an exact `W_DictMultiObject` goes direct, a dict subclass
     // (`moduledef.py:102-103` user-supplied `__builtins__`) routes through
-    // its `__setitem__`.
+    // its `__setitem__`.  A module is neither an exception nor a property,
+    // so this early return is order-independent from the arms below; the
+    // shared `setdictvalue` for every other object stays at the tail.
     unsafe {
         if is_module(obj) {
             let w_dict = pyre_object::w_module_get_w_dict(obj);
@@ -5153,15 +5238,14 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
             }
         }
     }
-    if setdictvalue(obj, name, value) {
-        return Ok(w_none());
-    }
-    // Property and similar non-instance objects: store via INSTANCE_DICT.
-    // property.__doc__ = "..." is common in stdlib (dis.py, etc.)
+    // descriptor.py:316-318 `__doc__ = GetSetProperty(W_Property.get_doc,
+    // W_Property.set_doc)` — the only writable property attribute;
+    // `property.__doc__ = "..."` is common in stdlib (dis.py, etc.).
+    // Other names (and member descriptors, which expose no setter,
+    // typedef.py:533-540) fall through to raiseattrerror.
     unsafe {
-        if is_property(obj) || pyre_object::memberobject::is_member(obj) {
-            let w_dict = crate::objspace::std::mapdict::_obj_getdict(obj);
-            pyre_object::w_dict_setitem_str(w_dict, name, value);
+        if is_property(obj) && name == "__doc__" {
+            pyre_object::propertyobject::w_property_set_doc(obj, value);
             return Ok(w_none());
         }
     }
@@ -5170,8 +5254,8 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
     // W_BaseException.typedef with `__dict__ = GetSetProperty(descr_get_dict)`,
     // so user code routinely does `e.foo = bar` (e.g.
     // `argparse.ArgumentTypeError`'s `e.message = ...` pattern).
-    // pyre's W_ExceptionObject has no per-instance W_DictObject yet;
-    // fall back to ATTR_TABLE which the matching getattr branch reads.
+    // Non-special names land in the lazily allocated instance dict on
+    // `W_ExceptionObject.w_dict` (interp_exceptions.py:113, 222-225).
     if unsafe { pyre_object::is_exception(obj) } {
         // `pypy/module/exceptions/interp_exceptions.py:156-157
         // W_BaseException.descr_setargs` →
@@ -5194,6 +5278,14 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
         // line 113-117).  Storage lives on `W_ExceptionObject`
         // directly — no ATTR_TABLE side store for these four names.
         match name {
+            "__dict__" => {
+                // `interp_exceptions.py:293` registers
+                // `__dict__ = GetSetProperty(descr_get_dict, descr_set_dict)`
+                // whose setter routes to `setdict` (typedef.py
+                // descr_set_dict) — replaces the whole instance dict.
+                setdict(obj, value)?;
+                return Ok(w_none());
+            }
             "__cause__" => {
                 // `interp_exceptions.py:166-174 descr_setcause` — None
                 // OR an instance whose type derives from `BaseException`,
@@ -5370,13 +5462,12 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
             }
             _ => {}
         }
-        ATTR_TABLE.with(|table| {
-            table
-                .borrow_mut()
-                .entry(obj as usize)
-                .or_default()
-                .insert(name.to_string(), value);
-        });
+    }
+    // descroperation.py:121-122 `if w_obj.setdictvalue(space, name, w_value):
+    // return` — exception extras land in the lazily allocated
+    // `W_ExceptionObject.w_dict` (interp_exceptions.py:113, 222-225) via
+    // the `getdict` exception arm.
+    if setdictvalue(obj, name, value) {
         return Ok(w_none());
     }
     Err(raiseattrerror(obj, name))
@@ -5413,7 +5504,7 @@ unsafe fn coerce_to_list_for_args(value: PyObjectRef) -> Result<PyObjectRef, PyE
 ///     return False
 /// ```
 fn setdictvalue(obj: PyObjectRef, name: &str, value: PyObjectRef) -> bool {
-    let w_dict = getdict(obj);
+    let w_dict = getdict_backing(obj);
     if w_dict.is_null() {
         return false;
     }
@@ -5573,7 +5664,7 @@ pub fn object_delattr(obj: PyObjectRef, name: &str) -> PyResult {
         return Err(PyError::type_error("args may not be deleted"));
     }
     // Instance/general: remove from instance dict, then ATTR_TABLE
-    let w_dict = getdict(obj);
+    let w_dict = getdict_backing(obj);
     if !w_dict.is_null() {
         let removed = unsafe { pyre_object::w_dict_delitem_str(w_dict, name) };
         if removed {
@@ -7094,6 +7185,11 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         if pyre_object::enumerateobject::is_enumerate(obj) {
             return Ok(obj);
         }
+        // `pypy/module/_sre/interp_sre.py:915 W_SRE_Scanner.iter_w` —
+        // `return self` (the finditer/scanner iterator).
+        if pyre_object::sreobject::is_sre_scanner(obj) {
+            return Ok(obj);
+        }
         // `iter(callable, sentinel)` product — its own iterator.
         if pyre_object::callableiteratorobject::is_callable_iterator(obj) {
             return Ok(obj);
@@ -7612,6 +7708,11 @@ pub fn next(obj: PyObjectRef) -> PyResult {
             }
             return Ok(pyre_object::w_tuple_new(vec![w_index, w_item]));
         }
+        // `pypy/module/_sre/interp_sre.py:918 W_SRE_Scanner.next_w` —
+        // search from the current position, yielding the match object.
+        if pyre_object::sreobject::is_sre_scanner(obj) {
+            return crate::module::_sre::interp_sre::sre_scanner_next(obj);
+        }
         // Instance __next__
         if is_instance(obj) {
             let w_type = w_instance_get_type(obj);
@@ -7625,34 +7726,64 @@ pub fn next(obj: PyObjectRef) -> PyResult {
 
 /// Property setter/getter/deleter helpers — PyPy: W_Property.setter/getter/deleter.
 /// args[0] is the owning property (bound via W_Method), args[1] is the new fn.
-fn property_setter_impl(args: &[PyObjectRef]) -> PyResult {
-    let prop = args[0];
-    let new_fn = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-    unsafe {
-        let fget = w_property_get_fget(prop);
-        let fdel = w_property_get_fdel(prop);
-        Ok(pyre_object::w_property_new(fget, new_fn, fdel))
+/// `descriptor.py:189-204 W_Property.init` doc-capture tail — store the
+/// explicit doc, else inherit `fget.__doc__` and mark `getter_doc`.
+/// (The subclass `space.setattr` branch at :202-203 is folded into the
+/// field write: pyre property subclass instances share the
+/// W_PropertyObject layout, so the slot is the only storage.)
+pub(crate) unsafe fn property_init_doc(prop: PyObjectRef, w_doc: PyObjectRef, fget: PyObjectRef) {
+    if !w_doc.is_null() && !is_none(w_doc) {
+        pyre_object::propertyobject::w_property_set_doc(prop, w_doc);
+    } else if !fget.is_null() && !is_none(fget) {
+        if let Ok(getter_doc) = getattr_str(fget, "__doc__") {
+            if !getter_doc.is_null() && !is_none(getter_doc) {
+                pyre_object::propertyobject::w_property_set_getter_doc(prop, getter_doc);
+            }
+        }
     }
+}
+
+/// `descriptor.py:256-273 W_Property._copy` — clone the property with
+/// one accessor replaced.  A getter-inherited doc (`getter_doc`) does
+/// not survive a getter replacement (descriptor.py:263-266); the
+/// constructor's doc capture then re-derives it from the new getter.
+unsafe fn property_copy(
+    prop: PyObjectRef,
+    w_getter: Option<PyObjectRef>,
+    w_setter: Option<PyObjectRef>,
+    w_deleter: Option<PyObjectRef>,
+) -> PyResult {
+    let getter = w_getter.unwrap_or_else(|| w_property_get_fget(prop));
+    let setter = w_setter.unwrap_or_else(|| w_property_get_fset(prop));
+    let deleter = w_deleter.unwrap_or_else(|| w_property_get_fdel(prop));
+    let getter_doc = (*(prop as *const pyre_object::propertyobject::W_PropertyObject)).getter_doc;
+    // descriptor.py:263-264 `if self.getter_doc and w_getter is not None`
+    // — judged on the getter AFTER defaulting from `w_fget`, so
+    // `.setter(s)` on a getter_doc property still passes doc=None and
+    // re-derives it from the kept getter (getter_doc stays inherited).
+    let w_doc = if getter_doc && !getter.is_null() {
+        pyre_object::PY_NULL
+    } else {
+        pyre_object::propertyobject::w_property_get_doc(prop)
+    };
+    let new_prop = pyre_object::w_property_new(getter, setter, deleter);
+    property_init_doc(new_prop, w_doc, getter);
+    Ok(new_prop)
+}
+
+fn property_setter_impl(args: &[PyObjectRef]) -> PyResult {
+    // descriptor.py:243-244 `setter` → `_copy(space, w_setter=w_setter)`
+    unsafe { property_copy(args[0], None, args.get(1).copied(), None) }
 }
 
 fn property_getter_impl(args: &[PyObjectRef]) -> PyResult {
-    let prop = args[0];
-    let new_fn = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-    unsafe {
-        let fset = w_property_get_fset(prop);
-        let fdel = w_property_get_fdel(prop);
-        Ok(pyre_object::w_property_new(new_fn, fset, fdel))
-    }
+    // descriptor.py:240-241 `getter` → `_copy(space, w_getter=w_getter)`
+    unsafe { property_copy(args[0], args.get(1).copied(), None, None) }
 }
 
 fn property_deleter_impl(args: &[PyObjectRef]) -> PyResult {
-    let prop = args[0];
-    let new_fn = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-    unsafe {
-        let fget = w_property_get_fget(prop);
-        let fset = w_property_get_fset(prop);
-        Ok(pyre_object::w_property_new(fget, fset, new_fn))
-    }
+    // descriptor.py:246-247 `deleter` → `_copy(space, w_deleter=w_deleter)`
+    unsafe { property_copy(args[0], None, None, args.get(1).copied()) }
 }
 
 // ── Generator methods ────────────────────────────────────────────────

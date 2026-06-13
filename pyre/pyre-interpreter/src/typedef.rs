@@ -395,6 +395,10 @@ pub fn init_typeobjects() {
         unsafe {
             pyre_object::w_type_set_hasdict(function_type, true);
             pyre_object::w_type_set_weakrefable(function_type, true);
+            // typedef.py:807 `method_descriptor=True` → typeobject.py:256
+            // `flag_method_descriptor` (the LOAD_METHOD fast-path gate,
+            // callmethod.py:66).
+            pyre_object::typeobject::w_type_set_flag_method_descriptor(function_type, true);
         }
         reg.insert(
             &crate::FUNCTION_TYPE as *const PyType as usize,
@@ -511,6 +515,44 @@ pub fn init_typeobjects() {
         reg.insert(
             &pyre_object::sliceobject::SLICE_TYPE as *const PyType as usize,
             new_typeobject_with_base("slice", init_slice_type, object_type) as usize,
+        );
+
+        // re.Pattern / re.Match — PyPy: module/_sre/interp_sre.py
+        // W_SRE_Pattern.typedef (:641) / W_SRE_Match.typedef (:869);
+        // neither is acceptable_as_base_class (:669/:896).
+        let sre_pattern_type = new_typeobject_with_base(
+            "re.Pattern",
+            crate::module::_sre::interp_sre::init_sre_pattern_type,
+            object_type,
+        );
+        unsafe { pyre_object::w_type_set_acceptable_as_base_class(sre_pattern_type, false) };
+        reg.insert(
+            &pyre_object::sreobject::SRE_PATTERN_TYPE as *const PyType as usize,
+            sre_pattern_type as usize,
+        );
+        let sre_match_type = new_typeobject_with_base(
+            "re.Match",
+            crate::module::_sre::interp_sre::init_sre_match_type,
+            object_type,
+        );
+        unsafe { pyre_object::w_type_set_acceptable_as_base_class(sre_match_type, false) };
+        reg.insert(
+            &pyre_object::sreobject::SRE_MATCH_TYPE as *const PyType as usize,
+            sre_match_type as usize,
+        );
+
+        // _sre.SRE_Scanner — W_SRE_Scanner.typedef (:949); the iterator
+        // behind Pattern.finditer/scanner; not acceptable_as_base_class
+        // (:957).
+        let sre_scanner_type = new_typeobject_with_base(
+            "_sre.SRE_Scanner",
+            crate::module::_sre::interp_sre::init_sre_scanner_type,
+            object_type,
+        );
+        unsafe { pyre_object::w_type_set_acceptable_as_base_class(sre_scanner_type, false) };
+        reg.insert(
+            &pyre_object::sreobject::SRE_SCANNER_TYPE as *const PyType as usize,
+            sre_scanner_type as usize,
         );
 
         // bytearray — PyPy: bytearrayobject.py, bases=(object,)
@@ -849,11 +891,10 @@ fn new_typeobject_with_base_and_layout(
                 newslotnames: vec![],
                 base_layout: parent_layout,
                 acceptable_as_base_class: has_new,
-                // Distinct-typedef builtins reuse INSTANCE_TYPE here, so no
-                // reachable instance carries this Layout's typedef; the
-                // dict-managing typedefs (module/function/...) get their true
-                // flag only with the distinct-TypeDef convergence.
-                typedef_hasdict: false,
+                // typedef.py:40 `hasdict = '__dict__' in rawdict` — a typedef
+                // that declares `__dict__` does its own dict management, so
+                // mapdict must not add a second one (typeobject.py:253-257).
+                typedef_hasdict: has_dict,
             })
         };
         pyre_object::w_type_set_layout(type_obj, layout);
@@ -5391,9 +5432,9 @@ fn init_code_type(ns: &mut DictStorage) {
     );
 }
 
-/// typedef.py:492-500 Member.typedef
+/// typedef.py:533-540 Member.typedef
 fn init_member_descriptor_type(ns: &mut DictStorage) {
-    // typedef.py:494 __get__ = interp2app(Member.descr_member_get)
+    // typedef.py:535 __get__ = interp2app(Member.descr_member_get)
     dict_storage_store(
         ns,
         "__get__",
@@ -5403,11 +5444,11 @@ fn init_member_descriptor_type(ns: &mut DictStorage) {
                 return Ok(pyre_object::w_none());
             }
             let obj = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-            // typedef.py:467: if space.is_w(w_obj, space.w_None): return self
+            // typedef.py:507-508: if space.is_w(w_obj, space.w_None): return self
             if obj.is_null() || unsafe { pyre_object::is_none(obj) } {
                 return Ok(descr);
             }
-            // typedef.py:470: self.typecheck(space, w_obj)
+            // typedef.py:510: self.typecheck(space, w_obj)
             unsafe {
                 let w_cls = pyre_object::w_member_get_cls(descr);
                 if !w_cls.is_null()
@@ -5423,24 +5464,25 @@ fn init_member_descriptor_type(ns: &mut DictStorage) {
                     )));
                 }
             }
-            // typedef.py:471-474: w_result = w_obj.getslotvalue(self.index)
+            // typedef.py:511-516: w_result = w_obj.getslotvalue(self.index);
+            // None → AttributeError("'%T' object has no attribute '%s'").
             let slot_name = unsafe { pyre_object::w_member_get_name(descr) };
-            let found = crate::baseobjspace::ATTR_TABLE.with(|table| {
-                let table = table.borrow();
-                table
-                    .get(&(obj as usize))
-                    .and_then(|d| d.get(slot_name).copied())
-            });
+            let index = unsafe { pyre_object::w_member_get_index(descr) };
+            let found = unsafe { crate::objspace::std::mapdict::getslotvalue(obj, index) };
             match found {
                 Some(v) => Ok(v),
                 None => Err(crate::PyError::new(
                     crate::PyErrorKind::AttributeError,
-                    slot_name.to_string(),
+                    format!(
+                        "'{}' object has no attribute '{}'",
+                        unsafe { (*(*obj).ob_type).name },
+                        slot_name,
+                    ),
                 )),
             }
         }),
     );
-    // typedef.py:495 __set__ = interp2app(Member.descr_member_set)
+    // typedef.py:536 __set__ = interp2app(Member.descr_member_set)
     dict_storage_store(
         ns,
         "__set__",
@@ -5451,7 +5493,7 @@ fn init_member_descriptor_type(ns: &mut DictStorage) {
             }
             let obj = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
             let value = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
-            // typedef.py:480: self.typecheck(space, w_obj)
+            // typedef.py:521: self.typecheck(space, w_obj)
             unsafe {
                 let w_cls = pyre_object::w_member_get_cls(descr);
                 if !w_cls.is_null()
@@ -5467,19 +5509,13 @@ fn init_member_descriptor_type(ns: &mut DictStorage) {
                     )));
                 }
             }
-            // typedef.py:481: w_obj.setslotvalue(self.index, w_value)
-            let slot_name = unsafe { pyre_object::w_member_get_name(descr) };
-            crate::baseobjspace::ATTR_TABLE.with(|table| {
-                let mut table = table.borrow_mut();
-                table
-                    .entry(obj as usize)
-                    .or_default()
-                    .insert(slot_name.to_string(), value);
-            });
+            // typedef.py:522: w_obj.setslotvalue(self.index, w_value)
+            let index = unsafe { pyre_object::w_member_get_index(descr) };
+            unsafe { crate::objspace::std::mapdict::setslotvalue(obj, index, value) };
             Ok(pyre_object::w_none())
         }),
     );
-    // typedef.py:496 __delete__ = interp2app(Member.descr_member_del)
+    // typedef.py:537 __delete__ = interp2app(Member.descr_member_del)
     dict_storage_store(
         ns,
         "__delete__",
@@ -5489,7 +5525,7 @@ fn init_member_descriptor_type(ns: &mut DictStorage) {
                 return Ok(pyre_object::w_none());
             }
             let obj = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-            // typedef.py:486: self.typecheck(space, w_obj)
+            // typedef.py:526: self.typecheck(space, w_obj)
             unsafe {
                 let w_cls = pyre_object::w_member_get_cls(descr);
                 if !w_cls.is_null()
@@ -5505,15 +5541,10 @@ fn init_member_descriptor_type(ns: &mut DictStorage) {
                     )));
                 }
             }
-            // typedef.py:487-490: success = w_obj.delslotvalue(self.index)
+            // typedef.py:527-531: success = w_obj.delslotvalue(self.index)
             let slot_name = unsafe { pyre_object::w_member_get_name(descr) };
-            let removed = crate::baseobjspace::ATTR_TABLE.with(|table| {
-                let mut table = table.borrow_mut();
-                table
-                    .get_mut(&(obj as usize))
-                    .and_then(|d| d.remove(slot_name))
-                    .is_some()
-            });
+            let index = unsafe { pyre_object::w_member_get_index(descr) };
+            let removed = unsafe { crate::objspace::std::mapdict::delslotvalue(obj, index) };
             if !removed {
                 return Err(crate::PyError::new(
                     crate::PyErrorKind::AttributeError,
@@ -5523,7 +5554,7 @@ fn init_member_descriptor_type(ns: &mut DictStorage) {
             Ok(pyre_object::w_none())
         }),
     );
-    // typedef.py:497 __name__ = interp_attrproperty('name', ...)
+    // typedef.py:538 __name__ = interp_attrproperty('name', ...)
     let name_getter = make_builtin_function_with_arity(
         "__name__",
         |args| {
@@ -5903,11 +5934,47 @@ fn init_property_type(ns: &mut DictStorage) {
         ns,
         "__new__",
         make_builtin_function("__new__", |args| {
-            // args[0] is cls; fget/fset/fdel follow.
-            let fget = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-            let fset = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
-            let fdel = args.get(3).copied().unwrap_or(pyre_object::PY_NULL);
-            Ok(pyre_object::w_property_new(fget, fset, fdel))
+            // args[0] is cls; fget/fset/fdel/doc follow.
+            // descriptor.py:186-189 `@unwrap_spec(w_fget=..., w_fset=...,
+            // w_fdel=..., w_doc=...)` — keyword forms bind too.
+            let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+            crate::builtins::kwarg_reject_unknown(
+                kwargs,
+                &["fget", "fset", "fdel", "doc"],
+                "property",
+            )?;
+            let arg = |idx: usize, name: &str| {
+                pos.get(idx)
+                    .copied()
+                    .or_else(|| crate::builtins::kwarg_get(kwargs, name))
+                    .unwrap_or(pyre_object::PY_NULL)
+            };
+            let fget = arg(1, "fget");
+            let fset = arg(2, "fset");
+            let fdel = arg(3, "fdel");
+            let w_doc = arg(4, "doc");
+            let prop = pyre_object::w_property_new(fget, fset, fdel);
+            unsafe {
+                // descriptor.py:193 `self.w_doc = w_doc`
+                if !w_doc.is_null() && !pyre_object::is_none(w_doc) {
+                    pyre_object::propertyobject::w_property_set_doc(prop, w_doc);
+                } else if !fget.is_null() && !pyre_object::is_none(fget) {
+                    // descriptor.py:195-204 — without an explicit doc,
+                    // inherit `fget.__doc__` and mark `getter_doc`.
+                    // (The subclass `space.setattr` branch at :202-203
+                    // is folded into the field write: pyre property
+                    // subclass instances share the W_PropertyObject
+                    // layout, so the slot is the only storage.)
+                    if let Ok(getter_doc) = crate::baseobjspace::getattr_str(fget, "__doc__") {
+                        if !getter_doc.is_null() && !pyre_object::is_none(getter_doc) {
+                            pyre_object::propertyobject::w_property_set_getter_doc(
+                                prop, getter_doc,
+                            );
+                        }
+                    }
+                }
+            }
+            Ok(prop)
         }),
     );
 }

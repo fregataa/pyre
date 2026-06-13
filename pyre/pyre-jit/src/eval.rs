@@ -1660,6 +1660,33 @@ thread_local! {
             majit_gc::GcAllocator::register_vtable_for_type(&mut gc, pytype_ptr, new_tid);
             pytype_to_tid.insert(pytype_ptr, new_tid);
         }
+        // W_SRE_Pattern / W_SRE_Match / W_SRE_Scanner (`_sre` compiled
+        // pattern, match result, and finditer scanner) — typed payloads
+        // via `#[pyre_class]` in AUTO-ID mode.  The leaked engine buffers
+        // (`code`, `spans`) are non-GC raw pointers the macro's
+        // auto-detection skips; scanner's pattern/string refs must be
+        // traced like PyPy's W_SRE_Scanner fields.  Registered at the
+        // tail of the tid chain: every earlier slot is pinned by an
+        // explicit `type_id = N` constant or a hardcoded comment-counted
+        // position, so an insertion anywhere above would shift them all.
+        register_pyre_class(
+            &mut gc,
+            &mut pytype_to_tid,
+            <pyre_object::sreobject::W_SRE_Pattern
+                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        );
+        register_pyre_class(
+            &mut gc,
+            &mut pytype_to_tid,
+            <pyre_object::sreobject::W_SRE_Match
+                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        );
+        register_pyre_class(
+            &mut gc,
+            &mut pytype_to_tid,
+            <pyre_object::sreobject::W_SRE_Scanner
+                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        );
         // rclass.py:340-346 — assign subclassrange_{min,max} to each
         // vtable entry. freeze_types() runs assign_inheritance_ids
         // (normalizecalls.py:373-389), then we write the computed ranges

@@ -433,6 +433,90 @@ pub unsafe fn instance_set_dict_slot(obj: PyObjectRef, w_dict: PyObjectRef) -> b
     node_write(map, inst, "dict", SPECIAL, w_dict)
 }
 
+// ── methods needed for slots (mapdict.py:764-780 MapdictSlotsSupport) ──
+
+/// mapdict.py:766-768 `MapdictSlotsSupport.getslotvalue` —
+/// `map.read(self, "slot", SLOTS_STARTING_FROM + slotindex)`.
+///
+/// `dont_look_inside` — same residual-call rationale as
+/// [`instance_node_getdictvalue`].
+///
+/// # Safety
+/// `obj` must be a live object reference. A non-`W_InstanceObject`
+/// receiver hits the `W_Root.getslotvalue` default — NotImplementedError
+/// (baseobjspace.py:119-120) — as a panic.
+#[majit_macros::dont_look_inside]
+pub unsafe fn getslotvalue(obj: PyObjectRef, slotindex: u32) -> Option<PyObjectRef> {
+    assert!(
+        unsafe { pyre_object::is_instance(obj) },
+        "W_Root.getslotvalue: receiver has no mapdict slot storage"
+    );
+    ensure_mapdict_initialized(obj);
+    let inst = &mut *(obj as *mut pyre_object::W_InstanceObject);
+    let map = inst._get_mapdict_map();
+    let attrkind = SLOTS_STARTING_FROM + slotindex as u16;
+    let w_res = unsafe { node_read(map, inst, "slot", attrkind) };
+    // read → _direct_read (mapdict.py:592-598) lazily migrates an unboxed
+    // attribute to boxed storage, as in `instance_node_getdictvalue`.
+    unsafe { maybe_migrate_to_boxed(map, inst, "slot", attrkind) };
+    w_res
+}
+
+/// mapdict.py:770-772 `MapdictSlotsSupport.setslotvalue` —
+/// `map.write(self, "slot", SLOTS_STARTING_FROM + slotindex, w_value)`.
+///
+/// `dont_look_inside` — same residual-call rationale as
+/// [`instance_node_setdictvalue`].
+///
+/// # Safety
+/// `obj` must be a live object reference. A non-`W_InstanceObject`
+/// receiver hits the `W_Root.setslotvalue` default — NotImplementedError
+/// (baseobjspace.py:122-123) — as a panic.
+#[majit_macros::dont_look_inside]
+pub unsafe fn setslotvalue(obj: PyObjectRef, slotindex: u32, w_value: PyObjectRef) {
+    assert!(
+        unsafe { pyre_object::is_instance(obj) },
+        "W_Root.setslotvalue: receiver has no mapdict slot storage"
+    );
+    ensure_mapdict_initialized(obj);
+    let inst = &mut *(obj as *mut pyre_object::W_InstanceObject);
+    let map = inst._get_mapdict_map();
+    let attrkind = SLOTS_STARTING_FROM + slotindex as u16;
+    let flag = node_write(map, inst, "slot", attrkind, w_value);
+    debug_assert!(flag, "node_write returned false for a slot attribute");
+}
+
+/// mapdict.py:774-780 `MapdictSlotsSupport.delslotvalue` —
+/// `map.delete(self, "slot", SLOTS_STARTING_FROM + slotindex)` then
+/// `_set_mapdict_storage_and_map`. Returns `false` when the slot was
+/// never written (the caller raises AttributeError).
+///
+/// `dont_look_inside` — same residual-call rationale as
+/// [`instance_node_setdictvalue`].
+///
+/// # Safety
+/// `obj` must be a live object reference. A non-`W_InstanceObject`
+/// receiver hits the `W_Root.delslotvalue` default — NotImplementedError
+/// (baseobjspace.py:125-126) — as a panic.
+#[majit_macros::dont_look_inside]
+pub unsafe fn delslotvalue(obj: PyObjectRef, slotindex: u32) -> bool {
+    assert!(
+        unsafe { pyre_object::is_instance(obj) },
+        "W_Root.delslotvalue: receiver has no mapdict slot storage"
+    );
+    ensure_mapdict_initialized(obj);
+    let inst = &mut *(obj as *mut pyre_object::W_InstanceObject);
+    let map = inst._get_mapdict_map();
+    let attrkind = SLOTS_STARTING_FROM + slotindex as u16;
+    match node_delete(map, &*inst, "slot", attrkind) {
+        None => false,
+        Some(new_obj) => {
+            inst._set_mapdict_storage_and_map(new_obj.storage, new_obj.map);
+            true
+        }
+    }
+}
+
 /// mapdict.py:423-431 `PlainAttribute.__init__`.
 ///
 /// # Safety
@@ -735,12 +819,13 @@ pub unsafe fn find_map_attr(self_node: MapRef, name: &str, attrkind: u16) -> Opt
 // its `AbstractAttribute` nodes are GC-managed. pyre interns map nodes as
 // immortal leaked `Box`es (`intern_node`/`new_terminator`, see comment at the
 // top of this file and lines 190-213), so a raw `MapRef` is the faithful
-// equivalent — the weakref could never expire. The entry therefore stores NO
-// movable `PyObjectRef` value, only immortal node pointers + the u64
-// version_tag, and re-reads the live value through `plain_direct_read` on every
-// hit. The slot needs no GC walking. (Contingency: were map nodes ever made
-// movable — Task #197 — the raw pointers would dangle and the cache would have
-// to switch to a forwarded design like `walk_method_cache_gc`.)
+// equivalent — the weakref could never expire. The map/attr node pointers and
+// the u64 version_tag therefore need no GC walking; attribute reads re-read
+// the live value through `plain_direct_read` on every hit. The one movable
+// reference is the LOAD_METHOD `w_method` slot (mapdict.py:1418), forwarded
+// during collection by `pycode::walk_mapdict_method_cache_gc`. (Contingency:
+// were map nodes ever made movable — Task #197 — the raw pointers would
+// dangle and the whole entry would have to switch to that forwarded design.)
 
 /// mapdict.py:1416-1422 `CacheEntry`. PyPy's shared `INVALID_CACHE_ENTRY`
 /// sentinel (a `CacheEntry` carrying a fake map, mapdict.py:1451-1454) is
@@ -2687,10 +2772,11 @@ pub fn _obj_getdict(self_ref: PyObjectRef) -> PyObjectRef {
     // makes the view funnel every get/set/del/iter through the instance map+storage
     // — the single `__dict__` authority.
     //
-    // Only a `W_InstanceObject` carries a mapdict. pyre conflates other hasdict
-    // objects (property/member, baseobjspace.rs:1850/3786) onto this adapter; they
-    // have no map, so their wrapper stays in the address-keyed INSTANCE_DICT side
-    // table as a plain own-storage dict.
+    // Only a `W_InstanceObject` carries a mapdict. User subclasses of builtin
+    // types (`class MyInt(int)`) keep the builtin layout (no map) while their
+    // type is hasdict, so their `__dict__` stays in the address-keyed
+    // INSTANCE_DICT side table as a plain own-storage dict until subclass
+    // instances grow mapdict storage (upstream `user_setup`, mapdict.py:758).
     if unsafe { pyre_object::is_instance(self_ref) } {
         if let Some(w_dict) = unsafe { instance_get_dict_slot(self_ref) } {
             return w_dict;
@@ -2885,6 +2971,14 @@ pub fn walk_mapdict_roots(mut visitor: impl FnMut(&mut PyObjectRef)) {
 ///     assert flag
 /// ```
 pub fn _obj_setdict(self_ref: PyObjectRef, w_dict: PyObjectRef) -> Result<(), PyError> {
+    // Upstream `space.isinstance_w(w_dict, space.w_dict)` also accepts
+    // dict subclasses (their instances are dict-layout
+    // W_DictMultiObject).  Pyre dict-subclass instances are
+    // `__dict_data__`-composed W_InstanceObject (typedef.rs
+    // dict_descr_new), and the devolved/cache readers below this slot
+    // (node SPECIAL reads, classify_attr) do raw layout dict ops, so
+    // only layout dicts are accepted until the subclass layout
+    // converges.
     if !unsafe { pyre_object::is_dict(w_dict) } {
         return Err(PyError::type_error(
             "setting dictionary to a non-dict".to_string(),

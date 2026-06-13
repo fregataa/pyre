@@ -182,6 +182,14 @@ pub struct W_TypeObject {
     /// typeobject.py:186 `uses_object_setattr` — the `__setattr__`
     /// companion of [`uses_object_getattribute`].
     pub uses_object_setattr: std::sync::atomic::AtomicBool,
+    /// typeobject.py:197 `flag_method_descriptor` (default `False`), set
+    /// from `typedef.method_descriptor` at `__init__`
+    /// (typeobject.py:256; typedef.py:22/61) — `True` only for the
+    /// `function` typedef (typedef.py:807).  Gates the LOAD_METHOD
+    /// unbound `[w_descr, w_obj]` fast path (callmethod.py:66).  pyre
+    /// has no TypeDef struct, so the creation site of each builtin
+    /// W_TypeObject sets it directly.
+    pub flag_method_descriptor: bool,
 }
 
 /// Source of fresh `version_tag` identities (`VersionTag()`, typeobject.py:73).
@@ -275,14 +283,18 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: *mut u8) -> PyObject
         // typeobject.py:251-260: terminator installed by the interpreter's
         // mapdict layer after construction; null until then.
         terminator: std::ptr::null(),
-        // typeobject.py:244-250: a fresh version tag at construction. (The
-        // is_mro_purely_of_types gate that leaves it None is a deferred
-        // refinement; pyre MROs are purely types in practice.)
+        // typeobject.py:244-250: a fresh version tag at construction.
+        // pyre's construction splits the MRO install into a separate
+        // `w_type_set_mro` call, so the `is_mro_purely_of_types` gate
+        // that demotes the tag to None lives there.
         version_tag: std::sync::atomic::AtomicU64::new(new_version_tag()),
         // typeobject.py:185-186: conservative `False` default, fixed during
         // real usage by the attribute fast paths.
         uses_object_getattribute: std::sync::atomic::AtomicBool::new(false),
         uses_object_setattr: std::sync::atomic::AtomicBool::new(false),
+        // typeobject.py:256 — user-defined typedefs never set
+        // `method_descriptor` (typedef.py:22 default `False`).
+        flag_method_descriptor: false,
     }) as PyObjectRef;
     register_heap_type(w_type as usize);
     w_type
@@ -364,6 +376,10 @@ pub fn w_type_new_builtin(
         // typeobject.py:185-186: conservative `False` default.
         uses_object_getattribute: std::sync::atomic::AtomicBool::new(false),
         uses_object_setattr: std::sync::atomic::AtomicBool::new(false),
+        // typeobject.py:256 — `typedef.method_descriptor` (typedef.py:22
+        // default `False`); the `function` creation site flips it
+        // (typedef.py:807).
+        flag_method_descriptor: false,
     }) as PyObjectRef
 }
 
@@ -487,6 +503,15 @@ pub unsafe fn w_type_get_base_layout(obj: PyObjectRef) -> *const Layout {
     }
 }
 
+/// typeobject.py:197 `flag_method_descriptor` getter/setter
+/// (callmethod.py:66 `space.type(w_descr).flag_method_descriptor`).
+pub unsafe fn w_type_get_flag_method_descriptor(obj: PyObjectRef) -> bool {
+    (*(obj as *const W_TypeObject)).flag_method_descriptor
+}
+pub unsafe fn w_type_set_flag_method_descriptor(obj: PyObjectRef, v: bool) {
+    (*(obj as *mut W_TypeObject)).flag_method_descriptor = v;
+}
+
 /// typeobject.py:179 `hasdict` getter/setter.
 pub unsafe fn w_type_get_hasdict(obj: PyObjectRef) -> bool {
     (*(obj as *const W_TypeObject)).hasdict
@@ -603,8 +628,28 @@ pub unsafe fn w_type_get_mro(obj: PyObjectRef) -> *mut Vec<PyObjectRef> {
 }
 
 /// Set the cached MRO.
+///
+/// Construction installs the MRO here (rather than in `__init__`
+/// itself, typeobject.py:244), so the version-tag cacheability gate
+/// (typeobject.py:244-250) is applied here too: a type whose MRO is
+/// not purely made of types keeps `_version_tag = None` (tag `0`,
+/// uncacheable) — `mutated()` then never refreshes it.
 pub unsafe fn w_type_set_mro(obj: PyObjectRef, mro: Vec<PyObjectRef>) {
+    let purely_of_types = is_mro_purely_of_types(&mro);
     (*(obj as *mut W_TypeObject)).mro_w = crate::lltype::malloc_raw(mro);
+    if !purely_of_types {
+        w_type_set_version_tag(obj, 0);
+    }
+}
+
+/// typeobject.py:1615-1619 `is_mro_purely_of_types(mro_w)`.
+pub unsafe fn is_mro_purely_of_types(mro_w: &[PyObjectRef]) -> bool {
+    for &w_class in mro_w {
+        if !is_type(w_class) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Check if an object is a type (user-defined class).

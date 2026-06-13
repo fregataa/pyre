@@ -70,6 +70,15 @@ pub struct Function {
     /// f.__annotations__` identity holds because both reads see the
     /// cached slot after the first allocation.
     pub w_ann: PyObjectRef,
+    /// PEP 649 `__annotate__` callable (CPython 3.14 `func_annotate`
+    /// slot; `MAKE_FUNCTION` `Annotate` flag) — evaluated with
+    /// `format=1` by the `__annotations__` getter when `w_ann` is
+    /// still unset, then discarded in favour of the stamped dict.
+    /// `PY_NULL` when the compiler emitted eager annotations or none.
+    /// No PyPy counterpart (upstream function.py targets 3.11, before
+    /// PEP 649); the typed slot mirrors how `w_ann` sits on the
+    /// function object rather than a side table.
+    pub w_annotate: PyObjectRef,
     /// `function.py:375 self.w_doc = w_doc` constructor slot plus
     /// `function.py:446-449 fget_func_doc` cache:
     ///
@@ -163,6 +172,9 @@ pub const FUNCTION_W_FUNC_GLOBALS_OBJ_OFFSET: usize =
 /// Field offset of `w_ann` within `Function` — the
 /// `function.py:50 w_ann` annotations dict slot.
 pub const FUNCTION_W_ANN_OFFSET: usize = std::mem::offset_of!(Function, w_ann);
+/// Field offset of `w_annotate` within `Function` — the PEP 649
+/// `__annotate__` callable slot.
+pub const FUNCTION_W_ANNOTATE_OFFSET: usize = std::mem::offset_of!(Function, w_annotate);
 /// Field offset of `w_doc` within `Function` — the
 /// `function.py:375 w_doc` docstring cache slot.
 pub const FUNCTION_W_DOC_OFFSET: usize = std::mem::offset_of!(Function, w_doc);
@@ -213,7 +225,7 @@ pub const FUNCTION_OBJECT_SIZE: usize = std::mem::size_of::<Function>();
 /// W_FloatObject leave the typeptr-shaped header field out of their
 /// `gc_ptr_offsets`. W_TypeObject instances are static-region and
 /// not subject to nursery relocation.
-pub const FUNCTION_GC_PTR_OFFSETS: [usize; 11] = [
+pub const FUNCTION_GC_PTR_OFFSETS: [usize; 12] = [
     FUNCTION_CODE_OFFSET,
     FUNCTION_CLOSURE_OFFSET,
     FUNCTION_DEFS_W_OFFSET,
@@ -227,6 +239,10 @@ pub const FUNCTION_GC_PTR_OFFSETS: [usize; 11] = [
     // `function.py:50 w_ann` — annotations dict, allocated lazily on
     // first read by the getter or stamped at MAKE_FUNCTION time.
     FUNCTION_W_ANN_OFFSET,
+    // PEP 649 `__annotate__` callable stamped by MAKE_FUNCTION's
+    // Annotate flag; live until the first `__annotations__` read
+    // materialises `w_ann`.
+    FUNCTION_W_ANNOTATE_OFFSET,
     // `function.py:375 w_doc` — docstring slot cached on first read.
     FUNCTION_W_DOC_OFFSET,
     // `function.py:54 qualname` — qualified name slot stamped at
@@ -376,6 +392,7 @@ fn function_new_impl(
         w_module: PY_NULL,
         w_func_globals_obj,
         w_ann: PY_NULL,
+        w_annotate: PY_NULL,
         w_doc: PY_NULL,
         w_qualname: PY_NULL,
         w_objclass: PY_NULL,
@@ -891,6 +908,12 @@ pub unsafe fn function_del_doc(obj: PyObjectRef) -> Result<(), crate::PyError> {
 /// (`f.__annotations__ is f.__annotations__`); pyre stamps the slot
 /// the same way through `function_set_annotations`.
 ///
+/// PEP 649 lazy annotations (no PyPy counterpart — upstream targets
+/// 3.11): when `w_ann` is unset but a `w_annotate` callable was
+/// stamped at MAKE_FUNCTION time, evaluate it with `format=1` and
+/// stamp the resulting dict, mirroring CPython 3.14
+/// `func_get_annotations`.
+///
 /// # Safety
 /// `obj` must point to a valid `Function`.
 #[inline]
@@ -903,6 +926,15 @@ pub unsafe fn function_get_annotations(obj: PyObjectRef) -> PyObjectRef {
         let cached = (*func).w_ann;
         if !cached.is_null() {
             return cached;
+        }
+        let annotate_fn = (*func).w_annotate;
+        if !annotate_fn.is_null() && !pyre_object::is_none(annotate_fn) {
+            let dict = crate::call_function(annotate_fn, &[pyre_object::w_int_new(1)]);
+            if !dict.is_null() {
+                function_write_barrier(obj);
+                (*func).w_ann = dict;
+                return dict;
+            }
         }
         let fresh = pyre_object::w_dict_new();
         function_write_barrier(obj);
@@ -2233,6 +2265,7 @@ mod tests {
                 std::mem::offset_of!(Function, w_module),
                 std::mem::offset_of!(Function, w_func_globals_obj),
                 std::mem::offset_of!(Function, w_ann),
+                std::mem::offset_of!(Function, w_annotate),
                 std::mem::offset_of!(Function, w_doc),
                 std::mem::offset_of!(Function, w_qualname),
                 std::mem::offset_of!(Function, w_objclass),

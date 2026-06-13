@@ -911,8 +911,8 @@ fn write_single_exception<W: Write>(writer: &mut W, exc: PyObjectRef) -> std::io
 
 /// `Lib/traceback.py:_format_final_exc_line` notes block — each entry of
 /// `e.__notes__` is printed on its own line after the exception
-/// header.  Notes are stored in ATTR_TABLE as a list of strings by
-/// `BaseException.add_note` (PEP 678).
+/// header.  Notes are stored in the exception's instance dict as a
+/// list of strings by `BaseException.add_note` (PEP 678).
 fn write_exception_notes<W: Write>(writer: &mut W, exc: PyObjectRef) -> std::io::Result<()> {
     if exc.is_null() || !unsafe { pyre_object::is_exception(exc) } {
         return Ok(());

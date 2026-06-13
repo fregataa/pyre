@@ -177,6 +177,7 @@ unsafe fn walk_raw_function_roots(
         visitor(&mut *(&mut func.w_module as *mut PyObjectRef as *mut majit_ir::GcRef));
         visitor(&mut *(&mut func.w_func_globals_obj as *mut PyObjectRef as *mut majit_ir::GcRef));
         visitor(&mut *(&mut func.w_ann as *mut PyObjectRef as *mut majit_ir::GcRef));
+        visitor(&mut *(&mut func.w_annotate as *mut PyObjectRef as *mut majit_ir::GcRef));
         visitor(&mut *(&mut func.w_doc as *mut PyObjectRef as *mut majit_ir::GcRef));
         visitor(&mut *(&mut func.w_qualname as *mut PyObjectRef as *mut majit_ir::GcRef));
         visitor(&mut *(&mut func.w_objclass as *mut PyObjectRef as *mut majit_ir::GcRef));
@@ -564,6 +565,11 @@ fn walk_pyframe_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
             // namespace-dict walk above does not reach; forward those so
             // a cache hit after a moving collection is not stale.
             crate::baseobjspace::walk_method_cache_gc(&mut forward);
+            // The per-pycode `_mapdict_caches` LOAD_METHOD slots hold a
+            // `w_method` pointer (mapdict.py:1418) that no custom trace
+            // reaches — code objects are Box-immortal — so forward those
+            // the same way.
+            crate::pycode::walk_mapdict_method_cache_gc(&mut forward);
         }
     });
 }
@@ -1677,6 +1683,7 @@ impl IterOpcodeHandler for PyFrame {
                 || pyre_object::dictviewobject::is_dict_view_iterator(iter)
                 || pyre_object::enumerateobject::is_enumerate(iter)
                 || pyre_object::callableiteratorobject::is_callable_iterator(iter)
+                || pyre_object::sreobject::is_sre_scanner(iter)
             {
                 return Ok(());
             }
@@ -1843,6 +1850,7 @@ impl IterOpcodeHandler for PyFrame {
                 || pyre_object::enumerateobject::is_enumerate(iter)
                 || pyre_object::callableiteratorobject::is_callable_iterator(iter)
                 || pyre_object::dictviewobject::is_dict_view_iterator(iter)
+                || pyre_object::sreobject::is_sre_scanner(iter)
             {
                 match crate::baseobjspace::next(iter) {
                     Ok(result) => {
@@ -1893,6 +1901,7 @@ impl IterOpcodeHandler for PyFrame {
                 || pyre_object::enumerateobject::is_enumerate(iter)
                 || pyre_object::callableiteratorobject::is_callable_iterator(iter)
                 || pyre_object::dictviewobject::is_dict_view_iterator(iter)
+                || pyre_object::sreobject::is_sre_scanner(iter)
         } {
             let cached = USER_ITER_NEXT_CACHE.with(|c| c.get());
             if !cached.is_null() {
@@ -2700,17 +2709,12 @@ impl OpcodeStepExecutor for PyFrame {
                 unsafe { crate::function::function_set_annotations(func, attr) };
             }
             MakeFunctionFlag::Annotate => {
-                // PEP 649: lazy annotations.  `attr` is a callable
-                // (`__annotate_func__` / `__annotate__`) that the
-                // `__annotations__` getter evaluates with `format=1`
-                // when the runtime dict is requested
-                // (`baseobjspace.rs:3540` annotate fallback for type
-                // annotations; same shape applies to functions).
-                crate::baseobjspace::ATTR_TABLE.with(|table| {
-                    let mut table = table.borrow_mut();
-                    let entry = table.entry(func as usize).or_default();
-                    entry.insert("__annotate_func__".to_string(), attr);
-                });
+                // PEP 649: lazy annotations.  `attr` is the
+                // `__annotate__` callable the `__annotations__` getter
+                // evaluates with `format=1` when the runtime dict is
+                // requested; stored on the function's typed
+                // `w_annotate` slot (CPython 3.14 `func_annotate`).
+                unsafe { (*(func as *mut crate::function::Function)).w_annotate = attr };
             }
             // `MakeFunctionFlag::TypeParams` (oparg.rs:356) carries the
             // tuple of TypeVar / ParamSpec / TypeVarTuple bound by a

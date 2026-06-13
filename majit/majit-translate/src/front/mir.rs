@@ -3533,14 +3533,7 @@ impl<'a> Lowering<'a> {
                 }
             }
             let impl_id = traitref_impl_id(tref, self.llbc, 0)?;
-            let ti = self
-                .llbc
-                .file
-                .translated
-                .rest
-                .get("trait_impls")?
-                .as_array()?
-                .get(impl_id as usize)?;
+            let ti = self.llbc.trait_impls_raw().get(impl_id as usize)?;
             let fn_id = ti.get("methods")?.as_array()?.iter().find_map(|m| {
                 let tm = m.get("kind")?.get("TraitMethod")?.as_array()?;
                 if tm.first()?.as_u64()? != decl_id {
@@ -3610,13 +3603,7 @@ impl<'a> Lowering<'a> {
             return self.resolve_tyexpr_to_adt_def_id(sb);
         }
         if let Some(trait_impl_id) = obj.get("Trait").and_then(serde_json::Value::as_u64) {
-            let trait_impls = self
-                .llbc
-                .file
-                .translated
-                .rest
-                .get("trait_impls")?
-                .as_array()?;
+            let trait_impls = self.llbc.trait_impls_raw();
             let ti = trait_impls.get(trait_impl_id as usize)?;
             let first_ty = ti
                 .as_object()?
@@ -4174,7 +4161,7 @@ fn resolve_impl_owner_adt_def_id_free(
         return resolve_tyexpr_to_adt_def_id_free(llbc, sb);
     }
     if let Some(trait_impl_id) = obj.get("Trait").and_then(serde_json::Value::as_u64) {
-        let trait_impls = llbc.file.translated.rest.get("trait_impls")?.as_array()?;
+        let trait_impls = llbc.trait_impls_raw();
         let ti = trait_impls.get(trait_impl_id as usize)?;
         let first_ty = ti
             .as_object()?
@@ -4221,7 +4208,7 @@ fn trait_impl_trait_path_for_fundecl(llbc: &Llbc, fd: &FunDecl) -> Option<String
         .as_object()?
         .get("Trait")
         .and_then(serde_json::Value::as_u64)?;
-    let trait_impls = llbc.file.translated.rest.get("trait_impls")?.as_array()?;
+    let trait_impls = llbc.trait_impls_raw();
     let ti = trait_impls.get(trait_impl_id as usize)?;
     // `impl_trait` is a TraitDeclRef; its trait-decl id field is `id`.
     let trait_id = ti

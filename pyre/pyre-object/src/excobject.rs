@@ -307,6 +307,12 @@ pub struct W_ExceptionObject {
     /// argument, the args tuple for several) when the slot is unset, and
     /// a later `e.code = x` write persists here ahead of that fallback.
     pub w_code: PyObjectRef,
+    /// `interp_exceptions.py:113 W_BaseException.w_dict = None` — the
+    /// per-instance attribute dict, lazily allocated by `getdict`
+    /// (`:222-225`) and replaced wholesale by `setdict` (`:227-231`).
+    /// Extra attributes (`e.note = ...`, PEP 678 `__notes__`) live
+    /// here.
+    pub w_dict: PyObjectRef,
 }
 
 pub const EXC_KIND_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, kind);
@@ -324,6 +330,7 @@ pub const EXC_W_STRERROR_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject,
 pub const EXC_W_FILENAME_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, w_filename);
 pub const EXC_W_FILENAME2_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, w_filename2);
 pub const EXC_W_CODE_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, w_code);
+pub const EXC_W_DICT_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, w_dict);
 
 /// GC trace offsets for `W_ExceptionObject` — `args_w` plus the three
 /// `PyObjectRef`-shaped chained-exception slots per
@@ -333,10 +340,11 @@ pub const EXC_W_CODE_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, w_c
 /// W_UnicodeTranslateError / W_UnicodeDecodeError / W_UnicodeEncodeError
 /// subclasses, plus the four W_OSError per-class slots (w_errno /
 /// w_strerror / w_filename / w_filename2), plus the W_SystemExit
-/// `w_code` slot.  `kind` is a `u8` tag, `message` is a `*mut String`
-/// (raw heap), and `suppress_context` is a bool — none of those are
-/// GC-traced.
-pub const W_EXCEPTION_GC_PTR_OFFSETS: [usize; 14] = [
+/// `w_code` slot, plus the lazily-allocated `w_dict`
+/// (interp_exceptions.py:113/222-231).  `kind` is a `u8` tag, `message`
+/// is a `*mut String` (raw heap), and `suppress_context` is a bool —
+/// none of those are GC-traced.
+pub const W_EXCEPTION_GC_PTR_OFFSETS: [usize; 15] = [
     EXC_ARGS_W_OFFSET,
     EXC_W_CAUSE_OFFSET,
     EXC_W_CONTEXT_OFFSET,
@@ -351,6 +359,7 @@ pub const W_EXCEPTION_GC_PTR_OFFSETS: [usize; 14] = [
     EXC_W_FILENAME_OFFSET,
     EXC_W_FILENAME2_OFFSET,
     EXC_W_CODE_OFFSET,
+    EXC_W_DICT_OFFSET,
 ];
 
 /// GC type id assigned to `W_ExceptionObject` at JitDriver init time.
@@ -446,6 +455,9 @@ pub fn w_exception_new_empty(kind: ExcKind) -> PyObjectRef {
         // `interp_exceptions.py:990` W_SystemExit class default
         // `w_code = None`.
         w_code: PY_NULL,
+        // `interp_exceptions.py:113 w_dict = None` — allocated on the
+        // first `getdict` (`:222-225`).
+        w_dict: PY_NULL,
     }) as PyObjectRef
 }
 
@@ -649,6 +661,41 @@ pub unsafe fn w_exception_get_traceback(obj: PyObjectRef) -> PyObjectRef {
 pub unsafe fn w_exception_set_traceback(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
         (*(obj as *mut W_ExceptionObject)).w_traceback = value;
+    }
+}
+
+/// `interp_exceptions.py:222-225 getdict` parity —
+///
+/// ```python
+/// def getdict(self, space):
+///     if self.w_dict is None:
+///         self.w_dict = space.newdict(instance=True)
+///     return self.w_dict
+/// ```
+///
+/// # Safety
+/// `obj` must point to a valid `W_ExceptionObject`.
+#[inline]
+pub unsafe fn w_exception_getdict(obj: PyObjectRef) -> PyObjectRef {
+    unsafe {
+        let exc = obj as *mut W_ExceptionObject;
+        if (*exc).w_dict.is_null() {
+            (*exc).w_dict = crate::w_dict_new();
+        }
+        (*exc).w_dict
+    }
+}
+
+/// `interp_exceptions.py:227-231 setdict` parity — writes the `w_dict`
+/// slot.  The non-dict `TypeError` check lives in the caller
+/// (`baseobjspace::setdict`).
+///
+/// # Safety
+/// `obj` must point to a valid `W_ExceptionObject`.
+#[inline]
+pub unsafe fn w_exception_setdict(obj: PyObjectRef, w_dict: PyObjectRef) {
+    unsafe {
+        (*(obj as *mut W_ExceptionObject)).w_dict = w_dict;
     }
 }
 

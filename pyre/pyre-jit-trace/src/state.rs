@@ -9913,9 +9913,14 @@ mod tests {
         let callable = <MIFrame as SharedOpcodeHandler>::pop_value(&mut state)
             .expect("callable should be present");
 
-        assert!(receiver.concrete.to_pyobj().is_null());
+        // callmethod.py:66-68 fast path — a plain function found through the
+        // type, not shadowed by an instance attribute, is pushed unbound as
+        // `[w_descr, w_obj]`; the receiver slot carries the instance.
+        assert_eq!(receiver.concrete.to_pyobj(), instance);
         unsafe {
-            assert!(pyre_object::is_method(callable.concrete.to_pyobj()));
+            assert!(pyre_interpreter::function::is_function(
+                callable.concrete.to_pyobj()
+            ));
         }
     }
 

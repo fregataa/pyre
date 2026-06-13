@@ -18,6 +18,7 @@
 
 use serde::Deserialize;
 use serde_json::Value;
+use serde_json::value::RawValue;
 
 // ---------------------------------------------------------------------------
 // FunDecl + meta
@@ -49,30 +50,44 @@ pub struct FunDecl {
     pub is_global_initializer: Option<u64>,
     /// `body` is `null` for opaque references and one of
     /// `{"Unstructured": {...}}`, `{"Structured": {...}}`, or
-    /// `{"Error": {...}}` otherwise. Kept as raw `Value` so a schema
-    /// change in the unused variants does not break load; project to
-    /// `Unstructured` via [`FunDecl::unstructured`].
-    pub body: Option<Value>,
+    /// `{"Error": {...}}` otherwise. Kept as the raw JSON text (not an
+    /// exploded `Value` tree) so the whole-corpus retained footprint
+    /// stays near the on-disk size; project to `Unstructured` on demand
+    /// via [`FunDecl::unstructured`]. A schema change in the unused
+    /// variants still does not break load.
+    pub body: Option<Box<RawValue>>,
 }
 
 impl FunDecl {
     /// Return the `Unstructured` (basic-block CFG) body if present.
     pub fn unstructured(&self) -> Option<Unstructured> {
+        #[derive(Deserialize)]
+        struct Proj {
+            #[serde(rename = "Unstructured")]
+            unstructured: Unstructured,
+        }
         let body = self.body.as_ref()?;
-        let inner = body.as_object()?.get("Unstructured")?.clone();
-        serde_json::from_value(inner).ok()
+        serde_json::from_str::<Proj>(body.get())
+            .ok()
+            .map(|p| p.unstructured)
     }
 
     /// Returns `Some(msg)` if Charon recorded a translation error
     /// (e.g. `"charon does not support thread local references"`).
     pub fn error_message(&self) -> Option<String> {
+        #[derive(Deserialize)]
+        struct Proj {
+            #[serde(rename = "Error")]
+            error: ErrBody,
+        }
+        #[derive(Deserialize)]
+        struct ErrBody {
+            msg: String,
+        }
         let body = self.body.as_ref()?;
-        let inner = body.as_object()?.get("Error")?;
-        inner
-            .as_object()?
-            .get("msg")
-            .and_then(Value::as_str)
-            .map(String::from)
+        serde_json::from_str::<Proj>(body.get())
+            .ok()
+            .map(|p| p.error.msg)
     }
 }
 
@@ -98,8 +113,6 @@ pub struct TypeDecl {
     pub def_id: u64,
     pub item_meta: ItemMeta,
     pub kind: TypeDeclKind,
-    #[serde(flatten)]
-    pub rest: std::collections::BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -125,8 +138,6 @@ pub struct FieldDecl {
     pub ty: TyRef,
     #[serde(default)]
     pub attr_info: Option<AttrInfo>,
-    #[serde(flatten)]
-    pub rest: std::collections::BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -141,8 +152,6 @@ pub struct VariantDecl {
     /// keeps deserialization total under the schema-drift policy.
     #[serde(default)]
     pub discriminant: Option<Value>,
-    #[serde(flatten)]
-    pub rest: std::collections::BTreeMap<String, Value>,
 }
 
 impl VariantDecl {
@@ -166,8 +175,6 @@ impl VariantDecl {
 pub struct TraitDecl {
     pub def_id: u64,
     pub item_meta: ItemMeta,
-    #[serde(flatten)]
-    pub rest: std::collections::BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -178,8 +185,6 @@ pub struct ItemMeta {
     pub attr_info: AttrInfo,
     #[serde(default)]
     pub is_local: bool,
-    #[serde(flatten)]
-    pub rest: std::collections::BTreeMap<String, Value>,
 }
 
 impl ItemMeta {
@@ -232,7 +237,6 @@ pub struct AttrInfo {
 #[derive(Debug, Deserialize)]
 pub struct Span {
     pub data: SpanData,
-    pub generated_from_span: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -253,8 +257,6 @@ pub struct Signature {
     pub is_unsafe: bool,
     pub inputs: Vec<TyRef>,
     pub output: TyRef,
-    #[serde(flatten)]
-    pub rest: std::collections::BTreeMap<String, Value>,
 }
 
 // ---------------------------------------------------------------------------
@@ -304,8 +306,6 @@ pub struct Unstructured {
     pub locals: Locals,
     pub body: Vec<BasicBlock>,
     pub span: Span,
-    #[serde(flatten)]
-    pub rest: std::collections::BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -349,8 +349,6 @@ impl BasicBlock {
 pub struct Statement {
     /// Raw statement-kind JSON.
     pub kind: Value,
-    #[serde(default)]
-    pub comments_before: Vec<Value>,
     pub span: Span,
 }
 
@@ -515,8 +513,6 @@ pub enum TermKind {
     Drop {
         target: u64,
         on_unwind: u64,
-        #[serde(flatten)]
-        rest: Value,
     },
     #[serde(other)]
     Unknown,

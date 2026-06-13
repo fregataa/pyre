@@ -47,6 +47,7 @@ pub mod rangeobject;
 pub mod setobject;
 pub mod sliceobject;
 pub mod specialisedtupleobject;
+pub mod sreobject;
 pub mod strobject;
 pub mod superobject;
 pub mod tupleobject;

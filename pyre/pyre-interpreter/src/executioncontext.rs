@@ -11,9 +11,13 @@ use crate::PyFrame;
 fn trace_frame_type() -> PyObjectRef {
     static TYPE: OnceLock<usize> = OnceLock::new();
     let raw = *TYPE.get_or_init(|| {
-        let tp = crate::typedef::make_builtin_type("frame", |ns| {
-            crate::dict_storage_store(ns, "__dict__", pyre_object::w_none());
-        });
+        let tp = crate::typedef::make_builtin_type("frame", |_| {});
+        // The wrapper wants a per-instance mapdict store; a `__dict__`
+        // rawdict key would instead claim the typedef manages the dict
+        // (typedef.py:40) and suppress the mapdict one
+        // (typeobject.py:253-257), so flip `hasdict` directly — the
+        // `create_dict_slot` flag flip (typeobject.py:1222-1226).
+        unsafe { pyre_object::w_type_set_hasdict(tp, true) };
         tp as usize
     });
     raw as PyObjectRef

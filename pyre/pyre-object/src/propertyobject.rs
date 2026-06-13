@@ -12,12 +12,20 @@ use pyre_macros::pyre_class;
 
 /// Python property descriptor object.
 ///
-/// Layout: `[ob_type | fget | fset | fdel]`
+/// Layout: `[ob_type | fget | fset | fdel | w_doc | getter_doc]`
 #[pyre_class("property", type_id = 19, static_name = "PROPERTY")]
 pub struct W_PropertyObject {
     pub fget: PyObjectRef,
     pub fset: PyObjectRef,
     pub fdel: PyObjectRef,
+    /// `descriptor.py:181 self.w_doc = space.w_None` — the instance
+    /// `__doc__` exposed through `GetSetProperty(get_doc, set_doc)`
+    /// (descriptor.py:316-318).  NULL plays None.
+    pub w_doc: PyObjectRef,
+    /// `descriptor.py:182 self.getter_doc = False` — True when the doc
+    /// was copied from `fget.__doc__` (descriptor.py:196-204); `_copy`
+    /// uses it to drop the inherited doc when the getter is replaced.
+    pub getter_doc: bool,
 }
 
 /// Allocate a new property object.
@@ -37,6 +45,8 @@ pub fn w_property_new(fget: PyObjectRef, fset: PyObjectRef, fdel: PyObjectRef) -
         fget,
         fset,
         fdel,
+        w_doc: PY_NULL,
+        getter_doc: false,
     })
 }
 
@@ -50,6 +60,28 @@ pub unsafe fn w_property_get_fset(obj: PyObjectRef) -> PyObjectRef {
 
 pub unsafe fn w_property_get_fdel(obj: PyObjectRef) -> PyObjectRef {
     (*(obj as *const W_PropertyObject)).fdel
+}
+
+/// `descriptor.py:249-250 W_Property.get_doc` — returns the raw slot
+/// (NULL plays None; the caller wraps).
+pub unsafe fn w_property_get_doc(obj: PyObjectRef) -> PyObjectRef {
+    (*(obj as *const W_PropertyObject)).w_doc
+}
+
+/// `descriptor.py:252-254 W_Property.set_doc` — explicit doc writes
+/// also clear `getter_doc`.
+pub unsafe fn w_property_set_doc(obj: PyObjectRef, w_doc: PyObjectRef) {
+    let prop = obj as *mut W_PropertyObject;
+    (*prop).w_doc = w_doc;
+    (*prop).getter_doc = false;
+}
+
+/// `descriptor.py:199-204` — stamp a doc inherited from `fget.__doc__`
+/// at construction time, marking `getter_doc`.
+pub unsafe fn w_property_set_getter_doc(obj: PyObjectRef, w_doc: PyObjectRef) {
+    let prop = obj as *mut W_PropertyObject;
+    (*prop).w_doc = w_doc;
+    (*prop).getter_doc = true;
 }
 
 #[inline]

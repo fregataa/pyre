@@ -330,7 +330,8 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
                 // resolves `__repr__` to `object` — fall through to the
                 // tuple formatting in that case rather than printing the
                 // generic `<object at ...>`.
-                if let Some((src, method)) = crate::baseobjspace::lookup_where(w_class, "__repr__")
+                if let Some((src, method)) =
+                    crate::baseobjspace::lookup_where_with_method_cache(w_class, "__repr__")
                 {
                     if !std::ptr::eq(src, crate::typedef::w_object()) && !method.is_null() {
                         // A raising override propagates; a non-string return is
@@ -580,6 +581,12 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
                     py_repr(step)?
                 )
             }
+        } else if pyre_object::sreobject::is_sre_pattern(obj) {
+            // `pypy/module/_sre/interp_sre.py:153 W_SRE_Pattern.repr_w`.
+            crate::module::_sre::interp_sre::sre_pattern_repr_str(obj)?
+        } else if pyre_object::sreobject::is_sre_match(obj) {
+            // `pypy/module/_sre/interp_sre.py:684 W_SRE_Match.repr_w`.
+            crate::module::_sre::interp_sre::sre_match_repr_str(obj)?
         } else if std::ptr::eq(tp, &INSTANCE_TYPE as *const PyType) {
             // Try __repr__ first, then __str__
             if let Some(s) = try_call_dunder(obj, "__repr__")? {

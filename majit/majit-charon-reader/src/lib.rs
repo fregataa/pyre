@@ -28,6 +28,7 @@ pub use ullbc::{
     TypeDecl, TypeDeclKind, Unstructured, VariantDecl,
 };
 
+use serde::Deserialize;
 use std::path::Path;
 
 /// Loaded `.llbc` / `.ullbc` artefact + lookup helpers.
@@ -74,21 +75,24 @@ impl Llbc {
 
     /// Parse a `.llbc` / `.ullbc` artefact from an in-memory byte slice.
     pub fn from_slice(bytes: &[u8]) -> Result<Self, SchemaError> {
-        // Parse to `Value` first so we can scan every nested
-        // `HashConsedValue` entry; then re-deserialize the same JSON
-        // into the typed `LlbcFile`.  Peak memory is ~3× the bytes
-        // (input slice + Value + LlbcFile) but settles back to
-        // LlbcFile + small `dedup_adt` / `dedup_body` once the Value
-        // is dropped.
-        let raw: serde_json::Value = serde_json::from_slice(bytes).map_err(SchemaError::Parse)?;
+        // Two single-purpose passes over `bytes`, never a full
+        // `serde_json::Value` of the whole document (which costs
+        // ~26× the input bytes as an exploded node tree):
+        //   1. `collect_dedup_bodies` scans the raw bytes for inline
+        //      `"HashConsedValue":[id, body]` occurrences, parsing only
+        //      each small `body` and discarding the rest.
+        //   2. `from_slice` streams the bytes straight into the typed
+        //      `LlbcFile` without the intermediate Value.
+        // Peak settles at the larger of {bytes + dedup bodies} and
+        // {bytes + LlbcFile}.
         let mut dedup_adt: Vec<(u64, u64)> = Vec::new();
         let mut dedup_body: Vec<(u64, serde_json::Value)> = Vec::new();
-        collect_dedup_bodies(&raw, &mut dedup_adt, &mut dedup_body);
+        collect_dedup_bodies(bytes, &mut dedup_adt, &mut dedup_body);
         dedup_adt.sort_by_key(|&(id, _)| id);
         dedup_adt.dedup_by_key(|p| p.0);
         dedup_body.sort_by_key(|p| p.0);
         dedup_body.dedup_by_key(|p| p.0);
-        let file: LlbcFile = serde_json::from_value(raw).map_err(SchemaError::Parse)?;
+        let file: LlbcFile = serde_json::from_slice(bytes).map_err(SchemaError::Parse)?;
         Ok(Self {
             file,
             dedup_adt,
@@ -197,13 +201,7 @@ impl Llbc {
     /// type (`kind: {"TraitType": [trait_id, idx]}`) to a concrete
     /// type in its `types[].skip_binder.value`.
     pub fn trait_impls_raw(&self) -> &[serde_json::Value] {
-        self.file
-            .translated
-            .rest
-            .get("trait_impls")
-            .and_then(serde_json::Value::as_array)
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
+        &self.file.translated.trait_impls
     }
 
     /// Iterate over every present `FunDecl` (skipping opaque `null` entries).
@@ -232,40 +230,48 @@ impl Llbc {
     }
 }
 
-/// Walk a raw `Value` tree, recording every inline
-/// `HashConsedValue: [id, body]` occurrence.  Records the body into
-/// `bodies` (the generic dedup-id → body index) and, when the body
-/// decodes as `{"Adt": {"id": {"Adt": <def_id>}}}`, also into `adt`
-/// (the dedup-id → ADT def_id index for fast Adt resolution).  Used
-/// during [`Llbc::from_slice`].
+/// Scan the raw LLBC bytes for every inline
+/// `"HashConsedValue":[id, body]` occurrence, recording the first
+/// `body` seen per `id` into `bodies` (the generic dedup-id → body
+/// index) and, when the body decodes as `{"Adt": {"id": {"Adt":
+/// <def_id>}}}`, also into `adt` (the dedup-id → ADT def_id index for
+/// fast Adt resolution).  Used during [`Llbc::from_slice`].
+///
+/// Operating on the raw bytes — rather than a fully materialised
+/// `serde_json::Value` of the whole document — keeps peak memory at the
+/// few thousand small type bodies actually deduplicated, instead of the
+/// ~26× blow-up of an exploded Value tree. The byte scan finds nested
+/// occurrences automatically (each is its own literal in the text), and
+/// a `seen` set keeps only the first body per `id` — every occurrence of
+/// a hash-consed `id` carries an identical body, so the choice is
+/// immaterial and the post-sort `dedup_by_key` result is unchanged.
 fn collect_dedup_bodies(
-    v: &serde_json::Value,
+    bytes: &[u8],
     adt: &mut Vec<(u64, u64)>,
     bodies: &mut Vec<(u64, serde_json::Value)>,
 ) {
-    match v {
-        serde_json::Value::Object(m) => {
-            if let Some(arr) = m
-                .get("HashConsedValue")
-                .and_then(serde_json::Value::as_array)
-                && arr.len() == 2
-                && let Some(id) = arr[0].as_u64()
-            {
-                if let Some(def_id) = adt_def_id_from_ty_body(&arr[1]) {
+    // The artefact is UTF-8 JSON; on the off chance it is not, there are
+    // no HashConsedValue entries to find and the typed parse will fail
+    // loudly downstream.
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return;
+    };
+    const KEY: &str = "\"HashConsedValue\":";
+    let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    for (off, _) in text.match_indices(KEY) {
+        let val_start = off + KEY.len();
+        // The value after the key is the `[id, body]` array; deserialize
+        // exactly that one value (the deserializer stops at the array's
+        // close, ignoring the trailing document).
+        let mut de = serde_json::Deserializer::from_slice(&bytes[val_start..]);
+        if let Ok((id, body)) = <(u64, serde_json::Value)>::deserialize(&mut de) {
+            if seen.insert(id) {
+                if let Some(def_id) = adt_def_id_from_ty_body(&body) {
                     adt.push((id, def_id));
                 }
-                bodies.push((id, arr[1].clone()));
-            }
-            for vv in m.values() {
-                collect_dedup_bodies(vv, adt, bodies);
+                bodies.push((id, body));
             }
         }
-        serde_json::Value::Array(arr) => {
-            for vv in arr {
-                collect_dedup_bodies(vv, adt, bodies);
-            }
-        }
-        _ => {}
     }
 }
 

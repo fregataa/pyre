@@ -19,14 +19,13 @@ use std::sync::OnceLock;
 fn sys_namespace_type() -> PyObjectRef {
     static TYPE: OnceLock<usize> = OnceLock::new();
     let raw = *TYPE.get_or_init(|| {
-        let tp = crate::typedef::make_builtin_type("sys.namespace", |ns| {
-            // typedef.py:34 — presence of `__dict__` in the init namespace
-            // is what flips `hasdict` on the resulting type (see
-            // typedef.rs:541/554). The value itself is never read; PyPy
-            // stores a `GetSetProperty` there, but the Rust port only needs
-            // the key to light up the per-instance attribute store.
-            dict_storage_store(ns, "__dict__", w_none());
-        });
+        let tp = crate::typedef::make_builtin_type("sys.namespace", |_| {});
+        // The stubs want a per-instance mapdict store; a `__dict__`
+        // rawdict key would instead claim the typedef manages the dict
+        // (typedef.py:40) and suppress the mapdict one
+        // (typeobject.py:253-257), so flip `hasdict` directly — the
+        // `create_dict_slot` flag flip (typeobject.py:1222-1226).
+        unsafe { w_type_set_hasdict(tp, true) };
         tp as usize
     });
     raw as PyObjectRef

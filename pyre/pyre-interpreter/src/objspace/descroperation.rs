@@ -17,7 +17,7 @@ use rustpython_wtf8::Wtf8Buf;
 
 use crate::baseobjspace::{
     getattr, getitem, is_true, issubtype_w, lookup, lookup_in_type, lookup_in_type_where,
-    lookup_where, p_abstract_issubclass_w, unwrap_cell,
+    lookup_where_with_method_cache, p_abstract_issubclass_w, unwrap_cell,
 };
 pub use crate::{PyError, PyErrorKind, PyResult};
 
@@ -962,7 +962,7 @@ unsafe fn try_instance_unaryop(a: PyObjectRef, dunder: &str) -> Option<PyResult>
 /// `str`/`list`/`tuple` install `__add__`/`__radd__` on their own type;
 /// an inherited (non-overridden) lookup resolves back to `tp`.
 unsafe fn dunder_overridden(obj: PyObjectRef, dunder: &str, tp: PyObjectRef) -> bool {
-    match crate::typedef::r#type(obj).and_then(|t| lookup_where(t, dunder)) {
+    match crate::typedef::r#type(obj).and_then(|t| lookup_where_with_method_cache(t, dunder)) {
         Some((src, _)) => !std::ptr::eq(src, tp),
         None => false,
     }
@@ -1581,7 +1581,7 @@ pub(crate) fn try_dispatch_binary_special(
         let Some(w_typ2) = crate::typedef::r#type(rhs) else {
             return Ok(None);
         };
-        let (w_left_src, mut w_left_impl) = match lookup_where(w_typ1, dunder) {
+        let (w_left_src, mut w_left_impl) = match lookup_where_with_method_cache(w_typ1, dunder) {
             Some((src, imp)) => (Some(src), Some(imp)),
             None => (None, None),
         };
@@ -1591,7 +1591,7 @@ pub(crate) fn try_dispatch_binary_special(
         // descroperation.py:652 — same type means the reflected method is
         // never considered.
         if !std::ptr::eq(w_typ1, w_typ2) {
-            let (w_right_src, wri) = match lookup_where(w_typ2, rdunder) {
+            let (w_right_src, wri) = match lookup_where_with_method_cache(w_typ2, rdunder) {
                 Some((src, imp)) => (Some(src), Some(imp)),
                 None => (None, None),
             };

@@ -2342,10 +2342,9 @@ fn make_exc_type_with_init(
                 // `interp_exceptions.py:236-247 BaseException.add_note`
                 // (Python 3.11+ PEP 678).  Appends a string to
                 // `self.__notes__`, allocating the list on first call.
-                // The list lives in ATTR_TABLE rather than a typed
-                // W_ExceptionObject slot — notes are a rare attribute,
-                // and the per-instance side store already handles
-                // `e.__notes__` reads via baseobjspace::getattr_str.
+                // The list lives in the exception's instance dict
+                // (`W_ExceptionObject.w_dict`), reached through the
+                // setattr/getattr paths in baseobjspace.
                 crate::dict_storage_store(
                     ns,
                     "add_note",

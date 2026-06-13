@@ -74,9 +74,11 @@ pub struct W_CodeObject {
     /// attribute cache (`mapdict.py:1480/1574`).  A `None` slot is PyPy's
     /// `INVALID_CACHE_ENTRY` (mapdict.py:1452); a `Some` holds the immortal map
     /// node + attribute node + `version_tag` last resolved for this slot, so a
-    /// monomorphic re-read skips the type lookup + map walk.  Holds no movable
-    /// reference (see [`crate::objspace::std::mapdict::MapdictCacheEntry`]), so —
-    /// like `globals_caches` — it carries no GC roots and is never walked.
+    /// monomorphic re-read skips the type lookup + map walk.  The
+    /// LOAD_METHOD fill additionally stores a movable `w_method`
+    /// reference (mapdict.py:1418), forwarded during collection by
+    /// `walk_mapdict_method_cache_gc`; the other fields are immortal
+    /// node pointers and need no walking.
     ///
     /// Owned via `Box::into_raw`, sized to `code.names.len()` at construction,
     /// never resized; `null` when `code_ptr` is null or unaligned.
@@ -556,7 +558,53 @@ pub unsafe fn w_code_mapdict_caches_set(
     let vec = unsafe { &mut *code.mapdict_caches };
     if let Some(slot) = vec.get_mut(nameindex) {
         *slot = Some(entry);
+        // The LOAD_METHOD fill (mapdict.py:1474) stores a movable
+        // `w_method` reference; register this code object so
+        // `walk_mapdict_method_cache_gc` forwards the slot.
+        if !entry.w_method.is_null() {
+            MAPDICT_METHOD_CACHE_CODES.with(|s| {
+                s.borrow_mut().insert(obj as usize);
+            });
+        }
     }
+}
+
+thread_local! {
+    /// Code objects whose `_mapdict_caches` hold (or once held) a filled
+    /// `w_method` slot.  In PyPy `CacheEntry.w_method` (mapdict.py:1418)
+    /// is traced through the GC-managed `PyCode`; pyre code objects are
+    /// Box-immortal (`w_code_new` → `Box::into_raw`), so no trace
+    /// reaches the slot — the extra-root walker forwards it through
+    /// this registry instead (same family as `walk_method_cache_gc`).
+    /// Entries are immortal code pointers, so they never dangle; the
+    /// registry retires when code objects become GC-managed.
+    static MAPDICT_METHOD_CACHE_CODES: std::cell::RefCell<std::collections::HashSet<usize>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+/// Forward every filled `entry.w_method` slot during collection — the
+/// faithful equivalent of the GC tracing PyPy's `CacheEntry.w_method`
+/// (mapdict.py:1418) gets through its GC-managed holder.  The cached
+/// map/attr node pointers are immortal interned nodes and the
+/// `version_tag` is a `u64`, so `w_method` is the entry's only movable
+/// reference.
+pub(crate) unsafe fn walk_mapdict_method_cache_gc(forward: &mut dyn FnMut(&mut PyObjectRef)) {
+    MAPDICT_METHOD_CACHE_CODES.with(|s| {
+        for &code in s.borrow().iter() {
+            let code = unsafe { &*(code as *const W_CodeObject) };
+            if code.mapdict_caches.is_null() {
+                continue;
+            }
+            let vec = unsafe { &mut *code.mapdict_caches };
+            for slot in vec.iter_mut() {
+                if let Some(entry) = slot.as_mut() {
+                    if !entry.w_method.is_null() {
+                        forward(&mut entry.w_method);
+                    }
+                }
+            }
+        }
+    });
 }
 
 /// Number of `_mapdict_caches` slots — equals `len(co_names_w)` at construction
