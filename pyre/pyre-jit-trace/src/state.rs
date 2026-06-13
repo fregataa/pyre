@@ -1997,6 +1997,16 @@ pub struct PyreSym {
     /// Virtualizable object pointer (PyFrame).
     /// RPython MetaInterp stores the virtualizable separately from MIFrame.
     pub(crate) concrete_vable_ptr: *mut u8,
+    /// Live (interpreter-owned) virtualizable `PyFrame` behind the tracing
+    /// snapshot, or 0 when tracing runs without one (tests).
+    /// `concrete_vable_ptr` points at the `snapshot_for_tracing` copy whose
+    /// `debugdata` / `lastblock` are owned clones freed when the snapshot
+    /// drops; vable-statics capture (`flush_to_frame`) reads those
+    /// pointer-valued fields from this frame so the trace's resume data
+    /// never carries snapshot-owned pointers.  RPython has no snapshot —
+    /// `read_boxes` (virtualizable.py:86-93) always reads the live
+    /// virtualizable, which is what this field restores.
+    pub(crate) live_vable_frame_addr: usize,
     /// Function-entry traces use typed locals (RPython MIFrame parity).
     pub(crate) is_function_entry_trace: bool,
     /// RPython MetaInterp.last_exc_value (pyjitpl.py:2745): concrete
@@ -3583,6 +3593,7 @@ impl PyreSym {
             is_function_entry_trace: false,
             concrete_execution_context: std::ptr::null(),
             concrete_vable_ptr: std::ptr::null_mut(),
+            live_vable_frame_addr: 0,
             last_exc_value: std::ptr::null_mut(),
             class_of_last_exc_is_const: false,
             last_exc_box: OpRef::NONE,
@@ -8511,6 +8522,9 @@ mod tests {
                 callee_frame_helper: |_| None,
                 recursive_force_cache_safe: |_| false,
                 jit_drop_callee_frame: std::ptr::null(),
+                jit_frame_set_slot_ref: std::ptr::null(),
+                jit_frame_set_slot_int: std::ptr::null(),
+                jit_frame_set_slot_float: std::ptr::null(),
                 jit_force_callee_frame: std::ptr::null(),
                 jit_force_recursive_call_1: std::ptr::null(),
                 jit_force_recursive_call_argraw_boxed_1: std::ptr::null(),
@@ -11164,6 +11178,15 @@ pub struct PendingInlineFrame {
     pub nargs: usize,
     pub caller_result_stack_idx: Option<usize>,
     pub caller_result_type: Option<Type>,
+    /// Symbolic callable + arg OpRefs of the CALL that pushed this frame.
+    /// Consumed by the inline back-edge CALL_ASSEMBLER path
+    /// (`do_recursive_call`) to shape the GuardNotForced /
+    /// GuardNoException resume via `push_call_replay_stack` — on guard
+    /// failure the parent re-executes the CALL, mirroring the residual
+    /// call capture. `OpRef::NONE` when the path is unavailable
+    /// (bridge-reconstructed frames).
+    pub replay_callable: OpRef,
+    pub replay_args: Vec<OpRef>,
 }
 
 /// Reify one Ref-bank recipe slot as the boxed `W_Root` pointer that
@@ -11302,6 +11325,11 @@ pub(crate) fn assemble_bridge_inline_pending(
         nargs: recipe.nargs,
         caller_result_stack_idx: None,
         caller_result_type: Some(Type::Ref),
+        // Reconstructed frames carry no CALL-site OpRefs; the inline
+        // back-edge CALL_ASSEMBLER path requires drop_frame_opref and
+        // is gated out for them anyway.
+        replay_callable: OpRef::NONE,
+        replay_args: Vec::new(),
     }
 }
 

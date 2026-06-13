@@ -1056,6 +1056,20 @@ pub enum DispatchError {
     /// own-portal callee frame is registered as the standard virtualizable
     /// (a perf follow-up).
     NonStandardVableFinishPortalUnsupported { pc: usize },
+    /// A residual call to a pure-Python callee that is inline-eligible
+    /// (plain, exact-positional, closure-free, not recursion-bound) but
+    /// whose body is NOT a straight-line leaf — it carries an internal loop
+    /// or branch (`goto_if_not` / `switch`) or a non-static `vable` op, so
+    /// the fast-path register-seeding inline (`try_walker_inline_user_call`)
+    /// declines.  Emitting the residual leaves the callee re-interpreted per
+    /// iteration (and its short inner loops compile + deopt-storm), strictly
+    /// slower than interpreting.  The trait tracer inlines such callees via
+    /// `push_inline_frame` + the `recursive-call-assembler` loop back-edge
+    /// (`metainterp.rs` opimpl_recursive_call_assembler).  Surface a typed
+    /// abort so the key routes to the trait leg (`FBW_DECLINED_KEYS`) until
+    /// the walker itself covers loop-callee inlining (task #62, the Phase-6
+    /// convergence).
+    LoopBearingCalleeInlineUnsupported { pc: usize },
 }
 
 /// Walk one opcode at `pc` and return the dispatch outcome plus the
@@ -4536,33 +4550,24 @@ fn try_execute_residual_call_via_executor(
             return Ok(None);
         }
     }
-    // Void-result calls (STORE_SUBSCR / list.append / dict.__setitem__ etc.)
-    // carry no value the walk specializes on — only their side effect.
-    //
     // `do_residual_call` (pyjitpl.py:2040/2104/2123 for CALL_MAY_FORCE_N /
-    // CALL_LOOPINVARIANT_N / CALL_N) still runs `executor.execute_varargs` for a
-    // void call, applying the side effect once during tracing, and then resumes
-    // the compiled loop at the *next* iteration (`raise_continue_running_normally`,
-    // pyjitpl.py:3072-3091, hands back the end-of-iteration-N state).  The
-    // full-body walk cannot mirror that eager step: it is a SYMBOLIC walk that
-    // does not advance the interpreter, so the compiled loop re-enters at the
-    // traced iteration N (entry = loop header) and re-runs the body.  Executing
-    // the helper here would land the heap mutation twice — once now, once when
-    // the compiled loop re-runs iteration N.  Record the call symbolically
-    // instead: falling through with `None` leaves the recorded residual op in
-    // the trace, so the compiled loop applies the side effect exactly once.
-    // That is the FBW-correct equivalent of the eager step, and the net
-    // once-per-iteration effect matches the trait path.  (Every `None`
-    // from this function marks `FBW_UNJOURNALED_EFFECT` at the dispatch
-    // sites, keeping the walk-end no-replay commit off for this trace.)
+    // CALL_LOOPINVARIANT_N / CALL_N) runs `executor.execute_varargs` for a void
+    // call exactly like the value-returning shapes, applying the side effect
+    // once during tracing and then resuming the compiled loop at the *next*
+    // iteration (`raise_continue_running_normally`, pyjitpl.py:3072-3091, hands
+    // back the end-of-iteration-N state so iteration N is never re-run).  Pyre
+    // mirrors the second half via the walk-end commit
+    // (`flush_walk_end_state_to_frame`, run_perfn_walk): a successful commit
+    // adopts the end-of-walk frame so the compiled loop enters at iteration
+    // N+1, leaving the eagerly-applied side effect counted once.  Executing
+    // void calls here (rather than recording-only) keeps that invariant whole —
+    // a deferred void store would be lost on commit (its symbolic op only fires
+    // for N+1+), which is why deferral previously forced the no-commit legacy
+    // replay.  The replay path that re-runs iteration N has the symmetric
+    // hazard for already-executed value calls (e.g. `list.insert` returns the
+    // None ref, so it is not a void call yet still mutates) — eager-everything +
+    // commit is the single consistent rule, matching `do_residual_call`.
     //
-    // The per-opcode arm walk has NO replay behind it (the interpreter
-    // advances opcode by opcode; the compiled loop enters at the next
-    // iteration), so a declined void effect would be lost, not deferred —
-    // it executes eagerly below, the direct `execute_varargs` analogue.
-    if ctx.is_full_body_walk && call_descr.result_type() == majit_ir::Type::Void {
-        return Ok(None);
-    }
     // pyjitpl.py:3329-3330 `vinfo.tracing_before_residual_call(virtualizable)`
     // heap half: every decline gate has passed, so the helper WILL execute —
     // set TOKEN_TRACING_RESCALL on the active virtualizable so a force
@@ -7179,11 +7184,24 @@ fn try_walker_inline_user_call(
     // residual_call args).  A callee that materializes a frame — any
     // `*_vable_*` op, emitted when a local must survive a sub-call —
     // reads from the unseeded frame box; inlining it would abort the
-    // *whole* enclosing trace with `VableBoxNotSeeded`.  Decline such
-    // callees (and the zero-param case) so the call lowers to an ordinary
-    // residual call rather than aborting (orthodox non-inlinable path).
-    if nparams == 0 || !callee_fast_path_inlinable(body.code, callee_descr_refs, ctx) {
+    // *whole* enclosing trace with `VableBoxNotSeeded`.
+    //
+    // The zero-param case lowers to an ordinary residual call (orthodox
+    // non-inlinable path); a residual zero-arg call is cheap and the trait
+    // leg has no positional-arg inline win to recover.
+    if nparams == 0 {
         return Ok(None);
+    }
+    // A param-bearing Python callee that is otherwise inline-eligible but
+    // whose body is not a straight-line leaf (loop / branch / non-static
+    // vable) cannot be served by the fast-path register seeding.  Emitting
+    // the residual leaves it re-interpreted per iteration and lets its short
+    // inner loops compile + deopt-storm — strictly slower than interpreting.
+    // The trait leg inlines such callees via `push_inline_frame` +
+    // `recursive-call-assembler`, so route the enclosing key there
+    // (`FBW_DECLINED_KEYS`) instead of recording the slow residual.
+    if !callee_fast_path_inlinable(body.code, callee_descr_refs, ctx) {
+        return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: op.pc });
     }
 
     // Path-1 (#68): the inlined callee's compile-time-constant frame fields,

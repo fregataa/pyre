@@ -21,6 +21,53 @@ impl pyre_interpreter::ControlFlowOpcodeHandler for crate::state::MIFrame {
             let back_edge_key = crate::driver::make_green_key(code_ptr, target);
             // pyjitpl.py:2951 self.heapcache.reset()
             ctx.heap_cache_mut().reset();
+            // opimpl_jit_merge_point parity (pyjitpl.py:1551,1565-1602): a
+            // back-edge reached while an inline callee frame is active
+            // (portal_call_depth>0) must NOT be unrolled like a root loop.
+            // Its `close_loop_args_at` JUMP arg-set is built from the inline
+            // callee's frame shape and diverges from the immutable root LABEL
+            // (the 20-vs-17 arity crash). RPython resumes the parent via
+            // finishframe + do_recursive_call(assembler_call=True) into the
+            // loop token (pyjitpl.py:1579-1602). When the callee loop's
+            // green key already has compiled code and the parent is the
+            // root frame, take that path: signal the metainterp to pop the
+            // inline frame and record a CALL_ASSEMBLER from the parent.
+            // Otherwise fall back to aborting the trace and stopping the
+            // root key so the callee loop compiles standalone first
+            // (warmstate.py:714 get_assembler_token would synthesize a
+            // compile_tmp_callback token here; until that is wired through
+            // the walker, gate strictly on compiled presence). The
+            // discriminators are set here and drained in
+            // `trace_step_result_to_action` where the frame stack and
+            // warm-state bookkeeping are reachable.
+            let is_inline = !this.parent_frames.is_empty();
+            if is_inline {
+                let parent_is_root = this.parent_frames.len() == 1;
+                let token_compiled = {
+                    let (driver, _) = crate::driver::driver_pair();
+                    driver.get_loop_token_number(back_edge_key).is_some()
+                };
+                if majit_metainterp::majit_log_enabled() {
+                    let (driver, _) = crate::driver::driver_pair();
+                    let mi_inline_depth = driver.meta_interp().inline_depth();
+                    eprintln!(
+                        "[jit][inline-loop-back-edge] parent_frames={} mi_inline_depth={} key={} target_pc={} sym_nlocals={} parent_is_root={} token_compiled={}",
+                        this.parent_frames.len(),
+                        mi_inline_depth,
+                        back_edge_key,
+                        target,
+                        this.sym().nlocals,
+                        parent_is_root,
+                        token_compiled,
+                    );
+                }
+                if parent_is_root && token_compiled {
+                    ctx.request_recursive_call_assembler(back_edge_key, target);
+                } else {
+                    ctx.request_inline_loop_abort();
+                }
+                return Ok(None);
+            }
             // pyjitpl.py:2957-2965 build live_arg_boxes ONCE.
             let live_args =
                 crate::state::MIFrame::close_loop_args_at(this, ctx, Some(target));

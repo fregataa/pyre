@@ -702,6 +702,80 @@ pub(crate) fn write_stack_slot(
     }
 }
 
+/// Write an inline callee frame's live state back to its heap `PyFrame`
+/// before a loop-token CALL_ASSEMBLER (opimpl_jit_merge_point
+/// portal_call_depth>0 → do_recursive_call, pyjitpl.py:1579-1602).
+///
+/// The callee's compiled loop reads `locals_cells_stack_w` /
+/// `last_instr` / `valuestackdepth` from the frame object at entry
+/// (virtualizable.py:86-98 read_boxes), but the inlined prefix advanced
+/// those values only in the symbolic register banks; the runtime frame
+/// still holds its creation-time state (call args). Emit the
+/// virtualizable write_boxes shape (virtualizable.py:99-110):
+/// SETFIELD_GC for the per-call statics + one residual helper CALL per
+/// live array slot. Slots never touched symbolically (`OpRef::NONE`)
+/// keep their runtime creation value.
+///
+/// The other four statics (`pycode`, `debugdata`, `lastblock`,
+/// `w_globals`) are correct from frame creation and have no mutators
+/// under CPython 3.14 bytecode (see `flush_to_frame_for_guard`).
+pub(crate) fn gen_writeback_inline_frame_to_heap(
+    ctx: &mut TraceCtx,
+    sym: &mut PyreSym,
+    frame_opref: OpRef,
+    target_pc: usize,
+    valuestackdepth: usize,
+) {
+    let info = crate::frame_layout::build_pyframe_virtualizable_info();
+
+    // last_instr = target_pc - 1 so the compiled loop's next_instr()
+    // lands on the merge point (pyjitpl.py:2973 reached_loop_header pin).
+    let last_instr = ctx.const_int(target_pc as i64 - 1);
+    if let Some(idx) = info.static_field_index_by_name("last_instr") {
+        let descr = info.static_field_descr(idx);
+        ctx.vable_setfield_descr(frame_opref, last_instr, descr);
+    }
+    let vsd = ctx.const_int(valuestackdepth as i64);
+    if let Some(idx) = info.static_field_index_by_name("valuestackdepth") {
+        let descr = info.static_field_descr(idx);
+        ctx.vable_setfield_descr(frame_opref, vsd, descr);
+    }
+
+    // locals_cells_stack_w items, emitted as residual helper CALLs
+    // (jit_frame_set_slot_{ref,int,float}) rather than SetarrayitemGc.
+    // direct_assembler_call (pyjitpl.py:3613) passes the red boxes as
+    // CALL_ASSEMBLER args, so virtual values among them are forced at
+    // the call; pyre's uniform `[frame, ec]` loop ABI delivers the reds
+    // through the heap frame instead, and making each slot value a call
+    // argument keeps the same force-at-call property. The raw int/float
+    // helper variants box runtime-side (w_int_new / w_float_new), so no
+    // boxing ops enter the trace. GC visibility of the stored refs
+    // between these stores and the compiled loop's entry loads is
+    // covered by `walk_jit_callee_frame_roots` (pyre-jit::call_jit) —
+    // the heap frame sits on no `CURRENT_FRAME` chain while compiled
+    // code runs.
+    let cb = crate::callbacks::get();
+    for slot in 0..valuestackdepth {
+        let Some(&value) = sym.registers_r.get(slot) else {
+            break;
+        };
+        if value == OpRef::NONE {
+            continue;
+        }
+        let index = ctx.const_int(slot as i64);
+        let (helper, value_type) = match ctx.get_opref_type(value) {
+            Some(Type::Int) => (cb.jit_frame_set_slot_int, Type::Int),
+            Some(Type::Float) => (cb.jit_frame_set_slot_float, Type::Float),
+            _ => (cb.jit_frame_set_slot_ref, Type::Ref),
+        };
+        ctx.call_void_typed(
+            helper,
+            &[frame_opref, index, value],
+            &[Type::Ref, Type::Int, value_type],
+        );
+    }
+}
+
 /// Read the symbolic OpRef at depth offset `stack_idx`, with lazy
 /// heap-fill from `locals_cells_stack_w` when the slot is empty.
 /// Symmetric counterpart of `write_stack_slot`.
@@ -2454,12 +2528,32 @@ impl MIFrame {
     pub(crate) fn flush_to_frame(&mut self, ctx: &mut TraceCtx) {
         let resume_pc = self.orgpc;
         let frame_addr = self.concrete_frame_addr;
-        let (code_ptr, debugdata, lastblock) = if frame_addr != 0 {
+        // virtualizable.py:86-93 read_boxes reads statics from the LIVE
+        // virtualizable.  The root MIFrame's concrete frame is the
+        // trace-stepping snapshot (`snapshot_for_tracing`), whose
+        // `debugdata` / `lastblock` are owned clones freed when tracing
+        // ends — a const captured from the snapshot dangles in the
+        // compiled trace's resume data, and the guard-failure vable
+        // write (`write_from_resume_data_partial`) then stamps the
+        // dangling pointer into the live frame.  Read the pointer-valued
+        // statics from the live virtualizable instead; `pycode` is
+        // copied by the snapshot so either source gives the same value.
+        // `last_instr` / `valuestackdepth` are plain values that evolve
+        // with the trace, so they stay snapshot-sourced below.
+        let statics_addr = {
+            let live = self.sym().live_vable_frame_addr;
+            if live != 0 && self.sym().owns_virtualizable_shadow() {
+                live
+            } else {
+                frame_addr
+            }
+        };
+        let (code_ptr, debugdata, lastblock) = if statics_addr != 0 {
             unsafe {
                 (
-                    *((frame_addr + PYFRAME_PYCODE_OFFSET) as *const usize),
-                    *((frame_addr + PYFRAME_DEBUGDATA_OFFSET) as *const usize),
-                    *((frame_addr + PYFRAME_LASTBLOCK_OFFSET) as *const usize),
+                    *((statics_addr + PYFRAME_PYCODE_OFFSET) as *const usize),
+                    *((statics_addr + PYFRAME_DEBUGDATA_OFFSET) as *const usize),
+                    *((statics_addr + PYFRAME_LASTBLOCK_OFFSET) as *const usize),
                 )
             }
         } else {
@@ -3075,9 +3169,18 @@ impl MIFrame {
                 }
             }
         }
+        // An active virtualizable owner must have its array base seeded by
+        // `init_symbolic` / `become_active_vable_owner` before the JUMP-arg
+        // derivation below reads `nlocals`/`vable_array_base`.  `nlocals` is
+        // NOT a usable proxy for "init ran": module-scope (`<module>`) frames
+        // are vable owners (M1 portal gate) yet have `co_nlocals == 0`, the
+        // same value as the struct default — names go through globals, not
+        // fast locals.  `target_array_capacity` below handles `nlocals == 0`
+        // via the `valuestackdepth` saturating-sub, so the seeded base is the
+        // real precondition.
         debug_assert!(
-            self.sym().nlocals > 0 || !self.sym().is_active_vable_owner,
-            "nlocals must be set by init_symbolic before close_loop_args_at"
+            !self.sym().is_active_vable_owner || self.sym().vable_array_base.is_some(),
+            "an active vable owner must have a seeded vable_array_base before close_loop_args_at"
         );
         // RPython close_loop_args parity: JUMP args must match the target
         // label's types (inputarg_types). materialize_loop_carried_value
@@ -7341,6 +7444,57 @@ impl MIFrame {
             nargs: args.len(),
             caller_result_stack_idx: None,
             caller_result_type: Some(Type::Ref),
+            replay_callable: callable,
+            replay_args: args.to_vec(),
+        })
+    }
+
+    /// pyjitpl.py:1425-1432 do_recursive_call(assembler_call=True) +
+    /// pyjitpl.py:3613-3635 direct_assembler_call, invoked on the PARENT
+    /// frame after the inline callee was popped at its loop back-edge
+    /// (opimpl_jit_merge_point portal_call_depth>0, pyjitpl.py:1579-1602).
+    ///
+    /// Records CALL_ASSEMBLER into the callee loop's compiled token with
+    /// `[callee_frame, ec]` red args (interp_jit.py:67 reds), bracketed by
+    /// the same vable/vref + GuardNotForced / GuardNoException sequence as
+    /// the residual-call emission (do_residual_call, pyjitpl.py:1995-2083).
+    /// The guard resume is shaped by `push_call_replay_stack` with the
+    /// original CALL's callable/args so a failure re-executes the call in
+    /// the interpreter — the same capture the residual path uses.
+    ///
+    /// Returns the CALL_ASSEMBLER result OpRef (Ref-typed: the callee's
+    /// boxed return value).
+    pub(crate) fn do_recursive_call_assembler(
+        &mut self,
+        token_number: u64,
+        callee_frame: OpRef,
+        replay_callable: OpRef,
+        replay_args: &[OpRef],
+        call_pc: usize,
+    ) -> Result<OpRef, PyError> {
+        self.with_ctx(|this, ctx| {
+            // pyjitpl.py:2017: do_residual_call step 1
+            this.vable_and_vrefs_before_residual_call(ctx);
+            let ec = this.ensure_execution_context(ctx);
+            let ca_result = ctx.call_assembler_red_only_ref(
+                token_number,
+                &[callee_frame, ec],
+                &[Type::Ref, Type::Ref],
+            );
+            // pyjitpl.py:3625-3631 direct_assembler_call: keep the callee
+            // virtualizable alive past the CALL_ASSEMBLER.
+            ctx.record_op(OpCode::Keepalive, &[callee_frame]);
+            // pyjitpl.py:2049
+            this.vrefs_after_residual_call(ctx);
+            // pyjitpl.py:2078
+            this.vable_after_residual_call()?;
+            // pyjitpl.py:2079
+            this.push_call_replay_stack(ctx, replay_callable, replay_args, call_pc);
+            this.generate_guard(ctx, OpCode::GuardNotForced, &[]);
+            this.generate_guard(ctx, OpCode::GuardNoException, &[]);
+            ctx.heap_cache_mut().invalidate_caches_for_escaped();
+            this.pop_call_replay_stack(ctx, replay_args.len())?;
+            Ok(ca_result)
         })
     }
 
@@ -7743,6 +7897,41 @@ impl MIFrame {
                 obj.concrete.to_pyobj(),
                 key.concrete.to_pyobj(),
                 value.concrete.to_pyobj(),
+            )?;
+            return Ok(Some(pyre_interpreter::StepResult::Continue));
+        }
+
+        // PUSH_NULL walker activation via direct symbolic push.
+        //
+        // The auto-gen arm jitcode for `PushNull` is `int_copy,
+        // residual_call_r_r(opcode_push_null, frame), live, ref_return` —
+        // a residual wrapper whose helper is NOT in the runtime fnaddr
+        // registry, so `try_execute_residual_call_via_executor` rejects
+        // its placeholder funcptr (47-bit gate) and the arm walk records
+        // the call WITHOUT executing it.  The concrete `PyFrame.
+        // valuestackdepth` then never advances, and the post-walk
+        // `resync_sym_vsd_from_concrete_frame` clobbers
+        // `sym.valuestackdepth` with the stale frame value — losing every
+        // preceding trait-leg push and underflowing the next CALL
+        // (`LOAD_NAME f; PUSH_NULL; LOAD_NAME s; CALL` at module scope,
+        // `f = g; f(s)` local-callable calls in function scope).
+        //
+        // Short-circuit the arm walk with the symbolic effect directly:
+        // PUSH_NULL pushes a constant NULL stack slot (the `_null_or_self`
+        // operand `opcode_call` pops and discards), so no IR op is needed —
+        // a `const_ref(PY_NULL)` through the trait push machinery keeps
+        // `sym.valuestackdepth` / vable shadow / concrete mirror coherent.
+        // Same delegation pattern as the StoreSubscr hook above; bypasses
+        // `apply_walker_stack_effect` because `push_value` handles vsd.
+        if matches!(instruction, Instruction::PushNull) {
+            use pyre_interpreter::SharedOpcodeHandler;
+            let _ = op_arg;
+            let null_opref = self.with_ctx(|_this, ctx| {
+                Ok::<_, PyError>(ctx.const_ref(pyre_object::PY_NULL as i64))
+            })?;
+            SharedOpcodeHandler::push_value(
+                self,
+                FrontendOp::new(null_opref, ConcreteValue::Ref(pyre_object::PY_NULL)),
             )?;
             return Ok(Some(pyre_interpreter::StepResult::Continue));
         }
@@ -8864,8 +9053,15 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             | Instruction::DictMerge { .. }
             | Instruction::SetFunctionAttribute { .. }
             | Instruction::UnpackEx { .. }
-            | Instruction::LoadName { .. }
-            | Instruction::StoreName { .. }
+            // Instruction::LoadName / StoreName excluded: the trait
+            // handlers (`load_name_value` / `store_name_value`) carry the
+            // celldict ModuleDictStrategy fast path (LOAD_GLOBAL_cached
+            // celldict.py:285-322: QUASIIMMUT_FIELD version dep + elidable
+            // cell fold; STORE_GLOBAL_cached celldict.py:328-333:
+            // layout-agnostic setitem_str). The walker's jitcode arm for
+            // these aborts with ResidualCallArgUnbound on the &str name
+            // argument — it was never exercised before module-level frames
+            // became portals.
             | Instruction::StoreGlobal { .. }
             | Instruction::DeleteAttr { .. }
             | Instruction::ImportName { .. }
@@ -8946,10 +9142,12 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             // wrong arg count (bridge fails to compile) and a backend
             // regalloc panic.  Keep the whole handler region on one concrete
             // (trait) leg so the bridge's framestate matches the loop entry.
-            // PushNull is a bare stack push (delta +1) with no may-force
-            // receiver and no `vsd <= nlocals` underflow guard, so it
-            // routes through the non-zero stack-effect resync alongside
-            // the other pure pushes.
+            // PushNull is handled by the dispatch_via_walker_for_opcode
+            // entry hook (direct const-NULL symbolic push): its auto-gen
+            // arm is an inert residual wrapper (`opcode_push_null` is not
+            // in the runtime fnaddr registry), so the arm-walk +
+            // vsd-resync route loses the push and underflows the
+            // following CALL.
             | Instruction::PushNull
     )
 }
@@ -9126,8 +9324,8 @@ fn apply_walker_stack_effect(state: &mut MIFrame, instruction: &Instruction) {
         | Instruction::LoadAttr { .. }
         | Instruction::StoreAttr { .. }
         // | Instruction::StoreSubscr { .. } // see production_walker_handles for the walker hook rationale
-        | Instruction::StoreFastStoreFast { .. }
-        | Instruction::PushNull => {
+        // | Instruction::PushNull // handled by the dispatch_via_walker_for_opcode entry hook; push_value advances vsd
+        | Instruction::StoreFastStoreFast { .. } => {
             // Non-zero stack delta. The walker arm's
             // `setfield_vable_i(valuestackdepth)` emit routes through
             // `vable_setfield` (trace_ctx.rs:2608-2655) which calls
@@ -9164,6 +9362,53 @@ pub(crate) fn trace_step_result_to_action(
 ) -> TraceAction {
     match result {
         Ok(pyre_interpreter::StepResult::Continue) => {
+            // opimpl_jit_merge_point portal_call_depth>0 orthodox path
+            // (pyjitpl.py:1579-1602): the inline-frame back-edge targets a
+            // loop with compiled code; surface the signal so the metainterp
+            // pops the inline frame and records a CALL_ASSEMBLER from the
+            // parent (finishframe + do_recursive_call assembler_call=True).
+            if let Some((green_key, target_pc)) = state.ctx().take_recursive_call_assembler() {
+                return TraceAction::RecursiveCallAssembler {
+                    green_key,
+                    target_pc,
+                };
+            }
+            // opimpl_jit_merge_point portal_call_depth>0 safe subset: a
+            // back-edge reached inside an inline callee frame was flagged in
+            // close_loop_args (it cannot be unrolled — its JUMP arg-set is
+            // built from the callee frame shape, diverging from the root
+            // LABEL). Abort this trace and stop tracing the root loop so the
+            // callee compiles standalone instead of being re-inlined. Reuses
+            // the trace-too-long recovery primitive (disable_noninlinable_-
+            // function, below) but targets the root key, not the callee.
+            if state.ctx().take_inline_loop_abort() {
+                let root_green_key = state.with_ctx(|_, ctx| ctx.root_green_key());
+                let callee_key = biggest_inline_trace_key(state);
+                let (driver, _) = crate::driver::driver_pair();
+                let warm_state = driver.meta_interp_mut().warm_state_mut();
+                // Stop tracing the root loop that inlined this callee, so the
+                // callee compiles as its own LOOP and runs in JIT code while
+                // the (trivial) root loop stays interpreted.
+                //
+                // The orthodox endpoint is a residual CALL_ASSEMBLER from the
+                // root into the callee's compiled loop (do_recursive_call,
+                // assembler_call=True). This safe subset stops short of
+                // emitting that call. Marking the *callee* non-inlinable
+                // instead would route it through a function-entry PROCEDURE
+                // compile, which is broken for a callee first reached by an
+                // aborted inline trace (guard-failure storm → crash); marking
+                // the *root* lets the callee's hot loop compile exactly as it
+                // does when the driver lives at module scope and never inlines
+                // it (the working baseline).
+                warm_state.disable_noninlinable_function(root_green_key);
+                if majit_metainterp::majit_log_enabled() {
+                    eprintln!(
+                        "[jit][inline-loop-abort] disable root={} (callee={:?})",
+                        root_green_key, callee_key
+                    );
+                }
+                return majit_metainterp::TraceAction::Abort;
+            }
             let compile_trace_succeeded = {
                 let (driver, _) = crate::driver::driver_pair();
                 driver.compile_trace_success_pending()

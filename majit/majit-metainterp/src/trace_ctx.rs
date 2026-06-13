@@ -242,6 +242,20 @@ pub struct TraceCtx {
     /// the green key for the inner loop. Used to register an alias
     /// so can_enter_jit at the inner back-edge finds the outer key's entry.
     pub cut_inner_green_key: Option<u64>,
+    /// Transient signal set when a back-edge is reached while an inline
+    /// callee frame is active (opimpl_jit_merge_point portal_call_depth>0).
+    /// Such a loop must not be unrolled as a root loop; the trace step
+    /// reads and clears this to abort instead. See `request_inline_loop_abort`.
+    pub(crate) inline_loop_abort_pending: bool,
+    /// Transient signal set when an inline-frame back-edge can take the
+    /// orthodox path instead of aborting: the callee loop's green key has
+    /// compiled code, so the metainterp pops the inline frame and records
+    /// a CALL_ASSEMBLER into the loop token from the parent
+    /// (opimpl_jit_merge_point portal_call_depth>0 → finishframe +
+    /// do_recursive_call(assembler_call=True), pyjitpl.py:1579-1602).
+    /// `(green_key, target_pc)` of the callee loop header. See
+    /// `request_recursive_call_assembler`.
+    pub(crate) recursive_call_assembler_pending: Option<(u64, usize)>,
     /// pyjitpl.py:3030 current_merge_points — loop headers visited during
     /// tracing with their trace positions. First visit records the key +
     /// position; second visit closes the loop.
@@ -1081,6 +1095,8 @@ impl TraceCtx {
             virtualizable_heap_ptr: None,
             header_pc: 0,
             cut_inner_green_key: None,
+            inline_loop_abort_pending: false,
+            recursive_call_assembler_pending: None,
             current_merge_points: vec![MergePoint {
                 green_key,
                 position: initial_position,
@@ -1147,6 +1163,8 @@ impl TraceCtx {
             virtualizable_heap_ptr: None,
             header_pc: 0,
             cut_inner_green_key: None,
+            inline_loop_abort_pending: false,
+            recursive_call_assembler_pending: None,
             current_merge_points: vec![MergePoint {
                 green_key,
                 position: initial_position,
@@ -1464,6 +1482,34 @@ impl TraceCtx {
     /// to a reached loop header during tracing.
     pub fn root_green_key(&self) -> u64 {
         self.root_green_key
+    }
+
+    /// Mark that the current back-edge was reached inside an inline callee
+    /// frame and must not be unrolled (opimpl_jit_merge_point
+    /// portal_call_depth>0). The trace step drains this via
+    /// [`take_inline_loop_abort`] and aborts the trace.
+    pub fn request_inline_loop_abort(&mut self) {
+        self.inline_loop_abort_pending = true;
+    }
+
+    /// Read and clear the inline-loop abort signal.
+    pub fn take_inline_loop_abort(&mut self) -> bool {
+        std::mem::take(&mut self.inline_loop_abort_pending)
+    }
+
+    /// Mark that the current inline-frame back-edge targets a loop whose
+    /// green key already has compiled code, so the metainterp should pop
+    /// the inline frame and record a CALL_ASSEMBLER into the loop token
+    /// from the parent frame (opimpl_jit_merge_point
+    /// portal_call_depth>0, pyjitpl.py:1579-1602). Drained via
+    /// [`Self::take_recursive_call_assembler`].
+    pub fn request_recursive_call_assembler(&mut self, green_key: u64, target_pc: usize) {
+        self.recursive_call_assembler_pending = Some((green_key, target_pc));
+    }
+
+    /// Read and clear the recursive-call-assembler signal.
+    pub fn take_recursive_call_assembler(&mut self) -> Option<(u64, usize)> {
+        self.recursive_call_assembler_pending.take()
     }
 
     /// Number of input arguments to the current trace.

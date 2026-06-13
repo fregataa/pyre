@@ -46,6 +46,7 @@ use pyre_object::intobject::w_int_new;
 use pyre_object::pyobject::is_int;
 use pyre_object::{PY_NULL, PyObjectRef};
 
+use majit_ir::GcRef;
 use pyre_interpreter::pyframe::PyFrame;
 use pyre_jit_trace::trace::trace_bytecode;
 
@@ -257,12 +258,26 @@ fn heap_alloc_frame(frame: PyFrame) -> *mut PyFrame {
         gc_header: majit_gc::header::GcHeader { tid_and_flags: 0 },
         frame,
     }));
-    unsafe { &mut (*gc_frame).frame as *mut PyFrame }
+    let ptr = unsafe { &mut (*gc_frame).frame as *mut PyFrame };
+    HEAP_CALLEE_FRAMES.with(|cell| unsafe { &mut *cell.get() }.push(ptr));
+    ptr
 }
 
 fn heap_free_frame(ptr: *mut PyFrame) {
+    HEAP_CALLEE_FRAMES.with(|cell| {
+        let frames = unsafe { &mut *cell.get() };
+        if let Some(pos) = frames.iter().position(|p| *p == ptr) {
+            frames.swap_remove(pos);
+        }
+    });
     let gc_frame = unsafe { (ptr as *mut u8).sub(GC_HEADER_SIZE) as *mut GcPyFrame };
     unsafe { drop(Box::from_raw(gc_frame)) };
+}
+
+thread_local! {
+    /// Live heap-fallback callee frames (arena overflow). Walked by
+    /// `walk_jit_callee_frame_roots` alongside armed arena slots.
+    static HEAP_CALLEE_FRAMES: UnsafeCell<Vec<*mut PyFrame>> = const { UnsafeCell::new(Vec::new()) };
 }
 
 struct FrameArena {
@@ -272,6 +287,13 @@ struct FrameArena {
     /// Frames below this index have been initialized at least once.
     /// Reuse only needs reinit of changed fields, not full new_for_call.
     initialized: usize,
+    /// Per-slot GC visibility: set once a slot's frame is fully
+    /// initialized for the current call, cleared on `put`. The extra
+    /// root walker (`walk_jit_callee_frame_roots`) visits only armed
+    /// slots — `top` alone cannot be used because a non-LIFO `put`
+    /// leaves dead slots below `top`, and a slot between `take` and
+    /// end-of-init holds an uninitialized or stale frame.
+    armed: [bool; ARENA_CAP],
 }
 
 impl FrameArena {
@@ -280,6 +302,7 @@ impl FrameArena {
             buf: Box::new([const { GcFrameSlot::zeroed() }; ARENA_CAP]),
             top: 0,
             initialized: 0,
+            armed: [false; ARENA_CAP],
         };
         // Publish stable pointers so Cranelift-generated code can
         // inline arena take/put without going through TLS.
@@ -312,6 +335,9 @@ impl FrameArena {
     /// Return a frame to the arena. Must be the most recently taken frame (LIFO).
     #[inline]
     fn put(&mut self, ptr: *mut PyFrame) -> bool {
+        if let Some(idx) = self.slot_index(ptr) {
+            self.armed[idx] = false;
+        }
         if self.top > 0 && ptr == self.buf[self.top - 1].frame.as_mut_ptr() {
             self.top -= 1;
             unsafe {
@@ -320,10 +346,30 @@ impl FrameArena {
             return true;
         }
         // Check if within arena range — don't free, but mark as non-LIFO.
-        let base = self.buf[0].frame.as_mut_ptr() as usize;
-        let end = unsafe { (self.buf.as_ptr() as *const GcFrameSlot).add(ARENA_CAP) as usize };
+        self.slot_index(ptr).is_some()
+    }
+
+    /// Slot index for a frame pointer inside the arena buffer, if any.
+    #[inline]
+    fn slot_index(&self, ptr: *mut PyFrame) -> Option<usize> {
+        let base = self.buf.as_ptr() as usize;
+        let end = unsafe { (self.buf.as_ptr()).add(ARENA_CAP) } as usize;
         let addr = ptr as usize;
-        addr >= base && addr < end
+        if addr >= base && addr < end {
+            Some((addr - base) / std::mem::size_of::<GcFrameSlot>())
+        } else {
+            None
+        }
+    }
+
+    /// Mark a fully-initialized in-use slot as visible to the GC root
+    /// walker. Call only after the frame body and its locals array are
+    /// completely written for the current call.
+    #[inline]
+    fn arm(&mut self, ptr: *mut PyFrame) {
+        if let Some(idx) = self.slot_index(ptr) {
+            self.armed[idx] = true;
+        }
     }
 
     /// Mark that frames up to `top` have been fully initialized.
@@ -345,6 +391,48 @@ thread_local! {
 #[inline]
 fn arena_ref() -> &'static mut FrameArena {
     FRAME_ARENA.with(|cell| unsafe { &mut *cell.get() })
+}
+
+/// Visit the GC-ref slots of one live callee frame: every
+/// `locals_cells_stack_w` item plus the ref-bearing statics — the same
+/// field set `walk_pyframe_roots` (pyre-interpreter::eval) visits for
+/// interpreter frames on the `CURRENT_FRAME` chain.
+///
+/// # Safety
+/// `frame` must point at a fully-initialized live `PyFrame`.
+unsafe fn visit_callee_frame_roots(frame: *mut PyFrame, visitor: &mut dyn FnMut(&mut GcRef)) {
+    let frame = unsafe { &mut *frame };
+    for slot in frame.locals_w_mut().as_mut_slice() {
+        visitor(unsafe { &mut *(slot as *mut PyObjectRef as *mut GcRef) });
+    }
+    visitor(unsafe { &mut *(&mut frame.f_generator_nowref as *mut PyObjectRef as *mut GcRef) });
+    visitor(unsafe { &mut *(&mut frame.w_yielding_from as *mut PyObjectRef as *mut GcRef) });
+    visitor(unsafe { &mut *(&mut frame.w_globals_obj as *mut PyObjectRef as *mut GcRef) });
+}
+
+/// Extra GC root walker for JIT-created callee frames (frame arena +
+/// heap fallbacks). These frames are host-allocated (zeroed GcHeader,
+/// outside the GC heap) and sit on no `CURRENT_FRAME`/`f_backref`
+/// chain while compiled code runs, so neither the standard tracer nor
+/// `walk_pyframe_roots` reaches their locals. Without this walk, a
+/// young object stored into a callee frame slot (argument boxing,
+/// back-edge CALL_ASSEMBLER writeback) is invisible to a minor
+/// collection and the slot is left pointing at evacuated nursery
+/// memory. Registered via `register_extra_root_walker`, mirroring the
+/// framework.py `root_walker.walk_roots` seam the collector already
+/// uses for the other host-side root sources.
+pub fn walk_jit_callee_frame_roots(visitor: &mut dyn FnMut(&mut GcRef)) {
+    let arena = arena_ref();
+    for idx in 0..ARENA_CAP {
+        if arena.armed[idx] {
+            unsafe { visit_callee_frame_roots(arena.buf[idx].frame.as_mut_ptr(), visitor) };
+        }
+    }
+    HEAP_CALLEE_FRAMES.with(|cell| {
+        for &ptr in unsafe { &*cell.get() }.iter() {
+            unsafe { visit_callee_frame_roots(ptr, visitor) };
+        }
+    });
 }
 
 // ── JIT call callbacks ───────────────────────────────────────────
@@ -1978,6 +2066,7 @@ pub fn trace_and_compile_from_bridge(
     // value-stack underflow / off-by-one-iteration result otherwise).
     let resume_state = frame.snapshot_for_tracing();
     let trace_frame = frame.snapshot_for_tracing();
+    let live_frame_addr = frame as *const PyFrame as usize;
     let mut adopted_walk_end_state = false;
     let outcome = {
         let (driver, _) = crate::eval::driver_pair();
@@ -1988,7 +2077,8 @@ pub fn trace_and_compile_from_bridge(
             &env,
             || {},
             |meta, sym| {
-                let (action, executed) = trace_bytecode(meta, sym, code, resume_pc, trace_frame);
+                let (action, executed) =
+                    trace_bytecode(meta, sym, code, resume_pc, trace_frame, live_frame_addr);
                 // pyjitpl.py:3048-3091 raise_continue_running_normally:
                 // a bridge walk that closed at a merge point and committed
                 // its end-of-walk state into the trace snapshot
@@ -2345,6 +2435,7 @@ fn create_callee_frame_impl_1_boxed(
             }
             arena.mark_initialized();
         }
+        arena.arm(ptr);
         return ptr as i64;
     }
 
@@ -2416,6 +2507,7 @@ fn create_self_recursive_callee_frame_impl_1_boxed(
             }
             arena.mark_initialized();
         }
+        arena.arm(ptr);
         if majit_metainterp::majit_log_enabled() {
             let f = unsafe { &*ptr };
             eprintln!(
@@ -2499,6 +2591,7 @@ fn create_callee_frame_impl(caller_frame: i64, callable: i64, args: &[PyObjectRe
             }
             arena.mark_initialized();
         }
+        arena.arm(ptr);
         return ptr as i64;
     }
 
@@ -2599,6 +2692,7 @@ pub extern "C" fn jit_create_self_recursive_callee_frame_1_raw_int(
                 arena.mark_initialized();
             }
         }
+        arena.arm(ptr);
         if majit_metainterp::majit_log_enabled() {
             let f = unsafe { &*ptr };
             eprintln!(
@@ -2737,6 +2831,35 @@ pub extern "C" fn jit_drop_callee_frame(frame_ptr: i64) {
         // Not an arena frame (heap fallback) — free GcPyFrame allocation.
         heap_free_frame(ptr);
     }
+}
+
+/// Store a W_Root into a callee frame's `locals_cells_stack_w[idx]`.
+///
+/// Residual helper for the inline back-edge CALL_ASSEMBLER writeback
+/// (do_recursive_call, pyjitpl.py:1579-1602): the callee's compiled
+/// loop reads its locals from the frame object at entry, so the
+/// inlined prefix's register values are stored back through these
+/// helpers before the call. Plain store, same as `PyFrame::push`.
+#[majit_macros::dont_look_inside]
+pub extern "C" fn jit_frame_set_slot_ref(frame_ptr: i64, idx: i64, value: i64) {
+    let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
+    frame.locals_w_mut()[idx as usize] = value as PyObjectRef;
+}
+
+/// `jit_frame_set_slot_ref` for a raw int value — boxes via `w_int_new`.
+#[majit_macros::dont_look_inside]
+pub extern "C" fn jit_frame_set_slot_int(frame_ptr: i64, idx: i64, raw: i64) {
+    let boxed = pyre_object::intobject::w_int_new(raw);
+    let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
+    frame.locals_w_mut()[idx as usize] = boxed;
+}
+
+/// `jit_frame_set_slot_ref` for a raw float value — boxes via `w_float_new`.
+#[majit_macros::dont_look_inside]
+pub extern "C" fn jit_frame_set_slot_float(frame_ptr: i64, idx: i64, raw: f64) {
+    let boxed = pyre_object::floatobject::w_float_new(raw);
+    let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
+    frame.locals_w_mut()[idx as usize] = boxed;
 }
 
 // ===========================================================================
@@ -3265,6 +3388,72 @@ pub extern "C" fn bh_load_method_self_fn(
         attr as pyre_object::PyObjectRef,
         name,
     ) as i64
+}
+
+/// `LOAD_NAME` residual for the standalone (blackhole / deopt)
+/// per-CodeObject jitcode.  `pyopcode.py:945-955 LOAD_NAME` — when
+/// `getorcreatedebug().w_locals is not get_w_globals()` the lookup
+/// tries `finditem_str(w_locals, varname)` first, then falls through
+/// to the `LOAD_GLOBAL` globals → builtins chain.  Delegates to the
+/// interpreter trait impl (`eval.rs load_name_checked_value`) so the
+/// blackhole re-execution and the interpreter share one lookup order.
+/// `LOAD_NAME` is traced via the `NamespaceOpcodeHandler` trait leg
+/// (not the walker), so this helper runs ONLY on the blackhole
+/// resume / deopt path, like `bh_getattr_fn`.  `w_name` is the
+/// interned immortal str constant the flatten driver lowers the
+/// `load_name` HLOp's name operand to (`box_str_constant`); `namei`
+/// feeds the `pycode._globals_caches[nameindex]` global cache
+/// (`celldict.py:292`).  On error it sets `BH_LAST_EXC_VALUE` and
+/// returns 0, matching `bh_load_global_fn`'s NameError path.
+pub extern "C" fn bh_load_name_fn(frame_ptr: i64, w_name: i64, namei: i64) -> i64 {
+    use pyre_interpreter::pyopcode::NamespaceOpcodeHandler;
+    assert!(
+        frame_ptr != 0,
+        "bh_load_name_fn requires a non-null PyFrame; every LOAD_NAME emit \
+         site must thread portal_frame_reg as the leading ref operand"
+    );
+    let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
+    let name =
+        unsafe { pyre_object::strobject::w_str_get_value(w_name as pyre_object::PyObjectRef) };
+    match frame.load_name_checked_value(name, namei as usize) {
+        Ok(w_value) => w_value as i64,
+        Err(err) => {
+            let exc_obj = err.to_exc_object();
+            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+            0
+        }
+    }
+}
+
+/// `STORE_NAME` residual for the standalone (blackhole / deopt)
+/// per-CodeObject jitcode.  `pyopcode.py:855-859 STORE_NAME` —
+/// `setitem_str(getorcreatedebug().w_locals, varname, w_newvalue)`.
+/// Delegates to the interpreter trait impl (`eval.rs
+/// store_name_value`), which routes non-dict mapping locals through
+/// `space.setitem` and module/class namespaces through the dict
+/// strategy.  Same blackhole-only execution contract and `w_name` ABI
+/// as `bh_load_name_fn`.  `STORE_NAME` carries no nameindex-keyed
+/// cache upstream, so the trait's `nameindex` argument is passed as 0.
+/// Returns 1 on success; on error it sets `BH_LAST_EXC_VALUE` and
+/// returns 0, matching `bh_store_subscr_fn`.
+pub extern "C" fn bh_store_name_fn(frame_ptr: i64, w_name: i64, value: i64) -> i64 {
+    use pyre_interpreter::pyopcode::NamespaceOpcodeHandler;
+    assert!(
+        frame_ptr != 0,
+        "bh_store_name_fn requires a non-null PyFrame; every STORE_NAME emit \
+         site must thread portal_frame_reg as the leading ref operand"
+    );
+    let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
+    let name =
+        unsafe { pyre_object::strobject::w_str_get_value(w_name as pyre_object::PyObjectRef) };
+    match frame.store_name_value(name, 0, value as pyre_object::PyObjectRef) {
+        Ok(()) => 1,
+        Err(err) => {
+            let exc_obj = err.to_exc_object();
+            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+            0
+        }
+    }
 }
 
 /// Load a constant from the code object.
