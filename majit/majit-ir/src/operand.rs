@@ -254,6 +254,12 @@ impl Operand {
         if b.is_constant() {
             return Operand::Const(b.clone());
         }
+        // Only position-only boxes remain `Operand::Box`. The optimizer
+        // grind (#9-④) reduced production mints to the S9 cross-phase
+        // residual: export-boundary `get_box_replacement` fallbacks (which
+        // carry their own producerless tripwire) and unmapped Phase-1
+        // short-preamble jump args. Both are producer-less by construction
+        // in the current context.
         Operand::Box(b.clone())
     }
 

@@ -646,6 +646,17 @@ pub struct OptContext {
     /// PreambleOp)` with linear-scan insert/pop/contains. The pool stays
     /// small per trace (one entry per imported pure short-preamble op),
     /// so O(n) operations are acceptable.
+    ///
+    /// The key stays the box's `OpRef` position rather than PyPy's box
+    /// identity (`unroll.py:37` keys by the box object). This is a
+    /// PRE-EXISTING-ADAPTATION beyond the Vec-vs-dict shape: the insert key
+    /// is the Phase-1 preamble source box (`force_op_from_preamble_op`,
+    /// `preamble_op.op`) while the `force_box` pop key is the Phase-2 body
+    /// box resolved to a position (`get_replacement_opref`) — two distinct
+    /// `Rc`s sharing one position across the peel boundary. A `BoxRef`
+    /// `Rc::ptr_eq` key would silent-miss the pop. Re-keying to box identity
+    /// is gated on the same short-preamble / InputArg identity unification
+    /// that defers `resolve_box_box`'s InputArg arm (#9/S9).
     pub(crate) potential_extra_ops: Vec<(OpRef, crate::optimizeopt::info::PreambleOp)>,
     /// RPython unroll.py: live ExtendedShortPreambleBuilder while replaying an
     /// existing target token's short preamble.
@@ -655,13 +666,13 @@ pub struct OptContext {
     /// the exported loop-header inputargs.
     pub exported_short_boxes: Vec<crate::optimizeopt::shortpreamble::PreambleOp>,
     /// unroll.py:480 `short_inputargs = sb.create_short_inputargs(label_args
-    /// + virtuals)` — the ShortBoxes-derived short-preamble inputargs,
-    /// carried from the preview pass (optimizer.rs, where the ShortBoxes
-    /// object lives) to `export_state_with_bounds` through the same channel
-    /// as `exported_short_boxes`. Position projection of the renamed
-    /// inputarg boxes; equals the export-site `label_args + virtuals`
-    /// recompute (measured identical across the corpus, 2026-06-11).
-    pub exported_short_inputargs: Vec<OpRef>,
+    /// + virtuals)` — the ShortBoxes-stored renamed inputarg boxes
+    /// themselves, carried from the preview pass (optimizer.rs, where the
+    /// ShortBoxes object lives) to `export_state_with_bounds` through the
+    /// same channel as `exported_short_boxes`. Position projection equals
+    /// the export-site `label_args + virtuals` recompute (measured
+    /// identical across the corpus, 2026-06-11).
+    pub exported_short_inputargs: Vec<crate::r#box::BoxRef>,
     /// optimizer.py: `can_replace_guards` — disable guard replacement during
     /// bridge compilation. Defaults to true for preamble.
     pub can_replace_guards: bool,
@@ -2709,18 +2720,23 @@ impl OptContext {
     pub fn initialize_imported_short_preamble_builder(
         &mut self,
         label_args: &[OpRef],
-        short_inputargs: &[OpRef],
+        short_inputargs: &[crate::r#box::BoxRef],
         exported_short_boxes: &[crate::optimizeopt::shortpreamble::PreambleOp],
     ) {
         let produced: Vec<(OpRef, crate::optimizeopt::shortpreamble::ProducedShortOp)> =
             exported_short_boxes
                 .iter()
                 .map(|entry| {
+                    // `materialize_box_at`, not `from_bound_op`: a
+                    // const-folded entry carries an inline-Const pos,
+                    // which resolves to its Const box.
+                    let res = self.materialize_box_at(entry.op.pos.get());
                     (
                         entry.op.pos.get(),
                         crate::optimizeopt::shortpreamble::ProducedShortOp {
                             kind: entry.kind.clone(),
-                            preamble_op: std::rc::Rc::new(entry.op.clone()),
+                            res,
+                            preamble_op: std::rc::Rc::new((*entry.op).clone()),
                             invented_name: entry.invented_name,
                             same_as_source: entry.same_as_source.clone(),
                         },
@@ -2758,7 +2774,7 @@ impl OptContext {
     pub fn initialize_imported_short_preamble_builder_from_short_boxes(
         &mut self,
         short_args: &[OpRef],
-        short_inputargs: &[OpRef],
+        short_inputargs: &[crate::r#box::BoxRef],
         short_boxes: &[(OpRef, crate::optimizeopt::shortpreamble::ProducedShortOp)],
         short_box_const_values: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, majit_ir::Value>,
         result_map: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
@@ -2904,6 +2920,29 @@ impl OptContext {
                     crate::optimizeopt::ImportedShortPureArg::Const(_, r) => r,
                 })
             };
+        // shortpreamble.py:283-296 produce_arg object-carry: a dependency
+        // arg is the dep's replay op OBJECT (upstream returns
+        // `produced_short_boxes[op].preamble_op`). Bind dep args to the
+        // dep entry's replay Rc (the same dual-key dict the builder will
+        // hold — last insert wins, matching VecAssoc overwrite), so
+        // `use_box` reads deps off the operand binding instead of a
+        // position-keyed side map. Slot / Const args keep the positional
+        // materialization.
+        let dep_or_materialize =
+            |ctx: &mut Self, produced: &[(OpRef, ProducedShortOp)], r: OpRef| {
+                // shortpreamble.py:288 Const arm: the arg is the Const box
+                // itself — a const-folded entry carries an inline-Const
+                // pos/key, which must not bind to the replay op.
+                if r.is_constant() {
+                    return ctx.materialize_box_at(r);
+                }
+                produced
+                    .iter()
+                    .rev()
+                    .find(|(k, _)| *k == r)
+                    .map(|(_, dep)| crate::r#box::BoxRef::from_bound_op(&dep.preamble_op))
+                    .unwrap_or_else(|| ctx.materialize_box_at(r))
+            };
 
         for (source, produced_op) in short_boxes {
             // Some ProducedShortOps (PreambleOpKind::Heap with non-getfield /
@@ -2929,7 +2968,7 @@ impl OptContext {
                     }
                     let resolved_arg_boxes: Vec<crate::r#box::BoxRef> = resolved_args
                         .iter()
-                        .map(|a| self.materialize_box_at(*a))
+                        .map(|a| dep_or_materialize(self, &produced, *a))
                         .collect();
                     let mut op = Op::new(
                         pure_call_opcode(produced_op.preamble_op.opcode),
@@ -2939,8 +2978,10 @@ impl OptContext {
                     if let Some(d) = produced_op.preamble_op.getdescr() {
                         op.setdescr(d);
                     }
+                    let res = self.materialize_box_at(op.pos.get());
                     let new_pop = ProducedShortOp {
                         kind: PreambleOpKind::Pure,
+                        res,
                         preamble_op: std::rc::Rc::new(op),
                         invented_name: produced_op.invented_name,
                         same_as_source: produced_op.same_as_source.clone(),
@@ -2974,11 +3015,14 @@ impl OptContext {
                                 majit_ir::Type::Float => OpCode::GetfieldGcF,
                                 majit_ir::Type::Void => return false,
                             };
-                            let mut op = Op::new(opcode, &[self.materialize_box_at(obj)]);
+                            let obj_b = dep_or_materialize(self, &produced, obj);
+                            let mut op = Op::new(opcode, &[obj_b]);
                             op.pos.set(replay_pos(*source, produced_op));
                             op.setdescr(descr);
+                            let res = self.materialize_box_at(op.pos.get());
                             ProducedShortOp {
                                 kind: PreambleOpKind::Heap,
+                                res,
                                 preamble_op: std::rc::Rc::new(op),
                                 invented_name: produced_op.invented_name,
                                 same_as_source: produced_op.same_as_source.clone(),
@@ -3010,13 +3054,15 @@ impl OptContext {
                                 Some(r) => r,
                                 None => return false,
                             };
-                            let obj_b = self.materialize_box_at(obj);
-                            let index_b = self.materialize_box_at(index_opref);
+                            let obj_b = dep_or_materialize(self, &produced, obj);
+                            let index_b = dep_or_materialize(self, &produced, index_opref);
                             let mut op = Op::new(opcode, &[obj_b, index_b]);
                             op.pos.set(replay_pos(*source, produced_op));
                             op.setdescr(descr);
+                            let res = self.materialize_box_at(op.pos.get());
                             ProducedShortOp {
                                 kind: PreambleOpKind::Heap,
+                                res,
                                 preamble_op: std::rc::Rc::new(op),
                                 invented_name: produced_op.invented_name,
                                 same_as_source: produced_op.same_as_source.clone(),
@@ -3047,13 +3093,13 @@ impl OptContext {
                     {
                         return false;
                     }
-                    let mut op = Op::new(
-                        loop_invariant_opcode(result_type),
-                        &[self.materialize_box_at(func_opref)],
-                    );
+                    let func_b = dep_or_materialize(self, &produced, func_opref);
+                    let mut op = Op::new(loop_invariant_opcode(result_type), &[func_b]);
                     op.pos.set(replay_pos(*source, produced_op));
+                    let res = self.materialize_box_at(op.pos.get());
                     let new_pop = ProducedShortOp {
                         kind: PreambleOpKind::LoopInvariant,
+                        res,
                         preamble_op: std::rc::Rc::new(op),
                         invented_name: produced_op.invented_name,
                         same_as_source: produced_op.same_as_source.clone(),
@@ -9943,7 +9989,10 @@ mod imported_short_preamble_fallback_tests {
             OptContext::with_inputarg_types(16, &[majit_ir::Type::Ref, majit_ir::Type::Ref]);
         ctx.initialize_imported_short_preamble_builder(
             &[OpRef::input_arg_ref(0), OpRef::input_arg_ref(1)],
-            &[OpRef::int_op(7), OpRef::int_op(8)],
+            &[
+                crate::r#box::BoxRef::from_opref(OpRef::int_op(7)),
+                crate::r#box::BoxRef::from_opref(OpRef::int_op(8)),
+            ],
             &[],
         );
 

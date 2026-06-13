@@ -1908,6 +1908,9 @@ impl Optimizer {
         let ops_rc: Vec<majit_ir::OpRc> =
             ops.iter().map(|op| std::rc::Rc::new(op.clone())).collect();
         self.run_optimize_from_inputs(&ops_rc, constants, num_inputs, false)
+            .into_iter()
+            .map(|rc| (*rc).clone())
+            .collect()
     }
 
     /// `OpRc`-threading entry for callers that hold the canonical
@@ -1921,17 +1924,17 @@ impl Optimizer {
         ops: &[majit_ir::OpRc],
         constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
         num_inputs: usize,
-    ) -> Vec<Op> {
+    ) -> Vec<majit_ir::OpRc> {
         self.run_optimize_from_inputs(ops, constants, num_inputs, true)
     }
 
-    fn run_optimize_from_inputs(
+    pub(crate) fn run_optimize_from_inputs(
         &mut self,
         ops: &[majit_ir::OpRc],
         constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
         num_inputs: usize,
         input_ops_from_ops: bool,
-    ) -> Vec<Op> {
+    ) -> Vec<majit_ir::OpRc> {
         // Ensure new ops get positions beyond all original trace positions.
         // Original ops keep their tracer-assigned positions; new ops (constants,
         // force materializations) must not collide with them.
@@ -1969,7 +1972,7 @@ impl Optimizer {
         inputarg_base: u32,
         start_next_pos: u32,
         input_ops_from_ops: bool,
-    ) -> Vec<Op> {
+    ) -> Vec<majit_ir::OpRc> {
         use majit_ir::OpRef;
         // Test-only auto-seed of `trace_inputargs` from the variant
         // tags of any InputArg*/IntOp/FloatOp/RefOp OpRef that references
@@ -2825,29 +2828,72 @@ impl Optimizer {
             // label_args + virtuals)` — read off the ShortBoxes object and
             // carry to export_state through the ctx channel (sibling of
             // `exported_short_boxes` below).
-            ctx.exported_short_inputargs = short_boxes
-                .create_short_inputargs(&preview_short_args)
-                .iter()
-                .map(|b| b.to_opref())
-                .collect();
+            ctx.exported_short_inputargs =
+                short_boxes.create_short_inputargs(&preview_short_args);
+            // Single-object carry: each exported entry keeps the preview
+            // ProducedShortOp's replay Rc, so the pos/arg canonicalization
+            // below lands on the object that dep-replay operands reference
+            // (upstream exports the ResOperation objects themselves,
+            // unroll.py:478-487). The per-entry rewrites require each entry
+            // to own a distinct Rc.
+            #[cfg(debug_assertions)]
+            {
+                let mut seen: Vec<*const majit_ir::Op> = Vec::with_capacity(produced.len());
+                for (_, p) in &produced {
+                    let ptr = std::rc::Rc::as_ptr(&p.preamble_op);
+                    debug_assert!(
+                        !seen.contains(&ptr),
+                        "exported short boxes share a replay OpRc at {:?}",
+                        p.preamble_op.pos.get()
+                    );
+                    seen.push(ptr);
+                }
+            }
             ctx.exported_short_boxes = produced
                 .into_iter()
                 .map(|(result, produced)| {
                     let canonical_result = ctx.get_replacement_opref(result);
-                    // Deep-clone: dual map entries share the replay OpRc;
-                    // the pos/arg rewrites below must stay per-entry.
-                    let mut preamble_op = (*produced.preamble_op).clone();
+                    let preamble_op = produced.preamble_op.clone();
                     // RPython parity: key and preamble_op.pos must be the
                     // same resolved value. Independent get_box_replacement
                     // calls can diverge when forwarding chains differ.
                     // Use canonical_result (resolved key) for both.
                     preamble_op.pos.set(canonical_result);
                     // optimizer.py:651-652 force_box loop parity.
+                    //
+                    // Resolve POSITIONALLY when a producer is registered at
+                    // this slot: replay-op args carry the dep replay handle
+                    // (produce_arg, shortpreamble.py:285) whose forwarded slot
+                    // is empty, so only the body producer registered at the
+                    // same position carries the Phase-1 forwarding to the
+                    // canonical end box this export boundary needs.
+                    //
+                    // When positional resolution finds NO producer, the carried
+                    // handle is unforwarded and resolves to itself
+                    // (resoperation.py:57-68): keep the handle OBJECT instead of
+                    // re-minting a producer-less position-only box, so its
+                    // identity (and the `Operand::Op`/`InputArg` shed) survives
+                    // the export. The encoded OpRef is identical either way
+                    // (`from_opref(arg.to_opref()) == arg.to_opref()`).
                     for i in 0..preamble_op.num_args() {
-                        preamble_op.setarg(i, ctx.resolve_box_box(&preamble_op.arg(i)));
+                        let arg = preamble_op.arg(i);
+                        // The `OpRef::none()` sentinel has no producer box
+                        // (`materialize_box_at` doc) — routing it through the
+                        // producer lookup is meaningless and trips the
+                        // `get_box_replacement` "box must exist" debug tripwire.
+                        if arg.is_none() {
+                            continue;
+                        }
+                        let resolved = ctx
+                            .get_box_replacement_box(arg.to_opref())
+                            .unwrap_or_else(|| arg.clone());
+                        preamble_op.setarg(i, resolved);
                     }
-                    if let Some(fail_args) = preamble_op.fail_args_mut() {
-                        for arg in fail_args {
+                    if let Some(fail_args) = preamble_op.fail_args.borrow_mut().as_mut() {
+                        for arg in fail_args.iter_mut() {
+                            if arg.is_none() {
+                                continue;
+                            }
                             *arg = majit_ir::operand::Operand::from_boxref(
                                 &ctx.get_box_replacement(arg.to_opref()),
                             );
@@ -2855,6 +2901,11 @@ impl Optimizer {
                     }
                     crate::optimizeopt::shortpreamble::PreambleOp {
                         op: preamble_op,
+                        // short_op.res travels with the entry — the SAME
+                        // box object the preview ProducedShortOp carries,
+                        // so the export/re-import round trip preserves
+                        // upstream Box identity.
+                        res: produced.res.clone(),
                         kind: produced.kind,
                         label_arg_idx: short_boxes.lookup_label_arg(canonical_result),
                         invented_name: produced.invented_name,
@@ -3160,9 +3211,9 @@ impl Optimizer {
                                     false,
                                     "position-only failarg hit const-compact remap: {arg_opref:?}"
                                 );
-                                *arg = majit_ir::operand::Operand::Box(BoxRef::from_opref(
-                                    arg_opref.with_raw(new_pos),
-                                ));
+                                *arg = majit_ir::operand::Operand::from_boxref(
+                                    &BoxRef::from_opref(arg_opref.with_raw(new_pos)),
+                                );
                             }
                         }
                     }
@@ -3200,8 +3251,14 @@ impl Optimizer {
                 for arg in &mut state.renamed_inputargs {
                     remap_opref(arg);
                 }
-                for arg in &mut state.short_inputargs {
-                    remap_opref(arg);
+                for arg in &state.short_inputargs {
+                    // Renamed-box positions track op compaction through the
+                    // shared `set_position` Cell (no-op for InputArg/Const
+                    // kinds, whose positions are not subject to compaction);
+                    // every holder of the same box object sees the update.
+                    let mut opref = arg.to_opref();
+                    remap_opref(&mut opref);
+                    arg.set_position(opref.raw());
                 }
                 // Remap exported_infos keys (Const keys pass through)
                 let old_infos = std::mem::take(&mut state.exported_infos);
@@ -3247,7 +3304,7 @@ impl Optimizer {
                         );
                         entry.op.setarg(i, BoxRef::from_opref(arg));
                     }
-                    if let Some(fa) = entry.op.fail_args_mut() {
+                    if let Some(fa) = entry.op.fail_args.borrow_mut().as_mut() {
                         for arg in fa.iter_mut() {
                             // Bound failargs live-track the producer's
                             // already-remapped pos (same rule as the args
@@ -3263,13 +3320,36 @@ impl Optimizer {
                                 arg_opref == pre,
                                 "position-only exported-short-box failarg remapped: {pre:?}"
                             );
-                            *arg = majit_ir::operand::Operand::Box(BoxRef::from_opref(arg_opref));
+                            *arg = majit_ir::operand::Operand::from_boxref(&BoxRef::from_opref(
+                                arg_opref,
+                            ));
                         }
                     }
-                    if let Some(ref mut src) = entry.same_as_source {
-                        let mut src_opref = src.to_opref();
-                        remap_opref(&mut src_opref);
-                        *src = BoxRef::from_opref(src_opref);
+                    // same_as_source: same rule as res below — the stored
+                    // box object is shared with the preview ProducedShortOp,
+                    // so rewrite its position Cell in place instead of
+                    // replacing it with a fresh position-only mint.
+                    if let Some(ref src) = entry.same_as_source {
+                        if let Some(op) = src.bound_op() {
+                            src.set_position(op.pos.get().raw());
+                        } else {
+                            let mut src_opref = src.to_opref();
+                            remap_opref(&mut src_opref);
+                            src.set_position(src_opref.raw());
+                        }
+                    }
+                    // res: a bound box live-tracks its producer through the
+                    // op handle — the producer's `Op.pos` was already
+                    // remapped above, so refreshing the position Cell from
+                    // it is idempotent (no double-map). Position-only mints
+                    // (test fixtures) go through the remap table instead;
+                    // `set_position` is a no-op for InputArg/Const kinds.
+                    if let Some(op) = entry.res.bound_op() {
+                        entry.res.set_position(op.pos.get().raw());
+                    } else {
+                        let mut res_opref = entry.res.to_opref();
+                        remap_opref(&mut res_opref);
+                        entry.res.set_position(res_opref.raw());
                     }
                 }
             }
@@ -3334,7 +3414,7 @@ impl Optimizer {
             }
         }
         self.final_ctx = Some(ctx);
-        ops.into_iter().map(|rc| (*rc).clone()).collect()
+        ops
     }
 
     /// unroll.py:183-236: optimize_bridge()
@@ -3353,7 +3433,7 @@ impl Optimizer {
     /// optimizer's exported_loop_state for the new target token.
     pub(crate) fn optimize_bridge(
         &mut self,
-        ops: &[Op],
+        ops: &[majit_ir::OpRc],
         constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
         num_inputs: usize,
         front_target_tokens: &mut Vec<crate::optimizeopt::unroll::TargetToken>,
@@ -3375,7 +3455,7 @@ impl Optimizer {
         // base into `optimize_with_constants_and_inputs_at` so step 3
         // seeds inputarg types at the shifted slots.
         bridge_inputarg_base: u32,
-    ) -> (Vec<Op>, bool) {
+    ) -> (Vec<majit_ir::OpRc>, bool) {
         // bridgeopt.py:124-185: deserialize_optimizer_knowledge
         // Store as pending — setup() inside optimize_with_constants_and_inputs
         // clears pass state, so we apply AFTER setup.
@@ -3413,15 +3493,13 @@ impl Optimizer {
             .map(|p| p + 1)
             .unwrap_or(bridge_inputarg_base + num_inputs as u32)
             .max(bridge_inputarg_base + num_inputs as u32);
-        let ops_rc: Vec<majit_ir::OpRc> =
-            ops.iter().map(|op| std::rc::Rc::new(op.clone())).collect();
         // Bridge ops are a fresh `TraceIterator`'s planted UNBOUND resop slots
         // (`bind_input_resops` binds them later, after `input_ops` is built),
         // so the input-ops seed is empty; producer lookup runs off `resop_refs`
         // (populated by `bind_input_resops`).
         self.explicit_input_ops_seed = Some(Vec::new());
         let optimized_ops = self.optimize_with_constants_and_inputs_at(
-            &ops_rc,
+            ops,
             constants,
             num_inputs,
             bridge_inputarg_base,
@@ -3480,7 +3558,7 @@ impl Optimizer {
                 );
                 self.send_extra_operation(&jump_op, &mut ctx);
                 let mut result = optimized_ops;
-                result.extend(ctx.new_operations.drain(..).map(|rc| (*rc).clone()));
+                result.extend(ctx.new_operations.drain(..));
                 return (result, false);
             }
             return (optimized_ops, false);
@@ -3556,7 +3634,7 @@ impl Optimizer {
                     );
                     self.send_extra_operation(&jump_op, &mut ctx);
                     let mut result = optimized_ops;
-                    result.extend(ctx.new_operations.drain(..).map(|rc| (*rc).clone()));
+                    result.extend(ctx.new_operations.drain(..));
                     return (result, false);
                 }
                 return (optimized_ops, false);
@@ -3566,7 +3644,7 @@ impl Optimizer {
         // unroll.py:212-213: vs is None → matched, JUMP redirected
         if vs.is_none() {
             let mut result = optimized_ops;
-            result.extend(ctx.new_operations.drain(..).map(|rc| (*rc).clone()));
+            result.extend(ctx.new_operations.drain(..));
             return (result, false);
         }
 
@@ -3616,7 +3694,7 @@ impl Optimizer {
         // unroll.py:226-227: vs is None → matched with forced boxes
         if vs2.is_none() {
             let mut result = optimized_ops;
-            result.extend(ctx.new_operations.drain(..).map(|rc| (*rc).clone()));
+            result.extend(ctx.new_operations.drain(..));
             return (result, false);
         }
 
@@ -3639,7 +3717,7 @@ impl Optimizer {
             );
             self.send_extra_operation(&jump_op, &mut ctx);
             let mut result = optimized_ops;
-            result.extend(ctx.new_operations.drain(..).map(|rc| (*rc).clone()));
+            result.extend(ctx.new_operations.drain(..));
             (result, false)
         } else {
             (optimized_ops, false)
@@ -6231,9 +6309,10 @@ mod tests {
         ctx.make_constant(OpRef::int_op(10_000), majit_ir::Value::Int(0));
         ctx.initialize_imported_short_preamble_builder(
             &[OpRef::int_op(0)],
-            &[OpRef::int_op(0)],
+            &[BoxRef::from_opref(OpRef::int_op(0))],
             &[crate::optimizeopt::shortpreamble::PreambleOp {
-                op: preamble_op.clone(),
+                op: std::rc::Rc::new(preamble_op.clone()),
+                res: BoxRef::from_opref(OpRef::int_op(14)),
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Pure,
                 label_arg_idx: None,
                 invented_name: false,

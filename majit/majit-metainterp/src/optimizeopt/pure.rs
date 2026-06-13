@@ -1313,11 +1313,16 @@ mod tests {
             Some(idx) => (0..=idx as u32).map(OpRef::int_op).collect(),
             None => vec![OpRef::int_op(0)],
         };
+        let short_inputarg_boxes: Vec<crate::r#box::BoxRef> = short_inputargs
+            .iter()
+            .map(|&a| crate::r#box::BoxRef::from_opref(a))
+            .collect();
         ctx.initialize_imported_short_preamble_builder(
             &short_inputargs,
-            &short_inputargs,
+            &short_inputarg_boxes,
             &[crate::optimizeopt::shortpreamble::PreambleOp {
-                op: preamble_op,
+                op: std::rc::Rc::new(preamble_op),
+                res: crate::r#box::BoxRef::from_opref(source),
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Pure,
                 label_arg_idx,
                 invented_name: false,
@@ -1329,14 +1334,23 @@ mod tests {
         if source != OpRef::NONE {
             // PreambleOp.op carries the Box itself (shortpreamble.py:12).
             let source_box = ctx.materialize_box_at(source);
-            let pop = crate::optimizeopt::info::PreambleOp {
-                op: source_box.clone(),
-                invented_name: false,
-                preamble_op: {
-                    let mut same_as = Op::new(OpCode::SameAsI, &[source_box]);
+            // Production threads the builder's replay Rc into the pop
+            // (produce_op family); mirror that here so use_box receives
+            // the same object the builder entry carries.
+            let replay = ctx
+                .imported_short_preamble_builder
+                .as_ref()
+                .and_then(|b| b.produced_short_op(source))
+                .map(|p| p.preamble_op)
+                .unwrap_or_else(|| {
+                    let mut same_as = Op::new(OpCode::SameAsI, &[source_box.clone()]);
                     same_as.pos.set(source);
                     std::rc::Rc::new(same_as)
-                },
+                });
+            let pop = crate::optimizeopt::info::PreambleOp {
+                op: source_box,
+                invented_name: false,
+                preamble_op: replay,
             };
             ctx.set_potential_extra_op(source, pop);
         }
@@ -2703,7 +2717,7 @@ mod tests {
                 majit_ir::OopSpecIndex::None,
             ),
         );
-        let imported = crate::optimizeopt::ImportedShortPureOp::new(
+        let mut imported = crate::optimizeopt::ImportedShortPureOp::new(
             &mut ctx,
             OpCode::CallPureI,
             Some(call_descr.clone()),
@@ -2723,6 +2737,15 @@ mod tests {
             (*imported.pop.preamble_op).clone(),
             Some(1),
         );
+        // Production threads the builder's replay Rc into the pop
+        // (produce_pure); mirror it so use_box sees one object.
+        if let Some(p) = ctx
+            .imported_short_preamble_builder
+            .as_ref()
+            .and_then(|b| b.produced_short_op(OpRef::int_op(1)))
+        {
+            imported.pop.preamble_op = p.preamble_op;
+        }
         ctx.imported_short_pure_ops.push(imported);
 
         pass.setup();
