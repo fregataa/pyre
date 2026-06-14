@@ -398,24 +398,13 @@ impl Optimizer {
             ),
             VirtualStateInfo::Unknown(tp) => *tp,
         };
-        // `Unknown` leaves carry no forwarded write (the
-        // `apply_imported_virtual_state` arm is a no-op), so reserve a bare
-        // position with no eager synthetic — matching the prior lazy path
-        // where nothing was minted until a later `materialize_box_at` access.
-        if let VirtualStateInfo::Unknown(_) = info {
-            let opref = ctx.alloc_op_position_typed(tp);
-            if crate::debug::have_debug_prints() {
-                crate::debug::log_one(
-                    "jit-optimizer",
-                    &format!("import_virtual_state_value {opref:?} <= {info:?}"),
-                );
-            }
-            return opref;
-        }
-        // Producer-less leaf with a forwarded write: mint the box up front
-        // and route the write through it (retires the per-arm
-        // `materialize_box_at(opref)` materialization inside
-        // `apply_imported_virtual_state`).
+        // Producer-less leaf: mint the box up front and route any forwarded
+        // write through it (the `Unknown` arm of
+        // `apply_imported_virtual_state` is a no-op, but the position must
+        // still bind its canonical host at allocation — task #194: a bare
+        // position resolves to `None`, so every later resolution would mint
+        // a fresh position-only box, splitting `same_box`-keyed export-cache
+        // keys and missing the `in_progress` cycle guard).
         let (opref, box_) = ctx.reserve_virtual_box(tp);
         if crate::debug::have_debug_prints() {
             crate::debug::log_one(
@@ -920,8 +909,11 @@ impl Optimizer {
                 // Ref-typed. PtrInfo presence alone cannot stand in for
                 // box.type because PtrInfo can also describe int-typed
                 // raw pointers (info.py:865 RawBufferPtrInfo +
-                // getrawptrinfo()).
-                let opref = ctx.alloc_op_position_typed(majit_ir::Type::Ref);
+                // getrawptrinfo()). Bind the head's canonical host at
+                // allocation so the PtrInfo write below lands
+                // unconditionally — a bare position resolves to `None` and
+                // would silently drop the imported virtual-ness.
+                let (opref, head_box) = ctx.reserve_virtual_box(majit_ir::Type::Ref);
                 let imported_fields: Vec<(u32, BoxRef)> = fields
                     .iter()
                     .map(|(field_idx, field_info)| {
@@ -941,29 +933,27 @@ impl Optimizer {
                         (*field_idx, BoxRef::from_opref(field_ref))
                     })
                     .collect();
-                let opref_box = ctx.get_box_replacement_box(opref);
                 let _ = field_descrs; // descr.all_fielddescrs() is authoritative
-                if let Some(b) = &opref_box {
-                    ctx.set_ptr_info(
-                        b,
-                        crate::optimizeopt::info::PtrInfo::Virtual(
-                            crate::optimizeopt::info::VirtualInfo {
-                                descr: descr.clone(),
-                                known_class: *known_class,
-                                ob_type_descr: ob_type_descr.clone(),
-                                fields: imported_fields,
-                                last_guard_pos: -1,
-                                avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
-                            },
-                        ),
-                    );
-                }
+                ctx.set_ptr_info(
+                    &head_box,
+                    crate::optimizeopt::info::PtrInfo::Virtual(
+                        crate::optimizeopt::info::VirtualInfo {
+                            descr: descr.clone(),
+                            known_class: *known_class,
+                            ob_type_descr: ob_type_descr.clone(),
+                            fields: imported_fields,
+                            last_guard_pos: -1,
+                            avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
+                        },
+                    ),
+                );
                 opref
             }
             VirtualStateInfo::VArray { descr, items, .. } => {
                 // unroll.py:454 Box carries its type. VArray heads are
-                // Ref-typed.
-                let opref = ctx.alloc_op_position_typed(majit_ir::Type::Ref);
+                // Ref-typed. Bound at allocation (task #194) — see the
+                // Virtual arm above.
+                let (opref, head_box) = ctx.reserve_virtual_box(majit_ir::Type::Ref);
                 let imported_items = items
                     .iter()
                     .map(|item_info| {
@@ -976,21 +966,18 @@ impl Optimizer {
                         ))
                     })
                     .collect();
-                let opref_box = ctx.get_box_replacement_box(opref);
-                if let Some(b) = &opref_box {
-                    ctx.set_ptr_info(
-                        b,
-                        crate::optimizeopt::info::PtrInfo::VirtualArray(
-                            crate::optimizeopt::info::VirtualArrayInfo {
-                                descr: descr.clone(),
-                                clear: false,
-                                items: imported_items,
-                                last_guard_pos: -1,
-                                avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
-                            },
-                        ),
-                    );
-                }
+                ctx.set_ptr_info(
+                    &head_box,
+                    crate::optimizeopt::info::PtrInfo::VirtualArray(
+                        crate::optimizeopt::info::VirtualArrayInfo {
+                            descr: descr.clone(),
+                            clear: false,
+                            items: imported_items,
+                            last_guard_pos: -1,
+                            avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
+                        },
+                    ),
+                );
                 opref
             }
             VirtualStateInfo::VStruct {
@@ -999,8 +986,9 @@ impl Optimizer {
                 field_descrs,
             } => {
                 // unroll.py:454 Box carries its type. VStruct heads are
-                // Ref-typed.
-                let opref = ctx.alloc_op_position_typed(majit_ir::Type::Ref);
+                // Ref-typed. Bound at allocation (task #194) — see the
+                // Virtual arm above.
+                let (opref, head_box) = ctx.reserve_virtual_box(majit_ir::Type::Ref);
                 let imported_fields = fields
                     .iter()
                     .map(|(field_idx, field_info)| {
@@ -1016,21 +1004,18 @@ impl Optimizer {
                         )
                     })
                     .collect();
-                let opref_box = ctx.get_box_replacement_box(opref);
                 let _ = field_descrs; // descr.all_fielddescrs() is authoritative
-                if let Some(b) = &opref_box {
-                    ctx.set_ptr_info(
-                        b,
-                        crate::optimizeopt::info::PtrInfo::VirtualStruct(
-                            crate::optimizeopt::info::VirtualStructInfo {
-                                descr: descr.clone(),
-                                fields: imported_fields,
-                                last_guard_pos: -1,
-                                avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
-                            },
-                        ),
-                    );
-                }
+                ctx.set_ptr_info(
+                    &head_box,
+                    crate::optimizeopt::info::PtrInfo::VirtualStruct(
+                        crate::optimizeopt::info::VirtualStructInfo {
+                            descr: descr.clone(),
+                            fields: imported_fields,
+                            last_guard_pos: -1,
+                            avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
+                        },
+                    ),
+                );
                 opref
             }
             VirtualStateInfo::VArrayStruct {
@@ -1039,8 +1024,9 @@ impl Optimizer {
                 element_fields,
             } => {
                 // unroll.py:454 Box carries its type. VArrayStruct heads
-                // are Ref-typed.
-                let opref = ctx.alloc_op_position_typed(majit_ir::Type::Ref);
+                // are Ref-typed. Bound at allocation (task #194) — see the
+                // Virtual arm above.
+                let (opref, head_box) = ctx.reserve_virtual_box(majit_ir::Type::Ref);
                 let imported_elements = element_fields
                     .iter()
                     .map(|fields| {
@@ -1063,21 +1049,18 @@ impl Optimizer {
                             .collect()
                     })
                     .collect();
-                let opref_box = ctx.get_box_replacement_box(opref);
-                if let Some(b) = &opref_box {
-                    ctx.set_ptr_info(
-                        b,
-                        crate::optimizeopt::info::PtrInfo::VirtualArrayStruct(
-                            crate::optimizeopt::info::VirtualArrayStructInfo {
-                                descr: descr.clone(),
-                                fielddescrs: fielddescrs.clone(),
-                                element_fields: imported_elements,
-                                last_guard_pos: -1,
-                                avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
-                            },
-                        ),
-                    );
-                }
+                ctx.set_ptr_info(
+                    &head_box,
+                    crate::optimizeopt::info::PtrInfo::VirtualArrayStruct(
+                        crate::optimizeopt::info::VirtualArrayStructInfo {
+                            descr: descr.clone(),
+                            fielddescrs: fielddescrs.clone(),
+                            element_fields: imported_elements,
+                            last_guard_pos: -1,
+                            avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
+                        },
+                    ),
+                );
                 opref
             }
             VirtualStateInfo::KnownClass { .. }
@@ -2186,7 +2169,10 @@ impl Optimizer {
         // `idx` mints `OpRef::*_op(idx)` matching the `Value` variant.
         for (&idx, value) in constants.iter() {
             let opref = OptContext::op_ref_for_value(idx, value);
-            ctx.seed_constant(opref, value.clone());
+            // seed_constant takes the canonical `_forwarded` host; resolve
+            // the body OpRef to its producing `Op` / `InputArg` box first.
+            let box_ = ctx.materialize_box_at(opref);
+            ctx.seed_constant(&box_, value.clone());
         }
 
         // Setup all passes
@@ -2485,7 +2471,7 @@ impl Optimizer {
                 // op/value_types chain. PtrInfo presence is an additional
                 // Ref-only side channel for inputargs not in `new_operations`.
                 let resolved_has_ptr_info = ctx
-                    .get_box_replacement_box(arg.to_opref())
+                    .resolve_box_box_opt(&arg)
                     .as_ref()
                     .map_or(false, |b| ctx.has_ptr_info(b));
                 let resolved_is_ref =
@@ -2498,7 +2484,7 @@ impl Optimizer {
                         .is_some()
                 {
                     let arg_is_virtual = ctx
-                        .get_box_replacement_box(arg.to_opref())
+                        .resolve_box_box_opt(&arg)
                         .as_ref()
                         .map_or(false, |b| ctx.is_virtual(b));
                     if arg_is_virtual {
@@ -2781,7 +2767,28 @@ impl Optimizer {
             // do in RPython.
             let post_force_args: Vec<OpRef> = resolved_args
                 .iter()
-                .map(|&a| ctx.get_replacement_opref(a))
+                .map(|&a| {
+                    let resolved = ctx.get_replacement_opref(a);
+                    // bind-at-alloc (task #194): `export_state` below keys its
+                    // `ExportCache` by these resolved positions. A producer-less
+                    // value-bearing position resolves to a throwaway `from_opref`
+                    // box, so each `resolve_to_boxref` returns a distinct Rc
+                    // (ptr-Eq-unstable) and `export_single_value` logs it as an
+                    // unbound export key. Bind the canonical `_forwarded` host
+                    // once via `materialize_box_at` (a `SameAs*` synthetic in
+                    // `resop_refs`, memoized through `Op::box_cache`) so the
+                    // export key resolves to one ptr-stable host — the identity
+                    // the #188 `OpRef`→`BoxRef` `ExportCache` rekey requires. The
+                    // returned `OpRef` is unchanged (synthetic and orphan share
+                    // the position), so the exported state is byte-identical.
+                    if !resolved.is_none()
+                        && !resolved.is_constant()
+                        && ctx.get_box_replacement_box(resolved).is_none()
+                    {
+                        ctx.materialize_box_at(resolved);
+                    }
+                    resolved
+                })
                 .collect();
             let preview_virtual_state =
                 crate::optimizeopt::virtualstate::export_state(&post_force_args, &ctx);
@@ -2899,7 +2906,7 @@ impl Optimizer {
                             continue;
                         }
                         let resolved = ctx
-                            .get_box_replacement_box(arg.to_opref())
+                            .resolve_box_box_opt(&arg)
                             .unwrap_or_else(|| arg.clone());
                         preamble_op.setarg(i, resolved);
                     }
@@ -3887,13 +3894,13 @@ impl Optimizer {
             // producer is registered yet — a short-preamble / bridge operand
             // dispatched mid-pass through `send_extra_operation`, whose
             // producer is neither emitted nor in `resop_refs` —
-            // `get_box_replacement_box` returns None. `materialize_box_at`
+            // `resolve_box_box_opt` returns None. `materialize_box_at`
             // then mints and registers the canonical `_forwarded` host (the
             // "Box always exists" invariant, resoperation.py:233) and we walk
             // it to its terminal, so the stored arg is BOUND on every dispatch
             // path. A sentinel operand keeps its unbound arg box (const
             // operands resolve through the `Some` arm above).
-            let resolved = match ctx.get_box_replacement_box(arg.to_opref()) {
+            let resolved = match ctx.resolve_box_box_opt(&arg) {
                 Some(b) => b,
                 None => {
                     let argref = arg.to_opref();
@@ -4221,7 +4228,8 @@ impl Optimizer {
             if let Some(bound) = bound {
                 if bound.is_constant() {
                     let const_val = bound.get_constant_int();
-                    ctx.make_constant(replaced, majit_ir::Value::Int(const_val));
+                    let b = ctx.materialize_box_at(replaced);
+                    ctx.make_constant_box(&b, majit_ir::Value::Int(const_val));
                 }
             }
         }
@@ -4570,9 +4578,8 @@ impl Optimizer {
         if let Some(fail_args) = op.fail_args_mut() {
             for fa_idx in 0..fail_args.len() {
                 if !fail_args[fa_idx].is_none() {
-                    if let Some(resolved) =
-                        ctx.get_box_replacement_not_const_box(fail_args[fa_idx].to_opref())
-                    {
+                    let arg_box = fail_args[fa_idx].to_boxref();
+                    if let Some(resolved) = ctx.get_box_replacement_not_const_box(&arg_box) {
                         fail_args[fa_idx] = majit_ir::operand::Operand::from_boxref(&resolved);
                     }
                 }
@@ -4694,7 +4701,7 @@ impl Optimizer {
         }
         // optimizer.py:756-757: b = self.getintbound(op.getarg(0)); if b.is_bool()
         let b = {
-            let b = ctx.get_box_replacement(arg0.to_opref());
+            let b = ctx.resolve_box_box(&arg0);
             ctx.getintbound_handle(&b).borrow().clone()
         };
         if !b.is_bool() {
@@ -4854,7 +4861,8 @@ mod tests {
             ctx: &mut OptContext,
         ) -> OptimizationResult {
             if op.pos.get() == self.target {
-                ctx.make_constant(op.pos.get(), majit_ir::Value::Int(self.value));
+                let b = ctx.materialize_box_at(op.pos.get());
+                ctx.make_constant_box(&b, majit_ir::Value::Int(self.value));
                 return OptimizationResult::Remove;
             }
             OptimizationResult::PassOn
@@ -4901,7 +4909,8 @@ mod tests {
             ctx: &mut OptContext,
         ) -> OptimizationResult {
             if op.pos.get() == self.target {
-                ctx.make_constant(op.pos.get(), self.value.clone());
+                let b = ctx.materialize_box_at(op.pos.get());
+                ctx.make_constant_box(&b, self.value.clone());
                 return OptimizationResult::Remove;
             }
             OptimizationResult::PassOn
@@ -4925,7 +4934,8 @@ mod tests {
             ctx: &mut OptContext,
         ) -> OptimizationResult {
             if op.pos.get() == self.target {
-                ctx.make_constant(op.pos.get(), self.value.clone());
+                let b = ctx.materialize_box_at(op.pos.get());
+                ctx.make_constant_box(&b, self.value.clone());
             }
             OptimizationResult::PassOn
         }
@@ -6184,13 +6194,15 @@ mod tests {
             INFO_UNKNOWN
         );
         // Known nonzero integer → INFO_NONNULL.
-        ctx.make_constant(OpRef::int_op(1), majit_ir::Value::Int(42));
+        let b = ctx.materialize_box_at(OpRef::int_op(1));
+        ctx.make_constant_box(&b, majit_ir::Value::Int(42));
         assert_eq!(
             Optimizer::getnullness(&mut ctx, OpRef::int_op(1)),
             INFO_NONNULL
         );
         // Known zero integer → INFO_NULL.
-        ctx.make_constant(OpRef::int_op(2), majit_ir::Value::Int(0));
+        let b = ctx.materialize_box_at(OpRef::int_op(2));
+        ctx.make_constant_box(&b, majit_ir::Value::Int(0));
         assert_eq!(
             Optimizer::getnullness(&mut ctx, OpRef::int_op(2)),
             INFO_NULL
@@ -6325,7 +6337,8 @@ mod tests {
             ],
         );
         preamble_op.pos.set(OpRef::int_op(14));
-        ctx.make_constant(OpRef::int_op(10_000), majit_ir::Value::Int(0));
+        let b = ctx.materialize_box_at(OpRef::int_op(10_000));
+        ctx.make_constant_box(&b, majit_ir::Value::Int(0));
         ctx.initialize_imported_short_preamble_builder(
             &[OpRef::int_op(0)],
             &[BoxRef::from_opref(OpRef::int_op(0))],
@@ -6462,5 +6475,57 @@ mod tests {
         assert_eq!(snap.opt_ops, 5);
         assert_eq!(snap.opt_guards, 2);
         assert_eq!(snap.opt_guards_shared, 1);
+    }
+
+    /// bind-at-alloc totality (task #194): an `Unknown` virtual-state leaf
+    /// must bind its canonical `_forwarded` host at allocation. A bare
+    /// position resolves to `None`, so every later resolution mints a fresh
+    /// position-only box — splitting `same_box`-keyed export-cache keys and
+    /// missing the `in_progress` cycle guard (the #228 residual).
+    #[test]
+    fn import_unknown_leaf_resolves_to_bound_box() {
+        let mut ctx = OptContext::with_num_inputs_and_start_pos(8, 0, 0, 50);
+        let info = crate::optimizeopt::virtualstate::VirtualStateInfo::Unknown(Type::Ref);
+        let opref = Optimizer::import_virtual_state_value(&info, &mut ctx);
+        assert!(
+            ctx.get_box_replacement_box(opref).is_some(),
+            "Unknown-leaf import must bind the canonical host at allocation"
+        );
+    }
+
+    /// Imported virtual heads must carry their `PtrInfo::Virtual`. The
+    /// label-args import used to allocate a bare head position and write
+    /// the info through `get_box_replacement_box(..)` guarded by `if let
+    /// Some(..)` — always `None` for a bare position, silently dropping
+    /// the virtual-ness of the imported state.
+    #[test]
+    fn import_label_args_virtual_head_installs_ptr_info() {
+        let mut ctx = OptContext::with_num_inputs_and_start_pos(8, 0, 0, 50);
+        let info = crate::optimizeopt::virtualstate::VirtualStateInfo::Virtual {
+            descr: make_size_descr(16),
+            known_class: None,
+            ob_type_descr: None,
+            fields: Vec::new(),
+            field_descrs: Vec::new(),
+        };
+        let mut walk_visited = crate::optimizeopt::vec_assoc::VecAssoc::new();
+        let mut label_slot = 0usize;
+        let head = Optimizer::import_virtual_state_from_label_args(
+            &info,
+            &[],
+            &mut label_slot,
+            &mut ctx,
+            &mut walk_visited,
+        );
+        let b = ctx
+            .get_box_replacement_box(head)
+            .expect("virtual head must bind the canonical host at allocation");
+        assert!(
+            matches!(
+                ctx.peek_ptr_info(&b),
+                Some(crate::optimizeopt::info::PtrInfo::Virtual(_))
+            ),
+            "imported virtual head must carry PtrInfo::Virtual"
+        );
     }
 }

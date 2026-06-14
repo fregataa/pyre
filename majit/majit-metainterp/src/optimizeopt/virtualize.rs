@@ -769,7 +769,8 @@ impl OptVirtualize {
             if let PtrInfo::Virtual(ref vinfo) = info {
                 if is_typeptr {
                     if let Some(class_val) = vinfo.known_class {
-                        ctx.make_constant(op.pos.get(), majit_ir::Value::Int(class_val));
+                        let b = ctx.materialize_box_at(op.pos.get());
+                        ctx.make_constant_box(&b, majit_ir::Value::Int(class_val));
                         return OptimizationResult::Remove;
                     }
                 }
@@ -808,8 +809,9 @@ impl OptVirtualize {
                         .and_then(|sd| sd.w_class_obj())
                         .filter(|&w| w != 0)
                     {
-                        ctx.make_constant(
-                            op.pos.get(),
+                        let b = ctx.materialize_box_at(op.pos.get());
+                        ctx.make_constant_box(
+                            &b,
                             majit_ir::Value::Ref(majit_ir::GcRef(w_class as usize)),
                         );
                         return OptimizationResult::Remove;
@@ -858,7 +860,8 @@ impl OptVirtualize {
                         _ => None,
                     };
                     if let Some(vtable) = vtable {
-                        ctx.make_constant(op.pos.get(), Value::Int(vtable as i64));
+                        let b = ctx.materialize_box_at(op.pos.get());
+                        ctx.make_constant_box(&b, Value::Int(vtable as i64));
                         return OptimizationResult::Remove;
                     }
                 }
@@ -994,7 +997,8 @@ impl OptVirtualize {
             array_box.as_ref().and_then(|b| ctx.peek_ptr_info(b))
         {
             let len = vinfo.items.len() as i64;
-            ctx.make_constant(op.pos.get(), Value::Int(len));
+            let b = ctx.materialize_box_at(op.pos.get());
+            ctx.make_constant_box(&b, Value::Int(len));
             return OptimizationResult::Remove;
         }
         // virtualize.py:273: self.make_nonnull(op.getarg(0))
@@ -2825,7 +2829,8 @@ mod tests {
         let mut ctx = OptContext::new(ops.len());
         ctx.snapshot_boxes = snapshots;
         for &(opref, ref val) in constants {
-            ctx.make_constant(opref, val.clone());
+            let b = ctx.materialize_box_at(opref);
+            ctx.make_constant_box(&b, val.clone());
         }
 
         let mut pass = OptVirtualize::new();
@@ -2937,7 +2942,8 @@ mod tests {
         // num_static=0) for consistency with `init`.
         let field_descr = test_vable_field_descr(8, Type::Int, 1);
         let arr_descr = array_descr(20);
-        ctx.make_constant(OpRef::int_op(50), Value::Int(0));
+        let b = ctx.materialize_box_at(OpRef::int_op(50));
+        ctx.make_constant_box(&b, Value::Int(0));
 
         let get_array_ptr = Op::with_descr(
             OpCode::GetfieldRawI,
@@ -3270,8 +3276,10 @@ mod tests {
         let field_descr = test_vable_field_descr(8, Type::Int, 1);
         let arr_descr = array_descr(20);
         // const array index 0 and a stored value.
-        ctx.make_constant(OpRef::int_op(50), Value::Int(0));
-        ctx.make_constant(OpRef::int_op(51), Value::Int(42));
+        let b = ctx.materialize_box_at(OpRef::int_op(50));
+        ctx.make_constant_box(&b, Value::Int(0));
+        let b = ctx.materialize_box_at(OpRef::int_op(51));
+        ctx.make_constant_box(&b, Value::Int(42));
 
         let get_array_ptr = Op::with_descr(
             OpCode::GetfieldRawI,
@@ -3376,9 +3384,12 @@ mod tests {
         let arr_descr = array_descr(20);
         // const index 0 + two stored values; int_op(60) is a NON-constant
         // index (never made constant) for the variable-index write.
-        ctx.make_constant(OpRef::int_op(50), Value::Int(0));
-        ctx.make_constant(OpRef::int_op(51), Value::Int(42));
-        ctx.make_constant(OpRef::int_op(52), Value::Int(99));
+        let b = ctx.materialize_box_at(OpRef::int_op(50));
+        ctx.make_constant_box(&b, Value::Int(0));
+        let b = ctx.materialize_box_at(OpRef::int_op(51));
+        ctx.make_constant_box(&b, Value::Int(42));
+        let b = ctx.materialize_box_at(OpRef::int_op(52));
+        ctx.make_constant_box(&b, Value::Int(99));
 
         let get_array_ptr = Op::with_descr(
             OpCode::GetfieldRawI,
@@ -4868,7 +4879,8 @@ mod tests {
     ) -> Vec<Op> {
         let mut ctx = OptContext::new(ops.len());
         for &(opref, ref val) in constants {
-            ctx.make_constant(opref, val.clone());
+            let b = ctx.materialize_box_at(opref);
+            ctx.make_constant_box(&b, val.clone());
         }
 
         let mut pass = OptVirtualize::new();

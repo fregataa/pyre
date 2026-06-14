@@ -76,28 +76,25 @@ impl IntBoundMakeGuards for IntBound {
         use crate::optimizeopt::Op;
         use majit_ir::{OpCode, Type, Value};
 
-        let mut alloc_const = |ctx: &mut crate::optimizeopt::OptContext, value: Value| {
-            // history.py:227/268/314 Const{Int,Float,Ptr}.value inline.
-            // IntBound guards mint Int values only, so the match is total
-            // on the variant tag.
-            let pos = match value {
-                Value::Int(v) => majit_ir::OpRef::const_int(v),
-                Value::Float(v) => majit_ir::OpRef::const_float(v),
-                Value::Ref(v) => majit_ir::OpRef::const_ptr(v),
-                Value::Void => panic!("alloc_const: ConstVoid not allowed"),
-            };
-            ctx.seed_constant(pos, value);
-            pos
+        // history.py:227/268/314 Const{Int,Float,Ptr}.value inline: the
+        // value rides on the inline-Const OpRef variant tag itself, so no
+        // `seed_constant` step is needed (its const arm is a no-op).
+        // IntBound guards mint Int values only, so the match is total.
+        let alloc_const = |value: Value| match value {
+            Value::Int(v) => majit_ir::OpRef::const_int(v),
+            Value::Float(v) => majit_ir::OpRef::const_float(v),
+            Value::Ref(v) => majit_ir::OpRef::const_ptr(v),
+            Value::Void => panic!("alloc_const: ConstVoid not allowed"),
         };
         if self.is_constant() {
-            let c = alloc_const(ctx, Value::Int(self.upper));
+            let c = alloc_const(Value::Int(self.upper));
             let arg_box = ctx.materialize_box_at(box_ref);
             let arg_c = ctx.materialize_box_at(c);
             guards.push(Op::new(OpCode::GuardValue, &[arg_box, arg_c]));
             return;
         }
         if self.lower > i64::MIN {
-            let bound = alloc_const(ctx, Value::Int(self.lower));
+            let bound = alloc_const(Value::Int(self.lower));
             let arg_box = ctx.materialize_box_at(box_ref);
             let arg_bound = ctx.materialize_box_at(bound);
             let mut op = Op::new(OpCode::IntGe, &[arg_box, arg_bound]);
@@ -113,7 +110,7 @@ impl IntBoundMakeGuards for IntBound {
             guards.push(Op::new(OpCode::GuardTrue, &[arg_op]));
         }
         if self.upper < i64::MAX {
-            let bound = alloc_const(ctx, Value::Int(self.upper));
+            let bound = alloc_const(Value::Int(self.upper));
             let arg_box = ctx.materialize_box_at(box_ref);
             let arg_bound = ctx.materialize_box_at(bound);
             let mut op = Op::new(OpCode::IntLe, &[arg_box, arg_bound]);
@@ -125,7 +122,7 @@ impl IntBoundMakeGuards for IntBound {
             guards.push(Op::new(OpCode::GuardTrue, &[arg_op]));
         }
         if !self.are_knownbits_implied() {
-            let mask = alloc_const(ctx, Value::Int(!self.tmask as i64));
+            let mask = alloc_const(Value::Int(!self.tmask as i64));
             let arg_box = ctx.materialize_box_at(box_ref);
             let arg_mask = ctx.materialize_box_at(mask);
             let mut op = Op::new(OpCode::IntAnd, &[arg_box, arg_mask]);
@@ -133,7 +130,7 @@ impl IntBoundMakeGuards for IntBound {
             op.pos.set(ctx.alloc_op_position_typed(Type::Int));
             let op_pos = op.pos.get();
             guards.push(op);
-            let value = alloc_const(ctx, Value::Int(self.tvalue as i64));
+            let value = alloc_const(Value::Int(self.tvalue as i64));
             let arg_op = ctx.materialize_box_at(op_pos);
             let arg_value = ctx.materialize_box_at(value);
             guards.push(Op::new(OpCode::GuardValue, &[arg_op, arg_value]));

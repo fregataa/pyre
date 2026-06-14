@@ -1878,7 +1878,8 @@ impl OptHeap {
                 .is_some()
             {
                 if let Some(value) = ctx.constant_fold(&op) {
-                    ctx.make_constant(op.pos.get(), value);
+                    let b = ctx.materialize_box_at(op.pos.get());
+                    ctx.make_constant_box(&b, value);
                     return OptimizationResult::Remove;
                 }
             }
@@ -2196,9 +2197,13 @@ impl OptHeap {
                     }
                 }
                 crate::optimizeopt::info::FieldEntry::Value(cached) => {
-                    // heap.py:88 not cached_field.same_box(arg1)
-                    // (ctx.same_box resolves both sides internally)
-                    if ctx.same_box(cached.to_opref(), arg1) {
+                    // heap.py:85-88 `if cached_field is not None:
+                    // cached_field = cached_field.get_box_replacement()` then
+                    // `if not cached_field or not cached_field.same_box(arg1)`
+                    // — a cleared slot stores None and counts as not cached;
+                    // gate on non-None and let ctx.same_box fold in the
+                    // get_box_replacement (heap.py:86) for both sides.
+                    if !cached.is_none() && ctx.same_box(cached.to_opref(), arg1) {
                         // heap.py:100 self._lazy_set = None
                         self.field_cache(descr).lazy_set = None;
                         return OptimizationResult::Remove;
@@ -2338,9 +2343,13 @@ impl OptHeap {
                     }
                 }
                 crate::optimizeopt::info::FieldEntry::Value(cached) => {
-                    // heap.py:88 not cached_field.same_box(arg1)
-                    // (ctx.same_box resolves both sides internally)
-                    if ctx.same_box(cached.to_opref(), arg1) {
+                    // heap.py:85-88 `if cached_field is not None:
+                    // cached_field = cached_field.get_box_replacement()` then
+                    // `if not cached_field or not cached_field.same_box(arg1)`
+                    // — a cleared slot stores None and counts as not cached;
+                    // gate on non-None and let ctx.same_box fold in the
+                    // get_box_replacement (heap.py:86) for both sides.
+                    if !cached.is_none() && ctx.same_box(cached.to_opref(), arg1) {
                         // heap.py:100 self._lazy_set = None
                         self.arrayitem_cache(descr, const_index).lazy_set = None;
                         return OptimizationResult::Remove;
@@ -3314,14 +3323,15 @@ impl Optimization for OptHeap {
                 else {
                     continue;
                 };
+                // heap.py:842-843: if box2 is None: continue (cleared slot)
+                if val.is_none() {
+                    continue;
+                }
                 // heap.py:844: box2 = box2.get_box_replacement() — one
                 // chain walk; the position view falls back to the source.
                 let val_box = ctx.get_box_replacement_box(val);
                 let val = val_box.as_ref().map_or(val, |b| b.to_opref());
                 // heap.py:845: if box2.is_constant() or box2 in available_boxes:
-                if val.is_none() {
-                    continue;
-                }
                 let val_ok = available_boxes.map_or(true, |ab| {
                     val.is_constant()
                         || val_box.as_ref().and_then(|cb| cb.const_value()).is_some()
@@ -3444,14 +3454,15 @@ impl Optimization for OptHeap {
                     else {
                         continue;
                     };
+                    // heap.py:863-864: if box2 is None: continue (cleared slot)
+                    if val.is_none() {
+                        continue;
+                    }
                     // heap.py:865: box2 = box2.get_box_replacement() — one
                     // chain walk; the position view falls back to the source.
                     let val_box = ctx.get_box_replacement_box(val);
                     let val = val_box.as_ref().map_or(val, |b| b.to_opref());
                     // heap.py:866: if box2.is_constant() or box2 in available_boxes:
-                    if val.is_none() {
-                        continue;
-                    }
                     let val_ok = available_boxes.map_or(true, |ab| {
                         val.is_constant()
                             || val_box.as_ref().and_then(|cb| cb.const_value()).is_some()
@@ -4077,7 +4088,8 @@ mod tests {
         let mut heap = OptHeap::new();
         let mut ctx = OptContext::with_inputarg_types(4, &[Type::Int]);
         let p0 = OpRef::input_arg_typed(0, Type::Int);
-        ctx.make_constant(p0, majit_ir::Value::Int(1));
+        let b = ctx.materialize_box_at(p0);
+        ctx.make_constant_box(&b, majit_ir::Value::Int(1));
 
         let pos1 = ctx.reserve_pos_typed(Type::Int);
         let mut op = Op::with_descr(OpCode::GetfieldGcI, &[BoxRef::from_opref(p0)], d);
@@ -4279,7 +4291,8 @@ mod tests {
 
         // We need to make the index a known constant in the context.
         let mut ctx = OptContext::new(ops.len());
-        ctx.make_constant(idx, majit_ir::Value::Int(3));
+        let b = ctx.materialize_box_at(idx);
+        ctx.make_constant_box(&b, majit_ir::Value::Int(3));
 
         let mut pass = OptHeap::new();
         pass.setup();
@@ -4339,7 +4352,8 @@ mod tests {
         op.pos.set(OpRef::int_op(200));
 
         let mut ctx = OptContext::new(256);
-        ctx.make_constant(idx, majit_ir::Value::Int(3));
+        let b = ctx.materialize_box_at(idx);
+        ctx.make_constant_box(&b, majit_ir::Value::Int(3));
         let pos100 = ctx.materialize_box_at(OpRef::ref_op(100));
         ctx.set_ptr_info(&pos100, PtrInfo::virtual_array(d, 8, false));
 
@@ -4379,7 +4393,8 @@ mod tests {
         );
 
         let mut ctx = OptContext::new(256);
-        ctx.make_constant(idx, majit_ir::Value::Int(3));
+        let b = ctx.materialize_box_at(idx);
+        ctx.make_constant_box(&b, majit_ir::Value::Int(3));
         let pos100 = ctx.materialize_box_at(OpRef::int_op(100));
         ctx.set_ptr_info(&pos100, PtrInfo::virtual_array(d.clone(), 8, false));
 
@@ -4693,7 +4708,8 @@ mod tests {
         assign_positions(&mut ops);
 
         let mut ctx = OptContext::new(ops.len());
-        ctx.make_constant(idx, majit_ir::Value::Int(5));
+        let b = ctx.materialize_box_at(idx);
+        ctx.make_constant_box(&b, majit_ir::Value::Int(5));
 
         let mut pass = OptHeap::new();
         pass.setup();
@@ -5424,7 +5440,8 @@ mod tests {
         assign_positions(&mut ops);
 
         let mut ctx = OptContext::new(ops.len());
-        ctx.make_constant(idx, majit_ir::Value::Int(3));
+        let b = ctx.materialize_box_at(idx);
+        ctx.make_constant_box(&b, majit_ir::Value::Int(3));
 
         let mut pass = OptHeap::new();
         pass.setup();
@@ -6360,7 +6377,8 @@ mod tests {
         assign_positions(&mut ops);
 
         let mut ctx = OptContext::new(ops.len());
-        ctx.make_constant(idx, majit_ir::Value::Int(5)); // byte index 5
+        let b = ctx.materialize_box_at(idx);
+        ctx.make_constant_box(&b, majit_ir::Value::Int(5)); // byte index 5
 
         let mut pass = OptHeap::new();
         pass.setup();
@@ -6439,8 +6457,10 @@ mod tests {
         assign_positions(&mut ops);
 
         let mut ctx = OptContext::new(ops.len());
-        ctx.make_constant(idx5, majit_ir::Value::Int(5));
-        ctx.make_constant(idx6, majit_ir::Value::Int(6));
+        let b = ctx.materialize_box_at(idx5);
+        ctx.make_constant_box(&b, majit_ir::Value::Int(5));
+        let b = ctx.materialize_box_at(idx6);
+        ctx.make_constant_box(&b, majit_ir::Value::Int(6));
 
         let mut pass = OptHeap::new();
         pass.setup();
@@ -6517,7 +6537,8 @@ mod tests {
         assign_positions(&mut ops);
 
         let mut ctx = OptContext::new(ops.len());
-        ctx.make_constant(idx, majit_ir::Value::Int(3));
+        let b = ctx.materialize_box_at(idx);
+        ctx.make_constant_box(&b, majit_ir::Value::Int(3));
 
         let mut pass = OptHeap::new();
         pass.setup();

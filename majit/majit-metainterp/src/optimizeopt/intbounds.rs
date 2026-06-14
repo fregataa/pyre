@@ -136,16 +136,18 @@ impl OptIntBounds {
     /// optimizer.py:434: make_constant_int(box, intvalue) — RPython just
     /// forwards to `make_constant(box, ConstInt(intvalue))`. The bounds-range
     /// safety check + `make_eq_const` shrink (optimizer.py:415-426) live in
-    /// `OptContext::make_constant`.
+    /// `OptContext::make_constant_box`.
     fn make_constant_int(&mut self, op: &Op, value: i64, ctx: &mut OptContext) {
-        ctx.make_constant(op.pos.get(), Value::Int(value));
+        let b = ctx.materialize_box_at(op.pos.get());
+        ctx.make_constant_box(&b, Value::Int(value));
     }
 
     /// OpRef-keyed variant of make_constant_int. Used by
     /// `propagate_bounds_backward` and the IntIsTrue/IsZero arms which
     /// receive an OpRef rather than an &Op.
     fn make_constant_int_ref(&mut self, opref: OpRef, value: i64, ctx: &mut OptContext) {
-        ctx.make_constant(opref, Value::Int(value));
+        let b = ctx.materialize_box_at(opref);
+        ctx.make_constant_box(&b, Value::Int(value));
     }
 
     /// intbounds.py:107 `inv_arg1 = ConstInt(-i1)` parity — synthesise a
@@ -1829,18 +1831,9 @@ impl OptIntBounds {
         OptimizationResult::PassOn
     }
 
-    /// autogenintrules.py helper used for pattern matching:
-    /// `as_operation(box, opnum)` returns the producing op iff its opcode
-    /// matches, else None.
-    fn as_operation(&self, opref: OpRef, opcode: OpCode, ctx: &mut OptContext) -> Option<Op> {
-        let op = ctx
-            .get_box_replacement_box(opref)
-            .and_then(|pb| ctx.get_producing_op(&pb))?;
-        if op.opcode == opcode { Some(op) } else { None }
-    }
-
-    /// `BoxRef`-terminal variant of [`as_operation`]: the producing op of an
-    /// operand already resolved to its terminal box (`resolve_box`).
+    /// autogenintrules.py helper `as_operation(box, opnum)`: the producing
+    /// op of an operand already resolved to its terminal box
+    /// (`resolve_box`), returned iff its opcode matches, else None.
     fn as_operation_b(
         &self,
         b: &crate::r#box::BoxRef,
@@ -2382,17 +2375,25 @@ impl OptIntBounds {
     }
 
     /// optimizer.py:366 as_operation parity:
-    /// Find the operation that produced cond_ref by searching new_operations.
+    /// Find the operation that produced `box_` by searching new_operations.
     /// RPython's `as_operation(box)` checks `_emittedoperations` directly;
-    /// majit's flat OpRef model requires a positional lookup.
-    fn find_producing_op<'a>(&self, cond_ref: OpRef, ctx: &'a OptContext) -> Option<&'a Op> {
+    /// majit's flat OpRef model requires a positional lookup. #188 rekeys
+    /// `new_operations` / `emitted_operations` to BoxRef identity, at which
+    /// point this positional scan collapses to the `_emittedoperations`
+    /// membership test on the box.
+    fn find_producing_op<'a>(
+        &self,
+        box_: &crate::r#box::BoxRef,
+        ctx: &'a OptContext,
+    ) -> Option<&'a Op> {
         // optimizer.py:372 `isinstance(op, AbstractResOp)` — a `Const` is not
         // an AbstractResOp, so `as_operation` returns None for it. A constant
         // operand has no producing op; bail before `raw()`, which panics on
         // the inline-`Const` OpRef variants.
-        if cond_ref.is_constant() {
+        if box_.is_constant() {
             return None;
         }
+        let cond_ref = box_.to_opref();
         // First try direct index (when OpRef matches new_operations index)
         let idx = cond_ref.raw() as usize;
         if idx < ctx.new_operations.len() && ctx.new_operations[idx].pos.get() == cond_ref {
@@ -2592,15 +2593,17 @@ impl OptIntBounds {
     /// call so the producing op of a now-constant value also gets a chance
     /// to tighten its other arguments.
     /// Reads the operand bound box-native through `getintbound_arg`
-    /// (→ `resolve_box_box`); the const-fold (`make_constant`) and the
-    /// `as_operation` producer lookup (`find_producing_op`) stay OpRef-keyed
-    /// (the legitimate `as_operation`/`make_constant` residuals).
+    /// (→ `resolve_box_box`); the `as_operation` producer lookup
+    /// (`find_producing_op`) now takes the box directly, keeping only an
+    /// internal flat-OpRef positional scan over `new_operations` (the
+    /// legitimate `_emittedoperations` residual, #188-gated). The const-fold
+    /// (`make_constant_int_ref`) stays OpRef-keyed pending #186.
     fn propagate_bounds_backward(&mut self, box_: &crate::r#box::BoxRef, ctx: &mut OptContext) {
         let b = self.getintbound_arg(box_.clone(), ctx);
         if b.is_constant() {
             self.make_constant_int_ref(box_.to_opref(), b.get_constant_int(), ctx);
         }
-        if let Some(producing_op) = self.find_producing_op(box_.to_opref(), ctx) {
+        if let Some(producing_op) = self.find_producing_op(box_, ctx) {
             let producing_op = producing_op.clone();
             self.propagate_bounds_backward_op(&producing_op, ctx);
         }
@@ -3482,7 +3485,7 @@ mod tests {
             // box.
             for i in 0..resolved_op.num_args() {
                 let a = resolved_op.arg(i);
-                let resolved = match ctx.get_box_replacement_box(a.to_opref()) {
+                let resolved = match ctx.resolve_box_box_opt(&a) {
                     Some(b) => b,
                     None => {
                         let ar = a.to_opref();
@@ -3528,7 +3531,8 @@ mod tests {
                             .get_box_replacement_box(a)
                             .map(|b| b.to_opref())
                             .unwrap_or(a);
-                        ctx.make_constant(cond, majit_ir::Value::Int(1));
+                        let b = ctx.materialize_box_at(cond);
+                        ctx.make_constant_box(&b, majit_ir::Value::Int(1));
                     }
                     OpCode::GuardFalse => {
                         let a = emitted.arg(0).to_opref();
@@ -3536,7 +3540,8 @@ mod tests {
                             .get_box_replacement_box(a)
                             .map(|b| b.to_opref())
                             .unwrap_or(a);
-                        ctx.make_constant(cond, majit_ir::Value::Int(0));
+                        let b = ctx.materialize_box_at(cond);
+                        ctx.make_constant_box(&b, majit_ir::Value::Int(0));
                     }
                     _ => {}
                 }

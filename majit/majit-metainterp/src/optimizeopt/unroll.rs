@@ -6525,7 +6525,8 @@ mod tests {
         // ConstPtr.value inline (history.py:314): the producer seeds the
         // inline variant that carries the pointer directly; the consumer
         // reads it back without any pool lookup.
-        ctx.seed_constant(OpRef::const_ptr(ptr), Value::Ref(ptr));
+        let ptr_box = ctx.materialize_box_at(OpRef::const_ptr(ptr));
+        ctx.seed_constant(&ptr_box, Value::Ref(ptr));
         ctx.exported_short_boxes
             .push(crate::optimizeopt::shortpreamble::PreambleOp {
                 op: {
@@ -6587,7 +6588,8 @@ mod tests {
         // reads it back without any pool lookup.
         let func_ptr = 0xCAFE;
         let func = OpRef::const_int(func_ptr);
-        ctx.seed_constant(func, Value::Int(func_ptr));
+        let func_box = ctx.materialize_box_at(func);
+        ctx.seed_constant(&func_box, Value::Int(func_ptr));
         ctx.exported_short_boxes
             .push(crate::optimizeopt::shortpreamble::PreambleOp {
                 op: {
@@ -6666,7 +6668,8 @@ mod tests {
             8,
             &[Type::Int, Type::Int, Type::Int, Type::Int],
         );
-        ctx.seed_constant(func, Value::Int(func_ptr));
+        let func_box = ctx.materialize_box_at(func);
+        ctx.seed_constant(&func_box, Value::Int(func_ptr));
 
         import_short_preamble_state(&[OpRef::int_op(0)], &[phase2_result], &exported, &mut ctx);
 

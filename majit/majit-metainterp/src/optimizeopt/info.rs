@@ -432,7 +432,8 @@ impl PtrInfoExt for PtrInfo {
                 Value::Ref(v) => OpRef::const_ptr(v),
                 Value::Void => panic!("alloc_const: ConstVoid not allowed"),
             };
-            ctx.seed_constant(pos, value);
+            // ConstInt/Float/Ptr value rides inline on `pos`
+            // (history.py:227/268/314); no `seed_constant` (const arm no-op).
             ctx.materialize_box_at(pos)
         };
         // info.py make_guards receives `op` as a Box object; bind the
@@ -909,7 +910,7 @@ fn force_box_impl(
                     // chain to the just-installed Const target (where it
                     // is a no-op per Const-box invariant).
                     let const_ref = GcRef(ptr.0);
-                    ctx.make_constant(opref, Value::Ref(const_ref));
+                    ctx.make_constant_arg(&box_, Value::Ref(const_ref));
                     ctx.set_ptr_info(&box_, PtrInfo::Constant(const_ref));
                     return opref;
                 }
@@ -1261,7 +1262,7 @@ fn force_box_impl(
             };
             if let Some(gcref) = c_s {
                 // vstring.py:83: get_box_replacement(op).set_forwarded(c_s)
-                ctx.make_constant(opref, Value::Ref(gcref));
+                ctx.make_constant_arg(&box_, Value::Ref(gcref));
                 return opref;
             }
 
@@ -1542,9 +1543,12 @@ mod tests {
     #[test]
     fn test_str_ptr_info_constant_string_spec_and_strgetitem() {
         let mut ctx = OptContext::new(16);
-        ctx.make_constant(OpRef::int_op(10), Value::Int(97));
-        ctx.make_constant(OpRef::int_op(11), Value::Int(98));
-        ctx.make_constant(OpRef::int_op(12), Value::Int(99));
+        let b = ctx.materialize_box_at(OpRef::int_op(10));
+        ctx.make_constant_box(&b, Value::Int(97));
+        let b = ctx.materialize_box_at(OpRef::int_op(11));
+        ctx.make_constant_box(&b, Value::Int(98));
+        let b = ctx.materialize_box_at(OpRef::int_op(12));
+        ctx.make_constant_box(&b, Value::Int(99));
 
         let info = PtrInfo::Str(StrPtrInfo {
             lenbound: None,
@@ -1604,11 +1608,16 @@ mod tests {
     #[test]
     fn test_str_ptr_info_slice_and_concat_dispatch() {
         let mut ctx = OptContext::new(32);
-        ctx.make_constant(OpRef::int_op(10), Value::Int(97));
-        ctx.make_constant(OpRef::int_op(11), Value::Int(98));
-        ctx.make_constant(OpRef::int_op(12), Value::Int(99));
-        ctx.make_constant(OpRef::int_op(20), Value::Int(1));
-        ctx.make_constant(OpRef::int_op(21), Value::Int(2));
+        let b = ctx.materialize_box_at(OpRef::int_op(10));
+        ctx.make_constant_box(&b, Value::Int(97));
+        let b = ctx.materialize_box_at(OpRef::int_op(11));
+        ctx.make_constant_box(&b, Value::Int(98));
+        let b = ctx.materialize_box_at(OpRef::int_op(12));
+        ctx.make_constant_box(&b, Value::Int(99));
+        let b = ctx.materialize_box_at(OpRef::int_op(20));
+        ctx.make_constant_box(&b, Value::Int(1));
+        let b = ctx.materialize_box_at(OpRef::int_op(21));
+        ctx.make_constant_box(&b, Value::Int(2));
 
         let source = OpRef::int_op(1);
         let source_box = ctx.materialize_box_at(source);

@@ -898,7 +898,8 @@ impl Optimization for OptPure {
                 });
                 if all_args_const {
                     if let Some(Value::Int(folded)) = ctx.constant_fold(&postponed) {
-                        ctx.make_constant(postponed.pos.get(), Value::Int(folded));
+                        let b = ctx.materialize_box_at(postponed.pos.get());
+                        ctx.make_constant_box(&b, Value::Int(folded));
                         self.last_emitted_was_removed = true;
                         return OptimizationResult::Remove; // guard also removed
                     }
@@ -1049,7 +1050,8 @@ impl Optimization for OptPure {
                 // `optimize_with_constants_and_inputs_at` per
                 // `unroll.py:119-123`.
                 if let Some(folded_value) = ctx.constant_fold(op) {
-                    ctx.make_constant(op.pos.get(), folded_value);
+                    let b = ctx.materialize_box_at(op.pos.get());
+                    ctx.make_constant_box(&b, folded_value);
                     self.last_emitted_was_removed = true;
                     return OptimizationResult::Remove;
                 }
@@ -1088,7 +1090,8 @@ impl Optimization for OptPure {
 
             // pure.py:191-196: _can_optimize_call_pure(op, start_index=1).
             if let Some(value) = self.lookup_call_pure_result(op, start_index, ctx) {
-                ctx.make_constant(op.pos.get(), value);
+                let b = ctx.materialize_box_at(op.pos.get());
+                ctx.make_constant_box(&b, value);
                 self.last_emitted_was_removed = true;
                 return OptimizationResult::Remove;
             }
@@ -2264,7 +2267,8 @@ mod tests {
 
         let mut pass = OptPure::new();
         let mut ctx = OptContext::with_num_inputs(4, 0);
-        ctx.make_constant(OpRef::ref_op(10), Value::Ref(GcRef(ptr)));
+        let b = ctx.materialize_box_at(OpRef::ref_op(10));
+        ctx.make_constant_box(&b, Value::Ref(GcRef(ptr)));
         pass.setup();
 
         // Resolve forwarded args (mirrors propagate_from_pass_range) so the op
@@ -2303,7 +2307,8 @@ mod tests {
 
         let mut pass = OptPure::new();
         let mut ctx = OptContext::with_num_inputs(4, 0);
-        ctx.make_constant(OpRef::ref_op(10), Value::Ref(GcRef(ptr)));
+        let b = ctx.materialize_box_at(OpRef::ref_op(10));
+        ctx.make_constant_box(&b, Value::Ref(GcRef(ptr)));
         pass.setup();
 
         // Resolve forwarded args (mirrors propagate_from_pass_range) so the op
@@ -2344,7 +2349,8 @@ mod tests {
 
         let mut pass = OptPure::new();
         let mut ctx = OptContext::with_num_inputs(4, 0);
-        ctx.make_constant(OpRef::ref_op(10), Value::Ref(GcRef(ptr)));
+        let b = ctx.materialize_box_at(OpRef::ref_op(10));
+        ctx.make_constant_box(&b, Value::Ref(GcRef(ptr)));
         pass.setup();
 
         // Resolve forwarded args (mirrors propagate_from_pass_range) so the op
@@ -2389,7 +2395,8 @@ mod tests {
         op.pos.set(OpRef::int_op(0));
 
         let mut ctx = OptContext::with_num_inputs(4, 0);
-        ctx.make_constant(OpRef::int_op(10), Value::Int(2));
+        let b = ctx.materialize_box_at(OpRef::int_op(10));
+        ctx.make_constant_box(&b, Value::Int(2));
 
         // Resolve forwarded args (mirrors propagate_from_pass_range) so the op
         // carries the canonical const box the pass reads via get_constant_box.
@@ -2661,7 +2668,8 @@ mod tests {
         // `is_constant()`, so the short-preamble producer re-exports the op
         // without any const_pool / known_constants bridge.
         let const_opref = OpRef::const_int(7);
-        ctx.seed_constant(const_opref, majit_ir::Value::Int(7));
+        let const_box = ctx.materialize_box_at(const_opref);
+        ctx.seed_constant(&const_box, majit_ir::Value::Int(7));
         let imported = crate::optimizeopt::ImportedShortPureOp::new(
             &mut ctx,
             OpCode::IntAdd,
@@ -2862,7 +2870,8 @@ mod tests {
         let mut pass = OptPure::new();
         let mut ctx = OptContext::with_num_inputs(6, 0);
         // func pointer arg must be a known constant for OptRewrite tracking
-        ctx.seed_constant(OpRef::int_op(100), majit_ir::Value::Int(0xCAFE));
+        let func_box = ctx.materialize_box_at(OpRef::int_op(100));
+        ctx.seed_constant(&func_box, majit_ir::Value::Int(0xCAFE));
         rewrite.setup();
         pass.setup();
 

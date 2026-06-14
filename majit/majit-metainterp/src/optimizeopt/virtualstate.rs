@@ -2450,6 +2450,28 @@ pub fn export_state(oprefs: &[OpRef], ctx: &OptContext) -> VirtualState {
 /// then overwrite" pattern from leaking the stub to in-flight recursive
 /// callers.
 pub(crate) struct ExportCache {
+    // Keyed by the resolved OpRef `get_box_replacement(opref).to_opref()` —
+    // the stable identity projection of the resolved box. virtualstate.py:712-716
+    // keys `self.info` (a plain identity dict) by `get_box_replacement(box)` and
+    // relies on "same resolved box → same key" for finished / in_progress dedup.
+    //
+    // The OpRef projection reproduces that invariant for every case: a bound
+    // producer resolves to its canonical position OpRef (bind-at-alloc #194), and
+    // a value-equal constant resolves to inline-Const's one canonical OpRef
+    // (value-merge — matching RPython's shared-instance dedup; distinct
+    // value-equal `ConstInt` objects are merged because inline-Const gives a
+    // constant one canonical handle, a benign over-merge since a constant
+    // resolves to a not-virtual node that emits no fail-arg box). Crucially it is
+    // also stable for an UNRESOLVED position: `get_box_replacement` mints a fresh
+    // `BoxRef::from_opref` per call when no canonical host is bound (export_state
+    // / unroll.rs do not enforce bind-at-alloc), so a BoxRef identity key would
+    // give two visits of the same OpRef *different* keys and split the cache;
+    // `from_opref(o).to_opref() == o` keeps them merged.
+    //
+    // CONVERGENCE: re-key to `BoxRef` identity (`Rc::ptr_eq`) once bind-at-alloc
+    // covers every export entry (export_state + unroll) so the resolved box has
+    // one canonical `Rc` per position. `VecAssoc`/`VecSet` are Vec-backed and
+    // compare by `Eq` only (never hash), so no GC pointer is hashed here.
     pub finished: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, Rc<VirtualStateInfoNode>>,
     pub in_progress: majit_ir::vec_set::VecSet<OpRef>,
 }
@@ -2493,14 +2515,14 @@ fn export_single_value(
     ctx: &OptContext,
     cache: &mut ExportCache,
 ) -> Rc<VirtualStateInfoNode> {
-    // virtualstate.py:713 `box = get_box_replacement(box)` — every
-    // create_state entry resolves the forwarding chain BEFORE the cache
-    // lookup, so two field references that forward to the same target
-    // collapse onto the same VirtualStateInfo. Without this normalization,
-    // distinct field-side OpRefs that resolve to the same forwarded box
-    // would each receive their own Rc, breaking the dedup invariant
-    // `enum_forced_boxes` and RPython matching rely on.
-    let opref = ctx.get_replacement_opref(opref);
+    // virtualstate.py:713-716 `box = get_box_replacement(box)` then keyed
+    // lookup on `self.info`: resolve the forwarding chain BEFORE the cache
+    // lookup so two field references forwarding to the same target collapse
+    // onto the same VirtualStateInfo. Key the DAG cache by the resolved OpRef
+    // projection (stable per resolved box, including unresolved positions; see
+    // ExportCache) — `to_opref()` is computed once and reused as both the cache
+    // key and the inner-export position.
+    let opref = ctx.get_box_replacement(opref).to_opref();
     // virtualstate.py:714-716: cache hit returns the cached state directly.
     if let Some(cached) = cache.finished.get(&opref) {
         return Rc::clone(cached);

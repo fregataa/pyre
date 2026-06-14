@@ -191,12 +191,16 @@ pub enum Forwarded {
 
 /// `Rc<Box>` newtype.
 ///
-/// `Eq` / `Hash` are pointer identity for ALL variants — mirrors PyPy's
-/// `is`-based default `__eq__` on `AbstractValue` (covers `ResOp` /
-/// `InputArg` / `Const`). PyPy's value-based comparison for constants is
-/// the explicit `same_box` / `same_constant` method (`history.py:204`),
-/// not `__eq__`. Callers that need value comparison on constants compare
-/// `const_value()` outputs directly.
+/// `==` / `Hash` follow object identity: `AbstractValue` defines no
+/// `__eq__` / `__hash__`, and `_get_hash_` defaults to
+/// `compute_identity_hash` (resoperation.py:29-39), so every plain
+/// box-keyed dict keys by `is`. A memoized wrapper per op / inputarg
+/// (`Op::box_cache` / `InputArg::box_cache`) makes `Rc::ptr_eq` a
+/// faithful `is`; the `none()` sentinel mirrors Python's singleton
+/// `None`. Value equality for `Const` is opt-in, never `==`: explicit
+/// [`same_box`](Self::same_box) calls (`history.py:211` →
+/// `same_constant`), the `r_dict` shape RPython builds on `same_box` /
+/// `_get_hash_` (optimizeopt/util.py:126-128 `args_dict`).
 pub struct BoxRef(Rc<Box>);
 
 impl BoxRef {
@@ -566,24 +570,25 @@ impl BoxRef {
     /// `resoperation.py:38 AbstractResOpOrInputArg.same_box`: `self is other`
     /// for ResOp / InputArg; `history.py:211 Const.same_box` delegates to
     /// `same_constant` (value comparison, `history.py:251/292/338`).
-    ///
-    /// `from_bound_op` / `from_bound_inputarg` memoize exactly one `BoxRef`
-    /// wrapper per op / inputarg (`Op::box_cache` / `InputArg::box_cache`),
-    /// so every resolution of the same ResOp / InputArg shares one `Rc<Box>`
-    /// and the `Rc::ptr_eq` of `==` is a faithful `self is other` probe.
-    /// Const boxes are minted fresh per resolution (no op to memoize on), so
-    /// their identity is compared by value via the `same_constant` arm.
+    /// ResOp / InputArg boxes compare by `Rc` pointer identity:
+    /// `from_bound_op` / `from_bound_inputarg` memoize one wrapper per op /
+    /// inputarg (`Op::box_cache` / `InputArg::box_cache`), so every
+    /// resolution of the same op / inputarg shares one `Rc<Box>`, making
+    /// `Rc::ptr_eq` a faithful `self is other`. Const boxes are minted
+    /// fresh per resolution (no op to memoize on), so they compare by
+    /// value. Two `none()` sentinels denote the same absent reference. A
+    /// shared `Rc` short-circuits every arm. Unlike `==` (object
+    /// identity), `same_box` is the explicit value-aware comparison —
+    /// callers opt in, exactly where RPython spells out `same_box(...)`.
     pub fn same_box(&self, other: &BoxRef) -> bool {
-        if self == other {
+        if Rc::ptr_eq(&self.0, &other.0) {
             return true;
         }
-        // Two `none()` sentinels denote the same absent reference
-        // (`OpRef::None`; `None is None`).
-        if self.is_none() || other.is_none() {
-            return self.is_none() && other.is_none();
-        }
-        match (self.const_value(), other.const_value()) {
-            (Some(a), Some(b)) => a == b,
+        match (&self.0.kind, &other.0.kind) {
+            (BoxKind::Const { .. }, BoxKind::Const { .. }) => {
+                self.const_value() == other.const_value()
+            }
+            (BoxKind::None, BoxKind::None) => true,
             _ => false,
         }
     }
@@ -1043,10 +1048,21 @@ impl std::ops::DerefMut for IntBoundBorrowMut {
 
 impl PartialEq for BoxRef {
     fn eq(&self, other: &Self) -> bool {
-        // PyPy `__eq__` on `AbstractValue` defaults to Python `is` for all
-        // box subclasses (ResOp / InputArg / Const). Value equality on
-        // constants is the explicit `same_constant` method, not `==`.
-        Rc::ptr_eq(&self.0, &other.0)
+        // `AbstractValue` defines no `__eq__` (resoperation.py:29-39):
+        // boxes — `Const` included — compare by object identity in `==`
+        // and in every plain box-keyed dict. Value equality is opt-in
+        // only, via explicit [`same_box`](Self::same_box) calls
+        // (history.py:211) or an `r_dict` built on it (the
+        // optimizeopt/util.py:126-128 `args_dict` shape).
+        // Two `none()` sentinels mirror Python's singleton `None`
+        // (`None is None`), keeping that arm identity-faithful.
+        if Rc::ptr_eq(&self.0, &other.0) {
+            return true;
+        }
+        matches!(
+            (&self.0.kind, &other.0.kind),
+            (BoxKind::None, BoxKind::None)
+        )
     }
 }
 
@@ -1054,7 +1070,17 @@ impl Eq for BoxRef {}
 
 impl std::hash::Hash for BoxRef {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        (Rc::as_ptr(&self.0) as usize).hash(state);
+        // `AbstractValue._get_hash_` defaults to `compute_identity_hash`
+        // (resoperation.py:33-35): plain hashing follows object identity,
+        // matching `eq`. The `none()` sentinel hashes to one bucket so
+        // its identity-free equality upholds the Hash/Eq contract.
+        match &self.0.kind {
+            BoxKind::None => 1u8.hash(state),
+            _ => {
+                2u8.hash(state);
+                (Rc::as_ptr(&self.0) as usize).hash(state);
+            }
+        }
     }
 }
 
@@ -1262,30 +1288,37 @@ mod tests {
         assert_eq!(f.type_(), Type::Float);
     }
 
-    /// PyPy `__eq__` defaults to `is` on `AbstractValue` for ALL box
-    /// subclasses (ResOp / InputArg / Const). Value comparison on constants
-    /// is the explicit `same_box` / `same_constant` method
-    /// (`history.py:204`), not `==`. `BoxRef::eq` therefore stays pointer
-    /// identity (`Rc::ptr_eq`) across every variant.
+    /// `BoxRef::eq` is object identity (`AbstractValue` has no `__eq__`,
+    /// resoperation.py:29-39): two independently-minted `new_const` boxes of
+    /// equal value are NOT `==`; value equality is opt-in via `same_box`
+    /// (`history.py:211 Const.same_box` → `same_constant`). The `none()`
+    /// sentinel mirrors Python's singleton `None` (`None is None`).
     #[test]
-    fn boxref_eq_is_pointer_identity_for_every_variant() {
+    fn boxref_eq_is_identity_value_eq_via_same_box() {
         use crate::vec_set::VecSet;
 
         let a = BoxRef::new_const(Value::Int(42));
         let b = BoxRef::new_const(Value::Int(42));
-        assert_ne!(a.as_ptr(), b.as_ptr());
-        assert_ne!(a, b);
+        assert_ne!(a.as_ptr(), b.as_ptr()); // distinct Rc wrappers
+        assert_ne!(a, b); // identity `==`: distinct Const objects differ
         assert_eq!(a, a.clone());
+        assert!(a.same_box(&b)); // value equality is the opt-in primitive
+        assert!(!a.same_box(&BoxRef::new_const(Value::Int(43))));
+        assert_eq!(BoxRef::none(), BoxRef::none()); // `None is None`
 
+        // Identity-keyed set: value-equal Const boxes occupy separate slots.
         let mut set: VecSet<BoxRef> = VecSet::new();
         set.insert(a.clone());
         assert!(set.contains(&a));
         assert!(!set.contains(&b));
 
+        // ResOp keeps pointer identity: distinct boxes at the same
+        // position/type are NOT equal, and value equality never applies.
         let r1 = BoxRef::new_resop(Type::Int, 0);
         let r2 = BoxRef::new_resop(Type::Int, 0);
         assert_ne!(r1, r2);
         assert_eq!(r1, r1.clone());
+        assert!(!r1.same_box(&r2));
     }
 
     #[test]

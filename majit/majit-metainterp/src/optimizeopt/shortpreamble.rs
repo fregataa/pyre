@@ -1171,7 +1171,6 @@ pub struct ProducedShortOp {
 /// in the imported short op. Mirrors the inline `imported_const_opref`
 /// closure inside the legacy `import_short_preamble_ops` (unroll.rs:3510).
 fn imported_const_opref(
-    ctx: &mut crate::optimizeopt::OptContext,
     imported_constants: &mut crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
     source: OpRef,
     value: &majit_ir::Value,
@@ -1189,7 +1188,8 @@ fn imported_const_opref(
         majit_ir::Value::Ref(v) => OpRef::const_ptr(*v),
         majit_ir::Value::Void => panic!("imported_const_opref: ConstVoid is not a value type"),
     };
-    ctx.seed_constant(opref, value.clone());
+    // ConstInt/Float/Ptr value rides inline on `opref` (history.py:227/
+    // 268/314); no `seed_constant` step (its const arm is a no-op).
     imported_constants.insert(source, opref);
     opref
 }
@@ -1227,7 +1227,7 @@ pub(crate) fn classify_short_arg(
         ctx.get_box_replacement_box(arg)
             .and_then(|cb| cb.const_value())
     }) {
-        let const_opref = imported_const_opref(ctx, imported_constants, arg, &value);
+        let const_opref = imported_const_opref(imported_constants, arg, &value);
         return Some(crate::optimizeopt::ImportedShortPureArg::Const(
             value,
             const_opref,

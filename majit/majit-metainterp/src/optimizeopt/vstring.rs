@@ -343,9 +343,8 @@ impl OptString {
         OptString
     }
 
-    fn get_plain_info(&self, opref: OpRef, ctx: &OptContext) -> Option<VStringPlainInfo> {
-        let resolved_box = ctx.get_box_replacement_box(opref);
-        match resolved_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
+    fn get_plain_info(&self, op: &BoxRef, ctx: &OptContext) -> Option<VStringPlainInfo> {
+        match ctx.peek_ptr_info(op) {
             Some(PtrInfo::Str(sinfo)) => match sinfo.variant {
                 VStringVariant::Plain(info) => Some(info),
                 _ => None,
@@ -354,21 +353,17 @@ impl OptString {
         }
     }
 
-    /// Run `f` against the VStringPlainInfo of `opref`, auto-mirroring the
+    /// Run `f` against the VStringPlainInfo of `op`, auto-mirroring the
     /// BoxRef snapshot after mutation via OptContext::with_ptr_info_mut.
     /// Returns `None` if the box has no PtrInfo, is not Str, or its variant
     /// is not Plain.
     fn with_plain_info_mut<R>(
         &self,
-        opref: OpRef,
+        op: &BoxRef,
         ctx: &mut OptContext,
         f: impl FnOnce(&mut VStringPlainInfo) -> R,
     ) -> Option<R> {
-        // When `opref` does not resolve, `materialize_box_at` would mint a fresh
-        // box carrying no PtrInfo, so `with_ptr_info_mut` returns `None`
-        // either way — the `?` early-out is equivalent without the mint.
-        let b = ctx.get_box_replacement_box(opref)?;
-        ctx.with_ptr_info_mut(&b, |info| {
+        ctx.with_ptr_info_mut(op, |info| {
             if let PtrInfo::Str(sinfo) = info {
                 if let VStringVariant::Plain(plain) = &mut sinfo.variant {
                     return Some(f(plain));
@@ -379,8 +374,8 @@ impl OptString {
         .flatten()
     }
 
-    fn is_virtual_plain(&self, opref: OpRef, ctx: &OptContext) -> bool {
-        self.get_plain_info(opref, ctx).is_some()
+    fn is_virtual_plain(&self, op: &BoxRef, ctx: &OptContext) -> bool {
+        self.get_plain_info(op, ctx).is_some()
     }
 
     fn get_concat_info(&self, opref: OpRef, ctx: &OptContext) -> Option<VStringConcatInfo> {
@@ -398,9 +393,8 @@ impl OptString {
         self.get_concat_info(opref, ctx).is_some()
     }
 
-    fn get_slice_info(&self, opref: OpRef, ctx: &OptContext) -> Option<VStringSliceInfo> {
-        let resolved_box = ctx.get_box_replacement_box(opref);
-        match resolved_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
+    fn get_slice_info(&self, op: &BoxRef, ctx: &OptContext) -> Option<VStringSliceInfo> {
+        match ctx.peek_ptr_info(op) {
             Some(PtrInfo::Str(sinfo)) => match sinfo.variant {
                 VStringVariant::Slice(info) => Some(info),
                 _ => None,
@@ -409,8 +403,8 @@ impl OptString {
         }
     }
 
-    fn is_virtual_slice(&self, opref: OpRef, ctx: &OptContext) -> bool {
-        self.get_slice_info(opref, ctx).is_some()
+    fn is_virtual_slice(&self, op: &BoxRef, ctx: &OptContext) -> bool {
+        self.get_slice_info(op, ctx).is_some()
     }
 
     /// vstring.py: read the string mode (0 = byte string, 1 = unicode) from
@@ -447,7 +441,8 @@ impl OptString {
         // Emit a dummy SameAsI to get an OpRef, then record the constant.
         let op = Op::new(OpCode::SameAsI, &[BoxRef::from_opref(OpRef::NONE)]);
         let opref = ctx.emit(op);
-        ctx.make_constant(opref, Value::Int(value));
+        let b = ctx.materialize_box_at(opref);
+        ctx.make_constant_box(&b, Value::Int(value));
         opref
     }
 
@@ -589,7 +584,7 @@ impl OptString {
 
     /// Handle STRSETITEM: if target is virtual Plain and index is constant, track.
     fn optimize_strsetitem(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let str_ref = ctx.resolve_box_box(&op.arg(0)).to_opref();
+        let str_ref = ctx.resolve_box_box(&op.arg(0));
         let idx_ref = op.arg(1).to_opref();
         let char_ref = op.arg(2).to_opref();
         let char_resolved = ctx.get_replacement_opref(char_ref);
@@ -600,7 +595,7 @@ impl OptString {
         {
             let i = idx as usize;
             let did_write = self
-                .with_plain_info_mut(str_ref, ctx, |info| {
+                .with_plain_info_mut(&str_ref, ctx, |info| {
                     if i < info._chars.len() {
                         info._chars[i] = Some(BoxRef::from_opref(char_resolved));
                         return true;
@@ -613,7 +608,7 @@ impl OptString {
             }
         }
         // Not virtual or index not constant -> force and emit.
-        self.force_if_virtual(str_ref, ctx);
+        self.force_if_virtual(&str_ref, ctx);
         OptimizationResult::PassOn
     }
 
@@ -624,14 +619,14 @@ impl OptString {
         op_rc: &majit_ir::OpRc,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
-        let str_ref = ctx.resolve_box_box(&op.arg(0)).to_opref();
+        let str_ref = ctx.resolve_box_box(&op.arg(0));
         let idx_ref = op.arg(1).to_opref();
 
         if let Some(idx) = ctx
             .get_box_replacement_box(idx_ref)
             .and_then(|b_| ctx.get_constant_int_box(&b_))
         {
-            if let Some(ch_ref) = self.strgetitem(str_ref, idx, ctx) {
+            if let Some(ch_ref) = self.strgetitem(str_ref.to_opref(), idx, ctx) {
                 let b_old = BoxRef::from_bound_op(op_rc);
                 let b_new = ctx.get_box_replacement(ch_ref);
                 ctx.make_equal_to(&b_old, &b_new);
@@ -639,7 +634,7 @@ impl OptString {
             }
         }
         // Not fully resolved -> force the string.
-        self.force_if_virtual(str_ref, ctx);
+        self.force_if_virtual(&str_ref, ctx);
         OptimizationResult::PassOn
     }
 
@@ -672,13 +667,16 @@ impl OptString {
         OptimizationResult::PassOn
     }
 
-    fn get_constant_int_bound(&self, opref: OpRef, ctx: &OptContext) -> Option<i64> {
-        ctx.get_box_replacement_box(opref).and_then(|b| {
-            ctx.peek_intbound_box(&b)
-                .filter(|bound| bound.is_constant())
-                .map(|bound| bound.get_constant_int())
-                .or_else(|| ctx.get_constant_int_box(&b))
-        })
+    fn get_constant_int_bound(&self, op: &BoxRef, ctx: &OptContext) -> Option<i64> {
+        // optimizer.py:99-113 getintbound resolves `op = get_box_replacement(op)`
+        // before reading the bound. Route through `resolve_box_box` (not the raw
+        // box-native walk) so a non-canonical InputArg operand reaches its
+        // canonical slot (mod.rs:4337) instead of missing the recorded bound.
+        let op = ctx.resolve_box_box(op);
+        ctx.peek_intbound_box(&op)
+            .filter(|bound| bound.is_constant())
+            .map(|bound| bound.get_constant_int())
+            .or_else(|| ctx.get_constant_int_box(&op))
     }
 
     /// vstring.py:556-589 _optimize_COPYSTRCONTENT
@@ -690,19 +688,18 @@ impl OptString {
     ) -> OptimizationResult {
         // copystrcontent(src, dst, src_start, dst_start, length)
         let src_ref = ctx.resolve_box_box(&op.arg(0)).to_opref();
-        let dst_ref = ctx.resolve_box_box(&op.arg(1)).to_opref();
-        let src_start_ref = op.arg(2).to_opref();
-        let dst_start_ref = op.arg(3).to_opref();
-        let length_ref = op.arg(4).to_opref();
+        let dst_ref = ctx.resolve_box_box(&op.arg(1));
         let src_ref_box = ctx.get_box_replacement_box(src_ref);
         let src_info = src_ref_box.as_ref().and_then(|b| ctx.getptrinfo(b));
         let src_is_virtual_or_constant = src_info
             .as_ref()
             .is_some_and(|info| info.is_virtual() || info.is_constant());
-        let dst_virtual = self.is_virtual_plain(dst_ref, ctx);
-        let src_start = self.get_constant_int_bound(src_start_ref, ctx);
-        let dst_start = self.get_constant_int_bound(dst_start_ref, ctx);
-        let length = self.get_constant_int_bound(length_ref, ctx);
+        // vstring.py:564/568: dst = getptrinfo(op.getarg(1)) resolves once;
+        // reuse the resolved box instead of re-walking the operand chain.
+        let dst_virtual = self.is_virtual_plain(&dst_ref, ctx);
+        let src_start = self.get_constant_int_bound(&op.arg(2), ctx);
+        let dst_start = self.get_constant_int_bound(&op.arg(3), ctx);
+        let length = self.get_constant_int_bound(&op.arg(4), ctx);
 
         if length == Some(0) {
             return OptimizationResult::Remove;
@@ -741,7 +738,7 @@ impl OptString {
                         // vstring.py:585-589: self.emit_extra(new_op)
                         let dst_index_ref = ctx.make_constant_int(dst_start + index);
                         let pass_idx = ctx.current_pass_idx;
-                        let arg_dst = ctx.materialize_box_at(dst_ref);
+                        let arg_dst = ctx.materialize_box_at(dst_ref.to_opref());
                         let arg_dst_index = ctx.materialize_box_at(dst_index_ref);
                         let arg_char = ctx.materialize_box_at(char_ref);
                         ctx.emit_extra(
@@ -751,7 +748,7 @@ impl OptString {
                     }
                 }
                 if dst_virtual {
-                    self.with_plain_info_mut(dst_ref, ctx, |info| {
+                    self.with_plain_info_mut(&dst_ref, ctx, |info| {
                         for (index, ch_ref) in dst_chars.into_iter().enumerate() {
                             let dst_index = (dst_start as usize) + index;
                             if dst_index < info._chars.len() {
@@ -780,18 +777,16 @@ impl OptString {
     }
 
     /// Force a string if it is virtual.
-    fn force_if_virtual(&mut self, opref: OpRef, ctx: &mut OptContext) {
-        if self.is_virtual(opref, ctx) {
-            self.force_box(opref, ctx);
+    fn force_if_virtual(&mut self, op: &BoxRef, ctx: &mut OptContext) {
+        if self.is_virtual(op, ctx) {
+            self.force_box(op.to_opref(), ctx);
         }
     }
 
-    /// Check if an OpRef references a virtual string (after forwarding).
+    /// Check if a box references a virtual string (after forwarding).
     #[allow(dead_code)]
-    fn is_virtual(&self, opref: OpRef, ctx: &OptContext) -> bool {
-        ctx.get_box_replacement_box(opref)
-            .as_ref()
-            .map_or(false, |b| ctx.is_virtual(b))
+    fn is_virtual(&self, op: &BoxRef, ctx: &OptContext) -> bool {
+        ctx.is_virtual(op)
     }
 
     /// vstring.py:383-391 _int_sub — constant-fold if both args are constant,
@@ -824,7 +819,7 @@ impl OptString {
         if let Some(arg0_box) = ctx.resolve_box_box_opt(&op.arg(0)) {
             ctx.make_nonnull_str(&arg0_box, mode);
         }
-        let str_ref = ctx.resolve_box_box(&op.arg(0)).to_opref();
+        let str_ref = op.arg(0).to_opref();
         if let Some(len) = self.get_known_length(str_ref, ctx) {
             let _ = len;
         }
@@ -840,15 +835,15 @@ impl OptString {
         if !crate::optimizeopt::earlyforce::OptEarlyForce::should_force_args(op) {
             return;
         }
-        // Collect refs first to avoid borrow issues.
-        let args: Vec<OpRef> = op
+        // Collect boxes first to avoid borrow issues.
+        let args: Vec<BoxRef> = op
             .getarglist()
             .iter()
-            .map(|a| ctx.resolve_box_box(&a).to_opref())
+            .map(|a| ctx.resolve_box_box(&a))
             .collect();
         for arg in args {
-            if self.is_virtual(arg, ctx) {
-                self.force_box(arg, ctx);
+            if self.is_virtual(&arg, ctx) {
+                self.force_box(arg.to_opref(), ctx);
             }
         }
     }
@@ -937,17 +932,15 @@ impl OptString {
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         if op.num_args() >= 4 {
-            let mut s = ctx.resolve_box_box(&op.arg(1)).to_opref();
-            // Mark the resolved source string as non-null before creating
-            // the virtual slice info.
-            if let Some(s_box) = ctx.get_box_replacement_box(s) {
-                ctx.make_nonnull_str(&s_box, mode);
-            }
+            // vstring.py:663: self.make_nonnull_str(op.getarg(1), mode)
+            let mut s = ctx.resolve_box_box(&op.arg(1));
+            ctx.make_nonnull_str(&s, mode);
             let mut start = ctx.resolve_box_box(&op.arg(2)).to_opref();
             let stop = ctx.resolve_box_box(&op.arg(3)).to_opref();
             let lgtop = self.int_sub(stop, start, ctx);
-            if let Some(info) = self.get_slice_info(s, ctx) {
-                let source = info.s.to_opref();
+            // vstring.py:682-685: double slicing s[i:j][k:l]
+            if let Some(info) = self.get_slice_info(&s, ctx) {
+                let source = info.s;
                 let source_start = info.start.to_opref();
                 s = source;
                 start = _int_add(source_start, start, ctx);
@@ -963,7 +956,7 @@ impl OptString {
                     mode,
                     length: -1,
                     variant: VStringVariant::Slice(VStringSliceInfo {
-                        s: BoxRef::from_opref(s),
+                        s: s.clone(),
                         start: BoxRef::from_opref(start),
                         lgtop: BoxRef::from_opref(lgtop),
                     }),
@@ -989,22 +982,18 @@ impl OptString {
             return OptimizationResult::PassOn;
         }
         // vstring.py:693-696
-        let arg1 = ctx.resolve_box_box(&op.arg(1)).to_opref();
-        let arg2 = ctx.resolve_box_box(&op.arg(2)).to_opref();
-        let i1 = ctx
-            .getptrinfo(&op.arg(1).get_box_replacement(false))
-            .is_some();
-        let i2 = ctx
-            .getptrinfo(&op.arg(2).get_box_replacement(false))
-            .is_some();
+        let arg1 = ctx.resolve_box_box(&op.arg(1));
+        let arg2 = ctx.resolve_box_box(&op.arg(2));
+        let i1 = ctx.getptrinfo(&arg1).is_some();
+        let i2 = ctx.getptrinfo(&arg2).is_some();
         // vstring.py:698-705: l1box = i1.getstrlen(arg1, self, mode)
         let l1box = if i1 {
-            Some(ctx.getstrlen_opref(arg1, mode))
+            Some(ctx.getstrlen_opref(arg1.to_opref(), mode))
         } else {
             None
         };
         let l2box = if i2 {
-            Some(ctx.getstrlen_opref(arg2, mode))
+            Some(ctx.getstrlen_opref(arg2.to_opref(), mode))
         } else {
             None
         };
@@ -1014,28 +1003,30 @@ impl OptString {
             let l2c = ctx.isinstance_const_int(l2);
             if let (Some(v1), Some(v2)) = (l1c, l2c) {
                 if v1 != v2 {
-                    ctx.make_constant(op.pos.get(), Value::Int(0));
+                    let b = ctx.materialize_box_at(op.pos.get());
+                    ctx.make_constant_box(&b, Value::Int(0));
                     return OptimizationResult::Remove;
                 }
             }
         }
         // vstring.py:714-718: handle_str_equal_level1 both directions
-        if let Some(result) = self.handle_str_equal_level1(arg1, arg2, op, mode, ctx) {
+        if let Some(result) = self.handle_str_equal_level1(&arg1, &arg2, op, mode, ctx) {
             return result;
         }
-        if let Some(result) = self.handle_str_equal_level1(arg2, arg1, op, mode, ctx) {
+        if let Some(result) = self.handle_str_equal_level1(&arg2, &arg1, op, mode, ctx) {
             return result;
         }
-        // vstring.py:720-724: handle_str_equal_level2 both directions
-        if let Some(result) = self.handle_str_equal_level2(arg1, arg2, op, mode, ctx) {
+        // vstring.py:720-724: handle_str_equal_level2 both directions, each
+        // passing the strlen box of its second argument computed above.
+        if let Some(result) = self.handle_str_equal_level2(&arg1, &arg2, l2box, op, mode, ctx) {
             return result;
         }
-        if let Some(result) = self.handle_str_equal_level2(arg2, arg1, op, mode, ctx) {
+        if let Some(result) = self.handle_str_equal_level2(&arg2, &arg1, l1box, op, mode, ctx) {
             return result;
         }
         // vstring.py:727-732: nonnull fallback with same_box check
-        let a_nonnull = i1 && self.is_known_nonnull(arg1, ctx);
-        let b_nonnull = i2 && self.is_known_nonnull(arg2, ctx);
+        let a_nonnull = i1 && self.is_known_nonnull(&arg1, ctx);
+        let b_nonnull = i2 && self.is_known_nonnull(&arg2, ctx);
         if a_nonnull && b_nonnull {
             // vstring.py:728: l1box.same_box(l2box) routes through
             // `OptContext::same_box` (history.py:204-205) which combines
@@ -1046,7 +1037,9 @@ impl OptString {
             } else {
                 OopSpecIndex::StreqNonnull
             };
-            if let Some(result) = self.generate_modified_call(oopspec, &[arg1, arg2], op, ctx) {
+            if let Some(result) =
+                self.generate_modified_call(oopspec, &[arg1.to_opref(), arg2.to_opref()], op, ctx)
+            {
                 return result;
             }
         }
@@ -1057,20 +1050,16 @@ impl OptString {
     /// vstring.py:735-787 handle_str_equal_level1
     fn handle_str_equal_level1(
         &self,
-        arg1: OpRef,
-        arg2: OpRef,
+        arg1: &BoxRef,
+        arg2: &BoxRef,
         op: &Op,
         mode: u8,
         ctx: &mut OptContext,
     ) -> Option<OptimizationResult> {
         // vstring.py:740-741: l2box = i2.getstrlen(arg2, self, mode)
-        let i2 = ctx
-            .get_box_replacement_box(arg2)
-            .as_ref()
-            .and_then(|b| ctx.getptrinfo(b))
-            .is_some();
+        let i2 = ctx.getptrinfo(arg2).is_some();
         let l2box = if i2 {
-            Some(ctx.getstrlen_opref(arg2, mode))
+            Some(ctx.getstrlen_opref(arg2.to_opref(), mode))
         } else {
             None
         };
@@ -1081,12 +1070,9 @@ impl OptString {
                 // vstring.py:744-755: len-0 check
                 if self.is_known_nonnull(arg1, ctx) {
                     // vstring.py:745: self.make_nonnull_str(arg1, mode)
-                    // Preserve the non-null string fact on the resolved box.
-                    if let Some(arg1_box) = ctx.get_box_replacement_box(arg1) {
-                        ctx.make_nonnull_str(&arg1_box, mode);
-                    }
+                    ctx.make_nonnull_str(arg1, mode);
                     // vstring.py:747: lengthbox = i1.getstrlen(arg1, self, mode)
-                    let lengthbox = ctx.getstrlen_opref(arg1, mode);
+                    let lengthbox = ctx.getstrlen_opref(arg1.to_opref(), mode);
                     let zero = ctx.emit_constant_int(0);
                     let arg_len = ctx.materialize_box_at(lengthbox);
                     let arg_zero = ctx.materialize_box_at(zero);
@@ -1097,21 +1083,17 @@ impl OptString {
             }
             if l2val == 1 {
                 // vstring.py:758-759: l1box = i1.getstrlen(arg1, self, mode)
-                let i1 = ctx
-                    .get_box_replacement_box(arg1)
-                    .as_ref()
-                    .and_then(|b| ctx.getptrinfo(b))
-                    .is_some();
+                let i1 = ctx.getptrinfo(arg1).is_some();
                 let l1box = if i1 {
-                    Some(ctx.getstrlen_opref(arg1, mode))
+                    Some(ctx.getstrlen_opref(arg1.to_opref(), mode))
                 } else {
                     None
                 };
                 let l1_const = l1box.and_then(|r| ctx.isinstance_const_int(r));
                 if l1_const == Some(1) {
                     // vstring.py:761-768: both length 1 → compare chars
-                    let c1 = self.strgetitem(arg1, 0, ctx);
-                    let c2 = self.strgetitem(arg2, 0, ctx);
+                    let c1 = self.strgetitem(arg1.to_opref(), 0, ctx);
+                    let c2 = self.strgetitem(arg2.to_opref(), 0, ctx);
                     if let (Some(ch1), Some(ch2)) = (c1, c2) {
                         let arg_ch1 = ctx.materialize_box_at(ch1);
                         let arg_ch2 = ctx.materialize_box_at(ch2);
@@ -1121,12 +1103,11 @@ impl OptString {
                     }
                 }
                 // vstring.py:769-774: arg1 is a virtual slice, arg2 is length 1
-                let resolved1 = ctx.get_replacement_opref(arg1);
-                if let Some(info) = self.get_slice_info(resolved1, ctx) {
+                if let Some(info) = self.get_slice_info(arg1, ctx) {
                     let source = info.s.to_opref();
                     let start = info.start.to_opref();
                     let length = info.lgtop.to_opref();
-                    if let Some(vchar) = self.strgetitem(arg2, 0, ctx) {
+                    if let Some(vchar) = self.strgetitem(arg2.to_opref(), 0, ctx) {
                         return self.generate_modified_call(
                             OopSpecIndex::StreqSliceChar,
                             &[source, start, length, vchar],
@@ -1140,16 +1121,18 @@ impl OptString {
         // vstring.py:776-787: arg2 is null
         if self.is_known_null(arg2, ctx) {
             if self.is_known_nonnull(arg1, ctx) {
-                ctx.make_constant(op.pos.get(), Value::Int(0));
+                let b = ctx.materialize_box_at(op.pos.get());
+                ctx.make_constant_box(&b, Value::Int(0));
                 return Some(OptimizationResult::Remove);
             }
             if self.is_known_null(arg1, ctx) {
-                ctx.make_constant(op.pos.get(), Value::Int(1));
+                let b = ctx.materialize_box_at(op.pos.get());
+                ctx.make_constant_box(&b, Value::Int(1));
                 return Some(OptimizationResult::Remove);
             }
             // vstring.py:784: PTR_EQ against CONST_NULL (ref-null, not int-zero)
             let null_const = ctx.emit_constant_ref(majit_ir::GcRef::NULL);
-            let arg_a = ctx.materialize_box_at(arg1);
+            let arg_a = ctx.materialize_box_at(arg1.to_opref());
             let arg_null = ctx.materialize_box_at(null_const);
             let mut eq_op = Op::new(OpCode::PtrEq, &[arg_a, arg_null]);
             eq_op.pos.set(op.pos.get());
@@ -1158,28 +1141,19 @@ impl OptString {
         None
     }
 
-    /// vstring.py:789-814 handle_str_equal_level2
+    /// vstring.py:789-811 handle_str_equal_level2 — `l2box` is the strlen
+    /// box of `arg2`, computed once by the caller (vstring.py:700-704) and
+    /// threaded through, never recomputed here.
     fn handle_str_equal_level2(
         &self,
-        arg1: OpRef,
-        arg2: OpRef,
+        arg1: &BoxRef,
+        arg2: &BoxRef,
+        l2box: Option<OpRef>,
         op: &Op,
         mode: u8,
         ctx: &mut OptContext,
     ) -> Option<OptimizationResult> {
-        // vstring.py:792-794: l2box = i2.getstrlen(arg1, self, mode)
-        // RPython calls getstrlen on i2 (arg2's info) with arg1 as the op.
-        let i2 = ctx
-            .get_box_replacement_box(arg2)
-            .as_ref()
-            .and_then(|b| ctx.getptrinfo(b))
-            .is_some();
-        let l2box = if i2 {
-            Some(ctx.getstrlen_for(arg2, arg1, mode))
-        } else {
-            None
-        };
-        // vstring.py:795-805: l2info = self.getintbound(l2box)
+        // vstring.py:792-805: if l2box: l2info = self.getintbound(l2box)
         if let Some(l2ref) = l2box {
             let l2info = {
                 let b = ctx.get_box_replacement(l2ref);
@@ -1187,20 +1161,24 @@ impl OptString {
             };
             if l2info.is_constant() && l2info.get_constant_int() == 1 {
                 // vstring.py:799: vchar = self.strgetitem(None, arg2, CONST_0, mode)
-                if let Some(vchar) = self.strgetitem(arg2, 0, ctx) {
+                if let Some(vchar) = self.strgetitem(arg2.to_opref(), 0, ctx) {
                     // vstring.py:800-804
                     let oopspec = if self.is_known_nonnull(arg1, ctx) {
                         OopSpecIndex::StreqNonnullChar
                     } else {
                         OopSpecIndex::StreqChecknullChar
                     };
-                    return self.generate_modified_call(oopspec, &[arg1, vchar], op, ctx);
+                    return self.generate_modified_call(
+                        oopspec,
+                        &[arg1.to_opref(), vchar],
+                        op,
+                        ctx,
+                    );
                 }
             }
         }
         // vstring.py:807-813: if arg1 is a virtual slice
-        let resolved1 = ctx.get_replacement_opref(arg1);
-        if let Some(info) = self.get_slice_info(resolved1, ctx) {
+        if let Some(info) = self.get_slice_info(arg1, ctx) {
             let source = info.s.to_opref();
             let start = info.start.to_opref();
             let length = info.lgtop.to_opref();
@@ -1209,16 +1187,20 @@ impl OptString {
             } else {
                 OopSpecIndex::StreqSliceChecknull
             };
-            return self.generate_modified_call(oopspec, &[source, start, length, arg2], op, ctx);
+            return self.generate_modified_call(
+                oopspec,
+                &[source, start, length, arg2.to_opref()],
+                op,
+                ctx,
+            );
         }
         None
     }
 
     /// vstring.py:776 `i2 and i2.is_null()` — uses getptrinfo which
     /// synthesizes ConstPtrInfo for constant refs.
-    fn is_known_null(&self, opref: OpRef, ctx: &OptContext) -> bool {
-        let opref_box = ctx.get_box_replacement_box(opref);
-        if let Some(info) = opref_box.as_ref().and_then(|b| ctx.getptrinfo(b)) {
+    fn is_known_null(&self, op: &BoxRef, ctx: &OptContext) -> bool {
+        if let Some(info) = ctx.getptrinfo(op) {
             return info.is_null();
         }
         false
@@ -1226,9 +1208,8 @@ impl OptString {
 
     /// vstring.py:777,800,808 `i1 and i1.is_nonnull()` — uses getptrinfo
     /// which synthesizes ConstPtrInfo for constant refs.
-    fn is_known_nonnull(&self, opref: OpRef, ctx: &OptContext) -> bool {
-        let opref_box = ctx.get_box_replacement_box(opref);
-        if let Some(info) = opref_box.as_ref().and_then(|b| ctx.getptrinfo(b)) {
+    fn is_known_nonnull(&self, op: &BoxRef, ctx: &OptContext) -> bool {
+        if let Some(info) = ctx.getptrinfo(op) {
             return info.is_nonnull() || info.is_virtual();
         }
         false
@@ -1253,7 +1234,8 @@ impl OptString {
         // encode the None-descr CALL directly instead of bailing.
         let (calldescr, func_addr) = cic.callinfo_for_oopspec(oopspec);
         let func_const = ctx.alloc_op_position_typed(majit_ir::Type::Int);
-        ctx.make_constant(func_const, Value::Int(func_addr as i64));
+        let b = ctx.materialize_box_at(func_const);
+        ctx.make_constant_box(&b, Value::Int(func_addr as i64));
         let mut call_args = vec![func_const];
         call_args.extend_from_slice(args);
         let mut call_args_box: Vec<BoxRef> = Vec::with_capacity(call_args.len());
@@ -1423,8 +1405,8 @@ impl Optimization for OptString {
 
             // vstring.py: STRHASH/UNICODEHASH — force virtual string and emit.
             OpCode::Strhash | OpCode::Unicodehash => {
-                let src = ctx.resolve_box_box(&op.arg(0)).to_opref();
-                self.force_if_virtual(src, ctx);
+                let src = ctx.resolve_box_box(&op.arg(0));
+                self.force_if_virtual(&src, ctx);
                 OptimizationResult::PassOn
             }
 
@@ -1521,7 +1503,8 @@ mod tests {
         let start_next_pos = (max_pos + 1).max(ops.len() as u32);
         let mut ctx = OptContext::with_num_inputs_and_start_pos(ops.len(), 0, 0, start_next_pos);
         for &(idx, val) in constants {
-            ctx.make_constant(OpRef::int_op(idx), Value::Int(val));
+            let b = ctx.materialize_box_at(OpRef::int_op(idx));
+            ctx.make_constant_box(&b, Value::Int(val));
         }
 
         let mut pass = OptString::new();
@@ -1786,8 +1769,10 @@ mod tests {
         let mut ctx = OptContext::new(10);
 
         // Constant length refs
-        ctx.make_constant(OpRef::int_op(100), Value::Int(3));
-        ctx.make_constant(OpRef::int_op(101), Value::Int(4));
+        let b = ctx.materialize_box_at(OpRef::int_op(100));
+        ctx.make_constant_box(&b, Value::Int(3));
+        let b = ctx.materialize_box_at(OpRef::int_op(101));
+        ctx.make_constant_box(&b, Value::Int(4));
 
         // Virtual plain strings
         let left_ref = OpRef::ref_op(10);
@@ -1825,8 +1810,10 @@ mod tests {
         );
 
         // slice = source[1:3] (start=1, length=2)
-        ctx.make_constant(OpRef::int_op(300), Value::Int(1)); // start
-        ctx.make_constant(OpRef::int_op(301), Value::Int(2)); // length
+        let b = ctx.materialize_box_at(OpRef::int_op(300));
+        ctx.make_constant_box(&b, Value::Int(1)); // start
+        let b = ctx.materialize_box_at(OpRef::int_op(301));
+        ctx.make_constant_box(&b, Value::Int(2)); // length
         let slice_ref = OpRef::ref_op(11);
         set_vstring_slice(
             &mut ctx,
@@ -1869,7 +1856,8 @@ mod tests {
         ctx.with_intbound_mut(&start_box, |b| {
             *b = IntBound::from_constant(1);
         });
-        ctx.make_constant(OpRef::int_op(301), Value::Int(2)); // length
+        let b = ctx.materialize_box_at(OpRef::int_op(301));
+        ctx.make_constant_box(&b, Value::Int(2)); // length
 
         let slice_ref = OpRef::ref_op(11);
         set_vstring_slice(&mut ctx, slice_ref, src_ref, start_ref, OpRef::int_op(301));
@@ -1894,8 +1882,10 @@ mod tests {
         let src_ref = OpRef::ref_op(10);
         set_vstring_plain(&mut ctx, src_ref, vec![None; 5]);
 
-        ctx.make_constant(OpRef::int_op(300), Value::Int(1)); // start
-        ctx.make_constant(OpRef::int_op(301), Value::Int(3)); // length
+        let b = ctx.materialize_box_at(OpRef::int_op(300));
+        ctx.make_constant_box(&b, Value::Int(1)); // start
+        let b = ctx.materialize_box_at(OpRef::int_op(301));
+        ctx.make_constant_box(&b, Value::Int(3)); // length
 
         let slice_ref = OpRef::ref_op(11);
         set_vstring_slice(
@@ -2178,9 +2168,12 @@ mod tests {
         let mut pass = OptString::new();
         let mut ctx = OptContext::new(10);
 
-        ctx.make_constant(OpRef::int_op(100), Value::Int(2));
-        ctx.make_constant(OpRef::int_op(101), Value::Int(3));
-        ctx.make_constant(OpRef::int_op(102), Value::Int(4));
+        let b = ctx.materialize_box_at(OpRef::int_op(100));
+        ctx.make_constant_box(&b, Value::Int(2));
+        let b = ctx.materialize_box_at(OpRef::int_op(101));
+        ctx.make_constant_box(&b, Value::Int(3));
+        let b = ctx.materialize_box_at(OpRef::int_op(102));
+        ctx.make_constant_box(&b, Value::Int(4));
 
         let a = OpRef::ref_op(10);
         let b = OpRef::ref_op(11);
@@ -2207,8 +2200,10 @@ mod tests {
         let mut pass = OptString::new();
         let mut ctx = OptContext::new(10);
 
-        ctx.make_constant(OpRef::int_op(100), Value::Int(2));
-        ctx.make_constant(OpRef::int_op(101), Value::Int(2));
+        let b = ctx.materialize_box_at(OpRef::int_op(100));
+        ctx.make_constant_box(&b, Value::Int(2));
+        let b = ctx.materialize_box_at(OpRef::int_op(101));
+        ctx.make_constant_box(&b, Value::Int(2));
 
         let left = OpRef::ref_op(10);
         let right = OpRef::ref_op(11);
@@ -2283,13 +2278,14 @@ mod tests {
         let mut left_op = Op::new(OpCode::Newstr, &[BoxRef::from_opref(OpRef::int_op(200))]);
         left_op.pos.set(left);
         let mut ctx = OptContext::new(10);
-        ctx.make_constant(OpRef::int_op(200), Value::Int(2));
+        let b = ctx.materialize_box_at(OpRef::int_op(200));
+        ctx.make_constant_box(&b, Value::Int(2));
 
         // Process NEWSTR → creates virtual Plain
         let left_op_rc = std::rc::Rc::new(left_op.clone());
         ctx.bind_input_resops(std::slice::from_ref(&left_op_rc));
         let _ = pass.propagate_forward(&left_op, &left_op_rc, &mut ctx);
-        assert!(pass.is_virtual(left, &ctx));
+        assert!(pass.is_virtual(&ctx.get_box_replacement(left), &ctx));
     }
 
     // ── Box/state parity tests ──
@@ -2521,55 +2517,6 @@ mod tests {
 
         // Subsequent call must return the cached lgtop.
         let strlen_ref2 = ctx.getstrlen_opref(arg2, 0);
-        assert_eq!(strlen_ref, strlen_ref2);
-    }
-
-    /// vstring.py:794 handle_str_equal_level2 parity:
-    /// i2.getstrlen(arg1, self, mode) — info from arg2, fallback STRLEN(arg1).
-    /// getstrlen_for(arg2, arg1, mode) must use arg2's info but emit
-    /// STRLEN(arg1) when lgtop is not cached.
-    #[test]
-    fn test_getstrlen_for_level2_uses_arg1_as_fallback() {
-        let mut ctx = OptContext::with_num_inputs_and_start_pos(10, 0, 0, 50);
-        let arg1 = OpRef::ref_op(0);
-        let arg2 = OpRef::ref_op(1);
-
-        // Attach non-virtual StrPtrInfo to arg2 with lgtop=None.
-        let arg2_box = ctx.materialize_box_at(arg2);
-        ctx.set_ptr_info(
-            &arg2_box,
-            PtrInfo::Str(StrPtrInfo {
-                lenbound: None,
-                lgtop: None,
-                mode: 0,
-                length: -1,
-                variant: VStringVariant::Ptr,
-                last_guard_pos: -1,
-                avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
-            }),
-        );
-
-        // getstrlen_for(arg2, arg1, 0): info from arg2, STRLEN fallback on arg1.
-        let strlen_ref = ctx.getstrlen_for(arg2, arg1, 0);
-
-        let (_pass_idx, strlen_op) = ctx
-            .extra_operations_after
-            .back()
-            .expect("should have emitted STRLEN");
-        assert_eq!(strlen_op.opcode, OpCode::Strlen);
-        assert_eq!(
-            strlen_op
-                .getarglist()
-                .iter()
-                .map(|a| a.to_opref())
-                .collect::<Vec<_>>(),
-            vec![arg1],
-            "STRLEN must use arg1 (op), not arg2 (info source)"
-        );
-        assert_eq!(strlen_ref, strlen_op.pos.get());
-
-        // lgtop is cached on arg2's info — second call returns cached value.
-        let strlen_ref2 = ctx.getstrlen_for(arg2, arg1, 0);
         assert_eq!(strlen_ref, strlen_ref2);
     }
 

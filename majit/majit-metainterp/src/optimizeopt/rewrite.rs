@@ -115,7 +115,8 @@ impl OptRewrite {
                 .and_then(|b| ctx.get_constant_int_box(&b)),
         ) {
             if let Some(result) = self.try_fold_binary_int(OpCode::IntFloorDiv, a, b) {
-                ctx.make_constant(op.pos.get(), Value::Int(result));
+                let b = ctx.materialize_box_at(op.pos.get());
+                ctx.make_constant_box(&b, Value::Int(result));
                 return OptimizationResult::Remove;
             }
         }
@@ -146,13 +147,18 @@ impl OptRewrite {
             .resolve_box_box_opt(&arg0)
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
-            ctx.make_constant(op.pos.get(), Value::Int(0));
+            let b = ctx.materialize_box_at(op.pos.get());
+            ctx.make_constant_box(&b, Value::Int(0));
             return OptimizationResult::Remove;
         }
 
         // x // x -> 1 (self-division, x != 0 guaranteed by semantics)
-        if ctx.same_box(arg0.to_opref(), arg1.to_opref()) {
-            ctx.make_constant(op.pos.get(), Value::Int(1));
+        if ctx
+            .resolve_box_box(&arg0)
+            .same_box(&ctx.resolve_box_box(&arg1))
+        {
+            let b = ctx.materialize_box_at(op.pos.get());
+            ctx.make_constant_box(&b, Value::Int(1));
             return OptimizationResult::Remove;
         }
 
@@ -213,7 +219,8 @@ impl OptRewrite {
                 .and_then(|b| ctx.get_constant_int_box(&b)),
         ) {
             if let Some(result) = self.try_fold_binary_int(OpCode::IntMod, a, b) {
-                ctx.make_constant(op.pos.get(), Value::Int(result));
+                let b = ctx.materialize_box_at(op.pos.get());
+                ctx.make_constant_box(&b, Value::Int(result));
                 return OptimizationResult::Remove;
             }
         }
@@ -223,7 +230,8 @@ impl OptRewrite {
             .resolve_box_box_opt(&arg1)
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
-            ctx.make_constant(op.pos.get(), Value::Int(0));
+            let b = ctx.materialize_box_at(op.pos.get());
+            ctx.make_constant_box(&b, Value::Int(0));
             return OptimizationResult::Remove;
         }
 
@@ -232,7 +240,8 @@ impl OptRewrite {
             .resolve_box_box_opt(&arg1)
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
-            ctx.make_constant(op.pos.get(), Value::Int(0));
+            let b = ctx.materialize_box_at(op.pos.get());
+            ctx.make_constant_box(&b, Value::Int(0));
             return OptimizationResult::Remove;
         }
 
@@ -241,13 +250,18 @@ impl OptRewrite {
             .resolve_box_box_opt(&arg0)
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
-            ctx.make_constant(op.pos.get(), Value::Int(0));
+            let b = ctx.materialize_box_at(op.pos.get());
+            ctx.make_constant_box(&b, Value::Int(0));
             return OptimizationResult::Remove;
         }
 
         // x % x -> 0 (self-modulo)
-        if ctx.same_box(arg0.to_opref(), arg1.to_opref()) {
-            ctx.make_constant(op.pos.get(), Value::Int(0));
+        if ctx
+            .resolve_box_box(&arg0)
+            .same_box(&ctx.resolve_box_box(&arg1))
+        {
+            let b = ctx.materialize_box_at(op.pos.get());
+            ctx.make_constant_box(&b, Value::Int(0));
             return OptimizationResult::Remove;
         }
 
@@ -386,11 +400,13 @@ impl OptRewrite {
             } else {
                 expect_isnot
             };
-            ctx.make_constant(op.pos.get(), Value::Int(intres as i64));
+            let b = ctx.materialize_box_at(op.pos.get());
+            ctx.make_constant_box(&b, Value::Int(intres as i64));
             return OptimizationResult::Remove;
         }
         if is_virtual1 {
-            ctx.make_constant(op.pos.get(), Value::Int(expect_isnot as i64));
+            let b = ctx.materialize_box_at(op.pos.get());
+            ctx.make_constant_box(&b, Value::Int(expect_isnot as i64));
             return OptimizationResult::Remove;
         }
 
@@ -407,7 +423,8 @@ impl OptRewrite {
         // rewrite.py:542-543: `elif arg0 is arg1:` — box identity
         // (resoperation.py:38 `same_box` base = `self is other`).
         if ctx.box_is(arg0, arg1) {
-            ctx.make_constant(op.pos.get(), Value::Int(!expect_isnot as i64));
+            let b = ctx.materialize_box_at(op.pos.get());
+            ctx.make_constant_box(&b, Value::Int(!expect_isnot as i64));
             return OptimizationResult::Remove;
         }
 
@@ -421,7 +438,8 @@ impl OptRewrite {
                 .and_then(|i| i.get_known_class(ctx.cpu.as_ref()));
             if let (Some(c0), Some(c1)) = (cls0, cls1) {
                 if c0 != c1 {
-                    ctx.make_constant(op.pos.get(), Value::Int(expect_isnot as i64));
+                    let b = ctx.materialize_box_at(op.pos.get());
+                    ctx.make_constant_box(&b, Value::Int(expect_isnot as i64));
                     return OptimizationResult::Remove;
                 }
             }
@@ -433,7 +451,8 @@ impl OptRewrite {
             let lb1 = info1.clone().and_then(|mut i| i.getlenbound(None));
             if let (Some(lb0), Some(lb1)) = (lb0, lb1) {
                 if lb0.known_ne(&lb1) {
-                    ctx.make_constant(op.pos.get(), Value::Int(expect_isnot as i64));
+                    let b = ctx.materialize_box_at(op.pos.get());
+                    ctx.make_constant_box(&b, Value::Int(expect_isnot as i64));
                     return OptimizationResult::Remove;
                 }
             }
@@ -456,11 +475,13 @@ impl OptRewrite {
     ) -> OptimizationResult {
         match self.getnullness(arg, ctx) {
             Nullness::Nonnull => {
-                ctx.make_constant(op.pos.get(), Value::Int(expect_nonnull as i64));
+                let b = ctx.materialize_box_at(op.pos.get());
+                ctx.make_constant_box(&b, Value::Int(expect_nonnull as i64));
                 OptimizationResult::Remove
             }
             Nullness::Null => {
-                ctx.make_constant(op.pos.get(), Value::Int(!expect_nonnull as i64));
+                let b = ctx.materialize_box_at(op.pos.get());
+                ctx.make_constant_box(&b, Value::Int(!expect_nonnull as i64));
                 OptimizationResult::Remove
             }
             Nullness::Unknown => OptimizationResult::PassOn,
@@ -480,7 +501,8 @@ impl OptRewrite {
             .resolve_box_box_opt(&arg0)
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
-            ctx.make_constant(op.pos.get(), Value::Int(if a < 0 { 0 } else { a }));
+            let b = ctx.materialize_box_at(op.pos.get());
+            ctx.make_constant_box(&b, Value::Int(if a < 0 { 0 } else { a }));
             return OptimizationResult::Remove;
         }
 
@@ -497,7 +519,8 @@ impl OptRewrite {
             }
             // force_ge_zero_neg: int_force_ge_zero(x) => 0 (if x known negative)
             if bound.upper < 0 {
-                ctx.make_constant(op.pos.get(), Value::Int(0));
+                let b = ctx.materialize_box_at(op.pos.get());
+                ctx.make_constant_box(&b, Value::Int(0));
                 return OptimizationResult::Remove;
             }
         }
@@ -520,7 +543,8 @@ impl OptRewrite {
                 .and_then(|b| ctx.get_constant_int_box(&b)),
         ) {
             let result = (a <= b && b < c) as i64;
-            ctx.make_constant(op.pos.get(), Value::Int(result));
+            let b = ctx.materialize_box_at(op.pos.get());
+            ctx.make_constant_box(&b, Value::Int(result));
             return OptimizationResult::Remove;
         }
 
@@ -737,12 +761,12 @@ impl OptRewrite {
         // rewrite.py postprocess_GUARD_VALUE:
         //   box = get_box_replacement(op.getarg(0))
         //   self.make_constant(box, op.getarg(1))
-        let box_ref = ctx.resolve_box_box(&arg0).to_opref();
+        let box_ref = ctx.resolve_box_box(&arg0);
         let v = ctx
             .resolve_box_box_opt(&arg1)
             .and_then(|b| b.const_value())
             .expect("postprocess_GUARD_VALUE requires const arg1");
-        ctx.make_constant(box_ref, v);
+        ctx.make_constant_box(&box_ref, v);
         OptimizationResult::PassOn
     }
 
@@ -965,7 +989,8 @@ impl OptRewrite {
 
         // rewrite.py:774-777: b1.known_eq_const(0) → 0
         if b1.known_eq_const(0) {
-            ctx.make_constant(op.pos.get(), Value::Int(0));
+            let b = ctx.materialize_box_at(op.pos.get());
+            ctx.make_constant_box(&b, Value::Int(0));
             ctx.last_op_removed = true;
             return Some(OptimizationResult::Remove);
         }
@@ -980,7 +1005,8 @@ impl OptRewrite {
         }
         // rewrite.py:785-788: x % 1 → 0
         if val == 1 {
-            ctx.make_constant(op.pos.get(), Value::Int(0));
+            let b = ctx.materialize_box_at(op.pos.get());
+            ctx.make_constant_box(&b, Value::Int(0));
             ctx.last_op_removed = true;
             return Some(OptimizationResult::Remove);
         }
@@ -1035,7 +1061,8 @@ impl OptRewrite {
 
         // rewrite.py:726-729: b1.known_eq_const(0) → 0
         if b1.known_eq_const(0) {
-            ctx.make_constant(op.pos.get(), Value::Int(0));
+            let b = ctx.materialize_box_at(op.pos.get());
+            ctx.make_constant_box(&b, Value::Int(0));
             ctx.last_op_removed = true;
             return Some(OptimizationResult::Remove);
         }
@@ -1387,7 +1414,8 @@ impl OptRewrite {
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
             let result = 1 - val;
-            ctx.make_constant(op.pos.get(), Value::Int(result));
+            let b = ctx.materialize_box_at(op.pos.get());
+            ctx.make_constant_box(&b, Value::Int(result));
             return Some(OptimizationResult::Remove);
         }
         // rewrite.py:61-65: b.known_eq_const(1) / b.known_eq_const(0)
@@ -1398,10 +1426,12 @@ impl OptRewrite {
             .and_then(|b| ctx.peek_intbound_box(&b))
         {
             if bound.known_eq_const(1) {
-                ctx.make_constant(op.pos.get(), Value::Int(0));
+                let b = ctx.materialize_box_at(op.pos.get());
+                ctx.make_constant_box(&b, Value::Int(0));
                 return Some(OptimizationResult::Remove);
             } else if bound.known_eq_const(0) {
-                ctx.make_constant(op.pos.get(), Value::Int(1));
+                let b = ctx.materialize_box_at(op.pos.get());
+                ctx.make_constant_box(&b, Value::Int(1));
                 return Some(OptimizationResult::Remove);
             }
         }
@@ -1579,14 +1609,16 @@ impl OptRewrite {
     fn emit_constant_int(&self, ctx: &mut OptContext, value: i64) -> OpRef {
         let op = Op::new(OpCode::SameAsI, &[]);
         let opref = ctx.emit(op);
-        ctx.make_constant(opref, Value::Int(value));
+        let b = ctx.materialize_box_at(opref);
+        ctx.make_constant_box(&b, Value::Int(value));
         opref
     }
 
     fn emit_constant_float(&self, ctx: &mut OptContext, value: f64) -> OpRef {
         let op = Op::new(OpCode::SameAsF, &[]);
         let opref = ctx.emit(op);
-        ctx.make_constant(opref, Value::Float(value));
+        let b = ctx.materialize_box_at(opref);
+        ctx.make_constant_box(&b, Value::Float(value));
         opref
     }
 }
@@ -2314,7 +2346,8 @@ mod tests {
             ctx.emit(op.clone());
         }
         for &(opref, value) in constants {
-            ctx.make_constant(opref, value);
+            let b = ctx.materialize_box_at(opref);
+            ctx.make_constant_box(&b, value);
         }
         let mut passes = test_pass_chain();
         let mut op = ops[target].clone();
@@ -2357,7 +2390,8 @@ mod tests {
             ctx.emit(op.clone());
         }
         for &(opref, value) in constants {
-            ctx.make_constant(opref, value);
+            let b = ctx.materialize_box_at(opref);
+            ctx.make_constant_box(&b, value);
         }
         let mut pass = OptRewrite::new();
         let mut op = ops[target].clone();
@@ -2810,7 +2844,8 @@ mod tests {
             }
             // Set op1 as constant 0 after it has been emitted
             if i == 1 {
-                ctx.make_constant(OpRef::int_op(1), Value::Int(0));
+                let b = ctx.materialize_box_at(OpRef::int_op(1));
+                ctx.make_constant_box(&b, Value::Int(0));
             }
         }
 
@@ -3325,7 +3360,8 @@ mod tests {
         let mut ctx = OptContext::new(4);
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
-        ctx.make_constant(OpRef::int_op(0), Value::Int(0));
+        let b = ctx.materialize_box_at(OpRef::int_op(0));
+        ctx.make_constant_box(&b, Value::Int(0));
 
         let mut pass = OptRewrite::new();
         // Process CondCallN -> removed
