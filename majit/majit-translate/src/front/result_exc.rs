@@ -402,12 +402,48 @@ pub(crate) fn lower_result_exc_returns(
         rewritten += 1;
     }
     if rewritten == 0 && tail_forwarded_returns == 0 {
+        // A scoped callee whose body is `return f(...)?` where `f` is
+        // outside [`RESULT_EXC_LOWERING_SCOPE`] (e.g. a trait method
+        // such as `OpcodeStepExecutor::return_value`): the optimised MIR
+        // folds the `?`-diamond into a direct forward of the callee's
+        // `Result` to `returnblock`, leaving no `Ok`/`Err` shell to
+        // rewrite, and the caller-rule capture never recorded the site
+        // (the callee is unscoped), so `tail_forwarded_returns` is 0.
+        // This is the same disposition as a scoped tail-forward
+        // (`SiteOutcome::TailForward`): the residual-call ABI erases the
+        // shell (`Ok` → value, `Err` → `BH_LAST_EXC_VALUE`) and the
+        // codewriter re-derives `guard_no_exception` op-locally, so the
+        // forward already carries `T` and the raise propagates
+        // implicitly — no rewrite is needed.
+        if has_tail_forwarded_call_result(graph) {
+            return Ok(0);
+        }
         return Err(format!(
             "{}: scoped Result-of-PyError callee with no rewritable returns",
             graph.name
         ));
     }
     Ok(rewritten)
+}
+
+/// True when some block's `Call` result flows straight to `returnblock`
+/// through pure positional forwarding — the `return f(...)?` tail-forward
+/// shape.  Used by [`lower_result_exc_returns`] to accept scoped callees
+/// that forward an unscoped callee's `Result` directly (the caller-rule
+/// capture only records scoped callees, so such sites never reach
+/// `rewire_result_exc_call_sites`).
+fn has_tail_forwarded_call_result(graph: &FunctionGraph) -> bool {
+    for bi in 0..graph.blocks.len() {
+        for op in &graph.blocks[bi].operations {
+            if matches!(op.kind, OpKind::Call { .. })
+                && let Some(r) = &op.result
+                && forwards_to_returnblock(graph, bi, r)
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 struct UseCounts {

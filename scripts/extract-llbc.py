@@ -325,6 +325,20 @@ def extract(args: argparse.Namespace) -> None:
             continue
 
         print(f"=== extracting {crate} -> {dest} ===")
+        # Charon writes the `.ullbc` only while rustc actually compiles
+        # the crate. Once the fingerprint skip above is past, the artefact
+        # is known absent or stale and must be (re)generated — but a warm
+        # `target/<host-triple>/` cache (e.g. `build/` was wiped while the
+        # build cache survived) makes the inner `cargo build` skip rustc
+        # and emit nothing, leaving `dest` missing. Touch the crate root
+        # to dirty just this unit's fingerprint so it always recompiles
+        # and re-emits; dependency crates stay cached (their MIR reaches
+        # Charon via rlib metadata), so re-runs remain cheap.
+        crate_root = path / "src" / "lib.rs"
+        if not crate_root.exists():
+            crate_root = path / "src" / "main.rs"
+        crate_root.touch()
+
         command = [
             str(charon_bin),
             "cargo",
@@ -336,6 +350,14 @@ def extract(args: argparse.Namespace) -> None:
             *host_config,
         ]
         subprocess.run(command, cwd=path, env=env, check=True)
+        # Fail loud rather than letting a missing artefact surface later
+        # as an opaque build.rs panic ("build/llbc/ is missing …").
+        if not dest.exists() or dest.stat().st_size == 0:
+            raise SystemExit(
+                f"extract-llbc.py: Charon emitted no artefact at {dest}\n"
+                "  the crate compiled but produced no MIR — "
+                "inspect the Charon output above"
+            )
         stamp_path.write_text(stamp + "\n")
         print(f"    wrote {dest} ({dest.stat().st_size} bytes)")
 
