@@ -967,10 +967,10 @@ impl DynasmBackend {
         }
     }
 
-    // `set_constants`, `set_constant_types`, `set_next_trace_id`,
-    // `set_next_header_pc` are provided via the `Backend` trait impl
-    // below so `compile_tmp_callback` and other backend-agnostic
-    // consumers can reach them through `&mut dyn Backend`.
+    // `set_constants_pool`, `set_next_trace_id`, and `set_next_header_pc`
+    // are provided via the `Backend` trait impl below so
+    // `compile_tmp_callback` and other backend-agnostic consumers can
+    // reach them through `&mut dyn Backend`.
 
     /// gc.py:525-531 parity: build a GcRewriterImpl from the active GC.
     fn gc_rewriter(

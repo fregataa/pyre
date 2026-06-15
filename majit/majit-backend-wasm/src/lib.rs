@@ -167,9 +167,8 @@ impl WasmBackend {
         self.vtable_offset
     }
 
-    // `set_constants`, `set_next_trace_id`, `set_next_header_pc` are
-    // provided via the `Backend` trait impl below.  wasm has no
-    // `set_constant_types` inherent — the trait default (no-op) is used.
+    // `set_constants_pool`, `set_next_trace_id`, and `set_next_header_pc`
+    // are provided via the `Backend` trait impl below.
 
     /// llmodel.py:53-54: store gc_ll_descr on the cpu instance.
     ///
