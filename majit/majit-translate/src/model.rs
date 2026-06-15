@@ -1134,10 +1134,6 @@ pub fn exception_exitcase() -> ExitCase {
 /// (concretetype on the struct field) so type-sensitive renaming /
 /// Void filtering at link sites can read kinds off either arm without
 /// projecting through a side table.
-///
-/// Pyre's dense slot index is projected back via
-/// `graph.slot_of(&var)` when downstream readers still key
-/// `HashMap<usize, _>` structures on the legacy slot index.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LinkArg {
     Value(crate::flowspace::model::Variable),
@@ -1145,17 +1141,6 @@ pub enum LinkArg {
 }
 
 impl LinkArg {
-    /// Project the link-arg's backing Variable to its graph-local
-    /// slot index.  Returns `None` for constants and for Variables not
-    /// registered on the graph.  Pure Variable-identity readers should
-    /// use [`Self::as_variable`] instead.
-    pub fn slot_in(&self, graph: &FunctionGraph) -> Option<usize> {
-        match self {
-            Self::Value(var) => graph.slot_of(var),
-            Self::Const(_) => None,
-        }
-    }
-
     /// Read the backing [`crate::flowspace::model::Variable`] for a
     /// `LinkArg::Value`; `None` for constants.  Direct over the
     /// upstream-orthodox storage — no graph projection needed.
@@ -1204,9 +1189,8 @@ pub struct Block {
     /// (`flowspace/model.py:21-25 Block([Variable("etype"),
     /// Variable("evalue")])`) — each predecessor Link carries
     /// values that map 1:1 to these inputargs.  Pyre stores the
-    /// upstream-orthodox `Variable` directly; consumers needing
-    /// pyre's dense slot index project via
-    /// [`FunctionGraph::slot_of`].
+    /// upstream-orthodox `Variable` directly; consumers match on the
+    /// `Variable` object by identity.
     pub inputargs: Vec<crate::flowspace::model::Variable>,
     pub operations: Vec<SpaceOperation>,
     /// RPython `Block.exitswitch`.
@@ -1283,10 +1267,9 @@ pub struct FrameState {
     /// Parallel `Hlvalue` carrier matching upstream
     /// `framestate.py:19 self.locals_w` shape — list of
     /// `Variable | Constant | None` indexed by `co_varnames` slot.
-    /// Currently derived from `entries` at the end of `union` via
-    /// `graph.variable_at(slot)` lookup; the long-term plan is to
-    /// promote this to the single source of truth and retire the
-    /// per-entry `Variable` carrier in `entries`.  Production read
+    /// Populated by `getstate` / `union` alongside `entries`; the
+    /// long-term plan is to promote this to the single source of truth
+    /// and retire the per-entry `Variable` carrier in `entries`.  Production read
     /// sites still consume `entries`; future substeps swap them over
     /// slot-by-slot before flipping the construction direction
     /// (fixtures populate `locals_w` directly, `entries` becomes
@@ -1325,45 +1308,16 @@ pub struct FrameState {
 }
 
 impl FrameState {
-    /// Iterate `(entry_slot, value_slot)` over **bound** entries in
-    /// storage order.  Unbound (None-killed) slots are skipped.
-    /// `entry_slot` is the position in [`Self::entries`]; `value_slot`
-    /// is the graph-wide slot index the entry binds.  Callers
-    /// translate `entry_slot` → name via
-    /// `GraphBuildContext::local_first_bind_order[entry_slot]` and
-    /// query the type via `graph.concretetype_at(value_slot)` —
-    /// upstream `framestate.py:locals_w` slot-index convention with
-    /// type carried on the `Variable.concretetype` slot.
-    pub fn iter_slots<'a>(
-        &'a self,
-        graph: &'a FunctionGraph,
-    ) -> impl Iterator<Item = (usize, usize)> + 'a {
-        self.entries
-            .iter()
-            .enumerate()
-            .filter_map(move |(i, e)| e.as_ref().and_then(|v| graph.slot_of(v).map(|s| (i, s))))
-    }
-
-    /// Project `entries[slot]` to a backing `Variable` via the graph's
-    /// slot table.  `Some` when the slot is bound and its `Variable`
-    /// resolves on `graph`; `None` for unbound (None-killed) slots or
-    /// out-of-range indices.
+    /// Read the backing `Variable` bound at `entries[slot]`.  `Some`
+    /// when the slot is bound; `None` for unbound (None-killed) slots
+    /// or out-of-range indices.  `entries` holds `Variable`s directly,
+    /// so this is a plain positional read.
     pub fn entry_var(
         &self,
         slot: usize,
         _graph: &FunctionGraph,
     ) -> Option<crate::flowspace::model::Variable> {
         self.entries.get(slot).cloned().flatten()
-    }
-
-    /// Project `entries[slot]` to the graph-wide value slot index its
-    /// backing Variable occupies.  Returns `Some(idx)` when the entry
-    /// is bound and resolves to a registered Variable; `None` for
-    /// None-killed slots or out-of-range indices.  Bridge accessor
-    /// after `entries` holds Variables directly the body becomes
-    /// `self.entry_var(slot, graph).and_then(|v| graph.slot_of(&v))`.
-    pub fn entry_slot(&self, slot: usize, graph: &FunctionGraph) -> Option<usize> {
-        self.entry_var(slot, graph).and_then(|v| graph.slot_of(&v))
     }
 
     /// Authoritative locals view — upstream `framestate.py:19 self.locals_w`
@@ -1507,9 +1461,10 @@ impl FrameState {
             Some(crate::flowspace::model::FSException::new(w_type, w_value))
         };
         // `framestate.py:79 locals = _union(self.locals_w, other.locals_w)`.
-        // Run LAST so the `ensure_variable_registered_void` cursor advance
-        // only fires when the failure-prone projections above have
-        // succeeded.
+        // Run LAST so the locals projection is computed only after the
+        // failure-prone stack / exception projections above have
+        // succeeded (each `.ok()?` aborts the whole merge on a per-cell
+        // `UnionError`).
         //
         // Direct line-by-line port: walk `self.locals_w` and
         // `other.locals_w` positionally and dispatch each cell pair
@@ -1540,59 +1495,15 @@ impl FrameState {
             })
             .collect::<Result<Vec<_>, _>>()
             .ok()?;
-        // Capture predecessor Variable identities before dropping the
-        // views — used below to distinguish fresh phi Variables (minted
-        // by `framestate.py:113-114 union`) from carry-through Variables
-        // (`framestate.py:108 if w1 == w2: return w1`).  Mirrors the
-        // pred-id gate in `register_phi_variables_in_stack_exc`.
-        // `VecSet` per [[feedback-no-hashmap-ever]]: this set's live
-        // size is bounded by the locals_w width (one merge frame), so
-        // linear scan is the right shape.
-        let pred_local_ids: majit_ir::vec_set::VecSet<u64> = self_view
-            .iter()
-            .chain(other_view.iter())
-            .filter_map(|c| c.as_ref())
-            .filter_map(|h| match h {
-                crate::flowspace::model::Hlvalue::Variable(v) => Some(v.id()),
-                _ => None,
-            })
-            .collect();
         drop(self_view);
         drop(other_view);
-        // `framestate.py:113-114 union` mints a fresh `Variable()` at
-        // every disagreeing-cell position.  Pair only those fresh phi
-        // Variables with a graph slot so downstream
-        // `Hlvalue→slot` bridge resolves at the merged-predecessor
-        // read site.  Carry-through Variables (`framestate.py:108 if
-        // w1 == w2: return w1`) are excluded by the `pred_local_ids`
-        // gate — they are already registered at their upstream
-        // definition site, and unconditional registration here would
-        // silently invent a slot for any externally-minted Variable
-        // that reached `union` unregistered, hiding the same kind of
-        // bug `register_phi_variables_in_stack_exc` catches for
-        // stack / exception cells.
-        for cell in locals_w.iter().flatten() {
-            if let crate::flowspace::model::Hlvalue::Variable(v) = cell {
-                if !pred_local_ids.contains(&v.id()) {
-                    graph.ensure_variable_registered_void(&v);
-                }
-            }
-        }
-        graph.register_phi_variables_in_stack_exc(
-            &self.stack,
-            &other.stack,
-            &stack,
-            &self.last_exception,
-            &other.last_exception,
-            &last_exception,
-        );
         // Derive `entries` from `locals_w` — `locals_w` is now the
         // primary carrier matching `framestate.py:19 self.locals_w`,
         // and `entries` is a backward-compatibility view for callers
         // that have not yet migrated.  `Hlvalue::Variable(v)` is
-        // cloned directly into the entry, with its identity already
-        // registered at either an upstream definition site or the
-        // `ensure_variable_registered_void` walk above.
+        // cloned directly into the entry, carrying the merged value's
+        // identity (`framestate.py:108/113-114 union` returns either a
+        // carry-through Variable or a fresh phi `Variable()`).
         // `Hlvalue::Constant(_)` cells carry no Variable identity
         // (Constants are not Variable-bound in the pyre IR), so they
         // collapse to `None` in the `entries` view — matching the
@@ -1790,11 +1701,9 @@ impl FrameState {
                 Hlvalue::Variable(src) => {
                     // `_copy(v) -> Variable(v)` (framestate.py:4): fresh
                     // Variable carrying the source's `_name` prefix
-                    // (annotation stays None). Identity-shared `_name`
-                    // makes the rename visible through the registry clone.
+                    // (annotation stays None).
                     let mut nv = graph.alloc_value_var();
                     nv.rename_from(src);
-                    graph.ensure_variable_registered_void(&nv);
                     Hlvalue::Variable(nv)
                 }
                 other => other.clone(),
@@ -1803,7 +1712,6 @@ impl FrameState {
         let copy_var = |v: &Variable, graph: &mut FunctionGraph| -> Variable {
             let mut nv = graph.alloc_value_var();
             nv.rename_from(v);
-            graph.ensure_variable_registered_void(&nv);
             nv
         };
         // `locals_w` is the authoritative carrier (framestate.py:19).
@@ -1947,34 +1855,6 @@ impl FrameState {
             .zip(other_exc.iter())
             .all(|(w1, w2)| cell_match(w1, w2))
     }
-
-    /// cfg(test) constructor that projects a slice of `Option<usize>`
-    /// slot indices into a `Vec<Option<Variable>>` ready for
-    /// `FrameState { entries: ..., .. }` initialization.  Used by
-    /// hand-built test fixtures so each fixture stays slot-indexed
-    /// while the storage carrier holds Variable identities.  Each slot
-    /// is materialized on `graph` via `bind_variable_at` if not already
-    /// present so subsequent `slot_of(v)` reads round-trip back to the
-    /// fixture's slot index.
-    #[cfg(test)]
-    pub(crate) fn entries_from_slots(
-        slots: &[Option<usize>],
-        graph: &mut FunctionGraph,
-    ) -> Vec<Option<crate::flowspace::model::Variable>> {
-        slots
-            .iter()
-            .map(|s| {
-                s.map(|idx| match graph.variable_at(idx) {
-                    Some(v) => v.clone(),
-                    None => {
-                        let v = crate::flowspace::model::Variable::new();
-                        graph.bind_variable_at(idx, v.clone());
-                        v
-                    }
-                })
-            })
-            .collect()
-    }
 }
 
 /// Hlvalue→LinkArg routing per cell, matching upstream
@@ -1982,7 +1862,7 @@ impl FrameState {
 /// `mergeable[i]` cell directly into `Link.args`.  Pyre's `LinkArg` is
 /// the matching closed sum: `Hlvalue::Variable(v)` → `LinkArg::Value(v)`
 /// (the Variable carries its identity inline so downstream readers
-/// recover the graph-local slot via `LinkArg::slot_in(graph)`);
+/// match on the Variable object directly);
 /// `Hlvalue::Constant(c)` → `LinkArg::Const(c)` (direct carry, no
 /// synthetic op or slot allocation required for the Constant domain).
 fn hlvalue_to_linkarg(w: &crate::flowspace::model::Hlvalue) -> LinkArg {
@@ -2789,12 +2669,12 @@ where
 /// jit_codewriter needs.
 ///
 /// RPython stores `.concretetype` inline on each `Variable` after
-/// `RPythonTyper.specialize()` rewrites the graph; pyre routes the
-/// same attribute through the backing `Variable` held in
-/// [`FunctionGraph::value_variables`], so [`FunctionGraph::concretetype`]
-/// reads `getkind(var.concretetype.borrow())` line-for-line with
-/// upstream.  `Unknown` is the pre-rtyper sentinel — `Variable`
-/// analogue before the rtyper ran.
+/// `RPythonTyper.specialize()` rewrites the graph; pyre reads the same
+/// attribute off the `Variable` directly, so
+/// [`FunctionGraph::concretetype_of`] reads
+/// `getkind(var.concretetype.borrow())` line-for-line with upstream.
+/// `Unknown` is the pre-rtyper sentinel — `Variable` analogue before
+/// the rtyper ran.
 ///
 /// The variants line up 1:1 with [`getkind`]'s output strings
 /// (`rpython/jit/metainterp/history.py:45-71`):
@@ -3100,37 +2980,6 @@ pub struct FunctionGraph {
     pub exceptblock: BlockId,
     pub blocks: Vec<Block>,
     pub notes: Vec<String>,
-    next_value: usize,
-    /// Per-slot backing [`crate::flowspace::model::Variable`].
-    ///
-    /// **Variable identity bridge** — RPython's IR is keyed on
-    /// `Variable` identity (`flowspace/model.py:280`); pyre uses
-    /// a dense slot index but eagerly stores the
-    /// `Variable` so [`Self::concretetype`] can route reads
-    /// through `Variable.concretetype` directly (the upstream
-    /// inline attribute), and so future passes can adopt
-    /// Variable-keyed lookups (`replace`, `name`, etc.) without
-    /// further churn.  Every freshly minted slot (via
-    /// [`Self::alloc_value_var_with_type`], [`Self::set_next_value`]
-    /// grow paths, etc.) gets a `Some(Variable::new())` so this
-    /// vec is the single source of truth — no parallel kind
-    /// side-table backs it.  Indexed by slot index.
-    pub value_variables: Vec<Option<crate::flowspace::model::Variable>>,
-    /// `flowspace::model::Variable.id` → graph-slot reverse index.
-    /// Populated by `ensure_variable_registered_void` / `bind_variable_at`
-    /// at Variable definition sites; consumed by `slot_of` /
-    /// `bridge_variable` lookup paths so a `Variable` carried through
-    /// `Hlvalue` / `LinkArg::Value` can be projected back to its
-    /// allocation slot for `value_variables` indexing.
-    ///
-    /// RPython has no counterpart — `framestate.py:92-99 getoutputargs`
-    /// pushes the polymorphic `Hlvalue` cell directly into `Link.args`,
-    /// no bridge needed because the link domain IS `Hlvalue`.  This map
-    /// is the documented TODO for pyre's slot-indexed
-    /// `value_variables` side table: it lets
-    /// Variable-keyed lookups resolve in `O(1)` without scanning
-    /// `value_variables` linearly.
-    pub(crate) variable_to_vid: std::collections::HashMap<u64, usize>,
     /// The source-level return type string (Rust `syn::ReturnType`
     /// rendered through `qualified_full_type_string`). RPython
     /// equivalent: `funcptr._obj.TO.RESULT` on the
@@ -3165,9 +3014,6 @@ impl FunctionGraph {
         let entry = BlockId(0);
         let returnblock = BlockId(1);
         let exceptblock = BlockId(2);
-        let return_value: usize = 0;
-        let last_exception: usize = 1;
-        let last_exc_value: usize = 2;
         // Canonical inputargs (returnvar / etype / evalue) get named
         // Variables matching `flowspace/model.py:21-25`
         // (`Variable("returnvar")`, `Variable("etype")`,
@@ -3180,10 +3026,6 @@ impl FunctionGraph {
         let var_returnvar = crate::flowspace::model::Variable::named("returnvar");
         let var_etype = crate::flowspace::model::Variable::named("etype");
         let var_evalue = crate::flowspace::model::Variable::named("evalue");
-        let mut variable_to_vid = std::collections::HashMap::new();
-        variable_to_vid.insert(var_returnvar.id(), return_value);
-        variable_to_vid.insert(var_etype.id(), last_exception);
-        variable_to_vid.insert(var_evalue.id(), last_exc_value);
         Self {
             name: name.into(),
             startblock: entry,
@@ -3207,7 +3049,7 @@ impl FunctionGraph {
                 },
                 Block {
                     id: returnblock,
-                    inputargs: vec![var_returnvar.clone()],
+                    inputargs: vec![var_returnvar],
                     operations: Vec::new(),
                     exitswitch: None,
                     exits: Vec::new(),
@@ -3216,7 +3058,7 @@ impl FunctionGraph {
                 },
                 Block {
                     id: exceptblock,
-                    inputargs: vec![var_etype.clone(), var_evalue.clone()],
+                    inputargs: vec![var_etype, var_evalue],
                     operations: Vec::new(),
                     exitswitch: None,
                     exits: Vec::new(),
@@ -3225,9 +3067,6 @@ impl FunctionGraph {
                 },
             ],
             notes: Vec::new(),
-            next_value: 3,
-            value_variables: vec![Some(var_returnvar), Some(var_etype), Some(var_evalue)],
-            variable_to_vid,
             return_type: None,
             owner_root: None,
             hints: Vec::new(),
@@ -3355,418 +3194,39 @@ impl FunctionGraph {
         (id, inputargs)
     }
 
-    /// Mint a fresh slot with `ConcreteType::Unknown` and hand back the
-    /// backing [`crate::flowspace::model::Variable`] directly.  Recover
-    /// the slot index via [`Self::slot_of`] when a `usize` carrier is
-    /// needed at a boundary.
+    /// Mint a fresh value [`crate::flowspace::model::Variable`] with
+    /// `ConcreteType::Unknown`.
     pub fn alloc_value_var(&mut self) -> crate::flowspace::model::Variable {
         self.alloc_value_var_with_type(ConcreteType::Unknown)
     }
 
-    /// Allocate a fresh slot with its [`ConcreteType`] stamped at
-    /// construction — pyre's analogue of upstream
-    /// `Variable(concretetype=...)` (RPython
-    /// `flowspace/model.py:Variable.__init__`).  Front-ends and the
-    /// rtyper should prefer this entry point so the per-value
-    /// kind never has to be back-filled via a second pass.
-    ///
-    /// Every freshly minted slot is paired with a backing
-    /// [`crate::flowspace::model::Variable`] (RPython parity:
-    /// `flowspace/model.py:280` — every IR slot is a `Variable`
-    /// instance).  The Variable's `concretetype` cell receives the
-    /// canonical `LowLevelType` representative for `ty` (see
-    /// [`concrete_to_canonical_lltype`]); a subsequent
-    /// [`Self::bind_variable_at`] from the rtyper handoff overrides
-    /// this synthetic type with the upstream-authoritative one.
+    /// Mint a fresh value [`crate::flowspace::model::Variable`] with its
+    /// [`ConcreteType`] stamped at construction — pyre's analogue of
+    /// upstream `Variable(concretetype=...)` (RPython
+    /// `flowspace/model.py:Variable.__init__`).  The Variable's
+    /// `concretetype` cell receives the canonical `LowLevelType`
+    /// representative for `ty` (see [`concrete_to_canonical_lltype`]);
+    /// the rtyper's `setconcretetype` later overrides it by writing the
+    /// authoritative type onto this same cell.
     pub fn alloc_value_var_with_type(
         &mut self,
         ty: ConcreteType,
     ) -> crate::flowspace::model::Variable {
-        let slot = self.next_value;
-        self.next_value += 1;
-        // Keep `value_variables` in lockstep with `next_value`.  Any
-        // gap means a downstream `concretetype(v)` would silently see
-        // `Unknown` — keep the invariant explicit.
-        debug_assert_eq!(
-            self.value_variables.len(),
-            slot,
-            "value_variables length must equal the next slot index ({} != {})",
-            self.value_variables.len(),
-            slot,
-        );
         let var = crate::flowspace::model::Variable::new();
         var.set_concretetype(concrete_to_canonical_lltype(ty));
-        self.variable_to_vid.insert(var.id(), slot);
-        self.value_variables.push(Some(var.clone()));
         var
     }
 
-    /// Read the backing [`crate::flowspace::model::Variable`] at the
-    /// given dense slot — pyre's bridge to RPython's Variable-keyed
-    /// IR. `None` for slots minted before the rtyper handoff or
-    /// jtransform synth values without a Variable backing.
-    pub fn variable_at(&self, idx: usize) -> Option<&crate::flowspace::model::Variable> {
-        self.value_variables.get(idx).and_then(|opt| opt.as_ref())
-    }
-
-    /// Slot-indexed lookup that panics when no backing Variable is
-    /// registered — for sites that have already guaranteed (via
-    /// rtyper handoff or jtransform synth) that the slot carries a
-    /// Variable. Performs the [`Self::variable_at`] lookup, panics
-    /// with a slot-projected diagnostic on miss, and clones the
-    /// backing Variable.
-    pub(crate) fn must_variable_at(&self, idx: usize) -> crate::flowspace::model::Variable {
-        self.variable_at(idx)
-            .unwrap_or_else(|| {
-                panic!(
-                    "must_variable: slot {} has no backing Variable on graph {:?}",
-                    idx, self.name,
-                )
-            })
-            .clone()
-    }
-
-    /// Bind an existing flowspace `Variable` to a previously-minted
-    /// dense slot — a test fixture primitive that installs a rtyper-typed
-    /// Variable's `concretetype` onto the placeholder at `idx`.  The
-    /// production rtyper hand-off
-    /// ([`crate::jit_codewriter::type_state::apply_from_flowspace_variables`])
-    /// writes `v.concretetype = T` straight onto the legacy graph
-    /// Variable carried by the identity-keyed `LegacyToTyped` map,
-    /// without routing through a slot.
-    ///
-    /// **RPython parity** — upstream `rtyper.setconcretetype(v)`
-    /// (`rpython/rtyper/rmodel.py:160`) performs `v.concretetype = T`
-    /// directly on the existing Variable.  Because Python attribute
-    /// writes propagate through every reference, the same write is
-    /// observed by `block.inputargs`, every `op.args` slot, and every
-    /// `link.args` entry that holds that Variable.  Pyre's
-    /// [`crate::flowspace::model::Variable::concretetype`] is wired as
-    /// `Rc<RefCell<…>>` for exactly that aliasing guarantee — so the
-    /// upstream-orthodox bind step is "copy the rtyper Variable's
-    /// concretetype into the existing placeholder's cell", not
-    /// "replace the slot".
-    ///
-    /// Replacing the slot would leave stale placeholders in
-    /// `Block.inputargs`, op operands, `Link.args`, `exitswitch`,
-    /// `last_exception`, and `last_exc_value` — Variable identity
-    /// matters downstream (regalloc keys colors on the Variable
-    /// pulled from `iter_variable_slots()` while flatten looks them up via
-    /// the block/op references), so a divergent identity surfaces as
-    /// missing colors.
-    #[cfg(test)]
-    pub(crate) fn bind_variable_at(&mut self, idx: usize, var: crate::flowspace::model::Variable) {
-        if idx >= self.value_variables.len() {
-            let old_len = self.value_variables.len();
-            self.value_variables.resize_with(idx + 1, || {
-                let placeholder = crate::flowspace::model::Variable::new();
-                Some(placeholder)
-            });
-            // Register only the placeholders that were just minted —
-            // pre-existing slots already have their `variable_to_vid`
-            // entry from the original allocation site, so the prior
-            // full-vec walk repeated O(n) work per resize call without
-            // changing any pre-existing mapping (the `entry().or_insert`
-            // shape made the rescan a no-op for older slots but still
-            // touched every slot every time).
-            for slot_idx in old_len..self.value_variables.len() {
-                if let Some(placeholder) = &self.value_variables[slot_idx] {
-                    self.variable_to_vid.insert(placeholder.id(), slot_idx);
-                }
-            }
-            // Keep the allocator cursor past any slot reserved here so
-            // a subsequent `alloc_value_var*()` lands on a fresh slot
-            // and the `value_variables.len() == next_value` invariant
-            // holds.
-            self.next_value = self.next_value.max(idx + 1);
-        }
-        match self.value_variables[idx].as_ref() {
-            Some(placeholder) if placeholder.id() != var.id() => {
-                // Mirror `v.concretetype = T` onto the existing
-                // placeholder's Rc-shared cell — every reference to
-                // the placeholder in `Block.inputargs`, op operands,
-                // `Link.args`, `exitswitch`, `last_exception`, and
-                // `last_exc_value` observes the new kind immediately.
-                if let Some(ct) = var.concretetype() {
-                    placeholder.set_concretetype(Some(ct));
-                }
-                // The placeholder identity remains authoritative; we
-                // also register the rtyper Variable's id so any
-                // downstream `slot_of(rtyper_var)` lookup still
-                // resolves to this slot.
-                self.variable_to_vid.insert(var.id(), idx);
-            }
-            _ => {
-                // No prior Variable for this slot — install the
-                // incoming one as the placeholder.
-                self.variable_to_vid.insert(var.id(), idx);
-                self.value_variables[idx] = Some(var);
-            }
-        }
-    }
-
-    /// Slot-indexed primitive — indexes `variable_to_vid` directly.
-    /// Canonical accessor: callers hand the index straight to
-    /// `value_variables` / `Block.inputargs`.
-    pub fn slot_of(&self, var: &crate::flowspace::model::Variable) -> Option<usize> {
-        self.variable_to_vid.get(&var.id()).copied()
-    }
-
-    /// LOOKUP-only slot bridge for an upstream `Variable` cell
-    /// (key = `Variable.id`).  Returns the slot previously
-    /// registered via `ensure_variable_registered_void` /
-    /// `ensure_variable_registered` / `bind_variable_at` at the Variable's
-    /// flowspace-side definition site (the matching pyre IR op result
-    /// or `Block.inputargs` slot, or a merge-phi minted by
-    /// `framestate.py:113-114 union`).
-    ///
-    /// Panics on miss.  Strict-parity rationale: upstream
-    /// `framestate.py:92-99 getoutputargs` carries a `Variable` object
-    /// into `Link.args`, and the Variable is by construction defined
-    /// somewhere upstream in the graph (as a `SpaceOperation.result`,
-    /// `Block.inputargs` entry, or a fresh `Variable()` minted by
-    /// `framestate.py:113-114 union` whose definition site is the
-    /// merge block's `inputargs`).  Pyre's `LinkArg::Value` has the
-    /// same precondition: every emitted slot must be "defined" —
-    /// i.e. produced by an op or bound as an inputarg — or downstream
-    /// consumers (annotator, rtyper, regalloc, backends) silently
-    /// drop the value (return `None` / `SomeValue::Impossible` / no
-    /// coloring).  Minting an unanchored slot here would convert
-    /// that silent drop into a strict-parity defect.
-    ///
-    /// The production mint paths that prime this table:
-    ///   - `ensure_variable_registered_void` — Variable-aware
-    ///     allocation, the canonical path for op results AND the
-    ///     fresh-phi mint site inside `FrameState::union`
-    ///     (`register_phi_variables_in_stack_exc`).  Both the
-    ///     `variable_to_vid` reverse index and the `value_variables`
-    ///     backing slot are written in a single call; idempotent
-    ///     re-call on an already-registered Variable leaves the
-    ///     existing slot intact without advancing the allocator cursor.
-    ///   - `bind_variable_at` — cfg(test) fixture hook that copies a
-    ///     typed Variable's `concretetype` onto an existing slot Variable.
-    ///
-    /// `ensure_variable_registered` is the cfg(test) slot-returning
-    /// form of the same allocator sequence, retained for fixtures
-    /// that need the freshly-minted slot id directly.
-    ///
-    /// Production callers route through [`Self::slot_of`] (returns
-    /// `Option<usize>`) instead; this panicking form is retained for
-    /// cfg(test) slot-shape assertions only.
-    #[cfg(test)]
-    pub fn bridge_variable(&self, v: &crate::flowspace::model::Variable) -> usize {
-        match self.variable_to_vid.get(&v.id()) {
-            Some(&slot) => slot,
-            None => panic!(
-                "bridge_variable: upstream Variable id={} has no registered slot on graph {:?}; \
-                 callers must invoke `ensure_variable_registered_void` / `ensure_variable_registered` \
-                 at the Variable's flowspace definition site (op result, block inputarg, or \
-                 merge-phi minted via framestate.py:113-114 union) before threading it through a \
-                 Link.args boundary",
-                v.id(),
-                self.name,
-            ),
-        }
-    }
-
-    /// Definition-site helper: idempotent lookup-or-allocate-and-register
-    /// for an upstream `Variable` whose paired graph slot is created right
-    /// now (no caller-supplied slot to honour).  Returns void; callers
-    /// recover the bound slot via [`Self::slot_of`].
-    ///
-    /// Use this at the **mint site** of a fresh Variable when the pyre
-    /// IR's slot is allocated alongside.  The two production mint
-    /// sites are:
-    ///   - `framestate.py:113-114 union` fresh phi Variables for the
-    ///     stack / exception projections of `FrameState::union`.  The
-    ///     allocated slot corresponds to the merge block's stack /
-    ///     exception inputarg at the matching position (materialised by
-    ///     the AST walker's merge-block construction).
-    ///   - Any future site that mints `Hlvalue::Variable(Variable::new())`
-    ///     as the result of a `SpaceOperation` and needs the pyre
-    ///     `OpKind`'s result slot to track the same identity.
-    ///
-    /// `slot_of` is the read side of the same table (`variable_to_vid`
-    /// lookup keyed on `Variable::id()`).  Re-call on the same Variable
-    /// is a no-op here without touching the allocator cursor — the early
-    /// return at the top of the body honors idempotence so a
-    /// carry-through Variable already registered at its upstream
-    /// definition site is left alone.
-    pub fn ensure_variable_registered_void(&mut self, v: &crate::flowspace::model::Variable) {
-        if self.variable_to_vid.contains_key(&v.id()) {
-            return;
-        }
-        let slot = self.next_value;
-        self.next_value += 1;
-        debug_assert_eq!(
-            self.value_variables.len(),
-            slot,
-            "value_variables length must equal the next slot index",
-        );
-        self.variable_to_vid.insert(v.id(), slot);
-        self.value_variables.push(Some(v.clone()));
-    }
-
-    /// Slot-returning form of [`Self::ensure_variable_registered_void`].
-    /// Retained for cfg(test) round-trip assertions that compare the
-    /// bound slot index across two calls; production sites use the void
-    /// sibling and recover the slot via [`Self::slot_of`].
-    #[cfg(test)]
-    pub fn ensure_variable_registered(&mut self, v: &crate::flowspace::model::Variable) -> usize {
-        self.ensure_variable_registered_void(v);
-        self.bridge_variable(v)
-    }
-
-    /// Walk a freshly-unioned stack + exception projection and register
-    /// every **fresh phi** `Hlvalue::Variable` cell with a slot
-    /// pairing.  Called from `FrameState::union` after
-    /// `flowspace::framestate::union_stack` / per-cell exception `union`
-    /// have produced the merged values but before `FrameState` is
-    /// returned to the caller.
-    ///
-    /// A merged `Variable` is treated as a **fresh phi** only when its
-    /// identity (`Variable::id`) does not match any `Variable` in the
-    /// corresponding `self` / `other` projection — i.e. the per-cell
-    /// `union` returned `Variable()` per `framestate.py:113-114`
-    /// (`flowspace::framestate::union` lines 374/382 for the
-    /// disagreeing-Variable and disagreeing-Constant arms).
-    /// Carry-through Variables (`framestate.py:108 if w1 == w2:
-    /// return w1`) keep one of the predecessor identities and are
-    /// already registered upstream at their definition site, so the
-    /// walk leaves them alone.
-    ///
-    /// The fresh-phi guard is critical: if an externally-minted
-    /// Variable enters one of the predecessors *without* having been
-    /// registered upstream, we must not silently mint a slot for
-    /// it here — that would advance the allocator cursor in a way
-    /// downstream codegen does not expect and surface as a slot
-    /// mismatch in cranelift / dynasm output.  Such Variables are
-    /// TODOs of the frontend's `last_exception`
-    /// flow and are left to their unregistered state; the future Z4
-    /// walker is responsible for registering them at their actual
-    /// definition site.
-    fn register_phi_variables_in_stack_exc(
-        &mut self,
-        self_stack: &[crate::flowspace::framestate::StackElem],
-        other_stack: &[crate::flowspace::framestate::StackElem],
-        merged_stack: &[crate::flowspace::framestate::StackElem],
-        self_exc: &Option<crate::flowspace::model::FSException>,
-        other_exc: &Option<crate::flowspace::model::FSException>,
-        merged_exc: &Option<crate::flowspace::model::FSException>,
-    ) {
-        use crate::flowspace::framestate::StackElem;
-        use crate::flowspace::model::{FSException, Hlvalue};
-
-        fn iter_variable_ids(
-            stack: &[StackElem],
-            exc: &Option<FSException>,
-        ) -> std::collections::HashSet<u64> {
-            let mut set = std::collections::HashSet::new();
-            for elem in stack {
-                match elem {
-                    StackElem::Value(Hlvalue::Variable(v)) => {
-                        set.insert(v.id());
-                    }
-                    StackElem::Value(Hlvalue::Constant(_)) => {}
-                    StackElem::Signal(s) => {
-                        for arg in s.args() {
-                            if let Hlvalue::Variable(v) = arg {
-                                set.insert(v.id());
-                            }
-                        }
-                    }
-                }
-            }
-            if let Some(e) = exc {
-                if let Hlvalue::Variable(v) = &e.w_type {
-                    set.insert(v.id());
-                }
-                if let Hlvalue::Variable(v) = &e.w_value {
-                    set.insert(v.id());
-                }
-            }
-            set
-        }
-
-        let pred_ids: std::collections::HashSet<u64> = iter_variable_ids(self_stack, self_exc)
-            .union(&iter_variable_ids(other_stack, other_exc))
-            .copied()
-            .collect();
-        let register_if_fresh =
-            |graph: &mut FunctionGraph, v: &crate::flowspace::model::Variable| {
-                if !pred_ids.contains(&v.id()) {
-                    graph.ensure_variable_registered_void(&v);
-                }
-            };
-        for elem in merged_stack {
-            match elem {
-                StackElem::Value(Hlvalue::Variable(v)) => register_if_fresh(self, v),
-                StackElem::Value(Hlvalue::Constant(_)) => {}
-                StackElem::Signal(s) => {
-                    for arg in s.args() {
-                        if let Hlvalue::Variable(v) = arg {
-                            register_if_fresh(self, &v);
-                        }
-                    }
-                }
-            }
-        }
-        if let Some(exc) = merged_exc {
-            if let Hlvalue::Variable(v) = &exc.w_type {
-                register_if_fresh(self, v);
-            }
-            if let Hlvalue::Variable(v) = &exc.w_value {
-                register_if_fresh(self, v);
-            }
-        }
-    }
-
-    /// `Variable.concretetype` getter — RPython's
-    /// `getkind(v.concretetype)` access pattern verbatim.  Reads
-    /// Reads the `Variable.concretetype` cell at slot `idx` straight
-    /// off the backing [`crate::flowspace::model::Variable`]'s inline
-    /// `concretetype` attribute; returns [`ConcreteType::Unknown`] when
-    /// no Variable is bound (caller bumped the slot allocator outside
-    /// the [`Self::alloc_value_var`] paths) or when the Variable's cell
-    /// is `None` (pre-rtyper window).  Use this when the caller already
-    /// holds the raw slot index (`compare_real_against_legacy`,
-    /// `concretetype_snapshot` iterators, etc.).
-    pub fn concretetype_at(&self, idx: usize) -> ConcreteType {
-        match self.value_variables.get(idx) {
-            Some(Some(var)) => Self::concretetype_of(var),
-            _ => ConcreteType::Unknown,
-        }
-    }
-
-    /// Variable-keyed mirror of [`Self::concretetype`] — reads the
-    /// `Variable.concretetype` cell directly without going through the
-    /// slot-indexed `value_variables` table.  RPython's resolver iterates
-    /// `Variable` instances directly (`rtyper.py:258 v.concretetype =
-    /// ...`); use this when the caller already holds a `&Variable`
-    /// (e.g. `OpKind::BinOp.lhs / .rhs`, `block.inputargs[i]`) to
-    /// skip the slot → Variable round-trip.
+    /// `Variable.concretetype` getter — reads the `Variable.concretetype`
+    /// cell directly.  RPython's resolver iterates `Variable` instances
+    /// directly (`rtyper.py:258 v.concretetype = ...`); use this when
+    /// the caller already holds a `&Variable` (e.g.
+    /// `OpKind::BinOp.lhs / .rhs`, `block.inputargs[i]`).
     pub fn concretetype_of(var: &crate::flowspace::model::Variable) -> ConcreteType {
         match var.concretetype.borrow().as_ref() {
             Some(lltype) => getkind(lltype),
             None => ConcreteType::Unknown,
         }
-    }
-
-    /// Snapshot every live slot's [`ConcreteType`] into a dense `Vec`
-    /// indexed by the dense slot index.  Used by passes that need to
-    /// borrow the kind table while mutating the graph
-    /// (`liveness::compute_liveness`, `assembler::Assembler::assemble`).
-    /// The snapshot reads each `Variable.concretetype` cell directly
-    /// from `value_variables`; the underlying source of truth is the
-    /// Variable's inline `concretetype` cell.
-    pub fn concretetype_snapshot(&self) -> Vec<ConcreteType> {
-        self.value_variables
-            .iter()
-            .map(|slot| match slot {
-                Some(var) => Self::concretetype_of(var),
-                None => ConcreteType::Unknown,
-            })
-            .collect()
     }
 
     /// Variable-direct kind-publication helper — writes through the
@@ -3785,30 +3245,6 @@ impl FunctionGraph {
         }
     }
 
-    /// Read-only view of the slot allocator cursor.  Used by passes
-    /// that need to mint fresh slots outside the graph (e.g.
-    /// `Transformer::allocate_synthetic_value` in `jtransform.rs`).
-    pub fn next_value(&self) -> usize {
-        self.next_value
-    }
-
-    /// Iterate every dense slot that has a backing
-    /// [`crate::flowspace::model::Variable`] on the graph, yielding
-    /// `(slot, &Variable)` pairs in cursor order.  Mirrors the
-    /// upstream RPython convention where regalloc / coloring passes
-    /// walk `Variable` instances directly — pyre's index-keyed
-    /// callers stay terse by routing through this single helper
-    /// instead of `0..next_value()` plus per-slot
-    /// `variable_at(slot)` re-checks.
-    pub fn iter_variable_slots(
-        &self,
-    ) -> impl Iterator<Item = (usize, &crate::flowspace::model::Variable)> {
-        self.value_variables
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, opt)| opt.as_ref().map(|var| (idx, var)))
-    }
-
     /// Walk the graph structure and collect every distinct
     /// [`crate::flowspace::model::Variable`] it references: block
     /// `inputargs`, operation operands
@@ -3816,14 +3252,12 @@ impl FunctionGraph {
     /// exception extravars, and the `exitswitch` condition.  Distinct by
     /// identity, in first-appearance order.
     ///
-    /// The Variable-direct counterpart to `iter_variable_slots()` for
-    /// passes that enumerate the graph's values and discard the dense
-    /// slot index (regalloc coloring, `Variable.annotation` reset /
-    /// commit).  Reads the value set straight off the IR rather than the
-    /// slot registry, so those passes are independent of
-    /// `value_variables`.  Values minted but never referenced are
-    /// naturally absent — every consumer filters such values out anyway
-    /// (`getcolor` returns `None`, `annotation` is empty).
+    /// The canonical value enumeration for passes that walk the graph's
+    /// values (regalloc coloring, `Variable.annotation` reset /
+    /// commit).  Reads the value set straight off the IR.  Values
+    /// minted but never referenced are naturally absent — every
+    /// consumer filters such values out anyway (`getcolor` returns
+    /// `None`, `annotation` is empty).
     pub fn iter_variables(&self) -> Vec<crate::flowspace::model::Variable> {
         use crate::flowspace::model::Variable;
         let mut seen: std::collections::HashSet<Variable> = std::collections::HashSet::new();
@@ -3867,43 +3301,9 @@ impl FunctionGraph {
         out
     }
 
-    /// Re-seat the slot allocator cursor.  Must be called after a
-    /// pass that synthesized values outside the graph so subsequent
-    /// `alloc_value_var()` calls do not collide.
-    pub fn set_next_value(&mut self, next: usize) {
-        debug_assert!(
-            next >= self.next_value,
-            "set_next_value must not walk the cursor backward: {} -> {}",
-            self.next_value,
-            next,
-        );
-        // Grow the Variable backing array to match the new cursor so
-        // the `value_variables.len() == next_value` invariant holds.
-        // Each synthesised slot gets a fresh `Variable::new()` whose
-        // `concretetype` cell is `None` — `concretetype()` returns
-        // `Unknown` for it until the rtyper / jtransform follows up
-        // with `set_concretetype` / `bind_variable_at`.
-        let starting_len = self.value_variables.len();
-        if next > starting_len {
-            self.value_variables
-                .resize_with(next, || Some(crate::flowspace::model::Variable::new()));
-            // Register every freshly-minted Variable in variable_to_vid
-            // so `slot_of` lookups against them succeed.  Tests that
-            // grow slots via `set_next_value` rely on this so any
-            // `slot_of(var)` projection succeeds.
-            for idx in starting_len..next {
-                if let Some(Some(var)) = self.value_variables.get(idx) {
-                    self.variable_to_vid.entry(var.id()).or_insert(idx);
-                }
-            }
-        }
-        self.next_value = next;
-    }
-
     /// Push an op whose fresh result `Variable` is minted in place
     /// when `has_result` is true; callers receive that `Variable`
-    /// directly without round-tripping through
-    /// `Option<usize>` + `must_variable_at`.
+    /// directly.
     pub fn push_op_var(
         &mut self,
         block: BlockId,
@@ -4429,30 +3829,45 @@ impl FunctionGraph {
     /// `Block.exits` — there is no upstream terminator variant that
     /// flags "this block raises".
     ///
-    /// Emits the same CFG shape as upstream: a Link to
-    /// `graph.exceptblock` with two fresh prevblock-side Variables
-    /// standing in for the `(etype, evalue)` pair.  The `_reason`
-    /// string is retained for optional GraphTransformNote annotations
-    /// (see `jtransform.rs::rewrite_graph`'s abort note); pass `""`
-    /// when not applicable.
+    /// Emits an unconditional Link to `graph.exceptblock` carrying the
+    /// `RaiseImplicit` `(w_type, w_value)` pair: the `AssertionError`
+    /// *class* Constant and a separate `AssertionError(msg)` *instance*
+    /// Constant (`flowcontext.py:1280-1282`).  The two slots are never
+    /// the same value — `w_value` is an exception instance, not the
+    /// class.  A bare raise with no concrete payload — a Rust
+    /// `UnwindResume` / `Abort` — has no source exception class, so
+    /// `exc_cls` is the upstream `else: Exception` default and the
+    /// instance message is the fixed `"implicit Exception shouldn't
+    /// occur"`.  Constants are always resolvable by the cutover adapter
+    /// (`flowspace_adapter.rs:1686 LinkArg::Const`), unlike the fresh
+    /// `alloc_value_var()` placeholders this previously emitted: those
+    /// had no producing operation and tripped the adapter's "undefined
+    /// operand as Link.args" invariant on every reachable raise block.
+    /// `last_exception` / `last_exc_value` extravars are not usable here:
+    /// `checkgraph` (`flowspace/model.rs:4693-4703`) permits them only
+    /// on the exception exits of a `canraise` block, not on this
+    /// unconditional single exit.
+    ///
+    /// The `_reason` string is retained for optional GraphTransformNote
+    /// annotations (see `jtransform.rs::rewrite_graph`'s abort note);
+    /// pass `""` when not applicable.
     ///
     /// Used only where no concrete exception payload is available at
     /// the raise site — the evaluated arguments path should call
     /// `set_raise_values` instead.
-    ///
-    /// The two minted Variables are defined by no block inputarg and
-    /// no op result, so the shape is checkgraph-illegal in flowspace
-    /// terms.  The flowspace adapter converts only the reachable block
-    /// closure, which makes the common producer (a predecessor-less
-    /// MIR unwind block whose inbound `on_unwind` edges were all
-    /// dropped at lowering) invisible downstream; a *reachable*
-    /// `set_raise` block still fails the adapter's operand-definedness
-    /// check and stays Skip-classified.
     pub fn set_raise(&mut self, block: BlockId, _reason: &str) {
+        use crate::flowspace::model::{HOST_ENV, HostObject};
         let exceptblock = self.exceptblock;
-        let etype_var = self.alloc_value_var();
-        let evalue_var = self.alloc_value_var();
-        self.set_goto(block, exceptblock, vec![etype_var, evalue_var]);
+        // w_type = Constant(AssertionError), w_value = Constant(AssertionError(msg)).
+        let etype = LinkArg::from(ConstValue::builtin("AssertionError"));
+        let cls = HOST_ENV
+            .lookup_builtin("AssertionError")
+            .unwrap_or_else(|| panic!("HOST_ENV missing builtin AssertionError"));
+        let message = ConstValue::byte_str("implicit Exception shouldn't occur");
+        let instance = HostObject::new_instance(cls, vec![message]);
+        let evalue = LinkArg::from(ConstValue::HostObject(instance));
+        let link = Link::new_mixed(vec![etype, evalue], exceptblock, None);
+        self.set_control_flow_metadata(block, None, vec![link]);
     }
 
     /// Terminate `block` with the implicit-exception raise shape of
@@ -4789,6 +4204,42 @@ mod tests {
     }
 
     #[test]
+    fn set_raise_routes_assertionerror_class_and_instance_to_exceptblock() {
+        use crate::flowspace::model::ConstValue;
+        let mut graph = FunctionGraph::new("demo");
+        let entry = graph.startblock;
+        graph.set_raise(entry, "");
+        // RaiseImplicit.nomoreblocks (flowcontext.py:1280-1282): the
+        // exceptblock Link carries the AssertionError *class* as w_type
+        // and a distinct AssertionError *instance* as w_value — never the
+        // class in both slots.
+        let entry_block = graph.block(entry);
+        assert_eq!(entry_block.exits.len(), 1);
+        let link = &entry_block.exits[0];
+        assert_eq!(link.target, graph.exceptblock);
+        assert_eq!(link.args.len(), 2);
+        let host_of = |arg: &LinkArg| match arg {
+            LinkArg::Const(c) => match &c.value {
+                ConstValue::HostObject(h) => h.clone(),
+                other => panic!("raise payload must be a HostObject Constant, got {other:?}"),
+            },
+            other => panic!("raise payload must be a Const link arg, got {other:?}"),
+        };
+        let w_type = host_of(&link.args[0]);
+        assert!(w_type.is_class(), "w_type must be the exception class");
+        assert!(w_type.qualname().contains("AssertionError"));
+        let w_value = host_of(&link.args[1]);
+        assert!(
+            w_value.is_instance(),
+            "w_value must be an exception instance, not the class"
+        );
+        assert_ne!(
+            link.args[0], link.args[1],
+            "exceptblock must not carry the same value in both slots"
+        );
+    }
+
+    #[test]
     fn recloseblock_preserves_existing_exitswitch() {
         let mut graph = FunctionGraph::new("demo");
         let entry = graph.startblock;
@@ -4836,23 +4287,23 @@ mod tests {
         // is None: return None" — a slot present in one predecessor
         // but missing in the other is killed (dropped) from the merged
         // state.  Pyre realises this via dense positional entries:
-        // the graph-wide first-bind order assigns slots [x=0,
-        // self_only=1, other_only=2]; `self` has slot 1 bound but slot
-        // 2 unbound, `other` has slot 2 bound but slot 1 unbound, so
-        // both one-sided slots collapse to None-kill at union.
+        // position 0 (`x`) is bound on both sides but with distinct
+        // Variable identities, position 1 (`self_only`) bound only on
+        // self, position 2 (`other_only`) bound only on other, so both
+        // one-sided slots collapse to None-kill at union.
         let mut graph = FunctionGraph::new("test");
+        let x_self = graph.alloc_value_var();
+        let self_only = graph.alloc_value_var();
+        let x_other = graph.alloc_value_var();
+        let other_only = graph.alloc_value_var();
         let self_state = FrameState {
-            entries: FrameState::entries_from_slots(&[Some(0), Some(1), None], &mut graph),
+            entries: vec![Some(x_self.clone()), Some(self_only), None],
             ..Default::default()
         };
         let other_state = FrameState {
-            entries: FrameState::entries_from_slots(&[Some(2), None, Some(3)], &mut graph),
+            entries: vec![Some(x_other.clone()), None, Some(other_only)],
             ..Default::default()
         };
-        // Reserve vid space past the test fixtures' hardcoded vids so
-        // a fresh allocation for the disagreement on slot 0 picks an
-        // id distinguishable from both predecessors.
-        graph.set_next_value(100);
         let merged = self_state.union(&other_state, &mut graph).expect(
             "test invariant: AST frontend union is total — entries domain has no \
              UnionError, vestigial stack/exc/blocklist/next_offset (framestate.py:78)",
@@ -4862,20 +4313,19 @@ mod tests {
             3,
             "merged state preserves positional length = max(len)"
         );
-        let surviving_slot = merged
-            .entry_slot(0, &graph)
+        let survivor = merged.entries[0]
+            .as_ref()
             .expect("slot 0 (x) is bound on both sides and must survive");
-        // Slot 0's predecessors disagreed on `value_id` (0 vs 2), so
-        // `union` allocated a fresh vid via `graph.alloc_value_var()`.
-        assert_ne!(surviving_slot, 0);
-        assert_ne!(surviving_slot, 2);
-        assert_eq!(surviving_slot, 100);
+        // Slot 0's predecessors disagreed on Variable identity, so
+        // `union` minted a fresh phi Variable distinct from both.
+        assert!(
+            *survivor != x_self && *survivor != x_other,
+            "disagreement must mint a fresh phi Variable distinct from both predecessors"
+        );
         // Slots 1 (`self_only`) and 2 (`other_only`) are bound on
         // exactly one side each, so both collapse to None-kill —
         // upstream `framestate.py:110-111` "if w1 or w2 is None: …
-        // return None" semantics.  Positional verification (slot
-        // index = name index per graph-wide first-bind order)
-        // replaces the prior name-string scan.
+        // return None" semantics.
         assert!(
             merged.entries[1].is_none() && merged.entries[2].is_none(),
             "one-sided slots must be None-killed positionally"
@@ -5218,81 +4668,11 @@ mod tests {
         );
     }
 
-    /// `bridge_variable` returns the previously-registered slot
-    /// for a Variable identity; cloning preserves identity
-    /// (id-sharing semantics in `flowspace::model::Variable::clone`)
-    /// so a clone resolves to the same slot.
-    #[test]
-    fn bridge_variable_resolves_registered_variable_to_paired_valueid() {
-        use crate::flowspace::model::Variable;
-        let mut graph = FunctionGraph::new("demo");
-        let v = Variable::new();
-        let vid = graph.ensure_variable_registered(&v);
-        assert_eq!(graph.bridge_variable(&v), vid);
-        let v_clone = v.clone();
-        assert_eq!(graph.bridge_variable(&v_clone), vid);
-    }
-
-    /// Distinct upstream `Variable`s register to distinct slots
-    /// via `ensure_variable_registered`'s allocator-advancing fast
-    /// path on first call.
-    #[test]
-    fn bridge_variable_distinct_registered_variables_resolve_distinct_vids() {
-        use crate::flowspace::model::Variable;
-        let mut graph = FunctionGraph::new("demo");
-        let v1 = Variable::new();
-        let v2 = Variable::new();
-        let vid1 = graph.ensure_variable_registered(&v1);
-        let vid2 = graph.ensure_variable_registered(&v2);
-        assert_ne!(vid1, vid2);
-        assert_eq!(graph.bridge_variable(&v1), vid1);
-        assert_eq!(graph.bridge_variable(&v2), vid2);
-    }
-
-    /// `bridge_variable` panics when the Variable identity has no
-    /// registered slot — strict-parity tripwire.  Callers must
-    /// register at the Variable's definition site (op result, block
-    /// inputarg, or fresh-phi mint) before crossing a Link.args
-    /// boundary.
-    #[test]
-    #[should_panic(expected = "bridge_variable: upstream Variable")]
-    fn bridge_variable_panics_on_unregistered_variable() {
-        use crate::flowspace::model::Variable;
-        let graph = FunctionGraph::new("demo");
-        let v = Variable::new();
-        let _ = graph.bridge_variable(&v);
-    }
-
-    /// `ensure_variable_registered` is idempotent on the same Variable
-    /// identity (returns the existing slot without allocating) and mints
-    /// a fresh slot only on first call.
-    #[test]
-    fn ensure_variable_registered_is_idempotent_lookup_or_alloc() {
-        use crate::flowspace::model::Variable;
-        let mut graph = FunctionGraph::new("demo");
-        let cursor_before = graph.next_value();
-        let v = Variable::new();
-        let vid1 = graph.ensure_variable_registered(&v);
-        let cursor_after_first = graph.next_value();
-        assert_eq!(
-            cursor_after_first,
-            cursor_before + 1,
-            "first call must advance the value cursor",
-        );
-        let vid2 = graph.ensure_variable_registered(&v);
-        assert_eq!(vid1, vid2);
-        assert_eq!(graph.next_value(), cursor_after_first);
-        assert_eq!(graph.bridge_variable(&v), vid1);
-    }
-
-    /// `FrameState::union` walks the merged stack and registers every
-    /// `Hlvalue::Variable` cell so the merged FrameState satisfies the
-    /// Hlvalue→slot bridge contract when it later becomes a
-    /// predecessor of another merge.  The disagreement at stack slot 0
-    /// (Variable vs Variable with distinct identities) yields a fresh
-    /// phi Variable per `framestate.py:113-114 return Variable()`; that
-    /// fresh identity is paired with a freshly-allocated slot via
-    /// `register_phi_variables_in_stack_exc`.
+    /// `FrameState::union` walks the merged stack.  The disagreement at
+    /// stack slot 0 (Variable vs Variable with distinct identities)
+    /// yields a fresh phi Variable per `framestate.py:113-114 return
+    /// Variable()`; that fresh identity is distinct from both
+    /// predecessors.
     #[test]
     fn union_registers_fresh_stack_phi_variable_with_valueid() {
         use crate::flowspace::framestate::StackElem;
@@ -5301,17 +4681,15 @@ mod tests {
         let mut graph = FunctionGraph::new("union_stack_phi");
         let v_a = Variable::new();
         let v_b = Variable::new();
-        let a_vid = graph.ensure_variable_registered(&v_a);
-        let b_vid = graph.ensure_variable_registered(&v_b);
 
         let pred_a = FrameState {
             entries: Vec::new(),
-            stack: vec![StackElem::Value(Hlvalue::Variable(v_a))],
+            stack: vec![StackElem::Value(Hlvalue::Variable(v_a.clone()))],
             ..Default::default()
         };
         let pred_b = FrameState {
             entries: Vec::new(),
-            stack: vec![StackElem::Value(Hlvalue::Variable(v_b))],
+            stack: vec![StackElem::Value(Hlvalue::Variable(v_b.clone()))],
             ..Default::default()
         };
 
@@ -5321,17 +4699,16 @@ mod tests {
         let StackElem::Value(Hlvalue::Variable(phi)) = &merged.stack[0] else {
             panic!("disagreement must mint a fresh phi Variable");
         };
-        let phi_slot = graph
-            .slot_of(phi)
-            .expect("fresh phi Variable must have a registered slot after union");
-        assert_ne!(phi_slot, a_vid);
-        assert_ne!(phi_slot, b_vid);
+        assert!(
+            *phi != v_a && *phi != v_b,
+            "fresh phi Variable must be distinct from both predecessors after union"
+        );
     }
 
     /// Carry-through stack Variable (identical Hlvalue identity on both
-    /// predecessors) is re-bound to its existing slot without
-    /// touching the allocator cursor — `framestate.py:108 if w1 == w2:
-    /// return w1` parity for the registration walk.
+    /// predecessors) carries through to the same Variable handle without
+    /// minting a fresh phi — `framestate.py:108 if w1 == w2: return w1`
+    /// parity.
     #[test]
     fn union_stack_carry_through_variable_keeps_existing_valueid() {
         use crate::flowspace::framestate::StackElem;
@@ -5339,7 +4716,6 @@ mod tests {
 
         let mut graph = FunctionGraph::new("union_stack_carry");
         let shared = Variable::new();
-        let shared_vid = graph.ensure_variable_registered(&shared);
 
         let pred_a = FrameState {
             entries: Vec::new(),
@@ -5352,19 +4728,16 @@ mod tests {
             ..Default::default()
         };
 
-        let cursor_before = graph.next_value();
         let merged = pred_a
             .union(&pred_b, &mut graph)
             .expect("carry-through union must succeed");
-        assert_eq!(
-            graph.next_value(),
-            cursor_before,
-            "carry-through must not advance the value cursor",
-        );
         let StackElem::Value(Hlvalue::Variable(carried)) = &merged.stack[0] else {
             panic!("Variable carry-through expected");
         };
-        assert_eq!(graph.slot_of(carried), Some(shared_vid));
+        assert_eq!(
+            carried, &shared,
+            "carry-through must reuse the shared Variable identity"
+        );
     }
 
     /// `FSException` projections route through the same registration
@@ -5379,15 +4752,12 @@ mod tests {
         let v_t2 = Variable::new();
         let v_v1 = Variable::new();
         let v_v2 = Variable::new();
-        for v in [&v_t1, &v_t2, &v_v1, &v_v2] {
-            graph.ensure_variable_registered_void(&v);
-        }
         let pred_a = FrameState {
             entries: Vec::new(),
             stack: Vec::new(),
             last_exception: Some(FSException::new(
-                Hlvalue::Variable(v_t1),
-                Hlvalue::Variable(v_v1),
+                Hlvalue::Variable(v_t1.clone()),
+                Hlvalue::Variable(v_v1.clone()),
             )),
             ..Default::default()
         };
@@ -5395,8 +4765,8 @@ mod tests {
             entries: Vec::new(),
             stack: Vec::new(),
             last_exception: Some(FSException::new(
-                Hlvalue::Variable(v_t2),
-                Hlvalue::Variable(v_v2),
+                Hlvalue::Variable(v_t2.clone()),
+                Hlvalue::Variable(v_v2.clone()),
             )),
             ..Default::default()
         };
@@ -5414,8 +4784,14 @@ mod tests {
         let Hlvalue::Variable(v_v_phi) = &exc.w_value else {
             panic!("w_value phi expected");
         };
-        assert!(graph.slot_of(v_t_phi).is_some());
-        assert!(graph.slot_of(v_v_phi).is_some());
+        assert!(
+            *v_t_phi != v_t1 && *v_t_phi != v_t2,
+            "w_type disagreement must mint a fresh phi Variable"
+        );
+        assert!(
+            *v_v_phi != v_v1 && *v_v_phi != v_v2,
+            "w_value disagreement must mint a fresh phi Variable"
+        );
     }
 
     /// `FrameState::union` derives the parallel
@@ -5430,9 +4806,6 @@ mod tests {
         let v_shared = Variable::new();
         let v_a_only = Variable::new();
         let v_b_only = Variable::new();
-        graph.ensure_variable_registered_void(&v_shared);
-        graph.ensure_variable_registered_void(&v_a_only);
-        graph.ensure_variable_registered_void(&v_b_only);
 
         let pred_a = FrameState {
             entries: vec![Some(v_shared.clone()), Some(v_a_only.clone()), None],
@@ -5485,8 +4858,6 @@ mod tests {
 
         let v_local = Variable::new();
         let v_stack = Variable::new();
-        graph.ensure_variable_registered_void(&v_local);
-        graph.ensure_variable_registered_void(&v_stack);
 
         let pred_state = FrameState {
             entries: vec![Some(v_local.clone())],
@@ -5498,14 +4869,9 @@ mod tests {
         };
         // Construct a target FrameState whose mergeable projection
         // demands all three cells via `Variable` placeholders (locals
-        // slot is Some, stack cells are Hlvalue::Variable).  Stack
-        // Variables are registered up front so the framestate-driven
-        // merge block construction can pair Variable identity with the
-        // graph's slot table.
+        // slot is Some, stack cells are Hlvalue::Variable).
         let v_target_stack_0 = Variable::new();
         let v_target_stack_1 = Variable::new();
-        graph.ensure_variable_registered_void(&v_target_stack_0);
-        graph.ensure_variable_registered_void(&v_target_stack_1);
         let target_state = FrameState {
             entries: vec![Some(v_local.clone())],
             stack: vec![
@@ -5554,7 +4920,6 @@ mod tests {
         // Target block created without inputargs — empty inputargs vec.
         let target = graph.create_block();
         let v_local = Variable::new();
-        graph.ensure_variable_registered_void(&v_local);
         let pred_state = FrameState {
             entries: vec![Some(v_local.clone())],
             ..Default::default()
@@ -5577,7 +4942,6 @@ mod tests {
         let mut graph = FunctionGraph::new("ensure_var_idempotent_input");
         let block = graph.create_block();
         let v = Variable::new();
-        graph.ensure_variable_registered_void(&v);
         graph.block_mut(block).inputargs.push(v.clone());
 
         let inputargs_before = graph.block(block).inputargs.len();
@@ -5630,7 +4994,6 @@ mod tests {
         let mut graph = FunctionGraph::new("ensure_var_orphan");
         let orphan = graph.create_block();
         let v = Variable::new();
-        graph.ensure_variable_registered_void(&v);
         let ok = graph.ensure_variable_at_block(orphan, &v);
         assert!(!ok, "no predecessors + not defined => fails (no threading)");
         assert!(
@@ -5651,7 +5014,6 @@ mod tests {
         let pred = graph.create_block();
         let target = graph.create_block();
         let v = Variable::new();
-        graph.ensure_variable_registered_void(&v);
         // Define v in pred via an Input op result.
         let _ = graph.push_op_var(
             pred,
@@ -5697,7 +5059,6 @@ mod tests {
         let mid = graph.create_block();
         let leaf = graph.create_block();
         let v = Variable::new();
-        graph.ensure_variable_registered_void(&v);
         let _ = graph.push_op_var(
             root,
             OpKind::Input {
@@ -5744,7 +5105,6 @@ mod tests {
         let header = graph.create_block();
         let body_tail = graph.create_block();
         let v = Variable::new();
-        graph.ensure_variable_registered_void(&v);
         let _ = graph.push_op_var(
             entry,
             OpKind::Input {
@@ -5796,15 +5156,11 @@ mod tests {
         use crate::flowspace::framestate::StackElem;
         use crate::flowspace::model::{Constant, FSException, Hlvalue, Variable};
 
-        let mut graph = FunctionGraph::new("getvariables_shape");
+        let graph = FunctionGraph::new("getvariables_shape");
         let v_local = Variable::new();
         let v_stack = Variable::new();
         let v_exc_type = Variable::new();
         let v_exc_value = Variable::new();
-        graph.ensure_variable_registered_void(&v_local);
-        graph.ensure_variable_registered_void(&v_stack);
-        graph.ensure_variable_registered_void(&v_exc_type);
-        graph.ensure_variable_registered_void(&v_exc_value);
 
         let fs = FrameState {
             entries: vec![Some(v_local.clone()), None],
@@ -5837,8 +5193,8 @@ mod tests {
     /// `create_block_from_framestate` materialises the merge block
     /// shape that `flowcontext.py:38 SpamBlock(framestate)` builds —
     /// `block.inputargs = framestate.getvariables()`, attached
-    /// `block.framestate = framestate`.  Inputarg Variables project
-    /// back to dense slot indices via `graph.slot_of`.
+    /// `block.framestate = framestate`.  Inputarg Variables carry the
+    /// framestate's Variable identities directly.
     #[test]
     fn create_block_from_framestate_sets_inputargs_and_attaches_state() {
         use crate::flowspace::framestate::StackElem;
@@ -5847,8 +5203,6 @@ mod tests {
         let mut graph = FunctionGraph::new("spamblock_shape");
         let v_local = Variable::new();
         let v_stack = Variable::new();
-        graph.ensure_variable_registered_void(&v_local);
-        graph.ensure_variable_registered_void(&v_stack);
 
         let fs = FrameState {
             entries: vec![Some(v_local.clone())],
@@ -5868,8 +5222,8 @@ mod tests {
             block.framestate.is_some(),
             "block.framestate stamped (SpamBlock parity)"
         );
-        assert_eq!(graph.slot_of(&block.inputargs[0]), graph.slot_of(&v_local));
-        assert_eq!(graph.slot_of(&block.inputargs[1]), graph.slot_of(&v_stack));
+        assert_eq!(&block.inputargs[0], &v_local);
+        assert_eq!(&block.inputargs[1], &v_stack);
     }
 
     /// The critical round-trip invariant: predecessor's
@@ -5887,8 +5241,6 @@ mod tests {
         let mut graph = FunctionGraph::new("mergeable_round_trip");
         let v_a = Variable::new();
         let v_b = Variable::new();
-        graph.ensure_variable_registered_void(&v_a);
-        graph.ensure_variable_registered_void(&v_b);
 
         // Two predecessors disagreeing on stack slot 0 (Variable phi)
         // and on exception (Variable phi); locals agree on v_a.
@@ -5896,9 +5248,6 @@ mod tests {
         let v_t2 = Variable::new();
         let v_v1 = Variable::new();
         let v_v2 = Variable::new();
-        for v in [&v_t1, &v_t2, &v_v1, &v_v2] {
-            graph.ensure_variable_registered_void(&v);
-        }
         let pred_a = FrameState {
             entries: vec![Some(v_a.clone())],
             stack: vec![

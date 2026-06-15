@@ -572,9 +572,51 @@ fn derive_program_metadata(
                     std::collections::HashMap::new();
                 for v in variants {
                     let variant_path = format!("{name}::{}", v.name);
-                    known_struct_names.insert(variant_path);
+                    known_struct_names.insert(variant_path.clone());
                     if let Some(d) = v.discriminant_i64() {
                         by_discr.insert(d, v.name.clone());
+                    }
+                    // Register the variant's payload fields as forced
+                    // class attributes, keyed by the crate-stripped variant
+                    // path — the enum-variant analog of the struct branch
+                    // above.  A `match e { V { f } => use(f) }` arm narrows
+                    // the scrutinee to the variant subclass; this gives that
+                    // subclass classdef the `f` attribute so
+                    // `getattr(narrowed, "f")` resolves through the same
+                    // `_init_classdef` forced-attribute path structs use.
+                    //
+                    // CONVERGENCE (E0c, not yet wired): `_init_classdef`
+                    // looks up forced attrs by the variant class qualname,
+                    // but `bookkeeper.rs::intern_enum_class` currently mints
+                    // that class under the *bare* leaf (`v.name`), not this
+                    // qualified `strip_crate_prefix(variant_path)` spelling
+                    // — so these attrs do not attach yet.  The enum classdef
+                    // path is also unconsumed: nothing calls
+                    // `set_pyre_enum_variants_by_discriminant`, and
+                    // `derive_subject_inputcells`
+                    // (`flowspace_adapter.rs`) seeds only
+                    // `getuniqueclassdef_for_struct_root`.  Wiring it means
+                    // (a) interning the variant class under this same
+                    // qualified spelling so it matches this key and stays
+                    // collision-distinct across enums sharing a leaf —
+                    // approaching `classdesc.py:679`
+                    // `FORCE_ATTRIBUTES_INTO_CLASSES`'s class-object
+                    // identity key — and (b) seeding
+                    // `getuniqueclassdef_for_enum_root` for enum-typed `Ref`
+                    // receivers, landed together with the E2 match-narrowing
+                    // consumer.
+                    let variant_attr_rows: Vec<(String, ValueType)> = v
+                        .fields
+                        .iter()
+                        .enumerate()
+                        .map(|(i, f)| {
+                            let fname = f.name.clone().unwrap_or_else(|| format!("__pos_{i}"));
+                            (fname, tyref_to_attr_value_type(&f.ty, llbc))
+                        })
+                        .collect();
+                    if !variant_attr_rows.is_empty() {
+                        struct_field_attrs
+                            .insert(strip_crate_prefix(&variant_path), variant_attr_rows);
                     }
                 }
                 if !by_discr.is_empty() {

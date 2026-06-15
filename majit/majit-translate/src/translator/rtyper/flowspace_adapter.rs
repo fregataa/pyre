@@ -31,13 +31,12 @@
 //! The adapter performs three responsibilities, all line-by-line at
 //! `function_graph_to_flowspace`:
 //!
-//! 1. **Annotation lift** — clone pyre's
-//!    `graph.variable_at(vid.0).annotation` cells (`Rc<RefCell<Option<Rc<SomeValue>>>>`,
-//!    `Variable.annotation` analogue) onto freshly-allocated
-//!    `flowspace::Variable`s. Variable identity is block-local per
-//!    `flowspace/model.py:checkgraph`; the adapter keeps a
-//!    `slot → Variable` representative map for post-specialize
-//!    readback.
+//! 1. **Annotation lift** — clone each legacy `Variable.annotation`
+//!    cell (`Rc<RefCell<Option<Rc<SomeValue>>>>`) onto a
+//!    freshly-allocated `flowspace::Variable`. Variable identity is
+//!    block-local per `flowspace/model.py:checkgraph`; the adapter
+//!    keeps a `legacy Variable → typed Variable` representative map
+//!    (keyed on Variable object identity) for post-specialize readback.
 //! 2. **Per-OpKind translation** — `translate_op` maps each pyre
 //!    `model::SpaceOperation` to a `flowspace::SpaceOperation` over
 //!    `Hlvalue` operands.  Pre-rtyper variants (`Input`, `ConstInt`,
@@ -55,8 +54,9 @@
 //!
 //! [`crate::translator::rtyper::cutover::specialize_legacy_graph_with_registry_returning_value_to_var`]
 //! drives this adapter, runs `RPythonTyper::specialize`, and returns
-//! the per-slot `Variable` map + per-slot `Constant.concretetype`
-//! `LowLevelType` table that consumers project to `ConcreteType` on demand.
+//! the legacy-`Variable`-keyed typed-`Variable` map + the per-`Variable`
+//! `Constant.concretetype` `LowLevelType` table that consumers project to
+//! `ConcreteType` on demand.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -81,7 +81,7 @@ use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
 /// graph Variable's object identity** (RPython keys cross-graph dicts on
 /// Variable objects, never on an integer slot): `legacy_var -> typed_var`
 /// lets consumers read `typed_var.concretetype` / `.annotation` back onto
-/// the legacy Variable they already hold, without a `slot_of` round-trip.
+/// the legacy Variable they already hold, with no slot-index round-trip.
 pub type LegacyToTyped = HashMap<Variable, Variable>;
 
 pub use crate::jit_codewriter::annotation_state::valuetype_to_someshell;
@@ -149,15 +149,16 @@ fn seed_variable(legacy_var: &Variable) -> Variable {
 ///    inputarg context (rarely but legitimately in legacy graphs).
 ///    Seeded for the same reason.
 ///
-/// Each slot is seeded exactly once via `entry().or_insert_with`,
-/// preserving operand identity across multiple readers — the op
-/// translator looks up the same Variable instance for every reader of a
-/// given slot, matching upstream Python's reference semantics where
-/// `op.args[i]` and `op2.args[j]` may be the same `Variable` object.
+/// Each legacy Variable is seeded exactly once via
+/// `entry().or_insert_with`, preserving operand identity across
+/// multiple readers — the op translator looks up the same Variable
+/// instance for every reader of a given operand, matching upstream
+/// Python's reference semantics where `op.args[i]` and `op2.args[j]`
+/// may be the same `Variable` object.
 ///
 /// **Restricted to the adapter / its tests.**  `function_graph_to_flowspace`
-/// builds a *block-local* `slot -> Variable` map per block in the
-/// topology assembly pass, mirroring `RPython` `checkgraph`'s
+/// builds a *block-local* `legacy Variable -> typed Variable` map per
+/// block in the topology assembly pass, mirroring `RPython` `checkgraph`'s
 /// per-block Variable invariant
 /// (`rpython/flowspace/model.py:585-590`: a Variable must be defined in
 /// exactly one block).  Using this whole-graph helper as the source of
@@ -218,7 +219,7 @@ pub(crate) fn build_value_to_variable_map(legacy: &FunctionGraph) -> LegacyToTyp
         // "variable used before definition" at the consumer's arg
         // slot, NOT at the missing-operand site.  Skipping the seed
         // here forces the first consumer's `lookup_operand` to fail
-        // with "undefined operand ValueId" instead (`is_known_unported`
+        // with "undefined operand" instead (`is_known_unported`
         // already matches that substring; the dual gate Skip-classifies
         // the graph cleanly at the producer-adjacent site).
         for op in &block.operations {
@@ -267,46 +268,40 @@ pub(crate) fn build_value_to_variable_map(legacy: &FunctionGraph) -> LegacyToTyp
     map
 }
 
-/// `slot → Hlvalue` map combining the [`LegacyToTyped`] map with
-/// constant-inlining of `OpKind::ConstInt` / `ConstFloat` define-ops.
+/// result-`Variable` → `Hlvalue` map combining the [`LegacyToTyped`]
+/// map with constant-inlining of `OpKind::ConstInt` / `ConstFloat`
+/// define-ops.
 ///
 /// RPython's flowspace inlines constants natively as `Hlvalue::Constant`
 /// in `op.args` (`flowspace/operation.py:152` `simple_call(target,
 /// *args)` — `target` and each `arg` is either a `Variable` or
 /// `Constant`). Pyre's legacy graph splits constants into define-ops
-/// (`OpKind::ConstInt(n)` produces a fresh slot consumed
-/// elsewhere). The adapter must recombine: every slot defined as a
-/// const becomes a `Hlvalue::Constant`; every other defined slot
+/// (`OpKind::ConstInt(n)` produces a fresh result consumed
+/// elsewhere). The adapter must recombine: every result defined as a
+/// const becomes a `Hlvalue::Constant`; every other defined result
 /// remains a `Hlvalue::Variable` from the variable map.
 ///
 /// Constants are wrapped with their low-level concretetype attached,
-/// matching RPython's `Constant.concretetype` shape. The legacy graph
-/// used a separate slot for the define-op; after inlining, that
-/// slot is tracked separately for readback.
+/// matching RPython's `Constant.concretetype` shape.
 ///
 /// Test-only: production const-inlining is carried by the `value_map`
-/// / `value_to_var` Variable-keyed path; this slot-keyed
-/// (`HashMap<usize, Hlvalue>`) builder survives solely as the mirror
-/// the `build_value_to_hlvalue_map_inlines_const_defines` fixture
-/// diffs against, so it is gated `#[cfg(test)]` to keep the production
-/// surface free of the slot namespace (`slot_of`).
+/// / `value_to_var` Variable-keyed path; this result-Variable-keyed
+/// builder survives solely as the mirror the
+/// `build_value_to_hlvalue_map_inlines_const_defines` fixture diffs
+/// against, so it is gated `#[cfg(test)]`.
 #[cfg(test)]
 pub fn build_value_to_hlvalue_map(
     legacy: &FunctionGraph,
     value_to_var: &LegacyToTyped,
-) -> HashMap<usize, Hlvalue> {
-    let mut map: HashMap<usize, Hlvalue> = value_to_var
+) -> HashMap<crate::flowspace::model::Variable, Hlvalue> {
+    let mut map: HashMap<crate::flowspace::model::Variable, Hlvalue> = value_to_var
         .iter()
-        .filter_map(|(legacy_var, var)| {
-            legacy
-                .slot_of(legacy_var)
-                .map(|idx| (idx, Hlvalue::Variable(var.clone())))
-        })
+        .map(|(legacy_var, var)| (legacy_var.clone(), Hlvalue::Variable(var.clone())))
         .collect();
 
     for block in &legacy.blocks {
         for op in &block.operations {
-            let Some(result) = op.result.as_ref().and_then(|v| legacy.slot_of(v)) else {
+            let Some(result) = op.result.clone() else {
                 continue;
             };
             match &op.kind {
@@ -379,18 +374,18 @@ fn const_ref_gcref_constant(addr: Option<i64>) -> Constant {
     Constant::with_concretetype(ConstValue::LLPtr(Box::new(p)), GCREF.clone())
 }
 
-/// Look up the `Hlvalue` for a slot operand. Surfaces a
+/// Look up the `Hlvalue` for an operand `Variable`. Surfaces a
 /// fail-loud `TyperError` when the operand is undefined (every
-/// referenced slot must have been seeded by
+/// referenced operand `Variable` must have been seeded by
 /// [`build_value_to_variable_map`] or shadowed by
 /// `build_value_to_hlvalue_map`'s const inlining).
 ///
 /// The error message embeds the enclosing `SpaceOperation` (variant
-/// name + result slot) and the role of the failing argument (e.g.
+/// name + result `Variable`) and the role of the failing argument (e.g.
 /// `"lhs"`, `"rhs"`, `"base"`, `"index"`, `"value"`, `"operand"`,
 /// `"args[i]"`, `"result"`) so per-graph diagnosis can locate the
 /// broken op without re-traversing the graph. The required substring
-/// `"undefined operand slot"` is preserved verbatim so the dual
+/// `"undefined operand"` is preserved verbatim so the dual
 /// gate's `is_known_unported` predicate (`cutover.rs:441`) keeps
 /// matching this category.
 fn lookup_operand(
@@ -405,7 +400,7 @@ fn lookup_operand(
             None => "None".to_string(),
         };
         TyperError::message(format!(
-            "translate_op: undefined operand slot {operand:?} as {arg_role} of {opkind} \
+            "translate_op: undefined operand {operand:?} as {arg_role} of {opkind} \
              (result {result_label}) — adapter invariant broken (every referenced \
              operand must be defined as a block inputarg or op result)",
             opkind = opkind_variant_name(&op.kind),
@@ -800,7 +795,7 @@ pub fn translate_op(
         //       consume it; for those, the absent translate output
         //       leaves the result_var unmapped in `value_to_var`,
         //       and the first consumer surfaces a fail-loud
-        //       "undefined operand ValueId" message that
+        //       "undefined operand" message that
         //       `is_known_unported` classifies as Skip — same
         //       outcome as the prior "post-rtyper jtransform
         //       variant" Skip, just at a more localised site.
@@ -1725,7 +1720,7 @@ fn post_rtyper_jtransform_variant_name(kind: &OpKind) -> Option<&'static str> {
 /// Output of [`function_graph_to_flowspace`] — the assembled
 /// `flowspace::FunctionGraph` plus enough side tables for
 /// `specialize_legacy_graph` to drive `RPythonTyper::specialize`
-/// against pyre's annotator surface and read back per-slot
+/// against pyre's annotator surface and read back per-`Variable`
 /// concretetypes.
 #[derive(Debug)]
 pub struct FlowspaceAdapterOutput {
@@ -1904,10 +1899,10 @@ fn legacy_const_define_hlvalue(op: &SpaceOperation) -> Option<Hlvalue> {
 /// `source_block_id` / `target_block_id` / `arg_index` carry the
 /// surrounding context for fail-loud diagnostics — when the lookup
 /// misses, the message embeds the predecessor and successor block ids
-/// plus the slot index in `Link.args`, so per-graph diagnosis can
+/// plus the `arg_index` into `Link.args`, so per-graph diagnosis can
 /// locate the broken link without re-traversing the graph.  Mirrors
 /// the role-bearing enrichment of `lookup_operand` (variant name +
-/// arg role).  The required substring `"undefined operand slot"`
+/// arg role).  The required substring `"undefined operand"`
 /// is preserved verbatim for `is_known_unported`
 /// (`cutover.rs:441`).
 fn link_arg_to_hlvalue(
@@ -1925,7 +1920,7 @@ fn link_arg_to_hlvalue(
         LinkArg::Const(cv) => Ok(Hlvalue::Constant(cv.clone())),
         LinkArg::Value(var) => value_map.get(var).cloned().ok_or_else(|| {
             TyperError::message(format!(
-                "translate_op: undefined operand slot {var:?} as Link.args[{arg_index}] entry \
+                "translate_op: undefined operand {var:?} as Link.args[{arg_index}] entry \
                  (source block {source_block_id:?} -> target block {target_block_id:?}) — \
                  adapter invariant broken (every referenced operand must be \
                  defined as a block inputarg or op result)",
@@ -2131,10 +2126,10 @@ pub(crate) fn derive_subject_inputcells(
 /// `on_unwind` cleanup blocks in the graph: `lower_call` / `Drop` /
 /// `Assert` forward past the Rust panic-table unwind edge
 /// (`front::mir`), and the orphan cleanup block is closed by `set_raise`
-/// with fresh, never-defined `etype`/`evalue` placeholders
-/// (`model.rs::set_raise`).  Without this prune those orphan operands
-/// reach [`link_arg_to_hlvalue`] and trip the "undefined operand slot"
-/// invariant even though the block can never execute.  The `Block.dead`
+/// (`model.rs::set_raise`).  `remove_dead_blocks` drops it before rtyping,
+/// exactly as RPython annotates only the startblock-reachable closure;
+/// without this prune the orphan block would be rtyped even though it can
+/// never execute.  The `Block.dead`
 /// flag covers only the framestate path's explicit marking
 /// (`mir.rs::lower_framestate`); startblock reachability is the general
 /// case the `dead` skip sites below also honour.
@@ -2520,7 +2515,7 @@ pub fn function_graph_to_flowspace(
             // would leave the consumer's flowspace arg referencing a
             // never-defined Variable.  Letting `lookup_operand` fail
             // at the first consumer surfaces the orthodox
-            // "undefined operand ValueId" message that
+            // "undefined operand" message that
             // `is_known_unported` classifies as Skip at the
             // producer-adjacent site.
             if let Some(result_var) = legacy_op.result.as_ref()
@@ -2600,11 +2595,11 @@ pub fn function_graph_to_flowspace(
                     // Inline counterpart of `lookup_operand` for the
                     // block.exitswitch path (no enclosing
                     // SpaceOperation). Required substring
-                    // `"undefined operand slot"` is preserved
+                    // `"undefined operand"` is preserved
                     // verbatim for `is_known_unported`
                     // (`cutover.rs:441`).
                     TyperError::message(format!(
-                        "translate_op: undefined operand slot {var:?} as block.exitswitch — \
+                        "translate_op: undefined operand {var:?} as block.exitswitch — \
                          adapter invariant broken (every referenced operand must be \
                          defined as a block inputarg or op result)",
                     ))
@@ -2644,20 +2639,19 @@ mod tests {
     use crate::translator::rtyper::legacy_annotator::setbinding;
     use crate::translator::rtyper::pyre_call_registry::PyreCallRegistry;
 
-    /// Test helper — project slot indices to backing Variables for
-    /// `Block { inputargs: ..., .. }` literals.  Auto-grows the
-    /// graph via `set_next_value` when an index past the canonical 3
-    /// slots is referenced so each has a backing Variable.
+    /// Mint `n` fresh values on `graph`, returned indexed `0..n` so
+    /// fixtures can refer to operands / results / inputargs positionally.
+    fn mint_vars(graph: &mut LegacyGraph, n: usize) -> Vec<crate::flowspace::model::Variable> {
+        (0..n).map(|_| graph.alloc_value_var()).collect()
+    }
+
+    /// Project positional indices to held Variables for
+    /// `Block { inputargs, .. }` literals.
     fn block_inputargs(
-        graph: &mut LegacyGraph,
+        vars: &[crate::flowspace::model::Variable],
         vids: &[usize],
     ) -> Vec<crate::flowspace::model::Variable> {
-        if let Some(max) = vids.iter().copied().max() {
-            if max >= graph.next_value() {
-                graph.set_next_value(max + 1);
-            }
-        }
-        vids.iter().map(|v| graph.must_variable_at(*v)).collect()
+        vids.iter().map(|&i| vars[i].clone()).collect()
     }
 
     /// Helper: empty `PyreCallRegistry` for tests that don't exercise
@@ -2666,19 +2660,6 @@ mod tests {
     /// share state with an enclosing annotator.
     fn empty_call_registry() -> PyreCallRegistry {
         PyreCallRegistry::new(Rc::new(Bookkeeper::new()))
-    }
-
-    /// Helper: a fresh `FunctionGraph` with slot capacity reserved up to
-    /// `high` so subsequent `must_variable_at` calls succeed.  Used by
-    /// `translate_op` arms whose `OpKind` operand fields now hold a
-    /// `Variable` and need to be projected back to their backing slot
-    /// via `graph.slot_of`.
-    fn translate_op_test_graph(high: usize) -> crate::model::FunctionGraph {
-        let mut g = crate::model::FunctionGraph::new("translate_op_fixture");
-        if high >= g.next_value() {
-            g.set_next_value(high + 1);
-        }
-        g
     }
 
     #[test]
@@ -2779,11 +2760,8 @@ mod tests {
     #[test]
     fn seed_variable_attaches_lifted_annotation_observable_via_clone() {
         let mut graph = LegacyGraph::new("seed_test");
-        // Allocate slots up to 7 so `graph.must_variable_at(7)` resolves.
-        while graph.next_value() <= 7 {
-            let _ = graph.alloc_value_var();
-        }
-        let legacy_var = graph.must_variable_at(7);
+        let vars = mint_vars(&mut graph, 8); // vars[0..8]
+        let legacy_var = vars[7].clone();
         setbinding(&legacy_var, ValueType::Int);
         let var = seed_variable(&legacy_var);
 
@@ -2822,10 +2800,14 @@ mod tests {
         );
     }
 
-    fn legacy_graph_with_inputarg_and_result(input: usize, result: usize) -> LegacyGraph {
+    fn legacy_graph_with_inputarg_and_result(
+        input: usize,
+        result: usize,
+    ) -> (LegacyGraph, Vec<crate::flowspace::model::Variable>) {
         let mut graph = LegacyGraph::new("test");
-        let inputargs = block_inputargs(&mut graph, &[input]);
-        let result_var = graph.must_variable_at(result);
+        let vars = mint_vars(&mut graph, input.max(result) + 1);
+        let inputargs = block_inputargs(&vars, &[input]);
+        let result_var = vars[result].clone();
         let mut block = Block {
             id: BlockId(0),
             inputargs,
@@ -2840,15 +2822,15 @@ mod tests {
         };
         block.id = graph.startblock;
         graph.blocks = vec![block];
-        graph
+        (graph, vars)
     }
 
     #[test]
     fn build_value_to_variable_map_seeds_inputargs_and_op_results() {
-        let graph = legacy_graph_with_inputarg_and_result(1, 2);
+        let (graph, vars) = legacy_graph_with_inputarg_and_result(1, 2);
 
-        setbinding(&graph.must_variable_at(1), ValueType::Int);
-        setbinding(&graph.must_variable_at(2), ValueType::Ref(None));
+        setbinding(&vars[1], ValueType::Int);
+        setbinding(&vars[2], ValueType::Ref(None));
         let map = build_value_to_variable_map(&graph);
 
         assert_eq!(
@@ -2858,7 +2840,7 @@ mod tests {
         );
         assert!(
             matches!(
-                map[&graph.must_variable_at(1)]
+                map[&vars[1]]
                     .annotation
                     .borrow()
                     .as_ref()
@@ -2869,7 +2851,7 @@ mod tests {
         );
         assert!(
             matches!(
-                map[&graph.must_variable_at(2)]
+                map[&vars[2]]
                     .annotation
                     .borrow()
                     .as_ref()
@@ -2886,12 +2868,10 @@ mod tests {
         // — every slot has one definition, but multiple readers).
         // Must produce one Variable identity per slot.
         let mut graph = LegacyGraph::new("dedup_test");
-        // Slots 0..2 are canonical (returnvar / etype / evalue);
-        // alloc one more so slot 3 has a backing Variable.
-        let _v3 = graph.alloc_value_var();
-        let inputargs = block_inputargs(&mut graph, &[1]);
-        let result2_var = graph.must_variable_at(2);
-        let result3_var = graph.must_variable_at(3);
+        let vars = mint_vars(&mut graph, 4); // vars[0..4]
+        let inputargs = block_inputargs(&vars, &[1]);
+        let result2_var = vars[2].clone();
+        let result3_var = vars[3].clone();
         let mut block = Block {
             id: BlockId(0),
             inputargs,
@@ -2913,27 +2893,18 @@ mod tests {
         block.id = graph.startblock;
         graph.blocks = vec![block];
 
-        setbinding(&graph.must_variable_at(1), ValueType::Int);
-        setbinding(&graph.must_variable_at(2), ValueType::Int);
-        setbinding(&graph.must_variable_at(3), ValueType::Int);
+        setbinding(&vars[1], ValueType::Int);
+        setbinding(&vars[2], ValueType::Int);
+        setbinding(&vars[3], ValueType::Int);
         let map = build_value_to_variable_map(&graph);
 
         assert_eq!(map.len(), 3, "three distinct slots → three Variables");
         // The identity invariant: the inputarg's Variable is one fresh
         // identity, the two op results are two more fresh identities, and
         // they don't collide.
-        assert_ne!(
-            map[&graph.must_variable_at(1)],
-            map[&graph.must_variable_at(2)]
-        );
-        assert_ne!(
-            map[&graph.must_variable_at(1)],
-            map[&graph.must_variable_at(3)]
-        );
-        assert_ne!(
-            map[&graph.must_variable_at(2)],
-            map[&graph.must_variable_at(3)]
-        );
+        assert_ne!(map[&vars[1]], map[&vars[2]]);
+        assert_ne!(map[&vars[1]], map[&vars[3]]);
+        assert_ne!(map[&vars[2]], map[&vars[3]]);
     }
 
     #[test]
@@ -2947,22 +2918,23 @@ mod tests {
         // BinOp lookup hits a fresh Variable with no concretetype and
         // trips genop's "wrong level!" assertion.
         let mut graph = LegacyGraph::new("rebind_alias");
+        let vars = mint_vars(&mut graph, 3); // vars[0..3]
         let mut block = Block {
             id: BlockId(0),
-            inputargs: block_inputargs(&mut graph, &[1]),
+            inputargs: block_inputargs(&vars, &[1]),
             operations: vec![
                 // Leading definition: result IS the inputarg.
                 SpaceOperation {
-                    result: Some(graph.must_variable_at(1)),
+                    result: Some(vars[1].clone()),
                     kind: OpKind::Input {
                         name: "x".to_string(),
                         ty: ValueType::Int,
                         class_root: None,
                     },
                 },
-                // Rebind: result is fresh; same name → alias to slot 1's Variable.
+                // Rebind: result is fresh; same name → alias to vars[1]'s Variable.
                 SpaceOperation {
-                    result: Some(graph.must_variable_at(2)),
+                    result: Some(vars[2].clone()),
                     kind: OpKind::Input {
                         name: "x".to_string(),
                         ty: ValueType::Int,
@@ -2978,12 +2950,11 @@ mod tests {
         block.id = graph.startblock;
         graph.blocks = vec![block];
 
-        setbinding(&graph.must_variable_at(1), ValueType::Int);
-        setbinding(&graph.must_variable_at(2), ValueType::Int);
+        setbinding(&vars[1], ValueType::Int);
+        setbinding(&vars[2], ValueType::Int);
         let map = build_value_to_variable_map(&graph);
         assert_eq!(
-            map[&graph.must_variable_at(1)],
-            map[&graph.must_variable_at(2)],
+            map[&vars[1]], map[&vars[2]],
             "Input rebind result must alias to inputarg Variable identity"
         );
     }
@@ -2993,12 +2964,10 @@ mod tests {
     #[test]
     fn build_value_to_hlvalue_map_inlines_const_defines() {
         let mut graph = LegacyGraph::new("const_inline");
-        // Slots 0..2 are canonical (returnvar / etype / evalue);
-        // alloc one more so slot 3 has a backing Variable.
-        let _v3 = graph.alloc_value_var();
-        let inputargs = block_inputargs(&mut graph, &[1]);
-        let result2_var = graph.must_variable_at(2);
-        let result3_var = graph.must_variable_at(3);
+        let vars = mint_vars(&mut graph, 4); // vars[0..4]
+        let inputargs = block_inputargs(&vars, &[1]);
+        let result2_var = vars[2].clone();
+        let result3_var = vars[3].clone();
         let mut block = Block {
             id: BlockId(0),
             inputargs,
@@ -3020,40 +2989,41 @@ mod tests {
         block.id = graph.startblock;
         graph.blocks = vec![block];
 
-        setbinding(&graph.must_variable_at(1), ValueType::Int);
-        setbinding(&graph.must_variable_at(2), ValueType::Int);
-        setbinding(&graph.must_variable_at(3), ValueType::Float);
+        setbinding(&vars[1], ValueType::Int);
+        setbinding(&vars[2], ValueType::Int);
+        setbinding(&vars[3], ValueType::Float);
         let var_map = build_value_to_variable_map(&graph);
         let hl_map = build_value_to_hlvalue_map(&graph, &var_map);
 
         // Inputarg keeps its Variable identity.
-        assert!(matches!(hl_map[&1], Hlvalue::Variable(_)));
+        assert!(matches!(hl_map[&vars[1]], Hlvalue::Variable(_)));
 
         // ConstInt define is inlined as Hlvalue::Constant(Int).
-        match &hl_map[&2] {
+        match &hl_map[&vars[2]] {
             Hlvalue::Constant(c) => match &c.value {
                 ConstValue::Int(n) => assert_eq!(*n, 42),
-                other => panic!("slot 2 must be ConstValue::Int, got {other:?}"),
+                other => panic!("result 2 must be ConstValue::Int, got {other:?}"),
             },
-            other => panic!("slot 2 must be inlined as Hlvalue::Constant, got {other:?}"),
+            other => panic!("result 2 must be inlined as Hlvalue::Constant, got {other:?}"),
         }
 
         // ConstFloat define is inlined as Hlvalue::Constant(Float).
-        match &hl_map[&3] {
+        match &hl_map[&vars[3]] {
             Hlvalue::Constant(c) => match &c.value {
                 ConstValue::Float(bits) => assert_eq!(*bits, 0xC000_0000_0000_0000),
-                other => panic!("slot 3 must be ConstValue::Float, got {other:?}"),
+                other => panic!("result 3 must be ConstValue::Float, got {other:?}"),
             },
-            other => panic!("slot 3 must be inlined as Hlvalue::Constant, got {other:?}"),
+            other => panic!("result 3 must be inlined as Hlvalue::Constant, got {other:?}"),
         }
     }
 
     #[test]
     fn translate_op_skips_input_define() {
         let value_map: HashMap<Variable, Hlvalue> = HashMap::new();
-        let graph = translate_op_test_graph(10);
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 11); // vars[0..11]
         let op = SpaceOperation {
-            result: Some(graph.must_variable_at(1)),
+            result: Some(vars[1].clone()),
             kind: OpKind::Input {
                 name: "x".to_string(),
                 ty: ValueType::Int,
@@ -3173,9 +3143,10 @@ mod tests {
     #[test]
     fn translate_op_skips_const_int_define() {
         let value_map: HashMap<Variable, Hlvalue> = HashMap::new();
-        let graph = translate_op_test_graph(10);
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 11); // vars[0..11]
         let op = SpaceOperation {
-            result: Some(graph.must_variable_at(1)),
+            result: Some(vars[1].clone()),
             kind: OpKind::ConstInt(7),
         };
         let result = translate_op(&op, &value_map, &empty_call_registry())
@@ -3190,9 +3161,10 @@ mod tests {
     #[test]
     fn translate_op_skips_const_float_define() {
         let value_map: HashMap<Variable, Hlvalue> = HashMap::new();
-        let graph = translate_op_test_graph(10);
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 11); // vars[0..11]
         let op = SpaceOperation {
-            result: Some(graph.must_variable_at(1)),
+            result: Some(vars[1].clone()),
             kind: OpKind::ConstFloat(0),
         };
         let result = translate_op(&op, &value_map, &empty_call_registry())
@@ -3210,17 +3182,18 @@ mod tests {
         let lhs_var = Hlvalue::Variable(Variable::new());
         let rhs_var = Hlvalue::Variable(Variable::new());
         let result_var = Hlvalue::Variable(Variable::new());
-        let graph = translate_op_test_graph(10);
-        value_map.insert(graph.must_variable_at(1), lhs_var.clone());
-        value_map.insert(graph.must_variable_at(2), rhs_var.clone());
-        value_map.insert(graph.must_variable_at(3), result_var.clone());
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 11); // vars[0..11]
+        value_map.insert(vars[1].clone(), lhs_var.clone());
+        value_map.insert(vars[2].clone(), rhs_var.clone());
+        value_map.insert(vars[3].clone(), result_var.clone());
 
         let op = SpaceOperation {
-            result: Some(graph.must_variable_at(3)),
+            result: Some(vars[3].clone()),
             kind: OpKind::BinOp {
                 op: "add".to_string(),
-                lhs: graph.must_variable_at(1),
-                rhs: graph.must_variable_at(2),
+                lhs: vars[1].clone(),
+                rhs: vars[2].clone(),
                 result_ty: ValueType::Int,
             },
         };
@@ -3238,21 +3211,16 @@ mod tests {
         // missing lhs surfaces the "adapter invariant broken" message
         // rather than a silent panic.
         let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
-        let graph = translate_op_test_graph(100);
-        value_map.insert(
-            graph.must_variable_at(2),
-            Hlvalue::Variable(Variable::new()),
-        );
-        value_map.insert(
-            graph.must_variable_at(3),
-            Hlvalue::Variable(Variable::new()),
-        );
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 100); // vars[0..100]
+        value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[3].clone(), Hlvalue::Variable(Variable::new()));
         let op = SpaceOperation {
-            result: Some(graph.must_variable_at(3)),
+            result: Some(vars[3].clone()),
             kind: OpKind::BinOp {
                 op: "add".to_string(),
-                lhs: graph.must_variable_at(99), // not in value_map
-                rhs: graph.must_variable_at(2),
+                lhs: vars[99].clone(), // not in value_map
+                rhs: vars[2].clone(),
                 result_ty: ValueType::Int,
             },
         };
@@ -3273,27 +3241,22 @@ mod tests {
         use crate::flowspace::argument::Signature;
         use crate::translator::rtyper::pyre_call_registry::FunctionPathKey;
         let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
-        let graph = translate_op_test_graph(10);
-        value_map.insert(
-            graph.must_variable_at(1),
-            Hlvalue::Variable(Variable::new()),
-        );
-        value_map.insert(
-            graph.must_variable_at(2),
-            Hlvalue::Variable(Variable::new()),
-        );
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 11); // vars[0..11]
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
         let registry = empty_call_registry();
         registry.get_or_register(
             FunctionPathKey::from_segments(["a", "b"]),
             Signature::new(vec!["x".into()], None, None),
         );
         let op = SpaceOperation {
-            result: Some(graph.must_variable_at(2)),
+            result: Some(vars[2].clone()),
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["a".into(), "b".into()],
                 },
-                args: vec![graph.must_variable_at(1)],
+                args: vec![vars[1].clone()],
                 result_ty: ValueType::Int,
             },
         };
@@ -3328,15 +3291,10 @@ mod tests {
         use crate::flowspace::argument::Signature;
         use crate::translator::rtyper::pyre_call_registry::FunctionPathKey;
         let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
-        let graph = translate_op_test_graph(10);
-        value_map.insert(
-            graph.must_variable_at(1),
-            Hlvalue::Variable(Variable::new()),
-        );
-        value_map.insert(
-            graph.must_variable_at(2),
-            Hlvalue::Variable(Variable::new()),
-        );
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 11); // vars[0..11]
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
         let registry = empty_call_registry();
         let other_entry = registry.get_or_register(
             FunctionPathKey::from_segments(["othermod", "shared_leaf"]),
@@ -3351,12 +3309,12 @@ mod tests {
             "colliding-leaf entries must be distinct HostObjects"
         );
         let op = SpaceOperation {
-            result: Some(graph.must_variable_at(2)),
+            result: Some(vars[2].clone()),
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["othermod".into(), "shared_leaf".into()],
                 },
-                args: vec![graph.must_variable_at(1)],
+                args: vec![vars[1].clone()],
                 result_ty: ValueType::Int,
             },
         };
@@ -3392,15 +3350,10 @@ mod tests {
         use crate::flowspace::argument::Signature;
         use crate::translator::rtyper::pyre_call_registry::FunctionPathKey;
         let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
-        let graph = translate_op_test_graph(10);
-        value_map.insert(
-            graph.must_variable_at(1),
-            Hlvalue::Variable(Variable::new()),
-        );
-        value_map.insert(
-            graph.must_variable_at(2),
-            Hlvalue::Variable(Variable::new()),
-        );
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 11); // vars[0..11]
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
         let registry = empty_call_registry();
         // Free-fn-shaped (snake_case module) candidate whose leaf
         // `ValueError` collides with the exception class name.
@@ -3420,12 +3373,12 @@ mod tests {
             "leaf-match fallback resolves the registered user fn"
         );
         let op = SpaceOperation {
-            result: Some(graph.must_variable_at(2)),
+            result: Some(vars[2].clone()),
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["simple_call".into(), "ValueError".into()],
                 },
-                args: vec![graph.must_variable_at(1)],
+                args: vec![vars[1].clone()],
                 result_ty: ValueType::Ref(None),
             },
         };
@@ -3462,22 +3415,17 @@ mod tests {
         // `flowspace/flowcontext.py:LOAD_GLOBAL` resolving against
         // `__builtin__.__dict__` after `frame.globals` misses.
         let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
-        let graph = translate_op_test_graph(10);
-        value_map.insert(
-            graph.must_variable_at(1),
-            Hlvalue::Variable(Variable::new()),
-        );
-        value_map.insert(
-            graph.must_variable_at(2),
-            Hlvalue::Variable(Variable::new()),
-        );
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 11); // vars[0..11]
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
         let op = SpaceOperation {
-            result: Some(graph.must_variable_at(2)),
+            result: Some(vars[2].clone()),
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["int".into()],
                 },
-                args: vec![graph.must_variable_at(1)],
+                args: vec![vars[1].clone()],
                 result_ty: ValueType::Int,
             },
         };
@@ -3512,17 +3460,12 @@ mod tests {
         // keys its `rtype_cast_ptr_to_int` typer on
         // (`rbuiltin.py:543-548`).
         let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
-        let graph = translate_op_test_graph(10);
-        value_map.insert(
-            graph.must_variable_at(1),
-            Hlvalue::Variable(Variable::new()),
-        );
-        value_map.insert(
-            graph.must_variable_at(2),
-            Hlvalue::Variable(Variable::new()),
-        );
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 11); // vars[0..11]
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
         let op = SpaceOperation {
-            result: Some(graph.must_variable_at(2)),
+            result: Some(vars[2].clone()),
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec![
@@ -3533,7 +3476,7 @@ mod tests {
                         "cast_ptr_to_int".into(),
                     ],
                 },
-                args: vec![graph.must_variable_at(1)],
+                args: vec![vars[1].clone()],
                 result_ty: ValueType::Int,
             },
         };
@@ -3565,13 +3508,11 @@ mod tests {
         // the implicit HOST_ENV-curation bound that the Layer 3
         // fallback relies on.
         let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
-        let graph = translate_op_test_graph(10);
-        value_map.insert(
-            graph.must_variable_at(2),
-            Hlvalue::Variable(Variable::new()),
-        );
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 11); // vars[0..11]
+        value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
         let op = SpaceOperation {
-            result: Some(graph.must_variable_at(2)),
+            result: Some(vars[2].clone()),
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec![
@@ -3602,23 +3543,18 @@ mod tests {
         // constant callable + constant interned target class, then the
         // pointer operand.
         let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
-        let graph = translate_op_test_graph(10);
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 10);
         let operand = Variable::new();
-        value_map.insert(
-            graph.must_variable_at(1),
-            Hlvalue::Variable(operand.clone()),
-        );
-        value_map.insert(
-            graph.must_variable_at(2),
-            Hlvalue::Variable(Variable::new()),
-        );
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(operand.clone()));
+        value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
         let op = SpaceOperation {
-            result: Some(graph.must_variable_at(2)),
+            result: Some(vars[2].clone()),
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["__cast_pointer".into(), "W_CastTarget".into()],
                 },
-                args: vec![graph.must_variable_at(1)],
+                args: vec![vars[1].clone()],
                 result_ty: ValueType::Ref(Some("W_CastTarget".into())),
             },
         };
@@ -3661,23 +3597,18 @@ mod tests {
         // ctor — flowspace receives a `simple_call(class_const, fields)`
         // shape just like FunctionPath; rtyper's InstanceRepr handles it.
         let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
-        let graph = translate_op_test_graph(10);
-        value_map.insert(
-            graph.must_variable_at(1),
-            Hlvalue::Variable(Variable::new()),
-        );
-        value_map.insert(
-            graph.must_variable_at(2),
-            Hlvalue::Variable(Variable::new()),
-        );
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 11); // vars[0..11]
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
         let op = SpaceOperation {
-            result: Some(graph.must_variable_at(2)),
+            result: Some(vars[2].clone()),
             kind: OpKind::Call {
                 target: crate::model::CallTarget::SyntheticTransparentCtor {
                     name: "Point".into(),
                     owner_path: Vec::new(),
                 },
-                args: vec![graph.must_variable_at(1)],
+                args: vec![vars[1].clone()],
                 result_ty: ValueType::Ref(None),
             },
         };
@@ -3701,27 +3632,19 @@ mod tests {
         // `isinstance(obj, cls)` flowspace op so the rtyper dispatches
         // to `InstanceRepr::rtype_isinstance`.
         let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
-        let graph = translate_op_test_graph(10);
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 4); // vars[0..4]
         let obj_hl_var = Variable::new();
         let cls_hl_var = Variable::new();
         let result_hl_var = Variable::new();
-        value_map.insert(
-            graph.must_variable_at(1),
-            Hlvalue::Variable(obj_hl_var.clone()),
-        );
-        value_map.insert(
-            graph.must_variable_at(2),
-            Hlvalue::Variable(cls_hl_var.clone()),
-        );
-        value_map.insert(
-            graph.must_variable_at(3),
-            Hlvalue::Variable(result_hl_var.clone()),
-        );
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(obj_hl_var.clone()));
+        value_map.insert(vars[2].clone(), Hlvalue::Variable(cls_hl_var.clone()));
+        value_map.insert(vars[3].clone(), Hlvalue::Variable(result_hl_var.clone()));
         let op = SpaceOperation {
-            result: Some(graph.must_variable_at(3)),
+            result: Some(vars[3].clone()),
             kind: OpKind::IsInstance {
-                obj: graph.must_variable_at(1),
-                class_carrier: graph.must_variable_at(2),
+                obj: vars[1].clone(),
+                class_carrier: vars[2].clone(),
                 result_ty: ValueType::Bool,
             },
         };
@@ -3758,24 +3681,16 @@ mod tests {
         // `flowspace/flowcontext.py: LOAD_ATTR + CALL_FUNCTION` shape.
         // args[0] is the receiver (matches Rust method-call lowering).
         let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
-        let graph = translate_op_test_graph(10);
-        value_map.insert(
-            graph.must_variable_at(1),
-            Hlvalue::Variable(Variable::new()),
-        ); // receiver
-        value_map.insert(
-            graph.must_variable_at(2),
-            Hlvalue::Variable(Variable::new()),
-        ); // arg
-        value_map.insert(
-            graph.must_variable_at(3),
-            Hlvalue::Variable(Variable::new()),
-        ); // result
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 11); // vars[0..11]
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new())); // receiver
+        value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new())); // arg
+        value_map.insert(vars[3].clone(), Hlvalue::Variable(Variable::new())); // result
         let op = SpaceOperation {
-            result: Some(graph.must_variable_at(3)),
+            result: Some(vars[3].clone()),
             kind: OpKind::Call {
                 target: crate::model::CallTarget::method("push", Some("Vec".into())),
-                args: vec![graph.must_variable_at(1), graph.must_variable_at(2)],
+                args: vec![vars[1].clone(), vars[2].clone()],
                 result_ty: ValueType::Int,
             },
         };
@@ -3816,23 +3731,18 @@ mod tests {
         // adapter. Reaching here means the rclass rewrite didn't run;
         // surface the structural invariant break.
         let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
-        let graph = translate_op_test_graph(10);
-        value_map.insert(
-            graph.must_variable_at(1),
-            Hlvalue::Variable(Variable::new()),
-        );
-        value_map.insert(
-            graph.must_variable_at(2),
-            Hlvalue::Variable(Variable::new()),
-        );
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 11); // vars[0..11]
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
         let op = SpaceOperation {
-            result: Some(graph.must_variable_at(2)),
+            result: Some(vars[2].clone()),
             kind: OpKind::Call {
                 target: crate::model::CallTarget::Indirect {
                     trait_root: "MyTrait".into(),
                     method_name: "do_it".into(),
                 },
-                args: vec![graph.must_variable_at(1)],
+                args: vec![vars[1].clone()],
                 result_ty: ValueType::Int,
             },
         };
@@ -3856,24 +3766,16 @@ mod tests {
         // ConstValue falls back to `top_result()`); fail-loud is the
         // parity-correct behaviour.
         let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
-        let graph = translate_op_test_graph(10);
-        value_map.insert(
-            graph.must_variable_at(1),
-            Hlvalue::Variable(Variable::new()),
-        );
-        value_map.insert(
-            graph.must_variable_at(2),
-            Hlvalue::Variable(Variable::new()),
-        );
-        value_map.insert(
-            graph.must_variable_at(3),
-            Hlvalue::Variable(Variable::new()),
-        );
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 11); // vars[0..11]
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[3].clone(), Hlvalue::Variable(Variable::new()));
         let op = SpaceOperation {
-            result: Some(graph.must_variable_at(3)),
+            result: Some(vars[3].clone()),
             kind: OpKind::IndirectCall {
-                funcptr: graph.must_variable_at(1),
-                args: vec![graph.must_variable_at(2)],
+                funcptr: vars[1].clone(),
+                args: vec![vars[2].clone()],
                 graphs: None,
                 result_ty: ValueType::Int,
             },
@@ -3896,14 +3798,15 @@ mod tests {
         let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
         let base_var = Hlvalue::Variable(Variable::new());
         let result_var = Hlvalue::Variable(Variable::new());
-        let graph = translate_op_test_graph(10);
-        value_map.insert(graph.must_variable_at(1), base_var.clone());
-        value_map.insert(graph.must_variable_at(2), result_var.clone());
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 11); // vars[0..11]
+        value_map.insert(vars[1].clone(), base_var.clone());
+        value_map.insert(vars[2].clone(), result_var.clone());
 
         let op = SpaceOperation {
-            result: Some(graph.must_variable_at(2)),
+            result: Some(vars[2].clone()),
             kind: OpKind::FieldRead {
-                base: graph.must_variable_at(1),
+                base: vars[1].clone(),
                 field: crate::model::FieldDescriptor::new("f", Some("Owner".into())),
                 ty: ValueType::Int,
                 pure: false,
@@ -3927,21 +3830,16 @@ mod tests {
     #[test]
     fn translate_op_field_write_lowers_to_setattr() {
         let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
-        let graph = translate_op_test_graph(10);
-        value_map.insert(
-            graph.must_variable_at(1),
-            Hlvalue::Variable(Variable::new()),
-        );
-        value_map.insert(
-            graph.must_variable_at(2),
-            Hlvalue::Variable(Variable::new()),
-        );
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 11); // vars[0..11]
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
         let op = SpaceOperation {
             result: None,
             kind: OpKind::FieldWrite {
-                base: graph.must_variable_at(1),
+                base: vars[1].clone(),
                 field: crate::model::FieldDescriptor::new("g", Some("Owner".into())),
-                value: graph.must_variable_at(2),
+                value: vars[2].clone(),
                 ty: ValueType::Int,
             },
         };
@@ -3968,24 +3866,16 @@ mod tests {
         // (ListRepr / TupleRepr / FixedSizeArrayRepr) and lowers to
         // `getarrayitem_gc_*`.
         let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
-        let graph = translate_op_test_graph(10);
-        value_map.insert(
-            graph.must_variable_at(1),
-            Hlvalue::Variable(Variable::new()),
-        );
-        value_map.insert(
-            graph.must_variable_at(2),
-            Hlvalue::Variable(Variable::new()),
-        );
-        value_map.insert(
-            graph.must_variable_at(3),
-            Hlvalue::Variable(Variable::new()),
-        );
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 11); // vars[0..11]
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[3].clone(), Hlvalue::Variable(Variable::new()));
         let op = SpaceOperation {
-            result: Some(graph.must_variable_at(3)),
+            result: Some(vars[3].clone()),
             kind: OpKind::ArrayRead {
-                base: graph.must_variable_at(1),
-                index: graph.must_variable_at(2),
+                base: vars[1].clone(),
+                index: vars[2].clone(),
                 item_ty: ValueType::Int,
                 array_type_id: None,
                 nolength: false,
@@ -4002,25 +3892,17 @@ mod tests {
     #[test]
     fn translate_op_array_write_lowers_to_setitem() {
         let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
-        let graph = translate_op_test_graph(10);
-        value_map.insert(
-            graph.must_variable_at(1),
-            Hlvalue::Variable(Variable::new()),
-        );
-        value_map.insert(
-            graph.must_variable_at(2),
-            Hlvalue::Variable(Variable::new()),
-        );
-        value_map.insert(
-            graph.must_variable_at(3),
-            Hlvalue::Variable(Variable::new()),
-        );
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 11); // vars[0..11]
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[3].clone(), Hlvalue::Variable(Variable::new()));
         let op = SpaceOperation {
             result: None,
             kind: OpKind::ArrayWrite {
-                base: graph.must_variable_at(1),
-                index: graph.must_variable_at(2),
-                value: graph.must_variable_at(3),
+                base: vars[1].clone(),
+                index: vars[2].clone(),
+                value: vars[3].clone(),
                 item_ty: ValueType::Int,
                 array_type_id: None,
                 nolength: false,
@@ -4041,24 +3923,16 @@ mod tests {
         // implicit `readarray + readinteriorfield` effects. Two flowspace
         // ops surface from one legacy op; the rtyper sees the chain.
         let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
-        let graph = translate_op_test_graph(10);
-        value_map.insert(
-            graph.must_variable_at(1),
-            Hlvalue::Variable(Variable::new()),
-        );
-        value_map.insert(
-            graph.must_variable_at(2),
-            Hlvalue::Variable(Variable::new()),
-        );
-        value_map.insert(
-            graph.must_variable_at(3),
-            Hlvalue::Variable(Variable::new()),
-        );
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 11); // vars[0..11]
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[3].clone(), Hlvalue::Variable(Variable::new()));
         let op = SpaceOperation {
-            result: Some(graph.must_variable_at(3)),
+            result: Some(vars[3].clone()),
             kind: OpKind::InteriorFieldRead {
-                base: graph.must_variable_at(1),
-                index: graph.must_variable_at(2),
+                base: vars[1].clone(),
+                index: vars[2].clone(),
                 field: crate::model::FieldDescriptor::new("x", Some("Point".into())),
                 item_ty: ValueType::Int,
                 array_type_id: None,
@@ -4125,26 +3999,18 @@ mod tests {
     #[test]
     fn translate_op_interior_field_write_unfolds_to_getitem_setattr_chain() {
         let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
-        let graph = translate_op_test_graph(10);
-        value_map.insert(
-            graph.must_variable_at(1),
-            Hlvalue::Variable(Variable::new()),
-        );
-        value_map.insert(
-            graph.must_variable_at(2),
-            Hlvalue::Variable(Variable::new()),
-        );
-        value_map.insert(
-            graph.must_variable_at(3),
-            Hlvalue::Variable(Variable::new()),
-        );
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 11); // vars[0..11]
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[3].clone(), Hlvalue::Variable(Variable::new()));
         let op = SpaceOperation {
             result: None,
             kind: OpKind::InteriorFieldWrite {
-                base: graph.must_variable_at(1),
-                index: graph.must_variable_at(2),
+                base: vars[1].clone(),
+                index: vars[2].clone(),
                 field: crate::model::FieldDescriptor::new("y", Some("Point".into())),
-                value: graph.must_variable_at(3),
+                value: vars[3].clone(),
                 item_ty: ValueType::Int,
                 array_type_id: None,
             },
@@ -4164,17 +4030,18 @@ mod tests {
         // invariant broken" message and embeds the enriched diagnostic
         // context (op variant + arg role).
         let value_map: HashMap<Variable, Hlvalue> = HashMap::new();
-        let graph = translate_op_test_graph(100);
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 101); // vars[0..101]
         let op = SpaceOperation {
-            result: Some(graph.must_variable_at(100)),
+            result: Some(vars[100].clone()),
             kind: OpKind::BinOp {
                 op: "add".to_string(),
-                lhs: graph.must_variable_at(99),
-                rhs: graph.must_variable_at(0),
+                lhs: vars[99].clone(),
+                rhs: vars[0].clone(),
                 result_ty: ValueType::Int,
             },
         };
-        let err = lookup_operand(&value_map, &graph.must_variable_at(99), &op, "lhs")
+        let err = lookup_operand(&value_map, &vars[99], &op, "lhs")
             .expect_err("undefined operand lookup must error");
         let msg = format!("{err}");
         assert!(
@@ -4195,7 +4062,8 @@ mod tests {
         link
     }
 
-    fn legacy_minimal_identity_return_graph() -> LegacyGraph {
+    fn legacy_minimal_identity_return_graph()
+    -> (LegacyGraph, Vec<crate::flowspace::model::Variable>) {
         // Smallest valid legacy graph: one inputarg, returns it
         // directly. Must produce a flowspace::FunctionGraph
         // whose startblock has the single inputarg Variable,
@@ -4209,13 +4077,14 @@ mod tests {
         // mirrors that by always emitting a single slot in the
         // returnblock's inputargs.
         let mut graph = LegacyGraph::new("identity_return");
+        let vars = mint_vars(&mut graph, 2); // vars[0..2]
         let startblock = Block {
             id: graph.startblock,
-            inputargs: block_inputargs(&mut graph, &[1]),
+            inputargs: block_inputargs(&vars, &[1]),
             operations: vec![],
             exitswitch: None,
             exits: vec![link_to_returnblock(
-                vec![LinkArg::Value(graph.must_variable_at(1))],
+                vec![LinkArg::Value(vars[1].clone())],
                 graph.returnblock,
             )],
             framestate: None,
@@ -4223,7 +4092,7 @@ mod tests {
         };
         let returnblock = Block {
             id: graph.returnblock,
-            inputargs: block_inputargs(&mut graph, &[1]),
+            inputargs: block_inputargs(&vars, &[1]),
             operations: vec![],
             exitswitch: None,
             exits: vec![],
@@ -4231,21 +4100,19 @@ mod tests {
             dead: false,
         };
         graph.blocks = vec![startblock, returnblock];
-        graph
+        (graph, vars)
     }
 
     #[test]
     fn function_graph_to_flowspace_minimal_identity_return_assembles_graph() {
-        let legacy = legacy_minimal_identity_return_graph();
+        let (legacy, vars) = legacy_minimal_identity_return_graph();
 
         let output = function_graph_to_flowspace(&legacy, &empty_call_registry())
             .expect("minimal graph must assemble");
 
         // value_to_var must contain the inputarg.
         assert!(
-            output
-                .value_to_var
-                .contains_key(&legacy.must_variable_at(1)),
+            output.value_to_var.contains_key(&vars[1]),
             "value_to_var must seed the legacy inputarg"
         );
 
@@ -4285,13 +4152,14 @@ mod tests {
         // RPythonTyper.getreturnvar finds the right Variable —
         // rtyper.rs:1633-1638).
         let mut graph = LegacyGraph::new("with_return_var");
+        let vars = mint_vars(&mut graph, 3); // vars[0..3]
         let startblock = Block {
             id: graph.startblock,
-            inputargs: block_inputargs(&mut graph, &[1]),
+            inputargs: block_inputargs(&vars, &[1]),
             operations: vec![],
             exitswitch: None,
             exits: vec![link_to_returnblock(
-                vec![LinkArg::Value(graph.must_variable_at(1))],
+                vec![LinkArg::Value(vars[1].clone())],
                 graph.returnblock,
             )],
             framestate: None,
@@ -4299,7 +4167,7 @@ mod tests {
         };
         let returnblock = Block {
             id: graph.returnblock,
-            inputargs: block_inputargs(&mut graph, &[2]),
+            inputargs: block_inputargs(&vars, &[2]),
             operations: vec![],
             exitswitch: None,
             exits: vec![],
@@ -4323,7 +4191,7 @@ mod tests {
         );
         match &returnblock.inputargs[0] {
             Hlvalue::Variable(v) => {
-                let expected = &output.value_to_var[&graph.must_variable_at(2)];
+                let expected = &output.value_to_var[&vars[2]];
                 assert_eq!(
                     v, expected,
                     "returnblock inputarg must preserve Variable identity from value_to_var"
@@ -4335,22 +4203,23 @@ mod tests {
 
     #[test]
     fn function_graph_to_flowspace_const_define_op_inlined_in_link_args() {
-        // ConstInt(7) defines slot 2. build_value_to_hlvalue_map
+        // ConstInt(7) defines vars[2]. build_value_to_hlvalue_map
         // inlines it into Link.args as Hlvalue::Constant — link
         // translation must use that
         // mapping rather than wrapping the unused Variable.
         let mut graph = LegacyGraph::new("const_link_arg");
+        let vars = mint_vars(&mut graph, 4); // vars[0..4]
         let startblock = Block {
             id: graph.startblock,
-            inputargs: block_inputargs(&mut graph, &[1]),
+            inputargs: block_inputargs(&vars, &[1]),
             operations: vec![SpaceOperation {
-                result: Some(graph.must_variable_at(2)),
+                result: Some(vars[2].clone()),
                 kind: OpKind::ConstInt(7),
             }],
             exitswitch: None,
-            // Return slot 2, the ConstInt define.
+            // Return vars[2], the ConstInt define.
             exits: vec![link_to_returnblock(
-                vec![LinkArg::Value(graph.must_variable_at(2))],
+                vec![LinkArg::Value(vars[2].clone())],
                 graph.returnblock,
             )],
             framestate: None,
@@ -4358,7 +4227,7 @@ mod tests {
         };
         let returnblock = Block {
             id: graph.returnblock,
-            inputargs: block_inputargs(&mut graph, &[3]),
+            inputargs: block_inputargs(&vars, &[3]),
             operations: vec![],
             exitswitch: None,
             exits: vec![],
@@ -4395,36 +4264,33 @@ mod tests {
         // validating link.args. Pyre's legacy graph represents those
         // as fresh slots whose only definition site is the link.
         let mut graph = LegacyGraph::new("canraise_with_extravars");
-        graph.set_next_value(12); // pre-allocate up to slot 11 for extravars
+        let vars = mint_vars(&mut graph, 12); // vars[0..12], extravars live at 10/11
         let startblock = Block {
             id: graph.startblock,
-            inputargs: block_inputargs(&mut graph, &[1, 2]),
+            inputargs: block_inputargs(&vars, &[1, 2]),
             operations: vec![SpaceOperation {
-                result: Some(graph.must_variable_at(3)),
+                result: Some(vars[3].clone()),
                 kind: OpKind::BinOp {
                     op: "add".to_string(),
-                    lhs: graph.must_variable_at(1),
-                    rhs: graph.must_variable_at(2),
+                    lhs: vars[1].clone(),
+                    rhs: vars[2].clone(),
                     result_ty: ValueType::Int,
                 },
             }],
             exitswitch: Some(crate::model::ExitSwitch::LastException),
             exits: vec![
-                link_to_returnblock(
-                    vec![LinkArg::Value(graph.must_variable_at(3))],
-                    graph.returnblock,
-                ),
+                link_to_returnblock(vec![LinkArg::Value(vars[3].clone())], graph.returnblock),
                 crate::model::Link::new_mixed(
                     vec![
-                        LinkArg::Value(graph.must_variable_at(10)),
-                        LinkArg::Value(graph.must_variable_at(11)),
+                        LinkArg::Value(vars[10].clone()),
+                        LinkArg::Value(vars[11].clone()),
                     ],
                     graph.exceptblock,
                     Some(crate::model::exception_exitcase()),
                 )
                 .extravars(
-                    Some(LinkArg::Value(graph.must_variable_at(10))),
-                    Some(LinkArg::Value(graph.must_variable_at(11))),
+                    Some(LinkArg::Value(vars[10].clone())),
+                    Some(LinkArg::Value(vars[11].clone())),
                 ),
             ],
             framestate: None,
@@ -4432,7 +4298,7 @@ mod tests {
         };
         let returnblock = Block {
             id: graph.returnblock,
-            inputargs: block_inputargs(&mut graph, &[4]),
+            inputargs: block_inputargs(&vars, &[4]),
             operations: vec![],
             exitswitch: None,
             exits: vec![],
@@ -4441,7 +4307,7 @@ mod tests {
         };
         let exceptblock = Block {
             id: graph.exceptblock,
-            inputargs: block_inputargs(&mut graph, &[10, 11]),
+            inputargs: block_inputargs(&vars, &[10, 11]),
             operations: vec![],
             exitswitch: None,
             exits: vec![],
@@ -4477,13 +4343,14 @@ mod tests {
         // translate_op error from inside Pass 2, not silently emit a
         // partial graph.
         let mut graph = LegacyGraph::new("unported_op");
-        let inputargs = block_inputargs(&mut graph, &[1]);
-        let arg_var = graph.must_variable_at(1);
+        let vars = mint_vars(&mut graph, 4); // vars[0..4]
+        let inputargs = block_inputargs(&vars, &[1]);
+        let arg_var = vars[1].clone();
         let startblock = Block {
             id: graph.startblock,
             inputargs,
             operations: vec![SpaceOperation {
-                result: Some(graph.must_variable_at(2)),
+                result: Some(vars[2].clone()),
                 kind: OpKind::Call {
                     target: crate::model::CallTarget::Indirect {
                         trait_root: "MyTrait".into(),
@@ -4495,7 +4362,7 @@ mod tests {
             }],
             exitswitch: None,
             exits: vec![link_to_returnblock(
-                vec![LinkArg::Value(graph.must_variable_at(2))],
+                vec![LinkArg::Value(vars[2].clone())],
                 graph.returnblock,
             )],
             framestate: None,
@@ -4503,7 +4370,7 @@ mod tests {
         };
         let returnblock = Block {
             id: graph.returnblock,
-            inputargs: block_inputargs(&mut graph, &[3]),
+            inputargs: block_inputargs(&vars, &[3]),
             operations: vec![],
             exitswitch: None,
             exits: vec![],
@@ -4529,10 +4396,9 @@ mod tests {
         // not reject the graph: only the reachable closure is
         // converted, mirroring upstream `iterblocks` (a flowspace
         // graph cannot contain unreachable blocks at all).
-        let mut legacy = legacy_minimal_identity_return_graph();
-        legacy.set_next_value(9);
-        let orphan_etype = legacy.must_variable_at(7);
-        let orphan_evalue = legacy.must_variable_at(8);
+        let (mut legacy, _vars) = legacy_minimal_identity_return_graph();
+        let orphan_etype = legacy.alloc_value_var();
+        let orphan_evalue = legacy.alloc_value_var();
         let exceptblock = legacy.exceptblock;
         legacy.blocks.push(Block {
             id: BlockId(3),
@@ -4564,13 +4430,13 @@ mod tests {
         // no inputarg and no op result must still fail loud — the
         // reachable-closure conversion does not relax SSA-definedness.
         let mut legacy = LegacyGraph::new("reachable_orphan_raise");
-        legacy.set_next_value(9);
-        let orphan_etype = legacy.must_variable_at(7);
-        let orphan_evalue = legacy.must_variable_at(8);
+        let vars = mint_vars(&mut legacy, 9);
+        let orphan_etype = vars[7].clone();
+        let orphan_evalue = vars[8].clone();
         let exceptblock = legacy.exceptblock;
         let startblock = Block {
             id: legacy.startblock,
-            inputargs: block_inputargs(&mut legacy, &[1]),
+            inputargs: block_inputargs(&vars, &[1]),
             operations: vec![],
             exitswitch: None,
             exits: vec![crate::model::Link::new_mixed(
@@ -4583,7 +4449,7 @@ mod tests {
         };
         let returnblock = Block {
             id: legacy.returnblock,
-            inputargs: block_inputargs(&mut legacy, &[1]),
+            inputargs: block_inputargs(&vars, &[1]),
             operations: vec![],
             exitswitch: None,
             exits: vec![],
@@ -4596,7 +4462,7 @@ mod tests {
             .expect_err("reachable orphan raise args must stay fail-loud");
         let msg = format!("{err}");
         assert!(
-            msg.contains("undefined operand slot"),
+            msg.contains("undefined operand"),
             "reachable orphan must keep the operand-definedness error, got: {msg}"
         );
     }

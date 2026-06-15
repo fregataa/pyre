@@ -7840,27 +7840,26 @@ mod tests {
         use crate::translator::translator::TranslationContext;
         use std::rc::Rc;
 
-        // Divergence map:
+        // Divergence map (post `set_raise` Const-arg fix):
         //   non-raising  : flat=No             | adapter OK, RaiseAnalyzer=false (AGREE)
-        //   set_raise    : flat=Yes            | adapter REJECTS (undefined slot, EXC link)
+        //   set_raise    : flat=Yes            | adapter OK, RaiseAnalyzer=true  (AGREE)
         //   reraise_only : flat=MemoryErrorOnly| adapter REJECTS (undefined slot, NORMAL link)
-        // The rejection is NOT an adapter exception-edge defect and NOT a
-        // missing exception-slot seed: both synthetic helpers are simply
-        // malformed — each carries an SSA-undefined value on a Link out of
-        // the producer-less entry block. raising_graph (set_raise = plain
-        // goto, no .extravars) routes a fresh etype/evalue on its EXCEPTION
-        // link to the exceptblock; reraise_only routes an undefined
-        // continuation_arg on its NORMAL fall-through link (two distinct
-        // edges, same root cause). RPython's own checkgraph
-        // (model.py:668-688) would reject both: every Link.args value must
-        // be defined in the predecessor block (only last_exception /
-        // last_exc_value may be defined only_in_link). Real front-end
-        // graphs ARE well-formed and DO convert — production runs
-        // function_graph_to_flowspace on every graph and check.py is green.
-        // So these `.is_err()` assertions pin that the adapter correctly
-        // enforces SSA-definedness, not an exception-edge limitation; the
-        // well_formed_raise_* test below proves the flowspace RaiseAnalyzer
-        // matches the flat _canraise on a well-formed raise graph.
+        // `set_raise` (model.rs) now closes the producer-less entry block
+        // with an unconditional Link to the exceptblock carrying the
+        // `AssertionError` class Constant and an `AssertionError(msg)`
+        // instance Constant in the `(etype, evalue)` slots (the
+        // `RaiseImplicit.nomoreblocks` shape, flowcontext.py:1279), so the
+        // synthetic raising_graph is well-formed and converts — the
+        // flowspace RaiseAnalyzer then agrees with the flat `_canraise=Yes`.
+        // reraise_only stays malformed for an unrelated reason: it routes an
+        // SSA-undefined `continuation_arg` on its NORMAL fall-through link
+        // (no producing op, not an entry inputarg), which RPython's own
+        // checkgraph (model.py:668-688) would also reject — every Link.args
+        // value must be defined in the predecessor block (only
+        // last_exception / last_exc_value may be defined only_in_link).
+        // Real front-end graphs ARE well-formed and DO convert — production
+        // runs function_graph_to_flowspace on every graph and check.py is
+        // green.
         let registry = || PyreCallRegistry::new(Rc::new(Bookkeeper::new()));
 
         // -- non-raising: converts, and both paths agree it cannot raise --
@@ -7885,27 +7884,47 @@ mod tests {
             );
         }
 
-        // -- raise-bearing SYNTHETIC helpers are malformed (an SSA-undefined
-        //    Link arg out of the empty entry block), so the adapter rejects
-        //    them; this pins the SSA-definedness invariant, not an
-        //    exception-edge defect (real graphs convert — see doc above) --
-        let raise_cases: [(&str, fn(&str) -> FunctionGraph, CanRaise); 2] = [
-            ("rs", raising_graph, CanRaise::Yes),
-            ("rr", reraise_only_graph, CanRaise::MemoryErrorOnly),
-        ];
-        for (label, build, expected_flat) in raise_cases {
+        // -- set_raise: a well-formed unconditional exceptblock exit (Const
+        //    exception args), so the adapter converts it and the flowspace
+        //    RaiseAnalyzer agrees with the flat `_canraise=Yes` --
+        {
             let mut cc = CallControl::new();
-            cc.register_function_graph(CallPath::from_segments([label]), build(label));
+            cc.register_function_graph(CallPath::from_segments(["rs"]), raising_graph("rs"));
             let flat = cc._canraise(
-                &CallTarget::function_path([label]),
+                &CallTarget::function_path(["rs"]),
                 &mut AnalysisCache::default(),
             );
-            assert_eq!(flat, expected_flat);
+            assert_eq!(flat, CanRaise::Yes);
+
+            let reg = registry();
+            let out = function_graph_to_flowspace(&raising_graph("rs"), &reg)
+                .expect("set_raise graph converts to flowspace (Const exception args)");
+            let translator = TranslationContext::new();
+            translator.graphs.borrow_mut().push(out.graph.clone());
+            let mut ra = RaiseAnalyzer::new(&translator);
+            assert!(
+                ra.analyze_direct_call(&out.graph, None),
+                "flowspace RaiseAnalyzer agrees the set_raise graph can raise"
+            );
+        }
+
+        // -- reraise_only is still malformed (an SSA-undefined
+        //    `continuation_arg` on its NORMAL fall-through link), so the
+        //    adapter rejects it; this pins the SSA-definedness invariant,
+        //    not an exception-edge defect (real graphs convert — see doc) --
+        {
+            let mut cc = CallControl::new();
+            cc.register_function_graph(CallPath::from_segments(["rr"]), reraise_only_graph("rr"));
+            let flat = cc._canraise(
+                &CallTarget::function_path(["rr"]),
+                &mut AnalysisCache::default(),
+            );
+            assert_eq!(flat, CanRaise::MemoryErrorOnly);
 
             let reg = registry();
             assert!(
-                function_graph_to_flowspace(&build(label), &reg).is_err(),
-                "adapter rejects the malformed synthetic graph (SSA-undefined Link arg)"
+                function_graph_to_flowspace(&reraise_only_graph("rr"), &reg).is_err(),
+                "adapter rejects the malformed reraise_only graph (SSA-undefined Link arg)"
             );
         }
     }

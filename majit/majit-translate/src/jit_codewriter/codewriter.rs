@@ -247,10 +247,10 @@ impl CodeWriter {
     ///
     /// `regalloc`/`flatten`/`assemble`/`liveness`/`format` all read
     /// kinds via `FunctionGraph::concretetype_of(&v)`, which routes
-    /// straight to the backing `Variable.concretetype` cell stored in
-    /// [`crate::model::FunctionGraph::value_variables`] — RPython's
+    /// straight to the backing `Variable.concretetype` cell carried
+    /// inline by the `Variable` objects the IR references — RPython's
     /// `Variable.concretetype` (`flowspace/model.py:280`) is the
-    /// single source of truth for every slot.  No type side-table
+    /// single source of truth for every value.  No type side-table
     /// parameter survives across stages: the post-rtyper merge
     /// below (`merge_synth_kinds_into_graph`) stamps each synth
     /// Variable's `.concretetype` cell via
@@ -266,10 +266,10 @@ impl CodeWriter {
     /// upstream `Variable`-based shape).  Operand identity in
     /// `SpaceOperation` payloads is already `Variable`;
     /// `FlatOp` operands are `Register` (regalloc color +
-    /// kind).  What still ties the codewriter to the legacy IR is the
-    /// dense slot index that `FunctionGraph` uses to key
-    /// `value_variables` and the side tables in `value_map` /
-    /// `alias_map` paths.  Migrating to the `Variable`-based IR
+    /// kind).  What still ties the codewriter to the legacy IR is that
+    /// it consumes [`crate::model::FunctionGraph`] and bridges to the
+    /// rtyper's typed Variables through the identity-keyed
+    /// `value_to_var` map.  Migrating to the `Variable`-based IR
     /// throughout would let pyre drop the `value_to_var` bridge and
     /// consume the rtyper's Variable graph directly — multi-week
     /// scope tracked separately.
@@ -996,8 +996,8 @@ fn stamp_classdef_hints_on_graph(
 /// where `return_var.concretetype` carries the same information.
 /// Pyre reads `graph.concretetype(returnblock.inputargs[0])`,
 /// which routes straight to the backing
-/// [`crate::flowspace::model::Variable::concretetype`] cell stored
-/// on the graph's `value_variables`.  The Variable IS the type source.
+/// [`crate::flowspace::model::Variable::concretetype`] cell carried
+/// inline on the returnblock inputarg Variable.  The Variable IS the type source.
 fn graph_result_kind(graph: &FunctionGraph) -> char {
     let returnblock = graph.block(graph.returnblock);
     let Some(arg) = returnblock.inputargs.first() else {
@@ -1048,7 +1048,6 @@ mod stamp_classdef_hints_tests {
         ))));
 
         let mut graph = FunctionGraph::new("producer_test");
-        graph.ensure_variable_registered_void(&recv_var);
         let _result_var = graph
             .push_op_var(
                 graph.startblock,
@@ -1082,7 +1081,6 @@ mod stamp_classdef_hints_tests {
         let recv_var = Variable::new();
         // No annotation bound.
         let mut graph = FunctionGraph::new("producer_test");
-        graph.ensure_variable_registered_void(&recv_var);
         graph
             .push_op_var(
                 graph.startblock,
@@ -1175,7 +1173,6 @@ mod stamp_classdef_hints_tests {
         ))));
 
         let mut graph = FunctionGraph::new("producer_test");
-        graph.ensure_variable_registered_void(&recv_var);
         graph
             .push_op_var(
                 graph.startblock,

@@ -326,6 +326,26 @@ pub struct Bookkeeper {
     /// already projected (dedups the pending drain and the bare-name
     /// arm's first-sight detection).
     pub(crate) projected_struct_rows: RefCell<std::collections::HashSet<String>>,
+    /// TODO: no upstream equivalent.  Snapshot of the LLBC-derived
+    /// `enum-name -> {discriminant -> variant-name}` metadata
+    /// (`SemanticProgram::enum_variant_by_discriminant`) used by
+    /// [`Self::getuniqueclassdef_for_enum_root`] to enumerate the
+    /// variant subclasses of an enum.  An enum models as a Python class
+    /// hierarchy — base class plus one subclass per variant — so the
+    /// receiver of a `match e { V { f } => .. }` narrows from the base
+    /// `SomeInstance` to the variant subclass and resolves the variant's
+    /// payload field through the subclass `ClassDef.attrs`.  `None` for
+    /// unit-test fixtures that wire the registry directly.
+    pub pyre_enum_variants_by_discriminant:
+        RefCell<Option<Rc<HashMap<String, HashMap<i64, String>>>>>,
+    /// TODO: no upstream equivalent.  Interning table mapping an enum
+    /// base/variant class name to its canonical host class `HostObject`,
+    /// the enum analog of [`Self::pyre_struct_root_classes`].  Parent and
+    /// variant classes share this table; the variant entries carry the
+    /// base class in their `HostObject` bases so `getuniqueclassdef`
+    /// wires the `basedef`/`subdefs` hierarchy.  Used by
+    /// [`Self::getuniqueclassdef_for_enum_root`].
+    pub pyre_enum_root_classes: RefCell<HashMap<String, HostObject>>,
 }
 
 impl std::fmt::Debug for Bookkeeper {
@@ -502,6 +522,8 @@ impl Bookkeeper {
             pyre_trait_unique_impls: RefCell::new(HashMap::new()),
             pending_struct_row_projection: RefCell::new(Vec::new()),
             projected_struct_rows: RefCell::new(std::collections::HashSet::new()),
+            pyre_enum_variants_by_discriminant: RefCell::new(None),
+            pyre_enum_root_classes: RefCell::new(HashMap::new()),
         }
     }
 
@@ -545,6 +567,18 @@ impl Bookkeeper {
             .as_ref()
             .map(|reg| reg.fields.keys().cloned().collect())
             .unwrap_or_default()
+    }
+
+    /// TODO: no upstream equivalent.  Wire the pyre-only
+    /// `enum-name -> {discriminant -> variant-name}` metadata so
+    /// [`Self::getuniqueclassdef_for_enum_root`] can build an enum's
+    /// variant subclass hierarchy.  Idempotent: a second call overwrites
+    /// the previous registry.
+    pub fn set_pyre_enum_variants_by_discriminant(
+        &self,
+        registry: Rc<HashMap<String, HashMap<i64, String>>>,
+    ) {
+        *self.pyre_enum_variants_by_discriminant.borrow_mut() = Some(registry);
     }
 
     /// Push a classdef into [`Self::needs_generic_instantiate`] unless
@@ -1620,6 +1654,83 @@ impl Bookkeeper {
             }
         }
         Ok(())
+    }
+
+    /// Resolve an enum type name to the `ClassDef` of its base class,
+    /// minting the base plus one subclass per registered variant so the
+    /// hierarchy mirrors how RPython models an algebraic type — a base
+    /// class with one subclass per case.  The receiver of a
+    /// `match e { V { f } => .. }` enters annotated as
+    /// `SomeInstance(base classdef)` and narrows to the variant subclass
+    /// in the matched arm; the variant's payload field resolves through
+    /// the subclass `ClassDef.attrs` (filled at `_init_classdef` from the
+    /// `FORCE_ATTRIBUTES_INTO_CLASSES` entries that
+    /// `front::mir::derive_program_metadata` registers per variant).
+    ///
+    /// The enum analog of [`Self::getuniqueclassdef_for_struct_root`].
+    /// The variant subclass is keyed by its bare leaf name (the same key
+    /// the LLBC metadata pass registers the variant's forced attributes
+    /// under), so `_init_classdef` finds the payload-field overrides by
+    /// `qualname`.  Identity is stable across calls — the host classes
+    /// are interned once in [`Self::pyre_enum_root_classes`], so the base
+    /// and its subclasses keep the same `ClassDef` by identity.
+    ///
+    /// Returns the base `ClassDef` even when the enum has no registered
+    /// variants (an attrs-empty base, the same way an unregistered struct
+    /// root yields an attrs-empty class).
+    pub fn getuniqueclassdef_for_enum_root(
+        self: &Rc<Self>,
+        enum_name: &str,
+    ) -> Result<Rc<RefCell<ClassDef>>, AnnotatorError> {
+        let base_host = self.intern_enum_class(enum_name, Vec::new());
+        let base_classdef = self.getuniqueclassdef(&base_host)?;
+        // Distinct variant leaf names, in discriminant order so the
+        // subclass registration order is deterministic across runs.
+        let variants: Vec<String> = {
+            let guard = self.pyre_enum_variants_by_discriminant.borrow();
+            match guard.as_ref().and_then(|reg| reg.get(enum_name)) {
+                Some(by_discr) => {
+                    let mut rows: Vec<(i64, String)> =
+                        by_discr.iter().map(|(d, v)| (*d, v.clone())).collect();
+                    rows.sort_by(|a, b| a.0.cmp(&b.0));
+                    let mut seen: Vec<String> = Vec::new();
+                    for (_, v) in rows {
+                        if !seen.contains(&v) {
+                            seen.push(v);
+                        }
+                    }
+                    seen
+                }
+                None => Vec::new(),
+            }
+        };
+        for variant in &variants {
+            // The variant carries the base class in its `HostObject`
+            // bases, so `getuniqueclassdef` -> `ClassDef::new` resolves
+            // `basedef` and registers the subclass in `base.subdefs`
+            // (classdesc.rs:2150-2195).  `_init_classdef` then pulls the
+            // variant's payload-field overrides keyed by this leaf name.
+            let variant_host = self.intern_enum_class(variant, vec![base_host.clone()]);
+            self.getuniqueclassdef(&variant_host)?;
+        }
+        Ok(base_classdef)
+    }
+
+    /// Resolve an enum base/variant class name to its canonical host
+    /// class `HostObject`, minting it on first sight (with the supplied
+    /// `bases`) and caching by name in [`Self::pyre_enum_root_classes`].
+    /// The enum analog of [`Self::intern_struct_root_class`]; the `bases`
+    /// argument is what lets a variant carry its enum base so
+    /// `getuniqueclassdef` wires the `basedef`/`subdefs` hierarchy.
+    fn intern_enum_class(self: &Rc<Self>, name: &str, bases: Vec<HostObject>) -> HostObject {
+        if let Some(existing) = self.pyre_enum_root_classes.borrow().get(name) {
+            return existing.clone();
+        }
+        let host = crate::flowspace::model::HostObject::new_class(name.to_string(), bases);
+        self.pyre_enum_root_classes
+            .borrow_mut()
+            .insert(name.to_string(), host.clone());
+        host
     }
 
     /// Resolve a struct type-root name to its canonical host class
@@ -3289,6 +3400,90 @@ mod tests {
                 .as_ref()
                 .is_some_and(|c| Rc::ptr_eq(c, &inner)),
             "PyFrame.pycode inner classdef must be the same Rc as the standalone PyCode lookup"
+        );
+    }
+
+    #[test]
+    fn getuniqueclassdef_for_enum_root_builds_variant_subclass_hierarchy() {
+        use crate::annotator::classdesc::register_struct_fields;
+        use crate::model::ValueType;
+        let bk = bk();
+        // Variant payload fields, registered the way the LLBC metadata
+        // pass (`derive_program_metadata`) registers them — keyed by the
+        // bare variant leaf name so `_init_classdef` finds them by
+        // `qualname`.  Names are E0b-unique to avoid colliding with other
+        // tests on the thread-local `FORCE_ATTRIBUTES_INTO_CLASSES`.
+        register_struct_fields("StoreNameE0b", &[("namei".to_string(), ValueType::Int)]);
+        register_struct_fields("LoadNameE0b", &[("namei".to_string(), ValueType::Int)]);
+        let mut by_discr: HashMap<i64, String> = HashMap::new();
+        by_discr.insert(0, "StoreNameE0b".to_string());
+        by_discr.insert(1, "LoadNameE0b".to_string());
+        let mut reg: HashMap<String, HashMap<i64, String>> = HashMap::new();
+        reg.insert("InstructionE0b".to_string(), by_discr);
+        bk.set_pyre_enum_variants_by_discriminant(Rc::new(reg));
+
+        let base = bk
+            .getuniqueclassdef_for_enum_root("InstructionE0b")
+            .expect("enum base registers");
+        // Identity: a second lookup returns the SAME base ClassDef Rc —
+        // the enum name resolves to one interned host class object.
+        let base2 = bk
+            .getuniqueclassdef_for_enum_root("InstructionE0b")
+            .expect("enum base re-lookup");
+        assert!(
+            Rc::ptr_eq(&base, &base2),
+            "enum name resolves to one identity-keyed base ClassDef"
+        );
+
+        // Orthodox registration: the base ClassDef lands in
+        // `bookkeeper.classdefs`.
+        assert!(
+            bk.classdef_snapshot().iter().any(|c| Rc::ptr_eq(c, &base)),
+            "base ClassDef must be registered in bookkeeper.classdefs"
+        );
+
+        // Hierarchy: one subclass per variant, each with the base as its
+        // `basedef`, carrying its own payload-field attribute.
+        let subdefs: Vec<Rc<RefCell<ClassDef>>> = base
+            .borrow()
+            .subdefs
+            .iter()
+            .filter_map(std::rc::Weak::upgrade)
+            .collect();
+        assert_eq!(subdefs.len(), 2, "one subclass per registered variant");
+        for variant_name in ["StoreNameE0b", "LoadNameE0b"] {
+            let sub = subdefs
+                .iter()
+                .find(|c| c.borrow().name == variant_name)
+                .unwrap_or_else(|| panic!("subclass {variant_name} registered under base.subdefs"));
+            let basedef = sub.borrow().basedef.clone();
+            assert!(
+                basedef.as_ref().is_some_and(|b| Rc::ptr_eq(b, &base)),
+                "variant {variant_name} subclass basedef is the enum base"
+            );
+            let g = sub.borrow();
+            let namei = g
+                .attrs
+                .get("namei")
+                .unwrap_or_else(|| panic!("variant {variant_name} payload attr `namei` projected"));
+            assert!(
+                matches!(namei.s_value, SomeValue::Integer(_)),
+                "variant payload `namei: i64` -> SomeInteger"
+            );
+        }
+    }
+
+    #[test]
+    fn getuniqueclassdef_for_enum_root_unregistered_yields_attrs_empty_base() {
+        // An enum with no registered variants yields an attrs-empty base
+        // (the same way an unregistered struct root does), not an error.
+        let bk = bk();
+        let base = bk
+            .getuniqueclassdef_for_enum_root("UnregisteredEnumE0b")
+            .expect("unregistered enum yields a base ClassDef");
+        assert!(
+            base.borrow().subdefs.is_empty(),
+            "no registered variants -> no subclasses"
         );
     }
 

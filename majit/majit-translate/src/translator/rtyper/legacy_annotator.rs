@@ -31,10 +31,10 @@ use crate::model::{FunctionGraph, Link, LinkArg, OpKind, ValueType};
 /// (`flowspace/model.py:Variable.annotation`).
 ///
 /// RPython equivalent: `RPythonAnnotator.complete()` — processes all
-/// blocks until no annotation changes.  All bindings land on
-/// `graph.variable_at(slot).annotation`; callers that want a flat
+/// blocks until no annotation changes.  All bindings land on each
+/// `Variable.annotation` cell; callers that want a flat
 /// `ValueType` discriminator read via `read_binding` (tests) or
-/// `somevalue_to_valuetype(&graph.variable_at(slot).annotation.borrow())`
+/// `somevalue_to_valuetype(&var.annotation.borrow())`
 /// (production).
 pub fn annotate(graph: &FunctionGraph) {
     // RPython parity: `annrpython.py:RPythonAnnotator.complete()`

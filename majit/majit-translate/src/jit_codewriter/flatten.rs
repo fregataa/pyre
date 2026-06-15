@@ -1497,22 +1497,22 @@ mod tests {
     use crate::flowspace::model::{ConstValue, Constant};
     use crate::model::{ExitCase, FunctionGraph, OpKind, SpaceOperation, exception_exitcase};
 
-    /// Test helper — build a `regallocs` map keyed on each populated
-    /// slot's Variable with color matching the slot's dense index.
-    /// Iterates only Variables already registered on the graph via
-    /// [`crate::model::FunctionGraph::iter_variable_slots`]; `num_regs`
-    /// is taken from `max_id + 1` so the register file width covers
-    /// every color produced by the identity mapping.
+    /// Test helper — build an Int-kind `regallocs` map that assigns
+    /// each Variable the graph references
+    /// ([`crate::model::FunctionGraph::iter_variables`]) a distinct
+    /// color in first-appearance order.  `num_regs` is `max_id + 1` so
+    /// the register file width covers the produced colors.  Whole-graph
+    /// flatten tests recover a Variable's expected register via
+    /// [`var_reg`] rather than assuming color == slot index.
     fn identity_regallocs(
         graph: &FunctionGraph,
         max_id: usize,
     ) -> std::collections::HashMap<RegKind, crate::regalloc::RegAllocResult> {
         let mut coloring: std::collections::HashMap<crate::flowspace::model::Variable, usize> =
             std::collections::HashMap::new();
-        for (slot, var) in graph.iter_variable_slots() {
-            if slot <= max_id {
-                coloring.insert(var.clone(), slot);
-            }
+        for var in graph.iter_variables() {
+            let color = coloring.len();
+            coloring.entry(var).or_insert(color);
         }
         let num_regs = max_id + 1;
         let mut m = std::collections::HashMap::new();
@@ -1521,6 +1521,35 @@ mod tests {
             crate::regalloc::RegAllocResult { coloring, num_regs },
         );
         m
+    }
+
+    /// Test helper — Int-kind `regallocs` that colors `vars[i]` as `i`,
+    /// for the `insert_renamings` harnesses that supply a value list
+    /// directly (their graph has no blocks for [`identity_regallocs`] to
+    /// walk) and assert expected registers as `int_reg(i)`.
+    fn identity_regallocs_from_vars(
+        vars: &[crate::flowspace::model::Variable],
+        num_regs: usize,
+    ) -> std::collections::HashMap<RegKind, crate::regalloc::RegAllocResult> {
+        let coloring = vars
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (v.clone(), i))
+            .collect();
+        let mut m = std::collections::HashMap::new();
+        m.insert(
+            RegKind::Int,
+            crate::regalloc::RegAllocResult { coloring, num_regs },
+        );
+        m
+    }
+
+    /// Look up the register [`identity_regallocs`] assigned to `var`.
+    fn var_reg(
+        regallocs: &std::collections::HashMap<RegKind, crate::regalloc::RegAllocResult>,
+        var: &crate::flowspace::model::Variable,
+    ) -> Register {
+        Register::new(RegKind::Int, regallocs[&RegKind::Int].coloring[var])
     }
 
     #[test]
@@ -1642,7 +1671,7 @@ mod tests {
         let mut graph = FunctionGraph::new("switch");
         let entry = graph.startblock;
         let cond_var = graph.push_op_var(entry, OpKind::ConstInt(1), true).unwrap();
-        let cond = graph.slot_of(&cond_var).expect("cond registered");
+        let cond_handle = cond_var.clone();
         let case0 = graph.create_block();
         let case1 = graph.create_block();
         let default = graph.create_block();
@@ -1667,7 +1696,7 @@ mod tests {
 
         let mut regallocs = identity_regallocs(&graph, 8);
         let flat = flatten(&graph, &mut regallocs);
-        let expected_value = Register::new(RegKind::Int, cond);
+        let expected_value = var_reg(&regallocs, &cond_handle);
         assert!(
             flat.insns.iter().any(|op| matches!(
                 op,
@@ -1947,12 +1976,8 @@ mod tests {
         let handler = graph.create_block();
         let handler_exc_type_var = graph.alloc_value_var();
         let handler_exc_value_var = graph.alloc_value_var();
-        let handler_exc_type = graph
-            .slot_of(&handler_exc_type_var)
-            .expect("handler_exc_type registered");
-        let handler_exc_value = graph
-            .slot_of(&handler_exc_value_var)
-            .expect("handler_exc_value registered");
+        let handler_exc_type_handle = handler_exc_type_var.clone();
+        let handler_exc_value_handle = handler_exc_value_var.clone();
         graph.push_inputarg_var(handler, handler_exc_type_var);
         graph.push_inputarg_var(handler, handler_exc_value_var.clone());
         // Upstream invariant: typed catch handlers are not empty blocks.
@@ -2011,12 +2036,11 @@ mod tests {
             )),
             "typed exception link should emit goto_if_exception_mismatch"
         );
-        // identity_regallocs maps each Variable at slot n → Int color n.
         // After Phase 3, LastException/LastExcValue carry [`Register`]
         // operands so the assertion compares against the materialized
         // Register identity directly.
-        let expected_exc_type_reg = Register::new(RegKind::Int, handler_exc_type);
-        let expected_exc_value_reg = Register::new(RegKind::Int, handler_exc_value);
+        let expected_exc_type_reg = var_reg(&regallocs, &handler_exc_type_handle);
+        let expected_exc_value_reg = var_reg(&regallocs, &handler_exc_value_handle);
         assert!(
             flat.insns.iter().any(
                 |op| matches!(op, FlatOp::LastException { dst } if *dst == expected_exc_type_reg)
@@ -2039,9 +2063,7 @@ mod tests {
         let mut graph = FunctionGraph::new("final_exceptblock");
         let entry = graph.startblock;
         let (exc_block, last_exception_var, last_exc_value_var) = graph.exceptblock_arg_vars();
-        let last_exc_value = graph
-            .slot_of(&last_exc_value_var)
-            .expect("last_exc_value registered");
+        let last_exc_value_handle = last_exc_value_var.clone();
         graph.set_goto(
             entry,
             exc_block,
@@ -2050,11 +2072,9 @@ mod tests {
 
         let mut regallocs = identity_regallocs(&graph, 16);
         let flat = flatten(&graph, &mut regallocs);
-        // identity_regallocs colors each Variable at slot n as Int n;
-        // Raise carries the exception value's Register (always Ref-kinded).
-        // The test fixture uses identity coloring so the matching Register
-        // is `Register::new(Int, last_exc_value.0)`.
-        let expected_raise_reg = Register::new(RegKind::Int, last_exc_value);
+        // Raise carries the exception value's Register; the fixture's
+        // identity coloring puts it on the value's assigned Int register.
+        let expected_raise_reg = var_reg(&regallocs, &last_exc_value_handle);
         let raise_idx = flat
             .insns
             .iter()
@@ -2107,8 +2127,8 @@ mod tests {
         let lhs_var = graph.push_op_var(entry, OpKind::ConstInt(7), true).unwrap();
         let rhs_var = graph.push_op_var(entry, OpKind::ConstInt(2), true).unwrap();
         graph.push_op_var(entry, OpKind::Live, false);
-        let lhs = graph.slot_of(&lhs_var).expect("lhs registered");
-        let rhs = graph.slot_of(&rhs_var).expect("rhs registered");
+        let lhs_handle = lhs_var.clone();
+        let rhs_handle = rhs_var.clone();
         let sum_var = graph
             .push_op_var(
                 entry,
@@ -2121,7 +2141,7 @@ mod tests {
                 true,
             )
             .unwrap();
-        let sum = graph.slot_of(&sum_var).expect("sum registered");
+        let sum_handle = sum_var.clone();
 
         let handler = graph.create_block();
         let handler_exc_type_var = graph.alloc_value_var();
@@ -2157,9 +2177,9 @@ mod tests {
 
         let mut regallocs = identity_regallocs(&graph, 16);
         let flat = flatten(&graph, &mut regallocs);
-        let expected_lhs = Register::new(RegKind::Int, lhs);
-        let expected_rhs = Register::new(RegKind::Int, rhs);
-        let expected_dst = Register::new(RegKind::Int, sum);
+        let expected_lhs = var_reg(&regallocs, &lhs_handle);
+        let expected_rhs = var_reg(&regallocs, &rhs_handle);
+        let expected_dst = var_reg(&regallocs, &sum_handle);
         assert!(
             flat.insns.iter().any(|op| matches!(
                 op,
@@ -2332,21 +2352,19 @@ mod tests {
             .max()
             .unwrap_or(0);
         let mut graph = FunctionGraph::new("renamings_test");
-        while graph.next_value() <= max_id {
-            let _ = graph.alloc_value_var_with_type(crate::model::ConcreteType::Signed);
-        }
+        let vars: Vec<crate::flowspace::model::Variable> = (0..=max_id)
+            .map(|_| graph.alloc_value_var_with_type(crate::model::ConcreteType::Signed))
+            .collect();
         let arg_vars: Vec<crate::flowspace::model::Variable> =
-            args.iter().map(|v| graph.must_variable_at(*v)).collect();
+            args.iter().map(|&v| vars[v].clone()).collect();
         let link = Link::new_mixed(
             arg_vars.into_iter().map(LinkArg::Value).collect(),
             BlockId(0),
             None,
         );
-        let target_input_vars: Vec<crate::flowspace::model::Variable> = target_inputargs
-            .iter()
-            .map(|v| graph.must_variable_at(*v))
-            .collect();
-        let regallocs = identity_regallocs(&graph, max_id);
+        let target_input_vars: Vec<crate::flowspace::model::Variable> =
+            target_inputargs.iter().map(|&v| vars[v].clone()).collect();
+        let regallocs = identity_regallocs_from_vars(&vars, max_id + 1);
         let mut f = GraphFlattener::new(&graph, &regallocs, false);
         f.insert_renamings(&link, &target_input_vars);
         f.ssarepr.insns
@@ -2359,15 +2377,13 @@ mod tests {
     ) -> Vec<FlatOp> {
         let max_id = target_inputargs.iter().copied().max().unwrap_or(0);
         let mut graph = FunctionGraph::new("renamings_test");
-        while graph.next_value() <= max_id {
-            let _ = graph.alloc_value_var_with_type(crate::model::ConcreteType::Signed);
-        }
-        let link = Link::new_mixed(link_args, BlockId(0), None);
-        let target_input_vars: Vec<crate::flowspace::model::Variable> = target_inputargs
-            .iter()
-            .map(|v| graph.must_variable_at(*v))
+        let vars: Vec<crate::flowspace::model::Variable> = (0..=max_id)
+            .map(|_| graph.alloc_value_var_with_type(crate::model::ConcreteType::Signed))
             .collect();
-        let regallocs = identity_regallocs(&graph, max_id);
+        let link = Link::new_mixed(link_args, BlockId(0), None);
+        let target_input_vars: Vec<crate::flowspace::model::Variable> =
+            target_inputargs.iter().map(|&v| vars[v].clone()).collect();
+        let regallocs = identity_regallocs_from_vars(&vars, max_id + 1);
         let mut f = GraphFlattener::new(&graph, &regallocs, false);
         f.insert_renamings(&link, &target_input_vars);
         f.ssarepr.insns
@@ -2375,9 +2391,9 @@ mod tests {
 
     /// `run_insert_renamings` variant that lets the test author
     /// stamp arbitrary per-Variable colorings (used by the coalesce /
-    /// cycle / multi-kind tests).  Builds a graph with enough
-    /// slots, then constructs each kind's `coloring` from
-    /// `graph.value_variables` so the Variable-keyed lookup matches.
+    /// cycle / multi-kind tests).  Mints one Variable per value id and
+    /// constructs each kind's `coloring` over those held Variables so
+    /// the Variable-keyed lookup matches.
     fn run_insert_renamings_with_coloring(
         args: &[usize],
         target_inputargs: &[usize],
@@ -2394,11 +2410,10 @@ mod tests {
             )
             .max()
             .unwrap_or(0);
-        // Per-slot kind: walk the spec so we can stamp each
-        // backing Variable's `concretetype` with the matching
-        // `ConcreteType` (Signed/GcRef/Float).  Without this stamp,
-        // `graph.concretetype_of(&var)` would default to `Unknown` and
-        // `kind_color_of` would skip the strict path.
+        // Per-value kind: stamp each Variable's `concretetype` with the
+        // matching `ConcreteType` (Signed/GcRef/Float).  Without this
+        // stamp `graph.concretetype_of(&var)` would default to `Unknown`
+        // and `kind_color_of` would skip the strict path.
         let mut value_kinds: HashMap<usize, RegKind> = HashMap::new();
         for (kind, pairs) in kind_colors {
             for (vid, _) in *pairs {
@@ -2406,23 +2421,23 @@ mod tests {
             }
         }
         let mut graph = FunctionGraph::new("renamings_test");
-        while graph.next_value() <= max_id {
-            let vid = graph.next_value();
-            let kind = value_kinds.get(&vid).copied().unwrap_or(RegKind::Int);
-            let concrete = match kind {
-                RegKind::Int => crate::model::ConcreteType::Signed,
-                RegKind::Ref => crate::model::ConcreteType::GcRef,
-                RegKind::Float => crate::model::ConcreteType::Float,
-            };
-            let _ = graph.alloc_value_var_with_type(concrete);
-        }
+        let vars: Vec<crate::flowspace::model::Variable> = (0..=max_id)
+            .map(|vid| {
+                let kind = value_kinds.get(&vid).copied().unwrap_or(RegKind::Int);
+                let concrete = match kind {
+                    RegKind::Int => crate::model::ConcreteType::Signed,
+                    RegKind::Ref => crate::model::ConcreteType::GcRef,
+                    RegKind::Float => crate::model::ConcreteType::Float,
+                };
+                graph.alloc_value_var_with_type(concrete)
+            })
+            .collect();
         let mut regallocs = HashMap::new();
         for (kind, pairs) in kind_colors {
             let mut coloring: HashMap<crate::flowspace::model::Variable, usize> = HashMap::new();
             let mut max_color = 0usize;
             for (vid, color) in *pairs {
-                let var = graph.must_variable_at(*vid);
-                coloring.insert(var, *color);
+                coloring.insert(vars[*vid].clone(), *color);
                 if *color + 1 > max_color {
                     max_color = *color + 1;
                 }
@@ -2436,16 +2451,14 @@ mod tests {
             );
         }
         let arg_vars: Vec<crate::flowspace::model::Variable> =
-            args.iter().map(|v| graph.must_variable_at(*v)).collect();
+            args.iter().map(|&v| vars[v].clone()).collect();
         let link = Link::new_mixed(
             arg_vars.into_iter().map(LinkArg::Value).collect(),
             BlockId(0),
             None,
         );
-        let target_input_vars: Vec<crate::flowspace::model::Variable> = target_inputargs
-            .iter()
-            .map(|v| graph.must_variable_at(*v))
-            .collect();
+        let target_input_vars: Vec<crate::flowspace::model::Variable> =
+            target_inputargs.iter().map(|&v| vars[v].clone()).collect();
         let mut f = GraphFlattener::new(&graph, &regallocs, false);
         f.insert_renamings(&link, &target_input_vars);
         f.ssarepr.insns

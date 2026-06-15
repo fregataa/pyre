@@ -4,7 +4,7 @@
 //! `model::FunctionGraph` by way of the
 //! [`crate::translator::rtyper::flowspace_adapter::function_graph_to_flowspace`]
 //! adapter, then projects each per-`Variable` `LowLevelType` back to a
-//! `ConcreteType` keyed by the original pyre slot (`usize`).
+//! `ConcreteType` keyed by the legacy `Variable` identity.
 //!
 //! ## Why this file is in `translator/rtyper/`
 //!
@@ -125,11 +125,11 @@ pub(crate) fn lowleveltype_to_concrete(ll: &LowLevelType) -> Result<ConcreteType
 // program-wide `compute_at_fixpoint` loop discovers callees from
 // subject call sites without any pre-seed.
 
-/// RAII guard that snapshots every live `legacy_graph.variable_at(slot).
-/// annotation` cell and restores it on `Drop`, isolating the
-/// dual-gate baseline's `legacy_annotator::annotate` writes from any
-/// subsequent reader on the same graph.  See the `dual_gate_check`
-/// doc for the failure mode this prevents.
+/// RAII guard that snapshots every live `Variable.annotation` cell
+/// reachable from `iter_variables()` and restores it on `Drop`,
+/// isolating the dual-gate baseline's `legacy_annotator::annotate`
+/// writes from any subsequent reader on the same graph.  See the
+/// `dual_gate_check` doc for the failure mode this prevents.
 struct LegacyAnnotationGuard {
     snapshot: Vec<(
         crate::flowspace::model::Variable,
@@ -159,15 +159,16 @@ impl Drop for LegacyAnnotationGuard {
     }
 }
 
-/// Run `specialize_legacy_graph` and diff against `legacy_state`.
+/// Run `specialize_legacy_graph` and diff the real path against the
+/// legacy walker's `Variable.concretetype` view.
 ///
 /// Returns `Err(message)` when:
 ///
 /// - the real path errors out (typer error from an unported `OpKind`
 ///   arm), OR
-/// - a legacy-known slot is missing / `Unknown` / different in
+/// - a legacy-known `Variable` is missing / `Unknown` / different in
 ///   the real path, OR
-/// - the real path produced a definite kind for a slot the legacy
+/// - the real path produced a definite kind for a `Variable` the legacy
 ///   resolver did not resolve.
 ///
 /// Returns `Ok(())` only when the legacy `legacy_graph.concretetype`
@@ -207,10 +208,8 @@ pub(crate) fn dual_gate_check(legacy_graph: &LegacyGraph) -> Result<(), String> 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         specialize_legacy_graph(legacy_graph)
     }));
-    let real_state = match result {
-        Ok(Ok((value_to_var, constants))) => {
-            project_value_to_var_to_map(&value_to_var, &constants, legacy_graph)
-        }
+    let (value_to_var, constants) = match result {
+        Ok(Ok(pair)) => pair,
         Ok(Err(e)) => return Err(format!("real path failed: {e}")),
         Err(payload) => {
             let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
@@ -226,7 +225,7 @@ pub(crate) fn dual_gate_check(legacy_graph: &LegacyGraph) -> Result<(), String> 
 
     // Defensive baseline diff against the legacy walker.  Mirrors the
     // `_with_registry` variant (cutover.rs:370-373): runs after the
-    // real path's flowin so `graph.variable_at(vid.0).annotation` is
+    // real path's flowin so `Variable.annotation` is
     // not pre-populated with the legacy walker's wider lift before
     // `seed_variable` runs (orthodox `_setbinding` monotonicity).
     // `legacy_resolve::resolve_types` writes `graph.concretetype` from
@@ -234,7 +233,7 @@ pub(crate) fn dual_gate_check(legacy_graph: &LegacyGraph) -> Result<(), String> 
     // comparison loop below reads `graph.concretetype` directly.
     //
     // The annotation guard snapshots every live
-    // `legacy_graph.variable_at(vid.0).annotation` cell before the
+    // `Variable.annotation` cell before the
     // baseline and restores the snapshot on `Drop` (end of this
     // function's scope, including early returns and panic unwinds).
     // Without it
@@ -262,54 +261,15 @@ pub(crate) fn dual_gate_check(legacy_graph: &LegacyGraph) -> Result<(), String> 
         ));
     }
 
-    let mut divergences: Vec<String> = Vec::new();
-
-    // Diff every legacy-defined value. Once this gate is used to prove
-    // cutover parity, real-path `Unknown` for a legacy-known value is a
-    // coverage bug, not success.
-    //
-    // The legacy walker's kinds are read from `legacy_graph.concretetype`:
-    // `resolve_types` dual-writes every populated slot through
-    // `FunctionGraph::set_concretetype_of_inline`, so the graph cells
-    // carry the kind view this comparison reads.
-    let legacy_snapshot = legacy_graph.concretetype_snapshot();
-    let reachable_vars = reachable_defined_vars(legacy_graph);
-    for (idx, legacy_kind) in legacy_snapshot.iter().enumerate() {
-        if *legacy_kind == ConcreteType::Unknown {
-            continue;
-        }
-        // Legacy-only slots: see `reachable_defined_vars`.
-        if !legacy_graph
-            .variable_at(idx)
-            .is_some_and(|v| reachable_vars.contains(v))
-        {
-            continue;
-        }
-        let real_kind = real_state.get(&idx).unwrap_or(&ConcreteType::Unknown);
-        if real_kind != legacy_kind {
-            divergences.push(format!(
-                "slot {} ({}): legacy={:?}, real={:?}",
-                idx,
-                divergence_slot_label(legacy_graph, idx),
-                legacy_kind,
-                real_kind
-            ));
-        }
-    }
-    // Asymmetry direction: real should not produce a definite kind for
-    // a slot the legacy resolver never resolved.
-    for (idx, real_kind) in &real_state {
-        let legacy_kind = legacy_graph.concretetype_at(*idx);
-        if legacy_kind == ConcreteType::Unknown {
-            divergences.push(format!(
-                "slot {} ({}): legacy={:?}, real={:?}",
-                idx,
-                divergence_slot_label(legacy_graph, *idx),
-                legacy_kind,
-                real_kind
-            ));
-        }
-    }
+    // Diff every legacy-resolved value against the real path. Once this
+    // gate is used to prove cutover parity, real-path `Unknown` for a
+    // legacy-known value (and the reverse asymmetry — a real kind for a
+    // value the legacy walker left Unknown) is a coverage bug, not
+    // success.  The legacy walker's kinds are read off each Variable's
+    // `concretetype` cell, which `resolve_types` populated through
+    // `FunctionGraph::set_concretetype_of_inline`.
+    let real_state = project_value_to_var(&value_to_var, &constants);
+    let divergences = collect_divergences(&real_state, legacy_graph);
 
     if divergences.is_empty() {
         Ok(())
@@ -341,9 +301,9 @@ pub(crate) fn dual_gate_check(legacy_graph: &LegacyGraph) -> Result<(), String> 
 pub(crate) enum DualGateOutcome {
     /// Real path completed without panicking and (when the legacy
     /// walker also succeeded as defensive baseline) every legacy-
-    /// known slot carried the same `ConcreteType` in the real
+    /// known `Variable` carried the same `ConcreteType` in the real
     /// path's projection.  Production consumes `real_state`
-    /// authoritatively.  Per-slot diff against the legacy
+    /// authoritatively.  Per-`Variable` diff against the legacy
     /// baseline runs whenever the legacy walker can produce a
     /// state — divergence routes the graph through
     /// `Skip("dual-gate divergence: ...")` so the codewriter falls
@@ -371,7 +331,7 @@ pub(crate) enum DualGateOutcome {
     /// - `OpKind::Call::FunctionPath { segments }` not in the
     ///   registry (cross-crate / primitive paths the production
     ///   walker doesn't reach yet).
-    /// - `undefined operand slot` from cross-block locals
+    /// - `undefined operand` from cross-block locals
     ///   threading not yet covered.
     /// - `unimplemented operation` from a not-yet-ported rtyper op
     ///   (e.g. `direct_call` for graphs the rpbc port doesn't
@@ -610,77 +570,38 @@ fn unpoison_failed_subject_callees(
     }
 }
 
-/// Local projection of `value_to_var` Variables' concretetype cells
-/// into a `BTreeMap<usize, ConcreteType>` keyed by the dense slot
-/// index.  Errors from unsupported lltypes are silently treated as
-/// missing entries — `specialize_legacy_graph` already propagates the
-/// failure to its caller before reaching the dual-gate, so reaching
-/// here implies every Variable's lltype is projectable.  BTreeMap
-/// iteration is ascending-slot-index so anchor-test "first
-/// divergence" messages stay deterministic across runs.
+/// Project the real path's resolved kind per legacy `Variable`, keyed
+/// by Variable identity.  `value_to_var` already pairs each legacy
+/// Variable with its rtyper-typed twin, and `constant_concretetypes`
+/// carries the ground-truth lltype for const-define results, so no slot
+/// projection is needed.  Errors from unsupported lltypes are treated as
+/// missing entries — `specialize_legacy_graph` already propagates such a
+/// failure before the dual-gate runs, so reaching here implies every
+/// lltype is projectable.
 ///
-/// Used by both [`dual_gate_check_with_registry`] and the
-/// [`dual_gate_check`] anchor-test helper to diff the real path against
-/// the legacy walker.
-/// Best-effort label for a diverging slot: the variable name plus the
-/// `OpKind` (or inputarg position) defining it.  Divergence messages
-/// name anonymous temps (`v2332`) -- without the defining op the
-/// report cannot be acted on short of a graph dump.  Runs only on the
-/// divergence path.
-fn divergence_slot_label(graph: &LegacyGraph, idx: usize) -> String {
-    let Some(var) = graph.variable_at(idx) else {
-        return "<no var>".to_string();
-    };
-    for block in graph.iter_blocks() {
-        for op in &block.operations {
-            if op.result.as_ref() == Some(var) {
-                let mut kind = format!("{:?}", op.kind);
-                if kind.len() > 120 {
-                    // `String::truncate` panics off a char boundary;
-                    // ConstRef payloads can embed multibyte string
-                    // literals, so floor the cut to a boundary.
-                    let mut cut = 120;
-                    while !kind.is_char_boundary(cut) {
-                        cut -= 1;
-                    }
-                    kind.truncate(cut);
-                }
-                return format!("{} <- {}", var.name(), kind);
-            }
-        }
-        if block.inputargs.iter().any(|ia| ia == var) {
-            return format!("{} <- inputarg of block {:?}", var.name(), block.id);
-        }
-    }
-    // Not defined by any op or inputarg — report where it is *used*
-    // (exitswitch / outgoing Link.args), the only remaining places a
-    // slot-table variable can appear; an undefined-but-used variable
-    // is itself the diagnosis.
-    for block in graph.iter_blocks() {
-        if let Some(crate::model::ExitSwitch::Value(sw)) = &block.exitswitch
-            && sw == var
-        {
-            return format!(
-                "{} <- exitswitch of block {:?} (no def)",
-                var.name(),
-                block.id
-            );
-        }
-        for link in &block.exits {
-            if link
-                .args
-                .iter()
-                .any(|a| matches!(a, crate::model::LinkArg::Value(v) if v == var))
-            {
-                return format!(
-                    "{} <- Link.args out of block {:?} (no def)",
-                    var.name(),
-                    block.id
-                );
+/// Used by both [`dual_gate_check_with_registry`] (via
+/// [`compare_real_against_legacy`]) and the [`dual_gate_check`]
+/// anchor-test helper to diff the real path against the legacy walker.
+fn project_value_to_var(
+    value_to_var: &LegacyToTyped,
+    constant_concretetypes: &HashMap<Variable, LowLevelType>,
+) -> HashMap<Variable, ConcreteType> {
+    let mut real_state: HashMap<Variable, ConcreteType> = HashMap::new();
+    for (legacy_var, typed_var) in value_to_var {
+        if let Some(lltype) = typed_var.concretetype().as_ref() {
+            if let Ok(kind) = lowleveltype_to_concrete(lltype) {
+                real_state.insert(legacy_var.clone(), kind);
             }
         }
     }
-    format!("{} (in no reachable block)", var.name())
+    // `Constant.concretetype` is the ground truth for constant operands;
+    // the const-define result Variable overrides the value_to_var entry.
+    for (legacy_var, lltype) in constant_concretetypes {
+        if let Ok(kind) = lowleveltype_to_concrete(lltype) {
+            real_state.insert(legacy_var.clone(), kind);
+        }
+    }
+    real_state
 }
 
 /// Variables defined (inputarg or op result) in the reachable block
@@ -718,40 +639,49 @@ fn reachable_defined_vars(graph: &LegacyGraph) -> std::collections::HashSet<Vari
     vars
 }
 
-fn project_value_to_var_to_map(
-    value_to_var: &LegacyToTyped,
-    constant_concretetypes: &HashMap<Variable, LowLevelType>,
+/// Diff the real path's per-Variable kinds against the legacy walker's
+/// kinds committed onto the same legacy Variables.  Walks
+/// [`FunctionGraph::iter_variables`] for a deterministic, slot-free
+/// traversal restricted to [`reachable_defined_vars`]; `value_to_var`
+/// aligns the two paths by Variable identity, so the legacy kind is
+/// read straight off each Variable's `concretetype` cell.  Returns
+/// every divergence; the caller decides first-only versus all.
+fn collect_divergences(
+    real_state: &HashMap<Variable, ConcreteType>,
     legacy_graph: &LegacyGraph,
-) -> std::collections::BTreeMap<usize, ConcreteType> {
-    let mut real_state = std::collections::BTreeMap::new();
-    // `value_to_var` is keyed by the legacy graph Variable's identity;
-    // this comparison diffs against the dense slot-indexed legacy
-    // snapshot, so project each key Variable back to its slot here.
-    for (legacy_var, typed_var) in value_to_var {
-        let Some(idx) = legacy_graph.slot_of(legacy_var) else {
+) -> Vec<String> {
+    let reachable_vars = reachable_defined_vars(legacy_graph);
+    let mut divergences = Vec::new();
+    for (pos, var) in legacy_graph.iter_variables().iter().enumerate() {
+        // `iterblocks()` parity: the real path annotates only the
+        // startblock-reachable closure, so a value defined solely in an
+        // unreachable legacy block has no real-path kind.  Comparing it
+        // reads real=Unknown and reports a false divergence; skip it
+        // exactly as the real path's `remove_dead_blocks` prune does.
+        if !reachable_vars.contains(var) {
             continue;
+        }
+        let legacy_kind = LegacyGraph::concretetype_of(var);
+        let real_present = real_state.get(var).copied();
+        let real_kind = real_present.unwrap_or(ConcreteType::Unknown);
+        // A kind the legacy walker resolved must match the real path;
+        // conversely the real path must not resolve a kind for a value
+        // the legacy walker left Unknown.
+        let diverges = if legacy_kind != ConcreteType::Unknown {
+            real_kind != legacy_kind
+        } else {
+            real_present.is_some()
         };
-        if let Some(lltype) = typed_var.concretetype().as_ref() {
-            if let Ok(kind) = lowleveltype_to_concrete(lltype) {
-                real_state.insert(idx, kind);
-            }
+        if diverges {
+            let label = legacy_graph
+                .value_name_for(var)
+                .unwrap_or_else(|| format!("v{pos}"));
+            divergences.push(format!(
+                "{label}: legacy={legacy_kind:?}, real={real_kind:?}"
+            ));
         }
     }
-    // `Constant.concretetype` is the ground truth for constant operands
-    // — read it from the adapter's per-`Variable` map rather than
-    // attempting to reconstruct from the reduced legacy `ValueType`
-    // view.  Project each const-define result Variable back to its slot
-    // (same as the `value_to_var` loop above) so it lands in the dense
-    // slot-indexed snapshot this helper diffs against.
-    for (legacy_var, lltype) in constant_concretetypes {
-        let Some(idx) = legacy_graph.slot_of(legacy_var) else {
-            continue;
-        };
-        if let Ok(kind) = lowleveltype_to_concrete(lltype) {
-            real_state.insert(idx, kind);
-        }
-    }
-    real_state
+    divergences
 }
 
 fn compare_real_against_legacy(
@@ -759,44 +689,10 @@ fn compare_real_against_legacy(
     constants: &HashMap<Variable, LowLevelType>,
     legacy_graph: &LegacyGraph,
 ) -> Option<String> {
-    let real_state = project_value_to_var_to_map(value_to_var, constants, legacy_graph);
-    let legacy_snapshot = legacy_graph.concretetype_snapshot();
-    let reachable_vars = reachable_defined_vars(legacy_graph);
-    for (idx, legacy_kind) in legacy_snapshot.iter().enumerate() {
-        if *legacy_kind == ConcreteType::Unknown {
-            continue;
-        }
-        // Legacy-only slots: see `reachable_defined_vars`.
-        if !legacy_graph
-            .variable_at(idx)
-            .is_some_and(|v| reachable_vars.contains(v))
-        {
-            continue;
-        }
-        let real_kind = real_state.get(&idx).unwrap_or(&ConcreteType::Unknown);
-        if real_kind != legacy_kind {
-            return Some(format!(
-                "slot {} ({}): legacy={:?}, real={:?}",
-                idx,
-                divergence_slot_label(legacy_graph, idx),
-                legacy_kind,
-                real_kind
-            ));
-        }
-    }
-    for (idx, real_kind) in &real_state {
-        let legacy_kind = legacy_graph.concretetype_at(*idx);
-        if legacy_kind == ConcreteType::Unknown {
-            return Some(format!(
-                "slot {} ({}): legacy={:?}, real={:?}",
-                idx,
-                divergence_slot_label(legacy_graph, *idx),
-                legacy_kind,
-                real_kind
-            ));
-        }
-    }
-    None
+    let real_state = project_value_to_var(value_to_var, constants);
+    collect_divergences(&real_state, legacy_graph)
+        .into_iter()
+        .next()
 }
 
 /// Return true when `msg` matches one of the known-unported
@@ -815,7 +711,7 @@ fn compare_real_against_legacy(
 /// | Substring                                  | Unimplemented feature                                                        |
 /// |--------------------------------------------|------------------------------------------------------------------------------|
 /// | `not registered in PyreCallRegistry`       | Extern Rust helper registry walker.                                          |
-/// | `undefined operand slot`                   | Adapter producer correctness.                                                |
+/// | `translate_op: undefined operand`          | Adapter producer correctness.                                                |
 /// | `unimplemented operation`                  | Per-opname rtyper handlers.                                                  |
 /// | `variable used before definition`          | Cross-block locals threading.                                                |
 /// | `MissingRTypeAttribute`                    | Typed-Ref → SomeInstance(ClassDef).                                          |
@@ -832,7 +728,7 @@ fn compare_real_against_legacy(
 /// predicate retires entirely.
 pub(crate) fn is_known_unported(msg: &str) -> bool {
     msg.contains("not registered in PyreCallRegistry")
-        || msg.contains("undefined operand slot")
+        || msg.contains("translate_op: undefined operand")
         || msg.contains("unimplemented operation")
         || msg.contains("variable ")
             && msg.contains(" used before definition")
@@ -1558,7 +1454,7 @@ pub fn specialize_legacy_graph(
 /// typed `Variable.concretetype` writes are copied onto the matching
 /// legacy Variables by
 /// [`crate::jit_codewriter::type_state::apply_from_flowspace_variables`].
-/// `constants` feeds [`project_value_to_var_to_map`] for the
+/// `constants` feeds [`project_value_to_var`] for the
 /// dual-gate baseline comparison.
 ///
 /// Test fixtures that hand-roll minimal SSA shapes without
@@ -1790,8 +1686,8 @@ pub fn specialize_legacy_graph_with_registry_returning_value_to_var(
     // No eager per-slot side table is built here.  Each callable that
     // needs a kind view derives one on demand from `value_to_var` +
     // `constant_concretetypes` via
-    // [`project_value_to_var_to_map`] — same `Variable.concretetype`
-    // / `Constant.concretetype` ground truth, routed at the
+    // [`project_value_to_var`] — same `Variable.concretetype`
+    // / `Constant.concretetype` ground truth, just routed at the
     // consumer instead of eagerly materialised here.  Run a
     // validation pass so unsupported lltypes still surface as a
     // [`TyperError`] at this boundary (a fail-loud `?` propagation).
@@ -1824,39 +1720,36 @@ mod tests {
         crate::model::Link::new_mixed(args, returnblock_id, None)
     }
 
-    /// Test helper — read the concrete kind for the legacy graph slot at
-    /// `idx` from the post-rtyper `LegacyToTyped` map's
-    /// `Variable.concretetype` cell (`flowspace/model.py:280`).  The map
-    /// is keyed by the legacy Variable's identity, so resolve the slot to
-    /// its backing Variable on `graph` first.
-    fn kind_of_in(value_to_var: &LegacyToTyped, graph: &LegacyGraph, idx: usize) -> ConcreteType {
-        let key = graph.must_variable_at(idx);
-        let var = value_to_var
-            .get(&key)
-            .unwrap_or_else(|| panic!("slot {idx} missing from value_to_var"));
-        let ll = var
-            .concretetype()
-            .unwrap_or_else(|| panic!("Variable.concretetype for slot {idx} not populated"));
-        lowleveltype_to_concrete(&ll)
-            .unwrap_or_else(|_| panic!("lltype for slot {idx} does not project to ConcreteType"))
+    /// Mint `n` fresh values on `graph`, returned indexed `0..n` so
+    /// fixtures can refer to inputargs / operands positionally.
+    fn mint_vars(graph: &mut LegacyGraph, n: usize) -> Vec<crate::flowspace::model::Variable> {
+        (0..n).map(|_| graph.alloc_value_var()).collect()
     }
 
-    /// Test helper — project slot indices to their backing Variables
-    /// on the graph so a `Block { inputargs: ..., .. }` struct literal
-    /// can carry the upstream-orthodox `Vec<Variable>` shape.
-    /// Auto-grows the graph via `set_next_value` when an index past
-    /// the canonical 3 slots is referenced so each has a backing
-    /// Variable registered in `variable_to_vid`.
+    /// Read the concrete kind for a legacy graph `Variable` from the
+    /// post-rtyper `LegacyToTyped` map's `Variable.concretetype` cell.
+    /// The map is keyed by the legacy Variable's identity.
+    fn kind_of_in(
+        value_to_var: &LegacyToTyped,
+        var: &crate::flowspace::model::Variable,
+    ) -> ConcreteType {
+        let typed = value_to_var
+            .get(var)
+            .unwrap_or_else(|| panic!("value missing from value_to_var"));
+        let ll = typed
+            .concretetype()
+            .unwrap_or_else(|| panic!("Variable.concretetype not populated"));
+        lowleveltype_to_concrete(&ll)
+            .unwrap_or_else(|_| panic!("lltype does not project to ConcreteType"))
+    }
+
+    /// Project positional indices to held Variables for
+    /// `Block { inputargs, .. }` literals.
     fn block_inputargs(
-        graph: &mut LegacyGraph,
+        vars: &[crate::flowspace::model::Variable],
         vids: &[usize],
     ) -> Vec<crate::flowspace::model::Variable> {
-        if let Some(max) = vids.iter().copied().max() {
-            if max >= graph.next_value() {
-                graph.set_next_value(max + 1);
-            }
-        }
-        vids.iter().map(|v| graph.must_variable_at(*v)).collect()
+        vids.iter().map(|&i| vars[i].clone()).collect()
     }
 
     #[test]
@@ -1967,8 +1860,9 @@ mod tests {
         // projection chain works end-to-end on a graph the rtyper can
         // resolve without any unported OpKind variants.
         let mut graph = LegacyGraph::new("identity_int");
-        let inputargs = block_inputargs(&mut graph, &[1]);
-        let v1_var = inputargs[0].clone();
+        let vars = mint_vars(&mut graph, 2);
+        let inputargs = block_inputargs(&vars, &[1]);
+        let v1_var = vars[1].clone();
         let startblock = Block {
             id: graph.startblock,
             inputargs,
@@ -1983,7 +1877,7 @@ mod tests {
         };
         let returnblock = Block {
             id: graph.returnblock,
-            inputargs: block_inputargs(&mut graph, &[1]),
+            inputargs: block_inputargs(&vars, &[1]),
             operations: vec![],
             exitswitch: None,
             exits: vec![],
@@ -1997,7 +1891,7 @@ mod tests {
             specialize_legacy_graph(&graph).expect("identity int graph must specialize");
 
         assert_eq!(
-            kind_of_in(&value_to_var, &graph, 1),
+            kind_of_in(&value_to_var, &vars[1]),
             ConcreteType::Signed,
             "Int-typed inputarg must specialize to Signed via SomeInteger → IntegerRepr"
         );
@@ -2007,8 +1901,9 @@ mod tests {
     fn specialize_legacy_graph_minimal_float_identity_resolves_float() {
         let _lock = anchor_lock();
         let mut graph = LegacyGraph::new("identity_float");
-        let inputargs = block_inputargs(&mut graph, &[1]);
-        let v1_var = inputargs[0].clone();
+        let vars = mint_vars(&mut graph, 2);
+        let inputargs = block_inputargs(&vars, &[1]);
+        let v1_var = vars[1].clone();
         let startblock = Block {
             id: graph.startblock,
             inputargs,
@@ -2023,7 +1918,7 @@ mod tests {
         };
         let returnblock = Block {
             id: graph.returnblock,
-            inputargs: block_inputargs(&mut graph, &[1]),
+            inputargs: block_inputargs(&vars, &[1]),
             operations: vec![],
             exitswitch: None,
             exits: vec![],
@@ -2037,7 +1932,7 @@ mod tests {
             specialize_legacy_graph(&graph).expect("identity float graph must specialize");
 
         assert_eq!(
-            kind_of_in(&value_to_var, &graph, 1),
+            kind_of_in(&value_to_var, &vars[1]),
             ConcreteType::Float,
             "Float-typed inputarg must specialize to Float via SomeFloat → FloatRepr"
         );
@@ -2055,8 +1950,9 @@ mod tests {
         // collapses any GC pointer to `ConcreteType::GcRef`, matching
         // legacy `resolve_types(Ref) -> GcRef`.
         let mut graph = LegacyGraph::new("identity_ref");
-        let inputargs = block_inputargs(&mut graph, &[1]);
-        let v1_var = inputargs[0].clone();
+        let vars = mint_vars(&mut graph, 2);
+        let inputargs = block_inputargs(&vars, &[1]);
+        let v1_var = vars[1].clone();
         let startblock = Block {
             id: graph.startblock,
             inputargs,
@@ -2071,7 +1967,7 @@ mod tests {
         };
         let returnblock = Block {
             id: graph.returnblock,
-            inputargs: block_inputargs(&mut graph, &[1]),
+            inputargs: block_inputargs(&vars, &[1]),
             operations: vec![],
             exitswitch: None,
             exits: vec![],
@@ -2084,7 +1980,7 @@ mod tests {
         let (value_to_var, _constants) = specialize_legacy_graph(&graph)
             .expect("Ref-typed inputarg must specialize via SomeInstance(classdef=None)");
         assert_eq!(
-            kind_of_in(&value_to_var, &graph, 1),
+            kind_of_in(&value_to_var, &vars[1]),
             ConcreteType::GcRef,
             "Ref-typed inputarg must project to GcRef matching legacy"
         );
@@ -2110,9 +2006,10 @@ mod tests {
         // `translator.graphs`, graphanalyze.rs) instead of falling to
         // `top_result()`.
         let mut graph = LegacyGraph::new("call_resolved");
-        let inputargs = block_inputargs(&mut graph, &[1]);
-        let v1_var = inputargs[0].clone();
-        let (_, _, v2_var) = graph.exceptblock_arg_vars();
+        let vars = mint_vars(&mut graph, 3);
+        let inputargs = block_inputargs(&vars, &[1]);
+        let v1_var = vars[1].clone();
+        let v2_var = vars[2].clone();
         let startblock = Block {
             id: graph.startblock,
             inputargs,
@@ -2136,7 +2033,7 @@ mod tests {
         };
         let returnblock = Block {
             id: graph.returnblock,
-            inputargs: block_inputargs(&mut graph, &[2]),
+            inputargs: block_inputargs(&vars, &[2]),
             operations: vec![],
             exitswitch: None,
             exits: vec![],
@@ -2156,8 +2053,9 @@ mod tests {
         // `base.bookkeeper` is the bookkeeper `ensure_session` attaches
         // the annotator to.
         let mut callee_graph = LegacyGraph::new("foo");
-        let foo_inputargs = block_inputargs(&mut callee_graph, &[10]);
-        let foo_v10_var = foo_inputargs[0].clone();
+        let callee_vars = mint_vars(&mut callee_graph, 11);
+        let foo_inputargs = block_inputargs(&callee_vars, &[10]);
+        let foo_v10_var = callee_vars[10].clone();
         let foo_start = Block {
             id: callee_graph.startblock,
             inputargs: foo_inputargs,
@@ -2172,7 +2070,7 @@ mod tests {
         };
         let foo_return = Block {
             id: callee_graph.returnblock,
-            inputargs: block_inputargs(&mut callee_graph, &[10]),
+            inputargs: block_inputargs(&callee_vars, &[10]),
             operations: vec![],
             exitswitch: None,
             exits: vec![],

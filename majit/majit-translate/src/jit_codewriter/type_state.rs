@@ -23,8 +23,8 @@ use crate::model::{FunctionGraph, OpKind, ValueType};
 ///
 /// The kind enum used to live here as a side-table value type;
 /// after the medium-term parity push it lives on each backing
-/// `Variable.concretetype` cell stored in
-/// [`FunctionGraph::value_variables`] (mirroring upstream
+/// `Variable.concretetype` cell carried inline on each backing
+/// `Variable` referenced by the IR (mirroring upstream
 /// `Variable.concretetype` line-for-line).  The alias keeps existing
 /// imports working while consumers migrate to reading
 /// `FunctionGraph::concretetype_of(&v)`.

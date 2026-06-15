@@ -4719,7 +4719,6 @@ mod tests {
             false,
         );
         graph.set_return(graph.startblock, None);
-        let input_slot = graph.slot_of(&input_var).expect("input must be registered");
 
         let transformed = rewrite_graph(&graph, &GraphTransformConfig::default());
         let guard = transformed
@@ -4734,9 +4733,8 @@ mod tests {
             .expect("GuardValue must survive the transform");
 
         assert_eq!(
-            transformed.graph.slot_of(guard),
-            Some(input_slot),
-            "GuardValue.value must follow PyPy _do_renaming through same_as"
+            guard, &input_var,
+            "GuardValue.value must follow _do_renaming through same_as"
         );
     }
 
@@ -4775,9 +4773,6 @@ mod tests {
             true,
         );
         graph.set_return(graph.startblock, None);
-        let receiver_slot = graph
-            .slot_of(&receiver_var)
-            .expect("receiver must be registered");
 
         let transformed = rewrite_graph(&graph, &GraphTransformConfig::default());
         let vtable_receiver = transformed
@@ -4792,9 +4787,8 @@ mod tests {
             .expect("VtableMethodPtr must survive the transform");
 
         assert_eq!(
-            transformed.graph.slot_of(vtable_receiver),
-            Some(receiver_slot),
-            "VtableMethodPtr.receiver must follow PyPy _do_renaming through same_as"
+            vtable_receiver, &receiver_var,
+            "VtableMethodPtr.receiver must follow _do_renaming through same_as"
         );
     }
 
@@ -5044,7 +5038,7 @@ mod tests {
     fn rewrite_graph_tags_vable_fields() {
         let mut graph = FunctionGraph::new("test");
         let base_var = graph.alloc_value_var();
-        let base = graph.slot_of(&base_var).expect("base registered");
+        let base_var_held = base_var.clone();
         graph.push_op_var(
             graph.startblock,
             OpKind::FieldRead {
@@ -5078,7 +5072,7 @@ mod tests {
             panic!("expected VableFieldRead, got {:?}", rewritten_op.kind);
         };
         assert_eq!(*field_index, 0);
-        assert_eq!(result.graph.slot_of(rewritten_base), Some(base));
+        assert_eq!(rewritten_base, &base_var_held);
     }
 
     #[test]
@@ -5086,7 +5080,7 @@ mod tests {
         let mut graph = FunctionGraph::new("test");
         let base_var = graph.alloc_value_var();
         let index_var = graph.alloc_value_var();
-        let base = graph.slot_of(&base_var).expect("base registered");
+        let base_var_held = base_var.clone();
         let array_var = graph
             .push_op_var(
                 graph.startblock,
@@ -5140,7 +5134,7 @@ mod tests {
             );
         };
         assert_eq!(*array_index, 0);
-        assert_eq!(result.graph.slot_of(rewritten_base), Some(base));
+        assert_eq!(rewritten_base, &base_var_held);
     }
 
     #[test]
@@ -6311,9 +6305,8 @@ mod tests {
         let config = GraphTransformConfig::default();
         let transformer = Transformer::new(&config);
         let mut graph = crate::model::FunctionGraph::new("test_promote_greens_fixture");
-        graph.set_next_value(3);
         let greens: Vec<crate::flowspace::model::Variable> =
-            (0..3).map(|i| graph.must_variable_at(i)).collect();
+            (0..3).map(|_| graph.alloc_value_var()).collect();
         let ops = transformer.promote_greens(&greens);
         assert_eq!(ops.len(), 6, "expect 2 ops per green");
         for i in 0..greens.len() {
@@ -6382,8 +6375,7 @@ mod tests {
         let config = GraphTransformConfig::default();
         let mut transformer = Transformer::new(&config).with_portal_jd(Some(0));
         let mut graph = crate::model::FunctionGraph::new("dup_red_fixture");
-        graph.set_next_value(3);
-        let r = graph.must_variable_at(0);
+        let r = graph.alloc_value_var();
         transformer.handle_jit_marker__jit_merge_point(
             vec![],
             vec![],
@@ -6423,11 +6415,6 @@ mod tests {
         use crate::jit_codewriter::type_state::ConcreteType;
         use crate::parse::CallPath;
 
-        let g1_slot: usize = 10;
-        let g2_slot: usize = 11;
-        let r1_slot: usize = 12;
-        let receiver_slot: usize = 99;
-
         let mut cc = CallControl::new();
         cc.setup_jitdriver(
             CallPath::from_segments(["test", "portal"]),
@@ -6443,17 +6430,15 @@ mod tests {
             .with_portal_jd(Some(0));
 
         // promote_greens reads Variable.concretetype directly to populate
-        // the GuardValue.value field — grow the backing Variable table
-        // to cover slot 99 (the receiver slot index used below).
+        // the GuardValue.value field. Mint four distinct values; jtransform
+        // reads operand kinds via Variable.concretetype, so hydrate the two
+        // greens and the red below to `'i'` instead of the Unknown-defaulted
+        // `'r'`.
         let mut graph = crate::model::FunctionGraph::new("test_jit_merge_point_fixture");
-        graph.set_next_value(100);
-        // jtransform now reads operand kinds via Variable.concretetype;
-        // hydrate it before invoking the handler so the green/red
-        // classifier picks `'i'` instead of the Unknown-defaulted `'r'`.
-        let receiver_var = graph.must_variable_at(receiver_slot);
-        let g1_var = graph.must_variable_at(g1_slot);
-        let g2_var = graph.must_variable_at(g2_slot);
-        let r1_var = graph.must_variable_at(r1_slot);
+        let receiver_var = graph.alloc_value_var();
+        let g1_var = graph.alloc_value_var();
+        let g2_var = graph.alloc_value_var();
+        let r1_var = graph.alloc_value_var();
         FunctionGraph::set_concretetype_of_inline(&g1_var, ConcreteType::Signed);
         FunctionGraph::set_concretetype_of_inline(&g2_var, ConcreteType::Signed);
         FunctionGraph::set_concretetype_of_inline(&r1_var, ConcreteType::Signed);
@@ -6541,10 +6526,9 @@ mod tests {
             .with_portal_jd(Some(0));
 
         let mut graph = crate::model::FunctionGraph::new("constant_red_fixture");
-        graph.set_next_value(100);
-        let receiver_var = graph.must_variable_at(99);
-        let g1_var = graph.must_variable_at(10);
-        let red_var = graph.must_variable_at(11);
+        let receiver_var = graph.alloc_value_var();
+        let g1_var = graph.alloc_value_var();
+        let red_var = graph.alloc_value_var();
         FunctionGraph::set_concretetype_of_inline(&g1_var, ConcreteType::Signed);
         FunctionGraph::set_concretetype_of_inline(&red_var, ConcreteType::Signed);
         // The red is the image of a source-level Constant: its
