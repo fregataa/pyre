@@ -2839,8 +2839,9 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
     let mut cur_num_ref_roots = target.num_ref_roots;
     let mut cur_max_output_slots = target.max_output_slots;
     let mut current_inputs = inputs.to_vec();
-    // External-JUMP re-entry LABEL selector (host_reentry_dispatch_key); 0
-    // for the initial entry and first-LABEL re-entries.
+    // External-JUMP re-entry LABEL selector (host_reentry_dispatch_key);
+    // 0 only for the initial entry — every external-JUMP re-entry,
+    // including the first LABEL, selects its loader (label_block_id + 1).
     let mut cur_dispatch_key: u32 = 0;
     // `compile.py:665 setattr(cpu, name, descr)` — borrow the owning
     // cpu's descr set for the whole dispatch loop.  External-JUMP
@@ -5978,9 +5979,9 @@ fn emit_attached_loop_dispatch(
     // depth from the descr's `target_frame_depth` cell (published with
     // Release ordering before `ll_loop_code` — see
     // `LoopTargetDescr::set_dispatch_target`) and compare against the
-    // current frame's `JF_FRAME_LENGTH` word; fall back to the
-    // deadframe exit when the frame is too small so the host loop can
-    // re-enter via `execute_token`, which reallocates for the target.
+    // current frame's `JF_FRAME_LENGTH` word; if the frame is too small,
+    // reallocate it in-place below and keep the closing-jump transfer in
+    // generated code.
     let depth_cell_ptr = builder
         .ins()
         .iconst(ptr_type, target_frame_depth_addr as i64);
@@ -6755,20 +6756,21 @@ impl JitExecResult {
     }
 }
 
-/// Host-loop external-JUMP re-entry dispatch key.  RPython's JUMP branches
-/// straight to `target_token._ll_loop_code` for the named LABEL
-/// (assembler.py:990-993); the cranelift body selects the LABEL through its
-/// entry `br_table` on `dispatch_key`.  The first LABEL (`label_block_id` 0)
-/// re-enters via the preamble (key 0), which decodes the inputarg layout
-/// from the freshly populated frame slots; a non-first LABEL re-enters
-/// directly at its loader (key `label_block_id + 1`), reading carried values
-/// from the same slots `run_compiled_code` populated (slot i ← inputs[i]).
+/// Host-loop external-JUMP re-entry dispatch key.  `assembler.py:2456-2462
+/// closing_jump` branches straight to `target_token._ll_loop_code` for the
+/// named LABEL — the LABEL's own code position (`regalloc.py:1397`), never the
+/// loop preamble — for *every* LABEL including the first.  The cranelift body
+/// selects the LABEL through its entry `br_table` on `dispatch_key`, which
+/// reserves key 0 for the preamble (the initial host entry that decodes the
+/// inputarg layout) and key `label_block_id + 1` for LABEL L's loader.  So an
+/// external JUMP to any LABEL — first or not — re-enters at its loader,
+/// reading carried values from the slots `run_compiled_code` populated
+/// (slot i ← inputs[i]).  This matches the in-code closing-jump path
+/// (`emit_attached_loop_dispatch` likewise passes `label_block_id + 1`); only
+/// the initial entry, which never goes through this function, uses key 0.
 fn host_reentry_dispatch_key(target_descr: &majit_ir::DescrRef) -> u32 {
     match target_descr.as_loop_target_descr() {
-        Some(ltd) => match ltd.label_block_id() {
-            0 => 0,
-            lbid => lbid + 1,
-        },
+        Some(ltd) => ltd.label_block_id() + 1,
         None => 0,
     }
 }
@@ -7119,17 +7121,20 @@ struct GuardInfo {
     /// vector accumulator variable and reduction operator.
     accum_info: Vec<AccumInfo>,
     /// `assembler.py:2456-2462 closing_jump` parity for cross-loop JUMP.
-    /// `Some((ll_addr, lbid_addr))` ⇔ this is an external-JUMP exit;
-    /// `ll_addr` is the heap-stable address of the target
-    /// `LoopTargetDescr`'s `ll_loop_code: AtomicUsize` slot, `lbid_addr`
-    /// is the address of its `label_block_id: AtomicU32` slot.
-    /// `emit_guard_exit` reads both in-code: tail-call only when
-    /// `ll_loop_code != 0 && label_block_id == 0` (i.e. the target is
-    /// the first LABEL of its compiled body so the function entry's
-    /// preamble decodes the right inputarg layout — parity with PyPy's
-    /// per-LABEL `JMP imm(target._ll_loop_code)`).  Anything else falls
-    /// through to the standard deadframe exit so the host loop can
-    /// dispatch via `execute_token` to the right wrapper.
+    /// `Some((ll_addr, lbid_addr, depth_addr))` ⇔ this is an external-JUMP
+    /// exit; `ll_addr` is the heap-stable address of the target
+    /// `LoopTargetDescr`'s `ll_loop_code: AtomicUsize` slot, `lbid_addr` the
+    /// address of its `label_block_id: AtomicU32` slot, `depth_addr` the
+    /// address of its `target_frame_depth` slot.  `emit_attached_loop_dispatch`
+    /// reads them in-code.  If `ll_loop_code != 0`, it first ensures the
+    /// current frame is wide enough for `target_frame_depth` (reallocating the
+    /// JITFRAME in place when needed), then tail-calls into the target and
+    /// selects the named LABEL — first or not — via
+    /// `dispatch_key = label_block_id + 1`, the cranelift analogue of PyPy's
+    /// `JMP imm(target._ll_loop_code)`.  Only a not-yet-compiled target falls
+    /// through to the deadframe exit, where the host loop re-enters via
+    /// `execute_token` (`host_reentry_dispatch_key` likewise routes every LABEL
+    /// to its loader).
     external_jump_ll_loop_code_addr: Option<(usize, usize, usize)>,
 }
 
@@ -7843,8 +7848,9 @@ impl CraneliftBackend {
         let mut cur_num_ref_roots = compiled.num_ref_roots;
         let mut cur_max_output_slots = compiled.max_output_slots;
         let mut cur_inputs = inputs.to_vec();
-        // External-JUMP re-entry LABEL selector (host_reentry_dispatch_key); 0
-        // for the initial entry and first-LABEL re-entries.
+        // External-JUMP re-entry LABEL selector (host_reentry_dispatch_key);
+        // 0 only for the initial entry — every external-JUMP re-entry,
+        // including the first LABEL, selects its loader (label_block_id + 1).
         let mut cur_dispatch_key: u32 = 0;
         // `compile.py:665 setattr(cpu, name, descr)` — borrow the owning
         // cpu's descr set for the whole dispatch loop.  Holding the read
@@ -13474,11 +13480,11 @@ impl CraneliftBackend {
             let dispatch_key_in = wb.block_params(eb)[1];
             let body_ref = self.module.declare_func_in_func(func_id, wb.func);
             // Forward the host-supplied dispatch_key to the body's entry
-            // `br_table`.  `run_compiled_code` passes 0 for the preamble
-            // (initial entry / first-LABEL re-entry) or `label_block_id + 1`
-            // to re-enter directly at a non-first LABEL on an external-JUMP
-            // host re-entry (assembler.py:990-993 per-LABEL `_ll_loop_code`:
-            // a JUMP branches straight to the target LABEL).
+            // `br_table`.  `run_compiled_code` passes 0 for initial entry
+            // through the preamble, or `label_block_id + 1` for any
+            // external-JUMP host re-entry (including the first LABEL),
+            // matching assembler.py:990-993 per-LABEL `_ll_loop_code`: a
+            // JUMP branches straight to the target LABEL.
             let call_inst = wb.ins().call(body_ref, &[jf_ptr_in, dispatch_key_in]);
             let ret = wb.inst_results(call_inst)[0];
             wb.ins().return_(&[ret]);
@@ -14477,10 +14483,11 @@ fn collect_guards(
         // PyPy emits — the immediate is rewritten when the target
         // compiles).  `op.descr` IS the target descr for external JUMPs;
         // for non-JUMP exits this stays `None`.  We also capture the
-        // `label_block_id` slot so the dispatch can refuse to enter the
-        // function preamble when the JUMP targets a non-first LABEL
-        // whose inputarg layout differs (`assembler.py:990-993` per-
-        // LABEL `_ll_loop_code` parity gate).
+        // `label_block_id` slot so the dispatch can select the named LABEL
+        // through the target body's `dispatch_key = label_block_id + 1`
+        // loader, including LABEL 0; key 0 remains reserved for initial
+        // preamble entry (`assembler.py:990-993` per-LABEL `_ll_loop_code`
+        // parity).
         let external_jump_ll_loop_code_addr = if is_external_jump {
             op.getdescr()
                 .as_ref()
@@ -15205,8 +15212,9 @@ impl majit_backend::Backend for CraneliftBackend {
         let mut cur_num_ref_roots = compiled.num_ref_roots;
         let mut cur_max_output_slots = compiled.max_output_slots;
         let mut cur_inputs = args.to_vec();
-        // External-JUMP re-entry LABEL selector (host_reentry_dispatch_key); 0
-        // for the initial entry and first-LABEL re-entries.
+        // External-JUMP re-entry LABEL selector (host_reentry_dispatch_key);
+        // 0 only for the initial entry — every external-JUMP re-entry,
+        // including the first LABEL, selects its loader (label_block_id + 1).
         let mut cur_dispatch_key: u32 = 0;
         let attachments_guard = compiled.cpu_attachments.read().unwrap();
         let attachments: &CpuDescrAttachments = &*attachments_guard;
@@ -22027,6 +22035,110 @@ mod tests {
 
         assert!(is_finish);
         assert_eq!(value, 25);
+    }
+
+    #[test]
+    #[ignore = "sets the process-global PYRE_CL_NO_CLOSING_JUMP env var to force the \
+        host-loop external-JUMP path (in-code closing_jump disabled); run serially: \
+        `PYRE_CL_NO_CLOSING_JUMP=1 cargo test -p majit-backend-cranelift --features dynasm \
+        test_host_loop_external_jump_to_first_label -- --ignored --test-threads=1`"]
+    fn test_host_loop_external_jump_to_first_label_uses_label_selector() {
+        // The first LABEL (`label_block_id` 0) is not special: `closing_jump`
+        // (assembler.py:2456-2462) branches to `target._ll_loop_code` for it
+        // too, never the preamble.  Here a peeled preamble (`IntAdd +1000`)
+        // precedes the start LABEL, then a bridge JUMPs back to the start
+        // descr.  With closing_jump disabled the JUMP surfaces as an
+        // `is_external_jump` deadframe and the host loop re-enters via the
+        // wrapper.  `host_reentry_dispatch_key` must pass `0 + 1` (the start
+        // LABEL's loader) so the carried value (5) reaches the body verbatim
+        // and it finishes 15.  Routing the first LABEL to the preamble (key 0)
+        // would re-run the `+1000` and finish 1015 instead.
+        unsafe { std::env::set_var("PYRE_CL_NO_CLOSING_JUMP", "1") };
+
+        let mut backend = CraneliftBackend::new();
+        let start_descr = make_label_descr(1500_290);
+        let final_descr = make_label_descr(1500_291);
+
+        let inputargs = vec![InputArg::new_int(0)];
+        let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw());
+        guard.setfailargs(smallvec::smallvec![BoxRef::from_opref(OpRef::int_op(1))]);
+        let root_ops = vec![
+            // Peeled preamble: runs once on the initial host entry, before the
+            // first LABEL.  A loader re-entry must skip it.
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::int_op(200)],
+                1,
+            ),
+            mk_op_with_descr(
+                OpCode::Label,
+                &[OpRef::int_op(1)],
+                OpRef::NONE.raw(),
+                start_descr.clone(),
+            ),
+            mk_op(OpCode::IntGt, &[OpRef::int_op(1), OpRef::int_op(100)], 2),
+            guard,
+            mk_op(OpCode::IntAdd, &[OpRef::int_op(1), OpRef::int_op(101)], 3),
+            mk_op_with_descr(
+                OpCode::Jump,
+                &[OpRef::int_op(3)],
+                OpRef::NONE.raw(),
+                final_descr.clone(),
+            ),
+            mk_op_with_descr(
+                OpCode::Label,
+                &[OpRef::int_op(4)],
+                OpRef::NONE.raw(),
+                final_descr,
+            ),
+            mk_op(OpCode::Finish, &[OpRef::int_op(4)], OpRef::NONE.raw()),
+        ];
+
+        let mut root_constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
+        root_constants.insert(200, 1000);
+        root_constants.insert(100, 0);
+        root_constants.insert(101, 10);
+        backend.set_constants(root_constants);
+
+        let mut token = JitCellToken::new(1500_292);
+        backend
+            .compile_loop(&inputargs, &root_ops, &mut token)
+            .unwrap();
+
+        let failed = backend.execute_token(&token, &[Value::Int(-1000)]);
+        let guard_descr =
+            get_latest_descr_from_deadframe(&failed).expect("guard should produce a descr");
+
+        let mut bridge_constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
+        bridge_constants.insert(103, 5);
+        backend.set_constants(bridge_constants);
+        let bridge_ops = vec![
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::int_op(103)],
+                1,
+            ),
+            mk_op_with_descr(
+                OpCode::Jump,
+                &[OpRef::int_op(1)],
+                OpRef::NONE.raw(),
+                start_descr,
+            ),
+        ];
+        backend
+            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, &[], None)
+            .unwrap();
+
+        backend.set_constants(majit_ir::VecAssoc::new());
+        let frame = backend.execute_token(&token, &[Value::Int(-1000)]);
+        let is_finish = backend.get_latest_descr(&frame).is_finish();
+        let value = backend.get_int_value(&frame, 0);
+
+        unsafe { std::env::remove_var("PYRE_CL_NO_CLOSING_JUMP") };
+
+        assert!(is_finish);
+        assert_eq!(value, 15);
     }
 
     #[test]
