@@ -51,6 +51,52 @@ pub struct Cpu {
     /// LOOKUP_METHOD `null_or_self` half — `(obj, attr, code, name_idx) →
     /// bound`. Pure binding decision shared with the interpreter.
     pub load_method_self_fn: extern "C" fn(i64, i64, i64, i64) -> i64,
+    /// STORE_ATTR residual — `(obj, value, code, name_idx) → void`.
+    /// Resolves the name from the code object and runs generic `setattr`.
+    pub store_attr_fn: extern "C" fn(i64, i64, i64, i64) -> i64,
+    /// BINARY_SLICE residual — `(obj, start, stop) → obj[start:stop]`.
+    pub binary_slice_fn: extern "C" fn(i64, i64, i64) -> i64,
+    /// DELETE_SUBSCR residual — `(obj, index) → void` (`del obj[index]`).
+    pub delete_subscr_fn: extern "C" fn(i64, i64) -> i64,
+    /// DELETE_ATTR residual — `(obj, code, name_idx) → void` (`del obj.name`).
+    /// Resolves the name from the code object and runs generic `delattr`.
+    pub delete_attr_fn: extern "C" fn(i64, i64, i64) -> i64,
+    /// FORMAT_SIMPLE residual — `value → str` (`f"{x}"`, empty spec).
+    /// User `__format__` may run Python (fallible).
+    pub format_simple_fn: extern "C" fn(i64) -> i64,
+    /// FORMAT_WITH_SPEC residual — `(value, spec) → str` (`f"{x:.2f}"`).
+    /// User `__format__` may run Python (fallible).
+    pub format_with_spec_fn: extern "C" fn(i64, i64) -> i64,
+    /// CONVERT_VALUE residual — `(value, conv) → str` (`f"{x!r}"`).
+    /// `conv` is a `runtime_ops::convert_value_code`; user `__str__` /
+    /// `__repr__` may run Python (fallible).
+    pub convert_value_fn: extern "C" fn(i64, i64) -> i64,
+    /// `bh_import_name_fn(fromlist, level, code, frame, name_idx)` —
+    /// IMPORT_NAME `__import__` residual; resolves the module name from the
+    /// code object, reads `__name__`/`__package__` for relative imports from
+    /// the threaded `frame`, and imports through the TLS-pinned execution
+    /// context (may run module top-level Python → fallible).
+    pub import_name_fn: extern "C" fn(i64, i64, i64, i64, i64) -> i64,
+    /// `bh_load_super_attr_fn(self, cls, code, name_idx)` — LOAD_SUPER_ATTR
+    /// `getattr(super(cls, self), name)` residual (descriptor `__get__` may
+    /// run Python → fallible).
+    pub load_super_attr_fn: extern "C" fn(i64, i64, i64, i64) -> i64,
+    /// `bh_super_attr_unwrap_fn(raw, which)` — LOAD_SUPER_ATTR method-form
+    /// unwrap (`which` 0 = func slot, 1 = self slot); pure / infallible.
+    pub super_attr_unwrap_fn: extern "C" fn(i64, i64) -> i64,
+    /// `bh_load_deref_value_fn(cell, code, deref_idx)` — LOAD_DEREF
+    /// dereference residual (cell contents, raising the named unbound-variable
+    /// `NameError` resolved via `code` + `deref_idx`).
+    pub load_deref_value_fn: extern "C" fn(i64, i64, i64) -> i64,
+    /// `bh_unary_invert_fn(value)` — UNARY_INVERT `~value` residual
+    /// (a user `__invert__` may run Python → fallible).
+    pub unary_invert_fn: extern "C" fn(i64) -> i64,
+    /// `bh_unary_not_fn(value)` — UNARY_NOT `not value` residual returning a
+    /// bool (a user `__bool__` / `__len__` may run Python; infallible).
+    pub unary_not_fn: extern "C" fn(i64) -> i64,
+    /// `bh_load_fast_check_fn(value, code, name_idx)` — LOAD_FAST_CHECK
+    /// unbound-local guard (returns `value`, or raises `NameError`).
+    pub load_fast_check_fn: extern "C" fn(i64, i64, i64) -> i64,
     /// `bhimpl_compare_op` — RPython compare_op opcodes.
     pub compare_fn: extern "C" fn(i64, i64, i64) -> i64,
     /// `bhimpl_binary_op` — RPython binary_op opcodes.
@@ -82,6 +128,16 @@ pub struct Cpu {
     /// The array is the forced `popvalues` list; length travels inside
     /// the array, so any arity fits.
     pub newtuple_from_array_fn: extern "C" fn(i64) -> i64,
+    /// BUILD_MAP — the forced `[k0, v0, ...]` pair array → dict.  Length
+    /// travels inside the array, so any arity fits.
+    pub build_map_from_array_fn: extern "C" fn(i64) -> i64,
+    /// BUILD_SET — the forced element array → set (fallible: element
+    /// hashing may run user `__hash__` / raise on a non-hashable element).
+    pub build_set_from_array_fn: extern "C" fn(i64) -> i64,
+    /// BUILD_STRING — the forced fragment array → concatenated str.
+    /// Fragments are already strings (formatted first), so this runs no
+    /// user code and is infallible (`Plain`).
+    pub build_string_from_array_fn: extern "C" fn(i64) -> i64,
     /// `bhimpl_unpack_sequence` — (count, seq) → validated tuple of items.
     pub unpack_sequence_fn: extern "C" fn(i64, i64) -> i64,
     /// Read item `index` out of the validated unpack tuple — (index, seq) → item.
@@ -175,6 +231,20 @@ impl Cpu {
             load_global_fn: crate::call_jit::bh_load_global_fn,
             load_attr_fn: crate::call_jit::bh_load_attr_fn,
             load_method_self_fn: crate::call_jit::bh_load_method_self_fn,
+            store_attr_fn: crate::call_jit::bh_store_attr_fn,
+            binary_slice_fn: crate::call_jit::bh_binary_slice_fn,
+            delete_subscr_fn: crate::call_jit::bh_delete_subscr_fn,
+            delete_attr_fn: crate::call_jit::bh_delete_attr_fn,
+            format_simple_fn: crate::call_jit::bh_format_simple_fn,
+            format_with_spec_fn: crate::call_jit::bh_format_with_spec_fn,
+            convert_value_fn: crate::call_jit::bh_convert_value_fn,
+            import_name_fn: crate::call_jit::bh_import_name_fn,
+            load_super_attr_fn: crate::call_jit::bh_load_super_attr_fn,
+            super_attr_unwrap_fn: crate::call_jit::bh_super_attr_unwrap_fn,
+            load_deref_value_fn: crate::call_jit::bh_load_deref_value_fn,
+            unary_invert_fn: crate::call_jit::bh_unary_invert_fn,
+            unary_not_fn: crate::call_jit::bh_unary_not_fn,
+            load_fast_check_fn: crate::call_jit::bh_load_fast_check_fn,
             compare_fn: crate::call_jit::bh_compare_fn,
             binary_op_fn: crate::call_jit::bh_binary_op_fn,
             box_int_fn: crate::call_jit::bh_box_int_fn,
@@ -186,6 +256,9 @@ impl Cpu {
             store_name_fn: crate::call_jit::bh_store_name_fn,
             build_list_fn: crate::call_jit::bh_build_list_fn,
             newtuple_from_array_fn: crate::call_jit::bh_newtuple_from_array,
+            build_map_from_array_fn: crate::call_jit::bh_build_map_from_array,
+            build_set_from_array_fn: crate::call_jit::bh_build_set_from_array,
+            build_string_from_array_fn: crate::call_jit::bh_build_string_from_array,
             unpack_sequence_fn: crate::call_jit::bh_unpack_sequence_fn,
             unpack_item_fn: crate::call_jit::bh_unpack_item_fn,
             build_slice_fn: crate::call_jit::bh_build_slice_fn,

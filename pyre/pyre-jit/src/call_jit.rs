@@ -481,6 +481,24 @@ extern "C" fn jit_exc_raise_shim(value: i64) {
     majit_backend_dynasm::jit_exc_raise(value);
 }
 
+/// Publish a raise from a may-force residual helper to BOTH executors.
+///
+/// `bh_call_fn`/`bh_call_fn_N` is bound as the may-force CALL target
+/// (`cpu.rs` `call_fn`, `codewriter.rs:3160` `CallFlavor::MayForce`), so the
+/// same helper runs under the blackhole interpreter AND inside a compiled
+/// trace.  The blackhole reads the raise from `BH_LAST_EXC_VALUE`; a compiled
+/// trace's `GUARD_NO_EXCEPTION` reads it from the backend `_store_exception`
+/// cells (`jit_exc_raise`).  Writing only `BH_LAST_EXC_VALUE` leaves
+/// `GUARD_NO_EXCEPTION` reading a stale 0, so the guard wrongly passes and the
+/// helper's NULL result flows to the consumer — keep both states in sync.
+fn publish_residual_call_exception(exc_obj: i64) {
+    majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj));
+    #[cfg(feature = "cranelift")]
+    majit_backend_cranelift::jit_exc_raise(exc_obj);
+    #[cfg(feature = "dynasm")]
+    majit_backend_dynasm::jit_exc_raise(exc_obj);
+}
+
 #[majit_macros::jit_may_force]
 pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
     #[cfg(feature = "cranelift")]
@@ -2903,7 +2921,7 @@ fn bh_call_self_recursive_portal(
         Ok(result) => result as i64,
         Err(err) => {
             let exc_obj = err.to_exc_object();
-            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+            publish_residual_call_exception(exc_obj as i64);
             0
         }
     })
@@ -3124,7 +3142,7 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
             pyre_interpreter::PyErrorKind::TypeError,
             "call on null callable".to_string(),
         );
-        majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(err.to_exc_object() as i64));
+        publish_residual_call_exception(err.to_exc_object() as i64);
         return 0;
     }
     // llmodel.py:822 bh_call_r — calldescr.call_stub_r is callable-type-agnostic.
@@ -3143,8 +3161,7 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
                 Ok(result) if !result.is_null() => result as i64,
                 Ok(_) => 0,
                 Err(err) => {
-                    let exc_obj = err.to_exc_object();
-                    majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+                    publish_residual_call_exception(err.to_exc_object() as i64);
                     0
                 }
             };
@@ -3173,8 +3190,7 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
         return match result {
             Ok(result) => result as i64,
             Err(err) => {
-                let exc_obj = err.to_exc_object();
-                majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+                publish_residual_call_exception(err.to_exc_object() as i64);
                 0
             }
         };
@@ -3198,8 +3214,7 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
     match result {
         Ok(result) => result as i64,
         Err(err) => {
-            let exc_obj = err.to_exc_object();
-            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+            publish_residual_call_exception(err.to_exc_object() as i64);
             0
         }
     }
@@ -3262,8 +3277,7 @@ pub extern "C" fn bh_load_global_fn(
                     Ok(None) => {}
                     Err(err) => {
                         let exc_obj = err.to_exc_object();
-                        majit_metainterp::blackhole::BH_LAST_EXC_VALUE
-                            .with(|c| c.set(exc_obj as i64));
+                        publish_residual_call_exception(exc_obj as i64);
                         return 0;
                     }
                 }
@@ -3277,7 +3291,7 @@ pub extern "C" fn bh_load_global_fn(
         format!("name '{}' is not defined", varname),
     );
     let exc_obj = err.to_exc_object();
-    majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+    publish_residual_call_exception(exc_obj as i64);
     0
 }
 
@@ -3353,6 +3367,242 @@ pub extern "C" fn bh_load_attr_fn(obj: i64, w_code_ptr: i64, name_idx: i64) -> i
             0
         }
     }
+}
+
+/// STORE_ATTR residual (`store_attr` HLOp → `residual_call_ir_v`).  The
+/// symmetric counterpart of [`bh_load_attr_fn`]: resolves the attribute
+/// name from the resume frame's code object via `name_idx` and runs the
+/// generic `setattr_str` (may invoke user `__setattr__` → `MayForce`).
+/// Void result, so always returns 0; an exception is published through
+/// `BH_LAST_EXC_VALUE` for the trailing `GuardNoException`.
+pub extern "C" fn bh_store_attr_fn(obj: i64, value: i64, w_code_ptr: i64, name_idx: i64) -> i64 {
+    let code = unsafe {
+        &*(pyre_interpreter::w_code_get_ptr(w_code_ptr as pyre_object::PyObjectRef)
+            as *const pyre_interpreter::CodeObject)
+    };
+    // Same `co_names`-index codegen invariant as `bh_load_attr_fn`.
+    let idx = name_idx as usize;
+    debug_assert!(
+        idx < code.names.len(),
+        "bh_store_attr_fn name_idx {idx} out of range ({} names) — codegen invariant",
+        code.names.len()
+    );
+    if idx >= code.names.len() {
+        return 0;
+    }
+    let name = code.names[idx].as_ref();
+    if let Err(err) = pyre_interpreter::baseobjspace::setattr_str(
+        obj as pyre_object::PyObjectRef,
+        name,
+        value as pyre_object::PyObjectRef,
+    ) {
+        let exc_obj = err.to_exc_object();
+        publish_residual_call_exception(exc_obj as i64);
+    }
+    0
+}
+
+/// DELETE_ATTR residual (`delete_attr` HLOp → `residual_call_ir_v`).
+/// Resolves the `co_names` name through the jitcode's own code object
+/// (same invariant as `bh_store_attr_fn`) and runs `del obj.name` through
+/// `baseobjspace::delattr_str`.  A user `__delattr__` may run Python
+/// (`MayForce`); on error the exception is published through
+/// `BH_LAST_EXC_VALUE` for the trailing `GuardNoException` and the call
+/// returns 0.
+pub extern "C" fn bh_delete_attr_fn(obj: i64, w_code_ptr: i64, name_idx: i64) -> i64 {
+    let code = unsafe {
+        &*(pyre_interpreter::w_code_get_ptr(w_code_ptr as pyre_object::PyObjectRef)
+            as *const pyre_interpreter::CodeObject)
+    };
+    let idx = name_idx as usize;
+    debug_assert!(
+        idx < code.names.len(),
+        "bh_delete_attr_fn name_idx {idx} out of range ({} names) — codegen invariant",
+        code.names.len()
+    );
+    if idx >= code.names.len() {
+        return 0;
+    }
+    let name = code.names[idx].as_ref();
+    if let Err(err) =
+        pyre_interpreter::baseobjspace::delattr_str(obj as pyre_object::PyObjectRef, name)
+    {
+        let exc_obj = err.to_exc_object();
+        publish_residual_call_exception(exc_obj as i64);
+    }
+    0
+}
+
+/// IMPORT_NAME residual (`import_name` HLOp → `residual_call_ir_r`).
+/// Resolves the module name from the jitcode's own code object via
+/// `name_idx` (same `co_names` invariant as `bh_load_attr_fn`), reads the
+/// importing frame's `__name__`/`__package__` (for relative imports) from the
+/// threaded `frame_ptr`, and runs `importhook` with the TLS-pinned execution
+/// context the eval loop stamps on entry.  Importing a module may run its
+/// top-level Python (`MayForce`); on error the exception is published
+/// through `BH_LAST_EXC_VALUE` for the trailing `GuardNoException` and the
+/// call returns 0.  `fromlist` and `level` are the two popped operands
+/// (`eval.rs import_name`: `fromlist = pop()`, `level = pop()`).
+pub extern "C" fn bh_import_name_fn(
+    fromlist: i64,
+    level: i64,
+    w_code_ptr: i64,
+    frame_ptr: i64,
+    name_idx: i64,
+) -> i64 {
+    let w_code = w_code_ptr as pyre_object::PyObjectRef;
+    let code = unsafe {
+        &*(pyre_interpreter::w_code_get_ptr(w_code) as *const pyre_interpreter::CodeObject)
+    };
+    let idx = name_idx as usize;
+    debug_assert!(
+        idx < code.names.len(),
+        "bh_import_name_fn name_idx {idx} out of range ({} names) — codegen invariant",
+        code.names.len()
+    );
+    if idx >= code.names.len() {
+        return 0;
+    }
+    let name = code.names[idx].as_ref();
+    // `import_name` reads the importing frame's globals for relative-import
+    // package resolution (`__name__` / `__package__`).  Read them from the
+    // live red frame passed as an explicit Ref argument — mirroring
+    // `bh_load_global_fn` — rather than `getexecutioncontext().gettopframe()`,
+    // which collapses to the wrong frame for an inlined non-portal callee.
+    // `w_globals` must be the wrapped dict object `resolve_package_name` does
+    // `finditem_str` against (not the raw DictStorage), so resolve it through
+    // `get_w_globals_obj`.
+    let frame = frame_ptr as *mut PyFrame;
+    let w_globals = if frame.is_null() {
+        pyre_object::PY_NULL
+    } else {
+        unsafe { (*frame).get_w_globals_obj() }
+    };
+    let ec = pyre_interpreter::call::getexecutioncontext();
+    let w_level = level as pyre_object::PyObjectRef;
+    let level = if unsafe { pyre_object::is_int(w_level) } {
+        unsafe { pyre_object::w_int_get_value(w_level) }
+    } else {
+        0
+    };
+    match pyre_interpreter::importing::importhook(
+        name,
+        w_globals,
+        fromlist as pyre_object::PyObjectRef,
+        level,
+        ec,
+    ) {
+        Ok(module) => module as i64,
+        Err(err) => {
+            let exc_obj = err.to_exc_object();
+            publish_residual_call_exception(exc_obj as i64);
+            0
+        }
+    }
+}
+
+/// LOAD_SUPER_ATTR residual (`load_super_attr` HLOp → `residual_call_ir_r`).
+/// Resolves the attribute name from the jitcode's code object via `name_idx`
+/// (same `co_names` invariant as `bh_load_attr_fn`), builds the `super(cls,
+/// self)` proxy, and runs `getattr` (a descriptor `__get__` may run Python →
+/// `MayForce`).  Returns the raw resolved attribute; the `is_method` form
+/// post-processes it through [`bh_super_attr_unwrap_fn`].  On error the
+/// exception is published through `BH_LAST_EXC_VALUE` for the trailing
+/// `GuardNoException` and the call returns 0.
+pub extern "C" fn bh_load_super_attr_fn(
+    self_obj: i64,
+    cls: i64,
+    w_code_ptr: i64,
+    name_idx: i64,
+) -> i64 {
+    let w_code = w_code_ptr as pyre_object::PyObjectRef;
+    let code = unsafe {
+        &*(pyre_interpreter::w_code_get_ptr(w_code) as *const pyre_interpreter::CodeObject)
+    };
+    let idx = name_idx as usize;
+    debug_assert!(
+        idx < code.names.len(),
+        "bh_load_super_attr_fn name_idx {idx} out of range ({} names) — codegen invariant",
+        code.names.len()
+    );
+    if idx >= code.names.len() {
+        return 0;
+    }
+    let name = code.names[idx].as_ref();
+    let proxy = pyre_object::superobject::w_super_new(
+        cls as pyre_object::PyObjectRef,
+        self_obj as pyre_object::PyObjectRef,
+    );
+    match pyre_interpreter::baseobjspace::getattr_str(proxy, name) {
+        Ok(result) => result as i64,
+        Err(err) => {
+            let exc_obj = err.to_exc_object();
+            publish_residual_call_exception(exc_obj as i64);
+            0
+        }
+    }
+}
+
+/// LOAD_SUPER_ATTR method-form unwrap (`super_attr_unwrap` HLOp →
+/// `residual_call_ir_r`).  Pure function of the raw attribute resolved by
+/// [`bh_load_super_attr_fn`] — `which == 0` yields the func slot, `which ==
+/// 1` the self slot.  When the attribute is a bound method, unwraps it to
+/// `(func, receiver)`; otherwise (staticmethod / classmethod) yields
+/// `(result, NULL)`.  Infallible and idempotent, so safe under the walk /
+/// replay double-execution seam.
+pub extern "C" fn bh_super_attr_unwrap_fn(raw: i64, which: i64) -> i64 {
+    let result = raw as pyre_object::PyObjectRef;
+    if unsafe { pyre_object::is_method(result) } {
+        if which == 0 {
+            unsafe { pyre_object::w_method_get_func(result) as i64 }
+        } else {
+            unsafe { pyre_object::w_method_get_self(result) as i64 }
+        }
+    } else if which == 0 {
+        raw
+    } else {
+        pyre_object::PY_NULL as i64
+    }
+}
+
+/// BINARY_SLICE residual (`binary_slice` HLOp → `residual_call_r_r`).
+/// Computes `obj[start:stop]` through the shared
+/// `runtime_ops::binary_slice_values` (the same code the interpreter's
+/// `binary_slice` runs).  A `__getitem__` on a user object may run Python
+/// (`MayForce`); on error the exception is published through
+/// `BH_LAST_EXC_VALUE` for the trailing `GuardNoException` and the call
+/// returns 0, matching [`bh_load_attr_fn`].
+pub extern "C" fn bh_binary_slice_fn(obj: i64, start: i64, stop: i64) -> i64 {
+    match pyre_interpreter::runtime_ops::binary_slice_values(
+        obj as pyre_object::PyObjectRef,
+        start as pyre_object::PyObjectRef,
+        stop as pyre_object::PyObjectRef,
+    ) {
+        Ok(result) => result as i64,
+        Err(err) => {
+            let exc_obj = err.to_exc_object();
+            publish_residual_call_exception(exc_obj as i64);
+            0
+        }
+    }
+}
+
+/// DELETE_SUBSCR residual (`delete_subscr` HLOp → `residual_call_r_v`).
+/// Runs `del obj[index]` through the shared `baseobjspace::delitem` (the
+/// same code the interpreter's `delete_subscript` runs).  A `__delitem__`
+/// on a user object may run Python (`MayForce`).  Void result, so always
+/// returns 0; on error the exception is published through
+/// `BH_LAST_EXC_VALUE` for the trailing `GuardNoException`, matching
+/// `bh_store_subscr_fn`.
+pub extern "C" fn bh_delete_subscr_fn(obj: i64, index: i64) -> i64 {
+    if let Err(err) = pyre_interpreter::baseobjspace::delitem(
+        obj as pyre_object::PyObjectRef,
+        index as pyre_object::PyObjectRef,
+    ) {
+        let exc_obj = err.to_exc_object();
+        publish_residual_call_exception(exc_obj as i64);
+    }
+    0
 }
 
 /// Compute the LOOKUP_METHOD `null_or_self` for blackhole LOAD_ATTR resume,
@@ -3583,7 +3833,7 @@ pub extern "C" fn bh_compare_fn(lhs: i64, rhs: i64, op_code: i64) -> i64 {
             pyre_interpreter::PyErrorKind::TypeError,
             "comparison on null operand".to_string(),
         );
-        majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(err.to_exc_object() as i64));
+        publish_residual_call_exception(err.to_exc_object() as i64);
         return 0;
     }
 
@@ -3613,6 +3863,31 @@ pub extern "C" fn bh_compare_fn(lhs: i64, rhs: i64, op_code: i64) -> i64 {
         return pyre_object::w_bool_from(matched) as i64;
     }
 
+    // op_code 6 = CONTAINS_OP `in`, 7 = `not in` (from compare_op_tag).
+    // lhs = needle/item, rhs = container/haystack (flatten lowers the args
+    // as `[item, container]`).
+    if op_code == 6 || op_code == 7 {
+        match pyre_interpreter::baseobjspace::contains(rhs, lhs) {
+            Ok(found) => {
+                let result = if op_code == 7 { !found } else { found };
+                return pyre_object::w_bool_from(result) as i64;
+            }
+            Err(err) => {
+                let exc_obj = err.to_exc_object();
+                publish_residual_call_exception(exc_obj as i64);
+                return 0;
+            }
+        }
+    }
+
+    // op_code 8 = IS_OP `is`, 9 = `is not` (from compare_op_tag).
+    // Pointer identity, infallible — never publishes BH_LAST_EXC_VALUE.
+    if op_code == 8 || op_code == 9 {
+        let same = std::ptr::eq(lhs, rhs);
+        let result = if op_code == 9 { !same } else { same };
+        return pyre_object::w_bool_from(result) as i64;
+    }
+
     // op_code is the compact tag from compare_op_tag (0-5), NOT the raw
     // ComparisonOperator discriminant. Reverse the mapping to get the enum.
     let Some(op) = pyre_interpreter::runtime_ops::compare_op_from_tag(op_code) else {
@@ -3620,14 +3895,14 @@ pub extern "C" fn bh_compare_fn(lhs: i64, rhs: i64, op_code: i64) -> i64 {
             pyre_interpreter::PyErrorKind::TypeError,
             format!("unknown compare op tag {op_code}"),
         );
-        majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(err.to_exc_object() as i64));
+        publish_residual_call_exception(err.to_exc_object() as i64);
         return 0;
     };
     match pyre_interpreter::opcode_ops::compare_value(lhs, rhs, op) {
         Ok(result) => result as i64,
         Err(err) => {
             let exc_obj = err.to_exc_object();
-            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+            publish_residual_call_exception(exc_obj as i64);
             0
         }
     }
@@ -3645,7 +3920,7 @@ pub extern "C" fn bh_binary_op_fn(lhs: i64, rhs: i64, op_code: i64) -> i64 {
             pyre_interpreter::PyErrorKind::TypeError,
             "binary op on null operand".to_string(),
         );
-        majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(err.to_exc_object() as i64));
+        publish_residual_call_exception(err.to_exc_object() as i64);
         return 0;
     }
 
@@ -3656,14 +3931,14 @@ pub extern "C" fn bh_binary_op_fn(lhs: i64, rhs: i64, op_code: i64) -> i64 {
             pyre_interpreter::PyErrorKind::TypeError,
             format!("unknown binary op tag {op_code}"),
         );
-        majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(err.to_exc_object() as i64));
+        publish_residual_call_exception(err.to_exc_object() as i64);
         return 0;
     };
     match pyre_interpreter::opcode_ops::binary_value(lhs, rhs, op) {
         Ok(result) => result as i64,
         Err(err) => {
             let exc_obj = err.to_exc_object();
-            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+            publish_residual_call_exception(exc_obj as i64);
             0
         }
     }
@@ -3706,6 +3981,221 @@ pub extern "C" fn bh_newtuple_from_array(array: i64) -> i64 {
         items.push(pyre_object::object_array::getarrayitem_ref(arr, i));
     }
     pyre_interpreter::runtime_ops::build_tuple_from_refs(&items) as i64
+}
+
+/// BUILD_MAP residual — the dict counterpart of [`bh_newtuple_from_array`].
+/// The length-prefixed array holds the interleaved `[k0, v0, k1, v1, ...]`
+/// pairs the codewriter unrolled via `setarrayitem_gc_r`;
+/// `build_map_from_refs` consumes them in `chunks_exact(2)`.  Keys are
+/// hashed (may run user `__hash__` / `__eq__`) and an unhashable key raises
+/// (`MayForce`, fallible); on error the exception is published through
+/// `BH_LAST_EXC_VALUE` for the trailing `GuardNoException` and the call
+/// returns 0.
+pub extern "C" fn bh_build_map_from_array(array: i64) -> i64 {
+    let arr = array as *const pyre_object::object_array::GcTypedArray;
+    let len = pyre_object::object_array::gcarray_len(arr);
+    let mut items: Vec<pyre_object::PyObjectRef> = Vec::with_capacity(len);
+    for i in 0..len {
+        items.push(pyre_object::object_array::getarrayitem_ref(arr, i));
+    }
+    match pyre_interpreter::runtime_ops::build_map_from_refs(&items) {
+        Ok(dict) => dict as i64,
+        Err(err) => {
+            let exc_obj = err.to_exc_object();
+            publish_residual_call_exception(exc_obj as i64);
+            0
+        }
+    }
+}
+
+/// BUILD_SET residual — the set counterpart of [`bh_build_map_from_array`].
+/// The length-prefixed array holds the `count` set elements the codewriter
+/// unrolled via `setarrayitem_gc_r`.  Element hashing may run user `__hash__`
+/// and a non-hashable element raises (`MayForce`, fallible); on error the
+/// exception is published through `BH_LAST_EXC_VALUE` for the trailing
+/// `GuardNoException` and the call returns 0.
+pub extern "C" fn bh_build_set_from_array(array: i64) -> i64 {
+    let arr = array as *const pyre_object::object_array::GcTypedArray;
+    let len = pyre_object::object_array::gcarray_len(arr);
+    let mut items: Vec<pyre_object::PyObjectRef> = Vec::with_capacity(len);
+    for i in 0..len {
+        items.push(pyre_object::object_array::getarrayitem_ref(arr, i));
+    }
+    match pyre_interpreter::runtime_ops::build_set_from_refs(&items) {
+        Ok(set) => set as i64,
+        Err(err) => {
+            let exc_obj = err.to_exc_object();
+            publish_residual_call_exception(exc_obj as i64);
+            0
+        }
+    }
+}
+
+/// BUILD_STRING residual (`build_string_from_array` HLOp →
+/// `residual_call_r_r`).  Concatenates the forced fragment array into a
+/// single `str` through the shared `runtime_ops::build_string_from_refs`.
+/// Fragments are already strings (FORMAT_SIMPLE / CONVERT_VALUE ran first),
+/// so this never runs user code → `Plain` (infallible, no exception
+/// publish), mirroring `bh_newtuple_from_array`.
+pub extern "C" fn bh_build_string_from_array(array: i64) -> i64 {
+    let arr = array as *const pyre_object::object_array::GcTypedArray;
+    let len = pyre_object::object_array::gcarray_len(arr);
+    let mut items: Vec<pyre_object::PyObjectRef> = Vec::with_capacity(len);
+    for i in 0..len {
+        items.push(pyre_object::object_array::getarrayitem_ref(arr, i));
+    }
+    pyre_interpreter::runtime_ops::build_string_from_refs(&items) as i64
+}
+
+/// FORMAT_SIMPLE residual (`format_simple` HLOp → `residual_call_r_r`).
+/// Formats `value` with the empty spec (`f"{x}"` → `str(value)`) through the
+/// shared `runtime_ops::format_value`.  A user `__format__` may run Python
+/// (`MayForce`); on error the exception is published through
+/// `BH_LAST_EXC_VALUE` for the trailing `GuardNoException` and the call
+/// returns 0.
+pub extern "C" fn bh_format_simple_fn(value: i64) -> i64 {
+    match pyre_interpreter::runtime_ops::format_value(
+        value as pyre_object::PyObjectRef,
+        pyre_object::PY_NULL,
+    ) {
+        Ok(s) => s as i64,
+        Err(err) => {
+            let exc_obj = err.to_exc_object();
+            publish_residual_call_exception(exc_obj as i64);
+            0
+        }
+    }
+}
+
+/// CONVERT_VALUE residual (`convert_value` HLOp → `residual_call_ir_r`).
+/// Converts `value` per `conv` (`0=Str/3=None → str`, `1=Repr → repr`,
+/// `2=Ascii → ascii`) through the shared `runtime_ops::convert_value`.  A
+/// user `__str__` / `__repr__` may run Python (`MayForce`); on error the
+/// exception is published through `BH_LAST_EXC_VALUE` for the trailing
+/// `GuardNoException` and the call returns 0.
+pub extern "C" fn bh_convert_value_fn(value: i64, conv: i64) -> i64 {
+    match pyre_interpreter::runtime_ops::convert_value(value as pyre_object::PyObjectRef, conv) {
+        Ok(s) => s as i64,
+        Err(err) => {
+            let exc_obj = err.to_exc_object();
+            publish_residual_call_exception(exc_obj as i64);
+            0
+        }
+    }
+}
+
+/// FORMAT_WITH_SPEC residual (`format_with_spec` HLOp → `residual_call_r_r`).
+/// Formats `value` with `spec` (`f"{x:.2f}"`) through the shared
+/// `runtime_ops::format_value`.  A user `__format__` may run Python
+/// (`MayForce`); on error the exception is published through
+/// `BH_LAST_EXC_VALUE` for the trailing `GuardNoException` and the call
+/// returns 0.
+pub extern "C" fn bh_format_with_spec_fn(value: i64, spec: i64) -> i64 {
+    match pyre_interpreter::runtime_ops::format_value(
+        value as pyre_object::PyObjectRef,
+        spec as pyre_object::PyObjectRef,
+    ) {
+        Ok(s) => s as i64,
+        Err(err) => {
+            let exc_obj = err.to_exc_object();
+            publish_residual_call_exception(exc_obj as i64);
+            0
+        }
+    }
+}
+
+/// LOAD_DEREF residual (`load_deref_value` HLOp → `residual_call_ir_r`).
+/// `cell` is the slot read from `locals_cells_stack_w`: a cell object whose
+/// contents are the free/cell variable's value, or the raw value for a slot
+/// that is not a cell.  Mirrors `load_deref` — dereference the cell and
+/// raise if the result is empty.  `code` + `deref_idx` resolve the variable
+/// name for the unbound-variable `NameError` (`deref_unbound_error`).  Runs no
+/// user code but reads mutable heap (`CallFlavor::Plain`); on the
+/// unbound-variable error the exception is published through
+/// `BH_LAST_EXC_VALUE` for the trailing `GuardNoException` and the call
+/// returns 0.
+pub extern "C" fn bh_load_deref_value_fn(cell: i64, w_code_ptr: i64, deref_idx: i64) -> i64 {
+    let slot = cell as pyre_object::PyObjectRef;
+    let value = if !slot.is_null() && unsafe { pyre_object::is_cell(slot) } {
+        unsafe { pyre_object::w_cell_get(slot) }
+    } else {
+        slot
+    };
+    if value == pyre_object::PY_NULL {
+        let code = unsafe {
+            &*(pyre_interpreter::w_code_get_ptr(w_code_ptr as pyre_object::PyObjectRef)
+                as *const pyre_interpreter::CodeObject)
+        };
+        let exc_obj = pyre_interpreter::pyframe::deref_unbound_error(code, deref_idx as usize)
+            .to_exc_object();
+        publish_residual_call_exception(exc_obj as i64);
+        return 0;
+    }
+    value as i64
+}
+
+/// UNARY_INVERT residual (`unary_invert` HLOp → `residual_call_r_r`).
+/// Computes `~value` through `opcode_ops::unary_invert_value` (`invert`); a
+/// user `__invert__` may run Python (`MayForce`).  On error the exception
+/// is published through `BH_LAST_EXC_VALUE` for the trailing
+/// `GuardNoException` and the call returns 0.
+pub extern "C" fn bh_unary_invert_fn(value: i64) -> i64 {
+    match pyre_interpreter::opcode_ops::unary_invert_value(value as pyre_object::PyObjectRef) {
+        Ok(result) => result as i64,
+        Err(err) => {
+            let exc_obj = err.to_exc_object();
+            publish_residual_call_exception(exc_obj as i64);
+            0
+        }
+    }
+}
+
+/// UNARY_NOT residual (`unary_not` HLOp → `residual_call_r_r`).  Returns
+/// `not value` as a bool object via `opcode_ops::truth_value`.  A user
+/// `__bool__` / `__len__` may run Python (`MayForce`), matching the
+/// interpreter's UNARY_NOT truth path; `truth_value` does not surface an
+/// error (the JIT and the interpreter share `is_true`), so the helper is
+/// infallible and never publishes `BH_LAST_EXC_VALUE`.
+pub extern "C" fn bh_unary_not_fn(value: i64) -> i64 {
+    let truth = pyre_interpreter::opcode_ops::truth_value(value as pyre_object::PyObjectRef);
+    pyre_object::w_bool_from(!truth) as i64
+}
+
+/// LOAD_FAST_CHECK residual (`load_fast_check` HLOp → `residual_call_ir_r`).
+/// The local slot is read from the vable exactly like LOAD_FAST and handed in
+/// as `value` (possibly `PY_NULL` for an unbound local).  Returns `value`
+/// unchanged when bound; on an unbound local raises `NameError`, resolving the
+/// variable name from the resume frame's code object via the `co_varnames`
+/// index baked in by the codewriter.  Reads no heap and runs no user code
+/// (`CallFlavor::Plain`); the exception is published through
+/// `BH_LAST_EXC_VALUE` for the trailing `GuardNoException` and the call
+/// returns 0.
+pub extern "C" fn bh_load_fast_check_fn(value: i64, w_code_ptr: i64, name_idx: i64) -> i64 {
+    if value as pyre_object::PyObjectRef != pyre_object::PY_NULL {
+        return value;
+    }
+    let code = unsafe {
+        &*(pyre_interpreter::w_code_get_ptr(w_code_ptr as pyre_object::PyObjectRef)
+            as *const pyre_interpreter::CodeObject)
+    };
+    // `name_idx` is a `co_varnames` index baked into the residual call by the
+    // codewriter from the originating LOAD_FAST_CHECK oparg.  An out-of-range
+    // index is a codegen invariant rather than a runtime-reachable error;
+    // mirror `execute_load_fast_check`'s `idx < code_varnames_len(code)` guard,
+    // falling back to the "<cell>" label rather than panicking in release.
+    let idx = name_idx as usize;
+    let name = if idx < code.varnames.len() {
+        code.varnames[idx].as_ref()
+    } else {
+        "<cell>"
+    };
+    let exc_obj = pyre_interpreter::PyError::new(
+        pyre_interpreter::PyErrorKind::NameError,
+        format!("local variable '{name}' referenced before assignment"),
+    )
+    .to_exc_object();
+    publish_residual_call_exception(exc_obj as i64);
+    0
 }
 
 #[cfg(test)]

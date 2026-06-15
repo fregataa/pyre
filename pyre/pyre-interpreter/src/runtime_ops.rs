@@ -1,12 +1,12 @@
 use std::slice;
 use std::sync::OnceLock;
 
-use crate::bytecode::{BinaryOperator, ComparisonOperator};
+use crate::bytecode::{BinaryOperator, ComparisonOperator, ConvertValueOparg};
 use pyre_object::{
     PY_NULL, PyObjectRef, W_SeqIterator, is_instance, is_list, is_range_iter, is_seq_iter, is_str,
-    is_tuple, w_dict_new, w_dict_store, w_int_get_value, w_int_new, w_list_getitem, w_list_len,
-    w_list_new, w_range_iter_has_next, w_range_iter_next, w_str_from_wtf8, w_str_get_wtf8,
-    w_str_len, w_tuple_getitem, w_tuple_len, w_tuple_new,
+    is_tuple, w_dict_new, w_dict_store_checked, w_int_get_value, w_int_new, w_list_getitem,
+    w_list_len, w_list_new, w_range_iter_has_next, w_range_iter_next, w_str_from_wtf8,
+    w_str_get_wtf8, w_str_len, w_tuple_getitem, w_tuple_len, w_tuple_new,
 };
 use rustpython_wtf8::{Wtf8, Wtf8Buf};
 
@@ -509,16 +509,202 @@ pub fn build_tuple_from_refs(items: &[PyObjectRef]) -> PyObjectRef {
     w_tuple_new(items.to_vec())
 }
 
-pub fn build_map_from_refs(items: &[PyObjectRef]) -> PyObjectRef {
+/// BUILD_MAP evaluation, shared by the interpreter (`build_map`) and the JIT
+/// residual (`bh_build_map_from_array`).  Stores each `[key, value]` pair
+/// through the checked dict setitem, which hashes the key (may run user
+/// `__hash__` / `__eq__`); an unhashable key raises, so — like
+/// `build_set_from_refs` — this is fallible.
+pub fn build_map_from_refs(items: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let dict = w_dict_new();
     for pair in items.chunks_exact(2) {
         let key = pair[0];
         let value = pair[1];
         unsafe {
-            w_dict_store(dict, key, value);
+            w_dict_store_checked(dict, key, value)
+                .map_err(|_| crate::baseobjspace::take_pending_hash_error())?;
         }
     }
-    dict
+    Ok(dict)
+}
+
+/// BUILD_SET evaluation, shared by the JIT residual (`bh_build_set_from_array`).
+/// Builds a set from the forced element array; element hashing may run user
+/// `__hash__` / `__eq__` and a non-hashable element raises `TypeError`, so —
+/// unlike `build_map_from_refs` / `build_tuple_from_refs` — this is fallible.
+pub fn build_set_from_refs(items: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::builtins::builtin_set_from_items(items)
+}
+
+/// BUILD_STRING evaluation, shared by the interpreter (`build_string`) and
+/// the JIT residual (`bh_build_string_from_array`): concatenates `parts`
+/// (already-stringified f-string fragments, in bottom-to-top order) into a
+/// single `str`.  Each fragment is a `str` by construction (FORMAT_SIMPLE /
+/// FORMAT_WITH_SPEC / CONVERT_VALUE ran first); the `bool` / `int` / `None`
+/// / `<object>` arms are defensive rendering, so this never runs user code
+/// and is infallible.
+pub fn build_string_from_refs(parts: &[PyObjectRef]) -> PyObjectRef {
+    let mut result = rustpython_wtf8::Wtf8Buf::new();
+    for part in parts {
+        unsafe {
+            if pyre_object::is_str(*part) {
+                result.push_wtf8(pyre_object::w_str_get_wtf8(*part));
+            } else if pyre_object::is_bool(*part) {
+                // `is_int` is true for a bool, so test `is_bool` first; a
+                // bool renders "True"/"False", not its int value.
+                result.push_str(if pyre_object::w_bool_get_value(*part) {
+                    "True"
+                } else {
+                    "False"
+                });
+            } else if pyre_object::is_int(*part) {
+                result.push_str(&pyre_object::w_int_get_value(*part).to_string());
+            } else if pyre_object::is_none(*part) {
+                result.push_str("None");
+            } else {
+                result.push_str("<object>");
+            }
+        }
+    }
+    pyre_object::w_str_from_wtf8(result)
+}
+
+/// CONVERT_VALUE conversion code, shared by the interpreter and the JIT
+/// codewriter so the `convert_value` residual carries a stable integer the
+/// C ABI can pass (`ConvertValueOparg` can't cross the residual boundary).
+/// `0 = Str`, `1 = Repr`, `2 = Ascii`, `3 = None` (`None` behaves as `Str`).
+pub fn convert_value_code(conv: ConvertValueOparg) -> i64 {
+    match conv {
+        ConvertValueOparg::Str => 0,
+        ConvertValueOparg::Repr => 1,
+        ConvertValueOparg::Ascii => 2,
+        ConvertValueOparg::None => 3,
+    }
+}
+
+/// CONVERT_VALUE evaluation, shared by the interpreter (`convert_value`) and
+/// the JIT residual (`bh_convert_value_fn`).  `conv` is a
+/// [`convert_value_code`] integer.  `Str` / `None` compute `str(value)` in
+/// WTF-8 so a lone surrogate survives (the `'%s' % x` rewrite path);
+/// `Repr` / `Ascii` go through `py_repr` / `py_ascii`.  A user
+/// `__str__` / `__repr__` may run Python → fallible.
+pub fn convert_value(value: PyObjectRef, conv: i64) -> Result<PyObjectRef, crate::PyError> {
+    if conv == 0 || conv == 3 {
+        let w = unsafe { crate::py_str_wtf8(value)? };
+        return Ok(pyre_object::w_str_from_wtf8(w));
+    }
+    let s = match conv {
+        1 => unsafe { crate::py_repr(value)? },
+        2 => crate::builtins::py_ascii(value)?,
+        _ => unsafe { crate::py_str(value)? },
+    };
+    Ok(pyre_object::w_str_new(&s))
+}
+
+/// FORMAT_SIMPLE / FORMAT_WITH_SPEC evaluation, shared by the interpreter
+/// (`format_simple` / `format_with_spec`) and the JIT residuals
+/// (`bh_format_simple_fn` / `bh_format_with_spec_fn`).  Formats `value`
+/// through `format_value_dispatch` (user `__format__` may run Python →
+/// fallible); a `PY_NULL` or non-`str` `spec` reads as the empty spec
+/// (`str(value)`), matching `format_simple`.
+pub fn format_value(value: PyObjectRef, spec: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    let spec_str = unsafe {
+        if !spec.is_null() && pyre_object::is_str(spec) {
+            match pyre_object::w_str_get_wtf8(spec).as_str() {
+                Ok(v) => v.to_string(),
+                Err(_) => String::new(),
+            }
+        } else {
+            String::new()
+        }
+    };
+    let s = crate::type_methods::format_value_dispatch(value, &spec_str)?;
+    Ok(pyre_object::w_str_from_wtf8(s))
+}
+
+/// BINARY_SLICE evaluation, shared by the interpreter (`binary_slice`)
+/// and the JIT residual (`bh_binary_slice_fn`): returns `obj[start:stop]`.
+/// `list` / `str` / `tuple` slice on element (code-point for `str`)
+/// boundaries; everything else (`bytes`, `bytearray`, instances with
+/// `__getitem__`) falls back to a `slice` object dispatched through
+/// `getitem`. A `None` start/stop defaults to `0` / `len`.
+pub fn binary_slice_values(
+    obj: PyObjectRef,
+    start: PyObjectRef,
+    stop: PyObjectRef,
+) -> Result<PyObjectRef, PyError> {
+    unsafe {
+        if pyre_object::is_list(obj) {
+            let len = pyre_object::w_list_len(obj) as i64;
+            let s = if pyre_object::is_none(start) {
+                0
+            } else {
+                pyre_object::w_int_get_value(start)
+            };
+            let e = if pyre_object::is_none(stop) {
+                len
+            } else {
+                pyre_object::w_int_get_value(stop)
+            };
+            let s = if s < 0 { (len + s).max(0) } else { s.min(len) } as usize;
+            let e = if e < 0 { (len + e).max(0) } else { e.min(len) } as usize;
+            let mut items = Vec::new();
+            for i in s..e {
+                if let Some(v) = pyre_object::w_list_getitem(obj, i as i64) {
+                    items.push(v);
+                }
+            }
+            return Ok(pyre_object::w_list_new(items));
+        }
+        if pyre_object::is_str(obj) {
+            // Slice on code-point boundaries over the WTF-8 view, so a
+            // surrogate-bearing or multi-byte string slices correctly.
+            let full = pyre_object::w_str_get_wtf8(obj);
+            let mut offsets: Vec<usize> = full.code_point_indices().map(|(i, _)| i).collect();
+            offsets.push(full.as_bytes().len());
+            let len = (offsets.len() - 1) as i64;
+            let s = if pyre_object::is_none(start) {
+                0
+            } else {
+                pyre_object::w_int_get_value(start)
+            };
+            let e = if pyre_object::is_none(stop) {
+                len
+            } else {
+                pyre_object::w_int_get_value(stop)
+            };
+            let s = if s < 0 { (len + s).max(0) } else { s.min(len) } as usize;
+            let e = (if e < 0 { (len + e).max(0) } else { e.min(len) } as usize).max(s);
+            let part = rustpython_wtf8::Wtf8::from_bytes(&full.as_bytes()[offsets[s]..offsets[e]])
+                .expect("code-point-aligned slice is WTF-8");
+            return Ok(pyre_object::w_str_from_wtf8(part.to_wtf8_buf()));
+        }
+        if pyre_object::is_tuple(obj) {
+            let len = pyre_object::w_tuple_len(obj) as i64;
+            let s = if pyre_object::is_none(start) {
+                0
+            } else {
+                pyre_object::w_int_get_value(start)
+            };
+            let e = if pyre_object::is_none(stop) {
+                len
+            } else {
+                pyre_object::w_int_get_value(stop)
+            };
+            let s = if s < 0 { (len + s).max(0) } else { s.min(len) } as usize;
+            let e = if e < 0 { (len + e).max(0) } else { e.min(len) } as usize;
+            let mut items = Vec::new();
+            for i in s..e {
+                if let Some(v) = pyre_object::w_tuple_getitem(obj, i as i64) {
+                    items.push(v);
+                }
+            }
+            return Ok(pyre_object::w_tuple_new(items));
+        }
+        // Fall back to slice(start, stop) → getitem dispatch.
+        // Handles bytes, bytearray, instances with __getitem__, etc.
+        let slice_obj = pyre_object::sliceobject::w_slice_new(start, stop, pyre_object::w_none());
+        crate::baseobjspace::getitem(obj, slice_obj)
+    }
 }
 
 fn build_list_from_args(args: &[i64]) -> i64 {
@@ -533,7 +719,19 @@ fn build_tuple_from_args(args: &[i64]) -> i64 {
 
 fn build_map_from_args(args: &[i64]) -> i64 {
     let items: Vec<_> = args.iter().map(|&arg| arg as PyObjectRef).collect();
-    build_map_from_refs(&items) as i64
+    // Legacy fixed-arity BUILD_MAP residual reached only on the blackhole /
+    // deopt path (the codewriter lowers BUILD_MAP through the array-based
+    // `bh_build_map_from_array`).  An unhashable key raises; signal it through
+    // `BH_LAST_EXC_VALUE` and return PY_NULL, like the other blackhole-only
+    // residuals.
+    match build_map_from_refs(&items) {
+        Ok(dict) => dict as i64,
+        Err(err) => {
+            let exc_obj = err.to_exc_object();
+            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+            PY_NULL as i64
+        }
+    }
 }
 
 #[majit_macros::dont_look_inside]

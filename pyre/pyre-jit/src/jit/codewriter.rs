@@ -2527,6 +2527,24 @@ fn emit_frontend_setitem(
     );
 }
 
+fn emit_frontend_delsubscr(
+    _graph: &mut super::flow::FunctionGraph,
+    block: &super::flow::BlockRef,
+    obj: super::flow::FlowValue,
+    key: super::flow::FlowValue,
+    offset: i64,
+) {
+    // flowcontext.py DELETE_SUBSCR -> `op.delitem(w_obj, w_subscr).eval(self)`.
+    // See `emit_frontend_setitem` for the void-result rationale.
+    record_graph_op(
+        block,
+        "delete_subscr",
+        vec![obj.into(), key.into()],
+        None,
+        offset,
+    );
+}
+
 fn emit_frontend_setattr(
     _graph: &mut super::flow::FunctionGraph,
     block: &super::flow::BlockRef,
@@ -2542,6 +2560,54 @@ fn emit_frontend_setattr(
         block,
         "setattr",
         vec![obj.into(), attr_name.into(), value.into()],
+        None,
+        offset,
+    );
+}
+
+/// STORE_ATTR — the residual counterpart of [`emit_frontend_getattr`].
+/// Records the 4-arg `store_attr(obj, value, code, name_idx)` HLOp (void
+/// result) that `flatten.rs::lower_setattr_hlop_to_insn` threads into the
+/// `bh_store_attr_fn(obj, value, code, name_idx)` residual.  Distinct from
+/// the bare `setattr` HLOp (an `is_pyre_canonical_elidable_hlop` rewritten
+/// to `setfield_gc`), so the generic attribute store survives lowering.
+fn emit_frontend_store_attr(
+    block: &super::flow::BlockRef,
+    obj: super::flow::FlowValue,
+    value: super::flow::FlowValue,
+    code_const: super::flow::FlowValue,
+    name_idx_const: super::flow::FlowValue,
+    offset: i64,
+) {
+    record_graph_op(
+        block,
+        "store_attr",
+        vec![
+            obj.into(),
+            value.into(),
+            code_const.into(),
+            name_idx_const.into(),
+        ],
+        None,
+        offset,
+    );
+}
+
+/// DELETE_ATTR — the residual counterpart of [`emit_frontend_store_attr`]
+/// with no stored value.  Records the 3-arg `delete_attr(obj, code,
+/// name_idx)` HLOp (void result) that `flatten.rs::lower_delete_attr_hlop_to_insn`
+/// threads into the `bh_delete_attr_fn(obj, code, name_idx)` residual.
+fn emit_frontend_delete_attr(
+    block: &super::flow::BlockRef,
+    obj: super::flow::FlowValue,
+    code_const: super::flow::FlowValue,
+    name_idx_const: super::flow::FlowValue,
+    offset: i64,
+) {
+    record_graph_op(
+        block,
+        "delete_attr",
+        vec![obj.into(), code_const.into(), name_idx_const.into()],
         None,
         offset,
     );
@@ -2758,6 +2824,27 @@ fn emit_frontend_binary(
     )
 }
 
+/// BINARY_SLICE — records the 3-arg `binary_slice(obj, start, stop)` HLOp
+/// (Ref result) lowered by `flatten.rs::lower_binary_slice_hlop_to_insn`
+/// into the `bh_binary_slice_fn(obj, start, stop)` residual.
+fn emit_frontend_binary_slice(
+    graph: &mut super::flow::FunctionGraph,
+    block: &super::flow::BlockRef,
+    obj: super::flow::FlowValue,
+    start: super::flow::FlowValue,
+    stop: super::flow::FlowValue,
+    offset: i64,
+) -> super::flow::Variable {
+    emit_graph_op_with_result(
+        graph,
+        block,
+        "binary_slice",
+        vec![obj.into(), start.into(), stop.into()],
+        Kind::Ref,
+        offset,
+    )
+}
+
 fn compare_opname(op: pyre_interpreter::bytecode::ComparisonOperator) -> &'static str {
     use pyre_interpreter::bytecode::ComparisonOperator as C;
 
@@ -2784,6 +2871,121 @@ fn emit_frontend_compare(
         block,
         compare_opname(op),
         vec![lhs.into(), rhs.into()],
+        Kind::Ref,
+        offset,
+    )
+}
+
+/// CONTAINS_OP lowering — reuses the compare-residual machinery. The
+/// graph op carries the args as `[item, container]`; `flatten`'s
+/// `compare_op_tag_for_opname` maps `contains`/`not_contains` to tags
+/// 6/7, and `bh_compare_fn` dispatches them to `baseobjspace::contains`.
+fn emit_frontend_contains(
+    graph: &mut super::flow::FunctionGraph,
+    block: &super::flow::BlockRef,
+    item: super::flow::FlowValue,
+    container: super::flow::FlowValue,
+    invert: pyre_interpreter::bytecode::Invert,
+    offset: i64,
+) -> super::flow::Variable {
+    let opname = match invert {
+        pyre_interpreter::bytecode::Invert::No => "contains",
+        pyre_interpreter::bytecode::Invert::Yes => "not_contains",
+    };
+    emit_graph_op_with_result(
+        graph,
+        block,
+        opname,
+        vec![item.into(), container.into()],
+        Kind::Ref,
+        offset,
+    )
+}
+
+fn emit_frontend_is_op(
+    graph: &mut super::flow::FunctionGraph,
+    block: &super::flow::BlockRef,
+    lhs: super::flow::FlowValue,
+    rhs: super::flow::FlowValue,
+    invert: pyre_interpreter::bytecode::Invert,
+    offset: i64,
+) -> super::flow::Variable {
+    let opname = match invert {
+        pyre_interpreter::bytecode::Invert::No => "is",
+        pyre_interpreter::bytecode::Invert::Yes => "is_not",
+    };
+    emit_graph_op_with_result(
+        graph,
+        block,
+        opname,
+        vec![lhs.into(), rhs.into()],
+        Kind::Ref,
+        offset,
+    )
+}
+
+fn emit_frontend_import_name(
+    graph: &mut super::flow::FunctionGraph,
+    block: &super::flow::BlockRef,
+    fromlist: super::flow::FlowValue,
+    level: super::flow::FlowValue,
+    code: super::flow::FlowValue,
+    frame: super::flow::FlowValue,
+    name_idx: super::flow::FlowValue,
+    offset: i64,
+) -> super::flow::Variable {
+    emit_graph_op_with_result(
+        graph,
+        block,
+        "import_name",
+        vec![
+            fromlist.into(),
+            level.into(),
+            code.into(),
+            frame.into(),
+            name_idx.into(),
+        ],
+        Kind::Ref,
+        offset,
+    )
+}
+
+fn emit_frontend_load_super_attr(
+    graph: &mut super::flow::FunctionGraph,
+    block: &super::flow::BlockRef,
+    self_value: super::flow::FlowValue,
+    cls_value: super::flow::FlowValue,
+    code: super::flow::FlowValue,
+    name_idx: super::flow::FlowValue,
+    offset: i64,
+) -> super::flow::Variable {
+    emit_graph_op_with_result(
+        graph,
+        block,
+        "load_super_attr",
+        vec![
+            self_value.into(),
+            cls_value.into(),
+            code.into(),
+            name_idx.into(),
+        ],
+        Kind::Ref,
+        offset,
+    )
+}
+
+fn emit_frontend_super_attr_unwrap(
+    graph: &mut super::flow::FunctionGraph,
+    block: &super::flow::BlockRef,
+    raw: super::flow::FlowValue,
+    which: super::flow::FlowValue,
+    offset: i64,
+) -> super::flow::Variable {
+    emit_graph_op_with_result(
+        graph,
+        block,
+        "super_attr_unwrap",
+        vec![raw.into(), which.into()],
         Kind::Ref,
         offset,
     )
@@ -3137,6 +3339,23 @@ struct FnPtrIndices {
     set_current_exception_fn: HelperHandle,
     load_attr_fn: HelperHandle,
     load_method_self_fn: HelperHandle,
+    store_attr_fn: HelperHandle,
+    build_map_from_array_fn: HelperHandle,
+    binary_slice_fn: HelperHandle,
+    delete_subscr_fn: HelperHandle,
+    delete_attr_fn: HelperHandle,
+    build_set_from_array_fn: HelperHandle,
+    format_simple_fn: HelperHandle,
+    format_with_spec_fn: HelperHandle,
+    build_string_from_array_fn: HelperHandle,
+    convert_value_fn: HelperHandle,
+    import_name_fn: HelperHandle,
+    load_super_attr_fn: HelperHandle,
+    super_attr_unwrap_fn: HelperHandle,
+    load_deref_value_fn: HelperHandle,
+    unary_invert_fn: HelperHandle,
+    unary_not_fn: HelperHandle,
+    load_fast_check_fn: HelperHandle,
 }
 
 /// Register every blackhole helper fn pointer with the assembler in
@@ -3353,6 +3572,137 @@ fn register_helper_fn_pointers(
     // Bound after the existing fn_ptrs to preserve their indices.
     let load_name_fn = bind(assembler, cpu.load_name_fn as *const (), CallFlavor::Plain);
     let store_name_fn = bind(assembler, cpu.store_name_fn as *const (), CallFlavor::Plain);
+    // `bh_store_attr_fn` calls `baseobjspace::setattr_str`, which can run
+    // user `__setattr__` (forces virtualizables) and raise → `MayForce`.
+    // Symmetric to `load_attr_fn`; appended last to preserve fn_ptr indices.
+    let store_attr_fn = bind(
+        assembler,
+        cpu.store_attr_fn as *const (),
+        CallFlavor::MayForce,
+    );
+    // `bh_build_map_from_array` allocates a dict and inserts the forced
+    // pair array; key insertion hashes (`__hash__` / `__eq__` can run user
+    // code that forces virtualizables) → `MayForce`.  Appended last to
+    // preserve fn_ptr indices.
+    let build_map_from_array_fn = bind(
+        assembler,
+        cpu.build_map_from_array_fn as *const (),
+        CallFlavor::MayForce,
+    );
+    // `bh_binary_slice_fn` runs `runtime_ops::binary_slice_values`, whose
+    // fallback dispatches a `slice` object through `getitem` — a user
+    // `__getitem__` can run Python and force virtualizables → `MayForce`.
+    // Appended last to preserve fn_ptr indices.
+    let binary_slice_fn = bind(
+        assembler,
+        cpu.binary_slice_fn as *const (),
+        CallFlavor::MayForce,
+    );
+    // `bh_delete_subscr_fn` runs `del obj[index]` via `baseobjspace::delitem`;
+    // a user `__delitem__` can run Python and force virtualizables → `MayForce`.
+    // Appended last to preserve fn_ptr indices.
+    let delete_subscr_fn = bind(
+        assembler,
+        cpu.delete_subscr_fn as *const (),
+        CallFlavor::MayForce,
+    );
+    // `bh_delete_attr_fn` runs `del obj.name` via `baseobjspace::delattr_str`;
+    // a user `__delattr__` can run Python and force virtualizables → `MayForce`.
+    // Appended last to preserve fn_ptr indices.
+    let delete_attr_fn = bind(
+        assembler,
+        cpu.delete_attr_fn as *const (),
+        CallFlavor::MayForce,
+    );
+    // `bh_build_set_from_array` builds a set from the forced element array;
+    // element hashing may run user `__hash__` → `MayForce`.  Appended last to
+    // preserve fn_ptr indices.
+    let build_set_from_array_fn = bind(
+        assembler,
+        cpu.build_set_from_array_fn as *const (),
+        CallFlavor::MayForce,
+    );
+    // `bh_format_simple_fn` formats a value (user `__format__` may run
+    // Python) → `MayForce`.  Appended last to preserve fn_ptr indices.
+    let format_simple_fn = bind(
+        assembler,
+        cpu.format_simple_fn as *const (),
+        CallFlavor::MayForce,
+    );
+    // `bh_format_with_spec_fn` formats a value with a spec (user `__format__`
+    // may run Python) → `MayForce`.  Appended last to preserve fn_ptr indices.
+    let format_with_spec_fn = bind(
+        assembler,
+        cpu.format_with_spec_fn as *const (),
+        CallFlavor::MayForce,
+    );
+    // `bh_build_string_from_array` concatenates the forced fragment array;
+    // fragments are already strings, so this runs no user code → `Plain`.
+    // Appended last to preserve fn_ptr indices.
+    let build_string_from_array_fn = bind(
+        assembler,
+        cpu.build_string_from_array_fn as *const (),
+        CallFlavor::Plain,
+    );
+    // `bh_convert_value_fn` converts a value (user `__str__` / `__repr__`
+    // may run Python) → `MayForce`.  Appended last to preserve fn_ptr indices.
+    let convert_value_fn = bind(
+        assembler,
+        cpu.convert_value_fn as *const (),
+        CallFlavor::MayForce,
+    );
+    // `bh_import_name_fn` runs `__import__` (module top-level Python may run)
+    // → `MayForce`.  Appended last to preserve fn_ptr indices.
+    let import_name_fn = bind(
+        assembler,
+        cpu.import_name_fn as *const (),
+        CallFlavor::MayForce,
+    );
+    // `bh_load_super_attr_fn` runs `getattr` on the super proxy (descriptor
+    // `__get__` may run Python) → `MayForce`.  `bh_super_attr_unwrap_fn` is
+    // pure but routes through the proven MayForce ir_r path.  Appended last
+    // to preserve fn_ptr indices.
+    let load_super_attr_fn = bind(
+        assembler,
+        cpu.load_super_attr_fn as *const (),
+        CallFlavor::MayForce,
+    );
+    let super_attr_unwrap_fn = bind(
+        assembler,
+        cpu.super_attr_unwrap_fn as *const (),
+        CallFlavor::MayForce,
+    );
+    // `bh_load_deref_value_fn` reads a cell's contents (mutable heap) and
+    // raises on an unbound free variable; it runs no user code, so `Plain`
+    // (CanRaise, no virtualizable force) rather than `MayForce`.  Appended
+    // last to preserve fn_ptr indices.
+    let load_deref_value_fn = bind(
+        assembler,
+        cpu.load_deref_value_fn as *const (),
+        CallFlavor::Plain,
+    );
+    // `bh_unary_invert_fn` computes `~value`; a user `__invert__` may run
+    // Python → `MayForce`.  Appended last to preserve fn_ptr indices.
+    let unary_invert_fn = bind(
+        assembler,
+        cpu.unary_invert_fn as *const (),
+        CallFlavor::MayForce,
+    );
+    // `bh_unary_not_fn` runs the truth test; a user `__bool__` / `__len__`
+    // may run Python → `MayForce`.  Appended last to preserve fn_ptr indices.
+    let unary_not_fn = bind(
+        assembler,
+        cpu.unary_not_fn as *const (),
+        CallFlavor::MayForce,
+    );
+    // `bh_load_fast_check_fn` only null-checks the local and raises NameError;
+    // it reads no heap and runs no user code → `Plain`.  Appended last to
+    // preserve fn_ptr indices.
+    let load_fast_check_fn = bind(
+        assembler,
+        cpu.load_fast_check_fn as *const (),
+        CallFlavor::Plain,
+    );
     FnPtrIndices {
         call_fn,
         load_global_fn,
@@ -3383,6 +3733,23 @@ fn register_helper_fn_pointers(
         set_current_exception_fn,
         load_attr_fn,
         load_method_self_fn,
+        store_attr_fn,
+        build_map_from_array_fn,
+        binary_slice_fn,
+        delete_subscr_fn,
+        delete_attr_fn,
+        build_set_from_array_fn,
+        format_simple_fn,
+        format_with_spec_fn,
+        build_string_from_array_fn,
+        convert_value_fn,
+        import_name_fn,
+        load_super_attr_fn,
+        super_attr_unwrap_fn,
+        load_deref_value_fn,
+        unary_invert_fn,
+        unary_not_fn,
+        load_fast_check_fn,
     }
 }
 
@@ -4068,6 +4435,7 @@ impl CodeWriter {
         // [last_instr, pycode, valuestackdepth, debugdata, lastblock,
         // w_globals], so the literals match
         // `virtualizable_spec.rs::PYFRAME_VABLE_FIELDS`.
+        const VABLE_LAST_INSTR_FIELD_IDX: u16 = 0;
         const VABLE_CODE_FIELD_IDX: u16 = 1;
         const VABLE_VALUESTACKDEPTH_FIELD_IDX: u16 = 2;
         const VABLE_NAMESPACE_FIELD_IDX: u16 = 5;
@@ -4288,6 +4656,91 @@ impl CodeWriter {
                     idx: load_method_self_fn_idx,
                     flavor: _load_method_self_fn_flavor,
                 },
+            store_attr_fn:
+                HelperHandle {
+                    idx: store_attr_fn_idx,
+                    flavor: _store_attr_fn_flavor,
+                },
+            build_map_from_array_fn:
+                HelperHandle {
+                    idx: build_map_from_array_fn_idx,
+                    flavor: _build_map_from_array_fn_flavor,
+                },
+            binary_slice_fn:
+                HelperHandle {
+                    idx: binary_slice_fn_idx,
+                    flavor: _binary_slice_fn_flavor,
+                },
+            delete_subscr_fn:
+                HelperHandle {
+                    idx: delete_subscr_fn_idx,
+                    flavor: _delete_subscr_fn_flavor,
+                },
+            delete_attr_fn:
+                HelperHandle {
+                    idx: delete_attr_fn_idx,
+                    flavor: _delete_attr_fn_flavor,
+                },
+            build_set_from_array_fn:
+                HelperHandle {
+                    idx: build_set_from_array_fn_idx,
+                    flavor: _build_set_from_array_fn_flavor,
+                },
+            format_simple_fn:
+                HelperHandle {
+                    idx: format_simple_fn_idx,
+                    flavor: _format_simple_fn_flavor,
+                },
+            format_with_spec_fn:
+                HelperHandle {
+                    idx: format_with_spec_fn_idx,
+                    flavor: _format_with_spec_fn_flavor,
+                },
+            build_string_from_array_fn:
+                HelperHandle {
+                    idx: build_string_from_array_fn_idx,
+                    flavor: _build_string_from_array_fn_flavor,
+                },
+            convert_value_fn:
+                HelperHandle {
+                    idx: convert_value_fn_idx,
+                    flavor: _convert_value_fn_flavor,
+                },
+            import_name_fn:
+                HelperHandle {
+                    idx: import_name_fn_idx,
+                    flavor: _import_name_fn_flavor,
+                },
+            load_super_attr_fn:
+                HelperHandle {
+                    idx: load_super_attr_fn_idx,
+                    flavor: _load_super_attr_fn_flavor,
+                },
+            super_attr_unwrap_fn:
+                HelperHandle {
+                    idx: super_attr_unwrap_fn_idx,
+                    flavor: _super_attr_unwrap_fn_flavor,
+                },
+            load_deref_value_fn:
+                HelperHandle {
+                    idx: load_deref_value_fn_idx,
+                    flavor: _load_deref_value_fn_flavor,
+                },
+            unary_invert_fn:
+                HelperHandle {
+                    idx: unary_invert_fn_idx,
+                    flavor: _unary_invert_fn_flavor,
+                },
+            unary_not_fn:
+                HelperHandle {
+                    idx: unary_not_fn_idx,
+                    flavor: _unary_not_fn_flavor,
+                },
+            load_fast_check_fn:
+                HelperHandle {
+                    idx: load_fast_check_fn_idx,
+                    flavor: _load_fast_check_fn_flavor,
+                },
         } = register_helper_fn_pointers(&mut assembler, self.cpu());
 
         // codewriter.py:37 `portal_jd = self.callcontrol.jitdriver_sd_from_portal_graph(graph)`
@@ -4349,6 +4802,23 @@ impl CodeWriter {
                 ],
                 load_attr_fn_idx,
                 load_method_self_fn_idx,
+                store_attr_fn_idx,
+                build_map_from_array_fn_idx,
+                binary_slice_fn_idx,
+                delete_subscr_fn_idx,
+                delete_attr_fn_idx,
+                build_set_from_array_fn_idx,
+                format_simple_fn_idx,
+                format_with_spec_fn_idx,
+                build_string_from_array_fn_idx,
+                convert_value_fn_idx,
+                import_name_fn_idx,
+                load_super_attr_fn_idx,
+                super_attr_unwrap_fn_idx,
+                load_deref_value_fn_idx,
+                unary_invert_fn_idx,
+                unary_not_fn_idx,
+                load_fast_check_fn_idx,
             });
         }
 
@@ -4780,7 +5250,35 @@ impl CodeWriter {
         // `"abort_permanent"` to the builder, so the external push is
         // an exact mirror of the pre-existing internal behavior.
         macro_rules! emit_abort_permanent {
-            () => {{
+            ($py_pc:expr) => {{
+                // Publish `last_instr` to the vable before the bail so the
+                // blackhole hands the interpreter the right resume
+                // coordinate.  The blackhole replays codewriter jitcode that
+                // only syncs `valuestackdepth` (`emit_vsd!`), never
+                // `last_instr` (field 0) — so a replay that travels far from
+                // its resume snapshot (e.g. an exception handler walked into
+                // a try/finally cleanup) reaches `abort_permanent` with
+                // `frame.last_instr` frozen at the snapshot pc.  The bail
+                // (`bhimpl_abort_permanent` → interpreter) would then resume
+                // at the stale opcode with the post-replay value stack and
+                // underflow.  Store `py_pc - 1` (the `set_last_instr_from_next_instr`
+                // convention: `next_instr = last_instr + 1`) so the
+                // interpreter resumes at this unsupported opcode and runs it.
+                if is_portal {
+                    let v_li: super::flow::FlowValue =
+                        super::flow::Constant::signed(($py_pc) as i64 - 1).into();
+                    record_graph_op(
+                        &current_block.block(),
+                        "setfield_vable_i",
+                        vable_setfield_int_graph_args(
+                            frame_var.into(),
+                            v_li.into(),
+                            VABLE_LAST_INSTR_FIELD_IDX,
+                        ),
+                        None,
+                        ($py_pc) as i64,
+                    );
+                }
                 // Graph-side dual-write so the canonical `flatten_graph`
                 // driver sees the same `abort_permanent` SpaceOp via
                 // passthrough.  Without this dual-write, canonical
@@ -6613,7 +7111,7 @@ impl CodeWriter {
                                 result.into()
                             };
                             if nargs > 8 {
-                                emit_abort_permanent!();
+                                emit_abort_permanent!(py_pc);
                             }
                             push_and_bump!(call_result_value, py_pc);
                         }
@@ -6721,7 +7219,7 @@ impl CodeWriter {
                                     let _ = emit_popvalue_ref!(current_depth, py_pc);
                                     let _ = pop_ref_or_fresh(&mut current_state, &mut graph);
                                 }
-                                emit_abort_permanent!();
+                                emit_abort_permanent!(py_pc);
                                 push_fresh_ref(&mut current_state, &mut graph);
                                 current_depth += 1;
                                 emit_vsd!(current_depth, py_pc);
@@ -7213,7 +7711,7 @@ impl CodeWriter {
                             // result on top. Preserve the net `+1` stack effect in
                             // the shadow graph and fall back to the interpreter for
                             // the actual helper call semantics.
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
                             emit_vsd!(current_depth, py_pc);
@@ -7315,7 +7813,7 @@ impl CodeWriter {
                             // value.  Unlike STORE_NAME it bypasses w_locals
                             // (`pyopcode.py:940`), and no hot path needs it
                             // yet — keep the abort until a helper lands.
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                             pop_and_decr_depth(&mut current_state, &mut current_depth);
                             emit_vsd!(current_depth, py_pc);
                         }
@@ -7325,27 +7823,38 @@ impl CodeWriter {
                             // RustPython: (1 pushed, 1 popped).
                             let _ = current_state.stack.pop();
                             push_fresh_ref(&mut current_state, &mut graph);
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
                         Instruction::StoreAttr { namei } => {
                             let name_idx = namei.get(op_arg) as usize;
-                            let attr_name =
-                                super::flow::Constant::string(code.names[name_idx].as_str());
+                            // rtyper-surrogate operands threaded into the
+                            // `bh_store_attr_fn(obj, value, code, name_idx)`
+                            // residual, identical to the LoadAttr arm: the
+                            // jitcode's own W_CodeObject as a post-rtype
+                            // `Signed(ptr) + Kind::Ref` constant and the
+                            // `co_names` index the helper resolves the name
+                            // with.
+                            let code_const: super::flow::FlowValue = super::flow::Constant::new(
+                                super::flow::ConstantValue::Signed(w_code as i64),
+                                Some(Kind::Ref),
+                            )
+                            .into();
+                            let name_idx_const: super::flow::FlowValue =
+                                super::flow::Constant::signed(name_idx as i64).into();
                             current_depth = current_depth.saturating_sub(1);
                             emit_vsd!(current_depth, py_pc);
                             let obj_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             current_depth = current_depth.saturating_sub(1);
                             emit_vsd!(current_depth, py_pc);
                             let stored_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            emit_frontend_setattr(
-                                &mut graph,
+                            emit_frontend_store_attr(
                                 &current_block.block(),
                                 obj_value,
-                                attr_name.into(),
                                 stored_value,
+                                code_const,
+                                name_idx_const,
                                 py_pc as i64,
                             );
-                            emit_abort_permanent!();
                         }
                         Instruction::LoadAttr { namei } => {
                             // LOAD_ATTR net-0 (plain form); the CPython-3.13
@@ -7491,12 +8000,12 @@ impl CodeWriter {
                             // pypy/interpreter/pyopcode.py:1281.
                             let _ = current_state.stack.pop();
                             push_fresh_ref(&mut current_state, &mut graph);
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         Instruction::ForIter { .. } => {
                             // push next item: net +1
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                             current_depth += 1;
                             emit_vsd!(current_depth, py_pc);
                         }
@@ -7504,7 +8013,7 @@ impl CodeWriter {
                         Instruction::EndFor => {
                             // Pyre's end_for() is a no-op (pyopcode.rs:999). Net: 0.
                             // The actual pop is handled by the subsequent PopIter (-1).
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         Instruction::PopIter => {
@@ -7514,27 +8023,49 @@ impl CodeWriter {
                         }
 
                         // BinarySlice: obj[start:stop] — pops 3 (stop, start, obj), pushes 1 (result).
-                        // Net stack effect: -2.
-                        // pyopcode.py BINARY_SLICE / eval.rs:2857-2935.
+                        // Net stack effect: -2.  Same stack-direct pattern as
+                        // BinaryOp: the `binary_slice` HLOp reads its operands from
+                        // the popped slots and `flatten::lower_binary_slice_hlop_to_insn`
+                        // threads them into the `bh_binary_slice_fn(obj, start, stop)`
+                        // residual.  TOS = stop, TOS1 = start, TOS2 = obj.
                         Instruction::BinarySlice => {
-                            for _ in 0..3 {
-                                pop_and_decr_depth(&mut current_state, &mut current_depth);
-                            }
-                            push_fresh_ref(&mut current_state, &mut graph);
-                            current_depth += 1;
-                            emit_abort_permanent!();
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
+                            let stop_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
+                            let start_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
+                            let obj_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let result_value = emit_frontend_binary_slice(
+                                &mut graph,
+                                &current_block.block(),
+                                obj_value,
+                                start_value,
+                                stop_value,
+                                py_pc as i64,
+                            );
+                            pin!(Some(result_value), stack_base + current_depth);
+                            push_and_bump!(result_value.into(), py_pc);
                         }
 
                         // ContainsOp: item in container — pops 2, pushes 1 (bool).
-                        // Net stack effect: -1.
-                        // pyopcode.py CONTAINS_OP / eval.rs:1784-1798.
-                        Instruction::ContainsOp { .. } => {
-                            for _ in 0..2 {
-                                pop_and_decr_depth(&mut current_state, &mut current_depth);
-                            }
-                            push_fresh_ref(&mut current_state, &mut graph);
-                            current_depth += 1;
-                            emit_abort_permanent!();
+                        // Net stack effect: -1. Same stack-direct pattern as
+                        // CompareOp: TOS = container, TOS1 = item.
+                        Instruction::ContainsOp { invert } => {
+                            let invert_kind = invert.get(op_arg);
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
+                            let container_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
+                            let item_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let result_value = emit_frontend_contains(
+                                &mut graph,
+                                &current_block.block(),
+                                item_value,
+                                container_value,
+                                invert_kind,
+                                py_pc as i64,
+                            );
+                            pin!(Some(result_value), stack_base + current_depth);
+                            push_and_bump!(result_value.into(), py_pc);
                         }
 
                         // CallKw: like Call but with extra kwnames tuple.
@@ -7549,7 +8080,7 @@ impl CodeWriter {
                             }
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // Swap: swap TOS with TOS[i]. No net stack effect.
@@ -7560,7 +8091,7 @@ impl CodeWriter {
                             if depth > 0 && depth <= stack_len {
                                 current_state.stack.swap(stack_len - 1, stack_len - depth);
                             }
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // LoadFastAndClear: push local, clear it. Net: +1.
@@ -7575,26 +8106,91 @@ impl CodeWriter {
                             }
                             current_state.stack.push(value);
                             current_depth += 1;
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // ListAppend(i): peek list at stack[i], pop value. Net: -1.
                         // shared_opcode.rs opcode_list_append.
                         Instruction::ListAppend { .. } => {
                             pop_and_decr_depth(&mut current_state, &mut current_depth);
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // BuildMap(count): pop 2*count key-value pairs, push dict. Net: -(2*count - 1).
                         // shared_opcode.rs opcode_build_map.
+                        // BuildMap(count): pops count key-value pairs (2*count
+                        // stack items), pushes 1 dict. Net: -(2*count - 1).
+                        //
+                        // Mirrors BuildTuple's `new_array_clear` + unrolled
+                        // `setarrayitem_gc_r` array build (`pyframe.py:408-419`),
+                        // then a single `build_map_from_array` residual consuming
+                        // the forced `[k0, v0, k1, v1, ...]` array. No arity cap:
+                        // the length travels in the array.
                         Instruction::BuildMap { count } => {
-                            let n = count.get(op_arg) as usize;
-                            for _ in 0..n * 2 {
-                                pop_and_decr_depth(&mut current_state, &mut current_depth);
+                            let nitems = count.get(op_arg) as usize * 2;
+                            // Empty `{}` (count 0) declines: the only corpus
+                            // site is `type(name, (), {})`, whose raise
+                            // (UnicodeEncodeError) exercises the unsupported
+                            // exception-resume-through-call path (#68/#51c).
+                            // Non-empty dict literals lower to the array
+                            // residual below.
+                            if nitems == 0 {
+                                push_fresh_ref(&mut current_state, &mut graph);
+                                current_depth += 1;
+                                emit_abort_permanent!(py_pc);
+                                continue;
                             }
-                            push_fresh_ref(&mut current_state, &mut graph);
-                            current_depth += 1;
-                            emit_abort_permanent!();
+                            let mut item_values_rev = Vec::with_capacity(nitems);
+                            for _ in 0..nitems {
+                                let item_reg = emit_popvalue_ref!(current_depth, py_pc);
+                                let item_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                                if let super::flow::FlowValue::Variable(v) = &item_value {
+                                    pin!(Some(*v), item_reg);
+                                }
+                                item_values_rev.push(item_value);
+                            }
+                            // popvalues pops top-first; the array keeps
+                            // bottom-to-top order, so reverse the pop order.
+                            let items: Vec<super::flow::FlowValue> =
+                                item_values_rev.into_iter().rev().collect();
+                            let array_var = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                "new_array_clear",
+                                vec![
+                                    super::flow::FlowValue::Constant(
+                                        super::flow::Constant::signed(nitems as i64),
+                                    )
+                                    .into(),
+                                ],
+                                Kind::Ref,
+                                py_pc as i64,
+                            );
+                            for (i, item) in items.into_iter().enumerate() {
+                                emit_graph_op_void(
+                                    &current_block.block(),
+                                    "setarrayitem_gc_r",
+                                    vec![
+                                        super::flow::FlowValue::Variable(array_var).into(),
+                                        super::flow::FlowValue::Constant(
+                                            super::flow::Constant::signed(i as i64),
+                                        )
+                                        .into(),
+                                        item.into(),
+                                    ],
+                                    py_pc as i64,
+                                );
+                            }
+                            let result_value = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                "build_map_from_array",
+                                vec![super::flow::FlowValue::Variable(array_var).into()],
+                                Kind::Ref,
+                                py_pc as i64,
+                            );
+                            pin!(Some(result_value), stack_base + current_depth);
+                            push_and_bump!(result_value.into(), py_pc);
                         }
 
                         // MapAdd(i): peek dict at stack[i], pop value + key. Net: -2.
@@ -7603,7 +8199,7 @@ impl CodeWriter {
                             for _ in 0..2 {
                                 pop_and_decr_depth(&mut current_state, &mut current_depth);
                             }
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // ── Remaining instructions: stack-effect-only accounting ──
@@ -7612,13 +8208,24 @@ impl CodeWriter {
                         // codewriter's mergeblock/pendingblocks converge.
 
                         // IsOp: pops 2, pushes 1 bool. Net: -1.
-                        Instruction::IsOp { .. } => {
-                            for _ in 0..2 {
-                                pop_and_decr_depth(&mut current_state, &mut current_depth);
-                            }
-                            push_fresh_ref(&mut current_state, &mut graph);
-                            current_depth += 1;
-                            emit_abort_permanent!();
+                        // Pointer identity routed through the compare residual
+                        // (`is` → tag 8, `is_not` → tag 9; bh_compare_fn).
+                        Instruction::IsOp { invert } => {
+                            let invert_kind = invert.get(op_arg);
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
+                            let rhs_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
+                            let lhs_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let result_value = emit_frontend_is_op(
+                                &mut graph,
+                                &current_block.block(),
+                                lhs_value,
+                                rhs_value,
+                                invert_kind,
+                                py_pc as i64,
+                            );
+                            pin!(Some(result_value), stack_base + current_depth);
+                            push_and_bump!(result_value.into(), py_pc);
                         }
 
                         // BuildTuple(count): pops count items, pushes 1 tuple. Net: -(count-1).
@@ -7692,25 +8299,131 @@ impl CodeWriter {
                         }
 
                         // BuildSet(count): pops count items, pushes 1 set. Net: -(count-1).
+                        //
+                        // Mirrors BuildMap's `new_array_clear` + unrolled
+                        // `setarrayitem_gc_r` array build, then a single
+                        // `build_set_from_array` residual consuming the forced
+                        // element array.  No arity cap: the length travels in
+                        // the array.  Unlike BuildMap, no count==0 decline —
+                        // BuildSet has no raising corpus site (`{}` is a dict),
+                        // and an empty array yields an empty set.
                         Instruction::BuildSet { count } => {
                             let n = count.get(op_arg) as usize;
+                            let mut item_values_rev = Vec::with_capacity(n);
                             for _ in 0..n {
-                                pop_and_decr_depth(&mut current_state, &mut current_depth);
+                                let item_reg = emit_popvalue_ref!(current_depth, py_pc);
+                                let item_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                                if let super::flow::FlowValue::Variable(v) = &item_value {
+                                    pin!(Some(*v), item_reg);
+                                }
+                                item_values_rev.push(item_value);
                             }
-                            push_fresh_ref(&mut current_state, &mut graph);
-                            current_depth += 1;
-                            emit_abort_permanent!();
+                            // popvalues pops top-first; the array keeps
+                            // bottom-to-top order, so reverse the pop order.
+                            let items: Vec<super::flow::FlowValue> =
+                                item_values_rev.into_iter().rev().collect();
+                            let array_var = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                "new_array_clear",
+                                vec![
+                                    super::flow::FlowValue::Constant(
+                                        super::flow::Constant::signed(n as i64),
+                                    )
+                                    .into(),
+                                ],
+                                Kind::Ref,
+                                py_pc as i64,
+                            );
+                            for (i, item) in items.into_iter().enumerate() {
+                                emit_graph_op_void(
+                                    &current_block.block(),
+                                    "setarrayitem_gc_r",
+                                    vec![
+                                        super::flow::FlowValue::Variable(array_var).into(),
+                                        super::flow::FlowValue::Constant(
+                                            super::flow::Constant::signed(i as i64),
+                                        )
+                                        .into(),
+                                        item.into(),
+                                    ],
+                                    py_pc as i64,
+                                );
+                            }
+                            let result_value = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                "build_set_from_array",
+                                vec![super::flow::FlowValue::Variable(array_var).into()],
+                                Kind::Ref,
+                                py_pc as i64,
+                            );
+                            pin!(Some(result_value), stack_base + current_depth);
+                            push_and_bump!(result_value.into(), py_pc);
                         }
 
                         // BuildString(count): pops count strings, pushes 1. Net: -(count-1).
+                        //
+                        // Same `new_array_clear` + unrolled `setarrayitem_gc_r`
+                        // array build as BuildSet, then a single
+                        // `build_string_from_array` residual concatenating the
+                        // forced fragment array.  The length travels in the
+                        // array (no arity cap).  Fragments are already strings
+                        // (FORMAT_SIMPLE / FORMAT_WITH_SPEC / CONVERT_VALUE ran
+                        // first), so the residual runs no user code → `Plain`.
                         Instruction::BuildString { count } => {
                             let n = count.get(op_arg) as usize;
+                            let mut item_values_rev = Vec::with_capacity(n);
                             for _ in 0..n {
-                                pop_and_decr_depth(&mut current_state, &mut current_depth);
+                                let item_reg = emit_popvalue_ref!(current_depth, py_pc);
+                                let item_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                                if let super::flow::FlowValue::Variable(v) = &item_value {
+                                    pin!(Some(*v), item_reg);
+                                }
+                                item_values_rev.push(item_value);
                             }
-                            push_fresh_ref(&mut current_state, &mut graph);
-                            current_depth += 1;
-                            emit_abort_permanent!();
+                            // popvalues pops top-first; the array keeps
+                            // bottom-to-top order, so reverse the pop order.
+                            let items: Vec<super::flow::FlowValue> =
+                                item_values_rev.into_iter().rev().collect();
+                            let array_var = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                "new_array_clear",
+                                vec![
+                                    super::flow::FlowValue::Constant(
+                                        super::flow::Constant::signed(n as i64),
+                                    )
+                                    .into(),
+                                ],
+                                Kind::Ref,
+                                py_pc as i64,
+                            );
+                            for (i, item) in items.into_iter().enumerate() {
+                                emit_graph_op_void(
+                                    &current_block.block(),
+                                    "setarrayitem_gc_r",
+                                    vec![
+                                        super::flow::FlowValue::Variable(array_var).into(),
+                                        super::flow::FlowValue::Constant(
+                                            super::flow::Constant::signed(i as i64),
+                                        )
+                                        .into(),
+                                        item.into(),
+                                    ],
+                                    py_pc as i64,
+                                );
+                            }
+                            let result_value = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                "build_string_from_array",
+                                vec![super::flow::FlowValue::Variable(array_var).into()],
+                                Kind::Ref,
+                                py_pc as i64,
+                            );
+                            pin!(Some(result_value), stack_base + current_depth);
+                            push_and_bump!(result_value.into(), py_pc);
                         }
 
                         // CallFunctionEx: pops callable+null+args+kwargs_or_null (4), pushes 1. Net: -3.
@@ -7720,52 +8433,83 @@ impl CodeWriter {
                             }
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
-                        // DeleteSubscr: pops 2 (key, obj). Net: -2.
+                        // DeleteSubscr: pops 2 (index, obj). Net: -2.
                         Instruction::DeleteSubscr => {
-                            for _ in 0..2 {
-                                pop_and_decr_depth(&mut current_state, &mut current_depth);
-                            }
-                            emit_abort_permanent!();
+                            current_depth -= 1;
+                            emit_vsd!(current_depth, py_pc);
+                            let key_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            current_depth -= 1;
+                            emit_vsd!(current_depth, py_pc);
+                            let obj_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            emit_frontend_delsubscr(
+                                &mut graph,
+                                &current_block.block(),
+                                obj_value,
+                                key_value,
+                                py_pc as i64,
+                            );
                         }
 
                         // DeleteAttr: pops 1 (obj). Net: -1.
-                        Instruction::DeleteAttr { .. } => {
-                            pop_and_decr_depth(&mut current_state, &mut current_depth);
-                            emit_abort_permanent!();
+                        Instruction::DeleteAttr { namei } => {
+                            let name_idx = namei.get(op_arg) as usize;
+                            // rtyper-surrogate operands threaded into the
+                            // `bh_delete_attr_fn(obj, code, name_idx)` residual,
+                            // identical to the StoreAttr arm: the jitcode's own
+                            // W_CodeObject as a post-rtype `Signed(ptr) + Kind::Ref`
+                            // constant and the `co_names` index the helper resolves
+                            // the name with.
+                            let code_const: super::flow::FlowValue = super::flow::Constant::new(
+                                super::flow::ConstantValue::Signed(w_code as i64),
+                                Some(Kind::Ref),
+                            )
+                            .into();
+                            let name_idx_const: super::flow::FlowValue =
+                                super::flow::Constant::signed(name_idx as i64).into();
+                            current_depth = current_depth.saturating_sub(1);
+                            emit_vsd!(current_depth, py_pc);
+                            let obj_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            emit_frontend_delete_attr(
+                                &current_block.block(),
+                                obj_value,
+                                code_const,
+                                name_idx_const,
+                                py_pc as i64,
+                            );
                         }
 
                         // PopJumpIfNone / PopJumpIfNotNone: pops 1. Net: -1.
                         Instruction::PopJumpIfNone { .. }
                         | Instruction::PopJumpIfNotNone { .. } => {
                             pop_and_decr_depth(&mut current_state, &mut current_depth);
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // SetAdd(i): peek set, pop value. Net: -1.
                         Instruction::SetAdd { .. } => {
                             pop_and_decr_depth(&mut current_state, &mut current_depth);
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // ListExtend(i): peek list, pop iterable. Net: -1.
                         Instruction::ListExtend { .. } => {
                             pop_and_decr_depth(&mut current_state, &mut current_depth);
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // SetUpdate(i): peek set, pop iterable. Net: -1.
                         Instruction::SetUpdate { .. } => {
                             pop_and_decr_depth(&mut current_state, &mut current_depth);
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // DictUpdate(i) / DictMerge(i): peek dict, pop source. Net: -1.
                         Instruction::DictUpdate { .. } | Instruction::DictMerge { .. } => {
                             pop_and_decr_depth(&mut current_state, &mut current_depth);
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // SetFunctionAttribute: pops func (TOS), pops attr (TOS1),
@@ -7778,7 +8522,7 @@ impl CodeWriter {
                             current_depth = current_depth.saturating_sub(1);
                             current_state.stack.push(func);
                             current_depth += 1;
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // EndSend: pops result (TOS), pops iter (TOS1), pushes result back.
@@ -7790,24 +8534,51 @@ impl CodeWriter {
                             current_depth = current_depth.saturating_sub(1);
                             current_state.stack.push(result);
                             current_depth += 1;
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
-                        // ImportName: pops 2 (level, fromlist), pushes 1 module. Net: -1.
-                        Instruction::ImportName { .. } => {
-                            for _ in 0..2 {
-                                pop_and_decr_depth(&mut current_state, &mut current_depth);
-                            }
-                            push_fresh_ref(&mut current_state, &mut graph);
-                            current_depth += 1;
-                            emit_abort_permanent!();
+                        // ImportName: pops 2 (fromlist=TOS, level=TOS1), pushes
+                        // 1 module. Net: -1.  `import_name(fromlist, level, code,
+                        // name_idx)` HLOp → `residual_call_ir_r(import_name_fn,
+                        // ListI[name_idx], ListR[fromlist, level, code])`.  The
+                        // jitcode's own W_CodeObject travels as a post-rtype
+                        // `Signed(ptr) + Kind::Ref` constant and the `co_names`
+                        // index the helper resolves the module name with — the
+                        // same surrogate-operand shape as the LoadAttr arm.
+                        // `bh_import_name_fn` runs `__import__` through the
+                        // TLS-pinned execution context (MayForce).
+                        Instruction::ImportName { namei } => {
+                            let name_idx = namei.get(op_arg) as usize;
+                            let code_const: super::flow::FlowValue = super::flow::Constant::new(
+                                super::flow::ConstantValue::Signed(w_code as i64),
+                                Some(Kind::Ref),
+                            )
+                            .into();
+                            let name_idx_const: super::flow::FlowValue =
+                                super::flow::Constant::signed(name_idx as i64).into();
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
+                            let fromlist_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
+                            let level_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let result_value = emit_frontend_import_name(
+                                &mut graph,
+                                &current_block.block(),
+                                fromlist_value,
+                                level_value,
+                                code_const,
+                                frame_var.into(),
+                                name_idx_const,
+                                py_pc as i64,
+                            );
+                            pin!(Some(result_value), stack_base + current_depth);
+                            push_and_bump!(result_value.into(), py_pc);
                         }
 
                         // ImportFrom: peek module, push attr. Net: +1.
                         Instruction::ImportFrom { .. } => {
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // StoreSlice: pops 4 (stop, start, obj, value). Net: -4.
@@ -7815,35 +8586,101 @@ impl CodeWriter {
                             for _ in 0..4 {
                                 pop_and_decr_depth(&mut current_state, &mut current_depth);
                             }
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
-                        // FormatWithSpec: pops 2 (spec, value), pushes 1 string. Net: -1.
+                        // FormatWithSpec: pops 2 (spec=TOS, value=TOS1), pushes 1
+                        // string. Net: -1.  `f"{x:.2f}"` →
+                        // `format_with_spec(value, spec)` HLOp lowered to
+                        // `residual_call_r_r(format_with_spec_fn_idx,
+                        // ListR[value, spec])` (`bh_format_with_spec_fn` formats
+                        // through the shared `runtime_ops::format_value`; a user
+                        // `__format__` may run Python → MayForce).
                         Instruction::FormatWithSpec => {
-                            for _ in 0..2 {
-                                pop_and_decr_depth(&mut current_state, &mut current_depth);
+                            let spec_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let spec_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            if let super::flow::FlowValue::Variable(v) = &spec_value {
+                                pin!(Some(*v), spec_reg);
                             }
-                            push_fresh_ref(&mut current_state, &mut graph);
-                            current_depth += 1;
-                            emit_abort_permanent!();
+                            let val_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let val_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            if let super::flow::FlowValue::Variable(v) = &val_value {
+                                pin!(Some(*v), val_reg);
+                            }
+                            let result_value = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                "format_with_spec",
+                                vec![val_value.into(), spec_value.into()],
+                                Kind::Ref,
+                                py_pc as i64,
+                            );
+                            pin!(Some(result_value), stack_base + current_depth);
+                            push_and_bump!(result_value.into(), py_pc);
                         }
 
-                        // LoadSuperAttr: pops 3 (super, cls, self).
-                        // is_method=false → pushes 1 (result). Net: -2.
-                        // is_method=true  → pushes 2 (func, self_or_null). Net: -1.
-                        // pyopcode.rs:1926-1932, eval.rs:2331-2360.
+                        // LoadSuperAttr: pops 3 (self=TOS, cls=TOS1,
+                        // global_super=TOS2). is_method=false → pushes 1
+                        // (result). Net: -2.  is_method=true → pushes 2 (func,
+                        // self_or_null). Net: -1.  `oparg >> 2` is the co_names
+                        // index, `oparg & 1` the is_method flag (both
+                        // compile-time constants).  `load_super_attr(self, cls,
+                        // code, name_idx)` HLOp →
+                        // `residual_call_ir_r(load_super_attr_fn, ListI[name_idx],
+                        // ListR[self, cls, code])` resolves `getattr(super(cls,
+                        // self), name)` (MayForce).  The is_method form runs the
+                        // runtime bound-method unwrap through two pure
+                        // `super_attr_unwrap(raw, which)` residuals (which 0 =
+                        // func slot, 1 = self slot), mirroring the LOAD_ATTR
+                        // method form's two-residual push.
                         Instruction::LoadSuperAttr { .. } => {
+                            let name_idx = (u32::from(op_arg) >> 2) as usize;
                             let is_method = (u32::from(op_arg) & 1) != 0;
-                            for _ in 0..3 {
-                                pop_and_decr_depth(&mut current_state, &mut current_depth);
-                            }
-                            push_fresh_ref(&mut current_state, &mut graph);
-                            current_depth += 1;
+                            let code_const: super::flow::FlowValue = super::flow::Constant::new(
+                                super::flow::ConstantValue::Signed(w_code as i64),
+                                Some(Kind::Ref),
+                            )
+                            .into();
+                            let name_idx_const: super::flow::FlowValue =
+                                super::flow::Constant::signed(name_idx as i64).into();
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
+                            let self_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
+                            let cls_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
+                            let _global_super = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let raw_value = emit_frontend_load_super_attr(
+                                &mut graph,
+                                &current_block.block(),
+                                self_value,
+                                cls_value,
+                                code_const,
+                                name_idx_const,
+                                py_pc as i64,
+                            );
                             if is_method {
-                                push_fresh_ref(&mut current_state, &mut graph);
-                                current_depth += 1;
+                                let func_value = emit_frontend_super_attr_unwrap(
+                                    &mut graph,
+                                    &current_block.block(),
+                                    raw_value.into(),
+                                    super::flow::Constant::signed(0).into(),
+                                    py_pc as i64,
+                                );
+                                pin!(Some(func_value), stack_base + current_depth);
+                                push_and_bump!(func_value.into(), py_pc);
+                                let self_slot_value = emit_frontend_super_attr_unwrap(
+                                    &mut graph,
+                                    &current_block.block(),
+                                    raw_value.into(),
+                                    super::flow::Constant::signed(1).into(),
+                                    py_pc as i64,
+                                );
+                                pin!(Some(self_slot_value), stack_base + current_depth);
+                                push_and_bump!(self_slot_value.into(), py_pc);
+                            } else {
+                                pin!(Some(raw_value), stack_base + current_depth);
+                                push_and_bump!(raw_value.into(), py_pc);
                             }
-                            emit_abort_permanent!();
                         }
 
                         // UnpackEx: pops 1, pushes before+1+after items. Net: before+after.
@@ -7856,7 +8693,7 @@ impl CodeWriter {
                                 push_fresh_ref(&mut current_state, &mut graph);
                                 current_depth += 1;
                             }
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // BuildInterpolation: conditionally pops format_spec when (oparg & 1) != 0,
@@ -7874,7 +8711,7 @@ impl CodeWriter {
                             }
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // BuildTemplate: pops 2, pushes 1. Net: -1.
@@ -7884,14 +8721,14 @@ impl CodeWriter {
                             }
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // CallIntrinsic1: pops 1, pushes 1 (result may differ). Net: 0.
                         Instruction::CallIntrinsic1 { .. } => {
                             let _ = current_state.stack.pop();
                             push_fresh_ref(&mut current_state, &mut graph);
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // CallIntrinsic2: variant-dependent stack effect.
@@ -7913,14 +8750,14 @@ impl CodeWriter {
                                     current_depth += 1;
                                 }
                             }
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // GetLen: peeks obj, pushes len. Net: +1.
                         Instruction::GetLen => {
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // LoadSpecial: pops 1 (obj), pushes 2 (callable, self_or_null). Net: +1.
@@ -7931,7 +8768,7 @@ impl CodeWriter {
                             current_depth += 1;
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // LoadFromDictOrGlobals: pops 1 (dict), pushes 1 (result). Net: 0.
@@ -7939,7 +8776,7 @@ impl CodeWriter {
                         Instruction::LoadFromDictOrGlobals { .. } => {
                             let _ = current_state.stack.pop();
                             push_fresh_ref(&mut current_state, &mut graph);
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // LoadFromDictOrDeref: structural adaptation — CPython pops dict,
@@ -7949,29 +8786,210 @@ impl CodeWriter {
                         Instruction::LoadFromDictOrDeref { .. } => {
                             let _ = current_state.stack.pop();
                             push_fresh_ref(&mut current_state, &mut graph);
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
+                        }
+
+                        // LOAD_DEREF: pushes the dereferenced cell value (+1).
+                        // The cell object lives in the same vable
+                        // `locals_cells_stack_w` array as the plain locals, so
+                        // `i` is a unified localsplus index read exactly like
+                        // LOAD_FAST (the vable getarrayitem path, inlining-safe
+                        // via `frame_var`).  The `load_deref_value(cell, code,
+                        // deref_idx)` HLOp → `residual_call_ir_r(
+                        // load_deref_value_fn, ListR[cell, code],
+                        // ListI[deref_idx])` dereferences the cell and raises
+                        // the named unbound-variable NameError
+                        // (`bh_load_deref_value_fn`, CallFlavor::Plain — reads
+                        // heap, runs no user code).  `deref_idx` is the unified
+                        // localsplus index the residual resolves the variable
+                        // name with through `code`.
+                        Instruction::LoadDeref { i } => {
+                            let deref_idx = i.get(op_arg).as_usize() as u16;
+                            let code_const: super::flow::FlowValue = super::flow::Constant::new(
+                                super::flow::ConstantValue::Signed(w_code as i64),
+                                Some(Kind::Ref),
+                            )
+                            .into();
+                            let deref_idx_const: super::flow::FlowValue =
+                                super::flow::Constant::signed(deref_idx as i64).into();
+                            emit_load_fast_ref!(current_depth, deref_idx, py_pc);
+                            let cell_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let cell_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            if let super::flow::FlowValue::Variable(v) = &cell_value {
+                                pin!(Some(*v), cell_reg);
+                            }
+                            let result_value = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                "load_deref_value",
+                                vec![cell_value.into(), code_const.into(), deref_idx_const.into()],
+                                Kind::Ref,
+                                py_pc as i64,
+                            );
+                            pin!(Some(result_value), stack_base + current_depth);
+                            push_and_bump!(result_value.into(), py_pc);
+                        }
+
+                        // LOAD_FAST_CHECK: reads a local that may be unbound,
+                        // pushes it, and raises NameError when the slot is
+                        // PY_NULL.  The local is read from the vable exactly
+                        // like LOAD_FAST (`emit_load_fast_ref!`, inlining-safe
+                        // via `frame_var`); the `load_fast_check(value, code,
+                        // name_idx)` HLOp → `residual_call_ir_r(
+                        // load_fast_check_fn, ListR[value, code],
+                        // ListI[name_idx])` returns the value when bound or
+                        // raises the unbound NameError (`bh_load_fast_check_fn`,
+                        // CallFlavor::Plain — reads no heap, runs no user code).
+                        // `name_idx` is the `co_varnames` index the residual
+                        // resolves the variable name with.
+                        Instruction::LoadFastCheck { var_num } => {
+                            let idx = var_num.get(op_arg).as_usize() as u16;
+                            let code_const: super::flow::FlowValue = super::flow::Constant::new(
+                                super::flow::ConstantValue::Signed(w_code as i64),
+                                Some(Kind::Ref),
+                            )
+                            .into();
+                            let name_idx_const: super::flow::FlowValue =
+                                super::flow::Constant::signed(idx as i64).into();
+                            emit_load_fast_ref!(current_depth, idx, py_pc);
+                            let value_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let value_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            if let super::flow::FlowValue::Variable(v) = &value_value {
+                                pin!(Some(*v), value_reg);
+                            }
+                            let result_value = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                "load_fast_check",
+                                vec![value_value.into(), code_const.into(), name_idx_const.into()],
+                                Kind::Ref,
+                                py_pc as i64,
+                            );
+                            pin!(Some(result_value), stack_base + current_depth);
+                            push_and_bump!(result_value.into(), py_pc);
                         }
 
                         // Loads that push +1.
-                        Instruction::LoadDeref { .. }
-                        | Instruction::LoadFastCheck { .. }
-                        | Instruction::LoadCommonConstant { .. }
+                        Instruction::LoadCommonConstant { .. }
                         | Instruction::LoadLocals
                         | Instruction::LoadBuildClass => {
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
+                        }
+
+                        // FormatSimple: pops value, pushes str(value). Net 0.
+                        // `f"{x}"` → `format_simple(value)` HLOp lowered to
+                        // `residual_call_r_r(format_simple_fn_idx, ListR[value])`
+                        // (`bh_format_simple_fn` formats with the empty spec; a
+                        // user `__format__` may run Python → MayForce).
+                        Instruction::FormatSimple => {
+                            let val_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let val_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            if let super::flow::FlowValue::Variable(v) = &val_value {
+                                pin!(Some(*v), val_reg);
+                            }
+                            let result_value = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                "format_simple",
+                                vec![val_value.into()],
+                                Kind::Ref,
+                                py_pc as i64,
+                            );
+                            pin!(Some(result_value), stack_base + current_depth);
+                            push_and_bump!(result_value.into(), py_pc);
+                        }
+
+                        // ConvertValue: pops 1 (value), pushes 1 (str). Net 0.
+                        // `f"{x!r}"` / the `'%s' % x` rewrite →
+                        // `convert_value(value, conv)` HLOp lowered to
+                        // `residual_call_ir_r(convert_value_fn_idx, ListI[conv],
+                        // ListR[value])`.  `conv` (Str/Repr/Ascii/None) is a
+                        // compile-time `runtime_ops::convert_value_code` baked as
+                        // a constant; `bh_convert_value_fn` runs str/repr/ascii
+                        // (a user `__str__` / `__repr__` may run Python →
+                        // MayForce).
+                        Instruction::ConvertValue { oparg } => {
+                            let conv_code = pyre_interpreter::runtime_ops::convert_value_code(
+                                oparg.get(op_arg),
+                            );
+                            let val_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let val_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            if let super::flow::FlowValue::Variable(v) = &val_value {
+                                pin!(Some(*v), val_reg);
+                            }
+                            let result_value = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                "convert_value",
+                                vec![
+                                    val_value.into(),
+                                    super::flow::FlowValue::Constant(
+                                        super::flow::Constant::signed(conv_code),
+                                    )
+                                    .into(),
+                                ],
+                                Kind::Ref,
+                                py_pc as i64,
+                            );
+                            pin!(Some(result_value), stack_base + current_depth);
+                            push_and_bump!(result_value.into(), py_pc);
+                        }
+
+                        // UNARY_INVERT: pops `value`, pushes `~value` (net 0).
+                        // `unary_invert(value)` HLOp →
+                        // `residual_call_r_r(unary_invert_fn, ListR[value])`
+                        // computes `~value` through
+                        // `opcode_ops::unary_invert_value`; a user `__invert__`
+                        // may run Python → MayForce.
+                        Instruction::UnaryInvert => {
+                            let val_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let val_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            if let super::flow::FlowValue::Variable(v) = &val_value {
+                                pin!(Some(*v), val_reg);
+                            }
+                            let result_value = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                "unary_invert",
+                                vec![val_value.into()],
+                                Kind::Ref,
+                                py_pc as i64,
+                            );
+                            pin!(Some(result_value), stack_base + current_depth);
+                            push_and_bump!(result_value.into(), py_pc);
+                        }
+
+                        // UNARY_NOT: pops `value`, pushes `not value` as a bool
+                        // (net 0).  `unary_not(value)` HLOp →
+                        // `residual_call_r_r(unary_not_fn, ListR[value])`
+                        // returns `not truth(value)` through
+                        // `opcode_ops::truth_value`; a user `__bool__` /
+                        // `__len__` may run Python → MayForce.
+                        Instruction::UnaryNot => {
+                            let val_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let val_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            if let super::flow::FlowValue::Variable(v) = &val_value {
+                                pin!(Some(*v), val_reg);
+                            }
+                            let result_value = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                "unary_not",
+                                vec![val_value.into()],
+                                Kind::Ref,
+                                py_pc as i64,
+                            );
+                            pin!(Some(result_value), stack_base + current_depth);
+                            push_and_bump!(result_value.into(), py_pc);
                         }
 
                         // Pops 1, pushes 1 (net 0). Replace shadow value.
-                        Instruction::ConvertValue { .. }
-                        | Instruction::FormatSimple
-                        | Instruction::UnaryNot
-                        | Instruction::UnaryInvert
-                        | Instruction::GetYieldFromIter => {
+                        Instruction::GetYieldFromIter => {
                             let _ = current_state.stack.pop();
                             push_fresh_ref(&mut current_state, &mut graph);
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // Structural adaptation: async opcodes. Pyre's dispatcher
@@ -7980,13 +8998,13 @@ impl CodeWriter {
                         Instruction::GetAiter | Instruction::GetAwaitable { .. } => {
                             let _ = current_state.stack.pop();
                             push_fresh_ref(&mut current_state, &mut graph);
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // StoreDeref: pops 1 value. Net: -1.
                         Instruction::StoreDeref { .. } => {
                             pop_and_decr_depth(&mut current_state, &mut current_depth);
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // Instructions that don't touch the operand stack (locals/cells only).
@@ -7997,14 +9015,14 @@ impl CodeWriter {
                         | Instruction::CopyFreeVars { .. }
                         | Instruction::MakeCell { .. }
                         | Instruction::SetupAnnotations => {
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // ExitInitCheck: no-op in pyre (pyopcode.rs:2069). Net: 0.
                         // RustPython pops the __init__ return value, but pyre's
                         // dispatch is a plain Ok(StepResult::Continue).
                         Instruction::ExitInitCheck => {
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // StoreName pops 1 value from the stack.
@@ -8016,14 +9034,14 @@ impl CodeWriter {
                         Instruction::YieldValue { .. } => {
                             let _ = current_state.stack.pop();
                             push_fresh_ref(&mut current_state, &mut graph);
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // ReturnGenerator: pushes 1. Net: +1.
                         Instruction::ReturnGenerator => {
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // Send: pops sent value, peeks iter, pushes next result. Net: 0.
@@ -8031,7 +9049,7 @@ impl CodeWriter {
                         Instruction::Send { .. } => {
                             let _ = current_state.stack.pop();
                             push_fresh_ref(&mut current_state, &mut graph);
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // Structural adaptation: async opcodes below. Pyre's dispatcher
@@ -8042,7 +9060,7 @@ impl CodeWriter {
                         Instruction::GetAnext => {
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // EndAsyncFor: pops 2. Net: -2.
@@ -8053,7 +9071,7 @@ impl CodeWriter {
                             for _ in 0..2 {
                                 pop_and_decr_depth(&mut current_state, &mut current_depth);
                             }
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // CleanupThrow: pops 3, pushes 1. Net: -2.
@@ -8063,7 +9081,7 @@ impl CodeWriter {
                             }
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // MatchSequence: peeks TOS (subject), pushes bool. Net: +1.
@@ -8071,12 +9089,12 @@ impl CodeWriter {
                         Instruction::MatchSequence => {
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // Catch-all: unknown instruction.
                         _other => {
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
                     }
                     sync_stack_state(&mut graph, &mut current_state, current_depth);

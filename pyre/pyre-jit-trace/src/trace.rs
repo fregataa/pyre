@@ -77,6 +77,10 @@ pub fn trace_bytecode(
     // A stale flag from a prior trace on this thread must not leak into
     // this trace's adoption decision.
     WALK_END_FLUSH_COMMITTED.with(|c| c.set(false));
+    // Likewise drop any cross-frame-resume abort request a prior aborted
+    // trace left unconsumed (`metainterp::interpret` clears it on the normal
+    // path; this guards the paths that exit before the poll runs).
+    let _ = crate::state::take_trace_abort_requested();
 
     let ctx = meta
         .trace_ctx()
@@ -818,6 +822,35 @@ fn probe_walk_perfn_jitcode(
     crate::jitcode_dispatch::fbw_store_journal_reset();
 }
 
+/// True when a loop body in `w_code` contains an `abort_permanent` marker.
+///
+/// An `abort_permanent` inside a loop body (e.g. the `SWAP` an `a < b < c`
+/// chained comparison lowers to, or any other unported in-loop opcode)
+/// corrupts the authoritative full-body walk: the unsupported op breaks the
+/// loop-input register seeding, so the walk mis-evaluates the loop guard,
+/// exits the loop on the first pass, and concretely executes the post-loop
+/// tail — double-running its side effects and leaving the frame positioned
+/// past the loop (#125).  The walk's reactive `abort_permanent` decline
+/// never fires because the corrupted guard exits before reaching the
+/// marker.  The scan is scoped to ops at/after the first `jit_merge_point`
+/// (the inner loop header) so a prologue-only marker (e.g. `COPY_FREE_VARS`
+/// ahead of a clean hot loop) does not over-decline.
+fn loop_body_has_abort_permanent(w_code: *const ()) -> bool {
+    let Some(pjc) = crate::state::pyjitcode_for_code(w_code) else {
+        return false;
+    };
+    let code = pjc.jitcode.code.as_slice();
+    let mut seen_merge_point = false;
+    for op in crate::jitcode_runtime::decoded_ops(code) {
+        if op.opname == "jit_merge_point" {
+            seen_merge_point = true;
+        } else if seen_merge_point && op.opname == "abort_permanent" {
+            return true;
+        }
+    }
+    false
+}
+
 /// Issue #73 production full-body tracer (Phase 5 flip, gated).
 ///
 /// `PYRE_FULL_BODY_WALK=1` drives the per-CodeObject JitCode body via
@@ -841,6 +874,16 @@ fn full_body_walk_trace(
     start_pc: usize,
     cf_addr: usize,
 ) -> TraceAction {
+    // #125: decline up front when a loop body carries an `abort_permanent`
+    // marker.  The authoritative walk would otherwise mis-seed the loop
+    // guard, exit early, and concretely double-execute the post-loop tail;
+    // routing to the trait tracer (which handles the unported op) is the
+    // same outcome the reactive in-walk `abort_permanent` decline reaches,
+    // minus the frame corruption.
+    if loop_body_has_abort_permanent(w_code) {
+        fbw_decline(crate::driver::make_green_key(w_code, start_pc));
+        return TraceAction::Abort;
+    }
     // Mirror the trait path (trace_bytecode pre-interpret): register the
     // initial merge point with typed input-arg boxes so the trace head
     // carries the portal's entry signature (`inputarg_types()`).  Without
@@ -877,7 +920,22 @@ fn full_body_walk_trace(
             .collect();
         ctx.add_merge_point(start_key, input_args, start_pc);
     }
-    match run_perfn_walk(ctx, sym, w_code, start_pc, cf_addr, true) {
+    let walk_result = run_perfn_walk(ctx, sym, w_code, start_pc, cf_addr, true);
+    // A guard snapshot emitted during the walk may have hit a resume
+    // coordinate the jitcode pc_map cannot encode (#124/#130) and requested
+    // an abort (`state::request_trace_abort`).  The walker does not poll the
+    // flag mid-walk, so honor it here before mapping the outcome — otherwise a
+    // walk that reaches a terminator would compile a trace carrying the bad
+    // guard.  Discarding the trace matches the trait leg's `interpret()` poll.
+    if crate::state::take_trace_abort_requested() {
+        if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+            eprintln!(
+                "[fbw-abort] start_pc={start_pc} unencodable cross-frame resume coordinate (#124/#130)"
+            );
+        }
+        return TraceAction::Abort;
+    }
+    match walk_result {
         Some((_entry, _code_len, Ok((outcome, _end_pc)))) => match outcome {
             crate::jitcode_dispatch::DispatchOutcome::CloseLoop {
                 jump_args,
@@ -914,6 +972,17 @@ fn full_body_walk_trace(
                 // path, trace_opcode.rs).  Ungated → no payload → `Abort`
                 // exactly as before the slice.
                 match crate::jitcode_dispatch::fbw_finish_payload_take() {
+                    // A top-level `void_return/` stashes a `Type::Void`-marked
+                    // payload: the portal exits with no value, so build a
+                    // FINISH with empty args.  The compile pipeline maps an
+                    // empty `finish_arg_types` to `done_with_this_frame_descr_void`
+                    // (pyjitpl/mod.rs `done_with_this_frame_descr_from_types`),
+                    // matching the trait tracer's `BC_VOID_RETURN` action.
+                    Some((_, majit_ir::Type::Void)) => TraceAction::Finish {
+                        finish_args: vec![],
+                        finish_arg_types: vec![],
+                        exit_with_exception: false,
+                    },
                     Some((finish_value, finish_type)) => TraceAction::Finish {
                         finish_args: vec![finish_value],
                         finish_arg_types: vec![finish_type],
@@ -972,7 +1041,6 @@ fn full_body_walk_trace(
             match e {
                 DE::AbortPermanentMarkerReached { .. }
                 | DE::GuardSnapshotVableUntyped { .. }
-                | DE::MayForceProtectedByExceptionHandlerUnsupported { .. }
                 | DE::MayForceNullRefArgUnsupported { .. }
                 | DE::BranchGuardKeptStackUnsupported { .. }
                 | DE::NonStandardVableFinishPortalUnsupported { .. }

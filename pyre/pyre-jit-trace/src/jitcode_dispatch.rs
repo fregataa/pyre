@@ -952,20 +952,6 @@ pub enum DispatchError {
     /// driver maps it to `TraceAction::Abort` and the loop falls back to
     /// the interpreter instead of compiling a wrong trace.
     MayForceNullRefArgUnsupported { pc: usize },
-    /// A may-force residual CALL that can raise (`GUARD_NO_EXCEPTION`
-    /// emitted) sits at a jitcode position immediately followed by a
-    /// `catch_exception/L` — i.e. the call is covered by a Python
-    /// `try`/`except` handler. The full-body walk cannot yet resume the
-    /// `GUARD_NO_EXCEPTION` deopt into that handler: the exception-path
-    /// bridge reads the standing exception value, but the walker's guard
-    /// resume snapshot does not seed it (task #51c exc-routing), so the
-    /// bridge dereferences a NULL exception object (`GuardClass ldr [x0]`
-    /// with `x0 == 0`). The trait tracer resumes the handler correctly,
-    /// so the walker surfaces a typed abort and the driver maps it to
-    /// `TraceAction::Abort` → interpreter fallback. Calls NOT covered by
-    /// a handler (e.g. `math.sqrt` in nbody) never deopt into a handler
-    /// and are unaffected.
-    MayForceProtectedByExceptionHandlerUnsupported { pc: usize },
     /// The virtualizable escaped during a concrete-executed may-force
     /// residual call: `vinfo.tracing_after_residual_call(virtualizable)`
     /// found the token cleared by the callee's force path
@@ -4236,52 +4222,11 @@ fn walker_abort_if_mayforce_null_ref_arg(
     Ok(())
 }
 
-/// Abort the walk when a may-force residual CALL that can raise lives in
-/// a jitcode body that contains exception-handler structure (any
-/// `catch_exception/L`).  CPython 3.13 routes a call's exception through
-/// the per-frame exception table rather than an inline marker right
-/// after the call, so the handler is reachable from the call site even
-/// though it is not at `op.next_pc`.  The full-body walk cannot yet
-/// resume the `GUARD_NO_EXCEPTION` deopt into such a handler: the
-/// exception-path bridge reads the standing exception value, but the
-/// walker's guard resume snapshot never seeds it (task #51c exc-routing),
-/// so the bridge dereferences a NULL exception object (`GuardClass ldr
-/// [x0]` with `x0 == 0`).  Falling back to the trait tracer (which
-/// resumes the handler correctly) keeps the loop correct.  Bodies with
-/// no `catch_exception/L` (nbody / fannkuch / the loop benches) never
-/// deopt into a handler and compile under the walk.  See
-/// [`DispatchError::MayForceProtectedByExceptionHandlerUnsupported`].
-fn walker_abort_if_protected_may_force(
-    code: &[u8],
-    op: &DecodedOp,
-    can_raise: bool,
-) -> Result<(), DispatchError> {
-    if !can_raise {
-        return Ok(());
-    }
-    // Abort whenever the walked body contains any `catch_exception/L`.  A
-    // may-force call's `GUARD_NO_EXCEPTION` deopt can route into that handler,
-    // and the walk cannot yet seed the handler's standing exception value at
-    // resume — the exception-path bridge bakes a NULL exception object, so the
-    // compiled `GuardClass ldr [x0]` dereferences `x0 == 0` (the synth
-    // `exceptions` loop: `may_fail` raises, caught in `main`'s handler reading
-    // `e.args[0]`).  Falling back to the trait tracer keeps such loops correct.
-    // A per-call precise gate (abort only when THIS call's Python pc is covered
-    // by a handler range) would need the handler-resume seeding to be reliable
-    // first; until then the conservative whole-body scan is the correct gate.
-    // Bodies with no handler (the loop benches / nbody / fannkuch) never deopt
-    // into a handler and compile under the walk.
-    if jitcode_has_exception_handler(code) {
-        return Err(DispatchError::MayForceProtectedByExceptionHandlerUnsupported { pc: op.pc });
-    }
-    Ok(())
-}
-
 /// Returns `true` when the jitcode body contains any `catch_exception/L`
 /// op — i.e. the source function has a `try`/`except` handler.  Used by
-/// [`walker_abort_if_protected_may_force`] to keep the full-body walk
-/// off functions whose `GUARD_NO_EXCEPTION` deopt could route into an
-/// exception handler the walk cannot yet resume.
+/// the residual-call fast paths that conservatively decline a handler-
+/// bearing body to the generic walk (which resumes a `GUARD_NO_EXCEPTION`
+/// deopt into the handler correctly) rather than to their concrete fold.
 fn jitcode_has_exception_handler(code: &[u8]) -> bool {
     crate::jitcode_runtime::decoded_ops(code).any(|op| op.opname == "catch_exception")
 }
@@ -5064,17 +5009,36 @@ fn collect_outer_active_boxes(
         unsafe {
             let jc = &*sym.jitcode;
             let payload = &jc.payload;
-            let live_locals = if payload.code_ptr.is_null() {
-                Vec::new()
+            let (live_locals, stack_depth_at_pc) = if payload.code_ptr.is_null() {
+                (Vec::new(), 0usize)
             } else {
                 let live_vars = crate::liveness::liveness_for(payload.code_ptr);
-                (0..sym.nlocals)
+                let live_locals = (0..sym.nlocals)
                     .filter(|&idx| live_vars.is_local_live(entry_py_pc as usize, idx))
-                    .collect::<Vec<usize>>()
+                    .collect::<Vec<usize>>();
+                // Operand-stack depth AT the snapshot's `entry_py_pc`.  The
+                // liveness banks (`frame_liveness_reg_indices_by_bank_at`)
+                // are read at that py_pc, so the stack-slot classification
+                // window must be the depth at that py_pc too — NOT
+                // `sym.valuestackdepth` (the walker's *current* position).
+                // For the per-opcode entry caller the two coincide, but a
+                // guard resuming at a not-taken branch target with a kept
+                // operand-stack temp (conditional expr / short-circuit /
+                // chained compare, #124/#281) resumes at a py_pc whose
+                // depth `> 0` while the walker stands at depth 0 — using
+                // the current depth there truncates `stack_color_map` and
+                // drops the kept temp's semantic slot, corrupting the
+                // resumed frame.
+                let depth = live_vars
+                    .depth_at_py_pc()
+                    .get(entry_py_pc as usize)
+                    .copied()
+                    .unwrap_or(0) as usize;
+                (live_locals, depth)
             };
             (
                 sym.nlocals,
-                sym.valuestackdepth.saturating_sub(sym.nlocals),
+                stack_depth_at_pc,
                 sym.owns_virtualizable_shadow(),
                 payload.metadata.pyre_color_for_semantic_local.clone(),
                 payload.metadata.stack_slot_color_map.clone(),
@@ -5661,6 +5625,23 @@ fn fbw_terminate_with_finish(
     Ok(())
 }
 
+/// Void variant of [`fbw_terminate_with_finish`] for the top-level
+/// `void_return/` portal exit (`compile_done_with_this_frame`'s VOID
+/// branch, pyjitpl.py:3202-3205).  Records the vable store-back +
+/// `GUARD_NOT_FORCED_2`, then stashes a `Type::Void`-marked payload so
+/// [`crate::trace::full_body_walk_trace`] builds a `TraceAction::Finish`
+/// with no args (`done_with_this_frame_descr_from_types(&[])` resolves the
+/// void descr).  Like the value path it does NOT record the `FINISH` op —
+/// the compile consumer records it from the empty `finish_args`.
+fn fbw_terminate_void_with_finish(
+    ctx: &mut WalkContext<'_, '_>,
+    op_pc: usize,
+) -> Result<(), DispatchError> {
+    fbw_store_token_in_vable(ctx, op_pc)?;
+    FBW_FINISH_PAYLOAD.with(|c| c.set(Some((OpRef::NONE, Type::Void))));
+    Ok(())
+}
+
 /// Map a JitCode byte offset back to the Python PC of the opcode whose
 /// JitCode region contains it: the largest `py_pc` with
 /// `pc_map[py_pc] <= jit_pc` (ties → larger `py_pc`).  `pc_map[py_pc]` is
@@ -6080,6 +6061,47 @@ fn walker_capture_snapshot_for_last_guard_impl(
                     "last_instr",
                     last_instr_op,
                     Value::Int(last_instr_value),
+                );
+                // Publish `valuestackdepth` for THIS guard's resume
+                // coordinate the same way `last_instr` is published above.
+                // `sym.valuestackdepth` is NOT usable: the walker never
+                // crosses `set_orgpc`, so that scalar keeps the loop-entry
+                // inputarg the trace was seeded with (a loop-invariant the
+                // optimizer folds to a constant = the loop-header depth).  A
+                // guard that resumes at a different depth — the `while`
+                // condition branch, or a may-force call whose
+                // `semantic_fallthrough_pc` lands on an opcode that keeps an
+                // operand-stack temp (`#124`) — then carries the wrong depth
+                // into its snapshot.  The resume reader writes this scalar
+                // into `frame.valuestackdepth`; an under-count hides the kept
+                // operand (the interpreter resumes thinking the stack is
+                // shallower than it is), and `setup_bridge_sym` derives
+                // `stack_only = valuestackdepth - nlocals` from it
+                // (`state.rs` Part 1), so a wrong count desyncs the bridge's
+                // operand-stack slots.  Compute the depth at the resume py_pc
+                // the SAME way the encoder (`collect_outer_active_boxes`)
+                // derives `valid_stack_only` — `nlocals +
+                // depth_at_py_pc[py_pc]` — so the published scalar stays
+                // symmetric with the active-box layout.  Fall back to
+                // `sym.valuestackdepth` only when liveness is unavailable.
+                let vsd_value = unsafe {
+                    let jc = &*sym.jitcode;
+                    if jc.payload.code_ptr.is_null() {
+                        sym.valuestackdepth as i64
+                    } else {
+                        let lv = crate::liveness::liveness_for(jc.payload.code_ptr);
+                        match lv.depth_at_py_pc().get(py_pc as usize).copied() {
+                            Some(d) => (sym.nlocals + d as usize) as i64,
+                            None => sym.valuestackdepth as i64,
+                        }
+                    }
+                };
+                let vsd_op = ctx.trace_ctx.const_int(vsd_value);
+                crate::trace_opcode::mirror_vable_static_to_boxes(
+                    ctx.trace_ctx,
+                    "valuestackdepth",
+                    vsd_op,
+                    Value::Int(vsd_value),
                 );
             }
             let (vable_boxes, vref_boxes) = ctx.trace_ctx.build_snapshot_vable_vref_boxes();
@@ -6797,12 +6819,10 @@ fn try_walker_call_assembler_self_recursive(
         return Ok(None);
     }
     // A self-recursive CALL_ASSEMBLER raising inside a `try` body must
-    // route its GUARD_NO_EXCEPTION deopt into the handler, which the
-    // walker snapshot cannot encode yet — the same gap
-    // `walker_abort_if_protected_may_force` gates on the residual path,
-    // but that gate runs only after this fast path would already have
-    // emitted.  Decline, so the residual path's protected-body abort
-    // falls back to the trait tracer.
+    // route its GUARD_NO_EXCEPTION deopt into the handler.  The concrete
+    // CALL_ASSEMBLER fold here cannot encode that resume in its snapshot;
+    // decline so the body takes the generic residual path, which walks the
+    // handler-bearing body and resumes the deopt into the handler.
     if jitcode_has_exception_handler(code) {
         return Ok(None);
     }
@@ -7599,15 +7619,13 @@ fn dispatch_residual_call_iRd_kind(
     } else {
         let (call_opcode, can_raise, emit_guard_not_forced) =
             select_residual_call_opcode(ei, dst_bank, "dispatch_residual_call_iRd_kind");
+        // The abort gate is static (EI flags) and must run BEFORE the
+        // concrete executor below: `do_residual_call` (pyjitpl.py:2019)
+        // executes the helper only on a path that keeps recording — it has
+        // no execute-then-abandon shape.  Aborting after execution would
+        // leave the helper's heap/exception effects standing while the
+        // declined retrace re-runs the same bytecode, double-applying them.
         walker_abort_if_mayforce_null_ref_arg(call_opcode, &allboxes, call_descr, ctx, op.pc)?;
-        // Both abort gates are static (EI flags + a jitcode body scan) and
-        // must run BEFORE the concrete executor below: `do_residual_call`
-        // (pyjitpl.py:2019) executes the helper only on a path that keeps
-        // recording — it has no execute-then-abandon shape.  Aborting after
-        // execution would leave the helper's heap/exception effects standing
-        // while the declined retrace re-runs the same bytecode, double-
-        // applying them.
-        walker_abort_if_protected_may_force(code, op, can_raise)?;
 
         // pyjitpl.py:2017 `vable_and_vrefs_before_residual_call` — fires
         // unconditionally on the forces branch.  Records FORCE_TOKEN +
@@ -9248,11 +9266,11 @@ fn dispatch_residual_call_iIRd_kind(
     // concrete; only the cell-strategy module-dict fast path is foldable.
     //
     // Skip handler-bearing bodies: `load_global_fn` is `CallFlavor::Plain`
-    // (can raise), so the generic residual path normally trips
-    // `walker_abort_if_protected_may_force` and falls the whole loop back to
-    // the trait tracer when a `catch_exception/L` is present.  Folding here
-    // would suppress that abort and let the walk compile a try/except body it
-    // cannot yet resume.
+    // (can raise a NameError), so folding away its residual call would drop
+    // the `GUARD_NO_EXCEPTION` that a `catch_exception/L` in the same body
+    // may resume into.  Leave such bodies on the generic residual path
+    // (which keeps the guard and resumes the handler correctly); the fold is
+    // a perf shortcut for handler-free global-call loops.
     //
     // Default ON since the Phase 5 flip (`PYRE_FBW_LOADGLOBAL_FOLD=0` opts
     // out): the fold is correct (`try_walker_load_global_cell_fold`
@@ -9395,10 +9413,6 @@ fn dispatch_residual_call_iIRd_kind(
         let (call_opcode, can_raise, emit_guard_not_forced) =
             select_residual_call_opcode(ei, dst_bank, "dispatch_residual_call_iIRd_kind");
         walker_abort_if_mayforce_null_ref_arg(call_opcode, &allboxes, call_descr, ctx, op.pc)?;
-        // Static gate BEFORE the concrete executor — see
-        // `dispatch_residual_call_iRd_kind` for the execute-then-abandon
-        // rationale (do_residual_call, pyjitpl.py:2019).
-        walker_abort_if_protected_may_force(code, op, can_raise)?;
 
         // pyjitpl.py:2017 `vable_and_vrefs_before_residual_call` —
         // records FORCE_TOKEN + SETFIELD_GC IR; runtime heap mutations
@@ -9583,10 +9597,6 @@ fn dispatch_residual_call_iIRFd_kind(
         let (call_opcode, can_raise, emit_guard_not_forced) =
             select_residual_call_opcode(ei, dst_bank, "dispatch_residual_call_iIRFd_kind");
         walker_abort_if_mayforce_null_ref_arg(call_opcode, &allboxes, call_descr, ctx, op.pc)?;
-        // Static gate BEFORE the concrete executor — see
-        // `dispatch_residual_call_iRd_kind` for the execute-then-abandon
-        // rationale (do_residual_call, pyjitpl.py:2019).
-        walker_abort_if_protected_may_force(code, op, can_raise)?;
 
         // pyjitpl.py:2017 `vable_and_vrefs_before_residual_call` —
         // records FORCE_TOKEN + SETFIELD_GC IR; runtime heap mutations
@@ -10449,27 +10459,37 @@ fn handle(
                 switchcase,
                 op.pc
             );
-            let (opcode, promoted) = if switchcase != 0 {
-                (OpCode::GuardTrue, ctx.trace_ctx.const_int(1))
+            let opcode = if switchcase != 0 {
+                OpCode::GuardTrue
             } else {
-                (OpCode::GuardFalse, ctx.trace_ctx.const_int(0))
+                OpCode::GuardFalse
             };
             // `pyjitpl.py:511-526 opimpl_goto_if_not` calls
             // `generate_guard(opnum, box, resumepc=orgpc)`; the first
             // line of `generate_guard` (`pyjitpl.py:2583`) is
             // `if isinstance(box, Const): return` — Const boxes already
-            // pin the value and need no guard. Same gate then governs
-            // the `replace_box` / register-rewrite path
-            // (`pyjitpl.py:523-526`). Resume-data capture
-            // (`capture_resumedata(resumepc=orgpc)` at
-            // `pyjitpl.py:2603`) is omitted here: the walker's IR is
-            // rolled back via `cut_trace`, so the snapshot the trait
-            // leg builds in `trace_opcode.rs:3275 MIFrame::generate_guard`
-            // has no production effect on this leg. Once the walker
-            // becomes the production trace emitter it needs to thread
-            // `op.pc` here as resumepc and
-            // capture the active-box snapshot the same way `MIFrame`
-            // does.
+            // pin the value and need no guard.
+            //
+            // No `replace_box`/register-rewrite here: the condbox feeding
+            // GOTO_IF_NOT is always the result of an int_is_* family op
+            // (the `assert switchcase == 0 || 1` invariant above), which
+            // `opimpl_goto_if_not_int_is_true` / `_int_is_zero` / the
+            // `int_lt..float_ge` fusions all dispatch with
+            // `replace=False` (`pyjitpl.py:529-556`): "does not make sense
+            // to replace condbox, because it does not appear anywhere in
+            // any register, we either just made it or it's constant
+            // anyway".  Only the bare `opimpl_goto_if_not(replace=True)`
+            // promotes its operand, and pyre never routes a raw boolean
+            // local through this arm.  Promoting the condbox to a constant
+            // here would fold a loop-variant truth value (e.g. the kept
+            // `flag` of `x = flag and 7`, `flag = i & 1`) into a constant,
+            // making the optimizer hoist the producing op + its guard out
+            // of the steady-state loop and drop the induction variable —
+            // a non-terminating miscompile.
+            //
+            // Resume-data capture (`capture_resumedata(resumepc=orgpc)` at
+            // `pyjitpl.py:2603`) is threaded via
+            // `walker_capture_snapshot_for_last_guard(other_target)`.
             // Branch guards resume at the runtime jump destination — the
             // branch NOT taken in the trace — not the `goto_if_not` opcode
             // itself (`trace_opcode.rs:4456-4462`, `resume_pc =
@@ -10499,12 +10519,6 @@ fn handle(
                 }
                 ctx.trace_ctx.record_guard(opcode, &[valuebox], 0);
                 walker_capture_snapshot_for_last_guard(ctx, other_target)?;
-                ctx.trace_ctx.replace_box(valuebox, promoted);
-                for slot in ctx.registers_i.iter_mut() {
-                    if *slot == valuebox {
-                        *slot = promoted;
-                    }
-                }
             }
             let next_pc = if switchcase != 0 { op.next_pc } else { target };
             Ok((DispatchOutcome::Continue, next_pc))
@@ -11115,8 +11129,19 @@ fn handle(
             // marker for void calls).
             // No operand bytes (the `/` argcodes is empty).
             if ctx.is_top_level {
-                ctx.trace_ctx
-                    .finish(&[], ctx.done_with_this_frame_descr_void.clone());
+                if fbw_call_assembler_enabled() {
+                    // Slice b: route the void portal exit through
+                    // `TraceAction::Finish` (empty args) so the compile
+                    // pipeline records the FINISH(void) from `finish_args`,
+                    // mirroring the three value-returning arms.  Store the
+                    // assembler token in the vable + GUARD_NOT_FORCED_2 like
+                    // those arms, then stash a void-marked payload; do NOT
+                    // call `ctx.trace_ctx.finish()` here (would double-record).
+                    fbw_terminate_void_with_finish(ctx, op.pc)?;
+                } else {
+                    ctx.trace_ctx
+                        .finish(&[], ctx.done_with_this_frame_descr_void.clone());
+                }
                 Ok((DispatchOutcome::Terminate, op.next_pc))
             } else {
                 Ok((DispatchOutcome::SubReturn { result: None }, op.next_pc))
@@ -13511,20 +13536,21 @@ mod tests {
     }
 
     #[test]
-    fn step_through_void_return_records_empty_finish_with_void_descr() {
-        // top-level `void_return/` records `FINISH([])` with
-        // `done_with_this_frame_descr_void`. RPython
-        // `pyjitpl.py:3202-3205 compile_done_with_this_frame`:
-        //   if result_type == VOID:
-        //       assert exitbox is None
-        //       exits = []
-        //       token = sd.done_with_this_frame_descr_void
+    fn step_through_void_return_stashes_void_finish_payload() {
+        // Top-level `void_return/` is the VOID portal exit (RPython
+        // `pyjitpl.py:3202-3205 compile_done_with_this_frame`, the
+        // `result_type == VOID` branch — `exits = []`,
+        // `token = sd.done_with_this_frame_descr_void`).  Under the
+        // `PYRE_FBW_CALL_ASSEMBLER` gate (default on) it mirrors the three
+        // value-returning arms: it does NOT record the FINISH op itself
+        // (the compile consumer records `FINISH([])` from the empty
+        // finish_args) and stashes a `Type::Void`-marked payload so
+        // `full_body_walk_trace` builds `TraceAction::Finish` with no args.
         let ret_byte = *insns_opname_to_byte()
             .get("void_return/")
             .expect("`void_return/` must be in insns table");
         let code = [ret_byte];
         let mut tc = fresh_trace_ctx();
-        let descr_void = make_fail_descr(77);
         let mut wc = WalkContext {
             registers_r: &mut [],
             registers_i: &mut [],
@@ -13539,7 +13565,7 @@ mod tests {
             done_with_this_frame_descr_ref: make_fail_descr(1),
             done_with_this_frame_descr_int: make_fail_descr(101),
             done_with_this_frame_descr_float: make_fail_descr(102),
-            done_with_this_frame_descr_void: descr_void.clone(),
+            done_with_this_frame_descr_void: make_fail_descr(77),
             exit_frame_with_exception_descr_ref: make_fail_descr(2),
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
@@ -13552,23 +13578,21 @@ mod tests {
             pending_guard_snapshot_error: None,
         };
         let ops_before = wc.trace_ctx.num_ops();
+        fbw_finish_payload_reset();
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("void_return/ must dispatch");
         assert_eq!(outcome, DispatchOutcome::Terminate);
         assert_eq!(next_pc, 1, "void_return/ has zero operand bytes");
         drop(wc);
-        assert_eq!(tc.num_ops(), ops_before + 1);
-        let last = tc.ops().last().expect("recorded op must exist");
-        assert_eq!(last.opcode, majit_ir::OpCode::Finish);
-        assert!(
-            last.num_args() == 0,
-            "void_return/ FINISH must carry zero args (RPython exits = [])",
+        assert_eq!(
+            tc.num_ops(),
+            ops_before,
+            "void_return must NOT record the FINISH itself: the compile \
+             consumer records FINISH([]) from the empty finish_args",
         );
-        let recorded_descr = last
-            .getdescr()
-            .expect("Finish must carry done_with_this_frame_descr_void");
-        assert!(
-            std::sync::Arc::ptr_eq(&recorded_descr, &descr_void),
-            "void_return/ must use done_with_this_frame_descr_void, not _ref",
+        assert_eq!(
+            fbw_finish_payload_take(),
+            Some((OpRef::NONE, Type::Void)),
+            "void portal exit stashes a Type::Void-marked payload",
         );
     }
 

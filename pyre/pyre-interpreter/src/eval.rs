@@ -1265,7 +1265,7 @@ impl SharedOpcodeHandler for PyFrame {
     }
 
     fn build_map(&mut self, items: &[Self::Value]) -> Result<Self::Value, PyError> {
-        Ok(build_map_from_refs(items))
+        build_map_from_refs(items)
     }
 
     fn store_subscr(
@@ -2367,9 +2367,7 @@ impl OpcodeStepExecutor for PyFrame {
             slot
         };
         if value == PY_NULL {
-            return Err(PyError::type_error(
-                "free variable referenced before assignment",
-            ));
+            return Err(crate::pyframe::deref_unbound_error(self.code(), idx));
         }
         self.push(value);
         Ok(())
@@ -2616,8 +2614,8 @@ impl OpcodeStepExecutor for PyFrame {
         let val = self.pop();
         // `f'{x}'` → `PyObject_Format(x, NULL)`; a user `__format__` is
         // invoked with an empty spec, otherwise this is `str(value)`.
-        let s = crate::type_methods::format_value_dispatch(val, "")?;
-        self.push(pyre_object::w_str_from_wtf8(s));
+        let s = crate::runtime_ops::format_value(val, pyre_object::PY_NULL)?;
+        self.push(s);
         Ok(())
     }
 
@@ -2627,23 +2625,11 @@ impl OpcodeStepExecutor for PyFrame {
         let val = self.pop();
         // `PyObject_Format(value, spec)` — dispatch to a user-defined
         // `__format__` when present, else apply the shared spec parser
-        // (empty spec → `str(value)`).  `type_methods::format_value_dispatch`
-        // keeps f-string `{n:08.3f}` and `"{:08.3f}".format(n)` identical.
-        // A format spec is expected to be valid text (specs do not carry
-        // surrogates), so a non-UTF-8 spec reads as empty rather than
-        // panicking.
-        let spec_str = unsafe {
-            if pyre_object::is_str(spec) {
-                match pyre_object::w_str_get_wtf8(spec).as_str() {
-                    Ok(v) => v.to_string(),
-                    Err(_) => String::new(),
-                }
-            } else {
-                String::new()
-            }
-        };
-        let s = crate::type_methods::format_value_dispatch(val, &spec_str)?;
-        self.push(pyre_object::w_str_from_wtf8(s));
+        // (empty spec → `str(value)`).  `runtime_ops::format_value` keeps
+        // f-string `{n:08.3f}` and `"{:08.3f}".format(n)` identical, and
+        // reads a non-`str`/non-UTF-8 spec as empty rather than panicking.
+        let s = crate::runtime_ops::format_value(val, spec)?;
+        self.push(s);
         Ok(())
     }
 
@@ -2655,22 +2641,8 @@ impl OpcodeStepExecutor for PyFrame {
         // of being forced through a Rust `String` via `py_str`.  This is
         // the path the `'%s' % x` → CONVERT_VALUE/FORMAT_SIMPLE compile
         // rewrite takes.
-        let is_str_conv = matches!(
-            conv,
-            crate::bytecode::ConvertValueOparg::Str | crate::bytecode::ConvertValueOparg::None
-        );
-        if is_str_conv {
-            let w = unsafe { crate::py_str_wtf8(val)? };
-            self.push(pyre_object::w_str_from_wtf8(w));
-            return Ok(());
-        }
-        let s = match conv {
-            crate::bytecode::ConvertValueOparg::Str => unsafe { crate::py_str(val)? },
-            crate::bytecode::ConvertValueOparg::Repr => unsafe { crate::py_repr(val)? },
-            crate::bytecode::ConvertValueOparg::Ascii => crate::builtins::py_ascii(val)?,
-            crate::bytecode::ConvertValueOparg::None => unsafe { crate::py_str(val)? },
-        };
-        self.push(pyre_object::w_str_new(&s));
+        let code = crate::runtime_ops::convert_value_code(conv);
+        self.push(crate::runtime_ops::convert_value(val, code)?);
         Ok(())
     }
 
@@ -3666,86 +3638,9 @@ impl OpcodeStepExecutor for PyFrame {
         let stop = self.pop();
         let start = self.pop();
         let obj = self.pop();
-        unsafe {
-            if pyre_object::is_list(obj) {
-                let len = pyre_object::w_list_len(obj) as i64;
-                let s = if pyre_object::is_none(start) {
-                    0
-                } else {
-                    pyre_object::w_int_get_value(start)
-                };
-                let e = if pyre_object::is_none(stop) {
-                    len
-                } else {
-                    pyre_object::w_int_get_value(stop)
-                };
-                let s = if s < 0 { (len + s).max(0) } else { s.min(len) } as usize;
-                let e = if e < 0 { (len + e).max(0) } else { e.min(len) } as usize;
-                let mut items = Vec::new();
-                for i in s..e {
-                    if let Some(v) = pyre_object::w_list_getitem(obj, i as i64) {
-                        items.push(v);
-                    }
-                }
-                self.push(pyre_object::w_list_new(items));
-                return Ok(());
-            }
-            if pyre_object::is_str(obj) {
-                // Slice on code-point boundaries over the WTF-8 view, so a
-                // surrogate-bearing or multi-byte string slices correctly.
-                let full = pyre_object::w_str_get_wtf8(obj);
-                let mut offsets: Vec<usize> = full.code_point_indices().map(|(i, _)| i).collect();
-                offsets.push(full.as_bytes().len());
-                let len = (offsets.len() - 1) as i64;
-                let s = if pyre_object::is_none(start) {
-                    0
-                } else {
-                    pyre_object::w_int_get_value(start)
-                };
-                let e = if pyre_object::is_none(stop) {
-                    len
-                } else {
-                    pyre_object::w_int_get_value(stop)
-                };
-                let s = if s < 0 { (len + s).max(0) } else { s.min(len) } as usize;
-                let e = (if e < 0 { (len + e).max(0) } else { e.min(len) } as usize).max(s);
-                let part =
-                    rustpython_wtf8::Wtf8::from_bytes(&full.as_bytes()[offsets[s]..offsets[e]])
-                        .expect("code-point-aligned slice is WTF-8");
-                self.push(pyre_object::w_str_from_wtf8(part.to_wtf8_buf()));
-                return Ok(());
-            }
-            if pyre_object::is_tuple(obj) {
-                let len = pyre_object::w_tuple_len(obj) as i64;
-                let s = if pyre_object::is_none(start) {
-                    0
-                } else {
-                    pyre_object::w_int_get_value(start)
-                };
-                let e = if pyre_object::is_none(stop) {
-                    len
-                } else {
-                    pyre_object::w_int_get_value(stop)
-                };
-                let s = if s < 0 { (len + s).max(0) } else { s.min(len) } as usize;
-                let e = if e < 0 { (len + e).max(0) } else { e.min(len) } as usize;
-                let mut items = Vec::new();
-                for i in s..e {
-                    if let Some(v) = pyre_object::w_tuple_getitem(obj, i as i64) {
-                        items.push(v);
-                    }
-                }
-                self.push(pyre_object::w_tuple_new(items));
-                return Ok(());
-            }
-            // Fall back to slice(start, stop) → getitem dispatch.
-            // Handles bytearray, instances with __getitem__, etc.
-            let slice_obj =
-                pyre_object::sliceobject::w_slice_new(start, stop, pyre_object::w_none());
-            let result = crate::baseobjspace::getitem(obj, slice_obj)?;
-            self.push(result);
-            Ok(())
-        }
+        let result = crate::runtime_ops::binary_slice_values(obj, start, stop)?;
+        self.push(result);
+        Ok(())
     }
 
     // ── StoreSlice (a[b:c] = d) ──
@@ -3762,29 +3657,7 @@ impl OpcodeStepExecutor for PyFrame {
             parts.push(self.pop());
         }
         parts.reverse();
-        let mut result = rustpython_wtf8::Wtf8Buf::new();
-        for part in &parts {
-            unsafe {
-                if pyre_object::is_str(*part) {
-                    result.push_wtf8(pyre_object::w_str_get_wtf8(*part));
-                } else if pyre_object::is_bool(*part) {
-                    // `is_int` is true for a bool, so test `is_bool` first; a
-                    // bool renders "True"/"False", not its int value.
-                    result.push_str(if pyre_object::w_bool_get_value(*part) {
-                        "True"
-                    } else {
-                        "False"
-                    });
-                } else if pyre_object::is_int(*part) {
-                    result.push_str(&pyre_object::w_int_get_value(*part).to_string());
-                } else if pyre_object::is_none(*part) {
-                    result.push_str("None");
-                } else {
-                    result.push_str("<object>");
-                }
-            }
-        }
-        self.push(pyre_object::w_str_from_wtf8(result));
+        self.push(crate::runtime_ops::build_string_from_refs(&parts));
         Ok(())
     }
 
