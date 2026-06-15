@@ -2790,8 +2790,15 @@ impl GcRewriter for GcRewriterImpl {
         // a no-op (common in bridges).
         let ops = Self::remove_bridge_exception(ops);
 
+        // Result positions are consumed only by result-producing ops; a
+        // Void-result op never occupies a position slot. Skip Void ops here
+        // for the same reason the `result_types` build loop below guards on
+        // `rt != Type::Void` — otherwise a Void op carrying the `VoidOp(
+        // u32::MAX)` sentinel (op_typed(NONE.raw(), Void)) would saturate
+        // the max and overflow the first `next_pos += 1` in `emit`.
         let next_pos = ops
             .iter()
+            .filter(|op| op.result_type() != Type::Void)
             .filter_map(|op| (!op.pos.get().is_none()).then_some(op.pos.get().raw()))
             .max()
             .map_or(0, |max_pos| max_pos.saturating_add(1));

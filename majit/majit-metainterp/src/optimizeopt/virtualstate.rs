@@ -1350,23 +1350,46 @@ impl VirtualState {
         }
         let expected_info = &expected.info;
         let incoming_info = &incoming.info;
-        // virtualstate.py:523-524: force_boxes + Virtual incoming
-        // → _generate_virtual_guards (check class compatibility only).
-        // virtualstate.py:523-524: force_boxes + incoming virtual, expected non-virtual
-        if state.force_boxes && incoming_info.is_virtual() && !expected_info.is_virtual() {
+        // virtualstate.py:523-524 NotVirtualStateInfoPtr._generate_guards:
+        //
+        //     if state.force_boxes and isinstance(other, VirtualStateInfo):
+        //         return self._generate_virtual_guards(other, box, runtime_box, state)
+        //
+        // The force-to-virtual path is defined ONLY on NotVirtualStateInfoPtr
+        // — a non-virtual *Ref* leaf. NotVirtualStateInfoInt/Float use the
+        // base NotVirtualStateInfo._generate_guards, which has no force
+        // branch. And `other` must be the virtual-instance class
+        // VirtualStateInfo (`Virtual`), never VArrayStateInfo /
+        // VStructStateInfo / VArrayStructStateInfo. There is no reverse
+        // force: a virtual `self` against a non-virtual `other` falls through
+        // to the main match and raises VirtualStatesCantMatch
+        // (AbstractVirtualStructStateInfo._generate_guards via
+        // _generalization_of_structpart, virtualstate.py:144-145).
+        if state.force_boxes
+            && matches!(incoming_info, VirtualStateInfo::Virtual { .. })
+            && matches!(
+                expected_info,
+                VirtualStateInfo::NonNull
+                    | VirtualStateInfo::KnownClass { .. }
+                    | VirtualStateInfo::Unknown(Type::Ref)
+                    | VirtualStateInfo::Constant(Value::Ref(_))
+            )
+        {
+            // virtualstate.py:557-571 _generate_virtual_guards: a virtual is
+            // never null, so only the type need be checked.
             return match expected_info {
+                // :566-568 LEVEL_CONSTANT → cannot unify a constant with a virtual.
                 VirtualStateInfo::Constant(_) => Err(()),
-                VirtualStateInfo::KnownClass { class_ptr } => {
-                    if let VirtualStateInfo::Virtual { known_class, .. } = incoming_info {
-                        if known_class.as_ref() == Some(class_ptr) {
-                            Ok(())
-                        } else {
-                            Err(())
-                        }
-                    } else {
+                // :570-571 LEVEL_KNOWNCLASS → known_class.same_constant(other.known_class).
+                VirtualStateInfo::KnownClass { class_ptr } => match incoming_info {
+                    VirtualStateInfo::Virtual { known_class, .. }
+                        if known_class.as_ref() == Some(class_ptr) =>
+                    {
                         Ok(())
                     }
-                }
+                    _ => Err(()),
+                },
+                // LEVEL_NONNULL / LEVEL_UNKNOWN(Ref) → pass, no guard.
                 _ => Ok(()),
             };
         }

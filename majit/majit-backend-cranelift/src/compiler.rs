@@ -2116,7 +2116,6 @@ const CALL_ASSEMBLER_RESULT_VOID: u64 = 0;
 const CALL_ASSEMBLER_RESULT_INT: u64 = 1;
 const CALL_ASSEMBLER_RESULT_FLOAT: u64 = 2;
 const CALL_ASSEMBLER_RESULT_REF: u64 = 3;
-const CALL_ASSEMBLER_RESULT_FORCE_TOKEN_REF: u64 = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum CallAssemblerCallerId {
@@ -2164,7 +2163,6 @@ fn call_assembler_result_kind_name(kind: u64) -> &'static str {
         CALL_ASSEMBLER_RESULT_INT => "int",
         CALL_ASSEMBLER_RESULT_FLOAT => "float",
         CALL_ASSEMBLER_RESULT_REF => "ref",
-        CALL_ASSEMBLER_RESULT_FORCE_TOKEN_REF => "force-token-ref",
         _ => "unknown",
     }
 }
@@ -2289,9 +2287,7 @@ fn collect_call_assembler_expectations(ops: &[Op]) -> Result<VecAssoc<u64, u64>,
                 "call-assembler descriptor must provide a compiled target token",
             )
         })?;
-        let resolved_target = resolve_call_assembler_target(opcode, call_descr)?;
-        let expected_result_kind =
-            expected_call_assembler_result_kind(call_descr, resolved_target.as_ref())?;
+        let expected_result_kind = expected_call_assembler_result_kind(call_descr)?;
         if let Some(&previous) = expectations.get(&target_token) {
             validate_call_assembler_target_result_kind(
                 target_token,
@@ -2313,6 +2309,16 @@ fn install_call_assembler_expectations(
 
     for (&target_token, &expected_result_kind) in &expectations {
         if let Some(target) = lookup_call_assembler_target(target_token) {
+            // Pending placeholders (null code_ptr) have not compiled their
+            // finish exits yet, so `fail_descrs` is empty. Defer the
+            // actual-result-kind check to the callee's own compile, where
+            // `register_call_assembler_target` runs
+            // `validate_registered_target_against_call_assembler_expectations`
+            // against the real finish descrs. Mirrors the pending guard in
+            // `resolve_call_assembler_target` (code_ptr.is_null()).
+            if target.code_ptr.is_null() {
+                continue;
+            }
             if let Some(actual_result_kind) =
                 actual_call_assembler_target_result_kind(&target.fail_descrs)?
             {
@@ -2689,9 +2695,6 @@ fn actual_call_assembler_result_kind(descr: &dyn FailDescr) -> Result<u64, Backe
         [] | [Type::Void] => Ok(CALL_ASSEMBLER_RESULT_VOID),
         [Type::Int] => Ok(CALL_ASSEMBLER_RESULT_INT),
         [Type::Float] => Ok(CALL_ASSEMBLER_RESULT_FLOAT),
-        [Type::Ref] if descr.force_token_slots() == [0] => {
-            Ok(CALL_ASSEMBLER_RESULT_FORCE_TOKEN_REF)
-        }
         [Type::Ref] => Ok(CALL_ASSEMBLER_RESULT_REF),
         other => Err(BackendError::Unsupported(format!(
             "call-assembler target exposes unsupported finish result layout: {other:?}"
@@ -2836,6 +2839,9 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
     let mut cur_num_ref_roots = target.num_ref_roots;
     let mut cur_max_output_slots = target.max_output_slots;
     let mut current_inputs = inputs.to_vec();
+    // External-JUMP re-entry LABEL selector (host_reentry_dispatch_key); 0
+    // for the initial entry and first-LABEL re-entries.
+    let mut cur_dispatch_key: u32 = 0;
     // `compile.py:665 setattr(cpu, name, descr)` — borrow the owning
     // cpu's descr set for the whole dispatch loop.  External-JUMP
     // bridge dispatch swaps the code entry but stays within the same
@@ -2853,6 +2859,7 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
             cur_max_output_slots,
             &current_inputs,
             &attachments,
+            cur_dispatch_key,
         );
         let fail_index = exec.fail_index;
         let direct_descr = exec.direct_descr.clone();
@@ -2892,8 +2899,8 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
                 // switch to the target loop identified by its TargetToken.
                 // assembler.py:2456-2462 closing_jump parity.
                 if bridge_descr.is_external_jump() {
-                    let target_entry = bridge_descr
-                        .target_descr()
+                    let target_descr = bridge_descr.target_descr();
+                    let target_entry = target_descr
                         .as_ref()
                         .and_then(lookup_loop_target)
                         .expect("external JUMP target must be a registered LoopTargetDescr");
@@ -2904,6 +2911,10 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
                     .unwrap_or_else(|err| {
                         panic!("bridge loop-reentry deadframe decode failed: {err}")
                     });
+                    cur_dispatch_key = target_descr
+                        .as_ref()
+                        .map(host_reentry_dispatch_key)
+                        .unwrap_or(0);
                     cur_code_ptr = target_entry.code_ptr;
                     cur_fail_descrs = target_entry.fail_descrs;
                     cur_num_ref_roots = target_entry.num_ref_roots;
@@ -3264,6 +3275,7 @@ fn call_assembler_fast_path_heap(
         target.max_output_slots,
         inputs,
         attachments,
+        0, // preamble entry
     );
     let fail_index = exec.fail_index;
     let direct_descr = exec.direct_descr.clone();
@@ -4448,9 +4460,6 @@ fn resolve_call_assembler_target(
         let finish_types = as_fd(finish_descr).fail_arg_types();
 
         // Validate that the finish result type matches the call descriptor.
-        // When force_token_slots are present the finish output type is Ref
-        // (the raw force-token handle), so accept that as matching a Ref
-        // result descriptor even though the value isn't a real GC ref.
         match call_descr.result_type() {
             Type::Void => {
                 if !finish_types.is_empty() {
@@ -4474,36 +4483,15 @@ fn resolve_call_assembler_target(
     Ok(Some(target))
 }
 
-fn expected_call_assembler_result_kind(
-    call_descr: &dyn CallDescr,
-    target: Option<&RegisteredLoopTarget>,
-) -> Result<u64, BackendError> {
+fn expected_call_assembler_result_kind(call_descr: &dyn CallDescr) -> Result<u64, BackendError> {
+    // Result kind comes purely from the call-assembler op's own result type,
+    // matching `_call_assembler_load_result` (x86/assembler.py:2291) which
+    // reads the dead frame's value index 0 with `kind = op.type`.
     match call_descr.result_type() {
         Type::Void => Ok(CALL_ASSEMBLER_RESULT_VOID),
         Type::Int => Ok(CALL_ASSEMBLER_RESULT_INT),
         Type::Float => Ok(CALL_ASSEMBLER_RESULT_FLOAT),
-        Type::Ref => {
-            let Some(target) = target else {
-                return Ok(CALL_ASSEMBLER_RESULT_REF);
-            };
-            // Loop-token targets expose no FINISH descr (see
-            // resolve_call_assembler_target): default to a plain Ref result.
-            // The FORCE_TOKEN_REF refinement only applies to function-entry
-            // traces whose finish carries a force-token slot.
-            let Some(finish_descr) = target.fail_descrs.iter().find(|d| as_fd(d).is_finish())
-            else {
-                return Ok(CALL_ASSEMBLER_RESULT_REF);
-            };
-            let finish_fd = as_fd(finish_descr);
-            Ok(
-                if finish_fd.fail_arg_types() == [Type::Ref] && finish_fd.force_token_slots() == [0]
-                {
-                    CALL_ASSEMBLER_RESULT_FORCE_TOKEN_REF
-                } else {
-                    CALL_ASSEMBLER_RESULT_REF
-                },
-            )
-        }
+        Type::Ref => Ok(CALL_ASSEMBLER_RESULT_REF),
     }
 }
 
@@ -4520,41 +4508,21 @@ fn build_known_values_set(inputargs: &[InputArg], ops: &[Op]) -> VecSet<u32> {
     known
 }
 
-fn build_force_token_set(inputargs: &[InputArg], ops: &[Op]) -> Result<VecSet<u32>, BackendError> {
+fn build_force_token_set(inputargs: &[InputArg], ops: &[Op]) -> VecSet<u32> {
+    // FORCE_TOKEN (resoperation.py:1090 'FORCE_TOKEN/0/r') yields the raw
+    // jitframe handle. Its Ref result is the frame pointer, not a heap GCREF,
+    // so it is excluded from the ref-root slots the GC traces and relocates.
     let mut force_tokens = VecSet::new();
     for (op_idx, op) in ops.iter().enumerate() {
         if op.pos.get().is_none() {
             continue;
         }
-        let result_var = op_var_index(op, op_idx, inputargs.len()) as u32;
         if op.opcode == OpCode::ForceToken {
+            let result_var = op_var_index(op, op_idx, inputargs.len()) as u32;
             force_tokens.insert(result_var);
-            continue;
-        }
-        if op.opcode == OpCode::CallAssemblerR {
-            let descr = op.getdescr().ok_or_else(|| {
-                unsupported_semantics(op.opcode, "call-assembler op must have a descriptor")
-            })?;
-            let call_descr = descr.as_call_descr().ok_or_else(|| {
-                unsupported_semantics(op.opcode, "call-assembler descriptor must be a CallDescr")
-            })?;
-            if let Some(target) = resolve_call_assembler_target(op.opcode, call_descr)? {
-                if let Some(finish_descr) = target
-                    .fail_descrs
-                    .iter()
-                    .find(|descr| as_fd(descr).is_finish())
-                {
-                    let finish_fd = as_fd(finish_descr);
-                    if finish_fd.fail_arg_types() == [Type::Ref]
-                        && finish_fd.force_token_slots() == [0]
-                    {
-                        force_tokens.insert(result_var);
-                    }
-                }
-            }
         }
     }
-    Ok(force_tokens)
+    force_tokens
 }
 
 /// Auxiliary LABEL type overrides on top of `OpTypeIndex`.
@@ -5906,7 +5874,7 @@ fn emit_attached_bridge_dispatch(
     emit_call_footer_shadowstack(builder, ptr_type);
     let mut bridge_sig = Signature::new(cranelift_codegen::isa::CallConv::Tail);
     bridge_sig.params.push(AbiParam::new(ptr_type));
-    bridge_sig.params.push(AbiParam::new(cl_types::I32)); // dispatch_key (LABEL id)
+    bridge_sig.params.push(AbiParam::new(cl_types::I32)); // dispatch_key selector
     bridge_sig.returns.push(AbiParam::new(ptr_type));
     let bridge_sig_ref = builder.import_signature(bridge_sig);
     // A bridge is linear (no LABELs): it always enters at its start, so the
@@ -5980,11 +5948,12 @@ fn emit_attached_loop_dispatch(
     // one code address per LABEL and a JUMP branches straight to the target
     // LABEL's address.  Cranelift exposes a single function entry, so the
     // target LABEL is selected by the `dispatch_key` argument the body's
-    // entry `br_table`s on.  Load the target descr's `label_block_id` and
-    // pass it as `dispatch_key` (return_call below); the target re-enters at
-    // exactly that LABEL with its carried values read from the jitframe slots
-    // this JUMP's `emit_guard_exit` populated, instead of always re-running
-    // the first LABEL's preamble.
+    // entry `br_table`s on.  Load the target descr's `label_block_id`; after
+    // the depth check, pass `label_block_id + 1` as `dispatch_key` (return_call
+    // below) because key 0 is reserved for the preamble.  The target re-enters
+    // at exactly that LABEL with its carried values read from the jitframe
+    // slots this JUMP's `emit_guard_exit` populated, instead of always
+    // re-running the first LABEL's preamble.
     let lbid_ptr = builder.ins().iconst(ptr_type, label_block_id_addr as i64);
     let lbid = builder
         .ins()
@@ -6100,7 +6069,7 @@ fn emit_attached_loop_dispatch(
     // received for its non-tail helper calls.
     let mut target_sig = Signature::new(cranelift_codegen::isa::CallConv::Tail);
     target_sig.params.push(AbiParam::new(ptr_type));
-    target_sig.params.push(AbiParam::new(cl_types::I32)); // dispatch_key (LABEL id)
+    target_sig.params.push(AbiParam::new(cl_types::I32)); // dispatch_key selector
     target_sig.returns.push(AbiParam::new(ptr_type));
     let target_sig_ref = builder.import_signature(target_sig);
     // x86/regalloc.py:1397 per-TargetToken `_ll_loop_code` parity: re-enter the
@@ -6786,6 +6755,24 @@ impl JitExecResult {
     }
 }
 
+/// Host-loop external-JUMP re-entry dispatch key.  RPython's JUMP branches
+/// straight to `target_token._ll_loop_code` for the named LABEL
+/// (assembler.py:990-993); the cranelift body selects the LABEL through its
+/// entry `br_table` on `dispatch_key`.  The first LABEL (`label_block_id` 0)
+/// re-enters via the preamble (key 0), which decodes the inputarg layout
+/// from the freshly populated frame slots; a non-first LABEL re-enters
+/// directly at its loader (key `label_block_id + 1`), reading carried values
+/// from the same slots `run_compiled_code` populated (slot i ← inputs[i]).
+fn host_reentry_dispatch_key(target_descr: &majit_ir::DescrRef) -> u32 {
+    match target_descr.as_loop_target_descr() {
+        Some(ltd) => match ltd.label_block_id() {
+            0 => 0,
+            lbid => lbid + 1,
+        },
+        None => 0,
+    }
+}
+
 fn run_compiled_code(
     code_ptr: *const u8,
     fail_descrs: &[DescrRef],
@@ -6793,6 +6780,7 @@ fn run_compiled_code(
     max_output_slots: usize,
     inputs: &[i64],
     attachments: &CpuDescrAttachments,
+    dispatch_key: u32,
 ) -> JitExecResult {
     // No alternate-stack switch here. The compiled prologue's inline
     // SP probe (`_call_header_with_stack_check`,
@@ -6807,6 +6795,7 @@ fn run_compiled_code(
         max_output_slots,
         inputs,
         attachments,
+        dispatch_key,
     )
 }
 
@@ -6817,6 +6806,7 @@ fn run_compiled_code_inner(
     max_output_slots: usize,
     inputs: &[i64],
     attachments: &CpuDescrAttachments,
+    dispatch_key: u32,
 ) -> JitExecResult {
     // RPython llmodel.py:298: frame = gc_ll_descr.malloc_jitframe(frame_info)
     // jitframe.py:48-52: jitframe_allocate(frame_info)
@@ -6918,7 +6908,10 @@ fn run_compiled_code_inner(
     }
 
     // llmodel.py:323 parity: ll_frame = func(ll_frame)
-    let func: unsafe extern "C" fn(*mut i64) -> *mut i64 = unsafe { std::mem::transmute(code_ptr) };
+    // The `trace_N_entry` wrapper takes a second `dispatch_key` argument
+    // (the entry `br_table` LABEL selector); 0 enters the preamble.
+    let func: unsafe extern "C" fn(*mut i64, i32) -> *mut i64 =
+        unsafe { std::mem::transmute(code_ptr) };
 
     let _jitted_guard = majit_backend::JittedGuard::enter();
 
@@ -6935,7 +6928,7 @@ fn run_compiled_code_inner(
             ),
         );
     }
-    let result_jf = unsafe { func(jf_ptr) };
+    let result_jf = unsafe { func(jf_ptr, dispatch_key as i32) };
     if majit_ir::debug::have_debug_prints() {
         majit_ir::debug::log_one("jit-running", &format!("post-call result_jf={result_jf:p}"));
     }
@@ -7850,6 +7843,9 @@ impl CraneliftBackend {
         let mut cur_num_ref_roots = compiled.num_ref_roots;
         let mut cur_max_output_slots = compiled.max_output_slots;
         let mut cur_inputs = inputs.to_vec();
+        // External-JUMP re-entry LABEL selector (host_reentry_dispatch_key); 0
+        // for the initial entry and first-LABEL re-entries.
+        let mut cur_dispatch_key: u32 = 0;
         // `compile.py:665 setattr(cpu, name, descr)` — borrow the owning
         // cpu's descr set for the whole dispatch loop.  Holding the read
         // lock is safe: `Backend::set_done_with_this_frame_descr_*` only
@@ -7866,6 +7862,7 @@ impl CraneliftBackend {
                 cur_max_output_slots,
                 &cur_inputs,
                 attachments,
+                cur_dispatch_key,
             );
             let fail_index = exec.fail_index;
             let direct_descr = exec.direct_descr.clone();
@@ -7911,11 +7908,15 @@ impl CraneliftBackend {
             // function JMPs, so we return and re-enter the target loop here.
             if fail_descr_fd.is_external_jump() {
                 slice_x2_probe::record_execute_with_inputs_hit();
-                let target_entry = fail_descr_fd
-                    .target_descr()
+                let target_descr = fail_descr_fd.target_descr();
+                let target_entry = target_descr
                     .as_ref()
                     .and_then(lookup_loop_target)
                     .expect("external JUMP target must be a registered LoopTargetDescr");
+                cur_dispatch_key = target_descr
+                    .as_ref()
+                    .map(host_reentry_dispatch_key)
+                    .unwrap_or(0);
                 cur_code_ptr = target_entry.code_ptr;
                 cur_fail_descrs = target_entry.fail_descrs;
                 cur_num_ref_roots = target_entry.num_ref_roots;
@@ -7973,6 +7974,7 @@ impl CraneliftBackend {
             bridge.max_output_slots,
             bridge_inputs,
             attachments,
+            0, // bridge entry (br_table preamble slot)
         );
         let fail_index = exec.fail_index;
         let direct_descr = exec.direct_descr.clone();
@@ -8063,10 +8065,10 @@ impl CraneliftBackend {
         // re-enters the target at a SPECIFIC LABEL, not always the first.
         // PyPy exposes one code address per LABEL; cranelift has a single
         // function entry, so the target LABEL is selected by a `dispatch_key`
-        // argument (the LABEL's `label_block_id`) that the entry block
-        // `br_table`s on.  The host wrapper passes 0 (first LABEL); an
-        // in-code closing-jump passes the target descr's `label_block_id`.
-        sig.params.push(AbiParam::new(cl_types::I32)); // dispatch_key (LABEL id)
+        // argument that the entry block `br_table`s on.  The host wrapper
+        // passes 0 for the preamble; an in-code closing-jump passes the target
+        // descr's `label_block_id + 1`.
+        sig.params.push(AbiParam::new(cl_types::I32)); // dispatch_key selector
         // RPython _call_footer (assembler.py:1097): mov eax, ebp; ret
         sig.returns.push(AbiParam::new(ptr_type)); // returned jf_ptr
 
@@ -8081,7 +8083,8 @@ impl CraneliftBackend {
 
         // Wrapper sig: same I/O shape, host call conv.
         let mut wrapper_sig = Signature::new(call_conv);
-        wrapper_sig.params.push(AbiParam::new(ptr_type));
+        wrapper_sig.params.push(AbiParam::new(ptr_type)); // jf_ptr
+        wrapper_sig.params.push(AbiParam::new(cl_types::I32)); // dispatch_key selector
         wrapper_sig.returns.push(AbiParam::new(ptr_type));
         let entry_id = self
             .module
@@ -8094,7 +8097,7 @@ impl CraneliftBackend {
         );
 
         // Pre-scan
-        let force_tokens = build_force_token_set(inputargs, ops)?;
+        let force_tokens = build_force_token_set(inputargs, ops);
         let mut fail_descrs: Vec<DescrRef> = Vec::new();
         let mut fail_descr_cells: Vec<Arc<majit_ir::FailDescrCell>> = Vec::new();
         let mut guard_infos: Vec<GuardInfo> = Vec::new();
@@ -10400,8 +10403,7 @@ impl CraneliftBackend {
                     let outcome_ptr_i64 = ptr_arg_as_i64(&mut builder, outcome_ptr, ptr_type);
                     let expected_result_kind = builder.ins().iconst(
                         cl_types::I64,
-                        expected_call_assembler_result_kind(call_descr, resolved_target.as_ref())?
-                            as i64,
+                        expected_call_assembler_result_kind(call_descr)? as i64,
                     );
 
                     let ca_merge_block = builder.create_block();
@@ -10492,13 +10494,21 @@ impl CraneliftBackend {
                         );
                         emit_push_gcmap(&mut builder, jf_ptr, per_call_gcmap);
 
-                        // fn(jf_ptr) → jf_ptr  (simple_call parity)
+                        // fn(jf_ptr, dispatch_key) → jf_ptr  (simple_call parity).
+                        // CALL_ASSEMBLER enters the callee at its preamble
+                        // (dispatch_key 0); the callee is a freshly entered
+                        // function, not an external-JUMP LABEL re-entry.
                         let mut sig = Signature::new(call_conv);
                         sig.params.push(AbiParam::new(ptr_type)); // jf_ptr
+                        sig.params.push(AbiParam::new(cl_types::I32)); // dispatch_key selector
                         sig.returns.push(AbiParam::new(ptr_type)); // returned jf_ptr
                         let sig_ref = builder.import_signature(sig);
-                        let call_inst =
-                            builder.ins().call_indirect(sig_ref, code_addr, &[args_ptr]);
+                        let ca_dispatch_key = builder.ins().iconst(cl_types::I32, 0);
+                        let call_inst = builder.ins().call_indirect(
+                            sig_ref,
+                            code_addr,
+                            &[args_ptr, ca_dispatch_key],
+                        );
                         let result_jf = builder.inst_results(call_inst)[0];
 
                         // _reload_frame_if_necessary: GC may have moved
@@ -13461,11 +13471,15 @@ impl CraneliftBackend {
             wb.switch_to_block(eb);
             wb.seal_block(eb);
             let jf_ptr_in = wb.block_params(eb)[0];
+            let dispatch_key_in = wb.block_params(eb)[1];
             let body_ref = self.module.declare_func_in_func(func_id, wb.func);
-            // Host entry always enters at the FIRST LABEL (dispatch_key 0):
-            // run_compiled_code loaded the inputs into the first LABEL's slots.
-            let entry_dispatch_key = wb.ins().iconst(cl_types::I32, 0);
-            let call_inst = wb.ins().call(body_ref, &[jf_ptr_in, entry_dispatch_key]);
+            // Forward the host-supplied dispatch_key to the body's entry
+            // `br_table`.  `run_compiled_code` passes 0 for the preamble
+            // (initial entry / first-LABEL re-entry) or `label_block_id + 1`
+            // to re-enter directly at a non-first LABEL on an external-JUMP
+            // host re-entry (assembler.py:990-993 per-LABEL `_ll_loop_code`:
+            // a JUMP branches straight to the target LABEL).
+            let call_inst = wb.ins().call(body_ref, &[jf_ptr_in, dispatch_key_in]);
             let ret = wb.inst_results(call_inst)[0];
             wb.ins().return_(&[ret]);
             wb.finalize();
@@ -13549,17 +13563,19 @@ impl CraneliftBackend {
         // `ll_loop_code` and a per-position `label_block_id`
         // (0, 1, 2, ...).  `assembler.py:990-993`'s per-LABEL
         // _ll_loop_code semantics are reconstructed at dispatch time:
-        // `emit_attached_loop_dispatch` checks the target's
-        // `label_block_id` cell at runtime and only takes the in-code
-        // tail-call when it's 0 (i.e. the target IS the first LABEL of
-        // its compiled body, so re-entering at the function entry runs
-        // the right preamble for the target's inputargs).  Non-zero
-        // means the JUMP targets a non-first LABEL whose inputarg
-        // count / layout differs from the function entry's preamble
-        // (verified for nbody: trace_id=1 has labels with 24-input
-        // preamble and 15-input body); for those, the dispatch falls
-        // through to the deadframe exit and the host loop re-enters
-        // the right wrapper via `execute_token`.
+        // `emit_attached_loop_dispatch` loads the target's
+        // `label_block_id` and passes `label_block_id + 1` as the
+        // `dispatch_key` of the in-code `return_call_indirect` (key 0 is the
+        // preamble); the body's entry `br_table` routes that key to the
+        // matching loader, which reads the
+        // target LABEL's carried values from the jitframe slots the
+        // JUMP populated and re-enters at exactly that LABEL, skipping
+        // the preamble.  Every LABEL — first or not — is reachable
+        // in-code this way.  The in-code tail-call falls through to the
+        // deadframe exit (host loop re-enters the wrapper via
+        // `execute_token`) only when the source frame is too small for
+        // the target's `target_frame_depth`, never because of the
+        // `label_block_id`.
         //
         // ll_loop_code targets the body (Tail conv) directly so in-code
         // dispatch can `return_call_indirect` between bodies without the
@@ -15189,6 +15205,9 @@ impl majit_backend::Backend for CraneliftBackend {
         let mut cur_num_ref_roots = compiled.num_ref_roots;
         let mut cur_max_output_slots = compiled.max_output_slots;
         let mut cur_inputs = args.to_vec();
+        // External-JUMP re-entry LABEL selector (host_reentry_dispatch_key); 0
+        // for the initial entry and first-LABEL re-entries.
+        let mut cur_dispatch_key: u32 = 0;
         let attachments_guard = compiled.cpu_attachments.read().unwrap();
         let attachments: &CpuDescrAttachments = &*attachments_guard;
 
@@ -15200,6 +15219,7 @@ impl majit_backend::Backend for CraneliftBackend {
                 cur_max_output_slots,
                 &cur_inputs,
                 attachments,
+                cur_dispatch_key,
             );
             let fail_index = exec.fail_index;
             let direct_descr = exec.direct_descr.clone();
@@ -15292,11 +15312,15 @@ impl majit_backend::Backend for CraneliftBackend {
             // entirely inside generated code.
             if fail_descr_fd.is_external_jump() {
                 slice_x2_probe::record_execute_with_inputs_hit();
-                let target_entry = fail_descr_fd
-                    .target_descr()
+                let target_descr = fail_descr_fd.target_descr();
+                let target_entry = target_descr
                     .as_ref()
                     .and_then(lookup_loop_target)
                     .expect("external JUMP target must be a registered LoopTargetDescr");
+                cur_dispatch_key = target_descr
+                    .as_ref()
+                    .map(host_reentry_dispatch_key)
+                    .unwrap_or(0);
                 cur_code_ptr = target_entry.code_ptr;
                 cur_fail_descrs = target_entry.fail_descrs;
                 cur_num_ref_roots = target_entry.num_ref_roots;
@@ -16495,6 +16519,49 @@ mod tests {
         // assertion that only exists for half-initialized test runtimes.
         gc.register_type(TypeInfo::simple(16));
         CraneliftBackend::with_gc_allocator(Box::new(gc))
+    }
+
+    /// Publish the JitFrame layout descrs so the GC rewriter's
+    /// handle_call_assembler pass (rewrite.py:665-695) can emit GC_LOAD /
+    /// GC_STORE against callee jitframes. Mirrors the dynasm test layout
+    /// (runner.rs install_call_assembler_test_layout); the offsets match
+    /// the production cranelift mapping in pyre-jit call_jit.rs
+    /// arena_jitframe_descrs. Reads jitframe_gc_type_id() after
+    /// set_gc_allocator has lazily registered JITFRAME.
+    fn install_call_assembler_test_layout() {
+        register_jitframe_layout(JitFrameLayoutInfo {
+            jitframe_descrs: Some(majit_gc::rewrite::JitFrameDescrs {
+                jitframe_tid: jitframe_gc_type_id(),
+                jitframe_fixed_size: majit_backend::jitframe::JITFRAME_FIXED_SIZE,
+                jf_frame_info_ofs: majit_backend::jitframe::JF_FRAME_INFO_OFS,
+                jf_descr_ofs: JF_DESCR_OFS,
+                jf_force_descr_ofs: JF_FORCE_DESCR_OFS,
+                jf_savedata_ofs: JF_SAVEDATA_OFS,
+                jf_guard_exc_ofs: JF_GUARD_EXC_OFS,
+                jf_forward_ofs: JF_FORWARD_OFS,
+                jf_frame_ofs: JF_FRAME_OFS,
+                jf_frame_baseitemofs: majit_backend::jitframe::FIRST_ITEM_OFFSET,
+                jf_frame_lengthofs: JF_FRAME_OFS + majit_backend::jitframe::LENGTHOFS,
+                sign_size: majit_backend::jitframe::SIGN_SIZE,
+            }),
+        });
+    }
+
+    /// GC-backed backend for CALL_ASSEMBLER tests:
+    /// validate_call_assembler_rewrite_prereqs (compiler.rs) requires both a
+    /// configured GC runtime and a registered JITFRAME layout. Build the GC
+    /// on the lazy path (like make_gc_backend), then install the layout once
+    /// set_gc_allocator has published the JITFRAME type id.
+    fn make_call_assembler_backend() -> CraneliftBackend {
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 1 << 20,
+            large_object_threshold: 1 << 20,
+            ..GcConfig::default()
+        });
+        gc.register_type(TypeInfo::simple(16));
+        let backend = CraneliftBackend::with_gc_allocator(Box::new(gc));
+        install_call_assembler_test_layout();
+        backend
     }
 
     #[derive(Default)]
@@ -21026,9 +21093,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "CALL_ASSEMBLER tests need GC runtime + jitframe layout setup (rewrite.py:613-695 handle_call_assembler / gen_malloc_frame parity); test harness still uses pre-rewrite shape from before validate_call_assembler_rewrite_prereqs landed"]
     fn test_call_assembler_i_executes_finish_only_target() {
-        let mut backend = CraneliftBackend::new();
+        let mut backend = make_call_assembler_backend();
 
         let callee_inputargs = vec![InputArg::new_int(0)];
         let callee_ops = vec![
@@ -21109,9 +21175,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "CALL_ASSEMBLER tests need GC runtime + jitframe layout setup (rewrite.py:613-695 handle_call_assembler / gen_malloc_frame parity); test harness still uses pre-rewrite shape from before validate_call_assembler_rewrite_prereqs landed"]
     fn test_call_assembler_compiles_before_target_is_registered() {
-        let mut backend = CraneliftBackend::new();
+        let mut backend = make_call_assembler_backend();
 
         let mut deferred_target = JitCellToken::new(1500_240);
         backend.set_next_trace_id(1500_241);
@@ -21126,6 +21191,7 @@ mod tests {
             ),
             mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
+        backend.register_pending_target(deferred_target.number, vec![Type::Int], 1, 1, -1);
         let mut caller = JitCellToken::new(1500_241);
         backend
             .compile_loop(&caller_inputargs, &caller_ops, &mut caller)
@@ -21155,9 +21221,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "CALL_ASSEMBLER tests need GC runtime + jitframe layout setup (rewrite.py:613-695 handle_call_assembler / gen_malloc_frame parity); test harness still uses pre-rewrite shape from before validate_call_assembler_rewrite_prereqs landed"]
     fn test_call_assembler_late_bound_ref_result_supports_plain_ref_finish() {
-        let mut backend = CraneliftBackend::new();
+        let mut backend = make_call_assembler_backend();
 
         let mut deferred_target = JitCellToken::new(1500_245);
         let caller_inputargs = vec![InputArg::new_ref(0)];
@@ -21171,6 +21236,7 @@ mod tests {
             ),
             mk_op(OpCode::Finish, &[OpRef::ref_op(1)], OpRef::NONE.raw()),
         ];
+        backend.register_pending_target(deferred_target.number, vec![Type::Ref], 1, 0, -1);
         let mut caller = JitCellToken::new(1500_246);
         backend
             .compile_loop(&caller_inputargs, &caller_ops, &mut caller)
@@ -21200,116 +21266,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "CALL_ASSEMBLER tests need GC runtime + jitframe layout setup (rewrite.py:613-695 handle_call_assembler / gen_malloc_frame parity); test harness still uses pre-rewrite shape from before validate_call_assembler_rewrite_prereqs landed"]
-    fn test_call_assembler_late_bound_ref_result_rejects_force_token_finish_shape() {
-        let mut backend = CraneliftBackend::new();
-
-        let mut deferred_target = JitCellToken::new(1500_247);
-        let caller_inputargs = vec![InputArg::new_int(0)];
-        let caller_ops = vec![
-            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
-            mk_op_with_descr(
-                OpCode::CallAssemblerR,
-                &[OpRef::input_arg_int(0)],
-                1,
-                make_call_assembler_descr(&deferred_target, vec![Type::Int], Type::Ref),
-            ),
-            mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
-        ];
-        let mut caller = JitCellToken::new(1500_248);
-        backend
-            .compile_loop(&caller_inputargs, &caller_ops, &mut caller)
-            .unwrap();
-
-        backend.set_next_trace_id(1500_247);
-        let callee_inputargs = vec![InputArg::new_int(0)];
-        let mut guard_op = mk_op(OpCode::GuardNotForced2, &[], OpRef::NONE.raw());
-        guard_op.setfailargs(smallvec::smallvec![BoxRef::from_opref(OpRef::int_op(1))]);
-        let callee_ops = vec![
-            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
-            mk_op(
-                OpCode::IntAdd,
-                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
-                1,
-            ),
-            mk_op(OpCode::ForceToken, &[], 2),
-            guard_op,
-            mk_op(OpCode::Finish, &[OpRef::ref_op(2)], OpRef::NONE.raw()),
-        ];
-        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
-        constants.insert(100, 10);
-        backend.set_constants(constants);
-        let err = backend
-            .compile_loop(&callee_inputargs, &callee_ops, &mut deferred_target)
-            .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("incompatible callee finish result kind"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    #[ignore = "CALL_ASSEMBLER tests need GC runtime + jitframe layout setup (rewrite.py:613-695 handle_call_assembler / gen_malloc_frame parity); test harness still uses pre-rewrite shape from before validate_call_assembler_rewrite_prereqs landed"]
-    fn test_call_assembler_redirect_rejects_incompatible_force_token_result_shape() {
-        let mut backend = CraneliftBackend::new();
-
-        let ref_inputargs = vec![InputArg::new_ref(0)];
-        let plain_ref_ops = vec![
-            mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
-            mk_op(
-                OpCode::Finish,
-                &[OpRef::input_arg_ref(0)],
-                OpRef::NONE.raw(),
-            ),
-        ];
-        let mut plain_ref_target = JitCellToken::new(1500_349);
-        backend
-            .compile_loop(&ref_inputargs, &plain_ref_ops, &mut plain_ref_target)
-            .unwrap();
-
-        let mut guard_op = mk_op(OpCode::GuardNotForced2, &[], OpRef::NONE.raw());
-        guard_op.setfailargs(smallvec::smallvec![BoxRef::from_opref(OpRef::ref_op(1))]);
-        let force_token_ops = vec![
-            mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
-            mk_op(OpCode::ForceToken, &[], 1),
-            guard_op,
-            mk_op(OpCode::Finish, &[OpRef::ref_op(1)], OpRef::NONE.raw()),
-        ];
-        let mut force_token_target = JitCellToken::new(1500_350);
-        backend
-            .compile_loop(&ref_inputargs, &force_token_ops, &mut force_token_target)
-            .unwrap();
-
-        let caller_ops = vec![
-            mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
-            mk_op_with_descr(
-                OpCode::CallAssemblerR,
-                &[OpRef::input_arg_ref(0)],
-                1,
-                make_call_assembler_descr(&plain_ref_target, vec![Type::Ref], Type::Ref),
-            ),
-            mk_op(OpCode::Finish, &[OpRef::ref_op(1)], OpRef::NONE.raw()),
-        ];
-        let mut caller = JitCellToken::new(1500_351);
-        backend
-            .compile_loop(&ref_inputargs, &caller_ops, &mut caller)
-            .unwrap();
-
-        let err = backend
-            .redirect_call_assembler(&plain_ref_target, &force_token_target)
-            .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("incompatible callee finish result kind"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    #[ignore = "CALL_ASSEMBLER tests need GC runtime + jitframe layout setup (rewrite.py:613-695 handle_call_assembler / gen_malloc_frame parity); test harness still uses pre-rewrite shape from before validate_call_assembler_rewrite_prereqs landed"]
     fn test_call_assembler_supports_direct_self_recursive_dispatch() {
-        let mut backend = CraneliftBackend::new();
+        let mut backend = make_call_assembler_backend();
 
         let inputargs = vec![InputArg::new_int(0)];
         let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
@@ -21340,6 +21298,7 @@ mod tests {
             mk_op(OpCode::IntAdd, &[OpRef::int_op(3), OpRef::int_op(100)], 4),
             mk_op(OpCode::Finish, &[OpRef::int_op(4)], OpRef::NONE.raw()),
         ];
+        backend.register_pending_target(token.number, vec![Type::Int], 1, 1, -1);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let compiled = token
@@ -21387,12 +21346,11 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "CALL_ASSEMBLER tests need GC runtime + jitframe layout setup (rewrite.py:613-695 handle_call_assembler / gen_malloc_frame parity); test harness still uses pre-rewrite shape from before validate_call_assembler_rewrite_prereqs landed"]
     fn test_call_assembler_reused_token_resets_stale_pending_dispatch_slot() {
         let token_number = 1500_252;
 
         {
-            let mut backend = CraneliftBackend::new();
+            let mut backend = make_call_assembler_backend();
             let inputargs = vec![InputArg::new_int(0)];
             let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
             constants.insert(100, 1);
@@ -21422,6 +21380,7 @@ mod tests {
                 mk_op(OpCode::IntAdd, &[OpRef::int_op(3), OpRef::int_op(100)], 4),
                 mk_op(OpCode::Finish, &[OpRef::int_op(4)], OpRef::NONE.raw()),
             ];
+            backend.register_pending_target(token.number, vec![Type::Int], 1, 1, -1);
             backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
             let failed = backend.execute_token(&token, &[Value::Int(0)]);
@@ -21444,7 +21403,8 @@ mod tests {
             assert_eq!(backend.get_int_value(&frame, 0), 4);
         }
 
-        let mut backend = CraneliftBackend::new();
+        let mut backend = make_call_assembler_backend();
+        backend.register_pending_target(token_number, vec![Type::Int], 1, 1, -1);
         let mut deferred_target = JitCellToken::new(token_number);
         let caller_inputargs = vec![InputArg::new_int(0)];
         let caller_ops = vec![
@@ -21764,7 +21724,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "label-selector dispatch (assembler.py:990-993 TargetToken._ll_loop_code per-label entry) is not yet ported — re-entry runs from the function code_ptr, not the target label's address. Cranelift cannot expose internal block addresses, so closing this requires either a per-label dispatch prologue or a switch-on-selector entry."]
     fn test_execute_bridge_external_jump_to_second_label_skips_preamble() {
         let mut backend = CraneliftBackend::new();
         let start_descr = make_label_descr(1500_265);
@@ -21851,7 +21810,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "label-selector dispatch (assembler.py:990-993 TargetToken._ll_loop_code per-label entry) is not yet ported — re-entry runs from the function code_ptr, not the target label's address. Cranelift cannot expose internal block addresses, so closing this requires either a per-label dispatch prologue or a switch-on-selector entry."]
     fn test_execute_bridge_external_jump_to_middle_label_uses_label_selector() {
         let mut backend = CraneliftBackend::new();
         let start_descr = make_label_descr(1500_268);
@@ -21950,6 +21908,125 @@ mod tests {
         let descr = backend.get_latest_descr(&frame);
         assert!(descr.is_finish());
         assert_eq!(backend.get_int_value(&frame, 0), 25);
+    }
+
+    #[test]
+    #[ignore = "sets the process-global PYRE_CL_NO_CLOSING_JUMP env var to force the \
+        host-loop external-JUMP path (in-code closing_jump disabled); run serially: \
+        `PYRE_CL_NO_CLOSING_JUMP=1 cargo test -p majit-backend-cranelift --features dynasm \
+        test_host_loop_external_jump_to_middle_label -- --ignored --test-threads=1`"]
+    fn test_host_loop_external_jump_to_middle_label_uses_label_selector() {
+        // Same scenario as the in-code variant above, but with closing_jump
+        // disabled the cross-loop JUMP surfaces as an `is_external_jump`
+        // deadframe and the host loop (`execute_with_inputs`) re-enters the
+        // target via its wrapper.  `host_reentry_dispatch_key` must pass the
+        // middle LABEL's `label_block_id + 1` so the body's entry `br_table`
+        // selects the loader (reading the carried value run_compiled_code
+        // loaded into slot 0) instead of the preamble — which would re-run
+        // the start LABEL and finish 35 instead of 25.
+        unsafe { std::env::set_var("PYRE_CL_NO_CLOSING_JUMP", "1") };
+
+        let mut backend = CraneliftBackend::new();
+        let start_descr = make_label_descr(1500_280);
+        let middle_descr = make_label_descr(1500_281);
+        let final_descr = make_label_descr(1500_282);
+
+        let inputargs = vec![InputArg::new_int(0)];
+        let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(1)], OpRef::NONE.raw());
+        guard.setfailargs(smallvec::smallvec![BoxRef::from_opref(
+            OpRef::input_arg_int(0)
+        )]);
+        let root_ops = vec![
+            mk_op_with_descr(
+                OpCode::Label,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+                start_descr,
+            ),
+            mk_op(
+                OpCode::IntGt,
+                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
+                1,
+            ),
+            guard,
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::int_op(101)],
+                2,
+            ),
+            mk_op_with_descr(
+                OpCode::Jump,
+                &[OpRef::int_op(2)],
+                OpRef::NONE.raw(),
+                middle_descr.clone(),
+            ),
+            mk_op_with_descr(
+                OpCode::Label,
+                &[OpRef::int_op(3)],
+                OpRef::NONE.raw(),
+                middle_descr.clone(),
+            ),
+            mk_op(OpCode::IntAdd, &[OpRef::int_op(3), OpRef::int_op(102)], 4),
+            mk_op_with_descr(
+                OpCode::Jump,
+                &[OpRef::int_op(4)],
+                OpRef::NONE.raw(),
+                final_descr.clone(),
+            ),
+            mk_op_with_descr(
+                OpCode::Label,
+                &[OpRef::int_op(5)],
+                OpRef::NONE.raw(),
+                final_descr,
+            ),
+            mk_op(OpCode::Finish, &[OpRef::int_op(5)], OpRef::NONE.raw()),
+        ];
+
+        let mut root_constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
+        root_constants.insert(100, 0);
+        root_constants.insert(101, 10);
+        root_constants.insert(102, 20);
+        backend.set_constants(root_constants);
+
+        let mut token = JitCellToken::new(1500_283);
+        backend
+            .compile_loop(&inputargs, &root_ops, &mut token)
+            .unwrap();
+
+        let failed = backend.execute_token(&token, &[Value::Int(0)]);
+        let guard_descr =
+            get_latest_descr_from_deadframe(&failed).expect("guard should produce a descr");
+
+        let mut bridge_constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
+        bridge_constants.insert(103, 5);
+        backend.set_constants(bridge_constants);
+        let bridge_ops = vec![
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::int_op(103)],
+                1,
+            ),
+            mk_op_with_descr(
+                OpCode::Jump,
+                &[OpRef::int_op(1)],
+                OpRef::NONE.raw(),
+                middle_descr,
+            ),
+        ];
+        backend
+            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, &[], None)
+            .unwrap();
+
+        backend.set_constants(majit_ir::VecAssoc::new());
+        let frame = backend.execute_token(&token, &[Value::Int(0)]);
+        let is_finish = backend.get_latest_descr(&frame).is_finish();
+        let value = backend.get_int_value(&frame, 0);
+
+        unsafe { std::env::remove_var("PYRE_CL_NO_CLOSING_JUMP") };
+
+        assert!(is_finish);
+        assert_eq!(value, 25);
     }
 
     #[test]
