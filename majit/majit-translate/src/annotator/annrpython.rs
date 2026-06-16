@@ -2593,32 +2593,46 @@ impl RPythonAnnotator {
             // (annrpython.py:566) — read generically off the exitswitch
             // binding; SomeBool and an integer-discriminant SomeInteger
             // both carry it, every other annotation defaults to `{}`.
-            let knowntypedata: KnownTypeData = match exitswitch {
-                Some(Hlvalue::Variable(ref v)) => v
-                    .annotation
-                    .borrow()
-                    .as_ref()
-                    .and_then(|rc| rc.knowntypedata().cloned())
-                    .unwrap_or_default(),
-                _ => HashMap::new(),
+            // The binding's TYPE also fixes the exitcase-key flavour: a
+            // bool exitswitch keys by truth, an integer `SwitchInt`
+            // (enum discriminant) keys by the case constant.
+            let (knowntypedata, int_keyed): (KnownTypeData, bool) = match exitswitch {
+                Some(Hlvalue::Variable(ref v)) => {
+                    let ann = v.annotation.borrow();
+                    let rc = ann.as_ref();
+                    let ktd = rc
+                        .and_then(|rc| rc.knowntypedata().cloned())
+                        .unwrap_or_default();
+                    let int_keyed = matches!(rc.map(|r| r.as_ref()), Some(SomeValue::Integer(_)));
+                    (ktd, int_keyed)
+                }
+                _ => (HashMap::new(), false),
             };
             for link in &exits {
                 let exitcase = link.borrow().exitcase.clone();
-                // `knowntypedata.get(link.exitcase, {})` — the outer
-                // key is the python-level exitcase truth value. For
-                // bool-discriminating exits upstream uses True/False
-                // directly; we extract the boolean from the exitcase
-                // constant.
-                let truth: Option<bool> = match exitcase {
+                // `knowntypedata.get(link.exitcase, {})` — key by the
+                // exitcase value. A bool exitswitch keys `True`/`False`;
+                // pyre's MIR also encodes a bool `SwitchInt` arm as
+                // `Int(0/1)` (mir.rs:6097), so a bool binding collapses
+                // the integer back to a truth value. An integer
+                // discriminant keys directly by the `Int` case constant.
+                let case_key: Option<ExitCaseKey> = match exitcase {
                     Some(Hlvalue::Constant(c)) => match &c.value {
-                        super::super::flowspace::model::ConstValue::Bool(b) => Some(*b),
-                        super::super::flowspace::model::ConstValue::Int(i) => Some(*i != 0),
+                        super::super::flowspace::model::ConstValue::Bool(b) => {
+                            Some(ExitCaseKey::Bool(*b))
+                        }
+                        super::super::flowspace::model::ConstValue::Int(i) if int_keyed => {
+                            Some(ExitCaseKey::Int(*i))
+                        }
+                        super::super::flowspace::model::ConstValue::Int(i) => {
+                            Some(ExitCaseKey::Bool(*i != 0))
+                        }
                         _ => None,
                     },
                     _ => None,
                 };
-                let constraints = truth
-                    .and_then(|t| knowntypedata.get(&ExitCaseKey::Bool(t)).cloned())
+                let constraints = case_key
+                    .and_then(|k| knowntypedata.get(&k).cloned())
                     .unwrap_or_default();
                 self.follow_link(graph, link, &constraints);
             }
