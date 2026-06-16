@@ -101,7 +101,10 @@ pub enum Specializer {
 
 pub trait PolicyOps: Debug {
     fn get_specializer(&self, directive: Option<&str>) -> Result<Specializer, PolicyError>;
-    fn no_more_blocks_to_annotate(&self, ann: &super::annrpython::RPythonAnnotator);
+    fn no_more_blocks_to_annotate(
+        &self,
+        ann: &super::annrpython::RPythonAnnotator,
+    ) -> Result<(), super::model::AnnotatorError>;
 }
 
 #[derive(Clone)]
@@ -119,8 +122,11 @@ impl PolicyHandle {
         self.0.get_specializer(directive)
     }
 
-    pub fn no_more_blocks_to_annotate(&self, ann: &super::annrpython::RPythonAnnotator) {
-        self.0.no_more_blocks_to_annotate(ann);
+    pub fn no_more_blocks_to_annotate(
+        &self,
+        ann: &super::annrpython::RPythonAnnotator,
+    ) -> Result<(), super::model::AnnotatorError> {
+        self.0.no_more_blocks_to_annotate(ann)
     }
 }
 
@@ -209,18 +215,23 @@ impl AnnotatorPolicy {
     /// rewrite. Sandbox-mode translation is not yet end-to-end usable
     /// regardless, so the placeholder trampoline does not reach a
     /// backend.
-    pub fn no_more_blocks_to_annotate(&self, ann: &super::annrpython::RPythonAnnotator) {
+    pub fn no_more_blocks_to_annotate(
+        &self,
+        ann: &super::annrpython::RPythonAnnotator,
+    ) -> Result<(), super::model::AnnotatorError> {
         use super::bookkeeper::EmulatedPbcCallKey;
-        use super::model::{SomePBC, SomeValue};
+        use super::model::{AnnotatorError, SomePBC, SomeValue};
         use crate::flowspace::model::{BlockKey, ConstValue, Constant, Hlvalue, HostObject};
         use crate::flowspace::operation::OpKind;
 
         let bk = &ann.bookkeeper;
         // upstream: for callback in bk.pending_specializations: callback()
-        let callbacks: Vec<Box<dyn Fn()>> =
+        let callbacks: Vec<Box<dyn Fn() -> Result<(), AnnotatorError>>> =
             bk.pending_specializations.borrow_mut().drain(..).collect();
         for callback in &callbacks {
-            callback();
+            // upstream lets a callback exception propagate; surface the
+            // first `Err` to the annotator's `complete()`.
+            callback()?;
         }
         // upstream: del bk.pending_specializations[:]  (already drained)
 
@@ -343,6 +354,7 @@ impl AnnotatorPolicy {
                 let _ = std::marker::PhantomData::<SomePBC>;
             }
         }
+        Ok(())
     }
 }
 
@@ -351,7 +363,10 @@ impl PolicyOps for AnnotatorPolicy {
         AnnotatorPolicy::get_specializer(self, directive)
     }
 
-    fn no_more_blocks_to_annotate(&self, ann: &super::annrpython::RPythonAnnotator) {
+    fn no_more_blocks_to_annotate(
+        &self,
+        ann: &super::annrpython::RPythonAnnotator,
+    ) -> Result<(), super::model::AnnotatorError> {
         AnnotatorPolicy::no_more_blocks_to_annotate(self, ann)
     }
 }
@@ -576,7 +591,10 @@ mod tests {
         let _ = graph; // keep the Rc alive for the duration of the test
 
         // Run the policy walker.
-        ann.policy.borrow().no_more_blocks_to_annotate(&ann);
+        ann.policy
+            .borrow()
+            .no_more_blocks_to_annotate(&ann)
+            .expect("no_more_blocks_to_annotate");
 
         // Verify the callee arg was rewritten to a Constant(HostObject).
         let args0 = block.borrow().operations[0].args[0].clone();
@@ -616,6 +634,7 @@ mod tests {
                 .borrow_mut()
                 .push(Box::new(move || {
                     c.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
                 }));
         }
         {
@@ -625,10 +644,30 @@ mod tests {
                 .borrow_mut()
                 .push(Box::new(move || {
                     c.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
                 }));
         }
-        ann.policy.borrow().no_more_blocks_to_annotate(&ann);
+        ann.policy
+            .borrow()
+            .no_more_blocks_to_annotate(&ann)
+            .expect("drain");
         assert_eq!(counter.load(Ordering::SeqCst), 2);
         assert!(ann.bookkeeper.pending_specializations.borrow().is_empty());
+    }
+
+    #[test]
+    fn no_more_blocks_to_annotate_propagates_callback_error() {
+        use super::super::model::AnnotatorError;
+        let ann = super::super::annrpython::RPythonAnnotator::new(None, None, None, false);
+        ann.bookkeeper
+            .pending_specializations
+            .borrow_mut()
+            .push(Box::new(|| Err(AnnotatorError::new("boom from finish"))));
+        let err = ann
+            .policy
+            .borrow()
+            .no_more_blocks_to_annotate(&ann)
+            .expect_err("callback Err must surface, not panic");
+        assert!(err.to_string().contains("boom from finish"));
     }
 }

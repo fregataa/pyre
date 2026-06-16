@@ -983,21 +983,17 @@ impl FunctionReprBase {
         //
         // If `any_description()` returns `None` the PBC is empty — upstream
         // would have tripped the `assert len(descs) > 0` in the ctor.
-        let callfamily = match s_pbc.any_description() {
-            Some(entry) => match entry {
-                DescEntry::Function(rc) => {
-                    let fd = rc.borrow();
-                    match fd.base.getcallfamily() {
-                        Ok(family) => Some(family),
-                        Err(_) => None,
-                    }
-                }
-                // MethodDesc / FrozenDesc / MethodOfFrozenDesc /
-                // ClassDesc also expose `getcallfamily` via the base
-                // `Desc`; only FunctionRepr needs the stored handle
-                // today so we leave those routes unpopulated until
-                // their concrete reprs land.
-                _ => None,
+        // `as_function()` yields the underlying FunctionDesc for both
+        // FunctionDesc and MemoDesc (MemoDesc is-a FunctionDesc,
+        // description.py:395). MethodDesc / FrozenDesc /
+        // MethodOfFrozenDesc / ClassDesc also expose `getcallfamily` via
+        // the base `Desc`, but only FunctionRepr needs the stored handle
+        // today so those routes stay unpopulated until their concrete
+        // reprs land.
+        let callfamily = match s_pbc.any_description().and_then(|e| e.as_function()) {
+            Some(rc) => match rc.borrow().base.getcallfamily() {
+                Ok(family) => Some(family),
+                Err(_) => None,
             },
             None => None,
         };
@@ -1040,7 +1036,9 @@ impl FunctionReprBase {
                 "FunctionReprBase.get_s_signatures: s_pbc is empty",
             ));
         };
-        let DescEntry::Function(rc) = entry else {
+        // MemoDesc is-a FunctionDesc (description.py:395), so accept its
+        // wrapped base via `as_function()`.
+        let Some(rc) = entry.as_function() else {
             return Err(TyperError::message(
                 "FunctionReprBase.get_s_signatures: representative is not a FunctionDesc",
             ));
@@ -1304,9 +1302,17 @@ impl FunctionRepr {
                 "FunctionRepr.get_concrete_llfn: expected a single FunctionDesc",
             ));
         }
-        let funcdesc_rc = match s_pbc.descriptions.values().next().expect("len checked") {
-            DescEntry::Function(rc) => rc.clone(),
-            _ => {
+        // MemoDesc is-a FunctionDesc (description.py:395): `as_function()`
+        // yields the wrapped base for both.
+        let funcdesc_rc = match s_pbc
+            .descriptions
+            .values()
+            .next()
+            .expect("len checked")
+            .as_function()
+        {
+            Some(rc) => rc,
+            None => {
                 return Err(TyperError::message(
                     "FunctionRepr.get_concrete_llfn: single desc is not a FunctionDesc",
                 ));
@@ -2606,7 +2612,15 @@ impl SmallFunctionSetPBCRepr {
             let b = Block::shared(args_v_hl.clone());
 
             // upstream: `llfn = self.rtyper.getcallable(row_of_graphs[desc])`.
-            let target_graph = row_of_graphs.get(&desc.desc_key()).ok_or_else(|| {
+            // `row_of_graphs` is built by `build_calltable_row`, which keys
+            // each entry on `desc.rowkey()` (description.py:62-68); look it
+            // up by the same key. For the FunctionDescs in a SmallFunction-
+            // SetPBCRepr `rowkey()` is the desc's own identity, matching
+            // upstream where `rowkey() is self`.
+            let row_key = desc
+                .rowkey()
+                .map_err(|e| TyperError::message(e.to_string()))?;
+            let target_graph = row_of_graphs.get(&row_key).ok_or_else(|| {
                 TyperError::message(format!(
                     "SmallFunctionSetPBCRepr.make_dispatcher: row_of_graphs missing \
                      entry for {desc:?}"
@@ -6870,7 +6884,9 @@ pub fn somepbc_rtyper_makerepr(
         ))
     })?;
     match kind {
-        DescKind::Function => {
+        // MemoDesc is-a FunctionDesc; a memo PBC builds the same repr
+        // (its `as_function()` yields the wrapped base).
+        DescKind::Function | DescKind::Memo => {
             if s_pbc.descriptions.len() == 1 && !s_pbc.can_be_none {
                 Ok(
                     std::sync::Arc::new(FunctionRepr::new(rtyper, s_pbc.clone())?)
@@ -9320,10 +9336,12 @@ mod pbc_repr_tests {
             "test::f",
             FlowConstant::new(ConstValue::Dict(Default::default())),
         ));
-        let fd_rc = ann.bookkeeper.newfuncdesc(&host_f).unwrap();
-        // newfuncdesc already inserts the desc into bookkeeper.descs
-        // keyed on the host object — `getdesc(host_f)` later returns
-        // the same FunctionDesc.
+        let fd_rc = ann
+            .bookkeeper
+            .newfuncdesc(&host_f)
+            .unwrap()
+            .as_function()
+            .unwrap();
 
         // Pre-populate the graph cache so consider_call_site can build
         // a row without hitting the missing pyobj path.

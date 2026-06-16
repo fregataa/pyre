@@ -535,6 +535,11 @@ pub(crate) fn simplify_desc_set_default(
 pub enum DescEntry {
     /// upstream `FunctionDesc` — ported file description.py:190-393.
     Function(Rc<RefCell<FunctionDesc>>),
+    /// upstream `MemoDesc(FunctionDesc)` — description.py:395-404. A
+    /// `@specialize.memo` function; `isinstance(desc, FunctionDesc)` is
+    /// true upstream, so every non-`pycall` dispatch delegates to the
+    /// wrapped FunctionDesc.
+    Memo(Rc<RefCell<MemoDesc>>),
     /// upstream `MethodDesc` — description.py:407-519.
     Method(Rc<RefCell<MethodDesc>>),
     /// upstream `FrozenDesc` — description.py:528-599.
@@ -555,6 +560,8 @@ impl DescEntry {
     pub fn desc_key(&self) -> DescKey {
         match self {
             DescEntry::Function(rc) => DescKey::from_rc(rc),
+            // `id(desc)` is the MemoDesc object's identity upstream.
+            DescEntry::Memo(rc) => DescKey::from_rc(rc),
             DescEntry::Method(rc) => DescKey::from_rc(rc),
             DescEntry::Frozen(rc) => DescKey::from_rc(rc),
             DescEntry::MethodOfFrozen(rc) => DescKey::from_rc(rc),
@@ -569,6 +576,7 @@ impl DescEntry {
     pub fn pyobj(&self) -> Option<HostObject> {
         match self {
             DescEntry::Function(rc) => rc.borrow().base.pyobj.clone(),
+            DescEntry::Memo(rc) => rc.borrow().base.borrow().base.pyobj.clone(),
             DescEntry::Method(_) => None,
             DescEntry::Frozen(rc) => rc.borrow().base.pyobj.clone(),
             DescEntry::MethodOfFrozen(_) => None,
@@ -582,6 +590,13 @@ impl DescEntry {
     pub fn kind(&self) -> super::model::DescKind {
         match self {
             DescEntry::Function(_) => super::model::DescKind::Function,
+            // upstream `getKind` keys on `desc.__class__`: a MemoDesc is
+            // a distinct kind (mixing with FunctionDesc → "mixing several
+            // kinds of PBCs"). `consider_call_site` / `simplify_desc_set`
+            // are inherited from FunctionDesc, so a homogeneous memo PBC
+            // routes through the Function path (see `SomePBC::simplify` /
+            // `consider_call_site`).
+            DescEntry::Memo(_) => super::model::DescKind::Memo,
             DescEntry::Method(_) => super::model::DescKind::Method,
             DescEntry::Class(_) => super::model::DescKind::Class,
             DescEntry::Frozen(_) => super::model::DescKind::Frozen,
@@ -603,6 +618,12 @@ impl DescEntry {
         match self {
             DescEntry::Function(fd) => {
                 DescEntry::Method(FunctionDesc::bind_under(fd, classdef, name))
+            }
+            // MemoDesc inherits `FunctionDesc.bind_under`; bind the wrapped
+            // FunctionDesc (the resulting MethodDesc carries the base
+            // funcdesc — a memo bound method is not a path pyre exercises).
+            DescEntry::Memo(md) => {
+                DescEntry::Method(FunctionDesc::bind_under(&md.borrow().base, classdef, name))
             }
             DescEntry::Method(md) => DescEntry::Method(md.borrow().bind_under(classdef, name)),
             // upstream: `Desc.bind_under` default = `return self`.
@@ -627,13 +648,14 @@ impl DescEntry {
         match self {
             DescEntry::Frozen(rc) => rc.borrow().s_read_attribute(name),
             DescEntry::Class(rc) => super::classdesc::ClassDesc::s_read_attribute(rc, name),
-            DescEntry::Function(_) | DescEntry::Method(_) | DescEntry::MethodOfFrozen(_) => {
-                Err(AnnotatorError::new(format!(
-                    "AttributeError: {:?} has no s_read_attribute (pbc_getattr of {:?})",
-                    self.kind(),
-                    name
-                )))
-            }
+            DescEntry::Function(_)
+            | DescEntry::Memo(_)
+            | DescEntry::Method(_)
+            | DescEntry::MethodOfFrozen(_) => Err(AnnotatorError::new(format!(
+                "AttributeError: {:?} has no s_read_attribute (pbc_getattr of {:?})",
+                self.kind(),
+                name
+            ))),
         }
     }
 
@@ -648,6 +670,8 @@ impl DescEntry {
     ) -> Result<(Rc<PyGraph>, Vec<Option<super::model::SomeValue>>), AnnotatorError> {
         match self {
             DescEntry::Function(rc) => rc.borrow().get_call_parameters(args_s),
+            // MemoDesc inherits `get_call_parameters` from FunctionDesc.
+            DescEntry::Memo(rc) => rc.borrow().base.borrow().get_call_parameters(args_s),
             DescEntry::Method(_)
             | DescEntry::Frozen(_)
             | DescEntry::MethodOfFrozen(_)
@@ -658,10 +682,32 @@ impl DescEntry {
         }
     }
 
+    /// RPython `desc.create_new_attribute(name, value)` polymorphism as
+    /// used by `MemoTable.finish` (specialize.py:219). Both `FrozenDesc`
+    /// (description.py:568) and `ClassDesc` (classdesc.py:804) define it;
+    /// every other desc kind raising at the Python level is surfaced as
+    /// an [`AnnotatorError`] (a memo argument set must be frozen PBCs or
+    /// classes).
+    pub fn create_new_attribute(
+        &self,
+        name: &str,
+        value: ConstValue,
+    ) -> Result<(), AnnotatorError> {
+        match self {
+            DescEntry::Frozen(rc) => rc.borrow().create_new_attribute(name, value),
+            DescEntry::Class(rc) => rc.borrow_mut().create_new_attribute(name, value),
+            _ => Err(AnnotatorError::new(format!(
+                "{:?} has no create_new_attribute (memo arg must be a frozen PBC or a class)",
+                self.kind()
+            ))),
+        }
+    }
+
     /// Shorthand predicates matching upstream `isinstance(desc, ...)`
     /// dispatch at bookkeeper callsites.
     pub fn is_function(&self) -> bool {
-        matches!(self, DescEntry::Function(_))
+        // upstream `isinstance(desc, FunctionDesc)` is true for MemoDesc.
+        matches!(self, DescEntry::Function(_) | DescEntry::Memo(_))
     }
     pub fn is_method(&self) -> bool {
         matches!(self, DescEntry::Method(_))
@@ -682,6 +728,8 @@ impl DescEntry {
     pub fn as_function(&self) -> Option<Rc<RefCell<FunctionDesc>>> {
         match self {
             DescEntry::Function(rc) => Some(rc.clone()),
+            // MemoDesc is-a FunctionDesc: yield the wrapped base.
+            DescEntry::Memo(rc) => Some(rc.borrow().base.clone()),
             _ => None,
         }
     }
@@ -719,6 +767,7 @@ impl DescEntry {
     ) -> Result<Rc<PyGraph>, AnnotatorError> {
         match self {
             DescEntry::Function(rc) => rc.borrow().get_graph(args, op_key),
+            DescEntry::Memo(rc) => rc.borrow().base.borrow().get_graph(args, op_key),
             DescEntry::Method(rc) => rc.borrow().get_graph(args, op_key),
             DescEntry::MethodOfFrozen(rc) => rc.borrow().get_graph(args, op_key),
             DescEntry::Frozen(_) | DescEntry::Class(_) => Err(AnnotatorError::new(format!(
@@ -733,6 +782,7 @@ impl DescEntry {
     pub fn rowkey(&self) -> Result<DescKey, AnnotatorError> {
         match self {
             DescEntry::Function(rc) => Ok(FunctionDesc::rowkey(rc)),
+            DescEntry::Memo(rc) => Ok(FunctionDesc::rowkey(&rc.borrow().base)),
             DescEntry::Method(rc) => Ok(rc.borrow().rowkey()),
             DescEntry::MethodOfFrozen(rc) => Ok(rc.borrow().rowkey()),
             DescEntry::Frozen(_) | DescEntry::Class(_) => Err(AnnotatorError::new(format!(
@@ -944,6 +994,7 @@ impl FunctionDesc {
     fn nameof_desc(desc: &DescEntry) -> String {
         match desc {
             DescEntry::Function(rc) => rc.borrow().name.clone(),
+            DescEntry::Memo(rc) => rc.borrow().base.borrow().name.clone(),
             DescEntry::Method(rc) => rc.borrow().name.clone(),
             DescEntry::MethodOfFrozen(rc) => rc.borrow().funcdesc.borrow().name.clone(),
             DescEntry::Class(rc) => rc.borrow().name.clone(),
@@ -1106,6 +1157,38 @@ impl FunctionDesc {
         let graph = self.buildgraph(computed_alt_name.as_deref(), builder)?;
         self.cache.borrow_mut().insert(key, graph.clone());
         Ok(graph)
+    }
+}
+
+/// Result of [`FunctionDesc::specialize`].
+///
+/// Upstream `specialize` returns either a `FunctionGraph` (the common
+/// graph-producing specializers) or a `SomeXxx` annotation (the `memo`
+/// specializer, specialize.py:275). Python lets the single method return
+/// either; the typed Rust port makes the union explicit. `pycall` /
+/// `get_graph` / `get_call_parameters` recover the graph via
+/// [`SpecializeResult::expect_graph`] (their upstream `assert
+/// isinstance(graph, FunctionGraph)`), while `MemoDesc::pycall` handles
+/// both arms.
+#[derive(Debug)]
+pub enum SpecializeResult {
+    /// A specialized flow graph (the `isinstance(result, FunctionGraph)`
+    /// case).
+    Graph(Rc<PyGraph>),
+    /// An annotation returned directly by the specializer (`memo`).
+    Annotation(SomeValue),
+}
+
+impl SpecializeResult {
+    /// upstream `assert isinstance(result, FunctionGraph)` — recover the
+    /// graph, erroring if the specializer returned an annotation.
+    pub fn expect_graph(self) -> Result<Rc<PyGraph>, AnnotatorError> {
+        match self {
+            SpecializeResult::Graph(graph) => Ok(graph),
+            SpecializeResult::Annotation(_) => Err(AnnotatorError::new(
+                "specialize() returned an annotation where a FunctionGraph was expected",
+            )),
+        }
     }
 }
 
@@ -1600,6 +1683,14 @@ impl FunctionDesc {
         Ok(())
     }
 
+    /// Whether this function's specializer is `memo`
+    /// (specialize.py:275) — the `if specializer is memo` discriminant
+    /// `newfuncdesc` (bookkeeper.py:419-425) uses to mint a `MemoDesc`
+    /// rather than a plain `FunctionDesc`.
+    pub fn is_memo(&self) -> bool {
+        matches!(self.specializer.as_ref(), Some(Specializer::Memo))
+    }
+
     /// RPython `FunctionDesc.specialize(inputcells, op=None)`
     /// (description.py:272-281).
     ///
@@ -1612,14 +1703,22 @@ impl FunctionDesc {
         &self,
         inputcells: &mut Vec<Option<SomeValue>>,
         op_key: Option<PositionKey>,
-    ) -> Result<Rc<PyGraph>, AnnotatorError> {
+    ) -> Result<SpecializeResult, AnnotatorError> {
         let op_key = op_key.or_else(|| self.base.bookkeeper.current_position_key());
         // upstream description.py:277 — `self.normalize_args(inputcells)`.
         // The Option layer is preserved into the specializer; only the
         // enforceargs / signature paths inside `normalize_args` need
         // concrete cells, and they materialise their own buffer there.
         self.normalize_args(inputcells)?;
-        match self.specializer.as_ref().unwrap_or(&Specializer::Default) {
+        // upstream specialize.py:275 — `memo` returns either the family's
+        // dispatch FunctionGraph (once `finish` builds it) or an
+        // annotation; it is already a `SpecializeResult`, so it bypasses
+        // the graph-producing dispatch below. `MemoDesc::pycall` handles
+        // both arms.
+        if let Some(Specializer::Memo) = self.specializer.as_ref() {
+            return super::specialize::memo(self, inputcells);
+        }
+        let graph = match self.specializer.as_ref().unwrap_or(&Specializer::Default) {
             Specializer::Default => self.default_specialize(inputcells),
             Specializer::Arg { parms } => self.specialize_argvalue(inputcells, parms),
             Specializer::ArgOrVar { parms } => {
@@ -1641,7 +1740,9 @@ impl FunctionDesc {
                         ))
                     })?;
                     if !s.is_constant() {
-                        return self.maybe_star_args(GraphCacheKey::None, inputcells);
+                        return self
+                            .maybe_star_args(GraphCacheKey::None, inputcells)
+                            .map(SpecializeResult::Graph);
                     }
                 }
                 self.specialize_argvalue(inputcells, parms)
@@ -1721,10 +1822,7 @@ impl FunctionDesc {
                 let key = GraphCacheKey::Tuple(vec![GraphCacheKey::Position(position_key)]);
                 self.maybe_star_args(key, inputcells)
             }
-            Specializer::Memo => Err(AnnotatorError::new(
-                "FunctionDesc.specialize: memo specializer still requires \
-                 rpython/annotator/specialize.py MemoTable support",
-            )),
+            Specializer::Memo => unreachable!("memo handled above (specialize.py:275)"),
             Specializer::LowLevelDefault => {
                 crate::translator::rtyper::annlowlevel::LowLevelAnnotatorPolicy::new(None)
                     .default_specialize(self, inputcells)
@@ -1828,7 +1926,8 @@ impl FunctionDesc {
                 .specialize_genconst(self, inputcells, i)
                 .map_err(|e| AnnotatorError::new(e.to_string()))
             }
-        }
+        }?;
+        Ok(SpecializeResult::Graph(graph))
     }
 
     /// RPython `FunctionDesc.pycall(whence, args, s_previous_result, op=None)`
@@ -1863,16 +1962,26 @@ impl FunctionDesc {
         s_previous_result: &SomeValue,
         op_key: Option<PositionKey>,
     ) -> Result<SomeValue, AnnotatorError> {
+        // A `@specialize.memo` function is upstream a `MemoDesc`
+        // (subclass of `FunctionDesc`) whose `pycall` is overridden. Rust
+        // has no inheritance and `MethodDesc`/`MethodOfFrozenDesc` reach
+        // the underlying `FunctionDesc` (via `as_function`), so the
+        // override is selected here by the same `specializer is memo`
+        // discriminant `newfuncdesc` uses — every call path that lands on
+        // a memo `FunctionDesc` dispatches to `MemoDesc.pycall`'s body.
+        if self.is_memo() {
+            return self.pycall_memo(args, s_previous_result, op_key);
+        }
         // upstream: `inputcells = self.parse_arguments(args)`.
         // Option-aware inputcells thread directly through specialize /
         // unmatch_signature / recursivecall, matching `description.py:283-298`
         // pycall's "pass inputcells through" propagation.
         let mut inputcells = self.parse_arguments(args, None)?;
         // upstream: `graph = self.specialize(inputcells, op)`.
-        let graph = self.specialize(&mut inputcells, op_key.clone())?;
-        // upstream: `assert isinstance(graph, FunctionGraph)` — Rust
-        // specialize() statically returns `Rc<PyGraph>` (PyGraph is the
-        // FunctionGraph subclass upstream), so the assertion collapses.
+        // upstream: `assert isinstance(graph, FunctionGraph)`.
+        let graph = self
+            .specialize(&mut inputcells, op_key.clone())?
+            .expect_graph()?;
 
         // upstream: `new_args = args.unmatch_signature(self.signature, inputcells)`.
         let new_args = args
@@ -1912,6 +2021,59 @@ impl FunctionDesc {
             .map_err(|e| AnnotatorError::new(format!("{}.pycall unionof: {}", self.name, e)))
     }
 
+    /// RPython `MemoDesc.pycall(whence, args, s_previous_result, op=None)`
+    /// (description.py:395-404).
+    ///
+    /// ```python
+    /// def pycall(self, whence, args, s_previous_result, op=None):
+    ///     inputcells = self.parse_arguments(args)
+    ///     s_result = self.specialize(inputcells, op)
+    ///     if isinstance(s_result, FunctionGraph):
+    ///         s_result = s_result.getreturnvar().annotation
+    ///         if s_result is None:
+    ///             s_result = s_ImpossibleValue
+    ///     s_result = unionof(s_result, s_previous_result)
+    ///     return s_result
+    /// ```
+    ///
+    /// The `memo` specializer returns the annotation directly
+    /// ([`SpecializeResult::Annotation`]); the graph-producing arm
+    /// recovers the return-var annotation as upstream does. Reached from
+    /// [`Self::pycall`] when `is_memo()` and from [`MemoDesc::pycall`].
+    fn pycall_memo(
+        &self,
+        args: &ArgumentsForTranslation,
+        s_previous_result: &SomeValue,
+        op_key: Option<PositionKey>,
+    ) -> Result<SomeValue, AnnotatorError> {
+        use super::model::s_impossible_value;
+        // upstream: `inputcells = self.parse_arguments(args)`.
+        let mut inputcells = self.parse_arguments(args, None)?;
+        // upstream: `s_result = self.specialize(inputcells, op)`.
+        let s_result = match self.specialize(&mut inputcells, op_key)? {
+            // upstream: `if isinstance(s_result, FunctionGraph): s_result
+            //              = s_result.getreturnvar().annotation; if
+            //              s_result is None: s_result = s_ImpossibleValue`.
+            SpecializeResult::Graph(graph) => {
+                let returnvar = graph.graph.borrow().getreturnvar();
+                match &returnvar {
+                    crate::flowspace::model::Hlvalue::Variable(v) => v
+                        .annotation
+                        .borrow()
+                        .as_ref()
+                        .map(|rc| (**rc).clone())
+                        .unwrap_or_else(s_impossible_value),
+                    _ => s_impossible_value(),
+                }
+            }
+            // `memo` returns the union-of-results annotation directly.
+            SpecializeResult::Annotation(s) => s,
+        };
+        // upstream: `s_result = unionof(s_result, s_previous_result)`.
+        super::model::unionof([&s_result, s_previous_result])
+            .map_err(|e| AnnotatorError::new(format!("MemoDesc.pycall unionof: {}", e)))
+    }
+
     /// RPython `FunctionDesc.get_graph(args, op)` (description.py:328-330).
     pub fn get_graph(
         &self,
@@ -1919,7 +2081,7 @@ impl FunctionDesc {
         op_key: Option<PositionKey>,
     ) -> Result<Rc<PyGraph>, AnnotatorError> {
         let mut inputs_s = self.parse_arguments(args, None)?;
-        self.specialize(&mut inputs_s, op_key)
+        self.specialize(&mut inputs_s, op_key)?.expect_graph()
     }
 
     /// RPython `FunctionDesc.get_call_parameters(args_s)`
@@ -1959,10 +2121,8 @@ impl FunctionDesc {
         // upstream: `inputcells = self.parse_arguments(args)`.
         let mut inputcells = self.parse_arguments(&args, None)?;
         // upstream: `graph = self.specialize(inputcells)`.
-        let graph = self.specialize(&mut inputcells, None)?;
-        // upstream: `assert isinstance(graph, FunctionGraph)` — Rust
-        // specialize() statically returns `Rc<PyGraph>` (PyGraph is the
-        // FunctionGraph subclass upstream), so the assertion collapses.
+        // upstream: `assert isinstance(graph, FunctionGraph)`.
+        let graph = self.specialize(&mut inputcells, None)?.expect_graph()?;
 
         // upstream: `new_args = args.unmatch_signature(self.signature, inputcells)`.
         let new_args = args
@@ -2131,13 +2291,18 @@ impl FunctionDesc {
 ///
 /// Overrides `pycall` to project the specialized graph's return
 /// annotation directly instead of driving a fresh `recursivecall`.
+/// Rust has no inheritance: the "is-a FunctionDesc" relation is modelled
+/// by wrapping the shared `Rc<RefCell<FunctionDesc>>` so every
+/// non-`pycall` operation ([`DescEntry`] dispatch: `desc_key`, `pyobj`,
+/// `rowkey`, `get_graph`, `as_function`, …) delegates to the same
+/// FunctionDesc identity the plain-`Function` path would carry.
 #[derive(Debug)]
 pub struct MemoDesc {
-    pub base: FunctionDesc,
+    pub base: Rc<RefCell<FunctionDesc>>,
 }
 
 impl MemoDesc {
-    pub fn new(base: FunctionDesc) -> Self {
+    pub fn new(base: Rc<RefCell<FunctionDesc>>) -> Self {
         MemoDesc { base }
     }
 
@@ -2156,14 +2321,15 @@ impl MemoDesc {
     ///     return s_result
     /// ```
     ///
-    /// In the Rust port `specialize` always returns `Rc<PyGraph>`
-    /// (upstream's union `SomeValue | FunctionGraph` collapses because
-    /// the memoize-on-Some hook isn't ported yet — specialize.py :memo
-    /// branch). The `isinstance(s_result, FunctionGraph)` arm is the
-    /// always-taken path here.
+    /// The `memo` specializer returns the annotation directly
+    /// ([`SpecializeResult::Annotation`]); the graph-producing arm
+    /// recovers the return-var annotation as upstream does. Delegates to
+    /// the wrapped FunctionDesc, whose `pycall` routes memo specializers
+    /// to [`FunctionDesc::pycall_memo`] — the same body every other call
+    /// path (`MethodDesc`/`MethodOfFrozenDesc`) reaches.
     pub fn pycall(
         &self,
-        _whence: Option<(
+        whence: Option<(
             crate::flowspace::model::GraphRef,
             crate::flowspace::model::BlockRef,
             usize,
@@ -2172,28 +2338,9 @@ impl MemoDesc {
         s_previous_result: &SomeValue,
         op_key: Option<super::bookkeeper::PositionKey>,
     ) -> Result<SomeValue, AnnotatorError> {
-        use super::model::s_impossible_value;
-        // upstream: `inputcells = self.parse_arguments(args)`.
-        let mut inputcells = self.base.parse_arguments(args, None)?;
-        // upstream: `s_result = self.specialize(inputcells, op)`.
-        let graph = self.base.specialize(&mut inputcells, op_key)?;
-        // upstream: `if isinstance(s_result, FunctionGraph): s_result =
-        //              s_result.getreturnvar().annotation`. In Rust
-        // `specialize` always returns a PyGraph (FunctionGraph subclass),
-        // so we always take this branch.
-        let returnvar = graph.graph.borrow().getreturnvar();
-        let s_result = match &returnvar {
-            crate::flowspace::model::Hlvalue::Variable(v) => v
-                .annotation
-                .borrow()
-                .as_ref()
-                .map(|rc| (**rc).clone())
-                .unwrap_or_else(s_impossible_value),
-            _ => s_impossible_value(),
-        };
-        // upstream: `s_result = unionof(s_result, s_previous_result)`.
-        super::model::unionof([&s_result, s_previous_result])
-            .map_err(|e| AnnotatorError::new(format!("MemoDesc.pycall unionof: {}", e)))
+        self.base
+            .borrow()
+            .pycall(whence, args, s_previous_result, op_key)
     }
 }
 
@@ -2416,15 +2563,29 @@ impl MethodDesc {
         if descs.is_empty() {
             return Ok(());
         }
-        let family = descs[0].borrow().base.getcallfamily()?;
+        // `Desc.getcallfamily()` keys the partition on `self.rowkey()`,
+        // and `MethodDesc.rowkey()` returns the funcdesc (description.py:
+        // 467-471). The base `getcallfamily`/`mergecallfamilies` here key
+        // on `Desc.identity`, so route them through each MethodDesc's
+        // funcdesc — whose `identity` is exactly that rowkey. This keeps
+        // the partition keyed by funcdesc identity, matching both the
+        // calltable rows (`build_calltable_row` keys by `desc.rowkey()`)
+        // and the rtyper-side retrieval (`funcdesc.getcallfamily()`).
+        let head_funcdesc = descs[0].borrow().funcdesc.clone();
+        let family = head_funcdesc.borrow().base.getcallfamily()?;
         let mut shape = args.rawshape();
         shape.shape_cnt += 1;
         let desc_entries: Vec<DescEntry> = descs.iter().cloned().map(DescEntry::Method).collect();
         let row = build_calltable_row(&desc_entries, args, op_key)?;
         family.borrow_mut().calltable_add_row(shape, row);
-        let borrowed: Vec<_> = descs.iter().skip(1).map(|d| d.borrow()).collect();
+        let other_funcdescs: Vec<Rc<RefCell<FunctionDesc>>> = descs
+            .iter()
+            .skip(1)
+            .map(|d| d.borrow().funcdesc.clone())
+            .collect();
+        let borrowed: Vec<_> = other_funcdescs.iter().map(|d| d.borrow()).collect();
         let others: Vec<&Desc> = borrowed.iter().map(|d| &d.base).collect();
-        descs[0].borrow().base.mergecallfamilies(&others)?;
+        head_funcdesc.borrow().base.mergecallfamilies(&others)?;
         Ok(())
     }
 
@@ -2868,7 +3029,12 @@ impl MethodOfFrozenDesc {
         if descs.is_empty() {
             return Ok(());
         }
-        let family = descs[0].borrow().base.getcallfamily()?;
+        // Route through the funcdesc so the call family is keyed by
+        // `rowkey()` (the funcdesc) rather than the methoddesc's own
+        // identity — see `MethodDesc::consider_call_site` for the
+        // rationale (description.py:467-471, :636-637).
+        let head_funcdesc = descs[0].borrow().funcdesc.clone();
+        let family = head_funcdesc.borrow().base.getcallfamily()?;
         let mut shape = args.rawshape();
         shape.shape_cnt += 1;
         let desc_entries: Vec<DescEntry> = descs
@@ -2878,9 +3044,14 @@ impl MethodOfFrozenDesc {
             .collect();
         let row = build_calltable_row(&desc_entries, args, op_key)?;
         family.borrow_mut().calltable_add_row(shape, row);
-        let borrowed: Vec<_> = descs.iter().skip(1).map(|d| d.borrow()).collect();
+        let other_funcdescs: Vec<Rc<RefCell<FunctionDesc>>> = descs
+            .iter()
+            .skip(1)
+            .map(|d| d.borrow().funcdesc.clone())
+            .collect();
+        let borrowed: Vec<_> = other_funcdescs.iter().map(|d| d.borrow()).collect();
         let others: Vec<&Desc> = borrowed.iter().map(|d| &d.base).collect();
-        descs[0].borrow().base.mergecallfamilies(&others)?;
+        head_funcdesc.borrow().base.mergecallfamilies(&others)?;
         Ok(())
     }
 }
@@ -3168,9 +3339,156 @@ mod tests {
         let mut inputcells = vec![Some(SomeValue::Integer(SomeInteger::default()))];
         let graph = fd
             .specialize(&mut inputcells, None)
-            .expect("argtype specialization");
+            .expect("argtype specialization")
+            .expect_graph()
+            .unwrap();
 
         assert_eq!(graph.graph.borrow().name, "f__int");
+    }
+
+    /// Build a memo-specialised FunctionDesc whose `host_call` maps a
+    /// bool argument to an int, then drive `specialize` and assert it
+    /// returns the union-of-results annotation (specialize.py:275-312).
+    #[test]
+    fn specialize_memo_returns_union_of_host_call_results() {
+        use crate::flowspace::model::HostCall;
+        use std::sync::Arc;
+
+        let (_ann, bk) = ann_bk();
+        let mut func = compiled_graph_func("def f(x):\n    return 0\n", Vec::new());
+        // memo invokes the host call, not the flow graph: true -> 10,
+        // false -> 20.
+        func.host_call = Some(HostCall(Arc::new(|args: &[ConstValue]| {
+            match args.first() {
+                Some(ConstValue::Bool(true)) => Ok(ConstValue::Int(10)),
+                Some(ConstValue::Bool(false)) => Ok(ConstValue::Int(20)),
+                other => Err(format!("unexpected memo arg: {other:?}")),
+            }
+        })));
+        let sig = func.code.as_ref().unwrap().signature.clone();
+        let host = HostObject::new_user_function(func.clone());
+        let fd = FunctionDesc::new(bk, Some(host), "f", sig, None, Some(Specializer::Memo));
+
+        // unknown bool -> all_values = [False, True] -> two host calls.
+        let mut inputcells = vec![Some(SomeValue::Bool(super::super::model::SomeBool::new()))];
+        let result = fd
+            .specialize(&mut inputcells, None)
+            .expect("memo specialization");
+        match result {
+            SpecializeResult::Annotation(s) => {
+                // union of constant 10 and constant 20 -> non-constant int.
+                assert!(matches!(s, SomeValue::Integer(_)), "got {s:?}");
+                assert!(
+                    !s.is_constant(),
+                    "two distinct results should not be constant"
+                );
+            }
+            SpecializeResult::Graph(_) => panic!("memo must return an annotation"),
+        }
+    }
+
+    /// A memo function with no `host_call` hook cannot be evaluated at
+    /// annotation time and must report it (specialize.py:287-290 — the
+    /// `func is None` analogue).
+    #[test]
+    fn specialize_memo_without_host_call_errors() {
+        let (_ann, bk) = ann_bk();
+        let func = compiled_graph_func("def f(x):\n    return 0\n", Vec::new());
+        let sig = func.code.as_ref().unwrap().signature.clone();
+        let host = HostObject::new_user_function(func.clone());
+        let fd = FunctionDesc::new(bk, Some(host), "f", sig, None, Some(Specializer::Memo));
+
+        let mut inputcells = vec![Some(SomeValue::Bool(super::super::model::SomeBool::new()))];
+        let err = fd
+            .specialize(&mut inputcells, None)
+            .expect_err("missing host_call must error");
+        assert!(err.to_string().contains("no host_call hook"), "got {}", err);
+    }
+
+    /// A host call that fails for one possible argument surfaces as an
+    /// [`AnnotatorError`] through the family's latch — no pre-flight, the
+    /// factory's single call latches the error (specialize.py:287-290).
+    #[test]
+    fn specialize_memo_surfaces_host_call_error() {
+        use crate::flowspace::model::HostCall;
+        use std::sync::Arc;
+
+        let (_ann, bk) = ann_bk();
+        let mut func = compiled_graph_func("def f(x):\n    return 0\n", Vec::new());
+        func.host_call = Some(HostCall(Arc::new(|args: &[ConstValue]| {
+            match args.first() {
+                Some(ConstValue::Bool(false)) => Ok(ConstValue::Int(20)),
+                // the True combination raises in the memo function.
+                _ => Err("memo body raised".to_string()),
+            }
+        })));
+        let sig = func.code.as_ref().unwrap().signature.clone();
+        let host = HostObject::new_user_function(func);
+        let fd = FunctionDesc::new(bk, Some(host), "f", sig, None, Some(Specializer::Memo));
+
+        let mut inputcells = vec![Some(SomeValue::Bool(super::super::model::SomeBool::new()))];
+        let err = fd
+            .specialize(&mut inputcells, None)
+            .expect_err("host-call failure must surface");
+        assert!(
+            err.to_string().contains("host call for")
+                && err.to_string().contains("memo body raised"),
+            "got {err}"
+        );
+    }
+
+    /// `getdesc` of a `@specialize.memo` function returns a
+    /// [`DescEntry::Memo`] (upstream `newfuncdesc` `if specializer is
+    /// memo`), and its `pycall` projects the union-of-results annotation
+    /// — the path a plain `FunctionDesc::pycall` would break on with
+    /// `expect_graph()` (specialize.py:275-312, description.py:395-404).
+    #[test]
+    fn getdesc_routes_memo_function_to_memodesc_pycall() {
+        use crate::flowspace::model::HostCall;
+        use std::sync::Arc;
+
+        let (_ann, bk) = ann_bk();
+        let mut func = compiled_graph_func("def f(x):\n    return 0\n", Vec::new());
+        // mark the function `@specialize.memo` so `newfuncdesc`'s policy
+        // lookup yields `Specializer::Memo`.
+        func.annspecialcase = Some("specialize:memo".to_string());
+        func.host_call = Some(HostCall(Arc::new(|args: &[ConstValue]| {
+            match args.first() {
+                Some(ConstValue::Bool(true)) => Ok(ConstValue::Int(10)),
+                Some(ConstValue::Bool(false)) => Ok(ConstValue::Int(20)),
+                other => Err(format!("unexpected memo arg: {other:?}")),
+            }
+        })));
+        let host = HostObject::new_user_function(func);
+
+        let entry = bk.getdesc(&host).expect("getdesc");
+        assert!(
+            matches!(entry, DescEntry::Memo(_)),
+            "memo function must route to DescEntry::Memo, got {:?}",
+            entry.kind()
+        );
+        // isinstance(desc, FunctionDesc) is true for MemoDesc.
+        assert!(entry.is_function());
+        assert!(entry.as_function().is_some());
+
+        let DescEntry::Memo(md) = &entry else {
+            unreachable!()
+        };
+        // unknown bool arg -> all_values = [False, True] -> union(20, 10).
+        let args = ArgumentsForTranslation::new(
+            vec![Some(SomeValue::Bool(super::super::model::SomeBool::new()))],
+            None,
+            None,
+        );
+        let s = md
+            .borrow()
+            .pycall(None, &args, &SomeValue::Impossible, None)
+            .expect("memo pycall projects union annotation");
+        assert!(matches!(s, SomeValue::Integer(_)), "got {s:?}");
+        assert!(
+            !s.is_constant(),
+            "two distinct results must not be constant"
+        );
     }
 
     /// Build a PyGraph with a given signature/defaults for the
@@ -3488,7 +3806,11 @@ mod tests {
             None, false, flags,
         )))];
 
-        let graph = fd.specialize(&mut inputcells, None).unwrap();
+        let graph = fd
+            .specialize(&mut inputcells, None)
+            .unwrap()
+            .expect_graph()
+            .unwrap();
 
         assert!(!graph.access_directly.get());
         match &inputcells[0] {
@@ -3523,7 +3845,11 @@ mod tests {
             ]))),
         ];
 
-        let graph = fd.specialize(&mut inputcells, None).unwrap();
+        let graph = fd
+            .specialize(&mut inputcells, None)
+            .unwrap()
+            .expect_graph()
+            .unwrap();
 
         assert_eq!(
             inputcells.len(),
@@ -3563,7 +3889,9 @@ mod tests {
 
         let graph = fd
             .specialize(&mut inputcells, None)
-            .expect("arg_or_var graph");
+            .expect("arg_or_var graph")
+            .expect_graph()
+            .unwrap();
 
         assert_eq!(graph.graph.borrow().name, "f__42");
     }
@@ -3596,7 +3924,11 @@ mod tests {
         let pbc = SomePBC::new(vec![DescEntry::Function(callee)], false);
         let mut inputcells = vec![Some(SomeValue::PBC(pbc))];
 
-        let graph = fd.specialize(&mut inputcells, None).expect("arg graph");
+        let graph = fd
+            .specialize(&mut inputcells, None)
+            .expect("arg graph")
+            .expect_graph()
+            .expect("arg graph");
 
         assert_eq!(graph.graph.borrow().name, "f__callee");
     }
@@ -3607,7 +3939,7 @@ mod tests {
         // surfaces the same buildgraph error via specialize →
         // cachedgraph → buildgraph.
         let fd = FunctionDesc::new(bk(), None, "f", int_sig(&[]), None, None);
-        let md = MemoDesc::new(fd);
+        let md = MemoDesc::new(Rc::new(RefCell::new(fd)));
         let args = ArgumentsForTranslation::new(vec![], None, None);
         let err = md
             .pycall(None, &args, &SomeValue::Impossible, None)
@@ -3636,8 +3968,8 @@ mod tests {
     #[test]
     fn memodesc_wraps_functiondesc() {
         let fd = FunctionDesc::new(bk(), None, "m", int_sig(&[]), None, None);
-        let md = MemoDesc::new(fd);
-        assert_eq!(md.base.name, "m");
+        let md = MemoDesc::new(Rc::new(RefCell::new(fd)));
+        assert_eq!(md.base.borrow().name, "m");
     }
 
     // ---- MethodDesc + FrozenDesc + MethodOfFrozenDesc (commit 3) ----
@@ -4152,6 +4484,70 @@ mod tests {
     }
 
     #[test]
+    fn method_consider_call_site_partitions_by_funcdesc_rowkey() {
+        // Two MethodDescs sharing one funcdesc but bound to different
+        // classdefs must land in the SAME call-family partition — keyed
+        // by the funcdesc rowkey (description.py:467-471), not by each
+        // methoddesc's own identity. consider_call_site routes through
+        // the funcdesc's call family, so the funcdesc family carries the
+        // calltable rows from both sites; per-methoddesc keying would
+        // scatter them into two partitions and leave this one empty.
+        let (_ann, bk) = ann_bk();
+        let cd_a = crate::annotator::classdesc::ClassDef::new_standalone("pkg.A", None);
+        let cd_b = crate::annotator::classdesc::ClassDef::new_standalone("pkg.B", None);
+        bk.register_classdef(cd_a.clone());
+        bk.register_classdef(cd_b.clone());
+        let func = compiled_graph_func("def m(self):\n    return self\n", Vec::new());
+        let host = HostObject::new_user_function(func.clone());
+        let fd = Rc::new(RefCell::new(FunctionDesc::new(
+            bk.clone(),
+            Some(host),
+            "m",
+            func.code.as_ref().unwrap().signature.clone(),
+            Some(func.defaults.clone()),
+            None,
+        )));
+        let m_a = bk.getmethoddesc(
+            &fd,
+            ClassDefKey::from_classdef(&cd_a),
+            Some(ClassDefKey::from_classdef(&cd_a)),
+            "m",
+            std::collections::BTreeMap::new(),
+        );
+        let m_b = bk.getmethoddesc(
+            &fd,
+            ClassDefKey::from_classdef(&cd_b),
+            Some(ClassDefKey::from_classdef(&cd_b)),
+            "m",
+            std::collections::BTreeMap::new(),
+        );
+        // Distinct methoddescs (different classdef keys).
+        assert!(!Rc::ptr_eq(&m_a, &m_b));
+
+        let args = ArgumentsForTranslation::new(vec![], None, None);
+        MethodDesc::consider_call_site(
+            std::slice::from_ref(&m_a),
+            &args,
+            &SomeValue::Impossible,
+            None,
+        )
+        .unwrap();
+        MethodDesc::consider_call_site(
+            std::slice::from_ref(&m_b),
+            &args,
+            &SomeValue::Impossible,
+            None,
+        )
+        .unwrap();
+
+        let family = fd.borrow().base.getcallfamily().unwrap();
+        assert!(
+            !family.borrow().calltables.is_empty(),
+            "both method call sites must populate the funcdesc-keyed call family"
+        );
+    }
+
+    #[test]
     fn call_family_find_row_reuses_current_bookkeeper_position() {
         let (_ann, bk) = ann_bk();
         let func = compiled_graph_func("def f(x):\n    return x\n", Vec::new());
@@ -4203,13 +4599,17 @@ mod tests {
         bk.set_position_key(Some(PositionKey::new(1, 2, 3)));
         let graph1 = fd
             .specialize(&mut inputs1, None)
-            .expect("first call-location specialization");
+            .expect("first call-location specialization")
+            .expect_graph()
+            .unwrap();
 
         let mut inputs2 = vec![Some(SomeValue::Integer(SomeInteger::default()))];
         bk.set_position_key(Some(PositionKey::new(1, 2, 4)));
         let graph2 = fd
             .specialize(&mut inputs2, None)
-            .expect("second call-location specialization");
+            .expect("second call-location specialization")
+            .expect_graph()
+            .unwrap();
 
         assert!(!Rc::ptr_eq(&graph1, &graph2));
         assert_eq!(fd.cache.borrow().len(), 2);

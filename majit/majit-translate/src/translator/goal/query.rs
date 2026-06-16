@@ -475,15 +475,14 @@ pub fn check_methods_qgen(t: &TranslationContext) -> Vec<String> {
                             Ok(e) => e,
                             Err(_) => continue,
                         };
-                        match entry {
-                            DescEntry::Function(fd) => Some(DescKey::from_rc(&fd)),
-                            _ => None,
-                        }
+                        // `isinstance(c, FunctionDesc)` — MemoDesc is-a
+                        // FunctionDesc (description.py:395), so accept its
+                        // wrapped base via `as_function()`.
+                        entry.as_function().map(|fd| DescKey::from_rc(&fd))
                     }
-                    ClassDictEntry::Desc(entry) => match entry {
-                        DescEntry::Function(fd) => Some(DescKey::from_rc(&fd)),
-                        _ => None,
-                    },
+                    ClassDictEntry::Desc(entry) => {
+                        entry.as_function().map(|fd| DescKey::from_rc(&fd))
+                    }
                 };
                 // Upstream `:96-98`: `if isinstance(c, FunctionDesc):
                 // if c not in funcs: yield "lost method: ..."`.

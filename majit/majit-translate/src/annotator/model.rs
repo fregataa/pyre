@@ -1034,6 +1034,14 @@ fn classdef_vec_contains(v: &[Rc<RefCell<ClassDef>>], needle: &Rc<RefCell<ClassD
 pub enum DescKind {
     /// RPython `description.FunctionDesc`.
     Function,
+    /// RPython `description.MemoDesc` (subclass of `FunctionDesc`).
+    /// Upstream `getKind` keys on `desc.__class__`, so a memo PBC is a
+    /// distinct kind: mixing it with a plain `FunctionDesc` in one PBC
+    /// raises "mixing several kinds of PBCs". Every kind-driven operation
+    /// (`consider_call_site`, `simplify_desc_set`) is inherited from
+    /// `FunctionDesc`, so a homogeneous memo PBC routes through the
+    /// Function path.
+    Memo,
     /// RPython `classdesc.ClassDesc`.
     Class,
     /// RPython `description.MethodDesc`.
@@ -1245,7 +1253,16 @@ impl SomePBC {
             can_be_none,
             subset_of,
         };
-        // upstream model.py:526 — `self.simplify()`.
+        // upstream model.py:526 — `self.simplify()` (dedup +
+        // `getKind()` mixed-kind check). The constructor is infallible, so
+        // a mixed-kind error here is not propagated at construction;
+        // instead it surfaces at every use through the propagating
+        // `get_kind()?` (consider_call_site, rtyper) and eagerly in
+        // `union` (the realistic source of a heterogeneous set, which
+        // rejects e.g. Function + Memo before this point). The outcome —
+        // a mixed PBC is rejected — matches upstream; only the timing
+        // differs. `simplify_desc_set` still runs on the homogeneous
+        // (Ok) path.
         let _ = pbc.simplify();
         // upstream model.py:527-531 — `knowntype = reduce(commonbase,
         // [x.knowntype for x in descriptions])`. Full `commonbase`
@@ -1359,6 +1376,7 @@ impl SomePBC {
                     super::description::MethodDesc::simplify_desc_set(&mut self.descriptions);
                 }
                 DescKind::Function
+                | DescKind::Memo
                 | DescKind::Class
                 | DescKind::Frozen
                 | DescKind::MethodOfFrozen => {
@@ -1397,7 +1415,10 @@ impl SomePBC {
             return Ok(());
         }
         match self.get_kind()? {
-            DescKind::Function => {
+            // MemoDesc inherits FunctionDesc.consider_call_site; a
+            // homogeneous memo PBC's `as_function()` yields each wrapped
+            // base FunctionDesc.
+            DescKind::Function | DescKind::Memo => {
                 let fns: Vec<_> = descs.iter().filter_map(|d| d.as_function()).collect();
                 super::description::FunctionDesc::consider_call_site(&fns, args, s_result, op_key)?;
             }
@@ -3520,6 +3541,26 @@ mod tests {
         ))))
     }
 
+    /// Build a stub [`DescEntry::Memo`] (a MemoDesc wrapping a
+    /// FunctionDesc) for SomePBC mixed-kind tests.
+    fn fake_memo_entry(
+        bk: &Rc<super::super::bookkeeper::Bookkeeper>,
+        name: &str,
+    ) -> super::super::description::DescEntry {
+        use super::super::super::flowspace::argument::Signature;
+        use super::super::description::{DescEntry, FunctionDesc, MemoDesc};
+        use std::cell::RefCell;
+        let fd = Rc::new(RefCell::new(FunctionDesc::new(
+            bk.clone(),
+            None,
+            name,
+            Signature::new(vec![], None, None),
+            None,
+            None,
+        )));
+        DescEntry::Memo(Rc::new(RefCell::new(MemoDesc::new(fd))))
+    }
+
     /// Build a stub [`DescEntry::Class`] for SomePBC lattice tests.
     fn fake_class_entry(
         bk: &Rc<super::super::bookkeeper::Bookkeeper>,
@@ -4566,6 +4607,18 @@ mod tests {
         let bk = Rc::new(super::super::bookkeeper::Bookkeeper::new());
         let a = SomeValue::PBC(SomePBC::new(vec![fake_function_entry(&bk, "f")], false));
         let b = SomeValue::PBC(SomePBC::new(vec![fake_class_entry(&bk, "C")], false));
+        assert!(union(&a, &b).is_err());
+    }
+
+    #[test]
+    fn union_pbc_function_memo_mixed_errors() {
+        // MemoDesc is a distinct DescKind::Memo, so a FunctionDesc PBC
+        // unioned with a MemoDesc PBC is a mixed-kind set and must be
+        // rejected — matching upstream where FunctionDesc + MemoDesc are
+        // different classes (model.py:558 getKind).
+        let bk = Rc::new(super::super::bookkeeper::Bookkeeper::new());
+        let a = SomeValue::PBC(SomePBC::new(vec![fake_function_entry(&bk, "f")], false));
+        let b = SomeValue::PBC(SomePBC::new(vec![fake_memo_entry(&bk, "g")], false));
         assert!(union(&a, &b).is_err());
     }
 

@@ -49,6 +49,14 @@ fn render_desc_repr(desc: &crate::annotator::description::DescEntry) -> String {
                 None => "<FunctionDesc>".into(),
             }
         }
+        DescEntry::Memo(md) => {
+            let base = md.borrow();
+            let fd = base.base.borrow();
+            match &fd.base.pyobj {
+                Some(pyobj) => format!("<MemoDesc for {:?}>", pyobj),
+                None => "<MemoDesc>".into(),
+            }
+        }
         DescEntry::Frozen(fd) => {
             let fd = fd.borrow();
             match &fd.base.pyobj {

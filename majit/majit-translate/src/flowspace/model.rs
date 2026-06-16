@@ -3679,6 +3679,22 @@ impl BlockRefExt for BlockRef {
     }
 }
 
+/// Native call hook carried by a memo-specialised [`GraphFunc`].
+///
+/// Wraps an `Arc<dyn Fn(&[ConstValue]) -> Result<ConstValue, String>>`
+/// so [`GraphFunc`] can stay `Clone`; a manual [`std::fmt::Debug`] keeps
+/// the `#[derive(Debug)]` on `GraphFunc` valid since `dyn Fn` is not
+/// `Debug`. Equality/identity of `GraphFunc` is `id`-based and ignores
+/// this field.
+#[derive(Clone)]
+pub struct HostCall(pub Arc<dyn Fn(&[ConstValue]) -> Result<ConstValue, String> + Send + Sync>);
+
+impl std::fmt::Debug for HostCall {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HostCall(..)")
+    }
+}
+
 /// Stand-in for the Python function object attached to
 /// `FunctionGraph.func`.
 #[derive(Clone, Debug)]
@@ -3694,6 +3710,16 @@ pub struct GraphFunc {
     /// Upstream `func._annspecialcase_` decorator tag consulted by
     /// `Bookkeeper.newfuncdesc()` when selecting a specializer.
     pub annspecialcase: Option<String>,
+    /// Annotation-time native call hook, the pyre stand-in for
+    /// `funcdesc.pyobj(*args)` in `rpython/annotator/specialize.py`'s
+    /// `memo`. RPython invokes the live Python callable directly;
+    /// pyre's analysed program is Rust, so a memo-specialised function
+    /// carries its native closure here — populated from the build-time
+    /// linkage to pyre-interpreter (or by a test). The currency is
+    /// [`ConstValue`], matching `all_values` output and
+    /// `Bookkeeper.immutablevalue` input. `None` for ordinary
+    /// functions, which never reach the memo path.
+    pub host_call: Option<HostCall>,
     /// Upstream generator helper attribute populated by
     /// `attach_next_method()`.
     pub _generator_next_method_of_: Option<HostObject>,
@@ -3833,6 +3859,7 @@ impl GraphFunc {
             _sandbox_external_name: None,
             class_: None,
             annspecialcase: None,
+            host_call: None,
             _generator_next_method_of_: None,
             _jit_look_inside_: None,
             relax_sig_check: None,

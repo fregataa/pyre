@@ -1080,8 +1080,9 @@ impl ClassDesc {
                     let bk = this.borrow().bookkeeper.upgrade().ok_or_else(|| {
                         AnnotatorError::new("ClassDesc.add_source_attribute: bookkeeper dropped")
                     })?;
-                    let funcdesc = bk.newfuncdesc(host)?;
-                    let entry = super::description::DescEntry::Function(funcdesc);
+                    // upstream `newfuncdesc` returns a MemoDesc or
+                    // FunctionDesc DescEntry per the specializer.
+                    let entry = bk.newfuncdesc(host)?;
                     this.borrow_mut()
                         .classdict
                         .insert(name.to_string(), ClassDictEntry::Desc(entry));
@@ -1768,6 +1769,34 @@ impl ClassDesc {
 
     /// RPython `ClassDesc.find_source_for(self, name)` (classdesc.py:808-817).
     ///
+    /// RPython `ClassDesc.create_new_attribute(name, value)`
+    /// (classdesc.py:804-806).
+    ///
+    /// ```python
+    /// def create_new_attribute(self, name, value):
+    ///     assert name not in self.classdict, "name clash: %r" % (name,)
+    ///     self.classdict[name] = Constant(value)
+    /// ```
+    ///
+    /// Used by `MemoTable.finish` to seed the per-PBC memo field when a
+    /// memo argument set is made of classes (mirror of
+    /// [`super::description::FrozenDesc::create_new_attribute`] for the
+    /// frozen-PBC case).
+    pub fn create_new_attribute(
+        &mut self,
+        name: impl Into<String>,
+        value: ConstValue,
+    ) -> Result<(), AnnotatorError> {
+        let name = name.into();
+        // upstream: `assert name not in self.classdict, "name clash"`.
+        if self.classdict.contains_key(&name) {
+            return Err(AnnotatorError::new(format!("name clash: {name:?}")));
+        }
+        // upstream: `self.classdict[name] = Constant(value)`.
+        self.classdict.insert(name, ClassDictEntry::constant(value));
+        Ok(())
+    }
+
     /// ```python
     /// def find_source_for(self, name):
     ///     if name in self.classdict:
@@ -2043,12 +2072,15 @@ impl ClassDesc {
             let Some(entry) = pbc.descriptions.values().next() else {
                 continue;
             };
-            let super::description::DescEntry::Function(initfuncdesc) = entry else {
+            // upstream `isinstance(initfuncdesc, FunctionDesc)` — MemoDesc
+            // is-a FunctionDesc (description.py:395), so `as_function()`
+            // accepts a `@specialize.memo` __init__ as well.
+            let Some(initfuncdesc) = entry.as_function() else {
                 continue;
             };
             let classdef_key = super::description::ClassDefKey::from_classdef(classdef);
             let initmethdesc = bk.getmethoddesc(
-                initfuncdesc,
+                &initfuncdesc,
                 classdef_key,
                 Some(classdef_key),
                 "__init__",
@@ -2062,14 +2094,20 @@ impl ClassDesc {
         //       initdescs[0].mergecallfamilies(*initdescs[1:])
         //       MethodDesc.consider_call_site(initdescs, args, s_None, op)
         if !initdescs.is_empty() {
-            let head_entry = super::description::DescEntry::Method(initdescs[0].clone());
-            let borrowed: Vec<_> = initdescs.iter().skip(1).map(|d| d.borrow()).collect();
+            // `MethodDesc.mergecallfamilies` keys on `self.rowkey()` (the
+            // funcdesc, description.py:467-471), so route through each
+            // initdesc's funcdesc whose `identity` is that rowkey.
+            // MethodDesc::consider_call_site redoes this internally, but
+            // upstream calls both explicitly.
+            let head_funcdesc = initdescs[0].borrow().funcdesc.clone();
+            let other_funcdescs: Vec<_> = initdescs
+                .iter()
+                .skip(1)
+                .map(|d| d.borrow().funcdesc.clone())
+                .collect();
+            let borrowed: Vec<_> = other_funcdescs.iter().map(|d| d.borrow()).collect();
             let others: Vec<&super::description::Desc> = borrowed.iter().map(|d| &d.base).collect();
-            // Route the mergecallfamilies through the head MethodDesc's
-            // Desc base — MethodDesc::consider_call_site will redo this
-            // internally, but upstream calls both explicitly.
-            let _ = head_entry;
-            initdescs[0].borrow().base.mergecallfamilies(&others)?;
+            head_funcdesc.borrow().base.mergecallfamilies(&others)?;
             let s_none = SomeValue::None_(super::model::SomeNone::new());
             super::description::MethodDesc::consider_call_site(&initdescs, args, &s_none, op_key)?;
         }

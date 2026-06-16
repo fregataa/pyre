@@ -41,4 +41,5 @@ pub mod listdef;
 pub mod model;
 pub mod policy;
 pub mod signature;
+pub mod specialize;
 pub mod unaryop;

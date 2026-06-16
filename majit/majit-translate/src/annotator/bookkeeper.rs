@@ -253,8 +253,22 @@ pub struct Bookkeeper {
     ///
     /// List of callbacks drained by
     /// `AnnotatorPolicy.no_more_blocks_to_annotate` before the final
-    /// annotation fixpoint.
-    pub pending_specializations: RefCell<Vec<Box<dyn Fn()>>>,
+    /// annotation fixpoint. Each callback (e.g. `MemoTable.finish`) is
+    /// fallible; upstream lets the exception propagate, so the drain
+    /// surfaces the first `Err` instead of swallowing or panicking on it.
+    pub pending_specializations: RefCell<Vec<Box<dyn Fn() -> Result<(), AnnotatorError>>>>,
+    /// RPython `self.all_specializations = {}` (bookkeeper.py:68).
+    ///
+    /// One entry per memo-specialised function, keyed by the funcdesc's
+    /// pointer identity (upstream keys by the `funcdesc` object itself,
+    /// specialize.py:285). Each value is the
+    /// `UnionFind(compute_one_result)` upstream uses (specialize.py:298) —
+    /// the families of argument tuples that can be called together, merged
+    /// on `union`, with each result living in its
+    /// [`super::specialize::MemoTable`]'s `table` — paired with a per-
+    /// family host-call error latch (see [`super::specialize::MemoFamily`]).
+    /// Consumed by [`super::specialize::memo`].
+    pub all_specializations: RefCell<HashMap<usize, super::specialize::MemoFamily>>,
     /// RPython `hasattr(self, 'position_key')` (bookkeeper.py:99).
     ///
     /// Upstream distinguishes "no position entered" (attribute absent)
@@ -515,6 +529,7 @@ impl Bookkeeper {
             _jit_annotation_cache: RefCell::new(HashMap::new()),
             immutable_cache: RefCell::new(HashMap::new()),
             pending_specializations: RefCell::new(Vec::new()),
+            all_specializations: RefCell::new(HashMap::new()),
             position_entered: std::cell::Cell::new(false),
             needs_generic_instantiate: RefCell::new(std::collections::BTreeMap::new()),
             pyre_struct_fields: RefCell::new(None),
@@ -1110,7 +1125,9 @@ impl Bookkeeper {
             return Ok(existing.clone());
         }
         let entry = if pyobj.is_user_function() {
-            DescEntry::Function(self.newfuncdesc(pyobj)?)
+            // upstream `newfuncdesc` already returns a MemoDesc or
+            // FunctionDesc per the specializer.
+            self.newfuncdesc(pyobj)?
         } else if pyobj.is_class() {
             // upstream bookkeeper.py:367-373 — pyobj is `object` check
             // raises, and `__builtin__` module check routes to
@@ -1197,15 +1214,11 @@ impl Bookkeeper {
     ///
     /// Rust port: pull signature / defaults from the HostObject's
     /// [`crate::flowspace::model::GraphFunc`], and request a
-    /// specializer from `AnnotatorPolicy.get_specializer(tag)` once
-    /// the policy backlink is wired (annrpython.py c1 dep). For now
-    /// the specializer is `None`, matching upstream's `tag = None →
-    /// default_specialize` path. The `MemoDesc` branch
-    /// (bookkeeper.py:424-425) lands with specialize.py.
-    pub fn newfuncdesc(
-        self: &Rc<Self>,
-        pyfunc: &HostObject,
-    ) -> Result<Rc<RefCell<FunctionDesc>>, AnnotatorError> {
+    /// specializer from `AnnotatorPolicy.get_specializer(tag)`. When the
+    /// specializer is `memo`, return a [`DescEntry::Memo`] wrapping the
+    /// `FunctionDesc` (upstream `if specializer is memo: return MemoDesc(
+    /// ...)`, bookkeeper.py:419-425); otherwise a [`DescEntry::Function`].
+    pub fn newfuncdesc(self: &Rc<Self>, pyfunc: &HostObject) -> Result<DescEntry, AnnotatorError> {
         let gf = pyfunc.user_function().ok_or_else(|| {
             AnnotatorError::new(format!(
                 "newfuncdesc({:?}) called on non-user-function HostObject",
@@ -1245,15 +1258,23 @@ impl Bookkeeper {
                 .get_specializer(gf.annspecialcase.as_deref())
                 .map_err(|e| AnnotatorError::new(e.to_string()))?,
         };
-        let fd = FunctionDesc::new(
+        let fd = Rc::new(RefCell::new(FunctionDesc::new(
             self.clone(),
             Some(pyfunc.clone()),
             name,
             signature,
             defaults,
             Some(specializer),
-        );
-        Ok(Rc::new(RefCell::new(fd)))
+        )));
+        // upstream: `if specializer is memo: return MemoDesc(...) else:
+        // return FunctionDesc(...)`.
+        if fd.borrow().is_memo() {
+            Ok(DescEntry::Memo(Rc::new(RefCell::new(
+                super::description::MemoDesc::new(fd),
+            ))))
+        } else {
+            Ok(DescEntry::Function(fd))
+        }
     }
 
     /// RPython `Bookkeeper.getfrozen(pyobj)` (bookkeeper.py:428-429).
@@ -2254,6 +2275,12 @@ impl Bookkeeper {
             let r = match entry {
                 super::description::DescEntry::Function(fd) => {
                     fd.borrow()
+                        .pycall(whence.clone(), args, &s_previous_result, op_key.clone())?
+                }
+                // upstream `MemoDesc.pycall` projects the union-of-results
+                // annotation (or the dispatch graph's return var).
+                super::description::DescEntry::Memo(md) => {
+                    md.borrow()
                         .pycall(whence.clone(), args, &s_previous_result, op_key.clone())?
                 }
                 super::description::DescEntry::Method(md) => {

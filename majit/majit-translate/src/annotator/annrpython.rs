@@ -1233,7 +1233,7 @@ impl RPythonAnnotator {
         loop {
             self.complete_pending_blocks()?;
             // upstream: `self.policy.no_more_blocks_to_annotate(self)`.
-            self.policy.borrow().no_more_blocks_to_annotate(self);
+            self.policy.borrow().no_more_blocks_to_annotate(self)?;
             let any_pending = self.genpendingblocks.borrow().iter().any(|d| !d.is_empty());
             if !any_pending {
                 break;

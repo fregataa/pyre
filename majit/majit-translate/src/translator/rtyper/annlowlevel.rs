@@ -390,8 +390,11 @@ impl PolicyOps for LowLevelAnnotatorPolicy {
         }
     }
 
-    fn no_more_blocks_to_annotate(&self, ann: &RPythonAnnotator) {
-        self.base.no_more_blocks_to_annotate(ann);
+    fn no_more_blocks_to_annotate(
+        &self,
+        ann: &RPythonAnnotator,
+    ) -> Result<(), crate::annotator::model::AnnotatorError> {
+        self.base.no_more_blocks_to_annotate(ann)
     }
 }
 
@@ -580,8 +583,11 @@ impl PolicyOps for MixLevelAnnotatorPolicy {
         }
     }
 
-    fn no_more_blocks_to_annotate(&self, ann: &RPythonAnnotator) {
-        self.ll.base.no_more_blocks_to_annotate(ann);
+    fn no_more_blocks_to_annotate(
+        &self,
+        ann: &RPythonAnnotator,
+    ) -> Result<(), crate::annotator::model::AnnotatorError> {
+        self.ll.base.no_more_blocks_to_annotate(ann)
     }
 }
 
