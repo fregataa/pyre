@@ -1585,6 +1585,39 @@ impl Bookkeeper {
         self.getuniqueclassdef(&host)
     }
 
+    /// Resolve the subclass `ClassDef` for one variant of a Rust enum —
+    /// a subclass of the enum's flat-union base. Composes the canonical
+    /// interning primitives rather than minting a parallel enum-class
+    /// registry: the base is the struct-root `ClassDef`
+    /// ([`Self::getuniqueclassdef_for_struct_root`]); the variant is
+    /// interned with that base as its sole `__bases__`
+    /// ([`Self::intern_class_by_qualname_with_bases`]), so the resulting
+    /// `ClassDef.basedef` chains through the base. That makes
+    /// `commonbase(base, variant) == base`, which is exactly what
+    /// `pairtype(SomeInstance, SomeInstance).improve` (binaryop.py:685)
+    /// needs to narrow a `SomeInstance(base)` to `SomeInstance(variant)`.
+    /// Identity is the canonical struct-root cache keyed by
+    /// `canonical_struct_name`; both `enum_root` and the `enum_root::variant`
+    /// path normalise to one stable `HostObject` apiece, so repeated
+    /// calls return the same `Rc`.
+    pub fn getuniqueclassdef_for_enum_variant(
+        self: &Rc<Self>,
+        enum_root: &str,
+        variant_name: &str,
+    ) -> Result<Rc<RefCell<ClassDef>>, AnnotatorError> {
+        // Base first — registers the flat-union root and publishes its
+        // identity-keyed HostObject in the struct-root cache.
+        self.getuniqueclassdef_for_struct_root(enum_root)?;
+        let canon_root = majit_ir::descr::canonical_struct_name(enum_root);
+        let base_host = self.intern_class_by_qualname(&canon_root);
+        // Variant subclass — interned WITH the base so ClassDesc::new
+        // wires basedef. Must precede any plain intern of this path
+        // (intern_*_with_bases returns the first-minted class verbatim).
+        let variant_path = format!("{canon_root}::{variant_name}");
+        let variant_host = self.intern_class_by_qualname_with_bases(&variant_path, vec![base_host]);
+        self.getuniqueclassdef(&variant_host)
+    }
+
     /// Project one struct's registry rows into its `ClassDef.attrs`
     /// — the pass-2 body of [`Self::getuniqueclassdef_for_struct_root`].
     fn project_struct_rows(self: &Rc<Self>, n: &str) -> Result<(), AnnotatorError> {
@@ -3317,6 +3350,73 @@ mod tests {
                 .is_some_and(|c| Rc::ptr_eq(c, &inner)),
             "PyFrame.pycode inner classdef must be the same Rc as the standalone PyCode lookup"
         );
+    }
+
+    #[test]
+    fn getuniqueclassdef_for_enum_variant_subclasses_the_flat_union_base() {
+        use crate::annotator::model::{SomeInstance, SomeValue};
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        // Flat-union base: __discriminant + the union of variant payloads.
+        reg.fields.insert(
+            "Color".to_string(),
+            vec![
+                ("__discriminant".to_string(), "i64".to_string()),
+                ("rgb".to_string(), "i64".to_string()),
+            ],
+        );
+        bk.set_pyre_struct_fields(Rc::new(reg));
+
+        let base = bk
+            .getuniqueclassdef_for_struct_root("Color")
+            .expect("base registers");
+        let variant = bk
+            .getuniqueclassdef_for_enum_variant("Color", "Rgb")
+            .expect("variant registers");
+
+        // The variant is a subclass of the base — its basedef chain
+        // reaches the base, so commonbase(base, variant) == base.
+        assert!(
+            variant.borrow().issubclass(&base),
+            "variant ClassDef must be a subclass of the flat-union base"
+        );
+        let common = crate::annotator::classdesc::ClassDef::commonbase(&base, &variant)
+            .expect("commonbase exists");
+        assert!(
+            Rc::ptr_eq(&common, &base),
+            "commonbase(base, variant) must be the base"
+        );
+
+        // Identity: a second call returns the same Rc (canonical cache).
+        let variant2 = bk
+            .getuniqueclassdef_for_enum_variant("Color", "Rgb")
+            .expect("variant re-lookup");
+        assert!(Rc::ptr_eq(&variant, &variant2), "variant identity stable");
+
+        // The payoff: improve() narrows SomeInstance(base) to
+        // SomeInstance(variant) given the variant as the refinement —
+        // exactly what the discriminant-keyed knowntypedata will feed it.
+        let s_base = SomeValue::Instance(SomeInstance::new(
+            Some(base.clone()),
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        let s_variant = SomeValue::Instance(SomeInstance::new(
+            Some(variant.clone()),
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        let narrowed = crate::annotator::binaryop::improve(&s_base, &s_variant);
+        match narrowed {
+            SomeValue::Instance(si) => assert!(
+                si.classdef
+                    .as_ref()
+                    .is_some_and(|c| Rc::ptr_eq(c, &variant)),
+                "improve(base, variant) narrows to the variant classdef"
+            ),
+            other => panic!("expected SomeInstance(variant), got {other:?}"),
+        }
     }
 
     #[test]
