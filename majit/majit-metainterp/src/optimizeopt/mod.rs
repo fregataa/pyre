@@ -2354,7 +2354,10 @@ impl OptContext {
             // vstring.py:286-293
             let left_len = self.getstrlen_for(vleft, vleft, mode);
             let right_len = self.getstrlen_for(vright, vright, mode);
-            let result = crate::optimizeopt::vstring::_int_add(left_len, right_len, self);
+            let left_len = self.materialize_box_at(left_len);
+            let right_len = self.materialize_box_at(right_len);
+            let result =
+                crate::optimizeopt::vstring::_int_add(&left_len, &right_len, self).to_opref();
             // vstring.py:293: self.lgtop = _int_add(optstring, len1box, len2box)
             if let Some(b) = self.get_box_replacement_box(info_opref) {
                 self.set_str_lgtop(&b, result);
@@ -2565,7 +2568,23 @@ impl OptContext {
     ///
     /// If the op has no pos assigned (NONE), sets it to `num_inputs + idx`
     /// so the backend's variable numbering stays consistent.
-    pub fn emit(&mut self, mut op: Op) -> OpRef {
+    pub fn emit(&mut self, op: Op) -> OpRef {
+        self.emit_impl(op, false)
+    }
+
+    /// `emit` variant that REUSES the recorder input op (the `live_synthetics`
+    /// entry at this position) as the emitted producer instead of cloning into
+    /// a fresh `Rc<Op>`. The input op is the object later ops' operands already
+    /// wrap; making it the producer collapses the two-Op-per-position
+    /// duplication that the `live_synthetics` catch-up otherwise bridges by
+    /// copying `_forwarded` and linking input -> clone. One box per value, the
+    /// op IS the box (resoperation.py:233). Falls back to the clone path when
+    /// no structurally-matching input op is live at this position.
+    pub(crate) fn emit_reusing(&mut self, op: Op) -> OpRef {
+        self.emit_impl(op, true)
+    }
+
+    fn emit_impl(&mut self, mut op: Op, reuse: bool) -> OpRef {
         if op.pos.get().is_none() || op.pos.get().is_constant() {
             // Tag the freshly allocated position with the producer op's
             // result type so the variant-tag readers
@@ -2684,6 +2703,35 @@ impl OptContext {
         // `debug_assert_box_type_invariant` below.
         Self::debug_assert_box_type_invariant(&op);
         let op_pos = op.pos.get();
+        // Reuse path: when an unchanged op flows through to final emission, reuse
+        // the recorder input op (the `live_synthetics` entry at this position) as
+        // the emitted producer rather than cloning. The input op is what later
+        // ops' operands already wrap, and the passes already wrote its
+        // `_forwarded` host via `find_producer_op`, so overwriting its args with
+        // the resolved operands and copying the descr makes it the single box per
+        // value (resoperation.py:233 the op IS the box). This is the structural
+        // collapse the clone path's catch-up only approximates by copying
+        // `_forwarded` onto a fresh clone and redirecting input -> clone.
+        // Guards are excluded (the guard path mutates `op` in emit_guard_operation
+        // before reaching here). The opcode/num_args match guards against reusing
+        // a non-matching stand-in; on any mismatch we fall through to the clone
+        // path below, which is always correct.
+        if reuse && !op.opcode.is_guard() {
+            if let Some(i) = self.live_synthetics.iter().position(|s| {
+                s.pos.get() == op_pos && s.opcode == op.opcode && s.num_args() == op.num_args()
+            }) {
+                let reused = self.live_synthetics.swap_remove(i);
+                for k in 0..op.num_args() {
+                    reused.setarg(k, op.arg(k));
+                }
+                match op.getdescr() {
+                    Some(d) => reused.setdescr(d),
+                    None => reused.cleardescr(),
+                }
+                self.new_operations.push(reused);
+                return op_pos;
+            }
+        }
         let op_rc = std::rc::Rc::new(op);
         // Catch up any BoxRef placeholder that `materialize_box_at` created for
         // `op_pos` ahead of this emit (forward-reference path).

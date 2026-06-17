@@ -228,9 +228,15 @@ impl StrPtrInfoExt for StrPtrInfo {
                 let mut chars = Vec::with_capacity(info._chars.len());
                 for ch in &info._chars {
                     let ch_box = ch.as_ref()?;
-                    // vstring.py:179: `c.is_constant()` for Plain strings
-                    // accepts only an actual ConstInt, not a synthesized
-                    // ConstInt from a constant IntBound.
+                    // vstring.py:179-180: `if c is None or not c.is_constant()`.
+                    // RPython stores the resolved char box in `_chars`, so a
+                    // bare `c.is_constant()` suffices. Pyre stores the operand's
+                    // position box (which forwards to its Const), so resolving
+                    // the chain first is the faithful equivalent of RPython's
+                    // direct check. `const_int()` (not `get_constant_int_box`)
+                    // keeps parity strict: a Const terminal folds, a box with
+                    // only a constant IntBound does NOT (no synthesized
+                    // ConstInt).
                     chars.push(
                         ctx.resolve_box_box_opt(ch_box)
                             .and_then(|cb| cb.const_int())?,
@@ -800,7 +806,17 @@ impl PtrInfoExt for PtrInfo {
                 .and_then(|cb| cb.const_value())
                 .is_none()
             {
-                // Check if it's a virtual that is also immutable+constant
+                // Check if it's a virtual that is also immutable+constant.
+                // info.py:282-303 threads a `memo` keyed on the receiver info
+                // (`if self in memo: return True`) to break recursion on a
+                // cyclic immutable virtual (A.field -> B, B.field -> A). pyre
+                // omits the memo: a JIT-created virtual cannot close such a
+                // cycle, since immutable fields are written by SETFIELD in
+                // construction order and the second box does not exist when the
+                // first is sealed. Convergence path if a prebuilt cyclic
+                // immutable virtual ever reaches here: thread a
+                // `memo: &mut Vec<BoxRef>` keyed on the receiver box (BoxRef
+                // Rc-identity) mirroring info.py:282-284.
                 if let Some(info) = resolved_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
                     if info.is_virtual() && info.is_immutable_and_filled_with_constants(ctx) {
                         continue;
@@ -866,6 +882,31 @@ fn force_box_impl(
     // RPython info.py:140-145: immutable virtual filled with constants
     // → constant fold to a compile-time constant pointer.
     if self_.is_immutable_and_filled_with_constants(ctx) {
+        // info.py:305-311 _force_elements_immutable: `subbox =
+        // optimizer.force_box(fld)` materializes EACH field — including a
+        // nested immutable virtual — into a Const before the parent's slots
+        // are written. `is_immutable_and_filled_with_constants` guarantees a
+        // non-Const field is itself an immutable virtual filled with
+        // constants, so `force_child` recurses through this same fold and
+        // const-folds it (no SETFIELD ops emitted). Run before borrowing
+        // `constant_fold_alloc` (force_child needs `&mut ctx`); a field that
+        // already resolves to a Const is left untouched.
+        if ctx.constant_fold_alloc.is_some() {
+            let field_boxes: Vec<BoxRef> = match self_ {
+                PtrInfo::Virtual(v) => v.fields.iter().map(|(_, r)| r.clone()).collect(),
+                PtrInfo::VirtualStruct(v) => v.fields.iter().map(|(_, r)| r.clone()).collect(),
+                _ => Vec::new(),
+            };
+            for fb in field_boxes {
+                if ctx
+                    .resolve_box_box_opt(&fb)
+                    .and_then(|b| b.const_value())
+                    .is_none()
+                {
+                    force_child(fb.to_opref(), ctx);
+                }
+            }
+        }
         if let Some(ref alloc_fn) = ctx.constant_fold_alloc {
             let field_descrs = &cached_fielddescrs;
             let (descr, fields) = match self_ {
@@ -1281,7 +1322,9 @@ fn force_box_impl(
                 VStringVariant::Concat(info) => {
                     let left_len = ctx.getstrlen_opref(info.vleft.to_opref(), mode);
                     let right_len = ctx.getstrlen_opref(info.vright.to_opref(), mode);
-                    crate::optimizeopt::vstring::_int_add(left_len, right_len, ctx)
+                    let left_len = ctx.materialize_box_at(left_len);
+                    let right_len = ctx.materialize_box_at(right_len);
+                    crate::optimizeopt::vstring::_int_add(&left_len, &right_len, ctx).to_opref()
                 }
                 VStringVariant::Ptr => unreachable!(),
             };
@@ -1330,8 +1373,9 @@ fn force_box_impl(
             match variant {
                 VStringVariant::Plain(info) => {
                     // vstring.py:194-205 VStringPlainInfo.initialize_forced_string
-                    let mut offset = zero;
+                    let mut offset = ctx.materialize_box_at(zero);
                     let one = ctx.emit_constant_int(1);
+                    let one = ctx.materialize_box_at(one);
                     for ch in &info._chars {
                         if let Some(ch_ref) = ch {
                             let ch_ref = ch_ref.to_opref();
@@ -1340,40 +1384,44 @@ fn force_box_impl(
                                 .map(|b| b.to_opref())
                                 .unwrap_or(ch_ref);
                             let arg_newop = ctx.materialize_box_at(newop);
-                            let arg_offset = ctx.materialize_box_at(offset);
+                            let arg_offset = ctx.resolve_box_box(&offset);
                             let arg_ch = ctx.materialize_box_at(ch_resolved);
                             let setitem_op = Op::new(set_opcode, &[arg_newop, arg_offset, arg_ch]);
                             emit_op(ctx, setitem_op);
                         }
-                        offset = crate::optimizeopt::vstring::_int_add(offset, one, ctx);
+                        offset = crate::optimizeopt::vstring::_int_add(&offset, &one, ctx);
                     }
                 }
                 VStringVariant::Concat(info) => {
                     // vstring.py:309-317 VStringConcatInfo.string_copy_parts
+                    let newop_box = ctx.materialize_box_at(newop);
+                    let zero_box = ctx.materialize_box_at(zero);
                     let offset = crate::optimizeopt::vstring::string_copy_parts(
-                        info.vleft.to_opref(),
-                        newop,
-                        zero,
+                        &info.vleft,
+                        &newop_box,
+                        &zero_box,
                         mode,
                         ctx,
                     );
                     crate::optimizeopt::vstring::string_copy_parts(
-                        info.vright.to_opref(),
-                        newop,
-                        offset,
+                        &info.vright,
+                        &newop_box,
+                        &offset,
                         mode,
                         ctx,
                     );
                 }
                 VStringVariant::Slice(info) => {
                     // vstring.py:230-233 VStringSliceInfo.string_copy_parts
+                    let newop_box = ctx.materialize_box_at(newop);
+                    let zero_box = ctx.materialize_box_at(zero);
                     crate::optimizeopt::vstring::copy_str_content(
                         ctx,
-                        info.s.to_opref(),
-                        newop,
-                        info.start.to_opref(),
-                        zero,
-                        info.lgtop.to_opref(),
+                        &info.s,
+                        &newop_box,
+                        &info.start,
+                        &zero_box,
+                        &info.lgtop,
                         mode,
                         true,
                     );

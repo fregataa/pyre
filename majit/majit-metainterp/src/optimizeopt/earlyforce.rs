@@ -81,24 +81,31 @@ impl Optimization for OptEarlyForce {
                     .as_ref()
                     .map(|b| b.to_opref())
                     .unwrap_or_else(|| op.arg(i).to_opref());
+                // optimizer.py:354-362: force_box pops the arg's
+                // potential_extra_op and hands it to the short-preamble
+                // producer BEFORE (and independent of) the virtual check, so a
+                // non-virtual short-box arg is added to the preamble too.
+                // `take_potential_extra_op` is a no-op when not unrolling or
+                // when no extra op is queued for this arg.
+                if let Some(tracked) = ctx.take_potential_extra_op(arg) {
+                    // shortpreamble.py:434: the resolved Box is handed
+                    // to the builder; fall back to the operand's own box.
+                    let arg_b = arg_box.clone().unwrap_or_else(|| op.arg(i));
+                    if let Some(builder) = ctx.active_short_preamble_producer_mut() {
+                        builder.add_preamble_op_from_pop(&tracked, arg_b);
+                    } else if let Some(builder) = ctx.imported_short_preamble_builder.as_mut() {
+                        builder.add_preamble_op_from_pop(&tracked, arg_b);
+                    }
+                }
+                // optimizer.py:363-366: if the arg carries a virtual PtrInfo,
+                // force it into the trace.
                 let arg_is_virtual = arg_box.as_ref().map_or(false, |b| ctx.is_virtual(b));
                 if arg_is_virtual {
-                    // optimizer.py:345-364: force_box path.
-                    // potential_extra_ops are handled by Optimizer.force_box,
-                    // but earlyforce only needs the virtual materialization.
-                    if let Some(tracked) = ctx.take_potential_extra_op(arg) {
-                        // shortpreamble.py:434: the resolved Box is handed
-                        // to the builder; fall back to the operand's own box.
-                        let arg_b = arg_box.clone().unwrap_or_else(|| op.arg(i));
-                        if let Some(builder) = ctx.active_short_preamble_producer_mut() {
-                            builder.add_preamble_op_from_pop(&tracked, arg_b);
-                        } else if let Some(builder) = ctx.imported_short_preamble_builder.as_mut() {
-                            builder.add_preamble_op_from_pop(&tracked, arg_b);
-                        }
-                    }
-                    let arg_box = ctx
-                        .get_box_replacement_box(arg)
-                        .expect("recorder-populated");
+                    // `arg_box` is the box-native resolution of `op.arg(i)`
+                    // (resolve_box_box_opt), already a chain terminal, and
+                    // `arg_is_virtual` is only set when it is `Some` and virtual,
+                    // so re-walking its OpRef would return the same info-host.
+                    let arg_box = arg_box.expect("arg_is_virtual implies a resolved box");
                     let mut info = ctx.take_ptr_info(&arg_box).unwrap();
                     let _forced = info.force_box(arg_box, ctx);
                 }

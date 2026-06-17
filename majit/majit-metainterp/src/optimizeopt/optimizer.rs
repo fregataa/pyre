@@ -4001,6 +4001,13 @@ impl Optimizer {
         // order — matching RPython's OptimizationResult.callback() chain.
         let mut postprocess_passes: Vec<usize> = Vec::new();
 
+        // Track whether any pass replaced the op. Only the untouched
+        // pass-through reaches final emission structurally identical to the
+        // recorder input op, so only then may emit reuse that input op as the
+        // producer (one box per value); a Replace mints a distinct op that is
+        // not the operand-wrapped input op.
+        let mut replaced = false;
+
         for pass_idx in start_pass..end_pass {
             ctx.current_pass_idx = pass_idx;
             let result = {
@@ -4015,7 +4022,7 @@ impl Optimizer {
                     if self.passes[pass_idx].have_postprocess_op(op.opcode) {
                         postprocess_passes.push(pass_idx);
                     }
-                    self.emit_operation(op.clone(), ctx);
+                    self.emit_operation(op.clone(), ctx, false);
                     // optimizer.py:585-589: invoke postprocess callbacks
                     // in reverse order after emission.
                     for &pp_idx in postprocess_passes.iter().rev() {
@@ -4043,6 +4050,7 @@ impl Optimizer {
                     // downstream `op_at` lookups resolve it directly
                     // without a side-table refresh.
                     current_op = op;
+                    replaced = true;
                 }
                 OptimizationResult::Restart(op) => {
                     // optimizer.py:567 `send_extra_operation(newop, opt=None)`:
@@ -4109,8 +4117,10 @@ impl Optimizer {
             }
         }
 
-        // If no pass handled it, emit as-is
-        self.emit_operation(current_op.clone(), ctx);
+        // If no pass handled it, emit as-is. An unreplaced pass-through is the
+        // recorder input op verbatim (args re-resolved), so emit may reuse that
+        // input op as the producer instead of cloning.
+        self.emit_operation(current_op.clone(), ctx, !replaced);
         // Postprocess in reverse order after emission.
         for &pp_idx in postprocess_passes.iter().rev() {
             self.passes[pp_idx].propagate_postprocess(&current_op, ctx);
@@ -4125,7 +4135,7 @@ impl Optimizer {
     /// RPython optimizer.py:623-625: _emit_operation calls force_box(arg)
     /// on every arg before final emission. In majit, this forces any remaining
     /// virtual args that weren't caught by pass-level handlers.
-    fn emit_operation(&mut self, mut op: Op, ctx: &mut OptContext) {
+    fn emit_operation(&mut self, mut op: Op, ctx: &mut OptContext, reuse: bool) {
         // RPython optimizer.py:614: _emit_operation is on the Optimizer (last
         // "pass" in the chain). Any force_box called here should emit directly,
         // matching RPython's Optimizer.emit_extra which just calls self.emit(op).
@@ -4258,7 +4268,11 @@ impl Optimizer {
                 op.getarglist()
             );
         }
-        let emitted = ctx.emit(op.clone());
+        let emitted = if reuse {
+            ctx.emit_reusing(op.clone())
+        } else {
+            ctx.emit(op.clone())
+        };
         // optimizer.py:674 `self._emittedoperations[op] = None` — record
         // the freshly emitted op so `as_operation` can later confirm it
         // is in the emit set before downstream callers reason about
@@ -6374,7 +6388,7 @@ mod tests {
         let (mut seeded_ops, snapshots) =
             super::super::seed_empty_guard_snapshots(std::slice::from_ref(&op));
         ctx.snapshot_boxes = snapshots;
-        opt.emit_operation(seeded_ops.pop().unwrap(), &mut ctx);
+        opt.emit_operation(seeded_ops.pop().unwrap(), &mut ctx, false);
 
         assert!(!ctx.in_final_emission);
         assert!(ctx.new_operations.iter().any(|op| op.opcode == OpCode::New));
@@ -6439,7 +6453,7 @@ mod tests {
         let (mut seeded_ops, snapshots) =
             super::super::seed_empty_guard_snapshots(std::slice::from_ref(&guard));
         ctx.snapshot_boxes = snapshots;
-        opt.emit_operation(seeded_ops.pop().unwrap(), &mut ctx);
+        opt.emit_operation(seeded_ops.pop().unwrap(), &mut ctx, false);
 
         let sp = ctx
             .build_imported_short_preamble()

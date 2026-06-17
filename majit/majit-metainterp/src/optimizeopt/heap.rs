@@ -1629,6 +1629,13 @@ impl OptHeap {
         let has_single_write_descr = op
             .with_call_descr(|cd| cd.get_extra_info().single_write_descr_array.is_some())
             .unwrap_or(false);
+        // heapcache.py:274-276 tests `isinstance(argboxes[3], ConstInt)` on the
+        // raw box: it runs in the tracing-layer heapcache where operands are not
+        // yet forwarded, so a constant index already IS a ConstInt. pyre fuses
+        // this check into the optimizer layer (heap.rs), where an operand may be
+        // a bound op forwarding to a const, so the same question — is the index a
+        // known constant — must resolve the forwarding via get_box_replacement
+        // before reading const_int.
         if oopspec == OopSpecIndex::Arraycopy
             && has_single_write_descr
             && op.num_args() >= 6

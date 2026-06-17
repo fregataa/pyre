@@ -789,13 +789,16 @@ impl Default for OptPure {
 }
 
 impl OptPure {
-    fn force_box(&mut self, opref: OpRef, ctx: &mut OptContext) -> OpRef {
+    fn force_box(&mut self, op: &BoxRef, ctx: &mut OptContext) -> OpRef {
         // Single resolve through the BoxRef terminal; the OpRef view is the
         // terminal's `to_opref()` (keystone equivalence, #113), so the prior
         // paired `get_box_replacement` + `get_box_replacement_box` of the
-        // same `opref` was a redundant double walk.
-        let resolved_box = ctx.get_box_replacement_box(opref);
-        let resolved = resolved_box.as_ref().map(|b| b.to_opref()).unwrap_or(opref);
+        // same operand was a redundant double walk.
+        let resolved_box = ctx.resolve_box_box_opt(op);
+        let resolved = resolved_box
+            .as_ref()
+            .map(|b| b.to_opref())
+            .unwrap_or_else(|| op.to_opref());
         if resolved_box.as_ref().map_or(false, |b| ctx.is_virtual(b)) {
             let resolved_box = resolved_box.expect("recorder-populated");
             let mut info = ctx.take_ptr_info(&resolved_box).unwrap();
@@ -821,7 +824,7 @@ impl OptPure {
     ) -> Option<Value> {
         let mut arg_consts = Vec::with_capacity(op.num_args().saturating_sub(start_index));
         for i in start_index..op.num_args() {
-            let forced = self.force_box(op.arg(i).to_opref(), ctx);
+            let forced = self.force_box(&op.arg(i), ctx);
             let Some(const_value) = ctx
                 .get_box_replacement_box(forced)
                 .and_then(|b| ctx.get_constant_box(&b))
@@ -962,7 +965,7 @@ impl Optimization for OptPure {
                 // ctx.emit() bypasses that optimizer path, so mirror the
                 // force_box step here before recording the postponed op.
                 for i in 0..postponed.num_args() {
-                    let forced = self.force_box(postponed.arg(i).to_opref(), ctx);
+                    let forced = self.force_box(&postponed.arg(i), ctx);
                     postponed.setarg(i, ctx.materialize_box_at(forced));
                 }
                 // Record and emit both the OVF op and the guard.
@@ -972,7 +975,7 @@ impl Optimization for OptPure {
             } else {
                 // Not a GUARD_NO_OVERFLOW: emit the postponed op now.
                 for i in 0..postponed.num_args() {
-                    let forced = self.force_box(postponed.arg(i).to_opref(), ctx);
+                    let forced = self.force_box(&postponed.arg(i), ctx);
                     postponed.setarg(i, ctx.materialize_box_at(forced));
                 }
                 ctx.emit(postponed);
