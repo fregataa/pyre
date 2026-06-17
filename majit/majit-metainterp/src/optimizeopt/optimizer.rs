@@ -6035,7 +6035,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // pre-existing test-setup bug (independent of rd_virtuals shape).
+    #[ignore = "test fixture uses FieldDescr without parent SizeDescr, so ensure_ptr_info_arg0 panics before rd_numb encoding is exercised"]
+    // Pre-existing test-setup bug (independent of rd_virtuals shape).
     // The fix needs three coupled changes that exceed an in-session port:
     //   (1) a parent-aware FieldDescr (TestDescr at line 4106 fits) returning
     //       a parent_descr so virtualize.rs:585-590 doesn't panic;

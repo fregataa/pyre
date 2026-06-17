@@ -5338,16 +5338,8 @@ mod tests {
         );
     }
 
-    // OptHeap's `force_from_effectinfo` path (heap.rs:2584) selectively
-    // forces lazy_sets based on the call's EffectInfo write_descrs_fields
-    // bitstring. A CallR with default EffectInfo (no writes) skips the
-    // force; the pending SetfieldGc lazy_set never gets emitted before the
-    // escape. RPython heap.py's `force_from_effectinfo` consults
-    // `effectinfo.check_forces_virtual_or_virtualizable()` and the
-    // EF_* extraeffect class to decide when to force unconditionally —
-    // pyre's port is incomplete here. Fix spans heap.rs force_from_effectinfo
-    // + virtualize.rs force_virtual ordering.
-    #[ignore = "OptHeap force_from_effectinfo: fresh-object escape via non-random-effects call skips lazy_set flush"]
+    // A residual call receiving a fresh virtual must force its pending float
+    // field store before the escape.
     #[test]
     fn test_callr_preserves_float_field_store_on_escaping_fresh_object() {
         let float_sd = size_descr(1);
@@ -5366,14 +5358,14 @@ mod tests {
             Op::with_descr(
                 OpCode::SetfieldGc,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
+                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(0)),
                     crate::r#box::BoxRef::from_opref(OpRef::int_op(100)),
                 ],
                 float_fd,
             ),
             Op::with_descr(
                 OpCode::CallR,
-                &[crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0))],
+                &[crate::r#box::BoxRef::from_opref(OpRef::ref_op(0))],
                 call_descr,
             ),
             Op::new(OpCode::Jump, &[]),

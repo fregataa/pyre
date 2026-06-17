@@ -10245,7 +10245,7 @@ mod tests {
     // OS_RAW_MALLOC_VARSIZE_CHAR. The current test supplies `func: 0` with no
     // registered calldescr, so `materialize_virtual_raw_buffer` cannot run the
     // resume.py:1456 bh_call_i; wiring up the backend allocator is a follow-up.
-    #[ignore]
+    #[ignore = "VRawBufferInfo recovery requires MetaInterp.callinfocollection with OS_RAW_MALLOC_VARSIZE_CHAR; current test has func=0/no calldescr"]
     #[test]
     fn test_materialize_virtual_ref_reconstructs_list_from_raw_buffer_ref() {
         ensure_test_callbacks();
