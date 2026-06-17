@@ -4451,14 +4451,25 @@ impl<M: Clone> MetaInterp<M> {
     ) -> *const u8 {
         // history.py:314 ConstPtr.value lives inline on the box —
         // `orig_inpargs[idx].getref_base()` parity read.
-        driver_descriptor
+        let from_consts = driver_descriptor
             .and_then(|driver| driver.virtualizable_arg_index())
             .and_then(|idx| ctx.initial_inputarg_consts.get(idx))
             .and_then(|const_box| match const_box.const_value() {
                 Some(majit_ir::Value::Ref(gcref)) => Some(gcref.0 as *const u8),
                 _ => None,
-            })
-            .unwrap_or(std::ptr::null())
+            });
+        if let Some(ptr) = from_consts {
+            return ptr;
+        }
+        // Bridge traces start from rebuilt resume state, not a fresh portal
+        // entry, so `initial_inputarg_consts` is not seeded with the
+        // virtualizable inputarg's ConstPtr. The live virtualizable pointer
+        // cached by `set_vable_ptr` during JitState setup is the same heap
+        // object (`orig_inpargs[idx].getref_base()`), so fall back to it.
+        if !self.vable_ptr.is_null() {
+            return self.vable_ptr;
+        }
+        ctx.virtualizable_heap_ptr().unwrap_or(std::ptr::null())
     }
 
     /// compile.py:168 / pyjitpl.py:3605 parity: every real loop token must
@@ -9188,26 +9199,17 @@ impl<M: Clone> MetaInterp<M> {
                     },
                 );
 
-                // The entry bridge ends in a JUMP into `green_key`'s compiled
-                // loop, so it inherits THAT loop's TargetTokens (compile.py:286-296).
-                // `green_key` is guaranteed compiled (checked at the top). The
-                // prior logic inherited from `original_green_key` and fell back to
-                // an empty list when origin != target, leaving a cross-loop entry
-                // bridge (interp origin uncompiled, distinct from the compiled
-                // target) with no target tokens — hence non-dispatchable
-                // (has_compiled_loop stays false -> no nbody residency win).
-                let front_target_tokens = self
-                    .compiled_loops
-                    .get(&green_key)
-                    .map(|c| c.front_target_tokens.clone())
-                    .unwrap_or_default();
-                // `compile.py:286-296` — the bridge's destination JCT inherits
-                // the loop's TargetTokens.  Mirror them onto
-                // `JitCellToken.target_tokens` so `has_compiled_targets`
-                // (`pyjitpl.py:3898`) reads non-empty after the bridge attaches.
-                for target_token in &front_target_tokens {
-                    token.record_target_token(target_token.as_jump_target_descr());
-                }
+                // ResumeFromInterpDescr.compile_and_attach (compile.py:1006-1023):
+                // the entry bridge starts with unoptimized interp args and ends in
+                // a JUMP into `green_key`'s loop. PyPy creates a fresh
+                // JitCellToken, sends the bridge to the backend, and
+                // attach_procedure_to_interp's it to the original green key WITHOUT
+                // setting target_tokens. Dispatch is gated on the attached
+                // procedure token carrying compiled code (warmstate.py:482-511),
+                // which `has_compiled_loop` reads — not on target_tokens. The JUMP
+                // resolves to `green_key`'s TargetToken via the JUMP op's own descr,
+                // so the entry-bridge token owns no TargetTokens of its own.
+                let front_target_tokens: Vec<crate::optimizeopt::unroll::TargetToken> = Vec::new();
                 let retraced_count = self
                     .compiled_loops
                     .get(&original_green_key)

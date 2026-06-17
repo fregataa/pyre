@@ -654,6 +654,30 @@ pub extern "C" fn dynasm_write_barrier_from_array(obj_ptr: u64) {
     });
 }
 
+/// llmodel.py:495-497 `write_ref_at_mem`: the write barrier implied by the
+/// framework GC transformer around every blackhole ref store
+/// (`bh_setfield_gc_r`, `bh_setarrayitem_gc_r`, `bh_setinteriorfield_gc_r`).
+/// The blackhole interpreter is not the JIT, so no inline TRACK_YOUNG_PTRS
+/// test precedes the call. `is_managed_heap_object` first guards the
+/// pyre-specific case where a reconstructed frame slot is not a GC-managed
+/// object (RPython's frame structs/arrays always are), then `write_barrier`
+/// flag-checks (gc.write_barrier → do_write_barrier). Mirrors cranelift's
+/// `write_barrier_if_managed`.
+fn dynasm_write_barrier_if_managed(obj_ptr: u64) {
+    if obj_ptr == 0 {
+        return;
+    }
+    DYNASM_ACTIVE_GC.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        if let Some(gc) = guard.as_mut() {
+            let obj = majit_ir::GcRef(obj_ptr as usize);
+            if gc.is_managed_heap_object(obj.0) {
+                gc.write_barrier(obj);
+            }
+        }
+    });
+}
+
 /// `_build_frame_realloc_slowpath` parity (assembler.py:143-189):
 /// JIT-side helper invoked when `_check_frame_depth` detects that
 /// `jf_frame.length < expected_depth`.  Allocates a wider JITFRAME,
@@ -2904,6 +2928,14 @@ impl Backend for DynasmBackend {
     ) {
         let offset = fielddescr.as_offset();
         unsafe { *((struct_ptr as *mut u8).add(offset) as *mut usize) = value.0 };
+        // llmodel.py:723 `bh_setfield_gc_r` → :495 `write_ref_at_mem`: the
+        // write barrier is implied by the framework GC transformer around the
+        // ref store, identical to the array ref setters. The blackhole has no
+        // inline TRACK_YOUNG_PTRS test, so use the managed-guarded
+        // flag-checking barrier (see bh_setarrayitem_gc_r). Without it, a
+        // young value stored into an old managed struct is not remembered and
+        // the next minor collection can free it while still referenced.
+        dynasm_write_barrier_if_managed(struct_ptr as u64);
     }
 
     /// llmodel.py:592-594 bh_getarrayitem_gc_i: ofs=base_size, size+sign
@@ -2990,14 +3022,14 @@ impl Backend for DynasmBackend {
         unsafe {
             *((array_ptr as *mut u8).offset(offset as isize) as *mut usize) = newvalue.0;
         }
-        // llmodel.py:495-497 `write_ref_at_mem`: raw_store + "write
-        // barrier is implied above". `dynasm_write_barrier_from_array`
-        // routes through `gc.jit_remember_young_pointer_from_array`
-        // for the CARDS_SET transition matching
-        // opassembler.py:953-960's array barrier path.
-        if array_ptr != 0 {
-            dynasm_write_barrier_from_array(array_ptr as u64);
-        }
+        // llmodel.py:495-497 `bh_setarrayitem_gc_r`: store + the generic
+        // flag-checking `do_write_barrier`. The blackhole has no inline
+        // TRACK_YOUNG_PTRS test ahead of the call, so it must not reuse the
+        // JIT-only `jit_remember_young_pointer_from_array` (which assumes the
+        // flag was already tested and would unconditionally remember an
+        // untracked target — e.g. a reconstructed frame array outside the GC
+        // heap — corrupting the remembered set).
+        dynasm_write_barrier_if_managed(array_ptr as u64);
     }
 
     /// llmodel.py:618-621 bh_setarrayitem_gc_f.
@@ -3050,9 +3082,10 @@ impl Backend for DynasmBackend {
         unsafe {
             *((array_ptr as *mut u8).offset(offset as isize) as *mut usize) = newvalue.0;
         }
-        if array_ptr != 0 {
-            dynasm_write_barrier_from_array(array_ptr as u64);
-        }
+        // Blackhole store — no inline TRACK_YOUNG_PTRS test precedes this
+        // call, so use the managed-guarded flag-checking barrier (see
+        // bh_setarrayitem_gc_r).
+        dynasm_write_barrier_if_managed(array_ptr as u64);
     }
 
     /// llmodel.py:648-651 bh_setinteriorfield_gc_f.  Float-typed interior
