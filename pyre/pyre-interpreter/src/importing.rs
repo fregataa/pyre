@@ -982,6 +982,7 @@ fn absolute_import(
 ) -> Result<PyObjectRef, crate::PyError> {
     let parts: Vec<&str> = modulename.split('.').collect();
     let mut first: Option<PyObjectRef> = None;
+    let mut parent: Option<PyObjectRef> = None;
     let mut prefix = Vec::new();
 
     for (level, &part) in parts.iter().enumerate() {
@@ -994,9 +995,28 @@ fn absolute_import(
                 format!("No module named '{modulename}'"),
             ));
         };
+        // _bootstrap._find_and_load (_bootstrap.py:1346-1352): bind the
+        // submodule as an attribute of its parent package so `import a.b`
+        // makes `a.b` reachable. Only an AttributeError is swallowed (with an
+        // ImportWarning); any other exception propagates.
+        if let Some(parent_mod) = parent {
+            if let Err(err) = crate::setattr_str(parent_mod, part, module) {
+                if err.kind != crate::PyErrorKind::AttributeError {
+                    return Err(err);
+                }
+                let parent_name = parts[..level].join(".");
+                crate::warn::warn(
+                    &format!(
+                        "Cannot set an attribute on '{parent_name}' for child module '{part}'"
+                    ),
+                    "ImportWarning",
+                );
+            }
+        }
         if level == 0 {
             first = Some(module);
         }
+        parent = Some(module);
     }
 
     // PyPy: if w_fromlist is not None, return the leaf module.
