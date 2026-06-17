@@ -1898,20 +1898,21 @@ impl<'a> Lowering<'a> {
                 // updated — the write goes through indirection, the
                 // base local remains the same Variable.
                 let value = match self.field_write_inline_const(&elem, &rvalue, &dest_ty) {
-                    // An int-typed `setfield_gc_i` keeps its constant
+                    // An int / bool / float field write keeps its constant
                     // operand inline (`LinkArg::Const`) instead of
-                    // materialising a `ConstInt` + `int_copy` into a
-                    // register: the assembler then takes the short `c`
+                    // materialising a `ConstInt` / `ConstFloat` + copy into
+                    // a register: the assembler then takes the short `c`
                     // byte (`setfield_gc_i/rcd`) or a pool slot
-                    // (`/rid`).  Mirrors RPython keeping a `ConstInt`
-                    // box as a `setfield_gc` argument and deferring the
+                    // (`/rid` for a wide int, `/rfd` for a float).
+                    // Mirrors RPython keeping the `Constant` box as a
+                    // `setfield_gc` argument and deferring the
                     // short-vs-pool choice to `assembler.py:99-107`.
                     // `Constant::new` defers `concretetype` to the rtyper
                     // like every front-end synthesized constant; the
                     // assembler recovers the value kind from the
-                    // self-describing Int/Bool `ConstValue` variant via
-                    // `constant_kind` (`getkind` fallback), so the
-                    // `setfield_gc_<kind>` opname is keyed correctly.
+                    // self-describing Int / Bool / Float `ConstValue`
+                    // variant via `constant_kind` (`getkind` fallback), so
+                    // the `setfield_gc_<kind>` opname is keyed correctly.
                     Some(const_value) => {
                         LinkArg::Const(crate::flowspace::model::Constant::new(const_value))
                     }
@@ -1951,34 +1952,34 @@ impl<'a> Lowering<'a> {
             .unwrap_or(recorded)
     }
 
-    /// If `elem` writes an int-typed struct field and `rvalue` is a
-    /// plain integer / bool constant, return the matching [`ConstValue`]
-    /// so the `FieldWrite` carries it inline (`setfield_gc_i/rcd` short
-    /// form, or `/rid` pool slot for a wide value) rather than forcing
-    /// it into a register with a `ConstInt` + `int_copy`.
+    /// If `elem` writes a struct field and `rvalue` is a plain pooled
+    /// constant matching the field's value bank — integer / bool for an
+    /// int-kind field, float for a float-kind field — return the matching
+    /// [`ConstValue`] so the `FieldWrite` carries it inline
+    /// (`setfield_gc_i/rcd` short form or `/rid` pool slot for an int,
+    /// `setfield_gc_f/rfd` pool slot for a float) rather than forcing it
+    /// into a register with a `ConstInt` / `ConstFloat` + copy.
     ///
-    /// RPython keeps a `Constant` of any kind as a `setfield_gc`
-    /// argument (codewriter args are `AbstractValue`, never
-    /// pre-materialised) and leaves the short-vs-pool encoding to the
-    /// assembler (`assembler.py:99-107`), so `setfield_gc_r` /
-    /// `setfield_gc_f` carry inline ref / float constants too.
+    /// RPython keeps the `Constant` box as a `setfield_gc` argument
+    /// (codewriter args are `AbstractValue`, never pre-materialised) and
+    /// leaves the short-vs-pool encoding to the assembler
+    /// (`assembler.py:99-107`).  The assembler `FieldWrite` arm derives
+    /// the value kind from the constant via `constant_kind` and routes a
+    /// float to a pooled `f` slot (`assembler.rs` `emit_const_f`), which
+    /// the walker resolves through the constants window of `registers_f`.
     ///
-    /// Convergence path: the build-time assembler already routes a
-    /// non-int `LinkArg::Const` to a pooled `r` / `f` slot
-    /// (`jit_codewriter/assembler.rs` `FieldWrite` arm `else` branch ->
-    /// `emit_const`), and the walker resolves those through the constants
-    /// window of `registers_r` / `registers_f`, so the only remaining gap
-    /// is this producer.  Only int `Field` projections currently inline
-    /// their constant; ref / float fields (and `Deref` / `Index` writes)
-    /// still take a materialised Variable, pending ref-constant GC-root
-    /// verification for the pooled `ConstRef` case.
+    /// Ref-kind field constants are not pooled at this layer: a string /
+    /// char / fn-pointer constant lowers to a runtime `Call`
+    /// (`build_rvalue`'s `DecodedConst::Str` / `FnPath` arms), not a
+    /// poolable `ConstPtr`, so it keeps the materialised path — as do
+    /// `Deref` / `Index` writes.
     fn field_write_inline_const(
         &self,
         elem: &ProjectionElem,
         rvalue: &Rvalue,
         dest_ty: &TyRef,
     ) -> Option<ConstValue> {
-        // Only a struct `Field` projection lowers to `setfield_gc_i`.
+        // Only a struct `Field` projection lowers to `setfield_gc_*`.
         let is_field = matches!(
             elem,
             ProjectionElem::Tagged(v)
@@ -1987,20 +1988,24 @@ impl<'a> Lowering<'a> {
         if !is_field {
             return None;
         }
-        // The stored field must be int-kind (the value-bank of
-        // `setfield_gc_i`); a ref / float field has no `c`/`i` int form.
-        if !matches!(tyref_to_value_type(dest_ty, self.llbc), ValueType::Int) {
-            return None;
-        }
-        // Only a bare integer / bool constant operand qualifies; a
-        // computed rvalue still flows through `build_rvalue`.
+        // Only a bare constant operand qualifies; a computed rvalue still
+        // flows through `build_rvalue`.
         let Rvalue::Use(Operand::Const(value)) = rvalue else {
             return None;
         };
-        match decode_constant(self.llbc, value).ok()? {
-            DecodedConst::Int(n) => Some(ConstValue::Int(n)),
-            DecodedConst::Bool(b) => Some(ConstValue::Bool(b)),
-            DecodedConst::Float(_) | DecodedConst::Str(_) | DecodedConst::FnPath(_) => None,
+        // Inline only a genuinely pooled constant matched to the field's
+        // value bank: int / bool into an int-kind field (`setfield_gc_i`),
+        // float into a float-kind field (`setfield_gc_f`).  `Str` / `FnPath`
+        // constants lower to a `Call`, not a poolable `ConstPtr`, so they
+        // fall through to the materialised path.
+        match (
+            tyref_to_value_type(dest_ty, self.llbc),
+            decode_constant(self.llbc, value).ok()?,
+        ) {
+            (ValueType::Int, DecodedConst::Int(n)) => Some(ConstValue::Int(n)),
+            (ValueType::Int, DecodedConst::Bool(b)) => Some(ConstValue::Bool(b)),
+            (ValueType::Float, DecodedConst::Float(bits)) => Some(ConstValue::Float(bits)),
+            _ => None,
         }
     }
 
