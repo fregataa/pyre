@@ -2717,6 +2717,12 @@ impl Bookkeeper {
                 s.base.const_box = Some(Constant::new(x.clone()));
                 Ok(SomeValue::Integer(s))
             }
+            ConstValue::InheritanceId { .. } => {
+                // A symbolic inheritance id is a Signed integer marker.
+                let mut s = SomeInteger::new(false, false);
+                s.base.const_box = Some(Constant::new(x.clone()));
+                Ok(SomeValue::Integer(s))
+            }
             ConstValue::LLAddress(_) => {
                 // `isinstance(x, llmemory.fakeaddress)` arm of
                 // `bookkeeper.py immutablevalue` — a prebuilt address

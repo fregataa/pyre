@@ -222,7 +222,12 @@ impl LowLevelType {
             // `lltype()` is Signed; `llmemory.sizeof(TYPE)` returns an
             // `ItemOffset(TYPE)` symbolic on the typed-address path.
             LowLevelType::Signed => {
-                matches!(value, ConstValue::Int(_) | ConstValue::AddressOffset(_))
+                matches!(
+                    value,
+                    ConstValue::Int(_)
+                        | ConstValue::AddressOffset(_)
+                        | ConstValue::InheritanceId { .. }
+                )
             }
             // upstream `Unsigned` / long-long primitives accept Python
             // `int` (range checking upstream; pyre's `ConstValue::Int` is

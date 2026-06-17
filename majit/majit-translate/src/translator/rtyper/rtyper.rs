@@ -313,9 +313,26 @@ impl ExceptionData {
             .expect("getfield with Signed result returns a value");
 
         // upstream `res = llops.genop('int_between', [genconst(min),
-        // field, genconst(max)], Bool)`.
-        let c_min = Constant::with_concretetype(ConstValue::Int(min_n), LowLevelType::Signed);
-        let c_max = Constant::with_concretetype(ConstValue::Int(max_n), LowLevelType::Signed);
+        // field, genconst(max)], Bool)`.  Carry the range markers as
+        // symbolic inheritance ids resolved at emission; the eager `value`
+        // keeps the emitted constant identical.  The owning classdef is not
+        // in scope here (only the vtable `_ptr`), so `cdef_id` is `None`.
+        let c_min = Constant::with_concretetype(
+            ConstValue::InheritanceId {
+                cdef_id: None,
+                is_max: false,
+                value: min_n,
+            },
+            LowLevelType::Signed,
+        );
+        let c_max = Constant::with_concretetype(
+            ConstValue::InheritanceId {
+                cdef_id: None,
+                is_max: true,
+                value: max_n,
+            },
+            LowLevelType::Signed,
+        );
         let v_res = llops
             .genop(
                 "int_between",
@@ -3364,12 +3381,14 @@ fn lowlevel_isinstance_helper_graph(
 ///
 /// Returns `(ll_isinstance_const, ll_isinstance_const_nonnull)`. The
 /// pair is cached implicitly under synthetic helper names
-/// `ll_isinstance_const_<min>_<max>` and
-/// `ll_isinstance_const_nonnull_<min>_<max>` in
-/// `rtyper.lowlevel_helper_graphs` — `(minid, maxid)` uniquely
-/// identifies the classdef after `normalizecalls.assign_inheritance_ids`
-/// has run, mirroring upstream's `rtyper.isinstance_helpers[cls._obj]`
-/// keying by vtable identity.
+/// `ll_isinstance_const_<flavor>_<class_identity>` and
+/// `ll_isinstance_const_nonnull_<flavor>_<class_identity>` in
+/// `rtyper.lowlevel_helper_graphs`, keyed by the vtable container
+/// identity — the analog of upstream's `rtyper.isinstance_helpers[cls._obj]`.
+/// `(minid, maxid)` are NOT part of the key; they are builder-closure
+/// data baked into the helper body, so a class's helper is never
+/// re-minted for a changed range and no inheritance id is frozen into a
+/// function name.
 ///
 /// Upstream's `number_with_subclasses()` (whether the inheritance
 /// range covers any proper subclass) — under the eager-marker integer
@@ -3410,16 +3429,17 @@ pub(crate) fn make_ll_isinstance(
     // marker between this class's start and end markers.
     let has_subclasses = maxid > minid + 1;
 
-    // Pyre-port: the cache key suffix `_<min>_<max>` is unique post-
-    // `normalizecalls.assign_inheritance_ids` only.  Reading the vtable
-    // before assignment would observe the default `Signed(0)` for both
-    // markers and collide every uninitialised class onto a single
-    // helper.  Pin the underlying container's stable identity (the
-    // `_struct.identity()` allocation pointer, preserved across `_ptr`
-    // clones) into the name so distinct classes never share a helper
-    // even if their range markers do.  Upstream keys this cache by
-    // `cls._obj` identity (`rclass.py:1149`); the container identity
-    // is the analog.
+    // Key the helper cache by the underlying container's stable
+    // identity (the `_struct.identity()` allocation pointer, preserved
+    // across `_ptr` clones), the analog of upstream keying by `cls._obj`
+    // identity (`rclass.py:1149`).  The inheritance ids (`minid`/`maxid`)
+    // are deliberately NOT in the key: they are builder-closure data
+    // baked into the helper body below.  Under a single numbering pass a
+    // class's range is write-once, so a class is never read with two
+    // different ranges and its helper never needs re-minting — and
+    // keeping the ids out of the name confines every id to a resolvable
+    // constant position, so a later lazy-resolution scheme cannot freeze
+    // a stale id into a function name.
     let class_identity: u64 = match cls_ptr._obj0_value() {
         Ok(Some(crate::translator::rtyper::lltypesystem::lltype::_ptr_obj::Struct(s))) => {
             s.identity() as u64
@@ -3427,17 +3447,16 @@ pub(crate) fn make_ll_isinstance(
         _ => cls_ptr._hashable_identity(),
     };
 
-    // Differentiate the cache name suffix by gc/raw flavor so the
-    // same class with both flavor witnesses (rare but legal) does
-    // not collide on a single helper body of the wrong obj type.
+    // Differentiate the cache name by gc/raw flavor so the same class
+    // with both flavor witnesses (rare but legal) does not collide on a
+    // single helper body of the wrong obj type.
     let flavor_tag = if *obj_lltype == *NONGCOBJECTPTR {
         "raw"
     } else {
         "gc"
     };
-    let nonnull_name =
-        format!("ll_isinstance_const_nonnull_{flavor_tag}_{class_identity}_{minid}_{maxid}");
-    let const_name = format!("ll_isinstance_const_{flavor_tag}_{class_identity}_{minid}_{maxid}");
+    let nonnull_name = format!("ll_isinstance_const_nonnull_{flavor_tag}_{class_identity}");
+    let const_name = format!("ll_isinstance_const_{flavor_tag}_{class_identity}");
 
     // Mint the non-null helper first so the const helper's direct_call
     // can resolve it via the cache when its builder runs.
@@ -6095,8 +6114,22 @@ mod tests {
         let Hlvalue::Constant(c_max) = &oplist[1].args[2] else {
             panic!("int_between arg[2] must be a Constant");
         };
-        assert_eq!(c_min.value, ConstValue::Int(7));
-        assert_eq!(c_max.value, ConstValue::Int(11));
+        assert_eq!(
+            c_min.value,
+            ConstValue::InheritanceId {
+                cdef_id: None,
+                is_max: false,
+                value: 7,
+            }
+        );
+        assert_eq!(
+            c_max.value,
+            ConstValue::InheritanceId {
+                cdef_id: None,
+                is_max: true,
+                value: 11,
+            }
+        );
         assert_eq!(c_min.concretetype.as_ref(), Some(&LowLevelType::Signed));
         assert_eq!(c_max.concretetype.as_ref(), Some(&LowLevelType::Signed));
 

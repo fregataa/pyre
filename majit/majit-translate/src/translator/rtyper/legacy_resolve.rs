@@ -394,6 +394,7 @@ fn const_value_to_concrete(value: &ConstValue) -> ConcreteType {
         | ConstValue::Bool(_)
         | ConstValue::SpecTag(_)
         | ConstValue::AddressOffset(_)
+        | ConstValue::InheritanceId { .. }
         | ConstValue::LLAddress(_) => ConcreteType::Signed,
         ConstValue::Float(_) => ConcreteType::Float,
         ConstValue::Placeholder => ConcreteType::Unknown,

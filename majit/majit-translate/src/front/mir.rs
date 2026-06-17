@@ -185,6 +185,9 @@ pub fn build_semantic_program_from_llbcs_with_static_addrs(
                 for (key, fields) in prog.struct_fields.fields {
                     acc.struct_fields.fields.entry(key).or_insert(fields);
                 }
+                for enum_root in prog.struct_fields.enum_roots {
+                    acc.struct_fields.enum_roots.insert(enum_root);
+                }
                 for (enum_key, by_discr) in prog.enum_variant_by_discriminant {
                     acc.enum_variant_by_discriminant
                         .entry(enum_key)
@@ -551,6 +554,8 @@ fn derive_program_metadata(
                 let leaf = name.rsplit("::").next().unwrap_or(&name).to_string();
                 known_struct_names.insert(name.clone());
                 known_struct_names.insert(leaf.clone());
+                struct_fields.enum_roots.insert(name.clone());
+                struct_fields.enum_roots.insert(leaf.clone());
                 // Register the enum as a flat class in `struct_fields`:
                 // the synthetic `__discriminant` tag plus the union of
                 // all variant payload fields.  `Rvalue::Discriminant`
@@ -668,6 +673,8 @@ fn harden_duplicate_leaf_metadata(
         }
     }
     let mut drop_field_aliases: Vec<String> = Vec::new();
+    let mut drop_enum_root_aliases: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     let mut tombstone_origins: Vec<String> = Vec::new();
     for (leaf, quals) in &by_leaf {
         if quals.len() < 2 {
@@ -679,6 +686,14 @@ fn harden_duplicate_leaf_metadata(
             .any(|q| &struct_fields.fields[*q] != first_rows)
         {
             drop_field_aliases.push((*leaf).to_string());
+            drop_enum_root_aliases.insert((*leaf).to_string());
+        }
+        let enum_qualified_count = quals
+            .iter()
+            .filter(|q| struct_fields.enum_roots.contains(**q))
+            .count();
+        if enum_qualified_count > 0 && enum_qualified_count != quals.len() {
+            drop_enum_root_aliases.insert((*leaf).to_string());
         }
         let first_module = strip_crate_prefix(quals[0])
             .rsplit_once("::")
@@ -726,11 +741,15 @@ fn harden_duplicate_leaf_metadata(
             .any(|q| &enum_variant_by_discriminant[*q] != first_map)
         {
             drop_enum_aliases.push((*leaf).to_string());
+            drop_enum_root_aliases.insert((*leaf).to_string());
         }
     }
     drop(enum_by_leaf);
     for leaf in drop_enum_aliases {
         enum_variant_by_discriminant.remove(&leaf);
+    }
+    for leaf in drop_enum_root_aliases {
+        struct_fields.enum_roots.remove(&leaf);
     }
 }
 
@@ -3820,6 +3839,14 @@ impl<'a> Lowering<'a> {
                             first_arg_ty.as_ref(),
                             &call.dest.ty,
                         )
+                        .or_else(|| {
+                            self.reflexive_into_iter_alias(
+                                &segments,
+                                &args,
+                                first_arg_ty.as_ref(),
+                                &call.dest.ty,
+                            )
+                        })
                         .or_else(|| self.trait_into_string_alias(&segments, &args, &call.dest.ty))
                         .or_else(|| {
                             self.oparg_arg_get_alias(&reg.kind, &segments, &args, &call.dest.ty)
@@ -4989,6 +5016,51 @@ impl<'a> Lowering<'a> {
         {
             return None;
         }
+        self.identity_self_call_alias(args, first_arg_ty, dest_ty)
+    }
+
+    /// Resolve the reflexive blanket `IntoIterator::into_iter`
+    /// (`core::iter::traits::collect::<Impl>::into_iter`) to its
+    /// operand.  `impl<I: Iterator> IntoIterator for I` sets
+    /// `IntoIter = Self` and `into_iter(self) -> Self { self }`, so the
+    /// call is an identity whenever the receiver type equals the
+    /// destination type.  The blanket fn's body is Opaque in the LLBC,
+    /// leaving the `Call` form permanently unliftable; an
+    /// already-an-iterator `into_iter` never appears as an op in RPython
+    /// graphs.  Concrete `IntoIterator` impls (`&[T]` → `slice::Iter`,
+    /// `Vec` → `vec::IntoIter`) have receiver ≠ destination and keep the
+    /// generic `Call` form.
+    fn reflexive_into_iter_alias(
+        &self,
+        segments: &[String],
+        args: &[Variable],
+        first_arg_ty: Option<&TyRef>,
+        dest_ty: &TyRef,
+    ) -> Option<Variable> {
+        let [.., iter_seg, traits_seg, collect_seg, impl_seg, leaf] = segments else {
+            return None;
+        };
+        if iter_seg.as_str() != "iter"
+            || traits_seg.as_str() != "traits"
+            || collect_seg.as_str() != "collect"
+            || impl_seg.as_str() != "<Impl>"
+            || leaf.as_str() != "into_iter"
+        {
+            return None;
+        }
+        self.identity_self_call_alias(args, first_arg_ty, dest_ty)
+    }
+
+    /// Shared resolution for an Opaque blanket-impl call whose receiver
+    /// type equals its result type: the call is a no-op, so it resolves
+    /// to its sole operand.  Used by the reflexive `Into::into` and
+    /// `IntoIterator::into_iter` blanket-impl aliases above.
+    fn identity_self_call_alias(
+        &self,
+        args: &[Variable],
+        first_arg_ty: Option<&TyRef>,
+        dest_ty: &TyRef,
+    ) -> Option<Variable> {
         let [arg] = args else {
             return None;
         };
@@ -8086,6 +8158,15 @@ mod tests {
         enums.insert("pyre_object::flow::Verdict".to_string(), same_as_a.clone());
         enums.insert("pyre_jit::flow::Verdict".to_string(), same_as_a.clone());
         enums.insert("Verdict".to_string(), same_as_a.clone());
+        reg.enum_roots
+            .insert("pyre_interpreter::eval::StepResult".to_string());
+        reg.enum_roots
+            .insert("pyre_jit::eval::StepResult".to_string());
+        reg.enum_roots.insert("StepResult".to_string());
+        reg.enum_roots
+            .insert("pyre_object::flow::Verdict".to_string());
+        reg.enum_roots.insert("pyre_jit::flow::Verdict".to_string());
+        reg.enum_roots.insert("Verdict".to_string());
 
         harden_duplicate_leaf_metadata(&mut reg, &mut origins, &mut enums);
 
@@ -8093,12 +8174,44 @@ mod tests {
             !enums.contains_key("StepResult"),
             "discriminant-divergent duplicate leaf must lose its bare alias"
         );
+        assert!(
+            !reg.enum_roots.contains("StepResult"),
+            "a discriminant-divergent enum leaf must not remain an enum-root alias"
+        );
         assert!(enums.contains_key("pyre_interpreter::eval::StepResult"));
         assert!(enums.contains_key("pyre_jit::eval::StepResult"));
         assert_eq!(
             enums.get("Verdict"),
             Some(&same_as_a),
             "equal-map duplicates keep the alias"
+        );
+        assert!(
+            reg.enum_roots.contains("Verdict"),
+            "equal-map duplicate enum roots keep the alias"
+        );
+    }
+
+    #[test]
+    fn harden_withdraws_enum_root_alias_for_struct_enum_leaf_collision() {
+        let mut reg = crate::front::semantic::StructFieldRegistry::default();
+        let enum_shape = rows(&[("__discriminant", "i64")]);
+        let struct_shape = rows(&[("payload", "i64")]);
+        reg.fields
+            .insert("left::Thing".to_string(), enum_shape.clone());
+        reg.fields.insert("right::Thing".to_string(), struct_shape);
+        reg.fields.insert("Thing".to_string(), enum_shape);
+        reg.enum_roots.insert("left::Thing".to_string());
+        reg.enum_roots.insert("Thing".to_string());
+        let mut origins = std::collections::HashMap::new();
+        origins.insert("Thing".to_string(), "left".to_string());
+        let mut enums = std::collections::HashMap::new();
+
+        harden_duplicate_leaf_metadata(&mut reg, &mut origins, &mut enums);
+
+        assert!(reg.enum_roots.contains("left::Thing"));
+        assert!(
+            !reg.enum_roots.contains("Thing"),
+            "mixed struct/enum duplicate leaf must lose the enum-root bare alias"
         );
     }
 

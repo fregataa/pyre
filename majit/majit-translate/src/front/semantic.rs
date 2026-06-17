@@ -9,7 +9,7 @@
 //! `front::mir`, the Charon ULLBC driver.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::model::{FunctionGraph, ImmutableRank, UnknownKind};
 
@@ -110,6 +110,10 @@ pub struct SemanticFunction {
 pub struct StructFieldRegistry {
     /// struct_name → [(field_name, full_field_type_string)]
     pub fields: HashMap<String, Vec<(String, String)>>,
+    /// Type roots registered from `TypeDeclKind::Enum`, published
+    /// under the same qualified and bare keys as `fields`.
+    #[serde(default)]
+    pub enum_roots: HashSet<String>,
 }
 
 impl StructFieldRegistry {
@@ -139,19 +143,27 @@ impl StructFieldRegistry {
     /// (every variant fieldless).  Payload-bearing enums carry the union
     /// of their variant fields as further rows.
     pub fn is_unit_only_enum(&self, owner: &str) -> bool {
-        self.lookup_fields(owner)
-            .is_some_and(|rows| matches!(rows, [(name, _)] if name == "__discriminant"))
+        self.is_enum_root(owner)
+            && self
+                .lookup_fields(owner)
+                .is_some_and(|rows| matches!(rows, [(name, _)] if name == "__discriminant"))
     }
 
-    /// True when `owner` is registered as an enum flat class — its first
-    /// row is the synthetic `__discriminant` tag.  Unlike
+    /// True when `owner` is registered as an enum flat class.  Unlike
     /// [`Self::is_unit_only_enum`] this also holds for payload-bearing
-    /// enums (whose later rows carry the union of variant fields), so it
-    /// gates the variant-ctor base linkage that every enum needs for
-    /// sibling variants to share a `commonbase`.
+    /// enums, so it gates the variant-ctor base linkage that every enum
+    /// needs for sibling variants to share a `commonbase`.
     pub fn is_enum_root(&self, owner: &str) -> bool {
-        self.lookup_fields(owner)
-            .is_some_and(|rows| matches!(rows.first(), Some((name, _)) if name == "__discriminant"))
+        if self.enum_roots.contains(owner) {
+            return true;
+        }
+        let receiver_leaf = owner.rsplit("::").next().unwrap_or(owner);
+        let canonical = majit_ir::descr::canonical_struct_name(receiver_leaf);
+        if canonical != receiver_leaf && self.enum_roots.contains(&canonical) {
+            return true;
+        }
+        self.unique_suffix_owner_key(owner)
+            .is_some_and(|key| self.enum_roots.contains(key))
     }
 
     fn lookup_fields(&self, owner: &str) -> Option<&[(String, String)]> {
@@ -447,6 +459,57 @@ mod tests {
             functions,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn enum_root_detection_uses_explicit_registry_not_discriminant_field() {
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "Plain".to_string(),
+            vec![
+                ("__discriminant".to_string(), "i64".to_string()),
+                ("payload".to_string(), "i64".to_string()),
+            ],
+        );
+        assert!(
+            !reg.is_enum_root("Plain"),
+            "a struct field named __discriminant must not make the owner an enum root"
+        );
+        assert!(!reg.is_unit_only_enum("Plain"));
+
+        reg.fields.insert(
+            "Color".to_string(),
+            vec![
+                ("__discriminant".to_string(), "i64".to_string()),
+                ("rgb".to_string(), "i64".to_string()),
+            ],
+        );
+        reg.enum_roots.insert("Color".to_string());
+        assert!(reg.is_enum_root("Color"));
+        assert!(!reg.is_unit_only_enum("Color"));
+
+        reg.fields.insert(
+            "Signal".to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        reg.enum_roots.insert("Signal".to_string());
+        assert!(reg.is_enum_root("Signal"));
+        assert!(reg.is_unit_only_enum("Signal"));
+
+        reg.fields.insert(
+            "left::Thing".to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        reg.fields.insert(
+            "right::Thing".to_string(),
+            vec![("payload".to_string(), "i64".to_string())],
+        );
+        reg.enum_roots.insert("left::Thing".to_string());
+        assert!(reg.is_enum_root("left::Thing"));
+        assert!(
+            !reg.is_enum_root("Thing"),
+            "a duplicate leaf must not resolve through the enum-root suffix fallback"
+        );
     }
 
     #[test]

@@ -843,7 +843,7 @@ pub enum OpKind {
     /// Constant resolved by the rtyper to a CLASSTYPE pointer; the
     /// rtyper then dispatches to
     /// [`InstanceRepr::rtype_isinstance`](crate::translator::rtyper::rclass::InstanceRepr::rtype_isinstance)
-    /// which mints either `ll_isinstance_const_{,nonnull}_<min>_<max>`
+    /// which mints either `ll_isinstance_const_{,nonnull}_<flavor>_<class_identity>`
     /// (Constant `class_carrier`) or the generic `ll_isinstance`
     /// (Variable `class_carrier`).
     IsInstance {

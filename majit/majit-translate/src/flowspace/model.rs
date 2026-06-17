@@ -2353,6 +2353,19 @@ pub enum ConstValue {
     /// has no cross-session `id()`, so we materialise identity as an
     /// atomic counter.
     SpecTag(u64),
+    /// Symbolic inheritance-id marker carrying a classdef's `minid` /
+    /// `maxid` for an `ll_issubclass_const` / exception-match range
+    /// check. `lltype()` is `Signed`; the concrete integer resolves only
+    /// at code emission (`emit_const_i_from_const`), like `AddressOffset`.
+    /// `value` holds the resolved id and is the integer emitted. `cdef_id`
+    /// (the stable `get_unique_cdef_id`) and `is_max` (min vs max
+    /// endpoint) identify the marker; `cdef_id` is `None` when only the
+    /// eager `value` is available.
+    InheritanceId {
+        cdef_id: Option<usize>,
+        is_max: bool,
+        value: i64,
+    },
 }
 
 impl PartialEq for ConstValue {
@@ -2384,6 +2397,18 @@ impl PartialEq for ConstValue {
             (ConstValue::HostObject(a), ConstValue::HostObject(b)) => a == b,
             (ConstValue::SpecTag(a), ConstValue::SpecTag(b)) => a == b,
             (ConstValue::AddressOffset(a), ConstValue::AddressOffset(b)) => a == b,
+            (
+                ConstValue::InheritanceId {
+                    cdef_id: a,
+                    is_max: x,
+                    value: v,
+                },
+                ConstValue::InheritanceId {
+                    cdef_id: b,
+                    is_max: y,
+                    value: w,
+                },
+            ) => a == b && x == y && v == w,
             _ => false,
         }
     }
@@ -2417,6 +2442,7 @@ impl std::fmt::Display for ConstValue {
             | ConstValue::LLAddress(_)
             | ConstValue::Function(_) => write!(f, "{self:?}"),
             ConstValue::AddressOffset(offset) => write!(f, "{offset:?}"),
+            ConstValue::InheritanceId { value, .. } => write!(f, "<inheritance-id {value}>"),
         }
     }
 }
@@ -2472,6 +2498,15 @@ impl Hash for ConstValue {
             ConstValue::HostObject(obj) => obj.hash(state),
             ConstValue::SpecTag(id) => id.hash(state),
             ConstValue::AddressOffset(offset) => offset.hash(state),
+            ConstValue::InheritanceId {
+                cdef_id,
+                is_max,
+                value,
+            } => {
+                cdef_id.hash(state);
+                is_max.hash(state);
+                value.hash(state);
+            }
         }
     }
 }
@@ -3111,6 +3146,7 @@ impl ConstValue {
             ConstValue::Atom(_) => Some(true),
             ConstValue::SpecTag(_) => Some(true),
             ConstValue::AddressOffset(_) => Some(true),
+            ConstValue::InheritanceId { .. } => Some(true),
         }
     }
 
@@ -3197,6 +3233,7 @@ impl ConstValue {
             | ConstValue::LLPtr(_)
             | ConstValue::LLAddress(_)
             | ConstValue::AddressOffset(_)
+            | ConstValue::InheritanceId { .. }
             | ConstValue::SpecTag(_) => None,
         }
     }

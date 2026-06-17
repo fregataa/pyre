@@ -234,6 +234,7 @@ impl Repr for IntegerRepr {
     fn convert_const(&self, value: &ConstValue) -> Result<Constant, TyperError> {
         let converted = match value {
             ConstValue::AddressOffset(_) => value.clone(),
+            ConstValue::InheritanceId { .. } => value.clone(),
             ConstValue::Int(_) => value.clone(),
             ConstValue::Bool(value) => ConstValue::Int(i64::from(*value)),
             _ => return Err(TyperError::message(format!("not an integer: {value:?}"))),

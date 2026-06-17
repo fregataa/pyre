@@ -2449,6 +2449,10 @@ impl Assembler {
             ConstValue::Int(n) => *n,
             ConstValue::Bool(b) => *b as i64,
             ConstValue::SpecTag(tag) => *tag as i64,
+            // Symbolic inheritance-id marker: emit the resolved id. When
+            // only the eager `value` is present it is the concrete id;
+            // `cdef_id` reserves the key for a numbering resolution.
+            ConstValue::InheritanceId { value, .. } => *value,
             ConstValue::AddressOffset(offset) => {
                 let resolved = match callcontrol {
                     Some(cc) => offset.byte_size(cc),

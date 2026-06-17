@@ -350,6 +350,7 @@ fn const_truthy(value: &ConstValue) -> bool {
         | ConstValue::LLPtr(_)
         | ConstValue::LLAddress(_)
         | ConstValue::AddressOffset(_)
+        | ConstValue::InheritanceId { .. }
         | ConstValue::SpecTag(_)
         | ConstValue::HostObject(_) => true,
     }
@@ -586,6 +587,15 @@ impl ClassRepr {
     /// RPython `ClassRepr.classdef` (rclass.py:194).
     pub fn classdef(&self) -> Rc<RefCell<ClassDef>> {
         self.classdef.clone()
+    }
+
+    /// True once [`Self::init_vtable`] has built the solid vtable. A
+    /// materialized vtable means this class's `subclassrange_min/max` has
+    /// been (or may have been) baked into an immutable jitcode constant, so
+    /// `normalizecalls::assign_inheritance_ids` must not re-resolve it to a
+    /// different range.
+    pub fn is_vtable_materialized(&self) -> bool {
+        self.vtable.borrow().is_some()
     }
 
     /// RPython `ClassRepr.vtable_type` (rclass.py:195). Exposed so
@@ -1313,8 +1323,26 @@ fn rtype_issubtype_helper(
                 "{caller}: subclassrange_max not Signed, got {max_val:?}"
             )));
         };
-        let c_min = Constant::with_concretetype(ConstValue::Int(min_n), LowLevelType::Signed);
-        let c_max = Constant::with_concretetype(ConstValue::Int(max_n), LowLevelType::Signed);
+        // Carry the range markers as symbolic inheritance ids resolved at
+        // emission; the eager `value` keeps the emitted constant identical.
+        // The owning classdef is not in scope here (only the vtable `_ptr`),
+        // so `cdef_id` is `None`.
+        let c_min = Constant::with_concretetype(
+            ConstValue::InheritanceId {
+                cdef_id: None,
+                is_max: false,
+                value: min_n,
+            },
+            LowLevelType::Signed,
+        );
+        let c_max = Constant::with_concretetype(
+            ConstValue::InheritanceId {
+                cdef_id: None,
+                is_max: true,
+                value: max_n,
+            },
+            LowLevelType::Signed,
+        );
         // upstream: `gendirectcall(ll_issubclass_const, v_cls1,
         //   minid, maxid)`.
         let helper = rtyper.lowlevel_helper_function(
@@ -4752,8 +4780,22 @@ mod tests {
         let Hlvalue::Constant(c_max) = &dc.args[3] else {
             panic!("c_max must be a Constant");
         };
-        assert_eq!(c_min.value, ConstValue::Int(2));
-        assert_eq!(c_max.value, ConstValue::Int(2));
+        assert_eq!(
+            c_min.value,
+            ConstValue::InheritanceId {
+                cdef_id: None,
+                is_max: false,
+                value: 2,
+            }
+        );
+        assert_eq!(
+            c_max.value,
+            ConstValue::InheritanceId {
+                cdef_id: None,
+                is_max: true,
+                value: 2,
+            }
+        );
     }
 
     #[test]

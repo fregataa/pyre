@@ -1352,6 +1352,7 @@ pub(crate) fn constvalue_kind(cv: &ConstValue) -> char {
         | ConstValue::Bool(_)
         | ConstValue::SpecTag(_)
         | ConstValue::AddressOffset(_)
+        | ConstValue::InheritanceId { .. }
         | ConstValue::LLAddress(_) => 'i',
         ConstValue::Float(_) => 'f',
         ConstValue::None

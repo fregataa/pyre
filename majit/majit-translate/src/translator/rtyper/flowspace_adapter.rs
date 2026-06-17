@@ -1549,12 +1549,12 @@ pub fn translate_op(
                         // itself (`resolve_aggregate_adt` pushes the
                         // enum leaf onto the variant's owner path); a
                         // struct ctor's owner tail is its module.  The
-                        // enum registers as a flat class whose first
-                        // row is the synthetic `__discriminant` tag
-                        // (`front::mir` metadata collection) — no
-                        // struct carries one — so that row
-                        // discriminates the two.  Mint the variant
-                        // class as a subclass of the flat enum class:
+                        // enum registers as a flat class and records
+                        // its type root explicitly in
+                        // `StructFieldRegistry::enum_roots`, so this
+                        // check does not depend on the synthetic
+                        // `__discriminant` field name.  Mint the
+                        // variant class as a subclass of the flat enum class:
                         // sibling variants then union to
                         // `SomeInstance(enum)` through
                         // `ClassDef::commonbase` (classdesc.py:251-254)
@@ -1567,8 +1567,7 @@ pub fn translate_op(
                         // the field-read side uses
                         // (`getuniqueclassdef_for_struct_root`), so
                         // ctor base and attr reads share one
-                        // `HostObject` Arc.  Applies to every enum root
-                        // (flat class leads with `__discriminant`),
+                        // `HostObject` Arc.  Applies to every enum root,
                         // payload-bearing included: the variant subclass
                         // inherits the base's projected payload rows
                         // exactly as the discriminant-narrowing path
@@ -3755,6 +3754,68 @@ mod tests {
             panic!("ctor callable must be ConstValue::HostObject");
         };
         assert_eq!(host.qualname(), "Point");
+    }
+
+    #[test]
+    fn translate_op_call_synthetic_transparent_ctor_uses_explicit_enum_root_registry() {
+        fn color_registry(mark_enum: bool) -> crate::front::StructFieldRegistry {
+            let mut reg = crate::front::StructFieldRegistry::default();
+            reg.fields.insert(
+                "Color".to_string(),
+                vec![
+                    ("__discriminant".to_string(), "i64".to_string()),
+                    ("rgb".to_string(), "i64".to_string()),
+                ],
+            );
+            if mark_enum {
+                reg.enum_roots.insert("Color".to_string());
+            }
+            reg
+        }
+
+        fn lower_ctor(
+            reg: crate::front::StructFieldRegistry,
+        ) -> crate::flowspace::model::HostObject {
+            let registry = empty_call_registry();
+            registry.set_pyre_struct_fields(Rc::new(reg));
+            let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+            let mut graph = LegacyGraph::new("translate_op_fixture");
+            let vars = mint_vars(&mut graph, 3);
+            value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
+            value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
+            let op = SpaceOperation {
+                result: Some(vars[2].clone()),
+                kind: OpKind::Call {
+                    target: crate::model::CallTarget::SyntheticTransparentCtor {
+                        name: "Rgb".into(),
+                        owner_path: vec!["Color".into()],
+                    },
+                    args: vec![vars[1].clone()],
+                    result_ty: ValueType::Ref(None),
+                },
+            };
+            let translated =
+                translate_op(&op, &value_map, &registry).expect("variant ctor must lower");
+            let Hlvalue::Constant(ref callable) = translated[0].args[0] else {
+                panic!("simple_call callable must be a Constant");
+            };
+            let ConstValue::HostObject(ref host) = callable.value else {
+                panic!("ctor callable must be ConstValue::HostObject");
+            };
+            host.clone()
+        }
+
+        let plain = lower_ctor(color_registry(false));
+        assert_eq!(plain.qualname(), "Color.Rgb");
+        assert!(
+            plain.class_bases().is_some_and(|bases| bases.is_empty()),
+            "__discriminant field rows alone must not mark a ctor as an enum variant"
+        );
+
+        let variant = lower_ctor(color_registry(true));
+        let bases = variant.class_bases().expect("variant ctor is a class");
+        assert_eq!(bases.len(), 1);
+        assert_eq!(bases[0].qualname(), "Color");
     }
 
     #[test]
