@@ -4285,7 +4285,6 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    #[ignore = "vable CALL_ASSEMBLER expansion still materializes the wrong frame: returns 0 instead of the rewritten vable field value (distinct from the FINISH done-descr kind bug)"]
     fn test_call_assembler_uses_gc_rewritten_vable_frame_without_double_materializing() {
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 1 << 20,
