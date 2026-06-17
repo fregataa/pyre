@@ -320,7 +320,23 @@ pub(crate) fn lower_result_exc_returns(
                         graph.name, field.name
                     ));
                 }
-                fieldwrite_idx = Some((i, value.clone()));
+                // The `__pos_0` payload flows on to a `to_exc_object`
+                // call / forwarding exit as an SSA operand, so an
+                // exception-carrying Result writes the ref-kind evalue
+                // `Variable`.  Since the int-kind `FieldWrite` widening
+                // (`LinkArg::Value`→`LinkArg::Const`) a payload write may
+                // instead carry an inline constant; that is never the
+                // exception-bridge shape (a const evalue cannot reach
+                // `to_exc_object`), so skip the rewrite rather than panic.
+                let Some(payload_var) = value.as_variable() else {
+                    return Err(format!(
+                        "{}: block {bi} Result __pos_0 payload write stores an \
+                         inline constant, not the evalue Variable threaded to \
+                         to_exc_object — not an exception-carrying Result shape",
+                        graph.name
+                    ));
+                };
+                fieldwrite_idx = Some((i, payload_var.clone()));
             }
         }
         let Some((fw_idx, payload)) = fieldwrite_idx else {
@@ -507,8 +523,23 @@ fn op_operand_vars(kind: &OpKind) -> Vec<Variable> {
         | OpKind::VableFieldRead { base, .. }
         | OpKind::VableForce { base }
         | OpKind::RecordQuasiImmutField { base, .. } => vec![base.clone()],
-        OpKind::FieldWrite { base, value, .. } | OpKind::VableFieldWrite { base, value, .. } => {
-            vec![base.clone(), value.clone()]
+        OpKind::FieldWrite { base, value, .. } => {
+            // Only a `Variable` value contributes an SSA reference; a
+            // `setfield_gc` inline `Const` carries no defining op.
+            let mut refs = vec![base.clone()];
+            if let Some(var) = value.as_variable() {
+                refs.push(var.clone());
+            }
+            refs
+        }
+        OpKind::VableFieldWrite { base, value, .. } => {
+            // Only a `Variable` value contributes an SSA reference; a
+            // `setfield_vable_i` inline `Const` carries no defining op.
+            let mut refs = vec![base.clone()];
+            if let Some(var) = value.as_variable() {
+                refs.push(var.clone());
+            }
+            refs
         }
         OpKind::ArrayRead { base, index, .. } | OpKind::InteriorFieldRead { base, index, .. } => {
             vec![base.clone(), index.clone()]
@@ -1100,7 +1131,7 @@ fn build_shell(
                     name: "__pos_0".to_string(),
                     owner_root: Some(owner),
                 },
-                value: payload,
+                value: crate::model::LinkArg::Value(payload),
                 ty: ValueType::Ref(None),
             },
         });

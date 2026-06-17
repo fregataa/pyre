@@ -2463,9 +2463,12 @@ fn emit_frontend_newlist(
     items: Vec<super::flow::FlowValue>,
     offset: i64,
 ) -> super::flow::Variable {
-    // flowcontext.py:1168-1171 BUILD_LIST -> `op.newlist(*items).eval(self)`.
-    // Preserve the frontend semantic op in the graph; the current
-    // build_list helper call remains a pyre backend adaptation only.
+    // flowcontext.py:1168-1170 BUILD_LIST -> `op.newlist(*items).eval(self)`.
+    // The flowspace graph carries a single `newlist` op over the operand
+    // items; the fixed-size array materialisation (`new_array_clear` +
+    // `setarrayitem_gc_r` + `newlist_from_array`) is the rtyper's job and is
+    // deferred to `lower_frontend_collection_ops`, which runs before register
+    // allocation.
     emit_graph_op_with_result(
         graph,
         block,
@@ -2474,6 +2477,108 @@ fn emit_frontend_newlist(
         Kind::Ref,
         offset,
     )
+}
+
+fn emit_frontend_newtuple(
+    graph: &mut super::flow::FunctionGraph,
+    block: &super::flow::BlockRef,
+    items: Vec<super::flow::FlowValue>,
+    offset: i64,
+) -> super::flow::Variable {
+    // flowcontext.py:1163-1165 BUILD_TUPLE -> `op.newtuple(*items).eval(self)`.
+    // Same flowspace/rtyper split as `newlist`: the single `newtuple` op is
+    // lowered to the fixed-size array build by `lower_frontend_collection_ops`.
+    emit_graph_op_with_result(
+        graph,
+        block,
+        "newtuple",
+        items.into_iter().map(Into::into).collect(),
+        Kind::Ref,
+        offset,
+    )
+}
+
+/// rtyper-analog lowering of the flowspace `newlist`/`newtuple` ops emitted
+/// by BUILD_LIST/BUILD_TUPLE (`flowcontext.py:1165,1170`) into the fixed-size
+/// array build the backend consumes:
+///
+/// ```text
+/// v = new_array_clear(Constant(len))
+/// setarrayitem_gc_r(v, Constant(0), item_0)
+/// ...
+/// setarrayitem_gc_r(v, Constant(len-1), item_{len-1})
+/// w = newlist_from_array(v)        # or newtuple_from_array(v)
+/// ```
+///
+/// RPython performs this lowering in the rtyper (`rtype_newlist`,
+/// `rpython/rtyper/rlist.py`; `rtype_newtuple`, `rpython/rtyper/rtuple.py`)
+/// long before the codewriter / flatten / regalloc stages run. Pyre fuses
+/// those stages, so the lowering runs here as a dedicated pass immediately
+/// before register allocation — the fresh array `Variable` must exist before
+/// the regalloc pre-pass colours the graph (`getcolor_var` panics on an
+/// uncoloured Variable). The array `Variable` is a short-lived temporary: it
+/// is produced by `new_array_clear` and dies at `*_from_array`, never live
+/// across a guard, so it never enters resume numbering.
+fn lower_frontend_collection_ops(graph: &super::flow::FunctionGraph) {
+    use super::flow::{Constant, FlowValue, SpaceOperation};
+    for block in graph.iterblocks() {
+        let has_collection_op = block
+            .borrow()
+            .operations
+            .iter()
+            .any(|op| op.opname == "newlist" || op.opname == "newtuple");
+        if !has_collection_op {
+            continue;
+        }
+        let old_ops = std::mem::take(&mut block.borrow_mut().operations);
+        let mut new_ops: Vec<SpaceOperation> = Vec::with_capacity(old_ops.len());
+        for op in old_ops {
+            let from_array_opname = match op.opname.as_str() {
+                "newlist" => "newlist_from_array",
+                "newtuple" => "newtuple_from_array",
+                _ => {
+                    new_ops.push(op);
+                    continue;
+                }
+            };
+            let len = op.args.len();
+            // `new_array_clear(Constant(len))` -> fresh array Variable. The
+            // length travels as the array's length-prefix constant; there is
+            // no arity cap.
+            let array_var = graph.fresh_variable(Kind::Ref);
+            new_ops.push(SpaceOperation::new(
+                "new_array_clear",
+                vec![FlowValue::Constant(Constant::signed(len as i64)).into()],
+                Some(array_var.into()),
+                op.offset,
+            ));
+            // `setarrayitem_gc_r(array, Constant(i), item_i)`. The op's args
+            // are already `bottom-to-top` order (the codewriter reverses the
+            // pop order), so the indices line up with `values_w[i]`.
+            for (i, item) in op.args.iter().enumerate() {
+                new_ops.push(SpaceOperation::new(
+                    "setarrayitem_gc_r",
+                    vec![
+                        FlowValue::Variable(array_var).into(),
+                        FlowValue::Constant(Constant::signed(i as i64)).into(),
+                        item.clone(),
+                    ],
+                    None,
+                    op.offset,
+                ));
+            }
+            // `space.newlist(items_w)` / `space.newtuple(items_w)` — a single
+            // residual call consuming the forced array, preserving the
+            // original `newlist`/`newtuple` result Variable.
+            new_ops.push(SpaceOperation::new(
+                from_array_opname,
+                vec![FlowValue::Variable(array_var).into()],
+                op.result.clone(),
+                op.offset,
+            ));
+        }
+        block.borrow_mut().operations = new_ops;
+    }
 }
 
 fn emit_frontend_newslice(
@@ -3356,8 +3461,8 @@ struct FnPtrIndices {
     getattr_fn: HelperHandle,
     load_name_fn: HelperHandle,
     store_name_fn: HelperHandle,
-    build_list_fn: HelperHandle,
     newtuple_from_array_fn: HelperHandle,
+    newlist_from_array_fn: HelperHandle,
     unpack_sequence_fn: HelperHandle,
     unpack_item_fn: HelperHandle,
     build_slice_fn: HelperHandle,
@@ -3413,8 +3518,8 @@ struct FnPtrIndices {
 ///   exception-class `__init__`); arbitrary user code that observes
 ///   virtualizables.  Matches `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE`
 ///   (`effectinfo.py:23`) → `MayForce`.
-/// * `load_global_fn` / `build_list_fn` / `build_slice_fn`: namespace dict lookup +
-///   list allocation; can raise (`NameError` / `MemoryError`) but do
+/// * `load_global_fn` / `build_slice_fn`: namespace dict lookup +
+///   slice allocation; can raise (`NameError` / `MemoryError`) but do
 ///   not force virtuals — `EF_CAN_RAISE` → `Plain`.
 /// * `box_int_fn` / `load_const_fn`: kept on `Plain` until the
 ///   upstream `@jit.elidable_promote` decorator is wired
@@ -3505,12 +3610,6 @@ fn register_helper_fn_pointers(
         cpu.store_subscr_fn as *const (),
         CallFlavor::MayForce,
     );
-    // `bh_build_list_fn` is allocation-only — `build_list_from_refs`
-    // wraps the supplied PyObjectRefs; items are pre-existing heap
-    // refs, no user `__init__` invocation (`call_jit.rs:3452-3464`).
-    // Matches `EF_CAN_RAISE` (allocation can `MemoryError`) without
-    // virtual-force.
-    let build_list_fn = bind(assembler, cpu.build_list_fn as *const (), CallFlavor::Plain);
     // `pypy/interpreter/pyopcode.py:1463-1472 BUILD_SLICE` calls
     // `space.newslice(w_start, w_end, w_step)`.  Pyre mirrors that with
     // a flat allocation helper; no user code runs, but allocation can fail.
@@ -3555,9 +3654,9 @@ fn register_helper_fn_pointers(
         cpu.set_current_exception_fn as *const (),
         CallFlavor::PlainCannotRaiseNoHeap,
     );
-    // `bh_newtuple_from_array` is allocation-only, same classification as
-    // `bh_build_list_fn` (`newtuple(list_w)` consuming the forced popvalues
-    // array, objspace.py:332): can `MemoryError`, no virtual-force.
+    // `bh_newtuple_from_array` is allocation-only (`newtuple(list_w)`
+    // consuming the forced popvalues array, objspace.py:332): can
+    // `MemoryError`, no virtual-force.
     let newtuple_from_array_fn = bind(
         assembler,
         cpu.newtuple_from_array_fn as *const (),
@@ -3755,6 +3854,21 @@ fn register_helper_fn_pointers(
         cpu.list_extend_fn as *const (),
         CallFlavor::MayForce,
     );
+    // `bh_newlist_from_array` (`newlist(list_w)` consuming the forced
+    // popvalues_mutable array) allocates a list and unboxes each element to
+    // pick the storage strategy; the allocation can raise (MemoryError) but
+    // it runs no user code and does not touch the virtualizable, so the
+    // effect is `EF_CAN_RAISE` → `Plain` (`call.py:288`: only the
+    // virtualizable analyzer raises `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE`).
+    // Virtual element boxes passed as call args are forced automatically by
+    // any residual call, independent of this flavor.  Matches the
+    // pointer-copy-only `bh_newtuple_from_array` sibling (`Plain`).
+    // Bound after the existing fn_ptrs to preserve their indices.
+    let newlist_from_array_fn = bind(
+        assembler,
+        cpu.newlist_from_array_fn as *const (),
+        CallFlavor::Plain,
+    );
     FnPtrIndices {
         call_fn,
         load_global_fn,
@@ -3767,8 +3881,8 @@ fn register_helper_fn_pointers(
         getattr_fn,
         load_name_fn,
         store_name_fn,
-        build_list_fn,
         newtuple_from_array_fn,
+        newlist_from_array_fn,
         unpack_sequence_fn,
         unpack_item_fn,
         build_slice_fn,
@@ -4620,15 +4734,15 @@ impl CodeWriter {
                     idx: store_name_fn_idx,
                     flavor: _store_name_fn_flavor,
                 },
-            build_list_fn:
-                HelperHandle {
-                    idx: build_list_fn_idx,
-                    flavor: _build_list_fn_flavor,
-                },
             newtuple_from_array_fn:
                 HelperHandle {
                     idx: newtuple_from_array_fn_idx,
                     flavor: _newtuple_from_array_fn_flavor,
+                },
+            newlist_from_array_fn:
+                HelperHandle {
+                    idx: newlist_from_array_fn_idx,
+                    flavor: _newlist_from_array_fn_flavor,
                 },
             unpack_sequence_fn:
                 HelperHandle {
@@ -4848,8 +4962,8 @@ impl CodeWriter {
                 getattr_fn_idx,
                 load_name_fn_idx,
                 store_name_fn_idx,
-                build_list_fn_idx,
                 newtuple_from_array_fn_idx,
+                newlist_from_array_fn_idx,
                 // `[u16; 9]` indexed by nargs (0..=8).  `call_fn_idx` (nargs=1)
                 // is the unsuffixed binding from line 3153; the suffixed
                 // 0/2..=8 fill the surrounding slots.
@@ -7238,27 +7352,16 @@ impl CodeWriter {
                             }
                         }
 
-                        // flowcontext.py:1168 BUILD_LIST -> `op.newlist(*items).eval(self)`
-                        // consumes all `itemcount` items and returns the list.
-                        // pyre's `build_list_fn` helper accepts the small fixed
-                        // arities this bytecode lowering can pass directly; larger
-                        // lists fall back to `abort_permanent` + interpreter —
-                        // silently dropping items was the prior behaviour and would
-                        // have produced wrong list contents at runtime.
+                        // flowcontext.py:1168-1170 BUILD_LIST — `items =
+                        // self.popvalues(itemcount)` then `w_list =
+                        // op.newlist(*items).eval(self)`.  The flowspace graph
+                        // records a single `newlist` op; the array
+                        // materialisation (`new_array_clear` +
+                        // `setarrayitem_gc_r` + `newlist_from_array`) is the
+                        // rtyper's job, deferred to
+                        // `lower_frontend_collection_ops`.  No arity cap.
                         Instruction::BuildList { count } => {
                             let argc = count.get(op_arg) as usize;
-                            if argc > 3 {
-                                for _ in 0..argc {
-                                    let _ = emit_popvalue_ref!(current_depth, py_pc);
-                                    let _ = pop_ref_or_fresh(&mut current_state, &mut graph);
-                                }
-                                emit_abort_permanent!(py_pc);
-                                push_fresh_ref(&mut current_state, &mut graph);
-                                current_depth += 1;
-                                emit_vsd!(current_depth, py_pc);
-                                continue;
-                            }
-                            let mut arg_regs_rev: Vec<u16> = Vec::with_capacity(argc);
                             let mut item_values_rev = Vec::with_capacity(argc);
                             for _ in 0..argc {
                                 let item_reg = emit_popvalue_ref!(current_depth, py_pc);
@@ -7266,41 +7369,20 @@ impl CodeWriter {
                                 if let super::flow::FlowValue::Variable(v) = &item_value {
                                     pin!(Some(*v), item_reg);
                                 }
-                                arg_regs_rev.push(item_reg);
                                 item_values_rev.push(item_value);
                             }
-                            let _: Vec<u16> = arg_regs_rev.iter().rev().copied().collect();
-                            // build_list_fn(argc, item0, item1, item2) → list. The C ABI is
-                            // `extern "C" fn(i64, i64, i64, i64)`; the helper dispatches
-                            // internally by `argc`, so unused item slots may be any
-                            // bit pattern. Encode unused slots as `ConstInt(0)` —
-                            // routed through the int constants pool, matches
-                            // upstream `make_three_lists` Constant admit
-                            // (jtransform.py:437-445). Used item slots stay
-                            // Ref-typed so they read from `registers_r`.
+                            // popvalues pops top-first; values_w keeps
+                            // bottom-to-top order (`values_w[n-1] = top`), so
+                            // reverse the pop order.
+                            let items: Vec<super::flow::FlowValue> =
+                                item_values_rev.into_iter().rev().collect();
                             let result_value = emit_frontend_newlist(
                                 &mut graph,
                                 &current_block.block(),
-                                item_values_rev.into_iter().rev().collect(),
+                                items,
                                 py_pc as i64,
                             );
                             pin!(Some(result_value), stack_base + current_depth);
-                            // BuildList factor
-                            // refactor.  The prior `emit_residual_call(
-                            // build_list_fn_idx, ...)` is replaced by a
-                            // single direct push of
-                            // `build_build_list_fn_residual_call_ir_r_insn`.
-                            // The helper internally pads unused item slots
-                            // with `ConstInt(0)` matching the prior inline
-                            // dummy logic, and produces the same `residual_
-                            // call_ir_r(ConstInt(fn_idx), ListI([argc, ...
-                            // dummies]), ListR([... regs]), Descr)` shape
-                            // `emit_residual_call_shape` would have
-                            // produced.  No graph dual-write exists for
-                            // build_list_fn (only the `newlist` frontend
-                            // HLOp recorded above).  Helper hardcodes
-                            // `CallFlavor::Plain` matching the production
-                            // source at codewriter.rs:2226.
                             push_and_bump!(result_value.into(), py_pc);
                         }
 
@@ -8333,15 +8415,12 @@ impl CodeWriter {
 
                         // BuildTuple(count): pops count items, pushes 1 tuple. Net: -(count-1).
                         //
-                        // pyopcode.py:995-998 BUILD_TUPLE — `items =
-                        // self.popvalues(itemcount)` (`pyframe.py:408-419`,
-                        // `@jit.unroll_safe` — the fixed-size list build
-                        // unrolls to `new_array_clear` + itemcount ×
-                        // `setarrayitem_gc_r`) followed by `w_tuple =
-                        // self.space.newtuple(items_w)` (`objspace.py:332`,
-                        // NOT unroll_safe — a single residual call consuming
-                        // the forced list).  No arity cap: argc travels as
-                        // the `new_array_clear` length constant.
+                        // flowcontext.py:1163-1165 BUILD_TUPLE — `items =
+                        // self.popvalues(itemcount)` then `w_tuple =
+                        // op.newtuple(*items).eval(self)`.  The flowspace graph
+                        // records a single `newtuple` op; the array
+                        // materialisation is deferred to the rtyper-analog
+                        // `lower_frontend_collection_ops`.  No arity cap.
                         Instruction::BuildTuple { count } => {
                             let argc = count.get(op_arg) as usize;
                             let mut item_values_rev = Vec::with_capacity(argc);
@@ -8355,46 +8434,13 @@ impl CodeWriter {
                             }
                             // popvalues pops top-first; values_w keeps
                             // bottom-to-top order (`values_w[n-1] = top`),
-                            // so reverse the pop order for the stores.
+                            // so reverse the pop order.
                             let items: Vec<super::flow::FlowValue> =
                                 item_values_rev.into_iter().rev().collect();
-                            let array_var = emit_graph_op_with_result(
+                            let result_value = emit_frontend_newtuple(
                                 &mut graph,
                                 &current_block.block(),
-                                "new_array_clear",
-                                vec![
-                                    super::flow::FlowValue::Constant(
-                                        super::flow::Constant::signed(argc as i64),
-                                    )
-                                    .into(),
-                                ],
-                                Kind::Ref,
-                                py_pc as i64,
-                            );
-                            for (i, item) in items.into_iter().enumerate() {
-                                emit_graph_op_void(
-                                    &current_block.block(),
-                                    "setarrayitem_gc_r",
-                                    vec![
-                                        super::flow::FlowValue::Variable(array_var).into(),
-                                        super::flow::FlowValue::Constant(
-                                            super::flow::Constant::signed(i as i64),
-                                        )
-                                        .into(),
-                                        item.into(),
-                                    ],
-                                    py_pc as i64,
-                                );
-                            }
-                            // objspace.py:332 `w_tuple = space.newtuple(items_w)`
-                            // — a single residual call consuming the forced
-                            // array.
-                            let result_value = emit_graph_op_with_result(
-                                &mut graph,
-                                &current_block.block(),
-                                "newtuple_from_array",
-                                vec![super::flow::FlowValue::Variable(array_var).into()],
-                                Kind::Ref,
+                                items,
                                 py_pc as i64,
                             );
                             pin!(Some(result_value), stack_base + current_depth);
@@ -9573,6 +9619,13 @@ impl CodeWriter {
         // remove_trivial_links merges single-entry/single-exit chains; the
         // canonical splice reads the simplified graph directly.
         super::simplify::remove_trivial_links(&graph);
+
+        // rtyper-analog lowering: expand the flowspace `newlist`/`newtuple`
+        // ops (BUILD_LIST/BUILD_TUPLE, `flowcontext.py:1165,1170`) into the
+        // fixed-size `new_array_clear` + `setarrayitem_gc_r` +
+        // `*_from_array` array build.  Must run before register allocation
+        // so the fresh array Variables receive colours.
+        lower_frontend_collection_ops(&graph);
 
         // Seed `walker_slot_for_variable` with each block's inputarg
         // slots before the splice regalloc coalescing reads it.  The
@@ -11026,32 +11079,6 @@ mod tests {
     }
 
     #[test]
-    fn emit_frontend_newlist_records_all_items() {
-        let start = Block::shared(Vec::new());
-        let mut graph = FunctionGraph::new("newlist", start.clone(), None);
-        let item0 = Variable::new(VariableId(20), Kind::Ref);
-        let item1 = Constant::signed(7);
-        let item2 = Variable::new(VariableId(21), Kind::Ref);
-
-        let result = emit_frontend_newlist(
-            &mut graph,
-            &start,
-            vec![item0.into(), item1.clone().into(), item2.into()],
-            44,
-        );
-
-        let block = start.borrow();
-        let op = block
-            .operations
-            .last()
-            .expect("newlist op should be recorded");
-        assert_eq!(op.opname, "newlist");
-        assert_eq!(op.offset, 44);
-        assert_eq!(op.args, vec![item0.into(), item1.into(), item2.into()]);
-        assert_eq!(op.result, Some(result.into()));
-    }
-
-    #[test]
     fn emit_frontend_newslice_records_three_ref_operands() {
         let start = Block::shared(Vec::new());
         let mut graph = FunctionGraph::new("newslice", start.clone(), None);
@@ -11078,6 +11105,123 @@ mod tests {
         assert_eq!(op.args, vec![w_start.into(), w_stop.into(), w_step.into()]);
         assert_eq!(op.result, Some(result.into()));
         assert_eq!(result.kind, Some(Kind::Ref));
+    }
+
+    #[test]
+    fn emit_frontend_newlist_records_all_items() {
+        let start = Block::shared(Vec::new());
+        let mut graph = FunctionGraph::new("newlist", start.clone(), None);
+        let item0 = Variable::new(VariableId(20), Kind::Ref);
+        let item1 = Constant::signed(7);
+        let item2 = Variable::new(VariableId(21), Kind::Ref);
+
+        let result = emit_frontend_newlist(
+            &mut graph,
+            &start,
+            vec![item0.into(), item1.clone().into(), item2.into()],
+            44,
+        );
+
+        let block = start.borrow();
+        let op = block
+            .operations
+            .last()
+            .expect("newlist op should be recorded");
+        assert_eq!(op.opname, "newlist");
+        assert_eq!(op.offset, 44);
+        assert_eq!(op.args, vec![item0.into(), item1.into(), item2.into()]);
+        assert_eq!(op.result, Some(result.into()));
+        assert_eq!(result.kind, Some(Kind::Ref));
+    }
+
+    #[test]
+    fn emit_frontend_newtuple_records_all_items() {
+        let start = Block::shared(Vec::new());
+        let mut graph = FunctionGraph::new("newtuple", start.clone(), None);
+        let item0 = Variable::new(VariableId(20), Kind::Ref);
+        let item1 = Constant::signed(7);
+        let item2 = Variable::new(VariableId(21), Kind::Ref);
+
+        let result = emit_frontend_newtuple(
+            &mut graph,
+            &start,
+            vec![item0.into(), item1.clone().into(), item2.into()],
+            45,
+        );
+
+        let block = start.borrow();
+        let op = block
+            .operations
+            .last()
+            .expect("newtuple op should be recorded");
+        assert_eq!(op.opname, "newtuple");
+        assert_eq!(op.offset, 45);
+        assert_eq!(op.args, vec![item0.into(), item1.into(), item2.into()]);
+        assert_eq!(op.result, Some(result.into()));
+        assert_eq!(result.kind, Some(Kind::Ref));
+    }
+
+    #[test]
+    fn lower_frontend_collection_ops_expands_newlist_to_array_build() {
+        let start = Block::shared(Vec::new());
+        let mut graph = FunctionGraph::new("newlist_lower", start.clone(), None);
+        let item0 = Variable::new(VariableId(30), Kind::Ref);
+        let item1 = Variable::new(VariableId(31), Kind::Ref);
+
+        let result =
+            emit_frontend_newlist(&mut graph, &start, vec![item0.into(), item1.into()], 50);
+
+        lower_frontend_collection_ops(&graph);
+
+        let block = start.borrow();
+        let ops = &block.operations;
+        // new_array_clear(Const(2)) + 2× setarrayitem_gc_r + newlist_from_array.
+        assert_eq!(ops.len(), 4);
+        assert_eq!(ops[0].opname, "new_array_clear");
+        assert_eq!(
+            ops[0].args,
+            vec![FlowValue::Constant(Constant::signed(2)).into()]
+        );
+        let array_var = match &ops[0].result {
+            Some(FlowValue::Variable(v)) => *v,
+            other => panic!("new_array_clear must produce an array Variable, got {other:?}"),
+        };
+        for (i, item) in [item0, item1].into_iter().enumerate() {
+            let op = &ops[1 + i];
+            assert_eq!(op.opname, "setarrayitem_gc_r");
+            assert_eq!(
+                op.args,
+                vec![
+                    FlowValue::Variable(array_var).into(),
+                    FlowValue::Constant(Constant::signed(i as i64)).into(),
+                    FlowValue::Variable(item).into(),
+                ]
+            );
+            assert_eq!(op.result, None);
+        }
+        assert_eq!(ops[3].opname, "newlist_from_array");
+        assert_eq!(ops[3].args, vec![FlowValue::Variable(array_var).into()]);
+        assert_eq!(ops[3].result, Some(result.into()));
+    }
+
+    #[test]
+    fn lower_frontend_collection_ops_expands_newtuple_with_newtuple_tail() {
+        let start = Block::shared(Vec::new());
+        let mut graph = FunctionGraph::new("newtuple_lower", start.clone(), None);
+        let item0 = Variable::new(VariableId(30), Kind::Ref);
+
+        let result = emit_frontend_newtuple(&mut graph, &start, vec![item0.into()], 51);
+
+        lower_frontend_collection_ops(&graph);
+
+        let block = start.borrow();
+        let ops = &block.operations;
+        // new_array_clear(Const(1)) + 1× setarrayitem_gc_r + newtuple_from_array.
+        assert_eq!(ops.len(), 3);
+        assert_eq!(ops[0].opname, "new_array_clear");
+        assert_eq!(ops[1].opname, "setarrayitem_gc_r");
+        assert_eq!(ops[2].opname, "newtuple_from_array");
+        assert_eq!(ops[2].result, Some(result.into()));
     }
 
     #[test]

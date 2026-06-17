@@ -7703,7 +7703,7 @@ mod tests {
             OpKind::FieldWrite {
                 base: base_var.clone(),
                 field: crate::model::FieldDescriptor::new("y", Some("Point".into())),
-                value: base_var.clone(), // dummy
+                value: crate::model::LinkArg::Value(base_var.clone()), // dummy
                 ty: ValueType::Int,
             },
             false,
@@ -7781,7 +7781,7 @@ mod tests {
             OpKind::FieldWrite {
                 base: base_var.clone(),
                 field: crate::model::FieldDescriptor::new("cache", Some("Obj".into())),
-                value: base_var,
+                value: crate::model::LinkArg::Value(base_var),
                 ty: ValueType::Int,
             },
             false,
@@ -8176,7 +8176,7 @@ mod tests {
             OpKind::FieldWrite {
                 base: base_var.clone(),
                 field: field.clone(),
-                value: base_var,
+                value: crate::model::LinkArg::Value(base_var),
                 ty: ValueType::Int,
             },
             false,

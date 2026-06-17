@@ -1878,17 +1878,40 @@ impl<'a> Lowering<'a> {
                 // projection element. The destination local is NOT
                 // updated — the write goes through indirection, the
                 // base local remains the same Variable.
-                let (_op, value_var) = self.build_rvalue(mir_bb, rvalue, &dest_ty)?;
-                // If `build_rvalue` produced an op, emit it first so
-                // `value_var` is bound before the write reads it.
-                if let Some(op) = _op {
-                    let bb_id = self.block_id[mir_bb];
-                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                        result: Some(value_var.clone()),
-                        kind: op,
-                    });
-                }
-                self.emit_projection_write(mir_bb, *inner, elem, value_var, &dest_ty)
+                let value = match self.field_write_inline_const(&elem, &rvalue, &dest_ty) {
+                    // An int-typed `setfield_gc_i` keeps its constant
+                    // operand inline (`LinkArg::Const`) instead of
+                    // materialising a `ConstInt` + `int_copy` into a
+                    // register: the assembler then takes the short `c`
+                    // byte (`setfield_gc_i/rcd`) or a pool slot
+                    // (`/rid`).  Mirrors RPython keeping a `ConstInt`
+                    // box as a `setfield_gc` argument and deferring the
+                    // short-vs-pool choice to `assembler.py:99-107`.
+                    // `Constant::new` defers `concretetype` to the rtyper
+                    // like every front-end synthesized constant; the
+                    // assembler recovers the value kind from the
+                    // self-describing Int/Bool `ConstValue` variant via
+                    // `constant_kind` (`getkind` fallback), so the
+                    // `setfield_gc_<kind>` opname is keyed correctly.
+                    Some(const_value) => {
+                        LinkArg::Const(crate::flowspace::model::Constant::new(const_value))
+                    }
+                    None => {
+                        let (op, value_var) = self.build_rvalue(mir_bb, rvalue, &dest_ty)?;
+                        // If `build_rvalue` produced an op, emit it first
+                        // so `value_var` is bound before the write reads
+                        // it.
+                        if let Some(op) = op {
+                            let bb_id = self.block_id[mir_bb];
+                            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                                result: Some(value_var.clone()),
+                                kind: op,
+                            });
+                        }
+                        LinkArg::Value(value_var)
+                    }
+                };
+                self.emit_projection_write(mir_bb, *inner, elem, value, &dest_ty)
             }
             _ => Err(LowerError::Unsupported(format!(
                 "bb{mir_bb}: Assign to {:?} destination not yet supported",
@@ -1909,6 +1932,59 @@ impl<'a> Lowering<'a> {
             .unwrap_or(recorded)
     }
 
+    /// If `elem` writes an int-typed struct field and `rvalue` is a
+    /// plain integer / bool constant, return the matching [`ConstValue`]
+    /// so the `FieldWrite` carries it inline (`setfield_gc_i/rcd` short
+    /// form, or `/rid` pool slot for a wide value) rather than forcing
+    /// it into a register with a `ConstInt` + `int_copy`.
+    ///
+    /// RPython keeps a `Constant` of any kind as a `setfield_gc`
+    /// argument (codewriter args are `AbstractValue`, never
+    /// pre-materialised) and leaves the short-vs-pool encoding to the
+    /// assembler (`assembler.py:99-107`), so `setfield_gc_r` /
+    /// `setfield_gc_f` carry inline ref / float constants too.
+    ///
+    /// Convergence path: the build-time assembler already routes a
+    /// non-int `LinkArg::Const` to a pooled `r` / `f` slot
+    /// (`jit_codewriter/assembler.rs` `FieldWrite` arm `else` branch ->
+    /// `emit_const`), and the walker resolves those through the constants
+    /// window of `registers_r` / `registers_f`, so the only remaining gap
+    /// is this producer.  Only int `Field` projections currently inline
+    /// their constant; ref / float fields (and `Deref` / `Index` writes)
+    /// still take a materialised Variable, pending ref-constant GC-root
+    /// verification for the pooled `ConstRef` case.
+    fn field_write_inline_const(
+        &self,
+        elem: &ProjectionElem,
+        rvalue: &Rvalue,
+        dest_ty: &TyRef,
+    ) -> Option<ConstValue> {
+        // Only a struct `Field` projection lowers to `setfield_gc_i`.
+        let is_field = matches!(
+            elem,
+            ProjectionElem::Tagged(v)
+                if v.as_object().is_some_and(|m| m.contains_key("Field"))
+        );
+        if !is_field {
+            return None;
+        }
+        // The stored field must be int-kind (the value-bank of
+        // `setfield_gc_i`); a ref / float field has no `c`/`i` int form.
+        if !matches!(tyref_to_value_type(dest_ty, self.llbc), ValueType::Int) {
+            return None;
+        }
+        // Only a bare integer / bool constant operand qualifies; a
+        // computed rvalue still flows through `build_rvalue`.
+        let Rvalue::Use(Operand::Const(value)) = rvalue else {
+            return None;
+        };
+        match decode_constant(self.llbc, value).ok()? {
+            DecodedConst::Int(n) => Some(ConstValue::Int(n)),
+            DecodedConst::Bool(b) => Some(ConstValue::Bool(b)),
+            DecodedConst::Float(_) | DecodedConst::Str(_) | DecodedConst::FnPath(_) => None,
+        }
+    }
+
     /// Emit the side-effectful write op for an `Assign` whose dest is
     /// a `Projection(inner, elem)`. `value` is the freshly computed
     /// rvalue.  `dest_ty` is the projected place's own `TyRef` — the
@@ -1921,9 +1997,20 @@ impl<'a> Lowering<'a> {
         mir_bb: usize,
         inner: Place,
         elem: ProjectionElem,
-        value: Variable,
+        value: LinkArg,
         dest_ty: &TyRef,
     ) -> Result<(), LowerError> {
+        // Only an int `FieldWrite` carries an inline `LinkArg::Const`
+        // (`setfield_gc_i/rcd` short form). Every other write target —
+        // `*p = v`, `arr[i] = v` — reads a materialised register, so a
+        // constant must already have been forced to a Variable by the
+        // caller. `lower_assign` only mints a `LinkArg::Const` for the
+        // int-Field case, so this expect never trips in practice.
+        let value_var = |v: &LinkArg| {
+            v.as_variable()
+                .expect("deref / array writes carry a materialised Variable value")
+                .clone()
+        };
         let inner_local = match &inner.kind {
             PlaceKind::Local(i) => Some(*i as usize),
             _ => None,
@@ -1950,7 +2037,7 @@ impl<'a> Lowering<'a> {
                     OpKind::ArrayWrite {
                         base: arr,
                         index: idx,
-                        value,
+                        value: value_var(&value),
                         item_ty: tyref_to_value_type(dest_ty, self.llbc),
                         array_type_id: None,
                         nolength: false,
@@ -1973,7 +2060,7 @@ impl<'a> Lowering<'a> {
                         target: CallTarget::FunctionPath {
                             segments: vec!["__deref_write".to_string()],
                         },
-                        args: vec![base, value],
+                        args: vec![base, value_var(&value)],
                         result_ty: ValueType::Void,
                     }
                 }
@@ -2015,7 +2102,7 @@ impl<'a> Lowering<'a> {
                     OpKind::ArrayWrite {
                         base,
                         index: idx_var,
-                        value,
+                        value: value_var(&value),
                         item_ty: ValueType::Int,
                         array_type_id: None,
                         nolength: false,
@@ -2497,7 +2584,7 @@ impl<'a> Lowering<'a> {
                                 name,
                                 owner_root: Some(result_ty_owner.clone()),
                             },
-                            value,
+                            value: crate::model::LinkArg::Value(value),
                             ty: ValueType::Ref(None),
                         },
                     });
@@ -4882,7 +4969,7 @@ impl<'a> Lowering<'a> {
                         name: name.to_string(),
                         owner_root: Some(owner.to_string()),
                     },
-                    value,
+                    value: LinkArg::Value(value),
                     ty: ValueType::Int,
                 },
             });

@@ -2068,12 +2068,15 @@ where
                 self.set_ref_reg(dest, Some(op), Some(ptr));
             }
             jitcode::insns::BC_SETFIELD_GC_I
+            | jitcode::insns::BC_SETFIELD_GC_I_C
             | jitcode::insns::BC_SETFIELD_GC_R
             | jitcode::insns::BC_SETFIELD_GC_F => {
                 // blackhole.py:1471-1483 bhimpl_setfield_gc_{i,r,f}: record
                 // SetfieldGc (a single op-kind whose descr carries the field
                 // type) and write the field through the live struct ptr. The
-                // value word is read from the int/ref/float bank by type.
+                // value word is read from the int/ref/float bank by type; the
+                // `/rcd` c-form (USE_C_FORM, assembler.py:312) inlines a signed
+                // byte in place of the int-register slot.
                 let (struct_reg, value_reg, descr_idx) = {
                     let frame = self.frames.current_mut();
                     frame.read_setfield_gc()
@@ -2089,6 +2092,10 @@ where
                 let (value_opref, concrete) = match bytecode {
                     jitcode::insns::BC_SETFIELD_GC_R => self.read_ref_reg(value_reg),
                     jitcode::insns::BC_SETFIELD_GC_F => self.read_float_reg(value_reg),
+                    jitcode::insns::BC_SETFIELD_GC_I_C => {
+                        let v = value_reg as u8 as i8 as i64;
+                        (OpRef::ConstInt(v), v)
+                    }
                     _ => self.read_int_reg(value_reg),
                 };
                 ctx.record_op_with_descr(
@@ -3391,6 +3398,35 @@ where
                         target_idx,
                         opref,
                         concrete,
+                    );
+                } else if self.frames.is_empty() {
+                    return TraceAction::Finish {
+                        finish_args: vec![opref],
+                        finish_arg_types: vec![majit_ir::Type::Int],
+                        exit_with_exception: false,
+                    };
+                }
+            }
+            // `int_return/c` — USE_C_FORM short source (`assembler.py:312`):
+            // the return value is one inline signed byte (`signedord`,
+            // `blackhole.py:123`), not a `registers_i` slot. Otherwise
+            // identical teardown to `BC_INT_RETURN`.
+            jitcode::insns::BC_INT_RETURN_C => {
+                self.clear_exception();
+                let value = self.frames.current_mut().next_u8() as i8 as i64;
+                let opref = OpRef::ConstInt(value);
+                let target = self.frames.current_mut().return_i;
+                self.pop_exception_frame(ctx);
+                if let Some(target_idx) = target {
+                    debug_assert!(
+                        !self.frames.is_empty(),
+                        "BC_INT_RETURN_C with return_i=Some but framestack drained",
+                    );
+                    self.frames.current_mut().make_result_of_lastop(
+                        JitArgKind::Int,
+                        target_idx,
+                        opref,
+                        value,
                     );
                 } else if self.frames.is_empty() {
                     return TraceAction::Finish {
@@ -4880,6 +4916,17 @@ where
                 };
                 let (value, concrete) = self.read_int_reg(src);
                 self.set_int_reg(dst, Some(value), Some(concrete));
+            }
+            // `int_copy/c>i` — USE_C_FORM short source (`assembler.py:312`):
+            // the small ConstInt is one inline signed byte (`signedord`,
+            // `blackhole.py:123`), not a `registers_i` slot. Operand order
+            // `[const][dst]` per argcode `c>i`.
+            jitcode::insns::BC_MOVE_I_C => {
+                let (value, dst) = {
+                    let frame = self.frames.current_mut();
+                    (frame.next_u8() as i8 as i64, frame.next_u8() as usize)
+                };
+                self.set_int_reg(dst, Some(OpRef::ConstInt(value)), Some(value));
             }
             // Parity #14 Slice C.5 retired the Pure half of this arm —
             // every Pure call site now emits canonical BC_RESIDUAL_CALL_*_I
@@ -6667,6 +6714,39 @@ mod tests {
         });
         assert_eq!(sf_i, Some((0, true)));
         assert_eq!(sf_r, Some((1, true)));
+    }
+
+    #[test]
+    fn jitcode_setfield_gc_i_c_records_const_value_and_field_descr() {
+        // The `/rcd` c-form (USE_C_FORM, assembler.py:312) inlines a small
+        // ConstInt value as one signed byte in place of the int-register
+        // slot.  Dispatch must decode the byte as an inline const, record the
+        // store with a ConstInt arg, and resolve the same FieldDescr as the
+        // plain `/rid` form — byte 222 (BC_SETFIELD_GC_I_C) is distinct from
+        // the NEW family so the arm is reached (insns.rs deconfliction).
+        let mut builder = JitCodeBuilder::new();
+        builder.new_struct(0, 16, 0xCE, &[(0, false, "value"), (8, true, "next")]);
+        builder.setfield_gc_i_c(0, -7, 0, 0xCE); // Node.value = -7 (inline const)
+        let jitcode = builder.finish();
+
+        let mut ctx = TraceCtx::for_test(0);
+        let mut sym = DummySym::default();
+        let action = trace_jitcode_with_args(&mut ctx, &mut sym, &jitcode, 0, |_pc| 0, &[]);
+        assert!(matches!(action, TraceAction::Continue));
+
+        let recorder = ctx.into_recorder();
+        let opcodes: Vec<_> = recorder.ops().iter().map(|o| o.opcode).collect();
+        assert_eq!(opcodes, vec![OpCode::New, OpCode::SetfieldGc]);
+
+        // The value operand is the inline signed-byte const, not a register.
+        let value = recorder.ops()[1].arg(1).const_int();
+        assert_eq!(value, Some(-7));
+        // The FieldDescr matches the `/rid` form (offset 0, index_in_parent 0).
+        let descr = recorder.ops()[1].getdescr().and_then(|d| {
+            d.as_field_descr()
+                .map(|f| (f.offset(), f.index_in_parent()))
+        });
+        assert_eq!(descr, Some((0, 0)));
     }
 
     #[test]

@@ -35,7 +35,7 @@
 //! | `ptr_eq/rr>i`, `ptr_ne/rr>i` | PARITY | r-bank pair → record PtrEq/PtrNe → i-bank dst via `binop_ref_to_int_record`. RPython `pyjitpl.py:326-336` exec-generated comparison opimpls (b1 is b2 fast path omitted, same rationale as int comparisons). |
 //! | `getfield_gc_i/rd>i`, `getfield_gc_r/rd>r` | PARITY (heapcache-aware) | r-bank obj + descr → heapcache lookup. Cache hit returns cached OpRef without recording; cache miss records `OpCode::GetfieldGc<I,R>` + `getfield_now_known` writeback. RPython `pyjitpl.py:855-882 + 929-950 _opimpl_getfield_gc_any_pureornot`. ConstPtr fast-path (`pyjitpl.py:856-860`) deferred — pyre walker doesn't track ConstPtr identity (optimizer's job post-trace). The pyre-specific `id>X` shape (int source — kind-flow kind-flow) stays unsupported. |
 //! | `setfield_gc_i/rid`, `setfield_gc_r/rrd` | PARITY (heapcache-aware, alias-clearing) | r-bank box + (i\|r)-bank valuebox + descr. If `getfield_cached(obj,descr) == Some(valuebox)` skip recording (RPython `if upd.currfieldbox is valuebox: return`); otherwise record `OpCode::SetfieldGc(obj, valuebox)` + `setfield_cached` write-through. Aliasing semantics: `CacheEntry.do_write_with_aliasing` (heapcache.py:90-94) routes through `_clear_cache_on_write(seen_alloc)` — always wipes `cache_anything`, additionally wipes `cache_seen_allocation` when the write target itself isn't seen-allocated. RPython `pyjitpl.py:973-988 _opimpl_setfield_gc_any`. The disabled is_unescaped branch (`pyjitpl.py:981-988`) is intentionally not ported — RPython itself has it commented out. `iid` / `ird` (int box) shapes stay unsupported (kind-flow territory). |
-//! | `getarrayitem_gc_r/rid>r` | PARITY (heapcache-aware) | r-bank array + i-bank index + descr → heapcache `getarrayitem` lookup. Cache hit returns cached OpRef without IR; cache miss records `OpCode::GetarrayitemGcR(array, index)` + `getarrayitem_now_known` writeback. RPython `pyjitpl.py:639-688 _do_getarrayitem_gc_any`. `_i` / `_f` shapes don't appear in pyre's insns table today; would land mechanically when emitted. |
+//! | `getarrayitem_gc_r/rid>r` | PARITY (heapcache-aware) | r-bank array + i-bank index + descr → heapcache `getarrayitem` lookup. Cache hit returns cached OpRef without IR; cache miss records `OpCode::GetarrayitemGcR(array, index)` + `getarrayitem_now_known` writeback. RPython `pyjitpl.py:639-688 _do_getarrayitem_gc_any`. All three `_i` / `_r` / `_f` result shapes are wired to this same heapcache body (kind-keyed dst bank, dispatch arms below) and registered in `wellknown_bh_insns()` (`insns.rs:865-866`) for blackhole execution + codewriter emission. |
 //! | `setarrayitem_gc_r/rird`, `setarrayitem_gc_r/rcrd` | PARITY (heapcache-aware) | r-bank array + i-bank index + r-bank value + descr. Always records `OpCode::SetarrayitemGc(array, index, value)` + `heapcache.setarrayitem(...)` write. RPython `pyjitpl.py:736-744 _opimpl_setarrayitem_gc_any` — no skip-on-redundant short-circuit because `setarrayitem` does aliasing-aware invalidation. The `rcrd` `c`-argcode form (USE_C_FORM `assembler.py:99-107/312`) decodes the index as one inline signed byte → ConstInt; same recording body otherwise. `rrid` / `rrrd` / `rrfd` (Ref index) shapes stay unsupported (kind-flow). |
 //! | `residual_call_r_r/iRd>r` | TODO (`direct_assembler_call` + `capture_resumedata` not yet wired) | classifies the call by `EffectInfo`. Wired sub-cases: (1) release-gil via [`direct_call_release_gil`] — `CallReleaseGilI` + arglist `[savebox, funcbox] + argboxes[1:]` reshape per `pyjitpl.py:3675-3681`, plus the outer forces-branch `GUARD_NOT_FORCED` (`:2079`) + `GUARD_NO_EXCEPTION` (`:2082`); (2) loop-invariant heapcache via [`loopinvariant_lookup`] / [`loopinvariant_now_known`] per `pyjitpl.py:2088 + 2109`; (3) vable IR bookkeeping (`pyjitpl.py:2055-2080`) via [`maybe_walker_vable_and_vrefs_before_residual_call`] — emits FORCE_TOKEN + SETFIELD_GC only; the runtime heap mutations on `vinfo.tracing_before_residual_call` / `vrefinfo.tracing_before_residual_call` (`pyjitpl.py:3318-3330`) and the after-call helpers (`pyjitpl.py:3337-3366`) stay on the trait-driven leg (`state.rs MIFrame::vable_and_vrefs_before_residual_call`, `trace_opcode.rs:2193-2349`) since the walker can't observe a force without executing the callee. The remaining branches go through [`select_residual_call_opcode`]: `CallMayForce*` + `GuardNotForced` on the rest of the forces-virtual path (`pyjitpl.py:2017-2082`), `CallLoopinvariant*` on `EF_LOOPINVARIANT` (`pyjitpl.py:2087-2110`), `CallPure*` on elidable, otherwise `Call*`. `GuardNoException` follows whenever `effectinfo.check_can_raise(False)` is true (`pyjitpl.py:2082 handle_possible_exception`). `heapcache.invalidate_caches_varargs(call_opcode, ei, allboxes)` (`pyjitpl.py:2042 + 2659`) is wired around every recorded call op. `OS_NOT_IN_TRACE` is fail-loud-guarded up front via [`do_not_in_trace_call_result`] — `effect_info_for_call_flavor` stub never sets the index today (`flatten.rs:431`), making it dead until producers land. Same fail-loud treatment via [`do_jit_force_virtual_guard`] for `OS_JIT_FORCE_VIRTUAL` (stricter-than-PyPy — needs OpRef→concrete-pointer resolver). Still deferred (each blocked on infrastructure absent from pyre-jit-trace): `direct_libffi_call` / `direct_assembler_call` specialization (`pyjitpl.py:1908-1990` — assembler_call paths route through `inline_call_*/dR>X` instead), KEEPALIVE for vablebox (only fires when `direct_assembler_call` returns a vablebox), and `num_live`-aware `capture_resumedata(after_residual_call=True)` on the guards (`pyjitpl.py:2078-2082 → 2586`). |
 //! | `residual_call_r_i/iRd>i` | PARITY (kind sibling of `_r_r`) | same EffectInfo classification + guard emission as `_r_r` — `select_residual_call_opcode('i', ...)` returns the int-typed `Call*` family (`CallReleaseGilI` / `CallMayForceI` / `CallLoopinvariantI` / `CallPureI` / `CallI`); only the dst writeback bank (`registers_i`) differs. RPython parity: `pyjitpl.py:1346 opimpl_residual_call_r_i = _opimpl_residual_call1`; `do_residual_call`'s `descr.get_normalized_result_type()` dispatch (pyjitpl.py:2022-2044) selects the int-result CALL op. Argboxes pass through [`build_allboxes`] same as `_r_r` (R-list-only argboxes → identity permutation when arg_types is ref-only). |
@@ -2612,13 +2612,18 @@ fn setfield_gc_via_heapcache(
     ctx: &mut WalkContext<'_, '_>,
     value_bank: char,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
-    // Operand layout `<r><v>d`: 1B r-reg(box) + 1B v-reg(value) + 2B descr-index.
+    // Operand layout `<r><v>d`: 1B r-reg(box) + 1B v(value) + 2B descr-index.
+    // For the `c`-coded short form (`setfield_gc_i/rcd`) the value byte is
+    // an inline signed constant (`signedord`, `blackhole.py:123`) read as a
+    // `ConstInt` box instead of an `i`-register slot; obj and descr keep the
+    // `rid` byte positions.
     let obj = read_ref_reg(code, op, 0, ctx)?;
     let valuebox = match value_bank {
         'i' => read_int_reg(code, op, 1, ctx)?,
         'r' => read_ref_reg(code, op, 1, ctx)?,
         'f' => read_float_reg(code, op, 1, ctx)?,
-        _ => unreachable!("value_bank must be 'i', 'r' or 'f'"),
+        'c' => OpRef::ConstInt(code[op.pc + 2] as i8 as i64),
+        _ => unreachable!("value_bank must be 'i', 'r', 'f' or 'c'"),
     };
     let descr = read_descr(code, op, 2, ctx)?;
     let descr_index = descr.index();
@@ -11072,6 +11077,9 @@ fn handle(
         // shapes are pyre kind-flow kind-flow territory and stay
         // unsupported.
         "setfield_gc_i/rid" => setfield_gc_via_heapcache(code, op, ctx, 'i'),
+        // USE_C_FORM short value (`assembler.py:99-107,312`): the stored
+        // int is an inline signed byte read as a `ConstInt` box.
+        "setfield_gc_i/rcd" => setfield_gc_via_heapcache(code, op, ctx, 'c'),
         "setfield_gc_r/rrd" => setfield_gc_via_heapcache(code, op, ctx, 'r'),
         "setfield_gc_f/rfd" => setfield_gc_via_heapcache(code, op, ctx, 'f'),
         // Heapcache-aware array reads/writes (canonical `rid>X` /
@@ -11178,6 +11186,25 @@ fn handle(
             let src_concrete = read_int_reg_concrete(code, op, 0, ctx);
             let dst = code[op.pc + 2] as usize;
             write_int_reg(ctx, op.pc, dst, src_val, src_concrete)?;
+            Ok((DispatchOutcome::Continue, op.next_pc))
+        }
+        "int_copy/c>i" => {
+            // `int_copy/c>i` — USE_C_FORM short source (`assembler.py:312`):
+            // the small ConstInt is one inline signed byte (`signedord`,
+            // `blackhole.py:123`), not a `registers_i` slot. Like `int_copy/i>i`
+            // this records no IR op (pure SSA copy); the dst is seeded with the
+            // constant box plus its concrete shadow so a downstream
+            // `goto_if_not/iL` / `switch/id` can fold. Operand layout `c>i`:
+            // 1B signed const + 1B dst.
+            let value = code[op.pc + 1] as i8 as i64;
+            let dst = code[op.pc + 2] as usize;
+            write_int_reg(
+                ctx,
+                op.pc,
+                dst,
+                OpRef::ConstInt(value),
+                ConcreteValue::Int(value),
+            )?;
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
         "float_copy/f>f" => {
@@ -11301,6 +11328,32 @@ fn handle(
                     // Slice b: portal-exit FINISH carries Type::Ref even for
                     // an int return (the eval_loop_jit result_type is REF),
                     // so `fbw_ensure_boxed_for_ca` re-boxes via wrapint.
+                    fbw_terminate_with_finish(ctx, result, op.pc)?;
+                } else {
+                    ctx.trace_ctx
+                        .finish(&[result], ctx.done_with_this_frame_descr_int.clone());
+                }
+                Ok((DispatchOutcome::Terminate, op.next_pc))
+            } else {
+                Ok((
+                    DispatchOutcome::SubReturn {
+                        result: Some(result),
+                    },
+                    op.next_pc,
+                ))
+            }
+        }
+        "int_return/c" => {
+            // USE_C_FORM short source (`assembler.py:312`): the return value
+            // is one inline signed byte (`signedord`, `blackhole.py:123`),
+            // not a `registers_i` slot — so `result` is a `ConstInt` that
+            // already carries its value (no `set_opref_concrete` needed).
+            // Otherwise identical to `int_return/i`. Operand layout `c`:
+            // 1B signed const at op.pc+1.
+            let value = code[op.pc + 1] as i8 as i64;
+            let result = OpRef::ConstInt(value);
+            if ctx.is_top_level {
+                if fbw_call_assembler_enabled() {
                     fbw_terminate_with_finish(ctx, result, op.pc)?;
                 } else {
                     ctx.trace_ctx

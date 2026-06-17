@@ -958,7 +958,13 @@ pub fn translate_op(
             base, field, value, ..
         } => {
             let base_hl = lookup_operand(value_map, base, op, "base")?;
-            let value_hl = lookup_operand(value_map, value, op, "value")?;
+            // The stored value is an `AbstractValue` — a `Variable`
+            // (resolve through the SSA map) or an inline `Constant`
+            // (carries its own value), mirroring `Hlvalue` directly.
+            let value_hl = match value {
+                crate::model::LinkArg::Value(var) => lookup_operand(value_map, var, op, "value")?,
+                crate::model::LinkArg::Const(c) => Hlvalue::Constant(c.clone()),
+            };
             let result = resolve_result_hlvalue(op, value_map)?;
             Ok(vec![FlowspaceOp::new(
                 "setattr",
@@ -3931,7 +3937,7 @@ mod tests {
             kind: OpKind::FieldWrite {
                 base: vars[1].clone(),
                 field: crate::model::FieldDescriptor::new("g", Some("Owner".into())),
-                value: vars[2].clone(),
+                value: crate::model::LinkArg::Value(vars[2].clone()),
                 ty: ValueType::Int,
             },
         };

@@ -443,7 +443,7 @@ pub(crate) fn remap_op_kind(
         } => OpKind::FieldWrite {
             base: remap_var(base),
             field: field.clone(),
-            value: remap_var(value),
+            value: value.map_value(remap_var),
             ty: ty.clone(),
         },
         OpKind::ArrayRead {
@@ -567,7 +567,7 @@ pub(crate) fn remap_op_kind(
         } => OpKind::VableFieldWrite {
             base: remap_var(base),
             field_index: *field_index,
-            value: remap_var(value),
+            value: value.map_value(remap_var),
             ty: ty.clone(),
         },
         OpKind::VableArrayRead {
@@ -868,7 +868,16 @@ pub fn op_variable_refs(kind: &OpKind) -> Vec<crate::flowspace::model::Variable>
             v
         }
         OpKind::FieldRead { base, .. } => vec![clone_var(base)],
-        OpKind::FieldWrite { base, value, .. } => vec![clone_var(base), clone_var(value)],
+        OpKind::FieldWrite { base, value, .. } => {
+            // `setfield_gc` stores either a register operand or an inline
+            // constant; only a `Variable` value contributes an SSA
+            // reference (a `Const` literal carries no defining op).
+            let mut refs = vec![clone_var(base)];
+            if let Some(var) = value.as_variable() {
+                refs.push(clone_var(var));
+            }
+            refs
+        }
         OpKind::ArrayRead { base, index, .. } => vec![clone_var(base), clone_var(index)],
         OpKind::ArrayWrite {
             base, index, value, ..
@@ -897,7 +906,15 @@ pub fn op_variable_refs(kind: &OpKind) -> Vec<crate::flowspace::model::Variable>
         OpKind::RecordQuasiImmutField { base, .. } => vec![clone_var(base)],
         OpKind::JitDebug { args, .. } => args.iter().map(&clone_var).collect(),
         OpKind::VableFieldRead { base, .. } => vec![clone_var(base)],
-        OpKind::VableFieldWrite { base, value, .. } => vec![clone_var(base), clone_var(value)],
+        OpKind::VableFieldWrite { base, value, .. } => {
+            // Only a `Variable` value contributes an SSA reference; a
+            // `setfield_vable_i` inline `Const` carries no defining op.
+            let mut refs = vec![clone_var(base)];
+            if let Some(var) = value.as_variable() {
+                refs.push(clone_var(var));
+            }
+            refs
+        }
         OpKind::VableArrayRead {
             base, elem_index, ..
         } => vec![clone_var(base), clone_var(elem_index)],

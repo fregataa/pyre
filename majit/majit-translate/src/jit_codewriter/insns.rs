@@ -438,6 +438,30 @@ pub const BC_NEW_ARRAY_CLEAR: u8 = 214;
 pub const BC_SETARRAYITEM_GC_R_C: u8 = 215;
 pub const BC_NEW_ARRAY_CLEAR_C: u8 = 216;
 
+// `int_copy` is in `USE_C_FORM` (`assembler.py:312`): a small ConstInt
+// source (-128..127) is written inline as one signed byte instead of a
+// constant-pool `i` slot, giving the key `int_copy/c>i`. pyre materialises
+// every int/bool constant through `int_copy` (`OpKind::ConstInt`/`ConstBool`
+// → `bhimpl_int_copy`), so the short form is the common small-constant path.
+// Byte 220 (not 217, which is `BC_NEW`): every `(opname, argcodes)` key
+// needs a distinct byte (`assembler.py:220`), and the byte→opname inverse
+// must stay 1:1 (`insns_byte_to_opname` panics otherwise).
+pub const BC_MOVE_I_C: u8 = 220;
+
+// `int_return` is in `USE_C_FORM` (`assembler.py:312`): a small const-int
+// return source (`FlatOp::IntReturn(Const)`) is written inline as one
+// signed byte, giving the key `int_return/c` (sibling of `int_return/i`,
+// BC_INT_RETURN = 148).  Byte 221 (not 218, which is `BC_NEW_ARRAY`).
+pub const BC_INT_RETURN_C: u8 = 221;
+
+// `setfield_gc` is in `USE_C_FORM` (`assembler.py:312`): a small ConstInt
+// store value (-128..127) is written inline as one signed byte, giving
+// the key `setfield_gc_i/rcd` (sibling of `setfield_gc_i/rid`,
+// BC_SETFIELD_GC_I = 172).  A wider constant or a register value keeps
+// the `i` pool-slot form.  Byte 222 (not 219, which is
+// `BC_NEW_WITH_VTABLE`).
+pub const BC_SETFIELD_GC_I_C: u8 = 222;
+
 // pyre-only `abort/>r` — Ref-result variant of `abort/` (BC_ABORT = 13)
 // emitted by `Assembler::encode_op`'s default branch when an `OpKind::
 // Abort { result_kind: Ref }` reaches the assembler.  Lives in
@@ -611,6 +635,9 @@ pub fn wellknown_bh_insns() -> VecAssoc<&'static str, u8> {
     // registered so `setup_insns` does not fall back to `u8::MAX` for
     // them.
     m.insert("int_return/i", BC_INT_RETURN);
+    // `int_return/c` — USE_C_FORM short source (`assembler.py:312`): a small
+    // const-int return value inline as one signed byte.
+    m.insert("int_return/c", BC_INT_RETURN_C);
     m.insert("ref_return/r", BC_REF_RETURN);
     m.insert("float_return/f", BC_FLOAT_RETURN);
     m.insert("void_return/", BC_VOID_RETURN);
@@ -805,6 +832,13 @@ pub fn wellknown_bh_insns() -> VecAssoc<&'static str, u8> {
     // main RPython producer of `int_copy` ops (cycle-break renamings),
     // which pyre's super-inst expansion also re-uses.
     m.insert("int_copy/i>i", BC_MOVE_I);
+    // `int_copy/c>i` — USE_C_FORM short source (`assembler.py:312`): a small
+    // ConstInt source takes the inline `c` byte instead of a pool `i` slot.
+    // pyre materialises every small int/bool constant through `int_copy`
+    // (`OpKind::ConstInt`/`ConstBool`), so the short form is the common path
+    // and must share the fixed byte with the runtime blackhole dispatch
+    // (`blackhole.rs` BC_MOVE_I_C wiring) rather than draw a dynamic byte.
+    m.insert("int_copy/c>i", BC_MOVE_I_C);
     m.insert("ref_copy/r>r", BC_MOVE_R);
     m.insert("float_copy/f>f", BC_MOVE_F);
 
@@ -835,6 +869,10 @@ pub fn wellknown_bh_insns() -> VecAssoc<&'static str, u8> {
     m.insert("getfield_gc_r/rd>r", BC_GETFIELD_GC_R);
     m.insert("getfield_gc_f/rd>f", BC_GETFIELD_GC_F);
     m.insert("setfield_gc_i/rid", BC_SETFIELD_GC_I);
+    // USE_C_FORM short value (`assembler.py:99-107,312`): a small
+    // ConstInt store value takes the inline `c` byte in place of the
+    // `i` value register.
+    m.insert("setfield_gc_i/rcd", BC_SETFIELD_GC_I_C);
     m.insert("setfield_gc_r/rrd", BC_SETFIELD_GC_R);
     m.insert("setfield_gc_f/rfd", BC_SETFIELD_GC_F);
     // RPython `blackhole.py:1441-1443` aliases `bhimpl_getfield_gc_{i,r,f}_pure
@@ -1162,4 +1200,42 @@ pub fn pyre_extension_insns() -> VecAssoc<&'static str, u8> {
     // backend epic must look up the vtable slot itself.
     m.insert("vtable_method_ptr/rd>i", BC_VTABLE_METHOD_PTR);
     m
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// Every distinct `(opname, argcodes)` key must own a UNIQUE opcode
+    /// byte.  RPython `assembler.py:220 self.insns.setdefault(key,
+    /// len(self.insns))` assigns a fresh int per key, so the byte→opname
+    /// inverse is 1:1 by construction.  pyre hand-assigns the `BC_*`
+    /// constants, so this test is the structural replacement for that
+    /// guarantee: both the walker (`jitcode_dispatch`) and the fixed-byte
+    /// `JitCodeMachine` (`pyjitpl::dispatch`) route by raw byte, and a byte
+    /// shared by two keys silently mis-dispatches one of them (a `match`
+    /// arm shadows the later const, `names[byte] = key` is last-wins).  The
+    /// USE_C_FORM bytes once collided here (`int_copy/c>i`↔`new/d>r` @217,
+    /// `int_return/c`↔`new_array/...` @218, `setfield_gc_i/rcd`↔
+    /// `new_with_vtable/d>r` @219).
+    #[test]
+    fn opcode_bytes_are_one_to_one() {
+        let mut byte_to_key: HashMap<u8, String> = HashMap::new();
+        for table in [wellknown_bh_insns(), pyre_extension_insns()] {
+            for (key, byte) in table.iter() {
+                let key = (*key).to_string();
+                let byte = *byte;
+                if let Some(prev) = byte_to_key.get(&byte) {
+                    assert_eq!(
+                        *prev, key,
+                        "opcode byte {byte} maps to two distinct keys \
+                         {prev:?} and {key:?}; every key needs its own byte \
+                         (assembler.py:220 setdefault(key, len(insns)))",
+                    );
+                }
+                byte_to_key.insert(byte, key);
+            }
+        }
+    }
 }

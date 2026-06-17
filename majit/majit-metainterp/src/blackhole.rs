@@ -4668,6 +4668,22 @@ bhhandler_ii_i!(handler_int_ge, bhimpl_int_ge);
 // Wire as alias.
 bhhandler_i_i!(handler_int_copy, bhimpl_int_same_as);
 
+// `int_copy/c>i` — `c`-argcode source: `int_copy` is in USE_C_FORM
+// (`assembler.py:312`), so a small ConstInt is one inline signed byte
+// (`assembler.py:99-107` short branch) read via `signedord`
+// (`blackhole.py:123`) instead of a `registers_i` pool slot. `dst` is the
+// next byte. `bhimpl_int_copy` is the identity, so the byte value is the
+// stored result.
+fn handler_int_copy_c(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let a = code[position] as i8 as i64;
+    bh.registers_i[code[position + 1] as usize] = a;
+    Ok(position + 2)
+}
+
 /// blackhole.py:643 `bhimpl_ref_copy(a): return a` — @arguments("r", returns="r").
 fn bhimpl_ref_copy(a: i64) -> i64 {
     a
@@ -4819,6 +4835,22 @@ fn handler_int_return(
     // visible after a LeaveFrame since the frame teardown reads the
     // post-operand position.
     bh.position = position + 1;
+    Err(DispatchError::LeaveFrame)
+}
+
+/// Handler for `int_return/c` — USE_C_FORM short source (`assembler.py:312`):
+/// `int_return` reads its value from one inline signed byte (`signedord`,
+/// `blackhole.py:123`) rather than a `registers_i` slot.  Identical frame
+/// teardown to `handler_int_return`.
+fn handler_int_return_c(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let a = code[position] as i8 as i64;
+    bh.tmpreg_i = a;
+    bh.return_type = BhReturnType::Int;
+    bh.position = position + 1; // blackhole.py:169 parity (see int_return).
     Err(DispatchError::LeaveFrame)
 }
 
@@ -5775,6 +5807,22 @@ fn handler_setfield_gc_i(
     cpu.bh_setfield_gc_i(struct_ptr, value, descr);
     Ok(pos)
 }
+// `setfield_gc_i/rcd` — USE_C_FORM short value (`assembler.py:99-107,312`):
+// the stored int is one inline signed byte read via `signedord`
+// (`blackhole.py:123`) in place of a `registers_i` slot; the struct ref
+// and descr are unchanged from the `rid` form.
+fn handler_setfield_gc_i_c(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let struct_ptr = bh.registers_r[code[position] as usize];
+    let value = code[position + 1] as i8 as i64;
+    let (descr, pos) = read_descr(bh, code, position + 2);
+    let cpu = bh.cpu.expect("cpu not set");
+    cpu.bh_setfield_gc_i(struct_ptr, value, descr);
+    Ok(pos)
+}
 fn handler_setfield_gc_i_intbase(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
@@ -6629,6 +6677,14 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
         "int_copy/i>i".to_string(),
         majit_translate::insns::BC_MOVE_I,
     );
+    // `int_copy/c>i` — USE_C_FORM short source (`assembler.py:312`): a small
+    // ConstInt materialised inline as one signed byte instead of a pool slot.
+    // pyre emits this for every small int/bool constant, so the production
+    // blackhole must dispatch it; `handler_int_copy_c` decodes via `signedord`.
+    insns.insert(
+        "int_copy/c>i".to_string(),
+        majit_translate::insns::BC_MOVE_I_C,
+    );
     insns.insert(
         "ref_copy/r>r".to_string(),
         majit_translate::insns::BC_MOVE_R,
@@ -6665,6 +6721,12 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     insns.insert(
         "int_return/i".to_string(),
         majit_translate::insns::BC_INT_RETURN,
+    );
+    // `int_return/c` — USE_C_FORM short source (`assembler.py:312`): a small
+    // const-int return value emitted inline as one signed byte.
+    insns.insert(
+        "int_return/c".to_string(),
+        majit_translate::insns::BC_INT_RETURN_C,
     );
     insns.insert(
         "float_return/f".to_string(),
@@ -7140,6 +7202,8 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
 
     // Copy operations
     builder.wire_handler("int_copy/i>i", handler_int_copy);
+    // `int_copy/c>i` — USE_C_FORM short-const source (`assembler.py:312`).
+    builder.wire_handler("int_copy/c>i", handler_int_copy_c);
     // pyre-only abort placeholder emitted by `Assembler::encode_op`'s
     // default branch for `OpKind::Abort { .. }`.
     builder.wire_handler("abort/>i", handler_abort_result_marker_i);
@@ -7284,6 +7348,9 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     builder.wire_handler("getfield_gc_r_pure/rd>r", handler_getfield_gc_r);
     builder.wire_handler("getfield_gc_f_pure/rd>f", handler_getfield_gc_f);
     builder.wire_handler("setfield_gc_i/rid", handler_setfield_gc_i);
+    // USE_C_FORM short value (`assembler.py:99-107,312`): small ConstInt
+    // store value inline as one signed byte.
+    builder.wire_handler("setfield_gc_i/rcd", handler_setfield_gc_i_c);
     builder.wire_handler("setfield_gc_r/rrd", handler_setfield_gc_r);
     builder.wire_handler("setfield_gc_f/rfd", handler_setfield_gc_f);
     builder.wire_handler("setfield_gc_i/iid", handler_setfield_gc_i_intbase);
@@ -7602,6 +7669,8 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
 
     // Returns
     builder.wire_handler("int_return/i", handler_int_return);
+    // `int_return/c` — USE_C_FORM short-const source (`assembler.py:312`).
+    builder.wire_handler("int_return/c", handler_int_return_c);
     builder.wire_handler("ref_return/r", handler_ref_return);
     builder.wire_handler("float_return/f", handler_float_return);
     builder.wire_handler("void_return/", handler_void_return);

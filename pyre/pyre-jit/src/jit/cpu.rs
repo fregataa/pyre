@@ -128,8 +128,6 @@ pub struct Cpu {
     /// with `w_name` an interned str constant.  Blackhole/deopt lowering
     /// of `STORE_NAME` (`pyopcode.py:855`).
     pub store_name_fn: extern "C" fn(i64, i64, i64) -> i64,
-    /// `bhimpl_build_list` — (argc, item0, item1, item2) → new list.
-    pub build_list_fn: extern "C" fn(i64, i64, i64, i64) -> i64,
     /// `newtuple(list_w)` (`objspace.py:332`) — (ref array) → new tuple.
     /// The array is the forced `popvalues` list; length travels inside
     /// the array, so any arity fits.
@@ -144,6 +142,10 @@ pub struct Cpu {
     /// Fragments are already strings (formatted first), so this runs no
     /// user code and is infallible (`Plain`).
     pub build_string_from_array_fn: extern "C" fn(i64) -> i64,
+    /// `newlist(list_w)` — (ref array) → new list.  The array is the
+    /// forced `popvalues_mutable` list; length travels inside the array,
+    /// so any arity fits.
+    pub newlist_from_array_fn: extern "C" fn(i64) -> i64,
     /// `bhimpl_unpack_sequence` — (count, seq) → validated tuple of items.
     pub unpack_sequence_fn: extern "C" fn(i64, i64) -> i64,
     /// Read item `index` out of the validated unpack tuple — (index, seq) → item.
@@ -262,11 +264,11 @@ impl Cpu {
             getattr_fn: crate::call_jit::bh_getattr_fn,
             load_name_fn: crate::call_jit::bh_load_name_fn,
             store_name_fn: crate::call_jit::bh_store_name_fn,
-            build_list_fn: crate::call_jit::bh_build_list_fn,
             newtuple_from_array_fn: crate::call_jit::bh_newtuple_from_array,
             build_map_from_array_fn: crate::call_jit::bh_build_map_from_array,
             build_set_from_array_fn: crate::call_jit::bh_build_set_from_array,
             build_string_from_array_fn: crate::call_jit::bh_build_string_from_array,
+            newlist_from_array_fn: crate::call_jit::bh_newlist_from_array,
             unpack_sequence_fn: crate::call_jit::bh_unpack_sequence_fn,
             unpack_item_fn: crate::call_jit::bh_unpack_item_fn,
             build_slice_fn: crate::call_jit::bh_build_slice_fn,

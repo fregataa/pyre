@@ -36,6 +36,61 @@ fn kind_long_name(kind: RegKind) -> &'static str {
     }
 }
 
+/// `assembler.py:312` `USE_C_FORM` — the set of jitcode opnames whose
+/// small ConstInt operands may take the inline `c` short-const argcode
+/// (`assembler.py:163` `allow_short = (insn[0] in USE_C_FORM)`).  Listed
+/// verbatim, kept identical to the runtime assembler's `use_c_form`
+/// (`pyre-jit/src/jit/assembler.rs`).
+///
+/// In pyre's build-time flow model most operands carry no inline
+/// Constant — the rtyper materialises constants through dedicated
+/// `int_copy`/`ref_copy` ops and binops read registers — so only the
+/// opnames that still hold an inline Constant build-time actually reach
+/// the short branch: `int_copy` (`OpKind::ConstInt`/`ConstBool` and a
+/// const `FlatOp::Move` source), `int_return` (a const `FlatOp::IntReturn`
+/// source), `setfield_gc_i` (`OpKind::FieldWrite` with an inline int/bool
+/// `LinkArg::Const`), and `jit_merge_point` (handled inline in its own
+/// arm).  The remaining members are honoured by the runtime assembler,
+/// which lowers array/string ops with literal small operands.
+fn use_c_form(opname: &str) -> bool {
+    matches!(
+        opname,
+        "copystrcontent"
+            | "getarrayitem_gc_pure_i"
+            | "getarrayitem_gc_pure_r"
+            | "getarrayitem_gc_i"
+            | "getarrayitem_gc_r"
+            | "goto_if_not_int_eq"
+            | "goto_if_not_int_ge"
+            | "goto_if_not_int_gt"
+            | "goto_if_not_int_le"
+            | "goto_if_not_int_lt"
+            | "goto_if_not_int_ne"
+            | "int_add"
+            | "int_and"
+            | "int_copy"
+            | "int_eq"
+            | "int_ge"
+            | "int_gt"
+            | "int_le"
+            | "int_lt"
+            | "int_ne"
+            | "int_return"
+            | "int_sub"
+            | "jit_merge_point"
+            | "new_array"
+            | "new_array_clear"
+            | "newstr"
+            | "setarrayitem_gc_i"
+            | "setarrayitem_gc_r"
+            | "setfield_gc_i"
+            | "strgetitem"
+            | "strsetitem"
+            | "foobar"
+            | "baz"
+    )
+}
+
 // `reg_byte` and the `CURRENT_GRAPH` thread-local are absent because
 // every FlatOp variant carries a [`crate::flatten::Register`] (or
 // [`crate::flatten::RegOrConst`]) operand directly.  The assembler
@@ -653,10 +708,15 @@ impl Assembler {
                 // `encode_op` and the per-arm emitters had each gotten
                 // their own `startpoints.insert` call except this one.
                 state.startpoints.insert(state.code.len());
-                let src_reg = self.encode_regorconst_source(src, dst.kind, state, callcontrol);
                 let kind_char = kind_char_of(dst.kind);
                 let kind_name = kind_long_name(dst.kind);
-                let key = format!("{kind_name}_copy/{kind_char}>{kind_char}");
+                // `assembler.py:163` `allow_short = ('{kind}_copy' in
+                // USE_C_FORM)` — only `int_copy` qualifies, so an int Move
+                // with a small const source emits `int_copy/c>i`.
+                let allow_short = use_c_form(&format!("{kind_name}_copy"));
+                let (src_reg, src_argcode) =
+                    self.encode_regorconst_source(src, dst.kind, allow_short, state, callcontrol);
+                let key = format!("{kind_name}_copy/{src_argcode}>{kind_char}");
                 let opnum = self.get_opnum(&key);
                 state.code.push(opnum);
                 state.code.push(src_reg);
@@ -720,21 +780,33 @@ impl Assembler {
             // single-byte argcode `i`/`r`/`f` suffices for both register
             // and constant sources (upstream `assembler.py:164-174`).
             FlatOp::IntReturn(v) => {
-                let reg = self.encode_regorconst_source(v, RegKind::Int, state, callcontrol);
-                let opnum = self.get_opnum("int_return/i");
+                // `int_return` is in USE_C_FORM (`assembler.py:312`), so a
+                // small const-int source emits `int_return/c`.
+                let (reg, src_argcode) = self.encode_regorconst_source(
+                    v,
+                    RegKind::Int,
+                    use_c_form("int_return"),
+                    state,
+                    callcontrol,
+                );
+                let opnum = self.get_opnum(&format!("int_return/{src_argcode}"));
                 state.startpoints.insert(state.code.len());
                 state.code.push(opnum);
                 state.code.push(reg);
             }
             FlatOp::RefReturn(v) => {
-                let reg = self.encode_regorconst_source(v, RegKind::Ref, state, callcontrol);
+                // `ref_return` is not in USE_C_FORM; ref always pools to `r`.
+                let (reg, _) =
+                    self.encode_regorconst_source(v, RegKind::Ref, false, state, callcontrol);
                 let opnum = self.get_opnum("ref_return/r");
                 state.startpoints.insert(state.code.len());
                 state.code.push(opnum);
                 state.code.push(reg);
             }
             FlatOp::FloatReturn(v) => {
-                let reg = self.encode_regorconst_source(v, RegKind::Float, state, callcontrol);
+                // `float_return` is not in USE_C_FORM; float always pools to `f`.
+                let (reg, _) =
+                    self.encode_regorconst_source(v, RegKind::Float, false, state, callcontrol);
                 let opnum = self.get_opnum("float_return/f");
                 state.startpoints.insert(state.code.len());
                 state.code.push(opnum);
@@ -752,7 +824,9 @@ impl Assembler {
             // standard OverflowError instance.  Blackhole:
             // `blackhole.py:1000 bhimpl_raise(excvalue)`.
             FlatOp::Raise(v) => {
-                let reg = self.encode_regorconst_source(v, RegKind::Ref, state, callcontrol);
+                // `raise` is not in USE_C_FORM; the excvalue is a Ref → `r`.
+                let (reg, _) =
+                    self.encode_regorconst_source(v, RegKind::Ref, false, state, callcontrol);
                 let opnum = self.get_opnum("raise/r");
                 state.startpoints.insert(state.code.len());
                 state.code.push(opnum);
@@ -856,22 +930,27 @@ impl Assembler {
         pos
     }
 
-    /// Encode a [`RegOrConst`] operand into the byte stream.
+    /// Encode a [`RegOrConst`] operand into the byte stream and return
+    /// its `(byte, argcode)`.
     ///
-    /// `RegOrConst::Reg` carries `(kind, color)` directly — no
-    /// regalloc lookup needed.  Constants emit through `emit_const`
-    /// with `expected_kind` (variant-fixed) selecting the constant
-    /// pool, mirroring `assembler.py:164-174` where the single-byte
-    /// argcode kind letter chooses between register and constant via
-    /// `byte >= count_regs[kind]`.  Returns the emitted byte; the
-    /// caller already knows the kind.
+    /// `RegOrConst::Reg` carries `(kind, color)` directly — no regalloc
+    /// lookup needed.  Constants emit through `emit_const` with
+    /// `expected_kind` (variant-fixed) selecting the constant pool,
+    /// mirroring `assembler.py:164-174` where the single-byte argcode kind
+    /// letter chooses between register and constant via
+    /// `byte >= count_regs[kind]`.  `allow_short` is `(opname in
+    /// USE_C_FORM)` (`assembler.py:163`); when set, a small integer-kind
+    /// Constant takes the inline `'c'` short form (`assembler.py:99-107`)
+    /// instead of a pooled `'i'` byte.  Register sources and ref/float
+    /// Constants always take their kind argcode.
     fn encode_regorconst_source(
         &mut self,
         arg: &crate::flatten::RegOrConst,
         expected_kind: RegKind,
+        allow_short: bool,
         state: &mut AssemblyState,
         callcontrol: Option<&CallControl>,
-    ) -> u8 {
+    ) -> (u8, char) {
         match arg {
             // RPython `assembler.py:164-174`: the single-byte argcode
             // is keyed on `Register.kind`, so the source operand's
@@ -893,7 +972,7 @@ impl Assembler {
                      (set MAJIT_COVERAGE_PANIC=1 to populate the flatop context)",
                     r.kind, self.current_graph_name, self.current_flatop_debug,
                 );
-                r.index as u8
+                (r.index as u8, kind_char_of(expected_kind))
             }
             crate::flatten::RegOrConst::Const(c) => {
                 // RPython `assembler.py:168` reads `getkind(x.concretetype)`
@@ -916,7 +995,21 @@ impl Assembler {
                          with the surrounding op's kind)",
                     );
                 }
-                self.emit_const(&c.value, kind_char, state, callcontrol)
+                // Only the int bank has a short-const form (argcode `c`);
+                // ref/float Constants always take their pooled `r`/`f` byte.
+                if kind_char == 'i' {
+                    self.emit_const_i_from_const_allow_short(
+                        &c.value,
+                        allow_short,
+                        state,
+                        callcontrol,
+                    )
+                } else {
+                    (
+                        self.emit_const(&c.value, kind_char, state, callcontrol),
+                        kind_char,
+                    )
+                }
             }
         }
     }
@@ -1168,21 +1261,22 @@ impl Assembler {
 
             // RPython `rpython/jit/codewriter/assembler.py:164-174`: ConstInt
             // is NOT a separate op — Constants appear as arguments to other
-            // instructions via `emit_const` which returns a pool-region
-            // register index (same byte shape as `emit_reg`). Pyre's model
-            // forces constants through a standalone materialization op since
-            // operands are always `Variable`; lowering that limitation is
-            // deferred (requires op-level constant operands). Until
-            // then, emit as `int_copy/i>i` — canonical register-to-register
-            // move — since `emit_const_i` already returns a pool-region
-            // register index (`num_regs_i + pool_pos`) and both src and dst
-            // are int-kind registers. This eliminates the pyre-only
-            // `const_int/c>i` opname and reuses the canonical
-            // `bhimpl_int_copy` handler.
+            // instructions via `emit_const`. Pyre's model forces constants
+            // through a standalone materialization op since operands are
+            // always `Variable`; lowering that limitation is deferred
+            // (requires op-level constant operands). Until then, materialise
+            // through `int_copy` and reuse the canonical `bhimpl_int_copy`
+            // handler: `int_copy` is in USE_C_FORM (`assembler.py:312`), so a
+            // small value (`-128..=127`) takes the inline `c` byte
+            // (`int_copy/c>i`) and a larger one a pool-region `i` slot
+            // (`int_copy/i>i`).
             OpKind::ConstInt(val) => {
-                let idx = self.emit_const_i(*val, state);
+                // assembler.py:163 `allow_short = ('int_copy' in USE_C_FORM)` →
+                // a small constant takes the inline `c` byte (`int_copy/c>i`).
+                let (idx, src_argcode) =
+                    self.emit_const_i_allow_short(*val, use_c_form("int_copy"), state);
                 state.code.push(idx);
-                argcodes.push('i');
+                argcodes.push(src_argcode);
                 if let Some(result) = op.result.as_ref() {
                     argcodes.push('>');
                     let (reg, kc) = self.lookup_reg_with_kind_var(result, regallocs);
@@ -1200,9 +1294,12 @@ impl Assembler {
             // collapses to 0/1 in the int constant pool and the
             // canonical `bhimpl_int_copy` handler runs in the blackhole.
             OpKind::ConstBool(val) => {
-                let idx = self.emit_const_i(*val as i64, state);
+                // Bool folds to kind `int`; `int_copy` is in USE_C_FORM, so the
+                // 0/1 value always fits the inline `c` byte (`int_copy/c>i`).
+                let (idx, src_argcode) =
+                    self.emit_const_i_allow_short(*val as i64, use_c_form("int_copy"), state);
                 state.code.push(idx);
-                argcodes.push('i');
+                argcodes.push(src_argcode);
                 if let Some(result) = op.result.as_ref() {
                     argcodes.push('>');
                     let (reg, kc) = self.lookup_reg_with_kind_var(result, regallocs);
@@ -1408,18 +1505,49 @@ impl Assembler {
                 let (reg, kc) = self.lookup_reg_with_kind_var(base, regallocs);
                 state.code.push(reg);
                 argcodes.push(kc);
-                let (reg, value_kind) = self.lookup_reg_with_kind_var(value, regallocs);
-                state.code.push(reg);
-                argcodes.push(value_kind);
+                // RPython `bhimpl_setfield_gc_{i,r,f}` canonical keys key
+                // off the VALUE's kind (`@arguments("cpu", "r", "X",
+                // "d")`), not the declared field type — declared field
+                // `ty` can be pyre-only Void/State/Unknown.  jtransform's
+                // rewrite_op_setfield derives the value kind from
+                // `getkind(v_newvalue.concretetype)`; mirror that via
+                // `constant_kind` (concretetype, falling back to the Value
+                // variant).  A Variable value is a register of its SSA
+                // kind.  An int Constant takes the short `c` byte
+                // (`setfield_gc_i/rcd`) when small or a pool `i` slot
+                // (`/rid`) when wide (`assembler.py:99-107`, `setfield_gc`
+                // ∈ USE_C_FORM at `assembler.py:312`); a ref/float Constant
+                // takes its pooled `r`/`f` byte (`assembler.py:168`).
+                let value_kind = match value {
+                    crate::model::LinkArg::Value(var) => {
+                        let (reg, kc) = self.lookup_reg_with_kind_var(var, regallocs);
+                        state.code.push(reg);
+                        argcodes.push(kc);
+                        kc
+                    }
+                    crate::model::LinkArg::Const(c) => {
+                        let kind = crate::flatten::constant_kind(c);
+                        if kind == 'i' {
+                            let (byte, argcode) = self.emit_const_i_from_const_allow_short(
+                                &c.value,
+                                use_c_form("setfield_gc_i"),
+                                state,
+                                callcontrol,
+                            );
+                            state.code.push(byte);
+                            argcodes.push(argcode);
+                        } else {
+                            let byte = self.emit_const(&c.value, kind, state, callcontrol);
+                            state.code.push(byte);
+                            argcodes.push(kind);
+                        }
+                        kind
+                    }
+                };
                 let descr_idx = self.emit_ready_descr(fielddescrof(field, ty, callcontrol));
                 state.code.push((descr_idx & 0xFF) as u8);
                 state.code.push((descr_idx >> 8) as u8);
                 argcodes.push('d');
-                // RPython `bhimpl_setfield_gc_{i,r,f}` canonical keys key
-                // off the VALUE register's kind (`@arguments("cpu", "r",
-                // "X", "d")`), not the declared field type — declared
-                // field `ty` can be pyre-only Void/State/Unknown while
-                // the SSA value register is always i/r/f after regalloc.
                 let opname = format!("setfield_gc_{value_kind}");
                 let key = format!("{opname}/{argcodes}");
                 let opnum = self.get_opnum(&key);
@@ -1571,9 +1699,28 @@ impl Assembler {
                 let (reg, kc) = self.lookup_reg_with_kind_var(base, regallocs);
                 state.code.push(reg);
                 argcodes.push(kc);
-                let (reg, value_kind) = self.lookup_reg_with_kind_var(value, regallocs);
-                state.code.push(reg);
-                argcodes.push(value_kind);
+                // `setfield_vable_i` is not in USE_C_FORM
+                // (`assembler.py:312-345`): a constant value never takes
+                // the short `c` byte, always a pool slot.  The value kind
+                // follows `getkind(v_newvalue.concretetype)` via
+                // `constant_kind` — int → pool `i` (`setfield_vable_i/rid`),
+                // ref/float → pool `r`/`f` (`assembler.py:168`).  A register
+                // value keeps its own SSA kind.
+                let value_kind = match value {
+                    crate::model::LinkArg::Value(var) => {
+                        let (reg, kc) = self.lookup_reg_with_kind_var(var, regallocs);
+                        state.code.push(reg);
+                        argcodes.push(kc);
+                        kc
+                    }
+                    crate::model::LinkArg::Const(c) => {
+                        let kind = crate::flatten::constant_kind(c);
+                        let byte = self.emit_const(&c.value, kind, state, callcontrol);
+                        state.code.push(byte);
+                        argcodes.push(kind);
+                        kind
+                    }
+                };
                 let descr_idx = self.emit_ready_descr(crate::jitcode::BhDescr::VableField {
                     index: *field_index,
                 });
@@ -2287,15 +2434,21 @@ impl Assembler {
         state: &mut AssemblyState,
         callcontrol: Option<&CallControl>,
     ) -> u8 {
-        let value = match value {
+        let value = Self::resolve_const_i_value(value, callcontrol);
+        self.emit_const_i(value, state)
+    }
+
+    /// Resolve an integer-kind [`ConstValue`] to its concrete `i64`
+    /// (`assembler.py:168` value extraction).  `llmemory` address offsets
+    /// are symbolic; resolve to the concrete byte size at code emission.
+    /// Struct field offsets / sizes come from the `CallControl`'s struct
+    /// layouts (it implements `OffsetLayout`); the layout-free offsets
+    /// resolve even without a `callcontrol`.
+    fn resolve_const_i_value(value: &ConstValue, callcontrol: Option<&CallControl>) -> i64 {
+        match value {
             ConstValue::Int(n) => *n,
             ConstValue::Bool(b) => *b as i64,
             ConstValue::SpecTag(tag) => *tag as i64,
-            // `llmemory` address offsets are symbolic; resolve to the
-            // concrete byte size at code emission. Struct field offsets /
-            // sizes come from the `CallControl`'s struct layouts (it
-            // implements `OffsetLayout`); the layout-free offsets resolve
-            // even without a `callcontrol`.
             ConstValue::AddressOffset(offset) => {
                 let resolved = match callcontrol {
                     Some(cc) => offset.byte_size(cc),
@@ -2304,8 +2457,22 @@ impl Assembler {
                 resolved.unwrap_or_else(|err| panic!("emit_const_i: {err}"))
             }
             other => panic!("integer-kind constant not supported by emit_const_i: {other:?}"),
-        };
-        self.emit_const_i(value, state)
+        }
+    }
+
+    /// `assembler.py:99-107` short-const for an integer-kind Constant
+    /// operand: resolve to `i64`, then route through
+    /// [`Self::emit_const_i_allow_short`].  Returns `(byte, argcode)` —
+    /// `'c'` when the value took the inline short form, else `'i'`.
+    fn emit_const_i_from_const_allow_short(
+        &mut self,
+        value: &ConstValue,
+        allow_short: bool,
+        state: &mut AssemblyState,
+        callcontrol: Option<&CallControl>,
+    ) -> (u8, char) {
+        let value = Self::resolve_const_i_value(value, callcontrol);
+        self.emit_const_i_allow_short(value, allow_short, state)
     }
 
     fn emit_const_i(&mut self, value: i64, state: &mut AssemblyState) -> u8 {
@@ -2318,6 +2485,26 @@ impl Assembler {
         // Add to pool: index = num_regs + pool_position
         state.constants_i.push(value);
         (state.num_regs_i + state.constants_i.len() - 1) as u8
+    }
+
+    /// `assembler.py:99-107` — the `allow_short` branch of `emit_const`.
+    /// When `allow_short` (the surrounding opname is in [`use_c_form`])
+    /// and `value` fits in signed-i8 range, emit it inline as one byte
+    /// (`assembler.py:106` `self.code.append(chr(value & 0xFF))`) and
+    /// return argcode `'c'`; otherwise fall back to the constant pool and
+    /// return argcode `'i'`.  Returns `(byte, argcode)` — the caller
+    /// pushes `byte` and appends `argcode`.
+    fn emit_const_i_allow_short(
+        &mut self,
+        value: i64,
+        allow_short: bool,
+        state: &mut AssemblyState,
+    ) -> (u8, char) {
+        if allow_short && (-128..=127).contains(&value) {
+            (value as i8 as u8, 'c')
+        } else {
+            (self.emit_const_i(value, state), 'i')
+        }
     }
 
     fn emit_llexitcase(&mut self, value: &ConstValue, state: &mut AssemblyState) -> u8 {
@@ -3770,6 +3957,103 @@ mod tests {
         regallocs
     }
 
+    fn empty_state() -> AssemblyState {
+        AssemblyState {
+            code: Vec::new(),
+            constants_i: Vec::new(),
+            constants_r: Vec::new(),
+            constants_f: Vec::new(),
+            num_regs_i: 4,
+            num_regs_r: 0,
+            num_regs_f: 0,
+            label_positions: HashMap::new(),
+            tlabel_fixups: Vec::new(),
+            startpoints: majit_ir::vec_set::VecSet::new(),
+            alllabels: majit_ir::vec_set::VecSet::new(),
+            resulttypes: majit_ir::vec_assoc::VecAssoc::new(),
+        }
+    }
+
+    #[test]
+    fn use_c_form_matches_assembler_py_membership() {
+        // `assembler.py:312` USE_C_FORM members reachable build-time …
+        assert!(use_c_form("int_copy"));
+        assert!(use_c_form("int_return"));
+        assert!(use_c_form("jit_merge_point"));
+        // … and non-members that must keep the pooled `i`/`r`/`f` argcode.
+        assert!(!use_c_form("ref_copy"));
+        assert!(!use_c_form("float_copy"));
+        assert!(!use_c_form("getfield_gc_i"));
+    }
+
+    #[test]
+    fn emit_const_i_allow_short_uses_inline_byte_for_small_ints() {
+        // `assembler.py:99-107` — with `allow_short`, a signed-i8 value is
+        // emitted inline as one byte (argcode `c`) and never pooled.
+        let mut asm = Assembler::new();
+        let mut state = empty_state();
+        assert_eq!(
+            asm.emit_const_i_allow_short(5, true, &mut state),
+            (5u8, 'c')
+        );
+        // signed-i8 boundaries: 127 and -128 both stay inline.
+        assert_eq!(
+            asm.emit_const_i_allow_short(127, true, &mut state),
+            (127u8, 'c')
+        );
+        assert_eq!(
+            asm.emit_const_i_allow_short(-128, true, &mut state),
+            (128u8, 'c') // -128 as i8 as u8
+        );
+        assert!(
+            state.constants_i.is_empty(),
+            "the short form must not touch the int constant pool"
+        );
+
+        // Out of signed-i8 range → constant pool, argcode `i`. First pool
+        // slot is `num_regs_i + 0`.
+        let (byte, argcode) = asm.emit_const_i_allow_short(128, true, &mut state);
+        assert_eq!(argcode, 'i');
+        assert_eq!(byte, state.num_regs_i as u8);
+        assert_eq!(state.constants_i, vec![128]);
+
+        // `allow_short = false` (opname not in USE_C_FORM) pools even small
+        // ints — second pool slot is `num_regs_i + 1`.
+        let (byte, argcode) = asm.emit_const_i_allow_short(5, false, &mut state);
+        assert_eq!(argcode, 'i');
+        assert_eq!(byte, (state.num_regs_i + 1) as u8);
+        assert_eq!(state.constants_i, vec![128, 5]);
+    }
+
+    #[test]
+    fn encode_regorconst_source_threads_short_argcode() {
+        use crate::flatten::{RegOrConst, Register};
+        use crate::flowspace::model::{ConstValue, Constant};
+
+        let mut asm = Assembler::new();
+        let mut state = empty_state();
+        // A small int Constant in a USE_C_FORM op (`allow_short = true`,
+        // e.g. `int_return`/`int_copy`) takes the inline `c` argcode.
+        let arg = RegOrConst::Const(Constant::new(ConstValue::Int(42)));
+        assert_eq!(
+            asm.encode_regorconst_source(&arg, RegKind::Int, true, &mut state, None),
+            (42u8, 'c')
+        );
+        assert!(state.constants_i.is_empty());
+        // The same Constant without `allow_short` pools to `i`.
+        assert_eq!(
+            asm.encode_regorconst_source(&arg, RegKind::Int, false, &mut state, None),
+            (state.num_regs_i as u8, 'i')
+        );
+        assert_eq!(state.constants_i, vec![42]);
+        // A register source always takes its kind argcode, never `c`.
+        let reg = RegOrConst::Reg(Register::new(RegKind::Int, 3));
+        assert_eq!(
+            asm.encode_regorconst_source(&reg, RegKind::Int, true, &mut state, None),
+            (3u8, 'i')
+        );
+    }
+
     #[test]
     fn get_opnum_setdefault_allocates_dynamic_bytes_for_unregistered_keys() {
         // RPython parity: `assembler.py:220 self.insns.setdefault(key,
@@ -4223,7 +4507,7 @@ mod tests {
             OpKind::FieldWrite {
                 base: base_var.clone(),
                 field: FieldDescriptor::new("x", Some("Point".into())),
-                value: value_var.clone(),
+                value: crate::model::LinkArg::Value(value_var.clone()),
                 ty: ValueType::Unknown,
             },
             false,
@@ -4302,6 +4586,153 @@ mod tests {
             "unexpected setarrayitem_gc_v/iiid key: {:?}",
             asm.insns.keys().collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn assemble_setfield_const_int_uses_c_form() {
+        use crate::flatten::flatten as flatten_graph;
+        use crate::flowspace::model::{ConstValue, Constant};
+        use crate::jtransform::{GraphTransformConfig, Transformer};
+        use crate::model::{FieldDescriptor, FunctionGraph, LinkArg, OpKind, ValueType};
+
+        // A `setfield_gc_i` whose value is an inline integer Constant takes
+        // the short `c` byte (`setfield_gc_i/rcd`) when it fits a signed
+        // byte, else a pool `i` slot (`setfield_gc_i/rid`).  `setfield_gc`
+        // ∈ USE_C_FORM, `assembler.py:99-107,312`.
+        let build = |value: i64| -> Assembler {
+            let mut graph = FunctionGraph::new("const_setfield");
+            let base_var = graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::Input {
+                        name: "obj".into(),
+                        ty: ValueType::Ref(None),
+                        class_root: None,
+                    },
+                    true,
+                )
+                .unwrap();
+            graph.push_op_var(
+                graph.startblock,
+                OpKind::FieldWrite {
+                    base: base_var.clone(),
+                    field: FieldDescriptor::new("x", Some("Point".into())),
+                    value: LinkArg::Const(Constant::new(ConstValue::Int(value))),
+                    ty: ValueType::Unknown,
+                },
+                false,
+            );
+            graph.set_return(graph.startblock, None);
+            FunctionGraph::set_concretetype_of_inline(
+                &base_var,
+                crate::jit_codewriter::type_state::ConcreteType::GcRef,
+            );
+            let config = GraphTransformConfig::default();
+            let mut rewritten = Transformer::new(&config).transform(&graph).graph;
+            regalloc::augment_canonical_exceptblock_on_graph(&mut rewritten);
+            let mut regallocs = regalloc::perform_all_register_allocations(&rewritten);
+            let mut flat = flatten_graph(&rewritten, &mut regallocs);
+            let mut asm = Assembler::new();
+            let _ = asm.assemble(&mut flat, &regallocs);
+            asm
+        };
+
+        let small = build(7);
+        assert!(
+            small.insns.contains_key("setfield_gc_i/rcd"),
+            "small const setfield should take the c-form, got {:?}",
+            small.insns.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !small.insns.contains_key("setfield_gc_i/rid"),
+            "small const setfield should not materialise an i-register, got {:?}",
+            small.insns.keys().collect::<Vec<_>>()
+        );
+
+        let wide = build(100_000);
+        assert!(
+            wide.insns.contains_key("setfield_gc_i/rid"),
+            "wide const setfield should take the pool i-form, got {:?}",
+            wide.insns.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !wide.insns.contains_key("setfield_gc_i/rcd"),
+            "wide const setfield should not take the c-form, got {:?}",
+            wide.insns.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn assemble_setfield_vable_const_int_uses_pool_form() {
+        use crate::flatten::flatten as flatten_graph;
+        use crate::flowspace::model::{ConstValue, Constant};
+        use crate::jtransform::{GraphTransformConfig, Transformer, VirtualizableFieldDescriptor};
+        use crate::model::{FieldDescriptor, FunctionGraph, LinkArg, OpKind, ValueType};
+
+        // A `setfield_gc_i` whose field is virtualizable rewrites to
+        // `setfield_vable_i` (`jtransform.py:921-927`).  `setfield_vable_i`
+        // is NOT in USE_C_FORM (`assembler.py:312-345`), so an inline
+        // integer Constant value always takes the pool `i` slot
+        // (`setfield_vable_i/rid`) — never the short `c` byte — even when
+        // it fits a signed byte.
+        let build = |value: i64| -> Assembler {
+            let mut graph = FunctionGraph::new("const_setfield_vable");
+            let base_var = graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::Input {
+                        name: "frame".into(),
+                        ty: ValueType::Ref(None),
+                        class_root: None,
+                    },
+                    true,
+                )
+                .unwrap();
+            graph.push_op_var(
+                graph.startblock,
+                OpKind::FieldWrite {
+                    base: base_var.clone(),
+                    field: FieldDescriptor::new("depth", Some("Frame".into())),
+                    value: LinkArg::Const(Constant::new(ConstValue::Int(value))),
+                    ty: ValueType::Int,
+                },
+                false,
+            );
+            graph.set_return(graph.startblock, None);
+            FunctionGraph::set_concretetype_of_inline(
+                &base_var,
+                crate::jit_codewriter::type_state::ConcreteType::GcRef,
+            );
+            let config = GraphTransformConfig {
+                vable_fields: vec![VirtualizableFieldDescriptor::new(
+                    "depth",
+                    Some("Frame".into()),
+                    0,
+                )],
+                ..Default::default()
+            };
+            let mut rewritten = Transformer::new(&config).transform(&graph).graph;
+            regalloc::augment_canonical_exceptblock_on_graph(&mut rewritten);
+            let mut regallocs = regalloc::perform_all_register_allocations(&rewritten);
+            let mut flat = flatten_graph(&rewritten, &mut regallocs);
+            let mut asm = Assembler::new();
+            let _ = asm.assemble(&mut flat, &regallocs);
+            asm
+        };
+
+        for value in [7, 100_000] {
+            let asm = build(value);
+            assert!(
+                asm.insns.contains_key("setfield_vable_i/rid"),
+                "vable const setfield (value={value}) should take the pool i-form, got {:?}",
+                asm.insns.keys().collect::<Vec<_>>()
+            );
+            assert!(
+                !asm.insns.contains_key("setfield_vable_i/rcd"),
+                "vable const setfield (value={value}) must never take the c-form, got {:?}",
+                asm.insns.keys().collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]

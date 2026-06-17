@@ -3951,29 +3951,6 @@ pub extern "C" fn bh_binary_op_fn(lhs: i64, rhs: i64, op_code: i64) -> i64 {
     }
 }
 
-/// STORE_SUBSCR: obj[key] = value.
-/// RPython bhimpl_newlist: create a list from N items.
-/// argc is a raw integer count; items follow as PyObjectRef args.
-/// Blackhole's call_may_force_ref passes args from registers.
-pub extern "C" fn bh_build_list_fn(argc: i64, item0: i64, item1: i64, item2: i64) -> i64 {
-    let n = argc as usize;
-    let items: Vec<pyre_object::PyObjectRef> = match n {
-        0 => vec![],
-        1 => vec![item0 as pyre_object::PyObjectRef],
-        2 => vec![
-            item0 as pyre_object::PyObjectRef,
-            item1 as pyre_object::PyObjectRef,
-        ],
-        3 => vec![
-            item0 as pyre_object::PyObjectRef,
-            item1 as pyre_object::PyObjectRef,
-            item2 as pyre_object::PyObjectRef,
-        ],
-        _ => panic!("unsupported argc {} in bh_build_list_fn", argc),
-    };
-    pyre_interpreter::runtime_ops::build_list_from_refs(&items) as i64
-}
-
 /// BUILD_TUPLE: `space.newtuple(list_w)` (`objspace.py:332` →
 /// `tupleobject.py:477` wraptuple) consuming a length-prefixed
 /// `GcTypedArray` of refs — the forced `popvalues` list
@@ -4219,6 +4196,23 @@ pub extern "C" fn bh_load_fast_check_fn(value: i64, w_code_ptr: i64, name_idx: i
     .to_exc_object();
     publish_residual_call_exception(exc_obj as i64);
     0
+}
+
+/// BUILD_LIST: `space.newlist(list_w)` consuming a length-prefixed
+/// `GcTypedArray` of refs — the forced `popvalues_mutable` list
+/// (`pyframe.py:408-419`).  Length travels inside the array (offset-0
+/// prefix), so there is no arity cap.  Allocation-only; the items are
+/// pre-existing heap refs, no user code runs.  `w_list_new` selects the
+/// element strategy (`listobject.rs:381`), so a homogeneous-int list
+/// unboxes to the Integer strategy and carries no off-heap ref block.
+pub extern "C" fn bh_newlist_from_array(array: i64) -> i64 {
+    let arr = array as *const pyre_object::object_array::GcTypedArray;
+    let len = pyre_object::object_array::gcarray_len(arr);
+    let mut items: Vec<pyre_object::PyObjectRef> = Vec::with_capacity(len);
+    for i in 0..len {
+        items.push(pyre_object::object_array::getarrayitem_ref(arr, i));
+    }
+    pyre_interpreter::runtime_ops::build_list_from_refs(&items) as i64
 }
 
 #[cfg(test)]

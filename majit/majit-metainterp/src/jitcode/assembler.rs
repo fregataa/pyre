@@ -642,6 +642,22 @@ impl JitCodeBuilder {
         self.push_u16(descr);
     }
 
+    /// `c`-argcode form of [`Self::setfield_gc_i`] —
+    /// `assembler.py:99-107 emit_const(allow_short=True)` writes a small
+    /// ConstInt value (-128..127) inline as one signed byte (`setfield_gc_i`
+    /// is in `USE_C_FORM`, `assembler.py:312`).
+    ///
+    /// Encoding: `[BC_SETFIELD_GC_I_C][struct_reg u8][value i8]
+    ///             [descr_idx lo u8][descr_idx hi u8]`.
+    pub fn setfield_gc_i_c(&mut self, struct_reg: u16, value: i8, offset: usize, type_id: u64) {
+        self.touch_ref_reg(struct_reg);
+        let descr = self.add_struct_field_descr(offset, majit_ir::value::Type::Int, type_id);
+        self.write_insn("setfield_gc_i/rcd");
+        self.push_reg_u8(struct_reg, "setfield_gc_i_c struct");
+        self.push_u8(value as u8);
+        self.push_u16(descr);
+    }
+
     /// Emit `getfield_gc_i/rd>i` (`blackhole.py:1432 bhimpl_getfield_gc_i`):
     /// load `struct_reg`'s int field at `offset` into `dest`.
     pub fn getfield_gc_i(&mut self, dest: u16, struct_reg: u16, offset: usize) {

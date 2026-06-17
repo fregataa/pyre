@@ -513,7 +513,15 @@ pub enum OpKind {
     FieldWrite {
         base: crate::flowspace::model::Variable,
         field: FieldDescriptor,
-        value: crate::flowspace::model::Variable,
+        /// RPython `setfield_gc(p, x, descr)` where `x` is an
+        /// `AbstractValue` — either a `Variable` (register operand) or a
+        /// `Constant` (inline literal).  `LinkArg::Value`/`Const` mirrors
+        /// that union so a small-int constant can stay inline as the
+        /// stored value (`setfield_gc_i/rcd`) instead of being hoisted
+        /// into a separate `ConstInt -> register` materialisation.  Until
+        /// the MIR front-end stops materialising (the c-form activation),
+        /// every producer mints `LinkArg::Value`.
+        value: LinkArg,
         ty: ValueType,
     },
     ArrayRead {
@@ -643,10 +651,18 @@ pub enum OpKind {
     },
     /// Virtualizable field write → writes to boxes, no heap op.
     /// RPython: `setfield_vable_i/r/f`
+    ///
+    /// `value` is a [`LinkArg`] (register or inline constant) like
+    /// [`OpKind::FieldWrite`]: `rewrite_op_setfield` passes the setfield
+    /// `v_value` straight to `setfield_vable_%s`
+    /// (`jtransform.py:921-927`), which may be a `Constant`
+    /// (`flatten.py:360-371`).  `setfield_vable_i` is not in `USE_C_FORM`
+    /// (`assembler.py:312-345`), so a constant value always takes the
+    /// pool `i` slot (`setfield_vable_i/rid`), never the short `c` byte.
     VableFieldWrite {
         base: crate::flowspace::model::Variable,
         field_index: usize,
-        value: crate::flowspace::model::Variable,
+        value: LinkArg,
         ty: ValueType,
     },
     /// Virtualizable array read → reads from boxes.
@@ -1152,6 +1168,21 @@ impl LinkArg {
         match self {
             Self::Value(var) => Some(var),
             Self::Const(_) => None,
+        }
+    }
+
+    /// Remap the backing `Variable` of a `LinkArg::Value` through
+    /// `remap`, leaving a `LinkArg::Const` literal untouched.  Mirrors
+    /// the `remap_link_arg` closure in
+    /// [`remap_control_flow_metadata_var`] and RPython
+    /// `Hlvalue.replace(mapping)` where a `Constant` returns itself.
+    pub fn map_value(
+        &self,
+        remap: impl FnOnce(&crate::flowspace::model::Variable) -> crate::flowspace::model::Variable,
+    ) -> Self {
+        match self {
+            Self::Value(var) => Self::Value(remap(var)),
+            Self::Const(value) => Self::Const(value.clone()),
         }
     }
 }

@@ -3144,17 +3144,6 @@ pub struct LoweringContext {
     /// w_name, value]`, void result) via
     /// [`lower_store_name_hlop_to_insn`].
     pub store_name_fn_idx: u16,
-    /// `build_list_fn` descrs-pool index — see codewriter.rs:2401
-    /// (`bind(assembler, cpu.build_list_fn as *const (),
-    /// CallFlavor::Plain)`) for the production source.  BUILD_LIST
-    /// (single HLOp opname `newlist`) lowers to `residual_call_ir_r`
-    /// via [`build_build_list_fn_residual_call_ir_r_insn`] which
-    /// pads unused item slots with `ConstInt(0)` matching the
-    /// inline emit at codewriter.rs:6390-6398.  Walker only emits
-    /// `newlist` HLOp on graph for argc ≤ 3; argc > 3 emits
-    /// `abort_permanent` instead, so the canonical lowering arm
-    /// returns `None` (passthrough) on argc > 3.
-    pub build_list_fn_idx: u16,
     /// `bind(assembler, cpu.newtuple_from_array_fn as *const (),
     /// CallFlavor::Plain)` descrs-pool index for the production
     /// source.  BUILD_TUPLE records the rtyped `pyopcode.py:995-998`
@@ -3167,6 +3156,16 @@ pub struct LoweringContext {
     /// `new_array_clear` constant and inside the length-prefixed
     /// array.
     pub newtuple_from_array_fn_idx: u16,
+    /// `bind(assembler, cpu.newlist_from_array_fn as *const (),
+    /// CallFlavor::Plain)` descrs-pool index.  BUILD_LIST records the
+    /// `pyopcode.py` shape on the graph — `new_array_clear` + argc ×
+    /// `setarrayitem_gc_r` (the `@jit.unroll_safe` `popvalues_mutable`
+    /// list build, `pyframe.py:408-419`) + one `newlist_from_array`
+    /// call (`newlist(list_w)`) — and [`lower_tuple_build_hlop_to_insn`]
+    /// reads this index for the call op.  No arity cap: the length
+    /// travels as the
+    /// `new_array_clear` constant and inside the length-prefixed array.
+    pub newlist_from_array_fn_idx: u16,
     /// `call_fn_N` descrs-pool indices for nargs ∈ 0..=8 — see
     /// codewriter.rs:3206-3245 for the production source.  CALL
     /// (single HLOp opname `simple_call`) lowers to
@@ -4050,13 +4049,12 @@ pub fn pyobject_gcarray_bh_descr() -> BhDescr {
 ///   `values_w[i] = self.popvalue()` store of the `@jit.unroll_safe`
 ///   `popvalues` loop (`pyframe.py:408-419`).  `index` is a
 ///   `ConstInt` operand (the unroll fixes each index).  Void.
-/// - `newtuple_from_array(array) → tuple` —
-///   `residual_call_r_r(ConstInt(fn_idx), ListR([array]), Descr) →
-///   Reg(Ref, dst)`; `newtuple` (`objspace.py:332`) is NOT
-///   unroll_safe and residualizes as this single consumer.
-///   Allocation-only — `CallFlavor::Plain`, same classification as
-///   `build_list_fn`.  No arity cap: the length travels inside the
-///   length-prefixed array.
+/// - `newtuple_from_array(array) → tuple` / `newlist_from_array(array)
+///   → list` — `residual_call_r_r(ConstInt(fn_idx), ListR([array]),
+///   Descr) → Reg(Ref, dst)`; `newtuple` / `newlist` are NOT
+///   unroll_safe and residualize as this single consumer.
+///   Allocation-only — `CallFlavor::Plain`.  No arity cap: the length
+///   travels inside the length-prefixed array.
 ///
 /// Returns `None` for other opnames so the caller can fall through
 /// to other lowering arms.
@@ -4188,6 +4186,34 @@ where
             // first) → `Plain`, like the allocation-only `newtuple_from_array`.
             Some(build_residual_call_r_r_insn_from_operands(
                 ctx.build_string_from_array_fn_idx,
+                vec![array_operand],
+                CallFlavor::Plain,
+                majit_ir::PyreHelperKind::None,
+                dst_reg,
+            ))
+        }
+        "newlist_from_array" => {
+            if op.args.len() != 1 {
+                return None;
+            }
+            let array_operand =
+                flatten_arg_with_lowering(&op.args[0], get_register, lower_constant);
+            let dst_reg = match &op.result {
+                Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
+                _ => return None,
+            };
+            // `w_list_new` allocates a list and detects its storage strategy
+            // by unboxing each element (`IntegerListStrategy` /
+            // `FloatListStrategy` read `W_IntObject.intval` /
+            // `W_FloatObject.floatval`).  The allocation can raise but runs no
+            // user code and does not touch the virtualizable, so the effect is
+            // `EF_CAN_RAISE` → `Plain` (`call.py:288`: only the virtualizable
+            // analyzer raises `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE`).  Virtual
+            // element boxes passed as args are forced by the residual call
+            // regardless of flavor.  Matches the pointer-copy-only
+            // `newtuple_from_array` sibling (`Plain`).
+            Some(build_residual_call_r_r_insn_from_operands(
+                ctx.newlist_from_array_fn_idx,
                 vec![array_operand],
                 CallFlavor::Plain,
                 majit_ir::PyreHelperKind::None,
@@ -4390,125 +4416,6 @@ pub fn build_one_int_one_ref_fn_residual_call_ir_r_insn(
                 Kind::Ref,
                 vec![Operand::Register(Register::new(Kind::Ref, ref_reg))],
             )),
-            descr_operand,
-        ],
-        Register::new(Kind::Ref, dst_reg),
-    )
-}
-
-/// Construct the BuildList-family `residual_call_ir_r` Insn from
-/// raw register indices.  The production codewriter callsite
-/// replaces the prior `emit_residual_call(
-/// build_list_fn_idx, ...)` SSARepr emit at codewriter.rs:6002-6009
-/// with a single direct push of this helper's output.  No graph
-/// dual-write exists for `build_list_fn` (the graph carries
-/// `newlist(items)` HLOp via `emit_frontend_newlist`); this is a
-/// clean factor refactor with no asymmetry.
-///
-/// `build_list_fn` has C ABI `extern "C" fn(i64, i64, i64, i64)` —
-/// always 4 i64 parameters dispatched internally by the leading
-/// `argc` (`bh_build_list_fn` per `cpu.rs`).  The trailing 3 slots
-/// hold real boxed-Ref pointers when the corresponding item is
-/// present, or `0` (dummy bit pattern, routed through the int
-/// constants pool per `make_three_lists` jtransform.py:437-445)
-/// when absent.  Per codewriter.rs:5945-5954, `argc > 3` falls
-/// through to `emit_abort_permanent` and never invokes this
-/// helper, so `argc ∈ {0, 1, 2, 3}`.
-///
-/// Inline arg order from `emit_residual_call_shape` for call-args
-/// `[ConstInt(argc), maybe_Reg_or_ConstInt(item0),
-/// maybe_Reg_or_ConstInt(item1), maybe_Reg_or_ConstInt(item2)]`:
-///   * `args_i` = leading argc + each absent item's `0` dummy.
-///   * `args_r` = each present item's Reg.
-///   * `arg_kinds` preserves call-order (NOT bucket-order): always
-///     `[Int, item0_kind, item1_kind, item2_kind]` where each item kind is
-///     `Ref` when present and `Int` when dummy.
-///
-/// Both `ListI` and `ListR` are always pushed because `args_i` is
-/// always non-empty (leading argc) → `kinds = "ir"` → `residual_
-/// call_ir_r`.  `ListR` is empty for `argc=0` but still emitted
-/// (kind-selection logic at codewriter.rs:2771-2777 includes `'r'`
-/// in `kinds` whenever a kind appears in `arg_kinds`, but
-/// `emit_residual_call_shape` actually drives `kinds.contains('r')`
-/// off `kinds` → the empty `ListR` is pushed to keep the trailing
-/// `ListF?, Descr` slots in their canonical positions).  The
-/// helper mirrors that exactly.
-///
-/// `arg_regs.len()` must equal `argc`; caller is the production
-/// `Instruction::BuildList` arm which gathers the popped
-/// `arg_regs: Vec<u16>` directly off the stack.  Hardcoded
-/// `CallFlavor::Plain` matching the production source at
-/// codewriter.rs:2226 (`build_list_fn` is allocation-only).
-pub fn build_build_list_fn_residual_call_ir_r_insn(
-    build_list_fn_idx: u16,
-    argc: usize,
-    arg_regs: &[u16],
-    dst_reg: u16,
-) -> Insn {
-    assert_eq!(arg_regs.len(), argc, "arg_regs length must match argc");
-    let item_operands: Vec<Operand> = arg_regs
-        .iter()
-        .map(|&reg| Operand::Register(Register::new(Kind::Ref, reg)))
-        .collect();
-    build_build_list_fn_residual_call_ir_r_insn_from_operands(
-        build_list_fn_idx,
-        argc,
-        item_operands,
-        dst_reg,
-    )
-}
-
-/// Operand-flexible variant of `build_build_list_fn_residual_call_ir_r_insn`.
-/// Each item slot can be a `Register` (resolved Variable) OR a `Const*`
-/// (lowered Constant via `flatten_arg`'s Constant arm).  Used by the
-/// canonical driver's `lower_new_sequence_hlop_to_insn` to handle graph
-/// `newlist` HLOps whose items are Constants — upstream RPython's
-/// rtype pass would have pre-loaded these into Variables, but pyre's
-/// graph carries the un-rewritten Constants.
-pub fn build_build_list_fn_residual_call_ir_r_insn_from_operands(
-    build_list_fn_idx: u16,
-    argc: usize,
-    item_operands: Vec<Operand>,
-    dst_reg: u16,
-) -> Insn {
-    assert!(
-        argc <= 3,
-        "BuildList helper only supports argc ∈ {{0, 1, 2, 3}}"
-    );
-    assert_eq!(
-        item_operands.len(),
-        argc,
-        "item_operands length must match argc"
-    );
-    let mut arg_kinds: Vec<Kind> = Vec::with_capacity(4);
-    let mut args_i: Vec<Operand> = Vec::with_capacity(4);
-    let mut args_r: Vec<Operand> = Vec::with_capacity(3);
-    // Leading argc slot — always Int.
-    arg_kinds.push(Kind::Int);
-    args_i.push(Operand::ConstInt(argc as i64));
-    // Trailing 3 slots — Ref if present, Int dummy `0` if absent.
-    let mut item_iter = item_operands.into_iter();
-    for i in 0..3 {
-        if i < argc {
-            arg_kinds.push(Kind::Ref);
-            args_r.push(item_iter.next().unwrap());
-        } else {
-            arg_kinds.push(Kind::Int);
-            args_i.push(Operand::ConstInt(0));
-        }
-    }
-    let effect_info = effect_info_for_call_flavor(CallFlavor::Plain);
-    let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
-        effect_info,
-        arg_kinds,
-        result_kind: Some(Kind::Ref),
-    }));
-    Insn::op_with_result(
-        "residual_call_ir_r",
-        vec![
-            Operand::ConstInt(build_list_fn_idx as i64),
-            Operand::ListOfKind(ListOfKind::new(Kind::Int, args_i)),
-            Operand::ListOfKind(ListOfKind::new(Kind::Ref, args_r)),
             descr_operand,
         ],
         Register::new(Kind::Ref, dst_reg),
@@ -4808,9 +4715,6 @@ where
         return Some(insn);
     }
     if let Some(insn) = lower_store_name_hlop_to_insn(op, ctx, get_register, lower_constant) {
-        return Some(insn);
-    }
-    if let Some(insn) = lower_new_sequence_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
     if let Some(insn) = lower_tuple_build_hlop_to_insn(op, ctx, get_register, lower_constant) {
@@ -5793,76 +5697,6 @@ where
         operands,
         CallFlavor::MayForce,
         majit_ir::PyreHelperKind::CallFn,
-        dst_reg,
-    ))
-}
-
-/// Lower a BUILD_LIST-family pre-rtype HLOp `newlist(items)` →
-/// `result: Ref` to the equivalent post-rtype
-/// `residual_call_ir_r(ConstInt(fn_idx), ListI([argc, dummies]),
-/// ListR([item_regs]), Descr) → reg` Insn.  Pads unused item slots
-/// with `ConstInt(0)` (the
-/// `build_build_list_fn_residual_call_ir_r_insn` shape).
-/// BUILD_TUPLE no longer routes here — it records the rtyped
-/// `new_array_clear` / `setarrayitem_gc_r` / `newtuple_from_array`
-/// shape lowered by [`lower_tuple_build_hlop_to_insn`].
-///
-/// Walker contract: `emit_frontend_newlist` only fires for argc ≤ 3
-/// (codewriter.rs:6332-6346 — argc > 3 takes the `abort_permanent`
-/// branch which does NOT record the HLOp on the graph), so a
-/// graph-side `newlist` with argc > 3 indicates a walker
-/// non-orthodoxy; return `None` (passthrough) rather than asserting,
-/// matching the other lowering arms' "no match → passthrough"
-/// pattern.
-///
-/// Returns `None` for opnames other than `newlist` so the caller can
-/// fall through to other lowering arms.
-pub fn lower_new_sequence_hlop_to_insn<F, LC>(
-    op: &super::flow::SpaceOperation,
-    ctx: &LoweringContext,
-    get_register: &mut F,
-    lower_constant: &mut LC,
-) -> Option<Insn>
-where
-    F: FnMut(super::flow::Variable) -> Register,
-    LC: FnMut(&Constant) -> Operand,
-{
-    let fn_idx = match op.opname.as_str() {
-        "newlist" => ctx.build_list_fn_idx,
-        _ => return None,
-    };
-    let argc = op.args.len();
-    if argc > 3 {
-        return None;
-    }
-    // Walker emits each item Variable into a fresh Ref scratch via
-    // `emit_ref_copy!(arg_regs[i], item_reg)` then passes those scratch
-    // regs to the helper.  The canonical entry doesn't see those
-    // inline `ref_copy`s — it reads the item Variables directly off
-    // the SpaceOperation and resolves them through `get_register`.
-    // Constant items lower via `lower_constant` per
-    // `flatten.py:340-345 flatten_arg`'s Constant arm.
-    let item_operands: Vec<Operand> = op
-        .args
-        .iter()
-        .map(|arg| match arg {
-            super::flow::SpaceOperationArg::Value(super::flow::FlowValue::Variable(var)) => {
-                Some(Operand::Register(get_register(*var)))
-            }
-            super::flow::SpaceOperationArg::Value(super::flow::FlowValue::Constant(c)) => {
-                Some(lower_constant(c))
-            }
-            _ => None,
-        })
-        .collect::<Option<Vec<_>>>()?;
-    let dst_reg = match &op.result {
-        Some(super::flow::FlowValue::Variable(var)) => get_register(*var).index,
-        _ => return None,
-    };
-    Some(build_build_list_fn_residual_call_ir_r_insn_from_operands(
-        fn_idx,
-        argc,
-        item_operands,
         dst_reg,
     ))
 }
@@ -7064,8 +6898,8 @@ mod tests {
             getattr_fn_idx: 0,
             load_name_fn_idx: 0,
             store_name_fn_idx: 0,
-            build_list_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
+            newlist_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
@@ -7219,8 +7053,8 @@ mod tests {
             getattr_fn_idx: 0,
             load_name_fn_idx: 0,
             store_name_fn_idx: 0,
-            build_list_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
+            newlist_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
@@ -7361,8 +7195,8 @@ mod tests {
             getattr_fn_idx: 0,
             load_name_fn_idx: 0,
             store_name_fn_idx: 0,
-            build_list_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
+            newlist_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
@@ -7466,8 +7300,8 @@ mod tests {
             getattr_fn_idx: 0,
             load_name_fn_idx: 0,
             store_name_fn_idx: 0,
-            build_list_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
+            newlist_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
@@ -7615,8 +7449,8 @@ mod tests {
             getattr_fn_idx: 0,
             load_name_fn_idx: 0,
             store_name_fn_idx: 0,
-            build_list_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
+            newlist_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
@@ -7809,8 +7643,8 @@ mod tests {
             getattr_fn_idx: 0,
             load_name_fn_idx: 0,
             store_name_fn_idx: 0,
-            build_list_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
+            newlist_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
@@ -8052,8 +7886,8 @@ mod tests {
             getattr_fn_idx: 0,
             load_name_fn_idx: 0,
             store_name_fn_idx: 0,
-            build_list_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
+            newlist_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
@@ -8161,8 +7995,8 @@ mod tests {
             getattr_fn_idx: 0,
             load_name_fn_idx: 0,
             store_name_fn_idx: 0,
-            build_list_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
+            newlist_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
@@ -8214,8 +8048,8 @@ mod tests {
             getattr_fn_idx: 0,
             load_name_fn_idx: 0,
             store_name_fn_idx: 0,
-            build_list_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
+            newlist_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
@@ -8344,8 +8178,8 @@ mod tests {
             getattr_fn_idx: 0,
             load_name_fn_idx: 0,
             store_name_fn_idx: 0,
-            build_list_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
+            newlist_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
@@ -8432,7 +8266,7 @@ mod tests {
             getattr_fn_idx: 0,
             load_name_fn_idx: 0,
             store_name_fn_idx: 0,
-            build_list_fn_idx: 0,
+            newlist_from_array_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
             load_attr_fn_idx: 0,
@@ -8491,8 +8325,8 @@ mod tests {
             getattr_fn_idx: 0,
             load_name_fn_idx: 0,
             store_name_fn_idx: 0,
-            build_list_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
+            newlist_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
@@ -8542,8 +8376,8 @@ mod tests {
             getattr_fn_idx: 0,
             load_name_fn_idx: 0,
             store_name_fn_idx: 0,
-            build_list_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
+            newlist_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
@@ -8600,8 +8434,8 @@ mod tests {
             getattr_fn_idx: 0,
             load_name_fn_idx: 0,
             store_name_fn_idx: 0,
-            build_list_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
+            newlist_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
@@ -8685,8 +8519,8 @@ mod tests {
             getattr_fn_idx: 0,
             load_name_fn_idx: 0,
             store_name_fn_idx: 0,
-            build_list_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
+            newlist_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
@@ -8733,8 +8567,8 @@ mod tests {
             getattr_fn_idx: 0,
             load_name_fn_idx: 0,
             store_name_fn_idx: 0,
-            build_list_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
+            newlist_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
@@ -8795,8 +8629,8 @@ mod tests {
             getattr_fn_idx: 0,
             load_name_fn_idx: 0,
             store_name_fn_idx: 0,
-            build_list_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
+            newlist_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
@@ -8873,8 +8707,8 @@ mod tests {
             getattr_fn_idx: 0,
             load_name_fn_idx: 0,
             store_name_fn_idx: 0,
-            build_list_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
+            newlist_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
@@ -8936,8 +8770,8 @@ mod tests {
             getattr_fn_idx: 0,
             load_name_fn_idx: 0,
             store_name_fn_idx: 0,
-            build_list_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
+            newlist_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
@@ -9014,8 +8848,8 @@ mod tests {
             getattr_fn_idx: 0,
             load_name_fn_idx: 0,
             store_name_fn_idx: 0,
-            build_list_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
+            newlist_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
@@ -9068,8 +8902,8 @@ mod tests {
             getattr_fn_idx: 0,
             load_name_fn_idx: 0,
             store_name_fn_idx: 0,
-            build_list_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
+            newlist_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
@@ -9122,8 +8956,8 @@ mod tests {
             getattr_fn_idx: 0,
             load_name_fn_idx: 0,
             store_name_fn_idx: 0,
-            build_list_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
+            newlist_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
@@ -9181,8 +9015,8 @@ mod tests {
             getattr_fn_idx: 0,
             load_name_fn_idx: 0,
             store_name_fn_idx: 0,
-            build_list_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
+            newlist_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
@@ -9254,8 +9088,8 @@ mod tests {
             getattr_fn_idx: 0,
             load_name_fn_idx: 0,
             store_name_fn_idx: 0,
-            build_list_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
+            newlist_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
@@ -10143,230 +9977,6 @@ mod tests {
     }
 
     #[test]
-    fn build_build_list_fn_residual_call_ir_r_insn_emits_residual_call_ir_r_for_argc_2() {
-        // BuildList factor refactor.  argc=2:
-        // two item slots are real Refs, and the third trailing ABI slot
-        // is an Int dummy.  Expected shape:
-        // `[ConstInt(fn_idx), ListI([ConstInt(2), ConstInt(0)]),
-        // ListR([Reg(item0), Reg(item1)]),
-        // Descr(CallDescrStub{Plain, [Int, Ref, Ref, Int]})] → Reg(Ref, dst)`.
-        let insn = build_build_list_fn_residual_call_ir_r_insn(
-            /* build_list_fn_idx */ 18,
-            /* argc */ 2,
-            /* arg_regs */ &[3, 4],
-            /* dst_reg */ 5,
-        );
-        match insn {
-            Insn::Op {
-                opname,
-                args,
-                result: Some(reg),
-            } => {
-                assert_eq!(opname, "residual_call_ir_r");
-                assert_eq!(reg, Register::new(Kind::Ref, 5));
-                assert_eq!(args.len(), 4);
-                if let Operand::ConstInt(v) = &args[0] {
-                    assert_eq!(*v, 18);
-                } else {
-                    panic!("expected ConstInt(18) at args[0]");
-                }
-                if let Operand::ListOfKind(list) = &args[1] {
-                    assert_eq!(list.kind, Kind::Int);
-                    assert_eq!(list.content.len(), 2, "argc=2 → ListI=[2, 0]");
-                    if let Operand::ConstInt(v) = &list.content[0] {
-                        assert_eq!(*v, 2);
-                    } else {
-                        panic!("expected ConstInt(2) in ListI");
-                    }
-                    if let Operand::ConstInt(v) = &list.content[1] {
-                        assert_eq!(*v, 0);
-                    } else {
-                        panic!("expected trailing ConstInt(0) in ListI");
-                    }
-                } else {
-                    panic!("expected ListOfKind(Int) at args[1]");
-                }
-                if let Operand::ListOfKind(list) = &args[2] {
-                    assert_eq!(list.kind, Kind::Ref);
-                    assert_eq!(list.content.len(), 2);
-                } else {
-                    panic!("expected ListOfKind(Ref) at args[2]");
-                }
-                if let Operand::Descr(rc) = &args[3] {
-                    if let DescrOperand::CallDescrStub(stub) = &**rc {
-                        assert_eq!(
-                            stub.arg_kinds,
-                            vec![Kind::Int, Kind::Ref, Kind::Ref, Kind::Int],
-                        );
-                        assert_eq!(
-                            stub.effect_info,
-                            effect_info_for_call_flavor(CallFlavor::Plain),
-                        );
-                    } else {
-                        panic!("expected CallDescrStub");
-                    }
-                } else {
-                    panic!("expected Descr at args[3]");
-                }
-            }
-            other => panic!("expected Insn::Op, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn build_build_list_fn_residual_call_ir_r_insn_pads_argc_0_and_1() {
-        // argc=0: no real items.  arg_kinds=[Int, Int, Int, Int], args_i=
-        // [argc=0, dummy=0, dummy=0, dummy=0], args_r=[].  ListR is still
-        // pushed (empty) because kinds="ir" includes 'r'.
-        let argc_0 = build_build_list_fn_residual_call_ir_r_insn(18, 0, &[], 5);
-        if let Insn::Op { args, .. } = &argc_0 {
-            if let Operand::ListOfKind(list) = &args[1] {
-                assert_eq!(list.content.len(), 4, "argc=0 → ListI=[0, 0, 0, 0]");
-                for op in &list.content {
-                    if let Operand::ConstInt(v) = op {
-                        assert_eq!(*v, 0);
-                    } else {
-                        panic!("expected ConstInt in ListI");
-                    }
-                }
-            } else {
-                panic!("expected ListOfKind(Int) at args[1]");
-            }
-            if let Operand::ListOfKind(list) = &args[2] {
-                assert_eq!(list.content.len(), 0, "argc=0 → ListR=[]");
-            } else {
-                panic!("expected ListOfKind(Ref) at args[2]");
-            }
-            if let Operand::Descr(rc) = &args[3] {
-                if let DescrOperand::CallDescrStub(stub) = &**rc {
-                    assert_eq!(
-                        stub.arg_kinds,
-                        vec![Kind::Int, Kind::Int, Kind::Int, Kind::Int],
-                    );
-                }
-            }
-        } else {
-            panic!("expected Insn::Op");
-        }
-
-        // argc=1: 1 real item, 2 padding slots.  arg_kinds=[Int, Ref, Int, Int],
-        // args_i=[argc=1, dummy=0, dummy=0], args_r=[reg].
-        let argc_1 = build_build_list_fn_residual_call_ir_r_insn(18, 1, &[7], 5);
-        if let Insn::Op { args, .. } = &argc_1 {
-            if let Operand::ListOfKind(list) = &args[1] {
-                assert_eq!(list.content.len(), 3, "argc=1 → ListI=[1, 0, 0]");
-                let expected = [1, 0, 0];
-                for (op, expected) in list.content.iter().zip(expected) {
-                    if let Operand::ConstInt(v) = op {
-                        assert_eq!(*v, expected);
-                    } else {
-                        panic!("expected ConstInt in ListI");
-                    }
-                }
-            } else {
-                panic!("expected ListOfKind(Int) at args[1]");
-            }
-            if let Operand::ListOfKind(list) = &args[2] {
-                assert_eq!(list.content.len(), 1, "argc=1 → ListR=[reg]");
-            } else {
-                panic!("expected ListOfKind(Ref) at args[2]");
-            }
-            if let Operand::Descr(rc) = &args[3] {
-                if let DescrOperand::CallDescrStub(stub) = &**rc {
-                    assert_eq!(
-                        stub.arg_kinds,
-                        vec![Kind::Int, Kind::Ref, Kind::Int, Kind::Int],
-                    );
-                }
-            }
-        } else {
-            panic!("expected Insn::Op");
-        }
-
-        // argc=3: all trailing ABI slots are Refs.  arg_kinds=
-        // [Int, Ref, Ref, Ref], args_i=[argc=3], args_r=[reg, reg, reg].
-        let argc_3 = build_build_list_fn_residual_call_ir_r_insn(18, 3, &[7, 8, 9], 5);
-        if let Insn::Op { args, .. } = &argc_3 {
-            if let Operand::ListOfKind(list) = &args[1] {
-                assert_eq!(list.content.len(), 1, "argc=3 → ListI=[3]");
-                if let Operand::ConstInt(v) = &list.content[0] {
-                    assert_eq!(*v, 3);
-                } else {
-                    panic!("expected ConstInt(3) in ListI");
-                }
-            } else {
-                panic!("expected ListOfKind(Int) at args[1]");
-            }
-            if let Operand::ListOfKind(list) = &args[2] {
-                assert_eq!(list.content.len(), 3, "argc=3 → ListR=[reg, reg, reg]");
-            } else {
-                panic!("expected ListOfKind(Ref) at args[2]");
-            }
-            if let Operand::Descr(rc) = &args[3] {
-                if let DescrOperand::CallDescrStub(stub) = &**rc {
-                    assert_eq!(
-                        stub.arg_kinds,
-                        vec![Kind::Int, Kind::Ref, Kind::Ref, Kind::Ref],
-                    );
-                }
-            }
-        } else {
-            panic!("expected Insn::Op");
-        }
-    }
-
-    #[test]
-    fn build_build_list_fn_residual_call_ir_r_insn_matches_flatten_of_residual_call_op() {
-        // Byte-equivalence at argc=2 — feed an equivalent
-        // residual_call_ir_r SpaceOperation through
-        // `flatten_op_to_insn` and compare.
-        let item0 = Variable::new(VariableId(3), Kind::Ref);
-        let item1 = Variable::new(VariableId(4), Kind::Ref);
-        let dst = Variable::new(VariableId(5), Kind::Ref);
-        let descr = intern_call_descr_stub(
-            effect_info_for_call_flavor(CallFlavor::Plain),
-            vec![Kind::Int, Kind::Ref, Kind::Ref, Kind::Int],
-            Some(Kind::Ref),
-        );
-        let dual_op = SpaceOperation::new(
-            "residual_call_ir_r",
-            vec![
-                Constant::signed(18).into(),
-                FlowListOfKind::new(
-                    Kind::Int,
-                    vec![Constant::signed(2).into(), Constant::signed(0).into()],
-                )
-                .into(),
-                FlowListOfKind::new(Kind::Ref, vec![item0.into(), item1.into()]).into(),
-                descr.into(),
-            ],
-            Some(dst.into()),
-            0,
-        );
-        let mut get_register = identity_register_mapper();
-        let dual = flatten_op_to_insn(
-            &dual_op,
-            &mut get_register,
-            &mut flatten_constant_operand_for_test,
-        )
-        .expect("residual_call SpaceOperation must lower");
-        let prod = build_build_list_fn_residual_call_ir_r_insn(18, 2, &[3, 4], 5);
-        assert_eq!(format!("{prod:?}"), format!("{dual:?}"));
-    }
-
-    #[test]
-    #[should_panic(expected = "BuildList helper only supports argc")]
-    fn build_build_list_fn_residual_call_ir_r_insn_rejects_unsupported_argc() {
-        let _ = build_build_list_fn_residual_call_ir_r_insn(18, 4, &[1, 2, 3, 4], 5);
-    }
-
-    #[test]
-    #[should_panic(expected = "arg_regs length must match argc")]
-    fn build_build_list_fn_residual_call_ir_r_insn_rejects_arg_reg_mismatch() {
-        let _ = build_build_list_fn_residual_call_ir_r_insn(18, 2, &[1], 5);
-    }
-
-    #[test]
     #[should_panic(expected = "BUILD_SLICE expects argc=2 without step or argc=3 with step")]
     fn build_build_slice_fn_residual_call_ir_r_insn_rejects_two_arg_with_step() {
         let _ = build_build_slice_fn_residual_call_ir_r_insn(19, 2, 1, 2, Some(3), 4);
@@ -10650,8 +10260,8 @@ mod tests {
             getattr_fn_idx: 0,
             load_name_fn_idx: 0,
             store_name_fn_idx: 0,
-            build_list_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
+            newlist_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
@@ -10945,8 +10555,8 @@ mod tests {
             getattr_fn_idx: 0,
             load_name_fn_idx: 0,
             store_name_fn_idx: 0,
-            build_list_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
+            newlist_from_array_fn_idx: 0,
             call_fn_idx_by_nargs,
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
@@ -11060,8 +10670,8 @@ mod tests {
             compare_op_fn_idx: 0,
             truth_fn_idx: 0,
             store_subscr_fn_idx: 0,
-            build_list_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
+            newlist_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
             getattr_fn_idx: 0,
             load_attr_fn_idx: 91,

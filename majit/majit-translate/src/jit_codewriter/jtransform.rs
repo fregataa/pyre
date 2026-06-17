@@ -14,8 +14,8 @@ use serde::{Deserialize, Serialize};
 use crate::call::CallDescriptor;
 use crate::jit_codewriter::support::{NormalizedArg, decode_builtin_call};
 use crate::model::{
-    CallFuncPtr, CallTarget, FieldDescriptor, FunctionGraph, OpKind, SpaceOperation, ValueType,
-    remap_control_flow_metadata_var,
+    CallFuncPtr, CallTarget, FieldDescriptor, FunctionGraph, LinkArg, OpKind, SpaceOperation,
+    ValueType, remap_control_flow_metadata_var,
 };
 use majit_ir::descr::{EffectInfo, ExtraEffect, OopSpecIndex};
 
@@ -2238,11 +2238,14 @@ impl<'a> Transformer<'a> {
         &mut self,
         op: &SpaceOperation,
         field: &FieldDescriptor,
-        value: &crate::flowspace::model::Variable,
+        value: &LinkArg,
         ty: &ValueType,
         graph_name: &str,
     ) -> RewriteResult {
-        let typed_ty = self.get_value_type(value).unwrap_or_else(|| ty.clone());
+        let typed_ty = value
+            .as_variable()
+            .and_then(|v| self.get_value_type(v))
+            .unwrap_or_else(|| ty.clone());
         if let Some(vable_field) = self.config.vable_fields.iter().find(|c| c.matches(field)) {
             self.notes.push(GraphTransformNote {
                 function: graph_name.to_string(),
@@ -2261,6 +2264,11 @@ impl<'a> Transformer<'a> {
                 kind: OpKind::VableFieldWrite {
                     base: base_var,
                     field_index: vable_field.index,
+                    // `rewrite_op_setfield` forwards `v_value` unchanged to
+                    // `setfield_vable_%s` (`jtransform.py:921-927`); a
+                    // constant operand stays inline.  `setfield_vable_i`
+                    // is not in USE_C_FORM, so the assembler encodes it as
+                    // a pool `i` slot rather than the short `c` byte.
                     value: value.clone(),
                     ty: typed_ty,
                 },
@@ -4169,7 +4177,7 @@ fn remap_op(
         } => OpKind::FieldWrite {
             base: remap_value(base, aliases),
             field: field.clone(),
-            value: remap_value(value, aliases),
+            value: value.map_value(|v| remap_value(v, aliases)),
             ty: ty.clone(),
         },
         OpKind::ArrayRead {
@@ -4263,7 +4271,7 @@ fn remap_op(
         } => OpKind::VableFieldWrite {
             base: remap_value(base, aliases),
             field_index: *field_index,
-            value: remap_value(value, aliases),
+            value: value.map_value(|v| remap_value(v, aliases)),
             ty: ty.clone(),
         },
         OpKind::VableArrayRead {
@@ -5179,7 +5187,7 @@ mod tests {
             OpKind::FieldWrite {
                 base: base_var,
                 field: crate::model::FieldDescriptor::new("x", Some("Point".into())),
-                value: value_var.clone(),
+                value: crate::model::LinkArg::Value(value_var.clone()),
                 ty: ValueType::Unknown,
             },
             false,
