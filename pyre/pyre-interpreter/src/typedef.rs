@@ -2244,7 +2244,7 @@ fn init_dict_type(ns: &mut DictStorage) {
                 unsafe {
                     for (k, v) in pyre_object::w_dict_items(kw) {
                         if pyre_object::is_str(k)
-                            && pyre_object::w_str_get_value(k) == "__pyre_kw__"
+                            && pyre_object::w_str_get_wtf8(k).as_str() == Ok("__pyre_kw__")
                         {
                             continue;
                         }
@@ -7554,7 +7554,8 @@ fn init_object_type(ns: &mut DictStorage) {
             if let Some(kw) = kwargs {
                 let has_real_kw = unsafe {
                     pyre_object::w_dict_items(kw).into_iter().any(|(k, _)| {
-                        pyre_object::is_str(k) && pyre_object::w_str_get_value(k) != "__pyre_kw__"
+                        pyre_object::is_str(k)
+                            && pyre_object::w_str_get_wtf8(k).as_str() != Ok("__pyre_kw__")
                     })
                 };
                 if has_real_kw {

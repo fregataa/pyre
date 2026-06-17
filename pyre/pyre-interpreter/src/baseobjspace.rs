@@ -1997,6 +1997,16 @@ pub fn dict_storage_to_dict_kind(
 /// For other objects, looks up the attribute in the per-object side table.
 
 pub fn getattr_str(obj: PyObjectRef, name: &str) -> PyResult {
+    // `space.getattr` — the full path, including the `__getattr__` fallback.
+    getattr_str_impl(obj, name, true)
+}
+
+/// Shared body of `space.getattr` and the bare `object.__getattribute__` slot.
+/// `call_getattr` selects between them: `space.getattr` (`true`) consults
+/// `__getattr__` on miss (objspace.py:707 / descroperation.py:242), while the
+/// `object.__getattribute__` slot (`false`) raises straight away
+/// (descroperation.py:88) — the `__getattr__` fallback is space.getattr's job.
+fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResult {
     // `pypy/interpreter/baseobjspace.py:1146-1162 getattr`:
     //
     //     def getattr(self, w_obj, w_name):
@@ -2398,21 +2408,41 @@ pub fn getattr_str(obj: PyObjectRef, name: &str) -> PyResult {
             // validating wrappers).  `getattribute_if_not_from_object`
             // returns a non-default override or `None`, memoizing the
             // default in `uses_object_getattribute`.
+            //
+            // descroperation.py:234-245 `_handle_getattribute`: the custom
+            // slot runs alone, and an AttributeError it raises falls back to
+            // `__getattr__` (objspace.py:691-699 / 707-710).
             if name != "__getattribute__" {
                 if let Some(slot) = getattribute_if_not_from_object(w_type) {
                     let name_obj = w_str_new(name);
-                    return crate::call::call_function_impl_result(slot, &[obj, name_obj]);
+                    // objspace.py:666 / descroperation.py:238
+                    // `space.get_and_call_function(w_descr, w_obj, w_name)` —
+                    // bind the `__getattribute__` slot through `__get__`.
+                    match get_and_call_function(slot, obj, w_type, &[name_obj]) {
+                        Ok(v) => return Ok(v),
+                        Err(e) if e.kind == PyErrorKind::AttributeError => {
+                            return instance_getattr_hook_or_err(w_type, obj, name, e);
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
             }
 
             // Step 1: look up in type MRO
             let w_descr = lookup_in_type_where(w_type, name);
 
-            // Step 2: data descriptor takes priority over instance dict
+            // Step 2: data descriptor takes priority over instance dict.
+            // objspace.py:694-699 — a descriptor `__get__` raising
+            // AttributeError falls back to `__getattr__`, not propagated.
             if let Some(descr) = w_descr {
                 if is_data_descr(descr) {
-                    if let Some(result) = get(descr, obj, w_type)? {
-                        return Ok(result);
+                    match get(descr, obj, w_type) {
+                        Ok(Some(result)) => return Ok(result),
+                        Ok(None) => {}
+                        Err(e) if e.kind == PyErrorKind::AttributeError => {
+                            return instance_getattr_hook_or_err(w_type, obj, name, e);
+                        }
+                        Err(e) => return Err(e),
                     }
                 }
             }
@@ -2430,10 +2460,17 @@ pub fn getattr_str(obj: PyObjectRef, name: &str) -> PyResult {
             }
 
             // Step 4: non-data descriptor
-            // PyPy: descroperation.py — invoke __get__ to bind methods
+            // PyPy: descroperation.py — invoke __get__ to bind methods.
+            // objspace.py:694-699 — a non-data descriptor `__get__` raising
+            // AttributeError falls back to `__getattr__` too.
             if let Some(descr) = w_descr {
-                if let Some(result) = get(descr, obj, w_type)? {
-                    return Ok(result);
+                match get(descr, obj, w_type) {
+                    Ok(Some(result)) => return Ok(result),
+                    Ok(None) => {}
+                    Err(e) if e.kind == PyErrorKind::AttributeError => {
+                        return instance_getattr_hook_or_err(w_type, obj, name, e);
+                    }
+                    Err(e) => return Err(e),
                 }
                 // Step 5: builtin methods found in base type MRO need binding
                 // CPython: PyFunction_GET_CODE slot → bound method
@@ -2452,29 +2489,57 @@ pub fn getattr_str(obj: PyObjectRef, name: &str) -> PyResult {
                 return Ok(w_type);
             }
 
-            // descroperation.py descr__getattribute__: on AttributeError,
-            // check the type for `__getattr__` and call it.  Used by every
-            // wrapper class that delegates attribute lookup to a backing
-            // stream/buffer (unittest._WritelnDecorator, pathlib, etc.).
-            if let Some(getattr_fn) = lookup_in_type_where(w_type, "__getattr__") {
-                let name_obj = w_str_new(name);
-                let result = crate::call_function(getattr_fn, &[obj, name_obj]);
-                if !result.is_null() {
-                    return Ok(result);
-                }
-            }
-
-            return Err(PyError::new(
-                PyErrorKind::AttributeError,
-                format!(
-                    "'{}' object has no attribute '{name}'",
-                    w_type_get_name(w_type),
+            // descroperation.py:243-252 `_handle_getattribute`: on the terminal
+            // miss, `__getattr__` is the last resort.  Used by every wrapper
+            // class that delegates attribute lookup to a backing stream/buffer
+            // (unittest._WritelnDecorator, pathlib, etc.).
+            return instance_getattr_hook_or_err(
+                w_type,
+                obj,
+                name,
+                PyError::new(
+                    PyErrorKind::AttributeError,
+                    format!(
+                        "'{}' object has no attribute '{name}'",
+                        w_type_get_name(w_type)
+                    ),
                 ),
-            ));
+            );
         }
     }
 
-    object_getattr_miss(obj, name)
+    let result = object_getattr_miss(obj, name, call_getattr);
+    // module.py:130-142 `Module.descr_getattribute` — PEP 562: after the
+    // normal lookup misses with AttributeError, a module-level `__getattr__`
+    // stored in the module's own dict gets the final say, called with just the
+    // attribute name.  Only `space.getattr` consults it.
+    if let Err(ref e) = result {
+        if call_getattr && e.kind == PyErrorKind::AttributeError && unsafe { is_module(obj) } {
+            let w_dict = unsafe { pyre_object::w_module_get_w_dict(obj) };
+            if !w_dict.is_null() {
+                if let Some(mod_getattr) = finditem_str(w_dict, "__getattr__")? {
+                    if !mod_getattr.is_null() {
+                        let name_obj = w_str_new(name);
+                        return crate::call::call_function_impl_result(mod_getattr, &[name_obj]);
+                    }
+                }
+                // module.py:143-162 — no module `__getattr__`: phrase the miss
+                // with the module's `__name__` (`module 'name' has no attribute
+                // 'x'`), falling back to the bare form when `__name__` is
+                // absent.  (The `__spec__`-based circular-import diagnostics are
+                // not ported.)
+                let msg = match finditem_str(w_dict, "__name__")? {
+                    Some(w) if !w.is_null() && unsafe { pyre_object::is_str(w) } => {
+                        let nm = unsafe { pyre_object::w_str_get_wtf8(w) };
+                        format!("module '{nm}' has no attribute '{name}'")
+                    }
+                    _ => format!("module has no attribute '{name}'"),
+                };
+                return Err(PyError::new(PyErrorKind::AttributeError, msg));
+            }
+        }
+    }
+    result
 }
 
 // ─── `w_name`-taking attribute API ───
@@ -2528,20 +2593,42 @@ unsafe fn getattr_surrogate(obj: PyObjectRef, w_name: PyObjectRef, name: &Wtf8) 
         match object_getattribute_surrogate(obj, w_name, name) {
             Ok(v) => Ok(v),
             Err(e) => {
-                // descroperation.py:234-244 `_handle_getattribute`: only an
+                // descroperation.py:243-252 `_handle_getattribute`: only an
                 // AttributeError from `__getattribute__` (here a descriptor
                 // `__get__` or the dict miss) triggers the `__getattr__`
                 // fallback; any other exception propagates unchanged.
                 if e.kind != crate::PyErrorKind::AttributeError {
                     return Err(e);
                 }
-                if is_instance(obj) {
-                    let w_type = w_instance_get_type(obj);
-                    if let Some(getattr_fn) = lookup_in_type_where(w_type, "__getattr__") {
-                        let result = crate::call_function(getattr_fn, &[obj, w_name]);
-                        if !result.is_null() {
-                            return Ok(result);
+                // module.py:139-142 PEP 562: a module-level `__getattr__` in the
+                // module's own dict is consulted on miss, called unbound with
+                // just the name (a module hook is a dict value, not a type
+                // descriptor).
+                if is_module(obj) {
+                    let w_dict = pyre_object::w_module_get_w_dict(obj);
+                    if !w_dict.is_null() {
+                        if let Some(mod_getattr) = finditem_str(w_dict, "__getattr__")? {
+                            if !mod_getattr.is_null() {
+                                return crate::call::call_function_impl_result(
+                                    mod_getattr,
+                                    &[w_name],
+                                );
+                            }
                         }
+                    }
+                    return Err(e);
+                }
+                // `space.lookup(w_obj, '__getattr__')` walks `type(w_obj)` —
+                // the metaclass for a type receiver, the class for an
+                // instance — so the hook is found for any object, not just
+                // instances.  objspace.py:710 `get_and_call_function` binds the
+                // hook through `__get__` before calling it, so a
+                // staticmethod / classmethod / custom-descriptor `__getattr__`
+                // is handled.  The hook's result or its own exception is final.
+                let w_objtype = crate::typedef::r#type(obj).unwrap_or(std::ptr::null_mut());
+                if !w_objtype.is_null() {
+                    if let Some(getattr_fn) = lookup_in_type_where(w_objtype, "__getattr__") {
+                        return get_and_call_function(getattr_fn, obj, w_objtype, &[w_name]);
                     }
                 }
                 Err(e)
@@ -2572,19 +2659,42 @@ pub(crate) unsafe fn object_getattribute_surrogate(
             return Err(attr_error_wtf8(obj, name));
         }
         if is_type(obj) {
-            // typeobject.py W_TypeObject.descr_getattribute: a surrogate
-            // cannot name a metatype descriptor (those are identifiers), so
-            // the metatype data/non-data descriptor branches are unreachable
-            // and the type's own MRO is the whole protocol.  The found value
-            // is bound via `space.get(w_value, space.w_None, self)` =
-            // `__get__(None, type)`, the same as the identifier path, so a
-            // surrogate-named classmethod / property / custom descriptor is
-            // resolved rather than returned raw.
+            // typeobject.py:811-828 W_TypeObject.descr_getattribute. A
+            // surrogate name can reach a metatype descriptor via
+            // `setattr(type(cls), '\udc80', descr)`, so the full protocol
+            // applies: a metatype data descriptor wins first, then the type's
+            // own MRO value bound through `__get__(None, type)`, then a
+            // metatype non-data descriptor.
+            let metatype = crate::typedef::r#type(obj).unwrap_or(std::ptr::null_mut());
+            let w_descr = if metatype.is_null() {
+                None
+            } else {
+                lookup_in_type_wtf8(metatype, name)
+            };
+            // typeobject.py:814-819: metatype data descriptor, bound as
+            // `__get__(self, type(self))`.
+            if let Some(descr) = w_descr {
+                if is_data_descr(descr) {
+                    if let Some(result) = get(descr, obj, metatype)? {
+                        return Ok(result);
+                    }
+                }
+            }
+            // typeobject.py:820-823: the type's own MRO value, bound through
+            // `space.get(w_value, space.w_None, self)` = `__get__(None, type)`.
             if let Some(w_value) = lookup_in_type_wtf8(obj, name) {
                 if let Some(result) = get(w_value, w_none(), obj)? {
                     return Ok(result);
                 }
                 return Ok(w_value);
+            }
+            // typeobject.py:824-825: a metatype non-data descriptor, bound as
+            // `space.get(w_descr, self)`.
+            if let Some(descr) = w_descr {
+                if let Some(result) = get(descr, obj, metatype)? {
+                    return Ok(result);
+                }
+                return Ok(descr);
             }
             return Err(attr_error_wtf8(obj, name));
         }
@@ -2878,14 +2988,76 @@ pub fn object_getattribute(obj: PyObjectRef, name: &str) -> PyResult {
             ));
         }
     }
-    getattr_str(obj, name)
+    // Non-instance receiver (module, type, builtin object): the pure descriptor
+    // protocol with no `__getattr__` fallback — that belongs to space.getattr,
+    // not the bare object.__getattribute__ slot (descroperation.py:88).
+    getattr_str_impl(obj, name, false)
 }
 
-fn object_getattr_miss(obj: PyObjectRef, name: &str) -> PyResult {
+/// `descroperation.py:242-245` `_handle_getattribute` tail: on an
+/// AttributeError from the descriptor protocol (a custom `__getattribute__`,
+/// a descriptor `__get__`, or the terminal miss), look up `__getattr__` on the
+/// receiver type and call it; its result — or its own exception — is final.
+/// Returns the original error when there is no `__getattr__`.
+unsafe fn instance_getattr_hook_or_err(
+    w_type: PyObjectRef,
+    obj: PyObjectRef,
+    name: &str,
+    e: crate::PyError,
+) -> PyResult {
+    unsafe {
+        if let Some(getattr_fn) = lookup_in_type_where(w_type, "__getattr__") {
+            let name_obj = w_str_new(name);
+            // objspace.py:710 `space.get_and_call_function(w_descr, w_obj,
+            // w_name)` — bind `__getattr__` through `__get__` so a
+            // staticmethod / classmethod / custom-descriptor hook receives the
+            // arguments PyPy gives it.
+            return get_and_call_function(getattr_fn, obj, w_type, &[name_obj]);
+        }
+    }
+    Err(e)
+}
+
+fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResult {
     // Type objects: look up in type's own dict → base dicts
     // PyPy: typeobject.py lookup_where → MRO search + descriptor unwrap
     unsafe {
         if is_type(obj) {
+            // baseobjspace.py:76 — the metaclass is type(C), read from w_class.
+            let w_type_type = crate::typedef::w_type();
+            let w_object = crate::typedef::w_object();
+            let w_metaclass = {
+                let w_class = (*obj).w_class;
+                if !w_class.is_null() && !std::ptr::eq(w_class, w_type_type) {
+                    Some(w_class)
+                } else {
+                    None
+                }
+            };
+            let w_metaclasses: [Option<PyObjectRef>; 2] =
+                [w_metaclass, crate::typedef::gettypefor((*obj).ob_type)];
+            // typeobject.py:811-819 — a metatype DATA descriptor is consulted
+            // before anything else, including the hardcoded type attributes
+            // below.  Only honor one defined on a user metaclass (its owner is
+            // neither `type` nor `object`): the builtin getsets those bases
+            // carry are served by the dedicated short-circuits below, so
+            // letting them through here would re-enter this lookup.
+            for w_metaclass in w_metaclasses.iter().flatten() {
+                let w_metaclass = *w_metaclass;
+                if is_type(w_metaclass) {
+                    if let Some((src, descr)) = lookup_where(w_metaclass, name) {
+                        if !std::ptr::eq(src, w_type_type)
+                            && !std::ptr::eq(src, w_object)
+                            && is_data_descr(descr)
+                        {
+                            if let Some(result) = get(descr, obj, w_metaclass)? {
+                                return Ok(result);
+                            }
+                        }
+                    }
+                }
+            }
+
             // Special type attributes — PyPy: typeobject.py
             if name == "__class__" {
                 // `pypy/objspace/std/typeobject.py:198 type___class__getter`
@@ -3037,34 +3209,20 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str) -> PyResult {
             // (heaptype reads class dict, builtin types use the dot-
             // split of the class name with `"builtins"` fallback).
 
+            // typeobject.py:820-823 — the type's own MRO value, bound via
+            // `space.get(w_value, space.w_None, self)` = `__get__(None, type)`
+            // (functions stay unbound, classmethod binds the class, a custom
+            // descriptor sees `obj is None`).  The receiver must be the `None`
+            // singleton, not a null pointer, or a Python
+            // `__get__(self, obj, objtype=None)` loses its `obj` argument.
             if let Some(value) = lookup_in_type_where(obj, name) {
-                // typeobject.py W_TypeObject.descr_getattribute:
-                // `space.get(w_value, space.w_None, self)` — bind via
-                // `__get__(None, type)` (functions stay unbound, classmethod
-                // binds the class, a custom descriptor sees `obj is None`).
-                // The receiver must be the `None` singleton, not a null
-                // pointer, or a Python `__get__(self, obj, objtype=None)`
-                // loses its `obj` argument.
                 if let Some(result) = get(value, w_none(), obj)? {
                     return Ok(result);
                 }
                 return Ok(value);
             }
-            // Metaclass attribute lookup — PyPy: type.__getattribute__
-            // baseobjspace.py:76 — the metaclass is type(C), read from w_class.
-            let w_metaclass = {
-                let w_class = (*obj).w_class;
-                let w_type_type = crate::typedef::w_type();
-                if !w_class.is_null() && !std::ptr::eq(w_class, w_type_type) {
-                    Some(w_class)
-                } else {
-                    None
-                }
-            };
-            // PyPy: type.__getattribute__ → metatype descriptor protocol.
-            // Search metaclass MRO. Binding is handled by load_method.
-            let w_metaclasses: [Option<PyObjectRef>; 2] =
-                [w_metaclass, crate::typedef::gettypefor((*obj).ob_type)];
+            // typeobject.py:824-825 — a metatype non-data descriptor, bound as
+            // `space.get(w_descr, self)`.  Binding is handled by load_method.
             for w_metaclass in w_metaclasses.iter().flatten() {
                 let w_metaclass = *w_metaclass;
                 if is_type(w_metaclass) {
@@ -3073,6 +3231,31 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str) -> PyResult {
                             return Ok(result);
                         }
                         return Ok(value);
+                    }
+                }
+            }
+            // descroperation.py:243-252 _handle_getattribute: on a miss, fall
+            // back to `__getattr__` looked up on `type(obj)` — the metaclass —
+            // and call it; the hook's result or its own exception is final.
+            // Only `space.getattr` consults it; the bare object.__getattribute__
+            // slot raises straight away (descroperation.py:88).
+            if call_getattr {
+                for w_metaclass in w_metaclasses.iter().flatten() {
+                    let w_metaclass = *w_metaclass;
+                    if is_type(w_metaclass) {
+                        if let Some(getattr_fn) = lookup_in_type_where(w_metaclass, "__getattr__") {
+                            let name_obj = w_str_new(name);
+                            // objspace.py:710 `space.get_and_call_function(
+                            // w_descr, w_obj, w_name)` — the receiver is the type
+                            // object and its type is the metaclass, so bind
+                            // through `__get__` on the metaclass.
+                            return get_and_call_function(
+                                getattr_fn,
+                                obj,
+                                w_metaclass,
+                                &[name_obj],
+                            );
+                        }
                     }
                 }
             }
@@ -5006,7 +5189,9 @@ pub(crate) unsafe fn get(
         if fget.is_null() || is_none(fget) {
             return Err(property_no_accessor(descr, obj, "getter"));
         }
-        return Ok(Some(crate::call_function(fget, &[obj])));
+        // W_Property.get → `space.call_function(self.fget, w_obj)`: the
+        // getter's exception propagates rather than being swallowed.
+        return Ok(Some(crate::call::call_function_impl_result(fget, &[obj])?));
     }
 
     // typedef.py:504-516 Member.descr_member_get:
@@ -5087,7 +5272,10 @@ unsafe fn set(
         if fset.is_null() || is_none(fset) {
             return Err(property_no_accessor(descr, obj, "setter"));
         }
-        crate::call_function(fset, &[obj, value]);
+        // descriptor.py:228 W_Property.set → `space.call_function(self.fset,
+        // w_obj, w_value)`: the setter's exception propagates rather than
+        // being swallowed.
+        crate::call::call_function_impl_result(fset, &[obj, value])?;
         return Ok(true);
     }
 

@@ -223,7 +223,8 @@ pub fn do_combine_starstarargs_wrapped(
     // to `HashMap<String, ()>` rather than `HashSet` so the shape
     // matches PyPy's `dict` (key membership tested via `in`, value slot
     // present-but-unread per `seen[key] = None` at line 446).
-    let mut seen: std::collections::HashMap<String, ()> = std::collections::HashMap::new();
+    let mut seen: std::collections::HashMap<rustpython_wtf8::Wtf8Buf, ()> =
+        std::collections::HashMap::new();
     for (i, &w_key) in keys_w.iter().enumerate() {
         // argument.py:431 — `key = space.text_w(w_key)`; raise TypeError
         // if w_key is not a string.  argument.py:434-436 message:
@@ -236,7 +237,10 @@ pub fn do_combine_starstarargs_wrapped(
                     format!("keywords must be strings, not '{tp}'"),
                 ));
             }
-            pyre_object::w_str_get_value(w_key).to_string()
+            // `space.text_w` preserves lone surrogates as WTF-8 bytes; keep the
+            // key in WTF-8 so a surrogate keyword name survives the seen-set and
+            // the dict value read.
+            pyre_object::w_str_get_wtf8(w_key).to_owned()
         };
         // argument.py:439-445 — duplicate check against existing kwargs +
         // already-seen names in this iteration.
@@ -279,7 +283,7 @@ pub fn do_combine_starstarargs_wrapped(
             let direct = if backing.is_null() {
                 None
             } else {
-                unsafe { pyre_object::dictmultiobject::w_dict_getitem_str(backing, &key) }
+                unsafe { pyre_object::dictmultiobject::w_dict_getitem_wtf8(backing, &key) }
             };
             match direct {
                 Some(v) => v,

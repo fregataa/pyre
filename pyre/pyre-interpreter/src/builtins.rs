@@ -1237,12 +1237,12 @@ pub(crate) fn kwarg_reject_unknown(
         Some(d) => d,
         None => return Ok(()),
     };
-    let entries = unsafe { pyre_object::w_dict_str_entries(dict) };
+    let entries = unsafe { pyre_object::w_dict_str_entries_wtf8(dict) };
     for (key, _) in entries.iter() {
-        if key == "__pyre_kw__" {
+        if key.as_str() == Ok("__pyre_kw__") {
             continue;
         }
-        if !allowed.iter().any(|name| *name == key.as_str()) {
+        if !allowed.iter().any(|name| key.as_str() == Ok(*name)) {
             return Err(crate::PyError::type_error(format!(
                 "{fn_name}() got an unexpected keyword argument '{key}'"
             )));
@@ -1294,12 +1294,12 @@ pub(crate) fn bind_builtin_kwargs(
         filled[i] = true;
     }
     if let Some(dict) = kwargs {
-        let entries = unsafe { pyre_object::w_dict_str_entries(dict) };
+        let entries = unsafe { pyre_object::w_dict_str_entries_wtf8(dict) };
         for (key, val) in entries.iter() {
-            if key == "__pyre_kw__" {
+            if key.as_str() == Ok("__pyre_kw__") {
                 continue;
             }
-            match names.iter().position(|n| *n == key.as_str()) {
+            match names.iter().position(|n| key.as_str() == Ok(*n)) {
                 Some(idx) => {
                     if filled[idx] {
                         return Err(crate::PyError::type_error(format!(
@@ -1638,8 +1638,8 @@ fn type_descr_new_with_metaclass(
         if !w_ns_backing.is_null() {
             for (k, v) in unsafe { pyre_object::w_dict_items(w_ns_backing) } {
                 if unsafe { is_str(k) } {
-                    let key = unsafe { pyre_object::w_str_get_value(k) };
-                    if key == "__classcell__" {
+                    let key = unsafe { pyre_object::w_str_get_wtf8(k) };
+                    if key.as_str() == Ok("__classcell__") {
                         if !unsafe { pyre_object::is_cell(v) } {
                             let tp_name = match unsafe { crate::typedef::r#type(v) } {
                                 Some(tp) => unsafe { pyre_object::w_type_get_name(tp) }.to_string(),
@@ -1652,10 +1652,10 @@ fn type_descr_new_with_metaclass(
                         classcell = v;
                         continue;
                     }
-                    if key == "__classdictcell__" {
+                    if key.as_str() == Ok("__classdictcell__") {
                         continue;
                     }
-                    crate::dict_storage_store(&mut class_ns, key, v);
+                    crate::dict_storage_store_wtf8(&mut class_ns, key, v);
                 }
             }
         }
@@ -1749,7 +1749,7 @@ fn type_descr_new_with_metaclass(
                 pyre_object::w_dict_items(kw)
                     .into_iter()
                     .filter(|(k, _)| {
-                        is_str(*k) && pyre_object::w_str_get_value(*k) != "__pyre_kw__"
+                        is_str(*k) && pyre_object::w_str_get_wtf8(*k).as_str() != Ok("__pyre_kw__")
                     })
                     .collect()
             },
@@ -4052,7 +4052,22 @@ fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         return Ok(w_list_new(vec![]));
     }
     let obj = args[0];
-    let mut names: Vec<String> = Vec::new();
+    // app_inspect.py:57-62 — dir() is driven by the object's `__dir__`:
+    // `lookup_special(obj, '__dir__')` then `sorted(result)`.  pyre's builtin
+    // types do not register a default `__dir__` slot, so the manual
+    // enumeration below stands in for the default object / type / module
+    // `__dir__`; a `__dir__` found on the type here is a user override (or a
+    // builtin such as traceback) and drives dir() directly.
+    if let Some(w_type) = crate::typedef::r#type(obj) {
+        if let Some(dir_meth) =
+            unsafe { crate::baseobjspace::lookup_in_type_where(w_type, "__dir__") }
+        {
+            let result =
+                unsafe { crate::baseobjspace::get_and_call_function(dir_meth, obj, w_type, &[]) }?;
+            return builtin_sorted(&[result]);
+        }
+    }
+    let mut names: Vec<Wtf8Buf> = Vec::new();
     unsafe {
         if pyre_object::is_module(obj) {
             // Route through `w_module.w_dict` so dict-subclass-backed
@@ -4062,8 +4077,9 @@ fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             // `pypy/interpreter/module.py:77 Module.getdict()` returns
             // the dict directly regardless of subclass; pyre branches
             // on the underlying shape:
-            //   - exact `W_DictObject` → `w_dict_str_entries` returns
-            //     the storage-proxy union view in one call.
+            //   - exact `W_DictObject` → `w_dict_str_entries_wtf8` returns
+            //     the storage-proxy union view in one call, keeping
+            //     lone-surrogate global names.
             //   - dict subclass instance → iterate keys via the
             //     standard `iter()` protocol so the subclass's
             //     `__iter__` override participates (PyPy's
@@ -4071,14 +4087,14 @@ fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             let w_dict = pyre_object::w_module_get_w_dict(obj);
             if !w_dict.is_null() {
                 if pyre_object::is_dict(w_dict) {
-                    for (name, _) in pyre_object::dictmultiobject::w_dict_str_entries(w_dict) {
+                    for (name, _) in pyre_object::dictmultiobject::w_dict_str_entries_wtf8(w_dict) {
                         names.push(name);
                     }
                 } else if let Ok(keys_iter) = crate::baseobjspace::iter(w_dict) {
                     if let Ok(keys) = crate::builtins::collect_iterable(keys_iter) {
                         for k in keys {
                             if pyre_object::is_str(k) {
-                                names.push(pyre_object::w_str_get_value(k).to_string());
+                                names.push(pyre_object::w_str_get_wtf8(k).to_owned());
                             }
                         }
                     }
@@ -4088,8 +4104,8 @@ fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             let ns_ptr = pyre_object::typeobject::w_type_get_dict_ptr(obj);
             if !ns_ptr.is_null() {
                 let ns = &*(ns_ptr as *const DictStorage);
-                for (name, _) in ns.entries() {
-                    names.push(name.to_string());
+                for (name, _) in ns.entries_wtf8() {
+                    names.push(name.to_owned());
                 }
             }
         } else if pyre_object::is_instance(obj) {
@@ -4100,7 +4116,7 @@ fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             if !w_dict.is_null() {
                 for (k, _) in pyre_object::w_dict_items(w_dict) {
                     if pyre_object::is_str(k) {
-                        names.push(pyre_object::w_str_get_value(k).to_string());
+                        names.push(pyre_object::w_str_get_wtf8(k).to_owned());
                     }
                 }
             }
@@ -4115,15 +4131,15 @@ fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 let ns_ptr = pyre_object::typeobject::w_type_get_dict_ptr(w_type);
                 if !ns_ptr.is_null() {
                     let ns = &*(ns_ptr as *const DictStorage);
-                    for (name, _) in ns.entries() {
-                        names.push(name.to_string());
+                    for (name, _) in ns.entries_wtf8() {
+                        names.push(name.to_owned());
                     }
                 }
             }
         } else if pyre_object::is_dict(obj) {
             for (k, _) in pyre_object::w_dict_items(obj) {
                 if pyre_object::is_str(k) {
-                    names.push(pyre_object::w_str_get_value(k).to_string());
+                    names.push(pyre_object::w_str_get_wtf8(k).to_owned());
                 }
             }
         } else {
@@ -4138,8 +4154,8 @@ fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                     let ns_ptr = pyre_object::typeobject::w_type_get_dict_ptr(w_type);
                     if !ns_ptr.is_null() {
                         let ns = &*(ns_ptr as *const DictStorage);
-                        for (name, _) in ns.entries() {
-                            names.push(name.to_string());
+                        for (name, _) in ns.entries_wtf8() {
+                            names.push(name.to_owned());
                         }
                     }
                 }
@@ -4148,7 +4164,10 @@ fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     }
     names.sort();
     names.dedup();
-    let items: Vec<_> = names.into_iter().map(|s| w_str_new(&s)).collect();
+    let items: Vec<_> = names
+        .into_iter()
+        .map(pyre_object::w_str_from_wtf8)
+        .collect();
     Ok(w_list_new(items))
 }
 

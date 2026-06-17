@@ -747,17 +747,30 @@ thread_local! {
     static MAP_ATTR_CACHE: RefCell<MapAttrCache> = RefCell::new(MapAttrCache::new());
 }
 
-/// Deterministic hash of an attribute name. Only affects `MapAttrCache` bucket
-/// distribution — `find_map_attr` always rechecks name+attrkind, so a
-/// collision never changes the result. Stands in for
-/// `objectmodel.compute_hash(name)` (mapdict.py:91).
+/// `objectmodel.compute_hash(name)` for a (utf8-encoded) str (mapdict.py:94).
+///
+/// This ports the `fnv` mode of `compute_hash` — `objectmodel._hash_string`,
+/// the modified-FNV string hash (`rpython/rlib/objectmodel.py`). `compute_hash`
+/// is specialized through an overridable ll hash function
+/// (`get_ll_hash_function`), and the production default selected by
+/// `ChoiceOption("hash", ["fnv", "siphash24"], default="siphash24")`
+/// (`pypy/config/pypyoption.py:186`) is siphash24, not this — so this is a
+/// PRE-EXISTING-ADAPTATION choosing the deterministic `fnv` mode. It only
+/// affects `MapAttrCache` bucket distribution — `find_map_attr` always rechecks
+/// name+attrkind, so a divergent hash causes at most a cache miss, never a
+/// wrong result.
 fn compute_name_hash(name: &Wtf8) -> i64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in name.as_bytes() {
-        h ^= *b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    let s = name.as_bytes();
+    let length = s.len();
+    if length == 0 {
+        return -1;
     }
-    h as i64
+    let mut x: i64 = (s[0] as i64) << 7;
+    for &b in s {
+        x = 1000003i64.wrapping_mul(x) ^ (b as i64);
+    }
+    x ^= length as i64;
+    x
 }
 
 /// mapdict.py:86-117 `AbstractAttribute.find_map_attr` with the method cache

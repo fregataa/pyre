@@ -6,6 +6,8 @@
 use std::cell::{Cell, RefCell};
 use std::sync::OnceLock;
 
+use rustpython_wtf8::Wtf8Buf;
+
 use crate::{
     DictStorage, PyError, PyResult, builtin_code_get, dispatch_callable, function_get_closure,
     function_get_globals, function_get_globals_obj,
@@ -885,8 +887,9 @@ pub(crate) fn resolve_kwargs(
                         if !unsafe { pyre_object::is_str(kw_obj) } {
                             return false;
                         }
-                        let kw_s = unsafe { pyre_object::w_str_get_value(kw_obj) };
-                        (0..nkwonly).any(|j| &*code.varnames[skip_cls + n_pos_params + j] == kw_s)
+                        let kw_s = unsafe { pyre_object::w_str_get_value_opt(kw_obj) };
+                        (0..nkwonly)
+                            .any(|j| Some(&*code.varnames[skip_cls + n_pos_params + j]) == kw_s)
                     } else {
                         false
                     }
@@ -930,7 +933,7 @@ pub(crate) fn resolve_kwargs(
     // Match keywords to parameter names (PyPy: _match_keywords)
     // varnames[skip_cls..total_params] are the effective param names
     let mut extra_kwargs: Vec<(PyObjectRef, PyObjectRef)> = Vec::new();
-    let mut unmatched_kw_names: Vec<String> = Vec::new();
+    let mut unmatched_kw_names: Vec<Wtf8Buf> = Vec::new();
     for ki in 0..nkw {
         let kw_name = unsafe { pyre_object::w_tuple_getitem(kwarg_names, ki as i64) };
         let Some(kw_name_obj) = kw_name else { continue };
@@ -943,10 +946,14 @@ pub(crate) fn resolve_kwargs(
                 fname
             )));
         }
-        let kw_str = unsafe { pyre_object::w_str_get_value(kw_name_obj) };
+        // A lone-surrogate keyword name (not valid UTF-8) never equals a
+        // source-level parameter name, so it falls straight to **kwargs or
+        // the unexpected-keyword error below.
+        let kw_str = unsafe { pyre_object::w_str_get_value_opt(kw_name_obj) };
         let mut matched = false;
         for pi in 0..nparams {
-            if &*code.varnames[skip_cls + pi] == kw_str {
+            let param_name = &*code.varnames[skip_cls + pi];
+            if kw_str == Some(param_name) {
                 // argument.py:474 — positional-only parameter: if has_kwarg,
                 // treat as unmatched (absorb into **kwargs); otherwise error.
                 if skip_cls + pi < posonlyarg_count {
@@ -955,14 +962,14 @@ pub(crate) fn resolve_kwargs(
                     }
                     return Err(crate::PyError::type_error(format!(
                         "{}() got some positional-only arguments passed as keyword arguments: '{}'",
-                        fname, kw_str
+                        fname, param_name
                     )));
                 }
                 // argument.py:410 — duplicate keyword argument
                 if !result[pi].is_null() {
                     return Err(crate::PyError::type_error(format!(
                         "{}() got multiple values for argument '{}'",
-                        fname, kw_str
+                        fname, param_name
                     )));
                 }
                 result[pi] = kw_value;
@@ -974,7 +981,8 @@ pub(crate) fn resolve_kwargs(
             if has_varkw {
                 extra_kwargs.push((kw_name_obj, kw_value));
             } else {
-                unmatched_kw_names.push(kw_str.to_string());
+                unmatched_kw_names
+                    .push(unsafe { pyre_object::w_str_get_wtf8(kw_name_obj).to_owned() });
             }
         }
     }
@@ -1110,7 +1118,7 @@ pub(crate) fn bind_kwargs_to_signature(
     sig: &crate::Signature,
     fname: &str,
     pos_args: &[PyObjectRef],
-    kwargs: &[(String, PyObjectRef)],
+    kwargs: &[(Wtf8Buf, PyObjectRef)],
 ) -> Result<Vec<PyObjectRef>, crate::PyError> {
     let nparams = sig.argnames.len();
     let n_pos_params = sig.num_argnames(); // positional params (excludes kwonly tail)
@@ -1138,11 +1146,15 @@ pub(crate) fn bind_kwargs_to_signature(
 
     // _match_keywords — match each keyword to a param name by index.
     let mut extra_kwargs: Vec<(PyObjectRef, PyObjectRef)> = Vec::new();
-    let mut unmatched_kw_names: Vec<String> = Vec::new();
+    let mut unmatched_kw_names: Vec<Wtf8Buf> = Vec::new();
     for (key, value) in kwargs {
+        // A lone-surrogate keyword name (not valid UTF-8) never equals a
+        // source-level parameter name, so it falls straight to **kwargs or
+        // the unexpected-keyword error below.
+        let key_str = key.as_str().ok();
         let mut matched = false;
         for pi in 0..nparams {
-            if sig.argnames[pi] == key.as_str() {
+            if key_str == Some(sig.argnames[pi]) {
                 // argument.py:474 — positional-only param passed by keyword:
                 // absorb into **kwargs if present, else error.
                 if pi < posonly {
@@ -1167,7 +1179,7 @@ pub(crate) fn bind_kwargs_to_signature(
         }
         if !matched {
             if has_varkw {
-                extra_kwargs.push((pyre_object::w_str_new(key), *value));
+                extra_kwargs.push((pyre_object::w_str_from_wtf8(key.clone()), *value));
             } else {
                 unmatched_kw_names.push(key.clone());
             }
@@ -1227,7 +1239,7 @@ pub fn call_with_kwargs(
     frame: &mut crate::pyframe::PyFrame,
     callable: PyObjectRef,
     pos_args: &[PyObjectRef],
-    kwargs: &[(String, PyObjectRef)],
+    kwargs: &[(Wtf8Buf, PyObjectRef)],
 ) -> PyResult {
     let callable = crate::baseobjspace::unwrap_cell(callable);
 
@@ -1294,7 +1306,11 @@ pub fn call_with_kwargs(
                 }
                 for (key, value) in kwargs {
                     unsafe {
-                        pyre_object::w_dict_store(kwargs_dict, pyre_object::w_str_new(key), *value);
+                        pyre_object::w_dict_store(
+                            kwargs_dict,
+                            pyre_object::w_str_from_wtf8(key.clone()),
+                            *value,
+                        );
                     }
                 }
                 full_args.push(kwargs_dict);
@@ -1314,7 +1330,7 @@ pub fn call_with_kwargs(
                 if profile_active {
                     let keyword_names_w: Vec<pyre_object::PyObjectRef> = kwargs
                         .iter()
-                        .map(|(k, _)| pyre_object::w_str_new(k))
+                        .map(|(k, _)| pyre_object::w_str_from_wtf8(k.clone()))
                         .collect();
                     let keywords_w: Vec<pyre_object::PyObjectRef> =
                         kwargs.iter().map(|(_, v)| *v).collect();
@@ -1399,12 +1415,35 @@ pub fn call_with_kwargs(
                 result[i] = pos_args[i];
             }
             // Match keywords to parameter names
-            let mut extra_kwargs: Vec<(String, PyObjectRef)> = Vec::new();
-            let mut unmatched_kw_names: Vec<String> = Vec::new();
+            let posonly = code.posonlyarg_count as usize;
+            let mut extra_kwargs: Vec<(Wtf8Buf, PyObjectRef)> = Vec::new();
+            let mut unmatched_kw_names: Vec<Wtf8Buf> = Vec::new();
             for (key, value) in kwargs {
+                // A lone-surrogate keyword name never equals a source-level
+                // parameter name; it falls to **kwargs or the error below.
+                let key_str = key.as_str().ok();
                 let mut matched = false;
                 for pi in 0..total_params {
-                    if code.varnames[pi] == *key {
+                    if key_str == Some(code.varnames[pi].as_str()) {
+                        // argument.py:474 — positional-only param passed by
+                        // keyword: absorb into **kwargs if present, else error.
+                        if pi < posonly {
+                            if has_varkw {
+                                break;
+                            }
+                            return Err(crate::PyError::type_error(format!(
+                                "{}() got some positional-only arguments passed as keyword arguments: '{}'",
+                                fname, key
+                            )));
+                        }
+                        // argument.py:495 — ArgErrMultipleValues: keyword
+                        // duplicates an already-bound positional argument.
+                        if !result[pi].is_null() {
+                            return Err(crate::PyError::type_error(format!(
+                                "{}() got multiple values for argument '{}'",
+                                fname, key
+                            )));
+                        }
                         result[pi] = *value;
                         matched = true;
                         break;
@@ -1525,7 +1564,11 @@ pub fn call_with_kwargs(
                 let kw_dict = pyre_object::w_dict_new();
                 for (key, value) in &extra_kwargs {
                     unsafe {
-                        pyre_object::w_dict_store(kw_dict, pyre_object::w_str_new(key), *value);
+                        pyre_object::w_dict_store(
+                            kw_dict,
+                            pyre_object::w_str_from_wtf8(key.clone()),
+                            *value,
+                        );
                     }
                 }
                 final_args.push(kw_dict);
@@ -2091,14 +2134,8 @@ fn call_metaclass_with_kwargs(
         // compiling.py:213-219 — `space.call_args(w_meta, Arguments(name,
         // bases, ns, **kwds))`; a non-type metaclass receives the
         // class-definition keywords too.
-        let kwds: Vec<(String, PyObjectRef)> = if unsafe { pyre_object::is_dict(kwargs) } {
-            unsafe {
-                pyre_object::w_dict_items(kwargs)
-                    .into_iter()
-                    .filter(|(k, _)| pyre_object::is_str(*k))
-                    .map(|(k, v)| (pyre_object::w_str_get_value(k).to_string(), v))
-                    .collect()
-            }
+        let kwds: Vec<(Wtf8Buf, PyObjectRef)> = if unsafe { pyre_object::is_dict(kwargs) } {
+            unsafe { pyre_object::w_dict_str_entries_wtf8(kwargs) }
         } else {
             Vec::new()
         };
@@ -2373,8 +2410,8 @@ pub(crate) fn real_build_class(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
             unsafe {
                 for (k, v) in pyre_object::w_dict_items(last) {
                     if pyre_object::is_str(k) {
-                        let key = pyre_object::w_str_get_value(k);
-                        if key != "metaclass" && key != "__pyre_kw__" {
+                        let key = pyre_object::w_str_get_wtf8(k).as_str();
+                        if key != Ok("metaclass") && key != Ok("__pyre_kw__") {
                             pyre_object::w_dict_store(extra, k, v);
                         }
                     }
@@ -2461,13 +2498,9 @@ fn build_class_inner(
                 // compiling.py:190-196 — call __prepare__ with the
                 // class-definition keywords ('metaclass' already popped by
                 // the caller).
-                let prepare_kwds: Vec<(String, PyObjectRef)> = match extra_kwargs {
+                let prepare_kwds: Vec<(Wtf8Buf, PyObjectRef)> = match extra_kwargs {
                     Some(kw) if unsafe { pyre_object::is_dict(kw) } => unsafe {
-                        pyre_object::w_dict_items(kw)
-                            .into_iter()
-                            .filter(|(k, _)| pyre_object::is_str(*k))
-                            .map(|(k, v)| (pyre_object::w_str_get_value(k).to_string(), v))
-                            .collect()
+                        pyre_object::w_dict_str_entries_wtf8(kw)
                     },
                     _ => Vec::new(),
                 };
@@ -2541,9 +2574,9 @@ fn build_class_inner(
         if unsafe { pyre_object::is_dict(w_prepared_dict) } {
             for (key, value) in unsafe { pyre_object::w_dict_items(w_prepared_dict) } {
                 if !value.is_null() && unsafe { pyre_object::is_str(key) } {
-                    crate::dict_storage_store(
+                    crate::dict_storage_store_wtf8(
                         &mut class_ns,
-                        unsafe { pyre_object::w_str_get_value(key) },
+                        unsafe { pyre_object::w_str_get_wtf8(key) },
                         value,
                     );
                 }
@@ -2555,9 +2588,9 @@ fn build_class_inner(
             if !backing.is_null() && unsafe { pyre_object::is_dict(backing) } {
                 for (key, value) in unsafe { pyre_object::w_dict_items(backing) } {
                     if !value.is_null() && unsafe { pyre_object::is_str(key) } {
-                        crate::dict_storage_store(
+                        crate::dict_storage_store_wtf8(
                             &mut class_ns,
-                            unsafe { pyre_object::w_str_get_value(key) },
+                            unsafe { pyre_object::w_str_get_wtf8(key) },
                             value,
                         );
                     }
@@ -2642,9 +2675,9 @@ fn build_class_inner(
             // Dict subclass: read final entries off the backing dict.
             for (key, value) in unsafe { pyre_object::w_dict_items(backing) } {
                 if !value.is_null() && unsafe { pyre_object::is_str(key) } {
-                    crate::dict_storage_store(
+                    crate::dict_storage_store_wtf8(
                         class_ns,
-                        unsafe { pyre_object::w_str_get_value(key) },
+                        unsafe { pyre_object::w_str_get_wtf8(key) },
                         value,
                     );
                 }
@@ -2682,9 +2715,9 @@ fn build_class_inner(
                 }
                 let value = crate::baseobjspace::getitem(w_ns, key)?;
                 if !value.is_null() {
-                    crate::dict_storage_store(
+                    crate::dict_storage_store_wtf8(
                         class_ns,
-                        unsafe { pyre_object::w_str_get_value(key) },
+                        unsafe { pyre_object::w_str_get_wtf8(key) },
                         value,
                     );
                 }
@@ -2759,9 +2792,9 @@ fn build_class_inner(
             // and, for _EnumDict, reject the duplicate member keys.
             if mapping_namespace.is_none() {
                 let ns = unsafe { &*class_ns_ptr };
-                for (k, &v) in ns.entries() {
+                for (k, &v) in ns.entries_wtf8() {
                     if !v.is_null() {
-                        let key = pyre_object::w_str_new(k);
+                        let key = pyre_object::w_str_from_wtf8(k.to_owned());
                         // Use setitem to trigger __setitem__ on EnumDict etc.
                         let _ = crate::baseobjspace::setitem(w_prepared_dict, key, v);
                     }
@@ -2991,10 +3024,10 @@ pub(crate) fn call_init_subclass_on_bases(
     let w_super = pyre_object::superobject::w_super_new(w_type, w_type);
     let w_func = crate::baseobjspace::getattr_str(w_super, "__init_subclass__")?;
     // `__args__.replace_arguments([])` — keywords only, no positionals.
-    let kwds: Vec<(String, PyObjectRef)> = init_subclass_kwargs
+    let kwds: Vec<(Wtf8Buf, PyObjectRef)> = init_subclass_kwargs
         .iter()
         .filter(|(k, _)| unsafe { pyre_object::is_str(*k) })
-        .map(|(k, v)| (unsafe { pyre_object::w_str_get_value(*k) }.to_string(), *v))
+        .map(|(k, v)| (unsafe { pyre_object::w_str_get_wtf8(*k) }.to_owned(), *v))
         .collect();
     let frame = {
         let stored = BUILD_CLASS_EXEC_CTX.with(|c| c.get());

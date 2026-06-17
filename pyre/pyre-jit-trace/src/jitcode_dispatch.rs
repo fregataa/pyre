@@ -6819,6 +6819,53 @@ fn diagnose_inline_recognition(arg_concretes: &[ConcreteValue], op_pc: usize) {
     }
 }
 
+/// Resolve a concrete callable pointer to `(w_code, arg_count, has_closure)`,
+/// validating the `Function -> W_CodeObject -> CodeObject` type chain at every
+/// hop.  Returns `None` — decline to the orthodox residual call — when any link
+/// fails to type-check.
+///
+/// The `callable` comes from `ctx.concrete_registers_r`, a best-effort shadow
+/// that is NOT a GC root: a collection during the walk can leave the shadow
+/// pointing at freed/relocated memory whose first word still happens to read
+/// `FUNCTION_TYPE`.  Reading `(*callable).code` then yields a non-`W_CodeObject`
+/// (a host-allocated code wrapper never lives in the GC heap), so the
+/// `CODE_TYPE` tag check rejects the stale shadow before `code_ptr` is read —
+/// degrading to a residual call instead of dereferencing garbage.  Both walker
+/// call levers (inline-at-residual and self-recursive `CALL_ASSEMBLER`) share
+/// this resolver so the staleness guard is applied uniformly.
+///
+/// # Safety
+/// `callable` must be a non-null pointer obtained from a `ConcreteValue::Ref`.
+unsafe fn resolve_inlinable_callee(
+    callable: pyre_object::PyObjectRef,
+) -> Option<(*const (), usize, bool)> {
+    unsafe {
+        let function_type_addr = &pyre_interpreter::FUNCTION_TYPE as *const _ as usize;
+        if !pyre_interpreter::is_function(callable)
+            || (*callable).ob_type as *const () as usize != function_type_addr
+        {
+            return None;
+        }
+        let w_code = pyre_interpreter::function_get_code(callable);
+        if w_code.is_null() {
+            return None;
+        }
+        let code_type_addr = &pyre_interpreter::pycode::CODE_TYPE as *const _ as usize;
+        if (*(w_code as *const pyre_object::pyobject::PyObject)).ob_type as *const () as usize
+            != code_type_addr
+        {
+            return None;
+        }
+        let raw = pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
+            as *const pyre_interpreter::CodeObject;
+        if raw.is_null() {
+            return None;
+        }
+        let closure = pyre_interpreter::function_get_closure(callable);
+        Some((w_code, (*raw).arg_count as usize, !closure.is_null()))
+    }
+}
+
 /// The FBW fast-path inline convention (`try_walker_inline_user_call`) seeds
 /// only the callee's positional-argument registers `r0..nparams`; the
 /// callee's virtualizable frame box is left unseeded.  A callee whose body
@@ -7002,21 +7049,9 @@ fn try_walker_call_assembler_self_recursive(
     // loop reached through `CALL_ASSEMBLER`, not traced through — so a
     // branchy self-recursive body (`fib`'s `if n < 2`) is eligible here
     // even though `callee_fast_path_inlinable` declines it for inlining.
-    let function_type_addr = &pyre_interpreter::FUNCTION_TYPE as *const _ as usize;
-    let (w_code, nparams, has_closure) = unsafe {
-        if !pyre_interpreter::is_function(callable)
-            || (*callable).ob_type as *const () as usize != function_type_addr
-        {
-            return Ok(None);
-        }
-        let w_code = pyre_interpreter::function_get_code(callable);
-        let raw = pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
-            as *const pyre_interpreter::CodeObject;
-        if raw.is_null() {
-            return Ok(None);
-        }
-        let closure = pyre_interpreter::function_get_closure(callable);
-        (w_code, (*raw).arg_count as usize, !closure.is_null())
+    let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(callable) })
+    else {
+        return Ok(None);
     };
     if has_closure || nparams != 1 {
         return Ok(None);
@@ -7305,21 +7340,9 @@ fn try_walker_inline_user_call(
     if !null_or_self.is_null() {
         return Ok(None);
     }
-    let function_type_addr = &pyre_interpreter::FUNCTION_TYPE as *const _ as usize;
-    let (w_code, nparams, has_closure) = unsafe {
-        if !pyre_interpreter::is_function(callable)
-            || (*callable).ob_type as *const () as usize != function_type_addr
-        {
-            return Ok(None);
-        }
-        let w_code = pyre_interpreter::function_get_code(callable);
-        let raw = pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
-            as *const pyre_interpreter::CodeObject;
-        if raw.is_null() {
-            return Ok(None);
-        }
-        let closure = pyre_interpreter::function_get_closure(callable);
-        (w_code, (*raw).arg_count as usize, !closure.is_null())
+    let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(callable) })
+    else {
+        return Ok(None);
     };
     let nargs_passed = r_args.len() - 2;
     // Only exact-positional, closure-free calls: every callee local [0..nparams]

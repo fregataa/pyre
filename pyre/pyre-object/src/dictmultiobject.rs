@@ -2474,10 +2474,13 @@ pub unsafe fn w_dict_getitem_wtf8(
     w_dict_lookup(obj, w_key)
 }
 
-/// WTF-8 keyed sibling of `w_dict_setitem_str`.  A key that is valid
-/// UTF-8 takes the str fast path (so an ASCII/Unicode dict keeps its
-/// strategy); only a lone-surrogate key forces the object strategy via
-/// `w_dict_setitem_wtf8_no_proxy`.
+/// WTF-8 keyed equivalent of `space.setitem_str` — `setitem_str` is itself
+/// a fast path of `space.setitem`, so a key that is valid UTF-8 takes the
+/// str fast path (keeping an ASCII/Unicode dict on its strategy) and a
+/// lone-surrogate key wraps into a `W_StrObject` and routes through the
+/// general `w_dict_store` (`space.setitem`).  Unlike the back-mirror
+/// `_no_proxy` helper this carries no module-dict exception, matching
+/// `space.setitem_str`.
 ///
 /// # Safety
 /// `obj` must point to a valid `W_DictObject`.
@@ -2488,7 +2491,7 @@ pub unsafe fn w_dict_setitem_wtf8(
 ) {
     match key.as_str() {
         Ok(s) => w_dict_setitem_str(obj, s, value),
-        Err(_) => w_dict_setitem_wtf8_no_proxy(obj, key, value),
+        Err(_) => w_dict_store(obj, crate::w_str_from_wtf8(key.to_wtf8_buf()), value),
     }
 }
 
@@ -3206,17 +3209,46 @@ pub unsafe fn w_module_dict_items_inner(obj: PyObjectRef) -> Vec<(PyObjectRef, P
 /// celldict cell-cache walks uniformly.
 ///
 /// Keys that carry a lone surrogate (not valid UTF-8) are skipped:
-/// every consumer of this helper feeds the key into a `&str`-keyed
-/// path (dict_storage_store, call_with_kwargs, module `__dir__`),
-/// none of which can yet represent a surrogate key.  Skipping them
-/// here avoids the [`w_str_get_value`] panic until those paths thread
-/// the WTF-8 key through.
+/// the remaining `&str`-keyed consumers (dict_storage_store, module
+/// `__dir__`, builtins-module iteration) cannot yet represent a
+/// surrogate key, so skipping them here avoids the [`w_str_get_value`]
+/// panic.  The keyword-argument ABI no longer uses this helper — it
+/// threads the byte-ish key through [`w_dict_str_entries_wtf8`].
 pub unsafe fn w_dict_str_entries(obj: PyObjectRef) -> Vec<(String, PyObjectRef)> {
     w_dict_items(obj)
         .into_iter()
         .filter_map(|(k, v)| {
             if crate::is_str(k) {
                 crate::w_str_get_value_opt(k).map(|s| (s.to_string(), v))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Iterate over (key_wtf8, value) pairs, preserving lone-surrogate keys.
+///
+/// The surrogate-preserving counterpart of [`w_dict_str_entries`], used
+/// by the keyword-argument ABI (`call_with_kwargs`, `bind_kwargs_to_signature`,
+/// the builtin `__pyre_kw__` readers).  `Arguments` keeps keyword names as
+/// byte-ish `str` (`keywords: [str]`, `argument.py`), so a `**{'\udc80': v}`
+/// key survives as a `Wtf8Buf` rather than being dropped.
+///
+/// Non-str keys are dropped here, which is correct for the name-enumeration
+/// callers (`dir()`, dict merge).  It is NOT, however, the `**kwargs`-unpack
+/// contract: `argument.py` `_do_combine_starstarargs_wrapped` RAISES
+/// `TypeError("keywords must be strings, not '%T'")` on a non-str key rather
+/// than skipping it, so a caller on that path (`CALL_FUNCTION_EX`) must enforce
+/// the TypeError itself — this helper does not.
+pub unsafe fn w_dict_str_entries_wtf8(
+    obj: PyObjectRef,
+) -> Vec<(rustpython_wtf8::Wtf8Buf, PyObjectRef)> {
+    w_dict_items(obj)
+        .into_iter()
+        .filter_map(|(k, v)| {
+            if crate::is_str(k) {
+                Some((crate::w_str_get_wtf8(k).to_owned(), v))
             } else {
                 None
             }

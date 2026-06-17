@@ -3389,7 +3389,9 @@ pub fn dict_method_update(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     if let Some(kwargs) = kwargs_dict {
         unsafe {
             for (k, v) in pyre_object::w_dict_items(kwargs) {
-                if pyre_object::is_str(k) && pyre_object::w_str_get_value(k) == "__pyre_kw__" {
+                if pyre_object::is_str(k)
+                    && pyre_object::w_str_get_wtf8(k).as_str() == Ok("__pyre_kw__")
+                {
                     continue;
                 }
                 dict_store_checked(resolve_dict_backing(dict), k, v)?;

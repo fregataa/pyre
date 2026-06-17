@@ -3316,11 +3316,26 @@ impl OpcodeStepExecutor for PyFrame {
             }
         };
 
-        // Merge kwargs dict into call.
-        // argument.py Arguments.unpack_combined_starstarargs
-        if !kwargs_or_null.is_null() && unsafe { pyre_object::is_dict(kwargs_or_null) } {
-            let entries = unsafe { pyre_object::w_dict_str_entries(kwargs_or_null) };
-            if !entries.is_empty() {
+        // Merge the `**` mapping into the call.  argument.py:106-150
+        // `_combine_starstarargs_wrapped` accepts any mapping — the dict fast
+        // path or an arbitrary object via `keys()` / `__getitem__` — raising
+        // "argument after ** must be a mapping" for a non-mapping and
+        // "keywords must be strings" for a non-str key.
+        if !kwargs_or_null.is_null() {
+            let mut keyword_names_w: Vec<PyObjectRef> = Vec::new();
+            let mut keywords_w: Vec<PyObjectRef> = Vec::new();
+            crate::argument::combine_starstarargs_wrapped(
+                &mut keyword_names_w,
+                &mut keywords_w,
+                kwargs_or_null,
+                callable,
+            )?;
+            if !keyword_names_w.is_empty() {
+                let entries: Vec<(rustpython_wtf8::Wtf8Buf, PyObjectRef)> = keyword_names_w
+                    .iter()
+                    .zip(keywords_w.iter())
+                    .map(|(&k, &v)| (unsafe { pyre_object::w_str_get_wtf8(k) }.to_owned(), v))
+                    .collect();
                 let result = crate::call::call_with_kwargs(self, callable, &args, &entries)?;
                 self.push(result);
                 return Ok(());
@@ -3388,7 +3403,7 @@ impl OpcodeStepExecutor for PyFrame {
                 for ki in 0..nkw {
                     let name = unsafe { pyre_object::w_tuple_getitem(kwarg_names, ki as i64) };
                     if let Some(name_obj) = name {
-                        let key = unsafe { pyre_object::w_str_get_value(name_obj) }.to_string();
+                        let key = unsafe { pyre_object::w_str_get_wtf8(name_obj) }.to_owned();
                         kw_entries.push((key, args[n_pos + ki]));
                     }
                 }
@@ -3419,7 +3434,7 @@ impl OpcodeStepExecutor for PyFrame {
             for ki in 0..nkw {
                 let name = unsafe { pyre_object::w_tuple_getitem(kwarg_names, ki as i64) };
                 if let Some(name_obj) = name {
-                    let key = unsafe { pyre_object::w_str_get_value(name_obj) }.to_string();
+                    let key = unsafe { pyre_object::w_str_get_wtf8(name_obj) }.to_owned();
                     kw_entries.push((key, args[n_pos + ki]));
                 }
             }
@@ -3456,7 +3471,7 @@ impl OpcodeStepExecutor for PyFrame {
                 for ki in 0..nkw {
                     let name = unsafe { pyre_object::w_tuple_getitem(kwarg_names, ki as i64) };
                     if let Some(name_obj) = name {
-                        let key = unsafe { pyre_object::w_str_get_value(name_obj) }.to_string();
+                        let key = unsafe { pyre_object::w_str_get_wtf8(name_obj) }.to_owned();
                         kw_entries.push((key, args[n_pos + ki]));
                     }
                 }
