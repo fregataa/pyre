@@ -1,8 +1,6 @@
 use majit_ir::{VecAssoc, VecMapExt};
 use std::cell::RefCell;
 use std::sync::Arc;
-use std::sync::LazyLock;
-use std::sync::Mutex;
 /// runner.py: AbstractX86CPU — the Backend trait implementation.
 ///
 /// This is the entry point for the dynasm backend, corresponding to
@@ -61,8 +59,20 @@ struct DynasmCaTarget {
     index_of_virtualizable: i32,
 }
 
-static CALL_ASSEMBLER_TARGETS: LazyLock<Mutex<VecAssoc<u64, DynasmCaTarget>>> =
-    LazyLock::new(|| Mutex::new(VecAssoc::new()));
+thread_local! {
+    /// CALL_ASSEMBLER callee dispatch table.  RPython keeps the equivalent
+    /// state on `cpu.assembler` (per-CPU); pyre's JIT compiles and executes
+    /// on a single thread, so a thread-local mirrors that per-context scope
+    /// while keeping concurrent backend test binaries (each test runs on its
+    /// own thread) from sharing a global map keyed by reused token numbers —
+    /// a colliding token would otherwise let one thread bake another thread's
+    /// compiled `code_addr` into a CALL_ASSEMBLER site.  The map is read only
+    /// at compile time (the resolved address is baked into the code), so
+    /// thread-local scope never narrows what production (single-threaded) can
+    /// reach.
+    static CALL_ASSEMBLER_TARGETS: RefCell<VecAssoc<u64, DynasmCaTarget>> =
+        RefCell::new(VecAssoc::new());
+}
 
 /// `rewrite.py:665-695` `handle_call_assembler` per-callee metadata
 /// lookup, sourced from the registered `DynasmCaTarget`'s CLT Arc.
@@ -70,24 +80,24 @@ static CALL_ASSEMBLER_TARGETS: LazyLock<Mutex<VecAssoc<u64, DynasmCaTarget>>> =
 pub(crate) fn lookup_call_assembler_callee_locs(
     token_number: u64,
 ) -> Option<majit_gc::rewrite::CallAssemblerCalleeLocs> {
-    let guard = CALL_ASSEMBLER_TARGETS
-        .lock()
-        .expect("CALL_ASSEMBLER_TARGETS poisoned");
-    let target = guard.get(&token_number)?;
-    let clt = &target.compiled_loop_token;
-    // `JitFrameInfo` is `#[repr(C)]` and the Arc keeps the allocation
-    // pinned, matching cranelift's `compiler.rs:6107-6110` pattern.
-    let frame_info_ptr = {
-        let info = clt.frame_info.lock();
-        &*info as *const majit_backend::JitFrameInfo as usize
-    };
-    let frame_depth = clt.frame_info.lock().jfi_frame_depth as usize;
-    let ll_initial_locs = clt._ll_initial_locs.lock().clone();
-    Some(majit_gc::rewrite::CallAssemblerCalleeLocs {
-        _ll_initial_locs: ll_initial_locs,
-        frame_depth,
-        frame_info_ptr,
-        index_of_virtualizable: target.index_of_virtualizable,
+    CALL_ASSEMBLER_TARGETS.with(|cell| {
+        let guard = cell.borrow();
+        let target = guard.get(&token_number)?;
+        let clt = &target.compiled_loop_token;
+        // `JitFrameInfo` is `#[repr(C)]` and the Arc keeps the allocation
+        // pinned, matching cranelift's `compiler.rs:6107-6110` pattern.
+        let frame_info_ptr = {
+            let info = clt.frame_info.lock();
+            &*info as *const majit_backend::JitFrameInfo as usize
+        };
+        let frame_depth = clt.frame_info.lock().jfi_frame_depth as usize;
+        let ll_initial_locs = clt._ll_initial_locs.lock().clone();
+        Some(majit_gc::rewrite::CallAssemblerCalleeLocs {
+            _ll_initial_locs: ll_initial_locs,
+            frame_depth,
+            frame_info_ptr,
+            index_of_virtualizable: target.index_of_virtualizable,
+        })
     })
 }
 
@@ -1241,7 +1251,11 @@ impl DynasmBackend {
     /// demand inside `_cmp_guard_class` (assembler.py:1887-1890); pyre's
     /// dynasm assembler runs without a borrow of `self`, so we materialize
     /// the resolver as a VecAssoc up front.
-    fn collect_classptr_typeid_table(&self, ops: &[Op]) -> majit_ir::VecAssoc<i64, u32> {
+    fn collect_classptr_typeid_table(
+        &self,
+        ops: &[Op],
+        const_pool: &majit_ir::VecAssoc<u32, majit_ir::Const>,
+    ) -> majit_ir::VecAssoc<i64, u32> {
         let mut table = majit_ir::VecAssoc::new();
         if self.vtable_offset.is_some() || DYNASM_ACTIVE_GC.with(|cell| cell.borrow().is_none()) {
             // vtable_offset path doesn't need typeid lookups; without a
@@ -1255,8 +1269,15 @@ impl DynasmBackend {
             ) && op.num_args() >= 2
             {
                 let class_arg = op.arg(1).to_opref();
-                // history.py:227 — inline-Const carries its class pointer directly.
-                let classptr = class_arg.const_int_value();
+                // history.py:227 — inline-Const carries its class pointer
+                // directly.  The optimizer may also leave it as a plain
+                // const-pool OpRef (short preamble / constant folding), which
+                // regalloc resolves through the constants map in
+                // `RegisterManager::loc`; resolve it the same way here so the
+                // codegen-side `Loc::Immed` always has a matching typeid entry.
+                let classptr = class_arg
+                    .const_int_value()
+                    .or_else(|| const_pool.get(&class_arg.raw()).map(|c| c.as_raw_i64()));
                 if let Some(classptr) = classptr {
                     if let Some(tid) = self.lookup_typeid_from_classptr(classptr as usize) {
                         table.insert(classptr, tid);
@@ -1592,18 +1613,18 @@ impl DynasmBackend {
     }
 
     fn call_assembler_targets_snapshot() -> VecAssoc<u64, usize> {
-        CALL_ASSEMBLER_TARGETS
-            .lock()
-            .expect("CALL_ASSEMBLER_TARGETS poisoned")
-            .iter()
-            .filter_map(|(&k, t)| {
-                if t.code_addr != 0 {
-                    Some((k, t.code_addr))
-                } else {
-                    None
-                }
-            })
-            .collect()
+        CALL_ASSEMBLER_TARGETS.with(|cell| {
+            cell.borrow()
+                .iter()
+                .filter_map(|(&k, t)| {
+                    if t.code_addr != 0 {
+                        Some((k, t.code_addr))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        })
     }
 
     /// `rpython/jit/backend/x86/assembler.py:599` parity: store
@@ -1623,32 +1644,32 @@ impl DynasmBackend {
                 token_number, code_addr
             );
         }
-        let mut guard = CALL_ASSEMBLER_TARGETS
-            .lock()
-            .expect("CALL_ASSEMBLER_TARGETS poisoned");
-        match guard.get_mut(&token_number) {
-            Some(existing) => {
-                existing.code_addr = code_addr;
-                // Adopt the pending CLT Arc onto the JitCellToken so the
-                // pending-window allocation remains the live one.
-                token.compiled_loop_token = Some(Arc::clone(&existing.compiled_loop_token));
+        CALL_ASSEMBLER_TARGETS.with(|cell| {
+            let mut guard = cell.borrow_mut();
+            match guard.get_mut(&token_number) {
+                Some(existing) => {
+                    existing.code_addr = code_addr;
+                    // Adopt the pending CLT Arc onto the JitCellToken so the
+                    // pending-window allocation remains the live one.
+                    token.compiled_loop_token = Some(Arc::clone(&existing.compiled_loop_token));
+                }
+                None => {
+                    let clt = token
+                        .compiled_loop_token
+                        .as_ref()
+                        .expect("JitCellToken missing compiled_loop_token")
+                        .clone();
+                    guard.insert(
+                        token_number,
+                        DynasmCaTarget {
+                            code_addr,
+                            compiled_loop_token: clt,
+                            index_of_virtualizable,
+                        },
+                    );
+                }
             }
-            None => {
-                let clt = token
-                    .compiled_loop_token
-                    .as_ref()
-                    .expect("JitCellToken missing compiled_loop_token")
-                    .clone();
-                guard.insert(
-                    token_number,
-                    DynasmCaTarget {
-                        code_addr,
-                        compiled_loop_token: clt,
-                        index_of_virtualizable,
-                    },
-                );
-            }
-        }
+        });
     }
 
     fn redirect_call_assembler_target(old_number: u64, new_addr: usize) {
@@ -1658,13 +1679,11 @@ impl DynasmBackend {
                 old_number, new_addr
             );
         }
-        if let Some(existing) = CALL_ASSEMBLER_TARGETS
-            .lock()
-            .expect("CALL_ASSEMBLER_TARGETS poisoned")
-            .get_mut(&old_number)
-        {
-            existing.code_addr = new_addr;
-        }
+        CALL_ASSEMBLER_TARGETS.with(|cell| {
+            if let Some(existing) = cell.borrow_mut().get_mut(&old_number) {
+                existing.code_addr = new_addr;
+            }
+        });
     }
 
     /// Static entry point for `lib.rs register_pending_call_assembler_target`.
@@ -1690,14 +1709,14 @@ impl DynasmBackend {
         // managed-register save area and the callee enters with NULL inputs.
         *pending_clt._ll_initial_locs.lock() =
             (0..num_inputs).map(Self::input_initial_loc).collect();
-        CALL_ASSEMBLER_TARGETS
-            .lock()
-            .expect("CALL_ASSEMBLER_TARGETS poisoned")
-            .entry_or_insert_with(token_number, || DynasmCaTarget {
-                code_addr: 0,
-                compiled_loop_token: pending_clt,
-                index_of_virtualizable,
-            });
+        CALL_ASSEMBLER_TARGETS.with(|cell| {
+            cell.borrow_mut()
+                .entry_or_insert_with(token_number, || DynasmCaTarget {
+                    code_addr: 0,
+                    compiled_loop_token: pending_clt,
+                    index_of_virtualizable,
+                });
+        });
     }
 
     /// `rpython/jit/backend/llsupport/llmodel.py:534-537`
@@ -1746,7 +1765,7 @@ impl Backend for DynasmBackend {
         // The assembler stores the typed `Const` pool directly; each box
         // variant carries its own type (`Const::get_type`).
         let const_pool = std::mem::take(&mut self.constants);
-        let typeid_table = self.collect_classptr_typeid_table(&prepared_ops);
+        let typeid_table = self.collect_classptr_typeid_table(&prepared_ops, &const_pool);
         let guard_gc_type_info = self.collect_guard_gc_type_info();
         let subclass_range_table = self.collect_classptr_subclass_range_table(&prepared_ops);
         let attached_descrs = self.attached_descr_ptrs();
@@ -1988,7 +2007,7 @@ impl Backend for DynasmBackend {
                 majit_ir::format_trace(&prepared_ops, &constants)
             );
         }
-        let typeid_table = self.collect_classptr_typeid_table(&prepared_ops);
+        let typeid_table = self.collect_classptr_typeid_table(&prepared_ops, &const_pool);
         let guard_gc_type_info = self.collect_guard_gc_type_info();
         let subclass_range_table = self.collect_classptr_subclass_range_table(&prepared_ops);
         let attached_descrs = self.attached_descr_ptrs();
@@ -2501,10 +2520,9 @@ impl Backend for DynasmBackend {
     /// fail-descr cells it pins — would live for the entire process
     /// lifetime.  Drop the entry so the Arc chain unwinds.
     fn free_loop(&mut self, token: &JitCellToken) {
-        CALL_ASSEMBLER_TARGETS
-            .lock()
-            .expect("CALL_ASSEMBLER_TARGETS poisoned")
-            .remove(&token.number);
+        CALL_ASSEMBLER_TARGETS.with(|cell| {
+            cell.borrow_mut().remove(&token.number);
+        });
     }
 
     fn fail_descr_arc_from_addr(&self, descr_addr: usize) -> majit_ir::DescrRef {
@@ -4353,7 +4371,6 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    #[ignore = "virtualizable bridge re-entry: regalloc panics `box InputArg not found` (regalloc.rs:1280) — vable bridge inputarg binding gap, distinct from the FINISH done-descr kind bug"]
     fn test_self_recursive_virtualizable_bridge_reads_input0_from_compiled_bridge() {
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 1 << 20,
@@ -4435,11 +4452,7 @@ mod tests {
         let bridge_ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
             getfield,
-            mk_op(
-                OpCode::Finish,
-                &[OpRef::input_arg_int(1)],
-                OpRef::NONE.raw(),
-            ),
+            mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
         backend
             .compile_bridge(
@@ -4459,7 +4472,6 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    #[ignore = "double-recursive virtualizable dispatch: regalloc panics `box InputArgInt(1) not found` (regalloc.rs:1280) — vable inputarg binding gap, distinct from the FINISH done-descr kind bug"]
     fn test_double_recursive_virtualizable_call_assembler_keeps_entry_input0_live() {
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 1 << 20,
@@ -4560,11 +4572,7 @@ mod tests {
         let bridge_ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
             bridge_getfield,
-            mk_op(
-                OpCode::Finish,
-                &[OpRef::input_arg_int(1)],
-                OpRef::NONE.raw(),
-            ),
+            mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
         backend
             .compile_bridge(
@@ -4584,7 +4592,6 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    #[ignore = "bridge ref-input materialization panics at aarch64/assembler.rs:3394 — distinct from the FINISH done-descr kind bug"]
     fn test_bridge_materializes_register_ref_inputs_for_resolve_opref_ops() {
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 1 << 20,
@@ -4668,7 +4675,6 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    #[ignore = "bridge two-ref-input materialization panics at aarch64/assembler.rs:3394 — distinct from the FINISH done-descr kind bug"]
     fn test_bridge_materializes_two_register_ref_inputs_before_unused_raw_load() {
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 1 << 20,
@@ -4956,7 +4962,6 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    #[ignore = "collecting callee with second ref arg: regalloc panics `box InputArgRef(1) not found` (regalloc.rs:1280) — distinct from the FINISH done-descr kind bug"]
     fn test_call_assembler_preserves_fresh_callr_ref_with_second_ref_arg_across_collecting_callee_alloc()
      {
         install_test_libc_jitframe_tracer();
@@ -5002,7 +5007,7 @@ mod tests {
         plain_call.setdescr(make_plain_call_descr(vec![], Type::Ref));
         let mut call_asm = mk_op(
             OpCode::CallAssemblerR,
-            &[OpRef::input_arg_ref(1), OpRef::input_arg_ref(0)],
+            &[OpRef::ref_op(1), OpRef::input_arg_ref(0)],
             2,
         );
         call_asm.setdescr(make_call_assembler_descr(
