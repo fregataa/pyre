@@ -469,7 +469,7 @@ pub(crate) fn remap_op_kind(
         } => OpKind::ArrayWrite {
             base: remap_var(base),
             index: remap_var(index),
-            value: remap_var(value),
+            value: value.map_value(remap_var),
             item_ty: item_ty.clone(),
             array_type_id: array_type_id.clone(),
             nolength: *nolength,
@@ -881,7 +881,16 @@ pub fn op_variable_refs(kind: &OpKind) -> Vec<crate::flowspace::model::Variable>
         OpKind::ArrayRead { base, index, .. } => vec![clone_var(base), clone_var(index)],
         OpKind::ArrayWrite {
             base, index, value, ..
-        } => vec![clone_var(base), clone_var(index), clone_var(value)],
+        } => {
+            // `setarrayitem_gc` stores either a register operand or an
+            // inline constant; only a `Variable` value contributes an SSA
+            // reference (a `Const` literal carries no defining op).
+            let mut refs = vec![clone_var(base), clone_var(index)];
+            if let Some(var) = value.as_variable() {
+                refs.push(clone_var(var));
+            }
+            refs
+        }
         OpKind::InteriorFieldRead { base, index, .. } => vec![clone_var(base), clone_var(index)],
         OpKind::InteriorFieldWrite {
             base, index, value, ..

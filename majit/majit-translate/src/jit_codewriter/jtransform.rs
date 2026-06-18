@@ -2353,12 +2353,13 @@ impl<'a> Transformer<'a> {
         op: &SpaceOperation,
         base: &crate::flowspace::model::Variable,
         index: &crate::flowspace::model::Variable,
-        value: &crate::flowspace::model::Variable,
+        value: &crate::model::LinkArg,
         item_ty: &ValueType,
         graph_name: &str,
     ) -> RewriteResult {
-        let typed_item_ty = self
-            .get_value_type(value)
+        let typed_item_ty = value
+            .as_variable()
+            .and_then(|v| self.get_value_type(v))
             .unwrap_or_else(|| item_ty.clone());
         if let Some((vable_base, arr_idx, itemsize, is_signed)) =
             self.vable_array_vars.get(base).cloned()
@@ -2374,7 +2375,13 @@ impl<'a> Transformer<'a> {
                     base: vable_base,
                     array_index: arr_idx,
                     elem_index: index.clone(),
-                    value: value.clone(),
+                    // The vable rewrite only fires for virtualizable
+                    // arrays, which never carry an inline-const store; a
+                    // VableArrayWrite value is always a register.
+                    value: value
+                        .as_variable()
+                        .expect("vable array writes carry a Variable value")
+                        .clone(),
                     item_ty: typed_item_ty,
                     array_itemsize: itemsize,
                     array_is_signed: is_signed,
@@ -4236,7 +4243,7 @@ fn remap_op(
         } => OpKind::ArrayWrite {
             base: remap_value(base, aliases),
             index: remap_value(index, aliases),
-            value: remap_value(value, aliases),
+            value: value.map_value(|v| remap_value(v, aliases)),
             item_ty: item_ty.clone(),
             array_type_id: array_type_id.clone(),
             nolength: *nolength,
@@ -5251,7 +5258,7 @@ mod tests {
             OpKind::ArrayWrite {
                 base: base_var,
                 index: index_var,
-                value: value_var.clone(),
+                value: crate::model::LinkArg::Value(value_var.clone()),
                 item_ty: ValueType::Unknown,
                 array_type_id: None,
                 nolength: false,

@@ -482,6 +482,15 @@ pub const BC_INT_RETURN_C: u8 = 221;
 // `BC_NEW_WITH_VTABLE`).
 pub const BC_SETFIELD_GC_I_C: u8 = 222;
 
+// `setarrayitem_gc_i` is in `USE_C_FORM` (`assembler.py:339`): a small
+// ConstInt store value (-128..127) is written inline as one signed byte,
+// giving the const-VALUE key `setarrayitem_gc_i/ricd` (a sibling of the
+// const-INDEX `setarrayitem_gc_r/rcrd`, BC_SETARRAYITEM_GC_R_C = 215, and
+// of the register-value `setarrayitem_gc_i/riid`, BC_SETARRAYITEM_GC_I =
+// 176).  A wider constant or a register value keeps the `i` pool-slot
+// form.
+pub const BC_SETARRAYITEM_GC_I_C: u8 = 227;
+
 // pyre-only `abort/>r` — Ref-result variant of `abort/` (BC_ABORT = 13)
 // emitted by `Assembler::encode_op`'s default branch when an `OpKind::
 // Abort { result_kind: Ref }` reaches the assembler.  Lives in
@@ -923,6 +932,10 @@ pub fn wellknown_bh_insns() -> VecAssoc<&'static str, u8> {
     // `new_array_clear/id>r` itself is registered with the other
     // allocation opcodes (`new` / `new_with_vtable` / `new_array`) below.
     m.insert("setarrayitem_gc_r/rcrd", BC_SETARRAYITEM_GC_R_C);
+    // const-VALUE form: a small ConstInt store value inline as one signed
+    // byte (`setarrayitem_gc_i` ∈ USE_C_FORM, `assembler.py:339`), keyed
+    // off the int value bank like `setfield_gc_i/rcd`.
+    m.insert("setarrayitem_gc_i/ricd", BC_SETARRAYITEM_GC_I_C);
     m.insert("new_array_clear/cd>r", BC_NEW_ARRAY_CLEAR_C);
     m.insert("getarrayitem_gc_i/rid>i", BC_GETARRAYITEM_GC_I);
     m.insert("getarrayitem_gc_f/rid>f", BC_GETARRAYITEM_GC_F);

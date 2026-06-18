@@ -1629,9 +1629,41 @@ impl Assembler {
                 );
                 state.code.push(reg);
                 argcodes.push(kc);
-                let (reg, value_kind) = self.lookup_reg_with_kind_var(value, regallocs);
-                state.code.push(reg);
-                argcodes.push(value_kind);
+                // RPython `bhimpl_setarrayitem_gc_{i,r,f}` keys off the
+                // VALUE's kind; jtransform.py:803 derives it from
+                // `getkind(op.args[2].concretetype)` and passes the operand
+                // (Variable or Constant) verbatim.  Mirror the FieldWrite
+                // c-form: a Variable is a register; an int Constant takes
+                // the short `c` byte (`setarrayitem_gc_i/ricd`) when small
+                // (`setarrayitem_gc_i` ∈ USE_C_FORM, assembler.py:339) or a
+                // pool `i` slot otherwise; a ref/float Constant takes its
+                // pooled byte.
+                let value_kind = match value {
+                    crate::model::LinkArg::Value(var) => {
+                        let (reg, kc) = self.lookup_reg_with_kind_var(var, regallocs);
+                        state.code.push(reg);
+                        argcodes.push(kc);
+                        kc
+                    }
+                    crate::model::LinkArg::Const(c) => {
+                        let kind = crate::flatten::constant_kind(c);
+                        if kind == 'i' {
+                            let (byte, argcode) = self.emit_const_i_from_const_allow_short(
+                                &c.value,
+                                use_c_form("setarrayitem_gc_i"),
+                                state,
+                                callcontrol,
+                            );
+                            state.code.push(byte);
+                            argcodes.push(argcode);
+                        } else {
+                            let byte = self.emit_const(&c.value, kind, state, callcontrol);
+                            state.code.push(byte);
+                            argcodes.push(kind);
+                        }
+                        kind
+                    }
+                };
                 // pyre source-level array operations are emitted from
                 // `Vec<T>` / GcArray-backed layouts that always carry a
                 // length header at offset 0 (rust-source / jit_codewriter
@@ -4521,7 +4553,7 @@ mod tests {
             OpKind::ArrayWrite {
                 base: base_var.clone(),
                 index: index_var.clone(),
-                value: value_var.clone(),
+                value: crate::model::LinkArg::Value(value_var.clone()),
                 item_ty: ValueType::Unknown,
                 array_type_id: None,
                 nolength: false,

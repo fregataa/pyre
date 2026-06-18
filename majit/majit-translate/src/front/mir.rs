@@ -1897,7 +1897,7 @@ impl<'a> Lowering<'a> {
                 // projection element. The destination local is NOT
                 // updated — the write goes through indirection, the
                 // base local remains the same Variable.
-                let value = match self.field_write_inline_const(&elem, &rvalue, &dest_ty) {
+                let value = match self.field_write_inline_const(&inner, &elem, &rvalue, &dest_ty) {
                     // An int / bool / float field write keeps its constant
                     // operand inline (`LinkArg::Const`) instead of
                     // materialising a `ConstInt` / `ConstFloat` + copy into
@@ -1968,24 +1968,37 @@ impl<'a> Lowering<'a> {
     /// float to a pooled `f` slot (`assembler.rs` `emit_const_f`), which
     /// the walker resolves through the constants window of `registers_f`.
     ///
-    /// Ref-kind field constants are not pooled at this layer: a string /
-    /// char / fn-pointer constant lowers to a runtime `Call`
+    /// Ref-kind constants are not pooled at this layer: a string / char /
+    /// fn-pointer constant lowers to a runtime `Call`
     /// (`build_rvalue`'s `DecodedConst::Str` / `FnPath` arms), not a
-    /// poolable `ConstPtr`, so it keeps the materialised path — as do
-    /// `Deref` / `Index` writes.
+    /// poolable `ConstPtr`, so it keeps the materialised path.  A plain
+    /// `Deref` (`*p = v`) also keeps it, lowering to a `__deref_write`
+    /// Call whose args must be Variables; an `index_mut`-aliased `Deref`
+    /// and a `[i]` subscript both lower to `setarrayitem_gc_*`, whose
+    /// value operand can stay an inline `Constant` like `setfield_gc_*`
+    /// (jtransform.py:803 passes `op.args[2]` verbatim).
     fn field_write_inline_const(
         &self,
+        inner: &Place,
         elem: &ProjectionElem,
         rvalue: &Rvalue,
         dest_ty: &TyRef,
     ) -> Option<ConstValue> {
-        // Only a struct `Field` projection lowers to `setfield_gc_*`.
-        let is_field = matches!(
-            elem,
-            ProjectionElem::Tagged(v)
-                if v.as_object().is_some_and(|m| m.contains_key("Field"))
-        );
-        if !is_field {
+        // A `Field`, a `[i]` subscript, or an `index_mut`-aliased `Deref`
+        // lowers to a `setfield_gc_*` / `setarrayitem_gc_*` whose value
+        // operand can stay an inline `Constant`.  A plain `Deref` lowers
+        // to a `__deref_write` Call (Variable args only) and is excluded.
+        let inlinable_target = match elem {
+            ProjectionElem::Tagged(v) => v
+                .as_object()
+                .is_some_and(|m| m.contains_key("Field") || m.contains_key("Index")),
+            ProjectionElem::Atom(s) if s == "Deref" => matches!(
+                &inner.kind,
+                PlaceKind::Local(i) if self.index_elem_alias.contains_key(&(*i as usize))
+            ),
+            _ => false,
+        };
+        if !inlinable_target {
             return None;
         }
         // Only a bare constant operand qualifies; a computed rvalue still
@@ -1993,17 +2006,20 @@ impl<'a> Lowering<'a> {
         let Rvalue::Use(Operand::Const(value)) = rvalue else {
             return None;
         };
-        // Inline only a genuinely pooled constant matched to the field's
-        // value bank: int / bool into an int-kind field (`setfield_gc_i`),
-        // float into a float-kind field (`setfield_gc_f`).  `Str` / `FnPath`
-        // constants lower to a `Call`, not a poolable `ConstPtr`, so they
-        // fall through to the materialised path.
+        // Inline only a genuinely pooled constant matched to the target's
+        // value bank: int / bool into an int-kind target (`setfield_gc_i`
+        // / `setarrayitem_gc_i`; `getkind(Bool) == 'int'`), float into a
+        // float-kind target (`setfield_gc_f`).  A `Bool`-typed target
+        // (e.g. a `bool` array element) banks `i` just like an `Int`
+        // field.  `Str` / `FnPath` constants lower to a `Call`, not a
+        // poolable `ConstPtr`, so they fall through to the materialised
+        // path.
         match (
             tyref_to_value_type(dest_ty, self.llbc),
             decode_constant(self.llbc, value).ok()?,
         ) {
             (ValueType::Int, DecodedConst::Int(n)) => Some(ConstValue::Int(n)),
-            (ValueType::Int, DecodedConst::Bool(b)) => Some(ConstValue::Bool(b)),
+            (ValueType::Int | ValueType::Bool, DecodedConst::Bool(b)) => Some(ConstValue::Bool(b)),
             (ValueType::Float, DecodedConst::Float(bits)) => Some(ConstValue::Float(bits)),
             _ => None,
         }
@@ -2024,15 +2040,15 @@ impl<'a> Lowering<'a> {
         value: LinkArg,
         dest_ty: &TyRef,
     ) -> Result<(), LowerError> {
-        // Only an int `FieldWrite` carries an inline `LinkArg::Const`
-        // (`setfield_gc_i/rcd` short form). Every other write target —
-        // `*p = v`, `arr[i] = v` — reads a materialised register, so a
-        // constant must already have been forced to a Variable by the
-        // caller. `lower_assign` only mints a `LinkArg::Const` for the
-        // int-Field case, so this expect never trips in practice.
+        // A plain `*p = v` (`__deref_write` Call below) reads a
+        // materialised register: its Call args must be Variables, so a
+        // constant operand must already have been forced to a Variable.
+        // `field_write_inline_const` only mints a `LinkArg::Const` for the
+        // setfield / setarrayitem targets (Field, `[i]`, aliased Deref),
+        // never the plain-Deref Call, so this expect never trips.
         let value_var = |v: &LinkArg| {
             v.as_variable()
-                .expect("deref / array writes carry a materialised Variable value")
+                .expect("__deref_write carries a materialised Variable value")
                 .clone()
         };
         let inner_local = match &inner.kind {
@@ -2061,7 +2077,7 @@ impl<'a> Lowering<'a> {
                     OpKind::ArrayWrite {
                         base: arr,
                         index: idx,
-                        value: value_var(&value),
+                        value: value.clone(),
                         item_ty: tyref_to_value_type(dest_ty, self.llbc),
                         array_type_id: None,
                         nolength: false,
@@ -2126,7 +2142,7 @@ impl<'a> Lowering<'a> {
                     OpKind::ArrayWrite {
                         base,
                         index: idx_var,
-                        value: value_var(&value),
+                        value: value.clone(),
                         item_ty: ValueType::Int,
                         array_type_id: None,
                         nolength: false,
@@ -3689,7 +3705,7 @@ impl<'a> Lowering<'a> {
                         kind: OpKind::ArrayWrite {
                             base: base.clone(),
                             index: idx_a,
-                            value: elem_b,
+                            value: LinkArg::Value(elem_b),
                             item_ty: ValueType::Ref(None),
                             array_type_id: None,
                             nolength: false,
@@ -3700,7 +3716,7 @@ impl<'a> Lowering<'a> {
                         kind: OpKind::ArrayWrite {
                             base,
                             index: idx_b,
-                            value: elem_a,
+                            value: LinkArg::Value(elem_a),
                             item_ty: ValueType::Ref(None),
                             array_type_id: None,
                             nolength: false,

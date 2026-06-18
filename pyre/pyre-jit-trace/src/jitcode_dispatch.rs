@@ -2582,11 +2582,17 @@ fn setarrayitem_gc_via_heapcache(
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let array = read_ref_reg(code, op, 0, ctx)?;
     let index = read_int_reg(code, op, 1, ctx)?;
+    // Operand layout `<r><i><v>d`: r-reg(array) + i-reg(index) + v(value)
+    // + 2B descr-index.  For the `c`-coded short form
+    // (`setarrayitem_gc_i/ricd`) the value byte is an inline signed
+    // constant (`signedord`, `blackhole.py:123`) read as a `ConstInt`
+    // box instead of an `i`-register slot, mirroring `setfield_gc_i/rcd`.
     let value = match value_bank {
         'i' => read_int_reg(code, op, 2, ctx)?,
         'r' => read_ref_reg(code, op, 2, ctx)?,
         'f' => read_float_reg(code, op, 2, ctx)?,
-        _ => unreachable!("value_bank must be 'i', 'r' or 'f'"),
+        'c' => OpRef::ConstInt(code[op.pc + 3] as i8 as i64),
+        _ => unreachable!("value_bank must be 'i', 'r', 'f' or 'c'"),
     };
     let descr = read_descr(code, op, 3, ctx)?;
     let descr_index = descr.index();
@@ -11487,6 +11493,10 @@ fn handle(
             getarrayitem_gc_via_heapcache(code, op, ctx, OpCode::GetarrayitemGcPureF, 'f')
         }
         "setarrayitem_gc_i/riid" => setarrayitem_gc_via_heapcache(code, op, ctx, 'i'),
+        // const-VALUE `c`-argcode form (USE_C_FORM `assembler.py:339`):
+        // the store value is one inline signed byte → ConstInt, decoded
+        // inside the handler.  Mirror of `setfield_gc_i/rcd`.
+        "setarrayitem_gc_i/ricd" => setarrayitem_gc_via_heapcache(code, op, ctx, 'c'),
         "setarrayitem_gc_r/rird" => setarrayitem_gc_via_heapcache(code, op, ctx, 'r'),
         // `c`-argcode form (`assembler.py:99-107 emit_const(allow_short
         // =True)`, USE_C_FORM `assembler.py:312`): the index is one

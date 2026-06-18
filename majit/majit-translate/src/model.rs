@@ -542,7 +542,14 @@ pub enum OpKind {
     ArrayWrite {
         base: crate::flowspace::model::Variable,
         index: crate::flowspace::model::Variable,
-        value: crate::flowspace::model::Variable,
+        /// RPython `setarrayitem_gc(p, i, x, descr)` where `x` is an
+        /// `AbstractValue` — `op.args[2]` may be a `Variable` or a
+        /// `Constant` (jtransform.py:803).  `LinkArg::Value`/`Const`
+        /// mirrors that union so a small-int constant value can stay
+        /// inline (`setarrayitem_gc_i/ricd`) instead of being hoisted
+        /// into a `ConstInt -> register` materialisation, matching the
+        /// FieldWrite c-form activation.
+        value: LinkArg,
         item_ty: ValueType,
         /// RPython: ARRAY identity for `cpu.arraydescrof(ARRAY)`.
         array_type_id: Option<String>,

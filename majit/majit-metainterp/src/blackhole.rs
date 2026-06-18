@@ -5974,6 +5974,26 @@ fn handler_setarrayitem_gc_r_c(
     Ok(pos)
 }
 
+// `setarrayitem_gc_i/ricd` — `c`-argcode VALUE (`assembler.py:99-107
+// emit_const(allow_short=True)`, USE_C_FORM `assembler.py:339`): the
+// stored int is one inline signed byte (`blackhole.py:123` decodes `'c'`
+// as a signed char), not a `registers_i`/pool slot; the array ref, index
+// reg and descr keep the `riid` byte positions.  Mirror of
+// `handler_setfield_gc_i_c`.
+fn handler_setarrayitem_gc_i_c(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let array = bh.registers_r[code[position] as usize];
+    let index = bh.registers_i[code[position + 1] as usize];
+    let value = code[position + 2] as i8 as i64;
+    let (descr, pos) = read_descr(bh, code, position + 3);
+    let cpu = bh.cpu.expect("cpu not set");
+    cpu.bh_setarrayitem_gc_i(array, index, value, descr);
+    Ok(pos)
+}
+
 // ── getfield_raw (blackhole.py:1464-1472) ───────────────────────────
 fn handler_getfield_raw_i(
     bh: &mut BlackholeInterpreter,
@@ -7380,6 +7400,7 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     builder.wire_handler("getarrayitem_gc_i_pure/rid>i", handler_getarrayitem_gc_i);
     builder.wire_handler("getarrayitem_gc_r_pure/rid>r", handler_getarrayitem_gc_r);
     builder.wire_handler("setarrayitem_gc_i/riid", handler_setarrayitem_gc_i);
+    builder.wire_handler("setarrayitem_gc_i/ricd", handler_setarrayitem_gc_i_c);
     builder.wire_handler("setarrayitem_gc_r/rird", handler_setarrayitem_gc_r);
     builder.wire_handler("setarrayitem_gc_r/rcrd", handler_setarrayitem_gc_r_c);
 

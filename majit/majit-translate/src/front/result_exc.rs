@@ -546,8 +546,15 @@ fn op_operand_vars(kind: &OpKind) -> Vec<Variable> {
         }
         OpKind::ArrayWrite {
             base, index, value, ..
+        } => {
+            // An inline-const value references no Variable.
+            let mut refs = vec![base.clone(), index.clone()];
+            if let Some(v) = value.as_variable() {
+                refs.push(v.clone());
+            }
+            refs
         }
-        | OpKind::InteriorFieldWrite {
+        OpKind::InteriorFieldWrite {
             base, index, value, ..
         } => vec![base.clone(), index.clone(), value.clone()],
         OpKind::VableArrayRead {
