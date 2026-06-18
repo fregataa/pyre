@@ -2140,42 +2140,53 @@ fn os_error_errno_subclass(errno: i64) -> Option<&'static str> {
     let Ok(e) = i32::try_from(errno) else {
         return None;
     };
-    let name = if e == libc::EAGAIN
-        || e == libc::EALREADY
-        || e == libc::EINPROGRESS
-        || e == libc::EWOULDBLOCK
+    #[cfg(not(target_arch = "wasm32"))]
     {
-        "BlockingIOError"
-    } else if e == libc::EPIPE || errno_is_eshutdown(e) {
-        "BrokenPipeError"
-    } else if e == libc::ECHILD {
-        "ChildProcessError"
-    } else if e == libc::ECONNABORTED {
-        "ConnectionAbortedError"
-    } else if e == libc::ECONNREFUSED {
-        "ConnectionRefusedError"
-    } else if e == libc::ECONNRESET {
-        "ConnectionResetError"
-    } else if e == libc::EEXIST {
-        "FileExistsError"
-    } else if e == libc::ENOENT {
-        "FileNotFoundError"
-    } else if e == libc::EISDIR {
-        "IsADirectoryError"
-    } else if e == libc::ENOTDIR {
-        "NotADirectoryError"
-    } else if e == libc::EINTR {
-        "InterruptedError"
-    } else if e == libc::EACCES || e == libc::EPERM {
-        "PermissionError"
-    } else if e == libc::ESRCH {
-        "ProcessLookupError"
-    } else if e == libc::ETIMEDOUT {
-        "TimeoutError"
-    } else {
-        return None;
-    };
-    Some(name)
+        let name = if e == libc::EAGAIN
+            || e == libc::EALREADY
+            || e == libc::EINPROGRESS
+            || e == libc::EWOULDBLOCK
+        {
+            "BlockingIOError"
+        } else if e == libc::EPIPE || errno_is_eshutdown(e) {
+            "BrokenPipeError"
+        } else if e == libc::ECHILD {
+            "ChildProcessError"
+        } else if e == libc::ECONNABORTED {
+            "ConnectionAbortedError"
+        } else if e == libc::ECONNREFUSED {
+            "ConnectionRefusedError"
+        } else if e == libc::ECONNRESET {
+            "ConnectionResetError"
+        } else if e == libc::EEXIST {
+            "FileExistsError"
+        } else if e == libc::ENOENT {
+            "FileNotFoundError"
+        } else if e == libc::EISDIR {
+            "IsADirectoryError"
+        } else if e == libc::ENOTDIR {
+            "NotADirectoryError"
+        } else if e == libc::EINTR {
+            "InterruptedError"
+        } else if e == libc::EACCES || e == libc::EPERM {
+            "PermissionError"
+        } else if e == libc::ESRCH {
+            "ProcessLookupError"
+        } else if e == libc::ETIMEDOUT {
+            "TimeoutError"
+        } else {
+            return None;
+        };
+        Some(name)
+    }
+    // wasm32-unknown-unknown's libc lacks the errno constants; the errno →
+    // OSError-subclass remap is a POSIX-host concern unavailable there, so no
+    // subclass is selected (consistent with the disabled POSIX modules).
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = e;
+        None
+    }
 }
 
 /// `_parse_init_args` yields an errno only for a 2..=5 argument call whose
@@ -6221,7 +6232,7 @@ pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     let reading = mode.contains('r') || !writing;
 
     let data: String = if reading && !mode.contains('w') && !mode.contains('x') {
-        #[cfg(not(feature = "host_env"))]
+        #[cfg(any(not(feature = "host_env"), target_arch = "wasm32"))]
         {
             // Sandbox-intentional: with the host_env feature off the
             // interpreter must not reach `std::fs` directly.  Callers in
@@ -6233,9 +6244,9 @@ pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
                 "open() for reading requires host_env feature",
             ));
         }
-        #[cfg(feature = "host_env")]
+        #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
         let read_result = rustpython_host_env::fs::read(&path);
-        #[cfg(feature = "host_env")]
+        #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
         match read_result {
             Ok(bytes) => {
                 if binary {
