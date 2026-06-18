@@ -2770,8 +2770,7 @@ fn bh_size_spec_from_callcontrol(
         return None;
     }
     let size = cc
-        .struct_layouts
-        .get(owner)
+        .struct_layout_for(owner)
         .map(|layout| layout.size)
         .or_else(|| heuristic_struct_size_for_bh(cc, owner))?;
     Some(crate::jitcode::BhSizeSpec {
@@ -2820,7 +2819,7 @@ fn bh_all_field_specs_for_struct_into(
     owner: &str,
     specs: &mut Vec<crate::jitcode::BhFieldSpec>,
 ) {
-    if let Some(layout) = cc.struct_layouts.get(owner) {
+    if let Some(layout) = cc.struct_layout_for(owner) {
         // The textual entries registry carries the inner-struct type name
         // for nested fields; match by field name to recover the owner
         // string when recursing.  Cloned out of `cc` so the immutable
@@ -2874,8 +2873,7 @@ fn bh_all_field_specs_for_struct_into(
             (
                 majit_ir::descr::ArrayFlag::Struct,
                 majit_ir::value::Type::Ref,
-                cc.struct_layouts
-                    .get(field_type_str.as_str())
+                cc.struct_layout_for(field_type_str)
                     .map(|layout| layout.size)
                     .unwrap_or(std::mem::size_of::<usize>()),
             )
@@ -2921,8 +2919,7 @@ fn heuristic_struct_size_for_bh(cc: &CallControl, owner: &str) -> Option<usize> 
     let mut max_align = 0usize;
     for (_, field_type_str) in fields {
         let field_size = if cc.is_known_struct(field_type_str) {
-            cc.struct_layouts
-                .get(field_type_str.as_str())
+            cc.struct_layout_for(field_type_str)
                 .map(|layout| layout.size)
                 .unwrap_or(std::mem::size_of::<usize>())
         } else {
@@ -2978,8 +2975,7 @@ fn fielddescrof(
             }
         }
         if let Some(layout_field) = cc
-            .struct_layouts
-            .get(owner)
+            .struct_layout_for(owner)
             .and_then(|layout| layout.fields.iter().find(|fl| fl.name == field.name))
         {
             offset = layout_field.offset;
@@ -3043,8 +3039,7 @@ fn heuristic_field_layout(
             (
                 majit_ir::descr::ArrayFlag::Struct,
                 majit_ir::value::Type::Ref,
-                cc.struct_layouts
-                    .get(type_str)
+                cc.struct_layout_for(type_str)
                     .map(|layout| layout.size)
                     .unwrap_or(std::mem::size_of::<usize>()),
             )

@@ -801,7 +801,7 @@ pub struct CallControl {
     /// When registered, provides exact (offset, size) for struct fields,
     /// bypassing the type-string heuristic. The runtime/proc-macro populates
     /// this via `set_struct_layout()`.
-    pub struct_layouts: HashMap<String, StructLayout>,
+    pub struct_layouts: HashMap<majit_ir::descr::StructId, StructLayout>,
     /// RPython: `_immutable_fields_` per class. Maps struct_name →
     /// `(field_name, rank)` pairs declared immutable / quasi-immutable.
     /// Consulted by the heuristic fallback in `all_interiorfielddescrs`
@@ -851,7 +851,8 @@ pub struct CallControl {
 /// `get_size`) when they reach constant emission.
 impl crate::translator::rtyper::lltypesystem::llmemory::OffsetLayout for CallControl {
     fn field_offset(&self, struct_name: &str, fldname: &str) -> Option<i64> {
-        let layout = self.struct_layouts.get(struct_name)?;
+        let sid = majit_ir::descr::struct_id_for_name(struct_name)?;
+        let layout = self.struct_layouts.get(&sid)?;
         layout
             .fields
             .iter()
@@ -860,7 +861,8 @@ impl crate::translator::rtyper::lltypesystem::llmemory::OffsetLayout for CallCon
     }
 
     fn struct_size(&self, struct_name: &str) -> Option<i64> {
-        self.struct_layouts.get(struct_name).map(|l| l.size as i64)
+        let sid = majit_ir::descr::struct_id_for_name(struct_name)?;
+        self.struct_layouts.get(&sid).map(|l| l.size as i64)
     }
 }
 
@@ -955,21 +957,8 @@ impl StructLayout {
                 }
                 continue;
             }
-            let (flag, field_type, field_size) = if known_structs.contains(type_str.as_str()) {
-                // RPython: symbolic.get_field_token(STRUCT, fieldname) returns the
-                // actual embedded struct size, not just a pointer size.
-                let nested_size = known_struct_sizes
-                    .get(type_str.as_str())
-                    .copied()
-                    .unwrap_or(std::mem::size_of::<usize>());
-                (
-                    majit_ir::descr::ArrayFlag::Struct,
-                    majit_ir::value::Type::Ref,
-                    nested_size,
-                )
-            } else {
-                get_type_flag(type_str)
-            };
+            let (flag, field_type, field_size) =
+                field_metadata(type_str, known_structs, known_struct_sizes);
             if field_type == majit_ir::value::Type::Void || field_size == 0 {
                 continue;
             }
@@ -1019,6 +1008,81 @@ impl StructLayout {
         StructLayout {
             size,
             fields: layout_fields,
+        }
+    }
+
+    /// Correct a heuristic layout with exact rtyper-resolved per-field byte
+    /// offsets and total size.
+    ///
+    /// `symbolic.get_field_token` returns exact offsets in RPython (backed by
+    /// the C compiler); the heuristic only approximates `#[repr(C)]`, and
+    /// `#[repr(Rust)]` reorders/repacks fields, so the approximation can
+    /// disagree with the real allocation. Each present field's offset is
+    /// overwritten from `exact_offsets`. Fields the heuristic dropped (it
+    /// clears the field list when a nested struct makes interior offsets
+    /// unknown — but here every offset is known exactly) are re-synthesised
+    /// from `rows` at their exact offsets, so every field resolves through
+    /// `fielddescrof`'s struct-layout lookup rather than a tag-unaware
+    /// recompute. Per-field type/size/immutability classification stays as
+    /// computed from the type strings.
+    ///
+    /// `heaptracker.py:51 all_fielddescrs`: this re-synthesis keeps each
+    /// `rows` entry as one leaf — the offset-by-name layout consumed by
+    /// `fielddescrof`.  That is sufficient because an inner-field access
+    /// resolves on the inner struct directly (owner = the inner type), so
+    /// the offset lookup never asks for an `{outer}.{inner}` name here; the
+    /// by-value nested struct field's contribution to a sibling field's
+    /// **index** is recovered by the `get_fielddescr_index_in` recursion in
+    /// the `fielddescrof_concrete` walk ([`Self::recursive_field_count`]).
+    /// The header-embedding convention (`ob_header` / `base`) is flattened
+    /// upstream by the subclass chain in `intern_class_by_qualname` (the
+    /// embedded base's fields live on the base class, not in these `rows`).
+    pub fn apply_exact_layout(
+        &mut self,
+        rows: &[(String, String)],
+        exact_offsets: &std::collections::HashMap<String, u64>,
+        exact_size: Option<u64>,
+        known_structs: &std::collections::HashSet<String>,
+        known_struct_sizes: &std::collections::HashMap<String, usize>,
+        immutable_field_ranks: &std::collections::HashMap<String, crate::model::ImmutableRank>,
+    ) {
+        for fl in &mut self.fields {
+            if let Some(&offset) = exact_offsets.get(&fl.name) {
+                fl.offset = offset as usize;
+            }
+        }
+        let present: std::collections::HashSet<&str> =
+            self.fields.iter().map(|f| f.name.as_str()).collect();
+        let mut synthesised = Vec::new();
+        for (name, type_str) in rows {
+            if present.contains(name.as_str()) {
+                continue;
+            }
+            // heaptracker.py:62-67: typeptr/padding are not enumerated.
+            if name == "typeptr" || name.starts_with("c__pad") {
+                continue;
+            }
+            let Some(&offset) = exact_offsets.get(name) else {
+                continue;
+            };
+            let (flag, field_type, field_size) =
+                field_metadata(type_str, known_structs, known_struct_sizes);
+            if field_type == majit_ir::value::Type::Void || field_size == 0 {
+                continue;
+            }
+            let rank = immutable_field_ranks.get(name).copied();
+            synthesised.push(StructFieldLayout {
+                name: name.clone(),
+                offset: offset as usize,
+                size: field_size,
+                flag,
+                field_type,
+                rank,
+            });
+        }
+        self.fields.extend(synthesised);
+        if let Some(size) = exact_size {
+            self.size = size as usize;
         }
     }
 }
@@ -1254,8 +1318,22 @@ impl CallControl {
 
     /// RPython: register actual struct layout from `symbolic.get_field_token()`.
     /// The runtime calls this with layouts from `std::mem::offset_of!()` etc.
-    pub fn set_struct_layout(&mut self, struct_name: String, layout: StructLayout) {
-        self.struct_layouts.insert(struct_name, layout);
+    pub fn set_struct_layout(
+        &mut self,
+        struct_id: majit_ir::descr::StructId,
+        layout: StructLayout,
+    ) {
+        self.struct_layouts.insert(struct_id, layout);
+    }
+
+    /// Resolve a registered [`StructLayout`] by a struct / enum-variant
+    /// name in any spelling, through the name → StructId resolver.
+    /// `None` for an unknown or cross-module-ambiguous name — the layout
+    /// channel is keyed by object identity, so a name that does not
+    /// resolve to one identity has no layout.
+    pub fn struct_layout_for(&self, name: &str) -> Option<&StructLayout> {
+        let sid = majit_ir::descr::struct_id_for_name(name)?;
+        self.struct_layouts.get(&sid)
     }
 
     /// RPython: resolve a struct field's type string.
@@ -1565,9 +1643,40 @@ impl CallControl {
         &self,
         idx: u32,
         owner_root: &str,
+        owner_id: Option<majit_ir::descr::StructId>,
         field_name: &str,
     ) -> Option<majit_ir::descr::DescrRef> {
-        self.fielddescrof_concrete(idx, owner_root, field_name)
+        self.fielddescrof_concrete(idx, owner_root, owner_id, field_name)
+    }
+
+    /// Number of leaf fielddescr slots a struct contributes to its parent
+    /// — `heaptracker.py:97-113 get_fielddescr_index_in`'s `-r - 1`
+    /// advancement.  Skips `Void` and `typeptr` and RECURSES into a
+    /// by-value nested struct field (`isinstance(FIELD, lltype.Struct)`),
+    /// so an embedded struct contributes its inner leaves' count, not one
+    /// slot.  A pointer-to-struct field has a non-struct type string
+    /// (`*const X` / `&X` / `Box<X>`), so `is_known_struct` returns false
+    /// and it counts as the single pointer slot it is.
+    fn recursive_field_count(&self, struct_name: &str) -> usize {
+        let Some(fields) = self.struct_fields.fields.get(struct_name) else {
+            return 1;
+        };
+        let mut count = 0;
+        for (fname, fty) in fields {
+            let (_flag, ir_type, _size) = get_type_flag(fty);
+            if matches!(ir_type, majit_ir::value::Type::Void) {
+                continue;
+            }
+            if fname == "typeptr" {
+                continue;
+            }
+            if self.is_known_struct(fty) {
+                count += self.recursive_field_count(fty);
+            } else {
+                count += 1;
+            }
+        }
+        count
     }
 
     /// Trait-object sibling of [`Self::fielddescrof`] returning the
@@ -1601,6 +1710,7 @@ impl CallControl {
         &self,
         idx: u32,
         owner_root: &str,
+        owner_id: Option<majit_ir::descr::StructId>,
         field_name: &str,
     ) -> Option<majit_ir::descr::DescrRef> {
         use majit_ir::descr::{LLType, path_hash};
@@ -1623,6 +1733,20 @@ impl CallControl {
             let (flag, ir_type, field_size) = get_type_flag(fty);
             if fname == "typeptr" {
                 // heaptracker.py:102-103: `if name == 'typeptr': continue`
+                continue;
+            }
+            // heaptracker.py:108-110: a by-value nested struct field is not
+            // itself a leaf descr — `get_fielddescr_index_in` recurses into
+            // it, so it contributes its inner leaves' positions (and bytes),
+            // never matching as this `field_name` (an inner-field access
+            // resolves on the inner struct directly).  Checked before the
+            // name match to mirror the upstream `elif isinstance(FIELD,
+            // lltype.Struct)` ordering.  A pointer-to-struct field has a
+            // `*`/`&`/`Box<…>` type string, so `is_known_struct` is false
+            // and it stays a single pointer leaf.
+            if self.is_known_struct(fty) {
+                field_pos += self.recursive_field_count(fty);
+                offset = offset.saturating_add(compute_struct_size(self, fty));
                 continue;
             }
             if fname == field_name {
@@ -1670,8 +1794,18 @@ impl CallControl {
                 // 가 런타임 reader 와 단일 슬롯에서 만난다.
                 // `interiorfielddescrof`/`all_interiorfielddescrs` 와 동일
                 // 패턴 (`call.rs:1492` + `:5067`).
-                let canonical_owner = majit_ir::descr::canonical_struct_name(owner_root);
-                let struct_key = LLType::Struct(path_hash(&canonical_owner));
+                // Prefer the source-attached identity token (collision-free
+                // even when `owner_root` is a bare leaf two modules share);
+                // fall back to canonicalising the name when the descriptor
+                // carries no token (synthetic / positional construction).
+                // Both spellings hash to the same `u64` for a non-colliding
+                // type, so this keeps the runtime-publish convergence.
+                let struct_key = match owner_id {
+                    Some(sid) => LLType::Struct(sid.as_u64()),
+                    None => LLType::Struct(path_hash(&majit_ir::descr::canonical_struct_name(
+                        owner_root,
+                    ))),
+                };
                 // `descr.py:234-238 get_field_descr` always calls
                 // `get_size_descr(gccache, STRUCT, vtable)` to bind
                 // `fielddescr.parent_descr` before returning. Pyre's
@@ -1719,13 +1853,28 @@ impl CallControl {
                 // if the runtime published the parent but not this
                 // field, or a SimpleSizeDescr from line above).
                 // `descr.py:229 STRUCT._immutable_field(fieldname)` parity.
+                //
+                // `symbolic.get_field_token` (`symbolic.py:7`) returns the
+                // exact offset; prefer `struct_layouts` (rtyper-resolved /
+                // Charon-exact via `apply_exact_layout`) over the heuristic
+                // `offset` accumulation, which only approximates `#[repr(C)]`
+                // and diverges under `#[repr(Rust)]` reordering — the
+                // divergence that matters for enum variant payloads keyed
+                // by `{enum_leaf}::{variant}`.  Falls back to the
+                // accumulator only for a struct absent from `struct_layouts`.
+                let field_offset = owner_id
+                    .or_else(|| majit_ir::descr::struct_id_for_name(owner_root))
+                    .and_then(|sid| self.struct_layouts.get(&sid))
+                    .and_then(|l| l.fields.iter().find(|f| f.name.as_str() == field_name))
+                    .map(|f| f.offset)
+                    .unwrap_or(offset);
                 let rank = self.field_immutability(Some(owner_root), field_name);
                 let is_immutable = rank.map(|r| r.is_immutable()).unwrap_or(false);
                 let is_quasi_immutable = rank.map(|r| r.is_quasi_immutable()).unwrap_or(false);
                 let descr = majit_ir::descr::gc_cache().lock().unwrap().get_field_descr(
                     struct_key,
                     field_name,
-                    offset,
+                    field_offset,
                     field_size,
                     ir_type,
                     is_immutable,
@@ -1798,6 +1947,16 @@ impl CallControl {
         for (fname, fty) in fields {
             let (flag, ir_type, field_size) = get_type_flag(fty);
             if fname == "typeptr" {
+                continue;
+            }
+            // heaptracker.py:108-110: recurse past a by-value nested struct
+            // field so the inner FieldDescr's index matches
+            // `get_fielddescr_index_in`.  Mirrors the `fielddescrof_concrete`
+            // walk; the corpus's array-element structs carry no by-value
+            // nested struct field, so this never fires there.
+            if self.is_known_struct(fty) {
+                field_pos += self.recursive_field_count(fty);
+                offset = offset.saturating_add(compute_struct_size(self, fty));
                 continue;
             }
             if fname == field_name {
@@ -3967,6 +4126,15 @@ impl CallControl {
         &self.function_graphs
     }
 
+    /// The portal-rooted candidate closure (`find_all_graphs_bfs` result).
+    /// Used by the two-phase rtyper driver to annotate-all over exactly the
+    /// set the drain visits — the upstream `task_annotate` entry-point
+    /// closure analogue — rather than the whole defined `function_graphs`
+    /// corpus.
+    pub(crate) fn candidate_graphs(&self) -> &HashSet<CallPath> {
+        &self.candidate_graphs
+    }
+
     /// Returns true when a concrete helper address was registered for this
     /// path. Such a path is a real callable surface and must not be treated
     /// as a transparent Rust enum constructor by jtransform.
@@ -5796,7 +5964,9 @@ fn collect_readwrite_effects(
                     // `consider_struct=False` filter at effectinfo.py:380).
                     if let Some(owner) = field.owner_root.as_deref() {
                         if !field_read_descrs.iter().any(|d| d.index() == idx) {
-                            if let Some(descr) = cc.fielddescrof(idx, owner, &field.name) {
+                            if let Some(descr) =
+                                cc.fielddescrof(idx, owner, field.owner_id, &field.name)
+                            {
                                 field_read_descrs.push(descr);
                             }
                         }
@@ -5810,7 +5980,9 @@ fn collect_readwrite_effects(
                     // implicit `add_struct` walk, just into `write_descrs_fields`.
                     if let Some(owner) = field.owner_root.as_deref() {
                         if !field_write_descrs.iter().any(|d| d.index() == idx) {
-                            if let Some(descr) = cc.fielddescrof(idx, owner, &field.name) {
+                            if let Some(descr) =
+                                cc.fielddescrof(idx, owner, field.owner_id, &field.name)
+                            {
                                 field_write_descrs.push(descr);
                             }
                         }
@@ -6180,7 +6352,7 @@ fn all_interiorfielddescrs(
     // Path 1 carries `layout.size` directly; Path 2 derives from
     // accumulated offsets after the heuristic walk.
     // Path 1: actual layout from runtime (RPython: symbolic.get_field_token)
-    if let Some(layout) = cc.struct_layouts.get(struct_name) {
+    if let Some(layout) = cc.struct_layout_for(struct_name) {
         let size_descr_arc = {
             let mut gc = majit_ir::descr::gc_cache().lock().unwrap();
             // descr.py:108-118: vtable=0 here — pyre struct-array
@@ -6417,7 +6589,7 @@ fn all_interiorfielddescrs(
 /// 2. Type-string heuristic fallback
 fn compute_struct_size(cc: &CallControl, struct_name: &str) -> usize {
     // Path 1: actual layout from runtime (RPython: symbolic.get_size(STRUCT))
-    if let Some(layout) = cc.struct_layouts.get(struct_name) {
+    if let Some(layout) = cc.struct_layout_for(struct_name) {
         return layout.size;
     }
     // Path 2: heuristic fallback — RPython: symbolic always computes the full
@@ -6431,8 +6603,7 @@ fn compute_struct_size(cc: &CallControl, struct_name: &str) -> usize {
     for (_, field_type_str) in fields.iter() {
         let field_size = if cc.is_known_struct(field_type_str) {
             // RPython: symbolic.get_field_token() uses actual nested struct size.
-            cc.struct_layouts
-                .get(field_type_str.as_str())
+            cc.struct_layout_for(field_type_str)
                 .map(|l| l.size)
                 .unwrap_or(std::mem::size_of::<usize>())
         } else {
@@ -6450,8 +6621,7 @@ fn compute_struct_size(cc: &CallControl, struct_name: &str) -> usize {
         .iter()
         .map(|(_, ty)| {
             if cc.is_known_struct(ty) {
-                cc.struct_layouts
-                    .get(ty.as_str())
+                cc.struct_layout_for(ty)
                     .map(|l| l.size)
                     .unwrap_or(std::mem::size_of::<usize>())
                     .min(std::mem::size_of::<usize>())
@@ -6476,6 +6646,31 @@ fn compute_struct_size(cc: &CallControl, struct_name: &str) -> usize {
 /// - Ptr(gc) → FLAG_POINTER; Ptr(non-gc) → FLAG_UNSIGNED
 /// - Struct → FLAG_STRUCT; Float → FLAG_FLOAT
 /// - Bool/unsigned → FLAG_UNSIGNED; signed int → FLAG_SIGNED
+/// Per-field `(flag, field_type, size)` classification from a type string.
+///
+/// A field whose type is itself a known struct is an embedded struct
+/// (`symbolic.get_field_token` returns the embedded struct size, not a
+/// pointer size); everything else is classified by `get_type_flag`.
+fn field_metadata(
+    type_str: &str,
+    known_structs: &std::collections::HashSet<String>,
+    known_struct_sizes: &std::collections::HashMap<String, usize>,
+) -> (majit_ir::descr::ArrayFlag, majit_ir::value::Type, usize) {
+    if known_structs.contains(type_str) {
+        let nested_size = known_struct_sizes
+            .get(type_str)
+            .copied()
+            .unwrap_or(std::mem::size_of::<usize>());
+        (
+            majit_ir::descr::ArrayFlag::Struct,
+            majit_ir::value::Type::Ref,
+            nested_size,
+        )
+    } else {
+        get_type_flag(type_str)
+    }
+}
+
 fn get_type_flag(type_str: &str) -> (majit_ir::descr::ArrayFlag, majit_ir::value::Type, usize) {
     use majit_ir::descr::ArrayFlag;
     match type_str {
@@ -8897,5 +9092,39 @@ mod tests {
         let got = descriptor.extra_info.extradescrs.as_ref().unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].index(), 90);
+    }
+
+    /// finding 3b: a by-value nested struct field contributes its inner
+    /// leaves' fielddescr slots (`heaptracker.py:108-110
+    /// get_fielddescr_index_in` recursion), not one container slot, so a
+    /// field after it gets the right `field_pos`.  A pointer-to-struct
+    /// field stays a single leaf.
+    #[test]
+    fn recursive_field_count_flattens_by_value_nested_struct() {
+        let mut cc = CallControl::new();
+        cc.struct_fields.fields.insert(
+            "Inner".to_string(),
+            vec![
+                ("x".to_string(), "i64".to_string()),
+                ("y".to_string(), "i64".to_string()),
+            ],
+        );
+        // Outer embeds Inner by value between two scalars, plus a
+        // pointer-to-Inner that must NOT recurse.
+        cc.struct_fields.fields.insert(
+            "Outer".to_string(),
+            vec![
+                ("a".to_string(), "i64".to_string()),
+                ("inner".to_string(), "Inner".to_string()),
+                ("p".to_string(), "&Inner".to_string()),
+                ("b".to_string(), "i64".to_string()),
+            ],
+        );
+        cc.set_known_struct_names(["Inner".to_string()].into_iter().collect());
+
+        // Inner contributes its two leaves.
+        assert_eq!(cc.recursive_field_count("Inner"), 2);
+        // Outer: a(1) + inner→{x,y}(2) + `&Inner` pointer(1) + b(1) = 5.
+        assert_eq!(cc.recursive_field_count("Outer"), 5);
     }
 }

@@ -1635,7 +1635,7 @@ impl Bookkeeper {
     }
 
     /// Resolve the subclass `ClassDef` for one variant of a Rust enum —
-    /// a subclass of the enum's flat-union base. Composes the canonical
+    /// a subclass of the enum's discriminant-only base. Composes the canonical
     /// interning primitives rather than minting a parallel enum-class
     /// registry: the base is the struct-root `ClassDef`
     /// ([`Self::getuniqueclassdef_for_struct_root`]); the variant is
@@ -1654,17 +1654,61 @@ impl Bookkeeper {
         enum_root: &str,
         variant_name: &str,
     ) -> Result<Rc<RefCell<ClassDef>>, AnnotatorError> {
-        // Base first — registers the flat-union root and publishes its
-        // identity-keyed HostObject in the struct-root cache.
+        // Base first — registers the discriminant-only root and publishes
+        // its identity-keyed HostObject in the struct-root cache.
         self.getuniqueclassdef_for_struct_root(enum_root)?;
+        // Variant subclass — interned WITH the base so ClassDesc::new
+        // wires basedef. The SAME interning primitive the variant
+        // CONSTRUCTOR path uses ([`Self::intern_enum_variant_host`]), so
+        // both sides resolve one class object. Must precede any plain
+        // intern of this path (intern_*_with_bases returns the
+        // first-minted class verbatim).
+        let variant_host = self.intern_enum_variant_host(enum_root, variant_name);
+        // Project the variant's OWN payload rows onto the subclass —
+        // the RPython sum-type layout where each subclass carries its
+        // own fields (`rclass.py:82-88`), the base only the discriminant.
+        // A getattr on a narrowed `SomeInstance(variant)` then resolves
+        // the payload on the variant via the MRO (variant → base), with
+        // the variant's own field type.  The rows are registered under
+        // the canonical variant key in `front::mir`.
+        let canon_root = majit_ir::descr::canonical_struct_name(enum_root);
+        let variant_path = format!("{canon_root}::{variant_name}");
+        self.project_struct_rows(&variant_path)?;
+        self.getuniqueclassdef(&variant_host)
+    }
+
+    /// Intern (first-mint-wins) and return the canonical variant-subclass
+    /// `HostObject` for `{enum_root}::{variant_name}`, wiring the enum's
+    /// discriminant-only base as its sole `__bases__` (`rclass.py:82-88`).
+    ///
+    /// Both the discriminant-narrowing path
+    /// ([`Self::getuniqueclassdef_for_enum_variant`]) and the variant
+    /// CONSTRUCTOR path (`flowspace_adapter`'s `SyntheticTransparentCtor`
+    /// arm) intern through here, so a constructed `Some(x)` and a matched
+    /// `Some(x)` resolve to ONE class object — the single-class-per-variant
+    /// identity RPython gets from one Python class object
+    /// (`bookkeeper.py:339` keys `getuniqueclassdef` by the class object,
+    /// not a name string).  Splitting them into sibling classdefs would
+    /// union to the base (losing the payload narrowing) and disagree on
+    /// the payload attr/field owner.
+    ///
+    /// The cache key is `canonical_struct_name(enum_root)::variant_name`.
+    /// A leaf `enum_root` (`"Color"`, the ctor side, which carries the
+    /// enum leaf as its owner tail) and a canonical `enum_root`
+    /// (`"module::Color"`, the narrowing side, which reads the base
+    /// classdef's canonical name) normalise to the same key because
+    /// `canonical_struct_name` resolves the leaf through
+    /// `STRUCT_ORIGIN_REGISTRY` — the same normalisation the base itself
+    /// went through.
+    pub fn intern_enum_variant_host(
+        self: &Rc<Self>,
+        enum_root: &str,
+        variant_name: &str,
+    ) -> HostObject {
         let canon_root = majit_ir::descr::canonical_struct_name(enum_root);
         let base_host = self.intern_class_by_qualname(&canon_root);
-        // Variant subclass — interned WITH the base so ClassDesc::new
-        // wires basedef. Must precede any plain intern of this path
-        // (intern_*_with_bases returns the first-minted class verbatim).
         let variant_path = format!("{canon_root}::{variant_name}");
-        let variant_host = self.intern_class_by_qualname_with_bases(&variant_path, vec![base_host]);
-        self.getuniqueclassdef(&variant_host)
+        self.intern_class_by_qualname_with_bases(&variant_path, vec![base_host])
     }
 
     /// Build the discriminant→variant narrowing `knowntypedata` for a
@@ -1834,6 +1878,21 @@ impl Bookkeeper {
             seen.insert(cur.rsplit("::").next().unwrap_or(&cur).to_string());
             chain.push(cur.clone());
             let next = self.pyre_struct_fields.borrow().as_ref().and_then(|reg| {
+                // An enum-variant key `{enum_base}::{variant}` subclasses its
+                // enum base — the discriminant-only sum-type root
+                // (`rclass.py:82-88`).  Checked before the header convention
+                // because a variant's first field is its payload, not a
+                // header: without this the session prologue
+                // (`PyreCallRegistry::ensure_session`), which pre-mints every
+                // `struct_fields` key including the variant keys, would mint
+                // the variant base-less, and first-mint-wins would freeze
+                // that, dropping the subclass link the narrowing relies on.
+                if let Some((parent, _variant)) = cur.rsplit_once("::") {
+                    let parent_leaf = parent.rsplit("::").next().unwrap_or(parent);
+                    if reg.is_enum_base(parent) && !seen.contains(parent_leaf) {
+                        return Some(parent.to_string());
+                    }
+                }
                 let (first_name, first_ty) = reg.fields.get(&cur)?.first()?;
                 // Only header-conventional first fields mark subclassing
                 // (`ob_header: PyObject` / `base: FrameBlock`).  A
@@ -3570,18 +3629,19 @@ mod tests {
     }
 
     #[test]
-    fn getuniqueclassdef_for_enum_variant_subclasses_the_flat_union_base() {
+    fn getuniqueclassdef_for_enum_variant_subclasses_the_base() {
         use crate::annotator::model::{SomeInstance, SomeValue};
         use crate::front::StructFieldRegistry;
         let bk = bk();
         let mut reg = StructFieldRegistry::default();
-        // Flat-union base: __discriminant + the union of variant payloads.
+        // Discriminant-only base; the variant carries its own payload.
         reg.fields.insert(
             "Color".to_string(),
-            vec![
-                ("__discriminant".to_string(), "i64".to_string()),
-                ("rgb".to_string(), "i64".to_string()),
-            ],
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        reg.fields.insert(
+            "Color::Rgb".to_string(),
+            vec![("rgb".to_string(), "i64".to_string())],
         );
         bk.set_pyre_struct_fields(Rc::new(reg));
 
@@ -3596,7 +3656,7 @@ mod tests {
         // reaches the base, so commonbase(base, variant) == base.
         assert!(
             variant.borrow().issubclass(&base),
-            "variant ClassDef must be a subclass of the flat-union base"
+            "variant ClassDef must be a subclass of the base"
         );
         let common = crate::annotator::classdesc::ClassDef::commonbase(&base, &variant)
             .expect("commonbase exists");
@@ -3634,6 +3694,146 @@ mod tests {
             ),
             other => panic!("expected SomeInstance(variant), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn enum_variant_subclasses_base_even_when_struct_root_preregistered_first() {
+        // The session prologue (`PyreCallRegistry::ensure_session`) pre-mints
+        // EVERY `struct_fields` key through `getuniqueclassdef_for_struct_root`
+        // — including the variant keys — BEFORE any narrowing's
+        // `getuniqueclassdef_for_enum_variant` runs.  Since
+        // `intern_class_by_qualname` is first-mint-wins, the variant must
+        // acquire its enum base on that first mint, not lose it.
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "Color".to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        reg.fields.insert(
+            "Color::Rgb".to_string(),
+            vec![("rgb".to_string(), "i64".to_string())],
+        );
+        bk.set_pyre_struct_fields(Rc::new(reg));
+
+        // Prologue order: pre-register every struct root, variant keys first.
+        for root in bk.pyre_struct_root_names() {
+            let _ = bk.getuniqueclassdef_for_struct_root(&root);
+        }
+        let base = bk
+            .getuniqueclassdef_for_struct_root("Color")
+            .expect("base registers");
+        let variant = bk
+            .getuniqueclassdef_for_enum_variant("Color", "Rgb")
+            .expect("variant registers");
+        assert!(
+            variant.borrow().issubclass(&base),
+            "variant must subclass the base even when pre-registered as a struct root first"
+        );
+    }
+
+    #[test]
+    fn enum_variant_ctor_helper_and_narrowing_resolve_one_classdef_with_payload_attr() {
+        // The variant CONSTRUCTOR path (`flowspace_adapter`, via
+        // `intern_enum_variant_host`) and the discriminant-NARROWING path
+        // (`getuniqueclassdef_for_enum_variant`) must resolve the SAME
+        // class object — RPython's single-class-per-variant identity
+        // (`rclass.py:82-88`) — and it must carry the variant's payload
+        // attr.  Before the unification the ctor minted a dotted-qualname
+        // sibling classdef with no payload attrs.
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        // Canonical `module::Enum` + `module::Enum::Variant` spellings —
+        // already `::`-qualified, so `canonical_struct_name` passes them
+        // through and the test never touches the process-global
+        // `STRUCT_ORIGIN_REGISTRY`.
+        reg.fields.insert(
+            "shapes::Color".to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        reg.fields.insert(
+            "shapes::Color::Rgb".to_string(),
+            vec![("rgb".to_string(), "i64".to_string())],
+        );
+        bk.set_pyre_struct_fields(Rc::new(reg));
+
+        // Constructor side: the adapter interns through this helper.
+        let ctor_host = bk.intern_enum_variant_host("shapes::Color", "Rgb");
+        let ctor_classdef = bk
+            .getuniqueclassdef(&ctor_host)
+            .expect("ctor variant classdef");
+        // Narrowing side: the public API the discriminant read uses.
+        let narrow_classdef = bk
+            .getuniqueclassdef_for_enum_variant("shapes::Color", "Rgb")
+            .expect("narrowing variant classdef");
+
+        assert!(
+            Rc::ptr_eq(&ctor_classdef, &narrow_classdef),
+            "constructor and narrowing must resolve ONE variant class object"
+        );
+        assert!(
+            narrow_classdef.borrow().attrs.contains_key("rgb"),
+            "the unified variant class must carry its payload attr"
+        );
+        // And it subclasses the discriminant-only base.
+        let base = bk
+            .getuniqueclassdef_for_struct_root("shapes::Color")
+            .expect("base registers");
+        assert!(
+            narrow_classdef.borrow().issubclass(&base),
+            "variant subclasses the enum base"
+        );
+    }
+
+    #[test]
+    fn enum_variant_ctor_bare_leaf_canonicalises_to_one_classdef_with_narrowing() {
+        // The production ctor side carries the enum's *bare leaf* as its
+        // owner tail (`flowspace_adapter`), while the narrowing side reads
+        // the base classdef's *canonical* `module::Enum` name
+        // (`unaryop.rs`).  They unify only because `front::mir` registers
+        // the leaf → module origin so `canonical_struct_name(leaf)` lands
+        // on the same `module::Enum` spelling.  Without that origin the
+        // bare leaf passes through and the two sides mint sibling
+        // classdefs.  Uses a unique leaf so replacing the process-global
+        // `STRUCT_ORIGIN_REGISTRY` cannot perturb a concurrent test.
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "probemod::Newt".to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        reg.fields.insert(
+            "probemod::Newt::Eft".to_string(),
+            vec![("eft".to_string(), "i64".to_string())],
+        );
+        bk.set_pyre_struct_fields(Rc::new(reg));
+        // The origin `front::mir` now registers for an enum leaf.
+        majit_ir::descr::register_struct_origins(
+            [("Newt".to_string(), "probemod".to_string())].into(),
+        );
+
+        // Ctor side interns through `intern_enum_variant_host` with the
+        // bare leaf as owner tail.
+        let ctor_host = bk.intern_enum_variant_host("Newt", "Eft");
+        let ctor_classdef = bk
+            .getuniqueclassdef(&ctor_host)
+            .expect("ctor variant classdef");
+        // Narrowing side passes the base classdef's canonical name.
+        let narrow_classdef = bk
+            .getuniqueclassdef_for_enum_variant("probemod::Newt", "Eft")
+            .expect("narrowing variant classdef");
+
+        assert!(
+            Rc::ptr_eq(&ctor_classdef, &narrow_classdef),
+            "bare-leaf ctor and canonical narrowing must resolve ONE class object"
+        );
+        assert!(
+            narrow_classdef.borrow().attrs.contains_key("eft"),
+            "the unified variant class must carry its payload attr"
+        );
     }
 
     #[test]

@@ -224,6 +224,37 @@ impl CodeWriter {
         registry
     }
 
+    /// Two-phase rtyper prepass entry. Annotates the whole portal closure,
+    /// THEN rtypes it, populating the shared registry's `two_phase()` cache so
+    /// the subsequent per-graph drain reads cached types instead of re-running
+    /// the fused per-graph path. This is the production default; the whole
+    /// portal closure is annotated to a fixpoint before any block is rtyped,
+    /// matching upstream `translator.annotate()` → `rtyper.specialize()` →
+    /// `codewriter.make_jitcodes()` (driver.py:306/345/361) rather than the
+    /// fused per-graph annotate+rtype.
+    ///
+    /// `PYRE_TWO_PHASE_RTYPE=0` opts out to the fused per-graph dual-gate — a
+    /// comparison/debug escape hatch retained while the rtype coverage gaps
+    /// that keep the legacy walker load-bearing remain (per-subject blocker
+    /// cascade is deep; whole-corpus coverage is the full Rust-runtime
+    /// modeling tail, not an incremental lever).
+    ///
+    /// Must run AFTER `grab_initial_jitcodes` (so `candidate_graphs` is the
+    /// portal closure) and BEFORE any `drain_pending_graphs` that publishes a
+    /// covered graph — the production pipeline (`lib.rs`) calls this between the
+    /// two.
+    pub fn run_two_phase_prepass_if_enabled(&self, callcontrol: &CallControl) {
+        if std::env::var_os("PYRE_TWO_PHASE_RTYPE").is_some_and(|v| v == "0") {
+            return;
+        }
+        let registry = self.dual_gate_registry(callcontrol);
+        crate::translator::rtyper::cutover::run_two_phase_prepass(
+            &registry,
+            callcontrol.candidate_graphs(),
+            callcontrol.function_graphs(),
+        );
+    }
+
     /// RPython: `CodeWriter.transform_graph_to_jitcode()` (codewriter.py:33-72).
     ///
     /// Transforms a FunctionGraph into a JitCode through the 4-step pipeline.
@@ -307,11 +338,21 @@ impl CodeWriter {
     ) -> Option<crate::translator::rtyper::flowspace_adapter::LegacyToTyped> {
         let dual_gate_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let registry = self.dual_gate_registry(callcontrol);
-            crate::translator::rtyper::cutover::dual_gate_check_with_registry(
-                graph,
-                &registry,
-                callcontrol.function_graphs(),
-            )
+            // When the two-phase prepass populated the cache, read the cached
+            // real types instead of re-running the fused per-graph real path
+            // (which would re-rtype shared callees and re-trip the late-stage
+            // Skip). The legacy-baseline comparison + fallback stay per-graph.
+            if registry.two_phase_prepass_done() {
+                crate::translator::rtyper::cutover::dual_gate_outcome_from_cache(
+                    graph, &registry, diag_label,
+                )
+            } else {
+                crate::translator::rtyper::cutover::dual_gate_check_with_registry(
+                    graph,
+                    &registry,
+                    callcontrol.function_graphs(),
+                )
+            }
         }));
         let outcome = match dual_gate_outcome {
             Ok(result) => result,
@@ -774,6 +815,15 @@ impl CodeWriter {
     ) -> AllJitCodes {
         // RPython: self.callcontrol.grab_initial_jitcodes() (codewriter.py:76)
         callcontrol.grab_initial_jitcodes();
+        // Two-phase rtyper prepass (production default; `PYRE_TWO_PHASE_RTYPE=0`
+        // opts out): annotate the whole portal closure, THEN rtype it, BEFORE
+        // the per-graph drain — mirroring upstream `translator.annotate()` →
+        // `rtyper.specialize()` → `make_jitcodes()`. This unions every caller of
+        // a shared callee (e.g. `type_error`) before any callee is rtyped,
+        // removing the `fixed_graphs` late-stage-modify Skip the fused per-graph
+        // path suffers. The per-graph `dual_gate_publish_concretetypes` then
+        // reads the cached result.
+        self.run_two_phase_prepass_if_enabled(callcontrol);
         self.make_jitcodes_pending(callcontrol, config)
     }
 

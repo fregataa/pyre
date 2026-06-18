@@ -292,6 +292,94 @@ pub fn path_hash_stripped_crate(module_path: &str, struct_name: &str) -> u64 {
     }
 }
 
+/// Object-identity token for a STRUCT / enum-variant type definition —
+/// the layout-layer analog of RPython's `lltype.Struct` Python-object
+/// identity (`descr.py:109 cache[STRUCT]`).
+///
+/// RPython keys every field offset / size on the `lltype.Struct` OBJECT
+/// (`symbolic.get_field_token(STRUCT, name)` is `@specialize.memo()` over
+/// that object), so two distinct type definitions that happen to share a
+/// leaf name or a field shape are simply two distinct objects producing
+/// two independent tokens — a "shared leaf → single last-writer offset"
+/// collision is structurally inexpressible.  Pyre's layout layer lacks a
+/// live type object, so this token stands in for it: a `u64` minted from
+/// the FULLY-QUALIFIED canonical path (`module::Type`), never a bare
+/// leaf.  It wraps the SAME `path_hash` the descr layer already keys
+/// `LLType::Struct` on (the macro-emitted `__majit_type_id` and the
+/// analyzer converge on it), so the layout layer and the descr layer
+/// share ONE identity by construction.
+///
+/// Mint ONLY from a qualified / already-canonical name (`from_canonical`);
+/// minting from a bare leaf reintroduces the cross-module collision this
+/// token exists to remove.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct StructId(u64);
+
+impl StructId {
+    /// Mint from a canonical (qualified) struct / enum path such as
+    /// `module::Type` or `module::Enum::Variant`.  The caller is
+    /// responsible for passing a name that has already been resolved
+    /// through `canonical_struct_name` (or is qualified at the source) —
+    /// a bare leaf would collide across modules.
+    pub fn from_canonical(canonical_path: &str) -> Self {
+        StructId(path_hash(canonical_path))
+    }
+
+    /// The underlying path-stable `u64`, identical to the descr layer's
+    /// `LLType::Struct(_)` key for the same canonical path.
+    pub fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
+/// Resolve a struct / enum-variant name in ANY spelling a consumer might
+/// hold — full-crate `crate::mod::Type`, crate-stripped `mod::Type`, bare
+/// `Type`, or the enum-variant analogs — back to the one canonical
+/// [`StructId`].
+///
+/// RPython holds a live `lltype.Struct` object at every use site, so a
+/// reference always denotes the one identity regardless of how its name
+/// is spelled.  Pyre's layout consumers that only have a *string* (a
+/// rendered field type, an `lltype.Struct._name`) resolve it through this
+/// table — the layout-layer analog of dereferencing back to that object.
+/// Origins that carry the full Charon `name_path()` at their source
+/// (`FieldDescriptor.owner_id`, the per-field row token) attach the
+/// `StructId` directly and never need this; this table backs the origins
+/// that only have a string (e.g. `llmemory::FieldOffset`'s `st._name`).
+///
+/// Value is `Option<StructId>`: a bare-leaf spelling shared by two
+/// distinct modules maps to `None` (ambiguous) so an unqualified lookup
+/// resolves to no identity rather than silently binding the wrong type —
+/// the string-keyed "last-writer-wins" collision made structurally
+/// unrepresentable.
+static STRUCT_ID_BY_NAME: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, Option<StructId>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Populate / replace the global name → [`StructId`] resolution table.
+/// The front-end builds it once at populate, inserting every
+/// spelling-variant of each type that maps unambiguously, and `None` for
+/// any bare leaf two distinct modules share.
+pub fn register_struct_ids(table: std::collections::HashMap<String, Option<StructId>>) {
+    let mut guard = STRUCT_ID_BY_NAME.lock().unwrap();
+    *guard = table;
+}
+
+/// Look up the canonical [`StructId`] for a struct / enum-variant name in
+/// any spelling, stripping a leading reference / raw-pointer marker first
+/// (`&T` / `&mut T` / `*const T` / `*mut T` → `T`).  Returns `None` when
+/// the name is unknown or its bare leaf is cross-module-ambiguous.
+pub fn struct_id_for_name(raw: &str) -> Option<StructId> {
+    let s = raw
+        .trim_start_matches("*const ")
+        .trim_start_matches("*mut ")
+        .trim_start_matches("&mut ")
+        .trim_start_matches('&')
+        .trim();
+    let guard = STRUCT_ID_BY_NAME.lock().unwrap();
+    guard.get(s).copied().flatten()
+}
+
 /// Use-import resolver / module-aware canonicalisation table.
 ///
 /// Maps `bare_struct_name → defining_module_path` as discovered by

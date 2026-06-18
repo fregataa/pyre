@@ -1137,6 +1137,7 @@ fn build_shell(
                 field: FieldDescriptor {
                     name: "__pos_0".to_string(),
                     owner_root: Some(owner),
+                    owner_id: None,
                 },
                 value: crate::model::LinkArg::Value(payload),
                 ty: ValueType::Ref(None),

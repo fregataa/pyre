@@ -427,10 +427,41 @@ pub struct IndirectCallTargets {
     pub lst: Vec<crate::jitcode::JitCodeHandle>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FieldDescriptor {
     pub name: String,
     pub owner_root: Option<String>,
+    /// Object-identity token for the owning struct / enum-variant type,
+    /// minted from the full Charon `name_path()` at the field-resolution
+    /// source (`resolve_adt_field`) where the qualified path is still in
+    /// hand.  The layout layer keys offsets / sizes on this token instead
+    /// of the bare-leaf `owner_root` string, so two distinct type
+    /// definitions sharing a leaf name resolve to distinct offsets — the
+    /// analog of RPython holding the live `lltype.Struct` object.  `None`
+    /// when the descriptor was built outside the typed-ADT path (synthetic
+    /// tuples, tests, builder construction).
+    ///
+    /// Excluded from `PartialEq` / `Hash` (see the manual impls below): it
+    /// is functionally determined by `owner_root` at the typed sites, and
+    /// keeping it out of identity means a descriptor built with the token
+    /// stays equal to / hashes with one built without it, so op dedup /
+    /// CSE over `FieldDescriptor` is unaffected.
+    pub owner_id: Option<majit_ir::descr::StructId>,
+}
+
+impl PartialEq for FieldDescriptor {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name && self.owner_root == other.owner_root
+    }
+}
+
+impl Eq for FieldDescriptor {}
+
+impl std::hash::Hash for FieldDescriptor {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.name.hash(state);
+        self.owner_root.hash(state);
+    }
 }
 
 impl FieldDescriptor {
@@ -438,7 +469,14 @@ impl FieldDescriptor {
         Self {
             name: name.into(),
             owner_root,
+            owner_id: None,
         }
+    }
+
+    /// Builder-style setter for the owning-type identity token.
+    pub fn with_owner_id(mut self, owner_id: Option<majit_ir::descr::StructId>) -> Self {
+        self.owner_id = owner_id;
+        self
     }
 }
 

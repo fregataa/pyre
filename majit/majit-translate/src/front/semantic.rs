@@ -9,7 +9,7 @@
 //! `front::mir`, the Charon ULLBC driver.
 
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::model::{FunctionGraph, ImmutableRank, UnknownKind};
 
@@ -110,10 +110,6 @@ pub struct SemanticFunction {
 pub struct StructFieldRegistry {
     /// struct_name → [(field_name, full_field_type_string)]
     pub fields: HashMap<String, Vec<(String, String)>>,
-    /// Type roots registered from `TypeDeclKind::Enum`, published
-    /// under the same qualified and bare keys as `fields`.
-    #[serde(default)]
-    pub enum_roots: HashSet<String>,
 }
 
 impl StructFieldRegistry {
@@ -138,32 +134,23 @@ impl StructFieldRegistry {
             .map(|(_, ty)| ty.as_str())
     }
 
-    /// True when `owner` is registered as an enum flat class whose only
-    /// row is the synthetic `__discriminant` tag — a unit-only enum
-    /// (every variant fieldless).  Payload-bearing enums carry the union
-    /// of their variant fields as further rows.
-    pub fn is_unit_only_enum(&self, owner: &str) -> bool {
-        self.is_enum_root(owner)
-            && self
-                .lookup_fields(owner)
-                .is_some_and(|rows| matches!(rows, [(name, _)] if name == "__discriminant"))
-    }
-
-    /// True when `owner` is registered as an enum flat class.  Unlike
-    /// [`Self::is_unit_only_enum`] this also holds for payload-bearing
-    /// enums, so it gates the variant-ctor base linkage that every enum
-    /// needs for sibling variants to share a `commonbase`.
-    pub fn is_enum_root(&self, owner: &str) -> bool {
-        if self.enum_roots.contains(owner) {
-            return true;
-        }
-        let receiver_leaf = owner.rsplit("::").next().unwrap_or(owner);
-        let canonical = majit_ir::descr::canonical_struct_name(receiver_leaf);
-        if canonical != receiver_leaf && self.enum_roots.contains(&canonical) {
-            return true;
-        }
-        self.unique_suffix_owner_key(owner)
-            .is_some_and(|key| self.enum_roots.contains(key))
+    /// True when `owner` is registered as an enum base class — its sole
+    /// row is the synthetic `__discriminant` tag (`rclass.py:82-88`: the
+    /// sum-type base carries only the discriminant, each variant subclass
+    /// carries its own payload fields under `{enum}::{variant}` keys).  A
+    /// struct or non-enum owner has its own field rows and returns false.
+    ///
+    /// The discriminator is the row shape, not a stored type-kind flag,
+    /// because the registry erases `TypeDeclKind` once rows are projected.
+    /// That is sound: `__discriminant` is a reserved key emitted only by
+    /// the enum-base row builder in `front/mir.rs`; a `TypeDeclKind::Struct`
+    /// projects its real Rust field names, none of which is `__discriminant`
+    /// (`from_type_strings` skips synthetic `__pad`/typeptr rows and never
+    /// mints that name).  So a real single-field struct cannot be
+    /// misclassified as an enum base.
+    pub fn is_enum_base(&self, owner: &str) -> bool {
+        self.lookup_fields(owner)
+            .is_some_and(|rows| matches!(rows, [(name, _)] if name == "__discriminant"))
     }
 
     fn lookup_fields(&self, owner: &str) -> Option<&[(String, String)]> {
@@ -211,6 +198,23 @@ fn is_path_suffix(longer: &str, shorter: &str) -> bool {
     longer[..prefix_len].ends_with("::")
 }
 
+/// Exact memory layout of a type, resolved from Charon's per-target
+/// `variant_layouts.field_offsets` in the LLBC (not the `#[repr(C)]`-
+/// approximating heuristic).  Keyed in [`SemanticProgram::exact_layouts`]
+/// by owner root: a struct leaf / qualified name, or — for an enum
+/// variant — `{leaf}::{variant}`.  `field_offsets` carries the field's
+/// byte offset within the type; the heuristic provider is used only for
+/// roots without an entry here.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ExactLayout {
+    /// Total byte size when Charon resolved it.
+    pub size: Option<u64>,
+    /// Byte alignment when Charon resolved it.
+    pub align: Option<u64>,
+    /// `field_name → byte offset within the type`.
+    pub field_offsets: HashMap<String, u64>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SemanticProgram {
     pub functions: Vec<SemanticFunction>,
@@ -253,6 +257,24 @@ pub struct SemanticProgram {
     /// match the qualname `_init_classdef` reads; primitive fields carry
     /// `Int`/`Unsigned`/`Bool`/`Float`, every other shape `Ref(None)`.
     pub struct_field_attrs: HashMap<String, Vec<(String, crate::model::ValueType)>>,
+    /// Exact per-type memory layout (byte offsets, size, align) harvested
+    /// from Charon's LLBC `type_decl.layout`, keyed by the type's
+    /// [`StructId`](majit_ir::descr::StructId) object identity (one entry
+    /// per type definition, enum variants included).  Feeds the exact
+    /// `LayoutProvider`, replacing the heuristic for types that have an
+    /// entry; the heuristic remains the fallback.  Keying on the identity
+    /// token rather than a name string makes two distinct definitions
+    /// that share a leaf name structurally distinct, removing the
+    /// last-writer-wins collision the bare-leaf string key had.
+    pub exact_layouts: HashMap<majit_ir::descr::StructId, ExactLayout>,
+    /// Resolves a struct / enum-variant name in any spelling (full-crate,
+    /// crate-stripped, bare leaf, variant analogs) back to its canonical
+    /// [`StructId`](majit_ir::descr::StructId), or `None` for a bare leaf
+    /// two distinct modules share.  Registered into
+    /// `majit_ir::descr::STRUCT_ID_BY_NAME` so the layout consumers that
+    /// only hold a string (`llmemory::FieldOffset`'s `st._name`, a nested
+    /// field's rendered type) can reach the identity-keyed layout maps.
+    pub struct_ids: HashMap<String, Option<majit_ir::descr::StructId>>,
     /// `(path-segments, Signature, return-lltype)` for every local
     /// `unsafe fn` / unsafe impl-method whose return type resolves to
     /// unit or bool, harvested from the LLBC by
@@ -462,57 +484,6 @@ mod tests {
     }
 
     #[test]
-    fn enum_root_detection_uses_explicit_registry_not_discriminant_field() {
-        let mut reg = StructFieldRegistry::default();
-        reg.fields.insert(
-            "Plain".to_string(),
-            vec![
-                ("__discriminant".to_string(), "i64".to_string()),
-                ("payload".to_string(), "i64".to_string()),
-            ],
-        );
-        assert!(
-            !reg.is_enum_root("Plain"),
-            "a struct field named __discriminant must not make the owner an enum root"
-        );
-        assert!(!reg.is_unit_only_enum("Plain"));
-
-        reg.fields.insert(
-            "Color".to_string(),
-            vec![
-                ("__discriminant".to_string(), "i64".to_string()),
-                ("rgb".to_string(), "i64".to_string()),
-            ],
-        );
-        reg.enum_roots.insert("Color".to_string());
-        assert!(reg.is_enum_root("Color"));
-        assert!(!reg.is_unit_only_enum("Color"));
-
-        reg.fields.insert(
-            "Signal".to_string(),
-            vec![("__discriminant".to_string(), "i64".to_string())],
-        );
-        reg.enum_roots.insert("Signal".to_string());
-        assert!(reg.is_enum_root("Signal"));
-        assert!(reg.is_unit_only_enum("Signal"));
-
-        reg.fields.insert(
-            "left::Thing".to_string(),
-            vec![("__discriminant".to_string(), "i64".to_string())],
-        );
-        reg.fields.insert(
-            "right::Thing".to_string(),
-            vec![("payload".to_string(), "i64".to_string())],
-        );
-        reg.enum_roots.insert("left::Thing".to_string());
-        assert!(reg.is_enum_root("left::Thing"));
-        assert!(
-            !reg.is_enum_root("Thing"),
-            "a duplicate leaf must not resolve through the enum-root suffix fallback"
-        );
-    }
-
-    #[test]
     fn lookup_free_resolves_unique_free_function() {
         let prog = program(vec![
             free_fn("execute_opcode_step"),
@@ -535,5 +506,48 @@ mod tests {
         let prog = program(vec![free_fn("helper"), free_fn("helper")]);
         let lookup = MirGraphLookup::from_program(&prog);
         assert!(lookup.lookup_free("helper").is_none());
+    }
+
+    /// finding 2a: the enum variant-ctor discrimination probes the
+    /// qualified enum-base spelling before the bare leaf, so a ctor of an
+    /// enum whose leaf collides across modules — where the bare alias was
+    /// withdrawn and `lookup_fields`'s suffix shim is ambiguous — still
+    /// classifies as a variant ctor instead of misrouting to the
+    /// struct-ctor branch.
+    #[test]
+    fn enum_variant_ctor_discriminates_via_qualified_spelling_after_leaf_collision() {
+        // Two distinct enums share the leaf `E`.  `harden_duplicate_leaf_
+        // metadata` withdrew the bare `E` alias on the collision; both
+        // qualified spellings — the full `name_path`s — survive.
+        let mut reg = StructFieldRegistry::default();
+        let disc = vec![("__discriminant".to_string(), "i64".to_string())];
+        reg.fields.insert("crate::m1::E".to_string(), disc.clone());
+        reg.fields.insert("crate::m2::E".to_string(), disc);
+
+        // The bare `E` misses: no exact key, and the suffix shim is
+        // ambiguous across the two qualified spellings.
+        assert!(
+            !reg.is_enum_base("E"),
+            "ambiguous bare leaf does not resolve to an enum base"
+        );
+        // Each qualified spelling resolves exactly.
+        assert!(reg.is_enum_base("crate::m1::E"));
+        assert!(reg.is_enum_base("crate::m2::E"));
+
+        // The discrimination the variant ctor performs for `m1::E::V`:
+        // probe the qualified `owner_path.join("::")` first, then the bare
+        // tail.  The qualified probe routes correctly where the bare-only
+        // probe (prior behaviour) would misroute to the struct-ctor branch.
+        let owner_path = vec!["crate".to_string(), "m1".to_string(), "E".to_string()];
+        let owner_tail = owner_path.last();
+        let owner_qual = owner_path.join("::");
+        assert!(
+            reg.is_enum_base(&owner_qual) || owner_tail.is_some_and(|t| reg.is_enum_base(t)),
+            "qualified probe routes the ctor to the variant path"
+        );
+        assert!(
+            !owner_tail.is_some_and(|t| reg.is_enum_base(t)),
+            "bare-tail-only probe misses under collision"
+        );
     }
 }

@@ -23,6 +23,22 @@ use crate::model::ImmutableRank;
 pub trait LayoutProvider {
     /// Return the layout for a struct, or None to fall back to heuristic.
     fn get_struct_layout(&self, struct_name: &str) -> Option<StructLayout>;
+
+    /// Return the layout corrected with exact rtyper-resolved per-field byte
+    /// offsets and total size — the offsets `symbolic.get_field_token` reads
+    /// from the C compiler in RPython (`symbolic.py:7`), which the heuristic
+    /// only approximates.  No default: a provider must decide explicitly how
+    /// it honours the exact layout (the heuristic applies the offsets over
+    /// its `#[repr(C)]` approximation; an `offset_of!()`-backed provider
+    /// returns its already-exact layout).  There is no "optionally ignore
+    /// the symbolic layout" path — that would silently emit approximate
+    /// offsets where the exact ones were known.
+    fn get_struct_layout_exact(
+        &self,
+        struct_name: &str,
+        exact_offsets: &HashMap<String, u64>,
+        exact_size: Option<u64>,
+    ) -> Option<StructLayout>;
 }
 
 /// Default provider using type-string heuristic.
@@ -105,6 +121,30 @@ impl LayoutProvider for HeuristicLayoutProvider {
             &self.known_struct_sizes,
             &imm_ranks,
         ))
+    }
+
+    fn get_struct_layout_exact(
+        &self,
+        struct_name: &str,
+        exact_offsets: &HashMap<String, u64>,
+        exact_size: Option<u64>,
+    ) -> Option<StructLayout> {
+        let mut layout = self.get_struct_layout(struct_name)?;
+        let rows = self.fields_by_struct.get(struct_name)?;
+        let imm_ranks = self
+            .immutable_fields_by_struct
+            .get(struct_name)
+            .cloned()
+            .unwrap_or_default();
+        layout.apply_exact_layout(
+            rows,
+            exact_offsets,
+            exact_size,
+            &self.known_struct_names,
+            &self.known_struct_sizes,
+            &imm_ranks,
+        );
+        Some(layout)
     }
 }
 
@@ -197,5 +237,74 @@ mod tests {
         // rank) for fields outside `_immutable_fields_`.
         assert_eq!(layout.fields[1].rank, None);
         assert!(!layout.fields[1].is_immutable());
+    }
+
+    /// finding 3a: the enum base's `__discriminant` field resolves at the
+    /// tag's real byte position (`discriminant_offset`), not the heuristic
+    /// 0.  Mirrors the enum arm of `derive_program_metadata` (base
+    /// `ExactLayout` carries `{"__discriminant": discriminant_offset}`)
+    /// feeding the bridge's `get_struct_layout_exact`.
+    #[test]
+    fn enum_base_discriminant_resolves_at_tag_offset() {
+        use majit_charon_reader::ullbc::TypeLayout;
+
+        // A niche/tag enum whose tag sits at byte 8, not 0.
+        let niche: TypeLayout = serde_json::from_str(
+            r#"{ "size": 16, "align": 8,
+                 "variant_layouts": [{"field_offsets": [0]}, {"field_offsets": [0]}],
+                 "discriminator": {"Branch": {"offset": 8}} }"#,
+        )
+        .unwrap();
+        assert_eq!(niche.discriminant_offset(), Some(8));
+
+        // The base row registry: the discriminant-only sentinel the enum
+        // arm registers under the base spelling.
+        let mut fields = HashMap::new();
+        fields.insert(
+            "module::Enum".to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        let provider =
+            HeuristicLayoutProvider::from_struct_fields(&fields, &HashSet::new(), &HashMap::new());
+
+        // Heuristic alone would place the tag at offset 0.
+        assert_eq!(
+            provider.get_struct_layout("module::Enum").unwrap().fields[0].offset,
+            0
+        );
+
+        // The base ExactLayout the enum arm builds from the niche layout.
+        let mut base_offsets = HashMap::new();
+        base_offsets.insert(
+            "__discriminant".to_string(),
+            niche.discriminant_offset().unwrap_or(0),
+        );
+        let exact = provider
+            .get_struct_layout_exact("module::Enum", &base_offsets, niche.size)
+            .unwrap();
+        let disc = exact
+            .fields
+            .iter()
+            .find(|f| f.name == "__discriminant")
+            .expect("base layout carries the discriminant field");
+        assert_eq!(disc.offset, 8, "niche tag resolves at its real offset");
+        assert_eq!(exact.size, 16);
+
+        // A tag at offset 0 (the common case) registers 0, matching the
+        // heuristic exactly.
+        let mut zero_offsets = HashMap::new();
+        zero_offsets.insert("__discriminant".to_string(), 0u64);
+        let exact0 = provider
+            .get_struct_layout_exact("module::Enum", &zero_offsets, Some(8))
+            .unwrap();
+        assert_eq!(
+            exact0
+                .fields
+                .iter()
+                .find(|f| f.name == "__discriminant")
+                .unwrap()
+                .offset,
+            0
+        );
     }
 }

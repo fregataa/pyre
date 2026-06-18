@@ -88,7 +88,7 @@ use majit_charon_reader::{
     ullbc::{
         BasicBlock, CallClass, CallFunc, CallKind, CallPayload, FunDecl, FunId, NameSeg, Operand,
         Place, PlaceKind, ProjectionElem, RegularCall, Rvalue, StmtKind, SwitchTargets, TermKind,
-        TyRef, TypeDeclKind, Unstructured,
+        TyRef, TypeDecl, TypeDeclKind, Unstructured,
     },
 };
 
@@ -185,9 +185,6 @@ pub fn build_semantic_program_from_llbcs_with_static_addrs(
                 for (key, fields) in prog.struct_fields.fields {
                     acc.struct_fields.fields.entry(key).or_insert(fields);
                 }
-                for enum_root in prog.struct_fields.enum_roots {
-                    acc.struct_fields.enum_roots.insert(enum_root);
-                }
                 for (enum_key, by_discr) in prog.enum_variant_by_discriminant {
                     acc.enum_variant_by_discriminant
                         .entry(enum_key)
@@ -199,6 +196,22 @@ pub fn build_semantic_program_from_llbcs_with_static_addrs(
                 for (key, rows) in prog.struct_field_attrs {
                     acc.struct_field_attrs.entry(key).or_insert(rows);
                 }
+                for (key, layout) in prog.exact_layouts {
+                    acc.exact_layouts.entry(key).or_insert(layout);
+                }
+                // Merge the name → StructId resolver, collapsing a key to
+                // `None` when two crates disagree on the identity (a
+                // cross-crate bare-leaf clash).
+                for (key, id) in prog.struct_ids {
+                    acc.struct_ids
+                        .entry(key)
+                        .and_modify(|slot| {
+                            if *slot != id {
+                                *slot = None;
+                            }
+                        })
+                        .or_insert(id);
+                }
             }
         }
     }
@@ -206,7 +219,9 @@ pub fn build_semantic_program_from_llbcs_with_static_addrs(
     // `or_insert` merges above can re-introduce a bare-leaf alias that
     // is unique within one crate yet collides across crates (e.g. the
     // pyre-interpreter and pyre-jit `FrameBlock`s).  Re-derive the
-    // verdict from the merged qualified keys.
+    // verdict from the merged qualified keys.  (The exact-layout channel
+    // is keyed by `StructId` and so is collision-free by construction —
+    // only the still-string-keyed metadata channels need hardening.)
     if let Some(acc) = &mut merged {
         harden_duplicate_leaf_metadata(
             &mut acc.struct_fields,
@@ -224,6 +239,8 @@ pub fn build_semantic_program_from_llbcs_with_static_addrs(
             enum_variant_by_discriminant: std::collections::HashMap::new(),
             struct_origins: std::collections::HashMap::new(),
             struct_field_attrs: std::collections::HashMap::new(),
+            exact_layouts: std::collections::HashMap::new(),
+            struct_ids: std::collections::HashMap::new(),
             unsafe_fn_stubs: Vec::new(),
         }),
     )
@@ -303,6 +320,8 @@ pub fn build_semantic_program_from_llbc_with_static_addrs(
         mut enum_variant_by_discriminant,
         mut struct_origins,
         struct_field_attrs,
+        exact_layouts,
+        struct_ids,
     ) = derive_program_metadata(llbc);
     harden_duplicate_leaf_metadata(
         &mut struct_fields,
@@ -455,6 +474,8 @@ pub fn build_semantic_program_from_llbc_with_static_addrs(
         enum_variant_by_discriminant,
         struct_origins,
         struct_field_attrs,
+        exact_layouts,
+        struct_ids,
         // Populated post-build in `build_semantic_program_via_active_frontend`
         // (it iterates the full LLBC set), mirroring `merge_hints_from_llbcs`.
         unsafe_fn_stubs: Vec::new(),
@@ -465,7 +486,8 @@ pub fn build_semantic_program_from_llbc_with_static_addrs(
 /// Charon's `type_decls` + `trait_decls` tables.
 ///
 /// Returns `(known_struct_names, known_trait_names, struct_fields,
-/// enum_variant_by_discriminant, struct_origins, struct_field_attrs)`.
+/// enum_variant_by_discriminant, struct_origins, struct_field_attrs,
+/// exact_layouts)`.
 /// Names are taken from `item_meta.name_path()`; struct field rows
 /// resolve their type string via [`tyref_to_ast_string`] (Charon-resolved
 /// types: references stripped, raw pointers kept, `Vec<T>` / `[T;N]`
@@ -474,6 +496,25 @@ pub fn build_semantic_program_from_llbc_with_static_addrs(
 /// stripped (so the value matches the runtime def-path convention).
 /// `struct_field_attrs` maps the crate-stripped qualified struct name to
 /// its declaration-ordered `(field, ValueType)` register classes.
+/// Record a `name → StructId` mapping in the resolver table, collapsing
+/// to `None` (ambiguous) if the same name already mapped to a different
+/// identity — i.e. two distinct type definitions share that spelling
+/// (only possible for a bare leaf across modules).
+fn record_struct_id(
+    table: &mut std::collections::HashMap<String, Option<majit_ir::descr::StructId>>,
+    name: String,
+    id: majit_ir::descr::StructId,
+) {
+    table
+        .entry(name)
+        .and_modify(|slot| {
+            if *slot != Some(id) {
+                *slot = None;
+            }
+        })
+        .or_insert(Some(id));
+}
+
 fn derive_program_metadata(
     llbc: &Llbc,
 ) -> (
@@ -483,7 +524,14 @@ fn derive_program_metadata(
     std::collections::HashMap<String, std::collections::HashMap<i64, String>>,
     std::collections::HashMap<String, String>,
     std::collections::HashMap<String, Vec<(String, ValueType)>>,
+    std::collections::HashMap<majit_ir::descr::StructId, crate::front::semantic::ExactLayout>,
+    std::collections::HashMap<String, Option<majit_ir::descr::StructId>>,
 ) {
+    // Charon resolves layout per target; the LLBC carries a single
+    // entry for the extraction target (build-script `TARGET`).  An
+    // absent/non-matching target falls back to the sole entry inside
+    // `layout_for_target`, so an empty value still resolves it.
+    let target = std::env::var("TARGET").unwrap_or_default();
     let mut known_struct_names = std::collections::HashSet::new();
     let mut known_trait_names = std::collections::HashSet::new();
     let mut struct_fields = crate::front::semantic::StructFieldRegistry::default();
@@ -492,6 +540,15 @@ fn derive_program_metadata(
         std::collections::HashMap<i64, String>,
     > = std::collections::HashMap::new();
     let mut struct_origins: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut exact_layouts: std::collections::HashMap<
+        majit_ir::descr::StructId,
+        crate::front::semantic::ExactLayout,
+    > = std::collections::HashMap::new();
+    // name (any spelling) → canonical StructId; `None` marks a bare leaf
+    // two distinct modules share.  Inserts go through `record_struct_id`
+    // below so a cross-module bare-leaf clash collapses to `None`.
+    let mut struct_ids: std::collections::HashMap<String, Option<majit_ir::descr::StructId>> =
         std::collections::HashMap::new();
     let mut struct_field_attrs: std::collections::HashMap<String, Vec<(String, ValueType)>> =
         std::collections::HashMap::new();
@@ -514,6 +571,36 @@ fn derive_program_metadata(
                     .collect();
                 struct_fields.fields.insert(name.clone(), rows.clone());
                 struct_fields.fields.insert(leaf.clone(), rows);
+                // Object identity for this struct type, minted from the
+                // crate-stripped qualified path — the spelling the descr
+                // layer keys `LLType::Struct` on and the runtime macro
+                // publishes.  Every name spelling (full-crate, stripped,
+                // bare leaf) resolves to it through the resolver table.
+                let sid = majit_ir::descr::StructId::from_canonical(&strip_crate_prefix(&name));
+                record_struct_id(&mut struct_ids, name.clone(), sid);
+                record_struct_id(&mut struct_ids, strip_crate_prefix(&name), sid);
+                record_struct_id(&mut struct_ids, leaf.clone(), sid);
+                // Exact field byte offsets from Charon's resolved layout
+                // (the true Rust layout, not the heuristic).  Field index
+                // `i` matches the declaration order Charon offsets by.
+                // Absent layout (opaque type) leaves the type unrecorded;
+                // the heuristic provider covers it.  Keyed by the identity
+                // token — one entry per type definition.
+                if let Some(layout) = td.layout_for_target(&target) {
+                    let mut field_offsets = std::collections::HashMap::new();
+                    for (i, f) in fields.iter().enumerate() {
+                        let fname = f.name.clone().unwrap_or_else(|| format!("__pos_{i}"));
+                        if let Some(off) = layout.struct_field_offset(i) {
+                            field_offsets.insert(fname, off);
+                        }
+                    }
+                    let exact = crate::front::semantic::ExactLayout {
+                        size: layout.size,
+                        align: layout.align,
+                        field_offsets,
+                    };
+                    exact_layouts.insert(sid, exact);
+                }
                 // `bare leaf → crate-relative module`: drop the crate
                 // prefix (first segment) and the leaf (last segment) so
                 // the value matches the runtime def-path
@@ -552,45 +639,149 @@ fn derive_program_metadata(
                 // …) so a synthetic Aggregate(SyntheticTransparentCtor)
                 // can be matched downstream.
                 let leaf = name.rsplit("::").next().unwrap_or(&name).to_string();
+                // The crate-stripped `module::Enum` spelling — the
+                // canonical key `canonical_struct_name(enum_leaf)` resolves
+                // to (`STRUCT_ORIGIN_REGISTRY` prepends the same
+                // crate-stripped module path).  The annotator interns the
+                // base and its variants under this spelling
+                // (`intern_enum_variant_host`), so registering rows /
+                // attrs here lets `project_struct_rows` and the FORCE
+                // table find them on the one class object the narrowing
+                // and the constructor share.
+                let canon_base = strip_crate_prefix(&name);
+                // Register the bare-leaf → crate-relative module origin, the
+                // same way the struct arm does above.  `intern_enum_variant_host`
+                // relies on `canonical_struct_name(leaf)` resolving to the
+                // `module::Enum` spelling so the constructor side (owner tail =
+                // bare leaf) and the discriminant-narrowing side (the base
+                // classdef's canonical name) normalise to one cache key; without
+                // the origin the bare leaf passes through unchanged and the two
+                // sides mint sibling classdefs for one Rust enum.  First-write-
+                // wins on duplicate leaves; `harden_duplicate_leaf_metadata`
+                // empties the entry when distinct modules collide.
+                let module = canon_base
+                    .rsplit_once("::")
+                    .map(|(m, _)| m.to_string())
+                    .unwrap_or_default();
+                struct_origins.entry(leaf.clone()).or_insert(module);
                 known_struct_names.insert(name.clone());
                 known_struct_names.insert(leaf.clone());
-                struct_fields.enum_roots.insert(name.clone());
-                struct_fields.enum_roots.insert(leaf.clone());
-                // Register the enum as a flat class in `struct_fields`:
-                // the synthetic `__discriminant` tag plus the union of
-                // all variant payload fields.  `Rvalue::Discriminant`
-                // lowers to `FieldRead("__discriminant")` and payload
-                // projections emit `owner_root` = the enum LEAF (not the
-                // variant — `resolve_adt_field`), so every enum attr
-                // read lands on this one class.  First-writer-wins on a
-                // field name shared by several variants; the row only
-                // feeds the annotation-stage attr shell
-                // (`getuniqueclassdef_for_struct_root` pass 2), which
-                // RPython grows by generalization anyway.
-                let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-                seen.insert("__discriminant".to_string());
-                let mut rows: Vec<(String, String)> =
+                // Register the enum base class in `struct_fields` with
+                // only the synthetic `__discriminant` tag — the sum-type
+                // base carries the discriminant, each variant subclass
+                // carries its OWN payload fields (`rclass.py:82-88`,
+                // registered below under `{enum}::{variant}` keys and
+                // projected onto the variant classdef by
+                // `getuniqueclassdef_for_enum_variant`).
+                // `Rvalue::Discriminant` lowers to
+                // `FieldRead("__discriminant")` on the base; a payload
+                // projection resolves on the narrowed `SomeInstance(variant)`
+                // receiver (`enum_variant_narrowing_knowntypedata`) and
+                // reads at the variant-qualified runtime offset
+                // (`resolve_adt_field` owner_root = `{enum_leaf}::{variant}`).
+                let rows: Vec<(String, String)> =
                     vec![("__discriminant".to_string(), "i64".to_string())];
-                for v in variants {
+                struct_fields.fields.insert(name.clone(), rows.clone());
+                struct_fields.fields.insert(leaf.clone(), rows.clone());
+                struct_fields.fields.insert(canon_base.clone(), rows);
+                // Object identity for the enum base (the discriminant
+                // carrier), minted from the crate-stripped `module::Enum`.
+                let base_sid = majit_ir::descr::StructId::from_canonical(&canon_base);
+                record_struct_id(&mut struct_ids, name.clone(), base_sid);
+                record_struct_id(&mut struct_ids, leaf.clone(), base_sid);
+                record_struct_id(&mut struct_ids, canon_base.clone(), base_sid);
+                // Per-variant field rows + exact offsets under
+                // `{enum}::{variant}` keys — the RPython sum-type subclass
+                // layout where each variant carries its OWN fields, the base
+                // only the discriminant (`rclass.py:82-88`).  These feed the
+                // variant subclasses (their `getuniqueclassdef_for_enum_variant`
+                // attr projection) and the per-variant runtime offsets.
+                // Dual-published under the qualified and bare-leaf spellings
+                // because `resolve_adt_field` emits `owner_root` =
+                // `{enum_leaf}::{variant}`.  No cross-variant dedup: each
+                // variant owns its field namespace.
+                let enum_layout = td.layout_for_target(&target);
+                // Register the enum BASE in `exact_layouts`: a single
+                // `__discriminant` field at the tag's real byte position
+                // (`discriminator.Branch.offset` via `discriminant_offset`).
+                // `Rvalue::Discriminant` lowers to a `FieldRead("__discriminant")`
+                // keyed to the base identity, so a niche/non-zero tag resolves
+                // at its true offset instead of the heuristic 0.  A tag at
+                // offset 0 (the common case) registers 0, matching the
+                // heuristic exactly; a single-variant type has no `Branch`
+                // tag (`discriminant_offset` → `None`) and also registers 0.
+                if let Some(l) = enum_layout.as_ref() {
+                    let mut base_offsets = std::collections::HashMap::new();
+                    base_offsets.insert(
+                        "__discriminant".to_string(),
+                        l.discriminant_offset().unwrap_or(0),
+                    );
+                    let base_exact = crate::front::semantic::ExactLayout {
+                        size: l.size,
+                        align: l.align,
+                        field_offsets: base_offsets,
+                    };
+                    exact_layouts.insert(base_sid, base_exact);
+                }
+                for (vidx, v) in variants.iter().enumerate() {
+                    let variant_qual = format!("{name}::{}", v.name);
+                    let variant_leaf = format!("{leaf}::{}", v.name);
+                    let variant_canon = format!("{canon_base}::{}", v.name);
+                    let mut vrows: Vec<(String, String)> = Vec::with_capacity(v.fields.len());
+                    let mut vattrs: Vec<(String, ValueType)> = Vec::with_capacity(v.fields.len());
+                    let mut voffsets: std::collections::HashMap<String, u64> =
+                        std::collections::HashMap::new();
                     for (i, f) in v.fields.iter().enumerate() {
                         let fname = f.name.clone().unwrap_or_else(|| format!("__pos_{i}"));
-                        if seen.insert(fname.clone()) {
-                            // Zero-sized `Arg<T>` oparg markers row as a
-                            // plain integer — the Opaque external decl
-                            // has no projectable shape and the marker
-                            // value is never read (see
-                            // `tyref_is_bytecode_arg_marker`).
-                            let row_ty = if tyref_is_bytecode_arg_marker(&f.ty, llbc) {
-                                "u32".to_string()
-                            } else {
-                                tyref_to_ast_string(&f.ty, llbc)
-                            };
-                            rows.push((fname, row_ty));
+                        // A bytecode-arg marker reads as a `u32` at runtime
+                        // and annotates as an integer — keep the row string
+                        // and the FORCE attr type in agreement so the
+                        // projection refines the same shell.
+                        let (row_ty, attr_ty) = if tyref_is_bytecode_arg_marker(&f.ty, llbc) {
+                            ("u32".to_string(), ValueType::Int)
+                        } else {
+                            (
+                                tyref_to_ast_string(&f.ty, llbc),
+                                tyref_to_attr_value_type(&f.ty, llbc),
+                            )
+                        };
+                        if let Some(off) =
+                            enum_layout.as_ref().and_then(|l| l.field_offset(vidx, i))
+                        {
+                            voffsets.insert(fname.clone(), off);
                         }
+                        vattrs.push((fname.clone(), attr_ty));
+                        vrows.push((fname, row_ty));
                     }
+                    struct_fields
+                        .fields
+                        .insert(variant_qual.clone(), vrows.clone());
+                    struct_fields
+                        .fields
+                        .insert(variant_leaf.clone(), vrows.clone());
+                    struct_fields.fields.insert(variant_canon.clone(), vrows);
+                    // Object identity for the variant subclass, minted from
+                    // the crate-stripped `module::Enum::Variant`.
+                    let vsid = majit_ir::descr::StructId::from_canonical(&variant_canon);
+                    record_struct_id(&mut struct_ids, variant_qual.clone(), vsid);
+                    record_struct_id(&mut struct_ids, variant_leaf.clone(), vsid);
+                    record_struct_id(&mut struct_ids, variant_canon.clone(), vsid);
+                    if let Some(l) = enum_layout.as_ref() {
+                        let exact = crate::front::semantic::ExactLayout {
+                            size: l.size,
+                            align: l.align,
+                            field_offsets: voffsets,
+                        };
+                        exact_layouts.insert(vsid, exact);
+                    }
+                    // Variant payload attrs for `FORCE_ATTRIBUTES_INTO_CLASSES`,
+                    // keyed by the canonical `module::Enum::Variant` — the
+                    // key `_init_classdef` derives for the variant classdef
+                    // whether the narrowing or the constructor minted it, so
+                    // the payload attrs are forced onto the one variant
+                    // class.  Mirrors the struct arm above.
+                    struct_field_attrs.insert(variant_canon, vattrs);
                 }
-                struct_fields.fields.insert(name.clone(), rows.clone());
-                struct_fields.fields.insert(leaf.clone(), rows);
                 // discriminant → variant name, published under both the
                 // qualified path and the bare leaf so the opcode-dispatch
                 // extractor can resolve by either spelling.
@@ -626,6 +817,8 @@ fn derive_program_metadata(
         enum_variant_by_discriminant,
         struct_origins,
         struct_field_attrs,
+        exact_layouts,
+        struct_ids,
     )
 }
 
@@ -654,6 +847,19 @@ fn derive_program_metadata(
 ///   `canonical_struct_name` (descr.rs:342) already treats as
 ///   unresolvable — the bare spelling passes through unchanged instead
 ///   of canonicalising to whichever module registered first.
+/// - variant-leaf aliases: an enum variant dual-publishes a bare
+///   `Enum::Variant` 2-segment convenience alias alongside its qualified
+///   spellings.  The bare struct-leaf pass keys on the LAST segment
+///   (`Variant`), which mixes distinct enums' same-named variants and
+///   drops a `Variant` key that was never published, so a cross-module
+///   `Enum::Variant` collision survives.  A dedicated pass groups by the
+///   `Enum::Variant` tail and withdraws that alias off the same
+///   field-shape-divergence signal.
+///
+/// The exact-layout channel is no longer hardened here: it is keyed by
+/// `StructId` object identity, so two distinct definitions sharing a leaf
+/// are distinct entries by construction and there is no bare alias to
+/// withdraw.
 ///
 /// Derived purely from the current qualified (`::`-containing) keys, so
 /// the pass is idempotent and safe to re-run after the cross-LLBC
@@ -673,8 +879,6 @@ fn harden_duplicate_leaf_metadata(
         }
     }
     let mut drop_field_aliases: Vec<String> = Vec::new();
-    let mut drop_enum_root_aliases: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
     let mut tombstone_origins: Vec<String> = Vec::new();
     for (leaf, quals) in &by_leaf {
         if quals.len() < 2 {
@@ -686,14 +890,6 @@ fn harden_duplicate_leaf_metadata(
             .any(|q| &struct_fields.fields[*q] != first_rows)
         {
             drop_field_aliases.push((*leaf).to_string());
-            drop_enum_root_aliases.insert((*leaf).to_string());
-        }
-        let enum_qualified_count = quals
-            .iter()
-            .filter(|q| struct_fields.enum_roots.contains(**q))
-            .count();
-        if enum_qualified_count > 0 && enum_qualified_count != quals.len() {
-            drop_enum_root_aliases.insert((*leaf).to_string());
         }
         let first_module = strip_crate_prefix(quals[0])
             .rsplit_once("::")
@@ -718,6 +914,47 @@ fn harden_duplicate_leaf_metadata(
             module.clear();
         }
     }
+    // Variant-leaf aliases.  The enum-variant rows (`derive_program_metadata`)
+    // dual-publish each variant under qualified spellings
+    // (`module::Enum::Variant`, `crate::…::Enum::Variant`) AND a bare
+    // `Enum::Variant` 2-segment convenience alias.  The struct-leaf pass above
+    // groups by the LAST segment (`Variant`), which mixes distinct enums'
+    // same-named variants and tries to drop a bare `Variant` key that was never
+    // published — so a cross-module `Enum::Variant` collision (last-decl-wins on
+    // the bare alias) survives.  Group by the `Enum::Variant` tail so only
+    // genuine same-enum-leaf duplicates meet, then withdraw the bare alias off
+    // the same field-shape-divergence signal.  `resolve_adt_field` emits
+    // `owner_root = {enum_leaf}::{variant}`, so a withdrawn alias makes an
+    // ambiguous lookup miss to the qualified key or fail conservatively.
+    let mut variant_by_alias: std::collections::HashMap<String, Vec<&str>> =
+        std::collections::HashMap::new();
+    for key in struct_fields.fields.keys() {
+        if let Some((head, var)) = key.rsplit_once("::") {
+            if let Some((_, enm)) = head.rsplit_once("::") {
+                variant_by_alias
+                    .entry(format!("{enm}::{var}"))
+                    .or_default()
+                    .push(key);
+            }
+        }
+    }
+    let mut drop_variant_aliases: Vec<String> = Vec::new();
+    for (alias, quals) in &variant_by_alias {
+        if quals.len() < 2 {
+            continue;
+        }
+        let first_rows = &struct_fields.fields[quals[0]];
+        if quals[1..]
+            .iter()
+            .any(|q| &struct_fields.fields[*q] != first_rows)
+        {
+            drop_variant_aliases.push(alias.clone());
+        }
+    }
+    drop(variant_by_alias);
+    for alias in drop_variant_aliases {
+        struct_fields.fields.remove(&alias);
+    }
     // `enum_variant_by_discriminant` dual-publishes the same bare-leaf
     // alias (qualified path + leaf), so a cross-decl leaf collision
     // leaves a silent-winner discriminant map there too.  Same rule as
@@ -741,15 +978,27 @@ fn harden_duplicate_leaf_metadata(
             .any(|q| &enum_variant_by_discriminant[*q] != first_map)
         {
             drop_enum_aliases.push((*leaf).to_string());
-            drop_enum_root_aliases.insert((*leaf).to_string());
         }
     }
     drop(enum_by_leaf);
     for leaf in drop_enum_aliases {
         enum_variant_by_discriminant.remove(&leaf);
-    }
-    for leaf in drop_enum_root_aliases {
-        struct_fields.enum_roots.remove(&leaf);
+        // Every enum base row is the `__discriminant`-only sentinel
+        // (`derive_program_metadata`'s enum arm), so the struct-shape
+        // check above can never tell two distinct enums sharing a leaf
+        // apart — their bare base alias survives and
+        // `pyre_struct_root_names` pre-mints ONE merged base class for
+        // both.  Withdraw it here off the same discriminant-divergence
+        // signal, gated on the sentinel so a same-named real struct
+        // (whose bare alias the shape check already adjudicated) is left
+        // untouched.
+        if struct_fields
+            .fields
+            .get(&leaf)
+            .is_some_and(|rows| rows.len() == 1 && rows[0].0 == "__discriminant")
+        {
+            struct_fields.fields.remove(&leaf);
+        }
     }
 }
 
@@ -2122,8 +2371,9 @@ impl<'a> Lowering<'a> {
                     // fallback keeps non-Adt containers lowering as
                     // before.
                     let (field, ty) = match self.resolve_adt_field(field_payload) {
-                        Some((owner_root, field_name, _field_ty)) => (
-                            FieldDescriptor::new(field_name, Some(owner_root)),
+                        Some((owner_root, field_name, _field_ty, owner_id)) => (
+                            FieldDescriptor::new(field_name, Some(owner_root))
+                                .with_owner_id(owner_id),
                             tyref_to_value_type(dest_ty, self.llbc),
                         ),
                         None => (
@@ -2623,6 +2873,7 @@ impl<'a> Lowering<'a> {
                             field: crate::model::FieldDescriptor {
                                 name,
                                 owner_root: Some(result_ty_owner.clone()),
+                                owner_id: None,
                             },
                             value: crate::model::LinkArg::Value(value),
                             ty: ValueType::Ref(None),
@@ -2637,12 +2888,22 @@ impl<'a> Lowering<'a> {
             // field read at the bit level, and reusing the existing
             // `FieldRead` shape keeps the IR closed under the opkind
             // catalogue (per `front/mod.rs` rule — no new OpKinds in
-            // this layer). `owner_root` is left
-            // `None` because Charon's [`Place`] does not yet surface a
-            // resolvable enum type name; the codewriter that consumes
-            // this op may look up the receiver's classdef hint from
-            // type-flow if it needs a more specific descriptor.
+            // this layer).  The read is keyed to the enum base identity
+            // (`owner_root = module::Enum`, `owner_id = StructId`) so it
+            // resolves at the tag's real byte position — the enum base is
+            // registered in `exact_layouts` with `__discriminant` at
+            // `discriminant_offset()`.  A tag at offset 0 (the common
+            // case) registers 0, identical to the prior heuristic.  An
+            // unresolvable place type falls back to the unowned read.
             Rvalue::Discriminant(place) => {
+                let (owner_root, owner_id) = match self.tyref_adt_name_path(&place.ty) {
+                    Some(name_path) => {
+                        let canon = strip_crate_prefix(&name_path);
+                        let sid = majit_ir::descr::StructId::from_canonical(&canon);
+                        (Some(canon), Some(sid))
+                    }
+                    None => (None, None),
+                };
                 let base = self.resolve_place(mir_bb, place)?;
                 let res = self
                     .graph
@@ -2650,7 +2911,11 @@ impl<'a> Lowering<'a> {
                 Ok((
                     Some(OpKind::FieldRead {
                         base,
-                        field: FieldDescriptor::new("__discriminant", None),
+                        field: crate::model::FieldDescriptor {
+                            name: "__discriminant".to_string(),
+                            owner_root,
+                            owner_id,
+                        },
                         ty: ValueType::Int,
                         pure: true,
                     }),
@@ -2768,7 +3033,7 @@ impl<'a> Lowering<'a> {
                 // typed analogue today.
                 if let ProjectionElem::Tagged(v) = &elem
                     && let Some(field_payload) = v.as_object().and_then(|m| m.get("Field"))
-                    && let Some((owner_root, field_name, field_ty)) =
+                    && let Some((owner_root, field_name, field_ty, owner_id)) =
                         self.resolve_adt_field(field_payload)
                 {
                     let base = self.resolve_place(mir_bb, *inner)?;
@@ -2793,7 +3058,8 @@ impl<'a> Lowering<'a> {
                         result: Some(res.clone()),
                         kind: OpKind::FieldRead {
                             base,
-                            field: FieldDescriptor::new(field_name, Some(owner_root)),
+                            field: FieldDescriptor::new(field_name, Some(owner_root))
+                                .with_owner_id(owner_id),
                             ty,
                             pure: false,
                         },
@@ -3159,11 +3425,17 @@ impl<'a> Lowering<'a> {
         }
     }
 
-    /// The owner_root is the LLBC TypeDecl's leaf name
+    /// For a struct the owner_root is the LLBC TypeDecl's leaf name
     /// (`PyFrame` from `pyre_interpreter::pyframe::PyFrame`) so the
-    /// downstream `struct_fields` registry resolves with the same
-    /// leaf key.
-    fn resolve_adt_field(&self, payload: &serde_json::Value) -> Option<(String, String, TyRef)> {
+    /// downstream `struct_fields` registry resolves with the same leaf
+    /// key.  For an enum the read is a variant downcast, so the
+    /// owner_root is the variant-qualified `{enum_leaf}::{variant}` key
+    /// (the variant subclass carries its own fields at the exact
+    /// per-variant offset).
+    fn resolve_adt_field(
+        &self,
+        payload: &serde_json::Value,
+    ) -> Option<(String, String, TyRef, Option<majit_ir::descr::StructId>)> {
         let arr = payload.as_array()?;
         if arr.len() != 2 {
             return None;
@@ -3174,13 +3446,14 @@ impl<'a> Lowering<'a> {
         let variant_idx = adt.get(1).and_then(serde_json::Value::as_u64);
         let field_idx = arr[1].as_u64()? as usize;
         let td = self.llbc.type_by_id(type_id)?;
-        let owner_root = td
-            .item_meta
-            .name_path()
-            .rsplit("::")
-            .next()
-            .unwrap_or("")
-            .to_string();
+        // The full `name_path()` is in hand here, so mint the owning
+        // type's object-identity token from the crate-stripped qualified
+        // path (`module::Type` / `module::Enum::Variant`) — the same key
+        // the layout layer is registered under.  `owner_root` stays the
+        // bare leaf its non-layout consumers expect; `owner_id` carries
+        // the collision-free identity for the layout layer.
+        let name_path = td.item_meta.name_path();
+        let owner_root = name_path.rsplit("::").next().unwrap_or("").to_string();
         match (&td.kind, variant_idx) {
             (TypeDeclKind::Struct(fields), None) => {
                 let f = fields.get(field_idx)?;
@@ -3189,7 +3462,10 @@ impl<'a> Lowering<'a> {
                     .clone()
                     .unwrap_or_else(|| format!("__pos_{field_idx}"));
                 let ty = clone_tyref(&f.ty);
-                Some((owner_root, name, ty))
+                let owner_id = Some(majit_ir::descr::StructId::from_canonical(
+                    &strip_crate_prefix(&name_path),
+                ));
+                Some((owner_root, name, ty, owner_id))
             }
             (TypeDeclKind::Enum(variants), Some(vidx)) => {
                 let variant = variants.get(vidx as usize)?;
@@ -3199,7 +3475,18 @@ impl<'a> Lowering<'a> {
                     .clone()
                     .unwrap_or_else(|| format!("__pos_{field_idx}"));
                 let ty = clone_tyref(&f.ty);
-                Some((owner_root, name, ty))
+                // owner_root = the variant subclass `{enum_leaf}::{variant}`
+                // — the read resolves the variant's own field at its exact
+                // enum-relative offset (`variant_layouts[vidx].field_offsets`,
+                // registered under this key).  The downcast statically fixes
+                // the variant.
+                let variant_owner = format!("{owner_root}::{}", variant.name);
+                let owner_id = Some(majit_ir::descr::StructId::from_canonical(&format!(
+                    "{}::{}",
+                    strip_crate_prefix(&name_path),
+                    variant.name
+                )));
+                Some((variant_owner, name, ty, owner_id))
             }
             _ => None,
         }
@@ -4877,7 +5164,18 @@ impl<'a> Lowering<'a> {
                 result_ty: ValueType::Int,
             },
         );
-        self.emit_tagged_pair_aggregate(mir_bb, &owner, disc, payload, dest_local, target)?;
+        // Success (`arg != MIN`) is the `Some` variant (discriminant 1).
+        let payload_owner =
+            Self::tagged_pair_payload_owner(td, &owner, 1).unwrap_or_else(|| owner.clone());
+        self.emit_tagged_pair_aggregate(
+            mir_bb,
+            &owner,
+            &payload_owner,
+            disc,
+            payload,
+            dest_local,
+            target,
+        )?;
         Ok(true)
     }
 
@@ -4953,7 +5251,18 @@ impl<'a> Lowering<'a> {
                 result: Some(disc.clone()),
                 kind: OpKind::ConstInt(0),
             });
-            self.emit_tagged_pair_aggregate(mir_bb, &owner, disc, arg, dest_local, target)?;
+            // Always-`Ok`: the payload belongs to the `Ok` variant (tag 0).
+            let payload_owner =
+                Self::tagged_pair_payload_owner(td, &owner, 0).unwrap_or_else(|| owner.clone());
+            self.emit_tagged_pair_aggregate(
+                mir_bb,
+                &owner,
+                &payload_owner,
+                disc,
+                arg,
+                dest_local,
+                target,
+            )?;
             return Ok(true);
         }
         // Identity widening: bind the destination local directly to
@@ -5179,6 +5488,37 @@ impl<'a> Lowering<'a> {
             .as_str()
     }
 
+    /// The variant-qualified owner key `{owner}::{variant}` for the
+    /// SUCCESS variant a tagged-pair `__pos_0` payload belongs to
+    /// (`Option::Some` at disc 1, `Result::Ok` at disc 0).
+    ///
+    /// Resolution prefers the variant carrying the declared discriminant.
+    /// For a niche-optimised layout where the success variant has no
+    /// explicit discriminant (`discriminant_i64()` is `None`), it falls
+    /// back to the SOLE payload-carrying variant — the `__pos_0` payload
+    /// belongs to it by definition, never to the empty `None`/`Err`
+    /// sibling or the enum root (whose only field after the base/variant
+    /// split is `__discriminant`).  Resolving to the variant keeps the
+    /// write owner in agreement with the variant-qualified read owner
+    /// (`resolve_adt_field`).  `None` only when `td` is not an enum or no
+    /// single payload variant can be identified.
+    fn tagged_pair_payload_owner(td: &TypeDecl, owner: &str, disc: i64) -> Option<String> {
+        let TypeDeclKind::Enum(variants) = &td.kind else {
+            return None;
+        };
+        let v = variants
+            .iter()
+            .find(|v| v.discriminant_i64() == Some(disc))
+            .or_else(|| {
+                let mut payload_variants = variants.iter().filter(|v| !v.fields.is_empty());
+                match (payload_variants.next(), payload_variants.next()) {
+                    (Some(only), None) => Some(only),
+                    _ => None,
+                }
+            })?;
+        Some(format!("{owner}::{}", v.name))
+    }
+
     /// Shared tail for the decomposed checked-arithmetic /
     /// infallible-conversion call lowerings: write `disc` and
     /// `payload` into the destination `Option`/`Result` local as a
@@ -5187,22 +5527,23 @@ impl<'a> Lowering<'a> {
     /// local and close the block toward the call's success target.
     ///
     /// Unlike `resolve_aggregate_adt`'s enum arm, which constructs
-    /// the VARIANT identity (`Option::Some`), this constructs the
-    /// enum TYPE root (`Option`) and writes `__discriminant`
-    /// explicitly.  That is deliberate: `disc` may be a runtime value
-    /// (`checked_neg`'s `ne(v, MIN)`), so no single variant identity
-    /// is correct, and the enum root is exactly the flat class every
-    /// downstream enum attr read keys (`Rvalue::Discriminant` reads
-    /// `__discriminant` with no owner, payload projections key the
-    /// enum leaf — `resolve_adt_field` — and `extract_struct_fields`
-    /// registers `__discriminant` + the payload-field union on the
-    /// root).  Constructing a variant identity here instead breaks
-    /// the real-path annotation of multi-assigned destination locals
-    /// (`<other> ∪ int` UnionError in `mergeinputargs`).
+    /// the VARIANT identity (`Option::Some`), the CTOR here constructs
+    /// the enum TYPE root (`Option`).  That is deliberate: `disc` may
+    /// be a runtime value (`checked_neg`'s `ne(v, MIN)`), so no single
+    /// variant identity annotates the destination, and the root is the
+    /// `SomeInstance(enum)` that multi-assigned locals union against
+    /// (`<other> ∪ int` UnionError in `mergeinputargs` otherwise).
+    /// The `__discriminant` write keys the root too (the tag sits at
+    /// offset 0 of every variant).  The `__pos_0` write keys
+    /// `payload_owner` — the SUCCESS variant (`Option::Some` /
+    /// `Result::Ok`) — so its runtime offset matches the
+    /// `resolve_adt_field` read, which is variant-qualified
+    /// (`{enum_leaf}::{variant}`).
     fn emit_tagged_pair_aggregate(
         &mut self,
         mir_bb: usize,
         owner: &str,
+        payload_owner: &str,
         disc: Variable,
         payload: Variable,
         dest_local: usize,
@@ -5233,14 +5574,20 @@ impl<'a> Lowering<'a> {
         // `__pos_0` payload is the negated / widened integer the
         // `checked_neg` / `usize::try_from` callers materialize.  A
         // `Ref` field type here would disagree with that registration.
-        for (name, value) in [("__discriminant", disc), ("__pos_0", payload)] {
+        // `__discriminant` keys the root (tag offset 0); `__pos_0` keys
+        // the success variant so its exact offset matches the read.
+        for (name, value, field_owner) in [
+            ("__discriminant", disc, owner),
+            ("__pos_0", payload, payload_owner),
+        ] {
             self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                 result: None,
                 kind: OpKind::FieldWrite {
                     base: res.clone(),
                     field: crate::model::FieldDescriptor {
                         name: name.to_string(),
-                        owner_root: Some(owner.to_string()),
+                        owner_root: Some(field_owner.to_string()),
+                        owner_id: None,
                     },
                     value: LinkArg::Value(value),
                     ty: ValueType::Int,
@@ -8192,25 +8539,18 @@ mod tests {
         enums.insert("pyre_object::flow::Verdict".to_string(), same_as_a.clone());
         enums.insert("pyre_jit::flow::Verdict".to_string(), same_as_a.clone());
         enums.insert("Verdict".to_string(), same_as_a.clone());
-        reg.enum_roots
-            .insert("pyre_interpreter::eval::StepResult".to_string());
-        reg.enum_roots
-            .insert("pyre_jit::eval::StepResult".to_string());
-        reg.enum_roots.insert("StepResult".to_string());
-        reg.enum_roots
-            .insert("pyre_object::flow::Verdict".to_string());
-        reg.enum_roots.insert("pyre_jit::flow::Verdict".to_string());
-        reg.enum_roots.insert("Verdict".to_string());
+        // The `__discriminant`-only base rows as the enum arm registers
+        // them — shape-identical across enums, so only the discriminant
+        // divergence above can adjudicate the bare alias.
+        let disc = rows(&[("__discriminant", "i64")]);
+        reg.fields.insert("StepResult".to_string(), disc.clone());
+        reg.fields.insert("Verdict".to_string(), disc.clone());
 
         harden_duplicate_leaf_metadata(&mut reg, &mut origins, &mut enums);
 
         assert!(
             !enums.contains_key("StepResult"),
             "discriminant-divergent duplicate leaf must lose its bare alias"
-        );
-        assert!(
-            !reg.enum_roots.contains("StepResult"),
-            "a discriminant-divergent enum leaf must not remain an enum-root alias"
         );
         assert!(enums.contains_key("pyre_interpreter::eval::StepResult"));
         assert!(enums.contains_key("pyre_jit::eval::StepResult"));
@@ -8219,33 +8559,16 @@ mod tests {
             Some(&same_as_a),
             "equal-map duplicates keep the alias"
         );
+        // The bare enum-base row follows the discriminant signal: dropped
+        // for the divergent leaf, kept for the equal-map one.
         assert!(
-            reg.enum_roots.contains("Verdict"),
-            "equal-map duplicate enum roots keep the alias"
+            !reg.fields.contains_key("StepResult"),
+            "divergent enum base must lose its bare alias so it is not pre-minted as one merged class"
         );
-    }
-
-    #[test]
-    fn harden_withdraws_enum_root_alias_for_struct_enum_leaf_collision() {
-        let mut reg = crate::front::semantic::StructFieldRegistry::default();
-        let enum_shape = rows(&[("__discriminant", "i64")]);
-        let struct_shape = rows(&[("payload", "i64")]);
-        reg.fields
-            .insert("left::Thing".to_string(), enum_shape.clone());
-        reg.fields.insert("right::Thing".to_string(), struct_shape);
-        reg.fields.insert("Thing".to_string(), enum_shape);
-        reg.enum_roots.insert("left::Thing".to_string());
-        reg.enum_roots.insert("Thing".to_string());
-        let mut origins = std::collections::HashMap::new();
-        origins.insert("Thing".to_string(), "left".to_string());
-        let mut enums = std::collections::HashMap::new();
-
-        harden_duplicate_leaf_metadata(&mut reg, &mut origins, &mut enums);
-
-        assert!(reg.enum_roots.contains("left::Thing"));
-        assert!(
-            !reg.enum_roots.contains("Thing"),
-            "mixed struct/enum duplicate leaf must lose the enum-root bare alias"
+        assert_eq!(
+            reg.fields.get("Verdict"),
+            Some(&disc),
+            "equal-map enum base keeps its bare alias"
         );
     }
 
@@ -8268,6 +8591,50 @@ mod tests {
         assert_eq!(
             origins.get("W_IntObject").map(String::as_str),
             Some("intobject")
+        );
+    }
+
+    #[test]
+    fn harden_withdraws_shape_divergent_variant_leaf_alias() {
+        let mut reg = crate::front::semantic::StructFieldRegistry::default();
+        let shape_a = rows(&[("__pos_0", "i64")]);
+        let shape_b = rows(&[("__pos_0", "*mut Foo"), ("__pos_1", "u32")]);
+        // Two `Outcome` enums in different modules whose `Ok` variant rows
+        // diverge — the bare `Outcome::Ok` alias is last-decl-wins (shape_b),
+        // as the variant dual-publish leaves it.
+        reg.fields
+            .insert("crateX::moduleA::Outcome::Ok".to_string(), shape_a.clone());
+        reg.fields
+            .insert("moduleA::Outcome::Ok".to_string(), shape_a.clone());
+        reg.fields
+            .insert("crateY::moduleB::Outcome::Ok".to_string(), shape_b.clone());
+        reg.fields
+            .insert("moduleB::Outcome::Ok".to_string(), shape_b.clone());
+        reg.fields.insert("Outcome::Ok".to_string(), shape_b);
+        // A shape-identical `Status::Active` duplicate keeps its bare alias.
+        let shape_s = rows(&[("__pos_0", "u8")]);
+        reg.fields
+            .insert("moduleC::Status::Active".to_string(), shape_s.clone());
+        reg.fields
+            .insert("moduleD::Status::Active".to_string(), shape_s.clone());
+        reg.fields
+            .insert("Status::Active".to_string(), shape_s.clone());
+
+        let mut origins = std::collections::HashMap::new();
+        let mut enums = std::collections::HashMap::new();
+
+        harden_duplicate_leaf_metadata(&mut reg, &mut origins, &mut enums);
+
+        assert!(
+            !reg.fields.contains_key("Outcome::Ok"),
+            "shape-divergent variant-leaf alias must be withdrawn (bare last-segment pass missed it)"
+        );
+        assert!(reg.fields.contains_key("moduleA::Outcome::Ok"));
+        assert!(reg.fields.contains_key("moduleB::Outcome::Ok"));
+        assert_eq!(
+            reg.fields.get("Status::Active"),
+            Some(&shape_s),
+            "shape-identical variant duplicate keeps its bare alias"
         );
     }
 

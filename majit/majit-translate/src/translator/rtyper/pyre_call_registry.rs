@@ -61,7 +61,7 @@
 //! FunctionRepr.call`) all see the registry's entries.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::annotator::bookkeeper::Bookkeeper;
@@ -154,6 +154,39 @@ impl PyreFunctionEntry {
     }
 }
 
+/// Per-subject result of the two-phase rtyper drive (`PYRE_TWO_PHASE_RTYPE`).
+///
+/// Phase A (annotate-all over the portal closure) populates `value_to_var` /
+/// `constant_concretetypes` via the adapter + annotate-half and records the
+/// flowspace `graph_key`. Phase B (rtype-all with per-graph isolation) writes
+/// `Variable.concretetype` onto the `value_to_var` Variables in place, or
+/// records the `graph_key` in [`TwoPhaseTypeCache::rtype_skipped`] on failure.
+/// The per-graph publish reads this back instead of re-running the real path,
+/// reproducing upstream's `translator.annotate()` → `rtyper.specialize()` →
+/// `codewriter.make_jitcodes()` phase ordering (`driver.py:306/345/361`).
+pub struct TwoPhaseSubject {
+    pub graph_key: crate::flowspace::model::GraphKey,
+    pub value_to_var: crate::translator::rtyper::flowspace_adapter::LegacyToTyped,
+    pub constant_concretetypes: HashMap<
+        crate::flowspace::model::Variable,
+        crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+    >,
+}
+
+/// Whole-program two-phase type cache, keyed by subject path canonical key
+/// (`CallPath::canonical_key()`, the same string the publish receives as its
+/// `diag_label`).
+#[derive(Default)]
+pub struct TwoPhaseTypeCache {
+    pub subjects: HashMap<String, TwoPhaseSubject>,
+    /// Flowspace graph keys whose Phase-B rtype failed → publish Skips them
+    /// to the legacy walker (the migration-scaffold fallback).
+    pub rtype_skipped: HashSet<crate::flowspace::model::GraphKey>,
+    /// Set once the prepass has run so publish consults the cache instead of
+    /// re-running the real path. Cleared/absent ⟹ legacy per-graph behaviour.
+    pub prepass_done: bool,
+}
+
 /// Per-program registry. Constructed once per `analyze_program` /
 /// `specialize_legacy_graph_with_registry_returning_value_to_var`
 /// driver invocation; shares
@@ -180,6 +213,9 @@ pub struct PyreCallRegistry {
     bookkeeper: Rc<Bookkeeper>,
     entries: RefCell<HashMap<FunctionPathKey, Rc<PyreFunctionEntry>>>,
     aliases: RefCell<HashMap<FunctionPathKey, FunctionPathKey>>,
+    /// Whole-program two-phase type cache (`PYRE_TWO_PHASE_RTYPE`). Empty and
+    /// `prepass_done = false` unless the two-phase prepass populated it.
+    two_phase: RefCell<TwoPhaseTypeCache>,
     /// Lazily-constructed `(RPythonAnnotator, RPythonTyper)` pair
     /// shared by every per-session
     /// `specialize_legacy_graph_with_registry_returning_value_to_var`
@@ -206,8 +242,20 @@ impl PyreCallRegistry {
             bookkeeper,
             entries: RefCell::new(HashMap::new()),
             aliases: RefCell::new(HashMap::new()),
+            two_phase: RefCell::new(TwoPhaseTypeCache::default()),
             session: RefCell::new(None),
         }
+    }
+
+    /// Mutable access to the two-phase type cache (`PYRE_TWO_PHASE_RTYPE`).
+    pub fn two_phase(&self) -> std::cell::RefMut<'_, TwoPhaseTypeCache> {
+        self.two_phase.borrow_mut()
+    }
+
+    /// True once the two-phase prepass populated the cache; publish then reads
+    /// cached types instead of re-running the real path.
+    pub fn two_phase_prepass_done(&self) -> bool {
+        self.two_phase.borrow().prepass_done
     }
 
     /// Thread the program-wide `StructFieldRegistry` into the shared

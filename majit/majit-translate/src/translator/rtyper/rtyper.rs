@@ -2051,6 +2051,50 @@ impl RPythonTyper {
         Ok(())
     }
 
+    /// Migration-scaffold variant of [`call_all_setups`] that tolerates a
+    /// single repr's setup failure (e.g. an unported `DictRepr` panicking in
+    /// `rtyper_makerepr`) instead of aborting the whole batch with `?`.
+    ///
+    /// The whole-program two-phase prepass (Phase B, `cutover::
+    /// run_phase_b_rtype_isolated`) drives one shared rtyper over every
+    /// annotated graph; upstream `specialize()` is single-pass-fatal
+    /// (`rtyper.py:177-296`), but while pyre's legacy walker is still the
+    /// per-graph fallback+oracle, one graph's unported repr must not block
+    /// rtyping of every other graph. Each failing repr is dropped from the
+    /// queue (the graph that needs it later fails its own `specialize_block`
+    /// and is Skip-classified). Returns the number of skipped reprs. Does NOT
+    /// replace [`call_all_setups`] — the fused per-graph path keeps the strict,
+    /// parity-faithful `?`-propagating version.
+    pub fn call_all_setups_skip_tolerant(&self) -> usize {
+        let mut must_setup_more: Vec<Arc<dyn Repr>> = Vec::new();
+        let mut delayed: Vec<Arc<dyn Repr>> = Vec::new();
+        let mut skipped = 0usize;
+        loop {
+            let r = self.reprs_must_call_setup.borrow_mut().pop();
+            let Some(r) = r else {
+                break;
+            };
+            if r.is_setup_delayed() {
+                delayed.push(r);
+            } else {
+                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| r.setup()));
+                if matches!(res, Ok(Ok(()))) {
+                    must_setup_more.push(r);
+                } else {
+                    skipped += 1;
+                }
+            }
+        }
+        for r in &must_setup_more {
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| r.setup_final()));
+            if !matches!(res, Ok(Ok(()))) {
+                skipped += 1;
+            }
+        }
+        self.reprs_must_call_setup.borrow_mut().extend(delayed);
+        skipped
+    }
+
     /// RPython `HighLevelOp.dispatch` target (`rtyper.py:648-653`).
     pub fn translate_operation(&self, hop: &HighLevelOp) -> RTypeResult {
         match hop.spaceop.opname.as_str() {

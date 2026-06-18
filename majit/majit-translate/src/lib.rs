@@ -549,6 +549,10 @@ fn analyze_pipeline_from_module_paths(
     // `front::mir::derive_program_metadata`; any leaf absent from the map
     // still resolves through the runtime's simple-name dual-publish slot.
     majit_ir::descr::register_struct_origins(program.struct_origins.clone());
+    // Seed the name → StructId resolver so the layout consumers that only
+    // hold a string (`llmemory::FieldOffset`'s `st._name`, a nested
+    // field's rendered type) can reach the identity-keyed layout maps.
+    majit_ir::descr::register_struct_ids(program.struct_ids.clone());
     // Tier-3: seed `FORCE_ATTRIBUTES_INTO_CLASSES` (classdesc.py:957-961)
     // from the LLBC-sourced `program.struct_field_attrs` so
     // `ClassDesc::_init_classdef` pre-fills `ClassDef.attrs` before the
@@ -808,10 +812,29 @@ fn analyze_pipeline_from_module_paths(
     // `front::mir::collect_unsafe_fn_stubs_from_llbc`, populated on the
     // SemanticProgram in `build_semantic_program_via_active_frontend`.
     call_control.unsafe_fn_stubs = program.unsafe_fn_stubs.clone();
-    // Populate CallControl with layouts from the provider.
+    // Populate CallControl with layouts from the provider.  Where Charon
+    // resolved an exact layout (`program.exact_layouts`), use the true Rust
+    // offsets and total size — `#[repr(Rust)]` reorders/repacks fields, so
+    // the heuristic's `#[repr(C)]` approximation can disagree with the real
+    // allocation. For enum-variant keys the exact offsets are tag-inclusive,
+    // so the variant payload resolves at its real position. Per-field type
+    // classification, immutability rank, and size stay as the provider
+    // computed them; only the byte offsets and the struct size are corrected.
     for struct_name in program.struct_fields.fields.keys() {
-        if let Some(layout) = provider.get_struct_layout(struct_name) {
-            call_control.set_struct_layout(struct_name.clone(), layout);
+        // Resolve the (possibly multi-spelled) field-registry key to its
+        // identity token; an unresolved / ambiguous bare leaf has no
+        // identity to key a layout on, so skip it.
+        let Some(sid) = majit_ir::descr::struct_id_for_name(struct_name) else {
+            continue;
+        };
+        let layout = match program.exact_layouts.get(&sid) {
+            Some(exact) => {
+                provider.get_struct_layout_exact(struct_name, &exact.field_offsets, exact.size)
+            }
+            None => provider.get_struct_layout(struct_name),
+        };
+        if let Some(layout) = layout {
+            call_control.set_struct_layout(sid, layout);
         }
     }
     // Register graphs collected above (free functions only — trait
@@ -1618,6 +1641,11 @@ fn build_canonical_opcode_dispatch(
     // Phase 1: RPython grab_initial_jitcodes + drain portal + callees.
     // RPython call.py:145-148.
     call_control.grab_initial_jitcodes();
+    // Two-phase rtyper prepass (production default; `PYRE_TWO_PHASE_RTYPE=0`
+    // opts out): annotate-all → rtype-all over the portal closure before the
+    // drain publishes any covered graph, so a shared callee (e.g. `type_error`)
+    // is unioned across all its callers before being rtyped.
+    codewriter.run_two_phase_prepass_if_enabled(call_control);
     codewriter.drain_pending_graphs(call_control, &pipeline_config.transform);
 
     // Phase 2: register each opcode arm body as a synthetic graph.

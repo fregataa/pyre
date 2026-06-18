@@ -1549,56 +1549,71 @@ pub fn translate_op(
                         }
                     } else {
                         let bk = call_registry.bookkeeper();
-                        let qualname = format!("{}.{}", owner_path.join("."), name);
                         // A variant ctor's owner tail is the enum type
                         // itself (`resolve_aggregate_adt` pushes the
                         // enum leaf onto the variant's owner path); a
                         // struct ctor's owner tail is its module.  The
-                        // enum registers as a flat class and records
-                        // its type root explicitly in
-                        // `StructFieldRegistry::enum_roots`, so this
-                        // check does not depend on the synthetic
-                        // `__discriminant` field name.  Mint the
-                        // variant class as a subclass of the flat enum class:
-                        // sibling variants then union to
-                        // `SomeInstance(enum)` through
-                        // `ClassDef::commonbase` (classdesc.py:251-254)
-                        // exactly as upstream sibling subclasses do in
-                        // `SomeInstance` union (binaryop.py), instead
-                        // of failing `mergeinputargs` with "no common
-                        // base class" (e.g. the per-variant arms of a
-                        // derived `PyErrorKind::clone`).  The flat
-                        // class is interned by the same leaf spelling
-                        // the field-read side uses
-                        // (`getuniqueclassdef_for_struct_root`), so
-                        // ctor base and attr reads share one
-                        // `HostObject` Arc.  Applies to every enum root,
-                        // payload-bearing included: the variant subclass
-                        // inherits the base's projected payload rows
-                        // exactly as the discriminant-narrowing path
-                        // already mints them (`getuniqueclassdef_for_enum_variant`
-                        // bases variants ungated), so this adds no repr
-                        // obligation beyond what narrowing already
-                        // creates.  A payload row whose repr is not yet
-                        // ported (e.g. `Vec` → rlist.py ListRepr) walls
-                        // later in `convert_from_to`, which the dual gate
-                        // degrades to a graceful legacy Skip — strictly
-                        // better than the base-less variant's
-                        // `mergeinputargs` "no common base class" panic
-                        // (sibling `Option::Some` ∪ `Option::None`).
-                        let enum_base = owner_path.last().and_then(|owner_tail| {
-                            let registry = bk.pyre_struct_fields.borrow();
-                            let is_enum_root = registry
-                                .as_ref()
-                                .is_some_and(|reg| reg.is_enum_root(owner_tail));
-                            drop(registry);
-                            is_enum_root.then(|| bk.intern_class_by_qualname(owner_tail))
-                        });
-                        match enum_base {
-                            Some(base) => {
-                                bk.intern_class_by_qualname_with_bases(&qualname, vec![base])
-                            }
-                            None => bk.intern_class_by_qualname(&qualname),
+                        // enum base registers as a flat class whose only
+                        // row is the synthetic `__discriminant` tag
+                        // (`front::mir` metadata collection) — no struct
+                        // carries one — so `is_enum_base` discriminates an
+                        // enum variant ctor from a struct ctor.
+                        //
+                        // An enum variant interns through the SAME
+                        // primitive the discriminant-narrowing path uses
+                        // ([`Bookkeeper::intern_enum_variant_host`]), keyed
+                        // by `canonical_struct_name(enum_leaf)::variant`.
+                        // A constructed `Some(x)` and a matched `Some(x)`
+                        // then resolve to ONE class object (`rclass.py:
+                        // 82-88` single-class-per-variant), so they union
+                        // to that variant (not the base) and agree on the
+                        // payload attr / field owner.  The variant is a
+                        // subclass of the discriminant-only enum base, so
+                        // sibling variants still union to
+                        // `SomeInstance(enum)` through `ClassDef::commonbase`
+                        // (classdesc.py:251-254) instead of failing
+                        // `mergeinputargs` with "no common base class".
+                        // `canonical_struct_name` keeps two enums sharing a
+                        // leaf (`StepResult::Continue` vs
+                        // `JitAction::Continue`) distinct.
+                        //
+                        // A struct ctor keeps its dotted qualname: the
+                        // FORCE-attr projection in `_init_classdef`
+                        // (`struct_force_key_from_dotted_qualname`) strips
+                        // the crate to the `module::Type` key the
+                        // struct-field FORCE table uses.  The bare-leaf
+                        // case above (`owner_path` empty) is unchanged: a
+                        // bare variant name like `Ok` is ambiguous across
+                        // enums, so it is not interned.
+                        // Probe the QUALIFIED enum-base spelling
+                        // (`owner_path.join("::")` = the enum's full
+                        // `name_path`) before the bare tail.  The qualified
+                        // key survives `harden_duplicate_leaf_metadata`'s
+                        // bare-leaf withdrawal, so a variant ctor of an enum
+                        // whose leaf collides across modules
+                        // (`StepResult::Continue` vs `JitAction::Continue`)
+                        // still routes through `intern_enum_variant_host`
+                        // instead of falling through to the dotted struct-ctor
+                        // branch — which would mint a class unrelated to the
+                        // matched variant's, breaking enum base/variant class
+                        // identity (RPython keys identity on the live class
+                        // object, never a name, so this cannot arise upstream).
+                        // Interning still keys on the bare tail: a constructed
+                        // value and a discriminant-narrowed value both reach
+                        // the SAME base classdef (the narrowing reads back the
+                        // classdef name the ctor minted), so they agree.
+                        let owner_tail = owner_path.last();
+                        let owner_qual = owner_path.join("::");
+                        let is_enum_variant =
+                            bk.pyre_struct_fields.borrow().as_ref().is_some_and(|reg| {
+                                reg.is_enum_base(&owner_qual)
+                                    || owner_tail.is_some_and(|tail| reg.is_enum_base(tail))
+                            });
+                        if is_enum_variant {
+                            bk.intern_enum_variant_host(owner_tail.unwrap(), &name)
+                        } else {
+                            let qualname = format!("{}.{}", owner_path.join("."), name);
+                            bk.intern_class_by_qualname(&qualname)
                         }
                     };
                     let callable = Hlvalue::Constant(Constant::new(ConstValue::HostObject(host)));
@@ -3759,68 +3774,6 @@ mod tests {
             panic!("ctor callable must be ConstValue::HostObject");
         };
         assert_eq!(host.qualname(), "Point");
-    }
-
-    #[test]
-    fn translate_op_call_synthetic_transparent_ctor_uses_explicit_enum_root_registry() {
-        fn color_registry(mark_enum: bool) -> crate::front::StructFieldRegistry {
-            let mut reg = crate::front::StructFieldRegistry::default();
-            reg.fields.insert(
-                "Color".to_string(),
-                vec![
-                    ("__discriminant".to_string(), "i64".to_string()),
-                    ("rgb".to_string(), "i64".to_string()),
-                ],
-            );
-            if mark_enum {
-                reg.enum_roots.insert("Color".to_string());
-            }
-            reg
-        }
-
-        fn lower_ctor(
-            reg: crate::front::StructFieldRegistry,
-        ) -> crate::flowspace::model::HostObject {
-            let registry = empty_call_registry();
-            registry.set_pyre_struct_fields(Rc::new(reg));
-            let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
-            let mut graph = LegacyGraph::new("translate_op_fixture");
-            let vars = mint_vars(&mut graph, 3);
-            value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
-            value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
-            let op = SpaceOperation {
-                result: Some(vars[2].clone()),
-                kind: OpKind::Call {
-                    target: crate::model::CallTarget::SyntheticTransparentCtor {
-                        name: "Rgb".into(),
-                        owner_path: vec!["Color".into()],
-                    },
-                    args: vec![vars[1].clone()],
-                    result_ty: ValueType::Ref(None),
-                },
-            };
-            let translated =
-                translate_op(&op, &value_map, &registry).expect("variant ctor must lower");
-            let Hlvalue::Constant(ref callable) = translated[0].args[0] else {
-                panic!("simple_call callable must be a Constant");
-            };
-            let ConstValue::HostObject(ref host) = callable.value else {
-                panic!("ctor callable must be ConstValue::HostObject");
-            };
-            host.clone()
-        }
-
-        let plain = lower_ctor(color_registry(false));
-        assert_eq!(plain.qualname(), "Color.Rgb");
-        assert!(
-            plain.class_bases().is_some_and(|bases| bases.is_empty()),
-            "__discriminant field rows alone must not mark a ctor as an enum variant"
-        );
-
-        let variant = lower_ctor(color_registry(true));
-        let bases = variant.class_bases().expect("variant ctor is a class");
-        assert_eq!(bases.len(), 1);
-        assert_eq!(bases[0].qualname(), "Color");
     }
 
     #[test]

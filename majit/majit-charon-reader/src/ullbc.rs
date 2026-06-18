@@ -113,6 +113,105 @@ pub struct TypeDecl {
     pub def_id: u64,
     pub item_meta: ItemMeta,
     pub kind: TypeDeclKind,
+    /// Per-target memory layout Charon resolved for the concrete type:
+    /// a list of `{key: <target-triple>, value: TypeLayout}` entries
+    /// (one per extraction target — a single-target extraction carries
+    /// one). Field byte offsets live in
+    /// `value.variant_layouts[variant_idx].field_offsets` (a struct is a
+    /// single variant); the discriminant tag position in
+    /// `value.discriminator`. Kept as raw JSON text and projected on
+    /// demand via [`TypeDecl::layout_for_target`] so an unmodelled or
+    /// exotic layout shape can never break the whole-LLBC load (the
+    /// schema-drift policy above). `None` when Charon emitted no layout.
+    #[serde(default)]
+    pub layout: Option<Box<RawValue>>,
+}
+
+/// One `{key, value}` entry of [`TypeDecl::layout`].
+#[derive(Debug, Deserialize)]
+pub struct TargetLayout {
+    pub key: String,
+    pub value: TypeLayout,
+}
+
+/// Resolved memory layout of a single concrete type for one target.
+#[derive(Debug, Deserialize)]
+pub struct TypeLayout {
+    #[serde(default)]
+    pub size: Option<u64>,
+    #[serde(default)]
+    pub align: Option<u64>,
+    /// One entry per variant (a struct has a single entry). Carries the
+    /// per-variant field byte offsets.
+    #[serde(default)]
+    pub variant_layouts: Vec<VariantLayout>,
+    /// Tag/niche decoder (`{"Branch": {"offset": ..., ...}}` for a
+    /// niche/tag enum). Kept raw; read the tag byte position via
+    /// [`TypeLayout::discriminant_offset`].
+    #[serde(default)]
+    pub discriminator: Option<Value>,
+}
+
+/// Per-variant field offsets within [`TypeLayout`].
+#[derive(Debug, Deserialize)]
+pub struct VariantLayout {
+    /// Byte offset of each field, indexed by the variant's field
+    /// declaration order (matches [`VariantDecl::fields`] / a struct's
+    /// [`FieldDecl`] order).
+    #[serde(default)]
+    pub field_offsets: Vec<u64>,
+}
+
+impl TypeDecl {
+    /// Project the per-target layout, selecting the entry whose target
+    /// triple equals `target`, or the sole entry when exactly one is
+    /// present (single-target extraction). Returns `None` when layout is
+    /// absent, unparseable, or no entry matches — callers fall back to
+    /// the heuristic layout provider.
+    pub fn layout_for_target(&self, target: &str) -> Option<TypeLayout> {
+        let raw = self.layout.as_ref()?;
+        let entries: Vec<TargetLayout> = serde_json::from_str(raw.get()).ok()?;
+        select_target_layout(entries, target)
+    }
+}
+
+/// Pick the [`TargetLayout`] matching `target`, or the sole entry when
+/// exactly one is present. Returns `None` for an empty list or a
+/// multi-target list with no match.
+fn select_target_layout(mut entries: Vec<TargetLayout>, target: &str) -> Option<TypeLayout> {
+    if let Some(pos) = entries.iter().position(|e| e.key == target) {
+        return Some(entries.swap_remove(pos).value);
+    }
+    if entries.len() == 1 {
+        return Some(entries.swap_remove(0).value);
+    }
+    None
+}
+
+impl TypeLayout {
+    /// Byte offset of field `field_idx` within variant `variant_idx`.
+    pub fn field_offset(&self, variant_idx: usize, field_idx: usize) -> Option<u64> {
+        self.variant_layouts
+            .get(variant_idx)?
+            .field_offsets
+            .get(field_idx)
+            .copied()
+    }
+
+    /// Byte offset of field `field_idx` of a struct (the single variant).
+    pub fn struct_field_offset(&self, field_idx: usize) -> Option<u64> {
+        self.field_offset(0, field_idx)
+    }
+
+    /// Byte position of the discriminant tag (`discriminator.Branch.offset`).
+    /// `None` for a single-variant type or a non-`Branch` discriminator.
+    pub fn discriminant_offset(&self) -> Option<u64> {
+        self.discriminator
+            .as_ref()?
+            .get("Branch")?
+            .get("offset")?
+            .as_u64()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -610,4 +709,84 @@ pub enum CallClass {
     Ptr,
     /// Unrecognised — fail-loud at lowering site.
     Unknown,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A struct's field offsets are the single `variant_layouts[0]` entry.
+    #[test]
+    fn struct_layout_field_offsets() {
+        let json = r#"{
+            "size": 80, "align": 8,
+            "discriminator": null, "uninhabited": false,
+            "variant_layouts": [
+                {"field_offsets": [0, 24, 48, 72, 73], "uninhabited": false, "tagger": []}
+            ],
+            "repr": {"repr_algo": "Rust"}
+        }"#;
+        let layout: TypeLayout = serde_json::from_str(json).unwrap();
+        assert_eq!(layout.size, Some(80));
+        assert_eq!(layout.align, Some(8));
+        assert_eq!(layout.struct_field_offset(0), Some(0));
+        assert_eq!(layout.struct_field_offset(3), Some(72));
+        assert_eq!(layout.struct_field_offset(4), Some(73));
+        assert_eq!(layout.struct_field_offset(5), None);
+        // single-variant type has no decodable discriminant tag
+        assert_eq!(layout.discriminant_offset(), None);
+    }
+
+    /// An enum's per-variant field offsets, plus the niche tag position.
+    #[test]
+    fn enum_layout_per_variant_offsets_and_tag() {
+        let json = r#"{
+            "size": 104, "align": 8,
+            "discriminator": {"Branch": {"offset": 0, "int_ty": {"Unsigned": "U8"}}},
+            "uninhabited": false,
+            "variant_layouts": [
+                {"field_offsets": [0], "uninhabited": false, "tagger": []},
+                {"field_offsets": [8], "uninhabited": false,
+                 "tagger": [[0, {"Unsigned": ["U8", "6"]}]]}
+            ],
+            "repr": {"repr_algo": "Rust"}
+        }"#;
+        let layout: TypeLayout = serde_json::from_str(json).unwrap();
+        assert_eq!(layout.field_offset(0, 0), Some(0));
+        assert_eq!(layout.field_offset(1, 0), Some(8));
+        assert_eq!(layout.field_offset(2, 0), None);
+        assert_eq!(layout.discriminant_offset(), Some(0));
+    }
+
+    /// Target selection: exact-match wins; a sole entry is chosen even
+    /// when the requested target differs; an empty/no-match list is `None`.
+    #[test]
+    fn target_layout_selection() {
+        let two = r#"[
+            {"key": "x86_64-unknown-linux-gnu",
+             "value": {"variant_layouts": [{"field_offsets": [0]}]}},
+            {"key": "aarch64-apple-darwin",
+             "value": {"size": 16, "variant_layouts": [{"field_offsets": [8]}]}}
+        ]"#;
+        let entries: Vec<TargetLayout> = serde_json::from_str(two).unwrap();
+        // exact match selects the aarch64 entry (offset 8), not the first
+        assert_eq!(
+            select_target_layout(entries, "aarch64-apple-darwin")
+                .and_then(|l| l.struct_field_offset(0)),
+            Some(8)
+        );
+
+        let sole = r#"[{"key": "x86_64-unknown-linux-gnu",
+            "value": {"variant_layouts": [{"field_offsets": [0]}]}}]"#;
+        let entries: Vec<TargetLayout> = serde_json::from_str(sole).unwrap();
+        // sole entry chosen despite a non-matching requested target
+        assert_eq!(
+            select_target_layout(entries, "aarch64-apple-darwin")
+                .and_then(|l| l.struct_field_offset(0)),
+            Some(0)
+        );
+
+        // empty list → None
+        assert!(select_target_layout(Vec::new(), "aarch64-apple-darwin").is_none());
+    }
 }

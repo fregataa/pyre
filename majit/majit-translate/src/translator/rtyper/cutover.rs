@@ -1576,6 +1576,37 @@ pub fn specialize_legacy_graph_with_registry_returning_value_to_var(
     legacy: &LegacyGraph,
     call_registry: &crate::translator::rtyper::pyre_call_registry::PyreCallRegistry,
 ) -> Result<(LegacyToTyped, HashMap<Variable, LowLevelType>), TyperError> {
+    let (_graph, value_to_var, constant_concretetypes) =
+        drive_subject(legacy, call_registry, true)?;
+    Ok((value_to_var, constant_concretetypes))
+}
+
+/// Annotate one legacy subject against the shared session annotator/rtyper,
+/// optionally rtyping it in the same call.
+///
+/// `do_rtype = true` is the fused per-graph dual-gate path: annotate-half +
+/// `specialize_more_blocks` + lltype validation, committing the subject's
+/// blocks after rtype (the original behaviour, byte-identical).
+///
+/// `do_rtype = false` is the two-phase Phase-A annotate-only path: it runs the
+/// annotate-half and commits the subject's blocks into the shared session
+/// WITHOUT rtyping, so a later whole-program Phase-B `specialize_more_blocks`
+/// rtypes every annotated block at once — after all callers of a shared callee
+/// (e.g. `type_error`) have unioned its arg to a general `SomeString`, which is
+/// what removes the `fixed_graphs` late-stage-modify Skip. Returns the lifted
+/// flowspace `GraphRef` so the two-phase cache can record its `GraphKey`.
+fn drive_subject(
+    legacy: &LegacyGraph,
+    call_registry: &crate::translator::rtyper::pyre_call_registry::PyreCallRegistry,
+    do_rtype: bool,
+) -> Result<
+    (
+        crate::flowspace::model::GraphRef,
+        LegacyToTyped,
+        HashMap<Variable, LowLevelType>,
+    ),
+    TyperError,
+> {
     // RPython parity path.
     //
     // Upstream `RPythonTyper.specialize` runs ONCE per `Translator`,
@@ -1789,26 +1820,33 @@ pub fn specialize_legacy_graph_with_registry_returning_value_to_var(
     // adaptations.  Once R4 lands, `make_helpers` migrates to
     // `ensure_session` after `finish_exceptiondata` (single
     // session-prologue), keeping the per-subject body unchanged.
-    rtyper.specialize_more_blocks()?;
-
-    // ── Step 4 — validate per-slot lltype projection ──────────────
     //
-    // No eager per-slot side table is built here.  Each callable that
-    // needs a kind view derives one on demand from `value_to_var` +
-    // `constant_concretetypes` via
-    // [`project_value_to_var`] — same `Variable.concretetype`
-    // / `Constant.concretetype` ground truth, just routed at the
-    // consumer instead of eagerly materialised here.  Run a
-    // validation pass so unsupported lltypes still surface as a
-    // [`TyperError`] at this boundary (a fail-loud `?` propagation).
-    for var in value_to_var.values() {
-        let cell = var.concretetype.borrow();
-        if let Some(lltype) = cell.as_ref() {
+    // In the two-phase path (`do_rtype = false`) the rtype-half is
+    // deferred to the whole-program Phase-B `specialize_more_blocks`
+    // (see `run_two_phase_prepass`); this call only annotates, leaving
+    // the subject's blocks in `annotated` for that single later pass.
+    if do_rtype {
+        rtyper.specialize_more_blocks()?;
+
+        // ── Step 4 — validate per-slot lltype projection ──────────────
+        //
+        // No eager per-slot side table is built here.  Each callable that
+        // needs a kind view derives one on demand from `value_to_var` +
+        // `constant_concretetypes` via
+        // [`project_value_to_var`] — same `Variable.concretetype`
+        // / `Constant.concretetype` ground truth, just routed at the
+        // consumer instead of eagerly materialised here.  Run a
+        // validation pass so unsupported lltypes still surface as a
+        // [`TyperError`] at this boundary (a fail-loud `?` propagation).
+        for var in value_to_var.values() {
+            let cell = var.concretetype.borrow();
+            if let Some(lltype) = cell.as_ref() {
+                lowleveltype_to_concrete(lltype)?;
+            }
+        }
+        for lltype in constant_concretetypes.values() {
             lowleveltype_to_concrete(lltype)?;
         }
-    }
-    for lltype in constant_concretetypes.values() {
-        lowleveltype_to_concrete(lltype)?;
     }
 
     // The subject specialized cleanly — keep its blocks in the shared
@@ -1827,7 +1865,276 @@ pub fn specialize_legacy_graph_with_registry_returning_value_to_var(
         crate::jit_codewriter::jtransform_shadow::report_if_enabled(&graph.borrow());
     }
 
-    Ok((value_to_var, constant_concretetypes))
+    Ok((graph, value_to_var, constant_concretetypes))
+}
+
+/// Whole-program two-phase rtyper prepass (`PYRE_TWO_PHASE_RTYPE`).
+///
+/// Mirrors upstream `translator.annotate()` → `rtyper.specialize()`
+/// (`driver.py:325/345`): Phase A annotates EVERY graph in the portal closure
+/// to fixpoint — sharing the session annotator so all callers of a shared
+/// callee (e.g. `type_error`) union its arg to a general `SomeString` — THEN
+/// Phase B rtypes every annotated block in one pass. The per-graph publish
+/// ([`dual_gate_outcome_from_cache`]) reads the cached result instead of
+/// re-running the fused per-graph path, so no callee is rtyped before all its
+/// callers are annotated, removing the `fixed_graphs` late-stage-modify Skip.
+///
+/// Populates `call_registry.two_phase()`. The prepass is fully panic-contained
+/// and ALWAYS sets `prepass_done = true`: `make_jitcodes` runs in a spawned
+/// worker thread, so any escaping panic (the annrpython late-stage `panic!`, a
+/// `call_all_setups` failure, an unported repr setup) would unwind the thread
+/// and fail the build. The publish path ([`dual_gate_outcome_from_cache`]) is
+/// session-independent — it reads cached `Variable`s and re-runs the legacy
+/// walker, never the flowspace session — so a partial cache from an aborted
+/// prepass still yields Match for the graphs that completed and a safe
+/// legacy-walker Skip for the rest (zero regression, never the poisoned session).
+pub fn run_two_phase_prepass(
+    call_registry: &PyreCallRegistry,
+    candidate_graphs: &HashSet<crate::parse::CallPath>,
+    function_graphs: &crate::jit_codewriter::call::GraphStore,
+) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_two_phase_prepass_inner(call_registry, candidate_graphs, function_graphs)
+    }));
+    call_registry.two_phase().prepass_done = true;
+}
+
+fn run_two_phase_prepass_inner(
+    call_registry: &PyreCallRegistry,
+    candidate_graphs: &HashSet<crate::parse::CallPath>,
+    function_graphs: &crate::jit_codewriter::call::GraphStore,
+) {
+    // Deterministic order (R3): candidate_graphs is a HashSet; iterating it
+    // directly would make classdef numbering (and thus Match/Skip
+    // classification) vary run-to-run.
+    let mut paths: Vec<&crate::parse::CallPath> = candidate_graphs
+        .iter()
+        .filter(|p| function_graphs.get(p).is_some())
+        .collect();
+    paths.sort_by_key(|p| p.canonical_key());
+
+    // ── Phase A — annotate-all over the portal closure ───────────────
+    for path in &paths {
+        let Some(legacy) = function_graphs.get(path) else {
+            continue;
+        };
+        let fixed_at_entry: HashSet<crate::flowspace::model::GraphKey> = call_registry
+            .session_if_started()
+            .map(|(ann, _)| ann.fixed_graphs.borrow().keys().cloned().collect())
+            .unwrap_or_default();
+        let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drive_subject(legacy, call_registry, /* do_rtype = */ false)
+        }));
+        match attempt {
+            Ok(Ok((graph, value_to_var, constant_concretetypes))) => {
+                let key = path.canonical_key();
+                call_registry.two_phase().subjects.insert(
+                    key,
+                    crate::translator::rtyper::pyre_call_registry::TwoPhaseSubject {
+                        graph_key: crate::flowspace::model::GraphKey::of(&graph),
+                        value_to_var,
+                        constant_concretetypes,
+                    },
+                );
+            }
+            Ok(Err(_)) | Err(_) => {
+                // Annotate-half failed (or panicked): repair shared-callee state
+                // and leave the graph uncached so publish Skips it to the legacy
+                // walker. unpoison is itself contained — a panic here must not
+                // abort the remaining Phase A graphs.
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    unpoison_failed_subject_callees(
+                        call_registry,
+                        &fixed_at_entry,
+                        function_graphs,
+                    );
+                }));
+            }
+        }
+    }
+
+    // ── compute_at_fixpoint runs per-subject inside drive_subject's
+    // annotate-half (cutover compute_at_fixpoint call); it is monotonic so
+    // per-subject invocation reaches the same fixpoint (R2: the once-at-end
+    // upstream shape — annotator.complete() — is a deferred optimisation).
+
+    // ── Phase B — rtype-all with per-graph isolation ─────────────────
+    // Writes its rtype_skipped set into the cache incrementally so partial
+    // progress survives even if this call is cut short.
+    run_phase_b_rtype_isolated(call_registry, function_graphs);
+}
+
+/// Phase B: rtype every annotated block in one whole-program pass, tolerant of
+/// per-graph rtype failure (the migration scaffold — upstream `specialize()` is
+/// single-pass-fatal, rtyper.py:177-296). A block's `specialize_block` failure
+/// records its owning graph into the cache's `rtype_skipped` set; that graph's
+/// remaining blocks are excluded from later rounds (the publish then Skips it to
+/// the legacy walker) and its half-fixed callees are repaired via
+/// `unpoison_failed_subject_callees`. The skip set is written into the cache
+/// incrementally so partial progress survives a cut-short call.
+fn run_phase_b_rtype_isolated(
+    call_registry: &PyreCallRegistry,
+    lift_sources: &crate::jit_codewriter::call::GraphStore,
+) {
+    use crate::flowspace::model::{BlockRef, GraphKey, GraphRef};
+    let Ok((annotator, rtyper)) = call_registry.ensure_session() else {
+        return;
+    };
+    loop {
+        // Skip-tolerant repr setup: a single unported repr (e.g. DictRepr)
+        // must not abort rtyping of every other annotated graph. The graph
+        // that needs the skipped repr fails its own specialize_block below and
+        // is Skip-classified (parity fallback to the legacy walker).
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            rtyper.call_all_setups_skip_tolerant()
+        }));
+        // Snapshot the skip set (cache borrow drops before specialize_block).
+        let skipped: HashSet<GraphKey> = call_registry.two_phase().rtype_skipped.clone();
+        // annotated\already_seen, excluding blocks of already-skipped graphs.
+        let pending: Vec<(BlockRef, Option<GraphRef>)> = {
+            let annotated = annotator.annotated.borrow();
+            let all_blocks = annotator.all_blocks.borrow();
+            let already_seen = rtyper.already_seen.borrow();
+            annotated
+                .iter()
+                .filter(|(bkey, _)| !already_seen.contains_key(*bkey))
+                .filter_map(|(bkey, gopt)| {
+                    if let Some(g) = gopt {
+                        if skipped.contains(&GraphKey::of(g)) {
+                            return None;
+                        }
+                    }
+                    all_blocks.get(bkey).map(|b| (b.clone(), gopt.clone()))
+                })
+                .collect()
+        };
+        if pending.is_empty() {
+            break;
+        }
+        for (block, gopt) in pending {
+            if let Some(g) = &gopt {
+                if skipped.contains(&GraphKey::of(g)) {
+                    continue;
+                }
+            }
+            let fixed_at_entry: HashSet<GraphKey> =
+                annotator.fixed_graphs.borrow().keys().cloned().collect();
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                rtyper.specialize_block(&block)
+            }));
+            match res {
+                Ok(Ok(())) => rtyper.mark_already_seen(&block),
+                Ok(Err(_)) | Err(_) => {
+                    match &gopt {
+                        Some(g) => {
+                            // Skip this graph; the pending recompute excludes
+                            // its blocks, guaranteeing progress (one graph
+                            // removed per failure).
+                            call_registry
+                                .two_phase()
+                                .rtype_skipped
+                                .insert(GraphKey::of(g));
+                        }
+                        None => {
+                            // No graph to attribute (None-sentinel block);
+                            // mark it seen so the loop still progresses.
+                            rtyper.mark_already_seen(&block);
+                        }
+                    }
+                    // Repair half-fixed callees; contained so an unpoison panic
+                    // can't escape Phase B.
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        unpoison_failed_subject_callees(
+                            call_registry,
+                            &fixed_at_entry,
+                            lift_sources,
+                        );
+                    }));
+                    break;
+                }
+            }
+        }
+    }
+    // MixLevelHelperAnnotator drain (rtyper.py:238-241) is a no-op while R4 is
+    // unported — specialize_block never queues helper graphs today. When R4
+    // lands, take()+finish() rtyper.annmixlevel here.
+}
+
+/// Two-phase publish: derive the [`DualGateOutcome`] for `legacy` from the
+/// prepass cache instead of re-running the real path. Mirrors
+/// [`dual_gate_check_with_registry`]'s legacy-baseline comparison (the
+/// migration safety oracle) but consumes the cached real types.
+pub(crate) fn dual_gate_outcome_from_cache(
+    legacy: &LegacyGraph,
+    call_registry: &PyreCallRegistry,
+    diag_key: &str,
+) -> Result<DualGateOutcome, String> {
+    // Clone the cached real types out so the cache borrow drops before the
+    // legacy baseline runs (the baseline never touches the cache).
+    let cached = {
+        let tp = call_registry.two_phase();
+        match tp.subjects.get(diag_key) {
+            Some(subj) if !tp.rtype_skipped.contains(&subj.graph_key) => Some((
+                subj.value_to_var.clone(),
+                subj.constant_concretetypes.clone(),
+            )),
+            _ => None,
+        }
+    };
+    let Some((value_to_var, constants)) = cached else {
+        return Ok(DualGateOutcome::Skip(
+            "two-phase: subject not annotated/rtyped in prepass".to_string(),
+        ));
+    };
+
+    // Validate the cached lltypes project to concrete kinds (the Step-4 check
+    // deferred from `drive_subject`, which did not rtype in Phase A).
+    for var in value_to_var.values() {
+        let cell = var.concretetype.borrow();
+        if let Some(lltype) = cell.as_ref() {
+            if lowleveltype_to_concrete(lltype).is_err() {
+                return Ok(DualGateOutcome::Skip(
+                    "two-phase: cached lltype does not project".to_string(),
+                ));
+            }
+        }
+    }
+    for lltype in constants.values() {
+        if lowleveltype_to_concrete(lltype).is_err() {
+            return Ok(DualGateOutcome::Skip(
+                "two-phase: cached const lltype does not project".to_string(),
+            ));
+        }
+    }
+
+    // Legacy-baseline comparison oracle (the `dual_gate_check_with_registry`
+    // pattern): the real path is trusted only when it agrees with the proven
+    // legacy walker at `ConcreteType` granularity.
+    let _annotation_guard = LegacyAnnotationGuard::snapshot(legacy);
+    let baseline = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        super::legacy_annotator::annotate(legacy);
+        super::legacy_resolve::resolve_types(legacy);
+    }));
+    if let Err(payload) = baseline {
+        let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
+            (*s).to_string()
+        } else if let Some(s) = payload.downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "<unrecognised panic payload>".to_string()
+        };
+        return Err(format!(
+            "two-phase baseline panicked (legacy walker crashed before comparison): {msg}"
+        ));
+    }
+    if let Some(divergence) = compare_real_against_legacy(&value_to_var, &constants, legacy) {
+        return Ok(DualGateOutcome::Skip(format!(
+            "two-phase divergence: {divergence}"
+        )));
+    }
+    Ok(DualGateOutcome::Match {
+        real_value_to_var: value_to_var,
+    })
 }
 
 #[cfg(test)]
