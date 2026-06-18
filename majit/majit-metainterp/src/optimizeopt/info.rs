@@ -843,19 +843,40 @@ fn force_box_impl(
     // needed for the forwarding writes.
     let opref = box_.to_opref();
 
-    fn force_child(orig_ref: OpRef, ctx: &mut crate::optimizeopt::OptContext) -> OpRef {
-        let value_box = ctx.get_box_replacement_box(orig_ref);
-        let value_ref = value_box.as_ref().map(|b| b.to_opref()).unwrap_or(orig_ref);
+    // info.py:307: subbox = optimizer.force_box(fld) — `fld` is the field's
+    // own box. Force it (materialising a nested virtual) and return the
+    // resulting box, which the parent uses as a SETFIELD/SETARRAYITEM value
+    // operand. Box-native: the field box is passed and returned directly,
+    // matching `force_box(fld)` rather than an OpRef round-trip.
+    fn force_child(orig: &BoxRef, ctx: &mut crate::optimizeopt::OptContext) -> BoxRef {
+        let value_box = ctx.resolve_box_box_opt(orig);
+        // optimizer.py:356-357: `info = op.get_forwarded()` then `if op.type ==
+        // 'i' and info.is_constant(): return ConstInt(info.get_constant_int())`.
+        // The const-int synthesis is gated on an info that is ALREADY forwarded
+        // — force_box only reads the slot. `peek_intbound_box` reads the
+        // forwarded IntBound without the lazy `set_forwarded(IntBound())`
+        // install that `getintbound_handle` performs (optimizer.py:111), so a
+        // plain int box with no info is returned as-is below rather than given a
+        // fresh unbounded slot.
+        if let Some(b) = &value_box {
+            if b.const_value().is_none() && b.type_() == majit_ir::Type::Int {
+                if let Some(bound) = ctx.peek_intbound_box(b) {
+                    if bound.is_constant() {
+                        let c = ctx.make_constant_int(bound.get_constant_int());
+                        return ctx.materialize_box_at(c);
+                    }
+                }
+            }
+        }
         if value_box.as_ref().map_or(false, |b| ctx.is_virtual(b)) {
             let value_box = value_box.expect("recorder-populated");
             let mut info = ctx.take_ptr_info(&value_box).unwrap();
             let forced = force_box_impl(&mut info, value_box, ctx);
             return ctx
                 .get_box_replacement_box(forced)
-                .map(|b| b.to_opref())
-                .unwrap_or(forced);
+                .unwrap_or_else(|| ctx.materialize_box_at(forced));
         }
-        value_ref
+        value_box.unwrap_or_else(|| orig.clone())
     }
 
     // RPython info.py:148,226: optforce.emit_extra(op)
@@ -903,7 +924,7 @@ fn force_box_impl(
                     .and_then(|b| b.const_value())
                     .is_none()
                 {
-                    force_child(fb.to_opref(), ctx);
+                    force_child(&fb, ctx);
                 }
             }
         }
@@ -995,7 +1016,7 @@ fn force_box_impl(
                 ctx.make_equal_to(&box_, &b_alloc);
             }
             for (field_idx, value_ref) in std::mem::take(&mut vinfo.fields) {
-                let value_ref = force_child(value_ref.to_opref(), ctx);
+                let value_ref = force_child(&value_ref, ctx);
                 let descr = lookup_field_descr(&cached_fielddescrs, field_idx);
                 debug_assert!(
                     descr.is_some(),
@@ -1007,7 +1028,7 @@ fn force_box_impl(
                     "force_box: field_idx must resolve through descr.get_all_fielddescrs()[i]",
                 );
                 let arg_alloc = ctx.materialize_box_at(alloc_ref);
-                let arg_value = ctx.materialize_box_at(value_ref);
+                let arg_value = ctx.resolve_box_box(&value_ref);
                 let mut set_op = Op::new(OpCode::SetfieldGc, &[arg_alloc, arg_value]);
                 set_op.setdescr(descr);
                 emit_op(ctx, set_op);
@@ -1048,13 +1069,13 @@ fn force_box_impl(
                 ctx.make_equal_to(&box_, &b_alloc);
             }
             for (field_idx, value_ref) in std::mem::take(&mut vinfo.fields) {
-                let value_ref = force_child(value_ref.to_opref(), ctx);
+                let value_ref = force_child(&value_ref, ctx);
                 let descr = lookup_field_descr(&cached_fielddescrs, field_idx);
                 let descr = descr.expect(
                     "force_box: field_idx must resolve through descr.get_all_fielddescrs()[i]",
                 );
                 let arg_alloc = ctx.materialize_box_at(alloc_ref);
-                let arg_value = ctx.materialize_box_at(value_ref);
+                let arg_value = ctx.resolve_box_box(&value_ref);
                 let mut set_op = Op::new(OpCode::SetfieldGc, &[arg_alloc, arg_value]);
                 set_op.setdescr(descr);
                 emit_op(ctx, set_op);
@@ -1090,8 +1111,7 @@ fn force_box_impl(
             let clear = vinfo.clear;
             let descr = vinfo.descr.clone();
             for (i, item_ref) in items.into_iter().enumerate() {
-                let item_ref = item_ref.to_opref();
-                if item_ref == OpRef::NONE {
+                if item_ref.is_none() {
                     continue;
                 }
                 // info.py:543: const = optforce.optimizer.new_const_item(self.descr)
@@ -1100,7 +1120,7 @@ fn force_box_impl(
                 // (all raw=0).
                 if clear {
                     let is_default = ctx
-                        .get_box_replacement_box(item_ref)
+                        .resolve_box_box_opt(&item_ref)
                         .as_ref()
                         .and_then(|b| ctx.getconst(b))
                         .map_or(false, |(raw, _)| raw == 0);
@@ -1108,11 +1128,11 @@ fn force_box_impl(
                         continue;
                     }
                 }
-                let subbox = force_child(item_ref, ctx);
+                let subbox = force_child(&item_ref, ctx);
                 let idx_ref = ctx.emit_constant_int(i as i64);
                 let arg_alloc = ctx.materialize_box_at(alloc_ref);
                 let arg_idx = ctx.materialize_box_at(idx_ref);
-                let arg_sub = ctx.materialize_box_at(subbox);
+                let arg_sub = ctx.resolve_box_box(&subbox);
                 let mut set_op = Op::new(OpCode::SetarrayitemGc, &[arg_alloc, arg_idx, arg_sub]);
                 set_op.setdescr(descr.clone());
                 emit_op(ctx, set_op);
@@ -1166,10 +1186,10 @@ fn force_box_impl(
                     if value_ref.is_none() {
                         continue;
                     }
-                    let subbox = force_child(value_ref.to_opref(), ctx);
+                    let subbox = force_child(&value_ref, ctx);
                     let arg_alloc = ctx.materialize_box_at(alloc_ref);
                     let arg_idx = ctx.materialize_box_at(idx_ref);
-                    let arg_sub = ctx.materialize_box_at(subbox);
+                    let arg_sub = ctx.resolve_box_box(&subbox);
                     let mut set_op =
                         Op::new(OpCode::SetinteriorfieldGc, &[arg_alloc, arg_idx, arg_sub]);
                     if let Some(d) = fielddescrs.get(field_idx as usize).cloned() {
@@ -1200,7 +1220,20 @@ fn force_box_impl(
             }
             let alloc_ref = emit_op(ctx, call_op);
 
-            // info.py:152 unconditional set_forwarded.
+            // info.py:152/421 set_forwarded(self). RPython keeps the SAME
+            // RawBufferPtrInfo on the forced op and flips it non-virtual via
+            // `self.size = -1` (is_virtual = `size != -1`), so a later
+            // `getrawptrinfo` still recovers the raw-buffer identity. pyre
+            // installs `nonnull()` instead — a PRE-EXISTING-ADAPTATION: the
+            // RawSlice force keeps identity via a `parent = none` sentinel
+            // (see below), but a non-virtual RawBuffer would need a size=-1
+            // sentinel on `VirtualRawBufferInfo` AND an `is_virtual()` gate at
+            // every `matches!(PtrInfo::VirtualRawBuffer(_))` site in
+            // virtualize.rs (1232/1261/1269/…), which currently assume virtual
+            // and would re-virtualize a forced buffer. Raw buffers are absent
+            // from the check.py corpus, so that cascade is ungateable here.
+            // nonnull() preserves nonnull-ness; a later RAW_LOAD/RAW_STORE just
+            // residualizes (getrawptrinfo→None), which is the correct result.
             if let Some(b) = ctx.get_box_replacement_box(alloc_ref) {
                 ctx.set_ptr_info(&b, PtrInfo::nonnull());
             }
@@ -1214,13 +1247,20 @@ fn force_box_impl(
             let check_op = Op::new(OpCode::CheckMemoryError, &[arg_alloc]);
             emit_op(ctx, check_op);
 
-            // info.py:429-436: emit RAW_STORE for each buffered write
+            // info.py:429-436: emit RAW_STORE for each buffered write.
+            // info.py:433 uses `itembox = buffer.values[i]` DIRECTLY in the
+            // RAW_STORE — unlike the struct/array paths (info.py:222/548),
+            // RawBufferPtrInfo._force_elements does NOT optimizer.force_box the
+            // value (info.py:240: "there can be no virtuals stored in raw
+            // buffer"). Use the stored value box as-is; routing it through
+            // force_child would force-box it and synthesize a ConstInt for a
+            // constant-bound int, neither of which upstream does here.
             for (offset, _length, descr, value) in entries {
-                let value_ref = force_child(value, ctx);
+                let value_box = ctx.materialize_box_at(value);
                 let offset_ref = ctx.emit_constant_int(offset);
                 let arg_alloc = ctx.materialize_box_at(alloc_ref);
                 let arg_offset = ctx.materialize_box_at(offset_ref);
-                let arg_value = ctx.materialize_box_at(value_ref);
+                let arg_value = ctx.resolve_box_box(&value_box);
                 let mut store_op = Op::new(OpCode::RawStore, &[arg_alloc, arg_offset, arg_value]);
                 store_op.setdescr(descr);
                 emit_op(ctx, store_op);
@@ -1250,9 +1290,9 @@ fn force_box_impl(
             // Overwriting with `PtrInfo::nonnull()` would lose the
             // raw-slice identity and mis-route any later
             // `get_virtual_fields` / raw-guard path.
-            let parent_forced = force_child(slice.parent.to_opref(), ctx);
+            let parent_forced = force_child(&slice.parent, ctx);
             let offset_ref = ctx.emit_constant_int(slice.offset as i64);
-            let arg_parent = ctx.materialize_box_at(parent_forced);
+            let arg_parent = ctx.resolve_box_box(&parent_forced);
             let arg_offset = ctx.materialize_box_at(offset_ref);
             let mut add_op = Op::new(OpCode::IntAdd, &[arg_parent, arg_offset]);
             add_op.pos.set(opref);
