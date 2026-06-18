@@ -1436,6 +1436,40 @@ fn jit_blackhole_resume_from_guard(
     None
 }
 
+/// RAII guard registering each slot of the `#326` rollback snapshot's
+/// `locals` copy as a GC root for the duration of `bh.run()`.  The snapshot
+/// is a plain `Vec<PyObjectRef>` holding raw object pointers; the collector
+/// is moving (incminimark nursery -> oldgen copying), so a minor collection
+/// during the forward run would relocate those objects and leave the Vec
+/// holding from-space pointers.  Registering each element slot makes the
+/// root walker forward them in place (`collector.rs` reads `*slot`, copies,
+/// writes back), so the abort arm restores the live pointers rather than
+/// stale ones.  Mirrors `LocalsRoot` / the callee-locals root in `call.rs`.
+struct VableRollbackRoots {
+    slots: Vec<*mut *mut u8>,
+}
+
+impl VableRollbackRoots {
+    fn register(base: *const PyObjectRef, len: usize) -> Self {
+        let mut slots = Vec::with_capacity(len);
+        for i in 0..len {
+            let slot = unsafe { base.add(i) } as *mut *mut u8;
+            if unsafe { pyre_object::gc_hook::try_gc_add_root(slot) } {
+                slots.push(slot);
+            }
+        }
+        Self { slots }
+    }
+}
+
+impl Drop for VableRollbackRoots {
+    fn drop(&mut self) {
+        for &slot in &self.slots {
+            pyre_object::gc_hook::try_gc_remove_root(slot);
+        }
+    }
+}
+
 /// resume.py:1312 blackhole_from_resumedata parity:
 /// Decode rd_numb via ResumeDataDirectReader, build blackhole chain,
 /// run _run_forever.
@@ -1600,6 +1634,47 @@ pub fn blackhole_resume_via_rd_numb(
         eprintln!("[blackhole-resume] rd_numb path, chain built, running _run_forever",);
     }
 
+    // #326 blackhole-continuation rollback snapshot.  The blackhole
+    // commits every STORE_FAST / operand push to the virtualizable heap
+    // frame as it runs forward (`setarrayitem_vable_*` /
+    // `setfield_vable_i`).  If it later aborts — an opcode pyre cannot
+    // translate emits `BC_ABORT_PERMANENT` — the deopt drops back to the
+    // plain interpreter, which re-runs from the guard's resume PC.  But
+    // the heap frame still carries the aborted run's partial forward
+    // mutations, so any side effect already committed before the abort is
+    // applied a second time.  Capture the live frame here, right after the
+    // resume restore put it at the guard snapshot and before `bh.run()`
+    // mutates it, so the abort arm can roll it back and the interpreter's
+    // re-run applies each side effect exactly once.
+    //
+    // The snapshot holds raw `PyObjectRef`s across `bh.run()`; the GC is a
+    // moving collector (#336), so a minor collection during the run could
+    // relocate these.  `VableRollbackRoots` below registers each `locals`
+    // slot with the root walker so the collector forwards them in place and
+    // the abort arm restores live pointers, not from-space ones.  Capture
+    // the snapshotted frame pointer too, so the abort arm can confirm the
+    // frame that aborted is the same one this state belongs to before
+    // restoring it.
+    let vable_rollback: Option<(*mut PyFrame, Vec<PyObjectRef>, usize, isize)> = {
+        let frame_ptr = bh.virtualizable_ptr as *mut PyFrame;
+        if frame_ptr.is_null() {
+            None
+        } else {
+            let frame = unsafe { &*frame_ptr };
+            Some((
+                frame_ptr,
+                frame.locals_w().as_slice().to_vec(),
+                frame.valuestackdepth,
+                frame.last_instr,
+            ))
+        }
+    };
+    // Keep the snapshot's locals rooted for the whole forward run / abort
+    // window; dropped (roots removed) when this function returns.
+    let _vable_rollback_roots = vable_rollback
+        .as_ref()
+        .map(|(_, locals, _, _)| VableRollbackRoots::register(locals.as_ptr(), locals.len()));
+
     // blackhole.py:1794-1795 resume_in_blackhole:
     //   current_exc = _prepare_resume_from_failure(guard_opnum, deadframe)
     //   _run_forever(blackholeinterp, current_exc)
@@ -1666,6 +1741,34 @@ pub fn blackhole_resume_via_rd_numb(
             };
         }
         if bh.aborted {
+            // #326: roll the virtualizable heap frame back to the guard
+            // snapshot captured before `bh.run()`, discarding this aborted
+            // run's partial forward mutations.  The interpreter resumes
+            // from the guard resume PC with the pre-blackhole frame state,
+            // so every side effect (the aborting opcode's included) is
+            // applied exactly once instead of twice.
+            if let Some((snap_frame_ptr, locals, vsd, last_instr)) = &vable_rollback {
+                let frame_ptr = bh.virtualizable_ptr as *mut PyFrame;
+                // Roll back only when the frame that aborted is the same one
+                // the snapshot was captured from.  The `_run_forever` loop
+                // reassigns `bh` to a caller on callee return / exception
+                // propagation; a later abort then lands on the caller frame,
+                // whose valuestackdepth / last_instr would be clobbered with
+                // the callee's snapshot.  A per-frame snapshot for that
+                // multi-frame case is the #124 stack-snapshot epic; until
+                // then, skip rather than corrupt the caller frame.
+                if !frame_ptr.is_null() && frame_ptr == *snap_frame_ptr {
+                    let frame = unsafe { &mut *frame_ptr };
+                    let arr = frame.locals_w_mut().as_mut_slice();
+                    // The locals_cells_stack array length is fixed for a
+                    // frame's lifetime; restore it verbatim.
+                    if arr.len() == locals.len() {
+                        arr.copy_from_slice(locals);
+                    }
+                    frame.valuestackdepth = *vsd;
+                    frame.last_instr = *last_instr;
+                }
+            }
             if nbody_debug {
                 eprintln!(
                     "[nbody-debug] blackhole_resume_via_rd_numb failed: bh.aborted position={} last_opcode_position={}",
@@ -1935,6 +2038,11 @@ pub fn trace_and_compile_from_bridge(
     frame: &mut PyFrame,
     raw_values: &[i64],
     exit_layout: &majit_metainterp::CompiledExitLayout,
+    // `cpu.grab_exc_value(deadframe)` (llmodel.py:240): the pending
+    // exception this guard failure carries, or 0. Threaded so the bridge
+    // tracer can decline a pending-exception resume at a non-exception
+    // guard (see the deferral below).
+    guard_exc: i64,
 ) -> bool {
     use crate::eval::build_jit_state;
     use crate::jit::state::PyreEnv;
@@ -2083,6 +2191,54 @@ pub fn trace_and_compile_from_bridge(
         }
         let (driver, _) = crate::eval::driver_pair();
         driver.last_bridge_is_exception_guard = false;
+    }
+
+    // A pending exception at a NON-exception guard means a may-force
+    // residual call both raised and forced the frame, so GUARD_NOT_FORCED
+    // failed before GUARD_NO_EXCEPTION ran. That guard's resume_pc is the
+    // no-exception semantic fallthrough (the next opcode, e.g.
+    // RETURN_VALUE), so a normal-path bridge walk would trace the return
+    // of the NULL call result — emitting `Finish(NONE)` with no
+    // return-value box — and run the post-call residual ops concretely on
+    // a NULL operand. Decline the bridge and resume in the blackhole,
+    // which propagates the pending exception to its `catch_exception`
+    // handler exactly once. Skipping the walk also prevents the walk's
+    // concrete side effects from double-applying the handler's mutations
+    // against the post-blackhole replay.
+    //
+    // GUARD_NOT_FORCED is not an exception guard, so it does not stash the
+    // raised value into `jf_guard_exc` (`guard_exc` is 0 here); the live
+    // signal is the backend `pos_exception` cell the compiled
+    // GUARD_NO_EXCEPTION reads. A stale cell only over-declines (the
+    // blackhole resume with `guard_exc == 0` runs the no-exception
+    // continuation, identical to the prior panic-then-fallback path), so
+    // this never changes a result — only whether a bridge is attached.
+    let pending_exc = guard_exc != 0 || {
+        #[cfg(feature = "cranelift")]
+        {
+            majit_backend_cranelift::jit_exc_class_raw() != 0
+        }
+        #[cfg(all(feature = "dynasm", not(feature = "cranelift")))]
+        {
+            majit_backend_dynasm::jit_exc_class_raw() != 0
+        }
+        #[cfg(not(any(feature = "cranelift", feature = "dynasm")))]
+        {
+            false
+        }
+    };
+    if pending_exc && !last_bridge_is_exception_guard {
+        if majit_metainterp::majit_log_enabled() {
+            eprintln!(
+                "[jit][bridge-trace] decline (pending exc at non-exception guard) key={} trace={} fail={} resume_pc={}",
+                green_key, trace_id, fail_index, resume_pc
+            );
+        }
+        let (driver, _) = crate::eval::driver_pair();
+        if driver.is_tracing() {
+            driver.meta_interp_mut().abort_trace(false);
+        }
+        return false;
     }
 
     // pyjitpl.py:2841 interpret(): after start_retrace_from_guard, RPython
@@ -2314,7 +2470,10 @@ fn jit_ca_handle_guard_failure(
     // with the matching `start_compiling` even on panic.
     let compiled = {
         let _guard = crate::eval::GuardCompilingScope::new(&descr_arc);
-        trace_and_compile_from_bridge(&descr_arc, frame, raw_values, &exit_layout)
+        // CALL_ASSEMBLER guard failures grab their callee exception on the
+        // blackhole leg, not here; pass 0 so the non-exception-guard
+        // deferral keys only off the general guard path's `guard_exc`.
+        trace_and_compile_from_bridge(&descr_arc, frame, raw_values, &exit_layout, 0)
     };
 
     if majit_metainterp::majit_log_enabled() {
@@ -3116,6 +3275,30 @@ pub extern "C" fn bh_call_fn_8(
     )
 }
 
+/// Per-arity `bh_call_fn_<n>` thunks for nargs 9..=14, sharing the
+/// `(callable, null_or_self, arg0..arg{n-1})` ABI of the explicit
+/// `bh_call_fn_0..8` above.  nargs=14 (16 i64 params) is the ceiling
+/// the backend dispatch table (`call_stub.rs::dispatch_arity_body!`,
+/// `MAX_HOST_CALL_ARITY` = 16) supports; CALL with nargs > 14 falls
+/// through to `emit_abort_permanent!`.
+macro_rules! bh_call_fn_arity {
+    ($name:ident; $($arg:ident),+ $(,)?) => {
+        pub extern "C" fn $name(callable: i64, null_or_self: i64, $($arg: i64),+) -> i64 {
+            bh_call_fn_impl(
+                callable as PyObjectRef,
+                null_or_self as PyObjectRef,
+                &[$($arg as PyObjectRef),+],
+            )
+        }
+    };
+}
+bh_call_fn_arity!(bh_call_fn_9; a0, a1, a2, a3, a4, a5, a6, a7, a8);
+bh_call_fn_arity!(bh_call_fn_10; a0, a1, a2, a3, a4, a5, a6, a7, a8, a9);
+bh_call_fn_arity!(bh_call_fn_11; a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10);
+bh_call_fn_arity!(bh_call_fn_12; a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
+bh_call_fn_arity!(bh_call_fn_13; a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12);
+bh_call_fn_arity!(bh_call_fn_14; a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13);
+
 /// blackhole.py:1224 bhimpl_residual_call: cpu.bh_call_r.
 /// RPython: cpu.bh_call_r (llmodel.py:816) invokes calldescr.call_stub_r
 /// directly — a plain function-pointer call, no portal_runner indirection.
@@ -3243,11 +3426,17 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
     }
 }
 
-/// jtransform.py parity: namespace and code come from getfield_vable_r; the
-/// live frame is passed explicitly so `_load_global` can mirror
-/// `self.get_builtin()` in compiled residual-call paths as well as blackhole.
-/// namespace = getfield_vable_r(frame, w_globals), code = getfield_vable_r(frame, pycode).
-/// namei is the raw oparg from LOAD_GLOBAL: name_idx = namei >> 1.
+/// `_load_global` residual (pyopcode.py:958-969).  Resolves the namespace via
+/// the executing frame's `get_w_globals()` when the live frame OWNS this
+/// `w_code` (`frame.pycode == w_code`) — honoring an `exec(code, ns)`
+/// frame-specific namespace — and falls back to the callee's own promoted
+/// `w_code` globals otherwise (an inlined / chained callee's frame register
+/// aliases an outer frame, so it is not this code's frame).  The
+/// `namespace_ptr` operand is ignored for the same aliasing reason; it
+/// survives only as the cell-fold recogniser's hint.  The live frame is also
+/// passed so `self.get_builtin()` works in compiled residual-call paths as
+/// well as blackhole.  namei is the raw oparg from LOAD_GLOBAL:
+/// name_idx = namei >> 1.
 pub extern "C" fn bh_load_global_fn(
     namespace_ptr: i64,
     w_code_ptr: i64,
@@ -3266,7 +3455,8 @@ pub extern "C" fn bh_load_global_fn(
     }
 
     let varname = code.names[idx].as_ref();
-    let w_globals_obj = namespace_ptr as pyre_object::PyObjectRef;
+    let _ = namespace_ptr;
+    let parent_frame_ptr = frame_ptr as *const PyFrame;
     // pypy/interpreter/pyopcode.py:958-969 `_load_global`:
     //   w_value = self.space.finditem_str(self.get_w_globals(), varname)
     //   if w_value is None:
@@ -3274,14 +3464,31 @@ pub extern "C" fn bh_load_global_fn(
     //       if w_value is None:
     //           self._load_global_failed(w_varname)
     //
-    // Dispatch through the dict strategy on the globals object
-    // (`dictmultiobject.py:113-115 getitem_str`) so module dicts and
-    // plain dicts (exec/eval globals, no dict_storage_proxy) are both
-    // handled — matching the interpreter `load_global_value`.
-    if !w_globals_obj.is_null() {
-        if let Some(w_value) =
-            unsafe { pyre_object::dictmultiobject::w_dict_getitem_str(w_globals_obj, varname) }
-        {
+    // `self.get_w_globals()` (pyframe.py:129-133) is the executing frame's
+    // own namespace: the per-frame `w_globals` an `exec(code, ns)` installs
+    // in `debug_data`, falling back to the code's bound `w_globals` when
+    // there is no override.  Use it whenever the live frame OWNS this
+    // `w_code` (`frame.pycode == w_code`), so a compiled `LOAD_GLOBAL`
+    // resolves against the executing frame's globals — not the code's
+    // original module dict — exactly as the interpreter does.
+    //
+    // A frame that does NOT own this `w_code` is an aliased OUTER frame on a
+    // chained blackhole / inlined-callee resume (the same aliasing makes the
+    // `namespace_ptr` operand unusable, hence ignored above).  Resolve from
+    // the callee's own promoted `w_code` constant: reading `w_globals` from
+    // it yields the current (GC-forwarded) module dict the const-folding
+    // `frontend_global_flow_value` resolved statically, but live, so a
+    // relocated dict (a growing `memo`) is followed instead of dangling.
+    let w_globals = if !parent_frame_ptr.is_null()
+        && unsafe { (*parent_frame_ptr).pycode } as usize == w_code_ptr as usize
+    {
+        unsafe { (*parent_frame_ptr).get_w_globals() }
+    } else {
+        unsafe { pyre_interpreter::w_code_get_w_globals(w_code_ptr as pyre_object::PyObjectRef) }
+    };
+    if !w_globals.is_null() {
+        let globals = unsafe { &*w_globals };
+        if let Some(w_value) = pyre_interpreter::dict_storage_get(globals, varname) {
             return w_value as i64;
         }
     }
@@ -3289,7 +3496,6 @@ pub extern "C" fn bh_load_global_fn(
     // Residual helper adaptation: `self` is the live portal frame passed as
     // an explicit Ref argument, so `self.get_builtin()` maps to
     // PyFrame::get_builtin() without relying on blackhole-only TLS.
-    let parent_frame_ptr = frame_ptr as *const PyFrame;
     if !parent_frame_ptr.is_null() {
         let w_builtin = unsafe { (*parent_frame_ptr).get_builtin() };
         if !w_builtin.is_null() && unsafe { pyre_object::is_module(w_builtin) } {
@@ -3897,6 +4103,17 @@ pub extern "C" fn bh_compare_fn(lhs: i64, rhs: i64, op_code: i64) -> i64 {
     // proper exception type object, which made every `except SomeError:`
     // appear to match — wrong for any clause beyond the first.
     if op_code == 10 {
+        // Validate the match target is an exception class / tuple of exception
+        // classes first (`cmp_exc_match`, pyopcode.py:1034-1039), raising
+        // TypeError otherwise.  The BC handler runs
+        // `validate_check_exc_match_class` before the bool-returning
+        // `check_exc_match_against`, so the residual path must too — `except 5:`
+        // (or a tuple with a non-exception member) raises instead of silently
+        // producing a bool.
+        if let Err(err) = pyre_interpreter::eval::validate_check_exc_match_class(rhs) {
+            publish_residual_call_exception(err.to_exc_object() as i64);
+            return 0;
+        }
         let matched = pyre_interpreter::eval::check_exc_match_against(lhs, rhs);
         return pyre_object::w_bool_from(matched) as i64;
     }

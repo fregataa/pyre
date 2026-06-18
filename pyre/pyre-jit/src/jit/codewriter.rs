@@ -3235,10 +3235,12 @@ fn new_shadow_graph(code: &CodeObject) -> super::flow::FunctionGraph {
 }
 
 fn attach_catch_exception_edge(
+    code: &CodeObject,
     graph: &mut super::flow::FunctionGraph,
     block: &super::flow::BlockRef,
     target: &SpamBlockRef,
     source_state: &FrameState,
+    site: &ExceptionCatchSite,
 ) -> super::flow::LinkRef {
     // `flowcontext.py:148-149 guessexception` sets
     // `block.exitswitch = c_last_exception` before the link is
@@ -3257,7 +3259,26 @@ fn attach_catch_exception_edge(
     // sets `last_exception` to the fresh pair, so the same
     // Variables can be threaded into BOTH `link.args` (via
     // `getoutputargs` below) AND `link.extravars`.
-    let edge_state = exception_landing_state(graph, source_state);
+    //
+    // Reshape the cloned state to the handler-entry layout: unwind the
+    // operand stack to the handler's try-level `stack_depth`, push the
+    // `lasti` box (when flagged) and the exception value, and retarget
+    // `next_offset` to the handler PC — the exact transform
+    // `handler_entry_state_from_catch_site` applies when it builds the
+    // catch landing's framestate / inputargs.  A `raise` reached from a
+    // DEEPER operand-stack PC (e.g. mid-expression, inside a call's
+    // argument build-up) otherwise leaves `edge_state` at the raise
+    // point's stack depth and `next_offset`, so it is NOT union-
+    // compatible with the landing (`FrameState::union` declines on the
+    // `next_offset` / stack-length mismatch and `update_catch_landing_
+    // state` silently keeps the landing as-is).  The positional
+    // `getoutputargs` then shifts every arg past the stack delta,
+    // pairing a Ref slot with the landing's `last_exception` Int slot —
+    // surfacing downstream as an `int_copy` kind-mismatch at assemble
+    // time and as an `enforce_input_args` colour collision when the
+    // shifted CFG coalesce pair merges two landing inputargs.
+    let seeded = exception_landing_state(graph, source_state);
+    let edge_state = handler_entry_state_from_catch_site(code, graph, &seeded, site);
 
     // Update the landing block's framestate / inputargs from the
     // edge state.  Note: RPython models each
@@ -3475,6 +3496,12 @@ struct FnPtrIndices {
     call_fn_6: HelperHandle,
     call_fn_7: HelperHandle,
     call_fn_8: HelperHandle,
+    call_fn_9: HelperHandle,
+    call_fn_10: HelperHandle,
+    call_fn_11: HelperHandle,
+    call_fn_12: HelperHandle,
+    call_fn_13: HelperHandle,
+    call_fn_14: HelperHandle,
     get_current_exception_fn: HelperHandle,
     set_current_exception_fn: HelperHandle,
     load_attr_fn: HelperHandle,
@@ -3684,7 +3711,7 @@ fn register_helper_fn_pointers(
     // `load_global_fn`.  Bound after the existing fn_ptrs to preserve
     // their indices.
     let getattr_fn = bind(assembler, cpu.getattr_fn as *const (), CallFlavor::Plain);
-    // LOOKUP_METHOD lowering (appended last to preserve fn_ptr indices).
+    // LOOKUP_METHOD lowering (appended to preserve fn_ptr indices).
     // `bh_load_attr_fn` calls `baseobjspace::getattr`, which can run user
     // `__getattribute__` (forces virtualizables) and raise `AttributeError`
     // → `MayForce`.  `bh_load_method_self_fn` is the pure binding decision —
@@ -3869,6 +3896,17 @@ fn register_helper_fn_pointers(
         cpu.newlist_from_array_fn as *const (),
         CallFlavor::Plain,
     );
+    // Per-arity CALL helpers for nargs 9..=14 (every `call_fn_N` is bound
+    // `MayForce`).  Bound after the existing fn_ptrs to preserve their
+    // indices.  The arity ceiling is nargs=14 (16 i64 params: callable +
+    // null_or_self + 14 args); the backend dispatch table tops out at
+    // `MAX_HOST_CALL_ARITY` = 16.
+    let call_fn_9 = bind(assembler, cpu.call_fn_9 as *const (), CallFlavor::MayForce);
+    let call_fn_10 = bind(assembler, cpu.call_fn_10 as *const (), CallFlavor::MayForce);
+    let call_fn_11 = bind(assembler, cpu.call_fn_11 as *const (), CallFlavor::MayForce);
+    let call_fn_12 = bind(assembler, cpu.call_fn_12 as *const (), CallFlavor::MayForce);
+    let call_fn_13 = bind(assembler, cpu.call_fn_13 as *const (), CallFlavor::MayForce);
+    let call_fn_14 = bind(assembler, cpu.call_fn_14 as *const (), CallFlavor::MayForce);
     FnPtrIndices {
         call_fn,
         load_global_fn,
@@ -3895,6 +3933,12 @@ fn register_helper_fn_pointers(
         call_fn_6,
         call_fn_7,
         call_fn_8,
+        call_fn_9,
+        call_fn_10,
+        call_fn_11,
+        call_fn_12,
+        call_fn_13,
+        call_fn_14,
         get_current_exception_fn,
         set_current_exception_fn,
         load_attr_fn,
@@ -4686,7 +4730,7 @@ impl CodeWriter {
                 },
             load_global_fn:
                 HelperHandle {
-                    idx: _load_global_fn_idx,
+                    idx: load_global_fn_idx,
                     flavor: _load_global_fn_flavor,
                 },
             compare_fn:
@@ -4803,6 +4847,36 @@ impl CodeWriter {
                 HelperHandle {
                     idx: call_fn_8_idx,
                     flavor: _call_fn_8_flavor,
+                },
+            call_fn_9:
+                HelperHandle {
+                    idx: call_fn_9_idx,
+                    flavor: _call_fn_9_flavor,
+                },
+            call_fn_10:
+                HelperHandle {
+                    idx: call_fn_10_idx,
+                    flavor: _call_fn_10_flavor,
+                },
+            call_fn_11:
+                HelperHandle {
+                    idx: call_fn_11_idx,
+                    flavor: _call_fn_11_flavor,
+                },
+            call_fn_12:
+                HelperHandle {
+                    idx: call_fn_12_idx,
+                    flavor: _call_fn_12_flavor,
+                },
+            call_fn_13:
+                HelperHandle {
+                    idx: call_fn_13_idx,
+                    flavor: _call_fn_13_flavor,
+                },
+            call_fn_14:
+                HelperHandle {
+                    idx: call_fn_14_idx,
+                    flavor: _call_fn_14_flavor,
                 },
             get_current_exception_fn:
                 HelperHandle {
@@ -4964,9 +5038,9 @@ impl CodeWriter {
                 store_name_fn_idx,
                 newtuple_from_array_fn_idx,
                 newlist_from_array_fn_idx,
-                // `[u16; 9]` indexed by nargs (0..=8).  `call_fn_idx` (nargs=1)
-                // is the unsuffixed binding from line 3153; the suffixed
-                // 0/2..=8 fill the surrounding slots.
+                // `[u16; 15]` indexed by nargs (0..=14).  `call_fn_idx`
+                // (nargs=1) is the unsuffixed general binding; the suffixed
+                // 0/2..=14 fill the surrounding slots.
                 call_fn_idx_by_nargs: [
                     call_fn_0_idx,
                     call_fn_idx,
@@ -4977,6 +5051,12 @@ impl CodeWriter {
                     call_fn_6_idx,
                     call_fn_7_idx,
                     call_fn_8_idx,
+                    call_fn_9_idx,
+                    call_fn_10_idx,
+                    call_fn_11_idx,
+                    call_fn_12_idx,
+                    call_fn_13_idx,
+                    call_fn_14_idx,
                 ],
                 load_attr_fn_idx,
                 load_method_self_fn_idx,
@@ -5639,17 +5719,18 @@ impl CodeWriter {
                 // normal-control-flow Link (fallthrough / goto) is
                 // added by its own emit macro so the two edges coexist
                 // on `Block.exits`.
-                let landing = catch_sites
+                let site = catch_sites
                     .iter()
                     .find(|s| s.landing_label == catch_label)
                     .expect("catch_sites entry for catch_label")
-                    .landing
                     .clone();
                 attach_catch_exception_edge(
+                    code,
                     &mut graph,
                     &current_block.block(),
-                    &landing,
+                    &site.landing,
                     &current_state,
+                    &site,
                 );
             }};
         }
@@ -7106,12 +7187,156 @@ impl CodeWriter {
                             if is_portal {
                                 let _ = ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
                             }
-                            let name_idx = raw_namei as usize >> 1;
-                            let result_value = code
-                                .names
-                                .get(name_idx)
-                                .and_then(|name| frontend_global_flow_value(w_code, name.as_ref()))
-                                .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                            // #336: in the PORTAL jitcode, load the global at
+                            // RUNTIME from the live frame instead of const-
+                            // folding the resolved object's address into the
+                            // jitcode constant pool.  Const-folding bakes a raw
+                            // pointer into `constants_r`, which the moving
+                            // (incminimark) GC does not forward; a global object
+                            // still young at build time and relocated afterwards
+                            // (e.g. a `memo` dict mutated in the loop) leaves a
+                            // dangling pointer the blackhole resume then reads.
+                            // The register-form namespace (`getfield_vable_r`,
+                            // field 5 = the live `w_globals_obj`) lets
+                            // `try_walker_load_global_cell_fold` hoist the lookup
+                            // to a GC-safe live cell read (`QuasiimmutField` +
+                            // `jit_namespace_cell_lookup`), so the value is read
+                            // through the forwarded dict every iteration; the
+                            // `bh_load_global_fn` residual fallback derives the
+                            // namespace from `w_code`'s live `w_globals`.  pycode
+                            // (r1) is the jitcode's own promoted `W_Code`; the
+                            // frame (r2) feeds `get_builtin()`.
+                            //
+                            // The register-form namespace is portal-only.  In a
+                            // non-portal callee the frame register aliases the
+                            // outermost frame on a chained / inlined-callee
+                            // resume, and the extra `getfield_vable_r` graph op
+                            // misallocates against the inlined locals.  A
+                            // non-portal callee instead keeps the
+                            // `flowcontext.py:856-859 find_global` const-fold,
+                            // which the inliner needs as a foldable constant call
+                            // target — EXCEPT when the resolved global is a
+                            // mutable container (dict / list / set).  Such a
+                            // container is grown in place and relocates
+                            // nursery->oldgen after the jitcode is built, so its
+                            // const-folded address dangles when the blackhole
+                            // resumes the unfused callee (dynasm SIGSEGVs;
+                            // cranelift null-softens the read).  Resolve those
+                            // through the `bh_load_global_fn` residual whose
+                            // namespace operand is the callee's module dict
+                            // OBJECT (`dict_storage_to_dict`, built eagerly at
+                            // `PyFrame.__init__` so it reaches the non-moving
+                            // oldgen before any jitcode build): the cell-fold
+                            // then reads the container value live through that
+                            // stable dict every iteration instead of baking the
+                            // relocating value.  Functions / classes / modules
+                            // are created at module load and promoted to the
+                            // non-moving oldgen before any jitcode build, so
+                            // const-folding them stays GC-safe.
+                            let result_value: super::flow::FlowValue = if is_portal {
+                                let ns_var = emit_graph_op_with_result(
+                                    &mut graph,
+                                    &current_block.block(),
+                                    "getfield_vable_r",
+                                    vable_getfield_ref_graph_args(
+                                        frame_var.into(),
+                                        VABLE_NAMESPACE_FIELD_IDX,
+                                    ),
+                                    Kind::Ref,
+                                    py_pc as i64,
+                                );
+                                let code_const: super::flow::FlowValue =
+                                    super::flow::Constant::new(
+                                        super::flow::ConstantValue::Signed(w_code as i64),
+                                        Some(Kind::Ref),
+                                    )
+                                    .into();
+                                let loaded = residual_call!(
+                                    load_global_fn_idx,
+                                    CallFlavor::Plain,
+                                    majit_ir::PyreHelperKind::LoadGlobal,
+                                    vec![super::flow::Constant::signed(raw_namei).into()],
+                                    vec![ns_var.into(), code_const, frame_var.into()],
+                                    vec![],
+                                    vec![Kind::Ref, Kind::Ref, Kind::Ref, Kind::Int],
+                                    ResKind::Ref,
+                                    py_pc as i64,
+                                );
+                                loaded
+                                    .map(super::flow::FlowValue::from)
+                                    .unwrap_or_else(|| fresh_ref_value(&mut graph).into())
+                            } else {
+                                let name_idx = raw_namei as usize >> 1;
+                                let name = code.names.get(name_idx).map(|name| name.as_str());
+                                let w_globals = unsafe {
+                                    pyre_interpreter::w_code_get_w_globals(
+                                        w_code as pyre_object::PyObjectRef,
+                                    )
+                                };
+                                // Classify the resolved global: a globals-only
+                                // lookup suffices since builtins are never the
+                                // user-mutated containers this gate targets.
+                                let global_is_relocatable_container = !w_globals.is_null()
+                                    && name
+                                        .and_then(|nm| {
+                                            pyre_interpreter::dict_storage_get(
+                                                unsafe { &*w_globals },
+                                                nm,
+                                            )
+                                        })
+                                        .is_some_and(|obj| unsafe {
+                                            pyre_object::is_dict(obj)
+                                                || pyre_object::is_list(obj)
+                                                || pyre_object::is_set(obj)
+                                        });
+                                if global_is_relocatable_container {
+                                    // The namespace operand is the callee's
+                                    // module dict OBJECT.  `PyFrame.__init__`
+                                    // builds `w_globals_obj` eagerly
+                                    // (`dict_storage_to_dict`), so by jitcode
+                                    // build time it is already in the non-moving
+                                    // oldgen and const-folding ITS pointer is
+                                    // GC-safe.  `try_walker_load_global_cell_fold`
+                                    // reads the container VALUE live through it
+                                    // each iteration, so the relocating value is
+                                    // never baked.  A container is never a call
+                                    // target, so the cell-fold's deep-inline
+                                    // call mis-resolution does not apply.
+                                    let ns_obj =
+                                        pyre_interpreter::baseobjspace::dict_storage_to_dict(
+                                            w_globals,
+                                        );
+                                    let ns_const: super::flow::FlowValue =
+                                        super::flow::Constant::new(
+                                            super::flow::ConstantValue::Signed(ns_obj as i64),
+                                            Some(Kind::Ref),
+                                        )
+                                        .into();
+                                    let code_const: super::flow::FlowValue =
+                                        super::flow::Constant::new(
+                                            super::flow::ConstantValue::Signed(w_code as i64),
+                                            Some(Kind::Ref),
+                                        )
+                                        .into();
+                                    let loaded = residual_call!(
+                                        load_global_fn_idx,
+                                        CallFlavor::Plain,
+                                        majit_ir::PyreHelperKind::LoadGlobal,
+                                        vec![super::flow::Constant::signed(raw_namei).into()],
+                                        vec![ns_const, code_const, frame_var.into()],
+                                        vec![],
+                                        vec![Kind::Ref, Kind::Ref, Kind::Ref, Kind::Int],
+                                        ResKind::Ref,
+                                        py_pc as i64,
+                                    );
+                                    loaded
+                                        .map(super::flow::FlowValue::from)
+                                        .unwrap_or_else(|| fresh_ref_value(&mut graph).into())
+                                } else {
+                                    name.and_then(|nm| frontend_global_flow_value(w_code, nm))
+                                        .unwrap_or_else(|| fresh_ref_value(&mut graph).into())
+                                }
+                            };
                             if let super::flow::FlowValue::Variable(v) = &result_value {
                                 pin!(Some(*v), loaded_dst_reg);
                             }
@@ -7257,8 +7482,10 @@ impl CodeWriter {
                             // RPython blackhole.py: call_int_function transmutes
                             // to the correct arity. Each nargs needs a matching
                             // extern "C" fn with that many i64 parameters.
-                            // nargs > 8 → abort_permanent (no matching helper).
-                            let call_result_value = if nargs > 8 {
+                            // nargs > 14 → abort_permanent (no matching helper;
+                            // the backend dispatch tops out at 16 i64 args =
+                            // callable + null_or_self + 14).
+                            let call_result_value = if nargs > 14 {
                                 fresh_ref_value(&mut graph)
                             } else {
                                 // Graph-side `simple_call(callable,
@@ -7290,7 +7517,7 @@ impl CodeWriter {
                                 pin!(Some(result), stack_base + current_depth);
                                 result.into()
                             };
-                            if nargs > 8 {
+                            if nargs > 14 {
                                 emit_abort_permanent!(py_pc);
                             }
                             push_and_bump!(call_result_value, py_pc);
@@ -7825,16 +8052,18 @@ impl CodeWriter {
                             // (which has no RERAISE bytecode — its
                             // `Reraise.nomoreblocks` calls reraise
                             // directly into the exception link).
-                            // Suppress catch_exception adjacency:
-                            // RERAISE's source FrameState has had
-                            // POP_EXCEPT mutate the stack, which
-                            // makes the catch-landing union path
+                            // Attach the byte-adjacent catch when this
+                            // RERAISE PC is itself inside an outer
+                            // exception_table range: `emit_raise!` only
+                            // emits the catch when `catch_for_pc[py_pc]`
+                            // is Some, otherwise it falls through to
+                            // `exceptblock`. The catch-landing union path
                             // (`attach_catch_exception_edge` →
-                            // `getoutputargs_with_positions`)
-                            // mismatched against the explicit-raise
-                            // shape that earlier raise sites already
-                            // populated into the same landing.
-                            emit_raise!(exc_reg, exc_value, py_pc as i64, false);
+                            // `handler_entry_state_from_catch_site`)
+                            // reshapes the POP_EXCEPT-mutated source stack
+                            // to the handler try-level, so the landing no
+                            // longer mismatches the explicit-raise shape.
+                            emit_raise!(exc_reg, exc_value, py_pc as i64, true);
                         }
 
                         Instruction::WithExceptStart => {
@@ -10936,6 +11165,22 @@ mod tests {
             .expect("expected nested function code object")
     }
 
+    // Minimal `ExceptionCatchSite` for the `attach_catch_exception_edge`
+    // tests: a try-level stack depth of 0 with no `lasti` push and a
+    // handler PC at offset 0.  `handler_entry_state_from_catch_site`
+    // unwinds the edge state to this depth and pushes the exception value,
+    // matching the landing block's handler-entry layout.
+    fn synthetic_catch_site(landing: &SpamBlockRef) -> ExceptionCatchSite {
+        ExceptionCatchSite {
+            landing_label: 0,
+            handler_py_pc: 0,
+            stack_depth: 0,
+            push_lasti: false,
+            lasti_py_pc: 0,
+            landing: landing.clone(),
+        }
+    }
+
     fn fresh_variable_factory(start: u32) -> impl FnMut(Option<Kind>) -> Variable {
         let mut next_id = start;
         move |kind| {
@@ -12431,9 +12676,16 @@ mod tests {
         let catch_ref = SpamBlockRef::new(catch_block.clone(), None);
         let source_state = FrameState::new(Vec::new(), Vec::new(), None, Vec::new(), 0);
         let startblock_ref = graph.startblock.clone();
+        let site = synthetic_catch_site(&catch_ref);
 
-        let link =
-            attach_catch_exception_edge(&mut graph, &startblock_ref, &catch_ref, &source_state);
+        let link = attach_catch_exception_edge(
+            &code,
+            &mut graph,
+            &startblock_ref,
+            &catch_ref,
+            &source_state,
+            &site,
+        );
         let startblock = graph.startblock.borrow();
 
         assert_eq!(
@@ -12464,9 +12716,16 @@ mod tests {
             0,
         );
         let startblock_ref = graph.startblock.clone();
+        let site = synthetic_catch_site(&catch_ref);
 
-        let link =
-            attach_catch_exception_edge(&mut graph, &startblock_ref, &catch_ref, &source_state);
+        let link = attach_catch_exception_edge(
+            &code,
+            &mut graph,
+            &startblock_ref,
+            &catch_ref,
+            &source_state,
+            &site,
+        );
 
         let link_borrow = link.borrow();
         assert!(link_borrow.last_exception.is_some());
@@ -12489,19 +12748,28 @@ mod tests {
         let source_state =
             FrameState::new(vec![Some(local.into())], Vec::new(), None, Vec::new(), 0);
         let startblock_ref = graph.startblock.clone();
+        let site = synthetic_catch_site(&catch_ref);
 
         assert!(
             catch_block.borrow().inputargs.is_empty(),
             "catch landing block starts with no inputargs"
         );
 
-        attach_catch_exception_edge(&mut graph, &startblock_ref, &catch_ref, &source_state);
+        attach_catch_exception_edge(
+            &code,
+            &mut graph,
+            &startblock_ref,
+            &catch_ref,
+            &source_state,
+            &site,
+        );
 
         let inputargs = catch_block.borrow().inputargs.clone();
         assert_eq!(
             inputargs.len(),
-            3,
-            "expected 1 local + 2 exception Variables, got {:?}",
+            4,
+            "handler-entry layout: 1 local + the pushed exception value + \
+             the (last_exception, last_exc_value) pair, got {:?}",
             inputargs
         );
         assert!(

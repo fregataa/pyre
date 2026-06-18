@@ -7133,6 +7133,79 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
         "hint_force_virtualizable/r".to_string(),
         majit_translate::insns::BC_HINT_FORCE_VIRTUALIZABLE,
     );
+    // GC heap array allocation + element access — emitted by BUILD_TUPLE /
+    // BUILD_LIST (`new_array_clear` + `setarrayitem_gc_*`) and subscript
+    // load/store (`getarrayitem_gc_*`). Unlike the vable family above
+    // (which addresses the virtualizable frame), these touch ordinary heap
+    // arrays. A guard failure that resumes forward through a tuple/list
+    // build or an array element access must dispatch them; their `bhimpl_*`
+    // handlers are wired in `wire_bhimpl_handlers` below. Canonical bytes
+    // per `insns.rs` (blackhole.py:1311-1359). `getarrayitem_gc_*_pure` is
+    // the immutable-array (e.g. tuple) read shape, aliased to the same
+    // handler.
+    insns.insert(
+        "new_array_clear/id>r".to_string(),
+        majit_translate::insns::BC_NEW_ARRAY_CLEAR,
+    );
+    insns.insert(
+        "getarrayitem_gc_i/rid>i".to_string(),
+        majit_translate::insns::BC_GETARRAYITEM_GC_I,
+    );
+    insns.insert(
+        "getarrayitem_gc_r/rid>r".to_string(),
+        majit_translate::insns::BC_GETARRAYITEM_GC_R_RID,
+    );
+    insns.insert(
+        "getarrayitem_gc_f/rid>f".to_string(),
+        majit_translate::insns::BC_GETARRAYITEM_GC_F,
+    );
+    insns.insert(
+        "getarrayitem_gc_i_pure/rid>i".to_string(),
+        majit_translate::insns::BC_GETARRAYITEM_GC_I_PURE,
+    );
+    insns.insert(
+        "getarrayitem_gc_r_pure/rid>r".to_string(),
+        majit_translate::insns::BC_GETARRAYITEM_GC_R_PURE,
+    );
+    insns.insert(
+        "getarrayitem_gc_f_pure/rid>f".to_string(),
+        majit_translate::insns::BC_GETARRAYITEM_GC_F_PURE,
+    );
+    insns.insert(
+        "setarrayitem_gc_i/riid".to_string(),
+        majit_translate::insns::BC_SETARRAYITEM_GC_I,
+    );
+    insns.insert(
+        "setarrayitem_gc_r/rird".to_string(),
+        majit_translate::insns::BC_SETARRAYITEM_GC_R,
+    );
+    insns.insert(
+        "setarrayitem_gc_f/rifd".to_string(),
+        majit_translate::insns::BC_SETARRAYITEM_GC_F,
+    );
+    // Constant-operand "_C" forms, emitted when the array length, store
+    // index, or store value is a compile-time constant — a fixed-size
+    // tuple/list build (`new_array_clear/cd>r`) and its element stores
+    // (`setarrayitem_gc_r/rcrd`, const index; `setarrayitem_gc_i/ricd`,
+    // const int value).Whether the assembler emits the `_C` or
+    // the register form depends on constant folding during
+    // `make_jitcodes`, so a guard failure resuming forward through a
+    // constant-size build must dispatch these too. Their `bhimpl_*`
+    // handlers are already wired in `wire_bhimpl_handlers` below; without
+    // the map entry `wire_handler` silently no-ops and the byte stays
+    // unwired (`dispatch_step` panics on `0xd8`).
+    insns.insert(
+        "setarrayitem_gc_r/rcrd".to_string(),
+        majit_translate::insns::BC_SETARRAYITEM_GC_R_C,
+    );
+    insns.insert(
+        "setarrayitem_gc_i/ricd".to_string(),
+        majit_translate::insns::BC_SETARRAYITEM_GC_I_C,
+    );
+    insns.insert(
+        "new_array_clear/cd>r".to_string(),
+        majit_translate::insns::BC_NEW_ARRAY_CLEAR_C,
+    );
     builder.setup_insns(&insns);
     // `setup_insns` already derives `op_live` and `op_catch_exception`
     // from the registered canonical subset above.  `rvmprof_code/ii` is

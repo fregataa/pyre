@@ -971,22 +971,6 @@ pub fn frame_locals_cells_stack_array_ref(ctx: &mut TraceCtx, frame: OpRef) -> O
     frame_locals_cells_stack_array(ctx, frame)
 }
 
-/// Read-only JitCode lookup by CodeObject-wrapper pointer.
-///
-/// Blackhole/resume paths must not invoke compilation. Returns null
-/// if the code was not installed by the setup-time
-/// `CodeWriter.make_jitcodes()` result.
-///
-/// Uses the same canonical raw-code comparison as
-/// `MetaInterpStaticData::compiled_jitcode_lookup`; callers still
-/// pass the wrapper `w_code`, and the lookup normalizes it internally.
-pub(crate) fn jitcode_lookup(code: *const ()) -> *const JitCode {
-    ensure_finish_setup();
-    METAINTERP_SD
-        .with(|r| r.borrow().compiled_jitcode_lookup(code))
-        .unwrap_or(std::ptr::null())
-}
-
 /// warmspot.py:282 metainterp_sd.jitcodes[jitcode_index]:
 /// Resolve jitcode_index (sequential int from snapshot numbering)
 /// to the corresponding CodeObject pointer.
@@ -3581,19 +3565,6 @@ pub(crate) fn boxed_slot_value_for_type(_slot_type: Type, value: &Value) -> PyOb
         Value::Int(v) => w_int_new(*v),
         Value::Float(v) => pyre_object::floatobject::w_float_new(*v),
         Value::Ref(r) => r.as_usize() as PyObjectRef,
-        Value::Void => PY_NULL,
-    }
-}
-
-/// virtualizable.py:126/139 parity: box value for frame array slot.
-/// Frame array items (locals_cells_stack_w[*]) are declared as GCREF
-/// (interp_jit.py:25). The optimizer may unbox ints/floats in fail_args;
-/// this function re-boxes them for the frame. Ref values pass through.
-pub(crate) fn virtualizable_box_value(value: &Value) -> PyObjectRef {
-    match value {
-        Value::Ref(r) => r.as_usize() as PyObjectRef,
-        Value::Int(v) => w_int_new(*v),
-        Value::Float(v) => pyre_object::floatobject::w_float_new(*v),
         Value::Void => PY_NULL,
     }
 }
@@ -7467,16 +7438,48 @@ impl JitState for PyreJitState {
             sym.vable_lastblock,
             sym.vable_w_globals,
         ];
-        // virtualizable.py:139 load_list_of_boxes parity: both halves of
-        // virtualizable_boxes come from the resume-data stream — OpRefs via
-        // bridge_decode_box returns (OpRef, Value) pairs.
-        // No heap read. The seed helper pads short arrays with const-NULL
+        // virtualizable.py:139 load_list_of_boxes parity: the OpRef half of
+        // virtualizable_boxes comes from the resume-data stream
+        // (`bridge_decode_box`). The CONCRETE array shadow, however, is read
+        // from the restored live virtualizable — NOT from the resume-decoded
+        // `vable_array_values`. Those decoded values are off-heap copies of
+        // young GC pointers captured at guard-fail time; a minor collection
+        // during bridge setup (residual virtual materialization / op recording
+        // allocates) moves the referenced objects but cannot forward the
+        // off-heap decode Vec, leaving dangling pointers that crash the walk's
+        // getarrayitem_vable. The live frame (`sym.concrete_vable_ptr`,
+        // restored by `decode_and_restore_guard_failure`) sits on the
+        // CURRENT_FRAME chain, so `walk_pyframe_roots` forwards its
+        // `locals_cells_stack_w` items on every collection — its slots are
+        // always live. Read them directly, mirroring the root-trace seed
+        // (`read_all_boxes` from the rooted portal frame). Falls back to the
+        // decoded values only when no live pointer is bound (unit-test /
+        // init-before-run). The seed helper pads short arrays with const-NULL
         // OpRef; match that here by padding concrete values with
         // Value::Ref(GcRef::NULL) to the same length.
+        let live_array_values: Vec<majit_ir::Value> = if sym.concrete_vable_ptr.is_null() {
+            vable_array_values.clone()
+        } else {
+            let f =
+                unsafe { &*(sym.concrete_vable_ptr as *const pyre_interpreter::pyframe::PyFrame) };
+            let lp = f.locals_cells_stack_w;
+            if lp.is_null() {
+                vable_array_values.clone()
+            } else {
+                let arr = unsafe { &*lp };
+                let base = arr.items_ptr() as *const pyre_object::PyObjectRef;
+                let n = bridge_array_len.min(arr.len());
+                (0..n)
+                    .map(|i| {
+                        majit_ir::Value::Ref(majit_ir::GcRef(unsafe { *base.add(i) } as usize))
+                    })
+                    .collect()
+            }
+        };
         let mut concrete_values = Vec::with_capacity(vable_scalar_values.len() + bridge_array_len);
         concrete_values.extend_from_slice(&vable_scalar_values);
-        let taken_concrete = vable_array_values.len().min(bridge_array_len);
-        concrete_values.extend_from_slice(&vable_array_values[..taken_concrete]);
+        let taken_concrete = live_array_values.len().min(bridge_array_len);
+        concrete_values.extend_from_slice(&live_array_values[..taken_concrete]);
         while concrete_values.len() < vable_scalar_values.len() + bridge_array_len {
             concrete_values.push(majit_ir::Value::Ref(majit_ir::GcRef::NULL));
         }
@@ -7864,264 +7867,17 @@ impl JitState for PyreJitState {
             return self.validate_frame();
         }
 
-        // virtualizable.py:126-137 write_from_resume_data_partial:
-        // ALL static fields in unroll_static_fields order.
-        if let Some(last_instr) = values
-            .get(crate::virtualizable_gen::SYM_LAST_INSTR_IDX as usize)
-            .map(value_to_usize)
-        {
-            self.set_last_instr(last_instr);
+        // The rd_numb deopt path restores the whole virtualizable
+        // positionally before this runs (`resume.rs consume_vable_info` →
+        // `write_from_resume_data_partial`, resume.py:1399-1408).  The
+        // per-frame liveness section fills the blackhole REGISTERS and never
+        // touches the vable (blackhole.py:1376+), so the positional restore
+        // is authoritative for the frame.  Validate it and clear stale slots
+        // beyond valuestackdepth (blackhole fresh-frame parity), which the
+        // vable section restore does not perform.
+        if !self.validate_frame() {
+            return false;
         }
-        if let Some(code) = values
-            .get(crate::virtualizable_gen::SYM_PYCODE_IDX as usize)
-            .map(value_to_usize)
-        {
-            self.set_pycode(code);
-        }
-        if let Some(vsd) = values
-            .get(crate::virtualizable_gen::SYM_VALUESTACKDEPTH_IDX as usize)
-            .map(value_to_usize)
-        {
-            // Sanity check: vsd must not exceed the frame's total capacity
-            // (nlocals + stacksize). A bad vsd from stale guard recovery
-            // values can corrupt the frame and crash in as_mut_slice.
-            let max_vsd = self
-                .locals_cells_stack_array()
-                .map(|arr| arr.len())
-                .unwrap_or(0);
-            let safe_vsd = vsd.min(max_vsd);
-            self.set_valuestackdepth(safe_vsd);
-        }
-        if let Some(ns) = values
-            .get(crate::virtualizable_gen::SYM_W_GLOBALS_IDX as usize)
-            .map(value_to_usize)
-        {
-            self.set_w_globals(ns);
-        }
-
-        let nlocals = self.local_count();
-        let stack_only = self.valuestackdepth().saturating_sub(nlocals);
-        // resume.py:1077 consume_boxes(info, boxes_i, boxes_r, boxes_f) parity:
-        // RPython's consume_boxes uses position_info (liveness at resume PC)
-        // to map compact active_boxes back to register indices. Dead registers
-        // are skipped in the compact array — only live registers advance the
-        // value index.
-        //
-        // values[3..] = compact active_boxes from get_list_of_active_boxes,
-        // which filters by liveness. Use the same liveness table to restore.
-        // Two distinct pointers for the same PyFrame.pycode:
-        //   - `w_code_ptr`  : Python CodeObject WRAPPER (`PyObjectRef`).
-        //                     Key used by `jitcode_for`/`jitcode_lookup`
-        //                     (see trace_opcode.rs:3501/:3580 and
-        //                     state.rs:1908 — all pass the wrapper).
-        //   - `raw_code_ptr`: unwrapped Rust `CodeObject`. Consumed by
-        //                     `liveness_for` (the LiveVars cache key).
-        let (w_code_ptr, raw_code_ptr) = if self.frame != 0 {
-            let w_code = unsafe {
-                *((self.frame as *const u8).add(crate::frame_layout::PYFRAME_PYCODE_OFFSET)
-                    as *const *const ())
-            };
-            if !w_code.is_null() {
-                let raw = unsafe {
-                    pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
-                        as *const pyre_interpreter::CodeObject
-                };
-                (w_code, raw)
-            } else {
-                (std::ptr::null(), std::ptr::null())
-            }
-        } else {
-            (std::ptr::null(), std::ptr::null())
-        };
-        // resume.py:1383: info = blackholeinterp.get_current_position_info()
-        // blackhole.py:337: position was set by setposition(jitcode, pc) where
-        // pc comes from rd_numb — the same orgpc used by get_list_of_active_boxes.
-        // next_instr = orgpc + 1 + caches, which may have different liveness.
-        // `self.resume_pc` is the rd_numb pc word (set from
-        // `RebuiltFrame.pc`), so it may carry the after-residual-call
-        // marker.  Split it: `live_pc` is the plain Python PC for all
-        // py_pc-keyed liveness lookups, `live_after_residual_call`
-        // selects the post-call resume map below.
-        let live_pc_raw = self.resume_pc.take().unwrap_or_else(|| self.next_instr());
-        let (live_pc, live_after_residual_call) = {
-            let (p, a) = majit_ir::resumedata::decode_resume_pc(live_pc_raw as i32);
-            (p as usize, a)
-        };
-        let mut idx = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
-        // resume.py:1077 consume_boxes parity — iterate the SAME
-        // `all_liveness` BC_LIVE data the encoder used in
-        // `trace_opcode.rs::get_list_of_active_boxes`. For every live
-        // reg color, reverse-map through the current jitcode's live
-        // stack-slot colors before falling back to the local inputarg
-        // prefix. This keeps the encoder/decoder contract aligned on
-        // jitcode SSA liveness rather than the LiveVars approximation.
-        //
-        // Falls back to the LiveVars path below only when the frame's
-        // code is not (yet) registered or has no pc_map entry — i.e.
-        // the same fallback branch trace_opcode.rs:313-334 takes.
-        let decoded_via_jitcode: bool = (|| {
-            if w_code_ptr.is_null() {
-                return false;
-            }
-            let jc_ptr = jitcode_lookup(w_code_ptr);
-            if jc_ptr.is_null() {
-                return false;
-            }
-            let jc = unsafe { &*jc_ptr };
-            let payload = &jc.payload;
-            // G.4.3 portal-bridge writeback: positional iteration over
-            // `0..stack_base + depth_at_py_pc[live_pc]`, paired with the
-            // encoder's positional emit in
-            // `trace_opcode.rs::get_list_of_active_boxes` and the
-            // count check in `frame_value_count_at`.  Skips the canonical
-            // `all_liveness` path (whose register indices are for the
-            // dispatch loop, not the user PyFrame) and routes each
-            // consumed value to `set_local_at` / `set_stack_at` by the
-            // same `reg < stack_base` split the canonical path uses
-            // below.
-            //
-            // `metadata.stack_base = nlocals + ncells` (G.3h), the same
-            // value `local_count()` derives from `concrete_nlocals(frame)`
-            // — but reading from metadata makes the encoder/decoder
-            // symmetric source explicit (G.4.3a-fix: pre-fix code mixed
-            // `local_count() = stack_base` here with `nlocals_from_code()
-            // = varnames.len()` in the count callback, breaking parity
-            // for closure-bearing functions).
-            if payload.is_portal_bridge() {
-                let stack_base = payload.metadata.stack_base;
-                let depth = payload
-                    .metadata
-                    .depth_at_py_pc
-                    .get(live_pc)
-                    .copied()
-                    .unwrap_or(0) as usize;
-                let target_count = stack_base + depth;
-                for reg in 0..target_count {
-                    if let Some(value) = values.get(idx) {
-                        let boxed = virtualizable_box_value(value);
-                        if reg < stack_base {
-                            let _ = self.set_local_at(reg, boxed);
-                        } else {
-                            let stack_idx = reg - stack_base;
-                            if stack_idx < stack_only {
-                                let _ = self.set_stack_at(stack_idx, boxed);
-                            }
-                        }
-                    }
-                    idx += 1;
-                }
-                return true;
-            }
-            let resolved_jit_pc = if live_after_residual_call {
-                payload.after_residual_call_resume_pc_for(live_pc)
-            } else {
-                payload.resume_jitcode_pc_for(live_pc)
-            };
-            let Some(jit_pc) = resolved_jit_pc else {
-                return false;
-            };
-            let all_liveness = liveness_info_snapshot();
-            let off = payload.jitcode.get_live_vars_info(jit_pc, op_live());
-            if off + 2 >= all_liveness.len() {
-                return false;
-            }
-            let length_i = all_liveness[off] as u32;
-            let length_r = all_liveness[off + 1] as u32;
-            let length_f = all_liveness[off + 2] as u32;
-            let mut cursor = off + 3;
-            use majit_translate::liveness::LivenessIterator;
-            // Route Ref-bank live-register
-            // colors through `metadata.stack_slot_color_map` (forward
-            // map: stack slot d → post-rename color). Currently with
-            // input-arg pinning the map is `[nlocals, nlocals+1, ...]`
-            // so the lookup is currently identity; without the
-            // pinning, stack colors may differ from `nlocals + d` and
-            // the map is the single source of truth for the
-            // `color → stack-slot-index` reverse lookup the heap
-            // writeback needs.
-            let local_color_map: &[u16] = &payload.metadata.pyre_color_for_semantic_local;
-            let stack_color_map: &[u16] = &payload.metadata.stack_slot_color_map;
-            let live_local_indices: Vec<usize> = {
-                let code_ptr = if !payload.code_ptr.is_null() {
-                    payload.code_ptr
-                } else {
-                    raw_code_ptr
-                };
-                if code_ptr.is_null() {
-                    Vec::new()
-                } else {
-                    let live_vars = crate::liveness::liveness_for(code_ptr);
-                    (0..nlocals)
-                        .filter(|&local_idx| live_vars.is_local_live(live_pc, local_idx))
-                        .collect()
-                }
-            };
-            for (is_ref_bank, length) in [(false, length_i), (true, length_r), (false, length_f)] {
-                if length == 0 {
-                    continue;
-                }
-                let mut it = LivenessIterator::new(cursor, length, &all_liveness);
-                while let Some(reg_idx) = it.next() {
-                    let reg = reg_idx as usize;
-                    if let Some(value) = values.get(idx) {
-                        let boxed = virtualizable_box_value(value);
-                        if is_ref_bank {
-                            if let Some(slot_idx) = semantic_ref_slot_for_reg_color(
-                                nlocals,
-                                stack_only,
-                                local_color_map,
-                                stack_color_map,
-                                &live_local_indices,
-                                reg,
-                            ) {
-                                if slot_idx < nlocals {
-                                    let _ = self.set_local_at(slot_idx, boxed);
-                                } else {
-                                    let _ = self.set_stack_at(slot_idx - nlocals, boxed);
-                                }
-                            } else if reg < nlocals
-                                && matches!(value, Value::Int(_) | Value::Float(_))
-                            {
-                                // Runtime resume values are authoritative for
-                                // kind.  A stale Ref-bank liveness entry can
-                                // still carry an unboxed Int/Float fail arg;
-                                // box it into the semantic local without
-                                // widening Ref color reverse-mapping for
-                                // actual Ref values.
-                                let _ = self.set_local_at(reg, boxed);
-                            }
-                        } else if reg < nlocals {
-                            // Int/Float bank register indices are not Ref colors:
-                            // do not route them through
-                            // semantic_ref_slot_for_reg_color.  For the
-                            // current frame-local case, the jitcode liveness
-                            // uses the semantic local index; box the raw value
-                            // back into PyFrame.locals_cells_stack_w.
-                            let _ = self.set_local_at(reg, boxed);
-                        }
-                    }
-                    idx += 1;
-                }
-                cursor = it.offset;
-            }
-            true
-        })();
-        if !decoded_via_jitcode {
-            // The out-of-range-pc source that previously reached this
-            // branch is eliminated, and the bridge-resume tests run on the
-            // real trace-side jitcode registration path
-            // (`ensure_jitcode_index`). Unconditional panic — any hit is a
-            // bug.
-            panic!(
-                "bridge resume decode: jitcode path failed — \
-                 w_code_ptr={:p} raw_code_ptr={:p} live_pc={} \
-                 nlocals={} stack_only={}. Phase X-0/X-1 removed all \
-                 known triggers; further hits are bugs.",
-                w_code_ptr, raw_code_ptr, live_pc, nlocals, stack_only
-            );
-        }
-
-        // Clear stale slots beyond valuestackdepth (blackhole fresh frame parity).
         let vsd = self.valuestackdepth();
         if let Some(arr) = self.locals_cells_stack_array_mut() {
             for i in vsd..arr.len() {
@@ -10352,91 +10108,45 @@ mod tests {
     }
 
     #[test]
-    fn test_restore_guard_failure_uses_runtime_value_kinds_for_virtualizable_locals() {
-        use majit_ir::GcRef;
-        use majit_translate::liveness::encode_liveness;
-        use pyre_interpreter::pyframe::PyFrame;
-        use pyre_interpreter::{ConstantData, compile_exec};
+    #[ignore = "PyreSym::new_uninit hits the Phase X-1 skeleton-panic since the \
+                debug-only fallback was removed; needs a populated-jitcode harness."]
+    fn test_load_local_checked_value_respects_symbolic_local_type() {
+        let run_case = |symbolic_type: Type, name: &str, expected_guard: Option<OpCode>| {
+            let mut ctx = TraceCtx::for_test(1);
+            // The slot type matches `symbolic_type` (resoperation.py:719/727/739
+            // InputArg{Int,Float,Ref}); Void has no inputarg variant in RPython.
+            let local = OpRef::input_arg_typed(0, symbolic_type);
+            let mut sym = PyreSym::new_uninit(OpRef::NONE);
+            sym.registers_r = vec![local];
+            sym.symbolic_local_types = vec![symbolic_type];
+            sym.nlocals = 1;
 
-        let module = compile_exec("def f(a, b, c):\n    i = 0\n    return i\nf(1, 2, 3)\n")
-            .expect("test code should compile");
-        let code = module
-            .constants
-            .iter()
-            .find_map(|constant| match constant {
-                ConstantData::Code { code } if code.obj_name.as_str() == "f" => {
-                    Some((**code).clone())
-                }
-                _ => None,
-            })
-            .expect("test source should contain function code");
+            let mut state = MIFrame {
+                ctx: &mut ctx,
+                sym: &mut sym,
+                fallthrough_pc: 0,
+                parent_frames: Vec::new(),
+                pending_result_stack_idx: None,
+                pending_result_type: None,
+                pending_inline_frame: None,
+                residual_call_pc: None,
+                orgpc: 0,
+                concrete_frame_addr: 0,
+                pre_opcode_registers_r: None,
+                pre_opcode_semantic_depth: None,
+            };
 
-        let mut frame = PyFrame::new(code.clone());
-        frame.fix_array_ptrs();
-        let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
+            let loaded =
+                <MIFrame as LocalOpcodeHandler>::load_local_checked_value(&mut state, 0, name)
+                    .expect("local should load");
+            assert_eq!(loaded.opref, local);
 
-        // Register a jitcode keyed on frame.pycode so jitcode_lookup is
-        // non-null (else restore_guard_failure_values panics unconditionally
-        // at state.rs:8115). Publish a liveness buffer marking all four
-        // locals live in the Ref bank (length_r=4, colors 0..3): with a
-        // skeleton jitcode's empty color map, semantic_ref_slot_for_reg_color
-        // maps reg→slot identity (state.rs:1649), so the four array values
-        // land in locals 0..3. Local 3 carries Value::Int(7); the runtime
-        // value kind boxes it back as a real int regardless of the stale
-        // Ref slot type.
-        let mut all_liveness = vec![0u8, 4, 0];
-        all_liveness.extend(encode_liveness(&[0, 1, 2, 3]));
-        install_test_jitcode_with_liveness(&code, frame.pycode, &all_liveness, 1);
-
-        // Resume at the jitcode's single BC_LIVE (jit byte 0). In production
-        // resume_pc is the rd_numb pc; here next_instr would otherwise become
-        // last_instr+1 = 9 (out of the function's pc_map range) before the
-        // liveness lookup, so pin the lookup pc explicitly.
-        let mut state = PyreJitState {
-            frame: frame_ptr,
-            resume_pc: Some(0),
+            let tree_loop = ctx.into_tree_loop();
+            assert_eq!(tree_loop.ops.last().map(|op| op.opcode), expected_guard);
         };
-        state.set_next_instr(0);
-        state.set_valuestackdepth(4);
-        let meta = PyreMeta {
-            num_locals: 4,
-            ns_len: 0,
-            valuestackdepth: 4,
-            array_capacity: 4,
-            trace_extra_reds: 0,
-            has_virtualizable: true,
-            // Stale trace-entry types: all locals looked boxed refs when the
-            // trace started, but guard failure can still carry a raw int in
-            // slot `i`.
-            slot_types: vec![Type::Ref, Type::Ref, Type::Ref, Type::Ref],
-        };
-        let values = vec![
-            Value::Ref(GcRef(frame_ptr)),             // frame
-            Value::Ref(GcRef(0)),                     // ec (extra_red)
-            Value::Int(8),                            // last_instr
-            Value::Ref(GcRef(frame.pycode as usize)), // pycode
-            Value::Int(4),                            // valuestackdepth
-            Value::Ref(GcRef(0)),                     // debugdata
-            Value::Ref(GcRef(0)),                     // lastblock
-            Value::Ref(GcRef(0)),                     // w_globals
-            Value::Ref(GcRef(w_int_new(1) as usize)), // local a
-            Value::Ref(GcRef(w_int_new(2) as usize)), // local b
-            Value::Ref(GcRef(w_int_new(3) as usize)), // local c
-            Value::Int(7),                            // local i
-        ];
 
-        assert!(<PyreJitState as JitState>::restore_guard_failure_values(
-            &mut state,
-            &meta,
-            &values,
-            &majit_metainterp::blackhole::ExceptionState::default(),
-        ));
-
-        assert_eq!(state.next_instr(), 9);
-        assert_eq!(state.valuestackdepth(), 4);
-        let restored_i = state.local_at(3).expect("local i should be restored");
-        assert!(unsafe { is_int(restored_i) });
-        assert_eq!(unsafe { w_int_get_value(restored_i) }, 7);
+        run_case(Type::Int, "j", None);
+        run_case(Type::Ref, "b", Some(OpCode::GuardNonnull));
     }
 
     #[test]
