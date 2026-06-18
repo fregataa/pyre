@@ -583,6 +583,110 @@ impl Bookkeeper {
             .unwrap_or_default()
     }
 
+    /// No upstream equivalent — forced by pyre's numbering order, not a
+    /// casual workaround.  Upstream runs `assign_inheritance_ids` ONCE
+    /// inside `RPythonTyper.specialize`, AFTER `annotator.complete()`
+    /// reaches its fixpoint, when every instantiated class — variant
+    /// classes included — already exists; the single numbering pass sees
+    /// the complete set and needs no pre-mint.  pyre cannot follow that
+    /// order: it runs incremental per-subject `specialize_more_blocks`
+    /// (no single post-annotation driver), and `ClassRepr.fill_vtable_root`
+    /// bakes `minid`/`maxid` as eager `Signed` constants into the
+    /// cross-graph-cached vtable, so the ids must be stable in the session
+    /// prologue — before any per-subject annotation discovers a
+    /// lazily-minted variant class.  This pre-mint is the prologue-time
+    /// analogue of upstream's "all classes exist before numbering"
+    /// invariant, restricted to the enum-variant subtrees that would
+    /// otherwise be minted lazily mid-session: it pre-mints the variant
+    /// subclasses of every registered enum so the session-prologue
+    /// [`crate::translator::rtyper::normalizecalls::assign_inheritance_ids`]
+    /// pass numbers each `enum-base + variant-children` subtree as one
+    /// contiguous bracket.  Called from `PyreCallRegistry::ensure_session`
+    /// AFTER the struct-root loop (so the enum-base classdefs already
+    /// exist, UNNUMBERED) and BEFORE the single `assign_inheritance_ids`.
+    ///
+    /// A variant ctor instantiation (`PyError::type_error` →
+    /// `PyErrorKind::TypeError`) mints its variant class LAZILY during
+    /// annotation, after the prologue numbering has already baked the
+    /// enum base's `[minid,maxid]` bracket.  An on-demand
+    /// `assign_inheritance_ids` re-run then cannot number the fresh
+    /// child (its bracket would have to nest inside the parent's baked
+    /// range — not append-safe), so `ClassesPBCRepr.redispatch_call`
+    /// Skip-classifies the instantiation.  Pre-minting the whole subtree
+    /// here leaves every member UNNUMBERED at the single numbering pass,
+    /// so the contiguous bracket is assigned once and never shifts.
+    ///
+    /// Spelling MUST match the annotation path or the pre-mint is a
+    /// phantom that never matches the lazily-minted class, so each variant
+    /// is interned through the SAME [`Self::intern_enum_variant_host`]
+    /// primitive the discriminant-narrowing resolver
+    /// ([`Self::getuniqueclassdef_for_enum_variant`]) and the variant ctor
+    /// arm (`flowspace_adapter`'s `SyntheticTransparentCtor`) route through:
+    /// base = `intern_class_by_qualname(canonical_struct_name(root))`,
+    /// variant = `intern_class_by_qualname_with_bases(
+    /// "{canon_root}::{variant}", [base])`.  All three sites thus resolve
+    /// one `HostObject` per variant under the `::`-qualified key.
+    /// `enum_variant_by_discriminant` dual-publishes each enum under both
+    /// its `::`-qualified path and its bare leaf; iterate the qualified
+    /// keys only.  Gated on the same `is_enum_base` predicate the ctor arm
+    /// uses (a flat class whose sole row is the synthetic `__discriminant`
+    /// tag), so the pre-mint covers exactly the variant subclasses the
+    /// adapter can mint — payload-bearing enums included, since their
+    /// payloads live under `{enum}::{variant}` keys, not on the base.
+    pub fn pre_register_enum_variant_classes(self: &Rc<Self>) {
+        // Collect (qualified_root, [variant names]) for every enum base,
+        // releasing both registry borrows before minting (the intern /
+        // getuniqueclassdef calls re-borrow `pyre_struct_fields` and
+        // `pyre_struct_root_classes`).  Sorted for a deterministic mint
+        // order so the numbering bracket is reproducible.
+        let mut pairs: Vec<(String, Vec<String>)> = {
+            let variant_guard = self.pyre_enum_variant_by_discriminant.borrow();
+            let fields_guard = self.pyre_struct_fields.borrow();
+            let (Some(variants), Some(reg)) = (variant_guard.as_ref(), fields_guard.as_ref())
+            else {
+                return;
+            };
+            variants
+                .iter()
+                .filter(|(root, _)| root.contains("::"))
+                .filter_map(|(root, by_discr)| {
+                    let leaf = root.rsplit("::").next().unwrap_or(root);
+                    reg.is_enum_base(leaf).then(|| {
+                        let mut names: Vec<String> = by_discr.values().cloned().collect();
+                        names.sort();
+                        names.dedup();
+                        (root.clone(), names)
+                    })
+                })
+                .collect()
+        };
+        pairs.sort();
+
+        for (root, variant_names) in pairs {
+            // Materialize the discriminant-only base classdef before a
+            // variant references it through `getmro`; idempotent with the
+            // struct-root loop.  `canonical_struct_name(root)` is the same
+            // spelling `intern_enum_variant_host` resolves the base under,
+            // so the pre-mint and the discriminant-narrowing resolver share
+            // one base lineage and the variant subtree numbers as one
+            // bracket.
+            let canon_root = majit_ir::descr::canonical_struct_name(&root);
+            let base = self.intern_class_by_qualname(&canon_root);
+            let _ = self.getuniqueclassdef(&base);
+            for variant in variant_names {
+                // The SAME interning primitive the discriminant-narrowing
+                // resolver ([`Self::getuniqueclassdef_for_enum_variant`])
+                // and the variant ctor arm (`flowspace_adapter`) use, so
+                // all three sites resolve ONE variant classdef under the
+                // `::`-qualified key — no `.`-vs-`::` split that would mint
+                // a second, distinct sibling the single numbering pass never
+                // reaches.
+                let variant_host = self.intern_enum_variant_host(&root, &variant);
+                let _ = self.getuniqueclassdef(&variant_host);
+            }
+        }
+    }
+
     /// Push a classdef into [`Self::needs_generic_instantiate`] unless
     /// it is already present (upstream `dict[cdef] = True` idempotence).
     pub fn push_needs_generic_instantiate(&self, classdef: &Rc<RefCell<ClassDef>>) {
@@ -1646,9 +1750,11 @@ impl Bookkeeper {
     /// `pairtype(SomeInstance, SomeInstance).improve` (binaryop.py:685)
     /// needs to narrow a `SomeInstance(base)` to `SomeInstance(variant)`.
     /// Identity is the canonical struct-root cache keyed by
-    /// `canonical_struct_name`; both `enum_root` and the `enum_root::variant`
-    /// path normalise to one stable `HostObject` apiece, so repeated
-    /// calls return the same `Rc`.
+    /// `canonical_struct_name`; the base `enum_root` and the
+    /// `canon_root::variant` path ([`Self::intern_enum_variant_host`])
+    /// each normalise to one stable `HostObject`, so repeated calls
+    /// return the same `Rc` — and the variant `Rc` is the very one the
+    /// prologue pre-mint numbered.
     pub fn getuniqueclassdef_for_enum_variant(
         self: &Rc<Self>,
         enum_root: &str,
@@ -3670,6 +3776,22 @@ mod tests {
             .getuniqueclassdef_for_enum_variant("Color", "Rgb")
             .expect("variant re-lookup");
         assert!(Rc::ptr_eq(&variant, &variant2), "variant identity stable");
+
+        // The narrowing resolver, the prologue pre-mint, and the ctor arm
+        // must all intern ONE variant classdef.  A `.`-vs-`::` split would
+        // mint a second, distinct classdef that the single
+        // `assign_inheritance_ids` pass never reaches; assert the resolver
+        // returns the classdef the pre-mint / ctor obtain through the
+        // shared `intern_enum_variant_host` primitive (the `::`-qualified
+        // key).
+        let premint_host = bk.intern_enum_variant_host("Color", "Rgb");
+        let premint = bk
+            .getuniqueclassdef(&premint_host)
+            .expect("pre-mint variant classdef");
+        assert!(
+            Rc::ptr_eq(&variant, &premint),
+            "narrowing variant must be the pre-mint/ctor classdef from intern_enum_variant_host"
+        );
 
         // The payoff: improve() narrows SomeInstance(base) to
         // SomeInstance(variant) given the variant as the refinement —

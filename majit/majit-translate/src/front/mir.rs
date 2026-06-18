@@ -2904,10 +2904,21 @@ impl<'a> Lowering<'a> {
                     }
                     None => (None, None),
                 };
-                let base = self.resolve_place(mir_bb, place)?;
                 let res = self
                     .graph
                     .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                // A local bound directly to its payload by a decomposed
+                // always-`Ok` conversion (`try_lower_usize_try_from`)
+                // carries no runtime enum object — no `__discriminant`
+                // field exists to read.  Its tag is the recorded
+                // constant, so fold to `ConstInt(tag)` (mirrors
+                // `expect_on_const_ok`, which aliases the payload).
+                if let PlaceKind::Local(i) = &place.kind
+                    && let Some(&tag) = self.const_discriminant_locals.get(&(*i as usize))
+                {
+                    return Ok((Some(OpKind::ConstInt(tag)), res));
+                }
+                let base = self.resolve_place(mir_bb, place)?;
                 Ok((
                     Some(OpKind::FieldRead {
                         base,
@@ -4114,6 +4125,7 @@ impl<'a> Lowering<'a> {
                 let (segments, method_hint) = self.call_target_segments(mir_bb, &reg)?;
                 if self.try_lower_checked_neg(
                     mir_bb,
+                    &reg.kind,
                     &segments,
                     &args,
                     dest_local,
@@ -4123,6 +4135,17 @@ impl<'a> Lowering<'a> {
                     return Ok(());
                 }
                 if self.try_lower_usize_try_from(
+                    mir_bb,
+                    &reg.kind,
+                    &segments,
+                    &args,
+                    dest_local,
+                    &call.dest.ty,
+                    target,
+                )? {
+                    return Ok(());
+                }
+                if self.try_lower_num_from(
                     mir_bb,
                     &reg.kind,
                     &segments,
@@ -5097,12 +5120,19 @@ impl<'a> Lowering<'a> {
     /// payload `__pos_0 = neg(v)` (wrapping; the `None` arm never
     /// reads it).  The downstream discriminant switch and payload
     /// downcast then lower through the ordinary enum FieldRead paths.
+    /// The `i64::MIN` sentinel is only correct at word width, so the
+    /// lowering is gated on a word-sized signed operand (`i64`/`isize`)
+    /// — a narrower `checked_neg` overflows at its own narrower `MIN`
+    /// and keeps the generic `Call` form (none arise today; the live
+    /// callers are `neg`'s `int_value` and `rangeobject`'s `step`,
+    /// both `i64`).
     /// Returns `Ok(false)` when the call is not `checked_neg` (or the
     /// destination's `Option` decl cannot be resolved) so the generic
     /// `Call` lowering proceeds.
     fn try_lower_checked_neg(
         &mut self,
         mir_bb: usize,
+        kind: &CallKind,
         segments: &[String],
         args: &[Variable],
         dest_local: usize,
@@ -5122,6 +5152,22 @@ impl<'a> Lowering<'a> {
         let [arg] = args else {
             return Ok(false);
         };
+        // The decomposition compares against `i64::MIN`; restrict it to
+        // word-sized signed operands so a narrower `checked_neg` (which
+        // overflows at its own `MIN`) is not miscompiled.  The operand
+        // is the receiver — `checked_neg(self)` — so read `inputs[0]`.
+        let CallKind::Fun(FunId::Regular { id }) = kind else {
+            return Ok(false);
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return Ok(false);
+        };
+        let Some(src) = fd.signature.inputs.first() else {
+            return Ok(false);
+        };
+        if !matches!(self.tyref_literal_int_atom(src), Some("I64" | "Isize")) {
+            return Ok(false);
+        }
         // Resolve the destination `Option` decl so the FieldWrite owner
         // matches what `resolve_aggregate_adt` would record for a real
         // `Some(..)` construction site of the same type.
@@ -5276,6 +5322,106 @@ impl<'a> Lowering<'a> {
         self.const_discriminant_locals.insert(dest_local, 0);
         self.local_var[dest_local] = Some(arg);
         let bb_id = self.block_id[mir_bb];
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(true)
+    }
+
+    /// Lower an infallible numeric widening `<i64 as From<u32>>::from(x)`
+    /// (`core::convert::num::<Impl>::from`, Opaque in the LLBC) to an
+    /// identity bind on the destination local.  `From` is implemented in
+    /// core only for value-preserving conversions, and a
+    /// smaller-than-word unsigned source widens into the word-sized
+    /// carrier with no change of value — the same no-op `rarithmetic.py
+    /// widen` performs — so no op is emitted, exactly as the always-`Ok`
+    /// `usize::try_from` payload binds directly
+    /// ([`Lowering::try_lower_usize_try_from`]).  `pyopcode.rs`
+    /// `u32_as_i64` is `i64::from(x: u32)`.  Word-or-wider sources keep
+    /// the `Call` form (no smaller-than-word identity to fold).
+    fn try_lower_num_from(
+        &mut self,
+        mir_bb: usize,
+        kind: &CallKind,
+        segments: &[String],
+        args: &[Variable],
+        dest_local: usize,
+        dest_ty: &TyRef,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        let [first, .., module, impl_seg, leaf] = segments else {
+            return Ok(false);
+        };
+        if first.as_str() != "core"
+            || module.as_str() != "num"
+            || impl_seg.as_str() != "<Impl>"
+            || leaf.as_str() != "from"
+        {
+            return Ok(false);
+        }
+        let [arg] = args else {
+            return Ok(false);
+        };
+        let CallKind::Fun(FunId::Regular { id }) = kind else {
+            return Ok(false);
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return Ok(false);
+        };
+        let Some(src) = fd.signature.inputs.first() else {
+            return Ok(false);
+        };
+        // Only smaller-than-word unsigned sources widen as a
+        // value-preserving identity in the word carrier (the same gate
+        // `try_lower_usize_try_from` uses).
+        if !matches!(
+            self.tyref_literal_uint_atom(src),
+            Some("U8" | "U16" | "U32")
+        ) {
+            return Ok(false);
+        }
+        // Destination must be a word-sized integer carrier.  A signed
+        // word destination needs the same annotation re-type the cast
+        // path applies (the `Rvalue::Cast` unsigned→signed arm): aliasing
+        // a `uN` source straight into an `iN` carrier preserves the source
+        // `r_uint` annotation and trips the SomeInteger signedness
+        // `UnionError` (binaryop.py:178-202) when the value later meets a
+        // signed operand.  Route signed destinations through
+        // `rarithmetic.intmask` (identity on the i64 carrier, re-types
+        // Signed); alias unsigned destinations directly, as upstream
+        // `widen` leaves no op.
+        let dest_signed_word =
+            matches!(self.tyref_literal_int_atom(dest_ty), Some("I64" | "Isize"));
+        let dest_unsigned_word =
+            matches!(self.tyref_literal_uint_atom(dest_ty), Some("U64" | "Usize"));
+        if !dest_signed_word && !dest_unsigned_word {
+            return Ok(false);
+        }
+        let arg = arg.clone();
+        let bb_id = self.block_id[mir_bb];
+        if dest_signed_word {
+            let res = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(res.clone()),
+                kind: OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: ["rpython", "rlib", "rarithmetic", "intmask"]
+                            .into_iter()
+                            .map(str::to_string)
+                            .collect(),
+                    },
+                    args: vec![arg],
+                    result_ty: ValueType::Int,
+                },
+            });
+            self.local_var[dest_local] = Some(res);
+        } else {
+            // Identity widen: bind the destination directly to the operand —
+            // no op materialized, exactly as upstream `widen` leaves none.
+            self.local_var[dest_local] = Some(arg);
+        }
         let target_bb = self.block_id[target];
         let link_args = self.edge_args(mir_bb, target)?;
         self.graph.set_goto(bb_id, target_bb, link_args);
@@ -5517,6 +5663,27 @@ impl<'a> Lowering<'a> {
                 }
             })?;
         Some(format!("{owner}::{}", v.name))
+    }
+
+    /// The `Int` width atom (`"I8"` / `"I32"` / `"Isize"` …) of a
+    /// signed-integer literal type, mirroring [`tyref_literal_uint_atom`]
+    /// for the `{"Literal": {"Int": "Isize"}}` shell.  `None` for any
+    /// non-signed-literal type.
+    fn tyref_literal_int_atom<'t>(&self, ty: &'t TyRef) -> Option<&'t str>
+    where
+        'a: 't,
+    {
+        let value = match ty {
+            TyRef::Inline { value: (_, v) } => v,
+            TyRef::Other(v) => v,
+            TyRef::Dedup { id } => self.llbc.dedup_body(*id)?,
+        };
+        value
+            .as_object()?
+            .get("Literal")?
+            .as_object()?
+            .get("Int")?
+            .as_str()
     }
 
     /// Shared tail for the decomposed checked-arithmetic /
@@ -8336,11 +8503,940 @@ fn scalar_value_to_i64(v: &serde_json::Value) -> Option<i64> {
     None
 }
 
+/// Resolve a `Variable` used as a call argument back to the operation
+/// that produced it, following block-input `Link`s across blocks.
+///
+/// The `fmt`-chain recognizer (#277) fires at `alloc::fmt::format(v)`
+/// where `v` is the `Arguments` value — but `v` reaches that block as an
+/// `inputarg` threaded from the predecessor's `Arguments::new` result via
+/// the outgoing `Link`, not as a direct op result in the current block.
+/// Existing `try_lower_*` folds only read a call's direct args; the fmt
+/// recognizer needs this cross-block back-trace.
+///
+/// Returns `(block, op_index)` of the producing `SpaceOperation`, or
+/// `None` when `var` traces to a `Const`, a function input (no producing
+/// op), a phi merge (a block with more than one incoming `Link`, so no
+/// single producer), or a producer not yet emitted into `graph`.
+//
+// Staged for the #277 recognizer; not yet wired into the call dispatch.
+#[allow(dead_code)]
+fn resolve_to_producer_op(
+    graph: &FunctionGraph,
+    var: &crate::flowspace::model::Variable,
+) -> Option<(BlockId, usize)> {
+    let mut current = var.clone();
+    let mut visited: Vec<u64> = Vec::new();
+    loop {
+        if visited.contains(&current.id()) {
+            return None; // cycle guard
+        }
+        visited.push(current.id());
+
+        // (1) Produced directly by an op in some block?
+        for block in &graph.blocks {
+            for (idx, op) in block.operations.iter().enumerate() {
+                if op.result.as_ref().is_some_and(|r| r.id() == current.id()) {
+                    return Some((block.id, idx));
+                }
+            }
+        }
+
+        // (2) Otherwise it is a block inputarg — follow the single
+        // incoming Link's matching positional arg back one block.
+        let (owner, pos) = graph.blocks.iter().find_map(|block| {
+            block
+                .inputargs
+                .iter()
+                .position(|a| a.id() == current.id())
+                .map(|pos| (block.id, pos))
+        })?;
+        let mut incoming = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.exits.iter())
+            .filter(|link| link.target == owner);
+        let first = incoming.next()?;
+        if incoming.next().is_some() {
+            return None; // phi merge: no single producer
+        }
+        match first.args.get(pos)? {
+            crate::model::LinkArg::Value(v) => current = v.clone(),
+            crate::model::LinkArg::Const(_) => return None,
+        }
+    }
+}
+
+/// Decode the packed format-string template that `format_args!` lowers
+/// its `&[&str]` pieces into.  The pieces argument to `fmt::Arguments::new`
+/// is a `[u8; N]` byte buffer (charon lowers it as an `Array` of `U8`
+/// constant elements); this reconstructs the literal `pieces` and counts
+/// the argument placeholders.
+///
+/// Grammar (verified against the real LLBC for several handler graphs):
+/// - literal segment: a length byte `L` with `L < 0x80`, then `L` bytes
+///   of UTF-8 text appended to the current piece;
+/// - placeholder: the single byte `0xC0` — closes the current piece and
+///   begins the next (the Display-vs-Debug choice lives in the parallel
+///   args array, not in this template, so a placeholder carries no kind);
+/// - terminator: a `0x00` byte (only at a segment boundary; `0`/`0xC0`
+///   bytes inside a literal are consumed by its length prefix).
+///
+/// Returns `(pieces, placeholder_count)` with `pieces.len() ==
+/// placeholder_count + 1`.  Returns `None` (bail, leaving the graph
+/// untouched) on any high-bit control byte other than `0xC0` — i.e. a
+/// format spec with width/precision/fill or an explicit positional/named
+/// argument — and on non-UTF-8 literal bytes.
+//
+// Staged for the #277 recognizer; not yet wired into the call dispatch.
+#[allow(dead_code)]
+fn decode_packed_format_pieces(bytes: &[u8]) -> Option<(Vec<String>, usize)> {
+    let mut pieces: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut placeholders = 0usize;
+    let mut i = 0;
+    let mut terminated = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == 0x00 {
+            // terminator — must be the final byte
+            if i + 1 != bytes.len() {
+                return None;
+            }
+            terminated = true;
+            break;
+        } else if b == 0xC0 {
+            // plain sequential placeholder
+            pieces.push(std::mem::take(&mut current));
+            placeholders += 1;
+            i += 1;
+        } else if b < 0x80 {
+            // literal segment of length `b`
+            let start = i + 1;
+            let end = start.checked_add(b as usize)?;
+            let seg = bytes.get(start..end)?;
+            current.push_str(std::str::from_utf8(seg).ok()?);
+            i = end;
+        } else {
+            // any other control byte = format spec / positional arg: bail
+            return None;
+        }
+    }
+    // The grammar requires the `0x00` terminator at a segment boundary;
+    // running out of bytes without it is a truncated or wrong array, not
+    // a valid template — bail rather than accept it once wired.
+    if !terminated {
+        return None;
+    }
+    pieces.push(current);
+    Some((pieces, placeholders))
+}
+
+/// Read an `Array` aggregate literal: given the Variable holding a
+/// `SyntheticTransparentCtor { name: "Array" }` result, collect the
+/// values written to its `__pos_0..__pos_{n-1}` fields in index order.
+/// The ctor and its element `FieldWrite`s are emitted into one block by
+/// the `Rvalue::Aggregate` array lowering, so the search is block-local
+/// once the ctor is found. Returns `None` if `array_var` is not produced
+/// by an `Array` ctor, or its `__pos_i` writes are not the contiguous
+/// range `0..n`.
+//
+// Staged for the #277 recognizer; not yet wired into the call dispatch.
+#[allow(dead_code)]
+fn read_array_literal_elements(
+    graph: &FunctionGraph,
+    array_var: &crate::flowspace::model::Variable,
+) -> Option<Vec<crate::flowspace::model::Variable>> {
+    use crate::model::{CallTarget, OpKind};
+    let (block_id, ctor_idx) = resolve_to_producer_op(graph, array_var)?;
+    let block = graph.blocks.iter().find(|b| b.id == block_id)?;
+    match &block.operations.get(ctor_idx)?.kind {
+        OpKind::Call {
+            target: CallTarget::SyntheticTransparentCtor { name, .. },
+            ..
+        } if name == "Array" => {}
+        _ => return None,
+    }
+    let mut by_index: Vec<(usize, crate::flowspace::model::Variable)> = Vec::new();
+    for op in &block.operations {
+        if let OpKind::FieldWrite {
+            base, field, value, ..
+        } = &op.kind
+        {
+            if base.id() == array_var.id() {
+                let idx = field.name.strip_prefix("__pos_")?.parse::<usize>().ok()?;
+                // A `setfield_gc` inline `Const` element carries no SSA
+                // Variable; the recognizer needs a register operand per slot.
+                let write_var = value.as_variable()?;
+                by_index.push((idx, write_var.clone()));
+            }
+        }
+    }
+    by_index.sort_by_key(|(i, _)| *i);
+    for (expected, (idx, _)) in by_index.iter().enumerate() {
+        if *idx != expected {
+            return None;
+        }
+    }
+    Some(by_index.into_iter().map(|(_, v)| v).collect())
+}
+
+/// Resolve a Variable to the `i64` of the `ConstInt` op that produces it,
+/// following cross-block links via [`resolve_to_producer_op`]. Used to
+/// read the packed-format pieces byte array (each `__pos_i` element is a
+/// `ConstInt` byte).
+//
+// Staged for the #277 recognizer; not yet wired into the call dispatch.
+#[allow(dead_code)]
+fn resolve_const_int(
+    graph: &FunctionGraph,
+    var: &crate::flowspace::model::Variable,
+) -> Option<i64> {
+    use crate::model::OpKind;
+    let (block_id, idx) = resolve_to_producer_op(graph, var)?;
+    let block = graph.blocks.iter().find(|b| b.id == block_id)?;
+    match &block.operations.get(idx)?.kind {
+        OpKind::ConstInt(n) => Some(*n),
+        _ => None,
+    }
+}
+
+/// Whether a `Display` (`{}`) or `Debug` (`{:?}`) placeholder rendered an
+/// argument. Carried by the `fmt::rt::Argument::new_display` /
+/// `new_debug` constructor in the parallel args array (the packed pieces
+/// template does not encode the choice).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+enum FmtArgKind {
+    Display,
+    Debug,
+}
+
+/// One placeholder argument recovered from a `format_args!` chain: the
+/// value Variable the placeholder renders and its Display/Debug flavour.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct FmtArg {
+    value: crate::flowspace::model::Variable,
+    kind: FmtArgKind,
+}
+
+/// The decoded contents of a `format_args!` chain — the literal string
+/// pieces interleaved with the rendered placeholder arguments
+/// (`pieces.len() == args.len() + 1`).
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct FmtChain {
+    pieces: Vec<String>,
+    args: Vec<FmtArg>,
+}
+
+/// Match a `FunctionPath`'s trailing segments against `tail`, so a
+/// crate-qualified spelling (`core::fmt::Arguments::new`) and the
+/// crate-stripped front-end spelling (`fmt::Arguments::new`) both
+/// resolve.
+#[allow(dead_code)]
+fn fmt_path_ends_with(segments: &[String], tail: &[&str]) -> bool {
+    segments.len() >= tail.len()
+        && segments[segments.len() - tail.len()..]
+            .iter()
+            .zip(tail)
+            .all(|(s, t)| s.as_str() == *t)
+}
+
+/// The `fmt::Arguments::new(pieces, args)` constructor that `format_args!`
+/// builds from the on-stack pieces+args arrays.
+#[allow(dead_code)]
+fn is_arguments_new_path(segments: &[String]) -> bool {
+    fmt_path_ends_with(segments, &["Arguments", "new"])
+}
+
+/// Classify a `fmt::rt::Argument::new_display` / `new_debug` constructor
+/// path. Any other path (positional/named/width-bearing argument ctor) is
+/// not in the recognized subset.
+#[allow(dead_code)]
+fn fmt_argument_ctor_kind(segments: &[String]) -> Option<FmtArgKind> {
+    if fmt_path_ends_with(segments, &["Argument", "new_display"]) {
+        Some(FmtArgKind::Display)
+    } else if fmt_path_ends_with(segments, &["Argument", "new_debug"]) {
+        Some(FmtArgKind::Debug)
+    } else {
+        None
+    }
+}
+
+/// Unwrap the `format_args!` argument tuple-ref. Each Display/Debug
+/// argument reaches `Argument::new_display(&v)` as a `FieldRead` off the
+/// on-stack argument `Tuple` aggregate (`&(v,).0`); follow it back to the
+/// value written into that tuple field. Returns `var` unchanged when it
+/// is not produced by a `FieldRead` (value passed directly), and `None`
+/// when the tuple field has conflicting writers.
+#[allow(dead_code)]
+fn unwrap_fmt_arg_tuple_ref(
+    graph: &FunctionGraph,
+    var: &crate::flowspace::model::Variable,
+) -> Option<crate::flowspace::model::Variable> {
+    use crate::model::OpKind;
+    let (block_id, idx) = resolve_to_producer_op(graph, var)?;
+    let block = graph.blocks.iter().find(|b| b.id == block_id)?;
+    let (base, field_name) = match &block.operations.get(idx)?.kind {
+        OpKind::FieldRead { base, field, .. } => (base.clone(), field.name.clone()),
+        _ => return Some(var.clone()),
+    };
+    let mut found: Option<crate::flowspace::model::Variable> = None;
+    for b in &graph.blocks {
+        for op in &b.operations {
+            if let OpKind::FieldWrite {
+                base: write_base,
+                field,
+                value,
+                ..
+            } = &op.kind
+            {
+                if write_base.id() == base.id() && field.name == field_name {
+                    // A `setfield_gc` inline `Const` carries no SSA Variable;
+                    // the back-trace needs a register operand to follow.
+                    let write_var = value.as_variable()?;
+                    if found.as_ref().is_some_and(|f| f.id() != write_var.id()) {
+                        return None; // ambiguous: distinct values written
+                    }
+                    found = Some(write_var.clone());
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Recover one placeholder argument from an args-array element: the
+/// element is the result of a `fmt::rt::Argument::new_display` /
+/// `new_debug` constructor, whose sole argument back-traces (through the
+/// tuple-ref wrap) to the rendered value.
+#[allow(dead_code)]
+fn extract_fmt_arg(
+    graph: &FunctionGraph,
+    arg_elem: &crate::flowspace::model::Variable,
+) -> Option<FmtArg> {
+    use crate::model::{CallTarget, OpKind};
+    let (block_id, idx) = resolve_to_producer_op(graph, arg_elem)?;
+    let block = graph.blocks.iter().find(|b| b.id == block_id)?;
+    let (kind, inner) = match &block.operations.get(idx)?.kind {
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments },
+            args,
+            ..
+        } => (fmt_argument_ctor_kind(segments)?, args.first()?.clone()),
+        _ => return None,
+    };
+    let value = unwrap_fmt_arg_tuple_ref(graph, &inner)?;
+    Some(FmtArg { value, kind })
+}
+
+/// Back-trace a recognized `format_args!` chain from the Variable passed
+/// to `alloc::fmt::format(args)` (the String producer) to the literal
+/// pieces and the Display/Debug argument values. Composes the staged
+/// primitives:
+///   fmt-args → [`resolve_to_producer_op`] → `fmt::Arguments::new(pieces, args)`
+///     · pieces: [`read_array_literal_elements`] → [`resolve_const_int`] per
+///       byte → [`decode_packed_format_pieces`]
+///     · args: [`read_array_literal_elements`] → per element
+///       [`extract_fmt_arg`]
+/// Returns `None` (the recognizer leaves the graph untouched) on any
+/// shape outside the recognized subset, so it never fires on an
+/// unsupported chain.
+#[allow(dead_code)]
+fn extract_fmt_chain(
+    graph: &FunctionGraph,
+    fmt_args_var: &crate::flowspace::model::Variable,
+) -> Option<FmtChain> {
+    use crate::model::{CallTarget, OpKind};
+    // The format(args) argument is the result of `Arguments::new(pieces, args)`.
+    let (block_id, idx) = resolve_to_producer_op(graph, fmt_args_var)?;
+    let block = graph.blocks.iter().find(|b| b.id == block_id)?;
+    let (pieces_var, args_var) = match &block.operations.get(idx)?.kind {
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments },
+            args,
+            ..
+        } if is_arguments_new_path(segments) => (args.first()?.clone(), args.get(1)?.clone()),
+        _ => return None,
+    };
+    // Pieces: an `Array` of `ConstInt` bytes → decode the packed template.
+    let piece_byte_vars = read_array_literal_elements(graph, &pieces_var)?;
+    let mut bytes = Vec::with_capacity(piece_byte_vars.len());
+    for v in &piece_byte_vars {
+        bytes.push(u8::try_from(resolve_const_int(graph, v)?).ok()?);
+    }
+    let (pieces, placeholder_count) = decode_packed_format_pieces(&bytes)?;
+    // Args: an `Array` of `Argument::new_display|new_debug(&v)` ctors, one
+    // per placeholder.
+    let arg_elems = read_array_literal_elements(graph, &args_var)?;
+    if arg_elems.len() != placeholder_count {
+        return None;
+    }
+    let mut args = Vec::with_capacity(arg_elems.len());
+    for elem in &arg_elems {
+        args.push(extract_fmt_arg(graph, elem)?);
+    }
+    Some(FmtChain { pieces, args })
+}
+
+/// Emit a `__str_const` constant of `text` into `bb_id` and return its
+/// Variable — the same synthetic `Call(["__str_const", text])` shape the
+/// constant lowering uses (see [`Lowering::emit_constant`]); the flowspace
+/// adapter pre-folds it to the upstream string `Constant` and types it as
+/// a String.
+#[allow(dead_code)]
+fn emit_str_const(graph: &mut FunctionGraph, bb_id: BlockId, text: &str) -> Variable {
+    use crate::model::{CallTarget, OpKind, ValueType};
+    let var = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+    graph.block_mut(bb_id).operations.push(SpaceOperation {
+        result: Some(var.clone()),
+        kind: OpKind::Call {
+            target: CallTarget::FunctionPath {
+                segments: vec!["__str_const".to_string(), text.to_string()],
+            },
+            args: vec![],
+            result_ty: ValueType::Ref(None),
+        },
+    });
+    var
+}
+
+/// Emit a string concatenation `lhs + rhs` into `bb_id` and return its
+/// Variable. The `"add"` opname passes through the flowspace adapter
+/// unchanged; when both operands type as String the rtyper routes it to
+/// `pair(StringRepr, StringRepr).rtype_add` → `direct_call(ll_strconcat)`.
+#[allow(dead_code)]
+fn emit_str_add(
+    graph: &mut FunctionGraph,
+    bb_id: BlockId,
+    lhs: &Variable,
+    rhs: &Variable,
+) -> Variable {
+    use crate::model::{OpKind, ValueType};
+    let var = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+    graph.block_mut(bb_id).operations.push(SpaceOperation {
+        result: Some(var.clone()),
+        kind: OpKind::BinOp {
+            op: "add".to_string(),
+            lhs: lhs.clone(),
+            rhs: rhs.clone(),
+            result_ty: ValueType::Ref(None),
+        },
+    });
+    var
+}
+
+/// Emit the StringRepr-add left fold that materializes a recognized
+/// `format_args!` chain as a runtime String:
+///
+/// ```text
+/// acc = strconst(pieces[0])
+/// for each arg i:
+///     acc = acc + args[i].value          // render(&str) == identity
+///     acc = acc + strconst(pieces[i+1])
+/// ```
+///
+/// Returns the final String Variable. Each literal piece becomes a
+/// `__str_const` call and each concatenation a `BinOp("add")` the rtyper
+/// lowers through `ll_strconcat`. The caller must have verified every
+/// argument renders by identity (a `&str` `Display`); `Debug` rendering
+/// and non-`&str` `Display` are outside the recognized subset and are
+/// rejected before emission.
+#[allow(dead_code)]
+fn emit_fmt_concat(graph: &mut FunctionGraph, bb_id: BlockId, chain: &FmtChain) -> Variable {
+    let mut acc = emit_str_const(graph, bb_id, &chain.pieces[0]);
+    for (i, arg) in chain.args.iter().enumerate() {
+        acc = emit_str_add(graph, bb_id, &acc, &arg.value);
+        let next_piece = emit_str_const(graph, bb_id, &chain.pieces[i + 1]);
+        acc = emit_str_add(graph, bb_id, &acc, &next_piece);
+    }
+    acc
+}
+
 #[cfg(test)]
 mod tests {
     use super::harden_duplicate_leaf_metadata;
     use super::{cast_kind_is_raw_ptr, cast_pointer_marker_op, charon_type_value_to_ast_string};
     use majit_charon_reader::Llbc;
+
+    #[test]
+    fn resolve_to_producer_op_follows_cross_block_inputarg_link() {
+        use super::resolve_to_producer_op;
+        use crate::flowspace::model::Variable;
+        use crate::model::{FunctionGraph, Link, OpKind, SpaceOperation};
+
+        let mut graph = FunctionGraph::new("xblock");
+        let a = graph.create_block();
+        let b = graph.create_block();
+
+        // block A produces `x` via a ConstInt op.
+        let x = Variable::new();
+        graph.block_mut(a).operations.push(SpaceOperation {
+            result: Some(x.clone()),
+            kind: OpKind::ConstInt(7),
+        });
+
+        // block B takes `w` as its single inputarg; A links to B passing
+        // `x` for `w` (the cross-block threading the recognizer sees).
+        let w = Variable::new();
+        graph.block_mut(b).inputargs = vec![w.clone()];
+        let link = Link::from_variables(&graph, vec![x.clone()], b, None).with_prevblock(a);
+        graph.block_mut(a).exits = vec![link];
+
+        // `w` (block B inputarg) back-traces to A's ConstInt op.
+        assert_eq!(resolve_to_producer_op(&graph, &w), Some((a, 0)));
+        // A direct op result resolves to itself.
+        assert_eq!(resolve_to_producer_op(&graph, &x), Some((a, 0)));
+        // An unrelated free Variable has no producer.
+        assert_eq!(resolve_to_producer_op(&graph, &Variable::new()), None);
+    }
+
+    #[test]
+    fn decode_packed_format_pieces_matches_real_llbc_templates() {
+        use super::decode_packed_format_pieces;
+
+        // The four fixtures below are the verbatim `[u8; N]` pieces buffers
+        // charon lowers for these handler graphs (captured from the real
+        // pyre-interpreter.ullbc). Each asserts the reconstructed pieces +
+        // placeholder count, i.e. the original format string.
+
+        // `format!("stack underflow during {}", context)`
+        let (pieces, n) = decode_packed_format_pieces(&[
+            23, 115, 116, 97, 99, 107, 32, 117, 110, 100, 101, 114, 102, 108, 111, 119, 32, 100,
+            117, 114, 105, 110, 103, 32, 192, 0,
+        ])
+        .unwrap();
+        assert_eq!(
+            pieces,
+            vec!["stack underflow during ".to_string(), String::new()]
+        );
+        assert_eq!(n, 1);
+
+        // `format!("{} indices must be integers or slices, not {}", ..)`
+        let (pieces, n) = decode_packed_format_pieces(&[
+            192, 41, 32, 105, 110, 100, 105, 99, 101, 115, 32, 109, 117, 115, 116, 32, 98, 101, 32,
+            105, 110, 116, 101, 103, 101, 114, 115, 32, 111, 114, 32, 115, 108, 105, 99, 101, 115,
+            44, 32, 110, 111, 116, 32, 192, 0,
+        ])
+        .unwrap();
+        assert_eq!(
+            pieces,
+            vec![
+                String::new(),
+                " indices must be integers or slices, not ".to_string(),
+                String::new(),
+            ]
+        );
+        assert_eq!(n, 2);
+
+        // `format!("'{}' object does not support item assignment", ..)`
+        let (pieces, n) = decode_packed_format_pieces(&[
+            1, 39, 192, 41, 39, 32, 111, 98, 106, 101, 99, 116, 32, 100, 111, 101, 115, 32, 110,
+            111, 116, 32, 115, 117, 112, 112, 111, 114, 116, 32, 105, 116, 101, 109, 32, 97, 115,
+            115, 105, 103, 110, 109, 101, 110, 116, 0,
+        ])
+        .unwrap();
+        assert_eq!(
+            pieces,
+            vec![
+                "'".to_string(),
+                "' object does not support item assignment".to_string(),
+            ]
+        );
+        assert_eq!(n, 1);
+
+        // `format!("__init__() should return None, not '{}'", ..)`
+        let (pieces, n) = decode_packed_format_pieces(&[
+            36, 95, 95, 105, 110, 105, 116, 95, 95, 40, 41, 32, 115, 104, 111, 117, 108, 100, 32,
+            114, 101, 116, 117, 114, 110, 32, 78, 111, 110, 101, 44, 32, 110, 111, 116, 32, 39,
+            192, 1, 39, 0,
+        ])
+        .unwrap();
+        assert_eq!(
+            pieces,
+            vec![
+                "__init__() should return None, not '".to_string(),
+                "'".to_string(),
+            ]
+        );
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn decode_packed_format_pieces_bails_and_handles_edges() {
+        use super::decode_packed_format_pieces;
+
+        // A control byte other than 0xC0 (e.g. a format-spec / positional
+        // placeholder) must bail so the recognizer leaves the graph alone.
+        assert_eq!(decode_packed_format_pieces(&[0xC1, 0]), None);
+        assert_eq!(decode_packed_format_pieces(&[0x80, 0]), None);
+
+        // A literal length that overruns the buffer bails.
+        assert_eq!(decode_packed_format_pieces(&[5, 65, 66, 0]), None);
+
+        // A 0 byte that is not the final byte bails (terminator is last).
+        assert_eq!(decode_packed_format_pieces(&[0, 1, 65, 0]), None);
+
+        // A buffer that runs out without the 0x00 terminator is truncated
+        // or wrong — bail rather than accept a malformed template.
+        assert_eq!(decode_packed_format_pieces(&[2, 104, 105]), None);
+        assert_eq!(decode_packed_format_pieces(&[2, 104, 105, 192]), None);
+
+        // Literal-only template (no placeholders) → single piece.
+        let (pieces, n) = decode_packed_format_pieces(&[2, 104, 105, 0]).unwrap();
+        assert_eq!(pieces, vec!["hi".to_string()]);
+        assert_eq!(n, 0);
+
+        // Two consecutive literal segments accumulate into one piece
+        // (how a >127-byte literal is split); one placeholder follows.
+        let (pieces, n) = decode_packed_format_pieces(&[1, 97, 1, 98, 192, 0]).unwrap();
+        assert_eq!(pieces, vec!["ab".to_string(), String::new()]);
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn read_array_literal_then_decode_pieces_end_to_end() {
+        use super::{decode_packed_format_pieces, read_array_literal_elements, resolve_const_int};
+        use crate::flowspace::model::Variable;
+        use crate::model::{
+            CallTarget, FieldDescriptor, FunctionGraph, OpKind, SpaceOperation, ValueType,
+        };
+
+        // Build the pieces array the way the front-end lowers it: an
+        // `Array` ctor followed by `__pos_i` FieldWrites of ConstInt
+        // bytes. Template for `format!("hi{}")` → pieces ["hi", ""],
+        // one placeholder = bytes [2, 'h', 'i', 0xC0, 0].
+        let mut graph = FunctionGraph::new("arraylit");
+        let a = graph.create_block();
+        let arr = Variable::new();
+        graph.block_mut(a).operations.push(SpaceOperation {
+            result: Some(arr.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::SyntheticTransparentCtor {
+                    name: "Array".to_string(),
+                    owner_path: vec![],
+                },
+                args: vec![],
+                result_ty: ValueType::Ref(Some("Array".to_string())),
+            },
+        });
+        let bytes = [2i64, 104, 105, 0xC0, 0];
+        for (i, b) in bytes.iter().enumerate() {
+            let v = Variable::new();
+            graph.block_mut(a).operations.push(SpaceOperation {
+                result: Some(v.clone()),
+                kind: OpKind::ConstInt(*b),
+            });
+            graph.block_mut(a).operations.push(SpaceOperation {
+                result: None,
+                kind: OpKind::FieldWrite {
+                    base: arr.clone(),
+                    field: FieldDescriptor::new(format!("__pos_{i}"), Some("Array".to_string())),
+                    value: crate::model::LinkArg::Value(v),
+                    ty: ValueType::Ref(None),
+                },
+            });
+        }
+
+        let elements = read_array_literal_elements(&graph, &arr).expect("array elements");
+        assert_eq!(elements.len(), 5);
+        let decoded: Vec<u8> = elements
+            .iter()
+            .map(|v| resolve_const_int(&graph, v).expect("const int") as u8)
+            .collect();
+        assert_eq!(decoded, vec![2, 104, 105, 0xC0, 0]);
+        let (pieces, n) = decode_packed_format_pieces(&decoded).unwrap();
+        assert_eq!(pieces, vec!["hi".to_string(), String::new()]);
+        assert_eq!(n, 1);
+
+        // A non-Array producer (plain ConstInt) is rejected.
+        assert_eq!(read_array_literal_elements(&graph, &elements[0]), None);
+    }
+
+    /// Throwaway IR-capture probe for the #277 fmt recognizer: dumps the
+    /// lowered front-end op sequence for `stack_underflow_error` (the
+    /// canonical `type_error(format!("…{x}"))` chain) so the byte-array
+    /// piece decoder can be anchored to the real `Array`/`ConstInt` shape.
+    /// Ignored by default (loads the 242MB real LLBC); run with
+    /// `cargo test -p majit-translate --lib dump_fmt_chain_ir -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn dump_fmt_chain_ir() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "stack_underflow_error")
+            .expect("lower stack_underflow_error");
+        for block in &graph.blocks {
+            eprintln!("block {:?} inputargs={:?}", block.id, block.inputargs);
+            for (idx, op) in block.operations.iter().enumerate() {
+                eprintln!("  [{idx}] result={:?} kind={:?}", op.result, op.kind);
+            }
+            for link in &block.exits {
+                eprintln!("  exit -> {:?} args={:?}", link.target, link.args);
+            }
+        }
+    }
+
+    #[test]
+    fn extract_fmt_chain_recovers_pieces_and_args_cross_block() {
+        use super::{FmtArgKind, extract_fmt_chain};
+        use crate::flowspace::model::Variable;
+        use crate::model::{
+            CallTarget, FieldDescriptor, FunctionGraph, Link, OpKind, SpaceOperation, ValueType,
+        };
+
+        // Reconstruct the real `format!("hi{}", ctx)` front-end shape:
+        // block A builds the `Argument::new_display(&ctx)` through the
+        // argument Tuple (`&(ctx,).0`); block B builds the args + pieces
+        // arrays and `Arguments::new`. The args-array element is the
+        // new_display result threaded across the A→B link, so extraction
+        // must follow the cross-block inputarg back to it.
+        let mut graph = FunctionGraph::new("fmt_chain");
+        let a = graph.create_block();
+        let b = graph.create_block();
+
+        // ── block A: Argument::new_display(&ctx) via the arg Tuple ──
+        let ctx = Variable::new();
+        let tuple = Variable::new();
+        graph.block_mut(a).operations.push(SpaceOperation {
+            result: Some(tuple.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::SyntheticTransparentCtor {
+                    name: "Tuple".to_string(),
+                    owner_path: vec![],
+                },
+                args: vec![],
+                result_ty: ValueType::Ref(Some("Tuple".to_string())),
+            },
+        });
+        graph.block_mut(a).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::FieldWrite {
+                base: tuple.clone(),
+                field: FieldDescriptor::new("__pos_0", Some("Tuple".to_string())),
+                value: crate::model::LinkArg::Value(ctx.clone()),
+                ty: ValueType::Ref(None),
+            },
+        });
+        let arg_ref = Variable::new();
+        graph.block_mut(a).operations.push(SpaceOperation {
+            result: Some(arg_ref.clone()),
+            kind: OpKind::FieldRead {
+                base: tuple,
+                field: FieldDescriptor::new("__pos_0", Some("Tuple".to_string())),
+                ty: ValueType::Ref(None),
+                pure: false,
+            },
+        });
+        let argument = Variable::new();
+        graph.block_mut(a).operations.push(SpaceOperation {
+            result: Some(argument.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec![
+                        "fmt".to_string(),
+                        "rt".to_string(),
+                        "Argument".to_string(),
+                        "new_display".to_string(),
+                    ],
+                },
+                args: vec![arg_ref],
+                result_ty: ValueType::Ref(Some("Argument".to_string())),
+            },
+        });
+
+        // block B takes the new_display result as its single inputarg.
+        let arg_in = Variable::new();
+        graph.block_mut(b).inputargs = vec![arg_in.clone()];
+        let link = Link::from_variables(&graph, vec![argument], b, None).with_prevblock(a);
+        graph.block_mut(a).exits = vec![link];
+
+        // ── block B: args array, pieces array, Arguments::new ──
+        let args_arr = Variable::new();
+        graph.block_mut(b).operations.push(SpaceOperation {
+            result: Some(args_arr.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::SyntheticTransparentCtor {
+                    name: "Array".to_string(),
+                    owner_path: vec![],
+                },
+                args: vec![],
+                result_ty: ValueType::Ref(Some("Array".to_string())),
+            },
+        });
+        graph.block_mut(b).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::FieldWrite {
+                base: args_arr.clone(),
+                field: FieldDescriptor::new("__pos_0", Some("Array".to_string())),
+                value: crate::model::LinkArg::Value(arg_in),
+                ty: ValueType::Ref(None),
+            },
+        });
+        let pieces_arr = Variable::new();
+        graph.block_mut(b).operations.push(SpaceOperation {
+            result: Some(pieces_arr.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::SyntheticTransparentCtor {
+                    name: "Array".to_string(),
+                    owner_path: vec![],
+                },
+                args: vec![],
+                result_ty: ValueType::Ref(Some("Array".to_string())),
+            },
+        });
+        // `format!("hi{}")` packed template: [2, 'h', 'i', 0xC0, 0].
+        for (i, byte) in [2i64, 104, 105, 0xC0, 0].iter().enumerate() {
+            let v = Variable::new();
+            graph.block_mut(b).operations.push(SpaceOperation {
+                result: Some(v.clone()),
+                kind: OpKind::ConstInt(*byte),
+            });
+            graph.block_mut(b).operations.push(SpaceOperation {
+                result: None,
+                kind: OpKind::FieldWrite {
+                    base: pieces_arr.clone(),
+                    field: FieldDescriptor::new(format!("__pos_{i}"), Some("Array".to_string())),
+                    value: crate::model::LinkArg::Value(v),
+                    ty: ValueType::Int,
+                },
+            });
+        }
+        let fmt_args = Variable::new();
+        graph.block_mut(b).operations.push(SpaceOperation {
+            result: Some(fmt_args.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec![
+                        "fmt".to_string(),
+                        "Arguments".to_string(),
+                        "new".to_string(),
+                    ],
+                },
+                args: vec![pieces_arr.clone(), args_arr],
+                result_ty: ValueType::Ref(Some("Arguments".to_string())),
+            },
+        });
+
+        let chain = extract_fmt_chain(&graph, &fmt_args).expect("recognized fmt chain");
+        assert_eq!(chain.pieces, vec!["hi".to_string(), String::new()]);
+        assert_eq!(chain.args.len(), 1);
+        assert_eq!(chain.args[0].kind, FmtArgKind::Display);
+        // The recovered value is `ctx`, unwrapped through the arg Tuple.
+        assert_eq!(chain.args[0].value.id(), ctx.id());
+
+        // A non-`Arguments::new` producer is not recognized.
+        assert!(extract_fmt_chain(&graph, &pieces_arr).is_none());
+    }
+
+    #[test]
+    fn emit_fmt_concat_builds_interleaved_str_add_fold() {
+        use super::{FmtArg, FmtArgKind, FmtChain, emit_fmt_concat};
+        use crate::flowspace::model::Variable;
+        use crate::model::{CallTarget, FunctionGraph, OpKind};
+
+        // `format!("a{}b{}c", x, y)` → pieces ["a","b","c"], two args.
+        let mut graph = FunctionGraph::new("concat");
+        let bb = graph.create_block();
+        let x = Variable::new();
+        let y = Variable::new();
+        let chain = FmtChain {
+            pieces: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            args: vec![
+                FmtArg {
+                    value: x.clone(),
+                    kind: FmtArgKind::Display,
+                },
+                FmtArg {
+                    value: y.clone(),
+                    kind: FmtArgKind::Display,
+                },
+            ],
+        };
+        let result = emit_fmt_concat(&mut graph, bb, &chain);
+
+        let ops = &graph.blocks.iter().find(|b| b.id == bb).unwrap().operations;
+        // 3 literal `__str_const`s + 4 `add`s = 7 ops.
+        assert_eq!(ops.len(), 7);
+
+        let str_const_text = |i: usize| -> String {
+            match &ops[i].kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } if segments.first().map(String::as_str) == Some("__str_const") => {
+                    segments[1].clone()
+                }
+                other => panic!("op[{i}] not a __str_const: {other:?}"),
+            }
+        };
+        let add_operands = |i: usize| -> (u64, u64) {
+            match &ops[i].kind {
+                OpKind::BinOp { op, lhs, rhs, .. } if op == "add" => (lhs.id(), rhs.id()),
+                other => panic!("op[{i}] not an add: {other:?}"),
+            }
+        };
+        let result_id = |i: usize| ops[i].result.as_ref().unwrap().id();
+
+        assert_eq!(str_const_text(0), "a");
+        assert_eq!(str_const_text(2), "b");
+        assert_eq!(str_const_text(5), "c");
+        // Fold chain: ("a" + x) + "b", then (+ y) + "c".
+        assert_eq!(add_operands(1), (result_id(0), x.id()));
+        assert_eq!(add_operands(3), (result_id(1), result_id(2)));
+        assert_eq!(add_operands(4), (result_id(3), y.id()));
+        assert_eq!(add_operands(6), (result_id(4), result_id(5)));
+        assert_eq!(result.id(), result_id(6));
+    }
+
+    /// Anchor [`extract_fmt_chain`] to the real lowered IR of
+    /// `stack_underflow_error` (= `type_error(format!("stack underflow
+    /// during {context}"))`). Ignored by default (loads the 242MB real
+    /// LLBC); run with `cargo test -p majit-translate --lib
+    /// extract_fmt_chain_matches_real -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn extract_fmt_chain_matches_real_stack_underflow() {
+        use super::{FmtArgKind, extract_fmt_chain};
+        use crate::model::{CallTarget, OpKind};
+
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "stack_underflow_error")
+            .expect("lower stack_underflow_error");
+
+        // Find the `alloc::fmt::format(args)` call and extract its arg.
+        let fmt_args = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .find_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    args,
+                    ..
+                } if super::fmt_path_ends_with(segments, &["fmt", "format"]) => {
+                    args.first().cloned()
+                }
+                _ => None,
+            })
+            .expect("alloc::fmt::format call present");
+
+        let chain = extract_fmt_chain(&graph, &fmt_args).expect("recognized real fmt chain");
+        assert_eq!(
+            chain.pieces,
+            vec!["stack underflow during ".to_string(), String::new()]
+        );
+        assert_eq!(chain.args.len(), 1);
+        assert_eq!(chain.args[0].kind, FmtArgKind::Display);
+    }
 
     #[test]
     fn cast_pointer_marker_carries_root_in_path_and_result_type() {
