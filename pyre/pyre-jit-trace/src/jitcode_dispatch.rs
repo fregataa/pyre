@@ -12855,6 +12855,14 @@ mod tests {
                 Some(majit_translate::jitcode::BhDescr::JitCode { jitcode_index, .. }) => {
                     make_jitcode_descr(*jitcode_index)
                 }
+                // Residual calls surfaced during inline_call recursion (e.g.
+                // the arm bodies' helper calls) resolve their descr through
+                // `as_call_descr()`. Build a real CallDescr for `BhDescr::Call`
+                // entries, mirroring production (`descr.rs make_call_descr_from_bh`),
+                // so the walk does not surface ResidualCallDescrNotCallDescr.
+                Some(majit_translate::jitcode::BhDescr::Call { calldescr }) => {
+                    crate::descr::make_call_descr_from_bh(calldescr)
+                }
                 _ => make_fail_descr(1 + i),
             })
             .collect()
@@ -15117,7 +15125,6 @@ mod tests {
     // unification step before any `dispatch_via_miframe` invocation
     // can read production bytes. Tracked separately as a
     // prerequisite.
-    #[ignore = "blocked on pipeline.insns ↔ wellknown_bh_insns table unification (pipeline prerequisite)"]
     #[test]
     fn step_through_ref_copy_advances_past_operand_bytes() {
         // `ref_copy/r>r` Ref-bank sibling of `int_copy/i>i`.
@@ -15170,7 +15177,6 @@ mod tests {
         );
     }
 
-    #[ignore = "blocked on pipeline.insns ↔ wellknown_bh_insns table unification (pipeline prerequisite)"]
     #[test]
     fn ref_copy_writes_src_value_into_dst_register() {
         // Verify the dst writeback half of `ref_copy/r>r`.
@@ -15225,7 +15231,6 @@ mod tests {
         );
     }
 
-    #[ignore = "blocked on pipeline.insns ↔ wellknown_bh_insns table unification (pipeline prerequisite)"]
     #[test]
     fn ref_copy_with_out_of_range_dst_register_surfaces_typed_error() {
         let ref_copy_byte = *insns_opname_to_byte()
@@ -15273,7 +15278,6 @@ mod tests {
         );
     }
 
-    #[ignore = "blocked on pipeline.insns ↔ wellknown_bh_insns table unification (pipeline prerequisite)"]
     #[test]
     fn ref_copy_with_out_of_range_src_register_surfaces_typed_error() {
         let ref_copy_byte = *insns_opname_to_byte()
@@ -15430,8 +15434,6 @@ mod tests {
     // handler exists; this test will unignore once an interpreter
     // source path emits `int_or` (e.g., bitset / flag computation).
     #[test]
-    #[ignore = "int_or not currently emitted by pyre interpreter source — \
-                pipeline.insns drops it"]
     fn int_or_records_intor() {
         drive_int_binop("int_or/ii>i", majit_ir::OpCode::IntOr);
     }
@@ -18078,7 +18080,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "slice 2h: inline_call recursion surfaces sub-jitcode opnames the walker doesn't yet support (e.g. getfield_vable_i/rd>i). Full end-to-end acceptance lands when slice 2i adds handlers for the rest of the codewriter-emitted opnames."]
+    #[ignore = "end-to-end walk of the real ReturnValue arm reaches a goto_if_not whose value is symbolic in this unit setup (GotoIfNotValueNotConcrete { value: IntOp }); the walker needs concrete register values to decide the branch. Residual-call descrs now resolve (descr_pool_with_jitcode_adapters builds CallDescrs for BhDescr::Call); the remaining gap is a concrete-execution harness for the full arm body."]
     fn walk_return_value_arm_terminates_at_first_ref_return() {
         // Acceptance: walk the smallest real
         // arm jitcode (`Instruction::ReturnValue`, 18 bytes) end-to-end.
@@ -18186,14 +18188,14 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "PopTop's pop_top helper recurses through inline_call_r_r \
-        into a sub-jitcode whose body opens with `getfield_vable_i/rd>i` \
-        — that opname has no walker handler yet (Phase D-3 follow-up: \
-        MIFrame virtualizable_boxes / heapcache / vinfo prereqs).  \
-        Production shadow mode under `MAJIT_SHADOW_WALKER=1` survives \
-        because the bench traces never reach a PopTop opcode at JIT \
-        record time, so the walker recursion never gets exercised — \
-        but a direct unit-test invocation does, and surfaces the gap."]
+    #[ignore = "end-to-end walk of the real PopTop arm reaches a goto_if_not \
+        whose value is symbolic in this unit setup (GotoIfNotValueNotConcrete); \
+        the walker needs concrete register values to decide the branch. \
+        Residual-call descrs now resolve (descr_pool_with_jitcode_adapters \
+        builds CallDescrs for BhDescr::Call); the remaining gap is a \
+        concrete-execution harness for the full arm body. Production shadow \
+        mode under MAJIT_SHADOW_WALKER=1 is unaffected — bench traces never \
+        reach a PopTop opcode at JIT record time."]
     fn walk_pop_top_arm_terminates_with_recorded_ops() {
         // Acceptance skeleton: walk the entire PopTop arm
         // jitcode.  The outer arm body is 25 bytes / 9 ops after the
@@ -18675,7 +18677,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "inline_call_irf_v/dIRF not yet emitted by the pipeline build"]
     fn inline_call_irf_v_accepts_void_returning_callee() {
         let void_ret = *insns_opname_to_byte()
             .get("void_return/")
@@ -18755,7 +18756,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "inline_call_irf_v/dIRF not yet emitted by the pipeline build"]
     fn inline_call_irf_v_rejects_non_void_returning_callee() {
         let ref_ret = *insns_opname_to_byte()
             .get("ref_return/r")
