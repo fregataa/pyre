@@ -2122,6 +2122,17 @@ fn os_error_fill_slots(exc: PyObjectRef, args: &[PyObjectRef]) {
     }
 }
 
+/// `ESHUTDOWN` is a POSIX errno absent from the MSVC CRT, so the
+/// `BrokenPipeError` mapping is gated on it being defined (`#ifdef ESHUTDOWN`).
+#[cfg(unix)]
+fn errno_is_eshutdown(e: i32) -> bool {
+    e == libc::ESHUTDOWN
+}
+#[cfg(not(unix))]
+fn errno_is_eshutdown(_e: i32) -> bool {
+    false
+}
+
 /// `interp_exceptions.py:1207-1227 ERRNO_MAP` — the OSError subclass the
 /// exact `OSError` constructor selects for a recognised errno, by
 /// registered class name.  Returns `None` for an unmapped errno.
@@ -2135,7 +2146,7 @@ fn os_error_errno_subclass(errno: i64) -> Option<&'static str> {
         || e == libc::EWOULDBLOCK
     {
         "BlockingIOError"
-    } else if e == libc::EPIPE || e == libc::ESHUTDOWN {
+    } else if e == libc::EPIPE || errno_is_eshutdown(e) {
         "BrokenPipeError"
     } else if e == libc::ECHILD {
         "ChildProcessError"
