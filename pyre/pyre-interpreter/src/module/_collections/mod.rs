@@ -38,6 +38,42 @@ mod deque_class {
     /// Replace the backing list with `items`.
     fn store(self_obj: PyObjectRef, items: Vec<PyObjectRef>) {
         let _ = crate::baseobjspace::setattr_str(self_obj, "__data__", w_list_new(items));
+        modified(self_obj);
+    }
+
+    /// `interp_deque.py:107 modified` — lightweight iteration lock.  Any
+    /// mutation invalidates the outstanding lock so an in-progress
+    /// `count` / `index` / `remove` / `__contains__` / comparison detects
+    /// it.  PyPy invalidates a `Lock` object identity; pyre realizes the
+    /// same as a monotonic `__state__` counter (as CPython does via
+    /// `deque->state`): every mutation bumps it, and `checklock` raises when
+    /// the snapshot no longer matches.
+    fn lock_state(self_obj: PyObjectRef) -> i64 {
+        match crate::baseobjspace::getattr_str(self_obj, "__state__") {
+            Ok(w) if !w.is_null() && unsafe { is_int(w) } => unsafe { w_int_get_value(w) },
+            _ => 0,
+        }
+    }
+
+    fn modified(self_obj: PyObjectRef) {
+        let next = lock_state(self_obj).wrapping_add(1);
+        let _ = crate::baseobjspace::setattr_str(self_obj, "__state__", w_int_new(next));
+    }
+
+    /// `interp_deque.py:110 getlock` — snapshot the current lock token.
+    fn getlock(self_obj: PyObjectRef) -> i64 {
+        lock_state(self_obj)
+    }
+
+    /// `interp_deque.py:115 checklock` — raise `RuntimeError` if the deque
+    /// was mutated since `lock` was taken.
+    fn checklock(self_obj: PyObjectRef, lock: i64) -> Result<(), crate::PyError> {
+        if lock_state(self_obj) != lock {
+            return Err(crate::PyError::runtime_error(
+                "deque mutated during iteration",
+            ));
+        }
+        Ok(())
     }
 
     /// `self.maxlen`: `None` (unbounded) or a non-negative bound.  The
@@ -56,6 +92,7 @@ mod deque_class {
     fn do_append(self_obj: PyObjectRef, item: PyObjectRef) {
         let Some(d) = data(self_obj) else { return };
         unsafe { w_list_append(d, item) };
+        modified(self_obj);
         if let Some(m) = maxlen_bound(self_obj) {
             let mut items = snapshot(self_obj);
             if items.len() > m {
@@ -95,9 +132,52 @@ mod deque_class {
         if !crate::baseobjspace::isinstance(other, type_object())? {
             return Ok(pyre_object::w_not_implemented());
         }
-        let la = w_list_new(snapshot(self_obj));
-        let lb = w_list_new(snapshot(other));
-        crate::baseobjspace::compare(la, lb, op)
+        // `compare_by_iteration` (baseobjspace.py:1491) walks both deques
+        // through their iterators; each `W_DequeIter.next` checks the lock
+        // before yielding (interp_deque.py:650-652), so a mutation is detected
+        // up to — but not past — the element that decides the result.  pyre
+        // snapshots, so check each deque's lock before consuming its element
+        // and stop as soon as the result is determined.
+        use crate::baseobjspace::CompareOp;
+        let lock_a = getlock(self_obj);
+        let lock_b = getlock(other);
+        let snap_a = snapshot(self_obj);
+        let snap_b = snapshot(other);
+        let mut i = 0usize;
+        loop {
+            // next(w_it1): lock-check precedes the element.
+            checklock(self_obj, lock_a)?;
+            let x1 = snap_a.get(i).copied();
+            // next(w_it2): lock-check precedes the element.
+            checklock(other, lock_b)?;
+            let x2 = snap_b.get(i).copied();
+            match (x1, x2) {
+                (Some(a), Some(b)) => {
+                    if !crate::baseobjspace::eq_w(a, b)? {
+                        // First differing pair decides the result; no further
+                        // `next`, so no further lock check.
+                        return match op {
+                            CompareOp::Eq => Ok(pyre_object::w_bool_from(false)),
+                            CompareOp::Ne => Ok(pyre_object::w_bool_from(true)),
+                            _ => crate::baseobjspace::compare(a, b, op),
+                        };
+                    }
+                }
+                // One or both deques exhausted — decide by length.
+                _ => {
+                    let res = match op {
+                        CompareOp::Eq => x1.is_none() && x2.is_none(),
+                        CompareOp::Ne => !(x1.is_none() && x2.is_none()),
+                        CompareOp::Lt => x2.is_some(),
+                        CompareOp::Le => x1.is_none(),
+                        CompareOp::Gt => x1.is_some(),
+                        CompareOp::Ge => x2.is_none(),
+                    };
+                    return Ok(pyre_object::w_bool_from(res));
+                }
+            }
+            i += 1;
+        }
     }
 
     /// `W_Deque.mul` — repeat the elements `num` times, then re-bound by
@@ -207,9 +287,12 @@ mod deque_class {
                 Ok(())
             }
             fn count(self_obj: PyObjectRef, x: PyObjectRef) -> Result<i64, crate::PyError> {
+                let lock = getlock(self_obj);
                 let mut n = 0i64;
                 for it in snapshot(self_obj) {
-                    if crate::baseobjspace::eq_w(it, x)? {
+                    let equal = crate::baseobjspace::eq_w(it, x)?;
+                    checklock(self_obj, lock)?;
+                    if equal {
                         n += 1;
                     }
                 }
@@ -217,9 +300,12 @@ mod deque_class {
             }
             fn remove(self_obj: PyObjectRef, x: PyObjectRef) -> Result<(), crate::PyError> {
                 let mut items = snapshot(self_obj);
+                let lock = getlock(self_obj);
                 let mut pos = None;
                 for (i, &it) in items.iter().enumerate() {
-                    if crate::baseobjspace::eq_w(it, x)? {
+                    let equal = crate::baseobjspace::eq_w(it, x)?;
+                    checklock(self_obj, lock)?;
+                    if equal {
                         pos = Some(i);
                         break;
                     }
@@ -235,8 +321,11 @@ mod deque_class {
                 }
             }
             fn __contains__(self_obj: PyObjectRef, x: PyObjectRef) -> Result<bool, crate::PyError> {
+                let lock = getlock(self_obj);
                 for it in snapshot(self_obj) {
-                    if crate::baseobjspace::eq_w(it, x)? {
+                    let equal = crate::baseobjspace::eq_w(it, x)?;
+                    checklock(self_obj, lock)?;
+                    if equal {
                         return Ok(true);
                     }
                 }
@@ -269,6 +358,10 @@ mod deque_class {
             fn index(self_obj: PyObjectRef, x: PyObjectRef, start: Option<PyObjectRef>, stop: Option<PyObjectRef>) -> Result<i64, crate::PyError> {
                 let items = snapshot(self_obj);
                 let len = items.len() as i64;
+                // `space.iter(self)` takes the lock before `unwrap_start_stop`
+                // (interp_deque.py:393-396), so a `__index__` on start/stop
+                // that mutates the deque is caught by the first `checklock`.
+                let lock = getlock(self_obj);
                 let clamp = |i: i64| if i < 0 { (i + len).max(0) } else { i.min(len) };
                 let start = clamp(
                     start.map(|v| crate::builtins::getindex_w(v)).transpose()?.unwrap_or(0),
@@ -276,10 +369,19 @@ mod deque_class {
                 let stop = clamp(
                     stop.map(|v| crate::builtins::getindex_w(v)).transpose()?.unwrap_or(len),
                 );
-                let mut i = start;
-                while i < stop {
-                    if crate::baseobjspace::eq_w(items[i as usize], x)? {
-                        return Ok(i);
+                let upper = stop.min(len);
+                let mut i = 0i64;
+                while i < upper {
+                    // `space.next(w_iter)` checks the lock before each element.
+                    checklock(self_obj, lock)?;
+                    if i >= start {
+                        if crate::baseobjspace::eq_w(items[i as usize], x)? {
+                            // Match returns immediately, before the post-match
+                            // `checklock` (interp_deque.py:402-403).
+                            return Ok(i);
+                        }
+                        // interp_deque.py:406 — re-check after a non-match.
+                        checklock(self_obj, lock)?;
                     }
                     i += 1;
                 }

@@ -262,6 +262,17 @@ pub fn init_typeobjects() {
             &INT_TYPE as *const PyType,
         );
         reg.insert(&INT_TYPE as *const PyType as usize, int_type as usize);
+        // W_LongObject shares the `int` Python identity but has its own
+        // layout PyType (`LONG_TYPE`). Map it to the same `int_type`
+        // W_TypeObject so the `set_instantiate` loop caches the class on
+        // `LONG_TYPE` too — `w_long_new` stamps `w_class =
+        // get_instantiate(INT_TYPE)`, and `is_exact_builtin_instance`
+        // reads `get_instantiate(ob_type)` where `ob_type == LONG_TYPE`;
+        // both must resolve to the same object.
+        reg.insert(
+            &pyre_object::LONG_TYPE as *const PyType as usize,
+            int_type as usize,
+        );
 
         // float — floatobject.py, bases=(object,)
         reg.insert(
@@ -1745,15 +1756,16 @@ fn init_list_type(ns: &mut DictStorage) {
         "remove",
         make_builtin_function_with_arity("remove", crate::type_methods::list_method_remove, 2),
     );
-    // Container slots exposed as callable dunders.  Each delegates to
-    // the generic object-space op, which fast-paths the concrete list
-    // (so no re-dispatch back through these methods).
+    // Container slots exposed as callable dunders.  `__getitem__` binds the
+    // direct slot body (`getitem_slot`) rather than the operator entry, so a
+    // subclass override's `super().__getitem__` reaches the inherited builtin
+    // subscript instead of re-entering override dispatch.
     dict_storage_store(
         ns,
         "__getitem__",
         make_builtin_function_with_arity(
             "__getitem__",
-            |args| crate::baseobjspace::getitem(args[0], args[1]),
+            |args| crate::baseobjspace::getitem_slot(args[0], args[1]),
             2,
         ),
     );
@@ -1763,7 +1775,7 @@ fn init_list_type(ns: &mut DictStorage) {
         make_builtin_function_with_arity(
             "__setitem__",
             |args| {
-                crate::baseobjspace::setitem(args[0], args[1], args[2])?;
+                crate::baseobjspace::setitem_slot(args[0], args[1], args[2])?;
                 Ok(pyre_object::w_none())
             },
             3,
@@ -1775,7 +1787,7 @@ fn init_list_type(ns: &mut DictStorage) {
         make_builtin_function_with_arity(
             "__delitem__",
             |args| {
-                crate::baseobjspace::delitem(args[0], args[1])?;
+                crate::baseobjspace::delitem_slot(args[0], args[1])?;
                 Ok(pyre_object::w_none())
             },
             2,
@@ -1784,7 +1796,11 @@ fn init_list_type(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "__len__",
-        make_builtin_function_with_arity("__len__", |args| crate::baseobjspace::len(args[0]), 1),
+        make_builtin_function_with_arity(
+            "__len__",
+            |args| crate::baseobjspace::len_slot(args[0]),
+            1,
+        ),
     );
     dict_storage_store(
         ns,
@@ -1792,7 +1808,7 @@ fn init_list_type(ns: &mut DictStorage) {
         make_builtin_function_with_arity(
             "__contains__",
             |args| {
-                let found = crate::baseobjspace::contains(args[0], args[1])?;
+                let found = crate::baseobjspace::contains_slot(args[0], args[1])?;
                 Ok(pyre_object::w_bool_from(found))
             },
             2,
@@ -2204,7 +2220,7 @@ fn init_str_type(ns: &mut DictStorage) {
                     return Ok(pyre_object::w_bool_from(false));
                 }
                 Ok(pyre_object::w_bool_from(
-                    crate::baseobjspace::contains(args[0], args[1]).unwrap_or(false),
+                    crate::baseobjspace::contains_slot(args[0], args[1]).unwrap_or(false),
                 ))
             },
             2,
@@ -2219,7 +2235,7 @@ fn init_str_type(ns: &mut DictStorage) {
                 if args.is_empty() {
                     return Ok(pyre_object::w_int_new(0));
                 }
-                crate::baseobjspace::len(args[0])
+                crate::baseobjspace::len_slot(args[0])
             },
             1,
         ),
@@ -2233,7 +2249,7 @@ fn init_str_type(ns: &mut DictStorage) {
                 if args.len() < 2 {
                     return Err(crate::PyError::type_error("__getitem__"));
                 }
-                crate::baseobjspace::getitem(args[0], args[1])
+                crate::baseobjspace::getitem_slot(args[0], args[1])
             },
             2,
         ),
@@ -2586,7 +2602,7 @@ fn init_dict_type(ns: &mut DictStorage) {
                     };
                 }
                 Ok(pyre_object::w_bool_from(
-                    crate::baseobjspace::contains(args[0], args[1]).unwrap_or(false),
+                    crate::baseobjspace::contains_slot(args[0], args[1]).unwrap_or(false),
                 ))
             },
             2,
@@ -2607,7 +2623,7 @@ fn init_dict_type(ns: &mut DictStorage) {
                         unsafe { pyre_object::w_dict_len(dict) } as i64,
                     ));
                 }
-                crate::baseobjspace::len(args[0])
+                crate::baseobjspace::len_slot(args[0])
             },
             1,
         ),
@@ -2672,7 +2688,7 @@ fn init_dict_type(ns: &mut DictStorage) {
                 // For plain dict: direct delete. For dict subclass instance: use backing dict.
                 unsafe {
                     if pyre_object::is_dict(args[0]) {
-                        crate::baseobjspace::delitem(args[0], args[1])?;
+                        crate::baseobjspace::delitem_slot(args[0], args[1])?;
                     } else if pyre_object::is_instance(args[0]) {
                         // dict subclass — delete from __dict_data__ backing dict
                         if let Ok(backing) =
@@ -2915,7 +2931,11 @@ fn init_dict_view_common_slots(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "__len__",
-        make_builtin_function_with_arity("__len__", |args| crate::baseobjspace::len(args[0]), 1),
+        make_builtin_function_with_arity(
+            "__len__",
+            |args| crate::baseobjspace::len_slot(args[0]),
+            1,
+        ),
     );
     dict_storage_store(
         ns,
@@ -3617,7 +3637,7 @@ fn init_mappingproxy_type(ns: &mut DictStorage) {
             if args.is_empty() {
                 return Ok(pyre_object::w_int_new(0));
             }
-            crate::baseobjspace::len(args[0])
+            crate::baseobjspace::len_slot(args[0])
         }),
     );
     // dictproxyobject.py:35 descr_getitem → space.getitem(self.w_mapping, w_key)
@@ -3870,7 +3890,7 @@ fn init_tuple_type(ns: &mut DictStorage) {
                     return Ok(pyre_object::w_bool_from(false));
                 }
                 Ok(pyre_object::w_bool_from(
-                    crate::baseobjspace::contains(args[0], args[1]).unwrap_or(false),
+                    crate::baseobjspace::contains_slot(args[0], args[1]).unwrap_or(false),
                 ))
             },
             2,
@@ -3911,7 +3931,7 @@ fn init_tuple_type(ns: &mut DictStorage) {
         "__getitem__",
         make_builtin_function_with_arity(
             "__getitem__",
-            |args| crate::baseobjspace::getitem(args[0], args[1]),
+            |args| crate::baseobjspace::getitem_slot(args[0], args[1]),
             2,
         ),
     );
@@ -6623,8 +6643,9 @@ float_binop_rev!(
 // `NotImplemented` otherwise, so the reflected comparison on the other
 // operand gets a chance (`1 == 1.0` succeeds through `float.__eq__`).
 // When the operand passes the guard the value comparison is delegated to
-// `descroperation::compare`, whose matching-type fast paths return
-// directly without re-dispatching back through these dunders.
+// `descroperation::compare_slot` (the direct slot body), whose matching-type
+// fast paths return without re-entering override dispatch, so a subclass
+// override's `super().__eq__` (etc.) resolves to the inherited comparison.
 fn cmp_guard_int(b: PyObjectRef) -> bool {
     unsafe { pyre_object::pyobject::is_int_or_long(b) }
 }
@@ -6651,7 +6672,7 @@ macro_rules! cmp_dunder {
     ($name:ident, $op:ident, $guard:path) => {
         fn $name(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             if $guard(args[1]) {
-                crate::objspace::descroperation::compare(
+                crate::objspace::descroperation::compare_slot(
                     args[0],
                     args[1],
                     crate::objspace::descroperation::CompareOp::$op,
@@ -7037,7 +7058,7 @@ fn init_int_type(ns: &mut DictStorage) {
         make_builtin_function_with_arity(
             "__bool__",
             |args| {
-                Ok(pyre_object::w_bool_from(crate::baseobjspace::is_true(
+                Ok(pyre_object::w_bool_from(crate::baseobjspace::is_true_slot(
                     args[0],
                 )?))
             },
@@ -7451,7 +7472,7 @@ fn init_float_type(ns: &mut DictStorage) {
         make_builtin_function_with_arity(
             "__bool__",
             |args| {
-                Ok(pyre_object::w_bool_from(crate::baseobjspace::is_true(
+                Ok(pyre_object::w_bool_from(crate::baseobjspace::is_true_slot(
                     args[0],
                 )?))
             },

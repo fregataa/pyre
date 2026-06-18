@@ -565,7 +565,10 @@ pub fn isinstance(obj: PyObjectRef, classinfo: PyObjectRef) -> Result<bool, PyEr
         // `p_recursive_isinstance_type_w`.
         if let Some(cls_type) = crate::typedef::r#type(classinfo) {
             if let Some(check) = lookup_in_type(cls_type, "__instancecheck__") {
-                let result = crate::call::call_function_impl_result(check, &[classinfo, obj])?;
+                // abstractinst.py:122 `space.get_and_call_function(w_check,
+                // w_klass_or_tuple, w_obj)` — bind the descriptor to
+                // `classinfo` before calling with `obj`.
+                let result = get_and_call_function(check, classinfo, cls_type, &[obj])?;
                 return Ok(is_true(result)?);
             }
         }
@@ -610,7 +613,10 @@ pub fn issubclass(derived: PyObjectRef, classinfo: PyObjectRef) -> Result<bool, 
         // `isinstance` above.
         if let Some(cls_type) = crate::typedef::r#type(classinfo) {
             if let Some(check) = lookup_in_type(cls_type, "__subclasscheck__") {
-                let result = crate::call::call_function_impl_result(check, &[classinfo, derived])?;
+                // abstractinst.py:195 `space.get_and_call_function(w_check,
+                // w_klass_or_tuple, w_derived)` — bind the descriptor to
+                // `classinfo` before calling with `derived`.
+                let result = get_and_call_function(check, classinfo, cls_type, &[derived])?;
                 return Ok(is_true(result)?);
             }
         }
@@ -649,6 +655,49 @@ pub fn isabstractmethod_w(obj: PyObjectRef) -> Result<bool, crate::PyError> {
     }
 }
 
+/// Resolve a special method `name` on `obj`'s type, returning it (with the
+/// owning `w_type` for `get_and_call_function` binding) only when the object
+/// is a builtin subclass that *overrides* it — i.e. the MRO resolution
+/// differs from the implementation the builtin layout type itself registers.
+///
+/// The by-layout fast paths (`space.is_true` / `len` / `getitem` / `compare`
+/// / …) are the inherited builtin behaviour; a subclass that does not
+/// override the method must keep using them.  Crucially, the builtin
+/// typedef slots delegate back into these very `space` entry points
+/// (`list.__getitem__` → `space.getitem`, `int.__eq__` → `compare`), so
+/// dispatching the *inherited* slot would recurse forever — this helper
+/// returns `None` for the inherited case so the caller takes the fast path,
+/// and only returns `Some` for a genuine user override (whose body is user
+/// code, not a re-entry).
+///
+/// Returns `None` for exact builtins, for absent methods, and for inherited
+/// builtin slots.
+///
+/// # Safety
+/// `obj` must be a valid `PyObjectRef`.
+pub(crate) unsafe fn subclass_special_override(
+    obj: PyObjectRef,
+    name: &str,
+) -> Option<(PyObjectRef, PyObjectRef)> {
+    if pyre_object::is_exact_builtin_instance(obj) {
+        return None;
+    }
+    let w_type = crate::typedef::r#type(obj)?;
+    let method = lookup_in_type_where(w_type, name)?;
+    // The builtin layout type for `obj` — the canonical type object for its
+    // `ob_type`.  When the MRO resolution matches that type's own slot the
+    // method is inherited, not overridden.
+    let base = pyre_object::get_instantiate(&*(*obj).ob_type);
+    if !base.is_null() {
+        if let Some(inherited) = lookup_in_type_where(base, name) {
+            if std::ptr::eq(inherited, method) {
+                return None;
+            }
+        }
+    }
+    Some((method, w_type))
+}
+
 /// descroperation.py:265-285 `is_true`.
 ///
 /// ```python
@@ -667,12 +716,62 @@ pub fn isabstractmethod_w(obj: PyObjectRef) -> Result<bool, crate::PyError> {
 ///                 "__bool__ should return bool, returned %T", w_obj)
 /// ```
 ///
-/// The leading built-in fast paths short-circuit the `lookup` + call
-/// machinery for types whose `__bool__` / `__len__` are fixed and cannot
-/// raise. Only objects reaching the generic tail consult `__bool__` then
-/// `__len__`, where the call exceptions — and the non-bool-`__bool__`
-/// TypeError — propagate to the caller.
+/// A builtin subclass overriding `__bool__` / `__len__` is detected by
+/// [`subclass_special_override`] and dispatched first. The leading built-in
+/// fast paths then short-circuit the `lookup` + call machinery for exact
+/// builtins (and non-overriding subclasses, whose inherited truthiness is
+/// the by-layout result). Only objects matching no fast path reach the
+/// generic tail, which consults `__bool__` then `__len__`, where the call
+/// exceptions — and the non-bool-`__bool__` TypeError — propagate.
 pub fn is_true(obj: PyObjectRef) -> Result<bool, PyError> {
+    let obj = unwrap_cell(obj);
+    // descroperation.py:265 — `__bool__` (anywhere in the MRO) is consulted
+    // before `__len__`.  An exact builtin's `__bool__` / `__len__` are the
+    // inherited builtin slots, so its truthiness is computed by layout in
+    // `is_true_slot`; any other object (builtin subclass or user instance)
+    // takes the `lookup` path, where an inherited builtin `__bool__` is still
+    // found and wins over an overridden `__len__`.
+    if unsafe { is_exact_builtin_instance(obj) } {
+        return is_true_slot(obj);
+    }
+    is_true_lookup(obj)
+}
+
+/// descroperation.py:265-285 — the `lookup` path of `is_true`: `__bool__`
+/// first, then `__len__`, each bound via `get_and_call_function` so
+/// descriptors are honored.  Used for builtin subclasses and user instances
+/// (and by `is_true_slot` for an exact builtin that matched no by-layout fast
+/// path).  An inherited builtin `__bool__` is found here and takes priority
+/// over an overridden `__len__`.
+fn is_true_lookup(obj: PyObjectRef) -> Result<bool, PyError> {
+    if let Some(w_type) = crate::typedef::r#type(obj) {
+        if let Some(w_descr) = unsafe { lookup_in_type(w_type, "__bool__") } {
+            let w_res = unsafe { get_and_call_function(w_descr, obj, w_type, &[]) }?;
+            // The only instances of bool are `w_False` / `w_True`, so a
+            // non-bool result is a TypeError reporting the receiver's type
+            // (upstream's `%T` on `w_obj`).
+            if unsafe { is_bool(w_res) } {
+                return Ok(unsafe { w_bool_get_value(w_res) });
+            }
+            return Err(PyError::type_error(format!(
+                "__bool__ should return bool, returned {}",
+                object_functionstr_type_name(obj),
+            )));
+        }
+        if let Some(w_descr) = unsafe { lookup_in_type(w_type, "__len__") } {
+            let w_res = unsafe { get_and_call_function(w_descr, obj, w_type, &[]) }?;
+            let w_index = space_index(w_res)?;
+            return Ok(_check_len_result(w_index)? != 0);
+        }
+    }
+    Ok(true)
+}
+
+/// Direct truthiness body for `is_true`: the by-layout fast paths for exact
+/// builtins, falling back to `is_true_lookup`.  The builtin `int` / `float`
+/// `__bool__` base slots bind here so that the lookup path can invoke them
+/// (for non-overriding subclasses) without recursing through `is_true`.
+pub(crate) fn is_true_slot(obj: PyObjectRef) -> Result<bool, PyError> {
     let obj = unwrap_cell(obj);
     unsafe {
         if is_bool(obj) {
@@ -715,28 +814,9 @@ pub fn is_true(obj: PyObjectRef) -> Result<bool, PyError> {
             return Ok(false);
         }
     }
-    // descroperation.py:266-273 — `__bool__` first, then `__len__`; both
-    // looked up on the type (`space.lookup`), not the instance dict.
-    if let Some(w_descr) = unsafe { lookup(obj, "__bool__") } {
-        let w_res = crate::builtins::call_and_check(w_descr, &[obj])?;
-        // descroperation.py:277-285 — the only instances of bool are
-        // `w_False` / `w_True`, so a non-bool result is a TypeError. The
-        // message reports the receiver's type, matching upstream's `%T`
-        // on `w_obj`.
-        if unsafe { is_bool(w_res) } {
-            return Ok(unsafe { w_bool_get_value(w_res) });
-        }
-        return Err(PyError::type_error(format!(
-            "__bool__ should return bool, returned {}",
-            object_functionstr_type_name(obj),
-        )));
-    }
-    if let Some(w_descr) = unsafe { lookup(obj, "__len__") } {
-        let w_res = crate::builtins::call_and_check(w_descr, &[obj])?;
-        let w_index = space_index(w_res)?;
-        return Ok(_check_len_result(w_index)? != 0);
-    }
-    Ok(true)
+    // No by-layout fast path matched (an exact builtin without a layout
+    // predicate): consult `__bool__` / `__len__` via the lookup path.
+    is_true_lookup(obj)
 }
 
 // ── Subscript operations ─────────────────────────────────────────────
@@ -908,6 +988,34 @@ pub fn getitem(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
         } else {
             obj
         };
+        // A builtin sequence subclass (`is_list`/`is_tuple`/… stays true on
+        // the retagged layout) overriding `__getitem__` must dispatch the
+        // override; the by-layout slot below gives the inherited builtin
+        // subscript for exact instances and non-overriding subclasses.
+        if is_list(obj)
+            || is_tuple(obj)
+            || is_str(obj)
+            || pyre_object::bytesobject::is_bytes_like(obj)
+            || pyre_object::is_w_range(obj)
+        {
+            if let Some((method, w_type)) = subclass_special_override(obj, "__getitem__") {
+                return get_and_call_function(method, obj, w_type, &[index]);
+            }
+        }
+        getitem_slot(obj, index)
+    }
+}
+
+/// The builtin `__getitem__` slot body: subscript dispatch by concrete
+/// layout.  Reached from the operator [`getitem`] for exact instances and
+/// non-overriding subclasses, and bound directly as the `list`/`str`/`tuple`
+/// `__getitem__` slot so a subclass override's `super().__getitem__` resolves
+/// to the inherited builtin subscript instead of re-entering override
+/// dispatch (which would recurse).
+pub(crate) fn getitem_slot(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
+    let obj = unwrap_cell(obj);
+    let index = unwrap_cell(index);
+    unsafe {
         if is_list(obj) {
             return getitem_list(obj, index);
         }
@@ -1632,6 +1740,29 @@ pub fn setitem(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef) -> PyRe
                 "'mappingproxy' object does not support item assignment",
             ));
         }
+        // A builtin sequence subclass overriding `__setitem__` dispatches the
+        // override; exact instances and non-overriding subclasses fall through
+        // to the by-layout assignment slot below.
+        if is_list(obj) || pyre_object::bytearrayobject::is_bytearray(obj) {
+            if let Some((method, w_type)) = subclass_special_override(obj, "__setitem__") {
+                return get_and_call_function(method, obj, w_type, &[index, value]);
+            }
+        }
+    }
+    setitem_slot(obj, index, value)
+}
+
+/// The builtin `__setitem__` slot body: item-assignment dispatch by concrete
+/// layout.  Reached from the operator [`setitem`] for exact instances and
+/// non-overriding subclasses, and bound directly as the `list` `__setitem__`
+/// slot so a subclass override's `super().__setitem__` resolves to the
+/// inherited builtin assignment instead of re-entering override dispatch
+/// (which would recurse).
+pub(crate) fn setitem_slot(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef) -> PyResult {
+    let obj = unwrap_cell(obj);
+    let index = unwrap_cell(index);
+    let value = unwrap_cell(value);
+    unsafe {
         if is_list(obj) {
             return setitem_list(obj, index, value);
         }
@@ -1774,11 +1905,12 @@ unsafe fn setitem_bytearray(obj: PyObjectRef, index: PyObjectRef, value: PyObjec
 
 #[inline(never)]
 unsafe fn setitem_instance(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef) -> PyResult {
-    // descroperation.py:389 returns `space.get_and_call_function`'s result.
-    // pyre `call_function` stashes errors as PY_NULL; `call_and_check`
-    // recovers them and yields the `__setitem__` return value.
-    if let Some(method) = lookup_in_type_where(w_instance_get_type(obj), "__setitem__") {
-        return crate::builtins::call_and_check(method, &[obj, index, value]);
+    // descroperation.py:389 `space.get_and_call_function(w_descr, w_obj,
+    // w_key, w_value)` — bind the `__setitem__` descriptor to the receiver
+    // before calling with `(index, value)`.
+    let w_type = w_instance_get_type(obj);
+    if let Some(method) = lookup_in_type_where(w_type, "__setitem__") {
+        return get_and_call_function(method, obj, w_type, &[index, value]);
     }
     Err(PyError::type_error(format!(
         "'{}' object does not support item assignment",
@@ -1888,6 +2020,25 @@ pub fn exception_match(exc_type: PyObjectRef, check_class: PyObjectRef) -> bool 
 
 /// Get the length of a container: `len(obj)`.
 pub fn len(obj: PyObjectRef) -> PyResult {
+    // descroperation.py:294-298 `_len` — a builtin subclass overriding
+    // `__len__` dispatches the override (bound via `get_and_call_function`);
+    // exact builtins and non-overriding subclasses fall through to the
+    // by-layout slot body, which gives the inherited builtin length without
+    // re-entering override dispatch.
+    unsafe {
+        if let Some((method, w_type)) = subclass_special_override(obj, "__len__") {
+            return get_and_call_function(method, obj, w_type, &[]);
+        }
+    }
+    len_slot(obj)
+}
+
+/// The builtin `__len__` slot body: length dispatch by concrete layout.
+/// Reached from the operator [`len`] for exact instances and non-overriding
+/// subclasses, and bound directly as the `list`/`str` `__len__` slot so a
+/// subclass override's `super().__len__` resolves to the inherited builtin
+/// length instead of re-entering override dispatch (which would recurse).
+pub(crate) fn len_slot(obj: PyObjectRef) -> PyResult {
     // `pypy/objspace/std/dictproxyobject.py:32 descr_len` →
     // `space.len(self.w_mapping)`.
     let obj = unsafe {
@@ -1909,38 +2060,44 @@ pub fn len(obj: PyObjectRef) -> PyResult {
             }
             return Ok(w_int_new(pyre_object::w_dict_len(dict) as i64));
         }
-    }
-    unsafe {
         if is_list(obj) {
-            Ok(w_int_new(w_list_len(obj) as i64))
-        } else if is_tuple(obj) {
-            Ok(w_int_new(w_tuple_len(obj) as i64))
-        } else if is_dict(obj) {
-            Ok(w_int_new(w_dict_len(obj) as i64))
-        } else if pyre_object::is_set_or_frozenset(obj) {
-            Ok(w_int_new(pyre_object::w_set_len(obj) as i64))
-        } else if is_str(obj) {
-            Ok(w_int_new(w_str_len(obj) as i64))
-        } else if pyre_object::bytesobject::is_bytes_like(obj) {
-            Ok(w_int_new(
+            return Ok(w_int_new(w_list_len(obj) as i64));
+        }
+        if is_tuple(obj) {
+            return Ok(w_int_new(w_tuple_len(obj) as i64));
+        }
+        if is_dict(obj) {
+            return Ok(w_int_new(w_dict_len(obj) as i64));
+        }
+        if pyre_object::is_set_or_frozenset(obj) {
+            return Ok(w_int_new(pyre_object::w_set_len(obj) as i64));
+        }
+        if is_str(obj) {
+            return Ok(w_int_new(w_str_len(obj) as i64));
+        }
+        if pyre_object::bytesobject::is_bytes_like(obj) {
+            return Ok(w_int_new(
                 pyre_object::bytesobject::bytes_like_len(obj) as i64
-            ))
-        } else if pyre_object::is_w_range(obj) {
+            ));
+        }
+        if pyre_object::is_w_range(obj) {
             // `descr_len → self.w_length`, then `_check_len_result` →
             // `getindex_w(w_int, w_OverflowError)`: `len()` must fit a
             // machine word, so a bignum-length range raises OverflowError.
-            match pyre_object::w_range_length_i64(obj) {
+            return match pyre_object::w_range_length_i64(obj) {
                 Some(n) => Ok(w_int_new(n)),
                 None => Err(PyError::overflow_error(
                     "cannot fit 'int' into an index-sized integer",
                 )),
-            }
-        } else if pyre_object::is_long_range_iter(obj) {
+            };
+        }
+        if pyre_object::is_long_range_iter(obj) {
             // `iterobject.py W_LongRangeIterator.descr_len → w_len - w_index`.
-            Ok(pyre_object::range_bigint_to_obj(
+            return Ok(pyre_object::range_bigint_to_obj(
                 pyre_object::w_long_range_iter_len(obj),
-            ))
-        } else if is_range_iter(obj) {
+            ));
+        }
+        if is_range_iter(obj) {
             // `iterobject.py W_AbstractSeqIterObject.descr_length_hint`
             // — the iterator reports its REMAINING count, derived from
             // `(stop - current) / step`.
@@ -1952,40 +2109,26 @@ pub fn len(obj: PyObjectRef) -> PyResult {
             } else {
                 0
             };
-            Ok(w_int_new(count.max(0)))
-        } else if is_instance(obj) {
-            // descroperation.py:294-298 `_len` — `space.lookup(w_obj,
-            // '__len__')` then `space.get_and_call_function(w_descr,
-            // w_obj)`.  PyPy `get_and_call_function` raises on user
-            // exception; pyre's `call_function` stashes errors as PY_NULL.
-            // Use `call_and_check` so user-raised exceptions propagate.
-            if let Some(method) = lookup_in_type_where(w_instance_get_type(obj), "__len__") {
-                return crate::builtins::call_and_check(method, &[obj]);
-            }
-            // Per-instance __len__ via the unified getattr path (live dict + ATTR_TABLE).
-            if let Ok(method) = getattr_str(obj, "__len__") {
-                return crate::builtins::call_and_check(method, &[obj]);
-            }
-            Err(PyError::type_error(format!(
-                "object of type '{}' has no len()",
-                w_type_get_name(w_instance_get_type(obj)),
-            )))
-        } else {
-            // A metaclass `__len__` (e.g. `EnumMeta.__len__`) applies when
-            // the receiver is a class; `type` itself defines none, so an
-            // ordinary class still falls through to the error below.
-            if is_type(obj) {
-                if let Some(w_meta) = crate::typedef::r#type(obj) {
-                    if let Some(method) = lookup_in_type_where(w_meta, "__len__") {
-                        return crate::builtins::call_and_check(method, &[obj]);
-                    }
-                }
-            }
-            Err(PyError::type_error(format!(
-                "object of type '{}' has no len()",
-                (*(*obj).ob_type).name,
-            )))
+            return Ok(w_int_new(count.max(0)));
         }
+        // descroperation.py:294-298 `_len` — `space.lookup(w_obj, '__len__')`
+        // then `space.get_and_call_function(w_descr, w_obj)`.  Routed through
+        // `r#type` so a true user instance, a W_Root type (e.g. `deque`), and
+        // a class whose metaclass defines `__len__` (e.g. `EnumMeta.__len__`)
+        // all dispatch correctly.
+        if let Some(w_type) = crate::typedef::r#type(obj) {
+            if let Some(method) = lookup_in_type_where(w_type, "__len__") {
+                return get_and_call_function(method, obj, w_type, &[]);
+            }
+        }
+        // Per-instance __len__ via the unified getattr path (live dict + ATTR_TABLE).
+        if let Ok(method) = getattr_str(obj, "__len__") {
+            return crate::builtins::call_and_check(method, &[obj]);
+        }
+        Err(PyError::type_error(format!(
+            "object of type '{}' has no len()",
+            (*(*obj).ob_type).name,
+        )))
     }
 }
 
@@ -9444,6 +9587,35 @@ mod tests {
 /// PyPy: space.contains_w(haystack, needle)
 pub fn contains(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, PyError> {
     use pyre_object::*;
+    // A builtin container subclass overriding `__contains__` dispatches the
+    // override; exact instances and non-overriding subclasses fall through to
+    // the by-layout membership slot, which gives the inherited builtin scan
+    // without re-entering override dispatch.  Override targets are never a
+    // dict-proxy / dict-view / range, so this precedes the unwrap below.
+    unsafe {
+        if is_list(haystack)
+            || is_tuple(haystack)
+            || is_str(haystack)
+            || is_dict(haystack)
+            || pyre_object::is_set_or_frozenset(haystack)
+        {
+            if let Some((method, w_type)) = subclass_special_override(haystack, "__contains__") {
+                let result = get_and_call_function(method, haystack, w_type, &[needle])?;
+                return Ok(is_true(result)?);
+            }
+        }
+    }
+    contains_slot(haystack, needle)
+}
+
+/// The builtin `__contains__` slot body: membership dispatch by concrete
+/// layout.  Reached from the operator [`contains`] for exact instances and
+/// non-overriding subclasses, and bound directly as the `list`/`str`/`tuple`
+/// `__contains__` slot so a subclass override's `super().__contains__`
+/// resolves to the inherited builtin scan instead of re-entering override
+/// dispatch (which would recurse).
+pub(crate) fn contains_slot(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, PyError> {
+    use pyre_object::*;
     // `pypy/objspace/std/dictproxyobject.py:38 descr_contains` →
     // `space.contains(self.w_mapping, w_key)`.
     let haystack = unsafe {
@@ -9681,24 +9853,28 @@ pub fn eq_w(a: PyObjectRef, b: PyObjectRef) -> Result<bool, PyError> {
     }
     unsafe {
         use pyre_object::*;
-        if (is_int(a) || is_bool(a)) && (is_int(b) || is_bool(b)) {
-            let av = if is_bool(a) {
-                w_bool_get_value(a) as i64
-            } else {
-                w_int_get_value(a)
-            };
-            let bv = if is_bool(b) {
-                w_bool_get_value(b) as i64
-            } else {
-                w_int_get_value(b)
-            };
-            return Ok(av == bv);
-        }
-        if is_str(a) && is_str(b) {
-            // Compare WTF-8 bytes so lone-surrogate strings compare by
-            // content instead of panicking in `w_str_get_value`.
-            return Ok(pyre_object::w_str_get_wtf8(a).as_bytes()
-                == pyre_object::w_str_get_wtf8(b).as_bytes());
+        // The by-value fast paths assume exact builtin operands; a subclass
+        // overriding `__eq__` must dispatch through `compare` instead.
+        if is_exact_builtin_instance(a) && is_exact_builtin_instance(b) {
+            if (is_int(a) || is_bool(a)) && (is_int(b) || is_bool(b)) {
+                let av = if is_bool(a) {
+                    w_bool_get_value(a) as i64
+                } else {
+                    w_int_get_value(a)
+                };
+                let bv = if is_bool(b) {
+                    w_bool_get_value(b) as i64
+                } else {
+                    w_int_get_value(b)
+                };
+                return Ok(av == bv);
+            }
+            if is_str(a) && is_str(b) {
+                // Compare WTF-8 bytes so lone-surrogate strings compare by
+                // content instead of panicking in `w_str_get_value`.
+                return Ok(pyre_object::w_str_get_wtf8(a).as_bytes()
+                    == pyre_object::w_str_get_wtf8(b).as_bytes());
+            }
         }
     }
     Ok(is_true(compare(a, b, CompareOp::Eq)?)?)
@@ -9732,6 +9908,28 @@ pub fn delitem(obj: PyObjectRef, index: PyObjectRef) -> Result<(), PyError> {
                 "'mappingproxy' object does not support item deletion",
             ));
         }
+        // A builtin sequence subclass overriding `__delitem__` dispatches the
+        // override; exact instances and non-overriding subclasses fall through
+        // to the by-layout deletion slot below.
+        if is_list(obj) || pyre_object::bytearrayobject::is_bytearray(obj) {
+            if let Some((method, w_type)) = subclass_special_override(obj, "__delitem__") {
+                get_and_call_function(method, obj, w_type, &[index])?;
+                return Ok(());
+            }
+        }
+    }
+    delitem_slot(obj, index)
+}
+
+/// The builtin `__delitem__` slot body: item-deletion dispatch by concrete
+/// layout.  Reached from the operator [`delitem`] for exact instances and
+/// non-overriding subclasses, and bound directly as the `list` `__delitem__`
+/// slot so a subclass override's `super().__delitem__` resolves to the
+/// inherited builtin deletion instead of re-entering override dispatch
+/// (which would recurse).
+pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), PyError> {
+    use pyre_object::*;
+    unsafe {
         if is_list(obj) {
             if is_int(index) {
                 let i = w_int_get_value(index);

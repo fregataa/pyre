@@ -8376,12 +8376,14 @@ fn walker_concrete_ref_object(
 
 /// #124: walker-native truth specialization for the `truth_fn` residual
 /// (oopspec [`majit_ir::PyreHelperKind::Truth`]).  When the sole Ref operand
-/// is a concrete boxed `W_IntObject` (excluding `W_BoolObject`, whose vtable
-/// + 1-byte `boolval` layout differs), unbox it (`GUARD_CLASS INT` +
-/// `getfield intval`) and record `int_is_true`, stamping the folded concrete
-/// truth.  Returns the raw truth `OpRef` on success; `None` when the operand
-/// is not a concrete non-bool int — the caller then falls through to the
-/// generic may-force residual, preserving `__bool__` / `__len__` semantics.
+/// is a concrete boxed `W_IntObject` (excluding `W_BoolObject`, which shares
+/// the `intval: i64` layout but carries a distinct `BOOL_TYPE` `ob_type`, so
+/// the emitted `GUARD_CLASS INT` would not match it), unbox it
+/// (`GUARD_CLASS INT` + `getfield intval`) and record `int_is_true`, stamping
+/// the folded concrete truth.  Returns the raw truth `OpRef` on success;
+/// `None` when the operand is not a concrete non-bool int — the caller then
+/// falls through to the generic may-force residual, preserving `__bool__` /
+/// `__len__` semantics.
 ///
 /// Eliding the `CALL_MAY_FORCE` here also removes its `GUARD_NOT_FORCED` /
 /// `GUARD_NO_EXCEPTION`, whose kept-stack blackhole resume reads NULL peeled

@@ -1973,7 +1973,7 @@ pub unsafe fn w_dict_pop_checked(
     if is_module_dict(obj) {
         match w_module_dict_lookup_inner_checked(obj, key)? {
             Some(val) => {
-                w_dict_delitem(obj, key);
+                w_module_dict_delitem_inner_checked(obj, key)?;
                 Ok(Some(val))
             }
             None => Ok(None),

@@ -904,6 +904,56 @@ unsafe fn issubtype_cached(w_type: PyObjectRef, cls: PyObjectRef) -> bool {
     false
 }
 
+/// Builtin-subclass comparison override dispatch.
+///
+/// When either operand is a builtin subclass that *overrides* the comparison
+/// dunder, dispatch it with Python's reflected-subclass priority, calling
+/// only genuine overrides — never the inherited builtin slot, which delegates
+/// straight back into [`compare`] and would recurse forever.  Returns
+/// `Some(result)` once an override yields a non-`NotImplemented` value (or
+/// raises); `None` when neither side overrides — or every override returned
+/// `NotImplemented` — so the caller falls through to the by-layout fast paths
+/// / identity tail.
+unsafe fn try_compare_override(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> Option<PyResult> {
+    let dunder = match op {
+        CompareOp::Lt => "__lt__",
+        CompareOp::Le => "__le__",
+        CompareOp::Gt => "__gt__",
+        CompareOp::Ge => "__ge__",
+        CompareOp::Eq => "__eq__",
+        CompareOp::Ne => "__ne__",
+    };
+    let rdunder = reverse_dunder(dunder).unwrap_or(dunder);
+    let a_ov = crate::baseobjspace::subclass_special_override(a, dunder);
+    let b_ov = crate::baseobjspace::subclass_special_override(b, rdunder);
+    if a_ov.is_none() && b_ov.is_none() {
+        return None;
+    }
+    // Python's "subclass reflected op takes priority": if `b`'s type is a
+    // proper subclass of `a`'s type and `b` overrides the reflected op, run it
+    // first.
+    let b_first = b_ov.is_some()
+        && match (crate::typedef::r#type(a), crate::typedef::r#type(b)) {
+            (Some(at), Some(bt)) => !std::ptr::eq(at, bt) && issubtype_cached(bt, at),
+            _ => false,
+        };
+    let order = if b_first {
+        [(b_ov, b, a), (a_ov, a, b)]
+    } else {
+        [(a_ov, a, b), (b_ov, b, a)]
+    };
+    for (ov, recv, other) in order {
+        if let Some((method, w_type)) = ov {
+            match crate::baseobjspace::get_and_call_function(method, recv, w_type, &[other]) {
+                Ok(result) if !is_not_implemented(result) => return Some(Ok(result)),
+                Ok(_) => {}
+                Err(e) => return Some(Err(e)),
+            }
+        }
+    }
+    None
+}
+
 /// Map forward dunder to reverse dunder.
 /// PyPy: descroperation.py `_make_binop_impl` generates both directions.
 fn reverse_dunder(dunder: &str) -> Option<&'static str> {
@@ -2431,6 +2481,27 @@ pub fn xor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 /// Comparison operation dispatch.
 
 pub fn compare(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
+    let a = unwrap_cell(a);
+    let b = unwrap_cell(b);
+    // A builtin subclass overriding the comparison dunder dispatches the
+    // override first (with reflected-subclass priority); exact builtins and
+    // non-overriding subclasses fall through to the by-layout comparison slot,
+    // which gives the inherited builtin comparison.
+    unsafe {
+        if let Some(result) = try_compare_override(a, b, op) {
+            return result;
+        }
+    }
+    compare_slot(a, b, op)
+}
+
+/// The builtin comparison slot body: rich-comparison dispatch by concrete
+/// layout.  Reached from the operator [`compare`] for exact builtins and
+/// non-overriding subclasses, and bound by the `cmp_dunder!` slots so a
+/// subclass override's `super().__eq__` (etc.) resolves to the inherited
+/// builtin comparison instead of re-entering override dispatch (which would
+/// recurse).
+pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
     let a = unwrap_cell(a);
     let b = unwrap_cell(b);
     unsafe {

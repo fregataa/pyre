@@ -111,6 +111,36 @@ pub fn get_instantiate(tp: &PyType) -> PyObjectRef {
     tp.instantiate.load(Ordering::Acquire)
 }
 
+/// True when `obj`'s Python class is exactly the builtin type for its
+/// layout — i.e. NOT a user subclass.
+///
+/// A user subclass of a builtin keeps the builtin `ob_type` (and therefore
+/// the builtin struct layout and the `is_int` / `is_list` / … layout
+/// predicates) while `w_class` is retagged to the subclass type object
+/// (`typedef::subclass_to_tag`).  The type-specific fast paths in
+/// `space.is_true` / `eq_w` / `len` / `getitem` / … assume the receiver's
+/// Python class IS the builtin (no overridable special method); for a
+/// subclass instance they would bypass an overridden `__bool__` / `__len__`
+/// / `__eq__` / `__getitem__` / … .  Gate each fast path on this predicate
+/// and let a subclass fall through to the MRO `lookup` path.
+///
+/// A fresh builtin carries `w_class == get_instantiate(ob_type)` (see
+/// `w_int_new` etc.); the read-only singletons (`True` / `False` / `None` /
+/// `Ellipsis` / `NotImplemented`) leave `w_class` null and are always exact.
+///
+/// # Safety
+/// `obj` must be null or a valid `PyObjectRef`.
+#[inline]
+pub unsafe fn is_exact_builtin_instance(obj: PyObjectRef) -> bool {
+    if obj.is_null() {
+        return false;
+    }
+    unsafe {
+        let w_class = (*obj).w_class;
+        w_class.is_null() || std::ptr::eq(w_class, get_instantiate(&*(*obj).ob_type))
+    }
+}
+
 // Compile-time verification: AtomicI64/AtomicPtr are layout-compatible
 // with i64/*mut T so the JIT can read PyType fields at raw offsets.
 // Also verify OBJECT_VTABLE field order: subclassrange_min @ 0, max @ 8.
