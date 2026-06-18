@@ -589,7 +589,7 @@ fn run_perfn_walk(
         v
     };
 
-    // Per-fn descr-pool plumbing (task #50): the per-CodeObject body
+    // Per-fn descr-pool plumbing: the per-CodeObject body
     // resolves `d`/`j` descr operands through its OWN runtime pool
     // (`pjc.jitcode.exec.descrs`, `Vec<RuntimeBhDescr>`), NOT the global
     // `all_descr_refs()`.  Build the index-parallel adapted `descr_refs`

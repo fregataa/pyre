@@ -1348,9 +1348,7 @@ impl SomePBC {
                         > = std::collections::BTreeSet::new();
                         for entry in pbc.descriptions.values() {
                             if let Some(mof) = entry.as_method_of_frozen() {
-                                funcdesc_keys.insert(super::description::DescKey::from_rc(
-                                    &mof.borrow().funcdesc,
-                                ));
+                                funcdesc_keys.insert(mof.borrow().funcdesc.desc_key());
                             }
                         }
                         if funcdesc_keys.len() > 1 {

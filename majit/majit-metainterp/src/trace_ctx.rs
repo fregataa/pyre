@@ -442,7 +442,7 @@ pub struct TraceCtx {
     /// reads `box.getref_base()` off the Box at every use.
     pub(crate) virtualref_boxes: Vec<(OpRef, usize)>,
 
-    /// Task #64 bug-2: the decoded inline-callee recipes for the bridge
+    /// The decoded inline-callee recipes for the bridge
     /// currently being set up, stashed by `setup_bridge_sym` and drained
     /// once by `trace_bytecode` right before `interpret()`. `None` for
     /// primary traces and single-frame bridges.
@@ -456,7 +456,7 @@ pub struct TraceCtx {
     pub(crate) bridge_inline_carrier: Option<BridgeInlineCarrier>,
 }
 
-/// Task #64 bug-2: a decoded-but-not-yet-built description of one inlined
+/// A decoded-but-not-yet-built description of one inlined
 /// callee frame (`resume_data.frames[i]`, `i >= 1`) for a multi-frame
 /// bridge. `setup_bridge_sym` decodes the resume stream into this recipe
 /// while the resume data / rd_virtuals cache are in scope; `trace_bytecode`
@@ -485,7 +485,7 @@ pub struct ReconstructRecipe {
     pub nargs: usize,
 }
 
-/// Task #64 bug-2: the decoded inline-callee recipes for one multi-frame
+/// The decoded inline-callee recipes for one multi-frame
 /// bridge, plus the outermost (`frames[0]`) resume pc. `trace_bytecode`
 /// builds the caller-visible root frame at `root_pc` and pushes each
 /// recipe on top (innermost last), so the framestack matches the inline

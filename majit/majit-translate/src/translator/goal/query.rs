@@ -431,8 +431,7 @@ pub fn check_methods_qgen(t: &TranslationContext) -> Vec<String> {
             if let SomeValue::PBC(pbc) = s_value {
                 for entry in pbc.descriptions.values() {
                     if let DescEntry::Method(method_rc) = entry {
-                        let funcdesc = method_rc.borrow().funcdesc.clone();
-                        funcs.insert(DescKey::from_rc(&funcdesc));
+                        funcs.insert(method_rc.borrow().funcdesc.desc_key());
                     }
                 }
             }
@@ -476,13 +475,18 @@ pub fn check_methods_qgen(t: &TranslationContext) -> Vec<String> {
                             Err(_) => continue,
                         };
                         // `isinstance(c, FunctionDesc)` — MemoDesc is-a
-                        // FunctionDesc (description.py:395), so accept its
-                        // wrapped base via `as_function()`.
-                        entry.as_function().map(|fd| DescKey::from_rc(&fd))
+                        // FunctionDesc (description.py:395). Key on the
+                        // FuncDescEntry's `desc_key()` (the MemoDesc wrapper
+                        // for a memo, the FunctionDesc otherwise), the same
+                        // key the `funcs` set is built from above via
+                        // `MethodDesc.funcdesc.desc_key()`. Upstream
+                        // `bk.getdesc(c.value)` and `desc.funcdesc` are the
+                        // same object identity (`query.py:85,95`), so the
+                        // two sides must hash on the same desc; unwrapping to
+                        // the inner base here would miss a memo method.
+                        entry.as_func_entry().map(|fe| fe.desc_key())
                     }
-                    ClassDictEntry::Desc(entry) => {
-                        entry.as_function().map(|fd| DescKey::from_rc(&fd))
-                    }
+                    ClassDictEntry::Desc(entry) => entry.as_func_entry().map(|fe| fe.desc_key()),
                 };
                 // Upstream `:96-98`: `if isinstance(c, FunctionDesc):
                 // if c not in funcs: yield "lost method: ..."`.

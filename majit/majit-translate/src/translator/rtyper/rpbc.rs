@@ -5107,9 +5107,11 @@ pub struct MethodOfFrozenPBCRepr {
     /// RPython `self.rtyper = rtyper` (rpbc.py:850).
     pub rtyper: Weak<RPythonTyper>,
     /// RPython `self.funcdesc = funcdescs.pop()` (rpbc.py:853) — the
-    /// single shared underlying `FunctionDesc` across all bound
-    /// methods in `s_pbc`.
-    pub funcdesc: Rc<RefCell<crate::annotator::description::FunctionDesc>>,
+    /// single shared underlying funcdesc across all bound methods in
+    /// `s_pbc`. Carries the whole `FuncDescEntry` so a bound memo method
+    /// keeps its MemoDesc identity (upstream `desc.funcdesc` is the
+    /// MemoDesc, compared with `is`); `func()` is the FunctionDesc view.
+    pub funcdesc: crate::annotator::description::FuncDescEntry,
     /// RPython `self.s_im_self = SomePBC(im_selves)` (rpbc.py:867) —
     /// the PBC of the bound `frozendesc`s.
     pub s_im_self: SomePBC,
@@ -5134,7 +5136,7 @@ impl MethodOfFrozenPBCRepr {
         //            funcdescs.pop()`.
         let mut funcdesc_set: std::collections::BTreeMap<
             crate::annotator::description::DescKey,
-            Rc<RefCell<crate::annotator::description::FunctionDesc>>,
+            crate::annotator::description::FuncDescEntry,
         > = std::collections::BTreeMap::new();
         let mut frozendescs: Vec<crate::annotator::description::DescEntry> = Vec::new();
         for entry in s_pbc.descriptions.values() {
@@ -5144,9 +5146,12 @@ impl MethodOfFrozenPBCRepr {
                 )
             })?;
             let mof_b = mof.borrow();
-            let fd = mof_b.funcdesc.clone();
-            let fd_key = crate::annotator::description::DescKey::from_rc(&fd);
-            funcdesc_set.entry(fd_key).or_insert(fd);
+            // upstream `set([desc.funcdesc ...])` keys on the funcdesc
+            // identity — the MemoDesc itself for a memo, not its base.
+            let fd_key = mof_b.funcdesc.desc_key();
+            funcdesc_set
+                .entry(fd_key)
+                .or_insert_with(|| mof_b.funcdesc.clone());
             frozendescs.push(crate::annotator::description::DescEntry::Frozen(
                 mof_b.frozendesc.clone(),
             ));
@@ -5204,12 +5209,13 @@ impl MethodOfFrozenPBCRepr {
             )
         })?;
         let mof_b = mof.borrow();
-        // upstream: `if mdesc.funcdesc is not self.funcdesc: raise`.
-        if !Rc::ptr_eq(&mof_b.funcdesc, &self.funcdesc) {
+        // upstream: `if mdesc.funcdesc is not self.funcdesc: raise` —
+        // identity on the funcdesc (the MemoDesc itself for a memo).
+        if mof_b.funcdesc.desc_key() != self.funcdesc.desc_key() {
             return Err(TyperError::message(format!(
                 "not a method bound on {:?}: {:?}",
-                self.funcdesc.borrow().name,
-                mof_b.funcdesc.borrow().name,
+                self.funcdesc.func().borrow().name,
+                mof_b.funcdesc.func().borrow().name,
             )));
         }
         // upstream: `return self.r_im_self.convert_desc(mdesc.frozendesc)`.
@@ -5247,9 +5253,10 @@ impl MethodOfFrozenPBCRepr {
         use crate::annotator::model::SomeValue;
         use crate::flowspace::model::Constant as FlowConstant;
 
-        // upstream: `s_function = SomePBC([self.funcdesc])`.
+        // upstream: `s_function = SomePBC([self.funcdesc])` — the memo
+        // wrapper survives as the desc, not its unwrapped base.
         let s_function = SomeValue::PBC(SomePBC::new(
-            vec![DescEntry::function(self.funcdesc.clone())],
+            vec![DescEntry::Func(self.funcdesc.clone())],
             false,
         ));
         // upstream: `hop2 = hop.copy()`.
@@ -5378,7 +5385,7 @@ impl Repr for MethodOfFrozenPBCRepr {
         // (rpbc.py:183-184) — `return self.s_pbc`. For
         // MethodOfFrozenPBCRepr the equivalent is the funcdesc-derived
         // SomePBC: a single-FunctionDesc PBC (no can_be_None).
-        let s_callable = SomePBC::new(vec![DescEntry::function(self.funcdesc.clone())], false);
+        let s_callable = SomePBC::new(vec![DescEntry::Func(self.funcdesc.clone())], false);
         let r_func = rtyper.getrepr(&crate::annotator::model::SomeValue::PBC(s_callable))?;
         // upstream: `return r_func, 1` — the `1` is the arg-position
         // offset (skip the bound `self`).
@@ -6594,7 +6601,7 @@ impl MethodsPBCRepr {
                      a MethodDesc",
                 )
             })?;
-            funcdesc_entries.push(DescEntry::function(md.borrow().funcdesc.clone()));
+            funcdesc_entries.push(DescEntry::Func(md.borrow().funcdesc.clone()));
         }
 
         // upstream: `s_func = SomePBC(funcdescs, subset_of=r_func.s_pbc)`.
@@ -7470,7 +7477,7 @@ mod pbc_repr_tests {
         let frozendesc = Rc::new(StdRefCell::new(FrozenDesc::new(bk.clone(), pyobj).unwrap()));
         DescEntry::MethodOfFrozen(Rc::new(StdRefCell::new(MethodOfFrozenDesc::new(
             bk.clone(),
-            funcdesc.clone(),
+            crate::annotator::description::FuncDescEntry::plain(funcdesc.clone()),
             frozendesc,
         ))))
     }
@@ -7493,9 +7500,9 @@ mod pbc_repr_tests {
         // r_im_self is `SingleFrozenPBCRepr` → Void.
         assert_eq!(r.lowleveltype(), &LowLevelType::Void);
         assert_eq!(r.lowleveltype(), r.r_im_self.lowleveltype());
-        // The shared FunctionDesc on the repr is the same Rc as the
+        // The shared funcdesc on the repr is the same Rc as the
         // one bound on the MethodOfFrozenDesc.
-        assert!(Rc::ptr_eq(&r.funcdesc, &fd));
+        assert!(Rc::ptr_eq(&r.funcdesc.func(), &fd));
     }
 
     // The "mixed funcdescs" rejection branch (rpbc.py:851-853 `assert
@@ -7601,7 +7608,7 @@ mod pbc_repr_tests {
         let cd_key = ClassDefKey::from_classdef(classdef);
         DescEntry::Method(Rc::new(StdRefCell::new(MethodDesc::new(
             bk.clone(),
-            funcdesc.clone(),
+            crate::annotator::description::FuncDescEntry::plain(funcdesc.clone()),
             cd_key,
             Some(cd_key),
             name,

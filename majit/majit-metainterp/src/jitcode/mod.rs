@@ -715,10 +715,9 @@ mod tests {
         );
     }
 
-    /// Tasks #94c (abort/*) and #94b' (state_*) seeded the
-    /// `pyre_extension_insns()` quarantine with the 8 keys arising from
+    /// The `pyre_extension_insns()` quarantine holds 8 keys arising from
     /// the borrow-checker abort signals (2) and the proc-macro JIT-machine
-    /// state addressing (6).  Subsequent slices added 3 more pyre-only
+    /// state addressing (6), plus 3 more pyre-only
     /// keys — `inline_call_pyre_nested/P` (nested-bytecode `inline_call`
     /// adapter, `BC_INLINE_CALL = 17`), `abort/>r` (Ref-result variant of
     /// `abort/`), and `vtable_method_ptr/rd>i` (dyn-trait method-pointer

@@ -644,7 +644,7 @@ impl ClassRepr {
                         "ClassRepr.prepare_method expected MethodDesc entries after lookup_filter",
                     )
                 })?;
-                Ok(DescEntry::function(method.borrow().funcdesc.clone()))
+                Ok(DescEntry::Func(method.borrow().funcdesc.clone()))
             })
             .collect::<Result<_, TyperError>>()?;
         // rclass.py:236 — `return annmodel.SomePBC(funcdescs)`. The
@@ -5069,7 +5069,7 @@ mod tests {
 
     #[test]
     fn instance_repr_setup_terminates_on_cyclic_struct_graph() {
-        // Localizes the route-b stack overflow (task #100) at the RTYPER
+        // Localizes the route-b stack overflow at the RTYPER
         // layer. `getuniqueclassdef_for_struct_root` (transitive
         // registration) is already proven cycle-safe (bookkeeper test
         // `getuniqueclassdef_for_struct_root_terminates_on_cyclic_graph`).
@@ -5453,7 +5453,7 @@ mod tests {
         )));
         let method = Rc::new(RefCell::new(MethodDesc::new(
             bk,
-            funcdesc.clone(),
+            crate::annotator::description::FuncDescEntry::plain(funcdesc.clone()),
             ClassDefKey::from_classdef(&classdef),
             None,
             "method",

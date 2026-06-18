@@ -224,6 +224,14 @@ pub trait JitState: Sized {
     /// → `metainterp.execute_new_with_vtable` (resume.py:945-956 getvirtual_ptr).
     /// `rd_virtuals` is the parent guard's virtual descriptor table from
     /// the source trace's exit layout (None when the parent had no virtuals).
+    ///
+    /// This default body is an intentional no-op — correct for primary
+    /// traces and single-frame bridges, which carry no inlined-callee
+    /// resume frames to reconstruct. `JitState` implementations that
+    /// support multi-frame (inlined/recursive) bridges override it to
+    /// decode the resume stream into per-callee recipes and stash a
+    /// `BridgeInlineCarrier` on `ctx` (drained by `trace_bytecode` right
+    /// before `interpret()`).
     fn setup_bridge_sym(
         _sym: &mut Self::Sym,
         _ctx: &mut crate::trace_ctx::TraceCtx,

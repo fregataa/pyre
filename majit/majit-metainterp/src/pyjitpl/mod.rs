@@ -18036,7 +18036,7 @@ mod tests {
 
     #[test]
     fn walk_active_trace_refs_forwards_op_value_ref() {
-        // task #107: the recorder stamps the concrete runtime result onto
+        // The recorder stamps the concrete runtime result onto
         // `Op.value` (`set_concrete_at`). A minor collection during tracing
         // must forward a `Value::Ref` there; a non-Ref `Value` is untouched.
         let mut meta = MetaInterp::<()>::new(0);
@@ -18069,7 +18069,7 @@ mod tests {
 
     #[test]
     fn walk_active_trace_refs_forwards_inputarg_value_ref() {
-        // task #107: `set_concrete_at` also stamps `Value::Ref` onto recorder
+        // `set_concrete_at` also stamps `Value::Ref` onto recorder
         // InputArgs (loop / bridge entry args), reached only through this
         // walker since an InputArg has no args / fail_args to forward.
         let mut meta = MetaInterp::<()>::new(0);

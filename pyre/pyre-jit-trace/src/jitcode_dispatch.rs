@@ -410,7 +410,7 @@ pub struct WalkContext<'frame, 'static_a: 'frame> {
     /// walks (the per-`CodeObject` body resolves through its own
     /// `exec.descrs`).  Index-parallel to [`Self::descr_refs`].
     pub raw_descrs: RawDescrPool<'static_a>,
-    /// Whether this walk is the SOLE concrete-execution leg (task #51b).
+    /// Whether this walk is the SOLE concrete-execution leg.
     ///
     /// `false` (shadow validation, the diagnostic full-body probe,
     /// tests): a separate concrete interpreter (the Python interpreter
@@ -3817,35 +3817,29 @@ fn decode_descr_index(code: &[u8], op: &DecodedOp, operand_offset: usize) -> usi
 /// The recorded opcode kind selected above is for the IR trace
 /// only; concrete execution either fired (or was intentionally
 /// skipped via the two narrow branches above) before the trace op
-/// hits the recorder.  Pyre's walker today concrete-executes only
-/// the `CallPure*` branch (via [`try_fold_pure_call_via_executor`]),
-/// so the forces / loopinvariant-miss / default branches can miss the
-/// concrete heap effect that the next read depends on.
+/// hits the recorder.
 ///
-/// Per-branch concrete-execute status today:
+/// Per-branch concrete-execute status (sub-slices 3 + 4 landed — every
+/// non-pure residual call now concrete-executes during the walk, matching
+/// PyPy `do_residual_call` which runs `executor.execute_varargs` for the
+/// whole forces branch regardless of EI):
 ///
-/// | EI branch | Selected op | PyPy `execute_varargs` | Pyre walker | Reachable via |
-/// |---|---|---|---|---|
-/// | `is_call_release_gil()` | (early-routed to `direct_call_release_gil`) | n/a — separate `do_call_release_gil` path | (release-gil IR only, no concrete exec) | not via this selector |
-/// | `check_forces_virtual_or_virtualizable()` | `CallMayForce*` + `GuardNotForced` | `pure=False, exc=can_raise` — runs the helper, may force virtualizable | **record-only** | dispatcher_iRd/iIRd/iIRFd_kind forces branch |
-/// | `extraeffect == LoopInvariant` | `CallLoopinvariant*` | `pure=False, exc=False` — runs on cache miss | record-only on cache miss, [`loopinvariant_lookup`] reuses cached OpRef on hit (no execute, no record) | same dispatchers |
-/// | `check_is_elidable()` | `CallPure*` | `pure=True, exc=can_raise` — runs the helper, caches result | [`try_fold_pure_call_via_executor`] (elidable_cannot_raise only — see its caveats) | same dispatchers |
-/// | default | `Call*` + (`GuardNoException` iff can_raise) | `pure=False, exc=can_raise` — runs the helper | **record-only** | same dispatchers |
+/// | EI branch | Selected op | Pyre walker concrete-execute |
+/// |---|---|---|
+/// | `is_call_release_gil()` | (early-routed to [`direct_call_release_gil`], records `CALL_RELEASE_GIL_*`) | executed as `CallMayForce*` on the **original** `allboxes` via [`try_execute_residual_call_via_executor`] (sub-slice 4) |
+/// | `check_forces_virtual_or_virtualizable()` | `CallMayForce*` + `GuardNotForced` | executed via [`try_execute_residual_call_via_executor`] (active vable bracketed by the token protocol) |
+/// | `extraeffect == LoopInvariant` | `CallLoopinvariant*` | executed on cache miss; [`loopinvariant_lookup`] reuses the cached OpRef on hit (no execute, no record) |
+/// | `check_is_elidable()` | `CallPure*` | executed + cached via [`try_fold_pure_call_via_executor`] (elidable_cannot_raise only — see its caveats) |
+/// | default | `Call*` + (`GuardNoException` iff can_raise) | executed via [`try_execute_residual_call_via_executor`] |
 ///
-/// **Walker-record sites for non-elidable concrete-execute gap:**
-///   * [`dispatch_residual_call_iRd_kind`] (`residual_call_r_*/iRd>{v,r,i,f}` ←
-///     pyjitpl.py:1346 `_opimpl_residual_call1` / 1348 / 1350 / 1352)
-///   * [`dispatch_residual_call_iIRd_kind`] (`residual_call_ir_*/iIRd>{v,r,i,f}` ←
-///     pyjitpl.py:1349 `_opimpl_residual_call2` / 1351 / 1353 / 1355)
-///   * [`dispatch_residual_call_iIRFd_kind`] (`residual_call_irf_*/iIRFd>{v,r,i,f}` ←
-///     pyjitpl.py:1354 `_opimpl_residual_call3` / 1355 / 1357 / 1359)
-///
-/// All three call [`select_residual_call_opcode`] then
-/// `record_op_with_descr` then [`try_fold_pure_call_via_executor`].
-/// The orthodox fix replaces the last call with a wider
-/// `try_execute_residual_call_via_executor(call_opcode, ei, ...)`
-/// whose body matches PyPy `executor.execute_varargs` per the
-/// branch table above.
+/// All three dispatch entry points — [`dispatch_residual_call_iRd_kind`]
+/// (`_opimpl_residual_call1`), [`dispatch_residual_call_iIRd_kind`]
+/// (`_opimpl_residual_call2`), [`dispatch_residual_call_iIRFd_kind`]
+/// (`_opimpl_residual_call3`) — call [`select_residual_call_opcode`],
+/// `record_op_with_descr`, then [`try_fold_pure_call_via_executor`] (pure)
+/// + [`try_execute_residual_call_via_executor`] (non-pure).  The executor
+/// self-gates and degrades to recording-only when a precondition fails
+/// (non-authoritative walk, non-const funcbox, unpatched symbolic fnaddr).
 ///
 /// **Priority order for sub-slice 2 (widen):** Call* (default — the
 /// store_subscr_fn / set_current_exception class, smallest blast
@@ -4357,9 +4351,23 @@ pub fn bool_box_truth_reset() {
 ///   virtualizable is present, see force-virtual gate below).
 ///   * `CallPure*` is excluded — that's [`try_fold_pure_call_via_executor`]'s
 ///     job.
-///   * `CallReleaseGil*` / `CallAssembler*` are intentionally excluded:
-///     their trace-recording-time invariants (GIL transitions, jitdriver
-///     re-entry) need a separate audit (Task #390 sub-slice 4).
+///   * `CallReleaseGil*` / `CallAssembler*` are excluded from THIS
+///     function's direct opcode set, but for distinct reasons (sub-slice 4
+///     audit outcome):
+///     - `CallReleaseGil*` IS concrete-executed — `do_residual_call`
+///       (`pyjitpl.py:2019-2044`) runs step 2 with `opnum1 =
+///       CALL_MAY_FORCE_*` for the *whole* forces branch, and release-gil
+///       is a sub-case inside it.  [`direct_call_release_gil`] records the
+///       `CALL_RELEASE_GIL_*` op then re-enters this function with a
+///       `CallMayForce*` opcode and the original `allboxes`, so the GIL
+///       wrapper runs once during tracing exactly like a may-force call
+///       (the GIL transition is inert single-threaded during recording).
+///     - `CallAssembler*` is correctly NOT executed here: an assembler
+///       token re-enters the JIT, it is not a plain C func address, so the
+///       raw-`func_ptr` executor would fault.  Recursive `CALL_ASSEMBLER`
+///       is folded by [`try_walker_call_assembler_self_recursive`], which
+///       concrete-executes the callee through its own `CallMayForceR` path
+///       on the real callable (token lives only in the recorded op).
 ///   * **`CallMayForce*` vable token protocol**: PyPy `do_residual_call`
 ///     (`pyjitpl.py:2017-2082`) concrete-executes every `CallMayForce*`
 ///     via `executor.execute_varargs`, bracketed by the heap halves of
@@ -6566,11 +6574,12 @@ fn direct_call_release_gil(
     ei: &majit_ir::EffectInfo,
     allboxes: &[OpRef],
     descr: DescrRef,
+    call_descr: &dyn majit_ir::descr::CallDescr,
     dst_bank: char,
     dst: usize,
     pc: usize,
     caller: &'static str,
-) -> Result<(), DispatchError> {
+) -> Result<Option<DispatchOutcome>, DispatchError> {
     // pyjitpl.py:2017 `vable_and_vrefs_before_residual_call` —
     // release-gil is unconditionally a forces sub-case
     // (`pyjitpl.py:2063` sits inside the forces-virtual-or-virtualizable
@@ -6614,55 +6623,104 @@ fn direct_call_release_gil(
     if allboxes.len() > 1 {
         new_args.extend_from_slice(&allboxes[1..]);
     }
-    let result = ctx.trace_ctx.record_op_with_descr(opcode, &new_args, descr);
-    // pyjitpl.py:2072 `heapcache.invalidate_caches_varargs(opnum1, descr,
-    // allboxes)` — the forces-branch invalidation uses `opnum1` which is
-    // the corresponding `CALL_MAY_FORCE_*`, NOT `CALL_RELEASE_GIL_*`.
-    // Pass the **original** `allboxes` (not the reshaped
-    // `[savebox, funcbox] + argboxes[1:]`) so heapcache's
-    // `mark_escaped_varargs` sees the same operand identities upstream
-    // does at this site.
+    // Ordering note: the walker records the op here and concrete-executes
+    // below, whereas `do_residual_call` executes the `CALL_MAY_FORCE_*`
+    // first and only records (`direct_call_release_gil`, pyjitpl.py:3695)
+    // after `vrefs_after_residual_call()`. This record-then-execute order
+    // is a structural property of the FBW residual-call path shared by the
+    // generic walker — not specific to release-gil — so the result still
+    // back-patches `recorded`; a 1:1 execute-then-record reorder would
+    // require restructuring the whole walker residual-call flow.
+    let recorded = ctx.trace_ctx.record_op_with_descr(opcode, &new_args, descr);
+    // The forces-branch concrete-execute and the heapcache invalidation
+    // both key on the corresponding `CALL_MAY_FORCE_*` (`pyjitpl.py:2017-
+    // 2072 opnum1`), NOT `CALL_RELEASE_GIL_*`.
     let mayforce_opnum = match dst_bank {
         'i' => OpCode::CallMayForceI,
         'f' => OpCode::CallMayForceF,
         'v' => OpCode::CallMayForceN,
         _ => unreachable!("dst_bank validated above"),
     };
+    // pyjitpl.py:2019-2044 `do_residual_call` step 2: the forces branch
+    // concrete-executes the helper via `executor.execute_varargs(opnum1,
+    // allboxes, descr)` BEFORE step 4 selects which CALL_* op to record.
+    // The release-gil sub-case (`pyjitpl.py:2063`) sits *inside* that
+    // branch, so it is executed identically to a `CALL_MAY_FORCE_*` — on
+    // the **original** `allboxes` (`allboxes[0]` is the wrapper funcbox;
+    // the recorded op above used the re-shaped `[savebox, funcbox_real,
+    // …]`).  Task #390 sub-slice 4: this removes the asymmetry where
+    // release-gil was the only forces sub-case that recorded without
+    // executing — the same un-executed-side-effect SIGBUS class sub-slice
+    // 3 closed for the may-force branch.
+    // `try_execute_residual_call_via_executor` self-gates (authoritative-
+    // executor flag, const-funcbox, fnaddr ≥47-bit sanity) and degrades to
+    // recording-only on decline; on success it stamps `recorded` with the
+    // concrete result and brackets the active virtualizable token for the
+    // duration of the call (its may-force arm).
+    let resid_exec = try_execute_residual_call_via_executor(
+        ctx,
+        mayforce_opnum,
+        allboxes,
+        call_descr,
+        recorded,
+        pc,
+    )?;
+    // A `None` leaves the call recorded symbolically WITHOUT running it, so
+    // the walk-end no-replay commit must stay off for this trace.
+    if resid_exec.is_none() {
+        fbw_mark_unjournaled_effect();
+    }
+    let resid_raised = matches!(resid_exec, Some(Err(_)));
+    debug_assert!(
+        !resid_raised || ei.check_can_raise(false),
+        "{caller}: release-gil helper raised on a `!can_raise` EI — \
+         EffectInfo claim/reality mismatch"
+    );
+    // pyjitpl.py:2072 `heapcache.invalidate_caches_varargs(opnum1, descr,
+    // allboxes)` — forces-branch invalidation uses `opnum1`
+    // (`CALL_MAY_FORCE_*`) on the **original** `allboxes` so heapcache's
+    // `mark_escaped_varargs` sees the same operand identities upstream does.
     ctx.trace_ctx
         .heapcache_invalidate_caches_varargs(mayforce_opnum, Some(ei), allboxes);
-    // pyjitpl.py:1950 _opimpl_residual_call*: result writeback runs
-    // BEFORE handle_possible_exception().  Write `result` into
-    // `registers_*[dst]` here so the GUARD_NO_EXCEPTION fail_args
-    // capture below sees the recorded OpRef rather than the prior
-    // register value.  `'v'` (void) returns skip the writeback —
-    // there is no destination slot.
+    // pyjitpl.py:1950-1954 execute_varargs: `make_result_of_lastop(op)` runs
+    // BEFORE `handle_possible_exception()` precisely "because we need the box
+    // to show up in get_list_of_active_boxes()".  Write the recorded OpRef
+    // into `registers_*[dst]` for every non-void result REGARDLESS of whether
+    // the helper raised — the GUARD_NOT_FORCED resume snapshot captured below
+    // must see the result box in its slot, exactly as upstream's
+    // unconditional (non-void) make_result_of_lastop does.  `'v'` (void) is a
+    // no-op in `write_residual_call_result_to_dst`; on a raised call the OpRef
+    // carries a Null concrete shadow, never read on the exception path.
     if dst_bank != 'v' {
-        write_residual_call_result_to_dst(ctx, pc, dst, dst_bank, result)?;
+        write_residual_call_result_to_dst(ctx, pc, dst, dst_bank, recorded)?;
     }
     // pyjitpl.py:2079 GUARD_NOT_FORCED — unconditional on the outer
-    // forces-virtual-or-virtualizable branch (the release-gil sub-case
-    // is inside that branch, so the guard fires regardless of which
-    // sub-branch ran).  Walker omits the
-    // `vable_after_residual_call(funcbox)` short-circuit
-    // (`pyjitpl.py:2078`) entirely because it has no concrete callee
-    // execution to observe a force from — the trait-dispatch leg
-    // detects the force at `state.rs MIFrame::vable_after_residual_call`
-    // (`trace_opcode.rs:2237-2263`) and aborts via
-    // `PyError::runtime_error("ABORT_ESCAPE: ...")` before walker IR
-    // diff would run.
+    // forces-virtual-or-virtualizable branch (the release-gil sub-case is
+    // inside that branch).  A force inside the concrete-executed helper is
+    // observed by the executor's vable token bracket above, surfacing as
+    // `VableEscapedDuringResidualCall` (aborting the walk) before reaching
+    // this guard.
     ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
     walker_capture_snapshot_for_last_guard(ctx, pc)?;
-    // pyjitpl.py:2082 handle_possible_exception — emits
-    // GUARD_NO_EXCEPTION whenever the EffectInfo can raise.  The
-    // capture ports `capture_resumedata(after_residual_call=True)`
-    // (keyed on the guard opcode) so the optimizer's
-    // `store_final_boxes_in_guard` finds a populated
-    // `rd_resume_position`.
+    // pyjitpl.py:2082 handle_possible_exception — emits GUARD_EXCEPTION
+    // when the recording-time helper raised (then finishframe_exception:
+    // surface `SubRaise` so the dead arm tail is not recorded onto the
+    // exception path), else GUARD_NO_EXCEPTION.  The capture ports
+    // `capture_resumedata(after_residual_call=True)` so the optimizer's
+    // `store_final_boxes_in_guard` finds a populated `rd_resume_position`.
     if ei.check_can_raise(false) {
+        if resid_raised {
+            walker_record_guard_exception(ctx, pc);
+            let exc = ctx
+                .last_exc_value
+                .expect("resid_raised implies last_exc_value seeded by the Err branch");
+            let exc_concrete = ctx.last_exc_value_concrete;
+            return Ok(Some(DispatchOutcome::SubRaise { exc, exc_concrete }));
+        }
         ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
         walker_capture_snapshot_for_last_guard(ctx, pc)?;
     }
-    Ok(())
+    Ok(None)
 }
 
 /// `residual_call` shape `iRd>X` dispatcher. Reads `funcptr (i)`,
@@ -7452,12 +7510,14 @@ fn try_walker_call_assembler_self_recursive(
     // `do_residual_call_walker_emit`.  `CALL_ASSEMBLER_R` yields the boxed
     // PyObject return value, taken as-is by the Ref dst (the consuming
     // BINARY_OP unboxes); eligibility pinned `dst_bank == 'r'`.
-    // Skipped on `exec_raised`: `ca_result` carries no concrete result
-    // (the callee raised before producing one) — same skip as the
-    // residual dispatcher.
-    if !exec_raised {
-        write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, ca_result)?;
-    }
+    // Written REGARDLESS of `exec_raised`: on a raise `ca_result` is still
+    // the recorded CALL_ASSEMBLER OpRef (carrying a Null concrete shadow,
+    // never read on the exception path), and the after-call resume snapshots
+    // must see it in the dst slot — the same unconditional non-void writeback
+    // as the residual dispatcher (pyjitpl.py:1950-1954 / 2074-2077:
+    // make_result_of_lastop before handle_possible_exception for
+    // get_list_of_active_boxes).
+    write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, ca_result)?;
 
     // pyjitpl.py:2079: GUARD_NOT_FORCED + resume snapshot advanced past
     // the call (`capture_resumedata(after_residual_call=True)`).
@@ -8013,16 +8073,19 @@ fn dispatch_residual_call_iRd_kind(
     // sub-case below, the elidable branch, the default branch) come
     // out of `select_residual_call_opcode`.
     if ei.is_call_release_gil() {
-        direct_call_release_gil(
+        if let Some(outcome) = direct_call_release_gil(
             ctx,
             ei,
             &allboxes,
             descr.clone(),
+            call_descr,
             dst_bank,
             dst,
             op.pc,
             "dispatch_residual_call_iRd_kind",
-        )?;
+        )? {
+            return Ok((outcome, op.next_pc));
+        }
     } else if let Some(cached) = loopinvariant_lookup(ctx, ei, descr_key, funcptr) {
         // pyjitpl.py:2087-2110 EF_LOOPINVARIANT short-circuit. The
         // cached path emits no IR op and no guard, so result-before-
@@ -8121,21 +8184,17 @@ fn dispatch_residual_call_iRd_kind(
         // upstream's `executor.execute_varargs(opnum, ...)`.
         ctx.trace_ctx
             .heapcache_invalidate_caches_varargs(call_opcode, Some(ei), &allboxes);
-        // pyjitpl.py:1950 _opimpl_residual_call*: the result lands in
-        // `registers_*[reg_index]` BEFORE
-        // `handle_possible_exception()` runs.  Write the dst here so
-        // the guard's fail_args snapshot reads the recorded OpRef in
-        // the slot the resume position points at — otherwise raising
-        // calls would surface NONE in fail_args for the `>X` slot.
-        //
-        // Skip on `resid_raised`: `recorded` carries no concrete
-        // result (helper raised before producing one); writing it to
-        // dst would propagate a stale-stamped OpRef into downstream
-        // walker chain (`pyjitpl.py:1392` only stamps `result_box.value`
-        // on the success path of `execute_varargs`).
-        if !resid_raised {
-            write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, recorded)?;
-        }
+        // pyjitpl.py:1950-1954 execute_varargs: `make_result_of_lastop(op)`
+        // runs BEFORE `handle_possible_exception()` precisely "because we need
+        // the box to show up in get_list_of_active_boxes()".  Write the dst
+        // for every non-void result REGARDLESS of whether the helper raised,
+        // so the GUARD_NOT_FORCED fail_args snapshot reads the recorded OpRef
+        // in the slot the resume position points at — otherwise a raising call
+        // surfaces NONE in fail_args for the `>X` slot.  On a raised call the
+        // OpRef carries a Null concrete shadow (never read on the exception
+        // path); only the *caching* of a raised result is skipped below,
+        // matching upstream's `not last_exc_value` pure-cache gate.
+        write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, recorded)?;
         // pyjitpl.py:2079 `metainterp.generate_guard(rop.GUARD_NOT_FORCED)`
         // — unconditionally on the forces-virtual-or-virtualizable branch.
         // Walker omits the `vable_after_residual_call(funcbox)`
@@ -9926,16 +9985,19 @@ fn dispatch_residual_call_iIRd_kind(
     // pyjitpl.py:2063 forces-branch sub-case: route release-gil through
     // `direct_call_release_gil`.  Mirrors `dispatch_residual_call_iRd_kind`.
     if ei.is_call_release_gil() {
-        direct_call_release_gil(
+        if let Some(outcome) = direct_call_release_gil(
             ctx,
             ei,
             &allboxes,
             descr.clone(),
+            call_descr,
             dst_bank,
             dst,
             op.pc,
             "dispatch_residual_call_iIRd_kind",
-        )?;
+        )? {
+            return Ok((outcome, op.next_pc));
+        }
     } else if let Some(cached) = loopinvariant_lookup(ctx, ei, descr_key, funcptr) {
         // pyjitpl.py:2087-2110 EF_LOOPINVARIANT short-circuit; no IR
         // op, no guard, ordering moot.
@@ -10006,9 +10068,7 @@ fn dispatch_residual_call_iIRd_kind(
         // pyjitpl.py:1950 _opimpl_residual_call*: result writeback runs
         // BEFORE handle_possible_exception().  See
         // `dispatch_residual_call_iRd_kind` for the full citation.
-        if !resid_raised {
-            write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, recorded)?;
-        }
+        write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, recorded)?;
         if emit_guard_not_forced {
             ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
             walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
@@ -10112,16 +10172,19 @@ fn dispatch_residual_call_iIRFd_kind(
     do_jit_force_virtual_guard(ei, op.pc)?;
 
     if ei.is_call_release_gil() {
-        direct_call_release_gil(
+        if let Some(outcome) = direct_call_release_gil(
             ctx,
             ei,
             &allboxes,
             descr.clone(),
+            call_descr,
             dst_bank,
             dst,
             op.pc,
             "dispatch_residual_call_iIRFd_kind",
-        )?;
+        )? {
+            return Ok((outcome, op.next_pc));
+        }
     } else if let Some(cached) = loopinvariant_lookup(ctx, ei, descr_key, funcptr) {
         write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, cached)?;
     } else {
@@ -10194,9 +10257,7 @@ fn dispatch_residual_call_iIRFd_kind(
 
         ctx.trace_ctx
             .heapcache_invalidate_caches_varargs(call_opcode, Some(ei), &allboxes);
-        if !resid_raised {
-            write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, recorded)?;
-        }
+        write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, recorded)?;
         if emit_guard_not_forced {
             ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
             walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
@@ -16885,7 +16946,7 @@ mod tests {
         );
     }
 
-    // task #51b: when the walk is the authoritative concrete leg,
+    // When the walk is the authoritative concrete leg,
     // `try_execute_residual_call_via_executor` runs a `CallMayForce*`
     // residual call concretely (RPython runs every residual_call during
     // tracing) and stamps the recorded result OpRef so a downstream
@@ -17011,7 +17072,7 @@ mod tests {
         );
     }
 
-    // task #51c: a may-force call that RAISES (publishes on
+    // A may-force call that RAISES (publishes on
     // BH_LAST_EXC_VALUE) is transcribed onto WalkContext.last_exc_value
     // (+ last_exc_value_concrete) and BH_LAST_EXC_VALUE is restored so the
     // eval-loop walker-skip path can detect the pending exception; the

@@ -1126,7 +1126,7 @@ pub(crate) type SubDescrPool = (
 /// needs when inlined by full-body-walk call inlining: its OWN adapted
 /// `descr_refs` + raw `RuntimeBhDescr` slice (for `RawDescrPool::PerFn`) +
 /// `sub_jitcode_lookup`.  Mirror of the top-level diagnostic walk's per-fn
-/// descr-pool construction (`trace.rs:363-400`, task #50): a callee body's
+/// descr-pool construction (`trace.rs:363-400`): a callee body's
 /// `d`/`j` descr operands index its OWN `exec.descrs`, not the caller's pool.
 ///
 /// The pool lives on `PyJitCodePayload.sub_descr_pool`, not in a side table

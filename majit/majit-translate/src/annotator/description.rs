@@ -614,7 +614,21 @@ impl FuncDescEntry {
     }
 
     /// Wrap a `MemoDesc`.
+    ///
+    /// Upstream `MemoDesc(FunctionDesc)` (description.py:395) is one
+    /// object with one identity. The Rust port decomposes it into this
+    /// wrapper plus a *private* inner base `FunctionDesc` (minted only
+    /// inside `newfuncdesc` and never registered on its own), so the two
+    /// would otherwise carry two identities: `desc_key()` reports the
+    /// MemoDesc (`from_rc`), while `rowkey()` / `getcallfamily()` read
+    /// the inner base's `Desc.identity`. Slave the inner base's identity
+    /// to the MemoDesc here so both coincide — then the PBC set, the
+    /// methoddesc cache key, the call family and the call table all key
+    /// on a single identity, matching upstream where the MemoDesc *is*
+    /// the FunctionDesc (`rowkey()` returns `self`, description.py:365).
     pub fn memo(rc: Rc<RefCell<MemoDesc>>) -> Self {
+        let base = rc.borrow().base.clone();
+        base.borrow_mut().base.identity = DescKey::from_rc(&rc);
         FuncDescEntry {
             inner: FuncDescInner::Memo(rc),
         }
@@ -741,13 +755,11 @@ impl DescEntry {
         name: &str,
     ) -> DescEntry {
         match self {
-            // MemoDesc inherits `FunctionDesc.bind_under`; `func()` binds
-            // the wrapped FunctionDesc (the resulting MethodDesc carries
-            // the base funcdesc — a memo bound method is not a path pyre
-            // exercises).
-            DescEntry::Func(fe) => {
-                DescEntry::Method(FunctionDesc::bind_under(&fe.func(), classdef, name))
-            }
+            // MemoDesc inherits `FunctionDesc.bind_under`; passing the
+            // whole `FuncDescEntry` keeps a memo's exact identity in the
+            // resulting `MethodDesc.funcdesc` (upstream the bound `self`
+            // is the MemoDesc, which is-a FunctionDesc).
+            DescEntry::Func(fe) => DescEntry::Method(FunctionDesc::bind_under(fe, classdef, name)),
             DescEntry::Method(md) => DescEntry::Method(md.borrow().bind_under(classdef, name)),
             // upstream: `Desc.bind_under` default = `return self`.
             DescEntry::Frozen(_) | DescEntry::MethodOfFrozen(_) | DescEntry::Class(_) => {
@@ -911,18 +923,17 @@ impl DescEntry {
     /// `build_calltable_row` (description.py:66-67).
     pub fn rowkey(&self) -> Result<DescKey, AnnotatorError> {
         match self {
-            // Upstream `FunctionDesc.rowkey()` returns `self`
-            // (description.py:365), and a MemoDesc *is* a FunctionDesc, so
-            // there rowkey(memo) == id(memo) == the membership key
-            // (`desc_key`). Here a MemoDesc carries no Desc identity of its
-            // own — only its wrapped base — so for a memo this rowkey is
-            // the base's identity while `desc_key` (PBC membership) is the
-            // wrapper's; the two coincide upstream but split here. The
-            // split is unobservable: a memo call is replaced with a value
-            // or a dispatch graph at annotation time and never enters a
-            // calltable, so this arm is not reached for a memo. Matching
-            // upstream (rowkey == the wrapper) would require MemoDesc to
-            // embed its own Desc identity.
+            // rowkey is a FunctionDesc-level key by design: upstream
+            // "call families and call tables ... always contain
+            // FunctionDescs, not MethodDescs" (description.py:467-469), so
+            // MethodDesc / MethodOfFrozenDesc rowkey() return their
+            // funcdesc (description.py:467,636). For a plain function
+            // rowkey is the FunctionDesc itself; for a memo it is the
+            // MemoDesc (it *is* a FunctionDesc and inherits `rowkey()`
+            // returns `self`, description.py:365). `func()` reads the
+            // inner base, whose `identity` is slaved to the MemoDesc in
+            // `FuncDescEntry::memo`, so this returns the MemoDesc identity
+            // for a memo — the same identity `desc_key()` reports.
             DescEntry::Func(fe) => Ok(FunctionDesc::rowkey(&fe.func())),
             DescEntry::Method(rc) => Ok(rc.borrow().rowkey()),
             DescEntry::MethodOfFrozen(rc) => Ok(rc.borrow().rowkey()),
@@ -1136,7 +1147,7 @@ impl FunctionDesc {
         match desc {
             DescEntry::Func(fe) => fe.func().borrow().name.clone(),
             DescEntry::Method(rc) => rc.borrow().name.clone(),
-            DescEntry::MethodOfFrozen(rc) => rc.borrow().funcdesc.borrow().name.clone(),
+            DescEntry::MethodOfFrozen(rc) => rc.borrow().funcdesc.func().borrow().name.clone(),
             DescEntry::Class(rc) => rc.borrow().name.clone(),
             DescEntry::Frozen(rc) => rc
                 .borrow()
@@ -2309,14 +2320,16 @@ impl FunctionDesc {
     ///                                          name)
     /// ```
     pub fn bind_under(
-        self_rc: &Rc<RefCell<FunctionDesc>>,
+        funcdesc: &FuncDescEntry,
         originclassdef: &Rc<RefCell<super::classdesc::ClassDef>>,
         name: &str,
     ) -> Rc<RefCell<MethodDesc>> {
-        let bk = self_rc.borrow().base.bookkeeper.clone();
-        // upstream defaults: `selfclassdef=None`, `flags={}`.
+        let bk = funcdesc.func().borrow().base.bookkeeper.clone();
+        // upstream defaults: `selfclassdef=None`, `flags={}`. Passing the
+        // `FuncDescEntry` keeps a memo's exact identity in the resulting
+        // `MethodDesc.funcdesc` (upstream `self` is the MemoDesc itself).
         bk.getmethoddesc(
-            self_rc,
+            funcdesc,
             ClassDefKey::from_classdef(originclassdef),
             None,
             name,
@@ -2513,7 +2526,13 @@ impl ClassDefKey {
 pub struct MethodDesc {
     pub base: Desc,
     /// RPython `self.funcdesc` (description.py:413).
-    pub funcdesc: Rc<RefCell<FunctionDesc>>,
+    ///
+    /// Held as a [`FuncDescEntry`] so a memo method preserves the exact
+    /// `MemoDesc` identity (upstream `MethodDesc.funcdesc` *is* the
+    /// `MemoDesc`, which is-a `FunctionDesc`). Unwrapping to the base
+    /// `FunctionDesc` here would split the memo's identity from the one
+    /// the PBC set / call table carry.
+    pub funcdesc: FuncDescEntry,
     /// RPython `self.originclassdef` (description.py:414).
     pub originclassdef: ClassDefKey,
     /// RPython `self.selfclassdef` (description.py:415). `None` for
@@ -2533,7 +2552,7 @@ impl MethodDesc {
     /// (description.py:410-417).
     pub fn new(
         bookkeeper: Rc<Bookkeeper>,
-        funcdesc: Rc<RefCell<FunctionDesc>>,
+        funcdesc: FuncDescEntry,
         originclassdef: ClassDefKey,
         selfclassdef: Option<ClassDefKey>,
         name: impl Into<String>,
@@ -2551,7 +2570,7 @@ impl MethodDesc {
 
     /// RPython `MethodDesc.getuniquegraph()` (description.py:429-430).
     pub fn getuniquegraph(&self) -> Result<Rc<PyGraph>, AnnotatorError> {
-        self.funcdesc.borrow().getuniquegraph()
+        self.funcdesc.func().borrow().getuniquegraph()
     }
 
     /// RPython `MethodDesc.func_args(args)` (description.py:432-437).
@@ -2619,6 +2638,7 @@ impl MethodDesc {
     ) -> Result<SomeValue, AnnotatorError> {
         let func_args = self.func_args(args)?;
         self.funcdesc
+            .func()
             .borrow()
             .pycall(whence, &func_args, s_previous_result, op_key)
     }
@@ -2630,7 +2650,7 @@ impl MethodDesc {
         op_key: Option<PositionKey>,
     ) -> Result<Rc<PyGraph>, AnnotatorError> {
         let func_args = self.func_args(args)?;
-        self.funcdesc.borrow().get_graph(&func_args, op_key)
+        self.funcdesc.func().borrow().get_graph(&func_args, op_key)
     }
 
     /// RPython `MethodDesc.bind_under(classdef, name)` (description.py:447-449).
@@ -2673,8 +2693,13 @@ impl MethodDesc {
     /// "we are computing call families and call tables that always
     /// contain FunctionDescs, not MethodDescs. The present method
     /// returns the FunctionDesc to use as a key in that family."
+    ///
+    /// `funcdesc` is the whole `FuncDescEntry` (a memo keeps its MemoDesc
+    /// identity); `func().base.identity` is slaved to that wrapper in
+    /// `FuncDescEntry::memo`, so a bound memo method's rowkey is the
+    /// MemoDesc identity, exactly as upstream `return self.funcdesc`.
     pub fn rowkey(&self) -> DescKey {
-        self.funcdesc.borrow().base.identity
+        self.funcdesc.func().borrow().base.identity
     }
 
     /// RPython `MethodDesc.consider_call_site(descs, args, s_result, op)`
@@ -2711,7 +2736,7 @@ impl MethodDesc {
         // the partition keyed by funcdesc identity, matching both the
         // calltable rows (`build_calltable_row` keys by `desc.rowkey()`)
         // and the rtyper-side retrieval (`funcdesc.getcallfamily()`).
-        let head_funcdesc = descs[0].borrow().funcdesc.clone();
+        let head_funcdesc = descs[0].borrow().funcdesc.func();
         let family = head_funcdesc.borrow().base.getcallfamily()?;
         let mut shape = args.rawshape();
         shape.shape_cnt += 1;
@@ -2721,7 +2746,7 @@ impl MethodDesc {
         let other_funcdescs: Vec<Rc<RefCell<FunctionDesc>>> = descs
             .iter()
             .skip(1)
-            .map(|d| d.borrow().funcdesc.clone())
+            .map(|d| d.borrow().funcdesc.func())
             .collect();
         let borrowed: Vec<_> = other_funcdescs.iter().map(|d| d.borrow()).collect();
         let others: Vec<&Desc> = borrowed.iter().map(|d| &d.base).collect();
@@ -2781,7 +2806,7 @@ impl MethodDesc {
             }
             groups
                 .entry((
-                    DescKey::from_rc(&borrowed.funcdesc),
+                    borrowed.funcdesc.desc_key(),
                     borrowed.originclassdef,
                     borrowed.name.clone(),
                 ))
@@ -3076,7 +3101,10 @@ impl FrozenDesc {
 #[derive(Debug)]
 pub struct MethodOfFrozenDesc {
     pub base: Desc,
-    pub funcdesc: Rc<RefCell<FunctionDesc>>,
+    /// RPython `self.funcdesc` (description.py:606). Held as a
+    /// [`FuncDescEntry`] for the same memo-identity reason as
+    /// [`MethodDesc::funcdesc`].
+    pub funcdesc: FuncDescEntry,
     pub frozendesc: Rc<RefCell<FrozenDesc>>,
 }
 
@@ -3085,7 +3113,7 @@ impl MethodOfFrozenDesc {
     /// frozendesc)` (description.py:605-608).
     pub fn new(
         bookkeeper: Rc<Bookkeeper>,
-        funcdesc: Rc<RefCell<FunctionDesc>>,
+        funcdesc: FuncDescEntry,
         frozendesc: Rc<RefCell<FrozenDesc>>,
     ) -> Self {
         MethodOfFrozenDesc {
@@ -3135,6 +3163,7 @@ impl MethodOfFrozenDesc {
     ) -> Result<SomeValue, AnnotatorError> {
         let func_args = self.func_args(args)?;
         self.funcdesc
+            .func()
             .borrow()
             .pycall(whence, &func_args, s_previous_result, op_key)
     }
@@ -3146,12 +3175,12 @@ impl MethodOfFrozenDesc {
         op_key: Option<PositionKey>,
     ) -> Result<Rc<PyGraph>, AnnotatorError> {
         let func_args = self.func_args(args)?;
-        self.funcdesc.borrow().get_graph(&func_args, op_key)
+        self.funcdesc.func().borrow().get_graph(&func_args, op_key)
     }
 
     /// RPython `MethodOfFrozenDesc.rowkey()` (description.py:636-637).
     pub fn rowkey(&self) -> DescKey {
-        self.funcdesc.borrow().base.identity
+        self.funcdesc.func().borrow().base.identity
     }
 
     /// RPython `MethodOfFrozenDesc.consider_call_site(descs, args,
@@ -3173,7 +3202,7 @@ impl MethodOfFrozenDesc {
         // `rowkey()` (the funcdesc) rather than the methoddesc's own
         // identity — see `MethodDesc::consider_call_site` for the
         // rationale (description.py:467-471, :636-637).
-        let head_funcdesc = descs[0].borrow().funcdesc.clone();
+        let head_funcdesc = descs[0].borrow().funcdesc.func();
         let family = head_funcdesc.borrow().base.getcallfamily()?;
         let mut shape = args.rawshape();
         shape.shape_cnt += 1;
@@ -3187,7 +3216,7 @@ impl MethodOfFrozenDesc {
         let other_funcdescs: Vec<Rc<RefCell<FunctionDesc>>> = descs
             .iter()
             .skip(1)
-            .map(|d| d.borrow().funcdesc.clone())
+            .map(|d| d.borrow().funcdesc.func())
             .collect();
         let borrowed: Vec<_> = other_funcdescs.iter().map(|d| d.borrow()).collect();
         let others: Vec<&Desc> = borrowed.iter().map(|d| &d.base).collect();
@@ -4165,13 +4194,19 @@ mod tests {
         )))
     }
 
+    /// Wrap a plain `FunctionDesc` Rc as the [`FuncDescEntry`] that
+    /// `MethodDesc`/`MethodOfFrozenDesc`/`getmethoddesc` now take.
+    fn fde(fd: &Rc<RefCell<FunctionDesc>>) -> FuncDescEntry {
+        FuncDescEntry::plain(fd.clone())
+    }
+
     #[test]
     fn method_desc_new_carries_funcdesc_and_classes() {
         let bk = bk();
         let fd = wrap_fd(&bk, "m");
         let md = MethodDesc::new(
             bk,
-            fd.clone(),
+            fde(&fd),
             ClassDefKey::from_raw(1),
             Some(ClassDefKey::from_raw(2)),
             "m",
@@ -4180,7 +4215,35 @@ mod tests {
         assert_eq!(md.name, "m");
         assert_eq!(md.originclassdef, ClassDefKey::from_raw(1));
         assert_eq!(md.selfclassdef, Some(ClassDefKey::from_raw(2)));
-        assert!(Rc::ptr_eq(&md.funcdesc, &fd));
+        assert!(Rc::ptr_eq(&md.funcdesc.func(), &fd));
+    }
+
+    /// A bound memo method keeps the exact `MemoDesc` identity upstream's
+    /// `MethodDesc.funcdesc` carries (the MemoDesc *is* the bound `self`):
+    /// `funcdesc` stays a memo, and its `desc_key()` equals the one the
+    /// memo's own `DescEntry` reports — so the PBC set, the method-desc
+    /// cache key and the bound method all reference one identity.
+    #[test]
+    fn method_desc_preserves_memo_identity_of_funcdesc() {
+        let bk = bk();
+        let fd = wrap_fd(&bk, "m");
+        let memo_entry = FuncDescEntry::memo(Rc::new(RefCell::new(MemoDesc::new(fd))));
+        let md = MethodDesc::new(
+            bk,
+            memo_entry.clone(),
+            ClassDefKey::from_raw(1),
+            Some(ClassDefKey::from_raw(2)),
+            "m",
+            std::collections::BTreeMap::new(),
+        );
+        // point 2: `funcdesc` is the MemoDesc, not its unwrapped base.
+        assert!(md.funcdesc.is_memo());
+        // point 1: one identity shared with the memo's own DescEntry.
+        assert_eq!(md.funcdesc.desc_key(), memo_entry.desc_key());
+        assert_eq!(
+            DescEntry::Func(md.funcdesc.clone()).desc_key(),
+            DescEntry::Func(memo_entry).desc_key()
+        );
     }
 
     #[test]
@@ -4189,7 +4252,7 @@ mod tests {
         let fd = wrap_fd(&bk, "m");
         let md = MethodDesc::new(
             bk,
-            fd.clone(),
+            fde(&fd),
             ClassDefKey::from_raw(1),
             None,
             "m",
@@ -4198,13 +4261,41 @@ mod tests {
         assert_eq!(md.rowkey(), FunctionDesc::rowkey(&fd));
     }
 
+    /// Upstream a `MemoDesc` *is* a `FunctionDesc`: `rowkey()` returns
+    /// `self` (description.py:365) and `getcallfamily()` keys on it. The
+    /// Rust wrapper slaves the inner base's `identity` to the MemoDesc
+    /// (`FuncDescEntry::memo`), so the rowkey / call-family key
+    /// (`base.identity`) coincides with the wrapper identity
+    /// (`desc_key()`) — one identity, as upstream.
+    #[test]
+    fn memo_funcdesc_rowkey_and_callfamily_key_on_the_wrapper() {
+        let bk = bk();
+        let fd = wrap_fd(&bk, "m");
+        let memo = FuncDescEntry::memo(Rc::new(RefCell::new(MemoDesc::new(fd))));
+        // rowkey() (FunctionDesc::rowkey reads base.identity) == wrapper.
+        assert_eq!(FunctionDesc::rowkey(&memo.func()), memo.desc_key());
+        // getcallfamily()/querycallfamily() key on base.identity, now the
+        // wrapper identity — so the family is reachable by the MemoDesc.
+        assert_eq!(memo.func().borrow().base.identity, memo.desc_key());
+        // A bound memo method's rowkey is the MemoDesc identity too.
+        let md = MethodDesc::new(
+            bk,
+            memo.clone(),
+            ClassDefKey::from_raw(1),
+            None,
+            "m",
+            std::collections::BTreeMap::new(),
+        );
+        assert_eq!(md.rowkey(), memo.desc_key());
+    }
+
     #[test]
     fn method_desc_func_args_errors_when_unbound() {
         let bk = bk();
         let fd = wrap_fd(&bk, "m");
         let md = MethodDesc::new(
             bk,
-            fd,
+            fde(&fd),
             ClassDefKey::from_raw(1),
             None,
             "m",
@@ -4223,7 +4314,7 @@ mod tests {
         let fd = wrap_fd(&bk, "m");
         let md = MethodDesc::new(
             bk,
-            fd,
+            fde(&fd),
             ClassDefKey::from_raw(1),
             Some(ClassDefKey::from_classdef(&classdef)),
             "m",
@@ -4250,14 +4341,14 @@ mod tests {
         child_flags.insert("fresh_malloc".into(), true);
 
         let base_md = bk.getmethoddesc(
-            &fd,
+            &fde(&fd),
             origin,
             Some(ClassDefKey::from_classdef(&base)),
             "m",
             base_flags.clone(),
         );
         let child_md = bk.getmethoddesc(
-            &fd,
+            &fde(&fd),
             origin,
             Some(ClassDefKey::from_classdef(&child)),
             "m",
@@ -4615,7 +4706,7 @@ mod tests {
         let frozen = Rc::new(RefCell::new(
             FrozenDesc::new(bk.clone(), HostObject::new_module("mod")).unwrap(),
         ));
-        let mfd = MethodOfFrozenDesc::new(bk, fd.clone(), frozen);
+        let mfd = MethodOfFrozenDesc::new(bk, fde(&fd), frozen);
         assert_eq!(mfd.rowkey(), FunctionDesc::rowkey(&fd));
     }
 
@@ -4626,7 +4717,7 @@ mod tests {
         let frozen = Rc::new(RefCell::new(
             FrozenDesc::new(bk.clone(), HostObject::new_module("mod")).unwrap(),
         ));
-        let mfd = MethodOfFrozenDesc::new(bk, fd, frozen);
+        let mfd = MethodOfFrozenDesc::new(bk, fde(&fd), frozen);
         let args = ArgumentsForTranslation::new(vec![], None, None);
         let out = mfd.func_args(&args).expect("method-of-frozen args");
         assert!(matches!(out.arguments_w[0], Some(SomeValue::PBC(_))));
@@ -4648,7 +4739,7 @@ mod tests {
             None,
         )));
         let md = bk.getmethoddesc(
-            &fd,
+            &fde(&fd),
             ClassDefKey::from_classdef(&classdef),
             Some(ClassDefKey::from_classdef(&classdef)),
             "m",
@@ -4688,14 +4779,14 @@ mod tests {
             None,
         )));
         let m_a = bk.getmethoddesc(
-            &fd,
+            &fde(&fd),
             ClassDefKey::from_classdef(&cd_a),
             Some(ClassDefKey::from_classdef(&cd_a)),
             "m",
             std::collections::BTreeMap::new(),
         );
         let m_b = bk.getmethoddesc(
-            &fd,
+            &fde(&fd),
             ClassDefKey::from_classdef(&cd_b),
             Some(ClassDefKey::from_classdef(&cd_b)),
             "m",

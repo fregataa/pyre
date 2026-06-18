@@ -401,7 +401,7 @@ impl Optimizer {
         // Producer-less leaf: mint the box up front and route any forwarded
         // write through it (the `Unknown` arm of
         // `apply_imported_virtual_state` is a no-op, but the position must
-        // still bind its canonical host at allocation — task #194: a bare
+        // still bind its canonical host at allocation — a bare
         // position resolves to `None`, so every later resolution would mint
         // a fresh position-only box, splitting `same_box`-keyed export-cache
         // keys and missing the `in_progress` cycle guard).
@@ -952,7 +952,7 @@ impl Optimizer {
             }
             VirtualStateInfo::VArray { descr, items, .. } => {
                 // unroll.py:454 Box carries its type. VArray heads are
-                // Ref-typed. Bound at allocation (task #194) — see the
+                // Ref-typed. Bound at allocation — see the
                 // Virtual arm above.
                 let (opref, head_box) = ctx.reserve_virtual_box(majit_ir::Type::Ref);
                 let imported_items = items
@@ -987,7 +987,7 @@ impl Optimizer {
                 field_descrs,
             } => {
                 // unroll.py:454 Box carries its type. VStruct heads are
-                // Ref-typed. Bound at allocation (task #194) — see the
+                // Ref-typed. Bound at allocation — see the
                 // Virtual arm above.
                 let (opref, head_box) = ctx.reserve_virtual_box(majit_ir::Type::Ref);
                 let imported_fields = fields
@@ -1025,7 +1025,7 @@ impl Optimizer {
                 element_fields,
             } => {
                 // unroll.py:454 Box carries its type. VArrayStruct heads
-                // are Ref-typed. Bound at allocation (task #194) — see the
+                // are Ref-typed. Bound at allocation — see the
                 // Virtual arm above.
                 let (opref, head_box) = ctx.reserve_virtual_box(majit_ir::Type::Ref);
                 let imported_elements = element_fields
@@ -2797,7 +2797,7 @@ impl Optimizer {
                 .iter()
                 .map(|&a| {
                     let resolved = ctx.get_replacement_opref(a);
-                    // bind-at-alloc (task #194): `export_state` below keys its
+                    // bind-at-alloc: `export_state` below keys its
                     // `ExportCache` by these resolved positions. A producer-less
                     // value-bearing position resolves to a throwaway `from_opref`
                     // box, so each `resolve_to_boxref` returns a distinct Rc
@@ -6573,7 +6573,7 @@ mod tests {
         assert_eq!(snap.opt_guards_shared, 1);
     }
 
-    /// bind-at-alloc totality (task #194): an `Unknown` virtual-state leaf
+    /// bind-at-alloc totality: an `Unknown` virtual-state leaf
     /// must bind its canonical `_forwarded` host at allocation. A bare
     /// position resolves to `None`, so every later resolution mints a fresh
     /// position-only box — splitting `same_box`-keyed export-cache keys and

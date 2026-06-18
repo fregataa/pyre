@@ -2478,7 +2478,7 @@ impl OptContext {
         // Callers whose position is *read* before any write (imported
         // virtual-state leaves and heads) must use `reserve_virtual_box`
         // instead — a bare position read mints a fresh position-only box per
-        // resolution (task #194 bind-at-alloc).
+        // resolution (bind-at-alloc).
         // PyPy/RPython has no Box for positions that no `ResOperation()` /
         // `InputArg()` call produced (`resoperation.py:233-248`).
         OpRef::op_typed(raw, tp)

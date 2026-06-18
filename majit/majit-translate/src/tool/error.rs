@@ -82,7 +82,7 @@ fn render_desc_repr(desc: &crate::annotator::description::DescEntry) -> String {
         }
         DescEntry::MethodOfFrozen(mfd) => {
             let mfd = mfd.borrow();
-            let funcdesc = crate::annotator::description::DescEntry::function(mfd.funcdesc.clone());
+            let funcdesc = crate::annotator::description::DescEntry::Func(mfd.funcdesc.clone());
             let frozendesc =
                 crate::annotator::description::DescEntry::Frozen(mfd.frozendesc.clone());
             format!(

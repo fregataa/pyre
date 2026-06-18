@@ -1699,7 +1699,7 @@ pub fn register_resumedata_deopt(f: fn(usize, &mut Vec<i64>, &[Type], usize) -> 
 /// Sibling of [`RESUMEDATA_DEOPT_FN`] but returns layout structure
 /// instead of replaying deopt — used by `recovery_layout_ref()` to
 /// produce `ExitRecoveryLayout` without depending on the meta-side
-/// `ResumeGuardDescr.recovery_layout` cache (Path 1 epic / task #70).
+/// `ResumeGuardDescr.recovery_layout` cache.
 ///
 /// Returns `None` for descrs without a `ResumeGuardDescr` meta_descr
 /// (synthetic FINISH / external-JUMP) or when the StoredExitLayout

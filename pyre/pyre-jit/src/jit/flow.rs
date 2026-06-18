@@ -20,21 +20,26 @@
 //! (`rpython/jit/codewriter/flatten.py:306-334` emits `%s_copy` /
 //! `%s_push` / `%s_pop` when the pairs are not already coalesced).
 //!
-//! pyre-jit currently substitutes:
-//! - An SSARepr-level `ref_copy` scanner (`pyre-jit/src/jit/regalloc.rs`
-//!   `coalesce_variables`) in place of RPython's link-level scanner.
-//! - No `insert_renamings` at all — pyre-jit's walker pre-breaks cycles
-//!   with explicit `obj_tmp*` registers.
+//! This module is the RPython-orthodox replacement surface, and it is now
+//! the production path. The walker populates a `FunctionGraph` (built by
+//! `new_shadow_graph_with_portal_inputs`, `codewriter.rs`) alongside its
+//! `SSARepr` emission, and the canonical pipeline is driven from that
+//! graph:
 //!
-//! This module is the RPython-orthodox replacement surface. The data
-//! types preserve the same core object shape (Variable, Constant, Link,
-//! Block, FunctionGraph, including the special return/except blocks and
-//! link exception extras); follow-up slices wire the walker to populate a
-//! `FunctionGraph` alongside its current SSARepr emission and eventually
-//! drive the regalloc + insert_renamings passes from the graph.
+//!   `collect_cfg_coalesce_pairs` (link.args ↔ target.inputargs)
+//!        → `perform_register_allocation_all_kinds_with_pairs`
+//!        → `enforce_input_args`
+//!        → `flatten_graph` (which runs `insert_renamings`, `flatten.rs`)
 //!
-//! Scope of THIS slice: data types only. No walker integration yet.
-//! Subsequent slices of Step 6 (see task #205) populate and consume.
+//! The flattened stream is spliced in as the sole source of
+//! `ssarepr.insns` (`codewriter.rs`). The link-level coalesce reads
+//! `link.args ↔ target.inputargs` from the graph directly (replacing the
+//! former SSARepr-level `ref_copy` scanner in `regalloc.rs`), and
+//! `insert_renamings` emits the `%s_copy` / `%s_push` / `%s_pop` moves
+//! (`rpython/jit/codewriter/flatten.py:306-334`) rather than the walker's
+//! old explicit `obj_tmp*` cycle pre-breaking. The data types preserve the
+//! same core object shape (Variable, Constant, Link, Block, FunctionGraph,
+//! including the special return/except blocks and link exception extras).
 
 use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::collections::HashMap;

@@ -1141,13 +1141,15 @@ mod stamp_classdef_hints_tests {
         // definition time, then `bookkeeper.py:384` getdesc binds it
         // to the receiver on every access. The producer must perform
         // the same bind via `getmethoddesc_for_attribute`.
-        let funcdesc = Rc::new(RefCell::new(FunctionDesc::new(
-            bk.clone(),
-            None,
-            "push_value",
-            Signature::new(vec!["self".into(), "v".into()], None, None),
-            None,
-            None,
+        let funcdesc = crate::annotator::description::FuncDescEntry::plain(Rc::new(RefCell::new(
+            FunctionDesc::new(
+                bk.clone(),
+                None,
+                "push_value",
+                Signature::new(vec!["self".into(), "v".into()], None, None),
+                None,
+                None,
+            ),
         )));
         let unbound = bk.getmethoddesc(
             &funcdesc,
@@ -1200,7 +1202,7 @@ mod stamp_classdef_hints_tests {
         // selfclassdef=receiver_classdef, name)`. The cache now
         // contains the *bound* entry (selfclassdef = Some(receiver_key)).
         let bound_key = MethodDescKey {
-            funcdesc_id: DescKey::from_rc(&funcdesc),
+            funcdesc_id: funcdesc.desc_key(),
             originclassdef: classdef_key,
             selfclassdef: Some(classdef_key),
             name: "push_value".into(),

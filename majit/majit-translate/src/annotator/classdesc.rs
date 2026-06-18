@@ -2073,9 +2073,10 @@ impl ClassDesc {
                 continue;
             };
             // upstream `isinstance(initfuncdesc, FunctionDesc)` — MemoDesc
-            // is-a FunctionDesc (description.py:395), so `as_function()`
-            // accepts a `@specialize.memo` __init__ as well.
-            let Some(initfuncdesc) = entry.as_function() else {
+            // is-a FunctionDesc (description.py:395). Keep the whole
+            // `FuncDescEntry` so a `@specialize.memo` __init__ retains its
+            // exact MemoDesc identity in the resulting MethodDesc.
+            let Some(initfuncdesc) = entry.as_func_entry().cloned() else {
                 continue;
             };
             let classdef_key = super::description::ClassDefKey::from_classdef(classdef);
@@ -2099,11 +2100,11 @@ impl ClassDesc {
             // initdesc's funcdesc whose `identity` is that rowkey.
             // MethodDesc::consider_call_site redoes this internally, but
             // upstream calls both explicitly.
-            let head_funcdesc = initdescs[0].borrow().funcdesc.clone();
+            let head_funcdesc = initdescs[0].borrow().funcdesc.func();
             let other_funcdescs: Vec<_> = initdescs
                 .iter()
                 .skip(1)
-                .map(|d| d.borrow().funcdesc.clone())
+                .map(|d| d.borrow().funcdesc.func())
                 .collect();
             let borrowed: Vec<_> = other_funcdescs.iter().map(|d| d.borrow()).collect();
             let others: Vec<&super::description::Desc> = borrowed.iter().map(|d| &d.base).collect();

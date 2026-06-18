@@ -2361,12 +2361,15 @@ impl DescrContainer for dyn Backend + '_ {
 ///
 /// # Wiring status
 ///
-/// The recursive `CALL_ASSEMBLER` path (`pyjitpl/mod.rs::handle_call_assembler`)
-/// already routes pending callees through this helper. Step 2 — wiring
-/// `warmstate::get_assembler_token` (`warmstate.py:714-723`) to mark the
-/// resulting cell with `tmp=true` — and Step 3 — dropping
-/// `register_pending_target` plus the cranelift/dynasm pending placeholder
-/// registries entirely — remain pending (Tasks #195/#211).
+/// The recursive `CALL_ASSEMBLER` path (`pyjitpl/mod.rs::direct_assembler_call`)
+/// routes pending callees through `warmstate::get_assembler_token`
+/// (`warmstate.py:714-723`), which installs the synthesised cell with
+/// `tmp=true` (`set_procedure_token(token, true)`). Step 3 — dropping
+/// `register_pending_target` plus the cranelift/dynasm number-keyed pending
+/// placeholder registries — remains pending (Task #211): both backends
+/// resolve the callee `_ll_function_addr` only via the `u64` token-number
+/// registry, so re-rooting address resolution on the descr-carried
+/// `Arc<JitCellToken>` is a separate multi-session descr-identity cutover.
 ///
 /// # Parameters
 ///

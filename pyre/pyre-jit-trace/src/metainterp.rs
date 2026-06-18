@@ -13,6 +13,58 @@ use super::state::{
     ConcreteValue, MIFrame, PendingInlineFrame, PyreSym, ResumeFrameState, wrapfloat, wrapint,
 };
 
+/// Whether the route-b convergence path is enabled.  When on, a
+/// loop-bearing inline callee that reaches its CALL_ASSEMBLER boundary
+/// runs its concrete continuation once at that boundary
+/// (do_residual_call assembler_call=True, pyjitpl.py:2007-2055) and binds
+/// the real concrete result, instead of leaving the result's concrete
+/// half Null and the callee's remaining iterations to a re-run.  Default
+/// OFF; `PYRE_ROUTE_B=1` opts in while the convergence path is validated
+/// against the loop-bearing-callee shared-mutation oracle
+/// (`pyre/bench/synth/_pending/loop_callee_shared_mutation.py`).
+///
+/// With only the boundary continuation wired, enabling the flag does not
+/// yet pass the oracle: it trips `consume_vable_info`
+/// (`get_total_size == vable_size - 1`, resume.rs:6582).  The
+/// CALL_ASSEMBLER GuardNotForced encodes
+/// `vable_size = num_static + physical_array_len`, where
+/// `physical_array_len` is a frame's FIXED `locals_cells_stack_w`
+/// allocation (varnames + ncells + max_stackdepth), not its live stack
+/// depth — so the snapshot virtualizable and the runtime-resume
+/// virtualizable resolve to frames with different fixed array lengths, a
+/// multi-frame vable-identity divergence (the #124-class resume problem).
+/// That is distinct from the loop's one-time over-commit (the +3
+/// over-count), which is the root frame never advancing during tracing
+/// (`step_root_frame` does not concrete-step, #14).  Both must be resolved
+/// together; tracing the inline frame on the live frame is the remaining
+/// convergence work.
+pub(crate) fn route_b_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("PYRE_ROUTE_B").as_deref() == Ok("1"))
+}
+
+/// route-b continuation primitive: resume a popped inline callee's
+/// concrete frame from its current `next_instr()` to completion under a
+/// `TraceContinuationSuspendGuard`, so the callee's own loop back-edge
+/// does not start a nested trace (`jit_merge_point_keyed` skips the
+/// trace-continuation block while the guard is held).  Returns the
+/// callee's concrete return value, or PY_NULL on raise (the trace aborts
+/// on the error path regardless).
+///
+/// The frame must already be advanced through any traced iterations (its
+/// `next_instr()` points past them); this runs ONLY the remaining
+/// iterations.  It must not be a fresh frame built from the callee entry
+/// — that would re-run the traced iterations (a double-run).
+pub(crate) fn run_inline_continuation(
+    cf: &mut pyre_interpreter::pyframe::PyFrame,
+) -> pyre_object::PyObjectRef {
+    let _suspend = majit_metainterp::TraceContinuationSuspendGuard::enter();
+    match pyre_interpreter::eval::eval_loop_for_force(cf) {
+        Ok(v) => v,
+        Err(_) => pyre_object::PY_NULL,
+    }
+}
+
 /// RPython MIFrame (pyjitpl.py:65) — per-frame tracing state.
 pub struct MetaInterpFrame {
     pub sym: *mut PyreSym,
@@ -782,7 +834,7 @@ impl PyreMetaInterp {
         }
 
         // pyjitpl.py:1581 finishframe(None, leave_portal_frame=False).
-        let popped = self.framestack.pop().unwrap();
+        let mut popped = self.framestack.pop().unwrap();
         self.portal_call_depth -= 1;
         ctx.pop_inline_trace_position();
         {
@@ -832,15 +884,28 @@ impl PyreMetaInterp {
                         green_key, target_pc, token_number, call_pc,
                     );
                 }
-                // make_result_of_lastop (pyjitpl.py:1586-1589). Concrete
-                // half stays Null — see the method doc.
+                // route-b: run the callee's concrete continuation once
+                // here (do_residual_call assembler_call=True,
+                // pyjitpl.py:2007-2055), even when the result is
+                // discarded, then bind its real concrete result.  Default
+                // path leaves the concrete half Null and re-runs the
+                // remaining iterations — see the method doc.
+                let concrete_result = if route_b_enabled() {
+                    match popped.owned_concrete_frame.as_mut() {
+                        Some(cf) => ConcreteValue::from_pyobj(run_inline_continuation(&mut **cf)),
+                        None => ConcreteValue::Null,
+                    }
+                } else {
+                    ConcreteValue::Null
+                };
+                // make_result_of_lastop (pyjitpl.py:1586-1589).
                 if let Some(result_idx) = popped.caller_result_stack_idx {
                     super::trace_opcode::write_stack_slot(
                         parent_sym,
                         ctx,
                         result_idx,
                         result,
-                        ConcreteValue::Null,
+                        concrete_result,
                     );
                 }
                 // ChangeFrame: resume dispatch on the parent.

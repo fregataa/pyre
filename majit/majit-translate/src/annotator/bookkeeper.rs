@@ -1134,9 +1134,18 @@ impl Bookkeeper {
             let func = pyobj.bound_method_func().ok_or_else(|| {
                 AnnotatorError::new("Bookkeeper.getdesc(bound method): missing __func__")
             })?;
-            let funcdesc = self.getdesc(func)?.as_function().ok_or_else(|| {
-                AnnotatorError::new("Bookkeeper.getdesc(bound method): __func__ is not a function")
-            })?;
+            // Keep the whole `FuncDescEntry` (not `as_function()`, which
+            // unwraps a memo to its base) so a bound memo method's
+            // `MethodDesc.funcdesc` retains the exact MemoDesc identity.
+            let funcdesc = self
+                .getdesc(func)?
+                .as_func_entry()
+                .cloned()
+                .ok_or_else(|| {
+                    AnnotatorError::new(
+                        "Bookkeeper.getdesc(bound method): __func__ is not a function",
+                    )
+                })?;
 
             if self_obj.is_instance() {
                 call_cleanup_method(self_obj)?;
@@ -1281,7 +1290,7 @@ impl Bookkeeper {
     /// keyed on identity for the descriptor / classdef entries.
     pub fn getmethoddesc(
         self: &Rc<Self>,
-        funcdesc: &Rc<RefCell<FunctionDesc>>,
+        funcdesc: &super::description::FuncDescEntry,
         originclassdef: ClassDefKey,
         selfclassdef: Option<ClassDefKey>,
         name: &str,
@@ -1289,7 +1298,11 @@ impl Bookkeeper {
     ) -> Rc<RefCell<MethodDesc>> {
         let flags_vec: Vec<(String, bool)> = flags.iter().map(|(k, v)| (k.clone(), *v)).collect();
         let key = MethodDescKey {
-            funcdesc_id: DescKey::from_rc(funcdesc),
+            // `FuncDescEntry::desc_key()` is the memo wrapper's identity
+            // for a memo (the base FunctionDesc's for a plain function),
+            // so a memo method keys to the same identity the PBC set
+            // carries.
+            funcdesc_id: funcdesc.desc_key(),
             originclassdef,
             selfclassdef,
             name: name.to_string(),
@@ -3699,7 +3712,7 @@ mod tests {
 
     #[test]
     fn getuniqueclassdef_for_struct_root_terminates_on_cyclic_graph() {
-        // Localizes the route-b stack overflow (task #100): the seed fired
+        // Localizes the route-b stack overflow: the seed fired
         // for `FixedObjectArray` (fields `len: usize`, `_items:
         // [PyObjectRef; 0]`) and the build aborted with a stack overflow.
         // Reproduce the real shape — an array struct referencing the
@@ -3756,7 +3769,7 @@ mod tests {
 
     #[test]
     fn getuniqueclassdef_for_struct_root_handles_deep_plus_cyclic_chain() {
-        // Deep-chain regression gate for the iterative worklist (task #100).
+        // Deep-chain regression gate for the iterative worklist.
         // The 2026-05-29 route-b measurement overflowed the native stack in
         // the RECURSIVE transitive walk of `FixedObjectArray`.  The walk now
         // drives an explicit `Vec` worklist (no native recursion over the
@@ -4751,7 +4764,7 @@ mod tests {
         let bk = bk();
         let gf = GraphFunc::new("m", Constant::new(ConstValue::Dict(Default::default())));
         let host = HostObject::new_user_function(gf);
-        let fd = bk.getdesc(&host).unwrap().as_function().unwrap();
+        let fd = bk.getdesc(&host).unwrap().as_func_entry().cloned().unwrap();
         let origin = crate::annotator::description::ClassDefKey::from_raw(1);
         let self_def = Some(crate::annotator::description::ClassDefKey::from_raw(2));
         let flags = std::collections::BTreeMap::new();
@@ -4782,7 +4795,7 @@ mod tests {
         // Mint a MethodDesc via getmethoddesc and seed the attrs.
         let gf = GraphFunc::new("push", Constant::new(ConstValue::Dict(Default::default())));
         let host = HostObject::new_user_function(gf);
-        let fd = bk.getdesc(&host).unwrap().as_function().unwrap();
+        let fd = bk.getdesc(&host).unwrap().as_func_entry().cloned().unwrap();
         let md = bk.getmethoddesc(
             &fd,
             classdef_key,
@@ -4847,7 +4860,7 @@ mod tests {
         // (selfclassdef = None) so the walker has to perform the bind.
         let gf = GraphFunc::new("m", Constant::new(ConstValue::Dict(Default::default())));
         let host = HostObject::new_user_function(gf);
-        let fd = bk.getdesc(&host).unwrap().as_function().unwrap();
+        let fd = bk.getdesc(&host).unwrap().as_func_entry().cloned().unwrap();
         let unbound = bk.getmethoddesc(&fd, base_key, None, "m", std::collections::BTreeMap::new());
         assert_eq!(unbound.borrow().selfclassdef, None);
         let pbc = SomePBC::new([DescEntry::Method(unbound.clone())], false);
@@ -4903,7 +4916,7 @@ mod tests {
         // attribute carrying a pre-bound bound-method object.
         let gf = GraphFunc::new("m", Constant::new(ConstValue::Dict(Default::default())));
         let host = HostObject::new_user_function(gf);
-        let fd = bk.getdesc(&host).unwrap().as_function().unwrap();
+        let fd = bk.getdesc(&host).unwrap().as_func_entry().cloned().unwrap();
         let already_bound = bk.getmethoddesc(
             &fd,
             base_key,
@@ -4970,7 +4983,7 @@ mod tests {
         // override under a base-class attribute name.
         let gf = GraphFunc::new("m", Constant::new(ConstValue::Dict(Default::default())));
         let host = HostObject::new_user_function(gf);
-        let fd = bk.getdesc(&host).unwrap().as_function().unwrap();
+        let fd = bk.getdesc(&host).unwrap().as_func_entry().cloned().unwrap();
         let subclass_origin = bk.getmethoddesc(
             &fd,
             derived_key,
@@ -5030,10 +5043,20 @@ mod tests {
         // Two FunctionDescs so the MDs have distinct cache keys.
         let gf1 = GraphFunc::new("m", Constant::new(ConstValue::Dict(Default::default())));
         let host1 = HostObject::new_user_function(gf1);
-        let fd1 = bk.getdesc(&host1).unwrap().as_function().unwrap();
+        let fd1 = bk
+            .getdesc(&host1)
+            .unwrap()
+            .as_func_entry()
+            .cloned()
+            .unwrap();
         let gf2 = GraphFunc::new("m2", Constant::new(ConstValue::Dict(Default::default())));
         let host2 = HostObject::new_user_function(gf2);
-        let fd2 = bk.getdesc(&host2).unwrap().as_function().unwrap();
+        let fd2 = bk
+            .getdesc(&host2)
+            .unwrap()
+            .as_func_entry()
+            .cloned()
+            .unwrap();
 
         // MD1: already-bound to Base (selfclassdef = Some(base_key)).
         let already_bound = bk.getmethoddesc(
