@@ -174,15 +174,14 @@ impl StrPtrInfoExt for StrPtrInfo {
     /// always emits STRLEN and attaches lenbound as metadata; it never
     /// extracts a constant from lenbound directly.
     fn getstrlen(&self, ctx: &crate::optimizeopt::OptContext, mode: u8) -> Option<i64> {
-        // vstring.py:112: if self.lgtop is not None: return self.lgtop
+        // vstring.py:112: if self.lgtop is not None: return self.lgtop — the
+        // length BOX. Callers fold only when it `isinstance(ConstInt)`, so a
+        // length variable whose IntBound merely happens to be constant is NOT
+        // a known constant length: read only an actual ConstInt, not the bound.
         if let Some(lgtop) = self.lgtop.as_ref() {
-            return ctx.resolve_box_box_opt(lgtop).and_then(|b| {
-                ctx.get_constant_int_box(&b).or_else(|| {
-                    ctx.peek_intbound_box(&b)
-                        .filter(|ib| ib.is_constant())
-                        .map(|ib| ib.get_constant_int())
-                })
-            });
+            return ctx
+                .resolve_box_box_opt(lgtop)
+                .and_then(|b| ctx.get_constant_int_box(&b));
         }
         match &self.variant {
             // vstring.py:110-119: base StrPtrInfo.getstrlen always emits
@@ -191,10 +190,11 @@ impl StrPtrInfoExt for StrPtrInfo {
             VStringVariant::Ptr => None,
             // vstring.py:171-175: VStringPlainInfo.getstrlen
             VStringVariant::Plain(info) => Some(info._chars.len() as i64),
-            // vstring.py:251-253: VStringSliceInfo.getstrlen → self.lgtop
+            // vstring.py:251-253: VStringSliceInfo.getstrlen → self.lgtop;
+            // constant only when it is an actual ConstInt (isinstance check).
             VStringVariant::Slice(info) => {
                 let b = ctx.resolve_box_box_opt(&info.lgtop)?;
-                ctx.get_constant_int_or_bound_box(&b)
+                ctx.get_constant_int_box(&b)
             }
             // vstring.py:281-295: VStringConcatInfo.getstrlen
             VStringVariant::Concat(info) => {
@@ -284,8 +284,12 @@ impl StrPtrInfoExt for StrPtrInfo {
                 .and_then(|o| o.as_ref())
                 .map(|b| b.to_opref()),
             VStringVariant::Slice(info) => {
-                // vstring.py:491: index = _int_add(sinfo.start, index)
-                // Accept intbound-constant starts, not just literal constants.
+                // vstring.py:490-497: index = _int_add(sinfo.start, index), then
+                // the fold proceeds on `getintbound(index).is_constant()` — the
+                // IntBound of the COMPUTED index, not `isinstance(index, ConstInt)`.
+                // So a start whose IntBound is constant (even if the box is not a
+                // literal ConstInt) still yields a constant index and folds. Read
+                // the start via the intbound-aware accessor, not ConstInt-only.
                 let start_box = ctx.resolve_box_box_opt(&info.start)?;
                 let start = ctx.get_constant_int_or_bound_box(&start_box)?;
                 let s_box = ctx.resolve_box_box_opt(&info.s);
@@ -1083,9 +1087,16 @@ fn force_box_impl(
             alloc_ref
         }
         PtrInfo::VirtualArray(vinfo) => {
-            // info.py:540-558 ArrayPtrInfo._force_elements
-            // RPython `op.set_forwarded(self)` (post-force) is
-            // unconditional; the bound `box_` carries the PtrInfo write.
+            // info.py:152: AbstractVirtualPtrInfo.force_box does
+            // `newop.set_forwarded(self); self._is_virtual = False` — it keeps
+            // the SAME ArrayPtrInfo, now non-virtual, so getarrayinfo still
+            // recovers the array identity after forcing.
+            // PRE-EXISTING DIVERGENCE: pyre installs `nonnull()` instead,
+            // dropping the array identity (a later GETARRAYITEM residualizes
+            // rather than reading a tracked item). Convergence needs an
+            // `is_virtual` flag on `VirtualArrayInfo` plus an `is_virtual()`
+            // gate at the `matches!(PtrInfo::VirtualArray(_))` sites in
+            // virtualize.rs (same shape as the RawBuffer size=-1 sentinel).
             let len = vinfo.items.len();
             ctx.set_ptr_info(&box_, PtrInfo::nonnull());
 
@@ -1146,8 +1157,10 @@ fn force_box_impl(
             // virtualize.py:31: assert clear — ArrayStruct is always
             // created with clear=True, so the original op is always
             // NEW_ARRAY_CLEAR.
-            // RPython `op.set_forwarded(self)` (post-force) is
-            // unconditional; the bound `box_` carries the PtrInfo write.
+            // info.py:152 force_box keeps the SAME info (`set_forwarded(self);
+            // _is_virtual = False`). PRE-EXISTING DIVERGENCE: pyre installs
+            // `nonnull()`, dropping the array-struct identity — same convergence
+            // path as VirtualArray (an `is_virtual` flag + gated match sites).
             let num_elements = vinfo.element_fields.len();
             ctx.set_ptr_info(&box_, PtrInfo::nonnull());
 

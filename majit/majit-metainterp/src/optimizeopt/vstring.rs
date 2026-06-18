@@ -39,6 +39,15 @@ pub fn get_const_ptr_for_unicode(chars: &[i64], ctx: &OptContext) -> Option<maji
 ///
 /// Constant-folding INT_ADD: folds add-0 and const+const at the optimizer
 /// level. Non-constant adds emit an INT_ADD operation.
+///
+/// PRE-EXISTING DIVERGENCE: vstring.py:380 routes the new op through
+/// `optstring.optimizer.send_extra_operation(op)`, which re-dispatches from
+/// `first_optimization` (optimizer.py:594, default `opt=None`) — so OptIntBounds
+/// (a pass BEFORE OptString) computes the result bound. `emit_for_force` routes
+/// from the pass AFTER the current one (emit_extra(current_pass_idx)), skipping
+/// the earlier passes. Strict parity needs an inline full-chain re-dispatch hook
+/// on OptContext; `Optimizer::send_extra_operation` exists but is unreachable
+/// from inside a pass, which only holds `&mut OptContext`.
 pub fn _int_add(box1: &BoxRef, box2: &BoxRef, ctx: &mut OptContext) -> BoxRef {
     if let Some(v1) = ctx.resolve_box_box_opt(box1).and_then(|cb| cb.const_int()) {
         if v1 == 0 {
@@ -728,6 +737,12 @@ impl OptString {
         if let Some((target, index_box)) =
             self.strgetitem_rebase_residual(&str_ref, &op.arg(1), mode, ctx)
         {
+            // PRE-EXISTING DIVERGENCE: vstring.py:404 `_strgetitem` only builds
+            // the STRGETITEM and hands it to emit_extra; the operand is forced
+            // later at final emission (optimizer.py:650 force_box on args). pyre
+            // has no emit-time operand forcing for general ops, so the target is
+            // materialized here, ahead of upstream's timing. Convergence needs
+            // force_box to run over an emitted op's args at emission time.
             self.force_if_virtual(&target, ctx);
             let arg_s = ctx.resolve_box_box(&target);
             let arg_i = ctx.resolve_box_box(&index_box);
@@ -952,9 +967,12 @@ impl OptString {
     }
 
     /// vstring.py:383-391 _int_sub — constant-fold if both args are constant,
-    /// otherwise send INT_SUB through the optimizer so downstream passes
-    /// (int bounds, CSE) see it, matching `send_extra_operation` and the
-    /// sibling `_int_add`.
+    /// otherwise emit INT_SUB so downstream passes (int bounds, CSE) see it.
+    ///
+    /// PRE-EXISTING DIVERGENCE: vstring.py:389 uses
+    /// `optstring.optimizer.send_extra_operation(op)` (re-dispatch from
+    /// first_optimization); `emit_for_force` only routes from the next pass.
+    /// Same convergence note as the sibling `_int_add`.
     fn int_sub(&self, a: &BoxRef, b: &BoxRef, ctx: &mut OptContext) -> BoxRef {
         if let Some(vb) = ctx.resolve_box_box_opt(b).and_then(|cb| cb.const_int()) {
             if vb == 0 {

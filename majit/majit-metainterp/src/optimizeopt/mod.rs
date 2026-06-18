@@ -5953,6 +5953,19 @@ impl OptContext {
                 }
             }
         }
+        // optimizer.py:361-362: if op.type == 'i' and info.is_constant():
+        //     return ConstInt(info.get_constant_int())
+        // Mirrors Optimizer::force_box — a forced operand with an already-constant
+        // IntBound materializes as ConstInt; peek the bound without installing.
+        if let Some(rb) = self.get_box_replacement_box(resolved) {
+            if rb.const_value().is_none() && rb.type_() == Type::Int {
+                if let Some(bound) = self.peek_intbound_box(&rb) {
+                    if bound.is_constant() {
+                        return self.make_constant_int(bound.get_constant_int());
+                    }
+                }
+            }
+        }
         let resolved_box = self.get_box_replacement_box(opref);
         if let Some(mut info) = resolved_box.as_ref().and_then(|b| self.peek_ptr_info(b)) {
             if info.is_virtual() {

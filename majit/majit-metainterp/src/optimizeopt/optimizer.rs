@@ -1511,6 +1511,20 @@ impl Optimizer {
                 }
             }
         }
+        // optimizer.py:361-362: if op.type == 'i' and info.is_constant():
+        //     return ConstInt(info.get_constant_int())
+        // A forced operand whose IntBound is already constant materializes as a
+        // ConstInt before the virtual-force branch. Read the bound without
+        // installing one (peek), so a plain int box keeps flowing unchanged.
+        if let Some(rb) = ctx.get_box_replacement_box(resolved) {
+            if rb.const_value().is_none() && rb.type_() == majit_ir::Type::Int {
+                if let Some(bound) = ctx.peek_intbound_box(&rb) {
+                    if bound.is_constant() {
+                        return ctx.make_constant_int(bound.get_constant_int());
+                    }
+                }
+            }
+        }
         let resolved_box = ctx.get_box_replacement_box(opref);
         if resolved_box.as_ref().map_or(false, |b| ctx.is_virtual(b)) {
             // Virtualizable represents an existing heap object with tracked
