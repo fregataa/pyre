@@ -418,76 +418,57 @@ pub fn assign_inheritance_ids(annotator: &RPythonAnnotator) {
 
     // Resolve the whole inheritance ordering at once: every classdef
     // contributes a `(minid, maxid)` marker pair, all markers sort by
-    // lexicographic reversed-MRO witness, and the sorted position is the id
-    // (`compute_fn`: `peers.sort()` then `value = index`,
-    // normalizecalls.py:342-354).  Re-deriving the full set on each call
-    // makes a later-discovered subclass nest into its parent's bracket — the
-    // parent's maxid grows and ids past the bracket shift up — instead of
-    // leaving such a subclass unnumbered.
-    let proposed = global_sort_inheritance_ids(&snapshot);
+    // lexicographic reversed-MRO witness, and a marker's position in the
+    // sorted list IS its id.  This is upstream's `compute_fn` body verbatim
+    // — `peers.sort()` then `for i, peer in enumerate(peers): peer.value = i`
+    // (normalizecalls.py:342-354).  The sorted marker list is exactly the
+    // upstream `peers`; the id is read straight off the enumeration index,
+    // so there is no separate id table.  Re-deriving the full set on each
+    // call makes a later-discovered subclass nest into its parent's
+    // bracket — the parent's maxid grows and ids past the bracket shift up —
+    // instead of leaving such a subclass unnumbered.
+    let markers = build_sorted_inheritance_markers(&snapshot);
 
     // A class whose vtable is already materialized has had its
     // `subclassrange_min/max` read out and baked into a jitcode constant
     // pool, which is immutable once assembled (`OnceLock<JitCodeBody>`).
-    // Re-resolving such a class to a different range would leave that
+    // Re-resolving such a class to a different position would leave that
     // constant stale, and pyre's per-graph interleaved emit cannot rewrite
-    // it.  So when the global sort would shift an already-baked range, fall
-    // back to append-only numbering: number only the freshly-discovered
-    // hierarchies that append after the baked prefix, and leave a fresh
-    // subclass of a baked ancestor unnumbered for the per-graph `Skip`
-    // (`ClassesPBCRepr.redispatch_call`).  Numbering such a subclass cleanly
-    // needs the two-phase rtype/emit prepass that fixes every id before any
-    // constant is baked.  A new hierarchy with no common base sorts after
-    // the existing ids (its witness opens with a freshly-allocated, higher
-    // unique-cdef-id), so the common case never shifts a baked range and the
-    // global sort applies unchanged.
-    let shifts_baked_range = snapshot.iter().any(|classdef| {
-        let cd = classdef.borrow();
-        let (Some(cur_min), Some(cur_max)) = (cd.minid, cd.maxid) else {
-            return false;
-        };
+    // it.  So when the sort would shift an already-baked id, fall back to
+    // append-only numbering: number only the freshly-discovered hierarchies
+    // that append after the baked prefix, and leave a fresh subclass of a
+    // baked ancestor unnumbered for the per-graph `Skip`
+    // (`ClassesPBCRepr.redispatch_call`).  This is the pragmatic counterpart
+    // of upstream's `TooLateForNewSubclass` (normalizecalls.py:347-351),
+    // which instead raises; numbering such a subclass cleanly needs the
+    // two-phase rtype/emit prepass that fixes every id before any constant
+    // is baked.  A new hierarchy with no common base sorts after the existing
+    // ids (its witness opens with a freshly-allocated, higher unique-cdef-id),
+    // so the common case never shifts a baked id and the sort applies
+    // unchanged.
+    let shifts_baked_id = markers.iter().enumerate().any(|(index, marker)| {
+        let cd = marker.classdef.borrow();
         let baked = cd
             .repr
             .as_ref()
             .is_some_and(|repr| repr.is_vtable_materialized());
-        baked && proposed.get(&Rc::as_ptr(classdef)).copied() != Some((cur_min, cur_max))
+        let current = if marker.is_max { cd.maxid } else { cd.minid };
+        baked && current.is_some() && current != Some(index as i64)
     });
 
-    if shifts_baked_range {
+    if shifts_baked_id {
         assign_inheritance_ids_append_only(&snapshot);
         return;
     }
 
-    for classdef in &snapshot {
-        if let Some(&(min, max)) = proposed.get(&Rc::as_ptr(classdef)) {
-            let mut cd = classdef.borrow_mut();
-            cd.minid = Some(min);
-            cd.maxid = Some(max);
-        }
-    }
-}
-
-/// Build the `(minid, maxid)` markers for `classdefs`, sort them by the
-/// reversed-MRO witness, and return each classdef's sorted `(min, max)`
-/// position — the `compute_fn` resolution (peers.sort → value = index,
-/// normalizecalls.py:342-354) over the supplied set.
-fn global_sort_inheritance_ids(
-    classdefs: &[Rc<RefCell<ClassDef>>],
-) -> std::collections::HashMap<*const RefCell<ClassDef>, (i64, i64)> {
-    let markers = build_sorted_inheritance_markers(classdefs);
-    let mut proposed: std::collections::HashMap<*const RefCell<ClassDef>, (i64, i64)> =
-        std::collections::HashMap::with_capacity(classdefs.len());
     for (index, marker) in markers.iter().enumerate() {
-        let entry = proposed
-            .entry(Rc::as_ptr(&marker.classdef))
-            .or_insert((0, 0));
+        let mut cd = marker.classdef.borrow_mut();
         if marker.is_max {
-            entry.1 = index as i64;
+            cd.maxid = Some(index as i64);
         } else {
-            entry.0 = index as i64;
+            cd.minid = Some(index as i64);
         }
     }
-    proposed
 }
 
 /// Append-only fallback used when the global sort would shift an

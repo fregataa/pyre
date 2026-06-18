@@ -2353,14 +2353,17 @@ pub enum ConstValue {
     /// has no cross-session `id()`, so we materialise identity as an
     /// atomic counter.
     SpecTag(u64),
-    /// Symbolic inheritance-id marker carrying a classdef's `minid` /
-    /// `maxid` for an `ll_issubclass_const` / exception-match range
-    /// check. `lltype()` is `Signed`; the concrete integer resolves only
-    /// at code emission (`emit_const_i_from_const`), like `AddressOffset`.
-    /// `value` holds the resolved id and is the integer emitted. `cdef_id`
-    /// (the stable `get_unique_cdef_id`) and `is_max` (min vs max
-    /// endpoint) identify the marker; `cdef_id` is `None` when only the
-    /// eager `value` is available.
+    /// Inheritance-id marker carrying a classdef's `minid` / `maxid` for
+    /// an `ll_issubclass_const` / exception-match range check. `lltype()`
+    /// is `Signed`. The integer is resolved EAGERLY at rtype time — read
+    /// off the already-materialized vtable's `subclassrange_min/max` — and
+    /// carried in `value`; `emit_const_i_from_const` emits it verbatim
+    /// (unlike `AddressOffset`, which is genuinely resolved at emission).
+    /// `cdef_id` (the stable `get_unique_cdef_id`) and `is_max` (min vs max
+    /// endpoint) identify the marker and are RESERVED for a future
+    /// emission-time numbering resolution, only reachable under the
+    /// whole-program two-phase rtype/emit prepass; today `cdef_id` is
+    /// always `None`.
     InheritanceId {
         cdef_id: Option<usize>,
         is_max: bool,

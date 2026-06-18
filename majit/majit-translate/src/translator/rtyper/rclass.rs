@@ -1323,10 +1323,10 @@ fn rtype_issubtype_helper(
                 "{caller}: subclassrange_max not Signed, got {max_val:?}"
             )));
         };
-        // Carry the range markers as symbolic inheritance ids resolved at
-        // emission; the eager `value` keeps the emitted constant identical.
-        // The owning classdef is not in scope here (only the vtable `_ptr`),
-        // so `cdef_id` is `None`.
+        // Carry the range markers as inheritance ids; the id is resolved
+        // eagerly at rtype time (read off the vtable here) and `value` is
+        // emitted verbatim.  The owning classdef is not in scope (only the
+        // vtable `_ptr`), so `cdef_id` is `None`.
         let c_min = Constant::with_concretetype(
             ConstValue::InheritanceId {
                 cdef_id: None,
