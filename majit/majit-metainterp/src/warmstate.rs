@@ -596,11 +596,12 @@ impl WarmEnterState {
     /// independent cell state.
     ///
     /// Hash-only callers ([`Self::maybe_compile`]) still mutate the
-    /// bucket head via the legacy entry point. Migrating
-    /// `finish_tracing`, `abort_tracing`, `clear_loop_token`, and
-    /// `mark_dont_trace` to the typed chain-walk is tracked as a
-    /// pre-existing TODO follow-up so the typed
-    /// path's full lifecycle stays self-consistent on its own buckets.
+    /// bucket head via the legacy entry point. The typed chain-walk
+    /// variants of `finish_tracing`, `abort_tracing`, `clear_loop_token`,
+    /// and `mark_dont_trace` ([`Self::finish_tracing_for_key`] etc.) keep
+    /// the typed path's full lifecycle self-consistent on its own buckets;
+    /// the production cutover from the hash entry points is the separate
+    /// typed-greenkey threading work.
     pub fn maybe_compile_with_key(&mut self, key: &GreenKey) -> HotResult {
         let hash = key.get_uhash();
         if let Some(cell) = self.lookup_chain_with_key(key) {
@@ -666,6 +667,70 @@ impl WarmEnterState {
         cell.state = BaseJitCellState::Tracing;
         cell.tracing_generation = current_generation;
         HotResult::StartTracing
+    }
+
+    /// Typed-key variant of [`Self::finish_tracing`]. Walks the bucket
+    /// chain by comparekey so a typed green that collides with another
+    /// clears `JC_TRACING` on its own cell rather than the bucket head.
+    pub fn finish_tracing_for_key(&mut self, key: &GreenKey) {
+        if let Some(cell) = self.lookup_chain_with_key_mut(key) {
+            cell.flags &= !jc_flags::TRACING;
+            // State remains Tracing until attach_procedure_to_interp is called.
+        }
+    }
+
+    /// Typed-key variant of [`Self::abort_tracing`]. Walks the bucket
+    /// chain by comparekey so a collided typed green mutates its own
+    /// cell's `JC_TRACING` / abort-count / `DONT_TRACE_HERE` state.
+    pub fn abort_tracing_for_key(&mut self, key: &GreenKey, disable_noninlinable_function: bool) {
+        if let Some(cell) = self.lookup_chain_with_key_mut(key) {
+            cell.flags &= !jc_flags::TRACING;
+            cell.abort_count += 1;
+            if disable_noninlinable_function || (cell.flags & jc_flags::DONT_TRACE_HERE != 0) {
+                cell.flags |= jc_flags::DONT_TRACE_HERE;
+                cell.state = BaseJitCellState::DontTraceHere;
+            } else if cell.abort_count >= MAX_TRACE_ABORT_COUNT {
+                cell.flags |= jc_flags::DONT_TRACE_HERE;
+                cell.state = BaseJitCellState::DontTraceHere;
+            } else {
+                cell.state = BaseJitCellState::NotHot;
+            }
+        }
+
+        if disable_noninlinable_function {
+            self.disable_noninlinable_function_for_key(key);
+        }
+        if let Some(log) = &mut self.jitlog {
+            log.log_abort();
+        }
+    }
+
+    /// Typed-key variant of [`Self::clear_loop_token`]. Walks the bucket
+    /// chain by comparekey to clear the matching cell's loop token.
+    pub fn clear_loop_token_for_key(&mut self, key: &GreenKey) {
+        if let Some(cell) = self.lookup_chain_with_key_mut(key) {
+            cell.loop_token = None;
+        }
+    }
+
+    /// Typed-key variant of [`Self::mark_dont_trace`].
+    pub fn mark_dont_trace_for_key(&mut self, key: &GreenKey) {
+        self.disable_noninlinable_function_for_key(key);
+    }
+
+    /// Typed-key variant of [`Self::disable_noninlinable_function`]:
+    /// installs a cell for `key` if absent (matching the hash form's
+    /// `entry().or_insert`), then sets `DONT_TRACE_HERE` on the cell whose
+    /// comparekey matches `key`, not the bucket head.
+    pub fn disable_noninlinable_function_for_key(&mut self, key: &GreenKey) {
+        self.ensure_cell_for_key(key);
+        let cell = self
+            .lookup_chain_with_key_mut(key)
+            .expect("ensure_cell_for_key just installed a cell matching this key");
+        cell.flags |= jc_flags::DONT_TRACE_HERE;
+        if cell.flags & jc_flags::TRACING == 0 {
+            cell.state = BaseJitCellState::DontTraceHere;
+        }
     }
 
     /// Force-start tracing for a green key, bypassing the hot counter.
@@ -3062,6 +3127,103 @@ mod tests {
             .lookup_chain_with_key(&key_head_after_chain)
             .expect("walker must find chain head via comparekey");
         assert_eq!(hit_head.comparekey.as_ref(), Some(&key_head_after_chain));
+    }
+
+    /// Build a 2-cell chain in `target`'s bucket: a decoy cell at the head
+    /// (different comparekey) and `target`'s cell chained behind it, both
+    /// TRACING.  The typed-key lifecycle mutators must walk past the decoy
+    /// head and touch only `target`'s cell.
+    fn chain_decoy_then_target(target: &GreenKey, decoy: &GreenKey) -> WarmEnterState {
+        let mut ws = WarmEnterState::new(100);
+        let bucket = target.get_uhash();
+        let mut decoy_cell = BaseJitCell::new();
+        decoy_cell.flags |= jc_flags::TRACING;
+        decoy_cell.comparekey = Some(decoy.clone());
+        ws.install_new_cell(bucket, Some(decoy_cell));
+        let mut target_cell = BaseJitCell::new();
+        target_cell.flags |= jc_flags::TRACING;
+        target_cell.comparekey = Some(target.clone());
+        ws.install_new_cell(bucket, Some(target_cell));
+        ws
+    }
+
+    #[test]
+    fn finish_tracing_for_key_clears_tracing_on_matching_cell_only() {
+        let target = GreenKey::new(vec![5, 6]);
+        let decoy = GreenKey::new(vec![7, 8]);
+        let mut ws = chain_decoy_then_target(&target, &decoy);
+        ws.finish_tracing_for_key(&target);
+        let head = ws.lookup_chain(target.get_uhash()).expect("bucket head");
+        assert_eq!(head.comparekey.as_ref(), Some(&decoy));
+        assert!(head.flags & jc_flags::TRACING != 0, "decoy head untouched");
+        let hit = head.next.as_deref().expect("target chained behind decoy");
+        assert_eq!(hit.comparekey.as_ref(), Some(&target));
+        assert!(hit.flags & jc_flags::TRACING == 0, "target TRACING cleared");
+    }
+
+    #[test]
+    fn abort_tracing_for_key_marks_only_matching_cell() {
+        let target = GreenKey::new(vec![5, 6]);
+        let decoy = GreenKey::new(vec![7, 8]);
+        let mut ws = chain_decoy_then_target(&target, &decoy);
+        ws.abort_tracing_for_key(&target, true);
+        let head = ws.lookup_chain(target.get_uhash()).expect("bucket head");
+        assert!(
+            head.flags & jc_flags::TRACING != 0,
+            "decoy head still TRACING"
+        );
+        assert!(
+            head.flags & jc_flags::DONT_TRACE_HERE == 0,
+            "decoy not disabled"
+        );
+        let hit = head.next.as_deref().expect("target chained behind decoy");
+        assert!(hit.flags & jc_flags::TRACING == 0, "target TRACING cleared");
+        assert!(
+            hit.flags & jc_flags::DONT_TRACE_HERE != 0,
+            "target disabled by permanent abort"
+        );
+    }
+
+    #[test]
+    fn mark_dont_trace_for_key_sets_only_matching_cell() {
+        let target = GreenKey::new(vec![5, 6]);
+        let decoy = GreenKey::new(vec![7, 8]);
+        let mut ws = chain_decoy_then_target(&target, &decoy);
+        ws.mark_dont_trace_for_key(&target);
+        let head = ws.lookup_chain(target.get_uhash()).expect("bucket head");
+        assert!(
+            head.flags & jc_flags::DONT_TRACE_HERE == 0,
+            "decoy head not disabled"
+        );
+        let hit = head.next.as_deref().expect("target chained behind decoy");
+        assert!(
+            hit.flags & jc_flags::DONT_TRACE_HERE != 0,
+            "target disabled"
+        );
+    }
+
+    #[test]
+    fn clear_loop_token_for_key_clears_only_matching_cell() {
+        let target = GreenKey::new(vec![5, 6]);
+        let decoy = GreenKey::new(vec![7, 8]);
+        let mut ws = WarmEnterState::new(100);
+        let bucket = target.get_uhash();
+        let token = std::sync::Arc::new(JitCellToken::new(0x00c0_ffee_u64));
+        let mut decoy_cell = BaseJitCell::new();
+        decoy_cell.flags |= jc_flags::TRACING;
+        decoy_cell.comparekey = Some(decoy.clone());
+        decoy_cell.loop_token = Some(token.clone());
+        ws.install_new_cell(bucket, Some(decoy_cell));
+        let mut target_cell = BaseJitCell::new();
+        target_cell.flags |= jc_flags::TRACING;
+        target_cell.comparekey = Some(target.clone());
+        target_cell.loop_token = Some(token.clone());
+        ws.install_new_cell(bucket, Some(target_cell));
+        ws.clear_loop_token_for_key(&target);
+        let head = ws.lookup_chain(bucket).expect("bucket head");
+        assert!(head.loop_token.is_some(), "decoy loop_token kept");
+        let hit = head.next.as_deref().expect("target chained behind decoy");
+        assert!(hit.loop_token.is_none(), "target loop_token cleared");
     }
 
     /// `warmstate.py:714-723` `get_assembler_token` — a fresh typed key
