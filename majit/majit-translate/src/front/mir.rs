@@ -6492,8 +6492,15 @@ fn tyref_to_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
             if lit_obj.contains_key("Bool") {
                 return ValueType::Bool;
             }
-            if lit_obj.contains_key("Float") {
-                return ValueType::Float;
+            if let Some(f) = lit_obj.get("Float").and_then(serde_json::Value::as_str) {
+                // `getkind(SingleFloat) == 'int'` (history.py:53): single
+                // floats live in the int register bank; only `f64`
+                // (`lltype.Float`) keeps the float kind.
+                return if f == "F32" {
+                    ValueType::Int
+                } else {
+                    ValueType::Float
+                };
             }
         }
     }
@@ -6561,8 +6568,14 @@ fn tyref_to_attr_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
             if lit_obj.contains_key("Bool") {
                 return ValueType::Bool;
             }
-            if lit_obj.contains_key("Float") {
-                return ValueType::Float;
+            if let Some(f) = lit_obj.get("Float").and_then(serde_json::Value::as_str) {
+                // `getkind(SingleFloat) == 'int'`: single floats are
+                // int-banked; only `f64` keeps the float kind.
+                return if f == "F32" {
+                    ValueType::Int
+                } else {
+                    ValueType::Float
+                };
             }
         }
     }

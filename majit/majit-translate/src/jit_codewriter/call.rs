@@ -1372,8 +1372,12 @@ impl CallControl {
             )
         };
         // descr.py:366-370 — `concrete_type='f'` when the element OF is
-        // Float/SingleFloat (pyre has a single Float); otherwise `'\x00'`.
-        let concrete_type = if item_type == majit_ir::value::Type::Float {
+        // Float or SingleFloat.  A SingleFloat (`f32`) array element is
+        // int-banked (`Type::Int`, `get_type_flag`) but keeps the `'f'`
+        // width marker, so detect it by element name too.  Otherwise
+        // `'\x00'`.
+        let concrete_type = if item_type == majit_ir::value::Type::Float || elem_ref == Some("f32")
+        {
             'f'
         } else {
             '\x00'
@@ -2964,7 +2968,10 @@ fn return_type_string_to_kind(s: &str) -> char {
         "" | "()" => 'v',
         "i8" | "i16" | "i32" | "i64" | "isize" | "u8" | "u16" | "u32" | "u64" | "usize"
         | "bool" | "char" | "Self::Truth" => 'i',
-        "f32" | "f64" => 'f',
+        // `getkind(SingleFloat) == 'int'`: a singlefloat return travels
+        // in the int bank; only `f64` (`lltype.Float`) is float-kind.
+        "f32" => 'i',
+        "f64" => 'f',
         _ => 'r',
     }
 }
@@ -3039,7 +3046,10 @@ fn return_type_string_to_value_type(s: Option<&String>) -> Type {
         Some("i8") | Some("i16") | Some("i32") | Some("i64") | Some("isize") | Some("u8")
         | Some("u16") | Some("u32") | Some("u64") | Some("usize") | Some("bool") | Some("char")
         | Some("Self::Truth") => Type::Int,
-        Some("f32") | Some("f64") => Type::Float,
+        // `getkind(SingleFloat) == 'int'`: singlefloat returns in the int
+        // bank; only `f64` keeps the float kind.
+        Some("f32") => Type::Int,
+        Some("f64") => Type::Float,
         _ => Type::Ref,
     }
 }
@@ -6482,7 +6492,12 @@ fn get_type_flag(type_str: &str) -> (majit_ir::descr::ArrayFlag, majit_ir::value
         }
         // RPython: TYPE is lltype.Float → FLAG_FLOAT
         "f64" => (ArrayFlag::Float, majit_ir::value::Type::Float, 8),
-        "f32" => (ArrayFlag::Float, majit_ir::value::Type::Float, 4),
+        // RPython: SingleFloat is not lltype.Float and `rffi.cast(_, -1)
+        // != -1`, so `get_type_flag` lands FLAG_UNSIGNED (descr.py:254);
+        // `getkind(SingleFloat) == 'int'` → int-banked, size 4.  The `'f'`
+        // width marker for f32 arrays is restored separately in
+        // `get_array_descr`.
+        "f32" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 4),
         // RPython: rffi.cast(TYPE, -1) == -1 → FLAG_SIGNED
         "i64" | "isize" => (ArrayFlag::Signed, majit_ir::value::Type::Int, 8),
         "i32" => (ArrayFlag::Signed, majit_ir::value::Type::Int, 4),
@@ -6979,6 +6994,32 @@ pub fn describe_call(target: &CallTarget) -> Option<CallDescriptor> {
 mod tests {
     use super::*;
     use crate::model::{ExitSwitch, FunctionGraph, Link, LinkArg, ValueType, exception_exitcase};
+
+    /// `getkind(SingleFloat) == 'int'` (history.py:53): `f32` banks to the
+    /// int kind across the field/return classifiers (FLAG_UNSIGNED,
+    /// descr.py:254), while `f64` (`lltype.Float`) keeps the float kind.
+    #[test]
+    fn singlefloat_classifies_as_int_bank() {
+        use majit_ir::descr::ArrayFlag;
+        use majit_ir::value::Type;
+        let (f32_flag, f32_ty, f32_size) = get_type_flag("f32");
+        assert!(matches!(f32_flag, ArrayFlag::Unsigned));
+        assert_eq!(f32_ty, Type::Int);
+        assert_eq!(f32_size, 4);
+        let (f64_flag, f64_ty, _) = get_type_flag("f64");
+        assert!(matches!(f64_flag, ArrayFlag::Float));
+        assert_eq!(f64_ty, Type::Float);
+        assert_eq!(return_type_string_to_kind("f32"), 'i');
+        assert_eq!(return_type_string_to_kind("f64"), 'f');
+        assert_eq!(
+            return_type_string_to_value_type(Some(&"f32".to_string())),
+            Type::Int
+        );
+        assert_eq!(
+            return_type_string_to_value_type(Some(&"f64".to_string())),
+            Type::Float
+        );
+    }
 
     /// Synthetic `OpKind::Call` wrapper — mirrors RPython test_jtransform
     /// helpers that pass a pre-built `SpaceOperation('direct_call', ...)`

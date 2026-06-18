@@ -122,9 +122,10 @@ pub fn somevalue_to_valuetype(s: &SomeValue) -> ValueType {
     match s {
         SomeValue::Integer(_) => ValueType::Int,
         SomeValue::Bool(_) => ValueType::Bool,
-        SomeValue::Float(_) | SomeValue::SingleFloat(_) | SomeValue::LongFloat(_) => {
-            ValueType::Float
-        }
+        SomeValue::Float(_) | SomeValue::LongFloat(_) => ValueType::Float,
+        // `getkind(SingleFloat) == 'int'` (history.py:53): singlefloats
+        // are stored in an int register, not the float bank.
+        SomeValue::SingleFloat(_) => ValueType::Int,
         SomeValue::Instance(_) | SomeValue::Ptr(_) | SomeValue::PBC(_) => ValueType::Ref(None),
         // `SomeImpossibleValue` represents unreachable code (`model.py:627`),
         // which projects to `ValueType::Void` in pyre's flat enum just
