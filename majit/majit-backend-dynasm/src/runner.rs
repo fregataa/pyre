@@ -3821,7 +3821,6 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    #[ignore = "CallMallocNurseryVarsizeFrame fastpath still segfaults on aarch64 after backend FINISH descr attachment; keep out of default test suite until frame-allocation code is fixed"]
     fn test_varsize_frame_fastpath_does_not_overlap_previous_object_payload() {
         let mut gc = MiniMarkGC::new();
         gc.register_type(TypeInfo::simple(24));
@@ -3846,7 +3845,7 @@ mod tests {
             mk_op(
                 OpCode::GcStore,
                 &[
-                    OpRef::input_arg_int(0),
+                    OpRef::ref_op(0),
                     OpRef::int_op(10001),
                     OpRef::int_op(10002),
                     OpRef::int_op(10003),
@@ -3856,7 +3855,7 @@ mod tests {
             mk_op(
                 OpCode::GcStore,
                 &[
-                    OpRef::input_arg_int(0),
+                    OpRef::ref_op(0),
                     OpRef::int_op(10004),
                     OpRef::int_op(10004),
                     OpRef::int_op(10003),
@@ -3866,7 +3865,7 @@ mod tests {
             mk_op(
                 OpCode::GcStore,
                 &[
-                    OpRef::input_arg_int(0),
+                    OpRef::ref_op(0),
                     OpRef::int_op(10005),
                     OpRef::int_op(10006),
                     OpRef::int_op(10003),
@@ -3888,11 +3887,7 @@ mod tests {
                 ],
                 OpRef::NONE.raw(),
             ),
-            mk_op(
-                OpCode::Finish,
-                &[OpRef::input_arg_int(0)],
-                OpRef::NONE.raw(),
-            ),
+            mk_op(OpCode::Finish, &[OpRef::ref_op(0)], OpRef::NONE.raw()),
         ];
 
         let mut token = JitCellToken::new(1502);

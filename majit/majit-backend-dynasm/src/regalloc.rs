@@ -6505,4 +6505,34 @@ mod tests {
         assert_eq!(get_scale(4), 2);
         assert_eq!(get_scale(8), 3);
     }
+
+    #[test]
+    fn test_guard_not_forced_2_emits_fail_locs_without_frame_depth_argloc() {
+        // aarch64/regalloc.py:672 prepare_op_guard_not_forced_2 spills the
+        // failargs and returns only the guard fail locations. The guard does
+        // NOT carry a frame-depth argloc: check_frame_depth (assembler.py:927)
+        // is a bridge-prologue stack check whose expected size is patched
+        // after assembly (emit_check_frame_depth + patch_stack_checks), not a
+        // value threaded through the guard's arglocs.
+        let i0 = OpRef::input_arg_ref(0);
+        let inputargs = vec![InputArg::from_type(Type::Ref, i0.raw())];
+        let ops = vec![make_guard(OpCode::GuardNotForced2, 0, &[], &[i0])];
+
+        let mut ra = RegAlloc::new(majit_ir::VecAssoc::new(), &inputargs, &ops);
+        ra.prepare_loop();
+        let output = ra.walk_operations();
+
+        match &output[0] {
+            RegAllocOp::PerformGuard {
+                arglocs, faillocs, ..
+            } => {
+                assert_eq!(faillocs.len(), 1);
+                assert!(
+                    !arglocs.iter().any(|l| matches!(l, Loc::Immed(_))),
+                    "GuardNotForced2 must not carry a frame-depth immediate argloc, got {arglocs:?}"
+                );
+            }
+            other => panic!("expected PerformGuard, got {other:?}"),
+        }
+    }
 }
